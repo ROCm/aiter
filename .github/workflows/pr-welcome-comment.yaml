@@ -42,6 +42,6 @@ jobs:
             > Only add \`ci:atom_full\` for FlyDSL or Triton upgrades.
             > Add labels via the sidebar or \`gh pr edit ${context.issue.number} --add-label <label>\`
 
-            **PR title tags:**
-            Component tags (\`[Triton/Gluon]\`, \`[HIP]\`, \`[CK]\`, \`[ASM]\`, ...) are added to the PR title automatically from the changed files and re-synced on every push — change-type tags like \`[fix]\`/\`[Perf]\` and op tags like \`[MLA]\` are left untouched. Add the \`no-auto-title\` label to opt this PR out of title tagging.`
+            **PR title tags & labels:**
+            Component tags (\`[Triton/Gluon]\`, \`[HIP]\`, \`[CK]\`, \`[ASM]\`, ...) are added to the PR title and as PR labels automatically from the changed files and re-synced on every push — change-type tags like \`[fix]\`/\`[Perf]\`, op tags like \`[MLA]\`, and human labels (\`ci:*\`) are left untouched. Add the \`no-auto-title\` label to opt this PR out.`
             });

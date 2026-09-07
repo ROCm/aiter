@@ -140,6 +140,17 @@ namespace py = pybind11;
           py::arg("group_size"),                         \
           py::arg("limit")         = 0.0f,               \
           py::arg("shuffle_scale") = false);             \
+    m.def("situv2_and_mul_quant",                        \
+          &aiter::situv2_and_mul_quant,                  \
+          "Fused SiTUv2 and per-token FP8 quantization." \
+          " Requires group_size == d.",                  \
+          py::arg("out"),                                \
+          py::arg("input"),                              \
+          py::arg("scale"),                              \
+          py::arg("group_size"),                         \
+          py::arg("beta"),                               \
+          py::arg("linear_beta"),                        \
+          py::arg("shuffle_scale") = false);             \
     m.def("gelu_and_mul",                                \
           &aiter::gelu_and_mul,                          \
           "Activation function used in GELU.",           \
@@ -483,7 +494,8 @@ namespace py = pybind11;
           py::arg("scale_fmt"),                                                     \
           py::arg("weights_scale"),                                                 \
           py::arg("preshuffle") = false,                                            \
-          py::arg("is_neox") = true);                                               \
+          py::arg("is_neox") = true,                                                \
+          py::arg("compute_all_q_rope") = false);                                   \
     m.def("cp_gather_indexer_k_quant_cache",                                        \
           &aiter::cp_gather_indexer_k_quant_cache,                                  \
           py::arg("kv_cache"),                                                      \
@@ -1708,7 +1720,12 @@ namespace py = pybind11;
           py::arg("e8m0_shuffle")   = false,                             \
           py::arg("a16w4_shuffle")  = false,                             \
           py::arg("gate_up")        = false,                             \
-          py::arg("shuffle_weight") = false);
+          py::arg("shuffle_weight") = false);                             \
+    m.def("quant_mxfp6_gemm_hip",                                        \
+          &aiter::quant_mxfp6_gemm_hip,                                  \
+          py::arg("input"),                                              \
+          py::arg("packed"),                                             \
+          py::arg("packed_scale"));
 
 #define DSV4_ROTATE_QUANT_PYBIND                                                             \
     m.def("rotate_activation_fp4quant",                                                      \
@@ -1940,7 +1957,8 @@ namespace py = pybind11;
           py::arg("index_cache_dtype") = "auto",       \
           py::arg("k_scale")           = std::nullopt, \
           py::arg("v_scale")           = std::nullopt, \
-          py::arg("asm_layout")        = false)
+          py::arg("asm_layout")        = false,        \
+          py::arg("skip_index_branch") = false)
 
 #define FUSED_QKNORM_ROPE_CACHE_QUANT_PYBIND                           \
     m.def("fused_qk_norm_rope_cache_quant_shuffle",                    \
@@ -2016,7 +2034,8 @@ namespace py = pybind11;
           py::arg("use_shuffle_layout"),                               \
           py::arg("block_size"),                                       \
           py::arg("x"),                                                \
-          py::arg("rotary_dim") = 0);                                  \
+          py::arg("rotary_dim") = 0,                                   \
+          py::arg("v_norm")     = false);                              \
     m.def("fused_qk_norm_rope_cache_block_quant_shuffle",              \
           &aiter::fused_qk_norm_rope_cache_block_quant_shuffle,        \
           py::arg("qkv"),                                              \
@@ -2264,7 +2283,8 @@ namespace py = pybind11;
           py::arg("stride1"),                    \
           py::arg("k")         = 2048,           \
           py::arg("workspace") = std::nullopt,   \
-          py::arg("stable")    = false);         \
+          py::arg("stable")    = false,          \
+          py::arg("values")    = std::nullopt);  \
     m.def("topk_mb_workspace_size",              \
           &topk_mb_workspace_size,               \
           py::arg("numRows"),                    \

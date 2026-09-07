@@ -40,7 +40,7 @@ from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import Vector as Vec
 from flydsl.runtime.device import get_rocm_arch
 
-from aiter.ops.flydsl.utils import addressable_lds_bytes_for_gfx
+from aiter.jit.utils.chip_info import get_lds_capacity_bytes
 
 _LOG2E = host_math.log2(host_math.e)
 
@@ -166,7 +166,7 @@ def validate_hstu_attention_fwd(
             f"rows_per_batch_v={rows_per_batch_v} must divide block_n={block_n}, unless rows_per_batch_v > block_n"
         )
 
-    lds_cap = addressable_lds_bytes_for_gfx(arch)
+    lds_cap = get_lds_capacity_bytes(arch)
     lds_bytes = block_n * head_dim_k * 2 + block_n * hidden_dim * 2
     if lds_bytes > lds_cap:
         raise ValueError(f"LDS tile {lds_bytes} B exceeds the {lds_cap} B budget")
