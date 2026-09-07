@@ -21,13 +21,15 @@ import triton
 import triton.language as tl
 from einops import rearrange
 
-from aiter.ops.triton._triton_kernels.gated_delta_rule.decode.fused_sigmoid_gating_recurrent import (
+from aiter.ops.triton._triton_kernels.linear_attention.gated_delta_rule.decode.fused_sigmoid_gating_recurrent import (
     fused_sigmoid_gating_delta_rule_update,
 )
-from aiter.ops.triton.gated_delta_net.causal_conv1d_decode import (
+from aiter.ops.triton.linear_attention.chunk_delta_attn.fused_kda_decode import (
+    fused_kda_decode,
+)
+from aiter.ops.triton.linear_attention.gated_delta_rule.causal_conv1d_decode import (
     causal_conv1d_update_split_qkv,
 )
-from aiter.ops.triton.gated_delta_net.fused_kda_decode import fused_kda_decode
 
 DEVICE = "cuda"
 D = 128

@@ -8,11 +8,12 @@ import torch
 import triton
 from torch import Tensor
 
-from ..jit.core import compile_ops
-from .triton._triton_kernels.gated_delta_rule.utils.prefill_metadata import (
+from aiter.ops.triton._triton_kernels.linear_attention.gated_delta_rule.utils.prefill_metadata import (
     GatedDeltaRulePrefillMetadata,
     build_gated_delta_rule_prefill_metadata,
 )
+
+from ..jit.core import compile_ops
 
 MD_NAME = "module_chunk_gdr_fwd_h"
 RCP_LN2 = 1.4426950408889634
@@ -297,7 +298,7 @@ def chunk_gated_delta_rule_fwd_h_hip_fn(
     )
 
     if is_varlen:
-        from aiter.ops.triton._triton_kernels.gated_delta_rule.utils import (
+        from aiter.ops.triton._triton_kernels.linear_attention.gated_delta_rule.utils import (
             prepare_chunk_offsets,
             prepare_rebased_cu_seqlens,
         )

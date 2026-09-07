@@ -191,7 +191,7 @@ def _call_backend(
             metadata=metadata,
         )
     if backend == "triton2d":
-        from aiter.ops.triton.gated_delta_net.causal_conv1d_prefill import (
+        from aiter.ops.triton.linear_attention.gated_delta_rule.causal_conv1d_prefill import (
             causal_conv1d_split_qkv_triton_tile_fn,
         )
 
@@ -209,7 +209,7 @@ def _call_backend(
             metadata=metadata,
         )
     if backend == "triton":
-        from aiter.ops.triton.gated_delta_net.causal_conv1d_prefill import (
+        from aiter.ops.triton.linear_attention.gated_delta_rule.causal_conv1d_prefill import (
             causal_conv1d_split_qkv_triton_fn,
         )
 

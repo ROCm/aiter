@@ -47,7 +47,7 @@ from aiter.ops.flydsl.linear_attention_prefill_kernels import (
 from aiter.ops.prefill_batch_metadata import (
     build_gated_delta_rule_prefill_metadata,
 )
-from aiter.ops.triton._triton_kernels.gated_delta_rule.prefill.chunk_delta_h import (
+from aiter.ops.triton._triton_kernels.linear_attention.gated_delta_rule.prefill.chunk_delta_h import (
     chunk_gated_delta_rule_fwd_h_opt_vk,
 )
 from aiter.test_common import benchmark, checkAllclose, run_perftest

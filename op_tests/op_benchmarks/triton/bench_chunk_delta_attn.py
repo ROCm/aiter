@@ -36,7 +36,9 @@ if _REPO_ROOT not in sys.path:
 import torch
 import triton
 
-from aiter.ops.triton._triton_kernels.chunk_delta_attn import chunk_delta_attn_fwd
+from aiter.ops.triton._triton_kernels.linear_attention.chunk_delta_attn import (
+    chunk_delta_attn_fwd,
+)
 from op_tests.op_benchmarks.triton.utils.benchmark_utils import get_caller_name_no_ext
 
 # (B, T, H, K, V)  – representative prefill shapes

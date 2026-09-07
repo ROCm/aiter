@@ -42,7 +42,7 @@ if _REPO_ROOT not in sys.path:
 import torch
 import triton
 
-from aiter.ops.triton._triton_kernels.chunk_delta_attn.flash_kda import (
+from aiter.ops.triton._triton_kernels.linear_attention.chunk_delta_attn.flash_kda import (
     FLASH_KDA_CHUNK,
     flash_kda_fwd,
 )

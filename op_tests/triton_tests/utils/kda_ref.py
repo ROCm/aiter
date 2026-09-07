@@ -5,7 +5,7 @@
 """Pure-PyTorch reference for Kimi Delta Attention (KDA).
 
 The entry point mirrors the signature of
-``aiter.ops.triton.kimi_delta_attn.chunk_kimi_delta_attn`` so a test can drive
+``aiter.ops.triton.linear_attention.chunk_delta_attn.chunk_kimi_delta_attn`` so a test can drive
 both from a single argument dict.
 
 The recurrence is evaluated one token at a time in fp32 -- the definition the

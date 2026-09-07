@@ -296,7 +296,7 @@ def attnres_fwd_kernel(
 #
 # `cache_results=True` still gives in-process caching across repeated calls
 # with the same key within a run of this flag, same as fla's `cache_results`
-# kwarg (see aiter/ops/triton/_triton_kernels/chunk_delta_attn/chunk_delta_attn_utils.py).
+# kwarg (see aiter/ops/triton/_triton_kernels/linear_attention/chunk_delta_attn/chunk_delta_attn_utils.py).
 if ATTN_RES_TRITON_AUTOTUNE:
     _ATTN_RES_AUTOTUNE_CONFIGS = [
         triton.Config({"BL": BL}, num_warps=num_warps, num_stages=num_stages)

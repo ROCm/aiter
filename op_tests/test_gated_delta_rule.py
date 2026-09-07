@@ -17,24 +17,24 @@ from aiter.ops.chunk_gated_delta_rule_fwd_h import (
 from aiter.ops.flydsl.linear_attention_prefill_kernels import (
     chunk_gated_delta_rule_fwd_h_flydsl_opt,
 )
-from aiter.ops.triton._triton_kernels.gated_delta_rule.decode.fused_sigmoid_gating_recurrent import (
+from aiter.ops.triton._triton_kernels.linear_attention.gated_delta_rule.decode.fused_sigmoid_gating_recurrent import (
     fused_sigmoid_gating_delta_rule_update,
 )
-from aiter.ops.triton._triton_kernels.gated_delta_rule.gated_delta_rule_utils import (
+from aiter.ops.triton._triton_kernels.linear_attention.gated_delta_rule.gated_delta_rule_utils import (
     IS_AMD,
     IS_INTEL_ALCHEMIST,
     assert_close,
     device,
 )
-from aiter.ops.triton._triton_kernels.gated_delta_rule.prefill import (
+from aiter.ops.triton._triton_kernels.linear_attention.gated_delta_rule.prefill import (
     chunk_gated_delta_rule_fwd_h_opt_vk,
     fused_chunk_local_cumsum_scaled_dot_kkt_fwd,
     fused_solve_tril_recompute_w_u,
 )
-from aiter.ops.triton._triton_kernels.gated_delta_rule.prefill import (
+from aiter.ops.triton._triton_kernels.linear_attention.gated_delta_rule.prefill import (
     fused_solve_tril_recompute as fused_solve_module,
 )
-from aiter.ops.triton.gated_delta_net import (
+from aiter.ops.triton.linear_attention.gated_delta_rule import (
     chunk_gated_delta_rule,
     chunk_gated_delta_rule_opt,
     chunk_gated_delta_rule_opt_vk,
@@ -66,7 +66,7 @@ def test_chunk_opt_vk_unsupported_gfx12_runtime_allowlist(
     monkeypatch, arch: str, expected: bool
 ):
     chunk_module = importlib.import_module(
-        "aiter.ops.triton._triton_kernels.gated_delta_rule.prefill.chunk"
+        "aiter.ops.triton._triton_kernels.linear_attention.gated_delta_rule.prefill.chunk"
     )
     props = type("DeviceProperties", (), {"gcnArchName": arch})()
     monkeypatch.setattr(torch.cuda, "get_device_properties", lambda device: props)
@@ -1599,7 +1599,7 @@ def test_chunk_fwd_h_beyond_int32_chunk_offsets(seqlens):
     faulted the GPU. Zero k/w/u and no gate leave the state untouched, so every
     chunk snapshot must come back exactly equal to the initial state.
     """
-    from aiter.ops.triton._triton_kernels.gated_delta_rule.prefill import (
+    from aiter.ops.triton._triton_kernels.linear_attention.gated_delta_rule.prefill import (
         chunk_gated_delta_rule_fwd_h,
     )
 
@@ -1807,7 +1807,7 @@ def test_chunk_opt_vk_rejects_dense_index_count_mismatch():
 
 def test_chunk_opt_vk_hip_downgrade_preserves_indexed_state_args(monkeypatch):
     chunk_module = importlib.import_module(
-        "aiter.ops.triton._triton_kernels.gated_delta_rule.prefill.chunk"
+        "aiter.ops.triton._triton_kernels.linear_attention.gated_delta_rule.prefill.chunk"
     )
     initial_state = torch.empty(4, 1, 1, 1)
     initial_state_indices = torch.tensor([3], dtype=torch.int32)
@@ -1865,7 +1865,7 @@ def test_chunk_opt_vk_hip_downgrade_preserves_indexed_state_args(monkeypatch):
 
 def test_chunk_opt_vk_unsupported_gfx12_downgrades_to_triton(monkeypatch):
     chunk_module = importlib.import_module(
-        "aiter.ops.triton._triton_kernels.gated_delta_rule.prefill.chunk"
+        "aiter.ops.triton._triton_kernels.linear_attention.gated_delta_rule.prefill.chunk"
     )
     props = type("DeviceProperties", (), {"gcnArchName": "gfx1250"})()
     monkeypatch.setattr(torch.cuda, "get_device_properties", lambda device: props)

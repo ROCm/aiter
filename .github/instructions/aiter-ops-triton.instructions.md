@@ -29,7 +29,7 @@ forwards to another module, or a copy of a core helper inside a family module.
 The layout is: public wrapper modules in category folders
 (`gemm/{basic,batched,feed_forward,fused}/`, `attention/`, `moe/`,
 `normalization/`, `quant/`, `rope/`, `fusions/`, `comms/`, `conv/`,
-`gated_delta_net/`, `kimi_delta_attn/`, `gluon/`), kernel bodies under
+`linear_attention/{gated_delta_rule,chunk_delta_attn}/`, `gluon/`), kernel bodies under
 `_triton_kernels/` at the same relative category path, or under
 `_gluon_kernels/<arch>/` at the same relative category path when the Gluon
 implementation is architecture-specific. Shared machinery lives in `utils/`

@@ -30,7 +30,9 @@ from torch.profiler import ProfilerActivity, profile
 from aiter.ops.prefill_batch_metadata import (
     build_gated_delta_rule_prefill_metadata,
 )
-from aiter.ops.triton.gated_delta_net import chunk_gated_delta_rule_opt_vk
+from aiter.ops.triton.linear_attention.gated_delta_rule import (
+    chunk_gated_delta_rule_opt_vk,
+)
 
 CHUNK_SIZE = 64
 
