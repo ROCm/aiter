@@ -14,8 +14,6 @@ from flydsl.expr.typing import (
 )
 from flydsl.expr.typing import Vector as Vec
 
-from aiter.ops.flydsl.kernels import buffer_ops
-
 from ..mxfp4_gemm_common import _lds_swizzle_mask as lds_swizzle_mask
 from ..mxfp4_gemm_common import (
     flat_buffer_view,
@@ -27,6 +25,7 @@ from ..mxfp4_gemm_common import (
     lds_swizzle_mask_f8,
     lds_vec_load,
 )
+from .gemm_util import _buffer_load, _make_buffer_from_addr
 
 
 def scale_view(
@@ -360,7 +359,7 @@ def gemm2_compute_v2(
         return out
 
     # Stream B weights and scales through registers so use_nt reaches the ISA cache policy.
-    bq_rsrc = buffer_ops.create_buffer_resource_from_addr(arg_bq)
+    bq_buffer = _make_buffer_from_addr(arg_bq, fx.Int32, 4)
 
     bq_base_dw = [
         rocdl.readfirstlane(
@@ -401,13 +400,28 @@ def gemm2_compute_v2(
                     load_mask = (col < N_real) & (
                         kt_rt * fx.Int32(kHalves) + fx.Int32(half) < halves_real
                     )
-                bq_vec = buffer_ops.buffer_load(
-                    bq_rsrc,
-                    bq_off_dw,
-                    vec_width=4,
-                    dtype=T.i32,
-                    mask=load_mask,
+                safe_bq_off_dw = (
+                    load_mask.select(bq_off_dw, fx.Int32(0))
+                    if load_mask is not None
+                    else bq_off_dw
+                )
+                loaded_bq = _buffer_load(
+                    bq_buffer,
+                    safe_bq_off_dw // fx.Int32(4),
+                    fx.Int32,
+                    4,
                     cache_modifier=2 if use_nt else 0,
+                )
+                bq_vec = (
+                    fx.Vector.from_elements(
+                        [
+                            load_mask.select(loaded_bq[i], fx.Int32(0))
+                            for i in range_constexpr(4)
+                        ],
+                        fx.Int32,
+                    )
+                    if load_mask is not None
+                    else loaded_bq
                 )
                 bqf[j][half].store(Vec(bq_vec))
         chunk_kt = (

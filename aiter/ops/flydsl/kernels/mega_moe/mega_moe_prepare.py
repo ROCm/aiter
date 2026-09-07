@@ -11,8 +11,8 @@ from flydsl.expr.typing import T
 from flydsl.expr.typing import Vector as Vec
 from flydsl.runtime.device import get_rocm_arch
 
-from .. import buffer_ops
 from .. import communication_ops_utils as comm_ops
+from ..tensor_shim import ptr_buf_tensor
 from ..tensor_shim import _preload_compiled, _run_compiled
 from .dispatch import DispatchSlot, emit_dispatch_group, emit_dispatch_plan
 from .gemm_util import _buffer_load, _buffer_store, _make_buffer_from_addr
@@ -125,11 +125,9 @@ def compile_mega_moe_prepare(
 
         if const_expr(quant_blocks > 0):  # noqa: SIM102 - preserve DSL staging
             if quant_producer:
-                quant_in = buffer_ops.create_buffer_resource_from_addr(addr_quant_in)
-                quant_out = buffer_ops.create_buffer_resource_from_addr(addr_quant_out)
-                quant_scale = buffer_ops.create_buffer_resource_from_addr(
-                    addr_quant_scale
-                )
+                quant_in = ptr_buf_tensor(addr_quant_in, fx.Int32, unit_elems=4)
+                quant_out = ptr_buf_tensor(addr_quant_out, fx.Int32, unit_elems=4)
+                quant_scale = ptr_buf_tensor(addr_quant_scale, fx.Uint8)
                 scale_dim = model_dim // 32
                 total_groups = i32_cur_tok * fx.Int32(scale_dim)
                 group_stride = fx.Int32(quant_blocks * block_threads)

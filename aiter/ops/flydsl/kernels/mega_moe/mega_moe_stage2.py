@@ -9,15 +9,13 @@ from flydsl.expr import const_expr, range_constexpr, rocdl
 from flydsl.expr.typing import Int8, T
 from flydsl.runtime.device import get_rocm_arch
 
-from aiter.ops.flydsl.kernels import buffer_ops
-
 from ..mxfp4_gemm_common import _fabs_f32 as fabs_f32
 from ..mxfp4_gemm_common import (
     global_typed_ptr,
     lds_typed_ptr,
     lds_vec_load,
 )
-from ..tensor_shim import _preload_compiled, _run_compiled
+from ..tensor_shim import _preload_compiled, _run_compiled, ptr_buf_tensor
 
 from .gemm2 import (
     _resolve_g2_knobs,
@@ -26,6 +24,7 @@ from .gemm2 import (
     issue_a_load_lds_dt,
     kStages,
 )
+from .gemm_util import _buffer_store, _make_buffer_from_addr
 
 _BUFFER_OFFSET_ABI_BYTES = 1 << 31
 
@@ -129,7 +128,6 @@ def p2p_scatter_epilog(lds_acc_base, accm, n_block_idx, wave, lane, *, N_OUT, BM
             )
         )
         peer_base = rocdl.readfirstlane(T.i64, peer_base.ir_value())
-        rsrc_dst = buffer_ops.create_buffer_resource_from_addr(peer_base, num_records_bytes=comb_inp_nbytes)
         slot = dest_lid * fx.Int32(topk) + s
         row_base = slot * fx.Int32(token_nbytes)
         row_off = row_base + n_block_idx * fx.Int32(BN * out_elem_bytes)
@@ -223,11 +221,19 @@ def p2p_scatter_epilog(lds_acc_base, accm, n_block_idx, wave, lane, *, N_OUT, BM
                 fx.Int32(comb_inp_nbytes),
             )
             # Adjacent active lanes issue contiguous 8-byte stores without ds_bpermute gathers.
-            buffer_ops.buffer_store(
-                payload.ir_value(),
-                rsrc_dst,
-                payload_off,
-                offset_is_bytes=True,
+            payload_words = scatter_vec // 4
+            payload_buf = _make_buffer_from_addr(
+                peer_base,
+                fx.Int32,
+                payload_words,
+                num_records_bytes=comb_inp_nbytes,
+            )
+            _buffer_store(
+                payload_buf,
+                payload_off // fx.Int32(scatter_vec),
+                payload,
+                fx.Int32,
+                payload_words,
                 cache_modifier=2,
             )
 
@@ -241,11 +247,16 @@ def p2p_scatter_epilog(lds_acc_base, accm, n_block_idx, wave, lane, *, N_OUT, BM
                         + lane // fx.Int32(scale_group_lanes),
                         fx.Int32(comb_inp_nbytes),
                     )
-                    buffer_ops.buffer_store(
-                        e8m0.to(fx.Int8),
-                        rsrc_dst,
+                    scale_buf = _make_buffer_from_addr(
+                        peer_base,
+                        fx.Int8,
+                        num_records_bytes=comb_inp_nbytes,
+                    )
+                    _buffer_store(
+                        scale_buf,
                         scale_off,
-                        offset_is_bytes=True,
+                        e8m0.to(fx.Int8),
+                        fx.Int8,
                         cache_modifier=2,
                     )
 
@@ -255,11 +266,18 @@ def p2p_scatter_epilog(lds_acc_base, accm, n_block_idx, wave, lane, *, N_OUT, BM
                 row_off + col * fx.Int32(out_elem_bytes),
                 fx.Int32(comb_inp_nbytes),
             )
-            buffer_ops.buffer_store(
-                pk.ir_value(),
-                rsrc_dst,
-                off,
-                offset_is_bytes=True,
+            output_buf = _make_buffer_from_addr(
+                peer_base,
+                fx.BFloat16,
+                scatter_vec,
+                num_records_bytes=comb_inp_nbytes,
+            )
+            _buffer_store(
+                output_buf,
+                off // fx.Int32(scatter_vec * 2),
+                pk,
+                fx.BFloat16,
+                scatter_vec,
                 cache_modifier=2,
             )
 
@@ -372,35 +390,26 @@ def compile_mega_moe_stage2(*, model_dim: int, inter_dim: int, experts: int, top
         num_n_blocks = fx.Int32(i32_hidden) // fx.Int32(BN)
         k_bytes = fx.Int32(i32_inter) // fx.Int32(1 if is_f8 else 2)
         # kernel-invariant scatter resources + peer-base table (loaded into registers once).
-        trb_rsrc = buffer_ops.create_buffer_resource_from_addr(arg_trb)
-        eids_rsrc = buffer_ops.create_buffer_resource_from_addr(arg_eids)
-        r_stids = buffer_ops.create_buffer_resource_from_addr(arg_stids)
-        r_sweights = buffer_ops.create_buffer_resource_from_addr(arg_sweights)
+        trb_buf = ptr_buf_tensor(arg_trb, fx.Int32)
+        eids_buf = ptr_buf_tensor(arg_eids, fx.Int32)
+        stids_buf = ptr_buf_tensor(arg_stids, fx.Int32)
+        sweights_buf = ptr_buf_tensor(arg_sweights, fx.Float32)
         skip_base_a = fx.Int32(0)
         skip_base_b = fx.Int32(0)
         skip_rows = fx.Int32(0)
         if const_expr(runtime_pair_skip):
-            pair_config = buffer_ops.create_buffer_resource_from_addr(arg_pair_config)
-            parity_rsrc = buffer_ops.create_buffer_resource_from_addr(arg_parity)
-            active_parity = buffer_ops.buffer_load(
-                parity_rsrc, fx.Int32(0), vec_width=1, dtype=fx.Int32
-            )
-            packed_pair = buffer_ops.buffer_load(
-                pair_config,
-                active_parity * fx.Int32(npes) + fx.Int32(rank),
-                vec_width=1,
-                dtype=fx.Int32,
-            )
+            pair_config = ptr_buf_tensor(arg_pair_config, fx.Int32)
+            parity_buf = ptr_buf_tensor(arg_parity, fx.Int32)
+            active_parity = parity_buf[fx.Int32(0)]
+            packed_pair = pair_config[
+                active_parity * fx.Int32(npes) + fx.Int32(rank)
+            ]
             fx.rocdl.s_waitcnt(0)
             pair_enabled = (packed_pair & fx.Int32(1 << 16)) != fx.Int32(0)
             skip_a = packed_pair & fx.Int32(0xFF)
             skip_b = packed_pair.shrui(fx.Int32(8)) & fx.Int32(0xFF)
-            expert_tile_end = buffer_ops.create_buffer_resource_from_addr(
-                arg_expert_tile_end
-            )
-            count_matrix = buffer_ops.create_buffer_resource_from_addr(
-                arg_count_matrix
-            )
+            expert_tile_end = ptr_buf_tensor(arg_expert_tile_end, fx.Int32)
+            count_matrix = ptr_buf_tensor(arg_count_matrix, fx.Int32)
             skip_base_a_lane = fx.Int32(0)
             skip_base_b_lane = fx.Int32(0)
             skip_rows_lane = fx.Int32(0)
@@ -411,12 +420,8 @@ def compile_mega_moe_stage2(*, model_dim: int, inter_dim: int, experts: int, top
                 safe_prev_b = (skip_b > fx.Int32(0)).select(
                     skip_b - fx.Int32(1), fx.Int32(0)
                 )
-                prev_a = buffer_ops.buffer_load(
-                    expert_tile_end, safe_prev_a, vec_width=1, dtype=fx.Int32
-                ) * fx.Int32(SBM)
-                prev_b = buffer_ops.buffer_load(
-                    expert_tile_end, safe_prev_b, vec_width=1, dtype=fx.Int32
-                ) * fx.Int32(SBM)
+                prev_a = expert_tile_end[safe_prev_a] * fx.Int32(SBM)
+                prev_b = expert_tile_end[safe_prev_b] * fx.Int32(SBM)
                 skip_base_a_lane = (skip_a > fx.Int32(0)).select(
                     prev_a, fx.Int32(0)
                 )
@@ -426,12 +431,9 @@ def compile_mega_moe_stage2(*, model_dim: int, inter_dim: int, experts: int, top
                 group_count = fx.Int32(0)
                 group_column = fx.Int32(_total_experts + rank)
                 for source in range_constexpr(npes):
-                    group_count = group_count + buffer_ops.buffer_load(
-                        count_matrix,
-                        fx.Int32(source * _total_segments) + group_column,
-                        vec_width=1,
-                        dtype=fx.Int32,
-                    )
+                    group_count = group_count + count_matrix[
+                        fx.Int32(source * _total_segments) + group_column
+                    ]
                 skip_rows_lane = (
                     (group_count + fx.Int32(SBM - 1)) // fx.Int32(SBM)
                 ) * fx.Int32(SBM)
@@ -442,11 +444,9 @@ def compile_mega_moe_stage2(*, model_dim: int, inter_dim: int, experts: int, top
                 rocdl.readfirstlane(T.i32, skip_base_b_lane)
             )
             skip_rows = fx.Int32(rocdl.readfirstlane(T.i32, skip_rows_lane))
-        _r_p2p_tbl = buffer_ops.create_buffer_resource_from_addr(arg_p2p_comb_inp)
+        p2p_table = ptr_buf_tensor(arg_p2p_comb_inp, fx.Int64)
         if tx_i32 < fx.Int32(npes):
-            peer_base = buffer_ops.buffer_load(
-                _r_p2p_tbl, tx_i32, vec_width=1, dtype=fx.Int64
-            )
+            peer_base = p2p_table[tx_i32]
             fx.ptr_store(
                 peer_base,
                 lds_typed_ptr(
@@ -467,17 +467,13 @@ def compile_mega_moe_stage2(*, model_dim: int, inter_dim: int, experts: int, top
             sort_block_idx = m_row // fx.Int32(SBM)
             row_in_sort_block = m_row - sort_block_idx * fx.Int32(SBM)
             srcmap_row_base = (
-                buffer_ops.buffer_load(trb_rsrc, sort_block_idx, vec_width=1, dtype=fx.Int32)
+                trb_buf[sort_block_idx]
                 + row_in_sort_block
             )
             if tx_i32 < fx.Int32(BM):
                 sorted_pos = srcmap_row_base + tx_i32
-                packed = buffer_ops.buffer_load(
-                    r_stids, sorted_pos, vec_width=1, dtype=fx.Int32
-                )
-                weight = buffer_ops.buffer_load(
-                    r_sweights, sorted_pos, vec_width=1, dtype=fx.Float32
-                )
+                packed = stids_buf[sorted_pos]
+                weight = sweights_buf[sorted_pos]
                 fx.ptr_store(
                     packed,
                     lds_typed_ptr(
@@ -512,12 +508,7 @@ def compile_mega_moe_stage2(*, model_dim: int, inter_dim: int, experts: int, top
             skip = fx.Int32(0)
             if const_expr(runtime_pair_skip):
                 m_row = m_block_idx * fx.Int32(BM)
-                expert = buffer_ops.buffer_load(
-                    eids_rsrc,
-                    m_row // fx.Int32(SBM),
-                    vec_width=1,
-                    dtype=fx.Int32,
-                )
+                expert = eids_buf[m_row // fx.Int32(SBM)]
                 in_a = (
                     pair_enabled
                     & (expert == fx.Int32(_expert_offset) + skip_a)

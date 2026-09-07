@@ -88,7 +88,8 @@ def ptr_buf_tensor(
         address_space=fx.AddressSpace.Global,
         alignment=unit_elems * (elem.width // 8),
     )
-    view = fx.make_view(fx.inttoptr(pt, fx.Int64(ptrtoint(ptr))), layout)
+    address = fx.Int64(ptrtoint(ptr)) if isinstance(ptr, fx.Pointer) else fx.Int64(ptr)
+    view = fx.make_view(fx.inttoptr(pt, address), layout)
     return fx.rocdl.make_buffer_tensor(view, num_records_bytes=num_records_bytes)
 
 

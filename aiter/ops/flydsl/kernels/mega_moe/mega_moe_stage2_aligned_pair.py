@@ -16,17 +16,16 @@ from flydsl.expr import range_constexpr, rocdl
 from flydsl.expr.typing import Int8, T
 from flydsl.runtime.device import get_rocm_arch
 
-from aiter.ops.flydsl.kernels import buffer_ops
-
 from ..mxfp4_gemm_common import _fabs_f32 as fabs_f32
 from ..mxfp4_gemm_common import lds_typed_ptr, lds_vec_load
-from ..tensor_shim import _preload_compiled, _run_compiled
+from ..tensor_shim import _preload_compiled, _run_compiled, ptr_buf_tensor
 from .gemm2 import (
     _resolve_g2_knobs,
     gemm2_compute_v2,
     issue_a_load_lds_dt,
     kStages,
 )
+from .gemm_util import _buffer_store, _make_buffer_from_addr
 from .mega_moe_stage2 import (
     _fp8_scale_for_leader,
     _stage2_lds_bytes,
@@ -104,8 +103,10 @@ def _pair_routewise_half_scatter(lds_a, lds_b, n_block_idx, wave, lane, *,
                 )
             )
         )
-        destination = buffer_ops.create_buffer_resource_from_addr(
+        payload_buf = _make_buffer_from_addr(
             peer_base,
+            fx.Int32,
+            ALIGNED_PAIR_SCATTER_VEC // 4,
             num_records_bytes=comb_inp_nbytes,
         )
         row_base = (dest_lid * fx.Int32(topk) + slot) * fx.Int32(
@@ -176,11 +177,12 @@ def _pair_routewise_half_scatter(lds_a, lds_b, n_block_idx, wave, lane, *,
             row_base + n_block_idx * fx.Int32(BN) + col,
             fx.Int32(comb_inp_nbytes),
         )
-        buffer_ops.buffer_store(
-            payload.ir_value(),
-            destination,
-            payload_off,
-            offset_is_bytes=True,
+        _buffer_store(
+            payload_buf,
+            payload_off // fx.Int32(ALIGNED_PAIR_SCATTER_VEC),
+            payload,
+            fx.Int32,
+            ALIGNED_PAIR_SCATTER_VEC // 4,
             cache_modifier=2,
         )
 
@@ -194,11 +196,16 @@ def _pair_routewise_half_scatter(lds_a, lds_b, n_block_idx, wave, lane, *,
                     + half_lane // fx.Int32(scale_group_lanes),
                     fx.Int32(comb_inp_nbytes),
                 )
-                buffer_ops.buffer_store(
-                    e8m0.to(fx.Int8),
-                    destination,
+                scale_buf = _make_buffer_from_addr(
+                    peer_base,
+                    fx.Int8,
+                    num_records_bytes=comb_inp_nbytes,
+                )
+                _buffer_store(
+                    scale_buf,
                     scale_off,
-                    offset_is_bytes=True,
+                    e8m0.to(fx.Int8),
+                    fx.Int8,
                     cache_modifier=2,
                 )
 
@@ -292,21 +299,14 @@ def compile_mega_moe_stage2_aligned_pair(*, model_dim: int, inter_dim: int,
         lds_compute = fx.Int32(fx.ptrtoint(lds.buf.ptr))
         lds_compute_b = lds_compute + fx.Int32(second_compute_off)
 
-        expert_tile_end = buffer_ops.create_buffer_resource_from_addr(
-            arg_expert_tile_end
-        )
-        count_matrix = buffer_ops.create_buffer_resource_from_addr(arg_count_matrix)
-        pair_config = buffer_ops.create_buffer_resource_from_addr(arg_pair_config)
-        parity_rsrc = buffer_ops.create_buffer_resource_from_addr(arg_parity)
-        active_parity = buffer_ops.buffer_load(
-            parity_rsrc, fx.Int32(0), vec_width=1, dtype=fx.Int32
-        )
-        packed_pair = buffer_ops.buffer_load(
-            pair_config,
-            active_parity * fx.Int32(npes) + fx.Int32(rank),
-            vec_width=1,
-            dtype=fx.Int32,
-        )
+        expert_tile_end = ptr_buf_tensor(arg_expert_tile_end, fx.Int32)
+        count_matrix = ptr_buf_tensor(arg_count_matrix, fx.Int32)
+        pair_config = ptr_buf_tensor(arg_pair_config, fx.Int32)
+        parity_buf = ptr_buf_tensor(arg_parity, fx.Int32)
+        active_parity = parity_buf[fx.Int32(0)]
+        packed_pair = pair_config[
+            active_parity * fx.Int32(npes) + fx.Int32(rank)
+        ]
         fx.rocdl.s_waitcnt(0)
         # Every lane loads the same entry; broadcasting a lane-0 SSA value
         # after divergent control flow can select the wrong experts.
@@ -332,12 +332,8 @@ def compile_mega_moe_stage2_aligned_pair(*, model_dim: int, inter_dim: int,
             safe_prev_b = (pair_b_rt > fx.Int32(0)).select(
                 pair_b_rt - fx.Int32(1), fx.Int32(0)
             )
-            prev_a = buffer_ops.buffer_load(
-                expert_tile_end, safe_prev_a, vec_width=1, dtype=fx.Int32
-            ) * fx.Int32(SBM)
-            prev_b = buffer_ops.buffer_load(
-                expert_tile_end, safe_prev_b, vec_width=1, dtype=fx.Int32
-            ) * fx.Int32(SBM)
+            prev_a = expert_tile_end[safe_prev_a] * fx.Int32(SBM)
+            prev_b = expert_tile_end[safe_prev_b] * fx.Int32(SBM)
             group_a_lane = (pair_a_rt > fx.Int32(0)).select(
                 prev_a, fx.Int32(0)
             )
@@ -347,12 +343,9 @@ def compile_mega_moe_stage2_aligned_pair(*, model_dim: int, inter_dim: int,
             group_count = fx.Int32(0)
             group_column = fx.Int32(total_experts + rank)
             for source in range_constexpr(npes):
-                group_count = group_count + buffer_ops.buffer_load(
-                    count_matrix,
-                    fx.Int32(source * total_segments) + group_column,
-                    vec_width=1,
-                    dtype=fx.Int32,
-                )
+                group_count = group_count + count_matrix[
+                    fx.Int32(source * total_segments) + group_column
+                ]
             group_rows_lane = pair_enabled.select((
                 (group_count + fx.Int32(SBM - 1)) // fx.Int32(SBM)
             ) * fx.Int32(SBM), fx.Int32(0))
@@ -360,11 +353,9 @@ def compile_mega_moe_stage2_aligned_pair(*, model_dim: int, inter_dim: int,
         group_b = fx.Int32(rocdl.readfirstlane(T.i32, group_b_lane))
         group_rows = fx.Int32(rocdl.readfirstlane(T.i32, group_rows_lane))
         total_m_blocks = group_rows // fx.Int32(BM)
-        peer_table = buffer_ops.create_buffer_resource_from_addr(arg_p2p_comb_inp)
+        peer_table = ptr_buf_tensor(arg_p2p_comb_inp, fx.Int64)
         if tx < fx.Int32(npes):
-            peer = buffer_ops.buffer_load(
-                peer_table, tx, vec_width=1, dtype=fx.Int64
-            )
+            peer = peer_table[tx]
             fx.ptr_store(
                 peer,
                 lds_typed_ptr(
@@ -382,8 +373,8 @@ def compile_mega_moe_stage2_aligned_pair(*, model_dim: int, inter_dim: int,
         iterations = (
             remaining + fx.Int32(cu_num - 1)
         ) // fx.Int32(cu_num)
-        stids = buffer_ops.create_buffer_resource_from_addr(arg_stids)
-        sweights = buffer_ops.create_buffer_resource_from_addr(arg_sweights)
+        stids = ptr_buf_tensor(arg_stids, fx.Int32)
+        sweights = ptr_buf_tensor(arg_sweights, fx.Float32)
 
         def issue_all_a_loads(m_row, lds_base):
             for slot in range_constexpr(kStages):
@@ -403,18 +394,10 @@ def compile_mega_moe_stage2_aligned_pair(*, model_dim: int, inter_dim: int,
 
         def load_metadata(m_row_a, m_row_b):
             if tx < fx.Int32(BM):
-                packed_a = buffer_ops.buffer_load(
-                    stids, m_row_a + tx, vec_width=1, dtype=fx.Int32
-                )
-                packed_b = buffer_ops.buffer_load(
-                    stids, m_row_b + tx, vec_width=1, dtype=fx.Int32
-                )
-                weight_a = buffer_ops.buffer_load(
-                    sweights, m_row_a + tx, vec_width=1, dtype=fx.Float32
-                )
-                weight_b = buffer_ops.buffer_load(
-                    sweights, m_row_b + tx, vec_width=1, dtype=fx.Float32
-                )
+                packed_a = stids[m_row_a + tx]
+                packed_b = stids[m_row_b + tx]
+                weight_a = sweights[m_row_a + tx]
+                weight_b = sweights[m_row_b + tx]
                 fx.ptr_store(
                     packed_a,
                     lds_typed_ptr(
