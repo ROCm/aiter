@@ -274,6 +274,18 @@ def oob_is_neginf(out, rb, ls, le):
     return bool(torch.isneginf(out[~inside]).all().item())
 
 
+def window_is_written(out, ls, le):
+    """Every cell inside [local_start, local_end) must have been stored to.
+
+    `max_err` would also catch a dropped token -- an in-window -inf makes the relative
+    error infinite -- but only on the rows `sample_rows` happened to pick, so it stops
+    being a guard as soon as a case has more rows than that. This scans every row.
+    """
+    col = torch.arange(out.shape[1], device=out.device).unsqueeze(0)
+    inside = (col >= ls.unsqueeze(1)) & (col < le.unsqueeze(1))
+    return bool(torch.isfinite(out[inside]).all().item())
+
+
 def sample_rows(total, le, n=N_COS_SAMPLE, seed=0):
     nonempty = torch.nonzero(le > 0).flatten().tolist()
     if not nonempty:
@@ -358,8 +370,12 @@ def flydsl_decode(inp, ctx, batch, next_n, block_k):
 
 
 # ── correctness ───────────────────────────────────────────────────────────────
-def check_prefill(bs, windows_per_batch, seed, block_k, label):
-    """One ragged-prefill case: explicit per-row (start, end) windows, random data."""
+def check_prefill(bs, windows_per_batch, seed, block_k, label, cross_flydsl=True):
+    """One ragged-prefill case: explicit per-row (start, end) windows, random data.
+
+    `cross_flydsl=False` drops the second opinion for windows FlyDSL itself gets wrong --
+    see the unaligned-start cases in `run_corner`.
+    """
     qlens = [len(w) for w in windows_per_batch]
     total_q = sum(qlens)
     max_end = max(e for w in windows_per_batch for (_, e) in w)
@@ -385,9 +401,10 @@ def check_prefill(bs, windows_per_batch, seed, block_k, label):
     rows = sample_rows(total_q, le, seed=seed)
     err = max_err(out, ref_rows(inp, rows, rb, ls, le))
     oob = oob_is_neginf(out, rb, ls, le)
+    wr = window_is_written(out, ls, le)
 
     fly_err = float("nan")
-    fly = flydsl_prefill(inp, rb, ls, le, total_q, block_k)
+    fly = flydsl_prefill(inp, rb, ls, le, total_q, block_k) if cross_flydsl else None
     if fly is not None:
         out_f = fly()
         torch.cuda.synchronize()
@@ -396,9 +413,9 @@ def check_prefill(bs, windows_per_batch, seed, block_k, label):
         scale = out[m].abs().max().clamp(min=1e-6)
         fly_err = ((out[m] - out_f[m]).abs().max() / scale).item()
 
-    ok = err < 2e-5 and oob and (math.isnan(fly_err) or fly_err < 2e-5)
+    ok = err < 2e-5 and oob and wr and (math.isnan(fly_err) or fly_err < 2e-5)
     print(f"  [{'PASS' if ok else 'FAIL'}] {label:<34} bk={block_k:3d} "
-          f"err={err:.2e} vs_flydsl={fly_err:.2e} oob_neginf={oob}")  # fmt: skip
+          f"err={err:.2e} vs_flydsl={fly_err:.2e} oob={oob} written={wr}")  # fmt: skip
     return ok
 
 
@@ -440,9 +457,10 @@ def check_decode(bs, next_n, context_lens, seed, block_k, label, local_ends=None
     rows = sample_rows(total_q, le, seed=seed)
     err = max_err(out, ref_rows(inp, rows, rb, ls, le))
     oob = oob_is_neginf(out, rb, ls, le)
-    ok = err < 2e-5 and oob
+    wr = window_is_written(out, ls, le)
+    ok = err < 2e-5 and oob and wr
     print(f"  [{'PASS' if ok else 'FAIL'}] {label:<34} bk={block_k:3d} "
-          f"err={err:.2e} oob_neginf={oob}")  # fmt: skip
+          f"err={err:.2e} oob={oob} written={wr}")  # fmt: skip
     return ok
 
 
@@ -469,6 +487,24 @@ def run_corner():
         # MFMA_N=32 alignment: windows that end mid-tile in every residue class
         oks.append(check_prefill(1, [[(0, 32 * 3 + r) for r in range(1, 9)]],
                                  7, block_k, "mid-tile ends"))  # fmt: skip
+        # Window starts whose byte address is not 16 B aligned. The out store folds
+        # local_start into the base, which is the shape
+        # `KNOWN_ISSUE_out_store_alignment.md` (opus-ops) reports dropping the leading
+        # (4 - start%4) % 4 in-window tokens on. Width 40 and starts past 16 are that
+        # doc's own experiment; it calls the sub-16 region an incidental exemption not to
+        # be relied on, so both are covered. `max_err` catches a dropped token (an
+        # in-window -inf makes it infinite) and `oob_is_neginf` catches the opposite
+        # failure, a store leaking past the window.
+        #
+        # No FlyDSL second opinion: at num_warps=1 it exhibits exactly that bug, dropping
+        # (4 - start%4) % 4 leading cells, so it cannot serve as a reference here. The
+        # dequantized CPU reference still scores every row.
+        oks.append(check_prefill(1, [[(s, s + 40) for s in (17, 18, 19, 20, 33, 34, 35, 36)]],
+                                 12, block_k, "unaligned starts >= 16",
+                                 cross_flydsl=False))  # fmt: skip
+        oks.append(check_prefill(1, [[(s, s + 40) for s in (1, 2, 3, 5, 6, 7, 9, 13)]],
+                                 13, block_k, "unaligned starts < 16",
+                                 cross_flydsl=False))  # fmt: skip
         # decode: pure decode, MTP, and a context at a tile boundary
         oks.append(check_decode(2, 1, [128, 200], 8, block_k, "decode next_n=1"))
         oks.append(
