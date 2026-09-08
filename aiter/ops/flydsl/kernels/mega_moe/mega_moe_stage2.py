@@ -26,7 +26,6 @@ from .gemm2 import (
     issue_a_load_lds_dt,
     kStages,
 )
-from .gemm_util import _buffer_load, _make_buffer_from_addr
 
 _BUFFER_OFFSET_ABI_BYTES = 1 << 31
 
@@ -352,12 +351,14 @@ def compile_mega_moe_stage2(*, model_dim: int, inter_dim: int, experts: int, top
         num_n_blocks = fx.Int32(i32_hidden) // fx.Int32(BN)
         k_bytes = fx.Int32(i32_inter) // fx.Int32(1 if is_f8 else 2)
         # kernel-invariant scatter resources + peer-base table (loaded into registers once).
-        trb_rsrc = _make_buffer_from_addr(arg_trb, fx.Int32, 1)
-        r_stids = _make_buffer_from_addr(arg_stids, fx.Int32, 1)
-        r_sweights = _make_buffer_from_addr(arg_sweights, fx.Float32, 1)
-        _r_p2p_tbl = _make_buffer_from_addr(arg_p2p_comb_inp, fx.Int64, 1)
+        trb_rsrc = buffer_ops.create_buffer_resource_from_addr(arg_trb)
+        r_stids = buffer_ops.create_buffer_resource_from_addr(arg_stids)
+        r_sweights = buffer_ops.create_buffer_resource_from_addr(arg_sweights)
+        _r_p2p_tbl = buffer_ops.create_buffer_resource_from_addr(arg_p2p_comb_inp)
         if tx_i32 < fx.Int32(npes):
-            peer_base = _buffer_load(_r_p2p_tbl, tx_i32, fx.Int64, 1)
+            peer_base = buffer_ops.buffer_load(
+                _r_p2p_tbl, tx_i32, vec_width=1, dtype=fx.Int64
+            )
             fx.ptr_store(
                 peer_base,
                 lds_typed_ptr(
@@ -378,12 +379,17 @@ def compile_mega_moe_stage2(*, model_dim: int, inter_dim: int, experts: int, top
             sort_block_idx = m_row // fx.Int32(SBM)
             row_in_sort_block = m_row - sort_block_idx * fx.Int32(SBM)
             srcmap_row_base = (
-                _buffer_load(trb_rsrc, sort_block_idx, fx.Int32, 1) + row_in_sort_block
+                buffer_ops.buffer_load(trb_rsrc, sort_block_idx, vec_width=1, dtype=fx.Int32)
+                + row_in_sort_block
             )
             if tx_i32 < fx.Int32(BM):
                 sorted_pos = srcmap_row_base + tx_i32
-                packed = _buffer_load(r_stids, sorted_pos, fx.Int32, 1)
-                weight = _buffer_load(r_sweights, sorted_pos, fx.Float32, 1)
+                packed = buffer_ops.buffer_load(
+                    r_stids, sorted_pos, vec_width=1, dtype=fx.Int32
+                )
+                weight = buffer_ops.buffer_load(
+                    r_sweights, sorted_pos, vec_width=1, dtype=fx.Float32
+                )
                 fx.ptr_store(
                     packed,
                     lds_typed_ptr(
