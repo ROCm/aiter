@@ -277,10 +277,7 @@ def test_gemm_afp4_wfp4(
 
 
 def get_splitk_x_vals():
-    # Decode-shaped (small M) GEMMs whose tuned gfx950 configs select
-    # NUM_KSPLIT > 1. K is varied because the bug this covers scaled with K:
-    # a split slice was sized in elements while the kernel indexed in packed
-    # bytes, so the second half of the splits read past the end of x_fp4.
+    # Decode GEMMs whose tuned gfx950 configs select NUM_KSPLIT > 1
     return [
         (1, 10240, 8192),
         (16, 8192, 28672),
@@ -294,19 +291,6 @@ def get_splitk_x_vals():
 @pytest.mark.parametrize("M, N, K", get_splitk_x_vals())
 @pytest.mark.parametrize("num_ksplit", [2, 4, 8])
 def test_gemm_afp4_wfp4_preshuffle_splitk(M: int, N: int, K: int, num_ksplit: int):
-    """Cover the preshuffled split-K path against a torch reference.
-
-    NUM_KSPLIT is forced rather than taken from the tuned config so the
-    coverage cannot silently lapse if these shapes are re-tuned to
-    NUM_KSPLIT=1 -- which is how the element-vs-packed-byte K bug reached
-    users: no shape in get_x_vals() resolved to a tuned preshuffled config
-    with split-K, so the whole path was untested.
-
-    Note this manifests as a GPU memory access fault (i.e. the pytest worker
-    dies) rather than an assert_close failure, unless the out-of-bounds reads
-    happen to land in mapped memory, in which case the accumulation is
-    silently wrong and assert_close catches it.
-    """
     dtype = torch.bfloat16
     (
         x,
