@@ -4,6 +4,7 @@
 """Grouped contiguous-M A8W4 preshuffle MoE GEMM for gfx1250 (TDM pipeline)."""
 
 import math
+import os
 from collections import namedtuple
 
 import flydsl.compiler as flyc
@@ -41,6 +42,7 @@ from .tensor_shim import (
 )
 
 TDM_DESCRIPTOR_VERSION = 1
+AITER_FLYDSL_SPLIT_ACT = int(os.environ.get("AITER_FLYDSL_SPLIT_ACT", "0"))
 
 
 @flyc.jit
@@ -83,6 +85,7 @@ def launch_gemm_a8w4_tdm(
     arg_ep_row_map: fx.Tensor = None,
     f32_situ_beta: fx.Float32 = 1.0,
     f32_situ_linear_beta: fx.Float32 = 1.0,
+    split_act: Constexpr[int] = AITER_FLYDSL_SPLIT_ACT,
 ):
     """Launch the grouped contiguous-M a8w4 MoE GEMM for gfx1250.
 
@@ -146,6 +149,7 @@ def launch_gemm_a8w4_tdm(
         ep_slot_stride_bytes,
         ep_destination_stride,
         ep_world_size,
+        split_act,
     )
     _ = cache_tag
     if enable_ep_scatter:
@@ -723,7 +727,7 @@ def launch_gemm_a8w4_tdm(
             return RmemSlot(
                 a=[
                     fx.make_rmem_tensor(ACT_NDW, fx.Int32)
-                    for _ in range_constexpr(wmma_m_rep)
+                    for _ in range_constexpr(0 if split_act else wmma_m_rep)
                 ],
                 b=[
                     fx.make_rmem_tensor(WMMA_VECTOR_DWORDS, fx.Int32)
@@ -736,9 +740,16 @@ def launch_gemm_a8w4_tdm(
         # Two slots: the k-tile loop is a runtime scf.for, so the tile boundary
         # cannot carry a Python value, and a prefetch needs a slot no WMMA reads.
         rmem_slots = [make_rmem_slot() for _ in range_constexpr(2)]
+        # In split mode an A row is consumed by every N-repetition, then this
+        # shared ping-pong storage can be reused two rows later. It is independent
+        # of the two full weight slots carried across k128/tile boundaries.
+        act_slots = [
+            fx.make_rmem_tensor(ACT_NDW, fx.Int32)
+            for _ in range_constexpr(min(2, wmma_m_rep) if split_act else 0)
+        ]
 
         def load_lds_data(slot, lds_addr, ksl):
-            """Load one k128 from precomputed LDS bases into ``slot``."""
+            """Load one k128, excluding A only in split-activation mode."""
             sb_v = [
                 load_sb(lds_addr.sb, sn, ksl)
                 for sn in range_constexpr(sb_pairs)
@@ -751,11 +762,18 @@ def launch_gemm_a8w4_tdm(
             slot.sa.store(Vec.from_elements(sa_v + sa_v[: SA_WIDTH - sa_pairs]))
             for wn in range_constexpr(wmma_n_rep):
                 slot.b[wn].store(load_b(lds_addr.b, wn, ksl))
-            for wm in range_constexpr(wmma_m_rep):
-                slot.a[wm].store(load_a(lds_addr.a, wm, ksl))
+            if const_expr(not split_act):
+                for wm in range_constexpr(wmma_m_rep):
+                    slot.a[wm].store(load_a(lds_addr.a, wm, ksl))
+
+        def load_act(slot, lds_addr, ksl, wm):
+            """Load one activation row for one quarter of the WMMAs."""
+            slot.store(load_a(lds_addr.a, wm, ksl))
 
         def k_step(
             cur_rmem,
+            lds_addr,
+            ksl,
             next_rmem=None,
             load_nxt_fn=None,
             num_outstanding_tdm=None,
@@ -770,9 +788,27 @@ def launch_gemm_a8w4_tdm(
             if const_expr(load_nxt_fn is not None and not reuse_cur_rmem):
                 load_nxt_fn()
             sa_k, sb_k = cur_rmem.sa.load(), cur_rmem.sb.load()
-            mma_rows(FRONT, cur_rmem.a[:front_wm], cur_rmem.b, sa_k, sb_k)
-            if const_expr(len(BACK) > 0):
-                mma_rows(BACK, cur_rmem.a[front_wm:], cur_rmem.b, sa_k, sb_k)
+            if const_expr(split_act):
+                load_act(act_slots[0], lds_addr, ksl, 0)
+                for wm in range_constexpr(wmma_m_rep):
+                    if const_expr(wm + 1 < wmma_m_rep):
+                        load_act(
+                            act_slots[(wm + 1) % len(act_slots)],
+                            lds_addr,
+                            ksl,
+                            wm + 1,
+                        )
+                    mma_rows(
+                        [wm],
+                        [act_slots[wm % len(act_slots)]],
+                        cur_rmem.b,
+                        sa_k,
+                        sb_k,
+                    )
+            else:
+                mma_rows(FRONT, cur_rmem.a[:front_wm], cur_rmem.b, sa_k, sb_k)
+                if const_expr(len(BACK) > 0):
+                    mma_rows(BACK, cur_rmem.a[front_wm:], cur_rmem.b, sa_k, sb_k)
             if const_expr(reuse_cur_rmem):
                 load_nxt_fn()
 
@@ -784,11 +820,12 @@ def launch_gemm_a8w4_tdm(
             my_jobs=None,
             next_stage_wait=None,
         ):
-            """Compute one k-tile, carrying one k128 of A/B/scales across tiles.
+            """Compute one k-tile, carrying one prefetched k128 across tiles.
 
-            ``rmem_preloaded`` says this tile's subtile-0 A/B/scales are already
-            in rmem slot 0, put there by the previous tile's last k128, so the
-            tile top skips loading them.
+            ``rmem_preloaded`` says this tile's subtile-0 state is already in
+            rmem slot 0, put there by the previous tile's last k128, so the tile
+            top skips loading it. In split mode this state excludes activations,
+            which are loaded row-wise by ``k_step``.
             ``next_stage_buf`` is the next tile's LDS buffer, whose subtile 0 is
             loaded during this tile's last k128 -- so the tile boundary no longer
             exposes those ds_reads. ``next_stage_wait`` is the tensorcnt that fences
@@ -825,13 +862,24 @@ def launch_gemm_a8w4_tdm(
                     ksl + 1 == KWS and next_stage_lds_addr is not None
                 )
                 if const_expr(ksl == 0):
-                    rocdl.sched_dsrd(STATE_DS if not rmem_preloaded else 0)
+                    rocdl.sched_dsrd(
+                        (BS_DS if split_act else STATE_DS)
+                        if not rmem_preloaded
+                        else 0
+                    )
                 mma_total = n_acc - tail_mfma
                 # K256 needs grouping to limit VGPR-bank switches without
                 # turning the complete A/B/scale prefetch into long LDS bursts.
                 mma_group = min(MMA_GROUP, mma_total) if KWS > 1 else 1
                 schedule_slots = mma_total // mma_group
-                future_schedule = spread(STATE_DS if has_next else 0, schedule_slots)
+                future_schedule = spread(
+                    (
+                        wmma_m_rep * DS_A + (BS_DS if has_next else 0)
+                        if split_act
+                        else (STATE_DS if has_next else 0)
+                    ),
+                    schedule_slots,
+                )
                 # Spread the tail issue's TDMs over the WMMA groups: one burst
                 # would block the MFMA pipe for its whole descriptor setup.
                 tdm_schedule = spread(
@@ -870,6 +918,8 @@ def launch_gemm_a8w4_tdm(
                     next_rmem, load_nxt_fn = None, None
                 k_step(
                     rmem_slots[ksl % 2],
+                    lds_addr,
+                    ksl,
                     next_rmem,
                     load_nxt_fn,
                     num_outstanding_tdm=(
