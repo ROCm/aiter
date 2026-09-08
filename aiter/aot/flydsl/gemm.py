@@ -661,18 +661,20 @@ def compile_one_config(
     """Compile one GEMM kernel configuration and save it to cache."""
     from torch._subclasses.fake_tensor import FakeTensorMode
 
-    aot_arch = resolve_job_arch(cu_num, gfx)
     shape_str = f"{kernel_name}  M={m} N={n} K={k}"
     result = {
         "kernel_name": kernel_name,
         "kind": kind,
         "shape": shape_str,
         "compile_time": None,
-        "compile_arch": aot_arch,
+        "compile_arch": None,
     }
 
+    aot_arch = None
     t0 = time.time()
     try:
+        aot_arch = resolve_job_arch(cu_num, gfx)
+        result["compile_arch"] = aot_arch
         tensor_context = nullcontext() if kind == "hgemm" else FakeTensorMode()
         with (
             override_env("FLYDSL_GPU_ARCH", aot_arch),

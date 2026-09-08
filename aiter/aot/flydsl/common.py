@@ -18,7 +18,7 @@ from dataclasses import dataclass
 from multiprocessing.connection import wait as wait_for_sentinels
 from typing import Any
 
-from aiter.jit.utils.gfx_placeholders import GFX_PLACEHOLDERS, LEGACY_CU_NUM_TO_GFX
+from aiter.jit.utils.gfx_placeholders import LEGACY_CU_NUM_TO_GFX, is_missing_gfx
 
 _DEFAULT_KERNEL_TIMEOUT = 1200.0
 _DEFAULT_MAX_WORKERS = 64
@@ -72,9 +72,8 @@ def resolve_job_arch(cu_num: int = 0, gfx: str = "") -> str:
     256 -> gfx950). Unknown or missing values raise rather than inventing
     an architecture.
     """
-    gfx = "" if gfx is None else str(gfx).strip()
-    if gfx and gfx not in GFX_PLACEHOLDERS:
-        return gfx
+    if not is_missing_gfx(gfx):
+        return str(gfx).strip()
     return cu_num_to_arch(cu_num)
 
 
@@ -193,7 +192,18 @@ def _compile_one_config_for(kind: OpKind) -> Callable[..., dict[str, Any]]:
 def _run_one_to_file(
     worker: Callable[..., dict[str, Any]], kwargs: dict[str, Any], out_path: str
 ) -> None:
-    result = worker(**kwargs)
+    try:
+        result = worker(**kwargs)
+    except ValueError as e:
+        # Deterministic row/config errors (unknown gfx, gfx950-only kinds)
+        # must not look like a crashed worker: the pool retries nonzero
+        # exits as OOM/segfaults.
+        print(f"  [FAIL] {e}", flush=True)
+        result = {
+            "kernel_name": kwargs.get("kernel_name", ""),
+            "compile_time": None,
+            "error": str(e),
+        }
     tmp_path = out_path + ".tmp"
     with open(tmp_path, "w") as f:
         json.dump(result, f)

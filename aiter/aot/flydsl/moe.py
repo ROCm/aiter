@@ -1019,7 +1019,6 @@ def compile_one_config(
 
     Returns a dict with timing info.
     """
-    aot_arch = resolve_job_arch(cu_num, gfx)
     is_epilogue = kwargs.get("stage") == "epilogue"
     shape_str = (
         f"{kernel_name}  inter_dim={inter_dim} topk={topk}"
@@ -1034,7 +1033,7 @@ def compile_one_config(
         "kernel_name": kernel_name,
         "shape": shape_str,
         "compile_time": None,
-        "compile_arch": aot_arch,
+        "compile_arch": None,
     }
 
     from torch._subclasses.fake_tensor import FakeTensorMode
@@ -1049,8 +1048,11 @@ def compile_one_config(
         and kwargs.get("b_dtype") in ("fp4", "int4")
     )
 
+    aot_arch = None
     t0 = time.time()
     try:
+        aot_arch = resolve_job_arch(cu_num, gfx)
+        result["compile_arch"] = aot_arch
         if is_a16w_port:
             with override_env("FLYDSL_GPU_ARCH", aot_arch):
                 _precompile_a16w4_to_cache(

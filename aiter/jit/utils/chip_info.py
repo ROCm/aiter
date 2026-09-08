@@ -17,11 +17,11 @@ from torch_guard import torch_compile_guard
 
 try:
     from aiter.jit.utils.gfx_placeholders import (
-        GFX_PLACEHOLDERS,
         LEGACY_CU_NUM_TO_GFX,
+        is_missing_gfx,
     )
 except ImportError:
-    from gfx_placeholders import GFX_PLACEHOLDERS, LEGACY_CU_NUM_TO_GFX
+    from gfx_placeholders import LEGACY_CU_NUM_TO_GFX, is_missing_gfx
 
 logger = logging.getLogger("aiter")
 
@@ -148,10 +148,11 @@ def backfill_dataframe_gfx(df, source: str | None = None):
         df["gfx"] = df["cu_num"].map(gfx_from_cu_num)
         warned = True
     else:
-        gfx_text = df["gfx"].astype(str).str.strip()
-        bad = df["gfx"].isna() | gfx_text.isin(GFX_PLACEHOLDERS)
+        bad = df["gfx"].map(is_missing_gfx)
         if bad.any():
             df = df.copy()
+            # Pandas may have inferred a float gfx column (0.0 / NaN).
+            df["gfx"] = df["gfx"].astype(object)
             df.loc[bad, "gfx"] = df.loc[bad, "cu_num"].map(gfx_from_cu_num)
             warned = True
     if warned and source:

@@ -11,10 +11,10 @@ import pandas as pd
 
 try:
     from aiter.jit.utils.chip_info import (
-        GFX_PLACEHOLDERS,
         backfill_dataframe_gfx,
         reset_legacy_gfx_warnings_for_tests,
     )
+    from aiter.jit.utils.gfx_placeholders import GFX_PLACEHOLDERS
 
     _CHIP_INFO_ERR = None
 except Exception as e:  # noqa: BLE001
@@ -75,15 +75,33 @@ class TestFmoeLegacyGfxLoading(unittest.TestCase):
                 pd.DataFrame({"gfx": ["0"], "cu_num": [128]}), "placeholder.csv"
             )
 
-    def test_load_and_aot_share_placeholder_set(self):
-        from aiter.aot.flydsl.common import GFX_PLACEHOLDERS as aot_placeholders
-        from aiter.aot.flydsl.common import LEGACY_CU_NUM_TO_GFX as aot_cu_map
-        from aiter.jit.utils.chip_info import LEGACY_CU_NUM_TO_GFX as load_cu_map
+    def test_numeric_zero_gfx_is_treated_as_placeholder(self):
+        with self.assertLogs("aiter", level="WARNING"):
+            df = backfill_dataframe_gfx(
+                pd.DataFrame({"gfx": [0.0, float("nan")], "cu_num": [256, 80]}),
+                "pandas-float.csv",
+            )
+        self.assertEqual(list(df["gfx"]), ["gfx950", "gfx942"])
 
-        self.assertIs(GFX_PLACEHOLDERS, aot_placeholders)
-        self.assertIs(load_cu_map, aot_cu_map)
+    def test_load_and_aot_share_placeholder_set(self):
+        from aiter.aot.flydsl.common import LEGACY_CU_NUM_TO_GFX as aot_cu_map
+        from aiter.aot.flydsl.common import is_missing_gfx as aot_missing
+        from aiter.jit.utils.chip_info import LEGACY_CU_NUM_TO_GFX as load_cu_map
+        from aiter.jit.utils.gfx_placeholders import is_missing_gfx as load_missing
+
+        self.assertEqual(load_cu_map, aot_cu_map)
         self.assertIn("0", GFX_PLACEHOLDERS)
         self.assertNotIn(96, load_cu_map)
+        for cell in ("", "0", "0.0", 0, 0.0, "nan", "None", None):
+            self.assertTrue(load_missing(cell), msg=repr(cell))
+            self.assertTrue(aot_missing(cell), msg=repr(cell))
+            if cell is None:
+                continue
+            self.assertEqual(
+                resolve_job_arch(256, cell),
+                "gfx950",
+                msg=repr(cell),
+            )
 
 
 @unittest.skipUnless(
@@ -171,7 +189,7 @@ class TestAotFamilyTunedCsvsResolveArch(unittest.TestCase):
                     gfx = (row.get("gfx") or "").strip()
                     cu_raw = (row.get("cu_num") or "").strip()
                     try:
-                        cu_num = int(float(cu_raw)) if cu_raw else 0
+                        cu_num = int(cu_raw) if cu_raw else 0
                     except ValueError:
                         failures.append(f"{path}:{i} unparsable cu_num={cu_raw!r}")
                         continue
@@ -211,8 +229,29 @@ class TestFlydslMxfp4MoeAotGfx(unittest.TestCase):
             "cu_num": 80,
             "xcd_swizzle": 0,
         }
-        with self.assertRaisesRegex(ValueError, "gfx950-only"):
-            flydsl_mxfp4_aot.compile_one_config(**job)
+        result = flydsl_mxfp4_aot.compile_one_config(**job)
+        self.assertIsNone(result["compile_time"])
+
+    def test_same_shape_jobs_for_two_gfx_are_not_deduped(self):
+        job_950 = {
+            "stage": 1,
+            "kernel_name": "flydsl_mxmoe_g1_a4w4_16x256x256_f16in_nt",
+            "BM": 16,
+            "use_nt": 2,
+            "inline_quant": 0,
+            "D_HIDDEN": 2048,
+            "D_INTER": 1024,
+            "NE": 8,
+            "topk": 2,
+            "gfx": "gfx950",
+            "cu_num": 256,
+            "xcd_swizzle": 0,
+        }
+        job_1250 = {**job_950, "gfx": "gfx1250"}
+        self.assertNotEqual(
+            flydsl_mxfp4_aot._job_key(job_950),
+            flydsl_mxfp4_aot._job_key(job_1250),
+        )
 
 
 if __name__ == "__main__":

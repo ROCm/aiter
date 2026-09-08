@@ -45,11 +45,18 @@ _STAGE2_FP8_ROUTE_OUT = os.environ.get("AITER_FLYDSL_STAGE2_FP8", "0") == "1"
 
 
 def _job_key(job: dict) -> tuple:
-    """Dedup key == the runtime FlyDSL cache key."""
+    """Dedup key == the runtime FlyDSL cache key plus explicit ``gfx``.
+
+    Architecture is not part of the FlyDSL cache key, but two same-shape rows
+    for different gfx must both reach ``compile_one_config``: mxfp4 AOT is
+    gfx950-only, and silently dropping the other row skips that check.
+    """
+    gfx = job.get("gfx", "")
     if job.get("v2_stage2"):
         return (
             2,
             "layout",
+            gfx,
             job["BM"],
             job["BN"],
             job["BK"],
@@ -71,6 +78,7 @@ def _job_key(job: dict) -> tuple:
     if job["stage"] == 1:
         return (
             1,
+            gfx,
             job["BM"],
             job["use_nt"],
             job["inline_quant"],
@@ -82,6 +90,7 @@ def _job_key(job: dict) -> tuple:
         )
     return (
         2,
+        gfx,
         job["BM"],
         job["use_nt"],
         job["NE"],
@@ -387,11 +396,6 @@ def compile_one_config(**job):
     stage = job["stage"]
     cu_num = int(job.get("cu_num", 0) or 0)
     gfx = (job.get("gfx") or "").strip()
-    aot_arch = resolve_job_arch(cu_num, gfx)
-    if aot_arch != "gfx950":
-        raise ValueError(
-            f"mxfp4 MoE AOT is gfx950-only; row specifies gfx={gfx!r} cu_num={cu_num}"
-        )
     shape_str = (
         f"{job['kernel_name']} NE={job['NE']} D_INTER={job['D_INTER']} BM={job['BM']}"
     )
@@ -401,6 +405,11 @@ def compile_one_config(**job):
 
     t0 = time.time()
     try:
+        aot_arch = resolve_job_arch(cu_num, gfx)
+        if aot_arch != "gfx950":
+            raise ValueError(
+                f"mxfp4 MoE AOT is gfx950-only; row specifies gfx={gfx!r} cu_num={cu_num}"
+            )
         # mxfp4 a4w4 kernels are gfx950-only. In the GPU-free AOT build,
         # get_rocm_arch() detects gfx942 and the gfx950 intrinsics fail to
         # select (LLVM aborts), so pin FLYDSL_GPU_ARCH from the row's gfx.

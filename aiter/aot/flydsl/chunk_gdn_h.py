@@ -305,20 +305,22 @@ def _format_shape_str(job: dict) -> str:
 
 def compile_one_config(*, cu_num: int = 0, gfx: str = "", **kwargs) -> dict:
     """Compile one opt configuration and save it to cache."""
-    aot_arch = resolve_job_arch(cu_num, gfx)
     kwargs.pop("kernel_name", None)
     shape_str = _format_shape_str(kwargs)
     result = {
         "kernel_name": _KERNEL_NAME,
         "shape": shape_str,
         "compile_time": None,
-        "compile_arch": aot_arch,
+        "compile_arch": None,
     }
 
     from torch._subclasses.fake_tensor import FakeTensorMode
 
+    aot_arch = None
     t0 = time.time()
     try:
+        aot_arch = resolve_job_arch(cu_num, gfx)
+        result["compile_arch"] = aot_arch
         with (
             override_env("FLYDSL_GPU_ARCH", aot_arch),
             FakeTensorMode(),
