@@ -2865,43 +2865,51 @@ namespace aiter {
         auto compute_store_tile = [&](int i, int slot, fp32xfntile& v_fn) {
             DTYPE_I* s_x_rd_ptr = s_x + slot * tile_mk;
             DTYPE_I* s_residual_rd_ptr = s_residual + slot * (hc_mult * tile_mk);
+            static constexpr bool batch_lds = decode_pipeline || (mhc_bf16_mma_avail && warp_size == 32 && is_res_w_preshuffle_bf16 && res_shuf && tile_k == 32);
             static constexpr int ds_read_vec = 16 / sizeof(DTYPE_I);
             static constexpr int step = ds_read_vec;
             static constexpr int band_j = band_mk / (warp_size * ds_read_vec);
             // gfx1250 wave32 bf16 needs a 16-K/lane WMMA fragment = two band_j
             // iterations (2 x ds_read_vec) combined; band_j is even for tile_k in {32,64}.
-            for(int b = 0; b < m_repeat; b++) {
-                int s_offset = b * band_mk + lane_id % mfma_m * tile_k + lane_id / mfma_m * vec_tile;
-                [[maybe_unused]] float res_buf[2][ds_read_vec];  // gfx1250 bf16: buffer 2 j's -> 16/lane
-                // Issue both halves of the BF16 fragment before consuming either.
-                // Native LDS loads retain their register dependencies, so the
-                // compiler can wait at use instead of draining to a fixed count.
-                using pref_vec = opus::vector_t<DTYPE_I, ds_read_vec>;
-                pref_vec pref_x[band_j], pref_res[band_j][hc_mult];
-                if constexpr (decode_pipeline) {
+            using pref_vec = opus::vector_t<DTYPE_I, ds_read_vec>;
+            pref_vec pref_x[band_j], pref_res[band_j][hc_mult];
+            auto prefetch_band = [&](int pb) {
+                if constexpr (batch_lds) {
                     for (int pj = 0; pj < band_j; ++pj) {
-                        const int off = s_offset + pj * step;
+                        const int off = pb * band_mk + lane_id % mfma_m * tile_k
+                                      + lane_id / mfma_m * vec_tile + pj * step;
                         pref_x[pj] = *reinterpret_cast<pref_vec*>(s_x_rd_ptr + off);
                         const int kl = off % tile_k;
-                        const int row = b * mfma_m + lane_id % mfma_m;
+                        const int row = pb * mfma_m + lane_id % mfma_m;
                         const int rb = (kl / res_ks) * res_kb_stride_lds + row * res_ks + kl % res_ks;
                         for (int h = 0; h < hc_mult; ++h)
                             pref_res[pj][h] = *reinterpret_cast<pref_vec*>(s_residual_rd_ptr + rb + h * res_h_stride_lds);
                     }
                     __builtin_amdgcn_sched_barrier(0);
                 }
+            };
+            // Decode keeps its per-band load order. In the other BF16 path,
+            // the next band is fetched while the current WMMA is still pending.
+            if constexpr (!decode_pipeline) prefetch_band(0);
+            for(int b = 0; b < m_repeat; b++) {
+                if constexpr (decode_pipeline) prefetch_band(b);
+                int s_offset = b * band_mk + lane_id % mfma_m * tile_k + lane_id / mfma_m * vec_tile;
+                [[maybe_unused]] opus::vector_t<float, 8> res_bf_raw;
+                // Issue both halves of the BF16 fragment before consuming either.
+                // Native LDS loads retain their register dependencies, so the
+                // compiler can wait at use instead of draining to a fixed count.
                 for(int j = 0; j < band_j; j++) {
                     opus::vector_t<float, ds_read_vec> res;
                     using DTYPE_I_vec = opus::vector_t<DTYPE_I, ds_read_vec>;
                     DTYPE_I_vec x_vec;
-                    if constexpr (decode_pipeline) x_vec = pref_x[j];
+                    if constexpr (batch_lds) x_vec = pref_x[j];
                     else x_vec = *(reinterpret_cast<DTYPE_I_vec*>(s_x_rd_ptr + s_offset));
                     DTYPE_I_vec residual_vec[hc_mult];
                     // k_local within the k-step; ds_read_vec == KS keeps each read
                     // inside exactly one kk run, so only the addressing changes.
                     [[maybe_unused]] const int res_kl = s_offset % tile_k;
                     [[maybe_unused]] const int res_row = b * mfma_m + lane_id % mfma_m;
-                    if constexpr (decode_pipeline) {
+                    if constexpr (batch_lds) {
                         for (int h = 0; h < hc_mult; ++h) residual_vec[h] = pref_res[j][h];
                     } else if constexpr (res_shuf) {
                         static_assert(ds_read_vec <= res_ks && res_ks % ds_read_vec == 0,
@@ -2917,7 +2925,7 @@ namespace aiter {
                             residual_vec[h] = *(reinterpret_cast<DTYPE_I_vec*>(s_residual_rd_ptr + s_offset + h * tile_mk));
                         }
                     }
-                    if constexpr (!decode_pipeline) s_wait_all_dscnt(opus::number<hc_mult>{});
+                    if constexpr (!batch_lds) s_wait_all_dscnt(opus::number<hc_mult>{});
                     for(int k = 0; k < ds_read_vec; k++) {
                         res[k] = static_cast<float>(x_vec[k]) * post_mix_v[b];
                     }
@@ -3003,12 +3011,16 @@ namespace aiter {
                         // over matching K. rept0 = the earlier j, rept1 = this j.
                         static_assert(ds_read_vec == 8, "wave32 bf16 expects 8 elems/lane per step");
                         static_assert(band_j % 2 == 0, "gfx1250 bf16 needs band_j even (2-j combine)");
-                        for (int e = 0; e < ds_read_vec; e++) res_buf[j & 1][e] = res[e];
+                        opus::vector_t<opus::bf16_t, 8> res_bf_half;
+                        for (int e = 0; e < ds_read_vec; e++) {
+                            res_bf_half[e] = opus::fp32_to_bf16(res[e]);
+                        }
+                        auto raw_half = __builtin_bit_cast(opus::vector_t<float, 4>, res_bf_half);
+                        for (int e = 0; e < 4; e++) res_bf_raw[(j & 1) * 4 + e] = raw_half[e];
                         if ((j & 1) == 1) {
-                            opus::vector_t<opus::bf16_t, 16> res_bf;
-                            for (int e = 0; e < ds_read_vec; e++) {
-                                res_bf[e]              = opus::fp32_to_bf16(res_buf[0][e]);
-                                res_bf[ds_read_vec + e] = opus::fp32_to_bf16(res_buf[1][e]);
+                            auto res_bf = __builtin_bit_cast(opus::vector_t<opus::bf16_t, 16>, res_bf_raw);
+                            if constexpr (!decode_pipeline) {
+                                if (j + 1 == band_j && b + 1 < m_repeat) prefetch_band(b + 1);
                             }
                             for (int n = 0; n < repeat_n; n++) {
                                 opus::vector_t<opus::bf16_t, 16> fn_hi, fn_lo;
@@ -3231,6 +3243,15 @@ namespace aiter {
         // both. Reuse s_residual as scratch (dead after the k_loop); cast to float.
         float* s_red = reinterpret_cast<float*>(s_residual);
         static constexpr int v_per_lane = m_repeat * repeat_n * ovec;
+        // Interleave aligned four-float groups across lanes for vector LDS access.
+        auto reduction_offset = [&](int head, int c) {
+            if constexpr (mhc_bf16_mma_avail && warp_size == 32 && is_res_w_preshuffle_bf16) {
+                return head * warp_size * v_per_lane + (c / 4) * warp_size * 4
+                     + lane_id * 4 + c % 4;
+            } else {
+                return (head * warp_size + lane_id) * v_per_lane + c;
+            }
+        };
         float* s_sq = s_red + (hc_mult - 1) * warp_size * v_per_lane;  // disjoint
         // sqrsum per-warp partial (computed on all warps; DPP, no barrier needed)
         float sqrsum_w[m_repeat];
@@ -3247,12 +3268,11 @@ namespace aiter {
             __syncthreads();
         }  // (1) finish reads before scratch reuse
         if (warp_id != 0) {
-            int base = (warp_id - 1) * warp_size * v_per_lane + lane_id * v_per_lane;
             int c = 0;
             for (int b = 0; b < m_repeat; b++)
                 for (int n = 0; n < repeat_n; n++)
                     for (int e = 0; e < ovec; e++)
-                        s_red[base + c++] = v_cf[b][n][e];
+                        s_red[reduction_offset(warp_id - 1, c++)] = v_cf[b][n][e];
             if (n_idx == 0 && lane_id < mfma_m)
                 for (int b = 0; b < m_repeat; b++)
                     s_sq[((warp_id - 1) * mfma_m + lane_id) * m_repeat + b] = sqrsum_w[b];
@@ -3265,12 +3285,11 @@ namespace aiter {
         }  // (2) all LDS deposits visible
         if (warp_id == 0) {
             for (int w = 0; w < hc_mult - 1; w++) {
-                int base = w * warp_size * v_per_lane + lane_id * v_per_lane;
                 int c = 0;
                 for (int b = 0; b < m_repeat; b++)
                     for (int n = 0; n < repeat_n; n++)
                         for (int e = 0; e < ovec; e++)
-                            v_cf[b][n][e] += s_red[base + c++];
+                            v_cf[b][n][e] += s_red[reduction_offset(w, c++)];
             }
             for (int b = 0; b < m_repeat; b++) {
                 int gc_offset = (b * mfma_m + lane_id % mfma_m) * out_stride + (lane_id / mfma_m) * ovec;
