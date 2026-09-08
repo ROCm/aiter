@@ -1612,7 +1612,8 @@ def cmdGenFunc_mha_batch_prefill(
         filter_fwd += "_nsink*"
     blob_gen_cmd = [
         f"{CK_DIR}/example/ck_tile/01_fmha/generate.py -d batch_prefill "
-        "--receipt 200 --filter {} --output_dir {{}}".format(filter_fwd)
+        "--receipt 200 --filter {} --output_dir {{}}".format(filter_fwd),
+        f"{AITER_META_DIR}/hsa/codegen.py -m fmha_v3_fwd --output_dir {{}}",
     ]
     return {
         "md_name": md_name,

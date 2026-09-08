@@ -2,11 +2,13 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 import argparse
+import csv
 import ctypes
 import itertools
 import math
 import os
 import weakref
+from pathlib import Path
 
 import pandas as pd
 import pytest
@@ -17,6 +19,48 @@ import aiter
 from aiter import dtypes, per_tensor_quant
 from aiter.test_common import (
     perftest,
+)
+
+
+def get_batch_prefill_asm_cases() -> list[tuple[str, int, int, bool, int, int, int]]:
+    """Return dtype/shape/range data for each ASM manifest row."""
+    manifest = (
+        Path(__file__).resolve().parents[1]
+        / "hsa"
+        / "gfx950"
+        / "fmha_v3_fwd"
+        / "fmha_batch_prefill.csv"
+    )
+    with manifest.open(newline="") as handle:
+        rows = csv.DictReader(
+            line
+            for line in handle
+            if line.strip() and not line.lstrip().startswith(("//", "#", ";"))
+        )
+        cases = set()
+        for row in rows:
+            hdim_q, hdim_v = int(row["hdim_q"]), int(row["hdim_v"])
+            if hdim_q != hdim_v:
+                raise ValueError(
+                    "batch-prefill ASM test requires matching Q/V head dims"
+                )
+            cases.add(
+                (
+                    row["dtype"],
+                    hdim_q,
+                    int(row["page_size"]),
+                    int(row["mask"]) == 2,
+                    int(row["min_seqlen_q"]),
+                    int(row["max_seqlen_q"]),
+                    int(row["ts_qo"]),
+                )
+            )
+        return sorted(cases)
+
+
+_BATCH_PREFILL_ASM_CASES = get_batch_prefill_asm_cases()
+_BATCH_PREFILL_ASM_PAGE_SIZES = sorted(
+    {page_size for _, _, page_size, _, _, _, _ in _BATCH_PREFILL_ASM_CASES}
 )
 
 
@@ -1309,7 +1353,10 @@ def vectorize_kv_cache(
     return k_cache, v_cache
 
 
-@pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize(
+    "kernel_dtype,head_dim,page_size,causal,min_seqlen_q,max_seqlen_q,kernel_ts_qo",
+    _BATCH_PREFILL_ASM_CASES,
+)
 @pytest.mark.parametrize(
     "batch_size,qo_len,kv_len,num_qo_heads,num_kv_heads,randomize_lengths",
     [
@@ -1317,10 +1364,18 @@ def vectorize_kv_cache(
         (1, 128, 1024, 8, 1, False),
         (2, 512, 768, 8, 1, True),
         (2, 256, 256, 16, 2, False),
+        (1, 2304, 2304, 8, 1, False),
+        (1, 4608, 4608, 8, 1, False),
     ],
 )
-def test_batch_prefill_hd256_fp8_page64_asm(
+def test_batch_prefill_static_page_asm(
+    kernel_dtype,
+    head_dim,
     causal,
+    page_size,
+    min_seqlen_q,
+    max_seqlen_q,
+    kernel_ts_qo,
     batch_size,
     qo_len,
     kv_len,
@@ -1328,22 +1383,43 @@ def test_batch_prefill_hd256_fp8_page64_asm(
     num_kv_heads,
     randomize_lengths,
 ):
-    """LINEAR FP8 hd256 page_size=64 -- asm PAGED_VARLEN (packed Q/O + varlen)."""
+    """Manifest-declared LINEAR static-page ASM PAGED_VARLEN correctness."""
+    if (min_seqlen_q > 0 and qo_len < min_seqlen_q) or (
+        max_seqlen_q > 0 and qo_len > max_seqlen_q
+    ):
+        pytest.skip(f"Q length {qo_len} is outside this ts_qo={kernel_ts_qo} row")
+    if qo_len > 2048 and kernel_dtype != "fp8bf16":
+        pytest.skip("long-Q selector probe only applies to overlapping FP8 rows")
     if skip_test_if(
         get_gpu_arch() != "gfx950",
-        "hd256 FP8 page_size=64 asm is gfx950-only",
+        "static-page batch-prefill asm is gfx950-only",
     ):
         return
     torch.manual_seed(19378)
-    page_size = 64
-    head_dim = 256
-    dtype = torch.bfloat16
-    k_vector_size_fp8 = get_vector_size(dtypes.fp8)
+    if kernel_dtype == "fp8bf16":
+        dtype = torch.bfloat16
+        is_input_fp8 = True
+    elif kernel_dtype == "bf16":
+        dtype = torch.bfloat16
+        is_input_fp8 = False
+    elif kernel_dtype == "fp16":
+        dtype = torch.float16
+        is_input_fp8 = False
+    else:
+        raise ValueError(f"unsupported batch-prefill ASM dtype: {kernel_dtype}")
 
     qo_lens = build_qo_lens(batch_size, qo_len, randomize=randomize_lengths)
     q_indptr_cpu = convert_lens_to_indptr(qo_lens)
     q = build_q_tensor_for_test(
-        qo_lens, batch_size, qo_len, num_qo_heads, head_dim, dtype, -10, 10, True
+        qo_lens,
+        batch_size,
+        qo_len,
+        num_qo_heads,
+        head_dim,
+        dtype,
+        -10,
+        10,
+        is_input_fp8,
     )
     kv_lens = build_kv_lens(batch_size, kv_len, qo_lens, randomize=randomize_lengths)
     kv_cache = build_paged_kv_cache(
@@ -1353,10 +1429,10 @@ def test_batch_prefill_hd256_fp8_page64_asm(
         num_kv_heads,
         head_dim,
         kv_lens,
-        None,
-        None,
+        None if is_input_fp8 else -5,
+        None if is_input_fp8 else 5,
         dtype,
-        use_uniform=True,
+        use_uniform=is_input_fp8,
         contiguous_kv=True,
     )
     q_indptr_gpu = q_indptr_cpu.to(0)
@@ -1380,42 +1456,45 @@ def test_batch_prefill_hd256_fp8_page64_asm(
         return_lse=False,
     )
 
-    q_quant, q_descale = per_tensor_quant(q, quant_dtype=dtypes.fp8)
-    k_cache_quant, k_descale = per_tensor_quant(
-        k_cache_ref.to(dtype), quant_dtype=dtypes.fp8
-    )
-    v_cache_quant, v_descale = per_tensor_quant(
-        v_cache_ref.to(dtype), quant_dtype=dtypes.fp8
-    )
-    k_cache_quant, v_cache_quant = apply_kv_layout(
-        k_cache_quant,
-        v_cache_quant,
-        num_kv_heads,
-        head_dim,
-        page_size,
-        k_vector_size_fp8,
-        "linear",
-    )
+    kernel_kwargs = {"kv_last_page_lens": kv_last_page_len_gpu}
+    if is_input_fp8:
+        q_input, q_descale = per_tensor_quant(q, quant_dtype=dtypes.fp8)
+        k_input, k_descale = per_tensor_quant(
+            k_cache_ref.to(dtype), quant_dtype=dtypes.fp8
+        )
+        v_input, v_descale = per_tensor_quant(
+            v_cache_ref.to(dtype), quant_dtype=dtypes.fp8
+        )
+        kernel_kwargs.update(
+            q_descale=q_descale,
+            k_descale=k_descale,
+            v_descale=v_descale,
+        )
+    else:
+        q_input = q
+        k_input = k_cache_ref.to(dtype)
+        v_input = v_cache_ref.to(dtype)
 
-    out_fp8 = aiter.mha_batch_prefill_func(
-        q_quant,
-        k_cache_quant,
-        v_cache_quant,
+    output = aiter.mha_batch_prefill_func(
+        q_input,
+        k_input.contiguous(),
+        v_input.contiguous(),
         q_indptr_gpu,
         kv_indptr_gpu,
         kv_indices_gpu,
         int(qo_lens.max().item()),
         int(kv_lens.max().item()),
         causal=causal,
-        q_descale=q_descale,
-        k_descale=k_descale,
-        v_descale=v_descale,
-        kv_last_page_lens=kv_last_page_len_gpu,
+        **kernel_kwargs,
     )
-    fp8_threshold = 0.06 if causal and kv_len < qo_len else 0.055
-    if head_dim > 128:
-        fp8_threshold = max(fp8_threshold, 0.06)
-    verify_fp8_output(out_fp8, o_ref, threshold=fp8_threshold)
+    if is_input_fp8:
+        fp8_threshold = 0.06 if causal and kv_len < qo_len else 0.055
+        if head_dim > 128:
+            fp8_threshold = max(fp8_threshold, 0.06)
+        verify_fp8_output(output, o_ref, threshold=fp8_threshold)
+    else:
+        rtol, atol = get_tolerances(dtype)
+        assert_output_matches_reference(output, q_indptr_cpu, o_ref, rtol, atol)
 
 
 @pytest.mark.parametrize("table_layout", ["sglang", "vllm"])
@@ -2702,7 +2781,7 @@ parser.add_argument(
     "--pagesize",
     type=int,
     const=None,
-    choices=[1, 16, 64, 1024],
+    choices=sorted({1, 16, 1024, *_BATCH_PREFILL_ASM_PAGE_SIZES}),
     default=[1, 16, 1024],
     nargs="*",
     help="""page size.
