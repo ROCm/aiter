@@ -1229,7 +1229,9 @@ def mla_prefill_ps_fwd(
     attn_lse = torch.empty(
         (reduce_partial_map.size(0) * tile_q, nhead), dtype=dtypes.fp32, device=device
     )
-    final_lse = torch.empty((total_s, nhead), dtype=dtypes.fp32, device=device)
+    final_lse = torch.full(
+        (total_s, nhead), float("inf"), dtype=dtypes.fp32, device=device
+    )
 
     aiter.mla_prefill_ps_asm_fwd(
         Q,
