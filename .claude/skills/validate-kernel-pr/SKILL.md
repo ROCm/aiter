@@ -574,10 +574,28 @@ two look alike.
    module, and a regex loose enough to catch that also matches `gemm_a8w8_preshuffle` when the
    patch touched `gemm_a8w8`.
 
-The repository bench wins, and mechanically rather than as a preference: it is on **both sides**
-of the patch, so the baseline is this worktree with the patch reversed. A bench the PR adds is
-absent from base and forces the cross-tree transplant below, which needs `--perf-control-column`
-before it means anything.
+**When both paths resolve, both are timed.** They are not two guesses at one answer that a
+tie-break should reduce to one: a bench already in the repository and a bench the PR wrote measure
+different things, and the second is the one whose author chose what it would say. Timing only the
+repository's lets a PR ship a bench nobody ran; timing only the PR's takes the author's word for
+which numbers matter. `stages.perf.measurements[]` carries one entry per target — each with its
+own `target`, `target_basis`, `target_provenance` and `baseline_method` — including the targets
+that produced no number, so a path that was never tried reads differently from one that was tried
+and could not be measured.
+
+Which of them decides the verdict is settled on the measurements, not on the choice: **the worse
+attributable number gates**, and the fields at the top of `stages.perf` mirror that entry. Neither
+half of the rule is new. A comparison nobody can attribute already reports `skip` through the
+control-column gate below, so it never reaches the ranking in a state where it could gate; and
+taking the worst of what remains is what `median_ratio` already does across the columns of one
+table — the minimum, not the mean, because a kernel that got slower on one shape got slower.
+Nothing separating them falls to the repository bench, which is listed first for a mechanical
+reason: it is on **both sides** of the patch, so its baseline is this worktree with the patch
+reversed, where a bench the PR adds is absent from base and forces the cross-tree transplant.
+
+Findings follow the same split: the gating measurement's in full, and from the others only the
+notes. A second `should-fix` would report one problem as two, while *"the PR's own bench could not
+be attributed"* is a reason the reader is owed either way.
 
 Every other outcome is the fallback, and that asymmetry is the entire safety argument: a target
 declined costs a measurement, while a target chosen *wrong* spends a `should-fix` on an author
@@ -659,6 +677,22 @@ exit code 1, and it ships its own reproducer: both logs, both exit codes, and th
 is deliberately **not** a required stage — a run that could not be timed downgrades nothing, and a
 `PASS` stays a `PASS`.
 
+**A kernel change with nothing timing it is its own finding**, and the severity says whose move is
+next:
+
+| what happened | severity | why that one |
+| --- | --- | --- |
+| a python kernel changed in code, and neither path found anything to time it | `should-fix` → `NEEDS_WORK` | the author's gap, and one they can close. A note is what this stage said for years while shipping no number, and nobody acted on it |
+| candidates were found and discovery declined between them | `note` | nothing is missing; picking one is a reading of the diff, and the caller settles it with `--perf-target` |
+| only `csrc/` changed | `note` | every target here runs under `AITER_TRITON_ONLY=1`, so nothing this validator can time reaches that code. The gap is in the instrument, and no benchmark the author writes will close it |
+
+Two things hold it back from firing on PRs that owe nothing. A **comment-only** edit to a kernel is
+not a kernel change to time — the diff is read per file, and a file whose added and removed lines
+are all comments or blank does not count, because asking that author for a benchmark charges them
+for touching the file at all. And a run that never reached **both phases** cannot call anything
+missing: it could not have timed a benchmark sitting right in front of it, and its verdict is
+`INCONCLUSIVE`, which a `should-fix` would quietly overwrite with the more confident `NEEDS_WORK`.
+
 Because a bench harness routinely writes results next to the code (aiter targets drop a
 `tuned_op_bench.csv` in the repo root), the timing run snapshots and restores the worktree, touching
 only paths whose git status changed across it. Without that, the baseline cleanliness check would
@@ -673,7 +707,8 @@ the merge simulation, GPU claim, repo-aware runtime probe, policy comparison, ba
 the correctness target, execution receipt, and index scan all ran. It does **not** mean an extra
 shape grid was supplied — that stage is optional and completes nothing either way. Nor does it mean
 a timing comparison was made: read `stages.perf` for that, and read a `skip` there as "not
-measured", not as "no regression".
+measured", not as "no regression". A `PASS` on a PR that changed a kernel and brought no way to
+time it is not available any more — that case now carries its own `should-fix`.
 
 Process exit codes match the verdict: `PASS=0`, `BLOCK/NEEDS_WORK=1`, and `INCONCLUSIVE=2`.
 
