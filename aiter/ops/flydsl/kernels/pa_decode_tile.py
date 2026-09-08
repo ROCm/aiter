@@ -37,7 +37,8 @@ from flydsl.expr import math as fmath
 from flydsl.expr.typing import ReductionOp, T
 from flydsl.runtime.device import get_rocm_arch
 
-from . import buffer_ops, dpp_utils
+from . import dpp_utils
+from .tensor_shim import ptr_buf_scalar
 from .utils import cdiv, exp2_amdgcn_scalar, exp2_f32_fast, rcp_f32
 
 MFMA_MNK = (
@@ -294,24 +295,16 @@ def compile_pa_decode_tile(
         bt_num_records_bytes = (
             fx.Index(gpu.grid_dim.x) * fx.Index(max_blocks_per_seq) * 4
         )  # int32 entries
-        bt_rsrc = buffer_ops.create_buffer_resource(
-            block_tables_ptr, max_size=False, num_records_bytes=bt_num_records_bytes
+        bt_load = ptr_buf_scalar(
+            block_tables_ptr, num_records_bytes=bt_num_records_bytes
         )
-        ks_rsrc = buffer_ops.create_buffer_resource(key_scale_ptr, max_size=True)
-        vs_rsrc = buffer_ops.create_buffer_resource(value_scale_ptr, max_size=True)
         # Per-tensor: a single global scale, read once. Per-token: read
         # per-token instead (see _kv_scale_ops/_stage_kv_scale_to_lds below).
         if const_expr(not per_token_kv):
-            key_scale = fx.Int32(
-                buffer_ops.buffer_load(
-                    ks_rsrc, fx.Int32(0), vec_width=1, is_scalar=True
-                )
-            ).bitcast(fx.Float32)
-            value_scale = fx.Int32(
-                buffer_ops.buffer_load(
-                    vs_rsrc, fx.Int32(0), vec_width=1, is_scalar=True
-                )
-            ).bitcast(fx.Float32)
+            key_scale_load = ptr_buf_scalar(key_scale_ptr)
+            value_scale_load = ptr_buf_scalar(value_scale_ptr)
+            key_scale = fx.Int32(key_scale_load()).bitcast(fx.Float32)
+            value_scale = fx.Int32(value_scale_load()).bitcast(fx.Float32)
 
         num_tiles = cdiv(context_len, TILE_TOK)
         num_pages = cdiv(context_len, block_size)  # pages this sequence really owns
@@ -350,18 +343,27 @@ def compile_pa_decode_tile(
         TOK_CHUNK = NWARP * MFMA_MNK  # 64
         NCHUNK = TILE_TOK // TOK_CHUNK  # 4
 
+        if const_expr(per_token_kv):
+            scale_load_width = NCHUNK if block_size == 64 else 1
+            scale_copy_op = (
+                fx.rocdl.BufferCopy128b()
+                if block_size == 64
+                else fx.rocdl.BufferCopy32b()
+            )
+            _k_scale_load = _make_flat_loader(
+                key_scale_ptr, fx.Float32, scale_load_width, scale_copy_op
+            )
+            _v_scale_load = _make_flat_loader(
+                value_scale_ptr, fx.Float32, scale_load_width, scale_copy_op
+            )
+
         def _load_phys_scalar(page, vec_width=1):
             # Past `num_pages` the block-table entry is padding: whatever the
             # caller left there, often a stale id pointing at another sequence's
             # live page. Pin those to block 0 so the tokens the softmax masks
             # out always resolve to one known, in-bounds page instead. `page` is
             # wave-uniform, so the clamp is scalar.
-            result = buffer_ops.buffer_load(
-                bt_rsrc,
-                seq * max_blocks_per_seq + page,
-                vec_width=vec_width,
-                is_scalar=True,
-            )
+            result = bt_load(seq * max_blocks_per_seq + page, vec_width)
             if const_expr(vec_width == 1):
                 return (page < num_pages).select(fx.Int32(result), fx.Int32(0))
             loaded = fx.Vector(result)
@@ -405,16 +407,8 @@ def compile_pa_decode_tile(
                 phys = fx.Int32(phys_vec[0])
                 base_tok = lane16 * NCHUNK
                 scale_idx = phys * stride_ks_block + kv_h * stride_ks_head + base_tok
-                k_scale_vec = fx.Vector(
-                    buffer_ops.buffer_load(
-                        ks_rsrc, scale_idx, vec_width=NCHUNK, dtype=fx.Float32
-                    )
-                )
-                v_scale_vec = fx.Vector(
-                    buffer_ops.buffer_load(
-                        vs_rsrc, scale_idx, vec_width=NCHUNK, dtype=fx.Float32
-                    )
-                )
+                k_scale_vec = _k_scale_load(scale_idx)
+                v_scale_vec = _v_scale_load(scale_idx)
                 slot = (warp * TOK_PER_WARP + base_tok) * f32
                 _lds_store(sKScale_off + buf_off + slot, fx.Float32, k_scale_vec)
                 _lds_store(sVScale_off + buf_off + slot, fx.Float32, v_scale_vec)
@@ -423,16 +417,8 @@ def compile_pa_decode_tile(
                 # so the 4 sub-blocks stage in parallel across rgroup-groups.
                 phys = fx.Int32(fx.Vector(phys_vec)[rgroup])
                 scale_idx = phys * stride_ks_block + kv_h * stride_ks_head + lane16
-                k_scale_scalar = fx.Float32(
-                    buffer_ops.buffer_load(
-                        ks_rsrc, scale_idx, vec_width=1, dtype=fx.Float32
-                    )
-                )
-                v_scale_scalar = fx.Float32(
-                    buffer_ops.buffer_load(
-                        vs_rsrc, scale_idx, vec_width=1, dtype=fx.Float32
-                    )
-                )
+                k_scale_scalar = fx.Float32(_k_scale_load(scale_idx)[0])
+                v_scale_scalar = fx.Float32(_v_scale_load(scale_idx)[0])
                 fx.rocdl.sched_barrier(fx.rocdl.mask_vmem_rd)
                 slot = (warp * TOK_PER_WARP + rgroup * c16 + lane16) * f32
                 _lds_store(
