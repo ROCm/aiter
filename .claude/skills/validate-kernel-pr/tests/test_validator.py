@@ -2077,6 +2077,119 @@ class ValidateKernelPrTests(unittest.TestCase):
         self.assertLess(perf["median_ratio"], 0.95)
         self.assertEqual(1, result.returncode)
 
+    def _both_paths_patch(self, name, scale):
+        """A patch that changes the kernel AND ships a bench, so both paths resolve.
+
+        The shipped bench deliberately does not read VALUE -- it prints a fixed table. That
+        is the shape worth defending against: a PR arrives with a benchmark of its own that
+        cannot move under its own change, while the bench the repository already owns is the
+        one that would see it.
+        """
+
+        def mutate(repo):
+            (repo / "aiter" / "kernel.py").write_text(f"VALUE = {scale}\n")
+            (repo / self.NEW_BENCH_TARGET).write_text(
+                "import argparse\n"
+                "\n"
+                "\n"
+                "def main():\n"
+                "    parser = argparse.ArgumentParser()\n"
+                "    parser.add_argument('--scenario', default='test',\n"
+                "                        choices=['test', 'bench'])\n"
+                "    parser.parse_args()\n"
+                "    print('| dim | kernel us | reference us |')\n"
+                "    print('|---|---|---|')\n"
+                "    for dim in (1024, 2048, 4096, 8192):\n"
+                "        print(f'| {dim} | {dim / 100.0} | {dim / 50.0} |')\n"
+                "    print('4/4 cases passed')\n"
+                "\n"
+                "\n"
+                "if __name__ == '__main__':\n"
+                "    main()\n"
+            )
+
+        return self.fixture.make_patch(mutate, name)
+
+    def test_both_benches_are_timed_and_the_worse_one_decides(self):
+        # The PR ships a bench and the repository already owns one. Timing only the shipped
+        # bench takes the author's word for which numbers matter -- here it prints a constant
+        # table and reports `pass` while the kernel it ships alongside got twice as slow.
+        self.fixture.add_repo_bench()
+        patch = self._both_paths_patch("both-paths-regress.patch", scale="2.0")
+        result, report = self.fixture.validate(
+            patch,
+            tests="tests/test_sample.py",
+            expected_route="test_sample:run_kernel",
+            grid=False,
+            perf_control_column="reference us",
+        )
+
+        perf = report["stages"]["perf"]
+        self.assertEqual(
+            [
+                (self.fixture.REPO_BENCH, "discovered-repo-bench", "fail"),
+                (self.NEW_BENCH_TARGET, "discovered-pr-shipped", "pass"),
+            ],
+            [
+                (entry["target"], entry["target_basis"], entry["status"])
+                for entry in perf["measurements"]
+            ],
+        )
+        # The top of the stage mirrors the measurement that gates, so review-pr and
+        # validate_evidence.py read median_ratio from where they always read it.
+        self.assertEqual("fail", perf["status"])
+        self.assertEqual(self.fixture.REPO_BENCH, perf["target"])
+        self.assertLess(perf["median_ratio"], 0.95)
+        # One should-fix, not two: a second finding would double the count of one problem.
+        self.assertEqual(
+            1,
+            len(
+                [
+                    item
+                    for item in report["findings"]
+                    if item["stage"] == "perf" and item["severity"] == "should-fix"
+                ]
+            ),
+        )
+        self.assertEqual(1, result.returncode)
+
+    def test_a_measurement_nobody_can_attribute_is_reported_and_does_not_gate(self):
+        # Same two targets, no --perf-control-column. The shipped bench is absent from base,
+        # so its only baseline is the cross-tree transplant, and without a column the patch
+        # does not touch reproducing across the two trees that comparison means nothing. It
+        # skips -- and a skip made no claim, so it cannot be what a verdict rests on.
+        self.fixture.add_repo_bench()
+        patch = self._both_paths_patch("both-paths-unattributable.patch", scale="1.0")
+        result, report = self.fixture.validate(
+            patch,
+            tests="tests/test_sample.py",
+            expected_route="test_sample:run_kernel",
+            grid=False,
+        )
+
+        perf = report["stages"]["perf"]
+        shipped = perf["measurements"][1]
+        self.assertEqual(self.NEW_BENCH_TARGET, shipped["target"])
+        self.assertEqual("skip", shipped["status"])
+        self.assertIn("--perf-control-column", shipped["note"])
+        # Still listed, and that is the point of listing it: a reader can tell a path that
+        # was never tried from one that was tried and could not be measured. Its reason is a
+        # finding too, not only a field -- a note never gates, so there is nothing to protect
+        # by swallowing it, and a reader scanning findings would otherwise never learn that a
+        # second bench existed and went unmeasured.
+        self.assertTrue(
+            any(
+                item["stage"] == "perf"
+                and item["severity"] == "note"
+                and "--perf-control-column" in item["detail"]
+                for item in report["findings"]
+            ),
+            report["findings"],
+        )
+        self.assertEqual("pass", perf["status"])
+        self.assertEqual(self.fixture.REPO_BENCH, perf["target"])
+        self.assertEqual(0, result.returncode)
+
     #: A pytest-named file that ALSO parses argv in its module body. Found on
     #: ROCm/aiter#5172: pytest wins the runner selection, imports the module at collection
     #: with its own argv, and argparse exits the process. The file is green as a script.
@@ -4496,10 +4609,15 @@ class PerfDecisionTests(unittest.TestCase):
     def shipped(self, status, files=None):
         return self.perf.discover_shipped(status, (files or self.SHIPPED).get)
 
-    def choose(self, status, correctness_target, repo_benches=()):
-        return self.perf.choose_perf_target(
+    def choose_all(self, status, correctness_target, repo_benches=()):
+        return self.perf.choose_perf_targets(
             self.shipped(status), list(repo_benches), correctness_target
         )
+
+    def choose(self, status, correctness_target, repo_benches=()):
+        """The first target, flattened -- the shape a single-target choice always had."""
+        decision = self.choose_all(status, correctness_target, repo_benches)
+        return {**decision["targets"][0], "candidates": decision["candidates"]}
 
     def test_a_changed_kernel_file_becomes_the_module_a_bench_would_import(self):
         modules = self.perf.changed_kernel_modules(
@@ -4583,19 +4701,163 @@ class PerfDecisionTests(unittest.TestCase):
             self.repo_benches(["aiter.ops.triton.k"]),
         )
 
-    def test_a_repo_bench_wins_over_one_the_pr_ships(self):
-        # Mechanical, not a preference: a pre-existing bench is on both sides of the patch, so
-        # the baseline is this worktree with the patch reversed. A bench the PR adds is absent
-        # from base and forces the cross-tree transplant, which needs --perf-control-column.
-        decision = self.choose(
+    def entry(self, status, target, ratio=None):
+        measurement = {"status": status, "target": target}
+        if ratio is not None:
+            measurement["median_ratio"] = ratio
+        return {"measurement": measurement, "findings": []}
+
+    def test_the_worse_attributable_measurement_is_the_one_that_gates(self):
+        # The same rule median_ratio already follows across the columns of one table: the
+        # minimum, not the mean. A kernel that got slower on one bench got slower.
+        chosen = self.perf.gate(
+            [
+                self.entry("pass", "bench_clean.py", 1.02),
+                self.entry("fail", "bench_slow.py", 0.80),
+            ]
+        )
+        self.assertEqual("bench_slow.py", chosen["measurement"]["target"])
+
+    def test_a_measurement_that_made_no_claim_cannot_gate(self):
+        # A skip is not a bad result, it is the absence of one -- an unattributable cross-tree
+        # comparison lands here. Letting it gate would publish "we could not measure" as the
+        # stage's own status while a real measurement sat beside it unread.
+        chosen = self.perf.gate(
+            [
+                self.entry("skip", "bench_untimed.py"),
+                self.entry("pass", "bench_clean.py", 1.02),
+            ]
+        )
+        self.assertEqual("bench_clean.py", chosen["measurement"]["target"])
+
+    def test_two_regressions_are_ranked_by_how_bad_they_are(self):
+        chosen = self.perf.gate(
+            [
+                self.entry("fail", "bench_a.py", 0.90),
+                self.entry("fail", "bench_b.py", 0.40),
+            ]
+        )
+        self.assertEqual("bench_b.py", chosen["measurement"]["target"])
+
+    def test_nothing_separating_them_falls_to_the_repository_bench(self):
+        # choose_perf_targets orders the repository's bench first, and the tie-break inherits
+        # that order rather than inventing one: it is the comparison that needed no transplant
+        # to be believable, so it is the one to quote when both say the same thing.
+        chosen = self.perf.gate(
+            [
+                self.entry("pass", "bench_repo.py", 1.0),
+                self.entry("pass", "bench_shipped.py", 1.0),
+            ]
+        )
+        self.assertEqual("bench_repo.py", chosen["measurement"]["target"])
+
+    def compose(self, entries):
+        """Run the stage composer over a hand-built manifest and return the report."""
+        with tempfile.TemporaryDirectory() as work:
+            report = Path(work) / "report.json"
+            manifest = Path(work) / "manifest.json"
+            report.write_text(json.dumps({"stages": {}, "findings": []}))
+            manifest.write_text(json.dumps(entries))
+            self.assertEqual(
+                0,
+                self.perf.main(
+                    ["stage", "--report", str(report), "--manifest", str(manifest)]
+                ),
+            )
+            return json.loads(report.read_text())
+
+    def test_two_regressions_earn_one_should_fix_between_them(self):
+        # finish_report counts should-fix findings. Two targets that both saw the same kernel
+        # get slower is one problem seen twice, and letting each file its own would report it
+        # as two -- while the rows of both are already in measurements[] either way.
+        def regressed(target, ratio):
+            entry = self.entry("fail", target, ratio)
+            entry["findings"] = [
+                {
+                    "severity": "should-fix",
+                    "stage": "perf",
+                    "detail": f"{target} slower",
+                }
+            ]
+            return entry
+
+        report = self.compose(
+            [regressed("bench_a.py", 0.9), regressed("bench_b.py", 0.4)]
+        )
+        self.assertEqual(
+            ["bench_b.py slower"],
+            [
+                item["detail"]
+                for item in report["findings"]
+                if item["severity"] == "should-fix"
+            ],
+        )
+
+    def test_a_target_that_could_not_be_timed_still_says_so_out_loud(self):
+        # The other half of the same rule. A note cannot gate, so there is nothing to protect
+        # by dropping it, and a reader scanning findings would otherwise never learn that a
+        # second bench existed and went unmeasured.
+        skipped = self.entry("skip", "bench_shipped.py")
+        skipped["findings"] = [
+            {"severity": "note", "stage": "perf", "detail": "nothing to transplant"}
+        ]
+        report = self.compose([self.entry("pass", "bench_repo.py", 1.01), skipped])
+        self.assertEqual("bench_repo.py", report["stages"]["perf"]["target"])
+        self.assertIn(
+            "nothing to transplant",
+            [item["detail"] for item in report["findings"]],
+        )
+
+    def test_every_target_that_was_tried_is_reported_whether_or_not_it_measured(self):
+        # An untimed target is still a measurement. Dropping it would leave the report
+        # describing only the targets that happened to work, which reads as though the others
+        # were never tried.
+        entry = self.perf.measurement(
+            {
+                "target": "bench_x.py",
+                "skip_reason": "no harness",
+                "base_log": "/w/b.log",
+            },
+            read_text=lambda name: self.fail(f"a skip read {name}"),
+        )
+        self.assertEqual("skip", entry["measurement"]["status"])
+        self.assertEqual("bench_x.py", entry["measurement"]["target"])
+        self.assertEqual("/w/b.log", entry["measurement"]["base_log"])
+        self.assertEqual("note", entry["findings"][0]["severity"])
+
+    def test_both_paths_resolving_means_both_get_timed(self):
+        # Not a tie to be broken. A bench the repository already owns and a bench the PR wrote
+        # measure different things, and the second is the one whose author chose what it would
+        # say; timing only one of them takes somebody's word for something.
+        decision = self.choose_all(
             "A  op_tests/bench_new.py\n",
             "op_tests/test_old.py",
             repo_benches=["op_tests/op_benchmarks/triton/bench_k.py"],
         )
-        self.assertEqual("discovered-repo-bench", decision["basis"])
-        self.assertEqual("op_tests/op_benchmarks/triton/bench_k.py", decision["target"])
-        # The one it passed over is still named, so nobody has to wonder whether it was seen.
+        self.assertEqual(
+            [
+                ("discovered-repo-bench", "op_tests/op_benchmarks/triton/bench_k.py"),
+                ("discovered-pr-shipped", "op_tests/bench_new.py"),
+            ],
+            [(entry["basis"], entry["target"]) for entry in decision["targets"]],
+        )
+        # The repository's bench is first, and the order is load-bearing: it is what gate()
+        # falls back on when nothing separates the two measurements, and that comparison is
+        # the one that needed no transplant to be believable.
         self.assertIn("op_tests/bench_new.py", decision["candidates"])
+
+    def test_a_shipped_bench_does_not_claim_the_repository_offered_nothing(self):
+        # The shipped path's reason used to say the repository offers none, because reaching
+        # it meant the repository path had declined. Both can resolve now, and a reason that
+        # is only true on one route is worse than no reason at all.
+        decision = self.choose_all(
+            "A  op_tests/bench_new.py\n",
+            "op_tests/test_old.py",
+            repo_benches=["op_tests/op_benchmarks/triton/bench_k.py"],
+        )
+        self.assertNotIn("offers none", decision["targets"][1]["reason"])
+        alone = self.choose("A  op_tests/bench_new.py\n", "op_tests/test_old.py")
+        self.assertIn("offers none", alone["reason"])
 
     def test_a_shared_helper_matches_too_much_to_choose_from(self):
         # aiter.ops.triton.utils.types is imported by 13 benches. A dtype alias added to it
@@ -4692,13 +4954,15 @@ class PerfDecisionTests(unittest.TestCase):
         # be innocent, and nothing downstream can tell the two apart -- run_perf injects no
         # probe, so no evidence exists that the bench executed the changed line at all.
         files = dict(self.SHIPPED, **{"op_tests/bench_two.py": "# --scenario bench\n"})
-        decision = self.perf.choose_perf_target(
+        decision = self.perf.choose_perf_targets(
             self.shipped(
                 "A  op_tests/bench_new.py\nA  op_tests/bench_two.py\n", files=files
             ),
             [],
             "op_tests/test_old.py",
         )
+        self.assertEqual(1, len(decision["targets"]))
+        decision = {**decision["targets"][0], "candidates": decision["candidates"]}
         self.assertEqual("same-as-correctness-target", decision["basis"])
         self.assertEqual("op_tests/test_old.py", decision["target"])
         self.assertIn("--perf-target", decision["reason"])

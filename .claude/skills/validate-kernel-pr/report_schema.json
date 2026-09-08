@@ -777,6 +777,13 @@
               },
               "description": "Every file discovery considered a possible perf target. More than one means discovery declined rather than picked: which of several benches measures a given change is a reading of the diff, not a fact about it, and the caller settles it with --perf-target."
             },
+            "measurements": {
+              "type": "array",
+              "items": {
+                "type": "object"
+              },
+              "description": "One entry per timed target, each carrying its own `target`, `target_basis`, `target_provenance`, baseline method and result -- including the targets that produced no number, so a reader can tell a path that was never tried from one that was tried and could not be measured. When both discovery paths resolve, both are timed: a bench already in the repository and a bench the PR wrote measure different things. The fields at the top of this stage mirror whichever entry gates, so a reader who does not care that there were several sees exactly what a single-target report showed."
+            },
             "target_provenance": {
               "type": "string",
               "enum": [

@@ -338,7 +338,12 @@ def cmd_env_summary(args) -> int:
 
 
 def cmd_stats_field(args) -> int:
-    value = json.loads(args.stats)[args.field]
+    # A dotted path, so a caller reading a list of objects does not have to slice JSON in
+    # bash. `targets.0.basis` walks a list by integer index and a dict by key; a plain field
+    # name contains no dots and takes exactly the path it always took.
+    value = json.loads(args.stats)
+    for step in args.field.split("."):
+        value = value[int(step)] if isinstance(value, list) else value[step]
     # A bare print of a list gives Python's repr -- single quotes, no escaping -- which is
     # not JSON and cannot be handed back to the report writer. Fields that carry structure
     # ask for --json; every scalar caller is unaffected.

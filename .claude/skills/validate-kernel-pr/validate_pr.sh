@@ -99,6 +99,17 @@ PERF_TARGET=""
 PERF_TARGET_BASIS="same-as-correctness-target"
 PERF_TARGET_PROVENANCE="unknown"
 PERF_TARGET_PROVENANCE_REASON=""
+# Discovery can return two targets -- the repository's bench and the one the PR ships -- and
+# both get timed. Everything above describes ONE target and stays that way: PERF_TARGET is
+# what perf_detect and run_perf act on, and the loops below set it per iteration. What the
+# loops accumulate lives in these index-aligned arrays instead. Parallel arrays are a poor
+# record type, and bash offers no better one; the arrays exist only to carry results to the
+# manifest, where scrape_perf.py assembles them back into objects.
+PERF_TARGETS=()
+PERF_TARGET_BASES=()
+PERF_TARGET_BASIS_REASONS=()
+PERF_TARGET_PROVENANCES=()
+PERF_TARGET_PROVENANCE_REASONS=()
 TARGET_PYTHON="${PYTHON_BIN:-$(command -v python3 || command -v python || true)}"
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 
@@ -977,35 +988,56 @@ fi
 # question nobody asked is work, and the answer would go into a stage that reports `skip`.
 PERF_TARGET_BASIS_REASON=""
 PERF_CANDIDATES="[]"
+PERF_TARGETS=("$PERF_TARGET")
+PERF_TARGET_BASES=("$PERF_TARGET_BASIS")
+PERF_TARGET_BASIS_REASONS=("")
 if [ "$PERF_TARGET_BASIS" != "declared-by-caller" ] && [ "$PERF_ENABLED" -eq 1 ]; then
   PERF_DISCOVERY=$(printf '%s' "$PATCH_STATUS" \
     | "$SCRIPT_DIR/scrape_perf.py" discover \
       --root "$REPO_WT" --correctness-target "$TEST_FILE")
   if [ -n "$PERF_DISCOVERY" ]; then
-    PERF_TARGET_BASIS=$(stats_field "$PERF_DISCOVERY" basis)
-    PERF_TARGET=$(stats_field "$PERF_DISCOVERY" target)
-    PERF_TARGET_BASIS_REASON=$(stats_field "$PERF_DISCOVERY" reason)
+    PERF_TARGETS=()
+    PERF_TARGET_BASES=()
+    PERF_TARGET_BASIS_REASONS=()
+    # Both paths are timed when both resolve. The count comes from the discovery blob rather
+    # than from reading indices until one is empty, which cannot tell "past the end" from
+    # "this field is blank".
+    PERF_TARGET_COUNT=$(stats_field "$PERF_DISCOVERY" target_count)
+    for ((_i = 0; _i < PERF_TARGET_COUNT; _i++)); do
+      PERF_TARGETS+=("$(stats_field "$PERF_DISCOVERY" "targets.$_i.target")")
+      PERF_TARGET_BASES+=("$(stats_field "$PERF_DISCOVERY" "targets.$_i.basis")")
+      PERF_TARGET_BASIS_REASONS+=("$(stats_field "$PERF_DISCOVERY" "targets.$_i.reason")")
+    done
+    PERF_TARGET="${PERF_TARGETS[0]}"
+    PERF_TARGET_BASIS="${PERF_TARGET_BASES[0]}"
+    PERF_TARGET_BASIS_REASON="${PERF_TARGET_BASIS_REASONS[0]}"
     PERF_CANDIDATES=$(python3 "$TARGET_TOOL" stats-field --json "$PERF_DISCOVERY" candidates)
   fi
 fi
 
-# The same question test_provenance asks, asked of the file the timing runs will execute. It
+# The same question test_provenance asks, asked of every file the timing runs will execute. It
 # is the same pure function against the same snapshot -- a perf target is a target, and "did
 # the patch write this?" has one answer however the file is used. Reusing it also inherits the
 # honesty that no patch means `unknown` rather than a cheerful `pre-existing`.
-if [ "$PERF_TARGET" = "$TEST_FILE" ]; then
-  PERF_TARGET_PROVENANCE="$TEST_PROVENANCE"
-  PERF_TARGET_PROVENANCE_REASON="$TEST_PROVENANCE_REASON"
-elif [ -n "$PATCHF" ]; then
-  PERF_PROVENANCE_OUT=$(printf '%s' "$PATCH_STATUS" \
-    | "$SCRIPT_DIR/target_run.py" provenance "$PERF_TARGET" --patch-supplied)
-  PERF_TARGET_PROVENANCE=${PERF_PROVENANCE_OUT%%$'\n'*}
-  PERF_TARGET_PROVENANCE_REASON=${PERF_PROVENANCE_OUT#*$'\n'}
-else
-  PERF_PROVENANCE_OUT=$("$SCRIPT_DIR/target_run.py" provenance "$PERF_TARGET" </dev/null)
-  PERF_TARGET_PROVENANCE=${PERF_PROVENANCE_OUT%%$'\n'*}
-  PERF_TARGET_PROVENANCE_REASON=${PERF_PROVENANCE_OUT#*$'\n'}
-fi
+PERF_TARGET_PROVENANCES=()
+PERF_TARGET_PROVENANCE_REASONS=()
+for _target in "${PERF_TARGETS[@]}"; do
+  if [ "$_target" = "$TEST_FILE" ]; then
+    PERF_TARGET_PROVENANCES+=("$TEST_PROVENANCE")
+    PERF_TARGET_PROVENANCE_REASONS+=("$TEST_PROVENANCE_REASON")
+    continue
+  fi
+  if [ -n "$PATCHF" ]; then
+    PERF_PROVENANCE_OUT=$(printf '%s' "$PATCH_STATUS" \
+      | "$SCRIPT_DIR/target_run.py" provenance "$_target" --patch-supplied)
+  else
+    PERF_PROVENANCE_OUT=$("$SCRIPT_DIR/target_run.py" provenance "$_target" </dev/null)
+  fi
+  PERF_TARGET_PROVENANCES+=("${PERF_PROVENANCE_OUT%%$'\n'*}")
+  PERF_TARGET_PROVENANCE_REASONS+=("${PERF_PROVENANCE_OUT#*$'\n'}")
+done
+PERF_TARGET_PROVENANCE="${PERF_TARGET_PROVENANCES[0]}"
+PERF_TARGET_PROVENANCE_REASON="${PERF_TARGET_PROVENANCE_REASONS[0]}"
 
 # Two independent channels can carry the S1 grid: the target's own CLI flag (--shape-arg)
 # and an environment variable it reads (--shape-env). They are probed separately and the
@@ -1304,11 +1336,15 @@ PERF_RUN_LOGS=()
 PERF_RUN_RC=0
 run_perf_repeats() {
   local phase="$1"
+  # Which target this side is timing. Part of the log name because two targets are timed in
+  # the same phase and a shared name would have the second overwrite the first -- silently,
+  # since both sides would still find a readable log at the path they recorded.
+  local slot="$2"
   local index result rc
   PERF_RUN_LOGS=()
   PERF_RUN_RC=0
   for ((index = 1; index <= PERF_REPEAT; index++)); do
-    result=$(run_perf "$phase-perf-$index")
+    result=$(run_perf "$phase-perf-t$slot-$index")
     rc=${result%%|*}
     PERF_RUN_LOGS+=("${result##*|}")
     # Any failed repeat poisons the side: the reduction takes a minimum, so one truncated
@@ -1445,12 +1481,30 @@ fi
 CAN_TEST=1
 SKIP_REASON=""
 PERF_BASE_RC=""
-PERF_BASE_LOG=""
 PERF_BASE_LOGS=()
-PERF_HEAD_RC=""
-PERF_HEAD_LOG=""
 PERF_HEAD_LOGS=()
 PERF_SKIP_REASON=""
+# Per-target results, index-aligned with PERF_TARGETS. Pre-filled so that a phase that never
+# ran leaves every slot with an answer -- an unset slot under `set -u` is a crash, and the
+# report a crash produces is no report at all.
+PERF_SKIP_REASONS=()
+PERF_BASELINE_METHODS=()
+PERF_ARGS_LIST=()
+PERF_BASIS_LIST=()
+PERF_BASE_RCS=()
+PERF_BASE_LOGS_JOINED=()
+PERF_HEAD_RCS=()
+PERF_HEAD_LOGS_JOINED=()
+for _slot in "${!PERF_TARGETS[@]}"; do
+  PERF_SKIP_REASONS+=("")
+  PERF_BASELINE_METHODS+=("patch-reversed-same-worktree")
+  PERF_ARGS_LIST+=("")
+  PERF_BASIS_LIST+=("")
+  PERF_BASE_RCS+=("")
+  PERF_BASE_LOGS_JOINED+=("")
+  PERF_HEAD_RCS+=("")
+  PERF_HEAD_LOGS_JOINED+=("")
+done
 if [ -z "$PICK" ] && [ "$GPU_REQUIREMENT" != "not-required" ]; then
   CAN_TEST=0
   SKIP_REASON="no verified-idle GPU was claimed"
@@ -1491,11 +1545,15 @@ else
   # base tree times the OLD implementation through the SAME harness. That transplant is a
   # cross-tree comparison and is only attributable if something the patch does not touch
   # reproduces across it, which is what --perf-control-column requires below.
-  PERF_TRANSPLANT_SRC=""
-  if [ -n "$PATCHF" ] && [ "$PERF_ENABLED" -eq 1 ] && [ -f "$REPO_WT/$PERF_TARGET" ]; then
-    PERF_TRANSPLANT_SRC="$WORK/transplant-target"
-    cp "$REPO_WT/$PERF_TARGET" "$PERF_TRANSPLANT_SRC"
-  fi
+  PERF_TRANSPLANT_SRCS=()
+  for _slot in "${!PERF_TARGETS[@]}"; do
+    PERF_TRANSPLANT_SRCS+=("")
+    if [ -n "$PATCHF" ] && [ "$PERF_ENABLED" -eq 1 ] \
+        && [ -f "$REPO_WT/${PERF_TARGETS[$_slot]}" ]; then
+      PERF_TRANSPLANT_SRCS[$_slot]="$WORK/transplant-target-$_slot"
+      cp "$REPO_WT/${PERF_TARGETS[$_slot]}" "${PERF_TRANSPLANT_SRCS[$_slot]}"
+    fi
+  done
   if [ -n "$PATCHF" ]; then
     if git -C "$REPO_WT" apply -R --check "$PATCHF" >/dev/null 2>&1 \
         && git -C "$REPO_WT" apply -R "$PATCHF" >/dev/null 2>&1; then
@@ -1525,52 +1583,74 @@ else
       # number taken later, or on another box, or from the PR description, reintroduces
       # exactly the variance a 0.95 threshold is too tight to absorb.
       if [ "$PERF_ENABLED" -eq 1 ]; then
-        # Whether the PERF target survives the reverse-apply is its own question. It used to
-        # be answered with BASE_REPO_STATE, which describes the CORRECTNESS target -- the same
-        # file, back when perf had no target of its own. Once the two can differ that is a
-        # category error in both directions: a pre-existing bench alongside a PR-added unit
-        # test would be refused a baseline it could trivially have taken, and a PR-added bench
-        # alongside a pre-existing unit test would fall through to the ordinary branch and
-        # transplant nothing. Ask about the file that is about to be executed.
-        PERF_BASE_STATE="present"
-        [ -f "$REPO_WT/$PERF_TARGET" ] || PERF_BASE_STATE="target-not-present"
-        if [ "$PERF_BASE_STATE" = "target-not-present" ] \
-            && [ -z "$PERF_CONTROL_COLUMN" ]; then
-          PERF_SKIP_REASON="the PR adds this target, so a base timing requires transplanting it into the base tree; that comparison spans two trees and is only attributable when a column the patch does not touch reproduces across it, so --perf-control-column is required and was not supplied"
-        elif [ "$PERF_BASE_STATE" = "target-not-present" ] \
-            && [ -n "$PERF_TRANSPLANT_SRC" ] && [ -r "$PERF_TRANSPLANT_SRC" ]; then
-          mkdir -p "$(dirname "$REPO_WT/$PERF_TARGET")"
-          cp "$PERF_TRANSPLANT_SRC" "$REPO_WT/$PERF_TARGET"
-          PERF_BASELINE_METHOD="target-transplant"
-          if [ "$PERF_ARGS_SET" -eq 1 ] || perf_detect; then
+        # One pass per discovered target. Each keeps its own harness, its own baseline method
+        # and its own skip reason, because a target that could not be timed says nothing
+        # about the one beside it: the repository's bench takes an ordinary reversed-patch
+        # baseline while the PR's own bench needs a transplant, and either may fail alone.
+        for PERF_SLOT in "${!PERF_TARGETS[@]}"; do
+          PERF_TARGET="${PERF_TARGETS[$PERF_SLOT]}"
+          PERF_BASELINE_METHOD="patch-reversed-same-worktree"
+          PERF_SKIP_REASON=""
+          PERF_BASE_RC=""
+          PERF_BASE_LOGS=()
+          [ "$PERF_ARGS_SET" -eq 1 ] || PERF_ARGS=""
+          PERF_BASIS=""
+          PERF_TRANSPLANT_SRC="${PERF_TRANSPLANT_SRCS[$PERF_SLOT]}"
+          # Whether the PERF target survives the reverse-apply is its own question. It used to
+          # be answered with BASE_REPO_STATE, which describes the CORRECTNESS target -- the
+          # same file, back when perf had no target of its own. Once the two can differ that
+          # is a category error in both directions: a pre-existing bench alongside a PR-added
+          # unit test would be refused a baseline it could trivially have taken, and a
+          # PR-added bench alongside a pre-existing unit test would fall through to the
+          # ordinary branch and transplant nothing. Ask about the file about to be executed.
+          PERF_BASE_STATE="present"
+          [ -f "$REPO_WT/$PERF_TARGET" ] || PERF_BASE_STATE="target-not-present"
+          if [ "$PERF_BASE_STATE" = "target-not-present" ] \
+              && [ -z "$PERF_CONTROL_COLUMN" ]; then
+            PERF_SKIP_REASON="the PR adds this target, so a base timing requires transplanting it into the base tree; that comparison spans two trees and is only attributable when a column the patch does not touch reproduces across it, so --perf-control-column is required and was not supplied"
+          elif [ "$PERF_BASE_STATE" = "target-not-present" ] \
+              && [ -n "$PERF_TRANSPLANT_SRC" ] && [ -r "$PERF_TRANSPLANT_SRC" ]; then
+            mkdir -p "$(dirname "$REPO_WT/$PERF_TARGET")"
+            cp "$PERF_TRANSPLANT_SRC" "$REPO_WT/$PERF_TARGET"
+            PERF_BASELINE_METHOD="target-transplant"
+            if [ "$PERF_ARGS_SET" -eq 1 ] || perf_detect; then
+              perf_snapshot base
+              run_perf_repeats base "$PERF_SLOT"
+              PERF_BASE_RC=$PERF_RUN_RC
+              PERF_BASE_LOGS=("${PERF_RUN_LOGS[@]}")
+              perf_restore base
+            else
+              PERF_SKIP_REASON="$PERF_BASIS"
+            fi
+            # The transplanted file is not part of the base tree and must not be left in it:
+            # the cleanliness check that guards the head phase would otherwise fail and take
+            # the whole correctness phase down with it. Reached only when the perf target was
+            # absent from base a moment ago, so this deletes what the two lines above wrote
+            # and nothing else. Spelled with $TEST_FILE it would delete a TRACKED base file
+            # whenever the two targets differ -- dirtying the tree it keeps clean.
+            rm -f "$REPO_WT/$PERF_TARGET"
+          elif [ "$PERF_BASE_STATE" = "target-not-present" ]; then
+            PERF_SKIP_REASON="the PR adds this target and no copy of it was available to transplant onto base"
+          elif [ "$PERF_ARGS_SET" -eq 1 ] || perf_detect; then
             perf_snapshot base
-            run_perf_repeats base
+            run_perf_repeats base "$PERF_SLOT"
             PERF_BASE_RC=$PERF_RUN_RC
             PERF_BASE_LOGS=("${PERF_RUN_LOGS[@]}")
-            PERF_BASE_LOG="${PERF_BASE_LOGS[0]}"
             perf_restore base
           else
             PERF_SKIP_REASON="$PERF_BASIS"
           fi
-          # The transplanted file is not part of the base tree and must not be left in it:
-          # the cleanliness check that guards the head phase would otherwise fail and take
-          # the whole correctness phase down with it. Reached only when the perf target was
-          # absent from base a moment ago, so this deletes what the two lines above wrote and
-          # nothing else. Spelled with $TEST_FILE it would delete a TRACKED base file whenever
-          # the two targets differ -- dirtying the tree it exists to keep clean.
-          rm -f "$REPO_WT/$PERF_TARGET"
-        elif [ "$PERF_BASE_STATE" = "target-not-present" ]; then
-          PERF_SKIP_REASON="the PR adds this target and no copy of it was available to transplant onto base"
-        elif [ "$PERF_ARGS_SET" -eq 1 ] || perf_detect; then
-          perf_snapshot base
-          run_perf_repeats base
-          PERF_BASE_RC=$PERF_RUN_RC
-          PERF_BASE_LOGS=("${PERF_RUN_LOGS[@]}")
-          PERF_BASE_LOG="${PERF_BASE_LOGS[0]}"
-          perf_restore base
-        else
-          PERF_SKIP_REASON="$PERF_BASIS"
-        fi
+          PERF_SKIP_REASONS[$PERF_SLOT]="$PERF_SKIP_REASON"
+          PERF_BASELINE_METHODS[$PERF_SLOT]="$PERF_BASELINE_METHOD"
+          PERF_ARGS_LIST[$PERF_SLOT]="$PERF_ARGS"
+          PERF_BASIS_LIST[$PERF_SLOT]="$PERF_BASIS"
+          PERF_BASE_RCS[$PERF_SLOT]="$PERF_BASE_RC"
+          # Log lists are variable-length, and bash has no array of arrays. They are joined on
+          # newlines here and split back on newlines at the point of use; every path is one
+          # this script generated under $WORK, so none of them can contain one.
+          PERF_BASE_LOGS_JOINED[$PERF_SLOT]=$(printf '%s\n' "${PERF_BASE_LOGS[@]}")
+        done
+        PERF_TARGET="${PERF_TARGETS[0]}"
       fi
       if [ "$GRID_HOOK_OK" -eq 1 ]; then
         if [ -f "$REPO_WT/$TEST_FILE" ]; then
@@ -1734,15 +1814,20 @@ PY
     # Head's timing run pairs with the base one and is skipped outright when base produced
     # nothing: a head-only number reproduces the PR's own comparison and cannot show a
     # regression, which is the single thing this stage is for.
-    if [ "$PERF_ENABLED" -eq 1 ] && [ -n "$PERF_BASE_LOG" ]; then
-      perf_snapshot head
-      run_perf_repeats head
-      PERF_HEAD_RC=$PERF_RUN_RC
-      PERF_HEAD_LOGS=("${PERF_RUN_LOGS[@]}")
-      PERF_HEAD_LOG="${PERF_HEAD_LOGS[0]}"
-      # Symmetric with base: the grid run and the caller's worktree both follow this point,
-      # and neither should inherit a results file the timing run happened to drop.
-      perf_restore head
+    if [ "$PERF_ENABLED" -eq 1 ]; then
+      for PERF_SLOT in "${!PERF_TARGETS[@]}"; do
+        [ -n "${PERF_BASE_LOGS_JOINED[$PERF_SLOT]:-}" ] || continue
+        PERF_TARGET="${PERF_TARGETS[$PERF_SLOT]}"
+        PERF_ARGS="${PERF_ARGS_LIST[$PERF_SLOT]}"
+        perf_snapshot head
+        run_perf_repeats head "$PERF_SLOT"
+        PERF_HEAD_RCS[$PERF_SLOT]=$PERF_RUN_RC
+        PERF_HEAD_LOGS_JOINED[$PERF_SLOT]=$(printf '%s\n' "${PERF_RUN_LOGS[@]}")
+        # Symmetric with base: the grid run and the caller's worktree both follow this point,
+        # and neither should inherit a results file the timing run happened to drop.
+        perf_restore head
+      done
+      PERF_TARGET="${PERF_TARGETS[0]}"
     fi
 
 
@@ -2076,56 +2161,79 @@ fi
 # A timeout, a crash, a missing harness and a one-row table must never be able to look like
 # a regression, because a false regression here blocks a good PR and would get the stage
 # switched off within a week.
+#
+# Every discovered target contributes one measurement, whether or not it produced a number,
+# and the stage mirrors whichever of them gates. Which that is, is decided in scrape_perf.py
+# from the measurements; nothing here ranks anything.
+PERF_STAGE_COMPOSED=0
 if [ "$PERF_ENABLED" -ne 1 ]; then
   stage_note "perf" "skip" "perf measurement was disabled with --no-perf"
-elif [ -n "$PERF_SKIP_REASON" ]; then
-  stage_note "perf" "skip" "$PERF_SKIP_REASON"
-  finding "note" "perf" \
-    "no base-vs-head timing was taken: $PERF_SKIP_REASON"
-elif [ -z "$PERF_BASE_LOG" ] || [ -z "$PERF_HEAD_LOG" ]; then
-  PERF_WHY="the run did not reach both a baseline and a head phase"
-  [ "$CAN_TEST" -eq 0 ] && PERF_WHY="${SKIP_REASON:-$PERF_WHY}"
-  stage_note "perf" "skip" "$PERF_WHY"
-  finding "note" "perf" "no base-vs-head timing was taken: $PERF_WHY"
-elif [ "$PERF_BASE_RC" -ne 0 ] || [ "$PERF_HEAD_RC" -ne 0 ]; then
-  # Deliberately not a regression. A nonzero exit means the log is truncated at an unknown
-  # point, so any ratio drawn from it compares whatever happened to print before the crash.
-  PERF_WHY="benchmark run exited nonzero (base=$PERF_BASE_RC head=$PERF_HEAD_RC); timings from a truncated run are not comparable"
-  stage_note "perf" "skip" "$PERF_WHY"
-  jset_string "stages.perf.base_log" "$PERF_BASE_LOG"
-  jset_string "stages.perf.head_log" "$PERF_HEAD_LOG"
-  finding "note" "perf" "$PERF_WHY"
 else
-  PERF_JSON="$WORK/perf-compare.json"
-  "$SCRIPT_DIR/scrape_perf.py" \
-    --base "${PERF_BASE_LOGS[@]}" --head "${PERF_HEAD_LOGS[@]}" \
-    --threshold "$PERF_THRESHOLD" --min-rows "$PERF_MIN_ROWS" \
-    --out "$PERF_JSON" >/dev/null 2>"$WORK/perf-compare.err"
-  PERF_CMP_RC=$?
-  if [ "$PERF_CMP_RC" -ne 0 ] || [ ! -r "$PERF_JSON" ]; then
-    stage_note "perf" "skip" \
-      "the benchmark comparison failed: $(log_excerpt "$WORK/perf-compare.err")"
-    finding "note" "perf" \
-      "base and head both produced benchmark logs, but they could not be compared"
-  else
-    "$SCRIPT_DIR/scrape_perf.py" stage \
-      --report "$JSON" --compare "$PERF_JSON" \
-      --base-log "$PERF_BASE_LOG" --head-log "$PERF_HEAD_LOG" \
-      --base-sha "$BASE_SHA" --command "$PERF_ARGS" --basis "$PERF_BASIS" \
-      --baseline-method "$PERF_BASELINE_METHOD" \
+  PERF_MANIFEST="$WORK/perf-measurements.json"
+  rm -f "$PERF_MANIFEST"
+  for PERF_SLOT in "${!PERF_TARGETS[@]}"; do
+    PERF_WHY="${PERF_SKIP_REASONS[$PERF_SLOT]}"
+    PERF_JSON=""
+    PERF_SLOT_BASE_LOGS=()
+    PERF_SLOT_HEAD_LOGS=()
+    [ -n "${PERF_BASE_LOGS_JOINED[$PERF_SLOT]}" ] \
+      && mapfile -t PERF_SLOT_BASE_LOGS <<<"${PERF_BASE_LOGS_JOINED[$PERF_SLOT]}"
+    [ -n "${PERF_HEAD_LOGS_JOINED[$PERF_SLOT]}" ] \
+      && mapfile -t PERF_SLOT_HEAD_LOGS <<<"${PERF_HEAD_LOGS_JOINED[$PERF_SLOT]}"
+    if [ -n "$PERF_WHY" ]; then
+      :
+    elif [ "${#PERF_SLOT_BASE_LOGS[@]}" -eq 0 ] \
+        || [ "${#PERF_SLOT_HEAD_LOGS[@]}" -eq 0 ]; then
+      PERF_WHY="the run did not reach both a baseline and a head phase"
+      [ "$CAN_TEST" -eq 0 ] && PERF_WHY="${SKIP_REASON:-$PERF_WHY}"
+    elif [ "${PERF_BASE_RCS[$PERF_SLOT]}" -ne 0 ] \
+        || [ "${PERF_HEAD_RCS[$PERF_SLOT]}" -ne 0 ]; then
+      # Deliberately not a regression. A nonzero exit means the log is truncated at an unknown
+      # point, so any ratio drawn from it compares whatever printed before the crash.
+      PERF_WHY="benchmark run exited nonzero (base=${PERF_BASE_RCS[$PERF_SLOT]} head=${PERF_HEAD_RCS[$PERF_SLOT]}); timings from a truncated run are not comparable"
+    else
+      PERF_JSON="$WORK/perf-compare-$PERF_SLOT.json"
+      "$SCRIPT_DIR/scrape_perf.py" \
+        --base "${PERF_SLOT_BASE_LOGS[@]}" --head "${PERF_SLOT_HEAD_LOGS[@]}" \
+        --threshold "$PERF_THRESHOLD" --min-rows "$PERF_MIN_ROWS" \
+        --out "$PERF_JSON" >/dev/null 2>"$WORK/perf-compare-$PERF_SLOT.err"
+      PERF_CMP_RC=$?
+      if [ "$PERF_CMP_RC" -ne 0 ] || [ ! -r "$PERF_JSON" ]; then
+        PERF_WHY="the benchmark comparison failed: $(log_excerpt "$WORK/perf-compare-$PERF_SLOT.err")"
+        PERF_JSON=""
+      fi
+    fi
+    "$SCRIPT_DIR/scrape_perf.py" measure \
+      --manifest "$PERF_MANIFEST" \
+      --target "${PERF_TARGETS[$PERF_SLOT]}" \
+      --target-basis "${PERF_TARGET_BASES[$PERF_SLOT]}" \
+      --target-basis-reason "${PERF_TARGET_BASIS_REASONS[$PERF_SLOT]}" \
+      --target-provenance "${PERF_TARGET_PROVENANCES[$PERF_SLOT]}" \
+      --target-provenance-reason "${PERF_TARGET_PROVENANCE_REASONS[$PERF_SLOT]}" \
+      --skip-reason "$PERF_WHY" --compare "$PERF_JSON" \
+      --base-log "${PERF_SLOT_BASE_LOGS[0]:-}" \
+      --head-log "${PERF_SLOT_HEAD_LOGS[0]:-}" \
+      --base-sha "$BASE_SHA" --command "${PERF_ARGS_LIST[$PERF_SLOT]}" \
+      --basis "${PERF_BASIS_LIST[$PERF_SLOT]}" \
+      --baseline-method "${PERF_BASELINE_METHODS[$PERF_SLOT]}" \
       --control-column "$PERF_CONTROL_COLUMN" --control-tol "$PERF_CONTROL_TOL"
-  fi
+  done
+  "$SCRIPT_DIR/scrape_perf.py" stage --report "$JSON" --manifest "$PERF_MANIFEST"
+  PERF_STAGE_COMPOSED=1
 fi
 
-# After the chain, not inside it. `scrape_perf.py stage` REPLACES stages.perf wholesale and
-# stage_note does too, so a field written by any branch above would survive on some paths and
-# vanish on others -- and the reader most in need of knowing which file was timed is the one
-# reading a `skip`. Written once here, every branch reports it.
-jset_string "stages.perf.target" "$PERF_TARGET"
-jset_string "stages.perf.target_basis" "$PERF_TARGET_BASIS"
-jset_string "stages.perf.target_provenance" "$PERF_TARGET_PROVENANCE"
-jset_string "stages.perf.target_provenance_reason" "$PERF_TARGET_PROVENANCE_REASON"
-jset_string "stages.perf.target_basis_reason" "$PERF_TARGET_BASIS_REASON"
+# After the chain, not inside it. stage_note REPLACES stages.perf wholesale, so a field
+# written by the branch above would survive on some paths and vanish on others -- and the
+# reader most in need of knowing which file was timed is the one reading a `skip`. Skipped
+# when the measurements composed the stage, because there the target fields describe the
+# measurement that gates, and this would overwrite that answer with the first target's.
+if [ "$PERF_STAGE_COMPOSED" -ne 1 ]; then
+  jset_string "stages.perf.target" "$PERF_TARGET"
+  jset_string "stages.perf.target_basis" "$PERF_TARGET_BASIS"
+  jset_string "stages.perf.target_provenance" "$PERF_TARGET_PROVENANCE"
+  jset_string "stages.perf.target_provenance_reason" "$PERF_TARGET_PROVENANCE_REASON"
+  jset_string "stages.perf.target_basis_reason" "$PERF_TARGET_BASIS_REASON"
+fi
 # Reported even where discovery declined, and especially there: a reader who is told only
 # "the fallback stood" cannot tell an empty search from a search that found three benches and
 # refused to pick between them. The second of those is a question for the caller.

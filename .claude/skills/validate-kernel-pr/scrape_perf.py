@@ -662,15 +662,24 @@ def _resolve(candidates, correctness_target, kind, advice):
     return candidates[0], ""
 
 
-def choose_perf_target(shipped, repo_benches, correctness_target):
-    """Which of the two discovered targets to time, or why the fallback stands.
+def choose_perf_targets(shipped, repo_benches, correctness_target):
+    """Every discovered target worth timing, or the single fallback entry.
 
-    A repository bench wins over one the PR ships, and the reason is mechanical rather than a
+    When both paths resolve, BOTH are timed. They are not two guesses at one answer that a
+    tie-break should reduce to one: a bench already in the repository and a bench the PR
+    wrote measure different things, and the second is the one whose author chose what it
+    would say. Timing only the first would let a PR ship a bench nobody ran; timing only the
+    second would take the author's word for which numbers matter. The cost is one extra pair
+    of runs, and which of them decides the verdict is settled later by gate(), on the
+    measurements rather than on the choice.
+
+    The repository bench is listed first, and the reason is mechanical rather than a
     preference. A pre-existing bench is on BOTH sides of the patch, so the baseline is this
     worktree with the patch reversed -- one tree, no extra burden of proof. A bench the PR
     adds is absent from base and forces the target-transplant baseline, which spans two trees
-    and is only attributable when --perf-control-column reproduces across them. Choosing the
-    cheaper, more attributable comparison is not taste.
+    and is only attributable when --perf-control-column reproduces across them. Ordering the
+    cheaper, more attributable comparison first is not taste; it is also the order gate()
+    falls back on when nothing separates them.
     """
     repo_target, repo_reason = _resolve(
         repo_benches,
@@ -685,34 +694,44 @@ def choose_perf_target(shipped, repo_benches, correctness_target):
         "the benchmark the patch ships",
     )
     candidates = sorted(set(repo_benches) | set(shipped["candidates"]))
+    targets = []
 
     if repo_target is not None:
-        return {
-            "basis": BASIS_REPO,
-            "target": repo_target,
-            "reason": (
-                "the repository already owns exactly one benchmark importing what this patch "
-                "changed, and it is on both sides of the patch so the baseline needs no "
-                "transplant"
-            ),
-            "candidates": candidates,
-        }
+        targets.append(
+            {
+                "basis": BASIS_REPO,
+                "target": repo_target,
+                "reason": (
+                    "the repository already owns exactly one benchmark importing what this "
+                    "patch changed, and it is on both sides of the patch so the baseline "
+                    "needs no transplant"
+                ),
+            }
+        )
     if ship_target is not None:
-        return {
-            "basis": BASIS_SHIPPED,
-            "target": ship_target,
-            "reason": (
-                "the patch ships exactly one file carrying a benchmark harness, and the "
-                "repository offers none: %s" % repo_reason
-            ),
-            "candidates": candidates,
-        }
-    return {
-        "basis": BASIS_FALLBACK,
-        "target": correctness_target,
-        "reason": f"{repo_reason}; and {ship_reason}",
-        "candidates": candidates,
-    }
+        targets.append(
+            {
+                "basis": BASIS_SHIPPED,
+                "target": ship_target,
+                "reason": (
+                    "the patch ships exactly one file carrying a benchmark harness"
+                    + (
+                        ""
+                        if repo_target is not None
+                        else f", and the repository offers none: {repo_reason}"
+                    )
+                ),
+            }
+        )
+    if not targets:
+        targets.append(
+            {
+                "basis": BASIS_FALLBACK,
+                "target": correctness_target,
+                "reason": f"{repo_reason}; and {ship_reason}",
+            }
+        )
+    return {"targets": targets, "candidates": candidates}
 
 
 def _status_entries(text):
@@ -916,6 +935,117 @@ def perf_stage(result, context):
     return stage, findings
 
 
+# What a measurement carries about the file it timed. Repeated on every entry rather than
+# stated once for the stage: with two targets in play there is no "the" target, and a reader
+# holding one row of measurements[] must be able to tell what it measured without counting
+# back to a header.
+MEASUREMENT_TARGET_FIELDS = (
+    "target",
+    "target_basis",
+    "target_basis_reason",
+    "target_provenance",
+    "target_provenance_reason",
+)
+
+
+def measurement(context, read_text):
+    """One target's timing result: the stage entry it produces, and the findings it earns.
+
+    A target that was never timed is still a measurement. Dropping it would leave the report
+    describing only the targets that happened to work, which reads as though the others were
+    never tried -- and "the repository's bench was timed and the PR's own bench could not be"
+    is exactly the sentence a reviewer needs.
+    """
+    if context.get("skip_reason"):
+        stage = {"status": "skip", "note": context["skip_reason"]}
+        # Carried onto a skip too, when there are any. A run that exited nonzero produced a
+        # truncated log and no ratio; the log is still the only place a reader can see what
+        # it was doing when it stopped.
+        for side in ("base_log", "head_log"):
+            if context.get(side):
+                stage[side] = context[side]
+        findings = [
+            {
+                "severity": "note",
+                "stage": "perf",
+                "detail": "no base-vs-head timing was taken: " + context["skip_reason"],
+            }
+        ]
+    else:
+        stage, findings = perf_stage(json.loads(read_text(context["compare"])), context)
+    for field in MEASUREMENT_TARGET_FIELDS:
+        stage[field] = context.get(field, "")
+    return {"measurement": stage, "findings": findings}
+
+
+# `fail` is worse than `pass`, and both are worse than `skip` -- which is not a ranking of
+# outcomes but of standing. A skip made no claim, so it cannot be the measurement a verdict
+# rests on; it sinks to the bottom and only decides anything when nothing else is left.
+GATE_RANK = {"fail": 0, "pass": 1, "skip": 2}
+
+
+def gate(entries):
+    """Which of the timed targets decides the verdict.
+
+    The worse attributable number gates, and neither half of that is a new rule. A target
+    whose comparison could not be attributed reports `skip` -- the control-column gate in
+    attribute() already downgrades an unattributable cross-tree measurement, so an
+    un-chargeable number never reaches this ranking in a state where it could gate. Among
+    those that remain, taking the worst is what median_ratio already does across the columns
+    of a single table: the minimum, not the mean, because a kernel that got slower on one
+    shape got slower.
+
+    Ties fall to the earlier entry, which choose_perf_targets orders repository bench first --
+    the comparison that needed no transplant to be believable.
+    """
+
+    def worse(item):
+        index, entry = item
+        result = entry["measurement"]
+        return (
+            GATE_RANK.get(result["status"], 2),
+            result.get("median_ratio", 1.0),
+            index,
+        )
+
+    return min(enumerate(entries), key=worse)[1]
+
+
+def cmd_measure(args):
+    """Append one target's result to the manifest the stage is later composed from.
+
+    Written incrementally, one call per target, because the alternative is bash holding a
+    growing JSON structure in a shell variable and splicing into it -- which is authoring
+    JSON in bash, and every bug that has cost this validator a report came from doing that.
+    """
+    path = Path(args.manifest)
+    entries = json.loads(path.read_text()) if path.exists() else []
+    entries.append(
+        measurement(
+            {
+                "target": args.target,
+                "target_basis": args.target_basis,
+                "target_basis_reason": args.target_basis_reason,
+                "target_provenance": args.target_provenance,
+                "target_provenance_reason": args.target_provenance_reason,
+                "skip_reason": args.skip_reason,
+                "compare": args.compare,
+                "base_log": args.base_log,
+                "head_log": args.head_log,
+                "base_sha": args.base_sha,
+                "command": args.command,
+                "basis": args.basis,
+                "baseline_method": args.baseline_method,
+                "control_column": args.control_column,
+                "control_tol": args.control_tol,
+            },
+            read_text=lambda name: Path(name).read_text(),
+        )
+    )
+    path.write_text(json.dumps(entries, indent=2))
+    return 0
+
+
 def cmd_detect(args):
     """Exit 3, not 1, when there is no harness: 1 is what a crashed detector returns.
 
@@ -968,8 +1098,12 @@ def cmd_discover(args):
         read_text,
         exclude=set(shipped["candidates"]),
     )
-    decision = choose_perf_target(shipped, repo_benches, args.correctness_target)
+    decision = choose_perf_targets(shipped, repo_benches, args.correctness_target)
     decision["unspellable"] = shipped["unspellable"]
+    # Emitted so the caller can bound a `for` loop without asking a second question. bash has
+    # no way to measure the length of a JSON list, and the alternative -- reading indices
+    # until one comes back empty -- cannot tell "past the end" from "this field is empty".
+    decision["target_count"] = len(decision["targets"])
     print(json.dumps(decision))
     return 0
 
@@ -1007,23 +1141,31 @@ def cmd_restore(args):
 
 
 def cmd_stage(args):
+    """Compose stages.perf from every measurement taken, mirroring the one that gates.
+
+    The gating measurement's fields are copied to the top level rather than nested under a
+    winner, so `median_ratio`, `worst_column` and `regressed_rows` sit exactly where they sat
+    when there was only ever one target. review-pr and validate_evidence.py read them from
+    there and keep working without knowing this stage can now hold more than one number.
+    """
     report = json.loads(Path(args.report).read_text())
-    result = json.loads(Path(args.compare).read_text())
-    stage, findings = perf_stage(
-        result,
-        {
-            "base_log": args.base_log,
-            "head_log": args.head_log,
-            "base_sha": args.base_sha,
-            "command": args.command,
-            "basis": args.basis,
-            "baseline_method": args.baseline_method,
-            "control_column": args.control_column,
-            "control_tol": args.control_tol,
-        },
-    )
+    entries = json.loads(Path(args.manifest).read_text())
+    chosen = gate(entries)
+    stage = dict(chosen["measurement"])
+    stage["measurements"] = [entry["measurement"] for entry in entries]
     report["stages"]["perf"] = stage
-    report["findings"].extend(findings)
+    # The gating measurement's findings in full; from the others, only the notes. A second
+    # target that also regressed is already in measurements[] with its own rows, and a second
+    # should-fix would double the count of one problem -- finish_report reads that count. Its
+    # notes are a different matter: "the PR's own bench could not be attributed" is a reason
+    # the reader is owed whether or not that measurement is the one that gates.
+    report["findings"].extend(chosen["findings"])
+    for entry in entries:
+        if entry is chosen:
+            continue
+        report["findings"].extend(
+            item for item in entry["findings"] if item["severity"] == "note"
+        )
     Path(args.report).write_text(json.dumps(report, indent=2))
     return 0
 
@@ -1056,17 +1198,30 @@ def subcommand(argv):
     restore.add_argument("before")
     restore.set_defaults(func=cmd_restore)
 
+    measure = sub.add_parser(
+        "measure", help="record one target's timing result for the stage"
+    )
+    measure.add_argument("--manifest", required=True)
+    measure.add_argument("--target", default="")
+    measure.add_argument("--target-basis", default="")
+    measure.add_argument("--target-basis-reason", default="")
+    measure.add_argument("--target-provenance", default="")
+    measure.add_argument("--target-provenance-reason", default="")
+    measure.add_argument("--skip-reason", default="")
+    measure.add_argument("--compare", default="")
+    measure.add_argument("--base-log", default="")
+    measure.add_argument("--head-log", default="")
+    measure.add_argument("--base-sha", default="")
+    measure.add_argument("--command", default="")
+    measure.add_argument("--basis", default="")
+    measure.add_argument("--baseline-method", default="patch-reversed-same-worktree")
+    measure.add_argument("--control-column", default="")
+    measure.add_argument("--control-tol", default="0.10")
+    measure.set_defaults(func=cmd_measure)
+
     stage = sub.add_parser("stage", help="write the perf stage into the report")
     stage.add_argument("--report", required=True)
-    stage.add_argument("--compare", required=True)
-    stage.add_argument("--base-log", required=True)
-    stage.add_argument("--head-log", required=True)
-    stage.add_argument("--base-sha", required=True)
-    stage.add_argument("--command", default="")
-    stage.add_argument("--basis", default="")
-    stage.add_argument("--baseline-method", required=True)
-    stage.add_argument("--control-column", default="")
-    stage.add_argument("--control-tol", default="0.10")
+    stage.add_argument("--manifest", required=True)
     stage.set_defaults(func=cmd_stage)
 
     args = parser.parse_args(argv)
@@ -1078,7 +1233,7 @@ def subcommand(argv):
 # -- `discover` was registered on the subparser, reached this list's `not in`, and fell through
 # to the bare comparison parser, which exited 2 complaining about a missing --base. A caller
 # reading that has no reason to suspect the subcommand exists.
-SUBCOMMANDS = ("detect", "discover", "restore-worktree", "stage")
+SUBCOMMANDS = ("detect", "discover", "measure", "restore-worktree", "stage")
 
 
 def main(argv=None):
