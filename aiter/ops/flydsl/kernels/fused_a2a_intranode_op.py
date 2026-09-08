@@ -43,10 +43,12 @@ class FusedA2AIntraNodeOp:
     """Own symmetric receive and handshake buffers for one tensor shape.
 
     Set split=True or FUSED_A2A_SPLIT=1 for three ordered per-tensor launches.
-    Set quant=True or FUSED_A2A_QUANT=1 for Q/K/V MX E4M3 payloads.
+    Set quant=True or FUSED_A2A_QUANT=1 for Q/K/V quantized payloads.
+    FUSED_A2A_CODEC selects e4m3 (default) or symmetric int8 at construction.
     Quantized calls return locally dequantized bf16 Q/K/V by default.
-    Set return_mode="fp8" or FUSED_A2A_QUANT_RETURN=fp8 for
+    Set return_mode="fp8" or FUSED_A2A_QUANT_RETURN=fp8 for raw codec bytes in
     (outputs, (q_scales, k_scales, v_scales)); explicit return_mode overrides the env.
+    The legacy "fp8" return-mode name also selects raw bytes for int8.
     Scales follow the receive layout with one E8M0 byte per 32 adjacent values.
     All ranks must use the same mode and serialize calls on one stream.
     """
@@ -66,6 +68,11 @@ class FusedA2AIntraNodeOp:
         return_mode=None,
     ):
         self.quant = quant or os.environ.get("FUSED_A2A_QUANT", "0") == "1"
+        self.codec = os.environ.get("FUSED_A2A_CODEC", "e4m3")
+        if self.codec not in ("e4m3", "int8"):
+            raise ValueError(
+                f"expected FUSED_A2A_CODEC 'e4m3' or 'int8', got {self.codec}"
+            )
         self.return_mode = (
             os.environ.get("FUSED_A2A_QUANT_RETURN", "bf16")
             if return_mode is None
@@ -141,7 +148,7 @@ class FusedA2AIntraNodeOp:
                 for _ in range(2)
             )
             self._dequant_launch = make_fused_a2a_dequant_jit(
-                numel=numel, return_mode=self.return_mode
+                numel=numel, return_mode=self.return_mode, codec=self.codec
             )
         self.xdb_mem = mori_shmem_create_tensor((world_size,), torch.int64)
         for outputs in self.outputs_sets:
@@ -189,6 +196,7 @@ class FusedA2AIntraNodeOp:
                 fuse_norm_rope=role,
                 split=self.split,
                 quant=self.quant,
+                codec=self.codec,
                 element_size=element_size,
                 return_mode=self.return_mode,
             )

@@ -24,11 +24,63 @@ from .communication_ops_utils import (
 )
 from .quant_utils import emit_mx_e8m0_scale
 
-_JIT_SCHEMA_VERSION = "v15-v-quant"
+_JIT_SCHEMA_VERSION = "v16-v-quant-int8"
 _TRANSPORT_CHUNK_BYTES = 16
 _PUSH_PIPELINE_DEPTH = 16
 _OUT_CHANNEL_COUNT = 8
 _OUT_CHANNEL_DEPTH = 1
+
+
+def _int8_e8m0_scale(amax):
+    # Match the symmetric INT8 codec's floor and exponent cap, not MXFP8's.
+    need = (amax / fx.Float32(127.0)).maximumf(fx.Float32(1.0e-30))
+    exponent = (fmath.ceil(fmath.log2(need)) + fx.Float32(127.0)).to(fx.Int32)
+    exponent = (exponent < 0).select(fx.Int32(0), exponent)
+    return (exponent > 254).select(fx.Int32(254), exponent)
+
+
+def _pack_int8_pair(first, second):
+    packed = []
+    for value in (first, second):
+        rounded = fmath.roundeven(value)
+        clipped = rounded.maximumf(fx.Float32(-127.0)).minimumf(fx.Float32(127.0))
+        packed.append(clipped.to(fx.Int32) & 255)
+    return (packed[0] | (packed[1] << 8)).to(fx.Int16)
+
+
+def _unpack_int8_pair(word, high):
+    # Arithmetic shifts sign-extend each byte without an i8 vector memory op.
+    shift = 16 if high else 0
+    first = ((word << (24 - shift)) >> 24).to(fx.Float32)
+    second = ((word << (16 - shift)) >> 24).to(fx.Float32)
+    return fx.Vector.from_elements([first, second], fx.Float32)
+
+
+def _transport_scale(amax, codec):
+    if codec == "int8":
+        return _int8_e8m0_scale(amax)
+    return fx.Int32(
+        emit_mx_e8m0_scale(
+            amax.ir_value(),
+            mode=MxScaleRoundModeInt.RoundUp,
+            dtype=MxDtypeInt.FP8_E4M3,
+        )
+    )
+
+
+def _pack_transport_pair(first, second, codec):
+    if codec == "int8":
+        return _pack_int8_pair(first, second)
+    word = fx.rocdl.cvt_pk_fp8_f32(
+        T.i32, first.ir_value(), second.ir_value(), fx.Int32(0).ir_value(), 0
+    )
+    return fx.Int32(word).to(fx.Int16)
+
+
+def _unpack_transport_pair(word, high, codec):
+    if codec == "int8":
+        return _unpack_int8_pair(word, high)
+    return fx.Vector(fx.rocdl.cvt_pk_f32_fp8(T.f32x2, word, high))
 
 
 def make_fused_a2a_kernel(
@@ -43,6 +95,7 @@ def make_fused_a2a_kernel(
     fuse_norm_rope,
     split=False,
     quant=False,
+    codec="e4m3",
     element_size=2,
 ):
     row_nbytes = head_dim * element_size
@@ -227,26 +280,19 @@ def make_fused_a2a_kernel(
                             # Four adjacent vec=8 lanes own one post-RoPE MX block.
                             for shift in (1, 2):
                                 amax = amax.maximumf(amax.shuffle_xor(shift, 64))
-                            scale = fx.Int32(
-                                emit_mx_e8m0_scale(
-                                    amax.ir_value(),
-                                    mode=MxScaleRoundModeInt.RoundUp,
-                                    dtype=MxDtypeInt.FP8_E4M3,
-                                )
-                            )
+                            scale = _transport_scale(amax, codec)
                             reciprocal = ((fx.Int32(254) - scale) << 23).bitcast(
                                 fx.Float32
                             )
                             packed = []
                             for pair in range_constexpr(vec // 2):
-                                word = fx.rocdl.cvt_pk_fp8_f32(
-                                    T.i32,
-                                    (rotated[2 * pair] * reciprocal).ir_value(),
-                                    (rotated[2 * pair + 1] * reciprocal).ir_value(),
-                                    fx.Int32(0).ir_value(),
-                                    0,
+                                packed.append(
+                                    _pack_transport_pair(
+                                        rotated[2 * pair] * reciprocal,
+                                        rotated[2 * pair + 1] * reciprocal,
+                                        codec,
+                                    )
                                 )
-                                packed.append(fx.Int32(word).to(fx.Int16))
                             outputs.append(
                                 fx.Vector.from_elements(packed, dtype=fx.Int16).bitcast(
                                     fx.Int32
@@ -383,24 +429,17 @@ def make_fused_a2a_kernel(
                         # Each aligned four-lane group owns 32 contiguous head values.
                         for shift in (1, 2):
                             amax = amax.maximumf(amax.shuffle_xor(shift, 64))
-                        scale = fx.Int32(
-                            emit_mx_e8m0_scale(
-                                amax.ir_value(),
-                                mode=MxScaleRoundModeInt.RoundUp,
-                                dtype=MxDtypeInt.FP8_E4M3,
-                            )
-                        )
+                        scale = _transport_scale(amax, codec)
                         reciprocal = ((fx.Int32(254) - scale) << 23).bitcast(fx.Float32)
                         packed = []
                         for pair in range_constexpr(elements_per_chunk // 2):
-                            word = fx.rocdl.cvt_pk_fp8_f32(
-                                T.i32,
-                                (decoded[2 * pair] * reciprocal).ir_value(),
-                                (decoded[2 * pair + 1] * reciprocal).ir_value(),
-                                fx.Int32(0).ir_value(),
-                                0,
+                            packed.append(
+                                _pack_transport_pair(
+                                    decoded[2 * pair] * reciprocal,
+                                    decoded[2 * pair + 1] * reciprocal,
+                                    codec,
+                                )
                             )
-                            packed.append(fx.Int32(word).to(fx.Int16))
                         values.append(
                             fx.Vector.from_elements(packed, dtype=fx.Int16).bitcast(
                                 fx.Int32
@@ -558,6 +597,7 @@ def make_fused_a2a_jit(
     fuse_norm_rope,
     split=False,
     quant=False,
+    codec="e4m3",
     element_size=2,
     return_mode="bf16",
 ):
@@ -572,6 +612,7 @@ def make_fused_a2a_jit(
         fuse_norm_rope=fuse_norm_rope,
         split=split,
         quant=quant,
+        codec=codec,
         element_size=element_size,
     )
     key = (
@@ -585,6 +626,7 @@ def make_fused_a2a_jit(
         fuse_norm_rope,
         split,
         quant,
+        codec,
         element_size,
         return_mode,
         _JIT_SCHEMA_VERSION,
@@ -671,10 +713,10 @@ def make_fused_a2a_jit(
     return launch_single if split else launch
 
 
-def make_fused_a2a_dequant_jit(*, numel, return_mode="bf16"):
+def make_fused_a2a_dequant_jit(*, numel, return_mode="bf16", codec="e4m3"):
     block_threads = 256
     vec = 8
-    key = (numel, return_mode, _JIT_SCHEMA_VERSION)
+    key = (numel, return_mode, codec, _JIT_SCHEMA_VERSION)
 
     @flyc.kernel(known_block_size=[block_threads, 1, 1])
     def fused_a2a_dequant(
@@ -720,10 +762,8 @@ def make_fused_a2a_dequant_jit(*, numel, return_mode="bf16"):
             scale = scale_bits.bitcast(fx.Float32)
             values = []
             for pair_index in range_constexpr(vec // 2):
-                pair = fx.Vector(
-                    fx.rocdl.cvt_pk_f32_fp8(
-                        T.f32x2, words[pair_index // 2], bool(pair_index % 2)
-                    )
+                pair = _unpack_transport_pair(
+                    words[pair_index // 2], bool(pair_index % 2), codec
                 )
                 values.append(pair[0] * scale)
                 values.append(pair[1] * scale)

@@ -9,6 +9,7 @@ import os
 import socket
 
 import mori.shmem as ms
+import pytest
 import torch
 import torch.distributed as dist
 import torch.distributed._functional_collectives as funcol
@@ -78,24 +79,37 @@ def _mx_fp8_reference(values):
     return payload.view(torch.uint8).reshape_as(values), exponent.to(torch.uint8)
 
 
-def _dequantize(payload, scales, dtype=torch.float32):
-    blocks = payload.view(torch.float8_e4m3fn).float().reshape(*scales.shape, 32)
+def _mx_int8_reference(values):
+    """Symmetric RNE INT8 with the golden block-32 E8M0 scale rule."""
+    blocks = values.float().reshape(*values.shape[:-1], -1, 32)
+    need = (blocks.abs().amax(dim=-1) / 127.0).clamp_min(1.0e-30)
+    exponent = (torch.ceil(torch.log2(need)) + 127.0).clamp(0, 254)
+    scale = torch.exp2(exponent - 127.0)
+    payload = torch.round(blocks / scale.unsqueeze(-1)).clamp(-127, 127).to(torch.int8)
+    return payload.view(torch.uint8).reshape_as(values), exponent.to(torch.uint8)
+
+
+def _dequantize(payload, scales, dtype=torch.float32, codec="e4m3"):
+    value_dtype = torch.int8 if codec == "int8" else torch.float8_e4m3fn
+    blocks = payload.view(value_dtype).float().reshape(*scales.shape, 32)
     scale = torch.exp2(scales.float() - 127)
     return (blocks * scale.unsqueeze(-1)).reshape_as(payload).to(dtype)
 
 
-def _assert_quantized(payload, scales, reference, reference_scales, oracle, label):
+def _assert_quantized(
+    payload, scales, reference, reference_scales, oracle, label, codec="e4m3"
+):
     if payload.dtype != torch.uint8 or scales.dtype != torch.uint8:
         raise AssertionError(f"{label}: payload and E8M0 scales must be uint8")
     _assert_equal(scales, reference_scales, f"{label} scales")
-    actual = _dequantize(payload, scales)
+    actual = _dequantize(payload, scales, codec=codec)
     return _assert_quantized_values(actual, reference, oracle, label)
 
 
 def _assert_quantized_values(actual, reference, oracle, label):
     format_sqnr, _, _ = _metrics(actual, reference)
     mismatch_fraction = (actual != reference).float().mean().item()
-    # FP32 norm/RoPE can cross an FP8 rounding midpoint, but only very rarely.
+    # FP32 norm/RoPE can cross a codec rounding midpoint, but only very rarely.
     if not (format_sqnr >= 60.0 and mismatch_fraction <= 1.0e-4):
         raise AssertionError(
             f"{label}: format SQNR={format_sqnr:.4f} dB, "
@@ -140,6 +154,8 @@ def _assert_equal(actual, reference, label):
 def _run_rank(rank, world_size, port):
     torch.cuda.set_device(rank)
     device = torch.device("cuda", rank)
+    codec = os.environ.get("FUSED_A2A_CODEC", "e4m3")
+    quant_reference = _mx_int8_reference if codec == "int8" else _mx_fp8_reference
     dist.init_process_group(
         "cpu:gloo,cuda:nccl",
         init_method=f"tcp://127.0.0.1:{port}",
@@ -284,9 +300,12 @@ def _run_rank(rank, world_size, port):
                     if fuse_norm_rope
                     else inputs
                 )
-                quantized = [_mx_fp8_reference(input) for input in quant_inputs]
+                quantized = [quant_reference(input) for input in quant_inputs]
                 quant_references = a2a_references(
-                    [_dequantize(payload, scale) for payload, scale in quantized],
+                    [
+                        _dequantize(payload, scale, codec=codec)
+                        for payload, scale in quantized
+                    ],
                     heads_local,
                     seq_len,
                     head_dim,
@@ -329,6 +348,7 @@ def _run_rank(rank, world_size, port):
                                         scale_references[i],
                                         expected[i],
                                         tensor_name,
+                                        codec=codec,
                                     )
                                 )
                         else:
@@ -346,6 +366,7 @@ def _run_rank(rank, world_size, port):
                                         scale_references[i].shape
                                     ),
                                     torch.bfloat16,
+                                    codec=codec,
                                 )
                                 _assert_equal(actual, received_reference, tensor_name)
                                 quant_metrics.append(
@@ -357,10 +378,25 @@ def _run_rank(rank, world_size, port):
                                     )
                                     + " native-dequant=bit-exact"
                                 )
+                        if case_name == "small":
+                            actual_v = actuals[2].view(expected_shape)
+                            if return_mode == "fp8":
+                                actual_v = _dequantize(
+                                    actual_v,
+                                    scales[2].view(scale_references[2].shape),
+                                    codec=codec,
+                                )
+                            # Outlier absmax coarsens uniform INT8's bulk; deployed V lacks this pattern and gains 11.6 dB.
+                            min_v_sqnr = 31.0 if codec == "int8" else 40.0
+                            v_sqnr, _, _ = _metrics(actual_v, expected[2])
+                            if not v_sqnr >= min_v_sqnr:
+                                raise AssertionError(
+                                    f"small {codec} V: SQNR={v_sqnr:.4f} dB < {min_v_sqnr} dB"
+                                )
                         dist.barrier()
                     if rank == 0:
                         print(
-                            f"PASS {case_name} quant=True split={split} "
+                            f"PASS {case_name} quant=True codec={codec} split={split} "
                             f"norm_rope={fuse_norm_rope} return={return_mode}: "
                             + " ".join(quant_metrics)
                             + " epochs=3",
@@ -422,6 +458,19 @@ def main():
     skipped = len(_CASES) * int(_WORLD_SIZE < 8)
     print(f"{passed} passed, {skipped} skipped on {arch}")
     return 0
+
+
+def test_fused_a2a(capfd):
+    if not torch.cuda.is_available():
+        pytest.skip("fused_a2a requires ROCm GPUs")
+    arch = get_gfx_runtime()
+    if arch != "gfx950":
+        pytest.skip(f"fused_a2a supports gfx950, attached GPU is {arch}")
+    if torch.cuda.device_count() < _WORLD_SIZE:
+        pytest.skip(f"fused_a2a requires {_WORLD_SIZE} visible GPUs")
+    # Keep per-hop codec quality visible with the standard pytest -rs invocation.
+    with capfd.disabled():
+        assert main() == 0
 
 
 if __name__ == "__main__":
