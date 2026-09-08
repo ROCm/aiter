@@ -2,6 +2,9 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 """CPU regressions for fused-MoE legacy loading and AOT architecture handling."""
 
+import csv
+import glob
+import os
 import unittest
 
 import pandas as pd
@@ -63,6 +66,8 @@ class TestFmoeLegacyGfxLoading(unittest.TestCase):
     def test_unknown_cu_num_raises_instead_of_using_live_gpu(self):
         with self.assertRaisesRegex(ValueError, "cannot infer gfx from cu_num=128"):
             backfill_dataframe_gfx(pd.DataFrame({"cu_num": [128]}), "unknown.csv")
+        with self.assertRaisesRegex(ValueError, "cannot infer gfx from cu_num=96"):
+            backfill_dataframe_gfx(pd.DataFrame({"cu_num": [96]}), "gfx1250-96.csv")
 
     def test_placeholder_gfx_with_unknown_cu_num_raises(self):
         with self.assertRaisesRegex(ValueError, "cannot infer gfx from cu_num=128"):
@@ -72,9 +77,13 @@ class TestFmoeLegacyGfxLoading(unittest.TestCase):
 
     def test_load_and_aot_share_placeholder_set(self):
         from aiter.aot.flydsl.common import GFX_PLACEHOLDERS as aot_placeholders
+        from aiter.aot.flydsl.common import LEGACY_CU_NUM_TO_GFX as aot_cu_map
+        from aiter.jit.utils.chip_info import LEGACY_CU_NUM_TO_GFX as load_cu_map
 
         self.assertIs(GFX_PLACEHOLDERS, aot_placeholders)
+        self.assertIs(load_cu_map, aot_cu_map)
         self.assertIn("0", GFX_PLACEHOLDERS)
+        self.assertNotIn(96, load_cu_map)
 
 
 @unittest.skipUnless(
@@ -104,6 +113,83 @@ class TestFlydslMoeAotGfx(unittest.TestCase):
             resolve_job_arch("not-a-cu", "")
         with self.assertRaisesRegex(ValueError, "cannot map cu_num"):
             resolve_job_arch(128, "0")
+        with self.assertRaisesRegex(ValueError, "cannot map cu_num"):
+            resolve_job_arch(96, "")
+        with self.assertRaisesRegex(ValueError, "cannot map cu_num"):
+            resolve_job_arch(96, "0")
+
+
+# Merge-name substrings from FlyDSL AOT DEFAULT_CSVS (moe, mxfp4_moe, gemm,
+# grouped_moe, chunk_gdn_h). Untuned tables never hit resolve_job_arch.
+_AOT_TUNED_FAMILY_MARKERS = (
+    "tuned_fmoe",
+    "tuned_fhmoe",
+    "tuned_grouped_fmoe",
+    "a4w4_blockscale_tuned_gemm",
+    "a8w8_tuned_gemm",
+    "a8w8_bpreshuffle_tuned_gemm",
+    "a8w8_blockscale_tuned_gemm",
+    "a8w8_blockscale_bpreshuffle_tuned_gemm",
+    "a8w8_tuned_batched_gemm",
+    "bf16_tuned_batched_gemm",
+    "bf16_tuned_gemm",
+    "chunk_gdn_h_opt_tuned",
+)
+
+
+def _aot_family_tuned_csvs():
+    configs = os.path.join(
+        os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
+        "aiter",
+        "configs",
+    )
+    for path in glob.glob(os.path.join(configs, "**", "*.csv"), recursive=True):
+        name = os.path.basename(path)
+        if "untuned" in name:
+            continue
+        if any(marker in name for marker in _AOT_TUNED_FAMILY_MARKERS):
+            yield path
+
+
+@unittest.skipUnless(
+    resolve_job_arch is not None, f"resolve_job_arch not importable: {_JOB_ARCH_ERR}"
+)
+class TestAotFamilyTunedCsvsResolveArch(unittest.TestCase):
+    def test_every_aot_family_row_resolves_without_guessing_96(self):
+        failures = []
+        files = 0
+        rows = 0
+        cu96 = 0
+        for path in _aot_family_tuned_csvs():
+            files += 1
+            with open(path, newline="", encoding="utf-8") as f:
+                reader = csv.DictReader(
+                    line for line in f if not line.lstrip().startswith("#")
+                )
+                for i, row in enumerate(reader, start=2):
+                    rows += 1
+                    gfx = (row.get("gfx") or "").strip()
+                    cu_raw = (row.get("cu_num") or "").strip()
+                    try:
+                        cu_num = int(float(cu_raw)) if cu_raw else 0
+                    except ValueError:
+                        failures.append(f"{path}:{i} unparsable cu_num={cu_raw!r}")
+                        continue
+                    if cu_num == 96:
+                        cu96 += 1
+                    try:
+                        arch = resolve_job_arch(cu_num, gfx)
+                    except ValueError as e:
+                        failures.append(f"{path}:{i} gfx={gfx!r} cu_num={cu_num}: {e}")
+                        continue
+                    if cu_num == 96 and arch != "gfx1250":
+                        failures.append(
+                            f"{path}:{i} cu_num=96 resolved to {arch!r}, expected gfx1250"
+                        )
+        self.assertGreater(files, 0)
+        self.assertGreater(rows, 0)
+        self.assertGreater(cu96, 0)
+        self.assertEqual(failures, [])
 
 
 @unittest.skipUnless(

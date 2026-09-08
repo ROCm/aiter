@@ -18,7 +18,7 @@ from dataclasses import dataclass
 from multiprocessing.connection import wait as wait_for_sentinels
 from typing import Any
 
-from aiter.jit.utils.gfx_placeholders import GFX_PLACEHOLDERS
+from aiter.jit.utils.gfx_placeholders import GFX_PLACEHOLDERS, LEGACY_CU_NUM_TO_GFX
 
 _DEFAULT_KERNEL_TIMEOUT = 1200.0
 _DEFAULT_MAX_WORKERS = 64
@@ -49,23 +49,16 @@ class JobLabel:
         return f"{self.kind.name} {self.kernel_name}"
 
 
-_CU_NUM_TO_ARCH = {
-    80: "gfx942",
-    304: "gfx942",
-    256: "gfx950",
-}
-
-
 def cu_num_to_arch(cu_num: int) -> str:
     """Map a known legacy compute-unit count to its historical architecture."""
     try:
-        mapped = _CU_NUM_TO_ARCH.get(int(cu_num))
+        mapped = LEGACY_CU_NUM_TO_GFX.get(int(cu_num))
     except (TypeError, ValueError):
         mapped = None
     if mapped is None:
         raise ValueError(
             f"cannot map cu_num={cu_num!r} to an architecture; known values are "
-            f"{sorted(_CU_NUM_TO_ARCH)}"
+            f"{sorted(LEGACY_CU_NUM_TO_GFX)}"
         )
     return mapped
 

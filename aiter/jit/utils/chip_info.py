@@ -16,9 +16,12 @@ from cpp_extension import executable_path
 from torch_guard import torch_compile_guard
 
 try:
-    from aiter.jit.utils.gfx_placeholders import GFX_PLACEHOLDERS
+    from aiter.jit.utils.gfx_placeholders import (
+        GFX_PLACEHOLDERS,
+        LEGACY_CU_NUM_TO_GFX,
+    )
 except ImportError:
-    from gfx_placeholders import GFX_PLACEHOLDERS
+    from gfx_placeholders import GFX_PLACEHOLDERS, LEGACY_CU_NUM_TO_GFX
 
 logger = logging.getLogger("aiter")
 
@@ -112,17 +115,9 @@ def get_gfx_runtime() -> str:
     return gfx_arch
 
 
-# Backfill map for legacy tuned configs that predate the `gfx` column.
-# These cu_num values were only ever tuned on a single arch historically:
-#   256 -> gfx950, 80/304 -> gfx942.
-# Newer archs that happen to share a cu_num (e.g. gfx1250 also reports 256)
-# are always written with their real arch by the tuner, so they never rely on
-# this backfill.
-_LEGACY_CU_NUM_TO_GFX = {
-    256: "gfx950",
-    80: "gfx942",
-    304: "gfx942",
-}
+# Backfill uses LEGACY_CU_NUM_TO_GFX (shared with FlyDSL AOT). Newer SKUs that
+# share a cu_num (gfx1250 also reports 256) or use a count never shipped
+# without gfx (gfx1250 also reports 96) always write the real arch.
 
 _LEGACY_GFX_WARNED_SOURCES: set[str] = set()
 
@@ -176,13 +171,13 @@ def gfx_from_cu_num(cu_num) -> str:
     except (TypeError, ValueError) as e:
         raise ValueError(
             f"cannot infer gfx from cu_num={cu_num!r}; known legacy mappings are "
-            f"{dict(sorted(_LEGACY_CU_NUM_TO_GFX.items()))}"
+            f"{dict(sorted(LEGACY_CU_NUM_TO_GFX.items()))}"
         ) from e
-    gfx = _LEGACY_CU_NUM_TO_GFX.get(cu_num)
+    gfx = LEGACY_CU_NUM_TO_GFX.get(cu_num)
     if gfx is None:
         raise ValueError(
             f"cannot infer gfx from cu_num={cu_num}; known legacy mappings are "
-            f"{dict(sorted(_LEGACY_CU_NUM_TO_GFX.items()))}"
+            f"{dict(sorted(LEGACY_CU_NUM_TO_GFX.items()))}"
         )
     return gfx
 
