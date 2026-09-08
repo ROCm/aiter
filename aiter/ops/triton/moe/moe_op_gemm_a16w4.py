@@ -153,6 +153,8 @@ def get_kernel_config_gluon_v2_swizzle(m, n, k, routing_data):
     if block_m == 16:
         block_n = 128
         num_warps = 4
+        #tile_per_warp = [1,1]
+        #matrix_instr_nonkdim = 32
         tile_per_warp = [1,1]
         matrix_instr_nonkdim = 32
 
@@ -213,6 +215,7 @@ def get_kernel_config_gluon_v1_swizzle(m, n, k, routing_data):
     split_k = 1
     block_k = 256
     matrix_instr_nonkdim = 32
+    #matrix_instr_nonkdim = 16
 
     if block_m == 16:
         block_n = 128

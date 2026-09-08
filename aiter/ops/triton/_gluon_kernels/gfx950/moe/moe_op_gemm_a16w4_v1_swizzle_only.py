@@ -329,17 +329,22 @@ def _moe_gemm_a16w4(
         #Convert Layouts
         x = gl.convert_layout(x, DOT_LAYOUT_X)
         w = gl.convert_layout(w, DOT_LAYOUT_W_PACKED)
-        #w_scales = gl.convert_layout(w_scales, REG_CONSUME_WS_LAYOUT)
+        w_scales = gl.convert_layout(w_scales, REG_CONSUME_WS_LAYOUT)
+        #w_scales = gl.convert_layout(w_scales, LOAD_LAYOUT_WS)
+        
         
         w_scales = unswizzle_mx_scale_cdna4(w_scales, BLOCK_N, MX_SCALE_BLOCK_K)
 
         w_scales = w_scales.trans(1, 0)
-        w_scales = (
-            w_scales.reshape((MX_SCALE_BLOCK_K, 1, BLOCK_N))
-            .broadcast_to((MX_SCALE_BLOCK_K, MX_PACK_DIVISOR, BLOCK_N))
-           .reshape((MX_SCALE_BLOCK_K * MX_PACK_DIVISOR, BLOCK_N))
-        )
-        w_scales = gl.convert_layout(w_scales, DOT_LAYOUT_W)
+        #w_scales = (
+        #    w_scales.reshape((MX_SCALE_BLOCK_K, 1, BLOCK_N))
+        #    .broadcast_to((MX_SCALE_BLOCK_K, MX_PACK_DIVISOR, BLOCK_N))
+        #   .reshape((MX_SCALE_BLOCK_K * MX_PACK_DIVISOR, BLOCK_N))
+        #)
+        w_scale_layout: gl.constexpr = gl.amd.get_scaled_upcast_fp4_scale_layout(
+            w, w_scales, gl.bfloat16, axis=0)
+        
+        w_scales = gl.convert_layout(w_scales, w_scale_layout)
 
         #Scaled upcast to bf16
         w_bf16 = gl.amd.cdna4.scaled_upcast(w, w_scales, gl.bfloat16, axis=0)
@@ -360,11 +365,18 @@ def _moe_gemm_a16w4(
     )
 
     if B is not None:
-        bias = gl.load(
-            B + expt_id * stride_b_e + offs_out_n,
+        #bias = gl.load(
+        #    B + expt_id * stride_b_e + offs_out_n,
+        #    mask=offs_out_n < N,
+        #    other=0.0,
+        #    cache_modifier=W_CACHE_MODIFIER,
+        #)
+        bias = gl.amd.cdna3.buffer_load(
+            B + expt_id * stride_b_e ,
+            offs_out_n,
             mask=offs_out_n < N,
             other=0.0,
-            cache_modifier=W_CACHE_MODIFIER,
+            cache=W_CACHE_MODIFIER,
         )
         acc = acc + bias[None, :]
 
@@ -397,12 +409,12 @@ def _moe_gemm_a16w4(
     mask_m = offs_y_m < M
     mask_n = offs_y_n < yN
     Y += start_m * stride_y_m
-    YPtrs = Y + (offs_y_m[:, None] * stride_y_m + offs_y_n[None, :] * stride_y_n)
-    gl.store(YPtrs, out.to(Y.dtype.element_ty), mask=mask_m[:, None] & mask_n[None, :])
-    #y_offsets = offs_y_m[:, None] * stride_y_m + offs_y_n[None, :] * stride_y_n
-    #gl.amd.cdna3.buffer_store(
-    #    out.to(Y.dtype.element_ty), Y, y_offsets, mask=mask_m[:, None] & mask_n[None, :]
-    #)
+    #YPtrs = Y + (offs_y_m[:, None] * stride_y_m + offs_y_n[None, :] * stride_y_n)
+    #gl.store(YPtrs, out.to(Y.dtype.element_ty), mask=mask_m[:, None] & mask_n[None, :])
+    y_offsets = offs_y_m[:, None] * stride_y_m + offs_y_n[None, :] * stride_y_n
+    gl.amd.cdna3.buffer_store(
+        out.to(Y.dtype.element_ty), Y, y_offsets, mask=mask_m[:, None] & mask_n[None, :]
+    )
     
 
 
