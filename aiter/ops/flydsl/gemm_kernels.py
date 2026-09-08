@@ -261,17 +261,23 @@ def validate_gemm_decode_tensors(
     C: torch.Tensor,
     bias: torch.Tensor | None = None,
     arch: str | None = None,
+    check_overlap: bool = True,
 ) -> tuple[int, int, int]:
-    """Validate the packed real-tensor ABI shared by both kernel families."""
-    tensors = {"A": A, "B": B, "C": C}
-    for name, tensor in tensors.items():
-        if not isinstance(tensor, torch.Tensor):
+    """Validate the packed real-tensor ABI shared by both kernel families.
+
+    This runs per launch on the decode path, so it is deliberately flat: no
+    dicts, no helper calls, no tuple building. Same checks and messages as
+    before. `check_overlap` exists for callers that allocated C themselves and
+    therefore already know it cannot alias A or B.
+    """
+    for name, t in (("A", A), ("B", B), ("C", C)):
+        if not isinstance(t, torch.Tensor):
             raise TypeError(f"{name} must be a torch.Tensor")
-        if tensor.dim() != 2:
-            raise ValueError(f"{name} must be rank 2, got rank {tensor.dim()}")
-        if tensor.dtype != torch.bfloat16:
+        if t.dim() != 2:
+            raise ValueError(f"{name} must be rank 2, got rank {t.dim()}")
+        if t.dtype != torch.bfloat16:
             raise ValueError(f"{name} must have dtype torch.bfloat16")
-        if tensor.device.type != "cuda":
+        if t.device.type != "cuda":
             raise ValueError(f"{name} must be on a CUDA/ROCm device")
 
     m, k = A.shape
@@ -286,21 +292,17 @@ def validate_gemm_decode_tensors(
         raise ValueError("A, B, and C must be on the same device")
     _validate_hgemm_bias(A, bias, n)
 
-    expected_shapes = {"A": (m, k), "B": (n, k), "C": (m, n)}
-    expected_strides = {"A": (k, 1), "B": (k, 1), "C": (n, 1)}
-    for name, tensor in tensors.items():
-        if tuple(tensor.shape) != expected_shapes[name]:
+    for name, t, rows, cols in (("A", A, m, k), ("B", B, n, k), ("C", C, m, n)):
+        shape = t.shape
+        if shape[0] != rows or shape[1] != cols:
             raise ValueError(
-                f"{name} must have shape {expected_shapes[name]}, "
-                f"got {tuple(tensor.shape)}"
+                f"{name} must have shape {(rows, cols)}, got {tuple(shape)}"
             )
-        if (
-            not tensor.is_contiguous()
-            or tuple(tensor.stride()) != expected_strides[name]
-        ):
+        stride = t.stride()
+        if stride[0] != cols or stride[1] != 1:
             raise ValueError(f"{name} must use packed row-major storage")
 
-    if _overlaps(C, A) or _overlaps(C, B):
+    if check_overlap and (_overlaps(C, A) or _overlaps(C, B)):
         raise ValueError("C must not overlap A or B")
     gfx = get_gfx_runtime() if arch is None else arch
     if gfx not in ("gfx942", "gfx950"):

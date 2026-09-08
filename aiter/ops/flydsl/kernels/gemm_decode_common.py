@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import functools
 import re
 from collections.abc import Iterator
 from dataclasses import dataclass, replace
@@ -453,6 +454,10 @@ def gemm_decode_kernel_name(
     return name + ("_BIAS" if has_bias else "")
 
 
+# Cached: the dispatcher re-parses the same tuned kernel name on every launch,
+# and rebuilding the config from the string costs about 4.4 us of host time -
+# comparable to the kernels themselves at M=1.
+@functools.lru_cache(maxsize=1024)
 def parse_gemm_decode_kernel_name(
     name: str,
 ) -> tuple[str, int, int, int, DecodeConfig, bool]:
