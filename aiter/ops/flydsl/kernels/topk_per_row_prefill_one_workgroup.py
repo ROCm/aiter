@@ -23,16 +23,8 @@ _PASS1_HISTOGRAM_STAGES = 2
 _KEY_BITS = 32
 _LONG_RADIX_BITS = (12, 10, 10)
 _SHORT_RADIX_BITS = (11, 10, 11)
-_LONG_RADIX_SHIFTS = (
-    _LONG_RADIX_BITS[1] + _LONG_RADIX_BITS[2],
-    _LONG_RADIX_BITS[2],
-    0,
-)
-_SHORT_RADIX_SHIFTS = (
-    _SHORT_RADIX_BITS[1] + _SHORT_RADIX_BITS[2],
-    _SHORT_RADIX_BITS[2],
-    0,
-)
+_LONG_RADIX_SHIFTS = (_LONG_RADIX_BITS[1] + _LONG_RADIX_BITS[2], _LONG_RADIX_BITS[2], 0)
+_SHORT_RADIX_SHIFTS = (_SHORT_RADIX_BITS[1] + _SHORT_RADIX_BITS[2], _SHORT_RADIX_BITS[2], 0)
 _LONG_RADIX_MASKS = tuple((1 << bits) - 1 for bits in _LONG_RADIX_BITS)
 _SHORT_RADIX_MASKS = tuple((1 << bits) - 1 for bits in _SHORT_RADIX_BITS)
 _HIGH_BUCKETS = 1 << _LONG_RADIX_BITS[0]
@@ -94,18 +86,12 @@ def build_topk_per_row_prefill_one_workgroup_module(
     high_bins_per_thread = _HIGH_BUCKETS // block_threads
     later_bins_per_thread = _LATER_BUCKETS // block_threads
     short_bins_per_thread = _SHORT_HIGH_BUCKETS // block_threads
-    full_key_vector_steps = (
-        (_COMPACT_CAPACITY // _VEC) + block_threads - 1
-    ) // block_threads
+    full_key_vector_steps = ((_COMPACT_CAPACITY // _VEC) + block_threads - 1) // block_threads
     stable_sort_enabled = stable and block_threads == 1024 and k <= 2048
     stable_sort_capacity = 1 << (k - 1).bit_length() if stable_sort_enabled else 1
     stable_stage_capacity = k if stable_sort_enabled else 1
-    stable_sort_items_per_thread = (
-        stable_sort_capacity + block_threads - 1
-    ) // block_threads
-    stable_sort_sizes, stable_sort_strides = _build_bitonic_schedule(
-        stable_sort_capacity
-    )
+    stable_sort_items_per_thread = (stable_sort_capacity + block_threads - 1) // block_threads
+    stable_sort_sizes, stable_sort_strides = _build_bitonic_schedule(stable_sort_capacity)
     output_vector_count = k // _VEC
     output_vector_steps = (output_vector_count + block_threads - 1) // block_threads
     output_vector_elems = max(_VEC, output_vector_count * _VEC)
@@ -114,9 +100,7 @@ def build_topk_per_row_prefill_one_workgroup_module(
 
     @fx.struct
     class LongPass1Storage:
-        histograms: fx.Array[
-            fx.Int32, _PASS1_HISTOGRAM_STAGES * _HIGH_BUCKETS, 16
-        ]
+        histograms: fx.Array[fx.Int32, _PASS1_HISTOGRAM_STAGES * _HIGH_BUCKETS, 16]
 
     @fx.struct
     class LongLaterStorage:
@@ -128,11 +112,7 @@ def build_topk_per_row_prefill_one_workgroup_module(
 
     @fx.struct
     class ShortPass1Storage:
-        histograms: fx.Array[
-            fx.Int32,
-            _PASS1_HISTOGRAM_STAGES * _SHORT_HIGH_BUCKETS,
-            16,
-        ]
+        histograms: fx.Array[fx.Int32, _PASS1_HISTOGRAM_STAGES * _SHORT_HIGH_BUCKETS, 16]
         full_keys: fx.Array[fx.Int32, _COMPACT_CAPACITY, 16]
 
     @fx.union
@@ -168,7 +148,6 @@ def build_topk_per_row_prefill_one_workgroup_module(
 
         zero = fx.Int32(0)
         one = fx.Int32(1)
-        above_class = fx.Int32(2)
         vec_width = fx.Int32(_VEC)
         block_size = fx.Int32(block_threads)
         top_k = fx.Int32(k)
@@ -183,10 +162,7 @@ def build_topk_per_row_prefill_one_workgroup_module(
         physical_row = fx.slice(input, (row, None))
         input_row_iter = fx.add_offset(fx.get_iter(physical_row), row_start)
         input_row = fx.rocdl.make_buffer_tensor(
-            fx.make_view(
-                input_row_iter,
-                fx.make_layout(_MAX_ROW_ELEMENTS, 1),
-            ),
+            fx.make_view(input_row_iter, fx.make_layout(_MAX_ROW_ELEMENTS, 1)),
             num_records_bytes=fx.Int64(row_len) * fx.Int64(4),
         )
         input_vector_tiles = fx.logical_divide(input_row, fx.make_layout(_VEC, 1))
@@ -194,17 +170,11 @@ def build_topk_per_row_prefill_one_workgroup_module(
         row_indices = fx.slice(indices, (row, None))
         row_values = fx.slice(value_output, (row, None))
         row_index_tiles = fx.logical_divide(
-            fx.make_view(
-                fx.get_iter(row_indices),
-                fx.make_layout(output_vector_elems, 1),
-            ),
+            fx.make_view(fx.get_iter(row_indices), fx.make_layout(output_vector_elems, 1)),
             fx.make_layout(_VEC, 1),
         )
         row_value_tiles = fx.logical_divide(
-            fx.make_view(
-                fx.get_iter(row_values),
-                fx.make_layout(output_vector_elems, 1),
-            ),
+            fx.make_view(fx.get_iter(row_values), fx.make_layout(output_vector_elems, 1)),
             fx.make_layout(_VEC, 1),
         )
 
@@ -221,10 +191,7 @@ def build_topk_per_row_prefill_one_workgroup_module(
 
         # Long-row arena
         long_histogram_matrix = storage.arena.long_pass1.histograms.peek().view(
-            fx.make_layout(
-                (_PASS1_HISTOGRAM_STAGES, _HIGH_BUCKETS),
-                (_HIGH_BUCKETS, 1),
-            )
+            fx.make_layout((_PASS1_HISTOGRAM_STAGES, _HIGH_BUCKETS), (_HIGH_BUCKETS, 1))
         )
         long_histograms = (
             fx.slice(long_histogram_matrix, (0, None)),
@@ -236,26 +203,19 @@ def build_topk_per_row_prefill_one_workgroup_module(
         candidate_keys = storage.arena.long_later.candidate_keys.peek().view(
             fx.make_layout(_COMPACT_CAPACITY, 1)
         )
-        candidate_indices = (
-            storage.arena.long_later.candidate_indices.peek().view(
-                fx.make_layout(_COMPACT_CAPACITY, 1)
-            )
+        candidate_indices = storage.arena.long_later.candidate_indices.peek().view(
+            fx.make_layout(_COMPACT_CAPACITY, 1)
         )
         stable_keys = storage.arena.long_later.stable_keys.peek().view(
             fx.make_layout(stable_stage_capacity, 1)
         )
-        stable_indices = (
-            storage.arena.long_later.stable_indices.peek().view(
-                fx.make_layout(stable_stage_capacity, 1)
-            )
+        stable_indices = storage.arena.long_later.stable_indices.peek().view(
+            fx.make_layout(stable_stage_capacity, 1)
         )
 
         # Short-row arena
         short_histogram_matrix = storage.arena.short_pass1.histograms.peek().view(
-            fx.make_layout(
-                (_PASS1_HISTOGRAM_STAGES, _SHORT_HIGH_BUCKETS),
-                (_SHORT_HIGH_BUCKETS, 1),
-            )
+            fx.make_layout((_PASS1_HISTOGRAM_STAGES, _SHORT_HIGH_BUCKETS), (_SHORT_HIGH_BUCKETS, 1))
         )
         short_histograms = (
             fx.slice(short_histogram_matrix, (0, None)),
@@ -273,136 +233,39 @@ def build_topk_per_row_prefill_one_workgroup_module(
         # Key encoding and classification
         def ordered_key(value):
             bits = value.bitcast(fx.Int32)
-            return (
-                bits
-                ^ ((bits >> fx.Int32(31)) & fx.Int32(0x7FFFFFFF))
-                ^ sign_bit
-            )
+            return bits ^ ((bits >> fx.Int32(31)) & fx.Int32(0x7FFFFFFF)) ^ sign_bit
 
         def radix_bucket(key, shift, mask):
             return (key >> fx.Int32(shift)) & fx.Int32(mask)
 
-        def classify_levels(
-            first,
-            second,
-            third,
-            first_threshold,
-            second_threshold,
-            third_threshold,
-            levels,
-        ):
-            if const_expr(levels == 1):
-                above = first > first_threshold
-                equal = first == first_threshold
-            elif const_expr(levels == 2):
-                above = (first > first_threshold) | (
-                    (first == first_threshold)
-                    & (second > second_threshold)
-                )
-                equal = (first == first_threshold) & (second == second_threshold)
-            else:
-                above = (first > first_threshold) | (
-                    (first == first_threshold)
-                    & (
-                        (second > second_threshold)
-                        | (
-                            (second == second_threshold)
-                            & (third > third_threshold)
-                        )
-                    )
-                )
-                equal = (
-                    (first == first_threshold)
-                    & (second == second_threshold)
-                    & (third == third_threshold)
-                )
-            return above, equal
-
-        def classify(
-            key,
-            first_threshold,
-            second_threshold,
-            third_threshold,
-        ):
-            return classify_levels(
-                radix_bucket(
-                    key, _LONG_RADIX_SHIFTS[0], _LONG_RADIX_MASKS[0]
-                ),
-                radix_bucket(
-                    key, _LONG_RADIX_SHIFTS[1], _LONG_RADIX_MASKS[1]
-                ),
-                radix_bucket(
-                    key, _LONG_RADIX_SHIFTS[2], _LONG_RADIX_MASKS[2]
-                ),
-                first_threshold,
-                second_threshold,
-                third_threshold,
-                3,
-            )
+        def classify_prefix(key, radix_shifts, prefix_threshold, levels):
+            prefix_shift = radix_shifts[levels - 1]
+            prefix_mask = -1 if prefix_shift == 0 else (1 << (_KEY_BITS - prefix_shift)) - 1
+            prefix = radix_bucket(key, prefix_shift, prefix_mask)
+            comparable_prefix = prefix ^ sign_bit if levels == 3 else prefix
+            comparable_threshold = prefix_threshold ^ sign_bit if levels == 3 else prefix_threshold
+            return (comparable_prefix > comparable_threshold, prefix == prefix_threshold)
 
         def ordered_value(key):
             bits = (key < zero).select(key ^ sign_bit, key ^ fx.Int32(-1))
             return bits.bitcast(fx.Float32)
 
-        def threshold_key(first, second, third):
-            return (
-                first * fx.Int32(1 << _LONG_RADIX_SHIFTS[0])
-                + second * fx.Int32(1 << _LONG_RADIX_SHIFTS[1])
-                + third
-            )
-
-        def short_threshold_key(first, second, third):
-            return (
-                first * fx.Int32(1 << _SHORT_RADIX_SHIFTS[0])
-                + second * fx.Int32(1 << _SHORT_RADIX_SHIFTS[1])
-                + third
-            )
-
-        def store_key_result(pos, col, key, row_indices, row_values):
-            row_indices[pos] = row_start + col
-            if const_expr(write_values):
-                row_values[pos] = ordered_value(key)
-
-        def store_loaded_result(pos, col, value, row_indices, row_values):
-            row_indices[pos] = row_start + col
-            if const_expr(write_values):
-                row_values[pos] = value
-
-        def store_stable_candidate(
-            pos,
-            col,
-            key,
-            stable_keys,
-            stable_indices,
-        ):
-            stable_indices[pos] = col
-            if const_expr(write_values):
-                stable_keys[pos] = ordered_value(key).bitcast(fx.Int32)
-
         def scatter_unstable_key(
-            col,
-            key,
-            above,
-            equal,
-            num_needed,
-            row_indices,
-            row_values,
-            metadata,
+            col, key, above, equal, num_needed, row_indices, row_values, metadata
         ):
             if above:
                 out_pos = atomic_add_i32(metadata, one, _RUNNING_ABOVE, "workgroup")
                 if out_pos < top_k:
-                    store_key_result(out_pos, col, key, row_indices, row_values)
+                    row_indices[out_pos] = row_start + col
+                    if const_expr(write_values):
+                        row_values[out_pos] = ordered_value(key)
             elif equal:
                 back_pos = atomic_add_i32(metadata, one, _RUNNING_EQUAL, "workgroup")
                 if back_pos < num_needed:
-                    store_key_result(
-                        top_k - one - back_pos,
-                        col,
-                        key,
-                        row_indices,
-                        row_values,
-                    )
+                    out_pos = top_k - one - back_pos
+                    row_indices[out_pos] = row_start + col
+                    if const_expr(write_values):
+                        row_values[out_pos] = ordered_value(key)
 
         def scatter_equal_row(key, row_indices, row_values):
             for pos in range(tid, top_k, block_size):
@@ -434,38 +297,29 @@ def build_topk_per_row_prefill_one_workgroup_module(
                 histograms[0][pos] = merged
             gpu.barrier()
 
-        def block_exclusive_scan_pair(first, second, scan, metadata):
-            packed = first * fx.Int32(1 << _PACKED_COUNT_BITS) + second
-            packed_inclusive = _warp_inclusive_prefix_i32(packed, lane, _WAVE_SIZE)
-            packed_exclusive = packed_inclusive - packed
+        def block_excl_prefix_i32(packed_local, scan):
+            packed_inclusive = _warp_inclusive_prefix_i32(packed_local, lane, _WAVE_SIZE)
+            packed_exclusive = packed_inclusive - packed_local
             if lane == _WAVE_SIZE - 1:
                 scan[wave] = packed_inclusive
             gpu.barrier()
 
             if wave == 0:
-                active = lane < num_waves
-                safe_lane = active.select(lane, zero)
-                wave_total = active.select(scan[safe_lane], zero)
-                wave_inclusive = _warp_inclusive_prefix_i32(
-                    wave_total, lane, _WAVE_SIZE
-                )
-                if active:
-                    scan[lane + num_waves] = wave_inclusive - wave_total
+                wave_val = zero
+                if lane < num_waves:
+                    wave_val = scan[lane]
+                wave_inclusive = _warp_inclusive_prefix_i32(wave_val, lane, _WAVE_SIZE)
+                wave_exclusive = wave_inclusive - wave_val
+                if lane < num_waves:
+                    scan[lane] = wave_exclusive
                 if lane == num_waves - 1:
-                    # Threshold values are already live in registers here.
-                    # Reuse this metadata slot for the packed block total.
-                    metadata[_THIRD_ABOVE] = wave_inclusive
+                    scan[num_waves] = wave_inclusive
             gpu.barrier()
-            packed_prefix = scan[wave + num_waves] + packed_exclusive
-            packed_total = metadata[_THIRD_ABOVE]
-            return (
-                (packed_prefix >> fx.Int32(_PACKED_COUNT_BITS))
-                & fx.Int32(_PACKED_COUNT_MASK),
-                packed_prefix & fx.Int32(_PACKED_COUNT_MASK),
-                (packed_total >> fx.Int32(_PACKED_COUNT_BITS))
-                & fx.Int32(_PACKED_COUNT_MASK),
-                packed_total & fx.Int32(_PACKED_COUNT_MASK),
-            )
+
+            packed_prefix = scan[wave] + packed_exclusive
+            packed_total = scan[num_waves]
+            gpu.barrier()
+            return packed_prefix, packed_total
 
         def choose_threshold(
             target_k,
@@ -495,12 +349,7 @@ def build_topk_per_row_prefill_one_workgroup_module(
                 active = lane < num_waves
                 safe_lane = active.select(lane, zero)
                 wave_total = active.select(scan[safe_lane], zero)
-                wave_prefix = (
-                    _warp_inclusive_prefix_i32(
-                        wave_total, lane, _WAVE_SIZE
-                    )
-                    - wave_total
-                )
+                wave_prefix = _warp_inclusive_prefix_i32(wave_total, lane, _WAVE_SIZE) - wave_total
                 if active:
                     scan[lane + num_waves] = wave_prefix
             gpu.barrier()
@@ -511,9 +360,7 @@ def build_topk_per_row_prefill_one_workgroup_module(
             exclusive = wave_offset + wave_exclusive
             for item in range_constexpr(bins_per_thread):
                 inclusive = exclusive + counts[item]
-                if (exclusive <= target_prefix) & (
-                    inclusive > target_prefix
-                ):
+                if (exclusive <= target_prefix) & (inclusive > target_prefix):
                     metadata[threshold_slot] = first_bin + item  # Kth bucket
                     metadata[above_slot] = total - inclusive  # Higher-bucket count
                     metadata[count_slot] = inclusive - exclusive  # Bucket count
@@ -527,17 +374,11 @@ def build_topk_per_row_prefill_one_workgroup_module(
                     visit_one(col + item, values[item])
 
             unroll_stride = block_size * fx.Int32(_LOAD_UNROLL)
-            unroll_end = (
-                full_vector_count
-                > block_size * fx.Int32(_LOAD_UNROLL - 1)
-            ).select(
-                full_vector_count
-                - block_size * fx.Int32(_LOAD_UNROLL - 1),
-                zero,
+            unroll_end = (full_vector_count > block_size * fx.Int32(_LOAD_UNROLL - 1)).select(
+                full_vector_count - block_size * fx.Int32(_LOAD_UNROLL - 1), zero
             )
             n_unroll = (tid < unroll_end).select(
-                (unroll_end - one - tid) // unroll_stride + one,
-                zero,
+                (unroll_end - one - tid) // unroll_stride + one, zero
             )
             remain_col = full_vector_count * vec_width + tid
             if const_expr(reverse):
@@ -565,14 +406,9 @@ def build_topk_per_row_prefill_one_workgroup_module(
                 visit_vector(vector_idx3 * vec_width, values3)
 
             cleanup_offset = tid + n_unroll * unroll_stride
-            for offset in range(
-                cleanup_offset, full_vector_count, block_size
-            ):
+            for offset in range(cleanup_offset, full_vector_count, block_size):
                 vector_idx = vector_origin + vector_direction * offset
-                visit_vector(
-                    vector_idx * vec_width,
-                    _load_f32x4(input_vector_tiles, vector_idx),
-                )
+                visit_vector(vector_idx * vec_width, _load_f32x4(input_vector_tiles, vector_idx))
 
             if const_expr(not reverse):
                 if remain_col < row_len:
@@ -586,9 +422,7 @@ def build_topk_per_row_prefill_one_workgroup_module(
                 safe_idx = active.select(vector_idx, zero)
                 fragment = fx.make_rmem_tensor(full_key_fragment_layout, fx.Int32)
                 fx.copy_atom_call(
-                    full_key_load_atom,
-                    fx.slice(full_key_tiles, (None, safe_idx)),
-                    fragment,
+                    full_key_load_atom, fx.slice(full_key_tiles, (None, safe_idx)), fragment
                 )
                 values = fragment.load()
                 col_base = vector_idx * vec_width
@@ -611,6 +445,10 @@ def build_topk_per_row_prefill_one_workgroup_module(
             full_keys=None,
             candidate_keys=None,
             candidate_indices=None,
+            stable_keys=None,
+            stable_indices=None,
+            row_indices=None,
+            row_values=None,
         ):
             active = col < row_len
             if full_keys is not None:
@@ -622,48 +460,26 @@ def build_topk_per_row_prefill_one_workgroup_module(
                 prefix = radix_bucket(key, prefix_shift, prefix_mask)
                 if cache_key_index:
                     if active & (prefix > prefix_threshold):
-                        out_pos = atomic_add_i32(
-                            metadata,
-                            one,
-                            _RUNNING_ABOVE,
-                            "workgroup",
-                        )
+                        out_pos = atomic_add_i32(metadata, one, _RUNNING_ABOVE, "workgroup")
                         if out_pos < top_k:
                             if const_expr(stable):
-                                store_stable_candidate(
-                                    out_pos,
-                                    col,
-                                    key,
-                                    stable_keys,
-                                    stable_indices,
-                                )
+                                stable_indices[out_pos] = col
+                                if const_expr(write_values):
+                                    stable_keys[out_pos] = ordered_value(key).bitcast(fx.Int32)
                             else:
-                                store_key_result(
-                                    out_pos,
-                                    col,
-                                    key,
-                                    row_indices,
-                                    row_values,
-                                )
+                                row_indices[out_pos] = row_start + col
+                                if const_expr(write_values):
+                                    row_values[out_pos] = ordered_value(key)
                 active = active & (prefix == prefix_threshold)
             if active:
                 bucket = radix_bucket(key, shift, mask)
                 if not use_ping_pong or (wave & one) == zero:
-                    atomic_add_i32(
-                        histograms[0], one, bucket, "workgroup"
-                    )
+                    atomic_add_i32(histograms[0], one, bucket, "workgroup")
                 else:
-                    atomic_add_i32(
-                        histograms[1], one, bucket, "workgroup"
-                    )
+                    atomic_add_i32(histograms[1], one, bucket, "workgroup")
             if cache_key_index:
                 if active:
-                    candidate_pos = atomic_add_i32(
-                        metadata,
-                        one,
-                        _CANDIDATE_COUNT,
-                        "workgroup",
-                    )
+                    candidate_pos = atomic_add_i32(metadata, one, _CANDIDATE_COUNT, "workgroup")
                     if candidate_pos < fx.Int32(_COMPACT_CAPACITY):
                         candidate_keys[candidate_pos] = key
                         candidate_indices[candidate_pos] = col
@@ -686,57 +502,24 @@ def build_topk_per_row_prefill_one_workgroup_module(
             reset_scatter_counters(metadata, reset_above=reset_above)
 
             def emit(col, key):
-                prefix_shift = radix_shifts[levels - 1]
-                prefix_mask = (
-                    -1
-                    if prefix_shift == 0
-                    else (1 << (_KEY_BITS - prefix_shift)) - 1
-                )
-                prefix = radix_bucket(key, prefix_shift, prefix_mask)
-                comparable_prefix = (
-                    prefix ^ sign_bit if levels == 3 else prefix
-                )
-                comparable_threshold = (
-                    prefix_threshold ^ sign_bit
-                    if levels == 3
-                    else prefix_threshold
-                )
+                above, equal = classify_prefix(key, radix_shifts, prefix_threshold, levels)
                 scatter_unstable_key(
-                    col,
-                    key,
-                    comparable_prefix > comparable_threshold,
-                    prefix == prefix_threshold,
-                    num_needed,
-                    row_indices,
-                    row_values,
-                    metadata,
+                    col, key, above, equal, num_needed, row_indices, row_values, metadata
                 )
 
             if source == "lds":
                 scan_lds_keys(emit)
             elif source == "gm":
-                scan_gm_row(
-                    lambda col, value: emit(col, ordered_key(value))
-                )
+                scan_gm_row(lambda col, value: emit(col, ordered_key(value)))
             else:
                 for pos in range(tid, candidate_count, block_size):
-                    emit(
-                        candidate_indices[pos],
-                        candidate_keys[pos],
-                    )
+                    emit(candidate_indices[pos], candidate_keys[pos])
 
         # Stable emitters
-        def sort_and_store_stable(
-            row_indices,
-            row_values,
-            candidate_keys,
-            candidate_indices,
-        ):
+        def sort_and_store_stable(row_indices, row_values, candidate_keys, candidate_indices):
             for item in range_constexpr(stable_sort_items_per_thread):
                 pos = tid + item * block_threads
-                if (pos >= top_k) & (
-                    pos < fx.Int32(stable_sort_capacity)
-                ):
+                if (pos >= top_k) & (pos < fx.Int32(stable_sort_capacity)):
                     candidate_indices[pos] = fx.Int32(2147483647)
                     if const_expr(write_values):
                         candidate_keys[pos] = zero
@@ -745,14 +528,10 @@ def build_topk_per_row_prefill_one_workgroup_module(
             for stage in range_constexpr(len(stable_sort_sizes)):
                 size = stable_sort_sizes[stage]
                 stride = stable_sort_strides[stage]
-                for item in range_constexpr(
-                    stable_sort_items_per_thread
-                ):
+                for item in range_constexpr(stable_sort_items_per_thread):
                     pos = tid + item * block_threads
                     partner = pos ^ fx.Int32(stride)
-                    if (
-                        pos < fx.Int32(stable_sort_capacity)
-                    ) & (partner > pos):
+                    if (pos < fx.Int32(stable_sort_capacity)) & (partner > pos):
                         left = candidate_indices[pos]
                         right = candidate_indices[partner]
                         ascending = (pos & fx.Int32(size)) == zero
@@ -763,9 +542,7 @@ def build_topk_per_row_prefill_one_workgroup_module(
                             left_value = candidate_keys[pos]
                             right_value = candidate_keys[partner]
                             candidate_keys[pos] = swap.select(right_value, left_value)
-                            candidate_keys[partner] = swap.select(
-                                left_value, right_value
-                            )
+                            candidate_keys[partner] = swap.select(left_value, right_value)
                 gpu.barrier()
 
             for item in range_constexpr(stable_sort_items_per_thread):
@@ -776,69 +553,10 @@ def build_topk_per_row_prefill_one_workgroup_module(
                     if const_expr(write_values):
                         row_values[pos] = candidate_keys[pos].bitcast(fx.Float32)
 
-        def scatter_gm_stable_sorted(
-            first_threshold,
-            second_threshold,
-            third_threshold,
+        def scatter_stable_sorted_keys(
+            source,
+            prefix_threshold,
             num_needed,
-            row_indices,
-            row_values,
-            candidate_keys,
-            candidate_indices,
-            metadata,
-        ):
-            definite_expected = top_k - num_needed
-            reset_scatter_counters(metadata)
-
-            def collect_one(
-                col,
-                value,
-                candidate_keys,
-                candidate_indices,
-                metadata,
-            ):
-                above, equal = classify(
-                    ordered_key(value),
-                    first_threshold,
-                    second_threshold,
-                    third_threshold,
-                )
-                if above:
-                    pos = atomic_add_i32(metadata, one, _RUNNING_ABOVE, "workgroup")
-                    if pos < definite_expected:
-                        candidate_indices[pos] = col
-                        if const_expr(write_values):
-                            candidate_keys[pos] = value.bitcast(fx.Int32)
-                elif equal:
-                    tie_pos = atomic_add_i32(metadata, one, _RUNNING_EQUAL, "workgroup")
-                    if tie_pos < num_needed:
-                        pos = definite_expected + tie_pos
-                        candidate_indices[pos] = col
-                        if const_expr(write_values):
-                            candidate_keys[pos] = value.bitcast(fx.Int32)
-
-            scan_gm_row(
-                lambda col, value: collect_one(
-                    col,
-                    value,
-                    candidate_keys,
-                    candidate_indices,
-                    metadata,
-                ),
-            )
-            gpu.barrier()
-            sort_and_store_stable(
-                row_indices,
-                row_values,
-                candidate_keys,
-                candidate_indices,
-            )
-
-        def scatter_candidates_stable_sorted(
-            candidate_count,
-            first_threshold,
-            second_threshold,
-            third_threshold,
             levels,
             row_indices,
             row_values,
@@ -847,282 +565,76 @@ def build_topk_per_row_prefill_one_workgroup_module(
             stable_keys,
             stable_indices,
             metadata,
+            candidate_count=None,
         ):
-            for candidate_pos in range(
-                tid, candidate_count, block_size
+            definite_expected = top_k - num_needed
+            if source == "gm":
+                reset_scatter_counters(metadata)
+
+            def collect(
+                col, key, candidate_keys, candidate_indices, stable_keys, stable_indices, metadata
             ):
-                key = candidate_keys[candidate_pos]
-                above, equal = classify_levels(
-                    radix_bucket(
-                        key, _LONG_RADIX_SHIFTS[0], _LONG_RADIX_MASKS[0]
-                    ),
-                    radix_bucket(
-                        key, _LONG_RADIX_SHIFTS[1], _LONG_RADIX_MASKS[1]
-                    ),
-                    radix_bucket(
-                        key, _LONG_RADIX_SHIFTS[2], _LONG_RADIX_MASKS[2]
-                    ),
-                    first_threshold,
-                    second_threshold,
-                    third_threshold,
-                    levels,
-                )
-                if above | equal:
-                    out_pos = atomic_add_i32(
-                        metadata, one, _RUNNING_ABOVE, "workgroup"
-                    )
+                above, equal = classify_prefix(key, _LONG_RADIX_SHIFTS, prefix_threshold, levels)
+                if source == "gm":
+                    if above:
+                        pos = atomic_add_i32(metadata, one, _RUNNING_ABOVE, "workgroup")
+                        if pos < definite_expected:
+                            candidate_indices[pos] = col
+                            if const_expr(write_values):
+                                candidate_keys[pos] = ordered_value(key).bitcast(fx.Int32)
+                    elif equal:
+                        tie_pos = atomic_add_i32(metadata, one, _RUNNING_EQUAL, "workgroup")
+                        if tie_pos < num_needed:
+                            pos = definite_expected + tie_pos
+                            candidate_indices[pos] = col
+                            if const_expr(write_values):
+                                candidate_keys[pos] = ordered_value(key).bitcast(fx.Int32)
+                elif above | equal:
+                    out_pos = atomic_add_i32(metadata, one, _RUNNING_ABOVE, "workgroup")
                     if out_pos < top_k:
-                        stable_indices[out_pos] = candidate_indices[candidate_pos]
+                        stable_indices[out_pos] = col
                         if const_expr(write_values):
                             stable_keys[out_pos] = ordered_value(key).bitcast(fx.Int32)
+
+            if source == "gm":
+                scan_gm_row(
+                    lambda col, value: collect(
+                        col,
+                        ordered_key(value),
+                        candidate_keys,
+                        candidate_indices,
+                        stable_keys,
+                        stable_indices,
+                        metadata,
+                    )
+                )
+            else:
+                for pos in range(tid, candidate_count, block_size):
+                    collect(
+                        candidate_indices[pos],
+                        candidate_keys[pos],
+                        candidate_keys,
+                        candidate_indices,
+                        stable_keys,
+                        stable_indices,
+                        metadata,
+                    )
             gpu.barrier()
 
-            for item in range_constexpr(stable_sort_items_per_thread):
-                pos = tid + item * block_threads
-                if pos < top_k:
-                    candidate_indices[pos] = stable_indices[pos]
-                    if const_expr(write_values):
-                        candidate_keys[pos] = stable_keys[pos]
-            gpu.barrier()
-            sort_and_store_stable(
-                row_indices,
-                row_values,
-                candidate_keys,
-                candidate_indices,
-            )
-
-        def scatter_lds_stable_ordered(
-            first_threshold,
-            second_threshold,
-            third_threshold,
-            num_needed,
-            levels,
-            row_indices,
-            row_values,
-            scan,
-            metadata,
-        ):
-            above_base = zero
-            equal_base = zero
-            for step in range_constexpr(full_key_vector_steps):
-                vector_idx = step * block_threads + tid
-                active_vector = vector_idx < (row_len + fx.Int32(_VEC - 1)) // vec_width
-                safe_vector_idx = active_vector.select(vector_idx, zero)
-                fragment = fx.make_rmem_tensor(full_key_fragment_layout, fx.Int32)
-                fx.copy_atom_call(
-                    full_key_load_atom,
-                    fx.slice(
-                        full_key_tiles,
-                        (None, safe_vector_idx),
-                    ),
-                    fragment,
-                )
-                keys = fragment.load()
-                classes = fx.make_rmem_tensor(_VEC, fx.Int32)
-                local_above = zero
-                local_equal = zero
-                for item in range_constexpr(_VEC):
-                    col = vector_idx * vec_width + item
-                    above, equal = classify_levels(
-                        radix_bucket(
-                            keys[item],
-                            _SHORT_RADIX_SHIFTS[0],
-                            _SHORT_RADIX_MASKS[0],
-                        ),
-                        radix_bucket(
-                            keys[item],
-                            _SHORT_RADIX_SHIFTS[1],
-                            _SHORT_RADIX_MASKS[1],
-                        ),
-                        radix_bucket(
-                            keys[item],
-                            _SHORT_RADIX_SHIFTS[2],
-                            _SHORT_RADIX_MASKS[2],
-                        ),
-                        first_threshold,
-                        second_threshold,
-                        third_threshold,
-                        levels,
-                    )
-                    active = active_vector & (col < row_len)
-                    above_i32 = (active & above).select(one, zero)
-                    equal_i32 = (active & equal).select(one, zero)
-                    classes[item] = above_i32 * above_class + equal_i32
-                    local_above = local_above + above_i32
-                    local_equal = local_equal + equal_i32
-
-                (
-                    above_prefix,
-                    equal_prefix,
-                    block_above,
-                    block_equal,
-                ) = block_exclusive_scan_pair(
-                    local_above,
-                    local_equal,
-                    scan,
-                    metadata,
-                )
-                my_above = above_base + above_prefix
-                my_equal = equal_base + equal_prefix
-                for item in range_constexpr(_VEC):
-                    col = vector_idx * vec_width + item
-                    accepted_equal = (my_equal < num_needed).select(
-                        my_equal, num_needed
-                    )
-                    out_pos = my_above + accepted_equal
-                    if classes[item] == above_class:
-                        store_key_result(
-                            out_pos,
-                            col,
-                            keys[item],
-                            row_indices,
-                            row_values,
-                        )
-                        my_above = my_above + one
-                    elif classes[item] == one:
-                        if my_equal < num_needed:
-                            store_key_result(
-                                out_pos,
-                                col,
-                                keys[item],
-                                row_indices,
-                                row_values,
-                            )
-                        my_equal = my_equal + one
-                above_base = above_base + block_above
-                next_equal_base = equal_base + block_equal
-                equal_base = (
-                    next_equal_base < num_needed
-                ).select(next_equal_base, num_needed)
+            if source == "candidates":
+                for item in range_constexpr(stable_sort_items_per_thread):
+                    pos = tid + item * block_threads
+                    if pos < top_k:
+                        candidate_indices[pos] = stable_indices[pos]
+                        if const_expr(write_values):
+                            candidate_keys[pos] = stable_keys[pos]
                 gpu.barrier()
 
-        def scatter_gm_stable_ordered(
-            first_threshold,
-            second_threshold,
-            third_threshold,
-            num_needed,
-            row_indices,
-            row_values,
-            scan,
-            metadata,
-        ):
-            above_base = zero
-            equal_base = zero
+            sort_and_store_stable(row_indices, row_values, candidate_keys, candidate_indices)
 
-            num_steps = (full_vector_count + block_size - one) // block_size
-            for step in range(zero, num_steps, one):
-                vector_idx = step * block_size + tid
-                active_vector = vector_idx < full_vector_count
-                safe_vector_idx = active_vector.select(vector_idx, zero)
-                col_base = safe_vector_idx * vec_width
-                values = _load_f32x4(input_vector_tiles, safe_vector_idx)
-                classes = fx.make_rmem_tensor(_VEC, fx.Int32)
-                local_above = zero
-                local_equal = zero
-                for item in range_constexpr(_VEC):
-                    col = col_base + item
-                    above, equal = classify(
-                        ordered_key(values[item]),
-                        first_threshold,
-                        second_threshold,
-                        third_threshold,
-                    )
-                    active = active_vector & (col < row_len)
-                    above_i32 = (active & above).select(one, zero)
-                    equal_i32 = (active & equal).select(one, zero)
-                    classes[item] = above_i32 * above_class + equal_i32
-                    local_above = local_above + above_i32
-                    local_equal = local_equal + equal_i32
-
-                (
-                    above_prefix,
-                    equal_prefix,
-                    block_above,
-                    block_equal,
-                ) = block_exclusive_scan_pair(
-                    local_above,
-                    local_equal,
-                    scan,
-                    metadata,
-                )
-                my_above = above_base + above_prefix
-                my_equal = equal_base + equal_prefix
-                for item in range_constexpr(_VEC):
-                    col = col_base + item
-                    accepted_equal = (my_equal < num_needed).select(
-                        my_equal, num_needed
-                    )
-                    out_pos = my_above + accepted_equal
-                    if classes[item] == above_class:
-                        store_loaded_result(
-                            out_pos,
-                            col,
-                            values[item],
-                            row_indices,
-                            row_values,
-                        )
-                        my_above = my_above + one
-                    elif classes[item] == one:
-                        if my_equal < num_needed:
-                            store_loaded_result(
-                                out_pos,
-                                col,
-                                values[item],
-                                row_indices,
-                                row_values,
-                            )
-                        my_equal = my_equal + one
-                above_base = above_base + block_above
-                next_equal_base = equal_base + block_equal
-                equal_base = (
-                    next_equal_base < num_needed
-                ).select(next_equal_base, num_needed)
-                gpu.barrier()
-
-            if tid == 0:
-                running_above = above_base
-                running_equal = equal_base
-                remain_base = full_vector_count * vec_width
-                for item in range_constexpr(_VEC - 1):
-                    col = remain_base + item
-                    if col < row_len:
-                        value = input_row[col]
-                        above, equal = classify(
-                            ordered_key(value),
-                            first_threshold,
-                            second_threshold,
-                            third_threshold,
-                        )
-                        accepted_equal = (
-                            running_equal < num_needed
-                        ).select(running_equal, num_needed)
-                        out_pos = running_above + accepted_equal
-                        if above:
-                            store_loaded_result(
-                                out_pos,
-                                col,
-                                value,
-                                row_indices,
-                                row_values,
-                            )
-                            running_above = running_above + one
-                        elif equal:
-                            if running_equal < num_needed:
-                                store_loaded_result(
-                                    out_pos,
-                                    col,
-                                    value,
-                                    row_indices,
-                                    row_values,
-                                )
-                            running_equal = running_equal + one
-            gpu.barrier()
-
-        # Path finalization
-        def scatter_lds_selection(
-            first_threshold,
-            second_threshold,
-            third_threshold,
+        def scatter_stable_ordered_keys(
+            source,
+            radix_shifts,
             prefix_threshold,
             num_needed,
             levels,
@@ -1131,50 +643,102 @@ def build_topk_per_row_prefill_one_workgroup_module(
             scan,
             metadata,
         ):
-            all_equal = row_len < zero
-            if const_expr(levels == 3):
-                all_equal = metadata[_SELECTED_BUCKET_COUNT] == row_len
+            def scatter_step(elems, above_base, equal_base, row_indices, row_values):
+                num_elems = len(elems)
+                # Class encoding: 2 = above, 1 = equal, 0 = below.
+                classes = fx.make_rmem_tensor(num_elems, fx.Int32)
+                packed_local = 0
+                for item in range_constexpr(num_elems):
+                    valid, key, _ = elems[item]
+                    classes[item] = 0
+                    if valid:
+                        above, equal = classify_prefix(key, radix_shifts, prefix_threshold, levels)
+                        if above:
+                            classes[item] = 2
+                            packed_local = packed_local + fx.Int32(1 << 16)
+                        elif equal:
+                            classes[item] = 1
+                            packed_local = packed_local + 1
 
-            if all_equal:
-                scatter_equal_row(
-                    short_threshold_key(
-                        first_threshold,
-                        second_threshold,
-                        third_threshold,
-                    ),
-                    row_indices,
-                    row_values,
-                )
-            else:
-                if const_expr(stable):
-                    scatter_lds_stable_ordered(
-                        first_threshold,
-                        second_threshold,
-                        third_threshold,
-                        num_needed,
-                        levels,
-                        row_indices,
-                        row_values,
-                        scan,
-                        metadata,
+                packed_prefix, packed_step_total = block_excl_prefix_i32(packed_local, scan)
+                my_above = above_base + (packed_prefix >> 16)
+                my_eq = equal_base + (packed_prefix & fx.Int32(0xFFFF))
+                for item in range_constexpr(num_elems):
+                    valid, key, col = elems[item]
+                    cls = classes[item]
+                    if valid:
+                        accepted_equal = (my_eq < num_needed).select(my_eq, num_needed)
+                        out_pos = my_above + accepted_equal
+                        if cls == 2:
+                            row_indices[out_pos] = row_start + col
+                            if const_expr(write_values):
+                                row_values[out_pos] = ordered_value(key)
+                            my_above = my_above + 1
+                        elif cls == 1:
+                            if my_eq < num_needed:
+                                row_indices[out_pos] = row_start + col
+                                if const_expr(write_values):
+                                    row_values[out_pos] = ordered_value(key)
+                            my_eq = my_eq + 1
+                above_base = above_base + (packed_step_total >> 16)
+                next_eq_base = equal_base + (packed_step_total & fx.Int32(0xFFFF))
+                equal_base = (next_eq_base < num_needed).select(next_eq_base, num_needed)
+                gpu.barrier()
+                return above_base, equal_base
+
+            above_base = 0
+            equal_base = 0
+            if source == "lds":
+                row_vectors = (row_len + fx.Int32(_VEC - 1)) // vec_width
+                for step in range_constexpr(full_key_vector_steps):
+                    vector_idx = step * block_threads + tid
+                    active_vector = vector_idx < row_vectors
+                    safe_vector_idx = active_vector.select(vector_idx, 0)
+                    fragment = fx.make_rmem_tensor(full_key_fragment_layout, fx.Int32)
+                    fx.copy_atom_call(
+                        full_key_load_atom,
+                        fx.slice(full_key_tiles, (None, safe_vector_idx)),
+                        fragment,
                     )
-                else:
-                    scatter_unstable_keys(
-                        "lds",
-                        _SHORT_RADIX_SHIFTS,
-                        prefix_threshold,
-                        num_needed,
-                        levels,
-                        row_indices,
-                        row_values,
-                        metadata,
+                    keys = fragment.load()
+                    elems = []
+                    for item in range_constexpr(_VEC):
+                        col = vector_idx * vec_width + item
+                        elems.append((active_vector & (col < row_len), keys[item], col))
+                    above_base, equal_base = scatter_step(
+                        elems, above_base, equal_base, row_indices, row_values
+                    )
+            else:
+                num_steps = (full_vector_count + block_size - 1) // block_size
+                for step in range(0, num_steps, 1):
+                    vector_idx = step * block_size + tid
+                    active_vector = vector_idx < full_vector_count
+                    safe_vector_idx = active_vector.select(vector_idx, 0)
+                    values = _load_f32x4(input_vector_tiles, safe_vector_idx)
+                    keys = fx.make_rmem_tensor(_VEC, fx.Int32)
+                    for item in range_constexpr(_VEC):
+                        keys[item] = ordered_key(values[item])
+                    elems = []
+                    for item in range_constexpr(_VEC):
+                        col = vector_idx * vec_width + item
+                        elems.append((active_vector & (col < row_len), keys[item], col))
+                    above_base, equal_base = scatter_step(
+                        elems, above_base, equal_base, row_indices, row_values
+                    )
+
+                remain_base = full_vector_count * vec_width
+                if remain_base < row_len:
+                    col = remain_base + tid
+                    valid = col < row_len
+                    safe_col = valid.select(col, 0)
+                    elems = [(valid, ordered_key(input_row[safe_col]), col)]
+                    above_base, equal_base = scatter_step(
+                        elems, above_base, equal_base, row_indices, row_values
                     )
 
         def scatter_streaming_stable(
             candidate_count,
-            first_threshold,
-            second_threshold,
-            third_threshold,
+            prefix_threshold,
             num_needed,
             row_indices,
             row_values,
@@ -1185,33 +749,34 @@ def build_topk_per_row_prefill_one_workgroup_module(
             stable_keys,
             stable_indices,
         ):
-            if metadata[_SELECTED_BUCKET_COUNT] == row_len:
-                scatter_equal_row(
-                    threshold_key(
-                        first_threshold,
-                        second_threshold,
-                        third_threshold,
-                    ),
-                    row_indices,
-                    row_values,
+            if const_expr(stable_sort_enabled):
+                can_use_fast = (row_len >= fx.Int32(_STABLE_FAST_MIN_ROW_LEN)) & (
+                    metadata[_SELECTED_BUCKET_COUNT] == num_needed
                 )
-            else:
-                if const_expr(stable_sort_enabled):
-                    can_use_fast = (
-                        row_len >= fx.Int32(_STABLE_FAST_MIN_ROW_LEN)
-                    ) & (
-                        metadata[_SELECTED_BUCKET_COUNT] == num_needed
+                can_use_compact_fast = can_use_fast & (
+                    candidate_count <= fx.Int32(_COMPACT_CAPACITY)
+                )
+                if can_use_compact_fast:
+                    scatter_stable_sorted_keys(
+                        "candidates",
+                        prefix_threshold,
+                        num_needed,
+                        3,
+                        row_indices,
+                        row_values,
+                        candidate_keys,
+                        candidate_indices,
+                        stable_keys,
+                        stable_indices,
+                        metadata,
+                        candidate_count=candidate_count,
                     )
-                    can_use_compact_fast = can_use_fast & (
-                        candidate_count
-                        <= fx.Int32(_COMPACT_CAPACITY)
-                    )
-                    if can_use_compact_fast:
-                        scatter_candidates_stable_sorted(
-                            candidate_count,
-                            first_threshold,
-                            second_threshold,
-                            third_threshold,
+                else:
+                    if can_use_fast:
+                        scatter_stable_sorted_keys(
+                            "gm",
+                            prefix_threshold,
+                            num_needed,
                             3,
                             row_indices,
                             row_values,
@@ -1222,56 +787,36 @@ def build_topk_per_row_prefill_one_workgroup_module(
                             metadata,
                         )
                     else:
-                        if can_use_fast:
-                            scatter_gm_stable_sorted(
-                                first_threshold,
-                                second_threshold,
-                                third_threshold,
-                                num_needed,
-                                row_indices,
-                                row_values,
-                                candidate_keys,
-                                candidate_indices,
-                                metadata,
-                            )
-                        else:
-                            scatter_gm_stable_ordered(
-                                first_threshold,
-                                second_threshold,
-                                third_threshold,
-                                num_needed,
-                                row_indices,
-                                row_values,
-                                scan,
-                                metadata,
-                            )
-                else:
-                    scatter_gm_stable_ordered(
-                        first_threshold,
-                        second_threshold,
-                        third_threshold,
-                        num_needed,
-                        row_indices,
-                        row_values,
-                        scan,
-                        metadata,
-                    )
+                        scatter_stable_ordered_keys(
+                            "gm",
+                            _LONG_RADIX_SHIFTS,
+                            prefix_threshold,
+                            num_needed,
+                            3, # level
+                            row_indices,
+                            row_values,
+                            scan,
+                            metadata,
+                        )
+            else:
+                scatter_stable_ordered_keys(
+                    "gm",
+                    _LONG_RADIX_SHIFTS,
+                    prefix_threshold,
+                    num_needed,
+                    3, # level
+                    row_indices,
+                    row_values,
+                    scan,
+                    metadata,
+                )
 
-        def run_cached_path(
-            histograms,
-            full_keys,
-            row_indices,
-            row_values,
-            scan,
-            metadata,
-        ):
+        def run_cached_path(histograms, full_keys, row_indices, row_values, scan, metadata):
             thresholds = [zero, zero, zero]
             prefix_threshold = zero
             remaining_k = top_k
             for level in range_constexpr(3):
-                active_histograms = (
-                    histograms if level == 0 else (histograms[0],)
-                )
+                active_histograms = histograms if level == 0 else (histograms[0],)
                 clear_histograms(active_histograms, short_bins_per_thread)
                 if level == 0:
                     scan_gm_row(
@@ -1283,7 +828,7 @@ def build_topk_per_row_prefill_one_workgroup_module(
                             histograms,
                             use_ping_pong=True,
                             full_keys=full_keys,
-                        ),
+                        )
                     )
                 else:
                     scan_lds_keys(
@@ -1314,27 +859,33 @@ def build_topk_per_row_prefill_one_workgroup_module(
                 thresholds[level] = metadata[_THRESHOLD_SLOTS[level]]
                 remaining_k = remaining_k - metadata[_ABOVE_SLOTS[level]]
                 prefix_threshold = (
-                    prefix_threshold
-                    << fx.Int32(_SHORT_RADIX_BITS[level])
+                    prefix_threshold << fx.Int32(_SHORT_RADIX_BITS[level])
                 ) | thresholds[level]
-                can_finish = (
-                    True
-                    if level == 2
-                    else metadata[_SELECTED_BUCKET_COUNT] == remaining_k
-                )
+                can_finish = True if level == 2 else metadata[_SELECTED_BUCKET_COUNT] == remaining_k
                 if can_finish:
-                    scatter_lds_selection(
-                        thresholds[0],
-                        thresholds[1],
-                        thresholds[2],
-                        prefix_threshold,
-                        remaining_k,
-                        level + 1,
-                        row_indices,
-                        row_values,
-                        scan,
-                        metadata,
-                    )
+                    if const_expr(stable):
+                        scatter_stable_ordered_keys(
+                            "lds",
+                            _SHORT_RADIX_SHIFTS,
+                            prefix_threshold,
+                            remaining_k,
+                            level + 1,
+                            row_indices,
+                            row_values,
+                            scan,
+                            metadata,
+                        )
+                    else:
+                        scatter_unstable_keys(
+                            "lds",
+                            _SHORT_RADIX_SHIFTS,
+                            prefix_threshold,
+                            remaining_k,
+                            level + 1,
+                            row_indices,
+                            row_values,
+                            metadata,
+                        )
                     return
 
         def run_streaming_path(
@@ -1354,19 +905,11 @@ def build_topk_per_row_prefill_one_workgroup_module(
             remaining_k = top_k
             candidate_count = zero
             for level in range_constexpr(3):
-                active_histograms = (
-                    histograms if level == 0 else (histogram,)
-                )
-                bins_per_thread = (
-                    high_bins_per_thread
-                    if level == 0
-                    else later_bins_per_thread
-                )
+                active_histograms = histograms if level == 0 else (histogram,)
+                bins_per_thread = high_bins_per_thread if level == 0 else later_bins_per_thread
                 clear_histograms(active_histograms, bins_per_thread)
                 use_candidate_cache = (
-                    candidate_count <= fx.Int32(_COMPACT_CAPACITY)
-                    if level == 2
-                    else False
+                    candidate_count <= fx.Int32(_COMPACT_CAPACITY) if level == 2 else False
                 )
                 if use_candidate_cache:
                     for pos in range(tid, candidate_count, block_size):
@@ -1393,6 +936,10 @@ def build_topk_per_row_prefill_one_workgroup_module(
                             use_ping_pong=level == 0,
                             candidate_keys=candidate_keys,
                             candidate_indices=candidate_indices,
+                            stable_keys=stable_keys,
+                            stable_indices=stable_indices,
+                            row_indices=row_indices,
+                            row_values=row_values,
                         ),
                         reverse=level == 1,
                     )
@@ -1402,7 +949,7 @@ def build_topk_per_row_prefill_one_workgroup_module(
                 elif level == 1:
                     candidate_count = metadata[_CANDIDATE_COUNT]
 
-                # 求和选择阈值
+                # Select the threshold from the histogram.
                 choose_threshold(
                     remaining_k,
                     _ABOVE_SLOTS[level],
@@ -1414,15 +961,14 @@ def build_topk_per_row_prefill_one_workgroup_module(
                     bins_per_thread,
                 )
 
-                # 更新阈值和剩余k
+                # Update the threshold prefix and remaining K.
                 thresholds[level] = metadata[_THRESHOLD_SLOTS[level]]
                 remaining_k = remaining_k - metadata[_ABOVE_SLOTS[level]]
                 prefix_threshold = (
-                    prefix_threshold
-                    << fx.Int32(_LONG_RADIX_BITS[level])
+                    prefix_threshold << fx.Int32(_LONG_RADIX_BITS[level])
                 ) | thresholds[level]
 
-                # 快速退出路径
+                # Fast exit paths.
                 if const_expr(not stable):
                     can_finish = metadata[_SELECTED_BUCKET_COUNT] == remaining_k
                     if level == 0:
@@ -1460,9 +1006,7 @@ def build_topk_per_row_prefill_one_workgroup_module(
             if const_expr(stable):
                 scatter_streaming_stable(
                     candidate_count,
-                    thresholds[0],
-                    thresholds[1],
-                    thresholds[2],
+                    prefix_threshold,
                     remaining_k,
                     row_indices,
                     row_values,
@@ -1480,7 +1024,7 @@ def build_topk_per_row_prefill_one_workgroup_module(
                         _LONG_RADIX_SHIFTS,
                         prefix_threshold,
                         remaining_k,
-                        3, # level
+                        3,  # level
                         row_indices,
                         row_values,
                         metadata,
@@ -1495,37 +1039,25 @@ def build_topk_per_row_prefill_one_workgroup_module(
                         _LONG_RADIX_SHIFTS,
                         prefix_threshold,
                         remaining_k,
-                        3, # level
+                        3,
                         row_indices,
                         row_values,
                         metadata,
-                    )
+                    )  # level
 
-        def write_direct_output(
-            row_indices,
-            row_values,
-            row_index_tiles,
-            row_value_tiles,
-        ):
+        def write_direct_output(row_indices, row_values, row_index_tiles, row_value_tiles):
             for step in range_constexpr(output_vector_steps):
                 vector_idx = step * block_threads + tid
                 if vector_idx < output_vector_count:
                     col = vector_idx * vec_width
                     index_values = [
-                        (col + item < row_len).select(
-                            row_start + col + item,
-                            fx.Int32(-1),
-                        )
+                        (col + item < row_len).select(row_start + col + item, fx.Int32(-1))
                         for item in range_constexpr(_VEC)
                     ]
                     fragment = fx.make_rmem_tensor(index_fragment_layout, fx.Int32)
-                    fragment.store(
-                        fx.Vector.from_elements(index_values, dtype=fx.Int32)
-                    )
+                    fragment.store(fx.Vector.from_elements(index_values, dtype=fx.Int32))
                     fx.copy_atom_call(
-                        index_store_atom,
-                        fragment,
-                        fx.slice(row_index_tiles, (None, vector_idx)),
+                        index_store_atom, fragment, fx.slice(row_index_tiles, (None, vector_idx))
                     )
 
                     if const_expr(write_values):
@@ -1535,18 +1067,11 @@ def build_topk_per_row_prefill_one_workgroup_module(
                             valid = local_col < row_len
                             safe_col = valid.select(local_col, zero)
                             output_values.append(
-                                valid.select(
-                                    input_row[safe_col],
-                                    fx.Float32(float("-inf")),
-                                )
+                                valid.select(input_row[safe_col], fx.Float32(float("-inf")))
                             )
-                        value_fragment = fx.make_rmem_tensor(
-                            value_fragment_layout, fx.Float32
-                        )
+                        value_fragment = fx.make_rmem_tensor(value_fragment_layout, fx.Float32)
                         value_fragment.store(
-                            fx.Vector.from_elements(
-                                output_values, dtype=fx.Float32
-                            )
+                            fx.Vector.from_elements(output_values, dtype=fx.Float32)
                         )
                         fx.copy_atom_call(
                             value_store_atom,
@@ -1560,19 +1085,11 @@ def build_topk_per_row_prefill_one_workgroup_module(
                 safe_tail = valid.select(tail, zero)
                 row_indices[tail] = valid.select(row_start + tail, fx.Int32(-1))
                 if const_expr(write_values):
-                    row_values[tail] = valid.select(
-                        input_row[safe_tail],
-                        fx.Float32(float("-inf")),
-                    )
+                    row_values[tail] = valid.select(input_row[safe_tail], fx.Float32(float("-inf")))
 
         # Kernel control flow
         if row_len <= top_k:
-            write_direct_output(
-                row_indices,
-                row_values,
-                row_index_tiles,
-                row_value_tiles,
-            )
+            write_direct_output(row_indices, row_values, row_index_tiles, row_value_tiles)
 
         if row_len > top_k:
             if tid < _METADATA_SIZE:
@@ -1581,12 +1098,7 @@ def build_topk_per_row_prefill_one_workgroup_module(
 
             if row_len <= fx.Int32(_COMPACT_CAPACITY):
                 run_cached_path(
-                    short_histograms,
-                    full_keys,
-                    row_indices,
-                    row_values,
-                    scan,
-                    metadata,
+                    short_histograms, full_keys, row_indices, row_values, scan, metadata
                 )
             else:
                 run_streaming_path(
@@ -1613,15 +1125,7 @@ def build_topk_per_row_prefill_one_workgroup_module(
         stream: fx.Stream,
     ):
         topk_per_row_prefill_one_workgroup_kernel(
-            input,
-            row_starts,
-            row_ends,
-            indices,
-            values,
-        ).launch(
-            grid=(rows_m, 1, 1),
-            block=(block_threads, 1, 1),
-            stream=stream,
-        )
+            input, row_starts, row_ends, indices, values
+        ).launch(grid=(rows_m, 1, 1), block=(block_threads, 1, 1), stream=stream)
 
     return launch_topk_per_row_prefill_one_workgroup
