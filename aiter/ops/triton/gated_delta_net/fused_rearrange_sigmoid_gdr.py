@@ -211,19 +211,25 @@ def fused_rearrange_sigmoid_gated_delta_rule(
     """
     Fused Triton sigmoid-gated delta rule over packed QKV (decode-oriented).
     """
+    # Spelled as raised ``AssertionError``s rather than ``assert`` statements,
+    # keeping the type a caller may already handle while ``python -O`` can no
+    # longer strip the guard.
     expected_shape = (qkv.shape[0], key_dim * 2 + value_dim)
-    assert (
-        qkv.shape == expected_shape
-    ), f"expect qkv to be in shape {expected_shape}, got {qkv.shape}"
+    if qkv.shape != expected_shape:
+        raise AssertionError(
+            f"expect qkv to be in shape {expected_shape}, got {qkv.shape}"
+        )
     # Both paths get their head counts by floor-dividing these, so a remainder
     # silently narrows every view by its width and returns a result shaped for
     # the heads that survived, rather than saying the layout does not divide.
-    assert (
-        key_dim % head_k_dim == 0
-    ), f"key_dim {key_dim} must be a multiple of head_k_dim {head_k_dim}"
-    assert (
-        value_dim % head_v_dim == 0
-    ), f"value_dim {value_dim} must be a multiple of head_v_dim {head_v_dim}"
+    if key_dim % head_k_dim != 0:
+        raise AssertionError(
+            f"key_dim {key_dim} must be a multiple of head_k_dim {head_k_dim}"
+        )
+    if value_dim % head_v_dim != 0:
+        raise AssertionError(
+            f"value_dim {value_dim} must be a multiple of head_v_dim {head_v_dim}"
+        )
 
     # FlyDSL port (opt-in). Only the speculative-verify shape is routed;
     # everything else falls through to Triton below unchanged.

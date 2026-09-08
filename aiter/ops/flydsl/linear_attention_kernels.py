@@ -29,7 +29,9 @@ __all__ = [
 ]
 
 
-GDR_GPU_ARCH = get_rocm_arch()
+# _MTP_BY_ARCH is keyed on the base name; the hardware path already drops the
+# feature suffix, but an arch set by hand through the environment keeps it.
+GDR_GPU_ARCH = get_rocm_arch().split(":")[0]
 
 
 def _mtp_variant(mode, has_tree):
@@ -383,40 +385,41 @@ def flydsl_gdr_decode(
     batch_size, seq_length, num_k_heads, head_k_dim = query.shape
     num_v_heads = value.shape[-2]
     head_v_dim = value.shape[-1]
-    kwargs_ = get_default_kwargs(
-        str(dtype),
-        str(state_.dtype),
-        batch_size,
-        seq_length,
-        num_k_heads,
-        num_v_heads,
-        head_k_dim,
-        head_v_dim,
-    )
-    exe = create_vk_gdr_decode_kernel(
-        get_dtype_str(query.dtype),
-        get_dtype_str(A_log.dtype),
-        get_dtype_str(state_.dtype),
-        seq_length,
-        num_k_heads,
-        num_v_heads,
-        head_k_dim,
-        head_v_dim,
-        query.stride(),
-        key.stride(),
-        value.stride(),
-        state_.stride(),
-        a.stride(),
-        b.stride(),
-        use_qk_l2norm,
-        **kwargs_,
-    )
-    # One setting for every float op the body traces, rather than a flag per
-    # call site. The jit compiles on first call, not on build, so it has to
-    # still be in scope at the launch.
+    # The tiling reads the CU count off the current device. One fastmath setting
+    # for every float op the body traces, rather than a flag per call site; the
+    # jit compiles on first call, not on build, so it has to still be in scope
+    # at the launch.
     with CompilationContext.compile_hints({"fastmath": "fast"}), torch.cuda.device(
         query.device.index
     ):
+        kwargs_ = get_default_kwargs(
+            str(dtype),
+            str(state_.dtype),
+            batch_size,
+            seq_length,
+            num_k_heads,
+            num_v_heads,
+            head_k_dim,
+            head_v_dim,
+        )
+        exe = create_vk_gdr_decode_kernel(
+            get_dtype_str(query.dtype),
+            get_dtype_str(A_log.dtype),
+            get_dtype_str(state_.dtype),
+            seq_length,
+            num_k_heads,
+            num_v_heads,
+            head_k_dim,
+            head_v_dim,
+            query.stride(),
+            key.stride(),
+            value.stride(),
+            state_.stride(),
+            a.stride(),
+            b.stride(),
+            use_qk_l2norm,
+            **kwargs_,
+        )
         _run_compiled(
             exe,
             query,
@@ -626,16 +629,75 @@ def _snapshot_store_bytes(state_dtype, inter_dtype) -> int:
     return values_per_thread_k * inter_dtype.itemsize
 
 
+def _require_index(name, t, query, *, dims=None, layout="", covers=False):
+    """Refuse an index operand, which the kernel reads as a bare device address."""
+    if t.device != query.device:
+        raise ValueError(
+            f"`{name}` must sit on `query`'s device {query.device}; got {t.device}."
+        )
+    if t.dtype != torch.int32:
+        raise ValueError(f"`{name}` must be int32; got {t.dtype}.")
+    if dims is not None and t.dim() != dims:
+        want = f"{dims}-D {layout}".rstrip()
+        raise ValueError(f"`{name}` must be {want}; got shape {tuple(t.shape)}.")
+    if t.shape[0] != query.shape[0]:
+        raise ValueError(
+            f"`{name}` must carry one row per sequence ({query.shape[0]}); got "
+            f"shape {tuple(t.shape)}."
+        )
+    if covers and t.shape[1] < query.shape[1]:
+        raise ValueError(
+            f"`{name}` must reach every one of the {query.shape[1]} draft tokens; "
+            f"got shape {tuple(t.shape)}."
+        )
+
+
 def _mtp_common_checks(query, key, value, a, b, dt_bias, A_log, state, out):
+    """Refuse the operands the kernel would otherwise reinterpret.
+
+    Raised rather than asserted, here and for the index operands: ``python -O``
+    strips the statement form and takes the guard with it.
+    """
     device = query.device
     dtype = query.dtype
-    for t in (key, value, a, b, dt_bias, A_log, state, out):
-        assert t.device == device, "every MTP operand must sit on one device"
-    for t in (key, value, a, b, dt_bias, out):
-        assert t.dtype == dtype
-    assert state.dtype in _SUPPORTED_STATE_DTYPES
-    assert A_log.dtype in (torch.float32, torch.bfloat16)
-    assert state.data_ptr() % 16 == 0
+    if not query.is_cuda:
+        raise ValueError(f"`query` must be on a GPU; got {device}.")
+    operands = {
+        "key": key,
+        "value": value,
+        "a": a,
+        "b": b,
+        "dt_bias": dt_bias,
+        "A_log": A_log,
+        "state": state,
+        "out": out,
+    }
+    for name, t in operands.items():
+        if t.device != device:
+            raise ValueError(
+                f"every MTP operand must sit on one device; `{name}` is on "
+                f"{t.device} and `query` on {device}."
+            )
+    for name in ("key", "value", "a", "b", "dt_bias", "out"):
+        if operands[name].dtype != dtype:
+            raise ValueError(
+                f"`{name}` must carry `query`'s dtype {dtype}; got "
+                f"{operands[name].dtype}."
+            )
+    if state.dtype not in _SUPPORTED_STATE_DTYPES:
+        raise ValueError(
+            f"`state` dtype must be one of {list(_SUPPORTED_STATE_DTYPES)}; got "
+            f"{state.dtype}."
+        )
+    if A_log.dtype not in (torch.float32, torch.bfloat16):
+        raise ValueError(
+            f"`A_log` dtype must be float32 or bfloat16; got {A_log.dtype}."
+        )
+    if state.data_ptr() % 16 != 0:
+        raise ValueError(
+            "`state` must be 16-byte aligned for vectorized access; got address "
+            f"{state.data_ptr():#x}."
+        )
     if query.stride(-1) != 1:
         raise ValueError(
             "`query` must have a contiguous last dimension for vectorized loads; "
@@ -680,19 +742,6 @@ def _mtp_launch(
     num_v_heads = value.shape[-2]
     head_v_dim = value.shape[-1]
 
-    kwargs_ = get_mtp_default_kwargs(
-        str(query.dtype),
-        str(state.dtype),
-        state.dtype,
-        batch_size,
-        seq_length,
-        num_k_heads,
-        num_v_heads,
-        head_k_dim,
-        head_v_dim,
-        _mtp_variant(mode, has_tree),
-    )
-
     # Unused operands are handed an existing tensor: the const_expr guards mean
     # the kernel never builds a descriptor for them, but the launch still needs
     # a valid address in the slot.
@@ -700,45 +749,63 @@ def _mtp_launch(
     inter_strides = tuple(inter_buffer.stride()) if inter_buffer is not None else ()
     parent_strides = tuple(parent_tokens.stride()) if parent_tokens is not None else ()
 
-    # One setting for every float op the body traces, rather than a flag per
-    # call site.
-    build_hints = {"fastmath": "fast"}
-    # Measured per shape, so it rides in with the tuned tiling rather than
-    # being derived here.
-    waves_per_eu = kwargs_.get("WAVES_PER_EU", 0)
-    if waves_per_eu:
-        build_hints["waves_per_eu"] = waves_per_eu
-
-    with CompilationContext.compile_hints(build_hints):
-        exe = create_vk_gdr_mtp_kernel(
-            get_dtype_str(query.dtype),
-            get_dtype_str(A_log.dtype),
-            get_dtype_str(state.dtype),
-            get_dtype_str(inter_buffer.dtype) if inter_buffer is not None else "f32",
+    # The ladder reads the CU count off the current device.
+    with torch.cuda.device(query.device.index):
+        kwargs_ = get_mtp_default_kwargs(
+            str(query.dtype),
+            str(state.dtype),
+            state.dtype,
+            batch_size,
             seq_length,
             num_k_heads,
             num_v_heads,
             head_k_dim,
             head_v_dim,
-            query.stride(),
-            key.stride(),
-            value.stride(),
-            state.stride(),
-            a.stride(),
-            b.stride(),
-            tuple(state_indices.stride()) + ((1,) if state_indices.dim() == 1 else ()),
-            inter_strides,
-            parent_strides,
-            use_qk_l2norm,
-            mode,
-            has_tree,
-            disable_state_update,
-            **kwargs_,
+            _mtp_variant(mode, has_tree),
         )
 
+        # One setting for every float op the body traces, rather than a flag per
+        # call site.
+        build_hints = {"fastmath": "fast"}
+        # Rides with the one tiling that wants it rather than being derived here.
+        waves_per_eu = kwargs_.get("WAVES_PER_EU", 0)
+        if waves_per_eu:
+            build_hints["waves_per_eu"] = waves_per_eu
+
         # The jit compiles on first call, not on build, so the hint has to still
-        # be in scope here.
-        with torch.cuda.device(query.device.index):
+        # be in scope at the launch.
+        with CompilationContext.compile_hints(build_hints):
+            exe = create_vk_gdr_mtp_kernel(
+                get_dtype_str(query.dtype),
+                get_dtype_str(A_log.dtype),
+                get_dtype_str(state.dtype),
+                (
+                    get_dtype_str(inter_buffer.dtype)
+                    if inter_buffer is not None
+                    else "f32"
+                ),
+                seq_length,
+                num_k_heads,
+                num_v_heads,
+                head_k_dim,
+                head_v_dim,
+                query.stride(),
+                key.stride(),
+                value.stride(),
+                state.stride(),
+                a.stride(),
+                b.stride(),
+                tuple(state_indices.stride())
+                + ((1,) if state_indices.dim() == 1 else ()),
+                inter_strides,
+                parent_strides,
+                use_qk_l2norm,
+                mode,
+                has_tree,
+                disable_state_update,
+                **kwargs_,
+            )
+
             _run_compiled(
                 exe,
                 query,
@@ -790,12 +857,15 @@ def flydsl_gdr_mtp(
     if stream is None:
         stream = torch.cuda.current_stream()
     _mtp_common_checks(query, key, value, a, b, dt_bias, A_log, state, out)
-    assert ssm_state_indices.dtype == torch.int32
-    assert num_accepted_tokens.dtype == torch.int32
-    assert ssm_state_indices.dim() == 2, "the chain contract needs [batch, token]"
-    assert ssm_state_indices.shape[0] == query.shape[0]
-    assert ssm_state_indices.shape[1] >= query.shape[1]
-    assert num_accepted_tokens.shape[0] == query.shape[0]
+    _require_index(
+        "ssm_state_indices",
+        ssm_state_indices,
+        query,
+        dims=2,
+        layout="[batch, token]",
+        covers=True,
+    )
+    _require_index("num_accepted_tokens", num_accepted_tokens, query)
 
     _mtp_launch(
         mode=MTP_MODE_CHAIN,
@@ -850,9 +920,8 @@ def flydsl_gdr_mtp_sglang(
     if stream is None:
         stream = torch.cuda.current_stream()
     _mtp_common_checks(query, key, value, a, b, dt_bias, A_log, state, out)
-    assert initial_state_indices.dtype == torch.int32
-    assert initial_state_indices.dim() == 1
-    assert initial_state_indices.shape[0] == query.shape[0]
+    seqlen = query.shape[1]
+    _require_index("initial_state_indices", initial_state_indices, query, dims=1)
     if (intermediate_states_buffer is None) != (intermediate_state_indices is None):
         raise ValueError(
             "`intermediate_states_buffer` and `intermediate_state_indices` are "
@@ -864,11 +933,13 @@ def flydsl_gdr_mtp_sglang(
             "restarts each token from a snapshot, so there has to be one."
         )
     if intermediate_states_buffer is not None:
-        assert intermediate_states_buffer.dim() == 5, "[slot, step, HV, V, K]"
-        assert intermediate_states_buffer.shape[1] >= query.shape[1]
-        assert intermediate_states_buffer.shape[2] == value.shape[-2]
-        assert intermediate_states_buffer.shape[3] == value.shape[-1]
-        assert intermediate_states_buffer.shape[4] == query.shape[-1]
+        got = tuple(intermediate_states_buffer.shape)
+        want = (value.shape[-2], value.shape[-1], query.shape[-1])
+        if len(got) != 5 or got[1] < seqlen or got[2:] != want:
+            raise ValueError(
+                f"`intermediate_states_buffer` must be [slot, >={seqlen}, "
+                f"{want[0]}, {want[1]}, {want[2]}]; got {got}."
+            )
         if intermediate_states_buffer.stride(-1) != 1:
             raise ValueError(
                 "`intermediate_states_buffer` must have K contiguous; got stride "
@@ -884,13 +955,16 @@ def flydsl_gdr_mtp_sglang(
                 "-byte store that the buffer ops cannot express. Store the "
                 "snapshot at `state.dtype` or narrower."
             )
-        assert intermediate_state_indices.dtype == torch.int32
-        assert intermediate_state_indices.shape[0] == query.shape[0]
+        _require_index("intermediate_state_indices", intermediate_state_indices, query)
     if retrieve_parent_token is not None:
-        assert retrieve_parent_token.dtype == torch.int32
-        assert retrieve_parent_token.dim() == 2
-        assert retrieve_parent_token.shape[0] == query.shape[0]
-        assert retrieve_parent_token.shape[1] >= query.shape[1]
+        _require_index(
+            "retrieve_parent_token",
+            retrieve_parent_token,
+            query,
+            dims=2,
+            layout="[batch, token]",
+            covers=True,
+        )
 
     _mtp_launch(
         mode=MTP_MODE_SNAPSHOT,

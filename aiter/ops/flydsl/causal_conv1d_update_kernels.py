@@ -269,7 +269,16 @@ def _require_in_scope(
     public entry point has no way to ask whether its problem is in scope. That
     makes the entry point the one place left to say no, as it already does for
     an out-of-range width.
+
+    The arch screen reads ``x`` alone, so an operand left on another device is
+    refused here rather than reaching the launch as a foreign pointer.
     """
+    for name, t in (("conv_state", conv_state), ("weight", weight), ("bias", bias)):
+        if t is not None and t.device != x.device:
+            raise ValueError(
+                f"{fn}: every operand must sit on one device; `{name}` is on "
+                f"{t.device} and `x` on {x.device}."
+            )
     reason = _dtype_out_of_scope(x, conv_state, weight, bias)
     if reason is None and not _is_supported_arch(x.device):
         reason = f"{x.device} is not one of the built {list(_SUPPORTED_ARCHS)}"
@@ -371,8 +380,11 @@ def _causal_conv1d_update_sglang_flydsl_supported(
 def _resolve_activation(activation: bool | str | None) -> bool:
     if isinstance(activation, bool):
         activation = "silu" if activation else None
-    elif activation is not None:
-        assert activation in ("silu", "swish")
+    elif activation is not None and activation not in ("silu", "swish"):
+        raise ValueError(
+            "`activation` must be 'silu', 'swish', a bool or None; got "
+            f"{activation!r}."
+        )
     return activation in ("silu", "swish")
 
 
