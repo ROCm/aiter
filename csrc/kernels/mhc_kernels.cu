@@ -222,7 +222,7 @@ namespace aiter {
     mma_f32_16x16x4_fma((a), (b), (c))
 #endif
 
-    template <typename DTYPE_I, int num_warps, int tile_m, int tile_n, int tile_k, bool is_w_preshuffle_bf16 = false>
+    template <typename DTYPE_I, int num_warps, int tile_m, int tile_n, int tile_k, bool is_w_preshuffle_bf16 = false, bool vector_fn_load = false>
     __global__ __launch_bounds__(num_warps *  opus::get_warp_size(), 2)
     void mhc_pre_gemm_sqrsum_kernel(
         float* out,
@@ -686,12 +686,25 @@ namespace aiter {
                     int hi_f = mhc_fn_hi_float(k_group * x_vec_size +
                                                c * 2 * interleave_size * x_vec_size +
                                                r * interleave_size * x_vec_size);
-                    #pragma unroll
-                    for (int t = 0; t < 4; t++) {
-                        hi_raw[n][r * 4 + t] =
-                            *(s_fn_rd_ptr + fn_row * tile_k + ((hi_f + t) ^ mask));
-                        lo_raw[n][r * 4 + t] =
-                            *(s_fn_rd_ptr + fn_row * tile_k + ((hi_f + 8 + t) ^ mask));
+                    if constexpr (vector_fn_load) {
+                        // The XOR mask preserves each aligned four-float run.
+                        // Explicit vector loads avoid scalar LDS gathers and
+                        // register repacking of the BF16 WMMA fragments.
+                        using f32x4_ = opus::vector_t<float, 4>;
+                        *reinterpret_cast<f32x4_*>(hi_raw[n] + r * 4) =
+                            *reinterpret_cast<const f32x4_*>(
+                                s_fn_rd_ptr + fn_row * tile_k + (hi_f ^ mask));
+                        *reinterpret_cast<f32x4_*>(lo_raw[n] + r * 4) =
+                            *reinterpret_cast<const f32x4_*>(
+                                s_fn_rd_ptr + fn_row * tile_k + ((hi_f + 8) ^ mask));
+                    } else {
+                        #pragma unroll
+                        for (int t = 0; t < 4; t++) {
+                            hi_raw[n][r * 4 + t] =
+                                *(s_fn_rd_ptr + fn_row * tile_k + ((hi_f + t) ^ mask));
+                            lo_raw[n][r * 4 + t] =
+                                *(s_fn_rd_ptr + fn_row * tile_k + ((hi_f + 8 + t) ^ mask));
+                        }
                     }
                 }
             }
@@ -892,7 +905,7 @@ namespace aiter {
         }
     }
 
-#define MHC_PRE_GEMM_SQRSUM_KERNEL_IMPL(num_warps, tile_n, tile_k) \
+#define MHC_PRE_GEMM_SQRSUM_KERNEL_IMPL(num_warps, tile_n, tile_k, vector_fn_load) \
     AITER_DISPATCH_FLOATING16_TYPES_rmTorch(x.dtype(), "mhc_pre_gemm_sqrsum", [&] { \
         using DTYPE_I = typename hip2opus<scalar_t>::type; \
         const int tile_m = m_per_block; \
@@ -901,7 +914,7 @@ namespace aiter {
         dim3 block(num_warps * WARP_SIZE); \
         AITER_CHECK(hc_hidden_size % (tile_k * split_k) == 0, "hc_hidden_size must be divisible by tile_k * split_k"); \
         AITER_CHECK(hc_hidden_size >= (tile_k * split_k) * 2, "hc_hidden_size must >= tile_k * split_k * 2 stages prefetch"); \
-        mhc_pre_gemm_sqrsum_kernel<DTYPE_I, num_warps, tile_m, tile_n, tile_k, MHC_PRE_BF16><<<grid, block, 0, stream>>>( \
+        mhc_pre_gemm_sqrsum_kernel<DTYPE_I, num_warps, tile_m, tile_n, tile_k, MHC_PRE_BF16, vector_fn_load><<<grid, block, 0, stream>>>( \
             reinterpret_cast<float*>(out.data_ptr()), \
             reinterpret_cast<float*>(sqrsum.data_ptr()), \
             reinterpret_cast<DTYPE_I*>(x.data_ptr()), \
@@ -916,18 +929,31 @@ namespace aiter {
         ); \
     });
 
+// Packed BF16 vector LDS reads benefit both decode and prefill on gfx1250.
+// Query warp size at runtime: WARP_SIZE evaluates to 64 in host constant expressions.
 #define MHC_PRE_GEMM_SQRSUM_KERNEL_DISPATCH(tile_k) \
     if (tile_k == 64) { \
+        const bool vector_fn_load = MHC_PRE_BF16 && get_warp_size_func() == 32 && cu_num == 256 \
+            && hc_mult3 == 24 \
+            && (hc_hidden_size == 4 * 4096 || hc_hidden_size == 4 * 7168); \
         if (cu_num * 2 > m_blocks * split_k || hc_mult3 <= 16) { \
-            MHC_PRE_GEMM_SQRSUM_KERNEL_IMPL(4, 16, 64); \
+            if (vector_fn_load) { \
+                MHC_PRE_GEMM_SQRSUM_KERNEL_IMPL(4, 16, 64, true); \
+            } else { \
+                MHC_PRE_GEMM_SQRSUM_KERNEL_IMPL(4, 16, 64, false); \
+            } \
         } else { \
-            MHC_PRE_GEMM_SQRSUM_KERNEL_IMPL(4, 32, 64); \
+            if (vector_fn_load) { \
+                MHC_PRE_GEMM_SQRSUM_KERNEL_IMPL(4, 32, 64, true); \
+            } else { \
+                MHC_PRE_GEMM_SQRSUM_KERNEL_IMPL(4, 32, 64, false); \
+            } \
         } \
     } else if (tile_k == 128 || hc_mult3 <= 16) { \
         if (cu_num > m_blocks * split_k) { \
-            MHC_PRE_GEMM_SQRSUM_KERNEL_IMPL(4, 16, 128); \
+            MHC_PRE_GEMM_SQRSUM_KERNEL_IMPL(4, 16, 128, false); \
         } else { \
-            MHC_PRE_GEMM_SQRSUM_KERNEL_IMPL(4, 32, 128); \
+            MHC_PRE_GEMM_SQRSUM_KERNEL_IMPL(4, 32, 128, false); \
         } \
     } else { \
         AITER_CHECK(false, "tile_k must be 64 or 128"); \
