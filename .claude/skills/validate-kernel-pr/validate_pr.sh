@@ -92,6 +92,13 @@ PERF_BASELINE_METHOD="patch-reversed-same-worktree"
 # base?" to say WHICH target. Four of them read a state computed from the correctness
 # target, two write to the worktree, and one deletes from it.
 PERF_TARGET=""
+# How the validator came to be timing that file. A caller who names it has read the diff;
+# falling back to the correctness target is the validator's own inference, and the two are
+# not the same kind of evidence -- the same distinction runner_basis and test_provenance
+# already draw. Absent any measurement, this is what tells a reader whose choice it was.
+PERF_TARGET_BASIS="same-as-correctness-target"
+PERF_TARGET_PROVENANCE="unknown"
+PERF_TARGET_PROVENANCE_REASON=""
 TARGET_PYTHON="${PYTHON_BIN:-$(command -v python3 || command -v python || true)}"
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 
@@ -123,6 +130,7 @@ while [ "$#" -gt 0 ]; do
     --label) need_value "$@"; LABEL="$2"; shift 2;;
     --out) need_value "$@"; OUT="$2"; shift 2;;
     --perf-args) need_value "$@"; PERF_ARGS="$2"; PERF_ARGS_SET=1; shift 2;;
+    --perf-target) need_value "$@"; PERF_TARGET="$2"; PERF_TARGET_BASIS="declared-by-caller"; shift 2;;
     --perf-control-column) need_value "$@"; PERF_CONTROL_COLUMN="$2"; shift 2;;
     --no-perf) PERF_ENABLED=0; shift;;
     *) echo "unknown arg $1" >&2; exit 2;;
@@ -945,6 +953,24 @@ jset_string "test_selection.test_provenance_reason" "$TEST_PROVENANCE_REASON"
 if [ "$TEST_PROVENANCE" = "pr-added" ] || [ "$TEST_PROVENANCE" = "pr-modified" ]; then
   finding "note" "correctness" \
     "the evidence is not independent of the change: $TEST_PROVENANCE_REASON"
+fi
+
+# The same question, asked of the file the timing runs will execute. It is the same pure
+# function against the same snapshot -- a perf target is a target, and "did the patch write
+# this?" has one answer however the file is used. Reusing it also inherits the honesty that
+# no patch means `unknown` rather than a cheerful `pre-existing`.
+if [ "$PERF_TARGET" = "$TEST_FILE" ]; then
+  PERF_TARGET_PROVENANCE="$TEST_PROVENANCE"
+  PERF_TARGET_PROVENANCE_REASON="$TEST_PROVENANCE_REASON"
+elif [ -n "$PATCHF" ]; then
+  PERF_PROVENANCE_OUT=$(printf '%s' "$PATCH_STATUS" \
+    | "$SCRIPT_DIR/target_run.py" provenance "$PERF_TARGET" --patch-supplied)
+  PERF_TARGET_PROVENANCE=${PERF_PROVENANCE_OUT%%$'\n'*}
+  PERF_TARGET_PROVENANCE_REASON=${PERF_PROVENANCE_OUT#*$'\n'}
+else
+  PERF_PROVENANCE_OUT=$("$SCRIPT_DIR/target_run.py" provenance "$PERF_TARGET" </dev/null)
+  PERF_TARGET_PROVENANCE=${PERF_PROVENANCE_OUT%%$'\n'*}
+  PERF_TARGET_PROVENANCE_REASON=${PERF_PROVENANCE_OUT#*$'\n'}
 fi
 
 # Two independent channels can carry the S1 grid: the target's own CLI flag (--shape-arg)
@@ -2059,6 +2085,15 @@ else
       --control-column "$PERF_CONTROL_COLUMN" --control-tol "$PERF_CONTROL_TOL"
   fi
 fi
+
+# After the chain, not inside it. `scrape_perf.py stage` REPLACES stages.perf wholesale and
+# stage_note does too, so a field written by any branch above would survive on some paths and
+# vanish on others -- and the reader most in need of knowing which file was timed is the one
+# reading a `skip`. Written once here, every branch reports it.
+jset_string "stages.perf.target" "$PERF_TARGET"
+jset_string "stages.perf.target_basis" "$PERF_TARGET_BASIS"
+jset_string "stages.perf.target_provenance" "$PERF_TARGET_PROVENANCE"
+jset_string "stages.perf.target_provenance_reason" "$PERF_TARGET_PROVENANCE_REASON"
 
 record_gpu_activity_after
 finish_report

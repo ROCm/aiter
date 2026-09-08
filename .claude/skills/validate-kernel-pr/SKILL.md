@@ -130,6 +130,7 @@ variable (next section).
 | `--axis` | repeatable `NAME=--flag:v1;v2` — an independent axis that is not a shape |
 | `--tol-table` | tolerances recorded alongside the comparison |
 | `--perf-args` \| `--no-perf` | force the timing entry point, or skip timing entirely |
+| `--perf-target` | the file to **time**, when that is not the file to run. Defaults to `--target`'s file |
 | `--perf-control-column` | a column the patch does not touch; **required** before a transplanted baseline is believed |
 | `--label` `--out` | run name and report path (default `./validation_report.json`) |
 
@@ -548,6 +549,21 @@ The cost of a kernel change, measured rather than assumed. Base and head are tim
 locked GPU, back to back, in the same worktree — the baseline is this PR's own base with the patch
 reversed, not whatever machine the PR's table was produced on. A head-only number reproduces the
 PR's own comparison and cannot show a regression.
+
+**The file that is timed need not be the file that is run.** A timing run executes a file; a
+correctness run may select cases inside one with a pytest node id. They were the same file for as
+long as perf had no target of its own, and `--perf-target` is how you say otherwise — an aiter
+kernel's unit test and its bench are routinely two different files. `perf.target` names what was
+timed on every status including `skip`, and `perf.target_basis` says whose choice it was:
+`declared-by-caller` when someone who read the diff named it, `same-as-correctness-target` when
+the validator fell back. The fallback is an inference, not a reading of the change, and the report
+does not let the two look alike.
+
+`perf.target_provenance` then asks of that file the same question `test_provenance` asks of the
+correctness target, using the same function against the same post-apply snapshot:
+`pre-existing`, `pr-added`, `pr-modified`, or `unknown` when no patch was supplied. It is not
+bookkeeping — it decides the baseline. Only a `pre-existing` target sits on both sides of the
+patch and can be timed by reversing it; anything the patch wrote needs the transplant below.
 
 **A PR that adds its own benchmark target is not a PR with no baseline.** "The PR adds this
 target, so base has nothing to time against" ended the stage on aiter#4538 — whose entire

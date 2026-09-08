@@ -243,6 +243,9 @@ class ValidatorFixture:
         # The caller's declaration that they looked and no test exercises the change. Mutually
         # exclusive with `tests`, exactly as the two flags are on the command line.
         no_target=None,
+        # The file to TIME, when it is not the file to run. Defaults to None so every existing
+        # test keeps exercising the fallback, which is still the common case.
+        perf_target=None,
     ):
         report = self.root / f"{patch.stem}-report.json"
         # `cwd` exists for one reason: the validator has to accept RELATIVE --patch/--out from
@@ -282,6 +285,8 @@ class ValidatorFixture:
             command.extend(["--axis", axis])
         if perf_control_column:
             command.extend(["--perf-control-column", perf_control_column])
+        if perf_target:
+            command.extend(["--perf-target", perf_target])
         if runner:
             command.extend(["--runner", runner])
         if not perf:
@@ -1901,6 +1906,75 @@ class ValidateKernelPrTests(unittest.TestCase):
         self.assertIn("--perf-control-column", perf["note"])
         self.assertNotIn("nothing to time against", perf["note"])
 
+    def test_the_timed_file_is_named_even_when_it_is_the_one_that_was_run(self):
+        # The fallback is still an answer, and a reader of a skip needs it most. Before this,
+        # the only file named anywhere in a report was the correctness target, so a reader
+        # inferred the timed file from it -- an inference that is about to stop being true.
+        self.fixture.add_bench_target()
+        patch = self.fixture.make_patch(
+            self.fixture.rewrite_bench(
+                (self.fixture.repo / self.fixture.BENCH_TARGET)
+                .read_text()
+                .replace("SCALE = 1.0", "SCALE = 1.0  # untouched")
+            ),
+            "named-fallback.patch",
+        )
+        _, report = self.fixture.validate(
+            patch,
+            tests=self.fixture.BENCH_TARGET,
+            expected_route="test_bench:run_kernel",
+            grid=False,
+            runner="script",
+        )
+
+        perf = report["stages"]["perf"]
+        self.assertEqual(self.fixture.BENCH_TARGET, perf["target"])
+        self.assertEqual("same-as-correctness-target", perf["target_basis"])
+
+    def test_the_file_that_is_timed_need_not_be_the_file_that_is_run(self):
+        # Both halves of the divergence at once, and each is a guard the old spelling failed.
+        #
+        # The correctness target is PRE-EXISTING while the perf target is one the patch ADDS.
+        # BASE_REPO_STATE therefore reads `ran` -- so a perf stage keyed to it would take the
+        # ordinary same-worktree branch and time a file that is not in the base tree. Asking
+        # about the perf target instead reaches the transplant, which is the correct baseline
+        # for a bench the PR ships.
+        #
+        # And the transplant's cleanup, `rm -f`, is the reason this pair is one test. It exists
+        # to remove the file the transplant WROTE. Spelled with the correctness target it
+        # deletes tests/test_sample.py -- a tracked file, present on base, that nothing in this
+        # run put there. The tree goes dirty, the cleanliness check guarding the head phase
+        # fails, and the entire head correctness run is skipped. The perf stage would have
+        # silently disabled correctness validation, which is far worse than no perf stage.
+        patch = self._new_bench_patch("split-targets.patch", scale="0.5")
+        _, report = self.fixture.validate(
+            patch,
+            tests="tests/test_sample.py",
+            perf_target=self.NEW_BENCH_TARGET,
+            expected_route="test_sample:run_kernel",
+            grid=False,
+            perf_control_column="reference us",
+        )
+
+        perf = report["stages"]["perf"]
+        self.assertEqual(self.NEW_BENCH_TARGET, perf["target"])
+        self.assertEqual("declared-by-caller", perf["target_basis"])
+        self.assertEqual("pr-added", perf["target_provenance"])
+        # The correctness target was not written by this patch, and says so independently.
+        self.assertEqual("pre-existing", report["test_selection"]["test_provenance"])
+        # Asserted FIRST, ahead of everything it would take down with it. Under the old
+        # spelling this file is gone, and the assertions below then fail on a missing
+        # baseline_method -- a KeyError that names the wreckage instead of the cause.
+        self.assertTrue(
+            (self.fixture.repo / "tests" / "test_sample.py").is_file(),
+            "the transplant cleanup deleted a tracked base file it did not write",
+        )
+        self.assertNotEqual(
+            "skip", report["stages"]["correctness_repo_tests"]["status"]
+        )
+        # Keyed to the perf target: BASE_REPO_STATE said `ran`.
+        self.assertEqual("target-transplant", perf["baseline_method"])
+
     #: A pytest-named file that ALSO parses argv in its module body. Found on
     #: ROCm/aiter#5172: pytest wins the runner selection, imports the module at collection
     #: with its own argv, and argparse exits the process. The file is green as a script.
@@ -3501,10 +3575,23 @@ class SkillProseContractTests(unittest.TestCase):
         "runner_basis",
         "test_provenance",
     )
+    # The same distinction, asked about the file that gets TIMED rather than the one that gets
+    # run. These live under stages.perf, not test_selection -- test_selection.target is
+    # required and is written about the correctness target throughout -- so a check that reads
+    # only test_selection would admit a whole family of enums unexamined.
+    PERF_DECLARATION_FIELDS = (
+        "target_basis",
+        "target_provenance",
+    )
 
     def declaration_fields(self):
-        properties = self.schema["properties"]["test_selection"]["properties"]
-        return {name: properties[name] for name in self.DECLARATION_FIELDS}
+        selection = self.schema["properties"]["test_selection"]["properties"]
+        perf = self.schema["properties"]["stages"]["properties"]["perf"]["properties"]
+        fields = {name: selection[name] for name in self.DECLARATION_FIELDS}
+        fields.update(
+            {f"perf.{name}": perf[name] for name in self.PERF_DECLARATION_FIELDS}
+        )
+        return fields
 
     def test_every_value_the_schema_admits_is_one_the_code_can_write(self):
         # A schema that allows a value nothing produces is a promise to a reader that some

@@ -752,6 +752,31 @@
             "harness": {
               "type": "string"
             },
+            "target": {
+              "type": "string",
+              "description": "The file the timing runs execute. Not the same thing as `test_selection.target`, which is the correctness target and may be a pytest node id: a timing run executes a file. Reported on every status, including `skip` -- the reader most in need of knowing which file was timed is the one reading a report where nothing was."
+            },
+            "target_basis": {
+              "type": "string",
+              "enum": [
+                "declared-by-caller",
+                "same-as-correctness-target"
+              ],
+              "description": "Whose choice the timed file was. `declared-by-caller` means someone who read the diff named it with --perf-target; `same-as-correctness-target` is the validator's own fallback, which is an inference and not a reading of the change."
+            },
+            "target_provenance": {
+              "type": "string",
+              "enum": [
+                "pre-existing",
+                "pr-added",
+                "pr-modified",
+                "unknown"
+              ],
+              "description": "Whether the patch wrote the file being timed, computed by the same function as `test_selection.test_provenance` against the same post-apply snapshot. `pre-existing` is the only value under which the baseline needs no transplant, because the file is on both sides of the patch. `unknown` when no patch was supplied and nothing separates the target from the change."
+            },
+            "target_provenance_reason": {
+              "type": "string"
+            },
             "base_log": {
               "type": "string"
             },
