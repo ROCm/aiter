@@ -134,7 +134,7 @@ def chunk_kimi_delta_attn(
 
             FlashKDA agrees with the default pipeline to bf16 rather than
             exactly, as does 32 against 64 within the default pipeline itself.
-            Set `CHUNK_DELTA_ATTN_USE_FLASH_KDA=0` to pin the default pipeline.
+            Set `AITER_FDA_ENABLE=0` to pin the default pipeline.
         cu_seqlens (torch.LongTensor, optional):
             Cumulative sequence lengths of shape `[N+1]` for variable-length
             inputs, consistent with the FlashAttention API. Default: `None`.

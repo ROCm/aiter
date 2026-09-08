@@ -1,0 +1,11 @@
+{
+    "k2_ab_fused_gluon_wide": {
+        "BW": 64,
+        "num_warps": 4,
+        "MIN_BLOCKS_PER_CU": 2
+    },
+    "k2_ab_fused_gluon_narrow": {
+        "BW": 32,
+        "num_warps": 2
+    }
+}
