@@ -60,7 +60,6 @@ from aiter.ops.triton.quant.quant import dynamic_mxfp8_quant
 from aiter.ops.triton.quant.sage_attention_quant_wrappers import (
     fp4_v_padded_sequence,
     fp4_v_raw_buffer_size,
-    pack_v_mxfp4_colmajor_fp6_p_raw,
     pack_v_mxfp4_colmajor_raw,
 )
 
@@ -762,17 +761,14 @@ def test_mha_v4_mxfp4_fp6_p_pack_matches_permuted_canonical(sequence):
         token - within_block + paired, token.new_tensor(sequence - 1)
     )
 
-    raw, scale = pack_v_mxfp4_colmajor_fp6_p_raw(value)
     production_raw, production_scale = quantize_v_mxfp4_fp6_p(value)
     compiled_raw, compiled_scale = torch.compile(
-        pack_v_mxfp4_colmajor_fp6_p_raw, fullgraph=True
+        quantize_v_mxfp4_fp6_p, fullgraph=True
     )(value)
     expected_raw, expected_scale = pack_v_mxfp4_colmajor_raw(
         value[:, source_token].contiguous()
     )
 
-    assert torch.equal(raw, expected_raw)
-    assert torch.equal(scale, expected_scale)
     assert torch.equal(production_raw, expected_raw)
     assert torch.equal(production_scale, expected_scale)
     assert production_scale.untyped_storage().nbytes() == production_scale.numel() + 512
