@@ -1,11 +1,11 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
+import triton
 import triton.language as tl
+
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
 from aiter.ops.triton.utils.gemm_config_utils import get_gemm_config
-
-import triton
 
 _batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant_repr = make_kernel_repr(
     "_batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant_kernel",
@@ -162,7 +162,7 @@ def _batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant_ker
     acc_dtype = tl.float32 if c_ptr.type.element_ty != tl.int8 else tl.int32
     accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=acc_dtype)
 
-    for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
+    for k in range(tl.cdiv(K, BLOCK_SIZE_K)):
         if EVEN_K:
             a = tl.load(a_ptrs)
             b = tl.load(b_ptrs, cache_modifier=cache_modifier)
@@ -175,7 +175,7 @@ def _batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant_ker
         a_scale_recip = 1.0 / a_scale
         a = tl.clamp(a * a_scale_recip, DTYPE_MIN, DTYPE_MAX).to(b_ptr.dtype.element_ty)
 
-        accumulator += tl.dot(a, b, input_precision="ieee") * a_scale
+        accumulator += tl.dot(a, b) * a_scale
 
         a_ptrs += BLOCK_SIZE_K * stride_ak
         b_ptrs += BLOCK_SIZE_K * stride_bk

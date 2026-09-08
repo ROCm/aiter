@@ -1,0 +1,57 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (C) 2025-2026 FlyDSL Project Contributors
+
+
+def _to_ir(v):
+    """Coerce DSL Numeric values to raw MLIR values."""
+    from flydsl._mlir import ir as _ir
+    from flydsl.expr import arith as _arith_ext
+
+    if isinstance(v, int):
+        return _arith_ext.unwrap(
+            _arith_ext.constant(v, type=_ir.IntegerType.get_signless(32))
+        )
+    if isinstance(v, float):
+        return _arith_ext.unwrap(_arith_ext.constant(v, type=_ir.F32Type.get()))
+    if not isinstance(v, _ir.Value) and hasattr(v, "ir_value"):
+        return v.ir_value()
+    return v
+
+
+def update_dpp_i32(
+    old,
+    src,
+    dpp_ctrl: int,
+    row_mask: int = 0xF,
+    bank_mask: int = 0xF,
+    bound_ctrl: bool = False,
+    **kw,
+):
+    """Wrapper for ``llvm.amdgcn.update.dpp.i32``.
+
+    DPP controls are immediate operands. Common CDNA values:
+    280/264 for row xor-8, 276/260 for row xor-4, 78 for xor-2,
+    and 177 for xor-1 within a 16-lane row.
+    """
+    from flydsl._mlir import ir as _ir
+    from flydsl._mlir.dialects import llvm as _llvm
+    from flydsl.expr import arith as _arith_ext
+    from flydsl.expr.typing import T
+
+    return _llvm.call_intrinsic(
+        T.i32,
+        "llvm.amdgcn.update.dpp.i32",
+        [
+            _to_ir(old),
+            _to_ir(src),
+            _arith_ext.unwrap(_arith_ext.constant(dpp_ctrl, type=T.i32)),
+            _arith_ext.unwrap(_arith_ext.constant(row_mask, type=T.i32)),
+            _arith_ext.unwrap(_arith_ext.constant(bank_mask, type=T.i32)),
+            _arith_ext.unwrap(
+                _arith_ext.constant(bound_ctrl, type=_ir.IntegerType.get_signless(1))
+            ),
+        ],
+        [],
+        [],
+        **kw,
+    )

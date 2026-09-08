@@ -3,7 +3,9 @@
 
 #pragma once
 
-#include <torch/extension.h>
+#include "aiter_tensor.h"
+#include <cstdint>
+#include <optional>
 
 union PaWorkInfo
 {
@@ -36,18 +38,18 @@ union PaPartialTileInfo
 constexpr size_t kSizePaPartialTileInfoInDw = sizeof(PaPartialTileInfo) / sizeof(uint32_t);
 static_assert(kSizePaPartialTileInfoInDw == 2);
 
-void get_pa_metadata_v1(const torch::Tensor& seqlens_qo_indptr, // [batch size + 1]
-                        const torch::Tensor& pages_kv_indptr, // [batch size + 1]
-                        const torch::Tensor& context_lens,
+void get_pa_metadata_v1(const aiter_tensor_t& seqlens_qo_indptr, // [batch size + 1]
+                        const aiter_tensor_t& pages_kv_indptr, // [batch size + 1]
+                        const aiter_tensor_t& context_lens,
                         const int32_t num_heads_per_head_k,
                         const int32_t num_heads_k,
                         const bool is_causal,
-                        torch::Tensor& work_metadata_ptrs,
-                        torch::Tensor& work_indptr,
-                        torch::Tensor& work_info,
-                        torch::Tensor& reduce_indptr,
-                        torch::Tensor& reduce_final_map,
-                        torch::Tensor& reduce_partial_map,
+                        aiter_tensor_t& work_metadata_ptrs,
+                        aiter_tensor_t& work_indptr,
+                        aiter_tensor_t& work_info,
+                        aiter_tensor_t& reduce_indptr,
+                        aiter_tensor_t& reduce_final_map,
+                        aiter_tensor_t& reduce_partial_map,
                         const int32_t kv_granularity,
                         const int32_t block_size,
                         const int32_t max_seqlen_qo,

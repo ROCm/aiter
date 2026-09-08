@@ -5,33 +5,55 @@
 #ifdef USE_ROCM
 
 #include "aiter_hip_common.h"
+#include <cstddef>
 #include <functional>
 #include <stdexcept>
 #include <string>
-#include <tuple>
+#include <string_view>
+#include <type_traits>
 #include <unordered_map>
 
 // ---------------------------------------------------------------------------
-// GemmDispatchHash
+// GemmLookupKey
 //
-// Hash for the (gfx, cu_num, M, N, K) 5-tuple used as the C++ runtime
-// dispatch key in all CK GEMM modules.  The gfx arch string (e.g. "gfx942")
-// is included so that multi-arch .so files containing kernels for two
-// architectures that share the same cu_num do not collide.  Uses boost-style
-// mixing with the golden-ratio constant (0x9e3779b9) for a non-commutative,
-// low-collision hash.
+// POD dispatch key keyed on (gfx, cu_num, M, N, K).  Keeping it trivially
+// destructible and standard-layout lets the generated lookup tables be
+// constant-initialized into .data.rel.ro — no per-entry constructor code,
+// no exception-cleanup chain in the dispatch lambda.
+//
+// gfx views must point into storage that outlives the table.  In practice
+// table entries point to string literals ("gfx950"); runtime keys point
+// into get_device_gfx()'s permanently-cached std::string.
 // ---------------------------------------------------------------------------
-struct GemmDispatchHash
+struct GemmLookupKey
 {
-    size_t operator()(const std::tuple<std::string, int, int, int, int>& t) const
+    std::string_view gfx;
+    int cu_num;
+    int M;
+    int N;
+    int K;
+};
+
+static_assert(std::is_trivially_destructible_v<GemmLookupKey>);
+static_assert(std::is_standard_layout_v<GemmLookupKey>);
+
+struct GemmLookupKeyHash
+{
+    size_t operator()(const GemmLookupKey& k) const noexcept
     {
-        size_t h = std::hash<std::string>{}(std::get<0>(t));
-        h ^= std::hash<int>{}(std::get<1>(t)) + 0x9e3779b9 + (h << 6) + (h >> 2);
-        h ^= std::hash<int>{}(std::get<2>(t)) + 0x9e3779b9 + (h << 6) + (h >> 2);
-        h ^= std::hash<int>{}(std::get<3>(t)) + 0x9e3779b9 + (h << 6) + (h >> 2);
-        h ^= std::hash<int>{}(std::get<4>(t)) + 0x9e3779b9 + (h << 6) + (h >> 2);
+        size_t h = std::hash<std::string_view>{}(k.gfx);
+        h ^= std::hash<int>{}(k.cu_num) + 0x9e3779b9 + (h << 6) + (h >> 2);
+        h ^= std::hash<int>{}(k.M) + 0x9e3779b9 + (h << 6) + (h >> 2);
+        h ^= std::hash<int>{}(k.N) + 0x9e3779b9 + (h << 6) + (h >> 2);
+        h ^= std::hash<int>{}(k.K) + 0x9e3779b9 + (h << 6) + (h >> 2);
         return h;
     }
+};
+
+struct GemmLookupKeyEq
+{
+    bool operator()(const GemmLookupKey& a, const GemmLookupKey& b) const noexcept
+    { return a.cu_num == b.cu_num && a.M == b.M && a.N == b.N && a.K == b.K && a.gfx == b.gfx; }
 };
 
 // ---------------------------------------------------------------------------
@@ -60,8 +82,12 @@ inline int get_device_cu_num()
 // Cached per device ID via SynchronizedCache so that processes calling
 // hipSetDevice() across GPUs of different architectures always get the
 // correct arch string.  Strips any :sramecc+:xnack- suffix from gcnArchName.
+//
+// Returned by std::string_view because the cached std::string lives for the
+// program's lifetime (the cache is a function-local static unordered_map
+// that is never erased), so the view is permanently valid.
 // ---------------------------------------------------------------------------
-inline const std::string& get_device_gfx()
+inline std::string_view get_device_gfx()
 {
     static SynchronizedCache<int, std::string> cache;
     int device = -1;
@@ -79,48 +105,72 @@ inline const std::string& get_device_gfx()
 // GemmDispatchMap
 //
 // Convenience alias for the (gfx, cu_num, M, N, K)-keyed dispatch map type.
-// Each module instantiates this with its own RowwiseKernel / BlockwiseKernel
-// function type:
+// Each module instantiates this with its own raw-function-pointer kernel
+// type:
 //
+//   using RowwiseKernel    = torch::Tensor (*)(torch::Tensor&, ...);
 //   using RowwiseKernelMap = GemmDispatchMap<RowwiseKernel>;
+//
+// KernelFn must be trivially destructible (use a function pointer, not
+// std::function) for the constant-init / .rodata optimization to apply.
 // ---------------------------------------------------------------------------
 template <typename KernelFn>
 using GemmDispatchMap =
-    std::unordered_map<std::tuple<std::string, int, int, int, int>, KernelFn, GemmDispatchHash>;
+    std::unordered_map<GemmLookupKey, KernelFn, GemmLookupKeyHash, GemmLookupKeyEq>;
 
 // ---------------------------------------------------------------------------
-// BatchedGemmDispatchHash
+// BatchedGemmLookupKey
 //
-// Hash for the (gfx, cu_num, B, M, N, K) 6-tuple used as the C++ runtime
-// dispatch key in batched CK GEMM modules.  Same boost-style mixing as
-// GemmDispatchHash.
+// POD dispatch key keyed on (gfx, cu_num, B, M, N, K) — used by batched
+// GEMM modules.  Same trivial-destructibility / standard-layout properties
+// as GemmLookupKey.
 // ---------------------------------------------------------------------------
-struct BatchedGemmDispatchHash
+struct BatchedGemmLookupKey
 {
-    size_t operator()(const std::tuple<std::string, int, int, int, int, int>& t) const
+    std::string_view gfx;
+    int cu_num;
+    int B;
+    int M;
+    int N;
+    int K;
+};
+
+static_assert(std::is_trivially_destructible_v<BatchedGemmLookupKey>);
+static_assert(std::is_standard_layout_v<BatchedGemmLookupKey>);
+
+struct BatchedGemmLookupKeyHash
+{
+    size_t operator()(const BatchedGemmLookupKey& k) const noexcept
     {
-        size_t h = std::hash<std::string>{}(std::get<0>(t));
-        h ^= std::hash<int>{}(std::get<1>(t)) + 0x9e3779b9 + (h << 6) + (h >> 2);
-        h ^= std::hash<int>{}(std::get<2>(t)) + 0x9e3779b9 + (h << 6) + (h >> 2);
-        h ^= std::hash<int>{}(std::get<3>(t)) + 0x9e3779b9 + (h << 6) + (h >> 2);
-        h ^= std::hash<int>{}(std::get<4>(t)) + 0x9e3779b9 + (h << 6) + (h >> 2);
-        h ^= std::hash<int>{}(std::get<5>(t)) + 0x9e3779b9 + (h << 6) + (h >> 2);
+        size_t h = std::hash<std::string_view>{}(k.gfx);
+        h ^= std::hash<int>{}(k.cu_num) + 0x9e3779b9 + (h << 6) + (h >> 2);
+        h ^= std::hash<int>{}(k.B) + 0x9e3779b9 + (h << 6) + (h >> 2);
+        h ^= std::hash<int>{}(k.M) + 0x9e3779b9 + (h << 6) + (h >> 2);
+        h ^= std::hash<int>{}(k.N) + 0x9e3779b9 + (h << 6) + (h >> 2);
+        h ^= std::hash<int>{}(k.K) + 0x9e3779b9 + (h << 6) + (h >> 2);
         return h;
+    }
+};
+
+struct BatchedGemmLookupKeyEq
+{
+    bool operator()(const BatchedGemmLookupKey& a, const BatchedGemmLookupKey& b) const noexcept
+    {
+        return a.cu_num == b.cu_num && a.B == b.B && a.M == b.M && a.N == b.N && a.K == b.K &&
+               a.gfx == b.gfx;
     }
 };
 
 // ---------------------------------------------------------------------------
 // BatchedGemmDispatchMap
 //
-// Convenience alias for the (gfx, cu_num, B, M, N, K)-keyed dispatch map type.
-// Used by batched GEMM modules:
+// Convenience alias for the (gfx, cu_num, B, M, N, K)-keyed dispatch map
+// used by batched GEMM modules:
 //
 //   using BatchedRowwiseKernelMap = BatchedGemmDispatchMap<BatchedRowwiseKernel>;
 // ---------------------------------------------------------------------------
 template <typename KernelFn>
-using BatchedGemmDispatchMap =
-    std::unordered_map<std::tuple<std::string, int, int, int, int, int>,
-                       KernelFn,
-                       BatchedGemmDispatchHash>;
+using BatchedGemmDispatchMap = std::
+    unordered_map<BatchedGemmLookupKey, KernelFn, BatchedGemmLookupKeyHash, BatchedGemmLookupKeyEq>;
 
 #endif // USE_ROCM

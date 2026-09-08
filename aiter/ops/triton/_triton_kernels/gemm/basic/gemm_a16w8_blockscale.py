@@ -1,13 +1,13 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-import triton.language as tl
-from aiter.ops.triton._triton_kernels.quant.fused_fp8_quant import _fp8_quant_op
-from aiter.ops.triton.utils._triton.pid_preprocessing import pid_grid
-from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
-from aiter.ops.triton.utils.gemm_config_utils import get_gemm_config
-
 import triton
+import triton.language as tl
+
+from aiter.ops.triton._triton_kernels.quant.fused_fp8_quant import _fp8_quant_op
+from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
+from aiter.ops.triton.utils._triton.pid_preprocessing import pid_grid
+from aiter.ops.triton.utils.gemm_config_utils import get_gemm_config
 
 _gemm_a16w8_blockscale_repr = make_kernel_repr(
     "_gemm_a16w8_blockscale_kernel",
@@ -155,7 +155,9 @@ def _gemm_a16w8_blockscale_kernel(
         acc_dtype = tl.float32 if c_ptr.type.element_ty != tl.int8 else tl.int32
         accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=acc_dtype)
 
-        for k in range(pid_k * num_k_iter, (pid_k + 1) * num_k_iter):
+        for k in tl.range(
+            pid_k * num_k_iter, (pid_k + 1) * num_k_iter, num_stages=num_stages
+        ):
             # Load the next block of A and B, generate a mask by checking the K dimension.
             # If it is out of bounds, set it to 0.
             if EVEN_K:
@@ -177,14 +179,10 @@ def _gemm_a16w8_blockscale_kernel(
                 )
                 a = a.to(b_ptr.type.element_ty).reshape(BLOCK_SIZE_M, BLOCK_SIZE_K)
                 a_scale = a_scale.reshape(BLOCK_SIZE_M)
-                accumulator += (
-                    tl.dot(a, b, input_precision="ieee")
-                    * a_scale[:, None]
-                    * b_scale[None, :]
-                )
+                accumulator += tl.dot(a, b) * a_scale[:, None] * b_scale[None, :]
             else:
                 b = b.to(a_ptr.type.element_ty)
-                accumulator += tl.dot(a, b, input_precision="ieee") * b_scale[None, :]
+                accumulator += tl.dot(a, b) * b_scale[None, :]
 
             # Advance the ptrs to the next K block.
             a_ptrs += BLOCK_SIZE_K * stride_ak
@@ -393,14 +391,10 @@ def _gemm_a16w8_blockscale_preshuffle_kernel(
                 )
                 a = a.to(b_ptr.type.element_ty).reshape(BLOCK_SIZE_M, BLOCK_SIZE_K)
                 a_scale = a_scale.reshape(BLOCK_SIZE_M)
-                accumulator += (
-                    tl.dot(a, b, input_precision="ieee")
-                    * a_scale[:, None]
-                    * b_scale[None, :]
-                )
+                accumulator += tl.dot(a, b) * a_scale[:, None] * b_scale[None, :]
             else:
                 b = b.to(a_ptr.type.element_ty)
-                accumulator += tl.dot(a, b, input_precision="ieee") * b_scale[None, :]
+                accumulator += tl.dot(a, b) * b_scale[None, :]
 
             # Advance the ptrs to the next K block.
             a_ptrs += BLOCK_SIZE_K * stride_ak

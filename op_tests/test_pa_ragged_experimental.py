@@ -1,18 +1,12 @@
-import random
-from typing import List, Optional, Tuple, Union
-import itertools
-import torch
-import aiter
-import pytest
-from aiter.test_common import checkAllclose, perftest, tensor_dump, tensor_load
-from aiter import pertoken_quant
-from aiter import dtypes
-from enum import Enum
-from einops import rearrange
 import argparse
 import os
+import random
+from enum import Enum
+
 import numpy as np
-from aiter import paged_attention_ragged
+import torch
+
+from aiter import dtypes
 
 uniform_range = (-1, 1)
 
@@ -23,9 +17,19 @@ class PAVariant(Enum):
     Naive = 3
 
 
+STR_DTYPE_TO_TORCH_DTYPE = {
+    "half": torch.half,
+    "bfloat16": torch.bfloat16,
+    "float": torch.float,
+    "fp8": torch.uint8,
+    "fp8_e4m3": torch.uint8,
+    "fp8_e5m2": torch.uint8,
+}
+
+
 def get_kv_cache_torch_dtype(
-    cache_dtype: Optional[Union[str, torch.dtype]],
-    model_dtype: Optional[Union[str, torch.dtype]] = None,
+    cache_dtype: str | torch.dtype | None,
+    model_dtype: str | torch.dtype | None = None,
 ) -> torch.dtype:
     if isinstance(cache_dtype, str):
         if cache_dtype == "auto":
@@ -44,7 +48,7 @@ def get_kv_cache_torch_dtype(
     elif isinstance(cache_dtype, torch.dtype):
         torch_dtype = cache_dtype
     else:
-        raise ValueError(f"Invalid kv cache dtype: {cache_dtype}")
+        raise ValueError(f"Invalid kv cache dtype: {cache_dtype}")  # noqa: TRY004
     return torch_dtype
 
 
@@ -54,11 +58,11 @@ def kv_cache_factory_v2(
     num_layers: int,
     num_heads: int,
     head_size: int,
-    cache_dtype: Optional[Union[str, torch.dtype]],
-    model_dtype: Optional[Union[str, torch.dtype]] = None,
+    cache_dtype: str | torch.dtype | None,
+    model_dtype: str | torch.dtype | None = None,
     seed: int = 0,
-    device: Optional[str] = "cuda",
-) -> Tuple[List[torch.Tensor], List[torch.Tensor]]:
+    device: str | None = "cuda",
+) -> tuple[list[torch.Tensor], list[torch.Tensor]]:
 
     if cache_dtype == "fp8" and head_size % 16:
         raise ValueError(
@@ -67,7 +71,7 @@ def kv_cache_factory_v2(
 
     torch_dtype = get_kv_cache_torch_dtype(cache_dtype, model_dtype)
     key_cache_shape = (num_blocks, 1, num_heads, head_size)
-    key_caches: List[torch.Tensor] = []
+    key_caches: list[torch.Tensor] = []
     for _ in range(num_layers):
         key_cache = torch.empty(size=key_cache_shape, dtype=torch_dtype, device=device)
         if cache_dtype in ["auto", "half", "bfloat16", "float"]:
@@ -77,7 +81,7 @@ def kv_cache_factory_v2(
         key_caches.append(key_cache)
 
     value_cache_shape = (num_blocks, 1, num_heads, head_size)
-    value_caches: List[torch.Tensor] = []
+    value_caches: list[torch.Tensor] = []
     for _ in range(num_layers):
         value_cache = torch.empty(
             size=value_cache_shape, dtype=torch_dtype, device=device
@@ -94,7 +98,7 @@ def kv_ptr_factory(
     num_seqs: int,
     ctx_lens: int,
     page_size: int,
-) -> Tuple[List[torch.Tensor], List[torch.Tensor]]:
+) -> tuple[list[torch.Tensor], list[torch.Tensor]]:
     # kv_indptr
     num_blocks_list = [ctx_lens] * num_seqs
     kv_indptr = torch.tensor([0] + num_blocks_list).cumsum(dim=0, dtype=torch.int)
@@ -105,7 +109,7 @@ def kv_ptr_factory(
     )  # e.g., ctx_lens=10, page_size=3 --> padded_ctx_lens=12
     index_total = num_seqs * padded_ctx_lens
     head_per_row = int(np.ceil(ctx_lens / page_size))
-    head_total = num_seqs * int(np.ceil(ctx_lens / page_size))
+    num_seqs * int(np.ceil(ctx_lens / page_size))
 
     # Generate heads (Start from 0, page_size, 2xpage_size, ...)
     all_heads = np.arange(0, index_total, page_size)
@@ -187,7 +191,7 @@ def test_paged_attention(
     in_pt: str,
     ctx_lens: int,
     num_seqs: int,
-    num_heads: Tuple[int, int],
+    num_heads: tuple[int, int],
     head_size: int,
     use_alibi: bool,
     page_size: int,
@@ -216,7 +220,7 @@ def test_paged_attention(
         if use_alibi:
             alibi_slopes = torch.randn(num_query_heads, dtype=dtypes.fp32)
         assert num_query_heads % num_kv_heads == 0
-        num_queries_per_kv = num_query_heads // num_kv_heads
+        num_query_heads // num_kv_heads
         max_seq_len = ctx_lens
         padded_ctx_lens = page_size * int(np.ceil(max_seq_len / page_size))  # e.g.,
         num_blocks = padded_ctx_lens * num_seqs
@@ -249,7 +253,7 @@ def test_paged_attention(
 
         data = torch.load(in_pt)
         query = data["q"].clone().detach().to(TARGET_DEVICE)
-        workspace = torch.empty(*data["workspace_buffer_shape"]).to(TARGET_DEVICE)
+        torch.empty(*data["workspace_buffer_shape"]).to(TARGET_DEVICE)
         key_cache = torch.empty(*data["k_buffer_shape"]).to(TARGET_DEVICE)
         value_cache = torch.empty(*data["v_buffer_shape"]).to(TARGET_DEVICE)
         kv_indptr = data["kv_indptr"].clone().detach().to(TARGET_DEVICE)

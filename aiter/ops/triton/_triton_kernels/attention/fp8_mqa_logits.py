@@ -1,8 +1,19 @@
 import triton
 import triton.language as tl
 
+from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
 
-@triton.jit
+_fp8_mqa_logits_kernel_repr = make_kernel_repr(
+    "_fp8_mqa_logits_kernel",
+    [
+        "NUM_HEADS",
+        "HEAD_SIZE",
+        "BLOCK_KV",
+    ],
+)
+
+
+@triton.jit(repr=_fp8_mqa_logits_kernel_repr)
 def _fp8_mqa_logits_kernel(
     Q_ptr,  # fp8e4m3 [seq_len, H, D]
     KV_ptr,  # fp8e4m3 [seq_len_kv, D]
@@ -79,7 +90,7 @@ def _fp8_mqa_logits_kernel(
         kv_scales = tl.load(kv_scales_ptrs)
 
         # [NUM_HEADS, BLOCK_KV] = [NUM_HEADS, HEAD_SIZE] x [HEAD_SIZE, BLOCK_KV]
-        scores = tl.dot(q_block, kv_block, input_precision="ieee")
+        scores = tl.dot(q_block, kv_block)
         # Multiply by kv_scales (broadcast along rows)
         scores = scores * kv_scales[None, :]
         # ReLU
@@ -100,7 +111,7 @@ def _fp8_mqa_logits_kernel(
     kv_scales = tl.load(kv_scales_ptrs, mask=kv_col_mask, other=0.0)
 
     # [NUM_HEADS, BLOCK_KV] = [NUM_HEADS, HEAD_SIZE] x [HEAD_SIZE, BLOCK_KV]
-    scores = tl.dot(q_block, kv_block, input_precision="ieee")
+    scores = tl.dot(q_block, kv_block)
     # Multiply by kv_scales (broadcast along rows)
     scores = scores * kv_scales[None, :]
     # ReLU

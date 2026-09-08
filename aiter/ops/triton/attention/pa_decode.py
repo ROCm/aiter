@@ -2,25 +2,24 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 import math
-from typing import Optional
 
-import triton
 import torch
-from aiter.ops.triton._triton_kernels.attention.pa_decode import (
-    _paged_attn_decode_v1_wo_dot_kernel,
-    _paged_attn_decode_v1_w_dot_kernel,
-    _paged_attn_decode_v2_wo_dot_kernel,
-    _paged_attn_decode_v2_wo_dot_reduce_kernel,
-    _paged_attn_decode_v2_w_dot_kernel,
-    _paged_attn_decode_v2_w_dot_reduce_kernel,
-    _paged_attn_decode_v1_wo_dot_kernel_per_token_quant,
-    _paged_attn_decode_v1_w_dot_kernel_per_token_quant,
-    _paged_attn_decode_v2_wo_dot_kernel_per_token_quant,
-    _paged_attn_decode_v2_wo_dot_reduce_kernel_per_token_quant,
-    _paged_attn_decode_v2_w_dot_kernel_per_token_quant,
-    _paged_attn_decode_v2_w_dot_reduce_kernel_per_token_quant,
-)
+import triton
 
+from aiter.ops.triton._triton_kernels.attention.pa_decode import (
+    _paged_attn_decode_v1_w_dot_kernel,
+    _paged_attn_decode_v1_w_dot_kernel_per_token_quant,
+    _paged_attn_decode_v1_wo_dot_kernel,
+    _paged_attn_decode_v1_wo_dot_kernel_per_token_quant,
+    _paged_attn_decode_v2_w_dot_kernel,
+    _paged_attn_decode_v2_w_dot_kernel_per_token_quant,
+    _paged_attn_decode_v2_w_dot_reduce_kernel,
+    _paged_attn_decode_v2_w_dot_reduce_kernel_per_token_quant,
+    _paged_attn_decode_v2_wo_dot_kernel,
+    _paged_attn_decode_v2_wo_dot_kernel_per_token_quant,
+    _paged_attn_decode_v2_wo_dot_reduce_kernel,
+    _paged_attn_decode_v2_wo_dot_reduce_kernel_per_token_quant,
+)
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 
 _LOGGER = AiterTritonLogger()
@@ -164,7 +163,7 @@ def paged_attn_decode_v1(
     compute_type,
     num_kv_heads: int,
     scale: float,
-    alibi_slopes: Optional[torch.Tensor],
+    alibi_slopes: torch.Tensor | None,
     k_scale: float,
     v_scale: float,
     tp_rank: int = 0,
@@ -250,6 +249,12 @@ def paged_attn_decode_v1(
             QUERY_GRP_SZ_POW2=query_grp_sz_pow2,
             KV_BLK_SZ=kv_blk_sz,
             KV_BLK_SZ_POW2=kv_blk_sz,
+            # triton 3.8 inflated this GQA dot kernel to 202 VGPR (occ 3->2).
+            # Raising the VGPR budget to 256 (waves_per_eu=2) lets regalloc pipeline
+            # LDS reads deeper: s_waitcnt lgkmcnt(0) 72->50, s_nop 36->9, ~+42% on
+            # llama3 decode. NOTE: v2_w_dot is intentionally NOT changed -- there
+            # waves_per_eu=2 spills and regresses ~-15% on llama3-405B.
+            waves_per_eu=2,
         )
 
 
@@ -264,7 +269,7 @@ def paged_attn_decode_v2(
     compute_type,
     num_kv_heads: int,
     scale: float,
-    alibi_slopes: Optional[torch.Tensor],
+    alibi_slopes: torch.Tensor | None,
     k_scale: float,
     v_scale: float,
     max_num_partitions: int,
@@ -445,7 +450,7 @@ def paged_attn_decode_v1_per_token_quant(
     compute_type,
     num_kv_heads: int,
     scale: float,
-    alibi_slopes: Optional[torch.Tensor],
+    alibi_slopes: torch.Tensor | None,
     k_scale: torch.Tensor,
     v_scale: torch.Tensor,
     tp_rank: int = 0,
@@ -537,6 +542,10 @@ def paged_attn_decode_v1_per_token_quant(
             QUERY_GRP_SZ_POW2=query_grp_sz_pow2,
             KV_BLK_SZ=kv_blk_sz,
             KV_BLK_SZ_POW2=kv_blk_sz,
+            # Same VGPR-budget fix as the non-quant v1_w_dot path above: this is the
+            # identical GQA dot compute kernel (per-token FP8 scale loads only), so
+            # the occ 3->2 inflation and the waves_per_eu=2 recovery apply equally.
+            waves_per_eu=2,
         )
 
 
@@ -551,7 +560,7 @@ def paged_attn_decode_v2_per_token_quant(
     compute_type,
     num_kv_heads: int,
     scale: float,
-    alibi_slopes: Optional[torch.Tensor],
+    alibi_slopes: torch.Tensor | None,
     k_scale: torch.Tensor,
     v_scale: torch.Tensor,
     max_num_partitions: int,

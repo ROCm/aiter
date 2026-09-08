@@ -1,34 +1,27 @@
-#include <torch/extension.h>
+#pragma once
 
-#include "aiter_hip_common.h"
-#include <optional>
+#include "aiter_tensor.h"
 
-namespace rocm_torch_x {
+namespace aiter {
 
-class __attribute__((visibility("hidden"))) GroupNorm final
-{
-    public:
-    explicit GroupNorm() = default;
-    ~GroupNorm()         = default;
+// Group Normalization. All memory (output and scratch workspace) is allocated by
+// the caller (Python) and passed in; the C side only computes.
+//
+//   y:         output, same shape/dtype as x
+//   workspace: float32 scratch, capacity (in elements) must be
+//              >= 2 * ceil(4096 / (num_tokens * num_groups)) * (num_tokens * num_groups)
+//   x:         input [num_tokens, num_channels, ...], contiguous
+//   weight:    affine weight [num_channels], contiguous
+//   bias:      affine bias   [num_channels], contiguous
+//   epsilon:   numerical stability term
+//
+// Supported dtypes for x/y/weight/bias: fp32, fp16, bf16.
+void groupnorm_run(aiter_tensor_t& y,
+                   aiter_tensor_t& workspace,
+                   const aiter_tensor_t& x,
+                   int num_groups,
+                   const aiter_tensor_t& weight,
+                   const aiter_tensor_t& bias,
+                   double epsilon);
 
-    public:
-    // return empty if not supported
-    std::optional<torch::Tensor>
-    Run(torch::Tensor x, int num_groups, torch::Tensor weights, torch::Tensor bias, float epsilon);
-
-    private:
-    template <typename T>
-    torch::Tensor launchGroupNormKernel(uint32_t num_groups,
-                                        float epsilon,
-                                        const torch::Tensor x,
-                                        const torch::Tensor weights,
-                                        const torch::Tensor bias,
-                                        hipStream_t stream);
-
-    void reserveMeanAccumulator(uint32_t nums_to_reserve, torch::Device device);
-
-    private:
-    torch::Tensor mean_accumulator_;
-};
-
-} // namespace rocm_torch_x
+} // namespace aiter

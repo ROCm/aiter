@@ -1,12 +1,14 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-import triton.language as tl
-import torch
-import pytest
 import random
-from aiter.ops.triton.attention.pa_decode import paged_attention_decode
+
+import pytest
+import torch
+import triton.language as tl
+
 from aiter import pertoken_quant
+from aiter.ops.triton.attention.pa_decode import paged_attention_decode
 
 DEBUG_MODE = False
 
@@ -77,6 +79,7 @@ def input_helper(
     random_seed: int = 0,
 ):
     """Helper function to generate input tensors for paged attention testing."""
+    torch.manual_seed(random_seed)
     torch.cuda.manual_seed(random_seed)
     random.seed(random_seed)
 
@@ -188,10 +191,13 @@ def test_paged_attn(
 ):
 
     head_size = 128
-    torch.cuda.empty_cache()  # Helps avoid hangs in large tests
+
     if SEQ_LEN >= 8192 and B >= 16:
         pytest.skip("B>={4} and SEQ_LEN>={8192} tests are too slow")
+
+    torch.cuda.empty_cache()  # Helps avoid hangs in large tests
     torch.set_printoptions(threshold=100000)
+
     num_blocks = NUM_BLK
 
     (
@@ -277,13 +283,14 @@ def test_paged_attn_per_token_quant(
     compute_type,
     output_type,
 ):
-    torch.cuda.empty_cache()  # Helps avoid hangs in large tests
-    torch.set_printoptions(precision=5, threshold=10000)
     if D == 128 and KV_BLK_SZ == 512:  # Causes Shared Memory out of resources on Mi300
         pytest.skip("D={128} and KV_BLK_SZ={512} causes shared memory out of resources")
 
     if SEQ_LEN >= 8192 and B >= 16:
         pytest.skip("B>={4} and SEQ_LEN>={8192} tests are too slow")
+
+    torch.cuda.empty_cache()  # Helps avoid hangs in large tests
+    torch.set_printoptions(precision=5, threshold=10000)
 
     num_blocks = NUM_BLK
 

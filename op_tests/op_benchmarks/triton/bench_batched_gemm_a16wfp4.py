@@ -1,25 +1,27 @@
+import math
 import sys
+
 import torch
 import triton
-import math
-import aiter.ops.triton.utils._triton.arch_info as arch_info
-from aiter.ops.triton.gemm.batched.batched_gemm_afp4wfp4_pre_quant import (
-    batched_gemm_afp4wfp4_pre_quant,
+
+from aiter.ops.triton.gemm.batched.batched_gemm_a16wfp4 import (
+    batched_gemm_a16wfp4,
+)
+from aiter.ops.triton.utils._triton import arch_info
+from op_tests.op_benchmarks.triton.utils.argparse import (
+    add_argparse_ff,
+    get_ff_args,
+    get_parser,
+)
+from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
+    batched_model_benchmark_shapes,
+    get_caller_name_no_ext,
+    get_model_benchmark_object,
+    get_shape_benchmark_object,
+    print_vgpr,
 )
 from op_tests.triton_tests.gemm.batched.test_batched_gemm_a16wfp4 import (
     generate_batched_gemm_a16wfp4_inputs,
-)
-from op_tests.op_benchmarks.triton.utils.argparse import (
-    get_parser,
-    add_argparse_ff,
-    get_ff_args,
-)
-from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
-    get_model_benchmark_object,
-    get_shape_benchmark_object,
-    batched_model_benchmark_shapes,
-    print_vgpr,
-    get_caller_name_no_ext,
 )
 
 
@@ -32,22 +34,22 @@ def bench_gemm_fn(
     layout: str,
 ):
     c_dtype = torch.bfloat16
-    x, w, x_scale, w_scale, y = generate_batched_gemm_a16wfp4_inputs(
+    x, w, _x_scale, w_scale, y = generate_batched_gemm_a16wfp4_inputs(
         batch, M, N, K, c_dtype, layout=layout, output=True
     )
     # flops
     flops = 2.0 * M * N * K * batch
     # memory transfer
-    mem_read = x.numel() * x.element_size() + w.numel() * w.element_size()
-    mem_read += (
-        x_scale.numel() * x_scale.element_size()
+    mem_read = (
+        x.numel() * x.element_size()
+        + w.numel() * w.element_size()
         + w_scale.numel() * w_scale.element_size()
     )
-    mem_write = (M * N) * 2  # TODO: Fix for c_dtype != bf16
+    mem_write = y.numel() * y.element_size()
     mem = mem_read + mem_write
 
     ms = triton.testing.do_bench(
-        lambda: batched_gemm_afp4wfp4_pre_quant(x, w, w_scale, c_dtype, y),
+        lambda: batched_gemm_a16wfp4(x, w, w_scale, c_dtype, y),
         warmup=25,
         rep=100,
     )
@@ -74,7 +76,7 @@ def run_model_benchmark(args):
     )
 
     @triton.testing.perf_report([benchmark])
-    def bench_batched_gemm_afp4wfp4_pre_quant(
+    def bench_batched_gemm_a16wfp4(
         M, hidden_dim, intermediate_dim, batch, metric, layer, **kwargs
     ):
         if layer == "fc1":
@@ -92,9 +94,7 @@ def run_model_benchmark(args):
 
         return bench_gemm_fn(batch, M, N, K, metric, args.layout)
 
-    bench_batched_gemm_afp4wfp4_pre_quant.run(
-        save_path="." if args.o else None, print_data=True
-    )
+    bench_batched_gemm_a16wfp4.run(save_path="." if args.o else None, print_data=True)
 
 
 def run_shape_benchmark(args):
@@ -105,7 +105,7 @@ def run_shape_benchmark(args):
     )
 
     @triton.testing.perf_report([benchmark])
-    def bench_batched_gemm_afp4wfp4_pre_quant(
+    def bench_batched_gemm_a16wfp4(
         batch,
         M,
         N,
@@ -115,9 +115,7 @@ def run_shape_benchmark(args):
     ):
         return bench_gemm_fn(batch, M, N, K, metric, args.layout)
 
-    bench_batched_gemm_afp4wfp4_pre_quant.run(
-        save_path="." if args.o else None, print_data=True
-    )
+    bench_batched_gemm_a16wfp4.run(save_path="." if args.o else None, print_data=True)
 
 
 def run_benchmark(args, defaults):
@@ -129,7 +127,7 @@ def run_benchmark(args, defaults):
         unsupported_args = []
         for arg in unsupported_args:
             if getattr(args, arg, None) != getattr(defaults, arg, None):
-                raise Exception(
+                raise RuntimeError(
                     f"Argument '{arg}' is not supported for benchmarking with the --model flag."
                 )
         run_model_benchmark(args)
@@ -142,7 +140,7 @@ def run_benchmark(args, defaults):
         ]
         for arg in unsupported_args:
             if getattr(args, arg, None) != getattr(defaults, arg, None):
-                raise Exception(
+                raise RuntimeError(
                     f"Argument '{arg}' is not supported for benchmarking without the --model flag."
                 )
         run_shape_benchmark(args)
@@ -168,7 +166,7 @@ def main(args: list[str] | None = None):
     args, defaults = parse_args(args=args)
     if args.print_vgpr:
         print("Retrieving VGPR usage for Triton kernels...")
-        fun = lambda: run_benchmark(args, defaults)  # noqa: E731
+        fun = lambda: run_benchmark(args, defaults)
         print_vgpr(fun, get_caller_name_no_ext())
         return
     run_benchmark(args, defaults)

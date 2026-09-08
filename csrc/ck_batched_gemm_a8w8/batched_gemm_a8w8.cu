@@ -7,11 +7,13 @@
 #include "gemm_dispatch_utils.h"
 #include <cmath>
 
-using BatchedRowwiseKernel = std::function<
-    torch::Tensor(torch::Tensor &, torch::Tensor &,
-                  torch::Tensor &, torch::Tensor &, 
-                  torch::Tensor &, std::optional<torch::Tensor>,
-                  int)>;
+using BatchedRowwiseKernel = torch::Tensor (*)(torch::Tensor&,
+                                               torch::Tensor&,
+                                               torch::Tensor&,
+                                               torch::Tensor&,
+                                               torch::Tensor&,
+                                               std::optional<torch::Tensor>,
+                                               int);
 
 // For certain high priority shapes, we directly use the best kernel rather
 // than use heuristics.
@@ -99,8 +101,8 @@ BatchedRowwiseKernel batched_rowwise_dispatch(int B, int M, int N, int K)
     }
   }();
 
-  const int cu_num         = get_device_cu_num();
-  const std::string& gfx   = get_device_gfx();
+  const int cu_num           = get_device_cu_num();
+  const std::string_view gfx = get_device_gfx();
 
   // First check if this shape(B,M,N,K) is available in the direct lookup.
   auto it = lookup.find({gfx, cu_num, B, M, N, K});

@@ -1,32 +1,37 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-import random
 import argparse
+import os
+import random
 
 import torch
-import os
-
 import triton
 
-from aiter.test_common import run_perftest
+from aiter.ops.shuffle import shuffle_weight
 from aiter.ops.triton.attention.pa_mqa_logits import (
     deepgemm_fp8_paged_mqa_logits,
     deepgemm_fp8_paged_mqa_logits_schedule,
 )
-from aiter.ops.shuffle import shuffle_weight
+from aiter.ops.triton.utils._triton import arch_info
+from aiter.ops.triton.utils.types import get_fp8_e4m3_dtype
+from aiter.test_common import run_perftest
 
 
 def cdiv(x: int, y: int) -> int:
     return (x + y - 1) // y
 
 
-def kv_cache_cast_to_fp8(x: torch.Tensor, padding=False) -> torch.Tensor:
+def kv_cache_cast_to_fp8(
+    x: torch.Tensor, padding=False, fp8_dtype=None
+) -> torch.Tensor:
+    if fp8_dtype is None:
+        fp8_dtype = get_fp8_e4m3_dtype()
     num_blocks, block_size, num_heads, head_dim = x.shape
     assert num_heads == 1
     x_amax = x.abs().float().amax(dim=3, keepdim=True).clamp(1e-4)
     sf = x_amax / 240.0
-    x_scaled = (x * (1.0 / sf)).to(torch.float8_e4m3fnuz)
+    x_scaled = (x * (1.0 / sf)).to(fp8_dtype)
 
     padding_size = 0 if not padding else (16 - (block_size * 4) % 16) % 16
     x_fp8 = torch.empty(
@@ -51,8 +56,8 @@ def ref_fp8_paged_mqa_logits(
     block_tables: torch.Tensor,
     max_model_len: int,
 ):
-    batch_size, next_n, heads, dim = q.size()
-    num_block, block_size, _, dim = kv_cache.size()
+    batch_size, next_n, _heads, _dim = q.size()
+    _num_block, block_size, _, _dim = kv_cache.size()
     logits = torch.full(
         [batch_size * next_n, max_model_len],
         float("-inf"),
@@ -101,8 +106,8 @@ def ref_fp8_paged_mqa_logits_ragged(
     kv_indices: torch.Tensor,
     max_model_len: int,
 ):
-    batch_size, next_n, heads, dim = q.size()
-    seq_kv, block_size, dim = kv_cache.size()  # 3d
+    batch_size, next_n, _heads, _dim = q.size()
+    _seq_kv, _block_size, _dim = kv_cache.size()  # 3d
     logits = torch.full(
         [batch_size * next_n, max_model_len],
         float("-inf"),
@@ -202,7 +207,9 @@ def run_benchmark(args: argparse.Namespace):
         assert blocksize == 1 or args.kv_preshuffle and blocksize % 16 == 0
 
         var_ratio = 0.5
-        EnableVarCtxOpt = var_ratio > 0.0
+        # varctx gluon kernel only exists on the preshuffle path; passing a
+        # varctx schedule to the base kernel breaks compile (signature mismatch).
+        EnableVarCtxOpt = var_ratio > 0.0 and args.kv_preshuffle and not args.no_varctx
 
         context_lens = (
             torch.randint(
@@ -234,7 +241,11 @@ def run_benchmark(args: argparse.Namespace):
             dtype=torch.float32,
         )
 
-        qk_datatype = torch.float8_e4m3fnuz
+        qk_datatype = get_fp8_e4m3_dtype()
+        print(
+            f">>> arch={arch_info.get_arch()} fp8_dtype={qk_datatype} "
+            f"({'OCP e4m3fn' if qk_datatype is torch.float8_e4m3fn else 'e4m3fnuz'})"
+        )
         max_block_len = (
             (context_lens.max().item() + blocksize - 1) // blocksize * blocksize
         )
@@ -252,7 +263,9 @@ def run_benchmark(args: argparse.Namespace):
                 counter += 1
 
         q_fp8 = q.to(qk_datatype)
-        kv_cache_fp8 = kv_cache_cast_to_fp8(kv_cache, padding=args.padding)
+        kv_cache_fp8 = kv_cache_cast_to_fp8(
+            kv_cache, padding=args.padding, fp8_dtype=qk_datatype
+        )
 
         kv_indices = torch.zeros(
             prefix_sum_context_lens[-1], device="cuda", dtype=torch.int32
@@ -384,7 +397,9 @@ def run_benchmark(args: argparse.Namespace):
 
             padded_str = "T" if args.padding else "F"
             os.makedirs(aot_kernel_dir, exist_ok=True)
-            aot_name = f"paged_mqa_logits{"_preshuffle" if args.kv_preshuffle else ""}{"_varctx" if EnableVarCtxOpt else ""}_{heads}x{ChunkK}x{index_dim}_B{blocksize}P{padded_str}W{WavePerEU}"
+            # Inner quotes must differ from the outer ones: reusing them is PEP 701
+            # (Python 3.12+) and leaves this module unparseable on 3.10/3.11.
+            aot_name = f"paged_mqa_logits{'_preshuffle' if args.kv_preshuffle else ''}{'_varctx' if EnableVarCtxOpt else ''}_{heads}x{ChunkK}x{index_dim}_B{blocksize}P{padded_str}W{WavePerEU}"
 
             src = os.path.join(triton_cache_dir, cache_key)
             dst = os.path.join(aot_kernel_dir, aot_name)
@@ -453,6 +468,11 @@ if __name__ == "__main__":
         type=int,
         default=16,
         help="KVCache block size, only used when kv_preshuffle is enabled, must be multiple of 16",
+    )
+    parser.add_argument(
+        "--no-varctx",
+        action="store_true",
+        help="Disable varctx schedule (only applies with --kv_preshuffle)",
     )
 
     args = parser.parse_args()

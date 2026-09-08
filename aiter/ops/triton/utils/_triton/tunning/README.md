@@ -60,9 +60,14 @@ Example 3:
 
 **Verify performance**
 
-To verify that your tunned JSON config files actually is performant and can be correctly picked up by AITER, first you have to copy the generated JSON config files into `<path_to_aiter_root>/aiter/ops/triton/configs/gemm`:
+To verify that your tunned JSON config files actually is performant and can be correctly picked up by AITER, first you have to copy the generated JSON config files into the config tree. Every family lives in one nested layout, `configs/<arch>/<backend>/<op>/<d_type>/` (`<path_to_aiter_root>/aiter/ops/triton/configs/CLAUDE.md` is the authoritative rulebook). Files there carry **no arch prefix** — the arch is the directory — and the default file is named exactly `DEFAULT.json`, so drop the arch prefix when copying:
 
-    cp *.json <path_to_aiter_root>/aiter/ops/triton/configs/gemm/
+    cp GEMM-AFP4WFP4_PRESHUFFLED-N=7168-K=2048.json \
+        <path_to_aiter_root>/aiter/ops/triton/configs/gfx950/triton/gemm/gemm_afp4wfp4_preshuffled/
+
+`<d_type>` is the config name lowercased with dashes folded to underscores (`GEMM-AFP4WFP4_PRESHUFFLED` → `gemm_afp4wfp4_preshuffled`), and `<backend>` is `triton` unless you tuned the gluon kernel — the two backends read separate directories and never fall back to each other.
+
+Two gotchas: a family's `DEFAULT.json` must be in place before any specialized file resolves, and config reads are cached per path (including missing files), so restart the Python process after copying for the new files to be picked up.
 
 then, you can run, for example,
 

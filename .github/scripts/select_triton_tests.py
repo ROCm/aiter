@@ -20,6 +20,8 @@ from pathlib import Path
 # Third party libraries.
 import networkx as nx
 
+logger = logging.getLogger(__name__)
+
 # Small utility functions.
 # ------------------------------------------------------------------------------
 
@@ -28,7 +30,7 @@ def log_file_list(log_level: int, files: list[Path]) -> None:
     if not logging.getLogger().isEnabledFor(log_level):
         return
     for f in files:
-        logging.log(log_level, "* %s", f)
+        logger.log(log_level, "* %s", f)
 
 
 # Structure of Triton source files.
@@ -37,10 +39,10 @@ def log_file_list(log_level: int, files: list[Path]) -> None:
 
 def check_dir(p: Path) -> Path:
     if not p.exists():
-        logging.critical("Required directory [%s] doesn't exist.", p)
+        logger.critical("Required directory [%s] doesn't exist.", p)
         sys.exit(1)
     if not p.is_dir():
-        logging.critical("Required directory [%s] isn't a directory.", p)
+        logger.critical("Required directory [%s] isn't a directory.", p)
         sys.exit(1)
     return p
 
@@ -71,31 +73,31 @@ def list_files(dir: Path, suffix: str = "") -> set[Path]:
 
 def list_triton_op_files() -> set[Path]:
     files = list_files(triton_op_dir(), suffix=".py")
-    logging.debug("Found %d Triton operator source files.", len(files))
+    logger.debug("Found %d Triton operator source files.", len(files))
     return files
 
 
 def list_triton_kernel_files(kernel_dir: Path) -> set[Path]:
     files = list_files(kernel_dir, suffix=".py")
-    logging.debug("Found %d Triton kernel source files.", len(files))
+    logger.debug("Found %d Triton kernel source files.", len(files))
     return files
 
 
 def list_triton_config_files() -> set[Path]:
     files = list_files(triton_config_dir(), suffix=".json")
-    logging.debug("Found %d Triton kernel config files.", len(files))
+    logger.debug("Found %d Triton kernel config files.", len(files))
     return files
 
 
 def list_triton_test_files(test_dir: Path) -> set[Path]:
     files = list_files(test_dir, suffix=".py")
-    logging.debug("Found %d Triton test source files.", len(files))
+    logger.debug("Found %d Triton test source files.", len(files))
     return files
 
 
 def list_triton_bench_files(bench_dir: Path) -> set[Path]:
     files = list_files(bench_dir, suffix=".py")
-    logging.debug("Found %d Triton benchmark source files.", len(files))
+    logger.debug("Found %d Triton benchmark source files.", len(files))
     return files
 
 
@@ -157,7 +159,7 @@ def expand_mnk(json_string: str, config_files: list[Path]) -> list[str]:
     """
     # Early exit if no placeholders present.
     if not any(f"{{{p}}}" in json_string for p in MNK_PLACEHOLDERS):
-        logging.debug("No M/N/K placeholders in [%s].", json_string)
+        logger.debug("No M/N/K placeholders in [%s].", json_string)
         return [json_string]
     # Strip `f"` prefix and `"` suffix, then escape special regex characters. For
     # example, `f"gfx950-GEMM-N={N}-K={K}.json"` becomes `gfx950-GEMM-N=\{N\}-K=\{K\}.json`.
@@ -175,7 +177,7 @@ def expand_mnk(json_string: str, config_files: list[Path]) -> list[str]:
         )
     # Compile regex with anchors to match entire path.
     pattern = re.compile(f"^{pattern_str}$")
-    logging.debug("M/N/K regex is [%s].", pattern.pattern)
+    logger.debug("M/N/K regex is [%s].", pattern.pattern)
     # Return f-string representations of matching config paths.
     return [f'f"{path}"' for c in config_files if pattern.match(path := c.as_posix())]
 
@@ -193,7 +195,7 @@ def expand_moe_dtypes(json_strings: list[str]) -> list[str]:
 
 
 def expand_interpolations(json_string: str, config_files: list[Path]) -> list[str]:
-    if not (json_string.startswith("f'") or json_string.startswith('f"')):
+    if not (json_string.startswith(("f'", 'f"'))):
         return [json_string]
     # Replace config path placeholder
     if r"{AITER_TRITON_CONFIGS_PATH}" in json_string:
@@ -201,12 +203,12 @@ def expand_interpolations(json_string: str, config_files: list[Path]) -> list[st
             r"{AITER_TRITON_CONFIGS_PATH}",
             str(triton_config_dir().relative_to(root_dir()).as_posix()),
         )
-        logging.debug("Resolved {AITER_TRITON_CONFIGS_PATH}: [%s]", json_string)
+        logger.debug("Resolved {AITER_TRITON_CONFIGS_PATH}: [%s]", json_string)
     # Expand device variants
     expanded = [json_string]
     if r"{dev}" in json_string:
         expanded = [s.replace(r"{dev}", dev) for s in expanded for dev in DEVICES]
-        logging.debug("Resolved {dev}: %s", expanded)
+        logger.debug("Resolved {dev}: %s", expanded)
     # Expand GEMM M-N-K patterns
     expanded = [
         expanded_mnk for s in expanded for expanded_mnk in expand_mnk(s, config_files)
@@ -251,13 +253,13 @@ def resolve_json_strings(
             unresolved.append(json_string)
     # Log results
     if resolved:
-        logging.debug("Resolved JSON config files:")
+        logger.debug("Resolved JSON config files:")
         log_file_list(logging.DEBUG, resolved)
     log_level = logging.DEBUG
     if unresolved and logging.getLogger().isEnabledFor(log_level):
-        logging.log(log_level, "Unresolved JSON strings:")
+        logger.log(log_level, "Unresolved JSON strings:")
         for s in unresolved:
-            logging.log(log_level, "* %s", s)
+            logger.log(log_level, "* %s", s)
     return resolved
 
 
@@ -270,7 +272,7 @@ def resolve_gemm_config_names(gemm_config_names: list[str]) -> list[Path]:
         if p.is_file()
     ]
     if gemm_configs:
-        logging.debug("Resolved JSON GEMM config files:")
+        logger.debug("Resolved JSON GEMM config files:")
         log_file_list(logging.DEBUG, gemm_configs)
     return gemm_configs
 
@@ -301,10 +303,10 @@ def git(args: str, check: bool = True) -> subprocess.CompletedProcess:
             cwd=root_dir(),  # always run git commands from repo root
         )
     except FileNotFoundError:
-        logging.critical("Git not found.")
+        logger.critical("Git not found.")
         sys.exit(1)
     except subprocess.CalledProcessError:
-        logging.critical("Malformed Git command: [git %s].", args)
+        logger.critical("Malformed Git command: [git %s].", args)
         sys.exit(1)
 
 
@@ -314,7 +316,7 @@ def git_current_branch() -> str:
 
 def git_check_branch(branch: str) -> None:
     if git(f"rev-parse --verify --quiet {branch}", check=False).returncode != 0:
-        logging.critical("Branch [%s] doesn't exist.", branch)
+        logger.critical("Branch [%s] doesn't exist.", branch)
         sys.exit(1)
 
 
@@ -330,7 +332,7 @@ def git_filename_diff(source_branch: str, target_branch: str) -> set[Path]:
         if abs_path.exists() and abs_path.is_file():
             # Add path relative to root_dir() - this will match paths from `list_files` function.
             files.add(abs_path.relative_to(root_dir()))
-    logging.debug(
+    logger.debug(
         "There %s %d file%s in the diff from [%s] to [%s].",
         "is" if len(files) == 1 else "are",
         len(files),
@@ -344,7 +346,7 @@ def git_filename_diff(source_branch: str, target_branch: str) -> set[Path]:
 def get_filename_diff(source_branch: str | None, target_branch: str) -> set[Path]:
     if source_branch is None:
         source_branch = git_current_branch()
-        logging.info(
+        logger.info(
             "Source branch wasn't provided, using current branch [%s] as source branch.",
             source_branch,
         )
@@ -354,7 +356,7 @@ def get_filename_diff(source_branch: str | None, target_branch: str) -> set[Path
     git_check_branch(target_branch)
 
     if target_branch == source_branch:
-        logging.error("Source and target branches must be different.")
+        logger.error("Source and target branches must be different.")
         sys.exit(1)
 
     return git_filename_diff(source_branch, target_branch)
@@ -456,14 +458,14 @@ class Visitor(ast.NodeVisitor):
             # Check if it's a directory without `__init__.py`` (namespace package or external)
             p_dir = (root_dir() / import_py_file).with_suffix("")
             if p_dir.exists() and p_dir.is_dir():
-                logging.debug(
+                logger.debug(
                     "Directory [%s] exists but has no '__init__.py', skipping dependency [%s] of [%s].",
                     p_dir.relative_to(root_dir()),
                     import_,
                     self.source_file,
                 )
             else:
-                logging.warning(
+                logger.warning(
                     "Unable to find [%s] dependency of [%s] on filesystem.",
                     import_,
                     self.source_file,
@@ -537,11 +539,11 @@ class Visitor(ast.NodeVisitor):
 
 def parse_source_file(source_file: Path) -> tuple[list[Path], list[str], list[str]]:
     try:
-        logging.debug("Parsing source file [%s]...", str(source_file))
+        logger.debug("Parsing source file [%s]...", str(source_file))
         source = (root_dir() / source_file).read_text(encoding="utf-8")
         tree = ast.parse(source, filename=str(source_file))
     except Exception:
-        logging.exception("Skipping source file [%s].", source_file)
+        logger.exception("Skipping source file [%s].", source_file)
         return [], [], []
 
     visitor = Visitor(source_file)
@@ -549,22 +551,22 @@ def parse_source_file(source_file: Path) -> tuple[list[Path], list[str], list[st
 
     dependecies = sorted(visitor.dependencies)
     if not dependecies:
-        logging.debug("No dependecies of interest in [%s].", source_file)
+        logger.debug("No dependecies of interest in [%s].", source_file)
     else:
-        logging.debug("Dependecies of interest in [%s]:", source_file)
+        logger.debug("Dependecies of interest in [%s]:", source_file)
         log_file_list(logging.DEBUG, dependecies)
 
     json_strings = sorted(visitor.json_strings)
     if not json_strings:
-        logging.debug("No JSON strings in [%s].", source_file)
+        logger.debug("No JSON strings in [%s].", source_file)
     else:
-        logging.debug("JSON strings in [%s]: %s", source_file, str(json_strings))
+        logger.debug("JSON strings in [%s]: %s", source_file, str(json_strings))
 
     gemm_config_names = sorted(visitor.gemm_config_names)
     if not gemm_config_names:
-        logging.debug("No GEMM config names in [%s].", source_file)
+        logger.debug("No GEMM config names in [%s].", source_file)
     else:
-        logging.debug(
+        logger.debug(
             "GEMM config names in [%s]: %s", source_file, str(gemm_config_names)
         )
 
@@ -576,8 +578,10 @@ def parse_source_file_recursively(
     source_file: Path,
     config_files: list[Path],
     visited: set[Path],
-    deps_to_ignore: set[Path] = set(),
+    deps_to_ignore: set[Path] | None = None,
 ) -> None:
+    if deps_to_ignore is None:
+        deps_to_ignore = set()
     stack = [source_file]
 
     while stack:
@@ -591,23 +595,23 @@ def parse_source_file_recursively(
         # Add current node to the graph.
         current_str = str(current)
         graph.add_node(current_str)
-        logging.debug("Added graph node [%s].", current_str)
+        logger.debug("Added graph node [%s].", current_str)
 
         # Add dependencies of current node, and respective edges, to the graph.
         for d in dependencies:
             d_str = str(d)
             graph.add_node(d_str)
-            logging.debug("Added graph node [%s].", d_str)
+            logger.debug("Added graph node [%s].", d_str)
             graph.add_edge(d_str, current_str)
-            logging.debug("Added graph edge [%s]->[%s].", d_str, current_str)
+            logger.debug("Added graph edge [%s]->[%s].", d_str, current_str)
 
         # Add configs of current node, and respective edges, to the graph.
         for c in configs:
             c_str = str(c)
             graph.add_node(c_str)
-            logging.debug("Added graph node [%s].", c_str)
+            logger.debug("Added graph node [%s].", c_str)
             graph.add_edge(c_str, current_str)
-            logging.debug("Added graph edge [%s]->[%s].", c_str, current_str)
+            logger.debug("Added graph edge [%s]->[%s].", c_str, current_str)
 
         stack.extend(
             d
@@ -625,9 +629,9 @@ def tag_node(graph: nx.DiGraph, file: Path, tag: str) -> None:
     file_str = str(file)
     if file_str in graph.nodes:
         graph.nodes[file_str]["type"] = tag
-        logging.debug("Tagged file [%s] as a '%s' in the graph.", file_str, tag)
+        logger.debug("Tagged file [%s] as a '%s' in the graph.", file_str, tag)
     else:
-        logging.warning(
+        logger.warning(
             "Couldn't find file [%s] in the graph, unable to tag it as '%s'.",
             file_str,
             tag,
@@ -640,8 +644,10 @@ def add_files_to_dependency_graph(
     file_type: str,
     config_files: list[Path],
     visited: set[Path],
-    deps_to_ignore: set[Path] = set(),
+    deps_to_ignore: set[Path] | None = None,
 ) -> None:
+    if deps_to_ignore is None:
+        deps_to_ignore = set()
     for f in files:
         parse_source_file_recursively(
             graph, f, config_files, visited, deps_to_ignore=deps_to_ignore
@@ -680,7 +686,7 @@ def build_dependency_graph(
         visited,
         deps_to_ignore=deps_to_ignore,
     )
-    logging.debug(
+    logger.debug(
         "Built dependency graph of Triton source files with %d nodes and %d edges.",
         graph.number_of_nodes(),
         graph.number_of_edges(),
@@ -704,16 +710,16 @@ def find_tests_to_run(graph: nx.DiGraph, diff_inter_triton: list[Path]) -> list[
         if p_str in graph:
             reachable_diff_inter_triton.append(p)
         else:
-            logging.warning(
+            logger.warning(
                 "Triton source file [%s] isn't in the dependency graph, it's unreachable.",
                 p_str,
             )
     if not reachable_diff_inter_triton:
-        logging.warning("There are no reachable tests from the Triton diff.")
-        logging.warning(
+        logger.warning("There are no reachable tests from the Triton diff.")
+        logger.warning(
             "Please check test selection script, there might be a bug in it."
         )
-        logging.warning(
+        logger.warning(
             "Please check Triton code base, there may be some filesystem organizations that aren't taken into account."
         )
         return []
@@ -728,9 +734,7 @@ def find_tests_to_run(graph: nx.DiGraph, diff_inter_triton: list[Path]) -> list[
     tests_to_run: set[Path] = set()
     for p in reachable_diff_inter_triton:
         p_str = str(p)
-        logging.debug(
-            "Searching for tests related to Triton source file [%s]...", p_str
-        )
+        logger.debug("Searching for tests related to Triton source file [%s]...", p_str)
         if not is_all_bench:
             # Forward traversal for non-benchmarks.
             reachable_files = nx.descendants(graph, p_str) | {p_str}
@@ -745,7 +749,7 @@ def find_tests_to_run(graph: nx.DiGraph, diff_inter_triton: list[Path]) -> list[
                 if graph.nodes[p_ancestor].get("type") == "kernel"
                 for kernel_descendant in nx.descendants(graph, p_ancestor)
             }
-        logging.debug(
+        logger.debug(
             "There %s %d file%s reachable from [%s].",
             "is" if len(reachable_files) == 1 else "are",
             len(reachable_files),
@@ -757,7 +761,7 @@ def find_tests_to_run(graph: nx.DiGraph, diff_inter_triton: list[Path]) -> list[
             Path(f) for f in reachable_files if graph.nodes[f].get("type") == "test"
         }
         if test_files:
-            logging.debug(
+            logger.debug(
                 "There %s %d test%s reachable from [%s].",
                 "is" if len(test_files) == 1 else "are",
                 len(test_files),
@@ -766,13 +770,13 @@ def find_tests_to_run(graph: nx.DiGraph, diff_inter_triton: list[Path]) -> list[
             )
             tests_to_run.update(test_files)
         else:
-            logging.warning(
+            logger.warning(
                 "Couldn't find test files related to [%s] Triton source.", p_str
             )
 
     if tests_to_run:
         sorted_tests_to_run = sorted(tests_to_run)
-        logging.info(
+        logger.info(
             "There %s %d test%s reachable from the Triton diff:",
             "is" if len(sorted_tests_to_run) == 1 else "are",
             len(sorted_tests_to_run),
@@ -781,11 +785,11 @@ def find_tests_to_run(graph: nx.DiGraph, diff_inter_triton: list[Path]) -> list[
         log_file_list(logging.INFO, sorted_tests_to_run)
         return sorted_tests_to_run
     else:
-        logging.warning("Couldn't find any test file related to Triton diff.")
-        logging.warning(
+        logger.warning("Couldn't find any test file related to Triton diff.")
+        logger.warning(
             "Please check test selection script, there might be a bug in it."
         )
-        logging.warning("Please check Triton code base, there may be untested kernels.")
+        logger.warning("Please check Triton code base, there may be untested kernels.")
         return []
 
 
@@ -795,28 +799,28 @@ def find_tests_to_run(graph: nx.DiGraph, diff_inter_triton: list[Path]) -> list[
 
 def write_env_file(env_var: str, env_file: str, tests_to_run: list[Path]) -> None:
     if env_var is None or not (env_var := env_var.strip()):
-        logging.info(
+        logger.info(
             "Environment variable is absent, environment file won't be written."
         )
         return
     if env_file is None or not (env_file := env_file.strip()):
-        logging.info("Environment file is absent, it won't be written.")
+        logger.info("Environment file is absent, it won't be written.")
         return
     if not tests_to_run:
-        logging.warning(
+        logger.warning(
             "List of tests to run is empty, enviroment file won't be written."
         )
         return
     tests_to_run_joined_str = " ".join(str(t) for t in tests_to_run)
     env_file_data = f"{env_var}={tests_to_run_joined_str}"
-    logging.debug("Writing [%s] to [%s]...", env_file_data, env_file)
+    logger.debug("Writing [%s] to [%s]...", env_file_data, env_file)
     try:
         with open(env_file, "a") as env_file_fd:
             env_file_fd.write(env_file_data + "\n")
-        logging.info("Wrote tests to run to [%s] environment file.", env_file)
-    except IOError:
-        logging.exception("I/O error while writing to [%s] environment file.", env_file)
-        logging.info("The entire Triton test suite will be executed.")
+        logger.info("Wrote tests to run to [%s] environment file.", env_file)
+    except OSError:
+        logger.exception("I/O error while writing to [%s] environment file.", env_file)
+        logger.info("The entire Triton test suite will be executed.")
 
 
 # Command line interface parsing.
@@ -877,12 +881,12 @@ def main_logic(args: argparse.Namespace) -> None:
     del diff_files, all_files
 
     if not diff_inter_triton:
-        logging.info(
+        logger.info(
             "There are no Triton source files in diff, there's no need to run Triton tests."
         )
         return
 
-    logging.info(
+    logger.info(
         "There %s %d Triton source file%s in the diff:",
         "is" if len(diff_inter_triton) == 1 else "are",
         len(diff_inter_triton),
@@ -909,7 +913,7 @@ def main() -> None:
     main_logic(args)
     end_timestamp = time.perf_counter()
     elapsed_time_s = end_timestamp - start_timestamp
-    logging.info("Finished, execution took %.2f seconds.", elapsed_time_s)
+    logger.info("Finished, execution took %.2f seconds.", elapsed_time_s)
 
 
 if __name__ == "__main__":

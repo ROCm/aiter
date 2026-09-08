@@ -1,26 +1,27 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
-import torch
-import aiter
-from aiter.test_common import checkAllclose, perftest, benchmark
-from aiter import dtypes
-from typing import Tuple
 import argparse
 import itertools
+
 import pandas as pd
+import torch
+
+import aiter
+from aiter import dtypes
+from aiter.test_common import benchmark, checkAllclose, perftest
 
 MAX_TOKEN_SUPPORTED = 16384
 
 
 @perftest()
 def run_torch(
-    key, value, k_cache, v_cache, slot_mapping, block_size, x, asm_layout, quantCfg={}
+    key, value, k_cache, v_cache, slot_mapping, block_size, x, asm_layout, quantCfg=None
 ):
+    if quantCfg is None:
+        quantCfg = {}
     num_batch, num_tokens, num_heads, head_size = key.shape
     num_blocks = k_cache.shape[0]
-    dtype = k_cache.dtype
-    device = k_cache.device
 
     k_scale = None
     v_scale = None
@@ -101,8 +102,10 @@ def run_torch(
 
 @perftest()
 def run_aiter(
-    key, value, k_cache, v_cache, slot_mapping, block_size, x, asm_layout, quantCfg={}
+    key, value, k_cache, v_cache, slot_mapping, block_size, x, asm_layout, quantCfg=None
 ):
+    if quantCfg is None:
+        quantCfg = {}
     if quantCfg:
         k_scale = quantCfg["k_scale"]
         v_scale = quantCfg["v_scale"]
@@ -122,11 +125,12 @@ def run_aiter(
 def test_reshape_and_cache(
     ctx_lens: int,
     bs: int,
-    num_heads: Tuple[int, int],
+    num_heads: tuple[int, int],
     head_size: int,
     block_size: int,
     DType_KV: torch.dtype,
     DType_KVCache: torch.dtype,
+    DType_Slot: torch.dtype = torch.int64,
 ):
     ret = {}
     quantCfg = (
@@ -169,6 +173,11 @@ def test_reshape_and_cache(
             for i in range(ctx_lens)
         ]
     ).cuda()
+    # The kernels accept int32 as well as int64: the torch stacks keep
+    # slot_mapping in int64, while JAX front ends produce int32. The torch
+    # reference keeps its own int64 copy, since advanced indexing has its own
+    # index-dtype rules and this test is about the kernel, not about torch.
+    slot_mapping_kernel = slot_mapping.to(DType_Slot)
 
     k_cache_ref = k_cache.clone()
     v_cache_ref = v_cache.clone()
@@ -194,7 +203,7 @@ def test_reshape_and_cache(
         value,
         k_cache_a,
         v_cache_a,
-        slot_mapping,
+        slot_mapping_kernel,
         block_size,
         x,
         asm_layout,
@@ -223,6 +232,7 @@ def test_reshape_and_cache(
     slot_mapping = torch.tensor(
         [bsID * max_token_num_support + ctx_lens for bsID in range(bs)]
     ).cuda()
+    slot_mapping_kernel = slot_mapping.to(DType_Slot)
 
     k_cache_ref = k_cache.clone()
     v_cache_ref = v_cache.clone()
@@ -248,7 +258,7 @@ def test_reshape_and_cache(
         value,
         k_cache_a,
         v_cache_a,
-        slot_mapping,
+        slot_mapping_kernel,
         block_size,
         x,
         asm_layout,
@@ -267,7 +277,7 @@ def test_reshape_and_cache(
             msg=f"{names[i]} {el.shape}",
         )
     print(
-        f"finish test {ctx_lens=} {bs=} {num_heads=} {head_size=} {block_size=} {DType_KV=} {DType_KVCache=}"
+        f"finish test {ctx_lens=} {bs=} {num_heads=} {head_size=} {block_size=} {DType_KV=} {DType_KVCache=} {DType_Slot=}"
     )
     return ret
 
@@ -280,8 +290,14 @@ parser.add_argument(
     "-t",
     "--test",
     type=str,
-    choices=["bf16tobf16", "fp16tofp8", "fp16toi8", "bf16toi8"],
-    default=["bf16tobf16", "fp16tofp8", "fp16toi8", "bf16toi8"],
+    choices=["bf16tobf16", "bf16tobf16_slot_i32", "fp16tofp8", "fp16toi8", "bf16toi8"],
+    default=[
+        "bf16tobf16",
+        "bf16tobf16_slot_i32",
+        "fp16tofp8",
+        "fp16toi8",
+        "bf16toi8",
+    ],
     nargs="*",
     help="""select which test to run, default is all
     e.g.: -t fp16tofp8""",
@@ -322,6 +338,20 @@ for (
             16,
             dtypes.bf16,
             dtypes.bf16,
+        )
+    elif test == "bf16tobf16_slot_i32":
+        # Same case as bf16tobf16 with an int32 slot_mapping, which is what JAX
+        # front ends produce.
+        print("\nstart quant bf16->bf16, int32 slot_mapping")
+        ret = test_reshape_and_cache(
+            ctx,
+            bs,
+            (8, 1),
+            128,
+            16,
+            dtypes.bf16,
+            dtypes.bf16,
+            torch.int32,
         )
     elif test == "fp16tofp8":
         print("\nstart quant fp16->fp8")

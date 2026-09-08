@@ -5,8 +5,8 @@ import argparse
 import logging
 import os
 from multiprocessing import Pool, freeze_support, set_start_method
-from typing_extensions import Optional
 
+import pandas as pd
 import torch
 import torch.distributed as dist
 
@@ -35,7 +35,7 @@ def allreduce_custom(
     rankID,
     x,
     withGraph=False,
-    distributed_init_method: Optional[str] = None,
+    distributed_init_method: str | None = None,
 ):
     device = torch.device(f"cuda:{rankID}")
     torch.cuda.set_device(device)
@@ -58,9 +58,8 @@ def allreduce_custom(
 
     if withGraph:
         graph = torch.cuda.CUDAGraph()
-        with graph_capture() as gc:
-            with torch.cuda.graph(graph, stream=gc.stream):
-                out = tensor_model_parallel_all_reduce(x)
+        with graph_capture() as gc, torch.cuda.graph(graph, stream=gc.stream):
+            out = tensor_model_parallel_all_reduce(x)
         out.fill_(0)
 
         @perftest()
@@ -92,7 +91,7 @@ def test_allreduce_custom(
     shape,
     dtype,
     withGraph=False,
-    distributed_init_method: Optional[str] = None,
+    distributed_init_method: str | None = None,
 ):
     os.environ["MASTER_ADDR"] = "127.0.0.1"
     os.environ["MASTER_PORT"] = "49373"
@@ -111,9 +110,17 @@ def test_allreduce_custom(
     pool.close()
     pool.join()
     rets = [el.get() for el in rets]
+    all_us = [us for _, us in rets]
+    max_err = 0.0
     for out, us in rets:
         msg = f"test_allreduce_custom: {shape=} {dtype=} {withGraph=} {us:>8.2f}"
-        checkAllclose(ref, out.to(ref), msg=msg)
+        err = checkAllclose(ref, out.to(ref), msg=msg)
+        max_err = max(max_err, err)
+    return {
+        "min_us": min(all_us),
+        "max_us": max(all_us),
+        "err": max_err,
+    }
 
 
 l_dtype = ["fp16", "bf16"]
@@ -157,9 +164,10 @@ if __name__ == "__main__":
         l_dtype = [dtypes.d_dtypes[args.dtype]]
     if args.shape is not None:
         l_shape = [args.shape]
+    df = []
     for dtype in l_dtype:
         for shape in l_shape:
-            test_allreduce_custom(
+            ret = test_allreduce_custom(
                 8,
                 1,
                 shape,
@@ -169,4 +177,19 @@ if __name__ == "__main__":
                     get_ip(), get_open_port()
                 ),
             )
-            # test_allreduce_custom(8, 1, shape, dtype, withGraph=False)
+            df.append(ret)
+    df = pd.DataFrame(df)
+    show_cols = [
+        "tp_size",
+        "shape",
+        "dtype",
+        "withGraph",
+        "min_us",
+        "max_us",
+        "err",
+    ]
+    show_cols = [c for c in show_cols if c in df.columns]
+    logger.info(
+        "custom allreduce summary (markdown):\n%s",
+        df[show_cols].to_markdown(index=False),
+    )

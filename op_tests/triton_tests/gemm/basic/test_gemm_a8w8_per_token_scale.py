@@ -1,13 +1,14 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-import torch
 import pytest
+import torch
+import torch.nn.functional as F
+
 from aiter.ops.triton.gemm.basic.gemm_a8w8_per_token_scale import (
     gemm_a8w8_per_token_scale,
 )
-from aiter.ops.triton.utils.types import str_to_torch_dtype, get_fp8_dtypes
-import torch.nn.functional as F
+from aiter.ops.triton.utils.types import get_fp8_dtypes, str_to_torch_dtype
 
 
 def run_torch(x, weight, x_scale, w_scale, dtype=torch.bfloat16):
@@ -43,6 +44,7 @@ def generate_gemm_a8w8_per_token_scale_inputs(
     layout: str = "TN",
     output=False,
 ):
+    torch.manual_seed(0)
 
     if layout[0] == "T":
         x = (torch.rand((M, K), dtype=torch.float16, device="cuda") / 10).to(e4m3_type)

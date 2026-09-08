@@ -28,30 +28,26 @@ class kernelInstance:
             [
                 "bf16_batched",
                 ("x").join(
-                    map(
-                        lambda x: str(x),
-                        [
-                            self.BLOCK_SIZE,
-                            self.MPerBLOCK,
-                            self.NPerBLOCK,
-                            self.KPerBLOCK,
-                        ],
-                    )
+                    str(x)
+                    for x in [
+                        self.BLOCK_SIZE,
+                        self.MPerBLOCK,
+                        self.NPerBLOCK,
+                        self.KPerBLOCK,
+                    ]
                 ),
-                ("x").join(map(lambda x: str(x), [self.WAVE_TILE_M, self.WAVE_TILE_N])),
-                ("x").join(map(lambda x: str(x), [self.WAVE_MAP_M, self.WAVE_MAP_N])),
-                ("x").join(map(lambda x: str(x), self.ABLOCK_TRANSFER)),
-                ("x").join(map(lambda x: str(x), self.BBLOCK_TRANSFER)),
-                ("x").join(map(lambda x: str(x), self.CBLOCK_TRANSFER)),
-                ("x").join(map(lambda x: str(x), self.CBLOCK_SPV)),
+                ("x").join(str(x) for x in [self.WAVE_TILE_M, self.WAVE_TILE_N]),
+                ("x").join(str(x) for x in [self.WAVE_MAP_M, self.WAVE_MAP_N]),
+                ("x").join(str(x) for x in self.ABLOCK_TRANSFER),
+                ("x").join(str(x) for x in self.BBLOCK_TRANSFER),
+                ("x").join(str(x) for x in self.CBLOCK_TRANSFER),
+                ("x").join(str(x) for x in self.CBLOCK_SPV),
                 ("x").join(
-                    map(
-                        lambda x: str(x),
-                        [
-                            self.CSHUFFLE_MX_PER_WAVE_PERSHUFFLE,
-                            self.CSHUFFLE_NX_PER_WAVE_PERSHUFFLE,
-                        ],
-                    )
+                    str(x)
+                    for x in [
+                        self.CSHUFFLE_MX_PER_WAVE_PERSHUFFLE,
+                        self.CSHUFFLE_NX_PER_WAVE_PERSHUFFLE,
+                    ]
                 ),
                 self.LOOP_SCHED.lower(),
                 f"v{self.PIPELINE_VERSION}",

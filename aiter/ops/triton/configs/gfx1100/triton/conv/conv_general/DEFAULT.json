@@ -1,0 +1,20 @@
+{
+    "shapes": {
+        "N=1,C=3,H=224,W=224,K=64,R=7,S=7,sh=2,sw=2,ph=3,pw=3,dh=1,dw=1": {
+            "BLOCK_M": 64,
+            "BLOCK_N": 64,
+            "BLOCK_K": 64,
+            "GROUP_SIZE_M": 4,
+            "num_warps": 4,
+            "num_stages": 1
+        }
+    },
+    "any": {
+        "BLOCK_M": 64,
+        "BLOCK_N": 64,
+        "BLOCK_K": 64,
+        "GROUP_SIZE_M": 4,
+        "num_warps": 4,
+        "num_stages": 1
+    }
+}

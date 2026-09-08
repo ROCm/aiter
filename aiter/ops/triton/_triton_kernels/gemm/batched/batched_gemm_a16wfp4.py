@@ -1,13 +1,13 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
+import triton
 import triton.language as tl
+
 from aiter.ops.triton._triton_kernels.quant.quant import _mxfp4_quant_op
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
 from aiter.ops.triton.utils._triton.pid_preprocessing import pid_grid, remap_xcd
 from aiter.ops.triton.utils.gemm_config_utils import get_gemm_config
-
-import triton
 
 _batched_gemm_a16wfp4_repr = make_kernel_repr(
     "_batched_gemm_a16wfp4_kernel",
@@ -165,9 +165,8 @@ def _batched_gemm_a16wfp4_kernel(
             + offs_bn[None, :] * stride_bn
         )
         # Create pointers for the first block of A and B scales
-        offs_ks = (pid_k * (SPLITK_BLOCK_SIZE // SCALE_GROUP_SIZE)) + tl.arange(
-            0, BLOCK_SIZE_K // SCALE_GROUP_SIZE
-        )
+        offs_scale_k = tl.arange(0, BLOCK_SIZE_K // SCALE_GROUP_SIZE)
+        offs_ks = (pid_k * (SPLITK_BLOCK_SIZE // SCALE_GROUP_SIZE)) + offs_scale_k
         # B scales are N x K even though B operand is K x N.
         b_scale_ptrs = (
             b_scales_ptr
@@ -179,17 +178,26 @@ def _batched_gemm_a16wfp4_kernel(
         accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
 
         for k in range(pid_k * num_k_iter, (pid_k + 1) * num_k_iter):
-            b_scales = tl.load(b_scale_ptrs)
             # a_scales = tl.full((BLOCK_SIZE_M, BLOCK_SIZE_K//SCALE_GROUP_SIZE), 127, dtype=tl.uint8)
             # b_scales = tl.full((BLOCK_SIZE_N, BLOCK_SIZE_K//SCALE_GROUP_SIZE), 127, dtype=tl.uint8)
             # Load the next block of A and B, generate a mask by checking the K dimension.
             # If it is out of bounds, set it to 0.
             if EVEN_K:
+                b_scales = tl.load(b_scale_ptrs)
                 a_bf16 = tl.load(a_ptrs)
                 b = tl.load(b_ptrs, cache_modifier=cache_modifier)
             else:
+                # OOB scale bytes are not guaranteed to be zero, and 0xFF is NaN
+                # in e8m0, which dot_scaled propagates even where the masked-off
+                # data is zero. Read those groups as 127, a scale of 2^0.
+                scale_mask = offs_scale_k[None, :] < (
+                    2 * K // SCALE_GROUP_SIZE - k * (BLOCK_SIZE_K // SCALE_GROUP_SIZE)
+                )
+                b_scales = tl.load(b_scale_ptrs, mask=scale_mask, other=127)
                 a_bf16 = tl.load(
-                    a_ptrs, mask=offs_k_bf16[None, :] < K - k * BLOCK_SIZE_K, other=0
+                    a_ptrs,
+                    mask=offs_k_bf16[None, :] < 2 * K - k * BLOCK_SIZE_K,
+                    other=0,
                 )
                 b = tl.load(
                     b_ptrs, mask=offs_k[:, None] < K - k * (BLOCK_SIZE_K // 2), other=0
@@ -200,7 +208,9 @@ def _batched_gemm_a16wfp4_kernel(
                     a_bf16, BLOCK_SIZE_K, BLOCK_SIZE_M, SCALE_GROUP_SIZE
                 )
 
-            accumulator += tl.dot_scaled(a, a_scales, "e2m1", b, b_scales, "e2m1")
+            accumulator = tl.dot_scaled(
+                a, a_scales, "e2m1", b, b_scales, "e2m1", acc=accumulator
+            )
 
             # Advance the ptrs to the next K block.
             a_ptrs += BLOCK_SIZE_K * stride_ak
@@ -281,6 +291,10 @@ def get_splitk(K: int, BLOCK_SIZE_K: int, NUM_KSPLIT: int):
     # heuristics for make "EVEN_K == True" as much as possible
     NUM_KSPLIT_STEP = 2
     BLOCK_SIZE_K_STEP = 2
+    # Both decrements floor-divide, so they must be clamped: a NUM_KSPLIT below
+    # NUM_KSPLIT_STEP would go to 0 and the next cdiv(K, NUM_KSPLIT) would
+    # divide by zero, and BLOCK_SIZE_K can fall under the 16 that
+    # compute_splitk_params() enforces everywhere else.
     SPLITK_BLOCK_SIZE = (
         triton.cdiv((2 * triton.cdiv(K, NUM_KSPLIT)), BLOCK_SIZE_K) * BLOCK_SIZE_K
     )
@@ -292,14 +306,14 @@ def get_splitk(K: int, BLOCK_SIZE_K: int, NUM_KSPLIT: int):
         ):
             break
         elif K % (SPLITK_BLOCK_SIZE // 2) != 0 and NUM_KSPLIT > 1:
-            NUM_KSPLIT = NUM_KSPLIT // NUM_KSPLIT_STEP
+            NUM_KSPLIT = max(NUM_KSPLIT // NUM_KSPLIT_STEP, 1)
         elif SPLITK_BLOCK_SIZE % BLOCK_SIZE_K != 0:
             if NUM_KSPLIT > 1:
-                NUM_KSPLIT = NUM_KSPLIT // NUM_KSPLIT_STEP
+                NUM_KSPLIT = max(NUM_KSPLIT // NUM_KSPLIT_STEP, 1)
             elif BLOCK_SIZE_K > 16:
-                BLOCK_SIZE_K = BLOCK_SIZE_K // BLOCK_SIZE_K_STEP
+                BLOCK_SIZE_K = max(BLOCK_SIZE_K // BLOCK_SIZE_K_STEP, 16)
         elif K % (BLOCK_SIZE_K // 2) != 0 and BLOCK_SIZE_K > 16:
-            BLOCK_SIZE_K = BLOCK_SIZE_K // BLOCK_SIZE_K_STEP
+            BLOCK_SIZE_K = max(BLOCK_SIZE_K // BLOCK_SIZE_K_STEP, 16)
         else:
             break
 
@@ -317,4 +331,4 @@ def _get_config(
 ):
     # Note: Config files use K=2*K in their naming because FP4 weights are packed,
     # so the actual K dimension in the config file corresponds to 2*K unpacked elements
-    return get_gemm_config("BATCHED_GEMM_PREQUANT-AFP4WFP4", M, N, 2 * K)
+    return get_gemm_config("BATCHED_GEMM-A16WFP4", M, N, 2 * K)

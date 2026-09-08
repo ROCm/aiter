@@ -8,8 +8,8 @@
 #include "gemm_dispatch_utils.h"
 #include <cmath>
 
-using RowwiseKernel = std::function<torch::Tensor(
-    torch::Tensor&, torch::Tensor&, torch::Tensor&, torch::Tensor&, torch::Tensor&, int)>;
+using RowwiseKernel = torch::Tensor (*)(
+    torch::Tensor&, torch::Tensor&, torch::Tensor&, torch::Tensor&, torch::Tensor&, int);
 
 using RowwiseKernelMap = GemmDispatchMap<RowwiseKernel>;
 
@@ -130,8 +130,8 @@ RowwiseKernel rowwise_dispatch(int M, int N, int K)
         }
     }();
 
-    const int cu_num         = get_device_cu_num();
-    const std::string& gfx   = get_device_gfx();
+    const int cu_num           = get_device_cu_num();
+    const std::string_view gfx = get_device_gfx();
 
     // First check if this shape(M,N,K) is available in the direct lookup.
     auto it = lookup.find({gfx, cu_num, M, N, K});
@@ -181,15 +181,22 @@ torch::Tensor gemm_a8w8_bpreshuffle(torch::Tensor& XQ,
     int M      = XQ.size(0);
     int N      = WQ.size(0);
     int K      = XQ.size(1);
+    int WQK    = WQ.size(1);
     int KBatch = 1 << splitK;
+
+    TORCH_CHECK(WQK >= K,
+                "gemm_a8w8_bpreshuffle requires WQ K >= XQ K, got WQ K=",
+                WQK,
+                ", XQ K=",
+                K);
 
     if(x_scale.dtype() == at::ScalarType::Float && Y.dtype() == at::ScalarType::Half)
     {
-        rowwise_dispatch<F32, F16>(M, N, K)(XQ, WQ, x_scale, w_scale, Y, KBatch);
+        rowwise_dispatch<F32, F16>(M, N, WQK)(XQ, WQ, x_scale, w_scale, Y, KBatch);
     }
     else if(x_scale.dtype() == at::ScalarType::Float && Y.dtype() == at::ScalarType::BFloat16)
     {
-        rowwise_dispatch<F32, B16>(M, N, K)(XQ, WQ, x_scale, w_scale, Y, KBatch);
+        rowwise_dispatch<F32, B16>(M, N, WQK)(XQ, WQ, x_scale, w_scale, Y, KBatch);
     }
     else
     {

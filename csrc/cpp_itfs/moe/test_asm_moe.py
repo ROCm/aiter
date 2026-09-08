@@ -2,11 +2,12 @@
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
 import torch
-from aiter.test_common import perftest
-from aiter.fused_moe_bf16_asm import torch_moe
-from csrc.cpp_itfs.moe.asm_moe import asm_moe
 from aiter.fused_moe_gelu import fused_experts
+
 from aiter import ActivationType
+from aiter.fused_moe_bf16_asm import torch_moe
+from aiter.test_common import perftest
+from csrc.cpp_itfs.moe.asm_moe import asm_moe
 
 BLOCK_SIZE_M = 32
 

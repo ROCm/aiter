@@ -24,14 +24,14 @@ It supports page size = 1.
 # https://github.com/ModelTC/lightllm/blob/96353e868a840db4d103138caf15ed9dbea8c186/lightllm/models/deepseek2/triton_kernel/gqa_flash_decoding_stage2.py
 
 import functools
-import json
+
 import triton
 import triton.language as tl
+
 from aiter.ops.triton._triton_kernels.activation import _tanh
-from aiter.ops.triton.utils._triton.pid_preprocessing import remap_xcd
-from aiter.ops.triton.utils._triton import arch_info
-from aiter.ops.triton.utils.core import AITER_TRITON_CONFIGS_PATH
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
+from aiter.ops.triton.utils._triton.pid_preprocessing import remap_xcd
+from aiter.ops.triton.utils.config_utils import load_config_json, resolve_config_dir
 
 _fwd_grouped_kernel_stage1_rope_repr = make_kernel_repr(
     "_fwd_grouped_kernel_stage1_rope",
@@ -264,7 +264,7 @@ def _fwd_grouped_kernel_stage1_rope(
 
             # (16, 512) x (512, 32)
             # dot product of nope parts
-            qk += tl.dot(q, kv)
+            qk = tl.dot(q, kv, acc=qk)
 
             qk *= sm_scale
 
@@ -287,7 +287,7 @@ def _fwd_grouped_kernel_stage1_rope(
             p = tl.exp(qk - n_e_max[:, None])
             acc *= re_scale[:, None]
             # (16, 32) x (32, 512)
-            acc += tl.dot(p.to(v.dtype), v)
+            acc = tl.dot(p.to(v.dtype), v, acc=acc)
 
             e_sum = e_sum * re_scale + tl.sum(p, 1)
             e_max = n_e_max
@@ -299,14 +299,11 @@ def _fwd_grouped_kernel_stage1_rope(
             + offs_c[None, :]
         )
 
-        if USE_ROPE:
-            if LAST_SPLIT:
-                k_pe_last_token_ptrs = (
-                    k_pe_t_out
-                    + cur_batch * stride_kpe_tokens_out_b
-                    + tl.arange(0, BLOCK_R)
-                )
-                tl.store(k_pe_last_token_ptrs, k_pe_last_token, mask=mask_qk_r)
+        if USE_ROPE and LAST_SPLIT:
+            k_pe_last_token_ptrs = (
+                k_pe_t_out + cur_batch * stride_kpe_tokens_out_b + tl.arange(0, BLOCK_R)
+            )
+            tl.store(k_pe_last_token_ptrs, k_pe_last_token, mask=mask_qk_r)
 
         tl.store(
             Att_Out + offs_mid_o,
@@ -376,7 +373,7 @@ def _fwd_kernel_stage2(
     offs_v = cur_batch * stride_mid_ob + cur_head * stride_mid_oh + offs_d
     offs_logic = cur_batch * stride_mid_ob + cur_head * stride_mid_oh + Lv
 
-    for split_kv_id in range(0, NUM_KV_SPLITS):
+    for split_kv_id in range(NUM_KV_SPLITS):
         kv_len_per_split = tl.cdiv(cur_batch_seq_len, NUM_KV_SPLITS)
         split_kv_start = kv_len_per_split * split_kv_id
         split_kv_end = tl.minimum(split_kv_start + kv_len_per_split, cur_batch_seq_len)
@@ -405,12 +402,5 @@ def _fwd_kernel_stage2(
 
 @functools.lru_cache(maxsize=1024)
 def _get_config():
-    if not hasattr(_get_config, "_config_dict"):
-        dev = arch_info.get_arch()
-        _get_config._config_dict = {}
-        fpath = f"{AITER_TRITON_CONFIGS_PATH}/{dev}-MLA_DECODE_ROPE-DEFAULT.json"
-        with open(fpath, "r") as file:
-            config = json.load(file)
-        _get_config._config_dict = config
-
-    return _get_config._config_dict
+    cfg_dir = resolve_config_dir("attention", "MLA_DECODE_ROPE", backend="triton")
+    return load_config_json(f"{cfg_dir}/DEFAULT.json")

@@ -2,8 +2,8 @@
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 import argparse
 import os
-import sys
 import shutil
+import sys
 from pathlib import Path
 
 import pandas as pd
@@ -17,11 +17,15 @@ AITER_CORE_DIR = (
     else os.path.abspath(f"{this_dir}/../../aiter/jit/utils")
 )
 sys.path.insert(0, AITER_CORE_DIR)
-from chip_info import build_tune_dict, write_lookup_header  # noqa: E402
-
-from gemm_a8w8_blockscale_bpreshuffle_common import (  # noqa: E402
+from chip_info import (
+    build_tune_dict,
+    write_lookup_header,
+    write_name_keyed_lookup_header,
+)
+from gemm_a8w8_blockscale_bpreshuffle_common import (
     default_kernels_dict,
     kernelInstance,
+    kernels_by_name,
     kernels_list,
 )
 
@@ -86,12 +90,12 @@ torch::Tensor
             {k.AK1}, {k.BK1},
             {k.MPerXDL}, {k.NPerXDL},
             {k.WAVE_MAP_M}, {k.WAVE_MAP_N},
-            S<{(", ").join(map(lambda x:str(x),k.ABLOCK_TRANSFER))}>,
-            S<{(", ").join(map(lambda x:str(x),k.BBLOCK_TRANSFER))}>,
+            S<{(", ").join(str(x) for x in k.ABLOCK_TRANSFER)}>,
+            S<{(", ").join(str(x) for x in k.BBLOCK_TRANSFER)}>,
             {k.CSHUFFLE_MX_PER_WAVE_PERSHUFFLE},
             {k.CSHUFFLE_NX_PER_WAVE_PERSHUFFLE},
-            S<{(", ").join(map(lambda x:str(x),k.CBLOCK_TRANSFER))}>,
-            S<{(", ").join(map(lambda x:str(x),k.CBLOCK_SPV))}>,
+            S<{(", ").join(str(x) for x in k.CBLOCK_TRANSFER)}>,
+            S<{(", ").join(str(x) for x in k.CBLOCK_SPV)}>,
             ck::BlockGemmPipelineScheduler::{k.PIPELINE_Sched},
             ck::BlockGemmPipelineVersion::v{k.PIPELINE_VERSION},
             ck::tensor_operation::device::GemmSpecialization::{{GemmSpec}}>;
@@ -153,7 +157,18 @@ template torch::Tensor
             ).write_text(INSTANCE_dFP32_eFP16)
 
     def gen_lookup_dict(self, kernels_dict):
-        LOOKUP_head = """#pragma once
+        """Generate the dispatch lookup header.
+
+        - Tune mode: kernelId-keyed table for *_tune.cu (unchanged).
+        - Non-tune mode: name-keyed registry for the Python-driven dispatch
+          in gemm_a8w8_blockscale_bpreshuffle.cu.
+        """
+        output_path = os.path.join(
+            self.working_path, "gemm_a8w8_blockscale_bpreshuffle_lookup.h"
+        )
+
+        if self.istune:
+            LOOKUP_head = """#pragma once
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2024, Advanced Micro Devices, Inc. All rights reserved.
 
@@ -162,25 +177,49 @@ template torch::Tensor
 #define GENERATE_LOOKUP_TABLE(DTYPE, ETYPE)                                                                                      \\
    {                                                                                                                             \\"""
 
-        LOOKUP_template = """
+            LOOKUP_template = """
        {{{MNK},                                                                                                       \\
         {kernel_name}<DTYPE, ETYPE>}},                       \\"""
 
-        LOOKUP_end = """
+            LOOKUP_end = """
    }
 
 #endif // USE_ROCM
 """
-        write_lookup_header(
-            os.path.join(
-                self.working_path, "gemm_a8w8_blockscale_bpreshuffle_lookup.h"
-            ),
-            kernels_dict,
-            LOOKUP_head,
-            LOOKUP_template,
-            LOOKUP_end,
-            self.istune,
-        )
+            write_lookup_header(
+                output_path,
+                kernels_dict,
+                LOOKUP_head,
+                LOOKUP_template,
+                LOOKUP_end,
+                self.istune,
+            )
+        else:
+            LOOKUP_head = """#pragma once
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2024, Advanced Micro Devices, Inc. All rights reserved.
+
+#ifdef USE_ROCM
+
+#define GENERATE_LOOKUP_TABLE(DTYPE, ETYPE)                                                                                      \\
+   {                                                                                                                             \\"""
+
+            LOOKUP_template = """
+       {{"{kernel_name}",                                                                                                       \\
+        {kernel_name}<DTYPE, ETYPE>}},                       \\"""
+
+            LOOKUP_end = """
+   }
+
+#endif // USE_ROCM
+"""
+            write_name_keyed_lookup_header(
+                output_path,
+                kernels_dict,
+                LOOKUP_head,
+                LOOKUP_template,
+                LOOKUP_end,
+            )
 
     def gen_manifest_head(self, kernels_dict):
         MAINFEST_head = """#pragma once
@@ -215,8 +254,10 @@ torch::Tensor
             "w",
         ) as f:
             f.write(MAINFEST_head)
-            for mnk, k in kernels_dict.items():
-                f.write(MAINFEST_template.format(kernel_name=k.name))
+            f.writelines(
+                MAINFEST_template.format(kernel_name=k.name)
+                for mnk, k in kernels_dict.items()
+            )
             f.write(MAINFEST_end)
 
     def gen_instances(self, kernels_dict):
@@ -227,7 +268,7 @@ torch::Tensor
             shutil.rmtree(self.instances_path)
         os.mkdir(self.instances_path)
 
-        for mnk, k in kernels_dict.items():
+        for k in kernels_dict.values():
             self.gen_instance(k)
 
         self.gen_lookup_dict(kernels_dict)
@@ -237,7 +278,11 @@ torch::Tensor
 def get_tune_dict(tune_dict_csv):
     if os.path.exists(tune_dict_csv):
         return build_tune_dict(
-            pd.read_csv(tune_dict_csv), default_kernels_dict, kernels_list, libtype="ck"
+            pd.read_csv(tune_dict_csv),
+            default_kernels_dict,
+            kernels_list,
+            libtype="ck",
+            kernels_by_name=kernels_by_name,
         )
     return default_kernels_dict
 

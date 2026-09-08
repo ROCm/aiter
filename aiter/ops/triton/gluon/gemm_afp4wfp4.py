@@ -1,26 +1,16 @@
-from typing import Optional
-import functools
-import json
-
 import torch
 import triton
-import triton.language as tl
 from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
 
-import aiter.ops.triton.utils._triton.arch_info as arch_info
-from aiter.ops.triton.utils.core import AITER_TRITON_CONFIGS_PATH
-from aiter.ops.triton.utils.logger import AiterTritonLogger
+from aiter.ops.triton.utils._triton import arch_info
 from aiter.ops.triton.utils._triton.pid_preprocessing import pid_grid, remap_xcd
-import aiter.ops.triton.gluon.triton_version as tv
+from aiter.ops.triton.utils.gemm_config_utils import get_gemm_config
+from aiter.ops.triton.utils.logger import AiterTritonLogger
 
 _LOGGER = AiterTritonLogger()
 
-global _USE_GEMM_SPLITK_BF16
 _USE_GEMM_SPLITK_BF16 = False
-
-# Pre-compute version check as constexpr for use in JIT kernels
-TRITON_VERSION_GE_3_6_0 = tl.constexpr(tv.TRITON_VERSION_GE_3_6_0)
 
 
 @triton.heuristics(
@@ -151,9 +141,7 @@ def _gemm_afp4wfp4_kernel(
         vec=1, per_phase=1, max_phase=1, order=[0, 1]
     )
 
-    MFMA_INSTR_SHAPE: gl.constexpr = (
-        [32, 32, 64] if TRITON_VERSION_GE_3_6_0 else [32, 32]
-    )
+    MFMA_INSTR_SHAPE: gl.constexpr = [32, 32, 64]
     mfma_layout: gl.constexpr = gl.amd.AMDMFMALayout(
         version=4,
         instr_shape=MFMA_INSTR_SHAPE,
@@ -479,25 +467,15 @@ def _gemm_afp4wfp4_reduce_kernel(
     gl.store(c_out_ptrs, c)
 
 
-@functools.lru_cache(maxsize=1024)
 def _get_config(
     M: int,
     N: int,
     K: int,
 ):
-
-    if not hasattr(_get_config, "_config_dict"):
-        dev = arch_info.get_arch()
-        if dev != "gfx950":
-            raise ValueError(
-                "Gluon implementation is not supported on this device (requires CDNA4)."
-            )
-        fpath = f"{AITER_TRITON_CONFIGS_PATH}/gemm/gluon/{dev}-GEMM-AFP4WFP4.json"
-        with open(fpath, "r") as file:
-            config = json.load(file)
-        _get_config._config_dict = config
-
-    return _get_config._config_dict["any"]
+    if arch_info.get_arch() not in ["gfx950", "gfx1250"]:
+        raise ValueError("Gluon implementation is not supported on this device.")
+    config, _ = get_gemm_config("GEMM-AFP4WFP4", M, N, K, backend="gluon")
+    return config
 
 
 def gemm_afp4wfp4(
@@ -505,10 +483,10 @@ def gemm_afp4wfp4(
     w: torch.Tensor,
     x_scales: torch.Tensor,
     w_scales: torch.Tensor,
-    dtype: Optional[torch.dtype] = torch.bfloat16,
-    y: Optional[torch.Tensor] = None,
-    config: Optional[dict] = None,
-    skip_reduce: Optional[bool] = False,
+    dtype: torch.dtype | None = torch.bfloat16,
+    y: torch.Tensor | None = None,
+    config: dict | None = None,
+    skip_reduce: bool | None = False,
 ) -> torch.Tensor:
     """
     Computes matrix multiplication Y = X @ W^T with FP4 activations and FP4 weights.
@@ -574,7 +552,7 @@ def gemm_afp4wfp4(
     if y is None and (config["NUM_KSPLIT"] == 1 or not skip_reduce):
         y = torch.empty((M, N), dtype=dtype, device=x.device)
 
-    grid = lambda META: (  # noqa: E731
+    grid = lambda META: (
         (
             META["NUM_KSPLIT"]
             * triton.cdiv(M, META["BLOCK_SIZE_M"])

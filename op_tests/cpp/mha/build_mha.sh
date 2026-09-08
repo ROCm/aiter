@@ -31,7 +31,7 @@ echo "######## linking mha fwd"
                      $SCRIPT_DIR/benchmark_mha_fwd.cpp -o fwd.exe
 fi
 
-if [ x"$FMA_API" = x"bwd" ] || [ x"$FMA_API" = x"bwd_v3" ] || [ x"$FMA_API" = x"" ] ; then
+if [ x"$FMA_API" = x"bwd" ] || [ x"$FMA_API" = x"" ] ; then
 echo "######## linking mha bwd"
 /opt/rocm/bin/hipcc  -I$TOP_DIR/3rdparty/composable_kernel/include \
                      -I$TOP_DIR/3rdparty/composable_kernel/example/ck_tile/01_fmha/ \
@@ -42,4 +42,23 @@ echo "######## linking mha bwd"
                      --offload-arch=native \
                      -L $SCRIPT_DIR -lmha_bwd \
                      $SCRIPT_DIR/benchmark_mha_bwd.cpp -o bwd.exe
+fi
+
+if [ x"$FMA_API" = x"bwd_v3" ] ; then
+echo "######## linking mha bwd_v3 (CK-excluded host)"
+# bwd_v3 produces libmha_bwd.so with ENABLE_CK=0 (asm-only). Pair it with a
+# CK-free host so the build doesn't need to compile any CK headers (which
+# currently fail on archs like gfx1250 anyway).
+# rpath:
+#   $ORIGIN     -> find libmha_bwd.so next to the exe without LD_LIBRARY_PATH
+#   /opt/rocm/lib -> libamdhip64.so.7 lives here; avoid the user having to
+#                    prepend it to LD_LIBRARY_PATH every time
+/opt/rocm/bin/hipcc  -I$TOP_DIR/csrc/include \
+                     -std=c++20 -O3 \
+                     -DUSE_ROCM=1 \
+                     -DENABLE_CK=0 \
+                     --offload-arch=native \
+                     -L $SCRIPT_DIR -lmha_bwd \
+                     -Wl,-rpath,'$ORIGIN':/opt/rocm/lib \
+                     $SCRIPT_DIR/benchmark_mha_bwd_v3.cpp -o bwd.exe
 fi

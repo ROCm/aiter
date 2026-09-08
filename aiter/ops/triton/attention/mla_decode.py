@@ -30,6 +30,8 @@ import torch
 import triton
 import triton.language as tl
 
+from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
+
 is_hip_ = hasattr(torch.version, "hip") and torch.version.hip is not None
 
 
@@ -38,7 +40,23 @@ def tanh(x):
     return 2 * tl.sigmoid(2 * x) - 1
 
 
-@triton.jit
+_fwd_kernel_stage1_repr = make_kernel_repr(
+    "_fwd_kernel_stage1",
+    [
+        "kv_group_num",
+        "BLOCK_DMODEL",
+        "BLOCK_DPE",
+        "BLOCK_DV",
+        "BLOCK_N",
+        "NUM_KV_SPLITS",
+        "PAGE_SIZE",
+        "Lk",
+        "Lv",
+    ],
+)
+
+
+@triton.jit(repr=_fwd_kernel_stage1_repr)
 def _fwd_kernel_stage1(
     Q,
     K_Buffer,
@@ -277,7 +295,25 @@ def _decode_att_m_fwd(
     )
 
 
-@triton.jit
+_fwd_grouped_kernel_stage1_repr = make_kernel_repr(
+    "_fwd_grouped_kernel_stage1",
+    [
+        "kv_group_num",
+        "q_head_num",
+        "BLOCK_DMODEL",
+        "BLOCK_DPE",
+        "BLOCK_DV",
+        "BLOCK_N",
+        "BLOCK_H",
+        "NUM_KV_SPLITS",
+        "PAGE_SIZE",
+        "Lk",
+        "Lv",
+    ],
+)
+
+
+@triton.jit(repr=_fwd_grouped_kernel_stage1_repr)
 def _fwd_grouped_kernel_stage1(
     Q,
     K_Buffer,
@@ -316,7 +352,7 @@ def _fwd_grouped_kernel_stage1(
     cur_kv_head = cur_head_id // tl.cdiv(kv_group_num, BLOCK_H)
     split_kv_id = tl.program_id(2)
 
-    VALID_BLOCK_H: tl.constexpr = BLOCK_H if kv_group_num > BLOCK_H else kv_group_num
+    VALID_BLOCK_H: tl.constexpr = min(kv_group_num, BLOCK_H)
     cur_head = cur_head_id * VALID_BLOCK_H + tl.arange(0, BLOCK_H)
     mask_h = cur_head < (cur_head_id + 1) * VALID_BLOCK_H
     mask_h = mask_h & (cur_head < q_head_num)
@@ -543,7 +579,17 @@ def _decode_grouped_att_m_fwd(
     )
 
 
-@triton.jit
+_fwd_kernel_stage2_repr = make_kernel_repr(
+    "_fwd_kernel_stage2",
+    [
+        "NUM_KV_SPLITS",
+        "BLOCK_DV",
+        "Lv",
+    ],
+)
+
+
+@triton.jit(repr=_fwd_kernel_stage2_repr)
 def _fwd_kernel_stage2(
     Mid_O,
     o,
@@ -574,7 +620,7 @@ def _fwd_kernel_stage2(
     offs_v = cur_batch * stride_mid_ob + cur_head * stride_mid_oh + offs_d
     offs_logic = cur_batch * stride_mid_ob + cur_head * stride_mid_oh + Lv
 
-    for split_kv_id in range(0, NUM_KV_SPLITS):
+    for split_kv_id in range(NUM_KV_SPLITS):
         kv_len_per_split = tl.cdiv(cur_batch_seq_len, NUM_KV_SPLITS)
         split_kv_start = kv_len_per_split * split_kv_id
         split_kv_end = tl.minimum(split_kv_start + kv_len_per_split, cur_batch_seq_len)
@@ -646,7 +692,15 @@ def _decode_softmax_reducev_fwd(
     )
 
 
-@triton.jit
+_csr_to_dense_kernel_repr = make_kernel_repr(
+    "_csr_to_dense_kernel",
+    [
+        "BLOCK_N",
+    ],
+)
+
+
+@triton.jit(repr=_csr_to_dense_kernel_repr)
 def _csr_to_dense_kernel(
     kv_indices,
     kv_indptr,

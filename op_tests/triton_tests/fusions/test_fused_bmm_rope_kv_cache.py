@@ -1,30 +1,28 @@
-import torch
 import pytest
-
-from op_tests.test_rope import RotateStyle
-from op_tests.triton_tests.rope.test_rope import generate_rope_inputs
-from aiter.ops.triton.fusions.fused_kv_cache import (
-    fused_qk_rope_cat_and_cache_mla,
-)
-from aiter.ops.triton.utils._triton import arch_info
+import torch
 
 from aiter.ops.triton.fusions.fused_bmm_rope_kv_cache import (
     fused_fp4_bmm_rope_cat_and_cache_mla,
     fused_fp8_bmm_rope_cat_and_cache_mla,
 )
-from op_tests.triton_tests.gemm.batched.test_batched_gemm_a16wfp4 import (
-    generate_batched_gemm_a16wfp4_inputs,
-)
-from aiter.ops.triton.gemm.batched.batched_gemm_a16wfp4 import (
-    batched_gemm_a16wfp4,
-)
-
-from op_tests.triton_tests.gemm.batched.test_batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant import (
-    generate_batched_gemm_a16w8_inputs,
+from aiter.ops.triton.fusions.fused_kv_cache import (
+    fused_qk_rope_cat_and_cache_mla,
 )
 from aiter.ops.triton.gemm.batched.batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant import (
     batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant,
 )
+from aiter.ops.triton.gemm.batched.batched_gemm_a16wfp4 import (
+    batched_gemm_a16wfp4,
+)
+from aiter.ops.triton.utils._triton import arch_info
+from op_tests.test_rope import RotateStyle
+from op_tests.triton_tests.gemm.batched.test_batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant import (
+    generate_batched_gemm_a16w8_inputs,
+)
+from op_tests.triton_tests.gemm.batched.test_batched_gemm_a16wfp4 import (
+    generate_batched_gemm_a16wfp4_inputs,
+)
+from op_tests.triton_tests.rope.test_rope import generate_rope_inputs
 
 
 @pytest.mark.parametrize("T", [1, 2, 32, 2048])
@@ -54,6 +52,7 @@ def test_fused_fp4_bmm_rope_cat_and_cache_mla(
     if not arch_info.is_fp4_avail():
         pytest.skip("MXFP4 is not available on this device")
 
+    torch.manual_seed(0)
     _, w_k, _, w_k_scale, _ = generate_batched_gemm_a16wfp4_inputs(
         QH_per_KH * KH, T, D_lora, D_q_nope, dtype, layout="TN", output=False
     )
@@ -220,7 +219,7 @@ def test_fused_fp8_bmm_rope_cat_and_cache_mla(
         pytest.skip("MXFP8 is not available on this device")
 
     QH = QH_per_KH * KH
-
+    torch.manual_seed(0)
     q_nope, w_k, w_k_scale, _, _ = generate_batched_gemm_a16w8_inputs(
         QH,
         T,

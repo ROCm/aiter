@@ -1,10 +1,12 @@
-import torch
 import pytest
+import torch
+
 from aiter.ops.triton.fusions.fused_qk_concat import fused_qk_cat, fused_qk_rope_cat
-from op_tests.test_rope import ref_rope_sbhd_fwd, RotateStyle
+from op_tests.test_rope import RotateStyle, ref_rope_sbhd_fwd
 
 
 def generate_qk_inputs(B: int, QH_PER_KH: int, KH: int, D_nope: int, D_pe: int, dtype):
+    torch.manual_seed(0)
     q_nope = torch.randn((B, QH_PER_KH * KH, D_nope), dtype=dtype, device="cuda")
     q_pe = torch.randn((B, QH_PER_KH * KH, D_pe), dtype=dtype, device="cuda")
     k_nope = torch.randn((B, KH, D_nope), dtype=dtype, device="cuda")
