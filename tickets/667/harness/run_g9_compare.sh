@@ -15,11 +15,11 @@
 #     --repeats N      D5 repeats for variance (default: 3)
 #     --iters N        timed iters (default: 1000, of-record per D1)
 #     --cold N         warmup/rotation iters (default: 20)
-#     --out-prefix P   artifact path prefix (default: tickets/667/g9_compare)
+#     --out-prefix P   artifact path prefix (default: tickets/667/g9_compare; files are ${P}_${backend}.{md,csv})
 #     --                everything after is passed through to compare.py
 #
 # Examples:
-#   bash run_g9_compare.sh                      # full of-record sweep -> tickets/667/g9_compare.{md,csv}
+#   bash run_g9_compare.sh                      # full of-record sweep -> tickets/667/g9_compare_ck.{md,csv}
 #   bash run_g9_compare.sh --build-ck           # rebuild CK first, then sweep
 #   bash run_g9_compare.sh --backend ck --repeats 5 -- --shapes qwen3next --batches 1,8
 #   bash run_g9_compare.sh --validate           # D7 numerical cross-check (no perf sweep)
@@ -85,8 +85,8 @@ if [ "${VALIDATE}" -eq 1 ]; then
     exit $?
 fi
 
-MD_OUT="${OUT_PREFIX}.md"
-CSV_OUT="${OUT_PREFIX}.csv"
+MD_OUT="${OUT_PREFIX}_${BACKEND}.md"
+CSV_OUT="${OUT_PREFIX}_${BACKEND}.csv"
 
 echo "==> G9 compare: gpu=${GPU} backend=${BACKEND} repeats=${REPEATS} iters=${ITERS} cold=${COLD}"
 echo "    artifact -> ${MD_OUT} , ${CSV_OUT}"
