@@ -21,8 +21,6 @@ A8W4 path is selected by `a_dtype='fp8', b_dtype='fp4'` plus
 `gate_mode=GateMode.INTERLEAVE` + `a_scale_one=True` in stage1.
 """
 
-from contextlib import contextmanager
-
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl._mlir import ir
@@ -50,19 +48,6 @@ from .mfma_preshuffle_pipeline import (
     swizzle_xor16,
     tile_chunk_coord_i32,
 )
-
-
-@contextmanager
-def _if_then(if_op):
-    """Compat helper for SCF IfOp then-region across old/new Python APIs."""
-    with ir.InsertionPoint(if_op.then_block):
-        try:
-            yield if_op.then_block
-        finally:
-            blk = if_op.then_block
-            if (not blk.operations) or not isinstance(blk.operations[-1], scf.YieldOp):
-                scf.YieldOp([])
-
 
 _VALID_A_DTYPES = frozenset(("fp8", "fp16", "bf16", "int8", "fp4"))
 _VALID_B_DTYPES = frozenset(("fp8", "fp16", "int8", "int4", "fp4", "mxfp4"))
@@ -697,16 +682,14 @@ def compile_mixed_moe_gemm1_common(
             bx_m = bx * arith.constant(sort_block_m, index=True)
 
             bx_m_i32 = fx.Int32(bx_m)
-            blk_valid = (fx.Uint32(bx_m_i32) < fx.Uint32(num_valid_i32)).ir_value()
+            blk_valid = fx.Uint32(bx_m_i32) < fx.Uint32(num_valid_i32)
             expert_i32 = buffer_ops.buffer_load(
                 expert_rsrc, bx, vec_width=1, dtype=T.i32
             )
             expert_idx = fx.Index(expert_i32)
-            exp_valid = (fx.Uint32(expert_i32) < fx.Uint32(experts)).ir_value()
+            exp_valid = fx.Uint32(expert_i32) < fx.Uint32(experts)
             if const_expr(heterogeneous_b):
-                is_shared_expert = (
-                    fx.Int32(expert_i32) == fx.Int32(shared_expert_id)
-                ).ir_value()
+                is_shared_expert = fx.Int32(expert_i32) == fx.Int32(shared_expert_id)
 
             def moe_gemm1_body(shared_b: bool = False):
                 body_k_base_idx = k_base_idx
@@ -1783,9 +1766,9 @@ def compile_mixed_moe_gemm1_common(
                     k0_scale
                 )
                 c_tile_m_idx = arith.constant(tile_m, index=True)
-                tid_in_range = (fx.Index(tx) < fx.Index(c_tile_m_idx)).ir_value()
-                if_tid = scf.IfOp(tid_in_range)
-                with ir.InsertionPoint(if_tid.then_block):
+                tid_in_range = fx.Index(tx) < fx.Index(c_tile_m_idx)
+
+                def _tid_then():
                     tid_row = bx_m + tx
                     tid_val = buffer_ops.buffer_load(
                         sorted_rsrc, tid_row, vec_width=1, dtype=T.i32
@@ -1794,7 +1777,13 @@ def compile_mixed_moe_gemm1_common(
                         fx.Vector.from_elements([tid_val], fx.Int32),
                         lds_tid + fx.Int32(tx),
                     )
-                    scf.YieldOp([])
+
+                @flyc.jit
+                def _tid_dispatch():
+                    if tid_in_range:
+                        _tid_then()
+
+                _tid_dispatch()
 
                 acc_gate = [acc_init] * num_acc_n * m_repeat
                 acc_up = (
@@ -2347,7 +2336,7 @@ def compile_mixed_moe_gemm1_common(
                     s = fused2 >> 24
                     t_ok = fx.Uint32(t) < fx.Uint32(tokens_i32_v)
                     s_ok = fx.Uint32(s) < fx.Uint32(topk_i32_v)
-                    row_valid = (row_valid0 & (t_ok & s_ok)).ir_value()
+                    row_valid = row_valid0 & (t_ok & s_ok)
                     t_idx = fx.Index(t)
                     s_idx = fx.Index(s)
                     ts_idx = t_idx * arith.constant(topk, index=True) + s_idx
@@ -2596,11 +2585,9 @@ def compile_mixed_moe_gemm1_common(
 
                         if const_expr(need_sort):
                             col_g0_i32 = fx.Int32(col_g0)
-                            is_scale_writer = (
-                                (col_g0_i32 & c31_i32) == fx.Int32(c0_i32)
-                            ).ir_value()
-                            if_scale = scf.IfOp(is_scale_writer)
-                            with ir.InsertionPoint(if_scale.then_block):
+                            is_scale_writer = (col_g0_i32 & c31_i32) == fx.Int32(c0_i32)
+
+                            def _scale_writer_then():
                                 row_i32_s = fx.Int32(row)
                                 col_s_i32 = col_g0_i32 >> c5_i32
                                 d0 = row_i32_s >> c5_i32
@@ -2624,7 +2611,13 @@ def compile_mixed_moe_gemm1_common(
                                     byte_off,
                                     offset_is_bytes=True,
                                 )
-                                scf.YieldOp([])
+
+                            @flyc.jit
+                            def _scale_writer_dispatch():
+                                if is_scale_writer:
+                                    _scale_writer_then()
+
+                            _scale_writer_dispatch()
                     elif const_expr(is_splitk):
                         col_idx = col_g0 + arith.constant(sk_n_offset[0], index=True)
                         byte_off_col = col_idx * arith.constant(
@@ -2757,10 +2750,12 @@ def compile_mixed_moe_gemm1_common(
                                     frag=frag,
                                 )
 
-                        ifr = scf.IfOp(rp)
-                        with ir.InsertionPoint(ifr.then_block):
-                            fused_read()
-                            scf.YieldOp([])
+                        @flyc.jit
+                        def _fused_read_dispatch(fused_read=fused_read, rp=rp):
+                            if rp:
+                                fused_read()
+
+                        _fused_read_dispatch()
                 elif const_expr(gate_up_interleave and not is_splitk):
                     gui_eff_n = gui_out_n
                     gui_tile_n = tile_n // 2
@@ -2886,22 +2881,18 @@ def compile_mixed_moe_gemm1_common(
                         lds_out_split=lds_out_B,
                     )
 
-            if_blk = scf.IfOp(blk_valid)
-            with ir.InsertionPoint(if_blk.then_block):
-                ifexpert_of = scf.IfOp(exp_valid)
-                with ir.InsertionPoint(ifexpert_of.then_block):
+            @flyc.jit
+            def _gemm1_dispatch():
+                if blk_valid and exp_valid:
                     if const_expr(heterogeneous_b):
-                        format_if = scf.IfOp(is_shared_expert, has_else=True)
-                        with ir.InsertionPoint(format_if.then_block):
+                        if is_shared_expert:
                             moe_gemm1_body(shared_b=True)
-                            scf.YieldOp([])
-                        with ir.InsertionPoint(format_if.else_block):
+                        else:
                             moe_gemm1_body(shared_b=False)
-                            scf.YieldOp([])
                     else:
                         moe_gemm1_body()
-                    scf.YieldOp([])
-                scf.YieldOp([])
+
+            _gemm1_dispatch()
 
             gpu.barrier()
             scf.YieldOp([])
@@ -4610,7 +4601,7 @@ def compile_mixed_moe_gemm2_common(
                     row_stride_bytes_pre <= 16384
                 )
                 c_tile_m_idx = arith.constant(tile_m, index=True)
-                tid_in_range = (fx.Index(tx) < fx.Index(c_tile_m_idx)).ir_value()
+                tid_in_range = fx.Index(tx) < fx.Index(c_tile_m_idx)
                 r216_defer_tid = bool(
                     r139_xdma_first
                     and use_async_copy
@@ -4620,8 +4611,7 @@ def compile_mixed_moe_gemm2_common(
                 )
 
                 def emit_tid_lds_prologue():
-                    if_tid = scf.IfOp(tid_in_range)
-                    with ir.InsertionPoint(if_tid.then_block):
+                    def _tid_then():
                         tid_row = bx_m + tx
                         tid_val = buffer_ops.buffer_load(
                             sorted_rsrc, tid_row, vec_width=1, dtype=T.i32
@@ -4656,7 +4646,13 @@ def compile_mixed_moe_gemm2_common(
                                 fx.Vector.from_elements([tw_val_m], fx.Float32),
                                 lds_tw + fx.Int32(tx),
                             )
-                        scf.YieldOp([])
+
+                    @flyc.jit
+                    def _tid_dispatch():
+                        if tid_in_range:
+                            _tid_then()
+
+                    _tid_dispatch()
 
                 if const_expr(not r216_defer_tid):
                     emit_tid_lds_prologue()
@@ -5154,8 +5150,8 @@ def compile_mixed_moe_gemm2_common(
 
             def emit_moe_gemm2_body():
                 if const_expr(heterogeneous_b):
-                    format_if = scf.IfOp(is_shared_expert, has_else=True)
-                    with ir.InsertionPoint(format_if.then_block):
+
+                    def _fmt_then():
                         if const_expr(serial_shared_n):
                             moe_gemm2_then_body(shared_b=True, shared_n_half=0)
                             rocdl.s_waitcnt(0)
@@ -5163,28 +5159,39 @@ def compile_mixed_moe_gemm2_common(
                             moe_gemm2_then_body(shared_b=True, shared_n_half=1)
                         else:
                             moe_gemm2_then_body(shared_b=True)
-                        scf.YieldOp([])
-                    with ir.InsertionPoint(format_if.else_block):
-                        moe_gemm2_then_body(shared_b=False)
-                        scf.YieldOp([])
+
+                    @flyc.jit
+                    def _fmt_dispatch():
+                        if fx.Boolean(is_shared_expert):
+                            _fmt_then()
+                        else:
+                            moe_gemm2_then_body(shared_b=False)
+
+                    _fmt_dispatch()
                 else:
                     moe_gemm2_then_body()
 
             if const_expr(persistent):
                 cur_active = arith.andi(still_active, blk_valid)
                 do_gemm = arith.andi(cur_active, arith.andi(exp_valid, tile_has_tokens))
-                if_valid = scf.IfOp(do_gemm)
-                with ir.InsertionPoint(if_valid.then_block):
-                    emit_moe_gemm2_body()
-                    scf.YieldOp([])
+
+                @flyc.jit
+                def _gemm2_valid_dispatch():
+                    if fx.Boolean(do_gemm):
+                        emit_moe_gemm2_body()
+
+                _gemm2_valid_dispatch()
 
                 gpu.barrier()
                 scf.YieldOp([cur_active])
             else:
-                if_valid = scf.IfOp(all_valid)
-                with ir.InsertionPoint(if_valid.then_block):
-                    emit_moe_gemm2_body()
-                    scf.YieldOp([])
+
+                @flyc.jit
+                def _gemm2_valid_dispatch():
+                    if fx.Boolean(all_valid):
+                        emit_moe_gemm2_body()
+
+                _gemm2_valid_dispatch()
 
                 gpu.barrier()
                 scf.YieldOp([expert_i32, expert_b_base])
