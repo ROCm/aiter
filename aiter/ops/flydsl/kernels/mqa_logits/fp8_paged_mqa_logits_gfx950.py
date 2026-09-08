@@ -95,9 +95,7 @@ def load_q_pack(q_i32, byte_base, lane_div_16):
     return _concat_i32x4(lo, hi)
 
 
-def load_preshuffled_k_pack(
-    kv_i32, physical, tile_in_page, lane_mod_16, lane_div_16
-):
+def load_preshuffled_k_pack(kv_i32, physical, tile_in_page, lane_mod_16, lane_div_16):
     """Load a shuffle_weight(16,16) K column as an i32x8 MFMA operand."""
     base = (
         physical * BLOCK_I32
@@ -223,9 +221,7 @@ def _build_kernel(*, num_heads: int, next_n: int):
         lane_mod_16 = umod(lane, MFMA_N)
         lane_div_16 = udiv(lane, MFMA_N)
         mma = fx.make_mma_atom(
-            fx.rocdl.cdna4.MFMA_Scale(
-                MFMA_M, MFMA_N, HEAD_DIM, fx.Float8E4M3FN
-            )
+            fx.rocdl.cdna4.MFMA_Scale(MFMA_M, MFMA_N, HEAD_DIM, fx.Float8E4M3FN)
         )
 
         q_i32 = GTensor(Q, dtype=T.i32, shape=(-1,))
@@ -253,8 +249,7 @@ def _build_kernel(*, num_heads: int, next_n: int):
             [None for _ in range_constexpr(m_tiles)] for _ in range_constexpr(n_rows)
         ]
         w_rows = [
-            [None for _ in range_constexpr(m_tiles)]
-            for _ in range_constexpr(n_rows)
+            [None for _ in range_constexpr(m_tiles)] for _ in range_constexpr(n_rows)
         ]
         for row in range_constexpr(n_rows):
             q_row = fx.Int32(row)
@@ -313,9 +308,7 @@ def _build_kernel(*, num_heads: int, next_n: int):
             for slot in range_constexpr(B_RING):
                 b_bank[slot].store(b_slots[slot])
                 scale_bank[slot].store(
-                    fx.Vector.from_elements(
-                        [scale_slots[slot].ir_value()], fx.Float32
-                    )
+                    fx.Vector.from_elements([scale_slots[slot].ir_value()], fx.Float32)
                 )
 
         def _load_page_bank(bank):
@@ -359,9 +352,7 @@ def _build_kernel(*, num_heads: int, next_n: int):
             ]
             for slot in range_constexpr(B_RING):
                 scores = [
-                    mfma_scores(
-                        mma, a_rows[row], b_slots[slot], m_tiles=m_tiles
-                    )
+                    mfma_scores(mma, a_rows[row], b_slots[slot], m_tiles=m_tiles)
                     for row in range_constexpr(n_rows)
                 ]
                 if slot > 0:

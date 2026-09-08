@@ -101,12 +101,8 @@ def test_gfx950_wide_output_no_tail_drop():
     """Row 512 crosses the signed i32 byte-offset boundary at this stride."""
     batch = 513
     inp, kv_cache, _ = _inputs(32, next_n=1, kv_len=KV_BLOCK_SIZE, batch=batch)
-    compact = torch.full(
-        (batch, inp.max_model_len), float("-inf"), dtype=torch.float32
-    )
-    wide = torch.full(
-        (batch, WIDE_MAX_MODEL_LEN), float("-inf"), dtype=torch.float32
-    )
+    compact = torch.full((batch, inp.max_model_len), float("-inf"), dtype=torch.float32)
+    wide = torch.full((batch, WIDE_MAX_MODEL_LEN), float("-inf"), dtype=torch.float32)
 
     with torch.inference_mode():
         flydsl_fp8_paged_mqa_logits(

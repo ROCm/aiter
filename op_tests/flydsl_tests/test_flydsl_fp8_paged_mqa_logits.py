@@ -630,9 +630,14 @@ def main():
     args = parser.parse_args()
 
     if args.profile:
-        if args.kv_block_size != 64 or args.heads not in (32, 64) or args.next_n not in (
-            1,
-            2,
+        if (
+            args.kv_block_size != 64
+            or args.heads not in (32, 64)
+            or args.next_n
+            not in (
+                1,
+                2,
+            )
         ):
             raise SystemExit("kernel supports H in {32,64}, next_n in {1,2}, KVB=64")
         run_profile(args)
