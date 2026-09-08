@@ -6,7 +6,6 @@ import torch
 
 import aiter
 from aiter.jit.utils.chip_info import get_gfx
-from aiter.ops.flydsl.utils import is_flydsl_available
 from aiter.test_common import benchmark, perftest
 
 
@@ -510,7 +509,7 @@ aiter.logger.info("topk_per_row_prefill summary (markdown):\n%s", df_md)
 
 
 df = []
-flydsl_available = get_gfx() in ("gfx942", "gfx950") and is_flydsl_available()
+flydsl_available = get_gfx() in ("gfx942", "gfx950")
 for data_generation in args.data_generation:
     for m in args.decode_batch_size:
         for ctx in args.context_len:
