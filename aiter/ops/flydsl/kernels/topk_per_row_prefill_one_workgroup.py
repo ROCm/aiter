@@ -19,6 +19,7 @@ from .topk_per_row_decode import _load_f32x4, _warp_inclusive_prefix_i32
 _WAVE_SIZE = 32
 _VEC = 4
 _LOAD_UNROLL = 4
+_PASS1_HISTOGRAM_STAGES = 2
 _KEY_BITS = 32
 _LONG_RADIX_BITS = (12, 10, 10)
 _SHORT_RADIX_BITS = (11, 10, 11)
@@ -52,6 +53,8 @@ _RUNNING_EQUAL = 7
 _CANDIDATE_COUNT = 8
 _SELECTED_BUCKET_COUNT = 9
 _METADATA_SIZE = _SELECTED_BUCKET_COUNT + 1
+_ABOVE_SLOTS = (_FIRST_ABOVE, _SECOND_ABOVE, _THIRD_ABOVE)
+_THRESHOLD_SLOTS = (_FIRST_THRESHOLD, _SECOND_THRESHOLD, _THIRD_THRESHOLD)
 _PACKED_COUNT_BITS = 16
 _PACKED_COUNT_MASK = (1 << _PACKED_COUNT_BITS) - 1
 
@@ -111,8 +114,9 @@ def build_topk_per_row_prefill_one_workgroup_module(
 
     @fx.struct
     class LongPass1Storage:
-        histogram_ping: fx.Array[fx.Int32, _HIGH_BUCKETS, 16]
-        histogram_pong: fx.Array[fx.Int32, _HIGH_BUCKETS, 16]
+        histograms: fx.Array[
+            fx.Int32, _PASS1_HISTOGRAM_STAGES * _HIGH_BUCKETS, 16
+        ]
 
     @fx.struct
     class LongLaterStorage:
@@ -124,8 +128,11 @@ def build_topk_per_row_prefill_one_workgroup_module(
 
     @fx.struct
     class ShortPass1Storage:
-        histogram_ping: fx.Array[fx.Int32, _SHORT_HIGH_BUCKETS, 16]
-        histogram_pong: fx.Array[fx.Int32, _SHORT_HIGH_BUCKETS, 16]
+        histograms: fx.Array[
+            fx.Int32,
+            _PASS1_HISTOGRAM_STAGES * _SHORT_HIGH_BUCKETS,
+            16,
+        ]
         full_keys: fx.Array[fx.Int32, _COMPACT_CAPACITY, 16]
 
     @fx.union
@@ -213,11 +220,15 @@ def build_topk_per_row_prefill_one_workgroup_module(
         storage = fx.SharedAllocator().allocate(SharedStorage)
 
         # Long-row arena
-        long_histogram_ping = storage.arena.long_pass1.histogram_ping.peek().view(
-            fx.make_layout(_HIGH_BUCKETS, 1)
+        long_histogram_matrix = storage.arena.long_pass1.histograms.peek().view(
+            fx.make_layout(
+                (_PASS1_HISTOGRAM_STAGES, _HIGH_BUCKETS),
+                (_HIGH_BUCKETS, 1),
+            )
         )
-        long_histogram_pong = storage.arena.long_pass1.histogram_pong.peek().view(
-            fx.make_layout(_HIGH_BUCKETS, 1)
+        long_histograms = (
+            fx.slice(long_histogram_matrix, (0, None)),
+            fx.slice(long_histogram_matrix, (1, None)),
         )
         histogram = storage.arena.long_later.histogram.peek().view(
             fx.make_layout(_LATER_BUCKETS, 1)
@@ -240,15 +251,15 @@ def build_topk_per_row_prefill_one_workgroup_module(
         )
 
         # Short-row arena
-        short_histogram_ping = (
-            storage.arena.short_pass1.histogram_ping.peek().view(
-                fx.make_layout(_SHORT_HIGH_BUCKETS, 1)
+        short_histogram_matrix = storage.arena.short_pass1.histograms.peek().view(
+            fx.make_layout(
+                (_PASS1_HISTOGRAM_STAGES, _SHORT_HIGH_BUCKETS),
+                (_SHORT_HIGH_BUCKETS, 1),
             )
         )
-        short_histogram_pong = (
-            storage.arena.short_pass1.histogram_pong.peek().view(
-                fx.make_layout(_SHORT_HIGH_BUCKETS, 1)
-            )
+        short_histograms = (
+            fx.slice(short_histogram_matrix, (0, None)),
+            fx.slice(short_histogram_matrix, (1, None)),
         )
         full_keys = storage.arena.short_pass1.full_keys.peek().view(
             fx.make_layout(_COMPACT_CAPACITY, 1)
@@ -397,20 +408,20 @@ def build_topk_per_row_prefill_one_workgroup_module(
 
         # Histogram and workgroup scan primitives
 
-        def clear_histograms(histogram_ping, histogram_pong, bins_per_thread):
+        def clear_histograms(histograms, bins_per_thread):
             for item in range_constexpr(bins_per_thread):
                 pos = tid + item * block_threads
-                histogram_ping[pos] = zero
-                if const_expr(histogram_pong is not None):
-                    histogram_pong[pos] = zero
+                for stage in range_constexpr(len(histograms)):
+                    histograms[stage][pos] = zero
             gpu.barrier()
 
-        def merge_histograms(
-            histogram_ping, histogram_pong, bins_per_thread
-        ):
+        def merge_histograms(histograms, bins_per_thread):
             for item in range_constexpr(bins_per_thread):
                 pos = tid + item * block_threads
-                histogram_ping[pos] = histogram_ping[pos] + histogram_pong[pos]
+                merged = histograms[0][pos]
+                for stage in range_constexpr(1, len(histograms)):
+                    merged = merged + histograms[stage][pos]
+                histograms[0][pos] = merged
             gpu.barrier()
 
         def block_exclusive_scan_pair(first, second, scan, metadata):
@@ -577,24 +588,38 @@ def build_topk_per_row_prefill_one_workgroup_module(
                         body(col, values[item])
 
         # Radix histogram passes
-        def pass1_one(
+        def accumulate_histogram_bucket(
             col,
-            value,
+            key,
             shift,
             mask,
-            histogram_ping,
-            histogram_pong,
+            histograms,
+            match_prefix=False,
+            prefix_threshold=None,
+            use_ping_pong=False,
             full_keys=None,
         ):
-            if col < row_len:
-                key = ordered_key(value)
-                if const_expr(full_keys is not None):
+            active = col < row_len
+            if full_keys is not None:
+                if active:
                     full_keys[col] = key
+            if match_prefix:
+                prefix_shift = shift + mask.bit_length()
+                prefix_mask = (1 << (_KEY_BITS - prefix_shift)) - 1
+                active = active & (
+                    radix_bucket(key, prefix_shift, prefix_mask)
+                    == prefix_threshold
+                )
+            if active:
                 bucket = radix_bucket(key, shift, mask)
-                if (wave & one) == zero:
-                    atomic_add_i32(histogram_ping, one, bucket, "workgroup")
+                if not use_ping_pong or (wave & one) == zero:
+                    atomic_add_i32(
+                        histograms[0], one, bucket, "workgroup"
+                    )
                 else:
-                    atomic_add_i32(histogram_pong, one, bucket, "workgroup")
+                    atomic_add_i32(
+                        histograms[1], one, bucket, "workgroup"
+                    )
 
         def pass2_key(
             col,
@@ -622,13 +647,12 @@ def build_topk_per_row_prefill_one_workgroup_module(
                     else:
                         store_key_result(out_pos, col, key, row_indices, row_values)
             elif first == first_threshold:
-                atomic_add_i32(
-                    histogram,
-                    one,
-                    radix_bucket(
-                        key, _LONG_RADIX_SHIFTS[1], _LONG_RADIX_MASKS[1]
-                    ),
-                    "workgroup",
+                accumulate_histogram_bucket(
+                    col,
+                    key,
+                    _LONG_RADIX_SHIFTS[1],
+                    _LONG_RADIX_MASKS[1],
+                    (histogram,),
                 )
                 candidate_pos = atomic_add_i32(
                     metadata,
@@ -639,106 +663,6 @@ def build_topk_per_row_prefill_one_workgroup_module(
                 if candidate_pos < fx.Int32(_COMPACT_CAPACITY):
                     candidate_keys[candidate_pos] = key
                     candidate_indices[candidate_pos] = col
-
-        def pass2_cached_key(
-            key,
-            first_threshold,
-            histogram,
-        ):
-            first = radix_bucket(
-                key, _SHORT_RADIX_SHIFTS[0], _SHORT_RADIX_MASKS[0]
-            )
-            if first == first_threshold:
-                atomic_add_i32(
-                    histogram,
-                    one,
-                    radix_bucket(
-                        key, _SHORT_RADIX_SHIFTS[1], _SHORT_RADIX_MASKS[1]
-                    ),
-                    "workgroup",
-                )
-
-        def pass2_one(
-            col,
-            value,
-            first_threshold,
-            histogram,
-            metadata,
-            candidate_keys,
-            candidate_indices,
-            stable_keys,
-            stable_indices,
-            row_indices,
-            row_values,
-        ):
-            if col < row_len:
-                pass2_key(
-                    col,
-                    ordered_key(value),
-                    first_threshold,
-                    histogram,
-                    metadata,
-                    candidate_keys,
-                    candidate_indices,
-                    stable_keys,
-                    stable_indices,
-                    row_indices,
-                    row_values,
-                )
-
-        def pass3_one(
-            col,
-            value,
-            first_threshold,
-            second_threshold,
-        ):
-            if col < row_len:
-                key = ordered_key(value)
-                if (
-                    radix_bucket(
-                        key, _LONG_RADIX_SHIFTS[0], _LONG_RADIX_MASKS[0]
-                    )
-                    == first_threshold
-                ) & (
-                    radix_bucket(
-                        key, _LONG_RADIX_SHIFTS[1], _LONG_RADIX_MASKS[1]
-                    )
-                    == second_threshold
-                ):
-                    atomic_add_i32(
-                        histogram,
-                        one,
-                        radix_bucket(
-                            key, _LONG_RADIX_SHIFTS[2], _LONG_RADIX_MASKS[2]
-                        ),
-                        "workgroup",
-                    )
-
-        def pass3_cached_key(
-            key,
-            first_threshold,
-            second_threshold,
-            histogram,
-        ):
-            if (
-                radix_bucket(
-                    key, _SHORT_RADIX_SHIFTS[0], _SHORT_RADIX_MASKS[0]
-                )
-                == first_threshold
-            ) & (
-                radix_bucket(
-                    key, _SHORT_RADIX_SHIFTS[1], _SHORT_RADIX_MASKS[1]
-                )
-                == second_threshold
-            ):
-                atomic_add_i32(
-                    histogram,
-                    one,
-                    radix_bucket(
-                        key, _SHORT_RADIX_SHIFTS[2], _SHORT_RADIX_MASKS[2]
-                    ),
-                    "workgroup",
-                )
 
         def compact_pass3(
             candidate_count,
@@ -1380,246 +1304,58 @@ def build_topk_per_row_prefill_one_workgroup_module(
                         metadata,
                     )
 
-        def finish_lds_selection(
+        def scatter_streaming_unstable(
+            candidate_count,
             first_threshold,
-            need_after_first,
-            histogram,
-            scan,
-            metadata,
+            second_threshold,
+            third_threshold,
+            num_needed,
             row_indices,
             row_values,
-        ):
-            choose_threshold(
-                need_after_first,
-                _SECOND_ABOVE,
-                _SECOND_THRESHOLD,
-                _SELECTED_BUCKET_COUNT,
-                histogram,
-                scan,
-                metadata,
-                short_bins_per_thread,
-            )
-            second_threshold = metadata[_SECOND_THRESHOLD]
-            need_after_second = need_after_first - metadata[_SECOND_ABOVE]
-            if metadata[_SELECTED_BUCKET_COUNT] == need_after_second:
-                scatter_lds_selection(
-                    first_threshold,
-                    second_threshold,
-                    zero,
-                    need_after_second,
-                    2,
-                    row_indices,
-                    row_values,
-                    scan,
-                    metadata,
-                )
-            else:
-                clear_histograms(histogram, None, short_bins_per_thread)
-                scan_lds_keys(
-                    lambda _, key: pass3_cached_key(
-                        key,
-                        first_threshold,
-                        second_threshold,
-                        histogram,
-                    )
-                )
-                gpu.barrier()
-                choose_threshold(
-                    need_after_second,
-                    _THIRD_ABOVE,
-                    _THIRD_THRESHOLD,
-                    _SELECTED_BUCKET_COUNT,
-                    histogram,
-                    scan,
-                    metadata,
-                    short_bins_per_thread,
-                )
-                scatter_lds_selection(
-                    first_threshold,
-                    second_threshold,
-                    metadata[_THIRD_THRESHOLD],
-                    need_after_second - metadata[_THIRD_ABOVE],
-                    3,
-                    row_indices,
-                    row_values,
-                    scan,
-                    metadata,
-                )
-
-        def finish_candidate_unstable(
-            first_threshold,
-            need_after_first,
-            candidate_count,
-            histogram,
-            scan,
             metadata,
             candidate_keys,
             candidate_indices,
-            row_indices,
-            row_values,
         ):
-            can_finish_after_first = (
-                candidate_count <= fx.Int32(_COMPACT_CAPACITY)
-            ) & (
-                metadata[_SELECTED_BUCKET_COUNT] == need_after_first
-            )
-            if can_finish_after_first:
-                scatter_candidates_after_first(
+            if candidate_count <= fx.Int32(_COMPACT_CAPACITY):
+                scatter_candidates_unstable(
                     candidate_count,
+                    first_threshold,
+                    second_threshold,
+                    third_threshold,
+                    num_needed,
+                    3,
                     row_indices,
                     row_values,
+                    metadata,
                     candidate_keys,
                     candidate_indices,
                 )
             else:
-                choose_threshold(
-                    need_after_first,
-                    _SECOND_ABOVE,
-                    _SECOND_THRESHOLD,
-                    _SELECTED_BUCKET_COUNT,
-                    histogram,
-                    scan,
+                scatter_gm_unstable(
+                    first_threshold,
+                    second_threshold,
+                    third_threshold,
+                    num_needed,
+                    row_indices,
+                    row_values,
                     metadata,
-                    later_bins_per_thread,
                 )
-                second_threshold = metadata[_SECOND_THRESHOLD]
-                need_after_second = need_after_first - metadata[_SECOND_ABOVE]
-                can_finish_after_second = (
-                    candidate_count <= fx.Int32(_COMPACT_CAPACITY)
-                ) & (
-                    metadata[_SELECTED_BUCKET_COUNT]
-                    == need_after_second
-                )
-                if can_finish_after_second:
-                    scatter_candidates_unstable(
-                        candidate_count,
-                        first_threshold,
-                        second_threshold,
-                        zero,
-                        need_after_second,
-                        2,
-                        row_indices,
-                        row_values,
-                        metadata,
-                        candidate_keys,
-                        candidate_indices,
-                    )
-                else:
-                    clear_histograms(histogram, None, later_bins_per_thread)
-                    if candidate_count <= fx.Int32(
-                        _COMPACT_CAPACITY
-                    ):
-                        compact_pass3(
-                            candidate_count,
-                            second_threshold,
-                            histogram,
-                            candidate_keys,
-                        )
-                    else:
-                        scan_gm_row(
-                            lambda col, value: pass3_one(
-                                col,
-                                value,
-                                first_threshold,
-                                second_threshold,
-                            ),
-                        )
-                    gpu.barrier()
-                    choose_threshold(
-                        need_after_second,
-                        _THIRD_ABOVE,
-                        _THIRD_THRESHOLD,
-                        _SELECTED_BUCKET_COUNT,
-                        histogram,
-                        scan,
-                        metadata,
-                        later_bins_per_thread,
-                    )
-                    third_threshold = metadata[_THIRD_THRESHOLD]
-                    num_needed = need_after_second - metadata[_THIRD_ABOVE]
-                    if candidate_count <= fx.Int32(
-                        _COMPACT_CAPACITY
-                    ):
-                        scatter_candidates_unstable(
-                            candidate_count,
-                            first_threshold,
-                            second_threshold,
-                            third_threshold,
-                            num_needed,
-                            3,
-                            row_indices,
-                            row_values,
-                            metadata,
-                            candidate_keys,
-                            candidate_indices,
-                        )
-                    else:
-                        scatter_gm_unstable(
-                            first_threshold,
-                            second_threshold,
-                            third_threshold,
-                            num_needed,
-                            row_indices,
-                            row_values,
-                            metadata,
-                        )
 
-        def finish_candidate_stable(
-            first_threshold,
-            need_after_first,
+        def scatter_streaming_stable(
             candidate_count,
-            histogram,
+            first_threshold,
+            second_threshold,
+            third_threshold,
+            num_needed,
+            row_indices,
+            row_values,
             scan,
             metadata,
             candidate_keys,
             candidate_indices,
             stable_keys,
             stable_indices,
-            row_indices,
-            row_values,
         ):
-            choose_threshold(
-                need_after_first,
-                _SECOND_ABOVE,
-                _SECOND_THRESHOLD,
-                _SELECTED_BUCKET_COUNT,
-                histogram,
-                scan,
-                metadata,
-                later_bins_per_thread,
-            )
-            second_threshold = metadata[_SECOND_THRESHOLD]
-            need_after_second = need_after_first - metadata[_SECOND_ABOVE]
-            clear_histograms(histogram, None, later_bins_per_thread)
-            if candidate_count <= fx.Int32(_COMPACT_CAPACITY):
-                compact_pass3(
-                    candidate_count,
-                    second_threshold,
-                    histogram,
-                    candidate_keys,
-                )
-            else:
-                scan_gm_row(
-                    lambda col, value: pass3_one(
-                        col,
-                        value,
-                        first_threshold,
-                        second_threshold,
-                    ),
-                )
-            gpu.barrier()
-            choose_threshold(
-                need_after_second,
-                _THIRD_ABOVE,
-                _THIRD_THRESHOLD,
-                _SELECTED_BUCKET_COUNT,
-                histogram,
-                scan,
-                metadata,
-                later_bins_per_thread,
-            )
-            third_threshold = metadata[_THIRD_THRESHOLD]
-            num_needed = need_after_second - metadata[_THIRD_ABOVE]
             if metadata[_SELECTED_BUCKET_COUNT] == row_len:
                 scatter_equal_row(
                     threshold_key(
@@ -1693,88 +1429,87 @@ def build_topk_per_row_prefill_one_workgroup_module(
                     )
 
         def run_cached_path(
-            histogram_ping,
-            histogram_pong,
+            histograms,
             full_keys,
             row_indices,
             row_values,
             scan,
             metadata,
         ):
-            clear_histograms(
-                histogram_ping,
-                histogram_pong,
-                short_bins_per_thread,
-            )
-            scan_gm_row(
-                lambda col, value: pass1_one(
-                    col,
-                    value,
-                    _SHORT_RADIX_SHIFTS[0],
-                    _SHORT_RADIX_MASKS[0],
-                    histogram_ping,
-                    histogram_pong,
-                    full_keys,
-                ),
-            )
-            gpu.barrier()
-            merge_histograms(
-                histogram_ping,
-                histogram_pong,
-                short_bins_per_thread,
-            )
-            choose_threshold(
-                top_k,
-                _FIRST_ABOVE,
-                _FIRST_THRESHOLD,
-                _SELECTED_BUCKET_COUNT,
-                histogram_ping,
-                scan,
-                metadata,
-                short_bins_per_thread,
-            )
-
-            first_threshold = metadata[_FIRST_THRESHOLD]
-            need_after_first = top_k - metadata[_FIRST_ABOVE]
-            if metadata[_SELECTED_BUCKET_COUNT] == need_after_first:
-                scatter_lds_selection(
-                    first_threshold,
-                    zero,
-                    zero,
-                    need_after_first,
-                    1,
-                    row_indices,
-                    row_values,
+            thresholds = [zero, zero, zero]
+            prefix_threshold = zero
+            remaining_k = top_k
+            for level in range_constexpr(3):
+                active_histograms = (
+                    histograms if level == 0 else (histograms[0],)
+                )
+                clear_histograms(active_histograms, short_bins_per_thread)
+                if level == 0:
+                    scan_gm_row(
+                        lambda col, value: accumulate_histogram_bucket(
+                            col,
+                            ordered_key(value),
+                            _SHORT_RADIX_SHIFTS[0],
+                            _SHORT_RADIX_MASKS[0],
+                            histograms,
+                            use_ping_pong=True,
+                            full_keys=full_keys,
+                        ),
+                    )
+                else:
+                    scan_lds_keys(
+                        lambda col, key: accumulate_histogram_bucket(
+                            col,
+                            key,
+                            _SHORT_RADIX_SHIFTS[level],
+                            _SHORT_RADIX_MASKS[level],
+                            (histograms[0],),
+                            match_prefix=True,
+                            prefix_threshold=prefix_threshold,
+                        )
+                    )
+                gpu.barrier()
+                if level == 0:
+                    merge_histograms(histograms, short_bins_per_thread)
+                choose_threshold(
+                    remaining_k,
+                    _ABOVE_SLOTS[level],
+                    _THRESHOLD_SLOTS[level],
+                    _SELECTED_BUCKET_COUNT,
+                    histograms[0],
                     scan,
                     metadata,
-                )
-            else:
-                clear_histograms(
-                    histogram_ping,
-                    None,
                     short_bins_per_thread,
                 )
-                scan_lds_keys(
-                    lambda _, key: pass2_cached_key(
-                        key,
-                        first_threshold,
-                        histogram_ping,
+
+                thresholds[level] = metadata[_THRESHOLD_SLOTS[level]]
+                remaining_k = remaining_k - metadata[_ABOVE_SLOTS[level]]
+                if level < 2:
+                    prefix_threshold = (
+                        prefix_threshold
+                        << fx.Int32(_SHORT_RADIX_BITS[level])
+                    ) | thresholds[level]
+                can_finish = (
+                    True
+                    if level == 2
+                    else metadata[_SELECTED_BUCKET_COUNT] == remaining_k
+                )
+                if can_finish:
+                    scatter_lds_selection(
+                        thresholds[0],
+                        thresholds[1],
+                        thresholds[2],
+                        remaining_k,
+                        level + 1,
+                        row_indices,
+                        row_values,
+                        scan,
+                        metadata,
                     )
-                )
-                gpu.barrier()
-                finish_lds_selection(
-                    first_threshold,
-                    need_after_first,
-                    histogram_ping,
-                    scan,
-                    metadata,
-                    row_indices,
-                    row_values,
-                )
+                    return
 
         def run_streaming_path(
-            histogram_ping,
-            histogram_pong,
+            histograms,
             histogram,
             candidate_keys,
             candidate_indices,
@@ -1785,86 +1520,160 @@ def build_topk_per_row_prefill_one_workgroup_module(
             scan,
             metadata,
         ):
-            clear_histograms(
-                histogram_ping,
-                histogram_pong,
-                high_bins_per_thread,
-            )
-            scan_gm_row(
-                lambda col, value: pass1_one(
-                    col,
-                    value,
-                    _LONG_RADIX_SHIFTS[0],
-                    _LONG_RADIX_MASKS[0],
-                    histogram_ping,
-                    histogram_pong,
-                ),
-            )
-            gpu.barrier()
-            merge_histograms(
-                histogram_ping,
-                histogram_pong,
-                high_bins_per_thread,
-            )
-            choose_threshold(
-                top_k,
-                _FIRST_ABOVE,
-                _FIRST_THRESHOLD,
-                _SELECTED_BUCKET_COUNT,
-                histogram_ping,
-                scan,
-                metadata,
-                high_bins_per_thread,
-            )
+            thresholds = [zero, zero, zero]
+            prefix_threshold = zero
+            remaining_k = top_k
+            candidate_count = zero
+            for level in range_constexpr(3):
+                active_histograms = (
+                    histograms if level == 0 else (histogram,)
+                )
+                bins_per_thread = (
+                    high_bins_per_thread
+                    if level == 0
+                    else later_bins_per_thread
+                )
+                clear_histograms(active_histograms, bins_per_thread)
+                if level == 0:
+                    scan_gm_row(
+                        lambda col, value: accumulate_histogram_bucket(
+                            col,
+                            ordered_key(value),
+                            _LONG_RADIX_SHIFTS[0],
+                            _LONG_RADIX_MASKS[0],
+                            histograms,
+                            use_ping_pong=True,
+                        ),
+                    )
+                elif level == 1:
+                    scan_gm_row(
+                        lambda col, value: pass2_key(
+                            col,
+                            ordered_key(value),
+                            thresholds[0],
+                            histogram,
+                            metadata,
+                            candidate_keys,
+                            candidate_indices,
+                            stable_keys,
+                            stable_indices,
+                            row_indices,
+                            row_values,
+                        ),
+                        reverse=True,
+                    )
+                else:
+                    if candidate_count <= fx.Int32(_COMPACT_CAPACITY):
+                        compact_pass3(
+                            candidate_count,
+                            thresholds[1],
+                            histogram,
+                            candidate_keys,
+                        )
+                    else:
+                        scan_gm_row(
+                            lambda col, value: accumulate_histogram_bucket(
+                                col,
+                                ordered_key(value),
+                                _LONG_RADIX_SHIFTS[2],
+                                _LONG_RADIX_MASKS[2],
+                                (histogram,),
+                                match_prefix=True,
+                                prefix_threshold=prefix_threshold,
+                            ),
+                        )
+                gpu.barrier()
+                if level == 0:
+                    merge_histograms(histograms, bins_per_thread)
+                elif level == 1:
+                    candidate_count = metadata[_CANDIDATE_COUNT]
+                    if const_expr(not stable):
+                        can_finish = (
+                            candidate_count <= fx.Int32(_COMPACT_CAPACITY)
+                        ) & (
+                            metadata[_SELECTED_BUCKET_COUNT]
+                            == remaining_k
+                        )
+                        if can_finish:
+                            scatter_candidates_after_first(
+                                candidate_count,
+                                row_indices,
+                                row_values,
+                                candidate_keys,
+                                candidate_indices,
+                            )
+                            return
 
-            first_threshold = metadata[_FIRST_THRESHOLD]
-            need_after_first = top_k - metadata[_FIRST_ABOVE]
-            clear_histograms(histogram, None, later_bins_per_thread)
-            scan_gm_row(
-                lambda col, value: pass2_one(
-                    col,
-                    value,
-                    first_threshold,
-                    histogram,
+                choose_threshold(
+                    remaining_k,
+                    _ABOVE_SLOTS[level],
+                    _THRESHOLD_SLOTS[level],
+                    _SELECTED_BUCKET_COUNT,
+                    active_histograms[0],
+                    scan,
                     metadata,
-                    candidate_keys,
-                    candidate_indices,
-                    stable_keys,
-                    stable_indices,
-                    row_indices,
-                    row_values,
-                ),
-                reverse=True,
-            )
-            gpu.barrier()
+                    bins_per_thread,
+                )
+                thresholds[level] = metadata[_THRESHOLD_SLOTS[level]]
+                remaining_k = remaining_k - metadata[_ABOVE_SLOTS[level]]
+                if level < 2:
+                    prefix_threshold = (
+                        prefix_threshold
+                        << fx.Int32(_LONG_RADIX_BITS[level])
+                    ) | thresholds[level]
+
+                if level == 1:
+                    if const_expr(not stable):
+                        can_finish = (
+                            candidate_count <= fx.Int32(_COMPACT_CAPACITY)
+                        ) & (
+                            metadata[_SELECTED_BUCKET_COUNT]
+                            == remaining_k
+                        )
+                        if can_finish:
+                            scatter_candidates_unstable(
+                                candidate_count,
+                                thresholds[0],
+                                thresholds[1],
+                                zero,
+                                remaining_k,
+                                2,
+                                row_indices,
+                                row_values,
+                                metadata,
+                                candidate_keys,
+                                candidate_indices,
+                            )
+                            return
 
             if const_expr(stable):
-                finish_candidate_stable(
-                    first_threshold,
-                    need_after_first,
-                    metadata[_CANDIDATE_COUNT],
-                    histogram,
+                scatter_streaming_stable(
+                    candidate_count,
+                    thresholds[0],
+                    thresholds[1],
+                    thresholds[2],
+                    remaining_k,
+                    row_indices,
+                    row_values,
                     scan,
                     metadata,
                     candidate_keys,
                     candidate_indices,
                     stable_keys,
                     stable_indices,
-                    row_indices,
-                    row_values,
                 )
             else:
-                finish_candidate_unstable(
-                    first_threshold,
-                    need_after_first,
-                    metadata[_CANDIDATE_COUNT],
-                    histogram,
-                    scan,
+                scatter_streaming_unstable(
+                    candidate_count,
+                    thresholds[0],
+                    thresholds[1],
+                    thresholds[2],
+                    remaining_k,
+                    row_indices,
+                    row_values,
                     metadata,
                     candidate_keys,
                     candidate_indices,
-                    row_indices,
-                    row_values,
                 )
 
         def write_direct_output(
@@ -1947,8 +1756,7 @@ def build_topk_per_row_prefill_one_workgroup_module(
 
             if row_len <= fx.Int32(_COMPACT_CAPACITY):
                 run_cached_path(
-                    short_histogram_ping,
-                    short_histogram_pong,
+                    short_histograms,
                     full_keys,
                     row_indices,
                     row_values,
@@ -1957,8 +1765,7 @@ def build_topk_per_row_prefill_one_workgroup_module(
                 )
             else:
                 run_streaming_path(
-                    long_histogram_ping,
-                    long_histogram_pong,
+                    long_histograms,
                     histogram,
                     candidate_keys,
                     candidate_indices,
