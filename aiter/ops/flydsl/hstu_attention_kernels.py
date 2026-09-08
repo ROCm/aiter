@@ -572,7 +572,10 @@ def _bwd_tuned_config_map(tuned_file: str | None = None) -> dict[tuple, dict]:
         return (problem_key, kernel), duration, kernel_config
 
     default_tuned_file = (
-        Path(__file__).resolve().parent / "hstu_attention_bwd_tuned.csv"
+        Path(__file__).resolve().parents[2]
+        / "configs"
+        / "model_configs"
+        / "hstu_attention_bwd_tuned.csv"
     )
     tuned_file_path: Path = Path(tuned_file) if tuned_file else default_tuned_file
     if not tuned_file_path.is_file():
