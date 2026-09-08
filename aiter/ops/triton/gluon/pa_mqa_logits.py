@@ -1578,15 +1578,16 @@ def _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle_varctx(
         mfma_q = gl.convert_layout(q, mfma_layout_a)
 
         context_kv_idx_next_0 = tl.where(mask_kv_next_0, context_kv_idx_next_0, 0)
-        k_next_0 = gl.amd.cdna3.buffer_load(
-            ptr=KV_buffer,
-            offsets=offset_k_fixed + context_kv_idx_next_0[None, :] * stride_k_seq,
+        k_next_0 = gl.load(
+            KV_buffer
+            + offset_k_fixed
+            + context_kv_idx_next_0.to(gl.int64)[None, :] * stride_k_seq
         )
-        k_scale_f_next_0 = gl.amd.cdna3.buffer_load(
-            ptr=scale_buffer,
-            offsets=context_kv_idx_next_0 * stride_scale_seq
+        k_scale_f_next_0 = gl.load(
+            scale_buffer
+            + context_kv_idx_next_0.to(gl.int64) * stride_scale_seq
             + gl.arange(0, ChunkKPerStage, layout=gl.SliceLayout(0, mfma_layout_b))
-            % KVBlockSize,
+            % KVBlockSize
         )
 
         _amd_iglp_sched_group_barrier(DS_READ, 4, 0)
@@ -1620,15 +1621,16 @@ def _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle_varctx(
         #!=----------------------------
 
         context_kv_idx_next_1 = tl.where(mask_kv_next_1, context_kv_idx_next_1, 0)
-        k_next_1 = gl.amd.cdna3.buffer_load(
-            ptr=KV_buffer,
-            offsets=offset_k_fixed + context_kv_idx_next_1[None, :] * stride_k_seq,
+        k_next_1 = gl.load(
+            KV_buffer
+            + offset_k_fixed
+            + context_kv_idx_next_1.to(gl.int64)[None, :] * stride_k_seq
         )
-        k_scale_f_next_1 = gl.amd.cdna3.buffer_load(
-            ptr=scale_buffer,
-            offsets=context_kv_idx_next_1 * stride_scale_seq
+        k_scale_f_next_1 = gl.load(
+            scale_buffer
+            + context_kv_idx_next_1.to(gl.int64) * stride_scale_seq
             + gl.arange(0, ChunkKPerStage, layout=gl.SliceLayout(0, mfma_layout_b))
-            % KVBlockSize,
+            % KVBlockSize
         )
 
         _amd_s_set_prio(3)
@@ -1687,15 +1689,16 @@ def _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle_varctx(
                 + gl.arange(0, ChunkKPerStage, layout=gl.SliceLayout(0, mfma_layout_b))
                 // KVBlockSize,
             )
-            k_next_0 = gl.amd.cdna3.buffer_load(
-                ptr=KV_buffer,
-                offsets=offset_k_fixed + context_kv_idx_next_0[None, :] * stride_k_seq,
+            k_next_0 = gl.load(
+                KV_buffer
+                + offset_k_fixed
+                + context_kv_idx_next_0.to(gl.int64)[None, :] * stride_k_seq
             )
-            k_scale_f_next_0 = gl.amd.cdna3.buffer_load(
-                ptr=scale_buffer,
-                offsets=context_kv_idx_next_0 * stride_scale_seq
+            k_scale_f_next_0 = gl.load(
+                scale_buffer
+                + context_kv_idx_next_0.to(gl.int64) * stride_scale_seq
                 + gl.arange(0, ChunkKPerStage, layout=gl.SliceLayout(0, mfma_layout_b))
-                % KVBlockSize,
+                % KVBlockSize
             )
 
             _amd_s_set_prio(3)
@@ -1758,15 +1761,16 @@ def _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle_varctx(
                     )
                     // KVBlockSize,
                 )
-            k_next_1 = gl.amd.cdna3.buffer_load(
-                ptr=KV_buffer,
-                offsets=offset_k_fixed + context_kv_idx_next_1[None, :] * stride_k_seq,
+            k_next_1 = gl.load(
+                KV_buffer
+                + offset_k_fixed
+                + context_kv_idx_next_1.to(gl.int64)[None, :] * stride_k_seq
             )
-            k_scale_f_next_1 = gl.amd.cdna3.buffer_load(
-                ptr=scale_buffer,
-                offsets=context_kv_idx_next_1 * stride_scale_seq
+            k_scale_f_next_1 = gl.load(
+                scale_buffer
+                + context_kv_idx_next_1.to(gl.int64) * stride_scale_seq
                 + gl.arange(0, ChunkKPerStage, layout=gl.SliceLayout(0, mfma_layout_b))
-                % KVBlockSize,
+                % KVBlockSize
             )
             _amd_s_set_prio(2)
             mfma_k = gl.convert_layout(k, mfma_layout_b)
