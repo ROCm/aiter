@@ -46,15 +46,20 @@ def bench_na3d_flash(B, T, H, W, NH, HD, KT, KH, KW, dtype):
     # Also used as a timed candidate so the table shows the real kernel speedup.
     ref = _na3d_sdpa_exact(q, k, v, kernel_size=(KT, KH, KW))
 
-    # FLOPs/bytes model: logical neighborhood cost.
-    # sdpa_exact does extra masked work, so its effective TFLOPS is lower,
-    # which makes the comparison meaningful.
+    # Logical FLOPs: QK and AV dot products over K neighbors per query.
     #   QK: 2 * B * SEQ * K * C
     #   AV: 2 * B * SEQ * K * C
     flops = 4 * B * SEQ * K * C
-    # Bytes: Q loaded once, K and V reloaded per (t_kv, h_kv) row.
+    # Logical bytes: minimum data the operation must touch if every element is
+    # read/written exactly once: Q, K, V each read once per query, output written once.
+    # This is an effective/logical rate, not actual HBM traffic (which varies by
+    # implementation and tile size). The same formula is used for both candidates so
+    # the comparison is fair; sdpa_exact's lower effective TB/s reflects its higher
+    # real bandwidth cost.
+    #   reads : Q (SEQ*C) + K (SEQ*K*C) + V (SEQ*K*C)
+    #   writes: Out (SEQ*C)
     elem = q.element_size()
-    nbytes = (B * SEQ * C + 2 * B * SEQ * K * C) * elem
+    nbytes = (2 * B * SEQ * C + 2 * B * SEQ * K * C) * elem
 
     candidates = {
         "triton": lambda: na3d_flash_attn(q, k, v, kernel_size=(KT, KH, KW)),
@@ -73,7 +78,7 @@ def bench_na3d_flash(B, T, H, W, NH, HD, KT, KH, KW, dtype):
         )
         ret[f"{name} us"] = us
         ret[f"{name} TFLOPS"] = flops / us / 1e6
-        ret[f"{name} TB/s"] = nbytes / us / 1e6
+        ret[f"{name} eff TB/s"] = nbytes / us / 1e6
         ret[f"{name} err"] = err
     return ret
 
