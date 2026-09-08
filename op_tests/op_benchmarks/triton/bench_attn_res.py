@@ -12,6 +12,8 @@ Usage (from the repository root):
   python op_tests/op_benchmarks/triton/bench_attn_res.py -N 8192 -D 7168 -L 8
   python op_tests/op_benchmarks/triton/bench_attn_res.py --metric bandwidth --onorm
   python op_tests/op_benchmarks/triton/bench_attn_res.py --op gate --add-hidden
+  python op_tests/op_benchmarks/triton/bench_attn_res.py --op gate --add-hidden2
+  python op_tests/op_benchmarks/triton/bench_attn_res.py --op gate --close-block
   python op_tests/op_benchmarks/triton/bench_attn_res.py --op gate --sweep decode
 
 Bandwidth uses the MINIMUM required traffic (read each residual once + write
@@ -71,11 +73,22 @@ def bench_attn_res_fn(N, D, L, layout, metric, args):
 
     if args.op == "gate":
         # L counts the prefix, so the packed block holds L - 1 rows.
-        prefix, block_residual, score_weight, add_hidden = (
-            generate_attn_res_gate_inputs(N, D, L - 1, dtype, with_add=args.add_hidden)
+        prefix, block_residual, score_weight, add_hidden, add_hidden2 = (
+            generate_attn_res_gate_inputs(
+                N,
+                D,
+                L - 1,
+                dtype,
+                with_add=args.add_hidden or args.add_hidden2,
+                with_add2=args.add_hidden2,
+            )
         )
         if args.add_hidden:
             mem += 2 * N * D * elem_size  # add_hidden read + prefix write-back
+        if args.add_hidden2:
+            mem += N * D * elem_size  # second addend read
+        if args.close_block:
+            mem += N * L * D * elem_size  # fused block_out write, no separate cat
         output_rms_weight = (
             torch.randn(D, dtype=dtype, device="cuda") if args.onorm else None
         )
@@ -85,8 +98,11 @@ def bench_attn_res_fn(N, D, L, layout, metric, args):
             score_weight,
             args.eps,
             add_hidden,
+            add_hidden2,
             output_rms_weight=output_rms_weight,
+            output_rms_eps=args.out_eps,
             scale=args.scale,
+            close_block=args.close_block,
         )
     else:
         query, residuals, rms_weight, output_rms_weight = generate_attn_res_inputs(
@@ -167,6 +183,23 @@ def parse_args():
         help="For --op gate: fold the prefix += hidden add into the kernel",
     )
     parser.add_argument(
+        "--add-hidden2",
+        dest="add_hidden2",
+        action="store_true",
+        default=False,
+        help="For --op gate: also fold a second addend (implies --add-hidden)",
+    )
+    parser.add_argument(
+        "--close-block",
+        dest="close_block",
+        action="store_true",
+        default=False,
+        help=(
+            "For --op gate: also fuse cat([block_residual, prefix_out], -2) into "
+            "the kernel, instead of a separate torch.cat"
+        ),
+    )
+    parser.add_argument(
         "--sweep",
         type=str,
         default="prefill",
@@ -194,6 +227,12 @@ def parse_args():
         "--onorm", action="store_true", default=False, help="Enable the output RMSNorm"
     )
     parser.add_argument("--eps", type=float, default=1e-6, help="RMSNorm epsilon")
+    parser.add_argument(
+        "--out-eps",
+        type=float,
+        default=1e-6,
+        help="For --op gate: output RMSNorm epsilon (independent of --eps)",
+    )
     parser.add_argument("--scale", type=float, default=1.0, help="Logit scale")
     parser.add_argument("--warmup", type=int, default=25)
     parser.add_argument("--rep", type=int, default=100)

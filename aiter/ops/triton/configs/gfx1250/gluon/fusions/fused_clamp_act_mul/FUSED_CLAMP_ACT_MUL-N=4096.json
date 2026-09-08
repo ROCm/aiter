@@ -1,0 +1,16 @@
+{
+    "M_LEQ_128": {
+        "ROWS_PER_PROG": 1,
+        "BLOCK_SIZE_M": 1,
+        "BLOCK_SIZE_N": 512,
+        "num_warps": 2,
+        "waves_per_eu": 4
+    },
+    "M_LEQ_16384": {
+        "ROWS_PER_PROG": 2,
+        "BLOCK_SIZE_M": 2,
+        "BLOCK_SIZE_N": 256,
+        "num_warps": 1,
+        "waves_per_eu": 5
+    }
+}

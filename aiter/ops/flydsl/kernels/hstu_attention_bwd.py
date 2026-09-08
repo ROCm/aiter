@@ -42,12 +42,12 @@ from flydsl.expr import arith, const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import Vector as Vec
 from flydsl.runtime.device import get_rocm_arch
 
+from aiter.jit.utils.chip_info import get_lds_capacity_bytes
 from aiter.ops.flydsl.kernels.hstu_attention_common import (
     decode_lane,
     grouped_loader,
     swz_col,
 )
-from aiter.ops.flydsl.utils import addressable_lds_bytes_for_gfx
 
 
 def _dtype_to_elem_type(dtype_str: str):
@@ -85,7 +85,7 @@ def _arch_dma_params(arch: str | None = None):
 def lds_cap_bytes(arch: str | None = None) -> int:
     if arch is None:
         arch = get_rocm_arch()
-    return addressable_lds_bytes_for_gfx(arch)
+    return get_lds_capacity_bytes(arch)
 
 
 _LOG2E = host_math.log2(host_math.e)

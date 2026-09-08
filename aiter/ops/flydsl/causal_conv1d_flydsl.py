@@ -4,28 +4,17 @@
 
 import functools
 
+import flydsl.compiler as flyc
+import flydsl.expr as fx
 import torch
+from flydsl.expr.typing import Int32, T
+
+from aiter.ops.flydsl.kernels import buffer_ops
 
 from ..prefill_batch_metadata import CausalConvPrefillMetadata
 
-try:
-    import flydsl.compiler as flyc
-    import flydsl.expr as fx
-    from flydsl.expr.typing import Int32, T
-
-    from aiter.ops.flydsl.kernels import buffer_ops
-
-    _FLYDSL_AVAILABLE = True
-except Exception:  # pragma: no cover - flydsl optional  # noqa: BLE001
-    _FLYDSL_AVAILABLE = False
-
-
 PAD_SLOT_ID = -1
 _LOG2E = 1.4426950408889634
-
-
-def is_flydsl_available() -> bool:
-    return _FLYDSL_AVAILABLE
 
 
 def build_causal_conv1d_flydsl_module(
@@ -38,7 +27,6 @@ def build_causal_conv1d_flydsl_module(
     dtype_str: str = "bf16",
 ):
     """Build the FlyDSL causal conv1d kernel for the given config."""
-    assert _FLYDSL_AVAILABLE, "flydsl is not installed"
     assert width in (2, 3, 4)
     assert (
         tm == 64 and tn == 64 and block_threads == 256

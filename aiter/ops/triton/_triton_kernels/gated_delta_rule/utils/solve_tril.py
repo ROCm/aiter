@@ -35,6 +35,32 @@ DOT_PRECISION_AUTOTUNE_LIST = (
 )
 
 
+# tl.make_block_ptr was removed in Triton 3.8 ("Block pointers have been removed
+# in favor of the tensor descriptor API"). Every block access in this file is a
+# row-major (BR, BC) tile with unit column stride, so plain pointer arithmetic
+# with an explicit bounds mask reproduces the boundary_check=(0, 1) behaviour.
+@triton.jit
+def _bp_ld2d(base, R, C, rs, r0, c0, BR: tl.constexpr, BC: tl.constexpr):
+    r = r0 + tl.arange(0, BR)
+    c = c0 + tl.arange(0, BC)
+    return tl.load(
+        base + r[:, None] * rs + c[None, :],
+        mask=(r < R)[:, None] & (c < C)[None, :],
+        other=0.0,
+    )
+
+
+@triton.jit
+def _bp_st2d(base, R, C, rs, r0, c0, val, BR: tl.constexpr, BC: tl.constexpr):
+    r = r0 + tl.arange(0, BR)
+    c = c0 + tl.arange(0, BC)
+    tl.store(
+        base + r[:, None] * rs + c[None, :],
+        val,
+        mask=(r < R)[:, None] & (c < C)[None, :],
+    )
+
+
 @triton.heuristics(
     {
         "IS_VARLEN": lambda args: args["cu_seqlens"] is not None,
@@ -90,11 +116,8 @@ def solve_tril_16x16_kernel(
 
     offset = (i_t * 16) % BT
     if not USE_TMA:
-        p_A = tl.make_block_ptr(
-            A, (T, BT), (H * BT, 1), (i_t * 16, offset), (16, 16), (1, 0)
-        )
         # [16, 16]
-        b_A = tl.load(p_A, boundary_check=(0, 1)).to(tl.float32)
+        b_A = _bp_ld2d(A, T, BT, H * BT, i_t * 16, offset, 16, 16).to(tl.float32)
         b_A = tl.where(m_A, b_A, 0)
     else:
         desc = make_tensor_descriptor(A, [T, BT], [H * BT, 1], [16, 16])
@@ -112,13 +135,16 @@ def solve_tril_16x16_kernel(
         b_A = tl.where((o_i == i)[:, None], b_a, b_A)
     b_A += m_I
     if not USE_TMA:
-        p_Ai = tl.make_block_ptr(
-            Ai, (T, 16), (H * 16, 1), (i_t * 16, 0), (16, 16), (1, 0)
-        )
-        tl.store(
-            p_Ai,
-            b_A.to(p_Ai.dtype.element_ty, fp_downcast_rounding="rtne"),
-            boundary_check=(0, 1),
+        _bp_st2d(
+            Ai,
+            T,
+            16,
+            H * 16,
+            i_t * 16,
+            0,
+            b_A.to(Ai.dtype.element_ty, fp_downcast_rounding="rtne"),
+            16,
+            16,
         )
     else:
         desc_o.store([i_t * 16, 0], b_A.to(desc_o.dtype, fp_downcast_rounding="rtne"))
@@ -181,14 +207,8 @@ def merge_16x16_to_32x32_inverse_kernel(
     Ai += (bos * H + i_h) * BT
 
     if not USE_TMA:
-        p_A_11 = tl.make_block_ptr(
-            A, (T, BT), (H * BT, 1), (i_t * BT, 0), (16, 16), (1, 0)
-        )
-        p_A_22 = tl.make_block_ptr(
-            A, (T, BT), (H * BT, 1), (i_t * BT + 16, 16), (16, 16), (1, 0)
-        )
-        b_Ai_11 = tl.load(p_A_11, boundary_check=(0, 1)).to(tl.float32)
-        b_Ai_22 = tl.load(p_A_22, boundary_check=(0, 1)).to(tl.float32)
+        b_Ai_11 = _bp_ld2d(A, T, BT, H * BT, i_t * BT, 0, 16, 16).to(tl.float32)
+        b_Ai_22 = _bp_ld2d(A, T, BT, H * BT, i_t * BT + 16, 16, 16, 16).to(tl.float32)
     else:
         desc = make_tensor_descriptor(A, [T, BT], [H * BT, 1], [16, 16])
         desc_o = make_tensor_descriptor(Ai, [T, BT], [H * BT, 1], [16, 16])
@@ -212,10 +232,7 @@ def merge_16x16_to_32x32_inverse_kernel(
     b_Ai_22 += m_I
 
     if not USE_TMA:
-        p_A_21 = tl.make_block_ptr(
-            A, (T, BT), (H * BT, 1), (i_t * BT + 16, 0), (16, 16), (1, 0)
-        )
-        b_A_21 = tl.load(p_A_21, boundary_check=(0, 1)).to(tl.float32)
+        b_A_21 = _bp_ld2d(A, T, BT, H * BT, i_t * BT + 16, 0, 16, 16).to(tl.float32)
     else:
         b_A_21 = desc.load([i_t * BT + 16, 0]).to(tl.float32)
 
@@ -232,38 +249,40 @@ def merge_16x16_to_32x32_inverse_kernel(
     z16 = tl.zeros([16, 16], dtype=b_Ai_11.dtype)
 
     if not USE_TMA:
-        p_Ai_11 = tl.make_block_ptr(
-            Ai, (T, BT), (H * BT, 1), (i_t * BT, 0), (16, 16), (1, 0)
+        _bp_st2d(
+            Ai,
+            T,
+            BT,
+            H * BT,
+            i_t * BT,
+            0,
+            b_Ai_11.to(Ai.dtype.element_ty, fp_downcast_rounding="rtne"),
+            16,
+            16,
         )
-        p_Ai_21 = tl.make_block_ptr(
-            Ai, (T, BT), (H * BT, 1), (i_t * BT + 16, 0), (16, 16), (1, 0)
+        _bp_st2d(
+            Ai,
+            T,
+            BT,
+            H * BT,
+            i_t * BT + 16,
+            16,
+            b_Ai_22.to(Ai.dtype.element_ty, fp_downcast_rounding="rtne"),
+            16,
+            16,
         )
-        p_Ai_22 = tl.make_block_ptr(
-            Ai, (T, BT), (H * BT, 1), (i_t * BT + 16, 16), (16, 16), (1, 0)
+        _bp_st2d(
+            Ai,
+            T,
+            BT,
+            H * BT,
+            i_t * BT + 16,
+            0,
+            b_Ai_21.to(Ai.dtype.element_ty, fp_downcast_rounding="rtne"),
+            16,
+            16,
         )
-        p_Ai_12 = tl.make_block_ptr(
-            Ai, (T, BT), (H * BT, 1), (i_t * BT, 16), (16, 16), (1, 0)
-        )
-        tl.store(
-            p_Ai_11,
-            b_Ai_11.to(p_Ai_11.dtype.element_ty, fp_downcast_rounding="rtne"),
-            boundary_check=(0, 1),
-        )
-        tl.store(
-            p_Ai_22,
-            b_Ai_22.to(p_Ai_22.dtype.element_ty, fp_downcast_rounding="rtne"),
-            boundary_check=(0, 1),
-        )
-        tl.store(
-            p_Ai_21,
-            b_Ai_21.to(p_Ai_21.dtype.element_ty, fp_downcast_rounding="rtne"),
-            boundary_check=(0, 1),
-        )
-        tl.store(
-            p_Ai_12,
-            z16.to(p_Ai_12.dtype.element_ty),
-            boundary_check=(0, 1),
-        )
+        _bp_st2d(Ai, T, BT, H * BT, i_t * BT, 16, z16.to(Ai.dtype.element_ty), 16, 16)
     else:
         desc_o.store(
             [i_t * BT + 0, 0], b_Ai_11.to(desc_o.dtype, fp_downcast_rounding="rtne")
@@ -334,22 +353,10 @@ def merge_16x16_to_64x64_inverse_kernel(
     Ai += (bos * H + i_h) * BT
 
     if not USE_TMA:
-        p_A_11 = tl.make_block_ptr(
-            A, (T, BT), (H * BT, 1), (i_t * BT, 0), (16, 16), (1, 0)
-        )
-        p_A_22 = tl.make_block_ptr(
-            A, (T, BT), (H * BT, 1), (i_t * BT + 16, 16), (16, 16), (1, 0)
-        )
-        p_A_33 = tl.make_block_ptr(
-            A, (T, BT), (H * BT, 1), (i_t * BT + 32, 32), (16, 16), (1, 0)
-        )
-        p_A_44 = tl.make_block_ptr(
-            A, (T, BT), (H * BT, 1), (i_t * BT + 48, 48), (16, 16), (1, 0)
-        )
-        b_Ai_11 = tl.load(p_A_11, boundary_check=(0, 1)).to(tl.float32)
-        b_Ai_22 = tl.load(p_A_22, boundary_check=(0, 1)).to(tl.float32)
-        b_Ai_33 = tl.load(p_A_33, boundary_check=(0, 1)).to(tl.float32)
-        b_Ai_44 = tl.load(p_A_44, boundary_check=(0, 1)).to(tl.float32)
+        b_Ai_11 = _bp_ld2d(A, T, BT, H * BT, i_t * BT, 0, 16, 16).to(tl.float32)
+        b_Ai_22 = _bp_ld2d(A, T, BT, H * BT, i_t * BT + 16, 16, 16, 16).to(tl.float32)
+        b_Ai_33 = _bp_ld2d(A, T, BT, H * BT, i_t * BT + 32, 32, 16, 16).to(tl.float32)
+        b_Ai_44 = _bp_ld2d(A, T, BT, H * BT, i_t * BT + 48, 48, 16, 16).to(tl.float32)
     else:
         desc = make_tensor_descriptor(A, [T, BT], [H * BT, 1], [16, 16])
         desc_o = make_tensor_descriptor(Ai, [T, BT], [H * BT, 1], [16, 16])
@@ -390,30 +397,12 @@ def merge_16x16_to_64x64_inverse_kernel(
     b_Ai_44 += m_I
 
     if not USE_TMA:
-        p_A_21 = tl.make_block_ptr(
-            A, (T, BT), (H * BT, 1), (i_t * BT + 16, 0), (16, 16), (1, 0)
-        )
-        p_A_31 = tl.make_block_ptr(
-            A, (T, BT), (H * BT, 1), (i_t * BT + 32, 0), (16, 16), (1, 0)
-        )
-        p_A_32 = tl.make_block_ptr(
-            A, (T, BT), (H * BT, 1), (i_t * BT + 32, 16), (16, 16), (1, 0)
-        )
-        p_A_41 = tl.make_block_ptr(
-            A, (T, BT), (H * BT, 1), (i_t * BT + 48, 0), (16, 16), (1, 0)
-        )
-        p_A_42 = tl.make_block_ptr(
-            A, (T, BT), (H * BT, 1), (i_t * BT + 48, 16), (16, 16), (1, 0)
-        )
-        p_A_43 = tl.make_block_ptr(
-            A, (T, BT), (H * BT, 1), (i_t * BT + 48, 32), (16, 16), (1, 0)
-        )
-        b_A_21 = tl.load(p_A_21, boundary_check=(0, 1)).to(tl.float32)
-        b_A_31 = tl.load(p_A_31, boundary_check=(0, 1)).to(tl.float32)
-        b_A_32 = tl.load(p_A_32, boundary_check=(0, 1)).to(tl.float32)
-        b_A_41 = tl.load(p_A_41, boundary_check=(0, 1)).to(tl.float32)
-        b_A_42 = tl.load(p_A_42, boundary_check=(0, 1)).to(tl.float32)
-        b_A_43 = tl.load(p_A_43, boundary_check=(0, 1)).to(tl.float32)
+        b_A_21 = _bp_ld2d(A, T, BT, H * BT, i_t * BT + 16, 0, 16, 16).to(tl.float32)
+        b_A_31 = _bp_ld2d(A, T, BT, H * BT, i_t * BT + 32, 0, 16, 16).to(tl.float32)
+        b_A_32 = _bp_ld2d(A, T, BT, H * BT, i_t * BT + 32, 16, 16, 16).to(tl.float32)
+        b_A_41 = _bp_ld2d(A, T, BT, H * BT, i_t * BT + 48, 0, 16, 16).to(tl.float32)
+        b_A_42 = _bp_ld2d(A, T, BT, H * BT, i_t * BT + 48, 16, 16, 16).to(tl.float32)
+        b_A_43 = _bp_ld2d(A, T, BT, H * BT, i_t * BT + 48, 32, 16, 16).to(tl.float32)
     else:
         b_A_21 = desc.load([i_t * BT + 16, 0]).to(tl.float32)
         b_A_31 = desc.load([i_t * BT + 32, 0]).to(tl.float32)
@@ -465,111 +454,129 @@ def merge_16x16_to_64x64_inverse_kernel(
     z16 = tl.zeros([16, 16], dtype=b_Ai_11.dtype)
 
     if not USE_TMA:
-        p_Ai_11 = tl.make_block_ptr(
-            Ai, (T, BT), (H * BT, 1), (i_t * BT, 0), (16, 16), (1, 0)
-        )
-        p_Ai_22 = tl.make_block_ptr(
-            Ai, (T, BT), (H * BT, 1), (i_t * BT + 16, 16), (16, 16), (1, 0)
-        )
-        p_Ai_33 = tl.make_block_ptr(
-            Ai, (T, BT), (H * BT, 1), (i_t * BT + 32, 32), (16, 16), (1, 0)
-        )
-        p_Ai_44 = tl.make_block_ptr(
-            Ai, (T, BT), (H * BT, 1), (i_t * BT + 48, 48), (16, 16), (1, 0)
-        )
-        p_Ai_21 = tl.make_block_ptr(
-            Ai, (T, BT), (H * BT, 1), (i_t * BT + 16, 0), (16, 16), (1, 0)
-        )
-        p_Ai_31 = tl.make_block_ptr(
-            Ai, (T, BT), (H * BT, 1), (i_t * BT + 32, 0), (16, 16), (1, 0)
-        )
-        p_Ai_32 = tl.make_block_ptr(
-            Ai, (T, BT), (H * BT, 1), (i_t * BT + 32, 16), (16, 16), (1, 0)
-        )
-        p_Ai_41 = tl.make_block_ptr(
-            Ai, (T, BT), (H * BT, 1), (i_t * BT + 48, 0), (16, 16), (1, 0)
-        )
-        p_Ai_42 = tl.make_block_ptr(
-            Ai, (T, BT), (H * BT, 1), (i_t * BT + 48, 16), (16, 16), (1, 0)
-        )
-        p_Ai_43 = tl.make_block_ptr(
-            Ai, (T, BT), (H * BT, 1), (i_t * BT + 48, 32), (16, 16), (1, 0)
-        )
         # 6 strict-upper sub-block zero ptrs
-        p_Ai_12 = tl.make_block_ptr(
-            Ai, (T, BT), (H * BT, 1), (i_t * BT, 16), (16, 16), (1, 0)
+        _bp_st2d(
+            Ai,
+            T,
+            BT,
+            H * BT,
+            i_t * BT,
+            0,
+            b_Ai_11.to(Ai.dtype.element_ty, fp_downcast_rounding="rtne"),
+            16,
+            16,
         )
-        p_Ai_13 = tl.make_block_ptr(
-            Ai, (T, BT), (H * BT, 1), (i_t * BT, 32), (16, 16), (1, 0)
+        _bp_st2d(
+            Ai,
+            T,
+            BT,
+            H * BT,
+            i_t * BT + 16,
+            16,
+            b_Ai_22.to(Ai.dtype.element_ty, fp_downcast_rounding="rtne"),
+            16,
+            16,
         )
-        p_Ai_14 = tl.make_block_ptr(
-            Ai, (T, BT), (H * BT, 1), (i_t * BT, 48), (16, 16), (1, 0)
+        _bp_st2d(
+            Ai,
+            T,
+            BT,
+            H * BT,
+            i_t * BT + 32,
+            32,
+            b_Ai_33.to(Ai.dtype.element_ty, fp_downcast_rounding="rtne"),
+            16,
+            16,
         )
-        p_Ai_23 = tl.make_block_ptr(
-            Ai, (T, BT), (H * BT, 1), (i_t * BT + 16, 32), (16, 16), (1, 0)
+        _bp_st2d(
+            Ai,
+            T,
+            BT,
+            H * BT,
+            i_t * BT + 48,
+            48,
+            b_Ai_44.to(Ai.dtype.element_ty, fp_downcast_rounding="rtne"),
+            16,
+            16,
         )
-        p_Ai_24 = tl.make_block_ptr(
-            Ai, (T, BT), (H * BT, 1), (i_t * BT + 16, 48), (16, 16), (1, 0)
+        _bp_st2d(
+            Ai,
+            T,
+            BT,
+            H * BT,
+            i_t * BT + 16,
+            0,
+            b_Ai_21.to(Ai.dtype.element_ty, fp_downcast_rounding="rtne"),
+            16,
+            16,
         )
-        p_Ai_34 = tl.make_block_ptr(
-            Ai, (T, BT), (H * BT, 1), (i_t * BT + 32, 48), (16, 16), (1, 0)
+        _bp_st2d(
+            Ai,
+            T,
+            BT,
+            H * BT,
+            i_t * BT + 32,
+            0,
+            b_Ai_31.to(Ai.dtype.element_ty, fp_downcast_rounding="rtne"),
+            16,
+            16,
         )
-        tl.store(
-            p_Ai_11,
-            b_Ai_11.to(p_Ai_11.dtype.element_ty, fp_downcast_rounding="rtne"),
-            boundary_check=(0, 1),
+        _bp_st2d(
+            Ai,
+            T,
+            BT,
+            H * BT,
+            i_t * BT + 32,
+            16,
+            b_Ai_32.to(Ai.dtype.element_ty, fp_downcast_rounding="rtne"),
+            16,
+            16,
         )
-        tl.store(
-            p_Ai_22,
-            b_Ai_22.to(p_Ai_22.dtype.element_ty, fp_downcast_rounding="rtne"),
-            boundary_check=(0, 1),
+        _bp_st2d(
+            Ai,
+            T,
+            BT,
+            H * BT,
+            i_t * BT + 48,
+            0,
+            b_Ai_41.to(Ai.dtype.element_ty, fp_downcast_rounding="rtne"),
+            16,
+            16,
         )
-        tl.store(
-            p_Ai_33,
-            b_Ai_33.to(p_Ai_33.dtype.element_ty, fp_downcast_rounding="rtne"),
-            boundary_check=(0, 1),
+        _bp_st2d(
+            Ai,
+            T,
+            BT,
+            H * BT,
+            i_t * BT + 48,
+            16,
+            b_Ai_42.to(Ai.dtype.element_ty, fp_downcast_rounding="rtne"),
+            16,
+            16,
         )
-        tl.store(
-            p_Ai_44,
-            b_Ai_44.to(p_Ai_44.dtype.element_ty, fp_downcast_rounding="rtne"),
-            boundary_check=(0, 1),
+        _bp_st2d(
+            Ai,
+            T,
+            BT,
+            H * BT,
+            i_t * BT + 48,
+            32,
+            b_Ai_43.to(Ai.dtype.element_ty, fp_downcast_rounding="rtne"),
+            16,
+            16,
         )
-        tl.store(
-            p_Ai_21,
-            b_Ai_21.to(p_Ai_21.dtype.element_ty, fp_downcast_rounding="rtne"),
-            boundary_check=(0, 1),
+        _bp_st2d(Ai, T, BT, H * BT, i_t * BT, 16, z16.to(Ai.dtype.element_ty), 16, 16)
+        _bp_st2d(Ai, T, BT, H * BT, i_t * BT, 32, z16.to(Ai.dtype.element_ty), 16, 16)
+        _bp_st2d(Ai, T, BT, H * BT, i_t * BT, 48, z16.to(Ai.dtype.element_ty), 16, 16)
+        _bp_st2d(
+            Ai, T, BT, H * BT, i_t * BT + 16, 32, z16.to(Ai.dtype.element_ty), 16, 16
         )
-        tl.store(
-            p_Ai_31,
-            b_Ai_31.to(p_Ai_31.dtype.element_ty, fp_downcast_rounding="rtne"),
-            boundary_check=(0, 1),
+        _bp_st2d(
+            Ai, T, BT, H * BT, i_t * BT + 16, 48, z16.to(Ai.dtype.element_ty), 16, 16
         )
-        tl.store(
-            p_Ai_32,
-            b_Ai_32.to(p_Ai_32.dtype.element_ty, fp_downcast_rounding="rtne"),
-            boundary_check=(0, 1),
+        _bp_st2d(
+            Ai, T, BT, H * BT, i_t * BT + 32, 48, z16.to(Ai.dtype.element_ty), 16, 16
         )
-        tl.store(
-            p_Ai_41,
-            b_Ai_41.to(p_Ai_41.dtype.element_ty, fp_downcast_rounding="rtne"),
-            boundary_check=(0, 1),
-        )
-        tl.store(
-            p_Ai_42,
-            b_Ai_42.to(p_Ai_42.dtype.element_ty, fp_downcast_rounding="rtne"),
-            boundary_check=(0, 1),
-        )
-        tl.store(
-            p_Ai_43,
-            b_Ai_43.to(p_Ai_43.dtype.element_ty, fp_downcast_rounding="rtne"),
-            boundary_check=(0, 1),
-        )
-        tl.store(p_Ai_12, z16.to(p_Ai_12.dtype.element_ty), boundary_check=(0, 1))
-        tl.store(p_Ai_13, z16.to(p_Ai_13.dtype.element_ty), boundary_check=(0, 1))
-        tl.store(p_Ai_14, z16.to(p_Ai_14.dtype.element_ty), boundary_check=(0, 1))
-        tl.store(p_Ai_23, z16.to(p_Ai_23.dtype.element_ty), boundary_check=(0, 1))
-        tl.store(p_Ai_24, z16.to(p_Ai_24.dtype.element_ty), boundary_check=(0, 1))
-        tl.store(p_Ai_34, z16.to(p_Ai_34.dtype.element_ty), boundary_check=(0, 1))
     else:
         desc_o.store(
             [i_t * BT + 0, 0], b_Ai_11.to(desc_o.dtype, fp_downcast_rounding="rtne")

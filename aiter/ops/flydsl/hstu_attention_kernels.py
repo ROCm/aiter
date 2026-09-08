@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 
 """High-level FlyDSL HSTU Attention Forward API."""
 
@@ -134,7 +134,12 @@ def _tuned_config_map(tuned_file: str | None = None) -> dict[tuple, dict]:
             kernel_config,
         )
 
-    default_tuned_file = Path(__file__).resolve().parent / "hstu_attention_tuned.csv"
+    default_tuned_file = (
+        Path(__file__).resolve().parents[2]
+        / "configs"
+        / "model_configs"
+        / "hstu_attention_tuned.csv"
+    )
 
     tuned_file: Path = Path(tuned_file) if tuned_file else default_tuned_file
     if not tuned_file.is_file():
@@ -285,7 +290,7 @@ def _compile_launcher(
         has_targets=has_targets,
     )
 
-    # Default hueristic config
+    # Default heuristic config
     default_config = _get_default_config(
         hidden_dim=hidden_dim,
         head_dim=head_dim,

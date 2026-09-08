@@ -26,7 +26,6 @@ import torch
 import aiter
 from aiter import dtypes
 from aiter.jit.utils.chip_info import get_gfx
-from aiter.ops.flydsl.utils import is_flydsl_available
 from aiter.test_common import benchmark, checkAllclose, run_perftest
 
 torch.set_default_device("cuda")
@@ -743,6 +742,41 @@ def _run_contract_checks():
     if not supported(k, v):
         raise AssertionError("supported bf16 K=V=128 CDNA case was rejected")
 
+    # Repeated, nearly unit-normalized keys and slow decay occur for padded
+    # Qwen3.5 prompts.  They are a numerical stress case for the triangular
+    # inverse: bf16 intermediates can grow by orders of magnitude even though
+    # the fp32 reference remains finite and well bounded.
+    stress = GDNShape(t=64, hg=1, h=2)
+    stress_k = torch.zeros(1, stress.t, stress.hg, stress.k, dtype=dtypes.bf16)
+    stress_k[..., 0] = 1
+    stress_v = (
+        torch.linspace(
+            -1,
+            1,
+            1 * stress.t * stress.h * stress.v,
+            dtype=dtypes.fp32,
+        )
+        .reshape(1, stress.t, stress.h, stress.v)
+        .to(dtypes.bf16)
+    )
+    stress_g = torch.full((1, stress.t, stress.h), -1e-3, dtype=dtypes.fp32)
+    stress_beta = torch.full((1, stress.t, stress.h), 0.835, dtype=dtypes.fp32)
+    stress_common = {
+        "cu_seqlens": None,
+        "use_exp2": True,
+        "shape": stress,
+        "prefill_metadata": None,
+    }
+    stress_ref = _run_triton_prepare(
+        stress_k, stress_v, stress_g, stress_beta, **stress_common
+    )
+    stress_out = _run_flydsl_prepare(
+        stress_k, stress_v, stress_g, stress_beta, **stress_common
+    )
+    _check_prepare_outputs(
+        "prepare_flydsl_repeated_key", stress_ref, stress_out, 1, stress
+    )
+
     bad_v = v.cpu()
     if supported(k, bad_v):
         raise AssertionError("cross-device operands must be rejected")
@@ -918,9 +952,6 @@ def main():
         aiter.logger.warning(
             "FlyDSL GDN prepare unsupported on %s; skipping", get_gfx()
         )
-        return
-    if not is_flydsl_available():
-        aiter.logger.warning("FlyDSL is unavailable; skipping GDN prepare")
         return
 
     _configure_noise_filters()
