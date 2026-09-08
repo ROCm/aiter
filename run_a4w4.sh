@@ -5,6 +5,9 @@
   AITER_LOG_MORE=1 \
   AITER_MOE_EXPERT_BALANCE=true \
   AITER_FLYDSL_MOE_EXPERT_SCHEDULING_MODE=1 \
+  AITER_FLYDSL_MMA_FIRST_GROUP=10 \
+  AITER_FLYDSL_MMA_GROUP=10 \
+  AITER_FLYDSL_DS_FIRST_N=0 \
   python3 -u op_tests/test_flydsl_grouped_gemm_gfx1250.py \
     --scenario kernel \
     --data-format a4w4 \

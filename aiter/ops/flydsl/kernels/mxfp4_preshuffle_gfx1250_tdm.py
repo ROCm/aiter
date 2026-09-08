@@ -4,6 +4,7 @@
 """Grouped contiguous-M A8W4 preshuffle MoE GEMM for gfx1250 (TDM pipeline)."""
 
 import math
+import os
 from collections import namedtuple
 
 import flydsl.compiler as flyc
@@ -41,6 +42,13 @@ from .tensor_shim import (
 )
 
 TDM_DESCRIPTOR_VERSION = 1
+MMA_GROUP = int(os.environ.get("AITER_FLYDSL_MMA_GROUP", "10"))
+MMA_FIRST_GROUP = int(os.environ.get("AITER_FLYDSL_MMA_FIRST_GROUP", MMA_GROUP))
+DS_FIRST_N = int(os.environ.get("AITER_FLYDSL_DS_FIRST_N", "0"))
+if MMA_GROUP < 1 or MMA_FIRST_GROUP < 1:
+    raise ValueError("AITER_FLYDSL_MMA_GROUP values must be positive")
+if DS_FIRST_N < 0:
+    raise ValueError("AITER_FLYDSL_DS_FIRST_N must be non-negative")
 
 
 @flyc.jit
@@ -146,6 +154,9 @@ def launch_gemm_a8w4_tdm(
         ep_slot_stride_bytes,
         ep_destination_stride,
         ep_world_size,
+        MMA_GROUP,
+        MMA_FIRST_GROUP,
+        DS_FIRST_N,
     )
     _ = cache_tag
     if enable_ep_scatter:
@@ -225,11 +236,18 @@ def launch_gemm_a8w4_tdm(
         f"_wpt{num_waves_per_tensor_tdm}" if num_waves_per_tensor_tdm != 2 else ""
     )
     _ep = "_epscatter" if enable_ep_scatter else ""
+    _mma_group = (
+        f"_mg{MMA_GROUP}"
+        if MMA_FIRST_GROUP == MMA_GROUP
+        else f"_mg{MMA_FIRST_GROUP}x{MMA_GROUP}"
+    )
+    _ds_first = f"_dsfirst{DS_FIRST_N}" if DS_FIRST_N else ""
     _kname = (
         f"a8w4_tdm_{_afp}"
         f"_t{tile_m}x{tile_n}x{tile_k}_w{m_warp}x{n_warp}"
         f"_b{num_buffers}_K{K}"
-        f"{_grouped}{_act}{_bias}{_qout}{_cl}{_next_stage}{_waves_per_tensor}{_ep}"
+        f"{_grouped}{_act}{_bias}{_qout}{_cl}{_next_stage}{_waves_per_tensor}"
+        f"{_mma_group}{_ds_first}{_ep}"
     )
 
     @flyc.kernel(name=_kname, known_block_size=[block, 1, 1])
@@ -665,9 +683,6 @@ def launch_gemm_a8w4_tdm(
         FRONT = list(range(front_wm))
         BACK = list(range(front_wm, wmma_m_rep))
 
-        # Hint shape for compute_ktile. Re-swept on t256x256x256 with random
-        # activations: 4 is safe for both, 16 costs 2.5%; 2..8 is within noise.
-        MMA_GROUP = 4
         # WMMA held back as a closing pure-MFMA group, covering the next k128's
         # REUSE fence; the prefetch reads interleave evenly over the rest.
         FENCE_COVER_MMA = 8
@@ -830,7 +845,18 @@ def launch_gemm_a8w4_tdm(
                 # K256 needs grouping to limit VGPR-bank switches without
                 # turning the complete A/B/scale prefetch into long LDS bursts.
                 mma_group = min(MMA_GROUP, mma_total) if KWS > 1 else 1
-                schedule_slots = mma_total // mma_group
+                first_group = min(MMA_FIRST_GROUP, mma_total) if KWS > 1 else 1
+                remaining_mma = mma_total - first_group
+                remaining_slots = (
+                    (remaining_mma + mma_group - 1) // mma_group
+                    if remaining_mma > 0
+                    else 0
+                )
+                mma_groups = [first_group] + [
+                    min(mma_group, remaining_mma - i * mma_group)
+                    for i in range_constexpr(remaining_slots)
+                ]
+                schedule_slots = len(mma_groups)
                 future_schedule = spread(STATE_DS if has_next else 0, schedule_slots)
                 # Spread the tail issue's TDMs over the WMMA groups: one burst
                 # would block the MFMA pipe for its whole descriptor setup.
@@ -838,12 +864,16 @@ def launch_gemm_a8w4_tdm(
                     TDM_PER if (prefetch_kt is not None and ksl + 1 == KWS) else 0,
                     schedule_slots,
                 )
+                first_ds = min(DS_FIRST_N, future_schedule[0])
                 for i in range_constexpr(schedule_slots):
                     if const_expr(tdm_schedule[i] > 0):
                         rocdl.sched_vmem(tdm_schedule[i])
-                    rocdl.sched_mfma(mma_group)
-                    if const_expr(future_schedule[i] > 0):
-                        rocdl.sched_dsrd(future_schedule[i])
+                    if const_expr(i == 0 and first_ds > 0):
+                        rocdl.sched_dsrd(first_ds)
+                    rocdl.sched_mfma(mma_groups[i])
+                    remaining_ds = future_schedule[i] - (first_ds if i == 0 else 0)
+                    if const_expr(remaining_ds > 0):
+                        rocdl.sched_dsrd(remaining_ds)
                 # Closing on an MFMA group is what covers the next k128's fence,
                 # so it must come out of mma_total; reordering slots does not.
                 if const_expr(tail_mfma > 0):
