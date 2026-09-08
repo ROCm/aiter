@@ -4505,10 +4505,8 @@ class CustomAllreduce
             {
                 if(numel <= 4 * 7168)
                     ll_bs = 256;
-                else if(numel <= 8 * 8192)
+                else if(numel <= 4 * 8192)
                     ll128_bs = 256;
-                else if(numel <= 16 * 8192)
-                    ll128_bs = 512;
             }
             else if(world_size_ == 2)
             {
@@ -4516,10 +4514,8 @@ class CustomAllreduce
                     ll_bs = 256;
                 else if(numel <= 16 * 8192)
                     ll128_bs = 256;
-                else if(numel <= 128 * 7168)
+                else if(numel <= 64 * 7168)
                     ll128_bs = 512;
-                else if(numel <= 256 * 8192)
-                    ll128_bs = 1024;
             }
             if(ll_bs)
             {
