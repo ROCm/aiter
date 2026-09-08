@@ -19,28 +19,26 @@ from flydsl.expr.typing import T
 from flydsl.expr.utils.arith import _to_raw as _raw
 from flydsl.runtime.device import get_rocm_arch as get_hip_arch
 
-from aiter.ops.flydsl.kernels.fmha_gfx950.flash_attn_utils_pipeline import (
-    DualwaveFp8GemmHelper,
-    DualwaveFp8KernelContext,
-    DualwaveFp8KvGmemToLdsLoader,
-    DualwaveFp8KvLdsToVgprLoader,
-    DualwaveFp8QLoader,
-    DualwaveFp8SoftmaxHelper,
-    DualwaveFp8StoreHelper,
-)
-from aiter.ops.flydsl.kernels.fmha_gfx950.flash_attn_utils_primitives import (
-    MIN_Q_BLOCKS_XCD_SWIZZLE,
-    NUM_XCD_GFX950,
-    _s_setprio,
-    _stagger_extra_barrier_if_one,
-    _waitcnt_vm_n,
-)
-from aiter.ops.flydsl.kernels.fmha_gfx950.flash_attn_utils_splitk import (
+from aiter.ops.flydsl.kernels.fmha_gfx950.op_combine import (
     DualwaveSplitKCombineContext,
     DualwaveSplitKCombineHelper,
 )
-from aiter.ops.flydsl.kernels.fmha_gfx950.flash_attn_utils_traits import (
+from aiter.ops.flydsl.kernels.fmha_gfx950.op_epilog import DualwaveFp8StoreHelper
+from aiter.ops.flydsl.kernels.fmha_gfx950.op_gemm import DualwaveFp8GemmHelper
+from aiter.ops.flydsl.kernels.fmha_gfx950.op_lds import (
+    DualwaveFp8KvGmemToLdsLoader,
+    DualwaveFp8KvLdsToVgprLoader,
+    DualwaveFp8QLoader,
+)
+from aiter.ops.flydsl.kernels.fmha_gfx950.op_softmax import DualwaveFp8SoftmaxHelper
+from aiter.ops.flydsl.kernels.fmha_gfx950.pipeline import (
+    MIN_Q_BLOCKS_XCD_SWIZZLE,
+    NUM_XCD_GFX950,
+    DualwaveFp8KernelContext,
     _make_dualwave_swp_fp8_traits,
+    _s_setprio,
+    _stagger_extra_barrier_if_one,
+    _waitcnt_vm_n,
     dualwave_fp8_dma_per_iter,
 )
 from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled

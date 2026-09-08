@@ -20,11 +20,11 @@ import functools
 
 import torch
 
-from aiter.ops.flydsl.kernels.fmha_gfx950.flash_attn_utils_primitives import (
-    DUALWAVE_SWP_BLOCK_M,
-)
-from aiter.ops.flydsl.kernels.fmha_gfx950.flash_attn_utils_splitk import (
+from aiter.ops.flydsl.kernels.fmha_gfx950.op_combine import (
     dualwave_splitk_workspace_elems,
+)
+from aiter.ops.flydsl.kernels.fmha_gfx950.pipeline import (
+    DUALWAVE_SWP_BLOCK_M,
 )
 
 __all__ = ["dualwave_splitk_workspace_elems", "flydsl_flash_attn_fp8_func"]
