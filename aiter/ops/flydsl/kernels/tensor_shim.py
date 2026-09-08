@@ -53,7 +53,7 @@ _BUF_COPY_ATOM = {
 BUF_VIEW_MAX_ELEMS = 0xFFFFFFFF
 
 
-def ptr_rsrc(ptr, num_records_bytes=None):
+def ptr_rsrc(ptr):
     """Convert an fx.Pointer kernel arg to a buffer resource for buffer_load/store.
 
     Kept for kernels still on the raw `buffer_ops` path; migrated kernels should
@@ -61,35 +61,7 @@ def ptr_rsrc(ptr, num_records_bytes=None):
     """
     from aiter.ops.flydsl.kernels import buffer_ops
 
-    return buffer_ops.create_buffer_resource_from_addr(
-        fx.Int64(ptrtoint(ptr)), num_records_bytes=num_records_bytes
-    )
-
-
-def ptr_buf_scalar(ptr, num_records_bytes=None):
-    """Return a wave-uniform 32-bit ``s.buffer.load`` accessor.
-
-    The returned callable accepts an element offset and a width of one or four
-    dwords. Values are returned as raw i32 bits so callers can either consume
-    integer data directly or bitcast floating-point data without routing the
-    load through per-lane VGPR addressing. ``ptr`` may be either an opaque
-    ``fx.Pointer`` or a shaped ``fx.Tensor`` kernel argument.
-    """
-    from aiter.ops.flydsl.kernels import buffer_ops
-
-    if isinstance(ptr, fx.Pointer):
-        rsrc = ptr_rsrc(ptr, num_records_bytes=num_records_bytes)
-    else:
-        rsrc = buffer_ops.create_buffer_resource(
-            ptr,
-            max_size=num_records_bytes is None,
-            num_records_bytes=num_records_bytes,
-        )
-
-    def load(offset=0, vec_width=1):
-        return buffer_ops.buffer_load(rsrc, offset, vec_width=vec_width, is_scalar=True)
-
-    return load
+    return buffer_ops.create_buffer_resource_from_addr(fx.Int64(ptrtoint(ptr)))
 
 
 def buf_base_i64(base):

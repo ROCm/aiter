@@ -38,7 +38,7 @@ from flydsl.expr.typing import ReductionOp, T
 from flydsl.runtime.device import get_rocm_arch
 
 from . import dpp_utils
-from .tensor_shim import ptr_buf_scalar
+from .tensor_shim import ptr_buf_tensor
 from .utils import cdiv, exp2_amdgcn_scalar, exp2_f32_fast, rcp_f32
 
 MFMA_MNK = (
@@ -237,13 +237,13 @@ def compile_pa_decode_tile(
                 copy_op, fx.rocdl.CopyOpCDNA3BufferCopyType
             )
             copy_atom = fx.make_copy_atom(copy_op, elem_ty)
+            if const_expr(use_buffer_resource):
+                flat = ptr_buf_tensor(tensor_ptr, elem_ty, n=extent)
+            else:
+                flat = fx.Tensor(
+                    fx.make_view(fx.get_iter(tensor_ptr), fx.make_layout(extent, 1))
+                )
             reg = fx.make_rmem_tensor(fx.make_layout(reg_width, 1), elem_ty)
-            base_iter = (
-                fx.get_iter(fx.rocdl.make_buffer_tensor(tensor_ptr, max_size=True))
-                if use_buffer_resource
-                else fx.get_iter(tensor_ptr)
-            )
-            flat = fx.Tensor(fx.make_view(base_iter, fx.make_layout(extent, 1)))
             div = fx.logical_divide(flat, fx.make_layout(1, 1))
 
             def _load(elem_idx):
@@ -295,16 +295,19 @@ def compile_pa_decode_tile(
         bt_num_records_bytes = (
             fx.Index(gpu.grid_dim.x) * fx.Index(max_blocks_per_seq) * 4
         )  # int32 entries
-        bt_load = ptr_buf_scalar(
-            block_tables_ptr, num_records_bytes=bt_num_records_bytes
+        bt_buf = ptr_buf_tensor(
+            block_tables_ptr,
+            fx.Int32,
+            unit_elems=PAGES_PER_CHUNK,
+            num_records_bytes=bt_num_records_bytes,
         )
         # Per-tensor: a single global scale, read once. Per-token: read
         # per-token instead (see _kv_scale_ops/_stage_kv_scale_to_lds below).
         if const_expr(not per_token_kv):
-            key_scale_load = ptr_buf_scalar(key_scale_ptr)
-            value_scale_load = ptr_buf_scalar(value_scale_ptr)
-            key_scale = fx.Int32(key_scale_load()).bitcast(fx.Float32)
-            value_scale = fx.Int32(value_scale_load()).bitcast(fx.Float32)
+            key_scale_buf = ptr_buf_tensor(key_scale_ptr, fx.Float32)
+            value_scale_buf = ptr_buf_tensor(value_scale_ptr, fx.Float32)
+            key_scale = fx.Float32(key_scale_buf[0])
+            value_scale = fx.Float32(value_scale_buf[0])
 
         num_tiles = cdiv(context_len, TILE_TOK)
         num_pages = cdiv(context_len, block_size)  # pages this sequence really owns
@@ -361,12 +364,19 @@ def compile_pa_decode_tile(
             # Past `num_pages` the block-table entry is padding: whatever the
             # caller left there, often a stale id pointing at another sequence's
             # live page. Pin those to block 0 so the tokens the softmax masks
-            # out always resolve to one known, in-bounds page instead. `page` is
-            # wave-uniform, so the clamp is scalar.
-            result = bt_load(seq * max_blocks_per_seq + page, vec_width)
+            # out always resolve to one known, in-bounds page instead.
+            element_offset = seq * max_blocks_per_seq + page
             if const_expr(vec_width == 1):
+                result = bt_buf[element_offset]
                 return (page < num_pages).select(fx.Int32(result), fx.Int32(0))
-            loaded = fx.Vector(result)
+            bt_copy_atom = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), fx.Int32)
+            frag = fx.make_fragment_like(fx.slice(bt_buf, (0, None)))
+            fx.copy(
+                bt_copy_atom,
+                fx.slice(bt_buf, (element_offset // fx.Int32(vec_width), None)),
+                frag,
+            )
+            loaded = fx.Vector(fx.memref_load_vec(frag))
             return fx.Vector.from_elements(
                 [
                     (page + i < num_pages).select(fx.Int32(loaded[i]), fx.Int32(0))
