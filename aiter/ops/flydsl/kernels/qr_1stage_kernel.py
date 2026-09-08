@@ -31,8 +31,8 @@ from .qr_int4_kernel import (
     _CM_SC1,
     _INBOX_POLICY,
     SUPPORTED_WORLDS,
+    _acquire_inbox,
     _i32_to_bytes,
-    _invalidate_l1,
     _store_v4i32_peer_multi,
     _to_sgpr_i64,
 )
@@ -365,24 +365,26 @@ def make_qr_1stage_kernel(
                 flag_rsrc = buffer_ops.create_buffer_resource_from_addr(
                     peer_vec[rank] + _i32_to_bytes(elem)
                 )
-                current = _load_i32_at(flag_rsrc, fx.Int32(0), _CM_SC1)
+                # `sc0 sc1`, so each retry is fetched past L1 and L2 and no
+                # fence is needed in the loop; the acquire below covers the
+                # payload reads, once, after the join.
+                current = _load_i32_at(flag_rsrc, fx.Int32(0), _RECV_POLICY)
                 while current != color:
                     if spin_sleep:
-                        # Back off between polls. Each iteration costs an L1
-                        # invalidate plus an sc1 load, and under arrival skew
-                        # that runs for the whole skew window against the same
-                        # line the peer is trying to write.
+                        # Back off between polls. Each iteration is a load that
+                        # bypasses both caches, and under arrival skew that runs
+                        # for the whole skew window against the same line the
+                        # peer is trying to write.
                         llvm.InlineAsmOp(
                             None, [], f"s_sleep {spin_sleep}", "", has_side_effects=True
                         )
-                    current = _load_i32_at(flag_rsrc, fx.Int32(0), _CM_SC1)
-                    _invalidate_l1()
+                    current = _load_i32_at(flag_rsrc, fx.Int32(0), _RECV_POLICY)
             gpu.barrier()
             rocdl.s_waitcnt(vmcnt=0)
             if release_writeback is not None:
                 llvm.InlineAsmOp(None, [], release_writeback, "", has_side_effects=True)
                 rocdl.s_waitcnt(vmcnt=0)
-            _invalidate_l1()
+            _acquire_inbox()
 
         def _reduce(parity):
             """Sum this thread's atom across all N inbox copies, in rank order.

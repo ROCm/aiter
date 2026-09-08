@@ -52,6 +52,7 @@ from .qr_int4_kernel import (
     WAVE,
     WAVES,
     PackStorage,
+    _acquire_inbox,
     _atom_bf16_to_f16,
     _atom_f16_to_bf16,
     _clamp_fp16_overflow,
@@ -59,7 +60,6 @@ from .qr_int4_kernel import (
     _codec_quant,
     _e4m3_decoding_scale,
     _i32_to_bytes,
-    _invalidate_l1,
     _store_v4i32_peer,
     _to_sgpr_i64,
 )
@@ -466,18 +466,27 @@ def make_qr_int4_ring_kernel(
             """
             if tid == fx.Int32(0):
                 elem = _slot_i32(step, fx.Int32(0)) + fx.Int32(release_i32_off)
-                current = _load_i32_at(self_rsrc, elem, _CM_SC1)
+                # `sc0 sc1`, so each retry is fetched past L1 and L2 and no
+                # fence is needed in the loop; the acquire below covers the
+                # payload reads, once, after the join.
+                current = _load_i32_at(self_rsrc, elem, _RECV_POLICY)
                 while current != color:
-                    current = _load_i32_at(self_rsrc, elem, _CM_SC1)
-                    _invalidate_l1()
+                    current = _load_i32_at(self_rsrc, elem, _RECV_POLICY)
             gpu.barrier()
             # Unconditional, *after* the join, and not just inside the spin.
-            # The flag is read `sc1` so it is never stale, but the payload is
-            # read `nt` -- a hint, not a bypass -- so it can be answered from a
-            # line this CU cached before the predecessor wrote it. Invalidating
-            # only on a failed spin leaves the common case uncovered: when the
-            # flag is already present on the first read the loop body never
-            # runs, and the payload loads below can be served stale.
+            # Only `tid == 0` spins, so an acquire inside the loop would cover
+            # one lane of one wave and leave the rest of the workgroup reading
+            # the payload with nothing invalidated on its behalf -- and would be
+            # skipped entirely in the common case where the flag is already set
+            # on the first read.
+            #
+            # This is now defensive rather than load-bearing: `_RECV_POLICY` is
+            # `sc0 sc1`, so the payload loads below already bypass both caches
+            # and cannot be served a stale line on their own. It is kept because
+            # it costs one fence per step and the failure it guards against is a
+            # silent wrong result. (An earlier version of this comment said the
+            # payload was read `nt`; that describes the two-shot kernel, not
+            # this one -- see the note on _RECV_POLICY above.)
             #
             # Write back *before* invalidating. The ring stores
             # one chunk per all-gather op and then waits again -- so an acquire
@@ -486,7 +495,7 @@ def make_qr_int4_ring_kernel(
             rocdl.s_waitcnt(vmcnt=0)
             llvm.InlineAsmOp(None, [], "buffer_wbl2 sc1", "", has_side_effects=True)
             rocdl.s_waitcnt(vmcnt=0)
-            _invalidate_l1()
+            _acquire_inbox()
 
         def _op_substep(k, tile, sub):
             """One op of the ring, for one sub-tile. Stages LDS; does not send.

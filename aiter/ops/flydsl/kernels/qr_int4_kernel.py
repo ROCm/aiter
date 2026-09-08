@@ -55,10 +55,22 @@ LDS_BYTES = ATOMS * RANK_TILE_BYTES
 # Wire/inbox addresses are byte pointers; tile math is in i32 slots.
 I32_BYTES = 4
 
-# gfx942 buffer aux: bit 0 = sc0, bit 1 = sc1 (bypass L2), bit 2 = NT.
+# Buffer aux bits on gfx942/gfx950. This is LLVM's CPol encoding, which the
+# backend renames for CDNA: bit 0 (GLC) prints as `sc0`, bit 1 (SLC) as `nt`,
+# bit 4 (SCC) as `sc1`. Bit 2 exists in the encoding but CDNA has no use for
+# it, so it is dropped and emits nothing.
+#
+# These were previously 1/2/4, which is the bit order the names suggest but not
+# the one the hardware uses. The consequence was silent and invisible from the
+# source: `_CM_SC1` emitted `nt` (a hint, not a bypass) and `_CM_NT` emitted no
+# modifier at all. It only shows up in the disassembly -- every other coherence
+# op in this file is inline asm and so was unaffected.
+#
+# Verified against the gfx950 backend: aux 1 -> `sc0`, 2 -> `nt`, 4 -> (none),
+# 16 -> `sc1`, 17 -> `sc0 sc1`, 18 -> `nt sc1`.
 _CM_SC0 = 1
-_CM_SC1 = 2
-_CM_NT = 4
+_CM_NT = 2
+_CM_SC1 = 16
 
 # Cache policy for the peer stores in _fanout_nt / _publish, per inbox memory
 # type. See docs/qr_int4_mi350p.md.
@@ -448,15 +460,41 @@ def _load_i32_nt(rsrc, elem_off, cache_modifier=_CM_NT):
 
 
 def _load_i32_uncached(rsrc):
+    """One i32 that cannot be answered from this device's caches.
+
+    ``sc0 sc1`` is what LLVM itself emits for a system-scope load, and it is
+    what makes a spin loop safe without a fence in the loop body: the value
+    is fetched past L1 and L2 every time, so no retry can see a stale line.
+    ``sc1`` alone would only bypass L2.
+    """
     val = buffer_ops.buffer_load(
-        rsrc, 0, vec_width=1, dtype=T.i32, cache_modifier=_CM_SC1
+        rsrc, 0, vec_width=1, dtype=T.i32, cache_modifier=_CM_SC0 | _CM_SC1
     )
     rocdl.s_waitcnt(vmcnt=0)
     return fx.Int32(val)
 
 
-def _invalidate_l1():
-    llvm.InlineAsmOp(None, [], "buffer_inv sc1", "", has_side_effects=True)
+def _acquire_inbox():
+    """Acquire fence over global memory, system scope.
+
+    Replaces a raw ``buffer_inv sc1`` asm. On gfx950 the memory legalizer
+    lowers this to ``s_waitcnt vmcnt(0)`` + ``buffer_inv sc0 sc1``, so the
+    encoding comes from the target rather than from a string in this file.
+    ``one-as`` scopes it to global memory, which is why it does not also
+    wait on ``lgkmcnt``.
+
+    System scope, not agent. The data being acquired was written by another
+    GPU, and another GPU is a different agent: agent scope lowers to
+    ``buffer_inv sc1``, which clears L2 but leaves the vector L1 holding
+    whatever it had. That is what the old asm did.
+
+    Call this **once, after the workgroup joins** -- not inside a spin loop.
+    A flag load that carries ``sc0 sc1`` can never be answered from a stale
+    line, so the retry loop needs no fence of its own; what needs one is the
+    payload read that follows, and that needs it exactly once. See
+    :func:`make_qr_int4_kernel._wait_release`.
+    """
+    llvm.fence(llvm.AtomicOrdering.acquire, syncscope="one-as")
 
 
 @fx.struct
@@ -767,10 +805,12 @@ def make_qr_int4_kernel(
                 _store_v4i32_peer(dest + byte_off, v4, flag_policy)
 
         def _wait_flag(flag_rsrc, color):
+            # No fence in the loop body: _load_i32_uncached carries `sc0 sc1`,
+            # so a retry cannot be served from a stale line. The acquire the
+            # payload reads need is in _wait_release, once, after the join.
             current = _load_i32_uncached(flag_rsrc)
             while current != color:
                 current = _load_i32_uncached(flag_rsrc)
-                _invalidate_l1()
 
         def _wait_release(phase, color):
             if tid < world_size:
@@ -784,6 +824,12 @@ def make_qr_int4_kernel(
                     color,
                 )
             gpu.barrier()
+            # Unconditional and after the join. Only `tid < world_size` spun,
+            # so scoping the acquire to the spin would leave the other waves
+            # of this workgroup reading the payload with nothing invalidated
+            # on their behalf -- and would also skip it entirely in the common
+            # case where the flag is already set on the first read.
+            _acquire_inbox()
 
         def _recv_quantized(phase, src, sub, k=0):
             # Packed dword is at base+tid; scale dword is 1024 B later at a
