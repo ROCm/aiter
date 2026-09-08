@@ -694,7 +694,7 @@ def mxfp4_moe_gemm2(
             a_dtype, b_dtype, epilog, out_dtype,
         )
         and _kstatic
-        and not (has_pad or persist or is_ep)
+        and not (persist or is_ep)
         and bias is None
         and os.environ.get("MXFP4_G2_PREFETCH_IDS", "1") == "1"
     )
