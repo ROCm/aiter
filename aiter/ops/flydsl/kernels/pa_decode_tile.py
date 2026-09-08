@@ -230,24 +230,17 @@ def compile_pa_decode_tile(
         part = fx.Int32(gpu.block_id("z"))  # context partition handled by this CTA
         n_kv = fx.Int32(gpu.grid_dim.y)  # num_kv_heads == gridDim.y
 
-        # fx.copy-based flat loaders: K/V/context_len over a raw pointer, Q over
-        # a buffer resource.
-        def _make_flat_loader(tensor_ptr, elem_ty, reg_width, copy_op, extent=1 << 30):
-            use_buffer_resource = isinstance(
-                copy_op, fx.rocdl.CopyOpCDNA3BufferCopyType
-            )
-            copy_atom = fx.make_copy_atom(copy_op, elem_ty)
-            if const_expr(use_buffer_resource):
-                flat = ptr_buf_tensor(tensor_ptr, elem_ty, n=extent)
-            else:
-                flat = fx.Tensor(
-                    fx.make_view(fx.get_iter(tensor_ptr), fx.make_layout(extent, 1))
-                )
+        # K/V use raw UniversalCopy so their optional i64 offsets remain intact.
+        def _make_raw_flat_loader(tensor_ptr, elem_ty, reg_width, extent):
+            copy_atom = fx.make_copy_atom(fx.UniversalCopy128b(), elem_ty)
             reg = fx.make_rmem_tensor(fx.make_layout(reg_width, 1), elem_ty)
-            div = fx.logical_divide(flat, fx.make_layout(1, 1))
+            flat = fx.Tensor(
+                fx.make_view(fx.get_iter(tensor_ptr), fx.make_layout(extent, 1))
+            )
+            tiled = fx.logical_divide(flat, fx.make_layout(1, 1))
 
             def _load(elem_idx):
-                fx.copy(copy_atom, fx.slice(div, (None, elem_idx)), reg)
+                fx.copy(copy_atom, fx.slice(tiled, (None, elem_idx)), reg)
                 return fx.Vector(fx.memref_load_vec(reg))
 
             return _load
@@ -255,12 +248,8 @@ def compile_pa_decode_tile(
         # A cache above 2 GiB overflows an i32 element offset, so the flat view
         # and the offsets below widen together.
         KV_EXTENT = (1 << 42) if wide_kv_addressing else (1 << 30)
-        _k_load_fp8x16 = _make_flat_loader(
-            key_cache_ptr, FP8, 16, fx.UniversalCopy128b(), KV_EXTENT
-        )
-        _v_load_fp8x16 = _make_flat_loader(
-            value_cache_ptr, FP8, 16, fx.UniversalCopy128b(), KV_EXTENT
-        )
+        _k_load_fp8x16 = _make_raw_flat_loader(key_cache_ptr, FP8, 16, KV_EXTENT)
+        _v_load_fp8x16 = _make_raw_flat_loader(value_cache_ptr, FP8, 16, KV_EXTENT)
 
         def _kv_addr(phys, page_elems, rest):
             # `phys * page_elems` is the term that overflows first: it reaches
@@ -276,10 +265,23 @@ def compile_pa_decode_tile(
         _q_copy_op = (
             fx.rocdl.BufferCopy128b() if QLOAD_UNIT == 8 else fx.rocdl.BufferCopy64b()
         )
-        _q_load_chunk = _make_flat_loader(query_ptr, Q_DTYPE, QLOAD_UNIT, _q_copy_op)
-        _ctxlen_load = _make_flat_loader(
-            context_lengths_ptr, fx.Int32, 1, fx.rocdl.BufferCopy32b()
-        )
+        q_buf = ptr_buf_tensor(query_ptr, Q_DTYPE)
+        q_tiled = fx.logical_divide(q_buf, fx.make_layout(1, 1))
+        q_copy_atom = fx.make_copy_atom(_q_copy_op, Q_DTYPE)
+        q_reg = fx.make_rmem_tensor(fx.make_layout(QLOAD_UNIT, 1), Q_DTYPE)
+
+        def _q_load_chunk(elem_idx):
+            fx.copy(q_copy_atom, fx.slice(q_tiled, (None, elem_idx)), q_reg)
+            return fx.Vector(fx.memref_load_vec(q_reg))
+
+        ctx_buf = ptr_buf_tensor(context_lengths_ptr, fx.Int32)
+        ctx_tiled = fx.logical_divide(ctx_buf, fx.make_layout(1, 1))
+        ctx_copy_atom = fx.make_copy_atom(fx.rocdl.BufferCopy32b(), fx.Int32)
+        ctx_reg = fx.make_rmem_tensor(fx.make_layout(1, 1), fx.Int32)
+
+        def _ctxlen_load(elem_idx):
+            fx.copy(ctx_copy_atom, fx.slice(ctx_tiled, (None, elem_idx)), ctx_reg)
+            return fx.Vector(fx.memref_load_vec(ctx_reg))
 
         def _k_load16(byte_off):
             return _k_load_fp8x16(byte_off).bitcast(fx.Int64)
@@ -353,12 +355,33 @@ def compile_pa_decode_tile(
                 if block_size == 64
                 else fx.rocdl.BufferCopy32b()
             )
-            _k_scale_load = _make_flat_loader(
-                key_scale_ptr, fx.Float32, scale_load_width, scale_copy_op
+            scale_copy_atom = fx.make_copy_atom(scale_copy_op, fx.Float32)
+            k_scale_buf = ptr_buf_tensor(key_scale_ptr, fx.Float32)
+            v_scale_buf = ptr_buf_tensor(value_scale_ptr, fx.Float32)
+            k_scale_tiled = fx.logical_divide(k_scale_buf, fx.make_layout(1, 1))
+            v_scale_tiled = fx.logical_divide(v_scale_buf, fx.make_layout(1, 1))
+            k_scale_reg = fx.make_rmem_tensor(
+                fx.make_layout(scale_load_width, 1), fx.Float32
             )
-            _v_scale_load = _make_flat_loader(
-                value_scale_ptr, fx.Float32, scale_load_width, scale_copy_op
+            v_scale_reg = fx.make_rmem_tensor(
+                fx.make_layout(scale_load_width, 1), fx.Float32
             )
+
+            def _k_scale_load(elem_idx):
+                fx.copy(
+                    scale_copy_atom,
+                    fx.slice(k_scale_tiled, (None, elem_idx)),
+                    k_scale_reg,
+                )
+                return fx.Vector(fx.memref_load_vec(k_scale_reg))
+
+            def _v_scale_load(elem_idx):
+                fx.copy(
+                    scale_copy_atom,
+                    fx.slice(v_scale_tiled, (None, elem_idx)),
+                    v_scale_reg,
+                )
+                return fx.Vector(fx.memref_load_vec(v_scale_reg))
 
         def _load_phys_scalar(page, vec_width=1):
             # Past `num_pages` the block-table entry is padding: whatever the
