@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Large-M merged MoE front for Kimi-K3."""
+"""Decode-hot and large-M merged MoE front for Kimi-K3."""
 
 from __future__ import annotations
 

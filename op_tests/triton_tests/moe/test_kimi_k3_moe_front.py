@@ -6,6 +6,7 @@ import torch
 
 from aiter.jit.utils.chip_info import get_gfx_runtime
 from aiter.ops.triton.kimi_k3_moe_front import (
+    kimi_k3_moe_front_large_m_bf16,
     kimi_k3_moe_front_bf16_epilogue,
     merge_kimi_k3_moe_front_weights,
 )
@@ -134,3 +135,62 @@ def test_merge_weights_preserves_native_row_order():
         merged[SHARED_GATE_UP + NUM_EXPERTS :],
         routed,
     )
+
+
+def test_m7_full_front_matches_reference():
+    m = 7
+    generator = torch.Generator(device="cuda").manual_seed(20260908)
+    hidden_states = torch.randn(
+        (m, HIDDEN),
+        dtype=torch.bfloat16,
+        device="cuda",
+        generator=generator,
+    )
+    shared_weight = (
+        torch.randn(
+            (SHARED_GATE_UP, HIDDEN),
+            dtype=torch.bfloat16,
+            device="cuda",
+            generator=generator,
+        )
+        * 0.02
+    )
+    router_weight = (
+        torch.randn(
+            (NUM_EXPERTS, HIDDEN),
+            dtype=torch.bfloat16,
+            device="cuda",
+            generator=generator,
+        )
+        * 0.02
+    )
+    routed_weight = (
+        torch.randn(
+            (ROUTED_LATENT, HIDDEN),
+            dtype=torch.bfloat16,
+            device="cuda",
+            generator=generator,
+        )
+        * 0.02
+    )
+    merged_weight = merge_kimi_k3_moe_front_weights(
+        shared_weight,
+        router_weight,
+        routed_weight,
+    )
+
+    actual = kimi_k3_moe_front_large_m_bf16(
+        hidden_states,
+        merged_weight,
+    )
+    front_reference = torch.mm(
+        hidden_states,
+        merged_weight.t(),
+        out_dtype=torch.float32,
+    )
+    expected = _reference(front_reference)
+    torch.cuda.synchronize()
+
+    torch.testing.assert_close(actual[0], expected[0], rtol=0.01, atol=0.005)
+    torch.testing.assert_close(actual[1], expected[1], rtol=0.01, atol=0.01)
+    torch.testing.assert_close(actual[2], expected[2], rtol=0.01, atol=0.005)
