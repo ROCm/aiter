@@ -80,7 +80,7 @@ def get_kernel_config(m, n, k, routing_data):
     if block_m == 16:
         block_n = 256
         block_k = 128
-        num_warps = 4
+        num_warps = 8
 
         grid_m = routing_data.n_blocks(m, block_m)
         grid_n = triton.cdiv(n, block_n)

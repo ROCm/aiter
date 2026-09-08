@@ -7,25 +7,18 @@ import triton.language as tl
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
 from aiter.ops.triton.utils.conv_config_utils import get_conv_config
 
-from ..activation import _gelu_tanh, _relu, _relu6
-from .helpers import CONV_AUTOTUNE_ENABLED
+from ..activation import _apply_activation_from_str
 
 
 def _get_config_input(shape_key=None, M=None):
-    if CONV_AUTOTUNE_ENABLED:
-        return {}
     return get_conv_config("CONV-WINO-F4X3-INPUT", shape_key=shape_key, M=M)
 
 
 def _get_config_gemm(shape_key=None, M=None):
-    if CONV_AUTOTUNE_ENABLED:
-        return {}
     return get_conv_config("CONV-WINO-F4X3-GEMM", shape_key=shape_key, M=M)
 
 
 def _get_config_output(shape_key=None, M=None):
-    if CONV_AUTOTUNE_ENABLED:
-        return {}
     return get_conv_config("CONV-WINO-F4X3-OUTPUT", shape_key=shape_key, M=M)
 
 
@@ -957,7 +950,7 @@ def _winograd_f4x3_output_transform_kernel(
 
     # Bias
     if HAS_BIAS:
-        bias = tl.load(BIAS + offs_k, mask=k_mask, other=0.0)
+        bias = tl.load(BIAS + offs_k, mask=k_mask, other=0.0).to(tl.float32)
         y00 += bias
         y01 += bias
         y02 += bias
@@ -976,57 +969,22 @@ def _winograd_f4x3_output_transform_kernel(
         y33 += bias
 
     # Activation
-    if ACTIVATION == "relu":
-        y00 = _relu(y00)
-        y01 = _relu(y01)
-        y02 = _relu(y02)
-        y03 = _relu(y03)
-        y10 = _relu(y10)
-        y11 = _relu(y11)
-        y12 = _relu(y12)
-        y13 = _relu(y13)
-        y20 = _relu(y20)
-        y21 = _relu(y21)
-        y22 = _relu(y22)
-        y23 = _relu(y23)
-        y30 = _relu(y30)
-        y31 = _relu(y31)
-        y32 = _relu(y32)
-        y33 = _relu(y33)
-    elif ACTIVATION == "relu6":
-        y00 = _relu6(y00)
-        y01 = _relu6(y01)
-        y02 = _relu6(y02)
-        y03 = _relu6(y03)
-        y10 = _relu6(y10)
-        y11 = _relu6(y11)
-        y12 = _relu6(y12)
-        y13 = _relu6(y13)
-        y20 = _relu6(y20)
-        y21 = _relu6(y21)
-        y22 = _relu6(y22)
-        y23 = _relu6(y23)
-        y30 = _relu6(y30)
-        y31 = _relu6(y31)
-        y32 = _relu6(y32)
-        y33 = _relu6(y33)
-    elif ACTIVATION == "gelu":
-        y00 = _gelu_tanh(y00)
-        y01 = _gelu_tanh(y01)
-        y02 = _gelu_tanh(y02)
-        y03 = _gelu_tanh(y03)
-        y10 = _gelu_tanh(y10)
-        y11 = _gelu_tanh(y11)
-        y12 = _gelu_tanh(y12)
-        y13 = _gelu_tanh(y13)
-        y20 = _gelu_tanh(y20)
-        y21 = _gelu_tanh(y21)
-        y22 = _gelu_tanh(y22)
-        y23 = _gelu_tanh(y23)
-        y30 = _gelu_tanh(y30)
-        y31 = _gelu_tanh(y31)
-        y32 = _gelu_tanh(y32)
-        y33 = _gelu_tanh(y33)
+    y00 = _apply_activation_from_str(y00, ACTIVATION)
+    y01 = _apply_activation_from_str(y01, ACTIVATION)
+    y02 = _apply_activation_from_str(y02, ACTIVATION)
+    y03 = _apply_activation_from_str(y03, ACTIVATION)
+    y10 = _apply_activation_from_str(y10, ACTIVATION)
+    y11 = _apply_activation_from_str(y11, ACTIVATION)
+    y12 = _apply_activation_from_str(y12, ACTIVATION)
+    y13 = _apply_activation_from_str(y13, ACTIVATION)
+    y20 = _apply_activation_from_str(y20, ACTIVATION)
+    y21 = _apply_activation_from_str(y21, ACTIVATION)
+    y22 = _apply_activation_from_str(y22, ACTIVATION)
+    y23 = _apply_activation_from_str(y23, ACTIVATION)
+    y30 = _apply_activation_from_str(y30, ACTIVATION)
+    y31 = _apply_activation_from_str(y31, ACTIVATION)
+    y32 = _apply_activation_from_str(y32, ACTIVATION)
+    y33 = _apply_activation_from_str(y33, ACTIVATION)
 
     # Store 4x4 output tile
     n_valid = n < N
@@ -1078,84 +1036,3 @@ def _winograd_f4x3_output_transform_kernel(
                         tl.store(
                             y_base + p * stride_y_p + q * stride_y_q, val, mask=k_mask
                         )
-
-
-# Autotune search spaces (used when AITER_TRITON_CONV_AUTOTUNE=1).
-AUTOTUNE_WINO_GEMM_CONFIGS = [
-    triton.Config(
-        {"BLOCK_M": 128, "BLOCK_N": 128, "BLOCK_K": 64, "GROUP_SIZE_M": 8},
-        num_warps=8,
-        num_stages=1,
-    ),
-    triton.Config(
-        {"BLOCK_M": 128, "BLOCK_N": 64, "BLOCK_K": 64, "GROUP_SIZE_M": 8},
-        num_warps=4,
-        num_stages=1,
-    ),
-    triton.Config(
-        {"BLOCK_M": 64, "BLOCK_N": 128, "BLOCK_K": 64, "GROUP_SIZE_M": 8},
-        num_warps=4,
-        num_stages=1,
-    ),
-    triton.Config(
-        {"BLOCK_M": 64, "BLOCK_N": 64, "BLOCK_K": 64, "GROUP_SIZE_M": 4},
-        num_warps=4,
-        num_stages=1,
-    ),
-    # gfx1100 (RDNA3): smaller tiles / fewer warps for small-T buckets.
-    triton.Config(
-        {"BLOCK_M": 32, "BLOCK_N": 64, "BLOCK_K": 64, "GROUP_SIZE_M": 4},
-        num_warps=4,
-        num_stages=1,
-    ),
-    triton.Config(
-        {"BLOCK_M": 64, "BLOCK_N": 64, "BLOCK_K": 64, "GROUP_SIZE_M": 4},
-        num_warps=2,
-        num_stages=1,
-    ),
-]
-
-AUTOTUNE_WINO4_INPUT_CONFIGS = [
-    triton.Config({"BLOCK_C": 64}, num_warps=4, num_stages=1),
-    triton.Config({"BLOCK_C": 32}, num_warps=4, num_stages=1),
-    # gfx1100 (RDNA3): wider channel tile + a warp-8 option.
-    triton.Config({"BLOCK_C": 128}, num_warps=4, num_stages=1),
-    triton.Config({"BLOCK_C": 64}, num_warps=8, num_stages=1),
-    triton.Config({"BLOCK_C": 16}, num_warps=4, num_stages=1),
-]
-
-AUTOTUNE_WINO4_OUTPUT_CONFIGS = [
-    triton.Config({"BLOCK_K": 64}, num_warps=4, num_stages=1),
-    triton.Config({"BLOCK_K": 128}, num_warps=4, num_stages=1),
-    # gfx1100 (RDNA3): BLOCK_K=128 pegged the old ceiling on 17/19 shapes —
-    # probe larger, plus warp-8 options.
-    triton.Config({"BLOCK_K": 256}, num_warps=4, num_stages=1),
-    triton.Config({"BLOCK_K": 128}, num_warps=8, num_stages=1),
-    triton.Config({"BLOCK_K": 256}, num_warps=8, num_stages=1),
-]
-
-
-if CONV_AUTOTUNE_ENABLED:
-    _winograd_f4x3_input_transform_kernel = triton.autotune(
-        configs=AUTOTUNE_WINO4_INPUT_CONFIGS,
-        key=["T", "C_pad"],
-        cache_results=True,
-    )(_winograd_f4x3_input_transform_kernel)
-
-    _winograd_f4x3_cblocked_input_transform_kernel = triton.autotune(
-        configs=AUTOTUNE_WINO4_INPUT_CONFIGS,
-        key=["T", "C_pad"],
-        cache_results=True,
-    )(_winograd_f4x3_cblocked_input_transform_kernel)
-
-    _winograd_f4x3_batched_gemm_kernel = triton.autotune(
-        configs=AUTOTUNE_WINO_GEMM_CONFIGS,
-        key=["T", "K_out", "C_pad"],
-        cache_results=True,
-    )(_winograd_f4x3_batched_gemm_kernel)
-
-    _winograd_f4x3_output_transform_kernel = triton.autotune(
-        configs=AUTOTUNE_WINO4_OUTPUT_CONFIGS,
-        key=["T", "K_out"],
-        cache_results=True,
-    )(_winograd_f4x3_output_transform_kernel)

@@ -87,6 +87,10 @@ struct MlaMetadataV1KernelParameter
     int32_t topk;
     int32_t qk_batch_ratio;
     int32_t num_splits;
+    // auto_split (caller passed max_split_per_batch < 0): device derives the
+    // split count from workload; num_splits is only the upper bound.
+    // See mla_v12_effective_splits.
+    bool auto_split;
     bool is_causal;
     // round-robin context-parallel: when true, skip the per-qo-tile local-causal
     // KV trim (batch_tail) so each work spans the full local kv; the kernel masks

@@ -30,6 +30,7 @@ Run:
     python3 -m unittest op_tests.tuning_tests.test_config_shape_collision -v
 """
 
+import csv
 import os
 import shutil
 import sys
@@ -53,6 +54,7 @@ AITER_ROOT = os.path.dirname(
 # runtime; the merge set and dedup key are resolved entirely by get_config_file.
 FAMILIES = [
     ("AITER_CONFIG_GEMM_A4W4", "a4w4_blockscale_tuned_gemm"),
+    ("AITER_CONFIG_GEMM_A6W6", "a6w6_blockscale_tuned_gemm"),
     ("AITER_CONFIG_GEMM_A8W8", "a8w8_tuned_gemm"),
     ("AITER_CONFIG_GEMM_A8W8_BPRESHUFFLE", "a8w8_bpreshuffle_tuned_gemm"),
     ("AITER_CONFIG_GEMM_A8W8_BLOCKSCALE", "a8w8_blockscale_tuned_gemm"),
@@ -66,9 +68,15 @@ FAMILIES = [
         "AITER_CONFIG_BATCHED_GEMM_A8W8_BLOCKSCALE_MXSCALE",
         "batched_gemm_a8w8_blockscale_mxscale_tuned",
     ),
+    (
+        "AITER_CONFIG_BATCHED_GEMM_A8W8_BLOCKSCALE_MXSCALE_BPRESHUFFLE",
+        "batched_gemm_a8w8_blockscale_mxscale_bpreshuffle_tuned",
+    ),
     ("AITER_CONFIG_GEMM_BF16", "bf16_tuned_gemm"),
     ("AITER_CONFIG_FMOE", "tuned_fmoe"),
+    ("AITER_CONFIG_FHMOE", "tuned_fhmoe"),
     ("AITER_CONFIG_GROUPED_FMOE", "tuned_grouped_fmoe"),
+    ("AITER_CONFIG_GDN_K5_OPT", "chunk_gdn_h_opt_tuned"),
 ]
 
 
@@ -181,6 +189,9 @@ class TestConfigShapeCollision(unittest.TestCase):
     def test_a4w4_blockscale(self):
         self._check_family("AITER_CONFIG_GEMM_A4W4", "a4w4_blockscale_tuned_gemm")
 
+    def test_a6w6_blockscale(self):
+        self._check_family("AITER_CONFIG_GEMM_A6W6", "a6w6_blockscale_tuned_gemm")
+
     def test_a8w8(self):
         self._check_family("AITER_CONFIG_GEMM_A8W8", "a8w8_tuned_gemm")
 
@@ -212,14 +223,36 @@ class TestConfigShapeCollision(unittest.TestCase):
             "batched_gemm_a8w8_blockscale_mxscale_tuned",
         )
 
+    def test_batched_gemm_a8w8_blockscale_mxscale_bpreshuffle(self):
+        self._check_family(
+            "AITER_CONFIG_BATCHED_GEMM_A8W8_BLOCKSCALE_MXSCALE_BPRESHUFFLE",
+            "batched_gemm_a8w8_blockscale_mxscale_bpreshuffle_tuned",
+        )
+
     def test_bf16(self):
         self._check_family("AITER_CONFIG_GEMM_BF16", "bf16_tuned_gemm")
 
     def test_fmoe(self):
         self._check_family("AITER_CONFIG_FMOE", "tuned_fmoe")
 
+    def test_fhmoe(self):
+        merged = self._resolve(
+            self._tmp,
+            "AITER_CONFIG_FHMOE",
+            "tuned_fhmoe",
+        )
+        with open(merged, newline="") as f:
+            rows = list(csv.DictReader(f))
+        self.assertEqual(
+            {int(row["token"]) for row in rows},
+            {1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048},
+        )
+
     def test_grouped_fmoe(self):
         self._check_family("AITER_CONFIG_GROUPED_FMOE", "tuned_grouped_fmoe")
+
+    def test_gdn_k5_opt(self):
+        self._check_family("AITER_CONFIG_GDN_K5_OPT", "chunk_gdn_h_opt_tuned")
 
 
 def _fix_real_tree():

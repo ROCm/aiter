@@ -432,7 +432,7 @@ def _get_config(
     N: int,
     K: int,
     shuffle: bool = False,
-    backend: str | None = None,
+    backend: str = "triton",
 ):
     shuffle_suffix = "_PRESHUFFLED" if shuffle else ""
     config_name = f"GEMM-A8W8_BLOCKSCALE{shuffle_suffix}"
