@@ -11,11 +11,11 @@ from aiter.ops.triton._gluon_kernels.gfx950.moe.moe_op_gemm_a16w4 import (
     _moe_gemm_a16w4 as _moe_gemm_a16w4_gluon,
 )
 
-from aiter.ops.triton._gluon_kernels.gfx950.moe.moe_op_gemm_a16w4_v1_swizzle_only import (
-    _moe_gemm_a16w4 as _moe_gemm_a16w4_gluon_gfx950_v1_swizzle,
+from aiter.ops.triton._gluon_kernels.gfx950.moe.moe_op_gemm_a16w4_swizzle import (
+    _moe_gemm_a16w4 as _moe_gemm_a16w4_gluon_gfx950_swizzle,
 )
-from aiter.ops.triton._gluon_kernels.gfx950.moe.moe_op_gemm_a16w4_v2_swizzle_only import (
-    _moe_gemm_a16w4 as _moe_gemm_a16w4_gluon_gfx950_v2_swizzle,
+from aiter.ops.triton._gluon_kernels.gfx950.moe.moe_op_gemm_a16w4_swizzle_pipelined import (
+    _moe_gemm_a16w4 as _moe_gemm_a16w4_gluon_gfx950_swizzle_pipelined,
 )
 
 from aiter.ops.triton._gluon_kernels.gfx1250.moe.moe_op_gemm_a16w4 import (
@@ -148,7 +148,7 @@ def get_kernel_config_triton(m, n, k, routing_data):
     #print(f"m,n,k=({m},{n},{k}), ret={ret}")
     return ret
 
-def get_kernel_config_gluon_v2_swizzle(m, n, k, routing_data):
+def get_kernel_config_gluon_gfx950_pipelined(m, n, k, routing_data):
     block_m = routing_data.block_m
     group_m = 4
     num_xcds = 8
@@ -214,7 +214,7 @@ def get_kernel_config_gluon_v2_swizzle(m, n, k, routing_data):
     #print(f"m,n,k=({m},{n},{k}), ret={ret}")
     return ret
 
-def get_kernel_config_gluon_v1_swizzle(m, n, k, routing_data):
+def get_kernel_config_gluon_gfx950(m, n, k, routing_data):
     block_m = routing_data.block_m
     group_m = 4
     num_xcds = 8
@@ -278,7 +278,6 @@ def get_kernel_config_gluon_v1_swizzle(m, n, k, routing_data):
     }
     #print(f"m,n,k=({m},{n},{k}), ret={ret}")
     return ret
-
 
 def get_kernel_config_gluon_gfx1250(m, n, k, routing_data):
     block_m = routing_data.block_m
@@ -427,7 +426,6 @@ def moe_gemm_a16w4(
     assert quant_static_scale is None, "quant_static_scale must be none"
 
     # determine shapes
-
     M = x.shape[-2] if gather_indx is None else gather_indx.shape[0]
     K, N = x.shape[-1], w.shape[-1]
     block_m = routing_data.block_m
@@ -440,22 +438,24 @@ def moe_gemm_a16w4(
         w_scales_kernel = w_scales.transpose(1, 2)
 
     # compute optimization flags
-    use_v2 = False
     if backend == "gluon":
+        use_pipelined_gluon = False
         if get_arch() == "gfx1250":
             config = get_kernel_config_gluon(M, N, K, routing_data)
-        else:
+        elif get_arch() == "gfx950":
+            #Currently on gfx950, gluon kernels requires that swizzling is enabled
+            #and K % 256 == 0. Otherwise, fallback to Triton backend
             mask_k_limit = K % 256
             if mask_k_limit != 0 or swizzle_mx_scale is None:
                 backend = "triton"
                 config = get_kernel_config_triton(M, N, K, routing_data)
             else:
-                if use_v2:
-                    #print(f"v2 swizzle kernel")
-                    config = get_kernel_config_gluon_v2_swizzle(M, N, K, routing_data)       
+                #For smaller M, pipelined kernel performs much better
+                use_pipelined_gluon = True if M <=16 else False
+                if use_pipelined_gluon:
+                    config = get_kernel_config_gluon_gfx950_pipelined(M, N, K, routing_data)       
                 else:
-                    #print(f"v1 kernel")
-                    config = get_kernel_config_gluon_v1_swizzle(M, N, K, routing_data)
+                    config = get_kernel_config_gluon_gfx950(M, N, K, routing_data)
 
     else:
         config = get_kernel_config_triton(M, N, K, routing_data)
@@ -504,7 +504,6 @@ def moe_gemm_a16w4(
     grid_n = triton.cdiv(N, config["block_n"])
     grid = grid_m * grid_n * config["split_k"]
 
-    #print(f"M={M}, grid={grid}, grid_m={grid_m}, grid_n={grid_n}")
     # launch kernel
     if backend == "gluon":
         if get_arch() == "gfx1250":
@@ -561,8 +560,8 @@ def moe_gemm_a16w4(
                 kpack=config["kpack"],
             )
         else: #gfx950 gluon
-            if use_v2:
-              _moe_gemm_a16w4_gluon_gfx950_v2_swizzle[grid,](
+            if use_pipelined_gluon:
+              _moe_gemm_a16w4_gluon_gfx950_swizzle_pipelined[grid,](
               y,
               y.stride(0),
               y.stride(1),
@@ -618,9 +617,7 @@ def moe_gemm_a16w4(
               kpack=config["kpack"],
             )
             else:
-                #print(f"w_shape={w.shape} w_stride()= {w.stride()} {w.is_contiguous()}") 
-                #print(f"w_scales_shape={w_scales.shape} w_scales_stride()= {w_scales.stride()} {w_scales.is_contiguous()}") 
-                _moe_gemm_a16w4_gluon_gfx950_v1_swizzle[(grid,)](
+                _moe_gemm_a16w4_gluon_gfx950_swizzle[(grid,)](
                     y,
                     y.stride(0),
                     y.stride(1),
