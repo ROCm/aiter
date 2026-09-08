@@ -20,8 +20,10 @@ import functools
 
 import torch
 
-from aiter.ops.flydsl.kernels.fmha_gfx950.flash_attn_utils import (
+from aiter.ops.flydsl.kernels.fmha_gfx950.flash_attn_utils_primitives import (
     DUALWAVE_SWP_BLOCK_M,
+)
+from aiter.ops.flydsl.kernels.fmha_gfx950.flash_attn_utils_splitk import (
     dualwave_splitk_workspace_elems,
 )
 

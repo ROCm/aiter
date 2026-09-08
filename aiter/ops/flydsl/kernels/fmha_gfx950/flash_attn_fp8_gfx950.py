@@ -19,9 +19,7 @@ from flydsl.expr.typing import T
 from flydsl.expr.utils.arith import _to_raw as _raw
 from flydsl.runtime.device import get_rocm_arch as get_hip_arch
 
-from aiter.ops.flydsl.kernels.fmha_gfx950.flash_attn_utils import (
-    MIN_Q_BLOCKS_XCD_SWIZZLE,
-    NUM_XCD_GFX950,
+from aiter.ops.flydsl.kernels.fmha_gfx950.flash_attn_utils_pipeline import (
     DualwaveFp8GemmHelper,
     DualwaveFp8KernelContext,
     DualwaveFp8KvGmemToLdsLoader,
@@ -29,12 +27,20 @@ from aiter.ops.flydsl.kernels.fmha_gfx950.flash_attn_utils import (
     DualwaveFp8QLoader,
     DualwaveFp8SoftmaxHelper,
     DualwaveFp8StoreHelper,
-    DualwaveSplitKCombineContext,
-    DualwaveSplitKCombineHelper,
-    _make_dualwave_swp_fp8_traits,
+)
+from aiter.ops.flydsl.kernels.fmha_gfx950.flash_attn_utils_primitives import (
+    MIN_Q_BLOCKS_XCD_SWIZZLE,
+    NUM_XCD_GFX950,
     _s_setprio,
     _stagger_extra_barrier_if_one,
     _waitcnt_vm_n,
+)
+from aiter.ops.flydsl.kernels.fmha_gfx950.flash_attn_utils_splitk import (
+    DualwaveSplitKCombineContext,
+    DualwaveSplitKCombineHelper,
+)
+from aiter.ops.flydsl.kernels.fmha_gfx950.flash_attn_utils_traits import (
+    _make_dualwave_swp_fp8_traits,
     dualwave_fp8_dma_per_iter,
 )
 from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled
@@ -291,16 +297,16 @@ def build_flash_attn_dualwave_swp_fp8_module(
 
         init_args = [m_row, l_row] + v_o + [t0 % fx.Index(NPF)]
         loop_results = init_args
-        for j, loop_args in range(fx.Index(t0), t_end, fx.Index(2), init=init_args):
+        for j, loop_args in range(fx.Index(t0), t_end, 2, init=init_args):
             m_row = loop_args[0]
             l_row = loop_args[1]
             v_o = [loop_args[2 + i] for i in range_constexpr(D_CHUNKS)]
 
             a_buf = loop_args[2 + D_CHUNKS]
-            b_buf = _ring_wrap(a_buf + fx.Index(1))
-            nn_a_buf = _ring_wrap(a_buf + fx.Index(2))
-            f_a_buf = _ring_wrap(a_buf + fx.Index(4))
-            f_b_buf = _ring_wrap(a_buf + fx.Index(5))
+            b_buf = _ring_wrap(a_buf + 1)
+            nn_a_buf = _ring_wrap(a_buf + 2)
+            f_a_buf = _ring_wrap(a_buf + 4)
+            f_b_buf = _ring_wrap(a_buf + 5)
 
             v_k_a = kv_lds_to_regs.load_k(a_buf)
             v_k_b = kv_lds_to_regs.load_k(b_buf)
@@ -309,21 +315,21 @@ def build_flash_attn_dualwave_swp_fp8_module(
             v_s_b = gemm_helper.qk(v_k_b, q_wide)
             if const_expr(not PP):
                 v_s_a = _mask_sub(v_s_a, j)
-                v_s_b = _mask_sub(v_s_b, j + fx.Index(1))
+                v_s_b = _mask_sub(v_s_b, j + 1)
                 v_s_a, v_s_b = _mask_pair(v_s_a, v_s_b, j)
 
             v_v_a = kv_lds_to_regs.load_v(a_buf)
 
-            kv_gmem_to_lds.load_k((j + fx.Index(4)) * BN, f_a_buf)
-            kv_gmem_to_lds.load_k((j + fx.Index(5)) * BN, f_b_buf)
-            kv_gmem_to_lds.load_v((j + fx.Index(4)) * BN, f_a_buf)
-            kv_gmem_to_lds.load_v((j + fx.Index(5)) * BN, f_b_buf)
+            kv_gmem_to_lds.load_k((j + 4) * BN, f_a_buf)
+            kv_gmem_to_lds.load_k((j + 5) * BN, f_b_buf)
+            kv_gmem_to_lds.load_v((j + 4) * BN, f_a_buf)
+            kv_gmem_to_lds.load_v((j + 5) * BN, f_b_buf)
 
             if const_expr(PP):
                 _phase_bar()
                 _pp_prio(0)
                 v_s_a = _mask_sub(v_s_a, j)
-                v_s_b = _mask_sub(v_s_b, j + fx.Index(1))
+                v_s_b = _mask_sub(v_s_b, j + 1)
                 v_s_a, v_s_b = _mask_pair(v_s_a, v_s_b, j)
                 m_tile = _merge_tile_max(v_s_a, v_s_b)
                 v_o, m_new, l_row = _correct_o(v_o, m_row, l_row, m_tile)
