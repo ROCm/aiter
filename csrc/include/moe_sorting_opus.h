@@ -1668,7 +1668,8 @@ struct MoeSortingMultiPhaseKernel_P0_v1
                 IndexType eid = x[j.value]; // ext_vector_type must use int to []
                 uint32_t curr_token_id, curr_topk_id;
                 kargs.topk_mdiv.divmod(i * Problem::SubTokenTile + j, curr_token_id, curr_topk_id);
-                if(eid < kargs.num_experts)
+                // A negative id marks a padded row; unguarded it stores before p_expert_mesh.
+                if(eid >= 0 && eid < kargs.num_experts)
                 {
                     if constexpr(Problem::LocalToken)
                     {
