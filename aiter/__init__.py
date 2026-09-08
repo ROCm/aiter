@@ -142,6 +142,7 @@ else:
     from .ops.causal_conv1d_update import *
     from .ops.fused_split_gdr_update import *
     from .ops.gdr_decode_packed_bf16 import *
+    from .ops.flash_kda import *
     from . import mla  # noqa: F401
 
     # isort: on
