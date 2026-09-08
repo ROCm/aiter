@@ -15,7 +15,7 @@ from ..jit.core import compile_ops
 from ..utility.dtypes import get_dtype_fp8
 
 # Mirrors aiter::ScaleLayout in csrc/include/inverse_rope_group_quant.h.
-SCALE_LAYOUTS = {"row": 0, "mfma_tile": 1, "n32k4": 2}
+SCALE_LAYOUTS = {"row": 0, "mfma_tile": 1, "n32k4": 2, "transpose": 3}
 
 
 @compile_ops(
@@ -57,6 +57,10 @@ def scale_shape(
         )
     if scale_layout == "n32k4":
         return ((s + 31) // 32, num_groups, scale_groups * 32)
+    if scale_layout == "transpose":
+        # Both pitches are the logical extents; a caller wanting an M-aligned
+        # S_pad allocates it itself and passes the buffer in as x_scale.
+        return (num_groups, scale_groups, s)
     return (s, num_groups, scale_groups)
 
 
@@ -86,6 +90,13 @@ def inverse_rope_group_quant(
               ``V_MFMA_SCALE_F32_16x16x128_F8``.
             * ``"n32k4"``: ``[ceil(S,32)/32, G, Ks*32]``, for gfx1250's WMMA
               scaleB. Requires ``quant_group_size == 32``.
+            * ``"transpose"``: ``[G, Ks_pad, S_pad]``, M contiguous. No tile
+              swizzle -- a scale spanning the whole MFMA K step is broadcast by
+              the consumer rather than selected with op_sel, so there is nothing
+              to pack and only the axis order left to pick. The consumer's 16 M
+              lanes then read 16 adjacent bytes instead of bytes ``Ks`` apart.
+              Both pitches come from the buffer, so a caller may over-allocate
+              ``S_pad`` to its GEMM tile's M alignment.
 
         The two padded layouts round ``S`` up to 32 (``mfma_tile`` also rounds
         ``Ks`` up to its chunk width, 2 at ``quant_group_size == 128`` and 8

@@ -34,8 +34,17 @@ using OpusBmmMxscaleFlatmmSplitkKernel = void (*)(
 }  // namespace opus_bmm_detail
 
 // Table-driven kid -> launcher dispatch. Launchers come from the generated
-// GENERATE_BMM_MXSCALE_FLATMM_SPLITK_LOOKUP_FP32 macro; unknown / untuned kids
-// fall back to the 32x128x128 wg2 baseline.
+// GENERATE_BMM_MXSCALE_FLATMM_SPLITK_LOOKUP_FP32 macro, which covers every kid in
+// the catalog including kid 0 (the heuristic default, the 32x128x128 wg2 tile).
+//
+// A kid outside the map therefore means it was not emitted, which is a build
+// problem and not a shape the caller can recover from, so it throws. It used to
+// return the kid-0 launcher instead, and that silently substituted a different
+// kernel: adding a codegen tag means three hand-maintained lists in
+// gen_instances.py on top of the five gfx950 maps, and if any is missed the new
+// kids run kid 0's tile, pass the correctness gate, and time identically to each
+// other -- which is exactly how five different blds tiles once measured within
+// 0.1% of one another (see the kid224/225 note in opus_gemm_common.py).
 static opus_bmm_detail::OpusBmmMxscaleFlatmmSplitkKernel
 opus_bmm_a8w8_mxscale_tune_dispatch(int id)
 {
@@ -44,9 +53,11 @@ opus_bmm_a8w8_mxscale_tune_dispatch(int id)
       GENERATE_BMM_MXSCALE_FLATMM_SPLITK_LOOKUP_FP32(fp32_t)
   };
   auto it = kTune.find(id);
-  if (it != kTune.end())
-    return it->second;
-  return &opus_bmm_a8w8_mxscale_flatmm_splitk_256x32x128x128_2x1_16x16x128_1x128x128_wgpcu2<fp32_t>;
+  AITER_CHECK(it != kTune.end(),
+              "opus_bmm_a8w8_mxscale: kid ", id, " has no emitted instance. It is "
+              "either not in the catalog or its kernel_tag is missing from one of "
+              "the codegen maps; rebuild with AITER_REBUILD=1 after a codegen edit");
+  return it->second;
 }
 #endif  // OPUS_BUILD_HAS_GFX950
 

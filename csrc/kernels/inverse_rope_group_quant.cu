@@ -621,6 +621,11 @@ __global__ void inverse_rope_group_quant_kernel(
     {
         scale_row_base = static_cast<int64_t>(g) * S_pad * Ks_pad;
     }
+    else if constexpr(SCALE_LAYOUT == kScaleTranspose)
+    {
+        // [G, Ks_pad, S_pad]; the row's s term rides the per-group offset below.
+        scale_row_base = static_cast<int64_t>(g) * Ks_pad * S_pad;
+    }
     else if constexpr(SCALE_LAYOUT == kScaleN32K4)
     {
         // [ceil(S,32)/32, G, Ks*32]; the row's 4-byte slot inside its super.
@@ -658,6 +663,16 @@ __global__ void inverse_rope_group_quant_kernel(
                 const int iter = ((s >> 4) & 1) + (((k_group >> 2) & 1) << 1);
                 x_scale[scale_row_base + tile_base + lane_idx * 4 + iter] = byte;
             }
+        }
+        else if constexpr(SCALE_LAYOUT == kScaleTranspose)
+        {
+            // Writers in a block hold consecutive `row` and row = s*G + g, so
+            // they differ in g rather than in s and land Ks_pad*S_pad apart --
+            // as scattered as the mfma_tile path above, whose tiles are also
+            // per-g. The M-adjacency this layout creates pays off on the
+            // consumer, not here.
+            x_scale[scale_row_base + static_cast<int64_t>(k_group) * S_pad + s] =
+                byte;
         }
         else if constexpr(SCALE_LAYOUT == kScaleN32K4)
         {
@@ -951,13 +966,14 @@ void inverse_rope_group_quant(
     int64_t scale_layout)
 {
     AITER_CHECK(scale_layout == kScaleRowMajor || scale_layout == kScaleMfmaTile ||
-                    scale_layout == kScaleN32K4,
-                "scale_layout must be 0 (row-major), 1 (MFMA tile) or 2 (n32k4)");
+                    scale_layout == kScaleN32K4 || scale_layout == kScaleTranspose,
+                "scale_layout must be 0 (row-major), 1 (MFMA tile), 2 (n32k4) or 3 "
+                "(transpose)");
     AITER_CHECK(o.dim() == 3, "o must be [S,H,head_dim]");
     AITER_CHECK(x_fp8.dim() == 3, "x_fp8 must be [S,G,D]");
     AITER_CHECK(x_scale.dim() == 3,
-                "x_scale must be 3D ([S,G,Ks], [G,S_pad,Ks_pad] or "
-                "[S_pad/32,G,Ks*32])");
+                "x_scale must be 3D ([S,G,Ks], [G,S_pad,Ks_pad], "
+                "[S_pad/32,G,Ks*32] or [G,Ks_pad,S_pad])");
     AITER_CHECK(o.dtype() == AITER_DTYPE_bf16 || o.dtype() == AITER_DTYPE_fp16,
                 "o must be bf16/fp16, got ", AiterDtype_to_str(o.dtype()));
     AITER_CHECK(x_fp8.dtype() == AITER_DTYPE_fp8, "x_fp8 must be fp8");
@@ -1010,6 +1026,20 @@ void inverse_rope_group_quant(
                     "mfma scale: x_scale dim2 (Ks_pad) must be >= Ks and %",
                     k_pad_alignment, "==0");
     }
+    else if(scale_layout == kScaleTranspose)
+    {
+        CHECK_CONTIGUOUS(x_scale);
+        // dim1/dim2 carry a different axis than mfma_tile's, so the check has
+        // to follow the layout or a caller that allocated for one would
+        // silently be filled in the other.
+        AITER_CHECK(x_scale.size(0) == G, "transpose scale: x_scale dim0 must be G");
+        AITER_CHECK(x_scale.size(1) >= scale_n,
+                    "transpose scale [G,Ks_pad,S_pad]: x_scale dim1 (Ks_pad) "
+                    "must be >= Ks=", scale_n);
+        AITER_CHECK(x_scale.size(2) >= S,
+                    "transpose scale [G,Ks_pad,S_pad]: x_scale dim2 (S_pad) "
+                    "must be >= S");
+    }
     else if(scale_layout == kScaleN32K4)
     {
         CHECK_CONTIGUOUS(x_scale);
@@ -1046,8 +1076,15 @@ void inverse_rope_group_quant(
     // checks above only bound the padding from below, and its alignment depends
     // on the group size, so a caller that pads more would be addressed wrong.
     const bool mfma_tile = scale_layout == kScaleMfmaTile;
-    const int Ks_pad = mfma_tile ? static_cast<int>(x_scale.size(2)) : scale_n;
-    const int S_pad = mfma_tile ? static_cast<int>(x_scale.size(1)) : S;
+    const bool transposed = scale_layout == kScaleTranspose;
+    // The transpose has no MFMA tile to pad to, so like mfma_tile it reads both
+    // pitches off the buffer -- with dim1/dim2 the other way round.
+    const int Ks_pad = mfma_tile  ? static_cast<int>(x_scale.size(2))
+                       : transposed ? static_cast<int>(x_scale.size(1))
+                                    : scale_n;
+    const int S_pad = mfma_tile  ? static_cast<int>(x_scale.size(1))
+                      : transposed ? static_cast<int>(x_scale.size(2))
+                                   : S;
     const int wave_size = static_cast<int>(get_warp_size_func());
     const int rows = S * G;
     // The template instantiates one shape of head. Out here because the block
@@ -1474,6 +1511,10 @@ void inverse_rope_group_quant(
     if(scale_layout == kScaleMfmaTile)
     {
         dispatch_group_size(sl<kScaleMfmaTile>{});
+    }
+    else if(scale_layout == kScaleTranspose)
+    {
+        dispatch_group_size(sl<kScaleTranspose>{});
     }
     else if(scale_layout == kScaleN32K4)
     {
