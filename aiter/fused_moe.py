@@ -287,6 +287,7 @@ def _mxfp4_inline_sort_unsupported(
     a1_scale,
     a2_scale,
     stage2_scatter,
+    block_size_M,
     hidden_pad,
     intermediate_pad,
 ):
@@ -296,6 +297,11 @@ def _mxfp4_inline_sort_unsupported(
     The tuned-row lookup key pins dtypes, quant type, activation, g1u1 and
     doweight_stage1, so only what the key cannot see is checked here.
     """
+    if block_size_M is not None and int(block_size_M) != int(metadata.block_m):
+        return (
+            f"block_size_M={block_size_M} does not match tuned block_m="
+            f"{metadata.block_m}"
+        )
     if GateMode(gate_mode) is not GateMode.SEPARATED:
         return f"unsupported gate mode {gate_mode}"
     if hidden_pad or intermediate_pad:
@@ -1154,12 +1160,13 @@ def _fused_moe_impl(
             a1_scale=a1_scale,
             a2_scale=a2_scale,
             stage2_scatter=stage2_scatter,
+            block_size_M=block_size_M,
             hidden_pad=hidden_pad,
             intermediate_pad=intermediate_pad,
         )
         if reason:
             logger.warning(
-                f"[fused_moe] BM16 inline-sort config is unsupported ({reason}); "
+                f"[fused_moe] inline-sort config is unsupported ({reason}); "
                 "using default heuristics"
             )
             metadata = _resolve_metadata(disable_inline_sort=True)
@@ -2409,6 +2416,35 @@ def _flydsl_v2_stage2_wrapper(
     return out
 
 
+def _make_mxfp4_metadata(
+    kernel_name1,
+    kernel_name2,
+    gate_mode,
+    ksplit,
+    *,
+    block_m=None,
+    run_1stage=False,
+):
+    try:
+        parsed_block_m = _parse_mxfp4_g1_kname(kernel_name1)["BM"]
+    except (KeyError, TypeError, ValueError):
+        parsed_block_m = BLOCK_SIZE_M
+    return MOEMetadata(
+        stage1=functools.partial(
+            _mxfp4_a4w4_stage1_fw,
+            kernelName1=kernel_name1,
+            interleave=(gate_mode == GateMode.INTERLEAVE),
+        ),
+        stage2=functools.partial(_mxfp4_a4w4_stage2_fw, kernelName2=kernel_name2),
+        block_m=parsed_block_m if block_m is None else int(block_m),
+        ksplit=int(ksplit),
+        run_1stage=bool(run_1stage),
+        fuse_quant="fp4",
+        output_aux=True,
+        prequant=False,
+    )
+
+
 @functools.lru_cache(maxsize=2048)
 def get_2stage_cfgs(
     token,
@@ -2664,6 +2700,22 @@ def get_2stage_cfgs(
                 "[fused_moe] discarding tuned inline-sort config; "
                 "using default heuristics"
             )
+        elif _is_inline_sort_kname(kn1):
+            inline_metadata = _make_mxfp4_metadata(
+                kn1,
+                kn2,
+                gate_mode,
+                cfg.get("ksplit", 0),
+                block_m=cfg.get("block_m", BLOCK_SIZE_M),
+                run_1stage=cfg.get("run_1stage", False),
+            )
+            if not _is_mxfp4_inline_sort(inline_metadata):
+                cfg = None
+                _disable_inline_sort = True
+                logger.warning(
+                    "[fused_moe] discarding tuned inline-sort config with "
+                    "incomplete metadata; using default heuristics"
+                )
 
     if cfg is not None:
         kn2 = str(cfg.get("kernelName2", "") or "").strip()
@@ -2684,7 +2736,11 @@ def get_2stage_cfgs(
                 )
 
     bypass_tuned_config = int(os.environ.get("AITER_BYPASS_TUNE_CONFIG", "0"))
-    if config_file is not None and (cfg is None or bypass_tuned_config):
+    if (
+        config_file is not None
+        and (cfg is None or bypass_tuned_config)
+        and not _disable_inline_sort
+    ):
         raise NotImplementedError(
             "The dedicated FHMoE path requires an exact tuned config row for "
             f"{keys} in {tune_file}"
@@ -2801,22 +2857,11 @@ def get_2stage_cfgs(
         # gate_mode is a runtime weight-layout property, not a tuning key: route
         # any a4w4 kernelName to the port; the bound interleave flag picks the
         # compiled il/sep variant at runtime.
-        try:
-            _bm = _parse_mxfp4_g1_kname(kernelName1)["BM"]
-        except ValueError:
-            _bm = int(block_m) if block_m is not None else BLOCK_SIZE_M
-        return MOEMetadata(
-            stage1=functools.partial(
-                _mxfp4_a4w4_stage1_fw,
-                kernelName1=kernelName1,
-                interleave=(gate_mode == GateMode.INTERLEAVE),
-            ),
-            stage2=functools.partial(_mxfp4_a4w4_stage2_fw, kernelName2=kernelName2),
-            block_m=_bm,
-            ksplit=int(ksplit),
-            fuse_quant="fp4",
-            output_aux=True,
-            prequant=False,
+        return _make_mxfp4_metadata(
+            kernelName1,
+            kernelName2,
+            gate_mode,
+            ksplit,
         )
 
     if run_1stage:

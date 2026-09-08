@@ -6,6 +6,7 @@ import os
 import re
 import sys
 import tempfile
+from argparse import ArgumentTypeError
 from pathlib import Path
 from typing import Any, ClassVar
 
@@ -77,6 +78,7 @@ from aiter.ops.shuffle import (
 )
 from aiter.utility import fp4_utils
 from aiter.utility.base_tuner import TunerCommon
+from aiter.utility.dtypes import str2ActivationType, str2Dtype
 from aiter.utility.fp4_utils import moe_mxfp4_sort
 from aiter.utility.mp_tuner import mp_tuner
 from csrc.ck_gemm_moe_2stages_codegen.mxfp4_v2_tune_utils import (
@@ -109,6 +111,30 @@ TUNE_MOE_EXPERT_BALANCE = (
 )
 
 COS_DIFF_THRESHOLD = 1e-1
+
+
+def _parse_tuning_type(value):
+    if isinstance(value, (torch.dtype, ActivationType, QuantType)):
+        return value
+    if not isinstance(value, str):
+        raise ValueError(f"unsupported tuning type: {value!r}")  # noqa: TRY004
+
+    namespace, separator, name = value.strip().rpartition(".")
+    try:
+        if namespace == "torch" and separator:
+            parsed = getattr(torch, name)
+        elif namespace == "ActivationType" and separator:
+            parsed = str2ActivationType(name)
+        elif (namespace == "QuantType" and separator) or not separator:
+            parsed = str2Dtype(name)
+        else:
+            raise ValueError
+    except (ArgumentTypeError, AttributeError, TypeError, ValueError):
+        raise ValueError(f"unsupported tuning type: {value!r}") from None
+
+    if not isinstance(parsed, (torch.dtype, ActivationType, QuantType)):
+        raise ValueError(f"unsupported tuning type: {value!r}")  # noqa: TRY004
+    return parsed
 
 
 def _a16w_sorted_cos(ref, res, msg="", printLog=True):
@@ -6298,7 +6324,8 @@ class Mxfp4FlydslTuner(FmoeTuner):
         # is the right roofline for it. Untuned rows keep dtypes as strings, while
         # calculate() looks bpe up by torch dtype.
         key = tuple(
-            eval(row[col]) if col in self.DTYPE_KEYS else row[col] for col in self.keys
+            _parse_tuning_type(row[col]) if col in self.DTYPE_KEYS else row[col]
+            for col in self.keys
         )
         tflops, bw = self.calculate((key, "", kn1, candidate["block_m"], us, err))
         candidate.update(
