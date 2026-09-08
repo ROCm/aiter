@@ -137,8 +137,8 @@ def test_merge_weights_preserves_native_row_order():
     )
 
 
-def test_m7_full_front_matches_reference():
-    m = 7
+@pytest.mark.parametrize("m", [7, 14])
+def test_decode_full_front_matches_reference(m: int):
     generator = torch.Generator(device="cuda").manual_seed(20260908)
     hidden_states = torch.randn(
         (m, HIDDEN),
