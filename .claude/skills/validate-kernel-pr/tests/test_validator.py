@@ -2190,6 +2190,83 @@ class ValidateKernelPrTests(unittest.TestCase):
         self.assertEqual(self.fixture.REPO_BENCH, perf["target"])
         self.assertEqual(0, result.returncode)
 
+    def perf_findings(self, report, severity):
+        return [
+            item["detail"]
+            for item in report["findings"]
+            if item["stage"] == "perf" and item["severity"] == severity
+        ]
+
+    def test_a_kernel_change_with_nothing_timing_it_is_named(self):
+        # The gap this whole discovery layer exists to expose. The author changed a kernel,
+        # shipped no benchmark, and the repository owns none that imports it -- so no
+        # base-vs-head number exists for a reviewer to weigh. It used to report `skip` and
+        # change nothing, which is what a stage says when there was nothing to measure.
+        patch = self.fixture.make_patch(
+            lambda repo: (repo / "aiter" / "kernel.py").write_text("VALUE = 2.0\n"),
+            "unmeasured-kernel.patch",
+        )
+        result, report = self.fixture.validate(
+            patch,
+            tests="tests/test_sample.py",
+            expected_route="test_sample:run_kernel",
+            grid=False,
+        )
+
+        self.assertEqual("skip", report["stages"]["perf"]["status"])
+        self.assertEqual(
+            "same-as-correctness-target", report["stages"]["perf"]["target_basis"]
+        )
+        detail = self.perf_findings(report, "should-fix")
+        self.assertEqual(1, len(detail), report["findings"])
+        self.assertIn("aiter.kernel", detail[0])
+        # should-fix, so finish_report turns it into NEEDS_WORK. A note is what this stage
+        # said for years while shipping no number, and nobody acted on it.
+        self.assertEqual(1, result.returncode)
+
+    def test_a_native_only_change_is_a_note_and_still_passes(self):
+        # AITER_TRITON_ONLY=1 is on every target this validator launches, so nothing it can
+        # time reaches csrc/. The author cannot close that by writing a bench.
+        def mutate(repo):
+            (repo / "csrc").mkdir(exist_ok=True)
+            (repo / "csrc" / "gemm.cu").write_text("// faster\n")
+
+        patch = self.fixture.make_patch(mutate, "native-only.patch")
+        result, report = self.fixture.validate(
+            patch,
+            tests="tests/test_sample.py",
+            expected_route="test_sample:run_kernel",
+            grid=False,
+        )
+
+        self.assertEqual([], self.perf_findings(report, "should-fix"))
+        self.assertTrue(
+            any(
+                "AITER_TRITON_ONLY" in detail
+                for detail in self.perf_findings(report, "note")
+            ),
+            report["findings"],
+        )
+        self.assertEqual(0, result.returncode)
+
+    def test_no_perf_asks_no_question_and_so_names_no_gap(self):
+        # A caller who turned the stage off is not owed a finding about what it would have
+        # found. Discovery never runs, so there is nothing to report either way.
+        patch = self.fixture.make_patch(
+            lambda repo: (repo / "aiter" / "kernel.py").write_text("VALUE = 2.0\n"),
+            "unmeasured-kernel-no-perf.patch",
+        )
+        result, report = self.fixture.validate(
+            patch,
+            tests="tests/test_sample.py",
+            expected_route="test_sample:run_kernel",
+            grid=False,
+            perf=False,
+        )
+
+        self.assertEqual([], self.perf_findings(report, "should-fix"))
+        self.assertEqual(0, result.returncode)
+
     #: A pytest-named file that ALSO parses argv in its module body. Found on
     #: ROCm/aiter#5172: pytest wins the runner selection, imports the module at collection
     #: with its own argv, and argparse exits the process. The file is green as a script.
@@ -4700,6 +4777,135 @@ class PerfDecisionTests(unittest.TestCase):
             ["op_tests/op_benchmarks/triton/bench_k.py"],
             self.repo_benches(["aiter.ops.triton.k"]),
         )
+
+    def gap(
+        self,
+        status="skip",
+        basis=None,
+        modules=(),
+        native=(),
+        candidates=(),
+        phases_reached=1,
+    ):
+        return self.perf.coverage_gap(
+            status,
+            self.perf.BASIS_FALLBACK if basis is None else basis,
+            list(modules),
+            list(native),
+            list(candidates),
+            phases_reached=phases_reached,
+        )
+
+    def test_a_run_that_never_got_both_phases_cannot_call_anything_missing(self):
+        # No GPU, or a base tree that would not come clean. The report is INCONCLUSIVE and a
+        # should-fix would overwrite that with the more confident NEEDS_WORK -- on a run that
+        # could not have timed a benchmark had one been sitting right there.
+        self.assertIsNone(
+            self.gap(modules=["aiter.ops.triton.k"], phases_reached=0),
+        )
+
+    def test_a_comment_only_kernel_edit_is_not_a_kernel_change_to_time(self):
+        # The false positive this filter exists for. A PR that adds a docstring to a kernel
+        # cannot have made it slower, and asking its author for a benchmark is charging them
+        # for touching the file at all.
+        patch = (
+            "--- a/aiter/ops/triton/k.py\n"
+            "+++ b/aiter/ops/triton/k.py\n"
+            "@@ -1,2 +1,3 @@\n"
+            " VALUE = 1\n"
+            "+# a note for the next reader\n"
+            "+\n"
+        )
+        self.assertEqual(
+            [], self.perf.substantive_modules(["aiter.ops.triton.k"], patch)
+        )
+
+    def test_a_kernel_edit_with_one_real_line_in_it_still_counts(self):
+        patch = (
+            "--- a/aiter/ops/triton/k.py\n"
+            "+++ b/aiter/ops/triton/k.py\n"
+            "@@ -1,2 +1,3 @@\n"
+            "+# explain the constant\n"
+            "-VALUE = 1\n"
+            "+VALUE = 2\n"
+        )
+        self.assertEqual(
+            ["aiter.ops.triton.k"],
+            self.perf.substantive_modules(["aiter.ops.triton.k"], patch),
+        )
+
+    def test_a_real_change_to_one_file_does_not_vouch_for_another(self):
+        # Per file, not per patch. A PR that rewrites one kernel and comments another owes a
+        # benchmark for the first only, and crediting both would put the second author's name
+        # on a finding about code they documented.
+        patch = (
+            "--- a/aiter/ops/triton/a.py\n"
+            "+++ b/aiter/ops/triton/a.py\n"
+            "+VALUE = 2\n"
+            "--- a/aiter/ops/triton/b.py\n"
+            "+++ b/aiter/ops/triton/b.py\n"
+            "+# documented\n"
+        )
+        self.assertEqual(
+            ["aiter.ops.triton.a"],
+            self.perf.substantive_modules(
+                ["aiter.ops.triton.a", "aiter.ops.triton.b"], patch
+            ),
+        )
+
+    def test_a_kernel_change_nothing_measures_is_the_authors_gap(self):
+        found = self.gap(modules=["aiter.ops.triton.gemm.basic.gemm_a8w8"])
+        self.assertEqual("should-fix", found["severity"])
+        self.assertIn("gemm_a8w8", found["detail"])
+
+    def test_a_native_only_change_is_the_instruments_blind_spot(self):
+        # Pointedly not a should-fix. Every target here runs under AITER_TRITON_ONLY=1, so no
+        # timing run this validator can launch reaches csrc/ -- the author cannot close that
+        # gap by writing a bench, and charging them for it charges them for the tool.
+        found = self.gap(native=["csrc/kernels/gemm.cu"])
+        self.assertEqual("note", found["severity"])
+        self.assertIn("AITER_TRITON_ONLY", found["detail"])
+
+    def test_discovery_declining_is_the_callers_move_not_a_defect(self):
+        # Nothing is missing here: several files could measure the change and choosing is a
+        # reading of the diff. A should-fix would charge the author for the validator's own
+        # refusal to guess.
+        found = self.gap(
+            modules=["aiter.ops.triton.utils.types"],
+            candidates=["op_tests/bench_a.py", "op_tests/bench_b.py"],
+        )
+        self.assertEqual("note", found["severity"])
+        self.assertIn("--perf-target", found["detail"])
+
+    def test_a_measured_kernel_change_has_no_gap_to_name(self):
+        for status in ("pass", "fail"):
+            with self.subTest(status=status):
+                self.assertIsNone(self.gap(status, modules=["aiter.ops.triton.k"]))
+
+    def test_a_chosen_target_that_measured_nothing_speaks_for_itself(self):
+        # It already carries a skip reason saying what went wrong with it. A second finding
+        # claiming nothing measures this change would contradict the measurement beside it.
+        self.assertIsNone(
+            self.gap(basis="discovered-repo-bench", modules=["aiter.ops.triton.k"])
+        )
+        self.assertIsNone(
+            self.gap(basis="declared-by-caller", modules=["aiter.ops.triton.k"])
+        )
+
+    def test_a_change_that_touches_no_kernel_at_all_earns_nothing(self):
+        self.assertIsNone(self.gap())
+
+    def test_native_sources_are_read_off_the_patch_the_same_way_modules_are(self):
+        paths = self.perf.changed_native(
+            "M  csrc/kernels/gemm.cu\n"
+            "A  csrc/include/gemm.h\n"
+            "D  csrc/kernels/gone.cu\n"
+            'A  "csrc/odd\\tname.cu"\n'
+            "M  aiter/ops/triton/k.py\n"
+        )
+        # A deletion is not on head. A path git could not spell plainly is held out for the
+        # same reason discover_shipped holds one out: the name in the report would be a guess.
+        self.assertEqual(["csrc/include/gemm.h", "csrc/kernels/gemm.cu"], paths)
 
     def entry(self, status, target, ratio=None):
         measurement = {"status": status, "target": target}

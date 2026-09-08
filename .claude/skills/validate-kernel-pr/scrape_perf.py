@@ -504,6 +504,10 @@ BASIS_REPO = "discovered-repo-bench"
 # stage would report on a file whose kernel nobody touched.
 KERNEL_PREFIX = "aiter"
 
+# Where aiter keeps the C++/HIP the python kernels dispatch into. Nothing this validator
+# launches reaches it: every target runs under AITER_TRITON_ONLY=1.
+NATIVE_PREFIX = "csrc/"
+
 
 def discover_shipped(status_text, read_text):
     """Files the PATCH ITSELF wrote that carry a benchmark harness.
@@ -552,13 +556,74 @@ def changed_kernel_modules(status_text):
         code, path = line[:2], line[3:]
         if path.startswith('"') or "D" in code or not path.endswith(".py"):
             continue
-        parts = path[: -len(".py")].split("/")
-        if parts[-1] == "__init__":
-            parts.pop()
-        if not parts or parts[0] != KERNEL_PREFIX:
+        name = module_name(path)
+        if not name or name.split(".")[0] != KERNEL_PREFIX:
             continue
-        modules.append(".".join(parts))
+        modules.append(name)
     return sorted(set(modules))
+
+
+# A changed line that cannot alter what the machine does: blank, or a whole-line `#` comment.
+# Not an attempt to understand the diff -- just to tell "this kernel was edited" from "this
+# kernel's comments were edited", which is the difference between a gap worth naming and a
+# should-fix charged to somebody who fixed a typo.
+INERT_LINE_RE = re.compile(r"^\s*(#.*)?$")
+
+
+def substantive_modules(modules, patch_text):
+    """The subset of `modules` whose file the patch changes in code, not only in comments.
+
+    The coverage gap asks the author to bring a benchmark. Asking that of a PR that added a
+    docstring to a kernel would be the false positive this whole layer is arranged to avoid,
+    and it is not a hypothetical: a comment-only edit is what a harmless kernel PR looks
+    like. Under-matching is the safe direction here as everywhere else -- a module dropped
+    costs a finding nobody reads, a module kept wrongly costs an author a NEEDS_WORK.
+
+    A patch that cannot be read at all yields nothing, for the same reason.
+    """
+    touched, current = set(), None
+    for line in patch_text.splitlines():
+        if line.startswith("+++ "):
+            name = line[4:].strip()
+            current = name[2:] if name.startswith("b/") else name
+            continue
+        if current is None or line.startswith(("+++", "---")):
+            continue
+        if line[:1] in "+-" and not INERT_LINE_RE.match(line[1:]):
+            touched.add(current)
+    live = {module_name(path) for path in touched}
+    return [module for module in modules if module in live]
+
+
+def module_name(path):
+    """`aiter/ops/triton/k.py` -> `aiter.ops.triton.k`; a package's __init__ -> the package."""
+    if not path.endswith(".py"):
+        return ""
+    parts = path[: -len(".py")].split("/")
+    if parts[-1] == "__init__":
+        parts.pop()
+    return ".".join(parts)
+
+
+def changed_native(status_text):
+    """The C++/HIP sources the patch changed, which no timing run here will execute.
+
+    Separate from changed_kernel_modules because the two earn different severities. Every
+    target this validator launches runs under AITER_TRITON_ONLY=1, so a change under csrc/ is
+    not reached by anything it can time. That is this tool's blind spot, not a gap in the
+    author's evidence, and a should-fix for it would charge somebody for a limit of the
+    instrument.
+    """
+    paths = []
+    for line in status_text.splitlines():
+        if len(line) <= 3:
+            continue
+        code, path = line[:2], line[3:]
+        if path.startswith('"') or "D" in code:
+            continue
+        if path.startswith(NATIVE_PREFIX):
+            paths.append(path)
+    return sorted(set(paths))
 
 
 def imported_modules(text):
@@ -1011,6 +1076,83 @@ def gate(entries):
     return min(enumerate(entries), key=worse)[1]
 
 
+def coverage_gap(
+    stage_status,
+    target_basis,
+    kernel_modules,
+    native_paths,
+    candidates,
+    phases_reached=1,
+):
+    """The finding a kernel change with nothing timing it earns, or None.
+
+    Silent unless the run actually reached both a baseline and a head phase. A report that
+    never got a GPU, or whose base tree would not come clean, has no standing to say a
+    benchmark was missing -- it could not have run one either way, and its verdict is
+    INCONCLUSIVE, which a should-fix would quietly overwrite with the more confident
+    NEEDS_WORK.
+
+    Only reached when the fallback stood -- when discovery found no target and no caller
+    named one. A target that WAS chosen and then failed to produce a number already carries
+    its own skip reason saying what went wrong with it, and a second finding claiming nothing
+    measures this change would contradict the measurement sitting beside it.
+
+    The distinction the severities draw is whose move it is next.
+
+    A python kernel changed and NOTHING in the repository or the patch measures it: that is
+    the author's gap, and it is a should-fix, which finish_report turns into NEEDS_WORK. Not
+    a blocker -- an unmeasured kernel is not a broken one -- and not a note either, because
+    a note is what this stage said for years while shipping no number at all, and nobody
+    acted on it.
+
+    Candidates exist but discovery declined between them: nothing is missing. Several files
+    could measure this change and picking one is a reading of the diff, which is the caller's
+    to make with --perf-target. Charging the author for that would be charging them for the
+    validator's refusal to guess.
+
+    Only csrc/ changed: a note, and pointedly not a should-fix. Every target here runs under
+    AITER_TRITON_ONLY=1, so no timing run this validator can launch reaches that code. The
+    gap is in the instrument, and the author cannot close it by writing a bench.
+    """
+    if not phases_reached:
+        return None
+    if stage_status in ("pass", "fail") or target_basis != BASIS_FALLBACK:
+        return None
+    if candidates:
+        return {
+            "severity": "note",
+            "stage": "perf",
+            "detail": (
+                "%d files could measure this change and discovery declined to choose between "
+                "them (%s); name one with --perf-target to have it timed"
+                % (len(candidates), ", ".join(candidates))
+            ),
+        }
+    if kernel_modules:
+        return {
+            "severity": "should-fix",
+            "stage": "perf",
+            "detail": (
+                "this PR changes kernel code (%s) and nothing times it: the patch ships no "
+                "benchmark, and no benchmark already in the repository imports what it "
+                "changed, so no base-vs-head number exists for a reviewer to weigh"
+                % ", ".join(kernel_modules)
+            ),
+        }
+    if native_paths:
+        return {
+            "severity": "note",
+            "stage": "perf",
+            "detail": (
+                "this PR changes native sources (%s) and every target here runs under "
+                "AITER_TRITON_ONLY=1, so nothing this validator can time reaches them; the "
+                "absence of a perf number is a limit of the tool, not of the PR"
+                % ", ".join(native_paths[:3])
+            ),
+        }
+    return None
+
+
 def cmd_measure(args):
     """Append one target's result to the manifest the stage is later composed from.
 
@@ -1092,13 +1234,28 @@ def cmd_discover(args):
 
     status = sys.stdin.read()
     shipped = discover_shipped(status, read_text)
+    kernel_modules = changed_kernel_modules(status)
     repo_benches = discover_repo_benches(
-        changed_kernel_modules(status),
+        kernel_modules,
         walk,
         read_text,
         exclude=set(shipped["candidates"]),
     )
     decision = choose_perf_targets(shipped, repo_benches, args.correctness_target)
+    # What the patch changed, carried alongside what was found to time it. The two are only
+    # meaningful together: a kernel change with no candidate is a gap worth naming, and the
+    # same empty candidate list next to no kernel change is nothing at all.
+    # Only the modules the patch changes in CODE reach the gap. Discovery itself keeps using
+    # the unfiltered list: a comment-only edit beside a bench that already measures the kernel
+    # still gets timed, and timing it costs nothing and proves something.
+    decision["kernel_modules"] = (
+        substantive_modules(
+            kernel_modules, Path(args.patch).read_text(errors="replace")
+        )
+        if args.patch
+        else kernel_modules
+    )
+    decision["native_paths"] = changed_native(status)
     decision["unspellable"] = shipped["unspellable"]
     # Emitted so the caller can bound a `for` loop without asking a second question. bash has
     # no way to measure the length of a JSON list, and the alternative -- reading indices
@@ -1166,6 +1323,16 @@ def cmd_stage(args):
         report["findings"].extend(
             item for item in entry["findings"] if item["severity"] == "note"
         )
+    gap = coverage_gap(
+        stage["status"],
+        stage.get("target_basis", ""),
+        json.loads(args.kernel_modules),
+        json.loads(args.native_paths),
+        json.loads(args.candidates),
+        phases_reached=args.phases_reached,
+    )
+    if gap:
+        report["findings"].append(gap)
     Path(args.report).write_text(json.dumps(report, indent=2))
     return 0
 
@@ -1189,6 +1356,7 @@ def subcommand(argv):
     )
     discover.add_argument("--root", required=True)
     discover.add_argument("--correctness-target", required=True)
+    discover.add_argument("--patch", default="")
     discover.set_defaults(func=cmd_discover)
 
     restore = sub.add_parser(
@@ -1222,6 +1390,12 @@ def subcommand(argv):
     stage = sub.add_parser("stage", help="write the perf stage into the report")
     stage.add_argument("--report", required=True)
     stage.add_argument("--manifest", required=True)
+    # JSON lists, forwarded verbatim from what `discover` printed. bash is not authoring
+    # them; it is handing back a field it never opened.
+    stage.add_argument("--kernel-modules", default="[]")
+    stage.add_argument("--native-paths", default="[]")
+    stage.add_argument("--candidates", default="[]")
+    stage.add_argument("--phases-reached", type=int, default=1)
     stage.set_defaults(func=cmd_stage)
 
     args = parser.parse_args(argv)

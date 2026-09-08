@@ -988,13 +988,18 @@ fi
 # question nobody asked is work, and the answer would go into a stage that reports `skip`.
 PERF_TARGET_BASIS_REASON=""
 PERF_CANDIDATES="[]"
+# What the patch changed, as discovery saw it. Carried to the stage so "nothing timed this"
+# can be told apart from "there was nothing here to time": the first is a gap the author can
+# close, the second is not a finding at all.
+PERF_KERNEL_MODULES="[]"
+PERF_NATIVE_PATHS="[]"
 PERF_TARGETS=("$PERF_TARGET")
 PERF_TARGET_BASES=("$PERF_TARGET_BASIS")
 PERF_TARGET_BASIS_REASONS=("")
 if [ "$PERF_TARGET_BASIS" != "declared-by-caller" ] && [ "$PERF_ENABLED" -eq 1 ]; then
   PERF_DISCOVERY=$(printf '%s' "$PATCH_STATUS" \
     | "$SCRIPT_DIR/scrape_perf.py" discover \
-      --root "$REPO_WT" --correctness-target "$TEST_FILE")
+      --root "$REPO_WT" --correctness-target "$TEST_FILE" --patch "$PATCHF")
   if [ -n "$PERF_DISCOVERY" ]; then
     PERF_TARGETS=()
     PERF_TARGET_BASES=()
@@ -1012,6 +1017,10 @@ if [ "$PERF_TARGET_BASIS" != "declared-by-caller" ] && [ "$PERF_ENABLED" -eq 1 ]
     PERF_TARGET_BASIS="${PERF_TARGET_BASES[0]}"
     PERF_TARGET_BASIS_REASON="${PERF_TARGET_BASIS_REASONS[0]}"
     PERF_CANDIDATES=$(python3 "$TARGET_TOOL" stats-field --json "$PERF_DISCOVERY" candidates)
+    PERF_KERNEL_MODULES=$(python3 "$TARGET_TOOL" \
+      stats-field --json "$PERF_DISCOVERY" kernel_modules)
+    PERF_NATIVE_PATHS=$(python3 "$TARGET_TOOL" \
+      stats-field --json "$PERF_DISCOVERY" native_paths)
   fi
 fi
 
@@ -2218,7 +2227,17 @@ else
       --baseline-method "${PERF_BASELINE_METHODS[$PERF_SLOT]}" \
       --control-column "$PERF_CONTROL_COLUMN" --control-tol "$PERF_CONTROL_TOL"
   done
-  "$SCRIPT_DIR/scrape_perf.py" stage --report "$JSON" --manifest "$PERF_MANIFEST"
+  # A run that never got both phases cannot say a benchmark was missing -- it could not have
+  # run one either way, and its verdict is INCONCLUSIVE, which a should-fix would overwrite
+  # with the more confident NEEDS_WORK.
+  # BASE_READY is only assigned inside the branch CAN_TEST=1 takes, so it is read through a
+  # default: under `set -u` an unset name is a crash, and crashing here would cost the whole
+  # report to answer a question whose answer is already "no".
+  PERF_PHASES_REACHED=0
+  [ "$CAN_TEST" -eq 1 ] && [ "${BASE_READY:-0}" -eq 1 ] && PERF_PHASES_REACHED=1
+  "$SCRIPT_DIR/scrape_perf.py" stage --report "$JSON" --manifest "$PERF_MANIFEST" \
+    --kernel-modules "$PERF_KERNEL_MODULES" --native-paths "$PERF_NATIVE_PATHS" \
+    --candidates "$PERF_CANDIDATES" --phases-reached "$PERF_PHASES_REACHED"
   PERF_STAGE_COMPOSED=1
 fi
 
