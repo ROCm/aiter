@@ -137,7 +137,6 @@
   },
   "kv_split": {
     "SW": {
-      "SPLIT_POLICY": "occupancy",
       "SEGMENTS_PER_CU": 2,
       "MFMA_DIM": 16,
       "MAX_SEGMENTS": 1,
@@ -147,7 +146,6 @@
       "TILE_SIZE_MAX": 64
     },
     "DT_fp8_fp8": {
-      "SPLIT_POLICY": "occupancy",
       "SEGMENTS_PER_CU": 4,
       "MFMA_DIM": 32,
       "MIN_SEGMENTS": 1,
@@ -160,7 +158,6 @@
       "TILE_SIZE_MAX": 64
     },
     "any": {
-      "SPLIT_POLICY": "occupancy",
       "SEGMENTS_PER_CU": 2,
       "MFMA_DIM": 16,
       "MIN_SEGMENTS": 1,
