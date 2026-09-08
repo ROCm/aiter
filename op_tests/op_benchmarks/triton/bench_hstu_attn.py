@@ -126,9 +126,7 @@ def run_benchmark(args):
         dropout_pr = 0.0
         target_size: int = 20
         # apply_SL clamps long sequences to ~N^(sl_alpha/2). sl_alpha=2.0 is
-        # effectively "no clamp" (heavy, ~8x more Sum(n^2) work at N=16384);
-        # sl_alpha=1.7 matches the HSTU deployment distribution. Configurable so
-        # the bench can reproduce deployment-scale numbers.
+        # effectively no clamp; 1.7 matches the HSTU length distribution.
         sl_alpha: float = args.sl_alpha
         dtype = str_to_torch_dtype[type_str]
 

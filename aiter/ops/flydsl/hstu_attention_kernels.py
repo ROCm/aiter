@@ -443,6 +443,8 @@ def flydsl_hstu_attention_fwd(
         num_targets = torch.zeros(1, dtype=seq_offsets.dtype, device=out.device)
 
     launch_stream = torch.cuda.current_stream(q.device) if stream is None else stream
+    if launch_stream.device != q.device:
+        raise ValueError(f"`stream` must be on {q.device}, got {launch_stream.device}")
     with torch.cuda.device(q.device.index):
         _run_compiled(
             launcher,
@@ -902,6 +904,8 @@ def flydsl_hstu_attention_bwd(
         perm_c = torch.zeros(1, dtype=torch.int32, device=v.device)
 
     launch_stream = torch.cuda.current_stream(q.device) if stream is None else stream
+    if launch_stream.device != q.device:
+        raise ValueError(f"`stream` must be on {q.device}, got {launch_stream.device}")
     with torch.cuda.device(q.device.index):
         _run_compiled(
             dvdk_launcher,
@@ -1008,6 +1012,8 @@ def _make_bwd_kernel_runners(
         perm_c = torch.zeros(1, dtype=torch.int32, device=v.device)
 
     launch_stream = torch.cuda.current_stream(q.device) if stream is None else stream
+    if launch_stream.device != q.device:
+        raise ValueError(f"`stream` must be on {q.device}, got {launch_stream.device}")
 
     def run_dvdk():
         with torch.cuda.device(q.device.index):
