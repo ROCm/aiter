@@ -61,9 +61,9 @@ Backend choice is private to `mha_v4_quant`; recipe selection does not branch on
 | Rotated FP8 and FP8 V | Triton |
 | Canonical MXFP6 V | Triton |
 | Canonical MXFP4 V | Triton |
-| MXFP8/MXFP6/MXFP4 Q and K | HIP `module_fmha_v4_fwd` |
-| FP6-P MXFP6 V | HIP `module_fmha_v4_fwd` |
-| FP6-P MXFP4 V | HIP `module_fmha_v4_fwd` |
+| MXFP8/MXFP6/MXFP4 Q and K | HIP `module_mha_v4_quant` |
+| FP6-P MXFP6 V | HIP `module_mha_v4_quant` |
+| FP6-P MXFP4 V | HIP `module_mha_v4_quant` |
 
 ## APIs
 

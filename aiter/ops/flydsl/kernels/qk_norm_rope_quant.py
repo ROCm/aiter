@@ -18,7 +18,6 @@ from functools import lru_cache
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 import torch
-from flydsl._mlir.dialects import llvm, rocdl
 from flydsl.expr import const_expr, ptrtoint, range_constexpr
 from flydsl.expr import math as fmath
 from flydsl.expr.arith import FastMathFlags
@@ -50,12 +49,10 @@ def _imax(a, b):
 
 
 def _idiv(a, b):
-    """Truncating signed integer divide. ``//`` maps to arith.floordivsi, a
-    longer expansion; every dividend here is already clamped non-negative, so
-    the truncating op is both correct and cheaper."""
-    from flydsl.expr import arith
-
-    return fx.Int32(arith.divsi(a.ir_value(), b.ir_value()))
+    """Truncating integer divide. Signed ``//`` maps to arith.floordivsi, a
+    longer expansion; every dividend here is provably non-negative, so an
+    unsigned divide (divui) is both correct and cheaper."""
+    return fx.Int32(fx.Uint32(a) // fx.Uint32(b))
 
 
 _STATIC_ADAPTOR_CACHE = {}
@@ -173,7 +170,7 @@ def _scalar_load(base_i64, idx, fx_dt, copy_bits):
     buf = _scalar_view(base_i64, fx_dt)
     atom = fx.make_copy_atom(fx.rocdl.BufferCopy(copy_bits), fx_dt)
     r = fx.make_rmem_tensor(fx.make_layout(1, 1), fx_dt)
-    fx.copy_atom_call(atom, fx.slice(buf, (idx, None)), r)
+    fx.copy(atom, fx.slice(buf, (idx, None)), r)
     return fx.memref_load_vec(r)[0]
 
 
@@ -182,14 +179,13 @@ def _scalar_store(base_i64, idx, val, fx_dt, copy_bits):
     buf = _scalar_view(base_i64, fx_dt)
     atom = fx.make_copy_atom(fx.rocdl.BufferCopy(copy_bits), fx_dt)
     r = fx.make_rmem_tensor(fx.make_layout(1, 1), fx_dt)
-    fx.memref_store_vec(fx.Vector.from_elements([val.ir_value()], dtype=fx_dt), r)
-    fx.copy_atom_call(atom, r, fx.slice(buf, (idx, None)))
+    fx.memref_store_vec(fx.Vector.from_elements([val], dtype=fx_dt), r)
+    fx.copy(atom, r, fx.slice(buf, (idx, None)))
 
 
 def _store_bf16_tiled(vals_list, p_dst, copy, vec):
     """Convert VEC fp32 → bf16 and tiled-copy to ``p_dst``."""
-    raw = [v.ir_value() if hasattr(v, "ir_value") else v for v in vals_list]
-    f32v = fx.Vector.from_elements(raw, dtype=fx.Float32)
+    f32v = fx.Vector.from_elements(vals_list, dtype=fx.Float32)
     bf16v = f32v.truncf(T.vec(vec, T.bf16))
     frag = fx.make_fragment_like(p_dst)
     fx.memref_store_vec(bf16v, frag)
@@ -288,8 +284,8 @@ def _store_fp8_packed_w32(
     for dw_idx in range_constexpr(n_dwords):
         base = dw_idx * 4
         pk = fx.Int32(0).ir_value()
-        pk = rocdl.cvt_pk_fp8_f32(i32, safe[base + 0], safe[base + 1], pk, 0)
-        pk = rocdl.cvt_pk_fp8_f32(i32, safe[base + 2], safe[base + 3], pk, 1)
+        pk = fx.rocdl.cvt_pk_fp8_f32(i32, safe[base + 0], safe[base + 1], pk, 0)
+        pk = fx.rocdl.cvt_pk_fp8_f32(i32, safe[base + 2], safe[base + 3], pk, 1)
         dword_list.append(pk)
 
     off_bytes = row_base_bytes + idx * vec
@@ -405,7 +401,7 @@ def _build_kernel_w64(
             div_tensor, idx, *, layout=full_lay, atom=full_atom, dt=elem_dtype
         ):
             r = fx.make_rmem_tensor(layout, dt)
-            fx.copy_atom_call(atom, fx.slice(div_tensor, (None, idx)), r)
+            fx.copy(atom, fx.slice(div_tensor, (None, idx)), r)
             return fx.memref_load_vec(r)
 
         bid_x = fx.block_idx.x  # 0..H-1 (Q head) or H (KV)
@@ -534,8 +530,7 @@ def _build_kernel_w64(
                     scaled.append(xi * rstd)
 
             out_rmem = fx.make_rmem_tensor(full_lay, fx.Float32)
-            scaled_raw = [s.ir_value() for s in scaled]
-            scaled_vec = fx.Vector.from_elements(scaled_raw, dtype=fx.Float32)
+            scaled_vec = fx.Vector.from_elements(scaled, dtype=fx.Float32)
             fx.memref_store_vec(scaled_vec, out_rmem)
 
             is_rope = tid >= fx.Int32(ROPE_THREAD_LO)
@@ -553,8 +548,8 @@ def _build_kernel_w64(
                     o = cur[2 * k + 1]
                     c = cos_f32[k]
                     s = sin_f32[k]
-                    rope_elems.append((e * c - o * s).ir_value())
-                    rope_elems.append((e * s + o * c).ir_value())
+                    rope_elems.append(e * c - o * s)
+                    rope_elems.append(e * s + o * c)
                 rotated_vec = fx.Vector.from_elements(rope_elems, dtype=fx.Float32)
                 fx.memref_store_vec(rotated_vec, out_rmem)
 
@@ -938,10 +933,8 @@ def _build_kernel_w32(
                 wdiv = fx.logical_divide(wbuf, half_lay)
                 r0 = fx.make_rmem_tensor(half_lay, elem_dtype)
                 r1 = fx.make_rmem_tensor(half_lay, elem_dtype)
-                fx.copy_atom_call(half_atom, fx.slice(wdiv, (None, tid_val * 2)), r0)
-                fx.copy_atom_call(
-                    half_atom, fx.slice(wdiv, (None, tid_val * 2 + 1)), r1
-                )
+                fx.copy(half_atom, fx.slice(wdiv, (None, tid_val * 2)), r0)
+                fx.copy(half_atom, fx.slice(wdiv, (None, tid_val * 2 + 1)), r1)
                 v0 = fx.memref_load_vec(r0).to(fx.Float32)
                 v1 = fx.memref_load_vec(r1).to(fx.Float32)
                 combined = v0.shuffle(v1, list(range(VEC)))
@@ -982,7 +975,7 @@ def _build_kernel_w32(
 
         tok = _imin(bid_t * ROWS_PER_WG + tid_y, num_tokens - 1)
         bid_t = tok  # all downstream token offsets use the clamped token
-        bid_t_idx = fx.Index(tok)
+        bid_t_idx = fx.Int64(tok)
 
         def _ptr_buffer_resource(ptr, num_records_bytes=None):
             addr = fx.ptrtoint(ptr)
@@ -1034,8 +1027,8 @@ def _build_kernel_w32(
             rope_rel = _imax(tid - fx.Int32(ROPE_THREAD_LO), fx.Int32(0))
             cos_rmem = fx.make_rmem_tensor(rope_lay, elem_dtype)
             sin_rmem = fx.make_rmem_tensor(rope_lay, elem_dtype)
-            fx.copy_atom_call(rope_atom, fx.slice(cos_div, (None, rope_rel)), cos_rmem)
-            fx.copy_atom_call(rope_atom, fx.slice(sin_div, (None, rope_rel)), sin_rmem)
+            fx.copy(rope_atom, fx.slice(cos_div, (None, rope_rel)), cos_rmem)
+            fx.copy(rope_atom, fx.slice(sin_div, (None, rope_rel)), sin_rmem)
             cos_raw = fx.memref_load_vec(cos_rmem)
             sin_raw = fx.memref_load_vec(sin_rmem)
 
@@ -1084,9 +1077,7 @@ def _build_kernel_w32(
                     factor = rstd * quant_scale
                     scale_store = e8m0_biased.to(fx.Int8)
                 else:
-                    rcp_am = llvm.call_intrinsic(
-                        f32, "llvm.amdgcn.rcp.f32", [am_safe.ir_value()], [], []
-                    )
+                    rcp_am = fx.Float32(fx.rocdl.rcp(f32, am_safe))
                     _fc = _fp8_const()
                     factor = fx.Float32(_fc["max_over_sqrt2"]) * rcp_am
                     scale_store = am_safe * rstd * fx.Float32(_fc["inv_max_sqrt2"])
@@ -1147,7 +1138,7 @@ def _build_kernel_w32(
                         VEC,
                     )
 
-        q_tok_off_bytes = bid_t_idx * fx.Index(H * D * 2)
+        q_tok_off_bytes = bid_t_idx * fx.Int64(H * D * 2)
 
         if bid_x < H:
             head_idx = bid_x
@@ -1167,7 +1158,7 @@ def _build_kernel_w32(
                 qw_f32 = None
 
             if const_expr(quant):
-                q_tok_off_fp8 = bid_t_idx * fx.Index(H * D)
+                q_tok_off_fp8 = bid_t_idx * fx.Int64(H * D)
                 qo_g_tmp = GTensor(
                     q_out,
                     dtype=T.i8,
@@ -1222,7 +1213,7 @@ def _build_kernel_w32(
             w_f32 = w_vec.to(fx.Float32)
 
             if const_expr(quant):
-                kv_tok_off_fp8 = bid_t_idx * fx.Index(D)
+                kv_tok_off_fp8 = bid_t_idx * fx.Int64(D)
                 kvo_g_tmp = GTensor(
                     kv_out,
                     dtype=T.i8,
@@ -1244,7 +1235,7 @@ def _build_kernel_w32(
                     scale_base_off=scale_base_off_kv,
                 )
             else:
-                kv_tok_off_bf16 = bid_t_idx * fx.Index(D * 2)
+                kv_tok_off_bf16 = bid_t_idx * fx.Int64(D * 2)
                 kvo_g_tmp = GTensor(
                     kv_out,
                     dtype=T.bf16,
@@ -1367,7 +1358,7 @@ def _build_kernel_w32(
         num_tokens: fx.Int32,
         stream: fx.Stream,
     ):
-        grid_y = fx.Index(_idiv(num_tokens + ROWS_PER_WG - 1, fx.Int32(ROWS_PER_WG)))
+        grid_y = fx.Int64(_idiv(num_tokens + ROWS_PER_WG - 1, fx.Int32(ROWS_PER_WG)))
         k = kernel(
             q_in,
             kv_in,
@@ -2010,9 +2001,7 @@ def _build_kernel_w32_tdm(
                 scale_store = e8m0_biased.to(fx.Int8)
             elif const_expr(quant):
                 am_safe = am.maximumf(fx.Float32(1e-12))
-                rcp_am = llvm.call_intrinsic(
-                    T.f32, "llvm.amdgcn.rcp.f32", [am_safe.ir_value()], [], []
-                )
+                rcp_am = fx.Float32(fx.rocdl.rcp(T.f32, am_safe))
                 fc = _fp8_const()
                 factor = fx.Float32(fc["max_over_sqrt2"]) * rcp_am
                 scaled = xw * factor
@@ -2175,7 +2164,7 @@ def _build_kernel_w32_tdm(
                 # not landed; it stays latent only while the per-tile compute
                 # happens to outlast the load.
                 tdm_ops.tensor_wait(min(K - 1, CT - 1 - i))
-                rocdl.s_wait_dscnt(0)
+                fx.rocdl.s_wait_dscnt(0)
                 if const_expr(do_hoist):
                     cosv, sinv = cs_cache[0], cs_cache[1]
                 else:
@@ -2332,7 +2321,7 @@ def _build_kernel_w32_tdm(
             swa_cache_size,
         )
         k.launch(
-            grid=(fx.Index(gx), 1, 1),
+            grid=(fx.Int64(gx), 1, 1),
             block=(BLOCK_THREADS, RT, 1),
             stream=stream,
         )

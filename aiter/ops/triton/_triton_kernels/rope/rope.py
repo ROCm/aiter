@@ -4,6 +4,8 @@
 import triton
 import triton.language as tl
 
+from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
+
 
 @triton.jit
 def _get_neox_rotated_x_1D(
@@ -87,7 +89,22 @@ def _get_gptj_rotated_x(
     return x_rotated
 
 
-@triton.jit
+_rope_kernel_sbhd_fwd_repr = make_kernel_repr(
+    "_rope_kernel_sbhd_fwd",
+    [
+        "HAVE_NOPE",
+        "NOPE_FIRST",
+        "INPLACE",
+        "REUSE_FREQS_FRONT_PART",
+        "IS_NEOX",
+        "BLOCK_S",
+        "BLOCK_D",
+        "BLOCK_D_HALF",
+    ],
+)
+
+
+@triton.jit(repr=_rope_kernel_sbhd_fwd_repr)
 def _rope_kernel_sbhd_fwd(
     x_ptr,
     freqs_ptr,
@@ -191,7 +208,22 @@ def _rope_kernel_sbhd_fwd(
             tl.store(out_ptr + x_out_offs + BLOCK_D * stride_out_d, x, mask=x_mask)
 
 
-@triton.jit
+_rope_kernel_sbhd_bwd_repr = make_kernel_repr(
+    "_rope_kernel_sbhd_bwd",
+    [
+        "HAVE_NOPE",
+        "NOPE_FIRST",
+        "INPLACE",
+        "REUSE_FREQS_FRONT_PART",
+        "IS_NEOX",
+        "BLOCK_S",
+        "BLOCK_D",
+        "BLOCK_D_HALF",
+    ],
+)
+
+
+@triton.jit(repr=_rope_kernel_sbhd_bwd_repr)
 def _rope_kernel_sbhd_bwd(
     x_ptr,
     freqs_ptr,
@@ -300,7 +332,22 @@ def _rope_kernel_sbhd_bwd(
             tl.store(out_ptr + x_out_offs + BLOCK_D * stride_out_d, x, mask=x_mask)
 
 
-@triton.jit
+_rope_kernel_thd_fwd_repr = make_kernel_repr(
+    "_rope_kernel_thd_fwd",
+    [
+        "HAVE_NOPE",
+        "NOPE_FIRST",
+        "INPLACE",
+        "REUSE_FREQS_FRONT_PART",
+        "IS_NEOX",
+        "BLOCK_T",
+        "BLOCK_D",
+        "BLOCK_D_HALF",
+    ],
+)
+
+
+@triton.jit(repr=_rope_kernel_thd_fwd_repr)
 def _rope_kernel_thd_fwd(
     x_ptr,
     cu_seqlens_ptr,
@@ -409,7 +456,22 @@ def _rope_kernel_thd_fwd(
             tl.store(out_ptr + x_out_offs + BLOCK_D * stride_out_d, x, mask=x_mask)
 
 
-@triton.jit
+_rope_kernel_thd_bwd_repr = make_kernel_repr(
+    "_rope_kernel_thd_bwd",
+    [
+        "HAVE_NOPE",
+        "NOPE_FIRST",
+        "INPLACE",
+        "REUSE_FREQS_FRONT_PART",
+        "IS_NEOX",
+        "BLOCK_T",
+        "BLOCK_D",
+        "BLOCK_D_HALF",
+    ],
+)
+
+
+@triton.jit(repr=_rope_kernel_thd_bwd_repr)
 def _rope_kernel_thd_bwd(
     x_ptr,
     cu_seqlens_ptr,
@@ -518,7 +580,24 @@ def _rope_kernel_thd_bwd(
             tl.store(out_ptr + x_out_offs + BLOCK_D * stride_out_d, x, mask=x_mask)
 
 
-@triton.jit
+_rope_kernel_sbhd_cached_fwd_repr = make_kernel_repr(
+    "_rope_kernel_sbhd_cached_fwd",
+    [
+        "HAVE_NOPE",
+        "NOPE_FIRST",
+        "INPLACE",
+        "REUSE_FREQS_FRONT_PART",
+        "IS_NEOX",
+        "HAVE_POS",
+        "HAVE_OFFS",
+        "BLOCK_S",
+        "BLOCK_D",
+        "BLOCK_D_HALF",
+    ],
+)
+
+
+@triton.jit(repr=_rope_kernel_sbhd_cached_fwd_repr)
 def _rope_kernel_sbhd_cached_fwd(
     x_ptr,
     cos_ptr,
@@ -641,7 +720,24 @@ def _rope_kernel_sbhd_cached_fwd(
             tl.store(out_ptr + x_out_offs + BLOCK_D * stride_out_d, x, mask=x_mask)
 
 
-@triton.jit
+_rope_kernel_sbhd_cached_bwd_repr = make_kernel_repr(
+    "_rope_kernel_sbhd_cached_bwd",
+    [
+        "HAVE_NOPE",
+        "NOPE_FIRST",
+        "INPLACE",
+        "REUSE_FREQS_FRONT_PART",
+        "IS_NEOX",
+        "HAVE_POS",
+        "HAVE_OFFS",
+        "BLOCK_S",
+        "BLOCK_D",
+        "BLOCK_D_HALF",
+    ],
+)
+
+
+@triton.jit(repr=_rope_kernel_sbhd_cached_bwd_repr)
 def _rope_kernel_sbhd_cached_bwd(
     x_ptr,
     cos_ptr,
@@ -764,7 +860,26 @@ def _rope_kernel_sbhd_cached_bwd(
             tl.store(out_ptr + x_out_offs + BLOCK_D * stride_out_d, x, mask=x_mask)
 
 
-@triton.jit
+_rope_kernel_thd_cached_2c_fwd_repr = make_kernel_repr(
+    "_rope_kernel_thd_cached_2c_fwd",
+    [
+        "HAVE_NOPE",
+        "NOPE_FIRST",
+        "INPLACE",
+        "REUSE_FREQS_FRONT_PART",
+        "IS_NEOX",
+        "HAVE_POS",
+        "HAVE_OFFS",
+        "BLOCK_T",
+        "SPLIT_H_SIZE",
+        "BLOCK_D",
+        "BLOCK_D_HALF",
+        "num_stages",
+    ],
+)
+
+
+@triton.jit(repr=_rope_kernel_thd_cached_2c_fwd_repr)
 def _rope_kernel_thd_cached_2c_fwd(
     x_ptr,
     y_ptr,
@@ -941,7 +1056,26 @@ def _rope_kernel_thd_cached_2c_fwd(
                 )
 
 
-@triton.jit
+_rope_kernel_thd_cached_2c_bwd_repr = make_kernel_repr(
+    "_rope_kernel_thd_cached_2c_bwd",
+    [
+        "HAVE_NOPE",
+        "NOPE_FIRST",
+        "INPLACE",
+        "REUSE_FREQS_FRONT_PART",
+        "IS_NEOX",
+        "HAVE_POS",
+        "HAVE_OFFS",
+        "BLOCK_T",
+        "SPLIT_H_SIZE",
+        "BLOCK_D",
+        "BLOCK_D_HALF",
+        "num_stages",
+    ],
+)
+
+
+@triton.jit(repr=_rope_kernel_thd_cached_2c_bwd_repr)
 def _rope_kernel_thd_cached_2c_bwd(
     x_ptr,
     y_ptr,
@@ -1119,7 +1253,26 @@ def _rope_kernel_thd_cached_2c_bwd(
                 )
 
 
-@triton.jit
+_rope_kernel_cached_thd_2c_gqa_fwd_repr = make_kernel_repr(
+    "_rope_kernel_cached_thd_2c_gqa_fwd",
+    [
+        "HAVE_NOPE",
+        "NOPE_FIRST",
+        "INPLACE",
+        "REUSE_FREQS_FRONT_PART",
+        "IS_NEOX",
+        "HAVE_POS",
+        "HAVE_OFFS",
+        "BLOCK_T",
+        "QH_per_G",
+        "BLOCK_D",
+        "BLOCK_D_HALF",
+        "num_stages",
+    ],
+)
+
+
+@triton.jit(repr=_rope_kernel_cached_thd_2c_gqa_fwd_repr)
 def _rope_kernel_cached_thd_2c_gqa_fwd(
     x_ptr,
     y_ptr,
@@ -1299,7 +1452,25 @@ def _rope_kernel_cached_thd_2c_gqa_fwd(
                 )
 
 
-@triton.jit
+_rope_kernel_cached_thd_2c_gqa_onehead_fwd_repr = make_kernel_repr(
+    "_rope_kernel_cached_thd_2c_gqa_onehead_fwd",
+    [
+        "HAVE_NOPE",
+        "NOPE_FIRST",
+        "INPLACE",
+        "REUSE_FREQS_FRONT_PART",
+        "IS_NEOX",
+        "HAVE_POS",
+        "HAVE_OFFS",
+        "BLOCK_T",
+        "G",
+        "BLOCK_D",
+        "BLOCK_D_HALF",
+    ],
+)
+
+
+@triton.jit(repr=_rope_kernel_cached_thd_2c_gqa_onehead_fwd_repr)
 def _rope_kernel_cached_thd_2c_gqa_onehead_fwd(
     x_ptr,
     y_ptr,
@@ -1474,7 +1645,26 @@ def _rope_kernel_cached_thd_2c_gqa_onehead_fwd(
                 )
 
 
-@triton.jit
+_rope_kernel_cached_thd_2c_gqa_bwd_repr = make_kernel_repr(
+    "_rope_kernel_cached_thd_2c_gqa_bwd",
+    [
+        "HAVE_NOPE",
+        "NOPE_FIRST",
+        "INPLACE",
+        "REUSE_FREQS_FRONT_PART",
+        "IS_NEOX",
+        "HAVE_POS",
+        "HAVE_OFFS",
+        "BLOCK_T",
+        "QH_per_G",
+        "BLOCK_D",
+        "BLOCK_D_HALF",
+        "num_stages",
+    ],
+)
+
+
+@triton.jit(repr=_rope_kernel_cached_thd_2c_gqa_bwd_repr)
 def _rope_kernel_cached_thd_2c_gqa_bwd(
     x_ptr,
     y_ptr,
@@ -1654,7 +1844,25 @@ def _rope_kernel_cached_thd_2c_gqa_bwd(
                 )
 
 
-@triton.jit
+_rope_kernel_cached_thd_2c_gqa_onehead_bwd_repr = make_kernel_repr(
+    "_rope_kernel_cached_thd_2c_gqa_onehead_bwd",
+    [
+        "HAVE_NOPE",
+        "NOPE_FIRST",
+        "INPLACE",
+        "REUSE_FREQS_FRONT_PART",
+        "IS_NEOX",
+        "HAVE_POS",
+        "HAVE_OFFS",
+        "BLOCK_T",
+        "G",
+        "BLOCK_D",
+        "BLOCK_D_HALF",
+    ],
+)
+
+
+@triton.jit(repr=_rope_kernel_cached_thd_2c_gqa_onehead_bwd_repr)
 def _rope_kernel_cached_thd_2c_gqa_onehead_bwd(
     x_ptr,
     y_ptr,
@@ -1829,7 +2037,18 @@ def _rope_kernel_cached_thd_2c_gqa_onehead_bwd(
                 )
 
 
-@triton.jit
+_rope_fwd_2d_kernel_neox_repr = make_kernel_repr(
+    "_rope_fwd_2d_kernel_neox",
+    [
+        "WH",
+        "HEIGHT",
+        "WEIGHT",
+        "BLOCK_D",
+    ],
+)
+
+
+@triton.jit(repr=_rope_fwd_2d_kernel_neox_repr)
 def _rope_fwd_2d_kernel_neox(
     x_ptr,
     cos_h_ptr,
@@ -1936,7 +2155,29 @@ def _rope_fwd_2d_kernel_neox(
     tl.store(out_ptr + offs_x, out)
 
 
-@triton.jit
+_rope_fwd_3d_repr = make_kernel_repr(
+    "_rope_fwd_3d",
+    [
+        "L",
+        "N_HEADS",
+        "C",
+        "c_total",
+        "sp_size",
+        "sp_rank",
+        "max_freq_seq_len",
+        "s_per_rank",
+        "pad_freq_val_r",
+        "pad_freq_val_i",
+        "BLOCK_L",
+        "BLOCK_N",
+        "BLOCK_C",
+        "C1",
+        "C2",
+    ],
+)
+
+
+@triton.jit(repr=_rope_fwd_3d_repr)
 def _rope_fwd_3d(
     x_ptr,
     freqs_real_ptr,

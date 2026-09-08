@@ -494,17 +494,30 @@ def _flash_kda_segment_kernel(
     if STORE_FINAL:  # noqa: SIM102
         if tl.load(seg_is_last + i_seg) == 1:
             i_n = tl.load(seg_seq + i_seg).to(tl.int64)
+            dt_s = final_state.dtype.element_ty
             if STATE_V_FIRST:
                 f_off = (i_n * H + i_h) * V * K + o_w[None, :] * K
-                tl.store(final_state + f_off + o_k1[:, None], b_h1, mask=m_w[None, :])
-                tl.store(final_state + f_off + o_k2[:, None], b_h2, mask=m_w[None, :])
+                tl.store(
+                    final_state + f_off + o_k1[:, None],
+                    b_h1.to(dt_s),
+                    mask=m_w[None, :],
+                )
+                tl.store(
+                    final_state + f_off + o_k2[:, None],
+                    b_h2.to(dt_s),
+                    mask=m_w[None, :],
+                )
             else:
                 f_off = (i_n * H + i_h) * K * V + o_w[None, :]
                 tl.store(
-                    final_state + f_off + o_k1[:, None] * V, b_h1, mask=m_w[None, :]
+                    final_state + f_off + o_k1[:, None] * V,
+                    b_h1.to(dt_s),
+                    mask=m_w[None, :],
                 )
                 tl.store(
-                    final_state + f_off + o_k2[:, None] * V, b_h2, mask=m_w[None, :]
+                    final_state + f_off + o_k2[:, None] * V,
+                    b_h2.to(dt_s),
+                    mask=m_w[None, :],
                 )
 
 
@@ -541,8 +554,12 @@ def _flash_kda_seg_scan_kernel(
 
     if HAS_H0:
         base = (i_n * H + i_h) * K * V + o_v[None, :]
-        b_h1 = tl.load(h0 + base + o_k1[:, None] * V, mask=m_v[None, :], other=0.0)
-        b_h2 = tl.load(h0 + base + o_k2[:, None] * V, mask=m_v[None, :], other=0.0)
+        b_h1 = tl.load(h0 + base + o_k1[:, None] * V, mask=m_v[None, :], other=0.0).to(
+            tl.float32
+        )
+        b_h2 = tl.load(h0 + base + o_k2[:, None] * V, mask=m_v[None, :], other=0.0).to(
+            tl.float32
+        )
     else:
         b_h1 = tl.zeros([64, BV], dtype=tl.float32)
         b_h2 = tl.zeros([64, BV], dtype=tl.float32)
@@ -831,13 +848,14 @@ def flash_kda_fwd(
     if h0 is not None:
         if state_v_first:
             h0 = h0.transpose(-1, -2)
-        h0 = h0.to(torch.float32).contiguous()
+        h0 = h0.contiguous()
 
     o = torch.empty_like(v)
     final_state = None
     if output_final_state:
         shape = (N, H, V, K) if state_v_first else (N, H, K, V)
-        final_state = torch.empty(shape, dtype=torch.float32, device=dev)
+        state_dtype = h0.dtype if h0 is not None else torch.float32
+        final_state = torch.empty(shape, dtype=state_dtype, device=dev)
 
     common = {
         "ws_kd": ws_kd,
