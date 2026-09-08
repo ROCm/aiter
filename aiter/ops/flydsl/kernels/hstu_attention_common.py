@@ -36,11 +36,42 @@ WARP_SIZE = 64
 NUM_GRID_GROUPS = 8
 MFMA_M = 16
 MFMA_N = 16
+# Register-resident score/dS fragments feed the sequence-axis GEMMs directly.
+# Their accumulator layout is also the operand layout of a 16-deep MFMA, so
+# keep those chained GEMMs at K=16 on both architectures.
 MFMA_K = 16
 MFMA_LANE_K = 4
 MFMA_LANE_K_LOG2 = 2
 assert (1 << MFMA_LANE_K_LOG2) == MFMA_LANE_K
+# The accumulator layout is independent of the instruction's contraction depth:
+# both 16x16x16 and 16x16x32 produce four fp32 values per wave64 lane.
 MFMA_ELEMS_PER_LANE = (MFMA_M * MFMA_N) // WARP_SIZE
+
+
+def _arch_mfma_params(arch: str | None = None):
+    """Return dimension-axis ``(mfma_k, operand_elems_per_lane, log2_operand_elems)``.
+
+    CDNA3 uses the native 16x16x16 f16/bf16 instruction. CDNA4 doubles the
+    contraction depth for QK and VdO with 16x16x32, so each lane supplies eight
+    operand elements while the four-element accumulator fragment remains
+    unchanged. Sequence-axis GEMMs retain the fixed constants above because
+    their inputs are reused accumulator fragments.
+    """
+    if arch is None:
+        arch = get_rocm_arch()
+    mfma_k = 16 if (arch or "").startswith("gfx942") else 32
+    lane_k = (MFMA_M * mfma_k) // WARP_SIZE
+    lane_k_log2 = int(host_math.log2(lane_k))
+    assert (1 << lane_k_log2) == lane_k
+    return mfma_k, lane_k, lane_k_log2
+
+
+def _mfma_params_for_dim(dim: int, arch: str | None = None):
+    """Use the preferred architecture MFMA depth when ``dim`` supports it."""
+    preferred = _arch_mfma_params(arch)
+    if dim % preferred[0] == 0:
+        return preferred
+    return MFMA_K, MFMA_LANE_K, MFMA_LANE_K_LOG2
 
 
 def _dtype_to_elem_type(dtype_str: str):
@@ -88,6 +119,41 @@ def exp2_f32(x):
             fx.Float32.ir_type, "llvm.amdgcn.exp2.f32", [x.ir_value()], [], []
         )
     )
+
+
+def make_mfma_acc(mfma_k: int, lane_k: int, elem_dtype, c_rmem):
+    """Build one ``acc(a_pack, b_pack, c) -> c'`` for an MFMA of depth ``mfma_k``.
+
+    Must be called from inside a ``@flyc.kernel`` body: it allocates the atom and
+    the A/B register fragments. Callers share ``c_rmem`` (always the 4-wide C
+    fragment). Equal ``(mfma_k, lane_k)`` pairs should reuse the same acc so
+    gfx942 keeps a single 16x16x16 atom instead of three identical ones.
+    """
+    atom = fx.make_mma_atom(fx.rocdl.MFMA(MFMA_M, MFMA_M, mfma_k, elem_dtype))
+    a_rmem = fx.make_rmem_tensor(lane_k, elem_dtype)
+    b_rmem = fx.make_rmem_tensor(lane_k, elem_dtype)
+
+    def acc(a_pack, b_pack, c):
+        a_rmem.store(Vec(a_pack))
+        b_rmem.store(Vec(b_pack))
+        c_rmem.store(Vec(c))
+        fx.mma_atom_call(atom, c_rmem, a_rmem, b_rmem, c_rmem)
+        return c_rmem.load().ir_value()
+
+    return acc
+
+
+def bind_mfma_accs(elem_dtype, *shapes):
+    """Return one acc per ``(mfma_k, lane_k)``, reusing atoms for equal shapes."""
+    c_rmem = fx.make_rmem_tensor(MFMA_ELEMS_PER_LANE, fx.Float32)
+    cache = {}
+    accs = []
+    for mfma_k, lane_k in shapes:
+        key = (mfma_k, lane_k)
+        if key not in cache:
+            cache[key] = make_mfma_acc(mfma_k, lane_k, elem_dtype, c_rmem)
+        accs.append(cache[key])
+    return accs
 
 
 def pack_mfma_frag(vals, is_bf16: bool, elem_dtype):

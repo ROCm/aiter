@@ -52,6 +52,8 @@ from aiter.ops.flydsl.kernels.hstu_attention_common import (
     WARP_SIZE,
     _arch_dma_params,
     _dtype_to_elem_type,
+    _mfma_params_for_dim,
+    bind_mfma_accs,
     decode_lane,
     exp2_f32,
     grouped_loader,
@@ -107,13 +109,15 @@ def validate_hstu_attention_bwd(
         raise ValueError(f"max_seq_len must be positive, got {max_seq_len}")
     if not host_math.isfinite(alpha):
         raise ValueError(f"alpha must be finite, got {alpha}")
-    if head_dim <= 0 or head_dim % MFMA_K != 0:
+    mfma_qk_k, _, _ = _mfma_params_for_dim(head_dim, arch)
+    if head_dim <= 0 or head_dim % mfma_qk_k != 0:
         raise ValueError(
-            f"head_dim must be positive and a multiple of MFMA_K={MFMA_K}, got {head_dim}"
+            f"head_dim must be positive and a multiple of MFMA_K={mfma_qk_k}, got {head_dim}"
         )
-    if hidden_dim <= 0 or hidden_dim % MFMA_M != 0:
+    mfma_da_k, _, _ = _mfma_params_for_dim(hidden_dim, arch)
+    if hidden_dim <= 0 or hidden_dim % mfma_da_k != 0:
         raise ValueError(
-            f"hidden_dim must be positive and a multiple of MFMA_M={MFMA_M}, got {hidden_dim}"
+            f"hidden_dim must be positive and a multiple of MFMA_K={mfma_da_k}, got {hidden_dim}"
         )
 
     if block_m <= 0:
@@ -210,6 +214,8 @@ def build_hstu_attention_bwd_dvdk(
     KV_OWNED_SUBTILES = ROWS_PER_WAVE // MFMA_M
     Q_STREAM_SUBTILES = BLOCK_N // MFMA_N
     WAVES_PER_EU = waves_per_eu
+    MFMA_QK_K, MFMA_QK_LANE_K, _ = _mfma_params_for_dim(head_dim)
+    MFMA_DA_K, MFMA_DA_LANE_K, _ = _mfma_params_for_dim(hidden_dim)
 
     DMA_BYTES, DMA_ELEMS, K_SWZ_ROWS, K_SWZ_SHIFT = _arch_dma_params()
 
@@ -218,11 +224,11 @@ def build_hstu_attention_bwd_dvdk(
     has_window = max_attn_len > 0
     has_contextual = contextual_seq_len > 0
 
-    K_STEPS = head_dim // MFMA_K
+    K_STEPS = head_dim // MFMA_QK_K
     HEAD_DIM_K = ((head_dim + 63) // 64) * 64
-    K_STEPS_K = HEAD_DIM_K // MFMA_K
+    K_STEPS_K = HEAD_DIM_K // MFMA_QK_K
     D_CHUNKS = hidden_dim // MFMA_M
-    DK_STEPS = hidden_dim // MFMA_K
+    DK_STEPS = hidden_dim // MFMA_DA_K
     HC_CHUNKS = head_dim // MFMA_M
 
     num_kv_tiles = (max_seq_len + BLOCK_M - 1) // BLOCK_M
@@ -277,20 +283,19 @@ def build_hstu_attention_bwd_dvdk(
         out_dk: fx.Tensor,
     ) -> None:
         elem_type = elem_dtype.ir_type
-        c_zero_mfma_pack = Vec.filled(MFMA_LANE_K, 0.0, elem_dtype).ir_value()
+        c_zero_qk_pack = Vec.filled(MFMA_QK_LANE_K, 0.0, elem_dtype).ir_value()
+        c_zero_da_pack = Vec.filled(MFMA_DA_LANE_K, 0.0, elem_dtype).ir_value()
 
-        # ---- MMA atom: one 16x16x16 f16/bf16 accumulate per wave ----
-        _mma_atom = fx.make_mma_atom(fx.rocdl.MFMA(MFMA_M, MFMA_M, MFMA_K, elem_dtype))
-        _mfma_a = fx.make_rmem_tensor(MFMA_LANE_K, elem_dtype)
-        _mfma_b = fx.make_rmem_tensor(MFMA_LANE_K, elem_dtype)
-        _mfma_c = fx.make_rmem_tensor(MFMA_ELEMS_PER_LANE, fx.Float32)
-
-        def mfma_acc(a_pack, b_pack, c):
-            _mfma_a.store(Vec(a_pack))
-            _mfma_b.store(Vec(b_pack))
-            _mfma_c.store(Vec(c))
-            fx.mma_atom_call(_mma_atom, _mfma_c, _mfma_a, _mfma_b, _mfma_c)
-            return _mfma_c.load().ir_value()
+        # QK and V*dO use the architecture-native dimension-axis MFMA. The dV
+        # and dK sequence reductions stay 16-deep so score fragments can remain
+        # register-resident without a cross-lane redistribution. Equal shapes
+        # share one atom (the gfx942 path).
+        qk_mfma_acc, da_mfma_acc, mfma_acc = bind_mfma_accs(
+            elem_dtype,
+            (MFMA_QK_K, MFMA_QK_LANE_K),
+            (MFMA_DA_K, MFMA_DA_LANE_K),
+            (MFMA_K, MFMA_LANE_K),
+        )
 
         tid = fx.Int32(gpu.thread_idx.x)
         wave_id, _lane, lane_div_16, lane_mod_16 = decode_lane(
@@ -341,8 +346,8 @@ def build_hstu_attention_bwd_dvdk(
                 xid = (xid > max_id).select(max_id, xid)
             return xid
 
-        k_load = grouped_loader(k, head_dim, MFMA_LANE_K)
-        v_load = grouped_loader(v, hidden_dim, MFMA_LANE_K)
+        k_load = grouped_loader(k, head_dim, MFMA_QK_LANE_K)
+        v_load = grouped_loader(v, hidden_dim, MFMA_DA_LANE_K)
 
         q_head_offset = head_idx * fx.Int32(head_dim)
         q_base_byte_offset = (
@@ -355,14 +360,14 @@ def build_hstu_attention_bwd_dvdk(
         lds = fx.SharedAllocator().allocate(SharedStorage).peek()
         q_view = lds.q.view(
             fx.make_layout(
-                (BLOCK_N, Q_STRIDE // MFMA_LANE_K, MFMA_LANE_K),
-                (Q_STRIDE, MFMA_LANE_K, 1),
+                (BLOCK_N, Q_STRIDE // MFMA_QK_LANE_K, MFMA_QK_LANE_K),
+                (Q_STRIDE, MFMA_QK_LANE_K, 1),
             )
         )
         do_view = lds.do.view(
             fx.make_layout(
-                (BLOCK_N, DO_STRIDE // MFMA_LANE_K, MFMA_LANE_K),
-                (DO_STRIDE, MFMA_LANE_K, 1),
+                (BLOCK_N, DO_STRIDE // MFMA_DA_LANE_K, MFMA_DA_LANE_K),
+                (DO_STRIDE, MFMA_DA_LANE_K, 1),
             )
         )
         q_lds_byte_base = fx.ptrtoint(fx.get_iter(q_view))
@@ -402,26 +407,26 @@ def build_hstu_attention_bwd_dvdk(
 
         k_packs = []
         for ks in range_constexpr(K_STEPS):
-            k_col = fx.Int32(ks * MFMA_K) + lane_div_16 * fx.Int32(MFMA_LANE_K)
+            k_col = fx.Int32(ks * MFMA_QK_K) + lane_div_16 * fx.Int32(MFMA_QK_LANE_K)
             per_og = []
             for og in range_constexpr(KV_OWNED_SUBTILES):
                 safe = kv_in_bounds[og].select(seq_start + kv_rows[og], seq_start)
                 raw = k_load(
-                    fx.Int64(safe), head_idx, k_col // fx.Int32(MFMA_LANE_K)
+                    fx.Int64(safe), head_idx, k_col // fx.Int32(MFMA_QK_LANE_K)
                 ).ir_value()
-                per_og.append(kv_in_bounds[og].select(raw, c_zero_mfma_pack))
+                per_og.append(kv_in_bounds[og].select(raw, c_zero_qk_pack))
             k_packs.append(per_og)
 
         v_packs = []
         for ks in range_constexpr(DK_STEPS):
-            v_col = fx.Int32(ks * MFMA_K) + lane_div_16 * fx.Int32(MFMA_LANE_K)
+            v_col = fx.Int32(ks * MFMA_DA_K) + lane_div_16 * fx.Int32(MFMA_DA_LANE_K)
             per_og = []
             for og in range_constexpr(KV_OWNED_SUBTILES):
                 safe = kv_in_bounds[og].select(seq_start + kv_rows[og], seq_start)
                 raw = v_load(
-                    fx.Int64(safe), head_idx, v_col // fx.Int32(MFMA_LANE_K)
+                    fx.Int64(safe), head_idx, v_col // fx.Int32(MFMA_DA_LANE_K)
                 ).ir_value()
-                per_og.append(kv_in_bounds[og].select(raw, c_zero_mfma_pack))
+                per_og.append(kv_in_bounds[og].select(raw, c_zero_da_pack))
             v_packs.append(per_og)
 
         c_alpha = fx.Float32(alpha)
@@ -574,12 +579,16 @@ def build_hstu_attention_bwd_dvdk(
             q_row = fx.Int32(ng * MFMA_M) + lane_mod_16
             packs = []
             for ks in range_constexpr(K_STEPS_K):
-                q_col = fx.Int32(ks * MFMA_K) + lane_div_16 * fx.Int32(MFMA_LANE_K)
+                q_col = fx.Int32(ks * MFMA_QK_K) + lane_div_16 * fx.Int32(
+                    MFMA_QK_LANE_K
+                )
                 # swz_col is MFMA_LANE_K-aligned, so //MFMA_LANE_K selects the packed
                 # group and the trailing group axis carries the row stride.
                 packs.append(
                     q_view[
-                        q_row, q_swz_col(q_row, q_col) // fx.Int32(MFMA_LANE_K), None
+                        q_row,
+                        q_swz_col(q_row, q_col) // fx.Int32(MFMA_QK_LANE_K),
+                        None,
                     ].load()
                 )
             return packs
@@ -612,8 +621,8 @@ def build_hstu_attention_bwd_dvdk(
                 for og in range_constexpr(KV_OWNED_SUBTILES):
                     cur = Vec.filled(MFMA_ELEMS_PER_LANE, 0.0, fx.Float32).ir_value()
                     for ks in range_constexpr(K_STEPS_K):
-                        k_op = k_packs[ks][og] if ks < K_STEPS else c_zero_mfma_pack
-                        cur = mfma_acc(q_packs[ks].ir_value(), k_op, cur)
+                        k_op = k_packs[ks][og] if ks < K_STEPS else c_zero_qk_pack
+                        cur = qk_mfma_acc(q_packs[ks].ir_value(), k_op, cur)
                     s_vals = [Vec(cur)[i] for i in range_constexpr(MFMA_ELEMS_PER_LANE)]
 
                     def keep_row(i, og=og, q_ids=q_ids, q_raw=q_raw, q_in_seq=q_in_seq):
@@ -645,8 +654,8 @@ def build_hstu_attention_bwd_dvdk(
             for ng in range_constexpr(Q_STREAM_SUBTILES):
                 d_col = fx.Int32(c * MFMA_M) + lane_mod_16
                 q_lane = fx.Int32(ng * MFMA_M) + lane_div_16 * fx.Int32(MFMA_LANE_K)
-                d_grp = d_col // fx.Int32(MFMA_LANE_K)
-                d_lane = d_col % fx.Int32(MFMA_LANE_K)
+                d_grp = d_col // fx.Int32(MFMA_DA_LANE_K)
+                d_lane = d_col % fx.Int32(MFMA_DA_LANE_K)
                 elems = [
                     do_view[q_lane + fx.Int32(i), d_grp, d_lane]
                     for i in range_constexpr(MFMA_LANE_K)
@@ -675,9 +684,11 @@ def build_hstu_attention_bwd_dvdk(
             q_row = fx.Int32(ng * MFMA_M) + lane_mod_16
             packs = []
             for ks in range_constexpr(DK_STEPS):
-                d_col = fx.Int32(ks * MFMA_K) + lane_div_16 * fx.Int32(MFMA_LANE_K)
+                d_col = fx.Int32(ks * MFMA_DA_K) + lane_div_16 * fx.Int32(
+                    MFMA_DA_LANE_K
+                )
                 packs.append(
-                    do_view[q_row, d_col // fx.Int32(MFMA_LANE_K), None].load()
+                    do_view[q_row, d_col // fx.Int32(MFMA_DA_LANE_K), None].load()
                 )
             return packs
 
@@ -691,7 +702,7 @@ def build_hstu_attention_bwd_dvdk(
                 for og in range_constexpr(KV_OWNED_SUBTILES):
                     cur = Vec.filled(MFMA_ELEMS_PER_LANE, 0.0, fx.Float32).ir_value()
                     for ks in range_constexpr(DK_STEPS):
-                        cur = mfma_acc(do_a[ks].ir_value(), v_packs[ks][og], cur)
+                        cur = da_mfma_acc(do_a[ks].ir_value(), v_packs[ks][og], cur)
                     da_vals = [
                         Vec(cur)[i] for i in range_constexpr(MFMA_ELEMS_PER_LANE)
                     ]
@@ -720,8 +731,8 @@ def build_hstu_attention_bwd_dvdk(
                     elems.append(
                         q_view[
                             q_row,
-                            col // fx.Int32(MFMA_LANE_K),
-                            col % fx.Int32(MFMA_LANE_K),
+                            col // fx.Int32(MFMA_QK_LANE_K),
+                            col % fx.Int32(MFMA_QK_LANE_K),
                         ]
                     )
                 qb_packs.append(Vec.from_elements(elems, elem_dtype).ir_value())

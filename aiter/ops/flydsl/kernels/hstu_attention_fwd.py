@@ -46,13 +46,14 @@ from aiter.ops.flydsl.kernels.hstu_attention_common import (
     MFMA_ELEMS_PER_LANE,
     MFMA_K,
     MFMA_LANE_K,
-    MFMA_LANE_K_LOG2,
     MFMA_M,
     MFMA_N,
     NUM_GRID_GROUPS,
     WARP_SIZE,
     _arch_dma_params,
     _dtype_to_elem_type,
+    _mfma_params_for_dim,
+    bind_mfma_accs,
     exp2_f32,
 )
 
@@ -93,9 +94,10 @@ def validate_hstu_attention_fwd(
         raise ValueError(f"num_heads must be positive, got {num_heads}")
     if not host_math.isfinite(alpha):
         raise ValueError(f"alpha must be finite, got {alpha}")
-    if head_dim <= 0 or head_dim % MFMA_K != 0:
+    mfma_dim_k, _, _ = _mfma_params_for_dim(head_dim, arch)
+    if head_dim <= 0 or head_dim % mfma_dim_k != 0:
         raise ValueError(
-            f"head_dim must be positive and a multiple of MFMA_K={MFMA_K}, got {head_dim}"
+            f"head_dim must be positive and a multiple of MFMA_K={mfma_dim_k}, got {head_dim}"
         )
     if hidden_dim <= 0 or hidden_dim % MFMA_M != 0:
         raise ValueError(
@@ -187,10 +189,11 @@ def build_hstu_attention_fwd(
     Q_SUBTILES = ROWS_PER_WAVE // MFMA_M
     KV_SUBTILES = BLOCK_N // MFMA_N
     WAVES_PER_EU = waves_per_eu
+    MFMA_DIM_K, MFMA_DIM_LANE_K, MFMA_DIM_LANE_K_LOG2 = _mfma_params_for_dim(head_dim)
 
     assert num_waves > 0 and block_m % (num_waves * MFMA_M) == 0
     assert block_n % MFMA_M == 0
-    assert head_dim % MFMA_K == 0
+    assert head_dim % MFMA_DIM_K == 0
     assert hidden_dim % MFMA_M == 0
 
     # Arch-conditional DMA width + K LDS swizzle geometry (gfx942 dword / gfx950 dwordx4).
@@ -201,8 +204,8 @@ def build_hstu_attention_fwd(
     has_window = max_attn_len > 0
     has_contextual = contextual_seq_len > 0
 
-    # real 16-wide contraction steps (Q side)
-    K_STEPS = head_dim // MFMA_K
+    # QK contracts with the architecture-native dimension-axis MFMA.
+    K_STEPS = head_dim // MFMA_DIM_K
     # k_swz_col has period 64, so a K stride < 64 swizzles out of row and corrupts GEMM2's A-operand.
     # Round the K stride up to 64; the extra columns over-fetch (buffer bounds -> 0) against a zero Q
     # operand and contribute nothing. head_dim % 64 == 0 leaves HEAD_DIM_K == head_dim. HEAD_DIM_K
@@ -212,7 +215,7 @@ def build_hstu_attention_fwd(
     # column max is < head_dim, so it is compile-time true and dropped (else a live runtime select).
     K_COL_GUARD = head_dim < HEAD_DIM_K
     # padded contraction steps (K side); always a multiple of 4
-    K_STEPS_K = HEAD_DIM_K // MFMA_K
+    K_STEPS_K = HEAD_DIM_K // MFMA_DIM_K
     # GEMM2 output chunks (per-lane O accumulators)
     D_CHUNKS = hidden_dim // MFMA_M
 
@@ -239,7 +242,7 @@ def build_hstu_attention_fwd(
     assert BLOCK_N % ROWS_PER_BATCH_K == 0 or ROWS_PER_BATCH_K > BLOCK_N
     NUM_BATCHES_K = max(1, BLOCK_N // ROWS_PER_BATCH_K)
     K_NEEDS_GUARD = ROWS_PER_BATCH_K > BLOCK_N
-    assert VEC_K % MFMA_LANE_K == 0
+    assert VEC_K % MFMA_DIM_LANE_K == 0
 
     # V tile divisibility (the DMA pass also gates the register-load tiling below).
     v_tile_elems = BLOCK_N * hidden_dim
@@ -286,20 +289,16 @@ def build_hstu_attention_fwd(
         inv_n: fx.Float32,
     ) -> None:
         compute_type = fx.Float32.ir_type
-        c_zero_mfma_pack = Vec.filled(MFMA_LANE_K, 0.0, elem_dtype).ir_value()
+        c_zero_dim_pack = Vec.filled(MFMA_DIM_LANE_K, 0.0, elem_dtype).ir_value()
 
-        # ---- MMA atom: one 16x16x16 f16/bf16 accumulate per wave ----
-        _mma_atom = fx.make_mma_atom(fx.rocdl.MFMA(MFMA_M, MFMA_M, MFMA_K, elem_dtype))
-        _mfma_a = fx.make_rmem_tensor(MFMA_LANE_K, elem_dtype)
-        _mfma_b = fx.make_rmem_tensor(MFMA_LANE_K, elem_dtype)
-        _mfma_c = fx.make_rmem_tensor(MFMA_ELEMS_PER_LANE, fx.Float32)
-
-        def mfma_acc(a_pack, b_pack, c):
-            _mfma_a.store(Vec(a_pack))
-            _mfma_b.store(Vec(b_pack))
-            _mfma_c.store(Vec(c))
-            fx.mma_atom_call(_mma_atom, _mfma_c, _mfma_a, _mfma_b, _mfma_c)
-            return _mfma_c.load().ir_value()
+        # QK uses gfx942's 16x16x16 or gfx950's native 16x16x32. P*V remains
+        # 16-deep because P is reused directly from the four-value C fragment.
+        # Equal shapes share one atom (the gfx942 path).
+        dim_mfma_acc, mfma_acc = bind_mfma_accs(
+            elem_dtype,
+            (MFMA_DIM_K, MFMA_DIM_LANE_K),
+            (MFMA_K, MFMA_LANE_K),
+        )
 
         # ---- Thread / lane indices ----
         tid = fx.Int32(gpu.thread_idx.x)
@@ -352,7 +351,7 @@ def build_hstu_attention_fwd(
 
             return load
 
-        q_load = grouped_loader(q, head_dim, MFMA_LANE_K)
+        q_load = grouped_loader(q, head_dim, MFMA_DIM_LANE_K)
         v_load = grouped_loader(v, hidden_dim, VEC_V)
         k_load = grouped_loader(k, head_dim, VEC_K)
 
@@ -366,8 +365,8 @@ def build_hstu_attention_fwd(
         lds = fx.SharedAllocator().allocate(SharedStorage).peek()
         k_smem = lds.k.view(
             fx.make_layout(
-                (BLOCK_N, HEAD_DIM_K // MFMA_LANE_K, MFMA_LANE_K),
-                (HEAD_DIM_K, MFMA_LANE_K, 1),
+                (BLOCK_N, HEAD_DIM_K // MFMA_DIM_LANE_K, MFMA_DIM_LANE_K),
+                (HEAD_DIM_K, MFMA_DIM_LANE_K, 1),
             )
         )
         v_smem = lds.v.view(
@@ -382,12 +381,12 @@ def build_hstu_attention_fwd(
         # SHIFT >= LOG2, and every column is MFMA_LANE_K-aligned, XOR distributes over the group
         # division: (col ^ mask) // LANE == (col // LANE) ^ (mask // LANE). We therefore swizzle the
         # group index directly and index the grouped view without a runtime divide.
-        assert K_SWZ_SHIFT >= MFMA_LANE_K_LOG2
+        assert K_SWZ_SHIFT >= MFMA_DIM_LANE_K_LOG2
 
         def k_swz_grp(tile_row, col_grp):
             return col_grp ^ (
                 (tile_row & fx.Int32(K_SWZ_ROWS - 1))
-                << fx.Int32(K_SWZ_SHIFT - MFMA_LANE_K_LOG2)
+                << fx.Int32(K_SWZ_SHIFT - MFMA_DIM_LANE_K_LOG2)
             )
 
         q_wave_base = q_tile_idx * fx.Int32(BLOCK_M) + wave_id * fx.Int32(ROWS_PER_WAVE)
@@ -404,14 +403,14 @@ def build_hstu_attention_fwd(
         q_packs = []
         for ks in range_constexpr(K_STEPS):
             # column within the head
-            q_col = fx.Int32(ks * MFMA_K) + lane_div_16 * fx.Int32(MFMA_LANE_K)
+            q_col = fx.Int32(ks * MFMA_DIM_K) + lane_div_16 * fx.Int32(MFMA_DIM_LANE_K)
             per_qg = []
             for qg in range_constexpr(Q_SUBTILES):
                 safe = q_in_bounds[qg].select(seq_start + q_rows[qg], seq_start)
                 raw = q_load(
-                    fx.Int64(safe), head_idx, q_col // fx.Int32(MFMA_LANE_K)
+                    fx.Int64(safe), head_idx, q_col // fx.Int32(MFMA_DIM_LANE_K)
                 ).ir_value()
-                per_qg.append(q_in_bounds[qg].select(raw, c_zero_mfma_pack))
+                per_qg.append(q_in_bounds[qg].select(raw, c_zero_dim_pack))
             q_packs.append(per_qg)
 
         # ---- Score-gate helpers ----
@@ -511,7 +510,7 @@ def build_hstu_attention_fwd(
         k_load_col = k_load_lane_in_row * fx.Int32(VEC_K)
         # ...same column in MFMA_LANE_K-group units (VEC_K is MFMA_LANE_K-aligned -> const multiply,
         # no runtime divide) for the swizzled LDS store below.
-        k_load_col_grp = k_load_lane_in_row * fx.Int32(VEC_K // MFMA_LANE_K)
+        k_load_col_grp = k_load_lane_in_row * fx.Int32(VEC_K // MFMA_DIM_LANE_K)
 
         def async_load_k_regs(kv_start, full_tile=False):
             """Issue coalesced K[kv_start] global loads to registers (non-blocking).
@@ -554,12 +553,12 @@ def build_hstu_attention_fwd(
             """Write prefetched K vecs to LDS at XOR-swizzled columns (dword-pair vector stores)."""
             for b in range_constexpr(NUM_BATCHES_K):
                 row = k_load_row_in_batch + fx.Int32(b * ROWS_PER_BATCH_K)
-                for h in range_constexpr(VEC_K // MFMA_LANE_K):
+                for h in range_constexpr(VEC_K // MFMA_DIM_LANE_K):
                     col_grp = k_load_col_grp + fx.Int32(h)
                     half = Vec.from_elements(
                         [
-                            Vec(vecs[b])[h * MFMA_LANE_K + j]
-                            for j in range_constexpr(MFMA_LANE_K)
+                            Vec(vecs[b])[h * MFMA_DIM_LANE_K + j]
+                            for j in range_constexpr(MFMA_DIM_LANE_K)
                         ],
                         elem_dtype,
                     )
@@ -629,7 +628,7 @@ def build_hstu_attention_fwd(
             packs = []
             for ks in range_constexpr(K_STEPS_K):
                 # k_col = ks*MFMA_K + lane_div_16*MFMA_LANE_K, in MFMA_LANE_K-group units.
-                k_col_grp = fx.Int32(ks * (MFMA_K // MFMA_LANE_K)) + lane_div_16
+                k_col_grp = fx.Int32(ks * (MFMA_DIM_K // MFMA_DIM_LANE_K)) + lane_div_16
                 packs.append(
                     k_smem[local_k_row, k_swz_grp(local_k_row, k_col_grp), None].load()
                 )
@@ -672,12 +671,11 @@ def build_hstu_attention_fwd(
                     # Operand swap: A=K, B=Q (not A=Q, B=K) so the MFMA result P lands directly in
                     # GEMM2's A-operand layout (M=query, K=kv) -- P stays register-resident, no transposed-V scatter.
                     for ks in range_constexpr(K_STEPS_K):
-                        q_op = q_packs[ks][qg] if ks < K_STEPS else c_zero_mfma_pack
-                        cur = mfma_acc(k_packs[ks].ir_value(), q_op, cur)
+                        q_op = q_packs[ks][qg] if ks < K_STEPS else c_zero_dim_pack
+                        cur = dim_mfma_acc(k_packs[ks].ir_value(), q_op, cur)
                     s_vals = [Vec(cur)[i] for i in range_constexpr(MFMA_ELEMS_PER_LANE)]
 
                     if const_expr(apply_mask):
-
                         # keep_col is traced and consumed within this same loop iteration
                         # (see the comprehension below), so the loop vars it closes over are
                         # bound at definition time -- B023's late-binding concern doesn't apply.
