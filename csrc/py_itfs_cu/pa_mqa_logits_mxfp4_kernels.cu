@@ -18,6 +18,27 @@
 using mqa_logits_fp4_traits_4wave = opus_mqa_logits_fp4_traits<256, 64, 128, 64, 4>;
 using mqa_logits_fp4_traits_1wave = opus_mqa_logits_fp4_traits<64, 64, 128, 64, 1>;
 
+// XCDs on the device, queried once per device. Falls back to 1, which disables the
+// padding below -- correct, just not faster.
+static int pa_mqa_logits_xcd_count(int device_id)
+{
+    static thread_local int cached_dev = -1;
+    static thread_local int cached_xcc = 1;
+    if(device_id != cached_dev)
+    {
+        int xcc = 1;
+        if(hipDeviceGetAttribute(&xcc, hipDeviceAttributeNumberOfXccs, device_id) != hipSuccess ||
+           xcc < 1)
+        {
+            (void)hipGetLastError();   // keep it clean for the launch's own check
+            xcc = 1;
+        }
+        cached_dev = device_id;
+        cached_xcc = xcc;
+    }
+    return cached_xcc;
+}
+
 // Shape validation shared by both launches.
 //
 // Note `Q_ROW_BYTES` is the WHOLE query row (H * D/2), not the per-head count, so q.size(2)
@@ -147,7 +168,7 @@ static void pa_mqa_logits_mxfp4_launch_decode(aiter_tensor_t& q,
                           aiter_tensor_t& block_tables,
                           aiter_tensor_t& weights,
                           aiter_tensor_t& cu_seq_q,
-                          aiter_tensor_t& context_lens,
+                          aiter_tensor_t& local_ends,
                           aiter_tensor_t& out,
                           int batch,
                           int next_n_max,
@@ -159,14 +180,22 @@ static void pa_mqa_logits_mxfp4_launch_decode(aiter_tensor_t& q,
 {
     pa_mqa_logits_mxfp4_check_shapes<Traits>(
         q, q_scale, kv_cache, kv_scale, block_tables, weights, out, block_k, kv_block_size);
-    AITER_CHECK(cu_seq_q.dtype() == AITER_DTYPE_i32 && context_lens.dtype() == AITER_DTYPE_i32,
-                "cu_seq_q / context_lens must be int32");
+    AITER_CHECK(cu_seq_q.dtype() == AITER_DTYPE_i32 && local_ends.dtype() == AITER_DTYPE_i32,
+                "cu_seq_q / local_ends must be int32");
     AITER_CHECK(cu_seq_q.size(0) == batch + 1, "cu_seq_q must have length batch+1");
+    AITER_CHECK(local_ends.numel() >= q.size(0),
+                "local_ends is per query row; need at least ", q.size(0),
+                " entries, got ", local_ends.numel());
 
     if(batch <= 0 || next_n_max <= 0 || split_kv <= 0)
         return;
-    AITER_CHECK(batch <= 65535 && next_n_max <= 65535,
-                "decode launch: batch / next_n_max exceed grid.x/.y limit (65535)");
+    // A batch's MTP rows sit gridDim.x apart in workgroup id, so they share an XCD's L2
+    // only when the XCD count divides gridDim.x. Padding costs at most
+    // (xcds - 1) * next_n_max * split_kv CTAs, each returning on its first instruction.
+    const int xcds   = pa_mqa_logits_xcd_count(q.device_id);
+    const int grid_x = (batch + xcds - 1) / xcds * xcds;
+    AITER_CHECK(grid_x <= 65535 && next_n_max <= 65535,
+                "decode launch: padded batch / next_n_max exceed grid.x/.y limit (65535)");
 
     opus_mqa_logits_kargs kargs{};
     kargs.ptr_q             = q.data_ptr();
@@ -177,8 +206,9 @@ static void pa_mqa_logits_mxfp4_launch_decode(aiter_tensor_t& q,
     kargs.ptr_weights       = weights.data_ptr();
     kargs.ptr_out           = reinterpret_cast<float*>(out.data_ptr());
     kargs.ptr_cu_seq_q      = reinterpret_cast<const int*>(cu_seq_q.data_ptr());
-    kargs.ptr_context_lens  = reinterpret_cast<const int*>(context_lens.data_ptr());
+    kargs.ptr_local_ends    = reinterpret_cast<const int*>(local_ends.data_ptr());
     kargs.split_kv          = split_kv;
+    kargs.num_batches       = batch;
     kargs.max_seq_len       = max_seq_len;
     kargs.stride_out_row    = static_cast<int>(out.stride(0));
     kargs.weight_scale      = weight_scale;
@@ -191,7 +221,8 @@ static void pa_mqa_logits_mxfp4_launch_decode(aiter_tensor_t& q,
 
     // grid (batch, next_n_max, split_kv): batch on the fast x-axis clusters a batch's
     // split CTAs (shared KV) -> best L2 locality (min-of-N sweep winner; the only mapping kept).
-    dim3 grid(static_cast<unsigned>(batch),
+    // x is the XCD-padded count so the clustering does not depend on batch % xcds.
+    dim3 grid(static_cast<unsigned>(grid_x),
               static_cast<unsigned>(next_n_max),
               static_cast<unsigned>(split_kv));
     dim3 block(Traits::BLOCK_SIZE);
@@ -206,7 +237,7 @@ void pa_mqa_logits_mxfp4_fwd_decode(aiter_tensor_t& q,
                           aiter_tensor_t& block_tables,
                           aiter_tensor_t& weights,
                           aiter_tensor_t& cu_seq_q,
-                          aiter_tensor_t& context_lens,
+                          aiter_tensor_t& local_ends,
                           aiter_tensor_t& out,
                           int batch,
                           int next_n_max,
@@ -218,11 +249,11 @@ void pa_mqa_logits_mxfp4_fwd_decode(aiter_tensor_t& q,
 {
     if(block_k == mqa_logits_fp4_traits_4wave::KV_TILE_SIZE) {
         pa_mqa_logits_mxfp4_launch_decode<mqa_logits_fp4_traits_4wave>(
-            q, q_scale, kv_cache, kv_scale, block_tables, weights, cu_seq_q, context_lens, out,
+            q, q_scale, kv_cache, kv_scale, block_tables, weights, cu_seq_q, local_ends, out,
             batch, next_n_max, split_kv, weight_scale, block_k, kv_block_size, max_seq_len);
     } else if(block_k == mqa_logits_fp4_traits_1wave::KV_TILE_SIZE) {
         pa_mqa_logits_mxfp4_launch_decode<mqa_logits_fp4_traits_1wave>(
-            q, q_scale, kv_cache, kv_scale, block_tables, weights, cu_seq_q, context_lens, out,
+            q, q_scale, kv_cache, kv_scale, block_tables, weights, cu_seq_q, local_ends, out,
             batch, next_n_max, split_kv, weight_scale, block_k, kv_block_size, max_seq_len);
     } else {
         AITER_CHECK(false, "block_k must be 256 (4-wave) or 64 (1-wave), got ", block_k);
@@ -261,11 +292,11 @@ void pa_mqa_logits_mxfp4_fwd_prefill(aiter_tensor_t& q,
     }
 }
 
-// ── Prefill per-row window build (device, cudagraph-safe) ───────────────────
-// Builds the per-row [local_start, local_end) window arrays that the PREFILL
-// launch consumes, from cu_seq_q + context_lens (MTP tail-causal; for qlen == ctx
-// this is plain causal). Decode does NOT use this -- the decode kernel derives its
-// window inline. All inputs/outputs are caller-allocated device buffers (no
+// ── Per-row window build (device, cudagraph-safe) ───────────────────────────
+// Builds the per-row [local_start, local_end) window arrays BOTH launches consume, from
+// cu_seq_q + context_lens (MTP tail-causal; for qlen == ctx this is plain causal). Decode
+// reads only `local_ends`, and only when its window IS tail-causal -- a compressed KV
+// cache builds its own. All inputs/outputs are caller-allocated device buffers (no
 // hipMalloc / no host<->device sync); the launch grid is the static shape (total_q).
 namespace {
 

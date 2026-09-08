@@ -54,9 +54,10 @@ void pa_mqa_logits_mxfp4_fwd_prefill(aiter_tensor_t& q,
                           int max_seq_len);
 
 // DECODE launch: 3D grid (batch, next_n_max, split_kv). Q/weights/out PACKED
-// ([total_q, ...]); the packed row (cu_seq_q[batch]+n) and MTP tail-causal window
-// are derived inline from per-batch cu_seq_q / context_lens (no window arrays).
-// cudagraph-safe (grid from static shapes; context_lens only read in-kernel).
+// ([total_q, ...]); the packed row is cu_seq_q[batch]+n, scored over [0, local_ends[row]).
+// The window is READ, not derived: a compressed KV cache's floor((pos+1)/ratio) is not
+// expressible as ctx - (qlen-1-n). `pa_mqa_logits_mxfp4_prefill_windows` builds the
+// tail-causal case. cudagraph-safe (grid from static shapes; local_ends read in-kernel).
 void pa_mqa_logits_mxfp4_fwd_decode(aiter_tensor_t& q,
                           aiter_tensor_t& q_scale,
                           aiter_tensor_t& kv_cache,
@@ -64,7 +65,7 @@ void pa_mqa_logits_mxfp4_fwd_decode(aiter_tensor_t& q,
                           aiter_tensor_t& block_tables,
                           aiter_tensor_t& weights,
                           aiter_tensor_t& cu_seq_q,
-                          aiter_tensor_t& context_lens,
+                          aiter_tensor_t& local_ends,
                           aiter_tensor_t& out,
                           int batch,
                           int next_n_max,
@@ -103,15 +104,16 @@ struct opus_mqa_logits_kargs {
     const void* __restrict__ ptr_weights;   // [total_tokens, H] bf16, NATURAL
     float* __restrict__ ptr_out;             // [total_tokens, max_seq_len] fp32
 
-    // Prefill (SCHED Prefill): per-row window arrays, each [num_rows] int32.
+    // Per-row window arrays, each [total_q] int32. Prefill reads all three; decode reads
+    // only ptr_local_ends -- its rows always start at 0 and it gets the batch from grid.x.
     const int* __restrict__ ptr_row_to_batch;
     const int* __restrict__ ptr_local_starts;
     const int* __restrict__ ptr_local_ends;
-    // Decode (SCHED Decode): per-batch arrays; windows derived inline in-kernel.
+    // Decode (SCHED Decode) only.
     const int* __restrict__ ptr_cu_seq_q;       // [batch+1] int32 (packed qlen prefix sum)
-    const int* __restrict__ ptr_context_lens;   // [batch]   int32
     int   split_kv;            // context splits per row (>= 1); SCHED Decode only
     int   num_rows;            // total query rows (prefill grid.x)
+    int   num_batches;         // real batch count; decode grid.x is rounded up past it
 
     int   max_seq_len;
     int   stride_out_row;      // out row stride in elements (== max_seq_len for dense out)
@@ -494,7 +496,6 @@ void pa_mqa_logits_mxfp4_kernel(opus_mqa_logits_kargs kargs) {
     const int* p_local_starts = kargs.ptr_local_starts;
     const int* p_local_ends   = kargs.ptr_local_ends;
     const int* p_cu_seq_q     = kargs.ptr_cu_seq_q;
-    const int* p_context_lens = kargs.ptr_context_lens;
     int split_kv = kargs.split_kv;
     if constexpr(SCHED == mqa_logits_sched::Decode) { pin_sgpr(split_kv); }
 
@@ -527,16 +528,20 @@ void pa_mqa_logits_mxfp4_kernel(opus_mqa_logits_kargs kargs) {
         const int batch      = opus::block_id_x();
         const int mtp_pos    = opus::block_id_y();
         const int split_idx  = opus::block_id_z();
+        // grid.x is padded up to a whole number of XCDs (see the launcher). cu_seq_q has
+        // only num_batches+1 entries, so this must precede every load below.
+        if(batch >= kargs.num_batches) return;
         int q_start = p_cu_seq_q[batch];
         int q_next  = p_cu_seq_q[batch + 1];
-        int ctx_len = p_context_lens[batch];
-        pin_sgpr(ctx_len);
         const int qlen = q_next - q_start;
         if(mtp_pos >= qlen) return;
         row_id      = q_start + mtp_pos;
         batch_id    = batch;
         local_start = 0;
-        local_end   = ctx_len - (qlen - 1 - mtp_pos);
+        // Depends on q_start, so it is a second scalar round trip. A [batch, next_n_max]
+        // window array would address off blockIdx and issue with the cu_seq_q loads.
+        local_end   = p_local_ends[row_id];
+        pin_sgpr(local_end);
         const int window_tiles    = (local_end > 0) ? ((local_end + kv_tile_size - 1) / kv_tile_size) : 0;
         const int tiles_per_split = window_tiles / num_splits;
         const int remainder       = window_tiles - tiles_per_split * num_splits;

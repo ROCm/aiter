@@ -401,32 +401,40 @@ def check_prefill(bs, windows_per_batch, seed, block_k, label):
     return ok
 
 
-def check_decode(bs, next_n, context_lens, seed, block_k, label):
-    """One fixed-MTP decode case; the window is derived in-kernel, so this tests that too."""
+def check_decode(bs, next_n, context_lens, seed, block_k, label, local_ends=None):
+    """One fixed-MTP decode case, scoring the kernel against the same host-built window the
+    reference uses. `local_ends` overrides the MTP tail-causal default with an arbitrary
+    per-row list in packed (b, n) order -- only such a case can tell a kernel that READS
+    the window from one that derives it.
+    """
     total_q = bs * next_n
-    max_end = max(context_lens)
+    if local_ends is None:
+        # MTP tail-causal, packed row order (b, n).
+        local_ends = [
+            max(context_lens[b] - (next_n - 1 - n), 0)
+            for b in range(bs)
+            for n in range(next_n)
+        ]
+    assert len(local_ends) == total_q
+    max_end = max(max(local_ends), 1)
     inp = build_inputs(bs, max_end, total_q, block_k, seed)
-    ctx = torch.tensor(context_lens, dtype=torch.int32, device=dev)
+
+    rb, ls, le = [], [], list(local_ends)
+    for b in range(bs):
+        for _ in range(next_n):
+            rb.append(b)
+            ls.append(0)
+    rb = torch.tensor(rb, dtype=torch.int32, device=dev)
+    ls = torch.tensor(ls, dtype=torch.int32, device=dev)
+    le = torch.tensor(le, dtype=torch.int32, device=dev)
 
     out = pa_mqa_logits_mxfp4_decode(
         inp.q_packed, inp.q_scale, inp.kv_cache, inp.kv_scale, inp.block_tables,
-        inp.weights, ctx, inp.max_seq_len, next_n,
+        inp.weights, le, inp.max_seq_len, next_n,
         split_ctx_len=inp.max_seq_len, weight_scale=WEIGHT_SCALE,
         block_k=block_k, kv_block_size=KV_BLOCK_SIZE,
     )  # fmt: skip
     torch.cuda.synchronize()
-
-    # The MTP tail-causal rule the kernel derives internally, restated here so a
-    # disagreement shows up as a window mismatch rather than silently passing.
-    rb, ls, le = [], [], []
-    for b in range(bs):
-        for n in range(next_n):
-            rb.append(b)
-            ls.append(0)
-            le.append(max(context_lens[b] - (next_n - 1 - n), 0))
-    rb = torch.tensor(rb, dtype=torch.int32, device=dev)
-    ls = torch.tensor(ls, dtype=torch.int32, device=dev)
-    le = torch.tensor(le, dtype=torch.int32, device=dev)
 
     rows = sample_rows(total_q, le, seed=seed)
     err = max_err(out, ref_rows(inp, rows, rb, ls, le))
@@ -464,6 +472,15 @@ def run_corner():
         oks.append(check_decode(2, 1, [128, 200], 8, block_k, "decode next_n=1"))
         oks.append(check_decode(3, 4, [256, 129, 64], 9, block_k, "decode MTP next_n=4"))
         oks.append(check_decode(1, 8, [block_k * 2 + 1], 10, block_k, "decode tile+1"))
+        # COMPRESSED KV windows (CSA ratio 4): draft token n sees
+        # min((pos + n + 1) // 4, n_committed) rows. The floor makes that a STEP in n
+        # (50, 50, 51, 51) and the third batch is fully clamped (2, 2, 2, 2); neither shape
+        # is expressible as `ctx - (next_n - 1 - n)`.
+        csa = []
+        for pos, ncmt in ((201, 80), (98, 30), (7, 2)):
+            csa += [min((pos + n + 1) // 4, ncmt) for n in range(4)]
+        oks.append(check_decode(3, 4, None, 11, block_k,
+                                "decode CSA ratio-4 windows", local_ends=csa))  # fmt: skip
     print(f"\n  {sum(oks)}/{len(oks)} cases pass")
     return all(oks)
 
@@ -534,6 +551,11 @@ def bench_decode(shapes, block_ks, iters, warmup):
         total_q = batch * next_n
         inp = build_inputs(batch, max(ctxs), total_q, block_k, seed=batch + next_n)
         ctx = torch.tensor(ctxs, dtype=torch.int32, device=dev)
+        # Per forward, not per layer -- so outside the timed closure.
+        cu = torch.arange(
+            0, (batch + 1) * next_n, next_n, dtype=torch.int32, device=dev
+        )
+        _, _, le = compute_prefill_windows(cu, ctx, total_q)
         out = torch.full(
             (total_q, inp.max_seq_len), float("-inf"), dtype=torch.float32, device=dev
         )
@@ -541,7 +563,7 @@ def bench_decode(shapes, block_ks, iters, warmup):
         def ours():
             return pa_mqa_logits_mxfp4_decode(
                 inp.q_packed, inp.q_scale, inp.kv_cache, inp.kv_scale, inp.block_tables,
-                inp.weights, ctx, inp.max_seq_len, next_n,
+                inp.weights, le, inp.max_seq_len, next_n,
                 split_ctx_len=inp.max_seq_len, weight_scale=WEIGHT_SCALE,
                 block_k=block_k, kv_block_size=KV_BLOCK_SIZE, out=out,
             )  # fmt: skip

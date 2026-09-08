@@ -104,7 +104,7 @@ def pa_mqa_logits_mxfp4_fwd_decode(
     block_tables: torch.Tensor,
     weights: torch.Tensor,
     cu_seq_q: torch.Tensor,
-    context_lens: torch.Tensor,
+    local_ends: torch.Tensor,
     out: torch.Tensor,
     batch: int,
     next_n_max: int,
@@ -133,8 +133,9 @@ def compute_prefill_windows(
     total_q: int,
     out: tuple | None = None,
 ):
-    """Build the per-row ``[local_start, local_end)`` window arrays the prefill launch
-    consumes, from ``cu_seq_q`` + ``context_lens``. Device-side, cudagraph-safe.
+    """Build the per-row ``[local_start, local_end)`` window arrays BOTH launches consume,
+    from ``cu_seq_q`` + ``context_lens``. Device-side, cudagraph-safe. Decode reads only
+    ``local_ends``; call this ONCE per forward, not once per layer.
 
     The rule is MTP tail-causal -- batch ``b``'s ``n``-th row sees
     ``[0, context_lens[b] - (qlen - 1 - n))``, which reduces to plain causal when
@@ -235,7 +236,7 @@ def pa_mqa_logits_mxfp4_decode(
     kv_scale: torch.Tensor,
     block_tables: torch.Tensor,
     weights: torch.Tensor,
-    context_lens: torch.Tensor,
+    local_ends: torch.Tensor,
     max_seq_len: int,
     next_n_max: int,
     *,
@@ -249,9 +250,18 @@ def pa_mqa_logits_mxfp4_decode(
 ) -> torch.Tensor:
     """Decode MQA logits (MTP), schedule-free and cudagraph-safe. One path for fixed-MTP
     (``cu_seq_q=None``) and varqlen (``cu_seq_q`` given). ``q`` / ``weights`` / ``out`` are
-    PACKED ``[total_q, ...]``. 3D grid (batch, next_n_max, split_kv); the MTP tail-causal
-    window is derived inline from ``cu_seq_q`` + ``context_lens``, so decode needs no window
-    arrays and no window-build kernel.
+    PACKED ``[total_q, ...]``. 3D grid (batch, next_n_max, split_kv).
+
+    ``local_ends`` is ``[total_q]`` int32 indexed by the PACKED row ``cu_seq_q[b] + n``,
+    which is scored over ``[0, local_ends[row])``. It is read, not derived, so a compressed
+    KV cache -- row ``n`` sees ``floor((pos + 1) / ratio)``, which is not
+    ``ctx - (next_n - 1 - n)`` -- can express its window.
+    :func:`compute_prefill_windows` builds the tail-causal case. Build it, and
+    ``cu_seq_q``, ONCE per forward: both are per-forward quantities and the kernel runs
+    per layer. Leaving ``cu_seq_q`` as ``None`` costs a ``torch.arange`` on every call.
+
+    Rows with ``local_ends <= 0`` cost one workgroup that exits immediately, so padding
+    the row count to a static shape is cheap.
 
     ``next_n_max`` (REQUIRED): MTP width = grid y-dim. Fixed MTP -> every batch has exactly
     ``next_n_max`` tokens (uniform ``cu_seq_q`` built here). Varqlen -> padded upper bound
@@ -270,9 +280,14 @@ def pa_mqa_logits_mxfp4_decode(
     _require_gfx950("pa_mqa_logits_mxfp4")
     block_k = int(block_k)
     total_q = int(q_fp4.shape[0])
-    batch = int(context_lens.shape[0])
     next_n_max = int(next_n_max)
     if cu_seq_q is None:  # fixed-MTP: uniform per-batch qlen == next_n_max
+        if total_q % next_n_max:
+            raise ValueError(
+                f"fixed-MTP decode wants total_q ({total_q}) divisible by next_n_max "
+                f"({next_n_max}); pass cu_seq_q for a ragged batch."
+            )
+        batch = total_q // next_n_max
         cu_seq_q = torch.arange(
             0,
             (batch + 1) * next_n_max,
@@ -282,6 +297,7 @@ def pa_mqa_logits_mxfp4_decode(
         )
     else:
         cu_seq_q = cu_seq_q.to(torch.int32).contiguous()
+        batch = int(cu_seq_q.shape[0]) - 1
 
     # Split the context across CTAs only when query rows alone under-fill the GPU.
     max_chunks = max(1, (int(split_ctx_len) + block_k - 1) // block_k)
@@ -305,7 +321,7 @@ def pa_mqa_logits_mxfp4_decode(
         block_tables,
         weights,
         cu_seq_q,
-        context_lens.to(torch.int32).contiguous(),
+        local_ends.to(torch.int32).contiguous(),
         out,
         int(batch),
         int(next_n_max),

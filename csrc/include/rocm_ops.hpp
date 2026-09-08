@@ -1567,7 +1567,7 @@ namespace py = pybind11;
           py::arg("block_tables"),               \
           py::arg("weights"),                    \
           py::arg("cu_seq_q"),                   \
-          py::arg("context_lens"),               \
+          py::arg("local_ends"),                 \
           py::arg("out"),                        \
           py::arg("batch"),                      \
           py::arg("next_n_max"),                 \
