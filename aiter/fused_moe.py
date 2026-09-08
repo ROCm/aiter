@@ -334,7 +334,8 @@ def _mxfp4_inline_sort_unsupported(
 
     if w1_scale is None or w2_scale is None:
         return "missing MXFP4 weight scales"
-    if w1_scale.dtype != dtypes.fp8_e8m0 or w2_scale.dtype != dtypes.fp8_e8m0:
+    scale_dtypes = (dtypes.fp8_e8m0, torch.uint8)
+    if w1_scale.dtype not in scale_dtypes or w2_scale.dtype not in scale_dtypes:
         return "MXFP4 weight scales must be e8m0"
     experts, hidden, inter = w1.shape[0], hidden_states.shape[1], w2.shape[-1] * 2
     # Padded, not exact: a non-256-aligned inter_dim (Kimi-K3 I=384 gives 12
