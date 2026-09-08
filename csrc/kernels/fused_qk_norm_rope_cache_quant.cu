@@ -4998,48 +4998,17 @@ namespace aiter {
         vec_q_weight = *reinterpret_cast<const opus_vec_i*>(&q_weight[tid * vec_size_i]);
       }
 
-      // Hoist RoPE cos/sin: cos_ptr[cos_i] is identical for every Q head of this token,
-      // so load it once per wave (not once per head) and reuse across the HPW-head loop.
-      const bool is_pe_thread = (tid >= pe_tid_start && tid < pe_tid_end);
-      float pe_cos[vec_size_i], pe_sin[vec_size_i];
-      // KEPT GUARDED. Dropping the `if` and clamping the row to 0 for the non-PE
-      // lanes -- inverse_rope_group_quant's cos/sin fix from 4571cfd4, which works
-      // there -- MEASURED NULL here: T=16384 H=128 G=64, paired A/B 6 reps,
-      // 308.64 -> 308.42 us, -0.07% (95% CI [-1.05, +0.92], 3/6 reps negative).
-      // The ISA says why: the exec region does go away (s_and_saveexec 20 -> 18,
-      // s_or_b32 35 -> 33) but s_wait_xcnt goes UP, 46 -> 48 -- the drain moves to
-      // another guarded register instead of disappearing, the same way the FG
-      // kernel's store_scale edit behaved. Do not retry.
-      if (is_pe_thread) {
-        const int32_t pe_local_tid = tid - pe_tid_start;
-        // NOT vectorised, deliberately. The same load_rope_cos_sin<> treatment that
-        // is worth -12% on the FG (decode) kernel MEASURED AS A REGRESSION here:
-        // paired op_test, 5 clean pairs, H=32 -> T=16384 +1.95% (CI +0.23..+3.67,
-        // 1/5 negative) and T=1024 -0.72%. The coarse kernel already hoists this
-        // read ONCE PER WAVE and reuses it across the HPW-head loop, so there are
-        // only vec_size_i scalar loads per wave to begin with (not per head) --
-        // nothing to recover -- while the packed-index form it requires perturbs
-        // the scheduling of the much longer head loop. Left elementwise.
-        if constexpr (is_neox) {
-          constexpr int32_t half_pe_threads = pe_dim / vec_size_i / 2;  // 4
-          const bool is_x_half = (pe_local_tid < half_pe_threads);
-          #pragma unroll
-          for (int i = 0; i < vec_size_i; i++) {
-            const int32_t cos_i = is_x_half ? (pe_local_tid * vec_size_i + i)
-                                            : ((pe_local_tid - half_pe_threads) * vec_size_i + i);
-            pe_cos[i] = static_cast<float>(cos_ptr[cos_i]);
-            pe_sin[i] = static_cast<float>(sin_ptr[cos_i]);
-          }
-        } else {
-          #pragma unroll
-          for (int i = 0; i < vec_size_i; i += 2) {
-            const int32_t cos_i = (pe_local_tid * vec_size_i + i) >> 1;
-            pe_cos[i] = static_cast<float>(cos_ptr[cos_i]);
-            pe_sin[i] = static_cast<float>(sin_ptr[cos_i]);
-          }
-        }
-      }
-
+      // ORDER MATTERS: the q descriptor and the TDM prologue are issued BEFORE
+      // the cos/sin gather, so their setup covers the gather's latency.
+      //
+      // ATT at T=512 H=128 found the single worst stall in the kernel here: the
+      // two `global_load_b128` of cos/sin were followed immediately by
+      // `s_wait_loadcnt 0x1` and then a `v_lshlrev_b32` consuming the result --
+      // 9898 cycles over 8 hits, 1237 cycles stalled per wave, 99.9% of that
+      // instruction's latency. cos/sin is indexed by positions[token], so it is a
+      // scattered read with poor cache hit rate, and nothing was scheduled between
+      // issue and use. Neither the descriptor build nor the TDM prologue depends on
+      // cos/sin, so moving them up gives the gather something to hide behind.
       // Build the q buffer descriptor ONCE per wave (base = this token's q row); load each
       // head via a uniform per-head scalar offset (soffset) instead of rebuilding the SRD
       // (the make_gmem readfirstlane/saveexec pattern) for every head.
@@ -5088,6 +5057,49 @@ namespace aiter {
         for (int32_t d = 0; d < Q_TDM_DEPTH; ++d) q_tdm_issue(q_head_start + d, d);
       }
 #endif
+
+
+      // Hoist RoPE cos/sin: cos_ptr[cos_i] is identical for every Q head of this token,
+      // so load it once per wave (not once per head) and reuse across the HPW-head loop.
+      const bool is_pe_thread = (tid >= pe_tid_start && tid < pe_tid_end);
+      float pe_cos[vec_size_i], pe_sin[vec_size_i];
+      // KEPT GUARDED. Dropping the `if` and clamping the row to 0 for the non-PE
+      // lanes -- inverse_rope_group_quant's cos/sin fix from 4571cfd4, which works
+      // there -- MEASURED NULL here: T=16384 H=128 G=64, paired A/B 6 reps,
+      // 308.64 -> 308.42 us, -0.07% (95% CI [-1.05, +0.92], 3/6 reps negative).
+      // The ISA says why: the exec region does go away (s_and_saveexec 20 -> 18,
+      // s_or_b32 35 -> 33) but s_wait_xcnt goes UP, 46 -> 48 -- the drain moves to
+      // another guarded register instead of disappearing, the same way the FG
+      // kernel's store_scale edit behaved. Do not retry.
+      if (is_pe_thread) {
+        const int32_t pe_local_tid = tid - pe_tid_start;
+        // NOT vectorised, deliberately. The same load_rope_cos_sin<> treatment that
+        // is worth -12% on the FG (decode) kernel MEASURED AS A REGRESSION here:
+        // paired op_test, 5 clean pairs, H=32 -> T=16384 +1.95% (CI +0.23..+3.67,
+        // 1/5 negative) and T=1024 -0.72%. The coarse kernel already hoists this
+        // read ONCE PER WAVE and reuses it across the HPW-head loop, so there are
+        // only vec_size_i scalar loads per wave to begin with (not per head) --
+        // nothing to recover -- while the packed-index form it requires perturbs
+        // the scheduling of the much longer head loop. Left elementwise.
+        if constexpr (is_neox) {
+          constexpr int32_t half_pe_threads = pe_dim / vec_size_i / 2;  // 4
+          const bool is_x_half = (pe_local_tid < half_pe_threads);
+          #pragma unroll
+          for (int i = 0; i < vec_size_i; i++) {
+            const int32_t cos_i = is_x_half ? (pe_local_tid * vec_size_i + i)
+                                            : ((pe_local_tid - half_pe_threads) * vec_size_i + i);
+            pe_cos[i] = static_cast<float>(cos_ptr[cos_i]);
+            pe_sin[i] = static_cast<float>(sin_ptr[cos_i]);
+          }
+        } else {
+          #pragma unroll
+          for (int i = 0; i < vec_size_i; i += 2) {
+            const int32_t cos_i = (pe_local_tid * vec_size_i + i) >> 1;
+            pe_cos[i] = static_cast<float>(cos_ptr[cos_i]);
+            pe_sin[i] = static_cast<float>(sin_ptr[cos_i]);
+          }
+        }
+      }
 
       for (int32_t q_head_idx = q_head_start; q_head_idx < q_head_end; q_head_idx++) {
         opus_vec_i vec_q;
