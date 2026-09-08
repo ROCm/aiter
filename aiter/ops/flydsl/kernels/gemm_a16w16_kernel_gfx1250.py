@@ -11,9 +11,12 @@ from flydsl.expr.typing import T
 from flydsl.runtime.device import get_rocm_arch as get_hip_arch
 from flydsl.utils.smem_allocator import check_smem_capacity
 
+from aiter.ops.flydsl.kernels import communication_ops_utils as comm_ops
+
 WMMA_M, WMMA_N, WMMA_K = 16, 16, 32
 WAVE_SIZE, LDS_PAD_A, LDS_PAD_B = 32, 8, 8
 _SCHED_ALLOW_SALU = 1 << 2
+CPOL_DEV = 0x10
 KERNARG_PRELOAD_COUNT = 8
 
 
@@ -79,11 +82,6 @@ def compile_gemm_a16w16(
         f"bad sched_strategy {sched_strategy!r}",
     )
     _req(split_k >= 1, f"split_k must be >= 1, got {split_k}")
-    _req(
-        not (activation and split_k > 1),
-        "activation is applied per k-split partial; activation with split_k > 1 "
-        "would compute act(partial) summed instead of act(sum)",
-    )
 
     elem_bytes = 2
     elem_bytes_d = 2 if out_dtype in ("f16", "bf16") else 4
@@ -144,15 +142,13 @@ def compile_gemm_a16w16(
         b_imm_bytes, lds_b_stride = tile_k * elem_bytes, tile_k + LDS_PAD_B
         lds_b_elems = tile_n * lds_b_stride + LDS_PAD_B
 
-    _USE_XT = split_k > 1 and out_dtype == "f32"
-
-    if _USE_XT:
+    if split_k > 1:
 
         @fx.struct
         class SharedStorage:
             a: fx.Array[_fx_elem, num_buffers * lds_a_elems, 16]
             b: fx.Array[_fx_elem, num_buffers * lds_b_elems, 16]
-            xt: fx.Array[fx.Float32, num_warps * WMMA_M * WMMA_N, 16]
+            flag: fx.Array[fx.Int32, 1, 16]
 
     else:
 
@@ -172,6 +168,8 @@ def compile_gemm_a16w16(
         arg_x: fx.Pointer,
         arg_w: fx.Pointer,
         arg_bias: fx.Pointer,
+        arg_ws: fx.Pointer,
+        arg_sem: fx.Pointer,
         i32_m: fx.Int32,
         i32_ldy: fx.Int32,
         i32_lda: fx.Int32,
@@ -200,12 +198,40 @@ def compile_gemm_a16w16(
 
         warp_m_base, warp_n_base = wave_m_idx * warp_tile_m, wave_n_idx * warp_tile_n
         m_idx, ld_y = fx.Uint64(i32_m), fx.Uint64(i32_ldy)
-        gYp = fx.Tensor(fx.make_view(arg_y, fx.make_layout((1, 1), (1, 1))))
         gY = fx.rocdl.make_buffer_tensor(
             fx.Tensor(fx.make_view(arg_y, fx.make_layout((1, 1), (1, 1)))),
             max_size=False,
             num_records_bytes=m_idx * ld_y * elem_bytes_d,
         )
+        if const_expr(split_k > 1):
+            tiles_n = (N + tile_n - 1) // tile_n
+            n_pad = tiles_n * tile_n
+            m_pad = ((m_idx + (tile_m - 1)) // tile_m) * tile_m
+            plane = fx.Int64(m_pad) * n_pad
+
+            def _ws_view(plane_idx):
+                return fx.rocdl.make_buffer_tensor(
+                    fx.Tensor(
+                        fx.make_view(
+                            fx.add_offset(arg_ws, fx.Int64(plane_idx) * plane),
+                            fx.make_layout((1, 1), (1, 1)),
+                        )
+                    ),
+                    max_size=False,
+                    num_records_bytes=plane * 4,
+                )
+
+            gWs_mine = _ws_view(gpu.block_id("z"))
+            gWs = [_ws_view(s) for s in range_constexpr(split_k)]
+            tile_lin = fx.Uint64(bx) * tiles_n + fx.Uint64(by)
+            warp_lin = wave_m_idx * n_warp + wave_n_idx
+            ws_lane_base = (tile_lin * num_warps + warp_lin) * (
+                n_accs * WAVE_SIZE * 8
+            ) + (lane_kgrp * 16 + lane16) * 8
+            sem_addr = (
+                fx.Int64(fx.ptrtoint(arg_sem))
+                + (fx.Int64(bx) * tiles_n + fx.Int64(by)) * 4
+            )
 
         lds = fx.SharedAllocator(static=True).allocate(SharedStorage).peek()
         big_a_mem, big_b_mem = lds.a.ptr, lds.b.ptr
@@ -479,14 +505,8 @@ def compile_gemm_a16w16(
                     _acc_ty,
                 )
             if const_expr(split_k > 1):
-                add_atom = fx.make_copy_atom(
-                    fx.UniversalAtomicAdd(_acc_ty, syncscope=fx.rocdl.SyncScope.Agent),
-                    _acc_ty,
-                )
-            if const_expr(_USE_XT):
-                xt = fx.add_offset(
-                    lds.xt.ptr,
-                    (wave_m_idx * n_warp + wave_n_idx) * (WMMA_M * WMMA_N),
+                ws_atom = fx.make_copy_atom(
+                    fx.rocdl.BufferCopy128b(CPOL_DEV), fx.Float32
                 )
             if const_expr(add_bias):
                 bias_vecs = []
@@ -496,164 +516,148 @@ def compile_gemm_a16w16(
                     for half in range_constexpr(2):
                         bv = load_bias4(col_tile + half)
                         for i in range_constexpr(4):
-                            if const_expr(split_k > 1):
-                                elems.append(bv[i].to(fx.Float32) * (1.0 / split_k))
-                            else:
-                                elems.append(bv[i].to(fx.Float32))
+                            elems.append(bv[i].to(fx.Float32))
                     bias_vecs.append(
                         fx.Vector.from_elements(elems, fx.Float32).ir_value()
                     )
 
-            for wm in range_constexpr(wmma_m_rep):
-                for wn in range_constexpr(wmma_n_rep):
-                    acc = final_accs[wm * wmma_n_rep + wn]
-                    row = blk_m + warp_m_base + wm * WMMA_M + lane16
-                    col_base = blk_n + warp_n_base + wn * WMMA_N + lane_kgrp * 8
-                    if const_expr(add_bias):
-                        acc = acc + bias_vecs[wn]
-                    if const_expr(activation is not None):
-                        acc = fx.Vector.from_elements(
-                            [
-                                apply_activation_scalar(fx.Vector(acc)[i], activation)
-                                for i in range_constexpr(8)
-                            ],
-                            fx.Float32,
-                        ).ir_value()
+            def _vec4(acc, half):
+                return fx.Vector.from_elements(
+                    [fx.Vector(acc)[half * 4 + vi] for vi in range_constexpr(4)],
+                    fx.Float32,
+                )
 
-                    if const_expr(_half_out):
-                        h_vec = fx.Vector(acc).to(_out_num)
-                        c_off = row * ld_y + col_base
-                        if const_expr(split_k > 1):
-                            for pair in range_constexpr(4):
-                                pair_vec = fx.Vector.from_elements(
-                                    [h_vec[pair * 2], h_vec[pair * 2 + 1]],
-                                    _out_num,
-                                )
-                                if const_expr(n_edge == 0):
-                                    if row < m_idx:
-                                        fx.copy(
-                                            add_atom,
-                                            _rmem_vec(pair_vec, 2, _out_num),
-                                            gYp[None, c_off + pair * 2],
-                                        )
-                                else:
-                                    n_left = (
-                                        fx.Int32(N)
-                                        - fx.Int32(col_base)
-                                        - fx.Int32(pair * 2)
-                                    )
-                                    if row < m_idx:
-                                        if n_left >= fx.Int32(2):
-                                            fx.copy(
-                                                add_atom,
-                                                _rmem_vec(pair_vec, 2, _out_num),
-                                                gYp[None, c_off + pair * 2],
-                                            )
-                                        if n_left == fx.Int32(1):
-                                            one_vec = fx.Vector.from_elements(
-                                                [h_vec[pair * 2]], _out_num
-                                            )
-                                            fx.copy(
-                                                add_atom,
-                                                _rmem_vec(one_vec, 1, _out_num),
-                                                gYp[None, c_off + pair * 2],
-                                            )
-                        else:
-                            if const_expr(n_edge == 0):
-                                fx.copy(
-                                    st_atom,
-                                    _rmem_vec(h_vec, 8, _out_num),
-                                    gY[None, c_off],
-                                )
-                            else:
-                                n_left = fx.Int32(N) - fx.Int32(col_base)
-                                if n_left >= fx.Int32(8):
-                                    fx.copy(
-                                        st_atom,
-                                        _rmem_vec(h_vec, 8, _out_num),
-                                        gY[None, c_off],
-                                    )
-                                if n_left < fx.Int32(8):
-                                    for e in range_constexpr(8):
-                                        if fx.Int32(e) < n_left:
-                                            one_vec = fx.Vector.from_elements(
-                                                [h_vec[e]], _out_num
-                                            )
-                                            fx.copy(
-                                                st1_atom,
-                                                _rmem_vec(one_vec, 1, _out_num),
-                                                gY[None, c_off + e],
-                                            )
-                    elif const_expr(split_k > 1):
-                        for e in range_constexpr(8):
-                            fx.ptr_store(
-                                fx.Vector(acc)[e],
-                                fx.add_offset(xt, lane16 * WMMA_N + lane_kgrp * 8 + e),
-                            )
-                        t_base = blk_m + warp_m_base + wm * WMMA_M
-                        t_col = blk_n + warp_n_base + wn * WMMA_N + lane16
-                        for e in range_constexpr(8):
-                            xt_row = t_base + lane_kgrp + 2 * e
-                            if xt_row < m_idx:
-                                xt_val = fx.Vector.from_elements(
-                                    [
-                                        fx.ptr_load(
-                                            fx.add_offset(
-                                                xt,
-                                                (lane_kgrp + 2 * e) * WMMA_N + lane16,
-                                            )
-                                        )
-                                    ],
-                                    fx.Float32,
-                                )
-                                if const_expr(n_edge == 0):
-                                    fx.copy(
-                                        add_atom,
-                                        _rmem_vec(xt_val, 1, fx.Float32),
-                                        gYp[None, xt_row * ld_y + t_col],
-                                    )
-                                else:
-                                    if t_col < fx.Uint64(N):
-                                        fx.copy(
-                                            add_atom,
-                                            _rmem_vec(xt_val, 1, fx.Float32),
-                                            gYp[None, xt_row * ld_y + t_col],
-                                        )
+            def _ws_off(acc_idx):
+                return ws_lane_base + acc_idx * (WAVE_SIZE * 8)
+
+            def store_partial(acc, acc_idx):
+                for half in range_constexpr(2):
+                    fx.copy(
+                        ws_atom,
+                        _rmem_vec(_vec4(acc, half), 4, fx.Float32),
+                        gWs_mine[None, _ws_off(acc_idx) + half * 4],
+                    )
+
+            def issue_partial_loads(acc_idx):
+                """Issue this lane's loads of all split_k planes (no waits here)."""
+                frags = []
+                for half in range_constexpr(2):
+                    for sidx in range_constexpr(split_k):
+                        r = fx.make_rmem_tensor(4, fx.Float32)
+                        fx.copy(
+                            ws_atom, gWs[sidx][None, _ws_off(acc_idx) + half * 4], r
+                        )
+                        frags.append(r)
+                return frags
+
+            def sum_partials(frags):
+                """Consume issue_partial_loads' fragments into one 8-wide fp32 vector."""
+                elems = []
+                for half in range_constexpr(2):
+                    total = None
+                    for sidx in range_constexpr(split_k):
+                        v = fx.Vector(frags[half * split_k + sidx].load())
+                        total = v if sidx == 0 else total + v
+                    for vi in range_constexpr(4):
+                        elems.append(total[vi])
+                return fx.Vector.from_elements(elems, fx.Float32)
+
+            def store_final(acc, row, col_base, wn):
+                if const_expr(add_bias):
+                    acc = acc + bias_vecs[wn]
+                if const_expr(activation is not None):
+                    acc = fx.Vector.from_elements(
+                        [
+                            apply_activation_scalar(fx.Vector(acc)[i], activation)
+                            for i in range_constexpr(8)
+                        ],
+                        fx.Float32,
+                    ).ir_value()
+                if const_expr(_half_out):
+                    h_vec = fx.Vector(acc).to(_out_num)
+                    c_off = row * ld_y + col_base
+                    if const_expr(n_edge == 0):
+                        fx.copy(st_atom, _rmem_vec(h_vec, 8, _out_num), gY[None, c_off])
                     else:
-                        for half in range_constexpr(2):
-                            vec4 = fx.Vector.from_elements(
-                                [
-                                    fx.Vector(acc)[half * 4 + vi]
-                                    for vi in range_constexpr(4)
-                                ],
-                                fx.Float32,
+                        n_left = fx.Int32(N) - fx.Int32(col_base)
+                        if n_left >= fx.Int32(8):
+                            fx.copy(
+                                st_atom, _rmem_vec(h_vec, 8, _out_num), gY[None, c_off]
                             )
-                            col = col_base + half * 4
-                            if const_expr(n_edge == 0):
+                        if n_left < fx.Int32(8):
+                            for e in range_constexpr(8):
+                                if fx.Int32(e) < n_left:
+                                    one_vec = fx.Vector.from_elements(
+                                        [h_vec[e]], _out_num
+                                    )
+                                    fx.copy(
+                                        st1_atom,
+                                        _rmem_vec(one_vec, 1, _out_num),
+                                        gY[None, c_off + e],
+                                    )
+                else:
+                    for half in range_constexpr(2):
+                        vec4 = _vec4(acc, half)
+                        col = col_base + half * 4
+                        if const_expr(n_edge == 0):
+                            fx.copy(
+                                st_atom,
+                                _rmem_vec(vec4, 4, fx.Float32),
+                                gY[None, row * ld_y + col],
+                            )
+                        else:
+                            n_left = fx.Int32(N) - fx.Int32(col)
+                            if n_left >= fx.Int32(4):
                                 fx.copy(
                                     st_atom,
                                     _rmem_vec(vec4, 4, fx.Float32),
                                     gY[None, row * ld_y + col],
                                 )
-                            else:
-                                n_left = fx.Int32(N) - fx.Int32(col)
-                                if n_left >= fx.Int32(4):
-                                    fx.copy(
-                                        st_atom,
-                                        _rmem_vec(vec4, 4, fx.Float32),
-                                        gY[None, row * ld_y + col],
-                                    )
-                                if n_left < fx.Int32(4):
-                                    for e in range_constexpr(4):
-                                        if fx.Int32(e) < n_left:
-                                            one_vec = fx.Vector.from_elements(
-                                                [vec4[e]], fx.Float32
-                                            )
-                                            fx.copy(
-                                                st1_atom,
-                                                _rmem_vec(one_vec, 1, fx.Float32),
-                                                gY[None, row * ld_y + col + e],
-                                            )
+                            if n_left < fx.Int32(4):
+                                for e in range_constexpr(4):
+                                    if fx.Int32(e) < n_left:
+                                        one_vec = fx.Vector.from_elements(
+                                            [vec4[e]], fx.Float32
+                                        )
+                                        fx.copy(
+                                            st1_atom,
+                                            _rmem_vec(one_vec, 1, fx.Float32),
+                                            gY[None, row * ld_y + col + e],
+                                        )
+
+            def _coords(wm, wn):
+                row = blk_m + warp_m_base + wm * WMMA_M + lane16
+                col_base = blk_n + warp_n_base + wn * WMMA_N + lane_kgrp * 8
+                return row, col_base
+
+            if const_expr(split_k == 1):
+                for wm in range_constexpr(wmma_m_rep):
+                    for wn in range_constexpr(wmma_n_rep):
+                        row, col_base = _coords(wm, wn)
+                        store_final(final_accs[wm * wmma_n_rep + wn], row, col_base, wn)
+            else:
+                for acc_idx in range_constexpr(n_accs):
+                    store_partial(final_accs[acc_idx], acc_idx)
+                comm_ops.waitcnt_all()
+                gpu.barrier()
+                if fx.Int32(tx) == fx.Int32(0):
+                    arrival = fx.Int32(comm_ops.atomic_add_agent(sem_addr, fx.Int32(1)))
+                    fx.ptr_store(
+                        (arrival == fx.Int32(split_k - 1)).select(
+                            fx.Int32(1), fx.Int32(0)
+                        ),
+                        lds.flag.ptr,
+                    )
+                gpu.barrier()
+                if fx.ptr_load(lds.flag.ptr) != fx.Int32(0):
+                    pending = [issue_partial_loads(i) for i in range_constexpr(n_accs)]
+                    for wm in range_constexpr(wmma_m_rep):
+                        for wn in range_constexpr(wmma_n_rep):
+                            row, col_base = _coords(wm, wn)
+                            total = sum_partials(pending[wm * wmma_n_rep + wn])
+                            store_final(total, row, col_base, wn)
+                    if fx.Int32(tx) == fx.Int32(0):
+                        comm_ops.atomic_add_agent(sem_addr, fx.Int32(-split_k))
 
         def _pack_state(accs_, a_, b_):
             return list(accs_) + list(a_) + list(b_)
@@ -757,6 +761,8 @@ def compile_gemm_a16w16(
         arg_x: fx.Pointer,
         arg_w: fx.Pointer,
         arg_bias: fx.Pointer,
+        arg_ws: fx.Pointer,
+        arg_sem: fx.Pointer,
         i32_m: fx.Int32,
         i32_ldy: fx.Int32,
         i32_lda: fx.Int32,
@@ -772,6 +778,8 @@ def compile_gemm_a16w16(
             arg_x,
             arg_w,
             arg_bias,
+            arg_ws,
+            arg_sem,
             i32_m,
             i32_ldy,
             i32_lda,
