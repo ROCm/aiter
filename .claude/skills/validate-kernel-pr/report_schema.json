@@ -89,7 +89,7 @@
       }
     },
     "passing_correctness_stage": {
-      "description": "What a correctness stage has to look like for the report to be PASS: it ran, it exited 0, and it executed at least one test. Referenced by both correctness stages -- they were spelled out twice, and divergence between two copies of the PASS gate would silently change what earns a clearance.",
+      "description": "What the correctness stage has to look like for the report to be PASS: it ran, it exited 0, and it executed at least one test. The optional shape grid is deliberately not held to this -- it is not a required stage and a pass there completes nothing, so requiring a shape of it would be a contract about a clearance it cannot grant.",
       "required": [
         "status",
         "exit",
@@ -379,26 +379,6 @@
           "type": "string",
           "description": "When no channel was established, names each channel tried and what was found in the target -- so a limit of the validator is never published as a property of the target."
         },
-        "grid_independence": {
-          "type": "string",
-          "enum": [
-            "adds-coverage",
-            "unknown"
-          ],
-          "description": "Whether the requested grid cells ask for anything outside the target's own defaults. The validator does not read the target to decide; the caller declares it with --grid-novelty. Only 'adds-coverage' can earn a pass for correctness_s1_grid."
-        },
-        "grid_independence_reason": {
-          "type": "string"
-        },
-        "grid_independence_basis": {
-          "type": "string",
-          "enum": [
-            "declared-by-caller",
-            "undeclared",
-            "no-grid"
-          ],
-          "description": "Where grid_independence came from. 'declared-by-caller' marks it as the caller's claim rather than a measurement; 'undeclared' means nobody stated what the grid covers, which is why an otherwise green grid is not credited."
-        },
         "axis_state": {
           "type": "string",
           "enum": [
@@ -496,7 +476,6 @@
         "test_policy",
         "baseline_control",
         "correctness_repo_tests",
-        "correctness_s1_grid",
         "execution_receipt",
         "index_width_scan"
       ],
@@ -645,7 +624,7 @@
               "$ref": "#/definitions/stage"
             }
           ],
-          "description": "A shape grid this skill owns, independent of what the PR chose to test: non-toy, boundary/odd, long-context. 'skip' with repo-default-only when the kernel exposes no shape override.",
+          "description": "An optional extra shape grid, run through a channel the caller named and proved at runtime. Deliberately NOT a required stage: when it was, every caller had to supply a grid whether or not they had anything to say with it, and aiter#4538's grid re-ran a strict subset of the target's own defaults and was credited as new coverage. A pass here completes nothing; only a failure carries weight, and it carries it whatever the cells were.",
           "properties": {
             "grid": {
               "type": "string"
@@ -1015,9 +994,6 @@
               "correctness_repo_tests": {
                 "$ref": "#/definitions/passing_correctness_stage"
               },
-              "correctness_s1_grid": {
-                "$ref": "#/definitions/passing_correctness_stage"
-              },
               "execution_receipt": {
                 "required": [
                   "status",
@@ -1049,7 +1025,7 @@
                   },
                   "required_shapes": {
                     "type": "array",
-                    "minItems": 1,
+                    "description": "The shapes a delivered grid asked for and the receipt had to observe. Empty is legal, and used to be unreachable because the grid was a required stage: with it optional, a PASS report can attest route execution and nothing about shapes. executed_shapes below stays non-empty, so a receipt still never passes without having watched something happen.",
                     "items": {
                       "type": "string",
                       "minLength": 1

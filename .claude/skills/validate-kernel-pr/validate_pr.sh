@@ -5,15 +5,19 @@
 # Design rules it enforces (each learned from a real failure mode):
 #   * isolation is REPORTED, never assumed  -- no docker here, so: worktree + private caches
 #   * arch coverage is REPORTED, never implied -- a gfx950 box cannot validate a gfx942 claim
-#   * the repo's own tests are NOT trusted as coverage -- S1 runs its own shape grid, because
-#     a suite whose odd/unaligned shapes are commented out passes while the tail path is broken
+#   * a test is run and where it CAME FROM is reported -- a test the PR ships was written by
+#     the same hand as the code it grades, and a change nothing runs at all is a blocker
+#   * an extra shape grid is OPTIONAL and earns nothing -- it can only ever add a failure.
+#     While it was required, every caller supplied one whether or not it covered anything the
+#     target did not already run, and aiter#4538's duplicate was credited as new coverage
 #   * a green pytest with loosened tolerances is not a pass -- tolerances are policy-checked
 #   * GPU is claimed over a sampling window and locked (kernel-profiling-optimization skill)
 #
 #   * correctness is not performance -- a kernel PR can compute the right values and still
 #     be a regression, so base and head are also timed, on the same locked GPU, back to back
 #
-# usage: validate_pr.sh --repo <worktree> --target <test file or pytest node> [--patch p.patch]
+# usage: validate_pr.sh --repo <worktree> (--target <test file or node> | --no-target <reason>)
+#                       [--patch p.patch]
 #                       [--head-sha <expected PR head>] [--shape-env VAR]
 #                       [--grid "M,N,dt;..."] [--tol-table f32=1e-5,...]
 #                       [--perf-args "--scenario bench"] [--no-perf]
@@ -43,7 +47,6 @@ RUNNER_OVERRIDE=""
 RUNNER_REASON=""
 # The caller's declaration that they looked for a test exercising this change and found none.
 NO_TARGET_REASON=""
-GRID_NOVELTY=""
 AXES=()
 AXIS_CLI=()
 AXIS_CLI_OVERRIDE=()
@@ -110,7 +113,6 @@ while [ "$#" -gt 0 ]; do
     --axis) need_value "$@"; AXES+=("$2"); shift 2;;
     --runner) need_value "$@"; RUNNER_OVERRIDE="$2"; shift 2;;
     --runner-reason) need_value "$@"; RUNNER_REASON="$2"; shift 2;;
-    --grid-novelty) need_value "$@"; GRID_NOVELTY="$2"; shift 2;;
     --tol-table) need_value "$@"; TOL_TABLE="$2"; shift 2;;
     --label) need_value "$@"; LABEL="$2"; shift 2;;
     --out) need_value "$@"; OUT="$2"; shift 2;;
@@ -985,35 +987,20 @@ if [ -n "$GRID" ] && [ "$GRID_HOOK_OK" -ne 1 ]; then
   fi
 fi
 jset_string "test_selection.grid_channel_reason" "$GRID_CHANNEL_REASON"
-# ---- Is the grid actually independent of what the target already runs?
+# The grid used to be REQUIRED -- correctness_s1_grid was a required stage, so a run without one
+# topped out at INCONCLUSIVE. That is what made callers supply a grid whether or not they had
+# anything to say with it, and on ROCm/aiter#4538 the three requested shapes were all already in
+# the target's own default list: the "independent" grid re-ran a strict subset of the repository
+# run and the report credited it as new coverage.
 #
-# A consumed channel says the target READS the grid. It says nothing about whether the grid
-# asks for anything the target would not have run anyway. On ROCm/aiter#4538 all three
-# requested shapes were already in the target's own `--shapes` default list, so the "S1 grid"
-# re-ran a strict subset of the repository run and the report presented it as independent
-# coverage -- the exact duplication this stage exists to prevent.
+# The answer at the time was to make the caller DECLARE what their cells covered and to refuse a
+# pass without the declaration -- more bookkeeping around a grid nobody wanted to supply. The
+# answer now is that the grid earns nothing. It is optional, it is not a required stage, and a
+# passing grid cannot move the verdict; only a FAILING one can, and a failure is a real defect
+# whether or not the cells were novel. A duplicate grid is then harmless rather than policed,
+# which is why the whole grid_independence vocabulary is gone: the error it guarded against is
+# no longer reachable.
 #
-# Which cells are novel is a reading of the target's source, so the caller states it and the
-# validator records it as a declaration. What the validator still enforces is the consequence:
-# only a grid DECLARED to add coverage can earn a pass. An undeclared grid is `unknown`, and
-# `unknown` is not credited -- the caller who cannot say what their grid covers has not shown
-# it covers anything.
-GRID_INDEPENDENCE="unknown"
-GRID_INDEPENDENCE_BASIS="undeclared"
-if [ -z "$GRID" ]; then
-  GRID_INDEPENDENCE_REASON="no shape grid was requested, so there was nothing to compare"
-  GRID_INDEPENDENCE_BASIS="no-grid"
-elif [ -n "$GRID_NOVELTY" ]; then
-  GRID_INDEPENDENCE="adds-coverage"
-  GRID_INDEPENDENCE_REASON="$GRID_NOVELTY"
-  GRID_INDEPENDENCE_BASIS="declared-by-caller"
-else
-  GRID_INDEPENDENCE_REASON="no --grid-novelty was declared, so this run has no statement of what these cells cover that the target's own defaults do not"
-fi
-jset_string "test_selection.grid_independence" "$GRID_INDEPENDENCE"
-jset_string "test_selection.grid_independence_reason" "$GRID_INDEPENDENCE_REASON"
-jset_string "test_selection.grid_independence_basis" "$GRID_INDEPENDENCE_BASIS"
-
 # ---- Extra axes.
 #
 # A grid is one ordered tuple on one flag. A target whose remaining knobs are separate flags
@@ -1766,7 +1753,6 @@ print(json.dumps(axes))
         HEAD_GRID_EXECUTED=$(stats_field "$HEAD_GRID_STATS" executed)
         python3 - "$JSON" "$HEAD_GRID_RC" "$GRID" "$HEAD_GRID_LOG" \
           "$HEAD_GRID_STATS" "$HEAD_PROBE_RC" "$HEAD_PROBE_LOG" \
-          "$GRID_INDEPENDENCE" "$GRID_INDEPENDENCE_REASON" \
           "$GRID_CHANNEL" "${HEAD_RC:-1}" <<'PY'
 import json
 import sys
@@ -1779,11 +1765,9 @@ import sys
     raw_stats,
     probe_exit,
     probe_log,
-    independence,
-    independence_reason,
     channel,
     repo_exit_code,
-) = sys.argv[1:12]
+) = sys.argv[1:10]
 data = json.load(open(path))
 stats = json.loads(raw_stats)
 status = "fail" if int(exit_code) else ("pass" if stats["executed"] else "skip")
@@ -1803,13 +1787,10 @@ if status == "fail" and stats.get("observed_work") == 0 and int(repo_exit_code) 
         f"shapes; a declared '{channel}' channel this target does not have and a shape that "
         f"crashes before the route both look exactly like this"
     )
-# A red grid is still a red grid: a grid that FAILS is reporting a real defect in the target
-# whatever its independence, and must keep its "fail". What an undeclared or duplicate grid
-# cannot do is earn a pass, because the only thing a passing duplicate proves is that the
-# repository run passed -- which correctness_repo_tests already said.
-if status == "pass" and independence != "adds-coverage":
-    status = "skip"
-    note = independence_reason
+# A "pass" here is recorded and earns nothing: this stage is not required, so its status cannot
+# complete a verdict, and the only thing a duplicate grid's pass would prove is that the
+# repository run passed -- which correctness_repo_tests already said. A "fail" is the direction
+# that carries weight, and it carries it whatever the cells were.
 data["stages"]["correctness_s1_grid"] = {
     "status": status,
     "exit": int(exit_code),
@@ -1818,19 +1799,12 @@ data["stages"]["correctness_s1_grid"] = {
     "stats": stats,
     "hook_probe_exit": int(probe_exit),
     "hook_probe_log": probe_log,
-    "independence": independence,
-    "independence_reason": independence_reason,
 }
 if note:
     data["stages"]["correctness_s1_grid"]["note"] = note
 json.dump(data, open(path, "w"), indent=2)
 PY
         mark_runtime_coverage "$HEAD_GRID_STATS" "$TARGET_RUNNER" "$HEAD_GRID_LOG"
-        if [ "$GRID_INDEPENDENCE" != "adds-coverage" ] \
-            && [ "$HEAD_GRID_RC" -eq 0 ]; then
-          finding "note" "correctness" \
-            "the shape grid is not credited as independent coverage: $GRID_INDEPENDENCE_REASON"
-        fi
         if [ "$HEAD_GRID_RC" -eq 0 ] && [ "$HEAD_GRID_EXECUTED" -eq 0 ]; then
           finding "note" "correctness" \
             "shape-grid target executed no tests; no grid claim is made"

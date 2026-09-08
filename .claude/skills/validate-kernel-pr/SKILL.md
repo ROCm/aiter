@@ -33,9 +33,9 @@ not get from a report.
 
 Most of the work below is judgement, and it is yours. Which target actually exercises the diff.
 How that target takes its shapes. Whether a changed tolerance was loosened or merely moved.
-Whether a grid cell is anything other than the default the target would have run anyway. These
-were once an AST scanner and a nineteen-flag command line, and the encoding was the mistake: a
-scanner that guesses wrong is wrong silently, whereas you can read the target and say why.
+Whether the target's own shapes leave a class of input untested. These were once an AST scanner
+and a nineteen-flag command line, and the encoding was the mistake: a scanner that guesses wrong
+is wrong silently, whereas you can read the target and say why.
 
 The ledger is not yours. Whether a stage ran, what it exited with, which GPU held the lock, which
 route the profiler observed, and what verdict follows — those are written by the tools below and
@@ -108,7 +108,6 @@ gh pr diff "$PR" --repo "$REPO" > "/tmp/pr-$PR.patch"
     --shape-vars M,N,dtype_str \
     --shape-env ROCDSL_SOFTMAX_SHAPES \
     --grid "64,2048,f32;64,2000,f32" \
-    --grid-novelty "the target's own cells are all powers of two; 2000 is the unaligned tail" \
     --tol-table "f32=1e-5,f16=2e-3,bf16=1e-2" \
     --out validation_report.json
 ```
@@ -127,7 +126,7 @@ variable (next section).
 | `--expected-route` | the `module:function` the profiler must observe; without it there is no receipt and no observed work |
 | `--shape-vars` | local names captured at each route call, in grid order |
 | `--shape-env` \| `--shape-arg` \| `--shape-argnames` | how the grid reaches the target: an env var it reads, its own CLI flag, or the `parametrize` names to replace |
-| `--grid` `--grid-novelty` | the cells, and what they cover that the target's own defaults do not. Undeclared novelty means a passing grid earns `skip` |
+| `--grid` | optional extra cells the target's own shapes miss. A passing grid earns no verdict; only a failing one is a finding |
 | `--axis` | repeatable `NAME=--flag:v1;v2` — an independent axis that is not a shape |
 | `--tol-table` | tolerances recorded alongside the comparison |
 | `--perf-args` \| `--no-perf` | force the timing entry point, or skip timing entirely |
@@ -307,10 +306,11 @@ ones are usually numerous and would drown the one that is actually the PR's doin
 Either way, the independent grid in the next stage stays visible: it is the answer to a disabled
 row, not a substitute for noticing one.
 
-### 5 — `correctness` — the repo's tests, then a grid the repo does not run
+### 5 — `correctness` — the target, and optionally shapes it does not run
 
-Two runs, reported separately, because the interesting case is when they disagree: what the PR's
-own suite says, and what a grid the PR never runs says.
+The target's own run is the evidence. An extra shape grid can be layered on top of it, reported
+separately, because the interesting case is when the two disagree — but only the target's run
+can earn a verdict.
 
 #### Choosing how to run the target
 
@@ -417,38 +417,32 @@ both possibilities, and **no blocker is charged**, because a receipt that observ
 routed work never saw the author's code fail at all. Check the flag yourself before you name it;
 the run will not do it for you.
 
-With no channel at all the stage is `skip` and the verdict `INCONCLUSIVE`. That is a positive
-control: without it, the same default test run gets reported twice under two stage names. When the
-kernel exposes no shape override at all, say `repo-default-only` rather than claim coverage that
-does not exist.
+With no channel at all the stage is `skip`, and that is now just a skip: the verdict is unaffected,
+because the grid is not a required stage. Say `repo-default-only` rather than claim coverage that
+does not exist — the report should show that the target's own shapes were all that ran.
 
-#### A proven channel is not the same as added coverage
+#### The grid earns nothing, and that is what makes it safe
 
-A target can consume the grid faithfully and still be handed cells it already runs by default. On
-ROCm/aiter#4538 all three requested shapes were in the target's own default list, so the
-"independent" grid re-ran a strict subset of the repository run and the stage reported `pass` —
-exactly the duplication this stage exists to prevent, and invisible in the report.
+`correctness_s1_grid` is **not a required stage**, and a passing grid cannot complete a verdict.
+Only a *failing* one moves anything, and a failure is a real defect whether or not the cells were
+novel.
 
-**You state what the grid covers; the validator does not read the target to check you.** Before
-you pick the cells, read the target's own default for the channel you are using, and pass
-`--grid-novelty "<which cells are outside it, and what they exercise>"`. That reason is published
-verbatim as `grid_independence_reason` with `grid_independence_basis: declared-by-caller`, so a
-reader can see it is your claim and go check it against the same source you read. With no `--grid`
-at all the basis is `no-grid` — nothing was asked for, so nothing is owed.
+That asymmetry replaced a much larger apparatus, and the history is worth keeping. The grid used
+to be required, so a run without one topped out at `INCONCLUSIVE` — which meant every caller had
+to supply a grid whether or not they had anything to say with it. On ROCm/aiter#4538 all three
+requested shapes were already in the target's own default list: the "independent" grid re-ran a
+strict subset of the repository run and the stage reported `pass`. The answer at the time was to
+make the caller *declare* what their cells covered (`--grid-novelty`) and to refuse a pass without
+it — more bookkeeping around a grid nobody wanted to supply.
 
-| value | meaning |
-|---|---|
-| `adds-coverage` | you declared `--grid-novelty`. Only this earns a `pass` |
-| `unknown` | you declared nothing. A **passing** run is downgraded to `skip` and the verdict to `INCONCLUSIVE` |
+Making the grid optional removes the pressure that produced that grid in the first place, and with
+it the reason to police duplication at all: a duplicate grid that passes now proves nothing and
+claims nothing, which is the correct amount. The `grid_independence` vocabulary is gone rather
+than fixed, because the error it guarded against is no longer reachable.
 
-There is no separate `duplicates-target-defaults` verdict, because the validator no longer derives
-one. Silence and duplication get the same answer, and that is the point: a caller who cannot say
-what their grid covers has not shown it covers anything. Do not reach for `--grid-novelty` to
-quiet the downgrade — an inaccurate reason is worse than the `skip`, which at least reports
-honestly that nothing was established.
-
-A grid that **fails** keeps its `fail` whatever you declared. The finding is real; what an
-undeclared grid cannot do is earn a pass.
+So supply `--grid` when you have read the diff and can say what the target's own shapes miss —
+a tail path against a suite of powers of two, long-context against a suite of toys. Supply nothing
+when you cannot. Neither choice costs you a verdict.
 
 #### Axes: when the failing configuration is not a shape
 
@@ -481,9 +475,6 @@ that never reached the kernel.
 
 Each axis also carries `hook_proof`, the probe's verdict for that one flag. It is the only
 evidence that an axis reached the kernel; a flag existing in the source is not.
-
-When it is a proven axis rather than the shape cells that makes the run independent, say so in
-`--grid-novelty` — that is one sentence, in one place, instead of two fields that can disagree.
 
 A requested axis is recorded **whatever becomes of it**, including when the run never got far
 enough to look for the flag. Dropping the request itself is precisely the silently narrowed test
@@ -646,8 +637,9 @@ These are fields, not prose, so a report cannot overclaim by omission:
   verdict `INCONCLUSIVE`.
 - **Every declared stage exists.** A stage that did not run is an object with `status: skip` and
   a reason; it never disappears and never becomes a JSON string.
-- **`test_selection`** — the exact target, selected runner, and independent grid. A
-  verdict applies only to those named inputs.
+- **`test_selection`** — the exact target, where it came from relative to the patch
+  (`test_provenance`), the selected runner, and any extra grid. A verdict applies only to
+  those named inputs.
 - **`runtime_identity`** — resolved package, interpreter, source SHA, and native artifact hashes.
 - **`execution_receipt`** — observed route, kernel symbols, and exact shapes emitted by the test.
 - **Every perf number keeps its provenance.** `stages.perf` carries the baseline it was measured

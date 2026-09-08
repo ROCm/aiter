@@ -27,7 +27,6 @@ REQUIRED_STAGES = {
     "test_policy",
     "baseline_control",
     "correctness_repo_tests",
-    "correctness_s1_grid",
     "execution_receipt",
     "index_width_scan",
 }
@@ -35,8 +34,10 @@ REQUIRED_STAGES = {
 
 # Stages that may be absent without making a report incomplete. `perf` runs only when the
 # target exposes a benchmark harness and both phases completed, so asserting an exact stage
-# set would turn an optional stage into a failure in every test in this file.
-OPTIONAL_STAGES = {"perf"}
+# set would turn an optional stage into a failure in every test in this file. The shape grid
+# joined it when it stopped being required: report.py backfills only the required stages, so a
+# run that exits before a runner is chosen writes no grid stage at all.
+OPTIONAL_STAGES = {"perf", "correctness_s1_grid"}
 
 
 def assert_stage_set(stages):
@@ -239,11 +240,6 @@ class ValidatorFixture:
         # default matches the fixture target, and a test whose subject is a script target says so
         # explicitly -- the same obligation a real caller now has.
         runner="pytest",
-        # Likewise the validator no longer reads the target to see whether the grid duplicates
-        # its own defaults -- the caller declares what the cells cover. This default keeps that
-        # obligation met for every test whose subject is something else; the tests that ARE
-        # about independence pass grid_novelty=None to exercise the undeclared path.
-        grid_novelty="these cells are outside the fixture target's own defaults",
         # The caller's declaration that they looked and no test exercises the change. Mutually
         # exclusive with `tests`, exactly as the two flags are on the command line.
         no_target=None,
@@ -278,8 +274,6 @@ class ValidatorFixture:
             if shape_env:
                 command.extend(["--shape-env", shape_env])
             command.extend(["--grid", grid_value])
-            if grid_novelty:
-                command.extend(["--grid-novelty", grid_novelty])
         if shape_arg:
             command.extend(["--shape-arg", shape_arg])
         if shape_argnames:
@@ -1523,80 +1517,58 @@ class ValidateKernelPrTests(unittest.TestCase):
             **kwargs,
         )
 
-    def test_an_undeclared_grid_is_not_credited_as_a_control(self):
-        # SKILL.md calls the S1 grid "a positive control against reporting the same default
-        # test run twice under different stage names". On aiter#4538 all three requested
-        # shapes were already in the target's own --shapes default list, so the stage
-        # reported `pass` for re-running a strict subset of correctness_repo_tests, and the
-        # verdict was PASS.
+    def test_a_green_grid_earns_nothing_and_costs_nothing(self):
+        # The grid used to be a REQUIRED stage, and that requirement is what produced
+        # aiter#4538: every caller had to supply a grid whether or not they had anything to
+        # say with it, and #4538's three cells were all already in the target's own --shapes
+        # default. The answer at the time was to demand a --grid-novelty declaration and
+        # refuse a pass without one.
         #
-        # The validator no longer reads --shapes to catch that, so it cannot tell a duplicate
-        # grid from a novel one -- which is exactly why silence cannot be credited. A caller
-        # who has not said what their cells cover gets the same answer aiter#4538's duplicate
-        # would have got.
-        patch = self._axis_patch("grid-undeclared.patch")
-        result, report = self._validate_axis_target(
-            patch, grid_value="9,1023,f32", grid_novelty=None
-        )
+        # Now the grid earns nothing, so there is nothing to police. A duplicate grid that
+        # passes proves nothing and claims nothing, which is the correct amount, and the
+        # verdict comes from the target's own run.
+        patch = self._axis_patch("grid-green.patch")
+        result, report = self._validate_axis_target(patch, grid_value="9,1023,f32")
 
-        selection = report["test_selection"]
-        self.assertEqual("unknown", selection["grid_independence"])
-        self.assertEqual("undeclared", selection["grid_independence_basis"])
-        self.assertIn("--grid-novelty", selection["grid_independence_reason"])
         grid_stage = report["stages"]["correctness_s1_grid"]
-        # The run itself was green. It is the missing claim, not a failure, that costs it.
         self.assertEqual(0, grid_stage["exit"])
-        self.assertEqual("skip", grid_stage["status"])
-        self.assertEqual("INCONCLUSIVE", report["verdict"])
-        self.assertEqual(2, result.returncode)
+        self.assertEqual("pass", grid_stage["status"])
+        self.assertNotIn("independence", grid_stage)
+        self.assertEqual("PASS", report["verdict"])
+        self.assertEqual(0, result.returncode)
 
-    def test_a_declared_grid_is_recorded_as_a_declaration_in_one_place(self):
-        # The caller's sentence is published verbatim, marked as their claim rather than a
-        # measurement, and written to ONE place. test_selection and the stage used to be
-        # filled in at different moments and could disagree -- test_selection saying
-        # "duplicates-target-defaults" beside a stage saying "adds-coverage", observed on
-        # ROCm/aiter#5081. One question, one answer.
-        patch = self._axis_patch("grid-declared.patch")
-        _, report = self._validate_axis_target(
-            patch,
-            grid_value="9,1023,f32",
-            grid_novelty="9,1023 is outside the target's own --shapes default of 7,257",
-        )
+    def test_a_run_with_no_grid_at_all_can_still_reach_pass(self):
+        # The invariant the requirement broke. A bugfix with no shape dimension has no grid to
+        # supply, and while correctness_s1_grid was required its `skip` capped every such run
+        # at INCONCLUSIVE however green the target was -- documented in review-pr as a class of
+        # PR that "cannot reach PASS by construction". That is now a property of a CPU-only
+        # target only.
+        patch = self._axis_patch("grid-absent.patch")
+        result, report = self._validate_axis_target(patch, grid=False)
 
-        selection = report["test_selection"]
-        stage = report["stages"]["correctness_s1_grid"]
-        self.assertEqual("adds-coverage", selection["grid_independence"])
-        self.assertEqual("declared-by-caller", selection["grid_independence_basis"])
-        self.assertEqual(
-            "9,1023 is outside the target's own --shapes default of 7,257",
-            selection["grid_independence_reason"],
-        )
-        self.assertEqual(stage["independence"], selection["grid_independence"])
-        self.assertEqual(
-            stage["independence_reason"], selection["grid_independence_reason"]
-        )
-        self.assertEqual("pass", stage["status"])
+        self.assertEqual("skip", report["stages"]["correctness_s1_grid"]["status"])
+        self.assertEqual("PASS", report["verdict"])
+        self.assertEqual(0, result.returncode)
 
-    def test_a_red_grid_stays_red_even_when_nobody_declared_what_it_covers(self):
-        # The downgrade is a refusal to CREDIT, not a way to make a failure disappear. A grid
-        # that fails is reporting a defect whatever the caller did or did not say about it.
-        # The target runs its defaults fine and dies on the shape only the grid asks for --
-        # after calling the route, so the failure is the kernel's, not a delivery problem.
+    def test_a_red_grid_is_still_a_blocker_though_it_can_earn_no_pass(self):
+        # The asymmetry that makes an optional grid worth having: it cannot complete a verdict
+        # and it can still break one. The target runs its defaults fine and dies on the shape
+        # only the grid asks for -- after calling the route, so the failure is the kernel's and
+        # not a delivery problem.
         red = self.AXIS_TARGET.replace(
             "            run_kernel(M, N, dtype_str, num_heads)\n",
             "            run_kernel(M, N, dtype_str, num_heads)\n"
             "            if N == 1023:\n"
             "                raise SystemExit('kernel is wrong at N=1023')\n",
         )
-        patch = self._axis_patch("grid-red-undeclared.patch", body=red)
-        _, report = self._validate_axis_target(
-            patch, grid_value="9,1023,f32", grid_novelty=None
-        )
+        patch = self._axis_patch("grid-red.patch", body=red)
+        result, report = self._validate_axis_target(patch, grid_value="9,1023,f32")
 
         stage = report["stages"]["correctness_s1_grid"]
-        self.assertEqual("unknown", report["test_selection"]["grid_independence"])
         self.assertEqual("fail", stage["status"])
         self.assertNotEqual(0, stage["exit"])
+        self.assertEqual("BLOCK", report["verdict"])
+        self.assertEqual(1, result.returncode)
 
     def test_each_head_run_keeps_its_own_execution_receipt(self):
         # head-repo and head-grid both ran inside the head phase and shared one receipt
@@ -2207,16 +2179,6 @@ class ValidateKernelPrTests(unittest.TestCase):
         # The refusal probe never ran for this target, and nothing else may stand in for it.
         self.assertEqual("not-evaluated", selection["axes"][0]["hook_proof"])
 
-        # And the grid-independence reason must describe THIS run. The old default claimed
-        # "the channel exposes no declared defaults to compare against" whenever the
-        # comparison did not happen - a statement about the target that this run never
-        # established, and false here: the target declares a default for --shapes. Now the
-        # reason is either the caller's own sentence or the absence of one, and the basis
-        # says which, so a reader is never handed a finding about the target on the
-        # validator's authority.
-        self.assertEqual("declared-by-caller", selection["grid_independence_basis"])
-        self.assertNotIn("no declared defaults", selection["grid_independence_reason"])
-
     def test_a_killed_run_leaves_no_stale_verdict_at_the_output_path(self):
         # The process exit code used to be read back out of `--out` AFTER finish_report, so
         # `--out` was a fallback source of truth. A run that died before finish_report copied
@@ -2695,16 +2657,11 @@ class GridChannelTests(unittest.TestCase):
             expected_route="__main__:run_kernel",
             shape_env="UNREAD_GRID_ENV",
             shape_arg="--shape",
-            # Deliberately NOT the target's own `--shape` default of 7,257,f32. This test is
-            # about which channel carries the grid, but a grid that only re-runs the
-            # target's defaults is now downgraded to `skip` on independence grounds, and
-            # that would mask the channel result this test exists to check.
             grid_value="9,1023,f32",
         )
 
         self.assertEqual("cli", report["test_selection"]["grid_channel"])
         self.assertEqual("", report["test_selection"]["grid_channel_reason"])
-        self.assertEqual("adds-coverage", report["test_selection"]["grid_independence"])
         grid_stage = report["stages"]["correctness_s1_grid"]
         self.assertNotEqual("skip", grid_stage["status"])
         self.assertEqual("pass", grid_stage["status"])
@@ -3539,8 +3496,6 @@ class SkillProseContractTests(unittest.TestCase):
     # The fields that separate a caller's claim from a measurement. These are the ones a
     # reader has to be able to look up, and the ones the refactor churned.
     DECLARATION_FIELDS = (
-        "grid_independence",
-        "grid_independence_basis",
         "grid_channel_basis",
         "axis_state",
         "runner_basis",
@@ -3591,7 +3546,7 @@ class SkillProseContractTests(unittest.TestCase):
         # The direction that actually caught the missing flag table. Checking only that the
         # documented flags exist passes trivially when the documentation is empty.
         #
-        # Whole-token, not substring: `--grid` occurs inside `--grid-novelty`, so a plain
+        # Whole-token, not substring: `--target` occurs inside `--no-target`, so a plain
         # `in` check would let the `--grid` row vanish and pass on a sentence about a
         # different flag. The same trap as `declared` inside `declared-by-caller`.
         for flag in sorted(self.accepted_flags()):

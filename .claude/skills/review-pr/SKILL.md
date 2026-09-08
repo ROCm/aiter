@@ -398,9 +398,10 @@ if [ -z "$VALIDATION_REPORT" ] \
       git -C "$PROJECT_ROOT" worktree prune
     }
     trap remove_auto_worktree EXIT
-    # Route and shape knowledge cannot be derived from a diff, so without these the receipt
-    # and grid stages skip and the run tops out at INCONCLUSIVE by construction. That is a
-    # limit of what a diff tells you, not a defect in the PR -- Step 8 must say so.
+    # Route knowledge cannot be derived from a diff, so without --expected-route the receipt
+    # stage skips and the run tops out at INCONCLUSIVE by construction. That is a limit of what
+    # a diff tells you, not a defect in the PR -- Step 8 must say so. A missing GRID no longer
+    # costs anything: the grid is optional and earns no clearance either way.
     # When a grid is supplied and no channel carries it, the report's
     # test_selection.grid_channel_reason names each channel tried, what was found in the
     # target, and which channels the target does offer -- so a wrong guess costs one run
@@ -483,10 +484,12 @@ required_stages = {
     "test_policy",
     "baseline_control",
     "correctness_repo_tests",
-    "correctness_s1_grid",
     "execution_receipt",
     "index_width_scan",
 }
+# Not required, and therefore not always present: a run that never got as far as choosing a
+# runner writes no grid stage at all, and report.py only backfills the required ones.
+OPTIONAL_STAGES = {"correctness_s1_grid"}
 missing = required_stages - report.get("stages", {}).keys()
 if missing:
     raise SystemExit(f"validation report omits required stages: {sorted(missing)}")
@@ -543,10 +546,10 @@ if set(coverage_basis) != set(coverage):
 if coverage:
     basis = coverage_basis[gpu_arch]
     if selection["runner"] == "pytest":
-        grid_stats = report["stages"]["correctness_s1_grid"].get("stats", {})
+        grid_stage = report["stages"].get("correctness_s1_grid", {})
         basis_stage = (
-            report["stages"]["correctness_s1_grid"]
-            if grid_stats.get("executed", 0) > 0
+            grid_stage
+            if grid_stage.get("stats", {}).get("executed", 0) > 0
             else report["stages"]["correctness_repo_tests"]
         )
         expected_basis = (
@@ -556,8 +559,10 @@ if coverage:
             raise SystemExit("pytest architecture coverage basis is inconsistent")
     elif selection["runner"] == "script" and not basis.startswith("script-"):
         raise SystemExit("script architecture coverage basis is inconsistent")
-for stage_name in ("correctness_repo_tests", "correctness_s1_grid"):
-    stage = report["stages"][stage_name]
+for stage_name in ("correctness_repo_tests", *OPTIONAL_STAGES):
+    stage = report["stages"].get(stage_name)
+    if stage is None:
+        continue
     stats = stage.get("stats")
     if stats is not None:
         stat_keys = ("tests", "failures", "errors", "skipped", "executed")
@@ -613,7 +618,9 @@ complete = (
     and report["stages"]["test_policy"]["status"] == "pass"
     and report["stages"]["baseline_control"]["status"] == "pass"
     and report["stages"]["correctness_repo_tests"]["status"] == "pass"
-    and report["stages"]["correctness_s1_grid"]["status"] == "pass"
+    # The grid is deliberately absent from this gate. Requiring it here is what made a bugfix
+    # with no shape dimension unable to reach PASS however green it was, and what pushed callers
+    # into supplying a grid they had nothing to say with.
     and report["stages"]["execution_receipt"]["status"] == "pass"
     and report["stages"]["index_width_scan"]["status"] == "info"
 )
@@ -792,7 +799,7 @@ Check which type(s) apply; these determine which Step 5 categories are mandatory
 - [ ] **Perf / benchmark PR** → P1 (numbers with units), P5 (setup cost excluded?), P2 (production shapes), P3 (reproducible), P6 (re-measure here — P1–P5 only grade the PR's own table)
 - [ ] **Test / benchmark only** → P2 (production shapes), HK6 (aiter-op-test format)
 - [ ] **Async / multi-stream** → G1 (stream sync missing), G1b (blocking queue.get without timeout in serving code)
-- [ ] **FlyDSL kernel** → D10 (compile result called?), D10b (arith.unwrap() before arith.bitcast?). A FlyDSL kernel change is runtime surface, so Step 1's triage marks it `REQUIRED` and, when the PR ships exactly one test target, has already run the validator against it. Use whatever report Step 1 accepted as the evidence; where it reached no report, mark the result `[static-only advisory review]` (see Step 8) and make no runtime clearance claim. Absence of a report is not itself a blocker. Two target classes cannot reach `PASS` by construction, so their `INCONCLUSIVE` is the expected output and not a deficiency: a CPU-only target claims no GPU and therefore no architecture, and a bugfix with no shape dimension has no grid for `correctness_s1_grid` to consume. Never ask such an author for a passing report.
+- [ ] **FlyDSL kernel** → D10 (compile result called?), D10b (arith.unwrap() before arith.bitcast?). A FlyDSL kernel change is runtime surface, so Step 1's triage marks it `REQUIRED` and, when the PR ships exactly one test target, has already run the validator against it. Use whatever report Step 1 accepted as the evidence; where it reached no report, mark the result `[static-only advisory review]` (see Step 8) and make no runtime clearance claim. Absence of a report is not itself a blocker. A CPU-only target still cannot reach `PASS` by construction — it claims no GPU and therefore no architecture — so its `INCONCLUSIVE` is the expected output and not a deficiency; never ask such an author for a passing report. A bugfix with no shape dimension used to be the second such class, because the shape grid was a required stage; it no longer is, and such a PR can now pass on its own test alone.
 - [ ] **New if/elif dispatch with variable assignment** → D1b (UnboundLocalError on uninitialized path)
 - [ ] **Change to behavior/dispatch of a downstream-consumed op** (mla / fused_moe / attention / mha / quant / gemm_op_a8w8 / moe_op / jit-core) → E4 (is downstream CI triggered or skipped?), E5 (stable-API owner sign-off)
 - [ ] **New `@compile_ops` / `torch.library.custom_op`, or change to an op's return dtype/arity** → D7 (fake/abstract impl exists?), D6 (fake dtype/shape matches real op?)
