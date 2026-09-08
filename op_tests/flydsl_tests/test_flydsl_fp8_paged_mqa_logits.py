@@ -240,8 +240,6 @@ def _verify_paged_mqa_logits(
     split_kv,
     block_size,
     preshuffle,
-    variant,
-    chunk_k,
 ):
     _split_kv = None if split_kv == 0 else split_kv
     kv_cache_kernel, out = _kernel_inputs(
@@ -273,8 +271,6 @@ def _verify_paged_mqa_logits(
             Preshuffle=preshuffle,
             KVBlockSize=block_size,
             SplitKV=_split_kv,
-            ChunkK=chunk_k,
-            variant=variant,
         )
 
     got_mask = got == float("-inf")
@@ -309,8 +305,6 @@ def _bench_flydsl_paged_kernel(
     preshuffle,
     block_size,
     split_kv,
-    chunk_k,
-    variant,
 ):
     _split_kv = None if split_kv == 0 else split_kv
 
@@ -326,8 +320,6 @@ def _bench_flydsl_paged_kernel(
             Preshuffle=preshuffle,
             KVBlockSize=block_size,
             SplitKV=_split_kv,
-            ChunkK=chunk_k,
-            variant=variant,
         )
 
     with torch.inference_mode():
@@ -343,10 +335,8 @@ def test_fp8_paged_mqa_logits(
     avg_kv_length,
     q_dtype,
     split_kv=0,
-    block_size=1,
-    preshuffle=False,
-    variant=None,
-    chunk_k=128,
+    block_size=64,
+    preshuffle=True,
     bench=False,
 ):
     inp = _build_inputs(
@@ -366,16 +356,12 @@ def test_fp8_paged_mqa_logits(
         split_kv,
         block_size,
         preshuffle,
-        variant,
-        chunk_k,
     )
     ret = {
         "gfx": get_gfx(),
         "kvb": block_size,
         "preshuffle": preshuffle,
         "split_kv": "auto" if split_kv == 0 else split_kv,
-        "variant": variant or "default",
-        "chunk_k": chunk_k,
         "flydsl err": err,
     }
     if not bench:
@@ -393,41 +379,38 @@ def test_fp8_paged_mqa_logits(
             preshuffle=preshuffle,
             block_size=block_size,
             split_kv=split_kv,
-            chunk_k=chunk_k,
-            variant=variant,
         )
     )
 
-    if block_size == 1 and not preshuffle:
-        from aiter.ops.triton.attention.pa_mqa_logits import (
-            deepgemm_fp8_paged_mqa_logits,
+    from aiter.ops.triton.attention.pa_mqa_logits import (
+        deepgemm_fp8_paged_mqa_logits,
+    )
+
+    out_ref = torch.full(
+        (batch_size * next_n, inp.max_model_len),
+        float("-inf"),
+        device="cuda",
+        dtype=torch.float32,
+    )
+
+    def fn_ref():
+        return deepgemm_fp8_paged_mqa_logits(
+            inp.q_fp8,
+            kv_cache_kernel,
+            inp.weights,
+            out_ref,
+            inp.context_lens,
+            inp.block_tables,
+            inp.max_model_len,
+            ChunkK=REF_CHUNK_K,
+            Preshuffle=True,
+            KVBlockSize=block_size,
+            WavePerEU=REF_WAVE_PER_EU,
         )
 
-        out_ref = torch.full(
-            (batch_size * next_n, inp.max_model_len),
-            float("-inf"),
-            device="cuda",
-            dtype=torch.float32,
-        )
-
-        def fn_ref():
-            return deepgemm_fp8_paged_mqa_logits(
-                inp.q_fp8,
-                inp.kv_cache_fp8,
-                inp.weights,
-                out_ref,
-                inp.context_lens,
-                inp.block_tables,
-                inp.max_model_len,
-                ChunkK=REF_CHUNK_K,
-                Preshuffle=False,
-                KVBlockSize=1,
-                WavePerEU=REF_WAVE_PER_EU,
-            )
-
-        with torch.inference_mode():
-            _, ref_us = run_perftest(fn_ref)
-        ret["gluon us"] = float(ref_us)
+    with torch.inference_mode():
+        _, ref_us = run_perftest(fn_ref)
+    ret["gluon us"] = float(ref_us)
 
     return ret
 
@@ -440,7 +423,6 @@ _BASE = {
     "avg_kv_length": 1024,
     "q_dtype": "fnuz",
 }
-_SHAPES = [(64, 64), (64, 128), (128, 64), (128, 128)]
 _AXES = (
     "batch_size",
     "next_n",
@@ -454,56 +436,35 @@ _AXES = (
 
 
 def _c(**kw):
-    return {**_BASE, "block_size": 64, **kw}
+    return {**_BASE, "block_size": 64, "preshuffle": True, **kw}
 
 
 def default_cases():
     cases = []
-    for heads, head_dim in _SHAPES:
-        for kvb in (1, 64):
-            cases.append(_c(heads=heads, head_dim=head_dim, block_size=kvb))
-        for kvb in (16, 64):
-            cases.append(
-                _c(heads=heads, head_dim=head_dim, block_size=kvb, preshuffle=True)
-            )
+    for heads in (32, 64):
+        for next_n in (1, 2):
+            cases.append(_c(heads=heads, next_n=next_n))
     cases += [_c(batch_size=b, next_n=n) for b, n in ((1, 1), (1, 2), (4, 2), (8, 1))]
     cases += [_c(avg_kv_length=kv) for kv in (128, 8192)]
     cases += [_c(split_kv=sk) for sk in (1, 4)]
     cases.append(_c(avg_kv_length=128, split_kv=4))
     cases.append(_c(avg_kv_length=8192, split_kv=1))
-    cases.append(_c(split_kv=4, preshuffle=True))
-    cases.append(_c(split_kv=1, block_size=16, preshuffle=True))
-    cases += [_c(variant=v) for v in ("paged_w2", "paged_w4")]
-    cases.append(_c(chunk_k=64, variant="paged_w2"))
-    cases.append(_c(chunk_k=256, variant="paged_w4"))
-    cases.append(_c(chunk_k=256))
-    cases.append(_c(preshuffle=True, variant="paged_w4"))
     return cases
 
 
 def exhaustive_cases():
     prod = itertools.product(
         [(1, 1), (1, 2), (2, 1), (2, 2), (4, 2), (8, 1)],
-        [64, 128],
-        [64, 128],
+        [32, 64],
+        [128],
         [128, 1024, 8192],
         ["fnuz"],
         [0, 1, 4],
-        [1, 64],
+        [64],
     )
-    cases = [
-        dict(zip(_AXES, (bs, nn, nh, hd, kv, qd, sk, kvb)))
+    return [
+        {**dict(zip(_AXES, (bs, nn, nh, hd, kv, qd, sk, kvb))), "preshuffle": True}
         for (bs, nn), nh, hd, kv, qd, sk, kvb in prod
-    ]
-    return cases + [
-        {**dict(zip(_AXES, (bs, nn, nh, hd, kv, qd, 0, kvb))), "preshuffle": True}
-        for bs, nn, nh, hd, kv, qd, kvb in [
-            (1, 1, 64, 128, 1024, "fnuz", 16),
-            (1, 2, 64, 128, 1024, "fnuz", 64),
-            (2, 1, 128, 128, 8192, "fnuz", 64),
-            (1, 1, 64, 64, 1024, "fnuz", 16),
-            (4, 2, 64, 128, 8192, "fnuz", 64),
-        ]
     ]
 
 
@@ -538,9 +499,7 @@ def run_profile(args):
         args.head_dim,
         args.split_kv,
         args.kv_block_size,
-        args.preshuffle,
-        args.variant,
-        args.chunk_k,
+        True,
     )
     _split_kv = None if args.split_kv == 0 else args.split_kv
 
@@ -553,12 +512,9 @@ def run_profile(args):
             inp.context_lens,
             inp.block_tables,
             inp.max_model_len,
-            Preshuffle=args.preshuffle,
+            Preshuffle=True,
             KVBlockSize=args.kv_block_size,
-            ChunkK=args.chunk_k,
             SplitKV=_split_kv,
-            WavePerEU=args.wave_per_eu,
-            variant=args.variant,
         )
 
     run()
@@ -569,7 +525,7 @@ def run_profile(args):
     print(
         f"# gfx={get_gfx()} B={args.batch} nn={args.next_n} H={args.heads} "
         f"D={args.head_dim} kv_len={args.kv_len} kvb={args.kv_block_size} "
-        f"preshuffle={args.preshuffle} chunk_k={args.chunk_k} iters={args.iters}"
+        f"preshuffle=True iters={args.iters}"
     )
     print(f"# KV requested: {kv_bytes / 1e6:.1f} MB")
     torch.cuda.synchronize()
@@ -595,8 +551,8 @@ def run_gluon_ab(args):
             head_dim=D,
             avg_kv_length=kv_len,
             q_dtype="fnuz",
-            block_size=1,
-            preshuffle=False,
+            block_size=64,
+            preshuffle=True,
             bench=True,
         )
         fly_us = ret["flydsl us"]
@@ -643,9 +599,6 @@ def main():
         help="run the full cartesian product instead of the curated matrix",
     )
     parser.add_argument(
-        "--no-preshuffle", action="store_true", help="skip preshuffle cases"
-    )
-    parser.add_argument(
         "--bench",
         action="store_true",
         help="also run run_perftest timing in the correctness sweep",
@@ -653,7 +606,7 @@ def main():
     parser.add_argument(
         "--compare-gluon",
         action="store_true",
-        help="run the production Gluon A/B decode shape sweep (KVBlockSize=1)",
+        help="run the Gluon A/B decode shape sweep (KVB=64, preshuffle)",
     )
     parser.add_argument(
         "--profile",
@@ -665,13 +618,9 @@ def main():
     parser.add_argument("--heads", type=int, default=64)
     parser.add_argument("--head-dim", type=int, default=128)
     parser.add_argument("--kv-len", type=int, default=32768)
-    parser.add_argument("--kv-block-size", type=int, default=1)
-    parser.add_argument("--preshuffle", action="store_true")
+    parser.add_argument("--kv-block-size", type=int, default=64)
     parser.add_argument("--q-dtype", type=str, default="fnuz", choices=["fnuz", "fn"])
     parser.add_argument("--split-kv", type=int, default=0)
-    parser.add_argument("--wave-per-eu", type=int, default=2)
-    parser.add_argument("--chunk-k", type=int, default=128)
-    parser.add_argument("--variant", type=str, default=None)
     parser.add_argument("--var-ratio", type=float, default=0.0)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--pool-blocks", type=int, default=0)
@@ -681,8 +630,11 @@ def main():
     args = parser.parse_args()
 
     if args.profile:
-        if args.preshuffle and args.kv_block_size % 16 != 0:
-            raise SystemExit("--preshuffle requires --kv-block-size divisible by 16")
+        if args.kv_block_size != 64 or args.heads not in (32, 64) or args.next_n not in (
+            1,
+            2,
+        ):
+            raise SystemExit("kernel supports H in {32,64}, next_n in {1,2}, KVB=64")
         run_profile(args)
         return
     if args.compare_gluon:
@@ -690,8 +642,6 @@ def main():
         return
 
     cases = exhaustive_cases() if args.exhaustive else default_cases()
-    if args.no_preshuffle:
-        cases = [c for c in cases if not c.get("preshuffle")]
 
     df = [test_fp8_paged_mqa_logits(bench=args.bench, **c) for c in cases]
     df = pd.DataFrame(df)

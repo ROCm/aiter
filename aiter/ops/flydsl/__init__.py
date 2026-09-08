@@ -33,14 +33,6 @@ _LAZY_IMPORTS = {
         ".kernels.mqa_logits.fp8_mqa_logits",
         "KERNEL_VARIANTS",
     ),
-    "FP8_PAGED_MQA_LOGITS_DEFAULT_VARIANT": (
-        ".kernels.mqa_logits.fp8_paged_mqa_logits",
-        "DEFAULT_VARIANT",
-    ),
-    "FP8_PAGED_MQA_LOGITS_VARIANTS": (
-        ".kernels.mqa_logits.fp8_paged_mqa_logits",
-        "KERNEL_VARIANTS",
-    ),
     "compute_varqlen_windows": (
         ".kernels.mqa_logits.pa_mqa_logits_fp4_prefill",
         "compute_varqlen_windows",
@@ -51,12 +43,8 @@ _LAZY_IMPORTS = {
         "flydsl_fp8_mqa_logits",
     ),
     "flydsl_fp8_paged_mqa_logits": (
-        ".kernels.mqa_logits.fp8_paged_mqa_logits",
+        ".kernels.mqa_logits.fp8_paged_mqa_logits_gfx950",
         "flydsl_fp8_paged_mqa_logits",
-    ),
-    "flydsl_fp8_paged_mqa_logits_generic": (
-        ".kernels.mqa_logits.fp8_paged_mqa_logits",
-        "flydsl_fp8_paged_mqa_logits_generic",
     ),
     "flydsl_fp8_paged_mqa_logits_gfx950": (
         ".kernels.mqa_logits.fp8_paged_mqa_logits_gfx950",
@@ -91,14 +79,11 @@ _LAZY_IMPORTS = {
 __all__ = [
     "FP8_MQA_LOGITS_DEFAULT_VARIANT",
     "FP8_MQA_LOGITS_VARIANTS",
-    "FP8_PAGED_MQA_LOGITS_DEFAULT_VARIANT",
-    "FP8_PAGED_MQA_LOGITS_VARIANTS",
     "GateMode",
     "compute_varqlen_windows",
     "flydsl_flash_attn_func",
     "flydsl_fp8_mqa_logits",
     "flydsl_fp8_paged_mqa_logits",
-    "flydsl_fp8_paged_mqa_logits_generic",
     "flydsl_fp8_paged_mqa_logits_gfx950",
     "flydsl_hgemm",
     "flydsl_mla_reduce_v1",

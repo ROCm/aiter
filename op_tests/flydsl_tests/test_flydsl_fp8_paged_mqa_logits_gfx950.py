@@ -5,13 +5,11 @@
 
 import argparse
 
+import pytest
 import torch
 
 from aiter.jit.utils.chip_info import get_gfx
-from aiter.ops.flydsl import (
-    flydsl_fp8_paged_mqa_logits,
-    flydsl_fp8_paged_mqa_logits_generic,
-)
+from aiter.ops.flydsl import flydsl_fp8_paged_mqa_logits
 from aiter.ops.triton.utils.types import get_fp8_e4m3_dtype
 from aiter.test_common import run_perftest
 from op_tests.flydsl_tests.test_flydsl_fp8_paged_mqa_logits import (
@@ -30,6 +28,7 @@ DEFAULT_HEADS = 64
 HEAD_DIM = 128
 KV_LEN = 32768
 KV_BLOCK_SIZE = 64
+WIDE_MAX_MODEL_LEN = 1 << 20
 
 
 def _inputs(heads, next_n=NEXT_N, kv_len=KV_LEN, batch=BATCH):
@@ -97,6 +96,48 @@ def test_gfx950_nq1_and_short_pages(heads=32):
         _check(inp, kv_cache, out, f"H={heads} pages={pages}")
 
 
+@pytest.mark.skipif(get_gfx() != "gfx950", reason="requires gfx950")
+def test_gfx950_wide_output_no_tail_drop():
+    """Row 512 crosses the signed i32 byte-offset boundary at this stride."""
+    batch = 513
+    inp, kv_cache, _ = _inputs(32, next_n=1, kv_len=KV_BLOCK_SIZE, batch=batch)
+    compact = torch.full(
+        (batch, inp.max_model_len), float("-inf"), dtype=torch.float32
+    )
+    wide = torch.full(
+        (batch, WIDE_MAX_MODEL_LEN), float("-inf"), dtype=torch.float32
+    )
+
+    with torch.inference_mode():
+        flydsl_fp8_paged_mqa_logits(
+            inp.q_fp8,
+            kv_cache,
+            inp.weights,
+            compact,
+            inp.context_lens,
+            inp.block_tables,
+            inp.max_model_len,
+            Preshuffle=True,
+            KVBlockSize=KV_BLOCK_SIZE,
+        )
+        flydsl_fp8_paged_mqa_logits(
+            inp.q_fp8,
+            kv_cache,
+            inp.weights,
+            wide,
+            inp.context_lens,
+            inp.block_tables,
+            WIDE_MAX_MODEL_LEN,
+            Preshuffle=True,
+            KVBlockSize=KV_BLOCK_SIZE,
+        )
+    torch.cuda.synchronize()
+
+    valid_cols = KV_BLOCK_SIZE
+    assert torch.equal(wide[:, :valid_cols], compact[:, :valid_cols])
+    assert torch.equal(wide[512:, :valid_cols], compact[512:, :valid_cols])
+
+
 def _benchmark(heads):
     from aiter.ops.triton.attention.pa_mqa_logits import (
         deepgemm_fp8_paged_mqa_logits,
@@ -105,24 +146,10 @@ def _benchmark(heads):
     )
 
     inp, kv_cache, out_new = _inputs(heads)
-    out_old = torch.full_like(out_new, float("-inf"))
     out_triton = torch.full_like(out_new, float("-inf"))
 
     def new_kernel():
         return _launch(inp, kv_cache, out_new)
-
-    def old_kernel():
-        return flydsl_fp8_paged_mqa_logits_generic(
-            inp.q_fp8,
-            kv_cache,
-            inp.weights,
-            out_old,
-            inp.context_lens,
-            inp.block_tables,
-            inp.max_model_len,
-            Preshuffle=True,
-            KVBlockSize=KV_BLOCK_SIZE,
-        )
 
     def triton_kernel():
         return deepgemm_fp8_paged_mqa_logits(
@@ -143,16 +170,13 @@ def _benchmark(heads):
     print(f"H={heads} triton {triton_version} backend={backend}")
     with torch.inference_mode():
         _, new_us = run_perftest(new_kernel, num_iters=50, num_warmup=8)
-        _, old_us = run_perftest(old_kernel, num_iters=50, num_warmup=8)
         _, triton_us = run_perftest(triton_kernel, num_iters=50, num_warmup=8)
     # WaveScope benchmarkPattern matches the first `time: {us} us` line (H=64).
     if heads == DEFAULT_HEADS:
         print(f"time: {new_us:.3f} us")
     else:
         print(f"time H={heads}: {new_us:.3f} us")
-    print(f"flydsl baseline: {old_us:.3f} us")
     print(f"{backend}: {triton_us:.3f} us")
-    print(f"vs flydsl: {old_us / new_us:.3f}x")
     print(f"vs {backend}: {triton_us / new_us:.3f}x")
 
 
