@@ -1649,16 +1649,16 @@ def _write_ninja_file_to_build_library(
         system_includes += include_paths(with_cuda)
         system_includes = list(set(system_includes))
 
-    # FIXME: build python module excluded with torch, use `pybind11`
-    # But we can't use this now because all aiter op based on torch
-    # which means pybind11 related build flags must from torch now
     common_cflags = []
     if is_python_module:
         import pybind11
 
         extra_include_paths.append(pybind11.get_include())
-        common_cflags += [f"{x}" for x in _get_pybind11_abi_build_flags()]
-        common_cflags += [f"{x}" for x in _get_glibcxx_abi_build_flags()]
+        if not torch_exclude:
+            common_cflags += [f"{x}" for x in _get_pybind11_abi_build_flags()]
+            common_cflags += [f"{x}" for x in _get_glibcxx_abi_build_flags()]
+        else:
+            common_cflags.append("-D_GLIBCXX_USE_CXX11_ABI=1")
 
     # sysconfig.get_path('include') gives us the location of Python.h
     # Explicitly specify 'posix_prefix' scheme on non-Windows platforms to workaround error on some MacOS
@@ -1672,11 +1672,8 @@ def _write_ninja_file_to_build_library(
     # file wherever it is.
     user_includes = [os.path.abspath(file) for file in extra_include_paths]
 
-    if not torch_exclude:
-        common_cflags.append(f"-DTORCH_EXTENSION_NAME={name}")
-        # common_cflags.append("-DTORCH_API_INCLUDE_EXTENSION_H")
-        # common_cflags += [f"{x}" for x in _get_pybind11_abi_build_flags()]
-        # common_cflags += [f"{x}" for x in _get_glibcxx_abi_build_flags()]
+    common_cflags.append(f"-DAITER_EXTENSION_NAME={name}")
+    common_cflags.append(f"-DTORCH_EXTENSION_NAME={name}")
 
     # Windows does not understand `-isystem` and quotes flags later.
     common_cflags += [f"-I{shlex.quote(include)}" for include in user_includes]
