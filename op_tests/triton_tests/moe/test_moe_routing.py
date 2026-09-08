@@ -413,7 +413,7 @@ def _check_routing_data_bucket(
 @pytest.mark.parametrize(
     "n_tokens, n_expts_tot, n_expts_act",
     [
-        (8, 128, 4),  # tiny: hits sort_tokens_fused path (n_tokens <= 16)
+        (8, 128, 4),  # tiny: hits sort_tokens_fused
         (16, 128, 4),  # boundary
         (64, 128, 4),
         (1024, 128, 4),

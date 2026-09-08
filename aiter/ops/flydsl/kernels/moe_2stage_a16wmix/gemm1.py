@@ -441,6 +441,11 @@ def compile_gemm1_a16w4_port(
     assert (
         TILE_N // (4 // k_wave)
     ) >= 16, f"TILE_N//(4//k_wave) must be >= 16 (num_acc_n>=1), got TILE_N={TILE_N}, k_wave={k_wave}"
+    # Whole 16-wide groups per N-wave, else num_acc_n truncates (TILE_N=96: 8 of 24).
+    assert TILE_N % (16 * (4 // k_wave)) == 0, (
+        f"TILE_N must be a multiple of {16 * (4 // k_wave)} (16*(4//k_wave), else "
+        f"num_acc_n truncates and drops columns), got TILE_N={TILE_N}, k_wave={k_wave}"
+    )
     assert BM % 16 == 0, f"BM must be a multiple of 16, got {BM}"
     NUM_N_BLOCKS = _INTER // TILE_N
 
