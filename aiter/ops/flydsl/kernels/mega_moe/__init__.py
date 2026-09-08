@@ -10,6 +10,8 @@ _LAZY = {
     "MegaMoEV2": "mega_moe_v2",
     "Stage1Config": "mega_moe_config",
     "Stage2Config": "mega_moe_config",
+    "TPMoEStage1": "tp_moe_stage1",
+    "TPMoEStage1Output": "tp_moe_stage1",
     "compile_gemm1": "gemm1",
     "gemm1_kernel": "gemm1",
     "select_mega_moe_config": "mega_moe_config",
