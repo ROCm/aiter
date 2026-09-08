@@ -169,8 +169,61 @@ replays, and retain numbered iteration groups for tail-20 analysis::
     --routing random \
     --torch-compile-cudagraph \
     --profile-warmup-iters 10 \
-    --profile-iters 40 \
-    --torch-profiler-dir trace_data/testwide_compile_trace
+  --profile-iters 40 \
+  --torch-profiler-dir trace_data/testwide_compile_trace
+
+DSV4 A8W4 EP16 preset
+---------------------
+
+DSV4 uses H=7168, I=3072, 384 global experts, 24 local experts per EP16 rank,
+TopK=6, FP8 activations, FP4 weights, per-1x32 E8M0 scales, SiLU, and the
+gate/up-interleaved GEMM1 layout.  Replace the tune file and add the preset on
+both nodes::
+
+  ATOM_MOE_GU_ITLV=1 \
+  AITER_BF16_FP8_MOE_BOUND=0 \
+  AITER_CONFIG_FMOE=aiter/configs/model_configs/dsv4_fp8fp4_tuned_fmoe.csv \
+  torchrun ... op_tests/multigpu_tests/test_wide_ep_moe.py \
+    --model-config dsv4 --bs-list 4,128 --accuracy-max-bs 128 --staged-only
+
+Node 0 (mi355-gpu-46)::
+
+  cd /home/hzm/aiter_test_wide_ep_moe
+  PYTHONPATH=/home/hzm/aiter_test_wide_ep_moe \
+  ATOM_MOE_GU_ITLV=1 \
+  AITER_BF16_FP8_MOE_BOUND=0 \
+  GLOO_SOCKET_IFNAME=enp193s0f1np1 \
+  MORI_SOCKET_IFNAME=enp193s0f1np1 \
+  NCCL_SOCKET_IFNAME=enp193s0f1np1 \
+  MORI_DEVICE_NIC=ionic \
+  MORI_RDMA_DEVICES='^rocep193s0f0,rocep193s0f1' \
+  MORI_IB_GID_INDEX=1 \
+  MORI_NUM_QP_PER_PE=2 \
+  MORI_SHMEM_HEAP_SIZE=40G \
+  MORI_EP_LAUNCH_CONFIG_MODE=AUTO \
+  GPU_PER_NODE=8 \
+  AITER_CONFIG_FMOE=aiter/configs/model_configs/dsv4_fp8fp4_tuned_fmoe.csv \
+  torchrun --nnodes=2 --node_rank=0 --nproc_per_node=1 \
+    --master_addr=10.2.80.17 --master_port=30010 \
+    op_tests/multigpu_tests/test_wide_ep_moe.py \
+    --model-config dsv4 --bs-list 4,128 --accuracy-max-bs 128 \
+    --routing random --staged-only
+
+Node 1 (mi355-gpu-50) uses the identical command except::
+
+  --node_rank=1
+
+For compile profiling, remove ``--staged-only`` and append on both nodes::
+
+  --torch-compile-cudagraph \
+  --profile-warmup-iters 10 \
+  --profile-iters 40 \
+  --torch-profiler-dir trace_data/dsv4_testwide_compile_trace
+
+The source DSV4 table is tuned for EP8 with 48 local experts.  Its EP16 rows
+preserve the same kernels and token buckets with 24 local experts.  Because the
+current fused_moe EP lookup removes one historical fake-expert TopK slot, the
+table also contains TopK=5 lookup aliases for MORI's real TopK=6 input.
 """
 
 from __future__ import annotations
@@ -187,6 +240,7 @@ import mori
 import mori.shmem as ms
 import torch
 import torch.distributed as dist
+import torch.nn.functional as F
 
 import aiter
 from aiter import ActivationType, QuantType, dtypes
@@ -197,16 +251,33 @@ from aiter.ops.shuffle import (
     shuffle_weight,
     shuffle_weight_a16w4,
 )
+from aiter.test_common import checkAllclose
 from aiter.utility import fp4_utils
 
 # Target EP16 A4W4 pipeline shape. The CSV-compatible result format follows
 # aiter/configs/model_configs/kimik3_a4w4_tuned_fmoe.csv, while this benchmark
 # intentionally uses the requested larger intermediate dimension (3072).
-NETWORK = {
-    "model_dim": 3584,
-    "inter_dim": 3072,
-    "experts": 896,
-    "topk": 16,
+NETWORKS = {
+    "kimi": {
+        "model_dim": 3584,
+        "inter_dim": 3072,
+        "experts": 896,
+        "topk": 16,
+        "quant": "a4w4",
+        "activation": ActivationType.Situv2,
+        "gate_mode": "separated",
+    },
+    # DSV4's tune table is EP8 with 48 local experts: 48 * 8 = 384 global.
+    # The EP16 conversion keeps 384 global experts and uses 24 per rank.
+    "dsv4": {
+        "model_dim": 7168,
+        "inter_dim": 3072,
+        "experts": 384,
+        "topk": 6,
+        "quant": "a8w4",
+        "activation": ActivationType.Silu,
+        "gate_mode": "interleave",
+    },
 }
 GPU_PER_NODE_DEFAULT = 8
 
@@ -348,7 +419,9 @@ def _make_local_inputs(
     return x.contiguous(), topk_weights.contiguous(), topk_ids.contiguous()
 
 
-def _quantize_local_weights(model_dim, inter_dim, local_experts, rank, seed, device):
+def _quantize_local_weights(
+    model_dim, inter_dim, local_experts, rank, seed, device, quant="a4w4"
+):
     """Per-rank local-expert bf16 weights -> a4w4 (per_1x32 mxfp4) quantized +
     shuffled, following test_moe_ep.py's a4w4_mxfp4 branch exactly. Returns both
     the kernel-ready shuffled tensors and the unshuffled quantized tensors (for
@@ -392,26 +465,27 @@ def _quantize_local_weights(model_dim, inter_dim, local_experts, rank, seed, dev
     # mxmoe GEMM1 consumes the A16W4 preshuffle, while the previous
     # flydsl_moe1_afp4 baseline consumes the generic layout.  Keep both paths
     # testable without rewriting the weight setup between regression runs.
+    use_a16w4_layout = use_mxmoe_w1 or quant == "a8w4"
     w1_a = (
-        shuffle_weight_a16w4(w1_qt, 16, False)
-        if use_mxmoe_w1
+        shuffle_weight_a16w4(w1_qt, 16, quant == "a8w4")
+        if use_a16w4_layout
         else shuffle_weight(w1_qt, layout=(16, 16))
     )
     w2_a = (
         shuffle_weight_a16w4(w2_qt, 16, False)
-        if use_mxmoe_w1
+        if use_a16w4_layout
         else shuffle_weight(w2_qt, layout=(16, 16))
     )
     w1_s = (
-        shuffle_scale_a16w4(w1_scale, local_experts, False)
-        if use_mxmoe_w1
+        shuffle_scale_a16w4(w1_scale, local_experts, quant == "a8w4")
+        if use_a16w4_layout
         else fp4_utils.e8m0_shuffle(w1_scale)
     )
     w2_s = (
         shuffle_scale_a16w4(
             w2_scale.view(-1, inter_dim // 32), local_experts, False
         )
-        if use_mxmoe_w1
+        if use_a16w4_layout
         else fp4_utils.e8m0_shuffle(w2_scale)
     )
     w1_a.is_shuffled = True
@@ -428,18 +502,22 @@ def _dequant_weight(w_qt, w_scale, orig_shape):
     return (wf * sf).to(torch.bfloat16)
 
 
-def _dequant_tokens(tok_fp4, scale, hidden_dim):
-    """Dequantize dispatched fp4 tokens back to bf16 (local compute only, never
-    crosses the network -- the network transport itself carried fp4)."""
-    n = tok_fp4.shape[0]
-    wf = fp4_utils.mxfp4_to_f32(tok_fp4).view(n, hidden_dim)
+def _dequant_tokens(tok_quant, scale, hidden_dim):
+    """Dequantize dispatched MXFP4/MXFP8 tokens for the Torch reference."""
+    n = tok_quant.shape[0]
+    if tok_quant.dtype == dtypes.fp4x2:
+        values = fp4_utils.mxfp4_to_f32(tok_quant).view(n, hidden_dim)
+    elif tok_quant.dtype == dtypes.fp8:
+        values = tok_quant.float().view(n, hidden_dim)
+    else:
+        raise ValueError(f"unsupported dispatched dtype for reference: {tok_quant.dtype}")
     sf = fp4_utils.e8m0_to_f32(scale).view(n, hidden_dim // 32)
     sf = sf.unsqueeze(-1).expand(-1, -1, 32).reshape(n, hidden_dim)
-    return (wf * sf).to(torch.bfloat16)
+    return (values * sf).to(torch.bfloat16)
 
 
-def _torch_moe_situv2_reference(x, w1, w2, weights, global_ids, expert_mask):
-    """Local EP reference following test_moe_2stage's SiTUv2 definition."""
+def _torch_moe_reference(x, w1, w2, weights, global_ids, expert_mask, activation):
+    """Local EP reference for SiLU or SiTUv2 gate/up activation."""
     compute_type = torch.float32
     batch, model_dim = x.shape
     topk = weights.shape[1]
@@ -457,9 +535,24 @@ def _torch_moe_situv2_reference(x, w1, w2, weights, global_ids, expert_mask):
             gate, up = (x_routes[mask] @ w1[expert_id].transpose(0, 1)).split(
                 [inter_dim, inter_dim], dim=-1
             )
-            hidden = situv2(gate, up, beta=1.0, linear_beta=1.0)
+            hidden = (
+                situv2(gate, up, beta=1.0, linear_beta=1.0)
+                if activation == ActivationType.Situv2
+                else F.silu(gate) * up
+            )
             out[mask] = hidden @ w2[expert_id].transpose(0, 1)
     return (out * weights.view(batch, topk, 1)).sum(dim=1).to(x.dtype)
+
+
+def _logits_diff(reference, actual):
+    """Cosine-style error metric used by AITER's fused-MoE accuracy tests."""
+    reference = reference.double()
+    actual = actual.double()
+    denominator = (reference.square() + actual.square()).sum()
+    if float(denominator) == 0.0:
+        return 0.0 if torch.equal(reference, actual) else float("inf")
+    similarity = 2 * (reference * actual).sum() / denominator
+    return float(1 - similarity)
 
 
 def _build_expert_mask(experts, local_expert_start, local_expert_end, device):
@@ -555,6 +648,8 @@ def _run_one_bs(
     local_experts,
     model_dim,
     inter_dim,
+    quant,
+    activation,
     world_size,
     iters,
     stat_iters,
@@ -660,8 +755,29 @@ def _run_one_bs(
     diagnostic_out = combine_out[:bs]
     if out is not None and bs <= accuracy_max_bs:
         # GEMM2 uses atomic accumulation, so two otherwise identical launches
-        # are not bitwise deterministic. Keep this as a BF16 consistency check.
-        torch.testing.assert_close(out, diagnostic_out, rtol=1e-2, atol=2.5e-1)
+        # are not bitwise deterministic. A8W4 follows AITER's existing
+        # checkAllclose + logits_diff contract instead of a hard max-delta gate.
+        if quant == "a8w4":
+            staged_mismatch = checkAllclose(
+                out,
+                diagnostic_out,
+                rtol=1e-2,
+                atol=1e-2,
+                tol_err_ratio=0.05,
+                printLog=rank == 0,
+            )
+            staged_mismatch = _reduce_float(staged_mismatch, dist.ReduceOp.MAX)
+            staged_logits_diff = _reduce_float(
+                _logits_diff(out, diagnostic_out), dist.ReduceOp.MAX
+            )
+            if staged_mismatch != 0 and staged_logits_diff > 0.01:
+                raise AssertionError(
+                    f"bs={bs} public/staged A8W4 accuracy failed: "
+                    f"mismatch_ratio={staged_mismatch:.6f}, "
+                    f"logits_diff={staged_logits_diff:.6f}"
+                )
+        else:
+            torch.testing.assert_close(out, diagnostic_out, rtol=1e-2, atol=2.5e-1)
 
     def _time_captured_kernel(call):
         for _ in range(3):
@@ -783,13 +899,14 @@ def _run_one_bs(
                     f"gemm2_from_inter_relL2={gemm2_rel_l2:.6f}",
                     flush=True,
                 )
-        ref_moe_out = _torch_moe_situv2_reference(
+        ref_moe_out = _torch_moe_reference(
             recv_tok_bf16[:total_recv],
             w1_deq,
             w2_deq,
             recv_wts[:total_recv],
             recv_idx[:total_recv],
             expert_mask,
+            activation,
         )
         rel_l2 = float(
             torch.linalg.vector_norm(
@@ -798,7 +915,33 @@ def _run_one_bs(
             / torch.linalg.vector_norm(ref_moe_out.float())
         )
         rel_l2 = _reduce_float(rel_l2, dist.ReduceOp.MAX)
-        if rel_l2 >= rtol:
+        if quant == "a8w4":
+            assert torch.isfinite(moe_out_correctness[:total_recv]).all()
+            mismatch_ratio = checkAllclose(
+                ref_moe_out,
+                moe_out_correctness[:total_recv],
+                rtol=1e-2,
+                atol=1e-2,
+                tol_err_ratio=0.05,
+                printLog=rank == 0,
+            )
+            mismatch_ratio = _reduce_float(mismatch_ratio, dist.ReduceOp.MAX)
+            logits_diff = _reduce_float(
+                _logits_diff(ref_moe_out, moe_out_correctness[:total_recv]),
+                dist.ReduceOp.MAX,
+            )
+            if rank == 0 and logits_diff > 1e-3:
+                print(
+                    f"[TestWideEpMoe] warning: bs={bs} A8W4 "
+                    f"logits_diff={logits_diff:.6g} > 1e-3",
+                    flush=True,
+                )
+            if mismatch_ratio != 0 and logits_diff > 0.01:
+                raise AssertionError(
+                    f"bs={bs} A8W4 accuracy failed: mismatch_ratio="
+                    f"{mismatch_ratio:.6f}, logits_diff={logits_diff:.6f}"
+                )
+        elif rel_l2 >= rtol:
             raise AssertionError(f"bs={bs} moe relL2={rel_l2:.6f} exceeds rtol={rtol}")
         assert diagnostic_out.shape == (bs, model_dim)
         assert torch.isfinite(diagnostic_out.float()).all(), "combine output has non-finite values"
@@ -943,6 +1086,7 @@ def _run_one_bs(
     profile_args = (x_fp4_bs, x_scale_bs, topk_weights_bs, topk_ids_bs)
     pipeline_kind = "eager_full_pipeline"
     if torch_compile_cudagraph:
+        op.prepare_torch_compile(*profile_args)
         profiled_call = torch.compile(op.forward_prequant, backend="cudagraphs")
         pipeline_kind = "torch_compile_cudagraph_test_wide_ep_forward"
 
@@ -952,10 +1096,44 @@ def _run_one_bs(
         torch.cuda.synchronize()
         assert compiled_out.shape == out.shape
         assert torch.isfinite(compiled_out.float()).all()
-        torch.testing.assert_close(compiled_out, out, rtol=1e-2, atol=2.5e-1)
+        compiled_rel_l2 = float(
+            torch.linalg.vector_norm((compiled_out - out).float())
+            / torch.linalg.vector_norm(out.float()).clamp_min(1e-30)
+        )
+        compiled_rel_l2 = _reduce_float(compiled_rel_l2, dist.ReduceOp.MAX)
+        if quant == "a8w4":
+            compiled_mismatch = checkAllclose(
+                out,
+                compiled_out,
+                rtol=1e-2,
+                atol=1e-2,
+                tol_err_ratio=0.05,
+                printLog=rank == 0,
+            )
+            compiled_mismatch = _reduce_float(compiled_mismatch, dist.ReduceOp.MAX)
+            compiled_logits_diff = _reduce_float(
+                _logits_diff(out, compiled_out), dist.ReduceOp.MAX
+            )
+            compile_failed = compiled_mismatch != 0 and compiled_logits_diff > 0.01
+        else:
+            compiled_mismatch = 0.0
+            compiled_logits_diff = 0.0
+            compile_failed = compiled_rel_l2 >= rtol
+        if compile_failed:
+            raise AssertionError(
+                f"bs={bs} compiled/eager relL2={compiled_rel_l2:.6f} "
+                f"mismatch_ratio={compiled_mismatch:.6f} "
+                f"logits_diff={compiled_logits_diff:.6f}"
+            )
         _barrier()
         if rank == 0:
-            print(f"[EP16-torch-compile] bs={bs} output check PASS", flush=True)
+            print(
+                f"[EP16-torch-compile] bs={bs} output check PASS "
+                f"relL2={compiled_rel_l2:.6f} "
+                f"mismatch_ratio={compiled_mismatch:.6f} "
+                f"logits_diff={compiled_logits_diff:.6f}",
+                flush=True,
+            )
 
     if torch_profiler_dir:
         from torch.profiler import ProfilerActivity, profile, record_function
@@ -1047,16 +1225,16 @@ def _run_one_bs(
         )
         if perf_out:
             record = {
-                "category": "ep16_a4w4_moe",
+                "category": f"ep16_{quant}_moe",
                 "params": {
                     "world_size": world_size,
                     "bs": bs,
-                    "experts": NETWORK["experts"],
+                    "experts": local_experts * world_size,
                     "local_experts": local_experts,
-                    "topk": NETWORK["topk"],
+                    "topk": topk_ids.shape[1],
                     "model_dim": model_dim,
                     "inter_dim": inter_dim,
-                    "quant_type": "per_1x32_a4w4",
+                    "quant_type": f"per_1x32_{quant}",
                 },
                 "stat_iters": keep,
                 "total_iters": iters,
@@ -1098,8 +1276,9 @@ def _run_one_bs(
                 fh.write(json.dumps(record, sort_keys=True) + "\n")
 
 
-def run_ep16_a4w4(
+def run_ep16(
     local_rank,
+    model_config,
     bs_list,
     iters,
     stat_iters,
@@ -1122,11 +1301,14 @@ def run_ep16_a4w4(
     perf_out = os.environ.get("MORI_PERF_OUT") if rank == 0 else None
 
     try:
-        network = NETWORK
+        network = NETWORKS[model_config]
         experts = network["experts"]
         model_dim = network["model_dim"]
         inter_dim = network["inter_dim"]
         topk = network["topk"]
+        quant = network["quant"]
+        activation = network["activation"]
+        gate_mode = network["gate_mode"]
         if experts % world_size != 0:
             raise ValueError(f"experts={experts} must be divisible by world_size={world_size}")
         local_experts = experts // world_size
@@ -1150,17 +1332,22 @@ def run_ep16_a4w4(
         else:
             (w1_a, w1_s, w2_a, w2_s), (w1_qt, w1_scale, w2_qt, w2_scale) = (
                 _quantize_local_weights(
-                    model_dim, inter_dim, local_experts, rank, seed, device
+                    model_dim, inter_dim, local_experts, rank, seed, device, quant
                 )
             )
         expert_mask = _build_expert_mask(experts, local_expert_start, local_expert_end, device)
 
         if rank == 0:
-            print(f"[EP16-a4w4] routing={routing!r}", flush=True)
+            print(
+                f"[TestWideEpMoe] model={model_config} quant={quant} "
+                f"activation={activation} routing={routing!r}",
+                flush=True,
+            )
 
-        torch_quant_act = aiter.get_torch_quant(QuantType.per_1x32)
-        x_fp4, x_scale = torch_quant_act(x, quant_dtype=dtypes.fp4x2)
-        x_fp4 = x_fp4.view(max_bs, model_dim // 2)
+        from aiter.ops.flydsl.kernels.mega_moe.quant import per_1x32_mx_quant
+
+        quant_mode = "fp4" if quant == "a4w4" else "fp8"
+        x_fp4, x_scale = per_1x32_mx_quant(x, quant_mode=quant_mode)
 
         op = TestWideEpMoe(
             rank=rank,
@@ -1169,7 +1356,9 @@ def run_ep16_a4w4(
             inter_dim=inter_dim,
             experts=experts,
             topk=topk,
-            quant="a4w4",
+            quant=quant,
+            activation=activation,
+            gate_mode=gate_mode,
             w1=w1_a,
             w1_scale=w1_s,
             w2=w2_a,
@@ -1199,6 +1388,8 @@ def run_ep16_a4w4(
                 local_experts,
                 model_dim,
                 inter_dim,
+                quant,
+                activation,
                 world_size,
                 iters,
                 stat_iters,
@@ -1218,6 +1409,12 @@ def run_ep16_a4w4(
 
 def main():
     parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--model-config",
+        choices=sorted(NETWORKS),
+        default="kimi",
+        help="built-in model/quantization preset",
+    )
     parser.add_argument("--bs-list", default="128,512,1024,2048,4096")
     parser.add_argument("--iters", type=int, default=100)
     parser.add_argument(
@@ -1274,8 +1471,9 @@ def main():
     node_rank = int(os.environ["RANK"])
 
     torch.multiprocessing.spawn(
-        run_ep16_a4w4,
+        run_ep16,
         args=(
+            args.model_config,
             bs_list,
             args.iters,
             args.stat_iters,

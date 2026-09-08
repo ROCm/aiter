@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Standalone MORI inter-node EP16 A4W4 MoE operator.
+"""Standalone MORI inter-node EP16 A4W4/A8W4 MoE operator.
 
 This FlyDSL operator is intentionally independent from MegaMoEV2 and its intranode
 implementation.  It only mirrors MegaMoEV2's public calling convention.
@@ -11,6 +11,44 @@ import os
 from dataclasses import dataclass
 
 import torch
+
+
+_TEST_WIDE_EP_INSTANCES = {}
+
+
+@torch.library.custom_op("aiter::test_wide_ep_forward", mutates_args=())
+def _test_wide_ep_forward(
+    x_quant: torch.Tensor,
+    x_scale: torch.Tensor,
+    topk_weight: torch.Tensor,
+    topk_ids: torch.Tensor,
+    instance_id: int,
+    model_dim: int,
+) -> torch.Tensor:
+    """Capture the complete TestWide pipeline behind one Dynamo boundary.
+
+    Keeping dispatch, fused_moe and combine in one opaque node prevents MORI's
+    Python graph breaks from turning the dispatch arena views into inputs of a
+    second cudagraph segment. Those segment inputs otherwise require ten D2D
+    staging copies per replay.
+    """
+    op = _TEST_WIDE_EP_INSTANCES[instance_id]
+    # [agent] MORI's combine result aliases its external symmetric arena, which
+    # is not owned by the cudagraph memory pool. Materialize exactly one
+    # pool-owned public output; this replaces the ten inter-segment copies.
+    return op._forward_prequant_impl(x_quant, x_scale, topk_weight, topk_ids).clone()
+
+
+@_test_wide_ep_forward.register_fake
+def _test_wide_ep_forward_fake(
+    x_quant,
+    x_scale,
+    topk_weight,
+    topk_ids,
+    instance_id,
+    model_dim,
+):
+    return x_quant.new_empty((topk_ids.shape[0], model_dim), dtype=torch.bfloat16)
 
 
 @dataclass
@@ -30,21 +68,23 @@ class TestWideEpMoeContext:
 
 
 class TestWideEpMoe:
-    """EP16 packed-FP4 dispatch/compute/combine implementation using MORI."""
+    """EP16 quantized dispatch/compute/combine implementation using MORI."""
 
     def __init__(
         self, *, rank, world_size, model_dim, inter_dim, experts, topk, quant,
         w1, w1_scale, w2, w2_scale, max_tok_per_rank, gpu_per_node: int = 8,
         mega_scheme: str = "fixedslot", swiglu_limit: float = 0.0,
+        activation=None, gate_mode=None,
     ):
         import mori
-        from aiter import dtypes
+        from aiter import ActivationType, dtypes
         from aiter.jit.utils.chip_info import get_gfx_runtime
+        from aiter.ops.flydsl.moe_common import GateMode
 
         if get_gfx_runtime() != "gfx950":
             raise ValueError("TestWideEpMoe is supported only on gfx950")
-        if quant != "a4w4":
-            raise ValueError("TestWideEpMoe supports quant='a4w4' only")
+        if quant not in ("a4w4", "a8w4"):
+            raise ValueError("TestWideEpMoe supports quant='a4w4' or quant='a8w4'")
         if world_size != 16 or gpu_per_node != 8:
             raise ValueError("TestWideEpMoe requires EP16 (2 nodes x 8 GPUs)")
         if experts % world_size:
@@ -62,6 +102,26 @@ class TestWideEpMoe:
         self.topk = int(topk)
         self.mtpr = int(max_tok_per_rank)
         self.quant = quant
+        if activation is None:
+            activation = ActivationType.Situv2 if quant == "a4w4" else ActivationType.Silu
+        if isinstance(activation, str):
+            activation = {
+                "silu": ActivationType.Silu,
+                "situv2": ActivationType.Situv2,
+            }.get(activation.lower())
+        if activation not in (ActivationType.Silu, ActivationType.Situv2):
+            raise ValueError("activation must be ActivationType.Silu or ActivationType.Situv2")
+        if quant == "a8w4" and activation != ActivationType.Silu:
+            raise ValueError("quant='a8w4' currently supports ActivationType.Silu only")
+        self.activation = activation
+        if gate_mode is None:
+            gate_mode = GateMode.SEPARATED if quant == "a4w4" else GateMode.INTERLEAVE
+        if isinstance(gate_mode, str):
+            gate_mode = GateMode(gate_mode)
+        if gate_mode not in (GateMode.SEPARATED, GateMode.INTERLEAVE):
+            raise ValueError("gate_mode must be separated or interleave")
+        self.gate_mode = gate_mode
+        self.activation_dtype = dtypes.fp4x2 if quant == "a4w4" else dtypes.fp8
         self.mega_scheme = mega_scheme
         self.swiglu_limit = float(swiglu_limit)
         self.capacity_mtpr = 1 << (self.mtpr - 1).bit_length()
@@ -75,10 +135,18 @@ class TestWideEpMoe:
         self.expert_mask[local_start : local_start + self.epr] = 1
         # SiTUv2 otherwise defaults to the BF16-activation A16W4 path. This
         # backend promises packed-FP4 activations, so select A4W4 explicitly.
-        os.environ["AITER_SITUV2_A8W4"] = "0"
-        os.environ["AITER_SITUV2_A4W4"] = "1"
+        if quant == "a4w4" and activation == ActivationType.Situv2:
+            os.environ["AITER_SITUV2_A8W4"] = "0"
+            os.environ["AITER_SITUV2_A4W4"] = "1"
+        elif quant == "a8w4":
+            # Match the established DSV4 serving contract. ATOM_MOE_GU_ITLV
+            # selects the interleaved gate/up layout in the serving frontend;
+            # this standalone op passes that layout explicitly via gate_mode.
+            # The AITER threshold must be zero so decode-sized prequantized FP8
+            # inputs are not reclassified as BF16.
+            os.environ.setdefault("AITER_BF16_FP8_MOE_BOUND", "0")
         cfg = mori.ops.EpDispatchCombineConfig(
-            data_type=dtypes.fp4x2,
+            data_type=self.activation_dtype,
             rank=self.rank,
             world_size=self.world_size,
             hidden_dim=self.model_dim,
@@ -97,8 +165,14 @@ class TestWideEpMoe:
         )
         self.op = mori.ops.EpDispatchCombineOp(cfg)
         self._owner_id = id(self)
+        _TEST_WIDE_EP_INSTANCES[self._owner_id] = self
         self._generation = 0
         self._active_dispatch = None
+
+    def prepare_torch_compile(self, x_quant, x_scale, weights, topk_ids):
+        """Declare the four fixed user inputs used by a cudagraph replay."""
+        for tensor in (x_quant, x_scale, weights, topk_ids):
+            torch._dynamo.mark_static_address(tensor, guard=True)
 
     def _validate_active_dispatch(self, dispatched):
         if not isinstance(dispatched, TestWideEpMoeContext):
@@ -126,25 +200,26 @@ class TestWideEpMoe:
             raise ValueError(f"weights and topk_ids must be on current device {dev}")
         return tokens
 
-    def dispatch_prequant(self, x_fp4, x_scale, weights, topk_ids):
-        from aiter import dtypes
-
+    def dispatch_prequant(self, x_quant, x_scale, weights, topk_ids):
         if self._active_dispatch is not None and not self._active_dispatch._consumed:
             raise RuntimeError("complete the in-flight dispatch with combine before dispatching again")
         tokens = self._validate_routing(weights, topk_ids)
-        if x_fp4.dtype != dtypes.fp4x2 or not x_fp4.is_contiguous():
-            raise ValueError("x_fp4 must be contiguous fp4x2")
-        if tuple(x_fp4.shape) != (tokens, self.model_dim // 2):
-            raise ValueError(f"x_fp4 must have shape ({tokens}, {self.model_dim // 2})")
+        if x_quant.dtype != self.activation_dtype or not x_quant.is_contiguous():
+            raise ValueError(
+                f"x_quant must be contiguous {self.activation_dtype}, got {x_quant.dtype}"
+            )
+        quant_width = self.model_dim // 2 if self.quant == "a4w4" else self.model_dim
+        if tuple(x_quant.shape) != (tokens, quant_width):
+            raise ValueError(f"x_quant must have shape ({tokens}, {quant_width})")
         if not x_scale.is_contiguous() or tuple(x_scale.shape) != (tokens, self.model_dim // 32):
             raise ValueError(f"x_scale must be contiguous with shape ({tokens}, {self.model_dim // 32})")
         # PyTorch/ROCm exposes E8M0 as a dedicated 1-byte dtype on newer
         # builds and as uint8 storage on older ones. MORI accepts both forms.
         if x_scale.element_size() != 1:
             raise ValueError("x_scale must use 1-byte E8M0 storage")
-        if x_fp4.device != self.dev or x_scale.device != self.dev:
-            raise ValueError(f"x_fp4 and x_scale must be on current device {self.dev}")
-        recv = self.op.dispatch(x_fp4, weights, x_scale, topk_ids)
+        if x_quant.device != self.dev or x_scale.device != self.dev:
+            raise ValueError(f"x_quant and x_scale must be on current device {self.dev}")
+        recv = self.op.dispatch(x_quant, weights, x_scale, topk_ids)
         self._generation += 1
         dispatched = TestWideEpMoeContext(
             tokens=recv[0], weights=recv[1], scales=recv[2], expert_ids=recv[3],
@@ -161,18 +236,18 @@ class TestWideEpMoe:
             raise ValueError(f"x_bf16 must have shape (tokens, {self.model_dim})")
         if x_bf16.device != self.dev:
             raise ValueError(f"x_bf16 must be on current device {self.dev}")
-        x_fp4, x_scale = self.quantize(x_bf16)
-        return self.dispatch_prequant(x_fp4, x_scale, weights, topk_ids)
+        x_quant, x_scale = self.quantize(x_bf16)
+        return self.dispatch_prequant(x_quant, x_scale, weights, topk_ids)
 
     def quantize(self, x_bf16):
         from .kernels.mega_moe.quant import per_1x32_mx_quant
 
-        return per_1x32_mx_quant(x_bf16, quant_mode="fp4")
+        quant_mode = "fp4" if self.quant == "a4w4" else "fp8"
+        return per_1x32_mx_quant(x_bf16, quant_mode=quant_mode)
 
     def fused_moe(self, dispatched: TestWideEpMoeContext):
-        from aiter import ActivationType, QuantType, dtypes
+        from aiter import QuantType, dtypes
         from aiter.fused_moe import fused_moe as run_fused_moe
-        from aiter.ops.flydsl.moe_common import GateMode
 
         self._validate_active_dispatch(dispatched)
         for name in ("tokens", "weights", "scales", "expert_ids", "num_tokens"):
@@ -181,8 +256,8 @@ class TestWideEpMoe:
                 raise ValueError(f"dispatched.{name} must be on current device {self.dev}")
         return run_fused_moe(
             dispatched.tokens, self.w1, self.w2, dispatched.weights, dispatched.expert_ids,
-            expert_mask=self.expert_mask, activation=ActivationType.Situv2,
-            gate_mode=GateMode.SEPARATED.value, quant_type=QuantType.per_1x32,
+            expert_mask=self.expert_mask, activation=self.activation,
+            gate_mode=self.gate_mode.value, quant_type=QuantType.per_1x32,
             w1_scale=self.w1_scale, w2_scale=self.w2_scale, a1_scale=dispatched.scales,
             num_local_tokens=dispatched.num_tokens[:1].to(dtypes.i32), dtype=torch.bfloat16,
         )
@@ -213,10 +288,21 @@ class TestWideEpMoe:
         return self.combine(local_output, dispatched)[0]
 
     def forward_prequant(
-        self, x_fp4, x_scale, weights, topk_ids, *, stream=None, slice_output=True
+        self, x_quant, x_scale, weights, topk_ids, *, stream=None, slice_output=True
     ):
         self._validate_public_options(stream, slice_output)
-        dispatched = self.dispatch_prequant(x_fp4, x_scale, weights, topk_ids)
+        # [agent] Capture the complete communication + compute pipeline as one
+        # TestWide-local op. A GEMM-only boundary leaves MORI dispatch outputs at
+        # a graph-segment boundary and merely changes how its D2D copies appear
+        # in ROCTracer instead of removing them.
+        if torch.compiler.is_compiling():
+            return _test_wide_ep_forward(
+                x_quant, x_scale, weights, topk_ids, self._owner_id, self.model_dim
+            )
+        return self._forward_prequant_impl(x_quant, x_scale, weights, topk_ids)
+
+    def _forward_prequant_impl(self, x_quant, x_scale, weights, topk_ids):
+        dispatched = self.dispatch_prequant(x_quant, x_scale, weights, topk_ids)
         if os.environ.get("AITER_DEBUG_WIDE_EP", "0") == "1":
             print(f"[TestWideEpMoe rank={self.rank}] dispatch complete", flush=True)
         local_output = self.fused_moe(dispatched)
