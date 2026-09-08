@@ -1,25 +1,33 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
+"""MHC config loading: ``get_mhc_config()`` / ``get_mhc_post_config()``,
+with the documented gfx942 arch fallback, on top of the shared core in
+``config_utils``.
+"""
+
 import functools
 import glob
 import os
 import re
 
 from aiter.ops.triton.utils._triton import arch_info
-from aiter.ops.triton.utils.core import (
+from aiter.ops.triton.utils.logger import AiterTritonLogger
+
+logger = AiterTritonLogger()
+
+from aiter.ops.triton.utils.config_utils import (
     USE_LRU_CACHE,
     load_config_json,
+    resolve_config_dir,
 )
-from aiter.ops.triton.utils.gemm_config_utils import resolve_config_dir
 
 _FALLBACK_DEV = "gfx942"
 
 
-def _config_dir(dev: str, config_name: str) -> str:
+def _mhc_config_dir(dev: str, config_name: str) -> str:
     """``dev``'s nested config directory for the ``config_name`` family."""
-    cfg_dir, _ = resolve_config_dir("mhc", config_name, backend="triton", arch=dev)
-    return cfg_dir
+    return resolve_config_dir("mhc", config_name, backend="triton", arch=dev)
 
 
 def _load_with_fallback(
@@ -28,11 +36,11 @@ def _load_with_fallback(
     """Load ``fname`` from ``dev``'s ``config_name`` directory, falling back to
     the gfx942 copy for arches without tuned MHC configs (may be suboptimal)."""
     config = load_config_json(
-        f"{_config_dir(dev, config_name)}/{fname}", required=False
+        f"{_mhc_config_dir(dev, config_name)}/{fname}", required=False
     )
     if config is None:
         config = load_config_json(
-            f"{_config_dir(_FALLBACK_DEV, config_name)}/{fname}", required=required
+            f"{_mhc_config_dir(_FALLBACK_DEV, config_name)}/{fname}", required=required
         )
     return config
 
@@ -43,7 +51,7 @@ def _c_thresholds(dev: str, actual_config_name: str) -> tuple[int, ...]:
     gfx942 fallback), sorted ascending."""
     thresholds = set()
     for d in {dev, _FALLBACK_DEV}:
-        cfg_dir = _config_dir(d, actual_config_name)
+        cfg_dir = _mhc_config_dir(d, actual_config_name)
         pattern = f"{cfg_dir}/{actual_config_name}-C=*.json"
         for fpath in glob.glob(pattern):
             match = re.search(r"-C=(\d+)\.json$", os.path.basename(fpath))
@@ -152,7 +160,7 @@ def get_mhc_post_config(M: int, C: int) -> dict:
     Picks the largest ``C_<value> <= C``, else ``"default"``.
     """
     dev = arch_info.get_arch()
-    cfg = load_config_json(f"{_config_dir(dev, 'MHC_POST')}/DEFAULT.json")
+    cfg = load_config_json(f"{_mhc_config_dir(dev, 'MHC_POST')}/DEFAULT.json")
 
     c_thresholds = sorted(
         int(k[2:]) for k in cfg if k.startswith("C_") and k[2:].isdigit()

@@ -122,15 +122,11 @@ def compile_gemm2_a4w4_port(
     SBM=None,
     persist=False,
     cu_num=0,
-    has_pad=False,
     g2_bhoist=None,
     g2_ascale_pf=None,
     g2_spart=None,
     g2_bf16_lds=None,
     g2_kstatic=False,
-    k_valid_halves=None,
-    has_kpad=False,
-    has_npad=False,
     out_dtype="bf16",
     enable_bias=False,
     g2_prefetch_ids=False,
@@ -211,13 +207,8 @@ def compile_gemm2_a4w4_port(
     K_TILES_RT_MAX = INTER_MAX // BK
     g2_apre = g2_kstatic and aStages >= K_TILES_RT_MAX
     a_preload = min(aStages, K_TILES_RT_MAX) if g2_apre else kStages
-    total_k_halves = K_TILES_RT_MAX * (BK // 128)
-    if k_valid_halves is None:
-        k_valid_halves = total_k_halves
-    if k_valid_halves < 0 or k_valid_halves > total_k_halves:
-        raise AssertionError(
-            f"k_valid_halves must be in [0, {total_k_halves}], " f"got {k_valid_halves}"
-        )
+    # N_OUT = model_dim/hidden is runtime; HIDDEN_MAX is a compile/cache bucket
+    # so different runtime hidden sizes can reuse one compiled launcher.
     assert (
         HIDDEN_MAX % BN == 0
     ), f"HIDDEN_MAX must be a multiple of {BN}, got {HIDDEN_MAX}"
@@ -236,9 +227,6 @@ def compile_gemm2_a4w4_port(
             "Use persist only with a_dtype='fp4', or run a8w4 with persist=False."
         )
     persist_tag = "" if not persist else f"_persist_cu{cu_num}"
-    pad_tag = (
-        "_pad" if has_pad else ""
-    )  # has_pad adds the runtime pad kernarg + weight-OOB pad-skip
     bh_tag = "_bhoist" if g2_bhoist else ""
     apf_tag = "_apf" if g2_ascale_pf else ""
     spart_tag = f"_spart{g2_group_num}x{g2_m01}" if g2_spart > 0 else ""
@@ -252,12 +240,8 @@ def compile_gemm2_a4w4_port(
     out_tag = "_fp8out" if route_out_fp8 else ""
     tile_tag = "" if (BN, BK) == (256, 256) else f"_bn{BN}_bk{BK}"
     bias_tag = "_bias" if enable_bias else ""
-    kh_tag = (
-        f"_kh{k_valid_halves}" if has_pad and k_valid_halves < total_k_halves else ""
-    )
-    pad_mode_tag = f"_kp{int(has_kpad)}_np{int(has_npad)}" if has_pad else ""
     g2_epi_lanes = _pick_epi_lanes(BM, BN, route_out_fp8, g2_scale_blk)
-    tag = f"hmax{HIDDEN_MAX}_imax{INTER_MAX}_bm{BM}{tile_tag}{'_nt' if use_nt else ''}_{etag}{atag}{btag}{sbm_tag}{persist_tag}{pad_tag}{pad_mode_tag}{kh_tag}{bh_tag}{apf_tag}{spart_tag}{bf16lds_tag}{dw_tag}{kst_tag}{pitch_tag}{sblk_tag}{out_tag}{bias_tag}_v2_biasabi6"
+    tag = f"hmax{HIDDEN_MAX}_imax{INTER_MAX}_bm{BM}{tile_tag}{'_nt' if use_nt else ''}_{etag}{atag}{btag}{sbm_tag}{persist_tag}{bh_tag}{apf_tag}{spart_tag}{bf16lds_tag}{dw_tag}{kst_tag}{pitch_tag}{sblk_tag}{out_tag}{bias_tag}_v2_biasabi7"
     name = f"gemm2_a4w4_port_{tag}" + ("_idpf" if g2_prefetch_ids else "")
 
     @fx.struct
@@ -283,13 +267,9 @@ def compile_gemm2_a4w4_port(
         i32_max_m_blocks,
         i32_inter,
         i32_hidden,
-        i32_kpad,
-        i32_npad,
         i32_grid_blocks,
     ):
-        # Shared body for both has_pad variants (@flyc.jit -> rewriter recurses scf if / grid-stride); default passes i32_kpad/i32_npad=0 (no kernarg), folding pad math away.
-        n_actual = i32_hidden
-        num_n_blocks = _udiv(n_actual, BN)
+        num_n_blocks = _udiv(i32_hidden, BN)
         k_bytes = _udiv(i32_inter, 1 if is_f8 else 2)
         aq_num = fx.Int64(i32_max_m_blocks) * fx.Int64(BM * k_bytes)
         lds = fx.SharedAllocator().allocate(SharedStorage).peek()
@@ -331,9 +311,7 @@ def compile_gemm2_a4w4_port(
                 wave,
                 arg_aq,
                 i32_inter,
-                n_actual,
-                i32_kpad,
-                i32_npad,
+                i32_hidden,
                 BM=BM,
                 BN=BN,
                 BK=BK,
@@ -346,7 +324,6 @@ def compile_gemm2_a4w4_port(
                 b_dtype=b_dtype,
                 use_reduce=use_reduce,
                 topk=topk,
-                has_pad=has_pad,
                 SBM=SBM,
                 g2_bhoist=g2_bhoist,
                 g2_ascale_pf=g2_ascale_pf,
@@ -358,9 +335,6 @@ def compile_gemm2_a4w4_port(
                 g2_epi_lanes=g2_epi_lanes,
                 g2_apre=g2_apre,
                 enable_bias=enable_bias,
-                k_valid_halves=k_valid_halves,
-                has_kpad=has_kpad,
-                has_npad=has_npad,
                 g2_prefetch_ids=g2_prefetch_ids,
                 mn_idx=mn_idx,
             )
@@ -443,8 +417,6 @@ def compile_gemm2_a4w4_port(
         i32_max_m_blocks: fx.Int32,
         i32_inter: fx.Int32,
         i32_hidden: fx.Int32,
-        i32_kpad: fx.Int32,
-        i32_npad: fx.Int32,
         arg_out: fx.Int64,
         arg_out_scale: fx.Int64,  # unused (atomic epilog); kept for signature parity
         i32_grid_blocks: fx.Int32,
@@ -473,8 +445,6 @@ def compile_gemm2_a4w4_port(
             i32_max_m_blocks,
             i32_inter,
             i32_hidden,
-            i32_kpad,
-            i32_npad,
             i32_grid_blocks,
         )
 
@@ -494,8 +464,6 @@ def compile_gemm2_a4w4_port(
         i32_grid_blocks: fx.Int32,
         i32_inter: fx.Int32,
         i32_hidden: fx.Int32,
-        i32_kpad: fx.Int32,
-        i32_npad: fx.Int32,
         arg_out: fx.Int64,
         arg_out_scale: fx.Int64,
         stream: fx.Stream,
@@ -517,8 +485,6 @@ def compile_gemm2_a4w4_port(
             i32_max_m_blocks,
             i32_inter,
             i32_hidden,
-            i32_kpad,
-            i32_npad,
             arg_out,
             arg_out_scale,
             i32_grid_blocks,
@@ -545,14 +511,10 @@ def get_g2(
     SBM=None,
     persist=False,
     cu_num=0,
-    has_pad=False,
     out_dtype="bf16",
     g2_bf16_lds=None,
     g2_spart=None,
     g2_kstatic=False,
-    k_valid_halves=None,
-    has_kpad=False,
-    has_npad=False,
     enable_bias=False,
     g2_prefetch_ids=False,
 ):
@@ -588,15 +550,11 @@ def get_g2(
         SBM,
         persist,
         cu_key,
-        has_pad,
         g2_bhoist,
         g2_ascale_pf,
         g2_spart,
         g2_bf16_lds,
         g2_kstatic,
-        k_valid_halves,
-        has_kpad,
-        has_npad,
         out_dtype,
         enable_bias,
         g2_prefetch_ids,
@@ -617,15 +575,11 @@ def get_g2(
             SBM=SBM,
             persist=persist,
             cu_num=cu_key,
-            has_pad=has_pad,
             g2_bhoist=g2_bhoist,
             g2_ascale_pf=g2_ascale_pf,
             g2_spart=g2_spart,
             g2_bf16_lds=g2_bf16_lds,
             g2_kstatic=g2_kstatic,
-            k_valid_halves=k_valid_halves,
-            has_kpad=has_kpad,
-            has_npad=has_npad,
             out_dtype=out_dtype,
             enable_bias=enable_bias,
             g2_prefetch_ids=g2_prefetch_ids,
@@ -676,8 +630,6 @@ def mxfp4_moe_gemm2(
     persist=False,
     cu_num=0,
     n_sorted_padded=None,
-    inter_dim_pad=0,
-    model_dim_pad=0,
     out_dtype="bf16",
     HIDDEN_MAX=8192,
     INTER_MAX=8192,
@@ -687,14 +639,13 @@ def mxfp4_moe_gemm2(
     bias=None,
     is_ep=False,
 ):
-    """Stage-2 down-proj gemm; epilog 'atomic' (weighted atomic.fadd) or 'reduce' (store into out[token_id*topk+slot]). inter_dim_pad/model_dim_pad>0 enable has_pad pad-skip (both 0 -> byte-identical); persist = fixed cu_num m-slot grid (default OFF)."""
+    """Stage-2 down-proj gemm for unpadded dimensions."""
     import torch
 
     _validate_v2_gemm2_dtypes(a_dtype, b_dtype)
     if persist and cu_num <= 0:
         cu_num = get_cu_num()
     SBM = _norm_sbm(SBM, BM)
-    has_pad = inter_dim_pad > 0 or model_dim_pad > 0
     if BN not in (128, 256, 512):
         raise AssertionError(f"BN must be one of (128, 256, 512), got {BN}")
     if BK not in (128, 256):
@@ -716,14 +667,6 @@ def mxfp4_moe_gemm2(
         raise AssertionError(
             f"D_INTER ({D_INTER}) exceeds compile cap INTER_MAX ({INTER_MAX})"
         )
-    if not 0 <= inter_dim_pad <= D_INTER:
-        raise AssertionError(
-            f"inter_dim_pad must be in [0, {D_INTER}], got {inter_dim_pad}"
-        )
-    if not 0 <= model_dim_pad <= D_HIDDEN:
-        raise AssertionError(
-            f"model_dim_pad must be in [0, {D_HIDDEN}], got {model_dim_pad}"
-        )
     if (
         str(out_dtype).strip().lower() == "bf16"
         and getattr(out, "dtype", None) != torch.bfloat16
@@ -740,11 +683,6 @@ def mxfp4_moe_gemm2(
     _kstatic = os.environ.get("MXFP4_G2_KSTATIC", "1") == "1"
     if _kstatic:
         INTER_MAX = D_INTER
-    real_k = D_INTER - inter_dim_pad
-    # Keep the half containing a partial real-K tail, matching v1. This
-    # skips complete trailing halves while allowing the final partial half
-    # to perform its unavoidable extra work (e.g. GPT-OSS 2880 -> 3072).
-    k_valid_halves = (real_k + 127) // 128
     if bias is not None:
         if bias.dtype != torch.float32:
             bias = bias.to(torch.float32)
@@ -775,13 +713,9 @@ def mxfp4_moe_gemm2(
         SBM=SBM,
         persist=persist,
         cu_num=cu_num,
-        has_pad=has_pad,
         out_dtype=out_dtype,
         g2_bf16_lds=g2_bf16_lds,
         g2_spart=g2_spart,
-        k_valid_halves=k_valid_halves,
-        has_kpad=inter_dim_pad > 0,
-        has_npad=model_dim_pad > 0,
         enable_bias=bias is not None,
         g2_prefetch_ids=g2_prefetch_ids,
     )
@@ -798,8 +732,6 @@ def mxfp4_moe_gemm2(
             _active_m_blocks_upper_bound(M_logical, topk, NE, BM, SBM),
         )
     out_scale = out  # unused by the atomic epilog; any valid device ptr is fine
-    # i32_kpad (inter_dim_pad) + i32_npad (model_dim_pad) are always threaded after
-    # i32_hidden; when has_pad is False they are 0 and the kernel folds pad math away.
     run_compiled(
         launch,
         inter_sorted_quant.data_ptr(),
@@ -816,8 +748,6 @@ def mxfp4_moe_gemm2(
         grid_blocks,
         D_INTER,
         D_HIDDEN,
-        int(inter_dim_pad),
-        int(model_dim_pad),
         out.data_ptr(),
         out_scale.data_ptr(),
         torch.cuda.current_stream() if stream is None else stream,

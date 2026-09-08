@@ -54,6 +54,15 @@ from aiter.ops.flydsl.moe_common import (
     DEFAULT_SITUV2_LINEAR_BETA,
     get_flydsl_activation_name,
 )
+from aiter.ops.flydsl.moe_kernels import (
+    flydsl_moe_stage1,
+    flydsl_moe_stage2,
+    get_flydsl_stage1_kernels,
+    get_flydsl_stage1_kernels_int4_bf16,
+    get_flydsl_stage2_kernels,
+    get_flydsl_stage2_kernels_int4_bf16,
+    get_flydsl_stage2_v2_kernels,
+)
 from aiter.ops.flydsl.mxfp4_kname import (
     _parse_mxfp4_g1_kname,
     parse_g2_kname_any,
@@ -71,48 +80,23 @@ from aiter.utility import fp4_utils
 from aiter.utility.base_tuner import TunerCommon
 from aiter.utility.fp4_utils import moe_mxfp4_sort
 from aiter.utility.mp_tuner import mp_tuner
+from csrc.ck_gemm_moe_2stages_codegen.mxfp4_v2_tune_utils import (
+    build_v2_inputs as _v2_build_inputs,
+)
+from csrc.ck_gemm_moe_2stages_codegen.mxfp4_v2_tune_utils import (
+    gen as _v2_gen,
+)
+from csrc.ck_gemm_moe_2stages_codegen.mxfp4_v2_tune_utils import (
+    populate_v2_intermediate_from_ref as _v2_populate_stage2,
+)
+from csrc.ck_gemm_moe_2stages_codegen.mxfp4_v2_tune_utils import (
+    v2_stage1_sorted_ref as _v2_stage1_ref,
+)
 from csrc.opus_moe.opus_moe_common import (
     OPUS_A8W4_GFX950_DECODE_KERNEL_CONTRACT,
     get_opus_a8w4_stage2_kernels,
     opus_a8w4_stage1_instances_for_shape,
 )
-
-try:
-    from aiter.ops.flydsl.utils import is_flydsl_available
-except ImportError:
-
-    def is_flydsl_available():
-        return False
-
-
-if is_flydsl_available():
-    try:
-        from aiter.ops.flydsl.moe_kernels import (
-            flydsl_moe_stage1,
-            flydsl_moe_stage2,
-            get_flydsl_stage1_kernels,
-            get_flydsl_stage1_kernels_int4_bf16,
-            get_flydsl_stage2_kernels,
-            get_flydsl_stage2_kernels_int4_bf16,
-            get_flydsl_stage2_v2_kernels,
-        )
-        from aiter.ops.flydsl.mxfp4_v2_tune_utils import (
-            build_v2_inputs as _v2_build_inputs,
-        )
-        from aiter.ops.flydsl.mxfp4_v2_tune_utils import (
-            gen as _v2_gen,
-        )
-        from aiter.ops.flydsl.mxfp4_v2_tune_utils import (
-            populate_v2_intermediate_from_ref as _v2_populate_stage2,
-        )
-        from aiter.ops.flydsl.mxfp4_v2_tune_utils import (
-            v2_stage1_sorted_ref as _v2_stage1_ref,
-        )
-    except ImportError:
-
-        def is_flydsl_available():
-            return False
-
 
 sys.path.insert(0, f"{AITER_CSRC_DIR}/ck_gemm_moe_2stages_codegen/")
 from gemm_moe_ck2stages_common import get_gemm1_kernels_list, get_gemm2_kernels_list
@@ -448,15 +432,12 @@ class FmoeTuner(TunerCommon):
     }
 
     def _clear_op_caches(self):
-        try:
-            import aiter.fused_moe as fmoe_module
+        import aiter.fused_moe as fmoe_module
 
-            if hasattr(fmoe_module, "cfg_2stages"):
-                fmoe_module.cfg_2stages = None
-            if hasattr(fmoe_module, "get_2stage_cfgs"):
-                fmoe_module.get_2stage_cfgs.cache_clear()
-        except ImportError:
-            pass
+        if hasattr(fmoe_module, "cfg_2stages"):
+            fmoe_module.cfg_2stages = None
+        if hasattr(fmoe_module, "get_2stage_cfgs"):
+            fmoe_module.get_2stage_cfgs.cache_clear()
 
     def _setup_specific_arguments(self):
 
@@ -1114,8 +1095,6 @@ class FmoeTuner(TunerCommon):
             SBM=sbm,
             persist=kparams["persist"],
             n_sorted_padded=n,
-            model_dim_pad=0,
-            inter_dim_pad=0,
         )
         if epilog == "reduce":
             from aiter.ops.flydsl.moe_kernels import _run_moe_reduction
@@ -3426,8 +3405,6 @@ class FmoeTuner(TunerCommon):
 
     def gen_flydsl_2stages_task(self, info, blockMs):
         tasks_flydsl = []
-        if not is_flydsl_available():
-            return tasks_flydsl
         (
             _gfx,
             _cu_num,
@@ -3473,7 +3450,8 @@ class FmoeTuner(TunerCommon):
         )
 
         for blockM in blockMs:
-            if blockM not in [32, 64, 128] or not use_g1u1:
+            # 16 included: a16w4/a8w4 emit t16 names, s1_tile_m drops the rest.
+            if blockM not in [16, 32, 64, 128] or not use_g1u1:
                 continue
             for kname, kparams in flydsl_s1_kernels.items():
                 is_splitk = kparams.get("k_batch", 1) > 1
@@ -3503,7 +3481,8 @@ class FmoeTuner(TunerCommon):
                 # otherwise pick it. Require num_acc_n >= 1 for a16w4.
                 if a_dtype_str == "bf16":
                     _n_waves = max(1, 4 // _kw)
-                    if (kparams["tile_n"] // _n_waves) < 16:
+                    # Match the kernel assert; a floor divide lets tile_n=96 through.
+                    if kparams["tile_n"] % (16 * _n_waves) != 0:
                         continue
 
                 # (kernel_name, kparams, is_fp4, is_fp8)
@@ -3670,13 +3649,13 @@ class FmoeTuner(TunerCommon):
                 # Skip a16w-mix stage2 candidates the port can't run correctly:
                 #  - _sbm (tile_m<blockM) re-tiles the SORTED [sorted_size, inter]
                 #    stream finer than the moe_sorting padding -> queue fault;
-                #  - tile_n=256 over-allocates LDS at large tile_m (compile failure
-                #    that takes the worker pool down); tile_n=128 covers the shape;
+                #  - LDS is tile_m*(tile_k*2 + tile_n*4); over 160 KiB the build fails;
                 #  - tile_k must divide inter_dim (K); tile_k=256 on non-256 inter
                 #    (e.g. 384) is parsed verbatim by the wrapper -> OOB/wrong out.
+                _s2_lds = s2_tile_m * (kparams["tile_k"] * 2 + kparams["tile_n"] * 4)
                 if a_dtype_str == "bf16" and (
                     s2_tile_m != blockM
-                    or kparams["tile_n"] == 256
+                    or _s2_lds > 160 * 1024
                     or inter_dim % kparams["tile_k"] != 0
                 ):
                     continue
@@ -3780,8 +3759,6 @@ class FmoeTuner(TunerCommon):
 
     def gen_flydsl_v2_2stages_task(self, info, blockMs):
         tasks = []
-        if not is_flydsl_available():
-            return tasks
         (
             _gfx,
             _cu_num,
@@ -3817,7 +3794,9 @@ class FmoeTuner(TunerCommon):
         out_dtype_str = "bf16"
         s1_kernels = get_flydsl_stage1_kernels(adtype, bdtype, out_dtype_str)
 
-        from aiter.ops.flydsl.mxfp4_v2_tune_utils import v2_stage1_dequant_cosine_err
+        from csrc.ck_gemm_moe_2stages_codegen.mxfp4_v2_tune_utils import (
+            v2_stage1_dequant_cosine_err,
+        )
 
         for blockM in blockMs:
             if blockM not in (32, 64, 128):
@@ -4260,8 +4239,6 @@ class FmoeTuner(TunerCommon):
 
     def gen_flydsl_i4_2stages_task(self, info, blockMs):
         tasks_flydsl = []
-        if not is_flydsl_available():
-            return tasks_flydsl
         (
             _gfx,
             _cu_num,
@@ -6201,14 +6178,20 @@ class Mxfp4FlydslTuner(FmoeTuner):
         """The GEMM1 activation tag for this row.
 
         Folding Situv2 into Silu makes the tuner write a name without
-        `_situv2`, which fused_moe then rejects on activation mismatch.
+        `_situv2`, which fused_moe then rejects on activation mismatch. Anything
+        MXMOE has no kernel for (Gelu, GeluTanh, ...) must raise rather than fall
+        through to Silu, or the row is tuned and validated against a SiLU
+        reference and ships as a silently wrong activation.
         """
         act_type = str(row.get("act_type", ""))
-        if act_type.endswith("Situv2"):
-            return "situv2"
-        if act_type.endswith("Swiglu"):
-            return "swiglu"
-        return "silu"
+        for suffix, tag in (
+            ("Situv2", "situv2"),
+            ("Swiglu", "swiglu"),
+            ("Silu", "silu"),
+        ):
+            if act_type.endswith(suffix):
+                return tag
+        raise ValueError(f"no MXMOE GEMM1 kernel for activation {act_type!r}")
 
     @staticmethod
     def _g2_kname(bm, use_nt, epilog):
@@ -6245,24 +6228,17 @@ class Mxfp4FlydslTuner(FmoeTuner):
         return cand
 
     def _candidate_rows(self, row):
-        from aiter.ops.flydsl.mxfp4_gemm2_kernels import _SUPPORTED as G2
-
-        g2_bms = {v[0] for v in G2}
         cands = []
         for g1 in self._g1_variants(row):
             bm = g1["bm"]
             kn1 = self._g1_kname(**g1)
-            # (A) native mxmoe g2 candidates (flydsl_mxmoe_g2_a4w4_*).
-            if bm in g2_bms:
-                for _, n2, ep in sorted(v for v in G2 if v[0] == bm):
-                    cands.append(
-                        self._candidate_row(row, bm, kn1, self._g2_kname(bm, n2, ep))
-                    )
-            # (B) path B: flydsl_moe2_layout g2 candidates coupled with this
-            # mxmoe g1. Only the native SBM==tile_m==bm variants (verified
-            # correct for BM in {16,32,64,128} x {atomic,reduce}); re-tiling
-            # (tile_m<bm) is not enabled. Selected e2e-fastest by
-            # _tune_one_shape.
+            # a4w4 pairs flydsl_mxmoe_g1_* with flydsl_moe2_layout_* only. The
+            # native flydsl_mxmoe_g2_a4w4_* family is deliberately not proposed:
+            # its BK=256 contraction requires D_INTER % 256 == 0, so it cannot
+            # serve inter_dim like 384, and the layout family covers the same
+            # tile space with the sort_block_m contract the port's intermediate
+            # needs. Only native SBM==tile_m==bm variants are used; re-tiling
+            # (tile_m < bm) is not supported by that layout.
             for kn2v, kp in get_flydsl_stage2_v2_kernels(
                 "fp4",
                 "fp4",
@@ -6314,10 +6290,18 @@ class Mxfp4FlydslTuner(FmoeTuner):
     def _port_e2e(data, kn1, kn2, topk, ne, h, dtype):
         # kn2 may name either gemm2 family (path B or native mxmoe).
         _g2 = parse_g2_kname_any(kn2)
-        BM = _g2["BM"]
         atomic = _g2["atomic"]
         p1 = _parse_mxfp4_g1_kname(kn1)
-        BM1 = p1["BM"]
+        # One block_m for the whole pipeline, taken from kernelName1 -- mirrors
+        # production, where metadata.block_m comes from kernelName1 and feeds the
+        # sort, the prequant, stage1 and stage2 alike. _candidate_rows only pairs
+        # a g1 with a g2 of the same tile_m, so the two always agree today;
+        # assert it rather than reading both, so relaxing that pairing cannot
+        # silently desync the prequant's block stride from the sorted_ids it walks.
+        BM = p1["BM"]
+        assert (
+            _g2["BM"] == BM
+        ), f"block_m mismatch between {kn1!r} (BM={BM}) and {kn2!r} (BM={_g2['BM']})"
         M = data["input"].shape[0]
         sti, sw, sei, nvi, moe_buf, m_indices, reverse_sorted = moe_sorting(
             data["topk_ids"],
@@ -6330,8 +6314,23 @@ class Mxfp4FlydslTuner(FmoeTuner):
             output_aux="opus",
         )
         moe_out = moe_buf if moe_buf.numel() else torch.empty((M, h), dtype=dtype)
+        stage1_input = data["input"]
+        stage1_scale = None
+        # Keep the tuner aligned with the production fused_moe_2stages pipeline:
+        # BM16 quantizes inline; the other A4W4 variants consume the fused Opus
+        # prequant output.
+        if BM != 16:
+            stage1_input, stage1_scale = aiter.fused_dynamic_mxfp4_quant_moe_sort(
+                input=data["input"],
+                sorted_ids=sti,
+                num_valid_ids=nvi,
+                token_num=M,
+                topk=topk,
+                block_size=BM,
+                sorted_weights=sw,
+            )
         inter_q, inter_s = _mxfp4_a4w4_stage1_fw(
-            data["input"],
+            stage1_input,
             data["w1_a16"],
             data["w2_a16"],
             sti,
@@ -6339,7 +6338,8 @@ class Mxfp4FlydslTuner(FmoeTuner):
             nvi,
             None,
             topk,
-            block_m=BM1,
+            block_m=BM,
+            a1_scale=stage1_scale,
             w1_scale=data["w1s_a16"],
             kernelName1=kn1,
             m_indices=m_indices,
@@ -6506,25 +6506,26 @@ class Mxfp4FlydslTuner(FmoeTuner):
             return [self._tune_one_shape(row, args) for row in rows]
 
         # One fresh process per shape (memory fully released between shapes),
-        # spread across mp_num GPUs. A shared queue hands out distinct GPU ids so
-        # the mp_num concurrent workers never collide on the same device.
+        # spread across mp_num GPUs, each on a distinct device.
         import multiprocessing as _mp
 
         print(
             f"[mxfp4-port] tuning {len(rows)} shapes across {mp_num} GPUs", flush=True
         )
         ctx = _mp.get_context("spawn")
-        mgr = ctx.Manager()
-        gpu_q = mgr.Queue()
-        for g in range(mp_num):
-            gpu_q.put(g)
-        payloads = [(self.keys, row, args, gpu_q) for row in rows]
-        with ctx.Pool(processes=mp_num, maxtasksperchild=1) as pool:
-            # chunksize=1 so each shape is its own task: with maxtasksperchild=1
-            # the worker is torn down after every shape (memory fully released,
-            # and one process never spans multiple GPUs via the shared queue).
-            results = pool.map(_mxfp4_tune_shape_worker, payloads, chunksize=1)
-        return results
+        payloads = [(self.keys, row, args, None) for row in rows]
+        results = _run_shapes_isolated(payloads, mp_num, ctx)
+        # A None means the shape's process died mid-shape (e.g. a C++ abort()).
+        # Report it as a failed shape rather than dropping it, so the run
+        # finishes and the failure shows up in the summary.
+        return [
+            (
+                res
+                if res is not None
+                else _mxfp4_failed_row(self.keys, row, "FAILED: worker died mid-shape")
+            )
+            for row, res in zip(rows, results)
+        ]
 
     def post_process(self, results, args, topk=-1, fast_mode=False):
         del args, topk, fast_mode
@@ -6553,10 +6554,10 @@ class Mxfp4FlydslTuner(FmoeTuner):
 
 
 def _mxfp4_tune_shape_worker(payload):
-    """Spawned worker: tune one shape on a queue-assigned GPU (for --mxfp4-flydsl
-    --mp). Rebuilds a minimal tuner since the instance need only carry ``keys``."""
-    keys, row, args, gpu_q = payload
-    gpu = gpu_q.get()
+    """Spawned worker: tune one shape on the parent-assigned GPU (for
+    --mxfp4-flydsl --mp). Rebuilds a minimal tuner since the instance need only
+    carry ``keys``."""
+    keys, row, args, gpu = payload
     try:
         torch.cuda.set_device(gpu)
         tuner = Mxfp4FlydslTuner.__new__(Mxfp4FlydslTuner)
@@ -6569,16 +6570,84 @@ def _mxfp4_tune_shape_worker(payload):
         return tuner._tune_one_shape(row, args)
     except Exception as exc:  # noqa: BLE001
         # Catastrophic (non per-candidate) failure: record as a failed shape so
-        # the pool keeps going instead of aborting the whole run.
-        best = Mxfp4FlydslTuner.__new__(Mxfp4FlydslTuner)
-        best.keys = keys
-        cand = best._candidate_rows(row)[0]
-        cand["us"] = Mxfp4FlydslTuner.INVALID_TIME
-        cand["kernelName1"] = (f"FAILED(GPU{gpu}): {exc}")[:240]
+        # the run keeps going instead of aborting.
         print(f"[mxfp4-port] shape failed on GPU{gpu}: {exc}", flush=True)
-        return cand
-    finally:
-        gpu_q.put(gpu)
+        return _mxfp4_failed_row(keys, row, f"FAILED(GPU{gpu}): {exc}")
+
+
+def _mxfp4_failed_row(keys, row, reason):
+    """A tuned-CSV row standing in for a shape that produced no timing."""
+    tuner = Mxfp4FlydslTuner.__new__(Mxfp4FlydslTuner)
+    tuner.keys = keys
+    cand = tuner._candidate_rows(row)[0]
+    cand["us"] = Mxfp4FlydslTuner.INVALID_TIME
+    cand["kernelName1"] = reason[:240]
+    return cand
+
+
+def _mxfp4_shape_proc(payload, out_q, idx):
+    """Child entry point: post the shape's result so the parent can tell a
+    finished shape apart from a worker that died mid-shape."""
+    out_q.put((idx, _mxfp4_tune_shape_worker(payload)))
+
+
+def _run_shapes_isolated(payloads, mp_num, ctx, entry=_mxfp4_shape_proc):
+    """Run each payload in its own fresh process, at most ``mp_num`` at a time.
+
+    Returns one entry per payload: the worker's result, or None if its process
+    died without producing one.
+
+    Why not Pool.map: a pool worker that dies mid-task (a C++ ``abort()`` is not
+    catchable from Python, so an unsupported shape takes the process down with
+    it) is never noticed -- the result simply never arrives and map() waits
+    forever, while the pool quietly spawns idle replacements. Owning the
+    processes lets us read ``exitcode`` and turn a dead worker into a reported
+    failure. GPU ids come from a parent-held free list rather than a shared
+    queue for the same reason: a killed child cannot leak the id it was holding
+    and starve every later shape.
+    """
+    import queue as _queue
+
+    out_q = ctx.Queue()
+    results = [None] * len(payloads)
+    running = {}  # idx -> (Process, gpu)
+    free_gpus = list(range(mp_num))
+    done, nxt = set(), 0
+
+    while len(done) < len(payloads):
+        while nxt < len(payloads) and free_gpus:
+            gpu = free_gpus.pop(0)
+            keys, row, args, _ = payloads[nxt]
+            proc = ctx.Process(
+                target=entry, args=((keys, row, args, gpu), out_q, nxt), daemon=True
+            )
+            proc.start()
+            running[nxt] = (proc, gpu)
+            nxt += 1
+
+        def _reap(idx):
+            proc, gpu = running.pop(idx)
+            proc.join()
+            free_gpus.append(gpu)
+            done.add(idx)
+
+        try:
+            idx, res = out_q.get(timeout=1.0)
+            results[idx] = res
+            _reap(idx)
+        except _queue.Empty:
+            # Nothing arrived for a full second, so any result a just-exited
+            # child had queued would already be here: an exited-but-unreported
+            # index really did die mid-shape.
+            for idx, (proc, _gpu) in list(running.items()):
+                if not proc.is_alive():
+                    print(
+                        f"[mxfp4-port] worker for shape {idx} died "
+                        f"(exitcode={proc.exitcode}) without a result",
+                        flush=True,
+                    )
+                    _reap(idx)
+    return results
 
 
 if __name__ == "__main__":

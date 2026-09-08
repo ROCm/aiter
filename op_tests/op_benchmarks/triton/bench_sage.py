@@ -24,6 +24,7 @@ from aiter.ops.mha_v4 import (
     AttentionFormat,
     AttentionScaleMode,
     mha_v4,
+    mha_v4_kv_tile,
     mha_v4_packed,
     mha_v4_q_multiplier,
     mxfp4_k_view,
@@ -42,9 +43,9 @@ from aiter.ops.mha_v4 import (
     quantize_v_fp8,
     quantize_v_mxfp4,
     quantize_v_mxfp6,
+    rotate_activation_hd128,
     scale_modes_for_formats,
 )
-from aiter.ops.quant import rotate_activation
 from aiter.ops.triton._triton_kernels.flash_attn_triton_amd import flash_attn_3
 from aiter.ops.triton.attention.fav3_sage import (
     fav3_sage_func,
@@ -595,6 +596,10 @@ def load_block_mask_from_json(
 
 
 def kernel_block_sizes(kernel: KernelName) -> tuple[int, int]:
+    # MHA v4's sparse tile is set by its manifest row, not by the Triton configs
+    # below: 256x128 on gfx950 but 256x64 on gfx942.
+    if kernel.startswith("mha4_"):
+        return 256, mha_v4_kv_tile()
     if kernel == "sage_mxfp4":
         cfg = get_sage_fwd_configs_mxfp4()
     else:
@@ -740,8 +745,8 @@ def cancel_internal_qk_rotation(
     """Pre-rotate Q/K so a fused production Hadamard quantizer emits raw-domain Q/K."""
     q_rotated = torch.empty_like(q)
     k_rotated = torch.empty_like(k)
-    rotate_activation(q_rotated, q)
-    rotate_activation(k_rotated, k)
+    rotate_activation_hd128(q_rotated, q)
+    rotate_activation_hd128(k_rotated, k)
     return q_rotated, k_rotated
 
 
@@ -897,12 +902,26 @@ def make_torch_ref_runner(
     )
 
 
+def _mha_v4_packed_sparse_kwargs(
+    block_lut: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None,
+) -> dict[str, torch.Tensor]:
+    if block_lut is None:
+        return {}
+    kv_block_indices, lut_start, lut_count = block_lut
+    return {
+        "kv_block_indices": kv_block_indices,
+        "lut_start": lut_start,
+        "lut_count": lut_count,
+    }
+
+
 def make_kernel_runner(
     args: argparse.Namespace,
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
     block_lut: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None,
+    block_mask: torch.Tensor | None = None,
 ) -> Any:
     q_bshd, k_bshd, v_bshd = layout_preprocess(
         q, k, v, layout=args.layout, target_layout="bshd"
@@ -917,6 +936,18 @@ def make_kernel_runner(
     i8fp8_scale_modes = scale_modes_for_formats(
         AttentionFormat.INT8, AttentionFormat.INT8, fp8_format
     )
+    packed_sparse = _mha_v4_packed_sparse_kwargs(block_lut)
+    raw_sparse = (
+        {"block_mask": block_mask}
+        if block_lut is not None and block_mask is not None
+        else {}
+    )
+
+    def launch_mha_v4_packed(*tensors, **kwargs):
+        return mha_v4_packed(*tensors, **packed_sparse, **kwargs)
+
+    def launch_mha_v4(*tensors, **kwargs):
+        return mha_v4(*tensors, **raw_sparse, **kwargs)
 
     if args.kernel == "sage_fp8":
         block_r = args.block_r
@@ -1106,7 +1137,7 @@ def make_kernel_runner(
             )
 
         packed = fp8_quantize(q_bshd, k_bshd, v_bshd, rotate_qk=args.hadamard_rotate)
-        return lambda: mha_v4_packed(
+        return lambda: launch_mha_v4_packed(
             *packed,
             fp8_format,
             fp8_format,
@@ -1135,7 +1166,7 @@ def make_kernel_runner(
             )
 
         packed = _production_quantize_mxfp8(q_bshd, k_bshd, v_bshd, softmax_scale)
-        return lambda: mha_v4_packed(
+        return lambda: launch_mha_v4_packed(
             *packed,
             fp8_format,
             fp8_format,
@@ -1151,7 +1182,7 @@ def make_kernel_runner(
                 "and does not support --qsmooth"
             )
         if args.e2e and args.hadamard_rotate and args.f8f6_v_scale == "block":
-            return lambda: mha_v4(
+            return lambda: launch_mha_v4(
                 q_bshd,
                 k_bshd,
                 v_bshd,
@@ -1184,7 +1215,7 @@ def make_kernel_runner(
             rotate_qk=args.hadamard_rotate,
             v_scale_mode=args.f8f6_v_scale,
         )
-        return lambda: mha_v4_packed(
+        return lambda: launch_mha_v4_packed(
             *packed,
             fp8_format,
             fp8_format,
@@ -1198,7 +1229,7 @@ def make_kernel_runner(
         k_clip = args.k_clip if args.k_clip is not None else args.qk_clip
 
         if args.e2e:
-            return lambda: mha_v4(
+            return lambda: launch_mha_v4(
                 q_bshd,
                 k_bshd,
                 v_bshd,
@@ -1215,7 +1246,7 @@ def make_kernel_runner(
             q_clip=q_clip,
             k_clip=k_clip,
         )
-        return lambda: mha_v4_packed(
+        return lambda: launch_mha_v4_packed(
             q_i8,
             k_i8,
             v_fp8,
@@ -1250,7 +1281,7 @@ def make_kernel_runner(
             return quantize(quant_q, quant_k, v_bshd, softmax_scale)
 
         def _kernel_mxfp4(q_fp4, q_descale, k_fp4, k_descale, v_quantized, v_descale):
-            return mha_v4_packed(
+            return launch_mha_v4_packed(
                 q_fp4,
                 k_fp4,
                 v_quantized,
@@ -1266,7 +1297,7 @@ def make_kernel_runner(
 
         if args.e2e:
             if args.hadamard_rotate:
-                return lambda: mha_v4(
+                return lambda: launch_mha_v4(
                     q_bshd,
                     k_bshd,
                     v_bshd,
@@ -1307,7 +1338,7 @@ def make_kernel_runner(
         )
 
         def _kernel_mxfp6(q_fp6, q_descale, k_fp6, k_descale, v_quantized, v_descale):
-            return mha_v4_packed(
+            return launch_mha_v4_packed(
                 q_fp6,
                 k_fp6,
                 v_quantized,
@@ -1323,7 +1354,7 @@ def make_kernel_runner(
 
         if args.e2e:
             if args.hadamard_rotate:
-                return lambda: mha_v4(
+                return lambda: launch_mha_v4(
                     q_bshd,
                     k_bshd,
                     v_bshd,
@@ -1541,7 +1572,9 @@ def benchmark_single_case(
         else None
     )
 
-    fn = make_kernel_runner(args, q, k, v, block_lut=block_lut)
+    fn = make_kernel_runner(
+        args, q, k, v, block_lut=block_lut, block_mask=block_attn_mask
+    )
     ms = triton.testing.do_bench(fn, warmup=args.warmup, rep=args.rep)
 
     if args.compare_to_ref:
@@ -1972,7 +2005,9 @@ def run_block_sparse_repetitions(
         > args.block_sparsity
     ).to(torch.bool)
     warmup_lut = block_attn_mask_to_ragged_lut(warmup_mask, return_none_if_dense=True)
-    fn_warmup = make_kernel_runner(args, q, k, v, block_lut=warmup_lut)
+    fn_warmup = make_kernel_runner(
+        args, q, k, v, block_lut=warmup_lut, block_mask=warmup_mask
+    )
     triton.testing.do_bench(fn_warmup, warmup=args.warmup, rep=args.rep)
 
     total_flops = (
@@ -1997,7 +2032,7 @@ def run_block_sparse_repetitions(
         ).to(torch.bool)
         lut = block_attn_mask_to_ragged_lut(mask, return_none_if_dense=True)
 
-        fn = make_kernel_runner(args, q, k, v, block_lut=lut)
+        fn = make_kernel_runner(args, q, k, v, block_lut=lut, block_mask=mask)
         ms = triton.testing.do_bench(fn, warmup=args.warmup, rep=args.rep)
         latencies_ms.append(ms)
 

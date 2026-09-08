@@ -1,7 +1,6 @@
 # adapted from triton_kernels package
 # original code https://github.com/triton-lang/triton/blob/main/python/triton_kernels/triton_kernels/matmul_ogs.py
 
-import functools
 import itertools
 
 import torch
@@ -20,27 +19,8 @@ from aiter.ops.triton._triton_kernels.moe.moe_op_gemm_a4w4 import (
 from aiter.ops.triton.moe.moe_routing.routing import RoutingData
 from aiter.ops.triton.moe.reduce import reduce_grouped
 from aiter.ops.triton.utils._triton.arch_info import get_arch
-from aiter.ops.triton.utils.core import load_config_json
-from aiter.ops.triton.utils.gemm_config_utils import (
-    pick_gemm_num_stages,
-    resolve_config_dir,
-)
-
-
-@functools.lru_cache
-def _get_a4w4_dispatch(arch: str) -> dict:
-    """Per-(block_m, N, K, bucket) dispatch table for moe_gemm_a4w4. Returns {}
-    if no tuned file is shipped for this arch.
-
-    ``arch`` stays in the signature for the callers that already resolved it;
-    resolve_config_dir() reads the same value from arch_info."""
-    # No backend= on purpose: the only tuned a4w4 table ships under gfx1250's
-    # gluon/ directory (it feeds the gluon dispatch path), so the probe has to
-    # fall through triton/ to gluon/ the same way a8w4 does.
-    cfg_dir, _ = resolve_config_dir("moe", "A4W4")
-    dispatch = load_config_json(f"{cfg_dir}/DEFAULT.json", required=False)
-    return dispatch if dispatch is not None else {}
-
+from aiter.ops.triton.utils.gemm_config_utils import pick_gemm_num_stages
+from aiter.ops.triton.utils.moe_config_utils import get_moe_dispatch
 
 # -----------------------------------------------------------------------------
 #                    Matrix Multiplication + Outer Gather/Scatter
@@ -164,7 +144,7 @@ def get_kernel_config_gluon(m, n, k, routing_data):
     num_xcds = 1
 
     arch = get_arch()
-    tuned = _get_a4w4_dispatch(arch)
+    tuned = get_moe_dispatch("A4W4", arch, "gluon")
     key = f"bm{block_m}_n{n}_k{k}_{m2bucket(m)}"
     if key not in tuned:
         key = f"bm{block_m}_any"

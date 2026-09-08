@@ -24,7 +24,10 @@ import aiter
 from aiter import dtypes, logger
 from aiter.jit.core import AITER_CONFIG_GEMM_BF16, get_asm_dir
 from aiter.jit.utils.chip_info import get_cu_num, get_gfx
-from aiter.ops.flydsl.utils import is_flydsl_available
+from aiter.ops.flydsl.gemm_kernels import (
+    flydsl_hgemm,
+    get_flydsl_splitk_hgemm_kernels,
+)
 from aiter.ops.gemm_op_a16w16 import ASM_SPLITK_MAX_GRID
 from aiter.ops.triton.gemm.basic.gemm_a16w16 import gemm_a16w16 as triton_gemm_a16w16
 from aiter.utility.base_tuner import GemmCommonTuner
@@ -33,20 +36,6 @@ from aiter.utility.mp_tuner import mp_tuner
 # ---------------------------------------------------------------------------
 # Optional backend imports
 # ---------------------------------------------------------------------------
-
-FLYDSL_TUNE_ERROR = None
-try:
-    if is_flydsl_available():
-        from aiter.ops.flydsl.gemm_kernels import (
-            flydsl_hgemm,
-            get_flydsl_splitk_hgemm_kernels,
-        )
-    else:
-        raise ImportError("flydsl package is not installed")
-except ImportError as exc:
-    flydsl_hgemm = None
-    get_flydsl_splitk_hgemm_kernels = None
-    FLYDSL_TUNE_ERROR = str(exc)
 
 OPUS_TUNE_ERROR = None
 try:
@@ -288,8 +277,6 @@ def run_skinny_gemm_a16w16(input, weight, bias=None, otype=dtypes.bf16):
 
 
 def run_flydsl_gemm_bf16(input, weight, bias=None, otype=dtypes.bf16, config=None):
-    if flydsl_hgemm is None:
-        raise RuntimeError(f"flydsl is not available for tuning: {FLYDSL_TUNE_ERROR}")
     if config is None:
         raise ValueError("flydsl tuning requires a kernel config")
     stages = config.get("stages", config.get("stage", 2))
@@ -337,8 +324,6 @@ def run_flydsl_gemm_bf16(input, weight, bias=None, otype=dtypes.bf16, config=Non
 
 @lru_cache(maxsize=1)
 def get_flydsl_bf16_catalog(m: int, n: int, k: int):
-    if get_flydsl_splitk_hgemm_kernels is None:
-        return []
     kernels = get_flydsl_splitk_hgemm_kernels("bf16", "bf16", m=m, n=n, k=k)
     catalog = [
         (idx, name, dict(kernels[name])) for idx, name in enumerate(sorted(kernels))
@@ -723,9 +708,6 @@ class GemmA16W16Tuner(GemmCommonTuner):
     def _get_flydsl_tasks(
         self, info_keys, has_bias, indtype, outdtype, scaleAB, is_shuffle, run_kwargs
     ):
-        if flydsl_hgemm is None or get_flydsl_splitk_hgemm_kernels is None:
-            logger.warning(f"FlyDSL not available, skip. reason: {FLYDSL_TUNE_ERROR}")
-            return []
         if scaleAB or indtype != dtypes.bf16:
             return []
         M, N, K = info_keys[2], info_keys[3], info_keys[4]

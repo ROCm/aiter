@@ -6,6 +6,7 @@ import triton
 import triton.language as tl
 
 from aiter.ops.triton._triton_kernels.moe.activations import _swiglu
+from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
 from aiter.ops.triton.utils._triton.pid_preprocessing import pid_grid
 
 
@@ -79,7 +80,27 @@ def unshuffle_weights(w, BLOCK_N, BLOCK_K):
     return w
 
 
-@triton.jit(launch_metadata=matmul_launch_metadata)
+_moe_gemm_int8_smoothquant_repr = make_kernel_repr(
+    "_moe_gemm_int8_smoothquant",
+    [
+        "BLOCK_M",
+        "BLOCK_N",
+        "BLOCK_K",
+        "GROUP_M",
+        "SPLIT_K",
+        "EVEN_K",
+        "PRESHUFFLED",
+        "W_CACHE_MODIFIER",
+        "N_EXPTS_ACT",
+        "APPLY_ACTIVATION",
+        "SWIGLU_ADD_RESIDUAL",
+    ],
+)
+
+
+@triton.jit(
+    repr=_moe_gemm_int8_smoothquant_repr, launch_metadata=matmul_launch_metadata
+)
 def _moe_gemm_int8_smoothquant(
     Y,
     stride_y_k,
