@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""FlyDSL one-workgroup prefill TopK interface."""
+"""FlyDSL gfx1250 one-block radix TopK interface."""
 
 from functools import lru_cache
 
@@ -9,10 +9,10 @@ import torch
 
 from aiter.jit.utils.chip_info import get_gfx
 
-from .kernels.tensor_shim import _run_compiled
-from .kernels.topk_per_row_prefill_one_workgroup import (
-    build_topk_per_row_prefill_one_workgroup_module,
+from .kernels.radix_topk_one_block_gfx1250 import (
+    build_radix_topk_one_block_gfx1250_module,
 )
+from .kernels.tensor_shim import _run_compiled
 
 _MAX_BUFFER_ROW_ELEMENTS = ((1 << 32) - 1) // torch.float32.itemsize
 _SUPPORTED_ARCHES = ("gfx1250",)
@@ -110,7 +110,7 @@ def _validate_values_signature(
         )
 
 
-def _validate_flydsl_topk_call(
+def _validate_call(
     logits: torch.Tensor,
     row_starts: torch.Tensor,
     row_ends: torch.Tensor,
@@ -141,7 +141,7 @@ def _validate_flydsl_topk_call(
 
 
 @lru_cache(maxsize=128)
-def _is_flydsl_topk_call_supported(
+def _is_call_supported(
     logits_signature: _TensorSignature,
     row_starts_signature: _TensorSignature,
     row_ends_signature: _TensorSignature,
@@ -180,7 +180,7 @@ def _is_flydsl_topk_call_supported(
     return True
 
 
-def is_flydsl_top_k_per_row_prefill_supported(
+def is_radix_topk_one_block_gfx1250_supported(
     logits: torch.Tensor,
     row_starts: torch.Tensor,
     row_ends: torch.Tensor,
@@ -191,8 +191,8 @@ def is_flydsl_top_k_per_row_prefill_supported(
     k: int,
     values: torch.Tensor | None = None,
 ) -> bool:
-    """Return whether the call can use the gfx1250 one-workgroup kernel."""
-    return _is_flydsl_topk_call_supported(
+    """Return whether the call can use the gfx1250 one-block kernel."""
+    return _is_call_supported(
         _tensor_signature(logits),
         _tensor_signature(row_starts),
         _tensor_signature(row_ends),
@@ -205,7 +205,7 @@ def is_flydsl_top_k_per_row_prefill_supported(
     )
 
 
-def flydsl_top_k_per_row_prefill(
+def radix_topk_one_block_gfx1250(
     logits: torch.Tensor,
     row_starts: torch.Tensor,
     row_ends: torch.Tensor,
@@ -219,7 +219,7 @@ def flydsl_top_k_per_row_prefill(
     max_effective_row_len: int | None = None,
 ) -> None:
     """Write per-row TopK indices and optional values."""
-    _validate_flydsl_topk_call(
+    _validate_call(
         logits,
         row_starts,
         row_ends,
@@ -243,7 +243,7 @@ def flydsl_top_k_per_row_prefill(
         )
     block_threads = 256 if max_effective_row_len <= 4096 else 1024
     stream = torch.cuda.current_stream(logits.device)
-    launcher = build_topk_per_row_prefill_one_workgroup_module(
+    launcher = build_radix_topk_one_block_gfx1250_module(
         k,
         block_threads=block_threads,
         write_values=values is not None,
