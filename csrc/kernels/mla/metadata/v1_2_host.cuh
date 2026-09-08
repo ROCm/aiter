@@ -4,6 +4,7 @@
 #include "ps.h"
 #include "v1_comm.cuh"
 #include <algorithm>
+#include <cassert>
 #include <iomanip>
 #include <iostream>
 #include <map>
