@@ -20,23 +20,23 @@ _WAVE_SIZE = 32
 _VEC = 4
 _LOAD_UNROLL = 4
 _KEY_BITS = 32
-_HIGH_BITS = 12
-_MIDDLE_BITS = 10
-_LOW_BITS = _KEY_BITS - _HIGH_BITS - _MIDDLE_BITS
-_HIGH_BUCKETS = 1 << _HIGH_BITS
-_LATER_BUCKETS = 1 << max(_MIDDLE_BITS, _LOW_BITS)
-_HIGH_SHIFT = _MIDDLE_BITS + _LOW_BITS
-_MIDDLE_SHIFT = _LOW_BITS
-_MIDDLE_MASK = (1 << _MIDDLE_BITS) - 1
-_LOW_MASK = (1 << _LOW_BITS) - 1
-_SHORT_HIGH_BITS = 11
-_SHORT_MIDDLE_BITS = 10
-_SHORT_LOW_BITS = _KEY_BITS - _SHORT_HIGH_BITS - _SHORT_MIDDLE_BITS
-_SHORT_HIGH_BUCKETS = 1 << _SHORT_HIGH_BITS
-_SHORT_HIGH_SHIFT = _SHORT_MIDDLE_BITS + _SHORT_LOW_BITS
-_SHORT_MIDDLE_SHIFT = _SHORT_LOW_BITS
-_SHORT_MIDDLE_MASK = (1 << _SHORT_MIDDLE_BITS) - 1
-_SHORT_LOW_MASK = (1 << _SHORT_LOW_BITS) - 1
+_LONG_RADIX_BITS = (12, 10, 10)
+_SHORT_RADIX_BITS = (11, 10, 11)
+_LONG_RADIX_SHIFTS = (
+    _LONG_RADIX_BITS[1] + _LONG_RADIX_BITS[2],
+    _LONG_RADIX_BITS[2],
+    0,
+)
+_SHORT_RADIX_SHIFTS = (
+    _SHORT_RADIX_BITS[1] + _SHORT_RADIX_BITS[2],
+    _SHORT_RADIX_BITS[2],
+    0,
+)
+_LONG_RADIX_MASKS = tuple((1 << bits) - 1 for bits in _LONG_RADIX_BITS)
+_SHORT_RADIX_MASKS = tuple((1 << bits) - 1 for bits in _SHORT_RADIX_BITS)
+_HIGH_BUCKETS = 1 << _LONG_RADIX_BITS[0]
+_LATER_BUCKETS = 1 << max(_LONG_RADIX_BITS[1:])
+_SHORT_HIGH_BUCKETS = 1 << _SHORT_RADIX_BITS[0]
 _MAX_ROW_ELEMENTS = ((1 << 32) - 1) // 4
 _COMPACT_CAPACITY = 4096
 _STABLE_FAST_MIN_ROW_LEN = 1 << 15
@@ -269,25 +269,8 @@ def build_topk_per_row_prefill_one_workgroup_module(
                 ^ sign_bit
             )
 
-        def high_bucket(key):
-            return key.shrui(fx.Int32(_HIGH_SHIFT))
-
-        def middle_bucket(key):
-            return key.shrui(fx.Int32(_MIDDLE_SHIFT)) & fx.Int32(_MIDDLE_MASK)
-
-        def low_bucket(key):
-            return key & fx.Int32(_LOW_MASK)
-
-        def short_high_bucket(key):
-            return key.shrui(fx.Int32(_SHORT_HIGH_SHIFT))
-
-        def short_middle_bucket(key):
-            return key.shrui(fx.Int32(_SHORT_MIDDLE_SHIFT)) & fx.Int32(
-                _SHORT_MIDDLE_MASK
-            )
-
-        def short_low_bucket(key):
-            return key & fx.Int32(_SHORT_LOW_MASK)
+        def radix_bucket(key, shift, mask):
+            return (key >> fx.Int32(shift)) & fx.Int32(mask)
 
         def classify_levels(
             first,
@@ -332,9 +315,15 @@ def build_topk_per_row_prefill_one_workgroup_module(
             third_threshold,
         ):
             return classify_levels(
-                high_bucket(key),
-                middle_bucket(key),
-                low_bucket(key),
+                radix_bucket(
+                    key, _LONG_RADIX_SHIFTS[0], _LONG_RADIX_MASKS[0]
+                ),
+                radix_bucket(
+                    key, _LONG_RADIX_SHIFTS[1], _LONG_RADIX_MASKS[1]
+                ),
+                radix_bucket(
+                    key, _LONG_RADIX_SHIFTS[2], _LONG_RADIX_MASKS[2]
+                ),
                 first_threshold,
                 second_threshold,
                 third_threshold,
@@ -347,15 +336,15 @@ def build_topk_per_row_prefill_one_workgroup_module(
 
         def threshold_key(first, second, third):
             return (
-                first * fx.Int32(1 << _HIGH_SHIFT)
-                + second * fx.Int32(1 << _MIDDLE_SHIFT)
+                first * fx.Int32(1 << _LONG_RADIX_SHIFTS[0])
+                + second * fx.Int32(1 << _LONG_RADIX_SHIFTS[1])
                 + third
             )
 
         def short_threshold_key(first, second, third):
             return (
-                first * fx.Int32(1 << _SHORT_HIGH_SHIFT)
-                + second * fx.Int32(1 << _SHORT_MIDDLE_SHIFT)
+                first * fx.Int32(1 << _SHORT_RADIX_SHIFTS[0])
+                + second * fx.Int32(1 << _SHORT_RADIX_SHIFTS[1])
                 + third
             )
 
@@ -410,7 +399,7 @@ def build_topk_per_row_prefill_one_workgroup_module(
                     histogram_pong[pos] = zero
             gpu.barrier()
 
-        def merge_pass1_histograms(
+        def merge_histograms(
             histogram_ping, histogram_pong, bins_per_thread
         ):
             for item in range_constexpr(bins_per_thread):
@@ -443,9 +432,11 @@ def build_topk_per_row_prefill_one_workgroup_module(
             packed_prefix = scan[wave + num_waves] + packed_exclusive
             packed_total = metadata[_THIRD_ABOVE]
             return (
-                packed_prefix.shrui(fx.Int32(_PACKED_COUNT_BITS)),
+                (packed_prefix >> fx.Int32(_PACKED_COUNT_BITS))
+                & fx.Int32(_PACKED_COUNT_MASK),
                 packed_prefix & fx.Int32(_PACKED_COUNT_MASK),
-                packed_total.shrui(fx.Int32(_PACKED_COUNT_BITS)),
+                (packed_total >> fx.Int32(_PACKED_COUNT_BITS))
+                & fx.Int32(_PACKED_COUNT_MASK),
                 packed_total & fx.Int32(_PACKED_COUNT_MASK),
             )
 
@@ -503,11 +494,11 @@ def build_topk_per_row_prefill_one_workgroup_module(
             gpu.barrier()
 
         # Global and LDS row iterators
-        def visit_vector(body, col, values):
-            for item in range_constexpr(_VEC):
-                body(col + item, values[item])
+        def scan_row(visit_one, reverse=False):
+            def visit_vector(col, values):
+                for item in range_constexpr(_VEC):
+                    visit_one(col + item, values[item])
 
-        def scan_row(body, reverse=False):
             unroll_stride = block_size * fx.Int32(_LOAD_UNROLL)
             unroll_end = (
                 full_vector_count
@@ -526,7 +517,7 @@ def build_topk_per_row_prefill_one_workgroup_module(
                 vector_origin = full_vector_count - one
                 vector_direction = -one
                 if remain_col < row_len:
-                    body(remain_col, input_row[remain_col])
+                    visit_one(remain_col, input_row[remain_col])
             else:
                 vector_origin = zero
                 vector_direction = one
@@ -539,12 +530,12 @@ def build_topk_per_row_prefill_one_workgroup_module(
                 vector_idx3 = vector_idx2 + vector_stride
                 values0 = _load_f32x4(input_vector_tiles, vector_idx0)
                 values1 = _load_f32x4(input_vector_tiles, vector_idx1)
-                visit_vector(body, vector_idx0 * vec_width, values0)
+                visit_vector(vector_idx0 * vec_width, values0)
                 values2 = _load_f32x4(input_vector_tiles, vector_idx2)
                 values3 = _load_f32x4(input_vector_tiles, vector_idx3)
-                visit_vector(body, vector_idx1 * vec_width, values1)
-                visit_vector(body, vector_idx2 * vec_width, values2)
-                visit_vector(body, vector_idx3 * vec_width, values3)
+                visit_vector(vector_idx1 * vec_width, values1)
+                visit_vector(vector_idx2 * vec_width, values2)
+                visit_vector(vector_idx3 * vec_width, values3)
 
             cleanup_offset = tid + n_unroll * unroll_stride
             for offset in range(
@@ -552,14 +543,13 @@ def build_topk_per_row_prefill_one_workgroup_module(
             ):
                 vector_idx = vector_origin + vector_direction * offset
                 visit_vector(
-                    body,
                     vector_idx * vec_width,
                     _load_f32x4(input_vector_tiles, vector_idx),
                 )
 
             if const_expr(not reverse):
                 if remain_col < row_len:
-                    body(remain_col, input_row[remain_col])
+                    visit_one(remain_col, input_row[remain_col])
 
         def scan_full_keys(body):
             row_vectors = (row_len + fx.Int32(_VEC - 1)) // fx.Int32(_VEC)
@@ -581,37 +571,24 @@ def build_topk_per_row_prefill_one_workgroup_module(
                         body(col, values[item])
 
         # Radix histogram passes
-        def add_high_bucket(key, histogram_ping, histogram_pong):
-            bucket = high_bucket(key)
-            if (wave & one) == zero:
-                atomic_add_i32(histogram_ping, one, bucket, "workgroup")
-            else:
-                atomic_add_i32(histogram_pong, one, bucket, "workgroup")
-
-        def add_short_high_bucket(key, histogram_ping, histogram_pong):
-            bucket = short_high_bucket(key)
-            if (wave & one) == zero:
-                atomic_add_i32(histogram_ping, one, bucket, "workgroup")
-            else:
-                atomic_add_i32(histogram_pong, one, bucket, "workgroup")
-
-        def pass1_one(col, value, histogram_ping, histogram_pong):
-            if col < row_len:
-                add_high_bucket(
-                    ordered_key(value), histogram_ping, histogram_pong
-                )
-
-        def pass1_cache_one(
+        def pass1_one(
             col,
             value,
+            shift,
+            mask,
             histogram_ping,
             histogram_pong,
-            full_keys,
+            full_keys=None,
         ):
             if col < row_len:
                 key = ordered_key(value)
-                full_keys[col] = key
-                add_short_high_bucket(key, histogram_ping, histogram_pong)
+                if const_expr(full_keys is not None):
+                    full_keys[col] = key
+                bucket = radix_bucket(key, shift, mask)
+                if (wave & one) == zero:
+                    atomic_add_i32(histogram_ping, one, bucket, "workgroup")
+                else:
+                    atomic_add_i32(histogram_pong, one, bucket, "workgroup")
 
         def pass2_key(
             col,
@@ -626,7 +603,9 @@ def build_topk_per_row_prefill_one_workgroup_module(
             row_indices,
             row_values,
         ):
-            first = high_bucket(key)
+            first = radix_bucket(
+                key, _LONG_RADIX_SHIFTS[0], _LONG_RADIX_MASKS[0]
+            )
             if first > first_threshold:
                 out_pos = atomic_add_i32(metadata, one, _RUNNING_ABOVE, "workgroup")
                 if out_pos < top_k:
@@ -637,7 +616,14 @@ def build_topk_per_row_prefill_one_workgroup_module(
                     else:
                         store_key_result(out_pos, col, key, row_indices, row_values)
             elif first == first_threshold:
-                atomic_add_i32(histogram, one, middle_bucket(key), "workgroup")
+                atomic_add_i32(
+                    histogram,
+                    one,
+                    radix_bucket(
+                        key, _LONG_RADIX_SHIFTS[1], _LONG_RADIX_MASKS[1]
+                    ),
+                    "workgroup",
+                )
                 candidate_pos = atomic_add_i32(
                     metadata,
                     one,
@@ -653,9 +639,18 @@ def build_topk_per_row_prefill_one_workgroup_module(
             first_threshold,
             histogram,
         ):
-            first = short_high_bucket(key)
+            first = radix_bucket(
+                key, _SHORT_RADIX_SHIFTS[0], _SHORT_RADIX_MASKS[0]
+            )
             if first == first_threshold:
-                atomic_add_i32(histogram, one, short_middle_bucket(key), "workgroup")
+                atomic_add_i32(
+                    histogram,
+                    one,
+                    radix_bucket(
+                        key, _SHORT_RADIX_SHIFTS[1], _SHORT_RADIX_MASKS[1]
+                    ),
+                    "workgroup",
+                )
 
         def pass2_one(
             col,
@@ -693,10 +688,25 @@ def build_topk_per_row_prefill_one_workgroup_module(
         ):
             if col < row_len:
                 key = ordered_key(value)
-                if (high_bucket(key) == first_threshold) & (
-                    middle_bucket(key) == second_threshold
+                if (
+                    radix_bucket(
+                        key, _LONG_RADIX_SHIFTS[0], _LONG_RADIX_MASKS[0]
+                    )
+                    == first_threshold
+                ) & (
+                    radix_bucket(
+                        key, _LONG_RADIX_SHIFTS[1], _LONG_RADIX_MASKS[1]
+                    )
+                    == second_threshold
                 ):
-                    atomic_add_i32(histogram, one, low_bucket(key), "workgroup")
+                    atomic_add_i32(
+                        histogram,
+                        one,
+                        radix_bucket(
+                            key, _LONG_RADIX_SHIFTS[2], _LONG_RADIX_MASKS[2]
+                        ),
+                        "workgroup",
+                    )
 
         def pass3_cached_key(
             key,
@@ -705,11 +715,24 @@ def build_topk_per_row_prefill_one_workgroup_module(
             histogram,
         ):
             if (
-                short_high_bucket(key) == first_threshold
+                radix_bucket(
+                    key, _SHORT_RADIX_SHIFTS[0], _SHORT_RADIX_MASKS[0]
+                )
+                == first_threshold
             ) & (
-                short_middle_bucket(key) == second_threshold
+                radix_bucket(
+                    key, _SHORT_RADIX_SHIFTS[1], _SHORT_RADIX_MASKS[1]
+                )
+                == second_threshold
             ):
-                atomic_add_i32(histogram, one, short_low_bucket(key), "workgroup")
+                atomic_add_i32(
+                    histogram,
+                    one,
+                    radix_bucket(
+                        key, _SHORT_RADIX_SHIFTS[2], _SHORT_RADIX_MASKS[2]
+                    ),
+                    "workgroup",
+                )
 
         def compact_pass3(
             candidate_count,
@@ -719,8 +742,20 @@ def build_topk_per_row_prefill_one_workgroup_module(
         ):
             for pos in range(tid, candidate_count, block_size):
                 key = candidate_keys[pos]
-                if middle_bucket(key) == second_threshold:
-                    atomic_add_i32(histogram, one, low_bucket(key), "workgroup")
+                if (
+                    radix_bucket(
+                        key, _LONG_RADIX_SHIFTS[1], _LONG_RADIX_MASKS[1]
+                    )
+                    == second_threshold
+                ):
+                    atomic_add_i32(
+                        histogram,
+                        one,
+                        radix_bucket(
+                            key, _LONG_RADIX_SHIFTS[2], _LONG_RADIX_MASKS[2]
+                        ),
+                        "workgroup",
+                    )
 
         # Non-stable emitters
 
@@ -741,9 +776,15 @@ def build_topk_per_row_prefill_one_workgroup_module(
 
             def emit(col, key, row_indices, row_values, metadata):
                 above, equal = classify_levels(
-                    short_high_bucket(key),
-                    short_middle_bucket(key),
-                    short_low_bucket(key),
+                    radix_bucket(
+                        key, _SHORT_RADIX_SHIFTS[0], _SHORT_RADIX_MASKS[0]
+                    ),
+                    radix_bucket(
+                        key, _SHORT_RADIX_SHIFTS[1], _SHORT_RADIX_MASKS[1]
+                    ),
+                    radix_bucket(
+                        key, _SHORT_RADIX_SHIFTS[2], _SHORT_RADIX_MASKS[2]
+                    ),
                     first_threshold,
                     second_threshold,
                     third_threshold,
@@ -965,9 +1006,15 @@ def build_topk_per_row_prefill_one_workgroup_module(
             ):
                 key = candidate_keys[candidate_pos]
                 above, equal = classify_levels(
-                    high_bucket(key),
-                    middle_bucket(key),
-                    low_bucket(key),
+                    radix_bucket(
+                        key, _LONG_RADIX_SHIFTS[0], _LONG_RADIX_MASKS[0]
+                    ),
+                    radix_bucket(
+                        key, _LONG_RADIX_SHIFTS[1], _LONG_RADIX_MASKS[1]
+                    ),
+                    radix_bucket(
+                        key, _LONG_RADIX_SHIFTS[2], _LONG_RADIX_MASKS[2]
+                    ),
                     first_threshold,
                     second_threshold,
                     third_threshold,
@@ -1030,9 +1077,21 @@ def build_topk_per_row_prefill_one_workgroup_module(
                 for item in range_constexpr(_VEC):
                     col = vector_idx * vec_width + item
                     above, equal = classify_levels(
-                        short_high_bucket(keys[item]),
-                        short_middle_bucket(keys[item]),
-                        short_low_bucket(keys[item]),
+                        radix_bucket(
+                            keys[item],
+                            _SHORT_RADIX_SHIFTS[0],
+                            _SHORT_RADIX_MASKS[0],
+                        ),
+                        radix_bucket(
+                            keys[item],
+                            _SHORT_RADIX_SHIFTS[1],
+                            _SHORT_RADIX_MASKS[1],
+                        ),
+                        radix_bucket(
+                            keys[item],
+                            _SHORT_RADIX_SHIFTS[2],
+                            _SHORT_RADIX_MASKS[2],
+                        ),
                         first_threshold,
                         second_threshold,
                         third_threshold,
@@ -1247,7 +1306,9 @@ def build_topk_per_row_prefill_one_workgroup_module(
             for pos in range(tid, candidate_count, block_size):
                 col = candidate_indices[pos]
                 key = candidate_keys[pos]
-                second = middle_bucket(key)
+                second = radix_bucket(
+                    key, _LONG_RADIX_SHIFTS[1], _LONG_RADIX_MASKS[1]
+                )
                 scatter_unstable_key(
                     col,
                     key,
@@ -1766,16 +1827,18 @@ def build_topk_per_row_prefill_one_workgroup_module(
                     short_bins_per_thread,
                 )
                 scan_row(
-                    lambda col, value: pass1_cache_one(
+                    lambda col, value: pass1_one(
                         col,
                         value,
+                        _SHORT_RADIX_SHIFTS[0],
+                        _SHORT_RADIX_MASKS[0],
                         short_histogram_ping,
                         short_histogram_pong,
                         full_keys,
                     ),
                 )
                 gpu.barrier()
-                merge_pass1_histograms(
+                merge_histograms(
                     short_histogram_ping,
                     short_histogram_pong,
                     short_bins_per_thread,
@@ -1800,12 +1863,14 @@ def build_topk_per_row_prefill_one_workgroup_module(
                     lambda col, value: pass1_one(
                         col,
                         value,
+                        _LONG_RADIX_SHIFTS[0],
+                        _LONG_RADIX_MASKS[0],
                         long_histogram_ping,
                         long_histogram_pong,
                     ),
                 )
                 gpu.barrier()
-                merge_pass1_histograms(
+                merge_histograms(
                     long_histogram_ping,
                     long_histogram_pong,
                     high_bins_per_thread,
