@@ -6369,7 +6369,35 @@ void fused_qk_norm_rope_group_quant(
                                  * (1 + prefill_q_waves_med);
 
   constexpr int MIN_OVERSUBSCRIPTION     = 4;    // decode -> med
-  constexpr int LARGE_PREFILL_THRESHOLD  = 48;   // med    -> large  (blocks/CU)
+  // med -> large at 16 blocks/CU, not 48.
+  //
+  // Seven shapes move across this boundary (blocks/CU in parens): T=512 H=128
+  // (22), T=1024 H=64 (23), T=2048 H=32 (24), T=4096 H=16 (28), T=1024 H=128
+  // (44), T=2048 H=64 (46), T=4096 H=32 (48). All go med (HPW=3) -> large
+  // (HPW=8); nothing else in the sweep changes tier.
+  //
+  // MEASURED, paired A/B, kernel-trace median of 103 dispatches, 6 reps each,
+  // every rep gated on an idle card:
+  //   T=4096 H=16   17.980 -> 16.631 us   -7.20%  (95% CI [-13.31, -1.09], 4/6)
+  //   T=2048 H=32   16.846 -> 17.299 us   +2.79%  (95% CI [ -0.85, +6.43], 2/6)
+  // One clear win, one indistinguishable from zero; the rest of the moved shapes
+  // land inside noise on a single-run sweep.
+  //
+  // Two cautions for anyone re-tuning this:
+  //
+  // 1. A single-run sweep is not enough to judge it. That sweep put T=4096 H=16
+  //    at -13.31% and T=2048 H=32 at +9.75%, and paired A/B shrank both toward
+  //    zero. Shapes whose tier does NOT change showed +3.1..+3.6% on the same
+  //    sweep, which bounds its noise at about +/-3%.
+  //
+  // 2. The win is not a function of blocks/CU alone. 24 (T=2048 H=32) is neutral
+  //    while 28 (T=4096 H=16) wins, so the boundary does not separate them --
+  //    H does. At small H the med tier's HPW=3 already covers most of the heads
+  //    (H=16 needs 6 waves), so switching to HPW=8 leaves only 2 waves and the
+  //    wave count falls faster than the per-wave work drops. A threshold that
+  //    also keys on H is the likely next refinement, but that needs more shapes
+  //    than this change was measured against.
+  constexpr int LARGE_PREFILL_THRESHOLD  = 16;   // med    -> large  (blocks/CU)
   constexpr int XLARGE_PREFILL_THRESHOLD = 300;  // large  -> xlarge (blocks/CU)
 
   const bool use_decode_path    = (prefill_blocks_med < MIN_OVERSUBSCRIPTION * num_CUs);
