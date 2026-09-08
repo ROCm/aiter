@@ -181,6 +181,11 @@ AITER_CONFIG_GDN_K5_OPT = os.getenv(
     f"{AITER_ROOT_DIR}/aiter/configs/chunk_gdn_h_opt_tuned.csv",
 )
 
+AITER_CONFIG_DISPATCH_COMBINE_INTRANODE = os.getenv(
+    "AITER_CONFIG_DISPATCH_COMBINE_INTRANODE",
+    f"{AITER_ROOT_DIR}/aiter/configs/tuned_dispatch_combine_intranode.csv",
+)
+
 
 class AITER_CONFIG:
     @property
@@ -281,6 +286,14 @@ class AITER_CONFIG:
             "AITER_CONFIG_GDN_K5_OPT",
             AITER_CONFIG_GDN_K5_OPT,
             "chunk_gdn_h_opt_tuned",
+        )
+
+    @property
+    def AITER_CONFIG_DISPATCH_COMBINE_INTRANODE_FILE(self):
+        return self.get_config_file(
+            "AITER_CONFIG_DISPATCH_COMBINE_INTRANODE",
+            AITER_CONFIG_DISPATCH_COMBINE_INTRANODE,
+            "tuned_dispatch_combine_intranode",
         )
 
     @property
@@ -731,6 +744,77 @@ def _so_offload_archs(so_path):
     return archs
 
 
+_PYBIND11_ABI_KEY_RE = re.compile(rb"__pybind11_internals_v[0-9A-Za-z_]+__")
+
+
+def _so_pybind11_abi_key(so_path):
+    # the key of pybind11's cross-module type registry, as embedded in a built
+    # .so. two extensions see the same registry only when this string matches
+    # byte for byte; it encodes the pybind11 internals version plus the compiler
+    # / stdlib / C++ ABI the module was built with. None means missing file or a
+    # module built without pybind11.
+    # find() first, then the regex: a plain scan over a several-hundred-MB CK
+    # module would otherwise touch every page just to reach one short string.
+    import mmap
+
+    try:
+        with open(so_path, "rb") as f, mmap.mmap(
+            f.fileno(), 0, access=mmap.ACCESS_READ
+        ) as mm:
+            pos = mm.find(b"__pybind11_internals_v")
+            if pos < 0:
+                return None
+            m = _PYBIND11_ABI_KEY_RE.match(mm, pos)
+            return m.group(0).decode() if m else None
+    except (OSError, ValueError, OverflowError):
+        return None
+
+
+@functools.lru_cache(maxsize=1024)
+def _pybind11_abi_keys(md_name, so_path, core_so_path):
+    # (module key, core key) when the two disagree, else None. lru_cached on the
+    # paths, so each .so is read at most once per process and the healthy answer
+    # costs one dict lookup. A module with no key at all (host-only, or built
+    # without pybind11) counts as agreeing: there is nothing to mismatch.
+    core_key = _so_pybind11_abi_key(core_so_path)
+    mod_key = _so_pybind11_abi_key(so_path)
+    if not core_key or not mod_key or core_key == mod_key:
+        return None
+    return (mod_key, core_key)
+
+
+def _raise_on_pybind11_abi_split(md_name, so_path, core_so_path, has_tensor_arg):
+    # aiter_tensor_t is registered exactly once, by module_aiter_core, and
+    # develop=True ops hand one of those objects to a different .so. That
+    # resolves only if both modules landed in the same pybind11 type registry,
+    # i.e. share the key above. When they do not, pybind11 sees an unregistered
+    # type and rejects the tensor arguments with a bare "incompatible function
+    # arguments", naming neither cause nor cure -- which is what PR #4847 hit and
+    # worked around by reverting a module to at::Tensor.
+    #
+    # The call is going to fail either way, so fail it here with the reason
+    # attached instead. Gated on an argument actually being a tensor: a mismatch
+    # only bites when an aiter_tensor_t has to cross, and a develop op called
+    # with none would otherwise still work.
+    keys = _pybind11_abi_keys(md_name, so_path, core_so_path)
+    if keys is None or not has_tensor_arg():
+        return
+    mod_key, core_key = keys
+    raise RuntimeError(
+        f"[{md_name}] was built against a different pybind11 ABI than "
+        f"module_aiter_core, so it cannot see the aiter_tensor_t registration "
+        f"and every tensor argument would be rejected:\n"
+        f"    {md_name}: {mod_key}\n"
+        f"      ({so_path})\n"
+        f"    module_aiter_core: {core_key}\n"
+        f"      ({core_so_path})\n"
+        f"The two .so files come from different build environments -- differing "
+        f"pybind11 version, C++ ABI, or one built against torch and one not. "
+        f"Rebuild both in one environment: AITER_REBUILD=1, or remove "
+        f"{get_user_jit_dir()} and let them rebuild."
+    )
+
+
 def _needs_arch_rebuild(md_name):
     # a prebuilt .so is a valid host extension on any GPU, so importing one
     # built for the wrong arch succeeds and only faults later at kernel launch.
@@ -761,7 +845,7 @@ def get_module(md_name):
     return __mds[md_name]
 
 
-rebuilded_list = ["module_aiter_core"]
+rebuilded_list = []
 
 
 def clone_3rdparty(third_party: str) -> None:
@@ -1309,6 +1393,7 @@ def get_args_of_build(ops_name: str, exclude=None):
                         "extra_include": single_ops["extra_include"],
                         "blob_gen_cmd": single_ops["blob_gen_cmd"],
                         "third_party": single_ops["third_party"],
+                        "torch_exclude": single_ops["torch_exclude"],
                     }
                     for (  # noqa: PLC0206  loop mutates d_all_ops[k] by key while reading single_ops[k]; .items() does not help
                         k
@@ -1997,6 +2082,24 @@ def compile_ops(
                     convert, tensor_cls, raw_stream, current_device = (
                         _pybind_develop_hooks()
                     )
+
+                    # Both .so files are loaded by now, so their real paths are
+                    # known (a prebuilt module lives in the package dir, a JIT
+                    # one under the user jit dir; only __file__ tells them
+                    # apart). The scan of each .so happens once per process; the
+                    # tensor-argument sweep is passed as a thunk so it only runs
+                    # on the broken path.
+                    core_mod = __mds.get("module_aiter_core")
+                    if core_mod is not None:
+                        _raise_on_pybind11_abi_split(
+                            md_name,
+                            getattr(module, "__file__", "") or "",
+                            getattr(core_mod, "__file__", "") or "",
+                            lambda: any(
+                                isinstance(a, tensor_cls)
+                                for a in (*args, *kwargs.values())
+                            ),
+                        )
 
                     args = tuple(
                         convert(a) if isinstance(a, tensor_cls) else a for a in args

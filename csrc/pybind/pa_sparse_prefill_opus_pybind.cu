@@ -4,7 +4,7 @@
 #include "aiter_stream.h"
 #include "pa_sparse_prefill_opus.h"
 
-PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
+PYBIND11_MODULE(AITER_EXTENSION_NAME, m)
 {
     AITER_SET_STREAM_PYBIND
     PA_SPARSE_PREFILL_OPUS_PYBIND;

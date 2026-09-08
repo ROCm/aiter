@@ -12,13 +12,18 @@ from aiter.ops.triton.attention.mha import (
     mha_set_use_fused_bwd_kernel,
     mha_set_use_int64_strides,
 )
+from aiter.ops.triton.utils.types import get_fp8_e4m3_dtype
 from aiter.test_mha_common import (
     attention_ref,
     attention_ref_with_tol,
     generate_qkv,
     generate_random_padding_mask,
+    quantize_fp8_per_bh,
 )
-from op_tests.triton_tests.attention.mha_test_utils import pad_rearrange_dropout_mask
+from op_tests.triton_tests.attention.mha_test_utils import (
+    pad_rearrange_dropout_mask,
+    skip_if_gluon_unsupported,
+)
 
 logging.basicConfig(level=logging.DEBUG)
 logger = logging.getLogger(__name__)
@@ -36,8 +41,16 @@ def _test_mha_impl(
     RETURN_LSE: bool,
     RETURN_SOFTMAX: bool,
     CAUSAL: bool,
+    backend: str = "triton",
     dtype=torch.bfloat16,
 ):
+    skip_if_gluon_unsupported(
+        backend,
+        dropout_p=DROPOUT,
+        return_lse=RETURN_LSE,
+        return_attn_probs=RETURN_SOFTMAX,
+    )
+
     torch.manual_seed(20)
     torch.cuda.empty_cache()
     q = torch.randn((BATCH, SEQLEN_Q, NUM_Q_HEADS, HEAD_SZ), device="cuda", dtype=dtype)
@@ -53,6 +66,7 @@ def _test_mha_impl(
         causal=CAUSAL,
         return_lse=RETURN_LSE,
         return_attn_probs=RETURN_SOFTMAX,
+        backend=backend,
     )
 
     if RETURN_LSE:
@@ -98,9 +112,10 @@ def _test_mha_impl(
     "SEQLEN_Q, SEQLEN_K",
     [(1, 1), (128, 128), (32, 16), (64, 128), (2048, 2048)],
 )
-@pytest.mark.parametrize("NUM_Q_HEADS, NUM_K_HEADS", [(1, 1), (8, 8), (48, 8)])
-@pytest.mark.parametrize("HEAD_SZ", [64, 128])
+@pytest.mark.parametrize("NUM_Q_HEADS, NUM_K_HEADS", [(1, 1), (8, 1), (64, 8)])
+@pytest.mark.parametrize("HEAD_SZ", [33, 64, 128])
 @pytest.mark.parametrize("CAUSAL", [(True), (False)])
+@pytest.mark.parametrize("backend", ["triton", "gluon"])
 def test_mha(
     BATCH: int,
     SEQLEN_Q: int,
@@ -109,6 +124,7 @@ def test_mha(
     NUM_K_HEADS: int,
     HEAD_SZ: int,
     CAUSAL: bool,
+    backend: str,
     dtype=torch.bfloat16,
 ):
     _test_mha_impl(
@@ -122,8 +138,151 @@ def test_mha(
         RETURN_LSE=False,
         RETURN_SOFTMAX=False,
         CAUSAL=CAUSAL,
+        backend=backend,
         dtype=dtype,
     )
+
+
+def _fp8_assert_close(actual, expected, atol=1.0, cos_sim_threshold=0.94):
+    """fp8 comparison: bounded max-abs error plus cosine similarity.
+
+    fp8 attention has larger elementwise error than bf16, so we check direction
+    (cosine similarity) in addition to a bounded absolute error.
+    """
+    a = actual.float().flatten()
+    b = expected.float().flatten()
+    max_abs = (a - b).abs().max().item()
+    assert max_abs <= atol, f"Max absolute error {max_abs:.4f} > {atol}"
+    if b.norm().item() > 1e-3:
+        cos_sim = torch.nn.functional.cosine_similarity(
+            a.unsqueeze(0), b.unsqueeze(0)
+        ).item()
+        assert (
+            cos_sim >= cos_sim_threshold
+        ), f"Cosine similarity {cos_sim:.6f} < {cos_sim_threshold}"
+
+
+@pytest.mark.parametrize("BATCH", [1, 4])
+@pytest.mark.parametrize("SEQLEN_Q, SEQLEN_K", [(128, 128), (512, 2048)])
+@pytest.mark.parametrize("NUM_Q_HEADS, NUM_K_HEADS", [(8, 8), (16, 4)])
+@pytest.mark.parametrize("HEAD_SZ", [64, 128])
+@pytest.mark.parametrize("CAUSAL", [True, False])
+def test_mha_fp8_gluon(
+    BATCH: int,
+    SEQLEN_Q: int,
+    SEQLEN_K: int,
+    NUM_Q_HEADS: int,
+    NUM_K_HEADS: int,
+    HEAD_SZ: int,
+    CAUSAL: bool,
+    dtype=torch.bfloat16,
+):
+    skip_if_gluon_unsupported("gluon")
+
+    torch.manual_seed(20)
+    torch.cuda.empty_cache()
+    q = torch.randn((BATCH, SEQLEN_Q, NUM_Q_HEADS, HEAD_SZ), device="cuda", dtype=dtype)
+    k = torch.randn((BATCH, SEQLEN_K, NUM_K_HEADS, HEAD_SZ), device="cuda", dtype=dtype)
+    v = torch.randn((BATCH, SEQLEN_K, NUM_K_HEADS, HEAD_SZ), device="cuda", dtype=dtype)
+
+    fp8_dtype = get_fp8_e4m3_dtype()
+    q_fp8, q_descale = quantize_fp8_per_bh(q, fp8_dtype)
+    k_fp8, k_descale = quantize_fp8_per_bh(k, fp8_dtype)
+    v_fp8, v_descale = quantize_fp8_per_bh(v, fp8_dtype)
+
+    gluon_out = flash_attn_func(
+        q_fp8,
+        k_fp8,
+        v_fp8,
+        causal=CAUSAL,
+        backend="gluon",
+        q_descale=q_descale,
+        k_descale=k_descale,
+        v_descale=v_descale,
+    )
+
+    torch_out, _, _ = attention_ref(q, k, v, causal=CAUSAL)
+
+    _fp8_assert_close(gluon_out, torch_out.to(gluon_out.dtype))
+
+
+@pytest.mark.parametrize("BATCH", [1, 4])
+@pytest.mark.parametrize("SEQLEN_Q, SEQLEN_K", [(128, 128), (512, 2048)])
+@pytest.mark.parametrize("NUM_Q_HEADS, NUM_K_HEADS", [(8, 8), (16, 4)])
+@pytest.mark.parametrize("HEAD_SZ", [64, 128])
+@pytest.mark.parametrize("CAUSAL", [True, False])
+def test_mha_varlen_fp8_gluon(
+    BATCH: int,
+    SEQLEN_Q: int,
+    SEQLEN_K: int,
+    NUM_Q_HEADS: int,
+    NUM_K_HEADS: int,
+    HEAD_SZ: int,
+    CAUSAL: bool,
+    dtype=torch.bfloat16,
+):
+    skip_if_gluon_unsupported("gluon")
+
+    torch.manual_seed(20)
+    torch.cuda.empty_cache()
+    q = torch.randn((BATCH, SEQLEN_Q, NUM_Q_HEADS, HEAD_SZ), device="cuda", dtype=dtype)
+    k = torch.randn((BATCH, SEQLEN_K, NUM_K_HEADS, HEAD_SZ), device="cuda", dtype=dtype)
+    v = torch.randn((BATCH, SEQLEN_K, NUM_K_HEADS, HEAD_SZ), device="cuda", dtype=dtype)
+    query_padding_mask = generate_random_padding_mask(
+        SEQLEN_Q, BATCH, "cuda", mode="random"
+    )
+    key_padding_mask = generate_random_padding_mask(
+        SEQLEN_K, BATCH, "cuda", mode="random"
+    )
+    (
+        q_unpad,
+        k_unpad,
+        v_unpad,
+        cu_seqlens_q,
+        cu_seqlens_k,
+        max_seqlen_q,
+        max_seqlen_k,
+        q,
+        k,
+        v,
+        output_pad_fn,
+        _,
+        _,
+    ) = generate_qkv(q, k, v, query_padding_mask, key_padding_mask, kvpacked=False)
+
+    # generate_qkv returns grad-tracking tensors; detach so the quantization below
+    # doesn't build an autograd graph for this forward-only kernel.
+    fp8_dtype = get_fp8_e4m3_dtype()
+    q_fp8, q_descale = quantize_fp8_per_bh(q_unpad.detach(), fp8_dtype, cu_seqlens_q)
+    k_fp8, k_descale = quantize_fp8_per_bh(k_unpad.detach(), fp8_dtype, cu_seqlens_k)
+    v_fp8, v_descale = quantize_fp8_per_bh(v_unpad.detach(), fp8_dtype, cu_seqlens_k)
+
+    gluon_out = flash_attn_varlen_func(
+        q_fp8,
+        k_fp8,
+        v_fp8,
+        cu_seqlens_q,
+        cu_seqlens_k,
+        max_seqlen_q,
+        max_seqlen_k,
+        causal=CAUSAL,
+        backend="gluon",
+        q_descale=q_descale,
+        k_descale=k_descale,
+        v_descale=v_descale,
+    )
+    gluon_out = output_pad_fn(gluon_out)
+
+    torch_out, _, _ = attention_ref(
+        q,
+        k,
+        v,
+        query_padding_mask=query_padding_mask,
+        key_padding_mask=key_padding_mask,
+        causal=CAUSAL,
+    )
+
+    _fp8_assert_close(gluon_out, torch_out.to(gluon_out.dtype))
 
 
 @pytest.mark.parametrize("NUM_Q_HEADS, NUM_K_HEADS", [(1, 1), (8, 1)])
@@ -158,7 +317,9 @@ def test_mha_with_dropout(
 
 
 # LLaMA 3 405B config
+@pytest.mark.parametrize("backend", ["triton", "gluon"])
 def test_mha_int64_strides(
+    backend: str,
     dtype=torch.bfloat16,
     test_backward=True,
 ):
@@ -171,12 +332,21 @@ def test_mha_int64_strides(
     """
     In the absence of strides being int64, parts of the offset computation is done in 32 bit and overflows resulting in segfaults.
     """
+    # The Gluon backend is forward-only and cannot return LSE, so drop both for it.
+    is_gluon = backend == "gluon"
+    return_lse = not is_gluon
+    test_backward = test_backward and not is_gluon
+    skip_if_gluon_unsupported(
+        backend,
+        dropout_p=DROPOUT,
+        return_lse=return_lse,
+    )
+
     torch.cuda.empty_cache()
     torch.manual_seed(20)
-    # use int64 strides.
-    mha_set_use_int64_strides(
-        True
-    )  # NOTE: if you set this to false this test case will segfault
+    # use int64 strides for the backend under test.
+    # NOTE: if you set this to false this test case will segfault
+    mha_set_use_int64_strides(True)
 
     # generate inputs with large strides
     def _generate_input(
@@ -220,7 +390,7 @@ def test_mha_int64_strides(
         print("cu_seqlens_q:", cu_seqlens_q.shape, cu_seqlens_q.stride())
         print("cu_seqlens_k:", cu_seqlens_k.shape, cu_seqlens_k.stride())
 
-    triton_out, _ = flash_attn_varlen_func(
+    out = flash_attn_varlen_func(
         q,
         k,
         v,
@@ -230,8 +400,10 @@ def test_mha_int64_strides(
         max_seqlens_k,
         dropout_p=DROPOUT,
         causal=CAUSAL,
-        return_lse=True,
+        return_lse=return_lse,
+        backend=backend,
     )
+    triton_out = out[0] if return_lse else out
     if test_backward:
         triton_dq, triton_dk, triton_dv = torch.autograd.grad(
             triton_out, (q, k, v), do.clone()
@@ -256,8 +428,16 @@ def _test_mha_varlen_impl(
     RETURN_LSE: bool,
     RETURN_SOFTMAX: bool,
     CAUSAL: bool,
+    backend: str = "triton",
     dtype=torch.bfloat16,
 ):
+    skip_if_gluon_unsupported(
+        backend,
+        dropout_p=DROPOUT,
+        return_lse=RETURN_LSE,
+        return_attn_probs=RETURN_SOFTMAX,
+    )
+
     torch.set_printoptions(threshold=10000)
     torch.cuda.empty_cache()
     torch.manual_seed(20)
@@ -318,6 +498,7 @@ def _test_mha_varlen_impl(
         causal=CAUSAL,
         return_lse=RETURN_LSE,
         return_attn_probs=RETURN_SOFTMAX,
+        backend=backend,
     )
 
     if RETURN_LSE:
@@ -387,10 +568,11 @@ def _test_mha_varlen_impl(
     [(1, 1), (128, 128), (32, 16), (64, 128), (2048, 2048)],
 )
 @pytest.mark.parametrize(
-    "NUM_Q_HEADS, NUM_K_HEADS", [(1, 1), (16, 16), (2, 1), (48, 8)]
+    "NUM_Q_HEADS, NUM_K_HEADS", [(1, 1), (8, 1), (16, 16), (64, 8)]
 )
-@pytest.mark.parametrize("HEAD_SZ", [8, 32, 128])
+@pytest.mark.parametrize("HEAD_SZ", [8, 32, 33, 128])
 @pytest.mark.parametrize("CAUSAL", [(True), (False)])
+@pytest.mark.parametrize("backend", ["triton", "gluon"])
 def test_mha_varlen(
     BATCH: int,
     SEQLEN_Q: int,
@@ -399,6 +581,7 @@ def test_mha_varlen(
     NUM_K_HEADS: int,
     HEAD_SZ: int,
     CAUSAL: bool,
+    backend: str,
     dtype=torch.bfloat16,
 ):
     _test_mha_varlen_impl(
@@ -412,6 +595,7 @@ def test_mha_varlen(
         RETURN_LSE=False,
         RETURN_SOFTMAX=False,
         CAUSAL=CAUSAL,
+        backend=backend,
         dtype=dtype,
     )
 
