@@ -50,6 +50,25 @@ def silu_and_mul_quant(
 
 
 @compile_ops("module_activation", develop=True)
+def situv2_and_mul_quant(
+    out: Tensor,
+    input: Tensor,
+    scale: Tensor,
+    group_size: int,
+    beta: float,
+    linear_beta: float,
+    shuffle_scale: bool = False,
+) -> None:
+    """Apply SiTUv2 and per-token FP8 quantization.
+
+    All tensors must be contiguous ROCm tensors. ``input`` is BF16 with shape
+    ``[..., 2 * d]`` where ``d`` is divisible by 8, ``out`` is FP8 with
+    ``input.numel() / 2`` elements, and ``scale`` is FP32 with one element per
+    token. Only ``group_size == d`` and ``shuffle_scale=False`` are supported.
+    """
+
+
+@compile_ops("module_activation", develop=True)
 def gelu_and_mul(out: Tensor, input: Tensor) -> None: ...
 
 
