@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""gfx1250 prefill TopK with one workgroup per input row.
+"""gfx1250 one-block radix TopK with one block per input row.
 
 Short rows cache ordered keys in LDS. Long rows compact the selected radix
 bucket, while stable modes add deterministic index ordering and tie-breaking.
@@ -64,7 +64,7 @@ def _build_bitonic_schedule(capacity: int) -> tuple[tuple[int, ...], ...]:
 
 
 @cache
-def build_topk_per_row_prefill_one_workgroup_module(
+def build_radix_topk_one_block_gfx1250_module(
     k: int,
     block_threads: int = 1024,
     write_values: bool = False,
@@ -124,12 +124,12 @@ def build_topk_per_row_prefill_one_workgroup_module(
 
     @flyc.kernel(
         name=(
-            f"topk_per_row_prefill_1wg_gfx1250_k{k}_b{block_threads}"
+            f"radix_topk_one_block_gfx1250_k{k}_b{block_threads}"
             f"_v{int(write_values)}_s{int(stable)}"
         ),
         known_block_size=[block_threads, 1, 1],
     )
-    def topk_per_row_prefill_one_workgroup_kernel(
+    def radix_topk_one_block_gfx1250_kernel(
         input: fx.Tensor,
         row_starts: fx.Tensor,
         row_ends: fx.Tensor,
@@ -1201,7 +1201,7 @@ def build_topk_per_row_prefill_one_workgroup_module(
                 )
 
     @flyc.jit
-    def launch_topk_per_row_prefill_one_workgroup(
+    def launch_radix_topk_one_block_gfx1250(
         input: fx.Tensor,
         row_starts: fx.Tensor,
         row_ends: fx.Tensor,
@@ -1210,8 +1210,8 @@ def build_topk_per_row_prefill_one_workgroup_module(
         rows_m: fx.Int32,
         stream: fx.Stream,
     ):
-        topk_per_row_prefill_one_workgroup_kernel(
+        radix_topk_one_block_gfx1250_kernel(
             input, row_starts, row_ends, indices, values
         ).launch(grid=(rows_m, 1, 1), block=(block_threads, 1, 1), stream=stream)
 
-    return launch_topk_per_row_prefill_one_workgroup
+    return launch_radix_topk_one_block_gfx1250

@@ -419,7 +419,7 @@ def top_k_per_row_prefill(
     )
 
 
-def flydsl_top_k_per_row_prefill(
+def radix_topk_one_block_gfx1250(
     logits: torch.Tensor,
     rowStarts: torch.Tensor,
     rowEnds: torch.Tensor,
@@ -432,9 +432,9 @@ def flydsl_top_k_per_row_prefill(
     stable: bool = False,
     max_effective_row_len: int | None = None,
 ) -> None:
-    """Use FlyDSL for per-row prefill TopK."""
-    from .flydsl.topk_per_row_prefill import (
-        flydsl_top_k_per_row_prefill as _impl,
+    """Use the FlyDSL gfx1250 one-block radix TopK kernel."""
+    from .flydsl.radix_topk_one_block_gfx1250 import (
+        radix_topk_one_block_gfx1250 as _impl,
     )
 
     return _impl(
