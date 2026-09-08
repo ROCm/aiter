@@ -7,7 +7,6 @@
 #include "custom_all_reduce.cuh"
 #include "mla.h"
 #include "opus/opus.hpp"
-#include <cassert>
 #include <cstdio>
 #include <optional>
 #include <sstream>
@@ -461,8 +460,6 @@ __device__ void mla_reduce_v1_impl_massive(const MlaReduceKernelV1Params& params
     __syncthreads();
 
     const int32_t reduce_partial_map_0 = p_lds_reduce_partial_map[0];
-    // single-split tiles must come with reduce_final_map, i.e. with need_lse
-    assert(num_splits > 1 || params.use_reduce_final_map);
     // slot [1] isn't loaded when num_splits == 1
     const int32_t reduce_partial_map_1 =
         (num_splits > 1) ? p_lds_reduce_partial_map[1] : reduce_partial_map_0;
@@ -579,8 +576,6 @@ __device__ void mla_reduce_v1_impl_simple(const MlaReduceKernelV1Params& params,
     __syncthreads();
 
     const int32_t reduce_partial_map_0 = p_lds_reduce_partial_map[0];
-    // single-split tiles must come with reduce_final_map, i.e. with need_lse
-    assert(num_splits > 1 || params.use_reduce_final_map);
     // slot [1] isn't loaded when num_splits == 1
     const int32_t reduce_partial_map_1 =
         (num_splits > 1) ? p_lds_reduce_partial_map[1] : reduce_partial_map_0;
@@ -778,8 +773,9 @@ __launch_bounds__(Traits::kNumThreads, Traits::kOccupancy) __global__
                                                   p_lds);
             }
         }
-        // num_split==1 with real partial slot (!=1) means need_lse has been set
-        // so we need to reduce even this single split tile to get a correct final_lse
+        // The -1 sentinel is only produced by the v1_0 decode metadata, where a single-split
+        // tile has no partial to reduce. On the PS path no -1 is written, so this reduces to
+        // num_splits >= 1 and every tile (including unsplit ones) gets a correct final_lse.
         else if(num_splits > 1 ||
                 (num_splits == 1 && params.p_reduce_partial_map[reduce_tile_start] != -1))
         {
@@ -877,8 +873,9 @@ __launch_bounds__(Traits::kNumThreads, Traits::kOccupancy) __global__
                 p_lds);
         }
     }
-    // num_split==1 with real partial slot (!=1) means need_lse has been set
-    // so we need to reduce even this single split tile to get a correct final_lse
+    // The -1 sentinel is only produced by the v1_0 decode metadata, where a single-split
+    // tile has no partial to reduce. On the PS path no -1 is written, so this reduces to
+    // num_splits >= 1 and every tile (including unsplit ones) gets a correct final_lse.
     else if(num_splits > 1 ||
             (num_splits == 1 && params.p_reduce_partial_map[reduce_tile_start] != -1))
     {
