@@ -49,6 +49,17 @@ _BUF_COPY_ATOM = {
 BUF_VIEW_MAX_ELEMS = 0xFFFFFFFF
 
 
+def ptr_rsrc(ptr):
+    """Convert an fx.Pointer kernel arg to a buffer resource for buffer_load/store.
+
+    Kept for kernels still on the raw `buffer_ops` path; migrated kernels should
+    use `ptr_buf_tensor` instead.
+    """
+    from aiter.ops.flydsl.kernels import buffer_ops
+
+    return buffer_ops.create_buffer_resource_from_addr(fx.Int64(ptrtoint(ptr)))
+
+
 def buf_base_i64(base):
     """i64 base address of *base*: an fx pointer, a tensor/memref, or an address.
 
