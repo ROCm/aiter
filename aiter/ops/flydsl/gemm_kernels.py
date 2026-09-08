@@ -13,20 +13,52 @@ import torch
 from torch import Tensor
 
 from aiter import logger
-from aiter.jit.utils.chip_info import get_gfx
+from aiter.jit.utils.chip_info import (
+    get_cu_num,
+    get_gfx,
+    get_gfx_runtime,
+)
 
 from .kernels.gemm_a16w16_gfx950 import (
     SPLIT_K_SEMAPHORE_MAX_LEN,
     gemm_a16w16,
 )
+from .kernels.gemm_decode_block_mfma import compile_gemm_decode_block_mfma_bf16
+from .kernels.gemm_decode_common import (
+    ActivationSource,
+    BlockMfmaDecodeConfig,
+    ContractionMode,
+    DecodeConfig,
+    OutputRounding,
+    ReductionMode,
+    WaveDecodeConfig,
+    gemm_decode_kernel_name,
+    get_decode_arch_traits,
+    iter_gemm_decode_configs,
+    parse_gemm_decode_kernel_name,
+)
+from .kernels.gemm_decode_wave import compile_gemm_decode_wave_bf16
 from .kernels.tensor_shim import _run_compiled
 
 __all__ = [
     "SPLIT_K_SEMAPHORE_MAX_LEN",
+    "ActivationSource",
+    "BlockMfmaDecodeConfig",
+    "ContractionMode",
+    "DecodeConfig",
+    "OutputRounding",
+    "ReductionMode",
+    "WaveDecodeConfig",
+    "compile_gemm_decode_bf16",
     "flydsl_hgemm",
     "flydsl_hgemm_kernel_name",
     "flydsl_preshuffle_gemm_a8",
+    "gemm_decode_bf16",
+    "gemm_decode_kernel_name",
+    "get_decode_arch_traits",
     "get_flydsl_hgemm_kernel_params",
+    "iter_gemm_decode_configs",
+    "parse_gemm_decode_kernel_name",
 ]
 
 
@@ -120,6 +152,36 @@ def get_flydsl_hgemm_kernel_params(name: str) -> dict | None:
     }
 
 
+def _normalize_launch_stream(
+    device: torch.device,
+    stream: torch.cuda.Stream | None,
+) -> torch.cuda.Stream:
+    launch_stream = (
+        torch.cuda.current_stream(device=device) if stream is None else stream
+    )
+    if launch_stream.device != device:
+        raise ValueError(f"`stream` must be on {device}, got {launch_stream.device}")
+    return launch_stream
+
+def _validate_hgemm_bias(
+    a: torch.Tensor,
+    bias: torch.Tensor | None,
+    n: int,
+) -> None:
+    if bias is None:
+        return
+    if bias.dim() != 1:
+        raise ValueError(f"`bias` must be 1D, got bias.dim={bias.dim()}")
+    if bias.shape != (n,):
+        raise ValueError(f"`bias` must have shape {(n,)}, got {tuple(bias.shape)}")
+    if bias.dtype != a.dtype:
+        raise ValueError(
+            f"`bias` dtype must match input dtype, got {bias.dtype=} {a.dtype=}"
+        )
+    if bias.device != a.device:
+        raise ValueError(f"`bias` must be on {a.device}, got {bias.device}")
+
+
 def flydsl_hgemm(
     a: torch.Tensor,
     b: torch.Tensor,
@@ -181,9 +243,138 @@ def flydsl_hgemm(
     )
 
 
-# ---------------------------------------------------------------------------
-# FlyDSL preshuffle GEMM kernel management
-# ---------------------------------------------------------------------------
+def _overlaps(lhs: torch.Tensor, rhs: torch.Tensor) -> bool:
+    """Check if two tensors overlap in memory."""
+
+    def _storage_range(tensor: torch.Tensor) -> tuple[int, int]:
+        begin = tensor.data_ptr()
+        return begin, begin + tensor.numel() * tensor.element_size()
+
+    lhs_begin, lhs_end = _storage_range(lhs)
+    rhs_begin, rhs_end = _storage_range(rhs)
+    return lhs_begin < rhs_end and rhs_begin < lhs_end
+
+
+def validate_gemm_decode_tensors(
+    A: torch.Tensor,
+    B: torch.Tensor,
+    C: torch.Tensor,
+    bias: torch.Tensor | None = None,
+    arch: str | None = None,
+    check_overlap: bool = True,
+) -> tuple[int, int, int]:
+    """Validate the packed real-tensor ABI shared by both kernel families.
+
+    This runs per launch on the decode path, so it is deliberately flat: no
+    dicts, no helper calls, no tuple building. Same checks and messages as
+    before. `check_overlap` exists for callers that allocated C themselves and
+    therefore already know it cannot alias A or B.
+    """
+    for name, t in (("A", A), ("B", B), ("C", C)):
+        if not isinstance(t, torch.Tensor):
+            raise TypeError(f"{name} must be a torch.Tensor")
+        if t.dim() != 2:
+            raise ValueError(f"{name} must be rank 2, got rank {t.dim()}")
+        if t.dtype != torch.bfloat16:
+            raise ValueError(f"{name} must have dtype torch.bfloat16")
+        if t.device.type != "cuda":
+            raise ValueError(f"{name} must be on a CUDA/ROCm device")
+
+    m, k = A.shape
+    n, b_k = B.shape
+    if not (1 <= m <= 5):
+        raise ValueError("decode GEMM supports exact M in [1, 5]")
+    if n <= 0 or k <= 0:
+        raise ValueError("decode GEMM requires positive N and K")
+    if b_k != k:
+        raise ValueError(f"B must have shape ({n}, {k}), got {tuple(B.shape)}")
+    if A.device != B.device or A.device != C.device:
+        raise ValueError("A, B, and C must be on the same device")
+    _validate_hgemm_bias(A, bias, n)
+
+    for name, t, rows, cols in (("A", A, m, k), ("B", B, n, k), ("C", C, m, n)):
+        shape = t.shape
+        if shape[0] != rows or shape[1] != cols:
+            raise ValueError(
+                f"{name} must have shape {(rows, cols)}, got {tuple(shape)}"
+            )
+        stride = t.stride()
+        if stride[0] != cols or stride[1] != 1:
+            raise ValueError(f"{name} must use packed row-major storage")
+
+    if check_overlap and (_overlaps(C, A) or _overlaps(C, B)):
+        raise ValueError("C must not overlap A or B")
+    gfx = get_gfx_runtime() if arch is None else arch
+    if gfx not in ("gfx942", "gfx950"):
+        raise ValueError(f"decode GEMM requires gfx942 or gfx950, got {gfx}")
+    return m, n, k
+
+
+def compile_gemm_decode_bf16(
+    m: int,
+    n: int,
+    k: int,
+    config: DecodeConfig,
+    *,
+    arch: str,
+    num_cus: int | None = None,
+    has_bias: bool = False,
+):
+    """Compile one exact unified ``(arch, M, N, K, config)`` identity."""
+    if isinstance(config, WaveDecodeConfig):
+        return compile_gemm_decode_wave_bf16(
+            m,
+            n,
+            k,
+            config,
+            arch,
+            has_bias=has_bias,
+        )
+    if isinstance(config, BlockMfmaDecodeConfig):
+        return compile_gemm_decode_block_mfma_bf16(
+            m,
+            n,
+            k,
+            config,
+            arch,
+            num_cus=num_cus,
+            has_bias=has_bias,
+        )
+    raise TypeError(f"unsupported decode config type: {type(config).__name__}")
+
+
+def gemm_decode_bf16(
+    A: torch.Tensor,
+    B: torch.Tensor,
+    C: torch.Tensor,
+    config: DecodeConfig,
+    stream: torch.cuda.Stream | None = None,
+    *,
+    bias: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Launch one Wave or BlockMFMA configuration for the inferred exact shape."""
+    runtime_arch = get_gfx_runtime()
+    m, n, k = validate_gemm_decode_tensors(
+        A,
+        B,
+        C,
+        bias=bias,
+        arch=runtime_arch,
+    )
+    if bias is not None and not bias.is_contiguous():
+        raise ValueError("bias must be contiguous")
+    launch_stream = _normalize_launch_stream(A.device, stream)
+    launcher = compile_gemm_decode_bf16(
+        m,
+        n,
+        k,
+        config,
+        arch=runtime_arch,
+        num_cus=get_cu_num(),
+        has_bias=bias is not None,
+    )
+    launcher(A, B, C, bias=bias, stream=fx.Stream(launch_stream))
+    return C
 
 
 @functools.lru_cache(maxsize=1)
