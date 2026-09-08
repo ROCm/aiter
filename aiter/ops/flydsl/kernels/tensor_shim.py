@@ -15,8 +15,6 @@ from flydsl.compiler.protocol import extract_to_ir_values
 from flydsl.expr import ptrtoint, range_constexpr
 from flydsl.expr.typing import T
 
-from aiter.ops.flydsl.kernels import vector
-
 # Global toggle for the amdgpu-kernarg-preload compile hint used by the flydsl
 # kernels. Enabled by default; set AITER_FLYDSL_KERNARG_PRELOAD=0 to disable it
 # globally for all kernels. AITER_FLYDSL_KERNARG_PRELOAD_COUNT overrides the
@@ -485,26 +483,3 @@ class GTensor(TensorBase):
             _to_raw(fx.Int64(bytes_offset_i64)),
             llvm.IntegerOverflowFlags(0),
         ).result
-
-
-class STensor(TensorBase):
-    def __init__(self, memptr, dtype, shape, stride=None, base_offset=0):
-        super().__init__(dtype, shape, stride, base_offset)
-        self.memptr = memptr.get()
-
-    def load(self, offset, vec_size=1):
-        vec_t = T.vec(vec_size, self.dtype)
-        x = vector.load_op(vec_t, self.memptr, [offset])
-        if vec_size > 1:
-            return x
-        else:
-            x = vector.extract(x, static_position=[0], dynamic_position=[])
-            return x
-
-    def store(self, offset, value, vec_size=1):
-        if vec_size > 1:
-            vector.store(value, self.memptr, [offset], alignment=16)
-        else:
-            vec_t = T.vec(1, self.dtype)
-            vec = vector.from_elements(vec_t, [value])
-            vector.store(vec, self.memptr, [offset], alignment=16)

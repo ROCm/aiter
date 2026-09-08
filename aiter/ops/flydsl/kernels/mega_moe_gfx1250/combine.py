@@ -28,7 +28,6 @@ from flydsl.expr import arith, range_constexpr
 from flydsl.expr.typing import Int32, Int64, T
 
 from aiter.ops.flydsl.kernels import communication_ops_utils as comm_ops
-from aiter.ops.flydsl.kernels import vector
 from aiter.ops.flydsl.kernels.buffer_ops import (
     buffer_load,
     buffer_store,
@@ -65,14 +64,16 @@ def _V1I32():
 
 def _bf16_accum_funcs():
     def to_accum(i32_scalar):
-        return vector.bitcast(
-            _V2BF16(), vector.from_elements(_V1I32(), [i32_scalar])
-        ).extf(_V2F32())
+        return (
+            fx.Vector.from_elements([i32_scalar], fx.Numeric.from_ir_type(T.i32))
+            .bitcast(fx.Numeric.from_ir_type(T.bf16))
+            .extf(_V2F32())
+        )
 
     def from_accum(acc):
-        return vector.extract(
-            vector.bitcast(_V1I32(), acc.truncf(_V2BF16())), static_position=[0]
-        )
+        return fx.Vector(acc.truncf(_V2BF16()).bitcast(fx.Numeric.from_ir_type(T.i32)))[
+            0
+        ]
 
     def zero_accum():
         return to_accum(arith.constant(0))
@@ -247,10 +248,12 @@ def _make_combine_fused_reduce(
                     _v8f = T.vec(8, T.f32)
                     _vacc = arith.constant_vector(0.0, _v8f)
                     for k_slot in range_constexpr(topk):
-                        _vacc = _vacc + vector.bitcast(_v8bf, _pre[_r][k_slot]).extf(
-                            _v8f
-                        )
-                    _res = vector.bitcast(T.vec(4, T.i32), _vacc.truncf(_v8bf))
+                        _vacc = _vacc + fx.Vector(_pre[_r][k_slot]).bitcast(
+                            fx.Numeric.from_ir_type(T.bf16)
+                        ).extf(_v8f)
+                    _res = fx.Vector(_vacc.truncf(_v8bf)).bitcast(
+                        fx.Numeric.from_ir_type(T.i32)
+                    )
                     buffer_store(_res, rsrc_out, out_base + _off)
             for u in range(main_end + lane, eff, WAVE):
                 _one(unit_base + u)

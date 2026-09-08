@@ -70,7 +70,6 @@ from flydsl.expr.arith import ArithValue
 from flydsl.expr.typing import Int32, T
 from flydsl.runtime.device import get_rocm_arch
 
-from aiter.ops.flydsl.kernels import vector
 from aiter.ops.flydsl.kernels.kernels_common import (
     create_llvm_ptr,
     format_kernel_name,
@@ -389,16 +388,15 @@ def _emit_quant_block_loop(c: SimpleNamespace) -> None:
             # gfx1250 native pk8: this lane's 8 contiguous bf16 cols, as one
             # aligned dwordx4.
             dwords4 = _load_src_unit(lane_unit)
-            vec8_bf16_ty = T.vec(8, T.bf16)
             vec8_f32_ty = T.vec(8, f32)
-            bf16x8 = vector.bitcast(vec8_bf16_ty, dwords4)
+            bf16x8 = fx.Vector(dwords4).bitcast(fx.Numeric.from_ir_type(T.bf16))
             f32x8 = bf16x8.extf(vec8_f32_ty)
 
             # per-block amax over this lane's 8 elems, then a butterfly
             # shuffle_xor across the block's 4 lanes.
             block_amax = c.c0_f32
             for j in range_constexpr(8):
-                xj = vector.extract(f32x8, static_position=[j], dynamic_position=[])
+                xj = fx.Vector(f32x8)[j]
                 absj = llvm.call_intrinsic(f32, "llvm.fabs.f32", [xj], [], [])
                 block_amax = arith.maximumf(block_amax, absj)
             for dist in c.amax_shuffle_dists:
@@ -424,15 +422,13 @@ def _emit_quant_block_loop(c: SimpleNamespace) -> None:
         else:
             # this lane's two contiguous bf16 columns -- one dword.
             dword_raw = _load_src_unit(lane_unit)
-            vec1_i32_ty = T.vec(1, i32)
-            vec2_bf16_ty = T.vec(ELEMS_PER_LANE, T.bf16)
             vec2_f32_ty = T.vec(ELEMS_PER_LANE, f32)
-            bf16_pair = vector.bitcast(
-                vec2_bf16_ty, vector.from_elements(vec1_i32_ty, [dword_raw])
-            )
+            bf16_pair = fx.Vector.from_elements(
+                [dword_raw], fx.Numeric.from_ir_type(i32)
+            ).bitcast(fx.Numeric.from_ir_type(T.bf16))
             f32_pair = bf16_pair.extf(vec2_f32_ty)
-            x0 = vector.extract(f32_pair, static_position=[0], dynamic_position=[])
-            x1 = vector.extract(f32_pair, static_position=[1], dynamic_position=[])
+            x0 = fx.Vector(f32_pair)[0]
+            x1 = fx.Vector(f32_pair)[1]
 
             # per-block amax: max over this lane's 2 elems, then a butterfly
             # shuffle_xor across the block's 16 lanes.
