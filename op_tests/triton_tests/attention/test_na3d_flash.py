@@ -15,7 +15,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from aiter.jit.utils.chip_info import get_gfx
+from aiter.jit.utils.chip_info import get_gfx_runtime as get_gfx
 from aiter.ops.triton.attention.na3d_flash import na3d_flash_attn
 from aiter.test_common import checkAllclose
 

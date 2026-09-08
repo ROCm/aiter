@@ -18,7 +18,7 @@ import torch
 
 import aiter
 from aiter import dtypes
-from aiter.jit.utils.chip_info import get_gfx
+from aiter.jit.utils.chip_info import get_gfx_runtime as get_gfx
 from aiter.ops.triton.attention.na3d_flash import na3d_flash_attn
 from aiter.test_common import benchmark, checkAllclose, run_perftest
 from op_tests.triton_tests.attention.test_na3d_flash import (
@@ -86,7 +86,7 @@ def bench_na3d_flash(B, T, H, W, NH, HD, KT, KH, KW, dtype):
 def main():
     try:
         gfx = get_gfx()
-    except RuntimeError as e:
+    except (RuntimeError, KeyError) as e:
         aiter.logger.warning("na3d_flash: could not detect GPU arch, skipping (%s)", e)
         return
     if gfx not in SUPPORTED_GFX:
