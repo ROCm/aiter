@@ -1,21 +1,74 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Shared indexing helpers for the FlyDSL HSTU attention backward kernels.
+"""Shared helpers for the FlyDSL HSTU attention forward and backward kernels.
 
-The KV-owned (dV/dK) and Q-owned (dQ) kernels use the same address-computation
-idioms with operand roles relabelled. These are factored here so there is a
-single source of truth, and so the thread-coordinate decomposition is expressed
-with FlyDSL layout algebra (idx2crd over a make_layout) rather than hand-rolled
-integer division/modulo.
+Two kinds of helpers live here so there is a single source of truth across the
+forward, the KV-owned (dV/dK) backward, and the Q-owned (dQ) backward kernels:
 
-All helpers build FlyDSL expressions and must be called from inside a
-@flyc.kernel body.
+* Host-side geometry constants and small host helpers (dtype mapping, per-arch
+  DMA/swizzle parameters, LDS capacity) shared by all HSTU kernel builders.
+* FlyDSL-expression indexing idioms (thread-coordinate decomposition, jagged
+  loaders, LDS column swizzle). These build FlyDSL expressions and must be
+  called from inside a @flyc.kernel body.
 """
 
 from __future__ import annotations
 
+import functools
+import math as host_math
+
 import flydsl.expr as fx
+from flydsl.runtime.device import get_rocm_arch
+
+from aiter.jit.utils.chip_info import get_lds_capacity_bytes
+
+_LOG2E = host_math.log2(host_math.e)
+
+
+# ---- Kernel geometry constants (shared by forward and backward) ----
+
+WARP_SIZE = 64
+# grid decoded group-major for locality
+NUM_GRID_GROUPS = 8
+MFMA_M = 16
+MFMA_N = 16
+MFMA_K = 16
+MFMA_LANE_K = 4
+MFMA_LANE_K_LOG2 = 2
+assert (1 << MFMA_LANE_K_LOG2) == MFMA_LANE_K
+MFMA_ELEMS_PER_LANE = (MFMA_M * MFMA_N) // WARP_SIZE
+
+
+def _dtype_to_elem_type(dtype_str: str):
+    if dtype_str == "f16":
+        return fx.Float16
+    if dtype_str == "bf16":
+        return fx.BFloat16
+    raise ValueError(f"unsupported dtype: {dtype_str!r} (expected 'f16' or 'bf16')")
+
+
+def _arch_dma_params(arch: str | None = None):
+    """K-staging params (DMA_BYTES, DMA_ELEMS, K_SWZ_ROWS, K_SWZ_SHIFT).
+
+    K columns are XOR-swizzled off LDS banks: swizzled_col = col ^ ((row & (ROWS-1)) << SHIFT).
+    gfx942: 32 banks -> dword DMA -> (16, 2); gfx950: 64 banks -> dwordx4 DMA -> (8, 3).
+    Both tile a 64-element block and the mask maxes < 64, so the XOR stays in-row (HEAD_DIM_K % 64 == 0).
+    """
+    if arch is None:
+        arch = get_rocm_arch()
+    if (arch or "").startswith("gfx942"):
+        dma_bytes, k_swz_rows, k_swz_shift = 4, 16, 2
+    else:
+        dma_bytes, k_swz_rows, k_swz_shift = 16, 8, 3
+    return dma_bytes, dma_bytes // 2, k_swz_rows, k_swz_shift
+
+
+@functools.lru_cache(maxsize=16384)
+def lds_cap_bytes(arch: str | None = None) -> int:
+    if arch is None:
+        arch = get_rocm_arch()
+    return get_lds_capacity_bytes(arch)
 
 
 def decode_lane(tid, num_waves: int, warp_size: int, mfma_n: int):

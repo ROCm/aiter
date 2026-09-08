@@ -42,53 +42,22 @@ from flydsl.expr import arith, const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import Vector as Vec
 from flydsl.runtime.device import get_rocm_arch
 
-from aiter.jit.utils.chip_info import get_lds_capacity_bytes
 from aiter.ops.flydsl.kernels.hstu_attention_common import (
+    _LOG2E,
+    MFMA_ELEMS_PER_LANE,
+    MFMA_K,
+    MFMA_LANE_K,
+    MFMA_M,
+    MFMA_N,
+    NUM_GRID_GROUPS,
+    WARP_SIZE,
+    _arch_dma_params,
+    _dtype_to_elem_type,
     decode_lane,
     grouped_loader,
+    lds_cap_bytes,
     swz_col,
 )
-
-
-def _dtype_to_elem_type(dtype_str: str):
-    if dtype_str == "f16":
-        return fx.Float16
-    if dtype_str == "bf16":
-        return fx.BFloat16
-    raise ValueError(f"unsupported dtype: {dtype_str!r} (expected 'f16' or 'bf16')")
-
-
-# ---- Kernel Geometry Constants (shared with the forward) ----
-
-WARP_SIZE = 64
-NUM_GRID_GROUPS = 8
-MFMA_M = 16
-MFMA_N = 16
-MFMA_K = 16
-MFMA_LANE_K = 4
-MFMA_ELEMS_PER_LANE = (MFMA_M * MFMA_N) // WARP_SIZE  # 4 f32 per lane
-
-
-def _arch_dma_params(arch: str | None = None):
-    if arch is None:
-        arch = get_rocm_arch()
-    if (arch or "").startswith("gfx942"):
-        dma_bytes = 4  # CDNA3 dword
-        k_swz_rows, k_swz_shift = 16, 2
-    else:
-        dma_bytes = 16  # CDNA4 dwordx4
-        k_swz_rows, k_swz_shift = 8, 3
-    return dma_bytes, dma_bytes // 2, k_swz_rows, k_swz_shift
-
-
-@functools.lru_cache(maxsize=16384)
-def lds_cap_bytes(arch: str | None = None) -> int:
-    if arch is None:
-        arch = get_rocm_arch()
-    return get_lds_capacity_bytes(arch)
-
-
-_LOG2E = host_math.log2(host_math.e)
 
 
 def validate_hstu_attention_bwd(

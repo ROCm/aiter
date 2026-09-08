@@ -41,46 +41,19 @@ from flydsl.expr.typing import Vector as Vec
 from flydsl.runtime.device import get_rocm_arch
 
 from aiter.jit.utils.chip_info import get_lds_capacity_bytes
-
-_LOG2E = host_math.log2(host_math.e)
-
-
-def _dtype_to_elem_type(dtype_str: str):
-    if dtype_str == "f16":
-        return fx.Float16
-    if dtype_str == "bf16":
-        return fx.BFloat16
-    raise ValueError(f"unsupported dtype: {dtype_str!r} (expected 'f16' or 'bf16')")
-
-
-# ---- Kernel Geometry Constants ----
-
-WARP_SIZE = 64
-# grid decoded group-major for locality
-NUM_GRID_GROUPS = 8
-MFMA_M = 16
-MFMA_N = 16
-MFMA_K = 16
-MFMA_LANE_K = 4
-MFMA_LANE_K_LOG2 = 2
-assert (1 << MFMA_LANE_K_LOG2) == MFMA_LANE_K
-MFMA_ELEMS_PER_LANE = (MFMA_M * MFMA_N) // WARP_SIZE
-
-
-def _arch_dma_params(arch: str | None = None):
-    """K-staging params (DMA_BYTES, DMA_ELEMS, K_SWZ_ROWS, K_SWZ_SHIFT).
-
-    K columns are XOR-swizzled off LDS banks: swizzled_col = col ^ ((row & (ROWS-1)) << SHIFT).
-    gfx942: 32 banks -> dword DMA -> (16, 2); gfx950: 64 banks -> dwordx4 DMA -> (8, 3).
-    Both tile a 64-element block and the mask maxes < 64, so the XOR stays in-row (HEAD_DIM_K % 64 == 0).
-    """
-    if arch is None:
-        arch = get_rocm_arch()
-    if (arch or "").startswith("gfx942"):
-        dma_bytes, k_swz_rows, k_swz_shift = 4, 16, 2
-    else:
-        dma_bytes, k_swz_rows, k_swz_shift = 16, 8, 3
-    return dma_bytes, dma_bytes // 2, k_swz_rows, k_swz_shift
+from aiter.ops.flydsl.kernels.hstu_attention_common import (
+    _LOG2E,
+    MFMA_ELEMS_PER_LANE,
+    MFMA_K,
+    MFMA_LANE_K,
+    MFMA_LANE_K_LOG2,
+    MFMA_M,
+    MFMA_N,
+    NUM_GRID_GROUPS,
+    WARP_SIZE,
+    _arch_dma_params,
+    _dtype_to_elem_type,
+)
 
 
 def validate_hstu_attention_fwd(
