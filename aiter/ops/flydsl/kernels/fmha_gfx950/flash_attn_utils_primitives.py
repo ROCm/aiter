@@ -61,6 +61,13 @@ def _ds_read_tr8_b64_imm(result_type, addr_i32, imm_offset=0):
 
     Returns 64 bits = 8 fp8 (the fp8 analog of ds_read_b64_tr_b16's 4 bf16),
     used for the fp8 V transpose load.
+
+    LOAD-BEARING asm: ``fx.rocdl.cdna4.LDSReadTrans8_64b()`` is the equivalent
+    copy atom, but this flydsl exposes no immediate-offset state for it, so
+    ``fx.copy`` over ``fx.add_offset`` views materialises one GEP per read
+    (54 vs 20 in the kernel IR) instead of folding into the instruction's
+    ``offset:`` field. Measured cost of the atom form: +31% at D=192/Dv=192
+    (24 reads per V load), -2% at Dv=128. Revisit if the atom gains imm_offset.
     """
     imm = int(imm_offset)
     raw_type = ir.VectorType.get([2], ir.IntegerType.get_signless(32))
@@ -94,8 +101,18 @@ def _bitcast_f32(value):
 def _attn_mask_vec2_imm(rel_i32, neg_inf_i32, thr_x, thr_y, x_ref_i32, y_ref_i32):
     """Causal pair mask: ``rel < thr ? -inf : score``, on the f32 bit patterns.
 
-    Two independent selects sharing one ``rel`` operand; lowers to the same
-    v_cmp/v_cndmask pair the hand-written asm used to pin.
+    Two independent selects sharing one ``rel`` operand. This replaced a
+    hand-written ``2x v_cmp_lt_i32 + 2x v_cndmask_b32`` asm block whose
+    ``=s,=s`` + tied ``2,3`` constraints pinned the masks in SGPRs and let each
+    cndmask reuse its source register. The fx form is an exact 1:1 lowering
+    (32 asm blocks -> 64 arith.cmpi + 64 arith.select in the kernel IR) and is
+    bit-identical; it only hands register allocation back to the compiler.
+
+    Measured trade vs the asm form: varlen cross-causal -3.56% (299.7 -> 289.0us,
+    the compiler schedules better once the instructions are not pinned), varlen
+    self-causal +0.94% (42.16 -> 42.56us, dense-diagonal masking is where the
+    saved v_mov paid off). Net positive and it removes an inline asm that had a
+    perfectly good fx equivalent, so the fx form is what ships.
     """
     rel = fx.Int32(rel_i32)
     neg_inf = fx.Int32(neg_inf_i32)
