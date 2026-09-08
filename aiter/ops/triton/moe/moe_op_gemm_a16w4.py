@@ -3,12 +3,8 @@
 
 import itertools
 
-from aiter.ops.triton.moe.moe_op_gemm_a8w4 import get_kernel_config_gluon
 import torch
 import triton
-from aiter.ops.triton._gluon_kernels.gfx950.moe.moe_op_gemm_a16w4 import (
-    _moe_gemm_a16w4 as _moe_gemm_a16w4_gluon,
-)
 
 from aiter.ops.triton._gluon_kernels.gfx950.moe.moe_op_gemm_a16w4_swizzle import (
     _moe_gemm_a16w4 as _moe_gemm_a16w4_gluon_gfx950_swizzle,
@@ -16,7 +12,6 @@ from aiter.ops.triton._gluon_kernels.gfx950.moe.moe_op_gemm_a16w4_swizzle import
 from aiter.ops.triton._gluon_kernels.gfx950.moe.moe_op_gemm_a16w4_swizzle_pipelined import (
     _moe_gemm_a16w4 as _moe_gemm_a16w4_gluon_gfx950_swizzle_pipelined,
 )
-
 from aiter.ops.triton._gluon_kernels.gfx1250.moe.moe_op_gemm_a16w4 import (
     _moe_gemm_a16w4 as _moe_gemm_a16w4_gluon,
 )
@@ -30,7 +25,7 @@ from aiter.ops.triton.utils.logger import AiterTritonLogger
 
 _LOGGER = AiterTritonLogger()
 
-_GLUON_SUPPORTED_ARCHS = ("gfx1250","gfx950")
+_GLUON_SUPPORTED_ARCHS = ("gfx1250", "gfx950")
 
 
 def _is_gluon_available():
@@ -136,8 +131,9 @@ def get_kernel_config_triton(m, n, k, routing_data):
         "matrix_instr_nonkdim": 16,
         "kpack": 1,
     }
-    #print(f"m,n,k=({m},{n},{k}), ret={ret}")
+    # print(f"m,n,k=({m},{n},{k}), ret={ret}")
     return ret
+
 
 def get_kernel_config_gluon_gfx950_pipelined(m, n, k, routing_data):
     block_m = routing_data.block_m
@@ -153,9 +149,9 @@ def get_kernel_config_gluon_gfx950_pipelined(m, n, k, routing_data):
     if block_m == 16:
         block_n = 128
         num_warps = 4
-        #tile_per_warp = [1,1]
-        #matrix_instr_nonkdim = 32
-        tile_per_warp = [1,1]
+        # tile_per_warp = [1,1]
+        # matrix_instr_nonkdim = 32
+        tile_per_warp = [1, 1]
         matrix_instr_nonkdim = 32
 
         grid_m = routing_data.n_blocks(m, block_m)
@@ -169,21 +165,21 @@ def get_kernel_config_gluon_gfx950_pipelined(m, n, k, routing_data):
 
     elif block_m == 32:
         if n <= 1024:
-            tile_per_warp = [1,2]
+            tile_per_warp = [1, 2]
             block_n = 128
             num_warps = 4
         elif n <= 4096:
-            tile_per_warp = [1,2]
+            tile_per_warp = [1, 2]
             block_n = 256
             num_warps = 4
         else:
-            tile_per_warp = [1,2]
+            tile_per_warp = [1, 2]
             block_n = 256
             num_warps = 4
 
     else:
-        tile_per_warp = [2,2]
-        block_n =  64
+        tile_per_warp = [2, 2]
+        block_n = 64
         num_warps = 4
 
     ret = {
@@ -199,11 +195,12 @@ def get_kernel_config_gluon_gfx950_pipelined(m, n, k, routing_data):
         "waves_per_eu": 0,
         "matrix_instr_nonkdim": matrix_instr_nonkdim,
         "kpack": 1,
-        "tile_per_warp0" : tile_per_warp[0],
-        "tile_per_warp1" : tile_per_warp[1]
+        "tile_per_warp0": tile_per_warp[0],
+        "tile_per_warp1": tile_per_warp[1],
     }
-    #print(f"m,n,k=({m},{n},{k}), ret={ret}")
+    # print(f"m,n,k=({m},{n},{k}), ret={ret}")
     return ret
+
 
 def get_kernel_config_gluon_gfx950(m, n, k, routing_data):
     block_m = routing_data.block_m
@@ -215,12 +212,12 @@ def get_kernel_config_gluon_gfx950(m, n, k, routing_data):
     split_k = 1
     block_k = 256
     matrix_instr_nonkdim = 32
-    #matrix_instr_nonkdim = 16
+    # matrix_instr_nonkdim = 16
 
     if block_m == 16:
         block_n = 128
         num_warps = 4
-        tile_per_warp = [1,2]
+        tile_per_warp = [1, 2]
         matrix_instr_nonkdim = 16
 
         grid_m = routing_data.n_blocks(m, block_m)
@@ -234,21 +231,21 @@ def get_kernel_config_gluon_gfx950(m, n, k, routing_data):
 
     elif block_m == 32:
         if n <= 1024:
-            tile_per_warp = [2,2]
+            tile_per_warp = [2, 2]
             block_n = 128
             num_warps = 4
         elif n <= 4096:
-            tile_per_warp = [1,2]
+            tile_per_warp = [1, 2]
             block_n = 256
             num_warps = 4
         else:
-            tile_per_warp = [1,2]
+            tile_per_warp = [1, 2]
             block_n = 256
             num_warps = 4
 
     else:
-        tile_per_warp = [2,2]
-        block_n =  256
+        tile_per_warp = [2, 2]
+        block_n = 256
         num_warps = 4
 
     ret = {
@@ -264,11 +261,12 @@ def get_kernel_config_gluon_gfx950(m, n, k, routing_data):
         "waves_per_eu": 0,
         "matrix_instr_nonkdim": matrix_instr_nonkdim,
         "kpack": 1,
-        "tile_per_warp0" : tile_per_warp[0],
-        "tile_per_warp1" : tile_per_warp[1]
+        "tile_per_warp0": tile_per_warp[0],
+        "tile_per_warp1": tile_per_warp[1],
     }
-    #print(f"m,n,k=({m},{n},{k}), ret={ret}")
+    # print(f"m,n,k=({m},{n},{k}), ret={ret}")
     return ret
+
 
 def get_kernel_config_gluon_gfx1250(m, n, k, routing_data):
     block_m = routing_data.block_m
@@ -302,6 +300,7 @@ def get_kernel_config_gluon_gfx1250(m, n, k, routing_data):
     }
     return ret
 
+
 def swizzle_scales_gfx950(data):
     NON_K_PRESHUFFLE_BLOCK_SIZE = 32
     block_shape = data.shape
@@ -313,6 +312,7 @@ def swizzle_scales_gfx950(data):
     E = block_shape[0]
     data = data.reshape(E, N // 32, SCALE_K * 32)
     return data.transpose(-1, -2)
+
 
 def swizzle_scales_gfx1250(data):
     E, K_SCALE, N = data.shape
@@ -426,19 +426,21 @@ def moe_gemm_a16w4(
     if backend == "gluon":
         use_pipelined_gluon = False
         if get_arch() == "gfx1250":
-            config = get_kernel_config_gluon(M, N, K, routing_data)
+            config = get_kernel_config_gluon_gfx1250(M, N, K, routing_data)
         elif get_arch() == "gfx950":
-            #Currently on gfx950, gluon kernels requires that swizzling is enabled
-            #and K % 256 == 0. Otherwise, fallback to Triton backend
+            # Currently on gfx950, gluon kernels requires that swizzling is enabled
+            # and K % 256 == 0. Otherwise, fallback to Triton backend
             mask_k_limit = K % 256
             if mask_k_limit != 0 or swizzle_mx_scale is None:
                 backend = "triton"
                 config = get_kernel_config_triton(M, N, K, routing_data)
             else:
-                #For smaller M, pipelined kernel performs much better
-                use_pipelined_gluon = True if M <=16 else False
+                # For smaller M, pipelined kernel performs much better
+                use_pipelined_gluon = M <= 16
                 if use_pipelined_gluon:
-                    config = get_kernel_config_gluon_gfx950_pipelined(M, N, K, routing_data)       
+                    config = get_kernel_config_gluon_gfx950_pipelined(
+                        M, N, K, routing_data
+                    )
                 else:
                     config = get_kernel_config_gluon_gfx950(M, N, K, routing_data)
 
@@ -544,63 +546,63 @@ def moe_gemm_a16w4(
                 matrix_instr_nonkdim=config["matrix_instr_nonkdim"],
                 kpack=config["kpack"],
             )
-        else: #gfx950 gluon
+        else:  # gfx950 gluon
             if use_pipelined_gluon:
-              _moe_gemm_a16w4_gluon_gfx950_swizzle_pipelined[grid,](
-              y,
-              y.stride(0),
-              y.stride(1),
-              y.stride(2),
-              x,
-              x.stride(0),
-              x.stride(1),
-              w,
-              w.stride(0),
-              w.stride(1),
-              w.stride(2),
-              w_scales,
-              w_scales.stride(0),  # stride_w_mx_e
-              w_scales.stride(1),  # stride_w_mx_k
-              w_scales.stride(2),  # stride_w_mx_n
-              bias,
-              stride_bias,
-              gammas,
-              M,
-              N,
-              K,
-              gather_indx,
-              expt_hist,
-              expt_token_offs_raw,
-              expt_hist_sum,
-              expt_block_pid_map,
-              grid_m,
-              grid_n,
-              apply_swiglu_matmul,
-              alpha,
-              limit,
-              reduction_n_matmul,
-              swiglu_add_residual,
-              routing_data.n_expts_act,
-              config["block_m"],
-              config["block_n"],
-              config["block_k"],
-              config["group_m"],
-              XCD_SWIZZLE=config["xcd_swizzle"],
-              NUM_BUFFERS=config["num_stages"],
-              SWIZZLE_MX_SCALE=swizzle_mx_scale,
-              SPLIT_K=config["split_k"],
-              MASK_K_LIMIT=K % config["block_k"],
-              NUM_FULL_K=K // config["block_k"],
-              W_CACHE_MODIFIER=config["w_cache_modifier"],
-              num_warps=config["num_warps"],
-              num_stages=config["num_stages"],
-              TILE_PER_WARP_0=config["tile_per_warp0"],
-              TILE_PER_WARP_1=config["tile_per_warp1"],
-              UPCAST_INDICES=should_upcast_indices(x, w, y),
-              waves_per_eu=config["waves_per_eu"],
-              matrix_instr_nonkdim=config["matrix_instr_nonkdim"],
-              kpack=config["kpack"],
-            )
+                _moe_gemm_a16w4_gluon_gfx950_swizzle_pipelined[grid,](
+                    y,
+                    y.stride(0),
+                    y.stride(1),
+                    y.stride(2),
+                    x,
+                    x.stride(0),
+                    x.stride(1),
+                    w,
+                    w.stride(0),
+                    w.stride(1),
+                    w.stride(2),
+                    w_scales,
+                    w_scales.stride(0),  # stride_w_mx_e
+                    w_scales.stride(1),  # stride_w_mx_k
+                    w_scales.stride(2),  # stride_w_mx_n
+                    bias,
+                    stride_bias,
+                    gammas,
+                    M,
+                    N,
+                    K,
+                    gather_indx,
+                    expt_hist,
+                    expt_token_offs_raw,
+                    expt_hist_sum,
+                    expt_block_pid_map,
+                    grid_m,
+                    grid_n,
+                    apply_swiglu_matmul,
+                    alpha,
+                    limit,
+                    reduction_n_matmul,
+                    swiglu_add_residual,
+                    routing_data.n_expts_act,
+                    config["block_m"],
+                    config["block_n"],
+                    config["block_k"],
+                    config["group_m"],
+                    XCD_SWIZZLE=config["xcd_swizzle"],
+                    NUM_BUFFERS=config["num_stages"],
+                    SWIZZLE_MX_SCALE=swizzle_mx_scale,
+                    SPLIT_K=config["split_k"],
+                    MASK_K_LIMIT=K % config["block_k"],
+                    NUM_FULL_K=K // config["block_k"],
+                    W_CACHE_MODIFIER=config["w_cache_modifier"],
+                    num_warps=config["num_warps"],
+                    num_stages=config["num_stages"],
+                    TILE_PER_WARP_0=config["tile_per_warp0"],
+                    TILE_PER_WARP_1=config["tile_per_warp1"],
+                    UPCAST_INDICES=should_upcast_indices(x, w, y),
+                    waves_per_eu=config["waves_per_eu"],
+                    matrix_instr_nonkdim=config["matrix_instr_nonkdim"],
+                    kpack=config["kpack"],
+                )
             else:
                 _moe_gemm_a16w4_gluon_gfx950_swizzle[(grid,)](
                     y,
@@ -657,7 +659,7 @@ def moe_gemm_a16w4(
                     matrix_instr_nonkdim=config["matrix_instr_nonkdim"],
                     kpack=config["kpack"],
                 )
-    else: #triton
+    else:  # triton
         _moe_gemm_a16w4_triton[(grid,)](
             y,
             y.stride(0),
@@ -709,8 +711,7 @@ def moe_gemm_a16w4(
             matrix_instr_nonkdim=config["matrix_instr_nonkdim"],
             kpack=config["kpack"],
         )
-  
-    
+
     # Build grouped reduction inputs in a uniform way
     group_indx = (
         None

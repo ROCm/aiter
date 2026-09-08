@@ -11,7 +11,6 @@ import torch
 from aiter.ops.triton.moe.moe_op_gemm_a16w4 import (
     moe_gemm_a16w4,
     moe_gemm_torch,
-    swizzle_scales_gfx950
 )
 
 # routing utilities
@@ -73,10 +72,9 @@ def init_compute_data(
     torch.manual_seed(0)
     in_m = m * (n_expts_act if gindx is None else 1)
     shape_x = (in_m, k)
-    x = alloc_rand(shape_x, device=device, dtype=act_dtype) #row-major
-    w = alloc_rand((n_expts_tot, k, n), device=device, dtype=weight_dtype) #row-major
+    x = alloc_rand(shape_x, device=device, dtype=act_dtype)  # row-major
+    w = alloc_rand((n_expts_tot, k, n), device=device, dtype=weight_dtype)  # row-major
     bias = alloc_rand((n_expts_tot, n), device=device, dtype=torch.float32)
-    #bias = torch.zeros((n_expts_tot, n), device=device,dtype=torch.float32)
     if has_y_gammas:
         gamma = 2 ** torch.randint(
             -5, 0, (m * n_expts_act,), device=device, dtype=torch.float32
@@ -216,7 +214,6 @@ class Case:
 @pytest.mark.parametrize("has_y_gammas", [False, True])
 @pytest.mark.parametrize("apply_swiglu", [False, True])
 @pytest.mark.parametrize("backend", [None, "gluon", "triton"])
-#@pytest.mark.parametrize("backend", ["triton"])
 def test_op(
     m,
     n,
@@ -283,12 +280,8 @@ def test_op(
     x_ref, w_ref, bias_ref = x_tri.clone(), w_tri.clone(), bias_tri.clone()
 
     # downcast to mxfp
-    #print(f"Before downcast w_tri.shape={w_tri.shape} w_tri.stride={w_tri.stride()} {w_tri.is_contiguous()}")
     w_tri, w_scale_tri = downcast_to_mxfp(w_tri, weight_dtype, axis=1)
     w_ref = upcast_from_mxfp(w_tri, w_scale_tri, torch.bfloat16, axis=1)
-    #print(f"After downcast w_tri.shape={w_tri.shape} w_tri.stride={w_tri.stride()} {w_tri.is_contiguous()}")
-    #print(f"After downcast w_scale_tri.shape={w_scale_tri.shape} w_scale_tri.stride={w_scale_tri.stride()} {w_scale_tri.is_contiguous()}")
-    #print(f"After downcast w_scale_tri={w_scale_tri}")
     if hbm_swizzling:
         w_scale_tri, swizzle_mx_scale = shuffle_scale_moe(
             w_scale_tri, preshuffle_factor=32, scale_kwidth=8, return_layout=True
@@ -307,8 +300,6 @@ def test_op(
         x_ref, w_ref, bias_ref, rdata, gindx, sindx, gammas, apply_swiglu
     )
 
-    #print(f"w_tri.shape={w_tri.shape}")
-    #print(f"w_scale_tri.shape={w_scale_tri.shape}")
     tri_y = moe_gemm_a16w4(
         x_tri,
         w_tri,

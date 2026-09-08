@@ -1,14 +1,14 @@
 import torch
-import triton
+import triton.experimental.gluon.language as gl
 import triton.language as tl
 from triton.experimental import gluon
-import triton.experimental.gluon.language as gl
 
-from aiter.ops.triton.utils._triton.pid_preprocessing import remap_xcd, pid_grid
 from aiter.ops.triton._triton_kernels.moe.activations import _swiglu
+from aiter.ops.triton.utils._triton.pid_preprocessing import pid_grid, remap_xcd
+
 
 def matmul_launch_metadata(grid, kernel, args):
-    ret = dict()
+    ret = {}
     M, N, K = None, args["N"], args["K"]
     Y, X, W = args["Y"], args["X"], args["W"]
     hist = args["ExptHist"]
@@ -99,6 +99,7 @@ def unswizzle_mx_scale_cdna4(
 
     return x
 
+
 @gluon.jit(launch_metadata=matmul_launch_metadata)
 def _moe_gemm_a16w4(
     Y,
@@ -156,9 +157,9 @@ def _moe_gemm_a16w4(
     TILE_PER_WARP_0: gl.constexpr,
     TILE_PER_WARP_1: gl.constexpr,
     UPCAST_INDICES: gl.constexpr = False,
-    matrix_instr_nonkdim: gl.constexpr = 16
+    matrix_instr_nonkdim: gl.constexpr = 16,
 ):
-    #TODO add gl.assume
+    # TODO add gl.assume
     gl.assume(stride_y_m >= 0)
     gl.assume(stride_y_n >= 0)
     gl.assume(stride_x_m >= 0)
@@ -186,7 +187,7 @@ def _moe_gemm_a16w4(
     OUT_BLOCK_N: gl.constexpr = BLOCK_N // ACTIVATION_REDUCTION_N
     yN = N // ACTIVATION_REDUCTION_N
 
-    pid = gl.program_id(0)    
+    pid = gl.program_id(0)
     index_type: gl.constexpr = gl.int64 if UPCAST_INDICES else gl.int32
 
     if XCD_SWIZZLE != 1:
@@ -204,7 +205,7 @@ def _moe_gemm_a16w4(
     expt_data = gl.load(ExptData + pid_m)
     if XCD_SWIZZLE == 1 and expt_data == -1:
         return
-    
+
     expt_id = expt_data & 0x0000FFFF
     block_id = expt_data >> 16
     M = gl.load(ExptHist + expt_id)
@@ -240,54 +241,57 @@ def _moe_gemm_a16w4(
         size_per_thread=[1, 4],
         threads_per_warp=[1, 64],
         warps_per_cta=[num_warps, 1],
-        order=[1, 0]
+        order=[1, 0],
     )
 
     MFMA_LAYOUT: gl.constexpr = gl.amd.AMDMFMALayout(
-        version=4, instr_shape=[16, 16,  matrix_instr_nonkdim], transposed=True, warps_per_cta=[1, num_warps], tiles_per_warp=[TILE_PER_WARP_0, TILE_PER_WARP_1]
+        version=4,
+        instr_shape=[16, 16, matrix_instr_nonkdim],
+        transposed=True,
+        warps_per_cta=[1, num_warps],
+        tiles_per_warp=[TILE_PER_WARP_0, TILE_PER_WARP_1],
     )
 
-    DOT_LAYOUT_X: gl.constexpr = gl.DotOperandLayout(operand_index=0, parent=MFMA_LAYOUT, k_width=8)
-    DOT_LAYOUT_W: gl.constexpr = gl.DotOperandLayout(operand_index=1, parent=MFMA_LAYOUT, k_width=8)
-    # Packed B operand (kWidth=4): W is loaded from LDS straight into this, so the
-    # axis=0 scaled_upcast output is already DOT_LAYOUT_W -- no transpose/convert.
-    DOT_LAYOUT_W_PACKED: gl.constexpr = gl.DotOperandLayout(operand_index=1, parent=MFMA_LAYOUT, k_width=4)
+    DOT_LAYOUT_X: gl.constexpr = gl.DotOperandLayout(
+        operand_index=0, parent=MFMA_LAYOUT, k_width=8
+    )
+    DOT_LAYOUT_W_PACKED: gl.constexpr = gl.DotOperandLayout(
+        operand_index=1, parent=MFMA_LAYOUT, k_width=4
+    )
 
     # TTGIR shared layouts: #shared2 (X), #shared (W, K-major), #shared1 (scale).
     SHARED_LAYOUT_X: gl.constexpr = gl.SwizzledSharedLayout(8, 1, 16, order=[1, 0])
-    SHARED_LAYOUT_W: gl.constexpr = gl.SwizzledSharedLayout(16, 1, 8, order=[0, 1])  # vec=16 matches async 128-bit i8 write
-    SHARED_LAYOUT_W_SCALES: gl.constexpr = gl.SwizzledSharedLayout(1, 1, 1, order=[1, 0])
+    SHARED_LAYOUT_W: gl.constexpr = gl.SwizzledSharedLayout(
+        16, 1, 8, order=[0, 1]
+    )  # vec=16 matches async 128-bit i8 write
+    SHARED_LAYOUT_W_SCALES: gl.constexpr = gl.SwizzledSharedLayout(
+        1, 1, 1, order=[1, 0]
+    )
     # N-major consume layout for the scale local_load before unswizzle/broadcast.
-
-
-    REG_WS_CONSUME_LAYOUT: gl.constexpr = gl.DistributedLinearLayout(
-        reg_bases=[[0, 64], [0, 128], [0, 2], [0, 1]],
-        lane_bases=[[0, 4], [0, 8], [0, 16], [0, 32], [0, 0], [0, 0]],
-        warp_bases=[[1, 0], [2, 0]],
-        block_bases=[],
-        shape=[4, 256],
-    )   
 
     # X / gather offsets
     X_base = X
     if GatherIndx is None:
         X_base += start_m * stride_x_m
-        offs_x_m_l = (BLOCK_M * block_id + gl.arange(0, BLOCK_M, layout=gl.SliceLayout(1, LOAD_LAYOUT_X))) % M
+        offs_x_m_l = (
+            BLOCK_M * block_id
+            + gl.arange(0, BLOCK_M, layout=gl.SliceLayout(1, LOAD_LAYOUT_X))
+        ) % M
         offs_x_m_l = tl.max_contiguous(tl.multiple_of(offs_x_m_l % M, BLOCK_M), BLOCK_M)
     else:
         if GatherIndx.dtype.element_ty == gl.uint16:
             IDX_LAYOUT: gl.constexpr = gl.SliceLayout(
-                0, gl.BlockedLayout([1,16], [64,1], [1,num_warps], [0,1])
-            )            
+                0, gl.BlockedLayout([1, 16], [64, 1], [1, num_warps], [0, 1])
+            )
         else:
             gl.static_assert(
                 GatherIndx.dtype.element_ty == gl.int32,
-                "Gather index datatype should be uint16 or int32", 
+                "Gather index datatype should be uint16 or int32",
             )
             IDX_LAYOUT: gl.constexpr = gl.SliceLayout(
-                0, gl.BlockedLayout([1,8], [64, 1], [1, num_warps], [0,1])
+                0, gl.BlockedLayout([1, 8], [64, 1], [1, num_warps], [0, 1])
             )
-        
+
         offs_x_m = BLOCK_M * block_id + gl.arange(0, BLOCK_M, layout=IDX_LAYOUT)
         mask_idx = offs_x_m < M
         offs_x_m = offs_x_m % M
@@ -296,22 +300,31 @@ def _moe_gemm_a16w4(
         offs_x_m = gl.where(mask_idx, offs_x_m, 0)
         offs_x_m_l = gl.convert_layout(offs_x_m, gl.SliceLayout(1, LOAD_LAYOUT_X))
     offs_x_k_l = gl.arange(0, BLOCK_K, layout=gl.SliceLayout(0, LOAD_LAYOUT_X))
-    x_offsets = offs_x_m_l.to(index_type)[:, None]*stride_x_m + offs_x_k_l.to(index_type)[None, :]*stride_x_k
+    x_offsets = (
+        offs_x_m_l.to(index_type)[:, None] * stride_x_m
+        + offs_x_k_l.to(index_type)[None, :] * stride_x_k
+    )
 
-    #W pointers
+    # W pointers
     W_base = W + expt_id * stride_w_e
     # Wrap along N so a block extending past N (BLOCK_N need not divide N) does
     # not read out of bounds; the extra columns are masked out at store time.
     # K-major W tile [PACKED_BLOCK_K_W, PACKED_BLOCK_N_W] (K on axis 0).
-    offs_w_n = (pid_n * PACKED_BLOCK_N_W + gl.arange(0, PACKED_BLOCK_N_W, gl.SliceLayout(0, LOAD_LAYOUT_W))) % (N // W_N_DIVISOR)
+    offs_w_n = (
+        pid_n * PACKED_BLOCK_N_W
+        + gl.arange(0, PACKED_BLOCK_N_W, gl.SliceLayout(0, LOAD_LAYOUT_W))
+    ) % (N // W_N_DIVISOR)
     offs_w_n = tl.max_contiguous(
         tl.multiple_of(offs_w_n % (N // W_N_DIVISOR), PACKED_BLOCK_N_W),
         PACKED_BLOCK_N_W,
     )
     offs_w_k = gl.arange(0, PACKED_BLOCK_K_W, gl.SliceLayout(1, LOAD_LAYOUT_W))
-    w_offsets = offs_w_k.to(index_type)[:, None] * stride_w_k + offs_w_n.to(index_type)[None, :] * stride_w_n
+    w_offsets = (
+        offs_w_k.to(index_type)[:, None] * stride_w_k
+        + offs_w_n.to(index_type)[None, :] * stride_w_n
+    )
 
-    #W scale pointers
+    # W scale pointers
     WMxScale_base = WMxScale + expt_id * stride_w_mx_e
     gl.static_assert(stride_w_mx_k is not None)
     gl.static_assert(stride_w_mx_n is not None)
@@ -319,28 +332,43 @@ def _moe_gemm_a16w4(
     PACKED_MX_BLOCK: gl.constexpr = MX_SCALE_BLOCK_K * PRESHUFFLE_FACTOR
     SCALE_BLOCK_N: gl.constexpr = BLOCK_N // PRESHUFFLE_FACTOR
 
-    offs_w_n_scale = (pid_n * SCALE_BLOCK_N + gl.arange(0, SCALE_BLOCK_N, gl.SliceLayout(1, LOAD_LAYOUT_WS))) % N
+    offs_w_n_scale = (
+        pid_n * SCALE_BLOCK_N
+        + gl.arange(0, SCALE_BLOCK_N, gl.SliceLayout(1, LOAD_LAYOUT_WS))
+    ) % N
     offs_w_n_scale = tl.max_contiguous(
         tl.multiple_of(offs_w_n_scale, SCALE_BLOCK_N), SCALE_BLOCK_N
     )
     offs_w_k_scale = gl.arange(0, PACKED_MX_BLOCK, gl.SliceLayout(0, LOAD_LAYOUT_WS))
-    w_scale_offsets = offs_w_k_scale.to(index_type)[None, :] * stride_w_mx_k + offs_w_n_scale.to(index_type)[:, None] * stride_w_mx_n 
+    w_scale_offsets = (
+        offs_w_k_scale.to(index_type)[None, :] * stride_w_mx_k
+        + offs_w_n_scale.to(index_type)[:, None] * stride_w_mx_n
+    )
 
     # v2: stage X/W/scale global -> LDS directly via async buffer_load_to_shared
     # (no register intermediate). The load layouts satisfy the CDNA4 direct-to-LDS
     # constraint (size_per_thread(contiguous) * elem_bits in {32, 128}). W is then
     # loaded from shared straight into the packed dot operand so the axis=0
     # scaled_upcast output is already DOT_LAYOUT_W -- no transpose, no bf16 convert.
-    x_smem = gl.allocate_shared_memory(X.dtype.element_ty, [NUM_BUFFERS, BLOCK_M, BLOCK_K], SHARED_LAYOUT_X)
-    w_smem = gl.allocate_shared_memory(W.dtype.element_ty, [NUM_BUFFERS, PACKED_BLOCK_K_W, PACKED_BLOCK_N_W], SHARED_LAYOUT_W)
-    ws_smem = gl.allocate_shared_memory(WMxScale.dtype.element_ty, [NUM_BUFFERS, SCALE_BLOCK_N, PACKED_MX_BLOCK], SHARED_LAYOUT_W_SCALES)
+    x_smem = gl.allocate_shared_memory(
+        X.dtype.element_ty, [NUM_BUFFERS, BLOCK_M, BLOCK_K], SHARED_LAYOUT_X
+    )
+    w_smem = gl.allocate_shared_memory(
+        W.dtype.element_ty,
+        [NUM_BUFFERS, PACKED_BLOCK_K_W, PACKED_BLOCK_N_W],
+        SHARED_LAYOUT_W,
+    )
+    ws_smem = gl.allocate_shared_memory(
+        WMxScale.dtype.element_ty,
+        [NUM_BUFFERS, SCALE_BLOCK_N, PACKED_MX_BLOCK],
+        SHARED_LAYOUT_W_SCALES,
+    )
 
     acc = gl.zeros((BLOCK_M, BLOCK_N), dtype=gl.float32, layout=MFMA_LAYOUT)
 
-    #num_k_iter = gl.cdiv(K, BLOCK_K)
+    # num_k_iter = gl.cdiv(K, BLOCK_K)
     num_k_iter = NUM_FULL_K
 
-    
     # Double-buffered software pipeline: the next tile's global->LDS async copy
     # is issued and in flight while the current tile is consumed + MFMA'd. Only
     # NUM_BUFFERS-1 groups are awaited so the newest copy overlaps compute.
@@ -348,11 +376,15 @@ def _moe_gemm_a16w4(
     write_idx = 0
 
     # Prologue: kick off tile 0's async loads.
-    gl.amd.cdna4.async_copy.buffer_load_to_shared(x_smem.index(write_idx), X_base, x_offsets)
+    gl.amd.cdna4.async_copy.buffer_load_to_shared(
+        x_smem.index(write_idx), X_base, x_offsets
+    )
     gl.amd.cdna4.async_copy.buffer_load_to_shared(
         w_smem.index(write_idx), W_base, w_offsets, cache_modifier=W_CACHE_MODIFIER
     )
-    gl.amd.cdna4.async_copy.buffer_load_to_shared(ws_smem.index(write_idx), WMxScale_base, w_scale_offsets)
+    gl.amd.cdna4.async_copy.buffer_load_to_shared(
+        ws_smem.index(write_idx), WMxScale_base, w_scale_offsets
+    )
     gl.amd.cdna4.async_copy.commit_group()
     write_idx += 1
     X_base += BLOCK_K * stride_x_k
@@ -361,11 +393,18 @@ def _moe_gemm_a16w4(
 
     for k in range(num_k_iter - 1):
         # Prefetch the next tile into the alternate buffer.
-        gl.amd.cdna4.async_copy.buffer_load_to_shared(x_smem.index(write_idx % NUM_BUFFERS), X_base, x_offsets)
         gl.amd.cdna4.async_copy.buffer_load_to_shared(
-            w_smem.index(write_idx % NUM_BUFFERS), W_base, w_offsets, cache_modifier=W_CACHE_MODIFIER
+            x_smem.index(write_idx % NUM_BUFFERS), X_base, x_offsets
         )
-        gl.amd.cdna4.async_copy.buffer_load_to_shared(ws_smem.index(write_idx % NUM_BUFFERS), WMxScale_base, w_scale_offsets)
+        gl.amd.cdna4.async_copy.buffer_load_to_shared(
+            w_smem.index(write_idx % NUM_BUFFERS),
+            W_base,
+            w_offsets,
+            cache_modifier=W_CACHE_MODIFIER,
+        )
+        gl.amd.cdna4.async_copy.buffer_load_to_shared(
+            ws_smem.index(write_idx % NUM_BUFFERS), WMxScale_base, w_scale_offsets
+        )
         gl.amd.cdna4.async_copy.commit_group()
         write_idx += 1
 
@@ -386,11 +425,12 @@ def _moe_gemm_a16w4(
 
         w_scales = w_scales.trans(1, 0)
         w_scale_layout: gl.constexpr = gl.amd.get_scaled_upcast_fp4_scale_layout(
-            w, MX_PACK_DIVISOR, gl.bfloat16, axis=0)
+            w, MX_PACK_DIVISOR, gl.bfloat16, axis=0
+        )
         w_scales = gl.convert_layout(w_scales, w_scale_layout)
 
         w_bf16 = gl.amd.cdna4.scaled_upcast(w, w_scales, gl.bfloat16, axis=0)
-        
+
         acc = gl.amd.cdna4.mfma(x, w_bf16, acc)
 
     # Last tile: drain all outstanding copies.
@@ -405,17 +445,17 @@ def _moe_gemm_a16w4(
 
     w_scales = w_scales.trans(1, 0)
     w_scale_layout: gl.constexpr = gl.amd.get_scaled_upcast_fp4_scale_layout(
-            w, MX_PACK_DIVISOR, gl.bfloat16, axis=0)
+        w, MX_PACK_DIVISOR, gl.bfloat16, axis=0
+    )
     w_scales = gl.convert_layout(w_scales, w_scale_layout)
 
     w_bf16 = gl.amd.cdna4.scaled_upcast(w, w_scales, gl.bfloat16, axis=0)
-    
-    acc = gl.amd.cdna4.mfma(x, w_bf16, acc)
 
+    acc = gl.amd.cdna4.mfma(x, w_bf16, acc)
 
     GLOBAL_STORE_LAYOUT_Y: gl.constexpr = MFMA_LAYOUT
     offs_out_n = BLOCK_N * pid_n + gl.arange(
-            0, BLOCK_N, gl.SliceLayout(0, GLOBAL_STORE_LAYOUT_Y)
+        0, BLOCK_N, gl.SliceLayout(0, GLOBAL_STORE_LAYOUT_Y)
     )
     offs_out_m = BLOCK_M * block_id + gl.arange(
         0, BLOCK_M, gl.SliceLayout(1, GLOBAL_STORE_LAYOUT_Y)
@@ -423,7 +463,7 @@ def _moe_gemm_a16w4(
 
     if B is not None:
         bias = gl.amd.cdna3.buffer_load(
-            B + expt_id * stride_b_e ,
+            B + expt_id * stride_b_e,
             offs_out_n,
             mask=offs_out_n < N,
             other=0.0,
@@ -447,9 +487,7 @@ def _moe_gemm_a16w4(
         out = acc
 
     if Gammas is not None:
-        gammas = gl.load(
-            Gammas + start_m + offs_out_m, mask=offs_out_m < M, other=0.0
-        )
+        gammas = gl.load(Gammas + start_m + offs_out_m, mask=offs_out_m < M, other=0.0)
         out = out * gammas[:, None]
 
     # Store Y (output N is OUT_BLOCK_N / yN after the activation reduction).
@@ -465,7 +503,3 @@ def _moe_gemm_a16w4(
     gl.amd.cdna3.buffer_store(
         out.to(Y.dtype.element_ty), Y, y_offsets, mask=mask_m[:, None] & mask_n[None, :]
     )
-    
-
-
-    

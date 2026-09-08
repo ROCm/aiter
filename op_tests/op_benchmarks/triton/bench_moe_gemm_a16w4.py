@@ -12,13 +12,13 @@ import torch
 import triton.profiler as proton
 
 from aiter.ops.triton.gemm.basic.gemm_a16w16 import gemm_a16w16
-from aiter.ops.triton.moe.moe_op_gemm_a16w4 import (
-    moe_gemm_a16w4,
-    swizzle_scales_gfx950
-)
+from aiter.ops.triton.moe.moe_op_gemm_a16w4 import moe_gemm_a16w4
 from aiter.ops.triton.moe.moe_routing.routing import routing
 from aiter.ops.triton.moe.quant_moe import downcast_to_mxfp
-from aiter.ops.triton.utils._triton.arch_info import get_arch
+from aiter.ops.triton.utils._triton.arch_info import (
+    get_arch,
+    is_mx_scale_preshuffling_avail,
+)
 from aiter.ops.triton.utils.shuffle import shuffle_scale_moe
 
 
@@ -100,9 +100,9 @@ def compute_roofline(
             f"{intensity_proxy_name}: {val:5d} | "
             f"Total latency (us): {total_latency_us:.2f} | "
             f"Kernel latency (us): {kernel_latency_us:.2f} | "
-            f"FLOPS: {perf["flops"]:.2f} | "
-            f"Bytes: {perf["bytes"]:.2f} | "
-            f"AI: {perf["flops"] / perf["bytes"]:.2f} | "
+            f"FLOPS: {perf['flops']:.2f} | "
+            f"Bytes: {perf['bytes']:.2f} | "
+            f"AI: {perf['flops'] / perf['bytes']:.2f} | "
             f"TFLOPS: {tflops:#.4g} | "
             f"TBPS: {tbps:.2f}"
         )
@@ -142,8 +142,15 @@ def compute_roofline(
 
 def check_and_shuffle_scales(scale, N, K):
     if N % 32 == 0 and K % (32 * 8) == 0:
-        scale = swizzle_scales_gfx950(scale)
-        return scale, "CDNA4_SCALE"
+        if is_mx_scale_preshuffling_avail():
+            scale = shuffle_scale_moe(
+                scale, arch=get_arch(), preshuffle_factor=32, scale_kwidth=8
+            )
+            if get_arch() == "gfx1250":
+                swizzle_mx_scale = "GFX1250_SCALE"
+            else:
+                swizzle_mx_scale = "CDNA4_SCALE"
+        return scale, swizzle_mx_scale
     else:
         return scale, None
 
@@ -194,8 +201,6 @@ def bench_mlp_single_weight_init(
     wg, _ = quantize(wg, "bf16")
     w1, w1_scale = quantize(w1, w_dtype)
     w2, w2_scale = quantize(w2, w_dtype)
-    #print(f"After quantize w1.shape={w1.shape}, w2.shape={w2.shape} ")
-    #print(f"After quantize w1_scale.shape={w1_scale.shape}, w2_scale.shape={w2_scale.shape} ")
     w1_scale, swizzle_mx_scale1 = check_and_shuffle_scales(w1_scale, dim2 // TP, dim1)
     w2_scale, swizzle_mx_scale2 = check_and_shuffle_scales(
         w2_scale, dim1, dim2 // TP // 2
@@ -227,7 +232,7 @@ def bench_mlp_single_weight_init(
             swizzle_mx_scale=swizzle_mx_scale1,
             out_dtype=x_dtype_torch,
             apply_swiglu=True,
-            backend=backend
+            backend=backend,
         )
         x = moe_gemm_a16w4(
             x,
@@ -242,7 +247,7 @@ def bench_mlp_single_weight_init(
             swizzle_mx_scale=swizzle_mx_scale2,
             out_dtype=x_dtype_torch,
             apply_swiglu=False,
-            backend=backend
+            backend=backend,
         )
 
     proton.finalize()
@@ -262,12 +267,21 @@ def bench_mlp(
     TP,
     op_regex,
     num_weight_inits=1,
-    backend=None
+    backend=None,
 ):
     all_results = []
     for _ in range(num_weight_inits):
         result = bench_mlp_single_weight_init(
-            batch, dim1, dim2, n_expts_tot, n_expts_act, x_dtype, w_dtype, TP, op_regex, backend
+            batch,
+            dim1,
+            dim2,
+            n_expts_tot,
+            n_expts_act,
+            x_dtype,
+            w_dtype,
+            TP,
+            op_regex,
+            backend,
         )
         all_results.append(result)
 
@@ -366,6 +380,12 @@ def parse_args(args: list[str] | None = None):
         default="gluon",
         help="gluon or triton backend",
     )
+    parser.add_argument(
+        "--TP",
+        type=int,
+        default=1,
+        help="Tensor Parallelism(TP)",
+    )
     return parser.parse_args(args=args)
 
 
@@ -390,7 +410,6 @@ def main(args: list[str] | None = None) -> None:
 
     quantized_dtypes = ["bf16", "mx4"]
 
-    print(f"batch_sizes_moe={batch_sizes_moe}")
     roofline_mlp(
         batch_sizes_moe,
         dim1,
@@ -399,13 +418,11 @@ def main(args: list[str] | None = None) -> None:
         active_experts,
         quantized_dtypes[0],
         quantized_dtypes[1],
-        #TP=1,
-        TP=8,
+        TP=parsed_args.TP,
         op_regex=parsed_args.op_regex,
-        #name="gpt-oss-x2",
-        name="DSV4-Flash",
+        name="default-model",
         num_weight_inits=parsed_args.num_weight_inits,
-        backend=parsed_args.backend
+        backend=parsed_args.backend,
     )
 
 
