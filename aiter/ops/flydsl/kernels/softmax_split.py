@@ -137,7 +137,10 @@ def build_softmax_split(M, N, dtype_str="bf16", *, device=None):
 
     @flyc.jit
     def launch(
-        X: fx.Tensor, P: fx.Tensor, Y: fx.Tensor, stream: fx.Stream = fx.Stream(None)  # noqa: B008 - FlyDSL stream annotation
+        X: fx.Tensor,
+        P: fx.Tensor,
+        Y: fx.Tensor,
+        stream: fx.Stream = fx.Stream(None),  # noqa: B008 - FlyDSL stream annotation
     ):
         partials(X, P).launch(grid=(M * chunks, 1, 1), block=(256, 1, 1), stream=stream)
         normalize(X, P, Y).launch(

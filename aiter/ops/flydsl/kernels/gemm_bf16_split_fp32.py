@@ -63,7 +63,11 @@ def build_gemm_bf16_split_fp32(m, n, config=None, *, device=None):
             y[row, col] = x[row, col].to(fx.BFloat16)
 
     @flyc.jit
-    def cast(X: fx.Tensor, Y: fx.Tensor, stream: fx.Stream = fx.Stream(None)):  # noqa: B008 - FlyDSL stream annotation
+    def cast(
+        X: fx.Tensor,
+        Y: fx.Tensor,
+        stream: fx.Stream = fx.Stream(None),  # noqa: B008 - FlyDSL stream annotation
+    ):
         convert(X, Y).launch(
             grid=((m * n + 255) // 256, 1, 1), block=(256, 1, 1), stream=stream
         )
