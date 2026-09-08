@@ -44,7 +44,7 @@ Usage:
 
     # narrow the perf sweep:
     HIP_VISIBLE_DEVICES=7 python3 op_tests/test_flydsl_causal_conv1d_update.py \
-        --mode vllm_verify -l qkvz_slice -b 128 -s 4
+        --mode vllm_verify -l qkvz_slice -b 128 --seqlen 4
 """
 
 from __future__ import annotations
@@ -60,6 +60,7 @@ import pytest
 import torch
 
 import aiter
+from aiter import dtypes
 from aiter.jit.utils.chip_info import get_gfx
 from aiter.test_common import benchmark, checkAllclose, run_perftest
 
@@ -1894,7 +1895,17 @@ def test_causal_conv1d_update_perf(
 
     ret = {"gfx": get_gfx(), "dtype": _DTYPE_NAME[dtype]}
     for name, (fn, extra) in candidates.items():
-        out = fn(**fresh(extra))
+        # The kernel mutates both x and conv_state, so correctness gets a
+        # one-iteration run on fresh buffers while the reported timing gets a
+        # second fresh set that run_perftest may replay freely.
+        out, _ = run_perftest(
+            fn,
+            **fresh(extra),
+            num_iters=1,
+            num_warmup=0,
+            num_rotate_args=1,
+            use_cuda_event=True,
+        )
         _, us = run_perftest(fn, **fresh(extra))
         # No reshaping: the oracle was handed the same `x` the candidates get, so
         # its answer already has the call site's own shape, packed or 2D.
@@ -1902,8 +1913,8 @@ def test_causal_conv1d_update_perf(
         ret[f"{name} TFLOPS"] = flops / us / 1e6
         ret[f"{name} TB/s"] = nbytes / us / 1e6
         ret[f"{name} err"] = checkAllclose(
-            out.float(),
-            ref.spec.float(),
+            out.to(dtypes.fp32),
+            ref.spec.to(dtypes.fp32),
             rtol=1e-2,
             atol=1e-2,
             msg=f"{name}: {label}",
@@ -1934,9 +1945,6 @@ def test_perf_row_agrees_with_the_spec(mode):
 # -- CI entry point -------------------------------------------------------
 
 
-_DTYPE_BY_NAME = {name: dt for dt, name in _DTYPE_NAME.items()}
-
-
 def _parse_args():
     parser = argparse.ArgumentParser(
         formatter_class=argparse.RawTextHelpFormatter,
@@ -1953,7 +1961,6 @@ def _parse_args():
     )
     parser.add_argument("-w", "--width", type=int, nargs="*", default=[4])
     parser.add_argument(
-        "-s",
         "--seqlen",
         type=int,
         nargs="*",
@@ -1965,10 +1972,10 @@ def _parse_args():
     parser.add_argument(
         "-d",
         "--dtype",
-        type=str,
+        type=dtypes.str2Dtype,
         nargs="*",
-        default=["bf16"],
-        choices=sorted(_DTYPE_BY_NAME),
+        default="bf16,",
+        choices=sorted(_DTYPE_NAME, key=str),
         help="""Storage dtype. Both are specialized and both are checked for
         correctness; the sweep defaults to bf16 because that is what the call
         sites run.""",
@@ -1992,39 +1999,41 @@ def _parse_args():
 
 
 def _run_perf_sweep(args):
-    rows = []
-    # Sweep order, slowest to fastest changing: mode, layout, dtype, width, ...
-    for mode, layout, dtype, width, seqlen, dim, batch in itertools.product(
-        args.mode,
-        args.layout,
-        args.dtype,
-        args.width,
-        args.seqlen,
-        args.dim,
-        args.batch,
-    ):
-        # A one-token speculative window is the `vllm_decode` row under another
-        # name.
-        if (seqlen == 1) != (mode == "vllm_decode"):
-            continue
-        if layout not in _MODE_LAYOUTS[mode]:
-            continue
-        rows.append(
-            test_causal_conv1d_update_perf(
-                batch=batch,
-                dim=dim,
-                width=width,
-                seqlen=seqlen,
-                mode=mode,
-                layout=layout,
-                dtype=_DTYPE_BY_NAME[dtype],
+    # Candidate sets differ by contract, so each mode gets its own table rather
+    # than scattering inapplicable vLLM/SGLang columns with NaN.
+    for mode in args.mode:
+        rows = []
+        for layout, dtype, width, seqlen, dim, batch in itertools.product(
+            args.layout,
+            args.dtype,
+            args.width,
+            args.seqlen,
+            args.dim,
+            args.batch,
+        ):
+            # A one-token speculative window is the `vllm_decode` row under
+            # another name.
+            if (seqlen == 1) != (mode == "vllm_decode"):
+                continue
+            if layout not in _MODE_LAYOUTS[mode]:
+                continue
+            rows.append(
+                test_causal_conv1d_update_perf(
+                    batch=batch,
+                    dim=dim,
+                    width=width,
+                    seqlen=seqlen,
+                    mode=mode,
+                    layout=layout,
+                    dtype=dtype,
+                )
             )
-        )
-    if rows:
-        aiter.logger.info(
-            "flydsl causal_conv1d_update perf (markdown):\n%s",
-            pd.DataFrame(rows).to_markdown(index=False),
-        )
+        if rows:
+            aiter.logger.info(
+                "flydsl causal_conv1d_update %s perf (markdown):\n%s",
+                mode,
+                pd.DataFrame(rows).to_markdown(index=False),
+            )
 
 
 def main():

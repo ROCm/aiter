@@ -36,7 +36,7 @@ Usage:
 
     # narrow the perf sweep:
     HIP_VISIBLE_DEVICES=7 python3 op_tests/test_flydsl_gdr_mtp.py \
-        --mode vllm_chain -b 32 -s 4
+        --mode vllm_chain -b 32 --seqlen 4
 """
 
 from __future__ import annotations
@@ -44,7 +44,6 @@ from __future__ import annotations
 import argparse
 import itertools
 import os
-import statistics
 import sys
 from typing import NamedTuple
 
@@ -53,6 +52,7 @@ import pytest
 import torch
 
 import aiter
+from aiter import dtypes
 from aiter.jit.utils.chip_info import get_gfx
 from aiter.test_common import benchmark, checkAllclose, run_perftest
 
@@ -127,12 +127,10 @@ SOFTPLUS_THRESHOLD = 20.0
 #: One mantissa step of the storage dtype: 2**-(mantissa bits + 1).
 _DTYPE_EPS = {torch.bfloat16: 2.0**-8, torch.float16: 2.0**-11}
 _DTYPE_NAME = {torch.bfloat16: "bf16", torch.float16: "fp16"}
-_DTYPE_BY_NAME = {"bf16": torch.bfloat16, "fp16": torch.float16}
 
 #: The state dtype is the one that moves the bytes: at the large-batch rows the
 #: pool is most of the traffic.
 _STATE_DTYPE_NAME = {torch.float32: "fp32", torch.bfloat16: "bf16"}
-_STATE_DTYPE_BY_NAME = {v: k for k, v in _STATE_DTYPE_NAME.items()}
 
 #: How many of those steps a result may accumulate, scaled per element by the
 #: conditioning bound from `_magnitudes`. Loose because the recurrence compounds
@@ -1327,10 +1325,6 @@ _SAMPLE_BUDGET_US = 20_000
 _MIN_ITERS = 101
 _MAX_ITERS = 2001
 
-# A cell whose repeats disagree by more than this was not measured, whatever the
-# median says.
-_SPREAD_WARN_PCT = 5.0
-
 
 @benchmark()
 def test_gdr_mtp_perf(
@@ -1340,17 +1334,11 @@ def test_gdr_mtp_perf(
     num_v_heads: int = 8,
     dtype: torch.dtype = torch.bfloat16,
     state_dtype: torch.dtype = STATE_DTYPE,
-    repeats: int = 1,
 ) -> dict:
     """One row of the perf table: every candidate timed and checked on one shape.
 
     The defaults are a small row, so importing this under pytest costs a few
     cheap launches; ``main()`` sweeps the real shapes.
-
-    ``repeats`` above one times every candidate that many times and reports the
-    median, warning on any cell whose samples disagree by more than
-    ``_SPREAD_WARN_PCT``. One sample sees a candidate that has fallen off a
-    cliff, but does not support a claim of a few percent.
 
     Each mode is measured against the upstream that defines its interface:
 
@@ -1490,9 +1478,18 @@ def test_gdr_mtp_perf(
 
     errs = {}
     for name, fn in candidates.items():
+        # Keep the checked output tied to run_perftest without comparing a state
+        # after the repeated timing pass against the original-state oracle.
+        out, _ = run_perftest(
+            fn,
+            num_iters=1,
+            num_warmup=0,
+            num_rotate_args=1,
+            use_cuda_event=True,
+        )
         errs[name] = checkAllclose(
-            fn().reshape(p.v.shape).float(),
-            ref.spec.reshape(p.v.shape).float(),
+            out.reshape(p.v.shape).to(dtypes.fp32),
+            ref.spec.reshape(p.v.shape).to(dtypes.fp32),
             rtol=1e-2,
             atol=1e-2,
             msg=f"{name}: {label}",
@@ -1507,17 +1504,13 @@ def test_gdr_mtp_perf(
     )
     num_iters = min(_MAX_ITERS, max(_MIN_ITERS, int(_SAMPLE_BUDGET_US / probe)))
 
-    # Round-robin, so the clock's drift over a row falls on every candidate
-    # alike instead of on whichever one held the window it drifted in.
-    # ``num_rotate_args`` is pinned for the same reason: at zero it is derived
-    # from free GPU memory at the moment of the call, and every candidate is a
-    # closure over its own tensors with no argument list to rotate.
-    samples = {name: [] for name in candidates}
-    for _ in range(repeats):
-        for name, fn in candidates.items():
-            samples[name].append(
-                run_perftest(fn, num_iters=num_iters, num_rotate_args=1)[1]
-            )
+    # Pin rotation equally for every candidate. At zero it is derived from free
+    # GPU memory at call time, while these candidates are closures with no
+    # argument list to rotate.
+    timings = {
+        name: run_perftest(fn, num_iters=num_iters, num_rotate_args=1)[1]
+        for name, fn in candidates.items()
+    }
 
     ret = {
         "gfx": get_gfx(),
@@ -1525,20 +1518,7 @@ def test_gdr_mtp_perf(
         "state_dtype": _STATE_DTYPE_NAME[state_dtype],
     }
     for name in candidates:
-        seen = samples[name]
-        us = statistics.median(seen)
-        # The median keeps one bad sample out of the number but cannot say the
-        # number was worth taking, so a wide spread is reported with it.
-        spread = 100 * (max(seen) - min(seen)) / us
-        if spread > _SPREAD_WARN_PCT:
-            aiter.logger.warning(
-                "gdr_mtp: %s: %s spread %.1f%% over %d repeats; "
-                "treat that cell as unmeasured",
-                label,
-                name,
-                spread,
-                repeats,
-            )
+        us = timings[name]
         ret[f"{name} us"] = us
         ret[f"{name} TFLOPS"] = flops / us / 1e6
         ret[f"{name} TB/s"] = nbytes / us / 1e6
@@ -1575,7 +1555,6 @@ def _parse_args():
     )
     parser.add_argument("-b", "--batch", type=int, nargs="*", default=[1, 128])
     parser.add_argument(
-        "-s",
         "--seqlen",
         type=int,
         nargs="*",
@@ -1596,17 +1575,17 @@ def _parse_args():
     parser.add_argument(
         "-d",
         "--dtype",
-        type=str,
+        type=dtypes.str2Dtype,
         nargs="*",
-        default=["bf16"],
-        choices=sorted(_DTYPE_BY_NAME),
+        default="bf16,",
+        choices=sorted(_DTYPE_NAME, key=str),
     )
     parser.add_argument(
         "--state-dtype",
-        type=str,
+        type=dtypes.str2Dtype,
         nargs="*",
-        default=["fp32"],
-        choices=sorted(_STATE_DTYPE_BY_NAME),
+        default="fp32,",
+        choices=sorted(_STATE_DTYPE_NAME, key=str),
         help="""Recurrent state dtype, swept separately from the activation
         dtype because it is the one that sets the traffic: the pool is most of
         what the large-batch rows move. The snapshot follows the state, since a
@@ -1616,14 +1595,6 @@ def _parse_args():
     )
     parser.add_argument(
         "--mode", type=str, nargs="*", default=list(BENCH_MODES), choices=BENCH_MODES
-    )
-    parser.add_argument(
-        "--repeats",
-        type=int,
-        default=3,
-        help="""Times each candidate is measured; the table reports the median
-        and a cell whose samples disagree is warned about. One sample per cell
-        is not enough to compare kernels within a few percent of each other.""",
     )
     return parser.parse_args()
 
@@ -1636,9 +1607,8 @@ def _run_perf_sweep(args):
                 seqlen=seqlen,
                 mode=mode,
                 num_v_heads=num_v_heads,
-                dtype=_DTYPE_BY_NAME[dtype],
-                state_dtype=_STATE_DTYPE_BY_NAME[state_dtype],
-                repeats=args.repeats,
+                dtype=dtype,
+                state_dtype=state_dtype,
             )
             for dtype, state_dtype, num_v_heads, seqlen, batch in itertools.product(
                 args.dtype, args.state_dtype, args.num_v_heads, args.seqlen, args.batch
