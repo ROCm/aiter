@@ -2352,7 +2352,7 @@ def compile_mixed_moe_gemm1_common(
 
                 def precompute_row(*, row_local, row):
                     fused2 = fx.ptr_load(lds_tid + fx.Int32(row_local)).ir_value()
-                    row_i32 = arith.index_cast(T.i32, row)
+                    row_i32 = fx.Int32(row)
                     row_valid0 = arith.cmpi(CmpIPredicate.ult, row_i32, num_valid_i32)
                     t = fused2 & mask24_i32
                     s = fused2 >> 24
@@ -3532,8 +3532,6 @@ def compile_mixed_moe_gemm2_common(
             i64_t = fx.Numeric.from_ir_type(i64)
             vec4_f32 = T.vec(4, f32)
             vec16_elems = 16 if a_elem_bytes == 1 else 8
-            vec8_elems = 8 if a_elem_bytes == 1 else 4
-            vec4_elems = 4 if a_elem_bytes == 1 else 2
 
             def ptr_buffer_resource(ptr, num_records_bytes):
                 addr = fx.ptrtoint(ptr)
@@ -4238,9 +4236,6 @@ def compile_mixed_moe_gemm2_common(
                         load_a_scale_tile(base_k, k_shift_bits),
                         load_b_scale_tile(base_k, k_shift_bits, by_n_p=by_n_p),
                     ]
-
-                T.vec(vec8_elems, x_elem)
-                T.vec(vec4_elems, x_elem)
 
                 def store_x_tile_to_lds(vec_x_in_parts, lds_base):
                     for i in range_constexpr(num_x_loads):
@@ -5008,7 +5003,7 @@ def compile_mixed_moe_gemm2_common(
                             None,
                         )
                     fused2 = fx.ptr_load(lds_tid + fx.Int32(row_local)).ir_value()
-                    row_i32 = arith.index_cast(T.i32, row)
+                    row_i32 = fx.Int32(row)
                     row_valid0 = arith.cmpi(CmpIPredicate.ult, row_i32, num_valid_i32)
                     t = fused2 & mask24_i32
                     s = fused2 >> 24

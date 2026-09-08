@@ -58,10 +58,6 @@ def _V2F32():
     return T.vec(2, T.f32)
 
 
-def _V1I32():
-    return T.vec(1, T.i32)
-
-
 def _bf16_accum_funcs():
     def to_accum(i32_scalar):
         return (
