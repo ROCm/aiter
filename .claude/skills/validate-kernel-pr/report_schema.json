@@ -309,9 +309,12 @@
       ],
       "properties": {
         "target": {
-          "type": "string",
+          "type": [
+            "string",
+            "null"
+          ],
           "minLength": 1,
-          "description": "Exact script file or pytest node/file selected by the caller."
+          "description": "Exact script file or pytest node/file selected by the caller. Null means the caller declared, with a reason in test_provenance_reason, that no test exercises this change -- which is a blocker, not an absence."
         },
         "shape_env": {
           "type": "string",
@@ -464,9 +467,10 @@
             "pre-existing",
             "pr-added",
             "pr-modified",
+            "none",
             "unknown"
           ],
-          "description": "Where the evidence came from, relative to the patch. A pre-existing test was not written to make this PR pass; a pr-added or pr-modified one was written by the same hand as the code it grades and can pass vacuously. Both are worth running, only one is independent, and a report that says only 'the target passed' has hidden which it got."
+          "description": "Where the evidence came from, relative to the patch. A pre-existing test was not written to make this PR pass; a pr-added or pr-modified one was written by the same hand as the code it grades and can pass vacuously. Both are worth running, only one is independent, and a report that says only 'the target passed' has hidden which it got. 'none' is the caller's declaration that no test exercises the change at all."
         },
         "test_provenance_reason": {
           "type": "string",

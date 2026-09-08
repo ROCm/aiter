@@ -244,6 +244,9 @@ class ValidatorFixture:
         # obligation met for every test whose subject is something else; the tests that ARE
         # about independence pass grid_novelty=None to exercise the undeclared path.
         grid_novelty="these cells are outside the fixture target's own defaults",
+        # The caller's declaration that they looked and no test exercises the change. Mutually
+        # exclusive with `tests`, exactly as the two flags are on the command line.
+        no_target=None,
     ):
         report = self.root / f"{patch.stem}-report.json"
         # `cwd` exists for one reason: the validator has to accept RELATIVE --patch/--out from
@@ -259,8 +262,7 @@ class ValidatorFixture:
             patch_arg,
             "--head-sha",
             "b" * 40,
-            "--target",
-            tests,
+            *(["--no-target", no_target] if no_target else ["--target", tests]),
             "--expected-route",
             expected_route,
             "--shape-vars",
@@ -405,6 +407,78 @@ class ValidateKernelPrTests(unittest.TestCase):
         for stage in report["stages"].values():
             self.assertIsInstance(stage, dict)
             self.assertIn("status", stage)
+
+    def test_a_change_with_no_test_at_all_is_a_blocker_not_a_usage_error(self):
+        # It used to be a usage error: the caller who looked and found nothing had no way to say
+        # so, the run died before writing anything, and the PR went unvalidated rather than red.
+        patch = self.fixture.make_patch(self.harmless_change, "no-test.patch")
+        result, report = self.fixture.validate(
+            patch, no_target="nothing under tests/ imports the changed entry point"
+        )
+
+        self.assertEqual(1, result.returncode)
+        self.assertEqual("BLOCK", report["verdict"])
+        self.assertEqual("none", report["test_selection"]["test_provenance"])
+        self.assertIsNone(report["test_selection"]["target"])
+        self.assertTrue(
+            any(
+                finding["severity"] == "blocker"
+                and "nothing under tests/" in finding["detail"]
+                for finding in report["findings"]
+            ),
+            report["findings"],
+        )
+
+    def test_the_no_test_blocker_still_names_the_head_it_is_about(self):
+        # A report review-pr cannot bind to the PR head is not evidence about that PR, so the
+        # blocker is published after the merge simulation rather than at argument parsing.
+        patch = self.fixture.make_patch(self.harmless_change, "no-test-head.patch")
+        _, report = self.fixture.validate(patch, no_target="no test exercises this")
+
+        self.assertEqual("b" * 40, report["repo"]["head"])
+        self.assertEqual("pass", report["stages"]["merge_sim"]["status"])
+
+    def test_a_forgotten_target_is_a_usage_error_and_never_a_blocker(self):
+        # The one substitution this must not make: a caller's slip published as a finding against
+        # the author. The absence has to be declared, with a reason, like the runner is.
+        patch = self.fixture.make_patch(self.harmless_change, "forgotten.patch")
+        report_path = self.fixture.root / "forgotten-report.json"
+        result = run(
+            [
+                str(VALIDATOR),
+                "--repo",
+                str(self.fixture.repo),
+                "--patch",
+                str(patch),
+                "--out",
+                str(report_path),
+            ],
+            check=False,
+        )
+
+        self.assertEqual(2, result.returncode)
+        self.assertIn("--target or --no-target", result.stderr)
+        self.assertFalse(report_path.exists())
+
+    def test_declaring_both_a_target_and_its_absence_is_refused(self):
+        patch = self.fixture.make_patch(self.harmless_change, "both.patch")
+        result = run(
+            [
+                str(VALIDATOR),
+                "--repo",
+                str(self.fixture.repo),
+                "--patch",
+                str(patch),
+                "--target",
+                "tests/test_sample.py",
+                "--no-target",
+                "there is no test",
+            ],
+            check=False,
+        )
+
+        self.assertEqual(2, result.returncode)
+        self.assertIn("contradict", result.stderr)
 
     def test_no_gpu_is_inconclusive_and_every_skip_is_declared(self):
         patch = self.fixture.make_patch(self.harmless_change, "no-gpu.patch")
@@ -3454,6 +3528,13 @@ class SkillProseContractTests(unittest.TestCase):
         self.skill = (SKILL_DIR / "SKILL.md").read_text()
         self.script = VALIDATOR.read_text()
         self.schema = json.loads((SKILL_DIR / "report_schema.json").read_text())
+        # The whole command surface, not just the entry point. Values used to be reachable only
+        # from bash, so searching one file was the same as searching the code; now a decision
+        # that moved into a tool would have read as unreachable and failed a test that was
+        # right about nothing. What the check is FOR is a value no code path writes.
+        self.code = self.script + "\n".join(
+            path.read_text() for path in sorted(SKILL_DIR.glob("*.py"))
+        )
 
     # The fields that separate a caller's claim from a measurement. These are the ones a
     # reader has to be able to look up, and the ones the refactor churned.
@@ -3463,6 +3544,7 @@ class SkillProseContractTests(unittest.TestCase):
         "grid_channel_basis",
         "axis_state",
         "runner_basis",
+        "test_provenance",
     )
 
     def declaration_fields(self):
@@ -3479,9 +3561,7 @@ class SkillProseContractTests(unittest.TestCase):
                 if not value:
                     continue
                 with self.subTest(field=field, value=value):
-                    self.assertIn(
-                        value, self.script, f"{field}: {value} is unreachable"
-                    )
+                    self.assertIn(value, self.code, f"{field}: {value} is unreachable")
 
     def test_every_value_the_schema_admits_is_one_the_prose_explains(self):
         # Backticked, not merely present: `declared` occurs inside `declared-by-caller`, so a

@@ -41,6 +41,8 @@ SHAPE_ARGNAMES=""
 # to say so rather than having a runner-selection artefact charged to the PR author.
 RUNNER_OVERRIDE=""
 RUNNER_REASON=""
+# The caller's declaration that they looked for a test exercising this change and found none.
+NO_TARGET_REASON=""
 GRID_NOVELTY=""
 AXES=()
 AXIS_CLI=()
@@ -96,6 +98,7 @@ while [ "$#" -gt 0 ]; do
     --repo) need_value "$@"; REPO_WT="$2"; shift 2;;
     --target) need_value "$@"; TESTS="$2"; shift 2;;
     --tests) need_value "$@"; TESTS="$2"; shift 2;;
+    --no-target) need_value "$@"; NO_TARGET_REASON="$2"; shift 2;;
     --patch) need_value "$@"; PATCHF="$2"; shift 2;;
     --head-sha) need_value "$@"; HEAD_SHA="$2"; shift 2;;
     --shape-env) need_value "$@"; SHAPE_ENV="$2"; shift 2;;
@@ -118,8 +121,24 @@ while [ "$#" -gt 0 ]; do
   esac
 done
 
-if [ -z "$REPO_WT" ] || [ -z "$TESTS" ]; then
-  echo "--repo and --target are required" >&2
+if [ -z "$REPO_WT" ]; then
+  echo "--repo is required" >&2
+  exit 2
+fi
+# A PR with runtime surface and no test that exercises it is a finding about the PR, and it used
+# to be a usage error: the caller who looked and found nothing had no way to say so, so the run
+# died before writing a report and the PR went unvalidated rather than red.
+#
+# It stays an error to supply NEITHER, because a forgotten --target must not read as "there is no
+# test" -- that would publish a caller's slip as a blocker against the author, which is the one
+# mistake this file spends the most lines avoiding. The absence has to be DECLARED, with a reason,
+# exactly like the runner is.
+if [ -n "$TESTS" ] && [ -n "$NO_TARGET_REASON" ]; then
+  echo "--target and --no-target contradict each other; supply one" >&2
+  exit 2
+fi
+if [ -z "$TESTS" ] && [ -z "$NO_TARGET_REASON" ]; then
+  echo "one of --target or --no-target <reason> is required" >&2
   exit 2
 fi
 if ! git -C "$REPO_WT" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
@@ -310,7 +329,14 @@ jset_json "arch_coverage" '{}'
 jset_json "arch_coverage_basis" '{}'
 jset_json "degraded_mode" 'null'
 jset_json "runtime_identity" 'null'
-jset_string "test_selection.target" "$TESTS"
+if [ -n "$TESTS" ]; then
+  jset_string "test_selection.target" "$TESTS"
+else
+  # `null`, not `""`. An empty string is what an unset variable also produces, and the one thing
+  # this field must distinguish is "nobody named a target" from "the caller looked and there is
+  # none". The second is a declaration, and it is paired with test_provenance: none below.
+  jset_json "test_selection.target" 'null'
+fi
 jset_string "test_selection.shape_env" "$SHAPE_ENV"
 jset_string "test_selection.grid" "$GRID"
 jset_string "test_selection.shape_arg" "$SHAPE_ARG"
@@ -379,6 +405,32 @@ else
   jset_string "repo.head" "$BASE_SHA"
   stage_note "merge_sim" "skip" \
     "checkout validated directly; no base-to-head patch was supplied, so merge and attribution were not tested"
+fi
+
+# ---------- no target: the PR ships no executable evidence ----------
+#
+# Placed AFTER the merge simulation and not before it, because a report review-pr cannot bind to
+# the PR head is not evidence about that PR. The blocker is only worth publishing once `repo.base`
+# and `repo.head` pin what it is a blocker about.
+#
+# A blocker, not a skip. A skip says "the validator could not establish this"; here the validator
+# established something, and what it established is that a change with runtime surface arrived
+# with nothing that runs it. review-pr reports a PR with no runtime surface as N/A and never gets
+# here, so reaching this line means the caller judged there IS surface -- and then found nothing
+# exercising it.
+if [ -z "$TESTS" ]; then
+  jset_string "test_selection.runner" "none"
+  jset_string "test_selection.runner_reason" \
+    "no target was declared, so there was nothing to choose a runner for"
+  jset_string "test_selection.runner_basis" "declared-by-caller"
+  jset_string "test_selection.test_provenance" "none"
+  jset_string "test_selection.test_provenance_reason" "$NO_TARGET_REASON"
+  stage_note "correctness_repo_tests" "skip" \
+    "the caller declared that no test exercises this change: $NO_TARGET_REASON"
+  finding "blocker" "correctness" \
+    "this change has runtime surface and no test exercises it, so nothing about its behaviour was run: $NO_TARGET_REASON"
+  finish_report
+  exit 1
 fi
 
 # ---------- stage 2: GPU claim (sampling window + whole-run lock) ----------

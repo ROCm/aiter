@@ -121,7 +121,8 @@ variable (next section).
 | `--repo` | worktree to validate (required) |
 | `--patch` | patch to apply first; a conflict is a blocker, not a skip |
 | `--head-sha` | the exact remote head this patch represents; omit only for a local candidate |
-| `--target` | the script file or pytest node the PR ships (`--tests` is an alias) |
+| `--target` | the script file or pytest node that exercises the change (`--tests` is an alias) |
+| `--no-target` | the reason you looked and found none. Publishes a **blocker**, not a skip — see below |
 | `--runner` `--runner-reason` | `pytest`, `script`, or `none`, and **why** — you read the target, the validator does not check you. `none` means you have decided nothing here is runnable |
 | `--expected-route` | the `module:function` the profiler must observe; without it there is no receipt and no observed work |
 | `--shape-vars` | local names captured at each route call, in grid order |
@@ -147,6 +148,31 @@ one. The report stays useful locally, and `review-pr` correctly refuses it as PR
 Choose the target by reading the diff, not by pattern-matching a filename. A target that does not
 touch the changed code can return `PASS` on evidence about something else entirely, and that reads
 to a reviewer as clearance — worse than no report at all.
+
+### Two places a target comes from, and the third case
+
+A target is either **already in the repository** or **shipped by the PR**, and the difference is
+recorded rather than flattened. `test_selection.test_provenance` reads it out of the patch:
+`pre-existing` when the patch does not touch the target, `pr-added` or `pr-modified` when it does,
+and `unknown` with no `--patch` to compare against — a checkout validated directly cannot tell a
+test the author wrote from one they did not, and answering `pre-existing` there would assert an
+independence nobody established. `none` is the fourth case, below.
+
+Both are worth running. Only one is independent. A pre-existing test was not written to make this
+PR pass; a test that arrives with the patch was written by the same hand as the code it grades and
+can pass vacuously without anyone noticing — which is why the execution receipt matters most in
+exactly that case. Whether the test is any *good* is a reading, and it stays with you; the report's
+job is only to stop a reviewer mistaking one for the other.
+
+**And when neither exists, say so with `--no-target "<what you looked for and did not find>"`.**
+That is a `blocker` and a `BLOCK` verdict: a change with runtime surface arrived with nothing that
+runs it. It is not a skip — a skip says the validator could not establish something, and here it
+established exactly what it says. You never reach this for a PR with no runtime surface at all;
+`review-pr` reports that as N/A and does not invoke the validator.
+
+Supplying **neither** flag stays a usage error, and that asymmetry is deliberate. A forgotten
+`--target` must not read as "there is no test", because that would publish your slip as a finding
+against the author. The absence has to be declared, with a reason, the same way the runner is.
 
 ## Host settings
 
