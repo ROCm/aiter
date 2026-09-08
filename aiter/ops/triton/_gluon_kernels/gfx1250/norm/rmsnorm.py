@@ -205,9 +205,11 @@ def _gluon_rms_norm_kernel(
         # preload the weights as they all fit within the shared memory
         gl.amd.gfx1250.tdm.async_load(weights_desc, [0], smemWeights)
         gl.amd.gfx1250.tdm.async_load(input_desc, [row_start, 0], smemInput.index(0))
-        
+
         # preload the next row's input
-        gl.amd.gfx1250.tdm.async_load(input_desc, [row_start + NUM_PROG, 0], smemInput.index(1))
+        gl.amd.gfx1250.tdm.async_load(
+            input_desc, [row_start + NUM_PROG, 0], smemInput.index(1)
+        )
         gl.amd.gfx1250.tdm.async_wait(1)
 
         # compute the rms norm for the first row
@@ -222,7 +224,6 @@ def _gluon_rms_norm_kernel(
         smemOutput1d = smemOutput.index(0).reshape([BLOCK_SIZE])
         smemOutput1d.store(rms_norm.to(output_ptr.dtype.element_ty))
         gl.amd.gfx1250.tdm.async_store(output_desc, [row_start, 0], smemOutput.index(0))
-
 
         for row_idx in range(row_start + NUM_PROG, n_rows, NUM_PROG):
             # determine the current and next stage
