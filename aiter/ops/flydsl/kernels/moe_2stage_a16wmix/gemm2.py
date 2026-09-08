@@ -130,7 +130,7 @@ def _atomic_bf16_epilog(
 
 
 @flyc.jit
-def _cshuffle_bf16_epilog(
+def _reduce_bf16_epilog(
     lds_acc_base_i32,
     accm,
     arg_out,
@@ -146,7 +146,7 @@ def _cshuffle_bf16_epilog(
     BN,
     TOPK,
 ):
-    """CShuffle then coalesced vec2 store into unique [token*topk+slot, N] rows.
+    """Unique-row store into [token*topk+slot, N] for a follow-up moe_reduce.
 
     Same 4-wave N-split / MFMA acc layout and BufferCopy loads/stores as
     ``_atomic_bf16_epilog``. Writes routing-weighted bf16 into LDS, remaps to
@@ -260,7 +260,7 @@ def _gemm2_body_a16w4(
     b_cache_mod=2,
     w_dtype="fp4",
     use_k16=False,
-    use_cshuffle=False,
+    use_reduce=False,
     topk=1,
 ):
     """a16w4/a16wi4/a16w16 stage2 body. K=inter_dim (contraction), N=model_dim (N_OUT).
@@ -378,8 +378,8 @@ def _gemm2_body_a16w4(
         [accm[i][J].load().ir_value() for J in range(num_acc_n)]
         for i in range(m_repeat)
     ]
-    if const_expr(use_cshuffle):
-        _cshuffle_bf16_epilog(
+    if const_expr(use_reduce):
+        _reduce_bf16_epilog(
             lds_acc_base_i32,
             accm_v,
             arg_out,
@@ -461,9 +461,9 @@ def compile_gemm2_a16w4_port(
     ), f"w_dtype must be 'mxfp4', 'int4' or 'bf16', got {w_dtype!r}"
     if epilog not in ("atomic", "reduce"):
         raise ValueError(f"epilog must be 'atomic' or 'reduce', got {epilog!r}")
-    _use_cshuffle = epilog == "reduce"
-    _topk = int(topk) if _use_cshuffle else 1
-    if _use_cshuffle and _topk < 1:
+    _use_reduce = epilog == "reduce"
+    _topk = int(topk) if _use_reduce else 1
+    if _use_reduce and _topk < 1:
         raise ValueError(f"reduce epilog requires topk>=1, got {_topk}")
     _use_k16 = use_k16
     _K = D_INTER
@@ -487,7 +487,7 @@ def compile_gemm2_a16w4_port(
     KH_TILE_BYTES = TILE_K * 2
 
     _a_bytes = BM * KH_TILE_BYTES
-    if _use_cshuffle:
+    if _use_reduce:
         _lds_bytes = max(_a_bytes, BM * TILE_N * 2)
     else:
         _lds_bytes = _a_bytes + BM * TILE_N * 4
@@ -502,7 +502,7 @@ def compile_gemm2_a16w4_port(
         _name += f"_w{waves_per_eu}"
     if persist:
         _name += "_persist"
-    if _use_cshuffle:
+    if _use_reduce:
         _name += f"_reduce_tk{_topk}"
 
     @fx.struct
@@ -580,7 +580,7 @@ def compile_gemm2_a16w4_port(
                 b_cache_mod=b_cache_mod,
                 w_dtype=w_dtype,
                 use_k16=_use_k16,
-                use_cshuffle=_use_cshuffle,
+                use_reduce=_use_reduce,
                 topk=_topk,
             )
 
