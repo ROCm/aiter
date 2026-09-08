@@ -31,6 +31,7 @@ expected at ~1e-6 (fp32 accumulation order), not at fp4 resolution.
 
 import argparse
 import itertools
+import math
 import random
 from dataclasses import dataclass
 
@@ -207,8 +208,8 @@ def build_inputs(bs, max_end, total_tokens, block_k, seed):
     )
     kv_scale = scale_to_opus(kv_e8, KV_BLOCK_SIZE)
     kv_scale_fly = kv_scale_flydsl(kv_e8, num_blocks)
-    block_tables = (
-        torch.arange(num_blocks, dtype=torch.int32, device=dev).reshape(bs, mbps)
+    block_tables = torch.arange(num_blocks, dtype=torch.int32, device=dev).reshape(
+        bs, mbps
     )
 
     # --- Q + weights ------------------------------------------------------
@@ -260,7 +261,9 @@ def max_err(out, ref):
         if vals is None:
             continue
         got = out[r, s:e].float()
-        err = max(err, (got - vals).abs().max().item() / vals.abs().max().clamp(min=1e-6))
+        err = max(
+            err, (got - vals).abs().max().item() / vals.abs().max().clamp(min=1e-6)
+        )
     return err
 
 
@@ -289,9 +292,7 @@ def flydsl_prefill(inp, rb, ls, le, total_q, block_k):
     except Exception:  # noqa: BLE001
         return None
     msl = inp.max_seq_len
-    _, cta_info, n_ctas = compute_prefill_schedule(
-        rb, ls, le, block_k, total_q, msl
-    )
+    _, cta_info, n_ctas = compute_prefill_schedule(rb, ls, le, block_k, total_q, msl)
     out = torch.full((total_q, msl), float("-inf"), dtype=torch.float32, device=dev)
 
     def launch():
@@ -395,7 +396,7 @@ def check_prefill(bs, windows_per_batch, seed, block_k, label):
         scale = out[m].abs().max().clamp(min=1e-6)
         fly_err = ((out[m] - out_f[m]).abs().max() / scale).item()
 
-    ok = err < 2e-5 and oob and (fly_err != fly_err or fly_err < 2e-5)
+    ok = err < 2e-5 and oob and (math.isnan(fly_err) or fly_err < 2e-5)
     print(f"  [{'PASS' if ok else 'FAIL'}] {label:<34} bk={block_k:3d} "
           f"err={err:.2e} vs_flydsl={fly_err:.2e} oob_neginf={oob}")  # fmt: skip
     return ok
@@ -470,7 +471,9 @@ def run_corner():
                                  7, block_k, "mid-tile ends"))  # fmt: skip
         # decode: pure decode, MTP, and a context at a tile boundary
         oks.append(check_decode(2, 1, [128, 200], 8, block_k, "decode next_n=1"))
-        oks.append(check_decode(3, 4, [256, 129, 64], 9, block_k, "decode MTP next_n=4"))
+        oks.append(
+            check_decode(3, 4, [256, 129, 64], 9, block_k, "decode MTP next_n=4")
+        )
         oks.append(check_decode(1, 8, [block_k * 2 + 1], 10, block_k, "decode tile+1"))
         # COMPRESSED KV windows (CSA ratio 4): draft token n sees
         # min((pos + n + 1) // 4, n_committed) rows. The floor makes that a STEP in n
@@ -511,7 +514,9 @@ def bench_prefill(bs_list, block_ks, iters, warmup):
             (total_q, inp.max_seq_len), float("-inf"), dtype=torch.float32, device=dev
         )
 
-        def ours():
+        # Defaults, not closure capture: this is rebuilt per iteration over names the
+        # loop later `del`s, so late binding would read the next shape's buffers.
+        def ours(inp=inp, rb=rb, ls=ls, le=le, block_k=block_k, out=out):
             return pa_mqa_logits_mxfp4_prefill(
                 inp.q_packed, inp.q_scale, inp.kv_cache, inp.kv_scale, inp.block_tables,
                 inp.weights, rb, ls, le, inp.max_seq_len, weight_scale=WEIGHT_SCALE,
@@ -560,7 +565,8 @@ def bench_decode(shapes, block_ks, iters, warmup):
             (total_q, inp.max_seq_len), float("-inf"), dtype=torch.float32, device=dev
         )
 
-        def ours():
+        # Bound as defaults for the same reason as bench_prefill's.
+        def ours(inp=inp, le=le, next_n=next_n, block_k=block_k, out=out):
             return pa_mqa_logits_mxfp4_decode(
                 inp.q_packed, inp.q_scale, inp.kv_cache, inp.kv_scale, inp.block_tables,
                 inp.weights, le, inp.max_seq_len, next_n,
@@ -569,7 +575,9 @@ def bench_decode(shapes, block_ks, iters, warmup):
             )  # fmt: skip
 
         _, us = run_perftest(ours, num_iters=iters, num_warmup=warmup)
-        n_logits = sum(max(c - (next_n - 1 - n), 0) for c in ctxs for n in range(next_n))
+        n_logits = sum(
+            max(c - (next_n - 1 - n), 0) for c in ctxs for n in range(next_n)
+        )
         rows.append({
             "batch": batch, "next_n": next_n, "max_ctx": max_ctx, "block_k": block_k,
             "total_q": total_q, "ours us": round(us, 2),

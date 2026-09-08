@@ -40,7 +40,7 @@ _SPEC = importlib.util.spec_from_file_location(
 T = importlib.util.module_from_spec(_SPEC)
 _SPEC.loader.exec_module(T)
 
-from aiter.ops.opus.pa_mqa_logits_opus import (  # noqa: E402
+from aiter.ops.opus.pa_mqa_logits_opus import (
     pa_mqa_logits_mxfp4_prefill,
 )
 
@@ -72,7 +72,9 @@ def one_case(start, end, block_k, seed):
     got = row[start:end].float()
     finite = torch.isfinite(got)
     err = (
-        ((got[finite] - ref[finite]).abs().max() / ref.abs().max().clamp(min=1e-6)).item()
+        (
+            (got[finite] - ref[finite]).abs().max() / ref.abs().max().clamp(min=1e-6)
+        ).item()
         if finite.any()
         else float("nan")
     )
