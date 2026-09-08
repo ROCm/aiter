@@ -503,7 +503,11 @@ def build_topk_per_row_prefill_one_workgroup_module(
             gpu.barrier()
 
         # Global and LDS row iterators
-        def scan_row(on_vec, on_scalar):
+        def visit_vector(body, col, values):
+            for item in range_constexpr(_VEC):
+                body(col + item, values[item])
+
+        def scan_row(body, reverse=False):
             unroll_stride = block_size * fx.Int32(_LOAD_UNROLL)
             unroll_end = (
                 full_vector_count
@@ -513,77 +517,49 @@ def build_topk_per_row_prefill_one_workgroup_module(
                 - block_size * fx.Int32(_LOAD_UNROLL - 1),
                 zero,
             )
-            for vector_idx in range(tid, unroll_end, unroll_stride):
-                vector_idx1 = vector_idx + block_size
-                vector_idx2 = vector_idx1 + block_size
-                vector_idx3 = vector_idx2 + block_size
-                values0 = _load_f32x4(input_vector_tiles, vector_idx)
-                values1 = _load_f32x4(input_vector_tiles, vector_idx1)
-                on_vec(vector_idx * vec_width, values0)
-                values2 = _load_f32x4(input_vector_tiles, vector_idx2)
-                values3 = _load_f32x4(input_vector_tiles, vector_idx3)
-                on_vec(vector_idx1 * vec_width, values1)
-                on_vec(vector_idx2 * vec_width, values2)
-                on_vec(vector_idx3 * vec_width, values3)
-
             n_unroll = (tid < unroll_end).select(
                 (unroll_end - one - tid) // unroll_stride + one,
                 zero,
             )
-            cleanup_start = tid + n_unroll * unroll_stride
-            for vector_idx in range(
-                cleanup_start, full_vector_count, block_size
-            ):
-                on_vec(
-                    vector_idx * vec_width,
-                    _load_f32x4(input_vector_tiles, vector_idx),
-                )
-
             remain_col = full_vector_count * vec_width + tid
-            if remain_col < row_len:
-                on_scalar(remain_col, input_row[remain_col])
+            if const_expr(reverse):
+                vector_origin = full_vector_count - one
+                vector_direction = -one
+                if remain_col < row_len:
+                    body(remain_col, input_row[remain_col])
+            else:
+                vector_origin = zero
+                vector_direction = one
 
-        def scan_row_reverse(on_vec, on_scalar):
-            remain_col = full_vector_count * vec_width + tid
-            if remain_col < row_len:
-                on_scalar(remain_col, input_row[remain_col])
-
-            unroll_stride = block_size * fx.Int32(_LOAD_UNROLL)
-            unroll_end = (
-                full_vector_count
-                > block_size * fx.Int32(_LOAD_UNROLL - 1)
-            ).select(
-                full_vector_count
-                - block_size * fx.Int32(_LOAD_UNROLL - 1),
-                zero,
-            )
             for offset in range(tid, unroll_end, unroll_stride):
-                vector_idx0 = full_vector_count - one - offset
-                vector_idx1 = vector_idx0 - block_size
-                vector_idx2 = vector_idx1 - block_size
-                vector_idx3 = vector_idx2 - block_size
+                vector_idx0 = vector_origin + vector_direction * offset
+                vector_stride = vector_direction * block_size
+                vector_idx1 = vector_idx0 + vector_stride
+                vector_idx2 = vector_idx1 + vector_stride
+                vector_idx3 = vector_idx2 + vector_stride
                 values0 = _load_f32x4(input_vector_tiles, vector_idx0)
                 values1 = _load_f32x4(input_vector_tiles, vector_idx1)
+                visit_vector(body, vector_idx0 * vec_width, values0)
                 values2 = _load_f32x4(input_vector_tiles, vector_idx2)
                 values3 = _load_f32x4(input_vector_tiles, vector_idx3)
-                on_vec(vector_idx0 * vec_width, values0)
-                on_vec(vector_idx1 * vec_width, values1)
-                on_vec(vector_idx2 * vec_width, values2)
-                on_vec(vector_idx3 * vec_width, values3)
+                visit_vector(body, vector_idx1 * vec_width, values1)
+                visit_vector(body, vector_idx2 * vec_width, values2)
+                visit_vector(body, vector_idx3 * vec_width, values3)
 
-            n_unroll = (tid < unroll_end).select(
-                (unroll_end - one - tid) // unroll_stride + one,
-                zero,
-            )
             cleanup_offset = tid + n_unroll * unroll_stride
             for offset in range(
                 cleanup_offset, full_vector_count, block_size
             ):
-                vector_idx = full_vector_count - one - offset
-                on_vec(
+                vector_idx = vector_origin + vector_direction * offset
+                visit_vector(
+                    body,
                     vector_idx * vec_width,
                     _load_f32x4(input_vector_tiles, vector_idx),
                 )
+
+            if const_expr(not reverse):
+                if remain_col < row_len:
+                    body(remain_col, input_row[remain_col])
 
         def scan_full_keys(body):
             row_vectors = (row_len + fx.Int32(_VEC - 1)) // fx.Int32(_VEC)
@@ -625,15 +601,6 @@ def build_topk_per_row_prefill_one_workgroup_module(
                     ordered_key(value), histogram_ping, histogram_pong
                 )
 
-        def pass1_vec(col, values, histogram_ping, histogram_pong):
-            for item in range_constexpr(_VEC):
-                pass1_one(
-                    col + item,
-                    values[item],
-                    histogram_ping,
-                    histogram_pong,
-                )
-
         def pass1_cache_one(
             col,
             value,
@@ -645,22 +612,6 @@ def build_topk_per_row_prefill_one_workgroup_module(
                 key = ordered_key(value)
                 full_keys[col] = key
                 add_short_high_bucket(key, histogram_ping, histogram_pong)
-
-        def pass1_cache_vec(
-            col,
-            values,
-            histogram_ping,
-            histogram_pong,
-            full_keys,
-        ):
-            for item in range_constexpr(_VEC):
-                pass1_cache_one(
-                    col + item,
-                    values[item],
-                    histogram_ping,
-                    histogram_pong,
-                    full_keys,
-                )
 
         def pass2_key(
             col,
@@ -734,34 +685,6 @@ def build_topk_per_row_prefill_one_workgroup_module(
                     row_values,
                 )
 
-        def pass2_vec(
-            col,
-            values,
-            first_threshold,
-            histogram,
-            metadata,
-            candidate_keys,
-            candidate_indices,
-            stable_keys,
-            stable_indices,
-            row_indices,
-            row_values,
-        ):
-            for item in range_constexpr(_VEC):
-                pass2_one(
-                    col + item,
-                    values[item],
-                    first_threshold,
-                    histogram,
-                    metadata,
-                    candidate_keys,
-                    candidate_indices,
-                    stable_keys,
-                    stable_indices,
-                    row_indices,
-                    row_values,
-                )
-
         def pass3_one(
             col,
             value,
@@ -774,15 +697,6 @@ def build_topk_per_row_prefill_one_workgroup_module(
                     middle_bucket(key) == second_threshold
                 ):
                     atomic_add_i32(histogram, one, low_bucket(key), "workgroup")
-
-        def pass3_vec(
-            col,
-            values,
-            first_threshold,
-            second_threshold,
-        ):
-            for item in range_constexpr(_VEC):
-                pass3_one(col + item, values[item], first_threshold, second_threshold)
 
         def pass3_cached_key(
             key,
@@ -909,18 +823,7 @@ def build_topk_per_row_prefill_one_workgroup_module(
                                 row_values,
                             )
 
-            def scatter_vec(col, values):
-                for item in range_constexpr(_VEC):
-                    scatter_one(
-                        col + item,
-                        values[item],
-                        row_indices,
-                        row_values,
-                        metadata,
-                    )
-
             scan_row(
-                scatter_vec,
                 lambda col, value: scatter_one(
                     col,
                     value,
@@ -1026,30 +929,7 @@ def build_topk_per_row_prefill_one_workgroup_module(
                         if const_expr(write_values):
                             candidate_keys[pos] = value.bitcast(fx.Int32)
 
-            def collect_vec(
-                col,
-                values,
-                candidate_keys,
-                candidate_indices,
-                metadata,
-            ):
-                for item in range_constexpr(_VEC):
-                    collect_one(
-                        col + item,
-                        values[item],
-                        candidate_keys,
-                        candidate_indices,
-                        metadata,
-                    )
-
             scan_row(
-                lambda col, values: collect_vec(
-                    col,
-                    values,
-                    candidate_keys,
-                    candidate_indices,
-                    metadata,
-                ),
                 lambda col, value: collect_one(
                     col,
                     value,
@@ -1626,12 +1506,6 @@ def build_topk_per_row_prefill_one_workgroup_module(
                         )
                     else:
                         scan_row(
-                            lambda col, values: pass3_vec(
-                                col,
-                                values,
-                                first_threshold,
-                                second_threshold,
-                            ),
                             lambda col, value: pass3_one(
                                 col,
                                 value,
@@ -1714,12 +1588,6 @@ def build_topk_per_row_prefill_one_workgroup_module(
                 )
             else:
                 scan_row(
-                    lambda col, values: pass3_vec(
-                        col,
-                        values,
-                        first_threshold,
-                        second_threshold,
-                    ),
                     lambda col, value: pass3_one(
                         col,
                         value,
@@ -1898,13 +1766,6 @@ def build_topk_per_row_prefill_one_workgroup_module(
                     short_bins_per_thread,
                 )
                 scan_row(
-                    lambda col, values: pass1_cache_vec(
-                        col,
-                        values,
-                        short_histogram_ping,
-                        short_histogram_pong,
-                        full_keys,
-                    ),
                     lambda col, value: pass1_cache_one(
                         col,
                         value,
@@ -1936,12 +1797,6 @@ def build_topk_per_row_prefill_one_workgroup_module(
                     high_bins_per_thread,
                 )
                 scan_row(
-                    lambda col, values: pass1_vec(
-                        col,
-                        values,
-                        long_histogram_ping,
-                        long_histogram_pong,
-                    ),
                     lambda col, value: pass1_one(
                         col,
                         value,
@@ -1984,20 +1839,7 @@ def build_topk_per_row_prefill_one_workgroup_module(
                     )
                 )
             else:
-                scan_row_reverse(
-                    lambda col, values: pass2_vec(
-                        col,
-                        values,
-                        first_threshold,
-                        histogram,
-                        metadata,
-                        candidate_keys,
-                        candidate_indices,
-                        stable_keys,
-                        stable_indices,
-                        row_indices,
-                        row_values,
-                    ),
+                scan_row(
                     lambda col, value: pass2_one(
                         col,
                         value,
@@ -2011,6 +1853,7 @@ def build_topk_per_row_prefill_one_workgroup_module(
                         row_indices,
                         row_values,
                     ),
+                    reverse=True,
                 )
             gpu.barrier()
             need_after_first = top_k - metadata[_FIRST_ABOVE]
