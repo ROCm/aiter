@@ -10,6 +10,11 @@
  * @Description: This is description.
  */
 
+// This translation unit is torch-free: define AITER_NO_TORCH_TYPES before any
+// aiter header so aiter_opus_plus.h does not pull in the c10 half/bfloat16
+// headers. The kernels use aiter::hip2opus + the _rmTorch dispatch macros, never
+// the t2opus<c10::*> specializations, so nothing here needs torch/ATen/c10.
+#define AITER_NO_TORCH_TYPES
 #include "aiter_dispatch.h"
 #include "hip_reduce.h"
 #include "aiter_hip_common.h"
@@ -1232,6 +1237,10 @@ void biased_grouped_topk(const aiter_tensor_t& gating_output,   // [num_tokens, 
     int topk            = topk_ids.size(1);
     size_t stride_gating = gating_output.stride(0);
     size_t stride_tk    = topk_ids.stride(0);
+    AITER_CHECK(topk_weights.dtype() == AITER_DTYPE_fp32,
+                "topk_weights must be float32");
+    AITER_CHECK(topk_ids.dtype() == AITER_DTYPE_i32,
+                "topk_ids must be int32");
     AITER_CHECK(gating_output.stride(1) == 1, "gating_output last dimension must be contiguous");
     AITER_CHECK(topk_grp >= 1 && topk_grp <= num_expert_group,
                 "topk_grp must be in [1, num_expert_group], but got topk_grp=",
@@ -1282,6 +1291,10 @@ void grouped_topk(const aiter_tensor_t& gating_output, // [num_tokens, num_exper
     size_t stride_gating = gating_output.stride(0);
     size_t stride_tk     = topk_ids.stride(0);
     const aiter_tensor_t& correction_bias = topk_ids;
+    AITER_CHECK(topk_weights.dtype() == AITER_DTYPE_fp32,
+                "topk_weights must be float32");
+    AITER_CHECK(topk_ids.dtype() == AITER_DTYPE_i32,
+                "topk_ids must be int32");
     AITER_CHECK(gating_output.stride(1) == 1, "gating_output last dimension must be contiguous");
     AITER_CHECK(topk_grp >= 1 && topk_grp <= num_expert_group,
                 "topk_grp must be in [1, num_expert_group], but got topk_grp=",
