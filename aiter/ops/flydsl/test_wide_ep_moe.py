@@ -1,5 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
-"""MORI inter-node backend for the gfx950 EP16 A4W4 MegaMoEV2 path."""
+"""Standalone MORI inter-node EP16 A4W4 MoE operator.
+
+This FlyDSL operator is intentionally independent from MegaMoEV2 and its intranode
+implementation.  It only mirrors MegaMoEV2's public calling convention.
+"""
 
 from __future__ import annotations
 
@@ -10,7 +14,7 @@ import torch
 
 
 @dataclass
-class MegaMoEInterNodeContext:
+class TestWideEpMoeContext:
     """Dispatch payload plus the private source-side state needed by combine."""
 
     tokens: torch.Tensor
@@ -25,27 +29,41 @@ class MegaMoEInterNodeContext:
     _consumed: bool = False
 
 
-class MegaMoEInterNodeBackend:
+class TestWideEpMoe:
     """EP16 packed-FP4 dispatch/compute/combine implementation using MORI."""
 
     def __init__(
-        self, *, rank, world_size, model_dim, experts, topk, w1, w1_scale,
-        w2, w2_scale, max_tok_per_rank, gpu_per_node: int = 8,
+        self, *, rank, world_size, model_dim, inter_dim, experts, topk, quant,
+        w1, w1_scale, w2, w2_scale, max_tok_per_rank, gpu_per_node: int = 8,
+        mega_scheme: str = "fixedslot", swiglu_limit: float = 0.0,
     ):
         import mori
         from aiter import dtypes
+        from aiter.jit.utils.chip_info import get_gfx_runtime
 
+        if get_gfx_runtime() != "gfx950":
+            raise ValueError("TestWideEpMoe is supported only on gfx950")
+        if quant != "a4w4":
+            raise ValueError("TestWideEpMoe supports quant='a4w4' only")
         if world_size != 16 or gpu_per_node != 8:
-            raise ValueError("A4W4 inter-node MegaMoEV2 requires EP16 (2 nodes x 8 GPUs)")
+            raise ValueError("TestWideEpMoe requires EP16 (2 nodes x 8 GPUs)")
+        if experts % world_size:
+            raise ValueError(f"experts={experts} must be divisible by world_size={world_size}")
+        if max_tok_per_rank <= 0:
+            raise ValueError("max_tok_per_rank must be positive")
         if model_dim % 32:
             raise ValueError("A4W4 inter-node model_dim must be divisible by 32")
         self.rank = int(rank)
         self.world_size = int(world_size)
         self.model_dim = int(model_dim)
+        self.inter_dim = int(inter_dim)
         self.experts = int(experts)
         self.epr = self.experts // self.world_size
         self.topk = int(topk)
         self.mtpr = int(max_tok_per_rank)
+        self.quant = quant
+        self.mega_scheme = mega_scheme
+        self.swiglu_limit = float(swiglu_limit)
         self.capacity_mtpr = 1 << (self.mtpr - 1).bit_length()
         self.dev = torch.device("cuda", torch.cuda.current_device())
         self.w1 = w1
@@ -83,10 +101,10 @@ class MegaMoEInterNodeBackend:
         self._active_dispatch = None
 
     def _validate_active_dispatch(self, dispatched):
-        if not isinstance(dispatched, MegaMoEInterNodeContext):
-            raise TypeError("dispatched must be MegaMoEInterNodeContext")
+        if not isinstance(dispatched, TestWideEpMoeContext):
+            raise TypeError("dispatched must be TestWideEpMoeContext")
         if dispatched._owner_id != self._owner_id:
-            raise ValueError("dispatch result belongs to a different MegaMoEV2 instance")
+            raise ValueError("dispatch result belongs to a different TestWideEpMoe instance")
         if dispatched._generation != self._generation or dispatched is not self._active_dispatch:
             raise RuntimeError("dispatch result is stale; only one dispatch may be in flight")
         if dispatched._consumed:
@@ -128,7 +146,7 @@ class MegaMoEInterNodeBackend:
             raise ValueError(f"x_fp4 and x_scale must be on current device {self.dev}")
         recv = self.op.dispatch(x_fp4, weights, x_scale, topk_ids)
         self._generation += 1
-        dispatched = MegaMoEInterNodeContext(
+        dispatched = TestWideEpMoeContext(
             tokens=recv[0], weights=recv[1], scales=recv[2], expert_ids=recv[3],
             num_tokens=recv[4], _source_topk_ids=topk_ids, _source_tokens=tokens,
             _owner_id=self._owner_id, _generation=self._generation,
@@ -147,11 +165,11 @@ class MegaMoEInterNodeBackend:
         return self.dispatch_prequant(x_fp4, x_scale, weights, topk_ids)
 
     def quantize(self, x_bf16):
-        from .quant import per_1x32_mx_quant
+        from .kernels.mega_moe.quant import per_1x32_mx_quant
 
         return per_1x32_mx_quant(x_bf16, quant_mode="fp4")
 
-    def fused_moe(self, dispatched: MegaMoEInterNodeContext):
+    def fused_moe(self, dispatched: TestWideEpMoeContext):
         from aiter import ActivationType, QuantType, dtypes
         from aiter.fused_moe import fused_moe as run_fused_moe
         from aiter.ops.flydsl.moe_common import GateMode
@@ -169,7 +187,7 @@ class MegaMoEInterNodeBackend:
             num_local_tokens=dispatched.num_tokens[:1].to(dtypes.i32), dtype=torch.bfloat16,
         )
 
-    def combine(self, local_output, dispatched: MegaMoEInterNodeContext):
+    def combine(self, local_output, dispatched: TestWideEpMoeContext):
         self._validate_active_dispatch(dispatched)
         if dispatched._source_topk_ids.device != self.dev or tuple(
             dispatched._source_topk_ids.shape
@@ -199,5 +217,15 @@ class MegaMoEInterNodeBackend:
     ):
         self._validate_public_options(stream, slice_output)
         dispatched = self.dispatch_prequant(x_fp4, x_scale, weights, topk_ids)
+        if os.environ.get("AITER_DEBUG_WIDE_EP", "0") == "1":
+            print(f"[TestWideEpMoe rank={self.rank}] dispatch complete", flush=True)
         local_output = self.fused_moe(dispatched)
-        return self.combine(local_output, dispatched)[0]
+        if os.environ.get("AITER_DEBUG_WIDE_EP", "0") == "1":
+            print(f"[TestWideEpMoe rank={self.rank}] fused_moe complete", flush=True)
+        output = self.combine(local_output, dispatched)[0]
+        if os.environ.get("AITER_DEBUG_WIDE_EP", "0") == "1":
+            print(f"[TestWideEpMoe rank={self.rank}] combine complete", flush=True)
+        return output
+
+    forward_bf16 = forward
+    __call__ = forward

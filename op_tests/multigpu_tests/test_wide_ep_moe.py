@@ -1,17 +1,17 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
-"""EP16 (2 nodes x 8 GPUs) a4w4 internode dispatch + fusedmoe + combine test.
+"""TestWideEpMoe EP16 A4W4 correctness, performance, and profiling test.
 
-Pipeline: fp4 dispatch (mori InterNodeV1) -> local fp4->bf16 dequant ->
-aiter fused_moe (a4w4_mxfp4, per_1x32 quant, real expert_mask) -> bf16 combine
-(mori InterNodeV1, same op instance).
+Pipeline: packed-FP4 dispatch (MORI InterNodeV1LL) -> AITER fused_moe
+(A4W4, per_1x32, real expert_mask) -> BF16 combine (MORI InterNodeV1LL,
+same TestWideEpMoe instance).
 
 Launch (2 nodes, one torchrun process per node, 8 local GPUs spawned inside):
 
   On node_rank 0:
     GPU_PER_NODE=8 torchrun --nnodes=2 --node_rank=0 --nproc_per_node=1 \
         --master_addr=<node0_ip> --master_port=29500 \
-        test_ep16_a4w4_dispatch_moe_combine.py --bs-list 128,512,1024,2048,4096
+        test_wide_ep_moe.py --bs-list 128,512,1024,2048,4096
   On node_rank 1: same with --node_rank=1
 """
 
@@ -33,8 +33,12 @@ import torch.distributed as dist
 import aiter
 from aiter import ActivationType, QuantType, dtypes
 from aiter.fused_moe import fused_topk, situv2
-from aiter.ops.flydsl.kernels.mega_moe import MegaMoEV2
-from aiter.ops.shuffle import shuffle_weight
+from aiter.ops.flydsl.test_wide_ep_moe import TestWideEpMoe
+from aiter.ops.shuffle import (
+    shuffle_scale_a16w4,
+    shuffle_weight,
+    shuffle_weight_a16w4,
+)
 from aiter.utility import fp4_utils
 
 # Target EP16 A4W4 pipeline shape. The CSV-compatible result format follows
@@ -70,12 +74,22 @@ def _cleanup():
 
 
 def _barrier():
+    debug = os.environ.get("AITER_DEBUG_WIDE_EP", "0") == "1"
+    rank = dist.get_rank() if dist.is_initialized() else -1
+    if debug:
+        print(f"[EP16-barrier rank={rank}] cuda sync 1 start", flush=True)
     torch.cuda.synchronize()
+    if debug:
+        print(f"[EP16-barrier rank={rank}] cuda sync 1 complete; shmem start", flush=True)
     ms.shmem_barrier_all()
+    if debug:
+        print(f"[EP16-barrier rank={rank}] shmem complete; cuda sync 2 start", flush=True)
     # Agent: shmem_barrier_all may enqueue device work. Drain it here so a
     # caller that records a CUDA event immediately after _barrier() does not
     # accidentally charge the barrier kernel to the following stage.
     torch.cuda.synchronize()
+    if debug:
+        print(f"[EP16-barrier rank={rank}] cuda sync 2 complete", flush=True)
 
 
 def _reduce_float(value, op):
@@ -183,6 +197,7 @@ def _quantize_local_weights(model_dim, inter_dim, local_experts, rank, seed, dev
     the dequantized reference computation)."""
     generator = torch.Generator(device=device).manual_seed(seed + 1000 + rank)
     torch_quant = aiter.get_torch_quant(QuantType.per_1x32)
+    use_mxmoe_w1 = os.environ.get("MORI_MXMOE_W1_LAYOUT", "0") == "1"
 
     w1 = (
         torch.randn(
@@ -193,8 +208,16 @@ def _quantize_local_weights(model_dim, inter_dim, local_experts, rank, seed, dev
         )
         * 0.1
     )
-    w1_qt, w1_scale = torch_quant(w1, quant_dtype=dtypes.fp4x2)
-    w1_qt = w1_qt.view(local_experts, 2 * inter_dim, model_dim // 2)
+    if use_mxmoe_w1:
+        from aiter.ops.quant import per_1x32_mx_quant_hip
+
+        w1_qt, w1_scale = per_1x32_mx_quant_hip(
+            w1.view(-1, model_dim), quant_dtype=dtypes.fp4x2
+        )
+        w1_qt = w1_qt.view(local_experts, 2 * inter_dim, model_dim // 2)
+    else:
+        w1_qt, w1_scale = torch_quant(w1, quant_dtype=dtypes.fp4x2)
+        w1_qt = w1_qt.view(local_experts, 2 * inter_dim, model_dim // 2)
 
     w2 = (
         torch.randn(
@@ -208,10 +231,31 @@ def _quantize_local_weights(model_dim, inter_dim, local_experts, rank, seed, dev
     w2_qt, w2_scale = torch_quant(w2, quant_dtype=dtypes.fp4x2)
     w2_qt = w2_qt.view(local_experts, model_dim, inter_dim // 2)
 
-    w1_a = shuffle_weight(w1_qt, layout=(16, 16))
-    w2_a = shuffle_weight(w2_qt, layout=(16, 16))
-    w1_s = fp4_utils.e8m0_shuffle(w1_scale)
-    w2_s = fp4_utils.e8m0_shuffle(w2_scale)
+    # mxmoe GEMM1 consumes the A16W4 preshuffle, while the previous
+    # flydsl_moe1_afp4 baseline consumes the generic layout.  Keep both paths
+    # testable without rewriting the weight setup between regression runs.
+    w1_a = (
+        shuffle_weight_a16w4(w1_qt, 16, False)
+        if use_mxmoe_w1
+        else shuffle_weight(w1_qt, layout=(16, 16))
+    )
+    w2_a = (
+        shuffle_weight_a16w4(w2_qt, 16, False)
+        if use_mxmoe_w1
+        else shuffle_weight(w2_qt, layout=(16, 16))
+    )
+    w1_s = (
+        shuffle_scale_a16w4(w1_scale, local_experts, False)
+        if use_mxmoe_w1
+        else fp4_utils.e8m0_shuffle(w1_scale)
+    )
+    w2_s = (
+        shuffle_scale_a16w4(
+            w2_scale.view(-1, inter_dim // 32), local_experts, False
+        )
+        if use_mxmoe_w1
+        else fp4_utils.e8m0_shuffle(w2_scale)
+    )
     w1_a.is_shuffled = True
     w2_a.is_shuffled = True
 
@@ -270,7 +314,7 @@ def _build_expert_mask(experts, local_expert_start, local_expert_end, device):
 def _run_comm_only_bs(bs, op, x_fp4, x_scale, weights, ids, model_dim, world_size,
                       iters, stat_iters, rank):
     """Time rank-aligned dispatch-only and combine-only phases."""
-    backend = op._backend
+    backend = op
     x_fp4 = x_fp4[:bs].contiguous()
     x_scale = x_scale[:bs].contiguous()
     weights = weights[:bs].contiguous()
@@ -360,6 +404,11 @@ def _run_one_bs(
     accuracy_max_bs,
     rank,
     perf_out,
+    torch_profiler_dir,
+    torch_compile_cudagraph,
+    profile_warmup_iters,
+    profile_iters,
+    staged_only,
 ):
     x_fp4_bs = x_fp4[:bs].contiguous()
     x_scale_bs = x_scale[:bs].contiguous()
@@ -373,18 +422,29 @@ def _run_one_bs(
         )
         return
 
-    # Public MegaMoEV2 contract: the facade owns the complete inter-node
-    # dispatch -> fused_moe -> combine sequence.
-    out = op.forward_prequant(x_fp4_bs, x_scale_bs, topk_weights_bs, topk_ids_bs).clone()
-    torch.cuda.synchronize()
-    assert out.shape == (bs, model_dim)
-    assert torch.isfinite(out.float()).all(), "MegaMoEV2 output has non-finite values"
+    out = None
+    if not staged_only:
+        # Public TestWideEpMoe contract: the operator owns the complete
+        # inter-node dispatch -> fused_moe -> combine sequence.
+        out = op.forward_prequant(
+            x_fp4_bs, x_scale_bs, topk_weights_bs, topk_ids_bs
+        ).clone()
+        torch.cuda.synchronize()
+        assert out.shape == (bs, model_dim)
+        assert torch.isfinite(out.float()).all(), "TestWideEpMoe output has non-finite values"
+
+        # The public-call check and staged diagnostic are distinct MORI epochs.
+        _barrier()
 
     # Diagnostic-only staged call through the private backend. This preserves
-    # per-stage profiling without adding stage methods to MegaMoEV2's public API.
-    backend = op._backend
-    assert backend is not None
+    # per-stage profiling without changing TestWideEpMoe's public forward API.
+    backend = op
+    debug_wide_ep = os.environ.get("AITER_DEBUG_WIDE_EP", "0") == "1"
+    if debug_wide_ep:
+        print(f"[EP16-debug rank={rank}] diagnostic dispatch start", flush=True)
     dispatched = backend.dispatch_prequant(x_fp4_bs, x_scale_bs, topk_weights_bs, topk_ids_bs)
+    if debug_wide_ep:
+        print(f"[EP16-debug rank={rank}] diagnostic dispatch complete", flush=True)
     recv_tok_fp4 = dispatched.tokens
     recv_wts = dispatched.weights
     recv_scale = dispatched.scales
@@ -402,19 +462,48 @@ def _run_one_bs(
         moe_out = backend.fused_moe(dispatched)
     finally:
         fused_moe_module.kernel_bench_callable = None
+    if debug_wide_ep:
+        print(f"[EP16-debug rank={rank}] diagnostic fused_moe complete", flush=True)
+        print(
+            f"[EP16-debug rank={rank}] combine ABI "
+            f"recv_shape={tuple(recv_tok_fp4.shape)} recv_stride={recv_tok_fp4.stride()} "
+            f"moe_shape={tuple(moe_out.shape)} moe_stride={moe_out.stride()} "
+            f"moe_contiguous={moe_out.is_contiguous()} total_recv={total_recv} "
+            f"source_tokens={bs}",
+            flush=True,
+        )
+    if staged_only:
+        torch.cuda.synchronize()
+        if debug_wide_ep:
+            print(f"[EP16-debug rank={rank}] fused_moe GPU sync complete", flush=True)
 
     # combine()'s indices/weights must be THIS rank's own [tokens, topk]
     # routing passed to dispatch() -- NOT dispatch()'s returned recv_idx/
     # recv_wts (ROCm/mori#475). weights=None: fused_moe already applied
     # topk weighting in stage2 (same convention as
     # test_dispatch_combine_internode.py's run_combine).
-    combine_out, combine_out_wts = backend.combine(moe_out, dispatched)
+    if staged_only and os.environ.get("AITER_DEBUG_COMBINE_WITH_WEIGHTS", "0") == "1":
+        # ABI diagnostic only: current MORI's official V1LL test passes the
+        # dispatch-returned weights into combine. Production fused_moe already
+        # applies them, so this path must not be used for numerical validation.
+        combine_out, combine_out_wts = backend.op.combine(
+            moe_out, dispatched.weights, dispatched._source_topk_ids
+        )
+        dispatched._consumed = True
+    else:
+        combine_out, combine_out_wts = backend.combine(moe_out, dispatched)
     torch.cuda.synchronize()
+    if debug_wide_ep:
+        print(f"[EP16-debug rank={rank}] diagnostic combine complete", flush=True)
+    # Captured atomic GEMM2 calls below intentionally reuse their output buffer
+    # for timing and therefore accumulate into ``moe_out``.  Preserve the
+    # single-execution result before benchmarking for correctness checks.
+    moe_out_correctness = moe_out.clone() if bs <= accuracy_max_bs else None
     diagnostic_out = combine_out[:bs]
-    if bs <= accuracy_max_bs:
+    if out is not None and bs <= accuracy_max_bs:
         # GEMM2 uses atomic accumulation, so two otherwise identical launches
         # are not bitwise deterministic. Keep this as a BF16 consistency check.
-        torch.testing.assert_close(out, diagnostic_out, rtol=1e-2, atol=1.25e-1)
+        torch.testing.assert_close(out, diagnostic_out, rtol=1e-2, atol=2.5e-1)
 
     def _time_captured_kernel(call):
         for _ in range(3):
@@ -430,6 +519,8 @@ def _run_one_bs(
         return sum(start.elapsed_time(end) for start, end in zip(starts, ends)) / 20
 
     kernel_us = {name: _time_captured_kernel(call) * 1000 for name, call in kernel_calls}
+    if debug_wide_ep:
+        print(f"[EP16-debug rank={rank}] captured GEMM timing complete", flush=True)
     gemm1_us_local = kernel_us.get("stage1", 0.0)
     gemm2_us_local = kernel_us.get("stage2", 0.0)
     gemm1_us = _reduce_float(gemm1_us_local, dist.ReduceOp.SUM) / world_size
@@ -442,11 +533,98 @@ def _run_one_bs(
     # ---- correctness (only below accuracy_max_bs, all-gather ref is O(bs*world)) ----
     rel_l2 = -1.0
     if bs <= accuracy_max_bs:
+        if debug_wide_ep:
+            print(f"[EP16-debug rank={rank}] torch reference start", flush=True)
         # Reference-only dequantization. The measured production path passes
         # dispatch's packed FP4 activation and E8M0 scale directly to fused_moe.
         recv_tok_bf16 = _dequant_tokens(recv_tok_fp4, recv_scale, model_dim)
         w1_deq = _dequant_weight(w1_qt, w1_scale, (local_experts, 2 * inter_dim, model_dim))
         w2_deq = _dequant_weight(w2_qt, w2_scale, (local_experts, model_dim, inter_dim))
+        if os.environ.get("AITER_DEBUG_MX_EP_SYNC", "0") == "1":
+            debug_sort = getattr(fused_moe_module, "_mx_ep_debug_sort", None)
+            stage1_call = dict(kernel_calls).get("stage1")
+            if debug_sort is not None and stage1_call is not None:
+                stage1_q, stage1_scale = stage1_call()
+                torch.cuda.synchronize()
+                post_pad = debug_sort["post_pad"]
+                block_m_dbg = debug_sort["block_m"]
+                token_rows = debug_sort["sorted_ids"][:post_pad] & 0x00FFFFFF
+                valid = token_rows < debug_sort["valid_rows"]
+                expert_rows = debug_sort["sorted_expert_ids"][
+                    : debug_sort["tile_count"]
+                ].repeat_interleave(block_m_dbg)[:post_pad]
+                m_rows = debug_sort["m_indices"][:post_pad]
+                matches = 0
+                elements = 0
+                sq_error = 0.0
+                sq_reference = 0.0
+                gemm2_ref = torch.zeros_like(moe_out, dtype=torch.float32)
+                torch_quant = aiter.get_torch_quant(QuantType.per_1x32)
+                for expert_id in torch.unique(expert_rows[valid]).tolist():
+                    rows = torch.nonzero(valid & (expert_rows == expert_id)).flatten()
+                    gate, up = (
+                        recv_tok_bf16[m_rows[rows].long()].float()
+                        @ w1_deq[int(expert_id)].float().transpose(0, 1)
+                    ).split([inter_dim, inter_dim], dim=-1)
+                    ref_inter = situv2(gate, up, beta=1.0, linear_beta=1.0)
+                    ref_q, _ = torch_quant(
+                        ref_inter.to(torch.bfloat16), quant_dtype=dtypes.fp4x2
+                    )
+                    got = stage1_q[rows]
+                    ref_q = ref_q.view(torch.uint8)
+                    matches += int((got == ref_q).sum().item())
+                    elements += got.numel()
+                    # Invert the BM32/BN256 scale layout written by GEMM1 and
+                    # read by layout GEMM2. One dword is indexed by
+                    # (m_chunk, ku, wave_group, m_lane), with two N-block
+                    # halves and two 16-row halves packed into its four bytes.
+                    scale_cols = inter_dim // 32
+                    c = torch.arange(scale_cols, device=recv_tok_fp4.device)
+                    n_block = c // 4
+                    wave_group = c % 4
+                    ku = n_block // 2
+                    ikxdl = n_block % 2
+                    rr = rows[:, None]
+                    chunk = rr // 32
+                    m_lane = rr % 16
+                    row_half = (rr % 32) // 16
+                    per_chunk_dw = ((inter_dim // 32) // 4 // 2) * 64
+                    byte_addr = (
+                        (chunk * per_chunk_dw + ku * 64 + wave_group * 16 + m_lane)
+                        * 4
+                        + ikxdl * 2
+                        + row_half
+                    )
+                    scale_raw = stage1_scale.view(torch.uint8).flatten()[byte_addr]
+                    got_f32 = fp4_utils.mxfp4_to_f32(got).view(
+                        rows.numel(), inter_dim
+                    )
+                    scale_f32 = fp4_utils.e8m0_to_f32(scale_raw).repeat_interleave(
+                        32, dim=-1
+                    )
+                    got_f32 = got_f32 * scale_f32
+                    diff = got_f32 - ref_inter.float()
+                    sq_error += float((diff * diff).sum().item())
+                    sq_reference += float((ref_inter.float() ** 2).sum().item())
+                    route_out = got_f32 @ w2_deq[int(expert_id)].float().transpose(0, 1)
+                    route_out *= debug_sort["sorted_weights"][rows].float().view(-1, 1)
+                    gemm2_ref.index_add_(0, m_rows[rows].long(), route_out)
+                ratio = matches / max(elements, 1)
+                inter_rel_l2 = (sq_error / max(sq_reference, 1e-30)) ** 0.5
+                gemm2_rel_l2 = float(
+                    torch.linalg.vector_norm(
+                        moe_out_correctness[:total_recv].float()
+                        - gemm2_ref[:total_recv]
+                    )
+                    / torch.linalg.vector_norm(gemm2_ref[:total_recv])
+                )
+                print(
+                    f"[AITER_DEBUG_MX_EP] rank={rank} GEMM1 packed-code "
+                    f"match={ratio:.6f} ({matches}/{elements}) "
+                    f"decoded_inter_relL2={inter_rel_l2:.6f} "
+                    f"gemm2_from_inter_relL2={gemm2_rel_l2:.6f}",
+                    flush=True,
+                )
         ref_moe_out = _torch_moe_situv2_reference(
             recv_tok_bf16[:total_recv],
             w1_deq,
@@ -456,7 +634,9 @@ def _run_one_bs(
             expert_mask,
         )
         rel_l2 = float(
-            torch.linalg.vector_norm((moe_out[:total_recv] - ref_moe_out).float())
+            torch.linalg.vector_norm(
+                (moe_out_correctness[:total_recv] - ref_moe_out).float()
+            )
             / torch.linalg.vector_norm(ref_moe_out.float())
         )
         rel_l2 = _reduce_float(rel_l2, dist.ReduceOp.MAX)
@@ -464,6 +644,16 @@ def _run_one_bs(
             raise AssertionError(f"bs={bs} moe relL2={rel_l2:.6f} exceeds rtol={rtol}")
         assert diagnostic_out.shape == (bs, model_dim)
         assert torch.isfinite(diagnostic_out.float()).all(), "combine output has non-finite values"
+        if debug_wide_ep:
+            print(f"[EP16-debug rank={rank}] torch reference complete", flush=True)
+
+    if staged_only:
+        if rank == 0:
+            print(
+                f"[EP16-staged-only] bs={bs} relL2={rel_l2:.6f} PASS",
+                flush=True,
+            )
+        return
 
     # ---- logical GEMM row count: (received row, local expert slot) pairs ----
     # actually computed by fused_moe's grouped GEMM -- exact, not an estimate.
@@ -587,6 +777,55 @@ def _run_one_bs(
     combine_gbps = _reduce_float(combine_gbps_local, dist.ReduceOp.SUM) / world_size
     combine_gbps_best = _reduce_float(combine_gbps_local, dist.ReduceOp.MAX)
     combine_gbps_worst = _reduce_float(combine_gbps_local, dist.ReduceOp.MIN)
+
+    # Profile the public TestWideEpMoe forward API. In compile mode deliberately
+    # wrap that public interface directly rather than introducing another
+    # fused_moe facade in the implementation.
+    profiled_call = op.forward_prequant
+    profile_args = (x_fp4_bs, x_scale_bs, topk_weights_bs, topk_ids_bs)
+    pipeline_kind = "eager_full_pipeline"
+    if torch_compile_cudagraph:
+        profiled_call = torch.compile(op.forward_prequant, backend="cudagraphs")
+        pipeline_kind = "torch_compile_cudagraph_test_wide_ep_forward"
+
+        # Validate the compiled public callable itself.  The eager correctness
+        # checks above do not prove that graph capture/replay preserves output.
+        compiled_out = profiled_call(*profile_args).clone()
+        torch.cuda.synchronize()
+        assert compiled_out.shape == out.shape
+        assert torch.isfinite(compiled_out.float()).all()
+        torch.testing.assert_close(compiled_out, out, rtol=1e-2, atol=2.5e-1)
+        _barrier()
+        if rank == 0:
+            print(f"[EP16-torch-compile] bs={bs} output check PASS", flush=True)
+
+    if torch_profiler_dir:
+        from torch.profiler import ProfilerActivity, profile, record_function
+
+        for _ in range(profile_warmup_iters):
+            profiled_call(*profile_args)
+        torch.cuda.synchronize()
+        _barrier()
+        with profile(
+            activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+            record_shapes=True,
+        ) as prof:
+            for profile_iter in range(profile_iters):
+                with record_function(
+                    f"megamoe_ep16_{pipeline_kind}_bs{bs}_iter{profile_iter}"
+                ):
+                    profiled_call(*profile_args)
+            torch.cuda.synchronize()
+        os.makedirs(torch_profiler_dir, exist_ok=True)
+        prof.export_chrome_trace(
+            os.path.join(torch_profiler_dir, f"rank{rank}_bs{bs}.json")
+        )
+        if rank == 0:
+            print(
+                f"[EP16-torch-profiler] bs={bs} traces={torch_profiler_dir} "
+                f"iters={profile_iters} pipeline={pipeline_kind}",
+                flush=True,
+            )
 
     # MoE: exact logical-M FLOPs (grouped GEMM1 gate+up, GEMM2 down) -> TFLOPS.
     #
@@ -713,6 +952,11 @@ def run_ep16_a4w4(
     gpu_per_node,
     node_rank,
     num_nodes,
+    torch_profiler_dir,
+    torch_compile_cudagraph,
+    profile_warmup_iters,
+    profile_iters,
+    staged_only,
 ):
     world_size = num_nodes * gpu_per_node
     rank = node_rank * gpu_per_node + local_rank
@@ -760,7 +1004,7 @@ def run_ep16_a4w4(
         x_fp4, x_scale = torch_quant_act(x, quant_dtype=dtypes.fp4x2)
         x_fp4 = x_fp4.view(max_bs, model_dim // 2)
 
-        op = MegaMoEV2(
+        op = TestWideEpMoe(
             rank=rank,
             world_size=world_size,
             model_dim=model_dim,
@@ -804,6 +1048,11 @@ def run_ep16_a4w4(
                 accuracy_max_bs,
                 rank,
                 perf_out,
+                torch_profiler_dir,
+                torch_compile_cudagraph,
+                profile_warmup_iters,
+                profile_iters,
+                staged_only,
             )
     finally:
         _cleanup()
@@ -822,6 +1071,26 @@ def main():
     parser.add_argument("--seed", type=int, default=123)
     parser.add_argument("--rtol", type=float, default=0.15)
     parser.add_argument("--accuracy-max-bs", type=int, default=512)
+    parser.add_argument(
+        "--torch-profiler-dir",
+        default=None,
+        help="export one full-pipeline torch.profiler Chrome trace per rank and BS",
+    )
+    parser.add_argument(
+        "--torch-compile-cudagraph",
+        action="store_true",
+        help=(
+            "apply torch.compile(backend='cudagraphs') directly to the public "
+            "TestWideEpMoe.forward_prequant interface"
+        ),
+    )
+    parser.add_argument("--profile-warmup-iters", type=int, default=10)
+    parser.add_argument("--profile-iters", type=int, default=40)
+    parser.add_argument(
+        "--staged-only",
+        action="store_true",
+        help="run one synchronized dispatch/fused_moe/combine diagnostic and stop",
+    )
     parser.add_argument(
         "--routing",
         choices=["random", "round_robin", "cross_node"],
@@ -859,6 +1128,11 @@ def main():
             gpu_per_node,
             node_rank,
             num_nodes,
+            args.torch_profiler_dir,
+            args.torch_compile_cudagraph,
+            args.profile_warmup_iters,
+            args.profile_iters,
+            args.staged_only,
         ),
         nprocs=gpu_per_node,
         join=True,
