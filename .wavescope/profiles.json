@@ -85,8 +85,8 @@
       "workload": "qr_int4 two-shot INT4 all-reduce \u00b7 TP4 gfx950 \u00b7 bf16 1024x7168 (14 MiB, 448 tiles) \u00b7 ST=8, finegrained inbox \u00b7 56 wg x 256 thr \u00b7 only 56 wg, so ATT placement is thinner than the M=4096 profiles",
       "cwd": "${workspaceFolder}",
       "kernelRegex": "^qr_int4_0$",
-      "launch": "env HIP_VISIBLE_DEVICES=0,1,2,3 AITER_QRINT4_ABLATE=none FLYDSL_DEBUG_ENABLE_DEBUG_INFO=1 FLYDSL_RUNTIME_ENABLE_CACHE=0 python3 op_tests/multigpu_tests/qr_ablation/run_ablation.py --inbox finegrained --ablate none --shapes 1024 --warmup 5 --iters 3",
-      "benchmark": "env HIP_VISIBLE_DEVICES=0,1,2,3 AITER_QRINT4_ABLATE=none python3 op_tests/multigpu_tests/qr_ablation/run_ablation.py --inbox finegrained --ablate none --shapes 1024 --warmup 5 --iters 30",
+      "launch": "env HIP_VISIBLE_DEVICES=0,1,2,3  FLYDSL_DEBUG_ENABLE_DEBUG_INFO=1 FLYDSL_RUNTIME_ENABLE_CACHE=0 python3 op_tests/multigpu_tests/bench_comm_allreduce.py -c fly_int4 --shape 1024,7168  --warmup 5 --iters 3",
+      "benchmark": "env HIP_VISIBLE_DEVICES=0,1,2,3 python3 op_tests/multigpu_tests/bench_comm_allreduce.py -c fly_int4 --shape 1024,7168 --warmup 5 --iters 30",
       "correctness": null,
       "roofline": false,
       "rocprof": {
