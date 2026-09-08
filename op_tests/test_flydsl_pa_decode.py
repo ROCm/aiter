@@ -127,6 +127,7 @@ def test_pa_decode_maps_gluon_buffers_and_scale_layout(monkeypatch):
         )
 
     monkeypatch.setattr(pa_decode_module, "_run_compiled", capture_launch)
+    monkeypatch.setattr(pa_decode_module, "ptr_arg", lambda tensor, dtype=None: tensor)
 
     def capture_reduce(
         output_5d, reduce_exp_sums, reduce_max_logits, logits, *args, **kwargs
