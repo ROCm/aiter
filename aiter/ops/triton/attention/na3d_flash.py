@@ -44,6 +44,10 @@ def na3d_flash_attn(
         Output tensor ``(B, T, H, W, NH, HD)`` bfloat16.
 
     Notes:
+        **Inference / forward-pass only.** No autograd backward is implemented.
+        Inputs with ``requires_grad=True`` will produce an output that is detached
+        from the autograd graph, silently dropping gradients.
+
         Input tensors are consumed in their native ``(B, T, H, W, NH, HD)`` layout
         without staging copies. Only a ``contiguous()`` call is made if a tensor is
         not already contiguous in that order.  ``W >= 16`` is required so that all
