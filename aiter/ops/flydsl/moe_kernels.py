@@ -562,7 +562,7 @@ def get_flydsl_stage2_kernels_int4_bf16(out_dtype: str) -> dict[str, dict]:
     tile_ks = [128, 256]
     tile_ms = [16, 32, 64, 128]
     tile_ns = [128]
-    modes = ["atomic", "cshuffle"]
+    modes = ["atomic", "reduce"]
 
     for tm in tile_ms:
         for tn in tile_ns:
@@ -747,7 +747,9 @@ def compile_flydsl_moe_stage2(
             w_dtype=b_dtype,
             # gfx942 lacks K=32 bf16 MFMA + v_cvt_pk_bf16_f32 -> K=16 fallback.
             use_k16="gfx95" not in str(get_rocm_arch()),
-            epilog="cshuffle" if mode == "cshuffle" else "atomic",
+            epilog=(
+                "reduce" if b_dtype == "int4" and mode == "reduce" else "atomic"
+            ),
             topk=topk,
         )
     if b_dtype in ("fp4", "fp8"):
@@ -2025,8 +2027,9 @@ def _flydsl_moe_stage2_impl(
     """Run stage2 with injectable compiler and launch-argument builders."""
 
     if a_dtype == "bf16" and b_dtype in ("fp4", "int4"):
-        # a16w-mix down-proj (a16w4 mxfp4 / a16wi4 int4): ported gemm2 atomic-scatters
-        # into the caller's moe_sorting-zeroed `out`. Tiles from the kernelName (like
+        # a16w-mix down-proj (a16w4 mxfp4 / a16wi4 int4). Default atomic-scatters
+        # into the caller's moe_sorting-zeroed `out`. a16wi4 mode=reduce writes
+        # unique [M*topk,H] rows then moe_reduce. Tiles from the kernelName (like
         # a4w4/a8w4). a16wi4 W2 uses the OLD-kernel int4 layout
         # (pack_int8_to_packed_int4(shuffle_weight(w,(16,16)))) + (E,G//2,N,2) bf16 scale.
         from aiter.ops.flydsl.kernels.moe_2stage_a16wmix import flydsl_a16w4_gemm2
@@ -2056,8 +2059,8 @@ def _flydsl_moe_stage2_impl(
         )
         _epilog = "atomic"
         gemm2_out = out
-        if b_dtype == "int4" and mode == "cshuffle":
-            _epilog = "cshuffle"
+        if b_dtype == "int4" and mode == "reduce":
+            _epilog = "reduce"
             gemm2_out = torch.empty(
                 (M_logical * int(topk), model_dim),
                 dtype=out.dtype,
@@ -2093,7 +2096,7 @@ def _flydsl_moe_stage2_impl(
             w_dtype=b_dtype,
             epilog=_epilog,
         )
-        if _epilog == "cshuffle":
+        if _epilog == "reduce":
             _run_moe_reduction(
                 gemm2_out,
                 out,

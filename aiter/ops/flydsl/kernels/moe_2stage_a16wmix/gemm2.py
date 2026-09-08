@@ -446,8 +446,9 @@ def compile_gemm2_a16w4_port(
 ):
     """a16w4/a16wi4/a16w16 (bf16 intermediate A x mxfp4/int4/bf16 W2) stage2 builder.
 
-    N_OUT = model_dim (down-proj output). D_INTER = inter_dim (contraction). Output
-    bf16 [tokens, model_dim] via atomic (routing-weighted) scatter.
+    N_OUT = model_dim (down-proj output). D_INTER = inter_dim (contraction).
+    ``epilog="atomic"``: routing-weighted scatter into [tokens, model_dim].
+    ``epilog="reduce"``: unique [token*topk+slot, N] rows (caller runs moe_reduce).
 
     ``xcd_swizzle`` (>0) bijectively round-robins the launch index across the 8 XCDs to
     balance per-XCD/HBM traffic (gemm2 is HBM-bound), + optional M-group swizzle for
@@ -458,12 +459,12 @@ def compile_gemm2_a16w4_port(
         "int4",
         "bf16",
     ), f"w_dtype must be 'mxfp4', 'int4' or 'bf16', got {w_dtype!r}"
-    if epilog not in ("atomic", "cshuffle"):
-        raise ValueError(f"epilog must be 'atomic' or 'cshuffle', got {epilog!r}")
-    _use_cshuffle = epilog == "cshuffle"
+    if epilog not in ("atomic", "reduce"):
+        raise ValueError(f"epilog must be 'atomic' or 'reduce', got {epilog!r}")
+    _use_cshuffle = epilog == "reduce"
     _topk = int(topk) if _use_cshuffle else 1
     if _use_cshuffle and _topk < 1:
-        raise ValueError(f"cshuffle epilog requires topk>=1, got {_topk}")
+        raise ValueError(f"reduce epilog requires topk>=1, got {_topk}")
     _use_k16 = use_k16
     _K = D_INTER
     assert _K % TILE_K == 0, f"D_INTER (K) must be a multiple of {TILE_K}, got {_K}"
@@ -502,7 +503,7 @@ def compile_gemm2_a16w4_port(
     if persist:
         _name += "_persist"
     if _use_cshuffle:
-        _name += f"_cshuffle_tk{_topk}"
+        _name += f"_reduce_tk{_topk}"
 
     @fx.struct
     class SharedStorage:
