@@ -62,9 +62,7 @@ def ptr_buf_scalar(ptr, num_records_bytes=None):
         )
 
     def load(offset=0, vec_width=1):
-        return buffer_ops.buffer_load(
-            rsrc, offset, vec_width=vec_width, is_scalar=True
-        )
+        return buffer_ops.buffer_load(rsrc, offset, vec_width=vec_width, is_scalar=True)
 
     return load
 
