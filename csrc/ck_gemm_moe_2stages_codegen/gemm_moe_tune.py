@@ -6060,37 +6060,6 @@ class GroupedFmoeTuner(FmoeTuner):
         resultdf.to_csv(file, index=False)
 
 
-@functools.lru_cache(maxsize=8)
-def _load_mxfp4_candidate_csv(path, keys):
-    """Index a recommend_mxfp4_candidates.py CSV by shape key.
-
-    lru_cache'd on (path, keys) so each --mp worker process parses the file once;
-    the parent cannot hand the table down, because _mxfp4_tune_shape_worker
-    rebuilds a bare tuner carrying only `keys`.
-    """
-    frame = pd.read_csv(path)
-    required = {*keys, "block_m", "kernelName1", "kernelName2"}
-    missing = required - set(frame.columns)
-    if missing:
-        raise ValueError(
-            f"candidate CSV {path} is missing columns {sorted(missing)}; "
-            "regenerate it with recommend_mxfp4_candidates.py"
-        )
-    if "rank" in frame.columns:
-        frame = frame.sort_values("rank", kind="stable")
-    table = {}
-    for _, row in frame.iterrows():
-        table.setdefault(tuple(str(row[k]) for k in keys), []).append(
-            {
-                "block_m": int(row["block_m"]),
-                "ksplit": int(row.get("ksplit", 0) or 0),
-                "kernelName1": str(row["kernelName1"]),
-                "kernelName2": str(row["kernelName2"]),
-            }
-        )
-    return table
-
-
 class Mxfp4FlydslTuner(FmoeTuner):
     """Tune the FlyDSL mxfp4 a4w4 *port* (flydsl_mxmoe_g{1,2}_a4w4_*) as one coupled
     unit.
@@ -6102,19 +6071,6 @@ class Mxfp4FlydslTuner(FmoeTuner):
         "tune_file": f"{AITER_ROOT_DIR}/aiter/configs/model_configs/kimik2_fp4_tuned_fmoe.csv",
         "config_env_name": "AITER_CONFIG_FMOE",
     }
-
-    def _setup_specific_arguments(self):
-        super()._setup_specific_arguments()
-        self.parser.add_argument(
-            "--candidate-csv",
-            dest="candidate_csv",
-            default="",
-            required=False,
-            help=(
-                "Tune only the candidates listed in this CSV instead of enumerating "
-                "the full space. Produced by recommend_mxfp4_candidates.py."
-            ),
-        )
 
     @staticmethod
     def _g1_kname(
@@ -6266,33 +6222,6 @@ class Mxfp4FlydslTuner(FmoeTuner):
         return cand
 
     def _candidate_rows(self, row):
-        # An agent-recommended CSV replaces enumeration outright. A shape missing
-        # from it is an error rather than a silent fall back to the full sweep --
-        # falling back would quietly cost hours of GPU time and produce a result
-        # the CSV never sanctioned.
-        candidate_csv = getattr(self, "_candidate_csv", "")
-        if candidate_csv:
-            keys = tuple(self.keys)
-            table = _load_mxfp4_candidate_csv(candidate_csv, keys)
-            shape_key = tuple(str(row[k]) for k in keys)
-            listed = table.get(shape_key)
-            if not listed:
-                raise ValueError(
-                    f"no candidates in {candidate_csv} for shape "
-                    + ", ".join(f"{k}={row[k]}" for k in keys)
-                    + " -- regenerate it for this shape set and arch"
-                )
-            listed_rows = []
-            for c in listed:
-                cand = self._candidate_row(
-                    row, c["block_m"], c["kernelName1"], c["kernelName2"]
-                )
-                # _candidate_row hardcodes ksplit=0; honour the CSV so the column
-                # is not silently ignored if a future recommender varies it.
-                cand["ksplit"] = c["ksplit"]
-                listed_rows.append(cand)
-            return listed_rows
-
         cands = []
         for g1 in self._g1_variants(row):
             bm = g1["bm"]
@@ -6510,11 +6439,6 @@ class Mxfp4FlydslTuner(FmoeTuner):
         """
         import signal
 
-        # The only place both the sequential and --mp paths pass through holding
-        # `args`: the mp worker rebuilds a bare tuner carrying just `keys`, so
-        # _candidate_rows cannot read the CSV path off the parent instance.
-        self._candidate_csv = getattr(args, "candidate_csv", "")
-
         timeout = int(getattr(args, "timeout", 0) or 0)
 
         class _CandidateTimeout(Exception):
@@ -6592,9 +6516,7 @@ class Mxfp4FlydslTuner(FmoeTuner):
             (
                 res
                 if res is not None
-                else _mxfp4_failed_row(
-                    self.keys, row, args, "FAILED: worker died mid-shape"
-                )
+                else _mxfp4_failed_row(self.keys, row, "FAILED: worker died mid-shape")
             )
             for row, res in zip(rows, results)
         ]
@@ -6644,19 +6566,13 @@ def _mxfp4_tune_shape_worker(payload):
         # Catastrophic (non per-candidate) failure: record as a failed shape so
         # the run keeps going instead of aborting.
         print(f"[mxfp4-port] shape failed on GPU{gpu}: {exc}", flush=True)
-        return _mxfp4_failed_row(keys, row, args, f"FAILED(GPU{gpu}): {exc}")
+        return _mxfp4_failed_row(keys, row, f"FAILED(GPU{gpu}): {exc}")
 
 
-def _mxfp4_failed_row(keys, row, args, reason):
-    """A tuned-CSV row standing in for a shape that produced no timing.
-
-    Carries `args` only to hand _candidate_rows the same candidate source the
-    shape would have been tuned from, so an agent-recommended CSV still governs
-    the placeholder instead of it falling back to the full sweep.
-    """
+def _mxfp4_failed_row(keys, row, reason):
+    """A tuned-CSV row standing in for a shape that produced no timing."""
     tuner = Mxfp4FlydslTuner.__new__(Mxfp4FlydslTuner)
     tuner.keys = keys
-    tuner._candidate_csv = getattr(args, "candidate_csv", "")
     cand = tuner._candidate_rows(row)[0]
     cand["us"] = Mxfp4FlydslTuner.INVALID_TIME
     cand["kernelName1"] = reason[:240]
