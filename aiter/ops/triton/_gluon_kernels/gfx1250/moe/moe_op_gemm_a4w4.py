@@ -624,6 +624,10 @@ def _moe_gemm_a4w4_prefill(
     Y_ROWS=0,
     PRELOAD_X_SCALES: gl.constexpr = False,
     XS_SLAB_COLS: gl.constexpr = 0,
+    # Warm L2 with the first this-many K-tiles of w during the prologue.
+    # 0 disables. Costs no LDS, unlike raising NUM_BUFFERS, which would
+    # cost a whole workgroup per CU on both prefill GEMMs.
+    L2_PREFETCH_DISTANCE: gl.constexpr = 0,
 ):
     MX_PACK_DIVISOR: gl.constexpr = 32
     gl.static_assert(
@@ -944,6 +948,12 @@ def _moe_gemm_a4w4_prefill(
         )
 
         load_idx += 1
+
+    if L2_PREFETCH_DISTANCE > 0:
+        for pf_j in gl.static_range(L2_PREFETCH_DISTANCE):
+            gl.amd.gfx1250.tdm.prefetch(
+                w_desc, [offs_w_n, pf_j * SHUFFLED_BLOCK_K_W]
+            )
 
     # preload tile 0 from LDS into registers
     gl.amd.gfx1250.tdm.async_wait((NUM_BUFFERS - 1) * NUM_TDM_OPS)
