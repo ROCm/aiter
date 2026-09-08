@@ -207,8 +207,9 @@ The ``a8w8_blockscale`` op runs:
           7168,3072 65536,1536 8192,1536 \
       --ck_preshuffle True --flydsl
 
-The ``a16w16`` op uses ``test_opus_a16w16_gemm.py`` with batch=1, M=512,
-K=7168 and N=64,384,1024,2048,32320,129280.
+The ``a16w16`` op uses the global tuned GEMM dispatcher with batch=1, K=7168,
+the token sweep as M and N=64,384,1024,2048,32320,129280. The selected
+``libtype`` is reported for every shape.
 
 The ``mega_moe`` op runs both sides of the comparison in one process and emits
 only their combined summary (the summary retains the base/fused timings,
@@ -226,11 +227,9 @@ above). Unset, each op runs its own default -- the ops do not share a supported
 range, so those defaults differ and each says why at its constant. Set, it
 applies to every op that sweeps tokens, and the file does not argue with it.
 
-``a16w16`` is not one of them: its range is a function of what opus has tuned,
-not a fixed limit. Shapes with no tuned winner fall back to a split-K kid whose
-launcher is 32-bit gmem-descriptor bound, which is both slow and, at M=65536,
-wrong. Re-tuning through csrc/gemm_a16w16/gemm_a16w16_tune.py --libtype opus is
-what widens the range, so the bench predicts nothing and reports what it gets.
+``a16w16`` is not one of them: it uses the DSv4 shape grid below and lets the
+global tuned GEMM table select the backend for every shape. A missing row uses
+the dispatcher's normal fallback instead of forcing a backend here.
 
 gfx1250's bundled CK does not compile, so the asm JIT modules must be built with
 ENABLE_CK=0. The script sets it (before importing aiter) so a plain run just
@@ -302,16 +301,18 @@ with _silence():
     import test_fmha_fwd_with_sink_asm as mha_mod  # has __main__ guard
     import test_mla_v4_kargpreld as mla_v4_kargpreld_mod
     import test_mxfp8fp4gemm as f8gemm_mod
-    import test_opus_a16w16_gemm as a16w16_mod
     import torch
     from triton_tests.attention import test_mla_v4_triton as mla_v4_triton_mod
 
     import aiter
+    import aiter.tuned_gemm as tuned_gemm_mod
     from aiter import dtypes
     from aiter.jit.utils.chip_info import get_cu_num, get_gfx
     from aiter.test_common import (
         DATA_DISTS,
         E8M0_SCALE_DISTS,
+        checkAllclose,
+        fill,
         make_generator,
         print_json_table,
         run_perftest,
@@ -351,10 +352,9 @@ _A16W16_NS = (64, 384, 1024, 2048, 32320, 129280)
 # is 16 GB of bf16 output at (65536, 129280).
 _A16W16_WIDE_N = 2048
 _A16W16_WIDE_N_MAX_M = 2048
-# a16w16 returns its own error ratio, and a wrong answer here is silent: the UT
-# neither raises nor prints a warning. Measured on gfx1250 / 20260827, every
-# shape that computed correctly came back 0 or ~1e-5, while M=65536 came back
-# 0.96-0.99 on all four of its N -- an unrelated result, not a tolerance miss.
+# A wrong a16w16 answer is otherwise silent. Measured on gfx1250 / 20260827,
+# every shape that computed correctly came back 0 or ~1e-5, while M=65536 came
+# back 0.96-0.99 on all four of its N -- an unrelated result, not a tolerance miss.
 # Anything above this is reported as a failed op rather than printed as data.
 _A16W16_MAX_ERR = 1e-2
 
@@ -1181,10 +1181,7 @@ def run_a8w8_blockscale(args):
 
 
 def run_a16w16(args):
-    """Run the DSv4 BF16 linear shapes through the Opus GEMM UT."""
-    # test_a16w16 returns only the error; its timing is printed as
-    #   [a16w16] batch=1 M=512 N=64 K=7168 dtype=... | 7.8us | 12.05 TFLOPs | err=0
-    # so capture the block and parse that line back out.
+    """Run the DSv4 BF16 linear shapes through the tuned GEMM dispatcher."""
     batch, K = 1, 7168
     rows = []
     _unused_scale_init(args, "a16w16")
@@ -1193,69 +1190,93 @@ def run_a16w16(args):
     for data_init, M, n in itertools.product(
         data_inits, _A16W16_MS, _A16W16_NS
     ):
+        config = tuned_gemm_mod.get_GEMM_A16W16_config(
+            M=M,
+            N=n,
+            K=K,
+            bias=False,
+            dtype=str(torch.bfloat16),
+            otype=str(torch.bfloat16),
+        )
+        libtype = config["libtype"]
         # N=32320/129280 is lm_head (the DeepSeek vocab, whole and TP4-sharded).
         # See _A16W16_WIDE_N: this is the one shape rule left here, and it is
         # about what DSv4 runs, not about what the kernel can do.
         if n > _A16W16_WIDE_N and M > _A16W16_WIDE_N_MAX_M:
             rows.append({"data_init": data_init, "seed": args.seed,
                          "batch": batch, "M": M, "N": n, "K": K,
+                         "libtype": libtype,
                          "err_msg": f"skipped: N>{_A16W16_WIDE_N} is lm_head, "
                                     f"capped at M<={_A16W16_WIDE_N_MAX_M}"})
             continue
-        # No >4 GiB pre-check. opus_dispatch_a16w16_gfx1250 tries the tuned
-        # table FIRST and returns on a hit; check_shape_4g runs only after that
-        # misses (opus_gemm_arch_gfx1250.cuh:161), on the way to the split-K
-        # heuristic kid -- whose launcher is what builds the 32-bit gmem
-        # descriptors. A tuned 4wave_wl_co winner never reaches it: that
-        # pipeline addresses gmem through TDM descriptors, which clamp every
-        # dimension and are not 32-bit bounded. So the limit belongs to one
-        # fallback path, not to a16w16, and predicting it here would keep
-        # skipping shapes that tuning has already made runnable. Let the kernel
-        # raise and record that instead.
+        # Exercise the same backend selected by the global tuned CSV rather than
+        # forcing every shape through the Opus-only regression helper.
         try:
+            A = fill(
+                (batch, M, K),
+                data_init,
+                generators[data_init],
+                dtype=torch.bfloat16,
+                device="cuda",
+            )
+            B = fill(
+                (n, K),
+                data_init,
+                generators[data_init],
+                dtype=torch.bfloat16,
+                device="cuda",
+            )
+            ref = torch.einsum("bmk,nk->bmn", A.float(), B.float()).to(
+                torch.bfloat16
+            )
             with _smi_case(
                 f"a16w16/batch={batch}/M={M}/N={n}/K={K}/"
                 f"data={data_init}/seed={args.seed}"
             ), _capture() as box:
-                err = a16w16_mod.test_a16w16(
-                    batch=batch,
-                    M=M,
-                    N=n,
-                    K=K,
-                    dist=data_init,
-                    gen=generators[data_init],
+                Y, us = run_perftest(
+                    tuned_gemm_mod.gemm_a16w16,
+                    A,
+                    B,
+                    None,
+                    torch.bfloat16,
+                    num_iters=101,
+                    num_warmup=2,
+                    num_rotate_args=0,
+                )
+                err = checkAllclose(
+                    Y,
+                    ref,
+                    msg=f"a16w16 b={batch} m={M} n={n} k={K}",
+                    rtol=0.1,
+                    atol=0.5,
                 )
         except Exception as exc:  # noqa: BLE001 - one shape must not end the sweep
             rows.append({"data_init": data_init, "seed": args.seed,
                          "batch": batch, "M": M, "N": n, "K": K,
+                         "libtype": libtype,
                          "err_msg": f"{type(exc).__name__}: {exc}"})
             continue
         captured = box[0].splitlines()
         row = {"data_init": data_init, "seed": args.seed,
-               "batch": batch, "M": M, "N": n, "K": K, "err": err}
+               "batch": batch, "M": M, "N": n, "K": K,
+               "libtype": libtype, "us": float(us),
+               "TFLOPS": 2.0 * batch * M * n * K / float(us) / 1e6,
+               "err": err}
         # float(): checkAllclose returns a bare 0 for a clean compare but a
         # numpy/torch scalar for a mismatch, and only one of those formats.
         if err is not None and float(err) > _A16W16_MAX_ERR:
             row["err_msg"] = (f"WRONG RESULT: err={float(err):g} "
                               f"> {_A16W16_MAX_ERR:g}")
             _note_failure(f"a16w16 M={M} N={n} K={K}", row["err_msg"])
-        for line in captured:
-            if not line.startswith("[a16w16]"):
-                continue
-            fields = [f.strip() for f in line.split("|")]
-            us = next((f for f in fields if f.endswith("us")), None)
-            tflops = next((f for f in fields if f.endswith("TFLOPs")), None)
-            row["us"] = float(us[:-2]) if us else None
-            row["TFLOPS"] = float(tflops[:-7]) if tflops else None
-            break
-        # Which kernel served this shape: a16w16 switches between a splitk pair
-        # and a 4wave_wl_co variant, and the timing alone does not say which.
+        # Which kernel served this shape: the selected backend alone does not
+        # identify the concrete kernel that reached the GPU.
         row["kernel"] = " + ".join(_kernel_names(captured)) or None
         rows.append(row)
     _print_table(
-        "gemm_a16w16_opus (DSv4)",
+        "gemm_a16w16_tuned (DSv4)",
         rows,
-        keep=["data_init", "seed", "batch", "M", "N", "K", "us", "TFLOPS", "kernel", "err"],
+        keep=["data_init", "seed", "batch", "M", "N", "K", "libtype",
+              "us", "TFLOPS", "kernel", "err"],
     )
 
 
