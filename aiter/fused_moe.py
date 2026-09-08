@@ -2058,7 +2058,14 @@ def _mxfp4_a4w4_stage1_fw(
     p1 = _parse_mxfp4_g1_kname(kernelName1)
     runtime_situ_beta = float(situ_beta)
     runtime_situ_linear_beta = float(situ_linear_beta)
-    runtime_swiglu_limit = 7.0 if swiglu_limit is None else float(swiglu_limit)
+    # swiglu_limit reaches the kernel as a scalar closure value, so it lands in
+    # FlyDSL's disk-cache key (see the note in mxfp4_gemm1.py), yet
+    # _activation_mul_batch only consumes it for swiglu -- silu and situv2 ignore
+    # it entirely. Pin the other activations to the default so a caller's limit
+    # cannot fork the cache into entries whose generated code is identical.
+    runtime_swiglu_limit = 7.0
+    if p1["act"] == "swiglu" and swiglu_limit is not None:
+        runtime_swiglu_limit = float(swiglu_limit)
     if not p1.get("enable_bias", False) and bias1 is not None:
         raise ValueError(
             "MXMOE bias presence does not match the cache-safe kernel name"
@@ -3584,11 +3591,13 @@ def fused_moe_2stages(
                 extra_stage1_args["topk_ids"] = topk_ids
         if metadata.stage2_has_bias:
             extra_stage2_args["bias2"] = _normalize_bias_for_kernel(bias2)
-    if stage1_func in (
-        _flydsl_stage1_wrapper,
-        _opus_a8w4_stage1_wrapper,
-        _mxfp4_a4w4_stage1_fw,
-    ):
+    if stage1_func in (_flydsl_stage1_wrapper, _opus_a8w4_stage1_wrapper):
+        # Hand these two the caller's limit unchanged. They clamp silu whenever a
+        # finite limit is configured (runtime_swiglu_limit in moe_kernels.py), and
+        # the torch reference does the same, so normalizing non-Swiglu to None
+        # would silently drop the clamp on paths outside this change.
+        extra_stage1_args["swiglu_limit"] = swiglu_limit
+    elif stage1_func is _mxfp4_a4w4_stage1_fw:
         extra_stage1_args["swiglu_limit"] = normalized_swiglu_limit
     if stage1_func is _flydsl_stage1_wrapper and metadata.skip_inter_quant:
         extra_stage1_args["v2_output_layout"] = True
