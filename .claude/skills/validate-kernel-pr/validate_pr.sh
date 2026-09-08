@@ -1986,9 +1986,10 @@ fi
 # ---- perf stage.
 #
 # Emitted last because it is the only stage needing results from both the baseline phase and
-# the head phase. It is deliberately NOT in finish_report's required-stage set: `complete` is
-# computed from the nine correctness stages, so a perf run that could not happen downgrades
-# nothing and a PASS stays a PASS. What it can do is append a should-fix finding, which
+# the head phase. It is deliberately NOT in finish_report's required-stage set -- the same
+# footing the shape grid now stands on: `complete` is computed from the required stages alone,
+# so a perf run that could not happen downgrades nothing and a PASS stays a PASS. What it can
+# do is append a should-fix finding, which
 # finish_report turns into NEEDS_WORK and exit 1 -- a measured regression is a real result,
 # not an advisory note, and the whole point of putting it in the deterministic layer is that
 # it ships its own reproducer (both logs, both exit codes, the command) with it.

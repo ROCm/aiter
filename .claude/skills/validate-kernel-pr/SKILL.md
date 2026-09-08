@@ -303,8 +303,9 @@ are coverage context — record them, they tell a reviewer what this suite never
 rows *this change* disabled produce `NEEDS_WORK`. The distinction matters because the pre-existing
 ones are usually numerous and would drown the one that is actually the PR's doing.
 
-Either way, the independent grid in the next stage stays visible: it is the answer to a disabled
-row, not a substitute for noticing one.
+A disabled row is also the clearest case for reaching past the target's own shapes with `--grid`:
+the row tells you exactly which input stopped being covered. That is an answer to a disabled row,
+not a substitute for noticing one.
 
 ### 5 — `correctness` — the target, and optionally shapes it does not run
 
@@ -397,8 +398,9 @@ actually has, and say what in the source told you so:
 The third channel exists because the first two require the target to have been *written* for a
 validator. Zero of the seven files in aiter's `op_tests/flydsl_tests/` expose an env var or a shape
 flag; every one declares shapes as parametrize literals. Four consecutive real FlyDSL kernel PRs
-reached `INCONCLUSIVE` for that reason alone, and the skip text blamed the kernel for a limit that
-belonged to the injector.
+reached `INCONCLUSIVE` for that reason alone — back when a missing grid capped the verdict — and
+the skip text blamed the kernel for a limit that belonged to the injector. The verdict no longer
+turns on it, but the diagnostic still has to name the injector rather than the target.
 
 **You name the channel; the validator does not read the file to check you.** It records
 `grid_channel_basis: declared-by-caller`, because your naming it is a claim, not a measurement.
@@ -505,11 +507,16 @@ channel could not be established. With no grid it attests route execution and no
 shapes, which is all it is then entitled to claim; abandoning it alongside the grid would throw
 away evidence already collected.
 
-**One receipt per run, not per phase.** The repo-tests run and the grid run both execute inside
-the head phase. Sharing one receipt path meant the second erased the first — and with the grid
-cells a subset of the target's defaults, a receipt written by *either* run satisfied the grid's
+**One receipt per run, not per phase.** The repo-tests run and a grid run both execute inside the
+head phase. Sharing one receipt path meant the second erased the first — and with the grid cells a
+subset of the target's defaults, a receipt written by *either* run satisfied the grid's
 requirement, which made the grid's own evidence unfalsifiable. One file per run, read the grid
 run's own file when a grid ran, and record which run the published receipt describes.
+
+With no grid the receipt's `required_shapes` is empty, and that is a legal `pass`. It was
+unreachable while the grid was mandatory, which is why the schema demanded a non-empty list there;
+`executed_shapes` still has to be non-empty, so a receipt never passes without having watched
+something happen.
 
 **Name the op a reviewer cares about, not the wrapper it runs through.** The probe resolves the
 declared route to a code object and walks the `__wrapped__` chain, so decoration does not have to
@@ -601,9 +608,10 @@ validation is far worse than no perf stage.
 `BLOCK` if a reproducible candidate defect fired, `NEEDS_WORK` if a deterministic policy concern
 fired, `INCONCLUSIVE` if any required stage did not complete, else `PASS`. `PASS` therefore means
 the merge simulation, GPU claim, repo-aware runtime probe, policy comparison, baseline control,
-both correctness targets, execution receipt, and index scan all ran. It does **not** mean a timing
-comparison was made: read `stages.perf` for that, and read a `skip` there as "not measured", not as
-"no regression".
+the correctness target, execution receipt, and index scan all ran. It does **not** mean an extra
+shape grid was supplied — that stage is optional and completes nothing either way. Nor does it mean
+a timing comparison was made: read `stages.perf` for that, and read a `skip` there as "not
+measured", not as "no regression".
 
 Process exit codes match the verdict: `PASS=0`, `BLOCK/NEEDS_WORK=1`, and `INCONCLUSIVE=2`.
 
@@ -681,8 +689,8 @@ a seeded defect, and these have not been:
   what stays unreachable is a target whose shapes are none of them — a parametrized case whose
   parameter is a **dict or object** rather than scalar cells, and a target taking shapes from a
   file or a fixture. Supplying a separate harness of our own is not the answer either: it would
-  have to be bound without changing the PR's diff hash or its live-base identity. Such runs stay
-  `INCONCLUSIVE`, and the reason says which case applied.
+  have to be bound without changing the PR's diff hash or its live-base identity. Such a target
+  simply gets no grid, which costs it nothing now, and the reason says which case applied.
 - **Axes on the env-var and pytest channels.** An axis rides argv, so it reaches script targets
   only. A pytest target's extra knobs are `parametrize` argnames, needing a different injector,
   and an env-var channel has no per-axis spelling to prove against. Requesting an axis on either
