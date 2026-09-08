@@ -36,7 +36,7 @@ Run from the aiter repo root so `op_tests/` siblings import cleanly:
     python op_tests/bench_gfx1250_combo.py --dsv4 --ops qk_norm   # QK norm + RoPE
     python op_tests/bench_gfx1250_combo.py --dsv4 --ops score_qk  # FP8 paged MQA logits
     python op_tests/bench_gfx1250_combo.py --dsv4 --ops mori_ep   # MORI EPv2 dispatch/combine
-    python op_tests/bench_gfx1250_combo.py --dsv4 --ops mega_moe  # Mega on/off, 4 GPUs
+    python op_tests/bench_gfx1250_combo.py --dsv4 --ops mega_moe  # base + Mega, 4 GPUs
 
 Environment
 -----------
@@ -210,21 +210,16 @@ The ``a8w8_blockscale`` op runs:
 The ``a16w16`` op uses ``test_opus_a16w16_gemm.py`` with batch=1, M=512,
 K=7168 and N=64,384,1024,2048,32320,129280.
 
-The ``mega_moe`` op runs both sides of the comparison:
+The ``mega_moe`` op runs both sides of the comparison in one process and emits
+only their combined summary (the summary retains the base/fused timings,
+speedup and stage-2 overlap rate):
 
     MORI_V2_KERNEL_BACKEND=hip MEGA_DISPATCH=mori \
     torchrun --standalone --nproc_per_node=4 \
       op_tests/multigpu_tests/test_mega_moe_gfx1250.py \
       -e 384 -k 6 -hd 7168 -id 3072 \
-      --layers 61 -tpr 512 --combine scatter_fused \
-      --acc_verify 0 --profile_table 1
-
-    MORI_V2_KERNEL_BACKEND=hip MEGA_DISPATCH=mori \
-    torchrun --standalone --nproc_per_node=4 \
-      op_tests/multigpu_tests/test_mega_moe_gfx1250.py \
-      -e 384 -k 6 -hd 7168 -id 3072 \
-      --layers 61 -tpr 512 --combine gather \
-      --acc_verify 0 --profile_table 1
+      --layers 61 -tpr 512 --combine both \
+      --acc_verify 0 --profile_table 0
 
 Token sweeps come from one variable, AITER_BENCH_TOKENS (see Environment
 above). Unset, each op runs its own default -- the ops do not share a supported
@@ -1305,7 +1300,7 @@ def run_mega_moe(args):
         "--acc_verify",
         "0",
         "--profile_table",
-        "1",
+        "0",
     ]
     # AITER_FORCE_A8W4 selects the grouped kernel's ACTIVATION dtype (0 -> fp4,
     # 1 -> fp8); the weights are mxfp4 either way and -q only picks their layout,
@@ -1315,7 +1310,7 @@ def run_mega_moe(args):
     for tokens, (quant, force_a8w4), (label, combine), data_init in itertools.product(
         _MEGA_MOE_TOKENS,
         (("a4w4_mxfp4", "0"), ("a8w4_mxfp4", "1")),
-        (("non-Mega", "base"), ("Mega", "fused")),
+        (("base+Mega", "both"),),
         data_inits,
     ):
         init_label = data_init or "native-default"
