@@ -265,6 +265,10 @@ _DEFAULT_SHAPES = [
     (2, 16, 16, 32, 4, 64, 3, 5, 5),
     # Cross-(t,h)-row: W=33 is not a multiple of BLOCK_Q=16.
     (1, 4, 8, 33, 4, 64, 3, 5, 5),
+    # KW > 17 forces BLOCK_Q=32/BLOCK_KV=64: BLOCK_Q=16/BLOCK_KV=32 is pruned
+    # because 32 < BLOCK_Q + KW - 1 = 16 + 27 - 1 = 42. Only the 32/64 configs
+    # survive; exercises large-KW masking and the W-boundary of BLOCK_KV=64.
+    (1, 4, 8, 32, 4, 64, 3, 5, 27),
 ]
 
 
@@ -282,6 +286,7 @@ _SDPA_FAST_SHAPES = [
     (1, 11, 16, 16, 4, 64, 11, 11, 11),  # edge: T == KT         (SEQ = 2 816)
     (1, 16, 16, 16, 4, 64, 11, 11, 11),  # edge: W == 16         (SEQ = 4 096)
     (2, 16, 16, 32, 4, 64, 3, 5, 5),  # edge: B > 1           (SEQ = 8 192)
+    (1, 4, 8, 32, 4, 64, 3, 5, 27),  # edge: KW=27>17, BLOCK_Q=32 only (SEQ = 1 024)
 ]
 
 
