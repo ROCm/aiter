@@ -246,6 +246,18 @@ def _is_inline_sort_kname(kernel1):
         return False
 
 
+def _is_inline_sort_cfg(kernel1, kernel2):
+    """Whether a tuned row targets the inline-sort two-stage path.
+
+    An inline-quant stage1 paired with a plain mxmoe stage2 belongs to the
+    mxmoe dispatcher instead, and must not be judged by this path's rules.
+    """
+    return (
+        _is_inline_sort_kname(kernel1)
+        and parse_flydsl_v2_gemm2_kernel(kernel2) is not None
+    )
+
+
 def _is_mxfp4_inline_sort(metadata):
     """Validate a config-driven inline-quant two-stage MXFP4 dispatch."""
     try:
@@ -2694,13 +2706,13 @@ def get_2stage_cfgs(
                 f"[fused_moe] discarding Opus tuned config for unsupported "
                 f"activation {activation}; using default heuristics"
             )
-        elif _disable_inline_sort and _is_inline_sort_kname(kn1):
+        elif _disable_inline_sort and _is_inline_sort_cfg(kn1, kn2):
             cfg = None
             logger.warning(
                 "[fused_moe] discarding tuned inline-sort config; "
                 "using default heuristics"
             )
-        elif _is_inline_sort_kname(kn1):
+        elif _is_inline_sort_cfg(kn1, kn2):
             inline_metadata = _make_mxfp4_metadata(
                 kn1,
                 kn2,
