@@ -1,12 +1,17 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
+"""gfx1250 prefill TopK with one workgroup per input row.
+
+Short rows cache ordered keys in LDS. Long rows compact the selected radix
+bucket, while stable modes add deterministic index ordering and tie-breaking.
+"""
+
 from functools import cache
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl.expr import const_expr, gpu, ptrtoint, range_constexpr
-from flydsl.expr.typing import T
 
 from .kernels_common import atomic_add_i32
 from .topk_per_row_decode import _load_f32x4, _warp_inclusive_prefix_i32
@@ -28,9 +33,6 @@ _SHORT_HIGH_BITS = 11
 _SHORT_MIDDLE_BITS = 10
 _SHORT_LOW_BITS = _KEY_BITS - _SHORT_HIGH_BITS - _SHORT_MIDDLE_BITS
 _SHORT_HIGH_BUCKETS = 1 << _SHORT_HIGH_BITS
-_SHORT_LATER_BUCKETS = 1 << max(
-    _SHORT_MIDDLE_BITS, _SHORT_LOW_BITS
-)
 _SHORT_HIGH_SHIFT = _SHORT_MIDDLE_BITS + _SHORT_LOW_BITS
 _SHORT_MIDDLE_SHIFT = _SHORT_LOW_BITS
 _SHORT_MIDDLE_MASK = (1 << _SHORT_MIDDLE_BITS) - 1
@@ -49,6 +51,23 @@ _RUNNING_ABOVE = 6
 _RUNNING_EQUAL = 7
 _CANDIDATE_COUNT = 8
 _SELECTED_BUCKET_COUNT = 9
+_METADATA_SIZE = _SELECTED_BUCKET_COUNT + 1
+_PACKED_COUNT_BITS = 16
+_PACKED_COUNT_MASK = (1 << _PACKED_COUNT_BITS) - 1
+
+
+def _build_bitonic_schedule(capacity: int) -> tuple[tuple[int, ...], ...]:
+    sizes = []
+    strides = []
+    size = 2
+    while size <= capacity:
+        stride = size // 2
+        while stride:
+            sizes.append(size)
+            strides.append(stride)
+            stride //= 2
+        size *= 2
+    return tuple(sizes), tuple(strides)
 
 
 @cache
@@ -65,6 +84,8 @@ def build_topk_per_row_prefill_one_workgroup_module(
         raise ValueError("k must be positive")
     if block_threads not in (256, 1024):
         raise ValueError("block_threads must be 256 or 1024")
+    if block_threads * _VEC > _PACKED_COUNT_MASK:
+        raise ValueError("one scan tile exceeds the packed count range")
 
     num_waves = block_threads // _WAVE_SIZE
     high_bins_per_thread = _HIGH_BUCKETS // block_threads
@@ -73,33 +94,26 @@ def build_topk_per_row_prefill_one_workgroup_module(
     full_key_vector_steps = (
         (_COMPACT_CAPACITY // _VEC) + block_threads - 1
     ) // block_threads
-    stable_fast_supported = block_threads == 1024 and k <= 2048
+    stable_sort_enabled = stable and block_threads == 1024 and k <= 2048
     stable_sort_capacity = (
-        1 << (k - 1).bit_length() if stable_fast_supported else 1
+        1 << (k - 1).bit_length() if stable_sort_enabled else 1
     )
     stable_stage_capacity = (
-        k if stable and stable_fast_supported else 1
+        k if stable_sort_enabled else 1
     )
     stable_sort_items_per_thread = (
         stable_sort_capacity + block_threads - 1
     ) // block_threads
-    stable_sort_sizes = []
-    stable_sort_strides = []
-    size = 2
-    while size <= stable_sort_capacity:
-        stride = size // 2
-        while stride:
-            stable_sort_sizes.append(size)
-            stable_sort_strides.append(stride)
-            stride //= 2
-        size *= 2
-    stable_sort_sizes = tuple(stable_sort_sizes)
-    stable_sort_strides = tuple(stable_sort_strides)
+    stable_sort_sizes, stable_sort_strides = _build_bitonic_schedule(
+        stable_sort_capacity
+    )
     output_vector_count = k // _VEC
     output_vector_steps = (
         output_vector_count + block_threads - 1
     ) // block_threads
     output_vector_elems = max(_VEC, output_vector_count * _VEC)
+
+    # LDS layouts
 
     @fx.struct
     class LongPass1Storage:
@@ -120,24 +134,17 @@ def build_topk_per_row_prefill_one_workgroup_module(
         histogram1: fx.Array[fx.Int32, _SHORT_HIGH_BUCKETS, 16]
         full_keys: fx.Array[fx.Int32, _COMPACT_CAPACITY, 16]
 
-    @fx.struct
-    class ShortLaterStorage:
-        histogram: fx.Array[fx.Int32, _SHORT_LATER_BUCKETS, 16]
-        padding: fx.Array[fx.Int32, _SHORT_LATER_BUCKETS, 16]
-        full_keys: fx.Array[fx.Int32, _COMPACT_CAPACITY, 16]
-
     @fx.union
     class ArenaStorage:
         long_pass1: LongPass1Storage
         long_later: LongLaterStorage
         short_pass1: ShortPass1Storage
-        short_later: ShortLaterStorage
 
     @fx.struct
     class SharedStorage:
         arena: ArenaStorage
         scan: fx.Array[fx.Int32, num_waves * 2, 16]
-        metadata: fx.Array[fx.Int32, 10, 16]
+        metadata: fx.Array[fx.Int32, _METADATA_SIZE, 16]
 
     @flyc.kernel(
         name=(
@@ -147,12 +154,11 @@ def build_topk_per_row_prefill_one_workgroup_module(
         known_block_size=[block_threads, 1, 1],
     )
     def topk_per_row_prefill_one_workgroup_kernel(
-        input_ptr: fx.Pointer,
-        row_starts_ptr: fx.Pointer,
-        row_ends_ptr: fx.Pointer,
-        indices_ptr: fx.Pointer,
-        values_ptr: fx.Pointer,
-        stride0: fx.Int32,
+        input: fx.Tensor,
+        row_starts: fx.Tensor,
+        row_ends: fx.Tensor,
+        indices: fx.Tensor,
+        value_output: fx.Tensor,
     ):
         row = fx.Int32(fx.block_idx.x)
         tid = fx.thread_idx.x
@@ -161,36 +167,23 @@ def build_topk_per_row_prefill_one_workgroup_module(
 
         zero = fx.Int32(0)
         one = fx.Int32(1)
-        two = fx.Int32(2)
+        above_class = fx.Int32(2)
         vec_width = fx.Int32(_VEC)
         block_size = fx.Int32(block_threads)
         top_k = fx.Int32(k)
         sign_bit = fx.Int32(-2147483648)
 
-        i32_ptr_type = fx.PointerType.get(
-            T.i32, address_space=fx.AddressSpace.Global, alignment=4
-        )
-        f32_ptr_type = fx.PointerType.get(
-            T.f32, address_space=fx.AddressSpace.Global, alignment=4
-        )
-
-        row_starts = fx.inttoptr(
-            i32_ptr_type, fx.Int64(ptrtoint(row_starts_ptr))
-        )
-        row_ends = fx.inttoptr(
-            i32_ptr_type, fx.Int64(ptrtoint(row_ends_ptr))
-        )
+        # Row views
         row_start = row_starts[row]
         row_len = row_ends[row] - row_start
-
-        input_row_addr = (
-            fx.Int64(ptrtoint(input_ptr))
-            + fx.Int64(row) * fx.Int64(stride0) * fx.Int64(4)
-            + fx.Int64(row_start) * fx.Int64(4)
+        physical_row = fx.slice(input, (row, None))
+        input_row_iter = fx.add_offset(
+            fx.get_iter(physical_row), row_start
         )
+        input_row_addr = fx.Int64(ptrtoint(input_row_iter))
         input_row = fx.rocdl.make_buffer_tensor(
             fx.make_view(
-                fx.inttoptr(f32_ptr_type, input_row_addr),
+                input_row_iter,
                 fx.make_layout(_MAX_ROW_ELEMENTS, 1),
             ),
             num_records_bytes=fx.Int64(row_len) * fx.Int64(4),
@@ -206,10 +199,10 @@ def build_topk_per_row_prefill_one_workgroup_module(
         skip_cnt = (skip_cnt > row_len).select(row_len, skip_cnt)
         aligned_len = row_len - skip_cnt
         len_cast = aligned_len // vec_width
-        aligned_addr = input_row_addr + fx.Int64(skip_cnt) * fx.Int64(4)
+        aligned_iter = fx.add_offset(input_row_iter, skip_cnt)
         aligned_row = fx.rocdl.make_buffer_tensor(
             fx.make_view(
-                fx.inttoptr(f32_ptr_type, aligned_addr),
+                aligned_iter,
                 fx.make_layout(_MAX_ROW_ELEMENTS, 1),
             ),
             num_records_bytes=fx.Int64(aligned_len) * fx.Int64(4),
@@ -218,19 +211,11 @@ def build_topk_per_row_prefill_one_workgroup_module(
             aligned_row, fx.make_layout(_VEC, 1)
         )
 
-        row_indices = fx.inttoptr(
-            i32_ptr_type,
-            fx.Int64(ptrtoint(indices_ptr))
-            + fx.Int64(row) * fx.Int64(k * 4),
-        )
-        row_values = fx.inttoptr(
-            f32_ptr_type,
-            fx.Int64(ptrtoint(values_ptr))
-            + fx.Int64(row) * fx.Int64(k * 4),
-        )
+        row_indices = fx.slice(indices, (row, None))
+        row_values = fx.slice(value_output, (row, None))
         row_index_tiles = fx.logical_divide(
             fx.make_view(
-                row_indices,
+                fx.get_iter(row_indices),
                 fx.make_layout(output_vector_elems, 1),
             ),
             fx.make_layout(_VEC, 1),
@@ -241,7 +226,7 @@ def build_topk_per_row_prefill_one_workgroup_module(
         index_fragment_layout = fx.make_layout(_VEC, 1)
         row_value_tiles = fx.logical_divide(
             fx.make_view(
-                row_values,
+                fx.get_iter(row_values),
                 fx.make_layout(output_vector_elems, 1),
             ),
             fx.make_layout(_VEC, 1),
@@ -271,13 +256,11 @@ def build_topk_per_row_prefill_one_workgroup_module(
                 fx.make_layout(_SHORT_HIGH_BUCKETS, 1)
             )
         )
-        short_histogram = (
-            storage.arena.short_later.histogram.peek().view(
-                fx.make_layout(_SHORT_LATER_BUCKETS, 1)
-            )
-        )
+        short_histogram = short_pass1_histogram0
         scan = storage.scan.peek().view(fx.make_layout(num_waves * 2, 1))
-        metadata = storage.metadata.peek().view(fx.make_layout(10, 1))
+        metadata = storage.metadata.peek().view(
+            fx.make_layout(_METADATA_SIZE, 1)
+        )
         candidate_keys = storage.arena.long_later.candidate_keys.peek().view(
             fx.make_layout(_COMPACT_CAPACITY, 1)
         )
@@ -304,6 +287,8 @@ def build_topk_per_row_prefill_one_workgroup_module(
             fx.UniversalCopy128b(), fx.Int32
         )
         full_key_fragment_layout = fx.make_layout(_VEC, 1)
+
+        # Key encoding and classification
 
         def ordered_key(value):
             bits = value.bitcast(fx.Int32)
@@ -337,6 +322,61 @@ def build_topk_per_row_prefill_one_workgroup_module(
         def short_low_bucket(key):
             return key & fx.Int32(_SHORT_LOW_MASK)
 
+        def classify_levels(
+            first,
+            second,
+            third,
+            first_threshold,
+            second_threshold,
+            third_threshold,
+            levels,
+        ):
+            if const_expr(levels == 1):
+                above = first > first_threshold
+                equal = first == first_threshold
+            elif const_expr(levels == 2):
+                above = (first > first_threshold) | (
+                    (first == first_threshold)
+                    & (second > second_threshold)
+                )
+                equal = (
+                    (first == first_threshold)
+                    & (second == second_threshold)
+                )
+            else:
+                above = (first > first_threshold) | (
+                    (first == first_threshold)
+                    & (
+                        (second > second_threshold)
+                        | (
+                            (second == second_threshold)
+                            & (third > third_threshold)
+                        )
+                    )
+                )
+                equal = (
+                    (first == first_threshold)
+                    & (second == second_threshold)
+                    & (third == third_threshold)
+                )
+            return above, equal
+
+        def classify(
+            key,
+            first_threshold,
+            second_threshold,
+            third_threshold,
+        ):
+            return classify_levels(
+                high_bucket(key),
+                middle_bucket(key),
+                low_bucket(key),
+                first_threshold,
+                second_threshold,
+                third_threshold,
+                3,
+            )
+
         def ordered_value(key):
             bits = (key < zero).select(
                 key ^ sign_bit, key ^ fx.Int32(-1)
@@ -369,11 +409,54 @@ def build_topk_per_row_prefill_one_workgroup_module(
             if const_expr(write_values):
                 row_values[pos] = value
 
-        def stable_equal_scatter(key, row_indices, row_values):
+        def scatter_unstable_key(
+            col,
+            key,
+            above,
+            equal,
+            num_needed,
+            row_indices,
+            row_values,
+            metadata,
+        ):
+            if above:
+                out_pos = atomic_add_i32(
+                    metadata,
+                    one,
+                    _RUNNING_ABOVE,
+                    "workgroup",
+                )
+                if out_pos < top_k:
+                    store_key_result(
+                        out_pos,
+                        col,
+                        key,
+                        row_indices,
+                        row_values,
+                    )
+            elif equal:
+                back_pos = atomic_add_i32(
+                    metadata,
+                    one,
+                    _RUNNING_EQUAL,
+                    "workgroup",
+                )
+                if back_pos < num_needed:
+                    store_key_result(
+                        top_k - one - back_pos,
+                        col,
+                        key,
+                        row_indices,
+                        row_values,
+                    )
+
+        def scatter_stable_equal_row(key, row_indices, row_values):
             for pos in range(tid, top_k, block_size):
                 row_indices[pos] = row_start + pos
                 if const_expr(write_values):
                     row_values[pos] = ordered_value(key)
+
+        # Histogram and workgroup scan primitives
 
         def clear_histogram(histogram, bins_per_thread):
             for item in range_constexpr(bins_per_thread):
@@ -398,7 +481,9 @@ def build_topk_per_row_prefill_one_workgroup_module(
             gpu.barrier()
 
         def block_exclusive_scan_pair(first, second, scan, metadata):
-            packed = first * fx.Int32(1 << 16) + second
+            packed = (
+                first * fx.Int32(1 << _PACKED_COUNT_BITS) + second
+            )
             packed_inclusive = _warp_inclusive_prefix_i32(
                 packed, lane, _WAVE_SIZE
             )
@@ -419,6 +504,8 @@ def build_topk_per_row_prefill_one_workgroup_module(
                         wave_inclusive - wave_total
                     )
                 if lane == num_waves - 1:
+                    # Threshold values are already live in registers here.
+                    # Reuse this metadata slot for the packed block total.
                     metadata[_THIRD_ABOVE] = wave_inclusive
             gpu.barrier()
             packed_prefix = (
@@ -426,13 +513,13 @@ def build_topk_per_row_prefill_one_workgroup_module(
             )
             packed_total = metadata[_THIRD_ABOVE]
             return (
-                packed_prefix.shrui(fx.Int32(16)),
-                packed_prefix & fx.Int32(0xFFFF),
-                packed_total.shrui(fx.Int32(16)),
-                packed_total & fx.Int32(0xFFFF),
+                packed_prefix.shrui(fx.Int32(_PACKED_COUNT_BITS)),
+                packed_prefix & fx.Int32(_PACKED_COUNT_MASK),
+                packed_total.shrui(fx.Int32(_PACKED_COUNT_BITS)),
+                packed_total & fx.Int32(_PACKED_COUNT_MASK),
             )
 
-        def choose_high_threshold(
+        def choose_threshold(
             target_k,
             above_slot,
             threshold_slot,
@@ -440,124 +527,14 @@ def build_topk_per_row_prefill_one_workgroup_module(
             histogram,
             scan,
             metadata,
+            bins_per_thread,
         ):
-            first_bin = tid * fx.Int32(high_bins_per_thread)
-            count0 = histogram[first_bin]
-            count1 = histogram[first_bin + one]
-            count2 = histogram[first_bin + two]
-            count3 = histogram[first_bin + fx.Int32(3)]
-            local_total = count0 + count1 + count2 + count3
-            wave_inclusive = _warp_inclusive_prefix_i32(
-                local_total, lane, _WAVE_SIZE
-            )
-            wave_exclusive = wave_inclusive - local_total
-
-            if lane == _WAVE_SIZE - 1:
-                scan[wave] = wave_inclusive
-            gpu.barrier()
-
-            if wave == 0:
-                active = lane < num_waves
-                safe_lane = active.select(lane, zero)
-                wave_total = active.select(scan[safe_lane], zero)
-                wave_prefix = (
-                    _warp_inclusive_prefix_i32(
-                        wave_total, lane, _WAVE_SIZE
-                    )
-                    - wave_total
-                )
-                if active:
-                    scan[lane + num_waves] = wave_prefix
-            gpu.barrier()
-
-            wave_offset = scan[wave + num_waves]
-            total = scan[num_waves - 1] + scan[num_waves * 2 - 1]
-            target_prefix = total - target_k
-            exclusive0 = wave_offset + wave_exclusive
-            inclusive0 = exclusive0 + count0
-            inclusive1 = inclusive0 + count1
-            inclusive2 = inclusive1 + count2
-            inclusive3 = inclusive2 + count3
-
-            def emit(bucket, exclusive, inclusive, metadata):
-                if (exclusive <= target_prefix) & (
-                    inclusive > target_prefix
-                ):
-                    metadata[threshold_slot] = bucket
-                    metadata[above_slot] = total - inclusive
-                    metadata[count_slot] = inclusive - exclusive
-
-            emit(first_bin, exclusive0, inclusive0, metadata)
-            emit(first_bin + one, inclusive0, inclusive1, metadata)
-            emit(first_bin + two, inclusive1, inclusive2, metadata)
-            emit(
-                first_bin + fx.Int32(3),
-                inclusive2,
-                inclusive3,
-                metadata,
-            )
-            gpu.barrier()
-
-        def choose_later_threshold(
-            target_k,
-            above_slot,
-            threshold_slot,
-            count_slot,
-            histogram,
-            scan,
-            metadata,
-        ):
-            count = histogram[tid]
-            wave_inclusive = _warp_inclusive_prefix_i32(
-                count, lane, _WAVE_SIZE
-            )
-            wave_exclusive = wave_inclusive - count
-
-            if lane == _WAVE_SIZE - 1:
-                scan[wave] = wave_inclusive
-            gpu.barrier()
-
-            if wave == 0:
-                active = lane < num_waves
-                safe_lane = active.select(lane, zero)
-                wave_total = active.select(scan[safe_lane], zero)
-                wave_prefix = (
-                    _warp_inclusive_prefix_i32(
-                        wave_total, lane, _WAVE_SIZE
-                    )
-                    - wave_total
-                )
-                if active:
-                    scan[lane + num_waves] = wave_prefix
-            gpu.barrier()
-
-            exclusive = scan[wave + num_waves] + wave_exclusive
-            inclusive = exclusive + count
-            total = scan[num_waves - 1] + scan[num_waves * 2 - 1]
-            target_prefix = total - target_k
-            if (exclusive <= target_prefix) & (
-                inclusive > target_prefix
-            ):
-                metadata[threshold_slot] = tid
-                metadata[above_slot] = total - inclusive
-                metadata[count_slot] = count
-            gpu.barrier()
-
-        def choose_short_threshold(
-            target_k,
-            above_slot,
-            threshold_slot,
-            count_slot,
-            histogram,
-            scan,
-            metadata,
-        ):
-            first_bin = tid * fx.Int32(short_bins_per_thread)
+            first_bin = tid * fx.Int32(bins_per_thread)
             counts = fx.make_rmem_tensor(
-                short_bins_per_thread, fx.Int32
+                bins_per_thread, fx.Int32
             )
             local_total = zero
-            for item in range_constexpr(short_bins_per_thread):
+            for item in range_constexpr(bins_per_thread):
                 count = histogram[first_bin + item]
                 counts[item] = count
                 local_total = local_total + count
@@ -588,7 +565,7 @@ def build_topk_per_row_prefill_one_workgroup_module(
             total = scan[num_waves - 1] + scan[num_waves * 2 - 1]
             target_prefix = total - target_k
             exclusive = wave_offset + wave_exclusive
-            for item in range_constexpr(short_bins_per_thread):
+            for item in range_constexpr(bins_per_thread):
                 inclusive = exclusive + counts[item]
                 if (exclusive <= target_prefix) & (
                     inclusive > target_prefix
@@ -598,6 +575,8 @@ def build_topk_per_row_prefill_one_workgroup_module(
                     metadata[count_slot] = inclusive - exclusive
                 exclusive = inclusive
             gpu.barrier()
+
+        # Global and LDS row iterators
 
         def scan_row(on_vec, on_scalar):
             unroll_stride = block_size * fx.Int32(_LOAD_UNROLL)
@@ -702,6 +681,8 @@ def build_topk_per_row_prefill_one_workgroup_module(
                     col = col_base + item
                     if active & (col < row_len):
                         body(col, values[item])
+
+        # Radix histogram passes
 
         def add_high_bucket(key, histogram0, histogram1):
             bucket = high_bucket(key)
@@ -834,7 +815,6 @@ def build_topk_per_row_prefill_one_workgroup_module(
                     candidate_indices[candidate_pos] = col
 
         def pass2_cached_key(
-            col,
             key,
             first_threshold,
             histogram,
@@ -936,6 +916,24 @@ def build_topk_per_row_prefill_one_workgroup_module(
                     second_threshold,
                 )
 
+        def pass3_cached_key(
+            key,
+            first_threshold,
+            second_threshold,
+            histogram,
+        ):
+            if (
+                short_high_bucket(key) == first_threshold
+            ) & (
+                short_middle_bucket(key) == second_threshold
+            ):
+                atomic_add_i32(
+                    histogram,
+                    one,
+                    short_low_bucket(key),
+                    "workgroup",
+                )
+
         def compact_pass3(
             candidate_count,
             second_threshold,
@@ -952,59 +950,9 @@ def build_topk_per_row_prefill_one_workgroup_module(
                         "workgroup",
                     )
 
-        def classify(
-            key,
-            first_threshold,
-            second_threshold,
-            third_threshold,
-        ):
-            first = high_bucket(key)
-            second = middle_bucket(key)
-            third = low_bucket(key)
-            above = (first > first_threshold) | (
-                (first == first_threshold)
-                & (
-                    (second > second_threshold)
-                    | (
-                        (second == second_threshold)
-                        & (third > third_threshold)
-                    )
-                )
-            )
-            equal = (
-                (first == first_threshold)
-                & (second == second_threshold)
-                & (third == third_threshold)
-            )
-            return above, equal
+        # Non-stable emitters
 
-        def short_classify(
-            key,
-            first_threshold,
-            second_threshold,
-            third_threshold,
-        ):
-            first = short_high_bucket(key)
-            second = short_middle_bucket(key)
-            third = short_low_bucket(key)
-            above = (first > first_threshold) | (
-                (first == first_threshold)
-                & (
-                    (second > second_threshold)
-                    | (
-                        (second == second_threshold)
-                        & (third > third_threshold)
-                    )
-                )
-            )
-            equal = (
-                (first == first_threshold)
-                & (second == second_threshold)
-                & (third == third_threshold)
-            )
-            return above, equal
-
-        def cached_scatter(
+        def scatter_cached_unstable(
             first_threshold,
             second_threshold,
             third_threshold,
@@ -1020,68 +968,25 @@ def build_topk_per_row_prefill_one_workgroup_module(
             gpu.barrier()
 
             def emit(col, key, row_indices, row_values, metadata):
-                first = short_high_bucket(key)
-                second = short_middle_bucket(key)
-                if const_expr(levels == 1):
-                    above = first > first_threshold
-                    equal = first == first_threshold
-                elif const_expr(levels == 2):
-                    above = (first > first_threshold) | (
-                        (first == first_threshold)
-                        & (second > second_threshold)
-                    )
-                    equal = (
-                        (first == first_threshold)
-                        & (second == second_threshold)
-                    )
-                else:
-                    third = short_low_bucket(key)
-                    above = (first > first_threshold) | (
-                        (first == first_threshold)
-                        & (
-                            (second > second_threshold)
-                            | (
-                                (second == second_threshold)
-                                & (third > third_threshold)
-                            )
-                        )
-                    )
-                    equal = (
-                        (first == first_threshold)
-                        & (second == second_threshold)
-                        & (third == third_threshold)
-                    )
-
-                if above:
-                    pos = atomic_add_i32(
-                        metadata,
-                        one,
-                        _RUNNING_ABOVE,
-                        "workgroup",
-                    )
-                    if pos < top_k:
-                        store_key_result(
-                            pos,
-                            col,
-                            key,
-                            row_indices,
-                            row_values,
-                        )
-                elif equal:
-                    back_pos = atomic_add_i32(
-                        metadata,
-                        one,
-                        _RUNNING_EQUAL,
-                        "workgroup",
-                    )
-                    if back_pos < num_needed:
-                        store_key_result(
-                            top_k - one - back_pos,
-                            col,
-                            key,
-                            row_indices,
-                            row_values,
-                        )
+                above, equal = classify_levels(
+                    short_high_bucket(key),
+                    short_middle_bucket(key),
+                    short_low_bucket(key),
+                    first_threshold,
+                    second_threshold,
+                    third_threshold,
+                    levels,
+                )
+                scatter_unstable_key(
+                    col,
+                    key,
+                    above,
+                    equal,
+                    num_needed,
+                    row_indices,
+                    row_values,
+                    metadata,
+                )
 
             scan_full_keys(
                 lambda col, key: emit(
@@ -1093,7 +998,7 @@ def build_topk_per_row_prefill_one_workgroup_module(
                 )
             )
 
-        def full_scatter(
+        def scatter_full_unstable(
             first_threshold,
             second_threshold,
             third_threshold,
@@ -1173,7 +1078,9 @@ def build_topk_per_row_prefill_one_workgroup_module(
                 ),
             )
 
-        def stable_sort_scatter(
+        # Stable emitters
+
+        def sort_and_store_stable(
             row_indices,
             row_values,
             candidate_keys,
@@ -1233,12 +1140,11 @@ def build_topk_per_row_prefill_one_workgroup_module(
                             fx.Float32
                         )
 
-        def stable_fast_scatter(
+        def scatter_stable_full_scan(
             first_threshold,
             second_threshold,
             third_threshold,
             num_needed,
-            classifier,
             row_indices,
             row_values,
             candidate_keys,
@@ -1258,7 +1164,7 @@ def build_topk_per_row_prefill_one_workgroup_module(
                 candidate_indices,
                 metadata,
             ):
-                above, equal = classifier(
+                above, equal = classify(
                     ordered_key(value),
                     first_threshold,
                     second_threshold,
@@ -1321,14 +1227,14 @@ def build_topk_per_row_prefill_one_workgroup_module(
                 ),
             )
             gpu.barrier()
-            stable_sort_scatter(
+            sort_and_store_stable(
                 row_indices,
                 row_values,
                 candidate_keys,
                 candidate_indices,
             )
 
-        def stable_compact_fast_scatter(
+        def scatter_stable_candidates(
             candidate_count,
             first_threshold,
             second_threshold,
@@ -1346,27 +1252,15 @@ def build_topk_per_row_prefill_one_workgroup_module(
                 tid, candidate_count, block_size
             ):
                 key = candidate_keys[candidate_pos]
-                first = high_bucket(key)
-                second = middle_bucket(key)
-                if const_expr(levels == 1):
-                    above = first > first_threshold
-                    equal = first == first_threshold
-                elif const_expr(levels == 2):
-                    above = (first > first_threshold) | (
-                        (first == first_threshold)
-                        & (second > second_threshold)
-                    )
-                    equal = (
-                        (first == first_threshold)
-                        & (second == second_threshold)
-                    )
-                else:
-                    above, equal = classify(
-                        key,
-                        first_threshold,
-                        second_threshold,
-                        third_threshold,
-                    )
+                above, equal = classify_levels(
+                    high_bucket(key),
+                    middle_bucket(key),
+                    low_bucket(key),
+                    first_threshold,
+                    second_threshold,
+                    third_threshold,
+                    levels,
+                )
                 if above | equal:
                     out_pos = atomic_add_i32(
                         metadata,
@@ -1391,14 +1285,14 @@ def build_topk_per_row_prefill_one_workgroup_module(
                     if const_expr(write_values):
                         candidate_keys[pos] = stable_keys[pos]
             gpu.barrier()
-            stable_sort_scatter(
+            sort_and_store_stable(
                 row_indices,
                 row_values,
                 candidate_keys,
                 candidate_indices,
             )
 
-        def stable_cached_scatter(
+        def scatter_stable_cached(
             first_threshold,
             second_threshold,
             third_threshold,
@@ -1406,7 +1300,6 @@ def build_topk_per_row_prefill_one_workgroup_module(
             levels,
             row_indices,
             row_values,
-            full_keys,
             scan,
             metadata,
         ):
@@ -1437,31 +1330,19 @@ def build_topk_per_row_prefill_one_workgroup_module(
                 local_equal = zero
                 for item in range_constexpr(_VEC):
                     col = vector_idx * vec_width + item
-                    first = short_high_bucket(keys[item])
-                    second = short_middle_bucket(keys[item])
-                    if const_expr(levels == 1):
-                        above = first > first_threshold
-                        equal = first == first_threshold
-                    elif const_expr(levels == 2):
-                        above = (first > first_threshold) | (
-                            (first == first_threshold)
-                            & (second > second_threshold)
-                        )
-                        equal = (
-                            (first == first_threshold)
-                            & (second == second_threshold)
-                        )
-                    else:
-                        above, equal = short_classify(
-                            keys[item],
-                            first_threshold,
-                            second_threshold,
-                            third_threshold,
-                        )
+                    above, equal = classify_levels(
+                        short_high_bucket(keys[item]),
+                        short_middle_bucket(keys[item]),
+                        short_low_bucket(keys[item]),
+                        first_threshold,
+                        second_threshold,
+                        third_threshold,
+                        levels,
+                    )
                     active = active_vector & (col < row_len)
                     above_i32 = (active & above).select(one, zero)
                     equal_i32 = (active & equal).select(one, zero)
-                    classes[item] = above_i32 * two + equal_i32
+                    classes[item] = above_i32 * above_class + equal_i32
                     local_above = local_above + above_i32
                     local_equal = local_equal + equal_i32
 
@@ -1484,7 +1365,7 @@ def build_topk_per_row_prefill_one_workgroup_module(
                         my_equal, num_needed
                     )
                     out_pos = my_above + accepted_equal
-                    if classes[item] == two:
+                    if classes[item] == above_class:
                         store_key_result(
                             out_pos,
                             col,
@@ -1510,12 +1391,11 @@ def build_topk_per_row_prefill_one_workgroup_module(
                 ).select(next_equal_base, num_needed)
                 gpu.barrier()
 
-        def stable_scatter(
+        def scatter_stable_ordered(
             first_threshold,
             second_threshold,
             third_threshold,
             num_needed,
-            classifier,
             row_indices,
             row_values,
             scan,
@@ -1532,7 +1412,7 @@ def build_topk_per_row_prefill_one_workgroup_module(
                 for item in range_constexpr(_VEC - 1):
                     if item < skip_cnt:
                         value = input_row[item]
-                        above, equal = classifier(
+                        above, equal = classify(
                             ordered_key(value),
                             first_threshold,
                             second_threshold,
@@ -1586,7 +1466,7 @@ def build_topk_per_row_prefill_one_workgroup_module(
                 local_equal = zero
                 for item in range_constexpr(_VEC):
                     col = col_base + item
-                    above, equal = classifier(
+                    above, equal = classify(
                         ordered_key(values[item]),
                         first_threshold,
                         second_threshold,
@@ -1595,7 +1475,7 @@ def build_topk_per_row_prefill_one_workgroup_module(
                     active = active_vector & (col < row_len)
                     above_i32 = (active & above).select(one, zero)
                     equal_i32 = (active & equal).select(one, zero)
-                    classes[item] = above_i32 * two + equal_i32
+                    classes[item] = above_i32 * above_class + equal_i32
                     local_above = local_above + above_i32
                     local_equal = local_equal + equal_i32
 
@@ -1618,7 +1498,7 @@ def build_topk_per_row_prefill_one_workgroup_module(
                         my_equal, num_needed
                     )
                     out_pos = my_above + accepted_equal
-                    if classes[item] == two:
+                    if classes[item] == above_class:
                         store_loaded_result(
                             out_pos,
                             col,
@@ -1652,7 +1532,7 @@ def build_topk_per_row_prefill_one_workgroup_module(
                     col = remain_base + item
                     if col < row_len:
                         value = input_row[col]
-                        above, equal = classifier(
+                        above, equal = classify(
                             ordered_key(value),
                             first_threshold,
                             second_threshold,
@@ -1683,7 +1563,9 @@ def build_topk_per_row_prefill_one_workgroup_module(
                             running_equal = running_equal + one
             gpu.barrier()
 
-        def compact_scatter_high(
+        # Compact candidate emitters
+
+        def scatter_candidates_after_first(
             candidate_count,
             row_indices,
             row_values,
@@ -1699,7 +1581,7 @@ def build_topk_per_row_prefill_one_workgroup_module(
                     row_values,
                 )
 
-        def compact_scatter_middle(
+        def scatter_candidates_after_second(
             candidate_count,
             second_threshold,
             num_needed,
@@ -1717,38 +1599,18 @@ def build_topk_per_row_prefill_one_workgroup_module(
                 col = candidate_indices[pos]
                 key = candidate_keys[pos]
                 second = middle_bucket(key)
-                if second > second_threshold:
-                    out_pos = atomic_add_i32(
-                        metadata,
-                        one,
-                        _RUNNING_ABOVE,
-                        "workgroup",
-                    )
-                    if out_pos < top_k:
-                        store_key_result(
-                            out_pos,
-                            col,
-                            key,
-                            row_indices,
-                            row_values,
-                        )
-                elif second == second_threshold:
-                    back_pos = atomic_add_i32(
-                        metadata,
-                        one,
-                        _RUNNING_EQUAL,
-                        "workgroup",
-                    )
-                    if back_pos < num_needed:
-                        store_key_result(
-                            top_k - one - back_pos,
-                            col,
-                            key,
-                            row_indices,
-                            row_values,
-                        )
+                scatter_unstable_key(
+                    col,
+                    key,
+                    second > second_threshold,
+                    second == second_threshold,
+                    num_needed,
+                    row_indices,
+                    row_values,
+                    metadata,
+                )
 
-        def compact_scatter(
+        def scatter_candidates_after_third(
             candidate_count,
             first_threshold,
             second_threshold,
@@ -1773,38 +1635,79 @@ def build_topk_per_row_prefill_one_workgroup_module(
                     second_threshold,
                     third_threshold,
                 )
-                if above:
-                    out_pos = atomic_add_i32(
-                        metadata,
-                        one,
-                        _RUNNING_ABOVE,
-                        "workgroup",
-                    )
-                    if out_pos < top_k:
-                        store_key_result(
-                            out_pos,
-                            col,
-                            key,
-                            row_indices,
-                            row_values,
-                        )
-                elif equal:
-                    back_pos = atomic_add_i32(
-                        metadata,
-                        one,
-                        _RUNNING_EQUAL,
-                        "workgroup",
-                    )
-                    if back_pos < num_needed:
-                        store_key_result(
-                            top_k - one - back_pos,
-                            col,
-                            key,
-                            row_indices,
-                            row_values,
-                        )
+                scatter_unstable_key(
+                    col,
+                    key,
+                    above,
+                    equal,
+                    num_needed,
+                    row_indices,
+                    row_values,
+                    metadata,
+                )
 
-        def finish_cached_path(
+        # Path finalization
+
+        def scatter_cached_selection(
+            first_threshold,
+            second_threshold,
+            third_threshold,
+            num_needed,
+            levels,
+            row_indices,
+            row_values,
+            scan,
+            metadata,
+        ):
+            if const_expr(stable):
+                if const_expr(levels == 3):
+                    if metadata[_SELECTED_BUCKET_COUNT] == row_len:
+                        scatter_stable_equal_row(
+                            short_threshold_key(
+                                first_threshold,
+                                second_threshold,
+                                third_threshold,
+                            ),
+                            row_indices,
+                            row_values,
+                        )
+                    else:
+                        scatter_stable_cached(
+                            first_threshold,
+                            second_threshold,
+                            third_threshold,
+                            num_needed,
+                            levels,
+                            row_indices,
+                            row_values,
+                            scan,
+                            metadata,
+                        )
+                else:
+                    scatter_stable_cached(
+                        first_threshold,
+                        second_threshold,
+                        third_threshold,
+                        num_needed,
+                        levels,
+                        row_indices,
+                        row_values,
+                        scan,
+                        metadata,
+                    )
+            else:
+                scatter_cached_unstable(
+                    first_threshold,
+                    second_threshold,
+                    third_threshold,
+                    num_needed,
+                    levels,
+                    row_indices,
+                    row_values,
+                    metadata,
+                )
+
+        def finish_cached_selection(
             first_threshold,
             need_after_first,
             histogram,
@@ -1814,7 +1717,7 @@ def build_topk_per_row_prefill_one_workgroup_module(
             row_values,
         ):
             if metadata[_SELECTED_BUCKET_COUNT] == need_after_first:
-                cached_scatter(
+                scatter_cached_selection(
                     first_threshold,
                     zero,
                     zero,
@@ -1822,10 +1725,11 @@ def build_topk_per_row_prefill_one_workgroup_module(
                     1,
                     row_indices,
                     row_values,
+                    scan,
                     metadata,
                 )
             else:
-                choose_short_threshold(
+                choose_threshold(
                     need_after_first,
                     _SECOND_ABOVE,
                     _SECOND_THRESHOLD,
@@ -1833,6 +1737,7 @@ def build_topk_per_row_prefill_one_workgroup_module(
                     histogram,
                     scan,
                     metadata,
+                    short_bins_per_thread,
                 )
                 second_threshold = metadata[_SECOND_THRESHOLD]
                 need_after_second = (
@@ -1842,7 +1747,7 @@ def build_topk_per_row_prefill_one_workgroup_module(
                     metadata[_SELECTED_BUCKET_COUNT]
                     == need_after_second
                 ):
-                    cached_scatter(
+                    scatter_cached_selection(
                         first_threshold,
                         second_threshold,
                         zero,
@@ -1850,28 +1755,21 @@ def build_topk_per_row_prefill_one_workgroup_module(
                         2,
                         row_indices,
                         row_values,
+                        scan,
                         metadata,
                     )
                 else:
                     clear_histogram(histogram, short_bins_per_thread)
-
-                    def low_histogram(col, key):
-                        if (
-                            short_high_bucket(key) == first_threshold
-                        ) & (
-                            short_middle_bucket(key)
-                            == second_threshold
-                        ):
-                            atomic_add_i32(
-                                histogram,
-                                one,
-                                short_low_bucket(key),
-                                "workgroup",
-                            )
-
-                    scan_full_keys(low_histogram)
+                    scan_full_keys(
+                        lambda _, key: pass3_cached_key(
+                            key,
+                            first_threshold,
+                            second_threshold,
+                            histogram,
+                        )
+                    )
                     gpu.barrier()
-                    choose_short_threshold(
+                    choose_threshold(
                         need_after_second,
                         _THIRD_ABOVE,
                         _THIRD_THRESHOLD,
@@ -1879,8 +1777,9 @@ def build_topk_per_row_prefill_one_workgroup_module(
                         histogram,
                         scan,
                         metadata,
+                        short_bins_per_thread,
                     )
-                    cached_scatter(
+                    scatter_cached_selection(
                         first_threshold,
                         second_threshold,
                         metadata[_THIRD_THRESHOLD],
@@ -1888,10 +1787,11 @@ def build_topk_per_row_prefill_one_workgroup_module(
                         3,
                         row_indices,
                         row_values,
+                        scan,
                         metadata,
                     )
 
-        def finish_candidate_path(
+        def finish_candidate_unstable(
             first_threshold,
             need_after_first,
             candidate_count,
@@ -1909,7 +1809,7 @@ def build_topk_per_row_prefill_one_workgroup_module(
                 metadata[_SELECTED_BUCKET_COUNT] == need_after_first
             )
             if can_finish_after_first:
-                compact_scatter_high(
+                scatter_candidates_after_first(
                     candidate_count,
                     row_indices,
                     row_values,
@@ -1917,7 +1817,7 @@ def build_topk_per_row_prefill_one_workgroup_module(
                     candidate_indices,
                 )
             else:
-                choose_later_threshold(
+                choose_threshold(
                     need_after_first,
                     _SECOND_ABOVE,
                     _SECOND_THRESHOLD,
@@ -1925,6 +1825,7 @@ def build_topk_per_row_prefill_one_workgroup_module(
                     histogram,
                     scan,
                     metadata,
+                    later_bins_per_thread,
                 )
                 second_threshold = metadata[_SECOND_THRESHOLD]
                 need_after_second = (
@@ -1937,7 +1838,7 @@ def build_topk_per_row_prefill_one_workgroup_module(
                     == need_after_second
                 )
                 if can_finish_after_second:
-                    compact_scatter_middle(
+                    scatter_candidates_after_second(
                         candidate_count,
                         second_threshold,
                         need_after_second,
@@ -1974,7 +1875,7 @@ def build_topk_per_row_prefill_one_workgroup_module(
                             ),
                         )
                     gpu.barrier()
-                    choose_later_threshold(
+                    choose_threshold(
                         need_after_second,
                         _THIRD_ABOVE,
                         _THIRD_THRESHOLD,
@@ -1982,6 +1883,7 @@ def build_topk_per_row_prefill_one_workgroup_module(
                         histogram,
                         scan,
                         metadata,
+                        later_bins_per_thread,
                     )
                     third_threshold = metadata[_THIRD_THRESHOLD]
                     num_needed = (
@@ -1990,7 +1892,7 @@ def build_topk_per_row_prefill_one_workgroup_module(
                     if candidate_count <= fx.Int32(
                         _COMPACT_CAPACITY
                     ):
-                        compact_scatter(
+                        scatter_candidates_after_third(
                             candidate_count,
                             first_threshold,
                             second_threshold,
@@ -2003,123 +1905,13 @@ def build_topk_per_row_prefill_one_workgroup_module(
                             candidate_indices,
                         )
                     else:
-                        full_scatter(
+                        scatter_full_unstable(
                             first_threshold,
                             second_threshold,
                             third_threshold,
                             num_needed,
                             row_indices,
                             row_values,
-                            metadata,
-                        )
-
-        def finish_cached_stable(
-            first_threshold,
-            need_after_first,
-            histogram,
-            scan,
-            metadata,
-            row_indices,
-            row_values,
-        ):
-            if metadata[_SELECTED_BUCKET_COUNT] == need_after_first:
-                stable_cached_scatter(
-                    first_threshold,
-                    zero,
-                    zero,
-                    need_after_first,
-                    1,
-                    row_indices,
-                    row_values,
-                    full_keys,
-                    scan,
-                    metadata,
-                )
-            else:
-                choose_short_threshold(
-                    need_after_first,
-                    _SECOND_ABOVE,
-                    _SECOND_THRESHOLD,
-                    _SELECTED_BUCKET_COUNT,
-                    histogram,
-                    scan,
-                    metadata,
-                )
-                second_threshold = metadata[_SECOND_THRESHOLD]
-                need_after_second = (
-                    need_after_first - metadata[_SECOND_ABOVE]
-                )
-                if (
-                    metadata[_SELECTED_BUCKET_COUNT]
-                    == need_after_second
-                ):
-                    stable_cached_scatter(
-                        first_threshold,
-                        second_threshold,
-                        zero,
-                        need_after_second,
-                        2,
-                        row_indices,
-                        row_values,
-                        full_keys,
-                        scan,
-                        metadata,
-                    )
-                else:
-                    clear_histogram(
-                        histogram, short_bins_per_thread
-                    )
-
-                    def low_histogram(col, key):
-                        if (
-                            short_high_bucket(key) == first_threshold
-                        ) & (
-                            short_middle_bucket(key)
-                            == second_threshold
-                        ):
-                            atomic_add_i32(
-                                histogram,
-                                one,
-                                short_low_bucket(key),
-                                "workgroup",
-                            )
-
-                    scan_full_keys(low_histogram)
-                    gpu.barrier()
-                    choose_short_threshold(
-                        need_after_second,
-                        _THIRD_ABOVE,
-                        _THIRD_THRESHOLD,
-                        _SELECTED_BUCKET_COUNT,
-                        histogram,
-                        scan,
-                        metadata,
-                    )
-                    third_threshold = metadata[_THIRD_THRESHOLD]
-                    if metadata[_SELECTED_BUCKET_COUNT] == row_len:
-                        stable_equal_scatter(
-                            short_threshold_key(
-                                first_threshold,
-                                second_threshold,
-                                third_threshold,
-                            ),
-                            row_indices,
-                            row_values,
-                        )
-                    else:
-                        stable_cached_scatter(
-                            first_threshold,
-                            second_threshold,
-                            third_threshold,
-                            (
-                                need_after_second
-                                - metadata[_THIRD_ABOVE]
-                            ),
-                            3,
-                            row_indices,
-                            row_values,
-                            full_keys,
-                            scan,
                             metadata,
                         )
 
@@ -2137,7 +1929,7 @@ def build_topk_per_row_prefill_one_workgroup_module(
             row_indices,
             row_values,
         ):
-            choose_later_threshold(
+            choose_threshold(
                 need_after_first,
                 _SECOND_ABOVE,
                 _SECOND_THRESHOLD,
@@ -2145,6 +1937,7 @@ def build_topk_per_row_prefill_one_workgroup_module(
                 histogram,
                 scan,
                 metadata,
+                later_bins_per_thread,
             )
             second_threshold = metadata[_SECOND_THRESHOLD]
             need_after_second = (
@@ -2174,7 +1967,7 @@ def build_topk_per_row_prefill_one_workgroup_module(
                     ),
                 )
             gpu.barrier()
-            choose_later_threshold(
+            choose_threshold(
                 need_after_second,
                 _THIRD_ABOVE,
                 _THIRD_THRESHOLD,
@@ -2182,13 +1975,14 @@ def build_topk_per_row_prefill_one_workgroup_module(
                 histogram,
                 scan,
                 metadata,
+                later_bins_per_thread,
             )
             third_threshold = metadata[_THIRD_THRESHOLD]
             num_needed = (
                 need_after_second - metadata[_THIRD_ABOVE]
             )
             if metadata[_SELECTED_BUCKET_COUNT] == row_len:
-                stable_equal_scatter(
+                scatter_stable_equal_row(
                     threshold_key(
                         first_threshold,
                         second_threshold,
@@ -2198,7 +1992,7 @@ def build_topk_per_row_prefill_one_workgroup_module(
                     row_values,
                 )
             else:
-                if const_expr(stable_fast_supported):
+                if const_expr(stable_sort_enabled):
                     can_use_fast = (
                         row_len >= fx.Int32(_STABLE_FAST_MIN_ROW_LEN)
                     ) & (
@@ -2209,7 +2003,7 @@ def build_topk_per_row_prefill_one_workgroup_module(
                         <= fx.Int32(_COMPACT_CAPACITY)
                     )
                     if can_use_compact_fast:
-                        stable_compact_fast_scatter(
+                        scatter_stable_candidates(
                             candidate_count,
                             first_threshold,
                             second_threshold,
@@ -2225,12 +2019,11 @@ def build_topk_per_row_prefill_one_workgroup_module(
                         )
                     else:
                         if can_use_fast:
-                            stable_fast_scatter(
+                            scatter_stable_full_scan(
                                 first_threshold,
                                 second_threshold,
                                 third_threshold,
                                 num_needed,
-                                classify,
                                 row_indices,
                                 row_values,
                                 candidate_keys,
@@ -2238,29 +2031,29 @@ def build_topk_per_row_prefill_one_workgroup_module(
                                 metadata,
                             )
                         else:
-                            stable_scatter(
+                            scatter_stable_ordered(
                                 first_threshold,
                                 second_threshold,
                                 third_threshold,
                                 num_needed,
-                                classify,
                                 row_indices,
                                 row_values,
                                 scan,
                                 metadata,
                             )
                 else:
-                    stable_scatter(
+                    scatter_stable_ordered(
                         first_threshold,
                         second_threshold,
                         third_threshold,
                         num_needed,
-                        classify,
                         row_indices,
                         row_values,
                         scan,
                         metadata,
                     )
+
+        # Kernel control flow
 
         if row_len <= top_k:
             for step in range_constexpr(output_vector_steps):
@@ -2333,12 +2126,12 @@ def build_topk_per_row_prefill_one_workgroup_module(
                     )
 
         if row_len > top_k:
-            if tid < 10:
+            if tid < _METADATA_SIZE:
                 metadata[tid] = zero
             gpu.barrier()
 
-            cache_all = row_len <= fx.Int32(_COMPACT_CAPACITY)
-            if cache_all:
+            cache_full_row = row_len <= fx.Int32(_COMPACT_CAPACITY)
+            if cache_full_row:
                 clear_pass1_histograms(
                     short_pass1_histogram0,
                     short_pass1_histogram1,
@@ -2366,7 +2159,7 @@ def build_topk_per_row_prefill_one_workgroup_module(
                     short_pass1_histogram1,
                     short_bins_per_thread,
                 )
-                choose_short_threshold(
+                choose_threshold(
                     top_k,
                     _FIRST_ABOVE,
                     _FIRST_THRESHOLD,
@@ -2374,6 +2167,7 @@ def build_topk_per_row_prefill_one_workgroup_module(
                     short_pass1_histogram0,
                     scan,
                     metadata,
+                    short_bins_per_thread,
                 )
             else:
                 clear_pass1_histograms(
@@ -2401,7 +2195,7 @@ def build_topk_per_row_prefill_one_workgroup_module(
                     pass1_histogram1,
                     high_bins_per_thread,
                 )
-                choose_high_threshold(
+                choose_threshold(
                     top_k,
                     _FIRST_ABOVE,
                     _FIRST_THRESHOLD,
@@ -2409,10 +2203,11 @@ def build_topk_per_row_prefill_one_workgroup_module(
                     pass1_histogram0,
                     scan,
                     metadata,
+                    high_bins_per_thread,
                 )
             first_threshold = metadata[_FIRST_THRESHOLD]
 
-            if cache_all:
+            if cache_full_row:
                 clear_histogram(
                     short_histogram, short_bins_per_thread
                 )
@@ -2422,10 +2217,9 @@ def build_topk_per_row_prefill_one_workgroup_module(
                 metadata[_RUNNING_ABOVE] = zero
                 metadata[_CANDIDATE_COUNT] = zero
             gpu.barrier()
-            if cache_all:
+            if cache_full_row:
                 scan_full_keys(
-                    lambda col, key: pass2_cached_key(
-                        col,
+                    lambda _, key: pass2_cached_key(
                         key,
                         first_threshold,
                         short_histogram,
@@ -2462,27 +2256,16 @@ def build_topk_per_row_prefill_one_workgroup_module(
                 )
             gpu.barrier()
             need_after_first = top_k - metadata[_FIRST_ABOVE]
-            if cache_all:
-                if const_expr(stable):
-                    finish_cached_stable(
-                        first_threshold,
-                        need_after_first,
-                        short_histogram,
-                        scan,
-                        metadata,
-                        row_indices,
-                        row_values,
-                    )
-                else:
-                    finish_cached_path(
-                        first_threshold,
-                        need_after_first,
-                        short_histogram,
-                        scan,
-                        metadata,
-                        row_indices,
-                        row_values,
-                    )
+            if cache_full_row:
+                finish_cached_selection(
+                    first_threshold,
+                    need_after_first,
+                    short_histogram,
+                    scan,
+                    metadata,
+                    row_indices,
+                    row_values,
+                )
             else:
                 if const_expr(stable):
                     finish_candidate_stable(
@@ -2500,7 +2283,7 @@ def build_topk_per_row_prefill_one_workgroup_module(
                         row_values,
                     )
                 else:
-                    finish_candidate_path(
+                    finish_candidate_unstable(
                         first_threshold,
                         need_after_first,
                         metadata[_CANDIDATE_COUNT],
@@ -2515,22 +2298,20 @@ def build_topk_per_row_prefill_one_workgroup_module(
 
     @flyc.jit
     def launch_topk_per_row_prefill_one_workgroup(
-        input_ptr: fx.Pointer,
-        row_starts_ptr: fx.Pointer,
-        row_ends_ptr: fx.Pointer,
-        indices_ptr: fx.Pointer,
-        values_ptr: fx.Pointer,
-        stride0: fx.Int32,
+        input: fx.Tensor,
+        row_starts: fx.Tensor,
+        row_ends: fx.Tensor,
+        indices: fx.Tensor,
+        values: fx.Tensor,
         rows_m: fx.Int32,
         stream: fx.Stream,
     ):
         topk_per_row_prefill_one_workgroup_kernel(
-            input_ptr,
-            row_starts_ptr,
-            row_ends_ptr,
-            indices_ptr,
-            values_ptr,
-            stride0,
+            input,
+            row_starts,
+            row_ends,
+            indices,
+            values,
         ).launch(
             grid=(rows_m, 1, 1),
             block=(block_threads, 1, 1),

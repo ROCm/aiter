@@ -8,7 +8,7 @@ from functools import lru_cache
 import flydsl.compiler as flyc
 import torch
 
-from .kernels.tensor_shim import _run_compiled, ptr_arg
+from .kernels.tensor_shim import _run_compiled
 from .kernels.topk_per_row_prefill_one_workgroup import (
     build_topk_per_row_prefill_one_workgroup_module,
 )
@@ -211,12 +211,11 @@ def flydsl_top_k_per_row_prefill(
     with torch.cuda.device(logits.device):
         _run_compiled(
             launcher,
-            ptr_arg(logits),
-            ptr_arg(row_starts),
-            ptr_arg(row_ends),
-            ptr_arg(indices),
-            ptr_arg(values if values is not None else logits),
-            stride0,
+            logits,
+            row_starts,
+            row_ends,
+            indices,
+            values if values is not None else logits,
             num_rows,
             stream,
         )
