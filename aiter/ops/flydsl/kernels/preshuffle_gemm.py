@@ -30,6 +30,10 @@ from .splitk_epilogue import CPOL_COHERENT, splitk_reduce_epilogue
 # (dsrd_preload, dvmem_preload) per (tile_m, tile_n, tile_k).
 _TILE_PRELOAD_TABLE = {
     # ── tile_m = 16 ──
+    (16, 16, 256): (4, 8),
+    (16, 16, 512): (8, 16),
+    (16, 32, 256): (4, 6),
+    (16, 32, 512): (8, 12),
     (16, 64, 256): (2, 2),
     (16, 64, 512): (4, 4),
     (16, 128, 256): (2, 2),
@@ -151,6 +155,10 @@ def compile_preshuffle_gemm(
     if split_k < 1 or K % split_k != 0:
         raise ValueError(f"split_k must divide K; got split_k={split_k}, K={K}")
     split_k_extent = K // split_k
+    if tile_n < 16 or tile_n % 16 != 0:
+        raise ValueError(
+            f"tile_n must be a multiple of 16 and at least 16; got tile_n={tile_n}"
+        )
     if tile_k <= 0 or split_k_extent % tile_k != 0:
         raise ValueError(
             "tile_k must be a positive divisor of K/split_k; "
@@ -203,12 +211,14 @@ def compile_preshuffle_gemm(
     k_iters = tile_k // tile_K_perm
     num_tiles = split_k_extent // tile_k
     m_repeat = tile_m // 16
-    num_waves = 4
+    # tile_n < 64 needs fewer waves so num_acc_n stays >= 1; clamp at 4 to keep
+    # large tiles at the historical 256-thread block.
+    num_waves = 4 if tile_n >= 64 else tile_n // 16
     n_per_wave = tile_n // num_waves
     num_acc_n = n_per_wave // 16
     acc_size = m_repeat * num_acc_n * 4
 
-    total_threads = 256
+    total_threads = num_waves * 64
     a_load_bytes = 16
     bytes_per_thread_a = (tile_m * tile_k * elem_bytes) // total_threads
     num_a_loads = bytes_per_thread_a // a_load_bytes
@@ -268,7 +278,7 @@ def compile_preshuffle_gemm(
             )
             tiled_mma = fx.make_tiled_mma(
                 _scale_atom,
-                fx.make_layout((1, 4, 1), (0, 1, 0)),
+                fx.make_layout((1, num_waves, 1), (0, 1, 0)),
                 fx.make_tile(None, None, fx.make_layout((32, 4), (1, 32))),
             )
         else:
@@ -839,7 +849,7 @@ def compile_preshuffle_gemm(
 
         tiled_mma = fx.make_tiled_mma(
             mma_atom,
-            fx.make_layout((1, 4, 1), (0, 1, 0)),
+            fx.make_layout((1, num_waves, 1), (0, 1, 0)),
             fx.make_tile(None, None, k_perm),
         )
 
@@ -903,7 +913,7 @@ def compile_preshuffle_gemm(
             value_attrs={"rocdl.waves_per_eu": waves_per_eu},
         ).launch(
             grid=(gx, gy, split_k),
-            block=(256, 1, 1),
+            block=(total_threads, 1, 1),
             stream=stream,
         )
 

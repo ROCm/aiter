@@ -327,6 +327,49 @@ def shuffle_weight_f4(src: torch.Tensor) -> torch.Tensor:
     return out.view(rows, kp).view(x_type)
 
 
+def shuffle_weight_w4_cdna4(src: torch.Tensor) -> torch.Tensor:
+    """gfx950 MXFP4 weight preshuffle for the 16x16x128 scaled MFMA.
+
+    Input is packed fp4 ``[N, K/2]`` (uint8/float4_e2m1fn_x2, two codes per byte).
+    The destination is ``[N/16, K_pk/64, KLane=4, NLane=16, KPack=16]`` bytes, which
+    is exactly what ``shuffle_weight(layout=(16, 16))`` produces on the packed-byte
+    view — the 4-bit case only differs in that a "byte" now carries two K values.
+    Kept as a named entry point so callers do not have to know that.
+    """
+    x_type = src.dtype
+    if hasattr(torch, "float4_e2m1fn_x2") and x_type == torch.float4_e2m1fn_x2:
+        src = src.view(torch.uint8)
+    return shuffle_weight(src, layout=(16, 16)).view(x_type)
+
+
+def shuffle_scale_w4_cdna4(src: torch.Tensor) -> torch.Tensor:
+    """gfx950 MXFP4 E8M0 scale preshuffle for the 16x16x128 scaled MFMA.
+
+    Input is ``[N, K/32]`` E8M0 bytes (one per 32-K block per column). The scaled
+    MFMA takes a 32-bit scale operand per lane and an ``opsel`` byte selector, with
+    lane ``l`` supplying column ``l % 16`` and 32-K sub-block ``l // 16`` of the
+    128-K step. Destination order is therefore
+    ``[N/32, K/256, KLane=4, NLane=16, KPack=2, NPack=2]``: consecutive dwords walk
+    (sub-block, column), and the dword's 4 bytes are the opsel axis — ``opsel =
+    kpack * 2 + npack`` picks the 128-K half of the 256-K chunk and the 16-column
+    half of the 32-column pair.
+    """
+    n, k_bytes = src.shape
+    n_lane, n_pack, k_pack = 16, 2, 2
+    k_lane = 64 // n_lane
+    if not (n % (n_lane * n_pack) == 0):
+        raise ValueError(f"N={n} must be a multiple of 32")
+    if not (k_bytes % (k_pack * k_lane) == 0):
+        raise ValueError(
+            f"scale K extent {k_bytes} must be a multiple of 8 (256 K values)"
+        )
+    n1 = n // (n_lane * n_pack)
+    k1 = k_bytes // (k_pack * k_lane)
+    out = src.view(n1, n_pack, n_lane, k1, k_pack, k_lane)
+    out = out.permute(0, 3, 5, 2, 4, 1).contiguous()
+    return out.view(n, k_bytes)
+
+
 def shuffle_scale(
     src: torch.Tensor,
     experts_cnt: int | None = None,
