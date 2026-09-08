@@ -1,9 +1,15 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""High-level FlyDSL Flash Attention APIs (gfx1201 / RDNA4).
+"""High-level FlyDSL Flash Attention APIs.
 
-Wraps the FlyDSL `flash_attn_func_gfx1201` kernel with:
+``flydsl_flash_attn_batch_func`` / ``flydsl_flash_attn_varlen_func`` dispatch by
+arch and dtype: gfx950 fp8 (e4m3fn, per-tensor descales) routes to the dual-wave
+kernel in ``kernels/fmha_gfx950``, gfx1250 bf16/f16 to the m32x8 prefill kernel.
+Anything else returns ``None`` so the caller falls through to CK/Triton.
+
+``flydsl_flash_attn_func`` (gfx1201 / RDNA4) wraps the
+`flash_attn_func_gfx1201` kernel with:
   - Build cache keyed by (num_heads, head_dim, causal, dtype, waves_per_eu, daz).
   - Automatic seq_len padding to the kernel's tile size (multiple of 128).
   - BSHD ([B, S, H, D]) input/output convention to match upstream
@@ -22,6 +28,7 @@ The kernel implements self-attention only (Lq == Lk). Cross-attention
 
 from __future__ import annotations
 
+import math
 from functools import lru_cache
 
 import torch
@@ -212,6 +219,74 @@ def flydsl_flash_attn_func(
     return o_p
 
 
+def _fp8_gfx950_supported(
+    q,
+    k,
+    v,
+    *,
+    softmax_scale,
+    return_lse,
+    dropout_p,
+    window_size,
+    bias,
+    alibi_slopes,
+    sink,
+    return_attn_probs,
+    block_table,
+    q_descale,
+    k_descale,
+    v_descale,
+    out,
+) -> bool:
+    """Gate for the gfx950 dual-wave fp8 kernel.
+
+    The kernel takes pre-quantized e4m3fn Q/K/V with per-tensor fp32 shape-[1]
+    descales and a hard-wired ``1/sqrt(D)`` softmax scale, and writes bf16.
+    Everything it cannot express -- LSE, dropout, sliding window, bias, ALiBi,
+    sink, paged KV, attention probabilities, a custom ``softmax_scale``, a
+    non-bf16 ``out`` -- is rejected here so the caller falls through to
+    CK/Triton rather than silently dropping it.
+    """
+    from ...jit.utils.chip_info import get_gfx
+
+    if get_gfx() != "gfx950":
+        return False
+    if not (q.dtype == k.dtype == v.dtype == torch.float8_e4m3fn):
+        return False
+    if out is not None and out.dtype != torch.bfloat16:
+        return False
+    if any(
+        s is None
+        or not torch.is_tensor(s)
+        or s.dtype != torch.float32
+        or s.numel() != 1
+        for s in (q_descale, k_descale, v_descale)
+    ):
+        return False
+    qk_hdim = q.shape[-1]
+    if softmax_scale is not None and not math.isclose(
+        softmax_scale, 1.0 / math.sqrt(qk_hdim), rel_tol=1e-6
+    ):
+        return False
+    nq, nkv = q.shape[-2], k.shape[-2]
+    return (
+        qk_hdim >= 64
+        and qk_hdim % 32 == 0
+        and k.shape[-1] == qk_hdim
+        and nkv > 0
+        and nq % nkv == 0
+        and not return_lse
+        and dropout_p == 0.0
+        and all(w < 0 for w in window_size[:2])
+        and (len(window_size) < 3 or window_size[2] == 0)
+        and bias is None
+        and alibi_slopes is None
+        and sink is None
+        and block_table is None
+        and not return_attn_probs
+    )
+
+
 def flydsl_flash_attn_varlen_func(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -232,6 +307,9 @@ def flydsl_flash_attn_varlen_func(
     block_table=None,
     out=None,
     sink=None,
+    q_descale=None,
+    k_descale=None,
+    v_descale=None,
 ):
     """FlyDSL MHA forward, varlen THD layout.
 
@@ -240,6 +318,43 @@ def flydsl_flash_attn_varlen_func(
     """
     from ...jit.core import is_experimental_enabled
     from ...jit.utils.chip_info import get_gfx
+
+    # gfx950 -- pre-quantized fp8 (e4m3fn) with per-tensor descales.
+    if _fp8_gfx950_supported(
+        q,
+        k,
+        v,
+        softmax_scale=softmax_scale,
+        return_lse=return_lse,
+        dropout_p=dropout_p,
+        window_size=window_size,
+        bias=bias,
+        alibi_slopes=alibi_slopes,
+        sink=sink,
+        return_attn_probs=return_attn_probs,
+        block_table=block_table,
+        q_descale=q_descale,
+        k_descale=k_descale,
+        v_descale=v_descale,
+        out=out,
+    ):
+        from .kernels.flash_attn_func_fp8_gfx950 import flydsl_flash_attn_fp8_func
+
+        return flydsl_flash_attn_fp8_func(
+            q,
+            k,
+            v,
+            causal=causal,
+            cu_seqlens_q=cu_seqlens_q,
+            cu_seqlens_kv=cu_seqlens_k,
+            max_seqlen_q=max_seqlen_q,
+            max_seqlen_kv=max_seqlen_k,
+            cross_seqlen=max_seqlen_q != max_seqlen_k,
+            q_descale=q_descale,
+            k_descale=k_descale,
+            v_descale=v_descale,
+            out=out,
+        )
 
     # FlyDSL m32x8 serves plain MHA plus attention-sink and sliding-window; other
     # features (bias, alibi, dropout, paging, return_attn_probs) fall through to
@@ -314,16 +429,52 @@ def flydsl_flash_attn_batch_func(
     return_attn_probs=False,
     sink=None,
     out=None,
+    q_descale=None,
+    k_descale=None,
+    v_descale=None,
 ):
     """FlyDSL MHA forward, batched BSHD ``[B, S, H, D]`` layout.
 
-    Routes to the dedicated BSHD m32x8 kernel (uniform ``seq_len``, no
-    ``cu_seqlens`` — CUDA-graph safe). Returns the result if FlyDSL can handle
-    this configuration, otherwise returns ``None`` so the caller falls through
+    Routes gfx950 fp8 to the dual-wave kernel and gfx1250 bf16/f16 to the
+    dedicated BSHD m32x8 kernel (uniform ``seq_len``, no ``cu_seqlens`` —
+    CUDA-graph safe). Returns the result if FlyDSL can handle this
+    configuration, otherwise returns ``None`` so the caller falls through
     to Triton/CK.
     """
     from ...jit.core import is_experimental_enabled
     from ...jit.utils.chip_info import get_gfx
+
+    # gfx950 -- pre-quantized fp8 (e4m3fn) with per-tensor descales.
+    if q.dim() == 4 and _fp8_gfx950_supported(
+        q,
+        k,
+        v,
+        softmax_scale=softmax_scale,
+        return_lse=return_lse,
+        dropout_p=dropout_p,
+        window_size=window_size,
+        bias=bias,
+        alibi_slopes=alibi_slopes,
+        sink=sink,
+        return_attn_probs=return_attn_probs,
+        block_table=None,
+        q_descale=q_descale,
+        k_descale=k_descale,
+        v_descale=v_descale,
+        out=out,
+    ):
+        from .kernels.flash_attn_func_fp8_gfx950 import flydsl_flash_attn_fp8_func
+
+        return flydsl_flash_attn_fp8_func(
+            q,
+            k,
+            v,
+            causal=causal,
+            q_descale=q_descale,
+            k_descale=k_descale,
+            v_descale=v_descale,
+            out=out,
+        )
 
     # BSHD routes to the m32x8 kernel. D_v=128. D_qk 128/192 are
     # the DEFAULT; D_qk==256 needs AITER_ENABLE_EXPERIMENTAL=1 (else CK).
