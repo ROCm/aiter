@@ -37,7 +37,6 @@ import math as host_math
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-from flydsl._mlir.dialects import llvm
 from flydsl.expr import arith, const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import Vector as Vec
 from flydsl.runtime.device import get_rocm_arch
@@ -54,8 +53,11 @@ from aiter.ops.flydsl.kernels.hstu_attention_common import (
     _arch_dma_params,
     _dtype_to_elem_type,
     decode_lane,
+    exp2_f32,
     grouped_loader,
     lds_cap_bytes,
+    make_lds_dma,
+    pack_mfma_frag,
     swz_col,
 )
 
@@ -275,7 +277,6 @@ def build_hstu_attention_bwd_dvdk(
         out_dk: fx.Tensor,
     ) -> None:
         elem_type = elem_dtype.ir_type
-        compute_type = fx.Float32.ir_type
         c_zero_mfma_pack = Vec.filled(MFMA_LANE_K, 0.0, elem_dtype).ir_value()
 
         # ---- MMA atom: one 16x16x16 f16/bf16 accumulate per wave ----
@@ -376,21 +377,7 @@ def build_hstu_attention_bwd_dvdk(
         do_lds_byte_base = fx.ptrtoint(fx.get_iter(do_view))
 
         # ── Copy-atom global->LDS DMA (buffer_load_lds via fx.copy) ──
-        _dma_atom = fx.make_copy_atom(
-            fx.rocdl.BufferCopyLDS(DMA_BYTES * 8), DMA_BYTES * 8
-        )
-        _lds_ptr_ty = fx.PointerType.get(elem_type, 2, DMA_BYTES)
-
-        def _rebased_buffer_div(base_iter, byte_off, n_elems):
-            # Fold the (large) seq/head base into the 48-bit descriptor base so the
-            # per-lane element index stays a small 32-bit voffset; max_size records.
-            base_i64 = fx.Int64(fx.ptrtoint(base_iter))
-            shifted = fx.inttoptr(base_iter.type, base_i64 + fx.Int64(byte_off))
-            buf_ptr = fx.rocdl.make_buffer_ptr(shifted)
-            return fx.logical_divide(
-                fx.make_view(buf_ptr, fx.make_layout(fx.Int32(n_elems), fx.Int32(1))),
-                fx.make_layout(1, 1),
-            )
+        _dma_atom, _lds_ptr_ty, _rebased_buffer_div = make_lds_dma(DMA_BYTES, elem_type)
 
         q_div = _rebased_buffer_div(
             fx.get_iter(q), q_base_byte_offset, max_seq_len * stride_qk_n
@@ -454,14 +441,7 @@ def build_hstu_attention_bwd_dvdk(
             with arith.fastmath(arith.FastMathFlags.fast):
                 sc = [s * c_alpha for s in s_list]
                 tt = [s * c_neg_log2e for s in sc]
-                emu = [
-                    fx.Float32(
-                        llvm.call_intrinsic(
-                            compute_type, "llvm.amdgcn.exp2.f32", [t.ir_value()], [], []
-                        )
-                    )
-                    for t in tt
-                ]
+                emu = [exp2_f32(t) for t in tt]
                 den = [c_one_f + e for e in emu]
                 sig = [c_one_f / d for d in den]
                 silu = [sc[i] * sig[i] for i in range(len(s_list))]
@@ -470,21 +450,6 @@ def build_hstu_attention_bwd_dvdk(
                     for i in range(len(s_list))
                 ]
             return silu, grad
-
-        def pack_p(vals):
-            if is_bf16:
-                c16 = fx.Int32(16)
-                cmask = fx.Int32(0xFFFF0000)
-
-                def bf16_pair(lo_f32, hi_f32):
-                    lo_i32 = fx.Float32(lo_f32).bitcast(fx.Int32)
-                    hi_i32 = fx.Float32(hi_f32).bitcast(fx.Int32)
-                    return (hi_i32 & cmask) | fx.Int32(arith.shrui(lo_i32, c16))
-
-                pairs = [bf16_pair(vals[0], vals[1]), bf16_pair(vals[2], vals[3])]
-                return Vec.from_elements(pairs, fx.Int32).bitcast(elem_dtype).ir_value()
-            elems = [fx.Float32(v).to(elem_dtype) for v in vals]
-            return Vec.from_elements(elems, elem_dtype).ir_value()
 
         kv_owned_ids = [to_id(kv_rows[og]) for og in range_constexpr(KV_OWNED_SUBTILES)]
 
@@ -670,7 +635,7 @@ def build_hstu_attention_bwd_dvdk(
                         keep[i].select(silu_vals[i], c_zero_f)
                         for i in range_constexpr(MFMA_ELEMS_PER_LANE)
                     ]
-                    p_packs[ng][og] = pack_p(p_vals)
+                    p_packs[ng][og] = pack_mfma_frag(p_vals, is_bf16, elem_dtype)
                     s_meta[ng][og] = (grad_vals, keep)
             return p_packs, s_meta
 
@@ -736,7 +701,7 @@ def build_hstu_attention_bwd_dvdk(
                         for i in range_constexpr(MFMA_ELEMS_PER_LANE):
                             gated = c_inv_n * grad_vals[i] * da_vals[i]
                             ds_vals.append(keep[i].select(gated, c_zero_f))
-                    ds_packs[ng][og] = pack_p(ds_vals)
+                    ds_packs[ng][og] = pack_mfma_frag(ds_vals, is_bf16, elem_dtype)
             return ds_packs
 
         def _dk_gather(c):

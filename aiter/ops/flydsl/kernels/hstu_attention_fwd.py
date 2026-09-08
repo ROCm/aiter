@@ -53,6 +53,7 @@ from aiter.ops.flydsl.kernels.hstu_attention_common import (
     WARP_SIZE,
     _arch_dma_params,
     _dtype_to_elem_type,
+    exp2_f32,
 )
 
 
@@ -422,9 +423,6 @@ def build_hstu_attention_fwd(
         c_one_f = fx.Float32(1.0)
         c_zero_f = fx.Float32(0.0)
 
-        def _exp2(x):
-            return fx.Float32(fx.rocdl.exp2(compute_type, x.ir_value()))
-
         def _rcp(x):
             return fx.Float32(fx.rocdl.rcp(compute_type, x.ir_value()))
 
@@ -434,7 +432,7 @@ def build_hstu_attention_fwd(
             recovered in the O epilogue. A masked/zeroed score gives g=0 -> exp2(0)=1 -> sig=0.5
             -> p=0."""
             g = [s * c_alpha_neg_log2e for s in s_list]
-            emu = [_exp2(gi) for gi in g]
+            emu = [exp2_f32(gi) for gi in g]
             den = [c_one_f + e for e in emu]
             sig = [_rcp(d) for d in den]
             return [g[i] * sig[i] for i in range(len(s_list))]

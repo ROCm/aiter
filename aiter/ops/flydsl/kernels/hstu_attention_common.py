@@ -19,6 +19,9 @@ import functools
 import math as host_math
 
 import flydsl.expr as fx
+from flydsl._mlir.dialects import llvm
+from flydsl.expr import arith
+from flydsl.expr.typing import Vector as Vec
 from flydsl.runtime.device import get_rocm_arch
 
 from aiter.jit.utils.chip_info import get_lds_capacity_bytes
@@ -71,6 +74,44 @@ def lds_cap_bytes(arch: str | None = None) -> int:
     return get_lds_capacity_bytes(arch)
 
 
+def exp2_f32(x):
+    """Base-2 exponential of an fp32 lane via the raw ``llvm.amdgcn.exp2.f32``
+    intrinsic (lowers to ``v_exp_f32``).
+
+    Shared by the forward SiLU gate and both backward SiLU/derivative gates. The
+    raw intrinsic is used on purpose rather than the stable ``fx.math.exp2``,
+    which does not reach ``v_exp_f32`` performance even under a fastmath context.
+    Callers supply their own ``arith.fastmath`` / compile-hint scope.
+    """
+    return fx.Float32(
+        llvm.call_intrinsic(
+            fx.Float32.ir_type, "llvm.amdgcn.exp2.f32", [x.ir_value()], [], []
+        )
+    )
+
+
+def pack_mfma_frag(vals, is_bf16: bool, elem_dtype):
+    """Pack 4 fp32 lane values into an MFMA operand fragment of ``elem_dtype``.
+
+    bf16: each fp32 is truncated to its high 16 bits and two are packed into one
+    i32 (low/high halves), then the i32 pair is bitcast to the bf16 vector. f16:
+    a straight per-element convert. Shared by the dV/dK and dQ backward kernels.
+    """
+    if is_bf16:
+        c16 = fx.Int32(16)
+        cmask = fx.Int32(0xFFFF0000)
+
+        def bf16_pair(lo_f32, hi_f32):
+            lo_i32 = fx.Float32(lo_f32).bitcast(fx.Int32)
+            hi_i32 = fx.Float32(hi_f32).bitcast(fx.Int32)
+            return (hi_i32 & cmask) | fx.Int32(arith.shrui(lo_i32, c16))
+
+        pairs = [bf16_pair(vals[0], vals[1]), bf16_pair(vals[2], vals[3])]
+        return Vec.from_elements(pairs, fx.Int32).bitcast(elem_dtype).ir_value()
+    elems = [fx.Float32(v).to(elem_dtype) for v in vals]
+    return Vec.from_elements(elems, elem_dtype).ir_value()
+
+
 def decode_lane(tid, num_waves: int, warp_size: int, mfma_n: int):
     """Decompose a flat thread id into (wave_id, lane, lane_div_n, lane_mod_n).
 
@@ -113,3 +154,32 @@ def swz_col(tile_row, col, swz_rows: int, swz_shift: int):
     Q (dV/dK kernel) and streamed K (dQ kernel) LDS tiles.
     """
     return col ^ ((tile_row & fx.Int32(swz_rows - 1)) << fx.Int32(swz_shift))
+
+
+def make_lds_dma(dma_bytes: int, elem_type):
+    """Build the global->LDS ``buffer_load_lds`` machinery shared by the backward
+    kernels' streamed loads (dV/dK streams Q/dO, dQ streams K).
+
+    Returns ``(dma_atom, lds_ptr_ty, rebased_buffer_div)``:
+
+    * ``dma_atom`` drives ``buffer_load_lds`` through the FlyDSL copy-atom API.
+      The atom hardcodes the cache-policy/aux operand to 0 (drops the raw path's
+      aux=1).
+    * ``lds_ptr_ty`` is the ``dma_bytes``-aligned LDS pointer type.
+    * ``rebased_buffer_div(base_iter, byte_off, n_elems)`` folds the (large)
+      seq/head byte base into the 48-bit descriptor base so the per-lane element
+      index stays a small 32-bit voffset; ``max_size`` records ``n_elems``.
+    """
+    dma_atom = fx.make_copy_atom(fx.rocdl.BufferCopyLDS(dma_bytes * 8), dma_bytes * 8)
+    lds_ptr_ty = fx.PointerType.get(elem_type, 2, dma_bytes)
+
+    def rebased_buffer_div(base_iter, byte_off, n_elems):
+        base_i64 = fx.Int64(fx.ptrtoint(base_iter))
+        shifted = fx.inttoptr(base_iter.type, base_i64 + fx.Int64(byte_off))
+        buf_ptr = fx.rocdl.make_buffer_ptr(shifted)
+        return fx.logical_divide(
+            fx.make_view(buf_ptr, fx.make_layout(fx.Int32(n_elems), fx.Int32(1))),
+            fx.make_layout(1, 1),
+        )
+
+    return dma_atom, lds_ptr_ty, rebased_buffer_div
