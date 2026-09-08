@@ -31,7 +31,7 @@ from aiter.jit.utils.chip_info import (
 )
 from aiter.jit.utils.torch_guard import torch_compile_guard
 from aiter.ops.flydsl.kernels.mega_moe_gfx1250.types import Stage2ScatterContext
-from aiter.ops.flydsl.moe_common import GateMode
+from aiter.ops.flydsl.moe_common import GateMode, get_flydsl_activation_name
 from aiter.ops.flydsl.mxfp4_kname import (
     _is_mxfp4_kname,
     _parse_mxfp4_g1_kname,
@@ -1053,6 +1053,7 @@ def _fused_moe_impl(
         has_stage2_bias=bias2 is not None,
         situ_beta=config_situ_beta,
         situ_linear_beta=config_situ_linear_beta,
+        swiglu_limit=swiglu_limit,
         opus_weights_shuffled=getattr(w1, "is_shuffled", False)
         and getattr(w2, "is_shuffled", False),
         config_file=_metadata_config_file,
@@ -1539,14 +1540,6 @@ def _needs_swiglu_bias_support(dtype, quant_type):
     return dtype in [dtypes.bf16, dtypes.fp16] and quant_type == QuantType.per_1x32
 
 
-def _mxfp4_activation_name(activation):
-    if activation == ActivationType.Swiglu:
-        return "swiglu"
-    if activation == getattr(ActivationType, "Situv2", None):
-        return "situv2"
-    return "silu"
-
-
 def _normalize_mxfp4_activation_params(
     activation,
     beta: float | None,
@@ -1835,6 +1828,19 @@ def _mxfp4_a4w4_stage1(
     inter_cols = D_INTER if out_dtype == "fp8" else D_INTER // 2
     inter_scale_cols = D_INTER // 32
     inter_scale_bytes = max_sorted * max((1024 // BM_MIN) * 4, inter_scale_cols * 2)
+    if native_scale_layout:
+        # The native BM16 layout addresses one *padded* chunk per M block:
+        # out_as_per_chunk_dw_for pads scale-N up to a multiple of 8 columns, so
+        # the kernel's stride between chunks exceeds inter_scale_cols whenever
+        # D_INTER // 32 is not a multiple of 8. Sizing on the unpadded width
+        # under-allocates and the last blocks write past the buffer (D_INTER=1408
+        # spans 49152 B where the unpadded figure gives 45056 B).
+        from aiter.ops.flydsl.kernels.mxfp4_gemm1 import out_as_per_chunk_dw_for
+
+        chunks = (max_sorted + BM - 1) // BM
+        inter_scale_bytes = max(
+            inter_scale_bytes, chunks * out_as_per_chunk_dw_for(D_INTER) * 4
+        )
     inter_dtype = dtypes.fp8 if out_dtype == "fp8" else torch.uint8
     inter_sorted_quant = torch.empty(
         (max_sorted, inter_cols), device=device, dtype=inter_dtype
@@ -2432,6 +2438,7 @@ def get_2stage_cfgs(
     has_stage2_bias=False,
     situ_beta=1.0,
     situ_linear_beta=1.0,
+    swiglu_limit=None,
     opus_weights_shuffled=None,
     config_file=None,
 ):
@@ -2664,12 +2671,36 @@ def get_2stage_cfgs(
     if cfg is not None and _is_mxfp4_kname(kn1):
         parsed_g1 = _parse_mxfp4_g1_kname(kn1)
         configured_act = parsed_g1["act"]
-        expected_act = _mxfp4_activation_name(activation)
+        # Gelu/GeluTanh are real ActivationType values that MXMOE has no kernel
+        # for. Folding them to "silu" would match a SiLU-tuned row and silently
+        # run the wrong activation, so ask for a name that refuses instead.
+        try:
+            expected_act = get_flydsl_activation_name(activation)
+        except ValueError:
+            expected_act = None
         reject_reason = None
-        if configured_act != expected_act:
+        if expected_act is None:
+            reject_reason = f"no MXMOE kernel for activation {activation!r}"
+        elif configured_act != expected_act:
             reject_reason = (
                 f"activation {configured_act!r} does not match runtime "
                 f"{expected_act!r}"
+            )
+        elif parsed_g1["interleave"] != (gate_mode == GateMode.INTERLEAVE):
+            # kernelName1 and the gate layout are not independent: BN64 and
+            # k_wave>1 variants are compiled separated-only, so keeping the tuned
+            # name while flipping interleave yields metadata that cannot launch.
+            reject_reason = (
+                f"kernelName1 was tuned for gate_mode="
+                f"{'interleave' if parsed_g1['interleave'] else 'separated'} but "
+                f"this call passes {gate_mode}"
+            )
+        elif swiglu_limit is not None and expected_act != "swiglu":
+            # MXMOE's _activation_mul_batch consumes the limit for swiglu only;
+            # silu/situv2 would ignore it while the torch reference clamps.
+            reject_reason = (
+                f"MXMOE cannot apply swiglu_limit={swiglu_limit!r} to "
+                f"activation {expected_act!r}"
             )
         elif not aiter.is_mxfp4_moe_shape_supported(expert, model_dim, inter_dim, topk):
             reject_reason = (
@@ -2842,15 +2873,16 @@ def get_2stage_cfgs(
         )
         runtime_interleave = gate_mode == GateMode.INTERLEAVE
         if _p1["interleave"] != runtime_interleave:
-            logger.warning(
-                "[fused_moe] tuned GEMM1 %r was tuned for gate_mode=%s but this "
-                "call passes gate_mode=%s; running the %s variant instead. "
-                "Re-tune this shape under %s for a valid perf config.",
-                kernelName1,
-                "interleave" if _p1["interleave"] else "separated",
-                gate_mode.value,
-                "interleave" if runtime_interleave else "separated",
-                gate_mode.value,
+            # A tuned config reaching here mismatched is already discarded above.
+            # An explicitly supplied name cannot be salvaged: BN64 and k_wave>1
+            # GEMM1 variants exist for the separated layout only, so honouring
+            # the caller's gate_mode would build metadata that fails later inside
+            # _assert_supported. Fail here, where the cause is still visible.
+            raise ValueError(
+                f"GEMM1 {kernelName1!r} is compiled for gate_mode="
+                f"{'interleave' if _p1['interleave'] else 'separated'} but this "
+                f"call passes {gate_mode.value!r}; supply a kernel matching the "
+                f"gate layout or re-tune this shape under {gate_mode.value!r}"
             )
         return MOEMetadata(
             stage1=functools.partial(
@@ -3431,6 +3463,7 @@ def fused_moe_2stages(
         has_stage2_bias=bias2 is not None,
         situ_beta=config_situ_beta,
         situ_linear_beta=config_situ_linear_beta,
+        swiglu_limit=swiglu_limit,
         opus_weights_shuffled=getattr(w1, "is_shuffled", False)
         and getattr(w2, "is_shuffled", False),
         config_file=_metadata_config_file,

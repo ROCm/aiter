@@ -1026,6 +1026,7 @@ def _run_moe_reduction(
     token_num,
     topk,
     model_dim,
+    *,
     model_dim_pad=0,
     expert_mask=None,
     topk_ids=None,

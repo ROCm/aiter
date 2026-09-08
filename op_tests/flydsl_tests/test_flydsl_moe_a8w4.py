@@ -349,7 +349,14 @@ def test_flydsl_stage2_fp8_ep_reduction():
     out = torch.empty((token, model_dim), dtype=torch.bfloat16, device="cuda")
 
     _run_moe_reduction(
-        target, out, token, topk, model_dim, expert_mask, topk_ids, is_fp8=True
+        target,
+        out,
+        token,
+        topk,
+        model_dim,
+        expert_mask=expert_mask,
+        topk_ids=topk_ids,
+        is_fp8=True,
     )
     torch.testing.assert_close(out, torch.full_like(out, 3.0))
 

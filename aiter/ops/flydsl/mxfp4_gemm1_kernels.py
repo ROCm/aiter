@@ -120,6 +120,16 @@ def _assert_supported(
         raise NotImplementedError(
             f"flydsl mxfp4 gemm1 requires D_HIDDEN (K) % {BK} == 0, got H={D_HIDDEN}"
         )
+    if D_HIDDEN // BK > 32:
+        # issue_b_scale_load picks between exactly two scale bases, the second
+        # offset by 16 K tiles, so the computed address only equals
+        # base + K_C * stride while K_C < 32. From K_C = 32 it aliases back onto
+        # tile K_C - 16 -- inside the buffer, so it is silently wrong rather than
+        # a fault. Reject until the base formula is generalized.
+        raise NotImplementedError(
+            "flydsl mxfp4 gemm1 B-scale addressing covers at most 32 K tiles, "
+            f"got D_HIDDEN/BK={D_HIDDEN // BK} (H={D_HIDDEN}, BK={BK})"
+        )
     if (2 * D_INTER) % BN != 0:
         raise NotImplementedError(
             f"flydsl mxfp4 gemm1 requires 2*D_INTER (N_OUT) % {BN} == 0, "

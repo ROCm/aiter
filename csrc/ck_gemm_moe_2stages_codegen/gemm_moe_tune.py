@@ -6178,14 +6178,20 @@ class Mxfp4FlydslTuner(FmoeTuner):
         """The GEMM1 activation tag for this row.
 
         Folding Situv2 into Silu makes the tuner write a name without
-        `_situv2`, which fused_moe then rejects on activation mismatch.
+        `_situv2`, which fused_moe then rejects on activation mismatch. Anything
+        MXMOE has no kernel for (Gelu, GeluTanh, ...) must raise rather than fall
+        through to Silu, or the row is tuned and validated against a SiLU
+        reference and ships as a silently wrong activation.
         """
         act_type = str(row.get("act_type", ""))
-        if act_type.endswith("Situv2"):
-            return "situv2"
-        if act_type.endswith("Swiglu"):
-            return "swiglu"
-        return "silu"
+        for suffix, tag in (
+            ("Situv2", "situv2"),
+            ("Swiglu", "swiglu"),
+            ("Silu", "silu"),
+        ):
+            if act_type.endswith(suffix):
+                return tag
+        raise ValueError(f"no MXMOE GEMM1 kernel for activation {act_type!r}")
 
     @staticmethod
     def _g2_kname(bm, use_nt, epilog):
