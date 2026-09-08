@@ -31,6 +31,7 @@ MXFP4_G1_VARIANTS = {
         (64, True, False),
         (64, False, False),
         (128, False, False),
+        (160, False, False),
         (16, True, True),
     },
     "fp8": {

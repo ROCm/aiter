@@ -4,6 +4,7 @@
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
+from flydsl._mlir.dialects import llvm as _llvm
 from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import T, as_ir_value
 
@@ -42,6 +43,16 @@ from .mxfp4_gemm_common import (
 )
 
 ACC_LDS_PAD_DW = 4
+
+
+def _agpr_accum_for(BM, BN, num_waves, a_dtype, interleave):
+    return (
+        BM > 128
+        and BN == 256
+        and num_waves == 4
+        and a_dtype == "fp4"
+        and not interleave
+    )
 
 
 def k_g2_half_for(inter):
@@ -105,6 +116,7 @@ def _gemm1_body(
     num_waves=4,
     k_wave=1,
     epi_splits=1,
+    split_khalves=False,
 ):
     # A-code tile bytes/row: fp4 packs 2 codes/byte (BK/2); fp8 is 1 B/elem (BK).
     KH_TILE = BK if a_dtype == "fp8" else BK // 2
@@ -131,7 +143,10 @@ def _gemm1_body(
     k_split = (
         a_dtype == "fp4"
         and not inline_quant
-        and BM == 128
+        and (
+            BM in (128, 160)
+            or (BM == 64 and split_khalves and k_wave == 1)
+        )
         and BN == 256
         and num_waves == 4
         and kMChunks > 1
@@ -270,13 +285,20 @@ def _gemm1_body(
         b_scale_s_base_hi.append(base + fx.Int32(16 * kBS_stride_k0_dw * 4))
 
     scale_atoms = _scale_mma_atoms(a_dtype)
-    accm = [
-        [fx.make_rmem_tensor(mem_4x1, fx.Float32) for _ in range(N_REPS)]
-        for _ in range(kMChunks)
-    ]
-    for i in range_constexpr(kMChunks):
-        for J in range_constexpr(N_REPS):
-            accm[i][J].store(fx.Vector.filled(4, 0.0, fx.Float32))
+    use_agpr = const_expr(_agpr_accum_for(BM, BN, num_waves, a_dtype, interleave))
+    if const_expr(use_agpr):
+        accm = [
+            [as_ir_value(fx.Vector.filled(4, 0.0, fx.Float32)) for _ in range(N_REPS)]
+            for _ in range(kMChunks)
+        ]
+    else:
+        accm = [
+            [fx.make_rmem_tensor(mem_4x1, fx.Float32) for _ in range(N_REPS)]
+            for _ in range(kMChunks)
+        ]
+        for i in range_constexpr(kMChunks):
+            for J in range_constexpr(N_REPS):
+                accm[i][J].store(fx.Vector.filled(4, 0.0, fx.Float32))
     b = [[[None, None] for _ in range(N_REPS)] for _ in range(kStages)]
     b_scale_v = [[None, None] for _ in range(kStages)]
 
@@ -845,18 +867,42 @@ def _gemm1_body(
             )
             bs_slot[mw] = r.load()[0]
 
-    def _mma(ci, opsel_a, opsel_b, a_frag, b_frag, sa, sb):
-        # opsel_a/opsel_b select the e8m0 scale byte in the shared 256-K word and are
-        # baked into the atom.
-        fx.gemm(
-            scale_atoms[(opsel_a, opsel_b)],
-            ci,
-            a_frag,
-            b_frag,
-            ci,
-            scale_a=sa,
-            scale_b=sb,
-        )
+    if const_expr(use_agpr):
+        _F32X4 = fx.Vector.make_type(4, fx.Float32)
+
+        def _mma(ci, opsel_a, opsel_b, a_frag, b_frag, sa, sb):
+            asm = (
+                "v_mfma_scale_f32_16x16x128_f8f6f4 $0, $1, $2, $0, $3, $4 "
+                f"op_sel:[{opsel_a & 1},{opsel_b & 1},0] "
+                f"op_sel_hi:[{opsel_a >> 1},{opsel_b >> 1},0] cbsz:4 blgp:4"
+            )
+            return _llvm.inline_asm(
+                _F32X4,
+                [
+                    as_ir_value(fx.Vector(fx.memref_load_vec(a_frag))),
+                    as_ir_value(fx.Vector(fx.memref_load_vec(b_frag))),
+                    as_ir_value(sa),
+                    as_ir_value(sb),
+                    ci,
+                ],
+                asm,
+                "=a,v,v,v,v,0",
+                has_side_effects=False,
+            )
+
+    else:
+
+        def _mma(ci, opsel_a, opsel_b, a_frag, b_frag, sa, sb):
+            fx.gemm(
+                scale_atoms[(opsel_a, opsel_b)],
+                ci,
+                a_frag,
+                b_frag,
+                ci,
+                scale_a=sa,
+                scale_b=sb,
+            )
+            return ci
 
     def mfma_cluster(b_slot, a, a_scale, bs_slot, J, khalf=None):
         if const_expr(interleave):
@@ -873,20 +919,20 @@ def _gemm1_body(
             if const_expr(kMChunks == 1):
                 sa = a_scale[0]
                 if const_expr(khalf is None or khalf == 0):
-                    _mma(accm[0][J], 0, 0 + in_b, a[0][0], bJ0, sa, sb)
+                    accm[0][J] = _mma(accm[0][J], 0, 0 + in_b, a[0][0], bJ0, sa, sb)
                 if const_expr(khalf is None or khalf == 1):
-                    _mma(accm[0][J], 2, 2 + in_b, a[0][1], bJ1, sa, sb)
+                    accm[0][J] = _mma(accm[0][J], 2, 2 + in_b, a[0][1], bJ1, sa, sb)
             else:
                 for sub in range_constexpr(kSubBlocks):
                     i0 = sub * 2 + 0
                     i1 = sub * 2 + 1
                     sa = a_scale[sub]
                     if const_expr(khalf is None or khalf == 0):
-                        _mma(accm[i0][J], 0, 0 + in_b, a[i0][0], bJ0, sa, sb)
-                        _mma(accm[i1][J], 1, 0 + in_b, a[i1][0], bJ0, sa, sb)
+                        accm[i0][J] = _mma(accm[i0][J], 0, 0 + in_b, a[i0][0], bJ0, sa, sb)
+                        accm[i1][J] = _mma(accm[i1][J], 1, 0 + in_b, a[i1][0], bJ0, sa, sb)
                     if const_expr(khalf is None or khalf == 1):
-                        _mma(accm[i0][J], 2, 2 + in_b, a[i0][1], bJ1, sa, sb)
-                        _mma(accm[i1][J], 3, 2 + in_b, a[i1][1], bJ1, sa, sb)
+                        accm[i0][J] = _mma(accm[i0][J], 2, 2 + in_b, a[i0][1], bJ1, sa, sb)
+                        accm[i1][J] = _mma(accm[i1][J], 3, 2 + in_b, a[i1][1], bJ1, sa, sb)
 
         if const_expr(BN == 64 and not interleave):
             if const_expr(num_waves == 2):
@@ -1197,7 +1243,11 @@ def _gemm1_body(
                         + lane_mod_16
                     )
                     lds_col = fx.Int32(BN_INT) + col_local if is_up else col_local
-                vec = fx.Vector(fx.memref_load_vec(accm[i][J]))
+                vec = (
+                    fx.Vector(accm[i][J])
+                    if const_expr(use_agpr)
+                    else fx.Vector(fx.memref_load_vec(accm[i][J]))
+                )
                 for v in range_constexpr(4):
                     idx = acc_idx(wave_k, row_base + fx.Int32(v), lds_col)
                     acc_store(idx, vec[v])
@@ -1497,8 +1547,9 @@ def _bm_constants(BM, BN, KH_TILE, K_TILES_TOTAL, k_wave=1, epi_splits=1):
 
 
 def default_epi_splits(BM, BN, k_wave=1, num_waves=4):
-    if BM == 128 and BN == 256 and num_waves == 4 and k_wave == 1:
-        return 2
+    if BN == 256 and num_waves == 4 and k_wave == 1:
+        if BM in (128, 160):
+            return 2
     return 1
 
 
@@ -1526,8 +1577,8 @@ def compile_gemm1_a4w4_port(
     num_waves=4,
     k_wave=1,
     epi_splits=None,
+    split_khalves=False,
 ):
-    """Compile GEMM1 with expert-sorted output."""
     if a_dtype not in ("fp4", "fp8"):
         raise AssertionError(f"a_dtype must be 'fp4' or 'fp8', got {a_dtype!r}")
     if (BM, use_nt, inline_quant) not in MXFP4_G1_VARIANTS[a_dtype]:
@@ -1647,6 +1698,8 @@ def compile_gemm1_a4w4_port(
         name_suffix += f"_kw{k_wave}"
     if epi_splits > 1:
         name_suffix += f"_es{epi_splits}"
+    if split_khalves and BM == 64:
+        name_suffix += "_ks64"
 
     block_threads = num_waves * k_wave * 64
 
@@ -1701,11 +1754,8 @@ def compile_gemm1_a4w4_port(
             n_block = wig // group_size_m
             return m_block * fx.Int32(NUM_N_BLOCKS) + n_block
 
-        if bx_i32 < bound:
-            if const_expr(xcd_swizzle > 0):
-                tile = _xcd(bx_i32)
-            else:
-                tile = bx_i32
+        @flyc.jit
+        def run_tile(tile):
             _gemm1_body(
                 lds_raw_ptr,
                 arg_aq,
@@ -1744,7 +1794,15 @@ def compile_gemm1_a4w4_port(
                 num_waves=num_waves,
                 k_wave=k_wave,
                 epi_splits=epi_splits,
+                split_khalves=split_khalves,
             )
+
+        if bx_i32 < bound:
+            if const_expr(xcd_swizzle > 0):
+                tile = _xcd(bx_i32)
+            else:
+                tile = bx_i32
+            run_tile(tile)
 
     @flyc.jit
     def launch_gemm1(
@@ -1786,4 +1844,6 @@ def compile_gemm1_a4w4_port(
     launch_gemm1.compile_hints = {
         "llvm_options": {"amdgpu-sched-strategy": "iterative-minreg"},
     }
+    if _agpr_accum_for(BM, BN, num_waves, a_dtype, interleave):
+        launch_gemm1.compile_hints["waves_per_eu"] = 1
     return launch_gemm1

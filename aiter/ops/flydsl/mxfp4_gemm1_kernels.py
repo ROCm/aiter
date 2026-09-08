@@ -10,6 +10,23 @@ from aiter.ops.flydsl import moe_kernels as _moe_kernels
 from aiter.ops.flydsl.mxfp4_kname import MXFP4_G1_VARIANTS
 
 
+def _g1_split_khalves_eligible(
+    n_tokens, D_HIDDEN, D_INTER, NE, topk, BM, BN, BK, use_nt, inline_quant,
+    xcd_swizzle, a_dtype, out_dtype, act, situ_beta, situ_linear_beta,
+    enable_bias, interleave, k_wave, num_waves,
+):
+    """Select the measured BM64 specialization using actual runtime dimensions."""
+    return (
+        n_tokens in (8192, 16384)
+        and (D_HIDDEN, D_INTER, NE, topk) == (3584, 384, 896, 16)
+        and (BM, BN, BK, xcd_swizzle, k_wave, num_waves) == (64, 256, 256, 2, 1, 4)
+        and a_dtype == out_dtype == "fp4"
+        and act == "situv2"
+        and situ_beta == situ_linear_beta == 1.0
+        and not (use_nt or inline_quant or enable_bias or interleave)
+    )
+
+
 @functools.cache
 def _get_compiled_mxfp4_gemm1_port(
     BM,
@@ -33,6 +50,8 @@ def _get_compiled_mxfp4_gemm1_port(
     native_scale_layout=False,
     num_waves=4,
     k_wave=1,
+    split_khalves=False,
+    epi_splits=None,
 ):
     from .kernels.mxfp4_gemm1 import compile_gemm1_a4w4_port
 
@@ -58,6 +77,8 @@ def _get_compiled_mxfp4_gemm1_port(
         native_scale_layout=native_scale_layout,
         num_waves=num_waves,
         k_wave=k_wave,
+        split_khalves=split_khalves,
+        epi_splits=epi_splits,
     )
 
 
@@ -245,7 +266,12 @@ def flydsl_mxfp4_gemm1(
     )
     from .kernels.mxfp4_gemm1 import gemm1_grid
 
-    launch = _get_compiled_mxfp4_gemm1_port(
+    split_khalves = _g1_split_khalves_eligible(
+        n_tokens, D_HIDDEN, D_INTER, NE, topk, BM, BN, BK, use_nt, inline_quant,
+        xcd_swizzle, a_dtype, out_dtype, act, situ_beta, situ_linear_beta,
+        bias is not None, interleave, k_wave, num_waves,
+    )
+    compile_args = (
         BM,
         use_nt,
         inline_quant,
@@ -267,24 +293,25 @@ def flydsl_mxfp4_gemm1(
         native_scale_layout,
         num_waves,
         k_wave,
+        split_khalves,
+        2 if split_khalves else None,
     )
+    launch = _get_compiled_mxfp4_gemm1_port(*compile_args)
     grid = gemm1_grid(n_tokens, BM, NE=NE, TOPK=topk, INTER=D_INTER, BN=BN)
-    _moe_kernels._run_compiled(
-        launch,
-        (
-            a_quant.data_ptr(),
-            a_scale_sorted_shuffled.data_ptr(),
-            w1_u8.data_ptr(),
-            w1_scale_u8.data_ptr(),
-            sorted_expert_ids.data_ptr(),
-            cumsum_tensor.data_ptr(),
-            m_indices.data_ptr(),
-            n_tokens,
-            grid,
-            inter_sorted_quant.data_ptr(),
-            inter_sorted_shuffled_scale.data_ptr(),
-            hidden_states.data_ptr(),
-            0 if bias is None else bias.data_ptr(),
-            torch.cuda.current_stream() if stream is None else stream,
-        ),
+    launch_args = (
+        a_quant.data_ptr(),
+        a_scale_sorted_shuffled.data_ptr(),
+        w1_u8.data_ptr(),
+        w1_scale_u8.data_ptr(),
+        sorted_expert_ids.data_ptr(),
+        cumsum_tensor.data_ptr(),
+        m_indices.data_ptr(),
+        n_tokens,
+        grid,
+        inter_sorted_quant.data_ptr(),
+        inter_sorted_shuffled_scale.data_ptr(),
+        hidden_states.data_ptr(),
+        0 if bias is None else bias.data_ptr(),
+        torch.cuda.current_stream() if stream is None else stream,
     )
+    _moe_kernels._run_compiled(launch, launch_args)

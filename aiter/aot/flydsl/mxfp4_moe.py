@@ -66,8 +66,18 @@ def _job_key(job: dict) -> tuple:
             job.get("enable_bias", False),
             job.get("g2_spart"),
             job.get("g2_bf16_lds"),
+            job.get("g2_prefetch_ids", False),
         )
     if job["stage"] == 1:
+        from aiter.ops.flydsl.mxfp4_gemm1_kernels import _g1_split_khalves_eligible
+
+        split_khalves = _g1_split_khalves_eligible(
+            job["n_tokens"], job["D_HIDDEN"], job["D_INTER"], job["NE"], job["topk"],
+            job["BM"], job["BN"], job["BK"], job["use_nt"], job["inline_quant"],
+            job["xcd_swizzle"], job["a_dtype"], job["out_dtype"], job["act"],
+            job["situ_beta"], job["situ_linear_beta"], job["enable_bias"],
+            job["interleave"], job["k_wave"], job["num_waves"],
+        )
         return (
             1,
             job["BM"],
@@ -92,6 +102,8 @@ def _job_key(job: dict) -> tuple:
             job["native_scale_layout"],
             job["num_waves"],
             job["k_wave"],
+            split_khalves,
+            2 if split_khalves else None,
         )
     return (
         2,
@@ -131,6 +143,34 @@ def parse_csv(csv_path: str):
         seen.add(key)
         jobs.append(job)
 
+    def _add_g1(job, raw_inter):
+        _add(job)  # Preserve the stored, padded-width cache entry.
+        if raw_inter != job["D_INTER"] and (2 * raw_inter) % job["BN"] == 0:
+            raw_job = dict(job, D_INTER=raw_inter)
+            _add(raw_job)
+            _add(dict(raw_job, n_tokens=job["BM"]))
+
+    def _add_v2(job, token):
+        from aiter.ops.flydsl.kernels.mxmoe_dispatcher import (
+            _g2_prefetch_ids_eligible,
+        )
+
+        _add(job)  # Keep the fallback for EP and explicit prefetch opt-out.
+        bf16_lds = job["g2_bf16_lds"]
+        if bf16_lds is None:
+            bf16_lds = os.environ.get("MXFP4_G2_BF16_LDS", "1") == "1"
+        if (
+            _g2_prefetch_ids_eligible(
+                token, job["NE"], job["topk"], job["N_OUT"], job["D_INTER"],
+                job["BM"], job["BN"], job["BK"], job["a_dtype"], job["b_dtype"],
+                job["epilog"], job["out_dtype"],
+            )
+            and os.environ.get("MXFP4_G2_KSTATIC", "1") == "1"
+            and bf16_lds
+            and not (job["has_pad"] or job["persist"] or job["enable_bias"])
+        ):
+            _add(dict(job, g2_prefetch_ids=True, n_tokens=token))
+
     with open(csv_path, newline="") as f:
         for row in csv.DictReader(f):
             token = int(row["token"])
@@ -160,7 +200,7 @@ def parse_csv(csv_path: str):
                         (DEFAULT_SITUV2_BETA, DEFAULT_SITUV2_LINEAR_BETA)
                     )
                 for situ_beta, situ_linear_beta in situ_params:
-                    _add(
+                    _add_g1(
                         {
                             "stage": 1,
                             "kernel_name": kn1,
@@ -172,16 +212,6 @@ def parse_csv(csv_path: str):
                             "inline_quant": p1["inline_quant"],
                             "prefetch_hidden": p1.get("prefetch_hidden", False),
                             "D_HIDDEN": model_dim,
-                            # Runtime derives D_INTER from the *stored* weight
-                            # width (``w1.shape[1] // 2``), and non-aligned
-                            # shards ship padded to a multiple of 256 with the
-                            # logical width carried separately in
-                            # ``w2.inter_real`` -- the same convention
-                            # ``is_mxfp4_moe_shape_supported`` uses. Keying on
-                            # the raw CSV ``inter_dim`` would miss those rows
-                            # (Kimi-K3: 384 stored as 512). ``d_inter`` is used
-                            # rather than the GEMM2 ``v2_d_inter`` because the
-                            # latter pads to a backend-specific tile_k.
                             "D_INTER": d_inter,
                             "NE": expert,
                             "topk": topk,
@@ -197,7 +227,8 @@ def parse_csv(csv_path: str):
                             "native_scale_layout": native_scale_layout_for(p1["BM"]),
                             "num_waves": p1.get("num_waves", 4),
                             "k_wave": p1.get("k_wave", 1),
-                        }
+                        },
+                        inter_dim,
                     )
 
             if v2_g2 is not None:
@@ -216,7 +247,7 @@ def parse_csv(csv_path: str):
                 )
                 enable_bias_options = [False, True] if bias_supported else [False]
                 for enable_bias in enable_bias_options:
-                    _add(
+                    _add_v2(
                         {
                             "stage": 2,
                             "v2_stage2": True,
@@ -243,7 +274,8 @@ def parse_csv(csv_path: str):
                             "enable_bias": enable_bias,
                             "g2_spart": v2_g2["spart"],
                             "g2_bf16_lds": v2_g2["bf16_lds"],
-                        }
+                        },
+                        token,
                     )
             elif _is_mxfp4_kname(kn2):
                 p2 = _parse_mxfp4_g2_kname(kn2)
@@ -405,7 +437,7 @@ def _compile_v2_stage2(job):
         sorted_token_ids=d,
         sorted_weights=d,
         out=target,
-        M_logical=job["BM"],
+        M_logical=job.get("n_tokens", job["BM"]),
         max_sorted=max_sorted,
         NE=job["NE"],
         D_HIDDEN=job["N_OUT"],
@@ -466,7 +498,11 @@ def compile_one_config(**job):
             if stage == 1:
                 _compile_stage1(job)
             elif job.get("v2_stage2"):
-                _compile_v2_stage2(job)
+                with override_env(
+                    "MXFP4_G2_PREFETCH_IDS",
+                    "1" if job.get("g2_prefetch_ids", False) else "0",
+                ):
+                    _compile_v2_stage2(job)
             else:
                 _compile_stage2(job)
         elapsed = time.time() - t0

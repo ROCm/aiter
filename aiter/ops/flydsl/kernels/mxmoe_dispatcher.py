@@ -36,7 +36,7 @@ def _active_m_blocks_upper_bound(M_logical, topk, NE, BM, SBM):
     routes = M_logical * topk
     active_experts = min(routes, NE)
     sort_blocks = (routes + active_experts * (SBM - 1) + SBM - 1) // SBM
-    return sort_blocks * (SBM // BM)
+    return sort_blocks * (-(-SBM // BM))
 
 
 def _validate_v2_gemm2_dtypes(a_dtype: str, b_dtype: str) -> None:
@@ -133,21 +133,29 @@ def compile_gemm2_a4w4_port(
     has_npad=False,
     out_dtype="bf16",
     enable_bias=False,
+    g2_prefetch_ids=False,
 ):
     """Compile gemm2 a4w4 down-proj; epilog 'atomic' (weighted atomic-fadd) or 'reduce' (store into out[token_id*topk+slot]). inter_dim runtime; SBM None -> SBM==BM byte-identical."""
     SBM = _norm_sbm(SBM, BM)
-    if BM not in (16, 32, 64, 128) or epilog not in ("atomic", "reduce"):
+    SUBS = -(-SBM // BM)
+    sub_tiled = SBM % BM != 0
+    if BM not in (16, 32, 64, 128, 160) or epilog not in ("atomic", "reduce"):
         raise AssertionError(
-            f"mxfp4_moe_gemm2 supports only (BM in {{16,32,64,128}}, epilog in {{'atomic','reduce'}}); "
-            f"got (BM={BM}, epilog={epilog})"
+            f"mxfp4_moe_gemm2 supports only (BM in {{16,32,64,128,160}}, "
+            f"epilog in {{'atomic','reduce'}}); got (BM={BM}, epilog={epilog})"
         )
     if BN not in (128, 256, 512) or BK not in (128, 256):
         raise AssertionError(
             "mxfp4_moe_gemm2 supports only "
             f"(BN in {{128,256,512}}, BK in {{128,256}}); got (BN={BN}, BK={BK})"
         )
-    if SBM % BM != 0:
-        raise AssertionError(f"SBM ({SBM}) must be a multiple of BM ({BM})")
+    if SBM < BM:
+        raise AssertionError(f"SBM ({SBM}) must be >= BM ({BM})")
+    if SBM % BM:
+        if SBM % 32 or BM % 32:
+            raise AssertionError(
+                f"sub-tiled gemm2 needs SBM ({SBM}) and BM ({BM}) 32-row aligned"
+            )
     use_reduce = epilog == "reduce"
     out_dtype = str(out_dtype).strip().lower()
     if out_dtype not in ("bf16", "fp8"):
@@ -210,8 +218,6 @@ def compile_gemm2_a4w4_port(
         raise AssertionError(
             f"k_valid_halves must be in [0, {total_k_halves}], " f"got {k_valid_halves}"
         )
-    # N_OUT = model_dim/hidden is runtime; HIDDEN_MAX is a compile/cache bucket
-    # so different runtime hidden sizes can reuse one compiled launcher.
     assert (
         HIDDEN_MAX % BN == 0
     ), f"HIDDEN_MAX must be a multiple of {BN}, got {HIDDEN_MAX}"
@@ -252,7 +258,7 @@ def compile_gemm2_a4w4_port(
     pad_mode_tag = f"_kp{int(has_kpad)}_np{int(has_npad)}" if has_pad else ""
     g2_epi_lanes = _pick_epi_lanes(BM, BN, route_out_fp8, g2_scale_blk)
     tag = f"hmax{HIDDEN_MAX}_imax{INTER_MAX}_bm{BM}{tile_tag}{'_nt' if use_nt else ''}_{etag}{atag}{btag}{sbm_tag}{persist_tag}{pad_tag}{pad_mode_tag}{kh_tag}{bh_tag}{apf_tag}{spart_tag}{bf16lds_tag}{dw_tag}{kst_tag}{pitch_tag}{sblk_tag}{out_tag}{bias_tag}_v2_biasabi6"
-    name = f"gemm2_a4w4_port_{tag}"
+    name = f"gemm2_a4w4_port_{tag}" + ("_idpf" if g2_prefetch_ids else "")
 
     @fx.struct
     class SharedStorage:
@@ -282,7 +288,8 @@ def compile_gemm2_a4w4_port(
         i32_grid_blocks,
     ):
         # Shared body for both has_pad variants (@flyc.jit -> rewriter recurses scf if / grid-stride); default passes i32_kpad/i32_npad=0 (no kernarg), folding pad math away.
-        num_n_blocks = _udiv(i32_hidden, BN)
+        n_actual = i32_hidden
+        num_n_blocks = _udiv(n_actual, BN)
         k_bytes = _udiv(i32_inter, 1 if is_f8 else 2)
         aq_num = fx.Int64(i32_max_m_blocks) * fx.Int64(BM * k_bytes)
         lds = fx.SharedAllocator().allocate(SharedStorage).peek()
@@ -324,7 +331,7 @@ def compile_gemm2_a4w4_port(
                 wave,
                 arg_aq,
                 i32_inter,
-                i32_hidden,
+                n_actual,
                 i32_kpad,
                 i32_npad,
                 BM=BM,
@@ -354,16 +361,26 @@ def compile_gemm2_a4w4_port(
                 k_valid_halves=k_valid_halves,
                 has_kpad=has_kpad,
                 has_npad=has_npad,
+                g2_prefetch_ids=g2_prefetch_ids,
                 mn_idx=mn_idx,
             )
 
+        def _m_tiles(cumsum0):
+            return _udiv(cumsum0, fx.Int32(SBM)) * fx.Int32(SUBS)
+
+        def _m_row_of(m_tile):
+            if const_expr(not sub_tiled):
+                return m_tile * fx.Int32(BM)
+            sb = _udiv(m_tile, fx.Int32(SUBS))
+            return sb * fx.Int32(SBM) + (m_tile - sb * fx.Int32(SUBS)) * fx.Int32(BM)
+
         if const_expr(not persist and g2_spart <= 0):
             # One-shot naive linear block->(m,n): issue A->LDS before the cumsum load (latency overlap).
-            issue_all_a_loads(_udiv(bx_i32, num_n_blocks) * fx.Int32(BM))
+            issue_all_a_loads(_m_row_of(_udiv(bx_i32, num_n_blocks)))
             rocdl.sched_barrier(0)
 
             cumsum0 = global_typed_ptr(arg_cumsum, T.i32)[0]
-            total_m_blocks = _udiv(cumsum0, BM)
+            total_m_blocks = _m_tiles(cumsum0)
             bound = total_m_blocks * fx.Int32(num_n_blocks)
 
             if fx.Int32(bx_i32) < bound:
@@ -371,7 +388,7 @@ def compile_gemm2_a4w4_port(
         elif const_expr(not persist):
             # One-shot with spatial-partitioner remap (g2_spart>0): needs M0=total_m_blocks so cumsum is read FIRST.
             cumsum0 = global_typed_ptr(arg_cumsum, T.i32)[0]
-            total_m_blocks = _udiv(cumsum0, BM)
+            total_m_blocks = _m_tiles(cumsum0)
             bound = total_m_blocks * fx.Int32(num_n_blocks)
 
             if fx.Int32(bx_i32) < bound:
@@ -383,7 +400,7 @@ def compile_gemm2_a4w4_port(
                     g2_m01,
                 )
                 unit_bx = m_block_idx * fx.Int32(num_n_blocks) + n_block_idx
-                issue_all_a_loads(m_block_idx * fx.Int32(BM))
+                issue_all_a_loads(_m_row_of(m_block_idx))
                 rocdl.sched_barrier(0)
                 run_unit(unit_bx, mn_idx=(m_block_idx, n_block_idx))
         else:
@@ -406,7 +423,7 @@ def compile_gemm2_a4w4_port(
                 m_block = m_tile0 + fx.Int32(_it) * c_stride
                 unit_bx = m_block * fx.Int32(num_n_blocks) + n_block
                 gpu.barrier()  # persist: separate prev-iter epilog C-slab LDS reads from this iter's A-load into the shared LDS union
-                issue_all_a_loads(m_block * fx.Int32(BM))
+                issue_all_a_loads(_m_row_of(m_block))
                 rocdl.sched_barrier(0)
                 if fx.Int32(m_block) < total_m_blocks:
                     run_unit(unit_bx)
@@ -537,6 +554,7 @@ def get_g2(
     has_kpad=False,
     has_npad=False,
     enable_bias=False,
+    g2_prefetch_ids=False,
 ):
     # Cache key uses compile-time buckets; runtime inter_dim/model_dim share a
     # launcher while remaining within their respective caps.
@@ -555,6 +573,7 @@ def get_g2(
         default_bf16_lds = "1" if g2_kstatic else "0"
         g2_bf16_lds = os.environ.get("MXFP4_G2_BF16_LDS", default_bf16_lds) == "1"
     g2_bf16_lds = bool(g2_bf16_lds)
+    g2_prefetch_ids = bool(g2_prefetch_ids and g2_bf16_lds)
     key = (
         BM,
         BN,
@@ -580,6 +599,7 @@ def get_g2(
         has_npad,
         out_dtype,
         enable_bias,
+        g2_prefetch_ids,
     )
     launch = G2_CACHE.get(key)
     if launch is None:
@@ -608,9 +628,24 @@ def get_g2(
             has_npad=has_npad,
             out_dtype=out_dtype,
             enable_bias=enable_bias,
+            g2_prefetch_ids=g2_prefetch_ids,
         )
         G2_CACHE[key] = launch
     return launch
+
+
+def _g2_prefetch_ids_eligible(
+    M_logical, NE, topk, D_HIDDEN, D_INTER, BM, BN, BK, a_dtype, b_dtype,
+    epilog, out_dtype,
+):
+    return (
+        M_logical in (4096, 32768)
+        and (NE, topk, D_HIDDEN, D_INTER) == (896, 16, 3584, 384)
+        and (BM, BN, BK) == (128, 256, 128)
+        and a_dtype == b_dtype == "fp4"
+        and epilog == "reduce"
+        and str(out_dtype).strip().lower() == "fp8"
+    )
 
 
 def mxfp4_moe_gemm2(
@@ -650,6 +685,7 @@ def mxfp4_moe_gemm2(
     g2_spart=None,
     stream=None,
     bias=None,
+    is_ep=False,
 ):
     """Stage-2 down-proj gemm; epilog 'atomic' (weighted atomic.fadd) or 'reduce' (store into out[token_id*topk+slot]). inter_dim_pad/model_dim_pad>0 enable has_pad pad-skip (both 0 -> byte-identical); persist = fixed cu_num m-slot grid (default OFF)."""
     import torch
@@ -714,6 +750,16 @@ def mxfp4_moe_gemm2(
             bias = bias.to(torch.float32)
         if not bias.is_contiguous():
             bias = bias.contiguous()
+    g2_prefetch_ids = (
+        _g2_prefetch_ids_eligible(
+            M_logical, NE, topk, D_HIDDEN, D_INTER, BM, BN, BK,
+            a_dtype, b_dtype, epilog, out_dtype,
+        )
+        and _kstatic
+        and not (has_pad or persist or is_ep)
+        and bias is None
+        and os.environ.get("MXFP4_G2_PREFETCH_IDS", "1") == "1"
+    )
     launch = get_g2(
         BM,
         BN,
@@ -737,16 +783,18 @@ def mxfp4_moe_gemm2(
         has_kpad=inter_dim_pad > 0,
         has_npad=model_dim_pad > 0,
         enable_bias=bias is not None,
+        g2_prefetch_ids=g2_prefetch_ids,
     )
     max_m_blocks = (max_sorted + BM - 1) // BM
+    _subs = -(-SBM // BM)
     if persist:
         # Fixed grid: cu_num m-slots; each block loops over its m-tiles.
         grid_blocks = cu_num
     elif n_sorted_padded is not None:
-        grid_blocks = n_sorted_padded // BM
+        grid_blocks = (n_sorted_padded // SBM) * _subs
     else:
         grid_blocks = min(
-            max_m_blocks,
+            ((max_sorted + SBM - 1) // SBM) * _subs,
             _active_m_blocks_upper_bound(M_logical, topk, NE, BM, SBM),
         )
     out_scale = out  # unused by the atomic epilog; any valid device ptr is fine

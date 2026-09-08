@@ -2270,6 +2270,7 @@ def _flydsl_v2_stage2_wrapper(
         g2_spart=cfg["spart"],
         out_dtype="fp8" if _s2_fp8_inter else "bf16",
         bias=bias2,
+        is_ep=expert_mask is not None,
     )
     if epilog == "reduce":
         from aiter.ops.flydsl.moe_kernels import _run_moe_reduction

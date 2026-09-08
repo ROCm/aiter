@@ -2,6 +2,8 @@
 # Copyright (C) 2025-2026 FlyDSL Project Contributors
 """Layout-API MXFP4 MoE GEMM device body (BM32): gemm2 down."""
 
+import os
+
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl.expr import arith as _arith
@@ -45,6 +47,7 @@ SCALE_STORE_CACHE_MODIFIER = 0
 _FP8_E8M0_SHIFT = 7
 
 _G2_EPI_LANES = 32
+
 
 
 def bq_view(
@@ -271,12 +274,15 @@ def gemm2_body_v2(
     k_valid_halves=None,
     has_kpad=False,
     has_npad=False,
+    g2_prefetch_ids=False,
 ):
     # GEMM2 double-buffers B weight and scale one tile ahead. bhoist issues that
     # prefetch above the LDS barrier; ascale_pf prefetches A-scale one tile ahead.
     # SBM (sort padding unit) >= BM (compute tile); SBM==BM default byte-identical.
     if SBM is None:
         SBM = BM
+    SUBS = -(-SBM // BM)
+    sub_tiled = SBM % BM != 0
     kMChunks = BM // 16  # 16-row MFMA row-groups
     kHalves = BK // 128  # 16x16x128 MFMA K-steps per K-tile
     tilesPerScaleChunk = 256 // BK  # K-tiles sharing one 256-K E8M0 word
@@ -320,18 +326,38 @@ def gemm2_body_v2(
     if const_expr(has_npad):
         N_real = N_OUT_rt - fx.Int32(i32_npad)
 
-    # block -> (m_block_idx, n_block_idx); e = sorted_expert_ids[SBM-padded sort block] (SBM==BM: sort_block==m_block_idx).
     if const_expr(mn_idx is not None):
         m_block_idx, n_block_idx = mn_idx
     else:
         m_block_idx = _udiv(bx_i32, num_n_blocks)
         n_block_idx = bx_i32 - m_block_idx * num_n_blocks
     eids_ptr = global_typed_ptr(arg_eids, T.i32)
-    m_row = m_block_idx * BM
-    if const_expr(SBM == BM):
-        e = rocdl.readfirstlane(T.i32, _raw(eids_ptr[m_block_idx]))
+    if const_expr(sub_tiled):
+        sort_block = fx.Int32(
+            rocdl.readfirstlane(T.i32, _raw(_udiv(m_block_idx, fx.Int32(SUBS))))
+        )
+        m_sub = fx.Int32(
+            rocdl.readfirstlane(
+                T.i32, _raw(m_block_idx - sort_block * fx.Int32(SUBS))
+            )
+        )
+        m_row = fx.Int32(
+            rocdl.readfirstlane(T.i32, _raw(sort_block * SBM + m_sub * BM))
+        )
+        e = rocdl.readfirstlane(T.i32, _raw(eids_ptr[sort_block]))
+        _left = fx.Int32(SBM) - m_sub * BM
+        m_rows_valid = fx.Int32(
+            rocdl.readfirstlane(
+                T.i32, _raw((_left < fx.Int32(BM)).select(_left, fx.Int32(BM)))
+            )
+        )
     else:
-        e = rocdl.readfirstlane(T.i32, _raw(eids_ptr[_udiv(m_row, fx.Int32(SBM))]))
+        m_row = m_block_idx * BM
+        m_rows_valid = None
+        if const_expr(SBM == BM):
+            e = rocdl.readfirstlane(T.i32, _raw(eids_ptr[m_block_idx]))
+        else:
+            e = rocdl.readfirstlane(T.i32, _raw(eids_ptr[_udiv(m_row, fx.Int32(SBM))]))
 
     lane_div_16 = lane // 16
     lane_mod_16 = lane % 16
@@ -666,10 +692,36 @@ def gemm2_body_v2(
             g2_scale_blk=g2_scale_blk,
             g2_epi_lanes=g2_epi_lanes,
             enable_bias=enable_bias,
+            m_rows_valid=m_rows_valid,
             **kw,
         )
 
+    def load_epilog_ids():
+        EPI_LANES = _G2_EPI_LANES if g2_epi_lanes is None else int(g2_epi_lanes)
+        EPI_ROWS = 256 // EPI_LANES
+        M_REPS = BM // EPI_ROWS
+        m_lane = fx.Int32(gpu.thread_id("x")) // EPI_LANES
+        stids = flat_buffer_view(
+            arg_stids, None, T.i32, align=4, elem_bytes=4, fold=False
+        )
+        load_i32 = fx.make_copy_atom(fx.rocdl.BufferCopy32b(), Int32)
+        packed = []
+        for mr in range_constexpr(M_REPS):
+            sorted_pos = m_row + mr * EPI_ROWS + m_lane
+            frag = fx.make_rmem_tensor(1, Int32)
+            fx.copy(load_i32, stids[None, sorted_pos], frag)
+            packed.append(Vec(frag.load())[0])
+        return packed
+
     g2_interleave = const_expr(g2_kstatic and g2_bf16_lds)
+    g2_prefetch_ids = const_expr(
+        g2_prefetch_ids
+        and g2_interleave
+        and use_reduce
+        and route_out_fp8
+        and bool(g2_defer_weight)
+    )
+    prefetched_ids = None
     epi_thunks = [] if const_expr(g2_interleave) else None
     if const_expr(g2_interleave):
         _epilog(c_frags, emit_thunks=epi_thunks)
@@ -755,6 +807,9 @@ def gemm2_body_v2(
                 rocdl.s_waitcnt(vmcnt=0, lgkmcnt=0)
                 gpu.barrier()
             rocdl.sched_barrier(0)
+            if const_expr(g2_prefetch_ids and kt == KT - 1):
+                prefetched_ids = load_epilog_ids()
+                rocdl.sched_barrier(0)
             rocdl.s_setprio(1)
             mfma_cluster(
                 cur_bqf,
@@ -881,7 +936,7 @@ def gemm2_body_v2(
     if const_expr(g2_interleave):
         rocdl.s_waitcnt(lgkmcnt=0)
         gpu.barrier()
-        _epilog(None, lds_ready=True)
+        _epilog(None, lds_ready=True, prefetched_ids=prefetched_ids)
     else:
         _epilog(
             [[c_frags[i][J].load() for J in range(numAccN)] for i in range(kMChunks)]
@@ -918,6 +973,8 @@ def atomic_bf16_epilog(
     emit_thunks=None,
     lds_ready=False,
     enable_bias=False,
+    prefetched_ids=None,
+    m_rows_valid=None,
 ):
     if SBM is None:
         SBM = BM
@@ -988,11 +1045,12 @@ def atomic_bf16_epilog(
     defer_w = bool(g2_defer_weight)
 
     # Prefetch sorted_token_ids / sorted_weights (invariant); latency overlaps stores+barriers.
-    packed = []
+    packed = [] if const_expr(prefetched_ids is None) else prefetched_ids
     weight = []
     for mr in range_constexpr(M_REPS):
         sorted_pos = m_row + mr * EPI_ROWS + m_lane
-        packed.append(load_scalar(load_i32, stids, sorted_pos, Int32))
+        if const_expr(prefetched_ids is None):
+            packed.append(load_scalar(load_i32, stids, sorted_pos, Int32))
         if const_expr(not defer_w):
             weight.append(load_scalar(load_f32, sweights, sorted_pos, Float32))
 
@@ -1256,12 +1314,19 @@ def atomic_bf16_epilog(
                 else:
                     fx.copy(atomic_bf16x2, out_frag, out_bf16[None, out_off])
 
+    rocdl.s_waitcnt(vmcnt=0)
+
     for mr in range_constexpr(M_REPS):
         token_id = packed[mr] & fx.Int32(0x00FFFFFF)
+        if const_expr(m_rows_valid is not None):
+            row_in_block = fx.Int32(mr * EPI_ROWS) + m_lane
+            token_id = (row_in_block < m_rows_valid).select(
+                token_id, fx.Int32(0x7FFFFFFF)
+            )
 
         @flyc.jit
         def store_if_valid(token_id, mr):
             if token_id < i32_M:
-                store_one_mr(mr)
+                    store_one_mr(mr)
 
         store_if_valid(token_id, mr)
