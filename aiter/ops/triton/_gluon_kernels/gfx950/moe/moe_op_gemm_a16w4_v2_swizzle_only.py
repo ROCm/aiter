@@ -385,13 +385,15 @@ def _moe_gemm_a16w4(
         # Scale -> [BLOCK_K, BLOCK_N] to match the axis=0 upcast output (DOT_LAYOUT_W).
         w_scales = unswizzle_mx_scale_cdna4(w_scales, BLOCK_N, MX_SCALE_BLOCK_K)
 
-        w_scales = (
-            w_scales.reshape((BLOCK_N, MX_SCALE_BLOCK_K, 1))
-            .broadcast_to((BLOCK_N, MX_SCALE_BLOCK_K, MX_PACK_DIVISOR))
-            .reshape((BLOCK_N, MX_SCALE_BLOCK_K * MX_PACK_DIVISOR ))
-        )
+        #w_scales = (
+        #    w_scales.reshape((BLOCK_N, MX_SCALE_BLOCK_K, 1))
+        #    .broadcast_to((BLOCK_N, MX_SCALE_BLOCK_K, MX_PACK_DIVISOR))
+        #    .reshape((BLOCK_N, MX_SCALE_BLOCK_K * MX_PACK_DIVISOR ))
+        #)
         w_scales = w_scales.trans(1, 0)
-        w_scales = gl.convert_layout(w_scales, DOT_LAYOUT_W)
+        w_scale_layout: gl.constexpr = gl.amd.get_scaled_upcast_fp4_scale_layout(
+            w, w_scales, gl.bfloat16, axis=0)
+        w_scales = gl.convert_layout(w_scales, w_scale_layout)
 
         w_bf16 = gl.amd.cdna4.scaled_upcast(w, w_scales, gl.bfloat16, axis=0)
         
@@ -408,13 +410,16 @@ def _moe_gemm_a16w4(
     # Scale -> [BLOCK_K, BLOCK_N] to match the axis=0 upcast output (DOT_LAYOUT_W).
     w_scales = unswizzle_mx_scale_cdna4(w_scales, BLOCK_N, MX_SCALE_BLOCK_K)
 
-    w_scales = (
-            w_scales.reshape((BLOCK_N, MX_SCALE_BLOCK_K, 1))
-            .broadcast_to((BLOCK_N, MX_SCALE_BLOCK_K, MX_PACK_DIVISOR))
-            .reshape((BLOCK_N, MX_SCALE_BLOCK_K * MX_PACK_DIVISOR ))
-    )
+    #w_scales = (
+    #        w_scales.reshape((BLOCK_N, MX_SCALE_BLOCK_K, 1))
+    #        .broadcast_to((BLOCK_N, MX_SCALE_BLOCK_K, MX_PACK_DIVISOR))
+    #        .reshape((BLOCK_N, MX_SCALE_BLOCK_K * MX_PACK_DIVISOR ))
+    #)
     w_scales = w_scales.trans(1, 0)
-    w_scales = gl.convert_layout(w_scales, DOT_LAYOUT_W)
+    w_scale_layout: gl.constexpr = gl.amd.get_scaled_upcast_fp4_scale_layout(
+            w, w_scales, gl.bfloat16, axis=0)
+    #w_scales = gl.convert_layout(w_scales, DOT_LAYOUT_W)
+    w_scales = gl.convert_layout(w_scales, w_scale_layout)
 
     w_bf16 = gl.amd.cdna4.scaled_upcast(w, w_scales, gl.bfloat16, axis=0)
     
@@ -431,11 +436,18 @@ def _moe_gemm_a16w4(
     )
 
     if B is not None:
-        bias = gl.load(
-            B + expt_id * stride_b_e + offs_out_n,
+        #bias = gl.load(
+        #    B + expt_id * stride_b_e + offs_out_n,
+        #    mask=offs_out_n < N,
+        #    other=0.0,
+        #    cache_modifier=W_CACHE_MODIFIER,
+        #)
+        bias = gl.amd.cdna3.buffer_load(
+            B + expt_id * stride_b_e ,
+            offs_out_n,
             mask=offs_out_n < N,
             other=0.0,
-            cache_modifier=W_CACHE_MODIFIER,
+            cache=W_CACHE_MODIFIER,
         )
         acc = acc + bias[None, :]
 
