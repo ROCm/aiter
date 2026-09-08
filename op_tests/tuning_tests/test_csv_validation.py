@@ -136,9 +136,9 @@ class TestCSVValidation(unittest.TestCase):
                 df = pd.read_csv(path)
                 df.columns = df.columns.str.strip()
                 self.assertIn("gfx", df.columns, path)
-                bad = df["gfx"].isna() | df["gfx"].astype(str).isin(
-                    ["", "0", "nan", "None"]
-                )
+                from aiter.jit.utils.gfx_placeholders import is_missing_gfx
+
+                bad = df["gfx"].map(is_missing_gfx)
                 self.assertFalse(bad.any(), f"{path}: invalid gfx values")
 
     def test_no_git_conflict_markers(self):

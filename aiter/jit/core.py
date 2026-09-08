@@ -22,7 +22,12 @@ from packaging.version import Version, parse
 
 this_dir = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, f"{this_dir}/utils/")
-from chip_info import get_gfx, get_gfx_list, get_gfx_runtime
+from chip_info import (
+    backfill_dataframe_gfx,
+    get_gfx,
+    get_gfx_list,
+    get_gfx_runtime,
+)
 from cpp_extension import _jit_compile, executable_path, get_hip_version
 from file_baton import FileBaton
 from torch_guard import torch_compile_guard
@@ -330,18 +335,15 @@ class AITER_CONFIG:
                     insert_before = "tflops" if "tflops" in all_cols else all_cols[-1]
                     all_cols.insert(all_cols.index(insert_before), c)
         for i, (path, df) in enumerate(source_pairs):
+            # Normalize placeholder gfx (missing column or 0/empty/NaN cells)
+            # before gfx-aware dedup. Otherwise gfx=0 and gfx950 look like
+            # distinct keys here, then the runtime loader backfills both and
+            # keeps first-seen instead of lowest us.
+            if "gfx" in all_cols and "cu_num" in df.columns:
+                df = backfill_dataframe_gfx(df, path)
             for c in all_cols:
                 if c not in df.columns:
-                    if c == "gfx" and "cu_num" in df.columns:
-                        # Legacy config without a gfx column: infer the arch from
-                        # cu_num (256->gfx950, 80/304->gfx942) so archs that share
-                        # a cu_num stay distinguishable after the merge.
-                        from aiter.jit.utils.chip_info import backfill_dataframe_gfx
-
-                        df = backfill_dataframe_gfx(df, path)
-                        source_pairs[i] = (path, df)
-                    else:
-                        df[c] = _FILL_DEFAULTS.get(c, 0)
+                    df[c] = _FILL_DEFAULTS.get(c, 0)
             source_pairs[i] = (path, df[all_cols])
 
         non_empty = [df for _, df in source_pairs if not df.empty]

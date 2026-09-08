@@ -5,6 +5,8 @@
 import csv
 import glob
 import os
+import shutil
+import tempfile
 import unittest
 
 import pandas as pd
@@ -38,6 +40,14 @@ try:
 except Exception as e:  # noqa: BLE001
     flydsl_mxfp4_aot = None
     _MXFP4_AOT_ERR = e
+
+try:
+    from aiter.jit import core as aiter_core
+
+    _CORE_ERR = None
+except Exception as e:  # noqa: BLE001
+    aiter_core = None
+    _CORE_ERR = e
 
 
 @unittest.skipUnless(
@@ -102,6 +112,36 @@ class TestFmoeLegacyGfxLoading(unittest.TestCase):
                 "gfx950",
                 msg=repr(cell),
             )
+
+
+@unittest.skipUnless(
+    aiter_core is not None, f"aiter.jit.core not importable: {_CORE_ERR}"
+)
+class TestMergeNormalizesPlaceholderGfx(unittest.TestCase):
+    def test_placeholder_and_explicit_gfx_collide_as_one_key(self):
+        header = (
+            "gfx,cu_num,token,model_dim,inter_dim,expert,topk,act_type,dtype,"
+            "q_dtype_a,q_dtype_w,q_type,use_g1u1,doweight_stage1,us"
+        )
+        shape = (
+            "256,4,2304,1536,8,2,ActivationType.Gelu,torch.bfloat16,"
+            "torch.bfloat16,torch.bfloat16,QuantType.No,1,0"
+        )
+        tmp = tempfile.mkdtemp(prefix="aiter_gfx_merge_")
+        try:
+            f1 = os.path.join(tmp, "legacy.csv")
+            f2 = os.path.join(tmp, "explicit.csv")
+            with open(f1, "w", encoding="utf-8") as fh:
+                fh.write(f"{header}\n0,{shape},100.0\n")
+            with open(f2, "w", encoding="utf-8") as fh:
+                fh.write(f"{header}\ngfx950,{shape},10.0\n")
+            with self.assertRaises(RuntimeError) as ctx:
+                aiter_core.AITER_CONFIGS.update_config_files(
+                    f"{f1}{os.pathsep}{f2}", "tuned_fmoe"
+                )
+            self.assertIn("duplicate shape", str(ctx.exception).lower())
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
 
 
 @unittest.skipUnless(
