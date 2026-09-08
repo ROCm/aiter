@@ -397,7 +397,9 @@ def _emit_quant_block_loop(c: SimpleNamespace) -> None:
             block_amax = c.c0_f32
             for j in range_constexpr(8):
                 xj = fx.Vector(f32x8)[j]
-                absj = llvm.call_intrinsic(f32, "llvm.fabs.f32", [xj], [], [])
+                absj = llvm.call_intrinsic(
+                    f32, "llvm.fabs.f32", [xj.ir_value()], [], []
+                )
                 block_amax = arith.maximumf(block_amax, absj)
             for dist in c.amax_shuffle_dists:
                 peer_amax = block_amax.shuffle_xor(
@@ -432,8 +434,8 @@ def _emit_quant_block_loop(c: SimpleNamespace) -> None:
 
             # per-block amax: max over this lane's 2 elems, then a butterfly
             # shuffle_xor across the block's 16 lanes.
-            abs0 = llvm.call_intrinsic(f32, "llvm.fabs.f32", [x0], [], [])
-            abs1 = llvm.call_intrinsic(f32, "llvm.fabs.f32", [x1], [], [])
+            abs0 = llvm.call_intrinsic(f32, "llvm.fabs.f32", [x0.ir_value()], [], [])
+            abs1 = llvm.call_intrinsic(f32, "llvm.fabs.f32", [x1.ir_value()], [], [])
             block_amax = arith.maximumf(c.c0_f32, arith.maximumf(abs0, abs1))
             for dist in c.amax_shuffle_dists:
                 peer_amax = block_amax.shuffle_xor(
