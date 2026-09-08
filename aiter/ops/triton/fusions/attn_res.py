@@ -43,8 +43,8 @@ from collections.abc import Sequence
 
 import torch
 import triton
-from triton.runtime import driver
 from triton import knobs
+from triton.runtime import driver
 
 from aiter.ops.triton._triton_kernels.fusions.attn_res import (
     ATTN_RES_TRITON_AUTOTUNE,

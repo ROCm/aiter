@@ -682,12 +682,12 @@ def test_attn_res_gate_launch_cache_bit_identical(monkeypatch, quant, close_bloc
         N, D, B, dtype, with_add=True
     )
     orw = torch.randn(D, dtype=dtype, device="cuda")
-    kwargs = dict(
-        output_rms_weight=orw,
-        output_rms_eps=1e-5,
-        close_block=close_block,
-        out_quant_dtype=fp8_dtype if quant else None,
-    )
+    kwargs = {
+        "output_rms_weight": orw,
+        "output_rms_eps": 1e-5,
+        "close_block": close_block,
+        "out_quant_dtype": fp8_dtype if quant else None,
+    }
 
     def run():
         return attn_res_gate(
