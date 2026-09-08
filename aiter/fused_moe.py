@@ -4,6 +4,7 @@
 import functools
 import os
 import re
+import csv
 from collections.abc import Callable
 from dataclasses import dataclass
 
@@ -108,6 +109,234 @@ def _moe_prepare_unsorted_input(topk_ids, topk_weights, model_dim, moebuf_dtype)
     # sorted_expert_ids / num_valid_ids slots are unread by FLAT kernels,
     # but must be valid device pointers -- alias topk_ids as scratch.
     return topk_ids_i32, topk_weights_f32, topk_ids_i32, topk_ids_i32, moe_buf
+
+
+_TRITON_FMOE_INDEX_COLS = (
+    "gfx",
+    "cu_num",
+    "token",
+    "model_dim",
+    "inter_dim",
+    "expert",
+    "topk",
+    "act_type",
+    "dtype",
+    "q_dtype_a",
+    "q_dtype_w",
+    "q_type",
+    "use_g1u1",
+    "doweight_stage1",
+)
+
+
+@functools.lru_cache(maxsize=1)
+def _load_triton_fmoe_configs() -> dict[tuple[str, ...], dict]:
+    tune_file = AITER_CONFIGS.AITER_CONFIG_TRITON_FMOE_FILE
+    if not tune_file or not os.path.exists(tune_file):
+        return {}
+
+    with open(tune_file, newline="") as f:
+        rows = list(csv.DictReader(f))
+    if not rows:
+        return {}
+
+    required_cols = set(_TRITON_FMOE_INDEX_COLS) | {
+        "block_size_m",
+        "block_size_n",
+        "block_size_k",
+        "group_size_m",
+        "num_warps",
+        "num_stages",
+    }
+    missing = sorted(required_cols - set(rows[0].keys()))
+    if missing:
+        raise KeyError(
+            f"Missing required Triton FMoE config columns in {tune_file}: {missing}"
+        )
+
+    table = {}
+    for row in rows:
+        key = tuple(str(row[col]).strip() for col in _TRITON_FMOE_INDEX_COLS)
+        table[key] = {
+            "BLOCK_SIZE_M": int(row["block_size_m"]),
+            "BLOCK_SIZE_N": int(row["block_size_n"]),
+            "BLOCK_SIZE_K": int(row["block_size_k"]),
+            "GROUP_SIZE_M": int(row["group_size_m"]),
+            "num_warps": int(row["num_warps"]),
+            "num_stages": int(row["num_stages"]),
+        }
+    return table
+
+
+def _get_gfx1201_triton_fmoe_config(
+    *,
+    M,
+    model_dim,
+    inter_dim,
+    expert,
+    topk,
+    activation,
+    dtype,
+    q_dtype_a,
+    q_dtype_w,
+    quant_type,
+    is_g1u1,
+    doweight_stage1,
+    expert_mask,
+    hidden_pad,
+    intermediate_pad,
+    bias1,
+    bias2,
+    w1_scale,
+    w2_scale,
+    a1_scale,
+    a2_scale,
+    num_local_tokens,
+    gate_mode,
+    w1_is_contiguous,
+    w2_is_contiguous,
+):
+    if not (
+        get_gfx_runtime() == "gfx1201"
+        and quant_type == QuantType.No
+        and activation == ActivationType.Silu
+        and dtype == dtypes.bf16
+        and q_dtype_a == dtypes.bf16
+        and q_dtype_w == dtypes.bf16
+        and is_g1u1
+        and not doweight_stage1
+        and model_dim == 2048
+        and inter_dim == 128
+        and expert == 256
+        and topk == 8
+        and expert_mask is None
+        and hidden_pad == 0
+        and intermediate_pad == 0
+        and bias1 is None
+        and bias2 is None
+        and w1_scale is None
+        and w2_scale is None
+        and a1_scale is None
+        and a2_scale is None
+        and num_local_tokens is None
+        and gate_mode == GateMode.SEPARATED
+        and w1_is_contiguous
+        and w2_is_contiguous
+    ):
+        return None
+
+    key = (
+        "gfx1201",
+        str(get_cu_num()),
+        str(M),
+        str(model_dim),
+        str(inter_dim),
+        str(expert),
+        str(topk),
+        str(activation),
+        str(dtype),
+        str(q_dtype_a),
+        str(q_dtype_w),
+        str(quant_type),
+        str(int(is_g1u1)),
+        str(int(doweight_stage1)),
+    )
+    return _load_triton_fmoe_configs().get(key)
+
+
+def _triton_bf16_g1u1_moe(
+    hidden_states,
+    w1,
+    w2,
+    topk_weight,
+    topk_ids,
+    *,
+    config,
+):
+    import triton.language as tl
+
+    from aiter.ops.moe_op import moe_sum
+    from aiter.ops.triton.moe.moe_align_block_size import moe_align_block_size_triton
+    from aiter.ops.triton.moe.moe_op import fused_moe as triton_moe
+    from aiter.ops.triton.moe.moe_op_silu_fused import fused_moe_silu
+
+    M, topk = topk_ids.shape
+    E, model_dim, inter_dim = get_inter_dim(w1.shape, w2.shape)
+    device = hidden_states.device
+    block_m = int(config["BLOCK_SIZE_M"])
+    max_num_tokens_padded = topk_ids.numel() + E * block_m - topk
+    max_num_m_blocks = (max_num_tokens_padded + block_m - 1) // block_m
+    sorted_token_ids = torch.empty(
+        (max_num_tokens_padded,), dtype=torch.int32, device=device
+    )
+    sorted_token_ids.fill_(topk_ids.numel())
+    sorted_expert_ids = torch.empty(
+        (max_num_m_blocks,), dtype=torch.int32, device=device
+    )
+    num_tokens_post_padded = torch.empty((1,), dtype=torch.int32, device=device)
+    stage1 = torch.empty((M * topk, inter_dim), dtype=dtypes.bf16, device=device)
+    stage2 = torch.empty((M, topk, model_dim), dtype=dtypes.bf16, device=device)
+    out = torch.empty((M, model_dim), dtype=dtypes.bf16, device=device)
+    topk_weight = (
+        topk_weight
+        if topk_weight.dtype == dtypes.fp32 and topk_weight.is_contiguous()
+        else topk_weight.to(dtypes.fp32).contiguous()
+    )
+    topk_ids = (
+        topk_ids
+        if topk_ids.dtype == dtypes.i32 and topk_ids.is_contiguous()
+        else topk_ids.to(dtypes.i32).contiguous()
+    )
+    moe_align_block_size_triton(
+        topk_ids,
+        E,
+        block_m,
+        sorted_token_ids,
+        sorted_expert_ids,
+        num_tokens_post_padded,
+    )
+    fused_moe_silu(
+        hidden_states,
+        w1,
+        stage1,
+        None,
+        None,
+        None,
+        topk_weight,
+        topk_ids,
+        sorted_token_ids,
+        sorted_expert_ids,
+        num_tokens_post_padded,
+        False,
+        topk,
+        tl.bfloat16,
+        False,
+        False,
+        False,
+        config=config,
+    )
+    triton_moe(
+        stage1,
+        w2,
+        stage2,
+        None,
+        None,
+        None,
+        topk_weight,
+        topk_ids,
+        sorted_token_ids,
+        sorted_expert_ids,
+        num_tokens_post_padded,
+        True,
+        1,
+        tl.bfloat16,
+        False,
+        False,
+        False,
+        config=config,
+    )
+    moe_sum(stage2, out)
+    return out
 
 
 def _adaptive_moe_sort(
@@ -985,6 +1214,43 @@ def _fused_moe_impl(
                 raise NotImplementedError(
                     f"a16w4 (bf16 A x MXFP4 W) SiTUv2 is not supported: {_why}."
                 )
+
+    triton_config = _get_gfx1201_triton_fmoe_config(
+        M=M,
+        model_dim=model_dim,
+        inter_dim=inter_dim,
+        expert=E,
+        topk=topk,
+        activation=activation,
+        dtype=dtype,
+        q_dtype_a=q_dtype_a,
+        q_dtype_w=q_dtype_w,
+        quant_type=quant_type,
+        is_g1u1=isG1U1,
+        doweight_stage1=doweight_stage1,
+        expert_mask=expert_mask,
+        hidden_pad=hidden_pad,
+        intermediate_pad=intermediate_pad,
+        bias1=bias1,
+        bias2=bias2,
+        w1_scale=w1_scale,
+        w2_scale=w2_scale,
+        a1_scale=a1_scale,
+        a2_scale=a2_scale,
+        num_local_tokens=num_local_tokens,
+        gate_mode=gate_mode,
+        w1_is_contiguous=w1.is_contiguous(),
+        w2_is_contiguous=w2.is_contiguous(),
+    )
+    if triton_config is not None:
+        return _triton_bf16_g1u1_moe(
+            hidden_states.contiguous(),
+            w1,
+            w2,
+            topk_weight,
+            topk_ids,
+            config=triton_config,
+        )
 
     metadata = get_2stage_cfgs(
         get_padded_M(M),  # consider token_num > 1024 as prefill
