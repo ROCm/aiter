@@ -1026,8 +1026,6 @@ def _run_moe_reduction(
     token_num,
     topk,
     model_dim,
-    *,
-    model_dim_pad=0,
     expert_mask=None,
     topk_ids=None,
     stream=None,
@@ -1035,6 +1033,9 @@ def _run_moe_reduction(
     topk_weights=None,
     fp8_scale_blk=None,
     fp8_pitch_align=None,
+    # Appended rather than inserted: everything above keeps the position it has
+    # on main, so an existing positional caller cannot be silently rebound.
+    model_dim_pad=0,
 ):
     """Topk reduction epilogue for stage2 reduce mode."""
     use_mask = expert_mask is not None
