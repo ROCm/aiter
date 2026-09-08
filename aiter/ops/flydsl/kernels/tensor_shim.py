@@ -36,9 +36,37 @@ AITER_FLYDSL_MOE_EXPERT_SCHEDULING_MODE = bool(
 )
 
 
-def ptr_rsrc(ptr):
+def ptr_rsrc(ptr, num_records_bytes=None):
     """Convert an fx.Pointer kernel arg to a buffer resource for buffer_load/store."""
-    return buffer_ops.create_buffer_resource_from_addr(fx.Int64(ptrtoint(ptr)))
+    return buffer_ops.create_buffer_resource_from_addr(
+        fx.Int64(ptrtoint(ptr)), num_records_bytes=num_records_bytes
+    )
+
+
+def ptr_buf_scalar(ptr, num_records_bytes=None):
+    """Return a wave-uniform 32-bit ``s.buffer.load`` accessor.
+
+    The returned callable accepts an element offset and a width of one or four
+    dwords. Values are returned as raw i32 bits so callers can either consume
+    integer data directly or bitcast floating-point data without routing the
+    load through per-lane VGPR addressing. ``ptr`` may be either an opaque
+    ``fx.Pointer`` or a shaped ``fx.Tensor`` kernel argument.
+    """
+    if isinstance(ptr, fx.Pointer):
+        rsrc = ptr_rsrc(ptr, num_records_bytes=num_records_bytes)
+    else:
+        rsrc = buffer_ops.create_buffer_resource(
+            ptr,
+            max_size=num_records_bytes is None,
+            num_records_bytes=num_records_bytes,
+        )
+
+    def load(offset=0, vec_width=1):
+        return buffer_ops.buffer_load(
+            rsrc, offset, vec_width=vec_width, is_scalar=True
+        )
+
+    return load
 
 
 _BUF_COPY_ATOM = {
