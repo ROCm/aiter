@@ -5,11 +5,14 @@ import functools
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
+from flydsl._mlir.dialects import llvm
 from flydsl.expr import arith, const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import T
 from flydsl.expr.typing import Vector as Vec
 
 from aiter.ops.flydsl.kernels.mxfp4_gemm_common import (
+    _gep1,
+    _global_base_ptr1,
     global_typed_ptr,
     lds_typed_ptr,
     lds_vec_load,
@@ -48,6 +51,7 @@ def _atomic_bf16_epilog(
     BM,
     N_OUT,
     BN,
+    use_k16=False,
 ):
     _kMChunks = BM // 16
     M_REPS = BM // 8
@@ -75,9 +79,15 @@ def _atomic_bf16_epilog(
 
     load_i32 = fx.make_copy_atom(fx.rocdl.BufferCopy32b(), fx.Int32)
     load_f32 = fx.make_copy_atom(fx.rocdl.BufferCopy32b(), fx.Float32)
-    atomic_bf16x2 = fx.make_copy_atom(
-        fx.rocdl.BufferAtomicPkAdd(fx.BFloat16), fx.BFloat16
-    )
+    # gfx950+ has buffer_atomic_pk_add_bf16. gfx942 only has the global packed
+    # form; emitting the buffer op there is LLVM "Cannot select BUFFER_ATOMIC_FADD
+    # v2bf16" (same fork as moe_gemm_2stage / mxfp4_gemm2).
+    if const_expr(not use_k16):
+        atomic_bf16x2 = fx.make_copy_atom(
+            fx.rocdl.BufferAtomicPkAdd(fx.BFloat16), fx.BFloat16
+        )
+    else:
+        out_base = _global_base_ptr1(arg_out)
 
     def load_scalar(atom, src, index, elem_ty):
         frag = fx.make_rmem_tensor(1, elem_ty)
@@ -123,10 +133,21 @@ def _atomic_bf16_epilog(
                 pk = Vec.from_elements(
                     [v2[0] * weight[mr], v2[1] * weight[mr]], fx.Float32
                 ).to(fx.BFloat16)
-                out_frag = fx.make_rmem_tensor(2, fx.BFloat16)
-                out_frag.store(pk)
                 out_off = row_base_addr + fx.Int32(s * 64)
-                fx.copy(atomic_bf16x2, out_frag, out_bf16[None, out_off])
+                if const_expr(use_k16):
+                    out_ptr = _gep1(out_base, out_off * fx.Int32(2))
+                    llvm.AtomicRMWOp(
+                        llvm.AtomicBinOp.fadd,
+                        out_ptr,
+                        _raw(pk),
+                        llvm.AtomicOrdering.monotonic,
+                        syncscope="agent",
+                        alignment=4,
+                    )
+                else:
+                    out_frag = fx.make_rmem_tensor(2, fx.BFloat16)
+                    out_frag.store(pk)
+                    fx.copy(atomic_bf16x2, out_frag, out_bf16[None, out_off])
 
 
 @flyc.jit
@@ -410,6 +431,7 @@ def _gemm2_body_a16w4(
             BM,
             N_OUT,
             TILE_N,
+            use_k16,
         )
 
 
