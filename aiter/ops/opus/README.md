@@ -249,13 +249,58 @@ a non-OPUS fallback as coverage.
 ## Tuning compatibility
 
 The exact public APIs execute a caller-selected kid. A16 production tuning
-continues through `csrc/gemm_a16w16/gemm_a16w16_tune.py`; MXFP8 BMM uses
-`csrc/opus_gemm/opus_bmm_mxscale_tune.py`.
+continues through `csrc/gemm_a16w16/gemm_a16w16_tune.py`; plain A8W8 and
+MXFP8 BMM use `csrc/opus_gemm/opus_gemm_a8w8_tune.py` and
+`csrc/opus_gemm/opus_bmm_mxscale_tune.py`, respectively.
 
 The CK-owned blockscale tuner remains unchanged. Its legacy
 `opus_gemm_a8w8_blockscale_bpreshuffle_tune(...)` import is retained in
-`gemm_op_a8w8.py` and calls the bpreshuffle family launcher directly. New
-OPUS-specific tuning code should live under `csrc/opus_gemm/`.
+`gemm_op_a8w8.py` and calls the bpreshuffle family launcher directly.
+
+### Plain A8W8 GEMM
+
+`csrc/opus_gemm/opus_gemm_a8w8_tune.py` tunes the gfx950 no-scale and ordinary
+blockscale GEMMs. It accepts the existing GEMM tuner options; CSV `scaleAB`
+selects the scale mode, so there is no `--family` option.
+
+```bash
+# Run from the repository root.
+export PYTHONPATH="$PWD"
+export ROCR_VISIBLE_DEVICES=0
+export HIP_VISIBLE_DEVICES=0
+
+cat > /tmp/opus_a8w8_shapes.csv <<'CSV'
+M,N,K,dtype,outdtype,bias,scaleAB,bpreshuffle
+64,4096,4096,fp8,fp32,False,False,False
+128,4096,4096,fp8,fp32,False,False,False
+64,4096,4096,fp8,fp32,False,True,False
+128,4096,4096,fp8,fp32,False,True,False
+CSV
+
+python3 csrc/opus_gemm/opus_gemm_a8w8_tune.py \
+  --input_file /tmp/opus_a8w8_shapes.csv \
+  --tuned_file /tmp/opus_a8w8_tuned.csv \
+  --libtype opus --mp 1
+
+python3 csrc/opus_gemm/opus_gemm_a8w8_tune.py \
+  --run_config /tmp/opus_a8w8_tuned.csv --libtype opus --mp 1
+```
+
+`-i/--untune_file` and `-o/--tune_file` are equivalent aliases. Missing
+`dtype`, `outdtype`, and `scaleAB` columns default to FP8, FP32, and `False`.
+`scaleAB=True` uses FP32 scales with the registered 1x128x128 group contract.
+Both modes require contiguous inputs/output, no bias or preshuffle, and
+`splitK=0`. Candidates come from the canonical registry and are checked against
+an independent FP32 dequantize-and-matmul reference. The default `--errRatio 0`
+rejects any element outside `rtol=atol=1e-2`.
+
+The output key includes `gfx,cu_num,M,N,K,dtype,outdtype,scaleAB`, so both
+scale modes can coexist for the same shape. `--all` retunes the input rows;
+`--profile_file` records all candidates. `--run_config` executes the saved
+`kernelId` through `opus_gemm` with preallocated FP32 output; without a path it
+reads `--tuned_file`. Callers own this CSV lookup. For M padding, allocate and
+zero-pad XQ, pad `x_scale` rows with finite scales (for example 1), call the
+saved kid with padded output, then slice back to the original M.
 
 ## A16 Torch workspace
 
@@ -400,6 +445,7 @@ skip on another architecture is not a pass for that target.
 | `policy.py` | A16 tuned/heuristic candidate selection plus MXFP8 tuned CSV discovery, padded-M lookup, local-to-global kid normalization and heuristic fallback |
 | `launch_plan.py` | shared `WorkspaceSpec`, A16 exact-kid/split-K planning, and A8 family contract/MXFP8 BMM planning |
 | `gemm_op_a8w8.py` | three non-MX A8 GEMM adapters, the legacy bpreshuffle tuner compatibility entry, MXFP8 BMM workspace materialization, and the unified `_launch_a8w8_backend` over four pybind raw bindings |
+| `csrc/opus_gemm/opus_gemm_a8w8_tune.py` | plain A8W8 no-scale/blockscale tuner and saved-kid CSV replay |
 | `moe_stage1_a8w4.py` | A8W4 MoE stage-1 runtime binding and launcher |
 | `moe_stage2_a8w4.py` | A8W4 MoE stage-2 runtime bindings and launchers |
 | `../gemm_op_a8w8.py` | general scaled CK/CKTile/ASM/Triton A8 dispatchers plus the tuned-row OPUS bpreshuffle route |

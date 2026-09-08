@@ -57,6 +57,7 @@ tree wins over any installed aiter):
     ... opus_bmm_mxscale_tune.py -i my_untuned.csv -o /tmp/out.csv --mp 8
 """
 
+import math
 import os
 import sys
 from typing import Any, ClassVar
@@ -81,7 +82,10 @@ for _p in (_HERE, _OPTESTS):
 
 # opus_gemm_common is pure python (stdlib only), so importing the codegen kid
 # table here does not pull in the build.
-from opus_gemm_common import a8w8_mxscale_bmm_kernel_lists
+from opus_gemm_common import (
+    a8w8_mxscale_bmm_kernel_lists,
+    bmm_mxscale_global_kid,
+)
 from test_opus_a8w8_bmm import (
     GROUP,
     _quant_block_e8m0,
@@ -521,7 +525,7 @@ class OpusBmmMxscaleTuner(GemmCommonTuner):
                 logger.info("skipping %d already-tuned shapes", int(mask.sum()))
             self.untunedf = self.untunedf[~mask].reset_index(drop=True)
 
-    # --- production-path benchmark -----------------------------------------
+    # --- saved exact-kid benchmark ------------------------------------------
     def _clear_op_caches(self):
         from aiter.ops import batched_gemm_op_a8w8
         from aiter.ops.opus import policy
@@ -529,9 +533,93 @@ class OpusBmmMxscaleTuner(GemmCommonTuner):
         policy._load_mxscale_bmm_tuned.cache_clear()
         policy.lookup_mxscale_bmm_config.cache_clear()
         policy._mxscale_bmm_kid_m_align.cache_clear()
-        batched_gemm_op_a8w8._MXSCALE_BMM_LAUNCH_PLANS.clear()
+        batched_gemm_op_a8w8._get_mxscale_bmm_launch_plan.cache_clear()
 
     def run_config(self, args):
+        from aiter.test_common import checkAllclose, run_perftest
+
+        required = {"libtype", "kernelId", "splitK"}
+        missing = required.difference(self.untunedf.columns)
+        if missing:
+            if missing == required:
+                return self._run_default_config(args)
+            raise ValueError(
+                f"--run_config requires a tuned CSV with {sorted(missing)}"
+            )
+
+        results = []
+        for seed, (_, row) in enumerate(self.untunedf.iterrows(), start=1):
+            b, m, n, k = (int(row[name]) for name in ("b", "m", "n", "k"))
+            if str(row["libtype"]).strip().lower() != "opus":
+                raise ValueError(
+                    "MXFP8 BMM --run_config only supports libtype=opus; "
+                    f"got {row['libtype']!r} for B={b}, M={m}, N={n}, K={k}"
+                )
+
+            saved_kid = int(row["kernelId"])
+            kernel_id = saved_kid
+            if kernel_id not in _CODEGEN_BMM:
+                legacy_global_kid = bmm_mxscale_global_kid(saved_kid)
+                if legacy_global_kid in _CODEGEN_BMM:
+                    kernel_id = legacy_global_kid
+            if kernel_id not in _CODEGEN_BMM:
+                raise ValueError(
+                    f"saved MXFP8 BMM kid {saved_kid} is not registered on gfx950"
+                )
+
+            split_k = int(row["splitK"])
+            if split_k not in _applicable(kernel_id, b, m, n, k):
+                raise ValueError(
+                    f"saved MXFP8 BMM kid {saved_kid} (global {kernel_id}) with "
+                    f"splitK={split_k} is incompatible with "
+                    f"B={b}, M={m}, N={n}, K={k}"
+                )
+
+            shape_str = f"B={b},M={m},N={n},K={k},kid={kernel_id},splitK={split_k}"
+            allowed, allowed_desc = self._get_run_config_err_ratio_limit(row, args)
+            data = gen_bmm_mxscale_data(
+                b,
+                m,
+                n,
+                k,
+                seed,
+                dtypes.bf16,
+                kernel_id,
+                split_k,
+            )
+            data[2].fill_(float("nan"))
+            out, us = run_perftest(
+                run_bmm_mxscale_bench,
+                *data[:6],
+                kernel_id,
+                split_k,
+                num_warmup=args.warmup,
+                num_iters=args.iters,
+            )
+            err_ratio = checkAllclose(
+                out,
+                data[6],
+                rtol=1e-2,
+                atol=1e-2,
+                tol_err_ratio=allowed,
+                msg=f"run_config {shape_str}",
+                printLog=args.verbose,
+            )
+            if (
+                not math.isfinite(us)
+                or us <= 0
+                or not math.isfinite(err_ratio)
+                or err_ratio > allowed
+            ):
+                raise RuntimeError(
+                    f"saved MXFP8 BMM kid {kernel_id} failed: "
+                    f"us={us}, errRatio={err_ratio} (>{allowed_desc})"
+                )
+            results.append({"shape": shape_str, "e2e_us": us, "status": "ok"})
+        return results
+
+    def _run_default_config(self, args):
+        """Keep shape-only ``--run_config``/``--compare`` on production policy."""
         from aiter.ops.batched_gemm_op_a8w8 import batched_gemm_a8w8_mxscale
         from aiter.test_common import checkAllclose, run_perftest
 
