@@ -120,11 +120,24 @@ def mhc_res_unshuffle(shuffled: torch.Tensor) -> torch.Tensor:
 
 
 @functools.lru_cache(maxsize=1024)
-def get_mhc_pre_splitk(m: int, hc_hidden_size: int) -> tuple[int, int]:
+def get_mhc_pre_splitk(
+    m: int, hc_hidden_size: int, is_w_preshuffle_bf16: bool = False
+) -> tuple[int, int]:
     prefetch_stages = 2
     tile_m = 16 * 4
     num_cu = get_cu_num()
     arch = get_gfx_runtime()
+    # Vector LDS weight reads shorten the gfx1250 BF16 loop. More split-K
+    # workgroups improve latency hiding for large M without changing FP32 tuning.
+    prefill_tg_factor = (
+        8
+        if is_w_preshuffle_bf16
+        and arch == "gfx1250"
+        and num_cu == 256
+        and m >= 2048
+        and hc_hidden_size in (4 * 4096, 4 * 7168)
+        else 4
+    )
     tile_k_tg_dict = (
         {
             128: 2 * num_cu,
@@ -132,7 +145,7 @@ def get_mhc_pre_splitk(m: int, hc_hidden_size: int) -> tuple[int, int]:
         }
         if arch.startswith("gfx9")
         else {
-            64: 4 * num_cu,
+            64: prefill_tg_factor * num_cu,
         }
     )
     selected_splitk = 1
@@ -412,10 +425,16 @@ def mhc_pre(
         hc_mult3 == hc_mult and sinkhorn_repeat == 0
     )
     hc_hidden_size = hc_mult * hidden_size
+    # The tuned packed-weight policy targets the standard four-stream pre GEMM.
+    packed_config = bool(is_w_preshuffle_bf16) and hc_mult == 4 and hc_mult3 == 24
     if large_m_splitk:
-        selected_splitk, selected_tile_k = get_mhc_pre_splitk_large_m(m, hc_hidden_size)
+        selected_splitk, selected_tile_k = get_mhc_pre_splitk_large_m(
+            m, hc_hidden_size, is_w_preshuffle_bf16=packed_config
+        )
     else:
-        selected_splitk, selected_tile_k = get_mhc_pre_splitk(m, hc_hidden_size)
+        selected_splitk, selected_tile_k = get_mhc_pre_splitk(
+            m, hc_hidden_size, is_w_preshuffle_bf16=packed_config
+        )
     device = residual.device
     out_pad = torch.empty(
         selected_splitk, m, (hc_mult3 + 31) // 32 * 32, dtype=dtypes.fp32, device=device
@@ -486,11 +505,15 @@ def mhc_post(
 ) -> None: ...
 
 
-def get_mhc_pre_splitk_large_m(m: int, hc_hidden_size: int) -> tuple[int, int]:
+def get_mhc_pre_splitk_large_m(
+    m: int, hc_hidden_size: int, is_w_preshuffle_bf16: bool = False
+) -> tuple[int, int]:
     """Split-K policy for gfx950 large-M post_pre kernel (M > 1024)."""
     if get_gfx_runtime() == "gfx950" and m >= 8192 and hc_hidden_size % (8 * 64) == 0:
         return 8, 64
-    return get_mhc_pre_splitk(m, hc_hidden_size)
+    return get_mhc_pre_splitk(
+        m, hc_hidden_size, is_w_preshuffle_bf16=is_w_preshuffle_bf16
+    )
 
 
 @compile_ops("module_mhc", develop=True)
