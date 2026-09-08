@@ -64,6 +64,31 @@ def make_sgpr_opaque(val_i32):
     return op.res
 
 
+def make_vgpr_opaque(val):
+    """Return ``val`` unchanged but forced to live in a VGPR.
+
+    A VALU instruction reads its scalar operands through a narrow port; a VOP3
+    like v_med3 that takes two different SGPRs can cost more than one that takes
+    a VGPR. Routing a wave-uniform bound through a "=v,v" asm makes it a vector
+    operand instead. Emits at most one v_mov.
+    """
+    op = llvm_dialect.InlineAsmOp(
+        res=ir.F32Type.get(),
+        operands_=[_raw(val)],
+        asm_string="",
+        # "0" ties the result to input operand 0. Untied ("=v,v") would allocate
+        # a fresh output register that the empty asm never writes, so the value
+        # would be garbage -- it still schedules identically, which makes the
+        # bug invisible to timing and visible only in the numeric check.
+        constraints="=v,0",
+        has_side_effects=False,
+        is_align_stack=False,
+    )
+    import flydsl.expr as _fx
+
+    return _fx.Float32(op.res)
+
+
 def _raw_lds_ptr(lds_base_idx, byte_offset):
     """Materialize an LLVM LDS pointer from a pre-extracted byte base."""
     from flydsl._mlir.dialects import llvm as _llvm
@@ -75,6 +100,12 @@ def _raw_lds_ptr(lds_base_idx, byte_offset):
     total_byte = _AV(lds_base_idx) + byte_offset
     addr_i32 = _raw(arith.index_cast(T.i32, total_byte))
     return _llvm.inttoptr(lds_ptr_ty, addr_i32)
+
+
+def lds_store_b16_raw(lds_base_idx, byte_offset, data_i32):
+    """Store the low 2 bytes of ``data_i32`` to LDS (raw LLVM ds_store_b16)."""
+    ptr_val = _raw_lds_ptr(lds_base_idx, byte_offset)
+    llvm_dialect.store(_raw(arith.trunci(T.i16, _raw(data_i32))), ptr_val)
 
 
 def lds_load_b128_raw(lds_base_idx, byte_offset):
@@ -149,6 +180,26 @@ def fmin_f32(a, b):
     return _fx.Float32(arith.minnumf(_raw(a), _raw(b)))
 
 
+def htanh_f32(x):
+    """tanh in one gfx1250 ``v_tanh_f32`` (TRANS unit, same rate as exp2/rcp)."""
+    import flydsl.expr as _fx
+
+    return _fx.Float32(
+        llvm_dialect.call_intrinsic(T.f32, "llvm.amdgcn.tanh.f32", [_raw(x)], [], [])
+    )
+
+
+def hfma_f32(a, b, c):
+    """a*b + c in one ``v_fma_f32`` (no fast-math contraction needed)."""
+    import flydsl.expr as _fx
+
+    return _fx.Float32(
+        llvm_dialect.call_intrinsic(
+            T.f32, "llvm.fma.f32", [_raw(a), _raw(b), _raw(c)], [], []
+        )
+    )
+
+
 def fclamp_f32(x, lo, hi):
     """Scalar f32 clamp via v_med3_num_f32."""
     import flydsl.expr as _fx
@@ -156,13 +207,27 @@ def fclamp_f32(x, lo, hi):
     return _fx.Float32(rocdl.fmed3(T.f32, _raw(x), _raw(lo), _raw(hi)))
 
 
-def fused_silu_swiglu_elem(g, u, *, swiglu, limit_f32, neg_limit_f32):
-    """One (gate, up) pair -> fused silu or swiglu scalar (gpt-oss clamp)."""
+def fused_silu_swiglu_elem(g, u, *, swiglu, limit_f32, neg_limit_f32, has_limit=True):
+    """One (gate, up) pair -> fused silu or swiglu scalar (gpt-oss clamp).
+
+    ``has_limit=False`` drops the clamp entirely. The limit is a runtime kernel
+    argument, so an infinite one (plain silu, where the gpt-oss clamp does not
+    apply) cannot be folded by the backend: it still costs a v_med3 for ``u``
+    and a v_min for ``g`` -- plus, because ``llvm.minnum`` must quiet sNaN in
+    IEEE mode, a v_max(g,g) canonicalisation. Three dead VALU ops and three dead
+    live values per element. The caller knows the limit at build time, so hoist
+    the decision there.
+    """
     import flydsl.expr as _fx
 
     _one = _fx.Float32(1.0)
-    g = fmin_f32(g, limit_f32)
-    u = fclamp_f32(u, neg_limit_f32, limit_f32)
+    if has_limit:
+        # v_med3 rather than fmin_f32: a two-sided clamp is one instruction and
+        # needs no NaN-quieting canonicalisation, so the gate costs the same as
+        # the up operand instead of twice as much. -FLT_MAX is exact here -- the
+        # gate clamp is one-sided and every finite input is >= -FLT_MAX.
+        g = fclamp_f32(g, _fx.Float32(-3.4028234663852886e38), limit_f32)
+        u = fclamp_f32(u, neg_limit_f32, limit_f32)
     if swiglu:
         nlog2e = _fx.Float32(-1.702 * LOG2E)
         exp_val = _fx.Float32(rocdl.exp2(T.f32, _raw(g * nlog2e)))
@@ -293,7 +358,19 @@ def batched_situv2(pairs, *, consts, range_constexpr):
     return results
 
 
-def batched_silu_swiglu(pairs, *, swiglu, limit_f32, neg_limit_f32, range_constexpr):
+def batched_silu_swiglu(
+    pairs,
+    *,
+    swiglu,
+    limit_f32,
+    neg_limit_f32,
+    range_constexpr,
+    barriers=True,
+    has_limit=True,
+    use_hw_tanh=False,
+    late_u_clamp=False,
+    gate_lo_f32=None,
+):
     """Batched silu/swiglu with pipelined exp2/rcp for better TRANS utilisation.
 
     Args:
@@ -301,6 +378,10 @@ def batched_silu_swiglu(pairs, *, swiglu, limit_f32, neg_limit_f32, range_conste
         swiglu: True for swiglu, False for silu.
         limit_f32, neg_limit_f32: clamp bounds.
         range_constexpr: the FlyDSL ``range_constexpr`` helper.
+        barriers: keep the sched_barrier walls between stages.
+        has_limit: False elides the clamp (an infinite limit is a no-op the
+            backend cannot fold, since the limit is a runtime argument).
+        use_hw_tanh: evaluate the sigmoid on v_tanh_f32 instead of exp2+rcp.
 
     Returns:
         list of activated f32 values, same length as *pairs*.
@@ -308,37 +389,108 @@ def batched_silu_swiglu(pairs, *, swiglu, limit_f32, neg_limit_f32, range_conste
     import flydsl.expr as _fx
 
     _one = _fx.Float32(1.0)
+    _half = _fx.Float32(0.5)
     nlog2e = _fx.Float32((-1.702 * LOG2E) if swiglu else (-LOG2E))
+    # tanh argument is c*g/2 for sigmoid(c*g); c is 1.702 for swiglu, 1 for silu.
+    scale_is_one = not swiglu
+    _tanh_arg_mul = _fx.Float32(1.702)
     N = len(pairs)
-    # Stage 1: clamp + exp2
+    # Stage 1: clamp + exp2. The clamp is skipped outright when the caller knows
+    # the limit is infinite -- see fused_silu_swiglu_elem for why the backend
+    # cannot do that itself. When it is kept, both operands go through v_med3:
+    # a one-sided fmin costs an extra v_max(x,x) to quiet sNaN under IEEE mode,
+    # and -FLT_MAX is an exact lower bound for the gate.
     gs, us, exp_vals = [], [], []
-    for i in range_constexpr(N):
-        g = fmin_f32(pairs[i][0], limit_f32)
-        u = fclamp_f32(pairs[i][1], neg_limit_f32, limit_f32)
-        gs.append(g)
-        us.append(u)
-    rocdl.sched_barrier(0)
+    if has_limit:
+        # The gate clamp is one-sided, so its lower bound is -FLT_MAX. As a
+        # Python constant that lands as a 32-bit LITERAL in every v_med3
+        # (0xff7fffff), making each one a 12-byte encoding instead of 8 -- 256
+        # of them per epilogue pass. Callers should hand in an SGPR-resident
+        # copy (see make_sgpr_opaque) so the operand is a scalar register.
+        neg_flt_max = (
+            _fx.Float32(-3.4028234663852886e38) if gate_lo_f32 is None else gate_lo_f32
+        )
+        for i in range_constexpr(N):
+            gs.append(fclamp_f32(pairs[i][0], neg_flt_max, limit_f32))
+        if late_u_clamp:
+            # Clamp the up operand at its consumer, not here. It is not needed
+            # until the final multiply, and computing it up front keeps N extra
+            # values live across the whole TRANS stage on a kernel that already
+            # runs at 1008 VGPRs. The raw accumulator it is derived from is live
+            # over that span either way, so this is a strict reduction.
+            us = None
+        else:
+            for i in range_constexpr(N):
+                us.append(fclamp_f32(pairs[i][1], neg_limit_f32, limit_f32))
+    else:
+        for i in range_constexpr(N):
+            gs.append(pairs[i][0])
+            us.append(pairs[i][1])
+
+    def _u(i):
+        if us is None:
+            return fclamp_f32(pairs[i][1], neg_limit_f32, limit_f32)
+        return us[i]
+    if use_hw_tanh:
+        # g*sigmoid(c*g) == m*(1 + tanh(c*m)) with m = g/2, because
+        # sigmoid(z) = (1 + tanh(z/2))/2. gfx1250 has v_tanh_f32 on the same
+        # TRANS unit as exp2/rcp, so this trades the exp2 + add + rcp chain
+        # (two TRANS ops and a serial dependency between them) for a single
+        # tanh feeding one v_fma -- half the TRANS traffic and half the
+        # TRANS-to-TRANS latency per element. The error shows up only where
+        # 1+tanh cancels (large negative g, where silu is ~1e-8 anyway) and is
+        # far below the MXFP4 quantisation this feeds.
+        ms, targs = [], []
+        for i in range_constexpr(N):
+            m = gs[i] * _half
+            ms.append(m)
+            targs.append(m if scale_is_one else m * _tanh_arg_mul)
+        if barriers:
+            rocdl.sched_barrier(0)
+        tanh_vals = []
+        for i in range_constexpr(N):
+            tanh_vals.append(htanh_f32(targs[i]))
+        if barriers:
+            rocdl.sched_barrier(0)
+        gsig_vals = []
+        for i in range_constexpr(N):
+            gsig_vals.append(hfma_f32(ms[i], tanh_vals[i], ms[i]))
+        if barriers:
+            rocdl.sched_barrier(0)
+        results = []
+        for i in range_constexpr(N):
+            if swiglu:
+                results.append(gsig_vals[i] * (_u(i) + _one))
+            else:
+                results.append(gsig_vals[i] * _u(i))
+        return results
+
+    if barriers:
+        rocdl.sched_barrier(0)
     for i in range_constexpr(N):
         exp_val = _fx.Float32(rocdl.exp2(T.f32, _raw(gs[i] * nlog2e)))
         exp_vals.append(exp_val)
     # Stage 2a: add 1+exp
-    rocdl.sched_barrier(0)
+    if barriers:
+        rocdl.sched_barrier(0)
     sum_vals = []
     for i in range_constexpr(N):
         sum_vals.append(_one + exp_vals[i])
     # Stage 2b: rcp
-    rocdl.sched_barrier(0)
+    if barriers:
+        rocdl.sched_barrier(0)
     rcp_vals = []
     for i in range_constexpr(N):
         rcp_vals.append(_fx.Float32(rocdl.rcp(T.f32, sum_vals[i])))
     # Stage 3: final mul
-    rocdl.sched_barrier(0)
+    if barriers:
+        rocdl.sched_barrier(0)
     results = []
     for i in range_constexpr(N):
         if swiglu:
-            results.append(gs[i] * rcp_vals[i] * (us[i] + _one))
+            results.append(gs[i] * rcp_vals[i] * (_u(i) + _one))
         else:
-            results.append(gs[i] * rcp_vals[i] * us[i])
+            results.append(gs[i] * rcp_vals[i] * _u(i))
     return results
 
 
@@ -353,9 +505,11 @@ __all__ = [
     "fused_situv2_elem",
     "lds_load_b32_raw",
     "lds_load_b128_raw",
+    "lds_store_b16_raw",
     "lds_store_b128_raw",
     "make_lds_copy_ops",
     "make_sgpr_opaque",
+    "make_vgpr_opaque",
     "pipeline_fence",
     "pipeline_fence_signal",
     "pipeline_fence_wait",

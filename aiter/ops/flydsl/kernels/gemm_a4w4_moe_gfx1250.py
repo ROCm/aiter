@@ -43,9 +43,15 @@ from flydsl.utils.smem_allocator import check_smem_capacity
 from aiter.utility.mx_types import MxDtypeInt as MxDtype
 
 from .gemm_common_gfx1250 import (
+    LOG2E,
+    lds_store_b16_raw,
+    make_sgpr_opaque,
+    make_vgpr_opaque,
     batched_silu_swiglu,
     batched_situv2,
     fused_silu_swiglu_elem,
+    fclamp_f32,
+    fmin_f32,
     fused_situv2_elem,
     make_lds_copy_ops,
     pipeline_fence,
@@ -68,6 +74,60 @@ from .tensor_shim import (
 # the quadrant plan, the seed banks and the planar LDS arena are all sized by it.
 SUPPORTED_PROFILE = (256, 256, 256, 2, 2, 4)
 SUPPORTED_CLUSTER = (4, 4)
+
+# PERF PROBE ONLY -- a bitmask of epilogue ablations. Every non-zero value
+# produces numerically WRONG output; must stay 0 outside a probe. Each bit
+# replaces one instruction class with something cheaper that yields the SAME
+# number of live values, so nothing downstream is dead-code-eliminated and the
+# A/B attributes only that class. Bits compose.
+#   1  drop the gpt-oss clamp (2 v_med3 per output value)
+#   2  drop the sigmoid (mul 0.5 + v_tanh + v_fma); keep clamp and the *u mul
+#   4  drop the amax / e8m0 block scale (constant scale instead)
+#   8  drop the cross-lane peer fetch (v_permlanex16, duplicate own instead)
+_EPI_PROBE = 0
+
+# Exchange the kgrp peer's half of each pk8 group as 2 packed bf16 dwords
+# instead of 4 loose f32 lanes -- see the comment at the pack site.
+_EPI_PACK_BF16_XCHG = True
+# Clamp the up operand at the final multiply instead of alongside the gate, so
+# it is not live across the TRANS stage.
+_EPI_LATE_U_CLAMP = False
+# Hold the clamp bounds in VGPRs rather than SGPRs/literals: a VOP3 v_med3 that
+# reads two different SGPRs pays for the narrow scalar operand port.
+_EPI_CLAMP_VGPR = True
+# Store each half-wave's own 2 bytes of fp4 instead of assembling a 4-byte dword
+# across the kgrp pair -- removes the pack's cross-lane shuffles entirely.
+_EPI_PACK_B16_STORE = False
+
+# Epilogue activation scheduling. All numerics-preserving: the activation is
+# elementwise, so batch width only changes instruction scheduling.
+#   _EPI_ACT_BLKS    -- MX blocks activated per batch (16 values per lane each).
+#                       Must divide N_MX_BLKS.
+#   _EPI_ACT_BARRIERS -- keep the sched_barrier walls between the activation's
+#                       clamp / tanh / fma / mul stages. Measured inside the
+#                       noise either way (649.8 off vs 653.2 on).
+#
+# The best width depends on how long the TRANS dependency chain is, and it
+# INVERTS between the two formulations (gemm1 us, --iters 128, const-init):
+#
+#              16 vals   32 vals   64 vals
+#   exp2+rcp   1044.7     796.8      --
+#   v_tanh      645.6     655.1     654.5
+#
+# With two serial TRANS ops per element there is nothing to cover the latency --
+# this kernel is 1008 VGPRs, one wave per SIMD, so no other wave is resident --
+# and narrow batching is catastrophic. With one TRANS op the chain is short
+# enough that fewer live values beats more ILP, and >= 32 is flat. Do not
+# re-tune one of these knobs without re-checking the other.
+_EPI_ACT_BLKS = 1
+_EPI_ACT_BARRIERS = True
+# Evaluate g*sigmoid(g) as m*(1+tanh(m)) on gfx1250's v_tanh_f32 instead of the
+# exp2 -> add -> rcp chain: one TRANS op per element instead of two.
+_EPI_HW_TANH = True
+# 16-row blocks whose activation is issued as one batch. Batch width is the
+# dominant epilogue knob (see the comment at the loop) -- it must divide
+# wmma_m_rep (8 here).
+_EPI_ACT_WM = 1
 
 
 def supports(tile_m, tile_n, tile_k, m_warp, n_warp, num_buffers):
@@ -134,6 +194,7 @@ def launch_gemm_a4w4_moe(
     cluster_n: Constexpr[int] = 4,
     f32_situ_beta: fx.Float32 = 1.0,
     f32_situ_linear_beta: fx.Float32 = 1.0,
+    act_has_limit: Constexpr[int] = 1,
 ):
     """Launch the grouped contiguous-M a4w4 MoE GEMM on the quadrant pipeline."""
     assert supports(
@@ -216,10 +277,19 @@ def launch_gemm_a4w4_moe(
     _act = f"_act{stage1_act}" if stage1_act else ""
     _qout = f"_q{stage1_quant_out}r{quant_wmma_rep}" if stage1_quant_out else ""
     _bias = "_bias" if has_bias else ""
+    _probe = f"_probe{_EPI_PROBE}" if _EPI_PROBE else ""
+    _epi = f"_eb{_EPI_ACT_BLKS}{'' if _EPI_ACT_BARRIERS else 'nb'}"
+    _epi += "_th" if _EPI_HW_TANH else ""
+    _epi += f"_wm{_EPI_ACT_WM}"
+    _epi += "_bx" if _EPI_PACK_BF16_XCHG else ""
+    _epi += "_lu" if _EPI_LATE_U_CLAMP else ""
+    _epi += "_cv2" if _EPI_CLAMP_VGPR else ""
+    _epi += "_b16" if _EPI_PACK_B16_STORE else ""
+    _epi += "" if act_has_limit else "_nolim"
     _kname = (
         f"a4w4_quad_t{tile_m}x{tile_n}x{tile_k}_w{m_warp}x{n_warp}"
         f"_b{num_buffers}_K{K}_e{n_experts}"
-        f"{_act}{_bias}{_qout}_cl{cluster_m}x{cluster_n}"
+        f"{_act}{_bias}{_qout}_cl{cluster_m}x{cluster_n}{_probe}{_epi}"
     )
 
     @flyc.kernel(name=_kname, known_block_size=[block, 1, 1])
@@ -827,6 +897,17 @@ def launch_gemm_a4w4_moe(
 
             stC_idx = fx.Index(fx.ptrtoint(base_ptr))
             neg_limit = fx.Float32(0.0) - f32_swiglu_limit
+            # Clamp bounds are wave-uniform, so the backend parks them in SGPRs
+            # and every v_med3 then reads TWO different scalars through the
+            # narrow scalar operand port. Forcing them into VGPRs makes all 512
+            # med3 all-VGPR and is worth 28 us (604.7 -> 576.3).
+            if const_expr(_EPI_CLAMP_VGPR):
+                gate_lo = make_vgpr_opaque(fx.Float32(-3.4028234663852886e38))
+                clamp_hi = make_vgpr_opaque(f32_swiglu_limit)
+                clamp_lo = make_vgpr_opaque(neg_limit)
+            else:
+                gate_lo = None
+                clamp_hi, clamp_lo = f32_swiglu_limit, neg_limit
             is_swiglu = stage1_act == 2
             is_situv2 = stage1_act == 3
             situ_c = (
@@ -850,88 +931,238 @@ def launch_gemm_a4w4_moe(
                 QUANT_ROWS_PER_TILE = quant_wmma_rep * 16
                 QRPT_LOG2 = int(math.log2(QUANT_ROWS_PER_TILE))
                 N_MX_BLKS = output_n_rep // WN_PER_MX_BLOCK
-                for wm in range_constexpr(wmma_m_rep):
+                # Rows are batched _EPI_ACT_WM 16-row blocks at a time. The
+                # activation is elementwise, so batch width is purely a
+                # scheduling knob -- but at 1008 VGPRs this kernel runs one wave
+                # per SIMD, so nothing else is resident to hide TRANS latency
+                # and the epilogue is latency-bound: measured 653 us at 32
+                # values per batch vs 958 us at 16, with byte-identical VGPR
+                # count and instruction count. Widen until it stops paying.
+                WM_G = _EPI_ACT_WM
+                for wm0 in range_constexpr(wmma_m_rep // WM_G):
                     # A 16-row block entirely past this expert's rows is
                     # OOB-clamped away at the store, so skip its work. Wave
-                    # uniform: one scalar branch, not per-lane masking.
-                    if wmb + wm * 16 < mn_oob:
-                        row_rel = wmb + wm * 16 + lane16
-                        row_i32 = fx.Int32(blk_m + row_rel)
-                        scale_tile = row_i32 >> QRPT_LOG2
-                        row_in_tile = row_i32 & (QUANT_ROWS_PER_TILE - 1)
-                        wmma_row = row_in_tile >> 4
-                        scale_lane = row_in_tile & 15
+                    # uniform: one scalar branch, not per-lane masking. Rows
+                    # increase with wm, so testing the group's first row skips
+                    # only groups that are wholly out of range.
+                    if wmb + wm0 * WM_G * 16 < mn_oob:
+                        rows = []
+                        for wi in range_constexpr(WM_G):
+                            wm = wm0 * WM_G + wi
+                            row_rel = wmb + wm * 16 + lane16
+                            row_i32 = fx.Int32(blk_m + row_rel)
+                            rows.append(
+                                (
+                                    wm,
+                                    row_rel,
+                                    row_i32 >> QRPT_LOG2,
+                                    (row_i32 & (QUANT_ROWS_PER_TILE - 1)) >> 4,
+                                    row_i32 & (QUANT_ROWS_PER_TILE - 1) & 15,
+                                )
+                            )
 
-                        e8m0_bytes = []
-                        mx_blk_is = []
-                        for mx_blk in range_constexpr(N_MX_BLKS):
+                        e8m0_bytes = {}
+                        mx_blk_is = {}
+                        for grp in range_constexpr(N_MX_BLKS // _EPI_ACT_BLKS):
                             pairs = []
-                            for sub_wn in range_constexpr(WN_PER_MX_BLOCK):
-                                wn = mx_blk * WN_PER_MX_BLOCK + sub_wn
-                                acc = Vec(accs[wm * output_n_rep + wn])
-                                for p in range_constexpr(4):
-                                    pairs.append((acc[2 * p], acc[2 * p + 1]))
+                            for wi in range_constexpr(WM_G):
+                                wm = wm0 * WM_G + wi
+                                for b in range_constexpr(_EPI_ACT_BLKS):
+                                    mx_blk = grp * _EPI_ACT_BLKS + b
+                                    for sub_wn in range_constexpr(WN_PER_MX_BLOCK):
+                                        wn = mx_blk * WN_PER_MX_BLOCK + sub_wn
+                                        acc = Vec(accs[wm * output_n_rep + wn])
+                                        for p in range_constexpr(4):
+                                            pairs.append((acc[2 * p], acc[2 * p + 1]))
 
-                            if const_expr(is_situv2):
-                                all_vals = batched_situv2(
+                            _clamp_on = bool(act_has_limit) and not (_EPI_PROBE & 1)
+                            if const_expr(_EPI_PROBE & 2):
+                                # PROBE: keep the clamp and the final *u, drop
+                                # only mul-0.5 / v_tanh / v_fma. Same value
+                                # count, so the pack path is untouched.
+                                if const_expr(_clamp_on):
+                                    batch_vals = [
+                                        fclamp_f32(
+                                            pairs[i][0], neg_limit, f32_swiglu_limit
+                                        )
+                                        * fclamp_f32(
+                                            pairs[i][1], neg_limit, f32_swiglu_limit
+                                        )
+                                        for i in range_constexpr(len(pairs))
+                                    ]
+                                else:
+                                    batch_vals = [
+                                        pairs[i][0] * pairs[i][1]
+                                        for i in range_constexpr(len(pairs))
+                                    ]
+                            elif const_expr(is_situv2):
+                                batch_vals = batched_situv2(
                                     pairs,
                                     consts=situ_c,
                                     range_constexpr=range_constexpr,
                                 )
                             else:
-                                all_vals = batched_silu_swiglu(
+                                batch_vals = batched_silu_swiglu(
                                     pairs,
                                     swiglu=is_swiglu,
-                                    limit_f32=f32_swiglu_limit,
-                                    neg_limit_f32=neg_limit,
+                                    limit_f32=clamp_hi,
+                                    neg_limit_f32=clamp_lo,
                                     range_constexpr=range_constexpr,
+                                    barriers=_EPI_ACT_BARRIERS,
+                                    has_limit=_clamp_on,
+                                    use_hw_tanh=_EPI_HW_TANH,
+                                    late_u_clamp=_EPI_LATE_U_CLAMP,
+                                    gate_lo_f32=gate_lo,
                                 )
 
-                            scale_f32, e8m0_byte = emit_amax_e8m0_native_scale(
-                                all_vals, wave_size=WAVE, dtype=MxDtype.FP4_E2M1
-                            )
-                            mx_col = blk_n + wnb + mx_blk * WN_PER_MX_BLOCK * 16
-                            e8m0_bytes.append(e8m0_byte)
-                            mx_blk_is.append(fx.Int32(mx_col) >> 6)
-
-                            for sub_wn in range_constexpr(WN_PER_MX_BLOCK):
-                                wn = mx_blk * WN_PER_MX_BLOCK + sub_wn
-                                local_vals = all_vals[sub_wn * 4 : sub_wn * 4 + 4]
-                                peer_vals = [
-                                    fx.Float32(value).shuffle_xor(16, WAVE)
-                                    for value in local_vals
-                                ]
-                                src = Vec.from_elements(
-                                    local_vals + peer_vals, fx.Float32
-                                )
-                                packed_i32 = emit_cvt_scalef32_pk8_fp4_bf16(
-                                    src.to(fx.BFloat16).ir_value(),
-                                    scale_f32,
-                                    i32_ty=T.i32,
-                                )
-                                if kgrp == 0:
-                                    col_fp4 = (wnb + wn * 16) // 4
-                                    lds_store_b32(
-                                        stC_idx,
-                                        row_rel * STORE_N + col_fp4,
-                                        Vec.from_elements([packed_i32], fx.Int32),
+                            vals_per_blk = WN_PER_MX_BLOCK * 4
+                            for wi in range_constexpr(WM_G):
+                                wm = wm0 * WM_G + wi
+                                row_rel = rows[wi][1]
+                                for b in range_constexpr(_EPI_ACT_BLKS):
+                                    mx_blk = grp * _EPI_ACT_BLKS + b
+                                    base = (wi * _EPI_ACT_BLKS + b) * vals_per_blk
+                                    all_vals = batch_vals[base : base + vals_per_blk]
+                                    if const_expr(_EPI_PROBE & 4):
+                                        # PROBE: constant block scale -- drops
+                                        # the |.| max tree, its peer shuffle and
+                                        # the e8m0 assembly, keeps both uses.
+                                        scale_f32 = fx.Float32(1.0)
+                                        e8m0_byte = arith.trunci(
+                                            T.i8, fx.Int32(127).ir_value()
+                                        )
+                                    else:
+                                        scale_f32, e8m0_byte = (
+                                            emit_amax_e8m0_native_scale(
+                                                all_vals,
+                                                wave_size=WAVE,
+                                                dtype=MxDtype.FP4_E2M1,
+                                            )
+                                        )
+                                    mx_col = (
+                                        blk_n + wnb + mx_blk * WN_PER_MX_BLOCK * 16
                                     )
+                                    e8m0_bytes[(wi, mx_blk)] = e8m0_byte
+                                    mx_blk_is[(wi, mx_blk)] = fx.Int32(mx_col) >> 6
 
-                        # Preshuffled e8m0 scale: one branch per wm.
-                        if row_rel < mn_oob and is_kgrp0:
-                            for mx_blk in range_constexpr(N_MX_BLKS):
-                                scale_dw = mx_blk_is[mx_blk] >> 2
-                                byte_in_dw = mx_blk_is[mx_blk] & 3
-                                dst_byte = (
-                                    (
-                                        (scale_tile * q_dst_scale_dwpr + scale_dw)
-                                        * quant_wmma_rep
-                                        + wmma_row
+                                    for sub_wn in range_constexpr(WN_PER_MX_BLOCK):
+                                        wn = mx_blk * WN_PER_MX_BLOCK + sub_wn
+                                        local_vals = all_vals[
+                                            sub_wn * 4 : sub_wn * 4 + 4
+                                        ]
+                                        if const_expr(_EPI_PACK_B16_STORE):
+                                            # Each half-wave stores only its own
+                                            # 4 fp4 values (2 bytes), so no peer
+                                            # data is needed at all: the pk8 is
+                                            # fed our 2 dwords twice and only its
+                                            # low 16 bits are kept. Trades 2
+                                            # v_permlanex16 per pk8 -- the most
+                                            # expensive op in the epilogue -- for
+                                            # a narrower store from all 32 lanes
+                                            # instead of a b32 from half of them.
+                                            own_dw = (
+                                                Vec.from_elements(
+                                                    local_vals, fx.Float32
+                                                )
+                                                .to(fx.BFloat16)
+                                                .bitcast(fx.Int32)
+                                            )
+                                            src = Vec.from_elements(
+                                                [
+                                                    own_dw[0],
+                                                    own_dw[1],
+                                                    own_dw[0],
+                                                    own_dw[1],
+                                                ],
+                                                fx.Int32,
+                                            ).bitcast(fx.BFloat16)
+                                        elif const_expr(_EPI_PACK_BF16_XCHG):
+                                            # Convert to bf16 BEFORE the peer
+                                            # exchange, not after. The pk8 pack
+                                            # wants 8 bf16 = 4 dwords, of which
+                                            # 4 lanes' worth are ours and 4 the
+                                            # kgrp peer's. Exchanging the two
+                                            # already-packed dwords costs 2
+                                            # v_permlanex16 instead of 4 on
+                                            # loose f32, and each lane converts
+                                            # only its own 4 values instead of
+                                            # all 8: half the cross-lane traffic
+                                            # and half the v_cvt_pk_bf16_f32.
+                                            own_dw = (
+                                                Vec.from_elements(
+                                                    local_vals, fx.Float32
+                                                )
+                                                .to(fx.BFloat16)
+                                                .bitcast(fx.Int32)
+                                            )
+                                            if const_expr(_EPI_PROBE & 8):
+                                                peer_dw = own_dw  # PROBE
+                                            else:
+                                                peer_dw = own_dw.shuffle_xor(16, WAVE)
+                                            src = Vec.from_elements(
+                                                [
+                                                    own_dw[0],
+                                                    own_dw[1],
+                                                    peer_dw[0],
+                                                    peer_dw[1],
+                                                ],
+                                                fx.Int32,
+                                            ).bitcast(fx.BFloat16)
+                                        else:
+                                            if const_expr(_EPI_PROBE & 8):
+                                                peer_vals = list(local_vals)  # PROBE
+                                            else:
+                                                peer_vals = [
+                                                    fx.Float32(value).shuffle_xor(
+                                                        16, WAVE
+                                                    )
+                                                    for value in local_vals
+                                                ]
+                                            src = Vec.from_elements(
+                                                local_vals + peer_vals, fx.Float32
+                                            ).to(fx.BFloat16)
+                                        packed_i32 = emit_cvt_scalef32_pk8_fp4_bf16(
+                                            src.ir_value(),
+                                            scale_f32,
+                                            i32_ty=T.i32,
+                                        )
+                                        col_fp4 = (wnb + wn * 16) // 4
+                                        if const_expr(_EPI_PACK_B16_STORE):
+                                            lds_store_b16_raw(
+                                                stC_idx,
+                                                fx.Int32(row_rel * STORE_N + col_fp4)
+                                                + fx.Int32(kgrp) * 2,
+                                                packed_i32,
+                                            )
+                                        elif kgrp == 0:
+                                            lds_store_b32(
+                                                stC_idx,
+                                                row_rel * STORE_N + col_fp4,
+                                                Vec.from_elements(
+                                                    [packed_i32], fx.Int32
+                                                ),
+                                            )
+
+                        # Preshuffled e8m0 scale: one branch per 16-row block.
+                        for wi in range_constexpr(WM_G):
+                            _, row_rel, scale_tile, wmma_row, scale_lane = rows[wi]
+                            if row_rel < mn_oob and is_kgrp0:
+                                for mx_blk in range_constexpr(N_MX_BLKS):
+                                    blk_i = mx_blk_is[(wi, mx_blk)]
+                                    scale_dw = blk_i >> 2
+                                    byte_in_dw = blk_i & 3
+                                    dst_byte = (
+                                        (
+                                            (scale_tile * q_dst_scale_dwpr + scale_dw)
+                                            * quant_wmma_rep
+                                            + wmma_row
+                                        )
+                                        * 16
+                                        + scale_lane
+                                    ) * 4 + byte_in_dw
+                                    fx.ptr_store(
+                                        e8m0_bytes[(wi, mx_blk)], scale_ptr + dst_byte
                                     )
-                                    * 16
-                                    + scale_lane
-                                ) * 4 + byte_in_dw
-                                fx.ptr_store(e8m0_bytes[mx_blk], scale_ptr + dst_byte)
             else:
                 if const_expr(has_bias):
                     bias_ptr_type = fx.PointerType.get(
@@ -968,6 +1199,7 @@ def launch_gemm_a4w4_moe(
                                         swiglu=is_swiglu,
                                         limit_f32=f32_swiglu_limit,
                                         neg_limit_f32=neg_limit,
+                                        has_limit=bool(act_has_limit),
                                     )
                                     for p in range_constexpr(4)
                                 ]

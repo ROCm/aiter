@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import math
 import os
 
 import torch
@@ -215,6 +216,9 @@ def flydsl_grouped_gemm_a8w4_masked(
             cluster_n_2d,
             f32_situ_beta=float(situ_beta),
             f32_situ_linear_beta=float(situ_linear_beta),
+            # An infinite limit makes the gpt-oss clamp a no-op, but it arrives
+            # as a runtime kernel argument, so only the host can fold it away.
+            act_has_limit=int(math.isfinite(float(swiglu_limit))),
         )
         return out
 
