@@ -36,35 +36,9 @@ AITER_FLYDSL_MOE_EXPERT_SCHEDULING_MODE = bool(
 )
 
 
-def ptr_rsrc(ptr, num_records_bytes=None):
+def ptr_rsrc(ptr):
     """Convert an fx.Pointer kernel arg to a buffer resource for buffer_load/store."""
-    return buffer_ops.create_buffer_resource_from_addr(
-        fx.Int64(ptrtoint(ptr)), num_records_bytes=num_records_bytes
-    )
-
-
-def ptr_buf_scalar(ptr, num_records_bytes=None):
-    """Return a wave-uniform 32-bit ``s.buffer.load`` accessor.
-
-    The returned callable accepts an element offset and a width of one or four
-    dwords. Values are returned as raw i32 bits so callers can either consume
-    integer data directly or bitcast floating-point data without routing the
-    load through per-lane VGPR addressing. ``ptr`` may be either an opaque
-    ``fx.Pointer`` or a shaped ``fx.Tensor`` kernel argument.
-    """
-    if isinstance(ptr, fx.Pointer):
-        rsrc = ptr_rsrc(ptr, num_records_bytes=num_records_bytes)
-    else:
-        rsrc = buffer_ops.create_buffer_resource(
-            ptr,
-            max_size=num_records_bytes is None,
-            num_records_bytes=num_records_bytes,
-        )
-
-    def load(offset=0, vec_width=1):
-        return buffer_ops.buffer_load(rsrc, offset, vec_width=vec_width, is_scalar=True)
-
-    return load
+    return buffer_ops.create_buffer_resource_from_addr(fx.Int64(ptrtoint(ptr)))
 
 
 _BUF_COPY_ATOM = {
@@ -84,11 +58,12 @@ BUF_VIEW_MAX_ELEMS = 0xFFFFFFFF
 def ptr_buf_tensor(
     ptr, elem=fx.Int32, n=BUF_VIEW_MAX_ELEMS, unit_elems=1, num_records_bytes=None
 ):
-    """Buffer-resource (V#) view of *ptr*, so ``t[i]`` / ``fx.slice`` index it.
+    """Buffer-resource (V#) view, so ``t[i]`` / ``fx.slice`` index it.
 
-    Keeps the addressing `buffer_ops` used: descriptor in SGPRs, 32-bit voffset
-    per access. Indexing a plain typed pointer instead builds a full 64-bit
-    address in VGPRs on every access.
+    ``ptr`` may be an opaque ``fx.Pointer`` or a shaped ``fx.Tensor`` kernel
+    argument. Keeps the addressing `buffer_ops` used: descriptor in SGPRs,
+    32-bit voffset per access. Indexing a plain typed pointer instead builds a
+    full 64-bit address in VGPRs on every access.
 
     ``unit_elems`` sets the access width and hence the rank:
       1  -> flat ``(n,)``; ``t[i]`` is one element. No atom, no fragment.
@@ -106,6 +81,14 @@ def ptr_buf_tensor(
         if unit_elems == 1
         else fx.make_layout((n, unit_elems), (unit_elems, 1))
     )
+    if isinstance(ptr, fx.Tensor):
+        tensor = fx.rocdl.make_buffer_tensor(
+            ptr,
+            max_size=num_records_bytes is None,
+            num_records_bytes=num_records_bytes,
+        )
+        return fx.Tensor(fx.make_view(fx.get_iter(tensor), layout))
+
     pt = fx.PointerType.get(
         elem.ir_type,
         address_space=fx.AddressSpace.Global,
