@@ -4,6 +4,7 @@
 import pytest
 import torch
 
+import aiter.ops.triton.fusions.attn_res as attn_res_module
 from aiter.ops.triton.fusions.attn_res import attn_res_fwd, attn_res_gate
 from aiter.ops.triton.utils.types import get_fp8_e4m3_dtype
 
@@ -414,9 +415,14 @@ def _dequant_per_token(y_fp8, y_scale):
 
 def run_torch_per_token_quant(x, fp8_dtype):
     """Reference for the fused per-token FP8 quant, in aiter's convention
-    (``_dynamic_per_token_quant_fp8_i8_kernel``): one fp32 scale per row, taken
-    as ``amax / finfo(dtype).max``, applied as a reciprocal multiply."""
-    scale = x.float().abs().amax(-1, keepdim=True) / torch.finfo(fp8_dtype).max
+    (``absMax * inverted_DTYPE_MAX`` in csrc/kernels/quant_kernels.cu, i.e. what
+    ``get_hip_quant(QuantType.per_Token)`` emits): one fp32 scale per row, taken
+    as ``amax * (1 / finfo(dtype).max)``, applied as a reciprocal multiply.
+
+    torch computes the multiply and the divide identically here; the kernel does
+    not, which is why it spells this one out (see ``QUANT_FP8`` in the kernel).
+    """
+    scale = x.float().abs().amax(-1, keepdim=True) * (1.0 / torch.finfo(fp8_dtype).max)
     return (x.float() * (1.0 / scale)).to(fp8_dtype), scale
 
 
@@ -484,15 +490,28 @@ def test_attn_res_gate_out_quant(B, with_add, close_block):
         torch.testing.assert_close(block_out, expected, atol=0, rtol=0)
 
 
-def test_attn_res_gate_out_quant_matches_unfused_quant():
+@pytest.mark.parametrize("N", [64, 512])
+def test_attn_res_gate_out_quant_matches_unfused_quant(N):
     """The fused quant is bit-identical to gate() followed by a separate
     per-token FP8 quant of its output.
 
     Run in fp32 so the unfused leg's intermediate is the kernel's own fp32
     result rather than a bf16 rounding of it; the two then have to agree
     exactly, which pins scale derivation and rounding, not just closeness.
+
+    This is also what keeps the kernel tied to the HIP per-token quant, which a
+    consumer runs on this same activation whenever the fold is off. That kernel
+    takes fp16/bf16 only, so it cannot be fed the fp32 tensor a bit-exact
+    comparison needs -- but it derives its scale by the identical reciprocal
+    multiply, so matching the torch reference below at rtol=0 matches it too.
+    Spelling the kernel's scale as a divide instead breaks this test: Triton
+    lowers an fp32 divide on AMD to a reciprocal plus refinement, which lands
+    about half the rows 1 ulp away from both torch and HIP.
+
+    ``N`` straddles ``_ATTN_RES_PREFILL_T``: the separated prefill path inlines its
+    own copy of the quant epilogue, so both have to be pinned.
     """
-    N, D, B = 64, 512, 3
+    D, B = 512, 3
     eps, dtype = 1e-6, torch.float32
     fp8_dtype = get_fp8_e4m3_dtype()
     prefix, block_residual, score_weight, _, _ = generate_attn_res_gate_inputs(
@@ -518,13 +537,46 @@ def test_attn_res_gate_out_quant_matches_unfused_quant():
 
     _qx, scale = run_torch_per_token_quant(y_fp32, fp8_dtype)
 
-    # The scale agrees to within one fp32 ulp rather than bit-exactly: Triton
-    # lowers the fp32 divide to a reciprocal plus refinement on AMD.
-    torch.testing.assert_close(y_scale, scale, atol=0.0, rtol=1e-6)
-    # Quantizing with the kernel's own scale takes that divide out of the
-    # comparison, leaving the rounding itself, which must match exactly.
+    # Bit-exact, not within-an-ulp: the kernel derives the scale by the same
+    # reciprocal multiply the reference does, so Triton's fp32 divide (which is
+    # a reciprocal plus refinement on AMD, and 1 ulp off) never enters.
+    torch.testing.assert_close(y_scale, scale, atol=0.0, rtol=0.0)
     qx = (y_fp32.float() * (1.0 / y_scale)).to(fp8_dtype)
     torch.testing.assert_close(y_fp8.float(), qx.float(), atol=0, rtol=0)
+
+
+# Straddles _ATTN_RES_PREFILL_T: the separated prefill path carries its own copy of
+# the quant epilogue, so the convention has to be asserted on both.
+@pytest.mark.parametrize("N", [8, 512])
+@pytest.mark.parametrize("close_block", [False, True])
+def test_attn_res_gate_out_quant_all_zero_row(N, close_block):
+    """An all-zero row gets scale 0 (the HIP convention) and quantizes to zeros.
+
+    The reciprocal of that scale is forced to 0 in the kernel; left as inf it
+    would store NaN, and a nonzero placeholder scale would disagree with every
+    other per-token quant in the tree on a row that occurs in real prefill
+    padding.
+    """
+    D, B = 256, 3
+    dtype, fp8_dtype = torch.bfloat16, get_fp8_e4m3_dtype()
+    prefix = torch.zeros(N, D, dtype=dtype, device="cuda")
+    block_residual = torch.zeros(N, B, D, dtype=dtype, device="cuda")
+    score_weight = torch.randn(D, dtype=dtype, device="cuda")
+    output_rms_weight = torch.randn(D, dtype=dtype, device="cuda")
+
+    out = attn_res_gate(
+        prefix,
+        block_residual,
+        score_weight,
+        1e-6,
+        output_rms_weight=output_rms_weight,
+        close_block=close_block,
+        out_quant_dtype=fp8_dtype,
+    )
+    y_fp8, y_scale = out[0]
+
+    assert torch.equal(y_scale, torch.zeros_like(y_scale))
+    assert torch.equal(y_fp8.float(), torch.zeros_like(y_fp8, dtype=torch.float32))
 
 
 def test_attn_res_gate_out_quant_requires_output_rms_weight():
@@ -540,6 +592,283 @@ def test_attn_res_gate_out_quant_requires_output_rms_weight():
             1e-6,
             out_quant_dtype=get_fp8_e4m3_dtype(),
         )
+
+
+def _gate_all_variants(prefix, block_residual, score_weight, orw, fp8_dtype):
+    """Every axis attn_res_gate keys its launch cache on, one call per setting.
+
+    Deliberately includes settings that do not change the result but DO change
+    the kernel Triton compiles: eps/out_eps/scale values (a scalar that happens
+    to be 1.0 specializes differently from one that does not), and an unaligned
+    prefix (which drops the 16-byte divisibility hint).
+    """
+    N, D = prefix.shape
+    add = torch.randn_like(prefix)
+    add2 = torch.randn_like(prefix)
+    # A row-sliced view: same shape and dtype, but offset off the 16-byte grid.
+    wide = torch.randn(N, D + 1, dtype=prefix.dtype, device=prefix.device)
+    unaligned = wide[:, 1:]
+    for kwargs in (
+        {},
+        {"add_hidden": add},
+        {"add_hidden": add, "add_hidden2": add2},
+        {"output_rms_weight": orw},
+        {"output_rms_weight": orw, "out_quant_dtype": fp8_dtype},
+        {"close_block": True},
+        {"add_hidden": add, "close_block": True},
+        {"output_rms_weight": orw, "out_quant_dtype": fp8_dtype, "close_block": True},
+        {"eps": 1.0},
+        {"output_rms_weight": orw, "output_rms_eps": 1.0},
+        {"scale": 0.8},
+        {"scale": 1.0},
+    ):
+        eps = kwargs.pop("eps", 1e-6)
+        add_hidden = kwargs.pop("add_hidden", None)
+        add_hidden2 = kwargs.pop("add_hidden2", None)
+        yield (
+            prefix,
+            block_residual,
+            score_weight,
+            eps,
+            add_hidden,
+            add_hidden2,
+        ), kwargs
+        yield (
+            unaligned,
+            block_residual,
+            score_weight,
+            eps,
+            add_hidden,
+            add_hidden2,
+        ), kwargs
+
+
+@pytest.mark.parametrize("B", [1, 8])
+@pytest.mark.parametrize("N", [1, 128])
+def test_attn_res_gate_launch_cache_matches_triton(monkeypatch, B, N):
+    """The cached launch must resolve to the kernel Triton itself would pick.
+
+    attn_res_gate skips Triton's per-launch argument specialization by caching
+    the resolved kernel under a key it derives itself (decode is host-bound, and
+    that specialization is the single largest cost in the launch). Getting the
+    key too coarse would silently run a kernel compiled for different arguments,
+    so the module can re-resolve through Triton on every hit and assert it got
+    the same object back; this turns that check on across the flag matrix.
+    """
+    monkeypatch.setattr(attn_res_module, "_LAUNCH_CACHE_VERIFY", True)
+    D = 256
+    dtype, fp8_dtype = torch.bfloat16, get_fp8_e4m3_dtype()
+    prefix, block_residual, score_weight, _, _ = generate_attn_res_gate_inputs(
+        N, D, B, dtype, with_add=False
+    )
+    orw = torch.randn(D, dtype=dtype, device="cuda")
+
+    for args, kwargs in _gate_all_variants(
+        prefix, block_residual, score_weight, orw, fp8_dtype
+    ):
+        # Twice: the first call populates the cache, the second is the hit that
+        # the verification actually checks.
+        attn_res_gate(*args, **kwargs)
+        attn_res_gate(*args, **kwargs)
+
+
+@pytest.mark.parametrize("close_block", [False, True])
+@pytest.mark.parametrize("quant", [False, True])
+def test_attn_res_gate_launch_cache_bit_identical(monkeypatch, quant, close_block):
+    """Cached and uncached launches must produce bit-identical results."""
+    N, D, B = 64, 256, 3
+    dtype, fp8_dtype = torch.bfloat16, get_fp8_e4m3_dtype()
+    prefix, block_residual, score_weight, add_hidden, _ = generate_attn_res_gate_inputs(
+        N, D, B, dtype, with_add=True
+    )
+    orw = torch.randn(D, dtype=dtype, device="cuda")
+    kwargs = dict(
+        output_rms_weight=orw,
+        output_rms_eps=1e-5,
+        close_block=close_block,
+        out_quant_dtype=fp8_dtype if quant else None,
+    )
+
+    def run():
+        return attn_res_gate(
+            prefix, block_residual, score_weight, 1e-6, add_hidden, **kwargs
+        )
+
+    monkeypatch.setattr(attn_res_module, "_LAUNCH_CACHE_ENABLED", False)
+    uncached = run()
+    monkeypatch.setattr(attn_res_module, "_LAUNCH_CACHE_ENABLED", True)
+    run()  # populate
+    cached = run()
+
+    def flat(out):
+        y = out[0]
+        tensors = list(y) if isinstance(y, tuple) else [y]
+        return tensors + [t for t in out[1:] if t is not None]
+
+    for a, b in zip(flat(uncached), flat(cached)):
+        torch.testing.assert_close(a.float(), b.float(), atol=0, rtol=0)
+
+
+def test_attn_res_gate_launch_cache_is_bounded_in_token_count():
+    """Token count must not be a cache axis, or decode would leak an entry a step.
+
+    N reaches the key only through the properties Triton specializes on
+    (16-divisibility, being 1, fitting in i32), not by value.
+    """
+    D, B = 256, 3
+    dtype = torch.bfloat16
+    attn_res_module._LAUNCH_CACHE.clear()
+    for N in range(17, 49):
+        prefix, block_residual, score_weight, _, _ = generate_attn_res_gate_inputs(
+            N, D, B, dtype, with_add=False
+        )
+        attn_res_gate(prefix, block_residual, score_weight, 1e-6)
+
+    entries = sum(len(v) for v in attn_res_module._LAUNCH_CACHE.values())
+    # N in [17, 48] spans both 16-divisibility classes and two launch-config
+    # buckets (<=64 vs the N<=8 bucket is not reached here), so a handful of
+    # entries is expected -- 32 would mean N leaked in by value.
+    assert entries <= 8, f"launch cache grew to {entries} entries over 32 token counts"
+
+
+def test_attn_res_separate_bl_table_matches_documented_buckets():
+    """Lock the tuned SEPARATE BL buckets, which key on the candidate count, not N.
+
+    The invariant the table encodes is that the separated loop must run at least
+    two iterations: BL = l2 // 2, capped at 4 by the register file. Every
+    measured loss sits at BL == l2, where the loop collapses to one iteration
+    and the wide tile buys registers with nothing to overlap. So a bucket that
+    drifts up to l2 is a real regression (-2% at B=4, -10% at B=8), not a
+    mistuning, and that is what these assertions pin.
+    """
+
+    def pick(tokens, l2, close_block=True):
+        return attn_res_module._pick_attn_res_separate_bl(tokens, l2, close_block)
+
+    mid = 4096  # inside the N range where BL>1 pays at all
+    assert pick(mid, 1) == 1
+    assert pick(mid, 2) == 1
+    assert pick(mid, 4) == 2
+    assert pick(mid, 8) == 4
+    assert pick(mid, 16) == 4  # capped, not 8
+    # BL>1 washes out above _ATTN_RES_SEPARATE_BL_MAX_T and turns into a ~3% loss.
+    assert pick(16384, 8) == 4
+    assert pick(16385, 8) == 1
+    assert pick(65536, 16) == 1
+    # The separated loop only covers L-1 rows, so BL must never exceed them.
+    assert pick(257, 1) == 1
+
+
+def test_attn_res_separate_bl_is_pinned_to_one_without_close_block():
+    """Without the block_out write, every BL>1 bucket has to collapse to 1.
+
+    This is the whole table's precondition, not a corner case: block_out is
+    roughly half the kernel's traffic at B=8, and with it gone the same buckets
+    swing from neutral to a 1.4-1.6x *regression* (BL=1 over BL=4 measures
+    0.60-0.68 at B=4..15). Swept with close_block off over the canonical grid
+    plus N=65536, BL=1 won every cell, so there is no second table to consult --
+    which is exactly why an accidental un-gating would be easy to miss.
+    """
+    pick = attn_res_module._pick_attn_res_separate_bl
+    for tokens in (257, 2048, 4096, 16384, 65536):
+        for l2 in (1, 2, 4, 8, 16):
+            assert pick(tokens, l2, False) == 1, (tokens, l2)
+            # ... while the gated-on path still has live BL>1 buckets, so this
+            # test cannot pass just because the table went flat everywhere.
+    assert pick(4096, 8, True) == 4
+
+
+@pytest.mark.parametrize("N", [512, 4096])
+@pytest.mark.parametrize("B", [1, 3, 8])
+def test_attn_res_gate_separate_bl_buckets_match_reference(N, B):
+    """The BL>1 SEPARATE branch has to be as accurate as the BL=1 one it replaced.
+
+    Nothing exercised that branch above N=256 before: SEPARATE pinned BL=1. It folds
+    the online softmax over a [BL, BD] tile instead of one row at a time, so the
+    summation order differs and results are *not* bit-identical to BL=1 -- the
+    fp8 scale in particular shifts on almost every row. That is reordering, not
+    error, so the reference is the fp32 torch one. B is what selects the bucket,
+    so the three values here cover all of it: BL=1, BL=2 and BL=4.
+    """
+    D, eps = 256, 1e-6
+    dtype = torch.bfloat16
+    prefix, block_residual, score_weight, add_hidden, add_hidden2 = (
+        generate_attn_res_gate_inputs(N, D, B, dtype, with_add=True, with_add2=True)
+    )
+    orw = torch.randn(D, dtype=dtype, device="cuda")
+
+    y_ref, prefix_ref = run_torch_gate(
+        prefix,
+        block_residual,
+        score_weight,
+        eps,
+        add_hidden,
+        add_hidden2,
+        output_rms_weight=orw,
+        output_rms_eps=1e-5,
+    )
+    y, prefix_out, block_out = attn_res_gate(
+        prefix,
+        block_residual,
+        score_weight,
+        eps,
+        add_hidden,
+        add_hidden2,
+        output_rms_weight=orw,
+        output_rms_eps=1e-5,
+        close_block=True,
+    )
+
+    atol, rtol = _TOL[dtype]
+    torch.testing.assert_close(y.float(), y_ref, atol=atol, rtol=rtol)
+    torch.testing.assert_close(prefix_out.float(), prefix_ref.float(), atol=0, rtol=0)
+    # close_block is cat([block_residual, prefix_out], -2) -- a pure relocation,
+    # and the BL tiling is exactly what walks those rows, so it is the piece most
+    # likely to go wrong if a wider tile mismaps its lanes.
+    expected_block = torch.cat([block_residual, prefix_out.unsqueeze(-2)], dim=-2)
+    torch.testing.assert_close(block_out, expected_block, atol=0, rtol=0)
+
+
+@pytest.mark.parametrize("N", [16384, 32768])
+def test_attn_res_gate_launch_cache_separates_separate_bl_buckets(monkeypatch, N):
+    """Two token counts in different BL buckets must not share a cache entry.
+
+    BL is a constexpr, and the only trace N leaves in the key is _int_spec,
+    which records 16-divisibility rather than a value. Now that the table keys
+    BL on the candidate count, _ATTN_RES_SEPARATE_BL_MAX_T is the only boundary N
+    still crosses, so 16384 and 32768 are the pair that isolates it: both land
+    in the _ATTN_RES_PACKED_CONFIGS catchall (same num_warps/num_stages) and
+    both are 16-divisible, leaving BL as the sole difference.
+
+    close_block must be on: BL>1 is gated on it, so with the default off both N
+    would pick BL=1 and this would pass without testing anything.
+
+    Verification mode re-resolves through Triton on every hit, so a key that
+    dropped BL would fail here rather than silently launching a kernel compiled
+    for the other tile width.
+    """
+    monkeypatch.setattr(attn_res_module, "_LAUNCH_CACHE_VERIFY", True)
+    D, B = 256, 8
+    dtype = torch.bfloat16
+    # The separated loop covers L-1 = B rows, matching the wrapper's l2 argument.
+    l2 = B  # already a power of two
+    assert attn_res_module._pick_attn_res_separate_bl(
+        16384, l2, True
+    ) != attn_res_module._pick_attn_res_separate_bl(
+        32768, l2, True
+    ), "N pair no longer spans a BL bucket boundary"
+
+    prefix, block_residual, score_weight, _, _ = generate_attn_res_gate_inputs(
+        N, D, B, dtype, with_add=False
+    )
+    # Prime with the other bucket first, so a too-coarse key would hit that
+    # entry rather than compiling fresh.
+    other_n = 32768 if N == 16384 else 16384
+    other = generate_attn_res_gate_inputs(other_n, D, B, dtype, with_add=False)
+    attn_res_gate(other[0], other[1], other[2], 1e-6, close_block=True)
+
+    attn_res_gate(prefix, block_residual, score_weight, 1e-6, close_block=True)
+    attn_res_gate(prefix, block_residual, score_weight, 1e-6, close_block=True)
 
 
 def test_attn_res_sequence_requires_d_multiple_of_16():
