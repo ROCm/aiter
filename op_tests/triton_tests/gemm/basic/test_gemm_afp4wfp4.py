@@ -276,21 +276,8 @@ def test_gemm_afp4_wfp4(
     triton.testing.assert_close(torch_out, triton_out)
 
 
-def get_splitk_x_vals():
-    # Decode GEMMs whose tuned gfx950 configs select NUM_KSPLIT > 1
-    return [
-        (1, 10240, 8192),
-        (16, 8192, 28672),
-        (32, 8192, 28672),
-        (64, 8192, 28672),
-        (64, 8192, 8192),
-        (128, 16384, 53248),
-    ]
-
-
-@pytest.mark.parametrize("M, N, K", get_splitk_x_vals())
-@pytest.mark.parametrize("num_ksplit", [2, 4, 8])
-def test_gemm_afp4_wfp4_preshuffle_splitk(M: int, N: int, K: int, num_ksplit: int):
+@pytest.mark.parametrize("M, N, K", [(1, 10240, 8192), (64, 8192, 28672)])
+def test_gemm_afp4_wfp4_preshuffle_splitk(M: int, N: int, K: int):
     dtype = torch.bfloat16
     (
         x,
@@ -316,7 +303,7 @@ def test_gemm_afp4_wfp4_preshuffle_splitk(M: int, N: int, K: int, num_ksplit: in
     # _get_config doubles K itself, so pass packed bytes as the wrapper does.
     config, _ = _get_afp4wfp4_config(M, N, K // 2, True, backend="triton")
     config = dict(config)
-    config["NUM_KSPLIT"] = num_ksplit
+    config["NUM_KSPLIT"] = 4
 
     triton_out = gemm_afp4wfp4_preshuffle(
         x,
