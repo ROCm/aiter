@@ -6363,6 +6363,52 @@ void fused_qk_norm_rope_group_quant(
   constexpr int PREFILL_Q_HEADS_PER_WAVE_MED   = 3;
   constexpr int PREFILL_Q_HEADS_PER_WAVE_LRG   = 8;
   constexpr int PREFILL_Q_HEADS_PER_WAVE_XLRG  = 16;
+  // ---------------------------------------------------------------------------
+  // Where the xlarge tier stands against flydsl, and why it is close to done.
+  //
+  // T=16384 H=128 G=64 on gfx1250: HIP ~299 us, flydsl ~227 us, ratio 1.31
+  // (three consecutive runs: 1.320 / 1.315 / 1.308). Geometry is already
+  // identical -- both launch 147456 waves at 16 rows per wave.
+  //
+  // ATT profile by SHARE of sampled cycles (absolute totals are not comparable
+  // between two captures; only the shares are):
+  //                    HIP     flydsl
+  //   wait            59.1%     67.0%
+  //     s_wait_xcnt   42.5%     34.6%   <- our only material deficit, +7.8pp
+  //     s_wait_tensorcnt 1.3%   16.0%   <- we are 14.7pp AHEAD here
+  //   VALU            32.4%     27.1%
+  //   SALU             7.6%      5.5%
+  //
+  // The three components of the remaining gap, each probed and each a dead end
+  // in the current design:
+  //
+  //   s_wait_xcnt   Three separate attempts (scale-store lane dedup, the DPP
+  //                 amax reduce, and unguarding the nope stores behind
+  //                 descriptor bounds) all removed exec regions and all left
+  //                 s_wait_xcnt flat or higher. Deleting one EXEC region just
+  //                 relocates the address-queue drain to the next one.
+  //
+  //   VALU          v_cvt_pk_bf16_f32 is 82892 cycles that flydsl does not spend
+  //                 at all -- it quantises the rotated PE to fp8 in the same
+  //                 store as the nope half, while our V4 contract writes PE as
+  //                 a separate bf16 tensor. That is precision we are buying, not
+  //                 inefficiency, and the contract is fixed. v_nop (45086
+  //                 cycles, 95% stalled, against flydsl's 175) is dependency-
+  //                 chain padding from the un-unrolled head loop; #pragma unroll
+  //                 2 measured +1.20%. Splitting sum_sq into two partials so the
+  //                 accumulate stays packed measured +4.29%.
+  //
+  //   SALU          Templating HPW so the trip count is compile-time known cut
+  //                 SALU 775 -> 702 in the ISA and measured +1.61%, i.e. inside
+  //                 noise. flydsl has no loop to unroll -- its range_constexpr
+  //                 is a plain Python range, so all 16 iterations are emitted as
+  //                 straight-line IR at construction time. That is a language
+  //                 difference, not something a pragma reaches.
+  //
+  // The big win at the other end of the size range (kernarg reorder, -20.2% at
+  // T=512) does not transfer: s_wait_kmcnt is 15.6% of T=512 and 1.2% here,
+  // because it is a fixed per-wave cost amortised over 20x more work.
+  // ---------------------------------------------------------------------------
 
   const int prefill_q_waves_med = (num_heads + PREFILL_Q_HEADS_PER_WAVE_MED - 1) / PREFILL_Q_HEADS_PER_WAVE_MED;
   const int prefill_blocks_med = ((num_tokens + PREFILL_TOKENS_PER_BLOCK - 1) / PREFILL_TOKENS_PER_BLOCK)
@@ -6398,7 +6444,26 @@ void fused_qk_norm_rope_group_quant(
   //    also keys on H is the likely next refinement, but that needs more shapes
   //    than this change was measured against.
   constexpr int LARGE_PREFILL_THRESHOLD  = 16;   // med    -> large  (blocks/CU)
-  constexpr int XLARGE_PREFILL_THRESHOLD = 300;  // large  -> xlarge (blocks/CU)
+  // large -> xlarge at 64 blocks/CU, not 300.
+  //
+  // This moves T=2048 (88 blocks/CU) and T=4096 (176) at H=128 from HPW=8 to
+  // HPW=16; T=8192 (352) and T=16384 (704) were already xlarge, T<=1024 stays
+  // large. flydsl runs 16 rows per wave at every size, so the old 300 boundary
+  // was leaving two sizes on a narrower wave than the reference.
+  //
+  // MEASURED, paired A/B, kernel-trace median of 103 dispatches, 6 reps each,
+  // all reps gated on an idle card:
+  //   T=4096 H=128   79.205 -> 76.461 us   -3.46%  (95% CI [-4.52, -2.40], 6/6)
+  //   T=2048 H=128   45.301 -> 44.433 us   -1.90%  (95% CI [-5.58, +1.78], 4/6)
+  // T=4096 is the clean result; T=2048 points the same way but its CI straddles
+  // zero, so treat it as "not worse" rather than as a second win.
+  //
+  // Context for why this was worth revisiting: ratio against flydsl across the
+  // size range after the kernarg and cos/sin fixes was
+  //   T=512 1.108, T=1024 1.173, T=2048 1.467, T=4096 1.303, T=8192 1.332,
+  //   T=16384 1.303
+  // T=2048 stood out as the worst cell, which is what pointed at the tier.
+  constexpr int XLARGE_PREFILL_THRESHOLD = 64;  // large  -> xlarge (blocks/CU)
 
   const bool use_decode_path    = (prefill_blocks_med < MIN_OVERSUBSCRIPTION * num_CUs);
   const bool use_xlarge_prefill = !use_decode_path
