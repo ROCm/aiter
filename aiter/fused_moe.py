@@ -235,7 +235,7 @@ def _return_output(ret, output):
 
 def _padded_scale_cols(size, group_size=32):
     """Scale columns per row, padded the way ``e8m0_shuffle`` pads them."""
-    return ((size // group_size + 7) // 8) * 8
+    return (((size + group_size - 1) // group_size + 7) // 8) * 8
 
 
 def _is_inline_sort_kname(kernel1):

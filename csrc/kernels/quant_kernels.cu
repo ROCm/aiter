@@ -2040,8 +2040,9 @@ void fused_dynamic_mx_quant_moe_sort_hip_bounded(aiter_tensor_t& output,
                                                  std::optional<aiter_tensor_t> sorted_weights)
 {
     AITER_CHECK(total_routes >= 0, __func__, " total_routes must be non-negative");
-    AITER_CHECK(
-        num_experts_upper_bound >= 0, __func__, " num_experts_upper_bound must be non-negative");
+    // A non-positive bound clamps the launch extent to 0, silently skipping
+    // every row, so reject it instead of under-launching.
+    AITER_CHECK(num_experts_upper_bound > 0, __func__, " num_experts_upper_bound must be positive");
     const int64_t padded_rows_upper_bound =
         moe_quant_padded_rows_upper_bound(total_routes, num_experts_upper_bound, block_m);
     fused_dynamic_mx_quant_moe_sort_hip_impl(output,

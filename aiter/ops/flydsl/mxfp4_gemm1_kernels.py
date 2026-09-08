@@ -109,6 +109,12 @@ def flydsl_mxfp4_gemm1(
         BN=BN,
         BK=BK,
     )
+    if act == "situv2" and (float(situ_beta) <= 0.0 or float(situ_linear_beta) <= 0.0):
+        # The epilogue takes their reciprocals; non-positive betas give inf/NaN.
+        raise ValueError(
+            "situ_beta/situ_linear_beta must be > 0, got "
+            f"{situ_beta!r}/{situ_linear_beta!r}"
+        )
     from .kernels.mxfp4_gemm1 import gemm1_grid
 
     launch = _get_compiled_mxfp4_gemm1_port(
