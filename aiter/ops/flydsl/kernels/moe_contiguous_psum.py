@@ -596,8 +596,7 @@ def build_moe_route_psum_fused_module():
         # The atomic needs a raw addrspace(3) pointer, so the counter array's
         # base is taken as an integer here; SharedAllocator has already folded
         # its offset in, leaving only the per-expert element offset to add.
-        # (fx.to_llvm_ptr would be the current spelling, but it needs a newer
-        # fly dialect than the pinned LLVM build exposes.)
+        # create_llvm_ptr builds the addrspace(3) pointer via fx.to_llvm_ptr.
         cnt_base_i64 = fx.Int64(fx.ptrtoint(lds_cnt))
         numel_i32 = fx.Uint32(numel)
         for route_i32 in range(tid, numel_i32, MAX_EXPERTS_PER_BLOCK):
