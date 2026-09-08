@@ -250,7 +250,6 @@ def build_topk_per_row_prefill_one_workgroup_module(
                 fx.make_layout(_SHORT_HIGH_BUCKETS, 1)
             )
         )
-        short_histogram = short_histogram_ping
         full_keys = storage.arena.short_pass1.full_keys.peek().view(
             fx.make_layout(_COMPACT_CAPACITY, 1)
         )
@@ -383,11 +382,18 @@ def build_topk_per_row_prefill_one_workgroup_module(
                         row_values,
                     )
 
-        def scatter_stable_equal_row(key, row_indices, row_values):
+        def scatter_equal_row(key, row_indices, row_values):
             for pos in range(tid, top_k, block_size):
                 row_indices[pos] = row_start + pos
                 if const_expr(write_values):
                     row_values[pos] = ordered_value(key)
+
+        def reset_scatter_counters(metadata, reset_above=True):
+            if tid == 0:
+                if const_expr(reset_above):
+                    metadata[_RUNNING_ABOVE] = zero
+                metadata[_RUNNING_EQUAL] = zero
+            gpu.barrier()
 
         # Histogram and workgroup scan primitives
 
@@ -487,14 +493,14 @@ def build_topk_per_row_prefill_one_workgroup_module(
                 if (exclusive <= target_prefix) & (
                     inclusive > target_prefix
                 ):
-                    metadata[threshold_slot] = first_bin + item
-                    metadata[above_slot] = total - inclusive
-                    metadata[count_slot] = inclusive - exclusive
+                    metadata[threshold_slot] = first_bin + item  # Kth bucket
+                    metadata[above_slot] = total - inclusive  # Higher-bucket count
+                    metadata[count_slot] = inclusive - exclusive  # Bucket count
                 exclusive = inclusive
             gpu.barrier()
 
         # Global and LDS row iterators
-        def scan_row(visit_one, reverse=False):
+        def scan_gm_row(visit_one, reverse=False):
             def visit_vector(col, values):
                 for item in range_constexpr(_VEC):
                     visit_one(col + item, values[item])
@@ -551,7 +557,7 @@ def build_topk_per_row_prefill_one_workgroup_module(
                 if remain_col < row_len:
                     visit_one(remain_col, input_row[remain_col])
 
-        def scan_full_keys(body):
+        def scan_lds_keys(body):
             row_vectors = (row_len + fx.Int32(_VEC - 1)) // fx.Int32(_VEC)
             for step in range_constexpr(full_key_vector_steps):
                 vector_idx = step * block_threads + tid
@@ -759,7 +765,7 @@ def build_topk_per_row_prefill_one_workgroup_module(
 
         # Non-stable emitters
 
-        def scatter_cached_unstable(
+        def scatter_lds_unstable(
             first_threshold,
             second_threshold,
             third_threshold,
@@ -769,10 +775,7 @@ def build_topk_per_row_prefill_one_workgroup_module(
             row_values,
             metadata,
         ):
-            if tid == 0:
-                metadata[_RUNNING_ABOVE] = zero
-                metadata[_RUNNING_EQUAL] = zero
-            gpu.barrier()
+            reset_scatter_counters(metadata)
 
             def emit(col, key, row_indices, row_values, metadata):
                 above, equal = classify_levels(
@@ -801,7 +804,7 @@ def build_topk_per_row_prefill_one_workgroup_module(
                     metadata,
                 )
 
-            scan_full_keys(
+            scan_lds_keys(
                 lambda col, key: emit(
                     col,
                     key,
@@ -811,7 +814,7 @@ def build_topk_per_row_prefill_one_workgroup_module(
                 )
             )
 
-        def scatter_full_unstable(
+        def scatter_gm_unstable(
             first_threshold,
             second_threshold,
             third_threshold,
@@ -820,10 +823,7 @@ def build_topk_per_row_prefill_one_workgroup_module(
             row_values,
             metadata,
         ):
-            if tid == 0:
-                metadata[_RUNNING_ABOVE] = zero
-                metadata[_RUNNING_EQUAL] = zero
-            gpu.barrier()
+            reset_scatter_counters(metadata)
 
             def scatter_one(
                 col,
@@ -864,7 +864,7 @@ def build_topk_per_row_prefill_one_workgroup_module(
                                 row_values,
                             )
 
-            scan_row(
+            scan_gm_row(
                 lambda col, value: scatter_one(
                     col,
                     value,
@@ -875,7 +875,6 @@ def build_topk_per_row_prefill_one_workgroup_module(
             )
 
         # Stable emitters
-
         def sort_and_store_stable(
             row_indices,
             row_values,
@@ -926,7 +925,7 @@ def build_topk_per_row_prefill_one_workgroup_module(
                     if const_expr(write_values):
                         row_values[pos] = candidate_keys[pos].bitcast(fx.Float32)
 
-        def scatter_stable_full_scan(
+        def scatter_gm_stable_sorted(
             first_threshold,
             second_threshold,
             third_threshold,
@@ -938,10 +937,7 @@ def build_topk_per_row_prefill_one_workgroup_module(
             metadata,
         ):
             definite_expected = top_k - num_needed
-            if tid == 0:
-                metadata[_RUNNING_ABOVE] = zero
-                metadata[_RUNNING_EQUAL] = zero
-            gpu.barrier()
+            reset_scatter_counters(metadata)
 
             def collect_one(
                 col,
@@ -970,7 +966,7 @@ def build_topk_per_row_prefill_one_workgroup_module(
                         if const_expr(write_values):
                             candidate_keys[pos] = value.bitcast(fx.Int32)
 
-            scan_row(
+            scan_gm_row(
                 lambda col, value: collect_one(
                     col,
                     value,
@@ -987,7 +983,7 @@ def build_topk_per_row_prefill_one_workgroup_module(
                 candidate_indices,
             )
 
-        def scatter_stable_candidates(
+        def scatter_candidates_stable_sorted(
             candidate_count,
             first_threshold,
             second_threshold,
@@ -1044,7 +1040,7 @@ def build_topk_per_row_prefill_one_workgroup_module(
                 candidate_indices,
             )
 
-        def scatter_stable_cached(
+        def scatter_lds_stable_ordered(
             first_threshold,
             second_threshold,
             third_threshold,
@@ -1149,7 +1145,7 @@ def build_topk_per_row_prefill_one_workgroup_module(
                 ).select(next_equal_base, num_needed)
                 gpu.barrier()
 
-        def scatter_stable_ordered(
+        def scatter_gm_stable_ordered(
             first_threshold,
             second_threshold,
             third_threshold,
@@ -1289,61 +1285,38 @@ def build_topk_per_row_prefill_one_workgroup_module(
                     row_values,
                 )
 
-        def scatter_candidates_after_second(
-            candidate_count,
-            second_threshold,
-            num_needed,
-            row_indices,
-            row_values,
-            metadata,
-            candidate_keys,
-            candidate_indices,
-        ):
-            if tid == 0:
-                metadata[_RUNNING_EQUAL] = zero
-            gpu.barrier()
-
-            for pos in range(tid, candidate_count, block_size):
-                col = candidate_indices[pos]
-                key = candidate_keys[pos]
-                second = radix_bucket(
-                    key, _LONG_RADIX_SHIFTS[1], _LONG_RADIX_MASKS[1]
-                )
-                scatter_unstable_key(
-                    col,
-                    key,
-                    second > second_threshold,
-                    second == second_threshold,
-                    num_needed,
-                    row_indices,
-                    row_values,
-                    metadata,
-                )
-
-        def scatter_candidates_after_third(
+        def scatter_candidates_unstable(
             candidate_count,
             first_threshold,
             second_threshold,
             third_threshold,
             num_needed,
+            levels,
             row_indices,
             row_values,
             metadata,
             candidate_keys,
             candidate_indices,
         ):
-            if tid == 0:
-                metadata[_RUNNING_EQUAL] = zero
-            gpu.barrier()
+            reset_scatter_counters(metadata, reset_above=False)
 
             for pos in range(tid, candidate_count, block_size):
                 col = candidate_indices[pos]
                 key = candidate_keys[pos]
-                above, equal = classify(
-                    key,
+                above, equal = classify_levels(
+                    radix_bucket(
+                        key, _LONG_RADIX_SHIFTS[0], _LONG_RADIX_MASKS[0]
+                    ),
+                    radix_bucket(
+                        key, _LONG_RADIX_SHIFTS[1], _LONG_RADIX_MASKS[1]
+                    ),
+                    radix_bucket(
+                        key, _LONG_RADIX_SHIFTS[2], _LONG_RADIX_MASKS[2]
+                    ),
                     first_threshold,
                     second_threshold,
                     third_threshold,
+                    levels,
                 )
                 scatter_unstable_key(
                     col,
@@ -1357,8 +1330,7 @@ def build_topk_per_row_prefill_one_workgroup_module(
                 )
 
         # Path finalization
-
-        def scatter_cached_selection(
+        def scatter_lds_selection(
             first_threshold,
             second_threshold,
             third_threshold,
@@ -1369,32 +1341,23 @@ def build_topk_per_row_prefill_one_workgroup_module(
             scan,
             metadata,
         ):
-            if const_expr(stable):
-                if const_expr(levels == 3):
-                    if metadata[_SELECTED_BUCKET_COUNT] == row_len:
-                        scatter_stable_equal_row(
-                            short_threshold_key(
-                                first_threshold,
-                                second_threshold,
-                                third_threshold,
-                            ),
-                            row_indices,
-                            row_values,
-                        )
-                    else:
-                        scatter_stable_cached(
-                            first_threshold,
-                            second_threshold,
-                            third_threshold,
-                            num_needed,
-                            levels,
-                            row_indices,
-                            row_values,
-                            scan,
-                            metadata,
-                        )
-                else:
-                    scatter_stable_cached(
+            all_equal = row_len < zero
+            if const_expr(levels == 3):
+                all_equal = metadata[_SELECTED_BUCKET_COUNT] == row_len
+
+            if all_equal:
+                scatter_equal_row(
+                    short_threshold_key(
+                        first_threshold,
+                        second_threshold,
+                        third_threshold,
+                    ),
+                    row_indices,
+                    row_values,
+                )
+            else:
+                if const_expr(stable):
+                    scatter_lds_stable_ordered(
                         first_threshold,
                         second_threshold,
                         third_threshold,
@@ -1405,19 +1368,19 @@ def build_topk_per_row_prefill_one_workgroup_module(
                         scan,
                         metadata,
                     )
-            else:
-                scatter_cached_unstable(
-                    first_threshold,
-                    second_threshold,
-                    third_threshold,
-                    num_needed,
-                    levels,
-                    row_indices,
-                    row_values,
-                    metadata,
-                )
+                else:
+                    scatter_lds_unstable(
+                        first_threshold,
+                        second_threshold,
+                        third_threshold,
+                        num_needed,
+                        levels,
+                        row_indices,
+                        row_values,
+                        metadata,
+                    )
 
-        def finish_cached_selection(
+        def finish_lds_selection(
             first_threshold,
             need_after_first,
             histogram,
@@ -1426,78 +1389,62 @@ def build_topk_per_row_prefill_one_workgroup_module(
             row_indices,
             row_values,
         ):
-            if metadata[_SELECTED_BUCKET_COUNT] == need_after_first:
-                scatter_cached_selection(
+            choose_threshold(
+                need_after_first,
+                _SECOND_ABOVE,
+                _SECOND_THRESHOLD,
+                _SELECTED_BUCKET_COUNT,
+                histogram,
+                scan,
+                metadata,
+                short_bins_per_thread,
+            )
+            second_threshold = metadata[_SECOND_THRESHOLD]
+            need_after_second = need_after_first - metadata[_SECOND_ABOVE]
+            if metadata[_SELECTED_BUCKET_COUNT] == need_after_second:
+                scatter_lds_selection(
                     first_threshold,
+                    second_threshold,
                     zero,
-                    zero,
-                    need_after_first,
-                    1,
+                    need_after_second,
+                    2,
                     row_indices,
                     row_values,
                     scan,
                     metadata,
                 )
             else:
+                clear_histograms(histogram, None, short_bins_per_thread)
+                scan_lds_keys(
+                    lambda _, key: pass3_cached_key(
+                        key,
+                        first_threshold,
+                        second_threshold,
+                        histogram,
+                    )
+                )
+                gpu.barrier()
                 choose_threshold(
-                    need_after_first,
-                    _SECOND_ABOVE,
-                    _SECOND_THRESHOLD,
+                    need_after_second,
+                    _THIRD_ABOVE,
+                    _THIRD_THRESHOLD,
                     _SELECTED_BUCKET_COUNT,
                     histogram,
                     scan,
                     metadata,
                     short_bins_per_thread,
                 )
-                second_threshold = metadata[_SECOND_THRESHOLD]
-                need_after_second = need_after_first - metadata[_SECOND_ABOVE]
-                if (
-                    metadata[_SELECTED_BUCKET_COUNT]
-                    == need_after_second
-                ):
-                    scatter_cached_selection(
-                        first_threshold,
-                        second_threshold,
-                        zero,
-                        need_after_second,
-                        2,
-                        row_indices,
-                        row_values,
-                        scan,
-                        metadata,
-                    )
-                else:
-                    clear_histograms(histogram, None, short_bins_per_thread)
-                    scan_full_keys(
-                        lambda _, key: pass3_cached_key(
-                            key,
-                            first_threshold,
-                            second_threshold,
-                            histogram,
-                        )
-                    )
-                    gpu.barrier()
-                    choose_threshold(
-                        need_after_second,
-                        _THIRD_ABOVE,
-                        _THIRD_THRESHOLD,
-                        _SELECTED_BUCKET_COUNT,
-                        histogram,
-                        scan,
-                        metadata,
-                        short_bins_per_thread,
-                    )
-                    scatter_cached_selection(
-                        first_threshold,
-                        second_threshold,
-                        metadata[_THIRD_THRESHOLD],
-                        need_after_second - metadata[_THIRD_ABOVE],
-                        3,
-                        row_indices,
-                        row_values,
-                        scan,
-                        metadata,
-                    )
+                scatter_lds_selection(
+                    first_threshold,
+                    second_threshold,
+                    metadata[_THIRD_THRESHOLD],
+                    need_after_second - metadata[_THIRD_ABOVE],
+                    3,
+                    row_indices,
+                    row_values,
+                    scan,
+                    metadata,
+                )
 
         def finish_candidate_unstable(
             first_threshold,
@@ -1544,10 +1491,13 @@ def build_topk_per_row_prefill_one_workgroup_module(
                     == need_after_second
                 )
                 if can_finish_after_second:
-                    scatter_candidates_after_second(
+                    scatter_candidates_unstable(
                         candidate_count,
+                        first_threshold,
                         second_threshold,
+                        zero,
                         need_after_second,
+                        2,
                         row_indices,
                         row_values,
                         metadata,
@@ -1566,7 +1516,7 @@ def build_topk_per_row_prefill_one_workgroup_module(
                             candidate_keys,
                         )
                     else:
-                        scan_row(
+                        scan_gm_row(
                             lambda col, value: pass3_one(
                                 col,
                                 value,
@@ -1590,12 +1540,13 @@ def build_topk_per_row_prefill_one_workgroup_module(
                     if candidate_count <= fx.Int32(
                         _COMPACT_CAPACITY
                     ):
-                        scatter_candidates_after_third(
+                        scatter_candidates_unstable(
                             candidate_count,
                             first_threshold,
                             second_threshold,
                             third_threshold,
                             num_needed,
+                            3,
                             row_indices,
                             row_values,
                             metadata,
@@ -1603,7 +1554,7 @@ def build_topk_per_row_prefill_one_workgroup_module(
                             candidate_indices,
                         )
                     else:
-                        scatter_full_unstable(
+                        scatter_gm_unstable(
                             first_threshold,
                             second_threshold,
                             third_threshold,
@@ -1648,7 +1599,7 @@ def build_topk_per_row_prefill_one_workgroup_module(
                     candidate_keys,
                 )
             else:
-                scan_row(
+                scan_gm_row(
                     lambda col, value: pass3_one(
                         col,
                         value,
@@ -1670,7 +1621,7 @@ def build_topk_per_row_prefill_one_workgroup_module(
             third_threshold = metadata[_THIRD_THRESHOLD]
             num_needed = need_after_second - metadata[_THIRD_ABOVE]
             if metadata[_SELECTED_BUCKET_COUNT] == row_len:
-                scatter_stable_equal_row(
+                scatter_equal_row(
                     threshold_key(
                         first_threshold,
                         second_threshold,
@@ -1691,7 +1642,7 @@ def build_topk_per_row_prefill_one_workgroup_module(
                         <= fx.Int32(_COMPACT_CAPACITY)
                     )
                     if can_use_compact_fast:
-                        scatter_stable_candidates(
+                        scatter_candidates_stable_sorted(
                             candidate_count,
                             first_threshold,
                             second_threshold,
@@ -1707,7 +1658,7 @@ def build_topk_per_row_prefill_one_workgroup_module(
                         )
                     else:
                         if can_use_fast:
-                            scatter_stable_full_scan(
+                            scatter_gm_stable_sorted(
                                 first_threshold,
                                 second_threshold,
                                 third_threshold,
@@ -1719,7 +1670,7 @@ def build_topk_per_row_prefill_one_workgroup_module(
                                 metadata,
                             )
                         else:
-                            scatter_stable_ordered(
+                            scatter_gm_stable_ordered(
                                 first_threshold,
                                 second_threshold,
                                 third_threshold,
@@ -1730,7 +1681,7 @@ def build_topk_per_row_prefill_one_workgroup_module(
                                 metadata,
                             )
                 else:
-                    scatter_stable_ordered(
+                    scatter_gm_stable_ordered(
                         first_threshold,
                         second_threshold,
                         third_threshold,
@@ -1740,6 +1691,181 @@ def build_topk_per_row_prefill_one_workgroup_module(
                         scan,
                         metadata,
                     )
+
+        def run_cached_path(
+            histogram_ping,
+            histogram_pong,
+            full_keys,
+            row_indices,
+            row_values,
+            scan,
+            metadata,
+        ):
+            clear_histograms(
+                histogram_ping,
+                histogram_pong,
+                short_bins_per_thread,
+            )
+            scan_gm_row(
+                lambda col, value: pass1_one(
+                    col,
+                    value,
+                    _SHORT_RADIX_SHIFTS[0],
+                    _SHORT_RADIX_MASKS[0],
+                    histogram_ping,
+                    histogram_pong,
+                    full_keys,
+                ),
+            )
+            gpu.barrier()
+            merge_histograms(
+                histogram_ping,
+                histogram_pong,
+                short_bins_per_thread,
+            )
+            choose_threshold(
+                top_k,
+                _FIRST_ABOVE,
+                _FIRST_THRESHOLD,
+                _SELECTED_BUCKET_COUNT,
+                histogram_ping,
+                scan,
+                metadata,
+                short_bins_per_thread,
+            )
+
+            first_threshold = metadata[_FIRST_THRESHOLD]
+            need_after_first = top_k - metadata[_FIRST_ABOVE]
+            if metadata[_SELECTED_BUCKET_COUNT] == need_after_first:
+                scatter_lds_selection(
+                    first_threshold,
+                    zero,
+                    zero,
+                    need_after_first,
+                    1,
+                    row_indices,
+                    row_values,
+                    scan,
+                    metadata,
+                )
+            else:
+                clear_histograms(
+                    histogram_ping,
+                    None,
+                    short_bins_per_thread,
+                )
+                scan_lds_keys(
+                    lambda _, key: pass2_cached_key(
+                        key,
+                        first_threshold,
+                        histogram_ping,
+                    )
+                )
+                gpu.barrier()
+                finish_lds_selection(
+                    first_threshold,
+                    need_after_first,
+                    histogram_ping,
+                    scan,
+                    metadata,
+                    row_indices,
+                    row_values,
+                )
+
+        def run_streaming_path(
+            histogram_ping,
+            histogram_pong,
+            histogram,
+            candidate_keys,
+            candidate_indices,
+            stable_keys,
+            stable_indices,
+            row_indices,
+            row_values,
+            scan,
+            metadata,
+        ):
+            clear_histograms(
+                histogram_ping,
+                histogram_pong,
+                high_bins_per_thread,
+            )
+            scan_gm_row(
+                lambda col, value: pass1_one(
+                    col,
+                    value,
+                    _LONG_RADIX_SHIFTS[0],
+                    _LONG_RADIX_MASKS[0],
+                    histogram_ping,
+                    histogram_pong,
+                ),
+            )
+            gpu.barrier()
+            merge_histograms(
+                histogram_ping,
+                histogram_pong,
+                high_bins_per_thread,
+            )
+            choose_threshold(
+                top_k,
+                _FIRST_ABOVE,
+                _FIRST_THRESHOLD,
+                _SELECTED_BUCKET_COUNT,
+                histogram_ping,
+                scan,
+                metadata,
+                high_bins_per_thread,
+            )
+
+            first_threshold = metadata[_FIRST_THRESHOLD]
+            need_after_first = top_k - metadata[_FIRST_ABOVE]
+            clear_histograms(histogram, None, later_bins_per_thread)
+            scan_gm_row(
+                lambda col, value: pass2_one(
+                    col,
+                    value,
+                    first_threshold,
+                    histogram,
+                    metadata,
+                    candidate_keys,
+                    candidate_indices,
+                    stable_keys,
+                    stable_indices,
+                    row_indices,
+                    row_values,
+                ),
+                reverse=True,
+            )
+            gpu.barrier()
+
+            if const_expr(stable):
+                finish_candidate_stable(
+                    first_threshold,
+                    need_after_first,
+                    metadata[_CANDIDATE_COUNT],
+                    histogram,
+                    scan,
+                    metadata,
+                    candidate_keys,
+                    candidate_indices,
+                    stable_keys,
+                    stable_indices,
+                    row_indices,
+                    row_values,
+                )
+            else:
+                finish_candidate_unstable(
+                    first_threshold,
+                    need_after_first,
+                    metadata[_CANDIDATE_COUNT],
+                    histogram,
+                    scan,
+                    metadata,
+                    candidate_keys,
+                    candidate_indices,
+                    row_indices,
+                    row_values,
+                )
 
         def write_direct_output(
             row_indices,
@@ -1819,148 +1945,30 @@ def build_topk_per_row_prefill_one_workgroup_module(
                 metadata[tid] = zero
             gpu.barrier()
 
-            cache_full_row = row_len <= fx.Int32(_COMPACT_CAPACITY)
-            if cache_full_row:
-                clear_histograms(
+            if row_len <= fx.Int32(_COMPACT_CAPACITY):
+                run_cached_path(
                     short_histogram_ping,
                     short_histogram_pong,
-                    short_bins_per_thread,
-                )
-                scan_row(
-                    lambda col, value: pass1_one(
-                        col,
-                        value,
-                        _SHORT_RADIX_SHIFTS[0],
-                        _SHORT_RADIX_MASKS[0],
-                        short_histogram_ping,
-                        short_histogram_pong,
-                        full_keys,
-                    ),
-                )
-                gpu.barrier()
-                merge_histograms(
-                    short_histogram_ping,
-                    short_histogram_pong,
-                    short_bins_per_thread,
-                )
-                choose_threshold(
-                    top_k,
-                    _FIRST_ABOVE,
-                    _FIRST_THRESHOLD,
-                    _SELECTED_BUCKET_COUNT,
-                    short_histogram_ping,
-                    scan,
-                    metadata,
-                    short_bins_per_thread,
-                )
-            else:
-                clear_histograms(
-                    long_histogram_ping,
-                    long_histogram_pong,
-                    high_bins_per_thread,
-                )
-                scan_row(
-                    lambda col, value: pass1_one(
-                        col,
-                        value,
-                        _LONG_RADIX_SHIFTS[0],
-                        _LONG_RADIX_MASKS[0],
-                        long_histogram_ping,
-                        long_histogram_pong,
-                    ),
-                )
-                gpu.barrier()
-                merge_histograms(
-                    long_histogram_ping,
-                    long_histogram_pong,
-                    high_bins_per_thread,
-                )
-                choose_threshold(
-                    top_k,
-                    _FIRST_ABOVE,
-                    _FIRST_THRESHOLD,
-                    _SELECTED_BUCKET_COUNT,
-                    long_histogram_ping,
-                    scan,
-                    metadata,
-                    high_bins_per_thread,
-                )
-            first_threshold = metadata[_FIRST_THRESHOLD]
-
-            if cache_full_row:
-                clear_histograms(short_histogram, None, short_bins_per_thread)
-            else:
-                clear_histograms(histogram, None, later_bins_per_thread)
-            if tid == 0:
-                metadata[_RUNNING_ABOVE] = zero
-                metadata[_CANDIDATE_COUNT] = zero
-            gpu.barrier()
-            if cache_full_row:
-                scan_full_keys(
-                    lambda _, key: pass2_cached_key(
-                        key,
-                        first_threshold,
-                        short_histogram,
-                    )
-                )
-            else:
-                scan_row(
-                    lambda col, value: pass2_one(
-                        col,
-                        value,
-                        first_threshold,
-                        histogram,
-                        metadata,
-                        candidate_keys,
-                        candidate_indices,
-                        stable_keys,
-                        stable_indices,
-                        row_indices,
-                        row_values,
-                    ),
-                    reverse=True,
-                )
-            gpu.barrier()
-            need_after_first = top_k - metadata[_FIRST_ABOVE]
-            if cache_full_row:
-                finish_cached_selection(
-                    first_threshold,
-                    need_after_first,
-                    short_histogram,
-                    scan,
-                    metadata,
+                    full_keys,
                     row_indices,
                     row_values,
+                    scan,
+                    metadata,
                 )
             else:
-                if const_expr(stable):
-                    finish_candidate_stable(
-                        first_threshold,
-                        need_after_first,
-                        metadata[_CANDIDATE_COUNT],
-                        histogram,
-                        scan,
-                        metadata,
-                        candidate_keys,
-                        candidate_indices,
-                        stable_keys,
-                        stable_indices,
-                        row_indices,
-                        row_values,
-                    )
-                else:
-                    finish_candidate_unstable(
-                        first_threshold,
-                        need_after_first,
-                        metadata[_CANDIDATE_COUNT],
-                        histogram,
-                        scan,
-                        metadata,
-                        candidate_keys,
-                        candidate_indices,
-                        row_indices,
-                        row_values,
-                    )
+                run_streaming_path(
+                    long_histogram_ping,
+                    long_histogram_pong,
+                    histogram,
+                    candidate_keys,
+                    candidate_indices,
+                    stable_keys,
+                    stable_indices,
+                    row_indices,
+                    row_values,
+                    scan,
+                    metadata,
+                )
 
     @flyc.jit
     def launch_topk_per_row_prefill_one_workgroup(
