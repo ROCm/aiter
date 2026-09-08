@@ -94,8 +94,9 @@ window. The monitor privately loads ROCm's unpackaged ``amdsmi`` binding from
 and prints a case-tagged min/mean/median/max table for clocks, power,
 temperature, activity and VRAM.
 ``mega_moe`` has every rank monitor its local GPU around synchronized graph
-replays, then gathers the four summaries to rank 0; ``mori_ep`` remains disabled
-until its dispatch/combine loop exposes an aligned telemetry window.
+replays, then gathers the four summaries to rank 0. ``mori_ep`` instead wraps
+each complete torchrun invocation with one outer-process monitor: it adds no
+replay, but its samples intentionally include setup, warmup and the timed sweep.
 
 Supported operator inputs can be overridden consistently with:
 
@@ -108,10 +109,9 @@ notice when these flags are supplied; the setting is never silently claimed.
 The current passthrough matrix is:
 
     DATA + SCALE + seed   moe, gemm, f8gemm, a8w8_blockscale
-    DATA + seed           a16w16, mega_moe, mhc, qk_norm, inverse_rope,
-                          score_qk, mla_v4_decode, mla_v4_prefill
+    DATA + seed           a16w16, mega_moe, mori_ep, mhc, qk_norm,
+                          inverse_rope, score_qk, mla_v4_decode, mla_v4_prefill
     DATA mapping only     mha (norm -> randn, constant -> const0.25)
-    native init only      mori_ep
 
 ``--scale-init`` is reported as not applicable for operators without a scale
 operand.
@@ -208,8 +208,7 @@ The ``a8w8_blockscale`` op runs:
       --ck_preshuffle True --flydsl
 
 The ``a16w16`` op uses the global tuned GEMM dispatcher with batch=1, K=7168,
-the token sweep as M and N=64,384,1024,2048,32320,129280. The selected
-``libtype`` is reported for every shape.
+the token sweep as M and N=64,384,1024,2048,32320,129280.
 
 The ``mega_moe`` op runs both sides of the comparison in one process and emits
 only their combined summary (the summary retains the base/fused timings,
@@ -258,9 +257,10 @@ import json
 import subprocess
 import sys
 import tempfile
+import time
 import warnings
 
-from smi_monitor import SMI_RESULT_PREFIX
+from smi_monitor import GpuMonitor, SMI_RESULT_PREFIX
 
 warnings.filterwarnings("ignore")
 
@@ -875,7 +875,7 @@ def _pin_arch(env):
 
 
 def _run_child(name, cmd, cwd, env=None, extract=None, timeout=None, tail=30,
-               kernels=True, smi=True, structured=False):
+               kernels=True, smi=True, outer_smi=False, structured=False):
     """Run a child UT with its output captured and surface only its results.
 
     Child UTs print their own progress, aiter INFO lines and (with FlyDSL) a
@@ -896,6 +896,14 @@ def _run_child(name, cmd, cwd, env=None, extract=None, timeout=None, tail=30,
     # env=None means "inherit ours", which already carries these two.
     if env is not None:
         _pin_arch(env)
+    monitor = None
+    monitor_start = None
+    if outer_smi and os.environ.get("AITER_SMI_MONITOR") == "1":
+        device = int(os.environ.get("AITER_SMI_DEVICE", "0"))
+        interval_s = float(os.environ.get("AITER_SMI_INTERVAL", "0.05"))
+        monitor = GpuMonitor(device_index=device, interval_s=interval_s)
+        monitor.start()
+        monitor_start = time.perf_counter()
     try:
         proc = subprocess.run(
             cmd, cwd=cwd, env=env, text=True, timeout=timeout,
@@ -915,6 +923,28 @@ def _run_child(name, cmd, cwd, env=None, extract=None, timeout=None, tail=30,
         print("\n".join(captured.splitlines()[-tail:]), flush=True)
         _note_failure(name, f"timed out after {timeout}s")
         return
+    finally:
+        if monitor is not None:
+            monitor.stop()
+            elapsed_s = time.perf_counter() - monitor_start
+            expected_samples = max(1, int(elapsed_s / interval_s))
+            record = {
+                "label": f"{name} [outer process]",
+                "device": device,
+                "interval_s": interval_s,
+                "duration_s": elapsed_s,
+                "launches": None,
+                "samples": len(monitor.samples),
+                "sample_status": (
+                    "ok"
+                    if len(monitor.samples) >= max(2, expected_samples // 2)
+                    else "insufficient"
+                ),
+                "metrics": monitor.summary(),
+            }
+            _collect_smi_rows(
+                [SMI_RESULT_PREFIX + json.dumps(record, sort_keys=True)]
+            )
     lines = proc.stdout.splitlines()
     _collect_smi_rows(lines)
     # `results` decides whether the op reported anything; the kernel digest is
@@ -1190,22 +1220,12 @@ def run_a16w16(args):
     for data_init, M, n in itertools.product(
         data_inits, _A16W16_MS, _A16W16_NS
     ):
-        config = tuned_gemm_mod.get_GEMM_A16W16_config(
-            M=M,
-            N=n,
-            K=K,
-            bias=False,
-            dtype=str(torch.bfloat16),
-            otype=str(torch.bfloat16),
-        )
-        libtype = config["libtype"]
         # N=32320/129280 is lm_head (the DeepSeek vocab, whole and TP4-sharded).
         # See _A16W16_WIDE_N: this is the one shape rule left here, and it is
         # about what DSv4 runs, not about what the kernel can do.
         if n > _A16W16_WIDE_N and M > _A16W16_WIDE_N_MAX_M:
             rows.append({"data_init": data_init, "seed": args.seed,
                          "batch": batch, "M": M, "N": n, "K": K,
-                         "libtype": libtype,
                          "err_msg": f"skipped: N>{_A16W16_WIDE_N} is lm_head, "
                                     f"capped at M<={_A16W16_WIDE_N_MAX_M}"})
             continue
@@ -1253,13 +1273,12 @@ def run_a16w16(args):
         except Exception as exc:  # noqa: BLE001 - one shape must not end the sweep
             rows.append({"data_init": data_init, "seed": args.seed,
                          "batch": batch, "M": M, "N": n, "K": K,
-                         "libtype": libtype,
                          "err_msg": f"{type(exc).__name__}: {exc}"})
             continue
         captured = box[0].splitlines()
         row = {"data_init": data_init, "seed": args.seed,
                "batch": batch, "M": M, "N": n, "K": K,
-               "libtype": libtype, "us": float(us),
+               "us": float(us),
                "TFLOPS": 2.0 * batch * M * n * K / float(us) / 1e6,
                "err": err}
         # float(): checkAllclose returns a bare 0 for a clean compare but a
@@ -1275,8 +1294,8 @@ def run_a16w16(args):
     _print_table(
         "gemm_a16w16_tuned (DSv4)",
         rows,
-        keep=["data_init", "seed", "batch", "M", "N", "K", "libtype",
-              "us", "TFLOPS", "kernel", "err"],
+        keep=["data_init", "seed", "batch", "M", "N", "K", "us", "TFLOPS",
+              "kernel", "err"],
     )
 
 
@@ -1471,7 +1490,7 @@ def run_score_qk(args):
 
 def run_mori_ep(args):
     """Run MORI EPv2 dispatch/combine at the DSv4 MoE shape."""
-    _unsupported_init(args, "mori_ep")
+    _unused_scale_init(args, "mori_ep")
     # Runs whatever mori the image provides; keeping it current is the image's
     # job. Updating it from here moved the measurement target between runs and
     # needed a dev ROCm toolchain the pip-wheel images do not ship.
@@ -1497,19 +1516,24 @@ def run_mori_ep(args):
             "MODES": env.get("MODES", "eager,graph"),
             "COMBINE_IN": env.get("COMBINE_IN", "inplace"),
             "CHECK": env.get("CHECK", "1"),
+            "SEED": str(args.seed),
             "DBN": "",
             "DWPB": "",
             "CBN": "",
             "CWPB": "",
         }
     )
-    # One child per wire: bench_ep.py reads $DISP once at import and builds the
-    # transport for that dtype, so the tiers cannot share a process.
-    for disp in _MORI_EP_DISP:
+    # bench_ep.py reads DATA_INIT and DISP at import and builds the transport
+    # for that pair, so neither axis can share a child process.
+    for data_init, disp in itertools.product(
+        args.data_init or ("norm",), _MORI_EP_DISP
+    ):
+        env["DATA_INIT"] = data_init
         env["DISP"] = disp
         note = " UNCHECKED" if disp in _MORI_EP_UNCHECKED else ""
         _run_child(
-            f"mori_ep (DSv4 dispatch/combine, disp={disp}, combine=bf16{note})",
+            f"mori_ep (DSv4 dispatch/combine, init={data_init}, disp={disp}, "
+            f"combine=bf16{note})",
             [
                 "torchrun",
                 "--standalone",
@@ -1521,6 +1545,7 @@ def run_mori_ep(args):
             extract=_lines(_quiet),
             timeout=3600,
             smi=False,
+            outer_smi=True,
         )
 
 
@@ -1960,7 +1985,10 @@ def main():
     p.add_argument(
         "--smi-monitor",
         action="store_true",
-        help="replay and sample each timed benchmark case after latency measurement",
+        help=(
+            "replay and sample each timed benchmark case; mori_ep instead "
+            "samples each complete torchrun invocation"
+        ),
     )
     p.add_argument(
         "--smi-device",
