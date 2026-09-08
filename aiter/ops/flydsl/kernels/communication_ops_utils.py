@@ -13,7 +13,7 @@ shared by the dispatch/combine ops.
 
 from __future__ import annotations
 
-import json
+import csv
 from dataclasses import dataclass, field
 
 import flydsl.expr as fx
@@ -29,6 +29,7 @@ __all__ = [
     "atomic_add_agent",
     "atomic_add_global_at",
     "atomic_add_system",
+    "atomic_add_workgroup",
     "fence_acquire",
     "fence_agent_acquire",
     "fence_agent_release",
@@ -37,6 +38,7 @@ __all__ = [
     "fence_system_release",
     "load_i32_acquire",
     "load_i32_nt",
+    "load_i32_system",
     "load_i64_acquire",
     "load_i64_global",
     "load_v4i32_nt",
@@ -46,6 +48,9 @@ __all__ = [
     "store_i32_system",
     "store_i64_global_system",
     "traced",
+    "wait_i32_until_equals",
+    "wait_i32_until_greater_than",
+    "wait_i64_until_equals",
     "waitcnt_all",
 ]
 
@@ -54,6 +59,13 @@ def _to_ptr_global(v):
     """Cast an i64 address to ``!llvm.ptr<1>`` (global address space)."""
     return _llvm_d.IntToPtrOp(
         _llvm_d.PointerType.get(address_space=1), arith.unwrap(v)
+    ).result
+
+
+def _to_ptr_shared(v):
+    """Cast an i64 address to ``!llvm.ptr<3>`` (shared address space)."""
+    return _llvm_d.IntToPtrOp(
+        _llvm_d.PointerType.get(address_space=3), arith.unwrap(v)
     ).result
 
 
@@ -106,6 +118,12 @@ def load_i64_acquire(addr_i64):
     ).res
 
 
+def load_i32_system(addr_i64, index):
+    """Compatibility system-scope i32 load at ``addr_i64 + index * 4``."""
+    item_addr = fx.Int64(addr_i64) + fx.Int64(index) * fx.Int64(4)
+    return fx.Int32(load_i32_acquire(item_addr))
+
+
 def load_i32_nt(base_i64, offset):
     """Non-temporal global i32 load at base + offset*4."""
     return _llvm_d.LoadOp(
@@ -145,6 +163,24 @@ def spin_until_gt_i32(addr_i64, val):
     while cur <= fx.Int32(val):
         cur = fx.Int32(load_i32_acquire(addr_i64))
     return cur
+
+
+def wait_i32_until_equals(addr_i64, expected):
+    """Compatibility wrapper for the historical MegaMoE wait helper."""
+    spin_until_eq_i32(addr_i64, expected)
+
+
+def wait_i32_until_greater_than(addr_i64, expected):
+    """Compatibility wrapper returning the first i32 value above ``expected``."""
+    return spin_until_gt_i32(addr_i64, expected)
+
+
+@traced
+def wait_i64_until_equals(addr_i64, expected):
+    """Spin until a system-visible i64 flag equals ``expected``."""
+    cur = fx.Int64(load_i64_acquire(addr_i64))
+    while cur != fx.Int64(expected):
+        cur = fx.Int64(load_i64_acquire(addr_i64))
 
 
 def store_i32_system(addr_i64, offset, val):
@@ -242,6 +278,17 @@ def atomic_add_system(addr_i64, val):
     return atomic_add_global_at(addr_i64, val)
 
 
+def atomic_add_workgroup(addr_i64, val):
+    """Workgroup-scope monotonic shared-memory fetch-and-add."""
+    return _llvm_d.AtomicRMWOp(
+        _llvm_d.AtomicBinOp.add,
+        _to_ptr_shared(addr_i64),
+        arith.unwrap(val),
+        _llvm_d.AtomicOrdering.monotonic,
+        syncscope="workgroup",
+    ).res
+
+
 @dataclass
 class GeometryTuningTable:
     """Per-shape token-count -> (block_num, warp_num_per_block) lookup; rounds up
@@ -264,6 +311,9 @@ class GeometryTuningTable:
         cls,
         path,
         *,
+        ep_size,
+        gfx=None,
+        gpu_model=None,
         dtype,
         hidden_dim,
         zero_copy,
@@ -271,40 +321,56 @@ class GeometryTuningTable:
         local_expert_num=None,
         combine_dtype="bf16",
     ):
-        """Build a per-op table from a multi-shape tuning JSON, filtered to this
-        op's shape; empty table => cfg defaults."""
-        with open(path, "r", encoding="utf-8") as f:
-            raw = json.load(f)
+        """Build a per-op table from ``tuned_dispatch_combine_intranode.csv``."""
+        with open(path, encoding="utf-8", newline="") as f:
+            rows = list(
+                csv.DictReader(line for line in f if not line.lstrip().startswith("#"))
+            )
 
-        def _match(r, want_dtype, need_zc):
+        def _row_match(r, want_dtype, need_zc):
             if (
                 r.get("dtype") != want_dtype
                 or int(r.get("hidden_dim", -1)) != hidden_dim
             ):
                 return False
-            if topk is not None and "topk" in r and int(r["topk"]) != topk:
+            if int(r.get("ep_size", ep_size)) != int(ep_size):
+                return False
+            row_gfx = (r.get("gfx") or "").strip()
+            if gfx and row_gfx and row_gfx != gfx:
+                return False
+            row_model = (r.get("gpu_model") or "").strip()
+            if gpu_model and row_model and row_model != gpu_model:
+                return False
+            if topk is not None and r.get("topk") and int(r["topk"]) != topk:
                 return False
             if (
                 local_expert_num is not None
-                and "local_expert_num" in r
+                and r.get("local_expert_num")
                 and int(r["local_expert_num"]) != local_expert_num
             ):
                 return False
-            return not (need_zc and bool(r.get("zero_copy", False)) != bool(zero_copy))
+            if need_zc:
+                zc_raw = (r.get("zero_copy") or "").strip()
+                if zc_raw:
+                    row_zc = zc_raw.lower() in ("1", "true", "yes")
+                    if row_zc != bool(zero_copy):
+                        return False
+            return True
 
-        def _build(rules, want_dtype, need_zc):
-            return {
-                int(r["num_tokens"]): (
+        def _build(phase, want_dtype, need_zc):
+            out = {}
+            for r in rows:
+                if r.get("phase") != phase or not _row_match(r, want_dtype, need_zc):
+                    continue
+                out[int(r["num_tokens"])] = (
                     int(r["block_num"]),
                     int(r["warp_num_per_block"]),
                 )
-                for r in rules
-                if _match(r, want_dtype, need_zc)
-            }
+            return out
 
         return cls(
-            dispatch=_build(raw.get("dispatch", []), dtype, need_zc=False),
-            combine=_build(raw.get("combine", []), combine_dtype, need_zc=True),
+            dispatch=_build("dispatch", dtype, need_zc=False),
+            combine=_build("combine", combine_dtype, need_zc=True),
         )
 
     def lookup(self, phase, num_tokens):

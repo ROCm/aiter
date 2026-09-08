@@ -561,10 +561,8 @@ def buffer_copy_gmem16_dwordx4(
 
 
 def _lds_store_xor16(
-    vector,
     *,
-    lds_memref,
-    vec_ty,
+    lds_ptr,
     layout_lds,
     row_local: ir.Value,
     col_local_i32: ir.Value,
@@ -574,21 +572,20 @@ def _lds_store_xor16(
     vec_part: ir.Value,
     elem_bytes: int,
 ):
-    """Store one chunk into LDS with CK-style XOR16 swizzle on the K dimension."""
+    """Store one chunk into LDS (fly u8 ptr) with CK-style XOR16 K swizzle."""
     if elem_bytes not in (1, 2):
         raise ValueError(f"elem_bytes must be 1 or 2, got {elem_bytes!r}")
     col_swz_bytes = swizzle_xor16(row_local, col_local_i32 * tx_c4, k_blocks16)
     col_swz = col_swz_bytes if elem_bytes == 1 else col_swz_bytes // 2
     idx0 = crd2idx((fx.Int32(row_local), fx.Int32(col_swz)), layout_lds) + lds_base
-    vector.store(vector.bitcast(vec_ty, vec_part), lds_memref, [idx0])
+    byte_off = fx.Int64(idx0) if elem_bytes == 1 else fx.Int64(idx0) * elem_bytes
+    u8_ptr = fx.recast_iter(fx.Uint8, lds_ptr)
+    fx.ptr_store(fx.Vector(vec_part).bitcast(fx.Uint8), u8_ptr + byte_off)
 
 
 def lds_store_16b_xor16(
-    arith,
-    vector,
     *,
-    lds_memref,
-    vec16_ty,
+    lds_ptr,
     layout_lds,
     row_local: ir.Value,
     col_local_i32: ir.Value,
@@ -598,11 +595,9 @@ def lds_store_16b_xor16(
     vec_part_i32x4: ir.Value,
     elem_bytes: int = 1,
 ):
-    """Store one 16B chunk into LDS with CK-style XOR16 swizzle on the K dimension."""
+    """Store one 16B chunk into LDS (fly u8 ptr) with CK-style XOR16 K swizzle."""
     _lds_store_xor16(
-        vector,
-        lds_memref=lds_memref,
-        vec_ty=vec16_ty,
+        lds_ptr=lds_ptr,
         layout_lds=layout_lds,
         row_local=row_local,
         col_local_i32=col_local_i32,
@@ -615,11 +610,8 @@ def lds_store_16b_xor16(
 
 
 def lds_store_8b_xor16(
-    arith,
-    vector,
     *,
-    lds_memref,
-    vec8_ty,
+    lds_ptr,
     layout_lds,
     row_local: ir.Value,
     col_local_i32: ir.Value,
@@ -629,11 +621,9 @@ def lds_store_8b_xor16(
     vec_part_i32x2: ir.Value,
     elem_bytes: int = 1,
 ):
-    """Store one 8B chunk into LDS with CK-style XOR16 swizzle on the K dimension."""
+    """Store one 8B chunk into LDS (fly u8 ptr) with CK-style XOR16 K swizzle."""
     _lds_store_xor16(
-        vector,
-        lds_memref=lds_memref,
-        vec_ty=vec8_ty,
+        lds_ptr=lds_ptr,
         layout_lds=layout_lds,
         row_local=row_local,
         col_local_i32=col_local_i32,
@@ -646,11 +636,8 @@ def lds_store_8b_xor16(
 
 
 def lds_store_4b_xor16(
-    arith,
-    vector,
     *,
-    lds_memref,
-    vec4_ty,
+    lds_ptr,
     layout_lds,
     row_local: ir.Value,
     col_local_i32: ir.Value,
@@ -660,11 +647,9 @@ def lds_store_4b_xor16(
     vec_part_i32x1: ir.Value,
     elem_bytes: int = 1,
 ):
-    """Store one 4B chunk into LDS with CK-style XOR16 swizzle on the K dimension."""
+    """Store one 4B chunk into LDS (fly u8 ptr) with CK-style XOR16 K swizzle."""
     _lds_store_xor16(
-        vector,
-        lds_memref=lds_memref,
-        vec_ty=vec4_ty,
+        lds_ptr=lds_ptr,
         layout_lds=layout_lds,
         row_local=row_local,
         col_local_i32=col_local_i32,
