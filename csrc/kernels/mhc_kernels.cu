@@ -2822,6 +2822,32 @@ namespace aiter {
         using float_hc_mult = opus::vector_t<float, hc_mult>;
         float post_mix_v[m_repeat];
         float_hc_mult comb_mix[m_repeat];
+#if defined(__gfx1250__)
+        // Keep coefficient loads in a shared EXEC region instead of waiting
+        // after every scalar read. Full decode tiles can batch all row bands;
+        // the per-band path avoids the prefill regression from that fast path.
+        if (decode_pipeline && m_oob == tile_m) {
+            for(int b = 0; b < m_repeat; b++) {
+                int row = b * mfma_m + lane_id % mfma_m;
+                post_mix_v[b] = post_layer_mix[(row + idx) * hc_mult + warp_id];
+                for(int h = 0; h < hc_mult; h++) {
+                    comb_mix[b][h] = comb_res_mix[(row + idx) * hc_mult2 + h * hc_mult + warp_id];
+                }
+            }
+        } else {
+            for(int b = 0; b < m_repeat; b++) {
+                int row = b * mfma_m + lane_id % mfma_m;
+                post_mix_v[b] = 0.0f;
+                opus::clear(comb_mix[b]);
+                if (row < m_oob) {
+                    post_mix_v[b] = post_layer_mix[(row + idx) * hc_mult + warp_id];
+                    for(int h = 0; h < hc_mult; h++) {
+                        comb_mix[b][h] = comb_res_mix[(row + idx) * hc_mult2 + h * hc_mult + warp_id];
+                    }
+                }
+            }
+        }
+#else
         for(int b = 0; b < m_repeat; b++) {
             int row = b * mfma_m + lane_id % mfma_m;
             post_mix_v[b] = row < m_oob ? post_layer_mix[(row + idx) * hc_mult + warp_id] : 0.0f;
@@ -2829,6 +2855,7 @@ namespace aiter {
                 comb_mix[b][h] = row < m_oob ? comb_res_mix[(row + idx) * hc_mult2 + h * hc_mult + warp_id] : 0.0f;
             }
         }
+#endif
 
         const int k_loop = hidden_size / (split_k * tile_k);
 
