@@ -9,14 +9,18 @@ from flydsl.expr import const_expr, gpu, ptrtoint, range_constexpr
 from flydsl.expr import math as fmath
 from flydsl.expr.typing import ReductionOp, T
 
-from .... import buffer_ops
 from .collectives import (
+    buffer_tensor_from_addr,
     decode_scaled_fp8_f32,
     e8m0_scale,
+    load_bf16,
+    load_buffer,
     load_e8m0_scale,
     load_fp8_words,
     pack_fp8_words,
     peer_base,
+    store_bf16,
+    store_buffer,
     store_fp8_words,
 )
 from .config import BLOCK, AtomicConfig
@@ -37,41 +41,24 @@ def _emit_quantize_item(config, local, shared, partial, item, add_shared):
         gpu.thread_id("x")
     ) * fx.Int32(VECTOR_WIDTH)
     if column < fx.Int32(h):
-        local_row = buffer_ops.create_buffer_resource_from_addr(
+        local_row = buffer_tensor_from_addr(
             fx.Int64(ptrtoint(local)) + fx.Int64(token) * fx.Int64(h * 2),
-            num_records_bytes=h * 2,
+            fx.BFloat16,
+            h * 2,
         )
         if const_expr(add_shared):
-            shared_row = buffer_ops.create_buffer_resource_from_addr(
+            shared_row = buffer_tensor_from_addr(
                 fx.Int64(ptrtoint(shared)) + fx.Int64(token) * fx.Int64(h * 2),
-                num_records_bytes=h * 2,
+                fx.BFloat16,
+                h * 2,
             )
         values = []
         for chunk in range_constexpr(VECTOR_WIDTH // 8):
-            loaded = fx.Vector(
-                buffer_ops.buffer_load(
-                    local_row,
-                    column + fx.Int32(chunk * 8),
-                    vec_width=8,
-                    dtype=T.bf16,
-                    cache_modifier=2,
-                )
-            ).extf(T.vec(8, T.f32))
+            chunk_offset = column + fx.Int32(chunk * 8)
+            loaded = load_bf16(local_row, chunk_offset, 8, 2).to(fx.Float32)
             if const_expr(add_shared):
-                shared_values = fx.Vector(
-                    buffer_ops.buffer_load(
-                        shared_row,
-                        column + fx.Int32(chunk * 8),
-                        vec_width=8,
-                        dtype=T.bf16,
-                        cache_modifier=2,
-                    )
-                ).extf(T.vec(8, T.f32))
-                loaded = (
-                    (loaded + shared_values)
-                    .truncf(T.vec(8, T.bf16))
-                    .extf(T.vec(8, T.f32))
-                )
+                shared_values = load_bf16(shared_row, chunk_offset, 8, 2).to(fx.Float32)
+                loaded = (loaded + shared_values).to(fx.BFloat16).to(fx.Float32)
             values.extend(loaded[element] for element in range_constexpr(8))
 
         vector = fx.Vector.from_elements(values, fx.Float32)
@@ -88,9 +75,10 @@ def _emit_quantize_item(config, local, shared, partial, item, add_shared):
         e8m0, quant_scale = e8m0_scale(local_max)
         packed = pack_fp8_words(vector, quant_scale, VECTOR_WIDTH // 4)
 
-        payload_row = buffer_ops.create_buffer_resource_from_addr(
+        payload_row = buffer_tensor_from_addr(
             fx.Int64(ptrtoint(partial)) + fx.Int64(token) * fx.Int64(h),
-            num_records_bytes=h,
+            fx.Int32,
+            h,
         )
         store_fp8_words(
             payload_row,
@@ -99,17 +87,18 @@ def _emit_quantize_item(config, local, shared, partial, item, add_shared):
             VECTOR_WIDTH // 4,
         )
         if lane % fx.Int32(32 // VECTOR_WIDTH) == fx.Int32(0):
-            scale_row = buffer_ops.create_buffer_resource_from_addr(
+            scale_row = buffer_tensor_from_addr(
                 fx.Int64(ptrtoint(partial))
                 + fx.Int64(config.m * h)
                 + fx.Int64(token) * fx.Int64(groups_per_row),
-                num_records_bytes=groups_per_row,
+                fx.Int8,
+                groups_per_row,
             )
-            buffer_ops.buffer_store(
-                e8m0.to(fx.Int8),
+            store_buffer(
                 scale_row,
                 column // fx.Int32(32),
-                offset_is_bytes=True,
+                e8m0.to(fx.Int8),
+                fx.Int8,
             )
 
 
@@ -142,18 +131,6 @@ def compile_quantize(config: AtomicConfig, add_shared: bool):
         )
 
     return launch
-
-
-def _store_bf16(resource, offset, values):
-    for chunk in range_constexpr(VECTOR_WIDTH // 8):
-        buffer_ops.buffer_store(
-            fx.Vector.from_elements(
-                [values[chunk * 8 + element] for element in range_constexpr(8)],
-                fx.BFloat16,
-            ),
-            resource,
-            offset + fx.Int32(chunk * 8),
-        )
 
 
 @functools.cache
@@ -199,9 +176,10 @@ def compile_reduce_scatter(config: AtomicConfig):
                     shape.tp_size
                 )
                 source_base = peer_base(partial_base, source)
-                source_row = buffer_ops.create_buffer_resource_from_addr(
+                source_row = buffer_tensor_from_addr(
                     source_base + fx.Int64(global_token) * fx.Int64(h),
-                    num_records_bytes=h,
+                    fx.Int32,
+                    h,
                 )
                 words = load_fp8_words(
                     source_row,
@@ -210,11 +188,12 @@ def compile_reduce_scatter(config: AtomicConfig):
                     load_width=4,
                     cache_modifier=2,
                 )
-                scale_row = buffer_ops.create_buffer_resource_from_addr(
+                scale_row = buffer_tensor_from_addr(
                     source_base
                     + fx.Int64(config.m * h)
                     + fx.Int64(global_token) * fx.Int64(groups_per_row),
-                    num_records_bytes=groups_per_row,
+                    fx.Int8,
+                    groups_per_row,
                 )
                 values = decode_scaled_fp8_f32(
                     words, load_e8m0_scale(scale_row, group, 2)
@@ -238,9 +217,10 @@ def compile_reduce_scatter(config: AtomicConfig):
             e8m0, quant_scale = e8m0_scale(local_max)
             packed = pack_fp8_words(acc, quant_scale, VECTOR_WIDTH // 4)
 
-            payload_row = buffer_ops.create_buffer_resource_from_addr(
+            payload_row = buffer_tensor_from_addr(
                 fx.Int64(ptrtoint(payload)) + fx.Int64(local_token) * fx.Int64(h),
-                num_records_bytes=h,
+                fx.Int32,
+                h,
             )
             store_fp8_words(
                 payload_row,
@@ -249,27 +229,29 @@ def compile_reduce_scatter(config: AtomicConfig):
                 4,
             )
             if pack_in_group == fx.Int32(0):
-                scale_row = buffer_ops.create_buffer_resource_from_addr(
+                scale_row = buffer_tensor_from_addr(
                     fx.Int64(ptrtoint(scales))
                     + fx.Int64(local_token) * fx.Int64(groups_per_row),
-                    num_records_bytes=groups_per_row,
+                    fx.Int8,
+                    groups_per_row,
                 )
-                buffer_ops.buffer_store(
-                    e8m0.to(fx.Int8),
+                store_buffer(
                     scale_row,
                     group,
-                    offset_is_bytes=True,
+                    e8m0.to(fx.Int8),
+                    fx.Int8,
                 )
 
             decoded = decode_scaled_fp8_f32(
                 packed,
                 (fx.Uint32(e8m0) << fx.Uint32(23)).bitcast(fx.Float32),
             )
-            output_row = buffer_ops.create_buffer_resource_from_addr(
+            output_row = buffer_tensor_from_addr(
                 fx.Int64(ptrtoint(output)) + fx.Int64(local_token) * fx.Int64(h * 2),
-                num_records_bytes=h * 2,
+                fx.BFloat16,
+                h * 2,
             )
-            _store_bf16(output_row, column, decoded)
+            store_bf16(output_row, column, decoded, VECTOR_WIDTH)
 
     @flyc.jit
     def launch(partial_base, output, payload, scales, rank, stream):
@@ -309,14 +291,20 @@ def compile_all_gather(config: AtomicConfig):
         source_slot = worker % fx.Int32(source_count)
         source_block = worker // fx.Int32(source_count)
         source = (rank + source_slot + fx.Int32(1)) % fx.Int32(shape.tp_size)
-        payload = buffer_ops.create_buffer_resource_from_addr(
-            peer_base(payload_base, source), num_records_bytes=0xFFFFFFFF
+        payload = buffer_tensor_from_addr(
+            peer_base(payload_base, source),
+            fx.Int32,
+            config.shard_rows * h,
         )
-        scales = buffer_ops.create_buffer_resource_from_addr(
-            peer_base(scale_base, source), num_records_bytes=0xFFFFFFFF
+        scales = buffer_tensor_from_addr(
+            peer_base(scale_base, source),
+            fx.Int8,
+            config.shard_rows * groups_per_row,
         )
-        output_resource = buffer_ops.create_buffer_resource_from_addr(
-            fx.Int64(ptrtoint(output)), num_records_bytes=0xFFFFFFFF
+        output_resource = buffer_tensor_from_addr(
+            fx.Int64(ptrtoint(output)),
+            fx.BFloat16,
+            shape.tp_size * config.shard_rows * h * 2,
         )
         start = source_block * fx.Int32(BLOCK) + fx.Int32(gpu.thread_id("x"))
         for item in range(
@@ -334,15 +322,7 @@ def compile_all_gather(config: AtomicConfig):
                 cache_modifier=1,
             )
             loaded = fx.Uint32(
-                fx.Uint8(
-                    buffer_ops.buffer_load(
-                        scales,
-                        group_item,
-                        vec_width=1,
-                        dtype=T.i8,
-                        cache_modifier=1,
-                    )
-                )
+                fx.Uint8(load_buffer(scales, group_item, fx.Int8, cache_modifier=1))
             )
             scale = (loaded << fx.Uint32(23)).bitcast(fx.Float32)
             values = decode_scaled_fp8_f32(words, scale)
@@ -354,7 +334,7 @@ def compile_all_gather(config: AtomicConfig):
                 + group * fx.Int32(32)
                 + pack_in_group * fx.Int32(VECTOR_WIDTH)
             )
-            _store_bf16(output_resource, output_column, values)
+            store_bf16(output_resource, output_column, values, VECTOR_WIDTH)
 
     @flyc.jit
     def launch(payload_base, scale_base, output, rank, stream):

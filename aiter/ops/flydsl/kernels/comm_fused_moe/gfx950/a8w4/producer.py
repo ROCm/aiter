@@ -3,37 +3,22 @@
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-from flydsl._mlir import ir
-from flydsl._mlir.dialects import llvm as llvm_d
-from flydsl.expr.typing import Int32, as_ir_value
 
 from ....mxmoe_dispatcher import compile_gemm2_a4w4_port
 from .config import MegakernelConfig, WindowConfig
 
+_ROUTE_STORE_CACHE_MODIFIER = 0x10  # sc1
+
 
 @flyc.jit
 def resolve_route_input_row(packed, tokens, topk):
-    packed = fx.Int32(as_ir_value(packed))
+    packed = fx.Int32(packed)
     token = packed & fx.Int32(0x00FFFFFF)
     route_slot = packed >> fx.Int32(24)
     valid = (token < tokens) & (route_slot < fx.Int32(topk))
     return valid.select(
         token * fx.Int32(topk) + route_slot,
         fx.Int32(0),
-    )
-
-
-def store_bf16_route(arg_out, element_offset, values):
-    byte_address = fx.Int64(arg_out) + fx.Int64(element_offset) * fx.Int64(2)
-    pointer = llvm_d.IntToPtrOp(
-        ir.Type.parse("!llvm.ptr<1>"), as_ir_value(byte_address)
-    ).result
-    llvm_d.InlineAsmOp(
-        None,
-        [pointer, as_ir_value(values.bitcast(Int32))],
-        "global_store_dwordx4 $0, $1, off sc1",
-        "v,v",
-        has_side_effects=True,
     )
 
 
@@ -64,7 +49,9 @@ def compile_megakernel_producer(config: MegakernelConfig, composition):
         out_dtype="bf16",
         enable_bias=False,
         _composition=composition,
-        _reduce_store=(store_bf16_route if config.producer_mode == "routes" else None),
+        _reduce_store_cache_modifier=(
+            _ROUTE_STORE_CACHE_MODIFIER if config.producer_mode == "routes" else None
+        ),
         _input_row_resolver=input_row_resolver,
     )
 

@@ -12,52 +12,30 @@ import hashlib
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-from flydsl._mlir import ir
-from flydsl.compiler.kernel_function import CompilationContext
 from flydsl.expr import const_expr, gpu, ptrtoint, range_constexpr, rocdl
 from flydsl.expr import math as fmath
 from flydsl.expr.typing import ReductionOp, T, as_ir_value
 
-from .... import buffer_ops
 from .... import communication_ops_utils as comm_ops
 from ....mxfp4_gemm_common import global_typed_ptr, lds_typed_ptr
 from .collectives import (
-    atomic_add_i32_agent,
+    buffer_tensor_from_addr,
     decode_scaled_fp8_f32,
     e8m0_scale,
+    load_bf16,
+    load_buffer,
     load_e8m0_scale,
     load_fp8_words,
     pack_fp8_words,
     peer_base,
+    store_bf16,
+    store_buffer,
     store_fp8_words,
-    store_i32_agent_release,
-    store_i32_relaxed,
-    store_i32_system_monotonic,
-    store_i32_system_release,
-    store_i64_relaxed,
-    wait_i32_agent_until_at_least,
-    wait_i32_system_until_at_least,
 )
 from .config import PRODUCER_COUNTER_STRIDE, SLOTS, MegakernelConfig
 from .producer import compile_megakernel_producer
 
 CPOL_COHERENT = 0x1 | 0x10
-
-
-def _load_bf16(resource, offset, vector_width, cache_modifier):
-    values = []
-    for chunk in range_constexpr(vector_width // 8):
-        loaded = fx.Vector(
-            buffer_ops.buffer_load(
-                resource,
-                offset + fx.Int32(chunk * 8),
-                vec_width=8,
-                dtype=T.bf16,
-                cache_modifier=cache_modifier,
-            )
-        )
-        values.extend(loaded[element] for element in range_constexpr(8))
-    return fx.Vector.from_elements(values, fx.BFloat16)
 
 
 def _decode_scaled_fp8_bf16(words, scale):
@@ -96,8 +74,8 @@ def _mxfp8_scale(values, lane, vector_width):
 
 @flyc.jit
 def _store_mxfp8_scale(
-    payload_resource,
-    scale_resource,
+    payload_buffer,
+    scale_buffer,
     payload_bytes,
     offset,
     vector_width,
@@ -107,33 +85,35 @@ def _store_mxfp8_scale(
 ):
     if const_expr(wide_scale):
         if offset % fx.Int32(32) == fx.Int32(0):
-            buffer_ops.buffer_store(
-                e8m0 << fx.Int32(23),
-                scale_resource,
+            store_buffer(
+                scale_buffer,
                 offset // fx.Int32(32),
+                e8m0 << fx.Int32(23),
+                fx.Int32,
                 cache_modifier=cache_modifier,
             )
     elif const_expr(vector_width == 8):
         if offset % fx.Int32(32) == fx.Int32(0):
-            buffer_ops.buffer_store(
-                e8m0.to(fx.Int8),
-                scale_resource,
+            store_buffer(
+                scale_buffer,
                 offset // fx.Int32(32),
+                e8m0.to(fx.Int8),
+                fx.Int8,
                 cache_modifier=cache_modifier,
-                offset_is_bytes=True,
             )
     else:
-        buffer_ops.buffer_store(
-            e8m0 << fx.Int32(23),
-            payload_resource,
+        store_buffer(
+            payload_buffer,
             fx.Int32(payload_bytes // 4) + offset // fx.Int32(vector_width),
+            e8m0 << fx.Int32(23),
+            fx.Int32,
             cache_modifier=cache_modifier,
         )
 
 
 def _load_mxfp8_scale(
-    payload_resource,
-    scale_resource,
+    payload_buffer,
+    scale_buffer,
     payload_bytes,
     offset,
     vector_width,
@@ -142,46 +122,27 @@ def _load_mxfp8_scale(
 ):
     if const_expr(wide_scale):
         return fx.Int32(
-            buffer_ops.buffer_load(
-                scale_resource,
+            load_buffer(
+                scale_buffer,
                 offset // fx.Int32(32),
-                vec_width=1,
-                dtype=T.i32,
+                fx.Int32,
                 cache_modifier=cache_modifier,
             )
         ).bitcast(fx.Float32)
     if const_expr(vector_width == 8):
         return load_e8m0_scale(
-            scale_resource,
+            scale_buffer,
             offset // fx.Int32(32),
             cache_modifier,
         )
     return fx.Int32(
-        buffer_ops.buffer_load(
-            payload_resource,
+        load_buffer(
+            payload_buffer,
             fx.Int32(payload_bytes // 4) + offset // fx.Int32(vector_width),
-            vec_width=1,
-            dtype=T.i32,
+            fx.Int32,
             cache_modifier=cache_modifier,
         )
     ).bitcast(fx.Float32)
-
-
-def _store_bf16(resource, offset, values, vector_width, cache_modifier=0):
-    if vector_width == 8:
-        buffer_ops.buffer_store(values, resource, offset, cache_modifier=cache_modifier)
-        return
-    for chunk in range_constexpr(vector_width // 8):
-        chunk_values = fx.Vector.from_elements(
-            [values[chunk * 8 + element] for element in range_constexpr(8)],
-            fx.BFloat16,
-        )
-        buffer_ops.buffer_store(
-            chunk_values,
-            resource,
-            offset + fx.Int32(chunk * 8),
-            cache_modifier=cache_modifier,
-        )
 
 
 @flyc.jit
@@ -221,55 +182,61 @@ def emit_service_tile(
     expected = fx.Int64(comm_ops.load_i64_global(epoch_address)) + fx.Int64(1)
     expected_i32 = fx.Int32(expected)
     slot = expected & fx.Int64(1)
-    output_resource = buffer_ops.create_buffer_resource_from_addr(
+    output_resource = buffer_tensor_from_addr(
         local_workspace_base + fx.Int64(config.output_offset),
-        num_records_bytes=payload_bytes,
+        fx.BFloat16,
+        payload_bytes,
     )
-    shared_resource = buffer_ops.create_buffer_resource_from_addr(
+    shared_resource = buffer_tensor_from_addr(
         fx.Int64(ptrtoint(shared_partial)),
-        num_records_bytes=payload_bytes,
+        fx.BFloat16,
+        payload_bytes,
     )
     route_resource = None
     accumulator_resource = None
     clear_accumulator_resource = None
     if const_expr(config.producer_mode == "atomic_shared"):
-        accumulator_resource = buffer_ops.create_buffer_resource_from_addr(
+        accumulator_resource = buffer_tensor_from_addr(
             local_workspace_base
             + fx.Int64(config.route_offset)
             + slot * fx.Int64(payload_bytes),
-            num_records_bytes=payload_bytes,
+            fx.BFloat16,
+            payload_bytes,
         )
-        clear_accumulator_resource = buffer_ops.create_buffer_resource_from_addr(
+        clear_accumulator_resource = buffer_tensor_from_addr(
             local_workspace_base
             + fx.Int64(config.route_offset)
             + (slot ^ fx.Int64(1)) * fx.Int64(payload_bytes),
-            num_records_bytes=payload_bytes,
+            fx.BFloat16,
+            payload_bytes,
         )
     else:
-        route_resource = buffer_ops.create_buffer_resource_from_addr(
+        route_resource = buffer_tensor_from_addr(
             local_workspace_base + fx.Int64(config.route_offset),
-            num_records_bytes=config.route_bytes,
+            fx.BFloat16,
+            config.route_bytes,
         )
-    partial_resource = buffer_ops.create_buffer_resource_from_addr(
+    partial_resource = buffer_tensor_from_addr(
         local_workspace_base + slot * fx.Int64(partial_bytes),
-        num_records_bytes=(
-            partial_payload_bytes if partial_scale_sideband else partial_bytes
-        ),
+        fx.Int32,
+        (partial_payload_bytes if partial_scale_sideband else partial_bytes),
     )
     partial_scale_resource = None
     if const_expr(partial_scale_sideband):
-        partial_scale_resource = buffer_ops.create_buffer_resource_from_addr(
+        partial_scale_resource = buffer_tensor_from_addr(
             local_workspace_base
             + slot * fx.Int64(partial_bytes)
             + fx.Int64(partial_payload_bytes),
-            num_records_bytes=config.partial_scale_bytes,
+            fx.Int32 if config.wide_partial_scales else fx.Int8,
+            config.partial_scale_bytes,
         )
     if const_expr(config.collective == "rsag"):
-        reduced_resource = buffer_ops.create_buffer_resource_from_addr(
+        reduced_resource = buffer_tensor_from_addr(
             local_workspace_base
             + fx.Int64(config.reduced_offset)
             + slot * fx.Int64(config.reduced_shard_bytes),
-            num_records_bytes=(
+            fx.Int32,
+            (
                 config.reduced_payload_bytes
                 if const_expr(config.vector_width == 8)
                 else config.reduced_shard_bytes
@@ -277,12 +244,13 @@ def emit_service_tile(
         )
         reduced_scale_resource = None
         if const_expr(config.vector_width == 8):
-            reduced_scale_resource = buffer_ops.create_buffer_resource_from_addr(
+            reduced_scale_resource = buffer_tensor_from_addr(
                 local_workspace_base
                 + fx.Int64(config.reduced_offset)
                 + slot * fx.Int64(config.reduced_shard_bytes)
                 + fx.Int64(config.reduced_payload_bytes),
-                num_records_bytes=config.reduced_scale_bytes,
+                fx.Int8,
+                config.reduced_scale_bytes,
             )
     service_stride = config.block_threads * config.service_groups
     service_start = tid + service_group * fx.Int32(config.block_threads)
@@ -303,7 +271,7 @@ def emit_service_tile(
     if const_expr(config.uses_rsag):
         if tid < fx.Int32(tp_size):
             gather_slot = state_n_tile * fx.Int32(tp_size) + tid
-            wait_i32_system_until_at_least(
+            comm_ops.spin_until_ge_i32_system(
                 local_workspace_base
                 + fx.Int64(config.gather_done_offset)
                 + fx.Int64(gather_slot) * fx.Int64(4),
@@ -320,25 +288,25 @@ def emit_service_tile(
             + tile_item * fx.Int32(config.vector_width)
         )
         if const_expr(config.producer_mode == "atomic_shared"):
-            shared_values = _load_bf16(
+            shared_values = load_bf16(
                 shared_resource,
                 output_offset,
                 config.vector_width,
                 config.local_load_cache_modifier,
-            ).extf(T.vec(config.vector_width, T.f32))
-            reduced_f32 = shared_values + _load_bf16(
+            ).to(fx.Float32)
+            reduced_f32 = shared_values + load_bf16(
                 accumulator_resource,
                 output_offset,
                 config.vector_width,
                 config.local_load_cache_modifier,
-            ).extf(T.vec(config.vector_width, T.f32))
+            ).to(fx.Float32)
         else:
-            shared_values = _load_bf16(
+            shared_values = load_bf16(
                 shared_resource,
                 output_offset,
                 config.vector_width,
                 config.local_load_cache_modifier,
-            ).extf(T.vec(config.vector_width, T.f32))
+            ).to(fx.Float32)
 
             def load_bf16_route(route_slot):
                 route_offset = (
@@ -347,12 +315,12 @@ def emit_service_tile(
                     + n_tile * fx.Int32(config.tile_n)
                     + tile_item * fx.Int32(config.vector_width)
                 )
-                return _load_bf16(
+                return load_bf16(
                     route_resource,
                     route_offset,
                     config.vector_width,
                     config.local_load_cache_modifier,
-                ).extf(T.vec(config.vector_width, T.f32))
+                ).to(fx.Float32)
 
             local_even = shared_values + load_bf16_route(0)
             if const_expr(topk == 1):
@@ -368,14 +336,14 @@ def emit_service_tile(
 
         if const_expr(config.shared_bf16_partials):
             if const_expr(config.producer_mode == "atomic_shared"):
-                _store_bf16(
+                store_bf16(
                     output_resource,
                     output_offset,
-                    reduced_f32.truncf(T.vec(config.vector_width, T.bf16)),
+                    reduced_f32.to(fx.BFloat16),
                     config.vector_width,
                 )
                 zero_bf16 = fx.Float32(0.0).to(fx.BFloat16)
-                _store_bf16(
+                store_bf16(
                     clear_accumulator_resource,
                     output_offset,
                     fx.Vector.from_elements(
@@ -386,10 +354,10 @@ def emit_service_tile(
                     cache_modifier=2,
                 )
             else:
-                _store_bf16(
+                store_bf16(
                     shared_resource,
                     output_offset,
-                    reduced_f32.truncf(T.vec(config.vector_width, T.bf16)),
+                    reduced_f32.to(fx.BFloat16),
                     config.vector_width,
                 )
             return None
@@ -462,17 +430,19 @@ def emit_service_tile(
         def load_peer(peer, cache_modifier=None, use_retained=False):
             if const_expr(config.shared_bf16_partials):
                 if const_expr(config.producer_mode == "atomic_shared"):
-                    peer_resource = buffer_ops.create_buffer_resource_from_addr(
+                    peer_resource = buffer_tensor_from_addr(
                         peer_base(workspace_flat_base, peer)
                         + fx.Int64(config.output_offset),
-                        num_records_bytes=payload_bytes,
+                        fx.BFloat16,
+                        payload_bytes,
                     )
                 else:
-                    peer_resource = buffer_ops.create_buffer_resource_from_addr(
+                    peer_resource = buffer_tensor_from_addr(
                         peer_base(shared_partial_flat_base, peer),
-                        num_records_bytes=payload_bytes,
+                        fx.BFloat16,
+                        payload_bytes,
                     )
-                return _load_bf16(
+                return load_bf16(
                     peer_resource,
                     offset,
                     load_vector_width,
@@ -485,7 +455,7 @@ def emit_service_tile(
                             else config.local_load_cache_modifier
                         )
                     ),
-                ).extf(T.vec(load_vector_width, T.f32))
+                ).to(fx.Float32)
             if const_expr(use_retained):
                 retained_packed, retained_e8m0 = retained_local_partial
                 scale = (fx.Uint32(retained_e8m0) << fx.Uint32(23)).bitcast(fx.Float32)
@@ -494,11 +464,10 @@ def emit_service_tile(
                     fx.Float32,
                 )
             load_offset = offset
-            peer_resource = buffer_ops.create_buffer_resource_from_addr(
+            peer_resource = buffer_tensor_from_addr(
                 peer_base(workspace_flat_base, peer) + slot * fx.Int64(partial_bytes),
-                num_records_bytes=(
-                    partial_payload_bytes if partial_scale_sideband else partial_bytes
-                ),
+                fx.Int32,
+                (partial_payload_bytes if partial_scale_sideband else partial_bytes),
             )
             if const_expr(cache_modifier is None):
                 cache_modifier = (
@@ -508,11 +477,12 @@ def emit_service_tile(
                 )
             peer_scale_resource = None
             if const_expr(partial_scale_sideband):
-                peer_scale_resource = buffer_ops.create_buffer_resource_from_addr(
+                peer_scale_resource = buffer_tensor_from_addr(
                     peer_base(workspace_flat_base, peer)
                     + slot * fx.Int64(partial_bytes)
                     + fx.Int64(partial_payload_bytes),
-                    num_records_bytes=config.partial_scale_bytes,
+                    fx.Int32 if config.wide_partial_scales else fx.Int8,
+                    config.partial_scale_bytes,
                 )
             if const_expr(config.wide_partial_scales):
                 scale = _load_mxfp8_scale(
@@ -615,10 +585,10 @@ def emit_service_tile(
                 offset,
                 retained_local_partial,
             )
-            _store_bf16(
+            store_bf16(
                 output_resource,
                 offset,
-                reduced.truncf(T.vec(config.vector_width, T.bf16)),
+                reduced.to(fx.BFloat16),
                 config.vector_width,
             )
 
@@ -649,7 +619,7 @@ def emit_service_tile(
             counter_slot = fx.Int64(0)
             if const_expr(config.producer_mode == "atomic_shared"):
                 counter_slot = slot ^ fx.Int64(1)
-            store_i32_relaxed(
+            counter_address = (
                 local_workspace_base
                 + fx.Int64(config.producer_done_offset)
                 + (
@@ -657,29 +627,41 @@ def emit_service_tile(
                     * fx.Int64(config.producer_counter_slots)
                     + counter_slot
                 )
-                * fx.Int64(PRODUCER_COUNTER_STRIDE),
+                * fx.Int64(PRODUCER_COUNTER_STRIDE)
+            )
+            fx.ptr_store(
                 fx.Int32(0),
+                global_typed_ptr(counter_address, T.i32),
             )
         if const_expr(config.service_groups > 1):
-            store_i32_relaxed(
-                local_workspace_base
-                + fx.Int64(config.service_done_offset)
-                + tile_byte_offset,
+            fx.ptr_store(
                 fx.Int32(0),
+                global_typed_ptr(
+                    local_workspace_base
+                    + fx.Int64(config.service_done_offset)
+                    + tile_byte_offset,
+                    T.i32,
+                ),
             )
-            store_i32_relaxed(
-                local_workspace_base
-                + fx.Int64(config.reduce_done_offset)
-                + tile_byte_offset,
+            fx.ptr_store(
                 fx.Int32(0),
+                global_typed_ptr(
+                    local_workspace_base
+                    + fx.Int64(config.reduce_done_offset)
+                    + tile_byte_offset,
+                    T.i32,
+                ),
             )
-            store_i32_relaxed(
-                local_workspace_base
-                + fx.Int64(config.gather_service_done_offset)
-                + tile_byte_offset,
+            fx.ptr_store(
                 fx.Int32(0),
+                global_typed_ptr(
+                    local_workspace_base
+                    + fx.Int64(config.gather_service_done_offset)
+                    + tile_byte_offset,
+                    T.i32,
+                ),
             )
-        store_i64_relaxed(epoch_address, expected)
+        fx.ptr_store(expected, global_typed_ptr(epoch_address, T.i64, align=8))
 
     def emit_rsag_reduce():
         collective_vector_width = config.vector_width
@@ -687,7 +669,7 @@ def emit_service_tile(
         def emit_gather_ack(barrier=True):
             if tid < fx.Int32(tp_size):
                 remote_slot = state_n_tile * fx.Int32(tp_size) + rank
-                store_i32_system_monotonic(
+                comm_ops.store_i32_global_system_monotonic(
                     peer_base(workspace_flat_base, tid)
                     + fx.Int64(config.gather_done_offset)
                     + fx.Int64(remote_slot) * fx.Int64(4),
@@ -703,7 +685,7 @@ def emit_service_tile(
             ):
                 if tid < fx.Int32(tp_size):
                     local_slot = state_n_tile * fx.Int32(tp_size) + tid
-                    wait_i32_system_until_at_least(
+                    comm_ops.spin_until_ge_i32_system(
                         local_workspace_base
                         + fx.Int64(config.gather_done_offset)
                         + fx.Int64(local_slot) * fx.Int64(4),
@@ -733,7 +715,9 @@ def emit_service_tile(
                 if tid == fx.Int32(0):
                     comm_ops.fence_agent_release()
                     arrival = fx.Int32(
-                        atomic_add_i32_agent(gather_done_address, fx.Int32(1))
+                        comm_ops.atomic_add_agent_one_as(
+                            gather_done_address, fx.Int32(1)
+                        )
                     )
                     fx.ptr_store(arrival, service_marker_ptr)
                 gpu.barrier()
@@ -782,10 +766,10 @@ def emit_service_tile(
                     ),
                     vector_width=collective_vector_width,
                 )
-                reduced_bf16 = reduced.truncf(T.vec(collective_vector_width, T.bf16))
+                reduced_bf16 = reduced.to(fx.BFloat16)
                 if const_expr(config.collective == "rsag"):
                     # Publish the local RS/AG shard directly.
-                    _store_bf16(
+                    store_bf16(
                         output_resource,
                         offset,
                         reduced_bf16,
@@ -803,14 +787,13 @@ def emit_service_tile(
                         if const_expr(peer == specialized_rank):
                             peer_output_resource = output_resource
                         else:
-                            peer_output_resource = (
-                                buffer_ops.create_buffer_resource_from_addr(
-                                    peer_base(workspace_flat_base, peer)
-                                    + fx.Int64(config.output_offset),
-                                    num_records_bytes=payload_bytes,
-                                )
+                            peer_output_resource = buffer_tensor_from_addr(
+                                peer_base(workspace_flat_base, peer)
+                                + fx.Int64(config.output_offset),
+                                fx.BFloat16,
+                                payload_bytes,
                             )
-                        _store_bf16(
+                        store_bf16(
                             peer_output_resource,
                             offset,
                             reduced_bf16,
@@ -853,14 +836,14 @@ def emit_service_tile(
         def emit_reduced_exchange(propagate_acquire):
             if tid < fx.Int32(tp_size):
                 remote_slot = state_n_tile * fx.Int32(tp_size) + rank
-                store_i32_system_monotonic(
+                comm_ops.store_i32_global_system_monotonic(
                     peer_base(workspace_flat_base, tid)
                     + fx.Int64(config.owner_ready_offset)
                     + fx.Int64(remote_slot) * fx.Int64(4),
                     expected_i32,
                 )
                 local_slot = state_n_tile * fx.Int32(tp_size) + tid
-                wait_i32_system_until_at_least(
+                comm_ops.spin_until_ge_i32_system(
                     local_workspace_base
                     + fx.Int64(config.owner_ready_offset)
                     + fx.Int64(local_slot) * fx.Int64(4),
@@ -886,7 +869,7 @@ def emit_service_tile(
             if tid == fx.Int32(0):
                 comm_ops.fence_agent_release()
                 arrival = fx.Int32(
-                    atomic_add_i32_agent(reduce_done_address, fx.Int32(1))
+                    comm_ops.atomic_add_agent_one_as(reduce_done_address, fx.Int32(1))
                 )
                 fx.ptr_store(arrival, service_marker_ptr)
             gpu.barrier()
@@ -900,7 +883,7 @@ def emit_service_tile(
                 gpu.barrier()
                 emit_reduced_exchange(False)
                 if tid == fx.Int32(0):
-                    store_i32_agent_release(
+                    comm_ops.store_i32_global_agent_release(
                         local_workspace_base
                         + fx.Int64(config.reduced_collective_ready_offset)
                         + fx.Int64(state_n_tile) * fx.Int64(4),
@@ -908,7 +891,7 @@ def emit_service_tile(
                     )
 
             if tid == fx.Int32(0):
-                wait_i32_agent_until_at_least(
+                comm_ops.spin_until_ge_i32_agent(
                     local_workspace_base
                     + fx.Int64(config.reduced_collective_ready_offset)
                     + fx.Int64(state_n_tile) * fx.Int64(4),
@@ -928,11 +911,12 @@ def emit_service_tile(
             shard_tokens = config.m // tp_size
             first_token = source_start // fx.Int32(vectors_per_token)
             vector_lane = source_start - first_token * fx.Int32(vectors_per_token)
-            source_resource = buffer_ops.create_buffer_resource_from_addr(
+            source_resource = buffer_tensor_from_addr(
                 peer_base(workspace_flat_base, source)
                 + fx.Int64(config.reduced_offset)
                 + slot * fx.Int64(config.reduced_shard_bytes),
-                num_records_bytes=(
+                fx.Int32,
+                (
                     config.reduced_payload_bytes
                     if const_expr(config.vector_width == 8)
                     else config.reduced_shard_bytes
@@ -940,12 +924,13 @@ def emit_service_tile(
             )
             source_scale_resource = None
             if const_expr(config.vector_width == 8):
-                source_scale_resource = buffer_ops.create_buffer_resource_from_addr(
+                source_scale_resource = buffer_tensor_from_addr(
                     peer_base(workspace_flat_base, source)
                     + fx.Int64(config.reduced_offset)
                     + slot * fx.Int64(config.reduced_shard_bytes)
                     + fx.Int64(config.reduced_payload_bytes),
-                    num_records_bytes=config.reduced_scale_bytes,
+                    fx.Int8,
+                    config.reduced_scale_bytes,
                 )
             for source_token in range(
                 first_token,
@@ -982,7 +967,7 @@ def emit_service_tile(
                     _decode_scaled_fp8_bf16(words, scale),
                     fx.BFloat16,
                 )
-                _store_bf16(
+                store_bf16(
                     output_resource,
                     offset,
                     values,
@@ -1039,7 +1024,7 @@ def emit_service_tile(
 
         if tid < fx.Int32(tp_size):
             remote_slot = state_n_tile * fx.Int32(tp_size) + rank
-            store_i32_system_monotonic(
+            comm_ops.store_i32_global_system_monotonic(
                 peer_base(workspace_flat_base, tid)
                 + fx.Int64(config.rank_ready_offset)
                 + fx.Int64(remote_slot) * fx.Int64(4),
@@ -1052,14 +1037,14 @@ def emit_service_tile(
                 + fx.Int64(local_slot) * fx.Int64(4)
             )
             if const_expr(config.single_pass_direct):
-                wait_i32_system_until_at_least(
+                comm_ops.spin_until_ge_i32_system(
                     ready_address,
                     expected_i32,
                     acquire=not optimized_m8_direct,
                     sleep=False,
                 )
             else:
-                wait_i32_system_until_at_least(
+                comm_ops.spin_until_ge_i32_system(
                     ready_address,
                     expected_i32,
                 )
@@ -1078,7 +1063,7 @@ def emit_service_tile(
             if tid == fx.Int32(0):
                 comm_ops.fence_agent_release()
                 arrival = fx.Int32(
-                    atomic_add_i32_agent(service_done_address, fx.Int32(1))
+                    comm_ops.atomic_add_agent_one_as(service_done_address, fx.Int32(1))
                 )
                 fx.ptr_store(arrival, service_marker_ptr)
             gpu.barrier()
@@ -1089,7 +1074,7 @@ def emit_service_tile(
                 if tid == fx.Int32(0):
                     comm_ops.fence_agent_acquire()
                     local_ready_slot = state_n_tile * fx.Int32(tp_size) + rank
-                    store_i32_system_release(
+                    comm_ops.store_i32_global_system_release(
                         local_workspace_base
                         + fx.Int64(config.rank_ready_offset)
                         + fx.Int64(local_ready_slot) * fx.Int64(4),
@@ -1099,7 +1084,7 @@ def emit_service_tile(
 
                 if tid < fx.Int32(tp_size):
                     peer_ready_slot = state_n_tile * fx.Int32(tp_size) + tid
-                    wait_i32_system_until_at_least(
+                    comm_ops.spin_until_ge_i32_system(
                         peer_base(workspace_flat_base, tid)
                         + fx.Int64(config.rank_ready_offset)
                         + fx.Int64(peer_ready_slot) * fx.Int64(4),
@@ -1108,7 +1093,7 @@ def emit_service_tile(
                 gpu.barrier()
                 if tid == fx.Int32(0):
                     comm_ops.fence_system_acquire()
-                    store_i32_agent_release(
+                    comm_ops.store_i32_global_agent_release(
                         local_workspace_base
                         + fx.Int64(config.collective_ready_offset)
                         + fx.Int64(state_n_tile) * fx.Int64(4),
@@ -1119,7 +1104,7 @@ def emit_service_tile(
 
         def wait_for_collective():
             if tid == fx.Int32(0):
-                wait_i32_agent_until_at_least(
+                comm_ops.spin_until_ge_i32_agent(
                     local_workspace_base
                     + fx.Int64(config.collective_ready_offset)
                     + fx.Int64(state_n_tile) * fx.Int64(4),
@@ -1299,7 +1284,7 @@ def compile_megakernel(
             gpu.barrier()
             if tid == fx.Int32(0):
                 ticket = fx.Int32(
-                    atomic_add_i32_agent(
+                    comm_ops.atomic_add_agent_one_as(
                         local_workspace_base
                         + fx.Int64(config.producer_done_offset)
                         + (
@@ -1325,7 +1310,7 @@ def compile_megakernel(
                 service_group = service_marker - fx.Int32(1)
                 if config.service_groups > 1:
                     if tid == fx.Int32(0):
-                        wait_i32_agent_until_at_least(
+                        comm_ops.spin_until_ge_i32_agent(
                             local_workspace_base
                             + fx.Int64(config.producer_done_offset)
                             + (
@@ -1372,13 +1357,6 @@ def compile_megakernel(
             size_expert_ids,
             stream,
         ):
-            if const_expr(config.waves_per_eu > 0):
-                context = CompilationContext.get_current()
-                for op in context.gpu_module_body.operations:
-                    if hasattr(op, "attributes") and op.OPERATION_NAME == "gpu.func":
-                        op.attributes["rocdl.waves_per_eu"] = ir.IntegerAttr.get(
-                            T.i32, config.waves_per_eu
-                        )
             kernel(
                 workspace,
                 x,
@@ -1395,6 +1373,11 @@ def compile_megakernel(
                 model_dim,
                 inter_dim,
                 size_expert_ids,
+                value_attrs=(
+                    {"rocdl.waves_per_eu": config.waves_per_eu}
+                    if config.waves_per_eu > 0
+                    else None
+                ),
             ).launch(
                 grid=launch_grid,
                 block=(config.block_threads, 1, 1),

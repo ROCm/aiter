@@ -9,16 +9,18 @@ from flydsl.expr import const_expr, gpu, ptrtoint, range_constexpr, rocdl
 from flydsl.expr import math as fmath
 from flydsl.expr.typing import ReductionOp, T
 
-from .... import buffer_ops
 from ....mxfp4_gemm_common import global_typed_ptr
 from .collectives import (
+    buffer_tensor_from_addr,
     decode_scaled_fp8_f32,
     e8m0_scale,
     emit_tp_all_gather,
     emit_tp_reduce_scatter,
+    load_bf16,
     load_e8m0_scale,
     load_fp8_words,
     pack_fp8_words,
+    store_buffer,
     store_fp8_words,
 )
 from .config import BLOCK, WindowConfig
@@ -150,10 +152,17 @@ def _emit_local(config: WindowConfig, route, partial, shared, worker):
             column = tid * fx.Int32(8) + fx.Int32(column_pass * columns_per_pass)
             if column < fx.Int32(window):
                 route_row_bytes = window + window // 8
-                route_row = buffer_ops.create_buffer_resource_from_addr(
+                route_row = buffer_tensor_from_addr(
                     fx.Int64(ptrtoint(route))
                     + fx.Int64(token) * fx.Int64(shape.topk * route_row_bytes),
-                    num_records_bytes=shape.topk * route_row_bytes,
+                    fx.Int32,
+                    shape.topk * route_row_bytes,
+                )
+                route_scale_row = buffer_tensor_from_addr(
+                    fx.Int64(ptrtoint(route))
+                    + fx.Int64(token) * fx.Int64(shape.topk * route_row_bytes),
+                    fx.Int8,
+                    shape.topk * route_row_bytes,
                 )
                 acc = fx.Vector.filled(8, 0.0, fx.Float32)
                 for slot in range_constexpr(shape.topk):
@@ -165,7 +174,7 @@ def _emit_local(config: WindowConfig, route, partial, shared, worker):
                         cache_modifier=2,
                     )
                     scale = load_e8m0_scale(
-                        route_row,
+                        route_scale_row,
                         fx.Int32(slot * route_row_bytes + window)
                         + column // fx.Int32(8),
                         2,
@@ -173,20 +182,13 @@ def _emit_local(config: WindowConfig, route, partial, shared, worker):
                     values = decode_scaled_fp8_f32(words, scale)
                     acc = acc + fx.Vector.from_elements(values, fx.Float32)
 
-                shared_row = buffer_ops.create_buffer_resource_from_addr(
+                shared_row = buffer_tensor_from_addr(
                     fx.Int64(ptrtoint(shared))
                     + fx.Int64(token) * fx.Int64(shape.model_dim * 2),
-                    num_records_bytes=shape.model_dim * 2,
+                    fx.BFloat16,
+                    shape.model_dim * 2,
                 )
-                shared_values = fx.Vector(
-                    buffer_ops.buffer_load(
-                        shared_row,
-                        column,
-                        vec_width=8,
-                        dtype=T.bf16,
-                        cache_modifier=2,
-                    )
-                ).extf(T.vec(8, T.f32))
+                shared_values = load_bf16(shared_row, column, 8, 2).to(fx.Float32)
                 acc = acc + shared_values
 
                 lane = tid & fx.Int32(63)
@@ -206,23 +208,25 @@ def _emit_local(config: WindowConfig, route, partial, shared, worker):
                     max_bits = local_max.bitcast(fx.Int32)
                 e8m0, quant_scale = e8m0_scale(local_max)
                 packed = pack_fp8_words(acc, quant_scale, 2)
-                payload_row = buffer_ops.create_buffer_resource_from_addr(
+                payload_row = buffer_tensor_from_addr(
                     fx.Int64(ptrtoint(partial)) + fx.Int64(token) * fx.Int64(window),
-                    num_records_bytes=window,
+                    fx.Int32,
+                    window,
                 )
                 store_fp8_words(payload_row, column, packed, 2)
                 if lane & fx.Int32(3) == fx.Int32(0):
-                    scale_row = buffer_ops.create_buffer_resource_from_addr(
+                    scale_row = buffer_tensor_from_addr(
                         fx.Int64(ptrtoint(partial))
                         + fx.Int64(m * window)
                         + fx.Int64(token) * fx.Int64(groups_per_row),
-                        num_records_bytes=groups_per_row,
+                        fx.Int8,
+                        groups_per_row,
                     )
-                    buffer_ops.buffer_store(
-                        e8m0.to(fx.Int8),
+                    store_buffer(
                         scale_row,
                         column // fx.Int32(32),
-                        offset_is_bytes=True,
+                        e8m0.to(fx.Int8),
+                        fx.Int8,
                     )
 
 

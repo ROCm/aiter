@@ -5,21 +5,110 @@ import functools
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-from flydsl._mlir import ir
-from flydsl._mlir.dialects import llvm as llvm_d
-from flydsl._mlir.dialects import scf
-from flydsl.expr import arith, gpu, ptrtoint, range_constexpr
+from flydsl.expr import gpu, ptrtoint, range_constexpr
 from flydsl.expr import math as fmath
 from flydsl.expr.typing import ReductionOp, T, as_ir_value
 
-from .... import buffer_ops
 from .... import communication_ops_utils as comm_ops
+from ....mxfp4_gemm_common import global_typed_ptr
+from ....tensor_shim import ptr_buf_tensor
 
 FLAT_VA_RANK_STRIDE = 1 << 32
 
 
 def peer_base(flat_base, peer):
     return flat_base + fx.Int64(peer) * fx.Int64(FLAT_VA_RANK_STRIDE)
+
+
+def buffer_tensor_from_addr(addr, elem, num_records_bytes):
+    """Create a bounded flat V# view over a raw global address."""
+    return ptr_buf_tensor(
+        global_typed_ptr(addr, elem.ir_type, align=max(1, elem.width // 8)),
+        elem,
+        num_records_bytes=num_records_bytes,
+    )
+
+
+def _buffer_copy_atom(elem, width, cache_modifier):
+    return fx.make_copy_atom(
+        fx.rocdl.BufferCopy(elem.width * width, cache_modifier), elem
+    )
+
+
+def load_buffer(buffer, offset, elem, *, width=1, cache_modifier=0):
+    fragment = fx.make_rmem_tensor(width, elem)
+    fx.copy(
+        _buffer_copy_atom(elem, width, cache_modifier),
+        fx.slice(
+            fx.logical_divide(buffer, fx.make_layout(width, 1)),
+            (None, offset // fx.Int32(width)),
+        ),
+        fragment,
+    )
+    value = fx.Vector(fx.memref_load_vec(fragment))
+    return value[0] if width == 1 else value
+
+
+def store_buffer(buffer, offset, value, elem, *, width=1, cache_modifier=0):
+    fragment = fx.make_rmem_tensor(width, elem)
+    if width == 1:
+        value = fx.Vector.from_elements([value], elem)
+    fx.memref_store_vec(value, fragment)
+    fx.copy(
+        _buffer_copy_atom(elem, width, cache_modifier),
+        fragment,
+        fx.slice(
+            fx.logical_divide(buffer, fx.make_layout(width, 1)),
+            (None, offset // fx.Int32(width)),
+        ),
+    )
+
+
+def load_bf16(buffer, offset, vector_width, cache_modifier):
+    if vector_width == 8:
+        return load_buffer(
+            buffer,
+            offset,
+            fx.BFloat16,
+            width=8,
+            cache_modifier=cache_modifier,
+        )
+    values = []
+    for chunk in range_constexpr(vector_width // 8):
+        loaded = load_buffer(
+            buffer,
+            offset + fx.Int32(chunk * 8),
+            fx.BFloat16,
+            width=8,
+            cache_modifier=cache_modifier,
+        )
+        values.extend(loaded[element] for element in range_constexpr(8))
+    return fx.Vector.from_elements(values, fx.BFloat16)
+
+
+def store_bf16(buffer, offset, values, vector_width, cache_modifier=0):
+    if vector_width == 8:
+        store_buffer(
+            buffer,
+            offset,
+            values,
+            fx.BFloat16,
+            width=8,
+            cache_modifier=cache_modifier,
+        )
+        return
+    for chunk in range_constexpr(vector_width // 8):
+        store_buffer(
+            buffer,
+            offset + fx.Int32(chunk * 8),
+            fx.Vector.from_elements(
+                [values[chunk * 8 + element] for element in range_constexpr(8)],
+                fx.BFloat16,
+            ),
+            fx.BFloat16,
+            width=8,
+            cache_modifier=cache_modifier,
+        )
 
 
 @functools.cache
@@ -55,120 +144,6 @@ def compile_epoch_barrier(tp_size: int):
 
     launch.__name__ = f"launch_comm_fused_moe_epoch_tp{tp_size}"
     return flyc.jit(launch)
-
-
-def atomic_add_i32_agent(addr, value):
-    return llvm_d.AtomicRMWOp(
-        llvm_d.AtomicBinOp.add,
-        comm_ops._to_ptr_global(addr),
-        as_ir_value(value),
-        llvm_d.AtomicOrdering.monotonic,
-        syncscope=fx.rocdl.SyncScope.AgentOneAs,
-    ).res
-
-
-def wait_i32_system_until_at_least(addr, expected, *, acquire=False, sleep=True):
-    def load():
-        return llvm_d.LoadOp(
-            ir.IntegerType.get_signless(32),
-            comm_ops._to_ptr_global(addr),
-            alignment=4,
-            volatile_=True,
-            ordering=(
-                llvm_d.AtomicOrdering.acquire
-                if acquire
-                else llvm_d.AtomicOrdering.monotonic
-            ),
-            syncscope=fx.rocdl.SyncScope.OneAs,
-        ).result
-
-    loop = scf.WhileOp([T.i32], [load()])
-    before = ir.Block.create_at_start(loop.before, [T.i32])
-    after = ir.Block.create_at_start(loop.after, [T.i32])
-    with ir.InsertionPoint(before):
-        current = before.arguments[0]
-        waiting = arith.CmpIOp(
-            arith.CmpIPredicate.slt, current, as_ir_value(expected)
-        ).result
-        scf.ConditionOp(waiting, [current])
-    with ir.InsertionPoint(after):
-        if sleep:
-            llvm_d.InlineAsmOp(None, [], "s_sleep 1", "", has_side_effects=True)
-        scf.YieldOp([load()])
-    return loop.results[0]
-
-
-def wait_i32_agent_until_at_least(addr, expected, *, sleep=True):
-    def load():
-        return llvm_d.LoadOp(
-            ir.IntegerType.get_signless(32),
-            comm_ops._to_ptr_global(addr),
-            alignment=4,
-            volatile_=True,
-            ordering=llvm_d.AtomicOrdering.monotonic,
-            syncscope=fx.rocdl.SyncScope.AgentOneAs,
-        ).result
-
-    loop = scf.WhileOp([T.i32], [load()])
-    before = ir.Block.create_at_start(loop.before, [T.i32])
-    after = ir.Block.create_at_start(loop.after, [T.i32])
-    with ir.InsertionPoint(before):
-        current = before.arguments[0]
-        waiting = arith.CmpIOp(
-            arith.CmpIPredicate.slt, current, as_ir_value(expected)
-        ).result
-        scf.ConditionOp(waiting, [current])
-    with ir.InsertionPoint(after):
-        if sleep:
-            llvm_d.InlineAsmOp(None, [], "s_sleep 1", "", has_side_effects=True)
-        scf.YieldOp([load()])
-    return loop.results[0]
-
-
-def store_i32_relaxed(addr, value):
-    llvm_d.StoreOp(
-        as_ir_value(value),
-        comm_ops._to_ptr_global(addr),
-        alignment=4,
-    )
-
-
-def store_i32_agent_release(addr, value):
-    llvm_d.StoreOp(
-        as_ir_value(value),
-        comm_ops._to_ptr_global(addr),
-        alignment=4,
-        ordering=llvm_d.AtomicOrdering.release,
-        syncscope=fx.rocdl.SyncScope.AgentOneAs,
-    )
-
-
-def store_i32_system_monotonic(addr, value):
-    llvm_d.StoreOp(
-        as_ir_value(value),
-        comm_ops._to_ptr_global(addr),
-        alignment=4,
-        ordering=llvm_d.AtomicOrdering.monotonic,
-        syncscope=fx.rocdl.SyncScope.OneAs,
-    )
-
-
-def store_i32_system_release(addr, value):
-    llvm_d.StoreOp(
-        as_ir_value(value),
-        comm_ops._to_ptr_global(addr),
-        alignment=4,
-        ordering=llvm_d.AtomicOrdering.release,
-        syncscope=fx.rocdl.SyncScope.OneAs,
-    )
-
-
-def store_i64_relaxed(addr, value):
-    llvm_d.StoreOp(
-        as_ir_value(value),
-        comm_ops._to_ptr_global(addr),
-        alignment=8,
-    )
 
 
 def e8m0_scale(local_max):
@@ -221,7 +196,7 @@ def decode_scaled_fp8_f32(words, scale):
                     as_ir_value(scale),
                     bool(half),
                 )
-            ).extf(T.vec(2, T.f32))
+            ).to(fx.Float32)
             values.extend((pair[0], pair[1]))
     return values
 
@@ -244,8 +219,8 @@ def decode_group32(e8m0, packed):
 
 
 def load_fp8_words(
-    resource,
-    offset,
+    buffer,
+    word_offset,
     *,
     word_count,
     load_width,
@@ -253,51 +228,33 @@ def load_fp8_words(
 ):
     words = []
     for chunk in range_constexpr(word_count // load_width):
-        raw = fx.Vector(
-            buffer_ops.buffer_load(
-                resource,
-                offset + fx.Int32(chunk * load_width),
-                vec_width=load_width,
-                dtype=T.i32,
-                cache_modifier=cache_modifier,
-            )
+        raw = load_buffer(
+            buffer,
+            word_offset + fx.Int32(chunk * load_width),
+            fx.Int32,
+            width=load_width,
+            cache_modifier=cache_modifier,
         )
         words.extend(raw[word] for word in range_constexpr(load_width))
     return words
 
 
-def load_e8m0_scale(resource, offset, cache_modifier):
-    e8m0 = buffer_ops.buffer_load(
-        resource,
-        offset,
-        vec_width=1,
-        dtype=T.i8,
-        cache_modifier=cache_modifier,
-    )
+def load_e8m0_scale(buffer, offset, cache_modifier):
+    e8m0 = load_buffer(buffer, offset, fx.Int8, cache_modifier=cache_modifier)
     return (fx.Uint32(fx.Uint8(e8m0)) << fx.Uint32(23)).bitcast(fx.Float32)
 
 
-def store_fp8_words(resource, offset, packed, store_width, cache_modifier=0):
+def store_fp8_words(buffer, byte_offset, packed, store_width, cache_modifier=0):
+    word_offset = byte_offset // fx.Int32(4)
     for chunk in range_constexpr(len(packed) // store_width):
         begin = chunk * store_width
-        buffer_ops.buffer_store(
+        store_buffer(
+            buffer,
+            word_offset + fx.Int32(begin),
             fx.Vector.from_elements(packed[begin : begin + store_width], fx.Int32),
-            resource,
-            offset + fx.Int32(begin * 4),
+            fx.Int32,
+            width=store_width,
             cache_modifier=cache_modifier,
-            offset_is_bytes=True,
-        )
-
-
-def _store_bf16_group32(resource, offset, values):
-    for chunk in range_constexpr(4):
-        buffer_ops.buffer_store(
-            fx.Vector.from_elements(
-                [values[chunk * 8 + element] for element in range_constexpr(8)],
-                fx.BFloat16,
-            ),
-            resource,
-            offset + fx.Int32(chunk * 8),
         )
 
 
@@ -334,9 +291,10 @@ def emit_tp_reduce_scatter(
         for source_round in range_constexpr(tp):
             source = (rank + local_token + fx.Int32(source_round)) % fx.Int32(tp)
             base = peer_base(flat_base, source)
-            source_row = buffer_ops.create_buffer_resource_from_addr(
+            source_row = buffer_tensor_from_addr(
                 base + fx.Int64(global_token) * fx.Int64(payload_width),
-                num_records_bytes=payload_width,
+                fx.Int32,
+                payload_width,
             )
             words = load_fp8_words(
                 source_row,
@@ -345,39 +303,46 @@ def emit_tp_reduce_scatter(
                 load_width=4,
                 cache_modifier=2,
             )
-            scale_row = buffer_ops.create_buffer_resource_from_addr(
+            scale_row = buffer_tensor_from_addr(
                 base
                 + fx.Int64(tokens * payload_width)
                 + fx.Int64(global_token) * fx.Int64(groups_per_row),
-                num_records_bytes=groups_per_row,
+                fx.Int8,
+                groups_per_row,
             )
             scale = load_e8m0_scale(scale_row, group, 2)
             values = decode_scaled_fp8_f32(words, scale)
             acc = acc + fx.Vector.from_elements(values, fx.Float32)
 
         e8m0, packed = quantize_group32(acc)
-        payload_row = buffer_ops.create_buffer_resource_from_addr(
+        payload_row = buffer_tensor_from_addr(
             fx.Int64(ptrtoint(payload))
             + fx.Int64(local_token) * fx.Int64(payload_width),
-            num_records_bytes=payload_width,
+            fx.Int32,
+            payload_width,
         )
         store_fp8_words(payload_row, column, packed, 4)
-        scale_row = buffer_ops.create_buffer_resource_from_addr(
+        scale_row = buffer_tensor_from_addr(
             fx.Int64(ptrtoint(scales))
             + fx.Int64(local_token) * fx.Int64(groups_per_row),
-            num_records_bytes=groups_per_row,
+            fx.Int8,
+            groups_per_row,
         )
-        buffer_ops.buffer_store(
-            e8m0.to(fx.Int8), scale_row, group, offset_is_bytes=True
+        store_buffer(
+            scale_row,
+            group,
+            e8m0.to(fx.Int8),
+            fx.Int8,
         )
 
         decoded = decode_group32(e8m0, packed)
-        output_row = buffer_ops.create_buffer_resource_from_addr(
+        output_row = buffer_tensor_from_addr(
             fx.Int64(ptrtoint(output))
             + fx.Int64(local_token) * fx.Int64(output_width * 2),
-            num_records_bytes=output_width * 2,
+            fx.BFloat16,
+            output_width * 2,
         )
-        _store_bf16_group32(output_row, column, decoded)
+        store_bf16(output_row, column, decoded, 32)
 
 
 @flyc.jit
@@ -399,14 +364,20 @@ def emit_tp_all_gather(
     source_slot = worker % fx.Int32(tp - 1)
     source_block = worker // fx.Int32(tp - 1)
     source = (rank + fx.Int32(1) + source_slot) % fx.Int32(tp)
-    payload = buffer_ops.create_buffer_resource_from_addr(
-        peer_base(payload_base, source), num_records_bytes=0xFFFFFFFF
+    payload = buffer_tensor_from_addr(
+        peer_base(payload_base, source),
+        fx.Int32,
+        shard_rows * payload_width,
     )
-    scales = buffer_ops.create_buffer_resource_from_addr(
-        peer_base(scale_base, source), num_records_bytes=0xFFFFFFFF
+    scales = buffer_tensor_from_addr(
+        peer_base(scale_base, source),
+        fx.Int8,
+        shard_rows * groups_per_row,
     )
-    output_rsrc = buffer_ops.create_buffer_resource_from_addr(
-        fx.Int64(ptrtoint(output)), num_records_bytes=0xFFFFFFFF
+    output_buffer = buffer_tensor_from_addr(
+        fx.Int64(ptrtoint(output)),
+        fx.BFloat16,
+        tp * shard_rows * output_width * 2,
     )
     start = source_block * fx.Int32(block) + fx.Int32(gpu.thread_id("x"))
     for group in range(
@@ -421,9 +392,7 @@ def emit_tp_all_gather(
             load_width=4,
             cache_modifier=1,
         )
-        scale_raw = buffer_ops.buffer_load(
-            scales, group, vec_width=1, dtype=T.i8, cache_modifier=1
-        )
+        scale_raw = load_buffer(scales, group, fx.Int8, cache_modifier=1)
         values = decode_group32(fx.Uint8(scale_raw), words)
         shard_row = group // fx.Int32(groups_per_row)
         group_in_row = group - shard_row * fx.Int32(groups_per_row)
@@ -432,4 +401,4 @@ def emit_tp_all_gather(
             + shard_row * fx.Int32(output_width)
             + group_in_row * fx.Int32(32)
         )
-        _store_bf16_group32(output_rsrc, output_column, values)
+        store_bf16(output_buffer, output_column, values, 32)

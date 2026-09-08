@@ -256,7 +256,7 @@ def gemm2_body_v2(
     g2_epi_lanes=None,
     g2_apre=False,
     enable_bias=False,
-    reduce_store=None,
+    reduce_store_cache_modifier=None,
     resolved_input_rows=(),
     output_n_base=0,
     output_width=None,
@@ -632,7 +632,7 @@ def gemm2_body_v2(
             enable_bias=enable_bias,
             output_n_base=output_n_base,
             output_width=output_width,
-            reduce_store=reduce_store,
+            reduce_store_cache_modifier=reduce_store_cache_modifier,
             **kw,
         )
 
@@ -868,7 +868,7 @@ def atomic_bf16_epilog(
     enable_bias=False,
     output_n_base=0,
     output_width=None,
-    reduce_store=None,
+    reduce_store_cache_modifier=None,
 ):
     if SBM is None:
         SBM = BM
@@ -898,13 +898,13 @@ def atomic_bf16_epilog(
     tx_i32 = fx.Int32(gpu.thread_id("x"))
     m_lane = tx_i32 // EPI_LANES
     n_lane = tx_i32 % EPI_LANES
-    if reduce_store is not None and (
+    if reduce_store_cache_modifier is not None and (
         not use_reduce or route_out_fp8 or enable_bias or g2_defer_weight
     ):
-        raise ValueError("custom BF16 stores require unweighted reduce output")
+        raise ValueError("custom BF16 store policies require unweighted reduce output")
     output_width = N_OUT if const_expr(output_width is None) else fx.Int32(output_width)
     output_n_base = fx.Int32(output_n_base)
-    store_vec = 8 if reduce_store is not None else 2
+    store_vec = 8 if reduce_store_cache_modifier is not None else 2
     store_group_n = EPI_LANES * store_vec
     col_start = n_lane * store_vec
     wave_n = BN // 4
@@ -926,6 +926,13 @@ def atomic_bf16_epilog(
     load_i32 = fx.make_copy_atom(fx.rocdl.BufferCopy32b(), Int32)
     load_f32 = fx.make_copy_atom(fx.rocdl.BufferCopy32b(), Float32)
     atomic_bf16x2 = fx.make_copy_atom(fx.rocdl.BufferAtomicPkAdd(BFloat16), BFloat16)
+    reduce_bf16x8 = (
+        fx.make_copy_atom(
+            fx.rocdl.BufferCopy128b(reduce_store_cache_modifier), BFloat16
+        )
+        if reduce_store_cache_modifier is not None
+        else None
+    )
     store_i32 = fx.make_copy_atom(fx.rocdl.BufferCopy32b(STORE_CACHE_MODIFIER), Int32)
     store_i8 = fx.make_copy_atom(fx.rocdl.BufferCopy8b(STORE_CACHE_MODIFIER), Int8)
 
@@ -1156,7 +1163,7 @@ def atomic_bf16_epilog(
                         store_route_group(col_lane8)
 
                 store_route_group_if_valid(col_lane8)
-        elif const_expr(reduce_store is not None):
+        elif const_expr(reduce_store_cache_modifier is not None):
             for s in range_constexpr(BN // store_group_n):
                 idx0 = row_in_block * BN + col_start + s * store_group_n
                 if const_expr(g2_bf16_lds):
@@ -1187,7 +1194,9 @@ def atomic_bf16_epilog(
                         Float32,
                     ).to(BFloat16)
                 out_off = row_base_addr + fx.Int64(s * store_group_n)
-                reduce_store(arg_out, out_off, pk)
+                out_frag = fx.make_rmem_tensor(store_vec, BFloat16)
+                out_frag.store(pk)
+                fx.copy(reduce_bf16x8, out_frag, out_bf16[None, out_off])
         else:
             for s in range_constexpr(BN // store_group_n):
                 # adjacent ee=0,1 contiguous -> one 2-wide load.

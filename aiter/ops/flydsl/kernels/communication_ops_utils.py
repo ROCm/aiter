@@ -27,6 +27,7 @@ from flydsl.expr.typing import T
 __all__ = [
     "GeometryTuningTable",
     "atomic_add_agent",
+    "atomic_add_agent_one_as",
     "atomic_add_global_at",
     "atomic_add_system",
     "fence_acquire",
@@ -36,13 +37,20 @@ __all__ = [
     "fence_system_acquire",
     "fence_system_release",
     "load_i32_acquire",
+    "load_i32_global_agent",
+    "load_i32_global_system",
     "load_i32_nt",
     "load_i64_acquire",
     "load_i64_global",
     "load_v4i32_nt",
     "spin_until_eq_i32",
+    "spin_until_ge_i32_agent",
+    "spin_until_ge_i32_system",
     "spin_until_ge_i64",
     "spin_until_gt_i32",
+    "store_i32_global_agent_release",
+    "store_i32_global_system_monotonic",
+    "store_i32_global_system_release",
     "store_i32_system",
     "store_i64_global_system",
     "traced",
@@ -94,6 +102,34 @@ def load_i32_acquire(addr_i64):
     ).res
 
 
+def load_i32_global_system(addr_i64, *, acquire=False):
+    """Volatile i32 load with system visibility for a spin-wait."""
+    return _llvm_d.LoadOp(
+        T.i32,
+        _to_ptr_global(addr_i64),
+        alignment=4,
+        volatile_=True,
+        ordering=(
+            _llvm_d.AtomicOrdering.acquire
+            if acquire
+            else _llvm_d.AtomicOrdering.monotonic
+        ),
+        syncscope=fx.rocdl.SyncScope.OneAs,
+    ).res
+
+
+def load_i32_global_agent(addr_i64):
+    """Volatile monotonic i32 load with agent-one-as visibility."""
+    return _llvm_d.LoadOp(
+        T.i32,
+        _to_ptr_global(addr_i64),
+        alignment=4,
+        volatile_=True,
+        ordering=_llvm_d.AtomicOrdering.monotonic,
+        syncscope=fx.rocdl.SyncScope.AgentOneAs,
+    ).res
+
+
 def load_i64_acquire(addr_i64):
     """Volatile monotonic i64 load suitable for a spin-wait."""
     return _llvm_d.LoadOp(
@@ -126,6 +162,28 @@ def spin_until_ge_i64(addr_i64, val):
     cur = fx.Int64(load_i64_acquire(addr_i64))
     while cur < fx.Int64(val):
         cur = fx.Int64(load_i64_acquire(addr_i64))
+    return cur
+
+
+@traced
+def spin_until_ge_i32_system(addr_i64, val, *, acquire=False, sleep=True):
+    """Spin on a system-visible i32 flag until it reaches ``val``."""
+    cur = fx.Int32(load_i32_global_system(addr_i64, acquire=acquire))
+    while cur < fx.Int32(val):
+        if fx.const_expr(sleep):
+            fx.rocdl.s_sleep(1)
+        cur = fx.Int32(load_i32_global_system(addr_i64, acquire=acquire))
+    return cur
+
+
+@traced
+def spin_until_ge_i32_agent(addr_i64, val, *, sleep=True):
+    """Spin on an agent-visible i32 flag until it reaches ``val``."""
+    cur = fx.Int32(load_i32_global_agent(addr_i64))
+    while cur < fx.Int32(val):
+        if fx.const_expr(sleep):
+            fx.rocdl.s_sleep(1)
+        cur = fx.Int32(load_i32_global_agent(addr_i64))
     return cur
 
 
@@ -182,6 +240,39 @@ def store_i64_global_system(addr_i64, val):
     )
 
 
+def store_i32_global_agent_release(addr_i64, val):
+    """Agent-one-as release store to a global i32 address."""
+    _llvm_d.StoreOp(
+        val.ir_value(),
+        _to_ptr_global(addr_i64),
+        alignment=4,
+        ordering=_llvm_d.AtomicOrdering.release,
+        syncscope=fx.rocdl.SyncScope.AgentOneAs,
+    )
+
+
+def store_i32_global_system_monotonic(addr_i64, val):
+    """System-visible monotonic store to a global i32 address."""
+    _llvm_d.StoreOp(
+        val.ir_value(),
+        _to_ptr_global(addr_i64),
+        alignment=4,
+        ordering=_llvm_d.AtomicOrdering.monotonic,
+        syncscope=fx.rocdl.SyncScope.OneAs,
+    )
+
+
+def store_i32_global_system_release(addr_i64, val):
+    """System-visible release store to a global i32 address."""
+    _llvm_d.StoreOp(
+        val.ir_value(),
+        _to_ptr_global(addr_i64),
+        alignment=4,
+        ordering=_llvm_d.AtomicOrdering.release,
+        syncscope=fx.rocdl.SyncScope.OneAs,
+    )
+
+
 def fence_acquire(syncscope):
     """Emit an acquire fence for the selected AMDGPU memory scope."""
     _llvm_d.FenceOp(_llvm_d.AtomicOrdering.acquire, syncscope=syncscope)
@@ -235,6 +326,11 @@ def atomic_add_global_at(addr_i64, val, syncscope="one-as"):
 def atomic_add_agent(addr_i64, val):
     """Agent-scope monotonic global fetch-and-add."""
     return atomic_add_global_at(addr_i64, val, syncscope=fx.rocdl.SyncScope.Agent)
+
+
+def atomic_add_agent_one_as(addr_i64, val):
+    """Agent-one-as monotonic global fetch-and-add."""
+    return atomic_add_global_at(addr_i64, val, syncscope=fx.rocdl.SyncScope.AgentOneAs)
 
 
 def atomic_add_system(addr_i64, val):

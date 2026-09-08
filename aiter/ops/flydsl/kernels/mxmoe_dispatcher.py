@@ -130,7 +130,7 @@ def compile_gemm2_a4w4_port(
     out_dtype="bf16",
     enable_bias=False,
     _composition=None,
-    _reduce_store=None,
+    _reduce_store_cache_modifier=None,
     _input_row_resolver=None,
     _output_n_range=None,
 ):
@@ -150,8 +150,8 @@ def compile_gemm2_a4w4_port(
         raise AssertionError(f"SBM ({SBM}) must be a multiple of BM ({BM})")
     if (_composition is None) != (_input_row_resolver is None):
         raise ValueError("a composed GEMM2 requires an input row resolver")
-    if _reduce_store is not None and _composition is None:
-        raise ValueError("a custom reduce store requires a composition")
+    if _reduce_store_cache_modifier is not None and _composition is None:
+        raise ValueError("a custom reduce-store cache policy requires a composition")
     use_reduce = epilog == "reduce"
     out_dtype = str(out_dtype).strip().lower()
     if out_dtype not in ("bf16", "fp8"):
@@ -393,7 +393,7 @@ def compile_gemm2_a4w4_port(
                 g2_apre=g2_apre,
                 enable_bias=enable_bias,
                 mn_idx=mn_idx,
-                reduce_store=_reduce_store,
+                reduce_store_cache_modifier=_reduce_store_cache_modifier,
                 resolved_input_rows=resolved_input_rows,
                 output_n_base=output_n_base,
                 output_width=output_width,
