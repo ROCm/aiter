@@ -395,6 +395,68 @@ def build_moe_contiguous_psum_remap_module():
     return launch_psum_remap
 
 
+_ROW_TO_TOKEN_BLOCK = 256
+
+
+def build_moe_row_to_token_module():
+    """Invert the route->row map into row->token, for a GEMM reading a compact A.
+
+    This is a separate launch rather than a few lines inside the remap above,
+    which already computes every final row: that kernel is a prefix scan and
+    runs as a single block, so adding 100k scattered stores to it cost 26 us at
+    16384 tokens. One thread per route instead covers the same stores in a
+    fraction of that.
+
+    The topk routes of one token all store the same token id, so the duplicate
+    writes race to the same value and need no ordering. Rows no route claims
+    keep whatever the caller pre-filled (-1, the padding sentinel).
+    """
+
+    @flyc.kernel(
+        name="moe_row_to_token",
+        known_block_size=[_ROW_TO_TOKEN_BLOCK, 1, 1],
+    )
+    def row_to_token_kernel(
+        topids_to_rows: fx.Pointer,  # (numel,) int32 route -> final row
+        row_to_token: fx.Pointer,  # (contiguous_m,) int32 out
+        numel: Int32,
+        topk: Int32,
+    ):
+        i = fx.Uint32(fx.block_idx.x) * _ROW_TO_TOKEN_BLOCK + fx.Uint32(
+            fx.thread_idx.x
+        )
+        if i < fx.Uint32(numel):
+            row = ptr_buf_tensor(topids_to_rows)[i]
+            # Dropped routes carry a negative sentinel and own no row.
+            if fx.Int32(row) >= fx.Int32(0):
+                ptr_buf_tensor(row_to_token)[fx.Uint32(row)] = fx.Int32(
+                    i // fx.Uint32(topk)
+                )
+
+    @flyc.jit
+    def launch_row_to_token(
+        topids_to_rows: fx.Pointer,
+        row_to_token: fx.Pointer,
+        numel: fx.Int32,
+        topk: fx.Int32,
+        grid_blocks: fx.Int32,
+        stream: fx.Stream = fx.Stream(None),  # noqa: B008
+    ):
+        row_to_token_kernel(topids_to_rows, row_to_token, numel, topk).launch(
+            grid=(fx.Int64(grid_blocks), 1, 1),
+            block=(_ROW_TO_TOKEN_BLOCK, 1, 1),
+            stream=stream,
+        )
+
+    launch_row_to_token.compile_hints = {
+        "llvm_options": {
+            "amdgpu-kernarg-preload": AITER_FLYDSL_KERNARG_PRELOAD,
+            "amdgpu-kernarg-preload-count": AITER_FLYDSL_KERNARG_PRELOAD_COUNT,
+        },
+    }
+    return launch_row_to_token
+
+
 def build_moe_contiguous_psum_remap_ep_module():
     """psum + masked->contiguous remap, fused with the gemm2 EP ep_rowmap build.
 

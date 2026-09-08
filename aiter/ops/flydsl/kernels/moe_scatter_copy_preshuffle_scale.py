@@ -54,9 +54,11 @@ Grid  : (tiles_per_expert, E, 1)   -- tiles_per_expert = max_m // (wmma_rep*16)
 Block : (BLOCK_THREADS, 1, 1)
 """
 
+import os
+
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-from flydsl.expr import range_constexpr
+from flydsl.expr import gpu, range_constexpr
 from flydsl.expr.typing import Int32
 
 from aiter.ops.flydsl.kernels.tensor_shim import (
@@ -224,3 +226,152 @@ def build_moe_scatter_copy_preshuffle_scale_module(
         },
     }
     return launch_preshuffle
+
+
+def build_moe_gather_preshuffle_scale_lds_module(
+    row_bytes: int, wmma_rep: int, scale_k_per_tile: int
+):
+    """Route-gather + preshuffle staged through LDS, contiguous on both sides.
+
+    The direct gather variant above can only make one side contiguous. The
+    preshuffle transposes (row, k) into (k, row), so adjacent threads either
+    read adjacent dwords of one token's scale row or write adjacent dwords of
+    one output line, never both. Writing whole 64 B lines while reading 4 bytes
+    out of each one just moves the 16x amplification from the store side to the
+    load side, which measured no faster than the scattered write it replaced.
+
+    Staging a whole row-tile in LDS transposes it there instead: the load pass
+    walks token rows, the store pass walks output lines, and both coalesce.
+
+    Launcher signature matches the gather variant::
+
+        (src, dst, rows_to_tokens, max_m, E, tiles_per_expert, stream=...)
+    """
+    assert row_bytes > 0 and row_bytes % 4 == 0, "scale row must be dword-aligned"
+    assert wmma_rep >= 1, "wmma_rep must be >= 1"
+    assert scale_k_per_tile % 4 == 0, "scale_k_per_tile must be a multiple of 4"
+    assert row_bytes % scale_k_per_tile == 0, "scale_k_per_tile must divide row"
+
+    src_dwords = row_bytes // 4
+    rows_per_tile = wmma_rep * 16
+    units_per_tile = 16 * src_dwords * wmma_rep
+
+    # Stage a k-slice of the row-tile, each slice in its own block (see the grid
+    # math below). Wider slices read each gathered row more contiguously, which
+    # is what this kernel is short of, so the budget is set high enough to take
+    # the whole row: at 16384 tokens that runs 6.9 us against 7.5 for a half row
+    # and 7.7 for an eighth. Slicing k costs nothing on the store side, whose
+    # runs are 16 dwords of one k either way. The budget stays a knob because
+    # the balance flips without the vectorized access below (a 29 KB tile then
+    # loses more to occupancy than contiguity wins).
+    _lds_budget = int(os.environ.get("AITER_PRESHUF_LDS_BUDGET", "32768"))
+    k_chunk = max(
+        (c for c in range(1, src_dwords + 1) if src_dwords % c == 0
+         and rows_per_tile * (c + 1) * 4 <= _lds_budget),
+        default=1,
+    )
+    k_chunks = src_dwords // k_chunk
+    # One dword of padding per row. The store pass reads an LDS column, whose
+    # natural stride would share banks (a 56-dword pitch is 24 mod 32, gcd 8, so
+    # 8-way); an odd pitch is coprime with 32 and spreads the wave over all.
+    lds_pitch = k_chunk + 1
+    units_per_chunk = rows_per_tile * k_chunk
+    # Each thread takes VEC consecutive dwords so the four accesses coalesce
+    # into one dwordx4 -- a wave then issues 512 B per instruction instead of
+    # 128 B, which matters most on the load side, where the gathered rows are
+    # scattered and every request costs a separate trip. VEC must divide both
+    # k_chunk (so a thread's run stays inside one row) and 16 (so a store run
+    # stays inside one output line).
+    VEC = 4 if (k_chunk % 4 == 0) else 1
+    units_vec = units_per_chunk // VEC
+    iters = (units_vec + BLOCK_THREADS - 1) // BLOCK_THREADS
+
+    @fx.struct
+    class _ScaleTileStorage:
+        buf: fx.Array[fx.Int32, rows_per_tile * lds_pitch, 16]
+
+    module_name = (
+        f"moe_gather_preshuffle_scale_lds_b{row_bytes}_r{wmma_rep}_k{scale_k_per_tile}"
+    )
+
+    @flyc.kernel(name=module_name, known_block_size=[BLOCK_THREADS, 1, 1])
+    def gather_preshuffle_lds_kernel(
+        src: fx.Pointer,  # (num_src, row_bytes) uint8
+        dst: fx.Pointer,  # (E*(max_m//wmma_rep), row_bytes*wmma_rep) uint8
+        rows_to_tokens: fx.Pointer,  # (E*max_m,) int32, -1 = padding
+        max_m: Int32,
+    ):
+        # x carries (tile, k-chunk) with the chunk in the low digit, so the
+        # blocks sharing a tile -- and therefore the same gathered token rows --
+        # stay adjacent and hit in L2.
+        xid = fx.Uint32(fx.block_idx.x)
+        tile = xid // k_chunks
+        c = xid - tile * k_chunks
+        e = fx.Uint32(fx.block_idx.y)
+        tid = fx.Uint32(fx.thread_idx.x)
+        max_m_i32 = fx.Uint32(max_m)
+
+        row_base = e * max_m_i32 + tile * rows_per_tile
+        tile_dword_base = e * (max_m_i32 * src_dwords) + tile * units_per_tile
+        sd_base = c * k_chunk
+
+        map_p = ptr_buf_tensor(rows_to_tokens)
+        src_p = ptr_buf_tensor(src)
+        dst_p = ptr_buf_tensor(dst)
+        lds_p = fx.SharedAllocator().allocate(_ScaleTileStorage).peek().buf.ptr
+
+        # Load: each thread takes VEC consecutive dwords of one token's row.
+        for it in range_constexpr(iters):
+            unit = (tid + it * BLOCK_THREADS) * VEC
+            if unit < fx.Uint32(units_per_chunk):
+                row = unit // k_chunk
+                sd = unit - row * k_chunk
+                srow = map_p[row_base + row]
+                valid = fx.Int32(srow) >= fx.Int32(0)
+                # Clamp in-bounds when padding, then zero the value.
+                src_off = valid.select(
+                    fx.Uint32(srow) * src_dwords + sd_base + sd, fx.Uint32(0)
+                )
+                for j in range_constexpr(VEC):
+                    v = fx.Int32(src_p[src_off + j])
+                    lds_p[row * lds_pitch + sd + j] = valid.select(v, fx.Int32(0))
+
+        gpu.barrier()
+
+        # Store: each thread takes VEC consecutive lanes of one output line.
+        for it in range_constexpr(iters):
+            unit = (tid + it * BLOCK_THREADS) * VEC
+            if unit < fx.Uint32(units_per_chunk):
+                lane = unit % 16
+                t2 = unit // 16
+                w = t2 % wmma_rep
+                sd = t2 // wmma_rep
+                dst_off = (
+                    tile_dword_base + ((sd_base + sd) * wmma_rep + w) * 16 + lane
+                )
+                for j in range_constexpr(VEC):
+                    dst_p[dst_off + j] = lds_p[(w * 16 + lane + j) * lds_pitch + sd]
+
+    @flyc.jit
+    def launch_gather_preshuffle_lds(
+        src: fx.Pointer,
+        dst: fx.Pointer,
+        rows_to_tokens: fx.Pointer,
+        max_m: fx.Int32,
+        E: fx.Int32,
+        tiles_per_expert: fx.Int32,
+        stream: fx.Stream,
+    ):
+        gather_preshuffle_lds_kernel(src, dst, rows_to_tokens, max_m).launch(
+            grid=(fx.Int64(tiles_per_expert) * k_chunks, fx.Int64(E), 1),
+            block=(BLOCK_THREADS, 1, 1),
+            stream=stream,
+        )
+
+    launch_gather_preshuffle_lds.compile_hints = {
+        "llvm_options": {
+            "amdgpu-kernarg-preload": AITER_FLYDSL_KERNARG_PRELOAD,
+            "amdgpu-kernarg-preload-count": AITER_FLYDSL_KERNARG_PRELOAD_COUNT,
+        },
+    }
+    return launch_gather_preshuffle_lds

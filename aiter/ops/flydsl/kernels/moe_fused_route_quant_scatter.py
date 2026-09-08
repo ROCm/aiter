@@ -58,6 +58,7 @@ Grid  : (ceil(numel / warps_per_block), 1, 1)   numel = token_num*topk
 Block : (BLOCK_THREADS, 1, 1)
 """
 
+import os
 from types import SimpleNamespace
 
 import flydsl.compiler as flyc
@@ -108,6 +109,28 @@ _TOKEN_MULTIDEST_BLOCKS_PER_CU = 4
 _TOKEN_MULTIDEST_MAX_KSPLIT = 14
 ELEMS_PER_LANE = 2  # bf16 columns each lane quantizes -> 1 fp4 byte / 2 fp8 bytes
 LANES_PER_MX_BLOCK = 32 // ELEMS_PER_LANE  # 16 lanes cover one 32-element MX block
+
+# Write one compact row per source token instead of one grouped row per route.
+# With topk=6 the scattered form stores every token's payload six times and its
+# scale sixteen times over (4 useful bytes per 64 B line), which is what makes
+# this kernel bandwidth-bound. Compact form writes each once, row-major, and
+# leaves it to the GEMM to gather rows via route -> token. Only the fused
+# multi-destination path honours this; the GEMM side must match, so it is
+# opt-in.
+_COMPACT_A = os.environ.get("AITER_COMPACT_A", "0") == "1"
+
+# The two halves cost very different amounts to consume. A compact payload only
+# needs the GEMM to gather by a different row index; a compact scale also needs
+# a different LDS layout there, since the scattered form is WMMA-interleaved.
+# Compacting the payload alone is therefore a usable intermediate, and the gap
+# between the two says what the harder half is worth.
+_COMPACT_SCALE = _COMPACT_A and os.environ.get("AITER_COMPACT_SCALE", "1") == "1"
+
+# Store each payload as soon as it is converted rather than holding every
+# block_iters result live until the store pass. Unset means "decide per
+# destination count" (see _emit_quant_block_loop); set it to force either way.
+_EARLY_STORE_ENV = os.environ.get("AITER_QUANT_EARLY_STORE")
+_EARLY_PAYLOAD_STORE = None if _EARLY_STORE_ENV is None else _EARLY_STORE_ENV == "1"
 
 # Architectures with native scaled-pack f32->fp4/fp8 conversion
 # (``v_cvt_scalef32_pk_{fp4,fp8}_f32``). On these the per-block pack folds the
@@ -353,6 +376,19 @@ def _emit_quant_block_loop(c: SimpleNamespace) -> None:
             num_records_bytes=c.src_scale_bytes_per_row,
         )
 
+    # Holding every block_iters payload live until the store pass costs one
+    # register each, which at 224 blocks per row is enough to cut occupancy.
+    # Retiring them at conversion wins that back, but only with a single
+    # destination: the scattered path stores the same value once per route, and
+    # moving all of those into the quant pass breaks up its load clustering for
+    # the same register saving (measured 33.7 -> 25.9 us compact, 78.1 -> 80.1
+    # scattered, at 16384 tokens).
+    early_payload_store = (
+        len(dst_payload) == 1
+        if _EARLY_PAYLOAD_STORE is None
+        else _EARLY_PAYLOAD_STORE
+    )
+
     def _mx_block_of(it):
         return (mx_group_base + arith.constant(it, type=i32)) * arith.constant(
             c.mx_blocks_per_wave_iter, type=i32
@@ -528,14 +564,23 @@ def _emit_quant_block_loop(c: SimpleNamespace) -> None:
                     packed_byte = ArithValue(nib0) | (ArithValue(nib1) << c.c4_i32)
                     payload_val = arith.trunci(T.i8, packed_byte)  # 1 fp4x2 B
 
-        quant_results.append((mx_block, payload_val, e8m0_scale))
+        if const_expr(early_payload_store):
+            # Retire the payload here instead of holding all block_iters of them
+            # live until the store pass. The store is branch-free, so the quant
+            # pass stays one basic block and its loads still cluster; only the
+            # scale, which needs a lead-lane branch, has to wait.
+            _emit_payload_stores(c, dst_payload, payload_val, mx_block)
+            quant_results.append((mx_block, None, e8m0_scale))
+        else:
+            quant_results.append((mx_block, payload_val, e8m0_scale))
 
     if const_expr(getattr(c, "scale_vec4", False)):
         # Payload per block as usual, but the row's e8m0 goes out 16 B at a
         # time: the store pass has every block's result live, so two adjacent
         # blocks' dwords pair into one dwordx4.
-        for mx_block, payload_val, _e8m0 in quant_results:
-            _emit_payload_stores(c, dst_payload, payload_val, mx_block)
+        if const_expr(not early_payload_store):
+            for mx_block, payload_val, _e8m0 in quant_results:
+                _emit_payload_stores(c, dst_payload, payload_val, mx_block)
         for i in range_constexpr(0, len(quant_results), 2):
             _emit_row_major_scale_vec4(
                 c, quant_results[i][0], quant_results[i][2], quant_results[i + 1][2]
@@ -549,21 +594,34 @@ def _emit_quant_block_loop(c: SimpleNamespace) -> None:
     # One quant result (payload_val + e8m0_scale) is written to every destination
     # row in ``c.dests``.
     for mx_block, payload_val, e8m0_scale in quant_results:
-        _emit_quant_result_stores(c, dst_payload, mx_block, payload_val, e8m0_scale)
+        _emit_quant_result_stores(
+            c,
+            dst_payload,
+            mx_block,
+            payload_val,
+            e8m0_scale,
+            skip_payload=early_payload_store,
+        )
 
 
-def _emit_quant_result_stores(c, dst_payload, mx_block, payload_val, e8m0_scale):
+def _emit_quant_result_stores(
+    c, dst_payload, mx_block, payload_val, e8m0_scale, *, skip_payload=False
+):
     """Write one MX-block result to every destination in ``c.dests``.
 
     Payload stores are unpredicated. The scale stores share one lead-lane guard
     covering all destinations, so a 6-dest kernel emits one dispatch per MX
     block instead of six.
+
+    ``skip_payload`` means the quant pass already retired the payload, so only
+    the scale is left; ``payload_val`` is then None.
     """
     # The block-scale's dword/byte position depends only on ``mx_block``.
     scale_dword = fx.Uint32(mx_block) // fx.Uint32(c.c4_i32)
     byte_in_dword = mx_block - scale_dword * c.c4_i32
     e8m0_byte = arith.trunci(T.i8, e8m0_scale)
-    _emit_payload_stores(c, dst_payload, payload_val, mx_block)
+    if const_expr(not skip_payload):
+        _emit_payload_stores(c, dst_payload, payload_val, mx_block)
 
     row_major_scale = getattr(c, "row_major_scale", False)
     if const_expr(row_major_scale and getattr(c, "scale_pack_dwords", False)):
@@ -576,7 +634,7 @@ def _emit_quant_result_stores(c, dst_payload, mx_block, payload_val, e8m0_scale)
     # as a host bool).
     def _store_lead_scale():
         for dst in c.dests:
-            if const_expr(row_major_scale):
+            if const_expr(row_major_scale or getattr(dst, "scale_row_major", False)):
                 # (row, feat_dim//32) bytes: each row's scales contiguous, so a
                 # warp's six destination writes stay within six rows instead of
                 # touching a fresh cache line per MX block.
@@ -1566,6 +1624,7 @@ def build_moe_fused_quant_preshuffle_route_ksplit_module(
     mx_blocks_per_wave_iter = L.mx_blocks_per_wave_iter
     mx_blocks_per_row = L.mx_blocks_per_row
     rows_per_tile = L.rows_per_tile
+    scale_dwords_per_row = L.scale_dwords_per_row
     dst_scale_dwords_per_row = L.dst_scale_dwords_per_row
     block_iters = L.block_iters
     amax_shuffle_dists = L.amax_shuffle_dists
@@ -1630,6 +1689,7 @@ def build_moe_fused_quant_preshuffle_route_ksplit_module(
         c_payload_bytes_per_block = arith.constant(payload_bytes_per_block, type=i32)
         c_payload_bytes_per_lane = arith.constant(payload_bytes_per_lane, type=i32)
         c_dst_scale_dwords_per_row = arith.constant(dst_scale_dwords_per_row, type=i32)
+        c_scale_dwords_per_row = arith.constant(scale_dwords_per_row, type=i32)
         c_wmma_rep = arith.constant(wmma_rep, type=i32)
         c_rows_per_tile = arith.constant(rows_per_tile, type=i32)
         c_lanes_per_block = arith.constant(lanes_per_mx_block, type=i32)
@@ -1934,6 +1994,10 @@ def build_moe_token_multidest_quant_module(
         f"{'_rmscale' if row_major_scale else ''}"
         f"{'_scpk' if scale_pack_dwords else ''}"
         f"{'_scv4' if scale_vec4 else ''}"
+        # Env-driven, so it has to reach the symbol: a compact build writes a
+        # different destination set than a scattered one.
+        f"{'_cpa' if _COMPACT_A else ''}"
+        f"{'_cps' if _COMPACT_SCALE else ''}"
         f"{f'_hidtdm{tdm_hidden_chunks}' if tdm_hidden_chunks else ''}"
         f"{f'_ks{ksplit}' if ksplit > 1 else ''}"
     )
@@ -2068,6 +2132,34 @@ def build_moe_token_multidest_quant_module(
                 for row in rows
             ]
 
+            # Compact A writes one row per source token instead of one per
+            # route, moving the route -> row indirection to the GEMM, which
+            # gathers through row_to_token. The two halves are independent: a
+            # compact payload only changes the GEMM's row index, while a compact
+            # scale also needs a second pass to rebuild the WMMA layout the GEMM
+            # reads, so the payload can be compacted on its own.
+            if const_expr(_COMPACT_A):
+                payload_dests = [SimpleNamespace(payload_row_i32=token_eff)]
+            else:
+                payload_dests = [
+                    SimpleNamespace(payload_row_i32=row) for row in rows
+                ]
+            if const_expr(_COMPACT_SCALE):
+                # Row-major by construction: the compact buffer is
+                # (token, feat_dim//32), which is what the row-major scale
+                # stores already address, keyed on payload_row_i32.
+                scale_dests = [
+                    SimpleNamespace(
+                        payload_row_i32=token_eff,
+                        scale_row_dword_base=token_eff * c_scale_dwords_per_row,
+                    )
+                ]
+            else:
+                scale_dests = [
+                    SimpleNamespace(payload_row_i32=row, scale_row_dword_base=sc)
+                    for row, sc in zip(rows, scales)
+                ]
+
             block_in_wave = lane // fx.Uint32(c_lanes_per_block)
             lane_in_block = lane - block_in_wave * c_lanes_per_block
             qc = SimpleNamespace(
@@ -2105,11 +2197,8 @@ def build_moe_token_multidest_quant_module(
                 block_in_wave=block_in_wave,
                 lane_in_block=lane_in_block,
                 is_block_lead=lane_in_block == c0_i32,
-                payload_dests=[SimpleNamespace(payload_row_i32=row) for row in rows],
-                dests=[
-                    SimpleNamespace(payload_row_i32=row, scale_row_dword_base=sc)
-                    for row, sc in zip(rows, scales)
-                ],
+                payload_dests=payload_dests,
+                dests=scale_dests,
                 # Byte view for the unpacked e8m0 store; the packed dword /
                 # dwordx4 row-major stores need a width-agnostic V# instead.
                 # Both carry the same zero-on-invalid bound.
@@ -2120,7 +2209,7 @@ def build_moe_token_multidest_quant_module(
                     fx.Int64(ptrtoint(grouped_scale)),
                     num_records_bytes=scale_records,
                 ),
-                row_major_scale=row_major_scale,
+                row_major_scale=row_major_scale or _COMPACT_SCALE,
                 c_scale_bytes_per_row=c_scale_bytes_per_row,
                 c_scale_dwords_per_row=c_scale_dwords_per_row,
                 hidden_chunks=max(1, tdm_hidden_chunks),
