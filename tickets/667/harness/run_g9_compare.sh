@@ -10,6 +10,7 @@
 # Usage:
 #   bash run_g9_compare.sh [options]
 #     --gpu N          GPU index (default: env GPU, else 6)
+#     --backend NAME   peer kernel to compare FlyDSL against (default: ck)
 #     --build-ck       (re)build the CK bench binary first via build_ck_bench.sh
 #     --repeats N      D5 repeats for variance (default: 3)
 #     --iters N        timed iters (default: 1000, of-record per D1)
@@ -20,7 +21,7 @@
 # Examples:
 #   bash run_g9_compare.sh                      # full of-record sweep -> tickets/667/g9_compare.{md,csv}
 #   bash run_g9_compare.sh --build-ck           # rebuild CK first, then sweep
-#   bash run_g9_compare.sh --repeats 5 -- --shapes qwen3next --batches 1,8
+#   bash run_g9_compare.sh --backend ck --repeats 5 -- --shapes qwen3next --batches 1,8
 #   bash run_g9_compare.sh --validate           # D7 numerical cross-check (no perf sweep)
 
 set -euo pipefail
@@ -33,6 +34,7 @@ BUILD_CK="${SCRIPT_DIR}/build_ck_bench.sh"
 CK_BIN="/workspaces/rocm-libraries-wdec/bench_ck_warp_decode"
 
 GPU="${GPU:-6}"
+BACKEND="ck"
 BUILD_CK_FIRST=0
 VALIDATE=0
 REPEATS=3
@@ -44,6 +46,7 @@ PASSTHRU=()
 while [ $# -gt 0 ]; do
     case "$1" in
         --gpu)        GPU="$2"; shift 2 ;;
+        --backend)    BACKEND="$2"; shift 2 ;;
         --build-ck)   BUILD_CK_FIRST=1; shift ;;
         --validate)   VALIDATE=1; shift ;;
         --repeats)    REPEATS="$2"; shift 2 ;;
@@ -85,10 +88,11 @@ fi
 MD_OUT="${OUT_PREFIX}.md"
 CSV_OUT="${OUT_PREFIX}.csv"
 
-echo "==> G9 compare: gpu=${GPU} repeats=${REPEATS} iters=${ITERS} cold=${COLD}"
+echo "==> G9 compare: gpu=${GPU} backend=${BACKEND} repeats=${REPEATS} iters=${ITERS} cold=${COLD}"
 echo "    artifact -> ${MD_OUT} , ${CSV_OUT}"
 
 HIP_VISIBLE_DEVICES="${GPU}" "${VENV_PY}" "${COMPARE}" \
+    --backend "${BACKEND}" \
     --iters "${ITERS}" --cold "${COLD}" --repeats "${REPEATS}" \
     --md-out "${MD_OUT}" --csv-out "${CSV_OUT}" \
     "${PASSTHRU[@]}"
