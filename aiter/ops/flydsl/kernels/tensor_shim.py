@@ -58,12 +58,11 @@ BUF_VIEW_MAX_ELEMS = 0xFFFFFFFF
 def ptr_buf_tensor(
     ptr, elem=fx.Int32, n=BUF_VIEW_MAX_ELEMS, unit_elems=1, num_records_bytes=None
 ):
-    """Buffer-resource (V#) view, so ``t[i]`` / ``fx.slice`` index it.
+    """Buffer-resource (V#) view of *ptr*, so ``t[i]`` / ``fx.slice`` index it.
 
-    ``ptr`` may be an opaque ``fx.Pointer`` or a shaped ``fx.Tensor`` kernel
-    argument. Keeps the addressing `buffer_ops` used: descriptor in SGPRs,
-    32-bit voffset per access. Indexing a plain typed pointer instead builds a
-    full 64-bit address in VGPRs on every access.
+    Keeps the addressing `buffer_ops` used: descriptor in SGPRs, 32-bit voffset
+    per access. Indexing a plain typed pointer instead builds a full 64-bit
+    address in VGPRs on every access.
 
     ``unit_elems`` sets the access width and hence the rank:
       1  -> flat ``(n,)``; ``t[i]`` is one element. No atom, no fragment.
@@ -81,14 +80,6 @@ def ptr_buf_tensor(
         if unit_elems == 1
         else fx.make_layout((n, unit_elems), (unit_elems, 1))
     )
-    if isinstance(ptr, fx.Tensor):
-        tensor = fx.rocdl.make_buffer_tensor(
-            ptr,
-            max_size=num_records_bytes is None,
-            num_records_bytes=num_records_bytes,
-        )
-        return fx.Tensor(fx.make_view(fx.get_iter(tensor), layout))
-
     pt = fx.PointerType.get(
         elem.ir_type,
         address_space=fx.AddressSpace.Global,

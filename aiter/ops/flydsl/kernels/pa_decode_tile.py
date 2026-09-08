@@ -204,21 +204,23 @@ def compile_pa_decode_tile(
 
     @flyc.kernel(known_block_size=(BLOCK_THREADS, 1, 1))
     def pa_decode_tile_kernel(
-        output_ptr: fx.Tensor,  # [num_seqs*query_length, num_q_heads, head_dim]  (written directly when NP==1)
+        output_ptr: fx.Pointer,  # [num_seqs*query_length, num_q_heads, head_dim]  (written directly when NP==1)
         # per-partition partial outputs (combined by the reduce kernel when NP>1):
-        pmax_ptr: fx.Tensor,  # [num_seqs*query_length, num_kv_heads, num_partitions, query_group_size]   row max
-        psum_ptr: fx.Tensor,  # [num_seqs*query_length, num_kv_heads, num_partitions, query_group_size]   row sum
-        pout_ptr: fx.Tensor,  # [num_seqs*query_length, num_kv_heads, num_partitions, query_group_size, head_dim] Q_DTYPE, normalized O_p/l_p
-        query_ptr: fx.Tensor,  # [num_seqs*query_length, num_q_heads, head_dim] -- row = seq*query_length + qi (MTP position)
-        key_cache_ptr: fx.Tensor,  # [num_blocks, num_kv_heads, head_dim//16, block_size, 16] (blocked, see module docstring)
-        value_cache_ptr: fx.Tensor,  # [num_blocks, num_kv_heads, block_size//16, head_dim, 16] (blocked, see module docstring)
-        block_tables_ptr: fx.Tensor,  # [num_seqs, max_blocks_per_seq]
-        context_lengths_ptr: fx.Tensor,  # [num_seqs]
-        key_scale_ptr: fx.Tensor,  # [1] per-tensor OR [num_blocks, num_kv_heads, block_size] per-token
-        value_scale_ptr: fx.Tensor,  # same shape as key_scale_ptr
+        pmax_ptr: fx.Pointer,  # [num_seqs*query_length, num_kv_heads, num_partitions, query_group_size]   row max
+        psum_ptr: fx.Pointer,  # [num_seqs*query_length, num_kv_heads, num_partitions, query_group_size]   row sum
+        pout_ptr: fx.Pointer,  # [num_seqs*query_length, num_kv_heads, num_partitions, query_group_size, head_dim] Q_DTYPE, normalized O_p/l_p
+        query_ptr: fx.Pointer,  # [num_seqs*query_length, num_q_heads, head_dim] -- row = seq*query_length + qi (MTP position)
+        key_cache_ptr: fx.Pointer,  # [num_blocks, num_kv_heads, head_dim//16, block_size, 16] (blocked, see module docstring)
+        value_cache_ptr: fx.Pointer,  # [num_blocks, num_kv_heads, block_size//16, head_dim, 16] (blocked, see module docstring)
+        block_tables_ptr: fx.Pointer,  # [num_seqs, max_blocks_per_seq]
+        context_lengths_ptr: fx.Pointer,  # [num_seqs]
+        key_scale_ptr: fx.Pointer,  # [1] per-tensor OR [num_blocks, num_kv_heads, block_size] per-token
+        value_scale_ptr: fx.Pointer,  # same shape as key_scale_ptr
         max_blocks_per_seq: fx.Int32,
         stride_ks_block: fx.Int32,
         stride_ks_head: fx.Int32,
+        stride_o_row: fx.Int32,
+        stride_o_head: fx.Int32,
         stride_q_row: fx.Int32,
         stride_q_head: fx.Int32,
     ):
@@ -230,12 +232,19 @@ def compile_pa_decode_tile(
         part = fx.Int32(gpu.block_id("z"))  # context partition handled by this CTA
         n_kv = fx.Int32(gpu.grid_dim.y)  # num_kv_heads == gridDim.y
 
+        output = fx.recast_iter(Q_DTYPE, output_ptr)
+        pmax = fx.recast_iter(fx.Float32, pmax_ptr)
+        psum = fx.recast_iter(fx.Float32, psum_ptr)
+        pout = fx.recast_iter(Q_DTYPE, pout_ptr)
+
         # K/V use raw UniversalCopy so their optional i64 offsets remain intact.
         def _make_raw_flat_loader(tensor_ptr, elem_ty, reg_width, extent):
             copy_atom = fx.make_copy_atom(fx.UniversalCopy128b(), elem_ty)
             reg = fx.make_rmem_tensor(fx.make_layout(reg_width, 1), elem_ty)
             flat = fx.Tensor(
-                fx.make_view(fx.get_iter(tensor_ptr), fx.make_layout(extent, 1))
+                fx.make_view(
+                    fx.recast_iter(elem_ty, tensor_ptr), fx.make_layout(extent, 1)
+                )
             )
             tiled = fx.logical_divide(flat, fx.make_layout(1, 1))
 
@@ -1232,25 +1241,23 @@ def compile_pa_decode_tile(
             gs_head_e = row - qi_e * query_group_size
             qh = kv_h * query_group_size + gs_head_e
 
-            def _emit(o_norm, sub):
+            def _emit(o_norm, sub, query_idx, query_head):
                 if const_expr(NP == 1):
-                    out_row = output_ptr[
-                        seq * query_length + qi_e, qh, None  # noqa: B023
-                    ]
-                    out_chunk = fx.slice(
-                        fx.logical_divide(out_row, fx.make_layout(OP_ELEMS, 1)),
-                        (None, sub),
+                    out_offset = (
+                        (seq * query_length + query_idx) * stride_o_row
+                        + query_head * stride_o_head
+                        + sub * OP_ELEMS
                     )
-                    out_chunk.store(o_norm)
+                    fx.ptr_store(o_norm, fx.add_offset(output, out_offset))
                 else:
                     base = (
                         (seq * n_kv + kv_h) * NP + part
                     ) * TOTAL_ROWS + row  # noqa: B023
-                    pout_div = fx.logical_divide(pout_ptr, fx.make_layout(OP_ELEMS, 1))
-                    pout_chunk = fx.slice(
-                        pout_div, (None, base * (head_dim // OP_ELEMS) + sub)
+                    pout_offset = base * head_dim + sub * OP_ELEMS
+                    fx.ptr_store(
+                        o_norm,
+                        fx.add_offset(pout, pout_offset),
                     )
-                    pout_chunk.store(o_norm)
 
             for vh in range_constexpr(VHE_CHUNKS):
                 o_slot = _o_slot(m, vh)
@@ -1261,7 +1268,7 @@ def compile_pa_decode_tile(
                 sub = head_base // OP_ELEMS
                 # Guard the partial last tile's out-of-range rows (folded away for full tiles).
                 if row < TOTAL_ROWS:
-                    _emit(o_norm, sub)
+                    _emit(o_norm, sub, qi_e, qh)
 
             if const_expr(NP > 1):  # noqa: SIM102
                 if warp == 0 and rgroup == 0:
@@ -1270,27 +1277,29 @@ def compile_pa_decode_tile(
                         # Convert the running max from log2 units (scale_qk folds
                         # in LOG2E) to natural-log units: the shared reduce
                         # re-applies LOG2E itself when combining partitions.
-                        pmax_ptr[base] = o_final[_m_slot(m)] * fx.Float32(1.0 / LOG2E)
-                        psum_ptr[base] = l_row
+                        pmax[base] = o_final[_m_slot(m)] * fx.Float32(1.0 / LOG2E)
+                        psum[base] = l_row
 
     @flyc.jit
     def pa_decode_tile_launch(
-        output: fx.Tensor,
-        pmax: fx.Tensor,
-        psum: fx.Tensor,
-        pout: fx.Tensor,
-        query: fx.Tensor,
-        key_cache: fx.Tensor,
-        value_cache: fx.Tensor,
-        block_tables: fx.Tensor,
-        context_lengths: fx.Tensor,
-        key_scale: fx.Tensor,  # [1] per-tensor OR [num_blocks, num_kv_heads, block_size] per-token
-        value_scale: fx.Tensor,  # same shape as key_scale
+        output: fx.Pointer,
+        pmax: fx.Pointer,
+        psum: fx.Pointer,
+        pout: fx.Pointer,
+        query: fx.Pointer,
+        key_cache: fx.Pointer,
+        value_cache: fx.Pointer,
+        block_tables: fx.Pointer,
+        context_lengths: fx.Pointer,
+        key_scale: fx.Pointer,  # [1] per-tensor OR [num_blocks, num_kv_heads, block_size] per-token
+        value_scale: fx.Pointer,  # same shape as key_scale
         max_blocks_per_seq: fx.Int32,
         num_seqs: fx.Int32,
         num_kv_heads: fx.Int32,
         stride_ks_block: fx.Int32,
         stride_ks_head: fx.Int32,
+        stride_o_row: fx.Int32,
+        stride_o_head: fx.Int32,
         stride_q_row: fx.Int32,
         stride_q_head: fx.Int32,
         stream: fx.Stream = fx.Stream(None),  # noqa: B008
@@ -1314,6 +1323,8 @@ def compile_pa_decode_tile(
                 max_blocks_per_seq,
                 stride_ks_block,
                 stride_ks_head,
+                stride_o_row,
+                stride_o_head,
                 stride_q_row,
                 stride_q_head,
             ).launch(

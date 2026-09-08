@@ -65,6 +65,9 @@ def _flydsl_pointer_dtype(dtype: torch.dtype):
         torch.float32: fx.Float32,
         torch.float16: fx.Float16,
         torch.bfloat16: fx.BFloat16,
+        torch.float8_e4m3fn: fx.Float8E4M3FN,
+        torch.float8_e4m3fnuz: fx.Float8E4M3FNUZ,
+        torch.int32: fx.Int32,
     }[dtype]
 
 
@@ -280,6 +283,9 @@ def pa_decode(
     assert (
         query.stride(2) == 1
     ), f"pa_decode requires a contiguous head_dim axis, got strides {query.stride()}"
+    assert (
+        output.stride(2) == 1
+    ), f"pa_decode requires a contiguous output head_dim axis, got strides {output.stride()}"
 
     dev = query.device
     for name, tensor in (
@@ -426,22 +432,24 @@ def pa_decode(
         s = torch.cuda.current_stream(dev)
         _run_compiled(
             compiled["launch"],
-            output,
-            pmax.view(-1),
-            psum.view(-1),
-            pout.view(-1),
-            query,
-            key_cache,
-            value_cache,
-            block_tables,
-            context_lengths,
-            key_scale_t,
-            value_scale_t,
+            ptr_arg(output, _flydsl_pointer_dtype(output.dtype)),
+            ptr_arg(pmax, fx.Float32),
+            ptr_arg(psum, fx.Float32),
+            ptr_arg(pout, _flydsl_pointer_dtype(pout.dtype)),
+            ptr_arg(query, _flydsl_pointer_dtype(query.dtype)),
+            ptr_arg(key_cache, _flydsl_pointer_dtype(key_cache.dtype)),
+            ptr_arg(value_cache, _flydsl_pointer_dtype(value_cache.dtype)),
+            ptr_arg(block_tables, fx.Int32),
+            ptr_arg(context_lengths, fx.Int32),
+            ptr_arg(key_scale_t, fx.Float32),
+            ptr_arg(value_scale_t, fx.Float32),
             int(max_blocks_per_seq),
             int(num_seqs),
             int(num_kv_heads),
             stride_ks_block,
             stride_ks_head,
+            int(output.stride(0)),
+            int(output.stride(1)),
             int(query.stride(0)),
             int(query.stride(1)),
             s,
