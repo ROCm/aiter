@@ -24,7 +24,7 @@ A8W4 path is selected by `a_dtype='fp8', b_dtype='fp4'` plus
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl._mlir import ir
-from flydsl._mlir.dialects import llvm, scf
+from flydsl._mlir.dialects import llvm
 from flydsl._mlir.dialects.arith import CmpIPredicate
 from flydsl.compiler.kernel_function import CompilationContext
 from flydsl.expr import arith, const_expr, gpu, range_constexpr, rocdl
@@ -671,25 +671,11 @@ def compile_mixed_moe_gemm1_common(
                 )
 
             PERSIST_M = persist_m
-            c0_p = arith.constant(0, index=True)
-            c1_p = arith.constant(1, index=True)
             c_pm = arith.constant(PERSIST_M, index=True)
-            for_persist = scf.ForOp(c0_p, c_pm, c1_p)
-            for_ip = ir.InsertionPoint(for_persist.body)
-            for_ip.__enter__()
-            mi_p = for_persist.induction_variable
-            bx = bx_persist * c_pm + mi_p
-            bx_m = bx * arith.constant(sort_block_m, index=True)
-
-            bx_m_i32 = fx.Int32(bx_m)
-            blk_valid = fx.Uint32(bx_m_i32) < fx.Uint32(num_valid_i32)
-            expert_i32 = buffer_ops.buffer_load(
-                expert_rsrc, bx, vec_width=1, dtype=T.i32
-            )
-            expert_idx = fx.Index(expert_i32)
-            exp_valid = fx.Uint32(expert_i32) < fx.Uint32(experts)
-            if const_expr(heterogeneous_b):
-                is_shared_expert = fx.Int32(expert_i32) == fx.Int32(shared_expert_id)
+            # Per-iteration state, rebound by _persist_iter each pass so the
+            # closures below see the current iteration's values.
+            bx = bx_m = bx_m_i32 = blk_valid = None
+            expert_i32 = expert_idx = exp_valid = is_shared_expert = None
 
             def moe_gemm1_body(shared_b: bool = False):
                 body_k_base_idx = k_base_idx
@@ -2892,11 +2878,37 @@ def compile_mixed_moe_gemm1_common(
                     else:
                         moe_gemm1_body()
 
-            _gemm1_dispatch()
+            def _persist_iter(mi_p):
+                nonlocal bx, bx_m, bx_m_i32, blk_valid
+                nonlocal expert_i32, expert_idx, exp_valid, is_shared_expert
+                bx = bx_persist * c_pm + mi_p
+                bx_m = bx * arith.constant(sort_block_m, index=True)
+                bx_m_i32 = fx.Int32(bx_m)
+                blk_valid = fx.Uint32(bx_m_i32) < fx.Uint32(num_valid_i32)
+                expert_i32 = buffer_ops.buffer_load(
+                    expert_rsrc, bx, vec_width=1, dtype=T.i32
+                )
+                expert_idx = fx.Index(expert_i32)
+                exp_valid = fx.Uint32(expert_i32) < fx.Uint32(experts)
+                if const_expr(heterogeneous_b):
+                    is_shared_expert = fx.Int32(expert_i32) == fx.Int32(
+                        shared_expert_id
+                    )
+                _gemm1_dispatch()
+                gpu.barrier()
 
-            gpu.barrier()
-            scf.YieldOp([])
-            for_ip.__exit__(None, None, None)
+            c0_p = arith.constant(0, index=True)
+            c1_p = arith.constant(1, index=True)
+
+            @flyc.jit
+            def _run_persist():
+                # init=[] keeps the index-typed induction variable (scf_range),
+                # matching the original scf.ForOp; the plain no-init form would
+                # dispatch to an i32 counter.
+                for mi_p, _ in range(c0_p, c_pm, c1_p, init=[]):
+                    _persist_iter(mi_p)
+
+            _run_persist()
 
     if heterogeneous_b:
 
@@ -3727,6 +3739,7 @@ def compile_mixed_moe_gemm2_common(
             c0_p = arith.constant(0, index=True)
             c1_p = arith.constant(1, index=True)
 
+            # Loop-invariant persistent-scheduling bounds, computed once.
             if const_expr(persistent):
                 c_cu = arith.constant(cu_num, index=True)
                 c_tm_p = arith.constant(tile_m, index=True)
@@ -3741,68 +3754,17 @@ def compile_mixed_moe_gemm2_common(
                 persist_start_tile = bx_persist * tiles_per_block_base + start_tail
                 i1 = ir.IntegerType.get_signless(1)
                 init_active = arith.constant(1, type=i1)
-                for_persist = scf.ForOp(c0_p, tiles_per_block, c1_p, [init_active])
             else:
                 c_pm = arith.constant(persist_m, index=True)
                 init_prev_expert = arith.constant(0, type=T.i32)
                 init_prev_b_base = arith.constant(0, index=True)
-                for_persist = scf.ForOp(
-                    c0_p,
-                    c_pm,
-                    c1_p,
-                    [init_prev_expert, init_prev_b_base],
-                )
 
-            for_ip = ir.InsertionPoint(for_persist.body)
-            for_ip.__enter__()
-            mi_p = for_persist.induction_variable
-
-            if const_expr(persistent):
-                still_active = for_persist.inner_iter_args[0]
-                bx = persist_start_tile + mi_p
-            else:
-                prev_expert_i32 = for_persist.inner_iter_args[0]
-                prev_expert_b_base = for_persist.inner_iter_args[1]
-                bx = bx_persist * arith.constant(persist_m, index=True) + mi_p
-
-            bx_m = bx * arith.constant(tile_m, index=True)
-
-            bx_m_i32 = fx.Int32(bx_m)
-            blk_valid = (fx.Uint32(bx_m_i32) < fx.Uint32(num_valid_i32)).ir_value()
-
-            sort_blk = _div_pow2(bx_m, _sort_block_m)
-            expert_i32 = buffer_ops.buffer_load(
-                expert_rsrc, sort_blk, vec_width=1, dtype=T.i32
-            )
-            expert_idx = fx.Index(expert_i32)
-            exp_valid = (fx.Uint32(expert_i32) < fx.Uint32(experts)).ir_value()
-            if const_expr(heterogeneous_b):
-                is_shared_expert = (
-                    fx.Int32(expert_i32) == fx.Int32(shared_expert_id)
-                ).ir_value()
-
-            if const_expr(persistent):
-                expert_b_base = expert_idx * arith.constant(expert_b_stride, index=True)
-            else:
-                delta_expert = fx.Int32(expert_i32) - fx.Int32(prev_expert_i32)
-                delta_expert_idx = fx.Index(delta_expert)
-                delta_b = delta_expert_idx * arith.constant(expert_b_stride, index=True)
-                expert_b_base = prev_expert_b_base + delta_b
-
-            first_tok = buffer_ops.buffer_load(
-                sorted_rsrc, bx_m, vec_width=1, dtype=T.i32
-            )
-            first_tid = fx.Int32(first_tok) & fx.Int32(0xFFFFFF)
-            tokens_i32_guard = fx.Int32(tokens_in)
-            tile_has_tokens = (
-                fx.Uint32(first_tid) < fx.Uint32(tokens_i32_guard)
-            ).ir_value()
-
-            if const_expr(pack_M < scale_pack_m):
-                m_off = _mod_pow2(_div_pow2(bx_m, 16), scale_pack_m)
-                m_scale_shift_i32 = fx.Int32(m_off * arith.constant(8, index=True))
-            else:
-                m_scale_shift_i32 = None
+            # Per-iteration state, rebound by _persist_iter each pass so the
+            # nested body closures see the current iteration's values.
+            bx = bx_m = bx_m_i32 = blk_valid = sort_blk = None
+            expert_i32 = expert_idx = exp_valid = is_shared_expert = None
+            expert_b_base = first_tok = first_tid = tile_has_tokens = None
+            tokens_i32_guard = m_scale_shift_i32 = None
 
             def moe_gemm2_then_body(
                 shared_b: bool = False,
@@ -5146,8 +5108,6 @@ def compile_mixed_moe_gemm2_common(
                 )
                 rocdl.s_setprio(0)
 
-            all_valid = arith.andi(blk_valid, arith.andi(exp_valid, tile_has_tokens))
-
             def emit_moe_gemm2_body():
                 if const_expr(heterogeneous_b):
 
@@ -5171,31 +5131,111 @@ def compile_mixed_moe_gemm2_common(
                 else:
                     moe_gemm2_then_body()
 
+            def _persist_setup(mi_p, still_active, prev_expert_i32, prev_expert_b_base):
+                nonlocal bx, bx_m, bx_m_i32, blk_valid, sort_blk
+                nonlocal expert_i32, expert_idx, exp_valid, is_shared_expert
+                nonlocal expert_b_base, first_tok, first_tid, tile_has_tokens
+                nonlocal tokens_i32_guard, m_scale_shift_i32
+                if const_expr(persistent):
+                    bx = persist_start_tile + mi_p
+                else:
+                    bx = bx_persist * arith.constant(persist_m, index=True) + mi_p
+                bx_m = bx * arith.constant(tile_m, index=True)
+                bx_m_i32 = fx.Int32(bx_m)
+                blk_valid = (fx.Uint32(bx_m_i32) < fx.Uint32(num_valid_i32)).ir_value()
+                sort_blk = _div_pow2(bx_m, _sort_block_m)
+                expert_i32 = buffer_ops.buffer_load(
+                    expert_rsrc, sort_blk, vec_width=1, dtype=T.i32
+                )
+                expert_idx = fx.Index(expert_i32)
+                exp_valid = (fx.Uint32(expert_i32) < fx.Uint32(experts)).ir_value()
+                if const_expr(heterogeneous_b):
+                    is_shared_expert = (
+                        fx.Int32(expert_i32) == fx.Int32(shared_expert_id)
+                    ).ir_value()
+                if const_expr(persistent):
+                    expert_b_base = expert_idx * arith.constant(
+                        expert_b_stride, index=True
+                    )
+                else:
+                    delta_expert = fx.Int32(expert_i32) - fx.Int32(prev_expert_i32)
+                    delta_expert_idx = fx.Index(delta_expert)
+                    delta_b = delta_expert_idx * arith.constant(
+                        expert_b_stride, index=True
+                    )
+                    expert_b_base = prev_expert_b_base + delta_b
+                first_tok = buffer_ops.buffer_load(
+                    sorted_rsrc, bx_m, vec_width=1, dtype=T.i32
+                )
+                first_tid = fx.Int32(first_tok) & fx.Int32(0xFFFFFF)
+                tokens_i32_guard = fx.Int32(tokens_in)
+                tile_has_tokens = (
+                    fx.Uint32(first_tid) < fx.Uint32(tokens_i32_guard)
+                ).ir_value()
+                if const_expr(pack_M < scale_pack_m):
+                    m_off = _mod_pow2(_div_pow2(bx_m, 16), scale_pack_m)
+                    m_scale_shift_i32 = fx.Int32(m_off * arith.constant(8, index=True))
+                else:
+                    m_scale_shift_i32 = None
+
             if const_expr(persistent):
-                cur_active = arith.andi(still_active, blk_valid)
-                do_gemm = arith.andi(cur_active, arith.andi(exp_valid, tile_has_tokens))
+
+                def _persist_iter(mi_p, still_active):
+                    _persist_setup(mi_p, still_active, None, None)
+                    cur_active = arith.andi(still_active, blk_valid)
+                    do_gemm = arith.andi(
+                        cur_active, arith.andi(exp_valid, tile_has_tokens)
+                    )
+
+                    @flyc.jit
+                    def _gemm2_valid_dispatch():
+                        if fx.Boolean(do_gemm):
+                            emit_moe_gemm2_body()
+
+                    _gemm2_valid_dispatch()
+                    gpu.barrier()
+                    return cur_active
 
                 @flyc.jit
-                def _gemm2_valid_dispatch():
-                    if fx.Boolean(do_gemm):
-                        emit_moe_gemm2_body()
+                def _run_persist():
+                    for mi_p, state in range(
+                        c0_p, tiles_per_block, c1_p, init=[init_active]
+                    ):
+                        cur_active = _persist_iter(mi_p, state[0])
+                        yield [cur_active]
 
-                _gemm2_valid_dispatch()
-
-                gpu.barrier()
-                scf.YieldOp([cur_active])
+                _run_persist()
             else:
 
+                def _persist_iter(mi_p, prev_expert_i32, prev_expert_b_base):
+                    _persist_setup(mi_p, None, prev_expert_i32, prev_expert_b_base)
+                    all_valid = arith.andi(
+                        blk_valid, arith.andi(exp_valid, tile_has_tokens)
+                    )
+
+                    @flyc.jit
+                    def _gemm2_valid_dispatch():
+                        if fx.Boolean(all_valid):
+                            emit_moe_gemm2_body()
+
+                    _gemm2_valid_dispatch()
+                    gpu.barrier()
+                    return expert_i32, expert_b_base
+
                 @flyc.jit
-                def _gemm2_valid_dispatch():
-                    if fx.Boolean(all_valid):
-                        emit_moe_gemm2_body()
+                def _run_persist():
+                    for mi_p, state in range(
+                        c0_p,
+                        c_pm,
+                        c1_p,
+                        init=[init_prev_expert, init_prev_b_base],
+                    ):
+                        nxt_expert_i32, nxt_expert_b_base = _persist_iter(
+                            mi_p, state[0], state[1]
+                        )
+                        yield [nxt_expert_i32, nxt_expert_b_base]
 
-                _gemm2_valid_dispatch()
-
-                gpu.barrier()
-                scf.YieldOp([expert_i32, expert_b_base])
-            for_ip.__exit__(None, None, None)
+                _run_persist()
 
     if heterogeneous_b:
 
