@@ -260,6 +260,7 @@ def main():
                             def fn(launch=launch, a=a, out=out, m=m):
                                 launch(a, out, m, stream=torch.cuda.current_stream())
                                 return out
+
                         else:
                             m, n, k = shape
                             a = fill((m, k), dist, gen, dtype=dt)
@@ -324,7 +325,8 @@ def main():
                             finally:
                                 os.environ.pop("AITER_SMI_MONITOR", None)
                         row["status"] = "passed"
-                    except Exception as exc:  # noqa: BLE001 - retain per-case failure and exit nonzero
+                    # Retain each case failure and exit nonzero after reporting.
+                    except Exception as exc:  # noqa: BLE001
                         import traceback
 
                         traceback.print_exc()
