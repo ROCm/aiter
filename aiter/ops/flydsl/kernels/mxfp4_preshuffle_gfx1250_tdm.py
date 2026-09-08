@@ -22,6 +22,8 @@ from .gemm_common_gfx1250 import (
     fused_situv2_elem,
     make_lds_copy_ops,
     pipeline_fence,
+    pipeline_fence_signal,
+    pipeline_fence_wait,
     situv2_consts,
     workgroup_barrier,
 )
@@ -711,6 +713,17 @@ def launch_gemm_a8w4_tdm(
 
         SA_WIDTH, SB_WIDTH = max(2, sa_pairs), max(2, sb_pairs)
         RmemSlot = namedtuple("RmemSlot", "a b sa sb")
+        use_seed_pipeline = (
+            a_is_fp4
+            and tile_m == 256
+            and tile_n == 256
+            and tile_k == 256
+            and m_warp == 2
+            and n_warp == 2
+            and num_buffers == 4
+            and next_stage_on
+            and K == 3072
+        )
 
         def make_rmem_slot():
             """Registers holding one k128 of A/B/scales, like c_frags.
@@ -735,7 +748,11 @@ def launch_gemm_a8w4_tdm(
 
         # Two slots: the k-tile loop is a runtime scf.for, so the tile boundary
         # cannot carry a Python value, and a prefetch needs a slot no WMMA reads.
-        rmem_slots = [make_rmem_slot() for _ in range_constexpr(2)]
+        rmem_slots = (
+            []
+            if const_expr(use_seed_pipeline)
+            else [make_rmem_slot() for _ in range_constexpr(2)]
+        )
 
         def load_lds_data(slot, lds_addr, ksl):
             """Load one k128 from precomputed LDS bases into ``slot``."""
@@ -897,6 +914,354 @@ def launch_gemm_a8w4_tdm(
                 )
                 rocdl.sched_barrier(0)
 
+        seed_marks = [0, 0]
+        if const_expr(use_seed_pipeline):
+            half_m = wmma_m_rep // 2
+            half_n = wmma_n_rep // 2
+            wmma_per_quadrant = half_m * half_n * KWS
+
+            class SeedDsOrder:
+                """Track the relative order of seed-pipeline LDS reads."""
+
+                LIMIT = 63
+
+                def __init__(self):
+                    self.issued = 0
+
+                def mark(self, count):
+                    self.issued += count
+                    return self.issued
+
+                def wait(self, mark):
+                    rocdl.s_wait_dscnt(min(self.issued - mark, self.LIMIT))
+
+            seed_ds = SeedDsOrder()
+
+            def make_seed_pipe(count, width):
+                return [
+                    [
+                        [
+                            fx.make_rmem_tensor(width, fx.Int32)
+                            for _ in range_constexpr(KWS)
+                        ]
+                        for _ in range_constexpr(count)
+                    ]
+                    for _ in range_constexpr(2)
+                ]
+
+            seed_a = make_seed_pipe(half_m, ACT_NDW)
+            seed_b = make_seed_pipe(half_n, WMMA_VECTOR_DWORDS)
+            seed_sa = make_seed_pipe(half_m // 2, 1)
+            seed_sb = make_seed_pipe(half_n, 1)
+
+            def seed_rmem(width, value):
+                tensor = fx.make_rmem_tensor(width, fx.Int32)
+                tensor.store(value)
+                return tensor
+
+            def seed_load_a(lds_addr, wm, ksl):
+                value = load_a(lds_addr.a, wm, ksl)
+                return value, seed_ds.mark(DS_A)
+
+            def seed_load_b(lds_addr, wn, ksl):
+                value = load_b(lds_addr.b, wn, ksl)
+                return value, seed_ds.mark(4)
+
+            def seed_load_sa(lds_addr, sm, ksl):
+                value = load_sa(lds_addr.sa, sm, ksl)
+                return value, seed_ds.mark(1)
+
+            def seed_load_sb(lds_addr, sn, ksl):
+                value = load_sb(lds_addr.sb, sn, ksl)
+                return value, seed_ds.mark(1)
+
+            def seed_scales_a(lds_addr, sm0):
+                return [
+                    seed_load_sa(lds_addr, sm0 + sm, ksl)[0]
+                    for sm in range_constexpr(half_m // 2)
+                    for ksl in range_constexpr(KWS)
+                ]
+
+            def seed_scales_b(lds_addr, sn0):
+                return [
+                    seed_load_sb(lds_addr, sn0 + sn, ksl)[0]
+                    for sn in range_constexpr(half_n)
+                    for ksl in range_constexpr(KWS)
+                ]
+
+            def load_seed_a_fragment(lds_addr, bank, wm):
+                for ksl in range_constexpr(KWS):
+                    seed_a[bank][wm][ksl].store(
+                        seed_load_a(lds_addr, wm, ksl)[0]
+                    )
+
+            def load_seed_b_fragment(lds_addr, bank, wn):
+                for ksl in range_constexpr(KWS):
+                    seed_b[bank][wn][ksl].store(
+                        seed_load_b(lds_addr, wn, ksl)[0]
+                    )
+
+            def load_half_data(lds_addr, bank):
+                """Load the persistent half of every k128 into one seed bank."""
+                for sm in range_constexpr(half_m // 2):
+                    for ksl in range_constexpr(KWS):
+                        value, _ = seed_load_sa(lds_addr, sm, ksl)
+                        seed_sa[bank][sm][ksl].store(
+                            Vec.from_elements([value], fx.Int32)
+                        )
+                for wm in range_constexpr(half_m):
+                    load_seed_a_fragment(lds_addr, bank, wm)
+                for sn in range_constexpr(half_n):
+                    for ksl in range_constexpr(KWS):
+                        value, _ = seed_load_sb(lds_addr, sn, ksl)
+                        seed_sb[bank][sn][ksl].store(
+                            Vec.from_elements([value], fx.Int32)
+                        )
+                for wn in range_constexpr(half_n):
+                    load_seed_b_fragment(lds_addr, bank, wn)
+
+            def load_seed_scale(pipe, bank):
+                return [register.load()[0] for row in pipe[bank] for register in row]
+
+            def mma_row_quad(
+                wm0,
+                wn0,
+                act,
+                wt,
+                sa_k,
+                sb_k,
+                n_fast,
+                producers,
+                mid=None,
+                mid_pos=0,
+            ):
+                """Compute one quadrant and produce the following quadrant."""
+                producer_count = len(producers)
+                for pos in range_constexpr(wmma_per_quadrant):
+                    n_minor = len(wt) if n_fast else len(act)
+                    minor = pos % n_minor
+                    ksl = (pos // n_minor) % KWS
+                    major = pos // (n_minor * KWS)
+                    i, j = (major, minor) if n_fast else (minor, major)
+                    wm = wm0 + i
+                    wn = wn0 + j
+                    idx = wm * wmma_n_rep + wn
+                    c_frags[idx].store(
+                        rocdl.wmma_scale_f32_32x16x128_f4(
+                            T.vec(16, T.f32),
+                            wt[j][ksl].load().ir_value(),
+                            act[i][ksl].load().ir_value(),
+                            c_frags[idx].load().ir_value(),
+                            sb_k[wn * KWS + ksl],
+                            sa_k[(wm // 2) * KWS + ksl],
+                            scaleAType=0,
+                            scaleBType=wm % 2,
+                        )
+                    )
+                    if const_expr(mid is not None and pos == mid_pos):
+                        mid()
+                    if const_expr(pos < producer_count):
+                        producers[pos]()
+                    if const_expr(pos == producer_count - 1):
+                        seed_sched_hint(producer_count - 1)
+
+            def seed_sched_hint(groups):
+                rocdl.sched_mfma(1)
+                rocdl.sched_dsrd(2)
+                for _ in range_constexpr(groups):
+                    rocdl.sched_mfma(1)
+                    rocdl.sched_dsrd(4)
+                rocdl.sched_barrier(0)
+
+            def seed_quadrant(
+                wm0,
+                wn0,
+                act,
+                wt,
+                sa_k,
+                sb_k,
+                n_fast,
+                need,
+                producers,
+                mid=None,
+                mid_pos=0,
+            ):
+                rocdl.sched_barrier(0)
+                seed_ds.wait(need)
+                rocdl.sched_barrier(0)
+                producer_count = len(producers)
+                assert producer_count <= wmma_per_quadrant
+                mma_row_quad(
+                    wm0,
+                    wn0,
+                    act,
+                    wt,
+                    sa_k,
+                    sb_k,
+                    n_fast,
+                    producers,
+                    mid,
+                    mid_pos,
+                )
+                rocdl.sched_barrier(0)
+                return seed_ds.issued
+
+            def compute_seed_stage(
+                stage,
+                next_stage,
+                bank,
+                next_bank,
+                future_slot,
+                future_kt,
+                fence_outstanding,
+                has_next,
+                parity,
+                my_jobs,
+            ):
+                a_top = seed_a[bank]
+                b_left = seed_b[bank]
+                sa_top = load_seed_scale(seed_sa, bank)
+                sb_left = load_seed_scale(seed_sb, bank)
+                a_bottom = [[None] * KWS for _ in range_constexpr(half_m)]
+                b_right = [[None] * KWS for _ in range_constexpr(half_n)]
+                sa_bottom = []
+                sb_right = []
+
+                def produce_b_right():
+                    producers = [
+                        lambda: sb_right.extend(seed_scales_b(stage, half_n))
+                    ]
+                    for wn in range_constexpr(half_n):
+                        for ksl in range_constexpr(KWS):
+
+                            def produce(wn=wn, ksl=ksl):
+                                b_right[wn][ksl] = seed_rmem(
+                                    WMMA_VECTOR_DWORDS,
+                                    seed_load_b(stage, half_n + wn, ksl)[0],
+                                )
+
+                            producers.append(produce)
+                    return producers
+
+                def produce_a_bottom():
+                    producers = [
+                        lambda: sa_bottom.extend(seed_scales_a(stage, half_m // 2))
+                    ]
+                    for wm in range_constexpr(half_m):
+                        for ksl in range_constexpr(KWS):
+
+                            def produce(wm=wm, ksl=ksl):
+                                a_bottom[wm][ksl] = seed_rmem(
+                                    ACT_NDW,
+                                    seed_load_a(stage, half_m + wm, ksl)[0],
+                                )
+
+                            producers.append(produce)
+                    return producers
+
+                def produce_seed_a():
+                    def scales():
+                        if const_expr(has_next):
+                            for sm in range_constexpr(half_m // 2):
+                                for ksl in range_constexpr(KWS):
+                                    value, _ = seed_load_sa(next_stage, sm, ksl)
+                                    seed_sa[next_bank][sm][ksl].store(
+                                        Vec.from_elements([value], fx.Int32)
+                                    )
+
+                    producers = [scales]
+                    for wm in range_constexpr(half_m):
+
+                        def produce(wm=wm):
+                            if const_expr(has_next):
+                                load_seed_a_fragment(next_stage, next_bank, wm)
+
+                        producers.append(produce)
+                    return producers
+
+                def produce_seed_b():
+                    def scales():
+                        if const_expr(has_next):
+                            for sn in range_constexpr(half_n):
+                                for ksl in range_constexpr(KWS):
+                                    value, _ = seed_load_sb(next_stage, sn, ksl)
+                                    seed_sb[next_bank][sn][ksl].store(
+                                        Vec.from_elements([value], fx.Int32)
+                                    )
+
+                    producers = [scales]
+                    for wn in range_constexpr(half_n):
+
+                        def produce(wn=wn):
+                            if const_expr(has_next):
+                                load_seed_b_fragment(next_stage, next_bank, wn)
+
+                        producers.append(produce)
+                    return producers
+
+                top_left = (0, 0)
+                top_right = (0, half_n)
+                bottom_left = (half_m, 0)
+                bottom_right = (half_m, half_n)
+                if const_expr(parity == 0):
+                    plan = [
+                        (top_left, a_top, b_left, produce_b_right),
+                        (top_right, a_top, b_right, produce_a_bottom),
+                        (bottom_left, a_bottom, b_left, produce_seed_a),
+                        (bottom_right, a_bottom, b_right, produce_seed_b),
+                    ]
+                else:
+                    plan = [
+                        (top_left, a_top, b_left, produce_a_bottom),
+                        (bottom_left, a_bottom, b_left, produce_b_right),
+                        (top_right, a_top, b_right, produce_seed_b),
+                        (bottom_right, a_bottom, b_right, produce_seed_a),
+                    ]
+
+                need = seed_marks[bank]
+                mid = None
+                for quadrant in range_constexpr(4):
+                    (wm0, wn0), act, wt, make_producers = plan[quadrant]
+                    if const_expr(quadrant == 2):
+                        need = seed_ds.issued
+                        rocdl.sched_barrier(0)
+                        seed_ds.wait(need)
+                        rocdl.sched_barrier(0)
+                        if const_expr(has_next):
+                            pipeline_fence_signal(
+                                outstanding=fence_outstanding,
+                                use_cluster=False,
+                            )
+
+                            def mid():
+                                rocdl.sched_barrier(0)
+                                pipeline_fence_wait(use_cluster=False)
+                                if const_expr(future_kt is not None):
+                                    issue(future_slot, future_kt, my_jobs)
+                                rocdl.sched_barrier(0)
+
+                    seed_quadrant(
+                        wm0,
+                        wn0,
+                        act,
+                        wt,
+                        sa_top + sa_bottom,
+                        sb_left + sb_right,
+                        quadrant > 0,
+                        need,
+                        (
+                            [lambda: None] * 8 + make_producers()
+                            if const_expr(quadrant == 2)
+                            else make_producers()
+                        ),
+                        mid,
+                        7,
+                    )
+                    if const_expr(quadrant == 2):
+                        mid = None
+                    need = seed_ds.issued if const_expr(quadrant < 2) else need
+                seed_marks[next_bank] = seed_ds.issued
+
         # Skip padding tiles (expert id == n_experts); uniform across workgroup
         if expert < n_experts:
             if const_expr(enable_ep_scatter):
@@ -919,9 +1284,63 @@ def launch_gemm_a8w4_tdm(
                 _rm_dst = lds_view(
                     fx.recast_iter(p32_shared, _rowmap_lds_ptr), (tile_m, 2), (2, 1)
                 )
+            if const_expr(use_seed_pipeline):
+                stage_lds_addrs = [
+                    calc_lds_addr(ptr_to_idx(buf_ptr(stage)))
+                    for stage in range_constexpr(num_buffers)
+                ]
+                for stage in range_constexpr(num_buffers):
+                    issue(stage, stage)
+                pipeline_fence(
+                    outstanding=TDM_PER * (num_buffers - 1),
+                    use_cluster=False,
+                )
+                load_half_data(stage_lds_addrs[0], 0)
+                seed_marks[0] = seed_ds.issued
+                n_steady = K_TILES - num_buffers
+                assert n_steady % num_buffers == 0
+
+                def run_seed_pipeline(my_jobs, parity):
+                    for revolution in range(n_steady // num_buffers):
+                        for stage in range_constexpr(num_buffers):
+                            kt = revolution * num_buffers + stage
+                            compute_seed_stage(
+                                stage_lds_addrs[stage],
+                                stage_lds_addrs[(stage + 1) % num_buffers],
+                                stage % 2,
+                                (stage + 1) % 2,
+                                stage,
+                                kt + num_buffers,
+                                TDM_PER * (num_buffers - 2),
+                                True,
+                                parity,
+                                my_jobs,
+                            )
+                    for stage in range_constexpr(num_buffers):
+                        if const_expr(enable_ep_scatter and stage == num_buffers - 1):
+                            fx.copy(_rm_atom, _rm_gt, _rm_dst)
+                        compute_seed_stage(
+                            stage_lds_addrs[stage],
+                            stage_lds_addrs[(stage + 1) % num_buffers],
+                            stage % 2,
+                            (stage + 1) % 2,
+                            stage,
+                            None,
+                            TDM_PER * max(0, num_buffers - 2 - stage),
+                            stage < num_buffers - 1,
+                            parity,
+                            my_jobs,
+                        )
+
+                wave_parity = fx.Int32(rocdl.readfirstlane(T.i32, wave % 2))
+
+                if wave_parity == 0:
+                    run_seed_pipeline(None, 0)
+                else:
+                    run_seed_pipeline(None, 1)
             # Post-compute wins for decode and for shallow pipelines: at
             # num_buffers<=2 mid-compute prefetches one tile and under-overlaps.
-            if const_expr(tile_m <= 64 or num_buffers <= 2):
+            elif const_expr(tile_m <= 64 or num_buffers <= 2):
                 # Post-compute issue: better for decode (small tile_m).
                 for i in range_constexpr(num_buffers):
                     issue(i, i)
