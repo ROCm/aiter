@@ -5096,11 +5096,30 @@ namespace aiter {
           const int32_t slot = (q_head_idx - q_head_start) % Q_TDM_DEPTH;
           // Wait only for THIS head's tile; the other Q_TDM_DEPTH-1 stay in flight
           // across this head's reduce -> rope -> quant -> store chain.
+          // s_wait_tensorcnt<N> = "at most N tensor ops still outstanding", so the
+          // ring's N is Q_TDM_DEPTH-1. This MUST cover every depth the dispatch can
+          // pick: a depth that falls through to a smaller N drains the whole ring
+          // and silently turns the prefetch off. It did -- the old switch stopped
+          // at case 3, so any DEPTH > 4 emitted s_wait_tensorcnt<0> (wait for ALL)
+          // and measured 17.9% slower at DEPTH=6, which was misread as an LDS /
+          // occupancy cost rather than a lost pipeline.
+          // s_wait_tensorcnt<N> = "at most N tensor ops still outstanding", so the
+          // ring's N is Q_TDM_DEPTH-1, and every depth the dispatch can pick MUST
+          // have a case. The old switch stopped at case 3, so any DEPTH > 4 fell
+          // through to s_wait_tensorcnt<0> -- wait for ALL -- which turns the
+          // prefetch off entirely. That is why DEPTH=6 measured 17.9% slower; it
+          // was misread as an LDS/occupancy cost. ISA confirms it: the DEPTH=6
+          // build emits s_wait_tensorcnt 0x0 where DEPTH=2 emits 0x1.
+          //
+          // The hardware ceiling is 3 tensor ops in flight per wave (opus.hpp:2953),
+          // so depth above 3 only parks the prologue. Range is [2,3]: depth 1 races
+          // the refill against the ds_read of the slot it overwrites (508a86ac).
+          static_assert(Q_TDM_DEPTH >= 2 && Q_TDM_DEPTH <= 3,
+                        "Q_TDM_DEPTH must be 2 or 3: 1 is a data race (508a86ac), "
+                        "and the hardware allows only 3 tensor ops in flight/wave.");
           switch (Q_TDM_DEPTH - 1) {
-            case 3:  opus::s_wait_tensorcnt<3>(); break;
             case 2:  opus::s_wait_tensorcnt<2>(); break;
-            case 1:  opus::s_wait_tensorcnt<1>(); break;
-            default: opus::s_wait_tensorcnt<0>(); break;
+            default: opus::s_wait_tensorcnt<1>(); break;
           }
           vec_q = *reinterpret_cast<const OPUS_LDS_ADDR opus_vec_i*>(
               q_lds_addr
