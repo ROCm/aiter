@@ -30,8 +30,18 @@ static inline bool dyn_gq_tuned_arch()
 }
 
 // gfx1250 tuning. All three are swept values; the sweeps are at the use sites.
-constexpr int kDynGqWideBlkMinPerSimd = 1;  // blocks/SIMD before the 256-thread block beats the 64
-constexpr int kDynGqTdmMinBlkPerSimd  = 6;  // blocks/SIMD below which TDM staging never amortises
+// The 256-thread block and TDM staging are mutually exclusive, and TDM wins where it
+// applies: a wider block scales the staged tile with it (16 KiB per ring slot instead of
+// 4), so the two together cost 22% at T=8192. Below the staging threshold the wide block
+// is worth 1-6% from T=512 up, and 2.7% NEGATIVE at T=128. Denominator 4 = a quarter of a
+// SIMD's worth of blocks, which puts the switch between T=128 and T=512.
+constexpr int kDynGqWideBlkPerSimdDenom = 4;
+// Blocks/SIMD below which TDM staging is skipped. At blk=64 this counts
+// rows*scaleN/32, so T=4096 sits at 7168 and T=8192 at 14336: 8 puts the switch between
+// them, which is where staging starts paying. It measured 10.18 vs 10.02 us at T=4096
+// (slightly harmful) against ~15% faster at T=16384. Below this the block widens to 256
+// instead -- the two are mutually exclusive, see kDynGqWideBlkPerSimdDenom.
+constexpr int kDynGqTdmMinBlkPerSimd  = 8;
 constexpr int kDynGqTdmKPT            = 2;  // staged steps per block
 
 // emit_e8m0_scale = false (default): legacy behaviour — fp4 outputs an e8m0
@@ -1020,7 +1030,7 @@ void dynamic_per_token_scaled_quant(aiter_tensor_t& out,         // [..., d]
                 const bool wide_ok =
                     dyn_gq_tuned_arch() &&
                     (static_cast<int64_t>(num_group) * num_thread_per_group / kBlkTuned) >=
-                        static_cast<int64_t>(simds_bs) * kDynGqWideBlkMinPerSimd;
+                        static_cast<int64_t>(simds_bs);   // one block per SIMD, unswept path
                 const int32_t blk_rt = wide_ok ? kBlkTuned : 64;
                 const int num_group_per_tg = blk_rt / num_thread_per_group;
                 static constexpr int32_t ooba = 4 / sizeof(out_t);
@@ -1165,22 +1175,30 @@ void dynamic_per_group_scaled_quant(aiter_tensor_t& out,         // [..., d]
             using out_t = decltype(out_type_tag);
             constexpr bool ss = decltype(shuffle_tag)::value;
             constexpr bool ee = decltype(e8m0_tag)::value;
-            // Block size follows the group ordering. Row-major reads a longer contiguous
-            // run when widened (28.7 -> 26.4 us at 64 -> 256); column-major spans more
-            // rows instead, and the lost locality outweighs it (27.0 -> 27.7).
+            // Column-major group order: consecutive groups walk x at a fixed y, which is
+            // what makes the transposed scale store contiguous. It also gates TDM staging,
+            // whose tile only forms under this order.
             constexpr bool kColMajor =
                 (std::is_same_v<out_t, opus::fp4_t> || ee) && ss && _GS == 128;
-            // The 64/256 split was swept on gfx1250; an untuned arch keeps the 64 it
-            // always had. Block size is a template argument, so both are instantiated and
-            // the arch picks at launch. The wider block covers 4x the groups, so it only
-            // pays once there are blocks to spare: at [T, 7168] it is 1.23x SLOWER at
-            // T=8 and 4-9% faster from T=2048 up.
-            static constexpr int32_t kBlkTuned = kColMajor ? 64 : 256;
+            // Block size is a template argument, so both widths are instantiated and the
+            // arch picks at launch; an untuned arch keeps the 64 it always had. TDM decides
+            // first, because a staged block scales its tile with the block width (16 KiB
+            // per ring slot at 256 against 4 at 64) and the two together measured 22%
+            // slower at T=8192. Where staging does not apply, the wide block is worth
+            // 4-6% from T=512 to T=4096.
+            static constexpr int32_t kBlkTuned = 256;
             const int simds_bs = static_cast<int>(get_num_cu_func()) * 4;
+            const int tdm_groups_at_64 = (64 / num_thread_per_group) * kDynGqTdmKPT;
+            const bool tdm_wanted =
+                dyn_gq_tuned_arch() && kColMajor && kDynGqTdmKPT > 1 &&
+                (rows % tdm_groups_at_64) == 0 &&
+                (static_cast<int64_t>(rows) * scaleN / tdm_groups_at_64) >=
+                    static_cast<int64_t>(simds_bs) * kDynGqTdmMinBlkPerSimd;
             const bool wide_ok =
-                dyn_gq_tuned_arch() &&
-                (static_cast<int64_t>(rows) * scaleN * num_thread_per_group / kBlkTuned) >=
-                    static_cast<int64_t>(simds_bs) * kDynGqWideBlkMinPerSimd;
+                dyn_gq_tuned_arch() && !tdm_wanted &&
+                (static_cast<int64_t>(rows) * scaleN * num_thread_per_group / kBlkTuned) *
+                        kDynGqWideBlkPerSimdDenom >=
+                    static_cast<int64_t>(simds_bs);
             const int32_t blk_rt = wide_ok ? kBlkTuned : 64;
             const int num_group_per_tg = blk_rt / num_thread_per_group;
             dim3 const block(blk_rt);
@@ -1201,17 +1219,9 @@ void dynamic_per_group_scaled_quant(aiter_tensor_t& out,         // [..., d]
                 (static_cast<int64_t>(rows) * cols + ooba - 1) / ooba * ooba;
             const int64_t oob_size = oob_elems * static_cast<int64_t>(sizeof(out_t));
 
-            // TDM staging, decided here because it changes the grid: a staged block owns
-            // kDynGqTdmKPT steps' worth of groups. It needs the block span to tile the
-            // matrix (hence rows % groups-per-staged-block) and it halves the block count,
-            // which costs 15% at T=128 and wins from a few thousand blocks up.
-            const int kGroupsPerStagedBlock = num_group_per_tg * kDynGqTdmKPT;
-            static constexpr int kTdmMinBlocksPerSimd = kDynGqTdmMinBlkPerSimd;
-            const int simds = static_cast<int>(get_num_cu_func()) * 4;   // 4 SIMDs per CU
-            const bool use_tdm =
-                dyn_gq_tuned_arch() &&
-                kColMajor && kDynGqTdmKPT > 1 && (rows % kGroupsPerStagedBlock) == 0 &&
-                (num_group / kGroupsPerStagedBlock) >= simds * kTdmMinBlocksPerSimd;
+            // Staging was decided at the block size above, because the two interact; it is
+            // named again here only because it also changes the grid.
+            const bool use_tdm = tdm_wanted;
 
             // The grid is deliberately sized by the UNSTAGED block span, so the back half
             // dispatches blocks that reject on the first resolve and retire. Sizing it
