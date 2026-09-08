@@ -240,7 +240,7 @@ def parse_args(args: list[str] | None = None):
     parser.add_argument(
         "--kernel-type",
         type=str,
-        choices=["bandwidth_bound", "compute_bound"],
+        choices=["bandwidth_bound", "bandwidth_bound_large", "compute_bound"],
         default="bandwidth_bound",
         help="Kernel variant to use (gluon only). Default: bandwidth_bound.",
     )
