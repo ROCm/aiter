@@ -311,7 +311,9 @@ def test_mha_v4_rejects_unavailable_sparse_recipe(q_format, v_format, message):
 
 @pytest.mark.parametrize("sparse", [False, True])
 def test_mha_v4_rejects_unimplemented_mxfp4_mxfp6_recipe(sparse):
-    with pytest.raises(NotImplementedError, match="raw preprocessing is not implemented"):
+    with pytest.raises(
+        NotImplementedError, match="raw preprocessing is not implemented"
+    ):
         _resolve_raw_recipe(
             AttentionFormat.MXFP4,
             AttentionFormat.MXFP4,
@@ -377,7 +379,9 @@ def test_mha_v4_mxfp6_fp6_p_layout_matches_permuted_canonical(sequence, dtype):
         | ((within_block & 0x04) << 3)
         | ((within_block & 0x20) >> 3)
     )
-    source_token = torch.minimum(token - within_block + paired, token.new_tensor(sequence - 1))
+    source_token = torch.minimum(
+        token - within_block + paired, token.new_tensor(sequence - 1)
+    )
     permuted = value[:, source_token].contiguous()
     expected, expected_scale = quantize_v_mxfp6(permuted)
     tiles = (sequence + 127) // 128
@@ -1537,9 +1541,7 @@ def test_mha_v4_sparse_work_table_leaves_uniform_counts_in_raster_order(
                 k_scale_mode=AttentionScaleMode.E8M0_PER_1X32,
                 v_scale_mode=AttentionScaleMode.F32_PER_TENSOR,
             ),
-            marks=pytest.mark.skipif(
-                get_gfx() != "gfx950", reason="gfx950 MX sparse"
-            ),
+            marks=pytest.mark.skipif(get_gfx() != "gfx950", reason="gfx950 MX sparse"),
             id="mxfp8",
         ),
         pytest.param(
@@ -1552,9 +1554,7 @@ def test_mha_v4_sparse_work_table_leaves_uniform_counts_in_raster_order(
                 AttentionFormat.MXFP6,
                 block_mask=mask,
             ),
-            marks=pytest.mark.skipif(
-                get_gfx() != "gfx950", reason="gfx950 MX sparse"
-            ),
+            marks=pytest.mark.skipif(get_gfx() != "gfx950", reason="gfx950 MX sparse"),
             id="f8f6",
         ),
         pytest.param(
@@ -1567,9 +1567,7 @@ def test_mha_v4_sparse_work_table_leaves_uniform_counts_in_raster_order(
                 native_fp8_format(),
                 block_mask=mask,
             ),
-            marks=pytest.mark.skipif(
-                get_gfx() != "gfx950", reason="gfx950 MX sparse"
-            ),
+            marks=pytest.mark.skipif(get_gfx() != "gfx950", reason="gfx950 MX sparse"),
             id="f6f8",
         ),
         pytest.param(
@@ -1582,9 +1580,7 @@ def test_mha_v4_sparse_work_table_leaves_uniform_counts_in_raster_order(
                 AttentionFormat.MXFP4,
                 block_mask=mask,
             ),
-            marks=pytest.mark.skipif(
-                get_gfx() != "gfx950", reason="gfx950 MX sparse"
-            ),
+            marks=pytest.mark.skipif(get_gfx() != "gfx950", reason="gfx950 MX sparse"),
             id="f6f4",
         ),
         pytest.param(
@@ -1597,9 +1593,7 @@ def test_mha_v4_sparse_work_table_leaves_uniform_counts_in_raster_order(
                 AttentionFormat.MXFP4 if mask is None else native_fp8_format(),
                 block_mask=mask,
             ),
-            marks=pytest.mark.skipif(
-                get_gfx() != "gfx950", reason="gfx950 MX sparse"
-            ),
+            marks=pytest.mark.skipif(get_gfx() != "gfx950", reason="gfx950 MX sparse"),
             id="mxfp4",
         ),
     ],

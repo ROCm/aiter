@@ -178,15 +178,11 @@ KERNEL_SPECS = {
         supports_block_sparse=True,
         uses_hadamard=True,
     ),
-    "fav3_fp8": KernelSpec(
-        (1.0, 1.0, 1.0), quantized=True, uses_hadamard=True
-    ),
+    "fav3_fp8": KernelSpec((1.0, 1.0, 1.0), quantized=True, uses_hadamard=True),
     "aiter_bf16": KernelSpec((2.0, 2.0, 2.0), include_in_all=True),
     "mha4_bf16": _mha_v4_spec((2.0, 2.0, 2.0), quantized=False),
     "mha4_bf16fp8": _mha_v4_spec((2.0, 2.0, 1.0)),
-    "mha4_i8fp8": _mha_v4_spec(
-        (1.0, 1.0, 1.0), supports_block_sparse=True
-    ),
+    "mha4_i8fp8": _mha_v4_spec((1.0, 1.0, 1.0), supports_block_sparse=True),
     "mha4_mxfp8": _mha_v4_spec(
         (1.0, 1.0, 1.0),
         supports_block_sparse=True,
@@ -452,7 +448,11 @@ def generate_test_tensors(
         # produce a late-tile outlier, so this is the structured input cosine-on-random missed.
         #   AITER_LATEPEAK_GAP : late-peak logit in nats (default 40.0 -> well past the cvt
         #                        saturation at scale_log2e*(S-seed) > 128 for 1/sqrt(d) scaling)
-        gap = float(os.environ.get("AITER_LATEPEAK_GAP", os.environ.get("AITER_LATESINK_GAP", "40.0")))
+        gap = float(
+            os.environ.get(
+                "AITER_LATEPEAK_GAP", os.environ.get("AITER_LATESINK_GAP", "40.0")
+            )
+        )
         scale = float(d_head) ** -0.5
         hot_keys = min(128, sk)  # one KV tile
         u = torch.randn((1, 1, 1, d_head), device=device, dtype=torch.float32)
@@ -1346,9 +1346,7 @@ def make_kernel_runner(
                 k_fp4 = mxfp4_k_view(k_raw, k_scale)
                 v_fp8, v_scale = quantize_v_fp8(v_bshd)
                 return q_fp4, q_scale, k_fp4, k_scale, v_fp8, v_scale
-            return _production_quantize_mxfp4(
-                quant_q, quant_k, v_bshd, softmax_scale
-            )
+            return _production_quantize_mxfp4(quant_q, quant_k, v_bshd, softmax_scale)
 
         def _kernel_mxfp4(q_fp4, q_descale, k_fp4, k_descale, v_quantized, v_descale):
             return launch_mha_v4_packed(

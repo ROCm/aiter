@@ -360,9 +360,7 @@ def _pack_v_mxfp4_colmajor_raw_fake(value):
     )
 
 
-@torch.library.custom_op(
-    "aiter::pack_v_mxfp4_colmajor_fp6_p_raw", mutates_args=()
-)
+@torch.library.custom_op("aiter::pack_v_mxfp4_colmajor_fp6_p_raw", mutates_args=())
 def pack_v_mxfp4_colmajor_fp6_p_raw(
     value: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:

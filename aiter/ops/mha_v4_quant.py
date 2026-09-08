@@ -43,9 +43,7 @@ MHA_V4_MXFP4_K_SCALE_SLACK_BYTES = 4
 MHA_V4_MXFP4_V_SCALE_SLACK_BYTES = MHA_V4_MXFP4_V_SCALE_TILE_BYTES
 MHA_V4_MXFP6_V_TILE_TOKENS = 128
 MHA_V4_MXFP6_V_PACKED_ROW_BYTES = 96
-MHA_V4_MXFP6_V_TILE_BYTES = (
-    MHA_V4_MXFP6_V_TILE_TOKENS * MHA_V4_MXFP6_V_PACKED_ROW_BYTES
-)
+MHA_V4_MXFP6_V_TILE_BYTES = MHA_V4_MXFP6_V_TILE_TOKENS * MHA_V4_MXFP6_V_PACKED_ROW_BYTES
 MHA_V4_MXFP6_V_SCALE_TILE_BYTES = 512
 MHA_V4_MXFP6_V_BUFFER_SLACK_BYTES = 256
 
@@ -322,9 +320,7 @@ def quantize_mxfp4_k(input: Tensor) -> tuple[Tensor, Tensor]:
         (scale_elements + MHA_V4_MXFP4_K_SCALE_SLACK_BYTES,), dtype=torch.uint8
     )
     scale_storage[scale_elements:].zero_()
-    scale = scale_storage[:scale_elements].view(
-        batch, sequence, heads, head_dim // 32
-    )
+    scale = scale_storage[:scale_elements].view(batch, sequence, heads, head_dim // 32)
     rotate_activation_mxfp4_quant_k(raw, scale, input)
     return raw, scale
 

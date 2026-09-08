@@ -292,9 +292,7 @@ def _validate_pack_contract(
         AttentionFormat.FP4_E2M1,
     ):
         return
-    raise ValueError(
-        f"unsupported V pack {v_pack.name} for format {v_format.name}"
-    )
+    raise ValueError(f"unsupported V pack {v_pack.name} for format {v_format.name}")
 
 
 def scale_modes_for_formats(
@@ -454,11 +452,7 @@ def _resolve_raw_recipe(
             and v_format in (AttentionFormat.MXFP6, AttentionFormat.MXFP4)
         )
     )
-    v_pack = (
-        AttentionPack.V_FOR_FP6_P
-        if uses_dense_p_pack
-        else AttentionPack.DEFAULT
-    )
+    v_pack = AttentionPack.V_FOR_FP6_P if uses_dense_p_pack else AttentionPack.DEFAULT
     return _RawRecipePlan(kind, scale_modes, v_pack)
 
 
@@ -940,7 +934,17 @@ def _launch_mxfp4_coalesced_fake(
     v_pack: int,
     softmax_scale: float,
 ) -> None:
-    del q, q_descale, k_data, k_descale, v_data, v_descale, v_format, v_pack, softmax_scale
+    del (
+        q,
+        q_descale,
+        k_data,
+        k_descale,
+        v_data,
+        v_descale,
+        v_format,
+        v_pack,
+        softmax_scale,
+    )
     del out
 
 
@@ -1038,7 +1042,9 @@ def _validate_mha_v4_raw_inputs(
     if kv_heads == 0:
         raise ValueError(f"{operation} requires non-empty KV heads")
     if q.shape[2] % kv_heads != 0:
-        raise ValueError(f"{operation} requires query heads to be divisible by KV heads")
+        raise ValueError(
+            f"{operation} requires query heads to be divisible by KV heads"
+        )
     gqa_ratio = q.shape[2] // kv_heads
     if gqa_ratio > 16 or gqa_ratio & (gqa_ratio - 1):
         raise ValueError(f"{operation} supports power-of-two GQA ratios up to 16")
@@ -1113,9 +1119,7 @@ def mha_v4(
     elif recipe.kind == _RawRecipeKind.MXFP8:
         if softmax_scale is None:
             softmax_scale = 128**-0.5
-        q_quantized, q_descale = quantize_mxfp8_q(
-            q, mha_v4_q_multiplier(softmax_scale)
-        )
+        q_quantized, q_descale = quantize_mxfp8_q(q, mha_v4_q_multiplier(softmax_scale))
         k_quantized, k_descale = quantize_mxfp8_k(k)
         v_quantized, v_descale = quantize_fp8(v)
     elif recipe.kind == _RawRecipeKind.INT8_FP8:
