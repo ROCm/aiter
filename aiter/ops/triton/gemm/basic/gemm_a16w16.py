@@ -20,12 +20,7 @@ from aiter.ops.triton._triton_kernels.gemm.basic.gemm_a16w16_persistent import (
 )
 from aiter.ops.triton.utils._triton.arch_info import get_arch
 from aiter.ops.triton.utils.common_utils import deserialize_str, serialize_dict
-from aiter.ops.triton.utils.config_utils import (
-    AITER_TRITON_CONFIGS_PATH,
-    load_config_json,
-)
 from aiter.ops.triton.utils.gemm_config_utils import (
-    STANDARD_M_BOUNDS,
     compute_splitk_params,
     get_gemm_config,
 )
@@ -137,7 +132,7 @@ def gemm_a16w16_(
         if config is None:
             config, _ = get_gemm_config(
                 "GEMM-A16W16-PERSISTENT", M, N, K, backend=backend
-            ) 
+            )
         if backend == "triton":
             config["NUM_KSPLIT"] = 1
             config = compute_splitk_params(config, K)

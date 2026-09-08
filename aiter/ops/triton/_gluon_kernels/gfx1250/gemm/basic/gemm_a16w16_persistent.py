@@ -156,7 +156,11 @@ def gemm_a16w16_persistent_kernel_(
             k_span = split_k_end - split_k_start
             num_k_tiles = gl.cdiv(k_span, BLOCK_K)
 
-            a_base = a_ptr + m_off.to(gl.int64) * stride_am + split_k_start.to(gl.int64) * stride_ak
+            a_base = (
+                a_ptr
+                + m_off.to(gl.int64) * stride_am
+                + split_k_start.to(gl.int64) * stride_ak
+            )
             a_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
                 base=a_base,
                 shape=(M - m_off, K - split_k_start),
@@ -166,7 +170,11 @@ def gemm_a16w16_persistent_kernel_(
             )
 
             if TRANSPOSE:
-                b_base = b_ptr + split_k_start.to(gl.int64) * stride_bk + n_off.to(gl.int64) * stride_bn
+                b_base = (
+                    b_ptr
+                    + split_k_start.to(gl.int64) * stride_bk
+                    + n_off.to(gl.int64) * stride_bn
+                )
                 b_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
                     base=b_base,
                     shape=(K - split_k_start, N - n_off),
@@ -175,7 +183,11 @@ def gemm_a16w16_persistent_kernel_(
                     layout=SHARED_LAYOUT_B,
                 )
             else:
-                b_base = b_ptr + n_off.to(gl.int64) * stride_bn + split_k_start.to(gl.int64) * stride_bk
+                b_base = (
+                    b_ptr
+                    + n_off.to(gl.int64) * stride_bn
+                    + split_k_start.to(gl.int64) * stride_bk
+                )
                 b_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
                     base=b_base,
                     shape=(N - n_off, K - split_k_start),
@@ -201,17 +213,20 @@ def gemm_a16w16_persistent_kernel_(
             # prologue
             for _ in gl.static_range(NUM_BUFFERS - 1):
                 gl.amd.gfx1250.tdm.async_load(
-                    a_desc, [0, 0],
+                    a_desc,
+                    [0, 0],
                     a_buffer.index(load_idx % NUM_BUFFERS),
                 )
                 if TRANSPOSE:
                     gl.amd.gfx1250.tdm.async_load(
-                        b_desc, [0, 0],
+                        b_desc,
+                        [0, 0],
                         b_buffer.index(load_idx % NUM_BUFFERS),
                     )
                 else:
                     gl.amd.gfx1250.tdm.async_load(
-                        b_desc, [0, 0],
+                        b_desc,
+                        [0, 0],
                         b_buffer.index(load_idx % NUM_BUFFERS),
                     )
                 a_desc = gl.amd.gfx1250.tdm.update_tensor_descriptor(
@@ -248,17 +263,20 @@ def gemm_a16w16_persistent_kernel_(
                 accumulator = gl.amd.gfx1250.wmma(cur_a, cur_b, accumulator)
 
                 gl.amd.gfx1250.tdm.async_load(
-                    a_desc, [0, 0],
+                    a_desc,
+                    [0, 0],
                     a_buffer.index(load_idx % NUM_BUFFERS),
                 )
                 if TRANSPOSE:
                     gl.amd.gfx1250.tdm.async_load(
-                        b_desc, [0, 0],
+                        b_desc,
+                        [0, 0],
                         b_buffer.index(load_idx % NUM_BUFFERS),
                     )
                 else:
                     gl.amd.gfx1250.tdm.async_load(
-                        b_desc, [0, 0],
+                        b_desc,
+                        [0, 0],
                         b_buffer.index(load_idx % NUM_BUFFERS),
                     )
 
@@ -282,7 +300,8 @@ def gemm_a16w16_persistent_kernel_(
                 )
                 if TRANSPOSE:
                     next_b = gl.amd.cdna4.async_copy.load_shared_relaxed(
-                        b_buffer.index((compute_idx + 1) % NUM_BUFFERS), OPERAND_LAYOUT_B
+                        b_buffer.index((compute_idx + 1) % NUM_BUFFERS),
+                        OPERAND_LAYOUT_B,
                     )
                 else:
                     next_b = gl.amd.cdna4.async_copy.load_shared_relaxed(
@@ -303,7 +322,8 @@ def gemm_a16w16_persistent_kernel_(
                 )
                 if TRANSPOSE:
                     next_b = gl.amd.cdna4.async_copy.load_shared_relaxed(
-                        b_buffer.index((compute_idx + 1) % NUM_BUFFERS), OPERAND_LAYOUT_B
+                        b_buffer.index((compute_idx + 1) % NUM_BUFFERS),
+                        OPERAND_LAYOUT_B,
                     )
                 else:
                     next_b = gl.amd.cdna4.async_copy.load_shared_relaxed(
