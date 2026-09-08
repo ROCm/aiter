@@ -338,28 +338,29 @@ def _compile_stage2(
     # Stage2's production bundle includes the terminal fused combine kernels.
     # Compile them here as well; otherwise a clean AOT-only service still falls
     # back to JIT after all GEMM2 variants have loaded successfully.
-    from aiter.ops.flydsl.kernels.communication_ops_utils import GeometryTuningTable
+    from aiter.ops.flydsl.kernels.communication_ops_utils import (
+        GeometryTuningTable,
+    )
     from aiter.ops.flydsl.kernels.flydsl_dispatch_combine_intranode_kernel import (
         make_combine_jit,
     )
+    from aiter.jit.core import AITER_CONFIGS
 
-    tuning_path = (
-        Path(__file__).resolve().parents[2]
-        / "ops"
-        / "flydsl"
-        / "kernels"
-        / "mega_moe_tuning_config"
-        / "flydsl_gfx950_mi355x_IntraNode_ep8.json"
-    )
-    tuning = GeometryTuningTable.from_tuning_file(
-        tuning_path,
-        dtype="fp8_ocp",
-        hidden_dim=model_dim,
-        zero_copy=False,
-        topk=topk,
-        local_expert_num=experts_per_rank,
-        combine_dtype="bf16",
-    )
+    tuning = GeometryTuningTable()
+    tuning_path = Path(AITER_CONFIGS.AITER_CONFIG_DISPATCH_COMBINE_INTRANODE_FILE)
+    if tuning_path.is_file():
+        tuning = GeometryTuningTable.from_tuning_file(
+            tuning_path,
+            ep_size=world_size,
+            gfx="gfx950",
+            gpu_model="mi355x",
+            dtype="fp8_ocp",
+            hidden_dim=model_dim,
+            zero_copy=False,
+            topk=topk,
+            local_expert_num=experts_per_rank,
+            combine_dtype="bf16",
+        )
     seen_combine = set()
     for entry in plan.entries:
         geometry = tuning.lookup("combine", entry.token_bucket)
