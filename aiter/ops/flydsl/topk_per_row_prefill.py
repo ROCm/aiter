@@ -5,8 +5,9 @@
 
 from functools import lru_cache
 
-import flydsl.compiler as flyc
 import torch
+
+from aiter.jit.utils.chip_info import get_gfx
 
 from .kernels.tensor_shim import _run_compiled
 from .kernels.topk_per_row_prefill_one_workgroup import (
@@ -109,11 +110,7 @@ def _validate_values_signature(
         )
 
 
-def _arch_name(device: torch.device) -> str:
-    return torch.cuda.get_device_properties(device).gcnArchName.split(":", 1)[0]
-
-
-def is_flydsl_top_k_per_row_prefill_supported(
+def _validate_flydsl_topk_call(
     logits: torch.Tensor,
     row_starts: torch.Tensor,
     row_ends: torch.Tensor,
@@ -122,50 +119,8 @@ def is_flydsl_top_k_per_row_prefill_supported(
     stride0: int,
     stride1: int,
     k: int,
-    values: torch.Tensor | None = None,
-) -> bool:
-    """Return whether the call can use the gfx1250 one-workgroup kernel."""
-    if not isinstance(logits, torch.Tensor) or logits.device.type != "cuda":
-        return False
-    if _arch_name(logits.device) not in _SUPPORTED_ARCHES:
-        return False
-    try:
-        _validate_signature(
-            _tensor_signature(logits),
-            _tensor_signature(row_starts),
-            _tensor_signature(row_ends),
-            _tensor_signature(indices),
-            num_rows,
-            stride0,
-            stride1,
-            k,
-        )
-        if values is not None:
-            _validate_values_signature(
-                _tensor_signature(values),
-                num_rows,
-                k,
-                logits.device,
-            )
-    except (RuntimeError, TypeError, ValueError):
-        return False
-    return True
-
-
-def flydsl_top_k_per_row_prefill(
-    logits: torch.Tensor,
-    row_starts: torch.Tensor,
-    row_ends: torch.Tensor,
-    indices: torch.Tensor,
     values: torch.Tensor | None,
-    num_rows: int,
-    stride0: int,
-    stride1: int,
-    k: int = 2048,
-    stable: bool = False,
-    max_effective_row_len: int | None = None,
 ) -> None:
-    """Write per-row TopK indices and optional values."""
     _validate_signature(
         _tensor_signature(logits),
         _tensor_signature(row_starts),
@@ -183,7 +138,99 @@ def flydsl_top_k_per_row_prefill(
             k,
             logits.device,
         )
-    if _arch_name(logits.device) not in _SUPPORTED_ARCHES:
+
+
+@lru_cache(maxsize=128)
+def _is_flydsl_topk_call_supported(
+    logits_signature: _TensorSignature,
+    row_starts_signature: _TensorSignature,
+    row_ends_signature: _TensorSignature,
+    indices_signature: _TensorSignature,
+    num_rows: int,
+    stride0: int,
+    stride1: int,
+    k: int,
+    values_signature: _TensorSignature | None,
+) -> bool:
+    logits_device = logits_signature[3]
+    if logits_device.type != "cuda":
+        return False
+    if get_gfx() not in _SUPPORTED_ARCHES:
+        return False
+    try:
+        _validate_signature(
+            logits_signature,
+            row_starts_signature,
+            row_ends_signature,
+            indices_signature,
+            num_rows,
+            stride0,
+            stride1,
+            k,
+        )
+        if values_signature is not None:
+            _validate_values_signature(
+                values_signature,
+                num_rows,
+                k,
+                logits_device,
+            )
+    except (RuntimeError, TypeError, ValueError):
+        return False
+    return True
+
+
+def is_flydsl_top_k_per_row_prefill_supported(
+    logits: torch.Tensor,
+    row_starts: torch.Tensor,
+    row_ends: torch.Tensor,
+    indices: torch.Tensor,
+    num_rows: int,
+    stride0: int,
+    stride1: int,
+    k: int,
+    values: torch.Tensor | None = None,
+) -> bool:
+    """Return whether the call can use the gfx1250 one-workgroup kernel."""
+    return _is_flydsl_topk_call_supported(
+        _tensor_signature(logits),
+        _tensor_signature(row_starts),
+        _tensor_signature(row_ends),
+        _tensor_signature(indices),
+        num_rows,
+        stride0,
+        stride1,
+        k,
+        None if values is None else _tensor_signature(values),
+    )
+
+
+def flydsl_top_k_per_row_prefill(
+    logits: torch.Tensor,
+    row_starts: torch.Tensor,
+    row_ends: torch.Tensor,
+    indices: torch.Tensor,
+    values: torch.Tensor | None,
+    num_rows: int,
+    stride0: int,
+    stride1: int,
+    k: int = 2048,
+    stable: bool = False,
+    max_effective_row_len: int | None = None,
+) -> None:
+    """Write per-row TopK indices and optional values."""
+    _validate_flydsl_topk_call(
+        logits,
+        row_starts,
+        row_ends,
+        indices,
+        num_rows,
+        stride0,
+        stride1,
+        k,
+        values,
+    )
+    if get_gfx() not in _SUPPORTED_ARCHES:
         raise ValueError("FlyDSL prefill TopK currently supports gfx1250 only")
     if num_rows == 0:
         return
@@ -195,27 +242,20 @@ def flydsl_top_k_per_row_prefill(
             "max_effective_row_len must be in [0, logits.shape[1]]"
         )
     block_threads = 256 if max_effective_row_len <= 4096 else 1024
-    device_index = logits.device.index
-    if device_index is None:
-        device_index = torch.cuda.current_device()
-    backend = flyc.compile_backend_name()
+    stream = torch.cuda.current_stream(logits.device)
     launcher = build_topk_per_row_prefill_one_workgroup_module(
         k,
         block_threads=block_threads,
         write_values=values is not None,
         stable=stable,
-        device_index=device_index,
-        backend=backend,
     )
-    stream = torch.cuda.current_stream(logits.device)
-    with torch.cuda.device(logits.device):
-        _run_compiled(
-            launcher,
-            logits,
-            row_starts,
-            row_ends,
-            indices,
-            values if values is not None else logits,
-            num_rows,
-            stream,
-        )
+    _run_compiled(
+        launcher,
+        logits,
+        row_starts,
+        row_ends,
+        indices,
+        values if values is not None else logits,
+        num_rows,
+        stream,
+    )
