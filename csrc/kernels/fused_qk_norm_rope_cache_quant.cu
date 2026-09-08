@@ -5993,7 +5993,30 @@ namespace aiter {
               int Q_GROUP_SIZE = 64, bool Q_SCALE_FP32 = false, bool HAS_Q_WEIGHT = false,
               int HEAD_DIM = 512, int TOKENS_PER_BLOCK = 1, int Q_TDM_DEPTH = 0>
     __global__ __launch_bounds__(TOKENS_PER_BLOCK * 64, 512 / (TOKENS_PER_BLOCK * 64))
+    // PARAMETER ORDER IS PERFORMANCE-CRITICAL, do not regroup for readability.
+    //
+    // -mllvm --amdgpu-kernarg-preload-count=32 preloads the first 32 dwords
+    // (128 B, kernarg 0x000..0x07f) into user SGPRs; anything past that costs a
+    // real s_load. With the 12 pointers first, MlaKernelParams started at 0x064
+    // and only its first 7 ints fit -- num_heads (0x0a0), max_position (0x0a4)
+    // and the SWA strides (0x0c4, 0x0d4) all fell outside.
+    //
+    // ATT at T=512 H=128 measured the cost: s_load_b96 @0xd4 = 2045 cycles and
+    // s_load_b128 @0xc4 = 903 cycles, 2948 of the kernel's 3132 scalar-load
+    // cycles in two instructions. flydsl by contrast issues one s_load_b512 from
+    // 0x0 and spends 25 cycles total on scalar loads.
+    //
+    // Putting the struct first moves every int field into the preload window.
+    // The pointers move out, but each is dereferenced through an SRD built once,
+    // so their loads are off the per-head path.
+    //
+    // (--amdgpu-kernarg-preload-count=64 was tried and is a no-op: the ISA is
+    // byte-identical, so the 32-dword window is a hardware/ABI limit on user
+    // SGPRs, not a tunable.)
     void fuse_qk_norm_rope_group_quant_cache_kernel(
+        const MlaKernelParams params,
+        float eps,
+        bool is_neox,
         const scalar_t* __restrict__ q,
         const scalar_t* __restrict__ kv,
         scalar_t* __restrict__ k_pe_out,
@@ -6006,9 +6029,6 @@ namespace aiter {
         const int64_t* __restrict__ positions,
         const scalar_t *__restrict__ cos_cache,
         const scalar_t *__restrict__ sin_cache,
-        float eps,
-        const MlaKernelParams params,
-        bool is_neox,
         // Optional fused SWA write (decode-only). Null when unused.
         cache_t*  __restrict__ swa_nope = nullptr,
         scalar_t* __restrict__ swa_rope = nullptr,
@@ -6041,6 +6061,9 @@ namespace aiter {
                  q_group_size_val, q_scale_fp32_val, has_q_weight_val, head_dim_val, tokens_per_block_val, \
                  q_tdm_depth_val> \
                <<<grid, block, coarse_lds_bytes, stream>>>(                                                             \
+                 mla_params,                                                                             \
+                 static_cast<float>(eps),                                                                \
+                 is_neox,                                                                                \
                  reinterpret_cast<const KV_T*>(q.data_ptr()),                                            \
                  reinterpret_cast<const KV_T*>(kv.data_ptr()),                                           \
                  reinterpret_cast<KV_T*>(k_rope_buff.data_ptr()),                                        \
@@ -6053,9 +6076,6 @@ namespace aiter {
                  reinterpret_cast<const int64_t*>(positions.data_ptr()),                                 \
                  reinterpret_cast<const KV_T*>(cos_cache.data_ptr()),                                    \
                  reinterpret_cast<const KV_T*>(sin_cache.data_ptr()),                                    \
-                 static_cast<float>(eps),                                                                \
-                 mla_params,                                                                             \
-                 is_neox,                                                                                \
                  reinterpret_cast<CACHE_T*>(swa_nope_ptr),                                               \
                  reinterpret_cast<KV_T*>(swa_rope_ptr),                                                  \
                  reinterpret_cast<const int32_t*>(swa_block_tables_ptr),                                 \
