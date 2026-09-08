@@ -18,7 +18,7 @@ from flydsl.expr.rocdl import ballot, readlane
 from flydsl.expr.typing import Float4E2M1FN, Int32, T
 
 from ..kernels_common import atomic_add_i32
-from ..tensor_shim import _run_compiled, ptr_buf_tensor
+from ..tensor_shim import GTensor, _run_compiled, ptr_buf_tensor
 from ..topk_per_row_decode import _warp_inclusive_prefix_i32
 from .pa_mqa_litetopk_fp4_common import (
     FP4_LITETOPK_SUPPORTED_TOPKS,
@@ -394,14 +394,17 @@ def build_pa_mqa_logits_fp4_prefill_module(
     litetopk_topk=512,
     litetopk_refresh_every=64,
     seed_report_page_errors=False,
+    input_fp8=False,
+    fp8_use_fma=False,
 ):
-    """Build the ragged-prefill FP4 MQA logits kernel."""
+    """Build the ragged-prefill paged MQA logits kernel."""
     block_threads_k = num_warps * WARP_SIZE
     m_tiles = heads // MFMA_M
-    k_tiles = head_dim // 128  # outer K-loop iters (MFMA K=128)
+    mfma_k = 32 if input_fp8 else 128
+    k_tiles = head_dim // mfma_k
     assert (
-        head_dim % 128 == 0
-    ), f"head_dim must be a multiple of 128 (MFMA K), got {head_dim}"
+        head_dim % mfma_k == 0
+    ), f"head_dim must be a multiple of MFMA K={mfma_k}, got {head_dim}"
     assert heads % MFMA_M == 0, f"heads must be a multiple of {MFMA_M}, got {heads}"
 
     N_TILES = block_k // MFMA_N
@@ -414,6 +417,10 @@ def build_pa_mqa_logits_fp4_prefill_module(
     assert not seed_calibration or num_warps <= 8
     assert not seed_emit or seed_calibration
     assert not seed_report_page_errors or seed_emit
+    assert not fp8_use_fma or input_fp8
+    if input_fp8:
+        assert (heads, head_dim) == (32, 128)
+        assert (kv_block_size, block_k, num_warps) == (64, 512, 8)
 
     assert (
         kv_block_size % MFMA_N == 0
@@ -434,6 +441,7 @@ def build_pa_mqa_logits_fp4_prefill_module(
     # KV_scale: [block_id, K_TILES, K_chunks=4, kv_block_size]
     _stride_kvs_ktile = 4 * kv_block_size
     _stride_kvs_block = k_tiles * _stride_kvs_ktile
+    _fp8_page_bytes = kv_block_size * (head_dim + 4)
 
     _kb_is_pow2 = kv_block_size & (kv_block_size - 1) == 0
     _kb_log2 = kv_block_size.bit_length() - 1
@@ -669,81 +677,116 @@ def build_pa_mqa_logits_fp4_prefill_module(
                         fx.get_iter(score_errors_ptr), fx.Int32
                     )
 
-        # Q load (hoisted): per (k_tile, mi_idx) a thread loads its 16-byte FP4
-        # chunk for head row mi_idx*16+lane_mod_16. Q: [total_tokens, H, D/2] uint8.
-        # Scaled FP4 16x16x128 MMA; opsel_b selects the per-nt scale byte, so one
-        # atom per nt (opsel_a stays 0 — Q scale is one byte per (k_tile, mi)).
-        mfma_atoms = [
-            fx.make_mma_atom(
-                fx.rocdl.cdna4.MFMA_Scale(
-                    16, 16, 128, Float4E2M1FN, Float4E2M1FN, opsel_a=0, opsel_b=nt
-                )
-            )
-            for nt in range(N_TILES_PER_WARP)
-        ]
-
-        Q_buf = fx.rocdl.make_buffer_tensor(q_ptr)
-        q_atom = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), 8)
-        q_reg_ty = fx.MemRefType.get(
-            T.i8, fx.LayoutType.get(16, 1), fx.AddressSpace.Register
-        )
-        q_reg_lay = fx.make_layout(16, 1)
-        q_a_ops = []
-        for k_tile in range_constexpr(k_tiles):
-            q_a_ops_kt = []
-            for mi_idx in range_constexpr(m_tiles):
-                q_row = fx.Int32(mi_idx * MFMA_M) + lane_mod_16
-                q_row_bytes = fx.slice(Q_buf, (row_id, q_row, None))
-                q_row_div = fx.logical_divide(q_row_bytes, fx.make_layout(16, 1))
-                col_idx = fx.Int32(k_tile * 4) + lane_div_16
-                r = fx.memref_alloca(q_reg_ty, q_reg_lay)
-                fx.copy(q_atom, fx.slice(q_row_div, (None, col_idx)), r)
-                q_4xi32 = fx.Vector(fx.memref_load_vec(r)).bitcast(fx.Int32)
-                a_frag = fx.make_rmem_tensor(4, fx.Int32)
-                a_frag.store(q_4xi32)
-                q_a_ops_kt.append(a_frag)
-            q_a_ops.append(q_a_ops_kt)
-
-        # Q scale: host-preshuffled [total_tokens, K_TILES, 4, 16, QS_PAD].
-        assert m_tiles <= 8, f"m_tiles={m_tiles} > 8 not supported. Use heads <= 128."
-        QS_buf = fx.rocdl.make_buffer_tensor(q_scale_ptr)
-        qs_atom = fx.make_copy_atom(_make_qs_buf_copy(), 8)
-        qs_reg_ty = fx.MemRefType.get(
-            T.i8, fx.LayoutType.get(qs_pad, 1), fx.AddressSpace.Register
-        )
-        qs_reg_lay = fx.make_layout(qs_pad, 1)
-        q_scale_ops = []
-        for k_tile in range_constexpr(k_tiles):
-            row = fx.slice(
-                QS_buf, (row_id, fx.Int32(k_tile), lane_div_16, lane_mod_16, None)
-            )
-            r = fx.memref_alloca(qs_reg_ty, qs_reg_lay)
-            fx.copy(qs_atom, row, r)
-            qs_dws_vec = fx.Vector(fx.memref_load_vec(r)).bitcast(fx.Int32)
-            qs_dws = [qs_dws_vec[i] for i in range(QS_DW)]
-            q_scale_ops.append(
-                [qs_dws[mi // 4] >> fx.Int32(8 * (mi % 4)) for mi in range(m_tiles)]
-            )
-
-        # Weights (hoisted): [total_tokens, H] bf16, addressed by row_id.
-        # Loaded as bf16 then widened to f32 for the per-head weighting below.
-        W_buf = fx.rocdl.make_buffer_tensor(weights_ptr)
-        w_row = fx.slice(W_buf, (row_id, None))
-        w_tiled_mi = fx.logical_divide(w_row, fx.make_layout(MFMA_M, 1))
-        w_atom = fx.make_copy_atom(fx.rocdl.BufferCopy64b(), 16)
-        w_reg_ty = fx.MemRefType.get(
-            T.bf16, fx.LayoutType.get(4, 1), fx.AddressSpace.Register
-        )
-        w_reg_lay = fx.make_layout(4, 1)
         ws_vec = fx.Vector.from_elements([weight_scale] * 4, dtype=fx.Float32)
-        w_per_lane = []
-        for mi_idx in range_constexpr(m_tiles):
-            tile = fx.slice(w_tiled_mi, (None, fx.Int32(mi_idx)))
-            tile_div = fx.logical_divide(tile, fx.make_layout(4, 1))
-            r = fx.memref_alloca(w_reg_ty, w_reg_lay)
-            fx.copy(w_atom, fx.slice(tile_div, (None, lane_div_16)), r)
-            w_f32 = fx.Vector(fx.memref_load_vec(r).to(fx.Float32))
-            w_per_lane.append(w_f32 * ws_vec)
+        if const_expr(input_fp8):
+            q_i32 = GTensor(q_ptr, dtype=T.i32, shape=(-1,))
+
+            def _load_pack_i64(i32_view, byte_offset):
+                dword_offset = fx.Int32(byte_offset) // 4
+                pair = i32_view.vec_load((dword_offset,), vec_size=2)
+                return fx.Vector(pair).bitcast(fx.Int64)[0].ir_value()
+
+            q_a_ops = []
+            for k_tile in range_constexpr(k_tiles):
+                q_a_ops_kt = []
+                for mi_idx in range_constexpr(m_tiles):
+                    q_row = fx.Int32(mi_idx * MFMA_M) + lane_mod_16
+                    byte_offset = (
+                        (row_id * fx.Int32(heads) + q_row) * fx.Int32(head_dim)
+                        + fx.Int32(k_tile * 32)
+                        + lane_div_16 * fx.Int32(8)
+                    )
+                    q_a_ops_kt.append(_load_pack_i64(q_i32, byte_offset))
+                q_a_ops.append(q_a_ops_kt)
+
+            weights_f32 = GTensor(weights_ptr, dtype=T.f32, shape=(-1, heads))
+            w_per_lane = []
+            for mi_idx in range_constexpr(m_tiles):
+                h0 = fx.Int32(mi_idx * MFMA_M) + lane_div_16 * fx.Int32(4)
+                w_per_lane.append(
+                    [
+                        fx.Float32(weights_f32[row_id, h0 + fx.Int32(ii)])
+                        for ii in range_constexpr(4)
+                    ]
+                )
+        else:
+            # Q load (hoisted): per (k_tile, mi_idx) a thread loads its 16-byte
+            # packed FP4 chunk for head row mi_idx*16+lane_mod_16.
+            mfma_atoms = [
+                fx.make_mma_atom(
+                    fx.rocdl.cdna4.MFMA_Scale(
+                        16,
+                        16,
+                        128,
+                        Float4E2M1FN,
+                        Float4E2M1FN,
+                        opsel_a=0,
+                        opsel_b=nt,
+                    )
+                )
+                for nt in range(N_TILES_PER_WARP)
+            ]
+            Q_buf = fx.rocdl.make_buffer_tensor(q_ptr)
+            q_atom = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), 8)
+            q_reg_ty = fx.MemRefType.get(
+                T.i8, fx.LayoutType.get(16, 1), fx.AddressSpace.Register
+            )
+            q_reg_lay = fx.make_layout(16, 1)
+            q_a_ops = []
+            for k_tile in range_constexpr(k_tiles):
+                q_a_ops_kt = []
+                for mi_idx in range_constexpr(m_tiles):
+                    q_row = fx.Int32(mi_idx * MFMA_M) + lane_mod_16
+                    q_row_bytes = fx.slice(Q_buf, (row_id, q_row, None))
+                    q_row_div = fx.logical_divide(q_row_bytes, fx.make_layout(16, 1))
+                    col_idx = fx.Int32(k_tile * 4) + lane_div_16
+                    r = fx.memref_alloca(q_reg_ty, q_reg_lay)
+                    fx.copy(q_atom, fx.slice(q_row_div, (None, col_idx)), r)
+                    q_4xi32 = fx.Vector(fx.memref_load_vec(r)).bitcast(fx.Int32)
+                    a_frag = fx.make_rmem_tensor(4, fx.Int32)
+                    a_frag.store(q_4xi32)
+                    q_a_ops_kt.append(a_frag)
+                q_a_ops.append(q_a_ops_kt)
+
+            assert (
+                m_tiles <= 8
+            ), f"m_tiles={m_tiles} > 8 not supported. Use heads <= 128."
+            QS_buf = fx.rocdl.make_buffer_tensor(q_scale_ptr)
+            qs_atom = fx.make_copy_atom(_make_qs_buf_copy(), 8)
+            qs_reg_ty = fx.MemRefType.get(
+                T.i8, fx.LayoutType.get(qs_pad, 1), fx.AddressSpace.Register
+            )
+            qs_reg_lay = fx.make_layout(qs_pad, 1)
+            q_scale_ops = []
+            for k_tile in range_constexpr(k_tiles):
+                row = fx.slice(
+                    QS_buf,
+                    (row_id, fx.Int32(k_tile), lane_div_16, lane_mod_16, None),
+                )
+                r = fx.memref_alloca(qs_reg_ty, qs_reg_lay)
+                fx.copy(qs_atom, row, r)
+                qs_dws_vec = fx.Vector(fx.memref_load_vec(r)).bitcast(fx.Int32)
+                qs_dws = [qs_dws_vec[i] for i in range(QS_DW)]
+                q_scale_ops.append(
+                    [qs_dws[mi // 4] >> fx.Int32(8 * (mi % 4)) for mi in range(m_tiles)]
+                )
+
+            W_buf = fx.rocdl.make_buffer_tensor(weights_ptr)
+            w_row = fx.slice(W_buf, (row_id, None))
+            w_tiled_mi = fx.logical_divide(w_row, fx.make_layout(MFMA_M, 1))
+            w_atom = fx.make_copy_atom(fx.rocdl.BufferCopy64b(), 16)
+            w_reg_ty = fx.MemRefType.get(
+                T.bf16, fx.LayoutType.get(4, 1), fx.AddressSpace.Register
+            )
+            w_reg_lay = fx.make_layout(4, 1)
+            w_per_lane = []
+            for mi_idx in range_constexpr(m_tiles):
+                tile = fx.slice(w_tiled_mi, (None, fx.Int32(mi_idx)))
+                tile_div = fx.logical_divide(tile, fx.make_layout(4, 1))
+                r = fx.memref_alloca(w_reg_ty, w_reg_lay)
+                fx.copy(w_atom, fx.slice(tile_div, (None, lane_div_16)), r)
+                w_f32 = fx.Vector(fx.memref_load_vec(r).to(fx.Float32))
+                w_per_lane.append(w_f32 * ws_vec)
 
         # ── prologue + N-1 prefetch loop + epilogue ──
 
@@ -803,68 +846,118 @@ def build_pa_mqa_logits_fp4_prefill_module(
             kvs_packed_list = []
 
             phys_shared = _uniform(phys_list[0])
-            kv_bt = _i32_buffer(
-                kv_cache_ptr,
-                width=4,
-                elem_offset=fx.Int64(phys_shared) * fx.Int64(_stride_kv_block // 4),
-            )
-            kvs_bt = _i32_buffer(
-                kv_scale_ptr,
-                width=1,
-                elem_offset=fx.Int64(phys_shared) * fx.Int64(_stride_kvs_block // 4),
-            )
-            kvs_base_off_elems = (
-                lane_div_16 * kv_block_size + lane_mod_16 * fx.Int32(N_TILES_PER_WARP)
-            ) >> fx.Int32(2)
-            for k_tile in range_constexpr(k_tiles):
-                kvs_packed = kvs_bt[
-                    kvs_base_off_elems + fx.Int32(k_tile * _stride_kvs_ktile // 4)
-                ]
-                kvs_packed_list.append(kvs_packed)
-
-            ni0 = warp_id * fx.Int32(N_TILES_PER_WARP)
-            token_local0 = (
-                (chunk_start + c_i32_arg) * fx.Int32(block_k)
-                + ni0 * fx.Int32(MFMA_N)
-                + lane_mod_16
-            )
-            token_in_block0 = _mod_kb(token_local0)
-            kv_base_off_elems = (
-                lane_div_16 * kv_block_size * _kv_chunk_bytes
-                + token_in_block0 * _kv_chunk_bytes
-            ) >> fx.Int32(2)
-            for nt in range_constexpr(N_TILES_PER_WARP):
-                for k_tile in range_constexpr(k_tiles):
-                    kv_soffset = k_tile * _stride_kv_ktile + nt * _stride_kv_ntile
-                    kv_c = _load_vec4_i32(
-                        kv_bt, kv_base_off_elems + fx.Int32(kv_soffset // 4)
+            if const_expr(input_fp8):
+                page_base = fx.Int64(phys_shared) * fx.Int64(_fp8_page_bytes)
+                kv_i32 = GTensor(
+                    kv_cache_ptr,
+                    dtype=T.i32,
+                    shape=(-1,),
+                    static_bytes_offset_i64=page_base,
+                )
+                scale_f32 = GTensor(
+                    kv_scale_ptr,
+                    dtype=T.f32,
+                    shape=(-1,),
+                    static_bytes_offset_i64=page_base,
+                )
+                for nt in range_constexpr(N_TILES_PER_WARP):
+                    kvs_packed_list.append(
+                        fx.Float32(scale_f32[fx.Int32(nt * MFMA_N) + lane_mod_16])
                     )
-                    kv_list.append(kv_c)
+                    for k_tile in range_constexpr(k_tiles):
+                        d0 = fx.Int32(k_tile * 32) + lane_div_16 * fx.Int32(8)
+                        payload_byte_offset = (
+                            fx.Int32(nt * MFMA_N * head_dim)
+                            + (d0 // fx.Int32(16)) * fx.Int32(MFMA_N * 16)
+                            + lane_mod_16 * fx.Int32(16)
+                            + (d0 % fx.Int32(16))
+                        )
+                        kv_list.append(_load_pack_i64(kv_i32, payload_byte_offset))
+            else:
+                kv_bt = _i32_buffer(
+                    kv_cache_ptr,
+                    width=4,
+                    elem_offset=fx.Int64(phys_shared) * fx.Int64(_stride_kv_block // 4),
+                )
+                kvs_bt = _i32_buffer(
+                    kv_scale_ptr,
+                    width=1,
+                    elem_offset=fx.Int64(phys_shared)
+                    * fx.Int64(_stride_kvs_block // 4),
+                )
+                kvs_base_off_elems = (
+                    lane_div_16 * kv_block_size
+                    + lane_mod_16 * fx.Int32(N_TILES_PER_WARP)
+                ) >> fx.Int32(2)
+                for k_tile in range_constexpr(k_tiles):
+                    kvs_packed = kvs_bt[
+                        kvs_base_off_elems + fx.Int32(k_tile * _stride_kvs_ktile // 4)
+                    ]
+                    kvs_packed_list.append(kvs_packed)
+
+                ni0 = warp_id * fx.Int32(N_TILES_PER_WARP)
+                token_local0 = (
+                    (chunk_start + c_i32_arg) * fx.Int32(block_k)
+                    + ni0 * fx.Int32(MFMA_N)
+                    + lane_mod_16
+                )
+                token_in_block0 = _mod_kb(token_local0)
+                kv_base_off_elems = (
+                    lane_div_16 * kv_block_size * _kv_chunk_bytes
+                    + token_in_block0 * _kv_chunk_bytes
+                ) >> fx.Int32(2)
+                for nt in range_constexpr(N_TILES_PER_WARP):
+                    for k_tile in range_constexpr(k_tiles):
+                        kv_soffset = k_tile * _stride_kv_ktile + nt * _stride_kv_ntile
+                        kv_c = _load_vec4_i32(
+                            kv_bt, kv_base_off_elems + fx.Int32(kv_soffset // 4)
+                        )
+                        kv_list.append(kv_c)
 
             return kv_list, kvs_packed_list
 
         def _issue_nt_mfmas(kv_list_in, kvs_packed_per_kt, nt):
             zero = fx.Vector.filled(4, 0.0, fx.Float32)
             accs = [zero] * m_tiles
-            # opsel_b=nt is baked into the atom; scale_b is the packed 4-nt word.
-            atom = mfma_atoms[nt]
-            for k_tile in range_constexpr(k_tiles):
-                b_frag = fx.make_rmem_tensor(4, fx.Int32)
-                b_frag.store(fx.Vector(kv_list_in[nt * k_tiles + k_tile]))
-                kv_scale_packed = kvs_packed_per_kt[k_tile]
-                for mi_idx in range_constexpr(m_tiles):
-                    c_frag = fx.make_rmem_tensor(4, fx.Float32)
-                    c_frag.store(fx.Vector(accs[mi_idx]))
-                    fx.gemm(
-                        atom,
-                        c_frag,
-                        q_a_ops[k_tile][mi_idx],
-                        b_frag,
-                        c_frag,
-                        scale_a=q_scale_ops[k_tile][mi_idx],
-                        scale_b=kv_scale_packed,
-                    )
-                    accs[mi_idx] = c_frag.load()
+            if const_expr(input_fp8):
+                mfma_res_ty = fx.Vector.make_type(4, fx.Float32)
+                for k_tile in range_constexpr(k_tiles):
+                    b_pack = kv_list_in[nt * k_tiles + k_tile]
+                    for mi_idx in range_constexpr(m_tiles):
+                        accs[mi_idx] = fx.Vector(
+                            rocdl.mfma_f32_16x16x32_fp8_fp8(
+                                mfma_res_ty,
+                                [
+                                    q_a_ops[k_tile][mi_idx],
+                                    b_pack,
+                                    accs[mi_idx],
+                                    0,
+                                    0,
+                                    0,
+                                ],
+                            )
+                        )
+            else:
+                # opsel_b=nt is baked into the atom; scale_b is the packed
+                # four-nt word.
+                atom = mfma_atoms[nt]
+                for k_tile in range_constexpr(k_tiles):
+                    b_frag = fx.make_rmem_tensor(4, fx.Int32)
+                    b_frag.store(fx.Vector(kv_list_in[nt * k_tiles + k_tile]))
+                    kv_scale_packed = kvs_packed_per_kt[k_tile]
+                    for mi_idx in range_constexpr(m_tiles):
+                        c_frag = fx.make_rmem_tensor(4, fx.Float32)
+                        c_frag.store(fx.Vector(accs[mi_idx]))
+                        fx.gemm(
+                            atom,
+                            c_frag,
+                            q_a_ops[k_tile][mi_idx],
+                            b_frag,
+                            c_frag,
+                            scale_a=q_scale_ops[k_tile][mi_idx],
+                            scale_b=kv_scale_packed,
+                        )
+                        accs[mi_idx] = c_frag.load()
             return accs
 
         def _store_candidate(values_buf, indices_buf, offset, score, logical_index):
@@ -909,14 +1002,32 @@ def build_pa_mqa_logits_fp4_prefill_module(
                 state[1] = tid
             gpu.barrier()
 
-        def _reduce_nt_score(accs):
+        def _reduce_nt_score(accs, kv_scale):
             zero = fx.Vector.filled(4, 0.0, fx.Float32)
             thread_sum = ZERO_F
             for mi_idx in range_constexpr(m_tiles):
-                relu_v = fx.Vector(accs[mi_idx]).maximumf(zero)
-                w_v = fx.Vector(w_per_lane[mi_idx])
+                scores = fx.Vector(accs[mi_idx])
+                relu_v = scores.maximumf(zero)
                 for elem in [0, 1, 2, 3]:
-                    thread_sum = fx.fma(relu_v[elem], w_v[elem], thread_sum)
+                    if const_expr(input_fp8 and fp8_use_fma):
+                        thread_sum = fx.fma(
+                            relu_v[elem],
+                            w_per_lane[mi_idx][elem],
+                            thread_sum,
+                        )
+                    elif const_expr(input_fp8):
+                        thread_sum = (
+                            thread_sum + relu_v[elem] * w_per_lane[mi_idx][elem]
+                        )
+                    else:
+                        thread_sum = fx.fma(
+                            relu_v[elem],
+                            fx.Vector(w_per_lane[mi_idx])[elem],
+                            thread_sum,
+                        )
+
+            if const_expr(input_fp8):
+                thread_sum = thread_sum * kv_scale
 
             lane_i32 = fx.Int32(lane_id)
 
@@ -930,13 +1041,18 @@ def build_pa_mqa_logits_fp4_prefill_module(
             thread_sum = _bperm_xor_add(thread_sum, 16)
             return _bperm_xor_add(thread_sum, 32)
 
-        def _post_process_nt(accs, nt, c_i32_arg, chunk_threshold):
+        def _score_nt(accs, kv_scales, nt):
+            if const_expr(input_fp8):
+                return _reduce_nt_score(accs, kv_scales[nt])
+            return _reduce_nt_score(accs, ZERO_F)
+
+        def _post_process_nt(accs, nt, c_i32_arg, chunk_threshold, kv_scale):
             """relu + per-head weight + per-thread sum + bperm + windowed store."""
             ni_warp = warp_id * fx.Int32(N_TILES_PER_WARP) + fx.Int32(nt)
             token_base = (chunk_start + c_i32_arg) * fx.Int32(
                 block_k
             ) + ni_warp * fx.Int32(MFMA_N)
-            thread_sum = _reduce_nt_score(accs)
+            thread_sum = _reduce_nt_score(accs, kv_scale)
             lane_i32 = fx.Int32(lane_id)
             # `weight_scale` already folded into `w_per_lane` (hoisted, once/wave).
 
@@ -1137,12 +1253,12 @@ def build_pa_mqa_logits_fp4_prefill_module(
 
             if const_expr(litetopk or seed_calibration):
                 accs_nt1 = _issue_nt_mfmas(kv_list_in, kvs_packed_list_in, 1)
-                score_nt0 = _reduce_nt_score(accs_nt0)
+                score_nt0 = _score_nt(accs_nt0, kvs_packed_list_in, 0)
                 accs_nt2 = _issue_nt_mfmas(kv_list_in, kvs_packed_list_in, 2)
-                score_nt1 = _reduce_nt_score(accs_nt1)
+                score_nt1 = _score_nt(accs_nt1, kvs_packed_list_in, 1)
                 accs_nt3 = _issue_nt_mfmas(kv_list_in, kvs_packed_list_in, 3)
-                score_nt2 = _reduce_nt_score(accs_nt2)
-                score_nt3 = _reduce_nt_score(accs_nt3)
+                score_nt2 = _score_nt(accs_nt2, kvs_packed_list_in, 2)
+                score_nt3 = _score_nt(accs_nt3, kvs_packed_list_in, 3)
                 if const_expr(litetopk):
                     _post_process_litetopk_chunk(
                         score_nt0,
@@ -1166,12 +1282,36 @@ def build_pa_mqa_logits_fp4_prefill_module(
                 )
             else:
                 accs_nt1 = _issue_nt_mfmas(kv_list_in, kvs_packed_list_in, 1)
-                _post_process_nt(accs_nt0, 0, c_i32_arg, chunk_threshold)
+                _post_process_nt(
+                    accs_nt0,
+                    0,
+                    c_i32_arg,
+                    chunk_threshold,
+                    kvs_packed_list_in[0] if input_fp8 else ZERO_F,
+                )
                 accs_nt2 = _issue_nt_mfmas(kv_list_in, kvs_packed_list_in, 2)
-                _post_process_nt(accs_nt1, 1, c_i32_arg, chunk_threshold)
+                _post_process_nt(
+                    accs_nt1,
+                    1,
+                    c_i32_arg,
+                    chunk_threshold,
+                    kvs_packed_list_in[1] if input_fp8 else ZERO_F,
+                )
                 accs_nt3 = _issue_nt_mfmas(kv_list_in, kvs_packed_list_in, 3)
-                _post_process_nt(accs_nt2, 2, c_i32_arg, chunk_threshold)
-                _post_process_nt(accs_nt3, 3, c_i32_arg, chunk_threshold)
+                _post_process_nt(
+                    accs_nt2,
+                    2,
+                    c_i32_arg,
+                    chunk_threshold,
+                    kvs_packed_list_in[2] if input_fp8 else ZERO_F,
+                )
+                _post_process_nt(
+                    accs_nt3,
+                    3,
+                    c_i32_arg,
+                    chunk_threshold,
+                    kvs_packed_list_in[3] if input_fp8 else ZERO_F,
+                )
                 return []
 
         # === Prologue ===
@@ -1518,6 +1658,8 @@ def compile_pa_mqa_logits_fp4_prefill(
     heads: int = DEFAULT_HEADS,
     head_dim: int = DEFAULT_HEAD_DIM,
     relative_output: bool = False,
+    input_fp8: bool = False,
+    fp8_use_fma: bool = False,
 ):
     kfn, block_threads = build_pa_mqa_logits_fp4_prefill_module(
         block_k=block_k,
@@ -1526,6 +1668,8 @@ def compile_pa_mqa_logits_fp4_prefill(
         heads=heads,
         head_dim=head_dim,
         relative_output=relative_output,
+        input_fp8=input_fp8,
+        fp8_use_fma=fp8_use_fma,
     )
 
     @flyc.jit
@@ -1593,6 +1737,8 @@ def compile_pa_mqa_litetopk_fp4_seed(
     status_underfilled: int = 1 << 1,
     status_nonfinite: int = 1 << 2,
     report_page_errors: bool = False,
+    input_fp8: bool = False,
+    fp8_use_fma: bool = False,
 ):
     kfn, block_threads = build_pa_mqa_logits_fp4_prefill_module(
         block_k=block_k,
@@ -1608,6 +1754,8 @@ def compile_pa_mqa_litetopk_fp4_seed(
         seed_status_underfilled=status_underfilled,
         seed_status_nonfinite=status_nonfinite,
         litetopk_topk=topk,
+        input_fp8=input_fp8,
+        fp8_use_fma=fp8_use_fma,
     )
 
     @flyc.jit
@@ -1671,6 +1819,136 @@ def compile_pa_mqa_litetopk_fp4_seed(
         ).launch(grid=(gxi,), block=(block_threads, 1, 1), stream=stream)
 
     return launch_pa_mqa_litetopk_fp4_seed, block_threads
+
+
+def _split_fp8_paged_cache(kv_cache: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    pages = kv_cache.shape[0]
+    flat = kv_cache.view(torch.uint8).view(pages, -1)
+    payload_bytes = 64 * 128
+    return (
+        flat[:, :payload_bytes].view(torch.float8_e4m3fn),
+        flat[:, payload_bytes:].view(torch.float32),
+    )
+
+
+def _flydsl_pa_mqa_litetopk_fp8_seed(
+    q_fp8: torch.Tensor,
+    kv_cache: torch.Tensor,
+    block_tables: torch.Tensor,
+    weights: torch.Tensor,
+    cta_info: torch.Tensor,
+    origin: torch.Tensor,
+    inv_delta: torch.Tensor,
+    threshold: torch.Tensor,
+    histogram: torch.Tensor,
+    candidate_values: torch.Tensor,
+    candidate_indices: torch.Tensor,
+    candidate_counts: torch.Tensor,
+    select_starts: torch.Tensor,
+    select_ends: torch.Tensor,
+    status: torch.Tensor,
+    *,
+    n_ctas: int,
+    merge_cap: int,
+    topk: int = 2048,
+    status_candidate_overflow: int = 1 << 0,
+    status_underfilled: int = 1 << 1,
+    status_nonfinite: int = 1 << 2,
+    page_errors: torch.Tensor | None = None,
+    block_k: int = 512,
+    num_warps: int = 8,
+    use_fma: bool | None = None,
+    stream: torch.cuda.Stream | None = None,
+) -> None:
+    """Score and emit the bounded H32/D128 FP8 LiteTopK seed."""
+    rows, heads, head_dim = q_fp8.shape
+    if (heads, head_dim) != (32, 128):
+        raise ValueError("FP8 LiteTopK seed requires H=32 and D=128")
+    if q_fp8.dtype != torch.float8_e4m3fn:
+        raise ValueError("q_fp8 must use torch.float8_e4m3fn")
+    if kv_cache.dtype not in (torch.uint8, torch.float8_e4m3fn) or tuple(
+        kv_cache.shape[1:]
+    ) != (64, 1, 132):
+        raise ValueError("kv_cache must be uint8 or E4M3FN [pages, 64, 1, 132]")
+    if weights.dtype != torch.float32 or weights.shape != (rows, heads):
+        raise ValueError("weights must be float32 [rows, 32]")
+    if n_ctas != rows:
+        raise ValueError("FP8 LiteTopK seed requires exactly one CTA per row")
+    if use_fma is None:
+        use_fma = rows <= 4096
+    if cta_info.dtype != torch.int32 or cta_info.shape != (rows, CTA_INFO_WIDTH):
+        raise ValueError("cta_info must be int32 [rows, 6]")
+    kv_payload, kv_scales = _split_fp8_paged_cache(kv_cache)
+    tensors = (
+        q_fp8,
+        kv_cache,
+        block_tables,
+        weights,
+        cta_info,
+        origin,
+        inv_delta,
+        threshold,
+        histogram,
+        candidate_values,
+        candidate_indices,
+        candidate_counts,
+        select_starts,
+        select_ends,
+        status,
+        *((page_errors,) if page_errors is not None else ()),
+    )
+    if any(t.device != q_fp8.device for t in tensors):
+        raise ValueError("all FP8 LiteTopK seed tensors must be on one device")
+    if stream is None:
+        stream = torch.cuda.current_stream(q_fp8.device)
+    if torch.device(stream.device) != q_fp8.device:
+        raise ValueError("stream and FP8 LiteTopK tensors must be on one device")
+
+    with torch.cuda.device(q_fp8.device), torch.cuda.stream(stream):
+        launcher, _ = compile_pa_mqa_litetopk_fp4_seed(
+            block_k=block_k,
+            kv_block_size=64,
+            num_warps=num_warps,
+            heads=heads,
+            head_dim=head_dim,
+            topk=topk,
+            status_candidate_overflow=status_candidate_overflow,
+            status_underfilled=status_underfilled,
+            status_nonfinite=status_nonfinite,
+            report_page_errors=page_errors is not None,
+            input_fp8=True,
+            fp8_use_fma=use_fma,
+        )
+        _run_compiled(
+            launcher,
+            q_fp8,
+            q_fp8,
+            kv_payload,
+            kv_scales,
+            block_tables,
+            weights,
+            cta_info,
+            origin,
+            inv_delta,
+            threshold,
+            histogram,
+            candidate_values,
+            candidate_indices,
+            candidate_counts,
+            select_starts,
+            select_ends,
+            status,
+            page_errors if page_errors is not None else candidate_values,
+            candidate_values.stride(0),
+            merge_cap,
+            block_tables.stride(0),
+            block_tables.shape[0],
+            block_tables.shape[1],
+            kv_cache.shape[0],
+            1.0,
+            n_ctas,
+            stream,
+        )
 
 
 def flydsl_pa_mqa_litetopk_fp4_seed(
@@ -1814,6 +2092,8 @@ def compile_pa_mqa_litetopk_fp4_prefill_scan(
     head_dim: int = DEFAULT_HEAD_DIM,
     topk: int = 512,
     refresh_every: int = 64,
+    input_fp8: bool = False,
+    fp8_use_fma: bool = False,
 ):
     kfn, block_threads = build_pa_mqa_logits_fp4_prefill_module(
         block_k=block_k,
@@ -1824,6 +2104,8 @@ def compile_pa_mqa_litetopk_fp4_prefill_scan(
         litetopk=True,
         litetopk_topk=topk,
         litetopk_refresh_every=refresh_every,
+        input_fp8=input_fp8,
+        fp8_use_fma=fp8_use_fma,
     )
 
     @flyc.jit
@@ -1885,6 +2167,141 @@ def compile_pa_mqa_litetopk_fp4_prefill_scan(
         ).launch(grid=(gxi,), block=(block_threads, 1, 1), stream=stream)
 
     return launch_pa_mqa_litetopk_fp4_prefill_scan, block_threads
+
+
+def _flydsl_pa_mqa_litetopk_fp8_prefill_scan(
+    q_fp8: torch.Tensor,
+    kv_cache: torch.Tensor,
+    block_tables: torch.Tensor,
+    weights: torch.Tensor,
+    cta_info: torch.Tensor,
+    origin: torch.Tensor,
+    inv_delta: torch.Tensor,
+    threshold: torch.Tensor,
+    histogram: torch.Tensor,
+    candidate_values: torch.Tensor,
+    candidate_indices: torch.Tensor,
+    candidate_counts: torch.Tensor,
+    page_errors: torch.Tensor,
+    score_errors: torch.Tensor,
+    *,
+    n_ctas: int,
+    merge_cap: int,
+    topk: int = 2048,
+    refresh_every: int = 32,
+    block_k: int = 512,
+    num_warps: int = 8,
+    use_fma: bool | None = None,
+    stream: torch.cuda.Stream | None = None,
+) -> None:
+    """Run H32/D128 FP8 paged scoring with the monotonic LiteTopK gate."""
+    rows, heads, head_dim = q_fp8.shape
+    if (heads, head_dim) != (32, 128):
+        raise ValueError("FP8 LiteTopK scan requires H=32 and D=128")
+    if q_fp8.dtype != torch.float8_e4m3fn:
+        raise ValueError("q_fp8 must use torch.float8_e4m3fn")
+    if kv_cache.dtype not in (torch.uint8, torch.float8_e4m3fn) or tuple(
+        kv_cache.shape[1:]
+    ) != (64, 1, 132):
+        raise ValueError("kv_cache must be uint8 or E4M3FN [pages, 64, 1, 132]")
+    if weights.dtype != torch.float32 or weights.shape != (rows, heads):
+        raise ValueError("weights must be float32 [rows, 32]")
+    if n_ctas != rows:
+        raise ValueError("FP8 LiteTopK scan requires exactly one CTA per row")
+    if use_fma is None:
+        use_fma = rows <= 4096
+    if refresh_every * block_k != 16_384:
+        raise ValueError("FP8 LiteTopK scan requires a 16384-token refresh")
+    if cta_info.dtype != torch.int32 or cta_info.shape != (rows, CTA_INFO_WIDTH):
+        raise ValueError("cta_info must be int32 [rows, 6]")
+    if histogram.dtype != torch.int32 or histogram.shape != (rows, 256):
+        raise ValueError("histogram must be int32 [rows, 256]")
+    if candidate_values.dtype != torch.float32 or candidate_values.shape != (
+        rows,
+        merge_cap,
+    ):
+        raise ValueError("candidate_values shape does not match rows and merge_cap")
+    if candidate_indices.dtype != torch.int32 or candidate_indices.shape != (
+        rows,
+        merge_cap,
+    ):
+        raise ValueError("candidate_indices shape does not match rows and merge_cap")
+    row_vectors = (
+        origin,
+        inv_delta,
+        threshold,
+        candidate_counts,
+        page_errors,
+        score_errors,
+    )
+    if any(t.shape != (rows,) for t in row_vectors):
+        raise ValueError("FP8 LiteTopK row metadata must have shape [rows]")
+    if origin.dtype != torch.float32 or inv_delta.dtype != torch.float32:
+        raise ValueError("origin and inv_delta must be float32")
+    if any(
+        t.dtype != torch.int32
+        for t in (threshold, candidate_counts, page_errors, score_errors)
+    ):
+        raise ValueError("FP8 LiteTopK counters and status must be int32")
+    kv_payload, kv_scales = _split_fp8_paged_cache(kv_cache)
+    tensors = (
+        q_fp8,
+        kv_cache,
+        block_tables,
+        weights,
+        cta_info,
+        histogram,
+        candidate_values,
+        candidate_indices,
+        *row_vectors,
+    )
+    if any(t.device != q_fp8.device for t in tensors):
+        raise ValueError("all FP8 LiteTopK scan tensors must be on one device")
+    if stream is None:
+        stream = torch.cuda.current_stream(q_fp8.device)
+    if torch.device(stream.device) != q_fp8.device:
+        raise ValueError("stream and FP8 LiteTopK tensors must be on one device")
+
+    with torch.cuda.device(q_fp8.device), torch.cuda.stream(stream):
+        launcher, _ = compile_pa_mqa_litetopk_fp4_prefill_scan(
+            block_k=block_k,
+            kv_block_size=64,
+            num_warps=num_warps,
+            heads=heads,
+            head_dim=head_dim,
+            topk=topk,
+            refresh_every=refresh_every,
+            input_fp8=True,
+            fp8_use_fma=use_fma,
+        )
+        _run_compiled(
+            launcher,
+            q_fp8,
+            q_fp8,
+            kv_payload,
+            kv_scales,
+            block_tables,
+            weights,
+            cta_info,
+            origin,
+            inv_delta,
+            threshold,
+            histogram,
+            candidate_values,
+            candidate_indices,
+            candidate_counts,
+            page_errors,
+            score_errors,
+            candidate_values.stride(0),
+            merge_cap,
+            block_tables.shape[1],
+            kv_cache.shape[0],
+            block_tables.stride(0),
+            block_tables.shape[0],
+            1.0,
+            n_ctas,
+            stream,
+        )
 
 
 def flydsl_pa_mqa_litetopk_fp4_prefill_scan(
@@ -2096,6 +2513,92 @@ def flydsl_pa_mqa_logits_fp4_prefill(
             block_tables.shape[1],
             kv_cache.shape[0],
             float(weight_scale),
+            n_ctas,
+            stream,
+        )
+    return out
+
+
+def _flydsl_pa_mqa_logits_fp8_prefill(
+    q_fp8: torch.Tensor,
+    kv_cache: torch.Tensor,
+    block_tables: torch.Tensor,
+    weights: torch.Tensor,
+    row_to_batch: torch.Tensor,
+    local_starts: torch.Tensor,
+    local_ends: torch.Tensor,
+    max_seq_len: int,
+    *,
+    block_k: int = 512,
+    num_warps: int = 8,
+    parallel_unit_num: int | None = None,
+    use_fma: bool | None = None,
+    out: torch.Tensor | None = None,
+    stream: torch.cuda.Stream | None = None,
+) -> torch.Tensor:
+    """Internal dense oracle for the H32/D128 paged FP8 score path."""
+    rows, heads, head_dim = q_fp8.shape
+    if (heads, head_dim) != (32, 128):
+        raise ValueError("FP8 paged MQA requires H=32 and D=128")
+    if q_fp8.dtype != torch.float8_e4m3fn:
+        raise ValueError("q_fp8 must use torch.float8_e4m3fn")
+    if kv_cache.dtype not in (torch.uint8, torch.float8_e4m3fn) or tuple(
+        kv_cache.shape[1:]
+    ) != (64, 1, 132):
+        raise ValueError("kv_cache must be uint8 or E4M3FN [pages, 64, 1, 132]")
+    if weights.dtype != torch.float32 or weights.shape != (rows, heads):
+        raise ValueError("weights must be float32 [rows, 32]")
+    if parallel_unit_num is None:
+        parallel_unit_num = max(1024, rows)
+    if use_fma is None:
+        use_fma = rows <= 4096
+    if stream is None:
+        stream = torch.cuda.current_stream(q_fp8.device)
+    kv_payload, kv_scales = _split_fp8_paged_cache(kv_cache)
+
+    with torch.cuda.device(q_fp8.device), torch.cuda.stream(stream):
+        _, cta_info, n_ctas = compute_prefill_schedule(
+            row_to_batch,
+            local_starts,
+            local_ends,
+            block_k,
+            parallel_unit_num,
+            max_seq_len,
+        )
+        if out is None:
+            out = torch.full(
+                (rows, max_seq_len),
+                float("-inf"),
+                dtype=torch.float32,
+                device=q_fp8.device,
+            )
+        else:
+            out.fill_(float("-inf"))
+        launcher, _ = compile_pa_mqa_logits_fp4_prefill(
+            block_k=block_k,
+            kv_block_size=64,
+            num_warps=num_warps,
+            heads=heads,
+            head_dim=head_dim,
+            input_fp8=True,
+            fp8_use_fma=use_fma,
+        )
+        _run_compiled(
+            launcher,
+            out,
+            q_fp8,
+            q_fp8,
+            kv_payload,
+            kv_scales,
+            block_tables,
+            weights,
+            cta_info,
+            out.stride(0),
+            block_tables.stride(0),
+            block_tables.shape[0],
+            block_tables.shape[1],
+            kv_cache.shape[0],
+            1.0,
             n_ctas,
             stream,
         )

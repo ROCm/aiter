@@ -37,6 +37,14 @@ _LAZY_IMPORTS = {
         ".pa_mqa_litetopk_fp4",
         "FP4LiteTopKWorkspace",
     ),
+    "FP8LiteTopKResult": (
+        ".pa_mqa_litetopk_fp8",
+        "FP8LiteTopKResult",
+    ),
+    "FP8LiteTopKWorkspace": (
+        ".pa_mqa_litetopk_fp8",
+        "FP8LiteTopKWorkspace",
+    ),
     "FP8_MQA_LOGITS_DEFAULT_VARIANT": (
         ".kernels.mqa_logits.fp8_mqa_logits",
         "DEFAULT_VARIANT",
@@ -53,6 +61,10 @@ _LAZY_IMPORTS = {
         ".pa_mqa_litetopk_fp4",
         "allocate_fp4_litetopk_workspace",
     ),
+    "allocate_fp8_litetopk_workspace": (
+        ".pa_mqa_litetopk_fp8",
+        "allocate_fp8_litetopk_workspace",
+    ),
     "fp4_litetopk_workspace_nbytes": (
         ".pa_mqa_litetopk_fp4",
         "fp4_litetopk_workspace_nbytes",
@@ -61,9 +73,21 @@ _LAZY_IMPORTS = {
         ".pa_mqa_litetopk_fp4",
         "fp4_litetopk_workspace_size",
     ),
+    "fp8_litetopk_workspace_nbytes": (
+        ".pa_mqa_litetopk_fp8",
+        "fp8_litetopk_workspace_nbytes",
+    ),
+    "fp8_litetopk_workspace_size": (
+        ".pa_mqa_litetopk_fp8",
+        "fp8_litetopk_workspace_size",
+    ),
     "flydsl_pa_mqa_litetopk_fp4_prefill": (
         ".pa_mqa_litetopk_fp4",
         "flydsl_pa_mqa_litetopk_fp4_prefill",
+    ),
+    "flydsl_pa_mqa_litetopk_fp8_prefill": (
+        ".pa_mqa_litetopk_fp8",
+        "flydsl_pa_mqa_litetopk_fp8_prefill",
     ),
     "prepare_fp4_litetopk_seed": (
         ".pa_mqa_litetopk_fp4",
@@ -106,8 +130,11 @@ __all__ = [
     "FP8_MQA_LOGITS_VARIANTS",
     "FP4LiteTopKResult",
     "FP4LiteTopKWorkspace",
+    "FP8LiteTopKResult",
+    "FP8LiteTopKWorkspace",
     "GateMode",
     "allocate_fp4_litetopk_workspace",
+    "allocate_fp8_litetopk_workspace",
     "compute_varqlen_windows",
     "flydsl_flash_attn_func",
     "flydsl_fp8_mqa_logits",
@@ -116,6 +143,7 @@ __all__ = [
     "flydsl_moe_stage1",
     "flydsl_moe_stage2",
     "flydsl_pa_mqa_litetopk_fp4_prefill",
+    "flydsl_pa_mqa_litetopk_fp8_prefill",
     "flydsl_pa_mqa_logits_fp4",
     "flydsl_pa_mqa_logits_fp4_prefill",
     "flydsl_pa_mqa_logits_fp4_varqlen",
@@ -123,6 +151,8 @@ __all__ = [
     "flydsl_qk_norm_rope_quant",
     "fp4_litetopk_workspace_nbytes",
     "fp4_litetopk_workspace_size",
+    "fp8_litetopk_workspace_nbytes",
+    "fp8_litetopk_workspace_size",
     "prepare_fp4_litetopk_seed",
 ]
 
