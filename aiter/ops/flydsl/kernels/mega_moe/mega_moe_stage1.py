@@ -505,13 +505,16 @@ def compile_mega_moe_stage1(
                 expected_tiles,
             )
 
-        # Compact producers join the work queue after their finite payload
-        # copy.  Its grid is capped at one CTA per CU, so waiting consumers
-        # cannot starve an unscheduled producer.  Fixed-slot producers retain
-        # the queued-consumer behavior until its owner epoch is converted.
-        consumer_id = ticket - fx.Int32(consumer_ticket_base)
+        # Arrival tickets keep fixed-slot owner/producers in the first resident
+        # cohort.  The stable block-ID suffix performs GEMM after any finite
+        # role work, except on the two-cohort grid where arrival order has the
+        # shorter tail.  Compact already uses block IDs and a bounded grid.
+        consumer_ticket = ticket
+        if const_expr(fixed_slot_dispatch and grid_mult != 2):
+            consumer_ticket = fx.block_idx.x
+        consumer_id = consumer_ticket - fx.Int32(consumer_ticket_base)
         consumer_base = fx.Int32(consumer_ticket_base)
-        consumer_active = (ticket >= consumer_base) & (
+        consumer_active = (consumer_ticket >= consumer_base) & (
             consumer_id < total_work
         )
         work_scratch = fx.recast_iter(fx.Int32, a_buf.ptr)

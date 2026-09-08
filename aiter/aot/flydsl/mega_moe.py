@@ -129,7 +129,8 @@ def _compile_stage1(
     )
     scale_dim = model_dim // 32
     seen_prepare = set()
-    for entry in plan.entries:
+    prepare_entries = () if plan.fixed_slot_dispatch else plan.entries
+    for entry in prepare_entries:
         config = entry.config.stage1
         prepare_blocks = max(
             1, min(config.num_dispatch_cu, (entry.token_bucket + 63) // 64)
