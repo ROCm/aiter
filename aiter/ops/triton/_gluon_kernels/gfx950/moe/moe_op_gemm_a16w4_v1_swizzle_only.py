@@ -242,14 +242,6 @@ def _moe_gemm_a16w4(
         order=[1, 0]
     )
     
-    REG_CONSUME_WS_LAYOUT: gl.constexpr = gl.DistributedLinearLayout(
-        reg_bases  = [[0, 64], [0, 128], [0, 2], [0, 1]],
-        lane_bases = [[0, 4],  [0, 8],  [0, 16], [0, 32], [0, 0], [0, 0]],
-        warp_bases = [[1, 0], [2, 0]],
-        block_bases= [],
-        shape      = [4, 256],
-    )
-
     MFMA_LAYOUT: gl.constexpr = gl.amd.AMDMFMALayout(
         version=4, instr_shape=[16, 16, matrix_instr_nonkdim], transposed=True, warps_per_cta=[1, num_warps], tiles_per_warp=[TILE_PER_WARP_0, TILE_PER_WARP_1]
     )
@@ -329,20 +321,13 @@ def _moe_gemm_a16w4(
         #Convert Layouts
         x = gl.convert_layout(x, DOT_LAYOUT_X)
         w = gl.convert_layout(w, DOT_LAYOUT_W_PACKED)
-        w_scales = gl.convert_layout(w_scales, REG_CONSUME_WS_LAYOUT)
-        #w_scales = gl.convert_layout(w_scales, LOAD_LAYOUT_WS)
-        
+        w_scales = gl.convert_layout(w_scales, LOAD_LAYOUT_WS)
         
         w_scales = unswizzle_mx_scale_cdna4(w_scales, BLOCK_N, MX_SCALE_BLOCK_K)
 
         w_scales = w_scales.trans(1, 0)
-        #w_scales = (
-        #    w_scales.reshape((MX_SCALE_BLOCK_K, 1, BLOCK_N))
-        #    .broadcast_to((MX_SCALE_BLOCK_K, MX_PACK_DIVISOR, BLOCK_N))
-        #   .reshape((MX_SCALE_BLOCK_K * MX_PACK_DIVISOR, BLOCK_N))
-        #)
         w_scale_layout: gl.constexpr = gl.amd.get_scaled_upcast_fp4_scale_layout(
-            w, w_scales, gl.bfloat16, axis=0)
+            w, MX_PACK_DIVISOR, gl.bfloat16, axis=0)
         
         w_scales = gl.convert_layout(w_scales, w_scale_layout)
 
@@ -365,12 +350,6 @@ def _moe_gemm_a16w4(
     )
 
     if B is not None:
-        #bias = gl.load(
-        #    B + expt_id * stride_b_e + offs_out_n,
-        #    mask=offs_out_n < N,
-        #    other=0.0,
-        #    cache_modifier=W_CACHE_MODIFIER,
-        #)
         bias = gl.amd.cdna3.buffer_load(
             B + expt_id * stride_b_e ,
             offs_out_n,
@@ -409,8 +388,6 @@ def _moe_gemm_a16w4(
     mask_m = offs_y_m < M
     mask_n = offs_y_n < yN
     Y += start_m * stride_y_m
-    #YPtrs = Y + (offs_y_m[:, None] * stride_y_m + offs_y_n[None, :] * stride_y_n)
-    #gl.store(YPtrs, out.to(Y.dtype.element_ty), mask=mask_m[:, None] & mask_n[None, :])
     y_offsets = offs_y_m[:, None] * stride_y_m + offs_y_n[None, :] * stride_y_n
     gl.amd.cdna3.buffer_store(
         out.to(Y.dtype.element_ty), Y, y_offsets, mask=mask_m[:, None] & mask_n[None, :]
