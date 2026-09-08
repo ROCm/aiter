@@ -224,7 +224,7 @@ def test_fused_add_rmsnorm(M, N, in_dtype_str):
     if out_dtype in (torch.float16, torch.bfloat16):
         atol, rtol = 1e-2, 1e-2
     else:
-        if _should_use_large_m_small_n(M, N):
+        if _should_use_large_m_small_n(M, N, backward=True):
             # Large-M/small-N path uses tiled 2-D grid; looser tolerance matches
             # the per-block rounding accumulated over BLOCK_M rows.
             atol, rtol = 1e-2, 1e-2

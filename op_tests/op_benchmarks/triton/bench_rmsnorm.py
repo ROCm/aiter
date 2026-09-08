@@ -63,6 +63,9 @@ def run_benchmark(args):
     if args.shape is not None:
         M, N = args.shape
         x_vals_list = [("custom", M, N)]
+    elif args.model is None and args.M is None:
+        # Default: sweep get_x_vals() which covers both standard and large-M/small-N
+        x_vals_list = [("custom", M, N) for M, N in get_x_vals()]
     else:
         x_vals_list = model_benchmark_shapes(args)
 
@@ -92,6 +95,8 @@ def run_benchmark(args):
     quant = args.quant
     add_residual = args.add_residual
     do_backward = args.backward
+    if do_backward and quant != "none":
+        raise ValueError("--backward cannot be combined with --quant")
 
     @triton.testing.perf_report([benchmark])
     def bench_rmsnorm(M, N, metric, model_name=None, **kwargs):
@@ -114,7 +119,7 @@ def run_benchmark(args):
             mem = mem_read + mem_write
             flops = 4 * M * N  # dominated by the norm; quant is elementwise
         elif do_backward:
-            # Backward: read x, dy, g, rsigma; write dx, dg partial.
+            # Backward only: build y once, reuse the retained graph each trial.
             x.requires_grad_(True)
             w.requires_grad_(True)
             y = rms_norm(x, w, eps)
@@ -122,8 +127,7 @@ def run_benchmark(args):
 
             def fn():
                 x.grad, w.grad = None, None
-                y = rms_norm(x, w, eps)
-                y.backward(dy)
+                y.backward(dy, retain_graph=True)
 
             mem_read = (2 * M * N + M + N) * x.element_size()  # x, dy, rsigma, g
             mem_write = (M * N + N) * x.element_size()  # dx, dg
@@ -221,7 +225,7 @@ def parse_args(args: list[str] | None = None):
         default=False,
         help=(
             "Benchmark the backward pass instead of forward. Exercises "
-            "_rmsnorm_bwd_kernel_large_m_small_n for M>8192,N<=2048 shapes."
+            "_rmsnorm_bwd_kernel_large_m_small_n for M>8192,N<=1024 shapes."
         ),
     )
     parser.add_argument(
