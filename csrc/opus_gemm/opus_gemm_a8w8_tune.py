@@ -20,6 +20,8 @@ from csrc.opus_gemm.opus_gemm_common import (
     kernels_list,
 )
 
+_SUPPORTED_GFX = "gfx950"
+
 
 def candidate_kids_for_shape(gfx, m, n, k, scale_ab, outdtype="fp32"):
     """Return registered plain A8W8 kids whose launch constraints fit the shape."""
@@ -212,6 +214,12 @@ class OpusA8W8Tuner(GemmCommonTuner):
         return self._normalize_rows(df) if not df.empty else df
 
     def pre_process(self, args):
+        gfx = self.get_gfx()
+        if gfx != _SUPPORTED_GFX:
+            self.parser.error(
+                "Plain OPUS A8W8 tuning and --run_config only support "
+                f"{_SUPPORTED_GFX}; current GPU is {gfx}"
+            )
         if args.splitK:
             self.parser.error("These plain OPUS A8W8 kernels require splitK=0")
         if args.compare or args.update_improved:
@@ -227,7 +235,7 @@ class OpusA8W8Tuner(GemmCommonTuner):
         if not args.untune_file:
             self.parser.error("--input_file/-i is required for tuning")
         df = self._normalize_rows(self.get_untuned_gemm_list(args.untune_file))
-        df = df[(df["gfx"] == self.get_gfx()) & (df["cu_num"] == self.get_cu_num())]
+        df = df[(df["gfx"] == gfx) & (df["cu_num"] == self.get_cu_num())]
         if df.empty:
             raise ValueError("No input shapes match the current GPU's gfx/cu_num")
         self.untunedf = df[self.keys].drop_duplicates().reset_index(drop=True)

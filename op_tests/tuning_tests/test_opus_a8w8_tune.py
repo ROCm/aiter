@@ -62,6 +62,32 @@ class TestOpusA8W8Tuner(unittest.TestCase):
         self.assertEqual(long_args.errRatio, 0)
         self.assertNotIn("family", vars(long_args))
 
+    def test_rejects_unsupported_arch_before_tune_or_replay(self):
+        cases = (
+            ("tune", self.args()),
+            (
+                "run_config",
+                self.tuner.parser.parse_args(["--run_config", self.output_file]),
+            ),
+        )
+        with patch.object(self.tuner, "get_gfx", return_value="gfx942"), patch.object(
+            self.tuner, "get_untuned_gemm_list"
+        ) as read_input, patch.object(self.tuner, "get_tuned_gemm_list") as read_tuned:
+            for mode, args in cases:
+                stderr = io.StringIO()
+                with (
+                    self.subTest(mode=mode),
+                    contextlib.redirect_stderr(stderr),
+                    self.assertRaises(SystemExit),
+                ):
+                    self.tuner.pre_process(args)
+                self.assertIn(
+                    "only support gfx950; current GPU is gfx942",
+                    stderr.getvalue(),
+                )
+        read_input.assert_not_called()
+        read_tuned.assert_not_called()
+
     def test_import_does_not_parse_or_tune(self):
         with patch("argparse.ArgumentParser.parse_args") as parse, patch(
             "aiter.utility.mp_tuner.mp_tuner"
