@@ -582,26 +582,8 @@ def gemm_a16w16_persistent_bandwidth_bound_large_kernel_(
                     OPERAND_LAYOUT_B,
                 )
 
-            # main loop: ds_read first (22-cycle latency), then WMMA on
-            # current registers + TDM loads hide that latency on separate
-            # functional units (matrix core, TDM engine, LDS)
+            # main loop
             for _ in range(num_k_tiles - (NUM_BUFFERS - 1)):
-                gl.amd.gfx1250.tdm.async_wait((NUM_BUFFERS - 3) * 2)
-
-                next_a = gl.amd.cdna4.async_copy.load_shared_relaxed(
-                    a_buffer.index((compute_idx + 1) % NUM_BUFFERS), OPERAND_LAYOUT_A
-                )
-                if TRANSPOSE:
-                    next_b = gl.amd.cdna4.async_copy.load_shared_relaxed(
-                        b_buffer.index((compute_idx + 1) % NUM_BUFFERS),
-                        OPERAND_LAYOUT_B,
-                    )
-                else:
-                    next_b = gl.amd.cdna4.async_copy.load_shared_relaxed(
-                        b_buffer.index((compute_idx + 1) % NUM_BUFFERS).permute([1, 0]),
-                        OPERAND_LAYOUT_B,
-                    )
-
                 accumulator = gl.amd.gfx1250.wmma(cur_a, cur_b, accumulator)
 
                 gl.amd.gfx1250.tdm.async_load(
@@ -633,7 +615,23 @@ def gemm_a16w16_persistent_bandwidth_bound_large_kernel_(
                     b_desc = gl.amd.gfx1250.tdm.update_tensor_descriptor(
                         b_desc, add_offsets=[0, BLOCK_K], clamp_bounds=True
                     )
+
+                gl.amd.gfx1250.tdm.async_wait((NUM_BUFFERS - 2) * 2)
                 load_idx += 1
+
+                next_a = gl.amd.cdna4.async_copy.load_shared_relaxed(
+                    a_buffer.index((compute_idx + 1) % NUM_BUFFERS), OPERAND_LAYOUT_A
+                )
+                if TRANSPOSE:
+                    next_b = gl.amd.cdna4.async_copy.load_shared_relaxed(
+                        b_buffer.index((compute_idx + 1) % NUM_BUFFERS),
+                        OPERAND_LAYOUT_B,
+                    )
+                else:
+                    next_b = gl.amd.cdna4.async_copy.load_shared_relaxed(
+                        b_buffer.index((compute_idx + 1) % NUM_BUFFERS).permute([1, 0]),
+                        OPERAND_LAYOUT_B,
+                    )
 
                 cur_a = next_a
                 cur_b = next_b
@@ -662,7 +660,6 @@ def gemm_a16w16_persistent_bandwidth_bound_large_kernel_(
                 cur_b = next_b
                 compute_idx += 1
 
-            # final wmma for the last pre-loaded tile
             accumulator = gl.amd.gfx1250.wmma(cur_a, cur_b, accumulator)
 
             if ADD_BIAS and pid_k == 0 and WRITES_FINAL:
