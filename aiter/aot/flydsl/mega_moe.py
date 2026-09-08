@@ -338,13 +338,13 @@ def _compile_stage2(
     # Stage2's production bundle includes the terminal fused combine kernels.
     # Compile them here as well; otherwise a clean AOT-only service still falls
     # back to JIT after all GEMM2 variants have loaded successfully.
+    from aiter.jit.core import AITER_CONFIGS
     from aiter.ops.flydsl.kernels.communication_ops_utils import (
         GeometryTuningTable,
     )
     from aiter.ops.flydsl.kernels.flydsl_dispatch_combine_intranode_kernel import (
         make_combine_jit,
     )
-    from aiter.jit.core import AITER_CONFIGS
 
     tuning = GeometryTuningTable()
     tuning_path = Path(AITER_CONFIGS.AITER_CONFIG_DISPATCH_COMBINE_INTRANODE_FILE)
