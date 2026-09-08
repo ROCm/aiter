@@ -153,6 +153,7 @@ class OneShotAllReduce:
             rank=self.rank,
             world_size=self.world_size,
             inbox_flags=inbox_flags,
+            device_index=self._device_index,
         )
         self.tile_bytes = spec["tile_bytes"]
         self.wire_tile_bytes = spec["wire_tile_bytes"]

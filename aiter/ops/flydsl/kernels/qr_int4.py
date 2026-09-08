@@ -255,7 +255,16 @@ def _validate_ipc_process_group(group, *, rank: int) -> None:
 class _StEngine:
     """One compile-time SUPER inbox + launch."""
 
-    def __init__(self, *, spec, group, rank: int, world_size: int, inbox_flags: int):
+    def __init__(
+        self,
+        *,
+        spec,
+        group,
+        rank: int,
+        world_size: int,
+        inbox_flags: int,
+        device_index: int,
+    ):
         self.spec = spec
         self.launch = spec["launch"]
         self.compiled = None
@@ -270,7 +279,9 @@ class _StEngine:
         self._peer_bases = [None] * world_size
         # The inbox is the only allocation peers write into, so it is the only
         # one whose memory type matters for fabric throughput.
-        self._buf_ptr = UncachedIpcHeap.alloc(self.buf_bytes, inbox_flags)
+        self._buf_ptr = UncachedIpcHeap.alloc(
+            self.buf_bytes, inbox_flags, expected_device=device_index
+        )
         self._meta_ptr = None
         my_handle = UncachedIpcHeap.get_mem_handle_bytes(self._buf_ptr)
         all_meta = UncachedIpcHeap.gather_object_list_via_broadcast(
@@ -292,7 +303,9 @@ class _StEngine:
         # Peer-pointer table and per-block colours: written by the host once and
         # by this rank's own kernel, never by a peer. Stays uncached in every
         # mode -- no cross-GPU visibility question, and it is a few KiB.
-        self._meta_ptr = UncachedIpcHeap.alloc_uncached(peer_bytes + color_bytes)
+        self._meta_ptr = UncachedIpcHeap.alloc_uncached(
+            peer_bytes + color_bytes, expected_device=device_index
+        )
         self._gpu_peer_ptrs = self._meta_ptr
         self._colors = self._meta_ptr + peer_bytes
         UncachedIpcHeap.copy_host_to_device(
@@ -383,6 +396,7 @@ class QRInt4:
         super_tile: int | None = None,
         grid_cap: int | None = None,
         inbox_memory: str = "auto",
+        batch_publishes: bool | None = None,
         min_bytes: int | None = None,
         algorithm: str = DEFAULT_ALGORITHM,
         rs_codec: str = "int4",
@@ -458,7 +472,14 @@ class QRInt4:
         self.algorithm = algorithm
         self.rs_codec = rs_codec
         self._algo = algo
-        self._batch_publishes = has_release_fence(resolved_inbox)
+
+        #self._batch_publishes = has_release_fence(resolved_inbox)
+        self._batch_publishes = (
+            has_release_fence(resolved_inbox)
+            if batch_publishes is None
+            else bool(batch_publishes)
+        )
+        
         self.min_bytes = algo.min_bytes if min_bytes is None else int(min_bytes)
         if self.min_bytes < 0:
             raise ValueError(f"min_bytes must be non-negative, got {self.min_bytes}")
@@ -487,6 +508,7 @@ class QRInt4:
                 rank=self.rank,
                 world_size=self.world_size,
                 inbox_flags=inbox_flags,
+                device_index=self._device_index,
             )
 
         primary = self._by_st[self.super_tile]
@@ -531,6 +553,7 @@ class QRInt4:
         if self._ladder and live_bytes is not None:
             want = self._ladder_st(live_bytes)
         if want == 1:
+            #print(f"[AITER DEBUG] Wanting 1, returning 1")
             return 1
         if self._batch_publishes:
             return want if num_tiles >= want else 1
@@ -648,4 +671,8 @@ class QRInt4:
             )
         num_tiles = max(1, (live_bytes + TILE_BYTES - 1) // TILE_BYTES)
         st = self._pick_st(num_tiles, live_bytes)
+
+        #print(f"[AITER DEBUG]: ")
+        #print(st, self._grid_x(num_tiles, st, self._by_st[st].grid), sorted(self._by_st))
+
         self._launch_eng(self._by_st[st], inp, out, stream)
