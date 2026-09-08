@@ -654,6 +654,82 @@ def fused_moe(
     )
 
 
+def _resolve_quant_dtypes(
+    M,
+    hidden_states,
+    w1,
+    quant_type,
+    activation,
+    gate_mode,
+    a1_scale,
+    dtype,
+):
+    """Pick the activation/weight quant dtypes for a 2-stage MoE launch.
+
+    Shared by ``fused_moe_`` and ``fused_moe_router`` so both agree on the
+    dtype that sizes the sorted buffers and keys the tuned config lookup.
+
+    Returns:
+        ``(dtype, quant_type, q_dtype_a, q_dtype_w)`` -- the resolved output
+        dtype, the remapped quant type, and the activation/weight quant
+        dtypes.
+    """
+    dtype = hidden_states.dtype if dtype is None else dtype
+    assert dtype in [
+        dtypes.fp16,
+        dtypes.bf16,
+    ], f"Fused_moe unsupported out dtype: {dtype}"
+    quant_type = quant_remap.get(quant_type, quant_type)
+    q_dtype_w = w1.dtype
+    q_dtype_a = w1.dtype if w1.dtype != torch.uint32 else dtypes.fp8
+    # If input is already FP8-quantized (e.g. from FP8 dispatch) with block scale,
+    # use FP8 as activation dtype to skip redundant re-quantization
+    if (
+        quant_type == QuantType.per_1x128
+        and hidden_states.dtype == dtypes.fp8
+        and a1_scale is not None
+    ):
+        q_dtype_a = dtypes.fp8
+    bf16_fp8_bound = int(os.environ.get("AITER_BF16_FP8_MOE_BOUND", "256"))
+    if quant_type == QuantType.per_1x32 and q_dtype_w == dtypes.i4x2:
+        # a16wi4: bf16 activations, int4 weights with groupwise scale
+        q_dtype_a = dtypes.bf16
+    elif quant_type == QuantType.per_1x32 and q_dtype_w == dtypes.fp8:
+        # mxfp8: both activation and weight are fp8 (per-1x32 e8m0 microscale).
+        q_dtype_a = dtypes.fp8
+    elif quant_type == QuantType.per_1x32:
+        if activation == ActivationType.Situv2:
+            # SiTUv2 defaults to a16w4 (bf16 activation x mxfp4 weight) on the
+            # mixed_moe kernels. AITER_SITUV2_A8W4 / AITER_SITUV2_A4W4 select the
+            # fp8 / fp4 activation instead; each has its own tuned config
+            # (kimik3_{a8w4,a4w4}_tuned_fmoe.csv). Tested before the INTERLEAVE
+            # branch below, which would otherwise claim SiTUv2 and pick the
+            # activation dtype itself.
+            if os.environ.get("AITER_SITUV2_A8W4", "0") == "1":
+                q_dtype_a = dtypes.fp8
+            elif os.environ.get("AITER_SITUV2_A4W4", "0") == "1":
+                q_dtype_a = dtypes.fp4x2
+            else:
+                q_dtype_a = dtypes.bf16
+        elif activation == ActivationType.Swiglu and gate_mode == GateMode.SEPARATED:
+            q_dtype_a = dtypes.bf16 if M < _SWIGLU_MXFP4_BF16_BOUND else dtypes.fp4x2
+        elif activation == ActivationType.Swiglu or gate_mode == GateMode.INTERLEAVE:
+            if get_gfx() != "gfx950" or M < bf16_fp8_bound:
+                q_dtype_a = dtypes.bf16
+            else:
+                q_dtype_a = dtypes.fp8
+        else:
+            q_dtype_a = dtypes.fp4x2
+
+    if get_gfx() == "gfx1250":
+        if os.environ.get("AITER_FORCE_A8W4", "0") in ("1"):
+            q_dtype_a = dtypes.fp8
+        else:
+            q_dtype_a = dtypes.fp4x2
+
+    return dtype, quant_type, q_dtype_a, q_dtype_w
+
+
 def fused_moe_fake(
     hidden_states: torch.Tensor,
     w1: torch.Tensor,  # [expert(local_expert:EP), inter_dim*2, dim] N,K
@@ -849,11 +925,9 @@ def _fused_moe_impl(
     global_E = E
     if expert_mask is not None:
         global_E = expert_mask.numel()
-    dtype = hidden_states.dtype if dtype is None else dtype
-    assert dtype in [
-        dtypes.fp16,
-        dtypes.bf16,
-    ], f"Fused_moe unsupported out dtype: {dtype}"
+    dtype, quant_type, q_dtype_a, q_dtype_w = _resolve_quant_dtypes(
+        M, hidden_states, w1, quant_type, activation, gate_mode, a1_scale, dtype
+    )
     if stage2_scatter is not None and output is not None:
         raise RuntimeError(
             "output= is incompatible with stage2_scatter: GEMM2 P2P-writes the "
@@ -864,53 +938,6 @@ def _fused_moe_impl(
         output, (M, model_dim), dtype, hidden_states.device
     )
     _validate_output_buffer_no_overlap(output, hidden_states)
-    quant_type = quant_remap.get(quant_type, quant_type)
-    q_dtype_w = w1.dtype
-    q_dtype_a = w1.dtype if w1.dtype != torch.uint32 else dtypes.fp8
-    # If input is already FP8-quantized (e.g. from FP8 dispatch) with block scale,
-    # use FP8 as activation dtype to skip redundant re-quantization
-    if (
-        quant_type == QuantType.per_1x128
-        and hidden_states.dtype == dtypes.fp8
-        and a1_scale is not None
-    ):
-        q_dtype_a = dtypes.fp8
-    bf16_fp8_bound = int(os.environ.get("AITER_BF16_FP8_MOE_BOUND", "256"))
-    if quant_type == QuantType.per_1x32 and q_dtype_w == dtypes.i4x2:
-        # a16wi4: bf16 activations, int4 weights with groupwise scale
-        q_dtype_a = dtypes.bf16
-    elif quant_type == QuantType.per_1x32 and q_dtype_w == dtypes.fp8:
-        # mxfp8: both activation and weight are fp8 (per-1x32 e8m0 microscale).
-        q_dtype_a = dtypes.fp8
-    elif quant_type == QuantType.per_1x32:
-        if activation == ActivationType.Situv2:
-            # SiTUv2 defaults to a16w4 (bf16 activation x mxfp4 weight) on the
-            # mixed_moe kernels. AITER_SITUV2_A8W4 / AITER_SITUV2_A4W4 select the
-            # fp8 / fp4 activation instead; each has its own tuned config
-            # (kimik3_{a8w4,a4w4}_tuned_fmoe.csv). Tested before the INTERLEAVE
-            # branch below, which would otherwise claim SiTUv2 and pick the
-            # activation dtype itself.
-            if os.environ.get("AITER_SITUV2_A8W4", "0") == "1":
-                q_dtype_a = dtypes.fp8
-            elif os.environ.get("AITER_SITUV2_A4W4", "0") == "1":
-                q_dtype_a = dtypes.fp4x2
-            else:
-                q_dtype_a = dtypes.bf16
-        elif activation == ActivationType.Swiglu and gate_mode == GateMode.SEPARATED:
-            q_dtype_a = dtypes.bf16 if M < _SWIGLU_MXFP4_BF16_BOUND else dtypes.fp4x2
-        elif activation == ActivationType.Swiglu or gate_mode == GateMode.INTERLEAVE:
-            if get_gfx() != "gfx950" or M < bf16_fp8_bound:
-                q_dtype_a = dtypes.bf16
-            else:
-                q_dtype_a = dtypes.fp8
-        else:
-            q_dtype_a = dtypes.fp4x2
-
-    if get_gfx() == "gfx1250":
-        if os.environ.get("AITER_FORCE_A8W4", "0") in ("1"):
-            q_dtype_a = dtypes.fp8
-        else:
-            q_dtype_a = dtypes.fp4x2
 
     if _q_dtype_a is not None:
         q_dtype_a = _q_dtype_a
@@ -1171,6 +1198,429 @@ def _fused_moe_impl(
             output=output,
         )
         return _return_output(ret, output)
+
+
+# Token count above which routing is not fused. Fusing wins at decode shapes,
+# where the four-kernel preamble is a large part of MoE latency; above that the
+# GEMMs dominate
+FUSED_MOE_ROUTER_MAX_TOKENS = 128
+
+# Mirror fused_moe_router_entry.cu. Phase 1 selects within one wave and the
+# shared rows take the lanes just past topk, so both must fit kWaveSize. The
+# pair scan gives each of BlockSize threads two expert slots.
+FUSED_MOE_ROUTER_MAX_TOPK = 64  # kWaveSize
+FUSED_MOE_ROUTER_MAX_EXPERTS = 512  # 2 * BlockSize
+
+
+def _cfg_topk(topk: int, n_shared: int, expert_mask: torch.Tensor | None) -> int:
+    """Tuned-config topk key: the width the unfused path would look up.
+
+    get_2stage_cfgs strips the EP fake slot back off, so add it here.
+    """
+    return topk + n_shared + int(expert_mask is not None and n_shared > 0)
+
+
+def fused_moe_router_arch_supported() -> bool:
+    """Whether this GPU can run :func:`fused_moe_router` at all.
+
+    Split out of :func:`fused_moe_router_supported` so callers can check it
+    before any tensor exists, e.g. when choosing a backend at startup.
+    """
+    return get_gfx() == "gfx950"
+
+
+def fused_moe_router_config_supported(
+    hidden_dim: int,
+    hidden_dtype: torch.dtype,
+    w1_dtype: torch.dtype,
+    quant_type: int = QuantType.No.value,
+    activation: int = ActivationType.Silu.value,
+    gate_mode: str = GateMode.SEPARATED.value,
+) -> bool:
+    """Whether the shapes and dtypes of a config are fusable.
+
+    Takes scalars, not tensors, so it can be answered before the first
+    forward. Leaves out the per-call limits (token count, expert grouping),
+    which only :func:`fused_moe_router_supported` can check.
+    """
+    return (
+        fused_moe_router_arch_supported()
+        and QuantType(quant_type) == QuantType.per_1x32
+        and ActivationType(activation) == ActivationType.Silu
+        and GateMode(gate_mode) == GateMode.SEPARATED
+        and w1_dtype == dtypes.fp4x2
+        and hidden_dtype == dtypes.bf16
+        and hidden_dim == 4096
+    )
+
+
+def fused_moe_router_supported(
+    hidden_states: torch.Tensor,
+    w1: torch.Tensor,
+    w2: torch.Tensor,
+    topk: int,
+    quant_type: int = QuantType.No.value,
+    activation: int = ActivationType.Silu.value,
+    num_expert_group: int = 1,
+    topk_group: int = 1,
+    gate_mode: str = GateMode.SEPARATED.value,
+    doweight_stage1: bool = False,
+    hidden_pad: int = 0,
+    intermediate_pad: int = 0,
+    a1_scale: torch.Tensor | None = None,
+    dtype: torch.dtype | None = None,
+    expert_mask: torch.Tensor | None = None,
+    num_fused_shared_experts: int = 0,
+) -> bool:
+    """Whether :func:`fused_moe_router` can serve this call.
+
+    Callers should check this and fall back to ``fused_moe_`` otherwise;
+    ``fused_moe_router`` asserts rather than silently mis-routing. It adds the
+    token cap, the expert-group limit and the tuned-config check on top of
+    :func:`fused_moe_router_config_supported`, so it depends on the actual
+    call and has to be re-checked on every forward.
+    """
+    # gating_output is not passed in, so derive global_E from the shapes. The
+    # mask spans every emitted id -- routed, then the shared slots, then the
+    # sentinel, which callers allocate whether or not shared fusion is on --
+    # so drop those trailing slots. Without a mask there is no EP and w1 holds
+    # routed plus shared.
+    n_shared = num_fused_shared_experts
+    local_E = w1.shape[0]
+    if expert_mask is not None:
+        global_E = expert_mask.numel() - n_shared - 1
+    else:
+        global_E = local_E - n_shared
+    if not (
+        fused_moe_router_config_supported(
+            hidden_states.shape[-1],
+            hidden_states.dtype,
+            w1.dtype,
+            quant_type=quant_type,
+            activation=activation,
+            gate_mode=gate_mode,
+        )
+        and hidden_states.shape[0] <= FUSED_MOE_ROUTER_MAX_TOKENS
+        # The kernel has no expert-group stage. 1/1 means "one group holding
+        # every expert", which is the same as no grouping at all.
+        and num_expert_group == 1
+        and topk_group == 1
+        # Phase 1 places the shared rows on the lanes just past topk, within
+        # the one wave the top-k selects in.
+        and 0 <= n_shared <= 1
+        and topk + n_shared <= FUSED_MOE_ROUTER_MAX_TOPK
+        # Mirror the entry's expert-count checks. topk is global, so it goes
+        # against global_E; only the shared rows live in this rank's w1.
+        and global_E <= FUSED_MOE_ROUTER_MAX_EXPERTS
+        and topk <= global_E
+        and local_E >= n_shared
+    ):
+        return False
+
+    # The tuned config picks 1-stage or FLAT for some shapes, and the fused
+    # router only implements the 2-stage non-FLAT path. Derived exactly as
+    # `fused_moe_router` does, so `get_2stage_cfgs` is an lru_cache hit there.
+    activation = ActivationType(activation)
+    quant_type = QuantType(quant_type)
+    gate_mode = GateMode(gate_mode)
+    M = hidden_states.shape[0]
+    E, model_dim, inter_dim = get_inter_dim(w1.shape, w2.shape)
+    dtype, quant_type, q_dtype_a, q_dtype_w = _resolve_quant_dtypes(
+        M, hidden_states, w1, quant_type, activation, gate_mode, a1_scale, dtype
+    )
+    # dtype overrides hidden_states.dtype and sizes moe_buf, which the kernel
+    # zero-fills as bf16.
+    if dtype != dtypes.bf16:
+        return False
+    metadata = get_2stage_cfgs(
+        get_padded_M(M),
+        model_dim,
+        inter_dim,
+        E,
+        _cfg_topk(topk, n_shared, expert_mask),
+        dtype,
+        q_dtype_a,
+        q_dtype_w,
+        quant_type,
+        inter_dim != w1.shape[1],
+        activation,
+        doweight_stage1,
+        hidden_pad,
+        intermediate_pad,
+        getattr(w1, "is_shuffled", False) or getattr(w2, "is_shuffled", False),
+        gate_mode,
+        is_ep=expert_mask is not None,
+        opus_weights_shuffled=getattr(w1, "is_shuffled", False)
+        and getattr(w2, "is_shuffled", False),
+    )
+    return not metadata.run_1stage and not metadata.flat
+
+
+def fused_moe_router(
+    hidden_states: torch.Tensor,
+    gating_output: torch.Tensor,  # [M, global_expert] router logits
+    correction_bias: torch.Tensor,  # [global_expert] e_score_correction_bias
+    w1: torch.Tensor,  # [expert(local_expert:EP), inter_dim*2, dim] N,K
+    w2: torch.Tensor,  # [expert(local_expert:EP), dim, inter_dim]
+    topk: int,
+    num_expert_group: int = 1,
+    topk_group: int = 1,
+    need_renorm: bool = True,
+    routed_scaling_factor: float = 1.0,
+    expert_mask: torch.Tensor | None = None,  # EP
+    activation: int = ActivationType.Silu.value,
+    quant_type: int = QuantType.No.value,
+    doweight_stage1: bool = False,
+    w1_scale: torch.Tensor | None = None,
+    w2_scale: torch.Tensor | None = None,
+    a1_scale: torch.Tensor | None = None,
+    a2_scale: torch.Tensor | None = None,
+    num_local_tokens: torch.Tensor | None = None,
+    dtype: torch.dtype | None = None,
+    hidden_pad: int = 0,
+    intermediate_pad: int = 0,
+    bias1: torch.Tensor | None = None,
+    bias2: torch.Tensor | None = None,
+    gate_mode: str = GateMode.SEPARATED.value,
+    num_fused_shared_experts: int = 0,
+    shared_expert_weight: float = 1.0,
+    ep_rank: int = 0,
+    ep_size: int = 1,
+) -> torch.Tensor:
+    """MoE forward that routes internally, replacing the 4-kernel preamble.
+
+    Same result as ``biased_grouped_topk`` -> ``fused_moe_``, but topk, the
+    sort and the MXFP4 activation quant run in one kernel
+    (``fused_moe_router_impl``). It takes ``gating_output`` instead of
+    ``topk_ids`` because the sorted buffers are sized from ``block_size_M``,
+    which comes from the tuned-config lookup here and is not known to callers.
+
+    Only the MXFP4 2-stage decode path is supported -- check
+    :func:`fused_moe_router_supported` first; anything else asserts.
+
+    Args:
+        hidden_states: ``[M, model_dim]`` bf16 activations.
+        gating_output: ``[M, global_expert]`` bf16 router logits.
+        correction_bias: ``[global_expert]`` bf16 sigmoid score correction.
+        w1: stage1 weights, ``[local_expert, inter_dim*2, model_dim]``.
+        w2: stage2 weights, ``[local_expert, model_dim, inter_dim]``.
+        topk: experts per token.
+        num_expert_group: expert-group count; only 1 is supported.
+        topk_group: groups kept per token; only 1 is supported.
+        need_renorm: renormalize the topk weights.
+        routed_scaling_factor: post-renorm weight scale.
+        expert_mask: ``[>= global_expert]`` int32, nonzero iff this rank owns
+            the expert. ``None`` for the non-EP config. Under shared fusion it
+            must also cover the shared slots and the trailing sentinel, i.e.
+            vLLM's ``global_expert + num_fused_shared_experts + 1`` layout.
+        num_fused_shared_experts: shared experts to append to each token's
+            picks, taking weight rows ``global_expert ..``. 0 disables.
+        shared_expert_weight: weight every token gives each shared expert.
+        ep_rank: this rank's index; only read under shared fusion.
+        ep_size: EP world size. Shared weights are replicated per rank, so
+            token ownership round-robins over it to keep the post-MoE
+            all-reduce from summing ``ep_size`` copies of the shared output.
+
+    Returns:
+        ``[M, model_dim]`` output in ``dtype`` (default ``hidden_states``').
+    """
+    from aiter.ops.fused_moe_router import (
+        fused_moe_router_impl,
+        get_fused_moe_router_workspace,
+    )
+
+    activation = ActivationType(activation)
+    quant_type = QuantType(quant_type)
+    gate_mode = GateMode(gate_mode)
+
+    device = hidden_states.device
+    M = hidden_states.shape[0]
+    E, model_dim, inter_dim = get_inter_dim(w1.shape, w2.shape)
+    isG1U1 = inter_dim != w1.shape[1]
+    isShuffled = getattr(w1, "is_shuffled", False) or getattr(w2, "is_shuffled", False)
+    # The routed-expert count is the gating width, NOT expert_mask.numel(). vLLM
+    # sizes the mask as global_num_experts + num_fused_shared_experts + 1
+    # (expert_map_manager.py:98) -- the trailing entries are the always-masked
+    # sentinel and any fused shared expert, neither of which is routed. E from
+    # get_inter_dim is the *local* count under EP, so it cannot be used either.
+    # global_E is the gating row stride in the kernel (gating + token * E), so
+    # taking it from the mask would read past the end of every row.
+    global_E = gating_output.shape[1]
+    # Every expert id the router can emit: routed, then the fused shared slots,
+    # then -- under EP -- the always-masked sentinel non-owner ranks park their
+    # shared row on. This is what sizes the sorted buffers and the histogram.
+    n_shared = num_fused_shared_experts
+    E_tot = global_E + n_shared + (1 if (expert_mask is not None and n_shared) else 0)
+    topk_total = topk + n_shared
+
+    dtype, quant_type, q_dtype_a, q_dtype_w = _resolve_quant_dtypes(
+        M, hidden_states, w1, quant_type, activation, gate_mode, a1_scale, dtype
+    )
+
+    metadata = get_2stage_cfgs(
+        get_padded_M(M),
+        model_dim,
+        inter_dim,
+        E,
+        _cfg_topk(topk, n_shared, expert_mask),
+        dtype,
+        q_dtype_a,
+        q_dtype_w,
+        quant_type,
+        isG1U1,
+        activation,
+        doweight_stage1,
+        hidden_pad,
+        intermediate_pad,
+        isShuffled,
+        gate_mode,
+        is_ep=expert_mask is not None,
+        opus_weights_shuffled=getattr(w1, "is_shuffled", False)
+        and getattr(w2, "is_shuffled", False),
+    )
+    block_size_M = int(metadata.block_m)
+
+    # The fused kernel hardcodes what it fuses: biased sigmoid topk over a
+    # single expert group, and an MXFP4 stage1 quant. Every other path needs
+    # the unfused preamble, so refuse instead of producing wrong numbers.
+    assert not metadata.run_1stage and not metadata.flat, (
+        "fused_moe_router: only the 2-stage non-FLAT path is fused; "
+        "gate on fused_moe_router_supported and call fused_moe_ otherwise"
+    )
+    assert q_dtype_a == dtypes.fp4x2 and quant_type == QuantType.per_1x32, (
+        f"fused_moe_router: fused quant is MXFP4 only, got {q_dtype_a=} "
+        f"{quant_type=}"
+    )
+    assert (
+        num_expert_group == 1 and topk_group == 1
+    ), f"fused_moe_router: {num_expert_group=} {topk_group=}, only 1/1 is fused"
+    assert not doweight_stage1, "fused_moe_router: doweight_stage1 is not fused"
+    # The kernel routes all M rows and reports num_valid_ids[1] = M, so a
+    # device-side valid-row count would leave the padding rows routed.
+    assert num_local_tokens is None, "fused_moe_router: num_local_tokens is not honored"
+    # Mirrors the entry's routed-expert check; assert here so the failure names
+    # the gating width rather than surfacing from C++.
+    assert global_E <= FUSED_MOE_ROUTER_MAX_EXPERTS, (
+        f"fused_moe_router: num_experts must be <= "
+        f"{FUSED_MOE_ROUTER_MAX_EXPERTS}, got {global_E}"
+    )
+    assert (
+        0 <= n_shared <= 1
+    ), f"fused_moe_router: num_fused_shared_experts must be 0 or 1, got {n_shared}"
+    # The shared experts get their own weight rows, appended after the local
+    # routed ones (matching vLLM's expert_map). Without them stage1 would index
+    # past the last expert for every shared row.
+    assert n_shared == 0 or E >= n_shared, (
+        f"fused_moe_router: {n_shared} fused shared experts need weight rows, "
+        f"but w1 has only {E}"
+    )
+    assert n_shared == 0 or expert_mask is not None or E == global_E + n_shared, (
+        f"fused_moe_router: non-EP shared fusion needs w1 to hold "
+        f"{global_E + n_shared} experts, got {E}"
+    )
+    assert (
+        dtype == dtypes.bf16
+    ), f"fused_moe_router: moe_buf is zero-filled as bf16, got out {dtype=}"
+    assert bias1 is None and bias2 is None, "fused_moe_router: swiglu bias is not fused"
+    # The mask spans every id the router can emit; shorter is a real bug.
+    assert expert_mask is None or expert_mask.numel() >= E_tot, (
+        f"fused_moe_router: expert_mask has {expert_mask.numel()} entries, "
+        f"need at least {E_tot}"
+    )
+    assert correction_bias is None or correction_bias.numel() >= global_E, (
+        f"fused_moe_router: correction_bias has {correction_bias.numel()} "
+        f"entries, need at least {global_E}"
+    )
+
+    # Sorted-map buffers, sized exactly as _moe_sorting_impl does, but over the
+    # full slot count: every emitted id (shared and sentinel included) gets its
+    # own padded block in the sort.
+    group_size = 32
+    max_num_tokens_padded = M * topk_total + E_tot * block_size_M - topk_total
+    max_num_m_blocks = (max_num_tokens_padded + block_size_M - 1) // block_size_M
+    topk_ids = torch.empty((M, topk_total), dtype=dtypes.i32, device=device)
+    topk_weights = torch.empty((M, topk_total), dtype=dtypes.fp32, device=device)
+    sorted_ids = torch.empty(max_num_tokens_padded, dtype=dtypes.i32, device=device)
+    sorted_weights = torch.empty(
+        max_num_tokens_padded, dtype=dtypes.fp32, device=device
+    )
+    sorted_expert_ids = torch.empty(max_num_m_blocks, dtype=dtypes.i32, device=device)
+    num_valid_ids = torch.empty(2, dtype=dtypes.i32, device=device)
+    # stage2 atomically accumulates into moe_buf, so it must start zeroed.
+    # The fused routing kernel now does that clear itself (passed as moe_buf
+    # below), which removes a separate ~4.6us torch FillFunctor launch per MoE
+    # block -- the launch the fusion exists to avoid. empty() is therefore
+    # correct here: the kernel writes every element before stage2 runs.
+    moe_buf = torch.empty((M, model_dim), dtype=dtype, device=device)
+
+    # Quantized stage1 input, sized as fused_dynamic_mx_quant_moe_sort does.
+    scaleN_pad = ((model_dim // group_size) + 7) // 8 * 8
+    a1 = torch.empty(M, model_dim // 2, dtype=dtypes.fp4x2, device=device)
+    a1_scale_sorted = torch.empty(
+        (max_num_tokens_padded + 31) // 32 * 32,
+        scaleN_pad,
+        dtype=dtypes.fp8_e8m0,
+        device=device,
+    )
+
+    fused_moe_router_impl(
+        gating_output,
+        correction_bias,
+        hidden_states,
+        topk_ids,
+        topk_weights,
+        sorted_ids,
+        sorted_weights,
+        sorted_expert_ids,
+        num_valid_ids,
+        a1,
+        a1_scale_sorted,
+        global_E,
+        topk,
+        block_size_M,
+        group_size,
+        need_renorm,
+        routed_scaling_factor,
+        get_fused_moe_router_workspace(device, FUSED_MOE_ROUTER_MAX_TOKENS),
+        expert_mask=expert_mask,
+        moe_buf=moe_buf,
+        num_fused_shared_experts=n_shared,
+        shared_expert_weight=shared_expert_weight,
+        ep_rank=ep_rank,
+        ep_size=ep_size,
+    )
+
+    return fused_moe_2stages(
+        hidden_states,
+        w1,
+        w2,
+        topk_total,
+        sorted_ids,
+        sorted_weights,
+        sorted_expert_ids,
+        num_valid_ids,
+        moe_buf,
+        isG1U1,
+        block_size_M,
+        activation=activation,
+        quant_type=quant_type,
+        doweight_stage1=doweight_stage1,
+        q_dtype_a=q_dtype_a,
+        q_dtype_w=q_dtype_w,
+        w1_scale=w1_scale,
+        w2_scale=w2_scale,
+        a1_scale=a1_scale,
+        a2_scale=a2_scale,
+        num_local_tokens=num_local_tokens,
+        hidden_pad=hidden_pad,
+        intermediate_pad=intermediate_pad,
+        topk_ids=topk_ids,
+        topk_weights=topk_weights,
+        gate_mode=gate_mode,
+        expert_mask=expert_mask,
+        a1_prequant=(a1, a1_scale_sorted),
+        _metadata=metadata,
+    )
 
 
 def fused_moe_1stage(
@@ -3143,6 +3593,10 @@ def fused_moe_2stages(
     _stage1_extra_args: dict | None = None,
     _stage2_extra_args: dict | None = None,
     output=None,
+    # (a1, a1_scale) already quantized+sorted by the caller; skips stage1 quant.
+    a1_prequant=None,
+    # Final config from a caller that already looked it up.
+    _metadata: MOEMetadata | None = None,
 ):
     quant_func = get_quant(quant_type)
     gate_mode = GateMode(gate_mode)
@@ -3160,32 +3614,41 @@ def fused_moe_2stages(
             else torch.empty((token_num, model_dim), dtype=dtype, device=device)
         )
     is_shuffled = getattr(w1, "is_shuffled", False) or getattr(w2, "is_shuffled", False)
-    metadata = get_2stage_cfgs(
-        get_padded_M(token_num),  # consider token_num > 1024 as prefill
-        model_dim,
-        inter_dim,
-        E,
-        topk,
-        dtype,
-        q_dtype_a,
-        q_dtype_w,
-        quant_type,
-        isG1U1,
-        activation,
-        doweight_stage1,
-        hidden_pad,
-        intermediate_pad,
-        is_shuffled,
-        gate_mode,
-        is_ep=expert_mask is not None,
-        has_stage2_bias=bias2 is not None,
-        opus_weights_shuffled=getattr(w1, "is_shuffled", False)
-        and getattr(w2, "is_shuffled", False),
-        config_file=_metadata_config_file,
-    )
-    if _metadata_transform is not None:
-        metadata = _metadata_transform(metadata)
-    if not metadata.prequant:
+    # _metadata is already final, so a transform would be silently dropped.
+    assert (
+        _metadata is None or _metadata_transform is None
+    ), "fused_moe_2stages: _metadata and _metadata_transform are exclusive"
+    if _metadata is not None:
+        metadata = _metadata
+    else:
+        metadata = get_2stage_cfgs(
+            get_padded_M(token_num),  # consider token_num > 1024 as prefill
+            model_dim,
+            inter_dim,
+            E,
+            topk,
+            dtype,
+            q_dtype_a,
+            q_dtype_w,
+            quant_type,
+            isG1U1,
+            activation,
+            doweight_stage1,
+            hidden_pad,
+            intermediate_pad,
+            is_shuffled,
+            gate_mode,
+            is_ep=expert_mask is not None,
+            has_stage2_bias=bias2 is not None,
+            opus_weights_shuffled=getattr(w1, "is_shuffled", False)
+            and getattr(w2, "is_shuffled", False),
+            config_file=_metadata_config_file,
+        )
+        if _metadata_transform is not None:
+            metadata = _metadata_transform(metadata)
+    if a1_prequant is not None:
+        a1, a1_scale = a1_prequant
+    elif not metadata.prequant:
         a1 = hidden_states
         a1_scale = None
     elif (
