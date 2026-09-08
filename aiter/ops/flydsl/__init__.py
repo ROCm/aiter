@@ -25,6 +25,11 @@ if _base_version < _MIN_FLYDSL_VERSION:
     )
 
 _LAZY_IMPORTS = {
+    "build_softmax_split": (".kernels.softmax_split", "build_softmax_split"),
+    "build_gemm_bf16_split_fp32": (
+        ".kernels.gemm_bf16_split_fp32",
+        "build_gemm_bf16_split_fp32",
+    ),
     "FP8_MQA_LOGITS_DEFAULT_VARIANT": (
         ".kernels.mqa_logits.fp8_mqa_logits",
         "DEFAULT_VARIANT",
@@ -76,6 +81,8 @@ __all__ = [
     "FP8_MQA_LOGITS_DEFAULT_VARIANT",
     "FP8_MQA_LOGITS_VARIANTS",
     "GateMode",
+    "build_gemm_bf16_split_fp32",
+    "build_softmax_split",
     "compute_varqlen_windows",
     "flydsl_flash_attn_func",
     "flydsl_fp8_mqa_logits",
