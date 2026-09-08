@@ -452,7 +452,11 @@ def _grouped_a8w4_tdm_moe(
 
     import torch
 
-    from aiter.ops.flydsl.grouped_gemm_mxfp4 import flydsl_grouped_gemm_a8w4_masked
+    from aiter.ops.flydsl.grouped_gemm_mxfp4 import (
+        A4W4_QUAD_CLUSTER,
+        a4w4_quad_pipeline_ok,
+        flydsl_grouped_gemm_a8w4_masked,
+    )
     from aiter.ops.flydsl.moe_kernels import (
         flydsl_moe_fused_quant_preshuffle,
         flydsl_moe_topids_to_rows,
@@ -475,7 +479,39 @@ def _grouped_a8w4_tdm_moe(
         n_warp2 = n_warp
     wmma_rep = get_wmma_m_rep(tile_m, tile_n, m_warp, n_warp, "gemm1")
     wmma_rep2 = get_wmma_m_rep(tile_m2, tile_n2, m_warp2, n_warp2, "gemm2")
-    _align_m = max(tile_m, tile_m2)
+
+    # The quadrant-pipeline a4w4 kernel launches a 2-D workgroup cluster whose
+    # B multicast fans one weight load across cluster_m M-tiles. B is per
+    # expert, so those M-tiles must share one expert -- which is exactly what
+    # aligning every expert's contiguous-M block to tile_m*cluster_m buys. The
+    # same alignment makes the padding-tile skip cluster-uniform, so peers all
+    # run or all skip and the pairwise-matched multicast loads cannot deadlock.
+    _quad_kw = dict(
+        a_is_fp4=(data_format == "fp4"),
+        enable_ep_scatter=stage2_scatter is not None,
+    )
+    _quad1 = a4w4_quad_pipeline_ok(
+        tile_m=tile_m,
+        tile_n=tile_n,
+        tile_k=tile_k,
+        m_warp=m_warp,
+        n_warp=n_warp,
+        num_buffers=min(num_buffers, max(1, model_dim // tile_k)),
+        N=2 * inter_dim,
+        **_quad_kw,
+    )
+    _quad2 = a4w4_quad_pipeline_ok(
+        tile_m=tile_m2,
+        tile_n=tile_n2,
+        tile_k=tile_k2,
+        m_warp=m_warp2,
+        n_warp=n_warp2,
+        num_buffers=min(num_buffers2, max(1, inter_dim // tile_k2)),
+        N=model_dim,
+        **_quad_kw,
+    )
+    _quad_align = A4W4_QUAD_CLUSTER[0] if (_quad1 or _quad2) else 1
+    _align_m = max(tile_m, tile_m2) * _quad_align
     contiguous_m = max(
         _align_m, _tdm_align_up(token_num * topk + E * _align_m - topk, _align_m)
     )
@@ -554,7 +590,9 @@ def _grouped_a8w4_tdm_moe(
         topids_to_rows,
         E,
         max_m,
-        tile_m,
+        # Only the quad path needs the coarser alignment; leave every other
+        # config on the tile_m alignment it was tuned with.
+        _align_m if (_quad1 or _quad2) else tile_m,
         num_valid_routes=_ep_nvr,
         ep_scatter_params=ep_scatter_params,
     )
@@ -697,6 +735,7 @@ def _grouped_a8w4_tdm_moe(
             cluster_n=cluster_n,
             waves_per_tensor_tdm=waves_per_tensor_tdm,
             next_stage_prefetch=next_stage_prefetch,
+            quad_pipeline=_quad1,
             **_situ_kw,
         )
     else:
@@ -727,6 +766,7 @@ def _grouped_a8w4_tdm_moe(
             cluster_n=cluster_n,
             waves_per_tensor_tdm=waves_per_tensor_tdm,
             next_stage_prefetch=next_stage_prefetch,
+            quad_pipeline=_quad1,
             **_situ_kw,
         )
         a2_payload, a2_scale = flydsl_moe_fused_quant_preshuffle(
@@ -766,6 +806,7 @@ def _grouped_a8w4_tdm_moe(
         cluster_n=cluster_n,
         waves_per_tensor_tdm=waves_per_tensor_tdm,
         next_stage_prefetch=next_stage_prefetch,
+        quad_pipeline=_quad2,
         **_ep_gemm2_kwargs,
     )
 
@@ -803,6 +844,7 @@ def _grouped_a8w4_tdm_moe(
                         cluster_n=cluster_n,
                         waves_per_tensor_tdm=waves_per_tensor_tdm,
                         next_stage_prefetch=next_stage_prefetch,
+                        quad_pipeline=_quad1,
                         **_situ_kw,
                     ),
                 )
@@ -837,6 +879,7 @@ def _grouped_a8w4_tdm_moe(
                         cluster_n=cluster_n,
                         waves_per_tensor_tdm=waves_per_tensor_tdm,
                         next_stage_prefetch=next_stage_prefetch,
+                        quad_pipeline=_quad1,
                         **_situ_kw,
                     ),
                 )
@@ -869,6 +912,7 @@ def _grouped_a8w4_tdm_moe(
                     cluster_n=cluster_n,
                     waves_per_tensor_tdm=waves_per_tensor_tdm,
                     next_stage_prefetch=next_stage_prefetch,
+                    quad_pipeline=_quad2,
                 ),
             )
         )

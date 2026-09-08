@@ -14,6 +14,41 @@ from .kernels.tensor_shim import ptr_arg
 
 _SUPPORTED_CLUSTER_N = (4, 3, 2)
 
+# 2-D cluster of the quadrant-pipeline a4w4 kernel (cluster_m x cluster_n).
+A4W4_QUAD_CLUSTER = (4, 4)
+
+
+def a4w4_quad_pipeline_ok(
+    *,
+    a_is_fp4,
+    tile_m,
+    tile_n,
+    tile_k,
+    m_warp,
+    n_warp,
+    num_buffers,
+    N,
+    enable_ep_scatter=False,
+) -> bool:
+    """Whether the quadrant-pipeline a4w4 kernel can serve this launch.
+
+    Says nothing about the contiguous-M alignment its B multicast needs -- that
+    is the MoE driver's to arrange, and it is why the caller passes
+    ``quad_pipeline`` explicitly instead of this being re-derived down here.
+    """
+    if os.environ.get("AITER_A4W4_QUAD_PIPELINE", "1") == "0":
+        return False
+    if not a_is_fp4 or enable_ep_scatter:
+        return False
+    from .kernels.gemm_a4w4_moe_gfx1250 import supports
+
+    if not supports(tile_m, tile_n, tile_k, m_warp, n_warp, num_buffers):
+        return False
+    cluster_m, cluster_n = A4W4_QUAD_CLUSTER
+    n_tiles = (int(N) + int(tile_n) - 1) // int(tile_n)
+    # grid.y must fill the cluster exactly, or a cluster never forms.
+    return n_tiles % cluster_n == 0 and cluster_m > 0
+
 
 def _select_next_stage_prefetch(csv_next_stage_prefetch: int) -> int:
     """Selects the environment override or the CSV setting."""
@@ -96,8 +131,16 @@ def flydsl_grouped_gemm_a8w4_masked(
     ep_row_map=None,
     situ_beta=1.0,
     situ_linear_beta=1.0,
+    quad_pipeline=False,
 ):
-    """Launches a contiguous-M grouped a8w4 GEMM on the TDM kernel."""
+    """Launches a contiguous-M grouped a8w4 GEMM on the TDM kernel.
+
+    ``quad_pipeline`` routes an a4w4 launch to the quadrant-pipeline kernel with
+    its 2-D cluster. Its B multicast fans one weight load across ``cluster_m``
+    M-tiles, so it is only correct when every expert's contiguous-M block is
+    aligned to ``tile_m * cluster_m`` rows. The caller owns that alignment and
+    therefore owns this flag; it is never inferred here.
+    """
     from .kernels.mxfp4_preshuffle_gfx1250_tdm import launch_gemm_a8w4_tdm
 
     if stream is None:
@@ -121,6 +164,60 @@ def flydsl_grouped_gemm_a8w4_masked(
         )
     enable_ep_scatter = stage2_scatter is not None
     ep_row_map_tensor = ep_row_map if ep_row_map is not None else out
+
+    if quad_pipeline:
+        if not a4w4_quad_pipeline_ok(
+            a_is_fp4=a_is_fp4,
+            tile_m=tile_m,
+            tile_n=tile_n,
+            tile_k=tile_k,
+            m_warp=m_warp,
+            n_warp=n_warp,
+            num_buffers=num_buffers,
+            N=N,
+            enable_ep_scatter=enable_ep_scatter,
+        ):
+            raise ValueError(
+                "quad_pipeline requested but this launch does not qualify "
+                f"(a_is_fp4={a_is_fp4} tile={tile_m}x{tile_n}x{tile_k} "
+                f"warps={m_warp}x{n_warp} buffers={num_buffers} N={N})"
+            )
+        from .kernels.gemm_a4w4_moe_gfx1250 import launch_gemm_a4w4_moe
+
+        cluster_m, cluster_n_2d = A4W4_QUAD_CLUSTER
+        launch_gemm_a4w4_moe(
+            out,
+            ptr_arg(a),
+            ptr_arg(w),
+            a_scales.view(torch.int32),
+            w_scales.view(torch.int32),
+            ptr_arg(m_tile_map),
+            bias_ptr,
+            quant_scale_tensor,
+            contiguous_m,
+            stream,
+            N,
+            K,
+            tile_m,
+            tile_n,
+            tile_k,
+            m_warp,
+            n_warp,
+            out_is_f16,
+            num_buffers,
+            n_experts,
+            stage1_act,
+            has_bias,
+            float(swiglu_limit),
+            stage1_quant_out,
+            quant_wmma_rep,
+            cluster_m,
+            cluster_n_2d,
+            f32_situ_beta=float(situ_beta),
+            f32_situ_linear_beta=float(situ_linear_beta),
+        )
+        return out
+
     launch_gemm_a8w4_tdm(
         out,
         ptr_arg(a),
