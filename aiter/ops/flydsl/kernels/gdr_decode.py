@@ -634,6 +634,7 @@ def create_vk_gdr_mtp_kernel(
     WARP_THREADS_K: int = 8,
     # Unused here; a parameter so it joins the cache key.
     WAVES_PER_EU: int = 0,
+    min_live_slot: int = 0,
 ):
     """Gated delta rule over a speculative draft window.
 
@@ -650,6 +651,7 @@ def create_vk_gdr_mtp_kernel(
     ``disable_state_update`` suppresses the write-back.
     """
     assert mode in (MTP_MODE_CHAIN, MTP_MODE_SNAPSHOT), f"unknown MTP mode {mode!r}"
+    assert min_live_slot in (0, 1)
     CHAIN = mode == MTP_MODE_CHAIN
     SNAPSHOT = not CHAIN
     TREE = bool(has_tree)
@@ -793,10 +795,6 @@ def create_vk_gdr_mtp_kernel(
 
         if const_expr(CHAIN):
             token_slots = [_slot_at(t) for t in range_constexpr(seq_length)]
-
-        # vLLM reserves slot 0 as its null block; SGLang's slot 0 is ordinary and
-        # a dead slot is a negative sentinel instead.
-        MIN_LIVE_SLOT = 1 if CHAIN else 0
 
         if const_expr(CHAIN):
             nacc_view = _gview(num_accepted, None, (batch_size, 1), (1, 1))
@@ -1242,7 +1240,7 @@ def create_vk_gdr_mtp_kernel(
                                     state_num,
                                 )
 
-                    if write_slot >= MIN_LIVE_SLOT:
+                    if write_slot >= min_live_slot:
                         _checkpoint()
 
                 if const_expr(snapshot != "no"):
@@ -1319,12 +1317,12 @@ def create_vk_gdr_mtp_kernel(
 
         # Flat rather than nested, so no scf.if carries a value out of itself.
         if const_expr(TREE):
-            if (read_slot >= MIN_LIVE_SLOT) & (cache_idx >= 0):
+            if (read_slot >= min_live_slot) & (cache_idx >= 0):
                 _do_mtp(reload_parents=True, snapshot="always")
-            if (read_slot >= MIN_LIVE_SLOT) & (cache_idx < 0):
+            if (read_slot >= min_live_slot) & (cache_idx < 0):
                 _do_mtp(reload_parents=False, snapshot="no")
         else:
-            if read_slot >= MIN_LIVE_SLOT:
+            if read_slot >= min_live_slot:
                 _do_mtp(
                     reload_parents=False,
                     snapshot="guarded" if SAVE_INTER else "no",

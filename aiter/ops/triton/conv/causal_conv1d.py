@@ -286,6 +286,7 @@ def causal_conv1d_update(
                 bias=bias,
                 num_accept_tokens=num_accepted_tokens,
                 cache_seqlens=cache_seqlens,
+                intermediate_conv_window=intermediate_conv_window,
             )
         ):
             return causal_conv1d_update_sglang_flydsl(

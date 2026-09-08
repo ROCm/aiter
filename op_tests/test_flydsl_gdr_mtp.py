@@ -1161,6 +1161,7 @@ def _triton_caller(p: _Problem, *, flydsl, inplace=False):
     pool = p.pool if inplace else p.pool.clone()
     a = p.a.reshape(tokens, HV)
     b = p.b.reshape(tokens, HV)
+    core = torch.empty(tokens, HV, V, device=DEVICE, dtype=p.q.dtype)
 
     def run():
         prev = os.environ.get("AITER_GDR_FLYDSL")
@@ -1182,6 +1183,7 @@ def _triton_caller(p: _Problem, *, flydsl, inplace=False):
                 ssm_state_indices=p.chain_indices,
                 num_accepted_tokens=p.num_accepted,
                 use_qk_l2norm_in_kernel=True,
+                core_attn_out=core,
             )
         finally:
             if prev is None:
@@ -1288,6 +1290,16 @@ def test_dispatch_seam_agrees_with_triton():
         ref.scale,
         "aiter Triton",
     )
+
+
+def test_dispatch_seam_accepts_slot_zero():
+    p = _make_problem(1, 2, seed=61, accepted="first")
+    p = p._replace(
+        chain_indices=torch.tensor([[0, 1]], device=DEVICE, dtype=torch.int32)
+    )
+    _, pool = _triton_call(p, flydsl=True)
+    assert not torch.equal(pool[0], p.pool[0])
+    assert not torch.equal(pool[1], p.pool[1])
 
 
 # -- perf -----------------------------------------------------------------

@@ -381,6 +381,9 @@ def test_split_gdr_update_decode(
     return ret
 
 
+test_split_gdr_update_decode.__test__ = False
+
+
 def _str2bool(value: str) -> bool:
     value = value.lower()
     if value not in ("true", "false"):

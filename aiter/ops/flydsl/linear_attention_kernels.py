@@ -734,6 +734,7 @@ def _mtp_launch(
     parent_tokens,
     inter_buffer,
     use_qk_l2norm,
+    min_live_slot,
     has_tree,
     disable_state_update,
     stream,
@@ -803,6 +804,7 @@ def _mtp_launch(
                 mode,
                 has_tree,
                 disable_state_update,
+                min_live_slot=min_live_slot,
                 **kwargs_,
             )
 
@@ -841,6 +843,7 @@ def flydsl_gdr_mtp(
     num_accepted_tokens: torch.Tensor,
     use_qk_l2norm: bool = False,
     stream: torch.cuda.Stream = None,
+    min_live_slot: int = 1,
 ):
     """Gated delta rule over a linear draft chain, vLLM's MTP contract.
 
@@ -866,6 +869,8 @@ def flydsl_gdr_mtp(
         covers=True,
     )
     _require_index("num_accepted_tokens", num_accepted_tokens, query)
+    if min_live_slot not in (0, 1):
+        raise ValueError(f"`min_live_slot` must be 0 or 1; got {min_live_slot}.")
 
     _mtp_launch(
         mode=MTP_MODE_CHAIN,
@@ -884,6 +889,7 @@ def flydsl_gdr_mtp(
         parent_tokens=None,
         inter_buffer=None,
         use_qk_l2norm=use_qk_l2norm,
+        min_live_slot=min_live_slot,
         has_tree=False,
         disable_state_update=False,
         stream=stream,
@@ -991,6 +997,7 @@ def flydsl_gdr_mtp_sglang(
         ),
         inter_buffer=intermediate_states_buffer,
         use_qk_l2norm=use_qk_l2norm,
+        min_live_slot=0,
         has_tree=retrieve_parent_token is not None,
         disable_state_update=disable_state_update,
         stream=stream,

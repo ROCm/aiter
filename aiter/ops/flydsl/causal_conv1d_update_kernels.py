@@ -359,6 +359,7 @@ def _causal_conv1d_update_sglang_flydsl_supported(
     bias: torch.Tensor | None = None,
     num_accept_tokens: torch.Tensor | None = None,
     cache_seqlens: torch.Tensor | None = None,
+    intermediate_conv_window: torch.Tensor | None = None,
 ) -> bool:
     """Whether ``causal_conv1d_update_sglang_flydsl`` can serve this problem.
 
@@ -366,6 +367,11 @@ def _causal_conv1d_update_sglang_flydsl_supported(
     as it is in SGLang's own Triton kernel.
     """
     if cache_seqlens is not None:
+        return False
+    if intermediate_conv_window is not None and (
+        intermediate_conv_window.dtype != x.dtype
+        or intermediate_conv_window.device != x.device
+    ):
         return False
     return _shapes_supported(
         x,
@@ -676,6 +682,15 @@ def causal_conv1d_update_sglang_flydsl(
     silu = _resolve_activation(activation)
 
     _require_in_scope(x, conv_state, weight, bias, "causal_conv1d_update_sglang_flydsl")
+    if intermediate_conv_window is not None:
+        if intermediate_conv_window.device != x.device:
+            raise ValueError(
+                "`intermediate_conv_window` must sit on the same device as `x`."
+            )
+        if intermediate_conv_window.dtype != x.dtype:
+            raise NotImplementedError(
+                "`intermediate_conv_window` dtype must match `x` dtype."
+            )
 
     unsqueeze = x.dim() == 2
     if unsqueeze:

@@ -1107,7 +1107,11 @@ def test_dispatch_seam_routes_to_flydsl(batch, dim, width, seqlen, spec, save_in
     t = _sglang_problem(batch, dim, width, seqlen, spec, save_inter, tree=False)
     label = f"seam b{batch} d{dim} w{width} s{seqlen} spec={spec} inter={save_inter}"
     assert _causal_conv1d_update_sglang_flydsl_supported(
-        t["x"], t["conv_state"], t["weight"], num_accept_tokens=t["num_accepted"]
+        t["x"],
+        t["conv_state"],
+        t["weight"],
+        num_accept_tokens=t["num_accepted"],
+        intermediate_conv_window=t["window"] if save_inter else None,
     ), f"{label}: expected this case to be in the port's scope"
 
     out_off, state_off, window_off, _ = _call_triton_entry(
@@ -1324,6 +1328,15 @@ def test_out_of_scope_is_refused_rather_than_mishandled():
         assert not fn(
             t["x"], t["conv_state"], t["weight"], bias=t["bias"].to(other)
         ), f"{fn.__name__} accepted a bias the kernel would read as {DTYPE}"
+    snapshot = torch.empty(
+        t["conv_state"].shape[0], 1, 256, 3, device=DEVICE, dtype=torch.float32
+    )
+    assert not _causal_conv1d_update_sglang_flydsl_supported(
+        t["x"],
+        t["conv_state"],
+        t["weight"],
+        intermediate_conv_window=snapshot,
+    )
 
     # -- refused by raising: the call cannot be completed at all --
     # Both entry points, so neither leaves an out-of-range width to the builder's
@@ -1332,6 +1345,13 @@ def test_out_of_scope_is_refused_rather_than_mishandled():
         causal_conv1d_update_sglang_flydsl(t["x"], state_wide, wide)
     with pytest.raises(NotImplementedError):
         causal_conv1d_update_flydsl(t["x"], state_wider, wider)
+    with pytest.raises(NotImplementedError):
+        causal_conv1d_update_sglang_flydsl(
+            t["x"],
+            t["conv_state"],
+            t["weight"],
+            intermediate_conv_window=snapshot,
+        )
     # The dtypes the predicates refuse above. Left to run, `dtype_str` falls
     # through to "fp16" and the kernel reads fp32 bytes as fp16, which is the
     # silent wrong answer the whole scope check exists to prevent.

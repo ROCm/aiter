@@ -108,6 +108,8 @@ def _try_flydsl_mtp(
         return None
     if scale is not None and abs(float(scale) - head_k_dim**-0.5) > 1e-12:
         return None
+    if qkv.is_cuda and torch.cuda.is_current_stream_capturing():
+        return None
 
     total_tokens = qkv.shape[0]
     window = _uniform_draft_window(cu_seqlens, total_tokens)
@@ -162,7 +164,7 @@ def _try_flydsl_mtp(
         return None
 
     out = (
-        core_attn_out[: total_tokens * HV * head_v_dim].view(
+        core_attn_out.view(-1)[: total_tokens * HV * head_v_dim].view(
             n_seq, window, HV, head_v_dim
         )
         if core_attn_out is not None
@@ -181,6 +183,7 @@ def _try_flydsl_mtp(
         ssm_state_indices=idx,
         num_accepted_tokens=nacc,
         use_qk_l2norm=use_qk_l2norm_in_kernel,
+        min_live_slot=0,
     )
     # Same rank as the Triton path below, which returns [1, T, HV, V].
     return out.view(1, total_tokens, HV, head_v_dim), initial_state
@@ -285,7 +288,7 @@ def fused_rearrange_sigmoid_gated_delta_rule(
         )
 
     o = (
-        core_attn_out[: NK * B * T * HV * V].view(NK, B, T, HV, V)
+        core_attn_out.view(-1)[: NK * B * T * HV * V].view(NK, B, T, HV, V)
         if core_attn_out is not None
         else qkv.new_empty(NK, B, T, HV, V)
     )
