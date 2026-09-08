@@ -4,14 +4,8 @@
 
 """FlyDSL Flash Attention fp8 (e4m3fn) forward for gfx950.
 
-Migrated from FlyDSL ``kernels/attention/flash_attn_interface.py``, restricted
-to the fp8 path: the gfx942 generic fallback, the bf16/f16 dual-wave, paged KV,
-LSE, bias/ALiBi/sink and the debug counters are not part of it and were left
-behind. What remains is the dense / packed-varlen / split-K fp8 launcher plus
-the two autotune heuristics it needs (tile height and KV-split count).
-
 Q/K/V are pre-quantized e4m3fn with per-tensor fp32 shape-[1] descales; the
-output is bf16.
+output is bf16. Dense, packed-varlen and split-K.
 """
 
 from __future__ import annotations
@@ -31,10 +25,7 @@ __all__ = ["dualwave_splitk_workspace_elems", "flydsl_flash_attn_fp8_func"]
 
 # Largest flat element count the fp8 C-ABI can address; see the split below.
 _FP8_MAX_FLAT_ELEMS = 2**31
-# fp8 lifts P by log2(448) - RESCALE_THRESHOLD. Past this KV length enough tiles
-# sit far below the running max that the extra two log2 units matter more than
-# the ~0.3% the lower threshold costs there; below it the two are equally
-# accurate and 6 is cheaper.
+# Past this KV length the extra P headroom outweighs the ~0.3% it costs.
 _FP8_LONG_SEQ = 4096
 _DENSE_LIGHT_CU_FALLBACK = 256
 
@@ -184,35 +175,22 @@ def flydsl_flash_attn_fp8_func(
     *,
     causal: bool = True,
     num_kv_heads: int | None = None,
-    # Varlen (packed cu_seqlens): pass both to enable the varlen path.
     cu_seqlens_q: torch.Tensor | None = None,
     cu_seqlens_kv: torch.Tensor | None = None,
-    # Max per-batch Q seqlen (varlen only). Required for varlen to size grid_y
-    # without synchronizing on cu_seqlens_q.
     max_seqlen_q: int | None = None,
-    # Max per-batch KV seqlen (varlen cross-attn only). Used to size the KV grid
-    # when seqlen_q != seqlen_kv per batch.
     max_seqlen_kv: int | None = None,
-    # Whether per-batch Sq and Skv can differ. Dense mode infers this from shapes;
-    # varlen mode requires it explicitly to choose the correct build variant.
     cross_seqlen: bool | None = None,
-    # Split-K. ``None`` autotunes it; ``1`` keeps the kernel unsplit.
     num_kv_splits: int | None = None,
-    # Pin the fp8 tile height to 128 or 256. ``None`` autotunes it.
     fp8_block_m: int | None = None,
-    # Per-tensor descales for the pre-quantized e4m3fn Q/K/V (fp32, shape [1]).
     q_descale: torch.Tensor | None = None,
     k_descale: torch.Tensor | None = None,
     v_descale: torch.Tensor | None = None,
-    # bf16 output tensor; allocated if None.
     out: torch.Tensor | None = None,
-    # Kernel build options.
     waves_per_eu: int = 2,
     daz: bool = True,
     dualwave_swp_lazy_rescale: bool = True,
     dualwave_swp_setprio: bool = True,
     dualwave_swp_enable_stagger: bool = True,
-    # CUDA/HIP stream; defaults to the current stream for q.device.
     stream: torch.cuda.Stream | None = None,
 ) -> torch.Tensor:
     """Run the gfx950 DUALWAVE_SWP fp8 flash attention forward.
@@ -243,7 +221,6 @@ def flydsl_flash_attn_fp8_func(
     Returns:
         bf16 output tensor of shape ``q.shape[:-1] + (v.shape[-1],)``.
     """
-    # ── validation ──────────────────────────────────────────────────────────
     if not (q.is_cuda and k.is_cuda and v.is_cuda):
         raise ValueError("flydsl_flash_attn_fp8_func: q/k/v must be CUDA tensors")
     if not (q.device == k.device == v.device):
@@ -265,12 +242,9 @@ def flydsl_flash_attn_fp8_func(
     if _auto_splits:
         num_kv_splits = 1
 
-    # The fp8 path flattens Q/K/V/O to 1-D and the C-ABI packs a dynamic dim as
-    # int32, so a launch aborts once any of them reaches 2**31 (S >= 131072 at
-    # D=128, H=64). K/V are checked too: cross-attention can hold a short Q and
-    # an over-long KV. Batch entries are independent and a leading slice of a
-    # contiguous tensor is still contiguous, so one launch per entry divides the
-    # flat dim by B at no copy.
+    # Q/K/V/O are flattened and the C-ABI packs the dynamic dim as int32, so no
+    # tensor may reach 2**31. Batch entries are independent and a leading slice
+    # stays contiguous, so one launch per entry divides the flat dim at no copy.
     if max(q.numel(), k.numel(), v.numel()) >= _FP8_MAX_FLAT_ELEMS:
         _packed = cu_seqlens_q is not None or cu_seqlens_kv is not None or q.dim() != 4
         if _packed or q.shape[0] == 1:
@@ -299,10 +273,8 @@ def flydsl_flash_attn_fp8_func(
             "stream": stream,
         }
         if out is None:
-            # Allocate once and hand each launch its own slice. Concatenating
-            # afterwards would consume the parts on the ambient stream while the
-            # kernels are still running on `stream`, and would hold two full
-            # outputs at a size where one is already several GB.
+            # One buffer, a slice per launch: concatenating afterwards would
+            # read the parts on the ambient stream while `stream` still runs.
             out = torch.empty(
                 q.shape[:-1] + (v.shape[-1],), dtype=torch.bfloat16, device=q.device
             )
@@ -349,7 +321,6 @@ def flydsl_flash_attn_fp8_func(
             "flydsl_flash_attn_fp8_func: cu_seqlens_q required when cu_seqlens_kv is given"
         )
 
-    # ── shape inference ─────────────────────────────────────────────────────
     if varlen:
         if q.dim() != 3:
             raise ValueError(
@@ -406,7 +377,6 @@ def flydsl_flash_attn_fp8_func(
             f"v={tuple(v.shape)}, k={tuple(k.shape)}"
         )
 
-    # ── autotune tile height and KV splits ──────────────────────────────────
     _skv_eff = (int(max_seqlen_kv) if cross else Sq) if varlen else int(Skv)
     _block_m = (
         _fp8_auto_block_m(B, H, Sq, _skv_eff, causal, _num_cu(q.device))
@@ -432,7 +402,6 @@ def flydsl_flash_attn_fp8_func(
             B, H, Sq, int(num_kv_splits), head_dim=Dv
         )
 
-    # ── build (cached) ──────────────────────────────────────────────────────
     with torch.cuda.device(q.device.index):
         launch_stream = (
             torch.cuda.current_stream(q.device) if stream is None else stream
@@ -463,7 +432,6 @@ def flydsl_flash_attn_fp8_func(
             ),
         )
 
-        # ── allocate output ─────────────────────────────────────────────────
         _out_shape = tuple(q.shape[:-1]) + (Dv,)
         if out is None:
             out = torch.empty(_out_shape, dtype=torch.bfloat16, device=q.device)
@@ -482,7 +450,6 @@ def flydsl_flash_attn_fp8_func(
         v_flat = v.contiguous().view(-1)
         o_flat = out.contiguous().view(-1)
 
-        # ── launch ──────────────────────────────────────────────────────────
         kwargs = {
             "stream": launch_stream,
             "q_descale": q_descale,

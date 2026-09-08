@@ -2,12 +2,7 @@
 # Copyright (c) 2025 FlyDSL Project Contributors
 # Modifications Copyright (C) 2026 Advanced Micro Devices, Inc.
 
-"""gfx950 DUALWAVE_SWP FP8 flash attention.
-
-Migrated from FlyDSL ``kernels/attention/flash_attn_fp8_gfx950.py``. The kernel
-body is unchanged; only the imports are repointed at the fp8 slice of the
-utilities under ``fmha_gfx950/``.
-"""
+"""gfx950 DUALWAVE_SWP FP8 flash attention."""
 
 import os
 

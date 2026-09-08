@@ -2,15 +2,7 @@
 # Copyright (c) 2025 FlyDSL Project Contributors
 # Modifications Copyright (C) 2026 Advanced Micro Devices, Inc.
 
-"""Per-block forward pass of the gfx950 dual-wave fp8 (e4m3fn) FMHA kernel.
-
-Holds what every stage shares: the low-level ROCDL / MLIR primitives, the
-compile-time tile/layout traits, and the kernel context the ``op_*`` stages
-derive from. Migrated from FlyDSL ``kernels/attention/flash_attn_utils.py`` and
-restricted to the symbols the fp8 path reaches. File layout follows
-csrc/kernels/mha_native/fused: ``op_*`` per stage, ``pipeline`` for the
-per-block forward pass.
-"""
+"""Per-block forward pass: shared primitives, traits, and the kernel context."""
 
 import math as host_math
 from dataclasses import dataclass
@@ -60,24 +52,6 @@ def _read_exec_i64():
 
 
 def _ds_read_tr8_b64_imm(result_type, addr_i32, imm_offset=0):
-    """gfx950 ds_read_b64_tr_b8 (8-bit transpose) with immediate byte offset.
-
-    Returns 64 bits = 8 fp8 (the fp8 analog of ds_read_b64_tr_b16's 4 bf16),
-    used for the fp8 V transpose load.
-
-    LOAD-BEARING asm. Both fx routes were tried and both regress the same way:
-      - ``fx.rocdl.cdna4.LDSReadTrans8_64b()`` copy atom + ``fx.copy``: +31%
-      - raw ``rocdl.ds_read_tr8_b64`` on a static-GEP pointer (the immediate
-        *is* expressible via ``get_element_ptr(static_byte_offset=...)``): +29%
-    both at D=192/Dv=192, while D=192/Dv=128 got ~2% faster. So the immediate
-    encoding is not the issue -- register pressure is. That shape already
-    spills, and dropping the asm's ``~{memory}`` + has_side_effects barrier lets
-    LLVM hoist the 32 transpose loads together, widening live ranges:
-        inline asm  vgpr=256 spill=30 scratch=124
-        intrinsic   vgpr=253 spill=40 scratch=164   (+33% spill traffic)
-    Same category as the ``_cvt_pk_bf16_f32_se`` note in
-    kernels/moe_2stage_a16wmix/utils.py: the side-effect barrier is the point.
-    """
     imm = int(imm_offset)
     raw_type = ir.VectorType.get([2], ir.IntegerType.get_signless(32))
     raw = llvm.inline_asm(
@@ -108,21 +82,7 @@ def _bitcast_f32(value):
 
 
 def _attn_mask_vec2_imm(rel_i32, neg_inf_i32, thr_x, thr_y, x_ref_i32, y_ref_i32):
-    """Causal pair mask: ``rel < thr ? -inf : score``, on the f32 bit patterns.
-
-    Two independent selects sharing one ``rel`` operand. This replaced a
-    hand-written ``2x v_cmp_lt_i32 + 2x v_cndmask_b32`` asm block whose
-    ``=s,=s`` + tied ``2,3`` constraints pinned the masks in SGPRs and let each
-    cndmask reuse its source register. The fx form is an exact 1:1 lowering
-    (32 asm blocks -> 64 arith.cmpi + 64 arith.select in the kernel IR) and is
-    bit-identical; it only hands register allocation back to the compiler.
-
-    Measured trade vs the asm form: varlen cross-causal -3.56% (299.7 -> 289.0us,
-    the compiler schedules better once the instructions are not pinned), varlen
-    self-causal +0.94% (42.16 -> 42.56us, dense-diagonal masking is where the
-    saved v_mov paid off). Net positive and it removes an inline asm that had a
-    perfectly good fx equivalent, so the fx form is what ships.
-    """
+    """Causal pair mask: ``rel < thr ? -inf : score``, on the f32 bit patterns."""
     rel = fx.Int32(rel_i32)
     neg_inf = fx.Int32(neg_inf_i32)
     out_x = (rel < fx.Int32(thr_x)).select(neg_inf, fx.Int32(x_ref_i32))

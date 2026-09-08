@@ -2,13 +2,7 @@
 # Copyright (c) 2025 FlyDSL Project Contributors
 # Modifications Copyright (C) 2026 Advanced Micro Devices, Inc.
 
-"""Split-K COMBINE pass and its workspace sizing.
-
-Part of the gfx950 dual-wave fp8 (e4m3fn) flash-attention kernel, migrated from
-FlyDSL ``kernels/attention/flash_attn_utils.py`` and restricted to the symbols
-the fp8 path reaches. File layout follows csrc/kernels/mha_native/fused:
-``op_*`` per stage, ``pipeline`` for the per-block forward pass.
-"""
+"""Split-K combine pass and workspace sizing."""
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
@@ -19,14 +13,6 @@ from flydsl.expr.typing import Vector as Vec
 from flydsl.expr.utils.arith import _to_raw as as_mlir_value
 
 from aiter.ops.flydsl.kernels import buffer_ops
-
-"""Split-K workspace sizing and the combine pass.
-
-Part of the gfx950 dual-wave fp8 (e4m3fn) flash-attention kernel, migrated from
-FlyDSL ``kernels/attention/flash_attn_utils.py`` and restricted to the symbols
-the fp8 path reaches. The bf16/f16 dual-wave, the gfx942 generic path, paged KV,
-and the bias/ALiBi helpers are not part of it and were left behind.
-"""
 from aiter.ops.flydsl.kernels.fmha_gfx950.pipeline import (
     _LOG2E,
     _cu_load,

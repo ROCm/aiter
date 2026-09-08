@@ -4,9 +4,9 @@
 """High-level FlyDSL Flash Attention APIs.
 
 ``flydsl_flash_attn_batch_func`` / ``flydsl_flash_attn_varlen_func`` dispatch by
-arch and dtype: gfx950 fp8 (e4m3fn, per-tensor descales) routes to the dual-wave
-kernel in ``kernels/fmha_gfx950``, gfx1250 bf16/f16 to the m32x8 prefill kernel.
-Anything else returns ``None`` so the caller falls through to CK/Triton.
+arch and dtype: gfx950 fp8 to ``kernels/fmha_gfx950``, gfx1250 bf16/f16 to the
+m32x8 prefill kernel, anything else ``None`` so the caller falls through to
+CK/Triton.
 
 ``flydsl_flash_attn_func`` (gfx1201 / RDNA4) wraps the
 `flash_attn_func_gfx1201` kernel with:
@@ -238,14 +238,11 @@ def _fp8_gfx950_supported(
     v_descale,
     out,
 ) -> bool:
-    """Gate for the gfx950 dual-wave fp8 kernel.
+    """Gate for the gfx950 fp8 kernel.
 
-    The kernel takes pre-quantized e4m3fn Q/K/V with per-tensor fp32 shape-[1]
-    descales and a hard-wired ``1/sqrt(D)`` softmax scale, and writes bf16.
-    Everything it cannot express -- LSE, dropout, sliding window, bias, ALiBi,
-    sink, paged KV, attention probabilities, a custom ``softmax_scale``, a
-    non-bf16 ``out`` -- is rejected here so the caller falls through to
-    CK/Triton rather than silently dropping it.
+    It needs e4m3fn Q/K/V with per-tensor descales, hard-wires ``1/sqrt(D)``,
+    and writes bf16. Reject anything else so it falls through rather than
+    silently dropping the feature.
     """
     from ...jit.utils.chip_info import get_gfx
 
@@ -319,7 +316,6 @@ def flydsl_flash_attn_varlen_func(
     from ...jit.core import is_experimental_enabled
     from ...jit.utils.chip_info import get_gfx
 
-    # gfx950 -- pre-quantized fp8 (e4m3fn) with per-tensor descales.
     if _fp8_gfx950_supported(
         q,
         k,
@@ -444,7 +440,6 @@ def flydsl_flash_attn_batch_func(
     from ...jit.core import is_experimental_enabled
     from ...jit.utils.chip_info import get_gfx
 
-    # gfx950 -- pre-quantized fp8 (e4m3fn) with per-tensor descales.
     if q.dim() == 4 and _fp8_gfx950_supported(
         q,
         k,

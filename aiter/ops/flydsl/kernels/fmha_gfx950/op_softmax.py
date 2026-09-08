@@ -2,13 +2,7 @@
 # Copyright (c) 2025 FlyDSL Project Contributors
 # Modifications Copyright (C) 2026 Advanced Micro Devices, Inc.
 
-"""The online-softmax stage, including causal / seq-pad masking.
-
-Part of the gfx950 dual-wave fp8 (e4m3fn) flash-attention kernel, migrated from
-FlyDSL ``kernels/attention/flash_attn_utils.py`` and restricted to the symbols
-the fp8 path reaches. File layout follows csrc/kernels/mha_native/fused:
-``op_*`` per stage, ``pipeline`` for the per-block forward pass.
-"""
+"""Online softmax, with causal / seq-pad masking."""
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx

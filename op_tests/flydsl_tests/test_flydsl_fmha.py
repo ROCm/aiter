@@ -1,13 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Tests for the FlyDSL flash-attention kernels.
-
-Two arch-scoped suites live here:
-  - ``flydsl_flash_attn_func`` (gfx1201 / RDNA4), bf16/f16.
-  - ``flydsl_flash_attn_fp8_func`` (gfx950), e4m3fn with per-tensor descales,
-    plus the ``fmha_kernels`` dispatch that routes to it.
-"""
+"""Tests for the FlyDSL flash-attention kernels: gfx1201 bf16/f16 and gfx950 fp8."""
 
 from __future__ import annotations
 
@@ -302,11 +296,8 @@ def test_flydsl_fmha_rejects_device_mismatch():
         flydsl_flash_attn_func(q, k, v)
 
 
-# ─────────────────────────── gfx950 fp8 (e4m3fn) ───────────────────────────
-#
-# Migrated from FlyDSL ``tests/kernels/test_flash_attn_fwd.py``. Q/K/V are
-# quantized per tensor to e4m3fn and the reference dequantizes the *same* fp8
-# values, so the only error measured is the kernel's, not the quantizer's.
+# gfx950 fp8 (e4m3fn). The reference dequantizes the *same* fp8 tensors, so the
+# error measured is the kernel's, not the quantizer's.
 
 FP8_DTYPE = torch.float8_e4m3fn
 # Fixed fp8 correctness gate; fp8 is lossy, so these are absolute bounds.
@@ -513,9 +504,6 @@ def _run_fp8_into_nan_out(q, k, v, head_dim_v, **kwargs):
     return out
 
 
-# ── shape coverage ──────────────────────────────────────────────────────────
-
-
 @_gfx950_only
 @pytest.mark.parametrize("causal", [False, True])
 @pytest.mark.parametrize(
@@ -660,9 +648,6 @@ def test_fp8_rejected_head_dims_raise_before_launch(head_dim, head_dim_v, match)
         _run_fp8_into_nan_out(q, k, v, head_dim_v, causal=False, num_kv_heads=H)
 
 
-# ── split-K coverage of the combine grid ────────────────────────────────────
-
-
 @_gfx950_only
 @pytest.mark.parametrize(
     "batch,seq_len,num_heads", [(1, 4097, 1), (1, 4097, 3), (1, 2050, 7), (1, 8193, 1)]
@@ -719,9 +704,6 @@ def test_fp8_varlen_split_kv_respects_batch_boundaries(seq_len, num_heads, head_
     ).any(), f"{int(torch.isnan(split).any(-1).sum())} output rows were never written"
     unsplit = _run_fp8_into_nan_out(q, k, v, head_dim_v, num_kv_splits=1, **kw)
     torch.testing.assert_close(split.float(), unsplit.float(), rtol=2e-2, atol=2e-2)
-
-
-# ── softmax / rescale behaviour ─────────────────────────────────────────────
 
 
 @_gfx950_only
@@ -852,9 +834,6 @@ def test_fp8_auto_block_m_picks(batch, num_heads, seqlen_q, seqlen_kv, causal, e
     )
 
 
-# ── output-tensor and flat-dim ABI ──────────────────────────────────────────
-
-
 @_gfx950_only
 @pytest.mark.parametrize("split", [False, True])
 def test_fp8_out_tensor_is_filled_and_returned(monkeypatch, split):
@@ -967,9 +946,6 @@ def test_fp8_split_result_survives_a_non_current_stream(monkeypatch):
     torch.cuda.synchronize()
 
     torch.testing.assert_close(got.float(), ref.float(), rtol=0, atol=0)
-
-
-# ── fmha_kernels dispatch ───────────────────────────────────────────────────
 
 
 def _fp8_dispatch_inputs(B=2, S=1024, H=8, D=128, varlen=False):
