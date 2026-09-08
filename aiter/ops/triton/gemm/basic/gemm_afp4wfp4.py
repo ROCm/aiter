@@ -421,7 +421,6 @@ def gemm_afp4wfp4_preshuffled_scales(
     return y
 
 
-# TODO: Split-K support
 def gemm_afp4wfp4_preshuffle(
     x_fp4: torch.Tensor,
     w_preshuf: torch.Tensor,

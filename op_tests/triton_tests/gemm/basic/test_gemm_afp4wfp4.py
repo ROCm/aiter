@@ -5,6 +5,9 @@ import torch
 import triton
 
 from aiter.ops.shuffle import shuffle_scale, shuffle_weight
+from aiter.ops.triton._triton_kernels.gemm.basic.gemm_afp4wfp4 import (
+    _get_config as _get_afp4wfp4_config,
+)
 from aiter.ops.triton.gemm.basic.gemm_afp4wfp4 import (
     gemm_afp4wfp4 as triton_gemm_afp4wfp4,
 )
@@ -269,6 +272,79 @@ def test_gemm_afp4_wfp4(
 
     if triton_out.dim() == 3:
         triton_out = triton_out.sum(dim=0).to(dtype)
+
+    triton.testing.assert_close(torch_out, triton_out)
+
+
+def get_splitk_x_vals():
+    # Decode-shaped (small M) GEMMs whose tuned gfx950 configs select
+    # NUM_KSPLIT > 1. K is varied because the bug this covers scaled with K:
+    # a split slice was sized in elements while the kernel indexed in packed
+    # bytes, so the second half of the splits read past the end of x_fp4.
+    return [
+        (1, 10240, 8192),
+        (16, 8192, 28672),
+        (32, 8192, 28672),
+        (64, 8192, 28672),
+        (64, 8192, 8192),
+        (128, 16384, 53248),
+    ]
+
+
+@pytest.mark.parametrize("M, N, K", get_splitk_x_vals())
+@pytest.mark.parametrize("num_ksplit", [2, 4, 8])
+def test_gemm_afp4_wfp4_preshuffle_splitk(M: int, N: int, K: int, num_ksplit: int):
+    """Cover the preshuffled split-K path against a torch reference.
+
+    NUM_KSPLIT is forced rather than taken from the tuned config so the
+    coverage cannot silently lapse if these shapes are re-tuned to
+    NUM_KSPLIT=1 -- which is how the element-vs-packed-byte K bug reached
+    users: no shape in get_x_vals() resolved to a tuned preshuffled config
+    with split-K, so the whole path was untested.
+
+    Note this manifests as a GPU memory access fault (i.e. the pytest worker
+    dies) rather than an assert_close failure, unless the out-of-bounds reads
+    happen to land in mapped memory, in which case the accumulation is
+    silently wrong and assert_close catches it.
+    """
+    dtype = torch.bfloat16
+    (
+        x,
+        w,
+        w_triton,
+        x_scales,
+        w_scales,
+        x_scales_triton,
+        w_scales_triton,
+        _out_dtype,
+        y,
+    ) = generate_gemm_afp4wfp4_inputs(
+        M,
+        N,
+        K,
+        dtype,
+        layout="TN",
+        output=True,
+        shuffle_scales_fg=True,
+        shuffle_weight_fg=True,
+    )
+
+    # _get_config doubles K itself, so pass packed bytes as the wrapper does.
+    config, _ = _get_afp4wfp4_config(M, N, K // 2, True, backend="triton")
+    config = dict(config)
+    config["NUM_KSPLIT"] = num_ksplit
+
+    triton_out = gemm_afp4wfp4_preshuffle(
+        x,
+        w_triton,
+        x_scales_triton,
+        w_scales_triton,
+        dtype,
+        y,
+        config=config,
+    )
+
+    torch_out = run_torch(x, w, x_scales, w_scales, dtype).to(dtype)
 
     triton.testing.assert_close(torch_out, triton_out)
 
