@@ -135,30 +135,12 @@ def gemm_a16w16_(
             NUM_WGS = torch.cuda.get_device_properties(x.device).multi_processor_count
 
         if config is None:
-            arch = get_arch()
-            _stem = f"{arch}-GEMM-A16W16-PERSISTENT-N={N}-K={K}.json"
-            _base = f"{AITER_TRITON_CONFIGS_PATH}/{arch}/{backend}/gemm"
-            _persistent_dir = f"{_base}/gemm_a16w16_persistent"
-            raw = load_config_json(f"{_persistent_dir}/{_stem}", required=False)
-            config = None
-            if raw is not None:
-                for bound in STANDARD_M_BOUNDS:
-                    if M <= bound and f"M_LEQ_{bound}" in raw:
-                        config = dict(raw[f"M_LEQ_{bound}"])
-                        break
-                if config is None:
-                    for bound in reversed(STANDARD_M_BOUNDS):
-                        if M >= bound and f"M_GEQ_{bound}" in raw:
-                            config = dict(raw[f"M_GEQ_{bound}"])
-                            break
-                if config is None and "any" in raw:
-                    config = dict(raw["any"])
-            if config is None:
-                config, _ = get_gemm_config(
-                    "GEMM-A16W16-PERSISTENT", M, N, K, backend=backend
-                )
-            if backend == "triton":
-                config = compute_splitk_params(config, K)
+            config, _ = get_gemm_config(
+                "GEMM-A16W16-PERSISTENT", M, N, K, backend=backend
+            ) 
+        if backend == "triton":
+            config["NUM_KSPLIT"] = 1
+            config = compute_splitk_params(config, K)
 
         if backend == "gluon":
             assert (

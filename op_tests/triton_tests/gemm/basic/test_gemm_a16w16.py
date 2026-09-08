@@ -225,11 +225,6 @@ def test_gemm_a16_w16_atomic_layout(M: int, N: int, K: int, layout):
 def test_gemm_a16w16_persistent_output(M: int, N: int, K: int, layout, output, backend):
     if backend == "gluon" and not is_gluon_supported():
         pytest.skip("Gluon not supported on this architecture")
-    if backend == "triton":
-        from aiter.ops.triton.utils._triton.arch_info import get_arch
-
-        if "gfx1250" in (get_arch() or ""):
-            pytest.skip("triton backend has no gfx1250 a16w16 config (gluon-only arch)")
     torch.cuda.empty_cache()
 
     x, w, _, _out_dtype, y = generate_gemm_a16w16_inputs(

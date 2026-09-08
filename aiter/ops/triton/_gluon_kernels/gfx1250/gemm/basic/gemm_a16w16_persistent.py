@@ -316,8 +316,12 @@ def gemm_a16w16_persistent_kernel_(
                 cur_b = next_b
                 compute_idx += 1
 
-            # final WMMA
-            accumulator = gl.amd.gfx1250.wmma(cur_a, cur_b, accumulator)
+            if ADD_BIAS and pid_k == 0 and WRITES_FINAL:
+                offs_bias = n_off + gl.arange(
+                    0, BLOCK_N, layout=gl.SliceLayout(0, WMMA_LAYOUT)
+                )
+                bias_vals = gl.load(bias_ptr + offs_bias, mask=offs_bias < N, other=0.0)
+                accumulator = accumulator + bias_vals[None, :]
 
             if USE_ACTIVATION and WRITES_FINAL:
                 accumulator = activation(accumulator)
@@ -586,6 +590,13 @@ def gemm_a16w16_persistent_compute_bound_kernel_(
             compute_idx += 1
 
         accumulator = gl.amd.gfx1250.wmma(cur_a, cur_b, accumulator)
+
+        if ADD_BIAS and pid_k == 0 and WRITES_FINAL:
+            offs_bias = n_off + gl.arange(
+                0, BLOCK_N, layout=gl.SliceLayout(0, WMMA_LAYOUT)
+            )
+            bias_vals = gl.load(bias_ptr + offs_bias, mask=offs_bias < N, other=0.0)
+            accumulator = accumulator + bias_vals[None, :]
 
         if USE_ACTIVATION and WRITES_FINAL:
             accumulator = activation(accumulator)

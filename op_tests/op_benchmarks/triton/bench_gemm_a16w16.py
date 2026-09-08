@@ -81,7 +81,14 @@ def bench_gemm_fn(
     else:
         ms = bench_fn(
             lambda: gemm_a16w16(
-                x, w, bias, c_dtype, y, activation=activation, backend=backend
+                x,
+                w,
+                bias,
+                c_dtype,
+                y,
+                activation=activation,
+                kernel_type=kernel_type,
+                backend=backend,
             ),
         )
 
