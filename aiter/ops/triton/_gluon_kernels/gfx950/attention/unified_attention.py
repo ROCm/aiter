@@ -1,5 +1,3 @@
-import os
-
 import torch
 import triton
 import triton.experimental.gluon.language as gl
@@ -13,8 +11,9 @@ from aiter.ops.triton.utils.common_utils import strip_annotate
 from aiter.ops.triton.utils.types import e4m3_dtype
 
 triton_version = Version(triton.__version__)
-
 TRITON_BEYOND_37 = gl.constexpr(triton_version >= Version("3.7"))
+
+float8_info = torch.finfo(e4m3_dtype)
 
 
 def _async_copy_accepts_distributed_layout() -> bool:
@@ -36,9 +35,6 @@ def _async_copy_accepts_distributed_layout() -> bool:
 # Use the offset_bases / DistributedLinearLayout KV-load path only when async_copy
 # accepts it; otherwise fall back to the BlockedLayout path (works everywhere).
 ASYNC_COPY_SUPPORTS_DISTRIBUTED = _async_copy_accepts_distributed_layout()
-float8_info = torch.finfo(e4m3_dtype)
-
-PRINT_IRS = os.environ.get("PRINT_IRS", "0") == "1"
 
 _MAX_PROPAGATE_NAN_ALL = gl.constexpr(PropagateNan.ALL)
 
@@ -90,12 +86,11 @@ def _offset_bases_to_blocked(offset_bases, contiguity, num_warps, warp_size, sha
 
 
 @gluon.constexpr_function
-def _swizzled_pair(n0, n1, CONTIGUITY, NUM_WARPS, WARP_SIZE, padding):
+def _padded_pair(n0, n1, CONTIGUITY, NUM_WARPS, WARP_SIZE, padding):
     """Shared + load layout for a tile whose dim0 is the contiguous axis in memory.
 
-    dim0 gets identity bases, dim1 an XOR rotation by the lane bits dim0 leaves
-    over. K always looks like this; so does V once the cache is pre-shuffled,
-    with the two dims swapped.
+    dim0 keeps identity bases, dim1's bases are cyclically rotated by the lane bits
+    dim0 leaves over, which is what moves consecutive rows off the same LDS bank.
     """
     lg0 = n0.bit_length() - 1
     lg1 = n1.bit_length() - 1
@@ -116,6 +111,123 @@ def _swizzled_pair(n0, n1, CONTIGUITY, NUM_WARPS, WARP_SIZE, padding):
 
 
 @gluon.constexpr_function
+def _shuffled_kv_layouts(HEAD_SIZE, TILE_SIZE, NUM_WARPS, C, WARP_SIZE, GATHER):
+    if GATHER:
+        # A gathered tile carries a per-token page address. Direct-to-LDS only
+        # lowers when that address is one scalar per lane, so the token axis has
+        # to be one a lane does not span: split the tile into [outer, token, W]
+        # and give the lane the W run alone.
+        def blocked3(dim0, dim1):
+            t1 = min(WARP_SIZE, dim1)
+            t0 = WARP_SIZE // t1
+            w0 = max(1, min(NUM_WARPS, dim0 // t0))
+            return gl.BlockedLayout(
+                size_per_thread=[1, 1, C],
+                threads_per_warp=[t0, t1, 1],
+                warps_per_cta=[w0, NUM_WARPS // w0, 1],
+                order=[2, 1, 0],
+            )
+
+        flat3 = gl.SwizzledSharedLayout(
+            vec=1, per_phase=1, max_phase=1, order=[2, 1, 0]
+        )
+        return (
+            blocked3(HEAD_SIZE // C, TILE_SIZE),
+            blocked3(TILE_SIZE // C, HEAD_SIZE),
+            flat3,
+            flat3,
+        )
+
+    def blocked(cols):
+        along_1 = max(1, min(NUM_WARPS, cols // (WARP_SIZE * C)))
+        return gl.BlockedLayout(
+            size_per_thread=[1, C],
+            threads_per_warp=[1, WARP_SIZE],
+            warps_per_cta=[NUM_WARPS // along_1, along_1],
+            order=[1, 0],
+        )
+
+    flat = gl.SwizzledSharedLayout(vec=1, per_phase=1, max_phase=1, order=[1, 0])
+    return blocked(TILE_SIZE * C), blocked(HEAD_SIZE * C), flat, flat
+
+
+@gluon.constexpr_function
+def _padded_kv_layouts(HEAD_SIZE, TILE_SIZE, NUM_WARPS, C, WARP_SIZE, FP8_KV):
+    """Plain cache: padded shared layouts with a rotated basis, and the matching
+    load layouts derived from the same bases the way CoalesceAsyncCopy would."""
+    LG2_HS = HEAD_SIZE.bit_length() - 1
+    LG2_TS = TILE_SIZE.bit_length() - 1
+    LG2_NW = NUM_WARPS.bit_length() - 1
+    LG2_WS = WARP_SIZE.bit_length() - 1
+
+    # CDNA4 WARP_SIZE=64 -> 6 lane bits, split between the HEAD_SIZE and TILE_SIZE dims
+    hs_lane = LG2_HS - (
+        C.bit_length() - 1
+    )  # lane bits on the HEAD_SIZE (contiguous) dim
+    ts_lane = LG2_WS - hs_lane  # remaining lane bits for the TILE_SIZE dim
+    ts_reg = LG2_TS - ts_lane - LG2_NW  # leftover reg bits for the TILE_SIZE dim
+
+    # K shared [HEAD_SIZE, TILE_SIZE]
+    blocked_k, shared_k = _padded_pair(
+        HEAD_SIZE,
+        TILE_SIZE,
+        C,
+        NUM_WARPS,
+        WARP_SIZE,
+        [1024, 16] if FP8_KV else [512, 8],
+    )
+
+    # V shared [TILE_SIZE, HEAD_SIZE] cannot reuse _padded_pair: dim1 (HEAD_SIZE)
+    # is the identity one here, and dim0 (TILE_SIZE) rotates by v_N only within a
+    # window of v_M bits, bits above v_M staying identity.
+    if HEAD_SIZE <= TILE_SIZE:
+        v_N = 1
+    elif ts_reg >= ts_lane:
+        v_N = LG2_NW + ts_reg
+    else:
+        v_N = LG2_NW
+    v_M = v_N + ts_lane
+
+    v_offset = [[0, 1 << i] for i in range(LG2_HS)] + [
+        ([1 << ((i + v_N) % v_M), 0] if i < v_M else [1 << i, 0]) for i in range(LG2_TS)
+    ]
+    shared_v = gl.PaddedSharedLayout(
+        interval_padding_pairs=[[1024, 32] if FP8_KV else [512, 32]],
+        offset_bases=v_offset,
+        cga_layout=[],
+        shape=[TILE_SIZE, HEAD_SIZE],
+    )
+    blocked_v = _offset_bases_to_blocked(
+        v_offset, C, NUM_WARPS, WARP_SIZE, [TILE_SIZE, HEAD_SIZE]
+    )
+    return blocked_k, blocked_v, shared_k, shared_v
+
+
+@gluon.constexpr_function
+def _legacy_kv_layouts(HEAD_SIZE, NUM_WARPS, C, WARP_SIZE, FP8_KV):
+    """Fallback for a triton whose async_copy will not take a linear load layout:
+    plain blocked loads over XOR-swizzled shared memory."""
+    HEAD_SIZE_DIV = HEAD_SIZE // C
+    blocked_v = gl.BlockedLayout(
+        size_per_thread=[1, C],
+        threads_per_warp=[WARP_SIZE // HEAD_SIZE_DIV, HEAD_SIZE_DIV],
+        warps_per_cta=[NUM_WARPS, 1],
+        order=[1, 0],
+    )
+    blocked_k = gl.BlockedLayout(
+        size_per_thread=[C, 1],
+        threads_per_warp=[HEAD_SIZE_DIV, WARP_SIZE // HEAD_SIZE_DIV],
+        warps_per_cta=[1, NUM_WARPS],
+        order=[0, 1],
+    )
+    shared_k = gl.SwizzledSharedLayout(vec=C, per_phase=2, max_phase=8, order=[0, 1])
+    shared_v = gl.SwizzledSharedLayout(
+        vec=C, per_phase=1, max_phase=1 if not FP8_KV else 8, order=[1, 0]
+    )
+    return blocked_k, blocked_v, shared_k, shared_v
+
+
+@gluon.constexpr_function
 def _make_cdna4_kv_load_layouts(
     HEAD_SIZE,
     TILE_SIZE,
@@ -125,146 +237,26 @@ def _make_cdna4_kv_load_layouts(
     SHUFFLED=False,
     GATHER=False,
 ):
-    """
-    Build load and shared memory layouts for CDNA4 async KV cache loading.
+    """Load and shared layouts for CDNA4 async KV cache loading, as
+    (blocked_k, blocked_v, shared_k, shared_v).
 
-    The PaddedSharedLayout defines an XOR-swizzled shared memory mapping.
-    The DistributedLinearLayout (load layout) is derived from it by partitioning
-    offset_bases across reg/lane/warp — matching Triton's CoalesceAsyncCopy.
-
-    Returns (blocked_k, blocked_v, shared_k_layout, shared_v_layout).
+    Three paths:
+     - a pre-shuffled cache
+     - regular k cache with padded shared layout
+     - swizzled shared layout
     """
-    # To support different triton versions: use the offset_bases /
-    # DistributedLinearLayout path only when async_copy accepts that layout.
+    # elements per 128-bit vector load
+    CONTIGUITY = 16 if FP8_KV else 8
+
     if SHUFFLED:
-        # The cache already sits in dot-operand order, so LDS needs no swizzle and no
-        # padding: copy the bytes straight in and un-shuffle with a view on read.
-        CONTIGUITY = 16 if FP8_KV else 8
-        flat = gl.SwizzledSharedLayout(vec=1, per_phase=1, max_phase=1, order=[1, 0])
-
-        # One warp covers WARP_SIZE * CONTIGUITY elements of a row; put the rest of
-        # the warps on whichever axis still has room, or each lane needs two loads.
-        def _blocked(cols):
-            per_warp = WARP_SIZE * CONTIGUITY
-            along_1 = max(1, min(NUM_WARPS, cols // per_warp))
-            return gl.BlockedLayout(
-                size_per_thread=[1, CONTIGUITY],
-                threads_per_warp=[1, WARP_SIZE],
-                warps_per_cta=[NUM_WARPS // along_1, along_1],
-                order=[1, 0],
-            )
-
-        # A gathered tile carries a per-token page address. Direct-to-LDS only
-        # lowers when that address is one scalar per lane, so the token axis has
-        # to be one a lane does not span: split the tile into
-        # [outer, token, W] and give the lane the W run alone.
-        def _blocked3(dim0, dim1):
-            t1 = min(WARP_SIZE, dim1)
-            t0 = WARP_SIZE // t1
-            w0 = max(1, min(NUM_WARPS, dim0 // t0))
-            return gl.BlockedLayout(
-                size_per_thread=[1, 1, CONTIGUITY],
-                threads_per_warp=[t0, t1, 1],
-                warps_per_cta=[w0, NUM_WARPS // w0, 1],
-                order=[2, 1, 0],
-            )
-
-        if GATHER:
-            flat3 = gl.SwizzledSharedLayout(
-                vec=1, per_phase=1, max_phase=1, order=[2, 1, 0]
-            )
-            return (
-                _blocked3(HEAD_SIZE // CONTIGUITY, TILE_SIZE),
-                _blocked3(TILE_SIZE // CONTIGUITY, HEAD_SIZE),
-                flat3,
-                flat3,
-            )
-        return (
-            _blocked(TILE_SIZE * CONTIGUITY),
-            _blocked(HEAD_SIZE * CONTIGUITY),
-            flat,
-            flat,
+        return _shuffled_kv_layouts(
+            HEAD_SIZE, TILE_SIZE, NUM_WARPS, CONTIGUITY, WARP_SIZE, GATHER
         )
-
     if TRITON_BEYOND_37 and ASYNC_COPY_SUPPORTS_DISTRIBUTED:
-        CONTIGUITY = 16 if FP8_KV else 8  # elements per 128-bit vector load
-        LG2_C = CONTIGUITY.bit_length() - 1
-        LG2_HS = HEAD_SIZE.bit_length() - 1
-        LG2_TS = TILE_SIZE.bit_length() - 1
-        LG2_NW = NUM_WARPS.bit_length() - 1
-        LG2_WS = WARP_SIZE.bit_length() - 1  # WAVE SIZE is 64
-
-        # CDNA4 WARP_SIZE=64 → 6 lane bits, split between HEAD_SIZE and TILE_SIZE dims
-        hs_lane = LG2_HS - LG2_C  # lane bits covering the HEAD_SIZE (contiguous) dim
-        ts_lane = LG2_WS - hs_lane  # remaining lane bits for the TILE_SIZE dim
-        ts_reg = LG2_TS - ts_lane - LG2_NW  # leftover reg bits for TILE_SIZE dim
-
-        # K shared [HEAD_SIZE, TILE_SIZE]: HEAD_SIZE is the contiguous axis in
-        # both layouts -- plain runs the whole head, shuffled runs K_WIDTH of it
-        # and K_WIDTH == CONTIGUITY -- so one construction covers both.
-        blocked_k, shared_k = _swizzled_pair(
-            HEAD_SIZE,
-            TILE_SIZE,
-            CONTIGUITY,
-            NUM_WARPS,
-            WARP_SIZE,
-            [1024, 16] if FP8_KV else [512, 8],
+        return _padded_kv_layouts(
+            HEAD_SIZE, TILE_SIZE, NUM_WARPS, CONTIGUITY, WARP_SIZE, FP8_KV
         )
-
-        # V shared [TILE_SIZE, HEAD_SIZE]
-        # dim1 (HEAD_SIZE): identity.  dim0 (TILE_SIZE): XOR rotation by v_N
-        # within a swizzle window of v_M bits (bits above v_M are identity).
-        #
-        # v_N is the position of the first lane base among the TILE_SIZE dim0
-        # bases after CoalesceAsyncCopy partitioning.  The partitioning assigns
-        # dim0 bases to lane/warp/reg in an order that depends on whether warps
-        # are split (HEAD_SIZE <= TILE_SIZE) or consecutive (HEAD_SIZE > TILE_SIZE)
-        if HEAD_SIZE <= TILE_SIZE:
-            v_N = 1
-        elif ts_reg >= ts_lane:
-            v_N = LG2_NW + ts_reg
-        else:
-            v_N = LG2_NW
-        v_M = v_N + ts_lane
-
-        v_offset = [[0, 1 << i] for i in range(LG2_HS)] + [
-            ([1 << ((i + v_N) % v_M), 0] if i < v_M else [1 << i, 0])
-            for i in range(LG2_TS)
-        ]
-        shared_v = gl.PaddedSharedLayout(
-            interval_padding_pairs=[[1024, 32] if FP8_KV else [512, 32]],
-            offset_bases=v_offset,
-            cga_layout=[],
-            shape=[TILE_SIZE, HEAD_SIZE],
-        )
-
-        blocked_v = _offset_bases_to_blocked(
-            v_offset, CONTIGUITY, NUM_WARPS, WARP_SIZE, [TILE_SIZE, HEAD_SIZE]
-        )
-    else:
-        CONTIGUITY = 16 if FP8_KV else 8
-        HEAD_SIZE_DIV = HEAD_SIZE // CONTIGUITY
-        blocked_v = gl.BlockedLayout(
-            size_per_thread=[1, CONTIGUITY],
-            threads_per_warp=[WARP_SIZE // HEAD_SIZE_DIV, HEAD_SIZE_DIV],
-            warps_per_cta=[NUM_WARPS, 1],
-            order=[1, 0],
-        )
-        blocked_k = gl.BlockedLayout(
-            size_per_thread=[CONTIGUITY, 1],
-            threads_per_warp=[HEAD_SIZE_DIV, WARP_SIZE // HEAD_SIZE_DIV],
-            warps_per_cta=[1, NUM_WARPS],
-            order=[0, 1],
-        )
-
-        shared_k = gl.SwizzledSharedLayout(
-            vec=CONTIGUITY, per_phase=2, max_phase=8, order=[0, 1]
-        )
-        shared_v = gl.SwizzledSharedLayout(
-            vec=CONTIGUITY, per_phase=1, max_phase=1 if not FP8_KV else 8, order=[1, 0]
-        )
-
-    return blocked_k, blocked_v, shared_k, shared_v
+    return _legacy_kv_layouts(HEAD_SIZE, NUM_WARPS, CONTIGUITY, WARP_SIZE, FP8_KV)
 
 
 @aggregate
@@ -386,20 +378,23 @@ class AttentionConfig:
         # CDNA4 shapes: bf16 32x32x16 / 16x16x32, fp8 32x32x64 / 16x16x128.
         if MFMA_DIM == 32:
             mfma_instr = [32, 32, 16] if not self.DOT_FP8 else [32, 32, 64]
-            self.K_WIDTH_QK = gl.constexpr(16) if self.DOT_FP8 else gl.constexpr(8)
-            if self.DOT_FP8:
-                self.K_WIDTH_PV = gl.constexpr(16)
-            elif SHUFFLED_KV_CACHE:
-                # The cache is shuffled in 16-byte groups, so the PV operand has to
-                # read in the same width or the un-shuffle stops being an inverse
-                # and the ds_read picks up 40% bank conflicts.
-                self.K_WIDTH_PV = gl.constexpr(8)
-            else:
-                self.K_WIDTH_PV = gl.constexpr(4)
         else:
             mfma_instr = [16, 16, 32] if not self.DOT_FP8 else [16, 16, 128]
+        if SHUFFLED_KV_CACHE:
+            # Both operands read flat LDS, so use the width the kv cache shape enforces
+            self.K_WIDTH_QK = gl.constexpr(KV_SHUFFLE_WIDTH)
+            self.K_WIDTH_PV = gl.constexpr(KV_SHUFFLE_WIDTH)
+        else:
+            # K comes through swizzled LDS: take the widest read a lane can do, 16 B
             self.K_WIDTH_QK = gl.constexpr(16) if self.DOT_FP8 else gl.constexpr(8)
-            self.K_WIDTH_PV = gl.constexpr(16) if self.DOT_FP8 else gl.constexpr(8)
+            if ALL_DECODE:
+                self.K_WIDTH_PV = self.K_WIDTH_QK
+            else:
+                # P is the QK accumulator, whose contiguous run along the reduction
+                # axis is 4 for every shape above, so 4 converts to the operand for
+                # free. V is indifferent: ds_read_tr's granularity comes from the
+                # instruction.
+                self.K_WIDTH_PV = gl.constexpr(4)
         # The PV dot reduces over TILE_SIZE, so the tile has to supply at least the
         # instruction's K
         assert TILE_SIZE >= mfma_instr[2], (
@@ -835,9 +830,6 @@ class AsyncGatherKVLoader:
         v_shared = gl.allocate_shared_memory(
             value_cache_ptr.type.element_ty, v_shape, layout=kv_cfg.shared_v_layout
         )
-        # Head + d-dimension offsets (tile-independent). The N-dim within-block
-        # offset is computed per tile in the load methods, so this works for any
-        # TILE_SIZE vs BLOCK_SIZE.
         if cfg.SHUFFLED_KV_CACHE:
             # Shuffled K is [.., HEAD_SIZE // W, BLOCK_SIZE, W]. The tile keeps
             # that shape so the token index sits on its own axis, which is what
@@ -1020,9 +1012,7 @@ class AsyncGatherKVLoader:
 
     @gluon.jit
     def load_block_ids(self, i):
-        # The loop calls this two tiles ahead of the copy that uses it. vmcnt is
-        # in-order, so gathering next to the async copy would drop the wait to
-        # vmcnt(0) and drain the KV copies the double buffer is overlapping.
+        # The loop calls this two tiles ahead of the copy that uses it
         seq_offset_k = i * self.cfg.TILE_SIZE + self.offs_n_k
         seq_offset_v = i * self.cfg.TILE_SIZE + self.offs_n_v
         # clamp so the loop's j+2 prefetch never reads past the block table
@@ -1039,8 +1029,6 @@ class AsyncGatherKVLoader:
             ptr=self.block_tables_ptr_shifted, offsets=block_table_idx_v
         )
         if self.cfg.SHUFFLED_KV_CACHE:
-            # K steps one token at a time; V steps a whole W-token group, which
-            # is why its page stays the same across the group.
             within_block_k = (
                 seq_offset_k % self.cfg.BLOCK_SIZE
             ) * self.cfg.stride_k_cache_3
