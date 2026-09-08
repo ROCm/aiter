@@ -88,8 +88,14 @@ def test_pa_decode_maps_gluon_buffers_and_scale_layout(monkeypatch):
         pytest.skip("FlyDSL is not available")
 
     pa_decode_module = importlib.import_module("aiter.ops.flydsl.pa_decode")
+    gluon_module = importlib.import_module("aiter.ops.triton.gluon.pa_decode_gluon")
     attention_module = importlib.import_module("aiter.ops.attention")
     captured = {}
+
+    assert (
+        gluon_module.launch_pa_decode_ps_reduce_flydsl
+        is pa_decode_module.launch_pa_decode_ps_reduce
+    )
 
     monkeypatch.setattr(
         pa_decode_module,
@@ -121,12 +127,19 @@ def test_pa_decode_maps_gluon_buffers_and_scale_layout(monkeypatch):
         )
 
     monkeypatch.setattr(pa_decode_module, "_run_compiled", capture_launch)
-    pa_ps_module = importlib.import_module("csrc.cpp_itfs.pa.pa_ps")
-    monkeypatch.setattr(
-        pa_ps_module,
-        "launch_pa_decode_ps_reduce",
-        lambda *args, **kwargs: None,
-    )
+
+    def capture_reduce(
+        output_5d, reduce_exp_sums, reduce_max_logits, logits, *args, **kwargs
+    ):
+        captured.update(
+            reduce_output=output_5d,
+            reduce_exp_sums=reduce_exp_sums,
+            reduce_max_logits=reduce_max_logits,
+            reduce_logits=logits,
+            reduce_kwargs=kwargs,
+        )
+
+    monkeypatch.setattr(pa_decode_module, "launch_pa_decode_ps_reduce", capture_reduce)
 
     query = torch.empty(1, 8, 128, dtype=torch.bfloat16)
     output = torch.empty_like(query)
@@ -163,6 +176,11 @@ def test_pa_decode_maps_gluon_buffers_and_scale_layout(monkeypatch):
     assert captured["max_logits"].data_ptr() == max_logits.data_ptr()
     assert captured["exp_sums"].data_ptr() == exp_sums.data_ptr()
     assert captured["temporary_output"].data_ptr() == temporary_output.data_ptr()
+    assert captured["reduce_output"].data_ptr() == output.data_ptr()
+    assert captured["reduce_exp_sums"].data_ptr() == exp_sums.data_ptr()
+    assert captured["reduce_max_logits"].data_ptr() == max_logits.data_ptr()
+    assert captured["reduce_logits"].data_ptr() == temporary_output.data_ptr()
+    assert captured["reduce_kwargs"]["context_partition_num"] == 2
 
     dispatches = []
     monkeypatch.setattr(
@@ -429,6 +447,7 @@ def test_pa_decode_tile(block_size):
         block_size=block_size,
         dtype=dtypes.bf16,
     )
+    assert result["partitions"] > 1
     assert result["flydsl err"] == 0
 
 
