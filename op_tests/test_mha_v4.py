@@ -1,16 +1,20 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 
+import argparse
+import itertools
 import math
 import os
 import subprocess
 import sys
 from typing import NamedTuple
 
+import pandas as pd
 import pytest
 import torch
 import torch._dynamo
 
+import aiter
 from aiter import dtypes
 from aiter.jit.core import AITER_ROOT_DIR
 from aiter.jit.utils.chip_info import get_gfx
@@ -62,6 +66,7 @@ from aiter.ops.triton.quant.sage_attention_quant_wrappers import (
     fp4_v_raw_buffer_size,
     pack_v_mxfp4_colmajor_raw,
 )
+from aiter.test_common import benchmark, checkAllclose, run_perftest
 
 
 def _e2m1_code_ties_low(value):
@@ -2327,3 +2332,97 @@ mha_v4_packed(
     )
     assert result.returncode != 0
     assert message in result.stderr
+
+
+def run_torch_mha_v4(q, k, v, softmax_scale):
+    """Compute dense BSHD attention in FP32 for benchmark validation."""
+    scores = (
+        torch.matmul(
+            q.transpose(1, 2).float(), k.transpose(1, 2).float().transpose(-1, -2)
+        )
+        * softmax_scale
+    )
+    return torch.matmul(
+        torch.softmax(scores, dim=-1), v.transpose(1, 2).float()
+    ).transpose(1, 2)
+
+
+@benchmark()
+def benchmark_mha_v4(batch, sequence_q, sequence_k, heads, dtype):
+    """Benchmark the public dense BF16 MHA v4 path against a Torch reference."""
+    head_dim = 128
+    softmax_scale = head_dim**-0.5
+    torch.manual_seed(batch + sequence_q + sequence_k + heads)
+    q = torch.randn((batch, sequence_q, heads, head_dim), device="cuda", dtype=dtype)
+    k = torch.randn((batch, sequence_k, heads, head_dim), device="cuda", dtype=dtype)
+    v = torch.randn_like(k)
+    reference = run_torch_mha_v4(q, k, v, softmax_scale)
+    candidates = {
+        "mha_v4": lambda: mha_v4(
+            q,
+            k,
+            v,
+            AttentionFormat.BF16,
+            AttentionFormat.BF16,
+            AttentionFormat.BF16,
+            softmax_scale=softmax_scale,
+        )
+    }
+    flops = 4 * batch * heads * sequence_q * sequence_k * head_dim
+    elements = batch * heads * head_dim * (sequence_q * 2 + sequence_k * 2)
+    nbytes = elements * q.element_size()
+    ret = {"gfx": get_gfx()}
+    for name, candidate in candidates.items():
+        output, us = run_perftest(candidate)
+        err = checkAllclose(
+            reference,
+            output.to(dtypes.fp32),
+            rtol=2e-2,
+            atol=2e-2,
+            msg=f"{name}: dense BF16",
+        )
+        ret[f"{name} us"] = us
+        ret[f"{name} TFLOPS"] = flops / us / 1e6
+        ret[f"{name} TB/s"] = nbytes / us / 1e6
+        ret[f"{name} err"] = err
+    return ret
+
+
+def main():
+    if get_gfx() != "gfx950":
+        aiter.logger.warning(
+            "MHA v4 BF16 benchmark unsupported on %s; skipping", get_gfx()
+        )
+        return
+
+    parser = argparse.ArgumentParser(
+        formatter_class=argparse.RawTextHelpFormatter,
+        description="Benchmark dense BF16 MHA v4",
+    )
+    parser.add_argument("-b", "--batch", type=int, nargs="*", default=[1])
+    parser.add_argument("--sequence-q", type=int, nargs="*", default=[128, 256])
+    parser.add_argument("--sequence-k", type=int, nargs="*", default=[128, 256])
+    parser.add_argument("--heads", type=int, nargs="*", default=[2, 8])
+    parser.add_argument(
+        "-d", "--dtype", type=dtypes.str2Dtype, nargs="*", default=[dtypes.bf16]
+    )
+    args = parser.parse_args()
+
+    rows = []
+    for batch, sequence_q, sequence_k, heads, dtype in itertools.product(
+        args.batch, args.sequence_q, args.sequence_k, args.heads, args.dtype
+    ):
+        if dtype != dtypes.bf16:
+            aiter.logger.warning("MHA v4 BF16 benchmark skips dtype %s", dtype)
+            continue
+        rows.append(benchmark_mha_v4(batch, sequence_q, sequence_k, heads, dtype))
+    if rows:
+        frame = pd.DataFrame(rows)
+        aiter.logger.info(
+            "MHA v4 dense BF16 summary (markdown):\n%s",
+            frame.to_markdown(index=False),
+        )
+
+
+if __name__ == "__main__":
+    main()

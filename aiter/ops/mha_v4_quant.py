@@ -476,6 +476,7 @@ def _quantize_v_fp8_fake(input: Tensor) -> tuple[Tensor, Tensor]:
 def quantize_v_mxfp4(input: Tensor) -> tuple[Tensor, Tensor]:
     """Pack hd128 BSHD V into raw column-major MXFP4 data and scale buffers."""
     _validate_bshd_hd128(input, "MXFP4 V quantization")
+    # TODO: Replace the nested Triton custom op with a canonical-layout HIP producer.
     return pack_v_mxfp4_colmajor_raw(input)
 
 
