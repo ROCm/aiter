@@ -476,6 +476,97 @@ def detect_harness(text):
     return None
 
 
+# How the validator came to be timing the file it timed. `same-as-correctness-target` is the
+# fallback and is an INFERENCE -- nobody read the diff and concluded that file was the right
+# one to time; it is simply the only file the caller named.
+BASIS_CALLER = "declared-by-caller"
+BASIS_FALLBACK = "same-as-correctness-target"
+BASIS_SHIPPED = "discovered-pr-shipped"
+
+
+def discover_shipped(status_text, read_text):
+    """Files the PATCH ITSELF wrote that carry a benchmark harness.
+
+    The first of the two places a perf target comes from: a PR that means to be faster
+    usually says so by bringing a bench along. This is the cheap half -- the patch already
+    told us which files it touched, and `detect_harness` already knows what a bench looks
+    like, so the only new work is asking the second question of the answers to the first.
+
+    `read_text` is injected rather than opened here, for the same reason `restore_worktree`
+    injects its three filesystem effects: the decision is then testable without a worktree,
+    and a decision that decides what gets EXECUTED deserves that.
+
+    Deletions are skipped. A file the patch removes is not on head and cannot be timed, and
+    the resulting `no such file` would arrive as a mysterious perf skip rather than as the
+    plain fact that the bench is gone. Git-quoted paths are skipped and returned separately:
+    this list feeds a `cp`, and a path we cannot spell is a path we must not act on.
+    """
+    candidates, unspellable = [], []
+    for line in status_text.splitlines():
+        if len(line) <= 3:
+            continue
+        code, path = line[:2], line[3:]
+        if path.startswith('"'):
+            unspellable.append(path)
+            continue
+        if "D" in code or not path.endswith(".py"):
+            continue
+        text = read_text(path)
+        if text is not None and detect_harness(text) is not None:
+            candidates.append(path)
+    return {"candidates": sorted(candidates), "unspellable": unspellable}
+
+
+def choose_perf_target(shipped, correctness_target):
+    """Which discovered target to time, or why the fallback stands.
+
+    Every branch that is not "exactly one, and it is new information" returns the fallback.
+    That asymmetry is deliberate and is the whole safety argument for discovery: a target
+    this function declines to pick costs a measurement, while a target it picks WRONG spends
+    a should-fix finding on a PR author whose code may be innocent. The stage cannot tell the
+    difference afterwards -- `run_perf` deliberately injects no probe, so nothing downstream
+    can check that the bench executed the changed line rather than merely importing near it.
+
+    Refusing to choose between several is the same rule `--runner` established: a caller who
+    can see the diff decides, and the report says a choice was owed rather than inventing one.
+    """
+    candidates = shipped["candidates"]
+    if not candidates:
+        return {
+            "basis": BASIS_FALLBACK,
+            "target": correctness_target,
+            "reason": "the patch ships no file carrying a benchmark harness",
+            "candidates": [],
+        }
+    if correctness_target in candidates:
+        return {
+            "basis": BASIS_FALLBACK,
+            "target": correctness_target,
+            "reason": "the correctness target is itself the benchmark the patch ships",
+            "candidates": candidates,
+        }
+    if len(candidates) > 1:
+        return {
+            "basis": BASIS_FALLBACK,
+            "target": correctness_target,
+            "reason": (
+                "the patch ships %d files carrying a benchmark harness (%s); which of them "
+                "measures this change is a reading of the diff and not a fact about it, so "
+                "name one with --perf-target" % (len(candidates), ", ".join(candidates))
+            ),
+            "candidates": candidates,
+        }
+    return {
+        "basis": BASIS_SHIPPED,
+        "target": candidates[0],
+        "reason": (
+            "the patch ships exactly one file carrying a benchmark harness, and it is not "
+            "the correctness target"
+        ),
+        "candidates": candidates,
+    }
+
+
 def _status_entries(text):
     """`git status --porcelain` output as {path: two-letter code}."""
     return {line[3:]: line[:2] for line in text.splitlines() if len(line) > 3}
@@ -692,6 +783,31 @@ def cmd_detect(args):
     return 0
 
 
+def cmd_discover(args):
+    """One JSON object on stdout, and exit 0 whether or not anything was found.
+
+    The opposite convention to cmd_detect above, for a reason: this command ALWAYS has an
+    answer -- the fallback is an answer -- so a nonzero exit here is unambiguously a crash
+    and never a shrug. The caller reads fields out of the blob with `target_run.py
+    stats-field`, the same generic reader the target stats already go through.
+    """
+    root = Path(args.root).resolve()
+
+    def read_text(path):
+        candidate = (root / path).resolve()
+        # A patch could name a path outside the worktree. Reading one would be a file
+        # disclosure through a report; declining is free and there is nothing to lose.
+        if root not in candidate.parents or not candidate.is_file():
+            return None
+        return candidate.read_text(errors="replace")
+
+    shipped = discover_shipped(sys.stdin.read(), read_text)
+    decision = choose_perf_target(shipped, args.correctness_target)
+    decision["unspellable"] = shipped["unspellable"]
+    print(json.dumps(decision))
+    return 0
+
+
 def cmd_restore(args):
     import shutil
     import subprocess
@@ -760,6 +876,13 @@ def subcommand(argv):
     detect.add_argument("target")
     detect.set_defaults(func=cmd_detect)
 
+    discover = sub.add_parser(
+        "discover", help="which file to time, read from the patch and the repo"
+    )
+    discover.add_argument("--root", required=True)
+    discover.add_argument("--correctness-target", required=True)
+    discover.set_defaults(func=cmd_discover)
+
     restore = sub.add_parser(
         "restore-worktree", help="undo what a timing run left behind"
     )
@@ -784,7 +907,12 @@ def subcommand(argv):
     return args.func(args)
 
 
-SUBCOMMANDS = ("detect", "restore-worktree", "stage")
+# The names main() will route to subcommand(). Written by hand and therefore checked by a test:
+# it went stale the first time a subcommand was added, and the failure is quiet in the worst way
+# -- `discover` was registered on the subparser, reached this list's `not in`, and fell through
+# to the bare comparison parser, which exited 2 complaining about a missing --base. A caller
+# reading that has no reason to suspect the subcommand exists.
+SUBCOMMANDS = ("detect", "discover", "restore-worktree", "stage")
 
 
 def main(argv=None):

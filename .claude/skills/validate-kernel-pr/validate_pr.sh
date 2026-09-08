@@ -259,6 +259,15 @@ stage_note() {
   python3 "$REPORT_TOOL" stage -- "$JSON" "$1" "$2" "$3"
 }
 
+# Reads one field out of any JSON blob a tool handed back. It sat 400 lines below its first
+# caller until perf target discovery acquired an earlier one -- bash resolves a function only
+# from definitions it has already executed, so the call failed with `command not found` and,
+# with no `set -e`, the run carried on with an empty variable. Helpers live up here with the
+# other helpers.
+stats_field() {
+  python3 "$TARGET_TOOL" stats-field "$1" "$2"
+}
+
 finding() {
   python3 "$REPORT_TOOL" finding -- "$JSON" "$1" "$2" "$3"
 }
@@ -893,9 +902,12 @@ fi
 TEST_PYTHONPATH="$PROBE_DIR:$SCRIPT_DIR:$TEST_PYTHONPATH"
 TEST_FILE=${TESTS%%::*}
 TARGET_PATH="$REPO_WT/$TEST_FILE"
-# A pytest node id selects cases within a file; a timing run executes the file. So the
-# default perf target is the correctness target's FILE, never its node id.
-PERF_TARGET=${PERF_TARGET:-$TEST_FILE}
+# A pytest node id selects cases within a file; a timing run executes the file. So where the
+# perf target falls back to the correctness target, it falls back to its FILE, never its node
+# id. Discovery below may replace this; a caller who passed --perf-target has settled it.
+if [ -z "$PERF_TARGET" ]; then
+  PERF_TARGET="$TEST_FILE"
+fi
 # The runner is DECLARED by the caller, not derived here. Reading the target and deciding
 # whether pytest can collect it is judgement, and judgement belongs in the prompt -- but a
 # declaration is not a measurement, so the report records which of the two it got. A reader who
@@ -955,10 +967,32 @@ if [ "$TEST_PROVENANCE" = "pr-added" ] || [ "$TEST_PROVENANCE" = "pr-modified" ]
     "the evidence is not independent of the change: $TEST_PROVENANCE_REASON"
 fi
 
-# The same question, asked of the file the timing runs will execute. It is the same pure
-# function against the same snapshot -- a perf target is a target, and "did the patch write
-# this?" has one answer however the file is used. Reusing it also inherits the honesty that
-# no patch means `unknown` rather than a cheerful `pre-existing`.
+# ---------- which file gets timed ----------
+# Two places a perf target comes from, and this commit implements the first: a bench the PR
+# itself ships. Run here, and not later beside the timing runs, because here the patch is
+# still applied -- the base phase reverses it out further down, and a bench the PR adds is
+# not in the tree once that happens.
+#
+# `--no-perf` skips the search outright: reading every file the patch touched to answer a
+# question nobody asked is work, and the answer would go into a stage that reports `skip`.
+PERF_TARGET_BASIS_REASON=""
+PERF_CANDIDATES="[]"
+if [ "$PERF_TARGET_BASIS" != "declared-by-caller" ] && [ "$PERF_ENABLED" -eq 1 ]; then
+  PERF_DISCOVERY=$(printf '%s' "$PATCH_STATUS" \
+    | "$SCRIPT_DIR/scrape_perf.py" discover \
+      --root "$REPO_WT" --correctness-target "$TEST_FILE")
+  if [ -n "$PERF_DISCOVERY" ]; then
+    PERF_TARGET_BASIS=$(stats_field "$PERF_DISCOVERY" basis)
+    PERF_TARGET=$(stats_field "$PERF_DISCOVERY" target)
+    PERF_TARGET_BASIS_REASON=$(stats_field "$PERF_DISCOVERY" reason)
+    PERF_CANDIDATES=$(python3 "$TARGET_TOOL" stats-field --json "$PERF_DISCOVERY" candidates)
+  fi
+fi
+
+# The same question test_provenance asks, asked of the file the timing runs will execute. It
+# is the same pure function against the same snapshot -- a perf target is a target, and "did
+# the patch write this?" has one answer however the file is used. Reusing it also inherits the
+# honesty that no patch means `unknown` rather than a cheerful `pre-existing`.
 if [ "$PERF_TARGET" = "$TEST_FILE" ]; then
   PERF_TARGET_PROVENANCE="$TEST_PROVENANCE"
   PERF_TARGET_PROVENANCE_REASON="$TEST_PROVENANCE_REASON"
@@ -1367,9 +1401,6 @@ mapfile -d '' -t TARGET_BASE_ENV < <(python3 "$TARGET_TOOL" env)
 jset_json "isolation.target_environment" \
   "$(python3 "$TARGET_TOOL" env-summary "${TARGET_BASE_ENV[@]}")"
 
-stats_field() {
-  python3 "$TARGET_TOOL" stats-field "$1" "$2"
-}
 
 # ---------- does this target actually need a GPU? ----------
 # Asked of the target, not inferred from the diff. A diff heuristic cannot settle this:
@@ -2094,6 +2125,11 @@ jset_string "stages.perf.target" "$PERF_TARGET"
 jset_string "stages.perf.target_basis" "$PERF_TARGET_BASIS"
 jset_string "stages.perf.target_provenance" "$PERF_TARGET_PROVENANCE"
 jset_string "stages.perf.target_provenance_reason" "$PERF_TARGET_PROVENANCE_REASON"
+jset_string "stages.perf.target_basis_reason" "$PERF_TARGET_BASIS_REASON"
+# Reported even where discovery declined, and especially there: a reader who is told only
+# "the fallback stood" cannot tell an empty search from a search that found three benches and
+# refused to pick between them. The second of those is a question for the caller.
+jset_json "stages.perf.candidates" "$PERF_CANDIDATES"
 
 record_gpu_activity_after
 finish_report

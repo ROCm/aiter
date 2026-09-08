@@ -760,9 +760,21 @@
               "type": "string",
               "enum": [
                 "declared-by-caller",
+                "discovered-pr-shipped",
                 "same-as-correctness-target"
               ],
-              "description": "Whose choice the timed file was. `declared-by-caller` means someone who read the diff named it with --perf-target; `same-as-correctness-target` is the validator's own fallback, which is an inference and not a reading of the change."
+              "description": "Whose choice the timed file was. `declared-by-caller` means someone who read the diff named it with --perf-target. `discovered-pr-shipped` means the patch wrote exactly one file carrying a benchmark harness and the validator took it. `same-as-correctness-target` is the fallback, which is an inference and not a reading of the change -- it also covers every case discovery DECLINED, so read `target_basis_reason` and `candidates` before concluding nothing was found."
+            },
+            "target_basis_reason": {
+              "type": "string",
+              "description": "Why the timed file is the one it is. Carries the decline reason when discovery refused to choose."
+            },
+            "candidates": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              },
+              "description": "Every file discovery considered a possible perf target. More than one means discovery declined rather than picked: which of several benches measures a given change is a reading of the diff, not a fact about it, and the caller settles it with --perf-target."
             },
             "target_provenance": {
               "type": "string",

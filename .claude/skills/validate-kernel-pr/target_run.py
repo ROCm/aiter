@@ -338,7 +338,11 @@ def cmd_env_summary(args) -> int:
 
 
 def cmd_stats_field(args) -> int:
-    print(json.loads(args.stats)[args.field])
+    value = json.loads(args.stats)[args.field]
+    # A bare print of a list gives Python's repr -- single quotes, no escaping -- which is
+    # not JSON and cannot be handed back to the report writer. Fields that carry structure
+    # ask for --json; every scalar caller is unaffected.
+    print(json.dumps(value) if args.json else value)
     return 0
 
 
@@ -389,6 +393,7 @@ def main(argv=None) -> int:
     field = sub.add_parser("stats-field", help="read one field out of a stats blob")
     field.add_argument("stats")
     field.add_argument("field")
+    field.add_argument("--json", action="store_true")
     field.set_defaults(func=cmd_stats_field)
 
     args = parser.parse_args(argv)

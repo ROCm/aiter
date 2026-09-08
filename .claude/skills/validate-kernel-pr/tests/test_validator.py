@@ -1975,6 +1975,29 @@ class ValidateKernelPrTests(unittest.TestCase):
         # Keyed to the perf target: BASE_REPO_STATE said `ran`.
         self.assertEqual("target-transplant", perf["baseline_method"])
 
+    def test_a_bench_the_pr_ships_is_timed_without_being_asked_for(self):
+        # The same divergence as above, reached without --perf-target. The caller named only
+        # the unit test; the patch brought a bench along, and a PR that means to be faster
+        # usually says so exactly that way. Nothing here is a new capability -- it is the
+        # previous commit's plumbing, driven by the diff instead of by a flag.
+        patch = self._new_bench_patch("shipped-bench.patch", scale="0.5")
+        _, report = self.fixture.validate(
+            patch,
+            tests="tests/test_sample.py",
+            expected_route="test_sample:run_kernel",
+            grid=False,
+            perf_control_column="reference us",
+        )
+
+        perf = report["stages"]["perf"]
+        self.assertEqual(self.NEW_BENCH_TARGET, perf["target"])
+        self.assertEqual("discovered-pr-shipped", perf["target_basis"])
+        self.assertEqual("pr-added", perf["target_provenance"])
+        self.assertEqual([self.NEW_BENCH_TARGET], perf["candidates"])
+        self.assertEqual("target-transplant", perf["baseline_method"])
+        # And it measured something: base VALUE = 1 against head VALUE = 0.5.
+        self.assertEqual("pass", perf["status"])
+
     #: A pytest-named file that ALSO parses argv in its module body. Found on
     #: ROCm/aiter#5172: pytest wins the runner selection, imports the module at collection
     #: with its own argv, and argparse exits the process. The file is green as a script.
@@ -4363,6 +4386,91 @@ class PerfDecisionTests(unittest.TestCase):
 
     def test_a_target_with_no_harness_is_not_given_one(self):
         self.assertIsNone(self.perf.detect_harness("def test_x():\n    assert True\n"))
+
+    def test_every_registered_subcommand_is_one_main_will_route_to(self):
+        # SUBCOMMANDS is the hand-written list main() dispatches on, and it went stale the
+        # first time one was added. The failure is quiet in the worst way: `discover` was
+        # registered on the subparser, missed this list, and fell through to the bare
+        # comparison parser, which exits 2 complaining about a missing --base. Nobody reading
+        # that has any reason to suspect the subcommand exists.
+        #
+        # Read out of the source rather than off the parser: argparse exposes its subparser
+        # choices only through private attributes, and a test that reaches into those breaks
+        # on a Python upgrade for reasons that have nothing to do with this skill.
+        source = (SKILL_DIR / "scrape_perf.py").read_text()
+        registered = set(re.findall(r'sub\.add_parser\(\s*"([a-z-]+)"', source))
+        self.assertEqual(registered, set(self.perf.SUBCOMMANDS))
+
+    #: Everything a patch might plausibly touch. Exactly one of these is a bench.
+    SHIPPED = {
+        "op_tests/bench_new.py": "import argparse\n# --scenario bench\n",
+        "op_tests/test_new.py": "def test_x():\n    assert True\n",
+        "aiter/ops/triton/k.py": "VALUE = 1\n",
+        "docs/notes.md": "# not python\n",
+    }
+
+    def shipped(self, status, files=None):
+        return self.perf.discover_shipped(status, (files or self.SHIPPED).get)
+
+    def test_a_bench_the_patch_ships_is_found_and_the_rest_of_it_is_not(self):
+        found = self.shipped(
+            "A  op_tests/bench_new.py\n"
+            "A  op_tests/test_new.py\n"
+            "M  aiter/ops/triton/k.py\n"
+            "A  docs/notes.md\n"
+        )
+        self.assertEqual(["op_tests/bench_new.py"], found["candidates"])
+
+    def test_a_bench_the_patch_deletes_is_not_offered_as_something_to_time(self):
+        # It is not on head. Timing it fails with a `no such file`, which reaches the reader
+        # as a mysterious perf skip rather than as the plain fact that the PR removed a bench.
+        self.assertEqual([], self.shipped("D  op_tests/bench_new.py\n")["candidates"])
+
+    def test_a_shipped_path_git_cannot_spell_plainly_is_held_out_of_the_list(self):
+        # This list feeds a `cp` and a `rm -f`. A path we cannot spell is one we must not act
+        # on -- the rule restore_worktree already follows, for the same reason.
+        found = self.shipped(
+            'A  "op_tests/bench\\303\\251.py"\nA  op_tests/bench_new.py\n'
+        )
+        self.assertEqual(["op_tests/bench_new.py"], found["candidates"])
+        self.assertEqual(1, len(found["unspellable"]))
+
+    def test_one_shipped_bench_that_is_not_the_correctness_target_is_taken(self):
+        decision = self.perf.choose_perf_target(
+            self.shipped("A  op_tests/bench_new.py\n"), "op_tests/test_old.py"
+        )
+        self.assertEqual("discovered-pr-shipped", decision["basis"])
+        self.assertEqual("op_tests/bench_new.py", decision["target"])
+
+    def test_a_bench_that_is_already_the_correctness_target_is_not_a_discovery(self):
+        # Nothing was learned. The caller named this file and it happens to be timeable, which
+        # is the case the perf stage has always handled; reporting it as discovered would tell
+        # a reader the validator read the diff when it did not.
+        decision = self.perf.choose_perf_target(
+            self.shipped("A  op_tests/bench_new.py\n"), "op_tests/bench_new.py"
+        )
+        self.assertEqual("same-as-correctness-target", decision["basis"])
+
+    def test_several_shipped_benches_are_named_rather_than_chosen_between(self):
+        # The safety argument for discovery, in one test. A target declined costs a
+        # measurement; a target chosen WRONG spends a should-fix on an author whose code may
+        # be innocent, and nothing downstream can tell the two apart -- run_perf injects no
+        # probe, so no evidence exists that the bench executed the changed line at all.
+        files = dict(self.SHIPPED, **{"op_tests/bench_two.py": "# --scenario bench\n"})
+        decision = self.perf.choose_perf_target(
+            self.shipped(
+                "A  op_tests/bench_new.py\nA  op_tests/bench_two.py\n", files=files
+            ),
+            "op_tests/test_old.py",
+        )
+        self.assertEqual("same-as-correctness-target", decision["basis"])
+        self.assertEqual("op_tests/test_old.py", decision["target"])
+        self.assertIn("--perf-target", decision["reason"])
+        # Named, not swallowed. A reader told only "the fallback stood" cannot tell an empty
+        # search from one that found two benches and refused to pick between them.
+        self.assertEqual(
+            ["op_tests/bench_new.py", "op_tests/bench_two.py"], decision["candidates"]
+        )
 
     def test_no_harness_exits_three_so_a_crash_is_distinguishable(self):
         target = Path(self.enterContext(tempfile.TemporaryDirectory())) / "t.py"

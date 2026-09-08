@@ -555,9 +555,24 @@ correctness run may select cases inside one with a pytest node id. They were the
 long as perf had no target of its own, and `--perf-target` is how you say otherwise — an aiter
 kernel's unit test and its bench are routinely two different files. `perf.target` names what was
 timed on every status including `skip`, and `perf.target_basis` says whose choice it was:
-`declared-by-caller` when someone who read the diff named it, `same-as-correctness-target` when
-the validator fell back. The fallback is an inference, not a reading of the change, and the report
-does not let the two look alike.
+`declared-by-caller` when someone who read the diff named it, `discovered-pr-shipped` when the
+patch brought a bench along and the validator took it, `same-as-correctness-target` when it fell
+back. The fallback is an inference, not a reading of the change, and the report does not let the
+two look alike.
+
+**A PR that means to be faster usually ships a bench saying so.** So when no `--perf-target` is
+given, the files the patch wrote are read for a benchmark harness, and exactly one that is not
+already the correctness target is taken. Every other outcome is the fallback, and that asymmetry
+is the entire safety argument: a target declined costs a measurement, while a target chosen
+*wrong* spends a `should-fix` on an author whose code may be innocent — and nothing downstream
+can tell those apart, because `run_perf` injects no probe and no evidence exists that the bench
+executed the changed line rather than merely importing near it.
+
+So more than one candidate is **named, not chosen between**. `perf.candidates` lists everything
+considered and `perf.target_basis_reason` says why the fallback stood, because a reader told only
+that it stood cannot distinguish an empty search from one that found three benches and refused.
+Which of several benches measures a given change is a reading of the diff, not a fact about it;
+settle it with `--perf-target`. This is the rule `--runner` already established.
 
 `perf.target_provenance` then asks of that file the same question `test_provenance` asks of the
 correctness target, using the same function against the same post-apply snapshot:
