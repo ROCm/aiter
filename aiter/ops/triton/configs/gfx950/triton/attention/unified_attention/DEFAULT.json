@@ -114,6 +114,22 @@
       "TILE_SIZE_MIN": 64,
       "TILE_SIZE_MAX": 64
     },
+    "D_GEQ_512.Q_GEQ_256": {
+      "BLOCK_M": 128,
+      "num_warps": 4,
+      "num_stages": 2,
+      "waves_per_eu": 2,
+      "TILE_SIZE_MIN": 16,
+      "TILE_SIZE_MAX": 16
+    },
+    "D_GEQ_256.Q_GEQ_256": {
+      "BLOCK_M": 128,
+      "num_warps": 2,
+      "num_stages": 2,
+      "waves_per_eu": 2,
+      "TILE_SIZE_MIN": 32,
+      "TILE_SIZE_MAX": 32
+    },
     "Q_LEQ_1": {
       "BLOCK_M": 16,
       "num_warps": 2,
