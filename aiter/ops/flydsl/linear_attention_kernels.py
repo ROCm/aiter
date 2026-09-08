@@ -5,14 +5,13 @@
 
 from __future__ import annotations
 
-import csv
+import collections
 import functools
 
 import torch
 from flydsl.compiler.kernel_function import CompilationContext
 from flydsl.runtime.device import get_rocm_arch
 
-from aiter.jit.core import AITER_CONFIGS
 from aiter.ops.triton.utils.device_info import get_num_sms
 
 from .kernels.gdr_decode import (
@@ -30,82 +29,12 @@ __all__ = [
 ]
 
 
-GDR_GLOBAL_CONFIG_MAP = None
 GDR_GPU_ARCH = get_rocm_arch()
-
-# Which kernel a tuned row was measured against. The three MTP contracts pick
-# different tilings at the same shape, so a row has to name its contract or
-# they overwrite each other.
-GDR_VARIANT_DECODE = "decode"
 
 
 def _mtp_variant(mode, has_tree):
-    """The table's name for an MTP contract."""
+    """Which contract a launch is running; the rung branches on it."""
     return f"{mode}_tree" if has_tree else mode
-
-
-def _tuned_config(
-    dtype_str,
-    state_dtype_str,
-    batch_size,
-    seq_length,
-    num_k_heads,
-    num_v_heads,
-    head_k_dim,
-    head_v_dim,
-    variant=GDR_VARIANT_DECODE,
-):
-    """The tuned row for this shape and kernel variant, or None.
-
-    Split out of ``get_default_kwargs`` so the MTP path can consult the same
-    table while starting from a different default. The table wins wherever it
-    has a row, on either path.
-    """
-    global GDR_GLOBAL_CONFIG_MAP
-    if GDR_GLOBAL_CONFIG_MAP is None:
-        _dict = {}
-        with open(AITER_CONFIGS.AITER_CONFIG_GDR_DECODE_FILE, encoding="utf-8") as f:
-            reader = csv.DictReader(f)
-            for row in reader:
-                obj = dict(row)
-                arch, b, sq, nkh, nvh, khd, vhd = (
-                    obj["arch"],
-                    int(obj["b"]),
-                    int(obj["sq"]),
-                    int(obj["num_k_heads"]),
-                    int(obj["num_v_heads"]),
-                    int(obj["head_k_dim"]),
-                    int(obj["head_v_dim"]),
-                )
-                d_str, sd_str = obj["dtype"], obj["state_dtype"]
-                var = obj.get("variant") or GDR_VARIANT_DECODE
-                if float(obj["duration"]) < 10000.0:
-                    row = {
-                        "NUM_BLOCKS_PER_V_DIM": int(obj["NUM_BLOCKS_PER_V_DIM"]),
-                        "NUM_WARPS": int(obj["NUM_WARPS"]),
-                        "WARP_THREADS_K": int(obj["WARP_THREADS_K"]),
-                    }
-                    # Optional trailing column, so rows written before it stay
-                    # readable. Zero leaves the choice to the compiler.
-                    if obj.get("waves_per_eu"):
-                        row["WAVES_PER_EU"] = int(obj["waves_per_eu"])
-                    _dict[(d_str, sd_str, arch, var, b, sq, nkh, nvh, khd, vhd)] = row
-        GDR_GLOBAL_CONFIG_MAP = _dict
-    return GDR_GLOBAL_CONFIG_MAP.get(
-        (
-            dtype_str,
-            state_dtype_str,
-            GDR_GPU_ARCH,
-            variant,
-            batch_size,
-            seq_length,
-            num_k_heads,
-            num_v_heads,
-            head_k_dim,
-            head_v_dim,
-        ),
-        None,
-    )
 
 
 def _tile_warps(tile_v, warp_threads_v, max_warps=4):
@@ -125,8 +54,8 @@ def _tile_warps(tile_v, warp_threads_v, max_warps=4):
 # most of the part idle and splitting the value dimension is the only way to
 # make more blocks. Each split adds a reduction across the blocks that share a
 # head, so it stops paying once the grid covers the machine: these are the
-# grids to split up to, in blocks per CU. Measured on gfx942; the fp32 state
-# moves twice the bytes per block and so tolerates one split more.
+# grids to split up to, in blocks per CU. The fp32 state moves twice the bytes
+# per block and so tolerates one split more.
 _DECODE_GRID_PER_CU = 1
 _DECODE_GRID_PER_CU_F32_STATE = 2
 
@@ -186,7 +115,7 @@ def _decode_tiling(batch_size, num_v_heads, head_k_dim, head_v_dim, state_dtype_
     The split is a function of ``batch_size * num_v_heads`` alone -- the grid
     the launch would have without one -- and the warp shape then follows from
     the value tile the split leaves. Neither depends on the head counts beyond
-    that product, which is why a rule can stand in for a table keyed on batch.
+    that product.
     """
     f32_state = state_dtype_str == "torch.float32"
     target = get_num_sms() * (
@@ -219,46 +148,65 @@ def get_default_kwargs(
     head_k_dim,
     head_v_dim,
 ):
-    d = _decode_tiling(batch_size, num_v_heads, head_k_dim, head_v_dim, state_dtype_str)
-    config = _tuned_config(
-        dtype_str,
-        state_dtype_str,
-        batch_size,
-        seq_length,
-        num_k_heads,
-        num_v_heads,
-        head_k_dim,
-        head_v_dim,
+    """The decode tiling for this launch.
+
+    Takes the whole launch shape, not just the part the rule reads, so a caller
+    does not have to know which part that is.
+    """
+    return _decode_tiling(
+        batch_size, num_v_heads, head_k_dim, head_v_dim, state_dtype_str
     )
-    if config:
-        d.update(config)
-    # The decode builder takes tiling keys only; WAVES_PER_EU is the MTP path's.
-    d.pop("WAVES_PER_EU", None)
-    return d
 
 
 _MTP_WARPS = 4
 # Tilings, as (blocks, warps, K group, waves per EU). The last spends a block on
 # a single warp over a quarter of the value dimension, thin enough that it needs
 # the occupancy hint with it.
+_MTP_SPLIT_8 = (8, _MTP_WARPS, 16, 0)
 _MTP_SPLIT_4 = (4, _MTP_WARPS, 8, 0)
 _MTP_SPLIT_2 = (2, _MTP_WARPS, 8, 0)
 _MTP_WHOLE = (1, _MTP_WARPS, 8, 0)
 _MTP_WIDE_K = (2, _MTP_WARPS, 16, 0)
+_MTP_WIDE_4 = (4, _MTP_WARPS, 16, 0)
 _MTP_THIN = (4, 1, 8, 3)
-
-# Grid coverage each rung holds up to, in blocks per CU, while the grid is still
-# short enough that splitting fills it.
-_MTP_FILL = ((0.75, _MTP_SPLIT_4), (1, _MTP_SPLIT_2), (2, _MTP_WHOLE))
 # Coverage past which the splits are close and a block's own shape decides.
 _MTP_SATURATED = 8
+
+# What the ladder takes from the part it runs on, and all it takes:
+#
+# ``fill``      the coverage each rung holds up to, in blocks per CU.
+# ``covered``   the tiling per contract once the grid is covered; a contract
+#               not named here wants the thin block, occupancy hint included.
+# ``long_grid`` the contracts that keep that tiling once the grid is long,
+#               instead of turning on the draft length.
+# ``thin``      the thin block on a long grid, hint included or not.
+_MtpArch = collections.namedtuple("_MtpArch", "fill covered long_grid thin")
+_MTP_DEFAULT = _MtpArch(
+    fill=((0.75, _MTP_SPLIT_4), (1, _MTP_SPLIT_2), (2, _MTP_WHOLE)),
+    covered={MTP_MODE_SNAPSHOT: _MTP_SPLIT_2},
+    long_grid={},
+    thin=_MTP_THIN,
+)
+_MTP_BY_ARCH = {
+    "gfx950": _MtpArch(
+        fill=(
+            (0.5, _MTP_SPLIT_8),
+            (0.75, _MTP_SPLIT_4),
+            (2, _MTP_SPLIT_2),
+            (4, _MTP_WHOLE),
+        ),
+        covered={MTP_MODE_SNAPSHOT: _MTP_SPLIT_2, MTP_MODE_CHAIN: _MTP_WIDE_4},
+        long_grid={MTP_MODE_CHAIN: _MTP_WIDE_4},
+        thin=(4, 1, 8, 0),
+    ),
+}
 # Longest draft that is still a single pair.
 _MTP_PAIR = 2
 # Tried in order when the head dims do not divide into the chosen tiling.
 _MTP_FALLBACK = (_MTP_SPLIT_4, _MTP_SPLIT_2, _MTP_WHOLE)
 
 
-def _mtp_rung(grid, seq_length, variant, num_sms):
+def _mtp_rung(grid, seq_length, variant, num_sms, arch):
     """The tiling for the grid this launch would have.
 
     Verify runs at the batch that has draft tokens outstanding, so the grid
@@ -266,17 +214,21 @@ def _mtp_rung(grid, seq_length, variant, num_sms):
     fills it. Filling stops paying once the grid covers the part and reverses
     past it, which is why the ladder comes back down to one block.
 
-    Past coverage what is left is how a block spends itself: the contracts that
-    do more per token -- the tree, which reads a parent for each one, and
-    vLLM's chain, which rolls the state back by the accepted count -- want a
-    thin block, and so does a draft longer than a pair.
+    Past coverage what is left is how a block spends itself, and that turns on
+    the contract -- the tree reads a parent for every token and vLLM's chain
+    rolls the state back by the accepted count, so neither spends a block the
+    way SGLang's chain does -- then, where the contract does not settle it, on
+    the draft length.
     """
-    for coverage, tiling in _MTP_FILL:
+    part = _MTP_BY_ARCH.get(arch, _MTP_DEFAULT)
+    for coverage, tiling in part.fill:
         if grid <= coverage * num_sms:
             return tiling
     if grid <= _MTP_SATURATED * num_sms:
-        return _MTP_SPLIT_2 if variant == MTP_MODE_SNAPSHOT else _MTP_THIN
-    return _MTP_WIDE_K if seq_length <= _MTP_PAIR else _MTP_THIN
+        return part.covered.get(variant, _MTP_THIN)
+    if variant in part.long_grid:
+        return part.long_grid[variant]
+    return _MTP_WIDE_K if seq_length <= _MTP_PAIR else part.thin
 
 
 def _mtp_shape(head_k_dim, head_v_dim, state_dtype, num_blocks, warps, warp_threads_k):
@@ -310,9 +262,10 @@ def _mtp_tiling(
     state_dtype,
     variant,
     num_sms,
+    arch,
 ):
     """The rung the launch lands on, dropped to one the head dims admit."""
-    rung = _mtp_rung(batch_size * num_v_heads, seq_length, variant, num_sms)
+    rung = _mtp_rung(batch_size * num_v_heads, seq_length, variant, num_sms, arch)
     for num_blocks, warps, warp_threads_k, waves_per_eu in (rung, *_MTP_FALLBACK):
         d = _mtp_shape(
             head_k_dim, head_v_dim, state_dtype, num_blocks, warps, warp_threads_k
@@ -342,7 +295,7 @@ def _mtp_kwargs(
     head_v_dim,
     variant,
 ):
-    """Pick a tiling for the MTP kernel, then let the tuned table override it.
+    """Pick a tiling for the MTP kernel.
 
     The decode default does not split the value dimension at all, which is right
     for it: decode is called at the batch a serving step accumulates, so
@@ -360,24 +313,12 @@ def _mtp_kwargs(
         state_dtype,
         variant,
         get_num_sms(),
+        GDR_GPU_ARCH,
     )
     if d is None:
         # No tiling fits; hand back the decode default and let the builder be
         # the one to refuse it, with its own message.
         d = {"NUM_BLOCKS_PER_V_DIM": 1, "NUM_WARPS": 4, "WARP_THREADS_K": 8}
-    config = _tuned_config(
-        dtype_str,
-        state_dtype_str,
-        batch_size,
-        seq_length,
-        num_k_heads,
-        num_v_heads,
-        head_k_dim,
-        head_v_dim,
-        variant,
-    )
-    if config:
-        d.update(config)
     return d
 
 

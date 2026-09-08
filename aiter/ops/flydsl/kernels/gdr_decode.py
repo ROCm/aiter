@@ -32,8 +32,7 @@ def _gview64(tensor, base, shape, stride):
 
     Shifting the descriptor pointer instead can land the term in the
     descriptor's own 32-bit offset and wrap silently; building the descriptor
-    off an already-shifted global pointer keeps it 64-bit. The pool and
-    snapshot bases below reach that far.
+    off an already-shifted global pointer keeps it 64-bit.
     """
     it = fx.add_offset(fx.get_iter(tensor), base)
     return fx.Tensor(
@@ -322,9 +321,8 @@ def create_vk_gdr_decode_kernel(
                 x = r_a + r_dt_bias
                 beta_x = softplus_beta_ * x
 
-                # softplus with the large-x identity: for beta_x > threshold,
-                # softplus(x) == x. select computes both arms (the overflow arm
-                # is discarded) -> bit-identical to the old branch.
+                # For beta_x > threshold, softplus(x) == x; both arms run and
+                # the overflowing one is dropped.
                 softplus_big = (f32_1 / softplus_beta_) * fx.math.log1p(
                     _fast_exp(beta_x)
                 )

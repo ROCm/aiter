@@ -65,7 +65,7 @@ from aiter.test_common import benchmark, checkAllclose, run_perftest
 
 # CI runs this as `python3 op_tests/<file>`, which puts op_tests/ on sys.path
 # rather than the repo root, so the vendored upstream kernels below would not
-# resolve. Same line as op_tests/test_gemm_a8w8_blockscale.py:9.
+# resolve.
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from op_tests.triton_tests.utils.causal_conv1d_update_refs import (
@@ -1276,9 +1276,8 @@ def test_out_of_scope_is_refused_rather_than_mishandled():
     holding only the public entry point cannot reach those predicates and so has
     nothing to fall through to.
 
-    Both are checked against the same out-of-scope input where one exists: the
-    two encoded the dtype rule separately once, and only the predicate's copy
-    was complete.
+    Both are checked against the same out-of-scope input where one exists, so
+    the two cannot come to disagree about what is in scope.
     """
     t = _make_inputs(4, 256, 4, 1, spec=False, seed=29)
     qsl = torch.zeros(5, dtype=torch.int32, device=DEVICE)
@@ -1690,9 +1689,8 @@ def test_sglang_reads_the_transposed_verify_window():
 BENCH_MODES = ("vllm_decode", "vllm_verify", "sglang_verify", "sglang_verify_tree")
 
 #: The x layouts each call site can produce; see the block above `_alloc_x`.
-#: Both SGLang windows are transposed views and cannot be anything else, a
-#: contiguous ``(batch, dim, tokens)`` being the one shape upstream rejects. The
-#: 2D sites produce either a contiguous tensor or a qkvz column slice.
+#: The SGLang windows have no second entry because the transposed view is the
+#: only layout upstream accepts there.
 _MODE_LAYOUTS = {
     "vllm_decode": ("contiguous", "qkvz_slice"),
     "vllm_verify": ("contiguous", "qkvz_slice"),
@@ -2009,7 +2007,6 @@ def _run_perf_sweep(args):
         # name.
         if (seqlen == 1) != (mode == "vllm_decode"):
             continue
-        # Only the layouts this call site can actually hand over.
         if layout not in _MODE_LAYOUTS[mode]:
             continue
         rows.append(

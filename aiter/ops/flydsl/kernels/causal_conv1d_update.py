@@ -289,7 +289,6 @@ def build_causal_conv1d_update_module(
             x_seq_idx, x_seq_stride = idx_seq, sx_seq
             o_seq_idx, o_seq_stride = idx_seq, so_seq
 
-        # Read and write bases differ only under APC.
         x_a = _addr_at(x_ptr, x_seq_idx, x_seq_stride)
         o_a = _addr_at(o_ptr, o_seq_idx, o_seq_stride)
         cs_a = _addr_at(cs_ptr, in_coord, scs_seq)
@@ -303,11 +302,10 @@ def build_causal_conv1d_update_module(
             )
             offset_dyn = nacc - fx.Int32(1)
             if fx.const_expr(IS_VARLEN):
-                # Upstream returns on an empty slot before it ever reads the accept
-                # count, so nothing constrains that entry. This kernel issues its
-                # loads unconditionally and only guards the stores, so pin the
-                # offset for empty slots rather than address conv_state with
-                # whatever the padding happens to hold.
+                # Nothing constrains an empty slot's accept count: upstream
+                # returns before reading it. Loads here are unconditional and
+                # only the stores are guarded, so pin the offset rather than
+                # address conv_state with whatever the padding holds.
                 offset_dyn = (s_len > fx.Int32(0)).select(offset_dyn, fx.Int32(0))
         else:
             offset_dyn = fx.Int32(0)
@@ -689,11 +687,12 @@ def build_causal_conv1d_update_sglang_module(
         elem_dtype = fx.BFloat16 if dtype_str == "bf16" else fx.Float16
 
         def _rsrc(ptr):
-            # Index tensors keep the raw descriptor, for the reasons the
-            # vLLM-shaped kernel above spells out.
+            # Index tensors keep the raw descriptor: their loads reach
+            # descriptor bases, which have to stay uniform.
             return buffer_ops.create_buffer_resource_from_addr(ptr)
 
-        # Same 64/32 split as the vLLM-shaped kernel above.
+        # A term scaling with the batch or the cache size goes in the 64-bit
+        # base; the buffer offset is 32 bits.
         def _addr_at(ptr, index, stride):
             return ptr + index.to(fx.Int64) * stride.to(fx.Int64) * fx.Int64(ELEM_BYTES)
 
@@ -896,14 +895,12 @@ def build_causal_conv1d_update_sglang_module(
             )
 
             def _mac(acc, w, v):
-                # SGLang's Triton kernel keeps only the accumulator in fp32, so
-                # each product is rounded to the input dtype before it is added.
-                # Reproducing that rounding is what makes this bit-exact.
+                # SGLang keeps only the accumulator in fp32, so each product is
+                # rounded to the input dtype before it is added.
                 return acc + (w * v).to(elem_dtype).to(fx.Float32)
 
             def _silu(acc):
-                # The bare intrinsic is what the Triton oracle lowers to, so it
-                # is what keeps the parity suite bit-exact.
+                # Bare intrinsic, as above: a library sigmoid breaks parity.
                 f32_ty = fx.Float32.ir_type
                 ex = fx.Float32(
                     rocdl.exp2(f32_ty, (acc * fx.Float32(-_LOG2E)).ir_value())
@@ -976,9 +973,8 @@ def build_causal_conv1d_update_sglang_module(
             ]
 
             def _store_run(vals, addr, base, stride, total, vectorize):
-                # Callers only set ``vectorize`` when the axis stride is 1, so
-                # the slot offset is a constant here; spelling it as one keeps
-                # the byte address out of the runtime path.
+                # ``vectorize`` implies an axis stride of 1, so the slot offset
+                # is a constant.
                 if fx.const_expr(vectorize):
                     for start, wd in _vec_chunks(total):
                         off = (

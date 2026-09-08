@@ -42,7 +42,6 @@ Usage:
 from __future__ import annotations
 
 import argparse
-import contextlib
 import itertools
 import os
 import statistics
@@ -59,7 +58,7 @@ from aiter.test_common import benchmark, checkAllclose, run_perftest
 
 # CI runs this as `python3 op_tests/<file>`, which puts op_tests/ on sys.path
 # rather than the repo root, so the vendored upstream kernels below would not
-# resolve. Same line as op_tests/test_gemm_a8w8_blockscale.py:9.
+# resolve.
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from op_tests.triton_tests.utils.gdr_mtp_refs import (
@@ -991,32 +990,6 @@ def test_a_snapshot_wider_than_the_state_is_refused_at_every_layer():
 # -- the two address computations, against each other ---------------------
 
 
-@contextlib.contextmanager
-def _one_tiling_for_every_contract():
-    """Drop every contract onto the same tiling, leaving addressing the only
-    difference between them.
-
-    The tuned table is keyed by contract, so at a shape where one contract has a
-    row and another does not the two run different tilings -- and a tiling sets
-    the order the partial products are summed in. Different orders differ by a
-    few ulp, which would sit on top of exactly the signal the bit-exact
-    comparison below is reading. Emptying the table drops both onto the rule,
-    which does not take a contract.
-    """
-    import aiter.ops.flydsl.linear_attention_kernels as lak
-
-    saved = lak.GDR_GLOBAL_CONFIG_MAP
-    lak.GDR_GLOBAL_CONFIG_MAP = {}
-    # The lookup memoises on the shape, not on the table, so a shape already
-    # asked for would come back with the row still applied.
-    lak._mtp_kwargs.cache_clear()
-    try:
-        yield
-    finally:
-        lak.GDR_GLOBAL_CONFIG_MAP = saved
-        lak._mtp_kwargs.cache_clear()
-
-
 def test_chain_checkpoints_and_snapshots_are_the_same_state():
     """The comparison that catches an addressing bug rather than a value bug.
 
@@ -1027,24 +1000,25 @@ def test_chain_checkpoints_and_snapshots_are_the_same_state():
     exactly.
 
     A value check cannot do this job: if an address wraps, the read and the write
-    wrap together and only the placement is wrong. Both runs are held to one
-    tiling so the comparison stays one of addresses; see
-    ``_one_tiling_for_every_contract``.
+    wrap together and only the placement is wrong. For the comparison to stay
+    one of addresses both runs have to be on one tiling, since a tiling sets the
+    order the partial products are summed in and different orders differ by a
+    few ulp. The rung does branch on the contract, but only once the grid covers
+    the part; these batches are far short of that, so both land on the same one.
     """
     for batch, seqlen in ((1, 2), (4, 4), (3, 8)):
         p = _make_problem(batch, seqlen, seed=batch * 5 + seqlen, accepted="first")
         # The chain rolls back to the slot for token 0, which holds the state
         # *after* token 0, not before it. Point the snapshot run at the same
         # place by giving it that slot as its single sequence slot.
-        with _one_tiling_for_every_contract():
-            chain_out, chain_pool = _run_flydsl_chain(p)
+        chain_out, chain_pool = _run_flydsl_chain(p)
 
-            # A column of the slot map, copied rather than viewed: a length-1
-            # slice keeps the row pitch as its stride and torch still calls it
-            # contiguous.
-            slot0 = torch.empty_like(p.seq_indices).copy_(p.chain_indices[:, 0])
-            snap = p._replace(seq_indices=slot0)
-            snap_out, _, inter = _run_flydsl_sglang(snap, save_inter=True)
+        # A column of the slot map, copied rather than viewed: a length-1
+        # slice keeps the row pitch as its stride and torch still calls it
+        # contiguous.
+        slot0 = torch.empty_like(p.seq_indices).copy_(p.chain_indices[:, 0])
+        snap = p._replace(seq_indices=slot0)
+        snap_out, _, inter = _run_flydsl_sglang(snap, save_inter=True)
 
         # Both start from the same state, so token 0's answers agree and every
         # checkpoint does. The chain's slot for token t holds the same value the
@@ -1655,7 +1629,6 @@ def _parse_args():
 
 
 def _run_perf_sweep(args):
-    # One table per mode; the candidate set is a property of the mode.
     for mode in args.mode:
         rows = [
             test_gdr_mtp_perf(

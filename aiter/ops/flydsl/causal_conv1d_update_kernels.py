@@ -39,7 +39,7 @@ from .kernels.causal_conv1d_update import (
 from .kernels.tensor_shim import _run_compiled
 
 #: Private, and absent from torch builds without a CUDA/ROCm backend, so the
-#: public spelling stays as the fallback -- same idiom as aiter/jit/core.py.
+#: public spelling stays as the fallback.
 _RAW_STREAM = getattr(torch._C, "_cuda_getCurrentRawStream", None)
 
 
@@ -240,7 +240,7 @@ def _dtype_out_of_scope(
 
     The single source for both refusals: :func:`_shapes_supported` turns it into
     the ``False`` the dispatch seam falls through on, and the entry points raise
-    it. Stating the rule once is what keeps those two from disagreeing.
+    it.
     """
     if conv_state.dtype not in _SUPPORTED_DTYPES:
         return (
@@ -450,8 +450,8 @@ def causal_conv1d_update_flydsl(
             )
     is_apc = block_idx_last_scheduled_token is not None
     if is_apc and initial_state_idx is None:
-        # A null deref upstream, which dereferences it unconditionally once the
-        # mode is on; say so instead.
+        # APC mode dereferences it unconditionally, so a missing one is a null
+        # deref upstream rather than a fallback.
         raise ValueError(
             "`initial_state_idx` is required when `block_idx_last_scheduled_token`"
             " is given."
@@ -507,7 +507,7 @@ def causal_conv1d_update_flydsl(
     null_block_arg = null_block_id if has_null_block else -1
 
     if channels_per_thread <= 0:
-        # Deliberately not _pick_cpt(), unlike the SGLang sibling.
+        # Held at 1 on this interface; only the SGLang entry point tunes it.
         channels_per_thread = 1
     if block_n <= 0:
         block_n = _pick_block_n(batch, dim, x.device, channels_per_thread)
@@ -735,7 +735,8 @@ def causal_conv1d_update_sglang_flydsl(
             batch, dim, x.device, channels_per_thread, env="AITER_FLYDSL_CONV1D_BN"
         )
 
-    # As in the vLLM sibling above; i_vec covers the snapshot's W-1 tap slots.
+    # Vectorize where the token axis is contiguous; for the snapshot that is
+    # its W-1 tap slots.
     cs_vec = bool(conv_state.stride(2) == 1)
     o_vec = bool(out.stride(2) == 1)
     i_vec = bool(save_inter and intermediate_conv_window.stride(3) == 1)
