@@ -15,6 +15,11 @@ from build_targets import (
 from cpp_extension import executable_path
 from torch_guard import torch_compile_guard
 
+try:
+    from aiter.jit.utils.gfx_placeholders import GFX_PLACEHOLDERS
+except ImportError:
+    from gfx_placeholders import GFX_PLACEHOLDERS
+
 logger = logging.getLogger("aiter")
 
 
@@ -118,9 +123,6 @@ _LEGACY_CU_NUM_TO_GFX = {
     80: "gfx942",
     304: "gfx942",
 }
-
-# Keep in sync with aiter.aot.flydsl.common._GFX_PLACEHOLDERS.
-GFX_PLACEHOLDERS = frozenset(("", "0", "nan", "None"))
 
 _LEGACY_GFX_WARNED_SOURCES: set[str] = set()
 

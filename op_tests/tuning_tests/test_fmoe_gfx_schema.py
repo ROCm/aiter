@@ -8,12 +8,14 @@ import pandas as pd
 
 try:
     from aiter.jit.utils.chip_info import (
+        GFX_PLACEHOLDERS,
         backfill_dataframe_gfx,
         reset_legacy_gfx_warnings_for_tests,
     )
 
     _CHIP_INFO_ERR = None
 except Exception as e:  # noqa: BLE001
+    GFX_PLACEHOLDERS = None
     backfill_dataframe_gfx = None
     reset_legacy_gfx_warnings_for_tests = None
     _CHIP_INFO_ERR = e
@@ -67,6 +69,12 @@ class TestFmoeLegacyGfxLoading(unittest.TestCase):
             backfill_dataframe_gfx(
                 pd.DataFrame({"gfx": ["0"], "cu_num": [128]}), "placeholder.csv"
             )
+
+    def test_load_and_aot_share_placeholder_set(self):
+        from aiter.aot.flydsl.common import GFX_PLACEHOLDERS as aot_placeholders
+
+        self.assertIs(GFX_PLACEHOLDERS, aot_placeholders)
+        self.assertIn("0", GFX_PLACEHOLDERS)
 
 
 @unittest.skipUnless(

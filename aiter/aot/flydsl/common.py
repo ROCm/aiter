@@ -18,6 +18,8 @@ from dataclasses import dataclass
 from multiprocessing.connection import wait as wait_for_sentinels
 from typing import Any
 
+from aiter.jit.utils.gfx_placeholders import GFX_PLACEHOLDERS
+
 _DEFAULT_KERNEL_TIMEOUT = 1200.0
 _DEFAULT_MAX_WORKERS = 64
 _DEFAULT_MAX_RETRIES = 2
@@ -53,9 +55,6 @@ _CU_NUM_TO_ARCH = {
     256: "gfx950",
 }
 
-# Keep in sync with aiter.jit.utils.chip_info.GFX_PLACEHOLDERS.
-_GFX_PLACEHOLDERS = frozenset(("", "0", "nan", "None"))
-
 
 def cu_num_to_arch(cu_num: int) -> str:
     """Map a known legacy compute-unit count to its historical architecture."""
@@ -81,7 +80,7 @@ def resolve_job_arch(cu_num: int = 0, gfx: str = "") -> str:
     an architecture.
     """
     gfx = "" if gfx is None else str(gfx).strip()
-    if gfx and gfx not in _GFX_PLACEHOLDERS:
+    if gfx and gfx not in GFX_PLACEHOLDERS:
         return gfx
     return cu_num_to_arch(cu_num)
 
