@@ -6,13 +6,171 @@ Pipeline: packed-FP4 dispatch (MORI InterNodeV1LL) -> AITER fused_moe
 (A4W4, per_1x32, real expert_mask) -> BF16 combine (MORI InterNodeV1LL,
 same TestWideEpMoe instance).
 
-Launch (2 nodes, one torchrun process per node, 8 local GPUs spawned inside):
+Prerequisites
+=============
 
-  On node_rank 0:
-    GPU_PER_NODE=8 torchrun --nnodes=2 --node_rank=0 --nproc_per_node=1 \
-        --master_addr=<node0_ip> --master_port=29500 \
-        test_wide_ep_moe.py --bs-list 128,512,1024,2048,4096
-  On node_rank 1: same with --node_rank=1
+Hardware and topology
+---------------------
+
+* AMD MI355/gfx950 GPUs only.
+* Exactly two nodes with eight visible GPUs per node (EP16, global ranks 0..15).
+* 896 global experts, 56 local experts per rank, TopK=16.
+* The fixed model shape in this test is H=3584 and I=3072.
+* Each GPU must have enough free VRAM for the 40 GiB MORI symmetric heap plus
+  local A4W4 weights and test workspaces.  Check GPU users before launching.
+* The two hosts must have all eight Ionic RDMA rails available.  The validated
+  setup excludes ``rocep193s0f0`` and ``rocep193s0f1`` (control/BNXT-facing
+  devices) and uses the remaining rails.
+
+Software and repository
+-----------------------
+
+* PyTorch must be a ROCm build with gfx950 support and distributed Gloo.
+* The PyTorch build must expose packed MXFP4 as
+  ``torch.float4_e2m1fn_x2`` (or the compatible one-byte storage ABI used by
+  this AITER revision).
+* MORI Python bindings and its InterNodeV1LL HIP kernels must be installed in
+  the container.  ``mori.shmem`` must support torch process-group bootstrap.
+* A working ROCm/hipcc and FlyDSL toolchain are required.  A clean checkout
+  JIT-builds AITER modules such as ``module_aiter_core``, ``module_moe_asm``,
+  ``module_moe_sorting_opus``, and ``module_quant`` on first use; one local
+  worker builds while the other workers wait on the JIT baton.
+* The tune file
+  ``aiter/configs/model_configs/kimik3_a4w4_tuned_fmoe.csv`` must exist and
+  contain the H3584/I3072/local-expert-56/TopK-compatible entries.
+* This test imports the standalone operator from
+  ``aiter.ops.flydsl.test_wide_ep_moe``.  It does not call ``MegaMoEV2``.
+
+Network and process setup
+-------------------------
+
+* Node 46 is node rank 0; node 50 is node rank 1.
+* The rendezvous address is node 46's data-network address ``10.2.80.17``;
+  do not use its management address.
+* Use the same unused ``master_port`` and identical test arguments on both
+  nodes.  Start node 0 and node 1 close together.
+* ``torchrun`` starts one coordinator process per node.  The test itself uses
+  ``torch.multiprocessing.spawn`` to create eight local GPU workers.
+* The selected Gloo/MORI/NCCL interface ``enp193s0f1np1`` must exist on both
+  nodes and permit node-to-node traffic.
+* Always set ``PYTHONPATH`` to this checkout.  The container may have another
+  editable AITER installation pointing at ``/home/hzm/aiter``; omitting
+  ``PYTHONPATH`` can silently test the wrong source tree.
+
+Input and numerical contract
+----------------------------
+
+* Dispatch input is packed FP4 plus one-byte E8M0 scale per 1x32 block.
+* GEMM1 and GEMM2 use A4W4 with ``ActivationType.Situv2`` and
+  ``QuantType.per_1x32``.
+* Combine output is BF16.
+* ``--routing`` controls test routing explicitly.  The unrelated
+  ``AITER_MOE_EXPERT_BALANCE`` environment variable is not consumed here.
+* ``--accuracy-max-bs`` controls which cases build the independent Torch MoE
+  reference.  Cases above that threshold still check shape, finite values,
+  public/staged consistency, and (when enabled) compiled/eager consistency.
+* In profiler mode, ``--profile-warmup-iters 10 --profile-iters 40`` records
+  numbered groups ``iter0`` through ``iter39``.  The standard report uses GPU
+  annotations from ``iter20`` through ``iter39``.
+
+Standard launch on MI355 nodes 46 and 50
+========================================
+
+Run from a checkout of this repository.  ``PYTHONPATH`` is explicit so a
+container-wide editable AITER installation cannot silently resolve another
+worktree.  Start node 0 first and node 1 immediately afterwards, using the same
+master address, port, environment, and test arguments.
+
+Node 0 (mi355-gpu-46)::
+
+  cd /home/hzm/aiter_test_wide_ep_moe
+  PYTHONPATH=/home/hzm/aiter_test_wide_ep_moe \
+  GLOO_SOCKET_IFNAME=enp193s0f1np1 \
+  MORI_SOCKET_IFNAME=enp193s0f1np1 \
+  NCCL_SOCKET_IFNAME=enp193s0f1np1 \
+  MORI_DEVICE_NIC=ionic \
+  MORI_RDMA_DEVICES='^rocep193s0f0,rocep193s0f1' \
+  MORI_IB_GID_INDEX=1 \
+  MORI_NUM_QP_PER_PE=2 \
+  MORI_SHMEM_HEAP_SIZE=40G \
+  MORI_EP_LAUNCH_CONFIG_MODE=AUTO \
+  GPU_PER_NODE=8 \
+  AITER_SITUV2_A4W4=1 \
+  AITER_CONFIG_FMOE=aiter/configs/model_configs/kimik3_a4w4_tuned_fmoe.csv \
+  torchrun --nnodes=2 --node_rank=0 --nproc_per_node=1 \
+    --master_addr=10.2.80.17 --master_port=30001 \
+    op_tests/multigpu_tests/test_wide_ep_moe.py \
+    --bs-list 4,128 --accuracy-max-bs 128 --routing random --staged-only
+
+Node 1 (mi355-gpu-50) uses the identical command except::
+
+  --node_rank=1
+
+The outer ``torchrun`` intentionally uses ``--nproc_per_node=1``.  This script
+then spawns ``GPU_PER_NODE=8`` local workers, producing global EP ranks 0..15.
+
+Environment variables
+---------------------
+
+``PYTHONPATH``
+    Selects this checkout instead of another editable AITER installation.
+``GLOO_SOCKET_IFNAME``
+    Pins the CPU process group to the inter-node data interface.
+``MORI_SOCKET_IFNAME``
+    Pins MORI control/bootstrap traffic to the same data interface.
+``NCCL_SOCKET_IFNAME``
+    Keeps any NCCL-side socket discovery on the data interface as well.
+``MORI_DEVICE_NIC=ionic``
+    Selects the MI355 Ionic RDMA NIC backend.
+``MORI_RDMA_DEVICES``
+    Excludes the two control/BNXT-facing devices; MORI uses the remaining eight
+    Ionic rails.
+``MORI_IB_GID_INDEX=1``
+    Selects the validated RoCE GID entry.
+``MORI_NUM_QP_PER_PE=2``
+    Creates two queue pairs per peer for InterNodeV1LL.
+``MORI_SHMEM_HEAP_SIZE=40G``
+    Reserves sufficient symmetric heap for EP16 and large token cases.
+``MORI_EP_LAUNCH_CONFIG_MODE=AUTO``
+    Lets MORI select its validated launch configuration.
+``GPU_PER_NODE=8``
+    Tells this script to spawn eight local GPU workers on each node.
+``AITER_SITUV2_A4W4=1``
+    Selects the A4W4 SiTUv2 fused-MoE path.
+``AITER_CONFIG_FMOE``
+    Selects the Kimi-K3 H3584/I3072 local-expert tune table.
+
+``AITER_MOE_EXPERT_BALANCE`` is intentionally not used.  Routing for this test
+is selected explicitly with ``--routing random|round_robin|cross_node``.
+
+Compile profiler example
+------------------------
+
+Add the following arguments to both nodes to compile the public
+``TestWideEpMoe.forward_prequant`` call, warm up ten times, profile forty
+replays, and retain numbered iteration groups for tail-20 analysis::
+
+  --torch-compile-cudagraph \
+  --profile-warmup-iters 10 \
+  --profile-iters 40 \
+  --torch-profiler-dir trace_data/testwide_compile_trace
+
+  torchrun \
+    --nnodes=2 \
+    --node_rank=0 \
+    --nproc_per_node=1 \
+    --master_addr=10.2.80.17 \
+    --master_port=30010 \
+    op_tests/multigpu_tests/test_wide_ep_moe.py \
+    --bs-list 4,128 \
+    --iters 1 \
+    --stat-iters 1 \
+    --accuracy-max-bs 128 \
+    --routing random \
+    --torch-compile-cudagraph \
+    --profile-warmup-iters 10 \
+    --profile-iters 40 \
+    --torch-profiler-dir trace_data/testwide_compile_trace
 """
 
 from __future__ import annotations
