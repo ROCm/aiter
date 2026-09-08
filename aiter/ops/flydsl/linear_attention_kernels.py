@@ -190,3 +190,8 @@ def flydsl_gdr_decode(
     if need_shuffle_state:
         state_ = state_.permute(0, 1, 3, 2).contiguous()
         state.copy_(state_)
+
+
+# Consumers may safely allocate ``out`` with ``torch.empty``: the fused kernel
+# writes positive zero for every negative-index graph-padding row.
+flydsl_gdr_decode.zeroes_invalid_output = True
