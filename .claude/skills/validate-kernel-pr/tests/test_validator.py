@@ -34,10 +34,8 @@ REQUIRED_STAGES = {
 
 # Stages that may be absent without making a report incomplete. `perf` runs only when the
 # target exposes a benchmark harness and both phases completed, so asserting an exact stage
-# set would turn an optional stage into a failure in every test in this file. The shape grid
-# joined it when it stopped being required: report.py backfills only the required stages, so a
-# run that exits before a runner is chosen writes no grid stage at all.
-OPTIONAL_STAGES = {"perf", "correctness_s1_grid"}
+# set would turn an optional stage into a failure in every test in this file.
+OPTIONAL_STAGES = {"perf"}
 
 
 def assert_stage_set(stages):
@@ -109,9 +107,6 @@ class ValidatorFixture:
         (self.repo / "aiter" / "kernel.py").write_text("VALUE = 1\n")
         (self.repo / "tests" / "test_sample.py").write_text(
             "import os\n"
-            '_GRID = os.environ.get("VALIDATOR_TEST_GRID", "")\n'
-            'if _GRID == "__VALIDATOR_INVALID_GRID__":\n'
-            '    raise ValueError("invalid validator grid probe")\n'
             '# (7, 257, "f32")\n'
             "def run_kernel(M, N, dtype_str):\n"
             "    assert M > 0 and N > 0 and dtype_str\n"
@@ -123,7 +118,7 @@ class ValidatorFixture:
             "    if phase:\n"
             "        expected = f\"/{phase.split('-')[0]}/aiter-jit\"\n"
             '        assert expected in os.environ["AITER_JIT_DIR"]\n'
-            '    shapes = _GRID or "7,257,f32"\n'
+            '    shapes = "7,257,f32"\n'
             "    for shape in shapes.split(';'):\n"
             "        M, N, dtype_str = shape.split(',')\n"
             "        run_kernel(int(M), int(N), dtype_str)\n"
@@ -222,19 +217,13 @@ class ValidatorFixture:
         picker=None,
         path_prefix=None,
         pylib=None,
-        grid=True,
         expected_route="test_sample:run_kernel",
-        grid_value="7,257,f32",
         python_bin=None,
         perf=True,
-        shape_env="VALIDATOR_TEST_GRID",
-        shape_arg=None,
-        shape_argnames=None,
         shape_vars="M,N,dtype_str",
         tol_table="f32=1e-5,f16=2e-3,bf16=1e-2",
         use_picker_env=True,
         cwd=None,
-        axes=(),
         perf_control_column=None,
         # The validator no longer classifies the target; the caller declares how to run it. This
         # default matches the fixture target, and a test whose subject is a script target says so
@@ -273,16 +262,6 @@ class ValidatorFixture:
             "--out",
             report_arg,
         ]
-        if grid:
-            if shape_env:
-                command.extend(["--shape-env", shape_env])
-            command.extend(["--grid", grid_value])
-        if shape_arg:
-            command.extend(["--shape-arg", shape_arg])
-        if shape_argnames:
-            command.extend(["--shape-argnames", shape_argnames])
-        for axis in axes:
-            command.extend(["--axis", axis])
         if perf_control_column:
             command.extend(["--perf-control-column", perf_control_column])
         if perf_target:
@@ -546,7 +525,6 @@ class ValidateKernelPrTests(unittest.TestCase):
         # architecture, so a clearance would be a claim no stage established.
         self.assertEqual("not-required", report["test_selection"]["gpu_requirement"])
         self.assertEqual("pass", report["stages"]["correctness_repo_tests"]["status"])
-        self.assertEqual("pass", report["stages"]["correctness_s1_grid"]["status"])
         self.assert_complete_stage_objects(report)
 
     def test_no_gpu_withholds_correctness_from_a_target_that_needs_a_device(self):
@@ -558,7 +536,6 @@ class ValidateKernelPrTests(unittest.TestCase):
             patch,
             tests="tests/test_needs_device.py",
             picker=no_gpu_picker,
-            grid=False,
             expected_route="test_needs_device:run_kernel",
         )
 
@@ -574,7 +551,6 @@ class ValidateKernelPrTests(unittest.TestCase):
 
         result, report = self.fixture.validate(
             patch,
-            grid_value="7,257,f32;8,513,bf16",
         )
 
         self.assertEqual(0, result.returncode)
@@ -608,7 +584,6 @@ class ValidateKernelPrTests(unittest.TestCase):
         result, report = self.fixture.validate(
             patch,
             tests="tests/test_new.py",
-            grid=False,
         )
 
         self.assertEqual(1, result.returncode)
@@ -635,7 +610,6 @@ class ValidateKernelPrTests(unittest.TestCase):
             patch,
             tests="tests/verify_kernel.py",
             runner="script",
-            grid=False,
         )
 
         self.assertEqual(2, result.returncode)
@@ -672,7 +646,6 @@ class ValidateKernelPrTests(unittest.TestCase):
             patch,
             tests="tests/verify_kernel.py",
             runner="script",
-            grid=False,
         )
 
         self.assertEqual(1, result.returncode)
@@ -693,7 +666,6 @@ class ValidateKernelPrTests(unittest.TestCase):
         result, report = self.fixture.validate(
             patch,
             tests="tests/kernel_helpers.py",
-            grid=False,
             # Neither runner can execute a library-only file, so a caller reading it declares
             # nothing -- and a target nobody can run is a skip, never a test failure.
             runner=None,
@@ -734,7 +706,6 @@ class ValidateKernelPrTests(unittest.TestCase):
 
         self.assertEqual("INCONCLUSIVE", report["verdict"])
         self.assertEqual("skip", report["stages"]["correctness_repo_tests"]["status"])
-        self.assertEqual("skip", report["stages"]["correctness_s1_grid"]["status"])
         self.assertEqual({}, report["arch_coverage"])
         self.assert_complete_stage_objects(report)
 
@@ -815,28 +786,6 @@ class ValidateKernelPrTests(unittest.TestCase):
         self.assertEqual("INCONCLUSIVE", report["verdict"])
         self.assertEqual("skip", report["stages"]["execution_receipt"]["status"])
 
-    def test_incomplete_shape_receipt_prevents_pass(self):
-        def omit_shape(repo):
-            path = repo / "tests" / "test_sample.py"
-            path.write_text(
-                path.read_text().replace(
-                    "    for shape in shapes.split(';'):\n",
-                    "    for shape in shapes.split(';')[:1]:\n",
-                )
-            )
-
-        patch = self.fixture.make_patch(omit_shape, "missing-shape.patch")
-        result, report = self.fixture.validate(
-            patch,
-            grid_value="7,257,f32;8,513,bf16",
-        )
-
-        self.assertEqual(2, result.returncode)
-        self.assertEqual("INCONCLUSIVE", report["verdict"])
-        receipt = report["stages"]["execution_receipt"]
-        self.assertEqual("skip", receipt["status"])
-        self.assertIn("missing required shapes", receipt["note"])
-
     def test_wrong_route_receipt_prevents_pass(self):
         patch = self.fixture.make_patch(self.harmless_change, "wrong-route.patch")
         result, report = self.fixture.validate(
@@ -905,50 +854,6 @@ class ValidateKernelPrTests(unittest.TestCase):
         self.assertEqual("INCONCLUSIVE", report["verdict"])
         self.assertIn(
             "trusted build provenance", report["stages"]["runtime_compat"]["note"]
-        )
-
-    def test_grid_pass_cannot_ignore_shape_environment(self):
-        def remove_grid_hook(repo):
-            path = repo / "tests" / "test_sample.py"
-            path.write_text(
-                path.read_text().replace("VALIDATOR_TEST_GRID", "UNRELATED_ENV")
-                + '\nUNUSED_GRID_NAME = "VALIDATOR_TEST_GRID"\n'
-                + "\n# VALIDATOR_TEST_GRID is intentionally not consumed.\n"
-            )
-
-        patch = self.fixture.make_patch(remove_grid_hook, "ignored-grid.patch")
-        _, report = self.fixture.validate(patch)
-
-        self.assertEqual("INCONCLUSIVE", report["verdict"])
-        self.assertEqual("skip", report["stages"]["correctness_s1_grid"]["status"])
-        # The channel is no longer refuted by reading the file, but by running the target with
-        # a deliberately invalid grid and watching it not care.
-        note = report["stages"]["correctness_s1_grid"]["note"]
-        self.assertIn("was not consumed", note)
-        self.assertIn("no shape reached the kernel", note)
-
-    def test_grid_pass_requires_runtime_shape_handshake(self):
-        def ignore_grid_value(repo):
-            path = repo / "tests" / "test_sample.py"
-            source = path.read_text().replace(
-                'if _GRID == "__VALIDATOR_INVALID_GRID__":',
-                "if False and _GRID:",
-            )
-            path.write_text(
-                source.replace(
-                    '    shapes = _GRID or "7,257,f32"',
-                    '    _ = _GRID\n    shapes = "7,257,f32"',
-                )
-            )
-
-        patch = self.fixture.make_patch(ignore_grid_value, "unused-grid.patch")
-        _, report = self.fixture.validate(patch)
-
-        self.assertEqual("INCONCLUSIVE", report["verdict"])
-        self.assertEqual("skip", report["stages"]["correctness_s1_grid"]["status"])
-        self.assertIn(
-            "ignores",
-            report["stages"]["correctness_s1_grid"]["note"],
         )
 
     def test_base_artifact_prevents_contaminated_head_run(self):
@@ -1093,57 +998,6 @@ class ValidateKernelPrTests(unittest.TestCase):
         self.assertEqual("INCONCLUSIVE", report["verdict"])
         self.assertEqual("skip", report["stages"]["merge_sim"]["status"])
 
-    def test_unfound_shape_arg_reports_a_missing_hook_not_an_absent_grid(self):
-        # A --shape-arg naming a flag the target does not accept used to reach the branch that
-        # says "no shape grid was configured" -- a fact about the caller, when what happened is
-        # a fact about the target. Both skip, so only the reason distinguishes a validator that
-        # could not find the hook from a caller that never asked for one, and that reason is
-        # the whole point of a stage that reports its own limits.
-        def add_script_target(repo):
-            (repo / "tests" / "verify_kernel.py").write_text(
-                "def verify_kernel():\n"
-                "    return True\n"
-                "\n"
-                "if __name__ == '__main__':\n"
-                "    assert verify_kernel()\n"
-                "    print('56/56 cases passed')\n"
-            )
-
-        patch = self.fixture.make_patch(add_script_target, "unfound-shape-arg.patch")
-        _, report = self.fixture.validate(
-            patch,
-            tests="tests/verify_kernel.py",
-            runner="script",
-            shape_env=None,
-            shape_arg="--shapes",
-        )
-
-        # Asserted before the grid_channel field below, so that this test fails on the reason
-        # the skip gives rather than on the field that was added to carry it.
-        self.assertEqual("skip", report["stages"]["correctness_s1_grid"]["status"])
-        note = report["stages"]["correctness_s1_grid"]["note"]
-        self.assertNotIn("no configured shape override", note)
-        # The skip names the channel and what was observed, and it does NOT say the target
-        # ignores it: a caller who named a flag that does not exist gets the same runtime
-        # evidence, and blaming the target for that publishes the caller's mistake as a
-        # property of someone's code.
-        self.assertIn("was not consumed", note)
-        self.assertIn("cli", note)
-        self.assertNotIn("target ignores", note)
-        # This target is ADDED by the patch, so on base it does not exist. The old static
-        # probe read a missing file and called the result "hook-not-found", stating something
-        # about a flag in a file it never opened; the base side now says which it was.
-        self.assertEqual(
-            "target-not-present",
-            report["stages"]["baseline_control"]["s1_grid"]["state"],
-        )
-        # `grid_channel` records the channel the caller declared, and the run is what refutes
-        # it. Erasing the declaration before the run lost the request itself.
-        self.assertEqual("cli", report["test_selection"]["grid_channel"])
-        self.assertEqual(
-            "declared-by-caller", report["test_selection"]["grid_channel_basis"]
-        )
-
     def bench_body(self, scale, trailer=""):
         self.fixture.add_bench_target()
         source = (self.fixture.repo / self.fixture.BENCH_TARGET).read_text()
@@ -1155,7 +1009,6 @@ class ValidateKernelPrTests(unittest.TestCase):
         return self.fixture.validate(
             patch,
             tests=self.fixture.BENCH_TARGET,
-            grid=False,
             expected_route="test_bench:run_kernel",
         )
 
@@ -1165,7 +1018,6 @@ class ValidateKernelPrTests(unittest.TestCase):
                 self.fixture.rewrite_bench(self.bench_body("1.25")), "perf-slow.patch"
             ),
             tests=self.fixture.BENCH_TARGET,
-            grid=False,
             expected_route="test_bench:run_kernel",
         )
         perf = report["stages"]["perf"]
@@ -1238,7 +1090,6 @@ class ValidateKernelPrTests(unittest.TestCase):
         result, report = self.fixture.validate(
             patch,
             tests=self.fixture.BENCH_TARGET,
-            grid=False,
             expected_route="test_bench:run_kernel",
             perf=False,
         )
@@ -1285,7 +1136,6 @@ class ValidateKernelPrTests(unittest.TestCase):
         _, report = self.fixture.validate(
             patch,
             tests=self.fixture.BENCH_TARGET,
-            grid=False,
             expected_route="test_bench:run_kernel",
         )
         self.assertEqual("fail", report["stages"]["perf"]["status"])
@@ -1302,7 +1152,6 @@ class ValidateKernelPrTests(unittest.TestCase):
         _, report = self.fixture.validate(
             patch,
             tests=self.fixture.BENCH_TARGET,
-            grid=False,
             expected_route="test_bench:run_kernel",
         )
 
@@ -1373,7 +1222,7 @@ class ValidateKernelPrTests(unittest.TestCase):
         )
 
         patch = self.fixture.make_patch(self.harmless_change, "perf-artifacts.patch")
-        result, report = self.fixture.validate(patch, grid_value="7,257,f32;8,513,bf16")
+        result, report = self.fixture.validate(patch)
 
         self.assertEqual("PASS", report["verdict"])
         self.assertEqual(0, result.returncode)
@@ -1438,7 +1287,6 @@ class ValidateKernelPrTests(unittest.TestCase):
         return self.fixture.validate(
             patch,
             tests=self.PERF_LINE_TARGET,
-            grid=False,
             expected_route="test_perfline:main",
         )
 
@@ -1485,7 +1333,7 @@ class ValidateKernelPrTests(unittest.TestCase):
         # it must still be able to reach PASS on correctness alone. If a skipped perf
         # stage could hold a verdict at INCONCLUSIVE, the stage would be unshippable.
         patch = self.fixture.make_patch(self.harmless_change, "perf-skip-pass.patch")
-        result, report = self.fixture.validate(patch, grid_value="7,257,f32;8,513,bf16")
+        result, report = self.fixture.validate(patch)
         self.assertEqual("skip", report["stages"]["perf"]["status"])
         self.assertEqual("PASS", report["verdict"])
         self.assertEqual(0, result.returncode)
@@ -1564,180 +1412,9 @@ class ValidateKernelPrTests(unittest.TestCase):
             patch,
             tests=self.AXIS_TARGET_PATH,
             expected_route="axis_kernel:run_kernel",
-            shape_env=None,
-            shape_arg="--shapes",
             perf=False,
             **kwargs,
         )
-
-    def test_a_green_grid_earns_nothing_and_costs_nothing(self):
-        # The grid used to be a REQUIRED stage, and that requirement is what produced
-        # aiter#4538: every caller had to supply a grid whether or not they had anything to
-        # say with it, and #4538's three cells were all already in the target's own --shapes
-        # default. The answer at the time was to demand a --grid-novelty declaration and
-        # refuse a pass without one.
-        #
-        # Now the grid earns nothing, so there is nothing to police. A duplicate grid that
-        # passes proves nothing and claims nothing, which is the correct amount, and the
-        # verdict comes from the target's own run.
-        patch = self._axis_patch("grid-green.patch")
-        result, report = self._validate_axis_target(patch, grid_value="9,1023,f32")
-
-        grid_stage = report["stages"]["correctness_s1_grid"]
-        self.assertEqual(0, grid_stage["exit"])
-        self.assertEqual("pass", grid_stage["status"])
-        self.assertNotIn("independence", grid_stage)
-        self.assertEqual("PASS", report["verdict"])
-        self.assertEqual(0, result.returncode)
-
-    def test_a_run_with_no_grid_at_all_can_still_reach_pass(self):
-        # The invariant the requirement broke. A bugfix with no shape dimension has no grid to
-        # supply, and while correctness_s1_grid was required its `skip` capped every such run
-        # at INCONCLUSIVE however green the target was -- documented in review-pr as a class of
-        # PR that "cannot reach PASS by construction". That is now a property of a CPU-only
-        # target only.
-        patch = self._axis_patch("grid-absent.patch")
-        result, report = self._validate_axis_target(patch, grid=False)
-
-        self.assertEqual("skip", report["stages"]["correctness_s1_grid"]["status"])
-        self.assertEqual("PASS", report["verdict"])
-        self.assertEqual(0, result.returncode)
-
-    def test_a_red_grid_is_still_a_blocker_though_it_can_earn_no_pass(self):
-        # The asymmetry that makes an optional grid worth having: it cannot complete a verdict
-        # and it can still break one. The target runs its defaults fine and dies on the shape
-        # only the grid asks for -- after calling the route, so the failure is the kernel's and
-        # not a delivery problem.
-        red = self.AXIS_TARGET.replace(
-            "            run_kernel(M, N, dtype_str, num_heads)\n",
-            "            run_kernel(M, N, dtype_str, num_heads)\n"
-            "            if N == 1023:\n"
-            "                raise SystemExit('kernel is wrong at N=1023')\n",
-        )
-        patch = self._axis_patch("grid-red.patch", body=red)
-        result, report = self._validate_axis_target(patch, grid_value="9,1023,f32")
-
-        stage = report["stages"]["correctness_s1_grid"]
-        self.assertEqual("fail", stage["status"])
-        self.assertNotEqual(0, stage["exit"])
-        self.assertEqual("BLOCK", report["verdict"])
-        self.assertEqual(1, result.returncode)
-
-    def test_each_head_run_keeps_its_own_execution_receipt(self):
-        # head-repo and head-grid both ran inside the head phase and shared one receipt
-        # path, so the second run erased the first. With the grid shapes a subset of the
-        # target's defaults -- aiter#4538's case -- a receipt written by EITHER run satisfies
-        # --grid, which makes the grid's own evidence unfalsifiable.
-        patch = self._axis_patch("receipt-split.patch")
-        _, report = self._validate_axis_target(patch, grid_value="9,1023,f32")
-
-        work = Path(report["stages"]["correctness_repo_tests"]["log"]).parent
-        repo_receipt = work / "head" / "execution-receipt-head-repo.json"
-        grid_receipt = work / "head" / "execution-receipt-head-grid.json"
-        self.assertTrue(repo_receipt.exists(), f"missing {repo_receipt}")
-        self.assertTrue(grid_receipt.exists(), f"missing {grid_receipt}")
-
-        repo_shapes = set(json.loads(repo_receipt.read_text())["executed_shapes"])
-        grid_shapes = set(json.loads(grid_receipt.read_text())["executed_shapes"])
-        # The repo run executes the target's defaults; the grid run executes the grid.
-        # Neither may contain the other's shapes, which is only checkable once they are
-        # separate files.
-        self.assertIn("7,257,f32", repo_shapes)
-        self.assertNotIn("9,1023,f32", repo_shapes)
-        self.assertEqual({"9,1023,f32"}, grid_shapes)
-        self.assertIn(
-            "head-grid", report["stages"]["execution_receipt"]["receipt_scope"]
-        )
-
-    def test_an_extra_axis_reaches_a_configuration_the_shape_grid_cannot_express(self):
-        # The shape channel is one ordered tuple bound to --shape-vars, so on aiter#4538 it
-        # could only ever vary (seq_len, seq_len_kv). num_heads is a separate flag whose
-        # default is [64, 128], and the kernel asserts at num_heads=16 -- a real blocker the
-        # validator had no way to request. --axis is that way.
-        patch = self._axis_patch("axis-blocker.patch")
-        result, report = self._validate_axis_target(
-            patch,
-            grid_value="9,1023,f32",
-            axes=("num_heads=--num-heads:16;32",),
-        )
-
-        selection = report["test_selection"]
-        self.assertEqual("proven", selection["axis_state"])
-        axis = selection["axes"][0]
-        self.assertEqual("num_heads", axis["name"])
-        # The probe's own verdict, not a reading of the source: this flag was fed an
-        # invalid value and refused it.
-        self.assertEqual("refused-invalid-value", axis["hook_proof"])
-        self.assertEqual(["16", "32"], axis["values"])
-        # The configuration the grid alone could never request now fails, loudly, and is
-        # attributed to the PR that adds the target.
-        self.assertEqual("fail", report["stages"]["correctness_s1_grid"]["status"])
-        self.assertEqual(1, result.returncode)
-        self.assertEqual("BLOCK", report["verdict"])
-        self.assertTrue(
-            any(
-                item["severity"] == "blocker" and "shape grid" in item["detail"]
-                for item in report["findings"]
-            ),
-            report["findings"],
-        )
-
-    def test_an_axis_the_target_ignores_is_named_not_silently_dropped(self):
-        # A flag the target declares but does not constrain would let the report claim
-        # coverage of head counts that never reached the kernel. The runtime refusal probe
-        # is what separates "declared" from "consumed", exactly as for --shape-arg, and a
-        # dropped axis has to be visible or the test space narrowed silently.
-        permissive = self.AXIS_TARGET.replace(
-            "parser.add_argument('--num-heads', type=int, nargs='*',\n"
-            "                        default=[64, 128])\n",
-            "parser.add_argument('--num-heads', type=str, nargs='*',\n"
-            "                        default=['64', '128'])\n",
-        ).replace(
-            "            run_kernel(M, N, dtype_str, num_heads)\n",
-            "            run_kernel(M, N, dtype_str, 64)\n",
-        )
-        self.assertNotEqual(permissive, self.AXIS_TARGET)
-        patch = self._axis_patch("axis-ignored.patch", body=permissive)
-        _, report = self._validate_axis_target(
-            patch,
-            grid_value="9,1023,f32",
-            axes=("num_heads=--num-heads:16;32",),
-        )
-
-        selection = report["test_selection"]
-        self.assertEqual("hook-not-consumed", selection["axis_state"])
-        self.assertIn("--num-heads", selection["axis_state_reason"])
-        # And the axis itself carries the probe's verdict. The source declares --num-heads
-        # perfectly well, so a structural reading called this axis proven; only the refusal
-        # probe can tell that the value never reached the kernel.
-        self.assertEqual("accepted-invalid-value", selection["axes"][0]["hook_proof"])
-        self.assertTrue(
-            any(
-                "requested test axes were dropped" in item["detail"]
-                for item in report["findings"]
-            ),
-            report["findings"],
-        )
-
-    def test_an_axis_spelled_wrong_is_refused_rather_than_guessed_at(self):
-        # --axis takes name=--flag:v1;v2. A spec missing any of the three used to be folded
-        # in with the flags the source did not declare and reported as a fact about the
-        # TARGET; it is the caller's own argument that is wrong, and the values must not be
-        # half-guessed onto the run's argv either way.
-        patch = self._axis_patch("axis-malformed.patch")
-        _, report = self._validate_axis_target(
-            patch,
-            grid_value="9,1023,f32",
-            axes=("num_heads=--num-heads",),
-        )
-
-        selection = report["test_selection"]
-        self.assertEqual("malformed-spec", selection["axis_state"])
-        self.assertIn("num_heads", selection["axis_state_reason"])
-        self.assertEqual("malformed-axis-spec", selection["axes"][0]["hook_proof"])
-        # The request survives in the report; what does not happen is a run pretending to
-        # cover an axis it never delivered.
-        self.assertEqual([], selection["axes"][0]["values"])
 
     def test_a_script_that_returns_without_working_earns_no_architecture_credit(self):
         # aiter#4538's target returns with exit 0 and a log line when the arch is
@@ -1764,11 +1441,8 @@ class ValidateKernelPrTests(unittest.TestCase):
             patch,
             tests=self.AXIS_TARGET_PATH,
             expected_route="axis_kernel:run_kernel",
-            shape_env=None,
-            shape_arg="--shapes",
             perf=False,
             runner="script",
-            grid=False,
         )
 
         stats = report["stages"]["correctness_repo_tests"]["stats"]
@@ -1828,7 +1502,6 @@ class ValidateKernelPrTests(unittest.TestCase):
             patch,
             tests=self.NEW_BENCH_TARGET,
             expected_route="aiter.kernel:main",
-            grid=False,
             perf=True,
             perf_control_column="reference us",
         )
@@ -1860,7 +1533,6 @@ class ValidateKernelPrTests(unittest.TestCase):
             patch,
             tests=self.NEW_BENCH_TARGET,
             expected_route="aiter.kernel:main",
-            grid=False,
             perf=True,
             perf_control_column="reference us",
         )
@@ -1925,7 +1597,6 @@ class ValidateKernelPrTests(unittest.TestCase):
             patch,
             tests=self.NEW_BENCH_TARGET,
             expected_route="aiter.kernel:main",
-            grid=False,
             perf=True,
             perf_control_column="reference us",
         )
@@ -1945,7 +1616,6 @@ class ValidateKernelPrTests(unittest.TestCase):
             patch,
             tests=self.NEW_BENCH_TARGET,
             expected_route="aiter.kernel:main",
-            grid=False,
             perf=True,
         )
 
@@ -1971,7 +1641,6 @@ class ValidateKernelPrTests(unittest.TestCase):
             patch,
             tests=self.fixture.BENCH_TARGET,
             expected_route="test_bench:run_kernel",
-            grid=False,
             runner="script",
         )
 
@@ -2000,7 +1669,6 @@ class ValidateKernelPrTests(unittest.TestCase):
             tests="tests/test_sample.py",
             perf_target=self.NEW_BENCH_TARGET,
             expected_route="test_sample:run_kernel",
-            grid=False,
             perf_control_column="reference us",
         )
 
@@ -2033,7 +1701,6 @@ class ValidateKernelPrTests(unittest.TestCase):
             patch,
             tests="tests/test_sample.py",
             expected_route="test_sample:run_kernel",
-            grid=False,
             perf_control_column="reference us",
         )
 
@@ -2062,7 +1729,6 @@ class ValidateKernelPrTests(unittest.TestCase):
             patch,
             tests="tests/test_sample.py",
             expected_route="test_sample:run_kernel",
-            grid=False,
         )
 
         perf = report["stages"]["perf"]
@@ -2120,7 +1786,6 @@ class ValidateKernelPrTests(unittest.TestCase):
             patch,
             tests="tests/test_sample.py",
             expected_route="test_sample:run_kernel",
-            grid=False,
             perf_control_column="reference us",
         )
 
@@ -2164,7 +1829,6 @@ class ValidateKernelPrTests(unittest.TestCase):
             patch,
             tests="tests/test_sample.py",
             expected_route="test_sample:run_kernel",
-            grid=False,
         )
 
         perf = report["stages"]["perf"]
@@ -2210,7 +1874,6 @@ class ValidateKernelPrTests(unittest.TestCase):
             patch,
             tests="tests/test_sample.py",
             expected_route="test_sample:run_kernel",
-            grid=False,
         )
 
         self.assertEqual("skip", report["stages"]["perf"]["status"])
@@ -2236,7 +1899,6 @@ class ValidateKernelPrTests(unittest.TestCase):
             patch,
             tests="tests/test_sample.py",
             expected_route="test_sample:run_kernel",
-            grid=False,
         )
 
         self.assertEqual([], self.perf_findings(report, "should-fix"))
@@ -2260,7 +1922,6 @@ class ValidateKernelPrTests(unittest.TestCase):
             patch,
             tests="tests/test_sample.py",
             expected_route="test_sample:run_kernel",
-            grid=False,
             perf=False,
         )
 
@@ -2337,8 +1998,6 @@ class ValidateKernelPrTests(unittest.TestCase):
         )
         result, report = self._validate_axis_target(
             patch,
-            grid_value="9,1023,f32",
-            axes=("num_heads=--num-heads:32;64",),
         )
 
         selection = report["test_selection"]
@@ -2347,10 +2006,6 @@ class ValidateKernelPrTests(unittest.TestCase):
         # as one so a reader can weigh it.
         self.assertEqual("script", selection["runner"])
         self.assertEqual("declared-by-caller", selection["runner_basis"])
-        # And because it is a script, the shape grid and the axis both reach it.
-        self.assertEqual("cli", selection["grid_channel"])
-        self.assertEqual("proven", selection["axis_state"])
-        self.assertEqual("pass", report["stages"]["correctness_s1_grid"]["status"])
         self.assertGreater(
             report["stages"]["correctness_repo_tests"]["stats"]["observed_work"], 0
         )
@@ -2393,12 +2048,15 @@ class ValidateKernelPrTests(unittest.TestCase):
             (repo / self.AXIS_TARGET_PATH).write_text(self.AXIS_TARGET)
 
         patch = self.fixture.make_patch(mutate, "wrapped-route.patch")
-        _, report = self._validate_axis_target(patch, grid_value="9,1023,f32")
+        _, report = self._validate_axis_target(patch)
 
         receipt = report["stages"]["execution_receipt"]
         self.assertEqual("pass", receipt["status"])
         self.assertEqual("axis_kernel:run_kernel", receipt["route"])
-        self.assertEqual(["9,1023,f32"], sorted(set(receipt["executed_shapes"])))
+        # The target's own shapes, because they are the only ones there are.
+        self.assertEqual(
+            ["7,257,f32", "8,64,f32"], sorted(set(receipt["executed_shapes"]))
+        )
         self.assertGreater(
             report["stages"]["correctness_repo_tests"]["stats"]["observed_work"], 0
         )
@@ -2414,64 +2072,13 @@ class ValidateKernelPrTests(unittest.TestCase):
             patch,
             tests=self.AXIS_TARGET_PATH,
             expected_route="axis_kernel:run_kernel",
-            shape_env=None,
-            shape_arg="--shapes",
             perf=False,
-            grid=False,
             runner="pytest",
         )
 
         selection = report["test_selection"]
         self.assertEqual("pytest", selection["runner"])
         self.assertEqual("declared-by-caller", selection["runner_basis"])
-
-    def test_a_channel_that_does_not_exist_is_not_charged_to_the_target(self):
-        # The channel is the caller's declaration and is no longer checked against the file. A
-        # flag the target does not define makes argparse exit non-zero, which from the exit
-        # code alone is indistinguishable from a red kernel -- and publishing it as one bills
-        # the caller's typo to the PR author.
-        #
-        # The run separates them without reading the source: this same target passed its
-        # repository run moments earlier, so it imports and executes. If the grid run then does
-        # no work at all, the delivery is what broke.
-        patch = self._axis_patch("bogus-channel.patch")
-        _, report = self.fixture.validate(
-            patch,
-            tests=self.AXIS_TARGET_PATH,
-            expected_route="axis_kernel:run_kernel",
-            shape_env=None,
-            shape_arg="--no-such-shape-flag",
-            grid_value="9,1023,f32",
-            perf=False,
-            runner="script",
-        )
-
-        grid = report["stages"]["correctness_s1_grid"]
-        # A red grid stays red -- the run did fail, and hiding that would be its own lie.
-        self.assertEqual("fail", grid["status"])
-        # But the note refuses to pick between the two things this looks like, because the
-        # evidence does not distinguish them.
-        self.assertIn("never seen failing on these shapes", grid["note"])
-        # Both explanations must be named. Asserting only that the note mentions a missing
-        # channel would still pass if the note went on to declare that the single cause --
-        # which is the judgement the evidence cannot support.
-        self.assertIn("channel this target does not have", grid["note"])
-        self.assertIn("crashes before the route", grid["note"])
-        self.assertIn("both look exactly like this", grid["note"])
-        # And nothing is charged to the author: the kernel was never observed running.
-        self.assertFalse(
-            any(item["severity"] == "blocker" for item in report["findings"]),
-            report["findings"],
-        )
-        self.assertTrue(
-            any(
-                "without reaching the routed work" in item["detail"]
-                for item in report["findings"]
-            ),
-            report["findings"],
-        )
-        # And the repository run, which did do work, keeps its own result.
-        self.assertEqual("pass", report["stages"]["correctness_repo_tests"]["status"])
 
     def test_an_undeclared_runner_runs_nothing_rather_than_guessing(self):
         # The guess is what this replaced: classifying an op_tests script as pytest published
@@ -2484,10 +2091,7 @@ class ValidateKernelPrTests(unittest.TestCase):
             patch,
             tests=self.AXIS_TARGET_PATH,
             expected_route="axis_kernel:run_kernel",
-            shape_env=None,
-            shape_arg="--shapes",
             perf=False,
-            grid=False,
             runner=None,
         )
 
@@ -2503,47 +2107,6 @@ class ValidateKernelPrTests(unittest.TestCase):
             any(item["severity"] == "blocker" for item in report["findings"]),
             report["findings"],
         )
-
-    def test_a_runner_that_cannot_run_the_target_is_named_as_such(self):
-        # "Red on both sides" is an attribution, not an explanation. This target parses argv in
-        # its module body, so pytest dies at collection while the same file is green as a
-        # script (ROCm/aiter#5172). The validator no longer detects that shape -- it now says
-        # so whenever NOTHING executed, which covers this case and every other one where the
-        # runner, not the code, is the candidate cause.
-        patch = self._axis_patch(
-            "argv-at-import.patch", body=self.ARGV_AT_IMPORT_TARGET
-        )
-        _, report = self.fixture.validate(
-            patch,
-            tests=self.AXIS_TARGET_PATH,
-            expected_route="axis_kernel:run_kernel",
-            shape_env=None,
-            shape_arg="--shapes",
-            grid_value="9,1023,f32",
-            axes=("num_heads=--num-heads:16;32",),
-            perf=False,
-            runner="pytest",
-        )
-
-        selection = report["test_selection"]
-        self.assertEqual("pytest", selection["runner"])
-        self.assertTrue(
-            any(
-                "the runner selection is a candidate cause" in item["detail"]
-                for item in report["findings"]
-            ),
-            report["findings"],
-        )
-
-        # A requested axis that could not be honoured must still appear. Publishing an empty
-        # `axes` beside a non-`none` axis_state loses the request itself, which is exactly
-        # the silently narrowed test space these fields exist to make visible.
-        self.assertEqual("unusable", selection["axis_state"])
-        self.assertEqual(1, len(selection["axes"]))
-        self.assertEqual("num_heads", selection["axes"][0]["name"])
-        self.assertEqual(["16", "32"], selection["axes"][0]["values"])
-        # The refusal probe never ran for this target, and nothing else may stand in for it.
-        self.assertEqual("not-evaluated", selection["axes"][0]["hook_proof"])
 
     def test_a_killed_run_leaves_no_stale_verdict_at_the_output_path(self):
         # The process exit code used to be read back out of `--out` AFTER finish_report, so
@@ -2755,355 +2318,6 @@ def new_file_diff(path, source):
     ) + "".join(f"+{line}\n" for line in lines)
 
 
-class GridChannelTests(unittest.TestCase):
-    """The S1 grid needs a delivery channel; there are three, probed independently."""
-
-    def setUp(self):
-        self.fixture = ValidatorFixture()
-
-    def tearDown(self):
-        self.fixture.close()
-
-    @staticmethod
-    def add_cli_shape_script(repo):
-        """A script target whose shapes arrive on its own CLI flag, and which
-        never reads an environment variable."""
-        (repo / "tests" / "run_shapes.py").write_text(
-            "import argparse\n"
-            "\n"
-            "def run_kernel(M, N, dtype_str):\n"
-            "    assert M > 0 and N > 0 and dtype_str\n"
-            "\n"
-            "def main():\n"
-            "    parser = argparse.ArgumentParser()\n"
-            '    parser.add_argument("--shape", nargs="*", default=["7,257,f32"])\n'
-            "    args = parser.parse_args()\n"
-            "    for shape in args.shape:\n"
-            "        M, N, dtype_str = shape.split(',')\n"
-            "        run_kernel(int(M), int(N), dtype_str)\n"
-            "    print(f'{len(args.shape)}/{len(args.shape)} shapes passed')\n"
-            "\n"
-            "if __name__ == '__main__':\n"
-            "    main()\n"
-        )
-
-    @staticmethod
-    def add_parametrized_target(repo):
-        """A pytest target whose shapes are literals inside its own parametrize mark --
-        the dominant shape in the real repository, and the case neither of the older two
-        channels can reach."""
-        (repo / "tests" / "test_parametrized.py").write_text(
-            "import pytest\n"
-            "\n"
-            "def run_kernel(M, N, dtype_str):\n"
-            "    assert M > 0 and N > 0 and dtype_str\n"
-            "\n"
-            '@pytest.mark.parametrize("M,N,dtype_str", [(3, 5, "f32")])\n'
-            "def test_shapes(M, N, dtype_str):\n"
-            "    run_kernel(M, N, dtype_str)\n"
-        )
-
-    @staticmethod
-    def add_single_name_parametrized_target(repo):
-        """One shape parameter -- the dominant shape in the targets this channel exists for.
-
-        `run_kernel` requires an int so that the invalid-grid probe fails INSIDE the target:
-        the sentinel arrives as a string and the assertion is what rejects it.
-        """
-        (repo / "tests" / "test_one_name.py").write_text(
-            "import pytest\n"
-            "\n"
-            "def run_kernel(m):\n"
-            "    assert isinstance(m, int) and m > 0\n"
-            "\n"
-            '@pytest.mark.parametrize("m", [3])\n'
-            "def test_one_shape(m):\n"
-            "    run_kernel(m)\n"
-        )
-
-    @staticmethod
-    def add_target_with_an_unrelated_parametrize(repo):
-        """Two tests in one file: one the grid replaces, one it must not touch.
-
-        `test_unrelated` binds `m` together with `other`, so the grid cannot be substituted
-        into it without leaving `other` unfilled. Its assertion on its OWN values is what
-        proves the plugin left it alone.
-        """
-        (repo / "tests" / "test_two_marks.py").write_text(
-            "import pytest\n"
-            "\n"
-            "def run_kernel(m, n):\n"
-            "    assert isinstance(m, int) and isinstance(n, int)\n"
-            "    assert m > 0 and n > 0\n"
-            "\n"
-            '@pytest.mark.parametrize("m,n", [(3, 5)])\n'
-            "def test_shapes(m, n):\n"
-            "    run_kernel(m, n)\n"
-            "\n"
-            '@pytest.mark.parametrize("m,other", [(11, "keep")])\n'
-            "def test_unrelated(m, other):\n"
-            "    assert (m, other) == (11, 'keep')\n"
-        )
-
-    @staticmethod
-    def add_target_that_rejects_the_grid_after_the_route_ran(repo):
-        """The repository run reaches the route; the grid run dies before it.
-
-        The guard is on the TEST, ahead of the call, so the grid phase produces a receipt
-        that observed nothing while the repository phase produced one that proved the route.
-        """
-        (repo / "tests" / "test_late_grid.py").write_text(
-            "import pytest\n"
-            "\n"
-            "def run_kernel(m):\n"
-            "    assert m > 0\n"
-            "\n"
-            '@pytest.mark.parametrize("m", [3])\n'
-            "def test_shape(m):\n"
-            '    assert m < 100, "shape unsupported by this target"\n'
-            "    run_kernel(m)\n"
-        )
-
-    def test_single_shape_argname_is_delivered_and_not_published_as_a_defect(self):
-        """The most consequential regression of the batch.
-
-        The plugin unwrapped one-name rows to scalars but passed `argnames` as a LIST, and
-        pytest sets force_tuple only for a `str` argnames. Collection died with "object of
-        type 'int' has no len()", the grid run exited non-zero, and the executor published
-        that crash as `[blocker] the PR adds this target and its independent shape grid
-        fails` -- a BLOCK verdict against three real authors for a fault in the injector.
-        """
-        patch = self.fixture.make_patch(
-            self.add_single_name_parametrized_target, "one-name.patch"
-        )
-
-        _, report = self.fixture.validate(
-            patch,
-            tests="tests/test_one_name.py",
-            expected_route="test_one_name:run_kernel",
-            shape_env=None,
-            shape_argnames="m",
-            shape_vars="m",
-            grid_value="128;256",
-        )
-
-        self.assertEqual("pytest", report["test_selection"]["grid_channel"])
-        self.assertNotEqual("BLOCK", report["verdict"])
-        self.assertEqual(
-            [], [item for item in report["findings"] if item["severity"] == "blocker"]
-        )
-        grid_stage = report["stages"]["correctness_s1_grid"]
-        self.assertEqual("pass", grid_stage["status"])
-        # Both grid rows collected and ran -- not one collection error counted as a test.
-        self.assertEqual(2, grid_stage["stats"]["executed"])
-        # And the injected values, not the target's own literal 3, are what reached the route.
-        receipt = report["stages"]["execution_receipt"]
-        self.assertEqual("pass", receipt["status"])
-        self.assertEqual(["128", "256"], sorted(receipt["executed_shapes"]))
-
-    def test_an_unrelated_parametrize_does_not_disable_the_channel(self):
-        """The partial-overlap guard belongs to a test function, not to a file.
-
-        Evaluated file-wide, `test_unrelated`'s `(m, other)` mark -- which overlaps the
-        requested names without being contained in them -- switched the channel off for every
-        test in the file, and the skip text then blamed the target for taking parameters it
-        demonstrably takes. The plugin has always decided per metafunc; only the executor's
-        reachability probe was file-scoped.
-        """
-        patch = self.fixture.make_patch(
-            self.add_target_with_an_unrelated_parametrize, "two-marks.patch"
-        )
-
-        _, report = self.fixture.validate(
-            patch,
-            tests="tests/test_two_marks.py",
-            expected_route="test_two_marks:run_kernel",
-            shape_env=None,
-            shape_argnames="m,n",
-            shape_vars="m,n",
-            grid_value="128,7;256,9",
-        )
-
-        self.assertEqual("pytest", report["test_selection"]["grid_channel"])
-        self.assertEqual("", report["test_selection"]["grid_channel_reason"])
-        grid_stage = report["stages"]["correctness_s1_grid"]
-        self.assertEqual("pass", grid_stage["status"])
-        # Two grid rows for test_shapes plus the one unrelated case, which kept its own
-        # parametrization: it asserts (11, 'keep') and would have failed had the grid been
-        # substituted into it.
-        self.assertEqual(3, grid_stage["stats"]["executed"])
-        receipt = report["stages"]["execution_receipt"]
-        self.assertEqual(["128,7", "256,9"], sorted(receipt["executed_shapes"]))
-
-    def test_a_failed_grid_run_does_not_erase_the_repository_run_receipt(self):
-        """Receipts are per label, because evidence already collected must not be deleted.
-
-        `head-repo` and `head-grid` shared `$WORK/head/execution-receipt.json`. The grid run
-        starts by removing that path, so a grid phase that observed nothing overwrote a
-        receipt that had already proved the route, and the report then said the route never
-        executed -- an erasure reported as an absence.
-        """
-        patch = self.fixture.make_patch(
-            self.add_target_that_rejects_the_grid_after_the_route_ran,
-            "receipt-erasure.patch",
-        )
-
-        _, report = self.fixture.validate(
-            patch,
-            tests="tests/test_late_grid.py",
-            expected_route="test_late_grid:run_kernel",
-            shape_env=None,
-            shape_argnames="m",
-            shape_vars="m",
-            grid_value="128;256",
-        )
-
-        # The grid phase really did fail; that is the premise, not the thing under test.
-        self.assertEqual("fail", report["stages"]["correctness_s1_grid"]["status"])
-        receipt = report["stages"]["execution_receipt"]
-        self.assertEqual("pass", receipt["status"])
-        self.assertEqual("test_late_grid:run_kernel", receipt["route"])
-        # The receipt that speaks is the repository run's, which observed the route.
-        self.assertEqual(["3"], receipt["executed_shapes"])
-
-    def test_invalid_grid_probe_needs_a_passing_control_before_it_proves_anything(self):
-        """A non-zero probe exit is evidence about the GRID only if the target works without it.
-
-        On a held-out PR whose module could not be imported, the invalid-grid probe failed for
-        that reason and the channel was credited although no shape ever reached the kernel.
-        The break is planted on BASE, so the base control run is red before the grid is ever
-        involved.
-        """
-        path = self.fixture.repo / "tests" / "test_sample.py"
-        path.write_text(
-            "raise ImportError('the module under test cannot be imported')\n"
-            + path.read_text()
-        )
-        run(["git", "add", "-A"], cwd=self.fixture.repo)
-        run(
-            [
-                "git",
-                "-c",
-                "user.name=Validator Test",
-                "-c",
-                "user.email=validator@example.com",
-                "commit",
-                "-q",
-                "-m",
-                "broken base",
-            ],
-            cwd=self.fixture.repo,
-        )
-        patch = self.fixture.make_patch(
-            ValidateKernelPrTests.harmless_change, "broken-control.patch"
-        )
-
-        _, report = self.fixture.validate(patch)
-
-        baseline_grid = report["stages"]["baseline_control"]["s1_grid"]
-        self.assertEqual("hook-not-consumed", baseline_grid["state"])
-        # No base grid run was attempted, so there is no exit code to report for one.
-        self.assertNotIn("exit", baseline_grid)
-        self.assertNotEqual("pass", report["stages"]["correctness_s1_grid"]["status"])
-
-    def test_working_cli_channel_survives_a_second_shape_flag(self):
-        """Supplying --shape-arg AND --shape-env must not discard the CLI channel.
-
-        The two probes describe one target that may have both hooks. An earlier version
-        assigned the env probe's result over the CLI probe's unconditionally, so a
-        caller who named both flags lost a working CLI channel and was then told the env
-        variable's absence was the reason no grid ran.
-        """
-        patch = self.fixture.make_patch(self.add_cli_shape_script, "cli-channel.patch")
-
-        _, report = self.fixture.validate(
-            patch,
-            tests="tests/run_shapes.py",
-            runner="script",
-            expected_route="__main__:run_kernel",
-            shape_env="UNREAD_GRID_ENV",
-            shape_arg="--shape",
-            grid_value="9,1023,f32",
-        )
-
-        self.assertEqual("cli", report["test_selection"]["grid_channel"])
-        self.assertEqual("", report["test_selection"]["grid_channel_reason"])
-        grid_stage = report["stages"]["correctness_s1_grid"]
-        self.assertNotEqual("skip", grid_stage["status"])
-        self.assertEqual("pass", grid_stage["status"])
-
-    def test_parametrized_target_runs_the_grid_through_the_pytest_channel(self):
-        """The third channel: pytest's own parametrization.
-
-        The target exposes neither a flag nor an environment variable, so before this
-        channel existed the stage was inert and the skip text blamed the kernel for a
-        limit that belonged to the injector.
-        """
-        patch = self.fixture.make_patch(
-            self.add_parametrized_target, "pytest-channel.patch"
-        )
-
-        _, report = self.fixture.validate(
-            patch,
-            tests="tests/test_parametrized.py",
-            expected_route="test_parametrized:run_kernel",
-            shape_env=None,
-            shape_argnames="M,N,dtype_str",
-            grid_value="7,257,f32;8,513,bf16",
-        )
-
-        self.assertEqual("pytest", report["test_selection"]["grid_channel"])
-        grid_stage = report["stages"]["correctness_s1_grid"]
-        self.assertNotEqual("skip", grid_stage["status"])
-        self.assertEqual("pass", grid_stage["status"])
-        self.assertEqual(2, grid_stage["stats"]["executed"])
-        # The grid actually reached the kernel: the receipt carries the injected shapes,
-        # not the (3, 5, "f32") literal the target parametrizes for itself.
-        receipt = report["stages"]["execution_receipt"]
-        self.assertEqual("pass", receipt["status"])
-        self.assertEqual(
-            ["7,257,f32", "8,513,bf16"], sorted(receipt["executed_shapes"])
-        )
-        # The invalid-grid probe must fail INSIDE THE TARGET. A poisoned row of the
-        # wrong arity would raise in the plugin instead, and its non-zero exit would
-        # credit the channel without the target ever having consumed a shape.
-        probe_log = Path(grid_stage["hook_probe_log"]).read_text()
-        self.assertNotIn("grid rows must have", probe_log)
-        self.assertIn("__VALIDATOR_INVALID_GRID__", probe_log)
-
-    def test_undeliverable_grid_names_the_channel_and_blames_the_right_party(self):
-        """A skip has to say which channel was tried and what was found there.
-
-        --shape-arg against a pytest target is a gap in the validator's own wiring, and
-        publishing it as a property of the target would send a reviewer to fix a kernel
-        that is not broken.
-        """
-        patch = self.fixture.make_patch(
-            ValidateKernelPrTests.harmless_change, "no-channel.patch"
-        )
-
-        _, report = self.fixture.validate(
-            patch,
-            shape_env="UNREAD_GRID_ENV",
-            shape_arg="--shape",
-        )
-
-        selection = report["test_selection"]
-        # The caller named an env var this target does not read. That claim is now recorded AS
-        # a claim and refuted by the run, rather than silently erased before the run --
-        # a reader can see both what was asked for and what happened to it.
-        self.assertEqual("env", selection["grid_channel"])
-        self.assertEqual("declared-by-caller", selection["grid_channel_basis"])
-        self.assertEqual("skip", report["stages"]["correctness_s1_grid"]["status"])
-        note = report["stages"]["correctness_s1_grid"]["note"]
-        self.assertIn("was not consumed", note)
-        # And the blame still lands nowhere: not on the kernel, which is not broken.
-        self.assertFalse(
-            any(item["severity"] == "blocker" for item in report["findings"]),
-            report["findings"],
-        )
-
-
 class ExecutionReceiptTests(unittest.TestCase):
     """The receipt must not report `pass` beside evidence it never collected."""
 
@@ -3249,8 +2463,6 @@ class ProbeReceiptTests(unittest.TestCase):
                     str(receipt_path),
                     "--expected-route",
                     route,
-                    "--grid",
-                    "",
                 ]
             ).stdout
         )
@@ -3308,58 +2520,6 @@ class EvidenceCheckerTests(unittest.TestCase):
         self.assertEqual(1, stats["tests"])
         self.assertEqual(1, stats["errors"])
         self.assertEqual(0, stats["executed"])
-
-    def test_pytest_channel_receipt_does_not_assert_across_namespaces(self):
-        """The grid is delivered as test PARAMETERS; the receipt records the ROUTE's locals.
-
-        Requiring one to contain the other produced "execution receipt is missing required
-        shapes" on a run whose every grid case passed. The requirement is still recorded and
-        the mismatch is named; only the cross-namespace containment assertion is dropped.
-        """
-        path = self.directory / "receipt.json"
-        path.write_text(json.dumps(self.RECEIPT))
-
-        result = self.evidence(
-            "receipt",
-            str(path),
-            "--expected-route",
-            "test_route:run_kernel",
-            "--grid",
-            "128,7;256,9",
-            "--grid-channel",
-            "pytest",
-        )
-
-        self.assertEqual("pass", result["status"])
-        # The grid's requirement is not discarded, only its containment assertion.
-        self.assertEqual(["128,7", "256,9"], result["required_shapes"])
-        self.assertEqual(["3,5"], result["executed_shapes"])
-        self.assertIn("different vocabularies", result["shape_namespace"])
-
-    def test_a_channel_that_shares_the_receipt_namespace_still_must_contain_the_grid(
-        self,
-    ):
-        """The control for the test above: without the pytest channel, nothing is relaxed.
-
-        The env and CLI channels put the grid into the same vocabulary the receipt records,
-        so a missing shape there is still a real gap in coverage.
-        """
-        path = self.directory / "receipt.json"
-        path.write_text(json.dumps(self.RECEIPT))
-
-        result = self.evidence(
-            "receipt",
-            str(path),
-            "--expected-route",
-            "test_route:run_kernel",
-            "--grid",
-            "128,7;256,9",
-            "--grid-channel",
-            "env",
-        )
-
-        self.assertEqual("skip", result["status"])
-        self.assertIn("missing required shapes", result["note"])
 
     def test_empty_native_artifact_list_states_what_it_does_not_mean(self):
         """`native_artifacts: []` was published as though it were a measurement.
@@ -3755,88 +2915,6 @@ class ScannerScopeTests(unittest.TestCase):
         self.assertEqual(1, payload["host_scope_candidates"], payload)
 
 
-class ShapeGridPluginTests(unittest.TestCase):
-    """The plugin is what substitutes the grid, so its refusals are what keep a target the
-    grid cannot express from being reported as a failing PR."""
-
-    def _run_target(self, argnames, grid, target_source):
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            plugin = root / "sgp.py"
-            plugin.write_text(
-                (SKILL_DIR / "shape_grid_plugin.py").read_text()
-                + f"\n_VALIDATION_SHAPE_ARGNAMES = {argnames!r}\n"
-                + f"_VALIDATION_SHAPE_GRID = {grid!r}\n"
-            )
-            target = root / "test_target.py"
-            target.write_text(target_source)
-            return subprocess.run(
-                [sys.executable, "-m", "pytest", "-p", "sgp", str(target), "-q"],
-                cwd=root,
-                capture_output=True,
-                text=True,
-            )
-
-    def test_dict_valued_parametrize_is_refused_rather_than_poisoned(self):
-        # A target parametrizing one `case: dict` passed the argnames-only gate, the grid
-        # substituted integers, and the target raised TypeError -- which the executor
-        # published as "the PR adds this target and its independent shape grid fails", a
-        # BLOCK against an author whose own suite was green in the same report.
-        result = self._run_target(
-            ("case",),
-            [(1,), (513,)],
-            "import pytest\n"
-            '@pytest.mark.parametrize("case", [{"m": 1}, {"m": 3}])\n'
-            "def test_case(case):\n"
-            "    assert case['m'] > 0\n",
-        )
-        self.assertEqual(0, result.returncode, result.stdout + result.stderr)
-        self.assertIn("2 passed", result.stdout)
-        self.assertNotIn("TypeError", result.stdout + result.stderr)
-
-    def test_grid_arity_mismatch_is_rejected_at_invocation(self):
-        # The arity check lived in the plugin generator, whose exit status run_pytest never
-        # read: the stale plugin from the previous phase survived, head-grid re-ran the
-        # invalid-grid sentinel, and its failure was published as "the PR adds this target and
-        # its independent shape grid fails" -- a blocker produced by a caller's typo. It is
-        # now refused at argument parsing, before any phase can run.
-        fixture = ValidatorFixture()
-        try:
-            result = subprocess.run(
-                [
-                    str(VALIDATOR),
-                    "--repo",
-                    str(fixture.repo),
-                    "--target",
-                    "tests/test_sample.py",
-                    "--shape-argnames",
-                    "m",
-                    "--grid",
-                    "255,3;512,4",
-                ],
-                capture_output=True,
-                text=True,
-            )
-        finally:
-            fixture.close()
-        self.assertEqual(2, result.returncode, result.stdout + result.stderr)
-        self.assertIn("--grid", result.stderr)
-
-    def test_a_single_scalar_argname_is_substituted(self):
-        # The same code path with scalar values must still replace the target's own literals,
-        # or the refusal above would have been bought by disabling the channel.
-        result = self._run_target(
-            ("m",),
-            [(3,), (15,), (32,)],
-            "import pytest\n"
-            '@pytest.mark.parametrize("m", [1, 2])\n'
-            "def test_m(m):\n"
-            "    assert m in (3, 15, 32)\n",
-        )
-        self.assertEqual(0, result.returncode, result.stdout + result.stderr)
-        self.assertIn("3 passed", result.stdout)
-
-
 class SkillProseContractTests(unittest.TestCase):
     """SKILL.md is the prose a model acts on, so a stale sentence is a live defect.
 
@@ -3862,8 +2940,6 @@ class SkillProseContractTests(unittest.TestCase):
     # The fields that separate a caller's claim from a measurement. These are the ones a
     # reader has to be able to look up, and the ones the refactor churned.
     DECLARATION_FIELDS = (
-        "grid_channel_basis",
-        "axis_state",
         "runner_basis",
         "test_provenance",
     )
@@ -3889,7 +2965,8 @@ class SkillProseContractTests(unittest.TestCase):
         # A schema that allows a value nothing produces is a promise to a reader that some
         # run, somewhere, might report it. `duplicates-target-defaults` outlived the AST
         # check that derived it and sat here for a full refactor saying the validator still
-        # compared a grid against the target's defaults, which it no longer does.
+        # compared an injected shape grid against the target's defaults, which it no longer
+        # does -- and the injection layer that would have done the comparing is now gone too.
         for field, spec in self.declaration_fields().items():
             for value in spec.get("enum", []):
                 if not value:
@@ -3899,7 +2976,7 @@ class SkillProseContractTests(unittest.TestCase):
 
     def test_every_value_the_schema_admits_is_one_the_prose_explains(self):
         # Backticked, not merely present: `declared` occurs inside `declared-by-caller`, so a
-        # bare substring check would let the axis_state row vanish and still pass on a
+        # bare substring check would let the runner_basis row vanish and still pass on a
         # sentence about a different field entirely.
         for field, spec in self.declaration_fields().items():
             for value in spec.get("enum", []):
@@ -3926,8 +3003,8 @@ class SkillProseContractTests(unittest.TestCase):
         # documented flags exist passes trivially when the documentation is empty.
         #
         # Whole-token, not substring: `--target` occurs inside `--no-target`, so a plain
-        # `in` check would let the `--grid` row vanish and pass on a sentence about a
-        # different flag. The same trap as `declared` inside `declared-by-caller`.
+        # `in` check would let the `--no-target` row vanish and pass on a sentence about
+        # a different flag. The same trap as `declared` inside `declared-by-caller`.
         for flag in sorted(self.accepted_flags()):
             with self.subTest(flag=flag):
                 self.assertRegex(
@@ -4506,32 +3583,6 @@ class TargetRunTests(unittest.TestCase):
         )
         self.assertEqual("pr-modified", result["provenance"])
 
-    def test_a_boolean_cell_arrives_as_a_boolean(self):
-        # "False" is a non-empty string, so it is truthy, and every row of a boolean dimension
-        # silently ran the True branch -- a grid that looked like it covered both.
-        self.assertIs(False, self.tool.coerce("False"))
-        self.assertIs(True, self.tool.coerce("True"))
-        self.assertIsNone(self.tool.coerce("None"))
-
-    def test_a_shape_cell_arrives_as_a_number_and_a_dtype_as_text(self):
-        # A test that indexes or allocates with a shape argument needs an int, not "128".
-        self.assertEqual(128, self.tool.coerce("128"))
-        self.assertIsInstance(self.tool.coerce("128"), int)
-        self.assertEqual(1.5, self.tool.coerce("1.5"))
-        self.assertEqual("bf16", self.tool.coerce("bf16"))
-
-    def test_the_invalid_grid_sentinel_keeps_the_arity_it_poisons(self):
-        # The probe must reach the TARGET, not crash the plugin: a row of the wrong arity
-        # raises inside pytest's parametrize, and that non-zero exit would credit the channel
-        # without the target ever having consumed a shape.
-        rows = self.tool.grid_rows(self.tool.SENTINEL, ("M", "N", "dtype"))
-        self.assertEqual([(self.tool.SENTINEL,) * 3], rows)
-
-    def test_a_row_that_does_not_match_the_argnames_is_refused(self):
-        with self.assertRaises(SystemExit) as caught:
-            self.tool.grid_rows("7,257", ("M", "N", "dtype"))
-        self.assertIn("3 cells", str(caught.exception))
-
     def test_a_script_run_reports_observed_work_not_a_case_count(self):
         # aiter#4538's target returns 0 with log output when the arch is unsupported, so a run
         # that graded 56 cases and one that graded none both reported executed=1. The count
@@ -4558,29 +3609,6 @@ class TargetRunTests(unittest.TestCase):
         unnamed = self.tool.script_stats(0, "/nonexistent/receipt.json", "")
         self.assertIsNone(unnamed["observed_work"])
         self.assertIn("no route was named", unnamed["basis"])
-
-    def test_a_phase_that_observed_nothing_does_not_speak_over_one_that_did(self):
-        with tempfile.TemporaryDirectory() as root:
-            grid = Path(root) / "grid.json"
-            repo = Path(root) / "repo.json"
-            repo.write_text(json.dumps({"route": "mod:run"}))
-
-            # No grid receipt at all: the repository run's stands.
-            self.assertEqual(
-                str(repo), self.tool.preferred_receipt(str(grid), str(repo))
-            )
-
-            # A grid receipt that proves no route does not displace it either.
-            grid.write_text(json.dumps({"route": None}))
-            self.assertEqual(
-                str(repo), self.tool.preferred_receipt(str(grid), str(repo))
-            )
-
-            # One that does prove the route is the run that exercised the injected shapes.
-            grid.write_text(json.dumps({"route": "mod:run"}))
-            self.assertEqual(
-                str(grid), self.tool.preferred_receipt(str(grid), str(repo))
-            )
 
     def test_a_credential_in_the_calling_shell_is_not_readable_from_the_target(self):
         # `env VAR=... <cmd>` ADDS to the inherited environment. The target is unmerged

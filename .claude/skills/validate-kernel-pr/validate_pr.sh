@@ -7,9 +7,9 @@
 #   * arch coverage is REPORTED, never implied -- a gfx950 box cannot validate a gfx942 claim
 #   * a test is run and where it CAME FROM is reported -- a test the PR ships was written by
 #     the same hand as the code it grades, and a change nothing runs at all is a blocker
-#   * an extra shape grid is OPTIONAL and earns nothing -- it can only ever add a failure.
-#     While it was required, every caller supplied one whether or not it covered anything the
-#     target did not already run, and aiter#4538's duplicate was credited as new coverage
+#   * the target's own run is the coverage. The validator does not synthesise shapes the
+#     target never ran; it reports which shapes reached the kernel and which rows this PR
+#     disabled, and leaves the judgement about whether that is enough to the reviewer
 #   * a green pytest with loosened tolerances is not a pass -- tolerances are policy-checked
 #   * GPU is claimed over a sampling window and locked (kernel-profiling-optimization skill)
 #
@@ -18,8 +18,7 @@
 #
 # usage: validate_pr.sh --repo <worktree> (--target <test file or node> | --no-target <reason>)
 #                       [--patch p.patch]
-#                       [--head-sha <expected PR head>] [--shape-env VAR]
-#                       [--grid "M,N,dt;..."] [--tol-table f32=1e-5,...]
+#                       [--head-sha <expected PR head>] [--tol-table f32=1e-5,...]
 #                       [--perf-args "--scenario bench"] [--no-perf]
 #                       --expected-route NAME [--label NAME] [--out report.json]
 set -uo pipefail
@@ -28,18 +27,10 @@ REPO_WT=""
 TESTS=""
 PATCHF=""
 HEAD_SHA=""
-SHAPE_ENV=""
-GRID=""
 EXPECTED_ROUTE=""
+# Local names to capture at each route call, in the order the kernel takes them. This is a
+# READING of the target's own run -- which shapes reached the kernel -- not an injection.
 SHAPE_VARS=""
-SHAPE_ARG=""
-SHAPE_ARGNAMES=""
-# Extra independent test axes, each `NAME=FLAG:v1;v2;...`. The shape grid is one ordered
-# tuple on one channel, which is the whole of what a target's shape flag accepts; a target
-# whose remaining knobs are separate flags -- head counts, dtypes, window modes -- could not
-# be gridded over them at all, so entire failing configurations were unreachable however the
-# grid was spelled. On ROCm/aiter#4538 that is `--num-heads`, whose default is `64 128`, and
-# the public API asserts at num_heads=16 in a configuration the validator could not request.
 # Force the runner instead of inferring it. The classifier is structural and can be
 # wrong in both directions; when it is, a caller who can see the target should be able
 # to say so rather than having a runner-selection artefact charged to the PR author.
@@ -47,10 +38,6 @@ RUNNER_OVERRIDE=""
 RUNNER_REASON=""
 # The caller's declaration that they looked for a test exercising this change and found none.
 NO_TARGET_REASON=""
-AXES=()
-AXIS_CLI=()
-AXIS_CLI_OVERRIDE=()
-AXIS_REPORT="[]"
 TOL_TABLE=""
 LABEL="run"
 OUT=""
@@ -128,13 +115,8 @@ while [ "$#" -gt 0 ]; do
     --no-target) need_value "$@"; NO_TARGET_REASON="$2"; shift 2;;
     --patch) need_value "$@"; PATCHF="$2"; shift 2;;
     --head-sha) need_value "$@"; HEAD_SHA="$2"; shift 2;;
-    --shape-env) need_value "$@"; SHAPE_ENV="$2"; shift 2;;
-    --grid) need_value "$@"; GRID="$2"; shift 2;;
     --expected-route) need_value "$@"; EXPECTED_ROUTE="$2"; shift 2;;
     --shape-vars) need_value "$@"; SHAPE_VARS="$2"; shift 2;;
-    --shape-arg) need_value "$@"; SHAPE_ARG="$2"; shift 2;;
-    --shape-argnames) need_value "$@"; SHAPE_ARGNAMES="$2"; shift 2;;
-    --axis) need_value "$@"; AXES+=("$2"); shift 2;;
     --runner) need_value "$@"; RUNNER_OVERRIDE="$2"; shift 2;;
     --runner-reason) need_value "$@"; RUNNER_REASON="$2"; shift 2;;
     --tol-table) need_value "$@"; TOL_TABLE="$2"; shift 2;;
@@ -185,30 +167,6 @@ if [ -n "$PATCHF" ]; then
 fi
 if [ -n "$OUT" ]; then
   OUT=$(cd -- "$(dirname -- "$OUT")" && pwd)/$(basename -- "$OUT")
-fi
-if [ -n "$SHAPE_ARGNAMES" ] && [ -n "$GRID" ]; then
-  if ! python3 - "$SHAPE_ARGNAMES" "$GRID" <<'PY'
-import sys
-
-names = [part.strip() for part in sys.argv[1].split(",") if part.strip()]
-rows = [row for row in sys.argv[2].split(";") if row.strip()]
-bad = [row for row in rows if len(row.split(",")) != len(names)]
-if bad:
-    print(
-        f"--grid rows must have {len(names)} cells to match --shape-argnames "
-        f"{','.join(names)}; offending rows: {bad}",
-        file=sys.stderr,
-    )
-    raise SystemExit(1)
-PY
-  then
-    # Checked here and not inside a phase. The arity check used to live in the plugin
-    # generator, whose exit status run_pytest never read: the stale plugin from the previous
-    # phase survived, head-grid re-ran the invalid-grid sentinel, and its failure was
-    # published as "the PR adds this target and its independent shape grid fails".
-    echo "--grid does not match --shape-argnames" >&2
-    exit 2
-  fi
 fi
 if [ -n "$HEAD_SHA" ] && [[ ! "$HEAD_SHA" =~ ^[0-9a-fA-F]{40}$ ]]; then
   echo "--head-sha must be a full 40-character commit OID" >&2
@@ -373,10 +331,6 @@ else
   # none". The second is a declaration, and it is paired with test_provenance: none below.
   jset_json "test_selection.target" 'null'
 fi
-jset_string "test_selection.shape_env" "$SHAPE_ENV"
-jset_string "test_selection.grid" "$GRID"
-jset_string "test_selection.shape_arg" "$SHAPE_ARG"
-jset_string "test_selection.shape_argnames" "$SHAPE_ARGNAMES"
 jset_string "test_selection.expected_route" "$EXPECTED_ROUTE"
 jset_string "test_selection.shape_vars" "$SHAPE_VARS"
 jset_string "test_selection.runner" "unresolved"
@@ -888,7 +842,7 @@ if commented_added:
             "stage": "test_policy",
             "detail": (
                 f"this change comments out {commented_added} additional shape rows; "
-                "independent boundary-grid coverage must remain explicit"
+                "shape coverage the suite used to have must not be dropped silently"
             ),
         }
     )
@@ -1048,161 +1002,16 @@ done
 PERF_TARGET_PROVENANCE="${PERF_TARGET_PROVENANCES[0]}"
 PERF_TARGET_PROVENANCE_REASON="${PERF_TARGET_PROVENANCE_REASONS[0]}"
 
-# Two independent channels can carry the S1 grid: the target's own CLI flag (--shape-arg)
-# and an environment variable it reads (--shape-env). They are probed separately and the
-# results are combined, because a caller who supplies both is describing one target that has
-# both -- and an earlier version let the env probe's result overwrite the CLI probe's
-# unconditionally, so supplying both DISCARDED a working CLI channel and then reported the
-# env channel's absence as the reason no grid ran.
-# Which channel carries the grid is settled by which flag the CALLER named, not by reading the
-# target. Reading it was static analysis of a claim the caller had already made, and the claim is
-# proved at runtime a few hundred lines below: the target is run once with a deliberately invalid
-# grid and must FAIL. A channel that does not exist cannot fail that way, so the proof stands on
-# its own and the AST pre-check only ever decided how good the error message was.
-GRID_HOOK_OK=0
-GRID_CHANNEL=""
-GRID_CHANNEL_BASIS=""
-if [ -n "$GRID" ]; then
-  # CLI first when several are named: the caller who spelled out a flag was most specific, and
-  # the wiring for the other two is narrower.
-  if [ -n "$SHAPE_ARG" ] && [ "$TARGET_RUNNER" = "script" ]; then
-    GRID_HOOK_OK=1
-    GRID_CHANNEL="cli"
-  elif [ -n "$SHAPE_ENV" ]; then
-    GRID_HOOK_OK=1
-    GRID_CHANNEL="env"
-  elif [ -n "$SHAPE_ARGNAMES" ] && [ "$TARGET_RUNNER" = "pytest" ]; then
-    GRID_HOOK_OK=1
-    GRID_CHANNEL="pytest"
-  fi
-  [ "$GRID_HOOK_OK" -eq 1 ] && GRID_CHANNEL_BASIS="declared-by-caller"
-fi
-jset_string "test_selection.grid_channel" "$GRID_CHANNEL"
-jset_string "test_selection.grid_channel_basis" "$GRID_CHANNEL_BASIS"
-# When no channel could even be named, say which of the several ways that happened applied. A
-# caller must be able to tell "I named nothing" from "I named something this runner cannot
-# deliver" -- and a limit of the validator must never be published as a property of the target.
-GRID_CHANNEL_REASON=""
-if [ -n "$GRID" ] && [ "$GRID_HOOK_OK" -ne 1 ]; then
-  if [ -z "$SHAPE_ARG" ] && [ -z "$SHAPE_ENV" ] && [ -z "$SHAPE_ARGNAMES" ]; then
-    GRID_CHANNEL_REASON="a grid was supplied but neither --shape-arg nor --shape-env named a channel to deliver it through"
-  else
-    GRID_CHANNEL_REASON="grid channel not established:"
-    if [ -n "$SHAPE_ARG" ] && [ "$TARGET_RUNNER" != "script" ]; then
-      GRID_CHANNEL_REASON="$GRID_CHANNEL_REASON --shape-arg '"'"'$SHAPE_ARG'"'"' was ignored because the target runs under $TARGET_RUNNER and the CLI channel is wired only for script targets (a validator limit, not a target property);"
-    fi
-    if [ -n "$SHAPE_ARGNAMES" ] && [ "$TARGET_RUNNER" != "pytest" ]; then
-      GRID_CHANNEL_REASON="$GRID_CHANNEL_REASON --shape-argnames needs a pytest target and this one runs under $TARGET_RUNNER;"
-    fi
-  fi
-fi
-jset_string "test_selection.grid_channel_reason" "$GRID_CHANNEL_REASON"
-# The grid used to be REQUIRED -- correctness_s1_grid was a required stage, so a run without one
-# topped out at INCONCLUSIVE. That is what made callers supply a grid whether or not they had
-# anything to say with it, and on ROCm/aiter#4538 the three requested shapes were all already in
-# the target's own default list: the "independent" grid re-ran a strict subset of the repository
-# run and the report credited it as new coverage.
-#
-# The answer at the time was to make the caller DECLARE what their cells covered and to refuse a
-# pass without the declaration -- more bookkeeping around a grid nobody wanted to supply. The
-# answer now is that the grid earns nothing. It is optional, it is not a required stage, and a
-# passing grid cannot move the verdict; only a FAILING one can, and a failure is a real defect
-# whether or not the cells were novel. A duplicate grid is then harmless rather than policed,
-# which is why the whole grid_independence vocabulary is gone: the error it guarded against is
-# no longer reachable.
-#
-# ---- Extra axes.
-#
-# A grid is one ordered tuple on one flag. A target whose remaining knobs are separate flags
-# -- head counts, dtypes, window modes -- cannot be gridded over them at all, so on aiter#4538
-# the kernel's assert at num_heads=16 was unreachable however the shape grid was spelled. An
-# axis is a name, a flag, and its values, and the caller supplies all three.
-#
-# Whether the target declares that flag is a reading of its source and is left to the caller.
-# What is NOT left to the caller is the proof: further down, every axis flag must be observed
-# REFUSING a deliberately invalid value before its values are allowed onto the grid run's
-# argv. A flag the target declares but ignores, or silently clamps, would otherwise let the
-# report claim coverage of head counts that never reached the kernel.
-AXIS_STATE="none"
-AXIS_STATE_REASON="no extra axes were requested"
-if [ "${#AXES[@]}" -gt 0 ]; then
-  # Record what was ASKED FOR before deciding whether it can be honoured. An empty `axes`
-  # beside a non-`none` axis_state loses the request itself: a reader could not see that a
-  # head-count axis had been requested and dropped -- which is precisely the silently
-  # narrowed test space this stage exists to make visible.
-  AXIS_REPORT=$(python3 - "${AXES[@]}" <<'PY'
-import json
-import sys
-
-axes = []
-for spec in sys.argv[1:]:
-    name, _, rest = spec.partition("=")
-    flag, _, values = rest.partition(":")
-    cells = [cell.strip() for cell in values.split(";") if cell.strip()]
-    entry = {
-        "name": name.strip(),
-        "flag": flag.strip(),
-        "values": cells,
-        # Filled in by the runtime refusal probe, which is the only thing that decides an
-        # axis is consumed. Until it runs, nothing here may be read as proof.
-        "hook_proof": "not-evaluated",
-    }
-    if not entry["name"] or not entry["flag"] or not cells:
-        entry["hook_proof"] = "malformed-axis-spec"
-    axes.append(entry)
-print(json.dumps(axes))
-PY
-)
-  AXIS_MALFORMED=$(python3 -c '
-import json
-import sys
-
-print(",".join(a["name"] or "(unnamed)" for a in json.loads(sys.argv[1])
-                if a["hook_proof"] == "malformed-axis-spec"))
-' "$AXIS_REPORT")
-  if [ -n "$AXIS_MALFORMED" ]; then
-    AXIS_STATE="malformed-spec"
-    AXIS_STATE_REASON="--axis wants name=--flag:v1;v2, and these do not parse: $AXIS_MALFORMED"
-  elif [ "$TARGET_RUNNER" != "script" ]; then
-    AXIS_STATE="unusable"
-    AXIS_STATE_REASON="extra axes ride argv, which reaches script targets only (this target runs under $TARGET_RUNNER)"
-  else
-    AXIS_STATE="declared"
-    AXIS_STATE_REASON="${#AXES[@]} axis/axes requested"
-    while IFS= read -r token; do
-      [ -n "$token" ] && AXIS_CLI+=("$token")
-    done < <(python3 -c '
-import json
-import sys
-
-for axis in json.loads(sys.argv[1]):
-    print(axis["flag"])
-    for value in axis["values"]:
-        print(value)
-' "$AXIS_REPORT")
-  fi
-fi
-jset_json "test_selection.axes" "$AXIS_REPORT"
-jset_string "test_selection.axis_state" "$AXIS_STATE"
-jset_string "test_selection.axis_state_reason" "$AXIS_STATE_REASON"
-
 # Runs the selected target once, whatever its runner is -- the name predates script targets.
-# The second argument is the grid VALUE, not an env assignment: the channel is decided by
-# the channel that probed positive. It used to take "$SHAPE_ENV=$GRID" and re-split on the
-# first `=`, which
-# worked for a CLI-only run only because an unset SHAPE_ENV left a leading `=` that the split
-# then removed -- the shapes were travelling inside a string shaped like the channel they were
-# not using.
 run_pytest() {
   local label="$1"
-  local grid_value="$2"
   local log="$WORK/$TARGET_RUNNER-$label.log"
   local phase=${label%%-*}
   local cache_root="$WORK/$phase"
   local junit="$cache_root/junit-$label.xml"
-  # Per LABEL, not per phase. head-repo and head-grid share a phase directory, so a grid run
-  # that died during collection overwrote the receipt head-repo had already written and the
-  # report claimed the route never executed -- erasing evidence that had been collected.
+  # Per LABEL, not per phase. Two runs sharing a phase directory would otherwise have the
+  # second overwrite the receipt the first had already written, and the report would claim
+  # the route never executed -- erasing evidence that had been collected.
   local receipt="$cache_root/execution-receipt-$label.json"
   mkdir -p "$cache_root/home" "$cache_root/xdg-cache" \
     "$cache_root/flydsl-cache" "$cache_root/triton-cache" \
@@ -1226,56 +1035,13 @@ run_pytest() {
     "AITER_JIT_DIR=$cache_root/aiter-jit"
     "VALIDATION_PHASE=$label"
   )
-  # The pytest channel needs its plugin generated per run, with the grid baked in, so the
-  # tested PR can neither read nor forge it.
-  local -a shape_plugin=()
-  if [ "$GRID_CHANNEL" = "pytest" ] && [ -n "$grid_value" ]; then
-    local _grid_value="$grid_value"
-    # Remove first: a generator that fails must not leave the PREVIOUS phase's plugin in
-    # place, or the next phase silently re-runs the grid it was carrying.
-    rm -f "$PROBE_DIR/${PROBE_MODULE}_shapes.py"
-    python3 "$TARGET_TOOL" shape-plugin "$SCRIPT_DIR/shape_grid_plugin.py" \
-      "$PROBE_DIR/${PROBE_MODULE}_shapes.py" "$SHAPE_ARGNAMES" "$_grid_value"
-    if [ ! -s "$PROBE_DIR/${PROBE_MODULE}_shapes.py" ]; then
-      echo "shape plugin generation failed for $label" >&2
-      printf '%s|%s\n' 2 "$log"
-      return 0
-    fi
-    shape_plugin=(-p "${PROBE_MODULE}_shapes")
-    # The plugin now carries the grid; nothing may also send it on argv or in the env.
-    grid_value=""
-  fi
-  local -a shape_cli=()
-  # Dispatch on the channel that actually probed positive, not on "--shape-arg was supplied".
-  # With both flags given and only the env channel real, the old condition still routed the
-  # grid through the CLI flag the target does not parse.
-  if [ -n "$grid_value" ] && [ "$GRID_CHANNEL" = "cli" ]; then
-    shape_cli=("$SHAPE_ARG")
-    local _old_ifs="$IFS"
-    IFS=';'
-    for _shape in $grid_value; do
-      [ -n "$_shape" ] && shape_cli+=("$_shape")
-    done
-    IFS="$_old_ifs"
-  elif [ -n "$grid_value" ] && [ "$GRID_CHANNEL" = "env" ]; then
-    environment+=("$SHAPE_ENV=$grid_value")
-  fi
-  # Extra axes ride on the same argv as the shape grid, so the run that carries the grid is
-  # the run that carries the axes and one receipt describes both. AXIS_CLI_OVERRIDE exists
-  # only for the per-axis refusal probes, which must send one deliberately invalid value and
-  # nothing else.
-  if [ "${#AXIS_CLI_OVERRIDE[@]}" -gt 0 ]; then
-    shape_cli+=("${AXIS_CLI_OVERRIDE[@]}")
-  elif [ -n "$grid_value" ] && [ "${#AXIS_CLI[@]}" -gt 0 ] \
-      && [ "$GRID_CHANNEL" = "cli" ]; then
-    shape_cli+=("${AXIS_CLI[@]}")
-  fi
+  # A script target is invoked bare: the shapes it runs are its own, and the validator has
+  # nothing to add to its argv.
   if [ "$TARGET_RUNNER" = "pytest" ]; then
     (
       cd "$REPO_WT" \
         && env -i "${TARGET_BASE_ENV[@]}" "${environment[@]}" timeout "$TIMEOUT" \
-          "$TARGET_PYTHON" -m pytest -p "$PROBE_MODULE" "${shape_plugin[@]}" \
-            "$TESTS" -x -q \
+          "$TARGET_PYTHON" -m pytest -p "$PROBE_MODULE" "$TESTS" -x -q \
             --junitxml="$junit" -o "cache_dir=$cache_root/pytest-cache"
     ) >"$log" 2>&1
   elif [ -n "$EXPECTED_ROUTE" ]; then
@@ -1283,13 +1049,13 @@ run_pytest() {
       cd "$REPO_WT" \
         && env -i "${TARGET_BASE_ENV[@]}" "${environment[@]}" timeout "$TIMEOUT" \
           "$TARGET_PYTHON" "$SCRIPT_DIR/run_script_with_probe.py" \
-            "$PROBE_MODULE" "$TEST_FILE" "${shape_cli[@]}"
+            "$PROBE_MODULE" "$TEST_FILE"
     ) >"$log" 2>&1
   else
     (
       cd "$REPO_WT" \
         && env -i "${TARGET_BASE_ENV[@]}" "${environment[@]}" timeout "$TIMEOUT" \
-          "$TARGET_PYTHON" "$TEST_FILE" "${shape_cli[@]}"
+          "$TARGET_PYTHON" "$TEST_FILE"
     ) >"$log" 2>&1
   fi
   local result=$?
@@ -1427,13 +1193,8 @@ target_stats() {
   fi
 }
 
-# The grid receipt is preferred when it proves the route, because it is the run that
-# exercised the injected shapes; otherwise the repository run's receipt stands. A phase that
-# observed nothing never speaks over one that observed something.
 head_receipt() {
-  python3 "$TARGET_TOOL" pick-receipt \
-    "$WORK/head/execution-receipt-head-grid.json" \
-    "$WORK/head/execution-receipt-head-repo.json"
+  printf '%s\n' "$WORK/head/execution-receipt-head-repo.json"
 }
 
 # ---------- credential-free execution isolation ----------
@@ -1457,7 +1218,7 @@ GPU_REQUIREMENT="required"
 GPU_REQUIREMENT_BASIS="a GPU was claimed, so whether the target can run without one was never probed; 'required' here is the conservative default, not an observation"
 if [ -z "$PICK" ]; then
   if [ "$RUNTIME_OK" -eq 1 ] && [ "$TARGET_RUNNER" != "none" ]; then
-    GPUFREE_RESULT=$(run_pytest "gpufree-probe" "")
+    GPUFREE_RESULT=$(run_pytest "gpufree-probe")
     GPUFREE_RC=${GPUFREE_RESULT%%|*}
     GPUFREE_LOG=${GPUFREE_RESULT##*|}
     GPUFREE_STATS=$(target_stats "gpufree-probe" "$GPUFREE_RC")
@@ -1534,14 +1295,10 @@ fi
 BASE_REPO_STATE="not-run"
 BASE_REPO_RC=""
 BASE_REPO_LOG=""
-BASE_GRID_STATE="not-run"
-BASE_GRID_RC=""
-BASE_GRID_LOG=""
 
 if [ "$CAN_TEST" -eq 0 ]; then
   stage_note "baseline_control" "skip" "$SKIP_REASON"
   stage_note "correctness_repo_tests" "skip" "$SKIP_REASON"
-  stage_note "correctness_s1_grid" "skip" "$SKIP_REASON"
   stage_note "execution_receipt" "skip" "$SKIP_REASON"
   finding "note" "correctness" "$SKIP_REASON; this report makes no correctness claim"
 else
@@ -1574,7 +1331,7 @@ else
 
     if [ "$BASE_READY" -eq 1 ]; then
       if [ -f "$REPO_WT/$TEST_FILE" ]; then
-        BASE_RESULT=$(run_pytest "base-repo" "")
+        BASE_RESULT=$(run_pytest "base-repo")
         BASE_REPO_RC=${BASE_RESULT%%|*}
         BASE_REPO_LOG=${BASE_RESULT##*|}
         BASE_REPO_STATS=$(target_stats "base-repo" "$BASE_REPO_RC")
@@ -1661,40 +1418,6 @@ else
         done
         PERF_TARGET="${PERF_TARGETS[0]}"
       fi
-      if [ "$GRID_HOOK_OK" -eq 1 ]; then
-        if [ -f "$REPO_WT/$TEST_FILE" ]; then
-          BASE_PROBE_RESULT=$(run_pytest \
-            "base-grid-probe" "__VALIDATOR_INVALID_GRID__")
-          BASE_PROBE_RC=${BASE_PROBE_RESULT%%|*}
-          BASE_PROBE_LOG=${BASE_PROBE_RESULT##*|}
-          # A non-zero probe exit is only evidence that the GRID was consumed when the same
-          # target succeeds without it. On a held-out PR whose module could not be imported at
-          # all, the probe failed for that reason and the channel was credited although no
-          # shape ever reached the kernel. Require the unpoisoned baseline run to have passed.
-          if [ "$BASE_PROBE_RC" -eq 0 ] || [ "${BASE_REPO_RC:-1}" -ne 0 ]; then
-            BASE_GRID_STATE="hook-not-consumed"
-          else
-            BASE_GRID_RESULT=$(run_pytest "base-grid" "$GRID")
-            BASE_GRID_RC=${BASE_GRID_RESULT%%|*}
-            BASE_GRID_LOG=${BASE_GRID_RESULT##*|}
-            BASE_GRID_STATS=$(target_stats "base-grid" "$BASE_GRID_RC")
-            if [ "$BASE_GRID_RC" -eq 0 ] \
-                && [ "$(stats_field "$BASE_GRID_STATS" executed)" -eq 0 ]; then
-              BASE_GRID_STATE="all-skipped"
-            else
-              BASE_GRID_STATE="ran"
-            fi
-          fi
-        else
-          BASE_GRID_STATE="target-not-present"
-        fi
-      elif [ -n "$GRID" ]; then
-        # Not "hook-not-found": nothing was looked for. A grid was requested and no channel
-        # was declared to carry it.
-        BASE_GRID_STATE="no-channel-declared"
-      else
-        BASE_GRID_STATE="not-configured"
-      fi
       if [ -n "$(git -C "$REPO_WT" status --porcelain --untracked-files=all)" ]; then
         BASE_READY=0
       fi
@@ -1721,42 +1444,19 @@ else
     else
       [ -n "${BASE_REPO_STATS:-}" ] || \
         BASE_REPO_STATS='{"tests":0,"failures":0,"errors":0,"skipped":0,"executed":0}'
-      [ -n "${BASE_GRID_STATS:-}" ] || \
-        BASE_GRID_STATS='{"tests":0,"failures":0,"errors":0,"skipped":0,"executed":0}'
       python3 - "$JSON" "$BASE_REPO_STATE" "${BASE_REPO_RC:-}" \
-        "$BASE_REPO_LOG" "$BASE_REPO_STATS" "$BASE_GRID_STATE" \
-        "${BASE_GRID_RC:-}" "$BASE_GRID_LOG" "$BASE_GRID_STATS" \
-        "${BASE_PROBE_RC:-}" "${BASE_PROBE_LOG:-}" <<'PY'
+        "$BASE_REPO_LOG" "$BASE_REPO_STATS" <<'PY'
 import json
 import sys
 
-(
-    path,
-    repo_state,
-    repo_exit,
-    repo_log,
-    repo_stats,
-    grid_state,
-    grid_exit,
-    grid_log,
-    grid_stats,
-    probe_exit,
-    probe_log,
-) = sys.argv[1:12]
+path, repo_state, repo_exit, repo_log, repo_stats = sys.argv[1:6]
 stage = {
     "status": "pass",
     "repo_tests": {"state": repo_state, "stats": json.loads(repo_stats)},
-    "s1_grid": {"state": grid_state, "stats": json.loads(grid_stats)},
 }
 if repo_exit:
     stage["repo_tests"]["exit"] = int(repo_exit)
     stage["repo_tests"]["log"] = repo_log
-if grid_exit:
-    stage["s1_grid"]["exit"] = int(grid_exit)
-    stage["s1_grid"]["log"] = grid_log
-if probe_exit:
-    stage["s1_grid"]["hook_probe_exit"] = int(probe_exit)
-    stage["s1_grid"]["hook_probe_log"] = probe_log
 data = json.load(open(path))
 data["stages"]["baseline_control"] = stage
 json.dump(data, open(path, "w"), indent=2)
@@ -1768,7 +1468,7 @@ PY
   fi
 
   if [ "$CAN_TEST" -eq 1 ]; then
-    HEAD_RESULT=$(run_pytest "head-repo" "")
+    HEAD_RESULT=$(run_pytest "head-repo")
     HEAD_RC=${HEAD_RESULT%%|*}
     HEAD_LOG=${HEAD_RESULT##*|}
     HEAD_STATS=$(target_stats "head-repo" "$HEAD_RC")
@@ -1832,268 +1532,36 @@ PY
         run_perf_repeats head "$PERF_SLOT"
         PERF_HEAD_RCS[$PERF_SLOT]=$PERF_RUN_RC
         PERF_HEAD_LOGS_JOINED[$PERF_SLOT]=$(printf '%s\n' "${PERF_RUN_LOGS[@]}")
-        # Symmetric with base: the grid run and the caller's worktree both follow this point,
-        # and neither should inherit a results file the timing run happened to drop.
+        # Symmetric with base: the next slot's run and the caller's worktree both follow this
+        # point, and neither should inherit a results file the timing run happened to drop.
         perf_restore head
       done
       PERF_TARGET="${PERF_TARGETS[0]}"
     fi
 
 
-    # Same causality requirement as the base side: a probe that fails because the target
-    # is broken proves nothing about the grid. On a held-out PR whose module could not be
-    # imported at all, the probe's non-zero exit credited the channel although no shape
-    # ever reached the kernel. Require the unpoisoned head run to have passed first.
-    if [ "$GRID_HOOK_OK" -eq 1 ] && [ "${HEAD_RC:-1}" -eq 0 ]; then
-      HEAD_PROBE_RESULT=$(run_pytest \
-        "head-grid-probe" "__VALIDATOR_INVALID_GRID__")
-      HEAD_PROBE_RC=${HEAD_PROBE_RESULT%%|*}
-      HEAD_PROBE_LOG=${HEAD_PROBE_RESULT##*|}
-      if [ "$HEAD_PROBE_RC" -eq 0 ]; then
-        # State what was observed, and do not assign it to a party. The target ran unchanged
-        # with a deliberately invalid grid, which happens both when the caller named a channel
-        # this target does not have and when the target has it and ignores it. Naming the
-        # target as the one that "ignores" the channel publishes a caller's mistake as a
-        # property of someone's code.
-        stage_note "correctness_s1_grid" "skip" \
-          "the declared $GRID_CHANNEL channel was not consumed: the target ran unchanged with a deliberately invalid grid, so either it does not read what --shape-$GRID_CHANNEL named or it ignores it; either way no shape reached the kernel"
-        stage_note "execution_receipt" "skip" \
-          "shape-grid runtime handshake failed on $GRID_CHANNEL"
-        jset_json "stages.correctness_s1_grid.hook_probe_exit" "$HEAD_PROBE_RC"
-        jset_string "stages.correctness_s1_grid.hook_probe_log" "$HEAD_PROBE_LOG"
-        finding "note" "correctness" \
-          "the selected target passes an invalid shape-grid probe, so grid consumption is unproven"
-      else
-        # Every requested axis must be observed REFUSING an invalid value before its values
-        # are allowed onto the grid run's argv. Without this an axis flag the target declares
-        # but ignores -- or one whose value it silently clamps -- would let the report claim
-        # coverage of head counts or dtypes that never reached the kernel. An axis that fails
-        # the probe is dropped from the run and named in the report; it is never dropped
-        # quietly, because a silently narrowed test space is the failure this stage exists to
-        # prevent.
-        if [ "$AXIS_STATE" = "declared" ]; then
-          AXIS_REFUSED_OK=1
-          AXIS_PROBE_FAILED=""
-          for _axis_flag in $(python3 -c '
-import json
-import sys
-
-for axis in json.loads(sys.argv[1]):
-    print(axis["flag"])
-' "$AXIS_REPORT"); do
-            AXIS_CLI_OVERRIDE=("$_axis_flag" "__VALIDATOR_INVALID_AXIS__")
-            AXIS_PROBE_RESULT=$(run_pytest "head-axisprobe" "")
-            AXIS_CLI_OVERRIDE=()
-            if [ "${AXIS_PROBE_RESULT%%|*}" -eq 0 ]; then
-              AXIS_REFUSED_OK=0
-              AXIS_PROBE_FAILED="$AXIS_PROBE_FAILED $_axis_flag"
-            fi
-          done
-          if [ "$AXIS_REFUSED_OK" -eq 1 ]; then
-            AXIS_STATE="proven"
-            AXIS_STATE_REASON="every axis flag rejected a deliberately invalid value"
-          else
-            AXIS_STATE="hook-not-consumed"
-            AXIS_STATE_REASON="these axis flags accepted a deliberately invalid value, so the target does not consume them:$AXIS_PROBE_FAILED"
-            AXIS_CLI=()
-            finding "note" "correctness" \
-              "requested test axes were dropped: $AXIS_STATE_REASON"
-          fi
-          # `hook_proof` carries the probe's own verdict per axis. It used to hold a
-          # structural reading of the target's source, which said nothing about whether the
-          # value arrived; the only evidence that ever counted is this refusal.
-          AXIS_REPORT=$(python3 -c '
-import json
-import sys
-
-failed = set(sys.argv[2].split())
-axes = json.loads(sys.argv[1])
-for axis in axes:
-    axis["hook_proof"] = (
-        "accepted-invalid-value" if axis["flag"] in failed else "refused-invalid-value"
-    )
-print(json.dumps(axes))
-' "$AXIS_REPORT" "$AXIS_PROBE_FAILED")
-          jset_json "test_selection.axes" "$AXIS_REPORT"
-          jset_string "test_selection.axis_state" "$AXIS_STATE"
-          jset_string "test_selection.axis_state_reason" "$AXIS_STATE_REASON"
-        fi
-        HEAD_GRID_RESULT=$(run_pytest "head-grid" "$GRID")
-        HEAD_GRID_RC=${HEAD_GRID_RESULT%%|*}
-        HEAD_GRID_LOG=${HEAD_GRID_RESULT##*|}
-        HEAD_GRID_STATS=$(target_stats "head-grid" "$HEAD_GRID_RC")
-        HEAD_GRID_EXECUTED=$(stats_field "$HEAD_GRID_STATS" executed)
-        python3 - "$JSON" "$HEAD_GRID_RC" "$GRID" "$HEAD_GRID_LOG" \
-          "$HEAD_GRID_STATS" "$HEAD_PROBE_RC" "$HEAD_PROBE_LOG" \
-          "$GRID_CHANNEL" "${HEAD_RC:-1}" <<'PY'
-import json
-import sys
-
-(
-    path,
-    exit_code,
-    grid,
-    log,
-    raw_stats,
-    probe_exit,
-    probe_log,
-    channel,
-    repo_exit_code,
-) = sys.argv[1:10]
-data = json.load(open(path))
-stats = json.loads(raw_stats)
-status = "fail" if int(exit_code) else ("pass" if stats["executed"] else "skip")
-note = ""
-if status == "skip":
-    note = "shape-grid target completed with no executed tests"
-# A grid run that fails without its receipt observing ANY routed work never reached the code
-# under test. That happens when the declared channel does not exist -- an unknown flag, a
-# parametrization naming an argument no test takes -- and it also happens when the grid asked for
-# a shape that crashes before the kernel runs, which is the grid doing its job. Nothing in the
-# evidence separates those two, so the status stays "fail" and the report says both are possible;
-# what does NOT happen is charging it to the author as a blocker, below.
-if status == "fail" and stats.get("observed_work") == 0 and int(repo_exit_code) == 0:
-    note = (
-        f"the grid run failed without its execution receipt observing any call to the routed "
-        f"work that the repository run reached, so the kernel was never seen failing on these "
-        f"shapes; a declared '{channel}' channel this target does not have and a shape that "
-        f"crashes before the route both look exactly like this"
-    )
-# A "pass" here is recorded and earns nothing: this stage is not required, so its status cannot
-# complete a verdict, and the only thing a duplicate grid's pass would prove is that the
-# repository run passed -- which correctness_repo_tests already said. A "fail" is the direction
-# that carries weight, and it carries it whatever the cells were.
-data["stages"]["correctness_s1_grid"] = {
-    "status": status,
-    "exit": int(exit_code),
-    "grid": grid,
-    "log": log,
-    "stats": stats,
-    "hook_probe_exit": int(probe_exit),
-    "hook_probe_log": probe_log,
-}
-if note:
-    data["stages"]["correctness_s1_grid"]["note"] = note
-json.dump(data, open(path, "w"), indent=2)
-PY
-        mark_runtime_coverage "$HEAD_GRID_STATS" "$TARGET_RUNNER" "$HEAD_GRID_LOG"
-        if [ "$HEAD_GRID_RC" -eq 0 ] && [ "$HEAD_GRID_EXECUTED" -eq 0 ]; then
-          finding "note" "correctness" \
-            "shape-grid target executed no tests; no grid claim is made"
-        elif [ "$HEAD_GRID_RC" -ne 0 ]; then
-          GRID_EXCERPT=$(log_excerpt "$HEAD_GRID_LOG")
-          # A blocker says "this PR is broken". When the grid run's own receipt observed no
-          # call to the routed work that the repository run DID reach, the kernel was never
-          # seen failing on these shapes -- the run stopped before it got there. That is not
-          # enough to charge anyone, and a mistyped --shape-arg reaches this line looking
-          # exactly like a real defect.
-          if [ "$(stats_field "$HEAD_GRID_STATS" observed_work)" = "0" ] \
-              && [ "$(stats_field "$HEAD_STATS" observed_work)" != "0" ]; then
-            finding "note" "correctness" \
-              "the independent shape grid failed without reaching the routed work the repository run reached, so no defect is attributed: $GRID_EXCERPT"
-          elif [ -z "$PATCHF" ]; then
-            finding "blocker" "correctness" \
-              "the independent shape grid fails on the supplied head checkout: $GRID_EXCERPT"
-          elif [ "$BASE_GRID_STATE" = "target-not-present" ]; then
-            finding "blocker" "correctness" \
-              "the PR adds this target and its independent shape grid fails: $GRID_EXCERPT"
-          elif [ "$BASE_GRID_STATE" = "ran" ] && [ "$BASE_GRID_RC" -eq 0 ]; then
-            finding "blocker" "correctness" \
-              "the independent shape grid passes on base and fails on head: $GRID_EXCERPT"
-          else
-            finding "note" "correctness" \
-              "the independent grid is red on both baseline and head; attribution is inconclusive"
-          fi
-        fi
-        # The grid's OWN receipt, not whichever head run wrote last. The grid exists to be a
-        # positive control against re-reporting the repo-default run under a second stage
-        # name; reading a shared receipt made that control unfalsifiable, because a receipt
-        # written by the default run satisfies --grid whenever the grid shapes are a subset
-        # of the target's own defaults.
-        RECEIPT_JSON=$(
-          python3 "$SCRIPT_DIR/validate_evidence.py" receipt \
-            "$(head_receipt)" \
-            --expected-route "$EXPECTED_ROUTE" --grid "$GRID" \
-            --grid-channel "$GRID_CHANNEL"
-        )
-        jset_json "stages.execution_receipt" "$RECEIPT_JSON"
-        jset_string "stages.execution_receipt.receipt_scope" \
-          "the head-grid run only; the head-repo run has its own receipt"
-        RECEIPT_STATUS=$(python3 - "$RECEIPT_JSON" <<'PY'
-import json
-import sys
-
-print(json.loads(sys.argv[1])["status"])
-PY
-)
-        if [ "$RECEIPT_STATUS" != "pass" ]; then
-          finding "note" "execution_receipt" \
-            "route/shape execution receipt was not established; PASS is not permitted"
-        fi
+    # The receipt describes the target's own run, which is the only run there is. It answers
+    # one question -- did the changed code actually execute -- and a green suite that never
+    # reached the route is the failure it exists to catch.
+    if [ -n "$EXPECTED_ROUTE" ] && [ -f "$(head_receipt)" ]; then
+      RECEIPT_JSON=$(
+        python3 "$SCRIPT_DIR/validate_evidence.py" receipt \
+          "$(head_receipt)" --expected-route "$EXPECTED_ROUTE"
+      )
+      jset_json "stages.execution_receipt" "$RECEIPT_JSON"
+      jset_string "stages.execution_receipt.receipt_scope" "the head-repo run"
+      RECEIPT_STATUS=$(python3 -c \
+        'import json,sys; print(json.loads(sys.argv[1])["status"])' "$RECEIPT_JSON")
+      if [ "$RECEIPT_STATUS" != "pass" ]; then
+        finding "note" "execution_receipt" \
+          "route execution receipt was not established; PASS is not permitted"
       fi
-    elif [ -n "$SHAPE_ENV" ] && [ -n "$GRID" ]; then
-      stage_note "correctness_s1_grid" "skip" \
-        "configured shape environment variable is not referenced by the target"
-      if [ -n "$EXPECTED_ROUTE" ] && [ -f "$(head_receipt)" ]; then
-        RECEIPT_JSON=$(
-          python3 "$SCRIPT_DIR/validate_evidence.py" receipt \
-            "$(head_receipt)" \
-            --expected-route "$EXPECTED_ROUTE" --grid "" --grid-channel ""
-        )
-        jset_json "stages.execution_receipt" "$RECEIPT_JSON"
-        jset_string "stages.execution_receipt.receipt_scope" \
-          "the head-repo run only; no grid run took place"
-        RECEIPT_STATUS=$(python3 -c \
-          'import json,sys; print(json.loads(sys.argv[1])["status"])' "$RECEIPT_JSON")
-        if [ "$RECEIPT_STATUS" != "pass" ]; then
-          finding "note" "execution_receipt" \
-            "route execution receipt was not established; PASS is not permitted"
-        fi
-      else
-        stage_note "execution_receipt" "skip" \
-          "shape-grid hook was not established and no route was supplied"
-      fi
-      finding "note" "correctness" \
-        "the selected target does not consume the configured shape-grid hook"
     else
-      # A skip must describe what was actually found. "kernel exposes no configured shape
-      # override" reads as a property of the target even when the real cause is that the
-      # validator ignored the channel the caller named -- which is a capability gap wearing a
-      # skip's costume, the exact failure this skill exists to prevent.
-      if [ -n "$GRID_CHANNEL_REASON" ]; then
-        stage_note "correctness_s1_grid" "skip" \
-          "$GRID_CHANNEL_REASON; coverage is repo-default-only"
-      elif [ -z "$GRID" ]; then
-        stage_note "correctness_s1_grid" "skip" \
-          "no --grid was supplied, so no independent shape coverage was attempted; coverage is repo-default-only"
-      else
-        stage_note "correctness_s1_grid" "skip" \
-          "kernel exposes no configured shape override; coverage is repo-default-only"
-      fi
-      if [ -n "$EXPECTED_ROUTE" ] && [ -f "$(head_receipt)" ]; then
-        RECEIPT_JSON=$(
-          python3 "$SCRIPT_DIR/validate_evidence.py" receipt \
-            "$(head_receipt)" \
-            --expected-route "$EXPECTED_ROUTE" --grid "" --grid-channel ""
-        )
-        jset_json "stages.execution_receipt" "$RECEIPT_JSON"
-        RECEIPT_STATUS=$(python3 -c \
-          'import json,sys; print(json.loads(sys.argv[1])["status"])' "$RECEIPT_JSON")
-        if [ "$RECEIPT_STATUS" != "pass" ]; then
-          finding "note" "execution_receipt" \
-            "route execution receipt was not established; PASS is not permitted"
-        fi
-      else
-        stage_note "execution_receipt" "skip" \
-          "no shape grid was configured and no route was supplied"
-      fi
-      finding "note" "correctness" \
-        "no independent shape-grid hook was configured; coverage is limited to repository defaults"
+      stage_note "execution_receipt" "skip" \
+        "no route was supplied, so nothing observed which work the target reached"
     fi
   else
     stage_note "correctness_repo_tests" "skip" \
-      "candidate patch was not restored after baseline control"
-    stage_note "correctness_s1_grid" "skip" \
       "candidate patch was not restored after baseline control"
     stage_note "execution_receipt" "skip" \
       "candidate patch was not restored after baseline control"
@@ -2158,8 +1626,8 @@ fi
 # ---- perf stage.
 #
 # Emitted last because it is the only stage needing results from both the baseline phase and
-# the head phase. It is deliberately NOT in finish_report's required-stage set -- the same
-# footing the shape grid now stands on: `complete` is computed from the required stages alone,
+# the head phase. It is deliberately NOT in finish_report's required-stage set: `complete` is
+# computed from the required stages alone,
 # so a perf run that could not happen downgrades nothing and a PASS stays a PASS. What it can
 # do is append a should-fix finding, which
 # finish_report turns into NEEDS_WORK and exit 1 -- a measured regression is a real result,

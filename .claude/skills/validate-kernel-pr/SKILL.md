@@ -58,7 +58,7 @@ boundary, whatever the file layout.)
 | `report.py init \| set \| stage \| finding \| coverage \| finish` | the report itself. `finish` computes the verdict from the stages actually recorded, validates against `report_schema.json`, and is the **sole** writer of `verdict` and of the process exit code. |
 | `pick-idle-gpu.py` | the sampling window that decides a GPU is idle, and the `idleness-basis:` line saying how it knows. |
 | `gpu_probe.py` | which device the run actually holds — arch, BDF, activity — asked of amd-smi, never turning an unreadable reading into an idle one. |
-| `target_run.py` | the decisions around one target run: what goes into the receipt probe, how a grid cell becomes a Python value, what a script target's exit code may be counted as, and which environment variables the target is allowed to see. |
+| `target_run.py` | the decisions around one target run: what goes into the receipt probe, what a script target's exit code may be counted as, and which environment variables the target is allowed to see. |
 | `scrape_perf.py` | everything around a timing run except the run: which harness the target exposes, how a benchmark's rows become comparable numbers, whether a cross-tree difference is attributable to the patch, and what a timing run is allowed to have left in the worktree. |
 | `scan_index_width.py` | the 32-bit index-width scan. |
 
@@ -106,8 +106,6 @@ gh pr diff "$PR" --repo "$REPO" > "/tmp/pr-$PR.patch"
     --runner pytest --runner-reason "the file is a pytest module the PR ships" \
     --expected-route kernels.softmax_kernel:build_softmax_module \
     --shape-vars M,N,dtype_str \
-    --shape-env ROCDSL_SOFTMAX_SHAPES \
-    --grid "64,2048,f32;64,2000,f32" \
     --tol-table "f32=1e-5,f16=2e-3,bf16=1e-2" \
     --out validation_report.json
 ```
@@ -124,10 +122,7 @@ variable (next section).
 | `--no-target` | the reason you looked and found none. Publishes a **blocker**, not a skip — see below |
 | `--runner` `--runner-reason` | `pytest`, `script`, or `none`, and **why** — you read the target, the validator does not check you. `none` means you have decided nothing here is runnable |
 | `--expected-route` | the `module:function` the profiler must observe; without it there is no receipt and no observed work |
-| `--shape-vars` | local names captured at each route call, in grid order |
-| `--shape-env` \| `--shape-arg` \| `--shape-argnames` | how the grid reaches the target: an env var it reads, its own CLI flag, or the `parametrize` names to replace |
-| `--grid` | optional extra cells the target's own shapes miss. A passing grid earns no verdict; only a failing one is a finding |
-| `--axis` | repeatable `NAME=--flag:v1;v2` — an independent axis that is not a shape |
+| `--shape-vars` | local names to capture at each route call, in the order the route takes them. A **reading** of the run, not an injection into it |
 | `--tol-table` | tolerances recorded alongside the comparison |
 | `--perf-args` \| `--no-perf` | force the timing entry point, or skip timing entirely |
 | `--perf-target` | the file to **time**, when that is not the file to run. Defaults to `--target`'s file |
@@ -304,15 +299,36 @@ are coverage context — record them, they tell a reviewer what this suite never
 rows *this change* disabled produce `NEEDS_WORK`. The distinction matters because the pre-existing
 ones are usually numerous and would drown the one that is actually the PR's doing.
 
-A disabled row is also the clearest case for reaching past the target's own shapes with `--grid`:
-the row tells you exactly which input stopped being covered. That is an answer to a disabled row,
-not a substitute for noticing one.
+A disabled row is a finding in its own right, and it is the one shape fact the validator can
+establish without running anything: the row names exactly which input stopped being covered, and
+the diff is proof the PR is what stopped covering it.
 
-### 5 — `correctness` — the target, and optionally shapes it does not run
+### 5 — `correctness` — the target's own run
 
-The target's own run is the evidence. An extra shape grid can be layered on top of it, reported
-separately, because the interesting case is when the two disagree — but only the target's run
-can earn a verdict.
+The target's own run is the evidence, and it is all of it. The validator does not synthesise
+shapes the target never ran.
+
+That is a deliberate retreat. There used to be an injection layer here: the caller supplied a
+`--grid` of extra cells, named one of three channels to deliver them through (an env var the
+target read, its own CLI flag, or the `parametrize` names to substitute), and a sentinel probe
+re-ran the target with a deliberately invalid grid to prove the channel was really consumed.
+The machinery was sound — the probe in particular, which is the only honest way to tell a channel
+that works from a flag the target silently ignores.
+
+What it could not survive was being **optional and unrewarded at the same time**. It had to be
+optional: while a missing grid capped the verdict at `INCONCLUSIVE`, every caller supplied one
+whether or not they had anything to say with it, and on ROCm/aiter#4538 the "independent" grid
+re-ran a strict subset of the target's own default shapes and was credited as new coverage. But
+once optional, a passing grid earned nothing and only a failing one could move a verdict — so the
+whole apparatus existed to occasionally produce a blocker that the caller had to hand-configure a
+channel, a flag and a cell list to reach. That is a lot of surface for a capability nobody is
+obliged to use, on a skill whose value is supposed to be in its prose.
+
+**What replaces it is you.** If the target's shapes are all powers of two and the diff touches a
+tail mask, that is a finding you write — "this suite cannot see the tail path this PR changes" —
+not a run you configure. It costs the report a `blocker` it might have earned automatically, and
+it buys back the several hundred lines that stood between a reviewer and the two questions this
+stage actually answers: did the target run, and did the changed code execute.
 
 #### Choosing how to run the target
 
@@ -377,112 +393,6 @@ on base, not a pre-existing failure. Any leftover artifact, any reverse/reapply 
 bleed aborts the head run into `INCONCLUSIVE` — a baseline you cannot trust makes the comparison
 worthless in the direction that clears the PR.
 
-#### The grid
-
-Cover three classes the PR's own tests routinely miss:
-
-| class | why |
-|---|---|
-| non-toy | `M=1` / `M=16` only is the standard agent-generated test |
-| boundary / odd | odd N, N not a multiple of the tile — where tail masks fail |
-| long-context / large M | where 32-bit index arithmetic wraps |
-
-Then decide how the grid reaches the target. These are alternatives — pick the one the target
-actually has, and say what in the source told you so:
-
-| the target takes its shapes from | what to look for |
-|---|---|
-| an environment variable | the source reads that name via `os.getenv` / `os.environ` |
-| its own CLI flag | the source passes that flag literal to `add_argument` |
-| `@pytest.mark.parametrize` literals | the source binds those names as test parameters; the shipped plugin replaces them |
-
-The third channel exists because the first two require the target to have been *written* for a
-validator. Zero of the seven files in aiter's `op_tests/flydsl_tests/` expose an env var or a shape
-flag; every one declares shapes as parametrize literals. Four consecutive real FlyDSL kernel PRs
-reached `INCONCLUSIVE` for that reason alone — back when a missing grid capped the verdict — and
-the skip text blamed the kernel for a limit that belonged to the injector. The verdict no longer
-turns on it, but the diagnostic still has to name the injector rather than the target.
-
-**You name the channel; the validator does not read the file to check you.** It records
-`grid_channel_basis: declared-by-caller`, because your naming it is a claim, not a measurement.
-
-**Reading the source is never enough to credit the channel.** Re-run the target with a
-deliberately invalid grid and require it to **fail**. A target that passes with garbage shapes is
-not consuming the grid — whatever the source looked like — so the stage is `skip`, never credited.
-This one probe is what makes every channel equally trustworthy, and it is the *only* thing that
-credits one, so it is where a channel you named wrongly gets caught.
-
-It catches the quiet case: a name the target ignores changes nothing, the invalid grid passes, and
-the stage skips. The loud case it cannot resolve — a flag the target does not define makes argparse
-exit non-zero, which looks exactly like a grid that found a shape the kernel crashes on. Nothing in
-the evidence tells those apart, so the run does not guess: the grid stays `fail`, the note names
-both possibilities, and **no blocker is charged**, because a receipt that observed no call to the
-routed work never saw the author's code fail at all. Check the flag yourself before you name it;
-the run will not do it for you.
-
-With no channel at all the stage is `skip`, and that is now just a skip: the verdict is unaffected,
-because the grid is not a required stage. Say `repo-default-only` rather than claim coverage that
-does not exist — the report should show that the target's own shapes were all that ran.
-
-#### The grid earns nothing, and that is what makes it safe
-
-`correctness_s1_grid` is **not a required stage**, and a passing grid cannot complete a verdict.
-Only a *failing* one moves anything, and a failure is a real defect whether or not the cells were
-novel.
-
-That asymmetry replaced a much larger apparatus, and the history is worth keeping. The grid used
-to be required, so a run without one topped out at `INCONCLUSIVE` — which meant every caller had
-to supply a grid whether or not they had anything to say with it. On ROCm/aiter#4538 all three
-requested shapes were already in the target's own default list: the "independent" grid re-ran a
-strict subset of the repository run and the stage reported `pass`. The answer at the time was to
-make the caller *declare* what their cells covered (`--grid-novelty`) and to refuse a pass without
-it — more bookkeeping around a grid nobody wanted to supply.
-
-Making the grid optional removes the pressure that produced that grid in the first place, and with
-it the reason to police duplication at all: a duplicate grid that passes now proves nothing and
-claims nothing, which is the correct amount. The `grid_independence` vocabulary is gone rather
-than fixed, because the error it guarded against is no longer reachable.
-
-So supply `--grid` when you have read the diff and can say what the target's own shapes miss —
-a tail path against a suite of powers of two, long-context against a suite of toys. Supply nothing
-when you cannot. Neither choice costs you a verdict.
-
-#### Axes: when the failing configuration is not a shape
-
-A grid is one ordered tuple on one channel, which is all a shape flag accepts. A target whose
-remaining knobs are separate flags — head counts, dtypes, window modes — cannot be gridded over
-them at all, so entire configurations stay unreachable however the grid is spelled. That is not a
-missing shape; it is a missing axis.
-
-aiter#4538 again: the shape flag carries `(seq_len, seq_len_kv)` while `--num-heads` is its own
-flag defaulting to `64 128`, and the public API asserts at `num_heads=16` — a real blocker no grid
-could have requested.
-
-An axis is a name, a flag, and its values: `--axis num_heads=--num-heads:16;32`. **You read the
-target to find the flag; the validator does not check that it exists.** If you name a flag the
-target does not take, the grid run dies at argument parsing — see the shape-channel section above
-for why that failure is reported without charging anyone.
-
-What the validator does enforce is the same burden of proof a shape channel carries: every axis
-flag is fed `__VALIDATOR_INVALID_AXIS__` and **must fail**. A flag that is declared but ignored,
-or whose value is silently clamped, would otherwise let the report claim coverage of head counts
-that never reached the kernel.
-
-| state | meaning |
-|---|---|
-| `none` / `unusable` | none requested, or the target is not a script — argv reaches script targets only |
-| `malformed-spec` | the `name=--flag:v1;v2` spelling does not parse; nothing is guessed from it |
-| `declared` | parsed and usable, but the probe has not reported yet. A finished report carrying this means the run died before the axis was proven, so believe nothing about the axis |
-| `hook-not-consumed` | a flag accepted the invalid value; the axis is **dropped and named**, never dropped quietly |
-| `proven` | every axis flag refused the invalid value, and its values rode the grid run's argv |
-
-Each axis also carries `hook_proof`, the probe's verdict for that one flag. It is the only
-evidence that an axis reached the kernel; a flag existing in the source is not.
-
-A requested axis is recorded **whatever becomes of it**, including when the run never got far
-enough to look for the flag. Dropping the request itself is precisely the silently narrowed test
-space this is here to make visible.
-
 ### 6 — `execution_receipt`
 
 Name the exact Python `module:function` route the diff is supposed to make execute, and the local
@@ -498,26 +408,20 @@ and records what actually got called:
 }
 ```
 
-`PASS` requires the observed route to equal the one you named, at least one observed route symbol,
-and every shape the grid asked for. The tested PR cannot earn credit by writing its own receipt:
-the producer is validator-owned, and the script runner calls that producer's hooks rather than
-re-implementing them — a re-implementation would be a second thing the PR's tree could influence.
+`PASS` requires the observed route to equal the one you named and at least one observed route
+symbol. The tested PR cannot earn credit by writing its own receipt: the producer is
+validator-owned, and the script runner calls that producer's hooks rather than re-implementing
+them — a re-implementation would be a second thing the PR's tree could influence.
 
-Validate a receipt whenever a route was named, **including** when no grid was configured or its
-channel could not be established. With no grid it attests route execution and nothing about
-shapes, which is all it is then entitled to claim; abandoning it alongside the grid would throw
-away evidence already collected.
+This is the stage that survived the grid, and it is the more important half. A grid answered
+"does the kernel also work on shapes nobody asked it about"; the receipt answers "did the changed
+code run **at all**", and a green suite that never reached the route is the failure that actually
+happens. `executed_shapes` records what the route was called with — a reading of the run the
+target chose, which is why it costs nothing and cannot be wrong about a shape it never saw.
 
-**One receipt per run, not per phase.** The repo-tests run and a grid run both execute inside the
-head phase. Sharing one receipt path meant the second erased the first — and with the grid cells a
-subset of the target's defaults, a receipt written by *either* run satisfied the grid's
-requirement, which made the grid's own evidence unfalsifiable. One file per run, read the grid
-run's own file when a grid ran, and record which run the published receipt describes.
-
-With no grid the receipt's `required_shapes` is empty, and that is a legal `pass`. It was
-unreachable while the grid was mandatory, which is why the schema demanded a non-empty list there;
-`executed_shapes` still has to be non-empty, so a receipt never passes without having watched
-something happen.
+**One receipt per run, not per phase.** Runs sharing a receipt path mean the second erases the
+first, and the report then claims the route never executed on evidence that was collected and
+thrown away. One file per run, and record which run the published receipt describes.
 
 **Name the op a reviewer cares about, not the wrapper it runs through.** The probe resolves the
 declared route to a code object and walks the `__wrapped__` chain, so decoration does not have to
@@ -704,8 +608,8 @@ validation is far worse than no perf stage.
 `BLOCK` if a reproducible candidate defect fired, `NEEDS_WORK` if a deterministic policy concern
 fired, `INCONCLUSIVE` if any required stage did not complete, else `PASS`. `PASS` therefore means
 the merge simulation, GPU claim, repo-aware runtime probe, policy comparison, baseline control,
-the correctness target, execution receipt, and index scan all ran. It does **not** mean an extra
-shape grid was supplied — that stage is optional and completes nothing either way. Nor does it mean
+the correctness target, execution receipt, and index scan all ran. It does **not** mean the
+target's shapes were adequate — nothing here measures that, and §5 says why. Nor does it mean
 a timing comparison was made: read `stages.perf` for that, and read a `skip` there as "not
 measured", not as "no regression". A `PASS` on a PR that changed a kernel and brought no way to
 time it is not available any more — that case now carries its own `should-fix`.
@@ -743,8 +647,7 @@ These are fields, not prose, so a report cannot overclaim by omission:
 - **Every declared stage exists.** A stage that did not run is an object with `status: skip` and
   a reason; it never disappears and never becomes a JSON string.
 - **`test_selection`** — the exact target, where it came from relative to the patch
-  (`test_provenance`), the selected runner, and any extra grid. A verdict applies only to
-  those named inputs.
+  (`test_provenance`), and the selected runner. A verdict applies only to those named inputs.
 - **`runtime_identity`** — resolved package, interpreter, source SHA, and native artifact hashes.
 - **`execution_receipt`** — observed route, kernel symbols, and exact shapes emitted by the test.
 - **Every perf number keeps its provenance.** `stages.perf` carries the baseline it was measured
@@ -782,18 +685,16 @@ a seeded defect, and these have not been:
   target can still produce `PASS`, and the only guard is that the report names it so a reviewer can
   reject the evidence. This is the load-bearing judgement in the whole skill and it is entirely
   yours.
-- **External grid adapters.** The three channels reach the great majority of aiter's `op_tests`;
-  what stays unreachable is a target whose shapes are none of them — a parametrized case whose
-  parameter is a **dict or object** rather than scalar cells, and a target taking shapes from a
-  file or a fixture. Supplying a separate harness of our own is not the answer either: it would
-  have to be bound without changing the PR's diff hash or its live-base identity. Such a target
-  simply gets no grid, which costs it nothing now, and the reason says which case applied.
-- **Axes on the env-var and pytest channels.** An axis rides argv, so it reaches script targets
-  only. A pytest target's extra knobs are `parametrize` argnames, needing a different injector,
-  and an env-var channel has no per-axis spelling to prove against. Requesting an axis on either
-  is `unusable` **with the reason**, never a silent drop.
+- **Shape adequacy.** Nothing measures whether the shapes the target ran are the shapes this
+  change needed. The validator reports which ones executed and which rows the PR disabled; the
+  judgement that a suite of powers of two cannot see a tail-mask change is yours to write, and
+  §5 explains why the injection layer that used to attempt it was removed rather than fixed.
+  Name the concrete loss: a PR that *narrows* its own test — slicing a shape loop, dropping a
+  parametrize case without commenting the row out — used to fail the receipt against the grid's
+  required shapes. Nothing catches that now except `executed_shapes` shrinking between base and
+  head, which is in the report for you to read and is not gated on.
 - **Variant attestation.** A receipt proves the route ran; it cannot say which kernel variant
-  the route selected. Until a variant is either a declared axis or a captured shape-local, a
+  the route selected. Until a variant is a captured shape-local, a
   report covering a module with N registered variants covers the ones its inputs happen to
   select, and says so rather than implying N.
 - **Naming the external runtime that executes the kernel.** `runtime_identity` resolves the
@@ -831,18 +732,20 @@ counts:
 python -m pytest .claude/skills/validate-kernel-pr/tests/test_validator.py -q
 ```
 
-The original FlyDSL softmax evidence is committed under `tests/mutants/`, pinned to
-`ROCm/FlyDSL@421935cc6f09fd9b27d5d5ae52e0960e18834bd5`. It includes a behavior-neutral control
-and the three distinct mutants from the PR table. Replay it on a checkout-matched runtime and a
-verified-idle GPU:
+**There is no longer an end-to-end seeded-defect replay, and that is a real gap.**
+`tests/mutants/` held four pinned FlyDSL softmax cases — a behaviour-neutral control plus a
+dropped tail mask, a widened tolerance and a mis-scaled vector index — and it was the only
+evidence this skill has ever had that it catches a real kernel defect rather than merely
+declining to invent one. Two of the four needed the shape grid to fire at all: the tail mask is
+only wrong at `N=2000`, which no shape in the target's own suite requests. Retiring the grid
+retired them with it, and keeping a replay script that could no longer run its own cases would
+have been worse than admitting the loss.
 
-```bash
-PYLIB=/path/to/flydsl-runtime \
-  bash .claude/skills/validate-kernel-pr/tests/replay_mutants.sh /path/to/FlyDSL
-```
-
-The replay fails unless the control is `PASS`, the tail-mask and vector-index mutants block in
-`correctness`, and the tolerance mutant blocks in `test_policy`.
+What is left is the synthetic suite above, which proves the report contract and every refusal
+rule, and proves nothing about detection. If you rebuild an end-to-end proof, build it from a
+defect the target's **own** shapes can reach — that is the constraint the deletion imposes, and
+`m2-loosen-tolerance` (a `test_policy` block, no shapes involved) is the shape of case that
+would still work.
 
 ---
 
