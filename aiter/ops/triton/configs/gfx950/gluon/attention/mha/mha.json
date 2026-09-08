@@ -1,0 +1,22 @@
+{
+  "fwd": {
+    "default": {
+      "BLOCK_M": 128,
+      "BLOCK_N": 64,
+      "waves_per_eu": 2,
+      "num_warps": 4
+    },
+    "pe": {
+      "BLOCK_M": 128,
+      "BLOCK_N": 32,
+      "waves_per_eu": 2,
+      "num_warps": 4
+    },
+    "fp8": {
+      "BLOCK_M": 128,
+      "BLOCK_N": 64,
+      "waves_per_eu": 2,
+      "num_warps": 4
+    }
+  }
+}
