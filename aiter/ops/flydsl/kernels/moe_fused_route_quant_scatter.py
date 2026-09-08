@@ -63,7 +63,7 @@ from types import SimpleNamespace
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl._mlir import ir
-from flydsl._mlir.dialects import llvm, scf
+from flydsl._mlir.dialects import llvm
 from flydsl.compiler.kernel_function import CompilationContext
 from flydsl.expr import arith, const_expr, gpu, ptrtoint, range_constexpr, rocdl
 from flydsl.expr.arith import ArithValue
@@ -499,15 +499,28 @@ def _emit_quant_block_loop(c: SimpleNamespace) -> None:
                 payload_val, payload_rsrc, payload_byte_off, offset_is_bytes=True
             )
 
-            # one e8m0 byte per block, written by the block's lead lane.
-            _if_lead = scf.IfOp(_raw(c.is_block_lead))
-            with ir.InsertionPoint(_if_lead.then_block):
+            # one e8m0 byte per block, written by the block's lead lane. This
+            # plain helper is not AST-rewritten, so the runtime guard is issued
+            # via a local @flyc.jit dispatch (a bare Python ``if`` here would
+            # eval the dynamic Boolean as a Python bool).
+            def _store_lead_scale(
+                dst=dst,
+                scale_dword=scale_dword,
+                byte_in_dword=byte_in_dword,
+                e8m0_byte=e8m0_byte,
+            ):
                 dst_scale_dword = (
                     dst.scale_row_dword_base + scale_dword * c.c_wmma_rep * 16
                 )
                 dst_scale_byte = dst_scale_dword * c.c4_i32 + byte_in_dword
                 c.scale_t[dst_scale_byte] = e8m0_byte
-                scf.YieldOp([])
+
+            @flyc.jit
+            def _dispatch_lead_scale():
+                if c.is_block_lead:
+                    _store_lead_scale()
+
+            _dispatch_lead_scale()
 
 
 def _emit_quant_one_k_group(c: SimpleNamespace, mx_group) -> None:
