@@ -86,6 +86,12 @@ PERF_MIN_ROWS="${PERF_MIN_ROWS:-3}"
 PERF_CONTROL_COLUMN=""
 PERF_CONTROL_TOL="${PERF_CONTROL_TOL:-0.10}"
 PERF_BASELINE_METHOD="patch-reversed-same-worktree"
+# The file the timing runs execute. It defaults to the correctness target, and until now it
+# WAS the correctness target -- run_perf simply reused $TEST_FILE. Naming it separately
+# changes nothing by itself; what it does is force the places that ask "is the target on
+# base?" to say WHICH target. Four of them read a state computed from the correctness
+# target, two write to the worktree, and one deletes from it.
+PERF_TARGET=""
 TARGET_PYTHON="${PYTHON_BIN:-$(command -v python3 || command -v python || true)}"
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 
@@ -879,6 +885,9 @@ fi
 TEST_PYTHONPATH="$PROBE_DIR:$SCRIPT_DIR:$TEST_PYTHONPATH"
 TEST_FILE=${TESTS%%::*}
 TARGET_PATH="$REPO_WT/$TEST_FILE"
+# A pytest node id selects cases within a file; a timing run executes the file. So the
+# default perf target is the correctness target's FILE, never its node id.
+PERF_TARGET=${PERF_TARGET:-$TEST_FILE}
 # The runner is DECLARED by the caller, not derived here. Reading the target and deciding
 # whether pytest can collect it is judgement, and judgement belongs in the prompt -- but a
 # declaration is not a measurement, so the report records which of the two it got. A reader who
@@ -1190,9 +1199,9 @@ run_pytest() {
 # target has is a reading of its source, and it lives in scrape_perf.py with the reasons for
 # it; what stays here is only whether there is a file to read.
 perf_detect() {
-  local file="$REPO_WT/$TEST_FILE"
+  local file="$REPO_WT/$PERF_TARGET"
   if [ ! -f "$file" ]; then
-    PERF_BASIS="the target file is not present in this checkout"
+    PERF_BASIS="the perf target $PERF_TARGET is not present in this checkout"
     return 1
   fi
   local harness
@@ -1283,7 +1292,7 @@ run_perf() {
   (
     cd "$REPO_WT" \
       && env -i "${TARGET_BASE_ENV[@]}" "${environment[@]}" timeout "$PERF_TIMEOUT" \
-        "$TARGET_PYTHON" "$TEST_FILE" "${extra[@]}"
+        "$TARGET_PYTHON" "$PERF_TARGET" "${extra[@]}"
   ) >"$log" 2>&1
   local result=$?
   echo "$result|$log"
@@ -1426,9 +1435,9 @@ else
   # cross-tree comparison and is only attributable if something the patch does not touch
   # reproduces across it, which is what --perf-control-column requires below.
   PERF_TRANSPLANT_SRC=""
-  if [ -n "$PATCHF" ] && [ "$PERF_ENABLED" -eq 1 ] && [ -f "$REPO_WT/$TEST_FILE" ]; then
+  if [ -n "$PATCHF" ] && [ "$PERF_ENABLED" -eq 1 ] && [ -f "$REPO_WT/$PERF_TARGET" ]; then
     PERF_TRANSPLANT_SRC="$WORK/transplant-target"
-    cp "$REPO_WT/$TEST_FILE" "$PERF_TRANSPLANT_SRC"
+    cp "$REPO_WT/$PERF_TARGET" "$PERF_TRANSPLANT_SRC"
   fi
   if [ -n "$PATCHF" ]; then
     if git -C "$REPO_WT" apply -R --check "$PATCHF" >/dev/null 2>&1 \
@@ -1459,13 +1468,22 @@ else
       # number taken later, or on another box, or from the PR description, reintroduces
       # exactly the variance a 0.95 threshold is too tight to absorb.
       if [ "$PERF_ENABLED" -eq 1 ]; then
-        if [ "$BASE_REPO_STATE" = "target-not-present" ] \
+        # Whether the PERF target survives the reverse-apply is its own question. It used to
+        # be answered with BASE_REPO_STATE, which describes the CORRECTNESS target -- the same
+        # file, back when perf had no target of its own. Once the two can differ that is a
+        # category error in both directions: a pre-existing bench alongside a PR-added unit
+        # test would be refused a baseline it could trivially have taken, and a PR-added bench
+        # alongside a pre-existing unit test would fall through to the ordinary branch and
+        # transplant nothing. Ask about the file that is about to be executed.
+        PERF_BASE_STATE="present"
+        [ -f "$REPO_WT/$PERF_TARGET" ] || PERF_BASE_STATE="target-not-present"
+        if [ "$PERF_BASE_STATE" = "target-not-present" ] \
             && [ -z "$PERF_CONTROL_COLUMN" ]; then
           PERF_SKIP_REASON="the PR adds this target, so a base timing requires transplanting it into the base tree; that comparison spans two trees and is only attributable when a column the patch does not touch reproduces across it, so --perf-control-column is required and was not supplied"
-        elif [ "$BASE_REPO_STATE" = "target-not-present" ] \
+        elif [ "$PERF_BASE_STATE" = "target-not-present" ] \
             && [ -n "$PERF_TRANSPLANT_SRC" ] && [ -r "$PERF_TRANSPLANT_SRC" ]; then
-          mkdir -p "$(dirname "$REPO_WT/$TEST_FILE")"
-          cp "$PERF_TRANSPLANT_SRC" "$REPO_WT/$TEST_FILE"
+          mkdir -p "$(dirname "$REPO_WT/$PERF_TARGET")"
+          cp "$PERF_TRANSPLANT_SRC" "$REPO_WT/$PERF_TARGET"
           PERF_BASELINE_METHOD="target-transplant"
           if [ "$PERF_ARGS_SET" -eq 1 ] || perf_detect; then
             perf_snapshot base
@@ -1479,9 +1497,12 @@ else
           fi
           # The transplanted file is not part of the base tree and must not be left in it:
           # the cleanliness check that guards the head phase would otherwise fail and take
-          # the whole correctness phase down with it.
-          rm -f "$REPO_WT/$TEST_FILE"
-        elif [ "$BASE_REPO_STATE" = "target-not-present" ]; then
+          # the whole correctness phase down with it. Reached only when the perf target was
+          # absent from base a moment ago, so this deletes what the two lines above wrote and
+          # nothing else. Spelled with $TEST_FILE it would delete a TRACKED base file whenever
+          # the two targets differ -- dirtying the tree it exists to keep clean.
+          rm -f "$REPO_WT/$PERF_TARGET"
+        elif [ "$PERF_BASE_STATE" = "target-not-present" ]; then
           PERF_SKIP_REASON="the PR adds this target and no copy of it was available to transplant onto base"
         elif [ "$PERF_ARGS_SET" -eq 1 ] || perf_detect; then
           perf_snapshot base
