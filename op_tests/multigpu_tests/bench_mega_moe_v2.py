@@ -268,7 +268,7 @@ def main():
         max_tok_per_rank=args.mtpr,
         swiglu_limit=SWIGLU_LIMIT,
     )
-    default_select_config = mega._select_config
+    default_select_config = mega._backend._select_config
     variant_select_config = None
     if (
         args.stage2_strided
@@ -334,11 +334,11 @@ def main():
                 stage1=stage1,
                 stage2=stage2,
             )
-            mega._active_config = config
+            mega._backend._active_config = config
             return config
 
         variant_select_config = select_strided_config
-        mega._select_config = variant_select_config
+        mega._backend._select_config = variant_select_config
 
     mori_cfg = mori.ops.EpDispatchCombineConfig(
         data_type=torch.bfloat16,
@@ -399,7 +399,7 @@ def main():
     x_q, x_scale = mega.quantize(x)
 
     def mega_stage1():
-        mega._run_fused_stage1(x_q, route_weights, x_scale, ids)
+        mega._backend._run_fused_stage1(x_q, route_weights, x_scale, ids)
 
     stage1_graph = capture(mega_stage1)
     print(f"[STEP] rank={rank} stage1-capture-done", flush=True)
@@ -407,7 +407,9 @@ def main():
     barrier()
 
     def mega_stage2():
-        holders["stage2"] = mega._run_stage2(tokens, None, True, mega._active_config)
+        holders["stage2"] = mega._backend._run_stage2(
+            tokens, None, True, mega._backend._active_config
+        )
 
     stage2_graph = capture(mega_stage2)
     print(f"[STEP] rank={rank} stage2-capture-done", flush=True)
@@ -420,10 +422,10 @@ def main():
     if args.check_variant:
         if variant_select_config is None:
             raise ValueError("--check-variant requires a Stage2 variant")
-        mega._select_config = default_select_config
+        mega._backend._select_config = default_select_config
         reference = mega(x, route_weights, ids).clone()
         barrier()
-        mega._select_config = variant_select_config
+        mega._backend._select_config = variant_select_config
         candidate = mega(x, route_weights, ids).clone()
         barrier()
         rel_l2 = (
