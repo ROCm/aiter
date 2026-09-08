@@ -32,8 +32,6 @@ This test uses distinct per-sequence blocks and a batch big enough to cross
 that no valid position was zeroed.
 """
 
-import math
-
 import pytest
 import torch
 
@@ -51,7 +49,9 @@ HEAD_DIM = 128
 KV_BLOCK = 64
 CHUNK_K = 256
 INDEX_DIM = HEAD_DIM + 4
-STRIDE_K_SEQ = KV_BLOCK * INDEX_DIM  # 8448 -> block_index*this overflows int32 at 254201
+STRIDE_K_SEQ = (
+    KV_BLOCK * INDEX_DIM
+)  # 8448 -> block_index*this overflows int32 at 254201
 FP8 = get_fp8_e4m3_dtype()
 
 
@@ -98,7 +98,15 @@ def _make_inputs(batch, ctx_list):
     flat[:, : KV_BLOCK * HEAD_DIM] = data.reshape(num_blocks, KV_BLOCK * HEAD_DIM)
 
     q_fp8 = q_bf16.to(FP8).contiguous()
-    return q_fp8, kvc, weights.contiguous(), context_lens, block_tables, t_max, num_blocks
+    return (
+        q_fp8,
+        kvc,
+        weights.contiguous(),
+        context_lens,
+        block_tables,
+        t_max,
+        num_blocks,
+    )
 
 
 def _run(q, kvc, w, ctx_lens, block_tables, t_max, vcs):
@@ -106,8 +114,17 @@ def _run(q, kvc, w, ctx_lens, block_tables, t_max, vcs):
         (q.shape[0], t_max), float("-inf"), dtype=torch.float32, device=dev
     )
     deepgemm_fp8_paged_mqa_logits(
-        q, kvc, w, out, ctx_lens, block_tables, t_max,
-        ChunkK=CHUNK_K, Preshuffle=True, KVBlockSize=KV_BLOCK, WavePerEU=2,
+        q,
+        kvc,
+        w,
+        out,
+        ctx_lens,
+        block_tables,
+        t_max,
+        ChunkK=CHUNK_K,
+        Preshuffle=True,
+        KVBlockSize=KV_BLOCK,
+        WavePerEU=2,
         VarCtxSchedule=vcs,
     )
     torch.cuda.synchronize()
