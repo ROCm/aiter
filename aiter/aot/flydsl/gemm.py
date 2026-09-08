@@ -63,7 +63,6 @@ from aiter.ops.flydsl.gemm_kernels import (
     SPLIT_K_SEMAPHORE_MAX_LEN,
     get_flydsl_hgemm_kernel_params,
 )
-from aiter.ops.flydsl.kernels.common import run_cached
 from aiter.ops.flydsl.kernels.gemm_a16w16_gfx950 import (
     GEMM_A16W16_DTYPE_BF16,
     GEMM_A16W16_DTYPE_FP16,
@@ -72,6 +71,7 @@ from aiter.ops.flydsl.kernels.gemm_a16w16_gfx950 import (
     gemm_a16w16_gfx950,
     make_gemm_a16w16_param_and_validate,
 )
+from aiter.ops.flydsl.kernels.kernels_common import run_cached
 from aiter.ops.flydsl.kernels.preshuffle_gemm import compile_preshuffle_gemm
 from aiter.ops.flydsl.mxfp8_128_bpreshuffle_gemm_gfx1250 import (
     BLOCK_K as SCALE_BLOCK_SIZE,
