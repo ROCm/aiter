@@ -27,7 +27,6 @@ from .quant_utils import emit_mx_e8m0_scale
 _JIT_SCHEMA_VERSION = "v16-v-quant-int8"
 _TRANSPORT_CHUNK_BYTES = 16
 _PUSH_PIPELINE_DEPTH = 16
-_OUT_CHANNEL_COUNT = 8
 _OUT_CHANNEL_DEPTH = 1
 
 
@@ -848,9 +847,9 @@ def make_fused_a2a_out_kernel(
         fx.barrier()
 
         rsrc_input = create_buffer_resource_from_addr(addr_input)
-        channel_warp_num = global_warp_num // _OUT_CHANNEL_COUNT
-        channel_id = global_warp_id % _OUT_CHANNEL_COUNT
-        channel_warp_id = global_warp_id // _OUT_CHANNEL_COUNT
+        channel_warp_num = global_warp_num // npes
+        channel_id = global_warp_id % npes
+        channel_warp_id = global_warp_id // npes
         group_step = channel_warp_num * _OUT_CHANNEL_DEPTH
         peer_base = fx.memref_load(p2p_bases, channel_id)
         dst_addr = peer_base + fx.Int64(rank * peer_chunks * 16)

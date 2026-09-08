@@ -403,7 +403,7 @@ def _run_rank(rank, world_size, port):
                             flush=True,
                         )
 
-            if world_size >= 8:
+            if world_size >= 2:
                 out_input = references[0].contiguous()
                 out_packed = out_input.permute(2, 0, 1, 3).contiguous()
                 out_reference = funcol.wait_tensor(
@@ -425,8 +425,7 @@ def _run_rank(rank, world_size, port):
                     print(f"PASS {case_name} out-hop=byte-identical", flush=True)
             elif rank == 0:
                 print(
-                    f"SKIP: {case_name} out-hop requires world_size>=8 "
-                    "(_OUT_CHANNEL_COUNT)",
+                    f"SKIP: {case_name} out-hop requires world_size>=2",
                     flush=True,
                 )
     finally:
@@ -453,9 +452,9 @@ def main():
 
     mp.spawn(_run_rank, args=(_WORLD_SIZE, _free_port()), nprocs=_WORLD_SIZE, join=True)
     passed = sum(
-        8 + 2 * (name == "small") + int(_WORLD_SIZE >= 8) for name, *_ in _CASES
+        8 + 2 * (name == "small") + int(_WORLD_SIZE >= 2) for name, *_ in _CASES
     )
-    skipped = len(_CASES) * int(_WORLD_SIZE < 8)
+    skipped = len(_CASES) * int(_WORLD_SIZE < 2)
     print(f"{passed} passed, {skipped} skipped on {arch}")
     return 0
 
