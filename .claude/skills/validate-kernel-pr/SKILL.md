@@ -560,19 +560,50 @@ patch brought a bench along and the validator took it, `same-as-correctness-targ
 back. The fallback is an inference, not a reading of the change, and the report does not let the
 two look alike.
 
-**A PR that means to be faster usually ships a bench saying so.** So when no `--perf-target` is
-given, the files the patch wrote are read for a benchmark harness, and exactly one that is not
-already the correctness target is taken. Every other outcome is the fallback, and that asymmetry
-is the entire safety argument: a target declined costs a measurement, while a target chosen
-*wrong* spends a `should-fix` on an author whose code may be innocent — and nothing downstream
-can tell those apart, because `run_perf` injects no probe and no evidence exists that the bench
-executed the changed line rather than merely importing near it.
+**Two places a perf target comes from, and neither of them is a filename.** When no
+`--perf-target` is given, both are searched:
+
+1. **A bench the PR ships** — `discovered-pr-shipped`. A PR that means to be faster usually says
+   so by bringing one along.
+2. **A bench the repository already has** — `discovered-repo-bench`. Every `.py` in the worktree
+   that carries a harness *and* imports a module the patch changed under `aiter/`.
+   `op_benchmarks/triton/bench_gemm_a8w8.py` imports `aiter.ops.triton.gemm.basic.gemm_a8w8`;
+   that import is an edge that can be checked, where a matching filename is only a resemblance.
+   The imports are **parsed, not matched** — aiter spells the same edge three ways, including
+   `from aiter.ops.triton.attention import extend_attention` where the imported name is itself a
+   module, and a regex loose enough to catch that also matches `gemm_a8w8_preshuffle` when the
+   patch touched `gemm_a8w8`.
+
+The repository bench wins, and mechanically rather than as a preference: it is on **both sides**
+of the patch, so the baseline is this worktree with the patch reversed. A bench the PR adds is
+absent from base and forces the cross-tree transplant below, which needs `--perf-control-column`
+before it means anything.
+
+Every other outcome is the fallback, and that asymmetry is the entire safety argument: a target
+declined costs a measurement, while a target chosen *wrong* spends a `should-fix` on an author
+whose code may be innocent — and nothing downstream can tell those apart, because `run_perf`
+injects no probe and no evidence exists that the bench executed the changed line rather than
+merely importing near it. **The edge proves reference, not execution.** That is the residual risk,
+and the refusals below are what bound it.
 
 So more than one candidate is **named, not chosen between**. `perf.candidates` lists everything
 considered and `perf.target_basis_reason` says why the fallback stood, because a reader told only
 that it stood cannot distinguish an empty search from one that found three benches and refused.
 Which of several benches measures a given change is a reading of the diff, not a fact about it;
 settle it with `--perf-target`. This is the rule `--runner` already established.
+
+One tie-break comes before that refusal, and only among candidates the import edge already
+proved: if exactly one of them lives under `op_tests/op_benchmarks/`, that is the benchmark. A
+file's place in the directory the project set aside for timing is a fact about how aiter is
+organised, not the resemblance the import edge exists to replace. Measured on 40 random
+`aiter/ops/triton` modules, it turns 10 resolutions into 12 and leaves the genuine ties alone —
+a change to the shared `aiter.ops.triton.utils.types` still declines, because 13 of its 14
+candidates live there and a tie is still a tie.
+
+A note on what this searches: **every** `.py` in the worktree, not a curated list of directories.
+aiter keeps benches in `op_tests/op_benchmarks/`, but 119 files elsewhere under `op_tests/` carry
+a timing harness too, and a hardcoded directory would quietly decide those are not perf tests.
+Measured at 1530 files and 0.3 s.
 
 `perf.target_provenance` then asks of that file the same question `test_provenance` asks of the
 correctness target, using the same function against the same post-apply snapshot:

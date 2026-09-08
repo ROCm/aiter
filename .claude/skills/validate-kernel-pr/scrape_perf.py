@@ -51,6 +51,7 @@ usage: scrape_perf.py --base b1.log [b2.log ...] --head h1.log [h2.log ...]
 """
 
 import argparse
+import ast
 import json
 import re
 import statistics
@@ -473,6 +474,19 @@ def detect_harness(text):
         # A substring test, not a parse, so it also matches a commented-out import (the
         # 12th target). That error is the safe one, per the docstring above.
         return {"args": "", "basis": "target uses the perftest/@benchmark harness"}
+    if "triton.testing.perf_report" in text or "triton.testing.do_bench" in text:
+        # aiter's fourth convention, and the one its DEDICATED benchmark directory is written
+        # in. Measured: 58 of the 67 files under op_tests/op_benchmarks/ time themselves this
+        # way and exactly one of the 59 repo-wide also matches a rule above -- so every rule
+        # this detector had was blind to almost the whole of op_benchmarks/. Pointing
+        # --perf-target straight at bench_gemm_a8w8.py reported "no benchmark entry point".
+        #
+        # Which is precisely the failure this docstring names: a missed harness says "there
+        # was nothing to measure" when the truth is that the detector was too narrow.
+        return {
+            "args": "",
+            "basis": "target uses the triton.testing perf_report/do_bench harness",
+        }
     return None
 
 
@@ -482,6 +496,13 @@ def detect_harness(text):
 BASIS_CALLER = "declared-by-caller"
 BASIS_FALLBACK = "same-as-correctness-target"
 BASIS_SHIPPED = "discovered-pr-shipped"
+BASIS_REPO = "discovered-repo-bench"
+
+# The namespace a kernel change lives in. Discovery's second path asks which benches import
+# what the patch changed, and a change outside this prefix is not a kernel change: editing a
+# test's input generator would otherwise match the bench that imports that test, and the perf
+# stage would report on a file whose kernel nobody touched.
+KERNEL_PREFIX = "aiter"
 
 
 def discover_shipped(status_text, read_text):
@@ -517,52 +538,179 @@ def discover_shipped(status_text, read_text):
     return {"candidates": sorted(candidates), "unspellable": unspellable}
 
 
-def choose_perf_target(shipped, correctness_target):
-    """Which discovered target to time, or why the fallback stands.
+def changed_kernel_modules(status_text):
+    """Dotted module names for the kernel sources the patch changed.
 
-    Every branch that is not "exactly one, and it is new information" returns the fallback.
-    That asymmetry is deliberate and is the whole safety argument for discovery: a target
-    this function declines to pick costs a measurement, while a target it picks WRONG spends
-    a should-fix finding on a PR author whose code may be innocent. The stage cannot tell the
-    difference afterwards -- `run_perf` deliberately injects no probe, so nothing downstream
-    can check that the bench executed the changed line rather than merely importing near it.
-
-    Refusing to choose between several is the same rule `--runner` established: a caller who
-    can see the diff decides, and the report says a choice was owed rather than inventing one.
+    `aiter/ops/triton/gemm/basic/gemm_a8w8.py` -> `aiter.ops.triton.gemm.basic.gemm_a8w8`,
+    and a package's `__init__.py` -> the package. Deletions are skipped: a module that is not
+    on head cannot be imported by anything we are about to run.
     """
-    candidates = shipped["candidates"]
+    modules = []
+    for line in status_text.splitlines():
+        if len(line) <= 3:
+            continue
+        code, path = line[:2], line[3:]
+        if path.startswith('"') or "D" in code or not path.endswith(".py"):
+            continue
+        parts = path[: -len(".py")].split("/")
+        if parts[-1] == "__init__":
+            parts.pop()
+        if not parts or parts[0] != KERNEL_PREFIX:
+            continue
+        modules.append(".".join(parts))
+    return sorted(set(modules))
+
+
+def imported_modules(text):
+    """Every module name a file imports, however it spells the import.
+
+    Parsed, not matched. aiter benches spell the same edge three ways --
+    `import aiter.ops.mha`, `from aiter.ops.triton.attention.mla import mla_decode_fwd`, and
+    `from aiter.ops.triton.attention import extend_attention` where the imported name is
+    itself a module. The last form is common enough in op_benchmarks/ that a regex over the
+    dotted path alone misses it, and a regex loose enough to catch it also matches
+    `gemm_a8w8_preshuffle` when the patch touched `gemm_a8w8`. The parse has neither problem.
+
+    A file that does not parse contributes nothing. That is the safe direction: it costs a
+    candidate, where a wrong candidate costs a finding against a PR author.
+
+    Relative imports are skipped -- resolving them needs the importing package, and a bench
+    that reaches a kernel through one is not something to guess at.
+    """
+    try:
+        tree = ast.parse(text)
+    except (SyntaxError, ValueError):
+        return set()
+    names = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            names.update(alias.name for alias in node.names)
+        elif isinstance(node, ast.ImportFrom) and node.module and not node.level:
+            names.add(node.module)
+            names.update(f"{node.module}.{alias.name}" for alias in node.names)
+    return names
+
+
+def discover_repo_benches(modules, walk, read_text, exclude=()):
+    """Files ALREADY in the repo that both carry a harness and import what changed.
+
+    The second of the two places a perf target comes from, and the one that covers the
+    ordinary kernel PR: the author changed a kernel and the repository already owns the bench
+    that measures it. `op_tests/op_benchmarks/triton/bench_gemm_a8w8.py` imports
+    `aiter.ops.triton.gemm.basic.gemm_a8w8` -- that import is an edge that can be checked,
+    where a matching filename is only a resemblance.
+
+    What the edge proves is that the bench REFERENCES the changed module. It does not prove
+    the bench executes the changed line: run_perf deliberately injects no probe, because a
+    traced kernel is not the kernel whose latency we are reporting, so nothing downstream can
+    close that gap. It is bounded instead by declining whenever the answer is not unique.
+    """
+    found = []
+    for path in walk():
+        if path in exclude:
+            continue
+        text = read_text(path)
+        if text is None or detect_harness(text) is None:
+            continue
+        if imported_modules(text) & set(modules):
+            found.append(path)
+    return sorted(found)
+
+
+# Where aiter keeps the files whose only job is timing. Used to break a tie between several
+# benches that all import the changed module, and ONLY to break a tie -- never to find a
+# candidate that the import edge did not already prove.
+#
+# This is not the filename-resemblance guess the import edge exists to avoid. `bench_gemm_a8w8`
+# looking like `gemm_a8w8` is a resemblance; a file living in the directory the project set
+# aside for benchmarks is a fact about how the project organises itself. Measured on 40 random
+# triton kernel modules: 10 resolved to one bench and 6 declined as ambiguous -- and all 6 had
+# a candidate here, so this converts every ambiguous case in the sample without touching the
+# refusals that matter. A change to the shared aiter.ops.triton.utils.types still declines,
+# because 13 of its 14 candidates are under this prefix and a tie is still a tie.
+BENCH_HOME = "op_tests/op_benchmarks/"
+
+
+def _resolve(candidates, correctness_target, kind, advice):
+    """One path's candidate list reduced to a target, or to the reason there is none.
+
+    Every outcome that is not "exactly one, and it is new information" resolves to None. That
+    asymmetry is the whole safety argument for discovery: a target declined costs a
+    measurement, while a target picked WRONG spends a should-fix finding on a PR author whose
+    code may be innocent -- and nothing downstream can tell the two apart, because run_perf
+    injects no probe and no evidence exists that the bench executed the changed line.
+
+    Refusing to choose between several is the rule --runner established: a caller who can see
+    the diff decides, and the report says a choice was owed rather than inventing one.
+    """
     if not candidates:
-        return {
-            "basis": BASIS_FALLBACK,
-            "target": correctness_target,
-            "reason": "the patch ships no file carrying a benchmark harness",
-            "candidates": [],
-        }
+        return None, f"nothing is {kind}"
     if correctness_target in candidates:
+        return None, f"the correctness target is itself {advice}"
+    if len(candidates) > 1:
+        # One tie-break before declining, and only among candidates the import edge already
+        # proved: if exactly one of them lives where the project keeps its benchmarks, that is
+        # the benchmark. Anything else and the choice is a reading of the diff.
+        home = [path for path in candidates if path.startswith(BENCH_HOME)]
+        if len(home) == 1:
+            return home[0], ""
+        return None, (
+            "%d files are %s (%s); which of them measures this change is a reading of the "
+            "diff and not a fact about it, so name one with --perf-target"
+            % (len(candidates), kind, ", ".join(candidates))
+        )
+    return candidates[0], ""
+
+
+def choose_perf_target(shipped, repo_benches, correctness_target):
+    """Which of the two discovered targets to time, or why the fallback stands.
+
+    A repository bench wins over one the PR ships, and the reason is mechanical rather than a
+    preference. A pre-existing bench is on BOTH sides of the patch, so the baseline is this
+    worktree with the patch reversed -- one tree, no extra burden of proof. A bench the PR
+    adds is absent from base and forces the target-transplant baseline, which spans two trees
+    and is only attributable when --perf-control-column reproduces across them. Choosing the
+    cheaper, more attributable comparison is not taste.
+    """
+    repo_target, repo_reason = _resolve(
+        repo_benches,
+        correctness_target,
+        "a benchmark already in the repository importing what the patch changed",
+        "the repository's benchmark for what the patch changed",
+    )
+    ship_target, ship_reason = _resolve(
+        shipped["candidates"],
+        correctness_target,
+        "a file the patch ships carrying a benchmark harness",
+        "the benchmark the patch ships",
+    )
+    candidates = sorted(set(repo_benches) | set(shipped["candidates"]))
+
+    if repo_target is not None:
         return {
-            "basis": BASIS_FALLBACK,
-            "target": correctness_target,
-            "reason": "the correctness target is itself the benchmark the patch ships",
+            "basis": BASIS_REPO,
+            "target": repo_target,
+            "reason": (
+                "the repository already owns exactly one benchmark importing what this patch "
+                "changed, and it is on both sides of the patch so the baseline needs no "
+                "transplant"
+            ),
             "candidates": candidates,
         }
-    if len(candidates) > 1:
+    if ship_target is not None:
         return {
-            "basis": BASIS_FALLBACK,
-            "target": correctness_target,
+            "basis": BASIS_SHIPPED,
+            "target": ship_target,
             "reason": (
-                "the patch ships %d files carrying a benchmark harness (%s); which of them "
-                "measures this change is a reading of the diff and not a fact about it, so "
-                "name one with --perf-target" % (len(candidates), ", ".join(candidates))
+                "the patch ships exactly one file carrying a benchmark harness, and the "
+                "repository offers none: %s" % repo_reason
             ),
             "candidates": candidates,
         }
     return {
-        "basis": BASIS_SHIPPED,
-        "target": candidates[0],
-        "reason": (
-            "the patch ships exactly one file carrying a benchmark harness, and it is not "
-            "the correctness target"
-        ),
+        "basis": BASIS_FALLBACK,
+        "target": correctness_target,
+        "reason": f"{repo_reason}; and {ship_reason}",
         "candidates": candidates,
     }
 
@@ -801,8 +949,26 @@ def cmd_discover(args):
             return None
         return candidate.read_text(errors="replace")
 
-    shipped = discover_shipped(sys.stdin.read(), read_text)
-    decision = choose_perf_target(shipped, args.correctness_target)
+    def walk():
+        # Every .py in the worktree, not a curated list of test directories. aiter keeps
+        # benches in op_tests/op_benchmarks/, but 119 files elsewhere under op_tests/ carry a
+        # timing harness too, and a hardcoded directory would quietly decide that those are
+        # not perf tests. Measured at 1530 files and 0.3s on this repository, which is not a
+        # cost worth buying a guess with. .git is skipped because it holds no source.
+        for candidate in sorted(root.rglob("*.py")):
+            if ".git" in candidate.parts:
+                continue
+            yield str(candidate.relative_to(root))
+
+    status = sys.stdin.read()
+    shipped = discover_shipped(status, read_text)
+    repo_benches = discover_repo_benches(
+        changed_kernel_modules(status),
+        walk,
+        read_text,
+        exclude=set(shipped["candidates"]),
+    )
+    decision = choose_perf_target(shipped, repo_benches, args.correctness_target)
     decision["unspellable"] = shipped["unspellable"]
     print(json.dumps(decision))
     return 0

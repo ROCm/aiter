@@ -761,9 +761,10 @@
               "enum": [
                 "declared-by-caller",
                 "discovered-pr-shipped",
+                "discovered-repo-bench",
                 "same-as-correctness-target"
               ],
-              "description": "Whose choice the timed file was. `declared-by-caller` means someone who read the diff named it with --perf-target. `discovered-pr-shipped` means the patch wrote exactly one file carrying a benchmark harness and the validator took it. `same-as-correctness-target` is the fallback, which is an inference and not a reading of the change -- it also covers every case discovery DECLINED, so read `target_basis_reason` and `candidates` before concluding nothing was found."
+              "description": "Whose choice the timed file was. `declared-by-caller` means someone who read the diff named it with --perf-target. `discovered-repo-bench` means the repository already owned exactly one benchmark importing a module the patch changed; it is preferred over the next because a pre-existing bench is on both sides of the patch and needs no transplant. `discovered-pr-shipped` means the patch wrote exactly one file carrying a benchmark harness. `same-as-correctness-target` is the fallback, which is an inference and not a reading of the change -- it also covers every case discovery DECLINED, so read `target_basis_reason` and `candidates` before concluding nothing was found."
             },
             "target_basis_reason": {
               "type": "string",

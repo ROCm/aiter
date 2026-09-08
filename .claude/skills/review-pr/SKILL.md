@@ -280,9 +280,20 @@ def perf_command(path):
     # Keep this in step with detect_harness() in validate-kernel-pr/scrape_perf.py.
     if "perftest" in text or "@benchmark" in text:
         return f"python3 {path}", "target uses the perftest/@benchmark harness"
+    # aiter's fourth convention, and the one its dedicated benchmark directory is written in.
+    # Measured: 58 of the 67 files under op_tests/op_benchmarks/ time themselves this way, and
+    # exactly one of the 59 repo-wide also matches a rule above -- so every rule above was
+    # blind to almost the whole of op_benchmarks/, and a reviewer pointed straight at
+    # bench_gemm_a8w8.py was told it had no benchmark entry point.
+    # Keep this in step with detect_harness() in validate-kernel-pr/scrape_perf.py.
+    if "triton.testing.perf_report" in text or "triton.testing.do_bench" in text:
+        return (
+            f"python3 {path}",
+            "target uses the triton.testing perf_report/do_bench harness",
+        )
     return None, (
-        "target exposes no benchmark entry point "
-        "(no --scenario bench, no perftest/@benchmark harness)"
+        "target exposes no benchmark entry point (no --scenario bench, no "
+        "perftest/@benchmark harness, no triton.testing perf_report/do_bench)"
     )
 
 

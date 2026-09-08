@@ -367,6 +367,54 @@ class ValidatorFixture:
             cwd=self.repo,
         )
 
+    #: A bench that is ALREADY in the repository and reaches the kernel through an import.
+    #: This is the ordinary aiter shape -- op_benchmarks/triton/bench_gemm_a8w8.py imports
+    #: aiter.ops.triton.gemm.basic.gemm_a8w8 -- and it is the edge discovery follows.
+    REPO_BENCH = "tests/bench_repo.py"
+
+    def add_repo_bench(self):
+        (self.repo / self.REPO_BENCH).write_text(
+            "import argparse\n"
+            "import os\n"
+            "import sys\n"
+            "\n"
+            "sys.path.insert(0, os.path.dirname(os.path.dirname(\n"
+            "    os.path.abspath(__file__))))\n"
+            "\n"
+            "from aiter.kernel import VALUE\n"
+            "\n"
+            "\n"
+            "def main():\n"
+            "    parser = argparse.ArgumentParser()\n"
+            "    parser.add_argument('--scenario', default='test',\n"
+            "                        choices=['test', 'bench'])\n"
+            "    parser.parse_args()\n"
+            "    print('| dim | kernel us | reference us |')\n"
+            "    print('|---|---|---|')\n"
+            "    for dim in (1024, 2048, 4096, 8192):\n"
+            "        print(f'| {dim} | {dim * VALUE / 100.0} | {dim / 50.0} |')\n"
+            "    print('4/4 cases passed')\n"
+            "\n"
+            "\n"
+            "if __name__ == '__main__':\n"
+            "    main()\n"
+        )
+        run(["git", "add", "-A"], cwd=self.repo)
+        run(
+            [
+                "git",
+                "-c",
+                "user.name=Validator Test",
+                "-c",
+                "user.email=validator@example.com",
+                "commit",
+                "-q",
+                "-m",
+                "add repo bench",
+            ],
+            cwd=self.repo,
+        )
+
     def rewrite_bench(self, body):
         """Return a mutate() that replaces the bench target wholesale."""
 
@@ -1997,6 +2045,37 @@ class ValidateKernelPrTests(unittest.TestCase):
         self.assertEqual("target-transplant", perf["baseline_method"])
         # And it measured something: base VALUE = 1 against head VALUE = 0.5.
         self.assertEqual("pass", perf["status"])
+
+    def test_a_bench_already_in_the_repo_times_a_change_that_brought_none(self):
+        # The ordinary kernel PR, and the case that motivated all of this. The author changed
+        # a kernel and shipped no bench; the repository already owns one that imports it --
+        # aiter's usual shape, where op_benchmarks/triton/bench_gemm_a8w8.py imports
+        # aiter.ops.triton.gemm.basic.gemm_a8w8. Before this the perf stage asked only whether
+        # the CORRECTNESS target happened to be timeable, so it reported `skip` with the bench
+        # sitting unread in the tree.
+        self.fixture.add_repo_bench()
+        patch = self.fixture.make_patch(
+            lambda repo: (repo / "aiter" / "kernel.py").write_text("VALUE = 2.0\n"),
+            "repo-bench.patch",
+        )
+        result, report = self.fixture.validate(
+            patch,
+            tests="tests/test_sample.py",
+            expected_route="test_sample:run_kernel",
+            grid=False,
+        )
+
+        perf = report["stages"]["perf"]
+        self.assertEqual(self.fixture.REPO_BENCH, perf["target"])
+        self.assertEqual("discovered-repo-bench", perf["target_basis"])
+        # Why it is preferred: the bench is on both sides of the patch, so no transplant and
+        # no control column are needed to make the comparison attributable.
+        self.assertEqual("pre-existing", perf["target_provenance"])
+        self.assertEqual("patch-reversed-same-worktree", perf["baseline_method"])
+        # VALUE 1 -> 2 doubles the kernel column's cost, and nothing else in this PR says so.
+        self.assertEqual("fail", perf["status"])
+        self.assertLess(perf["median_ratio"], 0.95)
+        self.assertEqual(1, result.returncode)
 
     #: A pytest-named file that ALSO parses argv in its module body. Found on
     #: ROCm/aiter#5172: pytest wins the runner selection, imports the module at collection
@@ -3751,6 +3830,11 @@ class ReviewSkillContractTests(unittest.TestCase):
             self.assertIn('"--scenario" in text', body, name)
             self.assertIn('"bench" in text', body, name)
             self.assertIn('"perftest" in text', body, name)
+            # aiter's fourth convention. The three above were blind to 58 of the 67 files in
+            # op_tests/op_benchmarks/ -- the directory whose entire purpose is timing -- and
+            # this check listed exactly the rules that shared the blind spot.
+            self.assertIn('"triton.testing.perf_report" in text', body, name)
+            self.assertIn('"triton.testing.do_bench" in text', body, name)
             # `run_perftest` is a strict subset of `perftest`, so testing the longer name
             # only narrows coverage. It missed 12 of aiter's 123 op_tests/ targets, every
             # one of which does have a timing harness.
@@ -4412,6 +4496,161 @@ class PerfDecisionTests(unittest.TestCase):
     def shipped(self, status, files=None):
         return self.perf.discover_shipped(status, (files or self.SHIPPED).get)
 
+    def choose(self, status, correctness_target, repo_benches=()):
+        return self.perf.choose_perf_target(
+            self.shipped(status), list(repo_benches), correctness_target
+        )
+
+    def test_a_changed_kernel_file_becomes_the_module_a_bench_would_import(self):
+        modules = self.perf.changed_kernel_modules(
+            "M  aiter/ops/triton/gemm/basic/gemm_a8w8.py\n"
+            "M  aiter/ops/triton/attention/__init__.py\n"
+            "D  aiter/ops/triton/gone.py\n"
+            "M  op_tests/triton_tests/test_gemm.py\n"
+            "M  setup.py\n"
+        )
+        # A package's __init__ is the package. A deletion is not on head and nothing we are
+        # about to run can import it. And a change under op_tests/ is not a kernel change --
+        # otherwise editing a test's input generator would match the bench importing that
+        # test, and the stage would report on a kernel nobody touched.
+        self.assertEqual(
+            [
+                "aiter.ops.triton.attention",
+                "aiter.ops.triton.gemm.basic.gemm_a8w8",
+            ],
+            modules,
+        )
+
+    def test_the_three_ways_a_bench_spells_an_import_all_count(self):
+        # Parsed, not matched. aiter benches use all three, and the third -- where the
+        # imported NAME is itself a module -- is common enough in op_benchmarks/ that a regex
+        # over the dotted path alone misses it.
+        found = self.perf.imported_modules(
+            "import aiter.ops.mha\n"
+            "from aiter.ops.triton.attention.mla import mla_decode_fwd\n"
+            "from aiter.ops.triton.attention import extend_attention\n"
+            "from . import sibling\n"
+        )
+        self.assertIn("aiter.ops.mha", found)
+        self.assertIn("aiter.ops.triton.attention.mla", found)
+        self.assertIn("aiter.ops.triton.attention.extend_attention", found)
+
+    def test_a_near_miss_module_name_is_not_an_import_of_the_changed_one(self):
+        # The reason this is a parse and not a regex. A pattern loose enough to catch the
+        # parent-package form above also matches the longer name here, and the perf stage
+        # would time a bench for a kernel the patch never touched.
+        found = self.perf.imported_modules(
+            "from aiter.ops.triton.gemm.gemm_a8w8_preshuffle import go\n"
+        )
+        self.assertNotIn("aiter.ops.triton.gemm.gemm_a8w8", found)
+
+    def test_a_file_that_does_not_parse_contributes_no_candidate(self):
+        # The safe direction: it costs a candidate, where a wrong candidate costs a finding
+        # against a PR author.
+        self.assertEqual(set(), self.perf.imported_modules("def broken(:\n"))
+
+    REPO = {
+        "op_tests/op_benchmarks/triton/bench_k.py": (
+            "# --scenario bench\nfrom aiter.ops.triton.k import go\n"
+        ),
+        "op_tests/triton_tests/test_k.py": "from aiter.ops.triton.k import go\n",
+        "op_tests/op_benchmarks/triton/bench_other.py": (
+            "# --scenario bench\nfrom aiter.ops.triton.other import go\n"
+        ),
+        # A harness AND a module whose dotted name has the changed one as a prefix. This one
+        # is here rather than in the imported_modules tests above because that is not where
+        # the mistake gets made: a substring check inside discover_repo_benches never calls
+        # imported_modules at all, so a unit test of the parser cannot see it.
+        "op_tests/op_benchmarks/triton/bench_near.py": (
+            "# --scenario bench\nfrom aiter.ops.triton.k_preshuffle import go\n"
+        ),
+    }
+
+    def repo_benches(self, modules, files=None):
+        files = files or self.REPO
+        return self.perf.discover_repo_benches(
+            modules, lambda: sorted(files), files.get
+        )
+
+    def test_a_bench_is_found_by_the_import_it_makes_not_by_its_name(self):
+        # The whole premise. A matching filename is a resemblance; an import is an edge that
+        # can be checked. test_k.py imports the same module but carries no harness,
+        # bench_other.py carries a harness but imports something else, and bench_near.py
+        # imports aiter.ops.triton.k_preshuffle -- which a substring check reads as an import
+        # of aiter.ops.triton.k, and times a bench for a kernel the patch never touched.
+        self.assertEqual(
+            ["op_tests/op_benchmarks/triton/bench_k.py"],
+            self.repo_benches(["aiter.ops.triton.k"]),
+        )
+
+    def test_a_repo_bench_wins_over_one_the_pr_ships(self):
+        # Mechanical, not a preference: a pre-existing bench is on both sides of the patch, so
+        # the baseline is this worktree with the patch reversed. A bench the PR adds is absent
+        # from base and forces the cross-tree transplant, which needs --perf-control-column.
+        decision = self.choose(
+            "A  op_tests/bench_new.py\n",
+            "op_tests/test_old.py",
+            repo_benches=["op_tests/op_benchmarks/triton/bench_k.py"],
+        )
+        self.assertEqual("discovered-repo-bench", decision["basis"])
+        self.assertEqual("op_tests/op_benchmarks/triton/bench_k.py", decision["target"])
+        # The one it passed over is still named, so nobody has to wonder whether it was seen.
+        self.assertIn("op_tests/bench_new.py", decision["candidates"])
+
+    def test_a_shared_helper_matches_too_much_to_choose_from(self):
+        # aiter.ops.triton.utils.types is imported by 13 benches. A dtype alias added to it
+        # would otherwise pick one of them, and GPU noise below the threshold would become a
+        # should-fix against an author who touched a dict literal.
+        many = [f"op_tests/op_benchmarks/triton/bench_{n}.py" for n in range(13)]
+        decision = self.choose("", "op_tests/test_old.py", repo_benches=many)
+        self.assertEqual("same-as-correctness-target", decision["basis"])
+        self.assertIn("--perf-target", decision["reason"])
+
+    def test_one_bench_among_test_files_that_share_its_import_is_still_the_bench(self):
+        # A real decline that should not have been one: three files import
+        # aiter.ops.triton.attention.fp8_mqa_logits and carry a harness, but only one of them
+        # lives where the project keeps its benchmarks. That is a fact about how aiter is
+        # organised, not the filename resemblance the import edge exists to replace.
+        decision = self.choose(
+            "",
+            "op_tests/test_old.py",
+            repo_benches=[
+                "op_tests/flydsl_tests/test_flydsl_fp8_mqa_logits.py",
+                "op_tests/op_benchmarks/triton/bench_fp8_mqa_logits.py",
+                "op_tests/test_flydsl_pa_mqa_logits_fp4_prefill.py",
+            ],
+        )
+        self.assertEqual("discovered-repo-bench", decision["basis"])
+        self.assertEqual(
+            "op_tests/op_benchmarks/triton/bench_fp8_mqa_logits.py", decision["target"]
+        )
+
+    def test_the_tie_break_breaks_ties_and_does_not_settle_them(self):
+        # Two candidates in the benchmark directory is still a tie. This is the guard that
+        # keeps the shared-helper case above declining: 13 of its 14 candidates live there.
+        decision = self.choose(
+            "",
+            "op_tests/test_old.py",
+            repo_benches=[
+                "op_tests/op_benchmarks/triton/bench_a.py",
+                "op_tests/op_benchmarks/triton/bench_b.py",
+            ],
+        )
+        self.assertEqual("same-as-correctness-target", decision["basis"])
+
+    def test_the_dedicated_benchmark_directorys_own_convention_is_recognised(self):
+        # 58 of the 67 files under op_tests/op_benchmarks/ time themselves this way and only
+        # one of the 59 repo-wide matches any earlier rule -- so every rule this detector had
+        # was blind to almost the whole of the directory whose entire purpose is timing.
+        # Pointing --perf-target straight at bench_gemm_a8w8.py reported "no benchmark entry
+        # point", which reads as "there was nothing to measure".
+        for source in (
+            "@triton.testing.perf_report([benchmark])\ndef bench(x):\n    pass\n",
+            "ms = triton.testing.do_bench(lambda: fn())\n",
+        ):
+            with self.subTest(source=source.split("\n")[0]):
+                self.assertIsNotNone(self.perf.detect_harness(source))
+
     def test_a_bench_the_patch_ships_is_found_and_the_rest_of_it_is_not(self):
         found = self.shipped(
             "A  op_tests/bench_new.py\n"
@@ -4436,9 +4675,7 @@ class PerfDecisionTests(unittest.TestCase):
         self.assertEqual(1, len(found["unspellable"]))
 
     def test_one_shipped_bench_that_is_not_the_correctness_target_is_taken(self):
-        decision = self.perf.choose_perf_target(
-            self.shipped("A  op_tests/bench_new.py\n"), "op_tests/test_old.py"
-        )
+        decision = self.choose("A  op_tests/bench_new.py\n", "op_tests/test_old.py")
         self.assertEqual("discovered-pr-shipped", decision["basis"])
         self.assertEqual("op_tests/bench_new.py", decision["target"])
 
@@ -4446,9 +4683,7 @@ class PerfDecisionTests(unittest.TestCase):
         # Nothing was learned. The caller named this file and it happens to be timeable, which
         # is the case the perf stage has always handled; reporting it as discovered would tell
         # a reader the validator read the diff when it did not.
-        decision = self.perf.choose_perf_target(
-            self.shipped("A  op_tests/bench_new.py\n"), "op_tests/bench_new.py"
-        )
+        decision = self.choose("A  op_tests/bench_new.py\n", "op_tests/bench_new.py")
         self.assertEqual("same-as-correctness-target", decision["basis"])
 
     def test_several_shipped_benches_are_named_rather_than_chosen_between(self):
@@ -4461,6 +4696,7 @@ class PerfDecisionTests(unittest.TestCase):
             self.shipped(
                 "A  op_tests/bench_new.py\nA  op_tests/bench_two.py\n", files=files
             ),
+            [],
             "op_tests/test_old.py",
         )
         self.assertEqual("same-as-correctness-target", decision["basis"])
