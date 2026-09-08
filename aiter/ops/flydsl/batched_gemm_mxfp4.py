@@ -80,9 +80,14 @@ def flydsl_batched_gemm_mxfp4(
     a_row_bytes = a.shape[-1]
     K = a_row_bytes * _A_CODES_PER_BYTE[a_dtype]
 
-    # tile_m % 16 / tile_n % 64 must be exact or the kernel's chunk counts silently drop work.
-    if tile_m % 16 != 0:
-        raise RuntimeError(f"[FlyDSL] tile_m ({tile_m}) must be a multiple of 16")
+    # tile_m % 32 / tile_n % 64 must be exact or the kernel's chunk counts silently drop work.
+    # This checked % 16, but the kernel asserts % 32 (the A e8m0 scale is 32-row
+    # granular), so tile_m=16 passed here and died on a raw assert inside launch_gemm.
+    if tile_m % 32 != 0:
+        raise RuntimeError(
+            f"[FlyDSL] tile_m ({tile_m}) must be a multiple of 32 "
+            "(the A e8m0 scale is 32-row granular)"
+        )
     if tile_n % 64 != 0:
         raise RuntimeError(f"[FlyDSL] tile_n ({tile_n}) must be a multiple of 64")
     if N % tile_n != 0:
@@ -92,6 +97,20 @@ def flydsl_batched_gemm_mxfp4(
     if tile_k not in (128, 256) or K % tile_k != 0:
         raise RuntimeError(
             f"[FlyDSL] tile_k must be 128/256 dividing K; got {tile_k}, K={K}"
+        )
+    # The A tile is staged into LDS in whole cooperative rounds of
+    # num_threads*16 bytes, so an A tile that is not a multiple of one round
+    # would leave part of itself never DMA'd. The kernel asserts this, but the
+    # per-dimension checks above cannot see it: it couples tile_m, tile_k, tile_n
+    # *and* a_dtype. (32, 128, 128) is fine for fp6 but not fp4, for instance.
+    a_row_b = tile_k // _A_CODES_PER_BYTE[a_dtype]
+    a_copy_granularity = min(4, tile_n // 16) * 64 * 16
+    if (tile_m * a_row_b) % a_copy_granularity != 0:
+        raise RuntimeError(
+            f"[FlyDSL] tile_m*tile_k/{_A_CODES_PER_BYTE[a_dtype]} "
+            f"({tile_m * a_row_b}B of A tile) must be a multiple of "
+            f"{a_copy_granularity}B (num_threads*16) for a_dtype={a_dtype!r}; "
+            f"got tile_m={tile_m}, tile_n={tile_n}, tile_k={tile_k}"
         )
 
     out_dtype = "bf16" if dtype == torch.bfloat16 else "fp16"
@@ -126,6 +145,12 @@ def flydsl_batched_gemm_mxfp4(
         tile_k,
         a_dtype,
         out_dtype,
+        # B is always MXFP4 here (see the function name / docstring). launch_gemm
+        # grew b_dtype when FlyDSL added the a8w8 (fp8 B) path, and this call was
+        # never updated -- it passed 15 positional args where 16 are required, so
+        # B bound to b_dtype, every stride shifted by one, and waves_per_eu (which
+        # has no default) was left unbound.
+        "fp4",
         B,
         *strides,
         0,
