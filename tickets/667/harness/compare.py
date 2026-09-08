@@ -21,7 +21,8 @@ FlyDSL/CK ratio table.  Design (see SILOTIGER-667-plan-bench.md):
 Env / prerequisites:
   * Run under flydsl_venv on the isolated GPU, e.g.
       HIP_VISIBLE_DEVICES=6 ./flydsl_venv/bin/python tickets/667/harness/compare.py
-  * CK binary path via ``CK_BENCH`` (exported by build_ck_bench.sh) or ``--ck-bench``.
+  * Peer kernel via ``--backend`` (currently only ``ck``). CK binary path via
+    ``CK_BENCH`` (exported by build_ck_bench.sh) or ``--ck-bench``.
 
 Examples:
   # full cold sweep, of-record iters (D1) + variance (D5), markdown + csv artifacts
@@ -30,7 +31,7 @@ Examples:
       --csv-out tickets/667/g9_compare.csv
   # quick smoke (one shape, tiny iters, single pass)
   HIP_VISIBLE_DEVICES=6 ./flydsl_venv/bin/python tickets/667/harness/compare.py \
-      --shapes qwen3next --batches 1 --iters 30 --cold 5 --repeats 1
+      --backend ck --shapes qwen3next --batches 1 --iters 30 --cold 5 --repeats 1
 """
 
 from __future__ import annotations
@@ -49,6 +50,9 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parents[3]  # /workspaces/aiter
 OPTEST = REPO / "op_tests" / "flydsl_tests" / "test_flydsl_warp_decode_moe.py"
 CK_BENCH_DEFAULT = "/workspaces/rocm-libraries-wdec/bench_ck_warp_decode"
+# Peer kernel families FlyDSL is compared against. Add new names here as
+# additional backends land; ``--backend`` choices stay in lockstep.
+BACKENDS = ("ck",)
 
 # Shape set (dims are the join key; CK shape names match these keys).
 #   H=hidden, I=inter, E=num_experts, K=top_k
@@ -258,13 +262,20 @@ def run_flydsl(mod, shapes, batches, iters, warmup, timing):
 def run_ck_repeats(shapes, batches, iters, cold, ck_bench, repeats):
     """Run the CK sweep `repeats` times; return ({key -> [us,...]}, provenance)."""
     agg: dict = {}
-    prov = "(CK skipped)"
+    prov = ""
     for r in range(repeats):
         records, prov = run_ck(shapes, batches, iters, cold, ck_bench)
         for k, us in records.items():
             agg.setdefault(k, []).append(us)
         print(f"[compare] CK repeat {r + 1}/{repeats} done", file=sys.stderr)
     return agg, prov
+
+
+def run_backend_repeats(backend, shapes, batches, iters, cold, ck_bench, repeats):
+    """Dispatch the peer-kernel sweep for ``--backend``."""
+    if backend == "ck":
+        return run_ck_repeats(shapes, batches, iters, cold, ck_bench, repeats)
+    raise ValueError(f"unsupported backend {backend!r}; choose from {BACKENDS}")
 
 
 def run_flydsl_repeats(mod, shapes, batches, iters, warmup, timing, repeats):
@@ -477,8 +488,12 @@ def main() -> int:
         "--method", default="weight_stream", choices=["weight_stream", "total_traffic"]
     )
     ap.add_argument("--ck-bench", default=os.environ.get("CK_BENCH", CK_BENCH_DEFAULT))
-    ap.add_argument("--no-ck", action="store_true", help="skip CK (FlyDSL-only)")
-    ap.add_argument("--no-flydsl", action="store_true", help="skip FlyDSL (CK-only)")
+    ap.add_argument(
+        "--backend",
+        default="ck",
+        choices=list(BACKENDS),
+        help="peer kernel to compare FlyDSL against (default: ck)",
+    )
     ap.add_argument(
         "--repeats",
         type=int,
@@ -509,35 +524,41 @@ def main() -> int:
     )
     gpu = gpu.split(",")[0].strip() if gpu else None
 
-    ck_records, ck_prov = {}, "(CK skipped)"
+    if args.backend == "ck" and not Path(args.ck_bench).exists():
+        ap.error(
+            f"CK binary not found: {args.ck_bench} (build_ck_bench.sh / --ck-bench)"
+        )
+
     mod = load_flydsl_module()
-    fly_records = {}
     with ClockSampler(gpu) as clk:
-        if not args.no_ck:
-            if not Path(args.ck_bench).exists():
-                ap.error(
-                    f"CK binary not found: {args.ck_bench} (build_ck_bench.sh / --ck-bench)"
-                )
-            ck_records, ck_prov = run_ck_repeats(
-                shapes, batches, args.iters, args.cold, args.ck_bench, args.repeats
-            )
-        if not args.no_flydsl:
-            fly_records = run_flydsl_repeats(
-                mod, shapes, batches, args.iters, args.warmup, args.timing, args.repeats
-            )
+        peer_records, peer_prov = run_backend_repeats(
+            args.backend,
+            shapes,
+            batches,
+            args.iters,
+            args.cold,
+            args.ck_bench,
+            args.repeats,
+        )
+        fly_records = run_flydsl_repeats(
+            mod, shapes, batches, args.iters, args.warmup, args.timing, args.repeats
+        )
     clk_summary = clk.summary()
 
     rows = build_rows(
-        mod, fly_records, ck_records, shapes, batches, args.method, args.noise_pct
+        mod, fly_records, peer_records, shapes, batches, args.method, args.noise_pct
     )
 
+    ck_worktree = (
+        _git_commit(Path(args.ck_bench).parent) if args.backend == "ck" else "n/a"
+    )
     header_lines = [
-        "SILOTIGER-667 G9 FlyDSL-vs-CK cold warp-decode comparison",
+        f"SILOTIGER-667 G9 FlyDSL-vs-{args.backend} cold warp-decode comparison",
         f"gfx={mod.get_gfx()}  aiter={_git_commit(REPO)}  "
-        f"ck_worktree={_git_commit(Path(args.ck_bench).parent)}",
+        f"backend={args.backend}  ck_worktree={ck_worktree}",
         f"iters={args.iters} cold={args.cold} timing={args.timing} method={args.method} "
         f"repeats={args.repeats}",
-        f"CK provenance: {ck_prov}",
+        f"{args.backend} provenance: {peer_prov}",
         f"clocks: auto (unpinnable on this gfx950; D1) -- effective {clk_summary} on GPU "
         f"{gpu}; per-cell spread%% + noisy flag (>{args.noise_pct:.0f}%) capture drift (D5).",
         "config policy (D3): default-vs-default. FlyDSL = library defaults, no overrides: "
