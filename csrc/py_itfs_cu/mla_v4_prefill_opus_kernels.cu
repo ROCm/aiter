@@ -17,16 +17,16 @@
 
 #include <cstddef>
 
-void pa_sparse_prefill_gfx950_opus_fwd(aiter_tensor_t& q,
-                                       aiter_tensor_t& unified_kv,
-                                       aiter_tensor_t& kv_indices_prefix,
-                                       aiter_tensor_t& kv_indptr_prefix,
-                                       aiter_tensor_t& kv,
-                                       aiter_tensor_t& kv_indices_extend,
-                                       aiter_tensor_t& kv_indptr_extend,
-                                       aiter_tensor_t& attn_sink,
-                                       aiter_tensor_t& out,
-                                       float softmax_scale)
+void opus_mla_v4_prefill_a16w16_gfx950_fwd(aiter_tensor_t& q,
+                                           aiter_tensor_t& unified_kv,
+                                           aiter_tensor_t& kv_indices_prefix,
+                                           aiter_tensor_t& kv_indptr_prefix,
+                                           aiter_tensor_t& kv,
+                                           aiter_tensor_t& kv_indices_extend,
+                                           aiter_tensor_t& kv_indptr_extend,
+                                           aiter_tensor_t& attn_sink,
+                                           aiter_tensor_t& out,
+                                           float softmax_scale)
 {
     // ---- Shape / dtype validation -----------------------------------------
     AITER_CHECK(q.dim() == 3, "q must be 3-D [N, H, D], got ndim=", q.dim());
@@ -55,7 +55,7 @@ void pa_sparse_prefill_gfx950_opus_fwd(aiter_tensor_t& q,
     const int H = static_cast<int>(q.size(1));
     const int D = static_cast<int>(q.size(2));
     AITER_CHECK(D == 512,
-                "Only D=512 is compiled for pa_sparse_prefill_gfx950_opus_fwd, got D=", D);
+                "Only D=512 is compiled for opus_mla_v4_prefill_a16w16_gfx950_fwd, got D=", D);
     AITER_CHECK(unified_kv.size(1) == D, "unified_kv last dim must equal q last dim (D=512)");
     AITER_CHECK(kv.size(1) == D, "kv last dim must equal q last dim (D=512)");
     AITER_CHECK(out.size(0) == N && out.size(1) == H && out.size(2) == D,
@@ -138,19 +138,19 @@ void pa_sparse_prefill_gfx950_opus_fwd(aiter_tensor_t& q,
 #undef LAUNCH_OPUS_MLA_V4_PREFILL
 }
 
-void pa_sparse_prefill_fp8_gfx950_opus_fwd(aiter_tensor_t& q_nope,
-                                           aiter_tensor_t& q_rope,
-                                           aiter_tensor_t& unified_kv_nope,
-                                           aiter_tensor_t& unified_kv_rope,
-                                           aiter_tensor_t& kv_indices_prefix,
-                                           aiter_tensor_t& kv_indptr_prefix,
-                                           aiter_tensor_t& kv_nope,
-                                           aiter_tensor_t& kv_rope,
-                                           aiter_tensor_t& kv_indices_extend,
-                                           aiter_tensor_t& kv_indptr_extend,
-                                           aiter_tensor_t& attn_sink,
-                                           aiter_tensor_t& out,
-                                           float softmax_scale)
+void opus_mla_v4_prefill_a8w8_gfx950_fwd(aiter_tensor_t& q_nope,
+                                         aiter_tensor_t& q_rope,
+                                         aiter_tensor_t& unified_kv_nope,
+                                         aiter_tensor_t& unified_kv_rope,
+                                         aiter_tensor_t& kv_indices_prefix,
+                                         aiter_tensor_t& kv_indptr_prefix,
+                                         aiter_tensor_t& kv_nope,
+                                         aiter_tensor_t& kv_rope,
+                                         aiter_tensor_t& kv_indices_extend,
+                                         aiter_tensor_t& kv_indptr_extend,
+                                         aiter_tensor_t& attn_sink,
+                                         aiter_tensor_t& out,
+                                         float softmax_scale)
 {
     // Single compiled configuration: split NoPE fp8 (448 + 14 E8M0 scales + pad
     // = 512 fp8 slots/row) and RoPE bf16 (64), D_HEAD = 512.
@@ -409,16 +409,16 @@ int gfx1250_pick_cluster_y(int num_h_blocks)
 
 } // namespace
 
-void pa_sparse_prefill_gfx1250_opus_fwd(aiter_tensor_t& q,
-                                        aiter_tensor_t& unified_kv,
-                                        aiter_tensor_t& kv_indices_prefix,
-                                        aiter_tensor_t& kv_indptr_prefix,
-                                        aiter_tensor_t& kv,
-                                        aiter_tensor_t& kv_indices_extend,
-                                        aiter_tensor_t& kv_indptr_extend,
-                                        aiter_tensor_t& attn_sink,
-                                        aiter_tensor_t& out,
-                                        float softmax_scale)
+void opus_mla_v4_prefill_a16w16_gfx1250_fwd(aiter_tensor_t& q,
+                                            aiter_tensor_t& unified_kv,
+                                            aiter_tensor_t& kv_indices_prefix,
+                                            aiter_tensor_t& kv_indptr_prefix,
+                                            aiter_tensor_t& kv,
+                                            aiter_tensor_t& kv_indices_extend,
+                                            aiter_tensor_t& kv_indptr_extend,
+                                            aiter_tensor_t& attn_sink,
+                                            aiter_tensor_t& out,
+                                            float softmax_scale)
 {
     // ---- Shape / dtype validation -----------------------------------------
     AITER_CHECK(q.dim() == 3, "q must be 3-D [N, H, D], got ndim=", q.dim());
@@ -546,19 +546,19 @@ void pa_sparse_prefill_gfx1250_opus_fwd(aiter_tensor_t& q,
     }
 }
 
-void pa_sparse_prefill_fp8_gfx1250_opus_fwd(aiter_tensor_t& q_nope,
-                                            aiter_tensor_t& q_rope,
-                                            aiter_tensor_t& unified_kv_nope,
-                                            aiter_tensor_t& unified_kv_rope,
-                                            aiter_tensor_t& kv_indices_prefix,
-                                            aiter_tensor_t& kv_indptr_prefix,
-                                            aiter_tensor_t& kv_nope,
-                                            aiter_tensor_t& kv_rope,
-                                            aiter_tensor_t& kv_indices_extend,
-                                            aiter_tensor_t& kv_indptr_extend,
-                                            aiter_tensor_t& attn_sink,
-                                            aiter_tensor_t& out,
-                                            float softmax_scale)
+void opus_mla_v4_prefill_a8w8_gfx1250_fwd(aiter_tensor_t& q_nope,
+                                          aiter_tensor_t& q_rope,
+                                          aiter_tensor_t& unified_kv_nope,
+                                          aiter_tensor_t& unified_kv_rope,
+                                          aiter_tensor_t& kv_indices_prefix,
+                                          aiter_tensor_t& kv_indptr_prefix,
+                                          aiter_tensor_t& kv_nope,
+                                          aiter_tensor_t& kv_rope,
+                                          aiter_tensor_t& kv_indices_extend,
+                                          aiter_tensor_t& kv_indptr_extend,
+                                          aiter_tensor_t& attn_sink,
+                                          aiter_tensor_t& out,
+                                          float softmax_scale)
 {
     // ---- Shape / dtype validation -----------------------------------------
     AITER_CHECK(q_nope.dim() == 3, "q_nope must be 3-D [N, H, 512], got ndim=", q_nope.dim());

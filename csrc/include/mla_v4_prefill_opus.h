@@ -29,28 +29,28 @@
 // One entry point per target: gfx950 runs the kernel compiled from the device
 // templates below, gfx1250 runs a prebuilt code object. The Python layer picks
 // one based on the running GPU.
-void pa_sparse_prefill_gfx950_opus_fwd(aiter_tensor_t& q,
-                                       aiter_tensor_t& unified_kv,
-                                       aiter_tensor_t& kv_indices_prefix,
-                                       aiter_tensor_t& kv_indptr_prefix,
-                                       aiter_tensor_t& kv,
-                                       aiter_tensor_t& kv_indices_extend,
-                                       aiter_tensor_t& kv_indptr_extend,
-                                       aiter_tensor_t& attn_sink,
-                                       aiter_tensor_t& out,
-                                       float softmax_scale);
+void opus_mla_v4_prefill_a16w16_gfx950_fwd(aiter_tensor_t& q,
+                                           aiter_tensor_t& unified_kv,
+                                           aiter_tensor_t& kv_indices_prefix,
+                                           aiter_tensor_t& kv_indptr_prefix,
+                                           aiter_tensor_t& kv,
+                                           aiter_tensor_t& kv_indices_extend,
+                                           aiter_tensor_t& kv_indptr_extend,
+                                           aiter_tensor_t& attn_sink,
+                                           aiter_tensor_t& out,
+                                           float softmax_scale);
 
 // gfx1250: only the bf16 variant is built into the code object.
-void pa_sparse_prefill_gfx1250_opus_fwd(aiter_tensor_t& q,
-                                        aiter_tensor_t& unified_kv,
-                                        aiter_tensor_t& kv_indices_prefix,
-                                        aiter_tensor_t& kv_indptr_prefix,
-                                        aiter_tensor_t& kv,
-                                        aiter_tensor_t& kv_indices_extend,
-                                        aiter_tensor_t& kv_indptr_extend,
-                                        aiter_tensor_t& attn_sink,
-                                        aiter_tensor_t& out,
-                                        float softmax_scale);
+void opus_mla_v4_prefill_a16w16_gfx1250_fwd(aiter_tensor_t& q,
+                                            aiter_tensor_t& unified_kv,
+                                            aiter_tensor_t& kv_indices_prefix,
+                                            aiter_tensor_t& kv_indptr_prefix,
+                                            aiter_tensor_t& kv,
+                                            aiter_tensor_t& kv_indices_extend,
+                                            aiter_tensor_t& kv_indptr_extend,
+                                            aiter_tensor_t& attn_sink,
+                                            aiter_tensor_t& out,
+                                            float softmax_scale);
 
 // Public API: split-precision prefill attention for DeepSeek-V4 DSA.
 //
@@ -71,33 +71,33 @@ void pa_sparse_prefill_gfx1250_opus_fwd(aiter_tensor_t& q,
 //   attn_sink          : [H] fp32 (per-head softmax-denominator bias)
 //   out                : [N, H, 512] bf16 (caller-allocated)
 // `softmax_scale` is forwarded to the kernel as-is (no implicit 1/sqrt(D)).
-void pa_sparse_prefill_fp8_gfx950_opus_fwd(aiter_tensor_t& q_nope,
-                                           aiter_tensor_t& q_rope,
-                                           aiter_tensor_t& unified_kv_nope,
-                                           aiter_tensor_t& unified_kv_rope,
-                                           aiter_tensor_t& kv_indices_prefix,
-                                           aiter_tensor_t& kv_indptr_prefix,
-                                           aiter_tensor_t& kv_nope,
-                                           aiter_tensor_t& kv_rope,
-                                           aiter_tensor_t& kv_indices_extend,
-                                           aiter_tensor_t& kv_indptr_extend,
-                                           aiter_tensor_t& attn_sink,
-                                           aiter_tensor_t& out,
-                                           float softmax_scale);
+void opus_mla_v4_prefill_a8w8_gfx950_fwd(aiter_tensor_t& q_nope,
+                                         aiter_tensor_t& q_rope,
+                                         aiter_tensor_t& unified_kv_nope,
+                                         aiter_tensor_t& unified_kv_rope,
+                                         aiter_tensor_t& kv_indices_prefix,
+                                         aiter_tensor_t& kv_indptr_prefix,
+                                         aiter_tensor_t& kv_nope,
+                                         aiter_tensor_t& kv_rope,
+                                         aiter_tensor_t& kv_indices_extend,
+                                         aiter_tensor_t& kv_indptr_extend,
+                                         aiter_tensor_t& attn_sink,
+                                         aiter_tensor_t& out,
+                                         float softmax_scale);
 
-void pa_sparse_prefill_fp8_gfx1250_opus_fwd(aiter_tensor_t& q_nope,
-                                            aiter_tensor_t& q_rope,
-                                            aiter_tensor_t& unified_kv_nope,
-                                            aiter_tensor_t& unified_kv_rope,
-                                            aiter_tensor_t& kv_indices_prefix,
-                                            aiter_tensor_t& kv_indptr_prefix,
-                                            aiter_tensor_t& kv_nope,
-                                            aiter_tensor_t& kv_rope,
-                                            aiter_tensor_t& kv_indices_extend,
-                                            aiter_tensor_t& kv_indptr_extend,
-                                            aiter_tensor_t& attn_sink,
-                                            aiter_tensor_t& out,
-                                            float softmax_scale);
+void opus_mla_v4_prefill_a8w8_gfx1250_fwd(aiter_tensor_t& q_nope,
+                                          aiter_tensor_t& q_rope,
+                                          aiter_tensor_t& unified_kv_nope,
+                                          aiter_tensor_t& unified_kv_rope,
+                                          aiter_tensor_t& kv_indices_prefix,
+                                          aiter_tensor_t& kv_indptr_prefix,
+                                          aiter_tensor_t& kv_nope,
+                                          aiter_tensor_t& kv_rope,
+                                          aiter_tensor_t& kv_indices_extend,
+                                          aiter_tensor_t& kv_indptr_extend,
+                                          aiter_tensor_t& attn_sink,
+                                          aiter_tensor_t& out,
+                                          float softmax_scale);
 
 #ifdef OPUS_MLA_V4_PREFILL_IMPL
 // ============================================================================
