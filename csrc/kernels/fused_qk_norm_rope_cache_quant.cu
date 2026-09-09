@@ -1977,7 +1977,7 @@ __global__ void fused_rope_rms_1way_kernel(const T* q_,
 //   Pass 0 to keep the runtime path. Selected by the host dispatcher
 //   based on the actual num_heads_q / num_heads_k.
 //
-//   Empirical impact at T=8192, HEAD_SIZE=128, bf16 on MI308X: 3-5% faster
+//   Empirical impact at T=8192, HEAD_SIZE=128, bf16 on MI308X: faster
 //   per-warp than the runtime path (kernel is dominated by VMEM latency,
 //   not int-div). VGPR usage and occupancy are identical.
 template <typename T,
@@ -4439,8 +4439,8 @@ namespace aiter {
     // Written elementwise (`cos_ptr[cos_i]`) the compiler cannot see any of that:
     // a `const scalar_t*` kernel parameter carries only alignof(scalar_t) == 2, so
     // LLVM refuses to merge and emits one global_load_u16 per entry plus ~4 VALU
-    // of 64-bit address math per pair. Measured on the gfx1250 decode FG kernel:
-    // 48 global_load_u16 where 4 global_load_b128 would do.
+    // of 64-bit address math per pair -- a run of narrow u16 loads where a handful
+    // of b128 loads would do.
     //
     // Reading through an ext_vector_type asserts the alignment that is actually
     // there, so the run collapses to a single b128 (bf16 N=8) load.
@@ -4878,20 +4878,12 @@ namespace aiter {
       // The alternative -- a block owning ONE token and a contiguous run of
       // TOKENS_PER_BLOCK*HPW heads, wave w taking head run_base + t*TPB + w at step
       // t so the concurrent Q row loads are ADJACENT rows -- was implemented and
-      // MEASURED. That is `row_of(tile) = tile*RT + wave`, whose workgroup
-      // owns one token's whole head set (CT*RT == H) for exactly this reason.
-      //
-      // It does not pay here: T=16384 H=128 G=64, paired A/B 6 reps, 301.44 ->
-      // 304.58 us, +1.04% (95% CI [-0.12, +2.21], 4/6 reps positive). Outputs were
-      // correct (err_q identical to baseline, 40/40 SWA byte-exact).
-      //
-      // Caveat on that number: the adjacent-row grid needs grid.x == num_tokens for
-      // the Q blocks, and grid.x is shared with the K row (blockIdx.y == 0), so the
-      // K row gets num_tokens blocks instead of ceil(num_tokens/TPB) -- 49152 blocks
-      // / 196608 wave slots against 36864 / 147456, i.e. arm B carried a +33%
-      // dispatch handicap (the surplus blocks retire whole on the token bounds
-      // test). The true mapping effect is therefore somewhere at or slightly below
-      // neutral, not the measured +1.04%.
+      // measured, and does not pay. (That variant also carries a dispatch handicap:
+      // it needs grid.x == num_tokens for the Q blocks, and grid.x is shared with
+      // the K row, so the K row gets num_tokens blocks instead of
+      // ceil(num_tokens/TPB). Merely swapping which grid dimension carries the head
+      // group, which has no such handicap, was measured separately and is also
+      // neutral.)
       //
       // Either way it cannot be a large win, because there is nothing for it to
       // share: head_dim=512 bf16 is a 1 KB row consumed entirely by one wave, and
@@ -5091,9 +5083,8 @@ namespace aiter {
       if (is_pe_thread) {
         const int32_t pe_local_tid = tid - pe_tid_start;
         // NOT vectorised, deliberately. The same load_rope_cos_sin<> treatment that
-        // is worth -12% on the FG (decode) kernel MEASURED AS A REGRESSION here:
-        // paired op_test, 5 clean pairs, H=32 -> T=16384 +1.95% (CI +0.23..+3.67,
-        // 1/5 negative) and T=1024 -0.72%. The coarse kernel already hoists this
+        // is a clear win on the FG (decode) kernel measured as a REGRESSION here.
+        // The coarse kernel already hoists this
         // read ONCE PER WAVE and reuses it across the HPW-head loop, so there are
         // only vec_size_i scalar loads per wave to begin with (not per head) --
         // nothing to recover -- while the packed-index form it requires perturbs
@@ -5284,8 +5275,7 @@ namespace aiter {
           // does not reproduce: the full sweep is byte-identical to the __shfl_xor
           // build -- same err_q value set, 40/40 paged-SWA checks exact.
           //
-          // Measured -2.07% at T=16384 H=128 G=64 (paired A/B, 15 clean reps,
-          // 95% CI [-2.95, -1.20]).
+          // Measured a real win at T=16384 H=128 G=64.
           thread_max = multithread_reduce_max_dpp<Q_REDUCE>(thread_max);
           constexpr MxDtype kQMxDt = kHwFp8E4m3Dtype;
           const E8m0BlockScale qs_scale =
@@ -5409,7 +5399,7 @@ namespace aiter {
 
     // ===========================================================================
     // Fine-grained variant -- auto-selected for the
-    // xlarge prefill tier (T >= ~8k, num_tokens <= 65535); ~5-17% faster there.
+    // xlarge prefill tier (T >= ~8k, num_tokens <= 65535).
     // ---------------------------------------------------------------------------
     // One block == one wave == exactly ONE (token, head) tile:
     //   grid.x = num_heads + 1 (head; 0 -> K, 1.. -> Q), grid.y = num_tokens.
@@ -5482,7 +5472,7 @@ namespace aiter {
       constexpr int32_t GROUP_SIZE = 64;
       constexpr int32_t reduce_thread_size = GROUP_SIZE / vec_size_i;
       // Streaming (read-once) inputs -> NT/SLC|GLC to bypass L2 (same as the coarse
-      // kernel). Measured: NT beats cached here (cached ~9% slower at H=128 decode).
+      // kernel). Measured: NT beats cached here.
       constexpr int32_t IN_LOAD_AUX = (sizeof(scalar_t) < 4) ? GROUP_NT : 0;
       constexpr int32_t in_chunk_bytes = (vec_size_i * sizeof(scalar_t)) % 16 == 0 ? 16 : 8;
 
@@ -5514,7 +5504,7 @@ namespace aiter {
       // load stall ahead of the main q/kv global load. Instead, each branch below issues
       // its q/kv data load FIRST, then computes these ptrs -- so the data load's long
       // global-memory latency overlaps the positions load + address setup. Measured
-      // ~5-10% faster at small-T (decode, latency-bound); numerically identical.
+      // faster at small-T (decode, latency-bound); numerically identical.
       auto compute_rope_ptrs = [&](const scalar_t*& cos_ptr, const scalar_t*& sin_ptr) {
         int32_t rope_pos = static_cast<int32_t>(positions[token_idx]);
         if (params.max_position > 0)
@@ -6013,17 +6003,14 @@ namespace aiter {
       // guard: 6 of 18 are `s_or_b32 exec_lo` (the EXEC restore after an
       // exec-masked memory op) and the rest are scalar-register reuse. The real
       // target is the exec masks -- `is_nope_thread`, the `tid % reduce == 0`
-      // scale store, `write_swa` -- which is the same fix that was worth -1.57%
-      // in inverse_rope_group_quant, not a change of load instruction.
+      // scale store, `write_swa` -- which is the same fix that paid off in
+      // inverse_rope_group_quant, not a change of load instruction.
       //
       // Kept behind the knob because the machinery (prologue issue + dispatched
       // s_wait_tensorcnt, LDS slots) is correct and bit-exact, and is the right
       // starting point if the xlarge prefill tier is ever revisited.
 #ifndef AITER_FG_USE_TDM
-// Measured -11.32% at the XLARGE tier (H=128 T=16384, paired op_test, 3 clean
-// pairs, 95% CI [-11.43, -11.20]) -- a real win there.
-//
-// Left OFF anyway: the same flag also reaches the DECODE tier, the other user of
+// Measured a real win at the XLARGE tier. Left OFF anyway: the same flag also reaches the DECODE tier, the other user of
 // the FG kernel, where TDM measured neutral-to-harmful -- the LDS round trip buys
 // nothing when a wave owns a single head, so there is no second tile to overlap
 // with, and a decode-latency regression outweighs the prefill gain. The knob
@@ -6399,12 +6386,12 @@ void fused_qk_norm_rope_group_quant(
   //
   // Four tiers, by prefill block count (= ceil(T/4) * (1 + q_waves_med)):
   //   decode : tiny T,  tokens_per_block=1, HPW=1   (max blocks to fill the CUs)
-  //   med    : mid T,                       HPW=3   (~8-11% better than 4 here;
+  //   med    : mid T,                       HPW=3   (better than 4 here;
   //            the prefill mid-range is occupancy/latency-bound, so more, smaller
   //            blocks fill the CUs better)
   //   large  : T ~ 2k-4k,                   HPW=8
   //   xlarge : T >= ~8k,                    HPW=16  (largest prefill chunks, e.g.
-  //            ATOM's 16384; HPW=16 is ~3-5% faster than 8 at T=8192/16384 for
+  //            ATOM's 16384; HPW=16 beats 8 at T=8192/16384 for
   //            H=64/128, while T<=4096 stays on the large tier at 8).
   // Thresholds are in blocks/CU, so they scale with H (larger H reaches a tier at
   // smaller T) and with the device CU count -- matching the measured per-H crossovers.
@@ -6419,14 +6406,14 @@ void fused_qk_norm_rope_group_quant(
   // amortised across 16 heads, with the Q-head TDM ring covering the loads.
   //
   // Two shape changes that look free and measured WORSE, both at T=16384 H=128:
-  //   #pragma unroll 2 on the head loop          +1.20%
-  //   templating HPW so the trip count is known  +1.61% (SALU 775 -> 702)
+  //   #pragma unroll 2 on the head loop
+  //   templating HPW so the trip count is compile-time known
   // The kernel is not SALU bound at this size, so trading code size for scalar
   // work does not pay.
   //
-  // The kernarg reorder that is worth -20.2% at T=512 does not transfer here:
-  // s_wait_kmcnt is 15.6% of T=512 and 1.2% at T=16384, being a fixed per-wave
-  // cost amortised over 20x more work.
+  // The kernarg reorder that is a large win at T=512 does not transfer here:
+  // s_wait_kmcnt is a sizeable share of T=512 and a negligible one at T=16384,
+  // being a fixed per-wave cost amortised over 20x more work.
   // ---------------------------------------------------------------------------
 
   const int prefill_q_waves_med = (num_heads + PREFILL_Q_HEADS_PER_WAVE_MED - 1) / PREFILL_Q_HEADS_PER_WAVE_MED;
@@ -6441,19 +6428,15 @@ void fused_qk_norm_rope_group_quant(
   // (44), T=2048 H=64 (46), T=4096 H=32 (48). All go med (HPW=3) -> large
   // (HPW=8); nothing else in the sweep changes tier.
   //
-  // MEASURED, paired A/B, kernel-trace median of 103 dispatches, 6 reps each,
-  // every rep gated on an idle card:
-  //   T=4096 H=16   17.980 -> 16.631 us   -7.20%  (95% CI [-13.31, -1.09], 4/6)
-  //   T=2048 H=32   16.846 -> 17.299 us   +2.79%  (95% CI [ -0.85, +6.43], 2/6)
-  // One clear win, one indistinguishable from zero; the rest of the moved shapes
-  // land inside noise on a single-run sweep.
+  // Paired A/B over the moved shapes: T=4096 H=16 is a clear win, T=2048 H=32 is
+  // indistinguishable from zero, and the rest land inside noise.
   //
   // Two cautions for anyone re-tuning this:
   //
-  // 1. A single-run sweep is not enough to judge it. That sweep put T=4096 H=16
-  //    at -13.31% and T=2048 H=32 at +9.75%, and paired A/B shrank both toward
-  //    zero. Shapes whose tier does NOT change showed +3.1..+3.6% on the same
-  //    sweep, which bounds its noise at about +/-3%.
+  // 1. A single-run sweep is not enough to judge it. It exaggerated both of those
+  //    shapes in opposite directions, and paired A/B pulled both toward zero.
+  //    Shapes whose tier does NOT change moved as much on the same sweep, which is
+  //    what bounds its noise.
   //
   // 2. The win is not a function of blocks/CU alone. 24 (T=2048 H=32) is neutral
   //    while 28 (T=4096 H=16) wins, so the boundary does not separate them --
@@ -6470,12 +6453,8 @@ void fused_qk_norm_rope_group_quant(
   // large. 16 rows per wave is the right width at every prefill size, so the old
   // 300 boundary was leaving two sizes on a narrower wave than they wanted.
   //
-  // MEASURED, paired A/B, kernel-trace median of 103 dispatches, 6 reps each,
-  // all reps gated on an idle card:
-  //   T=4096 H=128   79.205 -> 76.461 us   -3.46%  (95% CI [-4.52, -2.40], 6/6)
-  //   T=2048 H=128   45.301 -> 44.433 us   -1.90%  (95% CI [-5.58, +1.78], 4/6)
-  // T=4096 is the clean result; T=2048 points the same way but its CI straddles
-  // zero, so treat it as "not worse" rather than as a second win.
+  // Paired A/B: T=4096 H=128 is the clean win; T=2048 H=128 points the same way
+  // but its CI straddles zero, so treat it as "not worse", not a second win.
   //
   // T=2048 was the worst cell in the size sweep, which is what pointed at the tier.
   constexpr int XLARGE_PREFILL_THRESHOLD = 64;  // large  -> xlarge (blocks/CU)
@@ -6513,8 +6492,8 @@ void fused_qk_norm_rope_group_quant(
   // Q_GROUP_SIZE / Q_SCALE_FP32 are only meaningful when q_out is fp8 (q_dt != kAuto);
   // for bf16 q_out we collapse onto (G=64, e8m0) — the kernel ignores them.
   // Fine-grained path: 1 wave per (token, head), block=64,
-  // grid=(num_heads+1, num_tokens). Measured on gfx950 (MI355): ~5-17% faster
-  // than the coarse HPW path at large prefill (T >= ~8k) for both bf16 and fp8 Q.
+  // grid=(num_heads+1, num_tokens). Measured on gfx950 (MI355): faster than the
+  // coarse HPW path at large prefill (T >= ~8k) for both bf16 and fp8 Q.
   // At mid T (256-2048) the coarse path's per-wave head aggregation (one cos/sin
   // gather reused across HPW heads) wins, so we only switch to FG for the xlarge
   // tier. grid.y == num_tokens, so cap at 65535 (larger T would need a Y-chunk loop).
@@ -6522,22 +6501,21 @@ void fused_qk_norm_rope_group_quant(
   // wins for *many-head* shapes in the large tier: with H>=128 (e.g. DeepSeek-V4
   // at TP=1) the coarse HPW=8 path serializes 8 heads/wave with a long
   // load->2-pass-reduce->store chain, while FG's finer split hides the memory
-  // latency better. Measured on an idle MI355 (fp8 quant): H=128 large tier is
-  // ~3-14% faster under FG (T=2048..4096); H<=32 stays on coarse (FG regresses
-  // few-head shapes ~6-10%), and H=64 is mixed so it stays coarse too.
+  // latency better. Measured on an idle MI355 (fp8 quant): H=128 in the large tier
+  // is faster under FG; H<=32 stays on coarse (FG regresses few-head shapes), and
+  // H=64 is mixed so it stays coarse too.
   constexpr int FG_MANY_HEADS_MIN = 128;
   // Fine-grained (1 wave / (token,head)) wins for MANY-head shapes but regresses
   // few-head ones (the coarse path's per-wave work amortizes better with few heads).
-  // This holds at BOTH the large tier and the decode tier (measured on MI355, fp8+SWA,
-  // T=32: H=128 ~7% faster under FG, H=16 ~9% slower), so gate the decode->FG routing
+  // This holds at BOTH the large tier and the decode tier (measured on MI355,
+  // fp8+SWA), so gate the decode->FG routing
   // on the same many-heads threshold. The FG K wave carries the same fused SWA scatter
   // as the coarse path, so decode+SWA (H>=FG_MANY_HEADS_MIN) can use it too.
   // Decode tier -> always fine-grained. Measured on idle MI355 via rocprofv3
   // --kernel-trace (real GPU-kernel time, NOT wall-clock -- wall-clock is dominated
   // by HIP's per-call host dispatch and misranks the two): at T=32 the FG kernel
-  // matches the coarse path for H=16 (4.66 vs 4.68us) and beats it for H=128
-  // (5.96 vs 6.04us), while the coarse decode kernel additionally spills (12 B
-  // scratch, 32 VGPR vs FG's 24). FG also carries the SWA scatter, so decode+SWA
+  // matches the coarse path for H=16 and beats it for H=128, while the coarse
+  // decode kernel additionally spills. FG also carries the SWA scatter, so decode+SWA
   // uses it too. (Large tier keeps the FG_MANY_HEADS_MIN gate: coarse HPW>1 there
   // amortizes the cos/sin gather across heads, which FG can't at HPW>1.)
   // xlarge -> FG was an MI355 choice, and on gfx1250 it is the worst cell measured.
@@ -6547,8 +6525,7 @@ void fused_qk_norm_rope_group_quant(
   // once per row. Routing xlarge to coarse (HPW=16) lands at 36,864 WGs / 147,456
   // waves with 16 heads/wave, and coarse already carries the Q-head TDM ring.
 #ifndef AITER_XLARGE_USE_COARSE
-// MEASURED gfx1250 H=128 T=16384, paired op_test, 6/6 clean pairs, sd 0.50pp:
-//   569.59 -> 348.50 us, -38.82% (CI -39.21..-38.42).
+// A large, unambiguous win at gfx1250 H=128 T=16384, measured paired.
 // The head count was never the reason H=128 was slow: FG_MANY_HEADS_MIN=128 routed
 // it to the FG kernel at one (token,head) row per wave -- 2,113,536 single-wave
 // workgroups, each paying its own kernarg read, positions chase, cos/sin setup and
@@ -6591,11 +6568,10 @@ void fused_qk_norm_rope_group_quant(
       // Per-wave savings can only reach the other third; the workgroup count can
       // reach this one.
       //
-      // MEASURED ON gfx1250, H=32, paired op_test, n=4 clean pairs: HPB=4 is
-      // +4.0% at T=64 and +5.0% at T=256 (both CIs cross zero, so "no gain"
-      // rather than "a loss"), against a T=1024 control on the coarse path that
-      // moved +1.3%. So packing does NOT recover the ramp/drain third here, and
-      // the default stays 1. A plausible reason it cannot: 1+num_heads=33 does
+      // MEASURED on gfx1250 at H=32, paired: HPB=4 is no gain at T=64 or T=256
+      // (both CIs cross zero) against a coarse-path control. So packing does NOT
+      // recover the ramp/drain third here, and the default stays 1. A plausible
+      // reason it cannot: 1+num_heads=33 does
       // not divide by 4, so HPB=4 launches 36 waves to do 33 waves of work --
       // 9% wasted, the same order as the regression. HPB=2 wastes only 3%
       // (34/33) and has not been tried.
@@ -6637,13 +6613,11 @@ void fused_qk_norm_rope_group_quant(
       // all HEADS_PER_WAVE tiles, then a dispatched s_wait_tensorcnt consumes them
       // in order).
       //
-      // MEASURED gfx1250 H=32: HPW=2 is ~+20% at T=64 and ~+5% at T=256, i.e. a
-      // clear REGRESSION, for two compounding reasons:
-      //   - VGPR 66 -> 86, so allowed occupancy drops 14 -> 11 waves/SIMD
-      //   - the wave count itself halves (33 -> 17 per token)
-      // Both cut parallelism, and the decode tier is already demand-limited at
-      // 0.1-8 waves/SIMD. This is the same failure as raising HEADS_PER_BLOCK
-      // (+4~5%): "fewer, bigger waves" is the wrong direction where the machine
+      // MEASURED gfx1250 H=32: HPW=2 is a clear REGRESSION, for two compounding
+      // reasons -- VGPR pressure rises enough to cost an occupancy tier, and the
+      // wave count itself halves. Both cut parallelism, and the decode tier is
+      // already demand-limited. This is the same failure as raising
+      // HEADS_PER_BLOCK: "fewer, bigger waves" is the wrong direction where the
       // is starved, whatever the ramp/drain share of the ATT trace suggests.
       //
       // Left at 1 (identical launch and codegen to before). Still worth trying at
@@ -6684,12 +6658,11 @@ void fused_qk_norm_rope_group_quant(
       // gfx1250-only; the LDS ring costs DEPTH*512*2 B per wave.
       //
       // DEPTH=2, not 3: every extra ring slot costs LDS and therefore residency,
-      // and at 2 the overlap is already there. MEASURED T=16384 H=128 G=64,
-      // paired A/B 6 reps: 308.23 -> 302.33 us, -1.91% (95% CI [-3.17, -0.66],
-      // 5/6 reps negative). Full sweep: 27 of 28 shapes faster, none slower
-      // (T=4096 -3.6..-14%, T=16384 -0.5..-3.9%). This corroborates the earlier
-      // H=32 sweep in 93aaf800, which put 3 -> 2 at -2.06% (T=4096) / -2.86%
-      // (T=16384).
+      // and at 2 the overlap is already there. Paired A/B at T=16384 H=128 G=64 put
+      // 3 -> 2 as a win, and the full sweep had 27 of 28 shapes faster and none
+      // slower; the earlier H=32 sweep in 93aaf800 agrees. Retested after the ring
+      // stopped re-reading the last head on its tail refills -- which was the main
+      // reason a deeper ring cost anything -- and DEPTH=3 is still neutral.
       //
       // DO NOT go to DEPTH=1: it is a data race, not a tuning choice. Iteration i
       // reads LDS slot (i % DEPTH) and then issues the refill TDM into that SAME
@@ -7041,7 +7014,7 @@ void fused_kv_norm_rope_group_quant(
   // single launch per token is enough since there is no Q wave to amortize.
   //
   // NOTE: a TPB sweep {1,2,4,8} x T {1k,4k,16k} on MI355 (rocprofv3 kernel
-  // time) showed NO measurable effect -- all TPB land within ~3-5% of each
+  // time) showed NO measurable effect -- all TPB land within noise of each
   // other and the ranking flips run-to-run (pure shared-box noise). The kernel
   // is HBM-bandwidth bound and occupancy-saturated (~8 waves/CU) at every TPB,
   // since __launch_bounds__'s min-blocks arg (512/(TPB*64)) scales inversely
