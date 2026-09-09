@@ -13,7 +13,10 @@ from flydsl.expr.typing import T
 from flydsl.expr.typing import Vector as Vec
 from flydsl.expr.utils.arith import _to_raw as as_mlir_value
 
-from aiter.ops.flydsl.kernels.fmha_gfx950.pipeline import DualwaveFp8KernelContext
+from aiter.ops.flydsl.kernels.fmha_gfx950.pipeline import (
+    DualwaveFp8KernelContext,
+    p_bias_log2,
+)
 
 
 class DualwaveFp8StoreHelper(DualwaveFp8KernelContext):
@@ -59,6 +62,38 @@ class DualwaveFp8StoreHelper(DualwaveFp8KernelContext):
                 d_col = (dc * self.traits.D_CHUNK) + (2 * g + self.lane_div_32) * 8
                 o_global = self.global_idx_o(q_row, d_col)
                 self.buffer_store_128(o_pack, o_global)
+
+    def store_final_lse(self, m_row, l_row, q_row):
+        """LSE = ln(sum_j exp(s_j)), the layout aiter's CK varlen path returns.
+
+        m_row is the raw running max and l_row = sum exp2((s_j - m_row) * logit_scale
+        + p_bias), so the log-sum-exp is m_row * logit_scale + log2(l_row) - p_bias in
+        the log2 domain. The V descale scales O only and must not appear here.
+        """
+        lse_idx_raw = (
+            self.q_head_idx * fx.Index(self.lse_stride_h) + self.q_tok_base + q_row
+        )
+        lse_log2 = (
+            fx.Float32(m_row) * self.c_logit_scale
+            + fx.Float32(rocdl.log(T.f32, as_mlir_value(fx.Float32(l_row))))
+            - fx.Float32(p_bias_log2(self.traits))
+        )
+        lse = fx.Float32(
+            (fx.Float32(l_row) > self.c_zero_f).select(
+                lse_log2 * self.c_ln2_f, self.c_neg_inf
+            )
+        )
+
+        @flyc.jit
+        def _store_final_lse():
+            # 32 rows per wave: lanes 0-31 and 32-63 share a row, so one writes.
+            if self.lane < 32:
+                lse_idx = fx.Index(
+                    (q_row < self.seqlen_q_v).select(lse_idx_raw, self.lse_nelems)
+                )
+                self.lse_store_f32(lse, lse_idx)
+
+        _store_final_lse()
 
     def store_splitk_partial_o(self, v_o, m_row, l_row, q_row):
         m_row = fx.Float32(m_row) * self.c_logit_scale

@@ -17,6 +17,7 @@ from aiter.ops.flydsl.kernels.fmha_gfx950.pipeline import (
     _LOG2E,
     _cu_load,
     _make_ws_rsrc,
+    p_bias_log2,
 )
 
 
@@ -34,6 +35,7 @@ class DualwaveSplitKCombineContext:
         LSE=None,
         Sink=None,
         CuSeqQ=None,
+        lse_stride_h=None,
     ):
         if isinstance(traits_or_ctx, DualwaveSplitKCombineContext):
             self.__dict__.update(traits_or_ctx.__dict__)
@@ -50,6 +52,7 @@ class DualwaveSplitKCombineContext:
         self.batch_size = batch_size
         self.seq_len = seq_len
         self.stride_o_n = stride_o_n
+        self.lse_stride_h = lse_stride_h
 
     def init_types_and_constants(self):
         self.elem_dtype = fx.BFloat16  # fp8 in, bf16 out
@@ -108,10 +111,14 @@ class DualwaveSplitKCombineContext:
             q_tok_end = _cu_load(_cuq_div, self.batch_idx + 1, _cu_atom, _cu_v1i32)
             batch_byte_off = q_tok_base * self.stride_o_n_v * 2
             nrec_bytes = (q_tok_end - q_tok_base) * self.stride_o_n_v * 2
+            self.q_tok_base = q_tok_base
+            self.seqlen_q_v = q_tok_end - q_tok_base
         else:
             per_batch_elems = self.seq_len_v * self.stride_o_n_v
             batch_byte_off = self.batch_idx * per_batch_elems * 2
             nrec_bytes = per_batch_elems * 2
+            self.q_tok_base = self.batch_idx * self.seq_len_v
+            self.seqlen_q_v = self.seq_len_v
         self.o_nrec_bytes = nrec_bytes
         self.o_rsrc = buffer_ops.create_buffer_resource_from_addr(
             as_mlir_value(
@@ -120,6 +127,15 @@ class DualwaveSplitKCombineContext:
             num_records_bytes=as_mlir_value(fx.Int64(nrec_bytes)),
         )
         self.load_atom_64 = fx.make_copy_atom(fx.rocdl.BufferCopy64b(), fx.Int32)
+        if const_expr(self.traits.RETURN_LSE):
+            # [NUM_HEADS_Q, lse_stride_h] fp32, same layout as the dense path.
+            self.lse_nelems = fx.Index(self.traits.NUM_HEADS_Q) * fx.Index(
+                self.lse_stride_h
+            )
+            self.lse_rsrc = buffer_ops.create_buffer_resource_from_addr(
+                as_mlir_value(fx.Int64(fx.ptrtoint(fx.get_iter(self.LSE)))),
+                num_records_bytes=as_mlir_value(fx.Int64(self.lse_nelems * 4)),
+            )
 
     def workspace_resource(self, byte_offset, nrec_bytes):
         return _make_ws_rsrc(self.ws_base_i64, byte_offset, nrec_bytes)
@@ -230,6 +246,34 @@ class DualwaveSplitKCombineHelper(DualwaveSplitKCombineContext):
             o_pack.ir_value(),
             self.o_rsrc,
             as_mlir_value(fx.Int32(o_off)),
+            offset_is_bytes=True,
+        )
+
+    def store_lse(self, m_max, den):
+        """Combined LSE in natural log. Workspace m is already logit-scaled and den
+        carries P's log2 bias, so the log2-domain value is m_max + log2(den) - p_bias;
+        rows with no live split get -inf."""
+        lse_log2 = (
+            fx.Float32(m_max)
+            + fx.Float32(rocdl.log(T.f32, as_mlir_value(fx.Float32(den))))
+            - fx.Float32(p_bias_log2(self.traits))
+        )
+        lse = fx.Float32(
+            (fx.Float32(den) > self.c_zero_f).select(
+                lse_log2 * self.c_ln2_f, fx.Float32(float("-inf"))
+            )
+        )
+        lse_idx = (
+            self.q_head_idx * fx.Index(self.lse_stride_h)
+            + self.q_tok_base
+            + self.seq_idx
+        )
+        valid = self.row_valid & (self.seq_idx < self.seqlen_q_v) & (self.col == 0)
+        off = valid.select(fx.Index(lse_idx) * 4, self.lse_nelems * 4)
+        buffer_ops.buffer_store(
+            as_mlir_value(lse),
+            self.lse_rsrc,
+            as_mlir_value(fx.Int32(off)),
             offset_is_bytes=True,
         )
 

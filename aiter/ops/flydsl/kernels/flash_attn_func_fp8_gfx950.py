@@ -142,6 +142,7 @@ def _build_fp8(
     num_kv_splits: int = 1,
     block_m: int = 256,
     batch_interleave_group: int = 1,
+    return_lse: bool = False,
 ):
     """Build (and cache) the gfx950 fp8 launcher (dense, packed varlen, or split-K)."""
     from aiter.ops.flydsl.kernels.fmha_gfx950.flash_attn_fp8_gfx950 import (
@@ -165,6 +166,7 @@ def _build_fp8(
         num_kv_splits=num_kv_splits,
         block_m=block_m,
         batch_interleave_group=batch_interleave_group,
+        return_lse=return_lse,
     )
 
 
@@ -186,6 +188,7 @@ def flydsl_flash_attn_fp8_func(
     k_descale: torch.Tensor | None = None,
     v_descale: torch.Tensor | None = None,
     out: torch.Tensor | None = None,
+    return_lse: bool = False,
     waves_per_eu: int = 2,
     daz: bool = True,
     dualwave_swp_lazy_rescale: bool = True,
@@ -211,6 +214,9 @@ def flydsl_flash_attn_fp8_func(
         fp8_block_m: Pin the tile height to 128 or 256. ``None`` autotunes it.
         q_descale / k_descale / v_descale: fp32 shape-[1] descales, required.
         out: Optional pre-allocated bf16 output of shape ``q.shape[:-1] + (Dv,)``.
+        return_lse: Also return the natural-log softmax log-sum-exp, fp32
+            ``[H, total_q]`` (dense mode flattens the batch into ``B * Sq``), the
+            layout aiter's CK varlen forward returns.
         waves_per_eu: Kernel occupancy hint.
         daz: Enable denormals-are-zero.
         dualwave_swp_lazy_rescale: Enable lazy online softmax rescale.
@@ -219,7 +225,8 @@ def flydsl_flash_attn_fp8_func(
         stream: CUDA/HIP stream to launch on.
 
     Returns:
-        bf16 output tensor of shape ``q.shape[:-1] + (v.shape[-1],)``.
+        bf16 output tensor of shape ``q.shape[:-1] + (v.shape[-1],)``, or
+        ``(out, lse)`` when ``return_lse``.
     """
     if not (q.is_cuda and k.is_cuda and v.is_cuda):
         raise ValueError("flydsl_flash_attn_fp8_func: q/k/v must be CUDA tensors")
@@ -248,6 +255,11 @@ def flydsl_flash_attn_fp8_func(
     _out_elems = q.numel() // q.shape[-1] * v.shape[-1]
     if max(q.numel(), k.numel(), v.numel(), _out_elems) >= _FP8_MAX_FLAT_ELEMS:
         _packed = cu_seqlens_q is not None or cu_seqlens_kv is not None or q.dim() != 4
+        if return_lse:
+            raise NotImplementedError(
+                "flydsl_flash_attn_fp8_func: return_lse is not supported on the "
+                "per-batch split path taken past the int32 flat-element cap"
+            )
         if _packed or q.shape[0] == 1:
             raise NotImplementedError(
                 "flydsl_flash_attn_fp8_func: fp8 flattens Q/K/V/O and packs the dynamic "
@@ -438,6 +450,7 @@ def flydsl_flash_attn_fp8_func(
             batch_interleave_group=_fp8_batch_interleave_group(
                 B, causal, cross, int(num_kv_splits)
             ),
+            return_lse=return_lse,
         )
 
         _out_shape = tuple(q.shape[:-1]) + (Dv,)
@@ -469,6 +482,16 @@ def flydsl_flash_attn_fp8_func(
             "k_descale": k_descale,
             "v_descale": v_descale,
         }
+        lse = None
+        if return_lse:
+            # [H, total_q]; dense mode flattens the batch into the token axis, so
+            # q_tok_base = b * Sq already carries the batch offset.
+            _total_q = q.shape[0] if varlen else B * Sq
+            lse = torch.empty((H, _total_q), dtype=torch.float32, device=q.device)
+            if stream is not None:
+                lse.record_stream(launch_stream)
+            kwargs["lse"] = lse.view(-1)
+            kwargs["lse_stride_h"] = _total_q
         if splitk:
             _ws = torch.empty(ws_elems, dtype=torch.float32, device=q.device)
             if stream is not None:
@@ -484,4 +507,4 @@ def flydsl_flash_attn_fp8_func(
         if stream is not None:
             out.record_stream(launch_stream)
 
-    return out
+    return (out, lse) if return_lse else out

@@ -20,6 +20,22 @@ from aiter.ops.flydsl.kernels import buffer_ops
 
 _LOG2E = host_math.log2(host_math.e)
 
+# log2 of e4m3's largest finite value, 448. The softmax pre-scales P by this so
+# the fp8 cast keeps the distribution's tail (see DualwaveFp8SoftmaxHelper.sub_m).
+_P_HEADROOM_LOG2 = 8.807354922057604
+
+
+def p_bias_log2(traits):
+    """The log2-domain bias baked into P, and hence into l_row.
+
+    It cancels in O (l_row divides it back out) but not in a log-sum-exp read out
+    of l_row, which must subtract it.
+    """
+    headroom = _P_HEADROOM_LOG2
+    if traits.DUALWAVE_SWP_LAZY_RESCALE:
+        headroom -= traits.DUALWAVE_SWP_RESCALE_THRESHOLD
+    return max(0.0, headroom)
+
 
 # gfx950 (MI350/MI355X): 8 XCDs, each with a private ~4 MB L2.
 
@@ -435,6 +451,7 @@ class DualwaveSwpFp8Traits:
     SCHED_DS_READ_MASK: int
     NEG_INF_F32_BITS: int
     BATCH_INTERLEAVE_GROUP: int = 1
+    RETURN_LSE: bool = False
 
     @property
     def cache_tag(self):
@@ -467,6 +484,7 @@ class DualwaveSwpFp8Traits:
             self.BLOCK_M,
             self.BLOCK_SIZE,
             self.NUM_WAVES,
+            self.RETURN_LSE,
         )
 
 
@@ -487,6 +505,7 @@ def _make_dualwave_swp_fp8_traits(
     varlen=False,
     cross_seqlen=False,
     batch_interleave_group=1,
+    return_lse=False,
 ):
     """Build gfx950 DUALWAVE_SWP fp8 compile-time layout traits.
 
@@ -633,6 +652,7 @@ def _make_dualwave_swp_fp8_traits(
         SCHED_DS_READ_MASK=0x100,
         NEG_INF_F32_BITS=0xFF800000,
         BATCH_INTERLEAVE_GROUP=int(batch_interleave_group),
+        RETURN_LSE=bool(return_lse),
     )
 
 
@@ -742,6 +762,8 @@ class DualwaveFp8KernelContext:
         stride_q_n=None,
         stride_kv_n=None,
         head_dim_runtime=None,
+        LSE=None,
+        lse_stride_h=None,
     ):
         if isinstance(traits_or_ctx, DualwaveFp8KernelContext):
             self.__dict__.update(traits_or_ctx.__dict__)
@@ -764,6 +786,8 @@ class DualwaveFp8KernelContext:
         self.stride_q_n = stride_q_n
         self.stride_kv_n = stride_kv_n
         self.head_dim_runtime = head_dim_runtime
+        self.LSE = LSE
+        self.lse_stride_h = lse_stride_h
 
     def init_types_and_constants(self):
         traits = self.traits
@@ -778,6 +802,8 @@ class DualwaveFp8KernelContext:
         self.c_zero_f = fx.Float32(0.0)
         self.c_rescale_thr_f = fx.Float32(traits.DUALWAVE_SWP_RESCALE_THRESHOLD)
         self.c_zero_v16f32 = Vec.filled(16, 0.0, fx.Float32)
+        # LSE is stored in natural log; the kernel's m/l live in the log2 domain.
+        self.c_ln2_f = fx.Float32(1.0 / _LOG2E)
 
     def init_runtime_indices(self):
         traits = self.traits
@@ -897,6 +923,31 @@ class DualwaveFp8KernelContext:
         self.o_div = fx.logical_divide(
             fx.rocdl.make_buffer_tensor(self.O, num_records_bytes=o_nrec_bytes),
             fx.make_layout(1, 1),
+        )
+        if const_expr(traits.RETURN_LSE and not traits.SPLITK):
+            # LSE is [NUM_HEADS_Q, lse_stride_h] fp32; rows past the batch's own
+            # seqlen aim at num_records so the buffer drops them.
+            self.lse_nelems = fx.Index(traits.NUM_HEADS_Q) * fx.Index(self.lse_stride_h)
+            self.lse_div = fx.logical_divide(
+                fx.rocdl.make_buffer_tensor(
+                    self.LSE, num_records_bytes=as_mlir_value(self.lse_nelems * 4)
+                ),
+                fx.make_layout(1, 1),
+            )
+            self.lse_store_atom_32 = fx.make_copy_atom(
+                fx.rocdl.BufferCopy32b(), fx.Int32
+            )
+            self.lse_store_reg_32 = fx.make_rmem_tensor(fx.make_layout(1, 1), fx.Int32)
+
+    def lse_store_f32(self, f32_val, elem_index):
+        fx.memref_store_vec(
+            Vec.from_elements([fx.Float32(f32_val)], fx.Float32).bitcast(fx.Int32),
+            self.lse_store_reg_32,
+        )
+        fx.copy(
+            self.lse_store_atom_32,
+            self.lse_store_reg_32,
+            fx.slice(self.lse_div, (None, fx.Int32(elem_index))),
         )
 
     def init_atoms_and_lds_ptrs(self):
