@@ -255,6 +255,31 @@ def num_xcds():
     return 8
 
 
+def _swizzled_blk(bid_x, bid_y, bid_z, cluster_m, cluster_n, tile_m, tile_n, wgm):
+    """``(blk_m, blk_n)`` under the XCD-aware cluster order.
+
+    A function, and called from a TERNARY rather than an ``if`` statement: the
+    FlyDSL rewriter turns an ``if`` into a traced branch, and names bound inside
+    one do not escape it -- which shows up as a NameError on the *next* use, not
+    at the branch. mxfp4_preshuffle_gfx1250_tdm carries the same warning.
+    """
+    cl_x = bid_x // cluster_m
+    cl_y = bid_y // cluster_n
+    # Intra-cluster position -- the pair compute_cluster_position returns.
+    # Carried through untouched so every peer keeps the M tile its multicast
+    # mask assumes.
+    lx = bid_x - cl_x * cluster_m
+    ly = bid_y - cl_y * cluster_n
+    cl_per_run = fx.grid_dim.x // cluster_m
+    num_cl_n = fx.grid_dim.y // cluster_n
+    # Linear cluster id in dispatch order: x fastest, then y, then z.
+    cid = (bid_z * num_cl_n + cl_y) * cl_per_run + cl_x
+    m_cl, n_cl = _xcd_cluster_swizzle(
+        cid, cl_per_run * fx.grid_dim.z, num_cl_n, wgm, num_xcds()
+    )
+    return (m_cl * cluster_m + lx) * tile_m, (n_cl * cluster_n + ly) * tile_n
+
+
 def _xcd_cluster_swizzle(cid, num_cl_m, num_cl_n, wgm, n_xcds):
     """Remap a linear CLUSTER id to ``(m_cluster, n_cluster)`` for L2 reuse.
 
@@ -477,31 +502,15 @@ def launch_gemm_a4w4_moe(
         a_mask, b_mask = _mcast_masks(local_x, local_y, cluster_m, cluster_n)
 
         m_chunk = bid_z
-        if xcd_swizzle:
-            # Swizzle whole clusters. (bid_x % cluster_m, bid_y % cluster_n) is
-            # the intra-cluster position -- the same pair compute_cluster_position
-            # returns -- so carrying it through untouched keeps every peer on the
-            # M tile its multicast mask assumes.
-            cl_x = bid_x // cluster_m
-            cl_y = bid_y // cluster_n
-            lx = bid_x - cl_x * cluster_m
-            ly = bid_y - cl_y * cluster_n
-            cl_per_run = fx.grid_dim.x // cluster_m
-            num_cl_n = fx.grid_dim.y // cluster_n
-            # Linear cluster id in dispatch order: x fastest, then y, then z.
-            cid = (m_chunk * num_cl_n + cl_y) * cl_per_run + cl_x
-            m_cl, n_cl = _xcd_cluster_swizzle(
-                cid,
-                cl_per_run * fx.grid_dim.z,
-                num_cl_n,
-                xcd_swizzle,
-                num_xcds(),
+        # Ternary, never an `if` statement -- see _swizzled_blk. xcd_swizzle is a
+        # Constexpr, so only the taken side is ever built.
+        blk_m, blk_n = (
+            _swizzled_blk(
+                bid_x, bid_y, bid_z, cluster_m, cluster_n, tile_m, tile_n, xcd_swizzle
             )
-            blk_m = (m_cl * cluster_m + lx) * tile_m
-            blk_n = (n_cl * cluster_n + ly) * tile_n
-        else:
-            blk_m = (m_chunk * fx.grid_dim.x + bid_x) * tile_m
-            blk_n = bid_y * tile_n
+            if xcd_swizzle
+            else ((m_chunk * fx.grid_dim.x + bid_x) * tile_m, bid_y * tile_n)
+        )
         blk_m64 = fx.Int64(blk_m)
         blk_n64 = fx.Int64(blk_n)
 
