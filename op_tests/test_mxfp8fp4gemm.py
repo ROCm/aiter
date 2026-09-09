@@ -27,6 +27,7 @@ import pandas as pd
 import torch
 
 import aiter
+from aiter.ops.mxfp8fp4gemm_common import mxfp8fp4_gemm_splitk
 from aiter import dtypes
 from aiter.jit.utils.chip_info import get_gfx_runtime as get_gfx
 from aiter.ops.shuffle import (
@@ -62,28 +63,50 @@ PERSISTENT_TG = 256
 # Per-tile cluster sets (cluster_x, cluster_y) deployed in mxfp8fp4gemm.csv, kept in
 # sync with the cover in poc_kl/mi400/mxfp8fp4gemm/run.sh COVER_CONFIGS so the reported
 # label names the .co the cpp heuristic (get_heuristic_kernel) actually dispatches to.
-# This round ships the 256x256 cluster sweep only.
 _CLUSTERS = {
     (256, 256): [(4, 4), (2, 4), (4, 2), (2, 2), (1, 1)],
+    (64, 512): [(4, 1), (2, 1), (1, 1)],
+    (16, 512): [(4, 1), (2, 1), (1, 1)],
 }
 
 
-def _heuristic_tile(M):
+def _tiles_for(intype, apre):
+    """Tiles registered in the csv for this combo. 16x512 is FP4-only (its master
+    asserts B_DTYPE_FP4) and is deployed with a_preshuffle=0 only."""
+    tiles = [(256, 256), (64, 512)]
+    if intype == "a8w4" and not apre:
+        tiles.append((16, 512))
+    return tiles
+
+
+def _heuristic_tile(M, intype, apre):
     """Tile (tile_m, tile_n) the cpp dispatch picks (mirrors get_heuristic_kernel in
-    asm_mxfp8fp4gemm.cu). Only 256x256 is deployed this round, so every M resolves to
-    256x256 (small M falls back to it since no 64x512/16x512 tile is registered)."""
-    return (256, 256)
+    asm_mxfp8fp4gemm.cu): a tiny M wastes a taller tile's rows, so M<=16 prefers the
+    16x512 decode tile, M<=64 the 64x512 one, larger M 256x256 -- restricted to the
+    tiles actually registered for this (intype, apre)."""
+    if M <= 16:
+        prefs = [(16, 512), (64, 512), (256, 256)]
+    elif M <= 64:
+        prefs = [(64, 512), (256, 256)]
+    else:
+        prefs = [(256, 256), (64, 512)]
+    avail = _tiles_for(intype, apre)
+    return next(t for t in prefs if t in avail)
 
 
 def _heuristic_cluster(tile_m, tile_n, M, N):
     """(cluster_x, cluster_y) the cpp dispatch picks within the tile: the largest
-    cluster that fits the tile grid (cx<=ntiles, cy<=mtiles), tie-break by aspect
-    closeness then larger cx. 1x1 always fits, so a pick always exists."""
+    cluster that DIVIDES the tile grid evenly, tie-break by aspect closeness then
+    larger cx. 1x1 always fits (n % 1 == 0), so a pick always exists.
+
+    Divisibility, not just cx<=ntiles: a ragged last block leaves its trailing lanes
+    with an out-of-range tile id, which the kernel clamps onto the last valid tile
+    (redundant work). Must stay in sync with `fits` in asm_mxfp8fp4gemm.cu."""
     mtiles = (M + tile_m - 1) // tile_m
     ntiles = (N + tile_n - 1) // tile_n
     best, best_key = (1, 1), None
     for cx, cy in _CLUSTERS.get((tile_m, tile_n), [(1, 1)]):
-        score = cx * cy if (cx <= ntiles and cy <= mtiles) else 0
+        score = cx * cy if (ntiles % cx == 0 and mtiles % cy == 0) else 0
         key = (score, -abs(cx * mtiles - cy * ntiles), cx)
         if best_key is None or key > best_key:
             best, best_key = (cx, cy), key
@@ -264,6 +287,7 @@ def test_gemm(
     seed=0,
     mode="perf",
     knl_name=None,
+    splitk=0,
     num_warmup=2,
     num_iters=None,
     test_graph=False,
@@ -283,13 +307,14 @@ def test_gemm(
             N,
             K,
         )
-        _tm, _tn = _heuristic_tile(M)
+        _tm, _tn = _heuristic_tile(M, intype, apre)
         _cx, _cy = _heuristic_cluster(_tm, _tn, M, N)
         return {
             "gfx": get_gfx(),
             "knl_name": knl_name or "(heuristic)",
             "tile": f"{_tm}x{_tn}",
             "cluster": f"{_cx}x{_cy}",
+            "splitk": splitk or 1,
             "asm us": float("nan"),
             "asm TFLOPS": float("nan"),
             "asm TB/s": float("nan"),
@@ -319,7 +344,7 @@ def test_gemm(
     elif knl_name == "auto":
         middle = "mxfp8fp8" if intype == "a8w8" else "mxfp8fp4"
         pre = "ABpreShuffle" if apre else "BpreShuffle"
-        _tm, _tn = _heuristic_tile(M)
+        _tm, _tn = _heuristic_tile(M, intype, apre)
         _cx, _cy = _heuristic_cluster(_tm, _tn, M, N)
         base = f"f8gemm_{outtype}_{middle}_{pre}_{_tm}x{_tn}_{_cx}x{_cy}_ps"
         knl = f"_ZN5aiter{len(base)}{base}E"
@@ -328,7 +353,14 @@ def test_gemm(
 
     def run_asm(A, B, sA, sB):
         return kern(
-            A, B, sA, sB, dtype=out_dtype, a_preshuffle=bool(apre), kernelName=knl
+            A,
+            B,
+            sA,
+            sB,
+            dtype=out_dtype,
+            a_preshuffle=bool(apre),
+            kernelName=knl,
+            splitk=splitk,
         )
 
     asm_args = (inp["A"], inp["B"], inp["sA"], inp["sB"])
@@ -346,19 +378,26 @@ def test_gemm(
     # Report TG occupancy for the tile+cluster the cpp dispatch picks.
     _middle = "mxfp8fp8" if intype == "a8w8" else "mxfp8fp4"
     _pre = "ABpreShuffle" if apre else "BpreShuffle"
-    _tile_m, _tile_n = _heuristic_tile(M)
+    _tile_m, _tile_n = _heuristic_tile(M, intype, apre)
     _cx, _cy = _heuristic_cluster(_tile_m, _tile_n, M, N)
     _label = f"f8gemm_{outtype}_{_middle}_{_pre}_{_tile_m}x{_tile_n}_{_cx}x{_cy}_ps"
     _report_active_tg(M, N, _tile_m, _tile_n, _label)
-    # Structured algo details (mxfp8fp4gemm.csv columns): the cpp-dispatch tile
-    # (256x256 this round) and the aspect-selected cluster; no splitk/unroll axis.
+    # Structured algo details (mxfp8fp4gemm.csv columns): the cpp-dispatch tile,
+    # the aspect-selected cluster and the split-K count the cpp picks (asked for
+    # rather than mirrored -- choose_splitk owns the constraints).
     ret["tile"] = f"{_tile_m}x{_tile_n}"
     ret["cluster"] = f"{_cx}x{_cy}"
+    ret["splitk"] = splitk or mxfp8fp4_gemm_splitk(
+        M, N, K, int(intype == "a8w4"), apre, knl_name or None
+    )
     # Only a missing .co is reported as "not support"; any other failure (OOM,
     # memory fault, shape assert, ...) must propagate, not show as a green cell.
     # An explicit --knl-name that isn't in the cfg is a real error (typo / missing
     # build), so "kernel not in cfg" is benign ONLY on the heuristic path (knl == "").
-    _NOT_SUPPORTED_MARKERS = ("cannot get heuristic kernel",)
+    # An explicit --splitk the kernel cannot honour for this shape (odd count, K not
+    # divisible, more than WG_MAX TGs, non-256x256 tile) is a skip, not an error --
+    # a sweep runs the same count against every shape.
+    _NOT_SUPPORTED_MARKERS = ("cannot get heuristic kernel", "is not valid for")
     if not knl:
         _NOT_SUPPORTED_MARKERS += ("kernel not in cfg_mxfp8fp4gemm",)
     for name, (cand, cand_args) in candidates.items():
@@ -537,6 +576,16 @@ def main():
         ".co from mxfp8fp4gemm.csv by (b_intype, a_preshuffle) and shape. Any other "
         "value = force that exact mangled knl_name for all runs (developer debug).",
     )
+    parser.add_argument(
+        "--splitk",
+        type=int,
+        nargs="*",
+        default=[0],
+        help="split-K counts to run (0 = the count choose_splitk picks). Several "
+        "values sweep them, e.g. --splitk 1 2 4 8. Only the kernel's hard "
+        "constraints are checked, so a count deeper than the dispatch would pick "
+        "is allowed; 256x256 only.",
+    )
     # intype x shape is a full product, so each shape is run for both a8w8/a8w4.
     parser.add_argument(
         "-s",
@@ -601,6 +650,7 @@ def main():
             seed=args.seed,
             mode=args.mode,
             knl_name=args.knl_name,
+            splitk=splitk,
             num_warmup=args.warmup,
             num_iters=args.iters,
             test_graph=args.graph,
@@ -610,6 +660,7 @@ def main():
             apre_list, init_pairs, args.intype, args.outtype
         )
         for (M, N, K) in shapes_for(intype)
+        for splitk in args.splitk
     ]
     df_full = pd.DataFrame(rows)
     # JSON keeps every column (config + algo details + results) so each record is

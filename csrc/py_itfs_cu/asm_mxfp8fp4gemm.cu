@@ -27,11 +27,11 @@
 //   - mxfp8_mxfp8_gemm_asm: D[M,N] bf16 = A[M,K] mxfp8 * B[N,K] mxfp8   (a8w8)
 //   - mxfp8_mxfp4_gemm_asm: D[M,N] bf16 = A[M,K] mxfp8 * B[N,K/2] mxfp4 (a8w4)
 //
-// KernelArgs is the packed preload layout the POC silicon host ships (76B):
-// 5 pointers (MEM-first), then 9 tight 4B scalars. The persistent + cluster
+// KernelArgs is the packed preload layout the POC silicon host ships (80B):
+// 5 pointers (MEM-first), then 10 tight 4B scalars. The persistent + cluster
 // shaders do their own tile scheduling, so unlike f4gemm there are no
-// log2_grid kernargs -- the host only supplies M/N/K/batch and launches on a
-// fixed cluster grid.
+// log2_grid kernargs -- the host only supplies M/N/K/batch/splitk and launches
+// on a fixed cluster grid.
 #include "aiter_tensor.h"
 #include "aiter_ctypes_error.h"
 #include "asm_mxfp8fp4gemm_configs.hpp"
@@ -45,6 +45,11 @@ constexpr int MX_SCALE_BLOCK = 32;
 constexpr int F8GEMM_N_ALIGN      = 16;
 constexpr int F8GEMM_K_ALIGN      = 128;
 constexpr int F8GEMM_M_ALIGN_APRE = 2;
+// Every f8gemm .co is a persistent shader launching exactly this many threadgroups.
+constexpr int F8GEMM_WG_MAX = 256;
+// Split-K: PF_TILES(4) * TILE_K(128). A shallower split leaves the persistent
+// prologue's prefetch past the round's K range and the next round reads stale LDS.
+constexpr int F8GEMM_SPLITK_MIN_K = 512;
 
 // Preload-mode KernelArgs (4B-tight, MEM-first). Offsets in comments are the
 // kernarg byte offsets the preload-aware shader s_load's from.
@@ -64,8 +69,9 @@ struct __attribute__((packed)) KernelArgs
     unsigned int N;          // s18      off 0x40
     unsigned int K;          // s19      off 0x44
     unsigned int batch_size; // s20      off 0x48
+    unsigned int splitk;     // s21      off 0x4c
 };
-static_assert(sizeof(KernelArgs) == 76, "mxfp8fp4 preload KernelArgs must be 76B");
+static_assert(sizeof(KernelArgs) == 80, "mxfp8fp4 preload KernelArgs must be 80B");
 
 // Pick the best registered kernel variant for (M,N,K) given the B dtype and
 // a_preshuffle.
@@ -142,9 +148,17 @@ static std::tuple<std::string, int> get_heuristic_kernel(int M,
 
     // ---- Pass 2: cluster that best fits the selected tile's grid ----
     // cluster_x groups TILE_N columns (N), cluster_y groups TILE_M rows (M). The
-    // largest cluster whose macro-tile stays within the problem (cx<=ntiles,
-    // cy<=mtiles) maximizes data reuse; ties break toward the aspect closest to the
-    // tile grid, then larger cx. 1x1 always fits, so a valid pick always exists.
+    // largest cluster that DIVIDES the tile grid evenly maximizes data reuse; ties
+    // break toward the aspect closest to the tile grid, then larger cx. 1x1 always
+    // fits (n % 1 == 0), so a valid pick always exists.
+    //
+    // Divisibility, not just cx<=ntiles: a ragged last block leaves its trailing
+    // lanes with an out-of-range tile id. The kernel clamps them onto the last valid
+    // tile (calc_wg_coord) so they stay lock-step for the multicast TDM loads, but
+    // that work is redundant -- up to (cx*cy-1)/(cx*cy) of the block is wasted.
+    // Measured on N=1280 (5 N-tiles, 5 % 4 != 0), a8w8 K=8192: cluster 4x4 runs
+    // 31.9us at M=4096 and 44.7us at M=8192 against 25.3us / 35.7us for 1x1, i.e.
+    // the "fitting" cluster was ~20% SLOWER than no cluster at all.
     std::string selectedKernelName = "";
     if(bestTileRank < n_tile_prefs)
     {
@@ -167,7 +181,7 @@ static std::tuple<std::string, int> get_heuristic_kernel(int M,
 
             const int    cx        = cfg.cluster_x > 0 ? cfg.cluster_x : 1;
             const int    cy        = cfg.cluster_y > 0 ? cfg.cluster_y : 1;
-            const bool   fits      = (cx <= ntiles) && (cy <= mtiles);
+            const bool   fits      = (ntiles % cx == 0) && (mtiles % cy == 0);
             const int    score     = fits ? cx * cy : 0;
             const double aspectErr = std::fabs((double)cx * mtiles - (double)cy * ntiles);
 
@@ -204,6 +218,115 @@ static std::tuple<std::string, int> get_heuristic_kernel(int M,
     return std::make_tuple(selectedKernelName, 1);
 }
 
+// Resolve the variant to run: an explicit mangled kernelName, else the cached
+// heuristic. Shared by the launch and the splitk query so both see one decision.
+static const mxfp8fp4gemmConfig& resolve_kernel(int M,
+                                                int N,
+                                                int K,
+                                                const std::string& b_intype,
+                                                const std::string& out_type,
+                                                int a_preshuffle,
+                                                const char* kernelName)
+{
+    static CFG* config_map = &cfg_mxfp8fp4gemm;
+    AITER_CHECK(!config_map->empty(),
+                __func__,
+                " no kernel registered for mxfp8fp4gemm; check AITER_GPU_ARCHS=gfx1250");
+
+    std::string arch_id      = get_gpu_arch();
+    std::string selectedName = (kernelName && kernelName[0] != '\0') ? (arch_id + kernelName) : "";
+
+    const int intype_id = (b_intype == "mxfp4") ? 1 : 0;       // else mxfp8
+    using DictKey       = std::tuple<int, int, int, int, int>; // M,N,K,intype_id,apre
+    struct DictHash
+    {
+        size_t operator()(const DictKey& k) const
+        {
+            const auto& [m, n, kk, it, ap] = k;
+            size_t h                       = 1469598103934665603ull;
+            for(int v : {m, n, kk, it, ap})
+                h = (h ^ static_cast<size_t>(static_cast<unsigned>(v))) * 1099511628211ull;
+            return h;
+        }
+    };
+    static SynchronizedCache<DictKey, std::string, DictHash> heuristic_kernel_dict;
+
+    if(selectedName.empty())
+    {
+        selectedName =
+            heuristic_kernel_dict.get_or_create(DictKey(M, N, K, intype_id, a_preshuffle), [&]() {
+                auto [name, _] = get_heuristic_kernel(
+                    M, N, K, arch_id, b_intype, out_type, a_preshuffle, config_map);
+                return name;
+            });
+    }
+
+    auto it = config_map->find(selectedName);
+    AITER_CHECK(
+        it != config_map->end(), __func__, " kernel not in cfg_mxfp8fp4gemm: ", selectedName);
+
+    const auto& cfg = it->second;
+    // Guard the explicit-kernelName path. outtype MUST match: a mismatched .co
+    // keeps the same kernarg size (HIP won't catch it) but sizes stride_d / the
+    // output buffer for a different element width -> device-side OOB write.
+    AITER_CHECK(cfg.b_intype == b_intype && cfg.a_preshuffle == a_preshuffle &&
+                    cfg.outtype == out_type,
+                __func__,
+                " selected kernel ",
+                selectedName,
+                " mismatches requested b_intype/a_preshuffle/outtype (got outtype=",
+                cfg.outtype,
+                ", requested ",
+                out_type,
+                ")");
+    return cfg;
+}
+
+// Split-K count for this shape, 1 = unsplit. The kernel gives split s the K range
+// [s*K/splitk, (s+1)*K/splitk) and writes D as (splitk, M, N) WITHOUT reducing it --
+// summing the planes is the caller's job (aiter/ops/mxfp8fp4gemm_common.py).
+//
+// It checks none of the constraints below and a violation does not fault, it reads
+// garbage, so every one of them is enforced here. See
+// poc_kl/mi400/mxfp8fp4gemm/README.md "Split-K"; keep the two in sync.
+static bool splitk_is_valid(int M, int N, int K, const mxfp8fp4gemmConfig& cfg, int s)
+{
+    if(s == 1)
+        return true;
+    // cfg.splitk marks the variants whose .co actually declares _s_splitk (the
+    // 256x256 master). The others stop their kernarg preload short, so s21 would
+    // hold whatever was left in the SGPR.
+    if(cfg.splitk == 0)
+        return false;
+    if(s <= 0 || (s & (s - 1)) != 0) // pow2: the SP3 takes log2 with s_ctz_i32_b32
+        return false;
+    if(K % s != 0 || (K / s) % F8GEMM_K_ALIGN != 0)
+        return false; // each split must be a whole number of TILE_K steps
+    if(K / s < F8GEMM_SPLITK_MIN_K)
+        return false; // shallower than the persistent prologue's prefetch -> stale LDS
+    // One TG per tile per split; past WG_MAX the work needs a second persistent round.
+    const int tiles = ((M + cfg.tile_m - 1) / cfg.tile_m) * ((N + cfg.tile_n - 1) / cfg.tile_n);
+    return (long long)s * tiles <= F8GEMM_WG_MAX;
+}
+
+// Split count to use when the caller did not name one: the deepest split that is
+// still valid and still pays for its reduce.
+static int choose_splitk(int M, int N, int K, const mxfp8fp4gemmConfig& cfg)
+{
+    int best = 1;
+    for(int s = 2; splitk_is_valid(M, N, K, cfg, s); s *= 2)
+    {
+        // The reduce moves (s+1)*M*N*2 B in a separate pass. Filling the idle TGs only
+        // buys back a fraction of the GEMM, so keep that pass under a quarter of the
+        // GEMM's own operand traffic -- past that the split loses end to end (measured
+        // on 128x1280x8192, 2048x1280x8192 and 128x8192x1024).
+        if((long long)(s + 1) * M * N * 8 > (long long)(M + N) * K)
+            break;
+        best = s;
+    }
+    return best;
+}
+
 // Shared dispatch body for both a8w8 (B=mxfp8) and a8w4 (B=mxfp4).
 static void mxfp8fp4_launch(aiter_tensor_t* A,
                             aiter_tensor_t* B,
@@ -213,6 +336,7 @@ static void mxfp8fp4_launch(aiter_tensor_t* A,
                             const char* kernelName,
                             const std::string& b_intype,
                             int a_preshuffle,
+                            int splitk,
                             hipStream_t stream)
 {
     AITER_CHECK(out->dtype() == AITER_DTYPE_bf16, __func__, " only supports BFloat16 output");
@@ -256,60 +380,38 @@ static void mxfp8fp4_launch(aiter_tensor_t* A,
     args.N          = Ndim;
     args.K          = Kdim;
     args.batch_size = 1;
+    args.splitk     = splitk;
     size_t arg_size = sizeof(KernelArgs);
 
     const HipDeviceGuard device_guard(A->device_id);
 
-    static CFG* config_map = &cfg_mxfp8fp4gemm;
-    AITER_CHECK(!config_map->empty(),
+    const auto& cfg = resolve_kernel(Mdim, Ndim, Kdim, b_intype, out_type, a_preshuffle, kernelName);
+
+    // splitk<=0 means "let the heuristic decide"; an explicit count is only checked
+    // against the kernel's hard constraints (it validates none of them itself), so a
+    // caller may deliberately go deeper than choose_splitk would.
+    if(splitk <= 0)
+        splitk = choose_splitk(Mdim, Ndim, Kdim, cfg);
+    AITER_CHECK(splitk_is_valid(Mdim, Ndim, Kdim, cfg, splitk),
                 __func__,
-                " no kernel registered for mxfp8fp4gemm; check AITER_GPU_ARCHS=gfx1250");
-
-    std::string arch_id      = get_gpu_arch();
-    std::string selectedName = (kernelName && kernelName[0] != '\0') ? (arch_id + kernelName) : "";
-
-    const int intype_id = (b_intype == "mxfp4") ? 1 : 0; // else mxfp8
-    using DictKey       = std::tuple<int, int, int, int, int>; // M,N,K,intype_id,apre
-    struct DictHash
-    {
-        size_t operator()(const DictKey& k) const
-        {
-            const auto& [m, n, kk, it, ap] = k;
-            size_t h                       = 1469598103934665603ull;
-            for(int v : {m, n, kk, it, ap})
-                h = (h ^ static_cast<size_t>(static_cast<unsigned>(v))) * 1099511628211ull;
-            return h;
-        }
-    };
-    static SynchronizedCache<DictKey, std::string, DictHash> heuristic_kernel_dict;
-
-    if(selectedName.empty())
-    {
-        selectedName = heuristic_kernel_dict.get_or_create(
-            DictKey(Mdim, Ndim, Kdim, intype_id, a_preshuffle), [&]() {
-                auto [name, _] = get_heuristic_kernel(
-                    Mdim, Ndim, Kdim, arch_id, b_intype, out_type, a_preshuffle, config_map);
-                return name;
-            });
-    }
-
-    auto it = config_map->find(selectedName);
-    AITER_CHECK(
-        it != config_map->end(), __func__, " kernel not in cfg_mxfp8fp4gemm: ", selectedName);
-
-    const auto& cfg = it->second;
-    // Guard the explicit-kernelName path. outtype MUST match: a mismatched .co
-    // keeps the same kernarg size (HIP won't catch it) but sizes stride_d / the
-    // output buffer for a different element width -> device-side OOB write.
-    AITER_CHECK(cfg.b_intype == b_intype && cfg.a_preshuffle == a_preshuffle &&
-                    cfg.outtype == out_type,
+                " splitk=",
+                splitk,
+                " is not valid for ",
+                cfg.knl_name,
+                " at M=",
+                Mdim,
+                ", N=",
+                Ndim,
+                ", K=",
+                Kdim);
+    // D is (splitk, M, N) and the kernel does not reduce it -- the caller must have
+    // sized the buffer for every plane.
+    AITER_CHECK(out->numel() == (long long)splitk * Mdim * Ndim,
                 __func__,
-                " selected kernel ",
-                selectedName,
-                " mismatches requested b_intype/a_preshuffle/outtype (got outtype=",
-                cfg.outtype,
-                ", requested ",
-                out_type,
+                " out must hold splitk*M*N elements (splitk=",
+                splitk,
+                ", got numel=",
+                out->numel(),
                 ")");
 
     static SynchronizedCache<std::string_view, AiterAsmKernel> impl_ptr_map;
@@ -333,17 +435,15 @@ static void mxfp8fp4_launch(aiter_tensor_t* A,
     const int cluster_x = cfg.cluster_x > 0 ? cfg.cluster_x : 1;
     const int cluster_y = cfg.cluster_y > 0 ? cfg.cluster_y : 1;
 
-    constexpr int WG_MAX = 256; // must match the .co's WG_MAX
-
     const int cluster_size = cluster_x * cluster_y;
-    AITER_CHECK((WG_MAX % cluster_size) == 0,
+    AITER_CHECK((F8GEMM_WG_MAX % cluster_size) == 0,
                 __func__,
                 " persistent WG_MAX=",
-                WG_MAX,
+                F8GEMM_WG_MAX,
                 " not divisible by cluster_x*cluster_y=",
                 cluster_size);
 
-    const int clusters = WG_MAX / cluster_size; // reference gridX (gridY is 1)
+    const int clusters = F8GEMM_WG_MAX / cluster_size; // reference gridX (gridY is 1)
     const int gdx      = clusters * cluster_x;  // blocks along X
     const int gdy      = cluster_y;             // blocks along Y (gridY==1)
     const int gdz      = 1;
@@ -365,10 +465,12 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
      aiter_tensor_t* out,    // Out:[M, N] bf16
      const char* kernelName,
      int a_preshuffle,
+     int splitk, // <=0: pick with choose_splitk; out must then hold splitk*M*N
      hipStream_t stream),
-    (A, B, ScaleA, ScaleB, out, kernelName, a_preshuffle, stream))
+    (A, B, ScaleA, ScaleB, out, kernelName, a_preshuffle, splitk, stream))
 {
-    mxfp8fp4_launch(A, B, ScaleA, ScaleB, out, kernelName, "mxfp8", a_preshuffle, stream);
+    mxfp8fp4_launch(
+        A, B, ScaleA, ScaleB, out, kernelName, "mxfp8", a_preshuffle, splitk, stream);
 }
 
 AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
@@ -380,8 +482,25 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
      aiter_tensor_t* out,    // Out:[M, N] bf16
      const char* kernelName,
      int a_preshuffle,
+     int splitk, // <=0: pick with choose_splitk; out must then hold splitk*M*N
      hipStream_t stream),
-    (A, B, ScaleA, ScaleB, out, kernelName, a_preshuffle, stream))
+    (A, B, ScaleA, ScaleB, out, kernelName, a_preshuffle, splitk, stream))
 {
-    mxfp8fp4_launch(A, B, ScaleA, ScaleB, out, kernelName, "mxfp4", a_preshuffle, stream);
+    mxfp8fp4_launch(
+        A, B, ScaleA, ScaleB, out, kernelName, "mxfp4", a_preshuffle, splitk, stream);
+}
+
+// Split-K count the dispatch will use for this shape. The caller needs it up front:
+// D becomes (splitk, M, N) and only the caller can size that buffer and reduce it.
+AITER_CTYPES_DEFINE_ENTRYPOINT(
+    mxfp8fp4_gemm_splitk,
+    (int M, int N, int K, int b_is_fp4, int a_preshuffle, const char* kernelName,
+     hipStream_t stream),
+    (M, N, K, b_is_fp4, a_preshuffle, kernelName, stream))
+{
+    return choose_splitk(
+        M,
+        N,
+        K,
+        resolve_kernel(M, N, K, b_is_fp4 ? "mxfp4" : "mxfp8", "bf16", a_preshuffle, kernelName));
 }
