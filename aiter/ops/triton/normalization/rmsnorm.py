@@ -119,7 +119,7 @@ def _rmsnorm_backward(dz, x, gamma, rsigma):
         BLOCK_N = triton.next_power_of_2(N)
         BLOCK_M = max(min(16384 // BLOCK_N, 32), 8)
         num_prgms = triton.cdiv(M, BLOCK_M)
-        dg_tmp = torch.empty(num_prgms, N, device="cuda", dtype=torch.float32)
+        dg_tmp = torch.empty(num_prgms, N, device=x_.device, dtype=torch.float32)
         _rmsnorm_bwd_kernel_large_m_small_n[(num_prgms,)](
             dz_,
             x_,
@@ -155,7 +155,11 @@ def _rmsnorm_backward(dz, x, gamma, rsigma):
 
     dg_tmp = (
         torch.empty(
-            dg_tmp_rows(x_), N, device="cuda", dtype=torch.float32, requires_grad=False
+            dg_tmp_rows(x_),
+            N,
+            device=x_.device,
+            dtype=torch.float32,
+            requires_grad=False,
         )
         if need_reduction
         else None
