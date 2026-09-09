@@ -28,8 +28,6 @@ def _read_quad_cluster() -> tuple[int, int]:
     """
     m = int(os.environ.get("AITER_A4W4_QUAD_CLUSTER_M", "4"))
     n = int(os.environ.get("AITER_A4W4_QUAD_CLUSTER_N", "4"))
-    m = 1 
-    n = 4 
     if m < 1 or n < 1:
         raise ValueError(f"AITER_A4W4_QUAD_CLUSTER_{{M,N}} must be >= 1, got {m}x{n}")
     if m * n > 32:
@@ -42,6 +40,13 @@ def _read_quad_cluster() -> tuple[int, int]:
 
 # 2-D cluster of the quadrant-pipeline a4w4 kernel (cluster_m x cluster_n).
 A4W4_QUAD_CLUSTER = _read_quad_cluster()
+
+# XCD-aware tile order for the quad kernel: 0 = off (raw row-major map, the
+# shipped behaviour), >0 = on, and the value is the group width in M-clusters.
+# Off by default because it changes the tile->workgroup map for every launch;
+# turn it on per run to A/B it. 16 mirrors the TILES_PER_GROUP that
+# mxfp4_preshuffle_gfx1250_tdm uses.
+A4W4_QUAD_XCD_SWIZZLE = int(os.environ.get("AITER_A4W4_XCD_SWIZZLE", "0"))
 
 
 def a4w4_quad_pipeline_ok(
@@ -255,6 +260,7 @@ def flydsl_grouped_gemm_a8w4_masked(
             # An infinite limit makes the gpt-oss clamp a no-op, but it arrives
             # as a runtime kernel argument, so only the host can fold it away.
             act_has_limit=int(math.isfinite(float(swiglu_limit))),
+            xcd_swizzle=A4W4_QUAD_XCD_SWIZZLE,
         )
         return out
 

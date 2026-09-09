@@ -234,6 +234,61 @@ def max_cluster_workgroups(lds_bytes_per_wg):
     return max(1, min(MCAST_MASK_WGS, cus_per_se * wgs_per_cu))
 
 
+def num_xcds():
+    """Shader engines the dispatcher round-robins workgroups over (``num_xcc``).
+
+    Read from KFD rather than hardcoded: the swizzle below *inverts* this
+    round-robin, so a wrong count does not merely fail to help, it scatters
+    tiles that should share an L2. Falls back to the 8 this part reports.
+    """
+    for path in sorted(glob.glob(f"{_KFD_NODES}/*/properties")):
+        try:
+            with open(path) as f:
+                for line in f:
+                    key, _, value = line.partition(" ")
+                    if key == "num_xcc":
+                        n = int(value)
+                        if n >= 1:
+                            return n
+        except (OSError, ValueError):
+            continue
+    return 8
+
+
+def _xcd_cluster_swizzle(cid, num_cl_m, num_cl_n, wgm, n_xcds):
+    """Remap a linear CLUSTER id to ``(m_cluster, n_cluster)`` for L2 reuse.
+
+    Cluster-granular on purpose: a cluster is never split, so peers keep sharing
+    one M tile, which is what the A multicast and the cluster-uniform expert
+    bisect both rely on. Splitting a cluster here would not fail loudly -- it
+    would multicast the wrong rows.
+
+    Two effects, in order, following ``gemm_a8w8_8wave._xcd_swizzle_any``:
+    1. Invert the dispatcher's round-robin (cluster i -> XCD ``i % n_xcds``) so
+       that clusters sharing an XCD get CONSECUTIVE ids. Without this the
+       ``tile_m``-adjacent clusters that read the same expert's B block land on
+       different XCDs and each pulls its own copy through its own L2.
+    2. Group ``wgm`` M-clusters and sweep all N inside the group, so that group's
+       A/B stay resident across the sweep.
+    """
+    num_cl = num_cl_m * num_cl_n
+    xcd = cid % n_xcds
+    intra = cid // n_xcds
+    base = num_cl // n_xcds
+    extra = num_cl - base * n_xcds
+    cid2 = xcd * base + (xcd < extra).select(xcd, extra) + intra
+
+    span = wgm * num_cl_n
+    grp = cid2 // span
+    intra_grp = cid2 - grp * span
+    first_m = grp * wgm
+    rem = num_cl_m - first_m
+    gsz = (rem < wgm).select(rem, fx.Int32(wgm))
+    n_cl = intra_grp // gsz
+    m_cl = first_m + (intra_grp - n_cl * gsz)
+    return m_cl, n_cl
+
+
 @flyc.jit
 def launch_gemm_a4w4_moe(
     arg_c: fx.Tensor,
@@ -266,6 +321,7 @@ def launch_gemm_a4w4_moe(
     f32_situ_beta: fx.Float32 = 1.0,
     f32_situ_linear_beta: fx.Float32 = 1.0,
     act_has_limit: Constexpr[int] = 1,
+    xcd_swizzle: Constexpr[int] = 0,
 ):
     """Launch the grouped contiguous-M a4w4 MoE GEMM on the quadrant pipeline."""
     assert supports(
@@ -285,6 +341,10 @@ def launch_gemm_a4w4_moe(
         f"K={K} needs to be a multiple of tile_k={tile_k} with more than "
         f"{num_buffers} K-tiles"
     )
+    # 0 = off (the raw row-major map). >0 selects the XCD-aware tile order and
+    # is the group width in M-clusters, matching the repo's xcd_swizzle
+    # convention (gemm_a8w8_8wave, moe_kernels) where the value IS the wgm.
+    assert xcd_swizzle >= 0, f"xcd_swizzle={xcd_swizzle} must be >= 0"
 
     cluster_sync_revs = 8
     m_run_max, m_run_min = 32, 8
@@ -379,6 +439,7 @@ def launch_gemm_a4w4_moe(
         f"a4w4_quad_t{tile_m}x{tile_n}x{tile_k}_w{m_warp}x{n_warp}"
         f"_b{num_buffers}_K{K}_e{n_experts}"
         f"{_act}{_bias}{_qout}_cl{cluster_m}x{cluster_n}{_probe}{_epi}"
+        f"{f'_xcd{xcd_swizzle}' if xcd_swizzle else ''}"
     )
 
     @flyc.kernel(name=_kname, known_block_size=[block, 1, 1])
@@ -416,8 +477,31 @@ def launch_gemm_a4w4_moe(
         a_mask, b_mask = _mcast_masks(local_x, local_y, cluster_m, cluster_n)
 
         m_chunk = bid_z
-        blk_m = (m_chunk * fx.grid_dim.x + bid_x) * tile_m
-        blk_n = bid_y * tile_n
+        if xcd_swizzle:
+            # Swizzle whole clusters. (bid_x % cluster_m, bid_y % cluster_n) is
+            # the intra-cluster position -- the same pair compute_cluster_position
+            # returns -- so carrying it through untouched keeps every peer on the
+            # M tile its multicast mask assumes.
+            cl_x = bid_x // cluster_m
+            cl_y = bid_y // cluster_n
+            lx = bid_x - cl_x * cluster_m
+            ly = bid_y - cl_y * cluster_n
+            cl_per_run = fx.grid_dim.x // cluster_m
+            num_cl_n = fx.grid_dim.y // cluster_n
+            # Linear cluster id in dispatch order: x fastest, then y, then z.
+            cid = (m_chunk * num_cl_n + cl_y) * cl_per_run + cl_x
+            m_cl, n_cl = _xcd_cluster_swizzle(
+                cid,
+                cl_per_run * fx.grid_dim.z,
+                num_cl_n,
+                xcd_swizzle,
+                num_xcds(),
+            )
+            blk_m = (m_cl * cluster_m + lx) * tile_m
+            blk_n = (n_cl * cluster_n + ly) * tile_n
+        else:
+            blk_m = (m_chunk * fx.grid_dim.x + bid_x) * tile_m
+            blk_n = bid_y * tile_n
         blk_m64 = fx.Int64(blk_m)
         blk_n64 = fx.Int64(blk_n)
 
