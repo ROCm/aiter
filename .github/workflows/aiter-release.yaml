@@ -26,10 +26,6 @@ on:
         description: 'GPU architectures (e.g. gfx942;gfx950)'
         required: false
         default: 'gfx942;gfx950'
-      gpu_targets:
-        description: 'Explicit gfx:cu_num build targets (e.g. gfx942:304;gfx950:256). Overrides gpu_archs when set.'
-        required: false
-        default: ''
       runner:
         description: 'Select build host'
         required: true
@@ -171,9 +167,9 @@ jobs:
       BUILD_DOCKER_IMAGE: ${{ matrix.docker_image }}
       PYTHON_VERSION: ${{ matrix.python_version }}
       GPU_ARCHS: ${{ inputs.gpu_archs || github.event.inputs.gpu_archs }}
-      # Blank resolves to unset, so an unspecified gpu_targets leaves the
-      # GPU_ARCHS path exactly as it was.
-      AITER_GPU_TARGETS: ${{ inputs.gpu_targets || github.event.inputs.gpu_targets || '' }}
+      # workflow_call only, since workflow_dispatch is at GitHub's 10-input cap;
+      # blank resolves to unset, leaving GPU_ARCHS in charge of target selection.
+      AITER_GPU_TARGETS: ${{ inputs.gpu_targets || '' }}
       RELEASE_TYPE: ${{ inputs.release_type || github.event.inputs.release_type || 'none' }}
       ADD_DATE_STAMP: ${{ inputs.add_date_stamp || github.event.inputs.add_date_stamp }}
       USE_MANYLINUX: ${{ inputs.use_manylinux || github.event.inputs.use_manylinux || (startsWith(matrix.docker_image, 'pytorch/manylinux') && 'true') || 'false' }}
