@@ -36,7 +36,7 @@ Run from the aiter repo root so `op_tests/` siblings import cleanly:
     python op_tests/bench_gfx1250_combo.py --dsv4 --ops qk_norm   # QK norm + RoPE
     python op_tests/bench_gfx1250_combo.py --dsv4 --ops score_qk  # FP8 paged MQA logits
     python op_tests/bench_gfx1250_combo.py --dsv4 --ops mori_ep   # MORI EPv2 dispatch/combine
-    python op_tests/bench_gfx1250_combo.py --dsv4 --ops mega_moe  # Mega on/off, 4 GPUs
+    python op_tests/bench_gfx1250_combo.py --dsv4 --ops mega_moe  # base + Mega, 4 GPUs
 
 Environment
 -----------
@@ -59,8 +59,9 @@ same thing to every op:
     inverse_rope    1..16384. The axis is -s at fixed TP1/TP4 shapes
                     -b 128,16 32,4, and 65536 faults -- in the triton reference
                     the UT compares against, not in the kernel under test.
-    mega_moe        1..2048 plus 65536. The 65536 tier is expected to expose
-                    the current cco symmetric-arena limit; see _MEGA_MOE_TOKENS.
+    mega_moe        1..2048 plus 16384 and 65536. The 65536 tier is expected to
+                    expose the current cco symmetric-arena limit; see
+                    _MEGA_MOE_TOKENS.
     a8w8_blockscale 256..65536. M=256/512 cover DSv4 decode batches;
                     smaller M stays out because of a UT bug; see DSV4_OPS.
     mla_v4_prefill  1024..16384, the DSv4 prefill chunk. 65536 faults; see
@@ -94,8 +95,9 @@ window. The monitor privately loads ROCm's unpackaged ``amdsmi`` binding from
 and prints a case-tagged min/mean/median/max table for clocks, power,
 temperature, activity and VRAM.
 ``mega_moe`` has every rank monitor its local GPU around synchronized graph
-replays, then gathers the four summaries to rank 0; ``mori_ep`` remains disabled
-until its dispatch/combine loop exposes an aligned telemetry window.
+replays, then gathers the four summaries to rank 0. ``mori_ep`` instead wraps
+each complete torchrun invocation with one outer-process monitor: it adds no
+replay, but its samples intentionally include setup, warmup and the timed sweep.
 
 Supported operator inputs can be overridden consistently with:
 
@@ -108,10 +110,9 @@ notice when these flags are supplied; the setting is never silently claimed.
 The current passthrough matrix is:
 
     DATA + SCALE + seed   moe, gemm, f8gemm, a8w8_blockscale
-    DATA + seed           a16w16, mega_moe, mhc, qk_norm, inverse_rope,
-                          score_qk, mla_v4_decode, mla_v4_prefill
+    DATA + seed           a16w16, mega_moe, mori_ep, mhc, qk_norm,
+                          inverse_rope, score_qk, mla_v4_decode, mla_v4_prefill
     DATA mapping only     mha (norm -> randn, constant -> const0.25)
-    native init only      mori_ep
 
 ``--scale-init`` is reported as not applicable for operators without a scale
 operand.
@@ -207,35 +208,28 @@ The ``a8w8_blockscale`` op runs:
           7168,3072 65536,1536 8192,1536 \
       --ck_preshuffle True --flydsl
 
-The ``a16w16`` op uses ``test_opus_a16w16_gemm.py`` with batch=1, M=512,
-K=7168 and N=64,384,1024,2048,32320,129280.
+The ``a16w16`` op uses the global tuned GEMM dispatcher with batch=1, K=7168,
+the token sweep as M and N=64,384,1024,2048,32320,129280.
 
-The ``mega_moe`` op runs both sides of the comparison:
-
-    MORI_V2_KERNEL_BACKEND=hip MEGA_DISPATCH=mori \
-    torchrun --standalone --nproc_per_node=4 \
-      op_tests/multigpu_tests/test_mega_moe_gfx1250.py \
-      -e 384 -k 6 -hd 7168 -id 3072 \
-      --layers 61 -tpr 512 --combine scatter_fused \
-      --acc_verify 0 --profile_table 1
+The ``mega_moe`` op runs both sides of the comparison in one process and emits
+only their combined summary (the summary retains the base/fused timings,
+speedup and stage-2 overlap rate):
 
     MORI_V2_KERNEL_BACKEND=hip MEGA_DISPATCH=mori \
     torchrun --standalone --nproc_per_node=4 \
       op_tests/multigpu_tests/test_mega_moe_gfx1250.py \
       -e 384 -k 6 -hd 7168 -id 3072 \
-      --layers 61 -tpr 512 --combine gather \
-      --acc_verify 0 --profile_table 1
+      --layers 61 -tpr 512 --combine both \
+      --acc_verify 0 --profile_table 0
 
 Token sweeps come from one variable, AITER_BENCH_TOKENS (see Environment
 above). Unset, each op runs its own default -- the ops do not share a supported
 range, so those defaults differ and each says why at its constant. Set, it
 applies to every op that sweeps tokens, and the file does not argue with it.
 
-``a16w16`` is not one of them: its range is a function of what opus has tuned,
-not a fixed limit. Shapes with no tuned winner fall back to a split-K kid whose
-launcher is 32-bit gmem-descriptor bound, which is both slow and, at M=65536,
-wrong. Re-tuning through csrc/gemm_a16w16/gemm_a16w16_tune.py --libtype opus is
-what widens the range, so the bench predicts nothing and reports what it gets.
+``a16w16`` is not one of them: it uses the DSv4 shape grid below and lets the
+global tuned GEMM table select the backend for every shape. A missing row uses
+the dispatcher's normal fallback instead of forcing a backend here.
 
 gfx1250's bundled CK does not compile, so the asm JIT modules must be built with
 ENABLE_CK=0. The script sets it (before importing aiter) so a plain run just
@@ -264,9 +258,10 @@ import json
 import subprocess
 import sys
 import tempfile
+import time
 import warnings
 
-from smi_monitor import SMI_RESULT_PREFIX
+from smi_monitor import GpuMonitor, SMI_RESULT_PREFIX
 
 warnings.filterwarnings("ignore")
 
@@ -307,16 +302,18 @@ with _silence():
     import test_fmha_fwd_with_sink_asm as mha_mod  # has __main__ guard
     import test_mla_v4_kargpreld as mla_v4_kargpreld_mod
     import test_mxfp8fp4gemm as f8gemm_mod
-    import test_opus_a16w16_gemm as a16w16_mod
     import torch
     from triton_tests.attention import test_mla_v4_triton as mla_v4_triton_mod
 
     import aiter
+    import aiter.tuned_gemm as tuned_gemm_mod
     from aiter import dtypes
     from aiter.jit.utils.chip_info import get_cu_num, get_gfx
     from aiter.test_common import (
         DATA_DISTS,
         E8M0_SCALE_DISTS,
+        checkAllclose,
+        fill,
         make_generator,
         print_json_table,
         run_perftest,
@@ -356,10 +353,9 @@ _A16W16_NS = (64, 384, 1024, 2048, 32320, 129280)
 # is 16 GB of bf16 output at (65536, 129280).
 _A16W16_WIDE_N = 2048
 _A16W16_WIDE_N_MAX_M = 2048
-# a16w16 returns its own error ratio, and a wrong answer here is silent: the UT
-# neither raises nor prints a warning. Measured on gfx1250 / 20260827, every
-# shape that computed correctly came back 0 or ~1e-5, while M=65536 came back
-# 0.96-0.99 on all four of its N -- an unrelated result, not a tolerance miss.
+# A wrong a16w16 answer is otherwise silent. Measured on gfx1250 / 20260827,
+# every shape that computed correctly came back 0 or ~1e-5, while M=65536 came
+# back 0.96-0.99 on all four of its N -- an unrelated result, not a tolerance miss.
 # Anything above this is reported as a failed op rather than printed as data.
 _A16W16_MAX_ERR = 1e-2
 
@@ -502,7 +498,9 @@ _MLA_PREFILL_TOKENS = _tokens((1024, 2048, 4096, 8192, 16384))
 # and asks for 7.5 GB. That is a per_rank_vmm the UT never passes, not something
 # MORI_SHMEM_HEAP_SIZE reaches. Keep the tier in the sweep so the limitation is
 # visible in the structured failure output rather than silently unmeasured.
-_MEGA_MOE_TOKENS = _tokens((1, 16, 32, 64, 128, 256, 512, 1024, 2048, 65536))
+_MEGA_MOE_TOKENS = _tokens(
+    (1, 16, 32, 64, 128, 256, 512, 1024, 2048, 16384, 65536)
+)
 # What dispatch puts on the wire; combine is always bf16, so anything but bf16
 # is an asymmetric pair. fp4 is the wire DSv4 actually serves on -- the receiver
 # hands the payload straight to the expert GEMM as its A operand, and that GEMM
@@ -880,7 +878,7 @@ def _pin_arch(env):
 
 
 def _run_child(name, cmd, cwd, env=None, extract=None, timeout=None, tail=30,
-               kernels=True, smi=True, structured=False):
+               kernels=True, smi=True, outer_smi=False, structured=False):
     """Run a child UT with its output captured and surface only its results.
 
     Child UTs print their own progress, aiter INFO lines and (with FlyDSL) a
@@ -901,6 +899,14 @@ def _run_child(name, cmd, cwd, env=None, extract=None, timeout=None, tail=30,
     # env=None means "inherit ours", which already carries these two.
     if env is not None:
         _pin_arch(env)
+    monitor = None
+    monitor_start = None
+    if outer_smi and os.environ.get("AITER_SMI_MONITOR") == "1":
+        device = int(os.environ.get("AITER_SMI_DEVICE", "0"))
+        interval_s = float(os.environ.get("AITER_SMI_INTERVAL", "0.05"))
+        monitor = GpuMonitor(device_index=device, interval_s=interval_s)
+        monitor.start()
+        monitor_start = time.perf_counter()
     try:
         proc = subprocess.run(
             cmd, cwd=cwd, env=env, text=True, timeout=timeout,
@@ -920,6 +926,28 @@ def _run_child(name, cmd, cwd, env=None, extract=None, timeout=None, tail=30,
         print("\n".join(captured.splitlines()[-tail:]), flush=True)
         _note_failure(name, f"timed out after {timeout}s")
         return
+    finally:
+        if monitor is not None:
+            monitor.stop()
+            elapsed_s = time.perf_counter() - monitor_start
+            expected_samples = max(1, int(elapsed_s / interval_s))
+            record = {
+                "label": f"{name} [outer process]",
+                "device": device,
+                "interval_s": interval_s,
+                "duration_s": elapsed_s,
+                "launches": None,
+                "samples": len(monitor.samples),
+                "sample_status": (
+                    "ok"
+                    if len(monitor.samples) >= max(2, expected_samples // 2)
+                    else "insufficient"
+                ),
+                "metrics": monitor.summary(),
+            }
+            _collect_smi_rows(
+                [SMI_RESULT_PREFIX + json.dumps(record, sort_keys=True)]
+            )
     lines = proc.stdout.splitlines()
     _collect_smi_rows(lines)
     # `results` decides whether the op reported anything; the kernel digest is
@@ -1186,10 +1214,7 @@ def run_a8w8_blockscale(args):
 
 
 def run_a16w16(args):
-    """Run the DSv4 BF16 linear shapes through the Opus GEMM UT."""
-    # test_a16w16 returns only the error; its timing is printed as
-    #   [a16w16] batch=1 M=512 N=64 K=7168 dtype=... | 7.8us | 12.05 TFLOPs | err=0
-    # so capture the block and parse that line back out.
+    """Run the DSv4 BF16 linear shapes through the tuned GEMM dispatcher."""
     batch, K = 1, 7168
     rows = []
     _unused_scale_init(args, "a16w16")
@@ -1207,28 +1232,46 @@ def run_a16w16(args):
                          "err_msg": f"skipped: N>{_A16W16_WIDE_N} is lm_head, "
                                     f"capped at M<={_A16W16_WIDE_N_MAX_M}"})
             continue
-        # No >4 GiB pre-check. opus_dispatch_a16w16_gfx1250 tries the tuned
-        # table FIRST and returns on a hit; check_shape_4g runs only after that
-        # misses (opus_gemm_arch_gfx1250.cuh:161), on the way to the split-K
-        # heuristic kid -- whose launcher is what builds the 32-bit gmem
-        # descriptors. A tuned 4wave_wl_co winner never reaches it: that
-        # pipeline addresses gmem through TDM descriptors, which clamp every
-        # dimension and are not 32-bit bounded. So the limit belongs to one
-        # fallback path, not to a16w16, and predicting it here would keep
-        # skipping shapes that tuning has already made runnable. Let the kernel
-        # raise and record that instead.
+        # Exercise the same backend selected by the global tuned CSV rather than
+        # forcing every shape through the Opus-only regression helper.
         try:
+            A = fill(
+                (batch, M, K),
+                data_init,
+                generators[data_init],
+                dtype=torch.bfloat16,
+                device="cuda",
+            )
+            B = fill(
+                (n, K),
+                data_init,
+                generators[data_init],
+                dtype=torch.bfloat16,
+                device="cuda",
+            )
+            ref = torch.einsum("bmk,nk->bmn", A.float(), B.float()).to(
+                torch.bfloat16
+            )
             with _smi_case(
                 f"a16w16/batch={batch}/M={M}/N={n}/K={K}/"
                 f"data={data_init}/seed={args.seed}"
             ), _capture() as box:
-                err = a16w16_mod.test_a16w16(
-                    batch=batch,
-                    M=M,
-                    N=n,
-                    K=K,
-                    dist=data_init,
-                    gen=generators[data_init],
+                Y, us = run_perftest(
+                    tuned_gemm_mod.gemm_a16w16,
+                    A,
+                    B,
+                    None,
+                    torch.bfloat16,
+                    num_iters=101,
+                    num_warmup=2,
+                    num_rotate_args=0,
+                )
+                err = checkAllclose(
+                    Y,
+                    ref,
+                    msg=f"a16w16 b={batch} m={M} n={n} k={K}",
+                    rtol=0.1,
+                    atol=0.5,
                 )
         except Exception as exc:  # noqa: BLE001 - one shape must not end the sweep
             rows.append({"data_init": data_init, "seed": args.seed,
@@ -1237,30 +1280,25 @@ def run_a16w16(args):
             continue
         captured = box[0].splitlines()
         row = {"data_init": data_init, "seed": args.seed,
-               "batch": batch, "M": M, "N": n, "K": K, "err": err}
+               "batch": batch, "M": M, "N": n, "K": K,
+               "us": float(us),
+               "TFLOPS": 2.0 * batch * M * n * K / float(us) / 1e6,
+               "err": err}
         # float(): checkAllclose returns a bare 0 for a clean compare but a
         # numpy/torch scalar for a mismatch, and only one of those formats.
         if err is not None and float(err) > _A16W16_MAX_ERR:
             row["err_msg"] = (f"WRONG RESULT: err={float(err):g} "
                               f"> {_A16W16_MAX_ERR:g}")
             _note_failure(f"a16w16 M={M} N={n} K={K}", row["err_msg"])
-        for line in captured:
-            if not line.startswith("[a16w16]"):
-                continue
-            fields = [f.strip() for f in line.split("|")]
-            us = next((f for f in fields if f.endswith("us")), None)
-            tflops = next((f for f in fields if f.endswith("TFLOPs")), None)
-            row["us"] = float(us[:-2]) if us else None
-            row["TFLOPS"] = float(tflops[:-7]) if tflops else None
-            break
-        # Which kernel served this shape: a16w16 switches between a splitk pair
-        # and a 4wave_wl_co variant, and the timing alone does not say which.
+        # Which kernel served this shape: the selected backend alone does not
+        # identify the concrete kernel that reached the GPU.
         row["kernel"] = " + ".join(_kernel_names(captured)) or None
         rows.append(row)
     _print_table(
-        "gemm_a16w16_opus (DSv4)",
+        "gemm_a16w16_tuned (DSv4)",
         rows,
-        keep=["data_init", "seed", "batch", "M", "N", "K", "us", "TFLOPS", "kernel", "err"],
+        keep=["data_init", "seed", "batch", "M", "N", "K", "us", "TFLOPS",
+              "kernel", "err"],
     )
 
 
@@ -1305,7 +1343,7 @@ def run_mega_moe(args):
         "--acc_verify",
         "0",
         "--profile_table",
-        "1",
+        "0",
     ]
     # AITER_FORCE_A8W4 selects the grouped kernel's ACTIVATION dtype (0 -> fp4,
     # 1 -> fp8); the weights are mxfp4 either way and -q only picks their layout,
@@ -1315,7 +1353,7 @@ def run_mega_moe(args):
     for tokens, (quant, force_a8w4), (label, combine), data_init in itertools.product(
         _MEGA_MOE_TOKENS,
         (("a4w4_mxfp4", "0"), ("a8w4_mxfp4", "1")),
-        (("non-Mega", "base"), ("Mega", "fused")),
+        (("base+Mega", "both"),),
         data_inits,
     ):
         init_label = data_init or "native-default"
@@ -1455,7 +1493,7 @@ def run_score_qk(args):
 
 def run_mori_ep(args):
     """Run MORI EPv2 dispatch/combine at the DSv4 MoE shape."""
-    _unsupported_init(args, "mori_ep")
+    _unused_scale_init(args, "mori_ep")
     # Runs whatever mori the image provides; keeping it current is the image's
     # job. Updating it from here moved the measurement target between runs and
     # needed a dev ROCm toolchain the pip-wheel images do not ship.
@@ -1481,19 +1519,24 @@ def run_mori_ep(args):
             "MODES": env.get("MODES", "eager,graph"),
             "COMBINE_IN": env.get("COMBINE_IN", "inplace"),
             "CHECK": env.get("CHECK", "1"),
+            "SEED": str(args.seed),
             "DBN": "",
             "DWPB": "",
             "CBN": "",
             "CWPB": "",
         }
     )
-    # One child per wire: bench_ep.py reads $DISP once at import and builds the
-    # transport for that dtype, so the tiers cannot share a process.
-    for disp in _MORI_EP_DISP:
+    # bench_ep.py reads DATA_INIT and DISP at import and builds the transport
+    # for that pair, so neither axis can share a child process.
+    for data_init, disp in itertools.product(
+        args.data_init or ("norm",), _MORI_EP_DISP
+    ):
+        env["DATA_INIT"] = data_init
         env["DISP"] = disp
         note = " UNCHECKED" if disp in _MORI_EP_UNCHECKED else ""
         _run_child(
-            f"mori_ep (DSv4 dispatch/combine, disp={disp}, combine=bf16{note})",
+            f"mori_ep (DSv4 dispatch/combine, init={data_init}, disp={disp}, "
+            f"combine=bf16{note})",
             [
                 "torchrun",
                 "--standalone",
@@ -1505,6 +1548,7 @@ def run_mori_ep(args):
             extract=_lines(_quiet),
             timeout=3600,
             smi=False,
+            outer_smi=True,
         )
 
 
@@ -1944,7 +1988,10 @@ def main():
     p.add_argument(
         "--smi-monitor",
         action="store_true",
-        help="replay and sample each timed benchmark case after latency measurement",
+        help=(
+            "replay and sample each timed benchmark case; mori_ep instead "
+            "samples each complete torchrun invocation"
+        ),
     )
     p.add_argument(
         "--smi-device",
