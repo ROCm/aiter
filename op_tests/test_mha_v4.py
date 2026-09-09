@@ -1308,10 +1308,7 @@ def test_mha_v4_raw_compile_parity(q_format, v_format):
 
     assert eager.data_ptr() == eager_out.data_ptr()
     assert compiled.data_ptr() == compiled_out.data_ptr()
-    if q_format == AttentionFormat.BF16 and v_format == AttentionFormat.FP8:
-        torch.testing.assert_close(eager, compiled, atol=0.02, rtol=0.02)
-    else:
-        assert torch.equal(eager, compiled)
+    assert torch.equal(eager, compiled)
     assert torch.isfinite(consumed).all()
     assert churn.numel() == 16 * 1024 * 1024
 
