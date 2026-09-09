@@ -52,6 +52,208 @@ def find_seq_idx(
     return left - 1
 
 
+@triton.jit
+def _attention_tile(
+    acc,
+    M,
+    L,
+    Q,
+    j,
+    key_cache_ptr,
+    value_cache_ptr,
+    block_tables_ptr,
+    block_table_offset,
+    kv_head_idx,
+    qk_scale,
+    softcap,
+    offs_d,
+    offs_t,
+    offs_shfl,
+    dim_mask,
+    row_mask,
+    causal_bound,
+    context_len,
+    query_pos,
+    max_seq_prefix_len,
+    alibi_slope,
+    qq_bias_row_ptrs,
+    qq_bias_stride_0,
+    stride_k_cache_0,
+    stride_k_cache_1,
+    stride_k_cache_2,
+    stride_v_cache_0,
+    stride_v_cache_1,
+    stride_v_cache_2,
+    stride_k_cache_3: tl.constexpr,
+    stride_v_cache_3: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+    TILE_SIZE: tl.constexpr,
+    HEAD_SIZE: tl.constexpr,
+    HEAD_SIZE_PADDED: tl.constexpr,
+    K_WIDTH: tl.constexpr,
+    USE_SOFTCAP: tl.constexpr,
+    USE_ALIBI_SLOPES: tl.constexpr,
+    USE_QQ_BIAS: tl.constexpr,
+    SLIDING_WINDOW: tl.constexpr,
+    SHUFFLED_KV_CACHE: tl.constexpr,
+    KV_cache_modifier: tl.constexpr,
+    MASKED: tl.constexpr,
+    FUSE_SCALE: tl.constexpr,
+):
+    """One KV tile of the 2-D unified-attention loop.
+
+    MASKED=False is only legal for tiles that lie strictly below the causal
+    diagonal of every query row in the block AND carry no sliding-window
+    bound; the caller establishes that with `bulk_end`. It skips the score
+    masking, which is what lets the bulk loop pipeline.
+
+    FUSE_SCALE folds qk_scale into the exp2 argument instead of scaling the
+    qk product separately. It costs one bf16-ULP-class difference against the
+    stock path and is only valid without softcap/alibi/qq-bias, which all
+    need the scaled scores.
+    """
+    if not MASKED:
+        tl.static_assert(
+            SLIDING_WINDOW <= 0,
+            "the unmasked bulk loop cannot honour a sliding-window bound",
+        )
+    RCP_LN2: tl.constexpr = 1.4426950408889634
+    seq_offset = j * TILE_SIZE + offs_t
+    if TILE_SIZE == BLOCK_SIZE:
+        tile_mask = tl.full((1,), 1, dtype=tl.int1)
+    else:
+        tile_mask = seq_offset < max_seq_prefix_len
+
+    k_mask = None
+    v_mask = None
+    other = None
+    if SHUFFLED_KV_CACHE:
+        physical_block_idx_shfl = tl.load(block_tables_ptr + block_table_offset + j).to(
+            tl.int64
+        )
+        k_offset = (
+            physical_block_idx_shfl * stride_k_cache_0
+            + kv_head_idx * stride_k_cache_1
+            + offs_shfl
+        )
+        v_offset = (
+            physical_block_idx_shfl * stride_v_cache_0
+            + kv_head_idx * stride_v_cache_1
+            + offs_shfl
+        )
+    else:
+        physical_block_idx = tl.load(
+            block_tables_ptr + block_table_offset + seq_offset // BLOCK_SIZE
+        ).to(tl.int64)
+
+        v_offset = (
+            physical_block_idx[:, None] * stride_v_cache_0
+            + kv_head_idx * stride_v_cache_2
+            + offs_d[None, :] * stride_v_cache_3
+            + (seq_offset % BLOCK_SIZE)[:, None] * stride_v_cache_1
+        )
+        v_mask = dim_mask[None, :] & tile_mask[:, None]
+
+        k_offset = (
+            physical_block_idx[None, :] * stride_k_cache_0
+            + kv_head_idx * stride_k_cache_2
+            + offs_d[:, None] * stride_k_cache_3
+            + (seq_offset % BLOCK_SIZE)[None, :] * stride_k_cache_1
+        )
+        k_mask = dim_mask[:, None] & tile_mask[None, :]
+        other = 0.0
+
+    K_load = tl.load(
+        key_cache_ptr + k_offset,
+        mask=k_mask,
+        other=other,
+        cache_modifier=KV_cache_modifier,
+    )
+    K = K_load.to(Q.dtype)
+    if SHUFFLED_KV_CACHE:
+        K = (
+            K.reshape(HEAD_SIZE_PADDED // K_WIDTH, TILE_SIZE, K_WIDTH)
+            .permute(1, 0, 2)
+            .reshape(TILE_SIZE, HEAD_SIZE_PADDED)
+            .trans(1, 0)
+        )
+
+    V_load = tl.load(
+        value_cache_ptr + v_offset,
+        mask=v_mask,
+        other=other,
+        cache_modifier=KV_cache_modifier,
+    )
+    V = V_load.to(Q.dtype)
+    if SHUFFLED_KV_CACHE:
+        V = (
+            V.reshape(TILE_SIZE // K_WIDTH, HEAD_SIZE_PADDED, K_WIDTH)
+            .permute(0, 2, 1)
+            .reshape(TILE_SIZE, HEAD_SIZE_PADDED)
+        )
+
+    if FUSE_SCALE and not (USE_SOFTCAP or USE_ALIBI_SLOPES or USE_QQ_BIAS):
+        # Keep the qk product unscaled through the max, then fold qk_scale into
+        # the exp2 argument so `S*qk_scale - m_j` contracts to a single FMA.
+        # qk_scale > 0, and rounding is monotone, so
+        # max(qk_scale*S) == qk_scale*max(S) exactly.
+        S = tl.dot(Q, K)
+        if MASKED:
+            seq_mask = seq_offset[None, :] < causal_bound[:, None]
+            S = tl.where(row_mask[:, None] & seq_mask, S, float("-inf"))
+            if SLIDING_WINDOW > 0:
+                S = tl.where(
+                    (context_len + query_pos[:, None] - seq_offset) < SLIDING_WINDOW,
+                    S,
+                    float("-inf"),
+                )
+            m_j = tl.maximum(M, tl.max(S, axis=1) * qk_scale)
+            m_j = tl.where(m_j > float("-inf"), m_j, 0.0)
+        else:
+            m_j = tl.maximum(M, tl.max(S, axis=1) * qk_scale)
+        P = tl.math.exp2(S * qk_scale - m_j[:, None])
+    else:
+        S = qk_scale * tl.dot(Q, K)
+
+        if USE_SOFTCAP:
+            S = apply_softcap(S, softcap) * RCP_LN2
+
+        if MASKED:
+            seq_mask = seq_offset[None, :] < causal_bound[:, None]
+            S = tl.where(row_mask[:, None] & seq_mask, S, float("-inf"))
+            if SLIDING_WINDOW > 0:
+                S = tl.where(
+                    (context_len + query_pos[:, None] - seq_offset) < SLIDING_WINDOW,
+                    S,
+                    float("-inf"),
+                )
+
+        if USE_ALIBI_SLOPES:
+            S += alibi_slope[:, None] * (seq_offset - context_len) * RCP_LN2
+
+        if USE_QQ_BIAS:
+            key_rel_pos = seq_offset - context_len
+            is_query_key = key_rel_pos >= 0 and key_rel_pos < qq_bias_stride_0
+            qq_bias = tl.load(
+                qq_bias_row_ptrs + key_rel_pos[None, :],
+                mask=is_query_key[None, :],
+                other=0.0,
+            )
+            S += qq_bias * RCP_LN2
+
+        m_j = tl.maximum(M, tl.max(S, axis=1))
+        m_j = tl.where(m_j > float("-inf"), m_j, 0.0)
+        P = tl.math.exp2(S - m_j[:, None])
+
+    l_j = tl.sum(P, axis=1)
+    alpha = tl.math.exp2(M - m_j)
+    acc = acc * alpha[:, None]
+    L = L * alpha + l_j
+    M = m_j
+    acc = tl.dot(P.to(V.dtype), V, acc=acc)
+    return acc, M, L
+
+
 _kernel_unified_attention_2d_repr = make_kernel_repr(
     "kernel_unified_attention_2d",
     [
@@ -71,6 +273,8 @@ _kernel_unified_attention_2d_repr = make_kernel_repr(
         "ALL_DECODE",
         "SHUFFLED_KV_CACHE",
         "K_WIDTH",
+        "FASTTILE_SPLIT",
+        "FASTTILE_FUSE",
     ],
 )
 
@@ -126,6 +330,9 @@ def kernel_unified_attention_2d(
     ALL_DECODE: tl.constexpr = False,  # bool
     SHUFFLED_KV_CACHE: tl.constexpr = False,  # bool
     K_WIDTH: tl.constexpr = 0,  # int
+    # See KR_FASTTILE in aiter/ops/triton/attention/unified_attention.py.
+    FASTTILE_SPLIT: tl.constexpr = False,  # bool
+    FASTTILE_FUSE: tl.constexpr = False,  # bool
 ):
     kv_head_idx = tl.program_id(0)
     q_block_global_idx = tl.program_id(1)
@@ -280,160 +487,126 @@ def kernel_unified_attention_2d(
         k_descale = None
         v_descale = None
     KV_cache_modifier: tl.constexpr = ".cg" if ALL_DECODE else ""
-    # iterate through tiles (now limited to the sliding window range)
-    for j in range(tile_start, tile_end):
-        seq_offset = j * TILE_SIZE + offs_t
-        # to reduce the masking effect when not needed
-        if TILE_SIZE == BLOCK_SIZE:
-            tile_mask = tl.full((1,), 1, dtype=tl.int1)
-        else:
-            tile_mask = seq_offset < max_seq_prefix_len
+    causal_bound = context_len + query_pos + 1
+    row_mask = query_mask_1 & query_mask_0
 
-        k_mask = None
-        v_mask = None
-        other = None
-        if SHUFFLED_KV_CACHE:
-            physical_block_idx_shfl = tl.load(
-                block_tables_ptr + block_table_offset + j
-            ).to(tl.int64)
-            k_offset = (
-                physical_block_idx_shfl * stride_k_cache_0
-                + kv_head_idx * stride_k_cache_1
-                + offs_shfl
-            )
-
-            v_offset = (
-                physical_block_idx_shfl * stride_v_cache_0
-                + kv_head_idx * stride_v_cache_1
-                + offs_shfl
-            )
-        else:
-            physical_block_idx = tl.load(
-                block_tables_ptr + block_table_offset + seq_offset // BLOCK_SIZE
-            ).to(tl.int64)
-
-            v_offset = (
-                physical_block_idx[:, None] * stride_v_cache_0
-                + kv_head_idx * stride_v_cache_2
-                + offs_d[None, :] * stride_v_cache_3
-                + (seq_offset % BLOCK_SIZE)[:, None] * stride_v_cache_1
-            )
-            v_mask = dim_mask[None, :] & tile_mask[:, None]
-
-            k_offset = (
-                physical_block_idx[None, :] * stride_k_cache_0
-                + kv_head_idx * stride_k_cache_2
-                + offs_d[:, None] * stride_k_cache_3
-                + (seq_offset % BLOCK_SIZE)[None, :] * stride_k_cache_1
-            )
-            k_mask = dim_mask[:, None] & tile_mask[None, :]
-            other = 0.0
-
-        # K : (HEAD_SIZE, TILE_SIZE)
-        K_load = tl.load(
-            key_cache_ptr + k_offset,
-            mask=k_mask,
-            other=other,
-            cache_modifier=KV_cache_modifier,
+    if FASTTILE_SPLIT:
+        # The bulk loop covers the tiles that lie strictly below the causal
+        # diagonal of *every* row in this q-block, i.e. below the diagonal of
+        # its first (lowest-position) row.  Tile j qualifies when its last key
+        # (j+1)*TILE_SIZE - 1 is still < that row's causal bound, which is
+        # exactly j < bound // TILE_SIZE.
+        #
+        # Clamp into [tile_start, tile_end].  context_len is seq_len minus the
+        # query length and so goes negative whenever a sequence carries more
+        # query tokens than cached keys; the floor division then rounds toward
+        # -inf and would hand the masked loop below a negative first tile.
+        bulk_end = tl.maximum(
+            tile_start,
+            tl.minimum(
+                tile_end,
+                (context_len + q_block_local_idx * BLOCK_Q + 1) // TILE_SIZE,
+            ),
         )
-
-        K = K_load.to(Q.dtype)
-        if SHUFFLED_KV_CACHE:
-            K = (
-                K.reshape(
-                    HEAD_SIZE_PADDED // K_WIDTH,
-                    TILE_SIZE,
-                    K_WIDTH,
-                )
-                .permute(1, 0, 2)
-                .reshape(TILE_SIZE, HEAD_SIZE_PADDED)
-                .trans(1, 0)
+        for j in range(tile_start, bulk_end):
+            acc, M, L = _attention_tile(
+                acc=acc,
+                M=M,
+                L=L,
+                Q=Q,
+                j=j,
+                key_cache_ptr=key_cache_ptr,
+                value_cache_ptr=value_cache_ptr,
+                block_tables_ptr=block_tables_ptr,
+                block_table_offset=block_table_offset,
+                kv_head_idx=kv_head_idx,
+                qk_scale=qk_scale,
+                softcap=softcap,
+                offs_d=offs_d,
+                offs_t=offs_t,
+                offs_shfl=offs_shfl,
+                dim_mask=dim_mask,
+                row_mask=row_mask,
+                causal_bound=causal_bound,
+                context_len=context_len,
+                query_pos=query_pos,
+                max_seq_prefix_len=max_seq_prefix_len,
+                alibi_slope=alibi_slope if USE_ALIBI_SLOPES else None,
+                qq_bias_row_ptrs=qq_bias_row_ptrs if USE_QQ_BIAS else None,
+                qq_bias_stride_0=qq_bias_stride_0,
+                stride_k_cache_0=stride_k_cache_0,
+                stride_k_cache_1=stride_k_cache_1,
+                stride_k_cache_2=stride_k_cache_2,
+                stride_v_cache_0=stride_v_cache_0,
+                stride_v_cache_1=stride_v_cache_1,
+                stride_v_cache_2=stride_v_cache_2,
+                stride_k_cache_3=stride_k_cache_3,
+                stride_v_cache_3=stride_v_cache_3,
+                BLOCK_SIZE=BLOCK_SIZE,
+                TILE_SIZE=TILE_SIZE,
+                HEAD_SIZE=HEAD_SIZE,
+                HEAD_SIZE_PADDED=HEAD_SIZE_PADDED,
+                K_WIDTH=K_WIDTH,
+                USE_SOFTCAP=USE_SOFTCAP,
+                USE_ALIBI_SLOPES=USE_ALIBI_SLOPES,
+                USE_QQ_BIAS=USE_QQ_BIAS,
+                SLIDING_WINDOW=SLIDING_WINDOW,
+                SHUFFLED_KV_CACHE=SHUFFLED_KV_CACHE,
+                KV_cache_modifier=KV_cache_modifier,
+                MASKED=False,
+                FUSE_SCALE=FASTTILE_FUSE,
             )
+    else:
+        bulk_end = tile_start
 
-        # V : (TILE_SIZE, HEAD_SIZE)
-        V_load = tl.load(
-            value_cache_ptr + v_offset,
-            mask=v_mask,
-            other=other,
-            cache_modifier=KV_cache_modifier,
+    for j in range(bulk_end, tile_end):
+        acc, M, L = _attention_tile(
+            acc=acc,
+            M=M,
+            L=L,
+            Q=Q,
+            j=j,
+            key_cache_ptr=key_cache_ptr,
+            value_cache_ptr=value_cache_ptr,
+            block_tables_ptr=block_tables_ptr,
+            block_table_offset=block_table_offset,
+            kv_head_idx=kv_head_idx,
+            qk_scale=qk_scale,
+            softcap=softcap,
+            offs_d=offs_d,
+            offs_t=offs_t,
+            offs_shfl=offs_shfl,
+            dim_mask=dim_mask,
+            row_mask=row_mask,
+            causal_bound=causal_bound,
+            context_len=context_len,
+            query_pos=query_pos,
+            max_seq_prefix_len=max_seq_prefix_len,
+            alibi_slope=alibi_slope if USE_ALIBI_SLOPES else None,
+            qq_bias_row_ptrs=qq_bias_row_ptrs if USE_QQ_BIAS else None,
+            qq_bias_stride_0=qq_bias_stride_0,
+            stride_k_cache_0=stride_k_cache_0,
+            stride_k_cache_1=stride_k_cache_1,
+            stride_k_cache_2=stride_k_cache_2,
+            stride_v_cache_0=stride_v_cache_0,
+            stride_v_cache_1=stride_v_cache_1,
+            stride_v_cache_2=stride_v_cache_2,
+            stride_k_cache_3=stride_k_cache_3,
+            stride_v_cache_3=stride_v_cache_3,
+            BLOCK_SIZE=BLOCK_SIZE,
+            TILE_SIZE=TILE_SIZE,
+            HEAD_SIZE=HEAD_SIZE,
+            HEAD_SIZE_PADDED=HEAD_SIZE_PADDED,
+            K_WIDTH=K_WIDTH,
+            USE_SOFTCAP=USE_SOFTCAP,
+            USE_ALIBI_SLOPES=USE_ALIBI_SLOPES,
+            USE_QQ_BIAS=USE_QQ_BIAS,
+            SLIDING_WINDOW=SLIDING_WINDOW,
+            SHUFFLED_KV_CACHE=SHUFFLED_KV_CACHE,
+            KV_cache_modifier=KV_cache_modifier,
+            MASKED=True,
+            FUSE_SCALE=FASTTILE_FUSE,
         )
-
-        V = V_load.to(Q.dtype)
-        if SHUFFLED_KV_CACHE:
-            V = (
-                V.reshape(
-                    TILE_SIZE // K_WIDTH,
-                    HEAD_SIZE_PADDED,
-                    K_WIDTH,
-                )
-                .permute(0, 2, 1)
-                .reshape(TILE_SIZE, HEAD_SIZE_PADDED)
-            )
-
-        # S : (BLOCK_M, TILE_SIZE)
-        # qk_scale = scale * RCP_LN2 (log_2 e) so that we can use exp2 later
-        S = qk_scale * tl.dot(Q, K)
-
-        if USE_SOFTCAP:
-            # softcap here uses exp2 and consumes RCP_LN2 conversion.
-            # multiply by RCP_LN2 again to be used in later exp2
-            S = apply_softcap(S, softcap) * RCP_LN2
-        seq_mask = seq_offset[None, :] < context_len + query_pos[:, None] + 1
-
-        S = tl.where(
-            query_mask_1[:, None] & query_mask_0[:, None] & seq_mask, S, float("-inf")
-        )
-
-        if SLIDING_WINDOW > 0:
-            S = tl.where(
-                (context_len + query_pos[:, None] - seq_offset) < SLIDING_WINDOW,
-                S,
-                float("-inf"),
-            )
-
-        if USE_ALIBI_SLOPES:
-            # prescale w. RCP_LN2 for later exp2
-            S += alibi_slope[:, None] * (seq_offset - context_len) * RCP_LN2
-
-        if USE_QQ_BIAS:
-            # compute key positions relative to query section
-            key_rel_pos = seq_offset - context_len  # shape: [BLOCK_SIZE]
-            # load bias only for keys that correspond to queries
-            is_query_key = key_rel_pos >= 0 and key_rel_pos < qq_bias_stride_0
-            qq_bias = tl.load(
-                qq_bias_row_ptrs + key_rel_pos[None, :],
-                mask=is_query_key[None, :],  # avoid OOB for context keys
-                other=0.0,
-            )
-            # prescale w. RCP_LN2 for later exp2
-            S += qq_bias * RCP_LN2
-
-        # compute running maximum
-        # m_j : (BLOCK_M,)
-        m_j = tl.maximum(M, tl.max(S, axis=1))
-
-        # For sliding window there's a chance the max is -inf due to masking of
-        # the entire row. In this case we need to set m_j 0 to avoid NaN
-        m_j = tl.where(m_j > float("-inf"), m_j, 0.0)
-
-        # P : (BLOCK_M, TILE_SIZE)
-        P = tl.math.exp2(S - m_j[:, None])
-
-        # l_j : (BLOCK_M,)
-        l_j = tl.sum(P, axis=1)
-
-        # alpha : (BLOCK_M, )
-        alpha = tl.math.exp2(M - m_j)
-
-        # acc : (BLOCK_M, HEAD_SIZE_PADDED)
-        acc = acc * alpha[:, None]
-
-        # update constants
-        L = L * alpha + l_j
-        M = m_j
-
-        # acc : (BLOCK_M, HEAD_SIZE_PADDED)
-        acc = tl.dot(P.to(V.dtype), V, acc=acc)
 
     # epilogue
     # This helps the compiler do Newton Raphson on l_i vs on acc which is much larger.

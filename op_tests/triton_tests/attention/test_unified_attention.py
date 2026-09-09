@@ -8,11 +8,16 @@ import pytest
 import torch
 
 from aiter.ops.triton.attention.unified_attention import (
+    _fasttile_modes,
     _is_gluon_available,
     is_2d_gluon_available,
     unified_attention,
+    unified_attention_get_fasttile,
+    unified_attention_set_fasttile,
+    use_2d_kernel,
 )
 from aiter.ops.triton.utils._triton import arch_info
+from aiter.ops.triton.utils.device_info import get_num_sms
 from aiter.ops.triton.utils.shuffle import shuffle_scale_batched, shuffle_weight
 from aiter.ops.triton.utils.types import e4m3_dtype
 from aiter.test_common import checkAllclose
@@ -720,3 +725,342 @@ def test_triton_unified_attn(
             torch.testing.assert_close(output, ref_output, atol=atol, rtol=rtol),
             f"{torch.max(torch.abs(output - ref_output))}",
         )
+
+
+# ---------------------------------------------------------------------------
+# fasttile: the restructured 2-D prefill tile loop
+#
+# The schedule only touches the 2-D launch, and `use_2d_kernel` is picky: the
+# suite's usual shapes route to the 3-D kernel, where a fasttile test would
+# pass without executing a single restructured tile. Every shape below is
+# therefore checked with `_require_2d_kernel` before it is trusted.
+# ---------------------------------------------------------------------------
+
+# "short" takes the 2-D path deterministically via the max_seqlen_k <= 512
+# rule and still resolves to the BLOCK_M=128 prefill entry, so the bulk loop
+# runs several tiles. "long" is the production geometry: it qualifies on
+# program count on any gfx950 part. "ragged" and "head512" use head_size 512,
+# which always takes the 2-D path.
+#
+# "ragged" is a regression shape: its (567, 275) entry carries more query
+# tokens than cached keys, which makes context_len negative. A `bulk_end` that
+# is not clamped up to `tile_start` then floors below zero and hands the masked
+# loop a negative first tile.
+_RAGGED_SEQ_LENS = [
+    (1, 15),
+    (12, 133),
+    (12, 87),
+    (1, 133),
+    (2, 343),
+    (567, 275),
+    (34, 345),
+    (777, 777),
+    (454, 345),
+    (1, 134),
+]
+
+_FASTTILE_SHAPES = {
+    "short": {
+        "seq_lens": [(512, 512)],
+        "num_blocks": 512,
+        "block_size": 64,
+        "head_size": 64,
+        "num_heads": (64, 8),
+        "device": "cuda",
+    },
+    "long": {
+        "seq_lens": [(4096, 16384)],
+        "num_blocks": 512,
+        "block_size": 64,
+        "head_size": 64,
+        "num_heads": (64, 8),
+        "device": "cuda",
+    },
+    "ragged": {
+        "seq_lens": _RAGGED_SEQ_LENS,
+        "num_blocks": 2048,
+        "block_size": 16,
+        "head_size": 512,
+        "num_heads": (8, 8),
+        "device": "cuda",
+    },
+    "head512": {
+        "seq_lens": [(512, 512)],
+        "num_blocks": 2048,
+        "block_size": 16,
+        "head_size": 512,
+        "num_heads": (8, 8),
+        "device": "cuda",
+    },
+}
+
+# bf16 carries 8 mantissa bits, so one ULP at magnitude m is m * 2**-8. The
+# output dtype is bf16 for every case here, including the fp8 ones, so this is
+# the spacing that governs regardless of how q and the cache are stored.
+_BF16_ULP = 2**-8
+
+# The gate does not discriminate on dtype, so the fp8 prefill path takes the
+# restructured loop too and is covered here rather than excluded from it.
+_FASTTILE_DTYPES = (
+    ("bf16", torch.bfloat16, torch.bfloat16),
+    ("fp8", e4m3_dtype, e4m3_dtype),
+)
+
+
+@pytest.fixture
+def fasttile():
+    """Select a fasttile schedule for one test, restoring it afterwards."""
+    original = unified_attention_get_fasttile()
+    yield unified_attention_set_fasttile
+    unified_attention_set_fasttile(original)
+
+
+def _require_2d_kernel(shape, sliding_window=0):
+    """Skip rather than silently pass if this machine routes the shape to 3-D."""
+    num_heads = shape["num_heads"]
+    max_q = max(x[0] for x in shape["seq_lens"])
+    max_k = max(x[1] for x in shape["seq_lens"])
+    num_tokens = sum(x[0] for x in shape["seq_lens"])
+    # BLOCK_Q is bounded below by 1, so this over-counts programs at most by
+    # the tuned BLOCK_M; it only feeds the "enough programs" branch below.
+    num_2d_prgms = (num_tokens + len(shape["seq_lens"])) * num_heads[1]
+    params = SimpleNamespace(
+        head_size=shape["head_size"],
+        sliding_window=sliding_window,
+        all_decode=False,
+        max_seqlen_q=max_q,
+        max_seqlen_k=max_k,
+        num_2d_prgms=num_2d_prgms,
+        target_num_prgms=get_num_sms() * 4,
+    )
+    if not use_2d_kernel(params):
+        pytest.skip("shape routes to the 3-D kernel on this machine")
+
+
+def _run_unified_attention(data, shuffled_kv_cache=False):
+    (
+        query,
+        _key_cache_orig,
+        _value_cache_orig,
+        key_cache,
+        value_cache,
+        sinks,
+        output,
+        cu_query_lens,
+        kv_lens,
+        max_query_len,
+        max_kv_len,
+        scale,
+        window_size,
+        block_tables,
+        _maybe_quant_query,
+        _query_scales,
+        q_descale,
+        k_descale,
+        v_descale,
+        output_scale,
+    ) = data
+    unified_attention(
+        q=query,
+        k=key_cache,
+        v=value_cache,
+        out=output,
+        cu_seqlens_q=cu_query_lens,
+        seqused_k=kv_lens,
+        max_seqlen_q=max_query_len,
+        max_seqlen_k=max_kv_len,
+        softmax_scale=scale,
+        causal=True,
+        window_size=window_size,
+        block_table=block_tables,
+        softcap=0,
+        q_descale=q_descale,
+        k_descale=k_descale,
+        v_descale=v_descale,
+        sinks=sinks,
+        output_scale=output_scale,
+        shuffled_kv_cache=shuffled_kv_cache,
+        backend="triton",
+    )
+    return output.clone()
+
+
+def _drop_sinks(data):
+    data = list(data)
+    data[5] = None
+    return tuple(data)
+
+
+def _assert_ulp_close(stock, other, label, max_ulps=4.0):
+    """Assert `other` is within a few bf16 ULP of the stock kernel, elementwise.
+
+    The tolerance is deliberately mixed, because neither half works alone:
+
+    * ``rtol`` is the real contract -- each element must stay within `max_ulps`
+      of *its own* magnitude. A tensor-wide budget derived from max|out| would
+      let a small element drift thousands of its own ULPs unnoticed.
+    * ``atol`` is one ULP of the accumulation scale, and it is not slack. An
+      output element is a softmax-weighted sum of V, so its absolute error is
+      bounded by the scale of that sum, not by the element. Elements that come
+      out near zero do so by cancellation between O(max|out|) terms and retain
+      no significant digits, so a relative bound on them is meaningless. Only
+      such elements fall through to this floor; everything at a magnitude worth
+      measuring is governed by rtol.
+
+    Degenerate rows (a query position with no keys in range and no sink) are
+    NaN in the *stock* kernel too. ``equal_nan`` makes the NaN pattern part of
+    the contract: NaN against a number fails from either side.
+    """
+    finite = stock[~torch.isnan(stock)]
+    scale = finite.abs().max().item() if finite.numel() else 0.0
+    torch.testing.assert_close(
+        other,
+        stock,
+        rtol=max_ulps * _BF16_ULP,
+        atol=scale * _BF16_ULP,
+        equal_nan=True,
+        msg=lambda m: f"{label}: {m}",
+    )
+
+
+@pytest.mark.skipif(DEVICE_ARCH != "gfx950", reason="fasttile is gfx950-only")
+@pytest.mark.parametrize("shape_key", sorted(_FASTTILE_SHAPES))
+@pytest.mark.parametrize("dtypes", _FASTTILE_DTYPES, ids=lambda d: d[0])
+@pytest.mark.parametrize("mode", ["nofuse", "on"])
+@pytest.mark.parametrize("use_sinks", [False, True])
+@torch.inference_mode()
+def test_fasttile_matches_stock(fasttile, shape_key, dtypes, mode, use_sinks) -> None:
+    """The restructured tile loop must stay within a bf16 ULP of the stock path.
+
+    Comparing against `ref_paged_attn` at the suite's atol would not catch a
+    real bulk/tail-boundary bug: the bf16 quantisation floor is two orders of
+    magnitude larger than the difference the restructure is allowed to
+    introduce. So this pins the restructure against the *stock kernel*.
+    """
+    shape = _FASTTILE_SHAPES[shape_key]
+    _require_2d_kernel(shape)
+
+    _, q_dtype, kv_dtype = dtypes
+    data = generate_data(q_dtype=q_dtype, kv_dtype=kv_dtype, **shape)
+    if not use_sinks:
+        data = _drop_sinks(data)
+
+    # Both states are set explicitly, so this holds however the environment
+    # variable happened to be set for the run.
+    fasttile("off")
+    stock = _run_unified_attention(data).float()
+
+    fasttile(mode)
+    fast = _run_unified_attention(data).float()
+
+    _assert_ulp_close(stock, fast, f"fasttile({mode}, {dtypes[0]}, {shape_key})")
+
+
+@pytest.mark.skipif(DEVICE_ARCH != "gfx950", reason="fasttile is gfx950-only")
+@pytest.mark.parametrize("shape_key", sorted(_FASTTILE_SHAPES))
+@pytest.mark.parametrize("mode", ["nofuse", "on"])
+@torch.inference_mode()
+def test_fasttile_matches_reference(fasttile, shape_key, mode) -> None:
+    """Both modes must still satisfy the suite's accuracy contract."""
+    shape = _FASTTILE_SHAPES[shape_key]
+    _require_2d_kernel(shape)
+    data = generate_data(**shape)
+    ref_output = ref_paged_attn(
+        query=data[0],
+        key_cache=data[1],
+        value_cache=data[2],
+        query_lens=[x[0] for x in shape["seq_lens"]],
+        kv_lens=[x[1] for x in shape["seq_lens"]],
+        block_tables=data[13],
+        scale=data[11],
+        out_dtype=torch.bfloat16,
+        sinks=data[5],
+        q_descale=data[16],
+        k_descale=data[17],
+        v_descale=data[18],
+        output_scale=data[19],
+    ).float()
+
+    fasttile(mode)
+    out = _run_unified_attention(data).float()
+    torch.testing.assert_close(out, ref_output, atol=1.5e-2, rtol=1e-2)
+
+
+@pytest.mark.parametrize("all_decode", [True, False])
+@pytest.mark.parametrize("sliding_window", [0, 256])
+@pytest.mark.parametrize("mode", ["nofuse", "on"])
+def test_fasttile_gate_declines_uncertified_paths(
+    fasttile, all_decode, sliding_window, mode
+) -> None:
+    """The restructure must stay off for decode and for windowed layers.
+
+    The bulk loop drops the sliding-window bound as well as the causal one, so
+    a gate that let a windowed layer through would be silently wrong rather
+    than merely uncertified. On any architecture but gfx950 the gate declines
+    outright, which is what makes this safe to enable globally.
+    """
+    fasttile(mode)
+    split, fuse = _fasttile_modes(
+        SimpleNamespace(
+            sliding_window=sliding_window,
+            all_decode=all_decode,
+            softmax_scale=0.125,
+        )
+    )
+    expected = DEVICE_ARCH == "gfx950" and not all_decode and sliding_window <= 0
+    assert split is expected
+    assert fuse is (expected and mode == "on")
+
+
+@pytest.mark.parametrize("softmax_scale", [-0.125, 0.0, 0.125])
+def test_fasttile_fold_requires_positive_scale(fasttile, softmax_scale) -> None:
+    """The fold must decline a non-positive scale, keeping the split.
+
+    It takes the maximum of the unscaled logits and scales that, which is the
+    true maximum only because scaling by a positive constant is monotone. Under
+    a negative scale it would pick the minimum and hand exp2 large positive
+    arguments; the stock path takes the maximum of the already-scaled logits
+    and is stable either way.
+    """
+    fasttile("on")
+    split, fuse = _fasttile_modes(
+        SimpleNamespace(sliding_window=0, all_decode=False, softmax_scale=softmax_scale)
+    )
+    on_gfx950 = DEVICE_ARCH == "gfx950"
+    assert split is on_gfx950
+    assert fuse is (on_gfx950 and softmax_scale > 0)
+
+
+def test_fasttile_rejects_unknown_mode(fasttile) -> None:
+    """An unusable value must fail loudly rather than silently mean 'off'."""
+    with pytest.raises(ValueError, match="Invalid fasttile value"):
+        fasttile("fastest")
+
+
+@pytest.mark.skipif(DEVICE_ARCH != "gfx950", reason="fasttile is gfx950-only")
+@pytest.mark.parametrize("dtypes", _FASTTILE_DTYPES, ids=lambda d: d[0])
+@pytest.mark.parametrize("mode", ["nofuse", "on"])
+@torch.inference_mode()
+def test_fasttile_matches_stock_shuffled_kv(fasttile, dtypes, mode) -> None:
+    """The restructure must hold for the pre-shuffled cache layout too.
+
+    Shuffled pages address K and V through a different branch of the tile body
+    -- the block table is indexed once per tile rather than per token, because
+    a shuffled tile is exactly one page -- so the bulk pass exercises code the
+    non-shuffled shapes never reach. The rest of the suite skips shuffled off
+    gfx1250, which left this branch uncovered on the arch the schedule targets.
+    """
+    _, q_dtype, kv_dtype = dtypes
+    shape = dict(_FASTTILE_SHAPES["short"])
+    _require_2d_kernel(shape)
+    data = generate_data(
+        q_dtype=q_dtype, kv_dtype=kv_dtype, shuffled_kv_cache=True, **shape
+    )
+
+    fasttile("off")
+    stock = _run_unified_attention(data, shuffled_kv_cache=True).float()
+
+    fasttile(mode)
+    fast = _run_unified_attention(data, shuffled_kv_cache=True).float()
+
+    _assert_ulp_close(stock, fast, f"fasttile({mode}, {dtypes[0]}, shuffled)")
