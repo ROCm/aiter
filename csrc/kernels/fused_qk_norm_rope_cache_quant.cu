@@ -5039,22 +5039,43 @@ namespace aiter {
                      * sizeof(scalar_t);
       }
       using QTdmWin = opus::tdm<scalar_t, opus::seq<head_size, 1>>;
-      auto q_tdm_issue = [&](int32_t head, int32_t slot) {
-        // Clamp so the ring always issues Q_TDM_DEPTH tiles: the dispatched wait
-        // below is a compile-time constant and would be satisfied early if the tail
-        // issued fewer (the bug that corrupted the FG multi-head version).
-        const int32_t h = head < q_head_end ? head : (q_head_end - 1);
-        auto w = opus::make_tdm<QTdmWin>(
-            static_cast<opus::u32_t>(
-                q_lds_addr + static_cast<__UINTPTR_TYPE__>(slot * head_size) * sizeof(scalar_t)),
-            q + token_q_base + h * params.q_stride_1,
-            static_cast<opus::u32_t>(head_size), 1u,
-            opus::u64_t(head_size), 0u, 0u);
-        w.async_load(0u);
+      // ONE window for the whole head loop, walked with move(), instead of a fresh
+      // make_tdm() per head. make_tdm() runs make_from_layout(): a readfirstlane on
+      // every field, both saturating_subs and the global-offset product. In the ISA
+      // that is ~25 SALU per head -- the single largest block left in the loop.
+      // move(0_I, 1) touches three scalars (origin[1], dim1_clamped, the offset).
+      //
+      // The window is 2-D over [head, head_size] with pitch q_stride_1, so the head
+      // axis is the one move() walks. Two consequences:
+      //
+      //  - extent[1] = the wave's head count, so the hardware clamps the tail: once
+      //    origin[1] passes the last head, dim1_clamped saturates to 0 and the
+      //    refill still ISSUES -- which is all s_wait_tensorcnt<DEPTH-1> counts --
+      //    but fetches nothing. That replaces the old `h = min(head, q_head_end-1)`
+      //    clamp and is strictly safer: the old form re-read the last head, this one
+      //    touches no memory.
+      //  - the row pitch is q_stride_1 rather than head_size. They are equal for a
+      //    packed [T, H, 512] q, which is why the old form worked, but the window
+      //    now walks the stride it is actually given.
+      //
+      // The LDS write point is an async_load() argument, not window state (see the
+      // tdm comments), so all Q_TDM_DEPTH ring slots share this one window.
+      QTdmWin q_tdm_win;
+      if constexpr (Q_TDM_DEPTH > 0) {
+        q_tdm_win = opus::make_tdm<QTdmWin>(
+            static_cast<opus::u32_t>(q_lds_addr),
+            q + token_q_base + q_head_start * params.q_stride_1,
+            static_cast<opus::u32_t>(head_size),
+            static_cast<opus::u32_t>(q_head_end - q_head_start),
+            static_cast<opus::u64_t>(params.q_stride_1), 0u, 0u);
+      }
+      auto q_tdm_issue = [&](int32_t slot) {
+        q_tdm_win.async_load(static_cast<opus::u32_t>(slot * head_size));
+        q_tdm_win.move(opus::number<0>{}, 1);
       };
       if constexpr (Q_TDM_DEPTH > 0) {
         #pragma unroll
-        for (int32_t d = 0; d < Q_TDM_DEPTH; ++d) q_tdm_issue(q_head_start + d, d);
+        for (int32_t d = 0; d < Q_TDM_DEPTH; ++d) q_tdm_issue(d);
       }
 #endif
 
@@ -5112,6 +5133,11 @@ namespace aiter {
                          + static_cast<int64_t>(q_head_start) * params.q_rope_out_stride_1;
       // Lane predicates and the PE store offset depend only on tid, so they belong
       // out here with the offsets rather than being rebuilt once per head.
+      // Rotating ring slot. `(q_head_idx - q_head_start) % Q_TDM_DEPTH` is a signed
+      // modulo: LLVM cannot prove the dividend non-negative, so it emits the
+      // sign-correction dance (s_lshr 31 / s_add / s_and / s_sub) -- 5 SALU per head
+      // for what is a counter.
+      int32_t q_slot = 0;
       const bool is_nope_thr = (tid < nope_vec);  // nope-first
       const int32_t pe_store_off = (tid - pe_tid_start) * vec_size_i;
       const bool pe_is_x_half = ((tid - pe_tid_start) < (pe_dim / vec_size_i / 2));
@@ -5120,7 +5146,7 @@ namespace aiter {
         opus_vec_i vec_q;
 #if defined(__gfx1250__)
         if constexpr (Q_TDM_DEPTH > 0) {
-          const int32_t slot = (q_head_idx - q_head_start) % Q_TDM_DEPTH;
+          const int32_t slot = q_slot;
           // Wait only for THIS head's tile; the other Q_TDM_DEPTH-1 stay in flight
           // across this head's reduce -> rope -> quant -> store chain.
           // s_wait_tensorcnt<N> = "at most N tensor ops still outstanding", so the
@@ -5153,7 +5179,8 @@ namespace aiter {
               + static_cast<__UINTPTR_TYPE__>((slot * head_size) + tid * vec_size_i)
                 * sizeof(scalar_t));
           // Refill this slot with the head Q_TDM_DEPTH ahead.
-          q_tdm_issue(q_head_idx + Q_TDM_DEPTH, slot);
+          q_tdm_issue(slot);
+          q_slot = (slot + 1 == Q_TDM_DEPTH) ? 0 : (slot + 1);
         } else
 #endif
         {
@@ -5217,26 +5244,26 @@ namespace aiter {
         //
         // The amax moved up into the sum_sq loop for the same kind of reason; see
         // the note there.
-        auto apply_rope = [&](auto& v) {
-          if (is_pe_thread) {
-            if constexpr (is_neox) {
-              constexpr int32_t half_pe_threads = pe_dim / vec_size_i / 2;  // 4
-              const bool is_x_half = pe_is_x_half;
-              #pragma unroll
-              for (int i = 0; i < vec_size_i; i++) {
-                float my_val = v[i];
-                float pair_val = __shfl_xor(my_val, half_pe_threads, WARP_SIZE);
-                v[i] = is_x_half ? (my_val * pe_cos[i] - pair_val * pe_sin[i])
+        // src and dst may alias: every pair reads both inputs before writing either,
+        // and the neox form shuffles a local copy.
+        auto apply_rope = [&](const auto& src, auto& dst) {
+          if constexpr (is_neox) {
+            constexpr int32_t half_pe_threads = pe_dim / vec_size_i / 2;  // 4
+            const bool is_x_half = pe_is_x_half;
+            #pragma unroll
+            for (int i = 0; i < vec_size_i; i++) {
+              float my_val = src[i];
+              float pair_val = __shfl_xor(my_val, half_pe_threads, WARP_SIZE);
+              dst[i] = is_x_half ? (my_val * pe_cos[i] - pair_val * pe_sin[i])
                                  : (my_val * pe_cos[i] + pair_val * pe_sin[i]);
-              }
-            } else {
-              #pragma unroll
-              for (int i = 0; i < vec_size_i; i += 2) {
-                float fqx = v[i];
-                float fqy = v[i + 1];
-                v[i]     = fqx * pe_cos[i] - fqy * pe_sin[i];
-                v[i + 1] = fqy * pe_cos[i] + fqx * pe_sin[i];
-              }
+            }
+          } else {
+            #pragma unroll
+            for (int i = 0; i < vec_size_i; i += 2) {
+              float fqx = src[i];
+              float fqy = src[i + 1];
+              dst[i]     = fqx * pe_cos[i] - fqy * pe_sin[i];
+              dst[i + 1] = fqy * pe_cos[i] + fqx * pe_sin[i];
             }
           }
         };
@@ -5286,8 +5313,6 @@ namespace aiter {
             if constexpr (HAS_Q_WEIGHT) v *= static_cast<float>(vec_q_weight[i]);
             work[i] = v;
           }
-          apply_rope(work);
-
           query_t* q_out_head = q_out + q_out_off;
           if (is_nope_thr) {
             {
@@ -5302,15 +5327,21 @@ namespace aiter {
             auto q_out_buf = opus::make_gmem<query_t>(q_out_head, q_oob_o * sizeof(query_t));
             q_out_buf.template store<vec_size_o>(vec_out, tid * vec_size_i);
           }
-          // is_pe_thread IS `tid >= pe_tid_start && tid < pe_tid_end`; spelling it out
-          // again here made LLVM build a second exec mask instead of reusing the one
-          // apply_rope already has (s_and_saveexec_b32 +4).
           if (is_pe_thread) {
-            // PE lanes ran with inv_scale = 1.0f, so work is exactly x*rstd rotated.
+            // Rope straight into the bf16 store rather than back into `work`. The
+            // rotated values used to be written back so that one vector fed both
+            // stores, but `work` has to stay live across the branch for the nope
+            // lanes, so the rope temporaries could not take its registers -- the
+            // write-back cost 9 pure register moves per head in the ISA
+            // (v_dual_mov_b32 x4 + v_mov_b32). Nope lanes never read a rotated value
+            // and PE lanes never reach the fp8 store, so the two results do not need
+            // to share a home. PE lanes ran with inv_scale = 1.0f, so work is x*rstd.
+            opus::vector_t<float, vec_size_i> roped;
+            apply_rope(work, roped);
             scalar_t* q_rope_head = q_rope_out + q_rope_off;
             opus_vec_i vrope;
             #pragma unroll
-            for (int i = 0; i < vec_size_i; i++) vrope[i] = static_cast<scalar_t>(work[i]);
+            for (int i = 0; i < vec_size_i; i++) vrope[i] = static_cast<scalar_t>(roped[i]);
             *reinterpret_cast<opus_vec_i*>(&q_rope_head[pe_store_off]) = vrope;
           }
           (void)q_scale_raw;  // legacy separate-scale param unused on the inline path
@@ -5323,7 +5354,7 @@ namespace aiter {
             if constexpr (HAS_Q_WEIGHT) v *= static_cast<float>(vec_q_weight[i]);
             work[i] = v;
           }
-          apply_rope(work);
+          if (is_pe_thread) apply_rope(work, work);
           opus_vec_i vec_out;
           #pragma unroll
           for (int i = 0; i < vec_size_i; i++) vec_out[i] = static_cast<scalar_t>(work[i]);
