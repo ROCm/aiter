@@ -1422,7 +1422,7 @@ std::string getHipblasltKernelName(int solution_index)
     return hipblaslt_ext::getKernelNameFromAlgo(hipblaslt_handle, heuristicResult[0].algo);
 }
 
-PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
+PYBIND11_MODULE(AITER_EXTENSION_NAME, m)
 {
     AITER_SET_STREAM_PYBIND;
     m.def("hipb_create_extension", &hipb_create_extension, "create_extension");

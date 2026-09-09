@@ -7,6 +7,9 @@ import torch
 import triton
 
 from aiter.ops.shuffle import shuffle_scale, shuffle_weight
+from aiter.ops.triton._triton_kernels.gemm.basic.gemm_afp4wfp4 import (
+    _get_config as _get_afp4wfp4_config,
+)
 from aiter.ops.triton.gemm.basic.gemm_afp4wfp4 import (
     gemm_afp4wfp4 as triton_gemm_afp4wfp4,
 )
@@ -268,6 +271,50 @@ def test_gemm_afp4_wfp4(
 
     if triton_out.dim() == 3:
         triton_out = triton_out.sum(dim=0).to(dtype)
+
+    triton.testing.assert_close(torch_out, triton_out)
+
+
+@pytest.mark.parametrize("M, N, K", [(1, 10240, 8192), (64, 8192, 28672)])
+def test_gemm_afp4_wfp4_preshuffle_splitk(M: int, N: int, K: int):
+    dtype = torch.bfloat16
+    (
+        x,
+        w,
+        w_triton,
+        x_scales,
+        w_scales,
+        x_scales_triton,
+        w_scales_triton,
+        _out_dtype,
+        y,
+    ) = generate_gemm_afp4wfp4_inputs(
+        M,
+        N,
+        K,
+        dtype,
+        layout="TN",
+        output=True,
+        shuffle_scales_fg=True,
+        shuffle_weight_fg=True,
+    )
+
+    # _get_config doubles K itself, so pass packed bytes as the wrapper does.
+    config, _ = _get_afp4wfp4_config(M, N, K // 2, True, backend="triton")
+    config = dict(config)
+    config["NUM_KSPLIT"] = 4
+
+    triton_out = gemm_afp4wfp4_preshuffle(
+        x,
+        w_triton,
+        x_scales_triton,
+        w_scales_triton,
+        dtype,
+        y,
+        config=config,
+    )
+
+    torch_out = run_torch(x, w, x_scales, w_scales, dtype).to(dtype)
 
     triton.testing.assert_close(torch_out, triton_out)
 

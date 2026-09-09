@@ -524,8 +524,28 @@ def create_vk_gdr_decode_kernel(
                         state_num,
                     )
 
+        def _zero_padding_output():
+            zero = fx.Float32(0.0).to(data_num)
+            for sq_i in range_constexpr(seq_length):
+                for vi in range_constexpr(WARP_TILE_V_ITERS):
+                    global_v_i = global_v_start + vi * WARP_GROUP_TILE_V
+
+                    def _write_zero(_sq=sq_i, _gv=global_v_i):
+                        _store_vec(
+                            cp_data,
+                            fx.slice(out_view, (b_i, _sq, hv_i, _gv, None)),
+                            zero,
+                            1,
+                            data_num,
+                        )
+
+                    if warp_k_vec_start == 0:
+                        _write_zero()
+
         if (read_pool_idx >= 0) & (write_pool_idx >= 0):
             _do_decode()
+        else:
+            _zero_padding_output()
 
     @flyc.jit
     def launch_gdr_decode_kernel(
