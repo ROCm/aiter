@@ -651,14 +651,6 @@ OPUS_D decltype(auto) scaled_cast(const S& s, float inverted_scale)
     return scaled_cast<D>(fp32_vec, inverted_scale);
 }
 
-// Optional state for a vector prefetch whose address must survive until a later
-// wait_vector_loads(). Use a separate token for each outstanding load call.
-// The byte offset is the actual VMEM operand, not the source element index.
-struct vector_load_token
-{
-    int byte_offset;
-};
-
 // Load a large vector (vec_size elements of type T) from gmem buffer in chunks.
 // Each chunk issues one buffer_load instruction of chunk_bytes bytes (4/8/16 ->
 // dword/dwordx2/dwordx4). Total loads = vec_size * sizeof(T) / chunk_bytes.
@@ -711,21 +703,6 @@ __device__ opus::vector_t<T, vec_size> load_vector_nbytes(opus::gmem<T>& buffer,
     });
 
     return result;
-}
-
-// Capture the same byte address used by load() without changing ordinary callers.
-template <typename T,
-          int vec_size,
-          int chunk_bytes,
-          int aux = 0,
-          bool interleave = false,
-          int interleave_thread_size = WARP_SIZE>
-__device__ opus::vector_t<T, vec_size> load_vector_nbytes(
-    opus::gmem<T>& buffer, int row_offset, vector_load_token& token)
-{
-    token.byte_offset = static_cast<unsigned>(row_offset) * sizeof(T);
-    return load_vector_nbytes<T, vec_size, chunk_bytes, aux, interleave, interleave_thread_size>(
-        buffer, row_offset);
 }
 
 // Store a vector (vec_size elements of DTYPE_I) to gmem buffer in chunks, with optional type
@@ -876,124 +853,6 @@ __device__ void store_vector(opus::gmem<T>& buffer,
     }
 }
 
-namespace detail {
-#if defined(__gfx1250__)
-    // MI400 guide 6.9.7.2: barrier signal/wait drains XCNT before completing.
-    // Every replay input stays in its assigned register throughout this packet.
-    // Call only where the algorithm already needs a workgroup barrier.
-    template<bool wait_tensor, int policy, typename V, int count>
-    __device__ __forceinline__ void store_vectors_barrier(
-        const __amdgpu_buffer_rsrc_t& resource, V (&data)[count], int (&bytes)[count])
-    {
-        static_assert(policy == 0 || policy == 3, "unsupported store cache policy");
-        static_assert(sizeof(V) == 16 && (count == 2 || count == 4));
-        if constexpr (count == 4) {
-            asm volatile(
-                ".if %c9\n"
-                "buffer_store_b128 %0, %4, %8, null offen th:TH_STORE_WB\n"
-                "buffer_store_b128 %1, %5, %8, null offen th:TH_STORE_WB\n"
-                "buffer_store_b128 %2, %6, %8, null offen th:TH_STORE_WB\n"
-                "buffer_store_b128 %3, %7, %8, null offen th:TH_STORE_WB\n"
-                ".else\n"
-                "buffer_store_b128 %0, %4, %8, null offen\n"
-                "buffer_store_b128 %1, %5, %8, null offen\n"
-                "buffer_store_b128 %2, %6, %8, null offen\n"
-                "buffer_store_b128 %3, %7, %8, null offen\n"
-                ".endif\n"
-                ".if %c10\ns_wait_tensorcnt 0\n.endif\n"
-                "s_barrier_signal -1\ns_barrier_wait 0xffff\n"
-                :: "v"(data[0]), "v"(data[1]), "v"(data[2]), "v"(data[3]),
-                   "v"(bytes[0]), "v"(bytes[1]), "v"(bytes[2]), "v"(bytes[3]),
-                   "s"(resource), "n"(policy), "n"(wait_tensor) : "memory");
-        } else {
-            asm volatile(
-                ".if %c5\n"
-                "buffer_store_b128 %0, %2, %4, null offen th:TH_STORE_WB\n"
-                "buffer_store_b128 %1, %3, %4, null offen th:TH_STORE_WB\n"
-                ".else\n"
-                "buffer_store_b128 %0, %2, %4, null offen\n"
-                "buffer_store_b128 %1, %3, %4, null offen\n"
-                ".endif\n"
-                ".if %c6\ns_wait_tensorcnt 0\n.endif\n"
-                "s_barrier_signal -1\ns_barrier_wait 0xffff\n"
-                :: "v"(data[0]), "v"(data[1]), "v"(bytes[0]), "v"(bytes[1]),
-                   "s"(resource), "n"(policy), "n"(wait_tensor) : "memory");
-        }
-    }
-#endif
-} // namespace detail
-
-// Deferred 16-byte stores for an algorithm that already needs a workgroup
-// barrier. set() uses element offsets; finish<true>() combines the stores with
-// that existing barrier on gfx1250 so replay inputs cannot be recycled early.
-// All workgroup threads must reach finish<true>(); it does not wait for the
-// stores to become globally visible. finish<false>() issues the tail stores.
-// Assign every slot before finish(). The gfx1250 barrier packet supports 2 or 4
-// vectors and cache policies 0/3; set_if() requires a bounded buffer resource.
-// Other architectures issue stores in set() and retain the explicit barrier.
-template <typename T, int vec_size, int count, int aux = 0>
-struct vector_store_batch
-{
-    static_assert(count > 0);
-    static_assert(opus::is_any_of_v<T, float, opus::fp16_t, opus::bf16_t>,
-                  "vector_store_batch supports fp32, fp16, and bf16 storage");
-    using vector_type = opus::vector_t<T, vec_size>;
-    opus::gmem<T>& buffer;
-#if defined(__gfx1250__)
-    vector_type data[count];
-    int bytes[count];
-#endif
-
-    template <typename V>
-    OPUS_D void set(int index, const V& value, int row_offset)
-    {
-        static_assert(opus::vector_traits<V>::size() == vec_size);
-#if defined(__gfx1250__)
-        for(int e = 0; e < vec_size; ++e) data[index][e] = static_cast<T>(value[e]);
-        bytes[index] = static_cast<unsigned>(row_offset) * sizeof(T);
-#else
-        using S = typename opus::vector_traits<V>::dtype;
-        store_vector<T, S, vec_size, aux>(buffer, value, row_offset);
-#endif
-    }
-
-    template <typename V>
-    OPUS_D void set_if(int index, const V& value,
-                      int row_offset, bool valid)
-    {
-#if defined(__gfx1250__)
-        // Keep the masked offset in the bounds-checked VGPR, including the
-        // uniform address terms; a negative offset discards an invalid lane.
-        asm volatile("" : "+v"(row_offset));
-        set(index, value, valid ? row_offset : -1);
-#else
-        if(valid) set(index, value, row_offset);
-#endif
-    }
-
-    template <bool barrier = true, bool wait_tensor = false>
-    OPUS_D void finish()
-    {
-        static_assert(barrier || !wait_tensor, "tensor wait requires the barrier packet");
-#if defined(__gfx1250__)
-        if constexpr(barrier)
-            detail::store_vectors_barrier<wait_tensor, aux>(buffer.cached_rsrc, data, bytes);
-        else
-        {
-            #pragma unroll
-            for(int i = 0; i < count; ++i)
-                buffer.template _store<vec_size>(data[i], bytes[i], 0, opus::number<aux>{});
-            #pragma unroll
-            for(int i = 0; i < count; ++i)
-                asm volatile("" :: "v"(data[i]), "v"(bytes[i]),
-                             "s"(buffer.cached_rsrc) : "memory");
-        }
-#else
-        if constexpr(barrier) __builtin_amdgcn_s_barrier();
-#endif
-    }
-};
-
 // Wait until both the regular load queue and the async-load queue have at most
 // the given number of outstanding entries. A negative count means "don't wait"
 // on that queue: on split-counter archs the corresponding instruction is not
@@ -1011,24 +870,6 @@ OPUS_D void s_wait_all_loadcnt(number<load_cnt> = {}, number<async_load_cnt> = {
 #else
     constexpr index_t vmcnt = (load_cnt < 0 ? 0 : load_cnt) + (async_load_cnt < 0 ? 0 : async_load_cnt);
     s_waitcnt_vmcnt(number<vmcnt>{});
-#endif
-}
-
-// Complete regular vector prefetches and retain their replay inputs until the
-// native load wait. pending=false is useful on the final pipeline iteration.
-template <typename T, int count>
-OPUS_D void wait_vector_loads(opus::gmem<T>& buffer,
-                             const vector_load_token (&tokens)[count], bool pending = true)
-{
-    s_wait_all_loadcnt(number<0>{}, number<-1>{});
-#if defined(__gfx1250__)
-    if(pending)
-    {
-        #pragma unroll
-        for(int i = 0; i < count; ++i)
-            asm volatile("" :: "v"(tokens[i].byte_offset));
-    }
-    asm volatile("" :: "s"(buffer.cached_rsrc));
 #endif
 }
 
