@@ -156,18 +156,35 @@ def l2norm_bwd_kernel(
     BT: tl.constexpr,
 ):
     i_t = tl.program_id(0)
-    p_y = tl.make_block_ptr(y, (T, D), (D, 1), (i_t * BT, 0), (BT, BD), (1, 0))
-    p_rstd = tl.make_block_ptr(rstd, (T,), (1,), (i_t * BT,), (BT,), (0,))
-    p_dy = tl.make_block_ptr(dy, (T, D), (D, 1), (i_t * BT, 0), (BT, BD), (1, 0))
-    p_dx = tl.make_block_ptr(dx, (T, D), (D, 1), (i_t * BT, 0), (BT, BD), (1, 0))
 
-    b_y = tl.load(p_y, boundary_check=(0, 1)).to(tl.float32)
-    b_rstd = tl.load(p_rstd, boundary_check=(0,)).to(tl.float32)
-    b_dy = tl.load(p_dy, boundary_check=(0, 1)).to(tl.float32)
+    _p_y_0 = (i_t * BT) + tl.arange(0, BT)
+    _p_y_1 = (0) + tl.arange(0, BD)
+    b_y = tl.load(
+        y + _p_y_0[:, None] * (D) + _p_y_1[None, :] * (1),
+        mask=(_p_y_0[:, None] < (T)) & (_p_y_1[None, :] < (D)),
+        other=0.0,
+    ).to(tl.float32)
+    _p_rstd_0 = (i_t * BT) + tl.arange(0, BT)
+    b_rstd = tl.load(rstd + _p_rstd_0 * (1), mask=(_p_rstd_0 < (T)), other=0.0).to(
+        tl.float32
+    )
+    _p_dy_0 = (i_t * BT) + tl.arange(0, BT)
+    _p_dy_1 = (0) + tl.arange(0, BD)
+    b_dy = tl.load(
+        dy + _p_dy_0[:, None] * (D) + _p_dy_1[None, :] * (1),
+        mask=(_p_dy_0[:, None] < (T)) & (_p_dy_1[None, :] < (D)),
+        other=0.0,
+    ).to(tl.float32)
     b_dx = (
         b_dy * b_rstd[:, None] - tl.sum(b_dy * b_y, 1)[:, None] * b_y * b_rstd[:, None]
     )
-    tl.store(p_dx, b_dx.to(p_dx.dtype.element_ty), boundary_check=(0, 1))
+    _p_dx_0 = (i_t * BT) + tl.arange(0, BT)
+    _p_dx_1 = (0) + tl.arange(0, BD)
+    tl.store(
+        dx + _p_dx_0[:, None] * (D) + _p_dx_1[None, :] * (1),
+        b_dx.to(dx.dtype.element_ty),
+        mask=(_p_dx_0[:, None] < (T)) & (_p_dx_1[None, :] < (D)),
+    )
 
 
 def l2norm_fwd(

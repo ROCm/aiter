@@ -5,8 +5,23 @@
 import triton
 import triton.language as tl
 
+from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
 from aiter.ops.triton.utils._triton.pid_preprocessing import pid_grid, remap_xcd
 from aiter.ops.triton.utils.gemm_config_utils import get_gemm_config
+
+_fused_gemm_a8w8_blockscale_split_cat_repr = make_kernel_repr(
+    "_fused_gemm_a8w8_blockscale_split_cat",
+    [
+        "BLOCK_SIZE_M",
+        "BLOCK_SIZE_N",
+        "BLOCK_SIZE_K",
+        "GROUP_SIZE_M",
+        "NUM_KSPLIT",
+        "SPLITK_BLOCK_SIZE",
+        "EVEN_K",
+        "cache_modifier",
+    ],
+)
 
 
 @triton.heuristics(
@@ -16,7 +31,7 @@ from aiter.ops.triton.utils.gemm_config_utils import get_gemm_config
         * triton.cdiv(args["N"], args["BLOCK_SIZE_N"]),
     }
 )
-@triton.jit
+@triton.jit(repr=_fused_gemm_a8w8_blockscale_split_cat_repr)
 def _fused_gemm_a8w8_blockscale_split_cat(
     # Pointers to matrices
     a_ptr,
@@ -244,6 +259,21 @@ def _fused_gemm_a8w8_blockscale_split_cat(
             tl.store(c1_ptrs, c, mask=c1_mask)
 
 
+_fused_gemm_a8w8_blockscale_preshuffle_split_cat_repr = make_kernel_repr(
+    "_fused_gemm_a8w8_blockscale_preshuffle_split_cat",
+    [
+        "BLOCK_SIZE_M",
+        "BLOCK_SIZE_N",
+        "BLOCK_SIZE_K",
+        "GROUP_SIZE_M",
+        "NUM_KSPLIT",
+        "SPLITK_BLOCK_SIZE",
+        "EVEN_K",
+        "cache_modifier",
+    ],
+)
+
+
 @triton.heuristics(
     {
         "EVEN_K": lambda args: args["K"] % args["BLOCK_SIZE_K"] == 0,
@@ -251,7 +281,7 @@ def _fused_gemm_a8w8_blockscale_split_cat(
         * triton.cdiv(args["N"], args["BLOCK_SIZE_N"]),
     }
 )
-@triton.jit
+@triton.jit(repr=_fused_gemm_a8w8_blockscale_preshuffle_split_cat_repr)
 def _fused_gemm_a8w8_blockscale_preshuffle_split_cat(
     # Pointers to matrices
     a_ptr,
@@ -497,7 +527,19 @@ def _fused_gemm_a8w8_blockscale_preshuffle_split_cat(
             tl.store(c1_ptrs, c, mask=c1_mask)
 
 
-@triton.jit
+_fused_gemm_a8w8_blockscale_split_cat_reduce_repr = make_kernel_repr(
+    "_fused_gemm_a8w8_blockscale_split_cat_reduce",
+    [
+        "BLOCK_SIZE_M",
+        "BLOCK_SIZE_N",
+        "BLOCK_SIZE_S3",
+        "ACTUAL_KSPLIT",
+        "MAX_KSPLIT",
+    ],
+)
+
+
+@triton.jit(repr=_fused_gemm_a8w8_blockscale_split_cat_reduce_repr)
 def _fused_gemm_a8w8_blockscale_split_cat_reduce(
     c_ptr,
     c1_ptr,

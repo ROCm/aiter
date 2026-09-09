@@ -1,8 +1,22 @@
 import triton
 import triton.language as tl
 
+from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
 
-@triton.jit
+_fused_mul_add_kernel_repr = make_kernel_repr(
+    "_fused_mul_add_kernel",
+    [
+        "BLOCK_SIZE_N",
+        "NEED_MASK",
+        "IS_A_SCALAR",
+        "IS_B_SCALAR",
+        "IS_A_TENSOR",
+        "IS_B_TENSOR",
+    ],
+)
+
+
+@triton.jit(repr=_fused_mul_add_kernel_repr)
 def _fused_mul_add_kernel(
     x_ptr,
     a_ptr,
