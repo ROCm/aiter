@@ -107,34 +107,6 @@ def _load_fanout_pair(
 
 
 @flyc.jit
-def _wave_inclusive_scan_i32(value, lane):
-    value_raw = value.ir_value()
-    zero_raw = fx.Int32(0).ir_value()
-    for shift, dpp in ((1, 0x111), (2, 0x112), (4, 0x114), (8, 0x118)):
-        remote = fx.rocdl.update_dpp(T.i32, zero_raw, value_raw, dpp, 0xF, 0xF, True)
-        value = (lane >= fx.Int32(shift)).select(value + fx.Int32(remote), value)
-        value_raw = value.ir_value()
-    source16 = (lane & fx.Int32(0x30)) - fx.Int32(1)
-    remote16 = fx.rocdl.ds_bpermute(T.i32, source16 * fx.Int32(4), value)
-    value = (lane >= fx.Int32(16)).select(value + fx.Int32(remote16), value)
-    source32 = (lane & fx.Int32(0x30)) - fx.Int32(17)
-    remote32 = fx.rocdl.ds_bpermute(T.i32, source32 * fx.Int32(4), value)
-    return (lane >= fx.Int32(32)).select(value + fx.Int32(remote32), value)
-
-
-@flyc.jit
-def _wave_reduce_max_i32(value, lane):
-    for distance in (1, 2, 4, 8, 16, 32):
-        peer = fx.Int32(
-            fx.rocdl.ds_bpermute(
-                T.i32, (lane ^ fx.Int32(distance)) * fx.Int32(4), value
-            )
-        )
-        value = (peer > value).select(peer, value)
-    return value
-
-
-@flyc.jit
 def _increment_i32(buffer, index):
     buffer[index] = buffer[index] + fx.Int32(1)
 
@@ -266,7 +238,9 @@ def _configure_payload_geometry(
             max_source_count = (source_count > max_source_count).select(
                 source_count, max_source_count
             )
-        max_source_count = _wave_reduce_max_i32(max_source_count, lane)
+        max_source_count = fx.coop.warp_reduce(
+            max_source_count, fx.ReductionOp.MAX, width=64
+        )
         group_count = fx.Int32(0)
         if lane == fx.Int32(0):
             group_count = local_hist[fx.Int32(fz_total_experts + destination)]
@@ -617,15 +591,19 @@ def emit_direct_fixed_slot_finalize(
         count = running[safe_expert]
         count = valid_expert.select(count, fx.Int32(0))
         overflow_flag = (count > fx.Int32(fz_cap)).select(fx.Int32(1), fx.Int32(0))
-        overflow_prefix = _wave_inclusive_scan_i32(overflow_flag, lane)
-        overflow_count = fx.Int32(fx.rocdl.readlane(T.i32, overflow_prefix, fz_epr - 1))
+        _, _, overflow_count = fx.coop.warp_scan_with_aggregate(
+            overflow_flag, fx.ReductionOp.ADD, width=64
+        )
         no_overflow = overflow_count == fx.Int32(0)
         safe_count = (count <= fx.Int32(fz_cap)).select(count, fx.Int32(0))
         num_expert_tiles = (safe_count + fx.Int32(fz_tile_m - 1)) // fx.Int32(fz_tile_m)
-        max_expert_tiles = _wave_reduce_max_i32(num_expert_tiles, lane)
-        inclusive_tiles = _wave_inclusive_scan_i32(num_expert_tiles, lane)
+        max_expert_tiles = fx.coop.warp_reduce(
+            num_expert_tiles, fx.ReductionOp.MAX, width=64
+        )
+        inclusive_tiles, _, total_tiles = fx.coop.warp_scan_with_aggregate(
+            num_expert_tiles, fx.ReductionOp.ADD, width=64
+        )
         metadata_base = inclusive_tiles - num_expert_tiles
-        total_tiles = fx.Int32(fx.rocdl.readlane(T.i32, inclusive_tiles, fz_epr - 1))
 
         if valid_expert:
             if no_overflow:
@@ -791,16 +769,15 @@ def _derive_allgather_offsets(
                 // destination_tile_m
             ) * destination_tile_m
             padded_rows = group_rows + normal_rows
-            inclusive_rows = _wave_inclusive_scan_i32(padded_rows, lane)
+            inclusive_rows, _, chunk_rows = fx.coop.warp_scan_with_aggregate(
+                padded_rows, fx.ReductionOp.ADD, width=64
+            )
             local_row_base = row_carry + inclusive_rows - padded_rows
             if valid_expert:
                 task_base[ge] = local_row_base + group_rows + normal_source_prefix
                 if group_member:
                     group_base[ge] = local_row_base + group_source_prefix
-            last_lane = min(63, epr - expert_chunk * 64 - 1)
-            row_carry = row_carry + fx.Int32(
-                fx.rocdl.readlane(T.i32, inclusive_rows, last_lane)
-            )
+            row_carry = row_carry + chunk_rows
 
 
 @flyc.jit
@@ -877,12 +854,16 @@ def _derive_next_fanout_pairs(
                 total_count * score_stride + fx.Int32(epr) - safe_expert,
                 fx.Int32(-1),
             )
-            best_score = _wave_reduce_max_i32(score, lane)
+            best_score = fx.coop.warp_reduce(
+                score, fx.ReductionOp.MAX, width=64
+            )
             best_expert = fx.Int32(epr) - (best_score % score_stride)
             second_score = (safe_expert != best_expert).select(
                 score, fx.Int32(-1)
             )
-            second_score = _wave_reduce_max_i32(second_score, lane)
+            second_score = fx.coop.warp_reduce(
+                second_score, fx.ReductionOp.MAX, width=64
+            )
         else:
             group_count_lane = fx.Int32(0)
             if lane == fx.Int32(0):
@@ -934,12 +915,16 @@ def _derive_next_fanout_pairs(
                 )
                 lane_best_score = new_best.select(score, lane_best_score)
 
-            best_score = _wave_reduce_max_i32(lane_best_score, lane)
+            best_score = fx.coop.warp_reduce(
+                lane_best_score, fx.ReductionOp.MAX, width=64
+            )
             best_expert = fx.Int32(epr) - (best_score % score_stride)
             lane_second_candidate = (lane_best_score == best_score).select(
                 lane_second_score, lane_best_score
             )
-            second_score = _wave_reduce_max_i32(lane_second_candidate, lane)
+            second_score = fx.coop.warp_reduce(
+                lane_second_candidate, fx.ReductionOp.MAX, width=64
+            )
         second_expert = fx.Int32(epr) - (second_score % score_stride)
         second_count = second_score // score_stride
         pair_a = (best_expert < second_expert).select(best_expert, second_expert)
@@ -1172,14 +1157,18 @@ def emit_dispatch_plan(
                 normal_count + fx.Int32(fz_tile_m - 1)
             ) // fx.Int32(fz_tile_m)
             num_tiles = group_num_tiles + normal_num_tiles
-            chunk_max = _wave_reduce_max_i32(num_tiles, lane)
+            chunk_max = fx.coop.warp_reduce(
+                num_tiles, fx.ReductionOp.MAX, width=64
+            )
             max_expert_tiles = (chunk_max > max_expert_tiles).select(
                 chunk_max, max_expert_tiles
             )
             group_padded_rows = group_num_tiles * fx.Int32(fz_tile_m)
             normal_padded_rows = normal_num_tiles * fx.Int32(fz_tile_m)
             padded_rows = group_padded_rows + normal_padded_rows
-            inclusive_rows = _wave_inclusive_scan_i32(padded_rows, lane)
+            inclusive_rows, _, chunk_rows = fx.coop.warp_scan_with_aggregate(
+                padded_rows, fx.ReductionOp.ADD, width=64
+            )
             local_row_base = row_carry + inclusive_rows - padded_rows
             group_row_base = local_row_base
             normal_row_base = local_row_base + group_padded_rows
@@ -1202,10 +1191,16 @@ def emit_dispatch_plan(
                     pair_b < fx.Int32(min(fz_epr, (expert_chunk + 1) * 64))
                 )
                 pair_a_group_base = pair_a_in_chunk.select(
-                    _wave_reduce_max_i32(pair_a_base_lane, lane), pair_a_group_base
+                    fx.coop.warp_reduce(
+                        pair_a_base_lane, fx.ReductionOp.MAX, width=64
+                    ),
+                    pair_a_group_base,
                 )
                 pair_b_group_base = pair_b_in_chunk.select(
-                    _wave_reduce_max_i32(pair_b_base_lane, lane), pair_b_group_base
+                    fx.coop.warp_reduce(
+                        pair_b_base_lane, fx.ReductionOp.MAX, width=64
+                    ),
+                    pair_b_group_base,
                 )
 
             if valid_expert:
@@ -1268,8 +1263,7 @@ def emit_dispatch_plan(
                     invalid_source=fz_npes * fz_mtpr,
                 )
 
-            last_lane = min(63, fz_epr - expert_chunk * 64 - 1)
-            row_carry = row_carry + fx.Int32(fx.rocdl.readlane(T.i32, inclusive_rows, last_lane))
+            row_carry = row_carry + chunk_rows
 
         if const_expr(fz_epr > 64):
             group_count_lane = fx.Int32(0)
@@ -1344,7 +1338,9 @@ def emit_dispatch_plan(
             source_count = valid_ge.select(source_count, fx.Int32(0))
             lane_counts.append(source_count)
             lane_total = lane_total + source_count
-        lane_prefix = _wave_inclusive_scan_i32(lane_total, lane) - lane_total
+        lane_prefix = fx.coop.warp_exclusive_scan(
+            lane_total, fx.ReductionOp.ADD, width=64
+        )
         source_prefix = lane_prefix
         for item in range_constexpr(pairs_per_lane):
             ge = lane_base + fx.Int32(item)
