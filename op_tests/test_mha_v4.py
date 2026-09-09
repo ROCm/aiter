@@ -36,6 +36,7 @@ from aiter.ops.mha_v4_quant import (
     MHA_V4_KV_TILE_ROWS,
     MHA_V4_LOG2E,
     MHA_V4_MXFP4_K_SCALE_SLACK_BYTES,
+    MHA_V4_MXFP6_V_BUFFER_SLACK_BYTES,
     MHA_V4_QUERY_TILE_ROWS,
     mha_v4_q_multiplier,
     mxfp4_k_view,
@@ -403,6 +404,15 @@ def test_mha_v4_mxfp6_fp6_p_layout_matches_permuted_canonical(sequence, dtype):
     assert torch.equal(scale.reshape(-1), expected_scale.reshape(-1))
     assert not torch.equal(packed, canonical)
     assert not torch.equal(scale, canonical_scale)
+
+    # The producer zeroes trailing slack for the ASM's speculative reads, and comparing only
+    # data_size bytes would let a regression there pass unnoticed.
+    slack = MHA_V4_MXFP6_V_BUFFER_SLACK_BYTES
+    assert packed.untyped_storage().nbytes() == data_size + slack
+    assert torch.equal(
+        packed.as_strided((slack,), (1,), data_size),
+        torch.zeros(slack, device=packed.device, dtype=torch.uint8),
+    )
 
 
 @pytest.mark.skipif(get_gfx() != "gfx950", reason="gfx950 F8F6 kernel")
