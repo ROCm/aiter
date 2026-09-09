@@ -2,6 +2,7 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 import os
+import threading
 from abc import ABC, abstractmethod
 from itertools import product
 
@@ -14,6 +15,7 @@ from flydsl._mlir.dialects import fly, llvm
 from flydsl.compiler.protocol import extract_to_ir_values
 from flydsl.expr import ptrtoint, range_constexpr
 from flydsl.expr.typing import T
+from flydsl.expr.typing import Vector as Vec
 
 from aiter.ops.flydsl.kernels import buffer_ops, vector
 
@@ -34,6 +36,8 @@ AITER_FLYDSL_KERNARG_PRELOAD_COUNT = int(
 AITER_FLYDSL_MOE_EXPERT_SCHEDULING_MODE = bool(
     int(os.environ.get("AITER_FLYDSL_MOE_EXPERT_SCHEDULING_MODE", "0"))
 )
+
+_PRELOAD_COMPILE_LOCK = threading.RLock()
 
 
 def ptr_rsrc(ptr):
@@ -85,13 +89,48 @@ def ptr_buf_tensor(
         address_space=fx.AddressSpace.Global,
         alignment=unit_elems * (elem.width // 8),
     )
-    view = fx.make_view(fx.inttoptr(pt, fx.Int64(ptrtoint(ptr))), layout)
+    address = fx.Int64(ptrtoint(ptr)) if isinstance(ptr, fx.Pointer) else fx.Int64(ptr)
+    view = fx.make_view(fx.inttoptr(pt, address), layout)
     return fx.rocdl.make_buffer_tensor(view, num_records_bytes=num_records_bytes)
 
 
-def buf_copy_atom(unit_bytes, elem=fx.Int32):
+def buf_copy_atom(unit_bytes, elem=fx.Int32, cache_modifier=0):
     """Copy atom for a ``unit_bytes``-wide buffer access."""
-    return fx.make_copy_atom(_BUF_COPY_ATOM[unit_bytes](), elem)
+    return fx.make_copy_atom(_BUF_COPY_ATOM[unit_bytes](cache_modifier), elem)
+
+
+def _buf_copy_slice(buffer, index, unit_elems):
+    if unit_elems == 1:
+        grouped = fx.logical_divide(buffer, fx.make_layout(1, 1))
+        return fx.slice(grouped, (None, index))
+    return fx.slice(buffer, (index, None))
+
+
+def buf_copy_load(buffer, index, elem=fx.Int32, unit_elems=1, cache_modifier=0):
+    """Load one vector unit, preserving an explicit buffer cache policy."""
+    fragment = fx.make_rmem_tensor(unit_elems, elem)
+    fx.copy(
+        buf_copy_atom(
+            unit_elems * (elem.width // 8), elem, cache_modifier=cache_modifier
+        ),
+        _buf_copy_slice(buffer, index, unit_elems),
+        fragment,
+    )
+    value = Vec(fragment.load())
+    return value[0] if unit_elems == 1 else value
+
+
+def buf_copy_store(buffer, index, value, elem=fx.Int32, unit_elems=1, cache_modifier=0):
+    """Store one vector unit, preserving an explicit buffer cache policy."""
+    fragment = fx.make_rmem_tensor(unit_elems, elem)
+    fragment.store(Vec.from_elements([value], elem) if unit_elems == 1 else Vec(value))
+    fx.copy(
+        buf_copy_atom(
+            unit_elems * (elem.width // 8), elem, cache_modifier=cache_modifier
+        ),
+        fragment,
+        _buf_copy_slice(buffer, index, unit_elems),
+    )
 
 
 def ptr_arg(t: torch.Tensor, dtype=None):
@@ -124,6 +163,31 @@ def _run_compiled(exe, *args):
         except Exception:  # noqa: BLE001, S110
             pass
         raise
+
+
+def _preload_compiled(exe, *args):
+    """Materialize a JIT artifact without dispatching its GPU kernels.
+
+    Newer FlyDSL versions expose ``JitFunction.preload()`` for this operation.
+    Older supported versions provide the same no-dispatch behavior through the
+    public ``COMPILE_ONLY`` mode.  Calling ``flyc.compile()`` without either
+    guard executes the launcher and is unsafe for preload callers that pass
+    placeholder pointers.
+    """
+    preload = getattr(exe, "preload", None)
+    if callable(preload):
+        return preload(*args)
+
+    with _PRELOAD_COMPILE_LOCK:
+        old_compile_only = os.environ.get("COMPILE_ONLY")
+        os.environ["COMPILE_ONLY"] = "1"
+        try:
+            return flyc.compile(exe, *args)
+        finally:
+            if old_compile_only is None:
+                os.environ.pop("COMPILE_ONLY", None)
+            else:
+                os.environ["COMPILE_ONLY"] = old_compile_only
 
 
 def _to_raw(v):
