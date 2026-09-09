@@ -61,9 +61,23 @@ void generate_reduce_info(int32_t num_work,
         covered_qo_end = final_loc[1];
         std::vector<uint32_t> partial_loc_vec(it->second.begin(), it->second.end());
         const int32_t num_partials   = partial_loc_vec.size();
-        assert(final_idx + 1 < static_cast<int32_t>(reduce_indptr.size()));
-        assert(final_idx < static_cast<int32_t>(reduce_final_map.size()));
-        assert(partial_idx + num_partials <= static_cast<int32_t>(reduce_partial_map.size()));
+        AITER_CHECK(final_idx + 1 < static_cast<int32_t>(reduce_indptr.size()),
+                    "reduce_indptr too small: need ",
+                    final_idx + 2,
+                    " entries, got ",
+                    reduce_indptr.size());
+        AITER_CHECK(final_idx < static_cast<int32_t>(reduce_final_map.size()),
+                    "reduce_final_map too small: need ",
+                    final_idx + 1,
+                    " entries, got ",
+                    reduce_final_map.size());
+        AITER_CHECK(partial_idx + num_partials <= static_cast<int32_t>(reduce_partial_map.size()),
+                    "reduce_partial_map too small: need ",
+                    partial_idx + num_partials,
+                    " slots, got ",
+                    reduce_partial_map.size(),
+                    "; get_ps_metadata_info_v1 must be sized with the same qlen_granularity and "
+                    "max_qlen that get_ps_metadata_v1 generates with");
         reduce_indptr[final_idx + 1] = reduce_indptr[final_idx] + num_partials;
         reduce_final_map[final_idx]  = FinalLoc{final_loc[0], final_loc[1]};
         std::copy(partial_loc_vec.begin(),
@@ -218,7 +232,14 @@ void kn_generate_ps_metadata(std::vector<int32_t>& seqlens_qo_indptr,
                             std::min(kv_start + consuming_blocks,
                                      pages_kv_indptr[current_tile.batch_idx + 1]);
 
-                        assert(current_work_idx < static_cast<int32_t>(work_info.size()));
+                        AITER_CHECK(current_work_idx < static_cast<int32_t>(work_info.size()),
+                                    "work_info too small: need more than ",
+                                    current_work_idx,
+                                    " entries, got ",
+                                    work_info.size(),
+                                    "; get_ps_metadata_info_v1 must be sized with the same "
+                                    "qlen_granularity and max_qlen that get_ps_metadata_v1 "
+                                    "generates with");
                         work_info[current_work_idx++] = {current_tile.batch_idx,
                                                          partial_o_loc,
                                                          current_tile.qo_start,
@@ -245,7 +266,14 @@ void kn_generate_ps_metadata(std::vector<int32_t>& seqlens_qo_indptr,
                             kv_length -
                             (kv_end - pages_kv_indptr[current_tile.batch_idx]) * block_size;
 
-                        assert(current_work_idx < static_cast<int32_t>(work_info.size()));
+                        AITER_CHECK(current_work_idx < static_cast<int32_t>(work_info.size()),
+                                    "work_info too small: need more than ",
+                                    current_work_idx,
+                                    " entries, got ",
+                                    work_info.size(),
+                                    "; get_ps_metadata_info_v1 must be sized with the same "
+                                    "qlen_granularity and max_qlen that get_ps_metadata_v1 "
+                                    "generates with");
                         work_info[current_work_idx++] = {current_tile.batch_idx,
                                                          partial_o_loc,
                                                          current_tile.qo_start,
