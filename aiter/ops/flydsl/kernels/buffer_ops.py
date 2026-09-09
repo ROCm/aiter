@@ -12,9 +12,12 @@ Buffer instructions are an AMD hardware feature (buffer resource descriptor
 plus ROCDL intrinsics) providing out-of-bounds protection and better memory
 throughput; plain memref load/store is not a substitute.
 
-Upstream: FlyDSL ``kernels/common/buffer_ops.py`` @ ROCm/FlyDSL#880.
-Behavior matches upstream; formatting and type annotations differ only to
-satisfy aiter's lint.
+Upstream: FlyDSL ``kernels/common/buffer_ops.py`` @ ROCm/FlyDSL#880, minus
+``create_llvm_ptr`` (now ``kernels_common.create_llvm_ptr``, built on fx so the
+backend resolves the address space). Everything kept behaves as upstream.
+
+``buffer_load(is_scalar=True)`` stays here for kernels not yet moved to the
+buffer-view API; migrated kernels should prefer ``tensor_shim.buf_scalar_load``.
 
 Example:
     >>> from aiter.ops.flydsl.kernels import buffer_ops
@@ -28,12 +31,21 @@ Example:
 
 from __future__ import annotations
 
+import inspect
+
 from flydsl._mlir import ir
 from flydsl._mlir.dialects import arith as std_arith
 from flydsl._mlir.dialects import llvm, rocdl
 from flydsl._mlir.extras import types as T
 from flydsl.expr.meta import dsl_loc_tracing
 from flydsl.runtime.device import is_rdna_arch
+
+# FlyDSL changed raw buffer cache policy from an i32 operand to an enum
+# attribute. Keep this vendored compatibility layer usable with both forms.
+_RAW_PTR_BUFFER_AUX_IS_ATTRIBUTE = (
+    inspect.signature(rocdl.RawPtrBufferLoadOp).parameters["aux"].kind
+    is inspect.Parameter.KEYWORD_ONLY
+)
 
 
 def _get_buffer_flags(arch=None):
@@ -74,13 +86,10 @@ def _get_buffer_flags(arch=None):
 
 
 __all__ = [
-    "BufferResourceDescriptor",
     "buffer_load",
     "buffer_store",
     "create_buffer_resource",
     "create_buffer_resource_from_addr",
-    "create_llvm_ptr",
-    "extract_base_index",
     "get_element_ptr",
 ]
 
@@ -166,41 +175,6 @@ def _ptr8_to_v4i32(ptr8_val) -> ir.Value:
     v4i32_ty = ir.VectorType.get([4], ir.IntegerType.get_signless(32))
     i128_val = llvm.ptrtoint(i128_ty, _unwrap_value(ptr8_val))
     return llvm.bitcast(v4i32_ty, i128_val)
-
-
-@dsl_loc_tracing
-def create_llvm_ptr(value, address_space: int = 0) -> ir.Value:
-    """Create an LLVM pointer from an integer or index value."""
-    value = _unwrap_value(value)
-    if isinstance(value.type, ir.IndexType):
-        i64_type = T.i64()
-        value = _unwrap_value(std_arith.IndexCastOp(i64_type, value).result)
-    ptr_type = ir.Type.parse(f"!llvm.ptr<{address_space}>")
-    return llvm.IntToPtrOp(ptr_type, value).result
-
-
-@dsl_loc_tracing
-def extract_base_index(tensor, address_space: int = 1) -> ir.Value:
-    """Extract the base address of a fly.memref as an index value.
-
-    Inverse of :func:`create_llvm_ptr` (index -> ptr). Useful when ISA
-    requires a raw pointer instead of a buffer resource descriptor
-    (e.g. global_atomic_pk_add_bf16 on gfx942).
-    """
-    from flydsl._mlir.dialects import fly as _fly
-    from flydsl._mlir.dialects import memref as _memref
-
-    raw = _unwrap_value(tensor)
-    try:
-        ir.MemRefType(raw.type)
-        return _memref.extract_aligned_pointer_as_index(raw)
-    except ValueError:
-        pass
-
-    ptr_type = ir.Type.parse(f"!llvm.ptr<{address_space}>")
-    ptr = _fly.extract_aligned_pointer_as_index(ptr_type, raw)
-    i64_val = llvm.PtrToIntOp(ir.IntegerType.get_signless(64), ptr).result
-    return _unwrap_value(std_arith.IndexCastOp(ir.IndexType.get(), i64_val).result)
 
 
 @dsl_loc_tracing
@@ -593,10 +567,10 @@ def buffer_load(
             soffset = _create_i32_constant(soffset_bytes)
         else:
             soffset = _to_i32_offset(_unwrap_value(soffset_bytes))
-    aux_attr = (
+    aux = (
         ir.IntegerAttr.get(ir.IntegerType.get_signless(32), cache_modifier)
-        if cache_modifier
-        else None
+        if _RAW_PTR_BUFFER_AUX_IS_ATTRIBUTE
+        else _create_i32_constant(cache_modifier)
     )
 
     # Emit buffer load
@@ -605,7 +579,7 @@ def buffer_load(
         rsrc,
         offset,
         soffset,
-        aux=aux_attr,
+        aux=aux,
     )
 
     return load_op.result
@@ -683,10 +657,10 @@ def buffer_store(
             soffset = _create_i32_constant(int(soffset_bytes))
         else:
             soffset = _to_i32_offset(_unwrap_value(soffset_bytes))
-    aux_attr = (
+    aux = (
         ir.IntegerAttr.get(ir.IntegerType.get_signless(32), cache_modifier)
-        if cache_modifier
-        else None
+        if _RAW_PTR_BUFFER_AUX_IS_ATTRIBUTE
+        else _create_i32_constant(cache_modifier)
     )
 
     # Emit buffer store
@@ -695,5 +669,5 @@ def buffer_store(
         rsrc,
         offset,
         soffset,
-        aux=aux_attr,
+        aux=aux,
     )

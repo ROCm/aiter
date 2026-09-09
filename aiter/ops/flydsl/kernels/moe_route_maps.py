@@ -13,7 +13,7 @@ from flydsl._mlir.dialects import llvm
 from flydsl.expr import arith, const_expr, gpu, ptrtoint, range_constexpr
 from flydsl.expr.typing import Int32, T
 
-from aiter.ops.flydsl.kernels import buffer_ops
+from aiter.ops.flydsl.kernels.kernels_common import create_llvm_ptr
 from aiter.ops.flydsl.kernels.tensor_shim import (
     AITER_FLYDSL_KERNARG_PRELOAD,
     AITER_FLYDSL_KERNARG_PRELOAD_COUNT,
@@ -69,10 +69,7 @@ def _slot_ptr(base_i64, elem_idx, address_space=1):
     The atomicrmw builder needs a raw ``!llvm.ptr<n>``, which the layout/buffer
     ops do not produce, so the byte address is formed by hand here.
     """
-    ptr = buffer_ops.create_llvm_ptr(
-        base_i64 + fx.Int64(elem_idx) * 4, address_space=address_space
-    )
-    return ptr._value if hasattr(ptr, "_value") else ptr
+    return create_llvm_ptr(base_i64 + fx.Int64(elem_idx) * 4, address_space)
 
 
 def build_moe_route_maps_module():
@@ -436,7 +433,9 @@ def build_moe_route_g2l_lds_module(weight_dtype="bf16"):
             my_rank = fx.Uint32(
                 llvm.AtomicRMWOp(
                     llvm.AtomicBinOp.add,
-                    _slot_ptr(cnt_base_i64, eff_e, address_space=3),
+                    _slot_ptr(
+                        cnt_base_i64, eff_e, address_space=fx.AddressSpace.Shared
+                    ),
                     c1,
                     llvm.AtomicOrdering.monotonic,
                     syncscope="workgroup",
