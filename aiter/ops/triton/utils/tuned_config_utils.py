@@ -7,6 +7,7 @@ device, on top of the shared core in ``config_utils``.
 """
 
 import functools
+import os
 
 import triton
 
@@ -21,6 +22,28 @@ from aiter.ops.triton.utils.config_utils import (
     _dtype_dir,
     load_config_json,
 )
+
+
+def autotune_enabled(family: str) -> bool:
+    """``<FAMILY>_TRITON_AUTOTUNE=1`` opts a kernel family into runtime tuning; off by default."""
+    return os.getenv(f"{family}_TRITON_AUTOTUNE", "0").lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
+
+
+def autotune_configs(
+    family: str,
+    configs: list[triton.Config],
+    default_config: triton.Config | None = None,
+) -> list[triton.Config]:
+    """Config list for ``@triton.autotune``: every candidate while the family tunes, else
+    only ``default_config`` (or ``configs[0]``) so nothing is benchmarked at launch."""
+    if autotune_enabled(family):
+        return configs
+    return [default_config if default_config is not None else configs[0]]
 
 
 @functools.lru_cache(maxsize=1024 if USE_LRU_CACHE else 0)
