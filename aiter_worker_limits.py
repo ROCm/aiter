@@ -6,6 +6,7 @@ import posixpath
 import threading
 import time
 import warnings
+from fractions import Fraction
 
 CPU_CORE_COUNT_UTILIZATION = 0.80
 # Approximate peak RSS observed per AOT worker, rounded up to 1.5 GB.
@@ -48,9 +49,15 @@ def _process_cpu_count() -> int:
 
 
 def get_cpu_worker_budget(cpu_count: int | None = None) -> int:
-    """Return at most 80% of logical CPUs, with one worker as the floor."""
+    """Apply 80% utilization to affinity and readable CPU quotas, flooring at one."""
     logical_cpus = (_process_cpu_count() if cpu_count is None else cpu_count) or 1
-    return max(1, int(logical_cpus * CPU_CORE_COUNT_UTILIZATION))
+    budget = max(1, int(logical_cpus * CPU_CORE_COUNT_UTILIZATION))
+    quota = _cgroup_cpu_quota()
+    if quota is not None:
+        # Preserve fractional CPUs until the final rounding, including 2.5 CPUs.
+        quota_budget = int(quota * Fraction(str(CPU_CORE_COUNT_UTILIZATION)))
+        budget = min(budget, max(1, quota_budget))
+    return budget
 
 
 def _host_available_memory_bytes() -> int:
@@ -92,8 +99,8 @@ def _resolve_cgroup_directory(
     return os.path.join(mount_point, *relative.split("/")) if relative else mount_point
 
 
-def _cgroup_memory_directories() -> list[tuple[str, str]]:
-    """Return current-to-root memory cgroup directories for v2 or v1."""
+def _cgroup_directories(controller: str) -> list[tuple[str, str]]:
+    """Return visible current-to-root directories for a v1/v2 controller."""
     try:
         with open(_PROC_SELF_CGROUP_PATH) as cgroup_file:
             cgroup_lines = cgroup_file.readlines()
@@ -103,7 +110,7 @@ def _cgroup_memory_directories() -> list[tuple[str, str]]:
         return []
 
     unified_path = None
-    memory_path = None
+    controller_path = None
     for line in cgroup_lines:
         try:
             hierarchy, controllers, path = line.rstrip("\n").split(":", 2)
@@ -111,8 +118,8 @@ def _cgroup_memory_directories() -> list[tuple[str, str]]:
             continue
         if hierarchy == "0" and not controllers:
             unified_path = path
-        if "memory" in controllers.split(","):
-            memory_path = path
+        if controller in controllers.split(","):
+            controller_path = path
 
     directories = []
     seen_directories = set()
@@ -135,11 +142,11 @@ def _cgroup_memory_directories() -> list[tuple[str, str]]:
             membership_path = unified_path
         elif (
             filesystem_type == "cgroup"
-            and memory_path is not None
-            and "memory" in super_options
+            and controller_path is not None
+            and controller in super_options
         ):
             version = "v1"
-            membership_path = memory_path
+            membership_path = controller_path
         if version is None:
             continue
 
@@ -162,6 +169,41 @@ def _cgroup_memory_directories() -> list[tuple[str, str]]:
                 break
             current = parent
     return directories
+
+
+def _cgroup_memory_directories() -> list[tuple[str, str]]:
+    return _cgroup_directories("memory")
+
+
+def _cgroup_cpu_quota() -> Fraction | None:
+    """Return the tightest readable quota/period across visible CPU ancestors.
+
+    Unlimited, unavailable, or malformed entries add no constraint; continue
+    checking other ancestors and mounts. CPU weights/shares and burst allowances
+    are not sustained bandwidth limits and are intentionally not used.
+    """
+    tightest = None
+    for version, directory in _cgroup_directories("cpu"):
+        try:
+            if version == "v2":
+                with open(os.path.join(directory, "cpu.max")) as quota_file:
+                    raw_quota, raw_period = quota_file.read().split()
+                if raw_quota == "max":
+                    continue
+            else:
+                with open(os.path.join(directory, "cpu.cfs_quota_us")) as quota_file:
+                    raw_quota = quota_file.read().strip()
+                with open(os.path.join(directory, "cpu.cfs_period_us")) as period_file:
+                    raw_period = period_file.read().strip()
+            quota, period = int(raw_quota), int(raw_period)
+            if quota <= 0 or period <= 0:
+                continue
+        except (OSError, ValueError):
+            continue
+        capacity = Fraction(quota, period)
+        if tightest is None or capacity < tightest:
+            tightest = capacity
+    return tightest
 
 
 def _cgroup_memory_bound() -> tuple[int | None, dict[str, object] | None]:

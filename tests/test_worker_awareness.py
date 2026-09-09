@@ -23,6 +23,12 @@ get_worker_count_for = worker_limits.get_worker_count_for
 
 
 class WorkerAwarenessTest(unittest.TestCase):
+    def setUp(self):
+        # These tests model affinity/memory independently of the test host quota.
+        quota = patch.object(worker_limits, "_cgroup_cpu_quota", return_value=None)
+        quota.start()
+        self.addCleanup(quota.stop)
+
     def test_worker_count_accepts_no_per_caller_default(self):
         self.assertEqual(tuple(inspect.signature(get_worker_count).parameters), ())
 

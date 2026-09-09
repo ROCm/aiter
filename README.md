@@ -138,6 +138,17 @@ AITER_USE_SYSTEM_TRITON=1 python3 -m pip install -e .
 
 ### Build parallelism
 
+CPU sizing also respects readable cgroup v2 `cpu.max` and v1
+`cpu.cfs_quota_us` / `cpu.cfs_period_us` limits across visible ancestors.
+The CPU worker budget is 80% of the smaller of affinity-available CPUs and
+quota/period, rounded down with a one-worker minimum (including sub-CPU quotas).
+For example, 192 visible CPUs with an 8-CPU quota yield six workers before memory
+and explicit ceilings apply. Quotas are reread on each worker-policy call.
+Unlimited, missing, unreadable, or malformed quota entries add no constraint;
+other readable ancestors and the existing affinity/memory limits still apply.
+CPU shares/weights and burst allowances do not increase this sustained budget.
+Ancestors hidden by the container's cgroup mount cannot be inspected.
+
 `AITER_MAX_JOBS` is AITER's optional top-level compilation-worker ceiling. A generic `MAX_JOBS` inherited from vLLM, SGLang, PyTorch, or another parent framework is ignored by plain AITER imports and remains unchanged. Once AITER is about to launch AITER-owned runtime JIT compilation, a valid `MAX_JOBS` is honored as a non-mutating legacy ceiling when `AITER_MAX_JOBS` is unset. For backward compatibility, AITER-owned standalone build entrypoints adopt a valid positive `MAX_JOBS` as `AITER_MAX_JOBS` when the latter is unset and emit a `FutureWarning`. On every worker-policy call, AITER selects the smaller of 80% of the CPUs available to the current process and effective available memory divided by the observed 1.5 GB RSS estimate per worker. Effective available memory is the smaller of host `MemAvailable` and remaining cgroup v2/v1 memory when a finite container limit is present.
 
 When `AITER_MAX_JOBS` is set, its normalized value is applied as an additional upper bound; it never bypasses the live CPU or memory caps. Invalid values fall back to automatic sizing, and non-positive values impose a one-worker ceiling. Automatic results are not written back into the environment.
