@@ -187,6 +187,7 @@ from aiter.ops.flydsl.warp_decode_moe import (  # noqa: E402
     flydsl_warp_decode_down_reduce,
     flydsl_warp_decode_gate_up,
     flydsl_warp_decode_gate_up_fp8act,
+    flydsl_warp_decode_moe,
 )
 
 # name, B, HIDDEN, INTER, E, TOPK, w_scale_mode, scale_block (None | (BN, BK))
@@ -963,6 +964,143 @@ def test_down_reduce_bf16(case):
     cos = _cosine(ref, out)
     print(f"[bf16 down {name}] cos={cos:.6f}")
     assert cos >= 0.99, f"bf16 down {name}: cos={cos:.6f}"
+
+
+@pytest.mark.parametrize("weight_kind", ["bf16", "fp8", "fp8act", "fp4"])
+def test_combined_moe_matches_explicit_stages(weight_kind):
+    """The public wrapper must be exactly the staged call, including out buffers."""
+    B, HIDDEN, INTER, E, TOPK = 1, 512, 512, 2, 1
+    inter_out = torch.empty((B, TOPK, INTER), dtype=torch.bfloat16, device="cuda")
+    final_out = torch.empty((B, HIDDEN), dtype=torch.bfloat16, device="cuda")
+
+    if weight_kind == "bf16":
+        x, w_gate, w_up, router_ids = _gen_bf16_gate_up(B, HIDDEN, INTER, E, TOPK)
+        _, w_down, _, router_wts = _gen_bf16_down(B, INTER, HIDDEN, E, TOPK)
+        expected_inter = flydsl_warp_decode_gate_up_bf16(x, w_gate, w_up, router_ids)
+        expected = flydsl_warp_decode_down_reduce_bf16(
+            expected_inter, w_down, router_ids, router_wts
+        )
+        got = flydsl_warp_decode_moe(
+            x,
+            w_gate,
+            w_up,
+            w_down,
+            router_ids,
+            router_wts,
+            intermediate=inter_out,
+            out=final_out,
+        )
+    elif weight_kind in ("fp8", "fp8act"):
+        mode = "pertensor" if weight_kind == "fp8" else "block2d"
+        scale_block = None if weight_kind == "fp8" else (128, 128)
+        x, w_gate, w_up, router_ids, wgs, wus = _gen_gate_up(
+            B, HIDDEN, INTER, E, TOPK, mode, scale_block
+        )
+        _, w_down, _, router_wts, wds = _gen_down(
+            B, INTER, HIDDEN, E, TOPK, mode, scale_block
+        )
+        x_scale = None
+        if weight_kind == "fp8act":
+            x_blocks = x.float().view(B, HIDDEN // 128, 128)
+            x_scale = (
+                x_blocks.abs().amax(dim=2).clamp(min=1e-8) / _FP8_E4M3_MAX
+            ).float()
+            x = (x_blocks / x_scale[..., None]).view(B, HIDDEN).to(torch.float8_e4m3fn)
+            x_scale = x_scale.flatten().contiguous()
+            expected_inter = flydsl_warp_decode_gate_up_fp8act(
+                x,
+                w_gate,
+                w_up,
+                router_ids,
+                x_scale,
+                wgs,
+                wus,
+                scale_block=scale_block,
+            )
+        else:
+            expected_inter = flydsl_warp_decode_gate_up(
+                x, w_gate, w_up, router_ids, wgs, wus
+            )
+        expected = flydsl_warp_decode_down_reduce(
+            expected_inter,
+            w_down,
+            router_ids,
+            router_wts,
+            wds,
+            w_scale_mode=mode,
+            scale_block=scale_block,
+        )
+        got = flydsl_warp_decode_moe(
+            x,
+            w_gate,
+            w_up,
+            w_down,
+            router_ids,
+            router_wts,
+            wgs,
+            wus,
+            wds,
+            x_scale=x_scale,
+            w_scale_mode=mode,
+            scale_block=scale_block,
+            intermediate=inter_out,
+            out=final_out,
+        )
+    else:
+        (
+            x,
+            w_gate,
+            w_up,
+            wgs,
+            wus,
+            router_ids,
+            _,
+            _,
+        ) = _gen_gate_up_fp4(B, HIDDEN, INTER, E, TOPK)
+        _, w_down, wds, _, router_wts, _ = _gen_down_fp4(B, INTER, HIDDEN, E, TOPK)
+        expected_inter = flydsl_warp_decode_gate_up_fp4(
+            x, w_gate, w_up, router_ids, wgs, wus
+        )
+        expected = flydsl_warp_decode_down_reduce_fp4(
+            expected_inter, w_down, router_ids, router_wts, wds
+        )
+        got = flydsl_warp_decode_moe(
+            x,
+            w_gate,
+            w_up,
+            w_down,
+            router_ids,
+            router_wts,
+            wgs,
+            wus,
+            wds,
+            intermediate=inter_out,
+            out=final_out,
+        )
+
+    assert got is final_out
+    torch.testing.assert_close(
+        inter_out, expected_inter, rtol=0, atol=0, equal_nan=True
+    )
+    torch.testing.assert_close(got, expected, rtol=0, atol=0, equal_nan=True)
+
+
+def test_combined_moe_rejects_stage_out_kwargs():
+    """The combined wrapper owns both output arguments."""
+    x = torch.empty((1, 512), dtype=torch.bfloat16, device="cuda")
+    w = torch.empty((1, 512, 512), dtype=torch.bfloat16, device="cuda")
+    ids = torch.zeros((1, 1), dtype=torch.int32, device="cuda")
+    weights = torch.ones((1, 1), dtype=torch.float32, device="cuda")
+    with pytest.raises(ValueError, match="intermediate=/out="):
+        flydsl_warp_decode_moe(
+            x,
+            w,
+            w,
+            w,
+            ids,
+            weights,
+            gate_up_kwargs={"out": torch.empty_like(ids)},
+        )
 
 
 # -------------------------------------------------------------------------

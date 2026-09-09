@@ -875,3 +875,169 @@ def flydsl_warp_decode_down_reduce_fp4(
         ),
     )
     return out
+
+
+def flydsl_warp_decode_moe(
+    x: torch.Tensor,
+    w_gate: torch.Tensor,
+    w_up: torch.Tensor,
+    w_down: torch.Tensor,
+    router_ids: torch.Tensor,
+    router_wts: torch.Tensor,
+    w_gate_scale: torch.Tensor | None = None,
+    w_up_scale: torch.Tensor | None = None,
+    w_down_scale: torch.Tensor | None = None,
+    *,
+    x_scale: torch.Tensor | None = None,
+    w_scale_mode: str | None = None,
+    scale_block: tuple[int, int] | None = None,
+    x_scale_bk: int = 128,
+    intermediate: torch.Tensor | None = None,
+    out: torch.Tensor | None = None,
+    gate_up_kwargs: dict | None = None,
+    down_reduce_kwargs: dict | None = None,
+) -> torch.Tensor:
+    """Run both stages of an unsorted, split-weight warp-decode MoE.
+
+    The weight dtype selects the existing staged implementation:
+
+    * BF16 weights use the BF16 gate/up and down kernels.
+    * FP8 weights use the FP8 kernels; an FP8 ``x`` selects the FP8-activation
+      gate/up kernel, otherwise ``x`` must be BF16.
+    * Packed MXFP4 weights (``uint8`` or ``float4_e2m1fn_x2``) use the MXFP4
+      kernels.
+
+    Weights retain the staged API's logical, K-contiguous layouts:
+    ``w_gate/w_up`` are ``[E, INTER, HIDDEN]`` (or packed along HIDDEN), and
+    ``w_down`` is ``[E, HIDDEN, INTER]`` (or packed along INTER). This wrapper
+    does not accept AITER's preshuffled fused-MoE layout and does not sort
+    routing metadata.
+
+    ``intermediate`` and ``out`` let serving/benchmark callers reuse the
+    ``[B, TOPK, INTER]`` and ``[B, HIDDEN]`` buffers respectively. Additional
+    stage tuning options may be supplied through ``gate_up_kwargs`` and
+    ``down_reduce_kwargs``; the wrapper owns their ``out`` arguments.
+    """
+    assert (
+        w_gate.dtype == w_up.dtype == w_down.dtype
+    ), "w_gate, w_up, and w_down must have the same dtype"
+    assert router_ids.dtype == torch.int32, "router_ids must be int32"
+    assert router_wts.dtype == torch.float32, "router_wts must be float32"
+    assert router_ids.shape == router_wts.shape, "router_ids/router_wts shape mismatch"
+
+    gate_kwargs = dict(gate_up_kwargs or {})
+    down_kwargs = dict(down_reduce_kwargs or {})
+    if "out" in gate_kwargs or "out" in down_kwargs:
+        raise ValueError("pass intermediate=/out= to flydsl_warp_decode_moe")
+
+    fp4_dtype = getattr(torch, "float4_e2m1fn_x2", None)
+    is_fp4 = w_gate.dtype == torch.uint8 or (
+        fp4_dtype is not None and w_gate.dtype == fp4_dtype
+    )
+
+    if w_gate.dtype == torch.bfloat16:
+        if any(s is not None for s in (w_gate_scale, w_up_scale, w_down_scale)):
+            raise ValueError("BF16 warp-decode weights do not take weight scales")
+        if x_scale is not None or w_scale_mode is not None or scale_block is not None:
+            raise ValueError("BF16 warp-decode does not take quantization options")
+        intermediate = flydsl_warp_decode_gate_up_bf16(
+            x, w_gate, w_up, router_ids, out=intermediate, **gate_kwargs
+        )
+        return flydsl_warp_decode_down_reduce_bf16(
+            intermediate,
+            w_down,
+            router_ids,
+            router_wts,
+            out=out,
+            **down_kwargs,
+        )
+
+    if is_fp4:
+        if x.dtype != torch.bfloat16:
+            raise ValueError("MXFP4 warp-decode requires BF16 activations")
+        if x_scale is not None:
+            raise ValueError("MXFP4 warp-decode does not take x_scale")
+        if w_scale_mode not in (None, "block2d"):
+            raise ValueError("MXFP4 warp-decode requires w_scale_mode='block2d'")
+        if any(s is None for s in (w_gate_scale, w_up_scale, w_down_scale)):
+            raise ValueError("MXFP4 warp-decode requires all three weight scales")
+        scale_block = (1, 32) if scale_block is None else scale_block
+        intermediate = flydsl_warp_decode_gate_up_fp4(
+            x,
+            w_gate,
+            w_up,
+            router_ids,
+            w_gate_scale,
+            w_up_scale,
+            scale_block=scale_block,
+            out=intermediate,
+            **gate_kwargs,
+        )
+        return flydsl_warp_decode_down_reduce_fp4(
+            intermediate,
+            w_down,
+            router_ids,
+            router_wts,
+            w_down_scale,
+            scale_block=scale_block,
+            out=out,
+            **down_kwargs,
+        )
+
+    if w_gate.dtype != torch.float8_e4m3fn:
+        raise ValueError(f"unsupported warp-decode weight dtype: {w_gate.dtype}")
+    if any(s is None for s in (w_gate_scale, w_up_scale, w_down_scale)):
+        raise ValueError("FP8 warp-decode requires all three weight scales")
+
+    if x.dtype == torch.float8_e4m3fn:
+        if x_scale is None:
+            raise ValueError("FP8-activation warp-decode requires x_scale")
+        if w_scale_mode not in (None, "block2d"):
+            raise ValueError(
+                "FP8-activation warp-decode requires block2d weight scales"
+            )
+        scale_block = (128, 128) if scale_block is None else scale_block
+        intermediate = flydsl_warp_decode_gate_up_fp8act(
+            x,
+            w_gate,
+            w_up,
+            router_ids,
+            x_scale,
+            w_gate_scale,
+            w_up_scale,
+            scale_block=scale_block,
+            x_scale_bk=x_scale_bk,
+            out=intermediate,
+            **gate_kwargs,
+        )
+        down_mode = "block2d"
+    else:
+        if x.dtype != torch.bfloat16:
+            raise ValueError("FP8 warp-decode requires BF16 or FP8 activations")
+        if x_scale is not None:
+            raise ValueError("BF16-activation warp-decode does not take x_scale")
+        down_mode = "pertensor" if w_scale_mode is None else w_scale_mode
+        intermediate = flydsl_warp_decode_gate_up(
+            x,
+            w_gate,
+            w_up,
+            router_ids,
+            w_gate_scale,
+            w_up_scale,
+            w_scale_mode=down_mode,
+            scale_block=scale_block,
+            out=intermediate,
+            **gate_kwargs,
+        )
+
+    return flydsl_warp_decode_down_reduce(
+        intermediate,
+        w_down,
+        router_ids,
+        router_wts,
+        w_down_scale,
+        w_scale_mode=down_mode,
+        scale_block=scale_block,
+        out=out,
+        **down_kwargs,
+    )
