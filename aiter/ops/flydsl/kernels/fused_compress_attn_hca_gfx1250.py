@@ -90,13 +90,14 @@ def _build_compress_forward_kernel(
     assert (
         slice_size % 32 == 0
     ), f"slice_size={slice_size} must be a multiple of 32 (wave width)"
+    # VEC=16 (slice_size=512) is excluded: `_load_f32_vec`, which serves the
+    # Phase 1 state-cache and ape reads, only splits up to 2x dwordx4.
     assert slice_size // 32 in (
         1,
         2,
         4,
         8,
-        16,
-    ), f"VEC={slice_size // 32} must be 1, 2, 4, 8, or 16"
+    ), f"VEC={slice_size // 32} must be 1, 2, 4, or 8 (slice_size={slice_size})"
     assert (
         ratio % k_split_num_waves == 0
     ), f"K={ratio} must divide evenly across {k_split_num_waves} waves"
@@ -182,27 +183,44 @@ def _build_compress_forward_kernel(
             # elements starting at slice_base + lid * VEC.
             col_off_base = fx.Int32(sid) * SLICE_SZ + lid * VEC
 
-            slot_map_rsrc = buffer_ops.create_buffer_resource(
-                state_slot_mapping, max_size=True
-            )
-            slot = buffer_ops.buffer_load(
-                slot_map_rsrc, batch_id, vec_width=1, dtype=i32
-            )
-
             kv_in_rsrc = buffer_ops.create_buffer_resource(kv_in, max_size=True)
             score_in_rsrc = buffer_ops.create_buffer_resource(score_in, max_size=True)
-            # Rebased onto this program's slot — see `state_slot_byte_offset`.
-            kv_state_rsrc = buffer_ops.create_buffer_resource(
-                kv_state,
-                max_size=True,
-                base_byte_offset=state_slot_byte_offset(slot, kv_state_slot_stride),
-            )
-            score_state_rsrc = buffer_ops.create_buffer_resource(
-                score_state,
-                max_size=True,
-                base_byte_offset=state_slot_byte_offset(slot, score_state_slot_stride),
-            )
             ape_rsrc = buffer_ops.create_buffer_resource(ape, max_size=True)
+
+            def _state_rsrcs():
+                """Build the state-cache descriptors, rebased onto this
+                program's slot -- see ``state_slot_byte_offset``.
+
+                Called from inside the Phase 1 loop body rather than hoisted up
+                here on purpose. ``slot`` is a load indexed by the plan's
+                batch_id, so it is a second memory round trip chained behind the
+                plan load, and nothing outside Phase 1 needs it. Leaving it in
+                the loop lets LICM sink it to the loop preheader, so a wave
+                whose K range holds no state-cache positions -- the common case,
+                and every wave when window_len is 0 -- never pays for it.
+                """
+                slot_map_rsrc = buffer_ops.create_buffer_resource(
+                    state_slot_mapping, max_size=True
+                )
+                slot = buffer_ops.buffer_load(
+                    slot_map_rsrc, batch_id, vec_width=1, dtype=i32
+                )
+                return (
+                    buffer_ops.create_buffer_resource(
+                        kv_state,
+                        max_size=True,
+                        base_byte_offset=state_slot_byte_offset(
+                            slot, kv_state_slot_stride
+                        ),
+                    ),
+                    buffer_ops.create_buffer_resource(
+                        score_state,
+                        max_size=True,
+                        base_byte_offset=state_slot_byte_offset(
+                            slot, score_state_slot_stride
+                        ),
+                    ),
+                )
 
             def _load_bf16_vec_to_f32(rsrc, base_off_elems_i32):
                 """Load VEC contiguous bf16 elements starting at
@@ -307,6 +325,7 @@ def _build_compress_forward_kernel(
                 # Slot term already folded into the descriptor base.
                 base_kv_off = ring * fx.Int32(kv_state_pos_stride) + col_off_base
                 base_sc_off = ring * fx.Int32(score_state_pos_stride) + col_off_base
+                kv_state_rsrc, score_state_rsrc = _state_rsrcs()
                 kv_list = _load_f32_vec(kv_state_rsrc, base_kv_off)
                 sc_list = _load_f32_vec(score_state_rsrc, base_sc_off)
                 sc_padded = [
@@ -394,31 +413,45 @@ def _build_compress_forward_kernel(
                 )
                 phase1_local = yield list(new_m) + list(new_kv) + list(new_w)
 
-            # Sub-loop 2: Phase 2 sub-range [split, k_end). Reads input;
-            # uses padded softmax (the is-pad-score branch is dead code
-            # since Phase 2 scores are always finite -- compiler elides).
-            # Carry Phase 1's accumulator through as init.
-            final = phase1_local
-            for k_static, state in range(
-                split_i32.ir_value(), k_end_i32.ir_value(), 1, init=phase1_local
-            ):
-                m_lane = list(state[0:VEC])
-                kv_lane = list(state[VEC : 2 * VEC])
-                w_lane = list(state[2 * VEC : 3 * VEC])
-                k_i32 = fx.Int32(k_static)
+            # Sub-loop 2: Phase 2 over the wave's WHOLE K range [k_start, k_end),
+            # with the [k_start, split) prefix masked to -inf because Phase 1
+            # already consumed it. A masked step is an exact no-op: score=-inf
+            # forces w_k=0 and m_new=m_old, so the accumulator is scaled by
+            # exp(0)=1 and incremented by 0.
+            #
+            # The point of covering the whole range instead of [split, k_end) is
+            # the trip count: K_PER_WAVE is a compile-time constant, so this
+            # unrolls and the scheduler hoists all K loads into one batch. With
+            # runtime bounds it cannot, and the resulting per-iteration
+            # load->softmax->load dependency chain is what throttled the kernel.
+            #
+            # Masked iters still issue their kv_in/score_in loads at a clamped
+            # in_row -- in-bounds by construction, the same wasted-read tradeoff
+            # the dynamic form already made for pure-Phase-1 waves.
+            m_lane = list(phase1_local[0:VEC])
+            kv_lane = list(phase1_local[VEC : 2 * VEC])
+            w_lane = list(phase1_local[2 * VEC : 3 * VEC])
+            for j in range_constexpr(K_PER_WAVE):
+                k_i32 = k_start_i32 + j
+                # Wave-uniform (split and k_start are both wave-uniform) -> SGPR
+                # compare, one cndmask per element.
+                is_consumed = arith.cmpi(
+                    CmpIPredicate.slt, k_i32.ir_value(), split_i32.ir_value()
+                )
                 p2_kv, p2_sc, p2_ape = _issue_phase2_loads(k_i32)
                 p2_score = [
-                    arith.AddFOp(p2_sc[i], p2_ape[i], fastmath=fm_fast).result
+                    arith.select(
+                        is_consumed,
+                        c_neg_inf,
+                        arith.AddFOp(p2_sc[i], p2_ape[i], fastmath=fm_fast).result,
+                    )
                     for i in range(VEC)
                 ]
-                new_m, new_kv, new_w = _softmax_step_padded(
+                m_lane, kv_lane, w_lane = _softmax_step_padded(
                     m_lane, kv_lane, w_lane, p2_score, p2_kv
                 )
-                final = yield list(new_m) + list(new_kv) + list(new_w)
 
-            m_local = list(final[0:VEC])
-            kv_local = list(final[VEC : 2 * VEC])
-            w_local = list(final[2 * VEC : 3 * VEC])
+            m_local, kv_local, w_local = m_lane, kv_lane, w_lane
 
             # -- LDS write: each thread writes VEC entries per array --
             # Layout: per array, NW * SLICE_SZ fp32 entries; per-thread
@@ -646,34 +679,41 @@ def _build_norm_rope_scatter_kernel(
 
         # Sentinel-skip: run the whole body only for position >= 0, as a closure
         # under a runtime `if` (rewriter sees an opaque call -> scf.if).
-        def _body():
-            tid_x_vec = fx.Int32(tid) * VEC
+        tid_x_vec = fx.Int32(tid) * VEC
 
-            # -- Load kv_compressed[pid, tid*VEC : tid*VEC + VEC] --
-            kvc_rsrc = buffer_ops.create_buffer_resource(kv_compressed, max_size=True)
-            base_off = fx.Int32(pid) * fx.Int32(kv_compressed_row_stride) + tid_x_vec
-            # VEC ? {2, 4, 8, 16}: VEC <= 4 -> single dwordx{VEC}; VEC>4 -> Nx dwordx4.
-            # comp_lane held as raw f32 ir.Values for the explicit-fastmath layer.
-            if const_expr(VEC <= 4):
-                raw = fx.Vector(
-                    buffer_ops.buffer_load(kvc_rsrc, base_off, vec_width=VEC, dtype=f32)
-                )
-                comp_lane = [raw[i].ir_value() for i in range(VEC)]
-            else:
-                quarter = 4
-                n_chunks = VEC // quarter
-                comp_lane = []
-                for q in range_constexpr(n_chunks):
-                    r = fx.Vector(
-                        buffer_ops.buffer_load(
-                            kvc_rsrc,
-                            base_off + q * quarter,
-                            vec_width=quarter,
-                            dtype=f32,
-                        )
+        # -- Load kv_compressed[pid, tid*VEC : tid*VEC + VEC] --
+        # Deliberately outside the sentinel guard: the address needs only pid,
+        # never the plan row. Under the guard it is control-dependent on the
+        # plan load and can only issue once that returns, putting two full
+        # memory round trips back to back in a kernel whose cost is pure
+        # latency (flat in plan_capacity). Out here both loads issue together.
+        # Sentinel rows then read a scratch row that is always allocated
+        # (kv_compressed is [plan_capacity, D]) and still write nothing.
+        kvc_rsrc = buffer_ops.create_buffer_resource(kv_compressed, max_size=True)
+        base_off = fx.Int32(pid) * fx.Int32(kv_compressed_row_stride) + tid_x_vec
+        # VEC ? {2, 4, 8, 16}: VEC <= 4 -> single dwordx{VEC}; VEC>4 -> Nx dwordx4.
+        # comp_lane held as raw f32 ir.Values for the explicit-fastmath layer.
+        if const_expr(VEC <= 4):
+            raw = fx.Vector(
+                buffer_ops.buffer_load(kvc_rsrc, base_off, vec_width=VEC, dtype=f32)
+            )
+            comp_lane = [raw[i].ir_value() for i in range(VEC)]
+        else:
+            quarter = 4
+            n_chunks = VEC // quarter
+            comp_lane = []
+            for q in range_constexpr(n_chunks):
+                r = fx.Vector(
+                    buffer_ops.buffer_load(
+                        kvc_rsrc,
+                        base_off + q * quarter,
+                        vec_width=quarter,
+                        dtype=f32,
                     )
-                    comp_lane += [r[i].ir_value() for i in range_constexpr(quarter)]
+                )
+                comp_lane += [r[i].ir_value() for i in range_constexpr(quarter)]
 
+        def _body():
             # -- RMSNorm (wave reduce-add of squares / D + eps; rsqrt) --
             sq_local = arith.constant(0.0, type=f32)
             for i in range_constexpr(VEC):

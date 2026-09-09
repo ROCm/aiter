@@ -2102,15 +2102,26 @@ _DEFAULT_COMPILE_HINTS = {
 def hca_per_n_config_gfx1250(plan_capacity: int) -> tuple[int, int]:
     """Return ``(slice_size, k_split_num_waves)`` for gfx1250 HCA.
 
-    Initial values -- need hardware tuning.
+    Tuned on hardware (median of 5 perftest runs per point, D=512 ratio=128):
+
+        capacity  18/24   48     80     144    1040
+        32,8       6.7    7.2   16.7   10.6    99.1
+        32,16      6.7    7.3   13.5   10.7    96.7
+        64,8       7.3    7.9   15.3   10.2    74.2
+        128,8      8.0    8.5   16.0   10.6    65.0
+        128,16     7.6    8.1   12.2   10.2    72.5
+
+    ``slice_size`` 256 was 2-3x off the best at every capacity measured and
+    512 does not build at all (VEC=16 exceeds what the Phase 1 f32 loader
+    handles), so neither is selectable here.
     """
     if plan_capacity <= 64:
         return 32, 8
+    if plan_capacity <= 96:
+        return 128, 16
     if plan_capacity <= 256:
         return 64, 8
-    if plan_capacity <= 1024:
-        return 256, 4
-    return 512, 1
+    return 128, 8
 
 
 @lru_cache(maxsize=32)
