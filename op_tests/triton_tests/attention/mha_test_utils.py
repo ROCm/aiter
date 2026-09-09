@@ -21,6 +21,8 @@ def skip_if_triton_padded_head_miscompiled(
 ):
     """
     Skip Triton forward tests miscompiled by the pinned ROCm Triton build.
+
+    Remove this function once the Triton compiler pinned by AITER CI is updated.
     """
     if (
         backend == "triton"
