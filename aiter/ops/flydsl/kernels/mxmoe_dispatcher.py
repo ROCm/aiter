@@ -11,13 +11,9 @@ from flydsl.expr.typing import Int8, T
 
 from aiter.jit.utils.chip_info import get_cu_num
 
-from .mxfp4_gemm_common import _udiv
-from .mxmoe_gemm_v2 import (
-    gemm2_body_v2,
-    global_typed_ptr,
-    issue_a_load_lds_dt,
-    kStages,
-)
+from .mxfp4_gemm_common import _udiv, global_typed_ptr, kStages
+from .mxmoe_g2_atoms import issue_a_load_lds_dt
+from .mxmoe_g2_kloop import gemm2_body_v2
 from .tensor_shim import _run_compiled as run_compiled
 
 __all__ = [
