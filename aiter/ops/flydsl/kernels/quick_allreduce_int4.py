@@ -93,8 +93,8 @@ def _clamp_fp16_overflow():
     intrinsic ``rocdl.disable_xdl_arb_stall`` uses for a different bit.
     """
     # hwreg(HW_REG_MODE, offset=23, size=2): id | (off<<6) | ((size-1)<<11)
-    imm = fx.arith.unwrap(fx.arith.constant(0xDC1, type=T.i32))
-    val = fx.arith.unwrap(fx.arith.constant(1, type=T.i32))
+    imm = as_ir_value(fx.Int32(0xDC1))
+    val = as_ir_value(fx.Int32(1))
     llvm.call_intrinsic(None, "llvm.amdgcn.s.setreg", [imm, val], [], [])
 
 
