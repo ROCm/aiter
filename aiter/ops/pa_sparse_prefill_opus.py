@@ -25,7 +25,7 @@ Constraints common to both:
   valid row index into ``unified_kv`` / ``kv`` respectively. Empty CSR rows
   (``kv_indptr[i] == kv_indptr[i+1]``) are allowed.
 
-See ``aiter/csrc/include/mla_v4_prefill_opus.h`` for the C++ API.
+See ``csrc/include/mla_v4_prefill_opus.h`` for the C++ API.
 """
 
 import torch
