@@ -24,7 +24,7 @@ from .communication_ops_utils import (
 )
 from .quant_utils import emit_f32_to_e2m1, emit_f32_to_e2m3, emit_mx_e8m0_scale
 
-_JIT_SCHEMA_VERSION = "v21-v4-mxfp4-v"
+_JIT_SCHEMA_VERSION = "v22-v4-mxfp6-q"
 _TRANSPORT_CHUNK_BYTES = 16
 _PUSH_PIPELINE_DEPTH = 16
 _OUT_CHANNEL_DEPTH = 1
@@ -90,6 +90,39 @@ def _pack_transport_pair(first, second, codec):
         T.i32, first.ir_value(), second.ir_value(), fx.Int32(0).ir_value(), 0
     )
     return fx.Int32(word).to(fx.Int16)
+
+
+def _v4_fp6_scale(amax):
+    exponent = ((amax.bitcast(fx.Int32) >> 23) & 255) - 2
+    return (amax == 0.0).select(fx.Int32(127), exponent)
+
+
+def _pack_v4_fp6(values, reciprocal):
+    codes = [
+        fx.Uint32(emit_f32_to_e2m3((values[i] * reciprocal).ir_value()))
+        for i in range(8)
+    ]
+    peer = [code.shuffle_xor(2, 64) for code in codes]
+    # Lanes 0/1 interleave their eight fields with lanes 2/3, respectively.
+    triples = [
+        codes[i] | (peer[i] << 6) | (codes[i + 1] << 12) | (peer[i + 1] << 18)
+        for i in range(0, 8, 2)
+    ]
+    return fx.Vector.from_elements(
+        [
+            triples[0] | (triples[1] << 24),
+            (triples[1] >> 8) | (triples[2] << 16),
+            (triples[2] >> 16) | (triples[3] << 8),
+        ],
+        fx.Uint32,
+    )
+
+
+@flyc.jit
+def _store_v4_fp6_q(words, resource, offset, lane):
+    if lane % 4 < 2:
+        for i in range_constexpr(3):
+            buffer_store(words[i], resource, offset + i)
 
 
 def _pack_v4_v_pair(first, second):
@@ -233,7 +266,9 @@ def make_fused_a2a_kernel(
     seq_full = seq_len * npes
     k_tiles = (seq_full + 127) // 128
 
-    def v4_word_offset(head, seq, chunk, mode):
+    def v4_word_offset(head, seq, chunk, mode, codec):
+        if codec == "mxfp6":
+            return (seq * heads_local + head) * 24 + (chunk // 4) * 6 + (chunk % 2) * 3
         if mode == "k":
             return (
                 (head * k_tiles + seq // 128) * 2048
@@ -438,7 +473,11 @@ def make_fused_a2a_kernel(
                             # Four adjacent vec=8 lanes own one post-RoPE MX block.
                             for shift in (1, 2):
                                 amax = amax.maximumf(amax.shuffle_xor(shift, 64))
-                            scale = _transport_scale(amax, codec)
+                            scale = (
+                                _v4_fp6_scale(amax)
+                                if mode and codec == "mxfp6"
+                                else _transport_scale(amax, codec)
+                            )
                             reciprocal = ((fx.Int32(254) - scale) << 23).bitcast(
                                 fx.Float32
                             )
@@ -451,7 +490,11 @@ def make_fused_a2a_kernel(
                                         codec,
                                     )
                                 )
-                            outputs.append(_pack_transport_words(packed, codec))
+                            outputs.append(
+                                _pack_v4_fp6(rotated, reciprocal)
+                                if mode and codec == "mxfp6"
+                                else _pack_transport_words(packed, codec)
+                            )
                             scales.append(scale.to(fx.Int8))
                         else:
                             outputs.append(
@@ -474,7 +517,7 @@ def make_fused_a2a_kernel(
                                 peer_base = fx.memref_load(p2p_bases, dest_pe)
                                 dst_byte = (
                                     v4_word_offset(
-                                        local_head, rank * seq_len + seq, 0, mode
+                                        local_head, rank * seq_len + seq, 0, mode, codec
                                     )
                                     * 4
                                     if mode
@@ -494,7 +537,15 @@ def make_fused_a2a_kernel(
                                         6160 if mode == "k" else row_nbytes
                                     ),
                                 )
-                                if const_expr(quant and codec == "mxfp6"):
+                                if const_expr(mode and codec == "mxfp6"):
+                                    _store_v4_fp6_q(
+                                        outputs[batch_idx],
+                                        rsrc_dst,
+                                        (lane_in_group // 4) * 6
+                                        + (lane_in_group % 2) * 3,
+                                        lane_in_group,
+                                    )
+                                elif const_expr(quant and codec == "mxfp6"):
                                     _store_fp6(
                                         outputs[batch_idx], rsrc_dst, lane_in_group
                                     )
@@ -622,7 +673,11 @@ def make_fused_a2a_kernel(
                         # Each aligned four-lane group owns 32 contiguous head values.
                         for shift in (1, 2):
                             amax = amax.maximumf(amax.shuffle_xor(shift, 64))
-                        scale = _transport_scale(amax, codec)
+                        scale = (
+                            _v4_fp6_scale(amax)
+                            if mode and codec == "mxfp6"
+                            else _transport_scale(amax, codec)
+                        )
                         reciprocal = ((fx.Int32(254) - scale) << 23).bitcast(fx.Float32)
                         packed = []
                         for pair in range_constexpr(elements_per_chunk // 2):
@@ -633,7 +688,11 @@ def make_fused_a2a_kernel(
                                     codec,
                                 )
                             )
-                        values.append(_pack_transport_words(packed, codec))
+                        values.append(
+                            _pack_v4_fp6(decoded, reciprocal)
+                            if mode and codec == "mxfp6"
+                            else _pack_transport_words(packed, codec)
+                        )
                         scales.append(scale.to(fx.Int8))
                     else:
                         values.append(raw)
@@ -644,7 +703,7 @@ def make_fused_a2a_kernel(
                     )
                     destinations.append(
                         v4_word_offset(
-                            local_head, rank * seq_len + seq, row_chunk, mode
+                            local_head, rank * seq_len + seq, row_chunk, mode, codec
                         )
                         if mode
                         else (
@@ -662,7 +721,14 @@ def make_fused_a2a_kernel(
                     valid_values.append(valid)
                 for batch_idx in range_constexpr(_PUSH_PIPELINE_DEPTH):
                     if valid_values[batch_idx]:
-                        if const_expr(quant and codec == "mxfp6"):
+                        if const_expr(mode and codec == "mxfp6"):
+                            _store_v4_fp6_q(
+                                values[batch_idx],
+                                rsrc_dst,
+                                destinations[batch_idx],
+                                lane,
+                            )
+                        elif const_expr(quant and codec == "mxfp6"):
                             _store_fp6(
                                 values[batch_idx], rsrc_dst, destinations[batch_idx]
                             )

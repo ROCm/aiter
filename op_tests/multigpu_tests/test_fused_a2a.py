@@ -514,8 +514,8 @@ def _check_hadamard_transport(rank, world_size, device, a2a_references):
         os.environ.pop(f"FUSED_A2A_CODEC_{role}", None)
 
 
-def _check_v4_output(rank, world_size, device):
-    from aiter.ops.mha_v4 import quantize_mxfp4_k, quantize_mxfp4_q
+def _check_v4_output(rank, world_size, device, q_codec="mxfp4"):
+    from aiter.ops.mha_v4 import quantize_mxfp4_k, quantize_mxfp4_q, quantize_mxfp6_q
 
     # Partial tiles, exact tiles, and a rank boundary inside a second K tile.
     cases = ((17, False, False), (32, True, False), (33, False, True), (17, True, True))
@@ -524,7 +524,9 @@ def _check_v4_output(rank, world_size, device):
     os.environ["FUSED_A2A_V4_OUTPUT"] = "1"
     os.environ["FUSED_A2A_HADAMARD"] = "0"
     for role in "QKV":
-        os.environ[f"FUSED_A2A_CODEC_{role}"] = "mxfp4" if role != "V" else "e4m3"
+        os.environ[f"FUSED_A2A_CODEC_{role}"] = (
+            q_codec if role == "Q" else "mxfp4" if role == "K" else "e4m3"
+        )
     for seq_len, split, fused in cases:
         softmax_scale = 0.125 if split else head_dim**-0.5
         inputs = [
@@ -559,7 +561,9 @@ def _check_v4_output(rank, world_size, device):
             ].contiguous()
             multiplier = softmax_scale * math.log2(math.e) if role == 0 else 1.0
             payload, scales = (
-                quantize_mxfp4_q(full, multiplier)
+                (quantize_mxfp6_q if q_codec == "mxfp6" else quantize_mxfp4_q)(
+                    full, multiplier
+                )
                 if role == 0
                 else quantize_mxfp4_k(full)
             )
@@ -591,14 +595,20 @@ def _check_v4_output(rank, world_size, device):
             for role, (expected, expected_scales, amax) in enumerate(references):
                 label = f"V4 {'QK'[role]} S={seq_len} split={split} fused={fused} rank={rank} epoch={epoch}"
                 actual_scales = scales[role].view_as(expected_scales)
-                ties, total = _assert_fused_fp6_scales(
-                    actual_scales, expected_scales, amax, label, max_value=6.0
-                )
+                if role == 0 and q_codec == "mxfp6":
+                    _assert_equal(actual_scales, expected_scales, f"{label} scales")
+                    ties, total = 0, actual_scales.numel()
+                else:
+                    ties, total = _assert_fused_fp6_scales(
+                        actual_scales, expected_scales, amax, label, max_value=6.0
+                    )
                 counts[0] += ties
                 counts[1] += total
                 same_scale = actual_scales == expected_scales
                 if role == 0:
-                    byte_mask = same_scale.repeat_interleave(16, -1).flatten()
+                    byte_mask = same_scale.repeat_interleave(
+                        24 if q_codec == "mxfp6" else 16, -1
+                    ).flatten()
                 else:
                     tiles = (seq_len * world_size + 127) // 128
                     padded = torch.zeros(
@@ -634,7 +644,7 @@ def _check_v4_output(rank, world_size, device):
         dist.all_reduce(totals)
         if rank == 0:
             print(
-                f"PASS V4 MXFP4 Q/K S={seq_len} split={split} fused={fused} epochs=3 scale-ties={totals[0].item()}/{totals[1].item()}",
+                f"PASS V4 Q={q_codec} K=mxfp4 S={seq_len} split={split} fused={fused} epochs=3 scale-ties={totals[0].item()}/{totals[1].item()}",
                 flush=True,
             )
     for name in (
@@ -905,6 +915,7 @@ def _run_rank(rank, world_size, port, v4_only=False, attention_seq=None):
             _check_v4_attention(rank, world_size, device, attention_seq)
             return
         _check_v4_output(rank, world_size, device)
+        _check_v4_output(rank, world_size, device, q_codec="mxfp6")
         _check_v4_v_output(rank, world_size, device)
         if v4_only:
             return

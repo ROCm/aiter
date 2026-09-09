@@ -119,10 +119,10 @@ class FusedA2AIntraNodeOp:
             if not self.quant or self.return_mode != "fp8":
                 raise ValueError("V4 output requires quant=True and return_mode='fp8'")
             if any(
-                mode and codec != "mxfp4"
+                mode and codec != "mxfp4" and not (mode == "q" and codec == "mxfp6")
                 for mode, codec in zip(self.v4_output, self.codecs)
             ):
-                raise ValueError("V4 output supports only MXFP4")
+                raise ValueError("V4 output supports MXFP4 Q/K/V and MXFP6 Q")
         self.split = split or os.environ.get("FUSED_A2A_SPLIT", "0") == "1"
         if self.v4_output[2] and not self.split:
             raise ValueError("V4 V output requires split=True")
