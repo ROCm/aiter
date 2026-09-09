@@ -30,7 +30,9 @@ from aiter.jit.utils.torch_guard import torch_compile_guard
 from aiter.ops.gemm_op_common import get_padded_m
 
 try:
-    from aiter.ops.opus.gemm_op_a16w16 import opus_gemm_a16w16_tune as _opus_tune
+    from aiter.ops.opus.gemm_op_a16w16 import (
+        opus_gemm_a16w16_tune as _opus_tune,
+    )
 except Exception:  # noqa: BLE001  blanket catch is intentional here
     _opus_tune = None
 
@@ -552,19 +554,38 @@ def opus_gemm(
     ), "opus_gemm does not support scaling"
     assert not bpreshuffle, "opus_gemm does not support bpreshuffle"
     splitK = int(config.get("splitK", 0)) if config is not None else 0
+    output_dtype = otype or inp.dtype
     m, _k = inp.shape
     n = weights.shape[0]
     # The split-K workspace (if any) is allocated capture-safely inside
     # opus_gemm_a16w16_tune -> _get_opus_workspace; no eager pre-warm needed.
-    Y = torch.empty(m, n, dtype=otype or inp.dtype, device=inp.device)
-    _opus_tune(
-        inp.unsqueeze(0),
-        weights.unsqueeze(0),
-        Y.unsqueeze(0),
-        bias=bias,
-        kernelId=int(solidx),
-        splitK=splitK,
-    )
+    Y = torch.empty(m, n, dtype=output_dtype, device=inp.device)
+    try:
+        _opus_tune(
+            inp.unsqueeze(0),
+            weights.unsqueeze(0),
+            Y.unsqueeze(0),
+            bias=bias,
+            kernelId=int(solidx),
+            splitK=splitK,
+        )
+    except RuntimeError as error:
+        message = str(error)
+        if not (
+            "Kernel id " in message
+            and "a16w16" in message
+            and "tune lookup table" in message
+        ):
+            raise
+        logger.warning(
+            "opus tuned config selected kernel %d, but it is absent from the "
+            "loaded module; falling back to torch",
+            solidx,
+        )
+        fallback = torch_gemm(inp, weights, solidx)
+        if bias is not None:
+            fallback = fallback.to(bias.dtype) + bias
+        return fallback.to(output_dtype)
     # NOTE: do NOT add bias again here -- the opus splitk reduce kernel already
     # folds `bias` into the fp32 accumulator before the bf16/fp32 cast (HAS_BIAS
     # path). The previous `Y = Y + bias` double-counted bias (output = A@B^T +
