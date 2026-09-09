@@ -1522,6 +1522,55 @@ def test_mha_v4_raw_mxfp4_v_supports_unaligned_sequence(q_format):
 
     assert torch.equal(eager, compiled)
     assert torch.isfinite(compiled).all()
+    # Determinism and finiteness alone pass on a wrong-but-stable result, so pin the value too.
+    assert _cosine_against_attention(eager, q, k, v) > _MX_UNALIGNED_COSINE
+
+
+def _cosine_against_attention(actual, q, k, v):
+    """Cosine of a BSHD MHA v4 result against full-precision attention."""
+    reference = torch.nn.functional.scaled_dot_product_attention(
+        q.transpose(1, 2).float(),
+        k.transpose(1, 2).float(),
+        v.transpose(1, 2).float(),
+    ).transpose(1, 2)
+    return torch.nn.functional.cosine_similarity(
+        actual.float().flatten(), reference.flatten(), dim=0
+    ).item()
+
+
+# Loose enough to absorb MXFP4 quantization error, which costs about 0.02 on its own at a
+# tile-aligned length, and tight enough that a mishandled partial tile cannot hide.
+_MX_UNALIGNED_COSINE = 0.95
+
+_MX_V_RECIPES = [
+    pytest.param(native_fp8_format(), AttentionFormat.MXFP6, id="f8f6"),
+    pytest.param(AttentionFormat.MXFP6, AttentionFormat.MXFP6, id="mxfp6"),
+    pytest.param(AttentionFormat.MXFP6, AttentionFormat.MXFP4, id="f6f4"),
+    pytest.param(AttentionFormat.MXFP4, AttentionFormat.MXFP4, id="f4f4"),
+]
+
+
+@pytest.mark.skipif(get_gfx() != "gfx950", reason="gfx950 MX V validation")
+@pytest.mark.parametrize(("qk_format", "v_format"), _MX_V_RECIPES)
+@pytest.mark.parametrize("tail", [1, 8, 32, 64, 96, 127])
+def test_mha_v4_mx_v_partial_kv_tile_matches_attention(qk_format, v_format, tail):
+    """Every MX V recipe must stay correct when the last KV tile is partly filled.
+
+    The KV length is one full 128-token tile plus `tail`, so the only thing varying is
+    partial-tile occupancy. Recipes with a per-tensor FP8 V are flat across `tail`, so any
+    dependence here belongs to the MX V path.
+    """
+    sequence = 128 + tail
+    torch.manual_seed(1234)
+    q = torch.randn((1, sequence, 5, 128), device="cuda", dtype=torch.bfloat16)
+    k = torch.randn_like(q)
+    v = torch.randn_like(q)
+
+    actual = mha_v4(q, k, v, qk_format, qk_format, v_format)
+    torch.cuda.synchronize()
+
+    assert torch.isfinite(actual).all()
+    assert _cosine_against_attention(actual, q, k, v) > _MX_UNALIGNED_COSINE
 
 
 def _mha_v4_sparse_co_available() -> bool:
