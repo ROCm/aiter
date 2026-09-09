@@ -32,10 +32,25 @@ def load_picker():
     The picker is the thing that knows which amd-smi to import and how to read activity without
     reporting an unavailable value as an idle one. Borrowing it keeps one implementation of that
     judgement rather than a second copy here that could drift away from it.
+
+    The import writes no bytecode. This skill ships inside the repository it validates, so a
+    ``__pycache__/pick-idle-gpu.pyc`` written beside this file lands in the worktree under test
+    -- and the baseline phase counts an ignored artifact as a dirty tree, so that one file skips
+    merge simulation and every stage downstream of it. The validator would be failing the PR for
+    a mess the validator made. Every python the shell launches carries
+    ``PYTHONDONTWRITEBYTECODE=1`` for this reason; this import is not one the shell launches, so
+    it holds the guarantee itself rather than trusting whatever environment it was called in.
     """
-    spec = importlib.util.spec_from_file_location("validation_gpu_picker", PICKER_PATH)
-    picker = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(picker)
+    previous = sys.dont_write_bytecode
+    sys.dont_write_bytecode = True
+    try:
+        spec = importlib.util.spec_from_file_location(
+            "validation_gpu_picker", PICKER_PATH
+        )
+        picker = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(picker)
+    finally:
+        sys.dont_write_bytecode = previous
     return picker
 
 

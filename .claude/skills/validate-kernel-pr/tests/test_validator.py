@@ -3521,6 +3521,30 @@ class GpuProbeTests(unittest.TestCase):
         self.assertTrue(hasattr(picker, "read_activity"))
         self.assertTrue(hasattr(picker, "import_amdsmi"))
 
+    def test_borrowing_the_picker_leaves_no_artifact_beside_it(self):
+        # The skill ships inside the repository it validates, so bytecode written next to the
+        # picker is bytecode written into the worktree under test -- and stage 1 reads an
+        # ignored artifact as a dirty tree, which skips merge simulation and every stage after
+        # it. This is the one import the shell does not launch, so PYTHONDONTWRITEBYTECODE on
+        # the command line cannot cover it; the guarantee has to live in load_picker itself.
+        tempdir = tempfile.TemporaryDirectory()
+        self.addCleanup(tempdir.cleanup)
+        elsewhere = Path(tempdir.name) / "pick-idle-gpu.py"
+        shutil.copy(self.probe.PICKER_PATH, elsewhere)
+        self.addCleanup(setattr, self.probe, "PICKER_PATH", self.probe.PICKER_PATH)
+        self.probe.PICKER_PATH = elsewhere
+        # Without this the test would pass for the wrong reason under an interpreter already
+        # started with -B, which is exactly the workaround this pins the fix in place of.
+        self.addCleanup(setattr, sys, "dont_write_bytecode", sys.dont_write_bytecode)
+        sys.dont_write_bytecode = False
+
+        self.probe.load_picker()
+
+        self.assertEqual([], list(Path(tempdir.name).glob("__pycache__/*")))
+        self.assertFalse(
+            sys.dont_write_bytecode, "the flag was left flipped for the process"
+        )
+
 
 class TargetRunTests(unittest.TestCase):
     """The decisions around one target run, which used to live inside bash heredocs.
