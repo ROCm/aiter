@@ -2719,18 +2719,14 @@ def get_2stage_cfgs(
             )
         elif _disable_inline_sort and _is_inline_sort_cfg(kn1, kn2):
             cfg = None
-            logger.warning(
-                "[fused_moe] discarding tuned inline-sort config; "
-                "using default heuristics"
-            )
+            logger.warning("[fused_moe] discarding tuned inline-sort config")
         elif _is_inline_sort_cfg(kn1, kn2) and (is_ep or has_stage2_bias):
             cfg = None
             unsupported = "expert_mask" if is_ep else "bias2"
             if is_ep and has_stage2_bias:
                 unsupported = "expert_mask and bias2"
             logger.warning(
-                f"[fused_moe] discarding tuned inline-sort config with {unsupported}; "
-                "using default heuristics"
+                f"[fused_moe] discarding tuned inline-sort config with {unsupported}"
             )
         elif _is_inline_sort_cfg(kn1, kn2):
             inline_metadata = _make_mxfp4_metadata(
@@ -2746,7 +2742,7 @@ def get_2stage_cfgs(
                 _disable_inline_sort = True
                 logger.warning(
                     "[fused_moe] discarding tuned inline-sort config with "
-                    "incomplete metadata; using default heuristics"
+                    "incomplete metadata"
                 )
 
     if cfg is not None:
@@ -2768,11 +2764,7 @@ def get_2stage_cfgs(
                 )
 
     bypass_tuned_config = int(os.environ.get("AITER_BYPASS_TUNE_CONFIG", "0"))
-    if (
-        config_file is not None
-        and (cfg is None or bypass_tuned_config)
-        and not _disable_inline_sort
-    ):
+    if config_file is not None and (cfg is None or bypass_tuned_config):
         raise NotImplementedError(
             "The dedicated FHMoE path requires an exact tuned config row for "
             f"{keys} in {tune_file}"
