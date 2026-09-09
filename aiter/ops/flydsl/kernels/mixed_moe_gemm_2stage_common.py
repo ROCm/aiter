@@ -5131,7 +5131,7 @@ def compile_mixed_moe_gemm2_common(
                 else:
                     moe_gemm2_then_body()
 
-            def _persist_setup(mi_p, still_active, prev_expert_i32, prev_expert_b_base):
+            def _persist_setup(mi_p, prev_expert_i32=None, prev_expert_b_base=None):
                 nonlocal bx, bx_m, bx_m_i32, blk_valid, sort_blk
                 nonlocal expert_i32, expert_idx, exp_valid, is_shared_expert
                 nonlocal expert_b_base, first_tok, first_tid, tile_has_tokens
@@ -5178,64 +5178,40 @@ def compile_mixed_moe_gemm2_common(
                 else:
                     m_scale_shift_i32 = None
 
+            # The persistent variant carries "still active"; the other carries the
+            # previous expert and its B base, to rebase by the expert delta.
             if const_expr(persistent):
+                loop_end, loop_init = tiles_per_block, [init_active]
+            else:
+                loop_end, loop_init = c_pm, [init_prev_expert, init_prev_b_base]
 
-                def _persist_iter(mi_p, still_active):
-                    _persist_setup(mi_p, still_active, None, None)
-                    cur_active = arith.andi(still_active, blk_valid)
-                    do_gemm = arith.andi(
+            def _persist_iter(mi_p, state):
+                _persist_setup(mi_p, *([] if persistent else [state[0], state[1]]))
+                if const_expr(persistent):
+                    cur_active = arith.andi(state[0], blk_valid)
+                    guard = arith.andi(
                         cur_active, arith.andi(exp_valid, tile_has_tokens)
                     )
-
-                    @flyc.jit
-                    def _gemm2_valid_dispatch():
-                        if fx.Boolean(do_gemm):
-                            emit_moe_gemm2_body()
-
-                    _gemm2_valid_dispatch()
-                    gpu.barrier()
-                    return cur_active
-
-                @flyc.jit
-                def _run_persist():
-                    for mi_p, state in range(
-                        c0_p, tiles_per_block, c1_p, init=[init_active]
-                    ):
-                        cur_active = _persist_iter(mi_p, state[0])
-                        yield [cur_active]
-
-                _run_persist()
-            else:
-
-                def _persist_iter(mi_p, prev_expert_i32, prev_expert_b_base):
-                    _persist_setup(mi_p, None, prev_expert_i32, prev_expert_b_base)
-                    all_valid = arith.andi(
+                else:
+                    guard = arith.andi(
                         blk_valid, arith.andi(exp_valid, tile_has_tokens)
                     )
 
-                    @flyc.jit
-                    def _gemm2_valid_dispatch():
-                        if fx.Boolean(all_valid):
-                            emit_moe_gemm2_body()
-
-                    _gemm2_valid_dispatch()
-                    gpu.barrier()
-                    return expert_i32, expert_b_base
-
                 @flyc.jit
-                def _run_persist():
-                    for mi_p, state in range(
-                        c0_p,
-                        c_pm,
-                        c1_p,
-                        init=[init_prev_expert, init_prev_b_base],
-                    ):
-                        nxt_expert_i32, nxt_expert_b_base = _persist_iter(
-                            mi_p, state[0], state[1]
-                        )
-                        yield [nxt_expert_i32, nxt_expert_b_base]
+                def _gemm2_valid_dispatch():
+                    if fx.Boolean(guard):
+                        emit_moe_gemm2_body()
 
-                _run_persist()
+                _gemm2_valid_dispatch()
+                gpu.barrier()
+                return [cur_active] if persistent else [expert_i32, expert_b_base]
+
+            @flyc.jit
+            def _run_persist():
+                for mi_p, state in range(c0_p, loop_end, c1_p, init=loop_init):
+                    yield _persist_iter(mi_p, state)
+
+            _run_persist()
 
     if heterogeneous_b:
 
