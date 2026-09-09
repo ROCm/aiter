@@ -36,6 +36,8 @@ _SUPPORTED_TOK_DTYPES = (
 )
 
 _SUPPORTED_QUANT_TYPES = ("none", "fp8_direct_cast")
+# "fp8_blockwise_1x32" is what the gfx1250 path calls combine_quant="mxfp8"
+# (mega_moe_gfx1250/mega_moe.py).
 _SUPPORTED_STAGE2_P2P_QUANT_TYPES = ("none", "fp8_blockwise_1x32")
 
 _MAX_INTRANODE_NPES = 8

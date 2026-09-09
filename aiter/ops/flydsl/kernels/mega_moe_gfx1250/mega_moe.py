@@ -14,9 +14,18 @@ from aiter.fused_moe import fused_moe
 from aiter.jit.utils.chip_info import get_gfx
 from aiter.ops.flydsl.moe_common import GateMode
 
-from .combine import _make_combine_fused_reduce, _make_combine_fused_sync
+from .combine import (
+    CHUNK_ELEMS as _COMBINE_CHUNK_ELEMS,
+)
+from .combine import (
+    COMBINE_LDS_BUDGET,
+    _make_combine_fused_reduce,
+    _make_combine_fused_sync,
+    combine_reduce_lds_bytes,
+)
 from .config import _WAVE_SIZE, _select_dispatch_config
 from .dispatch import _make_dispatch
+from .types import COMBINE_SCALE_BLOCK as _COMBINE_SCALE_BLOCK
 from .types import Stage2ScatterContext, _from_gpu_ptr
 
 __all__ = ["MegaMoEGfx1250"]
@@ -25,27 +34,63 @@ _DISPATCH_BACKENDS = ("flydsl", "mori")
 _MAX_WORLD_SIZE = 72
 _MAX_EXPERTS_PER_RANK = 512
 
+# "mxfp8" is what the mega_moe v2 path calls "fp8_blockwise_1x32" (kernels/
+# flydsl_dispatch_combine_intranode_op.py); that path has no fp4.
 _COMBINE_QUANT_MODES = ("none", "mxfp8", "mxfp4")
-# MX combine wire, kept in sync with the gemm2 scatter epilogue and the combine
-# reduce kernel: a slot is a payload plane of hidden fp8 bytes -- or half that
-# many fp4 bytes -- followed by a scale plane of hidden/32 e8m0 bytes. 256 is
-# the reduce's lane-tile unit, not a wire structure.
-_COMBINE_CHUNK_ELEMS = 256
-_COMBINE_SCALE_BLOCK = 32
-# Lane tile for the TDM combine: T tokens x C chunks per block iteration, which
-# the reduce turns into T*C*256/16 lanes -- so the quantized path runs a wider
-# block than the bf16 one. On the bf16 wire C=1 is enough and T only sets the
-# tile height.
+# Preferred lane tile for the TDM combine: T tokens x C chunks per block
+# iteration, which the reduce turns into T*C*256/16 lanes -- so the quantized
+# path runs a wider block than the bf16 one. A ceiling, not the answer:
+# `_combine_tile` walks these down until the tile fits a given topk.
 _COMBINE_TOKENS_PER_BLOCK = 16
 _COMBINE_CHUNKS_PER_ITER = 1
 # The MXFP8 wire wants a larger C: its scale plane puts only C*8 bytes in a TDM
 # row, so a small C makes that load pull a whole cache line per row for a
-# handful of bytes. C must divide the chunk count, and -- conservatively, as how
-# a TDM copy splits rows over its warps is not visible from here -- also divide
-# 4*topk, so the tile's T*topk rows spread evenly over its T*C/4 warps. T then
-# takes the tile as high as the reduce's 160KB LDS budget allows.
+# handful of bytes.
 _COMBINE_QUANT_TOKENS_PER_BLOCK = 8
 _COMBINE_QUANT_CHUNKS_PER_ITER = 4
+
+
+def _combine_tile(*, topk, hidden_dim, quant_bits):
+    """(tokens_per_block, chunks_per_iter) for the reduce, widest that fits.
+
+    C has to divide the hidden chunk count, since the reduce has no tail path
+    along hidden, and 2*topk, so the tile's T*topk rows spread evenly over the
+    block's T*C/2 warps.
+
+    T then takes the tile as high as the LDS budget allows, since trips per block
+    is what keeps the prefetch pipeline fed. LDS grows as T*topk, so a large topk
+    trades height away: topk=8 on the mxfp8 wire needs 164KB at the preferred
+    T=8 and lands on T=7.
+    """
+    n_chunks = hidden_dim // _COMBINE_CHUNK_ELEMS
+    max_chunks, max_toks = (
+        (_COMBINE_QUANT_CHUNKS_PER_ITER, _COMBINE_QUANT_TOKENS_PER_BLOCK)
+        if quant_bits
+        else (_COMBINE_CHUNKS_PER_ITER, _COMBINE_TOKENS_PER_BLOCK)
+    )
+    for chunks in range(max_chunks, 0, -1):
+        if n_chunks % chunks or (2 * topk) % chunks:
+            continue
+        for toks in range(max_toks, 0, -1):
+            lanes = toks * chunks * _COMBINE_CHUNK_ELEMS // 16
+            if lanes % _WAVE_SIZE:
+                continue
+            if (
+                combine_reduce_lds_bytes(
+                    experts_per_token=topk,
+                    quant_bits=quant_bits,
+                    tokens_per_block=toks,
+                    chunks_per_iter=chunks,
+                )
+                <= COMBINE_LDS_BUDGET
+            ):
+                return toks, chunks
+    raise ValueError(
+        f"no combine reduce tile fits the {COMBINE_LDS_BUDGET // 1024}KB LDS "
+        f"budget for topk={topk}, hidden_dim={hidden_dim}, "
+        f"combine_quant_bits={quant_bits}"
+    )
+
 
 # mori's C++ EpArgs offset stems -> this package's arena region names. All eight
 # are bound when a plan is built even though mori's dispatch dereferences only the
@@ -235,9 +280,12 @@ class MegaMoEConfig:
                 f"combine_quant must be one of {_COMBINE_QUANT_MODES}, "
                 f"got {self.combine_quant!r}"
             )
-        if self.combine_quant != "none" and self.hidden_dim % _COMBINE_CHUNK_ELEMS:
+        # Every wire, not just the quantized ones: the reduce tiles hidden in
+        # whole chunks and has no tail path.
+        if self.hidden_dim % _COMBINE_CHUNK_ELEMS:
             raise ValueError(
-                f"combine_quant={self.combine_quant!r} requires hidden_dim % "
+                f"the combine reduce tiles hidden in {_COMBINE_CHUNK_ELEMS}-"
+                f"element chunks with no tail path, so it needs hidden_dim % "
                 f"{_COMBINE_CHUNK_ELEMS} == 0, got {self.hidden_dim}"
             )
         if self.dispatch_backend not in _DISPATCH_BACKENDS:
@@ -689,14 +737,6 @@ class MegaMoEGfx1250:
             ],
         )
         self._arena.zero()
-        if os.environ.get("MEGA_DEBUG_POISON_COMB_INP", "0") == "1":
-            # Diagnostic: 0xFF bytes read back as bf16 NaN, so any comb_inp slot
-            # the scatter never writes shows up as NaN in the combine output.
-            _from_gpu_ptr(
-                self._arena.local_ptr("comb_inp"),
-                (self._arena._sizes["comb_inp"],),
-                torch.int8,
-            ).fill_(-1)
 
         self._token_destination_map = torch.full(
             (config.max_tokens_per_rank * config.topk,),
@@ -763,12 +803,11 @@ class MegaMoEGfx1250:
         # Keep the cross-device barrier in its own 1-block kernel so the reduce
         # grid is unconstrained. Both wires stage through LDS, so the block is
         # sized to the lane tile (T*C*256/16 lanes).
-        if config.combine_quant_bits:
-            _comb_toks = _COMBINE_QUANT_TOKENS_PER_BLOCK
-            _comb_chunks = _COMBINE_QUANT_CHUNKS_PER_ITER
-        else:
-            _comb_toks = _COMBINE_TOKENS_PER_BLOCK
-            _comb_chunks = _COMBINE_CHUNKS_PER_ITER
+        _comb_toks, _comb_chunks = _combine_tile(
+            topk=config.topk,
+            hidden_dim=config.hidden_dim,
+            quant_bits=config.combine_quant_bits,
+        )
         _lanes = _comb_toks * _comb_chunks * _COMBINE_CHUNK_ELEMS // 16
         combine_specs = [(512, _lanes // _WAVE_SIZE)]
         self._combine_specs = combine_specs
@@ -1021,11 +1060,6 @@ class MegaMoEGfx1250:
             self._config.rank,
             stream,
         )
-        _delay = int(os.environ.get("MEGA_DEBUG_COMBINE_DELAY", "0"))
-        if _delay:
-            # Diagnostic: graph-capturable GPU-side spin between the barrier and
-            # the reduce, to see whether in-flight P2P writes are the race.
-            torch.cuda._sleep(_delay)
         self._combine_variants[spec](
             self._arena.local_ptr("comb_inp"),
             self._combine_output.data_ptr(),

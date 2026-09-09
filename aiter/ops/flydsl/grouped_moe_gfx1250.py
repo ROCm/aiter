@@ -169,7 +169,9 @@ def _find_grouped_config(
     if not matches:
         matches = [row for row in rows if _matches(row, require_cu_num=False)]
     # A row that names ep_fused explicitly was tuned for that path, so it wins
-    # over an otherwise equal row that serves both.
+    # over an otherwise equal row that serves both. These are hand-picked, not
+    # tuned: measuring the fused path needs a live multi-rank arena for gemm2's
+    # scatter epilogue, which the single-GPU bench cannot stand up.
     ep_specific = [row for row in matches if _cell(row, "ep_fused")]
     if ep_specific:
         matches = ep_specific
@@ -186,7 +188,17 @@ def _find_grouped_config(
                 flush=True,
             )
         return None
-    matches.sort(key=lambda r: float(r.get("us") or 0.0))
+
+    # Unmeasured rows sort last: a hand-written row's blank or 0 `us` reads as
+    # infinitely fast and would beat every real measurement for the same shape.
+    def _by_measured_us(row):
+        try:
+            us = float(_cell(row, "us") or 0.0)
+        except ValueError:
+            us = 0.0
+        return (us <= 0.0, us)
+
+    matches.sort(key=_by_measured_us)
     return matches[0]
 
 
