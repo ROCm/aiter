@@ -24,7 +24,7 @@ from .communication_ops_utils import (
 )
 from .quant_utils import emit_f32_to_e2m1, emit_f32_to_e2m3, emit_mx_e8m0_scale
 
-_JIT_SCHEMA_VERSION = "v22-v4-mxfp6-q"
+_JIT_SCHEMA_VERSION = "v23-v4-mxfp6-qk"
 _TRANSPORT_CHUNK_BYTES = 16
 _PUSH_PIPELINE_DEPTH = 16
 _OUT_CHANNEL_DEPTH = 1
@@ -123,6 +123,36 @@ def _store_v4_fp6_q(words, resource, offset, lane):
     if lane % 4 < 2:
         for i in range_constexpr(3):
             buffer_store(words[i], resource, offset + i)
+
+
+@flyc.jit
+def _store_v4_fp6_k(words, scale, resource, tile_word, seq, lane):
+    group = lane % 16 // 4
+    token = seq % 128
+    if lane % 4 < 2:
+        for i in range_constexpr(3):
+            word = lane % 2 * 3 + i
+            offset = (word < 4).select(
+                token // 32 * 512 + group * 128 + token % 32 * 4 + word,
+                2048 + token // 32 * 256 + group * 64 + token % 32 * 2 + word - 4,
+            )
+            buffer_store(words[i], resource, tile_word + offset)
+    if lane % 4 == 0:
+        scale_slot = token % 32 // 16 * 256 + (token % 16 * 4 + token // 32) * 4
+        buffer_store(scale, resource, tile_word * 4 + 16384 + scale_slot + group)
+        if group > 0:
+            buffer_store(
+                scale, resource, tile_word * 4 + 16896 + scale_slot + group - 1
+            )
+        elif seq > 0:
+            previous = (token + 127) % 128
+            previous_slot = (
+                previous % 32 // 16 * 256 + (previous % 16 * 4 + previous // 32) * 4
+            )
+            previous_tile = tile_word * 4 - (token == 0).select(
+                fx.Int32(17408), fx.Int32(0)
+            )
+            buffer_store(scale, resource, previous_tile + 16896 + previous_slot + 3)
 
 
 def _pack_v4_v_pair(first, second):
@@ -267,6 +297,8 @@ def make_fused_a2a_kernel(
     k_tiles = (seq_full + 127) // 128
 
     def v4_word_offset(head, seq, chunk, mode, codec):
+        if codec == "mxfp6" and mode == "k":
+            return (head * k_tiles + seq // 128) * 4352
         if codec == "mxfp6":
             return (seq * heads_local + head) * 24 + (chunk // 4) * 6 + (chunk % 2) * 3
         if mode == "k":
@@ -523,7 +555,14 @@ def make_fused_a2a_kernel(
                                     if mode
                                     else dst_row * row_nbytes
                                 )
-                                dst_addr = fx.Uint64(peer_base + fx.Int64(dst_byte))
+                                dst_addr = fx.Uint64(
+                                    peer_base
+                                    + fx.Int64(
+                                        0
+                                        if mode == "k" and codec == "mxfp6"
+                                        else dst_byte
+                                    )
+                                )
                                 dst_addr_lo = readfirstlane(T.i32, fx.Uint32(dst_addr))
                                 dst_addr_hi = readfirstlane(
                                     T.i32, fx.Uint32(dst_addr >> 32)
@@ -534,10 +573,21 @@ def make_fused_a2a_kernel(
                                 rsrc_dst = create_buffer_resource_from_addr(
                                     uniform_dst_addr,
                                     num_records_bytes=(
-                                        6160 if mode == "k" else row_nbytes
+                                        heads_local * k_tiles * 17408
+                                        if mode == "k" and codec == "mxfp6"
+                                        else 6160 if mode == "k" else row_nbytes
                                     ),
                                 )
-                                if const_expr(mode and codec == "mxfp6"):
+                                if const_expr(mode == "k" and codec == "mxfp6"):
+                                    _store_v4_fp6_k(
+                                        outputs[batch_idx],
+                                        scales[batch_idx],
+                                        rsrc_dst,
+                                        dst_byte // 4,
+                                        rank * seq_len + seq,
+                                        lane_in_group,
+                                    )
+                                elif const_expr(mode and codec == "mxfp6"):
                                     _store_v4_fp6_q(
                                         outputs[batch_idx],
                                         rsrc_dst,
@@ -615,7 +665,7 @@ def make_fused_a2a_kernel(
             rsrc_dst = create_buffer_resource_from_addr(
                 uniform_peer_base,
                 num_records_bytes=(
-                    heads_local * k_tiles * 8192
+                    heads_local * k_tiles * (17408 if codec == "mxfp6" else 8192)
                     if mode == "k"
                     else total_chunks * wire_bytes
                 ),
@@ -721,7 +771,16 @@ def make_fused_a2a_kernel(
                     valid_values.append(valid)
                 for batch_idx in range_constexpr(_PUSH_PIPELINE_DEPTH):
                     if valid_values[batch_idx]:
-                        if const_expr(mode and codec == "mxfp6"):
+                        if const_expr(mode == "k" and codec == "mxfp6"):
+                            _store_v4_fp6_k(
+                                values[batch_idx],
+                                scales[batch_idx],
+                                rsrc_dst,
+                                destinations[batch_idx],
+                                scale_destinations[batch_idx] // (heads_local * 4),
+                                lane,
+                            )
+                        elif const_expr(mode and codec == "mxfp6"):
                             _store_v4_fp6_q(
                                 values[batch_idx],
                                 rsrc_dst,

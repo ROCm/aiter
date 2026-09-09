@@ -195,7 +195,9 @@ def _sequence_major_input(rank, heads, seq_len, head_dim, device):
     )
 
 
-def _norm_rope(input_tensor, weight, cos, sin, dtype=torch.bfloat16):
+def _norm_rope(
+    input_tensor, weight, cos, sin, dtype=torch.bfloat16, fused_rounding=False
+):
     heads, head_dim = input_tensor.shape[-2:]
     norm = torch.nn.RMSNorm(
         heads * head_dim,
@@ -206,11 +208,28 @@ def _norm_rope(input_tensor, weight, cos, sin, dtype=torch.bfloat16):
     )
     norm.weight.data.copy_(weight.float())
     values = norm(input_tensor.flatten(-2).float()).view_as(input_tensor.float())
+    if fused_rounding:
+        source = input_tensor.float()
+        reciprocal = torch.rsqrt(
+            source.flatten(-2).square().mean(-1, keepdim=True) + 1.0e-6
+        )
+        values = (
+            source * reciprocal.unsqueeze(-1) * weight.float().view(heads, head_dim)
+        )
     even = values[..., 0::2]
     odd = values[..., 1::2]
     output = torch.empty_like(values)
-    output[..., 0::2] = even * cos[..., 0::2] - odd * sin[..., 1::2]
-    output[..., 1::2] = even * sin[..., 1::2] + odd * cos[..., 0::2]
+    if fused_rounding:
+        # Emulate the device RoPE FMA's single FP32 rounding before the BF16 boundary.
+        output[..., 0::2] = (
+            even.double() * cos[..., 0::2].double() - (odd * sin[..., 1::2]).double()
+        )
+        output[..., 1::2] = (
+            even.double() * sin[..., 1::2].double() + (odd * cos[..., 0::2]).double()
+        )
+    else:
+        output[..., 0::2] = even * cos[..., 0::2] - odd * sin[..., 1::2]
+        output[..., 1::2] = even * sin[..., 1::2] + odd * cos[..., 0::2]
     return output.to(dtype)
 
 
@@ -514,8 +533,51 @@ def _check_hadamard_transport(rank, world_size, device, a2a_references):
         os.environ.pop(f"FUSED_A2A_CODEC_{role}", None)
 
 
-def _check_v4_output(rank, world_size, device, q_codec="mxfp4"):
-    from aiter.ops.mha_v4 import quantize_mxfp4_k, quantize_mxfp4_q, quantize_mxfp6_q
+def _check_v4_fp6_k_bytes(actual, expected, scales, label):
+    _, sequence, heads, _ = scales.shape
+    tiles = (sequence + 127) // 128
+    device = actual.device
+    s = torch.arange(sequence, device=device).view(-1, 1, 1, 1)
+    h = torch.arange(heads, device=device).view(1, -1, 1, 1)
+    g = torch.arange(4, device=device).view(1, 1, -1, 1)
+    d = torch.arange(24, device=device).view(1, 1, 1, -1)
+    base = (h * tiles + s // 128) * 17408
+    offsets = base + torch.where(
+        d < 16,
+        s % 128 // 32 * 2048 + g * 512 + s % 32 * 16 + d,
+        8192 + s % 128 // 32 * 1024 + g * 256 + s % 32 * 8 + d - 16,
+    )
+    valid = torch.zeros_like(actual, dtype=torch.bool)
+    valid[offsets.flatten()] = True
+    _assert_equal(actual[offsets], expected[offsets], f"{label} payload")
+    slot = s % 32 // 16 * 256 + (s % 16 * 4 + s % 128 // 32) * 4
+    a = (base + 16384 + slot + g).squeeze(-1)
+    b = a + 512
+    logical = scales[0]
+    shifted = torch.zeros_like(logical)
+    shifted[..., :3] = logical[..., 1:]
+    shifted[:-1, :, 3] = logical[1:, :, 0]
+    for offsets, values, region in ((a, logical, "A"), (b, shifted, "B")):
+        valid[offsets.flatten()] = True
+        _assert_equal(actual[offsets], values, f"{label} tail {region} mapping")
+        _assert_equal(
+            actual[offsets], expected[offsets], f"{label} tail {region} packer"
+        )
+    _assert_equal(
+        actual[~valid],
+        torch.zeros_like(actual[~valid]),
+        f"{label} reserved/padding/slack",
+    )
+
+
+def _check_v4_output(rank, world_size, device, q_codec="mxfp4", k_codec="mxfp4"):
+    from aiter.ops.mha_v4 import (
+        mxfp6_k_view,
+        quantize_mxfp4_k,
+        quantize_mxfp4_q,
+        quantize_mxfp6_k,
+        quantize_mxfp6_q,
+    )
 
     # Partial tiles, exact tiles, and a rank boundary inside a second K tile.
     cases = ((17, False, False), (32, True, False), (33, False, True), (17, True, True))
@@ -525,7 +587,7 @@ def _check_v4_output(rank, world_size, device, q_codec="mxfp4"):
     os.environ["FUSED_A2A_HADAMARD"] = "0"
     for role in "QKV":
         os.environ[f"FUSED_A2A_CODEC_{role}"] = (
-            q_codec if role == "Q" else "mxfp4" if role == "K" else "e4m3"
+            q_codec if role == "Q" else k_codec if role == "K" else "e4m3"
         )
     for seq_len, split, fused in cases:
         softmax_scale = 0.125 if split else head_dim**-0.5
@@ -549,7 +611,17 @@ def _check_v4_output(rank, world_size, device, q_codec="mxfp4"):
         cos = angles.cos().expand(1, seq_len, 1, head_dim).contiguous()
         sin = angles.sin().expand_as(cos).contiguous()
         transformed = [
-            _norm_rope(value, weight, cos, sin) if fused else value
+            (
+                _norm_rope(
+                    value,
+                    weight,
+                    cos,
+                    sin,
+                    fused_rounding=(q_codec == "mxfp6" or k_codec == "mxfp6"),
+                )
+                if fused
+                else value
+            )
             for value, weight in zip(inputs[:2], (norm_q, norm_k))
         ]
         references = []
@@ -565,8 +637,14 @@ def _check_v4_output(rank, world_size, device, q_codec="mxfp4"):
                     full, multiplier
                 )
                 if role == 0
-                else quantize_mxfp4_k(full)
+                else (quantize_mxfp6_k if k_codec == "mxfp6" else quantize_mxfp4_k)(
+                    full
+                )
             )
+            if role == 1 and k_codec == "mxfp6":
+                _, scales = mxfp6_k_view(
+                    payload, scales, 1, seq_len * world_size, local_heads
+                )
             rotated = (
                 (full.float() @ _hadamard_matrix(128, device)) * 128**-0.5 * multiplier
             )
@@ -594,8 +672,10 @@ def _check_v4_output(rank, world_size, device, q_codec="mxfp4"):
             torch.cuda.synchronize()
             for role, (expected, expected_scales, amax) in enumerate(references):
                 label = f"V4 {'QK'[role]} S={seq_len} split={split} fused={fused} rank={rank} epoch={epoch}"
-                actual_scales = scales[role].view_as(expected_scales)
-                if role == 0 and q_codec == "mxfp6":
+                actual_scales = scales[role][: expected_scales.numel()].view_as(
+                    expected_scales
+                )
+                if (q_codec if role == 0 else k_codec) == "mxfp6":
                     _assert_equal(actual_scales, expected_scales, f"{label} scales")
                     ties, total = 0, actual_scales.numel()
                 else:
@@ -605,6 +685,16 @@ def _check_v4_output(rank, world_size, device, q_codec="mxfp4"):
                 counts[0] += ties
                 counts[1] += total
                 same_scale = actual_scales == expected_scales
+                if role == 1 and k_codec == "mxfp6":
+                    assert payloads[role].numel() == expected.numel(), label
+                    _check_v4_fp6_k_bytes(
+                        payloads[role], expected, expected_scales, label
+                    )
+                    slack = scales[role][expected_scales.numel() :]
+                    _assert_equal(
+                        slack, torch.zeros_like(slack), f"{label} scale slack"
+                    )
+                    continue
                 if role == 0:
                     byte_mask = same_scale.repeat_interleave(
                         24 if q_codec == "mxfp6" else 16, -1
@@ -644,7 +734,7 @@ def _check_v4_output(rank, world_size, device, q_codec="mxfp4"):
         dist.all_reduce(totals)
         if rank == 0:
             print(
-                f"PASS V4 Q={q_codec} K=mxfp4 S={seq_len} split={split} fused={fused} epochs=3 scale-ties={totals[0].item()}/{totals[1].item()}",
+                f"PASS V4 Q={q_codec} K={k_codec} S={seq_len} split={split} fused={fused} epochs=3 scale-ties={totals[0].item()}/{totals[1].item()}",
                 flush=True,
             )
     for name in (
@@ -915,7 +1005,7 @@ def _run_rank(rank, world_size, port, v4_only=False, attention_seq=None):
             _check_v4_attention(rank, world_size, device, attention_seq)
             return
         _check_v4_output(rank, world_size, device)
-        _check_v4_output(rank, world_size, device, q_codec="mxfp6")
+        _check_v4_output(rank, world_size, device, q_codec="mxfp6", k_codec="mxfp6")
         _check_v4_v_output(rank, world_size, device)
         if v4_only:
             return

@@ -119,10 +119,12 @@ class FusedA2AIntraNodeOp:
             if not self.quant or self.return_mode != "fp8":
                 raise ValueError("V4 output requires quant=True and return_mode='fp8'")
             if any(
-                mode and codec != "mxfp4" and not (mode == "q" and codec == "mxfp6")
+                mode
+                and codec != "mxfp4"
+                and not (mode in ("q", "k") and codec == "mxfp6")
                 for mode, codec in zip(self.v4_output, self.codecs)
             ):
-                raise ValueError("V4 output supports MXFP4 Q/K/V and MXFP6 Q")
+                raise ValueError("V4 output supports MXFP4 Q/K/V and MXFP6 Q/K")
         self.split = split or os.environ.get("FUSED_A2A_SPLIT", "0") == "1"
         if self.v4_output[2] and not self.split:
             raise ValueError("V4 V output requires split=True")
@@ -178,8 +180,14 @@ class FusedA2AIntraNodeOp:
         self.peer_numel = numel // world_size
         payload_sizes = tuple(
             (
-                (shape[2] // world_size) * ((shape[1] * world_size + 127) // 128) * 8192
-                + (64 if mode == "v" else 0)
+                (shape[2] // world_size)
+                * ((shape[1] * world_size + 127) // 128)
+                * (17408 if mode == "k" and codec == "mxfp6" else 8192)
+                + (
+                    256
+                    if mode == "k" and codec == "mxfp6"
+                    else 64 if mode == "v" else 0
+                )
                 if mode in ("k", "v")
                 else (_transport_bytes(numel, codec) if self.quant else numel)
             )
@@ -203,11 +211,12 @@ class FusedA2AIntraNodeOp:
                             * 512
                             if mode == "v"
                             else numel // 32
+                            + (64 if mode == "k" and codec == "mxfp6" else 0)
                         ),
                     ),
                     torch.uint8,
                 )
-                for mode in self.v4_output
+                for mode, codec in zip(self.v4_output, self.codecs)
             )
             for _ in range(2)
         )
@@ -228,6 +237,10 @@ class FusedA2AIntraNodeOp:
                 numel=numel, return_mode=self.return_mode, codec=self.codecs
             )
         self.xdb_mem = mori_shmem_create_tensor((world_size,), torch.int64)
+        for scales in self.scales_sets:
+            for scale, mode, codec in zip(scales, self.v4_output, self.codecs):
+                if mode == "k" and codec == "mxfp6":
+                    scale.zero_()
         for outputs in self.outputs_sets:
             for output in outputs:
                 output.zero_()
