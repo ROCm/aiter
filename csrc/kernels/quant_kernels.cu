@@ -257,16 +257,19 @@ dynamic_per_group_scaled_quant_kernel(DTYPE_O* __restrict__ out,
     {
         inverted_scale = absMax * inverted_DTYPE_MAX;
     }
-    // The output is always laid out row-major, whatever order the groups were walked in,
-    // so index it by (x, y) rather than by the raw linear group id -- under
-    // kColumnMajorGroups that id counts down a column and would scatter the data store.
-    const int64_t out_group = kColumnMajorGroups ? (x * scaleN_pad + y) : groupId;
     // Interleaved layout: this thread's first chunk sits at lane * kChunkElems, and
     // store_vector's interleave mode strides the rest by num_thread_per_group chunks.
     static constexpr int kLaneStride = kInterleavedChunks ? kChunkElems : vec_size_o;
-    const int64_t row_offset = std::is_same_v<DTYPE_O, opus::fp4_t>
-                               ? out_group * group_size / 2 + lane_in_group * kLaneStride
-                               : out_group * group_size + lane_in_group * kLaneStride;
+    // The output is row-major regardless of the order in which groups are visited.
+    // Keep row and in-row offsets separate so tensors beyond a global descriptor's
+    // 32-bit byte reach can use one row as the descriptor range.
+    const int64_t out_row_offset =
+        std::is_same_v<DTYPE_O, opus::fp4_t> ? x * ori_cols / 2 : x * ori_cols;
+    const int32_t out_thread_offset =
+        (std::is_same_v<DTYPE_O, opus::fp4_t> ? y * group_size / 2
+                                              : y * group_size) +
+        lane_in_group * kLaneStride;
+    const int64_t row_offset = out_row_offset + out_thread_offset;
     // The scale write happens at the end of the kernel, but its address and value are
     // resolved HERE. Left in the tail, that arithmetic reused the data stores' VGPRs and
     // forced an `s_wait_xcnt 0x0` guarding every outstanding VMEM -- an ATT capture
@@ -333,18 +336,36 @@ dynamic_per_group_scaled_quant_kernel(DTYPE_O* __restrict__ out,
 
     using DTYPE_STORE = std::conditional_t<std::is_same_v<DTYPE_O, opus::fp4_t>, uint8_t, DTYPE_O>;
     auto* out_ptr     = reinterpret_cast<DTYPE_STORE*>(out);
-    auto buffer_o = opus::make_gmem<DTYPE_STORE>(out_ptr, oob_size);
+    auto store_output = [&](auto& buffer_o, int64_t offset) __attribute__((always_inline)) {
+        if constexpr(kInterleavedChunks)
+        {
+            store_vector<DTYPE_STORE, DTYPE_I, thread_data_size, RT, true,
+                         num_thread_per_group, kChunks, DTYPE_O, kStoreTakesDivisor>(
+                buffer_o, thread_data, offset, inverted_scale);
+        }
+        else
+        {
+            store_vector<DTYPE_STORE, DTYPE_I, thread_data_size, RT, false, WARP_SIZE, 1,
+                         DTYPE_O, kStoreTakesDivisor>(
+                buffer_o, thread_data, offset, inverted_scale);
+        }
+    };
 
-    if constexpr(kInterleavedChunks)
+    // Buffer resources expose a 32-bit byte range. For larger outputs, rebase the
+    // descriptor to this row and retain the optimized interleaved store mapping.
+    constexpr int64_t kDescriptorReach = (int64_t{1} << 32) - 1;
+    if(oob_size <= kDescriptorReach)
     {
-        store_vector<DTYPE_STORE, DTYPE_I, thread_data_size, RT, true, num_thread_per_group,
-                     kChunks, DTYPE_O, kStoreTakesDivisor>(
-            buffer_o, thread_data, row_offset, inverted_scale);
+        auto buffer_o = opus::make_gmem<DTYPE_STORE>(out_ptr, oob_size);
+        store_output(buffer_o, row_offset);
     }
     else
     {
-        store_vector<DTYPE_STORE, DTYPE_I, thread_data_size, RT, false, WARP_SIZE, 1, DTYPE_O,
-                     kStoreTakesDivisor>(buffer_o, thread_data, row_offset, inverted_scale);
+        const int64_t out_row_elems =
+            std::is_same_v<DTYPE_O, opus::fp4_t> ? ori_cols / 2 : ori_cols;
+        auto buffer_o = opus::make_gmem<DTYPE_STORE>(
+            out_ptr + out_row_offset, out_row_elems * sizeof(DTYPE_STORE));
+        store_output(buffer_o, out_thread_offset);
     }
 
     // Scale write, deferred to last on purpose: address and value were resolved above, so

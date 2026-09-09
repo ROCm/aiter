@@ -140,6 +140,17 @@ namespace py = pybind11;
           py::arg("group_size"),                         \
           py::arg("limit")         = 0.0f,               \
           py::arg("shuffle_scale") = false);             \
+    m.def("situv2_and_mul_quant",                        \
+          &aiter::situv2_and_mul_quant,                  \
+          "Fused SiTUv2 and per-token FP8 quantization." \
+          " Requires group_size == d.",                  \
+          py::arg("out"),                                \
+          py::arg("input"),                              \
+          py::arg("scale"),                              \
+          py::arg("group_size"),                         \
+          py::arg("beta"),                               \
+          py::arg("linear_beta"),                        \
+          py::arg("shuffle_scale") = false);             \
     m.def("gelu_and_mul",                                \
           &aiter::gelu_and_mul,                          \
           "Activation function used in GELU.",           \
@@ -1473,9 +1484,9 @@ namespace py = pybind11;
           py::arg("m_indices")         = std::nullopt, \
           py::arg("reverse_sorted")    = std::nullopt);
 
-#define PA_SPARSE_PREFILL_OPUS_PYBIND               \
+#define MLA_V4_PREFILL_OPUS_PYBIND                  \
     m.def("pa_sparse_prefill_gfx950_opus_fwd",      \
-          &pa_sparse_prefill_gfx950_opus_fwd,       \
+          &opus_mla_v4_prefill_a16w16_gfx950_fwd,   \
           py::arg("q"),                             \
           py::arg("unified_kv"),                    \
           py::arg("kv_indices_prefix"),             \
@@ -1487,7 +1498,7 @@ namespace py = pybind11;
           py::arg("out"),                           \
           py::arg("softmax_scale"));                \
     m.def("pa_sparse_prefill_gfx1250_opus_fwd",     \
-          &pa_sparse_prefill_gfx1250_opus_fwd,      \
+          &opus_mla_v4_prefill_a16w16_gfx1250_fwd,  \
           py::arg("q"),                             \
           py::arg("unified_kv"),                    \
           py::arg("kv_indices_prefix"),             \
@@ -1499,7 +1510,7 @@ namespace py = pybind11;
           py::arg("out"),                           \
           py::arg("softmax_scale"));                \
     m.def("pa_sparse_prefill_fp8_gfx950_opus_fwd",  \
-          &pa_sparse_prefill_fp8_gfx950_opus_fwd,   \
+          &opus_mla_v4_prefill_a8w8_gfx950_fwd,     \
           py::arg("q_nope"),                        \
           py::arg("q_rope"),                        \
           py::arg("unified_kv_nope"),               \
@@ -1514,7 +1525,7 @@ namespace py = pybind11;
           py::arg("out"),                           \
           py::arg("softmax_scale"));                \
     m.def("pa_sparse_prefill_fp8_gfx1250_opus_fwd", \
-          &pa_sparse_prefill_fp8_gfx1250_opus_fwd,  \
+          &opus_mla_v4_prefill_a8w8_gfx1250_fwd,    \
           py::arg("q_nope"),                        \
           py::arg("q_rope"),                        \
           py::arg("unified_kv_nope"),               \
@@ -1946,7 +1957,8 @@ namespace py = pybind11;
           py::arg("index_cache_dtype") = "auto",       \
           py::arg("k_scale")           = std::nullopt, \
           py::arg("v_scale")           = std::nullopt, \
-          py::arg("asm_layout")        = false)
+          py::arg("asm_layout")        = false,        \
+          py::arg("skip_index_branch") = false)
 
 #define FUSED_QKNORM_ROPE_CACHE_QUANT_PYBIND                           \
     m.def("fused_qk_norm_rope_cache_quant_shuffle",                    \
@@ -2271,7 +2283,8 @@ namespace py = pybind11;
           py::arg("stride1"),                    \
           py::arg("k")         = 2048,           \
           py::arg("workspace") = std::nullopt,   \
-          py::arg("stable")    = false);         \
+          py::arg("stable")    = false,          \
+          py::arg("values")    = std::nullopt);  \
     m.def("topk_mb_workspace_size",              \
           &topk_mb_workspace_size,               \
           py::arg("numRows"),                    \
