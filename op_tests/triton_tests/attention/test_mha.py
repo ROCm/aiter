@@ -23,6 +23,7 @@ from aiter.test_mha_common import (
 from op_tests.triton_tests.attention.mha_test_utils import (
     pad_rearrange_dropout_mask,
     skip_if_gluon_unsupported,
+    skip_if_triton_padded_head_miscompiled,
 )
 
 logging.basicConfig(level=logging.DEBUG)
@@ -127,6 +128,9 @@ def test_mha(
     backend: str,
     dtype=torch.bfloat16,
 ):
+    skip_if_triton_padded_head_miscompiled(
+        backend, HEAD_SZ, CAUSAL, SEQLEN_K, NUM_K_HEADS
+    )
     _test_mha_impl(
         BATCH,
         SEQLEN_Q,
@@ -584,6 +588,9 @@ def test_mha_varlen(
     backend: str,
     dtype=torch.bfloat16,
 ):
+    skip_if_triton_padded_head_miscompiled(
+        backend, HEAD_SZ, CAUSAL, SEQLEN_K, NUM_K_HEADS
+    )
     _test_mha_varlen_impl(
         BATCH,
         SEQLEN_Q,
