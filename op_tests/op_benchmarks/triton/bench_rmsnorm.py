@@ -1,4 +1,5 @@
 import argparse
+import math
 
 import torch
 import triton
@@ -129,8 +130,18 @@ def run_benchmark(args):
                 x.grad, w.grad = None, None
                 y.backward(dy, retain_graph=True)
 
-            mem_read = (2 * M * N + M + N) * x.element_size()  # x, dy, rsigma, g
-            mem_write = (M * N + N) * x.element_size()  # dx, dg
+            BLOCK_N = triton.next_power_of_2(N)
+            BLOCK_M = max(min(16384 // BLOCK_N, 32), 8)
+            num_prgms = math.ceil(M / BLOCK_M)
+            use_large_m = M > 8192 and N <= 2048
+            # x, dy: input dtype; rsigma: fp32 (4 bytes)
+            mem_read = (2 * M * N) * x.element_size() + M * 4 + N * x.element_size()
+            # dx: input dtype; dg: input dtype
+            mem_write = (M * N + N) * x.element_size()
+            if use_large_m:
+                # dg_tmp written by bwd kernel, read by reduction: fp32
+                mem_read += num_prgms * N * 4
+                mem_write += num_prgms * N * 4
             mem = mem_read + mem_write
             flops = 8 * M * N
         else:
