@@ -705,9 +705,9 @@ def test_fp8_rejected_head_dims_raise_before_launch(head_dim, head_dim_v, match)
 def test_fp8_auto_split_kv_writes_every_row(batch, seq_len, num_heads):
     """Auto split-K must not drop the tail of the combine grid."""
     D = 128
-    assert (batch * num_heads * seq_len) % (256 // (D // 4)) != 0, (
-        "shape would not exercise the tail"
-    )
+    assert (batch * num_heads * seq_len) % (
+        256 // (D // 4)
+    ) != 0, "shape would not exercise the tail"
     torch.manual_seed(0)
     q, k, v = (
         torch.randn(batch, seq_len, num_heads, D, device="cuda", dtype=torch.bfloat16)
@@ -715,9 +715,9 @@ def test_fp8_auto_split_kv_writes_every_row(batch, seq_len, num_heads):
         for _ in range(3)
     )
     out = _run_fp8_into_nan_out(q, k, v, D, causal=False, num_kv_heads=num_heads)
-    assert not torch.isnan(out).any(), (
-        f"{int(torch.isnan(out).any(-1).sum())} output rows were never written"
-    )
+    assert not torch.isnan(
+        out
+    ).any(), f"{int(torch.isnan(out).any(-1).sum())} output rows were never written"
 
 
 @_gfx950_only
@@ -749,9 +749,9 @@ def test_fp8_varlen_split_kv_respects_batch_boundaries(seq_len, num_heads, head_
         "cross_seqlen": False,
     }
     split = _run_fp8_into_nan_out(q, k, v, head_dim_v, num_kv_splits=2, **kw)
-    assert not torch.isnan(split).any(), (
-        f"{int(torch.isnan(split).any(-1).sum())} output rows were never written"
-    )
+    assert not torch.isnan(
+        split
+    ).any(), f"{int(torch.isnan(split).any(-1).sum())} output rows were never written"
     unsplit = _run_fp8_into_nan_out(q, k, v, head_dim_v, num_kv_splits=1, **kw)
     torch.testing.assert_close(split.float(), unsplit.float(), rtol=2e-2, atol=2e-2)
 
