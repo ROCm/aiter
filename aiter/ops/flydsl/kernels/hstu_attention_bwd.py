@@ -438,11 +438,8 @@ def build_hstu_attention_bwd_dvdk(
 
         def silu_and_grad_batch(s_list):
             # Fast (non-IEEE) SiLU + derivative on fp32 lanes. The fastmath context
-            # gives every add/mul the `fast` flag (matches the compile hints) and turns
-            # the reciprocal into v_rcp_f32, so no rocdl builder is needed there. exp2
-            # is the exception: it stays on the amdgcn intrinsic, which FlyDSL
-            # docs/api_stability.md classes as unstable, because the stable
-            # fx.math.exp2 does not reach v_exp_f32 perf even under this context
+            # gives every add/mul the `fast` flag and turns the reciprocal into
+            # v_rcp_f32, so no rocdl builder is needed there.
             with arith.fastmath(arith.FastMathFlags.fast):
                 sc = [s * c_alpha for s in s_list]
                 tt = [s * c_neg_log2e for s in sc]
@@ -814,8 +811,6 @@ def build_hstu_attention_bwd_dvdk(
                                     fx.Int64(seq_start + kv_row_e), head_idx, col
                                 ] = val
 
-    _hstu_compile_hints = {"fast_fp_math": True, "unsafe_fp_math": True}
-
     @flyc.jit
     def launch_hstu_attention_bwd_dvdk(
         q: fx.Tensor,
@@ -851,5 +846,4 @@ def build_hstu_attention_bwd_dvdk(
             },
         ).launch(grid=grid, block=BLOCK_THREADS, smem=0, stream=stream)
 
-    launch_hstu_attention_bwd_dvdk.compile_hints = _hstu_compile_hints
     return launch_hstu_attention_bwd_dvdk

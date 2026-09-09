@@ -667,11 +667,6 @@ def build_hstu_attention_bwd_dq(
                                     val
                                 )
 
-    _hstu_compile_hints = {
-        "fast_fp_math": True,
-        "unsafe_fp_math": True,
-    }
-
     @flyc.jit
     def launch_hstu_attention_bwd_dq(
         q: fx.Tensor,
@@ -710,5 +705,4 @@ def build_hstu_attention_bwd_dq(
             stream=stream,
         )
 
-    launch_hstu_attention_bwd_dq.compile_hints = _hstu_compile_hints
     return launch_hstu_attention_bwd_dq
