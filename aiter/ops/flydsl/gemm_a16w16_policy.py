@@ -87,7 +87,12 @@ class GemmConfigPruner:
         if not configs:
             return configs
         ious = [self._iou(config) for config in configs]
-        keep_ratio = max(0.625, 1 - self.m / 160, 1 - 120 / self.m)
+        # The M-dependent terms approach 1 as M grows, so without a ceiling a
+        # large-M shape only keeps tiles that divide N almost exactly. That
+        # evicts block_n=256 on shapes like N=384, and block_n=256 is the only
+        # width the half-tile-interleaved policy can express -- the pipeline it
+        # buys is worth more than the padding it costs.
+        keep_ratio = min(0.7, max(0.625, 1 - self.m / 160, 1 - 120 / self.m))
         min_iou = max(ious) * keep_ratio
         num_cus = self.device_props.multi_processor_count
         max_tiles = (

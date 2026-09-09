@@ -1,0 +1,11 @@
+M,N,K,flydsl_us_before,flydsl_us_after,speedup,hti_after,kernel_after,best_libtype,best_us
+16384,32,3456,21.6478,21.567,1.0037,False,flydsl_hgemm_abf16_wbf16_bf16_t64x32x64x8_ks1_w4x1x1_bias0_ktail0_gm4_pft_gfx950,hipblaslt,24.4903
+16384,384,3456,58.8271,56.9805,1.0324,True,flydsl_hgemm_abf16_wbf16_bf16_t128x256x64x2_ks1_w2x4x1_bias0_ktail0_gm4_pht_gfx950,hipblaslt,55.0815
+27556,384,3456,105.377,81.3713,1.295,True,flydsl_hgemm_abf16_wbf16_bf16_t256x256x64x2_ks1_w2x4x1_bias0_ktail0_gm0_pht_gfx950,hipblaslt,74.8317
+65536,192,1728,75.1023,62.3089,1.2053,False,flydsl_hgemm_abf16_wbf16_bf16_t256x256x64x2_ks1_w4x4x1_bias0_ktail0_gm4_pft_gfx950,hipblaslt,69.8923
+65536,192,3456,145.3112,115.2726,1.2606,False,flydsl_hgemm_abf16_wbf16_bf16_t256x256x64x2_ks1_w4x4x1_bias0_ktail0_gm4_pft_gfx950,hipblaslt,120.5177
+65536,384,1728,101.4712,100.461,1.0101,False,flydsl_hgemm_abf16_wbf16_bf16_t256x128x64x3_ks1_w4x4x1_bias0_ktail0_gm4_pft_gfx950,hipblaslt,109.5727
+65536,384,3456,182.5594,170.7364,1.0692,True,flydsl_hgemm_abf16_wbf16_bf16_t256x256x64x2_ks1_w2x4x1_bias0_ktail0_gm4_pht_gfx950,hipblaslt,176.885
+262144,192,1728,279.0496,247.7641,1.1263,False,flydsl_hgemm_abf16_wbf16_bf16_t256x256x64x2_ks1_w4x4x1_bias0_ktail0_gm4_pft_gfx950,hipblaslt,223.134
+262144,192,3456,544.9572,546.2611,0.9976,False,flydsl_hgemm_abf16_wbf16_bf16_t128x128x64x2_ks1_w2x4x1_bias0_ktail0_gm4_pft_gfx950,hipblaslt,428.0187
+1048576,96,1728,740.7124,731.4724,1.0126,False,flydsl_hgemm_abf16_wbf16_bf16_t128x96x64x2_ks1_w2x2x1_bias0_ktail0_gm0_pft_gfx950,hipblaslt,754.0363
