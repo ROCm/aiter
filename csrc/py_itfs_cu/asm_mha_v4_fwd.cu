@@ -207,6 +207,38 @@ void check_format_tensor(const at::Tensor& tensor, int64_t format, const char* n
     }
 }
 
+// E8M0 scale gathers are unguarded global loads: they address every row of the tile they are
+// running, plus MXFP4 K's two-tile producer lead, so the final tiles read past the logical rows.
+constexpr int64_t kMxScaleBlocksPerRow      = 4;
+constexpr int64_t kQueryScaleTileRows       = 256;
+constexpr int64_t kKvScaleTileRows          = 128;
+constexpr int64_t kKvScaleLookaheadRows     = 2 * kKvScaleTileRows;
+constexpr int64_t kKvScaleTrailingDwordSlack = 4;
+
+void check_scale_backing_storage(const at::Tensor& descale,
+                                 int64_t sequence,
+                                 int64_t heads,
+                                 int64_t tile_rows,
+                                 int64_t lookahead_rows,
+                                 int64_t trailing_slack,
+                                 const char* name)
+{
+    const int64_t padded = ((sequence + tile_rows - 1) / tile_rows) * tile_rows + lookahead_rows;
+    const int64_t required =
+        descale.numel() + (padded - sequence) * heads * kMxScaleBlocksPerRow + trailing_slack;
+    const int64_t backed = static_cast<int64_t>(descale.storage().nbytes()) -
+                           descale.storage_offset() * descale.element_size();
+    TORCH_CHECK(backed >= required,
+                "MX ",
+                name,
+                " descale needs ",
+                required,
+                " mapped bytes so the kernel's speculative tile gather stays in bounds, but only ",
+                backed,
+                " are backed; allocate it with the aiter.ops.mha_v4_quant producers, which reserve "
+                "zeroed slack");
+}
+
 const fmha_v4_fwdConfig&
 find_config(const std::string& arch, const MhaV4Recipe& recipe, int64_t mode)
 {
@@ -657,6 +689,23 @@ PackedMhaV4Shapes validate_packed_mha_v4(const at::Tensor& q,
         TORCH_CHECK(k_descale.sizes() ==
                         torch::IntArrayRef({shapes.batch, shapes.seqlen_k, shapes.nhead_k, 4}),
                     "MX K descale must have shape [batch, key_length, key_heads, 4]");
+        check_scale_backing_storage(q_descale,
+                                    shapes.seqlen_q,
+                                    shapes.nhead_q,
+                                    kQueryScaleTileRows,
+                                    0,
+                                    0,
+                                    "Q");
+        if(recipe.k_format == format_id(AttentionFormat::Fp4E2M1))
+        {
+            check_scale_backing_storage(k_descale,
+                                        shapes.seqlen_k,
+                                        shapes.nhead_k,
+                                        kKvScaleTileRows,
+                                        kKvScaleLookaheadRows,
+                                        kKvScaleTrailingDwordSlack,
+                                        "K");
+        }
     }
     else
     {

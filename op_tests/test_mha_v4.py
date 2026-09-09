@@ -1007,7 +1007,11 @@ def test_mha_v4_packed_rejects_wrong_scale_recipe():
 @pytest.mark.skipif(get_gfx() != "gfx950", reason="gfx950 MXFP8 validation")
 def test_mha_v4_packed_accepts_mxfp8_scale_recipe():
     q = torch.zeros((1, 128, 2, 128), device="cuda", dtype=torch.float8_e4m3fn)
-    qk_scale = torch.ones((1, 128, 2, 4), device="cuda", dtype=torch.uint8)
+    # The Q-scale gather covers the whole 256-row query tile, so back the view with those rows.
+    scale_storage = torch.ones(
+        MHA_V4_QUERY_TILE_ROWS * 2 * 4, device="cuda", dtype=torch.uint8
+    )
+    qk_scale = scale_storage[: 128 * 2 * 4].view(1, 128, 2, 4)
     v_scale = torch.ones(1, device="cuda", dtype=torch.float32)
     mha_v4_packed(
         q,
@@ -1083,6 +1087,56 @@ def test_mha_v4_packed_rejects_wrong_mxfp4_k_layout():
     )
     coalesced_k = mxfp4_k_view(raw, k_scale)
     assert coalesced_k.stride() == (16384, 64, 8192, 1)
+
+
+@pytest.mark.skipif(get_gfx() != "gfx950", reason="gfx950 MX scale validation")
+def test_mha_v4_packed_rejects_unbacked_mx_scales():
+    """An external caller passing exact-size scales would fault the speculative gathers.
+
+    clone() keeps the logical shape the size checks look at but drops the producer's
+    zeroed slack, which is exactly the shape of a caller-supplied tensor.
+    """
+    torch.manual_seed(5)
+    value = torch.randn((1, 257, 2, 128), device="cuda", dtype=torch.bfloat16)
+    fp8_format = native_fp8_format()
+
+    q_packed, q_scale = quantize_mxfp8_q(value, 1.0)
+    k_packed, k_scale = quantize_mxfp8_k(value)
+    v_packed, v_scale = quantize_fp8(value)
+    with pytest.raises(RuntimeError, match="speculative tile gather"):
+        mha_v4_packed(
+            q_packed,
+            k_packed,
+            v_packed,
+            q_scale.clone(),
+            k_scale,
+            v_scale,
+            fp8_format,
+            fp8_format,
+            fp8_format,
+            AttentionScaleMode.E8M0_PER_1X32,
+            AttentionScaleMode.E8M0_PER_1X32,
+            AttentionScaleMode.F32_PER_TENSOR,
+        )
+
+    mxfp4_q, mxfp4_q_scale = quantize_mxfp4_q(value, 1.0)
+    mxfp4_raw, mxfp4_k_scale = quantize_mxfp4_k(value)
+    mxfp4_v_raw, mxfp4_v_scale = quantize_v_mxfp4(value)
+    with pytest.raises(RuntimeError, match="speculative tile gather"):
+        mha_v4_packed(
+            mxfp4_q,
+            mxfp4_k_view(mxfp4_raw, mxfp4_k_scale),
+            mxfp4_v_view(mxfp4_v_raw, mxfp4_v_scale, value.shape[1]),
+            mxfp4_q_scale,
+            mxfp4_k_scale.clone(),
+            mxfp4_v_scale,
+            AttentionFormat.MXFP4,
+            AttentionFormat.MXFP4,
+            AttentionFormat.MXFP4,
+            AttentionScaleMode.E8M0_PER_1X32,
+            AttentionScaleMode.E8M0_PER_1X32,
+            AttentionScaleMode.E8M0_PER_1X32,
+        )
 
 
 @pytest.mark.skipif(get_gfx() != "gfx950", reason="gfx950 MHA v4 validation")
