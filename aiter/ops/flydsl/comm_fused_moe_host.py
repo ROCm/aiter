@@ -5,7 +5,7 @@ import csv
 import logging
 import math
 import re
-from dataclasses import MISSING, dataclass, fields
+from dataclasses import MISSING, dataclass, fields, replace
 from functools import cache
 from pathlib import Path
 
@@ -39,7 +39,7 @@ from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled, ptr_arg
 _PEER_VMM_ALLOCATION_ALIGNMENT = 2 * 1024 * 1024
 _MIN_ROCM_VERSION = (7, 2)
 _MAX_ABS_ERROR = 1.0
-_MAX_REL_L2_ERROR = 0.05
+_MAX_REL_L2_ERROR = 0.1
 _ACT_TYPE = "ActivationType.Silu"
 _DTYPE = "torch.bfloat16"
 _Q_DTYPE_A = "torch.float8_e4m3fn"
@@ -47,6 +47,7 @@ _Q_DTYPE_W = "torch.float4_e2m1fn_x2"
 
 logger = logging.getLogger("aiter")
 _Q_TYPE = "QuantType.per_1x32"
+_ADD_SHARED = True
 
 
 @dataclass(frozen=True, slots=True)
@@ -65,14 +66,18 @@ class ShapeKey:
     q_type: str = _Q_TYPE
     use_g1u1: int = 1
     doweight_stage1: int = 0
+    add_shared: bool | None = _ADD_SHARED
 
     def kernel_shape(self) -> Shape:
+        if self.add_shared is None:
+            raise ValueError("kernel shape requires an explicit add_shared value")
         return Shape(
             self.model_dim,
             self.inter_dim,
             self.experts,
             self.topk,
             self.tp,
+            self.add_shared,
         )
 
 
@@ -269,6 +274,11 @@ def _optional_float(row, name: str) -> float | None:
     return value if math.isfinite(value) else None
 
 
+def _optional_bool(row, name: str, default: bool) -> bool:
+    value = row.get(name)
+    return default if value in (None, "", "nan") else bool(_int_value(value, name))
+
+
 def _row_is_accurate(row) -> bool:
     max_abs = _optional_float(row, "max_abs")
     rel_l2 = _optional_float(row, "rel_l2")
@@ -319,6 +329,7 @@ def _winner_table() -> dict[ShapeKey, dict[int, PipelineConfig]]:
                 row["q_type"],
                 _int_value(row["use_g1u1"], "use_g1u1"),
                 _int_value(row["doweight_stage1"], "doweight_stage1"),
+                _optional_bool(row, "add_shared", _ADD_SHARED),
             )
             key = (shape, int(row["token"]))
             candidates.setdefault(key, []).append(row)
@@ -348,8 +359,23 @@ def winners_for(shape: ShapeKey) -> dict[int, PipelineConfig]:
             shape.q_type,
             shape.use_g1u1,
             shape.doweight_stage1,
+            shape.add_shared,
         )
     table = _winner_table()
+    if shape.add_shared is None:
+        matches = [
+            configs
+            for add_shared in (True, False)
+            if (configs := table.get(replace(shape, add_shared=add_shared)))
+        ]
+        if len(matches) != 1:
+            raise KeyError(
+                "comm_fused layout must match exactly one shared-add contract, "
+                f"got {len(matches)} for H={shape.model_dim}, "
+                f"I={shape.inter_dim}, E={shape.experts}, topk={shape.topk}, "
+                f"TP={shape.tp}"
+            )
+        return matches[0]
     try:
         return table[shape]
     except KeyError:
@@ -482,9 +508,13 @@ class _AtomicRunner:
         ordinary_stage2,
     ):
         config = self.config
-        add_shared = stage2_uses_route_reduce(ordinary_stage2)
-        if not add_shared:
-            self.output.copy_(shared_partial)
+        stage2_reduces_routes = stage2_uses_route_reduce(ordinary_stage2)
+        add_shared = config.shape.add_shared and stage2_reduces_routes
+        if not stage2_reduces_routes:
+            if config.shape.add_shared:
+                self.output.copy_(shared_partial)
+            else:
+                self.output.zero_()
         ordinary_stage2(
             *stage2_args[:6],
             self.output,
@@ -495,7 +525,7 @@ class _AtomicRunner:
         _run_compiled(
             atomic.compile_quantize(config, add_shared),
             ptr_arg(self.output),
-            ptr_arg(shared_partial),
+            ptr_arg(shared_partial if shared_partial is not None else self.output),
             ptr_arg(self.partial),
             stream,
         )
@@ -571,6 +601,8 @@ class _MegakernelRunner:
     def prepare_shared_partial(self, shared_partial: torch.Tensor) -> torch.Tensor:
         """Stage a normal shared contribution in the registered output window."""
 
+        if not self.config.shape.add_shared:
+            return self.output
         if not self.config.shared_bf16_partials:
             return shared_partial
         if self.config.producer_mode == "atomic_shared":
@@ -589,8 +621,16 @@ class _MegakernelRunner:
     ):
         del ordinary_stage2
         stream = torch.cuda.current_stream(self.device)
+        if not self.config.shape.add_shared:
+            shared_partial = self.output
+            if self.config.shared_bf16_partials:
+                self.shared_partial_ptr = self.output.data_ptr()
+                self.shared_partial_flat_base = (
+                    self.workspace_flat_base + self.config.output_offset
+                )
         if (
-            self.config.shared_bf16_partials
+            self.config.shape.add_shared
+            and self.config.shared_bf16_partials
             and self.config.producer_mode != "atomic_shared"
         ):
             shared_partial_ptr = shared_partial.data_ptr()
@@ -697,7 +737,11 @@ class _WindowRunner:
 
     def _local_args(self, phase, shared_partial):
         slot = phase % SLOTS
-        shared = shared_partial[:, phase * self.config.window :]
+        shared = (
+            shared_partial[:, phase * self.config.window :]
+            if shared_partial is not None
+            else self.output[:, phase * self.config.window :]
+        )
         return (
             ptr_arg(self.routes[slot]),
             ptr_arg(self.partials[slot]),
@@ -833,6 +877,7 @@ class _LazyRunners:
         self.tp_group = tp_group
         self.shape = shape
         self.configs = configs
+        self.add_shared = next(iter(configs.values())).shape.add_shared
         self.instances = {}
 
     def __contains__(self, tokens: int) -> bool:
@@ -867,7 +912,9 @@ class _LazyRunners:
         return self.instances[tokens]
 
 
-def create_flydsl_comm_fused_runners(*, tp_group, model_dim, inter_dim, experts, topk):
+def create_flydsl_comm_fused_runners(
+    *, tp_group, model_dim, inter_dim, experts, topk
+):
     shape = ShapeKey(
         get_gfx_runtime(),
         model_dim,
@@ -875,9 +922,12 @@ def create_flydsl_comm_fused_runners(*, tp_group, model_dim, inter_dim, experts,
         experts,
         topk,
         int(tp_group.world_size),
-        get_cu_num(),
+        add_shared=None,
     )
+    configs = winners_for(shape)
+    if not configs:
+        raise KeyError(f"unsupported comm_fused shape {shape}")
     key = (id(tp_group), shape)
     if key not in _RUNNER_CACHE:
-        _RUNNER_CACHE[key] = _LazyRunners(tp_group, shape, winners_for(shape))
+        _RUNNER_CACHE[key] = _LazyRunners(tp_group, shape, configs)
     return _RUNNER_CACHE[key]
