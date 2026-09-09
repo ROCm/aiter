@@ -217,7 +217,9 @@ def gemm_a16w16_(
             y = torch.empty((M, N), dtype=dtype, device=x.device)
 
         wmma_layout, operand_a, operand_b = create_wmma_layouts(num_warps)
-        shared_a, shared_b = create_shared_layouts(BLOCK_M, BLOCK_N, BLOCK_K, layout)
+        shared_a, shared_b = create_shared_layouts(
+            BLOCK_M, BLOCK_N, BLOCK_K, layout, x.element_size() * 8
+        )
 
         grid = (triton.cdiv(M, BLOCK_M) * triton.cdiv(N, BLOCK_N), 1)
 

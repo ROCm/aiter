@@ -174,7 +174,9 @@ def batched_gemm_bf16(
             )
 
         wmma_layout, operand_a, operand_b = create_wmma_layouts(num_warps)
-        shared_a, shared_b = create_shared_layouts(BLOCK_M, BLOCK_N, BLOCK_K, layout)
+        shared_a, shared_b = create_shared_layouts(
+            BLOCK_M, BLOCK_N, BLOCK_K, layout, XQ.element_size() * 8
+        )
 
         out_tensor = YQ if NUM_KSPLIT == 1 else y_pp
 
