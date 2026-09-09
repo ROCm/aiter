@@ -13,7 +13,6 @@ import aiter
 from aiter import dtypes
 from aiter.jit.utils.chip_info import get_gfx
 from aiter.ops.flydsl.gemm_a16w16_gfx1250 import gemm_a16w16 as flydsl_gemm_a16w16
-from aiter.ops.flydsl.utils import is_flydsl_available
 from aiter.ops.triton.gemm.basic.gemm_a16w16 import gemm_a16w16 as triton_gemm_a16w16
 from aiter.test_common import benchmark, checkAllclose, run_perftest
 
@@ -176,9 +175,9 @@ def summarize(name, rows):
 
 
 def main():
-    if get_gfx() not in SUPPORTED_GFX or not is_flydsl_available():
+    if get_gfx() not in SUPPORTED_GFX:
         aiter.logger.warning(
-            "flydsl gemm_a16w16 needs gfx1250 + flydsl; skipping on %s", get_gfx()
+            "flydsl gemm_a16w16 needs gfx1250; skipping on %s", get_gfx()
         )
         return
 
