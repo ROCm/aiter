@@ -3,8 +3,10 @@
 //
 // MXFP4 paged MQA logits (gfx950) — host launchers + prefill window build.
 // Thin wrapper over the device kernel in `pa_mqa_logits_mxfp4_opus.h`, which documents
-// the input ABI. Prefill launches a 1D grid with per-row window arrays, decode a 3D grid
-// with the windows derived in-kernel; both are schedule-free and cudagraph-safe.
+// the input ABI. Prefill launches a 1D grid over query rows, decode a 3D grid over
+// (batch, MTP position, KV split). Both READ their per-row window from `local_ends`
+// rather than deriving it, which is what lets a compressed KV cache express one, and
+// both are schedule-free and cudagraph-safe.
 
 #define PA_MQA_LOGITS_MXFP4_IMPL
 #include "pa_mqa_logits_mxfp4_opus.h"
@@ -56,12 +58,26 @@ static void pa_mqa_logits_mxfp4_check_shapes(aiter_tensor_t& q,
                                              aiter_tensor_t& weights,
                                              aiter_tensor_t& out,
                                              int block_k,
-                                             int kv_block_size)
+                                             int kv_block_size,
+                                             int max_seq_len)
 {
     AITER_CHECK(q.dim() == 3, "q must be 3-D [T, H, D/2], got ndim=", q.dim());
     AITER_CHECK(weights.dim() == 2, "weights must be 2-D [T, H], got ndim=", weights.dim());
     AITER_CHECK(block_tables.dim() == 2, "block_tables must be 2-D [batch, max_blocks_per_seq]");
     AITER_CHECK(out.dim() == 2, "out must be 2-D [T, max_seq_len], got ndim=", out.dim());
+    AITER_CHECK(weights.size(0) >= q.size(0),
+                "weights is per query row; need at least ", q.size(0), " rows, got ",
+                weights.size(0));
+    // The kernel bounds its store by the WINDOW, not by max_seq_len -- `max_seq_len` is
+    // carried in kargs and never read, only `stride_out_row` is. So these two are the only
+    // place an undersized `out` can be caught at all; a `local_ends` entry past out.size(1)
+    // is the caller's contract (see the wrapper docstring).
+    AITER_CHECK(out.size(0) >= q.size(0),
+                "out is [T, max_seq_len]; need at least ", q.size(0), " rows, got ",
+                out.size(0));
+    AITER_CHECK(out.size(1) >= max_seq_len,
+                "out is [T, max_seq_len]; need at least ", max_seq_len, " columns, got ",
+                out.size(1));
 
     constexpr int HEAD_BYTES = Traits::HEAD_DIM * Traits::ELEM_BITS / 8;  // 64: D/2 per head
     const int H       = static_cast<int>(q.size(1));
@@ -86,8 +102,18 @@ static void pa_mqa_logits_mxfp4_check_shapes(aiter_tensor_t& q,
     AITER_CHECK(weights.dtype() == AITER_DTYPE_bf16, "weights must be bf16");
     AITER_CHECK(block_tables.dtype() == AITER_DTYPE_i32, "block_tables must be int32");
     AITER_CHECK(out.dtype() == AITER_DTYPE_fp32, "out must be fp32");
-    AITER_CHECK(q.stride(2) == 1 && weights.stride(1) == 1 && out.stride(1) == 1,
-                "q / weights / out must be contiguous along their last dim");
+
+    // Every input is strided by a COMPILE-TIME constant in the kernel -- q by Q_ROW_BYTES,
+    // weights by W_ROW_ELEMS, q_scale / kv_scale / kv_cache by their row or page strides,
+    // block_tables by max_blocks_per_seq -- and no runtime stride is ever read. A padded or
+    // permuted input is therefore SILENTLY wrong, so require the layout the kernel assumes.
+    // `out` is the one exception: its row stride is passed through as stride_out_row, so it
+    // only needs its last dim packed.
+    AITER_CHECK(q.is_contiguous() && q_scale.is_contiguous() && kv_cache.is_contiguous() &&
+                    kv_scale.is_contiguous() && block_tables.is_contiguous() &&
+                    weights.is_contiguous(),
+                "q / q_scale / kv_cache / kv_scale / block_tables / weights must be contiguous");
+    AITER_CHECK(out.stride(1) == 1, "out must be contiguous along its last dim");
 
     AITER_CHECK(q_scale.numel() == (int64_t)q.size(0) * Traits::QS_ROW_BYTES,
                 "q_scale must hold ", (int)Traits::QS_ROW_BYTES, " bytes per query row "
@@ -122,11 +148,23 @@ static void pa_mqa_logits_mxfp4_launch_prefill(aiter_tensor_t& q,
                           int kv_block_size,
                           int max_seq_len)
 {
-    pa_mqa_logits_mxfp4_check_shapes<Traits>(
-        q, q_scale, kv_cache, kv_scale, block_tables, weights, out, block_k, kv_block_size);
+    pa_mqa_logits_mxfp4_check_shapes<Traits>(q, q_scale, kv_cache, kv_scale, block_tables,
+                                             weights, out, block_k, kv_block_size, max_seq_len);
     AITER_CHECK(row_to_batch.dtype() == AITER_DTYPE_i32 && local_starts.dtype() == AITER_DTYPE_i32 &&
                     local_ends.dtype() == AITER_DTYPE_i32,
                 "row_to_batch / local_starts / local_ends must be int32");
+    AITER_CHECK(row_to_batch.is_contiguous() && local_starts.is_contiguous() &&
+                    local_ends.is_contiguous(),
+                "row_to_batch / local_starts / local_ends must be contiguous");
+    // One CTA per row indexes all three arrays plus q / weights / out at `num_rows - 1`.
+    AITER_CHECK(num_rows <= q.size(0),
+                "num_rows exceeds the query rows in q: ", num_rows, " > ", q.size(0));
+    AITER_CHECK(static_cast<int64_t>(row_to_batch.numel()) >= num_rows &&
+                    static_cast<int64_t>(local_starts.numel()) >= num_rows &&
+                    static_cast<int64_t>(local_ends.numel()) >= num_rows,
+                "row_to_batch / local_starts / local_ends are per query row; need at least ",
+                num_rows, " entries each, got ", row_to_batch.numel(), " / ",
+                local_starts.numel(), " / ", local_ends.numel());
 
     if(num_rows <= 0)
         return;
@@ -159,7 +197,8 @@ static void pa_mqa_logits_mxfp4_launch_prefill(aiter_tensor_t& q,
     HIP_CALL_LAUNCH(hipGetLastError());
 }
 
-// ── Schedule-free DECODE launch: 3D grid (batch, next_n_max, split_kv); windows inline. ──
+// ── Schedule-free DECODE launch: 3D grid (batch, next_n_max, split_kv). The per-row
+//    window is read from `local_ends`, not derived, so a compressed cache fits. ──
 template<class Traits>
 static void pa_mqa_logits_mxfp4_launch_decode(aiter_tensor_t& q,
                           aiter_tensor_t& q_scale,
@@ -178,10 +217,12 @@ static void pa_mqa_logits_mxfp4_launch_decode(aiter_tensor_t& q,
                           int kv_block_size,
                           int max_seq_len)
 {
-    pa_mqa_logits_mxfp4_check_shapes<Traits>(
-        q, q_scale, kv_cache, kv_scale, block_tables, weights, out, block_k, kv_block_size);
+    pa_mqa_logits_mxfp4_check_shapes<Traits>(q, q_scale, kv_cache, kv_scale, block_tables,
+                                             weights, out, block_k, kv_block_size, max_seq_len);
     AITER_CHECK(cu_seq_q.dtype() == AITER_DTYPE_i32 && local_ends.dtype() == AITER_DTYPE_i32,
                 "cu_seq_q / local_ends must be int32");
+    AITER_CHECK(cu_seq_q.is_contiguous() && local_ends.is_contiguous(),
+                "cu_seq_q / local_ends must be contiguous");
     AITER_CHECK(cu_seq_q.size(0) == batch + 1, "cu_seq_q must have length batch+1");
     AITER_CHECK(local_ends.numel() >= q.size(0),
                 "local_ends is per query row; need at least ", q.size(0),
@@ -194,8 +235,9 @@ static void pa_mqa_logits_mxfp4_launch_decode(aiter_tensor_t& q,
     // (xcds - 1) * next_n_max * split_kv CTAs, each returning on its first instruction.
     const int xcds   = pa_mqa_logits_xcd_count(q.device_id);
     const int grid_x = (batch + xcds - 1) / xcds * xcds;
-    AITER_CHECK(grid_x <= 65535 && next_n_max <= 65535,
-                "decode launch: padded batch / next_n_max exceed grid.x/.y limit (65535)");
+    AITER_CHECK(grid_x <= 65535 && next_n_max <= 65535 && split_kv <= 65535,
+                "decode launch: padded batch / next_n_max / split_kv exceed the "
+                "grid.x/.y/.z limit (65535)");
 
     opus_mqa_logits_kargs kargs{};
     kargs.ptr_q             = q.data_ptr();
@@ -247,6 +289,9 @@ void pa_mqa_logits_mxfp4_fwd_decode(aiter_tensor_t& q,
                           int kv_block_size,
                           int max_seq_len)
 {
+    // pybind path: make the shape checks below throw a Python RuntimeError instead of
+    // abort()ing the interpreter. Same convention as opus_gemm.cu / gradlib.
+    aiter_detail::g_aiter_can_throw = true;
     if(block_k == mqa_logits_fp4_traits_4wave::KV_TILE_SIZE) {
         pa_mqa_logits_mxfp4_launch_decode<mqa_logits_fp4_traits_4wave>(
             q, q_scale, kv_cache, kv_scale, block_tables, weights, cu_seq_q, local_ends, out,
@@ -276,6 +321,7 @@ void pa_mqa_logits_mxfp4_fwd_prefill(aiter_tensor_t& q,
                           int kv_block_size,
                           int max_seq_len)
 {
+    aiter_detail::g_aiter_can_throw = true;   // throw, do not abort; see fwd_decode
     if(block_k == mqa_logits_fp4_traits_4wave::KV_TILE_SIZE) {
         pa_mqa_logits_mxfp4_launch_prefill<mqa_logits_fp4_traits_4wave>(
             q, q_scale, kv_cache, kv_scale, block_tables, weights,
@@ -354,10 +400,26 @@ void pa_mqa_logits_mxfp4_prefill_windows(aiter_tensor_t& cu_seq_q,
                                       aiter_tensor_t& local_ends,
                                       int total_q)
 {
+    aiter_detail::g_aiter_can_throw = true;   // throw, do not abort; see fwd_decode
     const int B = static_cast<int>(context_lens.size(0));
     AITER_CHECK(cu_seq_q.dtype() == AITER_DTYPE_i32 && context_lens.dtype() == AITER_DTYPE_i32,
                 "cu_seq_q / context_lens must be int32");
+    AITER_CHECK(cu_seq_q.is_contiguous() && context_lens.is_contiguous(),
+                "cu_seq_q / context_lens must be contiguous");
     AITER_CHECK(cu_seq_q.size(0) == B + 1, "cu_seq_q must have length B+1");
+    // The kernel writes all three arrays at every r < total_q, unconditionally.
+    AITER_CHECK(row_to_batch.dtype() == AITER_DTYPE_i32 && local_starts.dtype() == AITER_DTYPE_i32 &&
+                    local_ends.dtype() == AITER_DTYPE_i32,
+                "row_to_batch / local_starts / local_ends must be int32");
+    AITER_CHECK(row_to_batch.is_contiguous() && local_starts.is_contiguous() &&
+                    local_ends.is_contiguous(),
+                "row_to_batch / local_starts / local_ends must be contiguous");
+    AITER_CHECK(static_cast<int64_t>(row_to_batch.numel()) >= total_q &&
+                    static_cast<int64_t>(local_starts.numel()) >= total_q &&
+                    static_cast<int64_t>(local_ends.numel()) >= total_q,
+                "the window arrays hold one entry per query row; need at least ", total_q,
+                " each, got ", row_to_batch.numel(), " / ", local_starts.numel(), " / ",
+                local_ends.numel());
 
     if(total_q <= 0 || B <= 0)
         return;

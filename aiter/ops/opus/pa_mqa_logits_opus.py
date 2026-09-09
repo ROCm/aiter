@@ -281,6 +281,10 @@ def pa_mqa_logits_mxfp4_decode(
     block_k = int(block_k)
     total_q = int(q_fp4.shape[0])
     next_n_max = int(next_n_max)
+    if next_n_max <= 0:
+        raise ValueError(
+            f"next_n_max is the grid y-dim and must be >= 1, got {next_n_max}"
+        )
     if cu_seq_q is None:  # fixed-MTP: uniform per-batch qlen == next_n_max
         if total_q % next_n_max:
             raise ValueError(
@@ -300,8 +304,10 @@ def pa_mqa_logits_mxfp4_decode(
         batch = int(cu_seq_q.shape[0]) - 1
 
     # Split the context across CTAs only when query rows alone under-fill the GPU.
+    # An empty batch takes the no-split branch: there is nothing to launch and the C++ side
+    # returns before the grid is built, so the row count must not reach the division.
     max_chunks = max(1, (int(split_ctx_len) + block_k - 1) // block_k)
-    if total_q >= cta_target:
+    if total_q <= 0 or total_q >= cta_target:
         split_kv = 1
     else:
         split_kv = min(max_chunks, (cta_target + total_q - 1) // total_q)

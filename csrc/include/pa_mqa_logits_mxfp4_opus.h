@@ -264,7 +264,7 @@ enum class mqa_logits_sched {
 };
 }
 
-#ifndef __HIP_DEVICE_COMPILE__
+#if !defined(__HIP_DEVICE_COMPILE__) || !defined(__gfx950__)
 // Host pass: empty stub so the __device_stub__ symbol resolves for the launcher.
 namespace opus_logits {
 template<class T, mqa_logits_sched SCHED = mqa_logits_sched::Prefill>
