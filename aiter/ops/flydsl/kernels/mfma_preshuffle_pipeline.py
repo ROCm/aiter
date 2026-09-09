@@ -93,6 +93,37 @@ def _buffer_load_vec(
     return vector.bitcast(T.vec(int(vec_elems), elem_type), i32_vec)
 
 
+def _global_load_vec(
+    buffer_ops,
+    vector,
+    base_ptr,
+    idx,
+    *,
+    elem_type,
+    vec_elems,
+    elem_bytes,
+    offset_in_bytes,
+    cache_modifier=0,
+):
+    """Raw-pointer counterpart of :func:`_buffer_load_vec`.
+
+    Same ``idx`` convention, but the address is formed in full 64-bit by a GEP rather
+    than capped by ``buffer_load``'s 32-bit voffset. No hardware bounds check; see
+    ``buffer_ops.global_load_dwords``.
+    """
+    from flydsl.expr import arith as _ld_arith
+
+    elem_size = int(elem_bytes)
+    load_bytes = int(vec_elems) * elem_size
+    vec_width = load_bytes // 4
+
+    byte_idx = idx if offset_in_bytes else idx * _ld_arith.index(elem_size)
+    i32_vec = buffer_ops.global_load_dwords(
+        base_ptr, byte_idx, vec_width=vec_width, cache_modifier=cache_modifier
+    )
+    return vector.bitcast(T.vec(int(vec_elems), elem_type), i32_vec)
+
+
 @dataclass(frozen=True)
 class PreshuffleScaleLayout:
     """Container returned by `make_preshuffle_scale_layout`.

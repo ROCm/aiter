@@ -212,7 +212,17 @@ def _gemm1_body(
             _global_i32_buffer_view(addr_i64, num_bytes), fx.make_layout(tile_elems, 1)
         )
 
-    bq_tiles = _global_i32_buffer_tiles(arg_bq, BQ_BYTES, 4)
+    # The soffset below used to carry `e * N_OUT * K_HALF`, which overflows i32 before
+    # the buffer's own voffset would (9.85e9 at NE=896, N_OUT=6144, K_HALF=1792). Fold
+    # the expert into the descriptor's 64-bit base and keep the soffset expert-relative.
+    BQ_PER_EXPERT = BQ_BYTES // NE
+    assert BQ_PER_EXPERT == N_OUT * K_HALF, (
+        f"mxfp4 gemm1 per-expert B bytes {BQ_PER_EXPERT} != N_OUT*K_HALF "
+        f"({N_OUT * K_HALF}); the expert-relative soffset below assumes they match"
+    )
+    bq_tiles = _global_i32_buffer_tiles(
+        arg_bq + fx.Int64(e) * fx.Int64(BQ_PER_EXPERT), BQ_PER_EXPERT, 4
+    )
     bq_copy_atom = fx.make_copy_atom(fx.rocdl.BufferCopy128b(b_aux), fx.Int32)
     bq_reg_lay = fx.make_layout(4, 1)
 
@@ -264,7 +274,8 @@ def _gemm1_body(
             g = tile_il & fx.Int32(1)
             n0 = tile_il >> fx.Int32(1)
             col = (g * fx.Int32(N0_HALF) + n0) * fx.Int32(16)
-        v = (e * fx.Int32(N_OUT) + col) * fx.Int32(K_HALF)
+        # expert-relative: bq_tiles is already re-based to this expert
+        v = col * fx.Int32(K_HALF)
         b_load_s_base.append(rocdl.readfirstlane(T.i32, v))
 
     # -- b_scale_s_base / _hi (HIP 418-429) -----------------------------------
