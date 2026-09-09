@@ -17,6 +17,7 @@ from mori.shmem import mori_shmem_create_tensor
 
 from .fused_a2a_intranode_kernel import (
     _TRANSPORT_CHUNK_BYTES,
+    _transport_bytes,
     make_fused_a2a_dequant_jit,
     make_fused_a2a_jit,
     make_fused_a2a_out_jit,
@@ -44,9 +45,11 @@ class FusedA2AIntraNodeOp:
 
     Set split=True or FUSED_A2A_SPLIT=1 for three ordered per-tensor launches.
     Set quant=True or FUSED_A2A_QUANT=1 for Q/K/V quantized payloads.
-    FUSED_A2A_CODEC selects e4m3 (default), int8, or mxfp4 at construction.
+    FUSED_A2A_CODEC selects e4m3 (default), int8, mxfp4, or mxfp6 at construction.
     FUSED_A2A_CODEC_Q/K/V override the shared codec for individual roles.
     Raw mxfp4 payloads contain two E2M1 values per byte, low nibble first.
+    Raw mxfp6 payloads contain contiguous E2M3 six-bit codes, least-significant
+    bits first (four values per three bytes), with no padding.
     Quantized calls return locally dequantized bf16 Q/K/V by default.
     Set return_mode="fp8" or FUSED_A2A_QUANT_RETURN=fp8 for raw codec bytes in
     (outputs, (q_scales, k_scales, v_scales)); explicit return_mode overrides the env.
@@ -75,9 +78,9 @@ class FusedA2AIntraNodeOp:
             os.environ.get(f"FUSED_A2A_CODEC_{role}", self.codec) for role in "QKV"
         )
         for codec in (self.codec, *self.codecs):
-            if codec not in ("e4m3", "int8", "mxfp4"):
+            if codec not in ("e4m3", "int8", "mxfp4", "mxfp6"):
                 raise ValueError(
-                    f"expected codec 'e4m3', 'int8', or 'mxfp4', got {codec}"
+                    f"expected codec 'e4m3', 'int8', 'mxfp4', or 'mxfp6', got {codec}"
                 )
         self.return_mode = (
             os.environ.get("FUSED_A2A_QUANT_RETURN", "bf16")
@@ -132,7 +135,7 @@ class FusedA2AIntraNodeOp:
         self.outputs_sets = tuple(
             tuple(
                 mori_shmem_create_tensor(
-                    (numel // (2 if self.quant and codec == "mxfp4" else 1),),
+                    (_transport_bytes(numel, codec) if self.quant else numel,),
                     payload_dtype,
                 )
                 for codec in self.codecs

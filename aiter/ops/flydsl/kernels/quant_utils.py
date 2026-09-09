@@ -4,7 +4,7 @@
 """Shared MX-format quantization IR helpers for FlyDSL kernels.
 
 These functions emit MLIR/LLVM IR for the per-block E8M0 scale calculation
-and the f32 -> fp4 (e2m1) conversion. They are *IR builders* -- you must
+and f32 -> fp4 (e2m1) / fp6 (e2m3, e3m2) conversions. They are *IR builders* -- you must
 call them inside an active ``InsertionPoint`` (i.e. while the FlyDSL DSL
 is mid-build of a kernel function), and they emit the same arith / LLVM
 ops the kernels would otherwise emit inline.
@@ -250,6 +250,47 @@ def emit_f32_to_e2m1(qx_f32):
     e2m1 = normal_mask.select(normal_x, c0x7_i32)
     e2m1 = denormal_mask.select(denormal_x, e2m1)
     return (s >> c28_i32) | e2m1
+
+
+def _emit_f32_to_fp6(qx_f32, *, mbits, bias, max_bits):
+    shift = 23 - mbits
+    c1 = arith.constant(1, type=T.i32)
+    cshift = arith.constant(shift, type=T.i32)
+    c31 = arith.constant(31, type=T.i32)
+    cmin = arith.constant((128 - bias) << 23, type=T.i32)
+    cmax = arith.constant(max_bits, type=T.i32)
+    # Adding this power of two rounds subnormals directly onto their RNE grid.
+    cden = arith.constant((151 - bias - mbits) << 23, type=T.i32)
+    cnorm = arith.constant(
+        (((bias - 127) << 23) + (1 << (shift - 1)) - 1) & 0xFFFFFFFF,
+        type=T.i32,
+    )
+    bits = qx_f32.bitcast(T.i32)
+    sign = (bits & arith.constant(0x80000000, type=T.i32)) >> arith.constant(
+        26, type=T.i32
+    )
+    magnitude = bits & arith.constant(0x7FFFFFFF, type=T.i32)
+    denormal = arith.cmpi(CmpIPredicate.ult, magnitude, cmin)
+    normal = arith.cmpi(CmpIPredicate.ult, magnitude, cmax)
+    denorm_f32 = magnitude.bitcast(T.f32) + cden.bitcast(T.f32)
+    denorm_code = denorm_f32.bitcast(T.i32) - cden
+    odd = (magnitude >> cshift) & c1
+    normal_code = (magnitude + cnorm + odd) >> cshift
+    code = normal.select(normal_code, c31)
+    return sign | denormal.select(denorm_code, code)
+
+
+def emit_f32_to_e2m3(qx_f32):
+    """Convert scaled f32 to OCP FP6 E2M3, RNE with finite saturation.
+
+    Returns an i32 six-bit code (sign in bit 5), including signed zero.
+    """
+    return _emit_f32_to_fp6(qx_f32, mbits=3, bias=1, max_bits=0x40F00000)
+
+
+def emit_f32_to_e3m2(qx_f32):
+    """Convert scaled f32 to OCP FP6 E3M2, RNE with finite saturation."""
+    return _emit_f32_to_fp6(qx_f32, mbits=2, bias=3, max_bits=0x41E00000)
 
 
 def emit_amax_e8m0_native_scale(all_vals, *, wave_size, dtype=_D.FP8_E4M3):

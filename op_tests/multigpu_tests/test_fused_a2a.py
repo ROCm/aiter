@@ -11,6 +11,8 @@ import socket
 # The full codec sweep retains symmetric allocations until shmem_finalize.
 os.environ.setdefault("MORI_SHMEM_HEAP_SIZE", "12G")
 
+import flydsl.compiler as flyc
+import flydsl.expr as fx
 import mori.shmem as ms
 import pytest
 import torch
@@ -32,11 +34,89 @@ _CODEC_ROWS = (
     ("mxfp4", ("mxfp4", "mxfp4", "e4m3")),
     ("f4f4", ("mxfp4", "mxfp4", "mxfp4")),
     ("mixed", ("int8", "e4m3", "mxfp4")),
+    ("mxfp6", ("mxfp6", "mxfp6", "e4m3")),
+    ("f6f4", ("mxfp6", "mxfp6", "mxfp4")),
 )
 _CASES = (
     ("small", 8, 17, 128),
     ("deployed", 40, 9419, 128),
 )
+
+
+def _check_fp6_converters():
+    from flydsl.expr import T, const_expr
+
+    from aiter.ops.flydsl.kernels.buffer_ops import (
+        buffer_load,
+        buffer_store,
+        create_buffer_resource_from_addr,
+    )
+    from aiter.ops.flydsl.kernels.quant_utils import emit_f32_to_e2m3, emit_f32_to_e3m2
+
+    @flyc.kernel
+    def convert(
+        src: fx.Int64,
+        dst: fx.Int64,
+        count: fx.Constexpr[int],
+        variant: fx.Constexpr[int],
+    ):
+        index = fx.Int32(fx.gpu.block_id("x") * 256 + fx.gpu.thread_id("x"))
+        source = create_buffer_resource_from_addr(src)
+        output = create_buffer_resource_from_addr(dst)
+        if index < count:
+            value = buffer_load(source, index, vec_width=1, dtype=T.f32)
+            code = (
+                emit_f32_to_e2m3(value)
+                if const_expr(variant == 0)
+                else emit_f32_to_e3m2(value)
+            )
+            buffer_store(fx.Int32(code), output, index)
+
+    @flyc.jit
+    def launch(
+        src: fx.Int64,
+        dst: fx.Int64,
+        count: fx.Constexpr[int],
+        variant: fx.Constexpr[int],
+    ):
+        convert(src, dst, count, variant).launch(
+            grid=((count + 255) // 256,), block=(256,)
+        )
+
+    generator = torch.Generator().manual_seed(2307)
+    random = torch.randn(4096, generator=generator).cuda() * 32
+    for variant in ("e2m3", "e3m2"):
+        levels = _fp6_levels("cuda", variant)
+        midpoints = (levels[:-1] + levels[1:]) / 2
+        positive = torch.cat(
+            (
+                levels,
+                midpoints,
+                torch.nextafter(midpoints, torch.full_like(midpoints, float("inf"))),
+                torch.nextafter(midpoints, torch.zeros_like(midpoints)),
+                torch.tensor([1.96875, 1.9375, 65504.0, 1.0e-30], device="cuda"),
+            )
+        )
+        values = torch.cat((positive, -positive, random))
+        output = torch.empty_like(values, dtype=torch.int32)
+        launch(
+            fx.Int64(values.data_ptr()),
+            fx.Int64(output.data_ptr()),
+            values.numel(),
+            0 if variant == "e2m3" else 1,
+        )
+        torch.cuda.synchronize()
+        reference = _fp6_codes(values, variant).int()
+        _assert_equal(output, reference, f"{variant} converter")
+        _assert_equal(
+            _fp6_dequantize_codes(output, variant),
+            _fp6_dequantize_codes(reference, variant),
+            variant,
+        )
+        print(
+            f"PASS {variant} converter: {values.numel()} codes, all grid/midpoint neighbors and saturation",
+            flush=True,
+        )
 
 
 def _free_port():
@@ -122,8 +202,55 @@ def _mx_fp4_reference(values):
     return payload, exponent.to(torch.uint8)
 
 
+def _fp6_levels(device, variant="e2m3"):
+    mbits, bias = (3, 1) if variant == "e2m3" else (2, 3)
+    codes = torch.arange(32, device=device)
+    exponent, mantissa = codes >> mbits, codes & ((1 << mbits) - 1)
+    return torch.where(
+        exponent == 0,
+        mantissa.float() * 2.0 ** (1 - bias - mbits),
+        (1 + mantissa.float() / (1 << mbits)) * torch.exp2(exponent.float() - bias),
+    )
+
+
+def _fp6_codes(values, variant="e2m3"):
+    levels = _fp6_levels(values.device, variant)
+    magnitude = values.abs()
+    code = torch.zeros_like(values, dtype=torch.uint8)
+    for i in range(31):
+        midpoint = (levels[i] + levels[i + 1]) / 2
+        above = magnitude >= midpoint if i % 2 else magnitude > midpoint
+        code += above.to(torch.uint8)
+    return code | (torch.signbit(values).to(torch.uint8) << 5)
+
+
+def _fp6_dequantize_codes(codes, variant="e2m3"):
+    levels = _fp6_levels(codes.device, variant)
+    magnitude = levels[(codes & 31).long()]
+    return torch.where(codes & 32 != 0, -magnitude, magnitude)
+
+
+def _mx_fp6_reference(values):
+    """OCP E2M3 midpoint RNE, packed four codes per three bytes."""
+    blocks = values.float().reshape(*values.shape[:-1], -1, 32)
+    bits = (blocks.abs().amax(dim=-1) * (1.0 / 7.5)).view(torch.int32)
+    exponent = (((bits >> 23) & 255) + ((bits & 0x7FFFFF) != 0).int()).clamp(0, 255)
+    reciprocal = ((254 - exponent) << 23).view(torch.float32)
+    codes = _fp6_codes(blocks * reciprocal.unsqueeze(-1)).reshape(-1, 4).int()
+    words = codes[:, 0] | (codes[:, 1] << 6) | (codes[:, 2] << 12) | (codes[:, 3] << 18)
+    payload = torch.stack((words & 255, (words >> 8) & 255, words >> 16), dim=-1)
+    return payload.to(torch.uint8).reshape(
+        *values.shape[:-1], values.shape[-1] * 3 // 4
+    ), exponent.to(torch.uint8)
+
+
 def _dequantize(payload, scales, dtype=torch.float32, codec="e4m3"):
-    if codec == "mxfp4":
+    if codec == "mxfp6":
+        triplets = payload.reshape(-1, 3).int()
+        words = triplets[:, 0] | (triplets[:, 1] << 8) | (triplets[:, 2] << 16)
+        codes = torch.stack([(words >> (i * 6)) & 63 for i in range(4)], dim=-1)
+        values = _fp6_dequantize_codes(codes)
+    elif codec == "mxfp4":
         nibble = torch.stack((payload & 15, payload >> 4), dim=-1).long()
         levels = torch.tensor(
             [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0], device=payload.device
@@ -145,6 +272,30 @@ def _assert_quantized(
     _assert_equal(scales, reference_scales, f"{label} scales")
     actual = _dequantize(payload, scales, codec=codec)
     return _assert_quantized_values(actual, reference, oracle, label)
+
+
+def _assert_fused_fp6_scales(actual, reference, reference_amax, label):
+    different = actual != reference
+    delta = (actual.int() - reference.int()).abs()
+    lower = torch.minimum(actual, reference).float()
+    threshold = 7.5 * torch.exp2(lower - 127.0)
+    relative_distance = (reference_amax - threshold).abs() / threshold
+    # E8M0 steps at amax / 7.5 powers of two. Different FP32 reduction orders
+    # can straddle that threshold; neither ordering is intrinsically more correct.
+    tie = (
+        (delta == 1)
+        & torch.isfinite(relative_distance)
+        & (relative_distance <= 8 * torch.finfo(torch.float32).eps)
+    )
+    if torch.any(different & ~tie):
+        _assert_equal(actual[~tie], reference[~tie], f"{label} non-tie scales")
+    count = int(different.sum().item())
+    fraction = count / actual.numel()
+    if fraction > 1.0e-5:
+        raise AssertionError(
+            f"{label}: scale ties {count}/{actual.numel()} exceed 1e-5"
+        )
+    return count, actual.numel()
 
 
 def _assert_quantized_values(actual, reference, oracle, label):
@@ -448,6 +599,7 @@ def _run_rank(rank, world_size, port):
                 "int8": _mx_int8_reference,
                 "e4m3": _mx_fp8_reference,
                 "mxfp4": _mx_fp4_reference,
+                "mxfp6": _mx_fp6_reference,
             }
             for row_name, codecs in _CODEC_ROWS:
                 for role, role_codec in zip("QKV", codecs, strict=True):
@@ -461,7 +613,7 @@ def _run_rank(rank, world_size, port):
                         [payload],
                         heads_local,
                         seq_len,
-                        head_dim // (2 if role_codec == "mxfp4" else 1),
+                        head_dim * {"mxfp4": 4, "mxfp6": 6}.get(role_codec, 8) // 8,
                     )[0]
                     for (payload, _), role_codec in zip(quantized, codecs, strict=True)
                 ]
@@ -541,6 +693,116 @@ def _run_rank(rank, world_size, port):
                             "dequant=bit-exact epochs=3",
                             flush=True,
                         )
+            for row_name, codecs in _CODEC_ROWS[-2:]:
+                for role, role_codec in zip("QKV", codecs, strict=True):
+                    os.environ[f"FUSED_A2A_CODEC_{role}"] = role_codec
+                fused_inputs = (
+                    _norm_rope(q, norm_q, cos, sin, torch.float32),
+                    _norm_rope(k, norm_k, cos, sin, torch.float32),
+                    v,
+                )
+                quantized = [
+                    quantizers[role_codec](value)
+                    for value, role_codec in zip(fused_inputs, codecs, strict=True)
+                ]
+                quant_references = a2a_references(
+                    [
+                        _dequantize(payload, scale, codec=role_codec)
+                        for (payload, scale), role_codec in zip(
+                            quantized, codecs, strict=True
+                        )
+                    ],
+                    heads_local,
+                    seq_len,
+                    head_dim,
+                )
+                scale_references = a2a_references(
+                    [scale for _, scale in quantized],
+                    heads_local,
+                    seq_len,
+                    head_dim // 32,
+                )
+                amax_references = a2a_references(
+                    [
+                        value.float().reshape(*value.shape[:-1], -1, 32).abs().amax(-1)
+                        for value in fused_inputs[:2]
+                    ],
+                    heads_local,
+                    seq_len,
+                    head_dim // 32,
+                )
+                for split, return_mode in ((False, "fp8"), (True, "bf16")):
+                    tie_counts = [0, 0]
+                    op = FusedA2AIntraNodeOp(
+                        rank=rank,
+                        world_size=world_size,
+                        shape=q.shape,
+                        fuse_norm_rope=True,
+                        split=split,
+                        quant=True,
+                        return_mode=return_mode,
+                    )
+                    for epoch in range(3):
+                        result = op(*inputs, norm_q, norm_k, cos, sin)
+                        torch.cuda.synchronize()
+                        payloads = (
+                            result[0]
+                            if return_mode == "fp8"
+                            else op.outputs_sets[epoch % 2]
+                        )
+                        scales = (
+                            result[1]
+                            if return_mode == "fp8"
+                            else op.scales_sets[epoch % 2]
+                        )
+                        for i, role_codec in enumerate(codecs):
+                            label = f"{case_name} fused {row_name} {return_mode} {'qkv'[i]} rank={rank} epoch={epoch}"
+                            if i < 2:
+                                count, total = _assert_fused_fp6_scales(
+                                    scales[i].view_as(scale_references[i]),
+                                    scale_references[i],
+                                    amax_references[i],
+                                    label,
+                                )
+                                tie_counts[0] += count
+                                tie_counts[1] += total
+                            else:
+                                _assert_equal(
+                                    scales[i].view_as(scale_references[i]),
+                                    scale_references[i],
+                                    label,
+                                )
+                            decoded = _dequantize(
+                                payloads[i],
+                                scales[i].view_as(scale_references[i]),
+                                codec=role_codec,
+                            )
+                            actual = (
+                                decoded
+                                if return_mode == "fp8"
+                                else result[i].view(expected_shape)
+                            )
+                            reference = quant_references[i]
+                            if return_mode == "bf16":
+                                _assert_quantized_values(
+                                    decoded, reference, references[i], label
+                                )
+                                _assert_equal(actual, decoded.to(torch.bfloat16), label)
+                                reference = reference.to(torch.bfloat16)
+                            _assert_quantized_values(
+                                actual, reference, references[i], label
+                            )
+                        dist.barrier()
+                    counts = torch.tensor(tie_counts, dtype=torch.int64, device=device)
+                    dist.all_reduce(counts)
+                    if rank == 0:
+                        ties, blocks_checked = counts.tolist()
+                        print(
+                            f"PASS {case_name} row={row_name} split={split} norm_rope=True return={return_mode}: "
+                            f"format-correct epochs=3 scale-ties={ties}/{blocks_checked} "
+                            f"fraction={ties / blocks_checked:.9g}",
+                            flush=True,
+                        )
             for role in "QKV":
                 os.environ.pop(f"FUSED_A2A_CODEC_{role}", None)
 
@@ -601,9 +863,10 @@ def main():
         )
         return 0
 
+    _check_fp6_converters()
     mp.spawn(_run_rank, args=(_WORLD_SIZE, _free_port()), nprocs=_WORLD_SIZE, join=True)
-    passed = sum(
-        8 + 3 * (name == "small") + int(_WORLD_SIZE >= 2) + 2 * len(_CODEC_ROWS)
+    passed = 2 + sum(
+        12 + 3 * (name == "small") + int(_WORLD_SIZE >= 2) + 2 * len(_CODEC_ROWS)
         for name, *_ in _CASES
     )
     skipped = len(_CASES) * int(_WORLD_SIZE < 2)
