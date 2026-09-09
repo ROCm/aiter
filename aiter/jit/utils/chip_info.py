@@ -23,8 +23,45 @@ from torch_guard import torch_compile_guard
 logger = logging.getLogger("aiter")
 
 
+def _active_device_index() -> int | None:
+    """Ordinal of the HIP device this process launches on.
+
+    None when there is no HIP context to ask (torch missing, no visible device,
+    driver unusable).
+    """
+    try:
+        import torch
+
+        if not torch.cuda.is_available():
+            return None
+        return int(torch.cuda.current_device())
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _active_device_props():
+    """torch device properties of the active HIP device, or None."""
+    index = _active_device_index()
+    if index is None:
+        return None
+    try:
+        import torch
+
+        return torch.cuda.get_device_properties(index)
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _active_device_arch() -> str | None:
+    """gfx name of the active HIP device, or None."""
+    # gcnArchName carries target features: "gfx942:sramecc+:xnack-".
+    arch = getattr(_active_device_props(), "gcnArchName", "")
+    return arch.split(":", 1)[0].strip().lower() or None
+
+
 @functools.lru_cache(maxsize=1)
-def _detect_native() -> list[str]:
+def _detect_native_rocminfo() -> list[str]:
+    """Arch of the first GPU agent rocminfo enumerates."""
     try:
         rocminfo = executable_path("rocminfo")
         result = subprocess.run(
@@ -40,6 +77,21 @@ def _detect_native() -> list[str]:
     except Exception as e:
         raise RuntimeError(f"Get GPU arch from rocminfo failed: {e}") from e
     raise RuntimeError("No gfx arch found in rocminfo output.")
+
+
+def _detect_native() -> list[str]:
+    """Arch of the GPU this process would launch kernels on.
+
+    Prefers the active HIP device; falls back to rocminfo. That fallback names
+    the first GPU agent on the host, which is not the launching device once
+    HIP_VISIBLE_DEVICES or torch.cuda.set_device() has selected another.
+    Deliberately uncached: a call made before the HIP context exists would pin
+    the fallback.
+    """
+    arch = _active_device_arch()
+    if arch is not None:
+        return [arch]
+    return _detect_native_rocminfo()
 
 
 @torch_compile_guard()
@@ -60,7 +112,7 @@ def _resolve_dispatch_arch(archs: list[str]) -> str:
     return live_gfx if live_gfx in archs else max(archs)
 
 
-@functools.lru_cache(maxsize=10)
+@functools.lru_cache(maxsize=1)
 def get_gfx_custom_op_core() -> int:
     archs = get_build_archs_env() or _parse_gpu_archs_env(
         os.getenv("GPU_ARCHS", "native")
@@ -105,15 +157,26 @@ def get_lds_capacity_bytes(gfx: str | None = None) -> int:
         raise ValueError(f"Unknown LDS capacity for architecture {arch!r}") from exc
 
 
-@functools.lru_cache(maxsize=1)
+# Not an lru_cache: the rocminfo fallback must never be pinned. A caller that
+# runs before the HIP context exists (module import) would otherwise fix that
+# arch for the rest of the process.
+_GFX_RUNTIME: str | None = None
+
+
 def get_gfx_runtime() -> str:
-    """Return the arch of the live GPU, always via rocminfo.
+    """Return the arch of the live GPU, resolved from the active HIP device.
 
     Unlike get_gfx(), ignores GPU_ARCHS -- always detects the actual running
     GPU.  Use for runtime dispatch decisions (selecting tuned kernels, picking
     code paths).  Use get_gfx() for build-time codegen paths (gen_instances,
     csrc module-level arch selection) where no GPU may be available.
+
+    Memoised only once a HIP context has backed the answer; the rocminfo
+    fallback stays live.
     """
+    global _GFX_RUNTIME
+    if _GFX_RUNTIME is not None:
+        return _GFX_RUNTIME
     gfx_arch = _detect_native()[0]
     supported = set(GFX_MAP.values())
     if gfx_arch not in supported:
@@ -121,7 +184,19 @@ def get_gfx_runtime() -> str:
             f"Unknown GPU architecture: {gfx_arch}. "
             f"Supported architectures: {sorted(supported)}"
         )
+    if _active_device_arch() is not None:
+        _GFX_RUNTIME = gfx_arch
     return gfx_arch
+
+
+def _clear_gfx_runtime_cache() -> None:
+    """Drop the memoised arch."""
+    global _GFX_RUNTIME
+    _GFX_RUNTIME = None
+
+
+# Preserves the cache_clear() this function exposed while it was an lru_cache.
+get_gfx_runtime.cache_clear = _clear_gfx_runtime_cache
 
 
 # Backfill map for legacy tuned configs that predate the `gfx` column.
@@ -179,6 +254,11 @@ def get_gfx_list() -> list[str]:
 def get_cu_num_custom_op() -> int:
     cu_num = int(os.getenv("CU_NUM", "0"))
     if cu_num == 0:
+        # The launching device, not the first agent on the host -- and it
+        # reports the current partition's CU count.
+        props = _active_device_props()
+        if props is not None:
+            return int(props.multi_processor_count)
         try:
             rocminfo = executable_path("rocminfo")
             result = subprocess.run(
@@ -516,8 +596,13 @@ def write_lookup_header(
         f.write(lookup_end)
 
 
-def _get_pci_chip_id(device_id=0):
+def _get_pci_chip_id(device_id=None):
     import ctypes
+
+    if device_id is None:
+        # Device 0 need not be the device this process launches on.
+        active = _active_device_index()
+        device_id = 0 if active is None else active
 
     libhip = ctypes.CDLL("libamdhip64.so")
     chip_id = ctypes.c_int(0)
