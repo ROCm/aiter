@@ -46,7 +46,7 @@ class FusedA2AIntraNodeOp:
 
     Set split=True or FUSED_A2A_SPLIT=1 for three ordered per-tensor launches.
     Set quant=True or FUSED_A2A_QUANT=1 for Q/K/V quantized payloads.
-    FUSED_A2A_CODEC selects e4m3 (default), int8, mxfp4, or mxfp6 at construction.
+    FUSED_A2A_CODEC selects e4m3 (default), int8, mxfp4, mxfp6, or mxfp8.
     FUSED_A2A_CODEC_Q/K/V override the shared codec for individual roles.
     FUSED_A2A_HADAMARD=1 applies normalized Walsh-Hadamard to Q/K before
     quantization (after norm/RoPE when fused). V is unchanged. Default is off;
@@ -59,11 +59,13 @@ class FusedA2AIntraNodeOp:
     (outputs, (q_scales, k_scales, v_scales)); explicit return_mode overrides the env.
     The legacy "fp8" return-mode name also selects raw bytes for int8.
     Scales follow the receive layout with one E8M0 byte per 32 adjacent values.
-    FUSED_A2A_V4_OUTPUT=1 selects MHA V4 MXFP4 Q/K bytes (not V); per-role
+    FUSED_A2A_V4_OUTPUT=1 selects MHA V4 Q/K bytes (not V); per-role
     FUSED_A2A_V4_OUTPUT_Q/K/V overrides are available. Requires raw return.
-    V4 V requires split=True and S divisible by 32; it uses token-axis scales
-    in gather order and padded, permuted 128-token payload tiles with 64B slack.
-    Q is BSHD; K uses padded 128-token, four-plane tiles; both scales are BSH4.
+    V4 V requires split=True and S divisible by 32. MXFP4 V uses token-axis
+    scales in gather order and permuted 128-token tiles with 64B slack.
+    E4M3 V uses BSHD bytes and one float32 descale per destination tensor;
+    one extra launch exchanges send-side partial maxima before quantization.
+    MXFP8 Q/K are BSHD; low-bit K uses padded tiles. Q/K scales are BSH4.
     V4 Q/K always rotate, and Q folds the explicit softmax_scale * log2(e).
     All ranks must use the same mode and serialize calls on one stream.
     """
