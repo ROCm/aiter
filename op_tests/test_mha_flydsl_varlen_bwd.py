@@ -26,7 +26,6 @@ import torch
 import aiter
 from aiter import dtypes
 from aiter.jit.utils.chip_info import get_gfx
-from aiter.ops.flydsl import is_flydsl_available
 from aiter.ops.flydsl.fmha_kernels import flydsl_flash_attn_varlen_bwd
 from aiter.ops.mha import flash_attn_varlen_func
 from aiter.test_common import benchmark, checkAllclose, run_perftest
@@ -286,8 +285,8 @@ _PYTEST_CASES = [(c, 2) for c in SEQLEN_CASES] + [("small", 16)]
 
 
 @pytest.mark.skipif(
-    get_gfx() not in SUPPORTED_GFX or not is_flydsl_available(),
-    reason="flydsl varlen fmha backward requires flydsl on gfx942",
+    get_gfx() not in SUPPORTED_GFX,
+    reason="flydsl varlen fmha backward requires gfx942",
 )
 @pytest.mark.parametrize("case, nheads", _PYTEST_CASES)
 def test_fmha_varlen_bwd(case, nheads):
@@ -310,9 +309,6 @@ def main():
         aiter.logger.warning(
             "flydsl varlen fmha backward unsupported on %s; skipping", get_gfx()
         )
-        return
-    if not is_flydsl_available():
-        aiter.logger.warning("flydsl is not installed; skipping")
         return
 
     parser = argparse.ArgumentParser(

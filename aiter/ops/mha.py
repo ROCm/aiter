@@ -3305,8 +3305,6 @@ def _flash_attn_varlen_backward(
         # `can_impl_fmha_v3_bwd*` gates exclude by requiring hdim_q == hdim_v.
         # `deterministic` is absent on purpose: the kernel uses no atomics and
         # writes each of dq/dk/dv exactly once, so it is deterministic either way.
-        from .flydsl.utils import is_flydsl_available
-
         ret = get_gfx() == "gfx942"
         ret &= alibi_slopes is None
         ret &= dropout_p == 0.0
@@ -3326,7 +3324,6 @@ def _flash_attn_varlen_backward(
         # dq/dk/dv are optional here; the launcher allocates contiguous ones when
         # they are None.
         ret &= all(x is None or x.is_contiguous() for x in (dq, dk, dv))
-        ret &= is_flydsl_available()
 
         return ret
 

@@ -66,7 +66,6 @@ import torch.nn.functional as F
 import aiter
 from aiter import dtypes
 from aiter.jit.utils.chip_info import get_gfx
-from aiter.ops.flydsl import is_flydsl_available
 from aiter.ops.flydsl.fmha_kernels import flydsl_flash_attn_varlen_bwd
 from aiter.ops.mha import fmha_v3_varlen_bwd, mha_varlen_bwd
 from aiter.test_common import checkAllclose
@@ -489,12 +488,7 @@ def main():
         )
         return
 
-    # Only the flydsl candidate needs flydsl installed; the others are in-tree,
-    # so drop just that row rather than the whole run.
     names = [b for b in BACKENDS if b in args.backend]
-    if "flydsl" in names and not is_flydsl_available():
-        aiter.logger.warning("flydsl is not installed; skipping the flydsl backend")
-        names = [b for b in names if b != "flydsl"]
     if not names:
         return
 
