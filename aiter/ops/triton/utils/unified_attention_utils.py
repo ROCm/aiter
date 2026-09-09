@@ -155,7 +155,8 @@ def compute_tile_params(config: dict, block_size: int) -> dict:
 def compute_segment_params(config: dict, params) -> dict:
     """Derive NUM_SEGMENTS: how many ways to split the KV range for one query.
 
-    MFMA_DIM scales the budget down by the warps one program spans: a program
+    MFMA_DIM (gluon/gfx950):
+    scales the budget down by the warps one program spans: a program
     holding several slots but counted once over-splits by that factor.
     SPLIT_MIN_TILES and SPLIT_MIN_SHARE refuse the split outright, for too
     little context to divide or too few segments to pay for a reduce pass.
@@ -185,7 +186,7 @@ def compute_segment_params(config: dict, params) -> dict:
 
     budget = params.num_sms * per_cu
     prgms = max(1, params.num_2d_prgms)
-    # this is specific to gfx950 luon as the num waves depends on mfma dim there
+    # this is specific to gfx950 gluon as the num waves depends on mfma dim there
     if mfma_dim:
         budget //= max(1, triton.next_power_of_2(params.num_queries_per_kv) // mfma_dim)
     share = triton.cdiv(budget, prgms)
