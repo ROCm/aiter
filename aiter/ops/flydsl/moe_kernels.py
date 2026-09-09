@@ -1033,9 +1033,6 @@ def _run_moe_reduction(
     topk_weights=None,
     fp8_scale_blk=None,
     fp8_pitch_align=None,
-    # Appended rather than inserted: everything above keeps the position it has
-    # on main, so an existing positional caller cannot be silently rebound.
-    model_dim_pad=0,
 ):
     """Topk reduction epilogue for stage2 reduce mode."""
     use_mask = expert_mask is not None
@@ -1104,7 +1101,6 @@ def _run_moe_reduction(
     reduce_exe = compile_moe_reduction(
         topk=topk,
         model_dim=model_dim,
-        model_dim_pad=model_dim_pad,
         dtype_str=_reduce_dtype_str,
         use_mask=use_mask,
         num_experts=num_experts,
@@ -2285,16 +2281,14 @@ def _flydsl_moe_stage2_impl(
             token_num,
             topk,
             model_dim,
-            model_dim_pad=model_dim_pad,
             expert_mask=expert_mask,
             topk_ids=topk_ids,
             is_fp8=_s2_fp8_inter,
             fp8_scale_blk=_S2_LEGACY_FP8_SCALE_BLK,
             fp8_pitch_align=_S2_LEGACY_FP8_PITCH_ALIGN,
         )
-    if return_per_slot and model_dim_pad > 0:
-        # No reduction kernel runs in this debug/raw-output mode, so normalize
-        # its unlaunched padded tiles here.
+    if not accumulate and model_dim_pad > 0:
+        # Normalize padding that GEMM2 leaves unwritten.
         out.view(-1, model_dim)[:, model_dim - model_dim_pad :].zero_()
     return out
 
