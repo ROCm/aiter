@@ -230,8 +230,7 @@ def build_flash_attn_dualwave_swp_fp8_module(
             m_tile = softmax_helper.max2(
                 softmax_helper.reduce_max(v_s_a), softmax_helper.reduce_max(v_s_b)
             )
-            if const_expr(traits.CAUSAL):
-                m_tile = softmax_helper.floor_masked_max(m_tile)
+            m_tile = softmax_helper.floor_masked_max(m_tile)
             return m_tile
 
         def _load_q_regs():
