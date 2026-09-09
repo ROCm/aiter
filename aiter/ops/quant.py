@@ -1291,11 +1291,15 @@ def _rope_rotate_activation_fp4quant(
     positions: torch.Tensor,
     rope_dim: int,
     group_size: int = 32,
-    shuffle_scale: bool = True,
+    scale_layout: int = 1,
     do_rotate_act: bool = True,
 ) -> None:
     """Apply GPT-J style (interleaved) RoPE to trailing ``rope_dim``,
-    Hadamard-rotate, then FP4-quantize into packed ``out`` + e8m0 ``scale``."""
+    Hadamard-rotate, then FP4-quantize into packed ``out`` + e8m0 ``scale``.
+
+    ``scale_layout`` picks the e8m0 permutation: 0 natural, 1 FlyDSL/MFMA-16x16,
+    2 OPUS/MFMA-32x32. All are the same size, so passing the wrong one is
+    silent -- the consumer reads plausible scales at wrong offsets."""
 
 
 @compile_ops("module_dsv4_rotate_quant", fc_name="rope_rotate_activation", develop=True)
@@ -1331,6 +1335,10 @@ def _rope_rotate_activation_fp8quant(
     """
 
 
+# Must match `scale_layout_t` in csrc/include/dsv4_rotate_quant.h.
+_SCALE_LAYOUTS = {"natural": 0, "fly16": 1, "opus32": 2}
+
+
 def rope_rotate_activation(
     out: torch.Tensor,
     input: torch.Tensor,
@@ -1342,14 +1350,21 @@ def rope_rotate_activation(
     group_size: int | None = None,
     shuffle_scale: bool = True,
     do_rotate_act: bool = True,
+    scale_layout: str | None = None,
 ) -> None:
     """Apply GPT-J style (interleaved) RoPE to trailing ``rope_dim``, then
     Hadamard-rotate, dispatching on ``out.dtype``:
 
     - bf16/fp16 ``out``: plain rope+hadamard in place (``scale`` ignored).
     - ``fp4x2`` ``out``: FP4-quantize into packed ``out`` + e8m0 ``scale``
-      (``scale`` required; ``group_size`` defaults to 32). ``shuffle_scale``
-      selects the dsv4 preshuffled scale layout.
+      (``scale`` required; ``group_size`` defaults to 32). ``scale_layout``
+      picks the e8m0 permutation -- ``"natural"``, ``"fly16"`` (FlyDSL /
+      MFMA 16x16) or ``"opus32"`` (OPUS / MFMA 32x32). All are the same size,
+      so handing a consumer the wrong one is silent: it reads plausible scales
+      at wrong offsets. Name the layout the consumer reads.
+
+      ``shuffle_scale`` is the older boolean spelling (True -> ``"fly16"``,
+      False -> ``"natural"``) and is ignored when ``scale_layout`` is given.
     - ``fp8`` ``out``: per-(row, 1xGROUP) fp8-quantize into ``out`` + fp32
       ``scale`` (``scale`` required; ``group_size`` defaults to 128).
 
@@ -1367,7 +1382,13 @@ def rope_rotate_activation(
             positions,
             rope_dim,
             group_size=32 if group_size is None else group_size,
-            shuffle_scale=shuffle_scale,
+            scale_layout=_SCALE_LAYOUTS[
+                (
+                    scale_layout
+                    if scale_layout is not None
+                    else ("fly16" if shuffle_scale else "natural")
+                )
+            ],
             do_rotate_act=do_rotate_act,
         )
     elif out.dtype == dtypes.fp8:

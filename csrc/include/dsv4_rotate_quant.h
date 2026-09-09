@@ -8,6 +8,20 @@
 
 namespace aiter {
 
+// E8M0 scale layouts the fp4 quantizers can emit. All three are the same size,
+// so feeding a kernel the wrong one is silent -- it reads plausible
+// power-of-two scales at wrong offsets. A writer must name which it emits.
+//
+//   kNatural : row-major [rows, dim/group_size]
+//   kFly16   : FlyDSL / MFMA 16x16, [.., k_tiles, 4, 16, m_tiles_padded]
+//   kOpus32  : OPUS / MFMA 32x32,   [.., K_CHUNKS, 32, SCALE_BYTES]
+enum scale_layout_t : int32_t
+{
+    SCALE_LAYOUT_NATURAL = 0,
+    SCALE_LAYOUT_FLY16   = 1,
+    SCALE_LAYOUT_OPUS32  = 2,
+};
+
 void rotate_activation_fp4quant(aiter_tensor_t& out,
                                         aiter_tensor_t& scale,
                                         const aiter_tensor_t& input,
@@ -26,7 +40,7 @@ void rope_rotate_activation_fp4quant(aiter_tensor_t& out,
                                             const aiter_tensor_t& positions,
                                             int32_t rope_dim,
                                             int32_t group_size = 32,
-                                            bool shuffle_scale = true,
+                                            int32_t scale_layout = SCALE_LAYOUT_FLY16,
                                             bool do_rotate_act = true);
 
 // rope+hadamard, bf16/fp16 in-place (out shares dtype/stride with input).

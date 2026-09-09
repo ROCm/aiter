@@ -93,12 +93,44 @@ __device__ __forceinline__ void store_scale_e8m0(opus::e8m0_t* __restrict__ scal
                                                   const int32_t head_num,
                                                   const int32_t groups_per_row,
                                                   const int32_t group_idx,
-                                                  const bool shuffle_scale)
+                                                  const int32_t dim,
+                                                  const int32_t scale_layout)
 {
     auto* scale_u8 = reinterpret_cast<uint8_t*>(scale);
-    if(!shuffle_scale)
+    if(scale_layout == SCALE_LAYOUT_NATURAL)
     {
         scale_u8[static_cast<int64_t>(row_idx) * groups_per_row + group_idx] = scale_e8m0;
+        return;
+    }
+
+    if(scale_layout == SCALE_LAYOUT_OPUS32)
+    {
+        // MFMA 32x32, out shape [rows/MFMA_N, K_CHUNKS, MFMA_N, SCALE_BYTES]:
+        // rows split (tile, m) = divmod(row, 32), groups split
+        // (kt, g) = divmod(group, K_CHUNKS), byte index = kt * n_tiles + tile.
+        //
+        // Each factor is derived from its own definition, not from whatever is
+        // equal at H=64/D=128/group=32 -- there k_tiles, k_chunks and n_tiles
+        // all happen to be 2. SCALE_BYTES is exactly k_tiles*n_tiles, so unlike
+        // kFly16 there is no padding lane to zero-fill.
+        constexpr int32_t kMfmaN  = 32;
+        constexpr int32_t kMfmaK  = 64;
+        const int32_t k_tiles     = dim / kMfmaK;
+        const int32_t k_chunks    = groups_per_row / k_tiles;
+        const int32_t n_tiles     = head_num / kMfmaN;
+        const int32_t scale_bytes = k_tiles * n_tiles;
+
+        const int32_t prefix_idx = row_idx / head_num;
+        const int32_t head_idx   = row_idx - prefix_idx * head_num;
+        const int32_t tile       = head_idx / kMfmaN;
+        const int32_t m_inner    = head_idx - tile * kMfmaN;
+        const int32_t kt         = group_idx / k_chunks;
+        const int32_t g          = group_idx - kt * k_chunks;
+
+        const int64_t base =
+            static_cast<int64_t>(prefix_idx) * k_chunks * kMfmaN * scale_bytes;
+        scale_u8[base + (static_cast<int64_t>(g) * kMfmaN + m_inner) * scale_bytes +
+                 kt * n_tiles + tile] = scale_e8m0;
         return;
     }
 
@@ -269,7 +301,7 @@ __global__ void hadamard_rotate_activation_fp4quant_kernel(DTYPE_O* __restrict__
                                                             const int32_t head_num,
                                                             const int32_t stride,
                                                             const int32_t out_stride,
-                                                            const bool shuffle_scale,
+                                                            const int32_t scale_layout,
                                                             const int32_t group_size)
 {
     constexpr int warp_size = opus::get_warp_size();
@@ -377,7 +409,8 @@ __global__ void hadamard_rotate_activation_fp4quant_kernel(DTYPE_O* __restrict__
                              head_num,
                              groups_per_row,
                              col_offset >> log2_group_size,
-                             shuffle_scale);
+                             dim,
+                             scale_layout);
         }
 
         store_vector<DTYPE_O_STORE, float, vec_size, RT, false, WARP_SIZE, 1, DTYPE_O>(
@@ -401,7 +434,7 @@ __global__ void hadamard_rotate_activation_fp4quant_kernel(DTYPE_O* __restrict__
                                                         reinterpret_cast<DTYPE_O*>(out.data_ptr()), \
                                                         reinterpret_cast<opus::e8m0_t*>(scale_ptr), \
                                                         reinterpret_cast<DTYPE_I*>(input.data_ptr()), \
-                                                        m, head_num, stride, out_stride, shuffle_scale, group_size); \
+                                                        m, head_num, stride, out_stride, scale_layout, group_size); \
                                             });
 
 void rotate_activation_fp4quant(aiter_tensor_t& out,
@@ -412,6 +445,8 @@ void rotate_activation_fp4quant(aiter_tensor_t& out,
 {
     AITER_CHECK(group_size > 0 && (group_size & (group_size - 1)) == 0,
                 "group_size must be a power of 2");
+    // No OPUS consumer on this entry point; keep the boolean API and map it.
+    const int32_t scale_layout = shuffle_scale ? SCALE_LAYOUT_FLY16 : SCALE_LAYOUT_NATURAL;
     AITER_CHECK(group_size == 32 || group_size == 64 || group_size == 128,
                 "group_size must be 32, 64, 128");
     const int32_t dim = input.size(-1);
@@ -484,7 +519,7 @@ void rotate_activation(aiter_tensor_t& out,
     const int32_t out_stride = out.stride(-2);
     const int32_t m = input.numel() / dim;
     const int32_t head_num = input.size(-2);
-    const bool shuffle_scale = false;
+    const int32_t scale_layout = SCALE_LAYOUT_NATURAL;
     const int32_t group_size = 0;
     
     HipDeviceGuard device_guard(input.device_id);
@@ -528,7 +563,7 @@ __global__ void rope_hadamard_rotate_activation_fp4quant_kernel(DTYPE_O* __restr
                                                                         const int32_t rope_dim,
                                                                         const int32_t stride,
                                                                         const int32_t out_stride,
-                                                                        const bool shuffle_scale,
+                                                                        const int32_t scale_layout,
                                                                         const int32_t group_size)
 {
     constexpr int warp_size = opus::get_warp_size();
@@ -674,7 +709,8 @@ __global__ void rope_hadamard_rotate_activation_fp4quant_kernel(DTYPE_O* __restr
                              head_num,
                              groups_per_row,
                              col_offset >> log2_group_size,
-                             shuffle_scale);
+                             dim,
+                             scale_layout);
         }
 
         store_vector<DTYPE_O_STORE, float, vec_size, RT, false, WARP_SIZE, 1, DTYPE_O>(
@@ -703,7 +739,7 @@ __global__ void rope_hadamard_rotate_activation_fp4quant_kernel(DTYPE_O* __restr
                                                         reinterpret_cast<DTYPE_I const*>(cos.data_ptr()), \
                                                         reinterpret_cast<DTYPE_I const*>(sin.data_ptr()), \
                                                         reinterpret_cast<int64_t const*>(positions.data_ptr()), \
-                                                        m, head_num, rope_dim, stride, out_stride, shuffle_scale, group_size); \
+                                                        m, head_num, rope_dim, stride, out_stride, scale_layout, group_size); \
                                             });
 
 #define ROPE_ROTATE_ACTIVATION_FP4QUANT_KERNEL_IMPL(dim, fp4quant, vec_size, name) \
@@ -721,7 +757,7 @@ void rope_rotate_activation_fp4quant(aiter_tensor_t& out,
                                      const aiter_tensor_t& positions,
                                      const int32_t rope_dim,
                                      const int32_t group_size,
-                                     const bool shuffle_scale,
+                                     const int32_t scale_layout,
                                      const bool do_rotate_act)
 {
     AITER_CHECK(group_size > 0 && (group_size & (group_size - 1)) == 0,
@@ -764,7 +800,10 @@ void rope_rotate_activation_fp4quant(aiter_tensor_t& out,
     AITER_CHECK(dim % block_size == 0, "dim must be divisible by block_size");
     AITER_CHECK(scale.element_size() == 1, "scale element size must be 1");
     const int32_t groups_per_row = dim / group_size;
-    if(shuffle_scale)
+    AITER_CHECK(scale_layout == SCALE_LAYOUT_NATURAL || scale_layout == SCALE_LAYOUT_FLY16 ||
+                    scale_layout == SCALE_LAYOUT_OPUS32,
+                "scale_layout must be 0 (natural), 1 (fly16) or 2 (opus32)");
+    if(scale_layout == SCALE_LAYOUT_FLY16)
     {
         AITER_CHECK(head_num % 16 == 0, "head_num must be divisible by 16 for shuffled scale");
         AITER_CHECK(groups_per_row % 4 == 0,
@@ -776,6 +815,19 @@ void rope_rotate_activation_fp4quant(aiter_tensor_t& out,
             prefix_rows * (groups_per_row / 4) * 4 * 16 * m_tiles_padded;
         AITER_CHECK(scale.numel() >= static_cast<size_t>(expected_scale_numel),
                     "scale is too small for shuffled padded layout");
+    }
+    else if(scale_layout == SCALE_LAYOUT_OPUS32)
+    {
+        // [prefix_rows, K_CHUNKS, 32, SCALE_BYTES] -- same size as fly16.
+        AITER_CHECK(head_num % 32 == 0, "head_num must be divisible by 32 for opus32 scale");
+        AITER_CHECK(dim % 64 == 0, "dim must be divisible by 64 for opus32 scale");
+        AITER_CHECK(m % head_num == 0, "num rows must be divisible by head_num");
+        const int32_t k_tiles = dim / 64;
+        AITER_CHECK(groups_per_row % k_tiles == 0,
+                    "groups per row must be divisible by dim/64 for opus32 scale");
+        const int64_t prefix_rows = m / head_num;
+        AITER_CHECK(scale.numel() >= static_cast<size_t>(prefix_rows) * head_num * groups_per_row,
+                    "scale is too small for opus32 layout");
     }
     else
     {
@@ -854,7 +906,7 @@ void rope_rotate_activation(aiter_tensor_t& out,
     AITER_CHECK(rope_dim % vec_size == 0, "rope_dim must be divisible by vec_size");
 
     const int32_t group_size = 0;
-    const bool shuffle_scale = false;
+    const int32_t scale_layout = SCALE_LAYOUT_NATURAL;
     opus::e8m0_t* scale_ptr = nullptr;
     if(dim == 128)
     {
@@ -1332,7 +1384,8 @@ __global__ void norm_rope_hadamard_rotate_activation_fp4quant_kvcache_kernel(DTY
                                  1,
                                  groups_per_row,
                                  scale_group_idx,
-                                 false);
+                                 dim,
+                                 SCALE_LAYOUT_NATURAL);
             }
         }
 

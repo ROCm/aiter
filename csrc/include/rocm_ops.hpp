@@ -1791,7 +1791,7 @@ namespace py = pybind11;
           py::arg("positions"),                                                              \
           py::arg("rope_dim"),                                                               \
           py::arg("group_size")    = 32,                                                     \
-          py::arg("shuffle_scale") = true,                                                   \
+          py::arg("scale_layout")  = static_cast<int32_t>(aiter::SCALE_LAYOUT_FLY16),        \
           py::arg("do_rotate_act") = true);                                                  \
     m.def("rope_rotate_activation",                                                          \
           &aiter::rope_rotate_activation,                                                    \
