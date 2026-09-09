@@ -791,6 +791,18 @@ void topk_softmax(const aiter_tensor_t& topk_weights,         // [num_tokens, to
     // Determine number of routing experts (experts for topk selection)
     const int num_routing_experts = num_shared_experts > 0 ? num_experts_total - num_shared_experts : num_experts_total;
 
+    // The index buffers are written through `reinterpret_cast<int*>` below, so a
+    // 64-bit tensor would get only the low half of every slot filled and the rest
+    // left holding whatever the allocation happened to contain -- silently, with
+    // a plausible-looking tensor on return. Match the checks topk_gating already
+    // performs for the same arguments.
+    AITER_CHECK(topk_weights.dtype() == AITER_DTYPE_fp32,
+                "topk_weights must be float32");
+    AITER_CHECK(topk_indices.dtype() == AITER_DTYPE_i32,
+                "topk_indices must be int32");
+    AITER_CHECK(token_expert_indices.dtype() == AITER_DTYPE_i32,
+                "token_expert_indices must be int32");
+
     // Validate shared expert scoring function
     if(num_shared_experts > 0 && !shared_expert_scoring_func.empty())
     {
