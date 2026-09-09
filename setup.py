@@ -417,14 +417,6 @@ if PREBUILD_KERNELS != 0:
             )
 
 
-class NinjaBuildExtension(build_ext):
-    """Custom build_ext that defers expensive operations until run() is called."""
-
-    def run(self):
-        get_worker_count()
-        super().run()
-
-
 setup_requires = [
     "packaging",
     "psutil",
@@ -468,7 +460,7 @@ setup(
         "License :: OSI Approved :: BSD License",
         "Operating System :: Unix",
     ],
-    cmdclass={"build_ext": NinjaBuildExtension},
+    cmdclass={"build_ext": build_ext},
     # 3.8/3.9 have not actually worked for a long time: 81 modules already use
     # PEP 604 annotations (`X | None`) without `from __future__ import
     # annotations`, so they raise TypeError at import time on <3.10. Keep in sync

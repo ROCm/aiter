@@ -1562,8 +1562,7 @@ def _run_ninja_build(
 ) -> None:
     command = ["ninja", "-v"]
     num_workers = _get_num_workers(verbose, ninja_workers=ninja_workers)
-    if num_workers is not None:
-        command.extend(["-j", str(num_workers)])
+    command.extend(["-j", str(num_workers)])
     env = os.environ.copy()
 
     try:
