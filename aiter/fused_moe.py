@@ -295,7 +295,9 @@ def _mxfp4_inline_sort_unsupported(
     *,
     gate_mode,
     num_local_tokens,
+    expert_mask,
     bias1,
+    bias2,
     a1_scale,
     a2_scale,
     stage2_scatter,
@@ -324,7 +326,9 @@ def _mxfp4_inline_sort_unsupported(
         return "weights are not both preshuffled"
     for name, value in (
         ("num_local_tokens", num_local_tokens),
+        ("expert_mask", expert_mask),
         ("bias1", bias1),
+        ("bias2", bias2),
         ("a1_scale", a1_scale),
         ("a2_scale", a2_scale),
         ("stage2_scatter", stage2_scatter),
@@ -1169,7 +1173,9 @@ def _fused_moe_impl(
             topk_ids,
             gate_mode=gate_mode,
             num_local_tokens=num_local_tokens,
+            expert_mask=expert_mask,
             bias1=bias1,
+            bias2=bias2,
             a1_scale=a1_scale,
             a2_scale=a2_scale,
             stage2_scatter=stage2_scatter,
@@ -2556,6 +2562,10 @@ def get_2stage_cfgs(
                 .str.contains("moe_ck2stages")
             )
             df_fallback = df_fallback.loc[~is_ck2stages]
+        for column in ("kernelName1", "kernelName2"):
+            if column in df_fallback.columns:
+                is_mxfp4 = df_fallback[column].map(_is_mxfp4_kname)
+                df_fallback = df_fallback.loc[~is_mxfp4]
         if "act_type" in df_fallback.columns:
             df_fallback["act_type"] = _ACT_TYPE_DISABLED_KEY
         dup_mask = df_fallback.duplicated(subset=_INDEX_COLS, keep="first")
@@ -2711,6 +2721,15 @@ def get_2stage_cfgs(
             cfg = None
             logger.warning(
                 "[fused_moe] discarding tuned inline-sort config; "
+                "using default heuristics"
+            )
+        elif _is_inline_sort_cfg(kn1, kn2) and (is_ep or has_stage2_bias):
+            cfg = None
+            unsupported = "expert_mask" if is_ep else "bias2"
+            if is_ep and has_stage2_bias:
+                unsupported = "expert_mask and bias2"
+            logger.warning(
+                f"[fused_moe] discarding tuned inline-sort config with {unsupported}; "
                 "using default heuristics"
             )
         elif _is_inline_sort_cfg(kn1, kn2):
