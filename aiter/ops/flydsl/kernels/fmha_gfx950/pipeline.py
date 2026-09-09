@@ -21,9 +21,6 @@ from aiter.ops.flydsl.kernels import buffer_ops
 _LOG2E = host_math.log2(host_math.e)
 
 
-# gfx950 (MI350/MI355X): 8 XCDs, each with a private ~4 MB L2.
-
-
 LDS_BYTES_GFX950 = 160 * 1024
 
 
@@ -58,15 +55,6 @@ def _ds_read_tr8_b64_imm(result_type, addr_i32, imm_offset=0):
         has_side_effects=True,
     )
     return vector.BitCastOp(result_type, raw).result
-
-
-def _concat_vectors(lhs, rhs):
-    lhs_vec = Vec(lhs)
-    rhs_vec = Vec(rhs)
-    return lhs_vec.shuffle(
-        rhs_vec,
-        list(range(lhs_vec.numel)) + [lhs_vec.numel + i for i in range(rhs_vec.numel)],
-    )
 
 
 def _bitcast_i32(value):
@@ -127,53 +115,6 @@ def _anchor_v_o(traits, v_o):
         llvm.extractvalue(acc_irs[dc].type, ret, [dc])
         for dc in range_constexpr(traits.D_CHUNKS)
     ]
-
-
-def _anchor_v_p(traits, v_p, elem_dtype):
-    p_lo, p_hi = v_p
-    p_lo_all = _concat_vectors(p_lo[0], p_lo[1])
-    p_hi_all = _concat_vectors(p_hi[0], p_hi[1])
-    p_all = _concat_vectors(p_lo_all, p_hi_all)
-    p_all_ir = as_mlir_value(p_all)
-    p_all_anchored = llvm.inline_asm(
-        p_all_ir.type,
-        [p_all_ir],
-        "",
-        "=v,0",
-        has_side_effects=True,
-    )
-    p_vec = Vec(p_all_anchored, (traits.PV_K_STEPS * 2 * 8,), elem_dtype)
-    anchored_lo = []
-    anchored_hi = []
-    for pks in range_constexpr(traits.PV_K_STEPS):
-        lo_base = pks * 8
-        hi_base = traits.PV_K_STEPS * 8 + pks * 8
-        anchored_lo.append(
-            p_vec.shuffle(p_vec, [lo_base + i for i in range(8)]).ir_value()
-        )
-        anchored_hi.append(
-            p_vec.shuffle(p_vec, [hi_base + i for i in range(8)]).ir_value()
-        )
-    return anchored_lo, anchored_hi
-
-
-def _v_p_to_vec32(v_p):
-    p_lo, p_hi = v_p
-    p_lo_all = _concat_vectors(p_lo[0], p_lo[1])
-    p_hi_all = _concat_vectors(p_hi[0], p_hi[1])
-    return _concat_vectors(p_lo_all, p_hi_all).ir_value()
-
-
-def _v_vec32_to_p(traits, v_p_all, elem_dtype):
-    p_vec = Vec(v_p_all, (traits.PV_K_STEPS * 2 * 8,), elem_dtype)
-    p_lo = []
-    p_hi = []
-    for pks in range_constexpr(traits.PV_K_STEPS):
-        lo_base = pks * 8
-        hi_base = traits.PV_K_STEPS * 8 + pks * 8
-        p_lo.append(p_vec.shuffle(p_vec, [lo_base + i for i in range(8)]).ir_value())
-        p_hi.append(p_vec.shuffle(p_vec, [hi_base + i for i in range(8)]).ir_value())
-    return p_lo, p_hi
 
 
 def _score_pair_to_lists(v_s):
@@ -261,24 +202,6 @@ def _exp2_score_slice(v_s, start):
     for r in range_constexpr(16):
         hi_full.append(rocdl.exp2(T.f32, as_mlir_value(Vec(v_s[1])[r])))
     return lo_partial, hi_full
-
-
-def _pack_p_v8_slices(traits, v_p, pack_v8_fn):
-    lo_partial_list, hi_full = v_p
-    p_lo_packs = []
-    p_hi_packs = []
-    for pks in range_constexpr(traits.PV_K_STEPS):
-        p_base = pks * 8
-        lo_slice = [lo_partial_list[p_base + s] for s in range_constexpr(8)]
-        hi_slice = hi_full[p_base : p_base + 8]
-        p_lo_packs.append(pack_v8_fn(lo_slice))
-        p_hi_packs.append(pack_v8_fn(hi_slice))
-    return p_lo_packs, p_hi_packs
-
-
-def _safe_l_inv(l_row, zero_f):
-    l_inv = rocdl.rcp(T.f32, as_mlir_value(l_row))
-    return (fx.Float32(l_row) > zero_f).select(l_inv, zero_f)
 
 
 def _scale_o_accs(v_o, scale_scalar, traits):
@@ -398,8 +321,6 @@ class DualwaveSwpFp8Traits:
     NUM_HEADS_KV: int
     GQA_GROUP_SIZE: int
     CAUSAL: bool
-    DTYPE_STR: str
-    WAVES_PER_EU: int
     DAZ: bool
     DUALWAVE_SWP_LAZY_RESCALE: bool
     DUALWAVE_SWP_SETPRIO: bool
@@ -438,35 +359,29 @@ class DualwaveSwpFp8Traits:
 
     @property
     def cache_tag(self):
+        """The independent builder arguments, and nothing derived from them.
+
+        Every other trait is a pure function of these (verified by enumerating the
+        whole argument grid and checking this tuple stays injective), so adding one
+        cannot separate two builds that would otherwise share a binary.
+        """
         return (
+            "fp8_e4m3_dualwave_swp",
             self.NUM_HEADS_Q,
             self.NUM_HEADS_KV,
             self.HEAD_DIM,
+            self.HEAD_DIM_V,
+            self.BLOCK_M,
             self.CAUSAL,
-            self.DTYPE_STR,
-            self.WAVES_PER_EU,
             self.DAZ,
             self.DUALWAVE_SWP_LAZY_RESCALE,
             self.DUALWAVE_SWP_RESCALE_THRESHOLD,
             self.DUALWAVE_SWP_SETPRIO,
             self.DUALWAVE_SWP_ENABLE_STAGGER,
             self.NUM_KV_SPLITS,
-            self.SPLITK,
             self.VARLEN,
             self.CROSS_SEQLEN,
-            self.HEAD_DIM_V,
-            self.QLDS,
-            self.K_BAND_CHUNK,
-            "fp8_wide_qk_hiprec_pv",
-            self.ELEM_BYTES,
-            self.OUT_ELEM_BYTES,
-            self.LANE_SPLIT_KV,
-            self.VT_BF16_TOTAL,
-            self.NUM_PREFETCH_K,
             self.BATCH_INTERLEAVE_GROUP,
-            self.BLOCK_M,
-            self.BLOCK_SIZE,
-            self.NUM_WAVES,
         )
 
 
@@ -478,7 +393,6 @@ def _make_dualwave_swp_fp8_traits(
     head_dim_v=None,
     block_m=256,
     causal=True,
-    waves_per_eu=2,
     daz=True,
     dualwave_swp_lazy_rescale=True,
     dualwave_swp_setprio=True,
@@ -596,8 +510,6 @@ def _make_dualwave_swp_fp8_traits(
         NUM_HEADS_KV=num_kv_heads,
         GQA_GROUP_SIZE=gqa_group_size,
         CAUSAL=causal,
-        DTYPE_STR="fp8",
-        WAVES_PER_EU=waves_per_eu,
         DAZ=bool(daz),
         DUALWAVE_SWP_LAZY_RESCALE=bool(dualwave_swp_lazy_rescale),
         DUALWAVE_SWP_SETPRIO=bool(dualwave_swp_setprio),
@@ -652,15 +564,9 @@ def dualwave_fp8_dma_per_iter(traits):
 def _init_dualwave_thread_mapping(ctx):
     """Set block/wave/lane/head indices on a dualwave-style context.
 
-    Shared verbatim by DualwaveKernelContext and DualwaveFp8KernelContext."""
+    Sets h_idx / q_block_idx / batch_idx / split_idx and the lane decomposition."""
     traits = ctx.traits
-    batch_interleave_group = getattr(traits, "BATCH_INTERLEAVE_GROUP", 1)
-    # Swizzled Head-first Mapping (arXiv:2511.02132): the grid is head-fast, so one
-    # head's q-blocks scatter across all XCDs and each re-streams its K/V. Re-derive
-    # (head, q_block) with head as the slow axis to keep them on one XCD. Bijective,
-    # so output is bit-identical; split-K's third grid axis would not survive it.
-    # Non-causal only: under a causal mask q-block i does work proportional to i, so
-    # making q_block the fast axis clusters unequal work and costs 7% (measured).
+    batch_interleave_group = traits.BATCH_INTERLEAVE_GROUP
     if const_expr(batch_interleave_group > 1):
         linear_head_batch = fx.Index(gpu.block_idx.x)
         ctx.h_idx = linear_head_batch % traits.NUM_HEADS_Q
@@ -720,7 +626,7 @@ def _init_dualwave_q_row(ctx):
 class DualwaveFp8KernelContext:
     """Shared per-kernel state for the gfx950 dualwave fp8 attention helpers.
 
-    Mirrors ``DualwaveKernelContext`` but for the fp8 single path: raw fp8 Q/K/V
+    Raw fp8 Q/K/V
     (i8 buffer views), per-tensor Q/K/V descale scalars applied to the fp32 logits,
     and a bf16 ``vt`` LDS scratch for HIPREC PV."""
 

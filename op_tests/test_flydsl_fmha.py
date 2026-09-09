@@ -1123,3 +1123,43 @@ def test_fp8_dispatch_matches_direct_call():
     direct = flydsl_flash_attn_fp8_func(q, k, v, causal=True, **d)
     torch.cuda.synchronize()
     torch.testing.assert_close(via_dispatch.float(), direct.float(), rtol=0, atol=0)
+
+
+@_gfx950_only
+def test_fp8_repeat_launch_is_bit_exact_under_load():
+    """Identical inputs must give identical bits while the GPU is contended."""
+    from aiter.ops.flydsl.kernels.flash_attn_func_fp8_gfx950 import (
+        flydsl_flash_attn_fp8_func,
+    )
+
+    torch.manual_seed(0)
+    q, qs = _fp8_quant(torch.randn(2, 256, 8, 128, device="cuda", dtype=torch.bfloat16))
+    k, ks = _fp8_quant(
+        torch.randn(2, 1024, 8, 128, device="cuda", dtype=torch.bfloat16)
+    )
+    v, vs = _fp8_quant(
+        torch.randn(2, 1024, 8, 128, device="cuda", dtype=torch.bfloat16)
+    )
+    kw = {
+        "causal": False,
+        "q_descale": qs,
+        "k_descale": ks,
+        "v_descale": vs,
+        "num_kv_splits": 1,
+        "fp8_block_m": 128,
+    }
+
+    load = torch.cuda.Stream()
+    filler = torch.randn(8192, 8192, device="cuda", dtype=torch.bfloat16)
+    outs = []
+    for i in range(200):
+        if i % 10 == 0:
+            with torch.cuda.stream(load):
+                for _ in range(6):
+                    filler = filler @ filler
+        outs.append(flydsl_flash_attn_fp8_func(q, k, v, **kw).clone())
+    torch.cuda.synchronize()
+
+    base = outs[100]
+    bad = sum(1 for o in outs if not torch.equal(o, base))
+    assert bad == 0, f"{bad}/200 launches differed bitwise from the reference launch"

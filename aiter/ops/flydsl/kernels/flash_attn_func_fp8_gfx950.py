@@ -130,7 +130,6 @@ def _build_fp8(
     num_kv_heads: int,
     causal: bool,
     rescale_threshold: float,
-    waves_per_eu: int,
     daz: bool,
     lazy_rescale: bool,
     setprio: bool,
@@ -154,7 +153,6 @@ def _build_fp8(
         head_dim_v=head_dim_v,
         causal=causal,
         num_kv_heads=num_kv_heads,
-        waves_per_eu=waves_per_eu,
         daz=daz,
         rescale_threshold=rescale_threshold,
         dualwave_swp_lazy_rescale=lazy_rescale,
@@ -186,7 +184,6 @@ def flydsl_flash_attn_fp8_func(
     k_descale: torch.Tensor | None = None,
     v_descale: torch.Tensor | None = None,
     out: torch.Tensor | None = None,
-    waves_per_eu: int = 2,
     daz: bool = True,
     dualwave_swp_lazy_rescale: bool = True,
     dualwave_swp_setprio: bool = True,
@@ -211,7 +208,6 @@ def flydsl_flash_attn_fp8_func(
         fp8_block_m: Pin the tile height to 128 or 256. ``None`` autotunes it.
         q_descale / k_descale / v_descale: fp32 shape-[1] descales, required.
         out: Optional pre-allocated bf16 output of shape ``q.shape[:-1] + (Dv,)``.
-        waves_per_eu: Kernel occupancy hint.
         daz: Enable denormals-are-zero.
         dualwave_swp_lazy_rescale: Enable lazy online softmax rescale.
         dualwave_swp_setprio: Enable s_setprio scheduling hints.
@@ -267,7 +263,6 @@ def flydsl_flash_attn_fp8_func(
             "q_descale": q_descale,
             "k_descale": k_descale,
             "v_descale": v_descale,
-            "waves_per_eu": waves_per_eu,
             "daz": daz,
             "dualwave_swp_lazy_rescale": dualwave_swp_lazy_rescale,
             "dualwave_swp_setprio": dualwave_swp_setprio,
@@ -424,7 +419,6 @@ def flydsl_flash_attn_fp8_func(
             num_kv_heads=num_kv_heads,
             causal=causal,
             rescale_threshold=_fp8_rescale_threshold(_skv_eff),
-            waves_per_eu=waves_per_eu,
             daz=daz,
             lazy_rescale=dualwave_swp_lazy_rescale,
             setprio=dualwave_swp_setprio,

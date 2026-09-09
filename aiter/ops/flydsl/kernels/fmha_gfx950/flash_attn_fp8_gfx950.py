@@ -41,7 +41,6 @@ def build_flash_attn_dualwave_swp_fp8_module(
     head_dim_v=None,
     causal=True,
     num_kv_heads=None,
-    waves_per_eu=2,
     daz=True,
     dualwave_swp_lazy_rescale=True,
     rescale_threshold=6.0,
@@ -77,7 +76,6 @@ def build_flash_attn_dualwave_swp_fp8_module(
         head_dim_v=head_dim_v,
         block_m=block_m,
         causal=causal,
-        waves_per_eu=waves_per_eu,
         daz=daz,
         dualwave_swp_lazy_rescale=dualwave_swp_lazy_rescale,
         rescale_threshold=rescale_threshold,
@@ -203,11 +201,6 @@ def build_flash_attn_dualwave_swp_fp8_module(
         def _pv_part(v_p, v_v, v_o):
             v_o = gemm_helper.pv(v_p, v_v, v_o)
             return softmax_helper.anchor_v_o(v_o)
-
-        def _subtile_tail(v_s, v_v, v_o, l_row, m_new):
-            v_p, l_row = _softmax_part(v_s, l_row, m_new)
-            v_o = _pv_part(v_p, v_v, v_o)
-            return v_o, l_row
 
         def _mask_sub(v_s, tile_idx):
             if const_expr(traits.CAUSAL):
@@ -432,7 +425,7 @@ def build_flash_attn_dualwave_swp_fp8_module(
             stride_kv_n,
             head_dim_runtime,
             value_attrs={
-                "rocdl.waves_per_eu": waves_per_eu,
+                "rocdl.waves_per_eu": 1,
                 "rocdl.flat_work_group_size": f"{BLOCK_SIZE},{BLOCK_SIZE}",
                 "passthrough": passthrough_entries,
             },
@@ -471,7 +464,7 @@ def build_flash_attn_dualwave_swp_fp8_module(
         "llvm_options": _dualwave_swp_llvm_options,
     }
 
-    def _launch(
+    def _prepare(
         Q,
         K,
         V,
@@ -481,7 +474,6 @@ def build_flash_attn_dualwave_swp_fp8_module(
         stride_kv_n=None,
         stride_q_n=None,
         head_dim_runtime=None,
-        workspace_arg=None,
         *,
         seq_len_kv=None,
         workspace=None,
@@ -492,6 +484,7 @@ def build_flash_attn_dualwave_swp_fp8_module(
         v_descale=None,
         stream=None,
     ):
+        """Normalise the launch arguments shared by the run and compile paths."""
         if stride_kv_n is None:
             stride_kv_n = DEFAULT_STRIDE_KV_N
         if stride_q_n is None:
@@ -506,117 +499,41 @@ def build_flash_attn_dualwave_swp_fp8_module(
                 f"flash_attn_dualwave_swp fp8: batch_interleave_group={BATCH_INTERLEAVE_GROUP} requires "
                 f"batch_size divisible by it, got batch_size={batch_size}"
             )
-        if SPLITK:
-            if workspace is None:
-                raise ValueError(
-                    "num_kv_splits > 1 requires a fp32 workspace (see dualwave_splitk_workspace_elems)"
-                )
-            workspace_arg = workspace
-        if workspace_arg is None:
-            workspace_arg = O
-        # Dense launches still pass valid tensors for the (unused) cu_seqlens slots;
-        # the kernel only reads them under const_expr(VARLEN). Use O as a placeholder.
-        if cu_seqlens_q is None:
-            cu_seqlens_q = O
-        if cu_seqlens_kv is None:
-            cu_seqlens_kv = O
-        # Per-tensor fp8 descales (shape-[1] fp32), required by the kernel.
-        # O is only a placeholder so the C-ABI slot is a valid tensor.
-        if q_descale is None:
-            q_descale = O
-        if k_descale is None:
-            k_descale = O
-        if v_descale is None:
-            v_descale = O
+        if SPLITK and workspace is None:
+            raise ValueError(
+                "num_kv_splits > 1 requires a fp32 workspace (see dualwave_splitk_workspace_elems)"
+            )
+        ws = workspace if SPLITK else O
+        return (
+            Q,
+            K,
+            V,
+            O,
+            ws,
+            O if cu_seqlens_q is None else cu_seqlens_q,
+            O if cu_seqlens_kv is None else cu_seqlens_kv,
+            O if q_descale is None else q_descale,
+            O if k_descale is None else k_descale,
+            O if v_descale is None else v_descale,
+            batch_size,
+            seq_len,
+            seq_len_kv,
+            stride_q_n,
+            stride_kv_n,
+            head_dim_runtime,
+            fx.Stream(stream),
+        )
+
+    def _launch(*args, **kwargs):
         with CompilationContext.compile_hints(_dualwave_swp_compile_hints):
             return _run_compiled(
-                launch_flash_attn_dualwave_swp,
-                Q,
-                K,
-                V,
-                O,
-                workspace_arg,
-                cu_seqlens_q,
-                cu_seqlens_kv,
-                q_descale,
-                k_descale,
-                v_descale,
-                batch_size,
-                seq_len,
-                seq_len_kv,
-                stride_q_n,
-                stride_kv_n,
-                head_dim_runtime,
-                fx.Stream(stream),
+                launch_flash_attn_dualwave_swp, *_prepare(*args, **kwargs)
             )
 
-    def _compile(
-        Q,
-        K,
-        V,
-        O,
-        batch_size,
-        seq_len,
-        stride_kv_n=None,
-        stride_q_n=None,
-        head_dim_runtime=None,
-        workspace_arg=None,
-        *,
-        seq_len_kv=None,
-        workspace=None,
-        cu_seqlens_q=None,
-        cu_seqlens_kv=None,
-        q_descale=None,
-        k_descale=None,
-        v_descale=None,
-        stream=None,
-    ):
-        if stride_kv_n is None:
-            stride_kv_n = DEFAULT_STRIDE_KV_N
-        if stride_q_n is None:
-            stride_q_n = DEFAULT_STRIDE_Q_N
-        if head_dim_runtime is None:
-            head_dim_runtime = HEAD_DIM
-        if seq_len_kv is None:
-            seq_len_kv = seq_len
-        if SPLITK:
-            if workspace is None:
-                raise ValueError(
-                    "num_kv_splits > 1 requires a fp32 workspace (see dualwave_splitk_workspace_elems)"
-                )
-            workspace_arg = workspace
-        if workspace_arg is None:
-            workspace_arg = O
-        if cu_seqlens_q is None:
-            cu_seqlens_q = O
-        if cu_seqlens_kv is None:
-            cu_seqlens_kv = O
-        if q_descale is None:
-            q_descale = O
-        if k_descale is None:
-            k_descale = O
-        if v_descale is None:
-            v_descale = O
+    def _compile(*args, **kwargs):
         with CompilationContext.compile_hints(_dualwave_swp_compile_hints):
             return flyc.compile(
-                launch_flash_attn_dualwave_swp,
-                Q,
-                K,
-                V,
-                O,
-                workspace_arg,
-                cu_seqlens_q,
-                cu_seqlens_kv,
-                q_descale,
-                k_descale,
-                v_descale,
-                batch_size,
-                seq_len,
-                seq_len_kv,
-                stride_q_n,
-                stride_kv_n,
-                head_dim_runtime,
-                fx.Stream(stream),
+                launch_flash_attn_dualwave_swp, *_prepare(*args, **kwargs)
             )
 
     _launch.compile = _compile
