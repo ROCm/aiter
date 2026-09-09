@@ -307,12 +307,19 @@ def _make_inputs(
     mode: str = "sparse",
     device: torch.device | str = "cuda",
     seed: int = 0,
+    head_padded_q: bool = False,
 ) -> dict:
     assert mode in _MODES
     torch.manual_seed(seed)
     device = torch.device(device)
 
     q = (torch.randn(n, h, d, device=device, dtype=torch.float32) * 0.5).to(dtype)
+    if head_padded_q:
+        # A [N, H, D] view into a wider head buffer (TP-padded q), so q's head
+        # stride differs from a contiguous out's.
+        q_pad = torch.empty(n, max(64, h), d, device=device, dtype=dtype)
+        q_pad[:, :h] = q
+        q = q_pad[:, :h, :]
     unified_kv = (
         torch.randn(total_pages, d, device=device, dtype=torch.float32) * 0.5
     ).to(dtype)
@@ -635,6 +642,20 @@ def test_pa_sparse_prefill(prec, n, h, total_pages, total_tokens, mode):
         verify=True,
         bench=False,
     )
+
+
+@pytest.mark.parametrize("mode", _PYTEST_MODES)
+def test_pa_sparse_prefill_head_padded_q(mode):
+    """A strided (head-padded) q with the default contiguous out must match
+    the reference; the kernel used to address out with q's strides."""
+    n, h, d = 64, 16, 512
+    inputs = _make_inputs(
+        n, h, d, 256, 256, torch.bfloat16, mode=mode, seed=7, head_padded_q=True
+    )
+    scale = 1.0 / math.sqrt(d)
+    out = pa_sparse_prefill_opus(**inputs, softmax_scale=scale)
+    ref = _ref_pa_sparse_prefill_opus(**inputs, softmax_scale=scale)
+    torch.testing.assert_close(out.float(), ref.float(), rtol=1e-2, atol=1e-2)
 
 
 # ---------------------------------------------------------------------------

@@ -102,6 +102,8 @@ void pa_sparse_prefill_gfx950_opus_fwd(aiter_tensor_t& q,
     // head dim contiguous; we already enforced stride(D) == 1 above.
     kargs.stride_qo_n       = static_cast<int>(q.stride(0));
     kargs.stride_qo_h       = static_cast<int>(q.stride(1));
+    kargs.stride_o_n        = static_cast<int>(out.stride(0));
+    kargs.stride_o_h        = static_cast<int>(out.stride(1));
     kargs.stride_kv_page    = static_cast<int>(unified_kv.stride(0));
     AITER_CHECK(kargs.stride_kv_page == static_cast<int>(kv.stride(0)),
                 "unified_kv and kv must share row stride along the D dim");
