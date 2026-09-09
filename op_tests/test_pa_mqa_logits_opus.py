@@ -3,9 +3,13 @@
 
 """MXFP4 paged MQA logits (OPUS, 32x32x64 MFMA) -- correctness and perf on gfx950.
 
-    python3 op_tests/test_pa_mqa_logits_opus.py              # corner cases + both sweeps
-    python3 op_tests/test_pa_mqa_logits_opus.py --corner      # corner cases only
-    python3 op_tests/test_pa_mqa_logits_opus.py --prefill --bs 1 4 20
+Emits three markdown tables: corner cases, the prefill sweep and the decode sweep.
+
+    python3 op_tests/test_pa_mqa_logits_opus.py                    # the full default sweep
+    python3 op_tests/test_pa_mqa_logits_opus.py -b 1 -s 8,1024,1   # a quick subset
+
+Correctness covers both compiled variants. The perf sweeps run each side at its OWN default
+``block_k`` -- ours 64, FlyDSL 256 -- which is what an untuned caller gets from either.
 
 WHY THIS TEST IS SHAPED THE WAY IT IS
 -------------------------------------
@@ -39,14 +43,20 @@ import pandas as pd
 import torch
 import torch.nn.functional as F
 
+import aiter
+from aiter import dtypes
+from aiter.jit.utils.chip_info import get_gfx
 from aiter.ops.opus.pa_mqa_logits_opus import (
+    BLOCK_K_1WAVE,
     compute_prefill_windows,
     pa_mqa_logits_mxfp4_decode,
     pa_mqa_logits_mxfp4_prefill,
 )
-from aiter.test_common import run_perftest
+from aiter.test_common import benchmark, checkAllclose, run_perftest
 
 dev = "cuda"
+
+SUPPORTED_GFX = ["gfx950"]  # the kernel is gfx950-only; the wrapper enforces it too
 
 HEADS = 64
 HEAD_DIM = 128
@@ -66,11 +76,32 @@ BLOCKS_ROW = HEAD_DIM // SCALE_BLOCK  # 4 natural E8M0 blocks per row
 FLY_MFMA_M = 16
 FLY_KVS_NTPW = 4
 
-PREFILL_BLOCK_KS = (64, 256)
+COMPILED_BLOCK_KS = (64, 256)  # the two compiled variants: 1 wave/CTA and 4
+FLYDSL_DEFAULT_BLOCK_K = (
+    256  # what FlyDSL's own signature defaults to, and what ATOM runs
+)
+# block_tables / max_seq_len / out are sized from the LARGER block_k whichever variant is
+# timed, because the two round up differently -- an 841-token window needs 14 pages at 64
+# but 16 at 256 -- so sizing from the active one would either under-size the other side or
+# hand the two candidates a different `out` footprint, and hence different store traffic.
+SIZING_BLOCK_K = max(COMPILED_BLOCK_KS)
 PREFILL_TOTAL_QLEN = 16384
 PREFILL_QMIN = 800
 DECODE_CTA_TARGET = 1024
 N_COS_SAMPLE = 8
+
+# Not a command-line knob on purpose: readings taken at different iteration counts are
+# not comparable on this kernel (20/5 reads ~4.6% faster than 50/10 on the short shapes,
+# a clean bias rather than noise), so the budget is pinned here.
+PERF_ITERS = 50
+PERF_WARMUP = 10
+
+# Per-row / per-page byte counts, for the traffic denominator (see `roofline_bytes`).
+Q_ROW_BYTES = HEADS * HEAD_DIM // 2  # 4096: one packed fp4 query row
+QS_ROW_BYTES = K_CHUNKS * MFMA_N * SCALE_BYTES  # 256: its E8M0 scales
+W_ROW_BYTES = HEADS * 2  # 128: bf16 per-head weights
+KV_PAGE_BYTES = KV_BLOCK_SIZE * HEAD_DIM // 2  # 4096: one packed fp4 page
+KVS_PAGE_BYTES = K_CHUNKS * MFMA_N * SCALE_BYTES  # 256: its E8M0 scales
 
 FP4_E2M1_MAX = 6.0
 _FP4_GRID_VALUES = [
@@ -255,16 +286,46 @@ def ref_rows(inp, rows, rb, ls, le):
     return ref
 
 
-def max_err(out, ref):
-    err = 0.0
+def check_rows(out, ref, msg):
+    """`checkAllclose` over the in-window cells of the sampled rows.
+
+    Every row has a different window, so they are concatenated into one flat pair rather
+    than compared as a rectangle. The bound is relative: a logit is a signed sum over 64
+    heads of a 128-long dot product, so the values run to ~1e4 and `atol` is there only
+    for the cells the weights cancel to near zero, where a relative bound says nothing.
+    """
+    got, want = [], []
     for r, (s, e, vals) in ref.items():
         if vals is None:
             continue
-        got = out[r, s:e].float()
-        err = max(
-            err, (got - vals).abs().max().item() / vals.abs().max().clamp(min=1e-6)
-        )
-    return err
+        got.append(out[r, s:e].float())
+        want.append(vals.float())
+    if not got:
+        return 0.0
+    return checkAllclose(
+        torch.cat(want), torch.cat(got), rtol=2e-5, atol=1e-2, msg=msg, printLog=False
+    )
+
+
+def roofline_bytes(rb, le, total_q, n_logits):
+    """Bytes a launch must move at least once -- NOT one K vector per output logit.
+
+    The per-logit count is what a naive roofline gives and it is meaningless here: every
+    query row of a batch scores against the same KV pages, so on a long-context shape it
+    implies a ~14000x reuse factor and reports a "TB/s" above the card's HBM peak.
+    Counting each page once instead makes the figure a lower bound on real traffic, which
+    is the reading that can be held against a hardware limit.
+    """
+    if rb.numel() == 0:
+        return 0
+    ends = torch.zeros(int(rb.max().item()) + 1, dtype=torch.int64, device=rb.device)
+    ends.scatter_reduce_(0, rb.long(), le.long().clamp(min=0), reduce="amax")
+    pages = int(((ends + KV_BLOCK_SIZE - 1) // KV_BLOCK_SIZE).sum().item())
+    return (
+        total_q * (Q_ROW_BYTES + QS_ROW_BYTES + W_ROW_BYTES)
+        + pages * (KV_PAGE_BYTES + KVS_PAGE_BYTES)
+        + n_logits * 4
+    )
 
 
 def oob_is_neginf(out, rb, ls, le):
@@ -277,8 +338,8 @@ def oob_is_neginf(out, rb, ls, le):
 def window_is_written(out, ls, le):
     """Every cell inside [local_start, local_end) must have been stored to.
 
-    `max_err` would also catch a dropped token -- an in-window -inf makes the relative
-    error infinite -- but only on the rows `sample_rows` happened to pick, so it stops
+    `check_rows` would also catch a dropped token -- an in-window -inf never compares
+    close -- but only on the rows `sample_rows` happened to pick, so it stops
     being a guard as soon as a case has more rows than that. This scans every row.
     """
     col = torch.arange(out.shape[1], device=out.device).unsqueeze(0)
@@ -335,7 +396,7 @@ def flydsl_decode(inp, ctx, batch, next_n, block_k):
             compute_varctx_schedule,
         )
     except Exception as e:  # noqa: BLE001
-        print(f"    [flydsl decode unavailable] {type(e).__name__}: {e}")
+        aiter.logger.warning("flydsl decode unavailable: %s: %s", type(e).__name__, e)
         return None
 
     msl = inp.max_seq_len
@@ -364,7 +425,7 @@ def flydsl_decode(inp, ctx, batch, next_n, block_k):
         launch()
         torch.cuda.synchronize()
     except Exception as e:  # noqa: BLE001
-        print(f"    [flydsl decode failed] {type(e).__name__}: {e}")
+        aiter.logger.warning("flydsl decode failed: %s: %s", type(e).__name__, e)
         return None
     return launch
 
@@ -399,7 +460,9 @@ def check_prefill(bs, windows_per_batch, seed, block_k, label, cross_flydsl=True
     torch.cuda.synchronize()
 
     rows = sample_rows(total_q, le, seed=seed)
-    err = max_err(out, ref_rows(inp, rows, rb, ls, le))
+    err = check_rows(
+        out, ref_rows(inp, rows, rb, ls, le), f"prefill {label} bk={block_k}"
+    )
     oob = oob_is_neginf(out, rb, ls, le)
     wr = window_is_written(out, ls, le)
 
@@ -410,13 +473,17 @@ def check_prefill(bs, windows_per_batch, seed, block_k, label, cross_flydsl=True
         torch.cuda.synchronize()
         col = torch.arange(inp.max_seq_len, device=dev).unsqueeze(0)
         m = (col >= ls.unsqueeze(1)) & (col < le.unsqueeze(1))
-        scale = out[m].abs().max().clamp(min=1e-6)
-        fly_err = ((out[m] - out_f[m]).abs().max() / scale).item()
+        fly_err = checkAllclose(
+            out[m].float(), out_f[m].float(), rtol=2e-5, atol=1e-2,
+            msg=f"flydsl {label} bk={block_k}", printLog=False,
+        )  # fmt: skip
 
-    ok = err < 2e-5 and oob and wr and (math.isnan(fly_err) or fly_err < 2e-5)
-    print(f"  [{'PASS' if ok else 'FAIL'}] {label:<34} bk={block_k:3d} "
-          f"err={err:.2e} vs_flydsl={fly_err:.2e} oob={oob} written={wr}")  # fmt: skip
-    return ok
+    ok = err == 0 and oob and wr and (math.isnan(fly_err) or fly_err == 0)
+    return {
+        "case": label, "block_k": block_k, "rows": total_q, "max_win": int(le.max()),
+        "err": err, "vs flydsl": fly_err, "oob -inf": oob, "window written": wr,
+        "pass": ok,
+    }  # fmt: skip
 
 
 def check_decode(bs, next_n, context_lens, seed, block_k, label, local_ends=None):
@@ -446,6 +513,9 @@ def check_decode(bs, next_n, context_lens, seed, block_k, label, local_ends=None
     ls = torch.tensor(ls, dtype=torch.int32, device=dev)
     le = torch.tensor(le, dtype=torch.int32, device=dev)
 
+    # `cu_seq_q` left as None on purpose, so this covers the fixed-MTP convenience path
+    # where the wrapper derives it; `test_decode` passes one in and covers the other
+    # branch. Between them both forms of the argument are exercised.
     out = pa_mqa_logits_mxfp4_decode(
         inp.q_packed, inp.q_scale, inp.kv_cache, inp.kv_scale, inp.block_tables,
         inp.weights, le, inp.max_seq_len, next_n,
@@ -455,22 +525,33 @@ def check_decode(bs, next_n, context_lens, seed, block_k, label, local_ends=None
     torch.cuda.synchronize()
 
     rows = sample_rows(total_q, le, seed=seed)
-    err = max_err(out, ref_rows(inp, rows, rb, ls, le))
+    err = check_rows(
+        out, ref_rows(inp, rows, rb, ls, le), f"decode {label} bk={block_k}"
+    )
     oob = oob_is_neginf(out, rb, ls, le)
     wr = window_is_written(out, ls, le)
-    ok = err < 2e-5 and oob and wr
-    print(f"  [{'PASS' if ok else 'FAIL'}] {label:<34} bk={block_k:3d} "
-          f"err={err:.2e} oob={oob} written={wr}")  # fmt: skip
-    return ok
+    ok = err == 0 and oob and wr
+    return {
+        "case": label, "block_k": block_k, "rows": total_q, "max_win": int(le.max()),
+        "err": err, "vs flydsl": float("nan"), "oob -inf": oob, "window written": wr,
+        "pass": ok,
+    }  # fmt: skip
 
 
 def run_corner():
-    """Cases chosen to hit the pipeline and window corners, all on random data."""
-    print("=" * 78)
-    print("[corner] MXFP4 32x32x64 prefill + decode, random data, both block_k")
-    print("=" * 78)
+    """Cases chosen to hit the pipeline and window corners, all on random data.
+
+    Not a `@benchmark` function: its shape argument is a nested list of per-row windows,
+    which the decorator would render as one unreadable table cell. It builds its own row
+    dicts instead, and still ends in a summary table.
+
+    Every case runs at BOTH `block_k`. That is variant coverage, not a tuning sweep: the
+    two are separately compiled kernels with different CTA widths and KV split
+    granularities, they must produce identical results, and only 64 is ever shipped -- so
+    256 gets no exposure at all unless correctness exercises it here.
+    """
     oks = []
-    for block_k in PREFILL_BLOCK_KS:
+    for block_k in COMPILED_BLOCK_KS:
         # ragged windows incl. non-zero starts and non-32-aligned bounds
         oks.append(check_prefill(2, [[(0, 50), (0, 120), (0, 200)], [(0, 40), (0, 100)]],
                                  0, block_k, "ragged, 2 batches"))  # fmt: skip
@@ -520,8 +601,12 @@ def run_corner():
             csa += [min((pos + n + 1) // 4, ncmt) for n in range(4)]
         oks.append(check_decode(3, 4, None, 11, block_k,
                                 "decode CSA ratio-4 windows", local_ends=csa))  # fmt: skip
-    print(f"\n  {sum(oks)}/{len(oks)} cases pass")
-    return all(oks)
+    df = pd.DataFrame(oks)
+    aiter.logger.info(
+        "MXFP4 MQA logits corner cases, random data, %d/%d pass (markdown):\n%s",
+        int(df["pass"].sum()), len(df), df.to_markdown(index=False),
+    )  # fmt: skip
+    return bool(df["pass"].all())
 
 
 # ── perf ──────────────────────────────────────────────────────────────────────
@@ -535,121 +620,194 @@ def gen_prefill_qlens(bs, total=PREFILL_TOTAL_QLEN, qmin=PREFILL_QMIN, seed=0):
     return parts
 
 
-def bench_prefill(bs_list, block_ks, iters, warmup):
-    rows = []
-    for bs, block_k in itertools.product(bs_list, block_ks):
-        qlens = gen_prefill_qlens(bs, seed=bs)
-        total_q = sum(qlens)
-        inp = build_inputs(bs, max(qlens), total_q, block_k, seed=bs)
-        cu = torch.tensor(
-            [0] + list(itertools.accumulate(qlens)), dtype=torch.int32, device=dev
-        )
-        ctx = torch.tensor(qlens, dtype=torch.int32, device=dev)
-        rb, ls, le = compute_prefill_windows(cu, ctx, total_q)
-        out = torch.full(
-            (total_q, inp.max_seq_len), float("-inf"), dtype=torch.float32, device=dev
-        )
+def score_candidates(candidates, inp, rb, ls, le, total_q, n_logits, seed):
+    """Time every candidate, then score them all against the sampled-row reference.
 
-        # Defaults, not closure capture: this is rebuilt per iteration over names the
-        # loop later `del`s, so late binding would read the next shape's buffers.
-        def ours(inp=inp, rb=rb, ls=ls, le=le, block_k=block_k, out=out):
-            return pa_mqa_logits_mxfp4_prefill(
-                inp.q_packed, inp.q_scale, inp.kv_cache, inp.kv_scale, inp.block_tables,
-                inp.weights, rb, ls, le, inp.max_seq_len, weight_scale=WEIGHT_SCALE,
-                block_k=block_k, kv_block_size=KV_BLOCK_SIZE, out=out,
-            )  # fmt: skip
+    Scoring runs AFTER the last timed region and frees its temporaries: the reference
+    materializes a [heads, window] score matrix per sampled row -- ~1 GB on the longest
+    prefill shape -- and the caching allocator charges that churn to whichever kernel is
+    timed next, which is worth 4-9% to this kernel and nothing to FlyDSL.
+    """
+    flops = 2 * HEADS * HEAD_DIM * n_logits
+    nbytes = roofline_bytes(rb, le, total_q, n_logits)
 
-        _, us = run_perftest(ours, num_iters=iters, num_warmup=warmup)
-        n_logits = int((le - ls).clamp(min=0).sum().item())
-        row = {
-            "bs": bs, "block_k": block_k, "total_q": total_q,
-            "max_win": int(le.max()), "n_logits": n_logits,
-            "ours us": round(us, 2),
-            "TFLOPS": round(2 * HEADS * HEAD_DIM * n_logits / us / 1e6, 1),
-        }  # fmt: skip
-
-        fly = flydsl_prefill(inp, rb, ls, le, total_q, block_k)
-        if fly is not None:
-            _, us_f = run_perftest(fly, num_iters=iters, num_warmup=warmup)
-            row["flydsl us"] = round(us_f, 2)
-            row["ours/flydsl"] = f"{us / us_f - 1:+.1%}"
-        rows.append(row)
-        del inp, out
-        torch.cuda.empty_cache()
-    print("\nPrefill (causal, ctx == qlen; random data)")
-    print(pd.DataFrame(rows).to_markdown(index=False))
-
-
-def bench_decode(shapes, block_ks, iters, warmup):
-    rows = []
-    for (batch, max_ctx, next_n), block_k in itertools.product(shapes, block_ks):
-        g = random.Random(batch + max_ctx + next_n)
-        ctxs = [
-            ((g.randint(int(0.9 * max_ctx), max_ctx) + KV_BLOCK_SIZE - 1)
-             // KV_BLOCK_SIZE) * KV_BLOCK_SIZE
-            for _ in range(batch)
-        ]  # fmt: skip
-        total_q = batch * next_n
-        inp = build_inputs(batch, max(ctxs), total_q, block_k, seed=batch + next_n)
-        ctx = torch.tensor(ctxs, dtype=torch.int32, device=dev)
-        # Per forward, not per layer -- so outside the timed closure.
-        cu = torch.arange(
-            0, (batch + 1) * next_n, next_n, dtype=torch.int32, device=dev
-        )
-        _, _, le = compute_prefill_windows(cu, ctx, total_q)
-        out = torch.full(
-            (total_q, inp.max_seq_len), float("-inf"), dtype=torch.float32, device=dev
+    outs, times = {}, {}
+    for name, fn in candidates.items():
+        outs[name], times[name] = run_perftest(
+            fn, num_iters=PERF_ITERS, num_warmup=PERF_WARMUP
         )
 
-        # Bound as defaults for the same reason as bench_prefill's.
-        def ours(inp=inp, le=le, next_n=next_n, block_k=block_k, out=out):
-            return pa_mqa_logits_mxfp4_decode(
-                inp.q_packed, inp.q_scale, inp.kv_cache, inp.kv_scale, inp.block_tables,
-                inp.weights, le, inp.max_seq_len, next_n,
-                split_ctx_len=inp.max_seq_len, weight_scale=WEIGHT_SCALE,
-                block_k=block_k, kv_block_size=KV_BLOCK_SIZE, out=out,
-            )  # fmt: skip
+    ref = ref_rows(inp, sample_rows(total_q, le, seed=seed), rb, ls, le)
+    ret = {}
+    for name, us in times.items():
+        ret[f"{name} us"] = round(us, 2)
+        ret[f"{name} TFLOPS"] = round(flops / us / 1e6, 1)
+        ret[f"{name} TB per s"] = round(nbytes / us / 1e6, 3)
+        ret[f"{name} err"] = check_rows(outs[name], ref, name)
+    del ref, outs
+    torch.cuda.empty_cache()
+    return ret
 
-        _, us = run_perftest(ours, num_iters=iters, num_warmup=warmup)
-        n_logits = sum(
-            max(c - (next_n - 1 - n), 0) for c in ctxs for n in range(next_n)
-        )
-        rows.append({
-            "batch": batch, "next_n": next_n, "max_ctx": max_ctx, "block_k": block_k,
-            "total_q": total_q, "ours us": round(us, 2),
-            "TFLOPS": round(2 * HEADS * HEAD_DIM * n_logits / us / 1e6, 1),
-        })  # fmt: skip
-        del inp, out
-        torch.cuda.empty_cache()
-    print("\nDecode (fixed MTP; random data)")
-    print(pd.DataFrame(rows).to_markdown(index=False))
+
+@benchmark()
+def test_prefill(bs):
+    """One causal prefill shape: 16384 query rows split across `bs` batches, ctx == qlen.
+
+    Each side runs at ITS OWN default -- ours 64, FlyDSL 256 -- which is what an untuned
+    caller gets from either and matches the convention the production numbers use. A
+    matched-`block_k` reading is a different measurement and moves the margin by ~10
+    points on prefill, so do not read one as the other. `block_k` is not a sweep axis
+    here; `run_corner` is what keeps the second compiled variant covered.
+    """
+    qlens = gen_prefill_qlens(bs, seed=bs)
+    total_q = sum(qlens)
+    inp = build_inputs(bs, max(qlens), total_q, SIZING_BLOCK_K, seed=bs)
+    cu = torch.tensor(
+        [0] + list(itertools.accumulate(qlens)), dtype=torch.int32, device=dev
+    )
+    ctx = torch.tensor(qlens, dtype=torch.int32, device=dev)
+    rb, ls, le = compute_prefill_windows(cu, ctx, total_q)
+    out = torch.full(
+        (total_q, inp.max_seq_len), float("-inf"), dtype=torch.float32, device=dev
+    )
+
+    # Defaults, not closure capture: this is rebuilt per shape over names the sweep later
+    # drops, so late binding would read the next shape's buffers. `block_k` is left off
+    # so the timed call is the default one.
+    def ours(inp=inp, rb=rb, ls=ls, le=le, out=out):
+        return pa_mqa_logits_mxfp4_prefill(
+            inp.q_packed, inp.q_scale, inp.kv_cache, inp.kv_scale, inp.block_tables,
+            inp.weights, rb, ls, le, inp.max_seq_len, weight_scale=WEIGHT_SCALE,
+            kv_block_size=KV_BLOCK_SIZE, out=out,
+        )  # fmt: skip
+
+    candidates = {"ours": ours}
+    fly = flydsl_prefill(inp, rb, ls, le, total_q, FLYDSL_DEFAULT_BLOCK_K)
+    if fly is not None:
+        candidates["flydsl"] = fly
+
+    n_logits = int((le - ls).clamp(min=0).sum().item())
+    ret = {
+        "gfx": get_gfx(),
+        "total_q": total_q,
+        "max_win": int(le.max()),
+        "n_logits": n_logits,
+    }
+    ret.update(
+        score_candidates(candidates, inp, rb, ls, le, total_q, n_logits, seed=bs)
+    )
+    del inp, out
+    torch.cuda.empty_cache()
+    return ret
+
+
+@benchmark()
+def test_decode(batch, max_ctx, next_n):
+    """One fixed-MTP decode shape: `batch * next_n` packed rows over ragged contexts.
+
+    Each side at its own default, as in `test_prefill`. The config matters far more here
+    than on prefill -- FlyDSL's 64 is its weak decode setting and the choice is worth tens
+    of points, enough to flip the sign -- so 256 is the only honest baseline.
+    """
+    g = random.Random(batch + max_ctx + next_n)
+    ctxs = [
+        ((g.randint(int(0.9 * max_ctx), max_ctx) + KV_BLOCK_SIZE - 1)
+         // KV_BLOCK_SIZE) * KV_BLOCK_SIZE
+        for _ in range(batch)
+    ]  # fmt: skip
+    total_q = batch * next_n
+    inp = build_inputs(batch, max(ctxs), total_q, SIZING_BLOCK_K, seed=batch + next_n)
+    ctx = torch.tensor(ctxs, dtype=torch.int32, device=dev)
+    # `cu_seq_q` and the window arrays are per-forward quantities while the kernel runs per
+    # layer, so both are built here and PASSED IN. Leaving `cu_seq_q` as None makes the
+    # wrapper rebuild it with a `torch.arange` on every call, and `get_trace_perf` sums
+    # every CUDA event in the region, so that fill kernel lands in the reported time --
+    # measured at 1.2-1.8 us, i.e. 8-21% of these shapes, all of it harness rather than
+    # kernel. FlyDSL gets its `cta_info` precomputed for the same reason.
+    cu = torch.arange(0, (batch + 1) * next_n, next_n, dtype=torch.int32, device=dev)
+    rb, ls, le = compute_prefill_windows(cu, ctx, total_q)
+    out = torch.full(
+        (total_q, inp.max_seq_len), float("-inf"), dtype=torch.float32, device=dev
+    )
+
+    # Bound as defaults for the same reason as test_prefill's.
+    def ours(inp=inp, cu=cu, le=le, next_n=next_n, out=out):
+        return pa_mqa_logits_mxfp4_decode(
+            inp.q_packed, inp.q_scale, inp.kv_cache, inp.kv_scale, inp.block_tables,
+            inp.weights, le, inp.max_seq_len, next_n,
+            split_ctx_len=inp.max_seq_len, weight_scale=WEIGHT_SCALE,
+            cu_seq_q=cu, kv_block_size=KV_BLOCK_SIZE, out=out,
+        )  # fmt: skip
+
+    candidates = {"ours": ours}
+    fly = flydsl_decode(inp, ctx, batch, next_n, FLYDSL_DEFAULT_BLOCK_K)
+    if fly is not None:
+        candidates["flydsl"] = fly
+
+    n_logits = int((le - ls).clamp(min=0).sum().item())
+    ret = {
+        "gfx": get_gfx(),
+        "total_q": total_q,
+        "max_win": int(le.max()),
+        "n_logits": n_logits,
+    }
+    ret.update(
+        score_candidates(candidates, inp, rb, ls, le, total_q, n_logits, seed=batch)
+    )
+    del inp, out
+    torch.cuda.empty_cache()
+    return ret
 
 
 def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--corner", action="store_true", help="corner cases only")
-    ap.add_argument("--prefill", action="store_true")
-    ap.add_argument("--decode", action="store_true")
-    ap.add_argument("--bs", type=int, nargs="*", default=[1, 2, 4, 8, 12, 16, 20])
-    ap.add_argument("--block-k", type=int, nargs="*", default=list(PREFILL_BLOCK_KS))
-    ap.add_argument("--iters", type=int, default=50)
-    ap.add_argument("--warmup", type=int, default=10)
-    a = ap.parse_args()
+    # Whole-op arch gate, here rather than inside the @benchmark fns: CI discovers every
+    # op_tests/test_*.py and runs it on the gfx942 shard as well, where the wrapper's own
+    # gfx950 check would raise and fail the shard. Positive allow-list, so an unknown new
+    # card skips instead of launching a kernel that was never built for it.
+    if get_gfx() not in SUPPORTED_GFX:
+        aiter.logger.warning(
+            "pa_mqa_logits_mxfp4 is gfx950-only; skipping on %s", get_gfx()
+        )
+        return
 
-    only_bench = a.prefill or a.decode
-    ok = True
-    if not only_bench:
-        ok = run_corner()
-    if a.corner:
-        raise SystemExit(0 if ok else 1)
+    parser = argparse.ArgumentParser(
+        formatter_class=argparse.RawTextHelpFormatter,
+        description="config input of test",
+    )
+    parser.add_argument(
+        "-b", "--batch", type=int, nargs="*", default=[1, 2, 4, 8, 12, 16, 20],
+        help="prefill batch sizes; total_q is fixed at 16384 and split across them",
+    )  # fmt: skip
+    parser.add_argument(
+        "-s", "--decode-shapes", type=dtypes.str2tuple, nargs="*",
+        default=[(8, 8192, 8), (32, 8192, 4), (128, 8192, 1), (128, 1024, 8)],
+        help="decode shapes as batch,max_ctx,next_n triples",
+    )  # fmt: skip
+    args = parser.parse_args()
 
-    if not only_bench or a.prefill:
-        bench_prefill(a.bs, a.block_k, a.iters, a.warmup)
-    if not only_bench or a.decode:
-        bench_decode(
-            [(8, 8192, 8), (32, 8192, 4), (128, 8192, 1), (128, 1024, 8)],
-            a.block_k, a.iters, a.warmup,
-        )  # fmt: skip
+    ok = run_corner()
+
+    rows = [test_prefill(bs) for bs in args.batch]
+    aiter.logger.info(
+        "MXFP4 MQA logits prefill, causal (ctx == qlen), random data, each side at its "
+        "own default block_k (ours %d, flydsl %d) (markdown):\n%s",
+        BLOCK_K_1WAVE,
+        FLYDSL_DEFAULT_BLOCK_K,
+        pd.DataFrame(rows).to_markdown(index=False),
+    )
+
+    rows = [
+        test_decode(batch, max_ctx, next_n)
+        for batch, max_ctx, next_n in args.decode_shapes
+    ]
+    aiter.logger.info(
+        "MXFP4 MQA logits decode, fixed MTP, random data, each side at its own default "
+        "block_k (ours %d, flydsl %d) (markdown):\n%s",
+        BLOCK_K_1WAVE,
+        FLYDSL_DEFAULT_BLOCK_K,
+        pd.DataFrame(rows).to_markdown(index=False),
+    )
+
     raise SystemExit(0 if ok else 1)
 
 
