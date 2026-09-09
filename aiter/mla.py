@@ -568,6 +568,8 @@ def mla_decode_fwd(
     g_kv_indptr=None,
     cp_world_size=1,
     cp_rank=0,
+    logits_buf=None,
+    attn_lse_buf=None,
     causal=True,
 ):
     device = q.device
@@ -653,15 +655,17 @@ def mla_decode_fwd(
                     )
                 )
             )
-            else torch.empty(
-                (total_s, num_kv_splits, nhead, v_head_dim),
-                dtype=dtypes.fp32,
-                device=device,
+            else (
+                logits_buf[:total_s * num_kv_splits].view(total_s, num_kv_splits, nhead, v_head_dim)
+                if logits_buf is not None and logits_buf.numel() >= total_s * num_kv_splits * nhead * v_head_dim
+                else torch.empty((total_s, num_kv_splits, nhead, v_head_dim), dtype=dtypes.fp32, device=device)
             )
         )
 
-        attn_lse = torch.empty(
-            (total_s, num_kv_splits, nhead, 1), dtype=dtypes.fp32, device=device
+        attn_lse = (
+            attn_lse_buf[:total_s * num_kv_splits].view(total_s, num_kv_splits, nhead, 1)
+            if attn_lse_buf is not None and attn_lse_buf.numel() >= total_s * num_kv_splits * nhead
+            else torch.empty((total_s, num_kv_splits, nhead, 1), dtype=dtypes.fp32, device=device)
         )
         final_lse = (
             torch.empty((total_s, nhead), dtype=dtypes.fp32, device=device)
@@ -705,7 +709,7 @@ def mla_decode_fwd(
             cp_rank,
             valid_split_count,
             use_valid_split_count_reduce,
-            causal,
+
         )
 
         if num_kv_splits == 1 and (
@@ -934,7 +938,7 @@ def mla_decode_fwd(
                 final_lse,
                 q_scale,
                 kv_scale,
-                causal,
+
             )
         elif use_hk:
             aiter.hk_mla_decode_fwd(
@@ -979,7 +983,7 @@ def mla_decode_fwd(
                 cp_rank,
                 None,
                 0,
-                causal,
+
             )
 
         _mla_decode_reduce_v1_dispatch(
