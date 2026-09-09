@@ -2,6 +2,7 @@
 """Production host runtime for communication-fused FlyDSL MoE."""
 
 import csv
+import json
 import logging
 import math
 import re
@@ -38,9 +39,7 @@ from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled, ptr_arg
 
 _PEER_VMM_ALLOCATION_ALIGNMENT = 2 * 1024 * 1024
 _MIN_ROCM_VERSION = (7, 2)
-_MAX_ABS_ERROR = 1.0
-_MAX_REL_L2_ERROR = 0.1
-_ACT_TYPE = "ActivationType.Silu"
+_DEFAULT_ACT_TYPE = "ActivationType.Silu"
 _DTYPE = "torch.bfloat16"
 _Q_DTYPE_A = "torch.float8_e4m3fn"
 _Q_DTYPE_W = "torch.float4_e2m1fn_x2"
@@ -59,7 +58,7 @@ class ShapeKey:
     topk: int
     tp: int
     cu_num: int | None = None
-    act_type: str = _ACT_TYPE
+    act_type: str = _DEFAULT_ACT_TYPE
     dtype: str = _DTYPE
     q_dtype_a: str = _Q_DTYPE_A
     q_dtype_w: str = _Q_DTYPE_W
@@ -238,8 +237,8 @@ def _parse_megakernel_name(name: str, shape: Shape, m: int):
     return MegakernelConfig(shape=shape, m=m, **values)
 
 
-def _config(row, shape: Shape) -> PipelineConfig:
-    name = row["kernelName"]
+def _config(row, comm_config, shape: Shape) -> PipelineConfig:
+    name = comm_config["kernel"]
     m = _int_value(row["token"], "token")
     atomic = re.fullmatch(
         rf"{re.escape(_CONFIG_NAME_PREFIX)}atomic_rs(\d+)_ag(\d+)", name
@@ -256,72 +255,73 @@ def _config(row, shape: Shape) -> PipelineConfig:
     else:
         config = _parse_megakernel_name(name, shape, m)
         if config is None:
-            raise ValueError(f"unknown comm_fused kernelName {name!r}")
+            raise ValueError(f"unknown comm_fused kernel name {name!r}")
     block_m = _int_value(row["block_m"], "block_m")
     if config.sort_block_m != block_m:
         raise ValueError(
-            f"kernelName sort_block_m={config.sort_block_m} does not match "
-            f"CSV block_m={block_m}"
+            "comm_fused_configs.ar.kernel "
+            f"sort_block_m={config.sort_block_m} does not match CSV block_m={block_m}"
         )
     return config
 
 
-def _optional_float(row, name: str) -> float | None:
-    raw = row.get(name)
-    if raw in (None, ""):
+def _comm_fused_ar_config(row) -> dict | None:
+    raw = (row.get("comm_fused_configs") or "").strip()
+    # The common CSV merger uses zero for columns missing from a source table.
+    if raw in ("", "0"):
         return None
-    value = float(raw)
-    return value if math.isfinite(value) else None
+    try:
+        configs = json.loads(raw)
+    except json.JSONDecodeError as error:
+        raise ValueError(f"invalid comm_fused_configs JSON: {error}") from error
+    if not isinstance(configs, dict):
+        raise TypeError("comm_fused_configs must be a JSON object")
+    if "ar" not in configs:
+        return None
+    config = configs["ar"]
+    if not isinstance(config, dict):
+        raise TypeError("comm_fused_configs.ar must be a JSON object")
+
+    tp = config.get("tp")
+    if isinstance(tp, bool) or not isinstance(tp, int):
+        raise TypeError("comm_fused_configs.ar.tp must be an integer")
+    add_shared = config.get("add_shared")
+    if not isinstance(add_shared, bool):
+        raise TypeError("comm_fused_configs.ar.add_shared must be a boolean")
+    kernel = config.get("kernel")
+    if not isinstance(kernel, str) or not kernel:
+        raise ValueError("comm_fused_configs.ar.kernel must be a non-empty string")
+    latency = config.get("us")
+    if isinstance(latency, bool) or not isinstance(latency, (int, float)):
+        raise TypeError("comm_fused_configs.ar.us must be a finite number")
+    if not math.isfinite(latency):
+        raise ValueError("comm_fused_configs.ar.us must be a finite number")
+    return config
 
 
-def _optional_bool(row, name: str, default: bool) -> bool:
-    value = row.get(name)
-    return default if value in (None, "", "nan") else bool(_int_value(value, name))
-
-
-def _row_is_accurate(row) -> bool:
-    max_abs = _optional_float(row, "max_abs")
-    rel_l2 = _optional_float(row, "rel_l2")
-    return (max_abs is None or max_abs <= _MAX_ABS_ERROR) and (
-        rel_l2 is None or rel_l2 <= _MAX_REL_L2_ERROR
-    )
-
-
-def _select_row(key, rows):
-    accurate = [row for row in rows if _row_is_accurate(row)]
-    if not accurate:
-        raise ValueError(f"all comm_fused configs fail accuracy for {key}")
-    if len(accurate) == 1:
-        return accurate[0]
-    measured = [
-        (latency, row)
-        for row in accurate
-        if (latency := _optional_float(row, "us")) is not None
-    ]
-    if len(measured) != len(accurate):
-        raise ValueError(
-            f"duplicate comm_fused configs require measured 'us' for {key}"
-        )
-    return min(measured, key=lambda item: item[0])[1]
+def _select_row(rows):
+    if len(rows) == 1:
+        return rows[0]
+    return min(rows, key=lambda candidate: candidate[1]["us"])
 
 
 @cache
 def _winner_table() -> dict[ShapeKey, dict[int, PipelineConfig]]:
     candidates = {}
-    config_path = Path(AITER_CONFIGS.AITER_CONFIG_COMM_FUSED_MOE_FILE)
+    config_path = Path(AITER_CONFIGS.AITER_CONFIG_FMOE_FILE)
     with config_path.open(newline="") as file:
         for row in csv.DictReader(file):
-            # Skip ordinary Stage2 + TP AllReduce fallback rows.
-            if row["kernelName"].strip().lower() == "fallback":
+            comm_config = _comm_fused_ar_config(row)
+            if comm_config is None:
                 continue
             shape = ShapeKey(
                 row["gfx"],
-                int(row["model_dim"]),
-                int(row["inter_dim"]),
-                int(row["expert"]),
-                int(row["topk"]),
-                int(row["tp"]),
-                int(row["cu_num"]),
+                _int_value(row["model_dim"], "model_dim"),
+                _int_value(row["inter_dim"], "inter_dim"),
+                _int_value(row["expert"], "expert"),
+                _int_value(row["topk"], "topk"),
+                comm_config["tp"],
+                _int_value(row["cu_num"], "cu_num"),
                 row["act_type"],
                 row["dtype"],
                 row["q_dtype_a"],
@@ -329,14 +329,14 @@ def _winner_table() -> dict[ShapeKey, dict[int, PipelineConfig]]:
                 row["q_type"],
                 _int_value(row["use_g1u1"], "use_g1u1"),
                 _int_value(row["doweight_stage1"], "doweight_stage1"),
-                _optional_bool(row, "add_shared", _ADD_SHARED),
+                comm_config["add_shared"],
             )
-            key = (shape, int(row["token"]))
-            candidates.setdefault(key, []).append(row)
+            key = (shape, _int_value(row["token"], "token"))
+            candidates.setdefault(key, []).append((row, comm_config))
     table = {}
     for (shape, m), rows in candidates.items():
-        row = _select_row((shape, m), rows)
-        table.setdefault(shape, {})[m] = _config(row, shape.kernel_shape())
+        row, comm_config = _select_row(rows)
+        table.setdefault(shape, {})[m] = _config(row, comm_config, shape.kernel_shape())
     return table
 
 
@@ -913,7 +913,13 @@ class _LazyRunners:
 
 
 def create_flydsl_comm_fused_runners(
-    *, tp_group, model_dim, inter_dim, experts, topk
+    *,
+    tp_group,
+    model_dim,
+    inter_dim,
+    experts,
+    topk,
+    act_type: str = _DEFAULT_ACT_TYPE,
 ):
     shape = ShapeKey(
         get_gfx_runtime(),
@@ -922,6 +928,7 @@ def create_flydsl_comm_fused_runners(
         experts,
         topk,
         int(tp_group.world_size),
+        act_type=act_type,
         add_shared=None,
     )
     configs = winners_for(shape)

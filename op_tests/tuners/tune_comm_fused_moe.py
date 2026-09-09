@@ -3,6 +3,7 @@
 
 import argparse
 import csv
+import json
 import os
 import statistics
 from dataclasses import MISSING, dataclass, fields
@@ -289,7 +290,7 @@ def _run_ordinary_stage2_allreduce(
     return get_tp_group().all_reduce(case.partial_out, ca_fp8_quant=False)
 
 
-_WINNER_KEY_FIELDS = (
+_BASE_KEY_FIELDS = (
     "gfx",
     "cu_num",
     "token",
@@ -297,7 +298,6 @@ _WINNER_KEY_FIELDS = (
     "inter_dim",
     "expert",
     "topk",
-    "tp",
     "act_type",
     "dtype",
     "q_dtype_a",
@@ -305,13 +305,12 @@ _WINNER_KEY_FIELDS = (
     "q_type",
     "use_g1u1",
     "doweight_stage1",
-    "add_shared",
 )
-CSV_FIELDS = (
-    *_WINNER_KEY_FIELDS,
+_COMM_FUSED_CONFIGS_FIELD = "comm_fused_configs"
+PROFILE_FIELDS = (
+    *_BASE_KEY_FIELDS,
     "block_m",
-    "us",
-    "kernelName",
+    _COMM_FUSED_CONFIGS_FIELD,
     "max_abs",
     "rel_l2",
 )
@@ -579,9 +578,25 @@ def _winner_key(shape: ShapeKey, token: int) -> dict:
         "q_type": shape.q_type,
         "use_g1u1": shape.use_g1u1,
         "doweight_stage1": shape.doweight_stage1,
-        "add_shared": int(shape.add_shared),
-        "tp": shape.tp,
     }
+
+
+def _decode_comm_fused_configs(raw, *, context: str) -> dict:
+    if raw in (None, ""):
+        return {}
+    try:
+        configs = json.loads(raw)
+    except json.JSONDecodeError as error:
+        raise ValueError(
+            f"invalid comm_fused_configs JSON in {context}: {error}"
+        ) from error
+    if not isinstance(configs, dict):
+        raise TypeError(f"comm_fused_configs in {context} must be a JSON object")
+    return configs
+
+
+def _encode_comm_fused_configs(configs: dict) -> str:
+    return json.dumps(configs, separators=(",", ":"), sort_keys=True)
 
 
 def winner_row(shape: ShapeKey, result: TuningResult) -> dict:
@@ -597,45 +612,126 @@ def winner_row(shape: ShapeKey, result: TuningResult) -> dict:
     row = {
         **_winner_key(shape, config.m),
         "block_m": block_m,
-        "us": result.latency_us,
-        "kernelName": config_name(config),
+        _COMM_FUSED_CONFIGS_FIELD: _encode_comm_fused_configs(
+            {
+                "ar": {
+                    "add_shared": shape.add_shared,
+                    "kernel": config_name(config),
+                    "tp": shape.tp,
+                    "us": result.latency_us,
+                }
+            }
+        ),
         "max_abs": result.max_abs,
         "rel_l2": result.rel_l2,
     }
-    return {field: row.get(field, "") for field in CSV_FIELDS}
-
-
-def fallback_row(shape: ShapeKey, token: int, block_m: int) -> dict:
-    row = {
-        **_winner_key(shape, token),
-        "block_m": block_m,
-        "kernelName": "fallback",
-    }
-    return {field: row.get(field, "") for field in CSV_FIELDS}
+    return {field: row.get(field, "") for field in PROFILE_FIELDS}
 
 
 def write_winner(path, row: dict) -> None:
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     rows = []
+    fieldnames = None
     if path.exists():
         with path.open(newline="") as file:
-            rows = list(csv.DictReader(file))
-    key = tuple(str(row[field]) for field in _WINNER_KEY_FIELDS)
-    rows = [
+            reader = csv.DictReader(file)
+            rows = list(reader)
+            fieldnames = reader.fieldnames
+    if fieldnames is None or "kernelName1" not in fieldnames:
+        raise ValueError("comm-fused winners must be written to a tuned_fmoe CSV")
+    if _COMM_FUSED_CONFIGS_FIELD not in fieldnames:
+        fieldnames.append(_COMM_FUSED_CONFIGS_FIELD)
+    incoming_configs = _decode_comm_fused_configs(
+        row.get(_COMM_FUSED_CONFIGS_FIELD), context="tuning result"
+    )
+    incoming_ar = incoming_configs["ar"]
+    base_key = tuple(str(row[field]) for field in _BASE_KEY_FIELDS)
+    matches = [
         old
         for old in rows
-        if tuple(
-            str(old.get(field, "1" if field == "add_shared" else ""))
-            for field in _WINNER_KEY_FIELDS
-        )
-        != key
+        if tuple(str(old.get(field, "")) for field in _BASE_KEY_FIELDS) == base_key
     ]
-    rows.append({field: row.get(field, "") for field in CSV_FIELDS})
+    if len(matches) > 1:
+        raise ValueError(f"duplicate ordinary rows for comm_fused winner {base_key}")
+    if matches:
+        output_row = matches[0]
+        configs = _decode_comm_fused_configs(
+            output_row.get(_COMM_FUSED_CONFIGS_FIELD), context=str(base_key)
+        )
+        existing_ar = configs.get("ar")
+        if existing_ar is not None:
+            for field in ("tp", "add_shared"):
+                if existing_ar.get(field) != incoming_ar.get(field):
+                    raise ValueError(
+                        "one ordinary row cannot store multiple ar "
+                        f"{field} values for {base_key}"
+                    )
+        existing_block_m = output_row.get("block_m")
+        if existing_block_m not in (None, "") and int(existing_block_m) != int(
+            row["block_m"]
+        ):
+            raise ValueError(
+                f"comm_fused block_m={row['block_m']} does not match "
+                f"ordinary block_m={existing_block_m} for {base_key}"
+            )
+    else:
+        output_row = {field: "" for field in fieldnames}
+        output_row.update({field: row.get(field, "") for field in _BASE_KEY_FIELDS})
+        output_row["block_m"] = row["block_m"]
+        configs = {}
+        shared_tag = "shared" if incoming_ar["add_shared"] else "no_shared"
+        output_row["_tag"] = f"comm_fused_tp{incoming_ar['tp']}_{shared_tag}"
+        rows.append(output_row)
+    configs["ar"] = incoming_ar
+    output_row[_COMM_FUSED_CONFIGS_FIELD] = _encode_comm_fused_configs(configs)
     with path.open("w", newline="") as file:
-        writer = csv.DictWriter(file, fieldnames=CSV_FIELDS)
+        writer = csv.DictWriter(file, fieldnames=fieldnames, lineterminator="\n")
         writer.writeheader()
         writer.writerows(rows)
+
+
+def remove_winner(path, shape: ShapeKey, token: int) -> None:
+    path = Path(path)
+    if not path.exists():
+        return
+    with path.open(newline="") as file:
+        reader = csv.DictReader(file)
+        rows = list(reader)
+        fieldnames = reader.fieldnames
+    if fieldnames is None or "kernelName1" not in fieldnames:
+        raise ValueError("comm-fused winners must be written to a tuned_fmoe CSV")
+    winner_key = _winner_key(shape, token)
+    key = tuple(str(winner_key[field]) for field in _BASE_KEY_FIELDS)
+    retained = []
+    changed = False
+    for row in rows:
+        row_key = tuple(str(row.get(field, "")) for field in _BASE_KEY_FIELDS)
+        if row_key != key:
+            retained.append(row)
+            continue
+        configs = _decode_comm_fused_configs(
+            row.get(_COMM_FUSED_CONFIGS_FIELD), context=str(key)
+        )
+        ar_config = configs.get("ar")
+        if ar_config is None or (
+            ar_config["tp"] != shape.tp or ar_config["add_shared"] != shape.add_shared
+        ):
+            retained.append(row)
+            continue
+        changed = True
+        del configs["ar"]
+        if not configs and (row.get("_tag") or "").startswith("comm_fused"):
+            continue
+        row[_COMM_FUSED_CONFIGS_FIELD] = (
+            _encode_comm_fused_configs(configs) if configs else ""
+        )
+        retained.append(row)
+    if changed:
+        with path.open("w", newline="") as file:
+            writer = csv.DictWriter(file, fieldnames=fieldnames, lineterminator="\n")
+            writer.writeheader()
+            writer.writerows(retained)
 
 
 def _parse_args():
@@ -825,15 +921,12 @@ def main():
             if args.profile_output is not None:
                 args.profile_output.parent.mkdir(parents=True, exist_ok=True)
                 with args.profile_output.open("w", newline="") as file:
-                    writer = csv.DictWriter(file, fieldnames=CSV_FIELDS)
+                    writer = csv.DictWriter(file, fieldnames=PROFILE_FIELDS)
                     writer.writeheader()
                     writer.writerows(winner_row(shape, result) for result in results)
             if winner is None:
                 if args.winner_output is not None:
-                    write_winner(
-                        args.winner_output,
-                        fallback_row(shape, args.token, int(metadata.block_m)),
-                    )
+                    remove_winner(args.winner_output, shape, args.token)
                 print(
                     f"COMM_FUSED_TUNE_WINNER ordinary_us={ordinary_us:.4f} "
                     "kernel=ordinary",
@@ -849,7 +942,7 @@ def main():
                     f"speedup={ordinary_us / winner.latency_us:.4f}x "
                     f"max_abs={winner.max_abs:.6f} "
                     f"rel_l2={winner.rel_l2:.6f} "
-                    f"kernel={winner_data['kernelName']}",
+                    f"kernel={config_name(winner.config)}",
                     flush=True,
                 )
     finally:
