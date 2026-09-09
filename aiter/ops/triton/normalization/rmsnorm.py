@@ -14,9 +14,13 @@ from aiter.ops.triton._triton_kernels.normalization.rmsnorm import (
     _rmsnorm_bwd_triton,
     _rmsnorm_kernel_large_m_small_n,
 )
+from aiter.ops.triton.utils._triton.arch_info import get_arch
 from aiter.ops.triton.utils.device_info import get_num_sms
 from aiter.ops.triton.utils.logger import AiterTritonLogger
+from aiter.ops.triton.utils.normalization_config_utils import get_normalization_config
 from aiter.ops.triton.utils.types import get_dtype_max
+
+_RMSNORM_LARGE_M_DEFAULTS = {"num_warps": 8, "num_stages": 2}
 
 _LOGGER = AiterTritonLogger()
 
@@ -120,6 +124,10 @@ def _rmsnorm_backward(dz, x, gamma, rsigma):
         BLOCK_M = max(min(16384 // BLOCK_N, 32), 8)
         num_prgms = triton.cdiv(M, BLOCK_M)
         dg_tmp = torch.empty(num_prgms, N, device=x_.device, dtype=torch.float32)
+        _cfg = {
+            **_RMSNORM_LARGE_M_DEFAULTS,
+            **get_normalization_config("rmsnorm_large_m_small_n", get_arch()),
+        }
         _rmsnorm_bwd_kernel_large_m_small_n[(num_prgms,)](
             dz_,
             x_,
@@ -133,8 +141,8 @@ def _rmsnorm_backward(dz, x, gamma, rsigma):
             N,
             BLOCK_M=BLOCK_M,
             BLOCK_N=BLOCK_N,
-            num_warps=8,
-            num_stages=2,
+            num_warps=_cfg["num_warps"],
+            num_stages=_cfg["num_stages"],
         )
         grid_reduce = lambda meta: [triton.cdiv(N, meta["BLOCK_SIZE_N"])]
         _rmsnorm_bwd_dg_reduce_triton[grid_reduce](
@@ -631,6 +639,10 @@ def _rmsnorm_forward_large_m_small_n(
     BLOCK_M = min(16384 // BLOCK_N, 32)
     BLOCK_M = max(BLOCK_M, 8)
 
+    _cfg = {
+        **_RMSNORM_LARGE_M_DEFAULTS,
+        **get_normalization_config("rmsnorm_large_m_small_n", get_arch()),
+    }
     grid = (triton.cdiv(M, BLOCK_M),)
     _rmsnorm_kernel_large_m_small_n[grid](
         x,
@@ -646,7 +658,7 @@ def _rmsnorm_forward_large_m_small_n(
         y.stride(1),
         BLOCK_M=BLOCK_M,
         BLOCK_N=BLOCK_N,
-        num_warps=8,
-        num_stages=2,
+        num_warps=_cfg["num_warps"],
+        num_stages=_cfg["num_stages"],
     )
     return (y, rsigma) if return_rsigma else y
