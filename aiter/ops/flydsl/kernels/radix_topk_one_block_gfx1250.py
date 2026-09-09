@@ -4,8 +4,8 @@
 """gfx1250 one-block radix TopK with one block per input row.
 
 Short rows cache ordered keys in LDS. Long rows compact the selected radix
-bucket, while stable modes add deterministic index ordering and tie-breaking.
-Short-row specializations omit the long-row arena and streaming path.
+bucket; stable modes preserve index ordering and tie-breaking.
+Rows with length <= k copy/pad in the same kernel without running radix.
 """
 
 from functools import cache
@@ -76,7 +76,10 @@ def build_radix_topk_one_block_gfx1250_module(
     stable: bool = False,
     short_rows: bool = False,
 ):
-    """Build a kernel; short_rows requires every effective row length <= 4096."""
+    """Build a kernel specialized for the caller's row-length bounds.
+
+    short_rows requires every effective row length <= 4096.
+    """
     if k <= 0:
         raise ValueError("k must be positive")
     if block_threads not in (256, 1024):
@@ -94,6 +97,9 @@ def build_radix_topk_one_block_gfx1250_module(
     stable_sort_enabled = (
         stable and not short_rows and block_threads == 1024 and k <= 2048
     )
+    # At k=2048, scanning 32K elements costs less than sorting their selected
+    # indices. The larger sort becomes profitable at 64K elements.
+    stable_sort_min_row_len = _STABLE_INDEX_SORT_MIN_ROW_LEN * (2 if k > 1024 else 1)
     stable_sort_capacity = 1 << (k - 1).bit_length() if stable_sort_enabled else 1
     stable_stage_capacity = k if stable_sort_enabled else 1
     stable_data_columns = 1 + int(write_values)
@@ -370,12 +376,15 @@ def build_radix_topk_one_block_gfx1250_module(
             bins_per_thread,
             scan,
             metadata,
+            replicas=(),
         ):
             first_bin = tid * fx.Int32(bins_per_thread)
             counts = fx.make_rmem_tensor(bins_per_thread, fx.Int32)
             local_total = zero
             for item in range_constexpr(bins_per_thread):
                 count = histogram[first_bin + item]
+                for replica in range_constexpr(len(replicas)):
+                    count = count + replicas[replica][first_bin + item]
                 counts[item] = count
                 local_total = local_total + count
             wave_inclusive = _warp_inclusive_prefix_i32(local_total, lane, _WAVE_SIZE)
@@ -546,45 +555,68 @@ def build_radix_topk_one_block_gfx1250_module(
         def sort_and_store_stable(
             selected_value_bits, selected_local_indices, row_indices, row_values
         ):
+            local_indices = fx.make_rmem_tensor(stable_sort_items_per_thread, fx.Int32)
+            local_values = fx.make_rmem_tensor(stable_sort_items_per_thread, fx.Int32)
             for item in range_constexpr(stable_sort_items_per_thread):
                 pos = tid + item * block_threads
-                if (pos >= top_k) & (pos < fx.Int32(stable_sort_capacity)):
-                    selected_local_indices[pos] = fx.Int32(2147483647)
+                local_indices[item] = fx.Int32(2147483647)
+                local_values[item] = zero
+                if pos < top_k:
+                    local_indices[item] = selected_local_indices[pos]
                     if const_expr(write_values):
-                        selected_value_bits[pos] = zero
+                        local_values[item] = selected_value_bits[pos]
             gpu.barrier()
 
             for stage in range_constexpr(len(stable_sort_sizes)):
                 size = stable_sort_sizes[stage]
                 stride = stable_sort_strides[stage]
+                # Keep wave-local compare/exchanges in registers. Only a
+                # cross-wave partner needs LDS and workgroup synchronization.
+                if const_expr(stride >= _WAVE_SIZE):
+                    for item in range_constexpr(stable_sort_items_per_thread):
+                        pos = tid + item * block_threads
+                        if pos < fx.Int32(stable_sort_capacity):
+                            selected_local_indices[pos] = local_indices[item]
+                            if const_expr(write_values):
+                                selected_value_bits[pos] = local_values[item]
+                    gpu.barrier()
+
                 for item in range_constexpr(stable_sort_items_per_thread):
                     pos = tid + item * block_threads
-                    partner = pos ^ fx.Int32(stride)
-                    if (pos < fx.Int32(stable_sort_capacity)) & (partner > pos):
-                        left = selected_local_indices[pos]
-                        right = selected_local_indices[partner]
-                        ascending = (pos & fx.Int32(size)) == zero
-                        swap = ascending.select(left > right, left < right)
-                        selected_local_indices[pos] = swap.select(right, left)
-                        selected_local_indices[partner] = swap.select(left, right)
+                    left = local_indices[item]
+                    left_value = local_values[item]
+                    right = fx.Int32(2147483647)
+                    right_value = zero
+                    if const_expr(stride < _WAVE_SIZE):
+                        right = left.shuffle_xor(fx.Int32(stride), fx.Int32(_WAVE_SIZE))
                         if const_expr(write_values):
-                            left_value = selected_value_bits[pos]
-                            right_value = selected_value_bits[partner]
-                            selected_value_bits[pos] = swap.select(
-                                right_value, left_value
+                            right_value = left_value.shuffle_xor(
+                                fx.Int32(stride), fx.Int32(_WAVE_SIZE)
                             )
-                            selected_value_bits[partner] = swap.select(
-                                left_value, right_value
-                            )
-                gpu.barrier()
+                    else:
+                        if pos < fx.Int32(stable_sort_capacity):
+                            partner = pos ^ fx.Int32(stride)
+                            right = selected_local_indices[partner]
+                            if const_expr(write_values):
+                                right_value = selected_value_bits[partner]
+                    ascending = (pos & fx.Int32(size)) == zero
+                    lower_half = (pos & fx.Int32(stride)) == zero
+                    take_min = ascending == lower_half
+                    swap = take_min.select(left > right, left < right)
+                    local_indices[item] = swap.select(right, left)
+                    if const_expr(write_values):
+                        local_values[item] = swap.select(right_value, left_value)
+
+                if const_expr(stride >= _WAVE_SIZE):
+                    # Finish every LDS read before another wave can overwrite it.
+                    gpu.barrier()
 
             for item in range_constexpr(stable_sort_items_per_thread):
                 pos = tid + item * block_threads
                 if pos < top_k:
-                    col = selected_local_indices[pos]
-                    row_indices[pos] = row_start + col
+                    row_indices[pos] = row_start + local_indices[item]
                     if const_expr(write_values):
-                        row_values[pos] = selected_value_bits[pos].bitcast(fx.Float32)
+                        row_values[pos] = local_values[item].bitcast(fx.Float32)
 
         def scatter_stable_sorted_keys(
             source,
@@ -741,7 +773,9 @@ def build_radix_topk_one_block_gfx1250_module(
                     vector_idx = step * block_threads + tid
                     active_vector = vector_idx < row_vectors
                     safe_vector_idx = active_vector.select(vector_idx, 0)
-                    fragment = fx.make_rmem_tensor(full_key_fragment_layout, fx.Int32)
+                    fragment = fx.make_rmem_tensor(
+                        full_key_fragment_layout, fx.Int32
+                    )
                     fx.copy_atom_call(
                         full_key_load_atom,
                         fx.slice(full_key_tiles, (None, safe_vector_idx)),
@@ -798,9 +832,9 @@ def build_radix_topk_one_block_gfx1250_module(
                 )
 
             if const_expr(stable_sort_enabled):
-                can_use_index_sort = (
-                    row_len >= fx.Int32(_STABLE_INDEX_SORT_MIN_ROW_LEN)
-                ) & (metadata[_SELECTED_BUCKET_COUNT] == num_needed)
+                can_use_index_sort = (row_len >= fx.Int32(stable_sort_min_row_len)) & (
+                    metadata[_SELECTED_BUCKET_COUNT] == num_needed
+                )
                 can_sort_compacted_indices = can_use_index_sort & (
                     candidate_count <= fx.Int32(_COMPACT_CAPACITY)
                 )
@@ -867,7 +901,9 @@ def build_radix_topk_one_block_gfx1250_module(
                 )
             )
             gpu.barrier()
-            merge_histograms(histograms, short_bins_per_thread)
+            # Fusing the merge increases scan register pressure at 256 threads.
+            if const_expr(block_threads == 256):
+                merge_histograms(histograms, short_bins_per_thread)
             choose_threshold(
                 top_k,
                 _FIRST_ABOVE,
@@ -877,6 +913,7 @@ def build_radix_topk_one_block_gfx1250_module(
                 short_bins_per_thread,
                 scan,
                 metadata,
+                replicas=histograms[1:] if block_threads == 1024 else (),
             )
 
             remaining_k = top_k - metadata[_FIRST_ABOVE]
@@ -959,6 +996,7 @@ def build_radix_topk_one_block_gfx1250_module(
                 col,
                 key,
                 prefix_threshold,
+                compact_candidates,
                 candidate_ordered_keys,
                 candidate_local_indices,
                 staged_value_bits,
@@ -971,7 +1009,15 @@ def build_radix_topk_one_block_gfx1250_module(
                 mask = _LONG_RADIX_MASKS[1]
                 active = col < row_len
                 prefix = preceding_prefix(key, shift, mask)
-                if active & (prefix > prefix_threshold):
+                collect_above = fx.Int32(int(not stable)) == one
+                if const_expr(stable_sort_enabled):
+                    collect_above = collect_above | (
+                        (row_len >= fx.Int32(stable_sort_min_row_len))
+                        & compact_candidates
+                    )
+                # Ordered streaming emission does not consume this counter or
+                # the staging buffers. Avoid serializing those unused writes.
+                if active & (prefix > prefix_threshold) & collect_above:
                     out_pos = atomic_add_i32(metadata, one, _RUNNING_ABOVE, "workgroup")
                     if out_pos < top_k:
                         if const_expr(stable):
@@ -989,13 +1035,14 @@ def build_radix_topk_one_block_gfx1250_module(
                 if active:
                     bucket = radix_bucket(key, shift, mask)
                     atomic_add_i32(histogram, one, bucket, "workgroup")
-                if active:
+                if active & compact_candidates:
                     candidate_pos = atomic_add_i32(
                         metadata, one, _CANDIDATE_COUNT, "workgroup"
                     )
                     if candidate_pos < fx.Int32(_COMPACT_CAPACITY):
                         candidate_ordered_keys[candidate_pos] = key
-                        candidate_local_indices[candidate_pos] = col
+                        if const_expr(not stable or stable_sort_enabled):
+                            candidate_local_indices[candidate_pos] = col
 
             # Level 1: select the high radix bucket.
             clear_histograms(histograms, high_bins_per_thread)
@@ -1009,7 +1056,9 @@ def build_radix_topk_one_block_gfx1250_module(
                 )
             )
             gpu.barrier()
-            merge_histograms(histograms, high_bins_per_thread)
+            # Keep the smaller live range for throughput-oriented variants.
+            if const_expr(not stable or k <= 1024):
+                merge_histograms(histograms, high_bins_per_thread)
             choose_threshold(
                 top_k,
                 _FIRST_ABOVE,
@@ -1019,11 +1068,21 @@ def build_radix_topk_one_block_gfx1250_module(
                 high_bins_per_thread,
                 scan,
                 metadata,
+                replicas=histograms[1:] if stable and k > 1024 else (),
             )
 
             remaining_k = top_k - metadata[_FIRST_ABOVE]
             prefix_threshold = metadata[_FIRST_THRESHOLD]
-            candidate_count = zero
+            # Stable emission can skip compaction when its bucket exceeds LDS
+            # capacity. Keep the counter-based count for non-stable emission:
+            # carrying the first-pass count across the scan hurt its throughput
+            # (and also hurt stable variants with smaller k).
+            if const_expr(stable and k > 1024):
+                candidate_count = metadata[_SELECTED_BUCKET_COUNT]
+                compact_candidates = candidate_count <= fx.Int32(_COMPACT_CAPACITY)
+            else:
+                candidate_count = zero
+                compact_candidates = one > zero
             unstable_mode = fx.Int32(int(not stable)) == one
             can_finish = unstable_mode & (
                 metadata[_SELECTED_BUCKET_COUNT] == remaining_k
@@ -1042,6 +1101,7 @@ def build_radix_topk_one_block_gfx1250_module(
                         col,
                         ordered_key(value),
                         prefix_threshold,
+                        compact_candidates,
                         candidate_ordered_keys,
                         candidate_local_indices,
                         staged_value_bits,
@@ -1052,7 +1112,8 @@ def build_radix_topk_one_block_gfx1250_module(
                     reverse=True,
                 )
                 gpu.barrier()
-                candidate_count = metadata[_CANDIDATE_COUNT]
+                if const_expr(not stable or k <= 1024):
+                    candidate_count = metadata[_CANDIDATE_COUNT]
                 choose_threshold(
                     remaining_k,
                     _SECOND_ABOVE,
@@ -1159,7 +1220,20 @@ def build_radix_topk_one_block_gfx1250_module(
                                 3,
                             )
 
-        def write_direct_output(row_indices, row_values):
+        def write_direct_scalar(row_indices, row_values):
+            for step in range_constexpr((k + block_threads - 1) // block_threads):
+                col = step * block_threads + tid
+                if col < k:
+                    row_indices[col] = (col < row_len).select(
+                        row_start + col, fx.Int32(-1)
+                    )
+                    if const_expr(write_values):
+                        value = fx.Float32(float("-inf"))
+                        if col < row_len:
+                            value = physical_row[row_start + col]
+                        row_values[col] = value
+
+        def write_direct_vector(row_indices, row_values):
             for step in range_constexpr(output_vector_steps):
                 vector_idx = step * block_threads + tid
                 if vector_idx < output_vector_count:
@@ -1233,6 +1307,12 @@ def build_radix_topk_one_block_gfx1250_module(
                     row_values[tail] = valid.select(
                         input_row[safe_tail], fx.Float32(float("-inf"))
                     )
+
+        def write_direct_output(row_indices, row_values):
+            if const_expr(k <= block_threads):
+                write_direct_scalar(row_indices, row_values)
+            else:
+                write_direct_vector(row_indices, row_values)
 
         # Kernel control flow
         if row_len <= top_k:
