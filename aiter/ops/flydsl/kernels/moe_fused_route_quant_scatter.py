@@ -367,8 +367,10 @@ def _emit_quant_block_loop(c: SimpleNamespace) -> None:
                 * arith.constant(2, type=i32),
             )
         return buffer_ops.buffer_load(
-            hidden_rsrc, (feat_elem_base + col_base) >> c.c1_i32,
-            vec_width=4, dtype=i32,
+            hidden_rsrc,
+            (feat_elem_base + col_base) >> c.c1_i32,
+            vec_width=4,
+            dtype=i32,
         )
 
     quant_results = []
@@ -527,9 +529,7 @@ def _emit_quant_block_loop(c: SimpleNamespace) -> None:
         return
 
     for mx_block, payload_val, e8m0_scale in quant_results:
-        _emit_quant_result_stores(
-            c, dst_payload, mx_block, payload_val, e8m0_scale
-        )
+        _emit_quant_result_stores(c, dst_payload, mx_block, payload_val, e8m0_scale)
 
 
 def _emit_quant_result_stores(c, dst_payload, mx_block, payload_val, e8m0_scale):
@@ -642,8 +642,7 @@ def _emit_row_major_scale_dwords(c, mx_block, scale_dword, e8m0_scale):
     packed = _pack_block_group_dword(c, e8m0_scale)
 
     group_lead = arith.andi(
-        arith.andi(fx.Int32(c.block_in_wave), arith.constant(3, type=i32))
-        == c.c0_i32,
+        arith.andi(fx.Int32(c.block_in_wave), arith.constant(3, type=i32)) == c.c0_i32,
         c.is_block_lead,
     )
     _if = scf.IfOp(_raw(group_lead))
@@ -1840,16 +1839,13 @@ def build_moe_token_multidest_quant_topk6_module(
     block_iters = L.block_iters
     amax_shuffle_dists = L.amax_shuffle_dists
     if tdm_hidden_chunks and (
-        block_iters % tdm_hidden_chunks
-        or (feat_dim * 2) % (tdm_hidden_chunks * 16)
+        block_iters % tdm_hidden_chunks or (feat_dim * 2) % (tdm_hidden_chunks * 16)
     ):
         raise ValueError(
             f"tdm_hidden_chunks={tdm_hidden_chunks} must divide block_iters="
             f"{block_iters} and leave a 16 B-aligned chunk of {feat_dim * 2} B"
         )
-    hidden_chunk_bytes = (
-        feat_dim * 2 // tdm_hidden_chunks if tdm_hidden_chunks else 0
-    )
+    hidden_chunk_bytes = feat_dim * 2 // tdm_hidden_chunks if tdm_hidden_chunks else 0
     # Row-major e8m0 goes out packed: a dword per 4 MX blocks, widened to a
     # dwordx4 per 8 when the block count pairs up. Both need the pk8 geometry
     # (4 lanes per MX block) to assemble the bytes with xor-shuffles.
@@ -1885,13 +1881,9 @@ def build_moe_token_multidest_quant_topk6_module(
         c0_f32 = arith.constant(0.0, type=f32)
 
         c_wave = arith.constant(wave_size, type=i32)
-        c_payload_bytes_per_block = arith.constant(
-            payload_bytes_per_block, type=i32
-        )
+        c_payload_bytes_per_block = arith.constant(payload_bytes_per_block, type=i32)
         c_payload_bytes_per_lane = arith.constant(payload_bytes_per_lane, type=i32)
-        c_dst_scale_dwords_per_row = arith.constant(
-            dst_scale_dwords_per_row, type=i32
-        )
+        c_dst_scale_dwords_per_row = arith.constant(dst_scale_dwords_per_row, type=i32)
         c_wmma_rep = arith.constant(wmma_rep, type=i32)
         c_rows_per_tile = arith.constant(rows_per_tile, type=i32)
         c_lanes_per_block = arith.constant(lanes_per_mx_block, type=i32)
@@ -1901,9 +1893,7 @@ def build_moe_token_multidest_quant_topk6_module(
 
         tid = fx.Uint32(fx.thread_idx.x)
         bid = fx.Uint32(fx.block_idx.x)
-        warp_in_block = fx.Uint32(
-            rocdl.readfirstlane(i32, fx.Uint32(tid // c_wave))
-        )
+        warp_in_block = fx.Uint32(rocdl.readfirstlane(i32, fx.Uint32(tid // c_wave)))
         lane = tid - warp_in_block * c_wave
         token0 = bid * arith.constant(warps_per_block, type=i32)
         token = token0 + warp_in_block
@@ -1922,8 +1912,8 @@ def build_moe_token_multidest_quant_topk6_module(
                 hidden_chunk_bytes, type=i32
             )
             valid_rows = fx.Int32(token_num) - fx.Int32(token0)
-            hg_base = (
-                fx.recast_iter(fx.Int8, hidden) + fx.Int64(token0) * (feat_dim * 2)
+            hg_base = fx.recast_iter(fx.Int8, hidden) + fx.Int64(token0) * (
+                feat_dim * 2
             )
 
             def _issue_hidden(chunk):
@@ -1969,9 +1959,7 @@ def build_moe_token_multidest_quant_topk6_module(
                     _issue_hidden(chunk + 1)
                 if const_expr(chunk > 0):
                     if is_loader:
-                        tdm_ops.tensor_wait(
-                            1 if chunk + 1 < tdm_hidden_chunks else 0
-                        )
+                        tdm_ops.tensor_wait(1 if chunk + 1 < tdm_hidden_chunks else 0)
                     gpu.barrier()
 
         # CTA-uniform guard (every launched block owns at least one token), so
@@ -2048,9 +2036,7 @@ def build_moe_token_multidest_quant_topk6_module(
                 block_in_wave=block_in_wave,
                 lane_in_block=lane_in_block,
                 is_block_lead=lane_in_block == c0_i32,
-                payload_dests=[
-                    SimpleNamespace(payload_row_i32=row) for row in rows
-                ],
+                payload_dests=[SimpleNamespace(payload_row_i32=row) for row in rows],
                 dests=[
                     SimpleNamespace(payload_row_i32=row, scale_row_dword_base=sc)
                     for row, sc in zip(rows, scales)

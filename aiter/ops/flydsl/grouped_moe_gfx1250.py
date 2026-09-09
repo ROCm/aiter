@@ -640,8 +640,7 @@ def _grouped_a8w4_tdm_moe(
     _row_major_ascale = (
         not _prequantized
         and int(topk) == 6
-        and os.environ.get("AITER_FLYDSL_ROWMAJOR_ASCALE", "1")
-        in ("1", "true", "True")
+        and os.environ.get("AITER_FLYDSL_ROWMAJOR_ASCALE", "1") in ("1", "true", "True")
     )
 
     a1_payload, a1_scale = flydsl_moe_fused_quant_preshuffle(
