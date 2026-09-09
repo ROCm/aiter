@@ -313,6 +313,9 @@ def launch_gemm_a8w8_256x256(
                     0,
                     True,
                 )
+                if const_expr(not mx32):
+                    flat_wg = fx.Int32(local_x) + fx.Int32(local_y) * cluster_m
+                    mask = fx.Int32(1) << fx.Int32(rocdl.readfirstlane(T.i32, flat_wg))
             inner_bound = mn_oob if const_expr(owner == 2 and not mx32) else None
             desc = tdm_ops.make_tensor_descriptor_2d(
                 global_ptr=tensor,
@@ -421,13 +424,13 @@ def launch_gemm_a8w8_256x256(
         def _mma_one(wm, wn, act, wt, sa_k, sb_k):
             idx = wm * wmma_n_rep + wn
             fx.gemm(
-                wmma_atoms[wn % 2 if mx32 else 0][wm % 2 if mx32 else 0],
+                wmma_atoms[wn % 2 if mx32 else 0][wm % 2],
                 c_frags[idx],
                 wt,
                 act,
                 c_frags[idx],
                 scale_a=sb_k[wn // 2 if mx32 else 0],
-                scale_b=sa_k[wm // 2 if mx32 else wm],
+                scale_b=sa_k[wm // 2],
             )
 
         def _mma_block_range(
@@ -502,9 +505,9 @@ def launch_gemm_a8w8_256x256(
                 (sb_col // 32) * SUPER_K + (sb_col % 32) * 4,
             )
         else:
-            sa_sel = ((wmb + lane16) % 4) * 0x01010101
+            sa_sel = ((wmb + lane) % 4) * 0x01010101
             sb_sel = fx.Int32(0)
-            sa_byte = fx.index_cast(T.index, ((wmb + lane16) // 4) * 4)
+            sa_byte = fx.index_cast(T.index, ((wmb + lane) // 4) * 4)
             sb_byte = fx.index_cast(
                 T.index, (wnb // 128) * SC_K
             )  # contiguous, see above
@@ -566,7 +569,7 @@ def launch_gemm_a8w8_256x256(
         def _stage_load_sa_raw(stage, sm):
             if const_expr(mx32):
                 return lds_load_b32(stage_sa_addr[stage], sm * SUPER_K)[0]
-            return lds_load_b32(stage_sa_addr[stage], sm * 16)[0]
+            return lds_load_b32(stage_sa_addr[stage], sm * 32)[0]
 
         def _stage_load_sb_raw(stage, sn):
             if const_expr(mx32):
@@ -579,22 +582,18 @@ def launch_gemm_a8w8_256x256(
         def _sb_of(word):
             return word if const_expr(mx32) else _bcast_byte(word, sb_sel)
 
-        def _stage_load_sa(stage, sm):
-            return _sa_of(_stage_load_sa_raw(stage, sm))
-
-        N_SA = half_m // 2 * 2 if const_expr(mx32) else wmma_m_rep
+        N_SA = half_m // 2 * 2
         N_SB = half_n // 2 * 2 if const_expr(mx32) else 1
-        N_SA_LO = N_SA // 2 if const_expr(not mx32) else N_SA
 
         seed_a = [fx.make_rmem_tensor(16, fx.Int32) for _ in range_constexpr(half_m)]
         seed_b = [fx.make_rmem_tensor(16, fx.Int32) for _ in range_constexpr(half_n)]
-        seed_sa = [fx.make_rmem_tensor(1, fx.Int32) for _ in range_constexpr(N_SA_LO)]
+        seed_sa = [fx.make_rmem_tensor(1, fx.Int32) for _ in range_constexpr(N_SA)]
         seed_sb = [fx.make_rmem_tensor(1, fx.Int32) for _ in range_constexpr(N_SB)]
 
         def _seed_thunks(stage, parity=0):
             """One producer per WMMA slot, same cadence as the in-stage _mk producers."""
             head = []
-            for sm in range_constexpr(N_SA_LO):
+            for sm in range_constexpr(N_SA):
 
                 def _go_sa(sm=sm):
                     seed_sa[sm].store(
@@ -647,20 +646,9 @@ def launch_gemm_a8w8_256x256(
             parity=0,
         ):
             """One K-tile, four 64x64 quadrants, at most three fragment groups live."""
-            sa_k = [_sa_of(seed_sa[sm].load()[0]) for sm in range_constexpr(N_SA_LO)]
+            sa_k = [_sa_of(seed_sa[sm].load()[0]) for sm in range_constexpr(N_SA)]
             sb_k = [_sb_of(seed_sb[sn].load()[0]) for sn in range_constexpr(N_SB)]
             a0, b0 = seed_a, seed_b
-            sa_k = sa_k + [None] * (N_SA - N_SA_LO)
-
-            def _mk_sa_hi():
-                out = []
-                for sm in range_constexpr(N_SA_LO, N_SA):
-
-                    def _go(sm=sm):
-                        sa_k[sm] = _stage_load_sa(stage, sm)
-
-                    out.append(_go)
-                return out
 
             rocdl.sched_barrier(0)
 
@@ -798,7 +786,7 @@ def launch_gemm_a8w8_256x256(
                     0,
                     a0,
                     b0,
-                    _seq(_mk("b", 1, "b1"), _mk_sa_hi()),
+                    _seq(_mk("b", 1, "b1")),
                     False,
                 )
                 _quad(
@@ -835,7 +823,7 @@ def launch_gemm_a8w8_256x256(
                     0,
                     a0,
                     b0,
-                    _seq(_mk("a", 1, "a1"), _mk_sa_hi()),
+                    _seq(_mk("a", 1, "a1")),
                     True,
                 )
                 _quad(
