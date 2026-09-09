@@ -325,7 +325,7 @@ Let `padded_M=ceil_div(M,B_M)*B_M` and
 |---|---|---|
 | gfx950 two-stage | `[workspace_capacity_split_k,batch,padded_M,padded_N]` | FP32 |
 | gfx942 two-stage | `[workspace_capacity_split_k,batch,padded_M,padded_N]` | exact BF16/FP32 dtype |
-| gfx1250 two-stage | `[workspace_capacity_split_k,padded_M,padded_N]` | BF16 |
+| gfx1250 two-stage | `[workspace_capacity_split_k,padded_M,padded_N]` | FP32 |
 | gfx1250 pre-built CO direct | none | none |
 | gfx1250 fused | not publicly registered | factory/emitter/source retained for repair |
 
@@ -337,6 +337,13 @@ An explicit workspace must be on the XQ device, contiguous, 16-byte aligned,
 of the exact instance dtype, and large enough for the final split. Larger
 caller-provided workspaces are also accepted. A direct kid requires
 `workspace=None`.
+
+gfx1250 two-stage kids require `M <= 65535`, including `split_k=0/1`, because
+their separate reducer places one logical row in each `grid.y` block. The
+tuner excludes larger M, policy rejects stale split-K rows, and exact launch
+checks the limit before either kernel runs. Larger M can use a compatible
+tuned CO kid; the gfx1250 heuristic only selects two-stage kids and requests
+tuning when this limit is exceeded.
 
 gfx1250 clusterlaunch exact kids round the physical launch grid up to complete
 clusters; tile-less workgroups exit inside the pipeline. This does not change

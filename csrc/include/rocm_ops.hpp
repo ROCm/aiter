@@ -1474,9 +1474,9 @@ namespace py = pybind11;
           py::arg("m_indices")         = std::nullopt, \
           py::arg("reverse_sorted")    = std::nullopt);
 
-#define PA_SPARSE_PREFILL_OPUS_PYBIND               \
+#define MLA_V4_PREFILL_OPUS_PYBIND                  \
     m.def("pa_sparse_prefill_gfx950_opus_fwd",      \
-          &pa_sparse_prefill_gfx950_opus_fwd,       \
+          &opus_mla_v4_prefill_a16w16_gfx950_fwd,   \
           py::arg("q"),                             \
           py::arg("unified_kv"),                    \
           py::arg("kv_indices_prefix"),             \
@@ -1488,7 +1488,7 @@ namespace py = pybind11;
           py::arg("out"),                           \
           py::arg("softmax_scale"));                \
     m.def("pa_sparse_prefill_gfx1250_opus_fwd",     \
-          &pa_sparse_prefill_gfx1250_opus_fwd,      \
+          &opus_mla_v4_prefill_a16w16_gfx1250_fwd,  \
           py::arg("q"),                             \
           py::arg("unified_kv"),                    \
           py::arg("kv_indices_prefix"),             \
@@ -1500,7 +1500,7 @@ namespace py = pybind11;
           py::arg("out"),                           \
           py::arg("softmax_scale"));                \
     m.def("pa_sparse_prefill_fp8_gfx950_opus_fwd",  \
-          &pa_sparse_prefill_fp8_gfx950_opus_fwd,   \
+          &opus_mla_v4_prefill_a8w8_gfx950_fwd,     \
           py::arg("q_nope"),                        \
           py::arg("q_rope"),                        \
           py::arg("unified_kv_nope"),               \
@@ -1515,7 +1515,7 @@ namespace py = pybind11;
           py::arg("out"),                           \
           py::arg("softmax_scale"));                \
     m.def("pa_sparse_prefill_fp8_gfx1250_opus_fwd", \
-          &pa_sparse_prefill_fp8_gfx1250_opus_fwd,  \
+          &opus_mla_v4_prefill_a8w8_gfx1250_fwd,    \
           py::arg("q_nope"),                        \
           py::arg("q_rope"),                        \
           py::arg("unified_kv_nope"),               \

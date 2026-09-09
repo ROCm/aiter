@@ -560,6 +560,9 @@ def kid_rejects_shape(k_inst, M, N, K):
             splitk main kernel's mask_va_tail cover both edge cases, so
             splitk is safe for any (M, N, K).
     """
+    if k_inst.max_m is not None and M > k_inst.max_m:
+        return True
+
     # CO pipelines use dimension-clamped TDM descriptors for A/B/C, have no
     # split-K buffer, and support M/N/K tails. Their scalar extents remain int.
     if k_inst.kernel_tag in _A16W16_CO_TAGS:

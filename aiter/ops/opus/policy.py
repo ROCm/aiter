@@ -391,6 +391,13 @@ def select_a16w16_heuristic_kid(
             f"{arch} a16w16 heuristic returned kid {kid}, which is not in "
             "DEFAULT_COMPILED_KIDS_BY_ARCH"
         )
+    instance = get_kernel_instance(arch, "a16w16", kid)
+    if instance is not None and instance.max_m is not None and int(M) > instance.max_m:
+        raise RuntimeError(
+            f"opus {arch} a16w16 heuristic refuses M={M}: "
+            f"kid {kid} requires M <= {instance.max_m}. "
+            "Tune this shape for a non-split-K kernel."
+        )
     return kid
 
 

@@ -583,6 +583,8 @@ def test_global_a16_stale_opus_row_keeps_framework_fallback(monkeypatch):
     monkeypatch.setattr(tuned, "get_GEMM_A16W16_config_", lambda: {key: row})
     monkeypatch.setattr(tuned, "get_gfx", lambda: "gfx942")
     monkeypatch.setattr(tuned, "get_cu_num", lambda: 304)
+    # Revisit the stale key in both padded lookups without the native helper.
+    monkeypatch.setattr(tuned, "get_padded_m", lambda M, _N, _K, _gl: M)
     monkeypatch.setattr(tuned, "_opus_launch", object())
     monkeypatch.setattr(
         tuned.logger,
@@ -603,8 +605,13 @@ def test_global_a16_stale_opus_row_keeps_framework_fallback(monkeypatch):
         tuned.get_GEMM_A16W16_config.cache_clear()
 
     assert (config["libtype"], config["solidx"]) == ("torch", 0)
-    assert len(warnings) == 1
-    assert "kid=200, splitK=2" in warnings[0]
+    stale_warnings = [
+        message
+        for message in warnings
+        if message.startswith("Ignoring invalid OPUS tuned row")
+    ]
+    assert len(stale_warnings) == 1
+    assert "kid=200, splitK=2" in stale_warnings[0]
 
 
 def _capture_shape_driven_opus_launch(monkeypatch, *, arch, tuned_config):

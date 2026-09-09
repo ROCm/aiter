@@ -276,6 +276,11 @@ def _build_a16w16_launch_plan(
             f"OPUS kid {resolved_kid} does not support output dtype " f"{output_dtype}"
         )
 
+    if instance.max_m is not None and M > instance.max_m:
+        raise ValueError(
+            f"OPUS kid {resolved_kid} requires M <= {instance.max_m}; got M={M}"
+        )
+
     needs_workspace = resolved_kid in SPLITK_KIDS
     if instance.kernel_tag in _GFX1250_CO_TAGS and requested_split_k > 1:
         raise ValueError(

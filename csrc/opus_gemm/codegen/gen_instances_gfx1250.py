@@ -302,6 +302,11 @@ void
         split_k--;
     }}}}
 
+    // The reducer uses one logical row per grid.y block. Reject stale tuned
+    // rows and explicit kids before either kernel can launch an invalid grid.
+    AITER_CHECK(M <= {k.max_m},
+        "{k.name}: split-K reduce requires M <= {k.max_m}; got M=", M);
+
     int num_tiles_m = 1 + (M - 1) / {k.B_M};
     int num_tiles_n = 1 + (N - 1) / {k.B_N};
     const size_t padded_M_size = opus_checked_extent_product(
@@ -359,7 +364,7 @@ void
 
     {kernel_func}<Traits><<<grid_main, block_main, 0, stream>>>(kargs);
 
-    // Reduce reads the bf16 split-K workspace the main kernel wrote (D_WS=__bf16),
+    // Reduce reads the exact kid's typed partials (D_WS={workspace_ptr_type}),
     // re-accumulates in fp32, folds bias, casts to Y dtype. split_k is dispatched
     // to a compile-time (unrolled) reduce instance by the launch helper.
     if (Y.dtype() == AITER_DTYPE_bf16) {{{{

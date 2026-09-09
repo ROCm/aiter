@@ -128,6 +128,9 @@ class OpusGemmInstance:
     co_dtypes: tuple = ("bf16_t", "bf16_t", "bf16_t", "fp32_t")
     co_wave_layout: tuple = (4, 1)
 
+    # Optional logical-M limit imposed by this exact kernel's launch geometry.
+    max_m: int | None = None
+
     @property
     def name(self) -> str:
         parts = [
@@ -1144,7 +1147,7 @@ def _a16w16_cluster_tdm_splitk_ws_gfx1250(bm, bn, bk, layout, num_slots=3, wg_pe
     NO-CLUSTER (one WG per B_M x B_N tile). The main kernel WMMA-accumulates in
     fp32 and casts each split's partial into the exact kid's typed workspace; a
     separate reduce kernel sums the split slices in fp32, folds bias, and casts
-    to the Y dtype. The #4246 two-stage contract uses bf16 workspace. The
+    to the Y dtype. The two-stage families keep partials in fp32 workspace. The
     output_dtypes = ["fp32_t"] token selects the existing host launch-dispatch
     specialization; Y bf16/fp32 remains a runtime decision in the reducer.
 
@@ -1163,7 +1166,9 @@ def _a16w16_cluster_tdm_splitk_ws_gfx1250(bm, bn, bk, layout, num_slots=3, wg_pe
         "a16w16_cluster_tdm_splitk_ws",
         ["fp32_t"],
         arch_prefix="gfx1250",
-        splitk_workspace_dtype="bf16_t",
+        splitk_workspace_dtype="fp32_t",
+        # The separate reducer places one logical row in each grid.y block.
+        max_m=65535,
         ctdm_layout=layout,
         num_slots=num_slots,
         wg_per_cu=wg_per_cu,
@@ -1433,6 +1438,8 @@ def _a16w16_splitk_fuse_gfx1250(
         # fused launcher chooses the real bf16/fp32 Y type at runtime.
         output_dtypes=["fp32_t"],
         splitk_workspace_dtype=ws_dtype,
+        # This family reduces in-kernel, without the separate grid.y launch.
+        max_m=None,
         fuse_split_k=split_k,
         # Historical #4246 field name; physically this is an N-peer count.
         fuse_m_cluster=n_cluster,
