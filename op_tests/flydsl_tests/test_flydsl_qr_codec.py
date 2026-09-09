@@ -3,25 +3,26 @@
 
 """Codec-level tests for the QRInt4 wire formats.
 
-Single-GPU and no IPC: these check the *codec*, not the collective. The
-schedule tests in ``test_flydsl_qr_int4.py`` cover the wire protocol.
+Single GPU, no IPC: these cover the codec, while ``test_flydsl_qr_int4.py``
+covers the schedules that carry it.
 
-Two things are worth checking here that a collective test cannot.
+Two properties are load-bearing:
 
-First, packing is checked on the **words**, not on the reconstruction. A
-half-swap between the lane pair that shares an INT6 ``hi2`` slot reconstructs
-plausibly -- the values are still in range, still roughly the right magnitude --
-and would survive a reconstruction-only check while quietly costing accuracy at
-every hop. Comparing the packed i32 against a host reference catches it.
-
-Second, the error model that sizes the codec is asserted rather than trusted.
-``qr_codec_ref`` predicts ~21 dB for a TP8 ring on an INT6 reduce-scatter lap
-against ~15.7 on INT4, and those numbers are why INT6 is the TP8 default; if
-the model drifts, the default should be revisited rather than silently kept.
+* **Memory path equals register path.** Staging the quantized words through
+  LDS at their wire offsets and reading them back with ``_codec_load`` must
+  reproduce, bit for bit, what handing the same words straight to the
+  dequantizer produces. Relocation cannot change a value, so any disagreement
+  about where the 2-bit plane or the scale word lives shows up here -- and
+  nowhere else, since both sides of the real kernel would be wrong together.
+* **The analytic error bound.** E4M3 carries 3 mantissa bits, so the decoded
+  extremum is within 1/16 of the true one; on top of that a value can miss by
+  half a step, and one near the extreme can land a whole code short. That gives
+  ``|err| <= |ext| * (1/16 + 1.05/bias)`` with no free parameters.
 """
 
 from __future__ import annotations
 
+import functools
 import os
 import sys
 
@@ -32,138 +33,386 @@ if _REPO_ROOT not in sys.path:
 import pytest
 import torch
 
-from op_tests.flydsl_tests.qr_codec_ref import (
-    CODECS_REF,
-    GROUP,
-    INT4_REF,
-    INT6_REF,
-    allreduce_mesh,
-    allreduce_ring,
-    pack_int4,
-    pack_int6,
-    quantize,
-    roundtrip,
-    sqnr_db,
-    unpack_int4,
-    unpack_int6,
+from aiter.jit.utils.chip_info import get_gfx_runtime
+
+pytest.importorskip("flydsl")
+
+import flydsl.compiler as flyc
+import flydsl.expr as fx
+from flydsl.expr import gpu, rocdl
+from flydsl.expr.typing import Int32, Int64, Stream, T
+
+from aiter.ops.flydsl.kernels.qr_int_codec import (
+    CODECS,
+    _atom_bf16_to_f16,
+    _atom_f16_to_bf16,
+    _clamp_fp16_overflow,
+    _codec_dequant,
+    _codec_load,
+    _codec_quant,
+    _scale_from_word,
+    hi2_slot_of,
+    scale_slot_of,
+    thread_lane,
+)
+from aiter.ops.flydsl.kernels.qr_int_shared import BLOCK, make_pack_storage
+
+ARCH = get_gfx_runtime()
+SUPPORTED_ARCHS = ("gfx942", "gfx950")
+
+pytestmark = pytest.mark.skipif(
+    ARCH not in SUPPORTED_ARCHS or torch.cuda.device_count() < 1,
+    reason="QRInt4 codec needs one gfx942/gfx950 GPU",
 )
 
-# Values per thread-atom, and threads per block -- one "row" of the reference
-# packing is one rank-tile's worth of threads.
-ATOM_VALUES = 8
-BLOCK = 256
+#: One thread's contribution to a row: 8 bf16 values, 16 B -- the codec's own
+#: atom, not the collective's 8-atom tile. A "row" is one such atom for the
+#: whole block: BLOCK * 8 bf16 elements.
+_ATOM_BF16 = 8
+TILE_ELEMS = BLOCK * _ATOM_BF16
+_GRID_CAP = 256
 
 
-def _rows(n_rows: int, seed: int) -> torch.Tensor:
+def _global_i32_ptr(addr_i64):
+    ptr_ty = fx.PointerType.get(T.i32, address_space=fx.AddressSpace.Global, alignment=16)
+    return fx.inttoptr(ptr_ty, addr_i64)
+
+
+def make_codec_roundtrip_kernel(codec_name: str, via_memory: bool = True):
+    codec = CODECS[codec_name]
+    PackStorage = make_pack_storage(codec.rank_tile_i32)
+
+    @flyc.kernel(known_block_size=[BLOCK, 1, 1])
+    def qr_codec_roundtrip(
+        num_rows: Int32,
+        inp_ptr: Int64,
+        out_ptr: Int64,
+        n_blocks: Int32,
+    ):
+        _clamp_fp16_overflow()
+        tid = fx.Int32(gpu.thread_id("x"))
+        bid = fx.Int32(gpu.block_id("x"))
+
+        _wave, lane = thread_lane(tid)
+        scale_slot, pair_in_slot = scale_slot_of(tid)
+        hi2_leader, hi2_slot = hi2_slot_of(tid)
+
+        in_ptr = _global_i32_ptr(inp_ptr)
+        out_ptr_g = _global_i32_ptr(out_ptr)
+
+        lds = fx.SharedAllocator().allocate(PackStorage).peek()
+        smem_ptr = lds.pack.ptr
+        pack = lds.pack.view(
+            fx.make_layout((1, codec.rank_tile_i32), (codec.rank_tile_i32, 1))
+        )
+        row0 = fx.Int32(0)
+
+        def _row_i32_off(row):
+            # 4 i32 (16 B) per thread; BLOCK*4 i32 per row.
+            return row * fx.Int32(BLOCK * 4) + tid * fx.Int32(4)
+
+        def _load_atom(row):
+            v4 = fx.ptr_load(
+                in_ptr + _row_i32_off(row), result_type=fx.Vector.make_type(4, fx.Int32)
+            )
+            return _atom_bf16_to_f16(v4)
+
+        def _store_atom(row, value):
+            fx.ptr_store(_atom_f16_to_bf16(value), out_ptr_g + _row_i32_off(row))
+
+        def _get(off):
+            return fx.Int32(fx.ptr_load(smem_ptr + off))
+
+        def _write_packet(words, scale_word, is_leader):
+            fx.memref_store(words[0], pack, (row0, tid))
+            if codec.n_words == 2:  # noqa: SIM102
+                if hi2_leader:
+                    fx.memref_store(
+                        words[1], pack, (row0, fx.Int32(codec.hi2_i32_off) + hi2_slot)
+                    )
+            if is_leader:
+                fx.memref_store(
+                    scale_word, pack, (row0, fx.Int32(codec.scale_i32_off) + scale_slot)
+                )
+
+        def _row_via_memory(row):
+            words, scale_word, leader = _codec_quant(codec, _load_atom(row), lane, tid)
+            _write_packet(words, scale_word, leader)
+            rocdl.s_waitcnt(lgkmcnt=0)
+            gpu.barrier()
+            words_in, word_in = _codec_load(codec, _get, tid, scale_slot)
+            scale = _scale_from_word(codec, word_in, pair_in_slot)
+            _store_atom(row, _codec_dequant(codec, words_in, scale, tid))
+            gpu.barrier()
+
+        def _row_in_registers(row):
+            words, scale_word, _leader = _codec_quant(codec, _load_atom(row), lane, tid)
+            scale = _scale_from_word(codec, scale_word, pair_in_slot)
+            _store_atom(row, _codec_dequant(codec, words, scale, tid))
+
+        n_block_rows = (num_rows - bid + n_blocks - fx.Int32(1)) // n_blocks
+        for i in range(fx.Int32(0), n_block_rows, fx.Int32(1)):
+            row = bid + i * n_blocks
+            # Python-level, so exactly one body is traced and neither branch
+            # assigns anything the rewriter would have to thread as state.
+            if via_memory:
+                _row_via_memory(row)
+            else:
+                _row_in_registers(row)
+
+    flat_wg = f"{BLOCK},{BLOCK}"
+
+    @flyc.jit
+    def launch(
+        num_rows: Int32,
+        inp_ptr: Int64,
+        out_ptr: Int64,
+        grid_x: Int32,
+        stream: Stream = Stream(None),  # noqa: B008
+    ):
+        qr_codec_roundtrip(
+            num_rows,
+            inp_ptr,
+            out_ptr,
+            grid_x,
+            value_attrs={"rocdl.flat_work_group_size": flat_wg},
+        ).launch(grid=(grid_x, 1, 1), block=(BLOCK, 1, 1), stream=stream)
+
+    tag = f"{codec_name}_{'mem' if via_memory else 'reg'}"
+    launch.func.__name__ = f"launch_qr_codec_roundtrip_{tag}"
+    try:
+        qr_codec_roundtrip.func.__name__ = f"qr_codec_roundtrip_{tag}"
+    except AttributeError:
+        pass
+    return launch
+
+
+@functools.cache
+def _engine(codec_name: str, via_memory: bool):
+    return [make_codec_roundtrip_kernel(codec_name, via_memory), None]
+
+
+def codec_roundtrip(
+    x: torch.Tensor, codec_name: str, *, via_memory: bool = True
+) -> torch.Tensor:
+    """Quantize and dequantize *x* with the real kernel codec.
+
+    *x* is bf16 on a GPU with a whole number of :data:`TILE_ELEMS`.
+    ``via_memory=False`` skips the LDS staging and keeps the quantized words in
+    registers; the two must agree bit for bit.
+    """
+    if x.dtype != torch.bfloat16 or not x.is_cuda:
+        raise ValueError("codec_roundtrip needs a bf16 CUDA tensor")
+    if x.numel() % TILE_ELEMS:
+        raise ValueError(f"numel must be a multiple of {TILE_ELEMS}, got {x.numel()}")
+    x = x.contiguous()
+    out = torch.empty_like(x)
+    num_rows = x.numel() // TILE_ELEMS
+    grid_x = max(1, min(num_rows, _GRID_CAP))
+    eng = _engine(codec_name, via_memory)
+    args = (
+        Int32(num_rows),
+        Int64(int(x.data_ptr())),
+        Int64(int(out.data_ptr())),
+        Int32(grid_x),
+        Stream(None),
+    )
+    if eng[1] is None:
+        eng[1] = flyc.compile(eng[0], *args)
+    else:
+        eng[1](*args)
+    torch.cuda.synchronize()
+    return out
+
+
+# A quantization group is one E4M3 scale's worth of values: PAIR=2 threads x 8
+# values per atom. Thread t owns elements [8t, 8t+8) of an atom row and pairs
+# with its xor-1 neighbour, so groups are contiguous 16-element runs -- and an
+# atom row is 2048 elements, a multiple of 16, so a flat reshape lines up.
+GROUP_ELEMS = 16
+
+# Half-ulp of a 3-bit mantissa: the decoded extremum is within this fraction of
+# the true one.
+E4M3_REL_SLACK = 1.0 / 16.0
+
+CODEC_NAMES = ("int4", "int6")
+
+
+def _payload(*, n_tiles: int, seed: int, scale: float = 1.0) -> torch.Tensor:
     g = torch.Generator().manual_seed(seed)
-    return (
-        torch.randn(n_rows, BLOCK, ATOM_VALUES, generator=g, dtype=torch.float32) * 0.1
+    x = torch.randn(n_tiles * TILE_ELEMS, generator=g, dtype=torch.float32) * scale
+    return x.to(device="cuda:0", dtype=torch.bfloat16)
+
+
+def _groups(t: torch.Tensor) -> torch.Tensor:
+    return t.float().reshape(-1, GROUP_ELEMS)
+
+
+def _signed_extremum(g: torch.Tensor) -> torch.Tensor:
+    mx, mn = g.max(-1).values, g.min(-1).values
+    return torch.where(mx.abs() > mn.abs(), mx, mn)
+
+
+def _err_bound(bias: int) -> float:
+    """Largest ``|y-x| / |ext|`` the codec may produce, from its definition.
+
+    ``1/16`` for the E4M3 scale, ``0.5/bias`` for rounding, and up to another
+    ``0.5/bias`` because the positive end of the range stops one code short of
+    the negative end. Rounded up to ``1.05/bias`` for fp16 arithmetic.
+    """
+    return E4M3_REL_SLACK + 1.05 / bias
+
+
+@pytest.mark.parametrize("codec_name", CODEC_NAMES)
+def test_memory_path_matches_register_path(codec_name):
+    """Staging through the wire layout must not change a single bit.
+
+    This is the store/load consistency check. It would catch the two sides
+    disagreeing about where the INT6 2-bit plane lives, or a half-swap between
+    the threads that share one of its i32 slots.
+    """
+    x = _payload(n_tiles=2, seed=17)
+    through_lds = codec_roundtrip(x, codec_name, via_memory=True)
+    in_regs = codec_roundtrip(x, codec_name, via_memory=False)
+    mismatch = int((through_lds != in_regs).sum())
+    assert mismatch == 0, (
+        f"{mismatch}/{x.numel()} elements differ between the staged and "
+        "register paths: the wire layout is not round-tripping"
     )
 
 
-@pytest.mark.parametrize("codec_name", ("int4", "int6"))
-def test_pack_unpack_roundtrip_is_lossless(codec_name):
-    """The packing itself must lose nothing -- only the quantizer may."""
-    codec = CODECS_REF[codec_name]
-    x = _rows(4, seed=7)
-    q, _ = quantize(x.reshape(4, -1), codec)
-    q = q.reshape(4, BLOCK, ATOM_VALUES)
-    if codec is INT4_REF:
-        back = unpack_int4(pack_int4(q))
-    else:
-        lo4, hi2 = pack_int6(q)
-        back = unpack_int6(lo4, hi2)
-    assert torch.equal(back, q)
+@pytest.mark.parametrize("codec_name", CODEC_NAMES)
+def test_error_within_analytic_bound(codec_name):
+    x = _payload(n_tiles=4, seed=23)
+    y = codec_roundtrip(x, codec_name)
+    xg, yg = _groups(x), _groups(y)
+    ext = _signed_extremum(xg).abs().clamp_min(1e-20)
+    worst = float(((yg - xg).abs().max(-1).values / ext).max())
+    bound = _err_bound(CODECS[codec_name].bias)
+    assert worst <= bound, f"max |err|/|ext| {worst:.4f} > {bound:.4f}"
 
 
-def test_int6_low_plane_matches_int4_layout():
-    """INT6's nibble plane is byte-identical in layout to INT4's.
-
-    Not an incidental property: it is why ``_fanout_to_next`` needs nothing but
-    a different sector count, and why the 1024 B region keeps its offsets.
-    """
-    q = torch.randint(0, 64, (2, BLOCK, ATOM_VALUES), dtype=torch.int32)
-    lo4, _ = pack_int6(q)
-    assert torch.equal(lo4, pack_int4(q & 0xF))
-
-
-def test_int6_hi2_plane_is_half_the_width():
-    """512 B per rank-tile: two threads to an i32, 16 dense bits each."""
-    q = torch.randint(0, 64, (3, BLOCK, ATOM_VALUES), dtype=torch.int32)
-    lo4, hi2 = pack_int6(q)
-    assert lo4.shape == (3, BLOCK)
-    assert hi2.shape == (3, BLOCK // 2)
+@pytest.mark.parametrize("codec_name", CODEC_NAMES)
+def test_reconstruction_stays_in_range(codec_name):
+    """A saturating codec cannot amplify: nothing may exceed the group extremum."""
+    x = _payload(n_tiles=4, seed=29)
+    y = codec_roundtrip(x, codec_name)
+    xg, yg = _groups(x), _groups(y)
+    ext = _signed_extremum(xg).abs().clamp_min(1e-20)
+    worst = float((yg.abs().max(-1).values / ext).max())
+    assert worst <= 1.0 + E4M3_REL_SLACK + 1e-3, f"max |y|/|ext| {worst:.4f}"
 
 
-def test_int6_hi2_pairing_is_not_swapped():
-    """The even thread of a pair owns the *low* half of the shared i32.
-
-    Written as its own case because a swap here is the one packing bug that
-    reconstructs plausibly: every value stays in range and only the top two
-    bits move between two neighbouring threads.
-    """
-    q = torch.zeros(1, BLOCK, ATOM_VALUES, dtype=torch.int32)
-    # Thread 0 gets the top 2 bits set on element 0; thread 1 gets nothing.
-    q[0, 0, 0] = 0x30
-    _, hi2 = pack_int6(q)
-    assert hi2[0, 0] & 0xFFFF == 0x3, hex(int(hi2[0, 0]))
-    assert hi2[0, 0] >> 16 == 0
-
-    q = torch.zeros(1, BLOCK, ATOM_VALUES, dtype=torch.int32)
-    q[0, 1, 0] = 0x30  # odd thread -> high half
-    _, hi2 = pack_int6(q)
-    assert hi2[0, 0] & 0xFFFF == 0
-    assert hi2[0, 0] >> 16 == 0x3, hex(int(hi2[0, 0]))
+@pytest.mark.parametrize("codec_name", CODEC_NAMES)
+def test_group_extremum_keeps_its_sign(codec_name):
+    """The extremum drives the scale, so it must survive with its sign intact."""
+    x = _payload(n_tiles=2, seed=31)
+    xg, yg = _groups(x), _groups(codec_roundtrip(x, codec_name))
+    idx = xg.abs().argmax(-1, keepdim=True)
+    x_ext = xg.gather(-1, idx).squeeze(-1)
+    y_ext = yg.gather(-1, idx).squeeze(-1)
+    live = x_ext.abs() > 1e-6
+    assert bool((torch.sign(x_ext[live]) == torch.sign(y_ext[live])).all()), "Sign changed"
+    rel = float(((y_ext[live] - x_ext[live]).abs() / x_ext[live].abs()).max())
+    bound = _err_bound(CODECS[codec_name].bias)
+    assert rel <= bound, f"extremum moved {rel:.4f} > {bound:.4f}"
 
 
-@pytest.mark.parametrize("codec_name,min_db", (("int4", 21.0), ("int6", 32.0)))
-def test_single_roundtrip_sqnr(codec_name, min_db):
-    """Two extra bits are worth ~12 dB on one quantization."""
-    codec = CODECS_REF[codec_name]
-    x = _rows(8, seed=11).reshape(8, -1)
-    got = roundtrip(x, codec).to(torch.float32)
-    assert sqnr_db(got, x) >= min_db
+def test_int6_codec_is_more_accurate_than_int4():
+    """Two extra bits, on the same input."""
+    x = _payload(n_tiles=4, seed=41)
+    xf = x.float()
+    rms = {
+        c: float((codec_roundtrip(x, c).float() - xf).pow(2).mean().sqrt())
+        for c in CODEC_NAMES
+    }
+    ratio = rms["int6"] / rms["int4"]
+    assert 0.15 <= ratio <= 0.30, f"int6/int4 RMS ratio {ratio:.3f}, expected ~0.25"
 
 
-def test_degenerate_groups_do_not_produce_nan():
+@pytest.mark.parametrize("codec_name", CODEC_NAMES)
+def test_degenerate_groups_stay_finite(codec_name):
     """Zero and sub-2^-7 groups drive the encode reciprocal to its ceiling.
 
-    The kernel materialises ``1/d`` as fp16, so an unclamped reciprocal becomes
-    Inf and ``0 * Inf`` is NaN. INT6 has a quarter of INT4's headroom here, so
-    both codecs are checked.
+    ``1/d`` is materialised as fp16, so without the clamp in ``_codec_quant`` a
+    zero-extremum group reaches the codec as Inf and ``0 * Inf`` poisons the
+    tile. INT6 has a quarter of INT4's headroom here, hence both codecs.
     """
-    x = _rows(4, seed=13).reshape(4, -1)
-    x[0] = 0.0
-    x[1] *= 1e-8
-    x[2, : 4 * GROUP] = 0.0
-    for codec in (INT4_REF, INT6_REF):
-        got = roundtrip(x, codec)
-        assert torch.isfinite(got).all(), codec.name
+    x = _payload(n_tiles=2, seed=43).reshape(-1, GROUP_ELEMS)
+    x[0::4] = 0.0
+    x[1::4] *= 1e-8
+    x = x.reshape(-1)
+    y = codec_roundtrip(x, codec_name)
+    assert bool(torch.isfinite(y.float()).all()), "codec produced NaN or Inf"
+    zeros = y.reshape(-1, GROUP_ELEMS)[0::4]
+    assert bool((zeros == 0).all()), "an all-zero group did not stay zero"
 
 
-@pytest.mark.parametrize("world_size", (2, 4, 8))
-def test_ring_int6_beats_the_18db_floor(world_size):
-    """The reason INT6 is the TP8 default, asserted rather than assumed.
+# The largest representable group-extremum magnitude, and where the exponent
+# field pins to its minimum instead of shrinking further.
+E4M3_MAX = 480.0
+E4M3_FLOOR = 2.0**-7
 
-    INT4 is *not* asserted against the floor here: it is under it at TP8 by
-    construction, which is the whole point.
+
+def _spike_group(ext_value: float, fill: float = 0.02) -> torch.Tensor:
+    """One tile whose first group has extremum *ext_value*; every other element is *fill*.
+
+    :func:`_groups` reshapes flat into 16-wide runs, so element 0 is exactly
+    this group's extremum as long as *fill* cannot compete with it.
     """
-    xs = [_rows(2, seed=100 + r).reshape(2, -1) for r in range(world_size)]
-    ref = torch.stack(xs).sum(0)
-    got = allreduce_ring(xs, INT6_REF, INT4_REF)
-    assert sqnr_db(got, ref) >= 18.0
+    x = torch.full((TILE_ELEMS,), fill, dtype=torch.float32)
+    x[0] = ext_value
+    return x.to(device="cuda:0", dtype=torch.bfloat16)
 
 
-def test_ring_int4_at_tp8_is_the_configuration_int6_replaces():
-    """Pins the ~15 dB that motivated the change, so a drift is visible.
+@pytest.mark.parametrize("codec_name", CODEC_NAMES)
+@pytest.mark.parametrize("ext", (256.0, 400.0, 479.0, 490.0))
+def test_extremum_near_e4m3_ceiling_saturates(codec_name, ext):
+    """Right up to the ceiling, the extremum clamps to E4M3_MAX and stays close to true.
 
-    If this starts passing 18.0, the INT6 default is no longer buying what it
-    was introduced to buy and ``_RS_INT6_MIN_WORLD`` should be revisited.
+    490 is already past the true ceiling (480) and it still saturates cleanly,
+    because it has not yet crossed the ~496 threshold where the aliasing takes over.
     """
-    xs = [_rows(2, seed=100 + r).reshape(2, -1) for r in range(8)]
-    ref = torch.stack(xs).sum(0)
-    db = sqnr_db(allreduce_ring(xs, INT4_REF, INT4_REF), ref)
-    assert 14.0 <= db <= 17.0, db
+    decoded = float(codec_roundtrip(_spike_group(ext), codec_name)[0])
+    assert decoded <= E4M3_MAX + 1.0, decoded
+    assert decoded >= min(ext, E4M3_MAX) * 0.9, decoded
+
+
+@pytest.mark.parametrize("codec_name", CODEC_NAMES)
+def test_extremum_past_e4m3_ceiling_aliases_instead_of_saturating(codec_name):
+    """Past ~496 the codec does not merely clip -- it wraps to a smaller value.
+
+    A graceful saturating codec would have every extremum above the ceiling
+    decode to the same value, or one that only ever approaches it. This one
+    does not: 500 decodes *smaller* than 480 does.
+    """
+    at_ceiling = float(codec_roundtrip(_spike_group(480.0), codec_name)[0])
+    past_ceiling = float(codec_roundtrip(_spike_group(500.0), codec_name)[0])
+    huge_outlier = float(codec_roundtrip(_spike_group(1.0e6), codec_name)[0])
+    assert at_ceiling == pytest.approx(E4M3_MAX, abs=1.0)
+    assert past_ceiling < at_ceiling, (
+        f"500 decoded to {past_ceiling}, not smaller than 480's {at_ceiling} -- "
+        "the aliasing this test pins down may have changed"
+    )
+    # Whatever it aliases to, the exponent field is still clamped to [0, 15],
+    # so it cannot escape the format's own representable range.
+    for decoded in (past_ceiling, huge_outlier):
+        assert 0.0 <= decoded <= E4M3_MAX + 1.0, decoded
+
+
+@pytest.mark.parametrize("codec_name", CODEC_NAMES)
+def test_extremum_below_e4m3_floor_can_zero_the_whole_group(codec_name):
+    """Below the floor the codec can lose a group entirely, not merely round it coarsely.
+
+    1e-3 is well inside both bf16's and fp16's representable range. This is
+    the E4M3 exponent field pinning to its minimum while the byte that
+    results also happens to be the one reserved for exact 0.0.
+    """
+    zeroed = codec_roundtrip(_spike_group(1e-3, fill=0.0), codec_name)
+    assert torch.isfinite(zeroed.float()).all()
+    assert float(zeroed[0]) == 0.0, (
+        f"expected the sub-floor extremum to zero this group; got {float(zeroed[0])}"
+    )
 
 
 def _resolve(monkeypatch, algorithm, world_size, env=None, rs=None, ag=None):
@@ -199,8 +448,7 @@ def test_env_override_sets_both_laps(monkeypatch, env, expected):
 
 
 def test_explicit_argument_outranks_the_environment(monkeypatch):
-    got = _resolve(monkeypatch, "ring", 8, env="int6", rs="int4")
-    assert got == ("int4", "int6")
+    assert _resolve(monkeypatch, "ring", 8, env="int6", rs="int4") == ("int4", "int6")
 
 
 def test_env_that_the_schedule_cannot_build_falls_back(monkeypatch):
@@ -212,17 +460,3 @@ def test_explicit_codec_the_schedule_cannot_build_raises(monkeypatch):
     """Unlike the environment: naming it in code is a programming error."""
     with pytest.raises(ValueError, match="rs_codec"):
         _resolve(monkeypatch, "mesh", 8, rs="int6")
-
-
-def test_mesh_sqnr_is_world_size_independent():
-    """The mesh quantizes twice regardless of N, so its SQNR does not move.
-
-    This is the baseline the ring is compared against, and the reason the ring
-    needed a per-N answer where the mesh did not.
-    """
-    seen = []
-    for world_size in (2, 4, 8):
-        xs = [_rows(2, seed=200 + r).reshape(2, -1) for r in range(world_size)]
-        ref = torch.stack(xs).sum(0)
-        seen.append(sqnr_db(allreduce_mesh(xs, INT4_REF), ref))
-    assert max(seen) - min(seen) < 0.5, seen

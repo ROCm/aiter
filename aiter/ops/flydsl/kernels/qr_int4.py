@@ -30,22 +30,21 @@ from aiter.dist.parallel_state import in_the_same_node_as
 from aiter.jit.utils.chip_info import get_gfx_runtime
 
 from .qr_int4_ipc import UncachedIpcHeap
-from .qr_int4_kernel import (
-    CODECS,
-    DEFAULT_GRID_CAP,
-    SUPER_TILES,
-    SUPPORTED_WORLDS,
-    TILE_BYTES,
-    WORLD,
-    has_release_fence,
-    make_qr_int4_kernel,
-)
+from .qr_int4_kernel import SUPER_TILES, make_qr_int4_kernel
 from .qr_int4_ring_kernel import (
     AG_CODECS,
     RING_ST_LADDER,
     RING_SUPER_TILES,
     RS_CODECS,
     make_qr_int4_ring_kernel,
+)
+from .qr_int_codec import CODECS
+from .qr_int_shared import (
+    DEFAULT_GRID_CAP,
+    SUPPORTED_WORLDS,
+    TILE_BYTES,
+    WORLD,
+    has_release_fence,
 )
 
 logger = logging.getLogger("aiter")
@@ -171,7 +170,7 @@ ALGORITHMS = {
         super_tiles=RING_SUPER_TILES,
         rs_codecs=RS_CODECS,
         ag_codecs=AG_CODECS,
-        min_bytes=_RING_MIN_PAYLOAD_BYTES,
+        min_bytes=_RING_INT4_MIN_PAYLOAD_BYTES,
         min_batch_blocks=_MIN_BATCH_BLOCKS,
         default_super_tile=8,
         st_ladder=RING_ST_LADDER,

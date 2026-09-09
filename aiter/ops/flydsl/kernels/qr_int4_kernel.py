@@ -13,689 +13,54 @@ tile (8 GPUs → 1, 4 → 2, 2 → 4); LDS stays ``ATOMS * 1152``.
 
 """
 
-import logging
-import os
-from dataclasses import dataclass
-
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-from flydsl._mlir import ir
 from flydsl._mlir.dialects import llvm
 from flydsl.expr import gpu, range_constexpr, rocdl
-from flydsl.expr.typing import Int32, Int64, Stream, T, as_ir_value
+from flydsl.expr.typing import Int32, Int64, Stream, T
 
 from . import buffer_ops
+from .qr_int_codec import (
+    INT4,
+    N_SECTORS,
+    RANK_TILE_BYTES,
+    RANK_TILE_I32,
+    _atom_bf16_to_f16,
+    _atom_f16_to_bf16,
+    _clamp_fp16_overflow,
+    _codec_dequant,
+    _codec_quant,
+    _scale_from_word,
+    scale_slot_of,
+    thread_lane,
+)
+from .qr_int_shared import (
+    _INBOX_POLICY,
+    ATOMS,
+    BLOCK,
+    QUAD_LANES,
+    QUADS_PER_WAVE,
+    SUPPORTED_WORLDS,
+    TILE_BYTES,
+    TILE_FP16,
+    TILE_I32,
+    WORLD,
+    _acquire_inbox,
+    _i32_to_bytes,
+    _load_i32_nt,
+    _load_i32_uncached,
+    _store_v4i32_peer,
+    _to_sgpr_i64,
+    make_pack_storage,
+)
 
-logger = logging.getLogger("aiter")
-
-WORLD = 8  # Default value for world size
-SUPPORTED_WORLDS = (2, 4, 8)
-BLOCK = 256
-ATOMS = 8
-TILE_BYTES = BLOCK * ATOMS * 16
-TILE_I32 = TILE_BYTES // 4
-TILE_FP16 = TILE_BYTES // 2
-DEFAULT_GRID_CAP = 304 * 4
 PHASES = 2
 PHASE_REDUCE_SCATTER = 0
 PHASE_ALL_GATHER = 1
-RANK_TILE_BYTES = 1152
-RANK_TILE_I32 = RANK_TILE_BYTES // 4
 SUPER_TILES = (1, 8)
-# 1024 B INT4 (256 i32) then 128 B group-16 E4M3 (32 i32). Rank-tile 1152 B.
-SCALE_I32_OFF = 256
-# Two threads (PAIR) share one E4M3; GROUP threads share the i32 slot.
-GROUP = 8
-PAIR = 2
-WAVE = 64
-WAVES = 4
-# 4 lanes × 16 B = one 64 B NT sector. Not world_size.
-QUAD_LANES = 4
-QUADS_PER_WAVE = WAVE // QUAD_LANES
-N_SECTORS = RANK_TILE_BYTES // 64
 # dest × rank_atoms == ATOMS for every supported world size.
 PACK_I32 = ATOMS * RANK_TILE_I32
 LDS_BYTES = ATOMS * RANK_TILE_BYTES
-# Wire/inbox addresses are byte pointers; tile math is in i32 slots.
-I32_BYTES = 4
-
-# Buffer aux bits on gfx942/gfx950. This is LLVM's CPol encoding, which the
-# backend renames for CDNA: bit 0 (GLC) prints as `sc0`, bit 1 (SLC) as `nt`,
-# bit 4 (SCC) as `sc1`. Bit 2 exists in the encoding but CDNA has no use for
-# it, so it is dropped and emits nothing.
-#
-# These were previously 1/2/4, which is the bit order the names suggest but not
-# the one the hardware uses. The consequence was silent and invisible from the
-# source: `_CM_SC1` emitted `nt` (a hint, not a bypass) and `_CM_NT` emitted no
-# modifier at all. It only shows up in the disassembly -- every other coherence
-# op in this file is inline asm and so was unaffected.
-#
-# Verified against the gfx950 backend: aux 1 -> `sc0`, 2 -> `nt`, 4 -> (none),
-# 16 -> `sc1`, 17 -> `sc0 sc1`, 18 -> `nt sc1`.
-_CM_SC0 = 1
-_CM_NT = 2
-_CM_SC1 = 16
-
-# Cache policy for the peer stores in _fanout_nt / _publish, per inbox memory
-# type.
-#
-# On an uncached inbox the memory type does all the work: a store cannot sit in
-# any cache, so every peer sees the payload as soon as `vmcnt(0)` retires and
-# the release needs nothing beyond that.
-#
-# A fine-grained inbox is cacheable, which cuts both ways. Letting the payload
-# land in the writer's L2 is exactly what makes it fast on PCIe: the L2 coalesces
-# this kernel's 64 B destination-interleaved stores into large bursts, worth 30x
-# at prefill sizes (227 us against 6708 us at 14 MiB on MI350P). But `nt` is only
-# a non-temporal *hint* -- it does not write through -- so a payload store can
-# still be parked in L2 after `vmcnt(0)` while a peer spins on a flag it cannot
-# see. That stall clears only when unrelated traffic evicts the line, so its cost
-# scales inversely with how busy the kernel is: invisible at 448 blocks,
-# 5.3 seconds at 1 block.
-#
-# So keep the payload cacheable and make the *release* explicit: write back L2
-# after the payload drains, then publish the flag write-through so the peer's
-# spin observes it immediately. Forcing the payload itself write-through
-# (`sc0 sc1` on every store) also fixes visibility, but defeats the coalescing
-# and gives back the entire bandwidth win.
-# ``fanout`` picks which axis of the (peer, sector) fanout runs fastest across
-# consecutive quads; see the layouts in the kernel body.
-#
-# ``recv`` is the cache modifier the *reader* uses on its payload loads. It is
-# part of the same policy because it is the other half of the same decision: the
-# more the writer is allowed to cache, the harder the reader has to work to
-# avoid a stale line.
-_INBOX_POLICY = {
-    "uncached": {
-        "payload": "nt",
-        "flag": "nt",
-        "writeback": None,
-        "fanout": "sector",
-        "recv": _CM_NT,
-    },
-    "finegrained": {
-        "payload": "nt",
-        "flag": "sc0 sc1 nt",
-        "writeback": "buffer_wbl2 sc1",
-        "fanout": "peer",
-        "recv": _CM_NT,
-    },
-    # Coarse-grained: the only mode whose pages are marked cacheable, so the
-    # only one where a peer write can actually sit in the writer's L2 and be
-    # combined with its neighbours before going out on the wire.
-    #
-    # This is worth spelling out because the fine-grained entry above was built
-    # on the opposite belief. ROCm documents fine-grained coherence as *bought
-    # by giving up caching* -- the pages are marked write-uncached on CDNA -- so
-    # a design that picks "finegrained" in order to get L2 write-combining is
-    # asking for a behaviour the page tables have disabled. Coarse-grained is
-    # what that design actually wanted.
-    #
-    # The cost is that nothing is coherent for free. The payload stores are
-    # plain (no `nt`) so lines stay dirty in L2; `buffer_wbl2` at the publish
-    # point is what puts them on the wire; the flag goes out write-through so
-    # the peer's spin sees it after the payload; and the reader must bypass
-    # both its caches (`sc0 sc1`) rather than trust `nt`, which is only a hint
-    # and can be answered from a stale line.
-    "default": {
-        "payload": "",
-        "flag": "sc0 sc1",
-        "writeback": "buffer_wbl2 sc1",
-        "fanout": "peer",
-        "recv": _CM_SC0 | _CM_SC1,
-    },
-}
-FANOUT_ORDERS = ("sector", "peer")
-
-# Experiment hooks: override a fine-grained policy field from the environment.
-# The fine-grained fanout depends on L2 write-combining the 64 B peer stores
-# into large bursts, and whether `nt` lets a line linger long enough to be
-# combined is a property of the memory system, not of this kernel -- so it has
-# to be measured on the host it will run on rather than assumed. Unset means
-# the table above stands.
-for _field, _var in (
-    ("payload", "AITER_QRINT4_PAYLOAD_POLICY"),
-    ("flag", "AITER_QRINT4_FLAG_POLICY"),
-    ("writeback", "AITER_QRINT4_WRITEBACK_POLICY"),
-    ("fanout", "AITER_QRINT4_FANOUT"),
-):
-    _val = os.environ.get(_var)
-    if _val is not None:
-        _INBOX_POLICY["finegrained"][_field] = (
-            None if _val.lower() in ("none", "") and _field == "writeback" else _val
-        )
-        logger.warning("QRInt4: %s overridden to %r by %s", _field, _val, _var)
-
-
-def has_release_fence(inbox_memory: str) -> bool:
-    """Whether this inbox type needs an L2 writeback at every publish.
-
-    Callers use it to decide how hard to work at batching publishes: with a
-    fence they are expensive, without one they are nearly free.
-    """
-    return _INBOX_POLICY[inbox_memory]["writeback"] is not None
-
-
-# Dequant bit-trick: code | 0x6400 then + (-(1024+bias)) as f16x2 reconstructs
-# (q - bias). fp16 with exponent field 1024.0 holds the integer in its low
-# mantissa bits, so this works for any field that fits below bit 10 -- 4 bits
-# with bias 8, 6 bits with bias 32.
-_K_MASK_000F = 0x000F000F
-_K_MASK_0003 = 0x00030003
-_K_HALF2_1024 = 0x64006400
-_K_HALF2_1032 = 0xE408E408  # -1032.0 fp16x2 = -(1024 + 8)
-_K_HALF2_1056 = 0xE420E420  # -1056.0 fp16x2 = -(1024 + 32)
-
-# Largest finite fp16. The encode scale is materialised as fp16, so anything
-# above this becomes Inf there; see _codec_quant.
-_FP16_MAX = 65504.0
-
-
-@dataclass(frozen=True)
-class Codec:
-    """One wire format for a rank-tile: how it packs, and the geometry that implies.
-
-    ``bias`` is both the zero point of the unsigned code and the magnitude of
-    the most negative one, because the codec maps a group's signed extremum
-    onto ``-bias`` -- that is what uses the asymmetric range fully. The
-    decoding factor is therefore ``-1/bias``.
-
-    INT6 is INT4's nibble plane plus a dense 2-bit plane, rather than a 48-bit
-    field per thread. A 48-bit field straddles i32 boundaries and leaves the
-    regions off the 64 B fabric sector grid; two planes keep every region
-    sector-aligned (16 + 8 + 2 = 26) and leave the nibble plane byte-identical
-    to INT4's, so ``_fanout_to_next`` needs nothing but a different sector
-    count.
-    """
-
-    name: str
-    bits: int
-    bias: int
-    #: fp16x2 constant added after the ``| 0x6400`` trick: -(1024 + bias).
-    dequant_bias: int
-    #: i32 offset of the dense 2-bit plane in the rank-tile; None when the
-    #: codec has only a nibble plane.
-    hi2_i32_off: int | None
-    scale_i32_off: int
-    rank_tile_i32: int
-
-    @property
-    def n_words(self) -> int:
-        """Payload i32 a thread contributes per atom."""
-        return 1 if self.hi2_i32_off is None else 2
-
-    @property
-    def dec_step(self) -> float:
-        return -1.0 / self.bias
-
-    @property
-    def qmin(self) -> float:
-        return -float(self.bias)
-
-    @property
-    def qmax(self) -> float:
-        return float(self.bias - 1)
-
-    @property
-    def rank_tile_bytes(self) -> int:
-        return self.rank_tile_i32 * I32_BYTES
-
-    @property
-    def n_sectors(self) -> int:
-        return self.rank_tile_bytes // 64
-
-
-# 1024 B nibbles then 128 B scale; 1152 B rank-tile, 18 sectors.
-INT4 = Codec(
-    name="int4",
-    bits=4,
-    bias=8,
-    dequant_bias=_K_HALF2_1032,
-    hi2_i32_off=None,
-    scale_i32_off=SCALE_I32_OFF,
-    rank_tile_i32=RANK_TILE_I32,
-)
-# 1024 B nibbles, 512 B 2-bit plane, 128 B scale; 1664 B rank-tile, 26 sectors.
-INT6 = Codec(
-    name="int6",
-    bits=6,
-    bias=32,
-    dequant_bias=_K_HALF2_1056,
-    hi2_i32_off=256,
-    scale_i32_off=384,
-    rank_tile_i32=416,
-)
-CODECS = {c.name: c for c in (INT4, INT6)}
-
-
-def _f16x2(packed):
-    return fx.Vector.from_elements([packed], fx.Int32).bitcast(fx.Float16)
-
-
-def _i32(vec):
-    return vec.bitcast(fx.Int32)[0]
-
-
-def _minnumf(a, b):
-    return fx.Vector(fx.arith.minnumf(a, b), a.shape, a.dtype)
-
-
-def _splat_f16x2(x):
-    return fx.Vector.filled(2, x, fx.Float16)
-
-
-def _clamp_fp16_overflow():
-    """Saturate packed fp16 overflow to ±65504 instead of Inf.
-
-    Packed add/mul/FMA follow MODE bit 23 (FP16_OVFL). Unset, overflow
-    becomes Inf and every later FMA in that tile is Inf. Set, it saturates
-    to the max finite fp16. INT4 is already a saturating codec, so a rare
-    overflow should not poison the all-reduce.
-
-    There is no FlyDSL wrapper; ``s_setreg_imm32_b32 0xdc1, 1`` writes
-    ``hwreg(HW_REG_MODE, offset=23, size=2)``.
-    """
-    llvm.InlineAsmOp(None, [], "s_setreg_imm32_b32 0xdc1, 1", "", has_side_effects=True)
-
-
-def _shuffle_f16x2(vec, xor_off):
-    return _f16x2(fx.Int32(gpu.shuffle_xor(_i32(vec), xor_off, WAVE)))
-
-
-def _pair_signed_ext_f16(atom):
-    """Signed extremum of 16 fp16 (this thread's 8 + xor-1 neighbor)."""
-    p0, p1, p2, p3 = (
-        _f16x2(atom[0]),
-        _f16x2(atom[1]),
-        _f16x2(atom[2]),
-        _f16x2(atom[3]),
-    )
-    wmax = fx.maxnumf(fx.maxnumf(p0, p1), fx.maxnumf(p2, p3))
-    wmin = _minnumf(_minnumf(p0, p1), _minnumf(p2, p3))
-    wmax = fx.maxnumf(wmax, _shuffle_f16x2(wmax, 1))
-    wmin = _minnumf(wmin, _shuffle_f16x2(wmin, 1))
-    pk = (abs(wmax) > abs(wmin)).select(wmax, wmin)
-    lo, hi = pk[0], pk[1]
-    return fx.Float32((abs(lo) > abs(hi)).select(lo, hi))
-
-
-def _atom_bf16_to_f16(atom):
-    return fx.Vector(atom).bitcast(fx.BFloat16).to(fx.Float16).bitcast(fx.Int32)
-
-
-def _atom_f16_to_bf16(atom):
-    return fx.Vector(atom).bitcast(fx.Float16).to(fx.BFloat16).bitcast(fx.Int32)
-
-
-def _f32_to_e4m3(x):
-    """Signed E4M3 of a f32: 1 sign + 4 exp (bias 7, e=0 still implicit 1) + 3 mant.
-
-    Group-16 wire scale. Not IEEE OCP E4M3 denorms: e=0 still encodes
-    ``(1+m/8)*2^-7`` so typical INT4 extrema (~0.1) stay in range after
-    ×−1/8. Byte 0 is +0.
-    """
-    is_z = x == fx.Float32(0.0)
-    sign = (x < fx.Float32(0.0)).select(fx.Int32(0x80), fx.Int32(0))
-    bits = abs(x).bitcast(fx.Int32)
-    e = (bits.shrui(fx.Int32(23)) & fx.Int32(255)) - fx.Int32(127)
-    mant = bits & fx.Int32(0x7FFFFF)
-    m3 = (mant + fx.Int32(1 << 19)).shrui(fx.Int32(20))
-    carry = m3 == fx.Int32(8)
-    e = e + carry.select(fx.Int32(1), fx.Int32(0))
-    m3 = carry.select(fx.Int32(0), m3)
-    e4 = e + fx.Int32(7)
-    e4 = (e4 < fx.Int32(0)).select(
-        fx.Int32(0), (e4 > fx.Int32(15)).select(fx.Int32(15), e4)
-    )
-    byte = sign | (e4 << fx.Int32(3)) | (m3 & fx.Int32(7))
-    return is_z.select(fx.Int32(0), byte)
-
-
-def _e4m3_to_f32(b):
-    is_z = b == fx.Int32(0)
-    sign = (b & fx.Int32(0x80)) != fx.Int32(0)
-    e4 = b.shrui(fx.Int32(3)) & fx.Int32(15)
-    m3 = b & fx.Int32(7)
-    mag_bits = ((e4 + fx.Int32(120)) << fx.Int32(23)) | (m3 << fx.Int32(20))
-    mag = mag_bits.bitcast(fx.Float32)
-    signed = sign.select(-mag, mag)
-    return is_z.select(fx.Float32(0.0), signed)
-
-
-def _pack_e4m3_word(e, lane):
-    """Four pair-E4M3 bytes into the i32 scale slot (lanes 0,2,4,6 of GROUP)."""
-    base = (lane // GROUP) * GROUP
-    e0 = fx.Int32(gpu.shuffle_idx(e, base, WAVE))
-    e1 = fx.Int32(gpu.shuffle_idx(e, base + fx.Int32(2), WAVE))
-    e2 = fx.Int32(gpu.shuffle_idx(e, base + fx.Int32(4), WAVE))
-    e3 = fx.Int32(gpu.shuffle_idx(e, base + fx.Int32(6), WAVE))
-    b = fx.Int32(0xFF)
-    return (
-        (e0 & b)
-        | ((e1 & b) << fx.Int32(8))
-        | ((e2 & b) << fx.Int32(16))
-        | ((e3 & b) << fx.Int32(24))
-    )
-
-
-def _e4m3_decoding_scale(codec, e):
-    return _splat_f16x2(_e4m3_to_f32(e) * fx.Float32(codec.dec_step))
-
-
-def _clamp_f32(x, lo, hi):
-    x = (x < fx.Float32(lo)).select(fx.Float32(lo), x)
-    return (x > fx.Float32(hi)).select(fx.Float32(hi), x)
-
-
-def _quant_atom_fp16(codec, atom, enc_pk):
-    """Quantize 8 fp16 into this codec's planes, as packed i32 words."""
-    q = []
-    lo = _splat_f16x2(fx.Float16(codec.qmin))
-    hi = _splat_f16x2(fx.Float16(codec.qmax))
-    bias = fx.Vector.filled(2, fx.Int16(codec.bias), fx.Int16)
-    for i in range_constexpr(4):
-        w = _minnumf(fx.maxnumf(_f16x2(atom[i]) * enc_pk, lo), hi)
-        q.append(_i32(fx.roundeven(w).to(fx.Int16) + bias))
-    if codec.n_words == 1:
-        return (
-            q[0]
-            | (q[1] << fx.Int32(4))
-            | (q[2] << fx.Int32(8))
-            | (q[3] << fx.Int32(12)),
-        )
-    # Every code is masked here. In INT4 each field already fills its whole
-    # nibble, so the shift-or cannot collide; a 6-bit code would overrun its
-    # neighbour's slot if left whole.
-    m4 = fx.Int32(_K_MASK_000F)
-    m2 = fx.Int32(_K_MASK_0003)
-    lo4 = [qi & m4 for qi in q]
-    hi2 = [qi.shrui(fx.Int32(4)) & m2 for qi in q]
-    packed_lo = (
-        lo4[0]
-        | (lo4[1] << fx.Int32(4))
-        | (lo4[2] << fx.Int32(8))
-        | (lo4[3] << fx.Int32(12))
-    )
-    packed_hi = (
-        hi2[0]
-        | (hi2[1] << fx.Int32(2))
-        | (hi2[2] << fx.Int32(4))
-        | (hi2[3] << fx.Int32(6))
-    )
-    return (packed_lo, packed_hi)
-
-
-def _compact_hi2(packed_hi, lane):
-    """Two threads' 2-bit planes into the single i32 they share on the wire.
-
-    ``packed_hi`` carries its 8 live bits at [0..7] and [16..23] -- the f16x2
-    pairing puts a thread's even elements in the low half of every i32 and its
-    odd ones in the high half. Squeeze those to 16 dense bits, then merge with
-    the xor-1 neighbour. Both lanes of the pair compute the same word; only the
-    even one stores it, at ``hi2_i32_off + (tid >> 1)``.
-
-    ``lane & 1 == tid & 1``, so this is the same pairing
-    :func:`_pair_signed_ext_f16` already uses for the group-16 extremum -- no
-    second convention is introduced.
-    """
-    c = (packed_hi & fx.Int32(0xFF)) | (packed_hi.shrui(fx.Int32(8)) & fx.Int32(0xFF00))
-    other = fx.Int32(gpu.shuffle_xor(c, 1, WAVE))
-    is_even = (lane & fx.Int32(1)) == fx.Int32(0)
-    return is_even.select(c | (other << fx.Int32(16)), other | (c << fx.Int32(16)))
-
-
-def _expand_hi2(word, tid):
-    """Inverse of :func:`_compact_hi2`, for the calling thread's half."""
-    c = word.shrui((tid & fx.Int32(1)) * fx.Int32(16)) & fx.Int32(0xFFFF)
-    return (c & fx.Int32(0xFF)) | ((c & fx.Int32(0xFF00)) << fx.Int32(8))
-
-
-def _codec_quant(codec, atom, lane, tid):
-    """Quantize one atom. Returns ``(words, e4m3_word, is_leader)``.
-
-    ``words`` is this codec's payload i32s in wire order, and is opaque to the
-    caller: the ring restages received words verbatim on its all-gather lap and
-    must not have to know how many there are.
-    """
-    ext = _pair_signed_ext_f16(atom)
-    e = _f32_to_e4m3(ext)
-    d = _e4m3_to_f32(e) * fx.Float32(codec.dec_step)
-    # Clamp before the fp16 splat. An all-zero group gives d == 0, so the
-    # reciprocal is 1e7 -- Inf once narrowed to fp16, and 0 * Inf is NaN. Only
-    # MODE.FP16_OVFL saturation has been keeping that from poisoning a tile,
-    # and INT6 cuts the headroom fourfold: |d| is four times smaller for a
-    # given extremum, so 1/|d| peaks near 4096 rather than 1024.
-    enc = _clamp_f32(
-        fx.Float32(1.0) / (d + fx.Float32(1e-7)), -_FP16_MAX, _FP16_MAX
-    )
-    words = _quant_atom_fp16(codec, atom, _splat_f16x2(enc))
-    if codec.n_words == 2:
-        words = (words[0], _compact_hi2(words[1], lane))
-    is_leader = (tid % GROUP) == 0
-    return words, _pack_e4m3_word(e, lane), is_leader
-
-
-def _codec_dequant(codec, words, scale, tid, acc=None):
-    """Unpack four codes to f16x2, scale, optionally FMA into *acc*.
-
-    ``a * b + c`` does not contract to ``v_pk_fma_f16``; ``fx.fma`` does.
-    Two fp16 lanes are independent channels, not a dot into f32.
-
-    *words* are as they sit on the wire, so the 2-bit plane is still compacted
-    and is expanded here -- once, outside the loop.
-    """
-    out = []
-    mask = fx.Int32(_K_MASK_000F)
-    bias_hi = fx.Int32(_K_HALF2_1024)
-    bias_lo = _f16x2(fx.Int32(codec.dequant_bias))
-    packed = words[0]
-    if codec.n_words == 2:
-        hi = _expand_hi2(words[1], tid)
-        m2 = fx.Int32(_K_MASK_0003)
-    for i in range_constexpr(4):
-        code = packed.shrui(fx.Int32(i * 4)) & mask
-        if codec.n_words == 2:
-            code = code | ((hi.shrui(fx.Int32(i * 2)) & m2) << fx.Int32(4))
-        dq = _f16x2(code | bias_hi) + bias_lo
-        if acc is None:
-            out.append(_i32(dq * scale))
-        else:
-            out.append(_i32(fx.fma(dq, scale, _f16x2(acc[i]))))
-    return fx.Vector.from_elements(out, fx.Int32)
-
-
-def _codec_load(codec, get, tid, scale_slot):
-    """Read one packet through ``get(i32_off_in_tile) -> i32``.
-
-    Returns ``(words, e4m3_word)`` exactly as they sit on the wire -- the 2-bit
-    plane stays compacted -- so a forwarding path can restage them byte for
-    byte without decoding.
-    """
-    words = (get(tid),)
-    if codec.n_words == 2:
-        words = words + (
-            get(fx.Int32(codec.hi2_i32_off) + tid.shrui(fx.Int32(1))),
-        )
-    return words, get(fx.Int32(codec.scale_i32_off) + scale_slot)
-
-
-def _i32_to_bytes(i32_off):
-    return fx.Int64(i32_off) * fx.Int64(I32_BYTES)
-
-
-def _to_sgpr_i64(addr):
-    """Copy a wave-uniform i64 from vector to scalar registers.
-
-    Buffer loads/stores need the descriptor in scalar registers. After
-    ``peers[rank]``, every lane holds the same pointer, but it sits in a
-    vector register, so LLVM cannot prove that. It then serializes the
-    wave: one lane at a time, copy that lane's pointer to a scalar
-    register, mask to that lane, issue the load, repeat. ``readfirstlane``
-    copies lane 0's value into a scalar register once so the whole wave
-    issues a single buffer op.
-
-    Do this at the inbox descriptor, not on the peer list: fanout stores
-    use a different peer per lane, so those addresses must stay in vector
-    registers. ``T.i64`` is the result type ``readfirstlane`` requires.
-    """
-    return fx.Int64(rocdl.readfirstlane(T.i64, as_ir_value(addr)))
-
-
-def _store_v4i32_peer(addr_i64, data, policy):
-    """Store 16 B to a peer through a per-lane global address.
-
-    One instruction here sends 16 B to a different GPU in each lane of a
-    4-wide group. A buffer-descriptor store wants the descriptor in scalar
-    registers, so LLVM would serialize those lanes (one destination at a
-    time). A flat global store takes the address from a vector register,
-    so all destinations issue together.
-
-    *policy* is the cache-policy suffix for the inbox memory type; see
-    ``_PEER_STORE_POLICY``. Not yet applied natively -- see TODO below.
-    """
-    # TODO: no native cache-policy (nt / sc0 sc1) attribute exists yet on
-    # fly.ptr_store, so *policy* is currently ignored.
-    # ptr_ty = fx.PointerType.get(
-    #     fx.Vector.make_type(4, fx.Int32), address_space=fx.AddressSpace.Global
-    # )
-    # ptr = fx.inttoptr(ptr_ty, addr_i64)
-    # fx.ptr_store(data, ptr)
-    ptr_ty = ir.Type.parse("!llvm.ptr<1>")
-    ptr = llvm.IntToPtrOp(ptr_ty, as_ir_value(addr_i64)).result
-    llvm.InlineAsmOp(
-        None,
-        [ptr, as_ir_value(data)],
-        f"global_store_dwordx4 $0, $1, off {policy}",
-        "v,v",
-        has_side_effects=True,
-    )
-
-
-def _store_v4i32_peer_multi(pairs, policy):
-    """Emit a whole fanout of 16 B peer stores as ONE inline-asm block.
-
-    Same instruction as ``_store_v4i32_peer``, but every store in the group
-    lives inside a single ``InlineAsmOp``.
-
-    Why that matters: a VMEM store samples its address and data VGPRs
-    asynchronously *after* issue, so those registers must stay live until
-    ``vmcnt`` retires the store. LLVM guarantees that for real store
-    instructions -- ``SIInsertWaitcnts`` tracks the operands -- but it cannot
-    see inside inline asm. It therefore believes the data is dead the instant
-    the asm "executes" and is free to recycle those VGPRs for the next
-    address computation:
-
-        global_store_dwordx4 v[44:45], v[14:17], off nt   ; reads v[14:17]
-        v_lshl_add_u64       v[14:15], v[46:47], 0, v[8:9] ; clobbers them
-
-    which sends the next peer's *pointer* down the wire in place of the first
-    8 B of payload. Only shows up under register pressure -- one atom per
-    thread has slack, four does not.
-
-    Grouping the stores fixes it because LLVM allocates every operand of one
-    asm block to a distinct register and emits nothing between them, so
-    nothing can clobber a pending store's sources. The caller must still
-    ``s_waitcnt vmcnt(0)`` before reusing the values, which is what
-    ``_publish`` already does on the next line.
-
-    *pairs* is a sequence of ``(addr_i64, data_v4i32)``.
-    """
-    ptr_ty = ir.Type.parse("!llvm.ptr<1>")
-    operands, slots = [], []
-    # Reference a repeated payload once: listing the same value N times would
-    # have LLVM allocate N copies of it. Keyed on the *caller's* Python object,
-    # not on ``==`` over the lowered ir.Value -- MLIR compares those
-    # structurally, which silently folds four distinct atoms into one operand
-    # and stores atom 0's data for every atom.
-    data_slot: dict[int, int] = {}
-
-    for addr_i64, data in pairs:
-        ptr = llvm.IntToPtrOp(ptr_ty, as_ir_value(addr_i64)).result
-        operands.append(ptr)
-        a = len(operands) - 1
-        key = id(data)
-        if key not in data_slot:
-            operands.append(as_ir_value(data))
-            data_slot[key] = len(operands) - 1
-        slots.append((a, data_slot[key]))
-
-    asm = "\n\t".join(f"global_store_dwordx4 ${a}, ${d}, off {policy}" for a, d in slots)
-    llvm.InlineAsmOp(
-        None,
-        operands,
-        asm,
-        ",".join("v" * len(operands)),
-        has_side_effects=True,
-    )
-
-
-def _load_i32_nt(rsrc, elem_off, cache_modifier=_CM_NT):
-    """Load one i32 from the inbox under the policy's receive modifier.
-
-    Defaults to ``nt`` -- correct when the inbox memory cannot hold a stale
-    line in the first place. A cacheable (coarse-grained) inbox must pass
-    ``_CM_SC0 | _CM_SC1`` instead, because ``nt`` is a reuse *hint* and does
-    not stop this load being answered from the reader's own L1/L2.
-    """
-    return fx.Int32(
-        buffer_ops.buffer_load(
-            rsrc, elem_off, vec_width=1, dtype=T.i32, cache_modifier=cache_modifier
-        )
-    )
-
-
-def _load_i32_uncached(rsrc):
-    """One i32 that cannot be answered from this device's caches.
-
-    ``sc0 sc1`` is what LLVM itself emits for a system-scope load, and it is
-    what makes a spin loop safe without a fence in the loop body: the value
-    is fetched past L1 and L2 every time, so no retry can see a stale line.
-    ``sc1`` alone would only bypass L2.
-    """
-    val = buffer_ops.buffer_load(
-        rsrc, 0, vec_width=1, dtype=T.i32, cache_modifier=_CM_SC0 | _CM_SC1
-    )
-    rocdl.s_waitcnt(vmcnt=0)
-    return fx.Int32(val)
-
-
-def _acquire_inbox():
-    """Acquire fence over global memory, system scope.
-
-    Replaces a raw ``buffer_inv sc1`` asm. On gfx950 the memory legalizer
-    lowers this to ``s_waitcnt vmcnt(0)`` + ``buffer_inv sc0 sc1``, so the
-    encoding comes from the target rather than from a string in this file.
-    ``one-as`` scopes it to global memory, which is why it does not also
-    wait on ``lgkmcnt``.
-
-    System scope, not agent. The data being acquired was written by another
-    GPU, and another GPU is a different agent: agent scope lowers to
-    ``buffer_inv sc1``, which clears L2 but leaves the vector L1 holding
-    whatever it had. That is what the old asm did.
-
-    Call this **once, after the workgroup joins** -- not inside a spin loop.
-    A flag load that carries ``sc0 sc1`` can never be answered from a stale
-    line, so the retry loop needs no fence of its own; what needs one is the
-    payload read that follows, and that needs it exactly once. See
-    :func:`make_qr_int4_kernel._wait_release`.
-    """
-    llvm.fence(llvm.AtomicOrdering.acquire, syncscope="one-as")
-
-
-def make_pack_storage(n_i32: int):
-    """LDS staging for *n_i32* packed words, 16 B aligned.
-
-    A factory rather than one struct because the two schedules need different
-    sizes: the mesh stages every destination's packet (``ATOMS`` rows), while
-    the ring stages one destination's (``rank_atoms`` rows) and its row stride
-    depends on which codec that hop carries.
-    """
-
-    @fx.struct
-    class PackStorage:
-        pack: fx.Array[fx.Int32, n_i32, 16]
-
-    return PackStorage
 
 
 PackStorage = make_pack_storage(PACK_I32)
@@ -760,8 +125,7 @@ def make_qr_int4_kernel(
         tid = fx.Int32(gpu.thread_id("x"))
         bid = fx.Int32(gpu.block_id("x"))
 
-        thread_layout = fx.make_layout((WAVES, WAVE), (WAVE, 1))
-        wave, lane = fx.idx2crd(tid, thread_layout).unpack()
+        wave, lane = thread_lane(tid)
         quad_layout = fx.make_layout((QUADS_PER_WAVE, QUAD_LANES), (QUAD_LANES, 1))
         quad, lane_in_quad = fx.idx2crd(lane, quad_layout).unpack()
         quad_id = wave * fx.Int32(QUADS_PER_WAVE) + quad
@@ -783,12 +147,7 @@ def make_qr_int4_kernel(
             fx.make_layout((1, 4), (1, 1)),
         ).get_slice(tid)
         # Four group-16 E4M3 bytes share the i32 slot eight threads already own.
-        scale_own_layout = fx.make_layout(
-            (BLOCK // GROUP, GROUP // PAIR, PAIR), (GROUP, PAIR, 1)
-        )
-        scale_slot, pair_in_slot, _lane_in_pair = fx.idx2crd(
-            tid, scale_own_layout
-        ).unpack()
+        scale_slot, pair_in_slot = scale_slot_of(tid)
         # Rank-tile = 18 × 64 B Infinity Fabric sectors: 16 INT4 then 2 E4M3.
         # A workgroup has 64 quads. A stripe of 8 sectors needs world_size*8
         # quads (64 at 8 GPUs); leftover quads sit idle (always on the
@@ -897,7 +256,7 @@ def make_qr_int4_kernel(
             fx.memref_store(words[0], pack, (slot, tid))
             if is_leader:
                 fx.memref_store(
-                    scale, pack, (slot, fx.Int32(SCALE_I32_OFF) + scale_slot)
+                    scale, pack, (slot, fx.Int32(INT4.scale_i32_off) + scale_slot)
                 )
 
         def _pack_reduce_scatter(atoms):
@@ -1041,10 +400,9 @@ def make_qr_int4_kernel(
                 base = base + fx.Int32(k * RANK_TILE_I32)
             packed = _load_i32_nt(self_rsrc, base + tid, recv_policy)
             word = _load_i32_nt(
-                self_rsrc, base + fx.Int32(SCALE_I32_OFF) + scale_slot, recv_policy
+                self_rsrc, base + fx.Int32(INT4.scale_i32_off) + scale_slot, recv_policy
             )
-            e = word.shrui(pair_in_slot * fx.Int32(8)) & fx.Int32(0xFF)
-            return (packed,), _e4m3_decoding_scale(INT4, e)
+            return (packed,), _scale_from_word(INT4, word, pair_in_slot)
 
         def _reduce_scattered(sub):
             """Dequant-accumulate every peer's reduce-scatter packet for *sub*."""

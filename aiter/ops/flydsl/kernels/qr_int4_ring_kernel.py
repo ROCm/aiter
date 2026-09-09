@@ -29,37 +29,34 @@ from flydsl.expr import gpu, range_constexpr, rocdl
 from flydsl.expr.typing import Int32, Int64, Stream, T
 
 from . import buffer_ops
-
-# The codecs, the peer-store/load primitives and the geometry are shared with
-# the mesh kernel verbatim. They are private there by convention, not by
-# intent: these two kernels are the only consumers and they must agree byte for
-# byte.
-from .qr_int4_kernel import (
-    _CM_SC0,
-    _CM_SC1,
-    _INBOX_POLICY,
-    ATOMS,
-    BLOCK,
+from .qr_int_codec import (
     CODECS,
-    DEFAULT_GRID_CAP,  # noqa: F401  -- re-exported for host symmetry
     GROUP,
-    PAIR,
-    QUAD_LANES,
-    QUADS_PER_WAVE,
-    SUPPORTED_WORLDS,
-    TILE_BYTES,
-    TILE_FP16,
-    TILE_I32,
-    WAVE,
-    WAVES,
-    _acquire_inbox,
     _atom_bf16_to_f16,
     _atom_f16_to_bf16,
     _clamp_fp16_overflow,
     _codec_dequant,
     _codec_load,
     _codec_quant,
-    _e4m3_decoding_scale,
+    _scale_from_word,
+    hi2_slot_of,
+    scale_slot_of,
+    thread_lane,
+)
+from .qr_int_shared import (
+    _CM_SC0,
+    _CM_SC1,
+    _INBOX_POLICY,
+    ATOMS,
+    BLOCK,
+    DEFAULT_GRID_CAP,  # noqa: F401  -- re-exported for host symmetry
+    QUAD_LANES,
+    QUADS_PER_WAVE,
+    SUPPORTED_WORLDS,
+    TILE_BYTES,
+    TILE_FP16,
+    TILE_I32,
+    _acquire_inbox,
     _i32_to_bytes,
     _store_v4i32_peer,
     _to_sgpr_i64,
@@ -116,7 +113,7 @@ _RECV_POLICY = _CM_SC0 | _CM_SC1
 def _load_i32_at(rsrc, elem_off, cache_modifier):
     """One i32 from *rsrc* at an element offset, drained before it is read.
 
-    ``qr_int4_kernel._load_i32_uncached`` does the same but hardcodes offset 0,
+    ``qr_int_shared._load_i32_uncached`` does the same but hardcodes offset 0,
     which would force a fresh per-call descriptor here; the ring always has the
     inbox descriptor in hand and only the offset varies.
     """
@@ -258,16 +255,14 @@ def make_qr_int4_ring_kernel(
         tid = fx.Int32(gpu.thread_id("x"))
         bid = fx.Int32(gpu.block_id("x"))
 
-        thread_layout = fx.make_layout((WAVES, WAVE), (WAVE, 1))
-        wave, lane = fx.idx2crd(tid, thread_layout).unpack()
+        wave, lane = thread_lane(tid)
         quad_layout = fx.make_layout((QUADS_PER_WAVE, QUAD_LANES), (QUAD_LANES, 1))
         quad, lane_in_quad = fx.idx2crd(lane, quad_layout).unpack()
         quad_id = wave * fx.Int32(QUADS_PER_WAVE) + quad
 
         # Threads 2t and 2t+1 share one i32 of the INT6 2-bit plane; the even
         # one stores it.
-        hi2_leader = (tid & fx.Int32(1)) == fx.Int32(0)
-        hi2_slot = tid.shrui(fx.Int32(1))
+        hi2_leader, hi2_slot = hi2_slot_of(tid)
 
         hbm_layout = fx.make_layout(
             (num_tiles, ATOMS, BLOCK * 4),
@@ -280,12 +275,7 @@ def make_qr_int4_ring_kernel(
             fx.make_layout((1, BLOCK), (1, 1)),
             fx.make_layout((1, 4), (1, 1)),
         ).get_slice(tid)
-        scale_own_layout = fx.make_layout(
-            (BLOCK // GROUP, GROUP // PAIR, PAIR), (GROUP, PAIR, 1)
-        )
-        scale_slot, pair_in_slot, _lane_in_pair = fx.idx2crd(
-            tid, scale_own_layout
-        ).unpack()
+        scale_slot, pair_in_slot = scale_slot_of(tid)
         color_layout = fx.make_layout((grid,), (1,))
 
         # One allocation, one view per codec.
@@ -430,8 +420,7 @@ def make_qr_int4_ring_kernel(
             return _codec_load(codec, _get, tid, scale_slot)
 
         def _scale_of(codec, word):
-            e = word.shrui(pair_in_slot * fx.Int32(8)) & fx.Int32(0xFF)
-            return _e4m3_decoding_scale(codec, e)
+            return _scale_from_word(codec, word, pair_in_slot)
 
         def _fanout_to_next(step, sub):
             """Push the staged rank-tiles from LDS into the successor's inbox.

@@ -34,7 +34,7 @@ from .qr_int4 import (
     _validate_ipc_process_group,
     _StEngine,
 )
-from .qr_int4_kernel import SUPPORTED_WORLDS
+from .qr_int_shared import SUPPORTED_WORLDS
 
 logger = logging.getLogger("aiter")
 

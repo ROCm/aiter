@@ -18,24 +18,86 @@ so it can be pushed straight from registers.
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
+from flydsl._mlir import ir
 from flydsl._mlir.dialects import llvm
 from flydsl.expr import gpu, range_constexpr, rocdl
-from flydsl.expr.typing import Int32, Int64, Stream, T
+from flydsl.expr.typing import Int32, Int64, Stream, T, as_ir_value
 
 from . import buffer_ops
 
 # The peer-store/load primitives, the cache-policy table and the inbox-memory
-# taxonomy are shared with the quantized kernels verbatim. 
-from .qr_int4_kernel import (
+# taxonomy are shared with the quantized kernels verbatim.
+from .qr_int_shared import (
     _CM_SC0,
     _CM_SC1,
     _INBOX_POLICY,
     SUPPORTED_WORLDS,
     _acquire_inbox,
     _i32_to_bytes,
-    _store_v4i32_peer_multi,
     _to_sgpr_i64,
 )
+
+
+def _store_v4i32_peer_multi(pairs, policy):
+    """Emit a whole fanout of 16 B peer stores as ONE inline-asm block.
+
+    Same instruction as ``qr_int_shared._store_v4i32_peer``, but every store in
+    the group lives inside a single ``InlineAsmOp``. It lives here rather than
+    beside it because this kernel is its only consumer; the two must keep
+    agreeing on the ``global_store_dwordx4 ... {policy}`` encoding.
+
+    Why that matters: a VMEM store samples its address and data VGPRs
+    asynchronously *after* issue, so those registers must stay live until
+    ``vmcnt`` retires the store. LLVM guarantees that for real store
+    instructions -- ``SIInsertWaitcnts`` tracks the operands -- but it cannot
+    see inside inline asm. It therefore believes the data is dead the instant
+    the asm "executes" and is free to recycle those VGPRs for the next
+    address computation:
+
+        global_store_dwordx4 v[44:45], v[14:17], off nt   ; reads v[14:17]
+        v_lshl_add_u64       v[14:15], v[46:47], 0, v[8:9] ; clobbers them
+
+    which sends the next peer's *pointer* down the wire in place of the first
+    8 B of payload. Only shows up under register pressure -- one atom per
+    thread has slack, four does not.
+
+    Grouping the stores fixes it because LLVM allocates every operand of one
+    asm block to a distinct register and emits nothing between them, so
+    nothing can clobber a pending store's sources. The caller must still
+    ``s_waitcnt vmcnt(0)`` before reusing the values, which is what
+    ``_publish`` already does on the next line.
+
+    *pairs* is a sequence of ``(addr_i64, data_v4i32)``.
+    """
+    ptr_ty = ir.Type.parse("!llvm.ptr<1>")
+    operands, slots = [], []
+    # Reference a repeated payload once: listing the same value N times would
+    # have LLVM allocate N copies of it. Keyed on the *caller's* Python object,
+    # not on ``==`` over the lowered ir.Value -- MLIR compares those
+    # structurally, which silently folds four distinct atoms into one operand
+    # and stores atom 0's data for every atom.
+    data_slot: dict[int, int] = {}
+
+    for addr_i64, data in pairs:
+        ptr = llvm.IntToPtrOp(ptr_ty, as_ir_value(addr_i64)).result
+        operands.append(ptr)
+        a = len(operands) - 1
+        key = id(data)
+        if key not in data_slot:
+            operands.append(as_ir_value(data))
+            data_slot[key] = len(operands) - 1
+        slots.append((a, data_slot[key]))
+
+    asm = "\n\t".join(f"global_store_dwordx4 ${a}, ${d}, off {policy}" for a, d in slots)
+    llvm.InlineAsmOp(
+        None,
+        operands,
+        asm,
+        ",".join("v" * len(operands)),
+        has_side_effects=True,
+    )
+
+
 
 BLOCK = 256
 # 16 B per thread per atom -- one ``global_store_dwordx4``.
@@ -51,7 +113,7 @@ DEFAULT_ATOMS = 1
 # per-atom stride in ``_fanout`` / ``_reduce`` / ``hbm_layout``; that was wrong,
 # those three always agreed. The real fault was a VMEM store hazard the fanout
 # only exposes under the register pressure of several atoms -- see
-# ``_store_v4i32_peer_multi`` in ``qr_int4_kernel.py``, which now carries the
+# ``_store_v4i32_peer_multi`` below, which now carries the
 # whole fanout in one asm block. Passes at TP2 and TP4 for 1, 2 and 4 including
 # the run-ahead loop.
 #

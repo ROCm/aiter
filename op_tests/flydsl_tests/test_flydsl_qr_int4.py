@@ -44,13 +44,13 @@ from aiter.test_common import benchmark, run_perftest
 pytest.importorskip("flydsl")
 
 from aiter.ops.flydsl.kernels.qr_int4 import DEFAULT_GRID_CAP
-from aiter.ops.flydsl.kernels.qr_int4_kernel import (
+from aiter.ops.flydsl.kernels.qr_int4_ring_kernel import RING_ST_LADDER
+from aiter.ops.flydsl.kernels.qr_int_shared import (
     SUPPORTED_WORLDS,
     TILE_BYTES,
     WORLD,
     has_release_fence,
 )
-from aiter.ops.flydsl.kernels.qr_int4_ring_kernel import RING_ST_LADDER
 
 ARCH = get_gfx_runtime()
 SUPPORTED_ARCHS = ("gfx942", "gfx950")
