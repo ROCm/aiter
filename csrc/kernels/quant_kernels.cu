@@ -125,9 +125,15 @@ dynamic_per_group_scaled_quant_kernel(DTYPE_O* __restrict__ out,
     {
         inverted_scale = absMax * inverted_DTYPE_MAX;
     }
-    row_offset           = std::is_same_v<DTYPE_O, opus::fp4_t>
-                               ? groupId * group_size / 2 + (threadIdx.x % num_thread_per_group) * vec_size_o
-                               : groupId * group_size + (threadIdx.x % num_thread_per_group) * vec_size_o;
+    const int64_t out_row_offset =
+        std::is_same_v<DTYPE_O, opus::fp4_t> ? x * ori_cols / 2 : x * ori_cols;
+    const int32_t out_thread_offset =
+        (std::is_same_v<DTYPE_O, opus::fp4_t> ? y * group_size / 2
+                                              : y * group_size) +
+        (threadIdx.x % num_thread_per_group) * vec_size_o;
+    const int64_t out_linear_offset = out_row_offset + out_thread_offset;
+    // Fallback descriptor base for outputs beyond the global descriptor's
+    // 32-bit byte reach. Normal-size tensors retain the original global base.
     if(threadIdx.x % num_thread_per_group == 0)
     {
         if constexpr(use_e8m0_scale)
@@ -166,9 +172,24 @@ dynamic_per_group_scaled_quant_kernel(DTYPE_O* __restrict__ out,
 
     using DTYPE_STORE = std::conditional_t<std::is_same_v<DTYPE_O, opus::fp4_t>, uint8_t, DTYPE_O>;
     auto* out_ptr     = reinterpret_cast<DTYPE_STORE*>(out);
-    auto buffer_o = opus::make_gmem<DTYPE_STORE>(out_ptr, oob_size);
-
-    store_vector<DTYPE_STORE, DTYPE_I, thread_data_size, RT, false, WARP_SIZE, 1, DTYPE_O>(buffer_o, thread_data, row_offset, inverted_scale);
+    constexpr int64_t kDescriptorReach = (int64_t{1} << 32) - 1;
+    if(oob_size <= kDescriptorReach)
+    {
+        auto buffer_o = opus::make_gmem<DTYPE_STORE>(out_ptr, oob_size);
+        store_vector<DTYPE_STORE, DTYPE_I, thread_data_size, RT, false, WARP_SIZE, 1, DTYPE_O>(
+            buffer_o, thread_data, out_linear_offset, inverted_scale);
+    }
+    else
+    {
+        auto buffer_o = opus::make_gmem<DTYPE_STORE>(
+            out_ptr + out_row_offset,
+            static_cast<int64_t>(std::is_same_v<DTYPE_O, opus::fp4_t>
+                                     ? ori_cols / 2
+                                     : ori_cols) *
+                sizeof(DTYPE_STORE));
+        store_vector<DTYPE_STORE, DTYPE_I, thread_data_size, RT, false, WARP_SIZE, 1, DTYPE_O>(
+            buffer_o, thread_data, out_thread_offset, inverted_scale);
+    }
 }
 
 __global__ void initializeScale(float *d_data, int size, float value)

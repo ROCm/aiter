@@ -3,10 +3,8 @@
 
 """MHA Forward Prefill kernel — ``m32x8`` design, gfx1250 (MI400 / mi450).
 
-A fresh, clean FlyDSL kernel written in the high-level layout-algebra style
-(tiled copy / tiled MMA + ``SharedAllocator``) — deliberately independent of the
-hand-tuned, assembly-mirroring ``fmha_kernel.py`` (inline ASM, raw TDM
-descriptors, ``set_vgpr_bank`` hints, per-WMMA schedule tables).
+A clean FlyDSL kernel written in the high-level layout-algebra style
+(tiled copy / tiled MMA + ``SharedAllocator``).
 
 ``m32x8`` names the threadgroup shape: **8 waves per threadgroup**, each wave
 owning a **32-row** Q span (2 adjacent 16-row WMMA tiles). gfx1250 runs wave32,

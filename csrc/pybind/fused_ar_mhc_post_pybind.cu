@@ -5,7 +5,7 @@
 #include "fused_ar_mhc_post.h"
 #include "rocm_ops.hpp"
 
-PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
+PYBIND11_MODULE(AITER_EXTENSION_NAME, m)
 {
     AITER_SET_STREAM_PYBIND;
     m.def("fused_allreduce_mhc_post_only",
