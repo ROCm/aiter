@@ -56,6 +56,7 @@ import triton.language as tl
 from aiter.ops.triton._triton_kernels.chunk_delta_attn.chunk_delta_attn_utils import (
     CHUNK_DELTA_ATTN_TRITON_AUTOTUNE,
     autotune_cache_kwargs,
+    chunk_delta_attn_tuned_config,
     exp,
     exp2,
     input_guard,
@@ -308,25 +309,32 @@ def _flash_kda_prepare_kernel(
     tl.store(ws_inv_mqk + cc_off, b_INV)
 
 
-# K2 keeps three configs even with the global autotune flag off, where the other
-# kernels here fall back to one. Its parallelism is only num_segments * H *
-# (W / BW), so the best BW swings with head count: a pinned BW=32 costs ~1.4x at
-# H=16 and turns the path into a regression against the default pipeline. Three
-# configs is a cheap first-call sweep, and the result is cached.
-_K2_CONFIGS: list = (
-    [
-        triton.Config({"BW": BW}, num_warps=nw, num_stages=ns)
-        for BW in [16, 32, 64]
-        for nw in [2, 4]
-        for ns in [1, 2]
-    ]
-    if CHUNK_DELTA_ATTN_TRITON_AUTOTUNE
-    else [
+# K2's parallelism is only num_segments * H * (W / BW), so the best BW is set by the
+# segment count: one segment wants BW=16 (4x the blocks of BW=64), many want BW=64.
+_K2_CONFIGS: list = [
+    triton.Config({"BW": BW}, num_warps=nw, num_stages=ns)
+    for BW in [16, 32, 64]
+    for nw in [2, 4]
+    for ns in [1, 2]
+]
+_K2_TUNED = {
+    "single_seg": chunk_delta_attn_tuned_config(
+        "_flash_kda_segment_kernel_single_seg",
         triton.Config({"BW": 16}, num_warps=2, num_stages=2),
-        triton.Config({"BW": 32}, num_warps=2, num_stages=2),
-        triton.Config({"BW": 64}, num_warps=4, num_stages=2),
-    ]
-)
+    ),
+    "multi_seg": chunk_delta_attn_tuned_config(
+        "_flash_kda_segment_kernel_multi_seg",
+        triton.Config({"BW": 64}, num_warps=2, num_stages=2),
+    ),
+}
+
+
+def _k2_prune(configs, named_args, **kwargs):
+    """Tuning on: benchmark every config; off: the published tile for this segment class."""
+    if CHUNK_DELTA_ATTN_TRITON_AUTOTUNE:
+        return configs
+    segs_class = kwargs.get("NUM_SEGS_CLASS", named_args.get("NUM_SEGS_CLASS"))
+    return [_K2_TUNED["single_seg" if segs_class <= 1 else "multi_seg"]]
 
 
 def _seg_occupancy_class(num_segs: int) -> int:
@@ -349,6 +357,7 @@ def _seg_occupancy_class(num_segs: int) -> int:
     # and unsegmented schedules collide and whichever runs first sets the
     # config for both, a result the on-disk cache then keeps.
     key=["H", "K", "W", "C", "HAS_V", "COMPUTE_OUTPUT", "NUM_SEGS_CLASS"],
+    prune_configs_by={"early_config_prune": _k2_prune},
     **autotune_cache_kwargs,
 )
 @triton.jit
