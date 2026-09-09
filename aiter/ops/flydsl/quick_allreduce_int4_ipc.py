@@ -2,7 +2,7 @@
 # Copyright (c) 2025 FlyDSL Project Contributors
 # Modifications Copyright (C) 2026 Advanced Micro Devices, Inc.
 
-"""Uncached HIP IPC helpers for the FlyDSL INT4 QuickReduce inbox."""
+"""Uncached HIP IPC helpers for the FlyDSL INT4 quick-allreduce inbox."""
 
 from __future__ import annotations
 

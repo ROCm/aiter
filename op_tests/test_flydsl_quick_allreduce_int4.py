@@ -1,19 +1,21 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Runtime correctness for FlyDSL INT4 QuickReduce (``QRInt4``).
+"""Runtime correctness for FlyDSL INT4 quick all-reduce (``QuickAllReduceInt4``).
 
 Pytest collects validity cases only (no timing). ``python3`` this file
 runs an aiter-op-test ``@benchmark`` / markdown sweep. Every rank is a
-``multiprocessing`` spawn worker that builds its own ``QRInt4`` engine,
-calls ``compile()``, and in the sweep times ``fly.allreduce`` with
-``run_perftest``. The oracle is an untimed fp32 NCCL all-reduce of the
-same per-rank inputs. INT4 is lossy, so validity uses SQNR, a calibrated
-mismatch ratio, and a per-tile SQNR floor.
+``multiprocessing`` spawn worker that builds its own
+``QuickAllReduceInt4`` engine, calls ``compile()``, and in the sweep
+times ``fly.allreduce`` with ``run_perftest``. The oracle is an untimed
+fp32 NCCL all-reduce of the same per-rank inputs. INT4 is lossy, so
+validity uses SQNR, a calibrated mismatch ratio, and a per-tile SQNR
+floor.
 
 hidden=5120 is the width the kernel was tuned on, not a shape the kernel
-requires. QRInt4 runs on gfx942/gfx950 at TP∈{2,4,8}; other archs skip,
-and pytest skips a world size when fewer GPUs are visible than TP.
+requires. QuickAllReduceInt4 runs on gfx942/gfx950 at TP∈{2,4,8}; other
+archs skip, and pytest skips a world size when fewer GPUs are visible
+than TP.
 """
 
 from __future__ import annotations
@@ -44,8 +46,8 @@ pytest.importorskip("flydsl")
 
 set_start_method("spawn", force=True)
 
-from aiter.ops.flydsl.kernels.qr_int4 import DEFAULT_GRID_CAP
-from aiter.ops.flydsl.kernels.qr_int4_kernel import (
+from aiter.ops.flydsl.quick_allreduce_int4 import DEFAULT_GRID_CAP
+from aiter.ops.flydsl.kernels.quick_allreduce_int4 import (
     SUPPORTED_WORLDS,
     TILE_BYTES,
     WORLD,
@@ -75,7 +77,7 @@ _FILLS = (
 
 pytestmark = pytest.mark.skipif(
     ARCH not in SUPPORTED_ARCHS,
-    reason="QRInt4 requires an available gfx942 or gfx950 GPU",
+    reason="QuickAllReduceInt4 requires an available gfx942 or gfx950 GPU",
 )
 
 # Distinct correctness branches, not a tokens x hidden product.
@@ -188,7 +190,7 @@ def _run_rank(
 ) -> list[dict]:
     import torch.distributed as dist
 
-    from aiter.ops.flydsl import QRInt4
+    from aiter.ops.flydsl import QuickAllReduceInt4
 
     device = torch.device(f"cuda:{rank}")
     torch.cuda.set_device(device)
@@ -199,12 +201,12 @@ def _run_rank(
         rank=rank,
         device_id=device,
     )
-    # QRInt4 exchanges IPC metadata over a non-NCCL group; NCCL stays for the
-    # fp32 reference all-reduce.
+    # QuickAllReduceInt4 exchanges IPC metadata over a non-NCCL group;
+    # NCCL stays for the fp32 reference all-reduce.
     gloo = dist.new_group(backend="gloo")
     group = dist.group.WORLD
 
-    fly = QRInt4(
+    fly = QuickAllReduceInt4(
         group=gloo,
         device=device,
         rank=rank,
@@ -249,7 +251,7 @@ def _run_rank(
                 atol=CLOSE_ATOL,
                 tol_err_ratio=CLOSE_ERR_RATIO,
                 printLog=False,
-                msg=f"qr_int4 rank {rank}",
+                msg=f"quick_allreduce_int4 rank {rank}",
             )
             row = {
                 "tokens": ntok,
@@ -299,7 +301,7 @@ def _spawn(
         raise ValueError(f"unsupported world_size={world_size}")
     n_gpu = torch.cuda.device_count()
     if n_gpu < world_size:
-        pytest.skip(f"QRInt4 needs {world_size} GPUs, have {n_gpu}")
+        pytest.skip(f"QuickAllReduceInt4 needs {world_size} GPUs, have {n_gpu}")
     init_method = get_distributed_init_method(get_ip(), get_open_port())
     token_list = [t for t, _ in pairs]
     hidden_list = [h for _, h in pairs]
@@ -332,7 +334,7 @@ def _spawn(
     finally:
         pool.join()
     if len(ranks) != world_size:
-        raise RuntimeError(f"QRInt4 gathered {len(ranks)} ranks, expected {world_size}")
+        raise RuntimeError(f"QuickAllReduceInt4 gathered {len(ranks)} ranks, expected {world_size}")
     return ranks
 
 
@@ -389,7 +391,7 @@ _CODEC_FILL_CASES = (
 
 
 @pytest.mark.parametrize("fill,label", _CODEC_FILL_CASES)
-def test_qr_int4_e4m3_codec_fill(fill, label):
+def test_quick_allreduce_int4_e4m3_codec_fill(fill, label):
     ranks = _spawn(2, [(16, 1024)], time_it=False, fill=fill)
     _assert_validity(
         ranks,
@@ -401,7 +403,7 @@ def test_qr_int4_e4m3_codec_fill(fill, label):
 
 
 @pytest.mark.parametrize("world_size,tokens,hidden,label", _PYTEST_CASES)
-def test_qr_int4_sqnr_vs_fp32_allreduce(world_size, tokens, hidden, label):
+def test_quick_allreduce_int4_sqnr_vs_fp32_allreduce(world_size, tokens, hidden, label):
     ranks = _spawn(world_size, [(tokens, hidden)], time_it=False)
     _assert_validity(
         ranks,
@@ -413,7 +415,7 @@ def test_qr_int4_sqnr_vs_fp32_allreduce(world_size, tokens, hidden, label):
 
 
 @benchmark()
-def test_qr_int4(tokens, hidden, dtype, tp, grid_cap=DEFAULT_GRID_CAP):
+def test_quick_allreduce_int4(tokens, hidden, dtype, tp, grid_cap=DEFAULT_GRID_CAP):
     ranks = _spawn(tp, [(tokens, hidden)], time_it=True, grid_cap=grid_cap)
     row = _assert_validity(
         ranks,
@@ -440,12 +442,12 @@ def test_qr_int4(tokens, hidden, dtype, tp, grid_cap=DEFAULT_GRID_CAP):
     }
 
 
-test_qr_int4.__test__ = False
+test_quick_allreduce_int4.__test__ = False
 
 
 def main():
     if ARCH not in SUPPORTED_ARCHS:
-        aiter.logger.warning("QRInt4 unsupported on %s; skipping", ARCH)
+        aiter.logger.warning("QuickAllReduceInt4 unsupported on %s; skipping", ARCH)
         return
     n_gpu = torch.cuda.device_count()
 
@@ -467,7 +469,7 @@ def main():
         type=int,
         nargs="*",
         default=[1],
-        help="Not a QRInt4 dimension; only 1 runs, other values are skipped.",
+        help="Not a QuickAllReduceInt4 dimension; only 1 runs, other values are skipped.",
     )
     parser.add_argument(
         "--tp",
@@ -506,18 +508,18 @@ def main():
 
     for dtype in args.dtype:
         if dtype != dtypes.bf16:
-            aiter.logger.warning("QRInt4 payload is bf16; skipping %s", dtype)
+            aiter.logger.warning("QuickAllReduceInt4 payload is bf16; skipping %s", dtype)
             continue
         df = []
         for tp, batch, mnk in itertools.product(args.tp, args.batch, args.mnk):
             if batch != 1:
                 continue
             if tp not in SUPPORTED_WORLDS:
-                aiter.logger.warning("QRInt4 unsupported world_size=%s; skipping", tp)
+                aiter.logger.warning("QuickAllReduceInt4 unsupported world_size=%s; skipping", tp)
                 continue
             if n_gpu < tp:
                 aiter.logger.warning(
-                    "QRInt4 needs %s GPUs, have %s; skipping tp=%s",
+                    "QuickAllReduceInt4 needs %s GPUs, have %s; skipping tp=%s",
                     tp,
                     n_gpu,
                     tp,
@@ -526,11 +528,15 @@ def main():
             if not isinstance(mnk, tuple) or len(mnk) < 2:
                 raise ValueError(f"-s expects tokens,hidden; got {mnk!r}")
             tokens, hidden = int(mnk[0]), int(mnk[1])
-            df.append(test_qr_int4(tokens, hidden, dtype, tp, grid_cap=args.grid_cap))
+            df.append(
+                test_quick_allreduce_int4(
+                    tokens, hidden, dtype, tp, grid_cap=args.grid_cap
+                )
+            )
         if df:
             table = pd.DataFrame(df)
             aiter.logger.info(
-                "flydsl QR INT4 summary (markdown):\n%s",
+                "flydsl quick allreduce INT4 summary (markdown):\n%s",
                 table.to_markdown(index=False),
             )
             if args.out:

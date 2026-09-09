@@ -7,8 +7,8 @@ INT4 nibble: [-8,+7], −1/8, 4 B/thread, 1152 B rank-tile. Scale is
 group-16 signed E4M3 in the 128 B region. Super-tile ST∈{1,8}; host
 uses ST=1 when ``num_tiles ≤`` the occupancy-clamped persistent grid.
 Payload HBM is bf16; in-kernel math is packed fp16. Each rank owns
-``ATOMS / world_size`` atoms of a tile (8 GPUs → 1, 4 → 2, 2 → 4); LDS
-stays ``ATOMS * 1152``.
+``atoms / world_size`` atoms of a tile (8 GPUs → 1, 4 → 2, 2 → 4); LDS
+stays ``atoms * 1152``.
 """
 
 import flydsl.compiler as flyc
@@ -20,38 +20,21 @@ from flydsl.expr.typing import Int32, Int64, Stream, T, as_ir_value
 
 from . import buffer_ops
 
-WORLD = 8  # Default value for world size
+WORLD = 8
 SUPPORTED_WORLDS = (2, 4, 8)
+SUPER_TILES = (1, 8)
+DEFAULT_GRID_CAP = 304 * 4
+
+# Shared by host tile math, LDS PackStorage, and the kernel factory.
 BLOCK = 256
 ATOMS = 8
-TILE_BYTES = BLOCK * ATOMS * 16
-TILE_I32 = TILE_BYTES // 4
-TILE_FP16 = TILE_BYTES // 2
-DEFAULT_GRID_CAP = 304 * 4
-PHASES = 2
-PHASE_REDUCE_SCATTER = 0
-PHASE_ALL_GATHER = 1
-RANK_TILE_BYTES = 1152
-RANK_TILE_I32 = RANK_TILE_BYTES // 4
-SUPER_TILES = (1, 8)
-# 1024 B INT4 (256 i32) then 128 B group-16 E4M3 (32 i32). Rank-tile 1152 B.
-SCALE_I32_OFF = 256
-# Two threads (PAIR) share one E4M3; GROUP threads share the i32 slot.
-GROUP = 8
-PAIR = 2
 WAVE = 64
-WAVES = 4
-# 4 lanes × 16 B = one 64 B NT sector. Not world_size.
-QUAD_LANES = 4
-QUADS_PER_WAVE = WAVE // QUAD_LANES
-N_SECTORS = RANK_TILE_BYTES // 64
-# dest × rank_atoms == ATOMS for every supported world size.
-PACK_I32 = ATOMS * RANK_TILE_I32
-LDS_BYTES = ATOMS * RANK_TILE_BYTES
-# Wire/inbox addresses are byte pointers; tile math is in i32 slots.
-I32_BYTES = 4
+GROUP = 8
+TILE_BYTES = BLOCK * ATOMS * 16
+RANK_TILE_BYTES = 1152
+PACK_I32 = ATOMS * (RANK_TILE_BYTES // 4)
 
-# Conservative measured residency for gfx942/gfx950.
+# (world_size, super_tile) → VGPR-limited workgroups per CU.
 _RESIDENT_WGS_PER_CU = {
     (2, 1): 3,
     (2, 8): 4,
@@ -73,24 +56,17 @@ def clamp_grid_cap(
     if requested < 1 or cu_count < 1:
         raise ValueError("grid_cap and cu_count must be positive")
     if arch not in ("gfx942", "gfx950"):
-        raise ValueError(f"qr_int4 has no residency measurement for {arch!r}")
+        raise ValueError(
+            f"quick_allreduce_int4 has no residency measurement for {arch!r}"
+        )
     try:
         resident = _RESIDENT_WGS_PER_CU[(int(world_size), int(super_tile))]
     except KeyError:
         raise ValueError(
-            f"qr_int4 has no residency measurement for {(world_size, super_tile)}"
+            "quick_allreduce_int4 has no residency measurement for "
+            f"{(world_size, super_tile)}"
         ) from None
     return min(int(requested), resident * int(cu_count))
-
-
-# gfx942 buffer aux: bit 1 = sc1 (bypass L2), bit 2 = NT.
-_CM_SC1 = 2
-_CM_NT = 4
-
-# Dequant bit-trick: nibble | 0x6400 then + (-1032.0) as f16x2 reconstructs (q-8).
-_K_MASK_000F = 0x000F000F
-_K_HALF2_1024 = 0x64006400
-_K_HALF2_1032 = 0xE408E408  # -1032.0 fp16x2
 
 
 def _f16x2(packed):
@@ -99,10 +75,6 @@ def _f16x2(packed):
 
 def _i32(vec):
     return vec.bitcast(fx.Int32)[0]
-
-
-def _minnumf(a, b):
-    return fx.Vector(fx.arith.minnumf(a, b), a.shape, a.dtype)
 
 
 def _splat_f16x2(x):
@@ -117,10 +89,13 @@ def _clamp_fp16_overflow():
     to the max finite fp16. INT4 is already a saturating codec, so a rare
     overflow should not poison the all-reduce.
 
-    There is no FlyDSL wrapper; ``s_setreg_imm32_b32 0xdc1, 1`` writes
-    ``hwreg(HW_REG_MODE, offset=23, size=2)``.
+    FlyDSL has no MODE helper; ``llvm.amdgcn.s.setreg`` is the same
+    intrinsic ``rocdl.disable_xdl_arb_stall`` uses for a different bit.
     """
-    llvm.InlineAsmOp(None, [], "s_setreg_imm32_b32 0xdc1, 1", "", has_side_effects=True)
+    # hwreg(HW_REG_MODE, offset=23, size=2): id | (off<<6) | ((size-1)<<11)
+    imm = fx.arith.unwrap(fx.arith.constant(0xDC1, type=T.i32))
+    val = fx.arith.unwrap(fx.arith.constant(1, type=T.i32))
+    llvm.call_intrinsic(None, "llvm.amdgcn.s.setreg", [imm, val], [], [])
 
 
 def _shuffle_f16x2(vec, xor_off):
@@ -136,9 +111,9 @@ def _pair_signed_ext_f16(atom):
         _f16x2(atom[3]),
     )
     wmax = fx.maxnumf(fx.maxnumf(p0, p1), fx.maxnumf(p2, p3))
-    wmin = _minnumf(_minnumf(p0, p1), _minnumf(p2, p3))
+    wmin = fx.min(fx.min(p0, p1), fx.min(p2, p3))
     wmax = fx.maxnumf(wmax, _shuffle_f16x2(wmax, 1))
-    wmin = _minnumf(wmin, _shuffle_f16x2(wmin, 1))
+    wmin = fx.min(wmin, _shuffle_f16x2(wmin, 1))
     pk = (abs(wmax) > abs(wmin)).select(wmax, wmin)
     lo, hi = pk[0], pk[1]
     return fx.Float32((abs(lo) > abs(hi)).select(lo, hi))
@@ -153,15 +128,16 @@ def _atom_f16_to_bf16(atom):
 
 
 def _f32_to_e4m3(x):
-    """Signed E4M3 of a f32: 1 sign + 4 exp (bias 7, e=0 still implicit 1) + 3 mant.
+    """Pack f32 to a signed E4M3 byte: 1 sign, 4-bit exp (bias 7), 3-bit mantissa.
 
-    Group-16 wire scale. Not IEEE OCP E4M3 denorms: e=0 still encodes
-    ``(1+m/8)*2^-7`` so typical INT4 extrema (~0.1) stay in range after
-    ×−1/8. Byte ``0x00`` is +0 only. Any other nonzero input that would
-    pack to ``0x00`` (underflow clamp or exact ``2**-7``) becomes ``0x01``.
-    Negative underflow stays ``0x80``. Overflow saturates to max finite
-    (``0x7F`` / ``0xFF``), including mantissa, so ``512`` does not decode
-    as ``256``.
+    Decode is ``±(1 + m/8) * 2**(e - 7)`` for every ``e``, including 0
+    (no OCP denorms). ``0x7F`` / ``0xFF`` are max finite, not NaN.
+
+    ``0x00`` is +0 only. Any other value that would land there (positive
+    underflow, or exactly ``2**-7``) is stored as ``0x01``. Negative
+    underflow keeps ``0x80`` (``-2**-7``). Overflow clamps both exponent
+    and mantissa; saturating the exponent alone would map ``512`` to
+    ``256``.
     """
     is_z = x == fx.Float32(0.0)
     sign = (x < fx.Float32(0.0)).select(fx.Int32(0x80), fx.Int32(0))
@@ -217,7 +193,7 @@ def _quant_atom_fp16(atom, enc_pk):
     hi = _splat_f16x2(fx.Float16(7.0))
     bias = fx.Vector.filled(2, fx.Int16(8), fx.Int16)
     for i in range_constexpr(4):
-        w = _minnumf(fx.maxnumf(_f16x2(atom[i]) * enc_pk, lo), hi)
+        w = fx.min(fx.maxnumf(_f16x2(atom[i]) * enc_pk, lo), hi)
         q.append(_i32(fx.roundeven(w).to(fx.Int16) + bias))
     return q[0] | (q[1] << fx.Int32(4)) | (q[2] << fx.Int32(8)) | (q[3] << fx.Int32(12))
 
@@ -240,9 +216,10 @@ def _codec_dequant(packed, scale, acc=None):
     Two fp16 lanes are independent channels, not a dot into f32.
     """
     out = []
-    mask = fx.Int32(_K_MASK_000F)
-    bias_hi = fx.Int32(_K_HALF2_1024)
-    bias_lo = _f16x2(fx.Int32(_K_HALF2_1032))
+    # nibble | 0x6400 then + (-1032.0) f16x2 reconstructs (q-8).
+    mask = fx.Int32(0x000F000F)
+    bias_hi = fx.Int32(0x64006400)
+    bias_lo = _f16x2(fx.Int32(0xE408E408))
     for i in range_constexpr(4):
         q4 = (packed.shrui(fx.Int32(i * 4)) & mask) | bias_hi
         dq = _f16x2(q4) + bias_lo
@@ -254,25 +231,7 @@ def _codec_dequant(packed, scale, acc=None):
 
 
 def _i32_to_bytes(i32_off):
-    return fx.Int64(i32_off) * fx.Int64(I32_BYTES)
-
-
-def _to_sgpr_i64(addr):
-    """Copy a wave-uniform i64 from vector to scalar registers.
-
-    Buffer loads/stores need the descriptor in scalar registers. After
-    ``peers[rank]``, every lane holds the same pointer, but it sits in a
-    vector register, so LLVM cannot prove that. It then serializes the
-    wave: one lane at a time, copy that lane's pointer to a scalar
-    register, mask to that lane, issue the load, repeat. ``readfirstlane``
-    copies lane 0's value into a scalar register once so the whole wave
-    issues a single buffer op.
-
-    Do this at the inbox descriptor, not on the peer list: fanout stores
-    use a different peer per lane, so those addresses must stay in vector
-    registers. ``T.i64`` is the result type ``readfirstlane`` requires.
-    """
-    return fx.Int64(rocdl.readfirstlane(T.i64, as_ir_value(addr)))
+    return fx.Int64(i32_off) * fx.Int64(4)
 
 
 def _store_v4i32_nt_global(addr_i64, data):
@@ -282,37 +241,32 @@ def _store_v4i32_nt_global(addr_i64, data):
     4-wide group. A buffer-descriptor store wants the descriptor in scalar
     registers, so LLVM would serialize those lanes (one destination at a
     time). A flat global store takes the address from a vector register,
-    so all destinations issue together. ``nt`` skips L2; this is payload,
-    not a flag.
+    so all destinations issue together. ``nontemporal`` skips L2; this is
+    payload, not a flag. ``fx.ptr_store`` has no NT flag.
     """
     ptr_ty = ir.Type.parse("!llvm.ptr<1>")
     ptr = llvm.IntToPtrOp(ptr_ty, as_ir_value(addr_i64)).result
-    llvm.InlineAsmOp(
-        None,
-        [ptr, as_ir_value(data)],
-        "global_store_dwordx4 $0, $1, off nt",
-        "v,v",
-        has_side_effects=True,
-    )
+    llvm.StoreOp(as_ir_value(data), ptr, alignment=16, nontemporal=True)
 
 
 def _load_i32_nt(rsrc, elem_off):
     return fx.Int32(
         buffer_ops.buffer_load(
-            rsrc, elem_off, vec_width=1, dtype=T.i32, cache_modifier=_CM_NT
+            rsrc, elem_off, vec_width=1, dtype=T.i32, cache_modifier=4  # NT
         )
     )
 
 
 def _load_i32_uncached(rsrc):
     val = buffer_ops.buffer_load(
-        rsrc, 0, vec_width=1, dtype=T.i32, cache_modifier=_CM_SC1
+        rsrc, 0, vec_width=1, dtype=T.i32, cache_modifier=2  # sc1, bypass L2
     )
     rocdl.s_waitcnt(vmcnt=0)
     return fx.Int32(val)
 
 
 def _invalidate_l1():
+    # gfx942/gfx950 cannot select llvm.amdgcn.buffer.wbinvl1.sc.
     llvm.InlineAsmOp(None, [], "buffer_inv sc1", "", has_side_effects=True)
 
 
@@ -321,7 +275,9 @@ class PackStorage:
     pack: fx.Array[fx.Int32, PACK_I32, 16]
 
 
-def make_qr_int4_kernel(*, world_size: int = WORLD, super_tile: int = 1, grid: int):
+def make_quick_allreduce_int4_kernel(
+    *, world_size: int = WORLD, super_tile: int = 1, grid: int
+):
     if world_size not in SUPPORTED_WORLDS:
         raise ValueError(
             f"world_size must be one of {SUPPORTED_WORLDS}, got {world_size}"
@@ -332,6 +288,19 @@ def make_qr_int4_kernel(*, world_size: int = WORLD, super_tile: int = 1, grid: i
         raise ValueError(f"super_tile must be one of {SUPER_TILES}, got {super_tile!r}")
     if grid < 1:
         raise ValueError(f"grid must be positive, got {grid}")
+    PHASES = 2
+    PHASE_REDUCE_SCATTER = 0
+    PHASE_ALL_GATHER = 1
+    RANK_TILE_I32 = RANK_TILE_BYTES // 4
+    SCALE_I32_OFF = 256
+    PAIR = 2
+    WAVES = BLOCK // WAVE
+    QUAD_LANES = 4
+    QUADS_PER_WAVE = WAVE // QUAD_LANES
+    N_SECTORS = RANK_TILE_BYTES // 64
+    TILE_I32 = TILE_BYTES // 4
+    TILE_FP16 = TILE_BYTES // 2
+    LDS_BYTES = ATOMS * RANK_TILE_BYTES
     # Each rank owns this many 16-byte atoms of a 32 KiB tile
     # (8 GPUs → 1, 4 → 2, 2 → 4). LDS still holds all ATOMS atoms.
     rank_atoms = ATOMS // world_size
@@ -344,7 +313,7 @@ def make_qr_int4_kernel(*, world_size: int = WORLD, super_tile: int = 1, grid: i
     flags_i32 = PHASES * grid * world_size
 
     @flyc.kernel(known_block_size=[BLOCK, 1, 1])
-    def qr_int4(
+    def quick_allreduce_int4(
         rank: Int32,
         nbytes: Int64,
         num_tiles: Int32,
@@ -367,7 +336,7 @@ def make_qr_int4_kernel(*, world_size: int = WORLD, super_tile: int = 1, grid: i
         # 64 B NT sectors of one 1152 B rank-tile: (sector, lane-in-quad)
         # -> i32 start of the dwordx4. Isolated NT store stays explicit.
         nt_own_layout = fx.make_layout((N_SECTORS, QUAD_LANES), (16, 4))
-        # Remote NT fanout stays explicit global_store_dwordx4 nt.
+        # Remote NT fanout stays a vector-addressed nontemporal store.
         hbm_layout = fx.make_layout(
             (num_tiles, ATOMS, BLOCK * 4),
             (TILE_I32, BLOCK * 4, 1),
@@ -416,7 +385,7 @@ def make_qr_int4_kernel(*, world_size: int = WORLD, super_tile: int = 1, grid: i
         ]
         peer_vec = fx.Vector.from_elements(peers, dtype=fx.Int64)
         self_rsrc = buffer_ops.create_buffer_resource_from_addr(
-            _to_sgpr_i64(peer_vec[rank])
+            fx.Int64(rocdl.readfirstlane(T.i64, as_ir_value(peer_vec[rank])))
         )
         # inp/out are a 3-D i32 tensor consumed by TiledCopy (BufferCopy128b).
         # That API needs a FlyDSL buffer-backed tensor (layout + descriptor),
@@ -715,7 +684,7 @@ def make_qr_int4_kernel(*, world_size: int = WORLD, super_tile: int = 1, grid: i
     flat_wg = f"{BLOCK},{BLOCK}"
 
     @flyc.jit
-    def launch_qr_int4(
+    def launch_quick_allreduce_int4(
         rank: Int32,
         nbytes: Int64,
         num_tiles: Int32,
@@ -726,7 +695,7 @@ def make_qr_int4_kernel(*, world_size: int = WORLD, super_tile: int = 1, grid: i
         grid_x: Int32,
         stream: Stream = Stream(None),  # noqa: B008
     ):
-        qr_int4(
+        quick_allreduce_int4(
             rank,
             nbytes,
             num_tiles,
@@ -741,9 +710,11 @@ def make_qr_int4_kernel(*, world_size: int = WORLD, super_tile: int = 1, grid: i
             stream=stream,
         )
 
-    launch_qr_int4.func.__name__ = f"launch_qr_int4_ws{world_size}_st{super_tile}"
+    launch_quick_allreduce_int4.func.__name__ = (
+        f"launch_quick_allreduce_int4_ws{world_size}_st{super_tile}"
+    )
     return {
-        "launch": launch_qr_int4,
+        "launch": launch_quick_allreduce_int4,
         "flags_bytes": flags_i32 * 4,
         "data_bytes": PHASES * grid * world_size * wire_tile_bytes,
         "lds_bytes": LDS_BYTES,
