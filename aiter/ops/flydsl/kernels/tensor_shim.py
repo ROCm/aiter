@@ -2,6 +2,7 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 import os
+import threading
 from abc import ABC, abstractmethod
 from itertools import product
 
@@ -14,8 +15,7 @@ from flydsl._mlir.dialects import fly, llvm
 from flydsl.compiler.protocol import extract_to_ir_values
 from flydsl.expr import ptrtoint, range_constexpr
 from flydsl.expr.typing import T
-
-from aiter.ops.flydsl.kernels import buffer_ops, vector
+from flydsl.expr.typing import Vector as Vec
 
 # Global toggle for the amdgpu-kernarg-preload compile hint used by the flydsl
 # kernels. Enabled by default; set AITER_FLYDSL_KERNARG_PRELOAD=0 to disable it
@@ -35,10 +35,197 @@ AITER_FLYDSL_MOE_EXPERT_SCHEDULING_MODE = bool(
     int(os.environ.get("AITER_FLYDSL_MOE_EXPERT_SCHEDULING_MODE", "0"))
 )
 
+_PRELOAD_COMPILE_LOCK = threading.RLock()
+
+
+_BUF_COPY_ATOM = {
+    16: fx.rocdl.BufferCopy128b,
+    8: fx.rocdl.BufferCopy64b,
+    4: fx.rocdl.BufferCopy32b,
+    2: fx.rocdl.BufferCopy16b,
+    1: fx.rocdl.BufferCopy8b,
+}
+
+# Nominal extent of a raw-pointer buffer view. The real bound is the V#
+# num_records field, which make_buffer_tensor(max_size=True) pins to 0xFFFFFFFF
+# bytes, so this only has to be large enough not to constrain any caller's
+# indices.
+BUF_VIEW_MAX_ELEMS = 0xFFFFFFFF
+
 
 def ptr_rsrc(ptr):
-    """Convert an fx.Pointer kernel arg to a buffer resource for buffer_load/store."""
+    """Convert an fx.Pointer kernel arg to a buffer resource for buffer_load/store.
+
+    Kept for kernels still on the raw `buffer_ops` path; migrated kernels should
+    use `ptr_buf_tensor` instead.
+    """
+    from aiter.ops.flydsl.kernels import buffer_ops
+
     return buffer_ops.create_buffer_resource_from_addr(fx.Int64(ptrtoint(ptr)))
+
+
+def buf_base_i64(base):
+    """i64 base address of *base*: an fx pointer, a tensor/memref, or an address.
+
+    Lets a caller narrow a descriptor to one row (``ptr + row * row_bytes``)
+    without first materialising a pointer for it.
+    """
+    raw = extract_to_ir_values(base)[0]
+    if str(raw.type).startswith(("!fly.ptr", "!llvm.ptr")):
+        return fx.Int64(ptrtoint(base))
+    if isinstance(raw.type, (ir.IntegerType, ir.IndexType)):
+        return fx.Int64(base)
+    # tensor / memref kernel arg: take its aligned base pointer.
+    aligned = fly.extract_aligned_pointer_as_index(ir.Type.parse("!llvm.ptr<1>"), raw)
+    return fx.Int64(llvm.PtrToIntOp(T.i64, aligned).result)
+
+
+def ptr_buf_tensor(
+    ptr,
+    elem=fx.Int32,
+    n=BUF_VIEW_MAX_ELEMS,
+    unit_elems=1,
+    num_records_bytes=None,
+    unit_stride=None,
+):
+    """Buffer-resource (V#) view of *ptr*, so ``t[i]`` / ``fx.slice`` index it.
+
+    *ptr* is an fx.Pointer kernel arg or a raw i64 address (see
+    :func:`buf_base_i64`).
+
+    Keeps the addressing `buffer_ops` used: descriptor in SGPRs, 32-bit voffset
+    per access. Indexing a plain typed pointer instead builds a full 64-bit
+    address in VGPRs on every access.
+
+    ``unit_elems`` sets the access width and hence the rank:
+      1  -> flat ``(n,)``; ``t[i]`` is one element. No atom, no fragment.
+      >1 -> ``(n, unit_elems)``; ``fx.slice(t, (u, None))`` is one wide access
+            and ``fx.copy`` over it emits a single ``buffer_load_dwordx{2,4}``.
+            A vector *element type* would be the obvious spelling for this but
+            MLIR rejects it (``AlignAttr`` takes integer/float only), so the
+            width lives in the layout.
+
+    ``unit_stride`` is the element distance between consecutive units and
+    defaults to ``unit_elems`` (units tile the buffer, so ``u`` counts whole
+    units). Pass 1 for a wide access at an arbitrary *element* offset: units
+    then overlap -- meaningless to iterate but exact for the one slice a caller
+    takes, and the only way to express e.g. a dwordx4 store at a row base that
+    is only dword-aligned. It also sets the pointer alignment, which is all such
+    an access can rely on.
+
+    ``num_records_bytes`` may be a runtime value, for a hardware OOB check that
+    zero-fills rather than reading stale bytes.
+    """
+    unit_stride = unit_elems if unit_stride is None else unit_stride
+    layout = (
+        fx.make_layout((n,), (1,))
+        if unit_elems == 1
+        else fx.make_layout((n, unit_elems), (unit_stride, 1))
+    )
+    pt = fx.PointerType.get(
+        elem.ir_type,
+        address_space=fx.AddressSpace.Global,
+        alignment=unit_stride * (elem.width // 8),
+    )
+    view = fx.make_view(fx.inttoptr(pt, buf_base_i64(ptr)), layout)
+    return fx.rocdl.make_buffer_tensor(view, num_records_bytes=num_records_bytes)
+
+
+def buf_copy_atom(unit_bytes, elem=fx.Int32, cache_modifier=0):
+    """Copy atom for a ``unit_bytes``-wide buffer access (0=cached, 2=nt)."""
+    return fx.make_copy_atom(_BUF_COPY_ATOM[unit_bytes](cache_modifier), elem)
+
+
+def buf_scalar_load(t, index, cache_modifier=0):
+    """``t[index]`` as an ``s_buffer_load``: one dword landing in an SGPR.
+
+    *index* must be wave-uniform; nothing here checks that. Use it where the
+    result has to stay scalar -- e.g. a row that then narrows a per-row buffer
+    descriptor, which otherwise goes through a readfirstlane waterfall.
+
+    The layout API has no scalar spelling: ``t[i]`` and every ``BufferCopy*``
+    atom lower to ``rocdl.raw.ptr.buffer.load`` (VGPR), and ROCDL exposes no
+    ``s.buffer.load`` op to wrap. Hence the raw intrinsic, whose resource
+    operand is a v4i32 rather than the opaque buffer descriptor pointer.
+    """
+    rsrc = _to_raw(fx.rocdl.get_buffer_rsrc(fx.get_iter(t)))
+    rsrc_v4 = llvm.bitcast(
+        ir.VectorType.get([4], T.i32),
+        llvm.ptrtoint(ir.IntegerType.get_signless(128), rsrc),
+    )
+    return llvm.call_intrinsic(
+        T.i32,
+        "llvm.amdgcn.s.buffer.load.i32",
+        # The intrinsic offset is in bytes; `index` counts dwords.
+        [rsrc_v4, _to_raw(fx.Int32(index) * 4), _to_raw(fx.Int32(cache_modifier))],
+        [],
+        [],
+    )
+
+
+# GTensor takes MLIR scalar types (``T.f32``); the buffer views take fx classes.
+_FX_ELEM = {
+    "i8": fx.Int8,
+    "i16": fx.Int16,
+    "i32": fx.Int32,
+    "i64": fx.Int64,
+    "f16": fx.Float16,
+    "bf16": fx.BFloat16,
+    "f32": fx.Float32,
+}
+
+
+def _fx_elem(dtype):
+    """fx element class for an MLIR scalar type."""
+    key = str(dtype() if callable(dtype) else dtype)
+    try:
+        return _FX_ELEM[key]
+    except KeyError:
+        raise TypeError(f"no fx element class for MLIR type {key!r}") from None
+
+
+def _fx_value_elem(value):
+    """(fx element class, element count) of a scalar or vector SSA value."""
+    ty = extract_to_ir_values(value)[0].type
+    # Duck-typed vector check, as buffer_store did: this MLIR binding has no
+    # ir.VectorType.isinstance.
+    if hasattr(ty, "element_type"):
+        return _fx_elem(ty.element_type), ty.shape[0]
+    return _fx_elem(ty), 1
+
+
+def _buf_copy_slice(buffer, index, unit_elems):
+    if unit_elems == 1:
+        grouped = fx.logical_divide(buffer, fx.make_layout(1, 1))
+        return fx.slice(grouped, (None, index))
+    return fx.slice(buffer, (index, None))
+
+
+def buf_copy_load(buffer, index, elem=fx.Int32, unit_elems=1, cache_modifier=0):
+    """Load one vector unit, preserving an explicit buffer cache policy."""
+    fragment = fx.make_rmem_tensor(unit_elems, elem)
+    fx.copy(
+        buf_copy_atom(
+            unit_elems * (elem.width // 8), elem, cache_modifier=cache_modifier
+        ),
+        _buf_copy_slice(buffer, index, unit_elems),
+        fragment,
+    )
+    value = Vec(fragment.load())
+    return value[0] if unit_elems == 1 else value
+
+
+def buf_copy_store(buffer, index, value, elem=fx.Int32, unit_elems=1, cache_modifier=0):
+    """Store one vector unit, preserving an explicit buffer cache policy."""
+    fragment = fx.make_rmem_tensor(unit_elems, elem)
+    fragment.store(Vec.from_elements([value], elem) if unit_elems == 1 else Vec(value))
+    fx.copy(
+        buf_copy_atom(
+            unit_elems * (elem.width // 8), elem, cache_modifier=cache_modifier
+        ),
+        fragment,
+        _buf_copy_slice(buffer, index, unit_elems),
+    )
 
 
 def ptr_arg(t: torch.Tensor, dtype=None):
@@ -71,6 +258,31 @@ def _run_compiled(exe, *args):
         except Exception:  # noqa: BLE001, S110
             pass
         raise
+
+
+def _preload_compiled(exe, *args):
+    """Materialize a JIT artifact without dispatching its GPU kernels.
+
+    Newer FlyDSL versions expose ``JitFunction.preload()`` for this operation.
+    Older supported versions provide the same no-dispatch behavior through the
+    public ``COMPILE_ONLY`` mode.  Calling ``flyc.compile()`` without either
+    guard executes the launcher and is unsafe for preload callers that pass
+    placeholder pointers.
+    """
+    preload = getattr(exe, "preload", None)
+    if callable(preload):
+        return preload(*args)
+
+    with _PRELOAD_COMPILE_LOCK:
+        old_compile_only = os.environ.get("COMPILE_ONLY")
+        os.environ["COMPILE_ONLY"] = "1"
+        try:
+            return flyc.compile(exe, *args)
+        finally:
+            if old_compile_only is None:
+                os.environ.pop("COMPILE_ONLY", None)
+            else:
+                os.environ["COMPILE_ONLY"] = old_compile_only
 
 
 def _to_raw(v):
@@ -151,9 +363,6 @@ class TensorView:
         else:
             return (d_offset,)
 
-    def _lazy_init(self):
-        pass
-
     def __repr__(self):
         return f"TensorView(offset={self.base_offset}, shape={self.shape}, stride={self.stride}, dtype={self.dtype})"
 
@@ -217,7 +426,6 @@ class TensorView:
         )
 
     def copy_(self, src_tensor, thread_layout, value_layout, thread_idxs, vec_size):
-        src_tensor._lazy_init()
         ndim = len(thread_layout)
         src_offset = src_tensor.base_offset
         dst_offset = self.base_offset
@@ -246,13 +454,15 @@ class TensorView:
             self.store_impl(dst_vec_offset, value, vec_size=vec_size)
 
 
-class TensorBase(ABC):
+class TensorBase(TensorView, ABC):
+    """A ``TensorView`` whose element access a subclass supplies.
+
+    ``load``/``store`` are bound as the view's impls at construction, so every
+    indexing method is inherited rather than forwarded.
+    """
+
     def __init__(self, dtype, shape, stride=None, base_offset=0):
-        self.tensor_view = None
-        self.dtype = dtype
-        self.shape = shape
-        self.stride = stride
-        self.base_offset = base_offset
+        super().__init__(dtype, shape, stride, base_offset, self.load, self.store)
 
     @abstractmethod
     def load(self, offset):
@@ -261,54 +471,6 @@ class TensorBase(ABC):
     @abstractmethod
     def store(self, offset, value):
         pass
-
-    def _lazy_init(self):
-        if self.tensor_view is None:
-            self.tensor_view = TensorView(
-                self.dtype,
-                self.shape,
-                self.stride,
-                self.base_offset,
-                self.load,
-                self.store,
-            )
-            self.stride = self.tensor_view.stride
-            self.load_impl = self.tensor_view.load_impl
-            self.store_impl = self.tensor_view.store_impl
-
-    def __repr__(self):
-        self._lazy_init()
-        return self.tensor_view.__repr__()
-
-    def __getitem__(self, idxs):
-        self._lazy_init()
-        return self.tensor_view[idxs]
-
-    def __setitem__(self, idxs, value):
-        self._lazy_init()
-        self.tensor_view[idxs] = value
-
-    def vec_load(self, idxs, vec_size):
-        self._lazy_init()
-        return self.tensor_view.vec_load(idxs, vec_size)
-
-    def vec_store(self, idxs, value, vec_size):
-        self._lazy_init()
-        self.tensor_view.vec_store(idxs, value, vec_size)
-
-    def linear_offset(self, idxs):
-        self._lazy_init()
-        return self.tensor_view.linear_offset(idxs)
-
-    def local_tile(self, tile_shape, tile_idxs):
-        self._lazy_init()
-        return self.tensor_view.local_tile(tile_shape, tile_idxs)
-
-    def copy_(self, src_tensor, thread_layout, value_layout, thread_idxs, vec_size):
-        self._lazy_init()
-        self.tensor_view.copy_(
-            src_tensor, thread_layout, value_layout, thread_idxs, vec_size
-        )
 
 
 class TorchTensor(TensorBase):
@@ -335,62 +497,63 @@ class GTensor(TensorBase):
         static_bytes_offset_i64=None,
     ):
         super().__init__(dtype, shape, stride, base_offset)
-        raw = extract_to_ir_values(memref)[0]
-        if static_bytes_offset_i64 is None:
-            if str(raw.type).startswith("!fly.ptr"):
-                base_i64 = fx.Int64(ptrtoint(memref))
-                self.rsrc = buffer_ops.create_buffer_resource_from_addr(base_i64)
-            else:
-                self.rsrc = buffer_ops.create_buffer_resource(memref, max_size=True)
-        else:
-            array_base_i64 = self.get_llvm_ptr(memref, (static_bytes_offset_i64))
-            self.rsrc = buffer_ops.create_buffer_resource_from_addr(array_base_i64)
+        base = self.base_addr_i64(memref)
+        if static_bytes_offset_i64 is not None:
+            base = base + fx.Int64(static_bytes_offset_i64)
+        self.base_i64 = base
         self.cache_modifier = cache_modifier
 
+    def _view(self, elem, unit_elems):
+        """Buffer view whose unit is one access.
+
+        ``unit_stride=1`` because both offsets here are in *elements* while an
+        access may be several elements wide (a vec4 load at offset N reads
+        elements N..N+3), so units overlap and only element alignment holds.
+        Built per access rather than cached: a cached view would be pinned to
+        the block that first used it and not dominate later sibling blocks.
+        """
+        return ptr_buf_tensor(self.base_i64, elem, unit_elems=unit_elems, unit_stride=1)
+
     def load(self, offset, vec_size=1):
-        return buffer_ops.buffer_load(
-            self.rsrc, offset, vec_width=vec_size, dtype=self.dtype
-        )
+        elem = _fx_elem(self.dtype)
+        t = self._view(elem, vec_size)
+        if vec_size == 1:
+            return t[offset]
+        frag = fx.make_fragment_like(fx.slice(t, (0, None)))
+        atom = buf_copy_atom(vec_size * (elem.width // 8), elem)
+        fx.copy(atom, fx.slice(t, (offset, None)), frag)
+        return fx.memref_load_vec(frag)
 
     def store(self, offset, value, vec_size=1):
-        buffer_ops.buffer_store(
-            value, self.rsrc, offset, cache_modifier=self.cache_modifier
+        # Width comes from the value, not from self.dtype or vec_size: the
+        # offset is scaled by the *stored* element, so a dword-typed store into
+        # a bf16 view addresses dwords. Matches the buffer_store this replaces.
+        elem, n = _fx_value_elem(value)
+        t = self._view(elem, n)
+        if n == 1:
+            t[offset] = value
+            return
+        frag = fx.make_fragment_like(fx.slice(t, (0, None)))
+        fx.memref_store_vec(value, frag)
+        atom = buf_copy_atom(n * (elem.width // 8), elem, self.cache_modifier)
+        fx.copy(atom, frag, fx.slice(t, (offset, None)))
+
+    @property
+    def rsrc(self):
+        """The raw V#, for callers still issuing `buffer_ops` byte-offset ops."""
+        return fx.rocdl.get_buffer_rsrc(
+            fx.get_iter(self._view(_fx_elem(self.dtype), 1))
         )
+
+    @staticmethod
+    def base_addr_i64(ptr, ptr_type="!llvm.ptr<1>"):
+        """i64 base address of an fx pointer or a fly/memref value."""
+        return buf_base_i64(ptr)
 
     def get_llvm_ptr(self, ptr, bytes_offset_i64, ptr_type="!llvm.ptr<1>"):
         # fx.Int64 coerces index / i32 / i64 byte offsets to i64.
-        bytes_offset_i64 = _to_raw(fx.Int64(bytes_offset_i64))
-        _ptr_type = ir.Type.parse(ptr_type)
-        raw = extract_to_ir_values(ptr)[0]
-        if str(raw.type).startswith("!fly.ptr"):
-            base_ptr = _to_raw(fx.Int64(ptrtoint(ptr)))
-        else:
-            base_ptr = fly.extract_aligned_pointer_as_index(_ptr_type, raw)
-            base_ptr = llvm.PtrToIntOp(T.i64, base_ptr).result
-        llvm_ptr = llvm.AddOp(
-            base_ptr, bytes_offset_i64, llvm.IntegerOverflowFlags(0)
+        return llvm.AddOp(
+            _to_raw(self.base_addr_i64(ptr, ptr_type)),
+            _to_raw(fx.Int64(bytes_offset_i64)),
+            llvm.IntegerOverflowFlags(0),
         ).result
-        return llvm_ptr
-
-
-class STensor(TensorBase):
-    def __init__(self, memptr, dtype, shape, stride=None, base_offset=0):
-        super().__init__(dtype, shape, stride, base_offset)
-        self.memptr = memptr.get()
-
-    def load(self, offset, vec_size=1):
-        vec_t = T.vec(vec_size, self.dtype)
-        x = vector.load_op(vec_t, self.memptr, [offset])
-        if vec_size > 1:
-            return x
-        else:
-            x = vector.extract(x, static_position=[0], dynamic_position=[])
-            return x
-
-    def store(self, offset, value, vec_size=1):
-        if vec_size > 1:
-            vector.store(value, self.memptr, [offset], alignment=16)
-        else:
-            vec_t = T.vec(1, self.dtype)
-            vec = vector.from_elements(vec_t, [value])
-            vector.store(vec, self.memptr, [offset], alignment=16)
