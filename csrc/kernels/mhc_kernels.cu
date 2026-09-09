@@ -2807,7 +2807,14 @@ namespace aiter {
         
         static constexpr int fn_load_vec = 16 / sizeof(float);
         static constexpr int fn_load_waitcnt = tile_n * tile_k / (warp_size * fn_load_vec);
-        using fp32xfntile = opus::array<fp32xtile, repeat_n>;
+        // Decode fills each weight ring slot before its first use. Avoid
+        // opus::array's default zeroing of the not-yet-loaded second slot.
+        struct uninitialized_fn_tile {
+            fp32xtile data[repeat_n];
+            OPUS_D fp32xtile& operator[](int n) { return data[n]; }
+        };
+        using fp32xfntile = std::conditional_t<decode_pipeline, uninitialized_fn_tile,
+                                              opus::array<fp32xtile, repeat_n>>;
         auto vgpr_load_fn_tile = [&](int k) {
             fp32xfntile v_fn;
             const int offset_base = lane_id % mfma_n * fn_stride + warp_id * hidden_size
@@ -2953,12 +2960,56 @@ namespace aiter {
                         }
                     }
                     if constexpr (!batch_lds) s_wait_all_dscnt(opus::number<hc_mult>{});
-                    for(int k = 0; k < ds_read_vec; k++) {
-                        res[k] = static_cast<float>(x_vec[k]) * post_mix_v[b];
-                    }
-                    for(int h = 0; h < hc_mult; h++) {
+#if defined(__gfx1250__)
+                    if constexpr (decode_pipeline) {
+                        // OPSEL_HI broadcasts the coefficient's low DWORD to
+                        // both FP32 results without a duplicated coefficient VGPR.
+                        auto broadcast_operand = [](float value) {
+                            return __builtin_shufflevector(opus::fp32x2_t{value, 0.0f},
+                                                          opus::fp32x2_t{}, 0, -1);
+                        };
+                        for (int k = 0; k < ds_read_vec; k += 2) {
+                            opus::fp32x2_t a{static_cast<float>(residual_vec[0][k]),
+                                             static_cast<float>(residual_vec[0][k + 1])};
+                            opus::fp32x2_t c;
+                            asm("v_pk_mul_f32 %0, %1, %2 op_sel_hi:[0,1]"
+                                : "=v"(c) : "v"(broadcast_operand(comb_mix[b][0])), "v"(a));
+                            res[k] = c[0];
+                            res[k + 1] = c[1];
+                        }
+                        // Match the existing compiler contraction: round
+                        // residual[0]*comb[0], then FMA x*post into that value.
+                        // Reversing these terms changes the FP32 sqrsum.
+                        for (int k = 0; k < ds_read_vec; k += 2) {
+                            opus::fp32x2_t v{static_cast<float>(x_vec[k]),
+                                             static_cast<float>(x_vec[k + 1])};
+                            opus::fp32x2_t c{res[k], res[k + 1]};
+                            asm("v_pk_fma_f32 %0, %1, %2, %3 op_sel_hi:[0,1,1]"
+                                : "=v"(c) : "v"(broadcast_operand(post_mix_v[b])), "v"(v), "v"(c));
+                            res[k] = c[0];
+                            res[k + 1] = c[1];
+                        }
+                        for (int h = 1; h < hc_mult; ++h) {
+                            for (int k = 0; k < ds_read_vec; k += 2) {
+                                opus::fp32x2_t v{static_cast<float>(residual_vec[h][k]),
+                                                 static_cast<float>(residual_vec[h][k + 1])};
+                                opus::fp32x2_t c{res[k], res[k + 1]};
+                                asm("v_pk_fma_f32 %0, %1, %2, %3 op_sel_hi:[0,1,1]"
+                                    : "=v"(c) : "v"(broadcast_operand(comb_mix[b][h])), "v"(v), "v"(c));
+                                res[k] = c[0];
+                                res[k + 1] = c[1];
+                            }
+                        }
+                    } else
+#endif
+                    {
                         for(int k = 0; k < ds_read_vec; k++) {
-                            res[k] += static_cast<float>(residual_vec[h][k]) * comb_mix[b][h];
+                            res[k] = static_cast<float>(x_vec[k]) * post_mix_v[b];
+                        }
+                        for(int h = 0; h < hc_mult; h++) {
+                            for(int k = 0; k < ds_read_vec; k++) {
+                                res[k] += static_cast<float>(residual_vec[h][k]) * comb_mix[b][h];
+                            }
                         }
                     }
                     if(n_idx == 0) {
