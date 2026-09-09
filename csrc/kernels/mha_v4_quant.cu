@@ -540,7 +540,7 @@ __device__ __forceinline__ int32_t mxfp4_v_token(const int32_t column)
            ((column & 0x08) << 1);
 }
 
-template <typename DTYPE_I>
+template <typename DTYPE_I, bool FP6_P>
 __global__ __launch_bounds__(64) void quantize_v_mxfp4_kernel(
     uint8_t* __restrict__ out,
     uint8_t* __restrict__ scale,
@@ -576,8 +576,12 @@ __global__ __launch_bounds__(64) void quantize_v_mxfp4_kernel(
         const int32_t column_in_block = token_slice * 8 + i;
         const int32_t column = token_block * 32 + column_in_block;
         int32_t token_in_half = mxfp4_v_token(column);
-        token_in_half = (token_in_half & ~0x24) | ((token_in_half & 0x04) << 3) |
-                        ((token_in_half & 0x20) >> 3);
+        // An FP6 P operand consumes each 64-token half in a further-paired order.
+        if constexpr(FP6_P)
+        {
+            token_in_half = (token_in_half & ~0x24) | ((token_in_half & 0x04) << 3) |
+                            ((token_in_half & 0x20) >> 3);
+        }
         int32_t token = tile * 128 + token_half * 64 + token_in_half;
         const bool valid = token < sequence;
         token = valid ? token : sequence - 1;
@@ -1002,9 +1006,10 @@ void rotate_activation_mxfp4_quant_k(aiter_tensor_t& out,
     });
 }
 
-void quantize_v_mxfp4_fp6_p(aiter_tensor_t& out,
-                            aiter_tensor_t& scale,
-                            const aiter_tensor_t& input)
+template <bool FP6_P>
+void quantize_v_mxfp4_impl(aiter_tensor_t& out,
+                           aiter_tensor_t& scale,
+                           const aiter_tensor_t& input)
 {
     AITER_CHECK(get_gpu_arch() == "gfx950", "MXFP4 V quantization requires gfx950");
     AITER_CHECK(input.is_gpu(), "input must be on a GPU");
@@ -1033,9 +1038,9 @@ void quantize_v_mxfp4_fp6_p(aiter_tensor_t& out,
 
     HipDeviceGuard device_guard(input.device_id);
     const hipStream_t stream = aiter::getCurrentHIPStream();
-    AITER_DISPATCH_FLOATING16_TYPES_rmTorch(input.dtype(), "quantize_v_mxfp4_fp6_p", [&] {
+    AITER_DISPATCH_FLOATING16_TYPES_rmTorch(input.dtype(), "quantize_v_mxfp4", [&] {
         using DTYPE_I = typename aiter::hip2opus<scalar_t>::type;
-        quantize_v_mxfp4_kernel<DTYPE_I><<<dim3(blocks), dim3(64), 0, stream>>>(
+        quantize_v_mxfp4_kernel<DTYPE_I, FP6_P><<<dim3(blocks), dim3(64), 0, stream>>>(
             reinterpret_cast<uint8_t*>(out.data_ptr()),
             reinterpret_cast<uint8_t*>(scale.data_ptr()),
             reinterpret_cast<DTYPE_I const*>(input.data_ptr()),
@@ -1043,6 +1048,18 @@ void quantize_v_mxfp4_fp6_p(aiter_tensor_t& out,
             heads,
             tiles);
     });
+}
+
+void quantize_v_mxfp4_fp6_p(aiter_tensor_t& out,
+                            aiter_tensor_t& scale,
+                            const aiter_tensor_t& input)
+{
+    quantize_v_mxfp4_impl<true>(out, scale, input);
+}
+
+void quantize_v_mxfp4(aiter_tensor_t& out, aiter_tensor_t& scale, const aiter_tensor_t& input)
+{
+    quantize_v_mxfp4_impl<false>(out, scale, input);
 }
 
 } // namespace torch_itfs

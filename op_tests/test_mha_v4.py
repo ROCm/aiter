@@ -37,6 +37,8 @@ from aiter.ops.mha_v4_quant import (
     MHA_V4_KV_TILE_ROWS,
     MHA_V4_LOG2E,
     MHA_V4_MXFP4_K_SCALE_SLACK_BYTES,
+    MHA_V4_MXFP4_V_SCALE_SLACK_BYTES,
+    MHA_V4_MXFP4_V_SCALE_TILE_BYTES,
     MHA_V4_MXFP6_V_BUFFER_SLACK_BYTES,
     MHA_V4_QUERY_TILE_ROWS,
     mha_v4_q_multiplier,
@@ -755,6 +757,10 @@ def test_mha_v4_mxfp4_v_pack_matches_reference(sequence):
     assert torch.equal(scale, expected_scale)
     assert torch.equal(raw, raw_again)
     assert torch.equal(scale, scale_again)
+    # The HIP producer replaced a Triton packer; keep the retired one as a second oracle.
+    triton_raw, triton_scale = pack_v_mxfp4_colmajor_raw(value)
+    assert torch.equal(raw, triton_raw)
+    assert torch.equal(scale, triton_scale)
     assert torch.count_nonzero(raw[-64:]) == 0
     logical = mxfp4_v_view(raw, scale, sequence)
     assert logical.shape == value.shape
@@ -792,10 +798,13 @@ def test_mha_v4_mxfp4_fp6_p_pack_matches_permuted_canonical(sequence):
 
     assert torch.equal(production_raw, expected_raw)
     assert torch.equal(production_scale, expected_scale)
-    assert production_scale.untyped_storage().nbytes() == production_scale.numel() + 512
+    slack = MHA_V4_MXFP4_V_SCALE_SLACK_BYTES
+    assert (
+        production_scale.untyped_storage().nbytes() == production_scale.numel() + slack
+    )
     assert torch.equal(
-        production_scale.as_strided((512,), (1,), production_scale.numel()),
-        torch.zeros(512, device="cuda", dtype=torch.uint8),
+        production_scale.as_strided((slack,), (1,), production_scale.numel()),
+        torch.zeros(slack, device="cuda", dtype=torch.uint8),
     )
     assert torch.equal(compiled_raw, expected_raw)
     assert torch.equal(compiled_scale, expected_scale)
@@ -897,6 +906,36 @@ def test_mha_v4_q_scale_backing_storage_covers_query_tile(quantize, sequence):
     padded = -(-sequence // MHA_V4_QUERY_TILE_ROWS) * MHA_V4_QUERY_TILE_ROWS
     slack = (padded - sequence) * heads * 4
     assert scale.shape == (2, sequence, heads, 4)
+    assert scale.is_contiguous()
+    assert scale.untyped_storage().nbytes() == scale.numel() + slack
+    assert torch.equal(
+        scale.as_strided((slack,), (1,), scale.numel()),
+        torch.zeros(slack, device="cuda", dtype=torch.uint8),
+    )
+
+
+@pytest.mark.skipif(get_gfx() != "gfx950", reason="gfx950 scale gather validation")
+@pytest.mark.parametrize("sequence", [1, 128, 129, 257, 512])
+@pytest.mark.parametrize(
+    "quantize",
+    [quantize_v_mxfp4, quantize_v_mxfp4_fp6_p],
+    ids=["canonical", "fp6_p"],
+)
+def test_mha_v4_mxfp4_v_scale_backing_storage_covers_lookahead_tiles(
+    quantize, sequence
+):
+    """The MXFP4 Q/K rows gather V scales two 512-byte tiles ahead of the running tile.
+
+    The lead does not shrink at the end of the sequence, so the last tiles address scale bytes
+    past the final one whatever the length. Measured on gfx950: 1023 trailing mapped bytes still
+    fault, 1024 do not.
+    """
+    heads = 3
+    value = torch.randn((2, sequence, heads, 128), device="cuda", dtype=torch.bfloat16)
+    _, scale = quantize(value)
+
+    slack = MHA_V4_MXFP4_V_SCALE_SLACK_BYTES
+    assert slack == 2 * MHA_V4_MXFP4_V_SCALE_TILE_BYTES
     assert scale.is_contiguous()
     assert scale.untyped_storage().nbytes() == scale.numel() + slack
     assert torch.equal(
@@ -1130,6 +1169,22 @@ def test_mha_v4_packed_rejects_unbacked_mx_scales():
             mxfp4_q_scale,
             mxfp4_k_scale.clone(),
             mxfp4_v_scale,
+            AttentionFormat.MXFP4,
+            AttentionFormat.MXFP4,
+            AttentionFormat.MXFP4,
+            AttentionScaleMode.E8M0_PER_1X32,
+            AttentionScaleMode.E8M0_PER_1X32,
+            AttentionScaleMode.E8M0_PER_1X32,
+        )
+
+    with pytest.raises(RuntimeError, match="MX V descale needs"):
+        mha_v4_packed(
+            mxfp4_q,
+            mxfp4_k_view(mxfp4_raw, mxfp4_k_scale),
+            mxfp4_v_view(mxfp4_v_raw, mxfp4_v_scale, value.shape[1]),
+            mxfp4_q_scale,
+            mxfp4_k_scale,
+            mxfp4_v_scale.clone(),
             AttentionFormat.MXFP4,
             AttentionFormat.MXFP4,
             AttentionFormat.MXFP4,

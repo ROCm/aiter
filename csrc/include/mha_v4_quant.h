@@ -43,5 +43,9 @@ void quantize_v_mxfp4_fp6_p(aiter_tensor_t& out,
                             aiter_tensor_t& scale,
                             const aiter_tensor_t& input);
 
+void quantize_v_mxfp4(aiter_tensor_t& out,
+                      aiter_tensor_t& scale,
+                      const aiter_tensor_t& input);
+
 } // namespace torch_itfs
 } // namespace aiter

@@ -28,7 +28,6 @@ from aiter.ops.triton.quant.sage_attention_quant_wrappers import (
     FP4_V_TILE_TOKENS,
     fp4_v_padded_sequence,
     fp4_v_raw_buffer_size,
-    pack_v_mxfp4_colmajor_raw,
 )
 
 MHA_V4_LOG2E = 1.4426950408889634
@@ -37,10 +36,11 @@ MHA_V4_MXFP4_V_TILE_TOKENS = FP4_V_TILE_TOKENS
 MHA_V4_MXFP4_V_PACKED_ROW_BYTES = FP4_V_PACKED_BYTES_PER_TOKEN
 MHA_V4_MXFP4_V_SCALE_TILE_BYTES = 512
 MHA_V4_MXFP4_V_BUFFER_SLACK_BYTES = FP4_V_BUFFER_SLACK_BYTES
-# Dense kernels speculatively gather the overlapping final K-scale dword and one lookahead V-scale
-# tile. Keep those reads mapped and zero without changing either scale tensor's logical shape.
+# Dense kernels speculatively gather the overlapping final K-scale dword and two lookahead V-scale
+# tiles. Keep those reads mapped and zero without changing either scale tensor's logical shape.
+# Measured on gfx950: 1023 trailing V-scale bytes still fault, 1024 do not, whatever the shape.
 MHA_V4_MXFP4_K_SCALE_SLACK_BYTES = 4
-MHA_V4_MXFP4_V_SCALE_SLACK_BYTES = MHA_V4_MXFP4_V_SCALE_TILE_BYTES
+MHA_V4_MXFP4_V_SCALE_SLACK_BYTES = 2 * MHA_V4_MXFP4_V_SCALE_TILE_BYTES
 # The ASM Q-scale gather is an unguarded global load covering a whole 256-row query tile, so a
 # partial final tile addresses rows past the logical sequence.
 MHA_V4_QUERY_TILE_ROWS = 256
@@ -120,6 +120,15 @@ def rotate_activation_mxfp4_quant_k(
     input: Tensor,
 ) -> None:
     """Apply hd128 Walsh-Hadamard rotation and pack K in the MXFP4 ASM tile order."""
+
+
+@compile_ops("module_mha_v4_quant", develop=True)
+def _quantize_v_mxfp4_hip(
+    out: Tensor,
+    scale: Tensor,
+    input: Tensor,
+) -> None:
+    """Pack V into the canonical column-major MXFP4 order."""
 
 
 @compile_ops("module_mha_v4_quant", develop=True)
@@ -517,23 +526,38 @@ def _quantize_v_fp8_fake(input: Tensor) -> tuple[Tensor, Tensor]:
     )
 
 
+def _mxfp4_v_buffers(
+    input: Tensor, batch: int, sequence: int, heads: int
+) -> tuple[Tensor, Tensor]:
+    """Allocate the MXFP4 V payload plus a scale view backed by the gather's lookahead tiles."""
+    tiles = mxfp4_v_tiles(sequence)
+    raw = input.new_empty(
+        (mxfp4_v_raw_buffer_size(batch, sequence, heads),), dtype=torch.uint8
+    )
+    elements = batch * heads * tiles * MHA_V4_MXFP4_V_SCALE_TILE_BYTES
+    storage = input.new_empty(
+        (elements + MHA_V4_MXFP4_V_SCALE_SLACK_BYTES,), dtype=torch.uint8
+    )
+    storage[elements:].zero_()
+    scale = storage[:elements].view(
+        batch, heads, tiles * MHA_V4_MXFP4_V_SCALE_TILE_BYTES
+    )
+    return raw, scale
+
+
 @torch.library.custom_op("aiter::mha_v4_quantize_v_mxfp4_raw_v2", mutates_args=())
 def quantize_v_mxfp4(input: Tensor) -> tuple[Tensor, Tensor]:
     """Pack hd128 BSHD V into raw column-major MXFP4 data and scale buffers."""
-    _validate_bshd_hd128(input, "MXFP4 V quantization")
-    # TODO: Replace the nested Triton custom op with a canonical-layout HIP producer.
-    return pack_v_mxfp4_colmajor_raw(input)
+    batch, sequence, heads, _ = _validate_bshd_hd128(input, "MXFP4 V quantization")
+    raw, scale = _mxfp4_v_buffers(input, batch, sequence, heads)
+    _quantize_v_mxfp4_hip(raw, scale, input)
+    return raw, scale
 
 
 @quantize_v_mxfp4.register_fake
 def _quantize_v_mxfp4_raw_fake(input: Tensor) -> tuple[Tensor, Tensor]:
     batch, sequence, heads, _ = input.shape
-    tiles = mxfp4_v_tiles(sequence)
-    return input.new_empty(
-        (mxfp4_v_raw_buffer_size(batch, sequence, heads),), dtype=torch.uint8
-    ), input.new_empty(
-        (batch, heads, tiles * MHA_V4_MXFP4_V_SCALE_TILE_BYTES), dtype=torch.uint8
-    )
+    return _mxfp4_v_buffers(input, batch, sequence, heads)
 
 
 @torch.library.custom_op("aiter::mha_v4_quantize_v_mxfp4_fp6_p_raw", mutates_args=())
@@ -542,18 +566,7 @@ def quantize_v_mxfp4_fp6_p(input: Tensor) -> tuple[Tensor, Tensor]:
     batch, sequence, heads, _ = _validate_bshd_hd128(
         input, "MXFP4 V-for-FP6-P quantization"
     )
-    tiles = mxfp4_v_tiles(sequence)
-    raw = input.new_empty(
-        (mxfp4_v_raw_buffer_size(batch, sequence, heads),), dtype=torch.uint8
-    )
-    scale_elements = batch * heads * tiles * MHA_V4_MXFP4_V_SCALE_TILE_BYTES
-    scale_storage = input.new_empty(
-        (scale_elements + MHA_V4_MXFP4_V_SCALE_SLACK_BYTES,), dtype=torch.uint8
-    )
-    scale_storage[scale_elements:].zero_()
-    scale = scale_storage[:scale_elements].view(
-        batch, heads, tiles * MHA_V4_MXFP4_V_SCALE_TILE_BYTES
-    )
+    raw, scale = _mxfp4_v_buffers(input, batch, sequence, heads)
     _quantize_v_mxfp4_fp6_p_hip(raw, scale, input)
     return raw, scale
 
@@ -561,16 +574,7 @@ def quantize_v_mxfp4_fp6_p(input: Tensor) -> tuple[Tensor, Tensor]:
 @quantize_v_mxfp4_fp6_p.register_fake
 def _quantize_v_mxfp4_fp6_p_raw_fake(input: Tensor) -> tuple[Tensor, Tensor]:
     batch, sequence, heads, _ = input.shape
-    tiles = mxfp4_v_tiles(sequence)
-    scale_elements = batch * heads * tiles * MHA_V4_MXFP4_V_SCALE_TILE_BYTES
-    scale_storage = input.new_empty(
-        (scale_elements + MHA_V4_MXFP4_V_SCALE_SLACK_BYTES,), dtype=torch.uint8
-    )
-    return input.new_empty(
-        (mxfp4_v_raw_buffer_size(batch, sequence, heads),), dtype=torch.uint8
-    ), scale_storage[:scale_elements].view(
-        batch, heads, tiles * MHA_V4_MXFP4_V_SCALE_TILE_BYTES
-    )
+    return _mxfp4_v_buffers(input, batch, sequence, heads)
 
 
 @torch.library.custom_op("aiter::mha_v4_quantize_v_mxfp6", mutates_args=())

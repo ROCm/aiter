@@ -58,4 +58,9 @@ PYBIND11_MODULE(AITER_EXTENSION_NAME, m)
           py::arg("out"),
           py::arg("scale"),
           py::arg("input"));
+    m.def("_quantize_v_mxfp4_hip",
+          &aiter::torch_itfs::quantize_v_mxfp4,
+          py::arg("out"),
+          py::arg("scale"),
+          py::arg("input"));
 }

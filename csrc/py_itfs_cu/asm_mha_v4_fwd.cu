@@ -214,6 +214,9 @@ constexpr int64_t kQueryScaleTileRows       = 256;
 constexpr int64_t kKvScaleTileRows          = 128;
 constexpr int64_t kKvScaleLookaheadRows     = 2 * kKvScaleTileRows;
 constexpr int64_t kKvScaleTrailingDwordSlack = 4;
+// MXFP4 V scales are gathered two 512-byte tiles ahead of the tile being run, so the last tiles
+// address bytes past the final one whatever the sequence length. Mirrors FP4_V_SCALE_SLACK_BYTES.
+constexpr int64_t kMxFp4VScaleSlackBytes = 2 * 512;
 
 void check_scale_backing_storage(const at::Tensor& descale,
                                  int64_t sequence,
@@ -735,6 +738,20 @@ PackedMhaV4Shapes validate_packed_mha_v4(const at::Tensor& q,
         TORCH_CHECK(v_descale.sizes() ==
                         torch::IntArrayRef({shapes.batch, shapes.nhead_k, tiles * 512}),
                     "MX V descale must have shape [batch, key_heads, tiles * 512]");
+        if(recipe.v_format == format_id(AttentionFormat::Fp4E2M1))
+        {
+            const int64_t required = v_descale.numel() + kMxFp4VScaleSlackBytes;
+            const int64_t backed   = static_cast<int64_t>(v_descale.storage().nbytes()) -
+                                   v_descale.storage_offset() * v_descale.element_size();
+            TORCH_CHECK(backed >= required,
+                        "MX V descale needs ",
+                        required,
+                        " mapped bytes so the kernel's speculative tile gather stays in bounds, "
+                        "but only ",
+                        backed,
+                        " are backed; allocate it with the aiter.ops.mha_v4_quant producers, "
+                        "which reserve zeroed slack");
+        }
     }
     else if(mx_qk_format)
     {
