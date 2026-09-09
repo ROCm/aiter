@@ -448,6 +448,16 @@ _SPLITK_KID_MAX = 299
 _UNBAKED_KIDS: set[tuple[int, int]] = set()
 
 
+@functools.lru_cache(maxsize=1)
+def _unbaked_kernel_error() -> type[BaseException] | tuple:
+    from ...jit.core import get_module
+
+    try:
+        return get_module("module_deepgemm_opus").UnbakedKernelError
+    except Exception:  # noqa: BLE001
+        return ()
+
+
 def try_opus_gemm_a16w16_tune(
     XQ: torch.Tensor,
     WQ: torch.Tensor,
@@ -464,7 +474,7 @@ def try_opus_gemm_a16w16_tune(
         opus_gemm_a16w16_tune(XQ, WQ, Y, bias, kernelId, splitK)
     except RuntimeError as e:
         # A split-K workspace OOM is a RuntimeError too, and must escape.
-        if "tune lookup table" not in str(e):
+        if not isinstance(e, _unbaked_kernel_error()):
             raise
         _UNBAKED_KIDS.add(key)
         logger.warning(

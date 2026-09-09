@@ -111,9 +111,10 @@ opus_a16w16_tune_dispatch_gfx950<bf16_t>(int id)
     constexpr size_t kSize = sizeof(kTune) / sizeof(kTune[0]);
     OpusA16W16TuneEntry needle{id, nullptr};
     auto it = std::lower_bound(kTune, kTune + kSize, needle, tune_entry_less);
-    AITER_CHECK(it != kTune + kSize && it->kid == id,
-                "Kernel id ", id,
-                " not found in a16w16 bf16 tune lookup table");
+    AITER_CHECK_OR_RAISE(aiter_detail::unbaked_kernel_error,
+                         it != kTune + kSize && it->kid == id,
+                         "Kernel id ", id,
+                         " not found in a16w16 bf16 tune lookup table");
     return it->func;
 }
 
@@ -128,9 +129,10 @@ opus_a16w16_tune_dispatch_gfx950<fp32_t>(int id)
     constexpr size_t kSize = sizeof(kTune) / sizeof(kTune[0]);
     OpusA16W16TuneEntry needle{id, nullptr};
     auto it = std::lower_bound(kTune, kTune + kSize, needle, tune_entry_less);
-    AITER_CHECK(it != kTune + kSize && it->kid == id,
-                "Kernel id ", id,
-                " not found in a16w16 fp32 tune lookup table");
+    AITER_CHECK_OR_RAISE(aiter_detail::unbaked_kernel_error,
+                         it != kTune + kSize && it->kid == id,
+                         "Kernel id ", id,
+                         " not found in a16w16 fp32 tune lookup table");
     return it->func;
 }
 

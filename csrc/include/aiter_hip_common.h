@@ -40,7 +40,14 @@ aiter_check_fatal(const char* file, size_t line, Args&&... args)
     std::abort();
 }
 
-template <typename... Args>
+// Raised when a tuned row names a kernel id this build does not contain. Its own
+// type so a caller can fall back for it without catching every runtime_error.
+struct unbaked_kernel_error : std::runtime_error
+{
+    using std::runtime_error::runtime_error;
+};
+
+template <typename Error = std::runtime_error, typename... Args>
 [[noreturn]] inline void check_fail(const char* file, int line, Args&&... args)
 {
     std::ostringstream oss;
@@ -58,20 +65,24 @@ template <typename... Args>
     std::cerr << msg << std::endl;
     if(g_aiter_can_throw)
     {
-        throw std::runtime_error(std::move(msg));
+        throw Error(std::move(msg));
     }
     std::abort();
 }
 } // namespace aiter_detail
 
-#define AITER_CHECK(x, ...)                                                          \
-    do                                                                               \
-    {                                                                                \
-        if(!(x)) [[unlikely]]                                                        \
-        {                                                                            \
-            aiter_detail::check_fail(__FILE__, __LINE__ __VA_OPT__(, ) __VA_ARGS__); \
-        }                                                                            \
+#define AITER_CHECK_OR_RAISE(Error, x, ...)                                           \
+    do                                                                                \
+    {                                                                                 \
+        if(!(x)) [[unlikely]]                                                         \
+        {                                                                             \
+            aiter_detail::check_fail<Error>(__FILE__,                                 \
+                                            __LINE__ __VA_OPT__(, ) __VA_ARGS__);     \
+        }                                                                             \
     } while(0)
+
+#define AITER_CHECK(x, ...)                                                           \
+    AITER_CHECK_OR_RAISE(std::runtime_error, x __VA_OPT__(, ) __VA_ARGS__)
 
 // Fatal on any HIP error -- use for init/teardown/resource management where
 // failure means unrecoverable state.

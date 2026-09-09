@@ -70,10 +70,20 @@ def _detect_arch(
 
         target_archs = get_build_archs_env()
     except Exception as e:  # noqa: BLE001
-        logger.debug("opus: could not read AITER_GPU_TARGETS (%s)", e)
         # A malformed authoritative target must not silently fall back to a
         # conflicting GPU_ARCHS value and expose code that was never compiled.
-        return False, named or None
+        # Name the env var rather than reporting it as the device's arch: the
+        # value is a typo, not something a different GPU would fix.
+        source = "AITER_GPU_TARGETS" if named else "GPU_ARCHS"
+        value = named or gpu_archs_env
+        logger.warning(
+            "opus: could not resolve build targets from %s=%r (%s); "
+            "treating the arch as unsupported.",
+            source,
+            value,
+            e,
+        )
+        return False, f"unreadable {source} ({value})"
 
     if target_archs is not None:
         explicit_archs = list(target_archs)

@@ -254,9 +254,10 @@ SPLITK_TAGS = {
     *_SPLITK,
 }
 
-_WS_PARTIAL_TAGS = {
-    "a16w16_cluster_tdm_splitk_ws",
-    "a16w16_clusterlaunch_tdm_splitk_ws",
+_WS_PARTIAL_ATTR_BY_TAG = {
+    "a16w16_cluster_tdm_splitk_ws": "splitk_workspace_dtype",
+    "a16w16_clusterlaunch_tdm_splitk_ws": "splitk_workspace_dtype",
+    "a16w16_clusterlaunch_tdm_splitk_fuse": "fuse_ws_dtype",
 }
 
 
@@ -283,6 +284,12 @@ def _filter_opus_df_for_targets(tune_df, targets):
     if not targets:
         return tune_df
     columns = set(tune_df.columns)
+    if "gfx" in columns:
+        tune_df = tune_df.copy()
+        gfx_col = tune_df["gfx"]
+        tune_df["gfx"] = gfx_col.where(
+            gfx_col.isna(), gfx_col.astype(str).str.strip().str.lower()
+        )
     if {"gfx", "cu_num"} <= columns:
         missing = unmatched_targets(tune_df, targets)
         if missing:
@@ -290,17 +297,14 @@ def _filter_opus_df_for_targets(tune_df, targets):
                 f"[opus gen_instances] no tuned rows for build target(s) "
                 f"{', '.join(missing)}; those shapes fall back to the heuristic."
             )
-        has_gfx = tune_df["gfx"].notna() & tune_df["gfx"].astype(str).str.strip().ne("")
+        has_gfx = tune_df["gfx"].notna() & tune_df["gfx"].ne("")
         has_cu = tune_df["cu_num"].notna()
         if (has_gfx & has_cu).all():
             return filter_tune_df(tune_df, targets)
         exact = False
         for gfx, cu_num in targets:
             exact |= (
-                has_gfx
-                & has_cu
-                & tune_df["gfx"].astype(str).str.lower().eq(gfx)
-                & tune_df["cu_num"].eq(cu_num)
+                has_gfx & has_cu & tune_df["gfx"].eq(gfx) & tune_df["cu_num"].eq(cu_num)
             )
         # Concatenating CSVs of different vintages leaves NaN in whichever
         # target column the older one lacked. A row naming only its arch is
@@ -310,13 +314,11 @@ def _filter_opus_df_for_targets(tune_df, targets):
         # matching on the count alone can bake one arch's winner for the other.
         # Those rows drop out, as they did before any of this filtering existed.
         archs = {gfx for gfx, _ in targets}
-        gfx_only = (
-            has_gfx & ~has_cu & tune_df["gfx"].astype(str).str.lower().isin(archs)
-        )
+        gfx_only = has_gfx & ~has_cu & tune_df["gfx"].isin(archs)
         return tune_df[exact | gfx_only | (~has_gfx & ~has_cu)]
     if "gfx" in columns:
         archs = {gfx for gfx, _ in targets}
-        return tune_df[tune_df["gfx"].astype(str).str.lower().isin(archs)]
+        return tune_df[tune_df["gfx"].isin(archs)]
     # A cu_num-only or column-less legacy schema cannot be selected by target
     # safely (a CU count alone is ambiguous across arches, as above), so pass it
     # through unfiltered and let the kernel id and CU=0 shape fallback decide.
@@ -328,9 +330,10 @@ _CTYPE_BYTES = {"bf16_t": 2, "fp32_t": 4}
 
 def _ws_partial_ctype(k):
     """The kid's split-K partial ctype, or None if its slot is a real dtype."""
-    if k.kernel_tag not in _WS_PARTIAL_TAGS:
+    attr = _WS_PARTIAL_ATTR_BY_TAG.get(k.kernel_tag)
+    if attr is None:
         return None
-    return getattr(k, "splitk_workspace_dtype", "fp32_t")
+    return getattr(k, attr, "fp32_t")
 
 
 TRAITS_NAME_MAP = {

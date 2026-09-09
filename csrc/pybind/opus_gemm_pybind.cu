@@ -7,12 +7,15 @@
 #ifndef __HIP_DEVICE_COMPILE__
 
 #include "rocm_ops.hpp"
+#include "aiter_hip_common.h"
 #include "aiter_stream.h"
 #include "opus_gemm.h"
 #include "opus_bmm.h"
 
 PYBIND11_MODULE(AITER_EXTENSION_NAME, m)
 {
+    py::register_exception<aiter_detail::unbaked_kernel_error>(
+        m, "UnbakedKernelError", PyExc_RuntimeError);
     AITER_SET_STREAM_PYBIND
     OPUS_GEMM_PYBIND;
     OPUS_GEMM_A16W16_TUNE_PYBIND;

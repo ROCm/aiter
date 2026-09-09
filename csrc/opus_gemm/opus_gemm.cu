@@ -448,7 +448,9 @@ void opus_gemm_a16w16_tune(
 #if defined(OPUS_BUILD_HAS_GFX950) || defined(OPUS_BUILD_HAS_GFX942)
         opus_a16w16_tune_dispatch<fp32_t>(kernelId)(XQ, WQ, Y, bias, splitK);
 #else
-        AITER_CHECK(false, "opus_gemm_a16w16_tune: non-gfx1250 splitk dispatch unavailable");
+        AITER_CHECK_OR_RAISE(aiter_detail::unbaked_kernel_error,
+                             false,
+                             "opus_gemm_a16w16_tune: non-gfx1250 splitk dispatch unavailable");
 #endif
       }
     }
@@ -457,7 +459,10 @@ void opus_gemm_a16w16_tune(
 #if defined(OPUS_BUILD_HAS_GFX950) || defined(OPUS_BUILD_HAS_GFX942)
       opus_a16w16_tune_dispatch<bf16_t>(kernelId)(XQ, WQ, Y, bias, splitK);
 #else
-      AITER_CHECK(false, "opus_gemm_a16w16_tune: non-splitk bf16 dispatch unavailable for this arch");
+      AITER_CHECK_OR_RAISE(aiter_detail::unbaked_kernel_error,
+                           false,
+                           "opus_gemm_a16w16_tune: non-splitk bf16 dispatch "
+                           "unavailable for this arch");
 #endif
     }
     else if (Y.dtype() == AITER_DTYPE_fp32)
@@ -465,7 +470,10 @@ void opus_gemm_a16w16_tune(
 #if defined(OPUS_BUILD_HAS_GFX950) || defined(OPUS_BUILD_HAS_GFX942)
       opus_a16w16_tune_dispatch<fp32_t>(kernelId)(XQ, WQ, Y, bias, splitK);
 #else
-      AITER_CHECK(false, "opus_gemm_a16w16_tune: non-splitk fp32 dispatch unavailable for this arch");
+      AITER_CHECK_OR_RAISE(aiter_detail::unbaked_kernel_error,
+                           false,
+                           "opus_gemm_a16w16_tune: non-splitk fp32 dispatch "
+                           "unavailable for this arch");
 #endif
     }
     else

@@ -54,5 +54,5 @@ inline const Entry* opus_lookup_find(const Entry* first, const Entry* last,
         if (p->key.CU == cu_num) return p;
         if (p->key.CU == 0) legacy = p;
     }
-    return allow_fallback ? (legacy != nullptr ? legacy : it) : nullptr;
+    return allow_fallback ? legacy : nullptr;
 }

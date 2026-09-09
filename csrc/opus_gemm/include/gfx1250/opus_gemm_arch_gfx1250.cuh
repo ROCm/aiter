@@ -53,9 +53,10 @@ opus_a16w16_tune_dispatch_gfx1250<fp32_t>(int id)
     OpusA16W16TuneEntry needle{id, nullptr};
     auto it = std::lower_bound(kTune, kTune + kSize, needle,
                                kid_entry_less<OpusA16W16TuneEntry>);
-    AITER_CHECK(it != kTune + kSize && it->kid == id,
-                "Kernel id ", id,
-                " not found in a16w16 fp32 tune lookup table (gfx1250)");
+    AITER_CHECK_OR_RAISE(aiter_detail::unbaked_kernel_error,
+                         it != kTune + kSize && it->kid == id,
+                         "Kernel id ", id,
+                         " not found in a16w16 fp32 tune lookup table (gfx1250)");
     return it->func;
 }
 
@@ -90,13 +91,14 @@ opus_a16w16_co_tune_dispatch_gfx1250(int id)
     OpusA16W16CoTuneEntry needle{id, nullptr};
     auto it = std::lower_bound(kTune, kTune + kSize, needle,
                                kid_entry_less<OpusA16W16CoTuneEntry>);
-    AITER_CHECK(it != kTune + kSize && it->kid == id,
-                "Kernel id ", id,
-                " not found in the a16w16 pre-compiled (.co) tune lookup table "
-                "(gfx1250). Either it is not in this build's compile set, or "
-                "the build saw no gen_co/co_kernels.json / no matching "
-                "gen_co/<arch>/*.co and the whole family is empty (the loader "
-                "drops kids whose image is missing).");
+    AITER_CHECK_OR_RAISE(aiter_detail::unbaked_kernel_error,
+                         it != kTune + kSize && it->kid == id,
+                         "Kernel id ", id,
+                         " not found in the a16w16 pre-compiled (.co) tune lookup table "
+                         "(gfx1250). Either it is not in this build's compile set, or "
+                         "the build saw no gen_co/co_kernels.json / no matching "
+                         "gen_co/<arch>/*.co and the whole family is empty (the loader "
+                         "drops kids whose image is missing).");
     return it->func;
 }
 
