@@ -8,6 +8,8 @@ from __future__ import annotations
 import math
 import os
 import socket
+import sys
+import traceback
 
 # The full codec sweep retains symmetric allocations until shmem_finalize.
 os.environ.setdefault("MORI_SHMEM_HEAP_SIZE", "12G")
@@ -196,7 +198,13 @@ def _sequence_major_input(rank, heads, seq_len, head_dim, device):
 
 
 def _norm_rope(
-    input_tensor, weight, cos, sin, dtype=torch.bfloat16, fused_rounding=False
+    input_tensor,
+    weight,
+    cos,
+    sin,
+    dtype=torch.bfloat16,
+    fused_rounding=False,
+    exact_rms_sum=False,
 ):
     heads, head_dim = input_tensor.shape[-2:]
     norm = torch.nn.RMSNorm(
@@ -210,9 +218,15 @@ def _norm_rope(
     values = norm(input_tensor.flatten(-2).float()).view_as(input_tensor.float())
     if fused_rounding:
         source = input_tensor.float()
-        reciprocal = torch.rsqrt(
-            source.flatten(-2).square().mean(-1, keepdim=True) + 1.0e-6
-        )
+        mean_square = source.flatten(-2).square().mean(-1, keepdim=True)
+        if exact_rms_sum:
+            # Batched FP32 summation can move the reciprocal by one ULP and cross
+            # the final BF16 midpoint. Round the high-precision sum before FP32 RMS.
+            square_sum = (
+                source.flatten(-2).square().double().sum(-1, keepdim=True).float()
+            )
+            mean_square = square_sum / (heads * head_dim)
+        reciprocal = torch.rsqrt(mean_square + 1.0e-6)
         values = (
             source * reciprocal.unsqueeze(-1) * weight.float().view(heads, head_dim)
         )
@@ -573,6 +587,7 @@ def _check_v4_fp6_k_bytes(actual, expected, scales, label):
 def _check_v4_output(rank, world_size, device, q_codec="mxfp4", k_codec="mxfp4"):
     from aiter.ops.mha_v4 import (
         mxfp6_k_view,
+        quantize_int8,
         quantize_mxfp4_k,
         quantize_mxfp4_q,
         quantize_mxfp6_k,
@@ -582,7 +597,16 @@ def _check_v4_output(rank, world_size, device, q_codec="mxfp4", k_codec="mxfp4")
     )
 
     # Partial tiles, exact tiles, and a rank boundary inside a second K tile.
-    cases = ((17, False, False), (32, True, False), (33, False, True), (17, True, True))
+    cases = (
+        ((32, True, False), (96, True, True), (160, True, False), (32, True, True))
+        if q_codec == "int8"
+        else (
+            (17, False, False),
+            (32, True, False),
+            (33, False, True),
+            (17, True, True),
+        )
+    )
     heads, head_dim = 8, 128
     local_heads = heads // world_size
     os.environ["FUSED_A2A_V4_OUTPUT"] = "1"
@@ -612,6 +636,9 @@ def _check_v4_output(rank, world_size, device, q_codec="mxfp4", k_codec="mxfp4")
         angles = torch.arange(seq_len, device=device).view(1, -1, 1, 1) / 100
         cos = angles.cos().expand(1, seq_len, 1, head_dim).contiguous()
         sin = angles.sin().expand_as(cos).contiguous()
+        if q_codec == "int8" and seq_len == 32 and fused:
+            for value in inputs:
+                value.zero_()
         transformed = [
             (
                 _norm_rope(
@@ -620,8 +647,10 @@ def _check_v4_output(rank, world_size, device, q_codec="mxfp4", k_codec="mxfp4")
                     cos,
                     sin,
                     fused_rounding=(
-                        q_codec in ("mxfp6", "mxfp8") or k_codec in ("mxfp6", "mxfp8")
+                        q_codec in ("mxfp6", "mxfp8", "int8")
+                        or k_codec in ("mxfp6", "mxfp8", "int8")
                     ),
+                    exact_rms_sum=q_codec == "int8",
                 )
                 if fused
                 else value
@@ -635,6 +664,10 @@ def _check_v4_output(rank, world_size, device, q_codec="mxfp4", k_codec="mxfp4")
             full = torch.cat(gathered, dim=1)[
                 :, :, rank * local_heads : (rank + 1) * local_heads
             ].contiguous()
+            if (q_codec if role == 0 else k_codec) == "int8":
+                payload, scales = quantize_int8(full)
+                references.append((payload, scales, None))
+                continue
             multiplier = softmax_scale * math.log2(math.e) if role == 0 else 1.0
             payload, scales = (
                 (
@@ -677,6 +710,7 @@ def _check_v4_output(rank, world_size, device, q_codec="mxfp4", k_codec="mxfp4")
             quant=True,
             return_mode="fp8",
             softmax_scale=softmax_scale,
+            block_num=2 if seq_len == 160 else 128,
         )
         counts = [0, 0]
         for epoch in range(3):
@@ -687,7 +721,7 @@ def _check_v4_output(rank, world_size, device, q_codec="mxfp4", k_codec="mxfp4")
                 actual_scales = scales[role][: expected_scales.numel()].view_as(
                     expected_scales
                 )
-                if (q_codec if role == 0 else k_codec) in ("mxfp6", "mxfp8"):
+                if (q_codec if role == 0 else k_codec) in ("mxfp6", "mxfp8", "int8"):
                     _assert_equal(actual_scales, expected_scales, f"{label} scales")
                     ties, total = 0, actual_scales.numel()
                 else:
@@ -707,7 +741,7 @@ def _check_v4_output(rank, world_size, device, q_codec="mxfp4", k_codec="mxfp4")
                         slack, torch.zeros_like(slack), f"{label} scale slack"
                     )
                     continue
-                if (q_codec if role == 0 else k_codec) == "mxfp8":
+                if (q_codec if role == 0 else k_codec) in ("mxfp8", "int8"):
                     _assert_equal(
                         payloads[role], expected.view(torch.uint8).flatten(), label
                     )
@@ -941,7 +975,9 @@ def _check_v4_fp8_v_output(rank, world_size, device):
                 os.environ[name] = value
 
 
-def _check_v4_attention(rank, world_size, device, seq_len, qk_codec="mxfp4"):
+def _check_v4_attention(
+    rank, world_size, device, seq_len, qk_codec="mxfp4", fused=False
+):
     from aiter.ops.mha_v4 import (
         AttentionFormat,
         AttentionScaleMode,
@@ -962,14 +998,18 @@ def _check_v4_attention(rank, world_size, device, seq_len, qk_codec="mxfp4"):
     settings = {"FUSED_A2A_HADAMARD": "0"}
     for role in "QKV":
         settings[f"FUSED_A2A_CODEC_{role}"] = (
-            ("e4m3" if qk_codec == "mxfp8" else "mxfp4") if role == "V" else qk_codec
+            ("e4m3" if qk_codec in ("mxfp8", "int8") else "mxfp4")
+            if role == "V"
+            else qk_codec
         )
         settings[f"FUSED_A2A_V4_OUTPUT_{role}"] = "1"
     previous = {name: os.environ.get(name) for name in settings}
     os.environ.update(settings)
     try:
         inputs = [
-            _sequence_major_input(rank + 23 * role, heads, seq_len, head_dim, device)
+            _sequence_major_input(
+                rank + (19 if fused else 23) * role, heads, seq_len, head_dim, device
+            )
             for role in range(3)
         ]
         for role, value in enumerate(inputs):
@@ -979,10 +1019,25 @@ def _check_v4_attention(rank, world_size, device, seq_len, qk_codec="mxfp4"):
                     heads, head_dim
                 )
                 * (rank + role + 1)
-                / 32
+                / (16 if fused else 32)
             )
+        norm = torch.ones(heads * head_dim, device=device, dtype=torch.bfloat16)
+        angles = torch.arange(seq_len, device=device).view(1, -1, 1, 1) / 100
+        cos = angles.cos().expand(1, seq_len, 1, head_dim).contiguous()
+        sin = angles.sin().expand_as(cos).contiguous()
+        transformed = (
+            [
+                _norm_rope(
+                    source, norm, cos, sin, fused_rounding=True, exact_rms_sum=True
+                )
+                for source in inputs[:2]
+            ]
+            + [inputs[2]]
+            if fused
+            else inputs
+        )
         references = []
-        for source in inputs:
+        for source in transformed:
             gathered = [torch.empty_like(source) for _ in range(world_size)]
             dist.all_gather(gathered, source)
             references.append(
@@ -990,14 +1045,11 @@ def _check_v4_attention(rank, world_size, device, seq_len, qk_codec="mxfp4"):
                     :, :, rank * local_heads : (rank + 1) * local_heads
                 ].contiguous()
             )
-        norm = torch.ones(heads * head_dim, device=device, dtype=torch.bfloat16)
-        cos = torch.ones((1, seq_len, 1, head_dim), device=device)
-        sin = torch.zeros_like(cos)
         op = FusedA2AIntraNodeOp(
             rank=rank,
             world_size=world_size,
             shape=inputs[0].shape,
-            fuse_norm_rope=False,
+            fuse_norm_rope=fused,
             split=True,
             quant=True,
             return_mode="fp8",
@@ -1005,36 +1057,53 @@ def _check_v4_attention(rank, world_size, device, seq_len, qk_codec="mxfp4"):
             block_num=2 if seq_len == 160 else 128,
         )
         payloads, scales = op(*inputs, norm, norm, cos, sin)
-        if qk_codec == "mxfp8":
+        if qk_codec in ("mxfp8", "int8"):
             from aiter.ops.mha_v4 import (
                 quantize_fp8,
+                quantize_int8,
                 quantize_mxfp8_k,
                 quantize_mxfp8_q,
             )
 
             packed_refs = (
-                quantize_mxfp8_q(references[0], softmax_scale * math.log2(math.e)),
-                quantize_mxfp8_k(references[1]),
+                (
+                    quantize_int8(references[0])
+                    if qk_codec == "int8"
+                    else quantize_mxfp8_q(
+                        references[0], softmax_scale * math.log2(math.e)
+                    )
+                ),
+                (
+                    quantize_int8(references[1])
+                    if qk_codec == "int8"
+                    else quantize_mxfp8_k(references[1])
+                ),
                 quantize_fp8(references[2]),
             )
             for role, (payload_ref, scale_ref) in enumerate(packed_refs):
-                label = (
-                    f"V4 MXFP8 attention input {'QKV'[role]} S={seq_len} rank={rank}"
-                )
+                label = f"V4 {qk_codec} attention input {'QKV'[role]} S={seq_len} rank={rank}"
                 _assert_equal(
                     payloads[role], payload_ref.view(torch.uint8).flatten(), label
                 )
                 _assert_equal(
                     scales[role].flatten(), scale_ref.flatten(), f"{label} scale"
                 )
-        q_descale = scales[0].view(1, seq_full, local_heads, 4)
+        q_descale = (
+            scales[0]
+            if qk_codec == "int8"
+            else scales[0].view(1, seq_full, local_heads, 4)
+        )
         v_descale = (
             scales[2]
-            if qk_codec == "mxfp8"
+            if qk_codec in ("mxfp8", "int8")
             else scales[2].view(1, local_heads, tiles * 512)
         )
         # These views retain the transport buffers; no consumer-side repacking.
-        if qk_codec == "mxfp8":
+        if qk_codec == "int8":
+            q = payloads[0].view(torch.int8).view(1, seq_full, local_heads, 128)
+            k = payloads[1].view(torch.int8).view_as(q)
+            k_descale = scales[1]
+        elif qk_codec == "mxfp8":
             q = (
                 payloads[0]
                 .view(torch.float8_e4m3fn)
@@ -1053,18 +1122,25 @@ def _check_v4_attention(rank, world_size, device, seq_len, qk_codec="mxfp4"):
             k = mxfp4_k_view(payloads[1], k_descale)
         v = (
             payloads[2].view(torch.float8_e4m3fn).view(1, seq_full, local_heads, 128)
-            if qk_codec == "mxfp8"
+            if qk_codec in ("mxfp8", "int8")
             else mxfp4_v_view(payloads[2], v_descale, seq_full)
         )
         fmt = {
             "mxfp4": AttentionFormat.MXFP4,
             "mxfp6": AttentionFormat.MXFP6,
             "mxfp8": AttentionFormat.FP8_E4M3,
+            "int8": AttentionFormat.INT8,
         }[qk_codec]
         v_fmt = (
-            AttentionFormat.FP8_E4M3 if qk_codec == "mxfp8" else AttentionFormat.MXFP4
+            AttentionFormat.FP8_E4M3
+            if qk_codec in ("mxfp8", "int8")
+            else AttentionFormat.MXFP4
         )
-        mode = AttentionScaleMode.E8M0_PER_1X32
+        mode = (
+            AttentionScaleMode.F32_PER_TENSOR
+            if qk_codec == "int8"
+            else AttentionScaleMode.E8M0_PER_1X32
+        )
         output = torch.empty_like(references[0])
         actual = mha_v4_packed(
             q,
@@ -1078,7 +1154,11 @@ def _check_v4_attention(rank, world_size, device, seq_len, qk_codec="mxfp4"):
             v_fmt,
             mode,
             mode,
-            AttentionScaleMode.F32_PER_TENSOR if qk_codec == "mxfp8" else mode,
+            (
+                AttentionScaleMode.F32_PER_TENSOR
+                if qk_codec in ("mxfp8", "int8")
+                else mode
+            ),
             softmax_scale=softmax_scale,
             out=output,
         )
@@ -1096,7 +1176,7 @@ def _check_v4_attention(rank, world_size, device, seq_len, qk_codec="mxfp4"):
         atol, rtol = max(4 * baseline, 0.5), 0.1
         primary_error = (actual.float() - expected.float()).abs().max().item()
         oracle_error = (actual.float() - oracle.float()).abs()
-        label = f"V4 attention QK={qk_codec} V={v_fmt.name} S={seq_len} global-S={seq_full} rank={rank}"
+        label = f"V4 attention QK={qk_codec} V={v_fmt.name} S={seq_len} global-S={seq_full} fused={fused} rank={rank}"
         print(
             f"{label}: primary-max-abs={primary_error:.9g} (atol=0 rtol=0) "
             f"oracle-max-abs={oracle_error.max().item():.9g} "
@@ -1126,7 +1206,13 @@ def _check_v4_attention(rank, world_size, device, seq_len, qk_codec="mxfp4"):
 
 
 def _run_rank(
-    rank, world_size, port, v4_only=False, attention_seq=None, qk_codec="mxfp4"
+    rank,
+    world_size,
+    port,
+    v4_only=False,
+    attention_seq=None,
+    qk_codec="mxfp4",
+    fused=False,
 ):
     torch.cuda.set_device(rank)
     device = torch.device("cuda", rank)
@@ -1144,11 +1230,14 @@ def _run_rank(
         torch._C._distributed_c10d._register_process_group("mori", cpu_group)
         ms.shmem_torch_process_group_init("mori")
         if attention_seq is not None:
-            _check_v4_attention(rank, world_size, device, attention_seq, qk_codec)
+            _check_v4_attention(
+                rank, world_size, device, attention_seq, qk_codec, fused
+            )
             return
         _check_v4_output(rank, world_size, device)
         _check_v4_output(rank, world_size, device, q_codec="mxfp6", k_codec="mxfp6")
         _check_v4_output(rank, world_size, device, q_codec="mxfp8", k_codec="mxfp8")
+        _check_v4_output(rank, world_size, device, q_codec="int8", k_codec="int8")
         _check_v4_v_output(rank, world_size, device)
         _check_v4_fp8_v_output(rank, world_size, device)
         if v4_only:
@@ -1638,11 +1727,16 @@ def _run_rank(
                     f"SKIP: {case_name} out-hop requires world_size>=2",
                     flush=True,
                 )
+    except BaseException:
+        # Collective cleanup can mask a rank-local failure while peers keep running.
+        traceback.print_exc()
+        raise
     finally:
-        try:
-            ms.shmem_finalize()
-        finally:
-            dist.destroy_process_group()
+        if sys.exc_info()[0] is None:
+            try:
+                ms.shmem_finalize()
+            finally:
+                dist.destroy_process_group()
 
 
 def main():
@@ -1672,9 +1766,18 @@ def main():
     return 0
 
 
-@pytest.mark.parametrize("qk_codec", ("mxfp4", "mxfp6", "mxfp8"))
+@pytest.mark.parametrize(
+    "qk_codec,fused",
+    (
+        ("mxfp4", False),
+        ("mxfp6", False),
+        ("mxfp8", False),
+        ("int8", False),
+        ("int8", True),
+    ),
+)
 @pytest.mark.parametrize("seq_len", (32, 96, 160))
-def test_fused_a2a_v4_attention(capfd, seq_len, qk_codec):
+def test_fused_a2a_v4_attention(capfd, seq_len, qk_codec, fused):
     if not torch.cuda.is_available():
         pytest.skip("fused_a2a requires ROCm GPUs")
     if get_gfx_runtime() != "gfx950":
@@ -1687,7 +1790,7 @@ def test_fused_a2a_v4_attention(capfd, seq_len, qk_codec):
     with capfd.disabled():
         mp.spawn(
             _run_rank,
-            args=(_WORLD_SIZE, _free_port(), False, seq_len, qk_codec),
+            args=(_WORLD_SIZE, _free_port(), False, seq_len, qk_codec, fused),
             nprocs=_WORLD_SIZE,
             join=True,
         )

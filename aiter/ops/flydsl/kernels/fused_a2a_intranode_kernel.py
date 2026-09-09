@@ -24,7 +24,7 @@ from .communication_ops_utils import (
 )
 from .quant_utils import emit_f32_to_e2m1, emit_f32_to_e2m3, emit_mx_e8m0_scale
 
-_JIT_SCHEMA_VERSION = "v25-v4-fp8-v"
+_JIT_SCHEMA_VERSION = "v26-v4-int8-qk"
 _TRANSPORT_CHUNK_BYTES = 16
 _PUSH_PIPELINE_DEPTH = 16
 _OUT_CHANNEL_DEPTH = 1
@@ -831,6 +831,152 @@ def make_fused_a2a_kernel(
                                 )
 
         @flyc.jit
+        def transport_v4_int8_qk():
+            dest_pe = global_warp_id % npes
+            peer_warp = global_warp_id // npes
+            peer_warps = global_warp_num // npes
+            scale_table = create_buffer_resource_from_addr(addr_p2p_scale_q)
+            local_scale_base = buffer_load(scale_table, rank, vec_width=1, dtype=T.i64)
+            local_scales = create_buffer_resource_from_addr(local_scale_base)
+            scale = fx.Float32(1.0)
+            if const_expr(not v4_amax):
+                maximum = fx.Float32(0.0)
+                for part, state in range(
+                    lane, fx.Int32(global_warp_num), fx.Int32(64), init=[maximum]
+                ):
+                    value = buffer_load(
+                        local_scales,
+                        1 + dest_pe * global_warp_num + fx.Int32(part),
+                        vec_width=1,
+                        dtype=T.f32,
+                    )
+                    result = yield [state[0].maximumf(value)]
+                maximum = fx.Float32(result)
+                for shift in (32, 16, 8, 4, 2, 1):
+                    maximum = maximum.maximumf(maximum.shuffle_xor(shift, 64))
+                scale = maximum / fx.Float32(127.0)
+                scale = (scale > 0.0).select(scale, fx.Float32(1.0))
+                if (dest_pe == rank) & (peer_warp == 0) & (lane == 0):
+                    buffer_store(scale, local_scales, 0)
+
+            base = fx.Uint64(fx.memref_load(p2p_bases_q, dest_pe))
+            lo = readfirstlane(T.i32, fx.Uint32(base))
+            hi = readfirstlane(T.i32, fx.Uint32(base >> 32))
+            output = create_buffer_resource_from_addr(
+                (fx.Uint64(hi) << 32) | fx.Uint64(lo)
+            )
+            maximum = fx.Float32(0.0)
+            for seq, state in range(
+                peer_warp, fx.Int32(seq_len), fx.Int32(peer_warps), init=[maximum]
+            ):
+                seq = fx.Int32(seq)
+                tiles = []
+                sq_acc = fx.Float32(0.0)
+                for tile_idx in range_constexpr(n_tiles):
+                    values = fx.Vector(
+                        buffer_load(
+                            rsrc_input_q,
+                            seq * hd + tile_idx * tile + lane * vec,
+                            vec_width=vec,
+                            dtype=T.bf16,
+                        )
+                    ).to(fx.Float32)
+                    tiles.append(values)
+                    if const_expr(fuse_norm_rope):
+                        sq_acc = sq_acc.addf(
+                            fx.Float32(
+                                (values * values).reduce(
+                                    ReductionOp.ADD, fastmath=fm_fast
+                                )
+                            ),
+                            fastmath=fm_fast,
+                        )
+                if const_expr(fuse_norm_rope):
+                    rstd = fmath.rsqrt(
+                        wave_reduce_add(sq_acc) * (1.0 / hd) + 1.0e-6,
+                        fastmath=fm_fast,
+                    )
+                    freq = seq * head_dim + (lane * vec) % head_dim
+                    cos_lo = fx.Vector(
+                        buffer_load(rsrc_cos, freq, vec_width=4, dtype=T.f32)
+                    )
+                    cos_hi = fx.Vector(
+                        buffer_load(rsrc_cos, freq + 4, vec_width=4, dtype=T.f32)
+                    )
+                    sin_lo = fx.Vector(
+                        buffer_load(rsrc_sin, freq, vec_width=4, dtype=T.f32)
+                    )
+                    sin_hi = fx.Vector(
+                        buffer_load(rsrc_sin, freq + 4, vec_width=4, dtype=T.f32)
+                    )
+                current = state[0]
+                for tile_idx in range_constexpr(n_tiles):
+                    values = tiles[tile_idx]
+                    if const_expr(fuse_norm_rope):
+                        weights = fx.Vector(
+                            buffer_load(
+                                rsrc_norm_q,
+                                tile_idx * tile + lane * vec,
+                                vec_width=vec,
+                                dtype=T.bf16,
+                            )
+                        ).to(fx.Float32)
+                        scaled = [values[i] * rstd * weights[i] for i in range(vec)]
+                        rotated = []
+                        for pair in range_constexpr(4):
+                            c = cos_lo[2 * pair] if pair < 2 else cos_hi[2 * pair - 4]
+                            s = (
+                                sin_lo[2 * pair + 1]
+                                if pair < 2
+                                else sin_hi[2 * pair - 3]
+                            )
+                            even, odd = scaled[2 * pair], scaled[2 * pair + 1]
+                            rotated.extend([even * c - odd * s, even * s + odd * c])
+                        # INT8 consumes the raw BF16 norm/RoPE boundary, without
+                        # Hadamard rotation or the MX Q-multiplier fold.
+                        values = (
+                            fx.Vector.from_elements(rotated, fx.Float32)
+                            .to(fx.BFloat16)
+                            .to(fx.Float32)
+                        )
+                    head = tile_idx * 4 + lane // 16
+                    owns_head = head // heads_local == dest_pe
+                    if const_expr(v4_amax):
+                        for i in range_constexpr(vec):
+                            current = current.maximumf(
+                                owns_head.select(fmath.absf(values[i]), fx.Float32(0.0))
+                            )
+                    else:
+                        pairs = [
+                            _pack_int8_pair(
+                                values[2 * i] / scale, values[2 * i + 1] / scale
+                            )
+                            for i in range(4)
+                        ]
+                        if owns_head:
+                            destination = (
+                                (rank * seq_len + seq) * heads_local
+                                + head % heads_local
+                            ) * 16 + lane % 16
+                            buffer_store(
+                                _pack_transport_words(pairs, "int8"),
+                                output,
+                                destination * 2,
+                            )
+                result = yield [current]
+            if const_expr(v4_amax):
+                maximum = fx.Float32(result)
+                for shift in (32, 16, 8, 4, 2, 1):
+                    maximum = maximum.maximumf(maximum.shuffle_xor(shift, 64))
+                if lane == 0:
+                    slot = 1 + dest_pe * global_warp_num + rank * peer_warps + peer_warp
+                    for peer in range_constexpr(npes):
+                        base = buffer_load(scale_table, peer, vec_width=1, dtype=T.i64)
+                        buffer_store(
+                            maximum, create_buffer_resource_from_addr(base), slot
+                        )
+
+        @flyc.jit
         def transport_v4_fp8_v():
             # Every source owns a token shard of every destination's tensor.
             # Replicate only warp amax metadata so quantization stays send-side.
@@ -1058,7 +1204,9 @@ def make_fused_a2a_kernel(
                         # All waves finish reading the reduction before its next use.
                         fx.barrier()
 
-        if const_expr(formats[0] == "v" and codecs[0] == "e4m3"):
+        if const_expr(formats[0] in ("q", "k") and codecs[0] == "int8"):
+            transport_v4_int8_qk()
+        elif const_expr(formats[0] == "v" and codecs[0] == "e4m3"):
             transport_v4_fp8_v()
         elif const_expr(formats[0] == "v"):
             transport_v4_v()

@@ -65,8 +65,9 @@ class FusedA2AIntraNodeOp:
     scales in gather order and permuted 128-token tiles with 64B slack.
     E4M3 V uses BSHD bytes and one float32 descale per destination tensor;
     one extra launch exchanges send-side partial maxima before quantization.
-    MXFP8 Q/K are BSHD; low-bit K uses padded tiles. Q/K scales are BSH4.
-    V4 Q/K always rotate, and Q folds the explicit softmax_scale * log2(e).
+    INT8/MXFP8 Q/K are BSHD; low-bit K uses padded tiles. MX Q/K scales are BSH4.
+    INT8 Q/K use split launches and per-tensor F32 descales, without Hadamard
+    rotation or a Q multiplier. MX Q/K rotate and Q folds softmax_scale * log2(e).
     All ranks must use the same mode and serialize calls on one stream.
     """
 
@@ -123,12 +124,12 @@ class FusedA2AIntraNodeOp:
             if any(
                 mode
                 and codec != "mxfp4"
-                and not (mode in ("q", "k") and codec in ("mxfp6", "mxfp8"))
+                and not (mode in ("q", "k") and codec in ("mxfp6", "mxfp8", "int8"))
                 and not (mode == "v" and codec == "e4m3")
                 for mode, codec in zip(self.v4_output, self.codecs)
             ):
                 raise ValueError(
-                    "V4 output supports MXFP4 Q/K/V, MXFP6/MXFP8 Q/K and FP8 V"
+                    "V4 output supports MXFP4 Q/K/V, MXFP6/MXFP8/INT8 Q/K and FP8 V"
                 )
         self.split = split or os.environ.get("FUSED_A2A_SPLIT", "0") == "1"
         if self.v4_output[2] and not self.split:
@@ -139,7 +140,11 @@ class FusedA2AIntraNodeOp:
             or softmax_scale <= 0
         ):
             raise ValueError("V4 Q requires an explicit positive finite softmax_scale")
-        q_multiplier = softmax_scale * math.log2(math.e) if self.v4_output[0] else 1.0
+        q_multiplier = (
+            softmax_scale * math.log2(math.e)
+            if self.v4_output[0] and self.codecs[0] != "int8"
+            else 1.0
+        )
         if dtype != torch.bfloat16 and not (self.quant and dtype == torch.uint8):
             raise ValueError(
                 f"expected torch.bfloat16 or torch.uint8 with quant enabled, got {dtype}"
@@ -205,17 +210,25 @@ class FusedA2AIntraNodeOp:
             )
             for _ in range(2)
         )
-        self.v4_fp8_v = self.v4_output[2] == "v" and self.codecs[2] == "e4m3"
-        if self.v4_fp8_v and block_num * 4 % world_size:
-            raise ValueError("FP8 V requires the wave count divisible by world_size")
-        # FP8 V retains exchanged amax metadata after its public scalar descale.
+        self.v4_per_tensor = tuple(
+            (mode == "v" and codec == "e4m3")
+            or (mode in ("q", "k") and codec == "int8")
+            for mode, codec in zip(self.v4_output, self.codecs)
+        )
+        if any(self.v4_per_tensor) and not self.split:
+            raise ValueError("V4 per-tensor output requires split=True")
+        if any(self.v4_per_tensor) and block_num * 4 % world_size:
+            raise ValueError(
+                "V4 per-tensor output requires the wave count divisible by world_size"
+            )
+        # Per-tensor outputs retain exchanged amax metadata after their scalar descale.
         self.scale_storage_sets = tuple(
             tuple(
                 mori_shmem_create_tensor(
                     (
                         (
                             1 + world_size * block_num * 4
-                            if mode == "v" and codec == "e4m3"
+                            if per_tensor
                             else (
                                 (shape[2] // world_size)
                                 * ((shape[1] * world_size + 127) // 128)
@@ -226,14 +239,19 @@ class FusedA2AIntraNodeOp:
                             )
                         ),
                     ),
-                    torch.float32 if mode == "v" and codec == "e4m3" else torch.uint8,
+                    torch.float32 if per_tensor else torch.uint8,
                 )
-                for mode, codec in zip(self.v4_output, self.codecs)
+                for mode, codec, per_tensor in zip(
+                    self.v4_output, self.codecs, self.v4_per_tensor
+                )
             )
             for _ in range(2)
         )
         self.scales_sets = tuple(
-            (scales[0], scales[1], scales[2][:1] if self.v4_fp8_v else scales[2])
+            tuple(
+                scale[:1] if per_tensor else scale
+                for scale, per_tensor in zip(scales, self.v4_per_tensor)
+            )
             for scales in self.scale_storage_sets
         )
         self.output = self.outputs_sets[0][0]
@@ -298,7 +316,10 @@ class FusedA2AIntraNodeOp:
                 head_dim=shape[3],
                 block_num=block_num,
                 warp_num_per_block=(
-                    4 if self.split and self.v4_output[i] == "v" else warp_num_per_block
+                    4
+                    if self.split
+                    and (self.v4_output[i] == "v" or self.v4_per_tensor[i])
+                    else warp_num_per_block
                 ),
                 fuse_norm_rope=role,
                 split=self.split,
@@ -312,28 +333,31 @@ class FusedA2AIntraNodeOp:
             )
             for i, role in enumerate(roles)
         )
-        self._amax_launch = (
-            make_fused_a2a_jit(
-                rank=rank,
-                npes=world_size,
-                heads=shape[2],
-                seq_len=shape[1],
-                head_dim=shape[3],
-                block_num=block_num,
-                warp_num_per_block=4,
-                fuse_norm_rope=False,
-                split=True,
-                quant=True,
-                codec="e4m3",
-                v4_output="v",
-                v4_amax=True,
-                element_size=element_size,
-                return_mode=self.return_mode,
+        self._amax_launches = tuple(
+            (
+                make_fused_a2a_jit(
+                    rank=rank,
+                    npes=world_size,
+                    heads=shape[2],
+                    seq_len=shape[1],
+                    head_dim=shape[3],
+                    block_num=block_num,
+                    warp_num_per_block=4,
+                    fuse_norm_rope=role,
+                    split=True,
+                    quant=True,
+                    codec=self.codecs[i],
+                    v4_output=self.v4_output[i],
+                    v4_amax=True,
+                    element_size=element_size,
+                    return_mode=self.return_mode,
+                )
+                if self.v4_per_tensor[i]
+                else None
             )
-            if self.v4_fp8_v
-            else None
+            for i, role in enumerate(roles)
         )
-        self._amax_compiled = None
+        self._amax_compiled = [None] * len(self._amax_launches)
         self._compiled = [None] * len(self._launches)
 
     def __call__(
@@ -417,15 +441,15 @@ class FusedA2AIntraNodeOp:
                 ),
             )
         for i, args in enumerate(launch_args):
-            if i == 2 and self._amax_launch is not None:
-                if self._amax_compiled is None:
-                    self._amax_compiled = flyc.compile(
-                        self._amax_launch,
+            if self._amax_launches[i] is not None:
+                if self._amax_compiled[i] is None:
+                    self._amax_compiled[i] = flyc.compile(
+                        self._amax_launches[i],
                         *(fx.Int64(arg) for arg in args[:-1]),
                         args[-1],
                     )
                 else:
-                    self._amax_compiled(*args)
+                    self._amax_compiled[i](*args)
             if self._compiled[i] is None:
                 self._compiled[i] = flyc.compile(
                     self._launches[i],
