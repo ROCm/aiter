@@ -2963,6 +2963,26 @@ def _get_compiled_fused_quant_preshuffle(
 
 
 _ROUTEKS_KSPLIT_GRID_THRESHOLD = 512
+_TOKEN_MULTIDEST_MIN_TOKENS = 4096
+
+
+@functools.cache
+def _get_compiled_token_multidest_quant_topk6(
+    feat_dim: int,
+    wmma_rep: int,
+    quant_mode: str,
+    row_major_scale: bool = False,
+):
+    from aiter.ops.flydsl.kernels.moe_fused_route_quant_scatter import (
+        build_moe_token_multidest_quant_topk6_module,
+    )
+
+    return build_moe_token_multidest_quant_topk6_module(
+        feat_dim=feat_dim,
+        wmma_rep=wmma_rep,
+        quant_mode=quant_mode,
+        row_major_scale=row_major_scale,
+    )
 
 
 @functools.cache
@@ -3012,6 +3032,10 @@ def flydsl_moe_fused_quant_preshuffle(
     # ``quant_mode``: the sender already quantized, so the kernel only scatters
     # + preshuffles.
     prequantized_scale: torch.Tensor | None = None,
+    # When True, write the e8m0 scale as (row, feat_dim//32) instead of the
+    # 16-row-interleaved WMMA form. The consuming GEMM must be built with
+    # row_major_ascale so it does the interleave on its LDS->register read.
+    row_major_scale: bool = False,
 ):
     """Fused grouped quant + e8m0 scale-preshuffle in one kernel pass.
 
@@ -3104,6 +3128,39 @@ def flydsl_moe_fused_quant_preshuffle(
         else:
             row_starts_i32 = masked_m
             route_max_m_arg = 1
+        token_num = numel // int(source_topk) if source_topk > 0 else 0
+        use_token_multidest = (
+            not prequantized
+            and not remap_rows
+            and num_valid_routes is None
+            and int(source_topk) == 6
+            and token_num >= _TOKEN_MULTIDEST_MIN_TOKENS
+            and os.environ.get("AITER_FLYDSL_TOKEN_MULTIDEST_QUANT", "1")
+            in ("1", "true", "True")
+        )
+        if row_major_scale and not use_token_multidest:
+            raise ValueError(
+                "row_major_scale is only implemented on the topk=6 "
+                "token-multidest quant path"
+            )
+        if use_token_multidest:
+            launch = _get_compiled_token_multidest_quant_topk6(
+                feat_dim=feat_dim,
+                wmma_rep=wmma_rep,
+                quant_mode=quant_mode,
+                row_major_scale=bool(row_major_scale),
+            )
+            token_grid = (token_num + warps_per_block - 1) // warps_per_block
+            launch(
+                ptr_arg(grouped_in.contiguous().view(-1)),
+                ptr_arg(out_payload.view(-1)),
+                ptr_arg(out_scale.view(-1)),
+                ptr_arg(topids_to_rows_i32),
+                token_num,
+                token_grid,
+                stream=torch.cuda.current_stream(),
+            )
+            return out_payload, out_scale
         use_ksplit = grid_blocks < _ROUTEKS_KSPLIT_GRID_THRESHOLD
         launch = _get_compiled_fused_quant_preshuffle_route_ksplit(
             feat_dim=feat_dim,
