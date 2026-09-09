@@ -26,6 +26,7 @@ from aiter.ops.mha_v4 import (
     _resolve_raw_recipe,
     mha_v4,
     mha_v4_kv_tile,
+    mha_v4_mxfp8,
     mha_v4_packed,
     mha_v4_sparse_work_table,
     native_fp8_format,
@@ -1321,6 +1322,32 @@ def test_mha_v4_raw_compile_parity(q_format, v_format):
     assert torch.equal(eager, compiled)
     assert torch.isfinite(consumed).all()
     assert churn.numel() == 16 * 1024 * 1024
+
+
+@pytest.mark.skipif(get_gfx() != "gfx950", reason="gfx950 MXFP8 validation")
+def test_mha_v4_mxfp8_deprecated_alias_matches_mha_v4():
+    torch.manual_seed(41)
+    q = torch.randn((1, 257, 5, 128), device="cuda", dtype=torch.bfloat16)
+    k = torch.randn_like(q)
+    v = torch.randn_like(q)
+    fp8_format = native_fp8_format()
+
+    expected = mha_v4(
+        q,
+        k,
+        v,
+        fp8_format,
+        fp8_format,
+        fp8_format,
+        q_scale_mode=AttentionScaleMode.E8M0_PER_1X32,
+        k_scale_mode=AttentionScaleMode.E8M0_PER_1X32,
+        v_scale_mode=AttentionScaleMode.F32_PER_TENSOR,
+    )
+    with pytest.deprecated_call():
+        actual = mha_v4_mxfp8(q, k, v)
+    torch.cuda.synchronize()
+
+    assert torch.equal(actual, expected)
 
 
 @pytest.mark.skipif(get_gfx() != "gfx950", reason="gfx950 MXFP8 validation")

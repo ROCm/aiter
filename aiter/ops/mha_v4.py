@@ -12,6 +12,7 @@ the packed API; the work table is built inside the sparse custom op.
 import csv
 import functools
 import os
+import warnings
 from enum import IntEnum
 from typing import NamedTuple, Optional
 
@@ -53,6 +54,7 @@ __all__ = (
     "AttentionScaleMode",
     "mha_v4",
     "mha_v4_kv_tile",
+    "mha_v4_mxfp8",
     "mha_v4_packed",
     "mha_v4_q_multiplier",
     "mha_v4_sparse_work_table",
@@ -1227,4 +1229,42 @@ def mha_v4(
         return_lse=return_lse,
         v_pack=recipe.v_pack,
         **packed_lut,
+    )
+
+
+def mha_v4_mxfp8(
+    q: Tensor,
+    k: Tensor,
+    v: Tensor,
+    softmax_scale: Optional[float] = None,  # noqa: UP045
+    out: Optional[Tensor] = None,  # noqa: UP045
+    return_lse: bool = False,
+    block_mask: Optional[Tensor] = None,  # noqa: UP045
+) -> Tensor:
+    """Quantize BF16 BSHD Q/K to MXFP8 and V to per-tensor FP8.
+
+    Deprecated: this recipe is reachable through :func:`mha_v4` by passing FP8
+    formats with E8M0 per-1x32 Q/K scale modes.
+    """
+    warnings.warn(
+        "mha_v4_mxfp8 is deprecated; call mha_v4 with FP8 formats and "
+        "E8M0_PER_1X32 Q/K scale modes instead",
+        DeprecationWarning,
+        stacklevel=2,
+    )
+    fp8_format = native_fp8_format()
+    return mha_v4(
+        q,
+        k,
+        v,
+        fp8_format,
+        fp8_format,
+        fp8_format,
+        softmax_scale=softmax_scale,
+        out=out,
+        return_lse=return_lse,
+        block_mask=block_mask,
+        q_scale_mode=AttentionScaleMode.E8M0_PER_1X32,
+        k_scale_mode=AttentionScaleMode.E8M0_PER_1X32,
+        v_scale_mode=AttentionScaleMode.F32_PER_TENSOR,
     )
