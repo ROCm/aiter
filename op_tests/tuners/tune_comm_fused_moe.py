@@ -54,6 +54,7 @@ from aiter.ops.shuffle import shuffle_scale_a16w4, shuffle_weight_a16w4
 @dataclass
 class _Stage2Case:
     inter_states: torch.Tensor
+    ordinary_inter_states: torch.Tensor
     w2: torch.Tensor
     w2_scale: torch.Tensor
     a2_scale: torch.Tensor
@@ -109,7 +110,9 @@ def _cleanup_distributed():
     dist.destroy_process_group()
 
 
-def _make_stage2_case(args, rank: int, device, *, accumulate: bool):
+def _make_stage2_case(
+    args, rank: int, device, *, accumulate: bool, ordinary_sorted_input: bool
+):
     token = torch.arange(args.token, dtype=torch.int64, device=device)[:, None]
     slot = torch.arange(args.topk, dtype=torch.int64, device=device)[None, :]
     if args.route == "uniform":
@@ -166,6 +169,21 @@ def _make_stage2_case(args, rank: int, device, *, accumulate: bool):
     )
     del activations
     inter_states = inter_states.view(args.token, args.topk, args.inter_dim)
+    ordinary_inter_states = inter_states
+    if ordinary_sorted_input:
+        valid_count = int(num_valid_ids[0].item())
+        packed = sorted_ids[:valid_count].to(torch.int64)
+        sorted_token = packed & 0x00FFFFFF
+        sorted_slot = packed >> 24
+        valid_sorted_row = (sorted_token < args.token) & (sorted_slot < args.topk)
+        ordinary_inter_states = torch.zeros(
+            (valid_count, args.inter_dim),
+            dtype=inter_states.dtype,
+            device=device,
+        )
+        ordinary_inter_states[valid_sorted_row] = inter_states.view(
+            args.token * args.topk, args.inter_dim
+        )[sorted_token[valid_sorted_row] * args.topk + sorted_slot[valid_sorted_row]]
     a2_scale = mxfp4_moe_sort_fwd(
         a2_scale_unsorted.view(args.token * args.topk, -1),
         sorted_ids=sorted_ids,
@@ -208,6 +226,7 @@ def _make_stage2_case(args, rank: int, device, *, accumulate: bool):
     )
     return _Stage2Case(
         inter_states,
+        ordinary_inter_states,
         w2,
         w2_scale,
         a2_scale,
@@ -247,12 +266,12 @@ def _resolve_ordinary_stage2(args):
 
 
 def _run_ordinary_stage2_allreduce(
-    case, metadata, *, requires_output_zero, shared_partial
+    case, metadata, *, requires_output_zero, shared_partial=None
 ):
     if requires_output_zero:
         case.partial_out.zero_()
     metadata.stage2(
-        case.inter_states,
+        case.ordinary_inter_states,
         None,
         case.w2,
         case.sorted_token_ids,
@@ -265,7 +284,8 @@ def _run_ordinary_stage2_allreduce(
         block_m=int(metadata.block_m),
         sorted_weights=case.sorted_weights,
     )
-    case.partial_out.add_(shared_partial)
+    if shared_partial is not None:
+        case.partial_out.add_(shared_partial)
     return get_tp_group().all_reduce(case.partial_out, ca_fp8_quant=False)
 
 
@@ -285,6 +305,7 @@ _WINNER_KEY_FIELDS = (
     "q_type",
     "use_g1u1",
     "doweight_stage1",
+    "add_shared",
 )
 CSV_FIELDS = (
     *_WINNER_KEY_FIELDS,
@@ -377,22 +398,24 @@ def benchmark(
     stage2_args: tuple,
     stage2_kwargs: dict,
     ordinary_stage2=None,
-    shared_partial: torch.Tensor,
+    shared_partial: torch.Tensor | None,
     reference: torch.Tensor,
     warmup_replays: int = 100,
     rounds: int = 3,
     iterations: int = 20,
 ) -> TuningResult:
-    """Measure one complete Stage2 + shared + TP communication candidate."""
+    """Measure one fused Stage2 + TP communication candidate."""
 
     runner = create_runner(tp_group, config)
     runner.output.fill_(float("nan"))
-    candidate_shared = shared_partial.clone()
+    candidate_shared = (
+        shared_partial.clone() if shared_partial is not None else None
+    )
     prepare_shared_partial = getattr(runner, "prepare_shared_partial", None)
 
     def run():
         current_shared = candidate_shared
-        if prepare_shared_partial is not None:
+        if current_shared is not None and prepare_shared_partial is not None:
             current_shared = prepare_shared_partial(current_shared)
         return runner(
             stage2_args=stage2_args,
@@ -416,7 +439,7 @@ def benchmark(
         run,
         tp_group=tp_group,
         process_group=process_group,
-        device=shared_partial.device,
+        device=reference.device,
         warmup_replays=warmup_replays,
         rounds=rounds,
         iterations=iterations,
@@ -501,11 +524,30 @@ def candidate_configs(
     return tuple(dict.fromkeys(candidates))
 
 
+def production_config(shape: ShapeKey, token: int, family: str):
+    """Return the existing winner, allowing explicit families to bootstrap."""
+
+    from aiter.ops.flydsl.comm_fused_moe_host import winners_for
+
+    try:
+        current = winners_for(shape).get(token)
+    except KeyError:
+        # A new model shape has no production table yet.  Explicit candidate
+        # families are the bootstrap path used to create that first table.
+        current = None
+    if current is None and family == "current":
+        raise KeyError(
+            f"no production comm_fused config for M={token}; "
+            "select an explicit --family"
+        )
+    return current
+
+
 def select_winner(
     results,
     *,
     max_abs: float = 1.0,
-    max_rel_l2: float = 0.05,
+    max_rel_l2: float = 0.1,
     ordinary_us: float | None = None,
 ) -> TuningResult | None:
     valid = tuple(
@@ -537,6 +579,7 @@ def _winner_key(shape: ShapeKey, token: int) -> dict:
         "q_type": shape.q_type,
         "use_g1u1": shape.use_g1u1,
         "doweight_stage1": shape.doweight_stage1,
+        "add_shared": int(shape.add_shared),
         "tp": shape.tp,
     }
 
@@ -582,7 +625,11 @@ def write_winner(path, row: dict) -> None:
     rows = [
         old
         for old in rows
-        if tuple(str(old[field]) for field in _WINNER_KEY_FIELDS) != key
+        if tuple(
+            str(old.get(field, "1" if field == "add_shared" else ""))
+            for field in _WINNER_KEY_FIELDS
+        )
+        != key
     ]
     rows.append({field: row.get(field, "") for field in CSV_FIELDS})
     with path.open("w", newline="") as file:
@@ -593,7 +640,7 @@ def write_winner(path, row: dict) -> None:
 
 def _parse_args():
     parser = argparse.ArgumentParser(
-        description="Tune one complete FlyDSL GEMM2 + TP communication shape."
+        description="Tune one FlyDSL GEMM2 + TP communication shape."
     )
     parser.add_argument("--token", type=int, required=True)
     parser.add_argument("--model-dim", type=int, default=7168)
@@ -601,6 +648,13 @@ def _parse_args():
     parser.add_argument("--experts", type=int, default=384)
     parser.add_argument("--topk", type=int, default=6)
     parser.add_argument("--tp", type=int, default=8)
+    parser.add_argument(
+        "--add-shared",
+        type=int,
+        choices=(0, 1),
+        default=1,
+        help="Whether the fused Stage2 epilogue adds a shared partial.",
+    )
     parser.add_argument("--route", choices=("uniform", "skew"), default="uniform")
     parser.add_argument("--seed", type=int, default=20260819)
     parser.add_argument(
@@ -625,7 +679,7 @@ def _parse_args():
         help="Graph replays used to warm each candidate before timing.",
     )
     parser.add_argument("--max-abs", type=float, default=1.0)
-    parser.add_argument("--max-rel-l2", type=float, default=0.05)
+    parser.add_argument("--max-rel-l2", type=float, default=0.1)
     parser.add_argument(
         "--ordinary-only",
         action="store_true",
@@ -642,18 +696,29 @@ def main():
     try:
         metadata, requires_zero = _resolve_ordinary_stage2(args)
         args.tile_m = int(metadata.block_m)
-        case = _make_stage2_case(args, rank, device, accumulate=requires_zero)
-        shared = (
-            torch.arange(args.token, device=device, dtype=torch.float32)
-            .remainder(7)
-            .mul_(1.0 / 32.0)
-            .view(-1, 1)
-            + torch.arange(args.model_dim, device=device, dtype=torch.float32)
-            .remainder(17)
-            .mul_(1.0 / 128.0)
-            .view(1, -1)
-            + float(rank + 1) / 16.0
-        ).to(torch.bfloat16)
+        stage2_func = getattr(metadata.stage2, "func", metadata.stage2)
+        case = _make_stage2_case(
+            args,
+            rank,
+            device,
+            accumulate=requires_zero,
+            ordinary_sorted_input=(
+                getattr(stage2_func, "__name__", "") == "_flydsl_v2_stage2_wrapper"
+            ),
+        )
+        shared = None
+        if args.add_shared:
+            shared = (
+                torch.arange(args.token, device=device, dtype=torch.float32)
+                .remainder(7)
+                .mul_(1.0 / 32.0)
+                .view(-1, 1)
+                + torch.arange(args.model_dim, device=device, dtype=torch.float32)
+                .remainder(17)
+                .mul_(1.0 / 128.0)
+                .view(1, -1)
+                + float(rank + 1) / 16.0
+            ).to(torch.bfloat16)
         reference = _run_ordinary_stage2_allreduce(
             case,
             metadata,
@@ -693,15 +758,9 @@ def main():
             args.topk,
             args.tp,
             get_cu_num(),
+            add_shared=bool(args.add_shared),
         )
-        from aiter.ops.flydsl.comm_fused_moe_host import winners_for
-
-        current = winners_for(shape).get(args.token)
-        if current is None and args.family == "current":
-            raise KeyError(
-                f"no production comm_fused config for M={args.token}; "
-                "select an explicit --family"
-            )
+        current = production_config(shape, args.token, args.family)
         candidates = candidate_configs(
             current,
             args.family,

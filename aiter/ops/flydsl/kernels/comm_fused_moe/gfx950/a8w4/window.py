@@ -182,14 +182,17 @@ def _emit_local(config: WindowConfig, route, partial, shared, worker):
                     values = decode_scaled_fp8_f32(words, scale)
                     acc = acc + fx.Vector.from_elements(values, fx.Float32)
 
-                shared_row = buffer_tensor_from_addr(
-                    fx.Int64(ptrtoint(shared))
-                    + fx.Int64(token) * fx.Int64(shape.model_dim * 2),
-                    fx.BFloat16,
-                    shape.model_dim * 2,
-                )
-                shared_values = load_bf16(shared_row, column, 8, 2).to(fx.Float32)
-                acc = acc + shared_values
+                if const_expr(shape.add_shared):
+                    shared_row = buffer_tensor_from_addr(
+                        fx.Int64(ptrtoint(shared))
+                        + fx.Int64(token) * fx.Int64(shape.model_dim * 2),
+                        fx.BFloat16,
+                        shape.model_dim * 2,
+                    )
+                    shared_values = load_bf16(shared_row, column, 8, 2).to(
+                        fx.Float32
+                    )
+                    acc = acc + shared_values
 
                 lane = tid & fx.Int32(63)
                 local_max = fx.Float32(1e-10).maximumf(

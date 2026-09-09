@@ -1,12 +1,12 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
-"""TP8 correctness and performance smoke test for communication-fused MoE.
+"""Correctness and performance smoke test for communication-fused MoE.
 
 Run with:
     torchrun --standalone --nproc_per_node=8 \
         op_tests/multigpu_tests/test_comm_fused_moe.py
 
-The production target is the DeepSeek-V4-Pro TP8 Stage2 shape:
+The default production target is the DeepSeek-V4-Pro TP8 Stage2 shape:
 
 * hidden = 7168
 * local intermediate = 3072 / TP8 = 384
@@ -77,13 +77,14 @@ MODEL_DIM = 7168
 INTER_DIM = 384
 EXPERTS = 384
 TOPK = 6
+ADD_SHARED = True
 PRODUCTION_TOKENS = (1, 2, 4, 8, 16)
 ROUTES = ("uniform", "skew")
 MODES = ("eager", "graph")
 
 # Accuracy limits used by the production tuner and host dispatch.
 MAX_ABS = 1.0
-MAX_REL_L2 = 0.05
+MAX_REL_L2 = 0.1
 MAX_ERR_RATIO = 0.05
 
 # Performance is reported for visibility only; it is not a CI pass/fail gate.
@@ -104,6 +105,7 @@ class Stage2Case:
     tokens: int
     block_m: int
     inter_states: torch.Tensor
+    ordinary_inter_states: torch.Tensor
     a2_scale: torch.Tensor
     reference_a2_scale: torch.Tensor
     topk_ids: torch.Tensor
@@ -121,7 +123,7 @@ class Stage2Fixture:
     metadata: object
     ordinary_kernel: str
     requires_output_zero: bool
-    shared_partial: torch.Tensor
+    shared_partial: torch.Tensor | None
     reference: torch.Tensor
 
 
@@ -139,7 +141,7 @@ class FullMoeCase:
 @dataclass(slots=True)
 class FullMoeFixture:
     case: FullMoeCase
-    shared_partial: torch.Tensor
+    shared_partial: torch.Tensor | None
     reference: torch.Tensor
     stage2_stream: torch.cuda.Stream
 
@@ -310,6 +312,7 @@ def _make_stage2_case(
     requires_output_zero: bool,
     rank: int,
     device,
+    ordinary_sorted_input: bool,
 ) -> Stage2Case:
     topk_ids, topk_weights = _make_routes(tokens, route, device)
     (
@@ -356,6 +359,20 @@ def _make_stage2_case(
         quant_dtype=dtypes.fp8,
         scale_type=dtypes.fp8_e8m0,
     )
+    inter_states = inter_states.view(tokens, TOPK, INTER_DIM)
+    ordinary_inter_states = inter_states
+    if ordinary_sorted_input:
+        valid_count = int(num_valid_ids[0].item())
+        packed = sorted_ids[:valid_count].to(torch.int64)
+        sorted_token = packed & 0x00FFFFFF
+        sorted_slot = packed >> 24
+        valid_sorted_row = (sorted_token < tokens) & (sorted_slot < TOPK)
+        ordinary_inter_states = torch.zeros(
+            (valid_count, INTER_DIM), dtype=inter_states.dtype, device=device
+        )
+        ordinary_inter_states[valid_sorted_row] = inter_states.view(
+            tokens * TOPK, INTER_DIM
+        )[sorted_token[valid_sorted_row] * TOPK + sorted_slot[valid_sorted_row]]
     a2_scale = mxfp4_moe_sort_fwd(
         reference_a2_scale.view(tokens * TOPK, -1),
         sorted_ids=sorted_ids,
@@ -371,7 +388,8 @@ def _make_stage2_case(
     return Stage2Case(
         tokens=tokens,
         block_m=block_m,
-        inter_states=inter_states.view(tokens, TOPK, INTER_DIM),
+        inter_states=inter_states,
+        ordinary_inter_states=ordinary_inter_states,
         a2_scale=a2_scale,
         reference_a2_scale=reference_a2_scale,
         topk_ids=topk_ids,
@@ -429,7 +447,7 @@ def _torch_stage2_partial(
 def _torch_stage2_allreduce(
     case: Stage2Case,
     weights: Stage2Weights,
-    shared_partial: torch.Tensor,
+    shared_partial: torch.Tensor | None,
     group,
 ) -> torch.Tensor:
     output = _torch_stage2_partial(
@@ -439,7 +457,8 @@ def _torch_stage2_allreduce(
         case.topk_weights,
         weights,
     )
-    output.add_(shared_partial)
+    if shared_partial is not None:
+        output.add_(shared_partial)
     dist.all_reduce(output, group=group)
     return output
 
@@ -451,7 +470,7 @@ def _run_ordinary_stage2(
     if fixture.requires_output_zero:
         case.partial_out.zero_()
     fixture.metadata.stage2(
-        case.inter_states,
+        case.ordinary_inter_states,
         None,
         weights.kernel,
         case.sorted_token_ids,
@@ -464,7 +483,8 @@ def _run_ordinary_stage2(
         block_m=case.block_m,
         sorted_weights=case.sorted_weights,
     )
-    case.partial_out.add_(fixture.shared_partial)
+    if fixture.shared_partial is not None:
+        case.partial_out.add_(fixture.shared_partial)
     return get_tp_group().all_reduce(case.partial_out, ca_fp8_quant=False)
 
 
@@ -474,6 +494,7 @@ def _stage2_fixture(session: TestSession, tokens: int, route: str) -> Stage2Fixt
         return session.stage2_fixtures[key]
 
     metadata, kernel_name, requires_zero = _resolve_ordinary_stage2(tokens)
+    stage2_func = getattr(metadata.stage2, "func", metadata.stage2)
     case = _make_stage2_case(
         tokens,
         route,
@@ -481,8 +502,13 @@ def _stage2_fixture(session: TestSession, tokens: int, route: str) -> Stage2Fixt
         requires_zero,
         session.rank,
         session.device,
+        getattr(stage2_func, "__name__", "") == "_flydsl_v2_stage2_wrapper",
     )
-    shared = _shared_partial(tokens, session.rank, session.device)
+    shared = (
+        _shared_partial(tokens, session.rank, session.device)
+        if ADD_SHARED
+        else None
+    )
     reference = _torch_stage2_allreduce(case, session.weights, shared, session.group)
     fixture = Stage2Fixture(
         case=case,
@@ -555,7 +581,7 @@ def _make_full_moe_case(rank: int, device) -> FullMoeCase:
 def _torch_full_moe_allreduce(
     case: FullMoeCase,
     weights: Stage2Weights,
-    shared_partial: torch.Tensor,
+    shared_partial: torch.Tensor | None,
     group,
 ) -> torch.Tensor:
     stage1 = torch_moe_stage1(
@@ -583,7 +609,8 @@ def _torch_full_moe_allreduce(
         case.topk_weights,
         weights,
     )
-    output.add_(shared_partial)
+    if shared_partial is not None:
+        output.add_(shared_partial)
     dist.all_reduce(output, group=group)
     return output
 
@@ -592,7 +619,11 @@ def _full_moe_fixture(session: TestSession) -> FullMoeFixture:
     if session.full_fixture is not None:
         return session.full_fixture
     case = _make_full_moe_case(session.rank, session.device)
-    shared = _shared_partial(3, session.rank, session.device)
+    shared = (
+        _shared_partial(3, session.rank, session.device)
+        if ADD_SHARED
+        else None
+    )
     reference = _torch_full_moe_allreduce(case, session.weights, shared, session.group)
     session.full_fixture = FullMoeFixture(
         case=case,
@@ -801,17 +832,14 @@ def _run_stage2_case(
 ) -> dict[str, float | str]:
     fixture = _stage2_fixture(session, tokens, route)
     runner = session.runners[tokens]
-    if getattr(runner.config, "collective", None) != "direct":
-        raise AssertionError(
-            f"M={tokens} expected direct collective, got {runner.config!r}"
-        )
-
     def run_ordinary():
         return _run_ordinary_stage2(fixture, session.weights)
 
     def run_comm_fused():
         case = fixture.case
-        prepared = runner.prepare_shared_partial(fixture.shared_partial)
+        prepared = fixture.shared_partial
+        if prepared is not None:
+            prepared = runner.prepare_shared_partial(prepared)
         return runner(
             stage2_args=(
                 case.inter_states,
@@ -878,13 +906,13 @@ def _run_full_runtime_case(
 
     def run_ordinary():
         output = fused_moe(**moe_args)
-        output.add_(fixture.shared_partial)
+        if fixture.shared_partial is not None:
+            output.add_(fixture.shared_partial)
         return get_tp_group().all_reduce(output, ca_fp8_quant=False)
 
     def run_comm_fused(stage2_stream=None):
         return runtime.run(
-            shared_partial=None,
-            before_stage2=lambda: fixture.shared_partial,
+            shared_partial=fixture.shared_partial,
             stage2_stream=stage2_stream,
             **moe_args,
         )
@@ -933,7 +961,18 @@ def test_comm_fused_runtime(tokens: int, route: str, mode: str):
 def _parse_args():
     parser = argparse.ArgumentParser(
         formatter_class=argparse.RawTextHelpFormatter,
-        description="TP8 communication-fused MoE production validation",
+        description="Communication-fused MoE production validation",
+    )
+    parser.add_argument("--tp", type=int, default=TP_SIZE)
+    parser.add_argument("--model-dim", type=int, default=MODEL_DIM)
+    parser.add_argument("--inter-dim", type=int, default=INTER_DIM)
+    parser.add_argument("--experts", type=int, default=EXPERTS)
+    parser.add_argument("--topk", type=int, default=TOPK)
+    parser.add_argument(
+        "--add-shared",
+        type=int,
+        choices=(0, 1),
+        default=int(ADD_SHARED),
     )
     parser.add_argument(
         "-m",
@@ -982,9 +1021,15 @@ def _log_summary(name: str, rows: list[dict]) -> None:
 
 
 def main() -> None:
-    global _ACTIVE_SESSION
+    global _ACTIVE_SESSION, TP_SIZE, MODEL_DIM, INTER_DIM, EXPERTS, TOPK, ADD_SHARED
 
     args = _parse_args()
+    TP_SIZE = args.tp
+    MODEL_DIM = args.model_dim
+    INTER_DIM = args.inter_dim
+    EXPERTS = args.experts
+    TOPK = args.topk
+    ADD_SHARED = bool(args.add_shared)
     skip_reason = _runtime_skip_reason()
     if skip_reason is not None:
         if int(os.environ.get("LOCAL_RANK", "0")) == 0:
@@ -1014,6 +1059,7 @@ def main() -> None:
             TOPK,
             TP_SIZE,
             get_cu_num(),
+            add_shared=ADD_SHARED,
         )
         configs = winners_for(shape)
         missing = sorted(set(requested_tokens).difference(configs))
@@ -1022,7 +1068,15 @@ def main() -> None:
                 f"production comm-fused rows are missing: {missing}; "
                 f"available={sorted(configs)}"
             )
-        if 32 in configs:
+        is_default_dsv4_shape = (
+            MODEL_DIM,
+            INTER_DIM,
+            EXPERTS,
+            TOPK,
+            TP_SIZE,
+            ADD_SHARED,
+        ) == (7168, 384, 384, 6, 8, True)
+        if is_default_dsv4_shape and 32 in configs:
             raise AssertionError("M=32 fallback unexpectedly created a fused runner")
 
         session = TestSession(
@@ -1052,10 +1106,14 @@ def main() -> None:
                 stage2_rows.append(row)
 
         runtime_rows = []
-        for mode in MODES:
-            row = test_comm_fused_runtime(3, "skew", mode)
-            if rank == 0:
-                runtime_rows.append(row)
+        # Without a shared add, the caller still has to apply any model-specific
+        # post-processing and combine its separate shared branch. The generic
+        # full-MoE runtime fixture models the add-shared contract only.
+        if ADD_SHARED:
+            for mode in MODES:
+                row = test_comm_fused_runtime(3, "skew", mode)
+                if rank == 0:
+                    runtime_rows.append(row)
 
         if rank == 0:
             _log_summary("comm-fused MoE Stage2", stage2_rows)

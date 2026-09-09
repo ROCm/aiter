@@ -13,8 +13,9 @@ import torch
 class CommFusedMoeRuntime:
     """Reuse ordinary MoE through Stage1, then run fused Stage2 + TP AR.
 
-    Each prepared runner owns one exact token bucket and returns the complete
-    replicated ``[M, H]`` output.
+    Each prepared runner owns one exact token bucket. Runners with
+    ``add_shared=True`` add a shared partial before TP reduction; the others
+    return only the replicated routed result.
     """
 
     def __init__(
@@ -23,6 +24,7 @@ class CommFusedMoeRuntime:
         runners: dict[int, Callable],
     ) -> None:
         self.runners = runners
+        self.add_shared = runners.add_shared
 
     def supports(self, tokens: int) -> bool:
         from aiter.fused_moe import get_padded_M
@@ -37,7 +39,7 @@ class CommFusedMoeRuntime:
         stage2_stream: torch.cuda.Stream | None = None,
         **moe_args: Any,
     ) -> torch.Tensor:
-        """Run ordinary MoE through Stage1 and fuse the complete Stage2 result."""
+        """Run ordinary MoE through Stage1 and fuse Stage2 with TP reduction."""
 
         from aiter.fused_moe import _fused_moe_impl, get_padded_M
 
@@ -66,15 +68,16 @@ class CommFusedMoeRuntime:
                 current_shared = shared_partial
                 if before_stage2 is not None:
                     current_shared = before_stage2()
-                if current_shared is None:
+                add_shared = runner.config.shape.add_shared
+                if add_shared and current_shared is None:
                     raise RuntimeError("comm-fused Stage2 requires shared_partial")
-                if bucket != raw_tokens:
+                if add_shared and bucket != raw_tokens:
                     padded_shared = runner.output
                     padded_shared[:raw_tokens].copy_(current_shared)
                     padded_shared[raw_tokens:].zero_()
                     current_shared = padded_shared
                 prepare_shared_partial = getattr(runner, "prepare_shared_partial", None)
-                if prepare_shared_partial is not None:
+                if add_shared and prepare_shared_partial is not None:
                     current_shared = prepare_shared_partial(current_shared)
                 return runner(shared_partial=current_shared, **kwargs)
 

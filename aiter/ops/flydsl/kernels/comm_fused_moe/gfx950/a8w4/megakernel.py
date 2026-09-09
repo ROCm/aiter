@@ -288,26 +288,21 @@ def emit_service_tile(
             + tile_item * fx.Int32(config.vector_width)
         )
         if const_expr(config.producer_mode == "atomic_shared"):
-            shared_values = load_bf16(
-                shared_resource,
-                output_offset,
-                config.vector_width,
-                config.local_load_cache_modifier,
-            ).to(fx.Float32)
-            reduced_f32 = shared_values + load_bf16(
+            reduced_f32 = load_bf16(
                 accumulator_resource,
                 output_offset,
                 config.vector_width,
                 config.local_load_cache_modifier,
             ).to(fx.Float32)
+            if const_expr(config.shape.add_shared):
+                shared_values = load_bf16(
+                    shared_resource,
+                    output_offset,
+                    config.vector_width,
+                    config.local_load_cache_modifier,
+                ).to(fx.Float32)
+                reduced_f32 = shared_values + reduced_f32
         else:
-            shared_values = load_bf16(
-                shared_resource,
-                output_offset,
-                config.vector_width,
-                config.local_load_cache_modifier,
-            ).to(fx.Float32)
-
             def load_bf16_route(route_slot):
                 route_offset = (
                     (token * fx.Int32(topk) + fx.Int32(route_slot))
@@ -322,7 +317,15 @@ def emit_service_tile(
                     config.local_load_cache_modifier,
                 ).to(fx.Float32)
 
-            local_even = shared_values + load_bf16_route(0)
+            local_even = load_bf16_route(0)
+            if const_expr(config.shape.add_shared):
+                shared_values = load_bf16(
+                    shared_resource,
+                    output_offset,
+                    config.vector_width,
+                    config.local_load_cache_modifier,
+                ).to(fx.Float32)
+                local_even = shared_values + local_even
             if const_expr(topk == 1):
                 reduced_f32 = local_even
             else:
@@ -1153,7 +1156,7 @@ def compile_megakernel(
         .replace("shape=Shape(", "shape=Gemm2TPShape(", 1)
     )
     cache_config = hashlib.sha256(
-        f"mxmoe_bf16_route_dynamic_scale_v5:{legacy_config_repr}".encode()
+        f"mxmoe_bf16_route_dynamic_scale_v6:{legacy_config_repr}".encode()
     ).hexdigest()[:16]
 
     def compose(*, module_name, emit_gemm2_tile, shared_storage):
