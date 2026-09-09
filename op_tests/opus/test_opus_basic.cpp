@@ -546,7 +546,7 @@ bool test_opus_lookup_fallback_order() {
     // Neither shape has a 512-CU row: one has a legacy row to fall back on,
     // the other only its own CU rows.
     TEST_ASSERT(lk_find(1, 2, 3, 512)->func == &kLegacy, "legacy CU=0 preferred");
-    TEST_ASSERT(lk_find(4, 5, 6, 512)->func == &kOther, "falls to lowest baked CU");
+    TEST_ASSERT(lk_find(4, 5, 6, 512) == nullptr, "no legacy row misses");
     return true;
 }
 

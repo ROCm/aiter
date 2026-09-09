@@ -36,10 +36,11 @@ constexpr bool opus_shape_eq(const Entry& a, const Entry& b) noexcept
     return a.key.M == b.key.M && a.key.N == b.key.N && a.key.K == b.key.K;
 }
 
-// Return the winner tuned for this device's CU count. With fallback enabled,
-// prefer a legacy CU=0 shape-only entry, then preserve the historical behavior
-// of using the shape's first available row. Callers that run before a parallel
-// exact-CU table disable fallback so they cannot shadow that table's winner.
+// Return the winner tuned for this device's CU count, or with fallback enabled
+// a legacy CU=0 shape-only entry. A shape tuned only for other CU counts misses,
+// so the caller reaches its heuristic rather than another SKU's kernel. Callers
+// that run before a parallel exact-CU table disable fallback so they cannot
+// shadow that table's winner.
 template <typename Entry>
 inline const Entry* opus_lookup_find(const Entry* first, const Entry* last,
                                      int M, int N, int K, int cu_num,
