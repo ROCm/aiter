@@ -376,6 +376,11 @@ def get_topk_scratch_workspace(device: torch.device, size: int) -> torch.Tensor:
     return torch.empty(max(1, int(size)), dtype=torch.uint8, device=device)
 
 
+_FLYDSL_TOPK_PREFILL_DISABLED = os.environ.get(
+    "AITER_DISABLE_FLYDSL_TOPK_PREFILL", "0"
+) in ("1", "true", "True", "yes", "YES")
+
+
 def top_k_per_row_prefill(
     logits: torch.Tensor,
     rowStarts: torch.Tensor,
@@ -398,9 +403,14 @@ def top_k_per_row_prefill(
     ascending-index ordered, smallest-index tie-breaking emit so every
     tensor-parallel rank selects and orders an identical KV set; the caller sizes
     the workspace for the ob path in that case. On gfx1250, calls that would use
-    the HIP one-block path are dispatched to the FlyDSL one-block kernel."""
+    the HIP one-block path are dispatched to the FlyDSL one-block kernel unless
+    AITER_DISABLE_FLYDSL_TOPK_PREFILL is enabled."""
     use_mulblocks = not stable and topk_use_mulblocks(numRows, stride0)
-    if get_gfx() == "gfx1250" and not use_mulblocks:
+    if (
+        not _FLYDSL_TOPK_PREFILL_DISABLED
+        and get_gfx() == "gfx1250"
+        and not use_mulblocks
+    ):
         return flydsl_radix_topk_one_block_gfx1250(
             logits,
             rowStarts,
@@ -446,7 +456,6 @@ def flydsl_radix_topk_one_block_gfx1250(
     stride1: int,
     k: int = 2048,
     stable: bool = False,
-    max_effective_row_len: int | None = None,
 ) -> None:
     """Use the FlyDSL gfx1250 one-block radix TopK kernel."""
     from .flydsl.radix_topk_one_block_gfx1250 import (
@@ -464,7 +473,6 @@ def flydsl_radix_topk_one_block_gfx1250(
         stride1,
         k,
         stable,
-        max_effective_row_len,
     )
 
 
