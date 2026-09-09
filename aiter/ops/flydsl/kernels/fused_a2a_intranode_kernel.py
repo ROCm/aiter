@@ -24,7 +24,7 @@ from .communication_ops_utils import (
 )
 from .quant_utils import emit_f32_to_e2m1, emit_f32_to_e2m3, emit_mx_e8m0_scale
 
-_JIT_SCHEMA_VERSION = "v24-v4-mxfp8-qk"
+_JIT_SCHEMA_VERSION = "v25-v4-fp8-v"
 _TRANSPORT_CHUNK_BYTES = 16
 _PUSH_PIPELINE_DEPTH = 16
 _OUT_CHANNEL_DEPTH = 1
@@ -289,6 +289,7 @@ def make_fused_a2a_kernel(
     hadamard=False,
     v4_output="",
     q_multiplier=1.0,
+    v4_amax=False,
     element_size=2,
 ):
     row_nbytes = head_dim * element_size
@@ -830,6 +831,98 @@ def make_fused_a2a_kernel(
                                 )
 
         @flyc.jit
+        def transport_v4_fp8_v():
+            # Every source owns a token shard of every destination's tensor.
+            # Replicate only warp amax metadata so quantization stays send-side.
+            dest_pe = global_warp_id % npes
+            peer_warp = global_warp_id // npes
+            peer_warps = global_warp_num // npes
+            peer_chunks = total_chunks // npes
+            scale_table = create_buffer_resource_from_addr(addr_p2p_scale_q)
+            local_scale_base = buffer_load(scale_table, rank, vec_width=1, dtype=T.i64)
+            local_scales = create_buffer_resource_from_addr(local_scale_base)
+            if const_expr(v4_amax):
+                maximum = fx.Float32(0.0)
+                for chunk, state in range(
+                    peer_warp * 64 + lane,
+                    fx.Int32(peer_chunks),
+                    fx.Int32(peer_warps * 64),
+                    init=[maximum],
+                ):
+                    chunk = fx.Int32(chunk)
+                    seq = chunk // (heads_local * 16)
+                    head_chunk = chunk % (heads_local * 16)
+                    source = (seq * heads + dest_pe * heads_local) * 16 + head_chunk
+                    values = fx.Vector(
+                        buffer_load(rsrc_input_q, source * 8, vec_width=8, dtype=T.bf16)
+                    ).to(fx.Float32)
+                    current = state[0]
+                    for i in range_constexpr(8):
+                        current = current.maximumf(fmath.absf(values[i]))
+                    result = yield [current]
+                maximum = fx.Float32(result)
+                for shift in (32, 16, 8, 4, 2, 1):
+                    maximum = maximum.maximumf(maximum.shuffle_xor(shift, 64))
+                if lane == 0:
+                    slot = 1 + dest_pe * global_warp_num + rank * peer_warps + peer_warp
+                    for peer in range_constexpr(npes):
+                        base = buffer_load(scale_table, peer, vec_width=1, dtype=T.i64)
+                        buffer_store(
+                            maximum, create_buffer_resource_from_addr(base), slot
+                        )
+            else:
+                maximum = fx.Float32(0.0)
+                for part, state in range(
+                    lane, fx.Int32(global_warp_num), fx.Int32(64), init=[maximum]
+                ):
+                    part = fx.Int32(part)
+                    value = buffer_load(
+                        local_scales,
+                        1 + dest_pe * global_warp_num + part,
+                        vec_width=1,
+                        dtype=T.f32,
+                    )
+                    result = yield [state[0].maximumf(value)]
+                maximum = fx.Float32(result)
+                for shift in (32, 16, 8, 4, 2, 1):
+                    maximum = maximum.maximumf(maximum.shuffle_xor(shift, 64))
+                scale = maximum / fx.Float32(448.0)
+                scale = (scale > 0.0).select(scale, fx.Float32(1.0))
+                reciprocal = fx.Float32(1.0) / scale
+                if (dest_pe == rank) & (peer_warp == 0) & (lane == 0):
+                    buffer_store(scale, local_scales, 0)
+                base = fx.Uint64(fx.memref_load(p2p_bases_q, dest_pe))
+                lo = readfirstlane(T.i32, fx.Uint32(base))
+                hi = readfirstlane(T.i32, fx.Uint32(base >> 32))
+                output = create_buffer_resource_from_addr(
+                    (fx.Uint64(hi) << 32) | fx.Uint64(lo)
+                )
+                for chunk in range(
+                    peer_warp * 64 + lane,
+                    fx.Int32(peer_chunks),
+                    fx.Int32(peer_warps * 64),
+                ):
+                    chunk = fx.Int32(chunk)
+                    seq = chunk // (heads_local * 16)
+                    head_chunk = chunk % (heads_local * 16)
+                    source = (seq * heads + dest_pe * heads_local) * 16 + head_chunk
+                    values = fx.Vector(
+                        buffer_load(rsrc_input_q, source * 8, vec_width=8, dtype=T.bf16)
+                    ).to(fx.Float32)
+                    pairs = [
+                        _pack_transport_pair(
+                            values[2 * i] * reciprocal,
+                            values[2 * i + 1] * reciprocal,
+                            "e4m3",
+                        )
+                        for i in range(4)
+                    ]
+                    destination = rank * peer_chunks + chunk
+                    buffer_store(
+                        _pack_transport_words(pairs, "e4m3"), output, destination * 2
+                    )
+
+        @flyc.jit
         def transport_v4_v():
             # A rank boundary may cut a tile, but never a token-32 scale block.
             first_tile = rank * seq_len // 128
@@ -965,7 +1058,9 @@ def make_fused_a2a_kernel(
                         # All waves finish reading the reduction before its next use.
                         fx.barrier()
 
-        if const_expr(formats[0] == "v"):
+        if const_expr(formats[0] == "v" and codecs[0] == "e4m3"):
+            transport_v4_fp8_v()
+        elif const_expr(formats[0] == "v"):
             transport_v4_v()
         elif const_expr(fuse_norm_rope):
             process_qk(
@@ -1126,6 +1221,7 @@ def make_fused_a2a_jit(
     hadamard=False,
     v4_output="",
     q_multiplier=1.0,
+    v4_amax=False,
     element_size=2,
     return_mode="bf16",
 ):
@@ -1144,6 +1240,7 @@ def make_fused_a2a_jit(
         hadamard=hadamard,
         v4_output=v4_output,
         q_multiplier=q_multiplier,
+        v4_amax=v4_amax,
         element_size=element_size,
     )
     key = (
@@ -1161,6 +1258,7 @@ def make_fused_a2a_jit(
         hadamard,
         v4_output,
         q_multiplier,
+        v4_amax,
         element_size,
         return_mode,
         _JIT_SCHEMA_VERSION,

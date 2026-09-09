@@ -879,6 +879,68 @@ def _check_v4_v_output(rank, world_size, device):
         os.environ.pop(name, None)
 
 
+def _check_v4_fp8_v_output(rank, world_size, device):
+    from aiter.ops.mha_v4 import quantize_fp8
+
+    heads, head_dim = 8, 128
+    local_heads = heads // world_size
+    settings = {"FUSED_A2A_V4_OUTPUT": "0", "FUSED_A2A_V4_OUTPUT_V": "1"}
+    settings.update({f"FUSED_A2A_CODEC_{r}": "e4m3" for r in "QKV"})
+    previous = {name: os.environ.get(name) for name in settings}
+    os.environ.update(settings)
+    try:
+        for seq_len, blocks in ((32, 128), (96, 128), (160, 2)):
+            inputs = [
+                _sequence_major_input(rank + 23 * r, heads, seq_len, head_dim, device)
+                for r in range(3)
+            ]
+            # Distinct destination maxima, owned by different source ranks, expose
+            # a reduction over the wrong head shard or stale metadata on reuse.
+            head_ids = torch.arange(heads, device=device).view(1, 1, -1, 1)
+            values = inputs[2] * (head_ids + 1)
+            op = FusedA2AIntraNodeOp(
+                rank=rank,
+                world_size=world_size,
+                shape=inputs[0].shape,
+                fuse_norm_rope=False,
+                split=True,
+                quant=True,
+                return_mode="fp8",
+                block_num=blocks,
+            )
+            for epoch in range(3):
+                inputs[2] = (
+                    values * (rank + 1 if epoch == 0 else 0 if epoch == 1 else 0.125)
+                ).to(torch.bfloat16)
+                gathered = [torch.empty_like(inputs[2]) for _ in range(world_size)]
+                dist.all_gather(gathered, inputs[2])
+                full = torch.cat(gathered, dim=1)[
+                    :, :, rank * local_heads : (rank + 1) * local_heads
+                ].contiguous()
+                expected, expected_scale = quantize_fp8(full)
+                payloads, scales = op(*inputs)
+                torch.cuda.synchronize()
+                label = f"V4 FP8 V S={seq_len} rank={rank} epoch={epoch}"
+                _assert_equal(scales[2], expected_scale, f"{label} descale")
+                _assert_equal(
+                    payloads[2],
+                    expected.view(torch.uint8).flatten(),
+                    f"{label} payload",
+                )
+                dist.barrier()
+            if rank == 0:
+                print(
+                    f"PASS V4 FP8 V S={seq_len} blocks={blocks} epochs=3 payload=byte-exact descale=bit-exact",
+                    flush=True,
+                )
+    finally:
+        for name, value in previous.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
+
+
 def _check_v4_attention(rank, world_size, device, seq_len, qk_codec="mxfp4"):
     from aiter.ops.mha_v4 import (
         AttentionFormat,
@@ -1034,6 +1096,7 @@ def _run_rank(
         _check_v4_output(rank, world_size, device, q_codec="mxfp6", k_codec="mxfp6")
         _check_v4_output(rank, world_size, device, q_codec="mxfp8", k_codec="mxfp8")
         _check_v4_v_output(rank, world_size, device)
+        _check_v4_fp8_v_output(rank, world_size, device)
         if v4_only:
             return
 
