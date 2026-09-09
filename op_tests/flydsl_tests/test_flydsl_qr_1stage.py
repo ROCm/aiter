@@ -1,48 +1,77 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Correctness for the exact one-shot all-reduce.
+"""Correctness for the exact one-shot (1-stage) all-reduce (``OneShotAllReduce``).
 
-Three things are checked, and the second and third matter more than the first:
+
+Three things are checked per shape, and the second and third matter more than
+the first:
 
 1. The sum is right, against an fp32 reference, at the bf16 rounding floor.
 2. The result is **bit-identical on every rank**. The kernel accumulates in a
    fixed rank order for exactly this reason, and an SQNR check cannot see an
    ordering bug -- both answers would be equally "accurate".
 3. Repeated back-to-back calls stay correct under deliberate rank skew. The
-   inbox is double-buffered by ``colour & 1`` and the safety argument depends on
-   a straggler's read of call k finishing before anyone's push for call k+2; a
-   quiescent test never exercises that.
+   inbox is double-buffered by ``colour & 1`` and the safety argument depends
+   on a straggler's read of call k finishing before anyone's push for call
+   k+2; a quiescent test never exercises that. Covered by
+   ``test_qr_1stage_run_ahead``.
 
-Run directly (these are argparse scripts, not pytest):
-
-    HIP_VISIBLE_DEVICES=0,1 python3 -m op_tests.flydsl_tests.test_qr_1stage -tp 2
 """
 
 from __future__ import annotations
 
 import argparse
+import json
 import os
+import subprocess
 import sys
-import traceback
+import tempfile
+import time
 
+_REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+if _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
+
+import pytest
 import torch
-import torch.distributed as dist
-import torch.multiprocessing as mp
+
+from aiter.dist.utils import get_distributed_init_method, get_ip, get_open_port
+from aiter.jit.utils.chip_info import get_gfx_runtime
+
+pytest.importorskip("flydsl")
+
+from aiter.ops.flydsl.kernels.qr_1stage_kernel import (
+    DEFAULT_ATOMS,
+    DEFAULT_FANOUT,
+    DEFAULT_GRID_CAP,
+)
+from aiter.ops.flydsl.kernels.qr_int4 import _SUPPORTED_ARCHS
+from aiter.ops.flydsl.kernels.qr_int_shared import SUPPORTED_WORLDS
+
+ARCH = get_gfx_runtime()
+
+pytestmark = pytest.mark.skipif(
+    ARCH not in _SUPPORTED_ARCHS,
+    reason="OneShotAllReduce unsupported arch (need gfx942 or gfx950)",
+)
 
 HIDDEN = 7168
 # Shapes chosen to straddle the interesting boundaries: a single 4 KiB tile,
 # a partial last tile, an exact multiple, and enough tiles to force several
 # per block at a small grid cap.
-SHAPES = [1, 2, 3, 5, 8, 11, 16]
+SHAPES = (1, 2, 3, 5, 8, 11, 16)
 
-# The single-block corner, which HIDDEN=7168 cannot reach: at atoms=1 the tile
-# is 4096 B, so even m=1 there is 4 tiles and 4 blocks. This protocol has failed
-# at exactly one block before ("5.3 seconds at 1 block, invisible at 448",
-# qr_int4_kernel.py), so the release/invalidate pairing needs its own case.
-# (rows, hidden) pairs sized in bf16 against a 4096 B tile: one exact tile, one
-# partial tile, and one that is two tiles so the block loops twice.
-NARROW_SHAPES = [(1, 2048), (1, 1024), (1, 3072), (2, 2048)]
+# The single-block corner, which HIDDEN=7168 cannot reach.
+NARROW_SHAPES = ((1, 2048), (1, 1024), (1, 3072), (2, 2048))
+
+_SHAPE_CASES = tuple((m, HIDDEN, f"m={m}") for m in SHAPES) + tuple(
+    (m, hidden, f"{m}x{hidden}") for m, hidden in NARROW_SHAPES
+)
+
+RUN_AHEAD_M = 5
+RUN_AHEAD_ITERS = 200
+SQNR_FLOOR_DB = 45.0
 
 
 def _sqnr_db(ref: torch.Tensor, got: torch.Tensor) -> float:
@@ -55,103 +84,93 @@ def _sqnr_db(ref: torch.Tensor, got: torch.Tensor) -> float:
     return 10.0 * torch.log10(torch.tensor(p / e)).item()
 
 
-def _worker(
-    rank: int,
-    world_size: int,
-    init_method: str,
-    atoms: int,
-    grid_cap: int,
-    fanout: str,
-):
-    try:
-        torch.cuda.set_device(rank)
-        dist.init_process_group(
-            backend="gloo", init_method=init_method, rank=rank, world_size=world_size
-        )
-        from aiter.ops.flydsl.kernels.qr_1stage import OneShotAllReduce
+def _run_rank(args) -> None:
+    import torch.distributed as dist
 
-        device = torch.device(f"cuda:{rank}")
-        eng = OneShotAllReduce(
-            group=dist.group.WORLD,
-            device=device,
-            rank=rank,
-            world_size=world_size,
-            atoms=atoms,
-            grid_cap=grid_cap,
-            fanout=fanout,
-            # MAX_PAYLOAD_BYTES is a speed policy, not a correctness limit --
-            # the kernel is exact at every size -- so it must not decide what
-            # this test covers. Lifted so the shape list stays free to include
-            # sizes production would route elsewhere.
-            max_bytes=1 << 30,
-        )
+    from aiter.ops.flydsl.kernels.qr_1stage import OneShotAllReduce
 
-        warm = torch.zeros(1, HIDDEN, dtype=torch.bfloat16, device=device)
-        eng.compile(warm, torch.empty_like(warm))
+    rank = args.rank
+    device = torch.device(f"cuda:{rank}")
+    torch.cuda.set_device(device)
+    dist.init_process_group(
+        backend="gloo", init_method=args.init_method, world_size=args.tp, rank=rank
+    )
 
-        def _check(m, hidden, tag):
-            """One shape: accuracy against fp32, then bit-identity across ranks."""
-            bad = []
-            torch.manual_seed(1234 + m * 8191 + hidden)
-            # Same seed on every rank, then a per-rank shift, so the reference
-            # can be computed locally without another collective.
-            parts = [
-                torch.randn(m, hidden, dtype=torch.bfloat16, device=device) * (r + 1)
-                for r in range(world_size)
-            ]
-            inp = parts[rank].contiguous()
-            out = torch.empty_like(inp)
-            eng.allreduce(inp, out)
-            torch.cuda.synchronize()
+    eng = OneShotAllReduce(
+        group=dist.group.WORLD,
+        device=device,
+        rank=rank,
+        world_size=args.tp,
+        atoms=args.atoms,
+        grid_cap=args.grid_cap,
+        fanout=args.fanout,
+        # MAX_PAYLOAD_BYTES is a speed policy, not a correctness limit -- the
+        # kernel is exact at every size -- so it must not decide what this
+        # test covers. Lifted so the shape list stays free to include sizes
+        # production would route elsewhere.
+        max_bytes=1 << 30,
+    )
+    warm = torch.zeros(1, HIDDEN, dtype=torch.bfloat16, device=device)
+    eng.compile(warm, torch.empty_like(warm))
 
-            ref = torch.zeros(m, hidden, dtype=torch.float32, device=device)
-            for p in parts:
-                ref += p.float()
-
-            db = _sqnr_db(ref, out)
-            if db < 45.0:
-                bad.append(f"{tag}: SQNR {db:.2f} dB below the 45 dB bf16 floor")
-
-            # Bit-identity across ranks: gather the raw bits, compare exactly.
-            # Widened to int32 because gloo rejects int16 ("Invalid scalar
-            # type"); the widening is exact, so the comparison is still on bits.
-            bits = out.view(torch.int16).to(torch.int32).cpu()
-            gathered = [torch.empty_like(bits) for _ in range(world_size)]
-            dist.all_gather(gathered, bits)
-            for r, g in enumerate(gathered):
-                if not torch.equal(g, gathered[0]):
-                    n = int((g != gathered[0]).sum())
-                    bad.append(
-                        f"{tag}: rank {r} differs from rank 0 in {n} bf16 lanes "
-                        "(accumulation order is not rank-stable)"
-                    )
-                    break
-            return bad
-
-        failures = []
-        for m in SHAPES:
-            failures += _check(m, HIDDEN, f"m={m}")
-        # Single-block corner. Reported with the block count so a failure names
-        # the regime rather than just the shape.
-        for m, hidden in NARROW_SHAPES:
-            nb = eng._grid_x(eng._num_tiles(m * hidden * 2))
-            failures += _check(m, hidden, f"{m}x{hidden} ({nb} block(s))")
-
-        # Run-ahead: many back-to-back calls with one rank deliberately late.
-        m = 5
-        torch.manual_seed(99)
+    def _check(m, hidden, tag):
+        """One shape: accuracy against fp32, then bit-identity across ranks."""
+        bad = []
+        torch.manual_seed(1234 + m * 8191 + hidden)
+        # Same seed on every rank, then a per-rank shift, so the reference
+        # can be computed locally without another collective.
         parts = [
-            torch.randn(m, HIDDEN, dtype=torch.bfloat16, device=device) * (r + 1)
-            for r in range(world_size)
+            torch.randn(m, hidden, dtype=torch.bfloat16, device=device) * (r + 1)
+            for r in range(args.tp)
         ]
         inp = parts[rank].contiguous()
         out = torch.empty_like(inp)
-        ref = torch.zeros(m, HIDDEN, dtype=torch.float32, device=device)
+        out.zero_()
+        eng.allreduce(inp, out)
+        torch.cuda.synchronize()
+
+        ref = torch.zeros(m, hidden, dtype=torch.float32, device=device)
+        for p in parts:
+            ref += p.float()
+
+        db = _sqnr_db(ref, out)
+        if db < SQNR_FLOOR_DB:
+            bad.append(f"{tag}: SQNR {db:.2f} dB below the {SQNR_FLOOR_DB} dB bf16 floor")
+
+        # Bit-identity across ranks: gather the raw bits, compare exactly.
+        # Widened to int32 because gloo rejects int16 ("Invalid scalar
+        # type"); the widening is exact, so the comparison is still on bits.
+        bits = out.view(torch.int16).to(torch.int32).cpu()
+        gathered = [torch.empty_like(bits) for _ in range(args.tp)]
+        dist.all_gather(gathered, bits)
+        for r, g in enumerate(gathered):
+            if not torch.equal(g, gathered[0]):
+                n = int((g != gathered[0]).sum())
+                bad.append(
+                    f"{tag}: rank {r} differs from rank 0 in {n} bf16 lanes "
+                    "(accumulation order is not rank-stable)"
+                )
+                break
+        return bad
+
+    failures = []
+    if args.mode == "run_ahead":
+        m = args.tokens[0]
+        hidden = args.hiddens[0]
+        torch.manual_seed(99)
+        parts = [
+            torch.randn(m, hidden, dtype=torch.bfloat16, device=device) * (r + 1)
+            for r in range(args.tp)
+        ]
+        inp = parts[rank].contiguous()
+        out = torch.empty_like(inp)
+        ref = torch.zeros(m, hidden, dtype=torch.float32, device=device)
         for p in parts:
             ref += p.float()
         drag = torch.randn(4096, 4096, device=device, dtype=torch.float32)
         bad = 0
-        for it in range(200):
+        checks = 0
+        for it in range(args.iters):
             # Rank 0 does unrelated work first, so it enters each call late and
             # the others get a chance to run ahead into the other parity slot.
             if rank == 0 and it % 3 == 0:
@@ -160,62 +179,193 @@ def _worker(
             eng.allreduce(inp, out)
             if it % 25 == 0:
                 torch.cuda.synchronize()
-                if _sqnr_db(ref, out) < 45.0:
+                checks += 1
+                if _sqnr_db(ref, out) < SQNR_FLOOR_DB:
                     bad += 1
         torch.cuda.synchronize()
-        if _sqnr_db(ref, out) < 45.0 or bad:
-            failures.append(f"run-ahead loop: {bad} bad checks of 8")
+        if _sqnr_db(ref, out) < SQNR_FLOOR_DB or bad:
+            failures.append(f"run-ahead loop: {bad} bad checks of {checks}")
+    else:
+        for m, hidden in zip(args.tokens, args.hiddens, strict=True):
+            failures += _check(m, hidden, f"{m}x{hidden}")
 
-        eng.close()
-        if failures:
-            print(f"[rank {rank}] FAIL\n  " + "\n  ".join(failures), flush=True)
-        else:
-            print(f"[rank {rank}] PASS", flush=True)
-        dist.barrier()
-        dist.destroy_process_group()
-        sys.exit(1 if failures else 0)
-    except Exception:
-        print(f"[rank {rank}] EXCEPTION\n{traceback.format_exc()}", flush=True)
-        sys.exit(2)
+    gathered = [None] * args.tp
+    dist.all_gather_object(gathered, failures)
+    if rank == 0 and args.out:
+        with open(args.out, "w") as fh:
+            json.dump({"ranks": gathered}, fh)
+    dist.barrier()
+    eng.close()
+    dist.destroy_process_group()
+
+
+def _spawn(
+    world_size: int,
+    pairs: list[tuple[int, int]],
+    *,
+    atoms: int = DEFAULT_ATOMS,
+    grid_cap: int = DEFAULT_GRID_CAP,
+    fanout: str = DEFAULT_FANOUT,
+    mode: str = "shapes",
+    iters: int = RUN_AHEAD_ITERS,
+) -> list[list[str]]:
+    if world_size not in SUPPORTED_WORLDS:
+        raise ValueError(f"unsupported world_size={world_size}")
+    n_gpu = torch.cuda.device_count()
+    if n_gpu < world_size:
+        pytest.skip(f"OneShotAllReduce needs {world_size} GPUs, have {n_gpu}")
+    init_method = get_distributed_init_method(get_ip(), get_open_port())
+    out_path = os.path.join(tempfile.mkdtemp(prefix="flydsl_qr_1stage_"), "rank0.json")
+    env = dict(os.environ)
+    env["PYTHONPATH"] = (
+        f"{_REPO_ROOT}:{env['PYTHONPATH']}" if env.get("PYTHONPATH") else _REPO_ROOT
+    )
+    env["PYTHONUNBUFFERED"] = "1"
+    env.setdefault("FLYDSL_GPU_ARCH", ARCH)
+    tokens = ",".join(str(t) for t, _ in pairs)
+    hiddens = ",".join(str(h) for _, h in pairs)
+    procs = []
+    logs = []
+    for rank in range(world_size):
+        cmd = [
+            sys.executable,
+            os.path.abspath(__file__),
+            "--rank",
+            str(rank),
+            "--init-method",
+            init_method,
+            "--tp",
+            str(world_size),
+            "--atoms",
+            str(atoms),
+            "--grid-cap",
+            str(grid_cap),
+            "--fanout",
+            fanout,
+            "--mode",
+            mode,
+            "--tokens",
+            tokens,
+            "--hiddens",
+            hiddens,
+            "--iters",
+            str(iters),
+        ]
+        if rank == 0:
+            cmd += ["--out", out_path]
+        log = open(  # noqa: SIM115
+            f"/tmp/flydsl_qr_1stage_tp{world_size}_rank{rank}.log",
+            "w",
+        )
+        procs.append(
+            subprocess.Popen(cmd, env=env, stdout=log, stderr=subprocess.STDOUT)
+        )
+        logs.append(log)
+    rc = 0
+    deadline = time.time() + float(os.environ.get("FLYDSL_QR_TIMEOUT", "3600"))
+    for proc in procs:
+        try:
+            rc |= proc.wait(timeout=max(1.0, deadline - time.time()))
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            rc |= 1
+    for log in logs:
+        log.close()
+    if rc != 0:
+        tails = []
+        for rank in range(world_size):
+            path = f"/tmp/flydsl_qr_1stage_tp{world_size}_rank{rank}.log"
+            try:
+                with open(path) as fh:
+                    tails.append(f"===== rank {rank} =====\n{fh.read()[-4000:]}")
+            except OSError:
+                pass
+        raise RuntimeError("OneShotAllReduce ranks failed\n" + "\n".join(tails))
+    with open(out_path) as fh:
+        payload = json.load(fh)
+    ranks = payload["ranks"]
+    if len(ranks) != world_size:
+        raise RuntimeError(
+            f"OneShotAllReduce gathered {len(ranks)} ranks, expected {world_size}"
+        )
+    return ranks
+
+
+@pytest.mark.parametrize("world_size", SUPPORTED_WORLDS)
+@pytest.mark.parametrize("m,hidden,label", _SHAPE_CASES)
+def test_qr_1stage_sqnr_and_bitidentity(m, hidden, label, world_size):
+    ranks = _spawn(world_size, [(m, hidden)])
+    for rank, bad in enumerate(ranks):
+        assert not bad, f"{label}, tp={world_size}, rank {rank}: " + "; ".join(bad)
+
+
+@pytest.mark.parametrize("world_size", SUPPORTED_WORLDS)
+def test_qr_1stage_run_ahead(world_size):
+    """Many back-to-back calls with one rank deliberately late, to exercise
+    the double-buffered inbox under skew rather than only at rest."""
+    ranks = _spawn(world_size, [(RUN_AHEAD_M, HIDDEN)], mode="run_ahead")
+    for rank, bad in enumerate(ranks):
+        assert not bad, f"tp={world_size}, rank {rank}: " + "; ".join(bad)
 
 
 def main():
+    if ARCH not in _SUPPORTED_ARCHS:
+        print(f"OneShotAllReduce unsupported on {ARCH}; skipping")
+        return
+
     ap = argparse.ArgumentParser()
-    ap.add_argument("-tp", type=int, default=2)
-    ap.add_argument("--atoms", type=int, default=1)
-    ap.add_argument("--grid-cap", type=int, default=64)
-    ap.add_argument("--fanout", default="peer", choices=("peer", "atom"))
+    ap.add_argument("-tp", type=int, default=2, choices=SUPPORTED_WORLDS)
+    ap.add_argument("--atoms", type=int, default=DEFAULT_ATOMS)
+    ap.add_argument("--grid-cap", type=int, default=DEFAULT_GRID_CAP)
+    ap.add_argument("--fanout", default=DEFAULT_FANOUT, choices=("peer", "atom"))
     args = ap.parse_args()
 
     n = torch.cuda.device_count()
     if n < args.tp:
         raise SystemExit(f"need {args.tp} GPUs, saw {n}")
 
-    port = int(os.environ.get("AR_TEST_PORT", "29571"))
-    init_method = f"tcp://127.0.0.1:{port}"
-    mp.set_start_method("spawn", force=True)
-    procs = []
-    for r in range(args.tp):
-        p = mp.Process(
-            target=_worker,
-            args=(
-                r,
-                args.tp,
-                init_method,
-                args.atoms,
-                args.grid_cap,
-                args.fanout,
-            ),
-        )
-        p.start()
-        procs.append(p)
-    codes = []
-    for p in procs:
-        p.join()
-        codes.append(p.exitcode)
-    print(f"exit codes: {codes}")
-    raise SystemExit(0 if all(c == 0 for c in codes) else 1)
+    pairs = [(m, HIDDEN) for m in SHAPES] + list(NARROW_SHAPES)
+    ranks = _spawn(
+        args.tp, pairs, atoms=args.atoms, grid_cap=args.grid_cap, fanout=args.fanout
+    )
+    failures = [f"rank {r}: {bad}" for r, bad in enumerate(ranks) if bad]
+
+    run_ahead_ranks = _spawn(
+        args.tp,
+        [(RUN_AHEAD_M, HIDDEN)],
+        atoms=args.atoms,
+        grid_cap=args.grid_cap,
+        fanout=args.fanout,
+        mode="run_ahead",
+    )
+    failures += [f"rank {r}: {bad}" for r, bad in enumerate(run_ahead_ranks) if bad]
+
+    if failures:
+        print("FAIL\n  " + "\n  ".join(failures))
+        raise SystemExit(1)
+    print("PASS")
 
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument("--rank", type=int, default=None)
+    parser.add_argument("--init-method", default=None)
+    parser.add_argument("--tp", type=int, default=2)
+    parser.add_argument("--atoms", type=int, default=DEFAULT_ATOMS)
+    parser.add_argument("--grid-cap", type=int, default=DEFAULT_GRID_CAP)
+    parser.add_argument("--fanout", default=DEFAULT_FANOUT, choices=("peer", "atom"))
+    parser.add_argument("--mode", default="shapes", choices=("shapes", "run_ahead"))
+    parser.add_argument("--tokens", default="")
+    parser.add_argument("--hiddens", default="")
+    parser.add_argument("--iters", type=int, default=RUN_AHEAD_ITERS)
+    parser.add_argument("--out", default=None)
+    known, rest = parser.parse_known_args()
+    if known.rank is not None:
+        known.tokens = [int(t) for t in known.tokens.split(",") if t]
+        known.hiddens = [int(h) for h in known.hiddens.split(",") if h]
+        if len(known.tokens) != len(known.hiddens):
+            raise SystemExit("tokens and hiddens lists must match")
+        _run_rank(known)
+    else:
+        sys.argv = [sys.argv[0]] + rest
+        main()
