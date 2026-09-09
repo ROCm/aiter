@@ -20,12 +20,16 @@ from .topk_per_row_decode import _load_f32x4, _warp_inclusive_prefix_i32
 _WAVE_SIZE = 32
 _VEC = 4
 _LOAD_UNROLL = 4
-_PASS1_HISTOGRAM_STAGES = 2
+_PASS1_HISTOGRAM_REPLICAS = 2
 _KEY_BITS = 32
 _LONG_RADIX_BITS = (12, 10, 10)
 _SHORT_RADIX_BITS = (11, 10, 11)
 _LONG_RADIX_SHIFTS = (_LONG_RADIX_BITS[1] + _LONG_RADIX_BITS[2], _LONG_RADIX_BITS[2], 0)
-_SHORT_RADIX_SHIFTS = (_SHORT_RADIX_BITS[1] + _SHORT_RADIX_BITS[2], _SHORT_RADIX_BITS[2], 0)
+_SHORT_RADIX_SHIFTS = (
+    _SHORT_RADIX_BITS[1] + _SHORT_RADIX_BITS[2],
+    _SHORT_RADIX_BITS[2],
+    0,
+)
 _LONG_RADIX_MASKS = tuple((1 << bits) - 1 for bits in _LONG_RADIX_BITS)
 _SHORT_RADIX_MASKS = tuple((1 << bits) - 1 for bits in _SHORT_RADIX_BITS)
 _HIGH_BUCKETS = 1 << _LONG_RADIX_BITS[0]
@@ -33,7 +37,7 @@ _LATER_BUCKETS = 1 << max(_LONG_RADIX_BITS[1:])
 _SHORT_HIGH_BUCKETS = 1 << _SHORT_RADIX_BITS[0]
 _MAX_ROW_ELEMENTS = ((1 << 32) - 1) // 4
 _COMPACT_CAPACITY = 4096
-_STABLE_FAST_MIN_ROW_LEN = 1 << 15
+_STABLE_INDEX_SORT_MIN_ROW_LEN = 1 << 15
 
 _FIRST_ABOVE = 0
 _FIRST_THRESHOLD = 1
@@ -84,15 +88,21 @@ def build_radix_topk_one_block_gfx1250_module(
     high_bins_per_thread = _HIGH_BUCKETS // block_threads
     later_bins_per_thread = _LATER_BUCKETS // block_threads
     short_bins_per_thread = _SHORT_HIGH_BUCKETS // block_threads
-    full_key_vector_steps = ((_COMPACT_CAPACITY // _VEC) + block_threads - 1) // block_threads
+    full_key_vector_steps = (
+        (_COMPACT_CAPACITY // _VEC) + block_threads - 1
+    ) // block_threads
     stable_sort_enabled = (
         stable and not short_rows and block_threads == 1024 and k <= 2048
     )
     stable_sort_capacity = 1 << (k - 1).bit_length() if stable_sort_enabled else 1
     stable_stage_capacity = k if stable_sort_enabled else 1
     stable_data_columns = 1 + int(write_values)
-    stable_sort_items_per_thread = (stable_sort_capacity + block_threads - 1) // block_threads
-    stable_sort_sizes, stable_sort_strides = _build_bitonic_schedule(stable_sort_capacity)
+    stable_sort_items_per_thread = (
+        stable_sort_capacity + block_threads - 1
+    ) // block_threads
+    stable_sort_sizes, stable_sort_strides = _build_bitonic_schedule(
+        stable_sort_capacity
+    )
     output_vector_count = k // _VEC
     output_vector_steps = (output_vector_count + block_threads - 1) // block_threads
     output_vector_elems = max(_VEC, output_vector_count * _VEC)
@@ -101,18 +111,20 @@ def build_radix_topk_one_block_gfx1250_module(
 
     @fx.struct
     class LongPass1Storage:
-        histograms: fx.Array[fx.Int32, _PASS1_HISTOGRAM_STAGES * _HIGH_BUCKETS, 16]
+        histograms: fx.Array[fx.Int32, _PASS1_HISTOGRAM_REPLICAS * _HIGH_BUCKETS, 16]
 
     @fx.struct
     class LongLaterStorage:
         histogram: fx.Array[fx.Int32, _LATER_BUCKETS, 16]
-        candidate_keys: fx.Array[fx.Int32, _COMPACT_CAPACITY, 16]
-        candidate_indices: fx.Array[fx.Int32, _COMPACT_CAPACITY, 16]
+        candidate_ordered_keys: fx.Array[fx.Int32, _COMPACT_CAPACITY, 16]
+        candidate_local_indices: fx.Array[fx.Int32, _COMPACT_CAPACITY, 16]
         stable_data: fx.Array[fx.Int32, stable_stage_capacity * stable_data_columns, 16]
 
     @fx.struct
     class ShortPass1Storage:
-        histograms: fx.Array[fx.Int32, _PASS1_HISTOGRAM_STAGES * _SHORT_HIGH_BUCKETS, 16]
+        histograms: fx.Array[
+            fx.Int32, _PASS1_HISTOGRAM_REPLICAS * _SHORT_HIGH_BUCKETS, 16
+        ]
         full_keys: fx.Array[fx.Int32, _COMPACT_CAPACITY, 16]
 
     @fx.union
@@ -173,11 +185,15 @@ def build_radix_topk_one_block_gfx1250_module(
         row_indices = fx.slice(indices, (row, None))
         row_values = fx.slice(value_output, (row, None))
         row_index_tiles = fx.logical_divide(
-            fx.make_view(fx.get_iter(row_indices), fx.make_layout(output_vector_elems, 1)),
+            fx.make_view(
+                fx.get_iter(row_indices), fx.make_layout(output_vector_elems, 1)
+            ),
             fx.make_layout(_VEC, 1),
         )
         row_value_tiles = fx.logical_divide(
-            fx.make_view(fx.get_iter(row_values), fx.make_layout(output_vector_elems, 1)),
+            fx.make_view(
+                fx.get_iter(row_values), fx.make_layout(output_vector_elems, 1)
+            ),
             fx.make_layout(_VEC, 1),
         )
 
@@ -196,7 +212,9 @@ def build_radix_topk_one_block_gfx1250_module(
             short_storage = storage.arena
         else:
             long_histogram_matrix = storage.arena.long_pass1.histograms.peek().view(
-                fx.make_layout((_PASS1_HISTOGRAM_STAGES, _HIGH_BUCKETS), (_HIGH_BUCKETS, 1))
+                fx.make_layout(
+                    (_PASS1_HISTOGRAM_REPLICAS, _HIGH_BUCKETS), (_HIGH_BUCKETS, 1)
+                )
             )
             long_histograms = (
                 fx.slice(long_histogram_matrix, (0, None)),
@@ -205,26 +223,34 @@ def build_radix_topk_one_block_gfx1250_module(
             histogram = storage.arena.long_later.histogram.peek().view(
                 fx.make_layout(_LATER_BUCKETS, 1)
             )
-            candidate_keys = storage.arena.long_later.candidate_keys.peek().view(
-                fx.make_layout(_COMPACT_CAPACITY, 1)
+            candidate_ordered_keys = (
+                storage.arena.long_later.candidate_ordered_keys.peek().view(
+                    fx.make_layout(_COMPACT_CAPACITY, 1)
+                )
             )
-            candidate_indices = storage.arena.long_later.candidate_indices.peek().view(
-                fx.make_layout(_COMPACT_CAPACITY, 1)
+            candidate_local_indices = (
+                storage.arena.long_later.candidate_local_indices.peek().view(
+                    fx.make_layout(_COMPACT_CAPACITY, 1)
+                )
             )
             stable_data = storage.arena.long_later.stable_data.peek().view(
                 fx.make_layout(
-                    (stable_stage_capacity, stable_data_columns), (1, stable_stage_capacity)
+                    (stable_stage_capacity, stable_data_columns),
+                    (1, stable_stage_capacity),
                 )
             )
-            stable_indices = fx.slice(stable_data, (None, 0))
-            stable_keys = stable_indices
+            staged_local_indices = fx.slice(stable_data, (None, 0))
+            staged_value_bits = staged_local_indices
             if const_expr(write_values):
-                stable_keys = fx.slice(stable_data, (None, 1))
+                staged_value_bits = fx.slice(stable_data, (None, 1))
             short_storage = storage.arena.short_pass1
 
         # Short-row arena
         short_histogram_matrix = short_storage.histograms.peek().view(
-            fx.make_layout((_PASS1_HISTOGRAM_STAGES, _SHORT_HIGH_BUCKETS), (_SHORT_HIGH_BUCKETS, 1))
+            fx.make_layout(
+                (_PASS1_HISTOGRAM_REPLICAS, _SHORT_HIGH_BUCKETS),
+                (_SHORT_HIGH_BUCKETS, 1),
+            )
         )
         short_histograms = (
             fx.slice(short_histogram_matrix, (0, None)),
@@ -249,18 +275,27 @@ def build_radix_topk_one_block_gfx1250_module(
 
         def classify_prefix(key, radix_shifts, prefix_threshold, levels):
             prefix_shift = radix_shifts[levels - 1]
-            prefix_mask = -1 if prefix_shift == 0 else (1 << (_KEY_BITS - prefix_shift)) - 1
+            prefix_mask = (
+                -1 if prefix_shift == 0 else (1 << (_KEY_BITS - prefix_shift)) - 1
+            )
             prefix = radix_bucket(key, prefix_shift, prefix_mask)
             comparable_prefix = prefix ^ sign_bit if levels == 3 else prefix
-            comparable_threshold = prefix_threshold ^ sign_bit if levels == 3 else prefix_threshold
-            return (comparable_prefix > comparable_threshold, prefix == prefix_threshold)
+            comparable_threshold = (
+                prefix_threshold ^ sign_bit if levels == 3 else prefix_threshold
+            )
+            return (
+                comparable_prefix > comparable_threshold,
+                prefix == prefix_threshold,
+            )
 
         def ordered_value(key):
             bits = (key < zero).select(key ^ sign_bit, key ^ fx.Int32(-1))
             return bits.bitcast(fx.Float32)
 
+        # FlyDSL tracks indexed stores as SSA writes: store helpers take writable
+        # views explicitly; orchestration helpers capture the fixed kernel views.
         def scatter_unstable_key(
-            col, key, above, equal, num_needed, row_indices, row_values, metadata
+            col, key, above, equal, num_needed, row_indices, row_values
         ):
             if above:
                 out_pos = atomic_add_i32(metadata, one, _RUNNING_ABOVE, "workgroup")
@@ -287,21 +322,23 @@ def build_radix_topk_one_block_gfx1250_module(
         def clear_histograms(histograms, bins_per_thread):
             for item in range_constexpr(bins_per_thread):
                 pos = tid + item * block_threads
-                for stage in range_constexpr(len(histograms)):
-                    histograms[stage][pos] = zero
+                for replica in range_constexpr(len(histograms)):
+                    histograms[replica][pos] = zero
             gpu.barrier()
 
         def merge_histograms(histograms, bins_per_thread):
             for item in range_constexpr(bins_per_thread):
                 pos = tid + item * block_threads
                 merged = histograms[0][pos]
-                for stage in range_constexpr(1, len(histograms)):
-                    merged = merged + histograms[stage][pos]
+                for replica in range_constexpr(1, len(histograms)):
+                    merged = merged + histograms[replica][pos]
                 histograms[0][pos] = merged
             gpu.barrier()
 
         def block_excl_prefix_i32(packed_local, scan):
-            packed_inclusive = _warp_inclusive_prefix_i32(packed_local, lane, _WAVE_SIZE)
+            packed_inclusive = _warp_inclusive_prefix_i32(
+                packed_local, lane, _WAVE_SIZE
+            )
             packed_exclusive = packed_inclusive - packed_local
             if lane == _WAVE_SIZE - 1:
                 scan[wave] = packed_inclusive
@@ -330,9 +367,9 @@ def build_radix_topk_one_block_gfx1250_module(
             threshold_slot,
             count_slot,
             histogram,
+            bins_per_thread,
             scan,
             metadata,
-            bins_per_thread,
         ):
             first_bin = tid * fx.Int32(bins_per_thread)
             counts = fx.make_rmem_tensor(bins_per_thread, fx.Int32)
@@ -352,7 +389,10 @@ def build_radix_topk_one_block_gfx1250_module(
                 active = lane < num_waves
                 safe_lane = active.select(lane, zero)
                 wave_total = active.select(scan[safe_lane], zero)
-                wave_prefix = _warp_inclusive_prefix_i32(wave_total, lane, _WAVE_SIZE) - wave_total
+                wave_prefix = (
+                    _warp_inclusive_prefix_i32(wave_total, lane, _WAVE_SIZE)
+                    - wave_total
+                )
                 if active:
                     scan[lane + num_waves] = wave_prefix
             gpu.barrier()
@@ -372,14 +412,16 @@ def build_radix_topk_one_block_gfx1250_module(
 
         # Global and LDS row iterators
         def scan_gm_row(visit_one, reverse=False):
+            """Visit per-thread work; callbacks must not use block collectives."""
+
             def visit_vector(col, values):
                 for item in range_constexpr(_VEC):
                     visit_one(col + item, values[item])
 
             unroll_stride = block_size * fx.Int32(_LOAD_UNROLL)
-            unroll_end = (full_vector_count > block_size * fx.Int32(_LOAD_UNROLL - 1)).select(
-                full_vector_count - block_size * fx.Int32(_LOAD_UNROLL - 1), zero
-            )
+            unroll_end = (
+                full_vector_count > block_size * fx.Int32(_LOAD_UNROLL - 1)
+            ).select(full_vector_count - block_size * fx.Int32(_LOAD_UNROLL - 1), zero)
             n_unroll = (tid < unroll_end).select(
                 (unroll_end - one - tid) // unroll_stride + one, zero
             )
@@ -411,13 +453,16 @@ def build_radix_topk_one_block_gfx1250_module(
             cleanup_offset = tid + n_unroll * unroll_stride
             for offset in range(cleanup_offset, full_vector_count, block_size):
                 vector_idx = vector_origin + vector_direction * offset
-                visit_vector(vector_idx * vec_width, _load_f32x4(input_vector_tiles, vector_idx))
+                visit_vector(
+                    vector_idx * vec_width, _load_f32x4(input_vector_tiles, vector_idx)
+                )
 
-            if const_expr(not reverse):
+            if const_expr(not reverse):  # noqa: SIM102 - constexpr guard
                 if remain_col < row_len:
                     visit_one(remain_col, input_row[remain_col])
 
         def scan_lds_keys(body):
+            """Visit valid cached keys; callbacks may run on only part of the block."""
             row_vectors = (row_len + fx.Int32(_VEC - 1)) // fx.Int32(_VEC)
             for step in range_constexpr(full_key_vector_steps):
                 vector_idx = step * block_threads + tid
@@ -425,7 +470,9 @@ def build_radix_topk_one_block_gfx1250_module(
                 safe_idx = active.select(vector_idx, zero)
                 fragment = fx.make_rmem_tensor(full_key_fragment_layout, fx.Int32)
                 fx.copy_atom_call(
-                    full_key_load_atom, fx.slice(full_key_tiles, (None, safe_idx)), fragment
+                    full_key_load_atom,
+                    fx.slice(full_key_tiles, (None, safe_idx)),
+                    fragment,
                 )
                 values = fragment.load()
                 col_base = vector_idx * vec_width
@@ -435,58 +482,35 @@ def build_radix_topk_one_block_gfx1250_module(
                         body(col, values[item])
 
         # Radix histogram passes
-        def accumulate_histogram_bucket(
-            col,
-            key,
-            shift,
-            mask,
-            histograms,
-            match_prefix=False,
-            prefix_threshold=None,
-            cache_key_index=False,
-            use_ping_pong=False,
-            full_keys=None,
-            candidate_keys=None,
-            candidate_indices=None,
-            stable_keys=None,
-            stable_indices=None,
-            row_indices=None,
-            row_values=None,
+        def accumulate_first_histogram(
+            col, key, shift, mask, histograms, cached_keys=None
         ):
             active = col < row_len
-            if full_keys is not None:
+            if cached_keys is not None:  # noqa: SIM102 - constexpr guard
                 if active:
-                    full_keys[col] = key
-            if match_prefix:
-                prefix_shift = shift + mask.bit_length()
-                prefix_mask = (1 << (_KEY_BITS - prefix_shift)) - 1
-                prefix = radix_bucket(key, prefix_shift, prefix_mask)
-                if cache_key_index:
-                    if active & (prefix > prefix_threshold):
-                        out_pos = atomic_add_i32(metadata, one, _RUNNING_ABOVE, "workgroup")
-                        if out_pos < top_k:
-                            if const_expr(stable):
-                                if const_expr(stable_sort_enabled):
-                                    stable_indices[out_pos] = col
-                                    if const_expr(write_values):
-                                        stable_keys[out_pos] = ordered_value(key).bitcast(fx.Int32)
-                            else:
-                                row_indices[out_pos] = row_start + col
-                                if const_expr(write_values):
-                                    row_values[out_pos] = ordered_value(key)
-                active = active & (prefix == prefix_threshold)
+                    cached_keys[col] = key
             if active:
                 bucket = radix_bucket(key, shift, mask)
-                if not use_ping_pong or (wave & one) == zero:
+                # Wave parity selects a replica; these are not temporal stages.
+                if (wave & one) == zero:
                     atomic_add_i32(histograms[0], one, bucket, "workgroup")
                 else:
                     atomic_add_i32(histograms[1], one, bucket, "workgroup")
-            if cache_key_index:
-                if active:
-                    candidate_pos = atomic_add_i32(metadata, one, _CANDIDATE_COUNT, "workgroup")
-                    if candidate_pos < fx.Int32(_COMPACT_CAPACITY):
-                        candidate_keys[candidate_pos] = key
-                        candidate_indices[candidate_pos] = col
+
+        def preceding_prefix(key, shift, mask):
+            prefix_shift = shift + mask.bit_length()
+            prefix_mask = (1 << (_KEY_BITS - prefix_shift)) - 1
+            return radix_bucket(key, prefix_shift, prefix_mask)
+
+        def accumulate_prefix_histogram(
+            col, key, shift, mask, histogram, prefix_threshold
+        ):
+            active = col < row_len
+            prefix = preceding_prefix(key, shift, mask)
+            active = active & (prefix == prefix_threshold)
+            if active:
+                bucket = radix_bucket(key, shift, mask)
+                atomic_add_i32(histogram, one, bucket, "workgroup")
 
         # Non-stable emitters
         def scatter_unstable_keys(
@@ -495,38 +519,39 @@ def build_radix_topk_one_block_gfx1250_module(
             prefix_threshold,
             num_needed,
             levels,
-            row_indices,
-            row_values,
-            metadata,
             reset_above=True,
             candidate_count=None,
-            candidate_keys=None,
-            candidate_indices=None,
+            candidate_ordered_keys=None,
+            candidate_local_indices=None,
         ):
             reset_scatter_counters(metadata, reset_above=reset_above)
 
             def emit(col, key):
-                above, equal = classify_prefix(key, radix_shifts, prefix_threshold, levels)
+                above, equal = classify_prefix(
+                    key, radix_shifts, prefix_threshold, levels
+                )
                 scatter_unstable_key(
-                    col, key, above, equal, num_needed, row_indices, row_values, metadata
+                    col, key, above, equal, num_needed, row_indices, row_values
                 )
 
-            if source == "lds":
+            if source == "cached_row":
                 scan_lds_keys(emit)
-            elif source == "gm":
+            elif source == "global_row":
                 scan_gm_row(lambda col, value: emit(col, ordered_key(value)))
             else:
                 for pos in range(tid, candidate_count, block_size):
-                    emit(candidate_indices[pos], candidate_keys[pos])
+                    emit(candidate_local_indices[pos], candidate_ordered_keys[pos])
 
         # Stable emitters
-        def sort_and_store_stable(row_indices, row_values, candidate_keys, candidate_indices):
+        def sort_and_store_stable(
+            selected_value_bits, selected_local_indices, row_indices, row_values
+        ):
             for item in range_constexpr(stable_sort_items_per_thread):
                 pos = tid + item * block_threads
                 if (pos >= top_k) & (pos < fx.Int32(stable_sort_capacity)):
-                    candidate_indices[pos] = fx.Int32(2147483647)
+                    selected_local_indices[pos] = fx.Int32(2147483647)
                     if const_expr(write_values):
-                        candidate_keys[pos] = zero
+                        selected_value_bits[pos] = zero
             gpu.barrier()
 
             for stage in range_constexpr(len(stable_sort_sizes)):
@@ -536,117 +561,125 @@ def build_radix_topk_one_block_gfx1250_module(
                     pos = tid + item * block_threads
                     partner = pos ^ fx.Int32(stride)
                     if (pos < fx.Int32(stable_sort_capacity)) & (partner > pos):
-                        left = candidate_indices[pos]
-                        right = candidate_indices[partner]
+                        left = selected_local_indices[pos]
+                        right = selected_local_indices[partner]
                         ascending = (pos & fx.Int32(size)) == zero
                         swap = ascending.select(left > right, left < right)
-                        candidate_indices[pos] = swap.select(right, left)
-                        candidate_indices[partner] = swap.select(left, right)
+                        selected_local_indices[pos] = swap.select(right, left)
+                        selected_local_indices[partner] = swap.select(left, right)
                         if const_expr(write_values):
-                            left_value = candidate_keys[pos]
-                            right_value = candidate_keys[partner]
-                            candidate_keys[pos] = swap.select(right_value, left_value)
-                            candidate_keys[partner] = swap.select(left_value, right_value)
+                            left_value = selected_value_bits[pos]
+                            right_value = selected_value_bits[partner]
+                            selected_value_bits[pos] = swap.select(
+                                right_value, left_value
+                            )
+                            selected_value_bits[partner] = swap.select(
+                                left_value, right_value
+                            )
                 gpu.barrier()
 
             for item in range_constexpr(stable_sort_items_per_thread):
                 pos = tid + item * block_threads
                 if pos < top_k:
-                    col = candidate_indices[pos]
+                    col = selected_local_indices[pos]
                     row_indices[pos] = row_start + col
                     if const_expr(write_values):
-                        row_values[pos] = candidate_keys[pos].bitcast(fx.Float32)
+                        row_values[pos] = selected_value_bits[pos].bitcast(fx.Float32)
 
         def scatter_stable_sorted_keys(
             source,
             prefix_threshold,
             num_needed,
             levels,
-            row_indices,
-            row_values,
-            candidate_keys,
-            candidate_indices,
-            stable_keys,
-            stable_indices,
-            metadata,
+            candidate_ordered_keys,
+            candidate_local_indices,
+            staged_value_bits,
+            staged_local_indices,
             candidate_count=None,
         ):
+            # These aliases hold raw value bits and local indices during index sorting.
+            selected_value_bits = candidate_ordered_keys
+            selected_local_indices = candidate_local_indices
             definite_expected = top_k - num_needed
-            if source == "gm":
+            if source == "global_row":
                 reset_scatter_counters(metadata)
 
             def collect(
-                col, key, candidate_keys, candidate_indices, stable_keys, stable_indices, metadata
+                col,
+                key,
+                output_value_bits,
+                output_local_indices,
             ):
-                above, equal = classify_prefix(key, _LONG_RADIX_SHIFTS, prefix_threshold, levels)
-                if source == "gm":
+                above, equal = classify_prefix(
+                    key, _LONG_RADIX_SHIFTS, prefix_threshold, levels
+                )
+                if source == "global_row":
                     if above:
                         pos = atomic_add_i32(metadata, one, _RUNNING_ABOVE, "workgroup")
                         if pos < definite_expected:
-                            candidate_indices[pos] = col
+                            output_local_indices[pos] = col
                             if const_expr(write_values):
-                                candidate_keys[pos] = ordered_value(key).bitcast(fx.Int32)
+                                output_value_bits[pos] = ordered_value(key).bitcast(
+                                    fx.Int32
+                                )
                     elif equal:
-                        tie_pos = atomic_add_i32(metadata, one, _RUNNING_EQUAL, "workgroup")
+                        tie_pos = atomic_add_i32(
+                            metadata, one, _RUNNING_EQUAL, "workgroup"
+                        )
                         if tie_pos < num_needed:
                             pos = definite_expected + tie_pos
-                            candidate_indices[pos] = col
+                            output_local_indices[pos] = col
                             if const_expr(write_values):
-                                candidate_keys[pos] = ordered_value(key).bitcast(fx.Int32)
+                                output_value_bits[pos] = ordered_value(key).bitcast(
+                                    fx.Int32
+                                )
                 elif above | equal:
                     out_pos = atomic_add_i32(metadata, one, _RUNNING_ABOVE, "workgroup")
                     if out_pos < top_k:
-                        stable_indices[out_pos] = col
+                        output_local_indices[out_pos] = col
                         if const_expr(write_values):
-                            stable_keys[out_pos] = ordered_value(key).bitcast(fx.Int32)
+                            output_value_bits[out_pos] = ordered_value(key).bitcast(
+                                fx.Int32
+                            )
 
-            if source == "gm":
+            if source == "global_row":
                 scan_gm_row(
                     lambda col, value: collect(
                         col,
                         ordered_key(value),
-                        candidate_keys,
-                        candidate_indices,
-                        stable_keys,
-                        stable_indices,
-                        metadata,
+                        selected_value_bits,
+                        selected_local_indices,
                     )
                 )
             else:
                 for pos in range(tid, candidate_count, block_size):
                     collect(
-                        candidate_indices[pos],
-                        candidate_keys[pos],
-                        candidate_keys,
-                        candidate_indices,
-                        stable_keys,
-                        stable_indices,
-                        metadata,
+                        candidate_local_indices[pos],
+                        candidate_ordered_keys[pos],
+                        staged_value_bits,
+                        staged_local_indices,
                     )
             gpu.barrier()
 
-            if source == "candidates":
+            # The barrier above completes candidate reads before reusing their LDS.
+            if source == "compacted_candidates":
                 for item in range_constexpr(stable_sort_items_per_thread):
                     pos = tid + item * block_threads
                     if pos < top_k:
-                        candidate_indices[pos] = stable_indices[pos]
+                        selected_local_indices[pos] = staged_local_indices[pos]
                         if const_expr(write_values):
-                            candidate_keys[pos] = stable_keys[pos]
+                            selected_value_bits[pos] = staged_value_bits[pos]
                 gpu.barrier()
 
-            sort_and_store_stable(row_indices, row_values, candidate_keys, candidate_indices)
+            sort_and_store_stable(
+                selected_value_bits, selected_local_indices, row_indices, row_values
+            )
 
         def scatter_stable_ordered_keys(
-            source,
-            radix_shifts,
-            prefix_threshold,
-            num_needed,
-            levels,
-            row_indices,
-            row_values,
-            scan,
-            metadata,
+            source, radix_shifts, prefix_threshold, num_needed, levels
         ):
+            """Scan uniform block tiles: every thread must enter each scatter_step."""
+
             def scatter_step(elems, above_base, equal_base, row_indices, row_values):
                 num_elems = len(elems)
                 # Class encoding: 2 = above, 1 = equal, 0 = below.
@@ -656,17 +689,23 @@ def build_radix_topk_one_block_gfx1250_module(
                     valid, key, _ = elems[item]
                     classes[item] = 0
                     if valid:
-                        above, equal = classify_prefix(key, radix_shifts, prefix_threshold, levels)
+                        above, equal = classify_prefix(
+                            key, radix_shifts, prefix_threshold, levels
+                        )
                         if above:
                             classes[item] = 2
-                            packed_local = packed_local + fx.Int32(1 << 16)
+                            packed_local = packed_local + fx.Int32(
+                                1 << _PACKED_COUNT_BITS
+                            )
                         elif equal:
                             classes[item] = 1
                             packed_local = packed_local + 1
 
-                packed_prefix, packed_step_total = block_excl_prefix_i32(packed_local, scan)
-                my_above = above_base + (packed_prefix >> 16)
-                my_eq = equal_base + (packed_prefix & fx.Int32(0xFFFF))
+                packed_prefix, packed_step_total = block_excl_prefix_i32(
+                    packed_local, scan
+                )
+                my_above = above_base + (packed_prefix >> _PACKED_COUNT_BITS)
+                my_eq = equal_base + (packed_prefix & fx.Int32(_PACKED_COUNT_MASK))
                 for item in range_constexpr(num_elems):
                     valid, key, col = elems[item]
                     cls = classes[item]
@@ -684,15 +723,19 @@ def build_radix_topk_one_block_gfx1250_module(
                                 if const_expr(write_values):
                                     row_values[out_pos] = ordered_value(key)
                             my_eq = my_eq + 1
-                above_base = above_base + (packed_step_total >> 16)
-                next_eq_base = equal_base + (packed_step_total & fx.Int32(0xFFFF))
-                equal_base = (next_eq_base < num_needed).select(next_eq_base, num_needed)
+                above_base = above_base + (packed_step_total >> _PACKED_COUNT_BITS)
+                next_eq_base = equal_base + (
+                    packed_step_total & fx.Int32(_PACKED_COUNT_MASK)
+                )
+                equal_base = (next_eq_base < num_needed).select(
+                    next_eq_base, num_needed
+                )
                 gpu.barrier()
                 return above_base, equal_base
 
             above_base = 0
             equal_base = 0
-            if source == "lds":
+            if source == "cached_row":
                 row_vectors = (row_len + fx.Int32(_VEC - 1)) // vec_width
                 for step in range_constexpr(full_key_vector_steps):
                     vector_idx = step * block_threads + tid
@@ -744,101 +787,69 @@ def build_radix_topk_one_block_gfx1250_module(
             candidate_count,
             prefix_threshold,
             num_needed,
-            row_indices,
-            row_values,
-            scan,
-            metadata,
-            candidate_keys,
-            candidate_indices,
-            stable_keys,
-            stable_indices,
+            candidate_ordered_keys,
+            candidate_local_indices,
+            staged_value_bits,
+            staged_local_indices,
         ):
-            if const_expr(stable_sort_enabled):
-                can_use_fast = (row_len >= fx.Int32(_STABLE_FAST_MIN_ROW_LEN)) & (
-                    metadata[_SELECTED_BUCKET_COUNT] == num_needed
+            def scatter_ordered():
+                scatter_stable_ordered_keys(
+                    "global_row", _LONG_RADIX_SHIFTS, prefix_threshold, num_needed, 3
                 )
-                can_use_compact_fast = can_use_fast & (
+
+            if const_expr(stable_sort_enabled):
+                can_use_index_sort = (
+                    row_len >= fx.Int32(_STABLE_INDEX_SORT_MIN_ROW_LEN)
+                ) & (metadata[_SELECTED_BUCKET_COUNT] == num_needed)
+                can_sort_compacted_indices = can_use_index_sort & (
                     candidate_count <= fx.Int32(_COMPACT_CAPACITY)
                 )
-                if can_use_compact_fast:
+                if can_sort_compacted_indices:
                     scatter_stable_sorted_keys(
-                        "candidates",
+                        "compacted_candidates",
                         prefix_threshold,
                         num_needed,
                         3,
-                        row_indices,
-                        row_values,
-                        candidate_keys,
-                        candidate_indices,
-                        stable_keys,
-                        stable_indices,
-                        metadata,
+                        candidate_ordered_keys,
+                        candidate_local_indices,
+                        staged_value_bits,
+                        staged_local_indices,
                         candidate_count=candidate_count,
                     )
                 else:
-                    if can_use_fast:
+                    if can_use_index_sort:
                         scatter_stable_sorted_keys(
-                            "gm",
+                            "global_row",
                             prefix_threshold,
                             num_needed,
                             3,
-                            row_indices,
-                            row_values,
-                            candidate_keys,
-                            candidate_indices,
-                            stable_keys,
-                            stable_indices,
-                            metadata,
+                            candidate_ordered_keys,
+                            candidate_local_indices,
+                            staged_value_bits,
+                            staged_local_indices,
                         )
                     else:
-                        scatter_stable_ordered_keys(
-                            "gm",
-                            _LONG_RADIX_SHIFTS,
-                            prefix_threshold,
-                            num_needed,
-                            3,  # level
-                            row_indices,
-                            row_values,
-                            scan,
-                            metadata,
-                        )
+                        scatter_ordered()
             else:
-                scatter_stable_ordered_keys(
-                    "gm",
-                    _LONG_RADIX_SHIFTS,
-                    prefix_threshold,
-                    num_needed,
-                    3,  # level
-                    row_indices,
-                    row_values,
-                    scan,
-                    metadata,
-                )
+                scatter_ordered()
 
-        def run_cached_path(histograms, full_keys, row_indices, row_values, scan, metadata):
+        def run_cached_path(histograms):
             def scatter_selection(prefix_threshold, num_needed, levels):
                 if const_expr(stable):
                     scatter_stable_ordered_keys(
-                        "lds",
+                        "cached_row",
                         _SHORT_RADIX_SHIFTS,
                         prefix_threshold,
                         num_needed,
                         levels,
-                        row_indices,
-                        row_values,
-                        scan,
-                        metadata,
                     )
                 else:
                     scatter_unstable_keys(
-                        "lds",
+                        "cached_row",
                         _SHORT_RADIX_SHIFTS,
                         prefix_threshold,
                         num_needed,
                         levels,
-                        row_indices,
-                        row_values,
-                        metadata,
                     )
 
             # A return inside a dynamic FlyDSL if only exits its generated
@@ -846,14 +857,13 @@ def build_radix_topk_one_block_gfx1250_module(
             # First radix pass.
             clear_histograms(histograms, short_bins_per_thread)
             scan_gm_row(
-                lambda col, value: accumulate_histogram_bucket(
+                lambda col, value: accumulate_first_histogram(
                     col,
                     ordered_key(value),
                     _SHORT_RADIX_SHIFTS[0],
                     _SHORT_RADIX_MASKS[0],
                     histograms,
-                    use_ping_pong=True,
-                    full_keys=full_keys,
+                    cached_keys=full_keys,
                 )
             )
             gpu.barrier()
@@ -864,9 +874,9 @@ def build_radix_topk_one_block_gfx1250_module(
                 _FIRST_THRESHOLD,
                 _SELECTED_BUCKET_COUNT,
                 histograms[0],
+                short_bins_per_thread,
                 scan,
                 metadata,
-                short_bins_per_thread,
             )
 
             remaining_k = top_k - metadata[_FIRST_ABOVE]
@@ -878,14 +888,13 @@ def build_radix_topk_one_block_gfx1250_module(
                 # Second radix pass.
                 clear_histograms((histograms[0],), short_bins_per_thread)
                 scan_lds_keys(
-                    lambda col, key: accumulate_histogram_bucket(
+                    lambda col, key: accumulate_prefix_histogram(
                         col,
                         key,
                         _SHORT_RADIX_SHIFTS[1],
                         _SHORT_RADIX_MASKS[1],
-                        (histograms[0],),
-                        match_prefix=True,
-                        prefix_threshold=prefix_threshold,
+                        histograms[0],
+                        prefix_threshold,
                     )
                 )
                 gpu.barrier()
@@ -895,9 +904,9 @@ def build_radix_topk_one_block_gfx1250_module(
                     _SECOND_THRESHOLD,
                     _SELECTED_BUCKET_COUNT,
                     histograms[0],
+                    short_bins_per_thread,
                     scan,
                     metadata,
-                    short_bins_per_thread,
                 )
 
                 remaining_k = remaining_k - metadata[_SECOND_ABOVE]
@@ -911,14 +920,13 @@ def build_radix_topk_one_block_gfx1250_module(
                     # Third radix pass.
                     clear_histograms((histograms[0],), short_bins_per_thread)
                     scan_lds_keys(
-                        lambda col, key: accumulate_histogram_bucket(
+                        lambda col, key: accumulate_prefix_histogram(
                             col,
                             key,
                             _SHORT_RADIX_SHIFTS[2],
                             _SHORT_RADIX_MASKS[2],
-                            (histograms[0],),
-                            match_prefix=True,
-                            prefix_threshold=prefix_threshold,
+                            histograms[0],
+                            prefix_threshold,
                         )
                     )
                     gpu.barrier()
@@ -928,9 +936,9 @@ def build_radix_topk_one_block_gfx1250_module(
                         _THIRD_THRESHOLD,
                         _SELECTED_BUCKET_COUNT,
                         histograms[0],
+                        short_bins_per_thread,
                         scan,
                         metadata,
-                        short_bins_per_thread,
                     )
 
                     remaining_k = remaining_k - metadata[_THIRD_ABOVE]
@@ -942,25 +950,62 @@ def build_radix_topk_one_block_gfx1250_module(
         def run_streaming_path(
             histograms,
             histogram,
-            candidate_keys,
-            candidate_indices,
-            stable_keys,
-            stable_indices,
-            row_indices,
-            row_values,
-            scan,
-            metadata,
+            candidate_ordered_keys,
+            candidate_local_indices,
+            staged_value_bits,
+            staged_local_indices,
         ):
+            def accumulate_compacted_histogram(
+                col,
+                key,
+                prefix_threshold,
+                candidate_ordered_keys,
+                candidate_local_indices,
+                staged_value_bits,
+                staged_local_indices,
+                row_indices,
+                row_values,
+            ):
+                """Collect higher keys, then histogram and compact the matching bucket."""
+                shift = _LONG_RADIX_SHIFTS[1]
+                mask = _LONG_RADIX_MASKS[1]
+                active = col < row_len
+                prefix = preceding_prefix(key, shift, mask)
+                if active & (prefix > prefix_threshold):
+                    out_pos = atomic_add_i32(metadata, one, _RUNNING_ABOVE, "workgroup")
+                    if out_pos < top_k:
+                        if const_expr(stable):
+                            if const_expr(stable_sort_enabled):
+                                staged_local_indices[out_pos] = col
+                                if const_expr(write_values):
+                                    staged_value_bits[out_pos] = ordered_value(
+                                        key
+                                    ).bitcast(fx.Int32)
+                        else:
+                            row_indices[out_pos] = row_start + col
+                            if const_expr(write_values):
+                                row_values[out_pos] = ordered_value(key)
+                active = active & (prefix == prefix_threshold)
+                if active:
+                    bucket = radix_bucket(key, shift, mask)
+                    atomic_add_i32(histogram, one, bucket, "workgroup")
+                if active:
+                    candidate_pos = atomic_add_i32(
+                        metadata, one, _CANDIDATE_COUNT, "workgroup"
+                    )
+                    if candidate_pos < fx.Int32(_COMPACT_CAPACITY):
+                        candidate_ordered_keys[candidate_pos] = key
+                        candidate_local_indices[candidate_pos] = col
+
             # Level 1: select the high radix bucket.
             clear_histograms(histograms, high_bins_per_thread)
             scan_gm_row(
-                lambda col, value: accumulate_histogram_bucket(
+                lambda col, value: accumulate_first_histogram(
                     col,
                     ordered_key(value),
                     _LONG_RADIX_SHIFTS[0],
                     _LONG_RADIX_MASKS[0],
                     histograms,
-                    use_ping_pong=True,
                 )
             )
             gpu.barrier()
@@ -971,9 +1016,9 @@ def build_radix_topk_one_block_gfx1250_module(
                 _FIRST_THRESHOLD,
                 _SELECTED_BUCKET_COUNT,
                 histograms[0],
+                high_bins_per_thread,
                 scan,
                 metadata,
-                high_bins_per_thread,
             )
 
             remaining_k = top_k - metadata[_FIRST_ABOVE]
@@ -986,34 +1031,23 @@ def build_radix_topk_one_block_gfx1250_module(
             if can_finish:
                 # Fast exit after the first radix pass.
                 scatter_unstable_keys(
-                    "gm",
-                    _LONG_RADIX_SHIFTS,
-                    prefix_threshold,
-                    remaining_k,
-                    1,
-                    row_indices,
-                    row_values,
-                    metadata,
+                    "global_row", _LONG_RADIX_SHIFTS, prefix_threshold, remaining_k, 1
                 )
             else:
-                # Level 2: compact the selected high bucket and select its middle bucket.
+                # Level 2 reuses the first-pass histogram arena after choose_threshold
+                # has published its metadata and synchronized the block.
                 clear_histograms((histogram,), later_bins_per_thread)
                 scan_gm_row(
-                    lambda col, value: accumulate_histogram_bucket(
+                    lambda col, value: accumulate_compacted_histogram(
                         col,
                         ordered_key(value),
-                        _LONG_RADIX_SHIFTS[1],
-                        _LONG_RADIX_MASKS[1],
-                        (histogram,),
-                        match_prefix=True,
-                        prefix_threshold=prefix_threshold,
-                        cache_key_index=True,
-                        candidate_keys=candidate_keys,
-                        candidate_indices=candidate_indices,
-                        stable_keys=stable_keys,
-                        stable_indices=stable_indices,
-                        row_indices=row_indices,
-                        row_values=row_values,
+                        prefix_threshold,
+                        candidate_ordered_keys,
+                        candidate_local_indices,
+                        staged_value_bits,
+                        staged_local_indices,
+                        row_indices,
+                        row_values,
                     ),
                     reverse=True,
                 )
@@ -1025,9 +1059,9 @@ def build_radix_topk_one_block_gfx1250_module(
                     _SECOND_THRESHOLD,
                     _SELECTED_BUCKET_COUNT,
                     histogram,
+                    later_bins_per_thread,
                     scan,
                     metadata,
-                    later_bins_per_thread,
                 )
 
                 remaining_k = remaining_k - metadata[_SECOND_ABOVE]
@@ -1042,43 +1076,38 @@ def build_radix_topk_one_block_gfx1250_module(
                 if can_finish:
                     # Fast exit after the second radix pass.
                     scatter_unstable_keys(
-                        "candidates",
+                        "compacted_candidates",
                         _LONG_RADIX_SHIFTS,
                         prefix_threshold,
                         remaining_k,
                         2,
-                        row_indices,
-                        row_values,
-                        metadata,
                         reset_above=False,
                         candidate_count=candidate_count,
-                        candidate_keys=candidate_keys,
-                        candidate_indices=candidate_indices,
+                        candidate_ordered_keys=candidate_ordered_keys,
+                        candidate_local_indices=candidate_local_indices,
                     )
                 else:
                     # Level 3: select the low bucket and emit the final result.
                     clear_histograms((histogram,), later_bins_per_thread)
                     if candidate_count <= fx.Int32(_COMPACT_CAPACITY):
                         for pos in range(tid, candidate_count, block_size):
-                            accumulate_histogram_bucket(
+                            accumulate_prefix_histogram(
                                 pos,
-                                candidate_keys[pos],
+                                candidate_ordered_keys[pos],
                                 _LONG_RADIX_SHIFTS[2],
                                 _LONG_RADIX_MASKS[2],
-                                (histogram,),
-                                match_prefix=True,
-                                prefix_threshold=prefix_threshold,
+                                histogram,
+                                prefix_threshold,
                             )
                     else:
                         scan_gm_row(
-                            lambda col, value: accumulate_histogram_bucket(
+                            lambda col, value: accumulate_prefix_histogram(
                                 col,
                                 ordered_key(value),
                                 _LONG_RADIX_SHIFTS[2],
                                 _LONG_RADIX_MASKS[2],
-                                (histogram,),
-                                match_prefix=True,
-                                prefix_threshold=prefix_threshold,
+                                histogram,
+                                prefix_threshold,
                             )
                         )
                     gpu.barrier()
@@ -1088,9 +1117,9 @@ def build_radix_topk_one_block_gfx1250_module(
                         _THIRD_THRESHOLD,
                         _SELECTED_BUCKET_COUNT,
                         histogram,
+                        later_bins_per_thread,
                         scan,
                         metadata,
-                        later_bins_per_thread,
                     )
 
                     # All radix passes are complete; write the result.
@@ -1103,46 +1132,34 @@ def build_radix_topk_one_block_gfx1250_module(
                             candidate_count,
                             prefix_threshold,
                             remaining_k,
-                            row_indices,
-                            row_values,
-                            scan,
-                            metadata,
-                            candidate_keys,
-                            candidate_indices,
-                            stable_keys,
-                            stable_indices,
+                            candidate_ordered_keys,
+                            candidate_local_indices,
+                            staged_value_bits,
+                            staged_local_indices,
                         )
                     else:
                         if candidate_count <= fx.Int32(_COMPACT_CAPACITY):
                             scatter_unstable_keys(
-                                "candidates",
+                                "compacted_candidates",
                                 _LONG_RADIX_SHIFTS,
                                 prefix_threshold,
                                 remaining_k,
                                 3,
-                                row_indices,
-                                row_values,
-                                metadata,
                                 reset_above=False,
                                 candidate_count=candidate_count,
-                                candidate_keys=candidate_keys,
-                                candidate_indices=candidate_indices,
+                                candidate_ordered_keys=candidate_ordered_keys,
+                                candidate_local_indices=candidate_local_indices,
                             )
                         else:
                             scatter_unstable_keys(
-                                "gm",
+                                "global_row",
                                 _LONG_RADIX_SHIFTS,
                                 prefix_threshold,
                                 remaining_k,
                                 3,
-                                row_indices,
-                                row_values,
-                                metadata,
                             )
 
-        def write_direct_output(
-            row_indices, row_values, row_index_tiles, row_value_tiles
-        ):
+        def write_direct_output(row_indices, row_values):
             for step in range_constexpr(output_vector_steps):
                 vector_idx = step * block_threads + tid
                 if vector_idx < output_vector_count:
@@ -1150,13 +1167,10 @@ def build_radix_topk_one_block_gfx1250_module(
                     fragment = fx.make_rmem_tensor(index_fragment_layout, fx.Int32)
                     if vector_idx < full_vector_count:
                         index_values = [
-                            row_start + col + item
-                            for item in range_constexpr(_VEC)
+                            row_start + col + item for item in range_constexpr(_VEC)
                         ]
                         fragment.store(
-                            fx.Vector.from_elements(
-                                index_values, dtype=fx.Int32
-                            )
+                            fx.Vector.from_elements(index_values, dtype=fx.Int32)
                         )
                     else:
                         if col < row_len:
@@ -1167,20 +1181,20 @@ def build_radix_topk_one_block_gfx1250_module(
                                 for item in range_constexpr(_VEC)
                             ]
                             fragment.store(
-                                fx.Vector.from_elements(
-                                    index_values, dtype=fx.Int32
-                                )
+                                fx.Vector.from_elements(index_values, dtype=fx.Int32)
                             )
                         else:
-                            fragment.store(
-                                fx.Vector.filled(_VEC, -1, fx.Int32)
-                            )
+                            fragment.store(fx.Vector.filled(_VEC, -1, fx.Int32))
                     fx.copy_atom_call(
-                        index_store_atom, fragment, fx.slice(row_index_tiles, (None, vector_idx))
+                        index_store_atom,
+                        fragment,
+                        fx.slice(row_index_tiles, (None, vector_idx)),
                     )
 
                     if const_expr(write_values):
-                        value_fragment = fx.make_rmem_tensor(value_fragment_layout, fx.Float32)
+                        value_fragment = fx.make_rmem_tensor(
+                            value_fragment_layout, fx.Float32
+                        )
                         if vector_idx < full_vector_count:
                             value_fragment.store(
                                 _load_f32x4(input_vector_tiles, vector_idx)
@@ -1202,9 +1216,7 @@ def build_radix_topk_one_block_gfx1250_module(
                                 )
                             else:
                                 value_fragment.store(
-                                    fx.Vector.filled(
-                                        _VEC, float("-inf"), fx.Float32
-                                    )
+                                    fx.Vector.filled(_VEC, float("-inf"), fx.Float32)
                                 )
                         fx.copy_atom_call(
                             value_store_atom,
@@ -1215,16 +1227,16 @@ def build_radix_topk_one_block_gfx1250_module(
             tail = output_vector_count * _VEC + tid
             if tail < k:
                 valid = tail < row_len
+                safe_tail = valid.select(tail, zero)
                 row_indices[tail] = valid.select(row_start + tail, fx.Int32(-1))
                 if const_expr(write_values):
-                    output_value = fx.Float32(float("-inf"))
-                    if valid:
-                        output_value = input_row[tail]
-                    row_values[tail] = output_value
+                    row_values[tail] = valid.select(
+                        input_row[safe_tail], fx.Float32(float("-inf"))
+                    )
 
         # Kernel control flow
         if row_len <= top_k:
-            write_direct_output(row_indices, row_values, row_index_tiles, row_value_tiles)
+            write_direct_output(row_indices, row_values)
 
         if row_len > top_k:
             if tid < _METADATA_SIZE:
@@ -1232,26 +1244,18 @@ def build_radix_topk_one_block_gfx1250_module(
             gpu.barrier()
 
             if const_expr(short_rows):
-                run_cached_path(
-                    short_histograms, full_keys, row_indices, row_values, scan, metadata
-                )
+                run_cached_path(short_histograms)
             else:
                 if row_len <= fx.Int32(_COMPACT_CAPACITY):
-                    run_cached_path(
-                        short_histograms, full_keys, row_indices, row_values, scan, metadata
-                    )
+                    run_cached_path(short_histograms)
                 else:
                     run_streaming_path(
                         long_histograms,
                         histogram,
-                        candidate_keys,
-                        candidate_indices,
-                        stable_keys,
-                        stable_indices,
-                        row_indices,
-                        row_values,
-                        scan,
-                        metadata,
+                        candidate_ordered_keys,
+                        candidate_local_indices,
+                        staged_value_bits,
+                        staged_local_indices,
                     )
 
     @flyc.jit
