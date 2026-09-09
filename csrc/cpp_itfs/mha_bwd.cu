@@ -484,12 +484,16 @@ float fmha_v3_bwd(mha_bwd_args a, const ck_tile::stream_config& s)
                                                                          dqdkdv_cfgs,
                                                                          post_cfgs);
 
+    fprintf(stderr, "DEBUG fmha_v3_bwd: pre='%s' dqdkdv='%s' post='%s' need_post=%d\n",
+            pre_kernel.c_str(), dqdkdv_kernel.c_str(), post_kernel.c_str(), (int)need_post_processing);
     if((pre_kernel == "") || (dqdkdv_kernel == ""))
     {
+        fprintf(stderr, "DEBUG: kernel lookup failed\n");
         return -1;
     }
     if(need_post_processing && (post_kernel == ""))
     {
+        fprintf(stderr, "DEBUG: skipping post-processing (no post kernel for hdim=%d)\n", a.hdim_q);
         need_post_processing = false;
     }
 
@@ -691,9 +695,36 @@ float fmha_v3_bwd(mha_bwd_args a, const ck_tile::stream_config& s)
 #endif
     }
 
+    // Debug: dump all dqdkdv_args fields
+    {
+        auto& A = dqdkdv_args;
+        fprintf(stderr, "DEBUG dqdkdv_args dump:\n");
+        fprintf(stderr, "  ptrs: dq=%p dk=%p dv=%p q=%p k=%p v=%p do=%p lse=%p d=%p\n",
+                (void*)(uintptr_t)A.ptr_dq, (void*)(uintptr_t)A.ptr_dk, (void*)(uintptr_t)A.ptr_dv,
+                (void*)(uintptr_t)A.ptr_q, (void*)(uintptr_t)A.ptr_k, (void*)(uintptr_t)A.ptr_v,
+                (void*)(uintptr_t)A.ptr_do, (void*)(uintptr_t)A.ptr_lse, (void*)(uintptr_t)A.ptr_d);
+        fprintf(stderr, "  scalar=0x%08x log2e=0x%08x\n", *(uint32_t*)&A.scalar, *(uint32_t*)&A.log2e);
+        fprintf(stderr, "  seqlen_q=%u Ts=%u Hs_q=%u BAs_q=%u Seqs_q=%u\n",
+                A.seqlen_q, A.Ts, A.Hs_q, A.BAs_q, A.Seqs_q);
+        fprintf(stderr, "  ratio=%u Hs_k=%u BAs_k=%u Seqs_k=%u Seqs_dk=%u seqlen_k=%u\n",
+                A.ratio, A.Hs_k, A.BAs_k, A.Seqs_k, A.Seqs_dk, A.seqlen_k);
+        fprintf(stderr, "  head_dim_q=%u head_dim_v=%u nhead_q=%u\n",
+                A.head_dim_q, A.head_dim_v, A.nhead_q);
+        fprintf(stderr, "  Hs_v=%u BAs_v=%u Seqs_v=%u Hs_do=%u BAs_do=%u Seqs_do=%u\n",
+                A.Hs_v, A.BAs_v, A.Seqs_v, A.Hs_do, A.BAs_do, A.Seqs_do);
+        fprintf(stderr, "  Hs_dk=%u BAs_dk=%u Hs_dv=%u BAs_dv=%u Seqs_dv=%u\n",
+                A.Hs_dk, A.BAs_dk, A.Hs_dv, A.BAs_dv, A.Seqs_dv);
+        fprintf(stderr, "  Hs_lsed=%u ptr_qseq=%p ptr_kseq=%p\n",
+                A.Hs_lsed, (void*)(uintptr_t)A.ptr_qseq, (void*)(uintptr_t)A.ptr_kseq);
+        fprintf(stderr, "  ptr_qseq_padded=%p ptr_kseq_padded=%p\n",
+                (void*)(uintptr_t)A.ptr_qseq_padded, (void*)(uintptr_t)A.ptr_kseq_padded);
+        fprintf(stderr, "  max_seqlen_dq=%u mask_x=%d mask_y=%d\n",
+                A.max_seqlen_dq, A.mask_x, A.mask_y);
+    }
+
     auto dqdkdv_kernel_launch = [&]() {
         arg_size                  = sizeof(dqdkdv_args);
-        int bdx = (arch_id == "gfx1250") ? 128 : 256;
+        int bdx = (arch_id == "gfx1250") ? 128 : (a.hdim_q >= 256 ? 512 : 256);
         int gdx = (a.max_seqlen_k + ts_kv - 1) / ts_kv;
         int gdy = a.nhead_q;
         int gdz = a.batch;
@@ -707,11 +738,29 @@ float fmha_v3_bwd(mha_bwd_args a, const ck_tile::stream_config& s)
             {&dqdkdv_args, &arg_size, gdx, gdy, gdz, bdx, 1, 1, s.stream_id_});
     };
 
+    // DEBUG: skip ODO, run only dQdKdV with D=0 to isolate the issue
+    bool skip_odo_debug = false;
+    if(const char* e = std::getenv("SKIP_ODO")) skip_odo_debug = (atoi(e) != 0);
+
     if(!need_post_processing)
     {
+        // Debug: dump D values after ODO, before dQdKdV
+        auto debug_dump_D = [&](const ck_tile::stream_config& s_) {
+            if(!skip_odo_debug) pre_kernel_launch();
+            hipDeviceSynchronize();
+            float h_d[8];
+            hipMemcpy(h_d, a.d_ptr, sizeof(h_d), hipMemcpyDeviceToHost);
+            fprintf(stderr, "DEBUG D[0..7]: %.6f %.6f %.6f %.6f %.6f %.6f %.6f %.6f\n",
+                    h_d[0], h_d[1], h_d[2], h_d[3], h_d[4], h_d[5], h_d[6], h_d[7]);
+            fprintf(stderr, "DEBUG dqdkdv_args: seqlen_q=%u Hs_q=%u Seqs_q=%u Hs_lsed=%u\n",
+                    dqdkdv_args.seqlen_q, dqdkdv_args.Hs_q, dqdkdv_args.Seqs_q, dqdkdv_args.Hs_lsed);
+            fprintf(stderr, "DEBUG grid: gdx=%d gdy=%d gdz=%d bdx=%d ts_kv=%d\n",
+                    (int)((a.max_seqlen_k + ts_kv - 1) / ts_kv), (int)a.nhead_q, (int)a.batch,
+                    (arch_id == "gfx1250") ? 128 : 256, ts_kv);
+        };
         return ck_tile::launch_kernel(
             s,
-            [=](const ck_tile::stream_config& s_) { pre_kernel_launch(); },
+            [=](const ck_tile::stream_config& s_) { debug_dump_D(s_); },
             [=](const ck_tile::stream_config& s_) { dqdkdv_kernel_launch(); });
     }
 
