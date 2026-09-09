@@ -384,8 +384,7 @@ def _compile_moe_sorting_oneshot(
 
                 global_idx = token_id * c_topk + topk_slot
                 eid = _gld(topk_ids_it, global_idx)
-                valid_eid = (eid >= c_zero_i32) & (eid < c_E)
-                should_store = is_valid & valid_eid
+                should_store = is_valid & (eid >= c_zero_i32) & (eid < c_E)
 
                 # mesh[token_id, eid] = topk_slot + 1 (valid threads only).
                 # Invalid threads must NOT write to mesh[0] — that would race
@@ -1032,10 +1031,10 @@ def _compile_moe_sorting_multiphase(
             token_id = safe_flat // c_topk
             topk_slot = safe_flat % c_topk
             eid = _gld(topk_it, safe_flat)
-            valid_eid = (eid >= c_zero) & (eid < fx.Int32(E))
+            valid = valid & (eid >= c_zero) & (eid < fx.Int32(E))
             byte_offset = eid * i32_mesh_stride + token_id
             val_i8 = fx.Int32(topk_slot + c_one).to(fx.Int8)
-            if valid & valid_eid:
+            if valid:
                 ws_i8[byte_offset] = val_i8
 
     @flyc.jit
