@@ -77,7 +77,11 @@ def perftest(
             ] + [(args, kwargs)]
             run_iters(num_warmup, func, *args, **kwargs)
             torch.cuda.synchronize()
-            if int(os.environ.get("AITER_LOG_MORE", "0")) or use_cuda_event:
+            # Under pytest time with CUDA events: no torch.profiler session, hence no kineto chatter.
+            event_only = use_cuda_event or (
+                "PYTEST_CURRENT_TEST" in os.environ and not testGraph
+            )
+            if int(os.environ.get("AITER_LOG_MORE", "0")) or event_only:
                 latencies = []
                 start_event = torch.cuda.Event(enable_timing=True)
                 end_event = torch.cuda.Event(enable_timing=True)
@@ -90,7 +94,7 @@ def perftest(
                     torch.cuda.empty_cache()
                 avg = np.mean(latencies) * 1000
                 logger.info(f"avg: {avg} us/iter from cuda.Event")
-                if use_cuda_event:
+                if event_only:
                     return data, avg
 
             with tpf.profile(
