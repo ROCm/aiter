@@ -48,6 +48,7 @@ def _print_pass_rate(df, column, label):
 def calculate_pass_rate(df):
     _print_pass_rate(df, "acc result", "Output")
     _print_pass_rate(df, "lse result", "LSE")
+    _print_pass_rate(df, "wrapper result", "mla_prefill_ps_fwd")
 
 
 def ref_masked_attention(
@@ -457,6 +458,69 @@ def test_mla_prefill(
 
     us_mla_prefill_ps = us_mla_prefill_asm + us_reduce
     ret["us_mla_prefill_ps"] = us_mla_prefill_ps
+
+    # aiter.mla.mla_prefill_ps_fwd wraps the asm+reduce pair above and derives the
+    # partial buffer shapes itself, so check both stay in lockstep.
+    wrapper_output, wrapper_lse = aiter.mla.mla_prefill_ps_fwd(
+        q_quant,
+        k_quant,
+        v_quant,
+        torch.empty_like(output),
+        qo_indptr,
+        kv_indptr,
+        kv_indices,
+        work_indptr,
+        work_info,
+        max_qlen,
+        is_causal,
+        reduce_indptr=reduce_indptr,
+        reduce_final_map=reduce_final_map,
+        reduce_partial_map=reduce_partial_map,
+        softmax_scale=softmax_scale,
+        q_scale=q_scale,
+        k_scale=k_scale,
+        v_scale=v_scale,
+        return_lse=need_lse,
+    )
+    wrapper_err = checkAllclose(
+        output,
+        wrapper_output,
+        rtol=5e-2,
+        atol=5e-2,
+        msg="mla_prefill_ps_fwd[hand-rolled vs wrapper]: us......",
+    )
+    wrapper_status = "passed" if wrapper_err == 0 else "failed"
+    if need_lse:
+        if (
+            wrapper_lse is None
+            or wrapper_lse.shape != (total_s, nhead)
+            or wrapper_lse.dtype != dtypes.fp32
+        ):
+            aiter.logger.error(
+                "mla_prefill_ps_fwd: return_lse=True gave final_lse=%s, expected "
+                "shape %s dtype %s",
+                None if wrapper_lse is None else (wrapper_lse.shape, wrapper_lse.dtype),
+                (total_s, nhead),
+                dtypes.fp32,
+            )
+            wrapper_status = "failed"
+        elif (
+            checkAllclose(
+                final_lse,
+                wrapper_lse,
+                rtol=0,
+                atol=3e-2,
+                msg="mla_prefill_ps_fwd_lse[hand-rolled vs wrapper]: us......",
+            )
+            != 0
+        ):
+            wrapper_status = "failed"
+    elif wrapper_lse is not None:
+        aiter.logger.error(
+            "mla_prefill_ps_fwd: return_lse=False gave a non-None final_lse"
+        )
+        wrapper_status = "failed"
+    ret["wrapper result"] = wrapper_status
 
     if profile_ps:
         # calculate mla_prefill_ps kernel tflops
