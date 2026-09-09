@@ -1140,34 +1140,72 @@ def build_radix_topk_one_block_gfx1250_module(
                                 metadata,
                             )
 
-        def write_direct_output(row_indices, row_values, row_index_tiles, row_value_tiles):
+        def write_direct_output(
+            row_indices, row_values, row_index_tiles, row_value_tiles
+        ):
             for step in range_constexpr(output_vector_steps):
                 vector_idx = step * block_threads + tid
                 if vector_idx < output_vector_count:
                     col = vector_idx * vec_width
-                    index_values = [
-                        (col + item < row_len).select(row_start + col + item, fx.Int32(-1))
-                        for item in range_constexpr(_VEC)
-                    ]
                     fragment = fx.make_rmem_tensor(index_fragment_layout, fx.Int32)
-                    fragment.store(fx.Vector.from_elements(index_values, dtype=fx.Int32))
+                    if vector_idx < full_vector_count:
+                        index_values = [
+                            row_start + col + item
+                            for item in range_constexpr(_VEC)
+                        ]
+                        fragment.store(
+                            fx.Vector.from_elements(
+                                index_values, dtype=fx.Int32
+                            )
+                        )
+                    else:
+                        if col < row_len:
+                            index_values = [
+                                (col + item < row_len).select(
+                                    row_start + col + item, fx.Int32(-1)
+                                )
+                                for item in range_constexpr(_VEC)
+                            ]
+                            fragment.store(
+                                fx.Vector.from_elements(
+                                    index_values, dtype=fx.Int32
+                                )
+                            )
+                        else:
+                            fragment.store(
+                                fx.Vector.filled(_VEC, -1, fx.Int32)
+                            )
                     fx.copy_atom_call(
                         index_store_atom, fragment, fx.slice(row_index_tiles, (None, vector_idx))
                     )
 
                     if const_expr(write_values):
-                        output_values = []
-                        for item in range_constexpr(_VEC):
-                            local_col = col + item
-                            valid = local_col < row_len
-                            safe_col = valid.select(local_col, zero)
-                            output_values.append(
-                                valid.select(input_row[safe_col], fx.Float32(float("-inf")))
-                            )
                         value_fragment = fx.make_rmem_tensor(value_fragment_layout, fx.Float32)
-                        value_fragment.store(
-                            fx.Vector.from_elements(output_values, dtype=fx.Float32)
-                        )
+                        if vector_idx < full_vector_count:
+                            value_fragment.store(
+                                _load_f32x4(input_vector_tiles, vector_idx)
+                            )
+                        else:
+                            if col < row_len:
+                                output_values = []
+                                for item in range_constexpr(_VEC):
+                                    local_col = col + item
+                                    valid = local_col < row_len
+                                    output_value = fx.Float32(float("-inf"))
+                                    if valid:
+                                        output_value = input_row[local_col]
+                                    output_values.append(output_value)
+                                value_fragment.store(
+                                    fx.Vector.from_elements(
+                                        output_values, dtype=fx.Float32
+                                    )
+                                )
+                            else:
+                                value_fragment.store(
+                                    fx.Vector.filled(
+                                        _VEC, float("-inf"), fx.Float32
+                                    )
+                                )
                         fx.copy_atom_call(
                             value_store_atom,
                             value_fragment,
@@ -1177,10 +1215,12 @@ def build_radix_topk_one_block_gfx1250_module(
             tail = output_vector_count * _VEC + tid
             if tail < k:
                 valid = tail < row_len
-                safe_tail = valid.select(tail, zero)
                 row_indices[tail] = valid.select(row_start + tail, fx.Int32(-1))
                 if const_expr(write_values):
-                    row_values[tail] = valid.select(input_row[safe_tail], fx.Float32(float("-inf")))
+                    output_value = fx.Float32(float("-inf"))
+                    if valid:
+                        output_value = input_row[tail]
+                    row_values[tail] = output_value
 
         # Kernel control flow
         if row_len <= top_k:

@@ -17,6 +17,8 @@ from .kernels.tensor_shim import _run_compiled
 
 _MAX_BUFFER_ROW_ELEMENTS = ((1 << 32) - 1) // torch.float32.itemsize
 _SUPPORTED_ARCHES = ("gfx1250",)
+# The measured short-row crossover on gfx1250 is between 256 and 512 rows.
+_SHORT_ROWS_1024_THREAD_MAX_ROWS = 256
 
 _TensorSignature = tuple[
     torch.Size,
@@ -236,7 +238,11 @@ def radix_topk_one_block_gfx1250(
         return
 
     short_rows = logits.shape[1] <= _COMPACT_CAPACITY
-    block_threads = 256 if short_rows else 1024
+    block_threads = (
+        1024
+        if not short_rows or num_rows <= _SHORT_ROWS_1024_THREAD_MAX_ROWS
+        else 256
+    )
     stream = torch.cuda.current_stream(logits.device)
     launcher = build_radix_topk_one_block_gfx1250_module(
         k,

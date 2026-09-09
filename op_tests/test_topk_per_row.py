@@ -159,10 +159,25 @@ def run_top_k_per_row_prefill(
     stride_row: int,
     stride_col: int,
     k: int = 2048,
+    flydsl: bool = False,
+    stable: bool = False,
 ) -> None:
     """
     Run the top_k_per_row kernel.
     """
+    if flydsl:
+        return aiter.flydsl_radix_topk_one_block_gfx1250(
+            logits,
+            row_starts,
+            row_ends,
+            indices,
+            values,
+            num_rows,
+            stride_row,
+            stride_col,
+            k=k,
+            stable=stable,
+        )
     return aiter.top_k_per_row_prefill(
         logits,
         row_starts,
@@ -173,6 +188,7 @@ def run_top_k_per_row_prefill(
         stride_row,
         stride_col,
         k=k,
+        stable=stable,
     )
 
 
@@ -241,7 +257,13 @@ def run_top_k_per_row_decode(
 
 @benchmark()
 def test_top_k_per_row_prefill(
-    num_rows: int, num_prefix: int, top_k: int, data_generation: str = "random"
+    num_rows: int,
+    num_prefix: int,
+    top_k: int,
+    data_generation: str = "random",
+    flydsl: bool = False,
+    stable: bool = False,
+    write_values: bool = False,
 ) -> dict:
     """
     Test topk_per_row_prefill.
@@ -257,8 +279,11 @@ def test_top_k_per_row_prefill(
 
     # Create output tensors
     indices = torch.empty((num_rows, top_k), dtype=torch.int32, device="cuda")
-
-    torch.empty((num_rows, top_k), dtype=torch.float32, device="cuda").fill_(0)
+    values = (
+        torch.empty((num_rows, top_k), dtype=torch.float32, device="cuda")
+        if write_values
+        else None
+    )
 
     # Run the kernel
     _, us = run_top_k_per_row_prefill(
@@ -266,11 +291,13 @@ def test_top_k_per_row_prefill(
         row_starts,
         row_ends,
         indices,
-        None,  # values
+        values,
         num_rows,
         logits.stride(0),
         logits.stride(1),
         k=top_k,
+        flydsl=flydsl,
+        stable=stable,
     )
 
     # Run reference implementation
@@ -282,13 +309,27 @@ def test_top_k_per_row_prefill(
 
     # Compare results
     all_close = compare_topk_results(
-        logits, indices, torch_indices, row_starts, row_ends, top_k
+        logits,
+        indices,
+        torch_indices,
+        row_starts,
+        row_ends,
+        top_k,
+        stable=stable,
+        values=values,
     )
 
     # measure performance
     ret["context_len"] = logits.shape[1]
     ret["all_close"] = all_close
     ret["us"] = us
+    logical_elements = int((row_ends - row_starts).sum().item())
+    output_bytes = indices.nbytes + (0 if values is None else values.nbytes)
+    ret["TFLOPS"] = logical_elements / us / 1e6
+    ret["TB/s"] = (
+        logical_elements * logits.element_size() + output_bytes
+    ) / us / 1e6
+    ret["err"] = float(not all_close)
     return ret
 
 
@@ -496,12 +537,33 @@ test_mb_workspace_reuse()
 
 
 df = []
+prefill_flydsl_available = get_gfx() == "gfx1250"
 for data_generation in args.data_generation:
     for m in args.context_len:
         for k in args.top_k:
             for num_prefix in args.num_prefix:
-                ret = test_top_k_per_row_prefill(m, num_prefix, k, data_generation)
-                df.append(ret)
+                for stable in (False, True):
+                    for write_values in (False, True):
+                        ret = test_top_k_per_row_prefill(
+                            m,
+                            num_prefix,
+                            k,
+                            data_generation,
+                            stable=stable,
+                            write_values=write_values,
+                        )
+                        df.append(ret)
+                        if prefill_flydsl_available:
+                            ret = test_top_k_per_row_prefill(
+                                m,
+                                num_prefix,
+                                k,
+                                data_generation,
+                                flydsl=True,
+                                stable=stable,
+                                write_values=write_values,
+                            )
+                            df.append(ret)
 
 df = pd.DataFrame(df)
 df_md = df.to_markdown(index=False)
