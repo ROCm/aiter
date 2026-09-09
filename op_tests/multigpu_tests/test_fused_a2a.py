@@ -862,7 +862,7 @@ def _check_v4_v_output(rank, world_size, device):
         os.environ.pop(name, None)
 
 
-def _check_v4_attention(rank, world_size, device, seq_len):
+def _check_v4_attention(rank, world_size, device, seq_len, qk_codec="mxfp4"):
     from aiter.ops.mha_v4 import (
         AttentionFormat,
         AttentionScaleMode,
@@ -870,6 +870,7 @@ def _check_v4_attention(rank, world_size, device, seq_len):
         mha_v4_packed,
         mxfp4_k_view,
         mxfp4_v_view,
+        mxfp6_k_view,
     )
     from aiter.test_mha_common import attention_ref
 
@@ -880,7 +881,7 @@ def _check_v4_attention(rank, world_size, device, seq_len):
     softmax_scale = head_dim**-0.5
     settings = {"FUSED_A2A_HADAMARD": "0"}
     for role in "QKV":
-        settings[f"FUSED_A2A_CODEC_{role}"] = "mxfp4"
+        settings[f"FUSED_A2A_CODEC_{role}"] = "mxfp4" if role == "V" else qk_codec
         settings[f"FUSED_A2A_V4_OUTPUT_{role}"] = "1"
     previous = {name: os.environ.get(name) for name in settings}
     os.environ.update(settings)
@@ -922,15 +923,21 @@ def _check_v4_attention(rank, world_size, device, seq_len):
             block_num=2 if seq_len == 160 else 128,
         )
         payloads, scales = op(*inputs, norm, norm, cos, sin)
-        q_descale, k_descale = (
-            scale.view(1, seq_full, local_heads, 4) for scale in scales[:2]
-        )
+        q_descale = scales[0].view(1, seq_full, local_heads, 4)
         v_descale = scales[2].view(1, local_heads, tiles * 512)
         # These views retain the transport buffers; no consumer-side repacking.
-        q = payloads[0].view(1, seq_full, local_heads, 64)
-        k = mxfp4_k_view(payloads[1], k_descale)
+        if qk_codec == "mxfp6":
+            q = payloads[0].view(1, seq_full, local_heads, 96)
+            k, k_descale = mxfp6_k_view(
+                payloads[1], scales[1], 1, seq_full, local_heads
+            )
+        else:
+            q = payloads[0].view(1, seq_full, local_heads, 64)
+            k_descale = scales[1].view(1, seq_full, local_heads, 4)
+            k = mxfp4_k_view(payloads[1], k_descale)
         v = mxfp4_v_view(payloads[2], v_descale, seq_full)
-        fmt = AttentionFormat.MXFP4
+        fmt = AttentionFormat.MXFP6 if qk_codec == "mxfp6" else AttentionFormat.MXFP4
+        v_fmt = AttentionFormat.MXFP4
         mode = AttentionScaleMode.E8M0_PER_1X32
         output = torch.empty_like(references[0])
         actual = mha_v4_packed(
@@ -942,14 +949,14 @@ def _check_v4_attention(rank, world_size, device, seq_len):
             v_descale,
             fmt,
             fmt,
-            fmt,
+            v_fmt,
             mode,
             mode,
             mode,
             softmax_scale=softmax_scale,
             out=output,
         )
-        expected = mha_v4(*references, fmt, fmt, fmt, softmax_scale=softmax_scale)
+        expected = mha_v4(*references, fmt, fmt, v_fmt, softmax_scale=softmax_scale)
         oracle = attention_ref(*references, causal=False, upcast=True)[0]
         reordered = attention_ref(
             *references, causal=False, upcast=False, reorder_ops=True
@@ -959,7 +966,7 @@ def _check_v4_attention(rank, world_size, device, seq_len):
         atol, rtol = max(4 * baseline, 0.5), 0.1
         primary_error = (actual.float() - expected.float()).abs().max().item()
         oracle_error = (actual.float() - oracle.float()).abs()
-        label = f"V4 attention S={seq_len} global-S={seq_full} rank={rank}"
+        label = f"V4 attention QK={qk_codec} V=mxfp4 S={seq_len} global-S={seq_full} rank={rank}"
         print(
             f"{label}: primary-max-abs={primary_error:.9g} (atol=0 rtol=0) "
             f"oracle-max-abs={oracle_error.max().item():.9g} "
@@ -976,7 +983,7 @@ def _check_v4_attention(rank, world_size, device, seq_len):
         )
         dist.barrier()
         if rank == 0:
-            print(f"PASS V4 MXFP4 attention S={seq_len}", flush=True)
+            print(f"PASS V4 QK={qk_codec} V=mxfp4 attention S={seq_len}", flush=True)
     finally:
         for name, value in previous.items():
             if value is None:
@@ -985,7 +992,9 @@ def _check_v4_attention(rank, world_size, device, seq_len):
                 os.environ[name] = value
 
 
-def _run_rank(rank, world_size, port, v4_only=False, attention_seq=None):
+def _run_rank(
+    rank, world_size, port, v4_only=False, attention_seq=None, qk_codec="mxfp4"
+):
     torch.cuda.set_device(rank)
     device = torch.device("cuda", rank)
     codec = os.environ.get("FUSED_A2A_CODEC", "e4m3")
@@ -1002,7 +1011,7 @@ def _run_rank(rank, world_size, port, v4_only=False, attention_seq=None):
         torch._C._distributed_c10d._register_process_group("mori", cpu_group)
         ms.shmem_torch_process_group_init("mori")
         if attention_seq is not None:
-            _check_v4_attention(rank, world_size, device, attention_seq)
+            _check_v4_attention(rank, world_size, device, attention_seq, qk_codec)
             return
         _check_v4_output(rank, world_size, device)
         _check_v4_output(rank, world_size, device, q_codec="mxfp6", k_codec="mxfp6")
@@ -1528,8 +1537,9 @@ def main():
     return 0
 
 
+@pytest.mark.parametrize("qk_codec", ("mxfp4", "mxfp6"))
 @pytest.mark.parametrize("seq_len", (32, 96, 160))
-def test_fused_a2a_v4_attention(capfd, seq_len):
+def test_fused_a2a_v4_attention(capfd, seq_len, qk_codec):
     if not torch.cuda.is_available():
         pytest.skip("fused_a2a requires ROCm GPUs")
     if get_gfx_runtime() != "gfx950":
@@ -1542,7 +1552,7 @@ def test_fused_a2a_v4_attention(capfd, seq_len):
     with capfd.disabled():
         mp.spawn(
             _run_rank,
-            args=(_WORLD_SIZE, _free_port(), False, seq_len),
+            args=(_WORLD_SIZE, _free_port(), False, seq_len, qk_codec),
             nprocs=_WORLD_SIZE,
             join=True,
         )
