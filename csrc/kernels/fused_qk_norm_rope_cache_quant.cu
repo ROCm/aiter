@@ -4400,7 +4400,7 @@ namespace aiter {
         // up (`if (bid < 0 || pos < 0) return -1;`), so a 32-bit unsigned divide is
         // sufficient and is roughly half the sequence.
         //
-        // This is what flydsl does: its swa_cache_size is a runtime Int32 kernel
+        // The reference implementation does the same: swa_cache_size is a runtime
         // argument -- NOT a compile-time constant -- and it divides Int32 by Int32
         // after clamping pos to >= 0, widening to Int64 only for the final
         // `row * swa_pos_stride` byte offset ("a unified V4 pool runs to ~150M
@@ -4805,7 +4805,7 @@ namespace aiter {
 
     template <typename scalar_t, typename cache_t, typename query_t, vllm::Fp8KVCacheDataType kv_dt, vllm::Fp8KVCacheDataType q_dt,
               bool is_neox,
-              // --- NEW (flydsl-alignment) compile-time options ---
+              // --- compile-time layout/quant options ---
               int Q_GROUP_SIZE = 64, bool Q_SCALE_FP32 = false, bool HAS_Q_WEIGHT = false,
               int HEAD_DIM = 512, int TOKENS_PER_BLOCK = 1, int Q_TDM_DEPTH = 0>
     __device__ void fuse_qk_norm_rope_group_quant_cache_kernel_impl(
@@ -4878,7 +4878,7 @@ namespace aiter {
       // The alternative -- a block owning ONE token and a contiguous run of
       // TOKENS_PER_BLOCK*HPW heads, wave w taking head run_base + t*TPB + w at step
       // t so the concurrent Q row loads are ADJACENT rows -- was implemented and
-      // MEASURED. That is flydsl's `row_of(tile) = tile*RT + wave`, whose workgroup
+      // MEASURED. That is `row_of(tile) = tile*RT + wave`, whose workgroup
       // owns one token's whole head set (CT*RT == H) for exactly this reason.
       //
       // It does not pay here: T=16384 H=128 G=64, paired A/B 6 reps, 301.44 ->
@@ -5041,8 +5041,7 @@ namespace aiter {
       using QTdmWin = opus::tdm<scalar_t, opus::seq<head_size, 1>>;
       // ONE window for the whole head loop, walked with move(), instead of a fresh
       // make_tdm() per head. make_tdm() runs make_from_layout(): a readfirstlane on
-      // every field, both saturating_subs and the global-offset product. In the ISA
-      // that is ~25 SALU per head -- the single largest block left in the loop.
+      // every field, both saturating_subs and the global-offset product, where
       // move(0_I, 1) touches three scalars (origin[1], dim1_clamped, the offset).
       //
       // The window is 2-D over [head, head_size] with pitch q_stride_1, so the head
@@ -5086,12 +5085,9 @@ namespace aiter {
       float pe_cos[vec_size_i], pe_sin[vec_size_i];
       // KEPT GUARDED. Dropping the `if` and clamping the row to 0 for the non-PE
       // lanes -- inverse_rope_group_quant's cos/sin fix from 4571cfd4, which works
-      // there -- MEASURED NULL here: T=16384 H=128 G=64, paired A/B 6 reps,
-      // 308.64 -> 308.42 us, -0.07% (95% CI [-1.05, +0.92], 3/6 reps negative).
-      // The ISA says why: the exec region does go away (s_and_saveexec 20 -> 18,
-      // s_or_b32 35 -> 33) but s_wait_xcnt goes UP, 46 -> 48 -- the drain moves to
-      // another guarded register instead of disappearing, the same way the FG
-      // kernel's store_scale edit behaved. Do not retry.
+      // there -- measured null here. The exec region does go away, but s_wait_xcnt
+      // rises by as much: the address-queue drain relocates to the next guarded
+      // region instead of disappearing. Do not retry.
       if (is_pe_thread) {
         const int32_t pe_local_tid = tid - pe_tid_start;
         // NOT vectorised, deliberately. The same load_rope_cos_sin<> treatment that
@@ -5125,8 +5121,8 @@ namespace aiter {
       // Running output offsets instead of `q_head_idx * stride` per head. Both
       // strides are runtime int32 params promoted to int64 for the pointer add, so
       // each use costs a 64-bit multiply-add (s_mul + s_add_co_i32 + s_addc_u32);
-      // ATT counts 6 more s_add_co_i32 per head here than flydsl. The head loop is
-      // a unit-stride walk, so the same addresses come out of one add each.
+      // The head loop is a unit-stride walk, so the same addresses come out of one
+      // add each.
       int64_t q_out_off = token_qout_base
                         + static_cast<int64_t>(q_head_start) * params.q_out_stride_1;
       int64_t q_rope_off = static_cast<int64_t>(token_idx) * params.q_rope_out_stride_0
@@ -5135,8 +5131,7 @@ namespace aiter {
       // out here with the offsets rather than being rebuilt once per head.
       // Rotating ring slot. `(q_head_idx - q_head_start) % Q_TDM_DEPTH` is a signed
       // modulo: LLVM cannot prove the dividend non-negative, so it emits the
-      // sign-correction dance (s_lshr 31 / s_add / s_and / s_sub) -- 5 SALU per head
-      // for what is a counter.
+      // sign-correction dance for what is a counter.
       int32_t q_slot = 0;
       const bool is_nope_thr = (tid < nope_vec);  // nope-first
       const int32_t pe_store_off = (tid - pe_tid_start) * vec_size_i;
@@ -5190,11 +5185,9 @@ namespace aiter {
         }
 
         // Packed square-accumulate. `sum_sq += val*val` over vec_size_i scalars is a
-        // chain of vec_size_i dependent v_add_f32 -- ATT counts 16 of them executing
-        // per head here (plus 4 v_dual_add_f32), against flydsl's 2, because flydsl
-        // writes it as (xv*xv).reduce(ADD) and the multiply-accumulate lands on
-        // v_pk_fma_f32 (one instruction per two elements). Two independent lanes also
-        // halve the dependency depth.
+        // chain of vec_size_i dependent v_add_f32. Accumulating into a float2 puts
+        // the multiply-accumulate on v_pk_fma_f32 (one instruction per two elements)
+        // and halves the dependency depth.
         //
         // Reassociation changes the rounding of the sum; rstd feeds an e8m0 scale (a
         // power of two) and a bf16 store, both far coarser than a last-place
@@ -5291,14 +5284,8 @@ namespace aiter {
           // does not reproduce: the full sweep is byte-identical to the __shfl_xor
           // build -- same err_q value set, 40/40 paged-SWA checks exact.
           //
-          // ISA (dispatched instantiation, bf16/fp8/fp8 G=64 TPB=4 depth=2):
-          //   ds_bpermute_b32 52 -> 48, s_wait_dscnt 43 -> 34, v_max_num_f32 4 -> 0
-          //   (folded into v_max_num_f32_dpp), total 2725 -> 2685.
-          //
-          // MEASURED T=16384 H=128 G=64, paired A/B, 15 clean reps across two
-          // sessions (every rep verified idle before and after via
-          // rocm-smi --showpids plus VRAM): 296.50 -> 290.32 us, -2.07%
-          // (95% CI [-2.95, -1.20], 12/15 reps negative).
+          // Measured -2.07% at T=16384 H=128 G=64 (paired A/B, 15 clean reps,
+          // 95% CI [-2.95, -1.20]).
           thread_max = multithread_reduce_max_dpp<Q_REDUCE>(thread_max);
           constexpr MxDtype kQMxDt = kHwFp8E4m3Dtype;
           const E8m0BlockScale qs_scale =
@@ -5331,9 +5318,9 @@ namespace aiter {
             // Rope straight into the bf16 store rather than back into `work`. The
             // rotated values used to be written back so that one vector fed both
             // stores, but `work` has to stay live across the branch for the nope
-            // lanes, so the rope temporaries could not take its registers -- the
-            // write-back cost 9 pure register moves per head in the ISA
-            // (v_dual_mov_b32 x4 + v_mov_b32). Nope lanes never read a rotated value
+            // lanes, so the rope temporaries could not take its registers and the
+            // write-back cost a run of pure register moves per head. Nope lanes
+            // never read a rotated value
             // and PE lanes never reach the fp8 store, so the two results do not need
             // to share a home. PE lanes ran with inv_scale = 1.0f, so work is x*rstd.
             opus::vector_t<float, vec_size_i> roped;
@@ -5421,13 +5408,13 @@ namespace aiter {
     }
 
     // ===========================================================================
-    // Fine-grained variant (FlyDSL-style decomposition) -- auto-selected for the
+    // Fine-grained variant -- auto-selected for the
     // xlarge prefill tier (T >= ~8k, num_tokens <= 65535); ~5-17% faster there.
     // ---------------------------------------------------------------------------
     // One block == one wave == exactly ONE (token, head) tile:
     //   grid.x = num_heads + 1 (head; 0 -> K, 1.. -> Q), grid.y = num_tokens.
-    // Mirrors flydsl: no head loop, no tokens-per-block packing, head on the fast
-    // grid dim (co-scheduled blocks read contiguous q[token,*,:] rows). It also
+    // No head loop, no tokens-per-block packing, head on the fast grid dim
+    // (co-scheduled blocks read contiguous q[token,*,:] rows). It also
     // folds the quant: amax is taken over the RAW pre-norm input (so it fuses with
     // the row-sum butterfly), and rstd is folded into a single forward factor
     // applied to x_in directly -> fewer multiplies / live registers.
@@ -5435,10 +5422,8 @@ namespace aiter {
     // MEASURED (MI355, gfx950): this MATCHES the coarse kernel, it does not beat it.
     // The coarse kernel already runs at the HW occupancy cap (32 VGPR -> ~8 waves/
     // SIMD), so "more, smaller waves" buys nothing -- the kernel is memory-traffic
-    // bound, not occupancy bound. The residual gap to flydsl's wall-clock is mostly
-    // that flydsl stores PE as fp8 (64 B) while the V4 nm asm layout requires PE as
-    // bf16 (128 B), i.e. a format difference, not a schedule difference. Kept as a
-    // documented, correct A/B baseline for future memory-layout experiments.
+    // bound, not occupancy bound. Kept as a documented, correct A/B baseline for
+    // future memory-layout experiments.
     // The per-tile math + v4 nm asm store layout are identical to the coarse kernel.
     // ===========================================================================
     template <typename scalar_t, typename cache_t, typename query_t,
@@ -5991,16 +5976,16 @@ namespace aiter {
         const int32_t* __restrict__ swa_dest_row = nullptr,
         const int32_t* __restrict__ batch_id_per_token = nullptr
     ) {
-      // Waves in a block cover consecutive TOKENS at the same head, which is how
-      // flydsl's wave32 kernel packs (block=(WARP_SIZE, ROWS_PER_WG), grid.x=head,
-      // grid.y=token chunk). Packing tokens rather than heads matters at H=32:
+      // Waves in a block cover consecutive TOKENS at the same head
+      // (block=(WARP_SIZE, ROWS_PER_WG), grid.x=head, grid.y=token chunk).
+      // Packing tokens rather than heads matters at H=32:
       // 1+num_heads=33 divides badly (HEADS_PER_BLOCK=4 launches 36 waves to do 33
       // waves of work, 9% wasted, which is the order of the +4~5% that experiment
       // regressed by), while the token axis is a power of two and divides exactly.
       // Wave count is unchanged either way -- only the workgroup count moves, so
       // this trades 4x fewer WG dispatches against worse load locality (a block's
       // waves now read q[t..t+N, h, :], striding by q_stride_0, instead of the
-      // contiguous q[t, h..h+N, :]). flydsl takes that trade.
+      // contiguous q[t, h..h+N, :]).
       constexpr int TOKENS_PER_WG = TOKENS_PER_BLOCK;
       // Wave-uniform by construction -- see the coarse kernel's wave_id.
       const int32_t wave_id =
@@ -6035,17 +6020,16 @@ namespace aiter {
       // s_wait_tensorcnt, LDS slots) is correct and bit-exact, and is the right
       // starting point if the xlarge prefill tier is ever revisited.
 #ifndef AITER_FG_USE_TDM
-// MEASURED at the XLARGE tier (H=128 T=16384, paired op_test, 3 clean pairs,
-// sd 0.10pp): 570.07 -> 505.56 us, -11.32% (CI -11.43..-11.20). Real win.
+// Measured -11.32% at the XLARGE tier (H=128 T=16384, paired op_test, 3 clean
+// pairs, 95% CI [-11.43, -11.20]) -- a real win there.
 //
-// Left OFF anyway: the same flag also reaches the DECODE tier, which is the
-// other user of the FG kernel, and TDM there was measured neutral-to-harmful
-// (the LDS round trip buys nothing when a wave owns a single head, so there is
-// no second tile to overlap with). One unclean single run had H=16 T=64 going
-// 6.99 -> 10.26 us. A possible decode-latency regression of that size outweighs
-// an 11% prefill gain, and the knob cannot separate the two tiers without a
-// second FG instantiation. Turn on with -DAITER_FG_USE_TDM=1 if only the xlarge
-// prefill path matters; gate it per tier before making it the default.
+// Left OFF anyway: the same flag also reaches the DECODE tier, the other user of
+// the FG kernel, where TDM measured neutral-to-harmful -- the LDS round trip buys
+// nothing when a wave owns a single head, so there is no second tile to overlap
+// with, and a decode-latency regression outweighs the prefill gain. The knob
+// cannot separate the two tiers without a second FG instantiation. Turn on with
+// -DAITER_FG_USE_TDM=1 if only the xlarge prefill path matters; gate it per tier
+// before making it the default.
 #define AITER_FG_USE_TDM 0
 #endif
       constexpr bool kUseTdm =
@@ -6081,8 +6065,8 @@ namespace aiter {
     //
     // ATT at T=512 H=128 measured the cost: s_load_b96 @0xd4 = 2045 cycles and
     // s_load_b128 @0xc4 = 903 cycles, 2948 of the kernel's 3132 scalar-load
-    // cycles in two instructions. flydsl by contrast issues one s_load_b512 from
-    // 0x0 and spends 25 cycles total on scalar loads.
+    // cycles in two instructions -- against 25 cycles total when every field the
+    // per-head path needs sits inside the preload window.
     //
     // Putting the struct first moves every int field into the preload window.
     // The pointers move out, but each is dereferenced through an SRD built once,
@@ -6430,50 +6414,19 @@ void fused_qk_norm_rope_group_quant(
   constexpr int PREFILL_Q_HEADS_PER_WAVE_LRG   = 8;
   constexpr int PREFILL_Q_HEADS_PER_WAVE_XLRG  = 16;
   // ---------------------------------------------------------------------------
-  // Where the xlarge tier stands against flydsl, and why it is close to done.
+  // Heads per wave for the two prefill tiers. 16 at xlarge is the point of the
+  // coarse path: one cos/sin gather, one descriptor build and one kernarg read
+  // amortised across 16 heads, with the Q-head TDM ring covering the loads.
   //
-  // T=16384 H=128 G=64 on gfx1250: HIP ~299 us, flydsl ~227 us, ratio 1.31
-  // (three consecutive runs: 1.320 / 1.315 / 1.308). Geometry is already
-  // identical -- both launch 147456 waves at 16 rows per wave.
+  // Two shape changes that look free and measured WORSE, both at T=16384 H=128:
+  //   #pragma unroll 2 on the head loop          +1.20%
+  //   templating HPW so the trip count is known  +1.61% (SALU 775 -> 702)
+  // The kernel is not SALU bound at this size, so trading code size for scalar
+  // work does not pay.
   //
-  // ATT profile by SHARE of sampled cycles (absolute totals are not comparable
-  // between two captures; only the shares are):
-  //                    HIP     flydsl
-  //   wait            59.1%     67.0%
-  //     s_wait_xcnt   42.5%     34.6%   <- our only material deficit, +7.8pp
-  //     s_wait_tensorcnt 1.3%   16.0%   <- we are 14.7pp AHEAD here
-  //   VALU            32.4%     27.1%
-  //   SALU             7.6%      5.5%
-  //
-  // The three components of the remaining gap, each probed and each a dead end
-  // in the current design:
-  //
-  //   s_wait_xcnt   Three separate attempts (scale-store lane dedup, the DPP
-  //                 amax reduce, and unguarding the nope stores behind
-  //                 descriptor bounds) all removed exec regions and all left
-  //                 s_wait_xcnt flat or higher. Deleting one EXEC region just
-  //                 relocates the address-queue drain to the next one.
-  //
-  //   VALU          v_cvt_pk_bf16_f32 is 82892 cycles that flydsl does not spend
-  //                 at all -- it quantises the rotated PE to fp8 in the same
-  //                 store as the nope half, while our V4 contract writes PE as
-  //                 a separate bf16 tensor. That is precision we are buying, not
-  //                 inefficiency, and the contract is fixed. v_nop (45086
-  //                 cycles, 95% stalled, against flydsl's 175) is dependency-
-  //                 chain padding from the un-unrolled head loop; #pragma unroll
-  //                 2 measured +1.20%. Splitting sum_sq into two partials so the
-  //                 accumulate stays packed measured +4.29%.
-  //
-  //   SALU          Templating HPW so the trip count is compile-time known cut
-  //                 SALU 775 -> 702 in the ISA and measured +1.61%, i.e. inside
-  //                 noise. flydsl has no loop to unroll -- its range_constexpr
-  //                 is a plain Python range, so all 16 iterations are emitted as
-  //                 straight-line IR at construction time. That is a language
-  //                 difference, not something a pragma reaches.
-  //
-  // The big win at the other end of the size range (kernarg reorder, -20.2% at
-  // T=512) does not transfer: s_wait_kmcnt is 15.6% of T=512 and 1.2% here,
-  // because it is a fixed per-wave cost amortised over 20x more work.
+  // The kernarg reorder that is worth -20.2% at T=512 does not transfer here:
+  // s_wait_kmcnt is 15.6% of T=512 and 1.2% at T=16384, being a fixed per-wave
+  // cost amortised over 20x more work.
   // ---------------------------------------------------------------------------
 
   const int prefill_q_waves_med = (num_heads + PREFILL_Q_HEADS_PER_WAVE_MED - 1) / PREFILL_Q_HEADS_PER_WAVE_MED;
@@ -6514,8 +6467,8 @@ void fused_qk_norm_rope_group_quant(
   //
   // This moves T=2048 (88 blocks/CU) and T=4096 (176) at H=128 from HPW=8 to
   // HPW=16; T=8192 (352) and T=16384 (704) were already xlarge, T<=1024 stays
-  // large. flydsl runs 16 rows per wave at every size, so the old 300 boundary
-  // was leaving two sizes on a narrower wave than the reference.
+  // large. 16 rows per wave is the right width at every prefill size, so the old
+  // 300 boundary was leaving two sizes on a narrower wave than they wanted.
   //
   // MEASURED, paired A/B, kernel-trace median of 103 dispatches, 6 reps each,
   // all reps gated on an idle card:
@@ -6524,11 +6477,7 @@ void fused_qk_norm_rope_group_quant(
   // T=4096 is the clean result; T=2048 points the same way but its CI straddles
   // zero, so treat it as "not worse" rather than as a second win.
   //
-  // Context for why this was worth revisiting: ratio against flydsl across the
-  // size range after the kernarg and cos/sin fixes was
-  //   T=512 1.108, T=1024 1.173, T=2048 1.467, T=4096 1.303, T=8192 1.332,
-  //   T=16384 1.303
-  // T=2048 stood out as the worst cell, which is what pointed at the tier.
+  // T=2048 was the worst cell in the size sweep, which is what pointed at the tier.
   constexpr int XLARGE_PREFILL_THRESHOLD = 64;  // large  -> xlarge (blocks/CU)
 
   const bool use_decode_path    = (prefill_blocks_med < MIN_OVERSUBSCRIPTION * num_CUs);
@@ -6563,7 +6512,7 @@ void fused_qk_norm_rope_group_quant(
   //     4 dtype combos = 96 instantiations per source dtype (bf16 typical → 96 ko).
   // Q_GROUP_SIZE / Q_SCALE_FP32 are only meaningful when q_out is fp8 (q_dt != kAuto);
   // for bf16 q_out we collapse onto (G=64, e8m0) — the kernel ignores them.
-  // Fine-grained (FlyDSL-style) path: 1 wave per (token, head), block=64,
+  // Fine-grained path: 1 wave per (token, head), block=64,
   // grid=(num_heads+1, num_tokens). Measured on gfx950 (MI355): ~5-17% faster
   // than the coarse HPW path at large prefill (T >= ~8k) for both bf16 and fp8 Q.
   // At mid T (256-2048) the coarse path's per-wave head aggregation (one cos/sin
@@ -6591,36 +6540,30 @@ void fused_qk_norm_rope_group_quant(
   // scratch, 32 VGPR vs FG's 24). FG also carries the SWA scatter, so decode+SWA
   // uses it too. (Large tier keeps the FG_MANY_HEADS_MIN gate: coarse HPW>1 there
   // amortizes the cos/sin gather across heads, which FG can't at HPW>1.)
-  // xlarge -> FG was an MI355 choice. On gfx1250 it is the worst cell measured:
-  // H=128 T=16384 lands here and runs 2.24x flydsl, while H=16/32 (which fall in
-  // `large` -> coarse) run 1.53-1.64x. The reason is rows-per-wave, not the kernel
-  // body -- FG is one (token,head) row per wave, so at H=128 T=16384 it launches
-  // 2,113,536 single-wave workgroups and pays the per-wave fixed cost (kernarg,
-  // positions chase, cos/sin, descriptor setup) once per row. flydsl's TDM path
-  // gives each wave 16 rows: 16,384 WGs / 131,072 waves. Routing xlarge to coarse
-  // (HPW=16) lands at 36,864 WGs / 147,456 waves with 16 heads/wave -- essentially
-  // flydsl's shape -- and coarse already carries the Q-head TDM ring.
+  // xlarge -> FG was an MI355 choice, and on gfx1250 it is the worst cell measured.
+  // The reason is rows-per-wave, not the kernel body: FG is one (token,head) row per
+  // wave, so at H=128 T=16384 it launches 2,113,536 single-wave workgroups and pays
+  // the per-wave fixed cost (kernarg, positions chase, cos/sin, descriptor setup)
+  // once per row. Routing xlarge to coarse (HPW=16) lands at 36,864 WGs / 147,456
+  // waves with 16 heads/wave, and coarse already carries the Q-head TDM ring.
 #ifndef AITER_XLARGE_USE_COARSE
 // MEASURED gfx1250 H=128 T=16384, paired op_test, 6/6 clean pairs, sd 0.50pp:
 //   569.59 -> 348.50 us, -38.82% (CI -39.21..-38.42).
-// That moves H=128 from the worst cell measured against flydsl (2.52x) to the
-// same 1.54x the other head counts already sat at, which is the whole point:
-// H=128 was never slow because of the head count, it was slow because
-// FG_MANY_HEADS_MIN=128 routed it to the FG kernel at one (token,head) row per
-// wave -- 2,113,536 single-wave workgroups, each paying its own kernarg read,
-// positions chase, cos/sin setup and descriptor build. coarse gives a wave 16
-// heads and amortises all of that 16x, landing at 36,864 WGs / 147,456 waves.
-// FG_MANY_HEADS_MIN is an MI355 constant and is actively harmful here.
+// The head count was never the reason H=128 was slow: FG_MANY_HEADS_MIN=128 routed
+// it to the FG kernel at one (token,head) row per wave -- 2,113,536 single-wave
+// workgroups, each paying its own kernarg read, positions chase, cos/sin setup and
+// descriptor build. coarse gives a wave 16 heads and amortises all of that 16x,
+// landing at 36,864 WGs / 147,456 waves. FG_MANY_HEADS_MIN is an MI355 constant and
+// is actively harmful here.
 #define AITER_XLARGE_USE_COARSE 1
 #endif
   // FG_MANY_HEADS_MIN routing at the LARGE tier is the same MI355 constant, and on
   // gfx1250 it reproduces exactly the pathology AITER_XLARGE_USE_COARSE fixed one
   // tier up. Measured T=4096 H=128 G=64: FG launches 528,384 single-wave
-  // workgroups (one per (token,head)) against flydsl's 4,608 blocks / 36,864
-  // waves -- 14.3x the waves, each paying its own kernarg read, positions chase,
-  // cos/sin setup and descriptor build -- and runs 2.10x flydsl, the worst cell in
-  // the sweep. Coarse gives a wave HPW=8 heads and amortises all of it. Gated on
-  // the arch so gfx950/MI355 keeps the routing that was measured there.
+  // workgroups, one per (token,head), each paying its own kernarg read, positions
+  // chase, cos/sin setup and descriptor build. Coarse gives a wave HPW=8 heads and
+  // amortises all of that. Gated on the arch so gfx950/MI355 keeps the routing that
+  // was measured there.
   const bool fg_many_heads_ok = (get_gpu_arch() != "gfx1250");
   const bool use_finegrained =
       (num_tokens <= 65535)
@@ -6635,7 +6578,7 @@ void fused_qk_norm_rope_group_quant(
     if (use_finegrained) {
       // One wave per (token, head): grid.x = ceil((num_heads+1)/HEADS_PER_BLOCK)
       // (head 0 = K, 1.. = Q), grid.y = token. (num_tokens <= 65535 for V4 prefill
-      // chunks; larger T would need a Y-chunk loop like flydsl's MAX_GRID_Y.)
+      // chunks; larger T would need a Y-chunk loop.)
       // HEADS_PER_BLOCK waves per block, so a decode launch costs
       // ceil((num_heads+1)/HPB) * num_tokens workgroups instead of
       // (num_heads+1) * num_tokens. At H=32 that is 9 blocks/token instead of 33.
@@ -6675,9 +6618,8 @@ void fused_qk_norm_rope_group_quant(
       // gfx1250 ONLY. On wave32 a one-wave block is 32 threads, half a wave64
       // block, so covering the same T*H rows costs twice the workgroup
       // dispatches; packing tokens refills the block and cancels that. wave64
-      // never had the problem: flydsl's own kernel takes rows_per_wg on its w32
-      // builder and hard-codes block=(BLOCK_THREADS, 1, 1) on w64, i.e. it does
-      // NOT token-pack on gfx942/gfx950. The coarse-kernel note above also has
+      // never had the problem, so gfx942/gfx950 do NOT token-pack. The
+      // coarse-kernel note above also has
       // MI355 measured as memory-traffic bound rather than occupancy bound
       // there, which a launch-shape change cannot move.
       //
@@ -6861,7 +6803,7 @@ void fused_qk_norm_rope_group_quant(
 // PLAN_BASED=true: compress path -- resolve the paged dest + RoPE position IN-KERNEL
 //   from the SGLang-style `plan` ([cap,4] = ragged_id,batch_id,position,window_len) +
 //   `block_table`, so NO host slot_mapping/comp_pos build is needed (the plan is the
-//   MTP-aware / CG-safe source of truth, like flydsl Kernel B / fused_compress). `kv`
+//   MTP-aware / CG-safe source of truth). `kv`
 //   is the pre-pooled compressed K [cap, head_dim]; row = pid. ci = position/ratio,
 //   slot_in_block = ci%page_size, physical_block = block_table[batch_id, ci/page_size],
 //   comp_pos = ci*ratio. Sentinel rows (position<0) bail -> CG-safe fixed grid.
