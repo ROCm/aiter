@@ -1033,6 +1033,7 @@ def test_flydsl_aot_target_filter():
 
     import aiter.aot.flydsl.common as aot_common
     from aiter.aot.flydsl.common import OpKind, _filter_collected_aot_jobs
+    from aiter.aot.flydsl.gemm import filter_jobs_for_build_targets
 
     env_names = ("AITER_GPU_TARGETS", "GPU_ARCHS", "CU_NUM", "ARCH")
     original = {name: os.environ.pop(name, None) for name in env_names}
@@ -1076,16 +1077,25 @@ def test_flydsl_aot_target_filter():
         os.environ["CU_NUM"] = "128"
         selected = _filter_collected_aot_jobs(OpKind.GEMM, jobs)
         _check(
-            "legacy GPU_ARCHS remains arch-wide when CU_NUM is set",
-            [job["kernel_name"] for job in selected] == ["k128", "k256"],
+            "packaging pairs GPU_ARCHS with CU_NUM instead of baking the arch",
+            [job["kernel_name"] for job in selected] == ["k128"],
             str(selected),
         )
+        cli = [
+            job["kernel_name"]
+            for job in filter_jobs_for_build_targets(jobs, arch_wide=True)
+        ]
+        _check(
+            "the CLI mode still selects arch-wide, ignoring CU_NUM",
+            cli == ["k128", "k256"],
+            str(cli),
+        )
         del os.environ["CU_NUM"]
-        os.environ["GPU_ARCHS"] = "gfx942"
+        os.environ["GPU_ARCHS"] = "gfx950"
         selected = _filter_collected_aot_jobs(OpKind.GEMM, jobs)
         _check(
-            "legacy GPU_ARCHS without CU_NUM remains an arch-wide filter",
-            [job["kernel_name"] for job in selected] == ["other_arch"],
+            "GPU_ARCHS without CU_NUM takes the arch's default count",
+            [job["kernel_name"] for job in selected] == ["k256"],
             str(selected),
         )
         del os.environ["GPU_ARCHS"]
@@ -1136,8 +1146,8 @@ def test_flydsl_aot_target_filter():
         # GPU_ARCHS accepted ',' before the filter moved here; keep it that way.
         comma = _selects("GPU_ARCHS", "gfx942,gfx950")
         _check(
-            "comma-separated GPU_ARCHS selects both arches",
-            comma == ["k128", "k256", "other_arch"],
+            "comma-separated GPU_ARCHS resolves each arch to its default count",
+            comma == ["k256"],
             str(comma),
         )
     finally:

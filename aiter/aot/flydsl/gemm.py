@@ -29,7 +29,9 @@ Environment variables:
     FLYDSL_RUNTIME_CACHE_DIR  Cache directory (default: ~/.flydsl/cache)
     AITER_GPU_TARGETS         ';'/','-separated 'gfx' or 'gfx:cu_num' build
                               targets; missing pairs retain runtime fallback.
-    GPU_ARCHS                 Legacy arch-wide filter.
+    GPU_ARCHS                 Arch list. Packaging resolves it with CU_NUM into
+                              exact targets; the CLI keeps every job of that arch.
+    CU_NUM                    Compute-unit count paired with GPU_ARCHS.
     ARCH                      Legacy bare-arch filter.
 """
 
@@ -55,7 +57,11 @@ from aiter.aot.flydsl.common import (
     run_jobs_parallel,
 )
 from aiter.jit.core import AITER_CONFIGS
-from aiter.jit.utils.build_targets import KNOWN_GFX, _parse_gpu_targets_env
+from aiter.jit.utils.build_targets import (
+    KNOWN_GFX,
+    _parse_gpu_targets_env,
+    get_build_targets_env,
+)
 from aiter.jit.utils.chip_info import get_gfx_runtime
 from aiter.ops.flydsl.bpreshuffle_gemm_gfx1250 import (
     parse_wmma_kernel_name as parse_ptpc_wmma_kernel_name,
@@ -744,8 +750,22 @@ def active_target_env() -> tuple[str, str] | None:
     return None
 
 
-def filter_jobs_for_build_targets(jobs: list[dict]) -> list[dict]:
-    """Apply the same target selection to CLI and packaging AOT paths."""
+def _targets_from_archs_env(value: str) -> list[tuple[str, int]]:
+    """The (gfx, cu_num) pairs GPU_ARCHS and CU_NUM resolve to."""
+    # get_build_targets_env reads no live GPU, so expand 'native' first.
+    archs = _archs_from_env(value)
+    with override_env("GPU_ARCHS", ";".join(sorted(archs))):
+        return get_build_targets_env()
+
+
+def filter_jobs_for_build_targets(
+    jobs: list[dict], *, arch_wide: bool = False
+) -> list[dict]:
+    """Select the jobs to bake for the configured targets.
+
+    arch_wide selects on arch alone and ignores CU_NUM; otherwise GPU_ARCHS and
+    CU_NUM resolve to exact (gfx, cu_num) pairs.
+    """
     active = active_target_env()
     if active is None:
         return jobs
@@ -754,13 +774,19 @@ def filter_jobs_for_build_targets(jobs: list[dict]) -> list[dict]:
         # Not get_build_targets_env: it folds GPU_ARCHS in, and the two are
         # separate contracts here.
         selected, missing = _select_for_targets(jobs, _parse_gpu_targets_env())
-    else:
-        # ARCH and GPU_ARCHS stay arch-wide, including when CU_NUM is set.
+    elif arch_wide or var_name == "ARCH":
+        # ARCH names a bare arch and carries no CU count.
         try:
             archs = _archs_from_env(value)
         except ValueError as e:
             raise RuntimeError(f"{var_name} {e}.") from None
         selected, missing = _select_for_archs(jobs, archs)
+    else:
+        try:
+            targets = _targets_from_archs_env(value)
+        except ValueError as e:
+            raise RuntimeError(f"{var_name} {e}.") from None
+        selected, missing = _select_for_targets(jobs, targets)
     _warn_legacy_rows(jobs)
     _warn_unmatched(missing)
     return selected
@@ -851,7 +877,7 @@ def main():
     all_jobs = collect_aot_jobs(csv_paths, parse_csv)
     n_before = len(all_jobs)
     try:
-        all_jobs = filter_jobs_for_build_targets(all_jobs)
+        all_jobs = filter_jobs_for_build_targets(all_jobs, arch_wide=True)
     except RuntimeError as e:
         print(f"Error: {e}")
         sys.exit(1)
