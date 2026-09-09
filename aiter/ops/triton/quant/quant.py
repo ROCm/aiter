@@ -4,9 +4,6 @@
 import torch
 import triton
 
-from aiter.ops.triton._gluon_kernels.gfx950.quant.quant import (
-    gluon_dynamic_mxfp4_quant_kernel_gfx950,
-)
 from aiter.ops.triton._gluon_kernels.gfx1250.quant.quant import (
     gluon_dynamic_mxfp4_quant_kernel_gfx1250,
     gluon_dynamic_mxfp8_quant_kernel_gfx1250,
@@ -250,31 +247,7 @@ def dynamic_mxfp4_quant(
     )
     even_m_n = (M % BLOCK_SIZE_M == 0) and (N % (BLOCK_SIZE_N * NUM_ITER) == 0)
 
-    # The gfx950 Gluon kernel dropped its sw (manual bit-manipulation)
-    # fallback and always uses the hw-cvt instruction, which only supports
-    # bf16 -- non-bf16 input falls through to the plain Triton path below.
-    if arch_info.get_arch() == "gfx950" and x.dtype == torch.bfloat16:
-        gluon_dynamic_mxfp4_quant_kernel_gfx950[grid](
-            x,
-            x_fp4,
-            blockscale_e8m0,
-            *x.stride(),
-            *x_fp4.stride(),
-            *blockscale_e8m0.stride(),
-            M=M,
-            N=N,
-            MXFP4_QUANT_BLOCK_SIZE=MXFP4_QUANT_BLOCK_SIZE,
-            EVEN_M_N=even_m_n,
-            SCALING_MODE=0,
-            NUM_ITER=NUM_ITER,
-            BLOCK_SIZE_M=BLOCK_SIZE_M,
-            BLOCK_SIZE_N=BLOCK_SIZE_N,
-            NUM_STAGES=NUM_STAGES,
-            num_warps=NUM_WARPS,
-            waves_per_eu=0,
-        )
-
-    elif arch_info.get_arch() == "gfx1250":
+    if arch_info.get_arch() == "gfx1250":
         gluon_dynamic_mxfp4_quant_kernel_gfx1250[grid](
             x,
             x_fp4,
