@@ -185,6 +185,7 @@ def compute_segment_params(config: dict, params) -> dict:
 
     budget = params.num_sms * per_cu
     prgms = max(1, params.num_2d_prgms)
+    # this is specific to gfx950 luon as the num waves depends on mfma dim there
     if mfma_dim:
         budget //= max(1, triton.next_power_of_2(params.num_queries_per_kv) // mfma_dim)
     share = triton.cdiv(budget, prgms)
