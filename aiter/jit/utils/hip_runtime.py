@@ -45,8 +45,10 @@ def get_hip_runtime_version() -> tuple[int, int, int] | None:
     return raw // 10_000_000, (raw // 100_000) % 100, raw % 100_000
 
 
-def get_current_hip_device() -> int:
-    """Ordinal of the device this thread is bound to, or 0 if unavailable.
+def get_current_hip_device() -> int | None:
+    """Ordinal of the device this thread is bound to, or None if HIP cannot say.
+
+    None rather than 0, which is a real ordinal a caller could act on.
 
     Uncached on purpose: torch.cuda.set_device() moves it between calls.
     """
@@ -54,7 +56,7 @@ def get_current_hip_device() -> int:
         libhip = load_hip_runtime()
         val = ctypes.c_int(0)
         if libhip.hipGetDevice(ctypes.byref(val)) != 0:
-            return 0
+            return None
     except Exception:  # noqa: BLE001
-        return 0
+        return None
     return val.value
