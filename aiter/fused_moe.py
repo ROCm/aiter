@@ -1065,10 +1065,7 @@ def _fused_moe_impl(
 
     if output_aux:
         _validate_output_aux(output_aux)
-        # Only a re-selection: configs that do not ask for the aux arrays are
-        # left alone, so this cannot switch a non-aux config into the aux path.
-        if metadata.output_aux:
-            metadata = replace(metadata, output_aux=output_aux)
+        metadata = replace(metadata, output_aux=output_aux)
 
     block_size_M = metadata.block_m if block_size_M is None else block_size_M
     # Ensure block_size_M is int (metadata.block_m from CSV may be float)

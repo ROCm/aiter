@@ -2287,9 +2287,6 @@ def _flydsl_moe_stage2_impl(
             fp8_scale_blk=_S2_LEGACY_FP8_SCALE_BLK,
             fp8_pitch_align=_S2_LEGACY_FP8_PITCH_ALIGN,
         )
-    if not accumulate and model_dim_pad > 0:
-        # Normalize padding that GEMM2 leaves unwritten.
-        out.view(-1, model_dim)[:, model_dim - model_dim_pad :].zero_()
     return out
 
 
