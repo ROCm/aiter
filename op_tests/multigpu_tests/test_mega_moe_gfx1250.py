@@ -26,7 +26,8 @@ Launch (4x gfx1250; every env knob below is already the script's default):
       -q a4w4_mxfp4 -e 384 -k 6 -hd 7168 -id 3072 --layers 61 --combine base
     # Set MORI_CCO_BC to a prebuilt libmori_cco_device.bc to skip CCO JIT.
 
-Env / CLI: --layers --logits_tol --acc_verify --dispatch_commu_dtype -tpr -hd -id -e -k --shared_E -q
+Env / CLI: --layers --logits_tol --acc_verify --dispatch_wire --combine
+           -tpr -hd -id -e -k --shared_E -q
 """
 
 import argparse
@@ -42,7 +43,6 @@ from aiter import (
     QuantType,
     dtypes,
     get_gfx,
-    get_hip_quant,
     get_torch_quant,
     pertoken_quant,
 )
@@ -77,7 +77,6 @@ os.environ.setdefault("FLYDSL_GPU_ARCH", get_gfx())
 _FP8_DTYPE = dtypes.fp8
 QUANT_KEYS = ["No", "per_Token", "per_128x128", "a8w4_mxfp4", "a4w4_mxfp4"]
 _MXFP4_KEYS = ("a8w4_mxfp4", "a4w4_mxfp4")
-_FP8_KEYS = ("per_Token", "per_128x128")
 
 
 def _import_mori_comm():
@@ -103,16 +102,10 @@ def _import_mori_v2():
 
 
 # Config / quant-path spec
-def resolve_spec(quant_key, transport):
+def resolve_spec(quant_key):
     """How to prepare weights / quantize activations / call fused_moe for a quant
-    key, plus the dispatch transport dtype. transport: auto|bf16|fp8."""
+    key."""
     is_mxfp4 = quant_key in _MXFP4_KEYS
-    is_fp8 = quant_key in _FP8_KEYS
-
-    if transport == "auto":
-        transport = "fp8" if is_fp8 else "bf16"
-    if transport == "fp8" and not is_fp8:
-        transport = "bf16"
 
     if quant_key == "No":
         aiter_qtype = QuantType.No
@@ -134,11 +127,38 @@ def resolve_spec(quant_key, transport):
         "gate_mode": gate_mode,
         "activation": ActivationType.Silu,
         "is_mxfp4": is_mxfp4,
-        "is_fp8": is_fp8,
-        "transport": transport,
-        "prequant": transport == "fp8",
-        "fp8_dtype": _FP8_DTYPE,
     }
+
+
+# The MegaMoE (--combine fused) dispatch wire.
+_DISPATCH_WIRE_FOR_QUANT = {"a8w4_mxfp4": "fp8", "a4w4_mxfp4": "fp4"}
+
+
+def resolve_dispatch_wire(wire, quant_key):
+    """What MegaMoE's dispatch puts on the wire: bf16 | fp8 | fp4.
+
+    A quantizing wire is not a free choice -- the receiver hands the payload to
+    the grouped GEMM as its A operand, so it has to be the width that GEMM wants
+    (a8w4 -> fp8, a4w4 -> fp4), which is what ``auto`` resolves to. The other
+    pairing is a width error, not a slow path, so it is rejected here rather
+    than deep inside the gather.
+    """
+    if wire == "auto":
+        return _DISPATCH_WIRE_FOR_QUANT.get(quant_key, "bf16")
+    if wire == "bf16":
+        return "bf16"
+    want = _DISPATCH_WIRE_FOR_QUANT.get(quant_key)
+    if want is None:
+        raise ValueError(
+            f"--dispatch_wire={wire} needs an MX quant key "
+            f"({'/'.join(_DISPATCH_WIRE_FOR_QUANT)}), got -q {quant_key}"
+        )
+    if wire != want:
+        raise ValueError(
+            f"-q {quant_key} wants a {want} A operand, so --dispatch_wire={wire} "
+            "would hand the GEMM the wrong payload width"
+        )
+    return wire
 
 
 # Weight quantization + shuffle (device path) / dequant (reference)
@@ -224,15 +244,6 @@ def shuffle_group(w1_qt, w1_s, w2_qt, w2_s, spec, n_experts):
         w1_a = w1_a.view(dtypes.fp4x2)
         w2_a = w2_a.view(dtypes.fp4x2)
     return w1_a, w2_a, w1_ss, w2_ss
-
-
-def quant_tokens_fp8(tokens, spec):
-    """Per-token / per-block fp8 quant of the activations (fp8 pre-quant transport)."""
-    qt = spec["aiter_qtype"]
-    quant_func = get_hip_quant(
-        qt if qt != QuantType.per_128x128 else QuantType.per_1x128
-    )
-    return quant_func(tokens, quant_dtype=spec["fp8_dtype"])
 
 
 def moe_forward(
@@ -582,6 +593,8 @@ class DeviceMoEPipeline:
                 activation=self.spec["activation"],
                 gate_mode=self.spec["gate_mode"].value,
                 quant_type=self.spec["aiter_qtype"],
+                # Explicit so a stale $MEGA_DISPATCH_WIRE cannot change what is measured.
+                dispatch_wire=self.spec["dispatch_wire"],
             )
         else:
             EpDispatchCombineConfig, EpDispatchCombineOp = _import_mori_v2()
@@ -816,7 +829,11 @@ def main():
     args = _parse_args()
     dist_ctx = Dist()
     dev = torch.device("cuda", dist_ctx.local_rank)
-    spec = resolve_spec(args.quant_type, args.dispatch_commu_dtype)
+    # Set, not setdefault: the wire has to match this, so a stale environment
+    # value would otherwise make -q a4w4_mxfp4 silently measure a8w4.
+    os.environ["AITER_FORCE_A8W4"] = "0" if args.quant_type == "a4w4_mxfp4" else "1"
+    spec = resolve_spec(args.quant_type)
+    spec["dispatch_wire"] = resolve_dispatch_wire(args.dispatch_wire, args.quant_type)
 
     if spec["is_mxfp4"] and get_gfx() not in ("gfx950", "gfx1250"):
         if dist_ctx.rank == 0:
@@ -836,7 +853,8 @@ def main():
         print(
             f"[cfg] world={dist_ctx.world} layers={n_layers} tokens/rank={ct} hidden={hdim} "
             f"inter={idim} E={E} topk={topk} EPR={E // dist_ctx.world} quant={args.quant_type} "
-            f"combine={args.combine} "
+            f"combine={args.combine} dispatch_wire={spec['dispatch_wire']} "
+            f"force_a8w4={os.environ['AITER_FORCE_A8W4']} "
             f"gate={spec['gate_mode'].name} shared_E={args.shared_experts} gfx={get_gfx()}",
             flush=True,
         )
@@ -964,6 +982,10 @@ def main():
 
 
 def _parse_args():
+    # Imported here, not at module scope: pulling in the mega package before
+    # FLYDSL_GPU_ARCH is set below would hand flydsl the wrong arch.
+    from aiter.ops.flydsl.kernels.mega_moe_gfx1250 import read_dispatch_wire_env
+
     p = argparse.ArgumentParser(description="multi-layer EP MoE perf + accuracy")
     p.add_argument(
         "-q",
@@ -1011,11 +1033,14 @@ def _parse_args():
         "can stall multi-rank graph-profile runs)",
     )
     p.add_argument(
-        "--dispatch_commu_dtype",
+        "--dispatch_wire",
         type=str,
-        choices=["auto", "bf16", "fp8"],
-        default="auto",
-        help="dispatch transport (communication) dtype",
+        choices=["auto", "bf16", "fp8", "fp4"],
+        default=read_dispatch_wire_env(),
+        help="what dispatch puts on the wire (--combine fused only): bf16 sends "
+        "activations and the receiver quantizes each copy; fp8/fp4 quantize once "
+        "on the sender and forward the e8m0 row. 'auto' picks what the quant "
+        "key's GEMM wants.",
     )
     p.add_argument(
         "--combine",

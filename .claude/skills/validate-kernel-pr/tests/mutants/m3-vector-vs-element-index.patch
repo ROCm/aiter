@@ -1,0 +1,13 @@
+diff --git a/kernels/norm/softmax_kernel.py b/kernels/norm/softmax_kernel.py
+index b68a25a3..b44a0e66 100644
+--- a/kernels/norm/softmax_kernel.py
++++ b/kernels/norm/softmax_kernel.py
+@@ -161,7 +161,7 @@ def build_softmax_module(M: int, N: int, dtype_str: str = "f32"):
+                 norm_vec = row_buffer[tile_i] * inv_sum
+                 out_e = norm_vec if dtype_str == "f32" else norm_vec.to(elem_dtype)
+ 
+-                out_idx = tid + tile_i * BLOCK_THREADS
++                out_idx = (tid + tile_i * BLOCK_THREADS) * vec_width
+                 _store_vec(out_e, c_div, out_idx)
+ 
+         else:

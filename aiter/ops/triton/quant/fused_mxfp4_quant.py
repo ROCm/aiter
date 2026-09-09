@@ -20,6 +20,7 @@ from aiter.ops.triton._triton_kernels.quant.fused_mxfp4_quant import (
     _fused_rms_mxfp4_quant_kernel,
 )
 from aiter.ops.triton.utils._triton.arch_info import get_arch
+from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 from aiter.utility import dtypes
 
@@ -729,7 +730,18 @@ def fused_dynamic_mxfp4_quant_moe_sort(
     )
 
 
-@triton.jit
+_fused_quant_fp8_sort_repr = make_kernel_repr(
+    "_fused_quant_fp8_sort_kernel",
+    [
+        "BLOCK_SIZE_M",
+        "BLOCK_SIZE_N",
+        "QUANT_BLOCK_SIZE",
+        "TOPK",
+    ],
+)
+
+
+@triton.jit(repr=_fused_quant_fp8_sort_repr)
 def _fused_quant_fp8_sort_kernel(
     # Pointers
     input_ptr,
