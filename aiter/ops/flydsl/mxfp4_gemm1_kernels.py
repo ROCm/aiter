@@ -140,14 +140,10 @@ def _assert_supported(
             f"flydsl mxfp4 gemm1 requires BN in (64, 128, 256), got {BN}"
         )
     if BN == 64 and not (
-        BM == 32
-        and a_dtype == "fp4"
-        and out_dtype == "fp4"
-        and not inline_quant
-        and not interleave
+        BM == 32 and a_dtype == "fp4" and out_dtype == "fp4" and not inline_quant
     ):
         raise NotImplementedError(
-            "flydsl mxfp4 GEMM1 BN64 is restricted to BM32 A4W4 non-inline separated"
+            "flydsl mxfp4 GEMM1 BN64 is restricted to BM32 A4W4 non-inline"
         )
     if num_waves not in (2, 4):
         raise NotImplementedError(
@@ -170,8 +166,6 @@ def _assert_supported(
             raise NotImplementedError("k_wave > 1 is currently restricted to BM32")
         if inline_quant:
             raise NotImplementedError("k_wave > 1 does not support inline quantization")
-        if interleave:
-            raise NotImplementedError("k_wave > 1 requires separated gate/up layout")
         if num_waves * k_wave > 8:
             raise NotImplementedError(
                 f"k_wave creates too many waves: {num_waves} * {k_wave} > 8"

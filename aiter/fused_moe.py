@@ -2147,11 +2147,7 @@ def _mxfp4_a4w4_stage1_fw(
         kernelName1=kernelName1,
         device=device,
         use_nt=p1["use_nt"],
-        # interleave is the gate/up layout of the w1 tensor we were handed, so it
-        # can only come from the caller. It must never be ORed with the "_il"/"_sep"
-        # tag in kernelName1: that tag records which layout the tuner benchmarked,
-        # and a tuned row naming "_il" applied to a SEPARATED w1 makes the kernel
-        # read gate columns as up (silent garbage, cosine ~0 -- see the caller).
+        # The caller supplies the weight layout independently of kernelName1.
         interleave=interleave,
         num_waves=p1.get("num_waves", 4),
         native_scale_layout=native_scale_layout,
@@ -2690,15 +2686,6 @@ def get_2stage_cfgs(
                 f"activation {configured_act!r} does not match runtime "
                 f"{expected_act!r}"
             )
-        elif parsed_g1["interleave"] != (gate_mode == GateMode.INTERLEAVE):
-            # kernelName1 and the gate layout are not independent: BN64 and
-            # k_wave>1 variants are compiled separated-only, so keeping the tuned
-            # name while flipping interleave yields metadata that cannot launch.
-            reject_reason = (
-                f"kernelName1 was tuned for gate_mode="
-                f"{'interleave' if parsed_g1['interleave'] else 'separated'} but "
-                f"this call passes {gate_mode}"
-            )
         elif swiglu_limit is not None and expected_act != "swiglu":
             # MXMOE's _activation_mul_batch consumes the limit for swiglu only;
             # silu/situv2 would ignore it while the torch reference clamps.
@@ -2875,24 +2862,13 @@ def get_2stage_cfgs(
             _mxfp4_a4w4_stage2_fw,
             kernelName2=kernelName2,
         )
-        runtime_interleave = gate_mode == GateMode.INTERLEAVE
-        if _p1["interleave"] != runtime_interleave:
-            # A tuned config reaching here mismatched is already discarded above.
-            # An explicitly supplied name cannot be salvaged: BN64 and k_wave>1
-            # GEMM1 variants exist for the separated layout only, so honouring
-            # the caller's gate_mode would build metadata that fails later inside
-            # _assert_supported. Fail here, where the cause is still visible.
-            raise ValueError(
-                f"GEMM1 {kernelName1!r} is compiled for gate_mode="
-                f"{'interleave' if _p1['interleave'] else 'separated'} but this "
-                f"call passes {gate_mode.value!r}; supply a kernel matching the "
-                f"gate layout or re-tune this shape under {gate_mode.value!r}"
-            )
+        # gate_mode describes the runtime weight layout. The same tuned name
+        # selects the il/sep compiled variant, including BN64 and K-wave splits.
         return MOEMetadata(
             stage1=functools.partial(
                 _mxfp4_a4w4_stage1_fw,
                 kernelName1=kernelName1,
-                interleave=runtime_interleave,
+                interleave=(gate_mode == GateMode.INTERLEAVE),
             ),
             stage2=stage2_func,
             block_m=_bm,

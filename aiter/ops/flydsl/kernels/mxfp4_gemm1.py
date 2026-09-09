@@ -132,7 +132,7 @@ def _gemm1_body(
     M_REPS = BM // 16
     N_REPS = BN // (num_waves * 16)
     EPILOGUE_M_REPS = 1 if num_waves == 2 else M_REPS
-    B_SCALE_REPS = 1 if interleave and BN == 128 else 2
+    B_SCALE_REPS = max(1, N_REPS // 2) if interleave else 2
     wave_n = wave % fx.Int32(num_waves)
     wave_k = wave // fx.Int32(num_waves)
     aq_group_base = wave_k * fx.Int32(kAStages * BM * KH_TILE)
@@ -222,7 +222,7 @@ def _gemm1_body(
         if const_expr(interleave):
             col = (
                 n_block_idx * fx.Int32(BN)
-                + wave_n * fx.Int32(BN // 4)
+                + wave_n * fx.Int32(N_REPS * 16)
                 + fx.Int32(j * 16)
             )
         else:
@@ -238,7 +238,10 @@ def _gemm1_body(
         b_load_s_base.append(rocdl.readfirstlane(T.i32, v))
 
     if const_expr(interleave):
-        mni_base = n_block_idx * fx.Int32(BN // 32) + wave_n * fx.Int32(BN // 128)
+        # Each scale word covers two consecutive 16-column weight tiles.
+        mni_base = n_block_idx * fx.Int32(BN // 32) + wave_n * fx.Int32(
+            N_REPS
+        ) // fx.Int32(2)
         np_list = [mni_base, mni_base + fx.Int32(1)]
     else:
         if const_expr(BN == 64):
@@ -768,7 +771,7 @@ def _gemm1_body(
         v = ((lane_div_16 * fx.Int32(16)) + lane_mod_16) * fx.Int32(4)
         K_C_HI = K_C // 16
         imm = (K_C - K_C_HI * 16) * (kBS_stride_k0_dw * 4)
-        # Interleaved BN128 has only one scale slot.
+        # Interleaved BN64/BN128 have only one scale slot.
         for mw in range_constexpr(B_SCALE_REPS):
             s_off = b_scale_s_base[mw] if K_C_HI == 0 else b_scale_s_base_hi[mw]
             idx = (v + fx.Int32(imm)) // fx.Int32(4)
@@ -817,7 +820,13 @@ def _gemm1_body(
                     _mma(accm[i0][J], 2, 2 + in_b, a[i0][1], bJ1, sa, sb)
                     _mma(accm[i1][J], 3, 2 + in_b, a[i1][1], bJ1, sa, sb)
 
-        if const_expr(BN == 64 and not interleave):
+        if const_expr(interleave and N_REPS == 1):
+            # Adjacent waves consume the low/high N half of one scale word.
+            if (wave_n & fx.Int32(1)) == fx.Int32(0):
+                issue_cluster(0, 0)
+            else:
+                issue_cluster(0, 1)
+        elif const_expr(BN == 64 and not interleave):
             if const_expr(num_waves == 2):
                 if wave_n == fx.Int32(0):
                     issue_cluster(mni, 0)
@@ -1031,6 +1040,8 @@ def _gemm1_body(
     for i in range_constexpr(kMChunks):
         row_base = fx.Int32(i * 16) + lane_div_16 * fx.Int32(4)
         for J in range_constexpr(N_REPS):
+            # Both weight layouts assign alternating gate/up tiles to the
+            # same accumulators, including BN64's pairs of adjacent waves.
             if const_expr(BN == 64):
                 if const_expr(num_waves == 2):
                     gate_up = fx.Int32(J % 2)
@@ -1384,12 +1395,8 @@ def compile_gemm1_a4w4_port(
         # is one complete 32-column MX group for any activation. Only the tile
         # shape and data layout are constrained.
         assert (
-            BM == 32
-            and a_dtype == "fp4"
-            and out_dtype == "fp4"
-            and not inline_quant
-            and not interleave
-        ), "BN64 is restricted to BM32 A4W4 non-inline separated"
+            BM == 32 and a_dtype == "fp4" and out_dtype == "fp4" and not inline_quant
+        ), "BN64 is restricted to BM32 A4W4 non-inline"
     if num_waves == 2:
         assert BN == 64, "the two-wave specialization requires effective BN64"
     if native_scale_layout:
@@ -1399,7 +1406,6 @@ def compile_gemm1_a4w4_port(
     if k_wave > 1:
         assert BM == 32, "k_wave > 1 is currently restricted to BM32"
         assert not inline_quant, "k_wave > 1 does not support inline quantization"
-        assert not interleave, "k_wave > 1 requires separated gate/up layout"
         # Fused bias is k_wave-safe: every K-wave writes its partial accumulator
         # to its own acc_idx(wave_k, ...) LDS group, the cross-wave reduction
         # happens once inside acc_load_sum(), and run_epilogue() -- the only

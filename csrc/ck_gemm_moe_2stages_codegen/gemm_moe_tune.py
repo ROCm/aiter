@@ -6110,7 +6110,7 @@ class Mxfp4FlydslTuner(FmoeTuner):
         return name
 
     # GEMM1 axes swept on top of (BM, use_nt, inline_quant). Their constraints
-    # interact (BN64 implies BM32 non-inline separated; num_waves==2 implies
+    # interact (BN64 implies BM32 non-inline; num_waves==2 implies
     # BN64; k_wave>1 implies BM32 non-inline and num_waves*k_wave<=8), so
     # _g1_variants enumerates the cross-product and lets the kernel's own
     # _assert_supported reject the rest instead of duplicating that logic.

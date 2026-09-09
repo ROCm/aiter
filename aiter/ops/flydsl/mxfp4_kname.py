@@ -13,7 +13,6 @@ _MXMOE_G1_FLAG_TOKENS = {
     "F16IN",
     "HPF",
     "FP8OUT",
-    "IL",
     "SITUV2",
     "SWIGLU",
     "BIAS",
@@ -98,6 +97,8 @@ def _tokenize_mxfp4_kname(kname: str, stage: int, flag_tokens: set) -> dict:
 
 
 def _parse_mxfp4_g1_kname(kname: str) -> dict:
+    # Gate/up layout comes from the runtime gate_mode; the same config name
+    # can compile both interleaved and separated GPU kernels.
     parsed = _tokenize_mxfp4_kname(kname, 1, _MXMOE_G1_FLAG_TOKENS)
     nums, flags = parsed["nums"], parsed["flags"]
     act = "situv2" if "SITUV2" in flags else ("swiglu" if "SWIGLU" in flags else "silu")
@@ -113,7 +114,6 @@ def _parse_mxfp4_g1_kname(kname: str) -> dict:
         "xcd_swizzle": nums.get("xcd_swizzle", 0),
         "a_dtype": parsed["mode"].get("a_dtype", "fp4"),
         "out_dtype": "fp8" if "FP8OUT" in flags else "fp4",
-        "interleave": "IL" in flags,
         "act": act,
         "enable_bias": "BIAS" in flags,
         "num_waves": 2 if "W2" in flags else 4,

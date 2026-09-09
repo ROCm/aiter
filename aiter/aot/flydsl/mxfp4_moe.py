@@ -106,7 +106,7 @@ def _job_key(job: dict) -> tuple:
 
 
 def parse_csv(csv_path: str):
-    """Parse a tuned CSV into unique MXMOE-port compile jobs (one per stage)."""
+    """Parse a tuned CSV into unique MXMOE-port jobs for each stage and layout."""
     from aiter.ops.flydsl.moe_common import (
         DEFAULT_SITUV2_BETA,
         DEFAULT_SITUV2_LINEAR_BETA,
@@ -157,39 +157,42 @@ def parse_csv(csv_path: str):
                         (DEFAULT_SITUV2_BETA, DEFAULT_SITUV2_LINEAR_BETA)
                     )
                 for situ_beta, situ_linear_beta in situ_params:
-                    _add(
-                        {
-                            "stage": 1,
-                            "kernel_name": kn1,
-                            "BM": p1["BM"],
-                            "BN": p1["BN"],
-                            "BK": p1["BK"],
-                            "use_nt": p1["use_nt"],
-                            "n_tokens": token,
-                            "inline_quant": p1["inline_quant"],
-                            "prefetch_hidden": p1.get("prefetch_hidden", False),
-                            "D_HIDDEN": model_dim,
-                            # Config lookup and runtime GEMM1 both use the
-                            # unpadded logical width represented by this row.
-                            "D_INTER": inter_dim,
-                            "NE": expert,
-                            "topk": topk,
-                            "xcd_swizzle": p1["xcd_swizzle"],
-                            "a_dtype": p1["a_dtype"],
-                            "out_dtype": p1["out_dtype"],
-                            "act": p1["act"],
-                            "situ_beta": situ_beta,
-                            "situ_linear_beta": situ_linear_beta,
-                            "swiglu_limit": 7.0,
-                            "enable_bias": p1["enable_bias"],
-                            "interleave": p1["interleave"],
-                            "native_scale_layout": native_scale_layout_for(
-                                p1["BM"], p1["out_dtype"]
-                            ),
-                            "num_waves": p1.get("num_waves", 4),
-                            "k_wave": p1.get("k_wave", 1),
-                        }
-                    )
+                    # gate_mode selects the layout at runtime; CSV kernel names
+                    # represent both layouts, with separate compiled cache keys.
+                    for interleave in (False, True):
+                        _add(
+                            {
+                                "stage": 1,
+                                "kernel_name": kn1,
+                                "BM": p1["BM"],
+                                "BN": p1["BN"],
+                                "BK": p1["BK"],
+                                "use_nt": p1["use_nt"],
+                                "n_tokens": token,
+                                "inline_quant": p1["inline_quant"],
+                                "prefetch_hidden": p1.get("prefetch_hidden", False),
+                                "D_HIDDEN": model_dim,
+                                # Config lookup and runtime GEMM1 both use the
+                                # unpadded logical width represented by this row.
+                                "D_INTER": inter_dim,
+                                "NE": expert,
+                                "topk": topk,
+                                "xcd_swizzle": p1["xcd_swizzle"],
+                                "a_dtype": p1["a_dtype"],
+                                "out_dtype": p1["out_dtype"],
+                                "act": p1["act"],
+                                "situ_beta": situ_beta,
+                                "situ_linear_beta": situ_linear_beta,
+                                "swiglu_limit": 7.0,
+                                "enable_bias": p1["enable_bias"],
+                                "interleave": interleave,
+                                "native_scale_layout": native_scale_layout_for(
+                                    p1["BM"], p1["out_dtype"]
+                                ),
+                                "num_waves": p1.get("num_waves", 4),
+                                "k_wave": p1.get("k_wave", 1),
+                            }
+                        )
 
             if v2_g2 is not None:
                 bm = v2_g2["tile_m"]
