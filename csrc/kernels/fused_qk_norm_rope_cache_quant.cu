@@ -5101,6 +5101,21 @@ namespace aiter {
         }
       }
 
+      // Running output offsets instead of `q_head_idx * stride` per head. Both
+      // strides are runtime int32 params promoted to int64 for the pointer add, so
+      // each use costs a 64-bit multiply-add (s_mul + s_add_co_i32 + s_addc_u32);
+      // ATT counts 6 more s_add_co_i32 per head here than flydsl. The head loop is
+      // a unit-stride walk, so the same addresses come out of one add each.
+      int64_t q_out_off = token_qout_base
+                        + static_cast<int64_t>(q_head_start) * params.q_out_stride_1;
+      int64_t q_rope_off = static_cast<int64_t>(token_idx) * params.q_rope_out_stride_0
+                         + static_cast<int64_t>(q_head_start) * params.q_rope_out_stride_1;
+      // Lane predicates and the PE store offset depend only on tid, so they belong
+      // out here with the offsets rather than being rebuilt once per head.
+      const bool is_nope_thr = (tid < nope_vec);  // nope-first
+      const int32_t pe_store_off = (tid - pe_tid_start) * vec_size_i;
+      const bool pe_is_x_half = ((tid - pe_tid_start) < (pe_dim / vec_size_i / 2));
+
       for (int32_t q_head_idx = q_head_start; q_head_idx < q_head_end; q_head_idx++) {
         opus_vec_i vec_q;
 #if defined(__gfx1250__)
@@ -5147,70 +5162,97 @@ namespace aiter {
                 q_buf, tid * vec_size_i + q_head_idx * params.q_stride_1);
         }
 
-        float sum_sq = 0.0f;
+        // Packed square-accumulate. `sum_sq += val*val` over vec_size_i scalars is a
+        // chain of vec_size_i dependent v_add_f32 -- ATT counts 16 of them executing
+        // per head here (plus 4 v_dual_add_f32), against flydsl's 2, because flydsl
+        // writes it as (xv*xv).reduce(ADD) and the multiply-accumulate lands on
+        // v_pk_fma_f32 (one instruction per two elements). Two independent lanes also
+        // halve the dependency depth.
+        //
+        // Reassociation changes the rounding of the sum; rstd feeds an e8m0 scale (a
+        // power of two) and a bf16 store, both far coarser than a last-place
+        // difference, so the check is err_q rather than byte equality.
+        using f32x2_t = float __attribute__((ext_vector_type(2)));
+        f32x2_t acc2 = {0.0f, 0.0f};
+        f32x2_t amax2 = {0.0f, 0.0f};
         #pragma unroll
-        for (int i = 0; i < vec_size_i; i++) {
-          float val = static_cast<float>(vec_q[i]);
-          sum_sq += val * val;
+        for (int i = 0; i < vec_size_i; i += 2) {
+          const f32x2_t v = {static_cast<float>(vec_q[i]),
+                             static_cast<float>(vec_q[i + 1])};
+          acc2 += v * v;
+          if constexpr (q_dt != vllm::Fp8KVCacheDataType::kAuto) {
+            // amax of the RAW input, not of the normalized vector. rstd > 0 and
+            // round-to-nearest multiply is monotonic, so max|x*rstd| == (max|x|)*rstd
+            // bit-for-bit -- and taken here the amax does not wait on the normalize
+            // pass, or even on the RMS reduction.
+            f32x2_t a = v;
+            if constexpr (HAS_Q_WEIGHT) {
+              a *= f32x2_t{static_cast<float>(vec_q_weight[i]),
+                           static_cast<float>(vec_q_weight[i + 1])};
+            }
+            amax2 = __builtin_elementwise_max(amax2, __builtin_elementwise_abs(a));
+          }
         }
+        const float sum_sq = acc2.x + acc2.y;
+        const float amax_raw = fmaxf(amax2.x, amax2.y);
+        (void)amax_raw;
 
         auto sum_func = [](float a, float b) { return a + b; };
         float total_sum_sq = wave_reduce<float, decltype(sum_func), vec_stride, true>(sum_sq, sum_func);
         const float q_rms_scale = rsqrtf(total_sum_sq / static_cast<float>(head_size) + eps);
 
-        // Step 1: per-thread normalized + (optional) q_weight
-        float q_normed[vec_size_i];
-        #pragma unroll
-        for (int i = 0; i < vec_size_i; i++) {
-          float v = static_cast<float>(vec_q[i]) * q_rms_scale;
-          if constexpr (HAS_Q_WEIGHT) {
-            v *= static_cast<float>(vec_q_weight[i]);
-          }
-          q_normed[i] = v;
-        }
-
-        // Step 2: RoPE on pe threads (hoisted pe_cos/pe_sin), identity on nope threads.
-        float rotated[vec_size_i];
-        if (is_pe_thread) {
-          const int32_t pe_local_tid = tid - pe_tid_start;  // 0..7
-          if constexpr (is_neox) {
-            constexpr int32_t half_pe_threads = pe_dim / vec_size_i / 2;  // 4
-            const bool is_x_half = (pe_local_tid < half_pe_threads);
-            #pragma unroll
-            for (int i = 0; i < vec_size_i; i++) {
-              float my_val = q_normed[i];
-              float pair_val = __shfl_xor(my_val, half_pe_threads, WARP_SIZE);
-              rotated[i] = is_x_half ? (my_val * pe_cos[i] - pair_val * pe_sin[i])
-                                     : (my_val * pe_cos[i] + pair_val * pe_sin[i]);
+        // Steps 1-3 fused into a single work vector.
+        //
+        // This used to be three live fp32[vec_size_i] arrays and three passes:
+        // q_normed (x*rstd*w), rotated (RoPE, or a copy on the nope lanes), and
+        // vec_f32 (rotated*inv_scale). Two of those passes are multiplies by
+        // loop-invariant scalars, so they fold into one. The fold is exact, not
+        // approximate: inv_scale comes out of an e8m0 block scale, i.e. it is 2^-k,
+        // so rstd*inv_scale is exact and
+        //     (x * rstd) * inv_scale  ==  x * (rstd * inv_scale)
+        // bit-for-bit. Handing the PE lanes inv_scale = 1.0f rather than 0.0f lets a
+        // single `factor` drive the whole wave, so the fold costs no branch -- and a
+        // branch would not have paid anyway, since is_nope_thr diverges within the
+        // wave and both sides issue regardless. Their fp8 store stays masked off.
+        //
+        // The amax moved up into the sum_sq loop for the same kind of reason; see
+        // the note there.
+        auto apply_rope = [&](auto& v) {
+          if (is_pe_thread) {
+            if constexpr (is_neox) {
+              constexpr int32_t half_pe_threads = pe_dim / vec_size_i / 2;  // 4
+              const bool is_x_half = pe_is_x_half;
+              #pragma unroll
+              for (int i = 0; i < vec_size_i; i++) {
+                float my_val = v[i];
+                float pair_val = __shfl_xor(my_val, half_pe_threads, WARP_SIZE);
+                v[i] = is_x_half ? (my_val * pe_cos[i] - pair_val * pe_sin[i])
+                                 : (my_val * pe_cos[i] + pair_val * pe_sin[i]);
+              }
+            } else {
+              #pragma unroll
+              for (int i = 0; i < vec_size_i; i += 2) {
+                float fqx = v[i];
+                float fqy = v[i + 1];
+                v[i]     = fqx * pe_cos[i] - fqy * pe_sin[i];
+                v[i + 1] = fqy * pe_cos[i] + fqx * pe_sin[i];
+              }
             }
-          } else {
-            #pragma unroll
-            for (int i = 0; i < vec_size_i; i += 2) {
-              float fqx = q_normed[i];
-              float fqy = q_normed[i + 1];
-              rotated[i]     = fqx * pe_cos[i] - fqy * pe_sin[i];
-              rotated[i + 1] = fqy * pe_cos[i] + fqx * pe_sin[i];
-            }
           }
-        } else {
-          #pragma unroll
-          for (int i = 0; i < vec_size_i; i++) rotated[i] = q_normed[i];
-        }
+        };
 
-        // Step 3: write out. q_out base is the per-token-per-head row; every thread writes 8 elements
-        // at offset tid*vec_size_i. For nope_first this puts nope in [0..nope_dim), pe in [nope_dim..head_size);
-        // for !nope_first the same tid*vec_size_i mapping places pe threads (tid<8) at [0..pe_dim) and
-        // nope threads (tid>=8) at [pe_dim..head_size). Either way, this is a fully coalesced 64-lane store.
+        // q_out base is the per-token-per-head row; every thread writes 8 elements at
+        // offset tid*vec_size_i. For nope_first this puts nope in [0..nope_dim), pe in
+        // [nope_dim..head_size); for !nope_first the same mapping places pe threads
+        // (tid<8) at [0..pe_dim) and nope threads at [pe_dim..head_size). Either way
+        // it is a fully coalesced 64-lane store.
         if constexpr (q_dt != vllm::Fp8KVCacheDataType::kAuto) {
-          // FP8 Q mirrors the K layout: quantize NOPE only (1xGROUP_SIZE e8m0), write nope
-          // fp8 + inline duplicated e8m0 scale into q_out (q_nope_scale_buff, 512B), and
-          // write the rotated PE as bf16 into the separate q_rope_out (Q-PE NOT quantized).
-          const bool is_nope_thr = (tid < nope_vec);  // nope-first
-          // Floor baked into the accumulator init: guards the e8m0 scale against a
-          // zero/near-zero group amax with no extra op at the scale call site.
-          float thread_max = kFp8KvQuantAbsmaxFloorF32;
-          #pragma unroll
-          for (int i = 0; i < vec_size_i; i++) thread_max = fmaxf(thread_max, fabsf(rotated[i]));
+          // FP8 Q mirrors the K layout: quantize NOPE only (1xGROUP_SIZE e8m0), write
+          // nope fp8 + inline duplicated e8m0 scale into q_out (512B), and write the
+          // rotated PE as bf16 into the separate q_rope_out (Q-PE NOT quantized).
+          // Floor applied after the rescale, which is where it was when the amax was
+          // taken on the normalized vector.
+          float thread_max = fmaxf(amax_raw * q_rms_scale, kFp8KvQuantAbsmaxFloorF32);
           // Group-amax over the Q_REDUCE-lane group. DPP, not __shfl_xor: on gfx1250
           // __shfl_xor lowers to ds_bpermute_b32 through the LDS crossbar plus an
           // s_wait_dscnt, while the DPP form folds the lane move into the v_max
@@ -5231,35 +5273,23 @@ namespace aiter {
           // rocm-smi --showpids plus VRAM): 296.50 -> 290.32 us, -2.07%
           // (95% CI [-2.95, -1.20], 12/15 reps negative).
           thread_max = multithread_reduce_max_dpp<Q_REDUCE>(thread_max);
-          // E8M0 block scale via the shared MX helper, RoundUp mode (same as K).
           constexpr MxDtype kQMxDt = kHwFp8E4m3Dtype;
           const E8m0BlockScale qs_scale =
               fp_f32_to_e8m0_block_scale<MxScaleRoundMode::RoundUp, kQMxDt>(thread_max);
-          const float inv_scale = is_nope_thr ? qs_scale.inv_scale() : 0.0f;
+          const float inv_scale = is_nope_thr ? qs_scale.inv_scale() : 1.0f;
+          const float factor = q_rms_scale * inv_scale;
 
-          query_t* q_out_head = q_out + token_qout_base + q_head_idx * params.q_out_stride_1;
+          opus::vector_t<float, vec_size_i> work;
+          #pragma unroll
+          for (int i = 0; i < vec_size_i; i++) {
+            float v = static_cast<float>(vec_q[i]) * factor;
+            if constexpr (HAS_Q_WEIGHT) v *= static_cast<float>(vec_q_weight[i]);
+            work[i] = v;
+          }
+          apply_rope(work);
+
+          query_t* q_out_head = q_out + q_out_off;
           if (is_nope_thr) {
-            // Every lane of a group writes the e8m0 scale pair (s,s) at
-            // byte [nope_dim + 2*group_id), not just lane 0 of the group.
-            //
-            // thread_max is __shfl_xor-reduced across the Q_REDUCE lanes above, so
-            // qs_scale.byte is group-uniform, and group_id = tid/Q_REDUCE is too --
-            // the lanes of a group agree on both address and value, and the
-            // `% Q_REDUCE == 0` test only suppressed duplicate writes.
-            //
-            // The dedup did not pay for itself: restoring EXEC (`s_or_b32 exec_lo`)
-            // while the store is in flight is a WAR hazard costing a full
-            // `s_wait_xcnt 0x0` address-queue drain. Same fix, same argument as
-            // inverse_rope_group_quant's store_scale (commit 4571cfd4).
-            //
-            // MEASURED gfx1250 T=16384 H=128 G=64: 309.67 -> 307.83 us, -0.59%
-            // (95% CI [-1.18, -0.00], 6/6 reps same sign, outputs bit-identical).
-            // Real but an order of magnitude below the 7.7% the ATT exec-region
-            // share suggested: the coarse kernel only loses s_and_saveexec 22->20
-            // and s_wait_xcnt 48->46, i.e. LLVM never replicated this region per
-            // head of the HPW loop, so the drain is paid ~2x per wave, not 16x.
-            // group_id = (tid * vec_size_i) / Q_GROUP_SIZE = tid / Q_REDUCE; generic over
-            // Q_GROUP_SIZE (the compiler folds to a shift since Q_REDUCE is a power of 2).
             {
               const int group_id = tid / Q_REDUCE;  // 0..Q_NUM_GROUPS-1
               auto* qs = reinterpret_cast<uint8_t*>(q_out_head) + nope_dim;
@@ -5267,37 +5297,42 @@ namespace aiter {
                   static_cast<uint16_t>(qs_scale.byte) | (static_cast<uint16_t>(qs_scale.byte) << 8);
               *reinterpret_cast<uint16_t*>(qs + group_id * 2) = scale_pair;
             }
-            const uint32_t nope_out_offset = tid * vec_size_i;  // nope-first
-            // One vector cast, not vec_size_i scalar ones -- see the coarse Q store.
-            opus::vector_t<float, vec_size_i> vec_f32;
-            #pragma unroll
-            for (int i = 0; i < vec_size_i; i++) vec_f32[i] = rotated[i] * inv_scale;
-            opus_vec_q vec_out = opus::cast<query_t>(vec_f32);
+            // work already carries rstd*inv_scale, so the fp8 cast is the whole store.
+            opus_vec_q vec_out = opus::cast<query_t>(work);
             auto q_out_buf = opus::make_gmem<query_t>(q_out_head, q_oob_o * sizeof(query_t));
-            q_out_buf.template store<vec_size_o>(vec_out, nope_out_offset);
+            q_out_buf.template store<vec_size_o>(vec_out, tid * vec_size_i);
           }
-          if (tid >= pe_tid_start && tid < pe_tid_end) {
-            const int32_t pe_local_tid = tid - pe_tid_start;
-            scalar_t* q_rope_head = q_rope_out
-                + static_cast<int64_t>(token_idx) * params.q_rope_out_stride_0
-                + q_head_idx * params.q_rope_out_stride_1;
+          // is_pe_thread IS `tid >= pe_tid_start && tid < pe_tid_end`; spelling it out
+          // again here made LLVM build a second exec mask instead of reusing the one
+          // apply_rope already has (s_and_saveexec_b32 +4).
+          if (is_pe_thread) {
+            // PE lanes ran with inv_scale = 1.0f, so work is exactly x*rstd rotated.
+            scalar_t* q_rope_head = q_rope_out + q_rope_off;
             opus_vec_i vrope;
             #pragma unroll
-            for (int i = 0; i < vec_size_i; i++) vrope[i] = static_cast<scalar_t>(rotated[i]);
-            *reinterpret_cast<opus_vec_i*>(&q_rope_head[pe_local_tid * vec_size_i]) = vrope;
+            for (int i = 0; i < vec_size_i; i++) vrope[i] = static_cast<scalar_t>(work[i]);
+            *reinterpret_cast<opus_vec_i*>(&q_rope_head[pe_store_off]) = vrope;
           }
           (void)q_scale_raw;  // legacy separate-scale param unused on the inline path
         } else {
-          // bf16 output — write rotated as scalar_t (no quant)
-          opus_vec_i vec_out;
+          // bf16 output -- no quant, so factor is just rstd.
+          opus::vector_t<float, vec_size_i> work;
           #pragma unroll
           for (int i = 0; i < vec_size_i; i++) {
-            vec_out[i] = static_cast<scalar_t>(rotated[i]);
+            float v = static_cast<float>(vec_q[i]) * q_rms_scale;
+            if constexpr (HAS_Q_WEIGHT) v *= static_cast<float>(vec_q_weight[i]);
+            work[i] = v;
           }
-          scalar_t* q_out_head = reinterpret_cast<scalar_t*>(q_out) + token_qout_base + q_head_idx * params.q_out_stride_1;
+          apply_rope(work);
+          opus_vec_i vec_out;
+          #pragma unroll
+          for (int i = 0; i < vec_size_i; i++) vec_out[i] = static_cast<scalar_t>(work[i]);
+          scalar_t* q_out_head = reinterpret_cast<scalar_t*>(q_out) + q_out_off;
           auto q_out_buf = opus::make_gmem<scalar_t>(q_out_head, q_oob_o * sizeof(scalar_t));
           q_out_buf.template store<vec_size_o>(vec_out, tid * vec_size_i);
         }
+        q_out_off  += params.q_out_stride_1;
+        q_rope_off += params.q_rope_out_stride_1;
       } // end multi-head Q loop
       } // end Q processing (else branch of is_k_wave)
     }
