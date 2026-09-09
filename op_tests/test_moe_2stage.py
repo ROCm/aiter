@@ -28,6 +28,7 @@ from aiter.int4_utils import (
 )
 from aiter.jit.core import AITER_CONFIGS
 from aiter.jit.utils.chip_info import get_cu_num, get_gfx
+from aiter.ops.flydsl.kernels.mega_moe_gfx1250.types import Stage2ScatterContext
 from aiter.ops.flydsl.moe_common import GateMode
 from aiter.ops.quant import per_1x32_f8_scale_f8_quant, per_1x32_i4_quant
 from aiter.test_common import benchmark, checkAllclose, run_perftest
@@ -1008,6 +1009,66 @@ def _runtime_swiglu_mxfp4_q_dtype_a(
     return dtypes.bf16 if get_gfx() != "gfx950" or token < bound else dtypes.fp8
 
 
+def _moe_2stage_reference_workspace_gib(kwargs):
+    token = kwargs["token"]
+    topk = kwargs["topk"]
+    model_dim = kwargs["model_dim"]
+    inter_dim = kwargs["inter_dim"]
+    expert = kwargs["E"]
+    stage1_dim = inter_dim * 2 if kwargs["use_g1u1"] else inter_dim
+
+    # torch_moe_stage1/2 materialize routed fp32 activations and dequantized
+    # fp32 weights. This is a preflight estimate; OOM is still caught per case.
+    routed_activation_bytes = token * topk * (model_dim * 2 + stage1_dim) * 4
+    dequant_weight_bytes = expert * model_dim * (stage1_dim + inter_dim) * 4
+    input_score_bytes = token * (model_dim + expert) * 2
+    return (routed_activation_bytes + dequant_weight_bytes + input_score_bytes) / (
+        1024**3
+    )
+
+
+def _format_moe_2stage_case(kwargs):
+    return (
+        f"token={kwargs['token']}, dim=({kwargs['model_dim']},{kwargs['inter_dim']}), "
+        f"E={kwargs['E']}, topk={kwargs['topk']}, act={kwargs['actType']}, "
+        f"q={kwargs['qType']}, aq={kwargs['AQDType']}, wq={kwargs['WQDType']}, "
+        f"use_g1u1={kwargs['use_g1u1']}, doweight_stage1={kwargs['doweight_stage1']}"
+    )
+
+
+def _moe_2stage_skip_reason(kwargs):
+    # Set AITER_MOE_2STAGE_MAX_FREE_MEMORY_FRACTION=0 to run manually.
+    max_free_memory_fraction = float(
+        os.environ.get("AITER_MOE_2STAGE_MAX_FREE_MEMORY_FRACTION", "0.8")
+    )
+    if max_free_memory_fraction <= 0:
+        return None
+
+    reference_gib = _moe_2stage_reference_workspace_gib(kwargs)
+    try:
+        free_bytes, total_bytes = torch.cuda.mem_get_info()
+    except RuntimeError as exc:
+        aiter.logger.warning(
+            "moe_2stage: failed to query GPU memory, continuing without "
+            "preflight skip: %s",
+            exc,
+        )
+        return None
+
+    free_gib = free_bytes / (1024**3)
+    total_gib = total_bytes / (1024**3)
+    max_reference_gib = free_gib * max_free_memory_fraction
+    if reference_gib <= max_reference_gib:
+        return None
+
+    return (
+        f"estimated reference workspace {reference_gib:.1f} GiB exceeds "
+        f"{max_free_memory_fraction:.0%} of current free GPU memory "
+        f"({max_reference_gib:.1f} GiB of {free_gib:.1f} GiB free, "
+        f"{total_gib:.1f} GiB total)"
+    )
+
+
 def _iter_legacy_cases():
     """Yield (kwargs, extras) for the original CLI-driven sweep."""
     extras = {"model": "legacy"}
@@ -1216,6 +1277,116 @@ def test_bm16_tiled_scale_boundary():
             os.environ["AITER_BF16_FP8_MOE_BOUND"] = old_moe_bound
 
 
+def test_output_buffer_contract():
+    """Validate output identity, copy-back, validation, and compile contracts."""
+    torch.manual_seed(0)
+    token, model_dim, inter_dim, E, topk = 32, 512, 256, 8, 2
+    dtype = dtypes.bf16
+    hidden = torch.randn((token, model_dim), dtype=dtype) / 10
+    w1 = torch.randn((E, inter_dim * 2, model_dim), dtype=dtype) / 10
+    w2 = torch.randn((E, model_dim, inter_dim), dtype=dtype) / 10
+    gating = torch.randn((token, E), dtype=dtype)
+    topk_weights, topk_ids = fused_topk(hidden, gating, topk, True)
+    args = (hidden, w1, w2, topk_weights, topk_ids)
+
+    ref = fused_moe(*args)
+    # The comparisons below are exact, so check that is a kernel property.
+    assert torch.equal(ref, fused_moe(*args)), "fused_moe is not run-to-run stable"
+
+    def fresh_buffer():
+        return torch.full((token, model_dim), -7.0, dtype=dtype)
+
+    def call_and_read_back(buf):
+        out = fused_moe(*args, output=buf)
+        # Reading buf afterwards is the trap: compiled, it is answered from
+        # whatever the fake said the op returned.
+        return out.sum(), buf.sum()
+
+    sort = aiter.fused_moe._moe_sorting_impl
+
+    def sort_without_output(*a, **kw):
+        kw["output"] = None
+        return sort(*a, **kw)
+
+    # in_place=False stands in for FLAT, adaptive-aux atomic, and grouped gfx1250
+    # paths, which cannot take the caller's buffer and must copy their result into it.
+    for in_place in (True, False):
+        try:
+            if not in_place:
+                aiter.fused_moe._moe_sorting_impl = sort_without_output
+            buf = fresh_buffer()
+            assert fused_moe(*args, output=buf) is buf, f"{in_place=}: buf not returned"
+            assert torch.equal(buf, ref), f"{in_place=}: buf does not hold the result"
+
+            eager = call_and_read_back(fresh_buffer())
+            compiled = torch.compile(call_and_read_back)(fresh_buffer())
+            assert [float(x) for x in eager] == [
+                float(x) for x in compiled
+            ], f"{in_place=}: eager {eager} != compiled {compiled}"
+            assert eager[0] == eager[1] == ref.sum()
+        finally:
+            aiter.fused_moe._moe_sorting_impl = sort
+
+    def expect_raise(described, **kwargs):
+        try:
+            fused_moe(*args, **kwargs)
+        except RuntimeError:
+            return
+        raise AssertionError(f"fused_moe accepted {described}")
+
+    expect_raise("a mis-shaped output", output=torch.empty((token, model_dim + 1)))
+    expect_raise(
+        "an output of the wrong dtype",
+        output=torch.empty((token, model_dim), dtype=dtypes.fp32),
+    )
+    expect_raise(
+        "a non-contiguous output",
+        output=torch.empty((token, model_dim * 2), dtype=dtype)[:, ::2],
+    )
+    # moe_sorting zeroes output before stage1 reads hidden_states.
+    expect_raise("an output overlapping hidden_states", output=hidden)
+
+    # Disjoint slices of one pool are the symmetric-buffer case, and stay legal.
+    pool = torch.zeros((2 * token, model_dim), dtype=dtype)
+    pool[:token] = hidden
+    assert torch.equal(fused_moe(pool[:token], *args[1:], output=pool[token:]), ref)
+
+    stage2_scatter = Stage2ScatterContext(
+        arena_handle=0,
+        combine_input_offset=0,
+        slot_stride_bytes=1,
+        max_tokens_per_rank=token,
+        world_size=1,
+        source_token_map=torch.zeros_like(topk_ids, dtype=dtypes.i32),
+    )
+
+    def call_with_stage2_scatter(buf):
+        return fused_moe(
+            *args,
+            stage2_scatter=stage2_scatter,
+            output=buf,
+        )
+
+    def expect_stage2_scatter_raise(described, call):
+        try:
+            call()
+        except RuntimeError as error:
+            assert "output= is incompatible with stage2_scatter" in str(error)
+            return
+        raise AssertionError(f"fused_moe accepted {described}")
+
+    expect_stage2_scatter_raise(
+        "output with stage2_scatter",
+        lambda: call_with_stage2_scatter(fresh_buffer()),
+    )
+    expect_stage2_scatter_raise(
+        "output with stage2_scatter under torch.compile",
+        lambda: torch.compile(call_with_stage2_scatter)(fresh_buffer()),
+    )
+
+    aiter.logger.info("moe_2stage: output buffer contract passed")
+
+
 # ---------------------------------------------------------------------------
 # Run
 # ---------------------------------------------------------------------------
@@ -1231,6 +1402,7 @@ _case_iters = []
 if args.bm16_scale_boundary:
     test_bm16_tiled_scale_boundary()
 else:
+    test_output_buffer_contract()
     if not args.no_flydsl_csv:
         _case_iters.append(
             _iter_with_env(
@@ -1269,6 +1441,14 @@ df = []
 seen = 0
 for kwargs, extras in case_iter:
     seen += 1
+    skip_reason = _moe_2stage_skip_reason(kwargs)
+    if skip_reason is not None:
+        aiter.logger.warning(
+            "skip moe_2stage case: %s (%s)",
+            _format_moe_2stage_case(kwargs),
+            skip_reason,
+        )
+        continue
     _old_moe_bound = os.environ.get("AITER_BF16_FP8_MOE_BOUND")
     _force_moe_bound_zero = (
         kwargs["qType"],
@@ -1285,6 +1465,13 @@ for kwargs, extras in case_iter:
             ret = test_fmoe(
                 **kwargs, kernel_bench=args.kernel, ref_dtype=args.ref_dtype
             )
+    except torch.cuda.OutOfMemoryError as exc:
+        aiter.logger.warning(
+            "skip moe_2stage case after OOM: %s (%s)",
+            _format_moe_2stage_case(kwargs),
+            exc,
+        )
+        ret = None
     finally:
         if _force_moe_bound_zero:
             if _old_moe_bound is None:

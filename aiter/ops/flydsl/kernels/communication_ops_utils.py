@@ -13,28 +13,53 @@ shared by the dispatch/combine ops.
 
 from __future__ import annotations
 
-import json
+import csv
 from dataclasses import dataclass, field
 
 import flydsl.expr as fx
 from flydsl._mlir import ir
 from flydsl._mlir.dialects import llvm as _llvm_d
+from flydsl._mlir.dialects import rocdl as _rocdl_d
+from flydsl.compiler.ast_rewriter import ASTRewriter
 from flydsl.expr import arith
+from flydsl.expr.typing import T
 
 __all__ = [
     "GeometryTuningTable",
     "atomic_add_agent",
+    "atomic_add_agent_one_as",
     "atomic_add_global_at",
     "atomic_add_system",
+    "atomic_add_workgroup",
     "fence_acquire",
     "fence_agent_acquire",
     "fence_agent_release",
     "fence_release",
     "fence_system_acquire",
     "fence_system_release",
+    "load_i32_acquire",
+    "load_i32_global_agent",
+    "load_i32_global_system",
+    "load_i32_nt",
+    "load_i32_system",
+    "load_i64_acquire",
     "load_i64_global",
+    "load_v4i32_nt",
+    "spin_until_eq_i32",
+    "spin_until_ge_i32_agent",
+    "spin_until_ge_i32_system",
+    "spin_until_ge_i64",
+    "spin_until_gt_i32",
+    "store_i32_global_agent_release",
+    "store_i32_global_system_monotonic",
+    "store_i32_global_system_release",
     "store_i32_system",
     "store_i64_global_system",
+    "traced",
+    "wait_i32_until_equals",
+    "wait_i32_until_greater_than",
+    "wait_i64_until_equals",
+    "waitcnt_all",
 ]
 
 
@@ -43,6 +68,177 @@ def _to_ptr_global(v):
     return _llvm_d.IntToPtrOp(
         _llvm_d.PointerType.get(address_space=1), arith.unwrap(v)
     ).result
+
+
+def _to_ptr_shared(v):
+    """Cast an i64 address to ``!llvm.ptr<3>`` (shared address space)."""
+    return _llvm_d.IntToPtrOp(
+        _llvm_d.PointerType.get(address_space=3), arith.unwrap(v)
+    ).result
+
+
+def _ptr_plus(base_i64, offset, elem_bytes):
+    """Global pointer for base + offset*elem_bytes."""
+    addr = (
+        fx.Int64(arith.unwrap(base_i64)) + fx.Int64(arith.unwrap(offset)) * elem_bytes
+    )
+    return _to_ptr_global(addr)
+
+
+def traced(fn):
+    """Run FlyDSL's AST rewriting over a helper that kernel bodies call.
+
+    ``@flyc.kernel`` and ``@flyc.jit`` apply this same transform to their own
+    source but do not recurse into callees, so a helper that wants ``if`` /
+    ``while`` over traced values (rather than a host-side truthiness test) has
+    to opt in.
+    """
+    return ASTRewriter.transform(fn)
+
+
+def waitcnt_all():
+    """Drain outstanding gfx12 load/store counters before a grid barrier."""
+    _rocdl_d.s_wait_storecnt(0)
+    _rocdl_d.s_wait_loadcnt(0)
+
+
+def load_i32_acquire(addr_i64):
+    """Volatile monotonic i32 load suitable for a spin-wait."""
+    return _llvm_d.LoadOp(
+        T.i32,
+        _to_ptr_global(addr_i64),
+        alignment=4,
+        volatile_=True,
+        ordering=_llvm_d.AtomicOrdering.monotonic,
+        syncscope="one-as",
+    ).res
+
+
+def load_i32_global_system(addr_i64, *, acquire=False):
+    """Volatile i32 load with system visibility for a spin-wait."""
+    return _llvm_d.LoadOp(
+        T.i32,
+        _to_ptr_global(addr_i64),
+        alignment=4,
+        volatile_=True,
+        ordering=(
+            _llvm_d.AtomicOrdering.acquire
+            if acquire
+            else _llvm_d.AtomicOrdering.monotonic
+        ),
+        syncscope=fx.rocdl.SyncScope.OneAs,
+    ).res
+
+
+def load_i32_global_agent(addr_i64):
+    """Volatile monotonic i32 load with agent-one-as visibility."""
+    return _llvm_d.LoadOp(
+        T.i32,
+        _to_ptr_global(addr_i64),
+        alignment=4,
+        volatile_=True,
+        ordering=_llvm_d.AtomicOrdering.monotonic,
+        syncscope=fx.rocdl.SyncScope.AgentOneAs,
+    ).res
+
+
+def load_i64_acquire(addr_i64):
+    """Volatile monotonic i64 load suitable for a spin-wait."""
+    return _llvm_d.LoadOp(
+        T.i64,
+        _to_ptr_global(addr_i64),
+        alignment=8,
+        volatile_=True,
+        ordering=_llvm_d.AtomicOrdering.monotonic,
+        syncscope="one-as",
+    ).res
+
+
+def load_i32_system(addr_i64, index):
+    """Compatibility system-scope i32 load at ``addr_i64 + index * 4``."""
+    item_addr = fx.Int64(addr_i64) + fx.Int64(index) * fx.Int64(4)
+    return fx.Int32(load_i32_acquire(item_addr))
+
+
+def load_i32_nt(base_i64, offset):
+    """Non-temporal global i32 load at base + offset*4."""
+    return _llvm_d.LoadOp(
+        T.i32, _ptr_plus(base_i64, offset, 4), alignment=4, nontemporal=True
+    ).res
+
+
+def load_v4i32_nt(base_i64, offset):
+    """Non-temporal global vector<4xi32> load at base + offset*4."""
+    return _llvm_d.LoadOp(
+        T.i32x4, _ptr_plus(base_i64, offset, 4), alignment=4, nontemporal=True
+    ).res
+
+
+@traced
+def spin_until_ge_i64(addr_i64, val):
+    """Spin until a monotonic cross-device i64 flag is at least ``val``."""
+    cur = fx.Int64(load_i64_acquire(addr_i64))
+    while cur < fx.Int64(val):
+        cur = fx.Int64(load_i64_acquire(addr_i64))
+    return cur
+
+
+@traced
+def spin_until_ge_i32_system(addr_i64, val, *, acquire=False, sleep=True):
+    """Spin on a system-visible i32 flag until it reaches ``val``."""
+    cur = fx.Int32(load_i32_global_system(addr_i64, acquire=acquire))
+    while cur < fx.Int32(val):
+        if fx.const_expr(sleep):
+            fx.rocdl.s_sleep(1)
+        cur = fx.Int32(load_i32_global_system(addr_i64, acquire=acquire))
+    return cur
+
+
+@traced
+def spin_until_ge_i32_agent(addr_i64, val, *, sleep=True):
+    """Spin on an agent-visible i32 flag until it reaches ``val``."""
+    cur = fx.Int32(load_i32_global_agent(addr_i64))
+    while cur < fx.Int32(val):
+        if fx.const_expr(sleep):
+            fx.rocdl.s_sleep(1)
+        cur = fx.Int32(load_i32_global_agent(addr_i64))
+    return cur
+
+
+@traced
+def spin_until_eq_i32(addr_i64, val):
+    """Spin until an i32 flag equals ``val``."""
+    cur = fx.Int32(load_i32_acquire(addr_i64))
+    while cur != fx.Int32(val):
+        cur = fx.Int32(load_i32_acquire(addr_i64))
+    return cur
+
+
+@traced
+def spin_until_gt_i32(addr_i64, val):
+    """Spin until an i32 flag exceeds ``val`` and return the observed value."""
+    cur = fx.Int32(load_i32_acquire(addr_i64))
+    while cur <= fx.Int32(val):
+        cur = fx.Int32(load_i32_acquire(addr_i64))
+    return cur
+
+
+def wait_i32_until_equals(addr_i64, expected):
+    """Compatibility wrapper for the historical MegaMoE wait helper."""
+    spin_until_eq_i32(addr_i64, expected)
+
+
+def wait_i32_until_greater_than(addr_i64, expected):
+    """Compatibility wrapper returning the first i32 value above ``expected``."""
+    return spin_until_gt_i32(addr_i64, expected)
+
+
+@traced
+def wait_i64_until_equals(addr_i64, expected):
+    """Spin until a system-visible i64 flag equals ``expected``."""
+    cur = fx.Int64(load_i64_acquire(addr_i64))
+    while cur != fx.Int64(expected):
+        cur = fx.Int64(load_i64_acquire(addr_i64))
 
 
 def store_i32_system(addr_i64, offset, val):
@@ -77,6 +273,39 @@ def store_i64_global_system(addr_i64, val):
         alignment=8,
         ordering=_llvm_d.AtomicOrdering.release,
         syncscope="one-as",
+    )
+
+
+def store_i32_global_agent_release(addr_i64, val):
+    """Agent-one-as release store to a global i32 address."""
+    _llvm_d.StoreOp(
+        val.ir_value(),
+        _to_ptr_global(addr_i64),
+        alignment=4,
+        ordering=_llvm_d.AtomicOrdering.release,
+        syncscope=fx.rocdl.SyncScope.AgentOneAs,
+    )
+
+
+def store_i32_global_system_monotonic(addr_i64, val):
+    """System-visible monotonic store to a global i32 address."""
+    _llvm_d.StoreOp(
+        val.ir_value(),
+        _to_ptr_global(addr_i64),
+        alignment=4,
+        ordering=_llvm_d.AtomicOrdering.monotonic,
+        syncscope=fx.rocdl.SyncScope.OneAs,
+    )
+
+
+def store_i32_global_system_release(addr_i64, val):
+    """System-visible release store to a global i32 address."""
+    _llvm_d.StoreOp(
+        val.ir_value(),
+        _to_ptr_global(addr_i64),
+        alignment=4,
+        ordering=_llvm_d.AtomicOrdering.release,
+        syncscope=fx.rocdl.SyncScope.OneAs,
     )
 
 
@@ -135,9 +364,25 @@ def atomic_add_agent(addr_i64, val):
     return atomic_add_global_at(addr_i64, val, syncscope=fx.rocdl.SyncScope.Agent)
 
 
+def atomic_add_agent_one_as(addr_i64, val):
+    """Agent-one-as monotonic global fetch-and-add."""
+    return atomic_add_global_at(addr_i64, val, syncscope=fx.rocdl.SyncScope.AgentOneAs)
+
+
 def atomic_add_system(addr_i64, val):
     """System-scope monotonic global fetch-and-add."""
     return atomic_add_global_at(addr_i64, val)
+
+
+def atomic_add_workgroup(addr_i64, val):
+    """Workgroup-scope monotonic shared-memory fetch-and-add."""
+    return _llvm_d.AtomicRMWOp(
+        _llvm_d.AtomicBinOp.add,
+        _to_ptr_shared(addr_i64),
+        arith.unwrap(val),
+        _llvm_d.AtomicOrdering.monotonic,
+        syncscope="workgroup",
+    ).res
 
 
 @dataclass
@@ -162,6 +407,9 @@ class GeometryTuningTable:
         cls,
         path,
         *,
+        ep_size,
+        gfx=None,
+        gpu_model=None,
         dtype,
         hidden_dim,
         zero_copy,
@@ -169,40 +417,56 @@ class GeometryTuningTable:
         local_expert_num=None,
         combine_dtype="bf16",
     ):
-        """Build a per-op table from a multi-shape tuning JSON, filtered to this
-        op's shape; empty table => cfg defaults."""
-        with open(path, "r", encoding="utf-8") as f:
-            raw = json.load(f)
+        """Build a per-op table from ``tuned_dispatch_combine_intranode.csv``."""
+        with open(path, encoding="utf-8", newline="") as f:
+            rows = list(
+                csv.DictReader(line for line in f if not line.lstrip().startswith("#"))
+            )
 
-        def _match(r, want_dtype, need_zc):
+        def _row_match(r, want_dtype, need_zc):
             if (
                 r.get("dtype") != want_dtype
                 or int(r.get("hidden_dim", -1)) != hidden_dim
             ):
                 return False
-            if topk is not None and "topk" in r and int(r["topk"]) != topk:
+            if int(r.get("ep_size", ep_size)) != int(ep_size):
+                return False
+            row_gfx = (r.get("gfx") or "").strip()
+            if gfx and row_gfx and row_gfx != gfx:
+                return False
+            row_model = (r.get("gpu_model") or "").strip()
+            if gpu_model and row_model and row_model != gpu_model:
+                return False
+            if topk is not None and r.get("topk") and int(r["topk"]) != topk:
                 return False
             if (
                 local_expert_num is not None
-                and "local_expert_num" in r
+                and r.get("local_expert_num")
                 and int(r["local_expert_num"]) != local_expert_num
             ):
                 return False
-            return not (need_zc and bool(r.get("zero_copy", False)) != bool(zero_copy))
+            if need_zc:
+                zc_raw = (r.get("zero_copy") or "").strip()
+                if zc_raw:
+                    row_zc = zc_raw.lower() in ("1", "true", "yes")
+                    if row_zc != bool(zero_copy):
+                        return False
+            return True
 
-        def _build(rules, want_dtype, need_zc):
-            return {
-                int(r["num_tokens"]): (
+        def _build(phase, want_dtype, need_zc):
+            out = {}
+            for r in rows:
+                if r.get("phase") != phase or not _row_match(r, want_dtype, need_zc):
+                    continue
+                out[int(r["num_tokens"])] = (
                     int(r["block_num"]),
                     int(r["warp_num_per_block"]),
                 )
-                for r in rules
-                if _match(r, want_dtype, need_zc)
-            }
+            return out
 
         return cls(
-            dispatch=_build(raw.get("dispatch", []), dtype, need_zc=False),
-            combine=_build(raw.get("combine", []), combine_dtype, need_zc=True),
+            dispatch=_build("dispatch", dtype, need_zc=False),
+            combine=_build("combine", combine_dtype, need_zc=True),
         )
 
     def lookup(self, phase, num_tokens):

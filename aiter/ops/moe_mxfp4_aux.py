@@ -23,7 +23,18 @@ from torch import Tensor
 from ..jit.core import compile_ops
 
 
-@compile_ops("module_moe_mxfp4_aux")
+@compile_ops("module_moe_mxfp4_aux", develop=True)
+def _mxfp4_moe_sort_internal_is_supported(
+    NE: int,
+    TOPK: int,
+    D_HIDDEN: int,
+    MB: int,
+    zero_init: bool,
+) -> bool:
+    """Private dispatch probe; not exported through ``aiter.ops`` or ``aiter``."""
+
+
+@compile_ops("module_moe_mxfp4_aux", develop=True)
 def mxfp4_moe_sort_quant(
     a_input: Tensor,
     topk_ids: Tensor,
@@ -44,7 +55,7 @@ def mxfp4_moe_sort_quant(
 ) -> None: ...
 
 
-@compile_ops("module_moe_mxfp4_aux")
+@compile_ops("module_moe_mxfp4_aux", develop=True)
 def mxfp4_moe_sort(
     topk_ids: Tensor,
     topk_weight: Tensor,
@@ -56,6 +67,7 @@ def mxfp4_moe_sort(
     m_indices: Tensor,
     bf16_zero_out: Tensor,
     bf16_zero_workspace: Tensor,
+    sort3stage_ws: Tensor,
     M_logical: int,
     NE: int,
     TOPK: int,
@@ -66,7 +78,7 @@ def mxfp4_moe_sort(
 ) -> None: ...
 
 
-@compile_ops("module_moe_mxfp4_aux")
+@compile_ops("module_moe_mxfp4_aux", develop=True)
 def mxfp4_moe_quant(
     a_input: Tensor,
     a_quant: Tensor,
@@ -79,7 +91,7 @@ def mxfp4_moe_quant(
 ) -> None: ...
 
 
-@compile_ops("module_moe_mxfp4_aux")
+@compile_ops("module_moe_mxfp4_aux", develop=True)
 def mxfp4_moe_sort_scales(
     a_scale: Tensor,
     sorted_token_ids: Tensor,
@@ -93,7 +105,7 @@ def mxfp4_moe_sort_scales(
 ) -> None: ...
 
 
-@compile_ops("module_moe_mxfp4_aux")
+@compile_ops("module_moe_mxfp4_aux", develop=True)
 def mxfp4_moe_scatter_reduce(
     flat_out: Tensor,
     reverse_sorted: Tensor,
@@ -106,7 +118,7 @@ def mxfp4_moe_scatter_reduce(
 ) -> None: ...
 
 
-@compile_ops("module_moe_mxfp4_aux")
+@compile_ops("module_moe_mxfp4_aux", develop=True)
 def mxfp4_moe_scatter_reduce_q(
     flat_out_q: Tensor,
     flat_out_scale: Tensor,

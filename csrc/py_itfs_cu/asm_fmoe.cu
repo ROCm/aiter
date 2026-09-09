@@ -557,6 +557,7 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
     FMoeKernel* impl_ptr = nullptr;
     CFG* config_map      = nullptr;
     int smf              = 0;
+    bool is_mxfp4        = false;
     int model_dim        = down->size(1);
     int inter_dim        = down->size(2);
     inter_dim *= model_dim / gate->size(2);
@@ -609,6 +610,7 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
             AITER_CHECK(false, __func__, " Not find proper cfg in pertokenMXfp4_g1u1. ");
         impl_ptr = get_heuristic_kernel(inter_dim, sub_X_cnt, config_map, smf, kernel_name_str);
         impl_ptr->set_4bit(true);
+        is_mxfp4 = true;
     }
     else if((input->dtype() == AITER_DTYPE_bf16 || input->dtype() == AITER_DTYPE_fp16) &&
             gate->dtype() == AITER_DTYPE_fp4x2) // bf16/fp16 X + MXFP4 weights (in-kernel X quant)
@@ -628,6 +630,7 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
             AITER_CHECK(false, __func__, " Not find proper cfg in pertokenMXfp4_g1u1 (bf16 X). ");
         impl_ptr = get_heuristic_kernel(inter_dim, sub_X_cnt, config_map, smf, kernel_name_str);
         impl_ptr->set_4bit(true);
+        is_mxfp4 = true;
     }
     else if(input->dtype() == AITER_DTYPE_i8 || input->dtype() == AITER_DTYPE_u8) // int8
     {
@@ -664,6 +667,22 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
     else
     {
         AITER_CHECK(false, __func__, ": unsupport current input type:", AiterDtype_to_str(input->dtype()));
+    }
+
+    // The small-tile asm MXFP4 kernels drain O through a tile schedule derived
+    // from model_dim/1024, with no handling for a short trailing tile. Below
+    // 1024 no tiles are produced at all and the output buffer is left
+    // untouched; a non-multiple leaves the remainder columns unwritten. Both
+    // return a silently wrong result instead of failing, so require an exact
+    // multiple. A multiple of 256 is not enough: model_dim=2304 drops 256
+    // columns. Larger tiles use a different epilogue and are not constrained.
+    if(is_mxfp4 && impl_ptr->get_sub_GU() <= 128)
+    {
+        AITER_CHECK(model_dim >= 1024 && (model_dim % 1024) == 0,
+                    __func__,
+                    " asm MXFP4 kernels with sub_GU <= 128 require model_dim to be a positive "
+                    "multiple of 1024; got model_dim=" +
+                        std::to_string(model_dim));
     }
 
     impl_ptr->launch_kernel<1, 2>(out,

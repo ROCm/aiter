@@ -1,6 +1,6 @@
 name: FFM Triton Tests
 
-run-name: FFM Triton tests on ${{ inputs.runner || 'linux-aiter-do-mi350x-1' }}
+run-name: FFM Triton tests on ${{ inputs.runner || 'linux-aiter-build-mi250' }}
 
 on:
   pull_request:
@@ -10,7 +10,7 @@ on:
       runner:
         description: Self-hosted runner label to use for the FFM Triton tests.
         required: true
-        default: linux-aiter-do-mi350x-1
+        default: linux-aiter-build-mi250
         type: string
       docker_image:
         description: FFM image to pull and test.
@@ -27,7 +27,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}-${{ inputs.runner || 'linux-aiter-do-mi350x-1' }}
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ inputs.runner || 'linux-aiter-build-mi250' }}
   cancel-in-progress: true
 
 env:
@@ -57,8 +57,8 @@ jobs:
         github.event.pull_request.head.repo.full_name == github.repository
       )
     needs: ci_config
-    name: FFM Triton Tests (${{ inputs.runner || 'linux-aiter-do-mi350x-1' }}) / Shard ${{ matrix.shard }}
-    runs-on: ${{ inputs.runner || 'linux-aiter-do-mi350x-1' }}
+    name: FFM Triton Tests (${{ inputs.runner || 'linux-aiter-build-mi250' }}) / Shard ${{ matrix.shard }}
+    runs-on: ${{ inputs.runner || 'linux-aiter-build-mi250' }}
     timeout-minutes: 7200
     strategy:
       fail-fast: false

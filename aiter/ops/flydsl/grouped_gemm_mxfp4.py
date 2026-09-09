@@ -9,6 +9,7 @@ import os
 
 import torch
 
+from .kernels.mega_moe_gfx1250.types import Stage2ScatterContext
 from .kernels.tensor_shim import ptr_arg
 
 _SUPPORTED_CLUSTER_N = (4, 3, 2)
@@ -90,6 +91,9 @@ def flydsl_grouped_gemm_a8w4_masked(
     cluster_n=-1,
     waves_per_tensor_tdm=-1,
     next_stage_prefetch=0,
+    stage2_scatter: Stage2ScatterContext | None = None,
+    ep_destination_stride=0,
+    ep_row_map=None,
     situ_beta=1.0,
     situ_linear_beta=1.0,
 ):
@@ -115,6 +119,8 @@ def flydsl_grouped_gemm_a8w4_masked(
             f"[grouped-moe tdm] cluster_n={cluster_n} needs n_tiles={n_tiles} "
             f"(N={N}, tile_n={tile_n}) to be an exact multiple"
         )
+    enable_ep_scatter = stage2_scatter is not None
+    ep_row_map_tensor = ep_row_map if ep_row_map is not None else out
     launch_gemm_a8w4_tdm(
         out,
         ptr_arg(a),
@@ -145,7 +151,18 @@ def flydsl_grouped_gemm_a8w4_masked(
         cluster_n,
         _select_next_stage_prefetch(next_stage_prefetch),
         waves_per_tensor_tdm,
-        float(situ_beta),
-        float(situ_linear_beta),
+        enable_ep_scatter=int(enable_ep_scatter),
+        ep_arena_handle=(int(stage2_scatter.arena_handle) if enable_ep_scatter else 0),
+        ep_combine_input_offset=(
+            int(stage2_scatter.combine_input_offset) if enable_ep_scatter else 0
+        ),
+        ep_slot_stride_bytes=(
+            int(stage2_scatter.slot_stride_bytes) if enable_ep_scatter else 0
+        ),
+        ep_destination_stride=int(ep_destination_stride),
+        ep_world_size=int(stage2_scatter.world_size) if enable_ep_scatter else 0,
+        arg_ep_row_map=ep_row_map_tensor,
+        f32_situ_beta=float(situ_beta),
+        f32_situ_linear_beta=float(situ_linear_beta),
     )
     return out

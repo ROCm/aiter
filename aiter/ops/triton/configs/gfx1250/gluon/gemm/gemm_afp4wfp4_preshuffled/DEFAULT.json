@@ -1,0 +1,16 @@
+{
+  "M_LEQ_31": {
+    "BLOCK_SIZE_M": 16,
+    "BLOCK_SIZE_N": 64,
+    "BLOCK_SIZE_K": 256,
+    "num_warps": 4,
+    "NUM_BUFFERS": 2
+  },
+  "any": {
+    "BLOCK_SIZE_M": 256,
+    "BLOCK_SIZE_N": 256,
+    "BLOCK_SIZE_K": 256,
+    "num_warps": 4,
+    "NUM_BUFFERS": 4
+  }
+}
