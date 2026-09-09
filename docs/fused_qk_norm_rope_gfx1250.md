@@ -93,7 +93,6 @@ All default to the original behaviour. Turn on with `-D<NAME>=<value>`.
 | knob | default | status |
 |---|---|---|
 | `AITER_FG_USE_TDM` | *removed* | Was a validated win at xlarge, but the same flag also reached decode, where the LDS round trip buys nothing (a wave owns one head, so there is no second tile to overlap) and it measured neutral-to-harmful. It could not be gated per tier without a second FG instantiation, and once xlarge stopped routing to FG at all it reached no path. Knob and the code it gated deleted; see git history to revive it. |
-| `AITER_COARSE_SCALE_ALL_LANES` | 0 | Never run. Drops the `tid % Q_REDUCE == 0` dedup on the Q scale store. |
 | `AITER_FG_TOKENS_PER_WG` | 1 | Measured noise (−1.68% / +3.55%, CIs cross zero). |
 | `AITER_FG_HEADS_PER_WAVE` | 1 | **Regression +20%** at decode (VGPR 66→86, occupancy 14→11, wave count halved). |
 | `AITER_FG_HEADS_PER_BLOCK` | 1 | **Regression +4~5%** at decode. |
@@ -157,7 +156,9 @@ full `s_wait_xcnt 0x0` address-queue drain:
 | 662 | exec region exit | 2032 |
 
 `hit=2032 / 319 waves = 6.4` = the per-wave Q-head loop count, i.e. once per head.
-Together ~19% of the kernel. `AITER_COARSE_SCALE_ALL_LANES` targets the first.
+Together ~19% of the kernel. Dropping the `tid % Q_REDUCE == 0` dedup on the scale
+store -- so every lane of a group writes the same pair and EXEC is never restored
+mid-store -- targets the first, and is now the unconditional behaviour.
 
 ---
 

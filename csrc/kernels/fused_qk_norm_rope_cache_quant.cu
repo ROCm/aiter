@@ -5901,25 +5901,6 @@ namespace aiter {
       // TDM load path: one scalar tensor_load_to_lds per head instead of the
       // per-lane 2-chunk buffer_load.
       //
-      // OFF by default -- the premise was wrong. It was built to remove the xcnt
-      // WAR hazards that the 2-chunk buffer_load was assumed to create (18.6% of
-      // decode time in ATT). Disassembly of the FG kernel says otherwise:
-      //
-      //            s_wait_xcnt  buffer_load  tensor_load  ds_load
-      //   baseline     18            4            0          0
-      //   TDM          18            0            4          4
-      //
-      // The payload loads are gone and the xcnt count is IDENTICAL, so those
-      // sites never came from the payload. Following the xcnt sites to what they
-      // guard: 6 of 18 are `s_or_b32 exec_lo` (the EXEC restore after an
-      // exec-masked memory op) and the rest are scalar-register reuse. The real
-      // target is the exec masks -- `is_nope_thread`, the `tid % reduce == 0`
-      // scale store, `write_swa` -- which is the same fix that paid off in
-      // inverse_rope_group_quant, not a change of load instruction.
-      //
-      // Kept behind the knob because the machinery (prologue issue + dispatched
-      // s_wait_tensorcnt, LDS slots) is correct and bit-exact, and is the right
-      // starting point if the xlarge prefill tier is ever revisited.
       #define DISPATCH_NEOX_FG(NEOX) \
         fuse_qk_norm_rope_finegrained_impl<scalar_t,cache_t,query_t, kv_dt, q_dt, NEOX, \
             Q_GROUP_SIZE, Q_SCALE_FP32, HAS_Q_WEIGHT, HEAD_DIM, HEADS_PER_WAVE>( \
