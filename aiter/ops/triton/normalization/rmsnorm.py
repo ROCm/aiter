@@ -141,6 +141,8 @@ def _rmsnorm_backward(dz, x, gamma, rsigma):
             N,
             BLOCK_M=BLOCK_M,
             BLOCK_N=BLOCK_N,
+            NUM_WARPS=_cfg["num_warps"],
+            NUM_STAGES=_cfg["num_stages"],
             num_warps=_cfg["num_warps"],
             num_stages=_cfg["num_stages"],
         )
@@ -658,6 +660,8 @@ def _rmsnorm_forward_large_m_small_n(
         y.stride(1),
         BLOCK_M=BLOCK_M,
         BLOCK_N=BLOCK_N,
+        NUM_WARPS=_cfg["num_warps"],
+        NUM_STAGES=_cfg["num_stages"],
         num_warps=_cfg["num_warps"],
         num_stages=_cfg["num_stages"],
     )

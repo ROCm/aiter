@@ -1012,6 +1012,8 @@ _rmsnorm_kernel_large_m_small_n_repr = make_kernel_repr(
     [
         "BLOCK_M",
         "BLOCK_N",
+        "NUM_WARPS",
+        "NUM_STAGES",
     ],
 )
 
@@ -1031,6 +1033,8 @@ def _rmsnorm_kernel_large_m_small_n(
     stride_yn,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
+    NUM_WARPS: tl.constexpr,
+    NUM_STAGES: tl.constexpr,
 ):
     pid_m = tl.program_id(0)
     m_off = tl.cast(pid_m * BLOCK_M + tl.arange(0, BLOCK_M), tl.int64)
@@ -1065,7 +1069,7 @@ def _rmsnorm_kernel_large_m_small_n(
 
 _rmsnorm_bwd_kernel_large_m_small_n_repr = make_kernel_repr(
     "_rmsnorm_bwd_kernel_large_m_small_n",
-    ["BLOCK_M", "BLOCK_N"],
+    ["BLOCK_M", "BLOCK_N", "NUM_WARPS", "NUM_STAGES"],
 )
 
 
@@ -1083,6 +1087,8 @@ def _rmsnorm_bwd_kernel_large_m_small_n(
     N,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
+    NUM_WARPS: tl.constexpr,
+    NUM_STAGES: tl.constexpr,
 ):
     # Specialization for large-M / small-N (e.g. Qwen3 per-head q/k norm,
     # M=b*s*heads, N=head_dim). The generic _rmsnorm_bwd_triton caps the grid at
