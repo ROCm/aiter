@@ -9,7 +9,7 @@ from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
 
 _fused_sigmoid_mul_repr = make_kernel_repr(
     "_fused_sigmoid_mul_kernel",
-    ["BLOCK_SIZE_N", "NEED_MASK"],
+    ["BLOCK_SIZE_N", "NEED_MASK", "num_warps"],
 )
 
 
