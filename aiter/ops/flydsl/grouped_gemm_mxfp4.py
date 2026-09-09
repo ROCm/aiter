@@ -15,8 +15,33 @@ from .kernels.tensor_shim import ptr_arg
 
 _SUPPORTED_CLUSTER_N = (4, 3, 2)
 
+
+def _read_quad_cluster() -> tuple[int, int]:
+    """2-D cluster (cluster_m x cluster_n) of the quadrant-pipeline a4w4 kernel.
+
+    Defaults to the tuned 4x4. ``AITER_A4W4_QUAD_CLUSTER_M`` / ``_N`` override it
+    for sweeps. The mcast masks are 32-bit, so ``cluster_m * cluster_n <= 32`` is
+    the representability limit; a larger or non-positive request raises here
+    rather than deadlocking a cluster the hardware cannot form. Whether the
+    hardware can actually co-schedule the requested cluster is a separate,
+    ungated question -- some valid-on-paper shapes still hang.
+    """
+    m = int(os.environ.get("AITER_A4W4_QUAD_CLUSTER_M", "4"))
+    n = int(os.environ.get("AITER_A4W4_QUAD_CLUSTER_N", "4"))
+    m = 1 
+    n = 4 
+    if m < 1 or n < 1:
+        raise ValueError(f"AITER_A4W4_QUAD_CLUSTER_{{M,N}} must be >= 1, got {m}x{n}")
+    if m * n > 32:
+        raise ValueError(
+            f"AITER_A4W4_QUAD_CLUSTER {m}x{n} exceeds the 32-workgroup mcast-mask "
+            "limit (cluster_m*cluster_n must be <= 32)"
+        )
+    return (m, n)
+
+
 # 2-D cluster of the quadrant-pipeline a4w4 kernel (cluster_m x cluster_n).
-A4W4_QUAD_CLUSTER = (4, 4)
+A4W4_QUAD_CLUSTER = _read_quad_cluster()
 
 
 def a4w4_quad_pipeline_ok(
@@ -186,6 +211,17 @@ def flydsl_grouped_gemm_a8w4_masked(
         from .kernels.gemm_a4w4_moe_gfx1250 import launch_gemm_a4w4_moe
 
         cluster_m, cluster_n_2d = A4W4_QUAD_CLUSTER
+        if os.environ.get("AITER_A4W4_LOG_GRID"):
+            # cluster_m sets the per-expert contiguous-M alignment, so it also
+            # sets how many padding M tiles the grid carries. Comparing two
+            # cluster shapes on time alone is only fair alongside these.
+            print(
+                f"[a4w4-grid] cluster={cluster_m}x{cluster_n_2d} K={K} N={N} "
+                f"contiguous_m={int(contiguous_m)} "
+                f"mtiles={-(-int(contiguous_m) // tile_m)} "
+                f"ntiles={-(-int(N) // tile_n)}",
+                flush=True,
+            )
         launch_gemm_a4w4_moe(
             out,
             ptr_arg(a),

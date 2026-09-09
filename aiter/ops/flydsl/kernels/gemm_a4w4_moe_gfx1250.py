@@ -29,6 +29,7 @@ block to ``tile_m * cluster_m`` rows rather than ``tile_m``; see
 the pairwise-matched multicast loads never deadlock.
 """
 
+import glob
 import math
 
 import flydsl.compiler as flyc
@@ -73,7 +74,7 @@ from .tensor_shim import (
 # The profile the ported pipeline is written against. It is not a tuning knob:
 # the quadrant plan, the seed banks and the planar LDS arena are all sized by it.
 SUPPORTED_PROFILE = (256, 256, 256, 2, 2, 4)
-SUPPORTED_CLUSTER = (4, 4)
+SUPPORTED_CLUSTER = (2, 2)
 
 # PERF PROBE ONLY -- a bitmask of epilogue ablations. Every non-zero value
 # produces numerically WRONG output; must stay 0 outside a probe. Each bit
@@ -163,6 +164,76 @@ def _mcast_masks(local_x, local_y, cluster_m, cluster_n):
     return a_mask, b_mask
 
 
+# Largest cluster the mcast masks can address: they are 32-bit workgroup masks.
+MCAST_MASK_WGS = 32
+# Used when the KFD topology cannot be read. gfx1250 is 2 shader arrays per
+# shader engine, and this kernel takes a whole CU's LDS, so one workgroup per CU.
+FALLBACK_CUS_PER_SE = 16
+
+_KFD_NODES = "/sys/class/kfd/kfd/topology/nodes"
+
+
+def _gpu_topology():
+    """``(enabled CUs per shader engine, LDS bytes per CU)`` from KFD.
+
+    ``None`` when the topology is unreadable, which leaves the caller on its
+    conservative built-in bound rather than guessing upward.
+    """
+    for path in sorted(glob.glob(f"{_KFD_NODES}/*/properties")):
+        props = {}
+        try:
+            with open(path) as f:
+                for line in f:
+                    key, _, value = line.partition(" ")
+                    try:
+                        props[key] = int(value)
+                    except ValueError:
+                        pass
+        except OSError:
+            continue
+        simds = props.get("simd_count", 0)
+        simd_per_cu = props.get("simd_per_cu", 0)
+        arrays = props.get("array_count", 0)
+        arrays_per_engine = props.get("simd_arrays_per_engine", 0)
+        lds_kb = props.get("lds_size_in_kb", 0)
+        if not (simds and simd_per_cu and arrays and arrays_per_engine and lds_kb):
+            continue  # a CPU node, or a kernel that does not report these
+        engines = arrays // arrays_per_engine
+        cus = simds // simd_per_cu
+        if engines < 1 or cus < engines:
+            continue
+        return cus // engines, lds_kb * 1024
+    return None
+
+
+def max_cluster_workgroups(lds_bytes_per_wg):
+    """How many workgroups of this size can share one cluster.
+
+    A cluster's workgroups multicast into each other's LDS and meet at
+    ``cluster_barrier``, so every member must be RESIDENT AT THE SAME TIME. A
+    cluster the hardware cannot place does not fail -- it hangs. The bound is
+    therefore a co-residency bound: a cluster is placed inside one shader
+    engine, so it cannot exceed that engine's workgroup slots,
+
+        (enabled CUs per SE) * (LDS per CU // LDS per workgroup)
+
+    which on this part (256 CUs / 16 SEs, 320 KiB per CU) is 16 for a kernel
+    whose arena is a whole CU's LDS.
+
+    The HIP runtime is NOT a sufficient gate. ``hipOccupancyMaxPotentialCluster
+    Size`` answers 18 -- 2 shader arrays x 9 PHYSICAL CUs -- and ``hipOccupancy
+    MaxActiveClusters`` likewise accepts 17 and 18; two CUs per SE are harvested
+    on this part, so those clusters pass every runtime check and then hang.
+    Counting *enabled* CUs is what makes the bound sound.
+    """
+    topology = _gpu_topology()
+    if topology is None:
+        return min(MCAST_MASK_WGS, FALLBACK_CUS_PER_SE)
+    cus_per_se, lds_per_cu = topology
+    wgs_per_cu = max(1, lds_per_cu // max(1, int(lds_bytes_per_wg)))
+    return max(1, min(MCAST_MASK_WGS, cus_per_se * wgs_per_cu))
+
+
 @flyc.jit
 def launch_gemm_a4w4_moe(
     arg_c: fx.Tensor,
@@ -200,7 +271,16 @@ def launch_gemm_a4w4_moe(
     assert supports(
         tile_m, tile_n, tile_k, m_warp, n_warp, num_buffers
     ), f"only the tuned {SUPPORTED_PROFILE} profile is supported"
-    assert (cluster_m, cluster_n) == SUPPORTED_CLUSTER, "only a 4x4 cluster is tuned"
+    # 4x4 is the tuned cluster; the pipeline is parameterized on any
+    # representable shape for sweeps. Representability is only the cheap half of
+    # the contract -- the co-residency half needs ARENA_B and is asserted below.
+    assert cluster_m >= 1 and cluster_n >= 1, (
+        f"cluster {cluster_m}x{cluster_n} must be positive"
+    )
+    assert cluster_m * cluster_n <= MCAST_MASK_WGS, (
+        f"cluster {cluster_m}x{cluster_n} exceeds the {MCAST_MASK_WGS}-bit mcast "
+        "workgroup mask"
+    )
     assert K % tile_k == 0 and K // tile_k > num_buffers, (
         f"K={K} needs to be a multiple of tile_k={tile_k} with more than "
         f"{num_buffers} K-tiles"
@@ -273,6 +353,15 @@ def launch_gemm_a4w4_moe(
 
     ARENA_B = max(PLANAR_END, C_STORE_B)
     check_smem_capacity(ARENA_B, str(get_hip_arch()))
+    # Reject a cluster the hardware cannot co-schedule, here, rather than
+    # deadlocking the device with it -- see max_cluster_workgroups.
+    _cluster_cap = max_cluster_workgroups(ARENA_B)
+    assert cluster_m * cluster_n <= _cluster_cap, (
+        f"cluster {cluster_m}x{cluster_n} = {cluster_m * cluster_n} workgroups "
+        f"cannot be co-resident: at {ARENA_B} B of LDS each, one shader engine "
+        f"holds {_cluster_cap}. Such a cluster hangs instead of failing, so it "
+        "is rejected before launch."
+    )
 
     _act = f"_act{stage1_act}" if stage1_act else ""
     _qout = f"_q{stage1_quant_out}r{quant_wmma_rep}" if stage1_quant_out else ""
@@ -1274,11 +1363,21 @@ def launch_gemm_a4w4_moe(
     gx = (i32_m + (tile_m - 1)) // tile_m
     gy = (N + (tile_n - 1)) // tile_n
     gx = (((gx > 0).select(gx, fx.Int32(1)) + (cluster_m - 1)) // cluster_m) * cluster_m
-    # Split gx exactly, so no workgroup is left over to recompute a duplicate tile.
-    pow2 = gx & -gx
-    capped = (pow2 < m_run_max).select(pow2, fx.Int32(m_run_max))
-    m_run = ((gx > m_run_max) & (pow2 >= m_run_min)).select(capped, gx)
-    m_chunks = gx // m_run
+    # Split gx exactly, so no workgroup is left over to recompute a duplicate
+    # tile -- and split it in CLUSTERS, not workgroups. grid.x must be a whole
+    # number of clusters: a trailing partial cluster has multicast peers that
+    # were never launched, and its members wait on them forever. gx is already a
+    # multiple of cluster_m so the cluster count is exact, and capping the run at
+    # a POWER OF TWO keeps it a divisor of cx (= pow2 * odd), which is what keeps
+    # m_chunks exact. For the tuned 4x4 this reproduces the old split exactly.
+    cx = gx // cluster_m
+    run_max = 1 << (max(1, m_run_max // cluster_m).bit_length() - 1)
+    run_min = max(1, m_run_min // cluster_m)
+    pow2 = cx & -cx
+    capped = (pow2 < run_max).select(pow2, fx.Int32(run_max))
+    c_run = ((cx > run_max) & (pow2 >= run_min)).select(capped, cx)
+    m_run = c_run * cluster_m
+    m_chunks = cx // c_run
     # gy % cluster_n and the per-expert tile_m*cluster_m alignment are the
     # caller's to enforce; inside @flyc.jit N is traced, so a Python check here
     # would become a device branch rather than a host-side assert.
