@@ -1626,11 +1626,8 @@ namespace aiter {
 #endif
         static constexpr int x_async_load_threads = block_size * x_async_load_vec < residual_block ? block_size : residual_block / x_async_load_vec;
         static constexpr int x_load_waitcnt = residual_block / (x_async_load_threads * x_async_load_vec);
-        static_assert(x_async_load_threads % warp_size == 0,
-                      "x async loads must cover complete waves");
-        const bool loads_x = warp_id < x_async_load_threads / warp_size;
         auto lds_load_x_tile = [&](int k){
-            if (loads_x) {
+            if(threadIdx.x < x_async_load_threads) {
                 DTYPE_I* s_x_wr_ptr = s_x + (k & 1) * residual_block;
                 int offset = k * residual_block;
                 for(int i = 0; i < x_load_waitcnt; i++) {
@@ -1669,9 +1666,7 @@ namespace aiter {
         static_assert(residual_block % (warp_size * ds_read_vec) == 0, "residual_block must be divisible by warp_size * ds_read_vec");
         const int loop = sub_hidden_size / residual_block;
 
-        auto compute_store_tile = [&](int i, auto IsTail) {
-            constexpr int stores = residual_block / (warp_size * ds_read_vec);
-            vector_store_batch<DTYPE_I, ds_read_vec, stores, store_policy> output{g_out};
+        auto compute_store_tile = [&](int i) {
             DTYPE_I* s_x_rd_ptr = s_x + (i & 1) * residual_block;
             DTYPE_I* s_residual_rd_ptr = s_residual + (i & 1) * (hc_mult * residual_block);
             for(int j = 0; j < residual_block / (warp_size * ds_read_vec); j++) {
@@ -1692,9 +1687,8 @@ namespace aiter {
                         res[k] += static_cast<float>(residual_vec[h.value][k]) * comb_mix[h.value];
                     }
                 });
-                output.set(j, res, warp_id * hidden_size + i * residual_block + s_offset);
+                store_vector<DTYPE_I, float, ds_read_vec, store_policy>(g_out, res, warp_id * hidden_size + i * residual_block + s_offset);
             }
-            output.template finish<!IsTail.value>();
         };
 
         lds_load_x_tile(0);
@@ -1703,19 +1697,20 @@ namespace aiter {
             lds_load_x_tile(i + 1);
             lds_load_residual_tile(i + 1);
             __builtin_amdgcn_sched_barrier(0);
-            if (loads_x) {
+            if(threadIdx.x < x_async_load_threads) {
                 s_wait_all_loadcnt(opus::number<-1>{}, opus::number<x_load_waitcnt + residual_load_waitcnt>{});
             }
             else {
                 s_wait_all_loadcnt(opus::number<-1>{}, opus::number<residual_load_waitcnt>{});
             }
             __builtin_amdgcn_s_barrier();
-            compute_store_tile(i, opus::number<0>{});
+            compute_store_tile(i);
+            __builtin_amdgcn_s_barrier();
         }
         int i = loop - 1;
         s_wait_all_loadcnt(opus::number<-1>{}, 0_I);
         __builtin_amdgcn_s_barrier();
-        compute_store_tile(i, opus::number<1>{});
+        compute_store_tile(i);
     }
 
 
@@ -2813,15 +2808,13 @@ namespace aiter {
         static constexpr int fn_load_vec = 16 / sizeof(float);
         static constexpr int fn_load_waitcnt = tile_n * tile_k / (warp_size * fn_load_vec);
         using fp32xfntile = opus::array<fp32xtile, repeat_n>;
-        vector_load_token fn_loads[repeat_n];
         auto vgpr_load_fn_tile = [&](int k) {
             fp32xfntile v_fn;
             const int offset_base = lane_id % mfma_n * fn_stride + warp_id * hidden_size
                                   + lane_id / mfma_n * vec_tile + k * tile_k + k_split_offset;
             const int n_step = mfma_n * fn_stride;
             for(int n = 0; n < repeat_n; n++) {
-                v_fn[n] = load_vector_nbytes<float, vec_tile, 16, 0, false>(
-                    g_fn, offset_base + n * n_step, fn_loads[n]);
+                v_fn[n] = load_vector_nbytes<float, vec_tile, 16, 0, false>(g_fn, offset_base + n * n_step);
             }
             return v_fn;
         };
@@ -2906,8 +2899,6 @@ namespace aiter {
             // gfx1250 wave32 bf16 needs a 16-K/lane WMMA fragment = two band_j
             // iterations (2 x ds_read_vec) combined; band_j is even for tile_k in {32,64}.
             using pref_vec = opus::vector_t<DTYPE_I, ds_read_vec>;
-            vector_store_batch<DTYPE_I, ds_read_vec, decode_pipeline ? m_repeat * band_j : 1>
-                next_residual{g_nres};
             pref_vec pref_x[band_j], pref_res[band_j][hc_mult];
             auto prefetch_band = [&](int pb) {
                 if constexpr (batch_lds) {
@@ -2989,12 +2980,6 @@ namespace aiter {
                             nres_v[e] = static_cast<DTYPE_I>(res[e]);
                         }
                         *(reinterpret_cast<DTYPE_I_vec*>(s_nres_wr + w_off)) = nres_v;
-                    } else if constexpr (decode_pipeline) {
-                        const int p = b * band_j + j;
-                        int off = (int)(((int64_t)i * res_nkb + res_kl / res_ks) * res_kb_stride
-                                        + (int64_t)warp_id * res_head_stride)
-                                + res_row * res_ks + res_kl % res_ks;
-                        next_residual.set_if(p, res, off, res_row < m_oob);
                     } else if constexpr (res_shuf) {
                         // Rows past m_oob alias the next head's region (row is interior
                         // to the layout, so the buffer bound cannot cut them) -- drop
@@ -3106,10 +3091,6 @@ namespace aiter {
                     }
                 }
             }
-            if constexpr (decode_pipeline) {
-                wait_vector_loads(g_fn, fn_loads, i + 1 < k_loop);
-                next_residual.template finish<true, true>();
-            }
         };
 
         // gfx9 only: x and residual share the async counter, so the "leave in flight"
@@ -3198,14 +3179,14 @@ namespace aiter {
             // at one barrier. Only then overwrite the preceding LDS slot with
             // the next tile. Its transfer overlaps the current tile's compute.
             // Direct next_residual stores need no cross-wave LDS deposit.
-            MHC_TDM_DRAIN();
-            wait_vector_loads(g_fn, fn_loads);
-            __builtin_amdgcn_s_barrier();
             for (int i = 0; i < k_loop; i += n_stages) {
                 opus::static_for<n_stages>([&](auto S) {
                     constexpr int slot = S.value;
                     const int k = i + slot;
                     if (k < k_loop) {
+                        MHC_TDM_DRAIN();
+                        s_wait_all_loadcnt(0_I, opus::number<-1>{});
+                        __builtin_amdgcn_s_barrier();
                         if (k + 1 < k_loop) {
                             constexpr int next_slot = (slot + 1) % n_stages;
                             lds_load_x_tile(k + 1, next_slot);
@@ -3305,8 +3286,14 @@ namespace aiter {
             for (int b = 0; b < m_repeat; b++)
                 sqrsum_w[b] = cross_row_sum_4(sqrsum_part[b], lane_id);
         }
-        // Decode's last store packet already completed the scratch-reuse barrier.
-        if constexpr (!decode_pipeline) __syncthreads();
+        if constexpr (decode_pipeline) {
+            // Only LDS is exchanged across waves here. next_residual stores
+            // can remain in flight until kernel completion.
+            s_wait_all_dscnt(0_I);
+            __builtin_amdgcn_s_barrier();
+        } else {
+            __syncthreads();
+        }  // (1) finish reads before scratch reuse
         if (warp_id != 0) {
             int c = 0;
             for (int b = 0; b < m_repeat; b++)
