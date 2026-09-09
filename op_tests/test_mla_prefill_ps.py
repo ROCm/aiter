@@ -30,7 +30,10 @@ def _print_pass_rate(df, column, label):
     if column not in df.columns:
         return
     counts = df[column].value_counts()
-    num_tests = counts.sum()
+    num_tests = counts.sum() - counts.get("skipped", 0)
+    if num_tests == 0:
+        aiter.logger.info(f"{label}: no tests ran")
+        return
     num_passed = counts.get("passed", 0)
     num_warning = counts.get("warning", 0)
     num_failed = counts.get("failed", 0)
@@ -250,9 +253,11 @@ def test_mla_prefill(
     kv_indptr = torch.zeros(batch_size + 1, dtype=torch.int)
     seq_lens_kv = torch.empty(batch_size, dtype=torch.int)
     if varlen:
+        # qo_len is the floor so a varlen draw can never violate qo_len <= kv_len below.
+        min_kv = 1 if qo_len is None else qo_len
         for i in range(batch_size):
             seq_lens_kv[i] = max(
-                min(random.normalvariate(ctx_lens, ctx_lens / 2), ctx_lens), 1
+                min(random.normalvariate(ctx_lens, ctx_lens / 2), ctx_lens), min_kv
             )
     else:
         seq_lens_kv.fill_(ctx_lens)
@@ -411,7 +416,10 @@ def test_mla_prefill(
         dtype=dtypes.fp32,
         device=device,
     )
-    final_lse = torch.empty((total_s, nhead), dtype=dtypes.fp32, device=device)
+    # NaN sentinel: any NaN left after reduce is a row no tile ever wrote.
+    final_lse = torch.full(
+        (total_s, nhead), float("nan"), dtype=dtypes.fp32, device=device
+    )
 
     out_mla_prefill_asm, us_mla_prefill_asm = run_aiter_mla_prefill_asm(
         q_quant,
@@ -458,8 +466,8 @@ def test_mla_prefill(
             2.0
             * batch_size
             * num_head_q
-            * (qo_len if qo_len is not None else ctx_len)
-            * (qk_head_dim * ctx_len + v_head_dim * ctx_len)
+            * (qo_len if qo_len is not None else ctx_lens)
+            * (qk_head_dim * ctx_lens + v_head_dim * ctx_lens)
         ) / g_div
         tflops_mla_prefill_asm = ops / us_mla_prefill_asm / (1e6)
         # calulate reduce kernel bandwidth
@@ -554,9 +562,17 @@ def test_mla_prefill(
             ret["err lse"] = 0
             ret["lse result"] = "skipped"
         else:
-            assert torch.equal(
-                asm_lse.isneginf(), lse_ref.isneginf()
-            ), "final_lse -inf mask mismatch: some tiles did not get an LSE written"
+            # final_lse was pre-filled with NaN, so a surviving NaN is a row no tile
+            # wrote. For a fully masked row the kernel emits +inf where torch gives -inf.
+            mask_err = None
+            num_unwritten = asm_lse.isnan().sum().item()
+            if num_unwritten > 0:
+                mask_err = f"{num_unwritten} final_lse entries were never written"
+            elif not torch.equal(asm_lse.isposinf(), lse_ref.isneginf()):
+                mask_err = "final_lse empty-row mask mismatch (kernel emits +inf)"
+            if mask_err is not None:
+                aiter.logger.error("mla_prefill_lse: %s", mask_err)
+
             valid_mask = lse_ref.isfinite()
             if valid_mask.any():
                 asm_lse_valid = asm_lse[valid_mask]
@@ -583,10 +599,12 @@ def test_mla_prefill(
                 ret["lse max_rel_err"] = lse_rel.max().item()
                 ret["lse mean_rel_err"] = lse_rel.mean().item()
             else:
-                # All rows fully masked: the isneginf equality above already validated
-                # every entry, so this is a genuine pass, not a vacuous one.
+                # All rows fully masked: the mask check above already validated every
+                # entry, so this is a genuine pass, not a vacuous one.
                 lse_err = 0
                 lse_status = "passed"
+            if mask_err is not None:
+                lse_status = "failed"
             ret["err lse"] = lse_err
             ret["lse result"] = lse_status
 
@@ -740,8 +758,9 @@ parser.add_argument(
 parser.add_argument(
     "--need_lse",
     type=dtypes.str2bool,
-    default=True,
-    help="""request final_lse from the PS scheduler. Default: True.
+    nargs="*",
+    default=[False, True],
+    help="""request final_lse from the PS scheduler. Default: both False and True.
     True routes single-split tiles through reduce so final_lse is written;
     False keeps the direct-to-O fast path and leaves final_lse unpopulated.
     e.g.: --need_lse false""",
@@ -765,6 +784,7 @@ for (
     block_size,
     varlen,
     qo_len,
+    need_lse,
 ) in itertools.product(
     args.causal,
     args.num_heads,
@@ -775,6 +795,7 @@ for (
     args.block_size,
     args.varlen,
     args.qo_len,
+    args.need_lse,
 ):
     if qo_len is not None and qo_len > ctx_len:
         # Skip invalid combos in the sweep rather than asserting mid-run.
@@ -791,7 +812,7 @@ for (
         varlen,
         is_causal,
         qo_len=qo_len,
-        need_lse=args.need_lse,
+        need_lse=need_lse,
         load_metadata=args.load_metadata,
         dump_metadata=args.dump_metadata,
         profile_ps=args.profile,
