@@ -26,6 +26,7 @@ from aiter.ops.triton._triton_kernels.quant.quant import (
 )
 from aiter.ops.triton.utils._triton import arch_info
 from aiter.ops.triton.utils.logger import AiterTritonLogger
+from aiter.ops.triton.utils.quant_config_utils import get_quant_config
 from aiter.ops.triton.utils.types import e4m3_dtype
 
 __all__ = [
@@ -49,27 +50,33 @@ _MXFP8_LEGACY_BLOCK_SIZE = 128
 _LOGGER = AiterTritonLogger()
 
 
-def _mxfp8_gfx1250_block_config(M: int, K: int) -> tuple[int, int, int]:
+def _mxfp8_gfx1250_block_config(M: int, K: int) -> tuple[int, int, int, int]:
     """
-    Tuned (BLOCK_SIZE_M, BLOCK_SIZE_N, NUM_ITER) for dynamic_mxfp8_quant's M > 32
-    gfx1250 path, bucketed by M ({<=512, <=4096, >4096}) x K ({<=1024, <=3072,
-    >3072}) from a benchmark sweep. BLOCK_SIZE_N must be >= 128 (NUM_QUANT_BLOCKS
-    >= 4 required by scaled_downcast, see _mxfp8_quant_op).
+    Tuned (BLOCK_SIZE_M, BLOCK_SIZE_N, NUM_ITER, NUM_BUFFERS) for
+    dynamic_mxfp8_quant's M > 32 gfx1250 path, bucketed by M ({<=512, <=4096,
+    >4096}) x K ({<=1024, <=3072, >3072}). Values come from
+    configs/gfx1250/gluon/quant/quant_mxfp8/DEFAULT.json, tuned by a benchmark
+    sweep. BLOCK_SIZE_N must be >= 128 (NUM_QUANT_BLOCKS >= 4 required by
+    scaled_downcast, see _mxfp8_quant_op). NUM_BUFFERS defaults to 2
+    (double-buffered/prefetching loads+stores); some buckets pin it to 1
+    (no prefetch, fully synchronous per-tile) -- empirically found to be both
+    faster and required for correctness there, see repo notes.
     """
-    m_bucket = 0 if M <= 512 else 1 if M <= 4096 else 2
-    k_bucket = 0 if K <= 1024 else 1 if K <= 3072 else 2
-    table = {
-        (0, 0): (32, 128, 1),
-        (0, 1): (32, 128, 1),
-        (0, 2): (32, 128, 1),
-        (1, 0): (32, 128, 1),
-        (1, 1): (64, 128, 1),
-        (1, 2): (64, 128, 2),
-        (2, 0): (32, 256, 1),
-        (2, 1): (32, 512, 2),
-        (2, 2): (32, 512, 2),
-    }
-    return table[(m_bucket, k_bucket)]
+    m_key = (
+        "M_LEQ_512" if M <= 512 else "M_GT_512_LEQ_4096" if M <= 4096 else "M_GT_4096"
+    )
+    k_key = (
+        "K_LEQ_1024"
+        if K <= 1024
+        else "K_GT_1024_LEQ_3072" if K <= 3072 else "K_GT_3072"
+    )
+    cfg = get_quant_config("QUANT-MXFP8", f"{m_key}_{k_key}")
+    return (
+        cfg["BLOCK_SIZE_M"],
+        cfg["BLOCK_SIZE_N"],
+        cfg["NUM_ITER"],
+        cfg.get("NUM_BUFFERS", 2),
+    )
 
 
 def static_per_tensor_quant_fp8_i8(
@@ -363,13 +370,21 @@ def dynamic_mxfp8_quant(
         if M <= 32:
             NUM_ITER = 1
             BLOCK_SIZE_M = triton.next_power_of_2(M)
-            BLOCK_SIZE_N = 4096 // BLOCK_SIZE_M
+            # Capped at 512: BLOCK_SIZE_N=4096 (M=1) / 2048 (M=2) overflow the
+            # TDM descriptor's 8-bit log2 pad-interval field at LLVM lowering
+            # (TDMUtility.cpp createTDMDescriptor assert). 512 is verified safe
+            # and correct for M in {1,2,4,...,32}; NUM_ITER/grid still cover
+            # any K via cdiv.
+            BLOCK_SIZE_N = min(4096 // BLOCK_SIZE_M, 512)
             NUM_WARPS = 4
             NUM_STAGES = 1
+            NUM_BUFFERS = 2
         else:
             NUM_WARPS = 4
             NUM_STAGES = 2
-            BLOCK_SIZE_M, BLOCK_SIZE_N, NUM_ITER = _mxfp8_gfx1250_block_config(M, K)
+            BLOCK_SIZE_M, BLOCK_SIZE_N, NUM_ITER, NUM_BUFFERS = (
+                _mxfp8_gfx1250_block_config(M, K)
+            )
 
         grid = (
             triton.cdiv(M, BLOCK_SIZE_M),
@@ -377,15 +392,16 @@ def dynamic_mxfp8_quant(
         )
         even_m_n = (M % BLOCK_SIZE_M == 0) and (K % (BLOCK_SIZE_N * NUM_ITER) == 0)
 
-        kernel_args = dict(
-            BLOCK_SIZE_M=BLOCK_SIZE_M,
-            BLOCK_SIZE_N=BLOCK_SIZE_N,
-            NUM_ITER=NUM_ITER,
-            num_warps=NUM_WARPS,
-            MXFP8_QUANT_BLOCK_SIZE=_MXFP8_QUANT_BLOCK_SIZE,
-            EVEN_M_N=even_m_n,
-            waves_per_eu=4,
-        )
+        kernel_args = {
+            "BLOCK_SIZE_M": BLOCK_SIZE_M,
+            "BLOCK_SIZE_N": BLOCK_SIZE_N,
+            "NUM_ITER": NUM_ITER,
+            "num_warps": NUM_WARPS,
+            "MXFP8_QUANT_BLOCK_SIZE": _MXFP8_QUANT_BLOCK_SIZE,
+            "EVEN_M_N": even_m_n,
+            "NUM_BUFFERS": NUM_BUFFERS,
+            "waves_per_eu": 4,
+        }
         gluon_dynamic_mxfp8_quant_kernel_gfx1250[grid](
             x2d,
             y,

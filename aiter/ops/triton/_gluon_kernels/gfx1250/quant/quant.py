@@ -228,31 +228,20 @@ def _mxfp8_quant_op(
     MXFP8_QUANT_BLOCK_SIZE: gl.constexpr,
     num_warps: gl.constexpr,
 ):
-    """
-    Converts x (fp32) [BLOCK_SIZE_M, BLOCK_SIZE_N] to fp8 e4m3 via
-    gl.amd.cdna5.scaled_downcast, computing the per-32-element e8m0 scale
-    ourselves. Unlike mxfp4, fp8 downcast is elementwise (no packing), so
-    x_fp8 keeps the input's shape.
-
-    scaled_downcast requires bs_e8m0 in a compact layout (size_per_thread
-    reduced to NUM_QUANT_BLOCKS on the scaled axis), only expressible as a
-    plain BlockedLayout when threads_per_warp[axis] == 32 // size_per_thread
-    [axis] -- hence caller must use threads_per_warp=[8, 4], and we
-    convert_layout since gl.max's native output layout doesn't match.
-    """
+    """Converts x (fp32) to fp8 e4m3 (elementwise, no packing), computing the e8m0 scale per block."""
     NUM_QUANT_BLOCKS: gl.constexpr = BLOCK_SIZE_N // MXFP8_QUANT_BLOCK_SIZE
     x_grouped = x.reshape(BLOCK_SIZE_M, NUM_QUANT_BLOCKS, MXFP8_QUANT_BLOCK_SIZE)
     amax = gl.max(gl.abs(x_grouped), axis=-1, keep_dims=True)
     amax = amax.to(gl.int32, bitcast=True)
     amax = (amax + 0x200000).to(gl.uint32, bitcast=True) & 0xFF800000
     amax = amax.to(gl.float32, bitcast=True)
-    # e4m3 dtypeMax = 448 = 2**8 * 1.75 -> unbiased exponent offset -8 (mxfp4: -2, dtypeMax 6)
+    # e4m3 max=448=2**8*1.75 -> exponent offset -8 (mxfp4: -2, max 6)
     scale_e8m0_unbiased = gl.log2(amax).floor() - 8
     scale_e8m0_unbiased = gl.maximum(-127, gl.minimum(scale_e8m0_unbiased, 127))
     bs_e8m0 = scale_e8m0_unbiased.to(gl.uint8) + 127
     bs_e8m0 = bs_e8m0.reshape(BLOCK_SIZE_M, NUM_QUANT_BLOCKS)
 
-    # compact layout scaled_downcast requires for the scale (see docstring)
+    # scaled_downcast requires the scale in this compact per-thread layout
     compact_layout: gl.constexpr = gl.BlockedLayout(
         size_per_thread=[1, NUM_QUANT_BLOCKS],
         threads_per_warp=[8, 4],
@@ -287,20 +276,20 @@ def gluon_dynamic_mxfp8_quant_kernel_gfx1250(
     EVEN_M_N: gl.constexpr,
     NUM_BUFFERS: gl.constexpr = 2,
 ):
-    gl.static_assert(NUM_BUFFERS >= 2, "LDS kernel requires NUM_BUFFERS >= 2")
+    # NUM_BUFFERS=1: synchronous, no prefetch
+    gl.static_assert(NUM_BUFFERS >= 1, "LDS kernel requires NUM_BUFFERS >= 1")
 
     pid_m = gl.program_id(0)
     start_n = gl.program_id(1) * NUM_ITER
 
     NUM_QUANT_BLOCKS: gl.constexpr = BLOCK_SIZE_N // MXFP8_QUANT_BLOCK_SIZE
 
-    # LDS layout: row-major, vec=8 elements = 128-bit stores, padded to avoid bank conflicts
+    # row-major, vec=8 (128-bit), padded to avoid bank conflicts
     SHARED_LAYOUT_X: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
         [[BLOCK_SIZE_N, 8]], [BLOCK_SIZE_M, BLOCK_SIZE_N], [1, 0]
     )
 
-    # Register layout for LDS reads (order=[1,0]: N fastest, matches row-major LDS);
-    # threads_per_warp=[8,4] required by _mxfp8_quant_op's scaled_downcast.
+    # order=[1,0]: N fastest; threads_per_warp=[8,4] required by scaled_downcast
     blocked_layout: gl.constexpr = gl.BlockedLayout(
         size_per_thread=[1, 8],
         threads_per_warp=[8, 4],
@@ -308,13 +297,12 @@ def gluon_dynamic_mxfp8_quant_kernel_gfx1250(
         order=[1, 0],
     )
 
-    # LDS ring buffer
     x_buffer = gl.allocate_shared_memory(
         x_ptr.type.element_ty,
         shape=[NUM_BUFFERS, BLOCK_SIZE_M, BLOCK_SIZE_N],
         layout=SHARED_LAYOUT_X,
     )
-    # Store side is also ring-buffered, like x_buffer (see STORE_WAIT below).
+    # Also ring-buffered (see STORE_WAIT below)
     out_smem = gl.allocate_shared_memory(
         x_fp8_ptr.type.element_ty,
         shape=[NUM_BUFFERS, BLOCK_SIZE_M, BLOCK_SIZE_N],
@@ -328,11 +316,9 @@ def gluon_dynamic_mxfp8_quant_kernel_gfx1250(
         shape=[NUM_BUFFERS, BLOCK_SIZE_M, NUM_QUANT_BLOCKS],
         layout=SHARED_LAYOUT_BS,
     )
-    # 2 stores/iter (out, bs); same-kind TDM ops complete in issue order, so
-    # waiting for all but the oldest NUM_BUFFERS-1 pairs is enough before reuse.
+    # 2 stores/iter; same-kind TDM ops finish in issue order, so NUM_BUFFERS-1 pairs suffice
     STORE_WAIT: gl.constexpr = 2 * (NUM_BUFFERS - 1)
 
-    # TDM descriptor: base at this CTA's (M, N) origin
     x_base = (
         x_ptr
         + pid_m * BLOCK_SIZE_M * stride_x_m_in
@@ -363,7 +349,7 @@ def gluon_dynamic_mxfp8_quant_kernel_gfx1250(
     load_idx = 0
     compute_idx = 0
     num_tiles = min(NUM_ITER, gl.cdiv(N, BLOCK_SIZE_N) - start_n)
-    # ---- Prologue: fill NUM_BUFFERS-1 slots ----
+    # Prologue: fill NUM_BUFFERS-1 slots
     for _ in gl.static_range(NUM_BUFFERS - 1):
         gl.amd.gfx1250.tdm.async_load(
             x_desc, [0, 0], x_buffer.index(load_idx % NUM_BUFFERS)
@@ -373,12 +359,12 @@ def gluon_dynamic_mxfp8_quant_kernel_gfx1250(
         )
         load_idx += 1
 
-    # ---- Main loop: load tile ahead, wait for oldest, quant, store ----
+    # Main loop: load ahead, wait oldest, quant, store
     for _ in range(num_tiles - (NUM_BUFFERS - 1)):
         gl.amd.gfx1250.tdm.async_load(
             x_desc, [0, 0], x_buffer.index(load_idx % NUM_BUFFERS)
         )
-        gl.amd.gfx1250.tdm.async_wait(NUM_BUFFERS - 1)  # 1 TDM op/tile
+        gl.amd.gfx1250.tdm.async_wait(NUM_BUFFERS - 1)
         x_desc = gl.amd.gfx1250.tdm.update_tensor_descriptor(
             x_desc, add_offsets=[0, BLOCK_SIZE_N]
         )
@@ -412,7 +398,7 @@ def gluon_dynamic_mxfp8_quant_kernel_gfx1250(
         )
         compute_idx += 1
 
-    # ---- Epilogue: drain remaining NUM_BUFFERS-1 tiles ----
+    # Epilogue: drain remaining tiles
     for i in gl.static_range(NUM_BUFFERS - 1):
         gl.amd.gfx1250.tdm.async_wait(NUM_BUFFERS - 2 - i)
 
@@ -444,7 +430,5 @@ def gluon_dynamic_mxfp8_quant_kernel_gfx1250(
         )
         compute_idx += 1
 
-    # Final drain: up to STORE_WAIT stores may still be in flight; a CTA must
-    # not retire with any TDM store still outstanding against its LDS.
+    # CTA must not retire with any TDM store still outstanding
     gl.amd.gfx1250.tdm.async_wait(0)
-
