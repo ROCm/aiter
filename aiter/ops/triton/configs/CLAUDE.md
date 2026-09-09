@@ -31,7 +31,7 @@ configs/<arch>/<backend>/<op>/<d_type>/<CONFIG_NAME>-<suffix>.json
 
 | Segment     | Values                                                      |
 | ----------- | ----------------------------------------------------------- |
-| `<arch>`    | `gfx942`, `gfx950`, `gfx1100`, `gfx1151`, `gfx1200`, `gfx1201`, `gfx1250` |
+| `<arch>`    | `gfx942`, `gfx950`, `gfx1100`, `gfx1101`, `gfx1150`, `gfx1151`, `gfx1200`, `gfx1201`, `gfx1250` |
 | `<backend>` | `triton` or `gluon`                                          |
 | `<op>`      | `gemm`, `moe`, `conv`, `mhc`, `attention`, `gmm`, `fusions`  |
 | `<d_type>`  | `config_name.lower().replace("-", "_")` — `GEMM-AFP4WFP4` → `gemm_afp4wfp4`. The transform is `config_utils._dtype_dir()` |
