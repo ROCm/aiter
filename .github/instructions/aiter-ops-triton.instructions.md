@@ -67,6 +67,27 @@ and tuned JSON in `configs/`. Flag:
   only absolute imports (`from aiter.ops.triton.<...> import ...`) are
   allowed.
 
+## Framework portability — torch stays out of `utils/_triton/`
+
+`utils/_triton/` and the config loaders are torch-free so the kernels and
+their tuned configs can be imported by a framework that is not PyTorch
+(JAX-Triton is the live case). Flag:
+
+- `import torch`, `from torch import ...` or any `torch.` use added to a
+  module under `utils/_triton/`. The torch-using half belongs in `utils/` —
+  split the helper rather than duplicating it (`moe_common.py` already lives
+  on both sides). `utils/_triton/tunning/` is exempt: standalone tuning
+  harnesses, not importable library code.
+- torch newly introduced into config resolution (`utils/config_utils.py` or a
+  `*_config_utils.py` family module) — loading a tuned config must not
+  require torch.
+- A new kernel module under `_triton_kernels/` or `_gluon_kernels/` that
+  imports torch, or a first torch import added to one that is currently
+  torch-free. A jit body cannot call torch; what drags it in is host-side
+  glue — `torch.Tensor` annotations, dtype constants, `torch.empty`
+  allocations — and that belongs in the public wrapper. Kernel modules that
+  already import torch are grandfathered.
+
 ## Tuned configs: JSON placement and naming
 
 Every tuned config lives in one nested layout:
