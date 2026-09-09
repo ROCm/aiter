@@ -339,9 +339,7 @@ def test_top_k_per_row_prefill(
     logical_elements = int((row_ends - row_starts).sum().item())
     output_bytes = indices.nbytes + (0 if values is None else values.nbytes)
     ret["TFLOPS"] = logical_elements / us / 1e6
-    ret["TB/s"] = (
-        logical_elements * logits.element_size() + output_bytes
-    ) / us / 1e6
+    ret["TB/s"] = (logical_elements * logits.element_size() + output_bytes) / us / 1e6
     ret["err"] = float(not all_close)
     return ret
 
