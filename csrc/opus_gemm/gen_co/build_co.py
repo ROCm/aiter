@@ -459,6 +459,14 @@ def main():
         "tighter VGPR budgets spilling is the expected outcome, not a "
         "malfunction. The counts always land in build_info.json.",
     )
+    p.add_argument(
+        "--jobs",
+        "-j",
+        type=int,
+        default=None,
+        help="Optional worker ceiling, further clamped by AITER CPU/memory limits; "
+        "non-positive values select one worker",
+    )
     p.add_argument("--keep-temps", action="store_true")
     args = p.parse_args()
 
@@ -479,6 +487,8 @@ def main():
             "build_co: no pre-compiled entries -- check gen_co/co_kernels.json"
         )
     jobs = get_worker_count_for(len(instances))
+    if args.jobs is not None:
+        jobs = min(jobs, max(1, args.jobs))
 
     workdir = tempfile.mkdtemp(prefix="opus_build_co_")
     try:

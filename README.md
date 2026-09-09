@@ -138,6 +138,13 @@ AITER_USE_SYSTEM_TRITON=1 python3 -m pip install -e .
 
 ### Build parallelism
 
+The OPUS `csrc/opus_gemm/gen_co/build_co.py` and
+`op_tests/opus/device/setup.py` entrypoints accept `--jobs N`, `--jobs=N`,
+`-j N`, and `-jN` as additional worker ceilings. They never override tighter
+CPU, memory, environment, or work-count limits. Omitting the option keeps
+automatic sizing; zero and negative values select one worker. The device-test
+builder also retains its Python `build(verbose=False, jobs=None)` interface.
+
 CPU sizing also respects readable cgroup v2 `cpu.max` and v1
 `cpu.cfs_quota_us` / `cpu.cfs_period_us` limits across visible ancestors.
 The CPU worker budget is 80% of the smaller of affinity-available CPUs and

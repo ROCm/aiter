@@ -10,6 +10,7 @@ Usage:
     python setup.py --clean  # remove built artifacts
 """
 
+import argparse
 import os
 import subprocess
 import sys
@@ -126,7 +127,7 @@ def _compile_one(args):
     return os.path.basename(src), elapsed_ms
 
 
-def build(verbose=False):
+def build(verbose=False, jobs=None):
     from concurrent.futures import ProcessPoolExecutor, as_completed
 
     hipcc = _find_hipcc()
@@ -171,7 +172,8 @@ def build(verbose=False):
         obj = os.path.join(_THIS_DIR, s.replace(".cu", ".o"))
         extra = ["-mwavefrontsize64"] if s in _W64_SOURCES else []
         tasks.append((src, obj, hipcc, arch, verbose, extra))
-    jobs = get_worker_count_for(len(tasks))
+    worker_budget = get_worker_count_for(len(tasks))
+    jobs = worker_budget if jobs is None else min(worker_budget, max(1, int(jobs)))
 
     if verbose:
         print(f"[setup] arch={arch}, jobs={jobs}")
@@ -248,10 +250,25 @@ def clean():
         print("Nothing to clean.")
 
 
-if __name__ == "__main__":
-    adopt_legacy_max_jobs()
-    if "--clean" in sys.argv:
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--clean", action="store_true")
+    parser.add_argument("--verbose", "-v", action="store_true")
+    parser.add_argument(
+        "--jobs",
+        "-j",
+        type=int,
+        default=None,
+        help="Optional worker ceiling, further clamped by AITER CPU/memory limits; "
+        "non-positive values select one worker",
+    )
+    args = parser.parse_args()
+    if args.clean:
         clean()
     else:
-        verbose = "-v" in sys.argv or "--verbose" in sys.argv
-        build(verbose=verbose)
+        build(verbose=args.verbose, jobs=args.jobs)
+
+
+if __name__ == "__main__":
+    adopt_legacy_max_jobs()
+    main()
