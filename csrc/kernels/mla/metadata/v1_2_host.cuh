@@ -29,7 +29,9 @@ void generate_reduce_info(int32_t num_work,
                           std::vector<WorkInfo>& work_info,
                           std::vector<int32_t>& reduce_indptr,
                           std::vector<FinalLoc>& reduce_final_map,
-                          std::vector<int32_t>& reduce_partial_map)
+                          std::vector<int32_t>& reduce_partial_map,
+                          const bool need_lse,
+                          const int32_t total_qo_len)
 {
     std::map<std::vector<int32_t>, std::set<int32_t>> reduce_map; // 2d
     for(int32_t i = 0; i < num_work; ++i)
@@ -43,11 +45,20 @@ void generate_reduce_info(int32_t num_work,
         reduce_map[final_loc].insert(partial_loc);
     }
 
-    int32_t final_idx   = 0;
-    int32_t partial_idx = 0;
+    int32_t final_idx      = 0;
+    int32_t partial_idx    = 0;
+    int32_t covered_qo_end = 0;
     for(auto it = reduce_map.begin(); it != reduce_map.end(); ++it)
     {
         auto final_loc = it->first;
+        AITER_CHECK(!need_lse || final_loc[0] == covered_qo_end,
+                    "need_lse requires every query row to be covered by exactly one reduce "
+                    "group, but rows [",
+                    covered_qo_end,
+                    ", ",
+                    final_loc[0],
+                    ") belong to none, so final_lse would be left unwritten there");
+        covered_qo_end = final_loc[1];
         std::vector<uint32_t> partial_loc_vec(it->second.begin(), it->second.end());
         const int32_t num_partials   = partial_loc_vec.size();
         assert(final_idx + 1 < static_cast<int32_t>(reduce_indptr.size()));
@@ -61,6 +72,14 @@ void generate_reduce_info(int32_t num_work,
         final_idx++;
         partial_idx += partial_loc_vec.size();
     }
+    AITER_CHECK(!need_lse || covered_qo_end == total_qo_len,
+                "need_lse requires every query row to be covered by exactly one reduce group, "
+                "but coverage ends at ",
+                covered_qo_end,
+                " of ",
+                total_qo_len,
+                " rows, so final_lse would be left unwritten past that point");
+
     for(int i = final_idx; i < reduce_indptr.size(); i++)
     {
         reduce_indptr[i] = partial_idx;
@@ -188,7 +207,9 @@ void kn_generate_ps_metadata(std::vector<int32_t>& seqlens_qo_indptr,
                     {
                         consuming_blocks = remaining_blocks;
                         // When we need LSE we cannot skip reduce, as final_lse is only produced
-                        // by the reduce kernel.
+                        // by the reduce kernel. consuming_blocks == 0 stays excluded even under
+                        // need_lse, since there is no partial to reduce; generate_reduce_info
+                        // rejects that case rather than let final_lse go unwritten.
                         const bool skip_reduce =
                             (consuming_blocks == 0) || (!need_lse && current_block_idx == 0);
                         const int32_t partial_o_loc =
@@ -338,7 +359,9 @@ void get_ps_metadata_v1_2_host(const aiter_tensor_t& seqlens_qo_indptr, // [batc
                          work_info_vec,
                          reduce_indptr_vec,
                          reduce_final_map_vec,
-                         reduce_partial_map_vec);
+                         reduce_partial_map_vec,
+                         need_lse,
+                         p_seqlens_qo_indptr.back());
 
     // H2D (copy host result buffers back into the caller-provided device tensors)
     HIP_CALL(hipMemcpy(work_indptr.data_ptr(),
