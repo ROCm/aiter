@@ -9,6 +9,7 @@ import subprocess
 from build_targets import (
     GFX_CU_NUM_MAP,
     GFX_MAP,
+    _cu_num_or_none,
     _parse_gpu_archs_env,
     _parse_gpu_targets_env,
     filter_tune_df,
@@ -287,6 +288,25 @@ def get_cu_num():
     return cu_num
 
 
+def _warn_cu_num_ignored(targets: list[tuple[str, int]]) -> None:
+    """Warn when CU_NUM names a count AITER_GPU_TARGETS did not build for."""
+    cu_env = os.getenv("CU_NUM")
+    if not cu_env:
+        return
+    cu_num = _cu_num_or_none(cu_env)
+    if cu_num is None or any(cu == cu_num for _, cu in targets):
+        return
+    logger.warning(
+        "CU_NUM=%s does not match any build target in AITER_GPU_TARGETS (%s). "
+        "The targets decide which kernels are built; CU_NUM still sets the "
+        "count the runtime looks them up by, so every tuned shape falls back "
+        "to the default kernel. Drop CU_NUM, or add a gfx:%s target.",
+        cu_env,
+        ", ".join(f"{gfx}:{cu}" for gfx, cu in targets),
+        cu_num,
+    )
+
+
 def get_build_targets() -> list[tuple[str, int]]:
     """Return (gfx, cu_num) pairs to compile kernels for.
 
@@ -307,6 +327,7 @@ def get_build_targets() -> list[tuple[str, int]]:
     """
     targets = _parse_gpu_targets_env()
     if targets is not None:
+        _warn_cu_num_ignored(targets)
         return targets
 
     if gpu_archs_env_names():

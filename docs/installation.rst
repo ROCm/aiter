@@ -79,8 +79,11 @@ Environment Variables
      - Target GPU architecture(s), semicolon-separated. Use ``native`` to auto-detect.
      - ``native``
    * - ``AITER_GPU_TARGETS``
-     - Build targets as ``gfx:cu_num``, semicolon-separated. Overrides ``GPU_ARCHS``. Needed only for SKUs of one architecture that differ in CU count.
+     - Build targets as ``gfx:cu_num``, semicolon-separated. Overrides ``GPU_ARCHS``, and is used instead of ``CU_NUM`` for the build. Needed only for SKUs of one architecture that differ in CU count.
      - unset
+   * - ``CU_NUM``
+     - Compute-unit count. Pairs with ``GPU_ARCHS`` to pick which tuned rows are built, and overrides the live count the runtime uses to look kernels up. ``AITER_GPU_TARGETS`` replaces it for the build, but ``CU_NUM`` still applies at runtime.
+     - live device
    * - ``PREBUILD_KERNELS``
      - ``0`` = JIT only, ``1`` = core kernels, ``2`` = inference kernels, ``3`` = MHA only
      - ``0``

@@ -166,6 +166,26 @@ def test_active_device_arch_resolution():
             _reset()
 
 
+def test_gpu_archs_takes_the_live_cu_count():
+    from aiter.jit.utils import chip_info
+
+    # A binned gfx950: naming the arch alone must not resolve to the full SKU.
+    binned = [("gfx950:sramecc+:xnack-", 128)]
+    with _restored_env("AITER_GPU_TARGETS", "GPU_ARCHS", "CU_NUM"):
+        os.environ["GPU_ARCHS"] = "gfx950"
+        chip_info.get_gfx_runtime.cache_clear()
+        chip_info.get_cu_num.cache_clear()
+        try:
+            with _fake_hip_host(binned):
+                targets = chip_info.get_build_targets()
+        finally:
+            chip_info.get_gfx_runtime.cache_clear()
+            chip_info.get_cu_num.cache_clear()
+    assert targets == [
+        ("gfx950", 128)
+    ], f"GPU_ARCHS should take the live CU count for a binned part, got {targets}"
+
+
 def test_cpp_itfs_cache_identity():
     import csrc.cpp_itfs.utils as cpp_utils
 
@@ -206,5 +226,6 @@ def test_cpp_itfs_cache_identity():
 if __name__ == "__main__":
     test_runtime_arch_resolution()
     test_active_device_arch_resolution()
+    test_gpu_archs_takes_the_live_cu_count()
     test_cpp_itfs_cache_identity()
     print("ALL_PASS")
