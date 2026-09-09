@@ -16,9 +16,8 @@ Upstream: FlyDSL ``kernels/common/buffer_ops.py`` @ ROCm/FlyDSL#880, minus
 ``create_llvm_ptr`` (now ``kernels_common.create_llvm_ptr``, built on fx so the
 backend resolves the address space). Everything kept behaves as upstream.
 
-``buffer_load(is_scalar=True)`` stays here even though migrated kernels should
-prefer ``tensor_shim.buf_scalar_load``: kernels that have not been moved to the
-buffer-view API yet still call it through this entry point.
+``buffer_load(is_scalar=True)`` stays here for kernels not yet moved to the
+buffer-view API; migrated kernels should prefer ``tensor_shim.buf_scalar_load``.
 
 Example:
     >>> from aiter.ops.flydsl.kernels import buffer_ops

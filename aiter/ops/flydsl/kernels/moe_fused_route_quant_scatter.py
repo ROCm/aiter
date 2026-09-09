@@ -295,12 +295,12 @@ def _emit_quant_block_loop(c: SimpleNamespace) -> None:
             )
         )
 
-    # The hidden/payload SOURCE row is read through the width-agnostic buffer_ops
-    # V# (one descriptor per buffer, per-access vec_width): its pk8 access is a
-    # wide dwordx4 (16 B/lane) load, and routing that through a lane-unit
-    # ptr_buf_tensor forces a copy-atom + fragment whose register bundle survives
-    # into the store pass, inflating VGPRs by up to +50 on the fp4/fp8 pk8
-    # modules. Only the single-width scatter *stores* below are on the layout API.
+    # The hidden/payload SOURCE row stays on the width-agnostic buffer_ops V#
+    # (one descriptor per buffer, per-access vec_width). Its pk8 dwordx4 load
+    # (16 B/lane) through a lane-unit ptr_buf_tensor would force a copy-atom +
+    # fragment whose register bundle survives into the store pass, inflating
+    # VGPRs by up to +50 on the fp4/fp8 pk8 modules. Only the single-width
+    # scatter *stores* below are on the layout API.
     hidden_row_addr = c.hidden_base + fx.Uint64(c.feat_row_i32) * c.feat_bytes_per_row
     hidden_rsrc = buffer_ops.create_buffer_resource_from_addr(
         hidden_row_addr, num_records_bytes=c.feat_bytes_per_row
@@ -486,10 +486,10 @@ def _emit_quant_block_loop(c: SimpleNamespace) -> None:
         byte_in_dword = mx_block - scale_dword * c.c4_i32
         e8m0_byte = arith.trunci(T.i8, e8m0_scale)
         for di, dst in enumerate(c.dests):
-            # The MX payload row is written through the width-agnostic buffer_ops
-            # V# (per-access byte offset). The lane-unit ptr_buf_tensor store is
-            # correct and cheaper on most rows but perturbs VGPR alloc on the
-            # fp4/fp8 pk8 modules (+1..+4), so this buffer stays on buffer_ops.
+            # The MX payload row stays on the width-agnostic buffer_ops V#
+            # (per-access byte offset). A lane-unit ptr_buf_tensor store is
+            # correct and cheaper on most rows but perturbs VGPR alloc by +1..+4
+            # on the fp4/fp8 pk8 modules.
             payload_rsrc = dst_payload[di]
             payload_byte_off = (
                 mx_block * c.c_payload_bytes_per_block
@@ -500,9 +500,9 @@ def _emit_quant_block_loop(c: SimpleNamespace) -> None:
             )
 
             # one e8m0 byte per block, written by the block's lead lane. This
-            # plain helper is not AST-rewritten, so the runtime guard is issued
-            # via a local @flyc.jit dispatch (a bare Python ``if`` here would
-            # eval the dynamic Boolean as a Python bool).
+            # plain helper is not AST-rewritten, so the runtime guard goes through
+            # a local @flyc.jit dispatch (a bare Python ``if`` would eval the
+            # dynamic Boolean as a host bool).
             def _store_lead_scale(
                 dst=dst,
                 scale_dword=scale_dword,

@@ -105,13 +105,13 @@ def ptr_buf_tensor(
             MLIR rejects it (``AlignAttr`` takes integer/float only), so the
             width lives in the layout.
 
-    ``unit_stride`` is the element distance between consecutive units, and
+    ``unit_stride`` is the element distance between consecutive units and
     defaults to ``unit_elems`` (units tile the buffer, so ``u`` counts whole
     units). Pass 1 for a wide access at an arbitrary *element* offset: units
-    then overlap, which is meaningless to iterate but exact for the one slice a
-    caller takes, and it is the only way to express e.g. a dwordx4 store at a
-    row base that is only dword-aligned. It also sets the pointer alignment,
-    since that is the alignment such an access can actually rely on.
+    then overlap -- meaningless to iterate but exact for the one slice a caller
+    takes, and the only way to express e.g. a dwordx4 store at a row base that
+    is only dword-aligned. It also sets the pointer alignment, which is all such
+    an access can rely on.
 
     ``num_records_bytes`` may be a runtime value, for a hardware OOB check that
     zero-fills rather than reading stale bytes.

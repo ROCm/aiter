@@ -176,10 +176,10 @@ def build_moe_gather_reduce_module(
             row_bytes = fx.Int32(model_dim * 2)
             no_bytes = fx.Int32(0)
 
-            # unit_stride=1 on every dword view here: a row base is
-            # row * model_dim * 2 bytes, which is only dword-aligned for odd
-            # out_dwords (model_dim = 2 mod 4), so VEC-wide accesses index in
-            # dwords and may only claim dword alignment.
+            # unit_stride=1 on every dword view here: a row base of
+            # row * model_dim * 2 bytes is only dword-aligned for odd out_dwords
+            # (model_dim = 2 mod 4), so VEC-wide accesses index in dwords and can
+            # only claim dword alignment.
             def src_row_t(row_i32, sk, nrec_bytes, unit_elems):
                 base = in_base_i64 + fx.Uint64(row_i32) * (model_dim * 2)
                 if sk != 0:
