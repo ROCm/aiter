@@ -234,7 +234,7 @@ def fp8_mqa_logits(
                 else 0
             )
             num_chains = (2 if block_m == 2 else 1) if USE_FOLDED_REDUCTION else 0
-            # relax the store masking if we dont have to provide clean logits
+            # Relax the store masking if we don't have to provide clean logits
             relaxed_store = 0 if clean_logits else 1
             other = {
                 "USE_PADDED_SHARED_LAYOUT": ASYNC_COPY_SUPPORTS_DISTRIBUTED,
