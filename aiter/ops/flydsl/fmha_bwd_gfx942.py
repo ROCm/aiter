@@ -4,10 +4,11 @@
 """Host side of the FlyDSL varlen FMHA backward (d_qk=192, d_v=128, causal, bf16, gfx942).
 
 Grid planning plus cached ``CompiledFunction`` dispatch for the kernels in
-``fmha_bwd_core.py``: a ``k_delta`` pre-pass (D = rowsum(dO*O)) and one fused ``k_bwd`` that
-carries all five backward GEMMs.  Unlike the CK and ASM backwards this needs neither a separate
-``FmhaBwdOGradDotOKernel`` nor a ``FmhaBwdConvertQGradKernel``, and it does no work on zeros --
-d_v = 128 is native, so v/out/dout/dv are never padded to 192.
+``kernels/fmha_bwd_gfx942/fmha_bwd_core.py``: a ``k_delta`` pre-pass (D = rowsum(dO*O)) and one
+fused ``k_bwd`` that carries all five backward GEMMs.  The device code stays under ``kernels/``
+and everything host-side lives here.  Unlike the CK and ASM backwards this needs neither a
+separate ``FmhaBwdOGradDotOKernel`` nor a ``FmhaBwdConvertQGradKernel``, and it does no work on
+zeros -- d_v = 128 is native, so v/out/dout/dv are never padded to 192.
 
 The launcher never synchronises with the device: the grid is sized purely from tensor shapes and
 ``max_seqlen_*`` (both host-side), and the per-sequence bounds are read from ``cu_seqlens`` on
@@ -27,8 +28,7 @@ import functools
 
 import torch
 
-from ..tensor_shim import _run_compiled
-from .fmha_bwd_core import (
+from .kernels.fmha_bwd_gfx942.fmha_bwd_core import (
     BM2,
     BN1,
     DQK,
@@ -38,6 +38,7 @@ from .fmha_bwd_core import (
     VEC_RED,
     build,
 )
+from .kernels.tensor_shim import _run_compiled
 
 __all__ = ["flash_attn_varlen_bwd_d192_gfx942"]
 
@@ -169,6 +170,20 @@ def flash_attn_varlen_bwd_d192_gfx942(
     )
     ndblk, nb1, nbtot, ilv, nsp, nrblk_q, nrblk_v = _plan(
         t, h, n_seqs, int(max_seqlen_q), int(max_seqlen_k), _num_cu(dev_index)
+    )
+    # Every tensor is reached through a buffer descriptor whose `num_records` is a 32-bit BYTE
+    # count, so a >= 4 GiB operand wraps to `bytes % 2**32` and the kernel silently addresses
+    # only that window.  Measured on a 4.00 GiB dk: num_records became 76 KB and every gradient
+    # past token 99 was dropped with no error at all.  Fail loudly instead.  The ceiling is
+    # 2 GiB rather than the descriptor's 4: `_flat` derives the byte count from `Tlen * Hn` in
+    # i32 and sizes its layout extent for a `1 << 31` byte span, so the top half of the
+    # unsigned range wraps before the descriptor ever sees it.  The largest buffer is the
+    # dq/dk workspace, nsp slabs of [T, H, 192] bf16.
+    big = nsp * t * h * DQK * 2
+    assert big < (1 << 31), (
+        f"FlyDSL gfx942 backward addresses tensors through 32-bit buffer descriptors; "
+        f"T={t} x H={h} needs a {big / 2**30:.2f} GiB dq/dk workspace (>= 2 GiB). "
+        f"Split the batch so T*H < {(1 << 31) // (nsp * DQK * 2)}."
     )
 
     if dq is None:

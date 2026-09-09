@@ -51,8 +51,9 @@ WHY ONE LAUNCH AND WHY THIS GRID ORDER -- the two structural levers of this file
 The LDS arena is shared by the two branches (they are mutually exclusive), so the merged kernel
 costs the same 44.3 KB / workgroup as job A alone.
 
-Bounds: every global tensor is wrapped in a buffer resource with exact ``num_records``, so
-out-of-range loads return 0 and masked stores are dropped by the hardware.
+Bounds: every global tensor is read and written through a buffer tensor (``_flat``) whose
+descriptor carries an exact ``num_records``, so out-of-range loads return 0 and stores steered
+past the end are dropped by the hardware.
 """
 
 import functools
@@ -60,12 +61,8 @@ import os
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-from flydsl.expr import arith, gpu, range_constexpr, rocdl
-from flydsl.expr.arith import CmpIPredicate
+from flydsl.expr import range_constexpr
 from flydsl.expr.primitive import const_expr
-from flydsl.expr.typing import T
-
-from aiter.ops.flydsl.kernels import buffer_ops, vector
 
 DQK = 192
 DV = 128
@@ -92,6 +89,11 @@ LDVN = DV + 4
 
 NK_D = DQK // 16  # 12 MFMA tiles along d_qk
 NV_D = DV // 16  # 8 MFMA tiles along d_v
+
+# Row strides in 4-element load tiles: one token's d_qk / d_v span as seen through the
+# 4-wide buffer views the operands are read from.
+NQ_T = DQK // 4
+NV_T = DV // 4
 
 # ---- shared bf16 LDS arena; job A and job B are mutually exclusive so they alias -------------
 A_QN = 0  # job A: Q natural   [BM1, LDQ]
@@ -132,17 +134,48 @@ OPT_BPEEL = (
 
 # --------------------------------------------------------------------------- small helpers
 def _mfma(a, b, acc):
-    ai = vector.bitcast(T.vec(4, T.i16), a)
-    bi = vector.bitcast(T.vec(4, T.i16), b)
-    return rocdl.mfma_f32_16x16x16bf16_1k(T.vec(4, T.f32), [ai, bi, acc, 0, 0, 0])
+    """One ``v_mfma_f32_16x16x16_bf16_1k`` on bare v4 register values.
+
+    ``mma_atom_call`` (not ``fx.gemm``) because this issues a SINGLE atom: the fragments are
+    loose register vectors -- LDS ``ptr_load`` results and accumulators carried through
+    ``range(init=...)`` -- rather than a partitioned tensor for ``gemm`` to iterate.  The rmem
+    round-trip is free: the atom's per-lane fragment layout is exactly the hand-built one, so
+    the stores/loads fold into the same registers (measured identical, and bit-identical
+    gradients, vs. the raw ``rocdl.mfma_*`` intrinsic this replaced).
+    """
+    mma = fx.make_mma_atom(fx.rocdl.MFMA(16, 16, 16, fx.BFloat16))
+    fa = fx.make_rmem_tensor(fx.make_layout(4, 1), fx.BFloat16)
+    fb = fx.make_rmem_tensor(fx.make_layout(4, 1), fx.BFloat16)
+    fc = fx.make_rmem_tensor(fx.make_layout(4, 1), fx.Float32)
+    fx.memref_store_vec(a, fa)
+    fx.memref_store_vec(b, fb)
+    fx.memref_store_vec(acc, fc)
+    fx.mma_atom_call(mma, fc, fa, fb, fc)
+    return fx.memref_load_vec(fc)
+
+
+def _exp2(x):
+    """``v_exp_f32``, one instruction.
+
+    DELIBERATELY the raw ODS builder and not the stable ``fx.math.exp2`` (api_stability.md
+    §2.4).  ``math.exp2`` lowers to a denormal-range guard wrapped around the same hardware
+    op -- ``v_cmp_gt_f32`` + 2x ``v_cndmask_b32`` + ``v_add_f32`` + ``v_exp_f32`` +
+    ``v_ldexp_f32``, 6 VALU instead of 1 (verified on the final ISA; ``fastmath="afn"`` does
+    not remove it, the guard is a correctness fixup rather than a precision relaxation).
+    This runs once per score element in the innermost loop: measured 582 -> 608 us on the main
+    case, 701 -> 739 us on the uniform one.  The exponents here are bounded by construction
+    (x - lse <= 0), so the guard is dead work.
+    """
+    return fx.Float32(fx.rocdl.exp2(fx.Float32.ir_type, x.ir_value()))
 
 
 def _zero4():
-    return arith.constant_vector(0.0, T.vec(4, T.f32))
+    return fx.Vector.filled(4, 0.0, fx.Float32)
 
 
-def _get(vec4, i):
-    return fx.Float32(vector.extract(vec4, static_position=[i], dynamic_position=[]))
+def _get(acc4, i):
+    """Element ``i`` of an fp32 MFMA accumulator / LDS fragment."""
+    return fx.Vector(acc4)[i]
 
 
 def _pack4(vals):
@@ -155,19 +188,23 @@ def _pack4(vals):
     c_mask = fx.Int32(0xFFFF0000)
 
     def _pair(a, b):
-        ai = fx.Float32(a).bitcast(fx.Int32)
-        bi = fx.Float32(b).bitcast(fx.Int32)
-        return ((bi & c_mask) | ai.shrui(fx.Int32(16))).ir_value()
+        ai = a.bitcast(fx.Int32)
+        bi = b.bitcast(fx.Int32)
+        return (bi & c_mask) | fx.arith.shrui(ai, fx.Int32(16))
 
-    packed = vector.from_elements(
-        T.vec(2, T.i32), [_pair(vals[0], vals[1]), _pair(vals[2], vals[3])]
+    packed = fx.Vector.from_elements(
+        [_pair(vals[0], vals[1]), _pair(vals[2], vals[3])], dtype=fx.Int32
     )
-    return vector.bitcast(T.vec(4, T.bf16), packed)
+    return packed.bitcast(fx.BFloat16)
 
 
-# A byte offset far past any buffer's num_records but nowhere near the i32 wrap, so a masked
-# store stays out of range even after the constant `soffset` of the widest d-tile is added.
-_OOB = 0x40000000
+# Masked stores are dropped by steering them past the buffer descriptor's num_records rather
+# than predicating each one (see the job-A epilogue).  The steer target must be DERIVED from
+# the tensor, not a fixed constant: an earlier fixed "1 GiB past the base" landed back INSIDE
+# any output bigger than 1 GiB and silently corrupted it -- dk is T*H*384 bytes, so that is
+# only T = 21846 tokens at the 128-head MLA shape this kernel is for.  One element past the
+# last is enough (num_records bounds the access), and the views are element-indexed so the
+# count is in elements; the constant d-tile delta added on top keeps it past the end too.
 
 
 def _cvt1(v):
@@ -182,20 +219,74 @@ def _cvt1(v):
     Here we round-to-nearest by adding 0x8000 to the fp32 bit pattern -- the sign bit survives the
     truncation untouched, so a magnitude carry is exactly round-half-away-from-zero -- and drop
     the NaN fixup (these accumulators are finite by construction).
+
+    Unsigned throughout so ``>>`` is the logical shift; the narrowing ``to`` keeps the high half.
     """
-    bits = fx.Float32(v).bitcast(fx.Int32) + fx.Int32(0x00008000)
-    hi = bits.shrui(fx.Int32(16)).ir_value()
-    return arith.bitcast(T.bf16, arith.trunci(T.i16, hi))
+    bits = v.bitcast(fx.Uint32) + fx.Uint32(0x00008000)
+    return (bits >> fx.Uint32(16)).to(fx.Uint16).bitcast(fx.BFloat16)
 
 
-def _rsrc(tensor, nbytes):
-    """Buffer resource with an EXACT num_records: OOB loads return 0, masked stores are dropped.
+def _flat(tensor, nbytes, fx_dt, vec=1):
+    """Flat ``(ntile, vec)`` buffer-tensor view with an EXACT num_records.
 
-    (The JIT gives tensors a dynamic-shaped memref, so ``max_size=False`` cannot infer the size
-    on its own -- we hand it the byte count computed from the runtime dims.)"""
-    return buffer_ops.create_buffer_resource(
-        tensor, num_records_bytes=fx.Int32(nbytes).ir_value()
+    ``fx.slice(view, (tile, None))`` addresses element ``tile * vec`` as one packed
+    ``vec * sizeof(fx_dt)``-byte transaction.  ``nbytes`` is the byte count computed from the
+    runtime dims (the JIT gives tensors a dynamic-shaped memref, so the size cannot be
+    inferred): OOB loads return 0 and stores steered past it are dropped by the hardware,
+    which is what the causal tails and every epilogue mask rely on.
+
+    A layout shape must be compile-time while every tensor here is dynamically sized, so the
+    extent is not the real length but the whole span a buffer instruction can address -- an
+    i32 of bytes.  The layout only does address arithmetic; the descriptor's ``num_records``
+    is what bounds an access, and this way any index the kernel can legally form, including
+    the deliberately-past-the-end masked-store targets, still lands inside the layout.
+
+    ``num_records`` is a 32-bit BYTE count, so this addressing tops out at 4 GiB per tensor;
+    the launcher asserts that up front rather than letting it wrap silently.
+    """
+    ntile = (1 << 31) // (vec * (fx_dt.width // 8))
+    buf = fx.rocdl.make_buffer_tensor(tensor, num_records_bytes=fx.Int64(nbytes))
+    return fx.Tensor(
+        fx.make_view(fx.get_iter(buf), fx.make_layout((ntile, vec), (vec, 1)))
     )
+
+
+def _atom(fx_dt, vec):
+    """Widest single buffer copy atom covering a ``vec``-wide ``fx_dt`` fragment."""
+    return fx.make_copy_atom(fx.rocdl.BufferCopy(vec * fx_dt.width), fx_dt)
+
+
+def _ldv(buf, tile, fx_dt, vec):
+    """``vec`` elements at element offset ``tile * vec``, as a raw vector value.
+
+    Unwrapped here rather than at every use site: these fragments are fed straight to the MFMA
+    intrinsic, to ``fx.ptr_store``, and through ``range(init=...)``, all of which take a bare
+    ``ir.Value`` -- and the loop hands them back raw anyway.
+    """
+    frag = fx.make_rmem_tensor(fx.make_layout(vec, 1), fx_dt)
+    fx.copy_atom_call(_atom(fx_dt, vec), fx.slice(buf, (tile, None)), frag)
+    return frag.load().ir_value()
+
+
+def _ld1(buf, idx, fx_dt):
+    """One ``fx_dt`` element at element index ``idx``, typed."""
+    frag = fx.make_rmem_tensor(fx.make_layout(1, 1), fx_dt)
+    fx.copy_atom_call(_atom(fx_dt, 1), fx.slice(buf, (idx, None)), frag)
+    return frag.load()[0]
+
+
+def _stv(val, buf, tile, fx_dt, vec):
+    """Store the ``vec``-wide vector ``val`` at element offset ``tile * vec``."""
+    frag = fx.make_rmem_tensor(fx.make_layout(vec, 1), fx_dt)
+    fx.memref_store_vec(val, frag)
+    fx.copy_atom_call(_atom(fx_dt, vec), frag, fx.slice(buf, (tile, None)))
+
+
+def _st1(val, buf, idx, fx_dt):
+    """Store one ``fx_dt`` value at element index ``idx``."""
+    frag = fx.make_rmem_tensor(fx.make_layout(1, 1), fx_dt)
+    fx.memref_store_vec(fx.Vector.from_elements([val], dtype=fx_dt), frag)
+    fx.copy_atom_call(_atom(fx_dt, 1), frag, fx.slice(buf, (idx, None)))
 
 
 def _bf16x4(ptr):
@@ -212,16 +303,15 @@ def _packNr(vals):
     rnd = fx.Int32(0x00008000)
 
     def _pair(a, b):
-        ai = fx.Float32(a).bitcast(fx.Int32) + rnd
-        bi = fx.Float32(b).bitcast(fx.Int32) + rnd
-        return ((bi & c_mask) | ai.shrui(fx.Int32(16))).ir_value()
+        ai = a.bitcast(fx.Int32) + rnd
+        bi = b.bitcast(fx.Int32) + rnd
+        return (bi & c_mask) | fx.arith.shrui(ai, fx.Int32(16))
 
     npair = len(vals) // 2
-    packed = vector.from_elements(
-        T.vec(npair, T.i32),
-        [_pair(vals[2 * i], vals[2 * i + 1]) for i in range(npair)],
+    packed = fx.Vector.from_elements(
+        [_pair(vals[2 * i], vals[2 * i + 1]) for i in range(npair)], dtype=fx.Int32
     )
-    return vector.bitcast(T.vec(2 * npair, T.bf16), packed)
+    return packed.bitcast(fx.BFloat16)
 
 
 NT_RED = 256  # threads per split-K reduction workgroup
@@ -237,17 +327,18 @@ def build(nsp=1):
     it emitted before split-K existed.
 
     ``nsp > 1`` compiles a SECOND, independently cached variant used only for small workloads
-    (see ``_split()`` in fmha_bwd_kernel.py).  WHY: with 272 real workgroups on 304 CUs every
-    workgroup is co-resident, so the kernel's makespan is the LONGEST SINGLE WORKGROUP, not the
-    total work.  On a T=8192 / H=2 / 5-sequence case that is job A's block 0 of the 2200-token
-    sequence -- 69 streamed query tiles -- while the work-balanced average is only 23.8 tiles
-    per CU: a 2.9x imbalance that no dispatch ordering and no tile-size change can touch (the
-    block that owns the FIRST keys must contract over every query, whatever its width).  The
-    only way to shorten it is to cut the contraction itself: split the streamed range into
-    ``nsp`` chunks handled by ``nsp`` different workgroups, each writing a partial, and add a
-    trivial fully-coalesced elementwise reduction kernel.  ``k_bwd``'s signature is unchanged --
-    the partial workspaces are handed in through the dq/dk/dv slots and the per-split stride is
-    derived from ``Tlen*Hn``, so no extra kernel argument perturbs the nsp == 1 variant.
+    (see ``_split()`` in aiter/ops/flydsl/fmha_bwd_gfx942.py).  WHY: with 272 real workgroups on
+    304 CUs every workgroup is co-resident, so the kernel's makespan is the LONGEST SINGLE
+    WORKGROUP, not the total work.  On a T=8192 / H=2 / 5-sequence case that is job A's block 0
+    of the 2200-token sequence -- 69 streamed query tiles -- while the work-balanced average is
+    only 23.8 tiles per CU: a 2.9x imbalance that no dispatch ordering and no tile-size change
+    can touch (the block that owns the FIRST keys must contract over every query, whatever its
+    width).  The only way to shorten it is to cut the contraction itself: split the streamed
+    range into ``nsp`` chunks handled by ``nsp`` different workgroups, each writing a partial,
+    and add a trivial fully-coalesced elementwise reduction kernel.  ``k_bwd``'s signature is
+    unchanged -- the partial workspaces are handed in through the dq/dk/dv slots and the
+    per-split stride is derived from ``Tlen*Hn``, so no extra kernel argument perturbs the
+    nsp == 1 variant.
     """
 
     # ----------------------------------------------------------------- LDS storage layouts
@@ -275,7 +366,7 @@ def build(nsp=1):
         """D = rowsum(dO * O).
 
         The 16 partial sums of a row live in 16 CONSECUTIVE LANES of one wave, so the reduction
-        is a pure cross-lane XOR butterfly (4 shuffles): no LDS array, no ``gpu.barrier()``, and
+        is a pure cross-lane XOR butterfly (4 shuffles): no LDS array, no ``fx.barrier()``, and
         none of the 73.8 % bank-conflict rate the LDS round-trip used to carry.  The row groups
         are also unrolled UNR_D-deep with every global load issued up front, so each thread keeps
         2*UNR_D VMEM requests in flight -- this kernel is pure streaming bandwidth and was 89 %
@@ -284,58 +375,44 @@ def build(nsp=1):
         tid = fx.Int32(fx.thread_idx.x)
         bid = fx.Int32(fx.block_idx.x)
         nrow = Tlen * Hn
-        rdo = _rsrc(DO, nrow * (DV * 2))
-        ro = _rsrc(O, nrow * (DV * 2))
-        rd = _rsrc(DEL, nrow * 4)
+        bdo = _flat(DO, nrow * (DV * 2), fx.BFloat16, 8)
+        bo = _flat(O, nrow * (DV * 2), fx.BFloat16, 8)
+        bdel = _flat(DEL, nrow * 4, fx.Float32)
 
-        off = bid * (ROWS_DELTA * DV) + tid * 8
+        # One 8-wide tile per thread; the u-th pass steps a whole ROWS_D x DV element block, a
+        # compile-time tile delta that folds into the load's immediate offset field.
+        tile = bid * (ROWS_DELTA * DV // 8) + tid
         av = [
-            buffer_ops.buffer_load(
-                rdo, off, vec_width=8, dtype=T.bf16, soffset_bytes=u * ROWS_D * DV * 2
-            )
+            _ldv(bdo, tile + u * (ROWS_D * DV // 8), fx.BFloat16, 8)
             for u in range_constexpr(UNR_D)
         ]
         bv = [
-            buffer_ops.buffer_load(
-                ro, off, vec_width=8, dtype=T.bf16, soffset_bytes=u * ROWS_D * DV * 2
-            )
+            _ldv(bo, tile + u * (ROWS_D * DV // 8), fx.BFloat16, 8)
             for u in range_constexpr(UNR_D)
         ]
 
         lsub = tid % 16
         grow = tid // 16
         for u in range_constexpr(UNR_D):
+            # Even/odd lanes accumulate into two independent fp32 chains, so the 8-element dot
+            # product is not one serial dependency line.
+            a8 = fx.Vector(av[u])
+            b8 = fx.Vector(bv[u])
             e0 = fx.Float32(0.0)
             e1 = fx.Float32(0.0)
             for c in range_constexpr(4):
-                a0 = fx.Float32(
-                    vector.extract(av[u], static_position=[2 * c], dynamic_position=[])
-                )
-                b0 = fx.Float32(
-                    vector.extract(bv[u], static_position=[2 * c], dynamic_position=[])
-                )
-                a1 = fx.Float32(
-                    vector.extract(
-                        av[u], static_position=[2 * c + 1], dynamic_position=[]
-                    )
-                )
-                b1 = fx.Float32(
-                    vector.extract(
-                        bv[u], static_position=[2 * c + 1], dynamic_position=[]
-                    )
-                )
-                e0 = e0 + a0 * b0
-                e1 = e1 + a1 * b1
+                e0 = e0 + fx.Float32(a8[2 * c]) * fx.Float32(b8[2 * c])
+                e1 = e1 + fx.Float32(a8[2 * c + 1]) * fx.Float32(b8[2 * c + 1])
             acc = e0 + e1
             for s in range_constexpr(4):
-                acc = acc + acc.shuffle_xor(1 << s, 64)
+                acc = acc + fx.gpu.shuffle_xor(acc, 1 << s, 64)
             idx = bid * ROWS_DELTA + u * ROWS_D + grow
             ok = (lsub == 0) & (idx < nrow)
             t = idx // Hn
             h = idx % Hn
-            buffer_ops.buffer_store(
-                acc.ir_value(), rd, h * Tlen + t, mask=ok.ir_value()
-            )
+            # Only lane 0 of each row group holds the reduced sum; the other 15 and any row
+            # past the end are steered one element past DEL so the hardware drops the store.
+            _st1(acc, bdel, ok.select(h * Tlen + t, nrow), fx.Float32)
 
     @flyc.jit
     def launch_delta(
@@ -377,6 +454,7 @@ def build(nsp=1):
         wv = tid // 64
         lm = lane % 16
         lk = (lane // 16) * 4
+        lk4 = lane // 16  # lk as a 4-element tile index
 
         shx = fx.Int32(fx.block_idx.x)
         sq = shx % nseq
@@ -384,13 +462,15 @@ def build(nsp=1):
         yy = fx.Int32(fx.block_idx.y)
 
         nrow = Tlen * Hn
-        rq = _rsrc(Q, nrow * (DQK * 2))
-        rk = _rsrc(K, nrow * (DQK * 2))
-        rv = _rsrc(V, nrow * (DV * 2))
-        rdo = _rsrc(DO, nrow * (DV * 2))
-        rlse = _rsrc(LSE, nrow * 4)
-        rdel = _rsrc(DEL, nrow * 4)
-        rcu = _rsrc(CU, (nseq + 1) * 4)
+        # Q / K / V / dO are only ever read as 4-element MFMA fragments, so their views are
+        # tiled 4 wide and every offset into them below is a TILE index (element offset / 4).
+        gQ = _flat(Q, nrow * (DQK * 2), fx.BFloat16, 4)
+        gK = _flat(K, nrow * (DQK * 2), fx.BFloat16, 4)
+        gV = _flat(V, nrow * (DV * 2), fx.BFloat16, 4)
+        gDO = _flat(DO, nrow * (DV * 2), fx.BFloat16, 4)
+        gLSE = _flat(LSE, nrow * 4, fx.Float32)
+        gDEL = _flat(DEL, nrow * 4, fx.Float32)
+        gCU = _flat(CU, (nseq + 1) * 4, fx.Int32)
         # For nsp > 1 the three output slots are PARTIAL workspaces: nsp slabs of dq / dk / dv.
         # The partials are bf16, not fp32.  Measured: fp32 slabs cost 20.8 us in the reduction
         # (84 MB at 4.0 TB/s -- already at the bandwidth roof) plus ~9 us of extra store traffic
@@ -398,15 +478,21 @@ def build(nsp=1):
         # bf16 rounding on nsp values that are then summed in fp32: measured mean_rel vs the
         # fp32 reference stays at 3.4e-3 (gate 1.5e-2, and the frozen ASM baseline itself is at
         # 2.2e-3).
-        rdq = _rsrc(DQO, nrow * (DQK * 2 * nsp))
-        rdk = _rsrc(DKO, nrow * (DQK * 2 * nsp))
-        rdv = _rsrc(DVO, nrow * (DV * 2 * nsp))
+        # The gradients are written one element per store (see the epilogue), so unlike the
+        # operands these views stay 1 wide and take a plain element index.
+        gDQ = _flat(DQO, nrow * (DQK * 2 * nsp), fx.BFloat16)
+        gDK = _flat(DKO, nrow * (DQK * 2 * nsp), fx.BFloat16)
+        gDV = _flat(DVO, nrow * (DV * 2 * nsp), fx.BFloat16)
         if const_expr(nsp > 1):
             wst_q = nrow * DQK  # elements per partial slab of dq / dk
             wst_v = nrow * DV  # elements per partial slab of dv
+        # Total elements behind each output view; any index >= this is past num_records, so
+        # the hardware drops the store.  These are the masked-store steer targets.
+        oob_q = nrow * (DQK * nsp)  # dq / dk, all slabs
+        oob_v = nrow * (DV * nsp)  # dv, all slabs
 
-        lo = fx.Int32(buffer_ops.buffer_load(rcu, sq, vec_width=1, dtype=T.i32))
-        hi = fx.Int32(buffer_ops.buffer_load(rcu, sq + 1, vec_width=1, dtype=T.i32))
+        lo = _ld1(gCU, sq, fx.Int32)
+        hi = _ld1(gCU, sq + 1, fx.Int32)
         ln = hi - lo
 
         sclog = scale * fx.Float32(LOG2E)
@@ -418,6 +504,7 @@ def build(nsp=1):
 
         srow = tid // 16
         ssub = (tid % 16) * 4
+        ssub4 = tid % 16  # ssub as a 4-element tile index
         lrow = tid % BM1
 
         # ---- XOR swizzle of the TRANSPOSED LDS tiles (Q^T, dO^T, K^T) ---------------------
@@ -490,7 +577,7 @@ def build(nsp=1):
         # grid is several rounds deep the kernel is work-bound and mixing the two job types just
         # widens the working set -- measured on a uniform 32K case (1024 WGs): 724.5 -> 738.4 us
         # with the interleave forced on, vs 217.0 -> 205.8 us on the small case.  See
-        # `_interleave()` in fmha_bwd_kernel.py for the CU-count-based predicate.
+        # `_interleave()` in aiter/ops/flydsl/fmha_bwd_gfx942.py for the CU-count predicate.
         nb2v = nbtot - nb1
         mm = (nb1 < nb2v).select(nb1, nb2v)
         half = yy // 2
@@ -536,25 +623,18 @@ def build(nsp=1):
                 # --- K / V operand fragments for this wave's 16 keys, register-resident -------
                 ajl = wv * 16 + lm  # key row inside the block
                 akrow = lo + aj0 + ajl
-                # The 12 K / 8 V fragment loads differ only by a CONSTANT d-tile stride, so the
-                # whole vgpr address is computed once and the stride rides in the scalar
-                # `soffset` field -- 20 v_add_u32 of prologue address math deleted.
-                akb = (akrow * Hn + hh) * DQK + lk
-                avb = (akrow * Hn + hh) * DV + lk
+                # The 12 K / 8 V fragment loads differ only by a CONSTANT d-tile delta (an MFMA
+                # tile is 16 elements = 4 load tiles), so one vgpr address is computed here and
+                # each load folds its delta into the instruction's immediate offset -- 20
+                # v_add_u32 of prologue address math never emitted.
+                akb = (akrow * Hn + hh) * NQ_T + lk4
+                avb = (akrow * Hn + hh) * NV_T + lk4
                 akf = []
                 for ac in range_constexpr(NK_D):
-                    akf.append(
-                        buffer_ops.buffer_load(
-                            rk, akb, vec_width=4, dtype=T.bf16, soffset_bytes=ac * 32
-                        )
-                    )
+                    akf.append(_ldv(gK, akb + ac * 4, fx.BFloat16, 4))
                 avf = []
                 for ac in range_constexpr(NV_D):
-                    avf.append(
-                        buffer_ops.buffer_load(
-                            rv, avb, vec_width=4, dtype=T.bf16, soffset_bytes=ac * 32
-                        )
-                    )
+                    avf.append(_ldv(gV, avb + ac * 4, fx.BFloat16, 4))
 
                 # ---- software-pipelined staging ----------------------------------------------
                 # The five global tiles for the NEXT query block are issued right after the LDS
@@ -563,40 +643,17 @@ def build(nsp=1):
                 # loop.  Dependency-wait was 38 % of wave time before this.
                 def _ld_a(ii0):
                     r = []
+                    arow = (lo + ii0 + srow) * Hn + hh
                     for ac in range_constexpr(DQK // 64):
                         r.append(
-                            buffer_ops.buffer_load(
-                                rq,
-                                ((lo + ii0 + srow) * Hn + hh) * DQK + ssub + ac * 64,
-                                vec_width=4,
-                                dtype=T.bf16,
-                            )
+                            _ldv(gQ, arow * NQ_T + ssub4 + ac * 16, fx.BFloat16, 4)
                         )
                     for ac in range_constexpr(DV // 64):
                         r.append(
-                            buffer_ops.buffer_load(
-                                rdo,
-                                ((lo + ii0 + srow) * Hn + hh) * DV + ssub + ac * 64,
-                                vec_width=4,
-                                dtype=T.bf16,
-                            )
+                            _ldv(gDO, arow * NV_T + ssub4 + ac * 16, fx.BFloat16, 4)
                         )
-                    r.append(
-                        buffer_ops.buffer_load(
-                            rlse,
-                            hh * Tlen + lo + ii0 + lrow,
-                            vec_width=1,
-                            dtype=T.f32,
-                        )
-                    )
-                    r.append(
-                        buffer_ops.buffer_load(
-                            rdel,
-                            hh * Tlen + lo + ii0 + lrow,
-                            vec_width=1,
-                            dtype=T.f32,
-                        )
-                    )
+                    r.append(_ld1(gLSE, hh * Tlen + lo + ii0 + lrow, fx.Float32))
+                    r.append(_ld1(gDEL, hh * Tlen + lo + ii0 + lrow, fx.Float32))
                     return r
 
                 NQC = DQK // 64
@@ -620,42 +677,30 @@ def build(nsp=1):
                     dv_acc = [ast[NK_D + ac] for ac in range_constexpr(NV_D)]
                     apre = [ast[NK_D + NV_D + ac] for ac in range_constexpr(NPRE)]
 
-                    gpu.barrier()
+                    fx.barrier()
                     for ac in range_constexpr(NQC):
                         adc = ssub + ac * 64
-                        avq = apre[ac]
+                        avq = fx.Vector(apre[ac])
                         fx.ptr_store(avq, p_qn + (srow * LDQ + adc))
                         for ae in range_constexpr(4):
-                            fx.ptr_store(
-                                vector.extract(
-                                    avq, static_position=[ae], dynamic_position=[]
-                                ),
-                                p_qt + ((adc + ae) * LD1 + _wcol(ac)),
-                            )
+                            fx.ptr_store(avq[ae], p_qt + ((adc + ae) * LD1 + _wcol(ac)))
                     for ac in range_constexpr(NOC):
                         adc = ssub + ac * 64
-                        avo = apre[NQC + ac]
+                        avo = fx.Vector(apre[NQC + ac])
                         fx.ptr_store(avo, p_on + (srow * LDVN + adc))
                         for ae in range_constexpr(4):
-                            fx.ptr_store(
-                                vector.extract(
-                                    avo, static_position=[ae], dynamic_position=[]
-                                ),
-                                p_ot + ((adc + ae) * LD1 + _wcol(ac)),
-                            )
+                            fx.ptr_store(avo[ae], p_ot + ((adc + ae) * LD1 + _wcol(ac)))
                     if const_expr(OPT_ASCALE):
                         # LOG2E folded onto lse ONCE per staged row (1 VALU/thread/iteration)
                         # instead of once per score element (8/thread/iteration).
                         fx.ptr_store(
-                            (
-                                fx.Float32(apre[NQC + NOC]) * fx.Float32(LOG2E)
-                            ).ir_value(),
+                            fx.Float32(apre[NQC + NOC]) * fx.Float32(LOG2E),
                             p_ls + lrow,
                         )
                     else:
                         fx.ptr_store(apre[NQC + NOC], p_ls + lrow)
                     fx.ptr_store(apre[NQC + NOC + 1], p_de + lrow)
-                    gpu.barrier()
+                    fx.barrier()
                     anxt = _ld_a(ai0 + BM1)  # prefetch for the next iteration
 
                     ajg = aj0 + ajl  # this lane's key column (C-frag n index)
@@ -697,10 +742,8 @@ def build(nsp=1):
                                 # the identity can fire spuriously, but that lane's key row is
                                 # past the sequence and its dK/dV store is dropped by the
                                 # buffer resource in the epilogue, so the value is never read.
-                                adg = arith.cmpi(
-                                    CmpIPredicate.ult,
-                                    (adbase + (ait * 16 + aii)).ir_value(),
-                                    alnd.ir_value(),
+                                adg = fx.Uint32(adbase + (ait * 16 + aii)) < fx.Uint32(
+                                    alnd
                                 )
                             else:
                                 aig = ai0 + ait * 16 + lk + aii
@@ -712,15 +755,9 @@ def build(nsp=1):
                                 ax = (
                                     _get(s_acc, aii) * scale - _get(alse4, aii)
                                 ) * fx.Float32(LOG2E)
-                            apx = fx.Float32(rocdl.exp2(T.f32, ax.ir_value()))
-                            if const_expr(OPT_AMASK):
-                                ap = fx.Float32(
-                                    arith.select(
-                                        adg, apx.ir_value(), fx.Float32(0.0).ir_value()
-                                    )
-                                )
-                            else:
-                                ap = fx.Float32(adg.select(apx, fx.Float32(0.0)))
+                            apx = _exp2(ax)
+                            # Both mask forms are fx predicates, so one select serves either.
+                            ap = adg.select(apx, fx.Float32(0.0))
                             if const_expr(OPT_ASCALE):
                                 # `scale` rides on the dK epilogue instead (dK = dS^T.Q is
                                 # linear in it; dV = P^T.dO must NOT be scaled).
@@ -746,43 +783,41 @@ def build(nsp=1):
                     a_out = yield dk_acc + dv_acc + anxt
 
                 # --- epilogue: C fragments are (m = key row, n = d) --------------------------
-                # The 20 stores of one `aii` differ ONLY by the constant d-tile stride
-                # (16 elements = 32 B), so the whole address goes in ONE vgpr and the stride
-                # rides in the scalar `soffset` field: no per-store v_add and no per-store
-                # v_cndmask (the bounds mask is folded into that single vgpr up front by
-                # steering it to an address 1 GB past num_records, which the buffer resource
-                # drops in hardware).  That removes 160 of the epilogue's VALU ops.
+                # The 20 stores of one `aii` differ ONLY by a constant d-tile delta of 16
+                # elements, so one vgpr address is computed here and each store folds its delta
+                # into the instruction's immediate offset: no per-store v_add and no per-store
+                # v_cndmask (the bounds mask is folded into that single address up front by
+                # steering it far past num_records, which the buffer resource drops in
+                # hardware).  That keeps 160 VALU ops out of the epilogue.
                 for aii in range_constexpr(4):
                     ajgs = aj0 + wv * 16 + lk + aii
                     aok = ajgs < ln
                     aorow = lo + ajgs
                     if const_expr(nsp == 1):
-                        adkb = aok.select(((aorow * Hn + hh) * DQK + lm) * 2, _OOB)
-                        advb = aok.select(((aorow * Hn + hh) * DV + lm) * 2, _OOB)
+                        adkb = aok.select((aorow * Hn + hh) * DQK + lm, oob_q)
+                        advb = aok.select((aorow * Hn + hh) * DV + lm, oob_v)
                     else:
                         # Partial into slab `asp`.  Every (token, d, split) slot is written by
                         # exactly one workgroup, so the workspace needs no zeroing.
                         adkb = aok.select(
-                            (asp * wst_q + (aorow * Hn + hh) * DQK + lm) * 2, _OOB
+                            asp * wst_q + (aorow * Hn + hh) * DQK + lm, oob_q
                         )
                         advb = aok.select(
-                            (asp * wst_v + (aorow * Hn + hh) * DV + lm) * 2, _OOB
+                            asp * wst_v + (aorow * Hn + hh) * DV + lm, oob_v
                         )
                     for adt in range_constexpr(NK_D):
-                        buffer_ops.buffer_store(
+                        _st1(
                             _cvt1(_get(a_out[adt], aii)),
-                            rdk,
-                            adkb,
-                            offset_is_bytes=True,
-                            soffset_bytes=adt * 32,
+                            gDK,
+                            adkb + adt * 16,
+                            fx.BFloat16,
                         )
                     for adt in range_constexpr(NV_D):
-                        buffer_ops.buffer_store(
+                        _st1(
                             _cvt1(_get(a_out[NK_D + adt], aii)),
-                            rdv,
-                            advb,
-                            offset_is_bytes=True,
-                            soffset_bytes=adt * 32,
+                            gDV,
+                            advb + adt * 16,
+                            fx.BFloat16,
                         )
         else:
             # ------------------------------------------------------------------- job B: dQ
@@ -799,37 +834,18 @@ def build(nsp=1):
                 bil = wv * 16 + lm
                 big = bi0 + bil
                 bqrow = lo + big
-                bqb = (bqrow * Hn + hh) * DQK + lk
-                bob = (bqrow * Hn + hh) * DV + lk
+                bqb = (bqrow * Hn + hh) * NQ_T + lk4
+                bob = (bqrow * Hn + hh) * NV_T + lk4
                 bqf = []
                 for bc in range_constexpr(NK_D):
-                    bqf.append(
-                        buffer_ops.buffer_load(
-                            rq, bqb, vec_width=4, dtype=T.bf16, soffset_bytes=bc * 32
-                        )
-                    )
+                    bqf.append(_ldv(gQ, bqb + bc * 4, fx.BFloat16, 4))
                 bof = []
                 for bc in range_constexpr(NV_D):
-                    bof.append(
-                        buffer_ops.buffer_load(
-                            rdo, bob, vec_width=4, dtype=T.bf16, soffset_bytes=bc * 32
-                        )
-                    )
+                    bof.append(_ldv(gDO, bob + bc * 4, fx.BFloat16, 4))
                 # pre-scaled once per workgroup (see the job-A note): the inner loop then costs
                 # one v_fma per score element instead of mul+sub+mul.
-                blse_i = fx.Float32(
-                    buffer_ops.buffer_load(
-                        rlse, hh * Tlen + bqrow, vec_width=1, dtype=T.f32
-                    )
-                ) * fx.Float32(LOG2E)
-                bdel_i = (
-                    fx.Float32(
-                        buffer_ops.buffer_load(
-                            rdel, hh * Tlen + bqrow, vec_width=1, dtype=T.f32
-                        )
-                    )
-                    * scale
-                )
+                blse_i = _ld1(gLSE, hh * Tlen + bqrow, fx.Float32) * fx.Float32(LOG2E)
+                bdel_i = _ld1(gDEL, hh * Tlen + bqrow, fx.Float32) * scale
                 bi_ok = big < ln
 
                 # keys j <= i for some i in [i0, i0+BM2) => j < i0 + BM2, and j < ln
@@ -839,23 +855,14 @@ def build(nsp=1):
 
                 def _ld_b(jj0):
                     r = []
+                    brow = (lo + jj0 + srow) * Hn + hh
                     for bc in range_constexpr(DQK // 64):
                         r.append(
-                            buffer_ops.buffer_load(
-                                rk,
-                                ((lo + jj0 + srow) * Hn + hh) * DQK + ssub + bc * 64,
-                                vec_width=4,
-                                dtype=T.bf16,
-                            )
+                            _ldv(gK, brow * NQ_T + ssub4 + bc * 16, fx.BFloat16, 4)
                         )
                     for bc in range_constexpr(DV // 64):
                         r.append(
-                            buffer_ops.buffer_load(
-                                rv,
-                                ((lo + jj0 + srow) * Hn + hh) * DV + ssub + bc * 64,
-                                vec_width=4,
-                                dtype=T.bf16,
-                            )
+                            _ldv(gV, brow * NV_T + ssub4 + bc * 16, fx.BFloat16, 4)
                         )
                     return r
 
@@ -890,22 +897,17 @@ def build(nsp=1):
                     dq_acc = [bst[bc] for bc in range_constexpr(NK_D)]
                     bpre = [bst[NK_D + bc] for bc in range_constexpr(NPRB)]
 
-                    gpu.barrier()
+                    fx.barrier()
                     for bc in range_constexpr(NKC):
                         bdc = ssub + bc * 64
-                        bvk = bpre[bc]
+                        bvk = fx.Vector(bpre[bc])
                         fx.ptr_store(bvk, p_kn + (srow * LDQ + bdc))
                         for be in range_constexpr(4):
-                            fx.ptr_store(
-                                vector.extract(
-                                    bvk, static_position=[be], dynamic_position=[]
-                                ),
-                                p_kt + ((bdc + be) * LD2 + _wcol(bc)),
-                            )
+                            fx.ptr_store(bvk[be], p_kt + ((bdc + be) * LD2 + _wcol(bc)))
                     for bc in range_constexpr(NVC):
                         bdc = ssub + bc * 64
                         fx.ptr_store(bpre[NKC + bc], p_vn + (srow * LDVN + bdc))
-                    gpu.barrier()
+                    fx.barrier()
                     bnxt = _ld_b(bj0 + BN2)  # prefetch for the next iteration
 
                     for bjt in range_constexpr(BN2 // 16):
@@ -927,14 +929,14 @@ def build(nsp=1):
                         bdsv = []
                         for bii in range_constexpr(4):
                             bx_ = _get(st_acc, bii) * sclog - blse_i
-                            bpx = fx.Float32(rocdl.exp2(T.f32, bx_.ir_value()))
+                            bpx = _exp2(bx_)
                             if const_expr(masked):
                                 bjgg = bj0 + bjt * 16 + lk + bii
                                 if const_expr(OPT_BPEEL):
                                     bgood = bjgg <= big
                                 else:
                                     bgood = bi_ok & (bjgg <= big)
-                                bp = fx.Float32(bgood.select(bpx, fx.Float32(0.0)))
+                                bp = bgood.select(bpx, fx.Float32(0.0))
                             else:
                                 bp = bpx
                             bdsv.append(bp * (_get(pt_acc, bii) * scale - bdel_i))
@@ -968,18 +970,17 @@ def build(nsp=1):
                     bok = bigs < ln
                     borow = lo + bigs
                     if const_expr(nsp == 1):
-                        bqbase = bok.select(((borow * Hn + hh) * DQK + lm) * 2, _OOB)
+                        bqbase = bok.select((borow * Hn + hh) * DQK + lm, oob_q)
                     else:
                         bqbase = bok.select(
-                            (bsp * wst_q + (borow * Hn + hh) * DQK + lm) * 2, _OOB
+                            bsp * wst_q + (borow * Hn + hh) * DQK + lm, oob_q
                         )
                     for bdt in range_constexpr(NK_D):
-                        buffer_ops.buffer_store(
+                        _st1(
                             _cvt1(_get(b_out[bdt], bii)),
-                            rdq,
-                            bqbase,
-                            offset_is_bytes=True,
-                            soffset_bytes=bdt * 32,
+                            gDQ,
+                            bqbase + bdt * 16,
+                            fx.BFloat16,
                         )
 
     @flyc.jit
@@ -1037,32 +1038,20 @@ def build(nsp=1):
         """
         tid = fx.Int32(fx.thread_idx.x)
         bid = fx.Int32(fx.block_idx.x)
-        rws = _rsrc(WS, n * (2 * nsp))
-        rout = _rsrc(OUT, n * 2)
-        idx = (bid * NT_RED + tid) * VEC_RED
-        nb = n * 2  # byte stride between partial slabs
+        gWS = _flat(WS, n * (2 * nsp), fx.BFloat16, VEC_RED)
+        gOUT = _flat(OUT, n * 2, fx.BFloat16, VEC_RED)
+        tile = bid * NT_RED + tid
+        nt = n // VEC_RED  # tile stride between partial slabs
         pv = []
         for p in range_constexpr(nsp):
-            pv.append(
-                buffer_ops.buffer_load(
-                    rws,
-                    idx,
-                    vec_width=VEC_RED,
-                    dtype=T.bf16,
-                    soffset_bytes=(nb * p).ir_value(),
-                )
-            )
+            pv.append(fx.Vector(_ldv(gWS, tile + nt * p, fx.BFloat16, VEC_RED)))
         vals = []
         for e in range_constexpr(VEC_RED):
-            acc = fx.Float32(
-                vector.extract(pv[0], static_position=[e], dynamic_position=[])
-            )
+            acc = fx.Float32(pv[0][e])
             for p in range_constexpr(1, nsp):
-                acc = acc + fx.Float32(
-                    vector.extract(pv[p], static_position=[e], dynamic_position=[])
-                )
+                acc = acc + fx.Float32(pv[p][e])
             vals.append(acc)
-        buffer_ops.buffer_store(_packNr(vals), rout, idx)
+        _stv(_packNr(vals), gOUT, tile, fx.BFloat16, VEC_RED)
 
     @flyc.jit
     def launch_red(
