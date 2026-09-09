@@ -786,9 +786,7 @@ def build_radix_topk_one_block_gfx1250_module(
                     vector_idx = step * block_threads + tid
                     active_vector = vector_idx < row_vectors
                     safe_vector_idx = active_vector.select(vector_idx, 0)
-                    fragment = fx.make_rmem_tensor(
-                        full_key_fragment_layout, fx.Int32
-                    )
+                    fragment = fx.make_rmem_tensor(full_key_fragment_layout, fx.Int32)
                     fx.copy_atom_call(
                         full_key_load_atom,
                         fx.slice(full_key_tiles, (None, safe_vector_idx)),

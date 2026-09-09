@@ -73,20 +73,11 @@ def _validate_signature(
         if shape[0] < num_rows:
             raise ValueError(f"{name} does not have enough entries")
         if device != logits_device:
-            raise ValueError(
-                f"{name} must be on the same CUDA device as logits"
-            )
+            raise ValueError(f"{name} must be on the same CUDA device as logits")
 
-    indices_shape, indices_stride, indices_dtype, indices_device = (
-        indices_signature
-    )
-    if (
-        indices_shape != (num_rows, k)
-        or indices_dtype != torch.int32
-    ):
-        raise ValueError(
-            "indices must be an int32 tensor with shape [num_rows, k]"
-        )
+    indices_shape, indices_stride, indices_dtype, indices_device = indices_signature
+    if indices_shape != (num_rows, k) or indices_dtype != torch.int32:
+        raise ValueError("indices must be an int32 tensor with shape [num_rows, k]")
     if indices_stride != (k, 1):
         raise ValueError("indices must be contiguous")
     if indices_device != logits_device:
@@ -102,15 +93,11 @@ def _validate_values_signature(
 ) -> None:
     shape, stride, dtype, device = values_signature
     if shape != (num_rows, k) or dtype != torch.float32:
-        raise ValueError(
-            "values must be a float32 tensor with shape [num_rows, k]"
-        )
+        raise ValueError("values must be a float32 tensor with shape [num_rows, k]")
     if stride != (k, 1):
         raise ValueError("values must be contiguous")
     if device != logits_device:
-        raise ValueError(
-            "values must be on the same CUDA device as logits"
-        )
+        raise ValueError("values must be on the same CUDA device as logits")
 
 
 def _validate_call(
@@ -263,9 +250,7 @@ def radix_topk_one_block_gfx1250(
     width = logits.shape[1]
     short_rows = width <= _COMPACT_CAPACITY
     block_threads = (
-        1024
-        if not short_rows or num_rows <= _SHORT_ROWS_1024_THREAD_MAX_ROWS
-        else 256
+        1024 if not short_rows or num_rows <= _SHORT_ROWS_1024_THREAD_MAX_ROWS else 256
     )
     stream = torch.cuda.current_stream(logits.device)
     launcher = build_radix_topk_one_block_gfx1250_module(
