@@ -36,14 +36,12 @@ jobs:
         env:
           AITER_REPOSITORY: ${{ github.repository }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
-          PR_TITLE: ${{ github.event.pull_request.title }}
           HEAD_REPOSITORY: ${{ github.event.pull_request.head.repo.full_name }}
           HEAD_REF: ${{ github.event.pull_request.head.ref }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
           BASE_REF: ${{ github.event.pull_request.base.ref }}
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
           EVENT_TYPE: ${{ env.DISPATCH_EVENT_TYPE }}
-          TRIGGER_REASON: ${{ contains(github.event.pull_request.labels.*.name, 'ci:extended-test') && 'label' || 'title' }}
         run: |
           set -euo pipefail
           python3 - <<'PY'
@@ -55,16 +53,11 @@ jobs:
               "client_payload": {
                   "aiter_repo": os.environ["AITER_REPOSITORY"],
                   "pr_number": int(os.environ["PR_NUMBER"]),
-                  "pr_title": os.environ["PR_TITLE"],
                   "head_repo": os.environ["HEAD_REPOSITORY"],
                   "head_ref": os.environ["HEAD_REF"],
                   "head_sha": os.environ["HEAD_SHA"],
                   "base_ref": os.environ["BASE_REF"],
                   "base_sha": os.environ["BASE_SHA"],
-                  "trigger_reason": os.environ["TRIGGER_REASON"],
-                  "source_workflow_run_id": os.environ["GITHUB_RUN_ID"],
-                  "source_workflow_run_attempt": os.environ["GITHUB_RUN_ATTEMPT"],
-                  "triggering_actor": os.environ["GITHUB_TRIGGERING_ACTOR"],
               },
           }
 
