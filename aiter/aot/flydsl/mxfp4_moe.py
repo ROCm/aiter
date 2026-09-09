@@ -73,6 +73,7 @@ def _job_key(job: dict) -> tuple:
             job["NE"],
             job["topk"],
             job["xcd_swizzle"],
+            job.get("activation", "silu"),
         )
     return (
         2,
@@ -109,6 +110,8 @@ def parse_csv(csv_path: str):
 
     with open(csv_path, newline="") as f:
         for row in csv.DictReader(f):
+            activation = str(row.get("act_type", "")).split(".")[-1].strip().lower()
+            activation = "situv2" if activation == "situv2" else "silu"
             topk = int(row["topk"])
             # Shape comes from CSV columns; layout-v2 uses the exact K.
             model_dim = int(row["model_dim"])
@@ -129,6 +132,7 @@ def parse_csv(csv_path: str):
                 _add(
                     {
                         "stage": 1,
+                        "activation": activation,
                         "kernel_name": kn1,
                         "BM": p1["BM"],
                         "use_nt": p1["use_nt"],
@@ -224,6 +228,10 @@ def _dummy(nbytes=256):
 
 
 def _compile_stage1(job):
+    from aiter.ops.flydsl.moe_common import (
+        DEFAULT_SITUV2_BETA,
+        DEFAULT_SITUV2_LINEAR_BETA,
+    )
     from aiter.ops.flydsl.mxfp4_gemm1_kernels import flydsl_mxfp4_gemm1
 
     d = _dummy()
@@ -247,6 +255,9 @@ def _compile_stage1(job):
         D_INTER=job["D_INTER"],
         topk=job["topk"],
         xcd_swizzle=job["xcd_swizzle"],
+        act=job.get("activation", "silu"),
+        situ_beta=DEFAULT_SITUV2_BETA,
+        situ_linear_beta=DEFAULT_SITUV2_LINEAR_BETA,
         stream=0,
     )
 
