@@ -86,16 +86,26 @@ data sits in LDS, so VGPR is unchanged (92 -> 90/94).
 
 ---
 
-## 3. Knobs that are OFF (built, not validated)
+## 3. Build-time knobs: all removed
 
-All default to the original behaviour. Turn on with `-D<NAME>=<value>`.
+There are none left. Each was pinned at its default, and each turned out to be
+either unreachable or a measured regression, so the code they gated is gone and the
+behaviour is unconditional. Recorded here so the experiments are not repeated:
 
-| knob | default | status |
-|---|---|---|
-| `AITER_FG_USE_TDM` | *removed* | Was a validated win at xlarge, but the same flag also reached decode, where the LDS round trip buys nothing (a wave owns one head, so there is no second tile to overlap) and it measured neutral-to-harmful. It could not be gated per tier without a second FG instantiation, and once xlarge stopped routing to FG at all it reached no path. Knob and the code it gated deleted; see git history to revive it. |
-| `AITER_FG_TOKENS_PER_WG` | 1 | Measured noise (−1.68% / +3.55%, CIs cross zero). |
-| `AITER_FG_HEADS_PER_WAVE` | 1 | **Regression +20%** at decode (VGPR 66→86, occupancy 14→11, wave count halved). |
-| `AITER_FG_HEADS_PER_BLOCK` | 1 | **Regression +4~5%** at decode. |
+| former knob | why it went |
+|---|---|
+| `AITER_FG_USE_TDM` | A validated win at xlarge, but the same flag also reached decode, where the LDS round trip buys nothing (a wave owns one head, so there is no second tile to overlap) and it measured neutral-to-harmful. It could not be gated per tier without a second FG instantiation, and once xlarge stopped routing to FG it reached no path at all. |
+| `AITER_FG_TOKENS_PER_WG` | Measured noise, CIs cross zero. Pinned at 1. |
+| `AITER_FG_HEADS_PER_WAVE` | Clear regression at decode: VGPR pressure costs an occupancy tier and the wave count halves. Pinned at 1. |
+| `AITER_FG_HEADS_PER_BLOCK` | Regression at decode, and it was defined but never referenced -- raising it would have done nothing. |
+| `AITER_XLARGE_USE_COARSE` | Routing xlarge to coarse was a large win and became unconditional, so the `== 0` branch was dead. |
+| `AITER_VEC_ROPE_TABLE` | The vectorised cos/sin read is always the right one; the elementwise branch was unreachable. |
+| `AITER_COARSE_SCALE_ALL_LANES` | Documented but never implemented. What it described -- dropping the `tid % Q_REDUCE == 0` dedup on the scale store -- is what the code already does unconditionally, because restoring EXEC mid-store costs an address-queue drain. |
+
+`Q_TDM_DEPTH` survives as `constexpr int kCoarseQTdmDepth = 2`, not a macro: 1 is a
+data race (the refill overwrites the slot the consumer is still reading, 508a86ac),
+the hardware allows only 3 tensor ops in flight per wave, and 3 measured neutral
+against 2 both before and after the ring stopped re-reading the last head.
 
 ---
 

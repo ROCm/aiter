@@ -4449,24 +4449,13 @@ namespace aiter {
     __device__ inline void load_rope_cos_sin(
         const scalar_t* __restrict__ cos_ptr, const scalar_t* __restrict__ sin_ptr,
         int base, float (&c)[N], float (&s)[N]) {
-#ifndef AITER_VEC_ROPE_TABLE
-#define AITER_VEC_ROPE_TABLE 1
-#endif
-      if constexpr (AITER_VEC_ROPE_TABLE != 0) {
-        using vecN = opus::vector_t<scalar_t, N>;
-        const vecN vc = *reinterpret_cast<const vecN*>(cos_ptr + base);
-        const vecN vs = *reinterpret_cast<const vecN*>(sin_ptr + base);
-        #pragma unroll
-        for (int i = 0; i < N; ++i) {
-          c[i] = static_cast<float>(vc[i]);
-          s[i] = static_cast<float>(vs[i]);
-        }
-      } else {
-        #pragma unroll
-        for (int i = 0; i < N; ++i) {
-          c[i] = static_cast<float>(cos_ptr[base + i]);
-          s[i] = static_cast<float>(sin_ptr[base + i]);
-        }
+      using vecN = opus::vector_t<scalar_t, N>;
+      const vecN vc = *reinterpret_cast<const vecN*>(cos_ptr + base);
+      const vecN vs = *reinterpret_cast<const vecN*>(sin_ptr + base);
+      #pragma unroll
+      for (int i = 0; i < N; ++i) {
+        c[i] = static_cast<float>(vc[i]);
+        s[i] = static_cast<float>(vs[i]);
       }
     }
 
@@ -6276,6 +6265,13 @@ void fused_qk_norm_rope_group_quant(
   constexpr int PREFILL_Q_HEADS_PER_WAVE_MED   = 3;
   constexpr int PREFILL_Q_HEADS_PER_WAVE_LRG   = 8;
   constexpr int PREFILL_Q_HEADS_PER_WAVE_XLRG  = 16;
+  // Depth of the Q-head TDM prefetch ring in the coarse kernel (0 = off).
+  // Not a build-time knob: 1 is a data race (the refill overwrites the slot the
+  // consumer is still reading, see 508a86ac) and the hardware allows only 3 tensor
+  // ops in flight per wave, so the range is [2,3] and 3 measured neutral against 2
+  // both before and after the ring stopped re-reading the last head. The kernel's
+  // static_assert enforces the range.
+  constexpr int kCoarseQTdmDepth = 2;
   // ---------------------------------------------------------------------------
   // Heads per wave for the two prefill tiers. 16 at xlarge is the point of the
   // coarse path: one cos/sin gather, one descriptor build and one kernarg read
@@ -6400,19 +6396,16 @@ void fused_qk_norm_rope_group_quant(
   // the per-wave fixed cost (kernarg, positions chase, cos/sin, descriptor setup)
   // once per row. Routing xlarge to coarse (HPW=16) lands at 36,864 WGs / 147,456
   // waves with 16 heads/wave, and coarse already carries the Q-head TDM ring.
-#ifndef AITER_XLARGE_USE_COARSE
-// A large, unambiguous win at gfx1250 H=128 T=16384, measured paired.
-// The head count was never the reason H=128 was slow: FG_MANY_HEADS_MIN=128 routed
-// it to the FG kernel at one (token,head) row per wave -- 2,113,536 single-wave
-// workgroups, each paying its own kernarg read, positions chase, cos/sin setup and
-// descriptor build. coarse gives a wave 16 heads and amortises all of that 16x,
-// landing at 36,864 WGs / 147,456 waves. FG_MANY_HEADS_MIN is an MI355 constant and
-// is actively harmful here.
-#define AITER_XLARGE_USE_COARSE 1
-#endif
+  // The head count was never the reason H=128 was slow here: FG_MANY_HEADS_MIN=128
+  // routed it to the FG kernel at one (token,head) row per wave -- 2,113,536
+  // single-wave workgroups, each paying its own kernarg read, positions chase,
+  // cos/sin setup and descriptor build. coarse gives a wave 16 heads and amortises
+  // all of that 16x, landing at 36,864 WGs / 147,456 waves. Routing xlarge to
+  // coarse was a large, unambiguous win; FG_MANY_HEADS_MIN is an MI355 constant and
+  // is actively harmful here, so xlarge never takes the fine-grained path.
   // FG_MANY_HEADS_MIN routing at the LARGE tier is the same MI355 constant, and on
-  // gfx1250 it reproduces exactly the pathology AITER_XLARGE_USE_COARSE fixed one
-  // tier up. Measured T=4096 H=128 G=64: FG launches 528,384 single-wave
+  // gfx1250 it reproduces exactly the pathology that routing xlarge to coarse
+  // fixed one tier up. Measured T=4096 H=128 G=64: FG launches 528,384 single-wave
   // workgroups, one per (token,head), each paying its own kernarg read, positions
   // chase, cos/sin setup and descriptor build. Coarse gives a wave HPW=8 heads and
   // amortises all of that. Gated on the arch so gfx950/MI355 keeps the routing that
@@ -6420,8 +6413,7 @@ void fused_qk_norm_rope_group_quant(
   const bool fg_many_heads_ok = (get_gpu_arch() != "gfx1250");
   const bool use_finegrained =
       (num_tokens <= 65535)
-      && (((AITER_XLARGE_USE_COARSE == 0) && use_xlarge_prefill)
-          || (use_large_prefill && num_heads >= FG_MANY_HEADS_MIN && fg_many_heads_ok)
+      && ((use_large_prefill && num_heads >= FG_MANY_HEADS_MIN && fg_many_heads_ok)
           || use_decode_path);
   auto launch_all = [&](auto group_size_tag, auto scale_fp32_tag, auto has_qw_tag) {
     constexpr int  head_dim_val      = 512;
@@ -6452,17 +6444,10 @@ void fused_qk_norm_rope_group_quant(
       // 9% wasted, the same order as the regression. HPB=2 wastes only 3%
       // (34/33) and has not been tried.
       //
-      // Kept as a knob rather than reverted outright, because the grid divisor
-      // below is a real fix: the kernel indexes
-      // combined_head_idx = blockIdx.x * HPB + wave_id, so any HPB > 1 needs
-      // grid.x divided to match. The previous launch hard-coded
-      // grid.x = 1 + num_heads, which is only correct at HPB = 1 -- anyone who
-      // raised the constant would have launched HPB times the waves and had
-      // the overhang guard retire the surplus, i.e. a silent slowdown. At
-      // HPB = 1 this compiles to the identical launch as before.
-#ifndef AITER_FG_HEADS_PER_BLOCK
-#define AITER_FG_HEADS_PER_BLOCK 1
-#endif
+      // The grid divisor below stays general even though the count is 1: the
+      // kernel indexes combined_head_idx = blockIdx.x * HPB + wave_id, so any HPB
+      // above 1 needs grid.x divided to match, and hard-coding
+      // grid.x = 1 + num_heads (as an earlier launch did) is only correct at 1.
       // Tokens per workgroup: the waves of a block cover consecutive tokens at
       // one head (grid.x stays one head per block, so the awkward 1+num_heads
       // never has to divide). 1 keeps the previous one-wave-per-block launch.
@@ -6480,9 +6465,6 @@ void fused_qk_norm_rope_group_quant(
       // FG instantiation count for an unproven path. Setting it >1 on another
       // arch therefore fails loudly instead of silently running a shape that has
       // never been validated there.
-#ifndef AITER_FG_TOKENS_PER_WG
-#define AITER_FG_TOKENS_PER_WG 1
-#endif
       // Heads processed per WAVE (distinct from HEADS_PER_BLOCK, which is waves per
       // block). >1 cuts the wave count, amortises the per-wave positions[] chase,
       // and with TDM lets head h+1's copy overlap head h's math (prologue issues
@@ -6496,20 +6478,11 @@ void fused_qk_norm_rope_group_quant(
       // HEADS_PER_BLOCK: "fewer, bigger waves" is the wrong direction where the
       // is starved, whatever the ramp/drain share of the ATT trace suggests.
       //
-      // Left at 1 (identical launch and codegen to before). Still worth trying at
-      // the XLARGE prefill tier, which also uses the FG kernel but runs at ~80
-      // waves/SIMD, where the occupancy argument reverses -- untested.
-#ifndef AITER_FG_HEADS_PER_WAVE
-#define AITER_FG_HEADS_PER_WAVE 1
-#endif
-      constexpr int tokens_per_block_val = AITER_FG_TOKENS_PER_WG;  // waves/block = tokens/block
-      constexpr int fg_heads_per_wave_val = AITER_FG_HEADS_PER_WAVE;
-      if constexpr (tokens_per_block_val > 1) {
-        AITER_CHECK(get_gpu_arch() == "gfx1250",
-                    "AITER_FG_TOKENS_PER_WG > 1 is gfx1250-only (wave32 halves the "
-                    "block size, which is what token packing compensates for); "
-                    "rebuild with AITER_FG_TOKENS_PER_WG=1 for ", get_gpu_arch());
-      }
+      // Left at 1. Still worth trying at the XLARGE prefill tier, which also uses
+      // the FG kernel but runs far more waves/SIMD, where the occupancy argument
+      // reverses -- untested.
+      constexpr int tokens_per_block_val = 1;   // waves/block = tokens/block
+      constexpr int fg_heads_per_wave_val = 1;
       const int fg_blocks_x =
           (1 + num_heads + fg_heads_per_wave_val - 1) / fg_heads_per_wave_val;
       const int fg_blocks_y =
@@ -6547,13 +6520,10 @@ void fused_qk_norm_rope_group_quant(
       // DEPTH=2 correctness verified before shipping (the condition 508a86ac
       // attached to it): full sweep err_q max 5.45e-07 -- the same values the
       // DEPTH=3 baseline produces -- and 40/40 SWA checks byte-exact.
-#ifndef AITER_COARSE_Q_TDM_DEPTH
-#define AITER_COARSE_Q_TDM_DEPTH 2
-#endif
-      constexpr int q_tdm_depth_val = AITER_COARSE_Q_TDM_DEPTH;
+      constexpr int q_tdm_depth_val = kCoarseQTdmDepth;
       if constexpr (q_tdm_depth_val > 0) {
         AITER_CHECK(get_gpu_arch() == "gfx1250",
-                    "AITER_COARSE_Q_TDM_DEPTH > 0 is gfx1250-only (TDM); got ",
+                    "the coarse Q TDM ring is gfx1250-only; got ",
                     get_gpu_arch());
       }
       const size_t coarse_lds_bytes =
@@ -6572,10 +6542,10 @@ void fused_qk_norm_rope_group_quant(
       // of the wave while FETCH_SIZE is 1.089x ideal, i.e. traffic is at the
       // floor and the serial load -> wave_reduce -> store chain leaves MLP at 1.
       // gfx1250-only; the LDS ring costs DEPTH*512*2 B per wave.
-      constexpr int q_tdm_depth_val = AITER_COARSE_Q_TDM_DEPTH;
+      constexpr int q_tdm_depth_val = kCoarseQTdmDepth;
       if constexpr (q_tdm_depth_val > 0) {
         AITER_CHECK(get_gpu_arch() == "gfx1250",
-                    "AITER_COARSE_Q_TDM_DEPTH > 0 is gfx1250-only (TDM); got ",
+                    "the coarse Q TDM ring is gfx1250-only; got ",
                     get_gpu_arch());
       }
       const size_t coarse_lds_bytes =
