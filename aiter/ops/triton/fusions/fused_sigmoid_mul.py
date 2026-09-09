@@ -43,6 +43,11 @@ def fused_sigmoid_mul(
     """
     _LOGGER.info(f"FUSED_SIGMOID_MUL: x={tuple(x.shape)} dtype={x.dtype}")
 
+    assert x.is_cuda, "x must be a CUDA tensor"
+    assert gate.device == x.device, "x and gate must be on the same device"
+    assert x.dtype in (torch.float16, torch.bfloat16, torch.float32), (
+        f"unsupported dtype: {x.dtype}"
+    )
     assert x.shape == gate.shape, f"shape mismatch: {x.shape} vs {gate.shape}"
     assert x.dtype == gate.dtype, f"dtype mismatch: {x.dtype} vs {gate.dtype}"
     assert x.is_contiguous(), "x must be contiguous"
@@ -53,6 +58,7 @@ def fused_sigmoid_mul(
     else:
         assert out.shape == x.shape, f"out shape mismatch: {out.shape} vs {x.shape}"
         assert out.dtype == x.dtype, f"out dtype mismatch: {out.dtype} vs {x.dtype}"
+        assert out.device == x.device, "out must be on the same device as x"
         assert out.is_contiguous(), "out must be contiguous"
 
     N = x.numel()
