@@ -43,6 +43,64 @@ _CASES = (
 )
 
 
+def _hadamard_matrix(head_dim, device):
+    matrix = torch.ones((1, 1), device=device)
+    while matrix.shape[0] < head_dim:
+        matrix = torch.cat(
+            (torch.cat((matrix, matrix), 1), torch.cat((matrix, -matrix), 1)), 0
+        )
+    return matrix
+
+
+def _check_hadamard_precision():
+    from flydsl.expr import T
+
+    from aiter.ops.flydsl.kernels.buffer_ops import (
+        buffer_load,
+        buffer_store,
+        create_buffer_resource_from_addr,
+    )
+    from aiter.ops.flydsl.kernels.fused_a2a_intranode_kernel import _hadamard_head
+
+    @flyc.kernel
+    def rotate(src: fx.Int64, dst: fx.Int64):
+        lane = fx.Int32(fx.gpu.thread_id("x"))
+        offset = fx.Int32(fx.gpu.block_id("x") * 512) + lane * 8
+        source = create_buffer_resource_from_addr(src)
+        output = create_buffer_resource_from_addr(dst)
+        low = fx.Vector(buffer_load(source, offset, vec_width=4, dtype=T.f32))
+        high = fx.Vector(buffer_load(source, offset + 4, vec_width=4, dtype=T.f32))
+        values = [low[i] for i in range(4)] + [high[i] for i in range(4)]
+        result = _hadamard_head(values, lane, 128)
+        for half in range(2):
+            part = fx.Vector.from_elements(
+                [result[half * 4 + i] for i in range(4)], fx.Float32
+            )
+            buffer_store(part, output, offset + half * 4)
+
+    @flyc.jit
+    def launch(src: fx.Int64, dst: fx.Int64):
+        rotate(src, dst).launch(grid=(8,), block=(64,))
+
+    generator = torch.Generator().manual_seed(417)
+    inputs = torch.randn(2, 16, 128, generator=generator).cuda()
+    actual = torch.empty_like(inputs)
+    launch(fx.Int64(inputs.data_ptr()), fx.Int64(actual.data_ptr()))
+    matrix = _hadamard_matrix(128, inputs.device)
+    torch.testing.assert_close(
+        actual, (inputs @ matrix) * 128**-0.5, atol=2e-6, rtol=2e-6
+    )
+    scores = inputs[0] @ inputs[1].T
+    rotated_scores = actual[0] @ actual[1].T
+    torch.testing.assert_close(rotated_scores, scores, atol=2e-5, rtol=2e-6)
+    relative = (rotated_scores - scores).norm() / scores.norm()
+    print(
+        f"PASS Hadamard FP32 score-invariance: relative-L2={relative.item():.9g} "
+        f"max-abs={(rotated_scores - scores).abs().max().item():.9g}",
+        flush=True,
+    )
+
+
 def _check_fp6_converters():
     from flydsl.expr import T, const_expr
 
@@ -343,6 +401,118 @@ def _assert_equal(actual, reference, label):
         )
 
 
+def _check_hadamard_transport(rank, world_size, device, a2a_references):
+    heads, seq_len, head_dim = 8, 17, 128
+    heads_local = heads // world_size
+    shape = (1, heads_local, world_size * seq_len, head_dim)
+    scale_shape = (*shape[:-1], head_dim // 32)
+    matrix = _hadamard_matrix(head_dim, device)
+    quantizers = {
+        "int8": _mx_int8_reference,
+        "e4m3": _mx_fp8_reference,
+        "mxfp4": _mx_fp4_reference,
+        "mxfp6": _mx_fp6_reference,
+    }
+    # Independent Q/K expose sign, normalization, and head-boundary errors.
+    inputs = [
+        _sequence_major_input(rank + role * 19, heads, seq_len, head_dim, device)
+        for role in range(3)
+    ]
+    outliers = [value.clone() for value in inputs]
+    for value in outliers[:2]:
+        value[..., 13] = 90.5
+    for codec in ("int8", "mxfp4", "mxfp6"):
+        for role in "QKV":
+            os.environ[f"FUSED_A2A_CODEC_{role}"] = codec if role != "V" else "e4m3"
+        for split in (True, False):
+            ops = []
+            for enabled in (False, True):
+                os.environ["FUSED_A2A_HADAMARD"] = str(int(enabled))
+                ops.append(
+                    FusedA2AIntraNodeOp(
+                        rank=rank,
+                        world_size=world_size,
+                        shape=inputs[0].shape,
+                        fuse_norm_rope=False,
+                        split=split,
+                        quant=True,
+                        return_mode="fp8" if split else "bf16",
+                    )
+                )
+            for epoch, source in enumerate((inputs, outliers, inputs)):
+                references = a2a_references(source, heads_local, seq_len, head_dim)
+                rotated_refs = [
+                    (value.float() @ matrix) * head_dim**-0.5
+                    for value in references[:2]
+                ]
+                decoded = []
+                for op in ops:
+                    result = op(*source)
+                    parity = epoch % 2
+                    payloads = op.outputs_sets[parity]
+                    scales = op.scales_sets[parity]
+                    values = [
+                        _dequantize(payloads[i], scales[i].view(scale_shape), codec=c)
+                        for i, c in enumerate((codec, codec, "e4m3"))
+                    ]
+                    if not split:
+                        for i in range(3):
+                            _assert_equal(
+                                result[i].view(shape),
+                                values[i].to(torch.bfloat16),
+                                "Hadamard native dequant",
+                            )
+                    decoded.append(values)
+                for kind, buffers in (
+                    ("payload", [op.outputs_sets[epoch % 2][2] for op in ops]),
+                    ("scales", [op.scales_sets[epoch % 2][2] for op in ops]),
+                ):
+                    _assert_equal(*buffers, f"Hadamard V {kind}")
+                quantized_refs = []
+                for i in range(2):
+                    payload, scales = quantizers[codec](rotated_refs[i])
+                    oracle = _dequantize(payload, scales, codec=codec)
+                    quantized_refs.append(oracle)
+                    _assert_quantized_values(
+                        decoded[1][i], oracle, rotated_refs[i], f"Hadamard {codec} QK"
+                    )
+                scores = references[0].float() @ references[1].float().transpose(-1, -2)
+                actual_scores = decoded[1][0] @ decoded[1][1].transpose(-1, -2)
+                oracle_scores = quantized_refs[0] @ quantized_refs[1].transpose(-1, -2)
+                _assert_quantized_values(
+                    actual_scores, oracle_scores, scores, f"Hadamard {codec} scores"
+                )
+                score_sqnr = _metrics(actual_scores, scores)[0]
+                if epoch == 1:
+                    off_sqnr = _metrics(
+                        torch.stack(decoded[0][:2]), torch.stack(references[:2])
+                    )[0]
+                    on_sqnr = _metrics(
+                        torch.stack(decoded[1][:2]), torch.stack(rotated_refs)
+                    )[0]
+                    # hd128 rotation spreads the spike across all block-32 scales.
+                    # INT8 benefits here, but MX scaling already localizes outlier
+                    # damage: E2M1 can regress (21.27 -> 20.37 dB for channel 13
+                    # set to 90.5). Quality is format/input-dependent, not a gate.
+                    # MHA V4's packed API requires this Q/K preprocessing anyway.
+                    if rank == 0:
+                        print(
+                            f"PASS Hadamard {codec} split={split} outlier-SQNR "
+                            f"off={off_sqnr:.4f}dB on={on_sqnr:.4f}dB V=byte-identical",
+                            flush=True,
+                        )
+                elif epoch == 2 and rank == 0:
+                    print(
+                        f"PASS Hadamard {codec} split={split} random score-SQNR="
+                        f"{score_sqnr:.4f}dB epochs=3",
+                        flush=True,
+                    )
+                dist.barrier()
+    os.environ.pop("FUSED_A2A_HADAMARD", None)
+    for role in "QKV":
+        os.environ.pop(f"FUSED_A2A_CODEC_{role}", None)
+
+
 def _run_rank(rank, world_size, port):
     torch.cuda.set_device(rank)
     device = torch.device("cuda", rank)
@@ -419,6 +589,9 @@ def _run_rank(rank, world_size, port):
                         )
                     )
                 return references
+
+            if case_name == "small":
+                _check_hadamard_transport(rank, world_size, device, a2a_references)
 
             references = a2a_references(transformed, heads_local, seq_len, head_dim)
             transport_references = a2a_references(
@@ -863,9 +1036,10 @@ def main():
         )
         return 0
 
+    _check_hadamard_precision()
     _check_fp6_converters()
     mp.spawn(_run_rank, args=(_WORLD_SIZE, _free_port()), nprocs=_WORLD_SIZE, join=True)
-    passed = 2 + sum(
+    passed = 9 + sum(
         12 + 3 * (name == "small") + int(_WORLD_SIZE >= 2) + 2 * len(_CODEC_ROWS)
         for name, *_ in _CASES
     )

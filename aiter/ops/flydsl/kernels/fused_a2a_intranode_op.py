@@ -47,6 +47,9 @@ class FusedA2AIntraNodeOp:
     Set quant=True or FUSED_A2A_QUANT=1 for Q/K/V quantized payloads.
     FUSED_A2A_CODEC selects e4m3 (default), int8, mxfp4, or mxfp6 at construction.
     FUSED_A2A_CODEC_Q/K/V override the shared codec for individual roles.
+    FUSED_A2A_HADAMARD=1 applies normalized Walsh-Hadamard to Q/K before
+    quantization (after norm/RoPE when fused). V is unchanged. Default is off;
+    ignored without quantization. Consumers use rotated Q/K without an inverse.
     Raw mxfp4 payloads contain two E2M1 values per byte, low nibble first.
     Raw mxfp6 payloads contain contiguous E2M3 six-bit codes, least-significant
     bits first (four values per three bytes), with no padding.
@@ -73,6 +76,7 @@ class FusedA2AIntraNodeOp:
         return_mode=None,
     ):
         self.quant = quant or os.environ.get("FUSED_A2A_QUANT", "0") == "1"
+        self.hadamard = self.quant and os.environ.get("FUSED_A2A_HADAMARD", "0") == "1"
         self.codec = os.environ.get("FUSED_A2A_CODEC", "e4m3")
         self.codecs = tuple(
             os.environ.get(f"FUSED_A2A_CODEC_{role}", self.codec) for role in "QKV"
@@ -212,6 +216,7 @@ class FusedA2AIntraNodeOp:
                 split=self.split,
                 quant=self.quant,
                 codec=self.codecs[i] if self.split else self.codecs,
+                hadamard=self.hadamard and (not self.split or i < 2),
                 element_size=element_size,
                 return_mode=self.return_mode,
             )

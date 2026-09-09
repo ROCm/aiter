@@ -24,7 +24,7 @@ from .communication_ops_utils import (
 )
 from .quant_utils import emit_f32_to_e2m1, emit_f32_to_e2m3, emit_mx_e8m0_scale
 
-_JIT_SCHEMA_VERSION = "v18-per-role-mxfp6"
+_JIT_SCHEMA_VERSION = "v19-qk-hadamard"
 _TRANSPORT_CHUNK_BYTES = 16
 _PUSH_PIPELINE_DEPTH = 16
 _OUT_CHANNEL_DEPTH = 1
@@ -165,6 +165,31 @@ def _unpack_transport_pair(word, high, codec):
     return fx.Vector(fx.rocdl.cvt_pk_f32_fp8(T.f32x2, word, high))
 
 
+def _hadamard_head(values, lane, head_dim):
+    # Eight adjacent channels live in registers; the rest of the head is in
+    # aligned lane groups. XOR never crosses a head boundary.
+    result = [values[i] for i in range(8)]
+    for shift in (1, 2, 4):
+        result = [
+            (
+                result[i ^ shift] - result[i]
+                if i & shift
+                else result[i] + result[i ^ shift]
+            )
+            for i in range(8)
+        ]
+    for stage in range((head_dim // 8).bit_length() - 1):
+        shift = 1 << stage
+        result = [
+            ((lane & shift) == 0).select(
+                value + value.shuffle_xor(shift, 64),
+                value.shuffle_xor(shift, 64) - value,
+            )
+            for value in result
+        ]
+    return fx.Vector.from_elements(result, fx.Float32) * (head_dim**-0.5)
+
+
 def make_fused_a2a_kernel(
     *,
     rank,
@@ -178,6 +203,7 @@ def make_fused_a2a_kernel(
     split=False,
     quant=False,
     codec="e4m3",
+    hadamard=False,
     element_size=2,
 ):
     row_nbytes = head_dim * element_size
@@ -359,6 +385,8 @@ def make_fused_a2a_kernel(
                             )
                             rotated[2 * pair] = even * cos_even - odd * sin_odd
                             rotated[2 * pair + 1] = even * sin_odd + odd * cos_even
+                        if const_expr(hadamard):
+                            rotated = _hadamard_head(rotated, lane, head_dim)
                         if const_expr(quant):
                             amax = fx.Float32(0.0)
                             for i in range_constexpr(vec):
@@ -454,7 +482,7 @@ def make_fused_a2a_kernel(
                                             lane_in_group // 4,
                                         )
 
-        def transport(input_rsrc, p2p_bases, addr_p2p_scale, codec):
+        def transport(input_rsrc, p2p_bases, addr_p2p_scale, codec, rotate=False):
             wire_bytes = _transport_bytes(8, codec) if quant else 16
             wire_words = wire_bytes // 4
             peer_chunks = total_chunks // npes
@@ -510,6 +538,8 @@ def make_fused_a2a_kernel(
                     )
                     if const_expr(quant):
                         decoded = fx.Vector(raw).bitcast(fx.BFloat16).to(fx.Float32)
+                        if const_expr(rotate):
+                            decoded = _hadamard_head(decoded, lane, head_dim)
                         amax = fx.Float32(0.0)
                         for i in range_constexpr(elements_per_chunk):
                             amax = amax.maximumf(fmath.absf(decoded[i]))
@@ -573,9 +603,11 @@ def make_fused_a2a_kernel(
                     rsrc_input_k, rsrc_norm_k, p2p_bases_k, addr_p2p_scale_k, codecs[1]
                 )
         else:
-            transport(rsrc_input_q, p2p_bases_q, addr_p2p_scale_q, codecs[0])
+            transport(rsrc_input_q, p2p_bases_q, addr_p2p_scale_q, codecs[0], hadamard)
             if const_expr(not split):
-                transport(rsrc_input_k, p2p_bases_k, addr_p2p_scale_k, codecs[1])
+                transport(
+                    rsrc_input_k, p2p_bases_k, addr_p2p_scale_k, codecs[1], hadamard
+                )
         if const_expr(not split):
             transport(rsrc_input_v, p2p_bases_v, addr_p2p_scale_v, codecs[2])
 
@@ -696,6 +728,7 @@ def make_fused_a2a_jit(
     split=False,
     quant=False,
     codec="e4m3",
+    hadamard=False,
     element_size=2,
     return_mode="bf16",
 ):
@@ -711,6 +744,7 @@ def make_fused_a2a_jit(
         split=split,
         quant=quant,
         codec=codec,
+        hadamard=hadamard,
         element_size=element_size,
     )
     key = (
@@ -725,6 +759,7 @@ def make_fused_a2a_jit(
         split,
         quant,
         codec,
+        hadamard,
         element_size,
         return_mode,
         _JIT_SCHEMA_VERSION,
