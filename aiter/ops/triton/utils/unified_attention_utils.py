@@ -28,9 +28,8 @@ Dtypes fall back too: DT_fp8_fp8, then DT_fp8_any, DT_any_fp8, then "any".
 A section with no axes, like reduce above, is just a config.
 
 Tile size and number of splits (segments) are derived from the following parameters:
-TILE_SIZE_MIN/MAX, and MIN_SEGMENTS/MAX_SEGMENTS/SEGMENTS_PER_CU. MFMA_DIM and
-the SPLIT_MIN_* floors bend how the segment count is derived; see
-compute_segment_params.
+TILE_SIZE_MIN/MAX, and MIN_SEGMENTS/MAX_SEGMENTS/SEGMENTS_PER_CU, plus MFMA_DIM
+and the SPLIT_MIN_* floors; see compute_segment_params.
 """
 
 import copy
@@ -156,21 +155,14 @@ def compute_tile_params(config: dict, block_size: int) -> dict:
 def compute_segment_params(config: dict, params) -> dict:
     """Derive NUM_SEGMENTS: how many ways to split the KV range for one query.
 
-    The rule is always "claim one segment per spare launch slot": a budget of
-    ``num_sms * SEGMENTS_PER_CU`` slots, divided by the programs already queued,
-    rounded up to a power of two and clamped to the context. Two knobs bend it:
+    MFMA_DIM scales the budget down by the warps one program spans: a program
+    holding several slots but counted once over-splits by that factor.
+    SPLIT_MIN_TILES and SPLIT_MIN_SHARE refuse the split outright, for too
+    little context to divide or too few segments to pay for a reduce pass.
 
-    ``MFMA_DIM``: scale the budget down by the warps one program spans
-        (``next_power_of_2(num_queries_per_kv) // MFMA_DIM``, the warp count the
-        matching attn_3d entry will launch). A program occupying several warps
-        already holds that many slots, so counting it once over-splits.
-    ``SPLIT_MIN_TILES`` / ``SPLIT_MIN_SEGMENTS`` / ``SPLIT_MIN_WORK``: refuse to
-        split at all below this much context or this small a share. The floors
-        keep a split from costing more in the reduce than it wins back.
-
-    The reduce section takes the same parameters plus SMALL_SPLIT_MAX, and gets
-    num_warps out of this instead of a segment count: one warp is enough when
-    the split landed on its floor.
+    The reduce section carries the same parameters plus SMALL_SPLIT_MAX, and
+    gets num_warps out of this instead of a segment count: one warp is enough
+    when the split landed on its floor.
     """
     if "SEGMENTS_PER_CU" not in config:
         return config
@@ -182,8 +174,7 @@ def compute_segment_params(config: dict, params) -> dict:
     tile_hi = config.pop("SEGMENT_TILE_MAX", None)
     mfma_dim = config.pop("MFMA_DIM", None)
     min_tiles = config.pop("SPLIT_MIN_TILES", 0)
-    min_segments = config.pop("SPLIT_MIN_SEGMENTS", 0)
-    min_work = config.pop("SPLIT_MIN_WORK", 0)
+    min_share = config.pop("SPLIT_MIN_SHARE", 0)
 
     # tokens one segment must cover, so the split never outruns the context
     tile = triton.next_power_of_2(params.block_size)
@@ -192,19 +183,16 @@ def compute_segment_params(config: dict, params) -> dict:
     if cap is not None:
         limit = min(cap, limit)
 
-    prgms = max(1, params.num_2d_prgms)
     budget = params.num_sms * per_cu
+    prgms = max(1, params.num_2d_prgms)
     if mfma_dim:
-        warps = max(1, triton.next_power_of_2(params.num_queries_per_kv) // mfma_dim)
-        budget //= warps
+        budget //= max(1, triton.next_power_of_2(params.num_queries_per_kv) // mfma_dim)
     share = triton.cdiv(budget, prgms)
-
-    if limit <= min_tiles or share < max(min_segments, min_work // limit):
+    if limit <= min_tiles or share < min_share:
         segments = 1
     else:
         claim = max(min(lo, limit), min(limit, max(1, share)))
         segments = triton.next_power_of_2(claim)
-
     if small_split_max is None:
         config["NUM_SEGMENTS"] = segments
     elif segments <= min(small_split_max, limit):
