@@ -88,8 +88,7 @@ def _mha_v4_sparse_work_table_fake(
     nhead: int,
     q_tiles: int,
 ) -> Tensor:
-    del lut_count
-    return torch.empty(batch * nhead * q_tiles, dtype=torch.int32, device="cuda")
+    return lut_count.new_empty(batch * nhead * q_tiles, dtype=torch.int32)
 
 
 @compile_ops("module_fmha_v4_fwd", gen_fake=_mha_v4_sparse_work_table_fake)
