@@ -3,6 +3,7 @@
 
 import argparse
 import hashlib
+import os
 import random
 import sys
 
@@ -37,7 +38,6 @@ TEST_NAME = "main.normal_accuracy_performance.jit"
 # Global variables that will be set by command line arguments
 USE_TORCH_FLASH_REF = True
 
-torch.set_default_device("cuda")
 torch.set_printoptions(sci_mode=False)
 
 # Global configuration
@@ -1924,6 +1924,7 @@ def parse_arg_and_run_test(sample_rate0: float | None = None):
     else:
         sample_rate = sample_rate0
 
+    prev_default_device = torch.get_default_device()
     results_df = run_multi_pa_gluon_test(
         block_sizes,
         head_configs,
@@ -1943,10 +1944,12 @@ def parse_arg_and_run_test(sample_rate0: float | None = None):
         ps_options,
     )
 
+    torch.set_default_device(prev_default_device)  # per-case runs change it; restore
     output_file = f"run_pa_gluon_test.{TEST_NAME}.block_size_{block_sizes[0]}.triton.{TRITON_VERSION}.csv"
-    results_df.to_csv(output_file, index=False)
-
-    logger.info("\nResults saved to %s", output_file)
+    # Unit tests only check pass/fail; only the CLI (__main__) run keeps the CSV report.
+    if "PYTEST_CURRENT_TEST" not in os.environ:
+        results_df.to_csv(output_file, index=False)
+        logger.info("\nResults saved to %s", output_file)
     logger.info("\nSummary:\n%s", results_df)
 
     # Print mean of selected columns grouped by compute_type
