@@ -746,14 +746,15 @@ parser.add_argument(
     "--beta",
     type=float,
     default=None,
-    help="SiTUv2 gate scale param (beta). Default None -> 1.0. Only affects SiTUv2.",
+    help="SiTUv2 gate scale param (beta). Default None -> the tuned-config "
+    "policy value. Only affects SiTUv2.",
 )
 parser.add_argument(
     "--linear-beta",
     type=float,
     default=None,
-    help="SiTUv2 up (linear) scale param (linear_beta). Default None -> 1.0. "
-    "Only affects SiTUv2.",
+    help="SiTUv2 up (linear) scale param (linear_beta). Default None -> the "
+    "tuned-config policy value. Only affects SiTUv2.",
 )
 parser.add_argument(
     "--kernel",
@@ -937,12 +938,26 @@ _PER1X32_BF16_I4 = (aiter.QuantType.per_1x32, dtypes.bf16, dtypes.i4x2)
 _SITUV2_SUPPORTED_TRIPLES = (_PER1X32_FP8_FP4, _PER1X32_FP4_FP4)
 
 
-def _situv2_beta_kwargs(act_type):
+def _situv2_beta_kwargs(quant_type, aq_dtype, wq_dtype, act_type):
     """beta/linear_beta are only meaningful for SiTUv2; leave them unset (None)
-    for every other activation so silu/swiglu/gelu behavior is unchanged."""
-    if act_type == aiter.ActivationType.Situv2:
-        return {"beta": args.beta, "linear_beta": args.linear_beta}
-    return {}
+    for every other activation so silu/swiglu/gelu behavior is unchanged.
+
+    They are runtime scalars rather than tuned-config keys, so an unset beta
+    inherits whichever stage1 wrapper wins the dispatch (1.0 for FlyDSL). Take
+    the policy's pinned pair instead, so a row is validated at the same beta
+    the tuner measured it with; --beta / --linear-beta still override.
+    """
+    if act_type != aiter.ActivationType.Situv2:
+        return {}
+    policy = fmoe_runtime_policy(quant_type, aq_dtype, wq_dtype, act_type)
+    return {
+        "beta": args.beta if args.beta is not None else policy.situ_beta,
+        "linear_beta": (
+            args.linear_beta
+            if args.linear_beta is not None
+            else policy.situ_linear_beta
+        ),
+    }
 
 
 def _effective_swiglu_limit(quant_type, aq_dtype, wq_dtype, swiglu_limit):
@@ -1134,7 +1149,9 @@ def _iter_legacy_cases():
                             act_type,
                             hidden_pad=hidden_pad,
                             intermediate_pad=intermediate_pad,
-                            **_situv2_beta_kwargs(act_type),
+                            **_situv2_beta_kwargs(
+                                quant_type, aq_dtype, wq_dtype, act_type
+                            ),
                         ), extras
         elif triple == _PER1X32_FP4_FP4:
             for preshuffle in args.preshuffle:
@@ -1153,7 +1170,9 @@ def _iter_legacy_cases():
                             preshuffle=preshuffle,
                             hidden_pad=0,
                             intermediate_pad=0,
-                            **_situv2_beta_kwargs(act_type),
+                            **_situv2_beta_kwargs(
+                                quant_type, aq_dtype, wq_dtype, act_type
+                            ),
                         ), extras
         elif triple == _PER1X32_BF16_I4:
             for m in args.tokenNum:
@@ -1188,7 +1207,7 @@ def _iter_legacy_cases():
                         wq_dtype,
                         doweight_stage1,
                         act_type,
-                        **_situv2_beta_kwargs(act_type),
+                        **_situv2_beta_kwargs(quant_type, aq_dtype, wq_dtype, act_type),
                     ), extras
 
 
