@@ -3,6 +3,7 @@
 
 import argparse
 import hashlib
+import math
 import random
 import sys
 
@@ -2205,6 +2206,125 @@ def test_multi_case_set(case_set_name):
         sliding_window_accuracy_test()
     elif case_set_name == "sliding_window_performance":
         sliding_window_performance_test()
+
+
+@pytest.mark.skipif(
+    torch.version.hip is None or not torch.cuda.is_available(),
+    reason="requires an AMD GPU",
+)
+@pytest.mark.parametrize(
+    "page,lengths,dim,query_length,kv_heads",
+    [
+        (16, [2049, 513, 17], 256, 1, 4),
+        (16, [16, 17], 128, 1, 4),
+        (16, [17, 257], 128, 2, 4),
+        (1024, [1025, 17], 256, 1, 4),
+        (16, [16, 17], 128, 1, 1),
+    ],
+)
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("transposed", [False, True])
+def test_unused_v_cache_padding(
+    page, lengths, dim, query_length, kv_heads, dtype, transposed
+):
+    """NaN/Inf in unused V slots must not affect eager or Graph output."""
+    torch.manual_seed(20260909)
+    batch, heads = len(lengths), kv_heads * 4
+    cols = math.ceil(max(lengths) / page)
+    nblocks = batch * cols
+    q = torch.randn(batch * query_length, heads, dim, device="cuda", dtype=dtype)
+    k = torch.randn(nblocks, kv_heads, dim // 8, page, 8, device="cuda", dtype=dtype)
+    clean_v = torch.randn(nblocks, kv_heads, page, dim, device="cuda", dtype=dtype)
+    table = torch.arange(nblocks, device="cuda", dtype=torch.int32).view(batch, cols)
+    lens = torch.tensor(lengths, device="cuda", dtype=torch.int32)
+    out = torch.empty_like(q)
+    parts = math.ceil(max(lengths) / 256)
+    workspace_shape = (batch, kv_heads, parts, query_length * heads // kv_heads)
+    workspace = {
+        "exp_sums": torch.full(workspace_shape, float("nan"), device="cuda"),
+        "max_logits": torch.full(workspace_shape, float("nan"), device="cuda"),
+        "temporary_output": torch.full(
+            (*workspace_shape, dim), float("nan"), device="cuda", dtype=dtype
+        ),
+    }
+
+    def pack(v):
+        if transposed:
+            return (
+                v.view(nblocks, kv_heads, page // 8, 8, dim)
+                .permute(0, 1, 2, 4, 3)
+                .contiguous()
+            )
+        return v.transpose(2, 3).contiguous()
+
+    def launch(v):
+        pa_decode_gluon(
+            out,
+            q,
+            k,
+            v,
+            lens,
+            table,
+            dim**-0.5,
+            query_length,
+            parts,
+            256,
+            dtype,
+            ps=False,
+            **workspace,
+        )
+
+    launch(pack(clean_v))
+    expected = out.clone()
+    assert torch.isfinite(expected).all().item()
+    # Independent reference reads only live tokens, never physical padding.
+    references = []
+    for b, length in enumerate(lengths):
+        rows = table[b].long()
+        keys = (
+            k[rows]
+            .permute(0, 3, 1, 2, 4)
+            .reshape(-1, kv_heads, dim)[:length]
+            .repeat_interleave(4, dim=1)
+            .float()
+        )
+        values = (
+            clean_v[rows]
+            .permute(0, 2, 1, 3)
+            .reshape(-1, kv_heads, dim)[:length]
+            .repeat_interleave(4, dim=1)
+            .float()
+        )
+        for token in range(query_length):
+            live = length - query_length + token + 1
+            query = q[b * query_length + token].float()
+            p = torch.softmax(
+                torch.einsum("hd,thd->ht", query, keys[:live]) * dim**-0.5, dim=-1
+            )
+            references.append(torch.einsum("ht,thd->hd", p, values[:live]))
+    torch.testing.assert_close(
+        expected.float(), torch.stack(references), rtol=2e-2, atol=2e-2
+    )
+
+    for poison in (float("nan"), float("inf")):
+        poisoned = clean_v.clone()
+        for b, length in enumerate(lengths):
+            for block in range(cols):
+                valid = max(0, min(page, length - block * page))
+                poisoned[b * cols + block, :, valid:] = poison
+        value = pack(poisoned)
+        launch(value)
+        torch.testing.assert_close(out, expected, rtol=0, atol=0)
+        # Replay the same poisoned cache; no host/cache cleanup is allowed.
+        for _ in range(3):
+            launch(value)
+        torch.cuda.synchronize()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            launch(value)
+        for _ in range(2):
+            graph.replay()
+            torch.testing.assert_close(out, expected, rtol=0, atol=0)
 
 
 if __name__ == "__main__":

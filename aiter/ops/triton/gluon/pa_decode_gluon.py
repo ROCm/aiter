@@ -846,6 +846,17 @@ def paged_attention_decode_v2_gluon_large_block_dot_kernel(
             value_block = gl.load(value_cache_ptr + value_block_offsets)
             # Transpose to [KV_COMPUTE_BLOCK_SIZE, HEAD_SIZE_POW2]
             value_block = gl.permute(value_block, [1, 0])
+        # Unused cache lanes may contain NaN/Inf. Masking their attention
+        # probability is insufficient: MFMA would still evaluate 0 * NaN.
+        if kv_sub_sequence_start_index + KV_COMPUTE_BLOCK_SIZE > context_length:
+            value_token_offsets = kv_sub_sequence_start_index + gl.arange(
+                0,
+                KV_COMPUTE_BLOCK_SIZE,
+                layout=gl.SliceLayout(1, value_block.type.layout),
+            )
+            value_block = gl.where(
+                value_token_offsets[:, None] < context_length, value_block, 0
+            )
         # Perform matrix multiplication
         qk_matrix = gl.amd.cdna3.mfma(query_converted, key_converted, qk_accumulator)
         qk_matrix = gl.reshape(
@@ -1814,6 +1825,17 @@ def paged_attention_decode_sliding_window_head_1(
         value_tensor = gl.reshape(
             value_tensor, [CONTEXT_PARTITION_SIZE, HEAD_SIZE_POW2]
         )
+        # Mask physical padding before PV MFMA, including ONE_SHOT dispatch.
+        value_token_start = kv_block_start_idx * KV_COMPUTE_BLOCK_SIZE
+        if value_token_start + CONTEXT_PARTITION_SIZE > context_length:
+            value_token_offsets = value_token_start + gl.arange(
+                0,
+                CONTEXT_PARTITION_SIZE,
+                layout=gl.SliceLayout(1, value_tensor.type.layout),
+            )
+            value_tensor = gl.where(
+                value_token_offsets[:, None] < context_length, value_tensor, 0
+            )
         # Compute QK attention scores using MFMA (overlaps with value load)
         attention_scores = gl.amd.cdna3.mfma(
             query_converted, key_converted, qk_accumulator
@@ -2925,6 +2947,18 @@ def paged_attention_decode_sliding_window(
         value_tensor = gl.reshape(
             value_tensor, [CONTEXT_PARTITION_SIZE, HEAD_SIZE_POW2]
         )
+        # ONE_SHOT dispatch also uses this kernel. Physical V padding must
+        # not enter MFMA even when its softmax probability is zero.
+        value_token_start = kv_block_start_idx * KV_COMPUTE_BLOCK_SIZE
+        if value_token_start + CONTEXT_PARTITION_SIZE > context_length:
+            value_token_offsets = value_token_start + gl.arange(
+                0,
+                CONTEXT_PARTITION_SIZE,
+                layout=gl.SliceLayout(1, value_tensor.type.layout),
+            )
+            value_tensor = gl.where(
+                value_token_offsets[:, None] < context_length, value_tensor, 0
+            )
 
         attention_scores = gl.reshape(
             attention_scores, [QUERY_GROUP_SIZE_POW2, CONTEXT_PARTITION_SIZE]
@@ -3793,6 +3827,19 @@ def paged_attention_decode_v2_gluon_dot_kernel(
             value_tensor = gl.permute(value_tensor, [0, 2, 1])
             value_tensor = gl.reshape(
                 value_tensor, [KV_COMPUTE_BLOCK_SIZE, HEAD_SIZE_POW2]
+            )
+
+        # Zero unused V-cache register lanes before PV MFMA: masking the
+        # probability alone cannot suppress 0 * NaN/Inf from cache padding.
+        # Full compute blocks retain the unmasked fast path.
+        if kv_subsequence_start_idx + KV_COMPUTE_BLOCK_SIZE > context_length:
+            value_token_offsets = kv_subsequence_start_idx + gl.arange(
+                0,
+                KV_COMPUTE_BLOCK_SIZE,
+                layout=gl.SliceLayout(1, value_tensor.type.layout),
+            )
+            value_tensor = gl.where(
+                value_token_offsets[:, None] < context_length, value_tensor, 0
             )
 
         # Apply quantization scaling to attention scores
