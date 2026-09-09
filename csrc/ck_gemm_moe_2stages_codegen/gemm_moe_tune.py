@@ -2452,6 +2452,7 @@ class FmoeTuner(TunerCommon):
             w1_scale=w1_scale,
             w1_bias=w1_bias,
             doweight=doweight_stage1,
+            swiglu_limit=swiglu_limit,
             situ_beta=DEFAULT_SITUV2_BETA,
             situ_linear_beta=DEFAULT_SITUV2_LINEAR_BETA,
         )
@@ -4512,7 +4513,12 @@ class FmoeTuner(TunerCommon):
         return tasks_flydsl
 
     def run_config(self, args):
-        from aiter.fused_moe import fused_moe, fused_topk
+        from aiter.fused_moe import (
+            fmoe_runtime_env,
+            fmoe_runtime_policy,
+            fused_moe,
+            fused_topk,
+        )
         from aiter.test_common import checkAllclose, run_perftest
 
         untunedf = self.untunedf
@@ -4532,29 +4538,11 @@ class FmoeTuner(TunerCommon):
             q_type = QuantType.per_1x128 if q_type == QuantType.per_128x128 else q_type
             use_g1u1 = bool(row["use_g1u1"])
             doweight_stage1 = bool(row["doweight_stage1"])
-            # a16w4/a8w4/mxfp8 shuffle their weights into the gate-up interleaved
-            # (guinterleave) layout via shuffle_weight_a16w4, which the kernel only
-            # reads correctly under gate_mode=INTERLEAVE. fused_moe defaults to
-            # SEPARATED, so run_config must request INTERLEAVE for these paths
-            # (else the kernel misreads gate/up channels and the output is
-            # uncorrelated with the natural-layout reference). Mirrors
-            # op_tests/test_moe_2stage.py::_effective_gate_mode.
-            if q_type == QuantType.per_1x32 and (
-                (q_dtype_a in [dtypes.fp8, dtypes.bf16] and q_dtype_w == dtypes.fp4x2)
-                or (q_dtype_a == dtypes.fp8 and q_dtype_w == dtypes.fp8)
-            ):
-                gate_mode = "interleave"
-            else:
-                gate_mode = "separated"
-            # a16w4 / a8w4 (fp4 weight) configs were tuned with the fp8 (a8w4)
-            # kernel picker forced on. Below the default AITER_BF16_FP8_MOE_BOUND
-            # (256) fused_moe's per_1x32 picker selects the bf16/a16w4 path, which
-            # for Silu has no kernel and dispatch-crashes ("Unsupported kernel
-            # config for moe heuristic dispatch") -> the tuned fp8 kernel is never
-            # reached. Force the bound to 0 so the lookup matches how these shapes
-            # were tuned. Mirrors op_tests/test_moe_2stage.py and test_moe_ep.py.
-            if q_type == QuantType.per_1x32 and q_dtype_w == dtypes.fp4x2:
-                os.environ["AITER_BF16_FP8_MOE_BOUND"] = "0"
+            # Every knob that decides which tuned config fused_moe dispatches to
+            # lives in fmoe_runtime_policy, so this benchmark and
+            # op_tests/test_moe_2stage.py cannot drift apart on it.
+            policy = fmoe_runtime_policy(q_type, q_dtype_a, q_dtype_w, act_type)
+            gate_mode = policy.gate_mode
             shape_str = (
                 f"({token}, {model_dim}, {inter_dim}, E={expert}, topk={topk}, "
                 f"{row['act_type']}, {row['dtype']}, {row['q_dtype_a']}, "
@@ -4696,8 +4684,13 @@ class FmoeTuner(TunerCommon):
                     # a16w4 / a8w4 (16-bit or fp8 activation, fp4 weight): the
                     # weight layout follows the *config* activation dtype, not the
                     # runtime-effective one (mirror op_tests/test_moe_2stage.py).
-                    w1_qt_fmoe = shuffle_weight_a16w4(w1_qt_fmoe, 16, True)
-                    w1_scale_fmoe = shuffle_scale_a16w4(w1_scale, expert, True)
+                    # a8w4 interleaves w1 gate/up (GUGU, paired with
+                    # gate_mode=INTERLEAVE); a16w4 keeps standard GGUU, the same
+                    # layout generate_data_2stages tuned it with.
+                    w1_qt_fmoe = shuffle_weight_a16w4(w1_qt_fmoe, 16, policy.w1_gate_up)
+                    w1_scale_fmoe = shuffle_scale_a16w4(
+                        w1_scale, expert, policy.w1_gate_up
+                    )
                     w2_qt_fmoe = shuffle_weight_a16w4(w2_qt_fmoe, 16, False)
                     w2_scale_fmoe = shuffle_scale_a16w4(w2_scale, expert, False)
                 elif (
@@ -4719,8 +4712,10 @@ class FmoeTuner(TunerCommon):
                     # mxfp8 (a8w8): gate-up interleaved fp8 weight; w1 scale uses the
                     # a16w4 interleave, w2 scale uses plain e8m0 (mirror
                     # op_tests/test_moe_2stage.py is_mxfp8).
-                    w1_qt_fmoe = shuffle_weight_a16w4(w1_qt_fmoe, 16, True)
-                    w1_scale_fmoe = shuffle_scale_a16w4(w1_scale, expert, True)
+                    w1_qt_fmoe = shuffle_weight_a16w4(w1_qt_fmoe, 16, policy.w1_gate_up)
+                    w1_scale_fmoe = shuffle_scale_a16w4(
+                        w1_scale, expert, policy.w1_gate_up
+                    )
                     w2_qt_fmoe = shuffle_weight_a16w4(w2_qt_fmoe, 16, False)
                     w2_scale_fmoe = fp4_utils.e8m0_shuffle(w2_scale)
                 elif q_dtype_w != dtypes.fp4x2:
@@ -4782,25 +4777,35 @@ class FmoeTuner(TunerCommon):
                     torch_quant = aiter.get_torch_quant(q_type)
                     a1_qt, a1_scale = torch_quant(hidden, quant_dtype=q_dtype_a)
 
-                out, us = run_perftest(
-                    fused_moe,
-                    hidden,
-                    w1_qt_fmoe,
-                    w2_qt_fmoe,
-                    topk_weights,
-                    topk_ids,
-                    activation=act_type,
-                    quant_type=q_type,
-                    doweight_stage1=doweight_stage1,
-                    w1_scale=w1_scale_fmoe,
-                    w2_scale=w2_scale_fmoe,
-                    dtype=dtype,
-                    gate_mode=gate_mode,
-                    bias1=bias1_aiter,
-                    bias2=bias2_aiter,
-                    num_warmup=args.warmup,
-                    num_iters=args.iters,
+                # SiTUv2 beta/linear_beta are runtime scalars whose kernel default
+                # depends on the stage1 wrapper that wins dispatch, so pin them to
+                # the same constants torch_moe_2stages references.
+                situ_kwargs = (
+                    {"beta": policy.situ_beta, "linear_beta": policy.situ_linear_beta}
+                    if policy.situ_beta is not None
+                    else {}
                 )
+                with fmoe_runtime_env(policy):
+                    out, us = run_perftest(
+                        fused_moe,
+                        hidden,
+                        w1_qt_fmoe,
+                        w2_qt_fmoe,
+                        topk_weights,
+                        topk_ids,
+                        activation=act_type,
+                        quant_type=q_type,
+                        doweight_stage1=doweight_stage1,
+                        w1_scale=w1_scale_fmoe,
+                        w2_scale=w2_scale_fmoe,
+                        dtype=dtype,
+                        gate_mode=gate_mode,
+                        bias1=bias1_aiter,
+                        bias2=bias2_aiter,
+                        **situ_kwargs,
+                        num_warmup=args.warmup,
+                        num_iters=args.iters,
+                    )
                 # a16wi4: per_1x32_i4_quant stores int4 in an int8 container.
                 # The torch reference detects int4 weights by the i4x2 dtype, so
                 # pass an i4x2-reinterpreted view to the reference only (the kernel
