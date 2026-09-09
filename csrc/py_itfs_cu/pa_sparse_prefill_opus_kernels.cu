@@ -83,7 +83,7 @@ void pa_sparse_prefill_gfx950_opus_fwd(aiter_tensor_t& q,
     if (N == 0) return;
 
     // ---- Build kernel args -----------------------------------------------
-    pa_sparse_prefill_kargs kargs{};
+    pa_sparse_prefill_kargs_gfx950 kargs{};
     kargs.q_ptr             = q.data_ptr();
     kargs.unified_kv_ptr    = unified_kv.data_ptr();
     kargs.kv_ptr            = kv.data_ptr();
@@ -468,6 +468,12 @@ void pa_sparse_prefill_gfx1250_opus_fwd(aiter_tensor_t& q,
     args.total_tokens      = static_cast<int>(kv.size(0));
     args.stride_qo_n       = static_cast<int>(q.stride(0));
     args.stride_qo_h       = static_cast<int>(q.stride(1));
+    // The prebuilt code objects store the output through q's strides (their
+    // kernarg ABI has no separate out strides), so out must match q's layout.
+    AITER_CHECK(out.stride(0) == q.stride(0) && out.stride(1) == q.stride(1),
+                "gfx1250 pa_sparse_prefill requires out to share q's strides; "
+                "got out=(", out.stride(0), ",", out.stride(1),
+                ") q=(", q.stride(0), ",", q.stride(1), ")");
     args.stride_kv_page    = static_cast<int>(unified_kv.stride(0));
     AITER_CHECK(args.stride_kv_page == static_cast<int>(kv.stride(0)),
                 "unified_kv and kv must share row stride along the D dim");

@@ -129,12 +129,19 @@ struct pa_sparse_prefill_kargs
     int total_tokens;
     int stride_qo_n;
     int stride_qo_h;
-    // Output strides, taken from the out tensor; q and out may have different
-    // layouts (e.g. a strided q view with a contiguous out).
-    int stride_o_n;
-    int stride_o_h;
     int stride_kv_page;
     float softmax_scale;
+};
+
+// gfx950 adds the out strides so a strided q view can write a differently laid
+// out (usually contiguous) out. The gfx1250 prebuilt code objects consume
+// pa_sparse_prefill_kargs verbatim and their kernarg ABI is pinned by
+// PA_GFX1250_CO_ABI, so the extra fields live here instead of in the base
+// struct; the gfx1250 launcher instead requires out to share q's strides.
+struct pa_sparse_prefill_kargs_gfx950 : pa_sparse_prefill_kargs
+{
+    int stride_o_n;
+    int stride_o_h;
 };
 
 // Kernel arguments for the split-precision (NoPE fp8 / RoPE bf16) DSA prefill.
@@ -477,9 +484,9 @@ __host__ __device__ inline int ceil_div(int a, int b) { return (a + b - 1) / b; 
 
 // Device kernel templates — declared here, defined in the device pass below.
 template <class Traits>
-__global__ void pa_prefill_16mx8_32nx1_kernel(pa_sparse_prefill_kargs kargs);
+__global__ void pa_prefill_16mx8_32nx1_kernel(pa_sparse_prefill_kargs_gfx950 kargs);
 template <class Traits>
-__global__ void pa_prefill_16mx1_16nx4_kernel(pa_sparse_prefill_kargs kargs);
+__global__ void pa_prefill_16mx1_16nx4_kernel(pa_sparse_prefill_kargs_gfx950 kargs);
 template <class Traits>
 __global__ void pa_prefill_16mx8_32nx1_fp8_kernel(pa_fp8_kargs kargs);
 template <class Traits>
@@ -488,11 +495,11 @@ __global__ void pa_prefill_16mx1_16nx4_fp8_kernel(pa_fp8_kargs kargs);
 // Pull in the device kernel template bodies only on the gfx950 device pass.
 #if !defined(__HIP_DEVICE_COMPILE__) || !defined(__gfx950__)
 template <class Traits>
-__global__ void pa_prefill_16mx8_32nx1_kernel(pa_sparse_prefill_kargs)
+__global__ void pa_prefill_16mx8_32nx1_kernel(pa_sparse_prefill_kargs_gfx950)
 {
 }
 template <class Traits>
-__global__ void pa_prefill_16mx1_16nx4_kernel(pa_sparse_prefill_kargs)
+__global__ void pa_prefill_16mx1_16nx4_kernel(pa_sparse_prefill_kargs_gfx950)
 {
 }
 template <class Traits>
@@ -1607,7 +1614,7 @@ __device__ void pa_prefill_accum_pipelined(pa_sparse_prefill_kargs kargs,
 
 // ─── PA kernel: template on traits; K/V in shared, Q in registers, Flash Attention online softmax ───
 template<class Traits>
-__global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void pa_prefill_16mx8_32nx1_kernel(pa_sparse_prefill_kargs kargs) {
+__global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void pa_prefill_16mx8_32nx1_kernel(pa_sparse_prefill_kargs_gfx950 kargs) {
     using namespace opus;
     using namespace pa_16mx8_32nx1;
     using T = opus::remove_cvref_t<Traits>;
@@ -2106,7 +2113,7 @@ __device__ void pa_prefill_16mx1_16nx4_pipeline(pa_sparse_prefill_kargs kargs,
 
 // ─── PA kernel: template on traits; K/V in shared, Q in registers, Flash Attention online softmax ───
 template<class Traits>
-__global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void pa_prefill_16mx1_16nx4_kernel(pa_sparse_prefill_kargs kargs) {
+__global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void pa_prefill_16mx1_16nx4_kernel(pa_sparse_prefill_kargs_gfx950 kargs) {
     using namespace opus;
     using namespace pa_16mx1_16nx4;
     using T = opus::remove_cvref_t<Traits>;
