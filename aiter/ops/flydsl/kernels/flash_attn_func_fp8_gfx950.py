@@ -36,6 +36,14 @@ _FP8_AUTOSPLIT_CANDIDATES = tuple(range(1, 17))
 _FP8_AUTOSPLIT_FIXED_TILES = 10.4
 _FP8_AUTOSPLIT_CAUSAL_SKEW = 0.75
 _FP8_AUTOSPLIT_DENSE_MARGIN = 0.85
+# Splitting a causal shape in two doubles the workgroup count, so it only pays
+# while either the machine still has room for the second wave or the KV loop is
+# long enough to amortise the extra round plus the combine kernel. Measured on
+# gfx950/256CU (causal self-attention, D=128, min of 8x120), the sp2-vs-sp1
+# crossover tracks kv_tiles / (wgs / num_cu): ~0.70 machine-full at 32 KV tiles,
+# ~0.80 at 40, ~0.93 at 48, and past 1.0 from 64 tiles up -- i.e. a constant
+# ratio of roughly 50 along the whole boundary.
+_FP8_AUTOSPLIT_SPLIT2_OCCUPANCY = 50
 _FP8_NARROW_MAX_KV_TILES = 48
 _FP8_BATCH_INTERLEAVE_GROUP = 2
 
@@ -44,20 +52,34 @@ def _fp8_rescale_threshold(seqlen_kv: int) -> float:
     return 6.0 if seqlen_kv <= _FP8_LONG_SEQ else 4.0
 
 
-def _gpu_arch(device: torch.device) -> str:
+# Device properties and the shape heuristics below are pure functions of a device
+# index resp. a handful of ints, but they run on every call; small shapes are
+# entirely host-bound, so memoise them.
+@functools.lru_cache(maxsize=16)
+def _gpu_arch_cached(index: int | None) -> str:
     try:
-        return torch.cuda.get_device_properties(device.index).gcnArchName.split(":")[0]
+        return torch.cuda.get_device_properties(index).gcnArchName.split(":")[0]
     except Exception:  # noqa: BLE001
         return ""
 
 
-def _num_cu(device: torch.device) -> int:
+@functools.lru_cache(maxsize=16)
+def _num_cu_cached(index: int | None) -> int:
     try:
-        return int(torch.cuda.get_device_properties(device.index).multi_processor_count)
+        return int(torch.cuda.get_device_properties(index).multi_processor_count)
     except Exception:  # noqa: BLE001
         return _DENSE_LIGHT_CU_FALLBACK
 
 
+def _gpu_arch(device: torch.device) -> str:
+    return _gpu_arch_cached(device.index)
+
+
+def _num_cu(device: torch.device) -> int:
+    return _num_cu_cached(device.index)
+
+
+@functools.lru_cache(maxsize=256)
 def _fp8_auto_block_m(
     batch: int, num_heads: int, seqlen_q: int, seqlen_kv: int, num_cu: int
 ) -> int:
@@ -70,6 +92,7 @@ def _fp8_auto_block_m(
     return narrow if narrow_wgs <= num_cu else DUALWAVE_SWP_BLOCK_M
 
 
+@functools.lru_cache(maxsize=256)
 def _fp8_batch_interleave_group(
     batch: int, causal: bool, cross: bool, num_kv_splits: int
 ) -> int:
@@ -79,6 +102,7 @@ def _fp8_batch_interleave_group(
     return g if batch % g == 0 else 1
 
 
+@functools.lru_cache(maxsize=512)
 def _fp8_auto_kv_splits(
     batch: int,
     num_heads: int,
@@ -103,6 +127,13 @@ def _fp8_auto_kv_splits(
         kept = 0.5 * seqlen_kv / seqlen_q
     if kept < _FP8_AUTOSPLIT_CAUSAL_SKEW:
         if kv_tiles // 2 < _FP8_AUTOSPLIT_MIN_TILES or wgs > num_cu:
+            return 1
+        # The makespan model below rounds the workgroup count up to whole waves
+        # and is blind to causal skew, so this branch hard-codes 2 -- but 2 is
+        # only right while the shape leaves enough of the machine idle for the
+        # split to fill; a shape already at full occupancy just pays for a second
+        # round and a combine launch.
+        if wgs * _FP8_AUTOSPLIT_SPLIT2_OCCUPANCY > kv_tiles * num_cu:
             return 1
         interleaved = (
             _fp8_batch_interleave_group(batch, causal, seqlen_q != seqlen_kv, 1) > 1

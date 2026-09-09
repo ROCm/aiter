@@ -384,6 +384,27 @@ def _ref_lse(q, k, causal):
     return torch.logsumexp(scores, dim=-1).float()
 
 
+def _assert_lse_matches(got, ref):
+    """Compare LSE against the fp64 reference, treating fully-masked rows exactly.
+
+    A row that sees no key at all (bottom-right causal with Skv < Sq, or a
+    zero-length varlen KV entry) has LSE = -inf, and ``-inf - -inf`` is NaN, so
+    those rows are asserted as an exact bit match instead of a tolerance.
+    """
+    dead = torch.isinf(ref) & (ref < 0)
+    assert not torch.isnan(got).any(), (
+        f"LSE has {int(torch.isnan(got).sum())} NaN entries "
+        f"({int((torch.isnan(got) & dead).sum())} of them on fully-masked rows)"
+    )
+    assert torch.equal(got[dead], ref[dead]), (
+        f"{int((got[dead] != float('-inf')).sum())} of {int(dead.sum())} "
+        "fully-masked rows are not -inf"
+    )
+    live = ~dead
+    if live.any():
+        assert (got[live] - ref[live]).abs().max().item() < FP8_LSE_MAX_ERR
+
+
 def _run_fp8_shape(
     causal,
     batch=1,
@@ -1131,6 +1152,12 @@ def test_fp8_dispatch_rejects_unsupported(unsupported):
         (True, 1, 1024, 4096, 8, 1, 128, 128, 4),
         (False, 2, 512, 512, 8, 8, 128, 128, 2),
         (True, 1, 512, 2048, 12, 12, 192, 128, 4),
+        # Skv < Sq: bottom-right causal leaves the leading Sq-Skv rows with no
+        # visible key, so their LSE must be -inf rather than NaN.
+        (True, 1, 1024, 128, 8, 8, 128, 128, None),
+        (True, 1, 2048, 256, 16, 4, 128, 128, None),
+        (True, 1, 1024, 128, 8, 8, 192, 128, None),
+        (True, 1, 1024, 128, 8, 8, 128, 128, 4),
     ],
 )
 def test_fp8_return_lse_dense(causal, B, S, Skv, H, H_KV, D, Dv, splits):
@@ -1170,7 +1197,7 @@ def test_fp8_return_lse_dense(causal, B, S, Skv, H, H_KV, D, Dv, splits):
     assert torch.equal(out, out_only), "return_lse must not perturb O"
 
     ref = _ref_lse(_fp8_dequant(q, q_s), _fp8_dequant(k, k_s), causal)
-    assert (lse - ref).abs().max().item() < FP8_LSE_MAX_ERR
+    _assert_lse_matches(lse, ref)
 
 
 @_gfx950_only
@@ -1233,8 +1260,132 @@ def test_fp8_return_lse_varlen(causal, vl_q, vl_kv, H, H_KV, D, Dv, splits):
             k_r[cukv[b] : cukv[b + 1]].unsqueeze(0),
             causal,
         )[0]
-        got = lse[:, cuq[b] : cuq[b + 1]]
-        assert (got - ref).abs().max().item() < FP8_LSE_MAX_ERR
+        _assert_lse_matches(lse[:, cuq[b] : cuq[b + 1]], ref)
+
+
+@_gfx950_only
+@pytest.mark.parametrize("block_m", [128, 256])
+@pytest.mark.parametrize("splits", [1, 4])
+@pytest.mark.parametrize("S, Skv", [(1024, 128), (2048, 256)])
+def test_fp8_lse_fully_masked_rows_are_neg_inf(block_m, splits, S, Skv):
+    """Every dead row's LSE is exactly -inf, on every tile/split configuration.
+
+    Bottom-right causal with Skv < Sq leaves the leading Sq-Skv rows with no
+    visible key. The kernel used to seed the running max with a compile-time -inf
+    and compile with nnan+ninf fast math, so a q-block whose causal window is
+    empty carried poison into the epilogue and wrote NaN for a varying handful of
+    those rows on each launch -- hence the repeat loop rather than a single call.
+    """
+    from aiter.ops.flydsl.kernels.flash_attn_func_fp8_gfx950 import (
+        flydsl_flash_attn_fp8_func,
+    )
+
+    B, H, D = 1, 32, 128
+    torch.manual_seed(0)
+
+    def _t(*shape):
+        return torch.empty(*shape, dtype=torch.bfloat16, device="cuda").uniform_(
+            *FP8_UNIFORM_RANGE
+        )
+
+    q, q_s = _fp8_quant(_t(B, S, H, D))
+    k, k_s = _fp8_quant(_t(B, Skv, H, D))
+    v, v_s = _fp8_quant(_t(B, Skv, H, D))
+
+    for _ in range(4):
+        # Sentinel-filled so "never written" is distinguishable from "wrote NaN".
+        lse = torch.full((B, H, S), 1.2345e-7, dtype=torch.float32, device="cuda")
+        out, lse = flydsl_flash_attn_fp8_func(
+            q,
+            k,
+            v,
+            causal=True,
+            fp8_block_m=block_m,
+            num_kv_splits=splits,
+            q_descale=q_s,
+            k_descale=k_s,
+            v_descale=v_s,
+            return_lse=True,
+            lse=lse,
+        )
+        torch.cuda.synchronize()
+        dead_lse = lse[:, :, : S - Skv]
+        assert (dead_lse == float("-inf")).all(), (
+            f"{int((dead_lse != float('-inf')).sum())} of {dead_lse.numel()} "
+            f"fully-masked rows are not -inf "
+            f"(NaN={int(torch.isnan(dead_lse).sum())}, "
+            f"unwritten={int((dead_lse == 1.2345e-7).sum())})"
+        )
+        assert torch.isfinite(lse[:, :, S - Skv :]).all(), "live rows must be finite"
+        assert (out[:, : S - Skv].float() == 0).all(), "fully-masked rows of O are zero"
+
+
+@_gfx950_only
+@pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize(
+    "vl_q, vl_kv",
+    [
+        ([256, 128, 64], [512, 0, 300]),  # zero-length KV in the middle
+        ([256, 128], [0, 384]),  # zero-length KV first
+        ([256, 128], [0, 0]),  # every entry empty
+    ],
+)
+def test_fp8_varlen_zero_length_kv_entry(causal, vl_q, vl_kv):
+    """A varlen entry with no KV tokens yields O == 0 and LSE == -inf, not NaN.
+
+    MLA chunked prefill produces ``seqlen_kv == 0`` entries routinely, and the
+    downstream merge consumes LSE, so a NaN here spreads across the whole layer.
+    """
+    from aiter.ops.flydsl.kernels.flash_attn_func_fp8_gfx950 import (
+        flydsl_flash_attn_fp8_func,
+    )
+
+    H, D = 8, 128
+    torch.manual_seed(0)
+    cuq, cukv = [0], [0]
+    for a, b in zip(vl_q, vl_kv):
+        cuq.append(cuq[-1] + a)
+        cukv.append(cukv[-1] + b)
+
+    def _t(*shape):
+        return torch.empty(*shape, dtype=torch.bfloat16, device="cuda").uniform_(
+            *FP8_UNIFORM_RANGE
+        )
+
+    q, q_s = _fp8_quant(_t(cuq[-1], H, D))
+    # k/v still need a real allocation when every entry is empty.
+    k, k_s = _fp8_quant(_t(max(cukv[-1], 1), H, D))
+    v, v_s = _fp8_quant(_t(max(cukv[-1], 1), H, D))
+
+    out, lse = flydsl_flash_attn_fp8_func(
+        q,
+        k,
+        v,
+        causal=causal,
+        cu_seqlens_q=torch.tensor(cuq, dtype=torch.int32, device="cuda"),
+        cu_seqlens_kv=torch.tensor(cukv, dtype=torch.int32, device="cuda"),
+        max_seqlen_q=max(vl_q),
+        max_seqlen_kv=max(max(vl_kv), 1),
+        cross_seqlen=True,
+        q_descale=q_s,
+        k_descale=k_s,
+        v_descale=v_s,
+        return_lse=True,
+    )
+    torch.cuda.synchronize()
+
+    assert not torch.isnan(out.float()).any(), "empty KV entry must not give NaN in O"
+    assert not torch.isnan(lse).any(), "empty KV entry must not produce NaN in LSE"
+    for b, n_kv in enumerate(vl_kv):
+        if n_kv:
+            continue
+        o_b = out[cuq[b] : cuq[b + 1]].float()
+        lse_b = lse[:, cuq[b] : cuq[b + 1]]
+        assert (o_b == 0).all(), f"entry {b} has {int((o_b != 0).sum())} non-zero O"
+        assert (lse_b == float("-inf")).all(), (
+            f"entry {b} has {int((lse_b != float('-inf')).sum())} LSE entries "
+            "that are not -inf"
+        )
 
 
 @_gfx950_only

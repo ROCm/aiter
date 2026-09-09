@@ -269,7 +269,15 @@ def build_flash_attn_dualwave_swp_fp8_module(
             _stagger_extra_barrier_if_one(ctx.stagger_i32)
         _pp_prio(1)
 
-        m_row = ctx.c_neg_inf
+        # Seed the running max at the same floor `floor_masked_max` clamps every
+        # tile max to, not -inf: max(floor, m_tile) == max(-inf, m_tile) for any
+        # tile the kernel can produce, but the kernel compiles with fast fp math
+        # (nnan+ninf), under which a *compile-time* -inf reaching an arithmetic op
+        # is poison. A q-block whose causal window is empty skips the tile loop
+        # entirely and carries this seed straight into `m_row * c_logit_scale` in
+        # the epilogue, so with -inf that multiply yields a garbage register and
+        # the fully-masked row's LSE comes out NaN instead of -inf.
+        m_row = ctx.c_neg_floor
         l_row = ctx.c_zero_f
         v_o = [ctx.c_zero_v16f32 for _ in range_constexpr(D_CHUNKS)]
 
@@ -527,9 +535,15 @@ def build_flash_attn_dualwave_swp_fp8_module(
             raise ValueError(
                 "num_kv_splits > 1 requires a fp32 workspace (see dualwave_splitk_workspace_elems)"
             )
-        # O is bf16 and would be corrupted by the fp32 LSE stores.
-        if RETURN_LSE and lse is None:
-            raise ValueError("return_lse=True requires a fp32 lse tensor")
+        # O is bf16 and would be corrupted by the fp32 LSE stores. lse_stride_h
+        # sizes the LSE buffer descriptor, so leaving it at 0 gives num_records=0
+        # and the hardware silently drops every LSE store.
+        if RETURN_LSE and (lse is None or not lse_stride_h):
+            raise ValueError(
+                "return_lse=True requires a fp32 lse tensor and a non-zero "
+                f"lse_stride_h, got lse={'None' if lse is None else 'tensor'}, "
+                f"lse_stride_h={lse_stride_h}"
+            )
         ws = workspace if SPLITK else O
         return (
             Q,
