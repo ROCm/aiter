@@ -506,6 +506,37 @@ def _run_fp8_into_nan_out(q, k, v, head_dim_v, **kwargs):
 
 @_gfx950_only
 @pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize("num_heads,num_kv_heads", [(16, 1), (32, 8), (12, 12)])
+@pytest.mark.parametrize("seq_len", [4096, 8192])
+def test_fp8_gqa_dense(causal, num_heads, num_kv_heads, seq_len):
+    _run_fp8_shape(
+        causal,
+        batch=1,
+        seq_len=seq_len,
+        num_heads=num_heads,
+        num_kv_heads=num_kv_heads,
+        head_dim=128,
+        head_dim_v=128,
+    )
+
+
+@_gfx950_only
+@pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize("num_heads,num_kv_heads", [(16, 1), (32, 8)])
+def test_fp8_gqa_varlen(causal, num_heads, num_kv_heads):
+    _run_fp8_shape(
+        causal,
+        num_heads=num_heads,
+        num_kv_heads=num_kv_heads,
+        head_dim=128,
+        head_dim_v=128,
+        varlen_seqlens_q=FP8_VARLEN_Q_SEQLENS[2],
+        varlen_seqlens_kv=FP8_VARLEN_KV_SEQLENS[2],
+    )
+
+
+@_gfx950_only
+@pytest.mark.parametrize("causal", [False, True])
 @pytest.mark.parametrize(
     "batch,seq_len", [(1, 4096), (2, 4096), (3, 4096), (4, 4096), (1, 8192)]
 )
@@ -792,6 +823,7 @@ def test_fp8_default_is_the_lazy_rescale():
     torch.testing.assert_close(default.float(), lazy.float(), rtol=0, atol=0)
 
 
+@_gfx950_only
 def test_fp8_rescale_threshold_drops_past_the_long_sequence_bound():
     """fp8 picks its rescale threshold from the KV length.
 
@@ -810,28 +842,25 @@ def test_fp8_rescale_threshold_drops_past_the_long_sequence_bound():
     assert {f(s) for s in (1, 1024, 4096, 4097, 8192, 131072)} == {6.0, 4.0}
 
 
+@_gfx950_only
 @pytest.mark.parametrize(
-    "batch,num_heads,seqlen_q,seqlen_kv,causal,expect",
+    "batch,num_heads,seqlen_q,seqlen_kv,expect",
     [
-        (1, 8, 512, 512, True, 128),
-        (1, 8, 2048, 2048, True, 128),
-        (1, 8, 2048, 2048, False, 128),
-        (8, 32, 2048, 2048, True, 256),
-        (16, 32, 1024, 1024, True, 256),
-        (32, 32, 512, 512, True, 256),
-        (1, 8, 4096, 4096, True, 256),
-        (1, 8, 4096, 16384, True, 256),
-        (2, 8, 4096, 4096, True, 256),
+        (1, 8, 512, 512, 128),
+        (1, 8, 2048, 2048, 128),
+        (8, 32, 2048, 2048, 256),
+        (16, 32, 1024, 1024, 256),
+        (32, 32, 512, 512, 256),
+        (1, 8, 4096, 4096, 256),
+        (1, 8, 4096, 16384, 256),
+        (2, 8, 4096, 4096, 256),
     ],
 )
-def test_fp8_auto_block_m_picks(batch, num_heads, seqlen_q, seqlen_kv, causal, expect):
+def test_fp8_auto_block_m_picks(batch, num_heads, seqlen_q, seqlen_kv, expect):
     """Pin what ``_fp8_auto_block_m`` chooses; correctness tests pass either way."""
     from aiter.ops.flydsl.kernels import flash_attn_func_fp8_gfx950 as fa
 
-    assert (
-        fa._fp8_auto_block_m(batch, num_heads, seqlen_q, seqlen_kv, causal, 256)
-        == expect
-    )
+    assert fa._fp8_auto_block_m(batch, num_heads, seqlen_q, seqlen_kv, 256) == expect
 
 
 @_gfx950_only
@@ -893,7 +922,14 @@ def test_fp8_flat_overflow_guard_covers_every_tensor(monkeypatch, case):
     qq, qs = _fp8_quant(q)
     kq, ks = _fp8_quant(k)
     vq, vs = _fp8_quant(v)
-    kw = {"causal": False, "q_descale": qs, "k_descale": ks, "v_descale": vs}
+    kw = {
+        "causal": False,
+        "q_descale": qs,
+        "k_descale": ks,
+        "v_descale": vs,
+        "fp8_block_m": 256,
+        "num_kv_splits": 1,
+    }
 
     if case == "kv_only_over_limit":
         # Between q's count and k's, so only the K/V check can fire. B=2 splits.

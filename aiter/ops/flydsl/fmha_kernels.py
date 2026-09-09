@@ -219,6 +219,20 @@ def flydsl_flash_attn_func(
     return o_p
 
 
+@lru_cache(maxsize=64)
+def _fp8_gfx950_buildable(head_dim: int, head_dim_v: int) -> bool:
+    from .kernels.fmha_gfx950.pipeline import _make_dualwave_swp_fp8_traits
+
+    for block_m in (128, 256):
+        try:
+            _make_dualwave_swp_fp8_traits(
+                1, 1, head_dim, 6.0, head_dim_v=head_dim_v, block_m=block_m
+            )
+        except RuntimeError:
+            return False
+    return True
+
+
 def _fp8_gfx950_supported(
     q,
     k,
@@ -250,7 +264,7 @@ def _fp8_gfx950_supported(
         return False
     if not (q.dtype == k.dtype == v.dtype == torch.float8_e4m3fn):
         return False
-    if out is not None and out.dtype != torch.bfloat16:
+    if out is not None and (out.dtype != torch.bfloat16 or not out.is_contiguous()):
         return False
     if any(
         s is None
@@ -265,11 +279,11 @@ def _fp8_gfx950_supported(
         softmax_scale, 1.0 / math.sqrt(qk_hdim), rel_tol=1e-6
     ):
         return False
+    if not _fp8_gfx950_buildable(qk_hdim, v.shape[-1]):
+        return False
     nq, nkv = q.shape[-2], k.shape[-2]
     return (
-        qk_hdim >= 64
-        and qk_hdim % 32 == 0
-        and k.shape[-1] == qk_hdim
+        k.shape[-1] == qk_hdim
         and nkv > 0
         and nq % nkv == 0
         and not return_lse
@@ -316,7 +330,7 @@ def flydsl_flash_attn_varlen_func(
     from ...jit.core import is_experimental_enabled
     from ...jit.utils.chip_info import get_gfx
 
-    if _fp8_gfx950_supported(
+    if q.dim() == 3 and _fp8_gfx950_supported(
         q,
         k,
         v,

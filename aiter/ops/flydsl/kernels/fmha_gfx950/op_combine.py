@@ -176,26 +176,6 @@ class DualwaveSplitKCombineHelper(DualwaveSplitKCombineContext):
             m_max = fx.maxnumf(m_max, m_s[i + 1])
         return m_max
 
-    def fold_sink(self, m_max, bias_log2e):
-        sink_rsrc = buffer_ops.create_buffer_resource_from_addr(
-            as_mlir_value(fx.Int64(fx.ptrtoint(fx.get_iter(self.Sink)))),
-            num_records_bytes=as_mlir_value(fx.Int64(self.traits.NUM_HEADS_Q * 4)),
-        )
-        sink_f32 = buffer_ops.buffer_load(
-            sink_rsrc,
-            as_mlir_value(fx.Int32(self.q_head_idx)),
-            vec_width=1,
-            dtype=T.f32,
-        )
-
-        sink_log2 = sink_f32 * fx.Float32(bias_log2e)
-        m_new = fx.maxnumf(m_max, sink_log2)
-        sink_w = rocdl.exp2(T.f32, as_mlir_value(sink_log2 - m_new))
-        return m_new, sink_w
-
-    def add_sink_den(self, den, sink_w):
-        return den + sink_w
-
     def init_accumulators(self):
         return as_mlir_value(self.c_zero_v4f32), as_mlir_value(self.c_zero_f)
 
@@ -237,24 +217,6 @@ class DualwaveSplitKCombineHelper(DualwaveSplitKCombineContext):
         lo = rocdl.cvt_pk_bf16_f32(out4[0], out4[1])
         hi = rocdl.cvt_pk_bf16_f32(out4[2], out4[3])
         return Vec.from_elements([fx.Int32(lo), fx.Int32(hi)], fx.Int32)
-
-    def store_lse(self, m_max, den):
-        # Combined LSE = m_max * ln2 + ln(den); den = sum_s 2^(m_s - m_max) * l_s
-        # completes the natural-log, scale-folded LSE. One lane (col == 0) writes.
-        lse_base_i64 = fx.Int64(fx.ptrtoint(fx.get_iter(self.LSE)))
-        lse_per_batch_elems = self.traits.NUM_HEADS_Q * self.seq_len_v
-        lse_per_batch_bytes = lse_per_batch_elems * 4
-        lse_rsrc = _make_ws_rsrc(
-            lse_base_i64, self.batch_idx * lse_per_batch_bytes, lse_per_batch_bytes
-        )
-        lse_val = m_max * self.c_ln2_f + fx.log(den, fastmath=self.fm_fast)
-        lse_in_range = self.row_valid.select(self.local_ml_idx, lse_per_batch_elems)
-        lse_off = fx.Index((self.col == 0).select(lse_in_range, lse_per_batch_elems))
-        buffer_ops.buffer_store(
-            as_mlir_value(fx.Float32(lse_val)),
-            lse_rsrc,
-            as_mlir_value(fx.Int32(lse_off)),
-        )
 
     def store_output(self, o_pack):
         o_global = (

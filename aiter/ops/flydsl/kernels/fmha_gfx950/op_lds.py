@@ -34,15 +34,6 @@ class DualwaveFp8QLoader(DualwaveFp8KernelContext):
             lds_addr = self.lds_q_base_idx + c * 16
             self.buffer_load_lds_128(self.q_div, lds_addr, src_elem, 0)
 
-    def load_all_wide(self, q_row_in_block):
-        traits = self.traits
-        d_base = self.lane_div_32 * 32
-        packs = []
-        for ws in range_constexpr(traits.HEAD_DIM // 64):
-            byte_row = q_row_in_block * traits.HEAD_DIM + (ws * 64) + d_base
-            packs.append(self.read_i32x8_lds(self.lds_q_base_ptr, fx.Int32(byte_row)))
-        return packs
-
 
 class DualwaveFp8KvGmemToLdsLoader(DualwaveFp8KernelContext):
     def __init__(self, ctx):

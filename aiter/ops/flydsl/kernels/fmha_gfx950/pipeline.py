@@ -22,13 +22,9 @@ _LOG2E = host_math.log2(host_math.e)
 
 
 # gfx950 (MI350/MI355X): 8 XCDs, each with a private ~4 MB L2.
-NUM_XCD_GFX950 = 8
 
 
 LDS_BYTES_GFX950 = 160 * 1024
-
-
-MIN_Q_BLOCKS_XCD_SWIZZLE = 64
 
 
 # The dual-wave 8-wave CTA fixes the q-block height; callers need it to count
@@ -159,17 +155,6 @@ def _anchor_v_p(traits, v_p, elem_dtype):
             p_vec.shuffle(p_vec, [hi_base + i for i in range(8)]).ir_value()
         )
     return anchored_lo, anchored_hi
-
-
-def _v_pair_to_vec32(v):
-    return _concat_vectors(v[0], v[1]).ir_value()
-
-
-def _v_vec32_to_pair(v):
-    v_vec = Vec(v, (32,), fx.Float32)
-    v_lo = v_vec.shuffle(v_vec, [i for i in range(16)]).ir_value()
-    v_hi = v_vec.shuffle(v_vec, [16 + i for i in range(16)]).ir_value()
-    return v_lo, v_hi
 
 
 def _v_p_to_vec32(v_p):
@@ -444,13 +429,11 @@ class DualwaveSwpFp8Traits:
     DUALWAVE_SWP_KV_PER_BUFFER: int
     LDS_KV_TOTAL_SIZE: int
     DUALWAVE_SWP_K_BUF_BASE: tuple[int, int]
-    DUALWAVE_SWP_V_BUF_BASE: tuple[int, int]
     VT_BF16_TOTAL: int
     DUALWAVE_SWP_RESCALE_THRESHOLD: float
     SCHED_MFMA_MASK: int
     SCHED_DS_READ_MASK: int
     NEG_INF_F32_BITS: int
-    XCD_SWIZZLE: bool = False
     BATCH_INTERLEAVE_GROUP: int = 1
 
     @property
@@ -480,7 +463,6 @@ class DualwaveSwpFp8Traits:
             self.LANE_SPLIT_KV,
             self.VT_BF16_TOTAL,
             self.NUM_PREFETCH_K,
-            self.XCD_SWIZZLE,
             self.BATCH_INTERLEAVE_GROUP,
             self.BLOCK_M,
             self.BLOCK_SIZE,
@@ -504,7 +486,6 @@ def _make_dualwave_swp_fp8_traits(
     num_kv_splits=1,
     varlen=False,
     cross_seqlen=False,
-    xcd_swizzle=False,
     batch_interleave_group=1,
 ):
     """Build gfx950 DUALWAVE_SWP fp8 compile-time layout traits.
@@ -578,10 +559,6 @@ def _make_dualwave_swp_fp8_traits(
     dualwave_swp_k_buf_base = tuple(
         i * dualwave_swp_kv_per_buffer for i in range(num_prefetch_k)
     )
-    dualwave_swp_v_buf_base = tuple(
-        smem_k_tile_elems + i * dualwave_swp_kv_per_buffer
-        for i in range(num_prefetch_k)
-    )
 
     # The +128 covers the alignment the DMA base is rounded up to.
     eb_bf = 2
@@ -650,13 +627,11 @@ def _make_dualwave_swp_fp8_traits(
         DUALWAVE_SWP_KV_PER_BUFFER=dualwave_swp_kv_per_buffer,
         LDS_KV_TOTAL_SIZE=lds_kv_total_size,
         DUALWAVE_SWP_K_BUF_BASE=dualwave_swp_k_buf_base,
-        DUALWAVE_SWP_V_BUF_BASE=dualwave_swp_v_buf_base,
         VT_BF16_TOTAL=vt_bf16_total,
         DUALWAVE_SWP_RESCALE_THRESHOLD=rescale_threshold,
         SCHED_MFMA_MASK=0x008,
         SCHED_DS_READ_MASK=0x100,
         NEG_INF_F32_BITS=0xFF800000,
-        XCD_SWIZZLE=bool(xcd_swizzle),
         BATCH_INTERLEAVE_GROUP=int(batch_interleave_group),
     )
 
@@ -686,19 +661,7 @@ def _init_dualwave_thread_mapping(ctx):
     # so output is bit-identical; split-K's third grid axis would not survive it.
     # Non-causal only: under a causal mask q-block i does work proportional to i, so
     # making q_block the fast axis clusters unequal work and costs 7% (measured).
-    if const_expr(
-        traits.XCD_SWIZZLE
-        and not traits.SPLITK
-        and not traits.CAUSAL
-        and traits.NUM_HEADS_Q % NUM_XCD_GFX950 == 0
-    ):
-        num_q_blocks = fx.Index(gpu.grid_dim.y)
-        linear_wg = fx.Index(gpu.block_idx.x) + fx.Index(gpu.block_idx.y) * fx.Index(
-            traits.NUM_HEADS_Q
-        )
-        ctx.h_idx = linear_wg // num_q_blocks
-        ctx.q_block_idx = linear_wg % num_q_blocks
-    elif const_expr(batch_interleave_group > 1):
+    if const_expr(batch_interleave_group > 1):
         linear_head_batch = fx.Index(gpu.block_idx.x)
         ctx.h_idx = linear_head_batch % traits.NUM_HEADS_Q
         ctx.batch_idx = (
@@ -768,7 +731,7 @@ class DualwaveFp8KernelContext:
         K=None,
         V=None,
         O=None,
-        DebugCounts=None,
+        Workspace=None,
         CuSeqQ=None,
         CuSeqKv=None,
         QDescale=None,
@@ -790,7 +753,7 @@ class DualwaveFp8KernelContext:
         self.K = K
         self.V = V
         self.O = O
-        self.DebugCounts = DebugCounts
+        self.Workspace = Workspace
         self.CuSeqQ = CuSeqQ
         self.CuSeqKv = CuSeqKv
         self.QDescale = QDescale
@@ -807,11 +770,8 @@ class DualwaveFp8KernelContext:
         self.elem_dtype = fx.Float8E4M3FN
         self.fm_fast = fx.arith.FastMathFlags.fast
         self.v4i32_type = Vec.make_type(4, fx.Int32)
-        self.v4f16_type = Vec.make_type(4, self.elem_dtype)
         self.v16f32_type = Vec.make_type(16, fx.Float32)
         self.v2i32_type = Vec.make_type(2, fx.Int32)
-        self.p_elem = fx.BFloat16
-        self.v4bf16_type = Vec.make_type(4, fx.BFloat16)
         self.NUM_DMA_K = len(traits.K_BAND_CHUNK)
         self.c_neg_inf = fx.Float32(float("-inf"))
         self.c_neg_floor = fx.Float32(-3.0e38)
@@ -1039,7 +999,7 @@ class DualwaveFp8KernelContext:
     def init_workspace_io(self):
         if const_expr(self.traits.SPLITK):
             self.ws_div = fx.logical_divide(
-                fx.rocdl.make_buffer_tensor(self.DebugCounts), fx.make_layout(1, 1)
+                fx.rocdl.make_buffer_tensor(self.Workspace), fx.make_layout(1, 1)
             )
             self.ws_store_atom_32 = fx.make_copy_atom(
                 fx.rocdl.BufferCopy32b(), fx.Int32
@@ -1073,26 +1033,6 @@ class DualwaveFp8KernelContext:
         if const_expr(isinstance(buf_id, int)):
             return traits.DUALWAVE_SWP_K_BUF_BASE[buf_id]
         return buf_id * traits.DUALWAVE_SWP_KV_PER_BUFFER
-
-    def v_buf_base(self, buf_id):
-        traits = self.traits
-        if const_expr(isinstance(buf_id, int)):
-            return traits.DUALWAVE_SWP_V_BUF_BASE[buf_id]
-        return traits.SMEM_K_TILE_ELEMS + buf_id * traits.DUALWAVE_SWP_KV_PER_BUFFER
-
-    def v_pair_to_vec32(self, v):
-        return _v_pair_to_vec32(v)
-
-    def v_vec32_to_pair(self, v):
-        return _v_vec32_to_pair(v)
-
-    def bf16_trunc_pack_v8(self, f32_vals):
-        # HIPREC carries P/V as v8 bf16 regardless of the fp8 element dtype:
-        # pack 8 f32 -> 4 cvt_pk_bf16 dwords.
-        pairs = []
-        for j in range_constexpr(4):
-            pairs.append(rocdl.cvt_pk_bf16_f32(f32_vals[j * 2], f32_vals[j * 2 + 1]))
-        return Vec.from_elements(pairs, fx.Int32).bitcast(fx.BFloat16).ir_value()
 
     def buffer_load_128(self, elem_index):
         return _buffer_load_128(

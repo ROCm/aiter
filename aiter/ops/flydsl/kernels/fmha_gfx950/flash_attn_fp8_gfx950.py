@@ -4,8 +4,6 @@
 
 """gfx950 DUALWAVE_SWP FP8 flash attention."""
 
-import os
-
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl.compiler.kernel_function import CompilationContext
@@ -27,8 +25,6 @@ from aiter.ops.flydsl.kernels.fmha_gfx950.op_lds import (
 )
 from aiter.ops.flydsl.kernels.fmha_gfx950.op_softmax import DualwaveFp8SoftmaxHelper
 from aiter.ops.flydsl.kernels.fmha_gfx950.pipeline import (
-    MIN_Q_BLOCKS_XCD_SWIZZLE,
-    NUM_XCD_GFX950,
     DualwaveFp8KernelContext,
     _make_dualwave_swp_fp8_traits,
     _s_setprio,
@@ -55,7 +51,6 @@ def build_flash_attn_dualwave_swp_fp8_module(
     varlen=False,
     cross_seqlen=False,
     block_m=256,
-    _xcd_swizzle=False,
     batch_interleave_group=1,
 ):
     """Build the gfx950 dual-wave fp8 launcher (dense, packed varlen, or split-K)."""
@@ -91,7 +86,6 @@ def build_flash_attn_dualwave_swp_fp8_module(
         num_kv_splits=num_kv_splits,
         varlen=varlen,
         cross_seqlen=cross_seqlen,
-        xcd_swizzle=_xcd_swizzle,
         batch_interleave_group=batch_interleave_group,
     )
     # Builder-level aliases used by SharedStorage and the launch/compile wrappers.
@@ -123,7 +117,7 @@ def build_flash_attn_dualwave_swp_fp8_module(
         K: fx.Tensor,
         V: fx.Tensor,
         O: fx.Tensor,
-        DebugCounts: fx.Tensor,
+        Workspace: fx.Tensor,
         CuSeqQ: fx.Tensor,
         CuSeqKv: fx.Tensor,
         QDescale: fx.Tensor,
@@ -141,7 +135,7 @@ def build_flash_attn_dualwave_swp_fp8_module(
             K,
             V,
             O,
-            DebugCounts,
+            Workspace,
             CuSeqQ,
             CuSeqKv,
             QDescale,
@@ -180,20 +174,17 @@ def build_flash_attn_dualwave_swp_fp8_module(
         t0 = ctx.split_t0
         t_end = ctx.split_t_end
 
-        PP = const_expr(int(os.environ.get("FA_PP", "1")))
-        PP_PRIO = const_expr(int(os.environ.get("FA_PP_PRIO", "0")))
-        TPV = const_expr(int(os.environ.get("FA_TPV", "1")))
-
         def _pp_prio(v):
-            if const_expr(PP_PRIO):
+            if const_expr(traits.DUALWAVE_SWP_SETPRIO):
                 _s_setprio(v)
 
+        DMA_PER_ITER = const_expr(dualwave_fp8_dma_per_iter(traits))
+
         def _phase_bar():
+            _waitcnt_vm_n(DMA_PER_ITER)
             rocdl.sched_barrier(0)
             rocdl.s_barrier()
             rocdl.sched_barrier(0)
-
-        DMA_PER_ITER = const_expr(dualwave_fp8_dma_per_iter(traits))
 
         def _iter_end_bar():
             _waitcnt_vm_n(DMA_PER_ITER)
@@ -275,9 +266,9 @@ def build_flash_attn_dualwave_swp_fp8_module(
         rocdl.s_barrier()
         rocdl.sched_barrier(0)
 
-        if const_expr(PP):
+        if const_expr(traits.DUALWAVE_SWP_ENABLE_STAGGER):
             _stagger_extra_barrier_if_one(ctx.stagger_i32)
-            _pp_prio(1)
+        _pp_prio(1)
 
         m_row = ctx.c_neg_inf
         l_row = ctx.c_zero_f
@@ -306,11 +297,6 @@ def build_flash_attn_dualwave_swp_fp8_module(
 
             v_s_a = gemm_helper.qk(v_k_a, q_wide)
             v_s_b = gemm_helper.qk(v_k_b, q_wide)
-            if const_expr(not PP):
-                v_s_a = _mask_sub(v_s_a, j)
-                v_s_b = _mask_sub(v_s_b, j + 1)
-                v_s_a, v_s_b = _mask_pair(v_s_a, v_s_b, j)
-
             v_v_a = kv_lds_to_regs.load_v(a_buf)
 
             kv_gmem_to_lds.load_k((j + 4) * BN, f_a_buf)
@@ -318,45 +304,27 @@ def build_flash_attn_dualwave_swp_fp8_module(
             kv_gmem_to_lds.load_v((j + 4) * BN, f_a_buf)
             kv_gmem_to_lds.load_v((j + 5) * BN, f_b_buf)
 
-            if const_expr(PP):
-                _phase_bar()
-                _pp_prio(0)
-                v_s_a = _mask_sub(v_s_a, j)
-                v_s_b = _mask_sub(v_s_b, j + 1)
-                v_s_a, v_s_b = _mask_pair(v_s_a, v_s_b, j)
-                m_tile = _merge_tile_max(v_s_a, v_s_b)
-                v_o, m_new, l_row = _correct_o(v_o, m_row, l_row, m_tile)
-                v_o = softmax_helper.anchor_v_o(v_o)
-                v_p_a, l_row = _softmax_part(v_s_a, l_row, m_new)
-                _phase_bar()
-                _pp_prio(1)
-                v_v_b = kv_lds_to_regs.load_v(b_buf)
-                v_o = _pv_part(v_p_a, v_v_a, v_o)
-                _phase_bar()
-                _pp_prio(0)
-                v_p_b, l_row = _softmax_part(v_s_b, l_row, m_new)
-                m_row = m_new
+            _phase_bar()
+            _pp_prio(0)
+            v_s_a = _mask_sub(v_s_a, j)
+            v_s_b = _mask_sub(v_s_b, j + 1)
+            v_s_a, v_s_b = _mask_pair(v_s_a, v_s_b, j)
+            m_tile = _merge_tile_max(v_s_a, v_s_b)
+            v_o, m_new, l_row = _correct_o(v_o, m_row, l_row, m_tile)
+            v_o = softmax_helper.anchor_v_o(v_o)
+            v_p_a, l_row = _softmax_part(v_s_a, l_row, m_new)
+            _phase_bar()
+            _pp_prio(1)
+            v_v_b = kv_lds_to_regs.load_v(b_buf)
+            v_o = _pv_part(v_p_a, v_v_a, v_o)
+            _phase_bar()
+            _pp_prio(0)
+            v_p_b, l_row = _softmax_part(v_s_b, l_row, m_new)
+            m_row = m_new
 
-                if const_expr(TPV):
-                    _pp_prio(1)
-                    v_o = _pv_part(v_p_b, v_v_b, v_o)
-                    _iter_end_bar()
-                else:
-                    _iter_end_bar()
-                    _pp_prio(1)
-                    v_o = _pv_part(v_p_b, v_v_b, v_o)
-            else:
-                m_tile = _merge_tile_max(v_s_a, v_s_b)
-                v_o, m_new, l_row = _correct_o(v_o, m_row, l_row, m_tile)
-                v_o = softmax_helper.anchor_v_o(v_o)
-
-                v_o, l_row = _subtile_tail(v_s_a, v_v_a, v_o, l_row, m_new)
-                v_v_b = kv_lds_to_regs.load_v(b_buf)
-                v_o, l_row = _subtile_tail(v_s_b, v_v_b, v_o, l_row, m_new)
-                m_row = m_new
-
-                _iter_end_bar()
-
+            _pp_prio(1)
+            v_o = _pv_part(v_p_b, v_v_b, v_o)
+            _iter_end_bar()
             loop_results = yield [m_row, l_row] + v_o + [nn_a_buf]
         m_row = loop_results[0]
         l_row = loop_results[1]
@@ -412,7 +380,7 @@ def build_flash_attn_dualwave_swp_fp8_module(
         K: fx.Tensor,
         V: fx.Tensor,
         O: fx.Tensor,
-        DebugCounts: fx.Tensor,
+        Workspace: fx.Tensor,
         CuSeqQ: fx.Tensor,
         CuSeqKv: fx.Tensor,
         QDescale: fx.Tensor,
@@ -452,7 +420,7 @@ def build_flash_attn_dualwave_swp_fp8_module(
             K,
             V,
             O,
-            DebugCounts,
+            Workspace,
             CuSeqQ,
             CuSeqKv,
             QDescale,
@@ -484,7 +452,7 @@ def build_flash_attn_dualwave_swp_fp8_module(
             else:
                 stride_o_n = fx.Int32(DEFAULT_STRIDE_O_N)
             flash_attn_splitk_combine_kernel(
-                O, DebugCounts, CuSeqQ, batch_size, seq_len, stride_o_n
+                O, Workspace, CuSeqQ, batch_size, seq_len, stride_o_n
             ).launch(
                 grid=(combine_blocks, bs_idx, 1),
                 block=(COMBINE_BLOCK, 1, 1),
@@ -513,7 +481,7 @@ def build_flash_attn_dualwave_swp_fp8_module(
         stride_kv_n=None,
         stride_q_n=None,
         head_dim_runtime=None,
-        debug_counts=None,
+        workspace_arg=None,
         *,
         seq_len_kv=None,
         workspace=None,
@@ -543,9 +511,9 @@ def build_flash_attn_dualwave_swp_fp8_module(
                 raise ValueError(
                     "num_kv_splits > 1 requires a fp32 workspace (see dualwave_splitk_workspace_elems)"
                 )
-            debug_counts = workspace
-        if debug_counts is None:
-            debug_counts = O
+            workspace_arg = workspace
+        if workspace_arg is None:
+            workspace_arg = O
         # Dense launches still pass valid tensors for the (unused) cu_seqlens slots;
         # the kernel only reads them under const_expr(VARLEN). Use O as a placeholder.
         if cu_seqlens_q is None:
@@ -567,7 +535,7 @@ def build_flash_attn_dualwave_swp_fp8_module(
                 K,
                 V,
                 O,
-                debug_counts,
+                workspace_arg,
                 cu_seqlens_q,
                 cu_seqlens_kv,
                 q_descale,
@@ -592,7 +560,7 @@ def build_flash_attn_dualwave_swp_fp8_module(
         stride_kv_n=None,
         stride_q_n=None,
         head_dim_runtime=None,
-        debug_counts=None,
+        workspace_arg=None,
         *,
         seq_len_kv=None,
         workspace=None,
@@ -616,9 +584,9 @@ def build_flash_attn_dualwave_swp_fp8_module(
                 raise ValueError(
                     "num_kv_splits > 1 requires a fp32 workspace (see dualwave_splitk_workspace_elems)"
                 )
-            debug_counts = workspace
-        if debug_counts is None:
-            debug_counts = O
+            workspace_arg = workspace
+        if workspace_arg is None:
+            workspace_arg = O
         if cu_seqlens_q is None:
             cu_seqlens_q = O
         if cu_seqlens_kv is None:
@@ -636,7 +604,7 @@ def build_flash_attn_dualwave_swp_fp8_module(
                 K,
                 V,
                 O,
-                debug_counts,
+                workspace_arg,
                 cu_seqlens_q,
                 cu_seqlens_kv,
                 q_descale,
@@ -652,48 +620,5 @@ def build_flash_attn_dualwave_swp_fp8_module(
             )
 
     _launch.compile = _compile
-
-    if (
-        not _xcd_swizzle
-        and not causal
-        and not varlen
-        and NUM_KV_SPLITS == 1
-        and num_heads % NUM_XCD_GFX950 == 0
-    ):
-        block_m = traits.BLOCK_M
-        launch_xcd = build_flash_attn_dualwave_swp_fp8_module(
-            num_heads,
-            head_dim,
-            head_dim_v=head_dim_v,
-            causal=causal,
-            block_m=block_m,
-            num_kv_heads=num_kv_heads,
-            waves_per_eu=waves_per_eu,
-            daz=daz,
-            dualwave_swp_lazy_rescale=dualwave_swp_lazy_rescale,
-            rescale_threshold=rescale_threshold,
-            dualwave_swp_setprio=dualwave_swp_setprio,
-            dualwave_swp_enable_stagger=dualwave_swp_enable_stagger,
-            num_kv_splits=num_kv_splits,
-            varlen=varlen,
-            cross_seqlen=cross_seqlen,
-            batch_interleave_group=batch_interleave_group,
-            _xcd_swizzle=True,
-        )
-
-        def _pick(seq_len):
-            num_q_blocks = (int(seq_len) + block_m - 1) // block_m
-            return launch_xcd if num_q_blocks >= MIN_Q_BLOCKS_XCD_SWIZZLE else _launch
-
-        def _dispatch_launch(*args, **kwargs):
-            seq_len = args[5] if len(args) > 5 else kwargs["seq_len"]
-            return _pick(seq_len)(*args, **kwargs)
-
-        def _dispatch_compile(*args, **kwargs):
-            seq_len = args[5] if len(args) > 5 else kwargs["seq_len"]
-            return _pick(seq_len).compile(*args, **kwargs)
-
-        _dispatch_launch.compile = _dispatch_compile
-        return _dispatch_launch
 
     return _launch

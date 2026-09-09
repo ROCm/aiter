@@ -59,7 +59,7 @@ def _num_cu(device: torch.device) -> int:
 
 
 def _fp8_auto_block_m(
-    batch: int, num_heads: int, seqlen_q: int, seqlen_kv: int, causal: bool, num_cu: int
+    batch: int, num_heads: int, seqlen_q: int, seqlen_kv: int, num_cu: int
 ) -> int:
     """Pick BLOCK_M (256 wide / 128 narrow) for an fp8 shape."""
     kv_tiles = -(-seqlen_kv // _FP8_BLOCK_N)
@@ -245,13 +245,15 @@ def flydsl_flash_attn_fp8_func(
     # Q/K/V/O are flattened and the C-ABI packs the dynamic dim as int32, so no
     # tensor may reach 2**31. Batch entries are independent and a leading slice
     # stays contiguous, so one launch per entry divides the flat dim at no copy.
-    if max(q.numel(), k.numel(), v.numel()) >= _FP8_MAX_FLAT_ELEMS:
+    _out_elems = q.numel() // q.shape[-1] * v.shape[-1]
+    if max(q.numel(), k.numel(), v.numel(), _out_elems) >= _FP8_MAX_FLAT_ELEMS:
         _packed = cu_seqlens_q is not None or cu_seqlens_kv is not None or q.dim() != 4
         if _packed or q.shape[0] == 1:
             raise NotImplementedError(
                 "flydsl_flash_attn_fp8_func: fp8 flattens Q/K/V/O and packs the dynamic "
                 f"dim as int32, so no tensor may reach {_FP8_MAX_FLAT_ELEMS} elements; "
-                f"got q={q.numel()}, k={k.numel()}, v={v.numel()}. Shorten the sequence "
+                f"got q={q.numel()}, k={k.numel()}, v={v.numel()}, out={_out_elems}. "
+                "Shorten the sequence "
                 "or use bf16."
             )
         kw = {
@@ -379,7 +381,7 @@ def flydsl_flash_attn_fp8_func(
 
     _skv_eff = (int(max_seqlen_kv) if cross else Sq) if varlen else int(Skv)
     _block_m = (
-        _fp8_auto_block_m(B, H, Sq, _skv_eff, causal, _num_cu(q.device))
+        _fp8_auto_block_m(B, H, Sq, _skv_eff, _num_cu(q.device))
         if fp8_block_m is None
         else int(fp8_block_m)
     )
@@ -401,6 +403,12 @@ def flydsl_flash_attn_fp8_func(
         ws_elems = dualwave_splitk_workspace_elems(
             B, H, Sq, int(num_kv_splits), head_dim=Dv
         )
+        if ws_elems >= _FP8_MAX_FLAT_ELEMS:
+            raise NotImplementedError(
+                f"flydsl_flash_attn_fp8_func: num_kv_splits={int(num_kv_splits)} needs a "
+                f"{ws_elems}-element split-K workspace; the C-ABI packs the dynamic "
+                f"dim as int32 so it must stay under {_FP8_MAX_FLAT_ELEMS}"
+            )
 
     with torch.cuda.device(q.device.index):
         launch_stream = (
@@ -443,6 +451,11 @@ def flydsl_flash_attn_fp8_func(
             raise ValueError(
                 f"flydsl_flash_attn_fp8_func: fp8 output must be bf16, got {out.dtype}"
             )
+        elif not out.is_contiguous():
+            raise ValueError(
+                "flydsl_flash_attn_fp8_func: out must be contiguous, got strides "
+                f"{tuple(out.stride())} for shape {tuple(out.shape)}"
+            )
 
         # The fp8 gfx950 module takes flattened Q/K/V/O plus descale kwargs.
         q_flat = q.contiguous().view(-1)
@@ -457,9 +470,10 @@ def flydsl_flash_attn_fp8_func(
             "v_descale": v_descale,
         }
         if splitk:
-            kwargs["workspace"] = torch.empty(
-                ws_elems, dtype=torch.float32, device=q.device
-            )
+            _ws = torch.empty(ws_elems, dtype=torch.float32, device=q.device)
+            if stream is not None:
+                _ws.record_stream(launch_stream)
+            kwargs["workspace"] = _ws
         if varlen:
             kwargs.update(cu_seqlens_q=cu_seqlens_q, cu_seqlens_kv=cu_seqlens_kv)
             if cross:
@@ -467,5 +481,7 @@ def flydsl_flash_attn_fp8_func(
         elif cross:
             kwargs["seq_len_kv"] = Skv
         exe(q_flat, k_flat, v_flat, o_flat, B, Sq, **kwargs)
+        if stream is not None:
+            out.record_stream(launch_stream)
 
     return out

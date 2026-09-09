@@ -10,29 +10,23 @@ from flydsl._mlir import ir
 from flydsl._mlir.dialects import llvm
 from flydsl.expr import arith, const_expr, range_constexpr, rocdl
 from flydsl.expr.typing import T
-from flydsl.expr.typing import Vector as Vec
 from flydsl.expr.utils.arith import _to_raw as as_mlir_value
 
 from aiter.ops.flydsl.kernels.fmha_gfx950.pipeline import (
     DualwaveFp8KernelContext,
     _anchor_scalar_f32,
     _anchor_v_o,
-    _anchor_v_p,
     _apply_dualwave_causal_mask_pair,
     _attn_mask_vec2_imm,
     _causal_pair_thresholds,
     _exp2_score_slice,
-    _pack_p_v8_slices,
     _read_exec_i64,
-    _safe_l_inv,
     _scale_o_accs,
     _scale_sub_score_pair,
     _score_lists_to_vecs,
     _score_pair_max,
     _score_pair_sum,
     _score_pair_to_lists,
-    _v_p_to_vec32,
-    _v_vec32_to_p,
 )
 
 
@@ -66,23 +60,6 @@ class DualwaveFp8SoftmaxHelper(DualwaveFp8KernelContext):
         pair_thresholds = _causal_pair_thresholds(False)
         _apply_dualwave_causal_mask_pair(s_lo, rel_lo_i32, neg_inf_i32, pair_thresholds)
         _apply_dualwave_causal_mask_pair(s_hi, rel_hi_i32, neg_inf_i32, pair_thresholds)
-
-    def causal_mask_prologue_if_needed(self, v_s, tile_idx=None, kv_end_pos=None):
-        if tile_idx is None:
-            tile_idx = 0
-        if kv_end_pos is None:
-            kv_end_pos = self.traits.BLOCK_N
-
-        @flyc.jit
-        def _run(v_s, tile_idx=tile_idx, kv_end_pos=kv_end_pos):
-            s_lo, s_hi = v_s
-            if self.ctx_ref.q_start_pos_i32 + self.delta_i32 < fx.Int32(kv_end_pos):
-                lo_list, hi_list = self.v_s_vec_to_lists(v_s)
-                self._causal_mask_inplace((lo_list, hi_list), tile_idx)
-                s_lo, s_hi = _score_lists_to_vecs((lo_list, hi_list))
-            return s_lo, s_hi
-
-        return _run(v_s)
 
     def causal_mask_pair_if_needed(self, v_s_a, v_s_b, tile_a):
         """Causal-mask a BN128 tile pair under one scalar-uniform branch.
@@ -184,41 +161,14 @@ class DualwaveFp8SoftmaxHelper(DualwaveFp8KernelContext):
     def reduce_sum(self, l_row, v_p):
         return l_row + self.tile_sum(v_p)
 
-    def cast_p(self, v_p):
-        # Pack the finished softmax probabilities into v8 bf16 P packs for PV.
-        return _pack_p_v8_slices(self.traits, v_p, self.bf16_trunc_pack_v8)
-
     def scale_o(self, v_o, scale_scalar):
         _scale_o_accs(v_o, scale_scalar, self.traits)
-
-    def scale_v_p(self, v_p, scale_scalar):
-        # P is v8 bf16 (HIPREC): ext to f32, scale, repack bf16.
-        p_lo, p_hi = v_p
-        out_lo, out_hi = [], []
-        for src, dst in ((p_lo, out_lo), (p_hi, out_hi)):
-            for pk in src:
-                f32 = Vec(
-                    llvm.FPExtOp(
-                        Vec.make_type(8, fx.Float32), as_mlir_value(pk)
-                    ).result,
-                    (8,),
-                    fx.Float32,
-                )
-                scaled = [fx.Float32(f32[i]) * scale_scalar for i in range(8)]
-                dst.append(self.bf16_trunc_pack_v8(scaled))
-        return out_lo, out_hi
-
-    def anchor_v_p(self, v_p):
-        return _anchor_v_p(self.traits, v_p, elem_dtype=self.p_elem)
 
     def anchor_v_o(self, v_o):
         return _anchor_v_o(self.traits, v_o)
 
     def anchor_scalar_f32(self, x):
         return _anchor_scalar_f32(x)
-
-    def safe_l_inv(self, l_row):
-        return _safe_l_inv(l_row, self.c_zero_f)
 
     def rescale_from_tile_max(self, m_row, m_tile_max):
         row_max = fx.maxnumf(m_row, m_tile_max)
@@ -228,22 +178,6 @@ class DualwaveFp8SoftmaxHelper(DualwaveFp8KernelContext):
 
     def apply_l_rescale(self, l_row, rescale):
         return l_row * rescale
-
-    def rescale_o(self, v_o, m_row, l_row, m_tile_max, v_p):
-        m_new, corr = self.rescale_from_tile_max(m_row, m_tile_max)
-        self.scale_o(v_o, corr)
-        v_o = self.anchor_v_o(v_o)
-        v_p = self.scale_v_p(v_p, corr)
-        l_row = self.apply_l_rescale(l_row, corr)
-        return v_o, m_new, l_row, v_p
-
-    def v_p_to_vec32(self, v_p):
-        # P packs are (p_lo[0..1], p_hi[0..1]) v8 bf16; concat into one v32 SSA value
-        # for the scf.if loop-carry.
-        return _v_p_to_vec32(v_p)
-
-    def v_vec32_to_p(self, v_p_all):
-        return _v_vec32_to_p(self.traits, v_p_all, elem_dtype=self.p_elem)
 
     def _lazy_correction(self, v_o, m_row, m_tile_max):
         """Monotonic: a downward rebase gives corr > 1 and repeated ones overflow."""
@@ -255,41 +189,6 @@ class DualwaveFp8SoftmaxHelper(DualwaveFp8KernelContext):
             corr,
             [as_mlir_value(scaled_accs[i]) for i in range(self.traits.D_CHUNKS)],
         )
-
-    def lazy_rescale_o(self, v_o, m_row, l_row, m_tile_max, v_p):
-        @flyc.jit
-        def _run(v_o, m_row, l_row, m_tile_max, v_p):
-            m_diff = m_tile_max - m_row
-            m_diff_scaled = m_diff * self.c_logit_scale
-            below = fx.Float32(m_diff_scaled) <= self.c_rescale_thr_f
-            ballot = rocdl.ballot(T.i64, as_mlir_value(below))
-            all_below = arith.cmpi(
-                arith.CmpIPredicate.eq, as_mlir_value(ballot), _read_exec_i64()
-            )
-            all_below = llvm.intr_expect(
-                all_below, arith.constant(1, type=ir.IntegerType.get_signless(1))
-            )
-
-            o_out = [
-                as_mlir_value(v_o[dc]) for dc in range_constexpr(self.traits.D_CHUNKS)
-            ]
-            m_out = as_mlir_value(m_row)
-            l_out = as_mlir_value(l_row)
-            vp_out = self.v_p_to_vec32(v_p)
-            if fx.Boolean(all_below):
-                pass
-            else:
-                m_new, corr, scaled_accs = self._lazy_correction(v_o, m_row, m_tile_max)
-                o_out = [
-                    as_mlir_value(scaled_accs[dc])
-                    for dc in range_constexpr(self.traits.D_CHUNKS)
-                ]
-                vp_out = self.v_p_to_vec32(self.scale_v_p(v_p, corr))
-                l_out = as_mlir_value(l_row * corr)
-                m_out = self.anchor_scalar_f32(m_new)
-            return (o_out, m_out, l_out, self.v_vec32_to_p(vp_out))
-
-        return _run(v_o, m_row, l_row, m_tile_max, v_p)
 
     def lazy_correct_o(self, v_o, m_row, l_row, m_tile_max):
         @flyc.jit
