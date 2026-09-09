@@ -279,15 +279,35 @@ find_config(const std::string& arch, const MhaV4Recipe& recipe, int64_t mode)
                 " (0=dense, 1=sorted-sparse)");
 }
 
+// Every stride and extent below occupies a 32-bit kernarg slot. Truncating one would not fault; it
+// would silently address the wrong rows, so the launcher refuses the shape instead.
+uint32_t fit_u32(int64_t value, const char* name)
+{
+    TORCH_CHECK(value >= 0 && value <= static_cast<int64_t>(std::numeric_limits<uint32_t>::max()),
+                "MHA v4 ",
+                name,
+                " is ",
+                value,
+                ", which does not fit the 32-bit kernarg slot; this shape is too large for the "
+                "current kernel ABI");
+    return static_cast<uint32_t>(value);
+}
+
+uint32_t byte_stride(const at::Tensor& tensor, int64_t dim, const char* name)
+{
+    return fit_u32(tensor.stride(dim) * tensor.element_size(), name);
+}
+
 void set_descale_strides(const at::Tensor& tensor,
                          int head_dimension,
                          uint32_t& batch_stride,
-                         uint32_t& head_stride)
+                         uint32_t& head_stride,
+                         const char* name)
 {
     if(tensor.dim() >= 2)
     {
-        batch_stride = tensor.stride(0) * tensor.element_size();
-        head_stride  = tensor.stride(head_dimension) * tensor.element_size();
+        batch_stride = byte_stride(tensor, 0, name);
+        head_stride  = byte_stride(tensor, head_dimension, name);
     }
 }
 
@@ -536,42 +556,45 @@ void populate_dense_kernarg(FmhaV4Kernarg& args,
     static_assert(sizeof(float) == sizeof(uint32_t));
     const float scale = static_cast<float>(softmax_scale);
     std::memcpy(&args.scalar.value, &scale, sizeof(scale));
-    args.s_seq_len.value     = seqlen_q;
-    args.s_Seqs.value        = q.stride(1) * q.element_size();
-    args.s_Ts.value          = cfg.ts_qo * q.stride(1) * q.element_size();
-    args.s_Hs.value          = q.stride(2) * q.element_size();
-    args.s_Bs.value          = q.stride(0) * q.element_size();
+    args.s_seq_len.value     = fit_u32(seqlen_q, "query length");
+    args.s_Seqs.value        = byte_stride(q, 1, "Q sequence stride");
+    args.s_Ts.value          = fit_u32(cfg.ts_qo * q.stride(1) * q.element_size(), "Q tile stride");
+    args.s_Hs.value          = byte_stride(q, 2, "Q head stride");
+    args.s_Bs.value          = byte_stride(q, 0, "Q batch stride");
     args.s_gqa.value         = gqa_ratio;
-    args.s_k_Seqs.value      = k.stride(1) * k.element_size();
-    args.s_k_Hs.value        = k.stride(2) * k.element_size();
-    args.s_k_Bs.value        = k.stride(0) * k.element_size();
+    args.s_k_Seqs.value      = byte_stride(k, 1, "K sequence stride");
+    args.s_k_Hs.value        = byte_stride(k, 2, "K head stride");
+    args.s_k_Bs.value        = byte_stride(k, 0, "K batch stride");
     args.s_opt.value         = 5;
     args.s_lse.value         = 0;
-    args.s_kv_seq_len.value  = seqlen_k;
+    args.s_kv_seq_len.value  = fit_u32(seqlen_k, "key length");
     args.s_qk_head_dim.value = kHeadDim;
     args.s_v_head_dim.value  = kHeadDim;
     args.s_q_head_num.value  = nhead_q;
-    args.s_v_Seqs.value      = v.stride(1) * v.element_size();
-    args.s_v_Hs.value        = v.stride(2) * v.element_size();
-    args.s_v_Bs.value        = v.stride(0) * v.element_size();
-    args.s_o_Seqs.value      = out.stride(1) * out.element_size();
-    args.s_o_Hs.value        = out.stride(2) * out.element_size();
-    args.s_o_Bs.value        = out.stride(0) * out.element_size();
+    args.s_v_Seqs.value      = byte_stride(v, 1, "V sequence stride");
+    args.s_v_Hs.value        = byte_stride(v, 2, "V head stride");
+    args.s_v_Bs.value        = byte_stride(v, 0, "V batch stride");
+    args.s_o_Seqs.value      = byte_stride(out, 1, "output sequence stride");
+    args.s_o_Hs.value        = byte_stride(out, 2, "output head stride");
+    args.s_o_Bs.value        = byte_stride(out, 0, "output batch stride");
 
     if(!bf16_qk)
     {
         set_descale_strides(q_descale,
                             q_descale.dim() >= 3 ? 2 : 1,
                             args.s_descale_q_Bs.value,
-                            args.s_descale_q_Hs.value);
+                            args.s_descale_q_Hs.value,
+                            "Q descale stride");
         set_descale_strides(k_descale,
                             k_descale.dim() >= 3 ? 2 : 1,
                             args.s_descale_k_Bs.value,
-                            args.s_descale_k_Hs.value);
+                            args.s_descale_k_Hs.value,
+                            "K descale stride");
     }
     if(!bf16_v)
     {
-        set_descale_strides(v_descale, 1, args.s_descale_v_Bs.value, args.s_descale_v_Hs.value);
+        set_descale_strides(
+            v_descale, 1, args.s_descale_v_Bs.value, args.s_descale_v_Hs.value, "V descale stride");
     }
 }
 
