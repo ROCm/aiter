@@ -269,6 +269,7 @@ class TestTunePipeline(unittest.TestCase):
                     ),
                 ],
                 "keys": [
+                    "gfx",
                     "cu_num",
                     "token",
                     "model_dim",

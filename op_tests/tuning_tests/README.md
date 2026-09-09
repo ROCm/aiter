@@ -6,7 +6,8 @@ Minimal test suite for validating the aiter tuning infrastructure.
 
 | File | Level | GPU | What it tests |
 |------|-------|-----|---------------|
-| `test_csv_validation.py` | 0 | No | Tuned CSV integrity: duplicates (all families), invalid times, errRatio, git conflicts |
+| `test_csv_validation.py` | 0 | No | Tuned CSV integrity: duplicates (all families), invalid times, errRatio, git conflicts, explicit FMoE `gfx` |
+| `test_fmoe_gfx_schema.py` | 1 | No | FMoE `gfx` schema, legacy one-shot warnings, cross-gfx merge/lookup, FlyDSL AOT gfx selection |
 | `test_tuner_infra.py` | 1 | No | `base_tuner` utilities: CSV I/O, merge, dedup, calculate, post_process topk, update_config_files |
 | `test_compare_logic.py` | 1 | No | Compare/update_improved: `_build_compare_update_plan`, `_merge_compare_filtered_results` |
 | `test_mp_tuner_logic.py` | 1 | No | `mp_tuner` polling: timeout, AcceleratorError, KeyError, pool restart |
@@ -45,6 +46,7 @@ If `AITER_CONFIGS` is unavailable (e.g. aiter not installed), the test falls bac
 ```bash
 # Level 0+1 only (no GPU, <10s)
 python3 -m unittest op_tests.tuning_tests.test_csv_validation \
+  op_tests.tuning_tests.test_fmoe_gfx_schema \
   op_tests.tuning_tests.test_tuner_infra \
   op_tests.tuning_tests.test_mp_tuner_logic \
   op_tests.tuning_tests.test_online_tune -v

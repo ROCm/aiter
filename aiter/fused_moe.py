@@ -27,7 +27,6 @@ from aiter.jit.utils.chip_info import (
     get_cu_num,
     get_gfx,
     get_gfx_runtime,
-    gfx_from_cu_num,
 )
 from aiter.jit.utils.torch_guard import torch_compile_guard
 from aiter.ops.flydsl.kernels.mega_moe_gfx1250.types import Stage2ScatterContext
@@ -2276,17 +2275,9 @@ def get_2stage_cfgs(
 
     def _ensure_gfx_column(df):
         """Guarantee a usable `gfx` column, migrating legacy cu_num-only CSVs."""
-        if "gfx" not in df.columns:
-            df = df.copy()
-            df["gfx"] = df["cu_num"].map(gfx_from_cu_num)
-            return df
-        # Backfill placeholder/missing gfx (e.g. 0 filled when merging a config
-        # that lacks the column against ones that have it).
-        bad = df["gfx"].isna() | df["gfx"].astype(str).isin(["0", "", "nan", "None"])
-        if bad.any():
-            df = df.copy()
-            df.loc[bad, "gfx"] = df.loc[bad, "cu_num"].map(gfx_from_cu_num)
-        return df
+        from aiter.jit.utils.chip_info import backfill_dataframe_gfx
+
+        return backfill_dataframe_gfx(df, tune_file)
 
     def get_cfg_2stages(tune_file):
         import pandas as pd

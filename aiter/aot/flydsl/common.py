@@ -18,6 +18,8 @@ from dataclasses import dataclass
 from multiprocessing.connection import wait as wait_for_sentinels
 from typing import Any
 
+from aiter.jit.utils.gfx_placeholders import LEGACY_CU_NUM_TO_GFX, is_missing_gfx
+
 _DEFAULT_KERNEL_TIMEOUT = 1200.0
 _DEFAULT_MAX_WORKERS = 64
 _DEFAULT_MAX_RETRIES = 2
@@ -47,16 +49,32 @@ class JobLabel:
         return f"{self.kind.name} {self.kernel_name}"
 
 
-_CU_NUM_TO_ARCH = {
-    80: "gfx942",
-    304: "gfx942",
-    256: "gfx950",
-}
+def cu_num_to_arch(cu_num: int) -> str:
+    """Map a known legacy compute-unit count to its historical architecture."""
+    try:
+        mapped = LEGACY_CU_NUM_TO_GFX.get(int(cu_num))
+    except (TypeError, ValueError):
+        mapped = None
+    if mapped is None:
+        raise ValueError(
+            f"cannot map cu_num={cu_num!r} to an architecture; known values are "
+            f"{sorted(LEGACY_CU_NUM_TO_GFX)}"
+        )
+    return mapped
 
 
-def cu_num_to_arch(cu_num: int, default: str = "gfx950") -> str:
-    """Map compute-unit count to GPU architecture string."""
-    return _CU_NUM_TO_ARCH.get(cu_num, default)
+def resolve_job_arch(cu_num: int = 0, gfx: str = "") -> str:
+    """Architecture this AOT job should compile for.
+
+    Prefer an explicit ``gfx`` from the row. Placeholder values (``0``, empty,
+    ``nan``, ``None``) are treated as missing. If gfx is missing, fall back
+    only to the known historical CU-count mapping (80/304 -> gfx942,
+    256 -> gfx950). Unknown or missing values raise rather than inventing
+    an architecture.
+    """
+    if not is_missing_gfx(gfx):
+        return str(gfx).strip()
+    return cu_num_to_arch(cu_num)
 
 
 def job_identity(job: dict[str, Any]) -> tuple:
@@ -174,7 +192,18 @@ def _compile_one_config_for(kind: OpKind) -> Callable[..., dict[str, Any]]:
 def _run_one_to_file(
     worker: Callable[..., dict[str, Any]], kwargs: dict[str, Any], out_path: str
 ) -> None:
-    result = worker(**kwargs)
+    try:
+        result = worker(**kwargs)
+    except ValueError as e:
+        # Deterministic row/config errors (unknown gfx, gfx950-only kinds)
+        # must not look like a crashed worker: the pool retries nonzero
+        # exits as OOM/segfaults.
+        print(f"  [FAIL] {e}", flush=True)
+        result = {
+            "kernel_name": kwargs.get("kernel_name", ""),
+            "compile_time": None,
+            "error": str(e),
+        }
     tmp_path = out_path + ".tmp"
     with open(tmp_path, "w") as f:
         json.dump(result, f)

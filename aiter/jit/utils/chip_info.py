@@ -15,6 +15,14 @@ from build_targets import (
 from cpp_extension import executable_path
 from torch_guard import torch_compile_guard
 
+try:
+    from aiter.jit.utils.gfx_placeholders import (
+        LEGACY_CU_NUM_TO_GFX,
+        is_missing_gfx,
+    )
+except ImportError:
+    from gfx_placeholders import LEGACY_CU_NUM_TO_GFX, is_missing_gfx
+
 logger = logging.getLogger("aiter")
 
 
@@ -107,36 +115,72 @@ def get_gfx_runtime() -> str:
     return gfx_arch
 
 
-# Backfill map for legacy tuned configs that predate the `gfx` column.
-# These cu_num values were only ever tuned on a single arch historically:
-#   256 -> gfx950, 80/304 -> gfx942.
-# Newer archs that happen to share a cu_num (e.g. gfx1250 also reports 256)
-# are always written with their real arch by the tuner, so they never rely on
-# this backfill.
-_LEGACY_CU_NUM_TO_GFX = {
-    256: "gfx950",
-    80: "gfx942",
-    304: "gfx942",
-}
+# Backfill uses LEGACY_CU_NUM_TO_GFX (shared with FlyDSL AOT). Newer SKUs that
+# share a cu_num (gfx1250 also reports 256) or use a count never shipped
+# without gfx (gfx1250 also reports 96) always write the real arch.
+
+_LEGACY_GFX_WARNED_SOURCES: set[str] = set()
+
+
+def reset_legacy_gfx_warnings_for_tests() -> None:
+    """Clear one-shot legacy gfx warnings (test helper only)."""
+    _LEGACY_GFX_WARNED_SOURCES.clear()
+
+
+def warn_legacy_gfx_inference(source: str) -> None:
+    """Emit one warning per legacy tuned file lacking explicit ``gfx``."""
+    if not source or source in _LEGACY_GFX_WARNED_SOURCES:
+        return
+    _LEGACY_GFX_WARNED_SOURCES.add(source)
+    logger.warning(
+        "[fused_moe] %s lacks explicit gfx; inferring architecture from cu_num "
+        "(256->gfx950, 80/304->gfx942). Re-tune or migrate the artifact to "
+        "remove this ambiguity.",
+        source,
+    )
+
+
+def backfill_dataframe_gfx(df, source: str | None = None):
+    """Return ``df`` with a usable ``gfx`` column; warn once per source on inference."""
+    warned = False
+    if "gfx" not in df.columns:
+        df = df.copy()
+        df["gfx"] = df["cu_num"].map(gfx_from_cu_num)
+        warned = True
+    else:
+        bad = df["gfx"].map(is_missing_gfx)
+        if bad.any():
+            df = df.copy()
+            # Pandas may have inferred a float gfx column (0.0 / NaN).
+            df["gfx"] = df["gfx"].astype(object)
+            df.loc[bad, "gfx"] = df.loc[bad, "cu_num"].map(gfx_from_cu_num)
+            warned = True
+    if warned and source:
+        warn_legacy_gfx_inference(source)
+    return df
 
 
 def gfx_from_cu_num(cu_num) -> str:
-    """Infer the gfx arch for a legacy config row that has no `gfx` column.
+    """Infer gfx for a legacy config row that has no usable ``gfx`` value.
 
-    Used to migrate old tuned CSVs (keyed on cu_num only) to the new
-    (gfx, cu_num, ...) schema. Unknown cu_num falls back to the live GPU arch.
+    Only the historical CU mappings are accepted (80/304 -> gfx942,
+    256 -> gfx950). Unknown or unparsable ``cu_num`` values raise rather than
+    labeling the row with the live GPU architecture.
     """
     try:
         cu_num = int(cu_num)
-    except (TypeError, ValueError):
-        return get_gfx_runtime()
-    gfx = _LEGACY_CU_NUM_TO_GFX.get(cu_num)
-    if gfx is not None:
-        return gfx
-    try:
-        return get_gfx_runtime()
-    except Exception:  # noqa: BLE001
-        return "gfx942"
+    except (TypeError, ValueError) as e:
+        raise ValueError(
+            f"cannot infer gfx from cu_num={cu_num!r}; known legacy mappings are "
+            f"{dict(sorted(LEGACY_CU_NUM_TO_GFX.items()))}"
+        ) from e
+    gfx = LEGACY_CU_NUM_TO_GFX.get(cu_num)
+    if gfx is None:
+        raise ValueError(
+            f"cannot infer gfx from cu_num={cu_num}; known legacy mappings are "
+            f"{dict(sorted(LEGACY_CU_NUM_TO_GFX.items()))}"
+        )
+    return gfx
 
 
 @functools.lru_cache(maxsize=1)

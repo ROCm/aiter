@@ -47,7 +47,11 @@ from aiter.jit.core import (
     AITER_ROOT_DIR,
     get_asm_dir,
 )
-from aiter.jit.utils.chip_info import get_gfx, get_gfx_runtime, gfx_from_cu_num
+from aiter.jit.utils.chip_info import (
+    backfill_dataframe_gfx,
+    get_gfx,
+    get_gfx_runtime,
+)
 from aiter.ops.flydsl.moe_common import (
     DEFAULT_SITUV2_BETA,
     DEFAULT_SITUV2_LINEAR_BETA,
@@ -5014,7 +5018,7 @@ class FmoeTuner(TunerCommon):
                 # Migrate legacy tuned files lacking a gfx column: infer from
                 # cu_num so old rows stay matchable instead of collapsing to 0.
                 if col == "gfx" and "cu_num" in old_tunedf.columns:
-                    old_tunedf[col] = old_tunedf["cu_num"].map(gfx_from_cu_num)
+                    old_tunedf = backfill_dataframe_gfx(old_tunedf, file)
                 else:
                     old_tunedf[col] = 0
 
@@ -5757,7 +5761,9 @@ class FmoeTuner(TunerCommon):
                 and "gfx" not in self.tunedf.columns
                 and "cu_num" in self.tunedf.columns
             ):
-                self.tunedf["gfx"] = self.tunedf["cu_num"].map(gfx_from_cu_num)
+                self.tunedf = backfill_dataframe_gfx(
+                    self.tunedf, self.get_out_file(args.tune_file)
+                )
             if args.last:
                 self.untunedf = self.untunedf.iloc[-1:]
 
@@ -6385,7 +6391,7 @@ class Mxfp4FlydslTuner(FmoeTuner):
         for col in self.columns:
             if col not in old_tunedf.columns:
                 if col == "gfx" and "cu_num" in old_tunedf.columns:
-                    old_tunedf[col] = old_tunedf["cu_num"].map(gfx_from_cu_num)
+                    old_tunedf = backfill_dataframe_gfx(old_tunedf, file)
                 else:
                     old_tunedf[col] = ""
         valid = results[

@@ -31,12 +31,13 @@ import time
 from aiter.aot.flydsl.common import (
     collect_aot_jobs,
     compile_only_env,
-    cu_num_to_arch,
     job_identity,
     override_env,
+    resolve_job_arch,
     run_jobs_parallel,
 )
 from aiter.jit.core import AITER_CONFIGS
+from aiter.jit.utils.chip_info import warn_legacy_gfx_inference
 from aiter.ops.flydsl.kernels.tensor_shim import ptr_arg as _ptr_view_safe
 from aiter.ops.flydsl.moe_kernels import (
     _get_compiled_silu_fused,
@@ -59,7 +60,6 @@ DEFAULT_CSVS = [
     AITER_CONFIGS.AITER_CONFIG_FMOE_FILE,
     AITER_CONFIGS.AITER_CONFIG_FHMOE_FILE,
 ]
-MOE_AOT_ARCH_DEFAULT = "gfx950"
 
 
 def parse_csv(csv_path: str):
@@ -77,6 +77,9 @@ def parse_csv(csv_path: str):
 
     with open(csv_path, newline="") as f:
         reader = csv.DictReader(f)
+        has_gfx = "gfx" in (reader.fieldnames or [])
+        if not has_gfx:
+            warn_legacy_gfx_inference(csv_path)
         for row in reader:
             token = int(row["token"])
             model_dim = int(row["model_dim"])
@@ -85,6 +88,7 @@ def parse_csv(csv_path: str):
             topk = int(row["topk"])
             doweight_stage1 = bool(int(row.get("doweight_stage1", "0")))
             cu_num = int(row.get("cu_num", "0"))
+            gfx = row.get("gfx", "").strip()
             block_m = int(row.get("block_m", "0") or "0")
             shared_expert_id = int(row.get("shared_expert_id", "-1") or "-1")
             act_type = row.get("act_type", "")
@@ -137,6 +141,7 @@ def parse_csv(csv_path: str):
                     "inter_dim": inter_dim,
                     "topk": topk,
                     "cu_num": cu_num,
+                    "gfx": gfx,
                     # Not used by the epilogue compile; zeroed so dedup keys on
                     # (act, inter_dim, topk, cu_num) only.
                     "model_dim": 0,
@@ -174,6 +179,7 @@ def parse_csv(csv_path: str):
                         "topk": topk,
                         "doweight_stage1": doweight_stage1,
                         "cu_num": cu_num,
+                        "gfx": gfx,
                         "act": act,
                         "enable_bias": enable_bias,
                         "token_num": token,
@@ -1003,6 +1009,7 @@ def compile_one_config(
     experts: int,
     topk: int,
     cu_num: int = 0,
+    gfx: str = "",
     **kwargs,
 ) -> dict:
     """Compile one MoE kernel configuration and save to cache.
@@ -1012,7 +1019,6 @@ def compile_one_config(
 
     Returns a dict with timing info.
     """
-    aot_arch = cu_num_to_arch(cu_num, default=MOE_AOT_ARCH_DEFAULT)
     is_epilogue = kwargs.get("stage") == "epilogue"
     shape_str = (
         f"{kernel_name}  inter_dim={inter_dim} topk={topk}"
@@ -1027,7 +1033,7 @@ def compile_one_config(
         "kernel_name": kernel_name,
         "shape": shape_str,
         "compile_time": None,
-        "compile_arch": aot_arch,
+        "compile_arch": None,
     }
 
     from torch._subclasses.fake_tensor import FakeTensorMode
@@ -1042,8 +1048,11 @@ def compile_one_config(
         and kwargs.get("b_dtype") in ("fp4", "int4")
     )
 
+    aot_arch = None
     t0 = time.time()
     try:
+        aot_arch = resolve_job_arch(cu_num, gfx)
+        result["compile_arch"] = aot_arch
         if is_a16w_port:
             with override_env("FLYDSL_GPU_ARCH", aot_arch):
                 _precompile_a16w4_to_cache(
@@ -1074,6 +1083,7 @@ def compile_one_config(
 
                         precompile = precompile_fhmoe_to_cache
                         kwargs["shared_expert_id"] = shared_expert_id
+                        kwargs["gfx"] = gfx
                     else:
                         precompile = _precompile_to_cache
                     precompile(
@@ -1131,7 +1141,7 @@ def main():
     print(f"  Stage2 jobs:    {len(stage2_jobs)}")
     print(f"  Epilogue jobs:  {len(epilogue_jobs)}")
     print(f"  Total jobs:     {len(all_jobs)}")
-    print("  Compile arch: (from cu_num)")
+    print("  Compile arch: (from gfx, else known cu_num mapping)")
     print(f"  Cache dir:    {cache_dir}")
     print(f"  Target arch:  {arch}")
     print("=" * 72)

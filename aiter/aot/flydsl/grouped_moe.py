@@ -18,6 +18,7 @@ from aiter.aot.flydsl.common import (
     compile_only_env,
     job_identity,
     override_env,
+    resolve_job_arch,
     run_jobs_parallel,
 )
 from aiter.jit.core import AITER_CONFIGS
@@ -136,6 +137,7 @@ def parse_csv(csv_path: str):
                 "data_format": (
                     "fp4" if "float4" in row.get("q_dtype_a", "") else "a8w4"
                 ),
+                "cu_num": int(row.get("cu_num") or 0),
                 "gfx": row.get("gfx", ""),
             }
             for job in _scheduler_variants(row, base_job):
@@ -145,9 +147,6 @@ def parse_csv(csv_path: str):
                 seen.add(key)
                 jobs.append(job)
     return jobs
-
-
-GROUPED_MOE_AOT_ARCH_DEFAULT = "gfx1250"
 
 
 def _compile_grouped_moe_aux_kernels(job, *, dtype, quant_mode, wmma_rep, contiguous):
@@ -377,7 +376,8 @@ def compile_one_config(**job):
     import torch
     from torch._subclasses.fake_tensor import FakeTensorMode
 
-    aot_arch = job.pop("gfx", "") or GROUPED_MOE_AOT_ARCH_DEFAULT
+    cu_num = job.pop("cu_num", 0)
+    gfx = job.pop("gfx", "")
     shape_str = (
         # Use .get() so a missing key can't raise here, outside the try below:
         # an escaping exception would crash the worker (exitcode != 0), which the
@@ -388,8 +388,10 @@ def compile_one_config(**job):
         f"contiguous={bool(job.get('grouped_contiguous_m', False))}"
     )
 
+    aot_arch = None
     t0 = time.time()
     try:
+        aot_arch = resolve_job_arch(cu_num, gfx)
         # TODO(aot): only the auxiliary (non-GEMM) kernels are precompiled here.
         # The grouped GEMM itself moved to the TDM batched kernel
         # (aiter.ops.flydsl.batched_gemm_mxfp4), which has no AOT wiring yet, so

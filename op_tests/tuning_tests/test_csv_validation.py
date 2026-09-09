@@ -7,11 +7,21 @@ Catches: duplicates, invalid times, high errRatio, git merge conflicts,
 missing untuned files.
 """
 
+import glob
 import os
 import unittest
 from typing import Any, ClassVar
 
 import pandas as pd
+
+try:
+    # Same placeholder contract the loader enforces; importing aiter needs torch.
+    from aiter.jit.utils.gfx_placeholders import is_missing_gfx
+
+    _GFX_PLACEHOLDER_ERR = None
+except Exception as e:  # noqa: BLE001
+    is_missing_gfx = None
+    _GFX_PLACEHOLDER_ERR = e
 
 AITER_ROOT = os.path.dirname(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -123,6 +133,24 @@ class TestCSVValidation(unittest.TestCase):
                 "_tag",
             ],
         )
+
+    @unittest.skipUnless(
+        is_missing_gfx is not None,
+        f"gfx_placeholders not importable: {_GFX_PLACEHOLDER_ERR}",
+    )
+    def test_shipped_fmoe_configs_have_explicit_gfx(self):
+        model_dir = os.path.join(CONFIGS_DIR, "model_configs")
+        paths = [os.path.join(CONFIGS_DIR, "tuned_fmoe.csv")]
+        paths.extend(sorted(glob.glob(os.path.join(model_dir, "*tuned_fmoe*.csv"))))
+        for path in paths:
+            if "untuned" in os.path.basename(path):
+                continue
+            with self.subTest(path=os.path.basename(path)):
+                df = pd.read_csv(path)
+                df.columns = df.columns.str.strip()
+                self.assertIn("gfx", df.columns, path)
+                bad = df["gfx"].map(is_missing_gfx)
+                self.assertFalse(bad.any(), f"{path}: invalid gfx values")
 
     def test_no_git_conflict_markers(self):
         for name, fname in self.TUNED_CSVS.items():
