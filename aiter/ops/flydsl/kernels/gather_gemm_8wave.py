@@ -64,24 +64,6 @@ def _gather_a_offsets(lane_id, wave_id, n_rounds, row_bases):
 
 
 class BlockScale:
-    """128x128 block scale carried through the K loop by progressive rescaling.
-
-    The scale varies along K, so ``sum_kt P_kt * s_kt`` cannot be produced by
-    scaling once at the end. Keeping a second accumulator for the per-tile
-    product (what Triton does) would double the 128 accumulator VGPRs per lane
-    and halve occupancy, so instead the running accumulator is renormalised:
-
-        after tile kt:   acc == (sum_{j<=kt} P_j * s_j) / s_kt
-
-    which is maintained by multiplying acc by ``s_{kt-1} / s_kt`` just before the
-    MFMAs of tile kt, and multiplying by ``s_last`` in the epilogue. That is 3
-    accumulator-wide multiplies instead of a second accumulator.
-
-    With BLOCK_N == one head and nope == v_dim == 128, each half lies entirely
-    inside one 128-row scale block, so the whole thing is 8 scalars per
-    workgroup: the k half is scale row ``2*head``, the v half ``2*head + 1``, and
-    each row's ``K/128`` values are contiguous -- two 128-bit loads.
-    """
 
     def __init__(self, W_scale, head, n_scale_cols, k_iters):
         assert n_scale_cols == k_iters, (

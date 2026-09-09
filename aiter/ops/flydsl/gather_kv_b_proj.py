@@ -17,7 +17,7 @@ from torch import Tensor
 
 from aiter.jit.utils.chip_info import get_lds_capacity_bytes
 
-from .kernels.gather_kv_b_proj_8wave import compile_gather_kv_b_proj_8w
+from .kernels.gather_gemm_8wave import compile_gather_kv_b_proj_8w
 from .kernels.tensor_shim import _run_compiled
 
 # The MLA latent layout, fixed by the model.
