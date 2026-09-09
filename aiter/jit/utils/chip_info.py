@@ -316,7 +316,23 @@ def get_build_targets() -> list[tuple[str, int]]:
 
         try:
             live_gfx, live_cu = get_gfx_runtime(), get_cu_num()
-        except Exception:  # noqa: BLE001
+        except Exception as e:  # noqa: BLE001
+            named = ", ".join(f"{gfx}:{cu}" for gfx, cu in targets)
+            if _active_device_index() is None:
+                logger.info(
+                    "No GPU to ask; build targets %s take the default count "
+                    "for their arch.",
+                    named,
+                )
+            else:
+                logger.warning(
+                    "A GPU is present but the arch and CU probe failed (%s); "
+                    "build targets %s take the default count for their arch, "
+                    "which is wrong on a binned or partitioned part. Set "
+                    "CU_NUM or AITER_GPU_TARGETS to pin it.",
+                    e,
+                    named,
+                )
             return targets
 
         resolved = []
