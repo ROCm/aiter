@@ -4,6 +4,7 @@ import sys
 import pytest
 import torch
 
+from aiter import logger
 from aiter.ops.triton.attention.lean_atten_paged import persistent_lean_attention_paged
 
 
@@ -67,7 +68,7 @@ def test_persistent_lean_attention(
     try:
         sum_n_ctx = sum(int(n) for n in n_ctx)
     except ValueError:
-        print(f"N_CTX contains non-numeric values: {n_ctx}")
+        logger.info(f"N_CTX contains non-numeric values: {n_ctx}")
 
     # N_CTX is a list of context lengthes for all the req in a batch
     # First, calculate #BLOCK_N for each context length "list_num_block_n"
@@ -98,9 +99,9 @@ def test_persistent_lean_attention(
         mean=0.0, std=0.5
     )
 
-    print(f"Q shape={q.shape}")
-    print(f"K shape={k.shape}")
-    print(f"V shape={v.shape}")
+    logger.info(f"Q shape={q.shape}")
+    logger.info(f"K shape={k.shape}")
+    logger.info(f"V shape={v.shape}")
     torch.set_printoptions(threshold=10000)
 
     block_tables = []  # kv block tables used by lean attention
@@ -213,7 +214,7 @@ def main():
     try:
         sum_n_ctx = sum(int(n) for n in n_ctx)
     except ValueError:
-        print(f"N_CTX contains non-numeric values: {n_ctx}")
+        logger.info(f"N_CTX contains non-numeric values: {n_ctx}")
 
     # N_CTX is a list of context lengthes for all the req in a batch
     # First, calculate #BLOCK_N for each context length "list_num_block_n"
@@ -244,9 +245,9 @@ def main():
         mean=0.0, std=0.5
     )
 
-    print(f"Q shape={q.shape}")
-    print(f"K shape={k.shape}")
-    print(f"V shape={v.shape}")
+    logger.info(f"Q shape={q.shape}")
+    logger.info(f"K shape={k.shape}")
+    logger.info(f"V shape={v.shape}")
 
     num_kv_blocks = sum_n_ctx // BLOCK_N + (1 if (sum_n_ctx % BLOCK_N != 0) else 0)
 
@@ -255,7 +256,7 @@ def main():
         b = random.sample(range(num_kv_blocks), num_kv_blocks)
         block_tables.append(b)
     kv_block_tables = torch.tensor(block_tables, dtype=torch.int32, device="cuda")
-    print(f"KV block tables shape={kv_block_tables.shape}")
+    logger.info(f"KV block tables shape={kv_block_tables.shape}")
 
     # LeanAttention Specific Parameters
     Mp = torch.empty((total_programs, n_ctx_q), device=q.device, dtype=torch.float32)
@@ -284,7 +285,7 @@ def main():
         waves_per_eu,
     )
 
-    print(f"la_out[0,0,:10]={la_out[0,0,:10]}")
+    logger.info(f"la_out[0,0,:10]={la_out[0, 0, :10]}")
 
 
 if __name__ == "__main__":
