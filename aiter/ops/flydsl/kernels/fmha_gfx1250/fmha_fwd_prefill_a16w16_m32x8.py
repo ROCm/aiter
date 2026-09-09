@@ -158,6 +158,21 @@ USE_TDM_LOADER = True
 # global_store_async_from_lds_b128.
 O_VARIANT = "v3"
 
+# LDS->VGPR ring for the QK/PV WMMA streams. The gemms used to burst EVERY ds_load of
+# the resident KV tile into VGPRs before the first wmma, so the live cost scaled with
+# hdim (K: 32/48/64 loads = 128/192/256 VGPR at qk_hdim 128/192/256). A ring holds only
+# RING loads live at a fixed 4 VGPR each, with NP = RING - 2*LAG in flight.
+#
+# Swept on case 10 at fixed init: QK 20/4 and PV 16/4 both beat the old burst
+# (1255-1273us vs 1317us), and 256/128 goes from 223 spills to 0. The optimum is sharp --
+# QK ring 16/24/28 all lose 3-6% to 20, and PV lag 2/6 lose to 4. Keep RING a multiple of 4
+# (an odd wrap flips slot parity: +1 cyc on half the wmma).
+# LAG=0 with RING >= num_ds_loads reproduces the old burst exactly (A/B without a revert).
+QK_RING = 20
+QK_LAG = 4
+PV_RING = 16
+PV_LAG = 4
+
 # NOTE: the remaining tiling constants (chunk sizes, K/V write-tile + V swizzle
 # granularity) live inside fmha_b16_buffer_managers.py — they are intrinsic to the
 # managers' LDS layouts, so the kernel no longer declares them here.
@@ -171,18 +186,6 @@ O_VARIANT = "v3"
 def _warp_id():
     """Wave (warp) index within the workgroup, matching opus ``waveid_in_workgroup()``."""
     return fx.Int32(rocdl.wave_id())
-
-
-def _named_barrier_pair(warp_idx):
-    """2-wave SIMD-pair rendezvous (warp `i` ↔ `i+4`) for warp specialization.
-
-    TODO(named-barrier): wire the gfx1250 named barrier — one `@__nbar[warp_idx & 3]`
-    per SIMD pair (`s_barrier_signal_var(ptr, 2)` + `s_barrier_wait`), joined once in
-    the prologue. Currently a NO-OP: the LO/HI split only reorders each wave's own
-    self-contained load→compute, so it stays correct under the workgroup `gpu.barrier()`
-    alone; the named barrier is a perf-only SIMD-issue rendezvous, added after the
-    standalone probe validates allocation + per-pair sync."""
-    del warp_idx
 
 
 def _lane_id():
@@ -273,7 +276,107 @@ def _wmma(a, b, c):
     return wmma(v8f32, _ir(a), _ir(b), _ir(c), reuseA=False, reuseB=False).result
 
 
-def _qk_gemm(*, k_values, q_frags_list, n_block):
+def _keepalive(vals):
+    """Empty side-effecting inline asm: emits no instruction but counts as a USE, so the
+    operands stay live (VGPRs reserved) until this point. Load-bearing for the ring — a
+    slot holding no in-flight value looks dead to regalloc, which then reclaims the pair
+    the wmma just read, collapsing the WAR distance to 0 (LLVM falls back to
+    ``s_wait_alu depctr_va_vdst(0)`` and the VGPR saving evaporates)."""
+    ops = [_ir(v) for v in vals]
+    llvm_dialect.inline_asm(
+        None, ops, "", ",".join("v" for _ in ops), has_side_effects=True
+    )
+
+
+def _ring_num_prefetch(num_frag, ring, lag):
+    """In-flight ds_load depth (NP) of a ``_ring_drive`` with this geometry.
+
+    A tile that fits in the ring never wraps, so no slot is ever refilled and the WAR lag
+    buys nothing: prefetch the whole tile rather than deferring loads behind wmma they
+    gain nothing from. Only a wrapping ring pays for lag."""
+    num_ld = 2 * num_frag
+    if num_ld <= ring:
+        return num_ld
+    return ring - 2 * lag
+
+
+def _ring_head(*, num_frag, emit, ring, lag):
+    """Issue a ring's NP-deep prefetch early -- hoisting its LDS latency under unrelated
+    work -- for a later ``_ring_drive`` called with the same ``ring``/``lag``."""
+    return [emit(j) for j in range(_ring_num_prefetch(num_frag, ring, lag))]
+
+
+def _ring_drive(*, num_frag, emit, consume, ring, lag, head=None):
+    """Drive a fully-unrolled LDS->VGPR ring feeding a WMMA stream.
+
+    ``emit(j)`` emits ds_load ``j`` (2 per WMMA fragment); ``consume(i, lo, hi)`` emits
+    fragment ``i``'s WMMA chain. Only ``ring`` loads are live at once and
+    ``NP = ring - 2*lag`` are in flight, so a refill targets slots last read ``lag``
+    fragments ago -- trading pipeline depth for WAR distance at fixed VGPR cost.
+
+    Refills are hoisted ABOVE the wmma: that is what keeps the ring from reintroducing
+    the wmma->ds_load issue bubble the old burst avoided.
+
+    ``head`` optionally adopts an already-issued NP-deep prefetch (the PV case hoists it
+    above softmax so the LDS latency hides under the softmax VALU). A tile of at most
+    ``ring`` loads degenerates to the old burst-everything form (see
+    ``_ring_num_prefetch``), as does ``lag=0`` with ``ring >= 2*num_frag``.
+    """
+    num_ld = 2 * num_frag
+    NP = _ring_num_prefetch(num_frag, ring, lag)
+    ring = min(ring, num_ld)
+    assert NP > 0, f"ring={ring} too small for lag={lag} (NP={NP})"
+
+    def _waitn(n):
+        rocdl.sched_barrier(0)
+        rocdl.s_wait_dscnt(max(n, 0))
+        rocdl.sched_barrier(0)
+
+    a = [None] * ring
+    if head is not None:
+        assert len(head) == NP, f"head has {len(head)} loads, expected NP={NP}"
+        for i, v in enumerate(head):
+            a[i] = v
+    else:
+        for i in range(NP):
+            a[i] = emit(i)
+        rocdl.sched_barrier(0)  # pin the NP-deep burst above the stream
+
+    steady = num_frag - NP // 2
+    held = []  # held[i] = the pair fragment i read; released rel fragments later
+    rel = lag + 1  # refill is hoisted, so hold one fragment PAST the refill of that slot
+
+    def _refill(i):
+        for k in range(2):
+            j = 2 * i + NP + k
+            if j < num_ld:
+                a[j % ring] = emit(j)
+
+    for i in range(steady):
+        _waitn(NP - 2)
+        if lag and i >= rel:
+            _keepalive(held[i - rel])  # regs read by fragment i-rel die HERE, not at wmma
+            held[i - rel] = None
+        _refill(i)
+        lo, hi = a[(2 * i) % ring], a[(2 * i + 1) % ring]
+        rocdl.sched_barrier(0)
+        consume(i, lo, hi)
+        rocdl.sched_barrier(0)
+        held.append((lo, hi) if lag else None)
+    for i in range(steady, num_frag):
+        _waitn(NP - 2 * (i - steady + 1))
+        lo, hi = a[(2 * i) % ring], a[(2 * i + 1) % ring]
+        rocdl.sched_barrier(0)
+        consume(i, lo, hi)
+        rocdl.sched_barrier(0)
+    for p in held:
+        if p is not None:
+            _keepalive(p)
+
+
+def _qk_gemm(
+    *, k_emit, q_frags_list, n_block, head=None, ring=QK_RING, lag=QK_LAG
+):
     """GEMM1: S^T = K @ Q^T for one resident KV tile, for all R q-WMMA-tiles this
     wave owns. K is **shared** across the q-tiles (loaded once), so each K fragment
     is shuffled once and fed into R independent WMMA chains.
@@ -288,14 +391,12 @@ def _qk_gemm(*, k_values, q_frags_list, n_block):
     Q fragments. Returns ``s_acc_list``: a length-R list, each a list of NKV
     v8-f32 accumulators (== P^T for that q-tile).
 
-    ``k_values`` is the already-burst-loaded flat ``(kv, dt, half)`` list of
-    v8-bf16 ds_load results (from ``k_mgr.load_k_to_reg``, kept OUT of the WMMA stream so
-    there is no wmma->ds_load issue bubble). Each K fragment is the two 16-col halves of a
-    d-tile shuffled into a v16 fragment matching the Q frag layout.
-
-    NOTE: the ``s_wait_dscnt(0)`` that drains the K ds_load burst is now issued by the
-    (warp-specialized) main-loop preamble before this call — under warp specialization the
-    LO and HI warps drain at different points, so the wait can't live inside the gemm.
+    ``k_emit(j)`` emits the ``j``-th K ``ds_load`` of the resident block (see
+    ``k_mgr.load_one_to_reg``) in flat ``(kv, dt, half)`` order; ``_ring_drive`` calls it on
+    demand so only ``ring`` loads are live at a time instead of all 2*NKV*NDT. ``head`` adopts
+    an NP-deep prefetch already issued by the caller (the warp-specialized preamble, which
+    staggers it against the global->LDS prefetch). Each K fragment is the two 16-col halves of
+    a d-tile shuffled into a v16 fragment matching the Q frag layout.
     """
     R = len(q_frags_list)
     NKV = n_block // WMMA_N  # output kv tiles (WMMA_N kv rows each)
@@ -305,20 +406,24 @@ def _qk_gemm(*, k_values, q_frags_list, n_block):
     # K fragment (shared by all q-tiles); NDT d-tiles accumulate into one kv-tile's
     # s_acc, independently per q-tile.
     s_acc_list = [[None] * NKV for _ in range(R)]
-    j = 0
-    for kv in range(NKV):
-        for dt in range(NDT):
-            lo = k_values[j]
-            hi = k_values[j + 1]
-            j += 2
-            k_frag = lo.shuffle(hi, list(range(16)))
-            for qt in range(R):
-                acc = (
-                    s_acc_list[qt][kv]
-                    if dt > 0
-                    else fx.Vector.filled(8, 0.0, fx.Float32)
-                )
-                s_acc_list[qt][kv] = _wmma(k_frag, q_frags_list[qt][dt], acc)
+
+    def consume(i, lo, hi):
+        kv, dt = divmod(i, NDT)
+        k_frag = lo.shuffle(hi, list(range(16)))
+        for qt in range(R):
+            acc = (
+                s_acc_list[qt][kv] if dt > 0 else fx.Vector.filled(8, 0.0, fx.Float32)
+            )
+            s_acc_list[qt][kv] = _wmma(k_frag, q_frags_list[qt][dt], acc)
+
+    _ring_drive(
+        num_frag=NKV * NDT,
+        emit=k_emit,
+        consume=consume,
+        ring=ring,
+        lag=lag,
+        head=head,
+    )
     return s_acc_list
 
 
@@ -553,7 +658,17 @@ def _softmax(
     return p_list, m_new_list, d_new_list, corr_list, do_rescale_list
 
 
-def _pv_gemm(*, v_values, p_list, v_hdim, n_block, o_acc_list=None):
+def _pv_gemm(
+    *,
+    v_emit,
+    p_list,
+    v_hdim,
+    n_block,
+    o_acc_list=None,
+    head=None,
+    ring=PV_RING,
+    lag=PV_LAG,
+):
     """GEMM2: O^T = V^T @ P^T for one resident KV tile, for all R q-WMMA-tiles this
     wave owns. V is **shared** across the q-tiles (transpose-loaded once), so each
     V fragment is shuffled once and fed into R independent WMMA chains.
@@ -569,45 +684,46 @@ def _pv_gemm(*, v_values, p_list, v_hdim, n_block, o_acc_list=None):
     list of running O accumulators (each ``d_tiles`` v8-f32, already rescaled by
     ``corr``). Returns ``out_list``: a length-R list of updated O accumulators.
 
-    ``v_values`` is the already-burst-loaded flat ``(dt, kt, half)`` list of v8-bf16
-    transpose-load results (from ``v_mgr.load_v_to_reg``, kept OUT of the WMMA stream so there is
-    no wmma->ds_load issue bubble); a single ``s_wait_dscnt(0)`` drains that burst
-    here before any WMMA. Online accumulation: each tile's PV adds onto the running
-    o_acc. Each WMMA operand is a v16 bf16 fragment = two 16-wide halves shuffled:
-    A from V-tiles (kv, kv+16), B from softmax tiles (p[2kt], p[2kt+1]).
+    ``v_emit(j)`` emits the ``j``-th V transpose ds_load of the resident block (see
+    ``v_mgr.load_one_to_reg``) in flat ``(dt, kt, half)`` order; ``_ring_drive`` calls it on
+    demand so only ``ring`` loads are live at a time instead of all 2*d_tiles*nkt. ``head``
+    adopts the NP-deep prefetch the caller issues before softmax, so that latency still hides
+    under the softmax VALU. Online accumulation: each tile's PV adds onto the running o_acc.
+    Each WMMA operand is a v16 bf16 fragment = two 16-wide halves shuffled: A from V-tiles
+    (kv, kv+16), B from softmax tiles (p[2kt], p[2kt+1]).
     """
     R = len(p_list)
     d_tiles = v_hdim // WMMA_M  # output d-tiles (M axis, WMMA_M d rows each)
     nkt = n_block // WMMA_K  # kv contraction tiles (K=32 kv each)
 
-    # Drain the whole V transpose burst once; every v_values entry is now resident.
-    rocdl.s_wait_dscnt(0)
-
     out_list = [[None] * d_tiles for _ in range(R)]
-    for dt in range(d_tiles):
-        accs = [
-            (
-                o_acc_list[qt][dt]
-                if o_acc_list is not None
-                else fx.Vector.filled(8, 0.0, fx.Float32)
-            )
-            for qt in range(R)
-        ]
-        j = dt * nkt * 2
-        for kt in range(nkt):
-            # A-operand: V^T frag = two 16-kv transpose-load tiles -> v16 bf16
-            # (shared across q-tiles).
-            v_lo = v_values[j]
-            v_hi = v_values[j + 1]
-            j += 2
-            v_frag = v_lo.shuffle(v_hi, list(range(16)))
-            for qt in range(R):
-                # B-operand: P^T frag = two consecutive softmax kv-tiles -> v16 bf16.
-                p = p_list[qt]
-                p_frag = p[2 * kt].shuffle(p[2 * kt + 1], list(range(16)))
-                accs[qt] = _wmma(v_frag, p_frag, accs[qt])
+
+    def consume(i, v_lo, v_hi):
+        dt, kt = divmod(i, nkt)
+        # A-operand: V^T frag = two 16-kv transpose-load tiles -> v16 bf16 (shared
+        # across q-tiles).
+        v_frag = v_lo.shuffle(v_hi, list(range(16)))
         for qt in range(R):
-            out_list[qt][dt] = accs[qt]
+            acc = out_list[qt][dt]
+            if acc is None:
+                acc = (
+                    o_acc_list[qt][dt]
+                    if o_acc_list is not None
+                    else fx.Vector.filled(8, 0.0, fx.Float32)
+                )
+            # B-operand: P^T frag = two consecutive softmax kv-tiles -> v16 bf16.
+            p = p_list[qt]
+            p_frag = p[2 * kt].shuffle(p[2 * kt + 1], list(range(16)))
+            out_list[qt][dt] = _wmma(v_frag, p_frag, acc)
+
+    _ring_drive(
+        num_frag=d_tiles * nkt,
+        emit=v_emit,
+        consume=consume,
+        ring=ring,
+        lag=lag,
+        head=head,
+    )
     return out_list
 
 
@@ -677,9 +793,8 @@ def _core_attention(
     part that differs between varlen and batched layouts — and passes them here.
 
     Warp-specialized: the caller dispatches on runtime ``warp_type`` and traces this
-    body TWICE (once per compile-time ``warp_type``); the two instantiations differ in
-    the ``main_loop`` preamble ordering (LO drives K load, HI shadows it) and rendezvous
-    on a 2-wave named barrier (``_named_barrier_pair``, currently a no-op stub).
+    body TWICE (once per compile-time ``warp_type``); the two instantiations differ only
+    in the ``main_loop`` preamble ordering (LO drives K load, HI shadows it).
     """
     lane_idx = _lane_id()
     kv_head, q_head_idx, seq_idx = _packed_tile_indices(gqa_ratio, warp_idx, lane_idx)
@@ -781,16 +896,16 @@ def _core_attention(
     else:
         kv_len_wg = kv_len
 
-    # Tile range [start_tile, n_tiles): n_tiles from the right-clipped kv_len_wg;
+    # Tile range [start_tile, num_tiles): num_tiles from the right-clipped kv_len_wg;
     # start_tile skips whole tiles before the WG's min query's band start. The
     # defensive min() keeps start_tile a valid buffer index even for an over-launched
     # WG whose whole band is empty (its per-element masks zero the work anyway).
-    n_tiles = fx.ceildiv(kv_len_wg, fx.Int32(n_block))
+    num_tiles = fx.ceildiv(kv_len_wg, fx.Int32(n_block))
     if mask_left:
         wg_min_seq = (block_x * fx.Int32(BLOCK_M)) // fx.Int32(gqa_ratio)
         kv_lo = fx.max(wg_min_seq + causal_off - window_left, fx.Int32(0))
         start_tile = kv_lo // fx.Int32(n_block)
-        start_tile = fx.min(start_tile, fx.Int32(n_tiles) - fx.Int32(1))
+        start_tile = fx.min(start_tile, fx.Int32(num_tiles) - fx.Int32(1))
     else:
         start_tile = fx.Int32(0)
 
@@ -932,7 +1047,7 @@ def _core_attention(
     _init = _init + k_lds_ld_curr + k_lds_ld_next + v_lds_ld_curr + v_lds_ld_next
 
     # ========================================================================
-    # Main KV loop -- stream tiles [start_tile, n_tiles) through the N_KV_PP ping-pong
+    # Main KV loop -- stream tiles [start_tile, num_tiles) through the N_KV_PP ping-pong
     # ring, one tile per iteration. The buffer is selected by the carried curr ds
     # pointers, swapped curr<->next at the end of each `main_loop`.
     #
@@ -973,11 +1088,11 @@ def _core_attention(
         v_next = list(state[_VB0 + 1 * _NVB : _VB0 + 2 * _NVB])
 
         # Warp-specialized preamble: same pieces, ordered so the SIMD-mate pair (i / i+4)
-        # staggers K load vs prefetch around `_named_barrier_pair`. Correctness is
+        # staggers K load against the global->LDS prefetch. Correctness is
         # warp-type-independent (each wave reads its own resident K under the workgroup
-        # barrier); the rendezvous is a perf-only stagger. The READ (load_k_to_reg(k_curr))
-        # and ping-pong pointer machinery are UNIFORM; only the global->LDS ISSUE branches
-        # by USE_TDM_LOADER (V1 cluster_load_async / V2 TDM copy).
+        # barrier); the stagger is perf-only. The READ (the K ring head) and ping-pong
+        # pointer machinery are UNIFORM; only the global->LDS ISSUE branches by
+        # USE_TDM_LOADER (V1 cluster_load_async / V2 TDM copy).
         nxt = t + fx.Int32(1)
         nxt_row0 = nxt * fx.Int32(n_block)
         nxt_valid = _kv_valid(nxt_row0)
@@ -1053,41 +1168,53 @@ def _core_attention(
                     _async_load_to_lds(k_g, k_l, cluster=True, imm_offs=k_i)
                     _async_load_to_lds(v_g, v_l, cluster=True, imm_offs=v_i)
 
-            scf_if_dispatch(nxt < fx.Int32(n_tiles), _issue)
+            scf_if_dispatch(nxt < fx.Int32(num_tiles), _issue)
 
         # Address VALU up front (no barrier dependency) so it overlaps the drain; only
         # the async issue in _prefetch must stay after the barrier.
         addr = _addr_phase()
+        num_kfrag = k_mgr.num_ds_loads() // 2
+
+        def _k_emit(j):
+            return k_mgr.load_one_to_reg(k_curr, j)
+
+        def _k_head():
+            return _ring_head(
+                num_frag=num_kfrag, emit=_k_emit, ring=QK_RING, lag=QK_LAG
+            )
+
         if warp_type == WarpType.LO_WARP:
             _drain_barrier()
-            k_values = k_mgr.load_k_to_reg(k_curr)
+            k_head = _k_head()
             _prefetch(addr)
-            _named_barrier_pair(warp_idx)
         else:
             _drain_barrier()
             _prefetch(addr)
-            _named_barrier_pair(warp_idx)
-            k_values = k_mgr.load_k_to_reg(k_curr)
+            k_head = _k_head()
 
-        # Fence the K burst out of the WMMA stream (no wmma<-ds_load bubble). No explicit
-        # s_wait_dscnt: the K ds_load is SSA-visible, so mode-2 inserts the dscnt cover
-        # itself, placed optimally so the WMMA can issue as soon as its operands land.
+        # Fence the K prefetch out of the WMMA stream (no wmma<-ds_load bubble); the ring
+        # itself issues the s_wait_dscnt that covers each fragment.
         rocdl.sched_barrier(0)
 
-        # ---- GEMM1: S^T = K @ Q^T for this KV tile (== P^T pre-softmax); consumes the
-        # pre-loaded k_values (K burst already drained by the preamble above). ----
+        # ---- GEMM1: S^T = K @ Q^T for this KV tile (== P^T pre-softmax); the ring adopts
+        # the NP-deep K prefetch issued by the preamble above. ----
         s_list = _qk_gemm(
-            k_values=k_values,
+            k_emit=_k_emit,
             q_frags_list=q_frags,
             n_block=n_block,
+            head=k_head,
         )
 
-        # ---- Burst ALL this-tile V transpose ds_loads (out of the WMMA stream), now
-        # that QK has consumed the K burst. Issued BEFORE softmax so the ds_load
-        # latency hides under softmax's VALU; the values are consumed by _pv_gemm
-        # after the rescale. ----
+        # ---- Issue the V ring's NP-deep prefetch (out of the WMMA stream), now that QK
+        # has consumed its K ring. BEFORE softmax so the ds_load latency hides under
+        # softmax's VALU; _pv_gemm adopts it and refills the rest after the rescale. ----
+        num_vfrag = v_mgr.num_ds_loads() // 2
+
+        def _v_emit(j):
+            return v_mgr.load_one_to_reg(v_curr, j)
+
         rocdl.sched_barrier(0)
-        v_values = v_mgr.load_v_to_reg(v_curr)
+        v_head = _ring_head(num_frag=num_vfrag, emit=_v_emit, ring=PV_RING, lag=PV_LAG)
         rocdl.sched_barrier(0)
 
         # ---- Softmax: online update over this KV tile's kv axis, INDEPENDENTLY per
@@ -1150,7 +1277,8 @@ def _core_attention(
             o_resc_list.append(o_resc)
 
         o_new_list = _pv_gemm(
-            v_values=v_values,
+            v_emit=_v_emit,
+            head=v_head,
             p_list=p_list,
             v_hdim=v_hdim,
             n_block=n_block,
@@ -1168,7 +1296,7 @@ def _core_attention(
         out += k_next + k_curr + v_next + v_curr
         return out
 
-    # ---- Stream tiles [start_tile, n_tiles) through 3 sub-loops split by the attention
+    # ---- Stream tiles [start_tile, num_tiles) through 3 sub-loops split by the attention
     # band so interior tiles fully inside the band skip masking. clean_lo/clean_hi are
     # runtime split points, but the mask on/off per sub-loop is COMPILE-TIME (each loop
     # traces main_loop once with fixed None-ness). Ping-pong swap state threads
@@ -1176,20 +1304,20 @@ def _core_attention(
     # split leaves it intact.
     #   [start_tile, clean_lo) left boundary   (emitted only when mask_left)
     #   [clean_lo,   clean_hi) clean, no mask
-    #   [clean_hi,   n_tiles)  right boundary + kv_len tail (last tile)
-    n_iter = fx.Int32(n_tiles) - start_tile
-    n_last = fx.Int32(n_tiles) - fx.Int32(1)  # last tile always carries the kv_len tail
+    #   [clean_hi,   num_tiles)  right boundary + kv_len tail (last tile)
+    num_iter = fx.Int32(num_tiles) - start_tile
+    last_tile = fx.Int32(num_tiles) - fx.Int32(1)  # last tile always carries the kv_len tail
 
     # clean_hi = first tile that could need RIGHT masking = the WG's earliest query's
-    # diagonal tile ((min q_max + 1)//n_block). Kept <= n_last so the tail tile stays in
+    # diagonal tile ((min q_max + 1)//n_block). Kept <= last_tile so the tail tile stays in
     # the right loop, and >= start_tile for a valid partition.
     if mask_right:
         wg_min_seq = (block_x * fx.Int32(BLOCK_M)) // fx.Int32(gqa_ratio)
         qmax_min = fx.max(wg_min_seq + causal_off + window_right, fx.Int32(0))
         clean_hi = (qmax_min + fx.Int32(1)) // fx.Int32(n_block)
     else:
-        clean_hi = fx.Int32(n_tiles)
-    clean_hi = fx.max(fx.min(clean_hi, n_last), start_tile)
+        clean_hi = fx.Int32(num_tiles)
+    clean_hi = fx.max(fx.min(clean_hi, last_tile), start_tile)
 
     # clean_lo = first tile fully at/above the WG's latest query's window start
     # (ceildiv(max q_min, n_block)); clamped into [start_tile, clean_hi].
@@ -1238,7 +1366,7 @@ def _core_attention(
     state = _run_tiles(
         state,
         clean_hi,
-        fx.Int32(n_tiles),
+        fx.Int32(num_tiles),
         mask_left=mask_left,
         mask_right=mask_right,
         kv_len=kv_len,
@@ -1251,12 +1379,12 @@ def _core_attention(
     # (unnormalized); divide by the per-query denom d (peer-consistent across the
     # lane pair) to finish softmax. OManager16b masks rows with seq >= q_len.
     # ========================================================================
-    # O staging reuses the NON-CURRENT K|V slot. Local-parity ring: n_iter tiles occupy
-    # local indices 0..n_iter-1, so the LAST tile lives in buffer (n_iter-1)%N_KV_PP and
-    # the free (non-current) slot is n_iter%N_KV_PP (base 0KB or 128KB). With the last
+    # O staging reuses the NON-CURRENT K|V slot. Local-parity ring: num_iter tiles occupy
+    # local indices 0..num_iter-1, so the LAST tile lives in buffer (num_iter-1)%N_KV_PP and
+    # the free (non-current) slot is num_iter%N_KV_PP (base 0KB or 128KB). With the last
     # iteration's dead prefetch skipped, no wave ever writes that slot near the end: the
-    # last load into it was local tile n_iter-2 (issued during local tile n_iter-3,
-    # consumed at n_iter-2), and the top-of-body barrier at local tile n_iter-1 already
+    # last load into it was local tile num_iter-2 (issued during local tile num_iter-3,
+    # consumed at num_iter-2), and the top-of-body barrier at local tile num_iter-1 already
     # synchronized every wave past that read. So the slot is idle here -- no cross-wave
     # barrier needed. Only the V1 loader issues async loads (asynccnt); under TDM (V2/V3)
     # K/V/Q load via tensorcnt, so nothing increments asynccnt and s_wait_asynccnt(0) is a
@@ -1274,7 +1402,7 @@ def _core_attention(
     assert (
         o_mgr.get_lds_size_in_byte() <= slot_bytes
     ), f"O ring budget {o_mgr.get_lds_size_in_byte()}B exceeds K|V slot {slot_bytes}B"
-    non_cur_pp = n_iter % fx.Int32(N_KV_PP)
+    non_cur_pp = num_iter % fx.Int32(N_KV_PP)
     if not USE_TDM_LOADER:
         rocdl.s_wait_asynccnt(
             0
@@ -1808,7 +1936,7 @@ def _ensure_thd_kernel(
 
     _launch.compile_hints["llvm_options"] = {
         "amdgpu-expert-scheduling-mode": ENABLE_SCHED_MODE2,
-        # "amdgpu-sched-strategy": "coexec",  # gfx1250 co-exec sched; revisit after named barrier
+        # "amdgpu-sched-strategy": "coexec",  # gfx1250 co-exec sched for warp specialization
     }
     _launch.compile_hints["waves_per_eu"] = 2
     _launch_fns[key] = _launch
@@ -1918,7 +2046,7 @@ def _ensure_bshd_kernel(
 
     _launch.compile_hints["llvm_options"] = {
         "amdgpu-expert-scheduling-mode": ENABLE_SCHED_MODE2,
-        # "amdgpu-sched-strategy": "coexec",  # gfx1250 co-exec sched; revisit after named barrier
+        # "amdgpu-sched-strategy": "coexec",  # gfx1250 co-exec sched for warp specialization
     }
     _launch.compile_hints["waves_per_eu"] = 2
     _launch_fns[key] = _launch
