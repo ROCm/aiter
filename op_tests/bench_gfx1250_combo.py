@@ -59,8 +59,9 @@ same thing to every op:
     inverse_rope    1..16384. The axis is -s at fixed TP1/TP4 shapes
                     -b 128,16 32,4, and 65536 faults -- in the triton reference
                     the UT compares against, not in the kernel under test.
-    mega_moe        1..2048 plus 65536. The 65536 tier is expected to expose
-                    the current cco symmetric-arena limit; see _MEGA_MOE_TOKENS.
+    mega_moe        1..2048 plus 16384 and 65536. The 65536 tier is expected to
+                    expose the current cco symmetric-arena limit; see
+                    _MEGA_MOE_TOKENS.
     a8w8_blockscale 256..65536. M=256/512 cover DSv4 decode batches;
                     smaller M stays out because of a UT bug; see DSV4_OPS.
     mla_v4_prefill  1024..16384, the DSv4 prefill chunk. 65536 faults; see
@@ -497,7 +498,9 @@ _MLA_PREFILL_TOKENS = _tokens((1024, 2048, 4096, 8192, 16384))
 # and asks for 7.5 GB. That is a per_rank_vmm the UT never passes, not something
 # MORI_SHMEM_HEAP_SIZE reaches. Keep the tier in the sweep so the limitation is
 # visible in the structured failure output rather than silently unmeasured.
-_MEGA_MOE_TOKENS = _tokens((1, 16, 32, 64, 128, 256, 512, 1024, 2048, 65536))
+_MEGA_MOE_TOKENS = _tokens(
+    (1, 16, 32, 64, 128, 256, 512, 1024, 2048, 16384, 65536)
+)
 # What dispatch puts on the wire; combine is always bf16, so anything but bf16
 # is an asymmetric pair. fp4 is the wire DSv4 actually serves on -- the receiver
 # hands the payload straight to the expert GEMM as its A operand, and that GEMM
