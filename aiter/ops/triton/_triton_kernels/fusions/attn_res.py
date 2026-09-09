@@ -316,7 +316,5 @@ if ATTN_RES_TRITON_AUTOTUNE:
             "WRITE_BLOCK_CAT",
             "QUANT_FP8",
         ],
-        warmup=10,
-        rep=20,
         cache_results=True,
     )(attnres_fwd_kernel)
