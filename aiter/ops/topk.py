@@ -397,8 +397,24 @@ def top_k_per_row_prefill(
     When stable=True, the one-block path is forced with deterministic,
     ascending-index ordered, smallest-index tie-breaking emit so every
     tensor-parallel rank selects and orders an identical KV set; the caller sizes
-    the workspace for the ob path in that case."""
-    if not stable and topk_use_mulblocks(numRows, stride0):
+    the workspace for the ob path in that case. On gfx1250, calls that would use
+    the HIP one-block path are dispatched to the FlyDSL one-block kernel."""
+    use_mulblocks = not stable and topk_use_mulblocks(numRows, stride0)
+    if get_gfx() == "gfx1250" and not use_mulblocks:
+        return flydsl_radix_topk_one_block_gfx1250(
+            logits,
+            rowStarts,
+            rowEnds,
+            indices,
+            values,
+            numRows,
+            stride0,
+            stride1,
+            k,
+            stable,
+        )
+
+    if use_mulblocks:
         size = topk_mb_workspace_size(numRows, stride0, k, False)
         workspace = get_topk_mb_workspace(logits.device, size)
     else:
@@ -419,7 +435,7 @@ def top_k_per_row_prefill(
     )
 
 
-def radix_topk_one_block_gfx1250(
+def flydsl_radix_topk_one_block_gfx1250(
     logits: torch.Tensor,
     rowStarts: torch.Tensor,
     rowEnds: torch.Tensor,

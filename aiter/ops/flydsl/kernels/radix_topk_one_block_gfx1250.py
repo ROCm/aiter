@@ -458,9 +458,10 @@ def build_radix_topk_one_block_gfx1250_module(
                         out_pos = atomic_add_i32(metadata, one, _RUNNING_ABOVE, "workgroup")
                         if out_pos < top_k:
                             if const_expr(stable):
-                                stable_indices[out_pos] = col
-                                if const_expr(write_values):
-                                    stable_keys[out_pos] = ordered_value(key).bitcast(fx.Int32)
+                                if const_expr(stable_sort_enabled):
+                                    stable_indices[out_pos] = col
+                                    if const_expr(write_values):
+                                        stable_keys[out_pos] = ordered_value(key).bitcast(fx.Int32)
                             else:
                                 row_indices[out_pos] = row_start + col
                                 if const_expr(write_values):
