@@ -1,18 +1,22 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Host launch for gfx942/gfx950 TP∈{2,4,8} INT4 all-reduce.
+"""Host launch for gfx942/gfx950 TP∈{2,4,8} INT4/INT6 all-reduce.
 
 Public type ``QRInt4``, with two interchangeable schedules selected by
-``algorithm``: ``"two_shot"`` (the default -- direct fanout to all N-1 peers,
-twice) and ``"ring"`` (2(N-1) single-destination hops). Super-tile ST∈{1,8}.
-INT4 nibble + group-16 E4M3. Payload HBM is bf16.
+``algorithm``. Both are two-shot -- reduce-scatter then all-gather -- so they
+are named for the topology of each lap instead: 
+- ``"mesh"`` the default: fanout to all N-1 peers, twice.
+- ``"ring"`` 2(N-1) single-destination hops.
+Super-tile ST∈{1,8}. INT4 nibble or INT6 bit-plane pair, both with group-16
+E4M3 scales. Payload HBM is bf16.
 """
 
 from __future__ import annotations
 
 import ctypes
 import logging
+import os
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -27,6 +31,7 @@ from aiter.jit.utils.chip_info import get_gfx_runtime
 
 from .qr_int4_ipc import UncachedIpcHeap
 from .qr_int4_kernel import (
+    CODECS,
     DEFAULT_GRID_CAP,
     SUPER_TILES,
     SUPPORTED_WORLDS,
@@ -36,6 +41,7 @@ from .qr_int4_kernel import (
     make_qr_int4_kernel,
 )
 from .qr_int4_ring_kernel import (
+    AG_CODECS,
     RING_ST_LADDER,
     RING_SUPER_TILES,
     RS_CODECS,
@@ -47,61 +53,53 @@ logger = logging.getLogger("aiter")
 _SUPPORTED_ARCHS = ("gfx942", "gfx950")
 
 # How the IPC inbox is allocated. The wire protocol is identical in every
-# mode; only the memory type changes. See docs/qr_int4_mi350p.md.
+# mode; only the memory type changes.
 INBOX_MEMORY_MODES = ("auto", "uncached", "finegrained", "default")
 
+# Process-wide codec override, applied to *both* laps of whichever schedule is
+# selected. Unset means the per-world-size defaults in ``_resolve_codecs``.
+_CODEC_ENV_VAR = "AITER_ALL_REDUCE_CODEC"
+
+
+def _parse_codec_env() -> str | None:
+    """The codec named by ``AITER_ALL_REDUCE_CODEC``, or None.
+
+    Parsed once at import so an unrecognized value warns once rather than per
+    ``QRInt4``. An unrecognized value is ignored rather than fatal.
+    """
+    raw = os.environ.get(_CODEC_ENV_VAR)
+    if raw is None or not raw.strip():
+        return None
+    name = raw.strip().lower()
+    if name not in CODECS:
+        logger.warning(
+            "QRInt4: ignoring %s=%r, expected one of %s",
+            _CODEC_ENV_VAR,
+            raw,
+            tuple(n.upper() for n in CODECS),
+        )
+        return None
+    return name
+
+
+AITER_ALL_REDUCE_CODEC = _parse_codec_env()
+
 # Smallest payload sent through this kernel, in bytes.
-#
-# This is an accuracy policy, not a performance guard. On a fine-grained inbox
-# the kernel is faster than ``cross_device_reduce`` at every size measured on
-# MI350P at TP4 -- 13.4 us against 22.2 at 14 KiB, 15.0 against 54.3 at 112 KiB
-# -- so there is no size at which using it costs throughput. What it always
-# costs is ~36 dB of SQNR (~19 dB against the exact kernels' ~55 dB).
-#
-# The default skips the decode tail, where the absolute saving is a few
-# microseconds on a collective that is not the bottleneck and quantizing the
-# whole activation is a poor trade. Raise it to be more conservative, or pass
-# ``min_bytes=0`` to use the kernel at every size.
-#
-# The value comes from the post-fix sweep in docs/qr_int4_mi350p.md, not from
-# the pre-fix numbers, which had the kernel merely at par at these sizes.
 MIN_PAYLOAD_BYTES = 128 << 10
 
 # Floor on the block count when batching publishes into super-tiles; see
 # ``QRInt4._grid_x``. Shrinking the grid trades parallelism for fewer release
 # fences, which is only a good trade once there are enough fences to matter.
-# 32 is a quarter of an MI350P's 128 CUs: low enough that the 14 MiB case still
-# reaches its measured optimum of 56 blocks, high enough that the sub-MiB cases
-# keep the parallelism they actually need.
 _MIN_BATCH_BLOCKS = 32
 
-# Size floor for the ring, separate from the two-shot's -- and unlike the
-# two-shot's, this one is a *speed* policy, not an accuracy one.
-#
-# The ring pays 2(N-1) serialized handshakes where two-shot pays 2 (6 at TP4,
-# 14 at TP8) and buys back a contiguous single-destination write. Which wins is
-# purely a size question. Measured on MI350P (PCIe, fine-grained inbox), TP4,
-# bf16, hidden 7168, ST=8, 30 timed iterations:
-#
-#     tokens    MiB   two-shot     ring
-#        12    0.16     17.1 us   32.5 us   1.9x slower
-#       128    1.75     52.8 us   73.9 us
-#       512    7.00    134.8 us  157.0 us
-#       640    8.75    161.9 us  176.6 us
-#       768   10.50    192.1 us  191.3 us   <- par
-#       896   12.25    217.5 us  208.4 us
-#      1024   14.00    249.6 us  227.4 us   1.10x faster
-#      4096   56.00    939.8 us  829.7 us   1.13x faster
-#
-# 12 MiB sits just past the measured par point, so `is_beneficial` only admits
-# sizes where the ring actually wins rather than merely ties.
-#
-# Note this is a TP>=4 result. At TP2 the two-shot already writes to a single
-# peer, so there is no destination interleaving for the ring to remove and it
-# only adds hops: 458.5 us against 414.5 at 56 MiB. It is still *more accurate*
-# there (22.2 dB against 19.2, see the class docstring), which is a reason to
-# choose it, but not a throughput one.
-_RING_MIN_PAYLOAD_BYTES = 12 << 20
+# Size floor for the ring algorithm.
+# TODO: Measure the eaxct crossover between mesh and ring.
+_RING_INT4_MIN_PAYLOAD_BYTES = 12 << 20
+_RING_INT6_MIN_PAYLOAD_BYTES = 16 << 20
+_RING_MIN_PAYLOAD_BYTES_BY_RS_CODEC = {
+    "int4": _RING_INT4_MIN_PAYLOAD_BYTES,
+    "int6": _RING_INT6_MIN_PAYLOAD_BYTES,
+}
 
 
 @dataclass(frozen=True)
@@ -114,29 +112,40 @@ class _Algorithm:
     call, which super-tile values and wire formats that factory accepts, and
     where the size floor sits. That is this record.
 
-    ``build`` is keyword-only and always receives ``rank`` and ``rs_codec``,
-    whether or not a given schedule uses them. The ring bakes ``rank`` in at
-    compile time -- the chunk a step operates on is ``(rank - step) % N``, which
-    has to be a Python constant to index a register-resident atom list -- while
-    two-shot takes it as a runtime kernel argument and ignores it here.
+    ``build`` is keyword-only and always receives ``rank``, ``rs_codec`` and
+    ``ag_codec``, whether or not a given schedule uses them. The ring bakes
+    ``rank`` in at compile time -- the chunk a step operates on is
+    ``(rank - step) % N``, which has to be a Python constant to index a
+    register-resident atom list -- while the mesh takes it as a runtime kernel
+    argument and ignores it here.
     """
 
     name: str
     build: Callable[..., dict]
     super_tiles: tuple[int, ...]
     rs_codecs: tuple[str, ...]
+    ag_codecs: tuple[str, ...]
     min_bytes: int
     min_batch_blocks: int
     default_super_tile: int
+    # Per-reduce-scatter-codec override of ``min_bytes``. Empty means the codec
+    # does not move the floor, which is true of any schedule with one wire
+    # format. See ``_RING_MIN_PAYLOAD_BYTES_BY_RS_CODEC``.
+    min_bytes_by_rs_codec: tuple[tuple[str, int], ...] = ()
+
+    def floor_bytes(self, rs_codec: str) -> int:
+        return dict(self.min_bytes_by_rs_codec).get(rs_codec, self.min_bytes)
     # ``(min_payload_bytes, super_tile, grid_cap)`` rungs, ascending. Empty means
-    # "one super-tile for every size", which is what two-shot does. When it is
+    # "one super-tile for every size", which is what the mesh does. When it is
     # non-empty and the caller did not pin ``super_tile``, QRInt4 builds an
     # engine per rung and selects by payload size at launch.
     st_ladder: tuple[tuple[int, int, int], ...] = ()
 
 
-def _build_two_shot(*, world_size, rank, super_tile, grid, inbox_memory, rs_codec):
-    del rank, rs_codec  # a runtime kernel argument; and not a two-shot knob
+def _build_mesh(
+    *, world_size, rank, super_tile, grid, inbox_memory, rs_codec, ag_codec
+):
+    del rank, rs_codec, ag_codec  # a runtime kernel argument; and not mesh knobs
     return make_qr_int4_kernel(
         world_size=world_size,
         super_tile=super_tile,
@@ -146,11 +155,12 @@ def _build_two_shot(*, world_size, rank, super_tile, grid, inbox_memory, rs_code
 
 
 ALGORITHMS = {
-    "two_shot": _Algorithm(
-        name="two_shot",
-        build=_build_two_shot,
+    "mesh": _Algorithm(
+        name="mesh",
+        build=_build_mesh,
         super_tiles=SUPER_TILES,
         rs_codecs=("int4",),
+        ag_codecs=("int4",),
         min_bytes=MIN_PAYLOAD_BYTES,
         min_batch_blocks=_MIN_BATCH_BLOCKS,
         default_super_tile=8,
@@ -160,13 +170,89 @@ ALGORITHMS = {
         build=make_qr_int4_ring_kernel,
         super_tiles=RING_SUPER_TILES,
         rs_codecs=RS_CODECS,
+        ag_codecs=AG_CODECS,
         min_bytes=_RING_MIN_PAYLOAD_BYTES,
         min_batch_blocks=_MIN_BATCH_BLOCKS,
         default_super_tile=8,
         st_ladder=RING_ST_LADDER,
+        min_bytes_by_rs_codec=tuple(_RING_MIN_PAYLOAD_BYTES_BY_RS_CODEC.items()),
     ),
 }
-DEFAULT_ALGORITHM = "two_shot"
+DEFAULT_ALGORITHM = "mesh"
+
+# World size at which the ring's reduce-scatter lap needs INT6 to clear the
+# 18 dB SQNR floor the schedules are held to.
+#
+# The ring's error grows with N -- it requantizes the running partial at every
+# hop, and the partial's extremum grows with the contributions folded in -- so
+# unlike the mesh it does not have one SQNR for every world size.
+_RS_INT6_MIN_WORLD = 8
+
+
+_warned_codecs: set[tuple[str, str, str]] = set()
+
+
+def _warn_codec_unavailable(algo_name, label, requested, used):
+    """Say it once per (schedule, lap, request), not once per engine.
+
+    ``QRInt4`` builds one engine per super-tile rung, so a per-construction
+    warning would fire several times for one object and again for every object
+    -- for a condition that is a property of the schedule and cannot change
+    within a process.
+    """
+    key = (algo_name, label, requested)
+    if key in _warned_codecs:
+        return
+    _warned_codecs.add(key)
+    logger.warning(
+        "QRInt4: %s=%s does not apply to %s on algorithm=%r; using %r",
+        _CODEC_ENV_VAR,
+        requested.upper(),
+        label,
+        algo_name,
+        used,
+    )
+
+
+def _resolve_codecs(algo, world_size, rs_codec, ag_codec):
+    """Codecs for one engine: explicit argument > env var > per-N default.
+
+    ``None`` means "not specified", which is why the constructor cannot simply
+    default these to ``"int4"``: an explicit ``rs_codec="int4"`` has to outrank
+    ``AITER_ALL_REDUCE_CODEC=INT6``, and it cannot if the two are indistinguishable
+    by the time they get here.
+
+    A codec the selected schedule cannot build falls back with a warning rather
+    than raising . An explicit argument still raises.
+    """
+    rs_default = "int6" if world_size >= _RS_INT6_MIN_WORLD else "int4"
+
+    # The all-gather lap forwards bytes verbatim and so contributes exactly one
+    # quantization. It is the dominant error term if the RS lap is INT6.
+    ag_default = "int4"
+
+    def _pick(requested, default, supported, label):
+        if requested is not None:
+            if requested not in supported:
+                raise ValueError(
+                    f"{label} must be one of {supported} for "
+                    f"algorithm={algo.name!r}, got {requested!r}"
+                )
+            return requested
+        # The default is a property of the world size, not of the schedule.
+        if default not in supported:
+            default = supported[0]
+        env = AITER_ALL_REDUCE_CODEC
+        if env is not None and env != default:
+            if env in supported:
+                return env
+            _warn_codec_unavailable(algo.name, label, env, default)
+        return default
+
+    return (
+        _pick(rs_codec, rs_default, algo.rs_codecs, "rs_codec"),
+        _pick(ag_codec, ag_default, algo.ag_codecs, "ag_codec"),
+    )
 
 # KFD io-link type for xGMI, from include/uapi/linux/kfd_sysfs.h. PCIe is 2.
 _HSA_IOLINK_TYPE_XGMI = 11
@@ -346,25 +432,26 @@ class QRInt4:
 
     Requires a non-NCCL, single-node process group for IPC metadata exchange.
 
-    ``algorithm`` selects the schedule. Both are drop-in for each other -- same
-    constructor, same ``compile`` / ``allreduce`` / ``close``, same payload
-    rules -- so switching is one keyword:
+    ``algorithm`` selects the schedule. Both are two-shot -- reduce-scatter then
+    all-gather -- so they are named for the topology of each lap:
 
-    * ``"two_shot"`` (default) -- reduce-scatter then all-gather, each rank
-      pushing to every one of the ``N-1`` peers. Two hops. Optimal on a meshed
-      xGMI node.
+    * ``"mesh"`` (default) -- each rank pushes to every one of the ``N-1``
+      peers, twice. Two hops. Optimal on a meshed xGMI node.
     * ``"ring"`` -- ``2(N-1)`` hops, each a single contiguous run into exactly
       one peer's inbox. Same wire volume (``2(N-1)/N`` of the payload), traded
-      for per-destination locality: on a PCIe host, one shared uplink handed
-      ``>=256 B`` runs to one destination measured 54.03 GB/s against 36.25 for
-      64 B destination-interleaved. Structurally worse at decode sizes and on
-      xGMI; opt in deliberately.
+      for per-destination locality. Structurally worse at decode sizes and on
+      xGMI - opt in deliberately.
 
-    ``rs_codec`` is the wire format of the ring's reduce-scatter lap, which is
-    the only place the ring loses accuracy the two-shot does not (it requantizes
-    ``N-1`` times where two-shot requantizes once). ``"int6"`` widens that lap
-    only; the all-gather lap forwards bytes verbatim and stays INT4 in both.
-    Rejected for ``algorithm="two_shot"``, which has no such lap.
+    ``rs_codec`` and ``ag_codec`` are the wire formats of the ring's two laps.
+    The reduce-scatter lap is the only place the ring loses accuracy the mesh
+    does not -- it requantizes ``N-1`` times where the mesh requantizes once --
+    so it defaults to ``"int6"`` at TP8 where we would otherwise lose too much acccuracy. 
+    The all-gather lap forwards bytes verbatim and contributes a single quantization, 
+    so it defaults to ``"int4"`` everywhere and widens only by request.
+
+    Leave both ``None`` to get those defaults. ``AITER_ALL_REDUCE_CODEC=INT4``
+    or ``INT6`` overrides them process-wide, for both laps at once; an explicit
+    argument here outranks the environment.
 
     ``inbox_memory`` selects how the IPC inbox is allocated:
 
@@ -382,8 +469,6 @@ class QRInt4:
     ``min_bytes`` is the payload below which ``allreduce`` refuses to run,
     defaulting to ``MIN_PAYLOAD_BYTES``. ``compile`` is deliberately not gated:
     its warmup tensor is allowed to be small.
-
-    See ``docs/qr_int4_mi350p.md``.
     """
 
     def __init__(
@@ -399,7 +484,8 @@ class QRInt4:
         batch_publishes: bool | None = None,
         min_bytes: int | None = None,
         algorithm: str = DEFAULT_ALGORITHM,
-        rs_codec: str = "int4",
+        rs_codec: str | None = None,
+        ag_codec: str | None = None,
     ):
         if world_size not in SUPPORTED_WORLDS:
             raise ValueError(
@@ -410,7 +496,7 @@ class QRInt4:
                 f"algorithm must be one of {tuple(ALGORITHMS)}, got {algorithm!r}"
             )
         algo = ALGORITHMS[algorithm]
-        # ``None`` means "use the schedule's own policy": for two-shot that is a
+        # ``None`` means "use the schedule's own policy": for the mesh that is a
         # single super-tile, for the ring the payload-size ladder. Passing a
         # value pins one super-tile for every size, which is what the benchmark
         # variants and the tuning sweeps do.
@@ -422,11 +508,9 @@ class QRInt4:
                 f"super_tile must be one of {algo.super_tiles} for "
                 f"algorithm={algorithm!r}, got {super_tile!r}"
             )
-        if rs_codec not in algo.rs_codecs:
-            raise ValueError(
-                f"rs_codec must be one of {algo.rs_codecs} for "
-                f"algorithm={algorithm!r}, got {rs_codec!r}"
-            )
+        rs_codec, ag_codec = _resolve_codecs(
+            algo, int(world_size), rs_codec, ag_codec
+        )
         group_world = dist.get_world_size(group=group)
         group_rank = dist.get_rank(group=group)
         if group_world != int(world_size):
@@ -471,6 +555,7 @@ class QRInt4:
         self.inbox_memory = resolved_inbox
         self.algorithm = algorithm
         self.rs_codec = rs_codec
+        self.ag_codec = ag_codec
         self._algo = algo
 
         #self._batch_publishes = has_release_fence(resolved_inbox)
@@ -480,7 +565,9 @@ class QRInt4:
             else bool(batch_publishes)
         )
         
-        self.min_bytes = algo.min_bytes if min_bytes is None else int(min_bytes)
+        self.min_bytes = (
+            algo.floor_bytes(rs_codec) if min_bytes is None else int(min_bytes)
+        )
         if self.min_bytes < 0:
             raise ValueError(f"min_bytes must be non-negative, got {self.min_bytes}")
 
@@ -501,6 +588,7 @@ class QRInt4:
                 grid=by_cap[st],
                 inbox_memory=resolved_inbox,
                 rs_codec=rs_codec,
+                ag_codec=ag_codec,
             )
             self._by_st[st] = _StEngine(
                 spec=spec,
@@ -553,7 +641,6 @@ class QRInt4:
         if self._ladder and live_bytes is not None:
             want = self._ladder_st(live_bytes)
         if want == 1:
-            #print(f"[AITER DEBUG] Wanting 1, returning 1")
             return 1
         if self._batch_publishes:
             return want if num_tiles >= want else 1
@@ -671,8 +758,5 @@ class QRInt4:
             )
         num_tiles = max(1, (live_bytes + TILE_BYTES - 1) // TILE_BYTES)
         st = self._pick_st(num_tiles, live_bytes)
-
-        #print(f"[AITER DEBUG]: ")
-        #print(st, self._grid_x(num_tiles, st, self._by_st[st].grid), sorted(self._by_st))
 
         self._launch_eng(self._by_st[st], inp, out, stream)

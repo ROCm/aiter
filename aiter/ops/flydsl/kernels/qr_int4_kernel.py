@@ -1,17 +1,21 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""gfx942/gfx950 TP∈{2,4,8} INT4 two-shot all-reduce.
+"""gfx942/gfx950 TP∈{2,4,8} INT4 **mesh** all-reduce.
+
+Topology of each lap: every rank pushes directly to all ``N-1`` peers, twice. 
 
 INT4 nibble: [-8,+7], −1/8, 4 B/thread, 1152 B rank-tile. Scale is
 group-16 signed E4M3 in the 128 B region. Super-tile ST∈{1,8}; host
 uses ST=1 when ``num_tiles ≤ GRID``. Payload HBM is bf16; in-kernel
 math is packed fp16. Each rank owns ``ATOMS / world_size`` atoms of a
 tile (8 GPUs → 1, 4 → 2, 2 → 4); LDS stays ``ATOMS * 1152``.
+
 """
 
 import logging
 import os
+from dataclasses import dataclass
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
@@ -73,7 +77,7 @@ _CM_NT = 2
 _CM_SC1 = 16
 
 # Cache policy for the peer stores in _fanout_nt / _publish, per inbox memory
-# type. See docs/qr_int4_mi350p.md.
+# type.
 #
 # On an uncached inbox the memory type does all the work: a store cannot sit in
 # any cache, so every peer sees the payload as soon as `vmcnt(0)` retires and
@@ -172,10 +176,96 @@ def has_release_fence(inbox_memory: str) -> bool:
     return _INBOX_POLICY[inbox_memory]["writeback"] is not None
 
 
-# Dequant bit-trick: nibble | 0x6400 then + (-1032.0) as f16x2 reconstructs (q-8).
+# Dequant bit-trick: code | 0x6400 then + (-(1024+bias)) as f16x2 reconstructs
+# (q - bias). fp16 with exponent field 1024.0 holds the integer in its low
+# mantissa bits, so this works for any field that fits below bit 10 -- 4 bits
+# with bias 8, 6 bits with bias 32.
 _K_MASK_000F = 0x000F000F
+_K_MASK_0003 = 0x00030003
 _K_HALF2_1024 = 0x64006400
-_K_HALF2_1032 = 0xE408E408  # -1032.0 fp16x2
+_K_HALF2_1032 = 0xE408E408  # -1032.0 fp16x2 = -(1024 + 8)
+_K_HALF2_1056 = 0xE420E420  # -1056.0 fp16x2 = -(1024 + 32)
+
+# Largest finite fp16. The encode scale is materialised as fp16, so anything
+# above this becomes Inf there; see _codec_quant.
+_FP16_MAX = 65504.0
+
+
+@dataclass(frozen=True)
+class Codec:
+    """One wire format for a rank-tile: how it packs, and the geometry that implies.
+
+    ``bias`` is both the zero point of the unsigned code and the magnitude of
+    the most negative one, because the codec maps a group's signed extremum
+    onto ``-bias`` -- that is what uses the asymmetric range fully. The
+    decoding factor is therefore ``-1/bias``.
+
+    INT6 is INT4's nibble plane plus a dense 2-bit plane, rather than a 48-bit
+    field per thread. A 48-bit field straddles i32 boundaries and leaves the
+    regions off the 64 B fabric sector grid; two planes keep every region
+    sector-aligned (16 + 8 + 2 = 26) and leave the nibble plane byte-identical
+    to INT4's, so ``_fanout_to_next`` needs nothing but a different sector
+    count.
+    """
+
+    name: str
+    bits: int
+    bias: int
+    #: fp16x2 constant added after the ``| 0x6400`` trick: -(1024 + bias).
+    dequant_bias: int
+    #: i32 offset of the dense 2-bit plane in the rank-tile; None when the
+    #: codec has only a nibble plane.
+    hi2_i32_off: int | None
+    scale_i32_off: int
+    rank_tile_i32: int
+
+    @property
+    def n_words(self) -> int:
+        """Payload i32 a thread contributes per atom."""
+        return 1 if self.hi2_i32_off is None else 2
+
+    @property
+    def dec_step(self) -> float:
+        return -1.0 / self.bias
+
+    @property
+    def qmin(self) -> float:
+        return -float(self.bias)
+
+    @property
+    def qmax(self) -> float:
+        return float(self.bias - 1)
+
+    @property
+    def rank_tile_bytes(self) -> int:
+        return self.rank_tile_i32 * I32_BYTES
+
+    @property
+    def n_sectors(self) -> int:
+        return self.rank_tile_bytes // 64
+
+
+# 1024 B nibbles then 128 B scale; 1152 B rank-tile, 18 sectors.
+INT4 = Codec(
+    name="int4",
+    bits=4,
+    bias=8,
+    dequant_bias=_K_HALF2_1032,
+    hi2_i32_off=None,
+    scale_i32_off=SCALE_I32_OFF,
+    rank_tile_i32=RANK_TILE_I32,
+)
+# 1024 B nibbles, 512 B 2-bit plane, 128 B scale; 1664 B rank-tile, 26 sectors.
+INT6 = Codec(
+    name="int6",
+    bits=6,
+    bias=32,
+    dequant_bias=_K_HALF2_1056,
+    hi2_i32_off=256,
+    scale_i32_off=384,
+    rank_tile_i32=416,
+)
+CODECS = {c.name: c for c in (INT4, INT6)}
 
 
 def _f16x2(packed):
@@ -288,50 +378,145 @@ def _pack_e4m3_word(e, lane):
     )
 
 
-def _e4m3_decoding_scale(e):
-    return _splat_f16x2(_e4m3_to_f32(e) * fx.Float32(-0.125))
+def _e4m3_decoding_scale(codec, e):
+    return _splat_f16x2(_e4m3_to_f32(e) * fx.Float32(codec.dec_step))
 
 
-def _quant_atom_fp16(atom, enc_pk):
+def _clamp_f32(x, lo, hi):
+    x = (x < fx.Float32(lo)).select(fx.Float32(lo), x)
+    return (x > fx.Float32(hi)).select(fx.Float32(hi), x)
+
+
+def _quant_atom_fp16(codec, atom, enc_pk):
+    """Quantize 8 fp16 into this codec's planes, as packed i32 words."""
     q = []
-    lo = _splat_f16x2(fx.Float16(-8.0))
-    hi = _splat_f16x2(fx.Float16(7.0))
-    bias = fx.Vector.filled(2, fx.Int16(8), fx.Int16)
+    lo = _splat_f16x2(fx.Float16(codec.qmin))
+    hi = _splat_f16x2(fx.Float16(codec.qmax))
+    bias = fx.Vector.filled(2, fx.Int16(codec.bias), fx.Int16)
     for i in range_constexpr(4):
         w = _minnumf(fx.maxnumf(_f16x2(atom[i]) * enc_pk, lo), hi)
         q.append(_i32(fx.roundeven(w).to(fx.Int16) + bias))
-    return q[0] | (q[1] << fx.Int32(4)) | (q[2] << fx.Int32(8)) | (q[3] << fx.Int32(12))
+    if codec.n_words == 1:
+        return (
+            q[0]
+            | (q[1] << fx.Int32(4))
+            | (q[2] << fx.Int32(8))
+            | (q[3] << fx.Int32(12)),
+        )
+    # Every code is masked here. In INT4 each field already fills its whole
+    # nibble, so the shift-or cannot collide; a 6-bit code would overrun its
+    # neighbour's slot if left whole.
+    m4 = fx.Int32(_K_MASK_000F)
+    m2 = fx.Int32(_K_MASK_0003)
+    lo4 = [qi & m4 for qi in q]
+    hi2 = [qi.shrui(fx.Int32(4)) & m2 for qi in q]
+    packed_lo = (
+        lo4[0]
+        | (lo4[1] << fx.Int32(4))
+        | (lo4[2] << fx.Int32(8))
+        | (lo4[3] << fx.Int32(12))
+    )
+    packed_hi = (
+        hi2[0]
+        | (hi2[1] << fx.Int32(2))
+        | (hi2[2] << fx.Int32(4))
+        | (hi2[3] << fx.Int32(6))
+    )
+    return (packed_lo, packed_hi)
 
 
-def _codec_quant(atom, lane, tid):
+def _compact_hi2(packed_hi, lane):
+    """Two threads' 2-bit planes into the single i32 they share on the wire.
+
+    ``packed_hi`` carries its 8 live bits at [0..7] and [16..23] -- the f16x2
+    pairing puts a thread's even elements in the low half of every i32 and its
+    odd ones in the high half. Squeeze those to 16 dense bits, then merge with
+    the xor-1 neighbour. Both lanes of the pair compute the same word; only the
+    even one stores it, at ``hi2_i32_off + (tid >> 1)``.
+
+    ``lane & 1 == tid & 1``, so this is the same pairing
+    :func:`_pair_signed_ext_f16` already uses for the group-16 extremum -- no
+    second convention is introduced.
+    """
+    c = (packed_hi & fx.Int32(0xFF)) | (packed_hi.shrui(fx.Int32(8)) & fx.Int32(0xFF00))
+    other = fx.Int32(gpu.shuffle_xor(c, 1, WAVE))
+    is_even = (lane & fx.Int32(1)) == fx.Int32(0)
+    return is_even.select(c | (other << fx.Int32(16)), other | (c << fx.Int32(16)))
+
+
+def _expand_hi2(word, tid):
+    """Inverse of :func:`_compact_hi2`, for the calling thread's half."""
+    c = word.shrui((tid & fx.Int32(1)) * fx.Int32(16)) & fx.Int32(0xFFFF)
+    return (c & fx.Int32(0xFF)) | ((c & fx.Int32(0xFF00)) << fx.Int32(8))
+
+
+def _codec_quant(codec, atom, lane, tid):
+    """Quantize one atom. Returns ``(words, e4m3_word, is_leader)``.
+
+    ``words`` is this codec's payload i32s in wire order, and is opaque to the
+    caller: the ring restages received words verbatim on its all-gather lap and
+    must not have to know how many there are.
+    """
     ext = _pair_signed_ext_f16(atom)
     e = _f32_to_e4m3(ext)
-    d = _e4m3_to_f32(e) * fx.Float32(-0.125)
-    packed = _quant_atom_fp16(
-        atom, _splat_f16x2(fx.Float32(1.0) / (d + fx.Float32(1e-7)))
+    d = _e4m3_to_f32(e) * fx.Float32(codec.dec_step)
+    # Clamp before the fp16 splat. An all-zero group gives d == 0, so the
+    # reciprocal is 1e7 -- Inf once narrowed to fp16, and 0 * Inf is NaN. Only
+    # MODE.FP16_OVFL saturation has been keeping that from poisoning a tile,
+    # and INT6 cuts the headroom fourfold: |d| is four times smaller for a
+    # given extremum, so 1/|d| peaks near 4096 rather than 1024.
+    enc = _clamp_f32(
+        fx.Float32(1.0) / (d + fx.Float32(1e-7)), -_FP16_MAX, _FP16_MAX
     )
+    words = _quant_atom_fp16(codec, atom, _splat_f16x2(enc))
+    if codec.n_words == 2:
+        words = (words[0], _compact_hi2(words[1], lane))
     is_leader = (tid % GROUP) == 0
-    return packed, _pack_e4m3_word(e, lane), is_leader
+    return words, _pack_e4m3_word(e, lane), is_leader
 
 
-def _codec_dequant(packed, scale, acc=None):
-    """Unpack four INT4 nibbles to f16x2, scale, optionally FMA into *acc*.
+def _codec_dequant(codec, words, scale, tid, acc=None):
+    """Unpack four codes to f16x2, scale, optionally FMA into *acc*.
 
     ``a * b + c`` does not contract to ``v_pk_fma_f16``; ``fx.fma`` does.
     Two fp16 lanes are independent channels, not a dot into f32.
+
+    *words* are as they sit on the wire, so the 2-bit plane is still compacted
+    and is expanded here -- once, outside the loop.
     """
     out = []
     mask = fx.Int32(_K_MASK_000F)
     bias_hi = fx.Int32(_K_HALF2_1024)
-    bias_lo = _f16x2(fx.Int32(_K_HALF2_1032))
+    bias_lo = _f16x2(fx.Int32(codec.dequant_bias))
+    packed = words[0]
+    if codec.n_words == 2:
+        hi = _expand_hi2(words[1], tid)
+        m2 = fx.Int32(_K_MASK_0003)
     for i in range_constexpr(4):
-        q4 = (packed.shrui(fx.Int32(i * 4)) & mask) | bias_hi
-        dq = _f16x2(q4) + bias_lo
+        code = packed.shrui(fx.Int32(i * 4)) & mask
+        if codec.n_words == 2:
+            code = code | ((hi.shrui(fx.Int32(i * 2)) & m2) << fx.Int32(4))
+        dq = _f16x2(code | bias_hi) + bias_lo
         if acc is None:
             out.append(_i32(dq * scale))
         else:
             out.append(_i32(fx.fma(dq, scale, _f16x2(acc[i]))))
     return fx.Vector.from_elements(out, fx.Int32)
+
+
+def _codec_load(codec, get, tid, scale_slot):
+    """Read one packet through ``get(i32_off_in_tile) -> i32``.
+
+    Returns ``(words, e4m3_word)`` exactly as they sit on the wire -- the 2-bit
+    plane stays compacted -- so a forwarding path can restage them byte for
+    byte without decoding.
+    """
+    words = (get(tid),)
+    if codec.n_words == 2:
+        words = words + (
+            get(fx.Int32(codec.hi2_i32_off) + tid.shrui(fx.Int32(1))),
+        )
+    return words, get(fx.Int32(codec.scale_i32_off) + scale_slot)
 
 
 def _i32_to_bytes(i32_off):
@@ -497,9 +682,23 @@ def _acquire_inbox():
     llvm.fence(llvm.AtomicOrdering.acquire, syncscope="one-as")
 
 
-@fx.struct
-class PackStorage:
-    pack: fx.Array[fx.Int32, PACK_I32, 16]
+def make_pack_storage(n_i32: int):
+    """LDS staging for *n_i32* packed words, 16 B aligned.
+
+    A factory rather than one struct because the two schedules need different
+    sizes: the mesh stages every destination's packet (``ATOMS`` rows), while
+    the ring stages one destination's (``rank_atoms`` rows) and its row stride
+    depends on which codec that hop carries.
+    """
+
+    @fx.struct
+    class PackStorage:
+        pack: fx.Array[fx.Int32, n_i32, 16]
+
+    return PackStorage
+
+
+PackStorage = make_pack_storage(PACK_I32)
 
 
 def make_qr_int4_kernel(
@@ -603,7 +802,7 @@ def make_qr_int4_kernel(
         # "peer": consecutive quads walk the sectors of one peer, giving each
         # destination a 512 B contiguous run. PCIe wants that -- interleaving
         # destinations every 64 B costs ~1.5x against >=256 B runs (36.25 vs
-        # 54.03 GB/s measured on MI350P). See docs/qr_int4_mi350p.md.
+        # 54.03 GB/s measured on MI350P).
         fanout_int4_stripe = fx.make_layout((world_size, 8), int4_stride)
         fanout_scale_stripe = fx.make_layout((world_size, 2), scale_stride)
         color_layout = fx.make_layout((grid,), (1,))
@@ -692,8 +891,10 @@ def make_qr_int4_kernel(
                 frag.store(packed)
                 fx.copy(hbm_copy_atom, frag, dst)
 
-        def _lds_write_packet(slot, packed, scale, is_leader):
-            fx.memref_store(packed, pack, (slot, tid))
+        def _lds_write_packet(slot, words, scale, is_leader):
+            # INT4 only, so one payload word and no 2-bit plane. The ring is
+            # where the multi-plane store lives.
+            fx.memref_store(words[0], pack, (slot, tid))
             if is_leader:
                 fx.memref_store(
                     scale, pack, (slot, fx.Int32(SCALE_I32_OFF) + scale_slot)
@@ -708,11 +909,11 @@ def make_qr_int4_kernel(
             """
             for dest in range_constexpr(world_size):
                 for k in range_constexpr(rank_atoms):
-                    packed, scale, is_leader = _codec_quant(
-                        atoms[dest * rank_atoms + k], lane, tid
+                    words, scale, is_leader = _codec_quant(
+                        INT4, atoms[dest * rank_atoms + k], lane, tid
                     )
                     _lds_write_packet(
-                        fx.Int32(dest * rank_atoms + k), packed, scale, is_leader
+                        fx.Int32(dest * rank_atoms + k), words, scale, is_leader
                     )
 
         def _pack_all_gather(accs):
@@ -723,10 +924,10 @@ def make_qr_int4_kernel(
             NT fanout can push them into every peer's all-gather inbox.
             """
             for k in range_constexpr(rank_atoms):
-                packed, scale, is_leader = _codec_quant(accs[k], lane, tid)
+                words, scale, is_leader = _codec_quant(INT4, accs[k], lane, tid)
                 for dest in range_constexpr(world_size):
                     _lds_write_packet(
-                        fx.Int32(dest * rank_atoms + k), packed, scale, is_leader
+                        fx.Int32(dest * rank_atoms + k), words, scale, is_leader
                     )
 
         def _fanout_nt(phase, inbox_src, sub):
@@ -843,20 +1044,20 @@ def make_qr_int4_kernel(
                 self_rsrc, base + fx.Int32(SCALE_I32_OFF) + scale_slot, recv_policy
             )
             e = word.shrui(pair_in_slot * fx.Int32(8)) & fx.Int32(0xFF)
-            return packed, _e4m3_decoding_scale(e)
+            return (packed,), _e4m3_decoding_scale(INT4, e)
 
         def _reduce_scattered(sub):
             """Dequant-accumulate every peer's reduce-scatter packet for *sub*."""
             accs = [None] * rank_atoms
             for src in range_constexpr(world_size):
                 for k in range_constexpr(rank_atoms):
-                    packed, scale = _recv_quantized(
+                    words, scale = _recv_quantized(
                         PHASE_REDUCE_SCATTER, fx.Int32(src), sub, k
                     )
                     if accs[k] is None:
-                        accs[k] = _codec_dequant(packed, scale)
+                        accs[k] = _codec_dequant(INT4, words, scale, tid)
                     else:
-                        accs[k] = _codec_dequant(packed, scale, accs[k])
+                        accs[k] = _codec_dequant(INT4, words, scale, tid, accs[k])
             return accs
 
         def _recv_all_gather(sub):
@@ -864,10 +1065,10 @@ def make_qr_int4_kernel(
             gathered = []
             for src in range_constexpr(world_size):
                 for k in range_constexpr(rank_atoms):
-                    packed, scale = _recv_quantized(
+                    words, scale = _recv_quantized(
                         PHASE_ALL_GATHER, fx.Int32(src), sub, k
                     )
-                    gathered.append(_codec_dequant(packed, scale))
+                    gathered.append(_codec_dequant(INT4, words, scale, tid))
             return gathered
 
         # Stride by the *launched* grid, not the compile-time cap. The host

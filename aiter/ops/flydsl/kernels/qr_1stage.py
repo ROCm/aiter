@@ -5,13 +5,7 @@
 
 Public type ``OneShotAllReduce``. Decode-only by policy: one round and no
 grid-wide barrier, paid for with ``(N-1)*S`` of wire volume against the
-two-shot's ``2(N-1)/N*S``. That is a 4x increase at TP8, irrelevant at 14 KiB
-and decisive by ~1 MiB, so ``MAX_PAYLOAD_BYTES`` gates it rather than leaving a
-caller to discover the crossover.
-
-Everything around the kernel -- the IPC inbox, the peer-pointer table, the
-per-block colours -- is ``qr_int4``'s ``_StEngine``, reused as-is. See
-docs/qr_1stage.md.
+mesh's ``2(N-1)/N*S``. 
 """
 
 from __future__ import annotations
@@ -45,26 +39,7 @@ from .qr_int4_kernel import SUPPORTED_WORLDS
 logger = logging.getLogger("aiter")
 
 # Largest payload this kernel should be asked to move.
-#
-# A speed policy, not an accuracy one -- the kernel is bit-comparable with
-# ``cross_device_reduce`` at every size. One-shot pushes the whole payload to
-# every peer, so wire volume is ``(N-1)*S`` against the two-shot's
-# ``2(N-1)/N*S``: 7S vs 1.75S at TP8, 3S vs 1.5S at TP4. Below ~100 KiB the
-# round-trip saving dominates and the extra bytes are free; well above it they
-# are not.
-#
-# Measured at TP4 on xGMI, hidden 7168, sweeping 64 KiB -> 4 MiB against
-# cdr:2stage. Taking the min over three runs -- which is the honest read of cdr
-# here, because the intermittent cliff of docs/qr_1stage.md 5.2 fires almost
-# every run in this size range and inflates its mean by 15-20 us -- one-shot
-# wins through 210 KiB (1.03-1.18x) and loses from 224 KiB (0.92x), falling to
-# 0.60x by 2 MiB. So the crossover sits at ~215 KiB and the previous 256 KiB
-# guess was admitting sizes where this kernel is the wrong choice.
-#
-# 192 KiB rather than 215: the measurement is TP4-only, and TP8 is strictly
-# worse for a one-shot (7S of wire volume against a two-shot's 1.75S, versus
-# 3S/1.5S here), so the true crossover moves *down* with world size. The margin
-# is deliberate until TP8 is measured.
+# TODO: Measure the cross-over as a function of the world size.
 MAX_PAYLOAD_BYTES = 192 << 10
 
 
@@ -235,7 +210,7 @@ class OneShotAllReduce:
                 f"OneShotAllReduce got a {live_bytes} B payload, above the "
                 f"{self.max_bytes} B ceiling: this kernel pushes the whole "
                 "payload to every peer, so its wire volume is (N-1)x the "
-                "message where a two-shot moves 2(N-1)/N. Route large messages "
+                "message where a mesh schedule moves 2(N-1)/N. Route large messages "
                 "to QRInt4 or cross_device_reduce, or pass max_bytes to "
                 "override."
             )

@@ -54,12 +54,23 @@ from aiter.ops.flydsl.kernels.qr_int4_ring_kernel import RING_ST_LADDER
 
 ARCH = get_gfx_runtime()
 SUPPORTED_ARCHS = ("gfx942", "gfx950")
-# Per-schedule SQNR floor. The ring's reduce-scatter lap requantizes N-1 times
-# where two-shot requantizes once, but its all-gather lap forwards bytes
-# verbatim and adds nothing -- so it lands slightly *below* two-shot at TP4
-# (18.7 dB measured against 19.2) and clearly above it at TP2 (22.2 dB). One
-# floor cannot serve both.
-SQNR_MIN_DB = {"two_shot": 18.0, "ring": 17.0}
+# One SQNR floor for both schedules, in their shipping configuration.
+#
+# It used to take two. The ring's reduce-scatter lap requantizes N-1 times where
+# the mesh requantizes once, and the partial sum it requantizes grows with the
+# contributions folded in, so the ring's SQNR degrades with N where the mesh's
+# does not: 22.2 dB at TP2, 18.7 at TP4, ~15 at TP8 on an all-INT4 wire. No
+# single number covered that.
+#
+# Defaulting the ring's reduce-scatter lap to INT6 at TP8 lifts it to ~21 dB and
+# removes the reason for the split. Anything that falls below 18.0 now is a
+# regression, not a known cost of the schedule.
+SQNR_MIN_DB = {"mesh": 18.0, "ring": 18.0}
+
+# INT4 at TP8 is still a supported configuration -- AITER_ALL_REDUCE_CODEC=INT4
+# reaches it -- and is covered by its own case rather than skipped. It is held
+# to what it actually delivers, not to the shipping floor.
+SQNR_MIN_DB_TP8_INT4_RING = 15.0
 SUPER_TILE = 8
 TP = WORLD
 
@@ -97,7 +108,7 @@ def _pick_st(
     *,
     grid_cap: int = DEFAULT_GRID_CAP,
     inbox_memory: str = "uncached",
-    algorithm: str = "two_shot",
+    algorithm: str = "mesh",
 ) -> int:
     """Mirror of ``QRInt4._pick_st``, so the test asserts the rule not the code.
 
@@ -192,9 +203,14 @@ def _run_rank(args) -> None:
     rows = []
     for tokens, hidden in zip(args.tokens, args.hiddens, strict=True):
         gen = torch.Generator().manual_seed(1234 + rank)
-        inp = (
-            torch.randn(tokens, hidden, generator=gen, dtype=torch.float32) * 0.1
-        ).to(device=device, dtype=torch.bfloat16)
+        src = torch.randn(tokens, hidden, generator=gen, dtype=torch.float32) * 0.1
+        if args.fill == "degenerate":
+            # Half the rows exactly zero, half far below the E4M3 magnitude
+            # floor of 2^-7. Both drive the group extremum to (or under) zero,
+            # which is where the encode reciprocal blows up.
+            src[0::2] = 0.0
+            src[1::2] *= 1e-8
+        inp = src.to(device=device, dtype=torch.bfloat16)
         out = torch.empty_like(inp)
         ref = inp.to(torch.float32)
         dist.all_reduce(ref, group=group)
@@ -213,6 +229,11 @@ def _run_rank(args) -> None:
             "grid_cap": args.grid_cap,
             "algorithm": args.algorithm,
             "inbox_memory": fly.inbox_memory,
+            # Resolved, not requested: these come from the per-world-size
+            # default unless AITER_ALL_REDUCE_CODEC overrode it, and a
+            # regression should name the codec that produced it.
+            "rs_codec": fly.rs_codec,
+            "ag_codec": fly.ag_codec,
             # Pass nbytes as well: with a ladder the super-tile is chosen by
             # payload size, and omitting it silently reports the fallback.
             "st_used": fly._pick_st(tiles, nbytes),
@@ -251,7 +272,9 @@ def _spawn(
     time_it: bool,
     super_tile: int = SUPER_TILE,
     grid_cap: int = DEFAULT_GRID_CAP,
-    algorithm: str = "two_shot",
+    algorithm: str = "mesh",
+    codec: str | None = None,
+    fill: str = "randn",
 ) -> list[list[dict]]:
     # HIP QR/fused-AR use multiprocessing.Pool from ``python3`` __main__.
     # This file is also collected by pytest, and FlyDSL JIT needs a fresh
@@ -270,6 +293,13 @@ def _spawn(
     )
     env["PYTHONUNBUFFERED"] = "1"
     env.setdefault("FLYDSL_GPU_ARCH", ARCH)
+    # Pin the codec the way a deployment would, rather than through a private
+    # test-only flag: this exercises the override path itself, while leaving it
+    # unset exercises the per-world-size default.
+    if codec is not None:
+        env["AITER_ALL_REDUCE_CODEC"] = codec.upper()
+    else:
+        env.pop("AITER_ALL_REDUCE_CODEC", None)
     tokens = ",".join(str(t) for t, _ in pairs)
     hiddens = ",".join(str(h) for _, h in pairs)
     procs = []
@@ -294,6 +324,8 @@ def _spawn(
             str(super_tile),
             "--grid-cap",
             str(grid_cap),
+            "--fill",
+            fill,
         ]
         if time_it:
             cmd.append("--time-it")
@@ -342,7 +374,8 @@ def _assert_sqnr(
     hidden: int,
     world_size: int,
     label: str,
-    algorithm: str = "two_shot",
+    algorithm: str = "mesh",
+    floor: float | None = None,
 ) -> dict:
     expected_st = _pick_st(
         tokens,
@@ -363,23 +396,26 @@ def _assert_sqnr(
         row = rows[0]
         if row["st_used"] != expected_st:
             fails.append(f"rank {rank}: ST={row['st_used']}, expected {expected_st}")
-        floor = SQNR_MIN_DB[algorithm]
-        if row["sqnr_db"] < floor:
+        want = SQNR_MIN_DB[algorithm] if floor is None else floor
+        if row["sqnr_db"] < want:
             fails.append(
-                f"rank {rank}: SQNR {row['sqnr_db']:.2f} dB < {floor} "
+                f"rank {rank}: SQNR {row['sqnr_db']:.2f} dB < {want} "
                 f"(rel MAE {row['rel_mae']:.3e})"
             )
     if fails:
+        codecs = ranks[0][0]
         raise AssertionError(
-            f"{label} tp={world_size} tokens={tokens} hidden={hidden}: "
+            f"{label} tp={world_size} tokens={tokens} hidden={hidden} "
+            f"rs={codecs.get('rs_codec')} ag={codecs.get('ag_codec')}: "
             + "; ".join(fails)
         )
     return ranks[0][0]
 
 
-@pytest.mark.parametrize("algorithm", ("two_shot", "ring"))
+@pytest.mark.parametrize("algorithm", ("mesh", "ring"))
 @pytest.mark.parametrize("world_size,tokens,hidden,label", _PYTEST_CASES)
 def test_qr_int4_sqnr_vs_fp32_allreduce(world_size, tokens, hidden, label, algorithm):
+    """Shipping configuration: no codec pinned, so the per-N default applies."""
     ranks = _spawn(world_size, [(tokens, hidden)], time_it=False, algorithm=algorithm)
     _assert_sqnr(
         ranks,
@@ -389,6 +425,52 @@ def test_qr_int4_sqnr_vs_fp32_allreduce(world_size, tokens, hidden, label, algor
         label=f"{label}/{algorithm}",
         algorithm=algorithm,
     )
+
+
+@pytest.mark.parametrize(
+    "tokens,hidden,label",
+    [(t, h, lbl) for ws, t, h, lbl in _PYTEST_CASES if ws == 8],
+)
+def test_qr_int4_ring_tp8_int4_codec(tokens, hidden, label):
+    """TP8 ring forced back to an all-INT4 wire by the environment override.
+
+    Two things at once: that ``AITER_ALL_REDUCE_CODEC`` actually reaches the
+    kernel, and that the configuration it selects still produces a sane result.
+    It is held to :data:`SQNR_MIN_DB_TP8_INT4_RING`, not to the shipping floor
+    -- INT4 at TP8 is ~3 dB under that by construction, which is the whole
+    reason the default is INT6 there.
+    """
+    ranks = _spawn(
+        8, [(tokens, hidden)], time_it=False, algorithm="ring", codec="int4"
+    )
+    row = _assert_sqnr(
+        ranks,
+        tokens=tokens,
+        hidden=hidden,
+        world_size=8,
+        label=f"{label}/ring-int4",
+        algorithm="ring",
+        floor=SQNR_MIN_DB_TP8_INT4_RING,
+    )
+    assert row["rs_codec"] == "int4" and row["ag_codec"] == "int4", row
+
+
+@pytest.mark.parametrize("algorithm", ("mesh", "ring"))
+def test_qr_int4_degenerate_inputs(algorithm):
+    """All-zero and all-tiny groups must not produce NaN.
+
+    A group whose extremum is zero decodes to a zero scale, so the encode
+    reciprocal saturates; before it was clamped, that reached the codec as Inf
+    and ``0 * Inf`` poisoned the tile. INT6 quadruples the reciprocal for a
+    given extremum, so it has four times less headroom here than INT4.
+    """
+    ranks = _spawn(
+        2, [(512, 5120)], time_it=False, algorithm=algorithm, fill="degenerate"
+    )
+    for rank, rows in enumerate(ranks):
+        assert rows, f"rank {rank}: no rows"
+        for row in rows:
+            assert math.isfinite(row["rel_mae"]), f"rank {rank}: {row}"
 
 
 @benchmark()
@@ -538,9 +620,10 @@ if __name__ == "__main__":
     parser.add_argument("--init-method", default=None)
     parser.add_argument("--tokens", default="")
     parser.add_argument("--hiddens", default="")
-    parser.add_argument("--algorithm", default="two_shot")
+    parser.add_argument("--algorithm", default="mesh")
     parser.add_argument("--super-tile", type=int, default=SUPER_TILE)
     parser.add_argument("--grid-cap", type=int, default=DEFAULT_GRID_CAP)
+    parser.add_argument("--fill", default="randn", choices=("randn", "degenerate"))
     parser.add_argument("--time-it", action="store_true")
     parser.add_argument("--out", default=None)
     known, rest = parser.parse_known_args()

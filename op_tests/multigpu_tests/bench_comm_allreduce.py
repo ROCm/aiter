@@ -18,7 +18,7 @@ all-reduce is fastest at this shape, and what does it cost in accuracy".
 | ``qr_int6``   | quick-reduce, 6-bit codec               | int6     | no  |
 | ``qr_int4``   | quick-reduce, 4-bit codec               | int4     | no  |
 | ``qr_int3``   | quick-reduce, 3-bit codec (TP2 only)    | int3     | no  |
-| ``fly_int4``  | FlyDSL two-shot INT4 (ROCm/aiter#4970)  | int4     | no  |
+| ``fly_int4``  | FlyDSL mesh INT4 (ROCm/aiter#4970)      | int4     | no  |
 | ``rccl``      | ``dist.all_reduce``                     | bf16/fp16| yes |
 
 Candidates are skipped (an ``n/a`` cell in the latency/accuracy/busbw/roofline
@@ -226,17 +226,18 @@ if is_flydsl_available():
     from aiter.ops.flydsl.kernels.qr_int4 import (
         ALGORITHMS,
         MIN_PAYLOAD_BYTES,
+        _resolve_codecs,
         has_xgmi_peer_links,
     )
 
-    _FLY_MIN_BYTES = {n: a.min_bytes for n, a in ALGORITHMS.items()}
     HAS_FLY_INT4 = True
 else:
     QRInt4 = None
     OneShotAllReduce = None
     MIN_PAYLOAD_BYTES = 0
     _FLY1S_MAX_BYTES = 0
-    _FLY_MIN_BYTES = {}
+    ALGORITHMS = {}
+    _resolve_codecs = None
     has_xgmi_peer_links = None
     HAS_FLY_INT4 = False
 
@@ -301,7 +302,7 @@ class Candidate:
     quant: str | None = None  # QuickReduceRegime name, family == "qr"
     use_new: bool = True  # family == "cdr"
     fp8: bool = False  # family == "cdr"
-    algorithm: str = "two_shot"  # QRInt4 schedule, family == "fly"
+    algorithm: str = "mesh"  # QRInt4 schedule, family == "fly"
     # QRInt4 tuning knobs, family == "fly". None means "leave the constructor
     # default alone"; a value makes this candidate a distinct engine with its
     # own IPC inbox, so two rows can differ only in tuning.
@@ -363,10 +364,12 @@ CANDIDATES = (
     # where the native packet is 64 B, and to lose on PCIe.
     Candidate("fly_1stage_fa", "fly1s", 40.0, True, fanout="atom"),
     # Same kernel family, ring schedule. Its floor is lower than fly_int4's
-    # because the ring's reduce-scatter lap requantizes N-1 times where two-shot
+    # because the ring's reduce-scatter lap requantizes N-1 times where the mesh
     # requantizes once; measured 18.7 dB at TP4 (against 19.2), and *better*
-    # than two-shot at TP2 (22.2 dB) where the all-gather lap's verbatim
-    # forwarding dominates. 14 dB leaves the usual ~5 dB of headroom.
+    # than the mesh at TP2 (22.2 dB) where the all-gather lap's verbatim
+    # forwarding dominates. At TP8 INT4 would land ~15 dB, which is why the
+    # ring defaults to an INT6 reduce-scatter lap there (~21 dB); see
+    # QRInt4's rs_codec. 14 dB leaves the usual ~5 dB of headroom.
     # Auto: no pinned super_tile, so QRInt4 walks RING_ST_LADDER and picks by
     # payload size at launch. This is what production gets.
     Candidate("fly_int4_ring", "fly", 14.0, False, algorithm="ring"),  # 18.7 / n/a
@@ -469,17 +472,13 @@ def applicable(cand: Candidate, world_size: int, dtype, numel: int, nbytes: int)
         # production refuses to take.
         return not (cand.quant == "INT3" and world_size != 2)
     if cand.family == "fly":
-        # QRInt4.allreduce refuses payloads under its floor. The two schedules
-        # have different ones -- two-shot's is an accuracy policy, the ring's a
-        # speed one (it only overtakes two-shot past ~10.5 MiB on PCIe) -- so
-        # mirror whichever applies rather than letting the call raise.
-        floor = _FLY_MIN_BYTES[cand.algorithm]
+        # Deliberately *not* gated on QRInt4's own payload floor, which the
+        # engines here disable with min_bytes=0.
         return (
             HAS_FLY_INT4
             and get_gfx() in _FLY_ARCHS
             and world_size in _FLY_WORLDS
             and dtype == dtypes.bf16
-            and nbytes >= floor
         )
     if cand.family == "fly1s":
         # Gated from above, not below: OneShotAllReduce.allreduce refuses
@@ -584,7 +583,7 @@ def collective_bw(nbytes: int, us: float, world_size: int, kernel: str):
     NCCL-tests convention for all-reduce -- ``algbw * 2*(N-1)/N`` -- which
     normalizes across world size so numbers are comparable between TPs.
     ``traffic`` is what this particular kernel actually moves per rank:
-    one-shot reads the whole buffer from every peer, two-shot moves a
+    one-shot reads the whole buffer from every peer, a two-shot moves a
     reduce-scatter plus an all-gather.
     """
     n = world_size
@@ -899,6 +898,8 @@ def _worker(
                 rank=rank,
                 world_size=tp_size,
                 algorithm=algo,
+                # Measure every size the sweep asks for.
+                min_bytes=0,
                 **kw,
             )
         # compile() is itself a collective launch on every super-tile engine and
@@ -1019,7 +1020,7 @@ def _row(tp_size, tokens, hidden, dtype, rank_rets):
         # Rank spread, per candidate. Reported for every row rather than only
         # for PRIMARY: skew is mostly a property of the barrier, but not
         # entirely, and a candidate that compiles a *different kernel per rank*
-        # -- the ring bakes rank into its cache key where two-shot passes it as
+        # -- the ring bakes rank into its cache key where the mesh passes it as
         # a runtime argument -- can in principle land one rank with worse code
         # than the others. That shows up here and nowhere else in the report.
         #
@@ -1575,6 +1576,25 @@ def roofline_table(df, keys, measured):
     return out
 
 
+def _fly_floor_note(world_sizes) -> str:
+    """``QRInt4.allreduce``'s own size floor per (schedule, world size).
+    """
+    if not HAS_FLY_INT4:
+        return "n/a"
+    parts = []
+    for algorithm in sorted(ALGORITHMS):
+        for ws in sorted(set(world_sizes)):
+            if ws not in _FLY_WORLDS:
+                continue
+            algo = ALGORITHMS[algorithm]
+            rs_codec, ag_codec = _resolve_codecs(algo, ws, None, None)
+            floor = algo.floor_bytes(rs_codec)
+            parts.append(
+                f"{algorithm}/tp{ws} {floor >> 10} KiB (rs={rs_codec} ag={ag_codec})"
+            )
+    return "; ".join(parts) or "n/a"
+
+
 def _write_report(
     path, sections, args, visible: int, prod_regime, roofline_cus=None
 ) -> None:
@@ -1605,6 +1625,10 @@ def _write_report(
         f"- iters: {args.iters} (warmup {args.warmup})",
         f"- baseline: {args.baseline}",
         f"- fly_int4 available: {HAS_FLY_INT4}",
+        (
+            "- QRInt4 deployment floors (not enforced here): "
+            f"{_fly_floor_note(args.tp if args.tp else [4])}"
+        ),
         (
             "- bf16 cast to fp16 on the QR wire: "
             f"{os.environ.get('AITER_QUICK_REDUCE_CAST_BF16_TO_FP16', '1')}"

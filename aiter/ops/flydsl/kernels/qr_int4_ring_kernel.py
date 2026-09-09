@@ -1,21 +1,25 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""gfx942/gfx950 TP∈{2,4,8} INT4 **ring** all-reduce.
+"""gfx942/gfx950 TP∈{2,4,8} INT4/INT6 **ring** all-reduce.
 
-Same codec, tiling, IPC inbox, and colour handshake as the two-shot kernel in
-``qr_int4_kernel`` -- only the schedule differs. Instead of each rank pushing to
-all ``N-1`` peers twice, the ranks form a cycle and every step is a single
+Topology of the lap: the ranks form a cycle and every step is a single
 contiguous run into exactly one peer's inbox:
 
-* ``2(N-1)`` hops instead of 2, so ``2(N-1)`` handshakes instead of 2.
-* The same ``2(N-1)/N`` of the payload on the wire. The ring is bandwidth
+* ``2(N-1)`` hops and ``2(N-1)`` handshakes.
+* ``2(N-1)/N`` of the payload on the wire. The ring is bandwidth
   optimal (Patarasuk & Yuan, JPDC 69(2), 2009).
-* One destination per store. On a PCIe host, a GPU has a single shared x16 uplink, 
-  and a ring step writes ``rank_atoms * 1152 B`` to one peer, in address order, with no
-  destination switch.
+* One destination per store. On a PCIe host, a GPU has a single shared x16 uplink,
+  and a ring step writes ``rank_atoms * rank_tile B`` to one peer, in address
+  order, with no destination switch.
 
-The INT4 codec is imported from ``qr_int4_kernel``.
+The ring pays for that schedule is accuracy: its reduce-scatter lap
+requantizes the *running partial sum* ``N-1`` times where the mesh requantizes
+once, and the partial's extremum grows with the number of contributions folded
+into it. Hence the two codec knobs. Widening the reduce-scatter lap to INT6 improves 
+accuracy with the cost of using slightly more bandwidth. The all-gather lap forwards 
+the bytes it received untouched, so it contributes exactly one quantization and stays 
+INT4 unless asked otherwise by env variable AITER_ALL_REDUCE_CODEC.
 """
 
 import flydsl.compiler as flyc
@@ -26,42 +30,40 @@ from flydsl.expr.typing import Int32, Int64, Stream, T
 
 from . import buffer_ops
 
-# The codec, the peer-store/load primitives and the geometry are shared with the
-# two-shot kernel verbatim. They are private there by convention, not by intent:
-# these two kernels are the only consumers and they must agree byte for byte.
+# The codecs, the peer-store/load primitives and the geometry are shared with
+# the mesh kernel verbatim. They are private there by convention, not by
+# intent: these two kernels are the only consumers and they must agree byte for
+# byte.
 from .qr_int4_kernel import (
     _CM_SC0,
     _CM_SC1,
     _INBOX_POLICY,
     ATOMS,
     BLOCK,
+    CODECS,
     DEFAULT_GRID_CAP,  # noqa: F401  -- re-exported for host symmetry
     GROUP,
-    LDS_BYTES,
-    N_SECTORS,
     PAIR,
     QUAD_LANES,
     QUADS_PER_WAVE,
-    RANK_TILE_BYTES,
-    RANK_TILE_I32,
-    SCALE_I32_OFF,
     SUPPORTED_WORLDS,
     TILE_BYTES,
     TILE_FP16,
     TILE_I32,
     WAVE,
     WAVES,
-    PackStorage,
     _acquire_inbox,
     _atom_bf16_to_f16,
     _atom_f16_to_bf16,
     _clamp_fp16_overflow,
     _codec_dequant,
+    _codec_load,
     _codec_quant,
     _e4m3_decoding_scale,
     _i32_to_bytes,
     _store_v4i32_peer,
     _to_sgpr_i64,
+    make_pack_storage,
 )
 
 # Super-tile values the ring accepts.
@@ -77,8 +79,9 @@ from .qr_int4_kernel import (
 # are the values a caller may pin with ``super_tile=``.
 #
 # The buffer size is
-# ``2(N-1) * grid * (ST * rank_atoms * 1152 + 64)`` bytes, so ST=16 at the
-# default cap of 1216 is ~269 MB per rank against 28 MB at cap 128. 
+# ``(N-1) * grid * (ST * rank_atoms * (rs_tile + ag_tile) + 128)`` bytes, so
+# ST=16 at the default cap of 1216 is ~269 MB per rank all-INT4, ~329 MB with
+# an INT6 reduce-scatter lap, against 28/35 MB at cap 128.
 # Pin ``grid_cap`` alongside ``super_tile``.
 RING_SUPER_TILES = (1, 8, 16, 32)
 
@@ -89,20 +92,22 @@ RING_ST_LADDER = (
     (64 << 20, 32, 128),
 )
 
-# Wire formats accepted for the reduce-scatter lap.
+# Wire formats accepted per lap.
 #
-# The all-gather lap is always INT4 and is not listed here: it forwards the
-# bytes it received without touching them (see ``_ring_body``), so it has no
-# format of its own to choose. Widening the RS lap to INT6 is option for improving accuracy
-# for large TP (8, etc.) values.
-RS_CODECS = ("int4",)
+# Both laps take the same set, but they are separate arguments because they are
+# separate decisions: the reduce-scatter lap requantizes ``N-1`` times and is
+# what INT6 is for, while the all-gather lap forwards the bytes it received
+# without touching them (see ``_op_substep``) and so contributes exactly one
+# quantization -- the one at op ``N``, where this rank's chunk is final.
+RS_CODECS = ("int4", "int6")
+AG_CODECS = ("int4", "int6")
 
 # 64 quads of 4 lanes; one quad writes one 64 B fabric sector.
 QUADS_PER_BLOCK = BLOCK // QUAD_LANES
 
 # Cache policy for reading a rank-tile out of our own inbox.
 #
-# The two-shot reads its inbox `nt`, which is only a non-temporal hint -- it
+# The mesh reads its inbox `nt`, which is only a non-temporal hint -- it
 # does not bypass. For the ring algorithm, a hint is not enough:
 # `sc0 sc1` makes the load actually go to memory.
 _RECV_POLICY = _CM_SC0 | _CM_SC1
@@ -140,10 +145,11 @@ def make_qr_int4_ring_kernel(
     grid: int,
     inbox_memory: str = "finegrained",
     rs_codec: str = "int4",
+    ag_codec: str = "int4",
 ):
     """Build the ring kernel for one *rank*.
 
-    ``rank`` is a **compile-time** parameter here, unlike the two-shot kernel
+    ``rank`` is a **compile-time** parameter here, unlike the mesh kernel
     where it is a runtime argument. At op ``k`` the chunk a block works on is
     ``(rank - k) % N``, and that index selects from a Python list of
     register-resident atom fragments -- it has to be a Python constant. Baking
@@ -166,6 +172,8 @@ def make_qr_int4_ring_kernel(
         )
     if rs_codec not in RS_CODECS:
         raise ValueError(f"rs_codec must be one of {RS_CODECS}, got {rs_codec!r}")
+    if ag_codec not in AG_CODECS:
+        raise ValueError(f"ag_codec must be one of {AG_CODECS}, got {ag_codec!r}")
     if super_tile not in RING_SUPER_TILES:
         raise ValueError(
             f"super_tile must be one of {RING_SUPER_TILES}, got {super_tile!r}"
@@ -189,18 +197,40 @@ def make_qr_int4_ring_kernel(
     n_ops = 2 * world_size - 1  # ops are 1-based; op k reads slot k-2, writes k-1
     nxt = (rank + 1) % world_size
 
-    payload_i32 = rank_atoms * RANK_TILE_I32
-    release_i32_off = super_tile * payload_i32
-    wire_tile_i32 = release_i32_off + 16  # + one 64 B handshake sector
-    wire_tile_bytes = wire_tile_i32 * 4
-    inbox_bytes = steps * grid * wire_tile_bytes
+    rs = CODECS[rs_codec]
+    ag = CODECS[ag_codec]
+    # Which codec each wire slot carries. Ops 1..N-1 fill the reduce-scatter
+    # slots and ops N..2N-1 the all-gather ones, so the split is exactly at
+    # N-1 and is a compile-time property of the step index.
+    step_codec = [rs] * (world_size - 1) + [ag] * (world_size - 1)
 
-    # Every slot has exactly one writer -- the ring predecessor -- so the
-    # two-shot's per-sender axis collapses away entirely. That is what keeps the
+    # Per-step geometry. All Python ints, so every use below folds at trace
+    # time -- the mixed-codec inbox costs no address arithmetic over the
+    # single-codec one it replaces.
+    payload_i32 = [rank_atoms * c.rank_tile_i32 for c in step_codec]
+    release_i32_off = [super_tile * p for p in payload_i32]
+    wire_tile_i32 = [r + 16 for r in release_i32_off]  # + one 64 B handshake sector
+    step_base_i32, _acc = [], 0
+    for w in wire_tile_i32:
+        step_base_i32.append(_acc)
+        _acc += grid * w
+    inbox_bytes = _acc * 4
+
+    # Every slot has exactly one writer -- the ring predecessor -- so the mesh's
+    # per-sender axis collapses away entirely. That is what keeps the
     # atomics-free design sound here (there are no peer atomics over PCIe), and
-    # it makes the buffer (N-1)/N of the two-shot's rather than larger.
-    total_sectors = rank_atoms * N_SECTORS
-    fanout_rounds = -(-total_sectors // QUADS_PER_BLOCK)
+    # it makes the buffer (N-1)/N of the mesh's rather than larger.
+    total_sectors = [rank_atoms * c.n_sectors for c in step_codec]
+    fanout_rounds = [-(-t // QUADS_PER_BLOCK) for t in total_sectors]
+
+    # One staging buffer, sized for whichever codec needs more. Only
+    # ``rank_atoms`` rows: a ring stages one destination's packet, not every
+    # destination's, so this is 1664 B at TP8 against the mesh's 9216 B -- an
+    # INT6 ring costs less LDS than an INT4 mesh.
+    pack_row_i32 = max(rs.rank_tile_i32, ag.rank_tile_i32)
+    pack_i32 = rank_atoms * pack_row_i32
+    lds_bytes = pack_i32 * 4
+    PackStorage = make_pack_storage(pack_i32)
 
     def _chunk_of(k: int) -> int:
         """Which chunk op *k* carries, following the standard ring schedule.
@@ -234,7 +264,10 @@ def make_qr_int4_ring_kernel(
         quad, lane_in_quad = fx.idx2crd(lane, quad_layout).unpack()
         quad_id = wave * fx.Int32(QUADS_PER_WAVE) + quad
 
-        pack_layout = fx.make_layout((ATOMS, RANK_TILE_I32), (RANK_TILE_I32, 1))
+        # Threads 2t and 2t+1 share one i32 of the INT6 2-bit plane; the even
+        # one stores it.
+        hi2_leader = (tid & fx.Int32(1)) == fx.Int32(0)
+        hi2_slot = tid.shrui(fx.Int32(1))
 
         hbm_layout = fx.make_layout(
             (num_tiles, ATOMS, BLOCK * 4),
@@ -255,13 +288,15 @@ def make_qr_int4_ring_kernel(
         ).unpack()
         color_layout = fx.make_layout((grid,), (1,))
 
-        # Only rank_atoms of the ATOMS rows are used -- a ring stages one
-        # destination's packet, not every destination's. Reusing the two-shot's
-        # struct wastes at most 8 KiB of a 160 KiB budget and keeps one
-        # definition of the staging layout.
+        # One allocation, one view per codec.
         lds = fx.SharedAllocator().allocate(PackStorage).peek()
-        pack = lds.pack.view(pack_layout)
         smem_ptr = lds.pack.ptr
+        pack_views = {
+            c.name: lds.pack.view(
+                fx.make_layout((rank_atoms, c.rank_tile_i32), (c.rank_tile_i32, 1))
+            )
+            for c in ({rs.name: rs, ag.name: ag}).values()
+        }
 
         peer_rsrc = buffer_ops.create_buffer_resource_from_addr(peer_ptrs)
         peers = [
@@ -270,7 +305,7 @@ def make_qr_int4_ring_kernel(
         ]
         # A ring only ever names two of the peers, and ``rank`` is compile-time,
         # so both are plain Python indices into the loaded pointers. The
-        # two-shot packs these into an fx.Vector because its fanout selects a
+        # mesh packs these into an fx.Vector because its fanout selects a
         # peer with a *runtime* lane-dependent index; doing that here would put
         # a dynamic extract in front of a constant and get the wrong element.
         self_base = fx.Int64(peers[rank])
@@ -307,11 +342,14 @@ def make_qr_int4_ring_kernel(
             silently returns a *negative* index. ``step`` is a Python int, so the
             first term folds to a constant at trace time and this is no more work
             than the layout version.
+
+            With two codecs the steps are no longer uniformly sized, so the base
+            is a prefix sum rather than a product.
             """
             return (
-                fx.Int32(step * grid * wire_tile_i32)
-                + bid * fx.Int32(wire_tile_i32)
-                + sub * fx.Int32(payload_i32)
+                fx.Int32(step_base_i32[step])
+                + bid * fx.Int32(wire_tile_i32[step])
+                + sub * fx.Int32(payload_i32[step])
             )
 
         def _hbm_atom_row(buf, tile, atom):
@@ -335,7 +373,7 @@ def make_qr_int4_ring_kernel(
 
             Only ``rank_atoms`` of the tile, not all 8: a ring touches one chunk
             per op, and across the reduce-scatter lap it visits every chunk
-            exactly once -- so total HBM traffic matches the two-shot's single
+            exactly once -- so total HBM traffic matches the mesh's single
             bulk load, with far fewer values live across the spin-waits.
             """
             out = []
@@ -356,58 +394,74 @@ def make_qr_int4_ring_kernel(
             frag.store(_atom_f16_to_bf16(value))
             fx.copy(hbm_copy_atom, frag, dst)
 
-        def _lds_write_packet(j, packed, scale_word, is_leader):
+        def _lds_write_packet(codec, j, words, scale_word, is_leader):
+            """Stage one packet of *codec* into the row this hop will send.
+            """
+            pack = pack_views[codec.name]
             row = fx.Int32(j)
-            fx.memref_store(packed, pack, (row, tid))
+            fx.memref_store(words[0], pack, (row, tid))
+            if codec.n_words == 2:  # noqa: SIM102
+                if hi2_leader:
+                    fx.memref_store(
+                        words[1],
+                        pack,
+                        (row, fx.Int32(codec.hi2_i32_off) + hi2_slot),
+                    )
             if is_leader:
                 fx.memref_store(
                     scale_word,
                     pack,
-                    (row, fx.Int32(SCALE_I32_OFF) + scale_slot),
+                    (row, fx.Int32(codec.scale_i32_off) + scale_slot),
                 )
 
-        def _recv_raw(step, sub, j):
-            """This rank's inbox slot for *step*: the packed nibbles and the raw
-            E4M3 word, both exactly as the predecessor wrote them.
+        def _recv_raw(codec, step, sub, j):
+            """This rank's inbox slot for *step*, exactly as the predecessor wrote it.
 
-            Returned undecoded on purpose. The all-gather lap re-stages these
-            same two values into LDS and forwards them untouched, which is what
-            keeps that lap free of any additional quantization.
+            Returned undecoded on purpose -- the 2-bit plane stays compacted.
+            The all-gather lap restages these same values into LDS and forwards
+            them untouched, which is what keeps that lap free of any additional
+            quantization, and that only works if nothing here reinterprets them.
             """
-            base = _slot_i32(step, sub) + fx.Int32(j * RANK_TILE_I32)
-            packed = _load_i32_at(self_rsrc, base + tid, _RECV_POLICY)
-            word = _load_i32_at(
-                self_rsrc, base + fx.Int32(SCALE_I32_OFF) + scale_slot, _RECV_POLICY
-            )
-            return packed, word
+            base = _slot_i32(step, sub) + fx.Int32(j * codec.rank_tile_i32)
 
-        def _scale_of(word):
+            def _get(off):
+                return _load_i32_at(self_rsrc, base + off, _RECV_POLICY)
+
+            return _codec_load(codec, _get, tid, scale_slot)
+
+        def _scale_of(codec, word):
             e = word.shrui(pair_in_slot * fx.Int32(8)) & fx.Int32(0xFF)
-            return _e4m3_decoding_scale(e)
+            return _e4m3_decoding_scale(codec, e)
 
         def _fanout_to_next(step, sub):
             """Push the staged rank-tiles from LDS into the successor's inbox.
 
             One destination, sectors in address order, so the whole
-            ``rank_atoms * 1152 B`` lands as a single contiguous run. Quads past
-            the sector count sit idle rather than branching -- ``safe`` keeps
-            their address arithmetic in range, mirroring the two-shot.
+            ``rank_atoms * rank_tile B`` lands as a single contiguous run. Quads
+            past the sector count sit idle rather than branching -- ``safe``
+            keeps their address arithmetic in range, mirroring the mesh.
+
+            INT6 is 26 sectors to INT4's 18, so a TP8 hop drives 26 of the 64
+            quads rather than 18: the wider codec uses the fanout better.
             """
-            for rnd in range_constexpr(fanout_rounds):
+            codec = step_codec[step]
+            n_sectors = codec.n_sectors
+            n_total = total_sectors[step]
+            for rnd in range_constexpr(fanout_rounds[step]):
                 s = quad_id + fx.Int32(rnd * QUADS_PER_BLOCK)
-                in_range = s < fx.Int32(total_sectors)
+                in_range = s < fx.Int32(n_total)
                 safe = in_range.select(s, fx.Int32(0))
                 # Flat sector id -> (rank-atom, sector), then -> i32 offset. Both
                 # by arithmetic, for the same reason as _slot_i32: at TP8
                 # rank_atoms is 1, and a unit mode in a layout does not survive
                 # coalescing intact. The same offset addresses LDS and the
-                # wire, because the LDS pack rows and the wire rank-tiles share
-                # the RANK_TILE_I32 stride.
-                j = safe // fx.Int32(N_SECTORS)
-                sector = safe % fx.Int32(N_SECTORS)
-                if s < fx.Int32(total_sectors):
+                # wire, because this codec's LDS view and its wire rank-tiles
+                # share a row stride.
+                j = safe // fx.Int32(n_sectors)
+                sector = safe % fx.Int32(n_sectors)
+                if s < fx.Int32(n_total):
                     flat = (
-                        j * fx.Int32(RANK_TILE_I32)
+                        j * fx.Int32(codec.rank_tile_i32)
                         + sector * fx.Int32(16)
                         + lane_in_quad * fx.Int32(4)
                     )
@@ -421,12 +475,12 @@ def make_qr_int4_ring_kernel(
         def _publish(step, color):
             """Drain the payload, make it visible, then colour the slot tail.
 
-            Identical in shape to the two-shot's publish and for the same
+            Identical in shape to the mesh's publish and for the same
             reasons -- ``vmcnt`` is per-wave so the workgroup has to join before
             the flag goes out, and on a cacheable inbox a retired store is not
             yet a visible one, so the release needs an explicit L2 writeback.
-            What differs is the width: one quad, one destination, where the
-            two-shot needs one quad per peer.
+            What differs is the width: one quad, one destination, where the mesh
+            needs one quad per peer.
             """
             rocdl.s_waitcnt(vmcnt=0)
             gpu.barrier()
@@ -434,7 +488,7 @@ def make_qr_int4_ring_kernel(
                 llvm.InlineAsmOp(None, [], release_writeback, "", has_side_effects=True)
                 rocdl.s_waitcnt(vmcnt=0)
             if quad_id == fx.Int32(0):
-                vec_idx = fx.Int32(release_i32_off) + lane_in_quad * fx.Int32(4)
+                vec_idx = fx.Int32(release_i32_off[step]) + lane_in_quad * fx.Int32(4)
                 v4 = fx.Vector.from_elements([color, color, color, color], fx.Int32)
                 byte_off = _i32_to_bytes(_slot_i32(step, fx.Int32(0)) + vec_idx)
                 _store_v4i32_peer(next_base + byte_off, v4, flag_policy)
@@ -442,7 +496,7 @@ def make_qr_int4_ring_kernel(
         def _wait(step, color):
             """Spin until the predecessor has coloured *step*'s slot in our inbox.
 
-            One source, so one thread spins where the two-shot needs one per
+            One source, so one thread spins where the mesh needs one per
             peer. ``buffer_inv sc1`` between attempts is not optional: without
             it the load can be answered forever from a stale line, which is a
             hang rather than a slowdown.
@@ -457,7 +511,7 @@ def make_qr_int4_ring_kernel(
 
             Spins on the one shared ``self_rsrc`` descriptor at an element
             offset, rather than building a fresh descriptor from
-            ``self_base + elem*4``. The two-shot can afford the latter because
+            ``self_base + elem*4``. The mesh can afford the latter because
             its ``elem`` depends on ``tid`` (one spinner per source rank) and the
             resulting waterfall is genuine. Here there is exactly one source, so
             a per-call descriptor is a *uniform* value that LLVM cannot prove
@@ -465,7 +519,7 @@ def make_qr_int4_ring_kernel(
             serializes the wave around them, num_records included.
             """
             if tid == fx.Int32(0):
-                elem = _slot_i32(step, fx.Int32(0)) + fx.Int32(release_i32_off)
+                elem = _slot_i32(step, fx.Int32(0)) + fx.Int32(release_i32_off[step])
                 # `sc0 sc1`, so each retry is fetched past L1 and L2 and no
                 # fence is needed in the loop; the acquire below covers the
                 # payload reads, once, after the join.
@@ -485,7 +539,7 @@ def make_qr_int4_ring_kernel(
             # and cannot be served a stale line on their own. It is kept because
             # it costs one fence per step and the failure it guards against is a
             # silent wrong result. (An earlier version of this comment said the
-            # payload was read `nt`; that describes the two-shot kernel, not
+            # payload was read `nt`; that describes the mesh kernel, not
             # this one -- see the note on _RECV_POLICY above.)
             #
             # Write back *before* invalidating. The ring stores
@@ -508,53 +562,78 @@ def make_qr_int4_ring_kernel(
             ``else`` on a Python-level condition is evaluated at trace time and
             selects exactly one branch, so all compile-time branching here uses
             that form.
+
+            The codecs are compile-time too: an op reads the codec of the step
+            it receives from (``k-2``) and writes the codec of the step it sends
+            into (``k-1``). Those coincide everywhere except op ``N``, which is
+            the seam between the two laps -- it reads a reduce-scatter slot and
+            writes an all-gather one.
             """
             chunk = _chunk_of(k)
             is_leader = (tid % fx.Int32(GROUP)) == fx.Int32(0)
+            c_in = step_codec[k - 2] if k >= 2 else None
+            c_out = step_codec[k - 1] if k <= steps else None
 
             if k == 1:
                 # Pipeline fill: nothing to receive, push our own contribution.
                 atoms = _load_chunk_atoms(tile, chunk)
                 for j in range_constexpr(rank_atoms):
-                    packed, word, leader = _codec_quant(atoms[j], lane, tid)
-                    _lds_write_packet(j, packed, word, leader)
+                    words, word, leader = _codec_quant(c_out, atoms[j], lane, tid)
+                    _lds_write_packet(c_out, j, words, word, leader)
             elif k < world_size:
                 # Reduce-scatter: add our contribution to the running partial.
                 atoms = _load_chunk_atoms(tile, chunk)
                 for j in range_constexpr(rank_atoms):
-                    packed_in, word_in = _recv_raw(k - 2, sub, j)
-                    acc = _codec_dequant(packed_in, _scale_of(word_in), atoms[j])
-                    packed, word, leader = _codec_quant(acc, lane, tid)
-                    _lds_write_packet(j, packed, word, leader)
+                    words_in, word_in = _recv_raw(c_in, k - 2, sub, j)
+                    acc = _codec_dequant(
+                        c_in, words_in, _scale_of(c_in, word_in), tid, atoms[j]
+                    )
+                    words, word, leader = _codec_quant(c_out, acc, lane, tid)
+                    _lds_write_packet(c_out, j, words, word, leader)
             elif k == world_size:
-                # Last reduce. Every rank has now contributed, so this is the
-                # final sum for our own chunk: store it from the unquantized
-                # accumulator, since it never makes another wire hop. The same
-                # value is quantized once for the all-gather's first send.
+                # Last reduce, and the seam: c_in is the reduce-scatter codec,
+                # c_out the all-gather one. Every rank has now contributed, so
+                # this is the final sum for our own chunk: store it from the
+                # unquantized accumulator, since it never makes another wire
+                # hop. The same value is quantized once for the all-gather's
+                # first send, and that single quantization is the whole error
+                # the gather lap contributes.
                 atoms = _load_chunk_atoms(tile, chunk)
                 for j in range_constexpr(rank_atoms):
-                    packed_in, word_in = _recv_raw(k - 2, sub, j)
-                    acc = _codec_dequant(packed_in, _scale_of(word_in), atoms[j])
+                    words_in, word_in = _recv_raw(c_in, k - 2, sub, j)
+                    acc = _codec_dequant(
+                        c_in, words_in, _scale_of(c_in, word_in), tid, atoms[j]
+                    )
                     _store_chunk_atom(tile, chunk, j, acc)
-                    packed, word, leader = _codec_quant(acc, lane, tid)
-                    _lds_write_packet(j, packed, word, leader)
+                    words, word, leader = _codec_quant(c_out, acc, lane, tid)
+                    _lds_write_packet(c_out, j, words, word, leader)
             elif k < n_ops:
                 # All-gather: the chunk is already final, so decode it for our
                 # own output and forward the bytes we received unmodified. Not
                 # dequantizing-and-requantizing is what keeps this lap free of
-                # additional error.
+                # additional error -- and it is why c_in is c_out here.
                 for j in range_constexpr(rank_atoms):
-                    packed_in, word_in = _recv_raw(k - 2, sub, j)
+                    words_in, word_in = _recv_raw(c_in, k - 2, sub, j)
                     _store_chunk_atom(
-                        tile, chunk, j, _codec_dequant(packed_in, _scale_of(word_in))
+                        tile,
+                        chunk,
+                        j,
+                        _codec_dequant(
+                            c_in, words_in, _scale_of(c_in, word_in), tid
+                        ),
                     )
-                    _lds_write_packet(j, packed_in, word_in, is_leader)
+                    _lds_write_packet(c_out, j, words_in, word_in, is_leader)
             else:
                 # Final op: the last chunk arrives and stops here.
                 for j in range_constexpr(rank_atoms):
-                    packed_in, word_in = _recv_raw(k - 2, sub, j)
+                    words_in, word_in = _recv_raw(c_in, k - 2, sub, j)
                     _store_chunk_atom(
-                        tile, chunk, j, _codec_dequant(packed_in, _scale_of(word_in))
+                        tile,
+                        chunk,
+                        j,
+                        _codec_dequant(
+                            c_in, words_in, _scale_of(c_in, word_in), tid
+                        ),
                     )
 
         def _ring_group(i, n_this, color):
@@ -647,7 +726,10 @@ def make_qr_int4_ring_kernel(
     # rank is baked into the schedule, and the inbox memory type into the store
     # policy, so both have to reach the symbol name -- variants that differ only
     # in a compile-time constant must not collide in the JIT cache.
-    tag = f"ws{world_size}_r{rank}_st{super_tile}_{inbox_memory}_{rs_codec}"
+    tag = (
+        f"ws{world_size}_r{rank}_st{super_tile}_{inbox_memory}"
+        f"_{rs_codec}_{ag_codec}"
+    )
     launch_qr_int4_ring.func.__name__ = f"launch_qr_int4_ring_{tag}"
     try:
         qr_int4_ring.func.__name__ = f"qr_int4_ring_{tag}"
@@ -657,16 +739,19 @@ def make_qr_int4_ring_kernel(
         "launch": launch_qr_int4_ring,
         "flags_bytes": 0,  # the handshake rides in each slot's 64 B tail
         "data_bytes": inbox_bytes,
-        "lds_bytes": LDS_BYTES,
+        "lds_bytes": lds_bytes,
         "tile_bytes": TILE_BYTES,
         "tile_fp16": TILE_FP16,
-        "rank_tile_bytes": RANK_TILE_BYTES,
-        "wire_tile_bytes": wire_tile_bytes,
+        "rank_tile_bytes": rs.rank_tile_bytes,
+        "wire_tile_bytes": wire_tile_i32[0] * 4,
+        "ag_rank_tile_bytes": ag.rank_tile_bytes,
+        "ag_wire_tile_bytes": wire_tile_i32[-1] * 4,
         "super_tile": super_tile,
         "world_size": world_size,
         "rank": rank,
         "inbox_memory": inbox_memory,
         "rs_codec": rs_codec,
+        "ag_codec": ag_codec,
         "payload_policy": payload_policy,
         "flag_policy": flag_policy,
         "release_writeback": release_writeback,

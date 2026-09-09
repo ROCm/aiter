@@ -74,7 +74,7 @@ class UncachedIpcHeap:
     # simple. It is catastrophic on PCIe: peer writes into uncached memory
     # serialize per destination, so bandwidth collapses as the number of peers
     # written grows (measured on MI350P: 55 GB/s to 1 peer, 4.45 to 2, 1.44 to
-    # 3, against 33.5 GB/s fine-grained). See docs/qr_int4_mi350p.md.
+    # 3, against 33.5 GB/s fine-grained).
     _HIP_DEVICE_MALLOC_DEFAULT = 0x0
     _HIP_DEVICE_MALLOC_FINEGRAINED = 0x1
     _HIP_DEVICE_MALLOC_UNCACHED = 0x3
