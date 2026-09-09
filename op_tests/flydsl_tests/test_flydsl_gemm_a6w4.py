@@ -13,11 +13,7 @@ import pytest
 import torch
 
 pytest.importorskip("flydsl")
-from aiter.ops.flydsl import is_flydsl_available
 from aiter.utility.fp4_utils import e8m0_to_f32, mxfp4_to_f32
-
-if not is_flydsl_available():
-    pytest.skip("flydsl is not available", allow_module_level=True)
 
 
 def _is_gfx950() -> bool:

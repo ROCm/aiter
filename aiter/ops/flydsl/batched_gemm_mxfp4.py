@@ -11,6 +11,10 @@ as a non-contiguous [B,M,N] view)."""
 
 from __future__ import annotations
 
+import csv
+import functools
+import os
+
 import torch
 
 from aiter.jit.utils.chip_info import get_gfx
@@ -22,6 +26,9 @@ WMMA_K_GFX1250 = 128
 
 # a_dtype -> A bytes per code (fp4 = 2 codes/byte; fp6/fp8 = 1 byte/code).
 _A_CODES_PER_BYTE = {"fp4": 2, "fp6": 1, "fp8": 1}
+
+# gfx950 launch_gemm CompiledFunctions, keyed by their full Constexpr config.
+_GFX950_CF_CACHE: dict = {}
 
 
 def flydsl_batched_gemm_mxfp4(
@@ -37,6 +44,7 @@ def flydsl_batched_gemm_mxfp4(
     tile_m: int = 128,
     tile_n: int = 128,
     tile_k: int = 256,
+    k_batch: int = 1,
     out: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Thin strided-batched MXFP A x MXFP4 B launcher (gfx950). Operands are ALREADY prepared
@@ -54,6 +62,11 @@ def flydsl_batched_gemm_mxfp4(
         raise ValueError(f"[FlyDSL] layout must be 'bmn' or 'mbn'; got {layout!r}")
     if dtype not in (torch.bfloat16, torch.float16):
         raise ValueError(f"[FlyDSL] unsupported out dtype {dtype}")
+    # Only k_batch > 1 takes the split-K branch, so a non-positive value would
+    # slip through to the kernel and evaluate K_TILES % k_batch -- a constexpr
+    # division by zero at k_batch=0, and a negative grid.z extent below that.
+    if not isinstance(k_batch, int) or isinstance(k_batch, bool) or k_batch < 1:
+        raise ValueError(f"[FlyDSL] k_batch must be an int >= 1; got {k_batch!r}")
 
     if gfx == "gfx1250":
         return _run_gfx1250(
@@ -81,8 +94,9 @@ def flydsl_batched_gemm_mxfp4(
     K = a_row_bytes * _A_CODES_PER_BYTE[a_dtype]
 
     # tile_m % 32 / tile_n % 64 must be exact or the kernel's chunk counts silently drop work.
-    # This checked % 16, but the kernel asserts % 32 (the A e8m0 scale is 32-row
-    # granular), so tile_m=16 passed here and died on a raw assert inside launch_gemm.
+    # tile_m was checked against 16 here, but the kernel itself asserts % 32 (the A
+    # e8m0 scale is 32-row granular), so tile_m=16 slipped past this guard and died
+    # on a raw assert inside launch_gemm instead of a readable error.
     if tile_m % 32 != 0:
         raise RuntimeError(
             f"[FlyDSL] tile_m ({tile_m}) must be a multiple of 32 "
@@ -98,19 +112,21 @@ def flydsl_batched_gemm_mxfp4(
         raise RuntimeError(
             f"[FlyDSL] tile_k must be 128/256 dividing K; got {tile_k}, K={K}"
         )
-    # The A tile is staged into LDS in whole cooperative rounds of
-    # num_threads*16 bytes, so an A tile that is not a multiple of one round
-    # would leave part of itself never DMA'd. The kernel asserts this, but the
-    # per-dimension checks above cannot see it: it couples tile_m, tile_k, tile_n
-    # *and* a_dtype. (32, 128, 128) is fine for fp6 but not fp4, for instance.
-    a_row_b = tile_k // _A_CODES_PER_BYTE[a_dtype]
-    a_copy_granularity = min(4, tile_n // 16) * 64 * 16
-    if (tile_m * a_row_b) % a_copy_granularity != 0:
+    # The A tile is staged into LDS in whole cooperative rounds of num_threads*16
+    # bytes, so an A tile that is not a multiple of one round would leave part of
+    # itself never DMA'd. The kernel asserts this, but the per-dimension checks
+    # above cannot see it: it couples tile_m, tile_k, tile_n *and* a_dtype --
+    # (32, 128, 128) is fine for fp6 but not fp4, for instance. tiles_are_valid()
+    # applies the same rule when picking tiles; this guard is for direct callers,
+    # which would otherwise hit a raw kernel assert.
+    if not tiles_are_valid(tile_m, tile_n, tile_k, N, K, a_dtype):
+        a_row_b = tile_k // _A_CODES_PER_BYTE[a_dtype]
         raise RuntimeError(
             f"[FlyDSL] tile_m*tile_k/{_A_CODES_PER_BYTE[a_dtype]} "
             f"({tile_m * a_row_b}B of A tile) must be a multiple of "
-            f"{a_copy_granularity}B (num_threads*16) for a_dtype={a_dtype!r}; "
-            f"got tile_m={tile_m}, tile_n={tile_n}, tile_k={tile_k}"
+            f"{min(4, tile_n // 16) * 64 * 16}B (num_threads*16) for "
+            f"a_dtype={a_dtype!r}; got tile_m={tile_m}, tile_n={tile_n}, "
+            f"tile_k={tile_k}"
         )
 
     out_dtype = "bf16" if dtype == torch.bfloat16 else "fp16"
@@ -123,14 +139,61 @@ def flydsl_batched_gemm_mxfp4(
     else:
         strides = (-1, -1, -1, -1, -1, -1)
         shape = (B, M, N)
+    # ptr_arg erases dtype/shape/device, so a mismatched `out` is not a wrong
+    # result but an out-of-bounds write: the kernel would store bf16 elements
+    # into, say, an fp32 or an undersized allocation. Nothing downstream can
+    # catch that, so validate before taking the pointer.
+    if out is not None:
+        if out.dtype != dtype:
+            raise RuntimeError(f"[FlyDSL] out.dtype ({out.dtype}) must be {dtype}")
+        if tuple(out.shape) != tuple(shape):
+            raise RuntimeError(
+                f"[FlyDSL] out.shape ({tuple(out.shape)}) must be {tuple(shape)}"
+            )
+        if out.device != a.device:
+            raise RuntimeError(
+                f"[FlyDSL] out.device ({out.device}) must be {a.device}"
+            )
+        if not out.is_contiguous():
+            raise RuntimeError(
+                "[FlyDSL] out must be contiguous; the kernel writes it through a "
+                "raw pointer using the strides computed above"
+            )
     out_phys = (
         out if out is not None else torch.empty(shape, dtype=dtype, device=a.device)
     )
 
-    # @flyc.jit caches per Constexpr config internally; M rides i32_m at runtime (not baked).
-    # Operands go in as ptr_arg (raw data_ptr) so each launch skips per-tensor DLPack conversion.
-    launch_gemm(
-        ptr_arg(out_phys.view(-1)),
+    # Split-K. Without it the grid is ceil(M/tile_m) * (N/tile_n) workgroups, so a
+    # decode-shaped M leaves most of the device idle -- at M=1, N=4096, tile_n=64
+    # that is 64 workgroups against 256 CUs. k_batch splits the K loop across
+    # grid.z into fp32 partials that launch_splitk_reduce then sums, which
+    # measured 2.04x at M=1 with bit-identical output.
+    if k_batch > 1:
+        if (K // tile_k) % k_batch:
+            raise RuntimeError(
+                f"[FlyDSL] K/tile_k ({K // tile_k}) must be divisible by "
+                f"k_batch ({k_batch})"
+            )
+        if layout != "bmn" or B != 1:
+            raise RuntimeError(
+                "[FlyDSL] split-K needs the contiguous single-batch layout "
+                f"(bmn, B=1); got layout={layout!r}, B={B}"
+            )
+        gemm_dst = torch.empty((k_batch, M, N), dtype=torch.float32,
+                               device=a.device)
+    else:
+        gemm_dst = out_phys
+
+    # Everything the kernel bakes in. M is absent on purpose -- it rides i32_m at
+    # runtime, so one compiled config serves every batch size (verified: a config
+    # compiled at M=1 gives correct results for M up to 1000).
+    cfg_key = (N, K, tile_m, tile_n, tile_k, a_dtype, out_dtype, B, strides,
+               k_batch)
+
+    # Operands go in as ptr_arg (raw data_ptr) so each launch skips per-tensor
+    # DLPack conversion.
+    launch_args = (
+        ptr_arg(gemm_dst.view(-1)),
         ptr_arg(a.reshape(-1)),
         ptr_arg(w),
         ptr_arg(a_scales),
@@ -145,16 +208,56 @@ def flydsl_batched_gemm_mxfp4(
         tile_k,
         a_dtype,
         out_dtype,
-        # B is always MXFP4 here (see the function name / docstring). launch_gemm
-        # grew b_dtype when FlyDSL added the a8w8 (fp8 B) path, and this call was
-        # never updated -- it passed 15 positional args where 16 are required, so
-        # B bound to b_dtype, every stride shifted by one, and waves_per_eu (which
-        # has no default) was left unbound.
+        # B operand is always MXFP4 here (see the function name / docstring);
+        # launch_gemm grew b_dtype when FlyDSL added the a8w8 (fp8 B) path.
         "fp4",
         B,
         *strides,
-        0,
+        0,          # waves_per_eu
+        0,          # xcd_swizzle
+        k_batch,
     )
+
+    # Re-entering the @flyc.jit wrapper re-resolves the config from its 24
+    # arguments on every call, which measured ~18us of CPU per launch on MI355X.
+    # Holding the CompiledFunction it produces and calling that directly drops
+    # CPU dispatch to ~3.4us, so cache on the full Constexpr tuple.
+    #
+    # Deliberately NOT tensor_shim._run_compiled: that stashes one cf on the
+    # callable itself, which is right for the per-config closures the other
+    # kernels build but wrong here -- launch_gemm is a single shared module-level
+    # jit, so the first config's kernel would be handed to every later config.
+    cf = _GFX950_CF_CACHE.get(cfg_key)
+    if cf is None:
+        import flydsl.compiler as flyc
+
+        # flyc.compile both compiles and runs this first call.
+        _GFX950_CF_CACHE[cfg_key] = flyc.compile(launch_gemm, *launch_args)
+    else:
+        cf(*launch_args)
+
+    if k_batch > 1:
+        from .kernels.mxfp4_preshuffle import launch_splitk_reduce
+
+        reduce_args = (
+            ptr_arg(gemm_dst.view(-1)),
+            ptr_arg(out_phys.view(-1)),
+            M * N // 2,   # output dwords: 2 out elems per dword
+            M * N,        # dwords per fp32 slab
+            torch.cuda.current_stream(),
+            k_batch,
+            out_dtype,
+        )
+        reduce_key = ("reduce", M * N, k_batch, out_dtype)
+        rcf = _GFX950_CF_CACHE.get(reduce_key)
+        if rcf is None:
+            import flydsl.compiler as flyc
+
+            _GFX950_CF_CACHE[reduce_key] = flyc.compile(
+                launch_splitk_reduce, *reduce_args
+            )
+        else:
+            rcf(*reduce_args)
 
     # mbn C physical [M,B,N] -> logical [B,M,N] view.
     return out_phys.transpose(0, 1) if layout == "mbn" else out_phys
@@ -486,3 +589,338 @@ def flydsl_batched_gemm_a8w4_v2(
         cluster_n,
     )
     return out_phys.transpose(0, 1) if layout == "mbn" else out_phys
+
+
+# ---------------------------------------------------------------------------
+# gfx950 (wave64 MFMA) operand prep + tile selection.
+#
+# The helpers above (preshuffle_a8w4_weight_mbn / quant_act_mxfp8_mbn) target the
+# gfx1250 WMMA layout. These are the CDNA4 equivalents, and they are what the
+# module docstring means by "preshuffle_operands": callers should not have to
+# rediscover which of aiter's several shuffles this kernel wants.
+# ---------------------------------------------------------------------------
+
+# A dtypes quant_mx_act can produce. The kernel also takes fp8 A, which is where
+# a8w4 lives on gfx950 (aiter's gemm_a8w4_mxfp8 asm path is gfx1250-only).
+_MX_A_SUPPORTED = ("fp4", "fp6", "fp8")
+
+# In-process overrides, keyed by (M, N, K, a_dtype). Takes precedence over the
+# tuned CSV; mainly for tuners and tests.
+MX_TUNED_TILES: dict[tuple[int, int, int, str], tuple[int, int, int]] = {}
+
+# Shape-tuned tiles, same spirit as aiter/configs/a6w6_blockscale_tuned_gemm.csv:
+# exact (gfx, cu_num, M, N, K, a_dtype) matches only, everything else falls
+# through to the heuristic in pick_mx_tiles. Regenerate with
+# op_tests/op_benchmarks/hip/tune_gemm_mx_a6w4.py.
+#
+# Resolved through AITER_CONFIGS like every other tuned GEMM table, rather than
+# by walking up from __file__: that also picks up per-model tables dropped in
+# aiter/configs/model_configs/ and honours the AITER_CONFIG_GEMM_A6W4 override.
+
+
+def _mx_tuned_csv() -> str:
+    from aiter.jit.core import AITER_CONFIGS
+
+    return AITER_CONFIGS.AITER_CONFIG_GEMM_A6W4_FILE
+
+
+@functools.cache
+def _load_mx_tuned_csv() -> dict[tuple[str, int, int, int, int, str],
+                                 tuple[int, int, int]]:
+    MX_TUNED_CSV = _mx_tuned_csv()
+    if not os.path.exists(MX_TUNED_CSV):
+        return {}
+    table: dict[tuple[str, int, int, int, int, str], tuple[int, int, int]] = {}
+    with open(MX_TUNED_CSV, newline="") as fh:
+        for row in csv.DictReader(fh):
+            try:
+                key = (row["gfx"].strip(), int(row["cu_num"]), int(row["M"]),
+                       int(row["N"]), int(row["K"]), row["a_dtype"].strip())
+                tiles = (int(row["tile_m"]), int(row["tile_n"]),
+                         int(row["tile_k"]))
+            except (KeyError, ValueError) as exc:
+                raise ValueError(f"{MX_TUNED_CSV}: bad row {row!r}") from exc
+            if key in table:
+                raise ValueError(f"{MX_TUNED_CSV}: duplicate key {key}")
+            table[key] = tiles
+    return table
+
+
+def clear_mx_tuned_cache() -> None:
+    """Drop the cached tuned table after a tuner rewrites the CSV."""
+    _load_mx_tuned_csv.cache_clear()
+
+
+@functools.cache
+def _cu_count() -> int:
+    """Compute-unit count, for the occupancy check in pick_mx_tiles."""
+    try:
+        from aiter.jit.utils.chip_info import get_cu_num
+
+        return int(get_cu_num())
+    except Exception:  # noqa: BLE001
+        return 256  # MI355X
+
+
+
+def tiles_are_valid(
+    tile_m: int, tile_n: int, tile_k: int, N: int, K: int, a_dtype: str = "fp6"
+) -> bool:
+    """Is this tile triple launchable through :func:`flydsl_batched_gemm_mxfp4`?
+
+    Kept in sync with the asserts at the top of ``launch_gemm``, tightened to the
+    subset the public launcher exposes; picking a tile combination that violates
+    them otherwise dies on a raw kernel assert. The last condition is the
+    non-obvious one: the A tile is staged into LDS by whole cooperative rounds of
+    ``num_threads * 16`` bytes, so an A tile that is not a multiple of that would
+    leave part of itself never DMA'd.
+    """
+    # tile_n is held to % 64, not the kernel's own % 16: flydsl_batched_gemm_mxfp4
+    # requires 64, so a 16- or 32-wide tile that the kernel would accept is still
+    # unreachable through the public launcher. Keeping the looser rule here would
+    # let pick_mx_tiles hand back a tile the documented "pass it straight
+    # through" call then rejects.
+    if tile_m % 32 != 0 or tile_n % 64 != 0 or tile_k not in (128, 256):
+        return False
+    if N % tile_n != 0 or K % tile_k != 0:
+        return False
+    a_row_b = tile_k // 2 if a_dtype == "fp4" else tile_k
+    a_lds_b = tile_m * a_row_b
+    num_threads = min(4, tile_n // 16) * 64
+    return a_lds_b % (num_threads * 16) == 0
+
+
+def pick_mx_tiles(
+    M: int, N: int, K: int, a_dtype: str = "fp6"
+) -> tuple[int, int, int]:
+    """Pick (tile_m, tile_n, tile_k) for the gfx950 MX preshuffle GEMM.
+
+    Order: tuned table -> preference-ordered search filtered by
+    :func:`tiles_are_valid`, so the result is always something the kernel
+    accepts and callers can pass it straight through.
+
+    Preferences come from a tile sweep on MI355X (gfx950) over
+    (M,N,K) = (1024,4096,4096), (4096,4096,4096), (2048,8192,8192):
+
+      * tile_k=128 beat 256 by 83% and 101% on the two largest shapes -- 256
+        halves the number of K chunks and starves the pipeline. Prefer 128.
+      * tile_n=256 was in the top configs for every shape measured.
+      * tile_m tracks M; 32 is the floor (the A e8m0 scale is 32-row granular)
+        and 128 only pays off once M is large enough to fill it.
+
+    Below M~2048 the call is dominated by per-launch dispatch rather than
+    compute, so tile choice barely moves the needle there.
+    """
+    if K % 256 != 0:
+        raise RuntimeError(f"[FlyDSL] K ({K}) must be a multiple of 256")
+
+    # Tuned entries are data, and a hand-edited or stale row is not obviously
+    # wrong at parse time: tile_m=0 parses fine and then divides by zero in
+    # pick_mx_split_k, and a negative tile passes the modulo-only checks in
+    # tiles_are_valid. This function promises every result is launchable, so
+    # hold tuned rows to the same bar as searched ones.
+    def _checked(tiles, origin):
+        tile_m, tile_n, tile_k = tiles
+        if min(tiles) <= 0 or not tiles_are_valid(
+            tile_m, tile_n, tile_k, N, K, a_dtype
+        ):
+            raise RuntimeError(
+                f"[FlyDSL] {origin} gives tiles {tiles} for M={M} N={N} K={K} "
+                f"a_dtype={a_dtype!r}, which the kernel cannot launch"
+            )
+        return tiles
+
+    tuned = MX_TUNED_TILES.get((M, N, K, a_dtype))
+    if tuned is not None:
+        return _checked(tuned, "MX_TUNED_TILES")
+    key = (get_gfx(), _cu_count(), M, N, K, a_dtype)
+    tuned = _load_mx_tuned_csv().get(key)
+    if tuned is not None:
+        return _checked(tuned, f"{_mx_tuned_csv()} row {key}")
+
+    # tile_m: a sweep over the R1 / Qwen3.8-27B shapes picks 32 for essentially
+    # every M up to 128 and splits between 32/64/128 above that, so grow it only
+    # slowly. A wider M tile mostly costs occupancy on these N/K-heavy shapes.
+    if M <= 128:
+        m_pref = (32, 64, 128, 256)
+    elif M <= 512:
+        m_pref = (64, 32, 128, 256)
+    else:
+        m_pref = (128, 64, 32, 256)
+    n_pref = sorted((t for t in (256, 128, 64) if N % t == 0), reverse=True)
+    if not n_pref:
+        raise RuntimeError(
+            f"[FlyDSL] N ({N}) must be a multiple of 64 for the MX preshuffle GEMM"
+        )
+
+    # Fat N tiles are only worth it if the grid still fills the device. First
+    # pass takes the widest tile_n that still covers the CUs. If nothing covers
+    # them -- the common case for decode-shaped M -- the second pass runs tile_n
+    # ascending instead, because then the goal flips to *maximising* workgroups:
+    # over the tuned R1 / Qwen3.8-27B rows the underfilled cases chose tile_n=64
+    # 127 times against 39 for tile_n=256.
+    cu = _cu_count()
+    for tile_n_order in (n_pref, sorted(n_pref)):
+        require_occupancy = tile_n_order is n_pref
+        for tile_n in tile_n_order:
+            for tile_m in m_pref:
+                # tile_k=256 won at every K in the tuned sweep (loop overhead
+                # dominates the extra pipelining a 128 chunk buys).
+                for tile_k in (256, 128):
+                    if not tiles_are_valid(tile_m, tile_n, tile_k, N, K, a_dtype):
+                        continue
+                    if require_occupancy:
+                        workgroups = -(-M // tile_m) * (N // tile_n)
+                        if workgroups < cu:
+                            continue
+                    return tile_m, tile_n, tile_k
+    raise RuntimeError(
+        f"[FlyDSL] no valid tile combination for M={M} N={N} K={K} "
+        f"a_dtype={a_dtype!r}"
+    )
+
+
+def pick_mx_split_k(M: int, N: int, K: int, tile_m: int, tile_n: int,
+                    tile_k: int) -> int:
+    """Pick ``k_batch`` so the grid covers the device.
+
+    Without split-K the grid is ``ceil(M/tile_m) * (N/tile_n)`` workgroups, which
+    for a decode-shaped M leaves most CUs idle: at M=1, N=4096, tile_n=64 that is
+    64 workgroups on 256 CUs. Splitting the K loop across ``grid.z`` fills them.
+
+    Take the largest divisor of ``K/tile_k`` that does not overshoot the CU count
+    -- measured on MI355X, landing exactly on 256 workgroups gave 2.04x at M=1
+    while oversubscribing (448 or 896) gave some of it back.
+    """
+    base = -(-M // tile_m) * (N // tile_n)
+    cu = _cu_count()
+    if base >= cu:
+        return 1
+    k_tiles = K // tile_k
+    best = 1
+    for kb in range(2, k_tiles + 1):
+        if k_tiles % kb:
+            continue
+        if base * kb > cu:
+            break
+        best = kb
+    return best
+
+
+def preshuffle_mx_weight(w_bf16: torch.Tensor):
+    """Quantize + preshuffle a BF16 weight to the gfx950 MXFP4 B layout.
+
+    Args:
+        w_bf16: ``[N, K]`` bf16/fp16 weight (row = output N).
+    Returns:
+        ``(w_codes [N, K//2] uint8, w_scales [N, K//32] uint8)``, both already
+        shuffled -- pass straight to :func:`flydsl_batched_gemm_mxfp4`.
+    """
+    from aiter.ops.flydsl.mxfp6_utils import shuffle_scale_w4
+    from aiter.ops.quant import per_1x32_f4_quant
+    from aiter.ops.shuffle import shuffle_weight_NK
+
+    assert w_bf16.dim() == 2, f"expected [N,K], got {tuple(w_bf16.shape)}"
+    w_q, w_scale = per_1x32_f4_quant(w_bf16.float())[:2]
+    # shuffle_weight_NK(w, 16, 64) is bit-identical to FlyDSL's shuffle_weight_w4;
+    # only the scale needs the CDNA4-specific shuffle (shuffle_scale_n32k4 is the
+    # gfx1250 WMMA layout, not this one).
+    return shuffle_weight_NK(w_q, 16, 64), shuffle_scale_w4(w_scale, 1, False)
+
+
+def quant_mx_act(a_bf16: torch.Tensor, a_dtype: str = "fp6"):
+    """Quantize a BF16 activation to the gfx950 MX A layout.
+
+    Args:
+        a_bf16: ``[M, K]`` bf16/fp16 activation.
+        a_dtype: ``"fp6"`` (MXFP6-E2M3), ``"fp4"`` (MXFP4-E2M1) or ``"fp8"``
+            (MXFP8-E4M3).
+    Returns:
+        ``(a_codes, a_scales)``. ``a_codes`` is ``[M, K]`` for fp6/fp8 (1 byte
+        per code; fp6 is FP8-padded packed) or ``[M, K//2]`` for fp4;
+        ``a_scales`` is the shuffled E8M0 scale.
+    """
+    from aiter import dtypes
+    from aiter.ops.flydsl.mxfp6_utils import per_1x32_f6_quant, shuffle_scale_w4
+    from aiter.ops.quant import per_1x32_f4_quant, per_1x32_mx_quant_hip
+
+    if a_dtype not in _MX_A_SUPPORTED:
+        raise ValueError(
+            f"[FlyDSL] quant_mx_act supports {list(_MX_A_SUPPORTED)}; got {a_dtype!r}"
+        )
+    assert a_bf16.dim() == 2, f"expected [M,K], got {tuple(a_bf16.shape)}"
+
+    M = a_bf16.shape[0]
+    # Every quantizer here reduces over 32-row groups, so pad M up before
+    # quantizing and keep the scale at that padded height (the kernel indexes it
+    # in 32-row supers); only the codes are trimmed back to the real M.
+    m_pad = max(32, (M + 31) // 32 * 32)
+    if m_pad != M:
+        a_bf16 = torch.nn.functional.pad(a_bf16, (0, 0, 0, m_pad - M))
+
+    if a_dtype == "fp6":
+        codes, scale, _ = per_1x32_f6_quant(a_bf16)
+    elif a_dtype == "fp8":
+        codes, scale = per_1x32_mx_quant_hip(
+            a_bf16, quant_dtype=dtypes.fp8, scale_type=dtypes.fp8_e8m0
+        )
+    else:
+        codes, scale = per_1x32_f4_quant(a_bf16.float())[:2]
+    return codes[:M].contiguous(), shuffle_scale_w4(
+        scale.view(torch.uint8), 1, False
+    )
+
+
+def preshuffle_operands(a_bf16: torch.Tensor, w_bf16: torch.Tensor, *,
+                        a_dtype: str = "fp6"):
+    """Convenience wrapper: prepare both operands for a single (B=1) GEMM.
+
+    Real consumers usually split these -- the weight is prepared once at load
+    time (:func:`preshuffle_mx_weight`) and the activation every forward
+    (:func:`quant_mx_act`).
+
+    Returns ``(a_codes, w_codes, a_scales, w_scales)`` in
+    :func:`flydsl_batched_gemm_mxfp4` argument order.
+    """
+    a_codes, a_scales = quant_mx_act(a_bf16, a_dtype)
+    w_codes, w_scales = preshuffle_mx_weight(w_bf16)
+    return a_codes, w_codes, a_scales, w_scales
+
+
+def flydsl_gemm_mxfp4(
+    a: torch.Tensor,
+    w: torch.Tensor,
+    a_scales: torch.Tensor,
+    w_scales: torch.Tensor,
+    N: int,
+    dtype: torch.dtype = torch.bfloat16,
+    *,
+    a_dtype: str = "fp6",
+    tile_m: int | None = None,
+    tile_n: int | None = None,
+    tile_k: int | None = None,
+    k_batch: int | None = None,
+) -> torch.Tensor:
+    """Un-batched ``[M,K] x [N,K].T -> [M,N]`` MX preshuffle GEMM (gfx950).
+
+    Thin 2D front-end over :func:`flydsl_batched_gemm_mxfp4` (B=1) for linear
+    layers, which do not have a batch dimension. Tiles default to
+    :func:`pick_mx_tiles`. Operands come from :func:`quant_mx_act` /
+    :func:`preshuffle_mx_weight`.
+    """
+    assert a.dim() == 2, f"expected [M,K] activation, got {tuple(a.shape)}"
+    M, a_row = a.shape
+    K = a_row * _A_CODES_PER_BYTE[a_dtype]
+    if tile_m is None or tile_n is None or tile_k is None:
+        auto_m, auto_n, auto_k = pick_mx_tiles(M, N, K, a_dtype)
+        tile_m = auto_m if tile_m is None else tile_m
+        tile_n = auto_n if tile_n is None else tile_n
+        tile_k = auto_k if tile_k is None else tile_k
+    if k_batch is None:
+        k_batch = pick_mx_split_k(M, N, K, tile_m, tile_n, tile_k)
+    out = flydsl_batched_gemm_mxfp4(
+        a.view(1, M, a_row), w, a_scales, w_scales, N, dtype,
+        a_dtype=a_dtype, tile_m=tile_m, tile_n=tile_n, tile_k=tile_k,
+        k_batch=k_batch,
+    )
+    return out.view(M, N)
