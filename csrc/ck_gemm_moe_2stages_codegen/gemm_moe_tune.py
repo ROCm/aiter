@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
+import argparse
 import functools
 import math
 import os
@@ -459,6 +460,26 @@ class FmoeTuner(TunerCommon):
             required=False,
             help="Tune the FlyDSL mxfp4 a4w4 port as a coupled (g1, g2) unit instead of the normal fmoe tuner.",
         )
+        self.parser.add_argument(
+            "--mxfp4-search-mode",
+            choices=("prune", "full"),
+            help="GEMM1 search mode: prune by M_est (default) or search all legal "
+            "variants (full); requires --mxfp4-flydsl.",
+        )
+
+    def parse_args(self) -> argparse.Namespace:
+        args = super().parse_args()
+        # None distinguishes an omitted mode from an explicit prune request.
+        if args.mxfp4_search_mode is not None and (
+            not args.mxfp4_flydsl
+            or args.grouped_gemm
+            or not isinstance(self, Mxfp4FlydslTuner)
+        ):
+            self.parser.error(
+                "--mxfp4-search-mode requires --mxfp4-flydsl without --grouped-gemm"
+            )
+        args.mxfp4_search_mode = args.mxfp4_search_mode or "prune"
+        return args
 
     @staticmethod
     def weight_quant(
@@ -6063,6 +6084,12 @@ class GroupedFmoeTuner(FmoeTuner):
 class Mxfp4FlydslTuner(FmoeTuner):
     """Tune the FlyDSL mxfp4 a4w4 *port* (flydsl_mxmoe_g{1,2}_a4w4_*) as one coupled
     unit.
+
+    By default, prune GEMM1 using M_est = ceil(token * topk / expert). This
+    reduces candidate evaluation work and is expected to shorten tuning wall
+    time; the actual speedup has not been measured. Kernel performance and
+    winner retention on unseen shapes require separate validation. Use
+    --mxfp4-search-mode full to enumerate all statically supported GEMM1 variants.
     """
 
     ARG_DEFAULTS: ClassVar[dict[str, Any]] = {
@@ -6119,8 +6146,30 @@ class Mxfp4FlydslTuner(FmoeTuner):
     _G1_K_WAVE = (1, 2, 4)
     _G1_NUM_WAVES = (4, 2)
 
-    def _g1_variants(self, row):
-        """Valid _g1_kname kwargs for one shape, most-default first."""
+    @staticmethod
+    def _g1_matches_m_est(g1: dict[str, Any], m_est: int) -> bool:
+        """Apply M_est allowlists; require an explicit rule for each BM family."""
+        bm = g1["bm"]
+        if bm == 16:
+            return m_est < 16
+        if bm == 32:
+            return 4 <= m_est <= 128 and (
+                m_est <= 32
+                or (g1["num_waves"] == 4 and g1["k_wave"] == 1 and not g1["use_nt"])
+            )
+        if bm == 64:
+            return m_est >= 16 and (m_est <= 64 or not g1["use_nt"])
+        if bm == 128:
+            return m_est >= 64
+        raise ValueError(
+            f"Missing GEMM1 pruning rule for BM{bm}; add an M_est pruning rule "
+            "for this BM in Mxfp4FlydslTuner._g1_matches_m_est before using prune mode."
+        )
+
+    def _g1_variants(
+        self, row: dict[str, Any], full_search: bool = False
+    ) -> list[dict[str, Any]]:
+        """Supported _g1_kname kwargs, pruned by M_est unless full_search is set."""
         from aiter.ops.flydsl.mxfp4_gemm1_kernels import _assert_supported
         from aiter.ops.flydsl.mxfp4_kname import MXFP4_G1_VARIANTS
 
@@ -6171,7 +6220,17 @@ class Mxfp4FlydslTuner(FmoeTuner):
                                         "num_waves": num_waves,
                                     }
                                 )
-        return out
+        if full_search:
+            return out
+        m_est = (int(row["token"]) * topk + ne - 1) // ne
+        kept = [g1 for g1 in out if self._g1_matches_m_est(g1, m_est)]
+        if len(kept) < len(out):
+            print(
+                f"[mxfp4-port] pruned G1: M_est={m_est} "
+                f"valid={len(out)} kept={len(kept)}",
+                flush=True,
+            )
+        return kept
 
     @staticmethod
     def _row_act(row):
@@ -6227,9 +6286,11 @@ class Mxfp4FlydslTuner(FmoeTuner):
         )
         return cand
 
-    def _candidate_rows(self, row):
+    def _candidate_rows(
+        self, row: dict[str, Any], full_search: bool = False
+    ) -> list[dict[str, Any]]:
         cands = []
-        for g1 in self._g1_variants(row):
+        for g1 in self._g1_variants(row, full_search=full_search):
             bm = g1["bm"]
             kn1 = self._g1_kname(**g1)
             # a4w4 pairs flydsl_mxmoe_g1_* with flydsl_moe2_layout_* only. The
@@ -6459,8 +6520,11 @@ class Mxfp4FlydslTuner(FmoeTuner):
             except ValueError:
                 timeout = 0  # not on the main thread; cannot arm SIGALRM
 
+        candidates = self._candidate_rows(
+            row, full_search=getattr(args, "mxfp4_search_mode", "prune") == "full"
+        )
         best, failures = None, []
-        for candidate in self._candidate_rows(row):
+        for candidate in candidates:
             if timeout > 0:
                 signal.alarm(timeout)
             try:
@@ -6481,7 +6545,7 @@ class Mxfp4FlydslTuner(FmoeTuner):
                 if timeout > 0:
                     signal.alarm(0)
         if best is None:
-            best = self._candidate_rows(row)[0]
+            best = candidates[0]
             best["us"] = self.INVALID_TIME
             best["kernelName1"] = ("FAILED: " + "; ".join(failures))[:240]
             print(
@@ -6579,9 +6643,8 @@ def _mxfp4_failed_row(keys, row, reason):
     """A tuned-CSV row standing in for a shape that produced no timing."""
     tuner = Mxfp4FlydslTuner.__new__(Mxfp4FlydslTuner)
     tuner.keys = keys
-    cand = tuner._candidate_rows(row)[0]
+    cand = tuner._candidate_row(row, 0, reason[:240], "")
     cand["us"] = Mxfp4FlydslTuner.INVALID_TIME
-    cand["kernelName1"] = reason[:240]
     return cand
 
 
