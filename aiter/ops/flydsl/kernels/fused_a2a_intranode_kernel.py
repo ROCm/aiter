@@ -24,7 +24,7 @@ from .communication_ops_utils import (
 )
 from .quant_utils import emit_f32_to_e2m1, emit_f32_to_e2m3, emit_mx_e8m0_scale
 
-_JIT_SCHEMA_VERSION = "v20-v4-mxfp4-qk"
+_JIT_SCHEMA_VERSION = "v21-v4-mxfp4-v"
 _TRANSPORT_CHUNK_BYTES = 16
 _PUSH_PIPELINE_DEPTH = 16
 _OUT_CHANNEL_DEPTH = 1
@@ -90,6 +90,19 @@ def _pack_transport_pair(first, second, codec):
         T.i32, first.ir_value(), second.ir_value(), fx.Int32(0).ir_value(), 0
     )
     return fx.Int32(word).to(fx.Int16)
+
+
+def _pack_v4_v_pair(first, second):
+    # The V4 Triton packer nudges nonzero magnitudes down one FP32 ULP before
+    # conversion, so exact FP4 midpoints round toward zero rather than to even.
+    codes = []
+    for value in (first, second):
+        magnitude = fmath.absf(value)
+        code = fx.Int32(0)
+        for midpoint in (0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0):
+            code = code + (magnitude > midpoint).to(fx.Int32)
+        codes.append(code | ((value.bitcast(fx.Int32) >> 28) & 8))
+    return codes[0] | (codes[1] << 4)
 
 
 def _pack_transport_words(pairs, codec):
@@ -251,6 +264,11 @@ def make_fused_a2a_kernel(
                     "p2p_bases_q": fx.Array[fx.Int64, npes, 16],
                     "p2p_bases_k": fx.Array[fx.Int64, npes, 16],
                     "p2p_bases_v": fx.Array[fx.Int64, npes, 16],
+                    **(
+                        {"v_amax": fx.Array[fx.Float32, 512, 16]}
+                        if formats[0] == "v"
+                        else {}
+                    ),
                 }
             },
         )
@@ -661,7 +679,145 @@ def make_fused_a2a_kernel(
                                     scale_destinations[batch_idx],
                                 )
 
-        if const_expr(fuse_norm_rope):
+        @flyc.jit
+        def transport_v4_v():
+            # A rank boundary may cut a tile, but never a token-32 scale block.
+            first_tile = rank * seq_len // 128
+            rank_tiles = ((rank + 1) * seq_len + 127) // 128 - first_tile
+            scratch = shared.v_amax.view(fx.make_layout(512, 1))
+            scale_table = create_buffer_resource_from_addr(addr_p2p_scale_q)
+            channel_chunk = tid % 16
+            token_lane = tid // 16
+            for work in range(bid, fx.Int32(heads * rank_tiles), fx.Int32(block_num)):
+                head = work // rank_tiles
+                tile_id = first_tile + work % rank_tiles
+                dest_pe = head // heads_local
+                local_head = head % heads_local
+                peer_base = fx.Uint64(fx.memref_load(p2p_bases_q, dest_pe))
+                peer_lo = readfirstlane(T.i32, fx.Uint32(peer_base))
+                peer_hi = readfirstlane(T.i32, fx.Uint32(peer_base >> 32))
+                rsrc_dst = create_buffer_resource_from_addr(
+                    (fx.Uint64(peer_hi) << 32) | fx.Uint64(peer_lo),
+                    num_records_bytes=heads_local * k_tiles * 8192 + 64,
+                )
+                scale_base = fx.Uint64(
+                    buffer_load(scale_table, dest_pe, vec_width=1, dtype=T.i64)
+                )
+                scale_lo = readfirstlane(T.i32, fx.Uint32(scale_base))
+                scale_hi = readfirstlane(T.i32, fx.Uint32(scale_base >> 32))
+                rsrc_scale = create_buffer_resource_from_addr(
+                    (fx.Uint64(scale_hi) << 32) | fx.Uint64(scale_lo),
+                    num_records_bytes=heads_local * k_tiles * 512,
+                )
+                for quarter in range_constexpr(4):
+                    global_start = tile_id * 128 + quarter * 32
+                    owned = (global_start >= rank * seq_len) & (
+                        global_start
+                        < ((rank + 1) * seq_len if rank != npes - 1 else k_tiles * 128)
+                    )
+                    if owned:
+                        valid = global_start < seq_full
+                        values = []
+                        for half in range_constexpr(2):
+                            seq = valid.select(
+                                global_start - rank * seq_len + token_lane + half * 16,
+                                0,
+                            )
+                            raw = fx.Vector(
+                                buffer_load(
+                                    rsrc_input_q,
+                                    (seq * heads + head) * 128 + channel_chunk * 8,
+                                    vec_width=8,
+                                    dtype=T.bf16,
+                                )
+                            ).to(fx.Float32)
+                            values.append(
+                                fx.Vector.from_elements(
+                                    [
+                                        valid.select(raw[i], fx.Float32(0.0))
+                                        for i in range(8)
+                                    ],
+                                    fx.Float32,
+                                )
+                            )
+                        for i in range_constexpr(8):
+                            amax = fmath.absf(values[0][i]).maximumf(
+                                fmath.absf(values[1][i])
+                            )
+                            for shift in (16, 32):
+                                amax = amax.maximumf(amax.shuffle_xor(shift, 64))
+                            if lane < 16:
+                                fx.memref_store(
+                                    amax, scratch, warp * 128 + channel_chunk * 8 + i
+                                )
+                        fx.barrier()
+                        reciprocals = []
+                        for i in range_constexpr(8):
+                            amax = fx.Float32(0.0)
+                            for source_wave in range_constexpr(4):
+                                amax = amax.maximumf(
+                                    fx.memref_load(
+                                        scratch,
+                                        source_wave * 128 + channel_chunk * 8 + i,
+                                    )
+                                )
+                            bits = amax.maximumf(fx.Float32(1.0e-12)).bitcast(fx.Int32)
+                            scale = (
+                                ((bits >> 23) & 255)
+                                - 2
+                                + ((bits & 0x7FFFFF) > 0x400000).to(fx.Int32)
+                            )
+                            reciprocals.append(
+                                ((fx.Int32(254) - scale) << 23).bitcast(fx.Float32)
+                            )
+                            if token_lane == 0:
+                                channel = channel_chunk * 8 + i
+                                scale_offset = (
+                                    local_head * k_tiles + tile_id
+                                ) * 512 + quarter * 128
+                                scale_offset = (
+                                    scale_offset
+                                    + (channel % 32 // 2) * 8
+                                    + channel // 32
+                                    + (channel % 2) * 4
+                                )
+                                buffer_store(
+                                    scale.to(fx.Int8), rsrc_scale, scale_offset
+                                )
+                        for half in range_constexpr(2):
+                            pairs = [
+                                _pack_v4_v_pair(
+                                    values[half][2 * pair] * reciprocals[2 * pair],
+                                    values[half][2 * pair + 1]
+                                    * reciprocals[2 * pair + 1],
+                                )
+                                for pair in range(4)
+                            ]
+                            token = token_lane + half * 16
+                            column = (
+                                (quarter % 2) * 32
+                                + 4 * (token // 8)
+                                + 16 * ((token // 4) % 2)
+                                + token % 4
+                            )
+                            word_offset = (local_head * k_tiles + tile_id) * 2048
+                            word_offset = (
+                                word_offset
+                                + (2 * (channel_chunk // 4) + quarter // 2) * 256
+                                + column * 4
+                                + channel_chunk % 4
+                            )
+                            buffer_store(
+                                _pack_transport_words(pairs, "mxfp4"),
+                                rsrc_dst,
+                                word_offset,
+                            )
+                        # All waves finish reading the reduction before its next use.
+                        fx.barrier()
+
+        if const_expr(formats[0] == "v"):
+            transport_v4_v()
+        elif const_expr(fuse_norm_rope):
             process_qk(
                 rsrc_input_q,
                 rsrc_norm_q,

@@ -61,6 +61,8 @@ class FusedA2AIntraNodeOp:
     Scales follow the receive layout with one E8M0 byte per 32 adjacent values.
     FUSED_A2A_V4_OUTPUT=1 selects MHA V4 MXFP4 Q/K bytes (not V); per-role
     FUSED_A2A_V4_OUTPUT_Q/K/V overrides are available. Requires raw return.
+    V4 V requires split=True and S divisible by 32; it uses token-axis scales
+    in gather order and padded, permuted 128-token payload tiles with 64B slack.
     Q is BSHD; K uses padded 128-token, four-plane tiles; both scales are BSH4.
     V4 Q/K always rotate, and Q folds the explicit softmax_scale * log2(e).
     All ranks must use the same mode and serialize calls on one stream.
@@ -116,11 +118,14 @@ class FusedA2AIntraNodeOp:
         if any(self.v4_output):
             if not self.quant or self.return_mode != "fp8":
                 raise ValueError("V4 output requires quant=True and return_mode='fp8'")
-            if self.v4_output[2] or any(
+            if any(
                 mode and codec != "mxfp4"
                 for mode, codec in zip(self.v4_output, self.codecs)
             ):
-                raise ValueError("V4 output currently supports only MXFP4 Q/K")
+                raise ValueError("V4 output supports only MXFP4")
+        self.split = split or os.environ.get("FUSED_A2A_SPLIT", "0") == "1"
+        if self.v4_output[2] and not self.split:
+            raise ValueError("V4 V output requires split=True")
         if self.v4_output[0] and (
             softmax_scale is None
             or not math.isfinite(softmax_scale)
@@ -138,6 +143,8 @@ class FusedA2AIntraNodeOp:
             raise ValueError(f"rank must be in [0, {world_size}), got {rank}")
         if len(shape) != 4 or shape[0] != 1 or shape[-1] != 128:
             raise ValueError(f"expected input shape [1, S, H, 128], got {tuple(shape)}")
+        if self.v4_output[2] and shape[1] % 32 != 0:
+            raise ValueError("V4 V output requires seq_local divisible by 32")
         if shape[2] % world_size != 0:
             raise ValueError(
                 f"head count {shape[2]} must be divisible by world_size {world_size}"
@@ -172,7 +179,8 @@ class FusedA2AIntraNodeOp:
         payload_sizes = tuple(
             (
                 (shape[2] // world_size) * ((shape[1] * world_size + 127) // 128) * 8192
-                if mode == "k"
+                + (64 if mode == "v" else 0)
+                if mode in ("k", "v")
                 else (_transport_bytes(numel, codec) if self.quant else numel)
             )
             for mode, codec in zip(self.v4_output, self.codecs)
@@ -187,7 +195,19 @@ class FusedA2AIntraNodeOp:
         # Q/K/V scales use the payload's receive ordering.
         self.scales_sets = tuple(
             tuple(
-                mori_shmem_create_tensor((numel // 32,), torch.uint8) for _ in range(3)
+                mori_shmem_create_tensor(
+                    (
+                        (
+                            (shape[2] // world_size)
+                            * ((shape[1] * world_size + 127) // 128)
+                            * 512
+                            if mode == "v"
+                            else numel // 32
+                        ),
+                    ),
+                    torch.uint8,
+                )
+                for mode in self.v4_output
             )
             for _ in range(2)
         )
@@ -236,7 +256,6 @@ class FusedA2AIntraNodeOp:
         ms.shmem_barrier_all()
         self._epoch = 0
 
-        self.split = split or os.environ.get("FUSED_A2A_SPLIT", "0") == "1"
         self.fuse_norm_rope = fuse_norm_rope
         roles = (
             (fuse_norm_rope, fuse_norm_rope, False) if self.split else (fuse_norm_rope,)
@@ -249,7 +268,9 @@ class FusedA2AIntraNodeOp:
                 seq_len=shape[1],
                 head_dim=shape[3],
                 block_num=block_num,
-                warp_num_per_block=warp_num_per_block,
+                warp_num_per_block=(
+                    4 if self.split and self.v4_output[i] == "v" else warp_num_per_block
+                ),
                 fuse_norm_rope=role,
                 split=self.split,
                 quant=self.quant,

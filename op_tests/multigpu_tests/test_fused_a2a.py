@@ -645,6 +645,123 @@ def _check_v4_output(rank, world_size, device):
         os.environ.pop(name, None)
 
 
+def _check_v4_v_output(rank, world_size, device):
+    from aiter.ops.mha_v4 import quantize_v_mxfp4
+
+    heads, head_dim = 8, 128
+    local_heads = heads // world_size
+    os.environ["FUSED_A2A_V4_OUTPUT"] = "0"
+    os.environ["FUSED_A2A_V4_OUTPUT_V"] = "1"
+    for role in "QKV":
+        os.environ[f"FUSED_A2A_CODEC_{role}"] = "mxfp4"
+    # Rank boundaries inside tiles, tile crossings, and persistent workgroup reuse.
+    for seq_len, fused, block_num in (
+        (32, False, 128),
+        (96, True, 128),
+        (160, False, 2),
+    ):
+        seq_full = seq_len * world_size
+        tiles = (seq_full + 127) // 128
+        inputs = [
+            _sequence_major_input(rank + 23 * role, heads, seq_len, head_dim, device)
+            for role in range(3)
+        ]
+        tokens = torch.arange(seq_len, device=device).view(1, -1, 1, 1)
+        channels = torch.arange(head_dim, device=device).view(1, 1, 1, -1)
+        head_ids = torch.arange(heads, device=device).view(1, 1, -1, 1)
+        values = (
+            (tokens * 13 + channels * 7 + head_ids * 11 + rank * 17) % 61 - 30
+        ).float()
+        values *= torch.exp2(((tokens // 32 + channels + rank) % 7 - 3).float())
+        values[..., :8] = 0
+        inputs[2] = values.to(torch.bfloat16).contiguous()
+        gathered = [torch.empty_like(inputs[2]) for _ in range(world_size)]
+        dist.all_gather(gathered, inputs[2])
+        full = torch.cat(gathered, dim=1)[
+            :, :, rank * local_heads : (rank + 1) * local_heads
+        ].contiguous()
+        expected, expected_scales = quantize_v_mxfp4(full)
+        logical_amax = (
+            full.float().reshape(1, seq_full // 32, 32, local_heads, 128).abs().amax(2)
+        )
+        h = torch.arange(local_heads, device=device).view(-1, 1, 1)
+        g = torch.arange(seq_full // 32, device=device).view(1, -1, 1)
+        d = torch.arange(128, device=device).view(1, 1, -1)
+        scale_offsets = (
+            (h * tiles + g // 4) * 512
+            + (g % 4) * 128
+            + (d % 32 // 2) * 8
+            + d // 32
+            + (d % 2) * 4
+        )
+        reference_amax = logical_amax[0].transpose(0, 1)
+        s = torch.arange(seq_full, device=device).view(1, -1, 1)
+        pair = torch.arange(64, device=device).view(1, 1, -1)
+        j = s % 32
+        column = (s % 64 // 32) * 32 + 4 * (j // 8) + 16 * ((j // 4) % 2) + j % 4
+        payload_offsets = (
+            (h * tiles + s // 128) * 8192
+            + (2 * (pair // 16) + s % 128 // 64) * 1024
+            + column * 16
+            + pair % 16
+        )
+        valid_bytes = torch.zeros_like(expected, dtype=torch.bool)
+        valid_bytes[payload_offsets.flatten()] = True
+        norm = torch.ones(heads * head_dim, device=device, dtype=torch.bfloat16)
+        cos = torch.ones((1, seq_len, 1, head_dim), device=device)
+        sin = torch.zeros_like(cos)
+        op = FusedA2AIntraNodeOp(
+            rank=rank,
+            world_size=world_size,
+            shape=inputs[0].shape,
+            split=True,
+            quant=True,
+            return_mode="fp8",
+            fuse_norm_rope=fused,
+            block_num=block_num,
+        )
+        counts = [0, 0]
+        for epoch in range(3):
+            payloads, scales = op(*inputs, norm, norm, cos, sin)
+            torch.cuda.synchronize()
+            label = f"V4 V S={seq_len} fused={fused} rank={rank} epoch={epoch}"
+            assert payloads[2].shape == expected.shape, label
+            assert scales[2].numel() == expected_scales.numel(), label
+            actual_scale = scales[2][scale_offsets]
+            reference_scale = expected_scales.flatten()[scale_offsets]
+            ties, total = _assert_fused_fp6_scales(
+                actual_scale, reference_scale, reference_amax, label, max_value=6.0
+            )
+            counts[0] += ties
+            counts[1] += total
+            same = (actual_scale == reference_scale).repeat_interleave(32, dim=1)
+            same_pair = same[..., 0::2] & same[..., 1::2]
+            _assert_equal(
+                payloads[2][payload_offsets][same_pair],
+                expected[payload_offsets][same_pair],
+                label,
+            )
+            _assert_equal(
+                payloads[2][~valid_bytes],
+                torch.zeros_like(payloads[2][~valid_bytes]),
+                f"{label} padding/slack",
+            )
+            dist.barrier()
+        totals = torch.tensor(counts, device=device, dtype=torch.int64)
+        dist.all_reduce(totals)
+        if rank == 0:
+            print(
+                f"PASS V4 MXFP4 V S={seq_len} fused={fused} blocks={block_num} epochs=3 scale-ties={totals[0].item()}/{totals[1].item()}",
+                flush=True,
+            )
+    for name in (
+        "FUSED_A2A_V4_OUTPUT",
+        "FUSED_A2A_V4_OUTPUT_V",
+        *(f"FUSED_A2A_CODEC_{r}" for r in "QKV"),
+    ):
+        os.environ.pop(name, None)
+
+
 def _run_rank(rank, world_size, port, v4_only=False):
     torch.cuda.set_device(rank)
     device = torch.device("cuda", rank)
@@ -662,6 +779,7 @@ def _run_rank(rank, world_size, port, v4_only=False):
         torch._C._distributed_c10d._register_process_group("mori", cpu_group)
         ms.shmem_torch_process_group_init("mori")
         _check_v4_output(rank, world_size, device)
+        _check_v4_v_output(rank, world_size, device)
         if v4_only:
             return
 
@@ -1174,7 +1292,7 @@ def main():
     _check_hadamard_precision()
     _check_fp6_converters()
     mp.spawn(_run_rank, args=(_WORLD_SIZE, _free_port()), nprocs=_WORLD_SIZE, join=True)
-    passed = 13 + sum(
+    passed = 16 + sum(
         12 + 3 * (name == "small") + int(_WORLD_SIZE >= 2) + 2 * len(_CODEC_ROWS)
         for name, *_ in _CASES
     )
