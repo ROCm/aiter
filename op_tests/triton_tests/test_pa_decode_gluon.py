@@ -3,6 +3,7 @@
 
 import argparse
 import hashlib
+import os
 import random
 import sys
 
@@ -37,7 +38,6 @@ TEST_NAME = "main.normal_accuracy_performance.jit"
 # Global variables that will be set by command line arguments
 USE_TORCH_FLASH_REF = True
 
-torch.set_default_device("cuda")
 torch.set_printoptions(sci_mode=False)
 
 # Global configuration
@@ -129,7 +129,9 @@ def compare_arrays(
     if np.any(nan_mask2):
         result["nan_info"]["arr2_nan_count"] = np.sum(nan_mask2)
         result["nan_info"]["arr2_nan_positions"] = np.argwhere(nan_mask2)
-        logger.info(f"Warning: arr2 contains {result['nan_info']['arr2_nan_count']} NaN values")
+        logger.info(
+            f"Warning: arr2 contains {result['nan_info']['arr2_nan_count']} NaN values"
+        )
 
     # Compute absolute differences
     diff = np.abs(arr1 - arr2)
@@ -1866,7 +1868,9 @@ def run_multi_pa_gluon_test(
         test_configs_to_run = [
             config for config in test_configs if random.random() < sample_rate
         ]
-        logger.info(f"Using random sampling: running {len(test_configs_to_run)} out of {total} test cases (sample_rate={sample_rate:.2%})")
+        logger.info(
+            f"Using random sampling: running {len(test_configs_to_run)} out of {total} test cases (sample_rate={sample_rate:.2%})"
+        )
     else:
         test_configs_to_run = test_configs
         logger.info(f"Running all {total} test cases (sample_rate=100%)")
@@ -1914,6 +1918,7 @@ def parse_arg_and_run_test(sample_rate0: float | None = None):
     else:
         sample_rate = sample_rate0
 
+    prev_default_device = torch.get_default_device()
     results_df = run_multi_pa_gluon_test(
         block_sizes,
         head_configs,
@@ -1933,10 +1938,12 @@ def parse_arg_and_run_test(sample_rate0: float | None = None):
         ps_options,
     )
 
+    torch.set_default_device(prev_default_device)  # per-case runs change it; restore
     output_file = f"run_pa_gluon_test.{TEST_NAME}.block_size_{block_sizes[0]}.triton.{TRITON_VERSION}.csv"
-    results_df.to_csv(output_file, index=False)
-
-    logger.info(f"\nResults saved to {output_file}")
+    # Unit tests only check pass/fail; only the CLI (__main__) run keeps the CSV report.
+    if "PYTEST_CURRENT_TEST" not in os.environ:
+        results_df.to_csv(output_file, index=False)
+        logger.info(f"\nResults saved to {output_file}")
     logger.info(f"\nSummary:\n{results_df}")
 
     # Print mean of selected columns grouped by compute_type
@@ -2020,7 +2027,9 @@ def parse_arg_and_run_test(sample_rate0: float | None = None):
     # Check if all tests passed
     total_errors = results_df["err_gluon"].sum()
     if total_errors > 0:
-        logger.info(f"\nTests failed! {total_errors} test case(s) exceeded the error threshold. ")
+        logger.info(
+            f"\nTests failed! {total_errors} test case(s) exceeded the error threshold. "
+        )
         logger.info(f"Please check rows with non-zero err_gluon in {output_file}.")
         assert False, f"{total_errors} test case(s) exceeded the error threshold"
     else:
