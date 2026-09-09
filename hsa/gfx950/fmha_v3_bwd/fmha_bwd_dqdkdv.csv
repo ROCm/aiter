@@ -91,3 +91,4 @@ bf16,64,64,2,1,1,0,0,2,32,192,_ZN5aiter51fmha_bwd_hd64_bf16_causal_br_a32_rtz_ps
 bf16,64,64,0,0,0,0,0,0,32,192,_ZN5aiter37fmha_bwd_hd64_bf16_a16_rtne_recompileE,bwd_hd64_bf16_a16_rtne.co
 bf16,64,64,0,0,0,0,0,1,32,192,_ZN5aiter37fmha_bwd_hd64_bf16_a16_rtna_recompileE,bwd_hd64_bf16_a16_rtna.co
 bf16,64,64,0,0,0,0,0,2,32,192,_ZN5aiter36fmha_bwd_hd64_bf16_a16_rtz_recompileE,bwd_hd64_bf16_a16_rtz.co
+bf16,256,256,0,0,0,0,1,3,16,64,_ZN5aiter61fmha_bwd_fused_dkdv_dq_hd256_bf16_noncausal_varlen_aiter_gfx950E,bwd_hd256_bf16_a16_psskddv_group.co
