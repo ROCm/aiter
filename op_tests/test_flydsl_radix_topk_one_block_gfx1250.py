@@ -10,7 +10,7 @@ import pytest
 import torch
 
 from aiter.jit.utils.chip_info import get_gfx
-from aiter.ops.topk import flydsl_radix_topk_one_block_gfx1250
+from aiter.ops.topk import flydsl_radix_topk_one_block_gfx1250_prefill
 
 
 @pytest.mark.skipif(
@@ -90,7 +90,7 @@ def test_radix_compaction_and_index_sort(width, k, stable, distribution, write_v
     previous = None
     for _ in range(3):
         indices.fill_(-123456789)
-        flydsl_radix_topk_one_block_gfx1250(
+        flydsl_radix_topk_one_block_gfx1250_prefill(
             logits,
             starts,
             ends,
@@ -152,7 +152,7 @@ def test_direct_output_dispatch_boundary(rows, write_values):
     ends = starts + lengths
     indices = torch.full((rows, k), -123456789, device="cuda", dtype=torch.int32)
     values = torch.empty((rows, k), device="cuda") if write_values else None
-    flydsl_radix_topk_one_block_gfx1250(
+    flydsl_radix_topk_one_block_gfx1250_prefill(
         logits,
         starts,
         ends,

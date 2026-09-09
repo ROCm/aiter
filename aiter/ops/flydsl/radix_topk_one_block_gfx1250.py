@@ -210,7 +210,7 @@ def is_radix_topk_one_block_gfx1250_supported(
 
 def radix_topk_one_block_gfx1250(
     logits: torch.Tensor,
-    row_starts: torch.Tensor,
+    row_starts: torch.Tensor | None,
     row_ends: torch.Tensor,
     indices: torch.Tensor,
     values: torch.Tensor | None,
@@ -219,25 +219,49 @@ def radix_topk_one_block_gfx1250(
     stride1: int,
     k: int = 2048,
     stable: bool = False,
+    *,
+    is_decode: bool = False,
+    next_n: int = 1,
 ) -> None:
-    """Write per-row TopK indices and optional values."""
-    _validate_call(
-        logits,
-        row_starts,
-        row_ends,
-        indices,
-        num_rows,
-        stride0,
-        stride1,
-        k,
-        values,
-    )
+    """Write prefill or decode TopK indices through one shared wrapper."""
+    if is_decode:
+        from .topk_per_row import _validate_flydsl_topk_call
+
+        _validate_flydsl_topk_call(
+            logits,
+            next_n,
+            row_ends,
+            indices,
+            num_rows,
+            stride0,
+            stride1,
+            k,
+            values,
+        )
+        kernel_row_starts = row_ends
+    else:
+        if row_starts is None:
+            raise ValueError("row_starts is required for prefill")
+        _validate_call(
+            logits,
+            row_starts,
+            row_ends,
+            indices,
+            num_rows,
+            stride0,
+            stride1,
+            k,
+            values,
+        )
+        kernel_row_starts = row_starts
+
     if get_gfx() not in _SUPPORTED_ARCHES:
-        raise ValueError("FlyDSL prefill TopK currently supports gfx1250 only")
+        raise ValueError("FlyDSL one-block radix TopK currently supports gfx1250 only")
     if num_rows == 0:
         return
 
-    short_rows = logits.shape[1] <= _COMPACT_CAPACITY
+    width = logits.shape[1]
+    short_rows = width <= _COMPACT_CAPACITY
     block_threads = (
         1024
         if not short_rows or num_rows <= _SHORT_ROWS_1024_THREAD_MAX_ROWS
@@ -250,14 +274,17 @@ def radix_topk_one_block_gfx1250(
         write_values=values is not None,
         stable=stable,
         short_rows=short_rows,
+        is_decode=is_decode,
     )
     _run_compiled(
         launcher,
         logits,
-        row_starts,
+        kernel_row_starts,
         row_ends,
         indices,
         values if values is not None else logits,
+        width,
+        next_n,
         num_rows,
         stream,
     )
