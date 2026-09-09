@@ -138,9 +138,9 @@ def _collect_aot_jobs_for(kind: OpKind) -> list[dict[str, Any]]:
     ``flydsl.expr``). Job collection is therefore not free in the
     parent process, just shifted once out of every child."""
     if kind is OpKind.MEGA_MOE:
-        from .mega_moe import default_jobs
+        from .mega_moe import default_aot_jobs
 
-        return default_jobs()
+        return default_aot_jobs()
     if kind is OpKind.MOE:
         from .moe import DEFAULT_CSVS, parse_csv
     elif kind is OpKind.MXFP4_MOE:

@@ -11,7 +11,7 @@ the JIT path hits the cache instead of compiling again.
 | `gemm.py` | `GEMM` | GEMM kernels |
 | `grouped_moe.py` | `GROUPED_MOE` | gfx1250 grouped MoE GEMM kernels |
 | `chunk_gdn_h.py` | `CHUNK_GDN_H` | chunk-gdn-h opt (K5) kernels |
-| `mega_moe.py` | `MEGA_MOE` | MegaMoE A8W4 profile bundles for MTPR 8192/16384/32768 |
+| `mega_moe.py` | `MEGA_MOE` | MegaMoE A8W4 profile bundles for DeepSeek-V4-Pro and GLM-5.2 |
 | `common.py` | — | Shared job collection, the deadlock-free fork pool, and cache-hit checking logic |
 
 ---
@@ -54,11 +54,17 @@ python -m aiter.aot.flydsl.mega_moe
 
 # Restrict the deployment profiles when building a smaller custom image.
 python -m aiter.aot.flydsl.mega_moe --experts-per-rank 48
+
+# Compile only the GLM-5.2 EP8 decode profile.
+python -m aiter.aot.flydsl.mega_moe --mtpr 256 --experts-per-rank 32 \
+  --topk 8 --model-dim 6144 --inter-dim 2048 --swiglu-limit 0
 ```
 
-MegaMoE defaults to all three DeepSeek-V4-Pro deployment profiles: r0/r32/r64
-(`experts_per_rank=48/52/56`). The expert count is part of the compiled ABI, so
-one profile cannot safely reuse another profile's bundle.
+The default image includes all three DeepSeek-V4-Pro deployment profiles
+(MTPR 8192/16384/32768 and `experts_per_rank=48/52/56`) plus the GLM-5.2 EP8
+decode profile (MTPR 256, `experts_per_rank=32`, top-k 8). The expert count and
+model shape are part of the compiled ABI, so one profile cannot safely reuse
+another profile's bundle.
 
 ### Common arguments
 

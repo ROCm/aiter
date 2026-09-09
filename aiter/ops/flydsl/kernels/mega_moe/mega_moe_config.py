@@ -32,6 +32,10 @@ MAX_MTPR_CLASS = 32768
 INDEXED_PAYLOAD_MIN_MTPR = MAX_MTPR_CLASS
 INDEXED_PAYLOAD_MIN_SBM = 128
 REFERENCE_EXPERTS_PER_RANK = 48
+GLM52_MODEL_DIM = 6144
+GLM52_INTER_DIM = 2048
+GLM52_EXPERTS_PER_RANK = 32
+GLM52_DECODE_MTPR = 256
 # Compact route metadata dedicates ten bits to the global expert/group segment.
 # Under the EP8 protocol this admits 8 * 127 expert segments plus 8 group
 # segments.  The next expert would require segment 1024 and cannot be encoded.
@@ -349,6 +353,40 @@ def _select_large_stage2(
     )
 
 
+def _select_glm52_ep8_decode(bucket: int) -> MegaMoEConfig:
+    """MI355X GLM-5.2 EP8 decode policy for a fixed MTPR of 256."""
+    stage1 = _select_bounded_stage1(bucket, GLM52_INTER_DIM)
+    dispatch_cu = {
+        1: 224,
+        4: 128,
+        8: 192,
+        16: 128,
+        32: 128,
+        64: 160,
+        128: 96,
+        256: 64,
+    }[bucket]
+    stage1 = replace(stage1, num_dispatch_cu=dispatch_cu)
+    if bucket == 4:
+        stage1 = replace(
+            stage1,
+            tile_n=512,
+            num_waves=8,
+            mfma_amajor=True,
+            async_a_copy=True,
+        )
+    stage2 = _select_bounded_stage2(
+        bucket,
+        fixed_slot=False,
+        mtpr=GLM52_DECODE_MTPR,
+        sort_block_m=stage1.sort_block_m,
+        model_dim=GLM52_MODEL_DIM,
+    )
+    if bucket <= 128:
+        stage2 = replace(stage2, block_n=128, persist=True, persist_cu=192)
+    return MegaMoEConfig(stage1=stage1, stage2=stage2, p2p_quant="none")
+
+
 @cache
 def _select_bucket_config(
     bucket: int,
@@ -413,6 +451,15 @@ def select_mega_moe_config(
             f"MegaMoE v2 fanout needs {total_segments} segments, exceeding "
             f"the {MAX_FANOUT_SEGMENTS}-segment route metadata limit"
         )
+    if (
+        world_size == 8
+        and mtpr_class == GLM52_DECODE_MTPR
+        and experts_per_rank == GLM52_EXPERTS_PER_RANK
+        and model_dim == GLM52_MODEL_DIM
+        and inter_dim == GLM52_INTER_DIM
+        and bucket <= GLM52_DECODE_MTPR
+    ):
+        return _select_glm52_ep8_decode(bucket)
     return _select_bucket_config(
         bucket,
         mtpr_class,

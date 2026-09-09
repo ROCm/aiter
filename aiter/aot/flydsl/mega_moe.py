@@ -17,6 +17,10 @@ import torch
 
 from aiter.aot.flydsl.common import compile_only_env, override_env, run_jobs_parallel
 from aiter.ops.flydsl.kernels.mega_moe.mega_moe_config import (
+    GLM52_DECODE_MTPR,
+    GLM52_EXPERTS_PER_RANK,
+    GLM52_INTER_DIM,
+    GLM52_MODEL_DIM,
     build_mega_moe_bundle_plan,
 )
 
@@ -31,6 +35,8 @@ MODEL_DIM = 7168
 INTER_DIM = 3072
 NUM_CU = 256
 SWIGLU_LIMIT = 10.0
+GLM52_TOPK = 8
+GLM52_SWIGLU_LIMIT = 0.0
 _DEFAULT_COMBINE_BLOCK_NUM = 128
 _DEFAULT_COMBINE_WARP_NUM = 8
 
@@ -96,8 +102,49 @@ def default_jobs(
     ]
 
 
+def default_aot_jobs():
+    """Return every deployment profile shipped in the default AOT cache."""
+    return default_jobs() + default_jobs(
+        (GLM52_DECODE_MTPR,),
+        (GLM52_EXPERTS_PER_RANK,),
+        topk=GLM52_TOPK,
+        model_dim=GLM52_MODEL_DIM,
+        inter_dim=GLM52_INTER_DIM,
+        swiglu_limit=GLM52_SWIGLU_LIMIT,
+    )
+
+
 def _tensor(shape, dtype):
     return torch.empty(shape, dtype=dtype, device="cpu")
+
+
+def _combine_aot_identities(plan, tuning, mtpr):
+    identities = set()
+    for entry in plan.entries:
+        geometry = tuning.lookup("combine", entry.token_bucket)
+        block_num, warp_num = geometry or (
+            _DEFAULT_COMBINE_BLOCK_NUM,
+            _DEFAULT_COMBINE_WARP_NUM,
+        )
+        blockwise_fp8 = entry.config.p2p_quant == "fp8_blockwise_1x32"
+        identities.add((block_num, warp_num, blockwise_fp8))
+
+    # Runtime geometry is selected from the exact token count, not from the
+    # nearest MegaMoE bundle bucket. Include non-power-of-two tuning rows as
+    # well, otherwise an AOT image can compile successfully yet miss kernels
+    # used by GLM decode counts such as 6, 12, 24, 48, and 96.
+    p2p_modes = {entry.config.p2p_quant for entry in plan.entries}
+    for token_count, (block_num, warp_num) in tuning.combine.items():
+        if token_count <= mtpr:
+            for p2p_quant in p2p_modes:
+                identities.add(
+                    (
+                        block_num,
+                        warp_num,
+                        p2p_quant == "fp8_blockwise_1x32",
+                    )
+                )
+    return sorted(identities)
 
 
 def _compile_stage1(
@@ -361,18 +408,9 @@ def _compile_stage2(
             local_expert_num=experts_per_rank,
             combine_dtype="bf16",
         )
-    seen_combine = set()
-    for entry in plan.entries:
-        geometry = tuning.lookup("combine", entry.token_bucket)
-        block_num, warp_num = geometry or (
-            _DEFAULT_COMBINE_BLOCK_NUM,
-            _DEFAULT_COMBINE_WARP_NUM,
-        )
-        blockwise_fp8 = entry.config.p2p_quant == "fp8_blockwise_1x32"
-        identity = (block_num, warp_num, blockwise_fp8)
-        if identity in seen_combine:
-            continue
-        seen_combine.add(identity)
+    for block_num, warp_num, blockwise_fp8 in _combine_aot_identities(
+        plan, tuning, mtpr
+    ):
         launch = make_combine_jit(
             rank=rank,
             npes=world_size,
@@ -394,7 +432,7 @@ def _compile_stage2(
         )
         launch(
             *([fx.Int64(0)] * 18),
-            fx.Int32(entry.token_bucket),
+            fx.Int32(1),
             fx.Stream(None),
         )
 
