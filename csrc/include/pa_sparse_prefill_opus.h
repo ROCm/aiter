@@ -11,6 +11,7 @@
 
 #pragma once
 #include "aiter_tensor.h"
+#include <opus/dtypes.hpp>
 
 // Public API: prefill attention over two CSR ranges (prefix + extend).
 //
@@ -104,8 +105,8 @@ void pa_sparse_prefill_fp8_gfx1250_opus_fwd(aiter_tensor_t& q_nope,
 // Implementation section - only compiled in the .cu translation unit
 // ============================================================================
 
-using bf16_t = __bf16;
-using fp16_t = __fp16;
+using bf16_t = opus::dtypes::bf16;
+using fp16_t = opus::dtypes::fp16;
 // 8-bit float storage types, aliased to match opus's dtype registration.
 using fp8_t  = _BitInt(8);
 using bf8_t  = unsigned _BitInt(8);
