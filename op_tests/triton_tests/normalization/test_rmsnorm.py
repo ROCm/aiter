@@ -121,12 +121,13 @@ def get_vals():
         (16380, 1536),
         # (29, 17389), // Temporarily disable this test due to abort issues on CI
         # Large-M / small-N shapes that dispatch to _rmsnorm_kernel_large_m_small_n
-        # and _rmsnorm_bwd_kernel_large_m_small_n (M > 8192, N <= 2048).
+        # and _rmsnorm_bwd_kernel_large_m_small_n (M > 8192, N <= 1024).
         # Representative of Qwen3 per-head q/k norm (b*s*heads, head_dim).
         (16384, 128),
         (32768, 64),
         (16384, 512),
         (16384, 1024),
+        (16385, 513),  # non-power-of-two N and M not divisible by BLOCK_M
     ]
 
     return vals

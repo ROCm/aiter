@@ -20,8 +20,6 @@ from aiter.ops.triton.utils.logger import AiterTritonLogger
 from aiter.ops.triton.utils.normalization_config_utils import get_normalization_config
 from aiter.ops.triton.utils.types import get_dtype_max
 
-_RMSNORM_LARGE_M_DEFAULTS = {"num_warps": 8, "num_stages": 2}
-
 _LOGGER = AiterTritonLogger()
 
 
@@ -124,10 +122,7 @@ def _rmsnorm_backward(dz, x, gamma, rsigma):
         BLOCK_M = max(min(16384 // BLOCK_N, 32), 8)
         num_prgms = triton.cdiv(M, BLOCK_M)
         dg_tmp = torch.empty(num_prgms, N, device=x_.device, dtype=torch.float32)
-        _cfg = {
-            **_RMSNORM_LARGE_M_DEFAULTS,
-            **get_normalization_config("rmsnorm_large_m_small_n", get_arch()),
-        }
+        _cfg = get_normalization_config("rmsnorm_large_m_small_n", get_arch())
         _rmsnorm_bwd_kernel_large_m_small_n[(num_prgms,)](
             dz_,
             x_,
@@ -641,10 +636,7 @@ def _rmsnorm_forward_large_m_small_n(
     BLOCK_M = min(16384 // BLOCK_N, 32)
     BLOCK_M = max(BLOCK_M, 8)
 
-    _cfg = {
-        **_RMSNORM_LARGE_M_DEFAULTS,
-        **get_normalization_config("rmsnorm_large_m_small_n", get_arch()),
-    }
+    _cfg = get_normalization_config("rmsnorm_large_m_small_n", get_arch())
     grid = (triton.cdiv(M, BLOCK_M),)
     _rmsnorm_kernel_large_m_small_n[grid](
         x,

@@ -16,9 +16,9 @@ from aiter.ops.triton.utils.config_utils import (
 def get_normalization_config(config_name: str, arch: str) -> dict:
     """Per-arch launch config for a normalization kernel family.
 
-    Returns ``{}`` when no tuned file is shipped for this arch; callers
-    fall back to their safe defaults.
+    Raises ``FileNotFoundError`` when no config file is shipped for this arch,
+    naming the missing path. Seed a new arch directory from the nearest
+    measured arch before adding a new target.
     """
     cfg_dir = resolve_config_dir("normalization", config_name)
-    config = load_config_json(f"{cfg_dir}/DEFAULT.json", required=False)
-    return config if config is not None else {}
+    return load_config_json(f"{cfg_dir}/DEFAULT.json", required=True)
