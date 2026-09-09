@@ -27,28 +27,39 @@ _gemm_a16w16_compute_bound_repr = make_kernel_repr(
 )
 
 
+# TDM encodes log2(pad interval in dwords) in a 3-bit field, so the interval
+# cannot exceed 256 dwords (TDMUtility.cpp createTDMDescriptor).
+_MAX_PAD_INTERVAL_DWORDS = 256
+
+
+def _pad_interval(extent, elem_bits):
+    """Largest encodable pad interval, in elements, not exceeding `extent`."""
+    return min(extent, _MAX_PAD_INTERVAL_DWORDS * 32 // elem_bits)
+
+
 def create_shared_layouts(
     BLOCK_M: gl.constexpr,
     BLOCK_N: gl.constexpr,
     BLOCK_K: gl.constexpr,
     LAYOUT: gl.constexpr,
+    elem_bits: int = 16,
 ):
     if LAYOUT[0] == "T":
         SHARED_LAYOUT_A: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
-            [[BLOCK_K, 8]], [BLOCK_M, BLOCK_K], [1, 0]
+            [[_pad_interval(BLOCK_K, elem_bits), 8]], [BLOCK_M, BLOCK_K], [1, 0]
         )
     else:
         SHARED_LAYOUT_A: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
-            [[BLOCK_M, 8]], [BLOCK_K, BLOCK_M], [1, 0]
+            [[_pad_interval(BLOCK_M, elem_bits), 8]], [BLOCK_K, BLOCK_M], [1, 0]
         )
 
     if LAYOUT[1] == "T":
         SHARED_LAYOUT_B: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
-            [[BLOCK_N, 16]], [BLOCK_K, BLOCK_N], [1, 0]
+            [[_pad_interval(BLOCK_N, elem_bits), 16]], [BLOCK_K, BLOCK_N], [1, 0]
         )
     else:
         SHARED_LAYOUT_B: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
-            [[BLOCK_K, 8]], [BLOCK_N, BLOCK_K], [1, 0]
+            [[_pad_interval(BLOCK_K, elem_bits), 8]], [BLOCK_N, BLOCK_K], [1, 0]
         )
 
     return (SHARED_LAYOUT_A, SHARED_LAYOUT_B)
