@@ -3,6 +3,8 @@
 import logging
 import os
 import posixpath
+import threading
+import time
 import warnings
 
 CPU_CORE_COUNT_UTILIZATION = 0.80
@@ -13,8 +15,23 @@ _LEGACY_WORKER_ENV = "MAX_JOBS"
 _PROC_SELF_CGROUP_PATH = "/proc/self/cgroup"
 _PROC_SELF_MOUNTINFO_PATH = "/proc/self/mountinfo"
 _logger = logging.getLogger(__name__)
-_cgroup_memory_diagnostic_emitted = False
-_last_cgroup_memory_observation: dict[str, object] | None = None
+_memory_diagnostic_lock = threading.Lock()
+_memory_diagnostic_last_time: float | None = None
+_memory_diagnostic_last_budget: int | None = None
+_MEMORY_DIAGNOSTIC_INTERVAL = 60.0
+
+
+def _reset_memory_diagnostics_after_fork() -> None:
+    # A child must not inherit a lock held by a vanished parent thread.
+    global _memory_diagnostic_lock
+    global _memory_diagnostic_last_time, _memory_diagnostic_last_budget
+    _memory_diagnostic_lock = threading.Lock()
+    _memory_diagnostic_last_time = None
+    _memory_diagnostic_last_budget = None
+
+
+if hasattr(os, "register_at_fork"):
+    os.register_at_fork(after_in_child=_reset_memory_diagnostics_after_fork)
 
 
 def _process_cpu_count() -> int:
@@ -147,10 +164,8 @@ def _cgroup_memory_directories() -> list[tuple[str, str]]:
     return directories
 
 
-def _cgroup_memory_remaining_bytes() -> int | None:
+def _cgroup_memory_bound() -> tuple[int | None, dict[str, object] | None]:
     """Return the tightest finite remaining-memory bound across cgroup ancestors."""
-    global _last_cgroup_memory_observation
-
     remaining = None
     best_observation = None
     for version, directory in _cgroup_memory_directories():
@@ -190,8 +205,11 @@ def _cgroup_memory_remaining_bytes() -> int | None:
                 "usage": usage,
                 "usage_readable": usage_readable,
             }
-    _last_cgroup_memory_observation = best_observation
-    return remaining
+    return remaining, best_observation
+
+
+def _cgroup_memory_remaining_bytes() -> int | None:
+    return _cgroup_memory_bound()[0]
 
 
 def _read_cgroup_memory_stat(observation: dict[str, object]) -> dict[str, int]:
@@ -218,42 +236,68 @@ def _read_cgroup_memory_stat(observation: dict[str, object]) -> dict[str, int]:
         return {}
 
 
-def _maybe_log_cgroup_memory_diagnostic(memory_budget: int) -> None:
-    """Emit one diagnostic when conservative cgroup accounting is restrictive."""
-    global _cgroup_memory_diagnostic_emitted
+def _maybe_log_cgroup_memory_diagnostic(
+    cpu_budget: int,
+    memory_budget: int,
+    configured_ceiling: int | None,
+    observation: dict[str, object] | None,
+) -> None:
+    """Report significant cgroup throttling, with bounded repeat warnings."""
+    global _memory_diagnostic_last_time, _memory_diagnostic_last_budget
 
-    if _cgroup_memory_diagnostic_emitted or memory_budget > 3:
-        return
-    observation = _last_cgroup_memory_observation
-    if observation is None:
-        return
+    requested = min(cpu_budget, configured_ceiling or cpu_budget)
+    with _memory_diagnostic_lock:
+        if memory_budget >= requested:
+            # Recovery starts a new episode, but does not bypass the cooldown.
+            _memory_diagnostic_last_budget = None
+            return
+        if observation is None or not (
+            memory_budget <= 3 or memory_budget * 4 <= requested
+        ):
+            return
+        previous = _memory_diagnostic_last_budget
+        if previous is not None and not (
+            memory_budget * 2 <= previous or memory_budget == 1 < previous
+        ):
+            return
+        now = time.monotonic()
+        if (
+            _memory_diagnostic_last_time is not None
+            and now - _memory_diagnostic_last_time < _MEMORY_DIAGNOSTIC_INTERVAL
+        ):
+            return
+        _memory_diagnostic_last_time = now
+        _memory_diagnostic_last_budget = memory_budget
 
     stats = _read_cgroup_memory_stat(observation)
     limit_gib = int(observation["limit"]) / 1024**3
     usage = observation["usage"]
-    remaining = (
-        int(observation["limit"]) - int(usage) if usage is not None else 0
-    )
+    remaining = int(observation["limit"]) - int(usage) if usage is not None else 0
     remaining_gib = max(0, remaining) / 1024**3
     usage_text = (
         f"{int(observation['usage']) / 1024**3:.2f} GiB"
         if observation["usage"] is not None
         else "unavailable"
     )
-    stat_text = ", ".join(
-        f"{key}={value / 1024**3:.2f} GiB" for key, value in stats.items()
-    ) or "memory.stat unavailable"
+    stat_text = (
+        ", ".join(f"{key}={value / 1024**3:.2f} GiB" for key, value in stats.items())
+        or "memory.stat unavailable"
+    )
     unreadable_text = (
         "; usage was unreadable, so remaining memory was conservatively treated as 0"
         if not observation["usage_readable"]
         else ""
     )
-    log = _logger.warning if memory_budget == 1 else _logger.info
-    log(
-        "AITER worker budget limited to %d by cgroup memory: limit=%.2f GiB, "
+    _logger.warning(
+        "AITER compilation concurrency limited by cgroup memory: "
+        "requested=%d, selected=%d, cpu_budget=%d, configured_ceiling=%s, "
+        "limit=%.2f GiB, "
         "current=%s, remaining=%.2f GiB, worker_estimate=%.2f GiB; "
         "cgroup current usage conservatively includes page cache (%s)%s",
+        requested,
         memory_budget,
+        cpu_budget,
+        configured_ceiling if configured_ceiling is not None else "unset",
         limit_gib,
         usage_text,
         remaining_gib,
@@ -261,38 +305,32 @@ def _maybe_log_cgroup_memory_diagnostic(memory_budget: int) -> None:
         stat_text,
         unreadable_text,
     )
-    _cgroup_memory_diagnostic_emitted = True
 
 
-def _available_memory_bounds() -> tuple[int, int | None]:
-    """Return host available memory and the optional cgroup bound."""
+def _available_memory_bounds() -> tuple[int, int | None, dict[str, object] | None]:
+    """Return memory bounds and the observation used to calculate the cgroup bound."""
     host_available = _host_available_memory_bytes()
-    cgroup_remaining = _cgroup_memory_remaining_bytes()
-    return host_available, cgroup_remaining
+    cgroup_remaining, observation = _cgroup_memory_bound()
+    return host_available, cgroup_remaining, observation
 
 
-def _available_memory_bytes() -> int:
-    """Return memory available under both host and cgroup constraints."""
-    host_available, cgroup_remaining = _available_memory_bounds()
-    return (
-        host_available
-        if cgroup_remaining is None
-        else min(host_available, cgroup_remaining)
-    )
-
-
-def get_automatic_worker_budgets() -> tuple[int, int]:
-    """Return the CPU and memory worker budgets."""
+def _automatic_worker_snapshot() -> tuple[int, int, dict[str, object] | None]:
     cpu_budget = get_cpu_worker_budget()
-    host_available, cgroup_remaining = _available_memory_bounds()
+    host_available, cgroup_remaining, observation = _available_memory_bounds()
     available_memory = (
         host_available
         if cgroup_remaining is None
         else min(host_available, cgroup_remaining)
     )
     memory_budget = max(1, available_memory // EST_WORKER_RSS_BYTES)
-    if cgroup_remaining is not None and cgroup_remaining <= host_available:
-        _maybe_log_cgroup_memory_diagnostic(memory_budget)
+    if cgroup_remaining is None or cgroup_remaining > host_available:
+        observation = None
+    return cpu_budget, memory_budget, observation
+
+
+def get_automatic_worker_budgets() -> tuple[int, int]:
+    """Return CPU and memory budgets; diagnostics occur after ceiling resolution."""
+    cpu_budget, memory_budget, _ = _automatic_worker_snapshot()
     return cpu_budget, memory_budget
 
 
@@ -333,20 +371,21 @@ def _get_legacy_worker_limit() -> int | None:
 
 def _get_worker_count(*, honor_legacy_max_jobs: bool) -> int:
     """Apply AITER's explicit ceiling to the current automatic worker budget."""
-    automatic_workers = max(1, min(get_automatic_worker_budgets()))
+    cpu_budget, memory_budget, observation = _automatic_worker_snapshot()
+    configured_limit = None
     raw = os.environ.get(_WORKER_ENV)
     if raw is None and honor_legacy_max_jobs:
-        legacy_limit = _get_legacy_worker_limit()
-        if legacy_limit is None:
-            return automatic_workers
-        return min(automatic_workers, legacy_limit)
-    if raw is None:
-        return automatic_workers
-    try:
-        configured_limit = max(1, int(raw))
-    except ValueError:
-        return automatic_workers
-    return min(automatic_workers, configured_limit)
+        configured_limit = _get_legacy_worker_limit()
+    elif raw is not None:
+        try:
+            configured_limit = max(1, int(raw))
+        except ValueError:
+            pass
+    _maybe_log_cgroup_memory_diagnostic(
+        cpu_budget, memory_budget, configured_limit, observation
+    )
+    automatic_workers = max(1, min(cpu_budget, memory_budget))
+    return min(automatic_workers, configured_limit or automatic_workers)
 
 
 def get_worker_count() -> int:

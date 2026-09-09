@@ -152,6 +152,8 @@ The compatibility paths never change `MAX_JOBS`, and both explicit and legacy ce
 
 Process-pool workers force nested AITER, Ninja, CMake, Make, OpenMP, BLAS, and NumExpr compilation fanout to one.
 
+Cgroup-memory diagnostics compare the memory budget with the CPU budget after applying the requested worker ceiling. A warning is emitted when memory reduces that budget to three workers or fewer, or by at least a factor of four. Repeated warnings are suppressed unless the budget halves or reaches one worker, with a 60-second minimum interval. Recovery resets the reporting baseline without bypassing that interval. These diagnostics do not change worker selection or discount reclaimable page cache.
+
 Examples:
 
 ```bash

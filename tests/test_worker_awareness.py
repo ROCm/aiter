@@ -53,7 +53,7 @@ class WorkerAwarenessTest(unittest.TestCase):
         ), patch.object(
             worker_limits,
             "_available_memory_bounds",
-            return_value=(3 * worker_limits.EST_WORKER_RSS_BYTES, None),
+            return_value=(3 * worker_limits.EST_WORKER_RSS_BYTES, None, None),
         ):
             self.assertEqual(get_automatic_worker_budgets(), (6, 3))
 
@@ -196,79 +196,6 @@ class WorkerAwarenessTest(unittest.TestCase):
 
         self.assertEqual(remaining, 0)
 
-    def test_cgroup_memory_diagnostic_reports_page_cache_once(self):
-        with tempfile.TemporaryDirectory() as tempdir:
-            directory = pathlib.Path(tempdir)
-            (directory / "memory.max").write_text(str(4 * 1024**3))
-            (directory / "memory.current").write_text(str(3 * 1024**3))
-            (directory / "memory.stat").write_text(
-                "anon 1073741824\n"
-                "file 2147483648\n"
-                "active_file 536870912\n"
-                "inactive_file 1610612736\n"
-                "slab_reclaimable 268435456\n"
-            )
-            previous_diagnostic_state = (
-                worker_limits._cgroup_memory_diagnostic_emitted
-            )
-            worker_limits._cgroup_memory_diagnostic_emitted = False
-            try:
-                with patch.object(
-                    worker_limits,
-                    "_cgroup_memory_directories",
-                    return_value=[("v2", str(directory))],
-                ), patch.object(
-                    worker_limits,
-                    "_host_available_memory_bytes",
-                    return_value=256 * 1024**3,
-                ), patch.object(
-                    worker_limits, "_process_cpu_count", return_value=64
-                ), self.assertLogs(
-                    worker_limits._logger, level="WARNING"
-                ) as logs:
-                    self.assertEqual(
-                        worker_limits.get_automatic_worker_budgets(), (51, 1)
-                    )
-                    self.assertEqual(
-                        worker_limits.get_automatic_worker_budgets(), (51, 1)
-                    )
-                self.assertEqual(len(logs.output), 1)
-                self.assertIn("page cache", logs.output[0])
-                self.assertIn("inactive_file", logs.output[0])
-            finally:
-                worker_limits._cgroup_memory_diagnostic_emitted = (
-                    previous_diagnostic_state
-                )
-
-    def test_cgroup_diagnostic_skips_host_limited_budget(self):
-        with tempfile.TemporaryDirectory() as tempdir:
-            directory = pathlib.Path(tempdir)
-            (directory / "memory.max").write_text(str(32 * 1024**3))
-            (directory / "memory.current").write_text(str(1 * 1024**3))
-            previous_diagnostic_state = (
-                worker_limits._cgroup_memory_diagnostic_emitted
-            )
-            worker_limits._cgroup_memory_diagnostic_emitted = False
-            try:
-                with patch.object(
-                    worker_limits,
-                    "_available_memory_bounds",
-                    return_value=(1 * 1024**3, 31 * 1024**3),
-                ), patch.object(
-                    worker_limits, "_process_cpu_count", return_value=64
-                ), patch.object(
-                    worker_limits._logger, "warning"
-                ) as warning, patch.object(worker_limits._logger, "info") as info:
-                    self.assertEqual(
-                        worker_limits.get_automatic_worker_budgets(), (51, 1)
-                    )
-                warning.assert_not_called()
-                info.assert_not_called()
-            finally:
-                worker_limits._cgroup_memory_diagnostic_emitted = (
-                    previous_diagnostic_state
-                )
-
     def test_container_memory_caps_large_host_worker_budget(self):
         with patch.dict(os.environ, {}, clear=True), patch.object(
             worker_limits,
@@ -276,8 +203,8 @@ class WorkerAwarenessTest(unittest.TestCase):
             return_value=256 * 1024**3,
         ), patch.object(
             worker_limits,
-            "_cgroup_memory_remaining_bytes",
-            return_value=8 * 1024**3,
+            "_cgroup_memory_bound",
+            return_value=(8 * 1024**3, None),
         ), patch.object(
             worker_limits, "_process_cpu_count", return_value=128
         ):
@@ -288,14 +215,14 @@ class WorkerAwarenessTest(unittest.TestCase):
         with patch.dict(os.environ, {}, clear=True), patch.object(
             worker_limits,
             "_available_memory_bounds",
-            return_value=(10 * 1024**3, None),
+            return_value=(10 * 1024**3, None, None),
         ), patch.object(worker_limits, "_process_cpu_count", return_value=4):
             self.assertEqual(get_worker_count(), 3)
             self.assertNotIn("AITER_MAX_JOBS", os.environ)
 
     def test_explicit_aiter_max_jobs_is_clamped_to_automatic_caps(self):
         with patch.dict(os.environ, {"AITER_MAX_JOBS": "99"}, clear=True), patch.object(
-            worker_limits, "get_automatic_worker_budgets", return_value=(4, 3)
+            worker_limits, "_automatic_worker_snapshot", return_value=(4, 3, None)
         ) as automatic_budgets:
             self.assertEqual(get_worker_count(), 3)
             automatic_budgets.assert_called_once_with()
@@ -303,8 +230,8 @@ class WorkerAwarenessTest(unittest.TestCase):
     def test_automatic_worker_budget_is_recomputed_on_every_call(self):
         with patch.dict(os.environ, {}, clear=True), patch.object(
             worker_limits,
-            "get_automatic_worker_budgets",
-            side_effect=((102, 180), (1, 1)),
+            "_automatic_worker_snapshot",
+            side_effect=((102, 180, None), (1, 1, None)),
         ) as automatic_budgets:
             self.assertEqual(get_worker_count(), 102)
             self.assertEqual(get_worker_count(), 1)
@@ -315,7 +242,7 @@ class WorkerAwarenessTest(unittest.TestCase):
         with patch.dict(os.environ, {"MAX_JOBS": "99"}, clear=True), patch.object(
             worker_limits,
             "_available_memory_bounds",
-            return_value=(10 * 1024**3, None),
+            return_value=(10 * 1024**3, None, None),
         ), patch.object(worker_limits, "_process_cpu_count", return_value=4):
             self.assertEqual(get_worker_count(), 3)
             self.assertEqual(os.environ["MAX_JOBS"], "99")
@@ -326,8 +253,8 @@ class WorkerAwarenessTest(unittest.TestCase):
     ):
         with patch.dict(os.environ, {"MAX_JOBS": "2"}, clear=True), patch.object(
             worker_limits,
-            "get_automatic_worker_budgets",
-            return_value=(8, 8),
+            "_automatic_worker_snapshot",
+            return_value=(8, 8, None),
         ):
             self.assertEqual(get_compile_worker_count(), 2)
             self.assertEqual(os.environ["MAX_JOBS"], "2")
@@ -339,7 +266,7 @@ class WorkerAwarenessTest(unittest.TestCase):
             {"AITER_MAX_JOBS": "5", "MAX_JOBS": "2"},
             clear=True,
         ), patch.object(
-            worker_limits, "get_automatic_worker_budgets", return_value=(8, 8)
+            worker_limits, "_automatic_worker_snapshot", return_value=(8, 8, None)
         ):
             self.assertEqual(get_compile_worker_count(), 5)
 
@@ -351,22 +278,19 @@ class WorkerAwarenessTest(unittest.TestCase):
                 os.environ, {"MAX_JOBS": raw_value}, clear=True
             ), patch.object(
                 worker_limits,
-                "get_automatic_worker_budgets",
-                return_value=(8, 3),
+                "_automatic_worker_snapshot",
+                return_value=(8, 3, None),
             ):
                 self.assertEqual(get_compile_worker_count(), 3)
                 self.assertEqual(os.environ["MAX_JOBS"], raw_value)
                 self.assertNotIn("AITER_MAX_JOBS", os.environ)
 
     def test_runtime_jit_uses_legacy_aware_compile_helper(self):
-        tree = ast.parse(
-            (_REPO_ROOT / "aiter/jit/utils/cpp_extension.py").read_text()
-        )
+        tree = ast.parse((_REPO_ROOT / "aiter/jit/utils/cpp_extension.py").read_text())
         imported_names = {
             alias.name
             for node in ast.walk(tree)
-            if isinstance(node, ast.ImportFrom)
-            and node.module == "aiter_worker_limits"
+            if isinstance(node, ast.ImportFrom) and node.module == "aiter_worker_limits"
             for alias in node.names
         }
         self.assertIn("get_compile_worker_count", imported_names)
@@ -415,7 +339,7 @@ class WorkerAwarenessTest(unittest.TestCase):
 
     def test_adopted_legacy_ceiling_remains_clamped_to_live_limits(self):
         with patch.dict(os.environ, {"MAX_JOBS": "99"}, clear=True), patch.object(
-            worker_limits, "get_automatic_worker_budgets", return_value=(4, 3)
+            worker_limits, "_automatic_worker_snapshot", return_value=(4, 3, None)
         ):
             with self.assertWarns(FutureWarning):
                 adopt_legacy_max_jobs()
@@ -479,7 +403,7 @@ class WorkerAwarenessTest(unittest.TestCase):
             with self.subTest(raw_value=raw_value), patch.dict(
                 os.environ, {"AITER_MAX_JOBS": raw_value}, clear=True
             ), patch.object(
-                worker_limits, "get_automatic_worker_budgets", return_value=(6, 4)
+                worker_limits, "_automatic_worker_snapshot", return_value=(6, 4, None)
             ):
                 self.assertEqual(get_worker_count(), 4)
                 self.assertEqual(os.environ["AITER_MAX_JOBS"], raw_value)
@@ -488,7 +412,7 @@ class WorkerAwarenessTest(unittest.TestCase):
         with patch.dict(os.environ, {}, clear=True), patch.object(
             worker_limits,
             "_available_memory_bounds",
-            return_value=(0, None),
+            return_value=(0, None, None),
         ), patch.object(worker_limits, "_process_cpu_count", return_value=1):
             self.assertEqual(get_worker_count(), 1)
             self.assertNotIn("AITER_MAX_JOBS", os.environ)
@@ -497,7 +421,7 @@ class WorkerAwarenessTest(unittest.TestCase):
         with patch.dict(os.environ, {}, clear=True), patch.object(
             worker_limits,
             "_available_memory_bounds",
-            return_value=(4 * worker_limits.EST_WORKER_RSS_BYTES, None),
+            return_value=(4 * worker_limits.EST_WORKER_RSS_BYTES, None, None),
         ), patch.object(worker_limits, "_process_cpu_count", return_value=64):
             self.assertEqual(get_worker_count(), 4)
             self.assertNotIn("AITER_MAX_JOBS", os.environ)
@@ -520,7 +444,7 @@ class WorkerAwarenessTest(unittest.TestCase):
 
     def test_work_capped_worker_count_never_returns_zero(self):
         with patch.dict(os.environ, {"AITER_MAX_JOBS": "19"}, clear=True), patch.object(
-            worker_limits, "get_automatic_worker_budgets", return_value=(32, 32)
+            worker_limits, "_automatic_worker_snapshot", return_value=(32, 32, None)
         ):
             self.assertEqual(get_worker_count_for(0), 1)
             self.assertEqual(get_worker_count_for(3), 3)
