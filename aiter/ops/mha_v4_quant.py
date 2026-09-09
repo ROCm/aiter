@@ -41,6 +41,13 @@ MHA_V4_MXFP4_V_BUFFER_SLACK_BYTES = FP4_V_BUFFER_SLACK_BYTES
 # tile. Keep those reads mapped and zero without changing either scale tensor's logical shape.
 MHA_V4_MXFP4_K_SCALE_SLACK_BYTES = 4
 MHA_V4_MXFP4_V_SCALE_SLACK_BYTES = MHA_V4_MXFP4_V_SCALE_TILE_BYTES
+# The ASM Q-scale gather is an unguarded global load covering a whole 256-row query tile, so a
+# partial final tile addresses rows past the logical sequence.
+MHA_V4_QUERY_TILE_ROWS = 256
+# K scales are gathered per KV tile with a two-tile producer lead, so the last tiles address rows
+# past the sequence even when it is already tile-aligned.
+MHA_V4_KV_TILE_ROWS = 128
+MHA_V4_KV_SCALE_LOOKAHEAD_ROWS = 2 * MHA_V4_KV_TILE_ROWS
 MHA_V4_MXFP6_V_TILE_TOKENS = 128
 MHA_V4_MXFP6_V_PACKED_ROW_BYTES = 96
 MHA_V4_MXFP6_V_TILE_BYTES = MHA_V4_MXFP6_V_TILE_TOKENS * MHA_V4_MXFP6_V_PACKED_ROW_BYTES
@@ -204,12 +211,46 @@ def quantize_fp8_rotated(input: Tensor) -> tuple[Tensor, Tensor]:
     return quantize_fp8(rotated)
 
 
+def block_scale_storage(
+    input: Tensor,
+    batch: int,
+    sequence: int,
+    heads: int,
+    blocks: int,
+    tile_rows: int,
+    lookahead_rows: int = 0,
+    extra: int = 0,
+) -> Tensor:
+    """Allocate a per-row E8M0 scale view backed by padded gather rows.
+
+    The ASM kernels gather scales with unguarded global loads that address every
+    row of a tile, plus any producer lookahead, so the final tiles read past the
+    logical sequence. Keep those reads inside mapped, zeroed memory without
+    changing the tensor's logical shape or strides.
+    """
+    elements = batch * sequence * heads * blocks
+    padded = -(-sequence // tile_rows) * tile_rows + lookahead_rows
+    slack = (padded - sequence) * heads * blocks + extra
+    storage = input.new_empty((elements + slack,), dtype=torch.uint8)
+    storage[elements:].zero_()
+    return storage[:elements].view(batch, sequence, heads, blocks)
+
+
+def query_block_scale(
+    input: Tensor, batch: int, sequence: int, heads: int, blocks: int
+) -> Tensor:
+    """Per-row Q-scale view backed by a padded 256-row query tile."""
+    return block_scale_storage(
+        input, batch, sequence, heads, blocks, MHA_V4_QUERY_TILE_ROWS
+    )
+
+
 @torch.library.custom_op("aiter::mha_v4_quantize_mxfp8_q", mutates_args=())
 def quantize_mxfp8_q(input: Tensor, multiplier: float) -> tuple[Tensor, Tensor]:
     """Rotate and quantize hd128 BSHD Q to MXFP8 data and E8M0 block scales."""
     batch, sequence, heads, head_dim = _validate_bshd_hd128(input, "MXFP8 quantization")
     quantized = input.new_empty(input.shape, dtype=dtypes.fp8)
-    scale = input.new_empty((batch, sequence, heads, head_dim // 32), dtype=torch.uint8)
+    scale = query_block_scale(input, batch, sequence, heads, head_dim // 32)
     rotate_activation_mxfp8_quant(quantized, scale, input, multiplier)
     return quantized, scale
 
@@ -250,7 +291,7 @@ def quantize_mxfp4_q(input: Tensor, multiplier: float) -> tuple[Tensor, Tensor]:
     quantized = input.new_empty(
         (batch, sequence, heads, head_dim // 2), dtype=torch.uint8
     )
-    scale = input.new_empty((batch, sequence, heads, head_dim // 32), dtype=torch.uint8)
+    scale = query_block_scale(input, batch, sequence, heads, head_dim // 32)
     rotate_activation_mxfp4_quant(quantized, scale, input, multiplier)
     return quantized, scale
 
@@ -315,12 +356,16 @@ def quantize_mxfp4_k(input: Tensor) -> tuple[Tensor, Tensor]:
     raw = input.new_empty(
         (mxfp4_k_raw_buffer_size(batch, sequence, heads),), dtype=torch.uint8
     )
-    scale_elements = batch * sequence * heads * (head_dim // 32)
-    scale_storage = input.new_empty(
-        (scale_elements + MHA_V4_MXFP4_K_SCALE_SLACK_BYTES,), dtype=torch.uint8
+    scale = block_scale_storage(
+        input,
+        batch,
+        sequence,
+        heads,
+        head_dim // 32,
+        MHA_V4_KV_TILE_ROWS,
+        lookahead_rows=MHA_V4_KV_SCALE_LOOKAHEAD_ROWS,
+        extra=MHA_V4_MXFP4_K_SCALE_SLACK_BYTES,
     )
-    scale_storage[scale_elements:].zero_()
-    scale = scale_storage[:scale_elements].view(batch, sequence, heads, head_dim // 32)
     rotate_activation_mxfp4_quant_k(raw, scale, input)
     return raw, scale
 
@@ -369,7 +414,7 @@ def quantize_mxfp6_q(input: Tensor, multiplier: float) -> tuple[Tensor, Tensor]:
     quantized = input.new_empty(
         (batch, sequence, heads, head_dim // 32 * 24), dtype=torch.uint8
     )
-    scale = input.new_empty((batch, sequence, heads, head_dim // 32), dtype=torch.uint8)
+    scale = query_block_scale(input, batch, sequence, heads, head_dim // 32)
     rotate_activation_mxfp6_quant(quantized, scale, input, multiplier)
     return quantized, scale
 

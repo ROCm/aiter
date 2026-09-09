@@ -32,7 +32,11 @@ from aiter.ops.mha_v4 import (
     scale_modes_for_formats,
 )
 from aiter.ops.mha_v4_quant import (
+    MHA_V4_KV_SCALE_LOOKAHEAD_ROWS,
+    MHA_V4_KV_TILE_ROWS,
     MHA_V4_LOG2E,
+    MHA_V4_MXFP4_K_SCALE_SLACK_BYTES,
+    MHA_V4_QUERY_TILE_ROWS,
     mha_v4_q_multiplier,
     mxfp4_k_view,
     mxfp4_v_view,
@@ -43,6 +47,7 @@ from aiter.ops.mha_v4_quant import (
     quantize_mxfp4_k,
     quantize_mxfp4_q,
     quantize_mxfp6_k,
+    quantize_mxfp6_q,
     quantize_mxfp8_k,
     quantize_mxfp8_q,
     quantize_v_mxfp4,
@@ -844,12 +849,49 @@ def test_mha_v4_mxfp4_k_coalesced_layout(sequence):
     assert torch.equal(raw[raw_offset], expected)
 
     assert torch.equal(scale, dense_scale)
-    assert scale.untyped_storage().nbytes() == scale.numel() + 4
+    # The gather addresses whole KV tiles plus the producer lookahead, so the backing storage has to
+    # cover those rows and read as zero.
+    padded = tiles * MHA_V4_KV_TILE_ROWS + MHA_V4_KV_SCALE_LOOKAHEAD_ROWS
+    slack = (padded - sequence) * 3 * 4 + MHA_V4_MXFP4_K_SCALE_SLACK_BYTES
+    assert scale.untyped_storage().nbytes() == scale.numel() + slack
     assert torch.equal(
-        scale.as_strided((4,), (1,), scale.numel()),
-        torch.zeros(4, device="cuda", dtype=torch.uint8),
+        scale.as_strided((slack,), (1,), scale.numel()),
+        torch.zeros(slack, device="cuda", dtype=torch.uint8),
     )
     assert coalesced.stride() == (3 * tiles * 8192, 64, tiles * 8192, 1)
+
+
+@pytest.mark.skipif(get_gfx() != "gfx950", reason="gfx950 scale gather validation")
+@pytest.mark.parametrize("sequence", [1, 255, 256, 257, 513])
+@pytest.mark.parametrize(
+    "quantize",
+    [
+        lambda t: quantize_mxfp8_q(t, 1.0),
+        lambda t: quantize_mxfp4_q(t, 1.0),
+        lambda t: quantize_mxfp6_q(t, 1.0),
+    ],
+    ids=["mxfp8", "mxfp4", "mxfp6"],
+)
+def test_mha_v4_q_scale_backing_storage_covers_query_tile(quantize, sequence):
+    """The ASM Q-scale gather addresses all 256 rows of the tile it is running.
+
+    A partial final tile therefore reads past the logical sequence, so the backing storage must
+    cover the padded tile and read as zero. Without it those loads walk off the tensor and fault
+    the GPU at an unrelated later synchronization.
+    """
+    heads = 3
+    value = torch.randn((2, sequence, heads, 128), device="cuda", dtype=torch.bfloat16)
+    _, scale = quantize(value)
+
+    padded = -(-sequence // MHA_V4_QUERY_TILE_ROWS) * MHA_V4_QUERY_TILE_ROWS
+    slack = (padded - sequence) * heads * 4
+    assert scale.shape == (2, sequence, heads, 4)
+    assert scale.is_contiguous()
+    assert scale.untyped_storage().nbytes() == scale.numel() + slack
+    assert torch.equal(
+        scale.as_strided((slack,), (1,), scale.numel()),
+        torch.zeros(slack, device="cuda", dtype=torch.uint8),
+    )
 
 
 def test_mha_v4_rejects_unsupported_contracts():
