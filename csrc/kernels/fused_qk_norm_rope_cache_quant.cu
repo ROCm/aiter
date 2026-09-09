@@ -5419,7 +5419,7 @@ namespace aiter {
     template <typename scalar_t, typename cache_t, typename query_t,
               vllm::Fp8KVCacheDataType kv_dt, vllm::Fp8KVCacheDataType q_dt, bool is_neox,
               int Q_GROUP_SIZE = 64, bool Q_SCALE_FP32 = false, bool HAS_Q_WEIGHT = false,
-              int HEAD_DIM = 512, bool USE_TDM = false, int HEADS_PER_WAVE = 1>
+              int HEAD_DIM = 512, int HEADS_PER_WAVE = 1>
     __device__ void fuse_qk_norm_rope_finegrained_impl(
         const scalar_t* __restrict__ q,
         const scalar_t* __restrict__ kv,
@@ -5484,18 +5484,6 @@ namespace aiter {
       // Held as an integer address, not a pointer: reinterpret_cast from the
       // generic `char*` of extern __shared__ to an LDS-qualified pointer is an
       // illegal address-space cast. inverse_rope_group_quant routes the same way.
-      extern __shared__ char fqk_lds_raw[];
-      [[maybe_unused]] __UINTPTR_TYPE__ my_lds_addr = 0;
-#if defined(__gfx1250__)
-      if constexpr (USE_TDM) {
-        const int32_t wave_in_block = static_cast<int32_t>(threadIdx.x) / WARP_SIZE;
-        my_lds_addr = reinterpret_cast<__UINTPTR_TYPE__>(fqk_lds_raw)
-                    + static_cast<__UINTPTR_TYPE__>(wave_in_block * HEADS_PER_WAVE
-                                                    * head_size)
-                      * sizeof(scalar_t);
-      }
-#endif
-
       if (token_idx >= params.num_tokens) return;
       const int32_t head_limit = params.num_heads;  // valid combined idx is [0, num_heads]
 
@@ -5521,45 +5509,12 @@ namespace aiter {
       const scalar_t *cos_ptr_w = nullptr, *sin_ptr_w = nullptr;
       compute_rope_ptrs(cos_ptr_w, sin_ptr_w);
 
-      // ---- TDM prologue: issue every head this wave owns, so head h+1's copy is
-      // in flight while head h computes. This is the actual double buffering; the
-      // dispatched wait below consumes them in order.
-#if defined(__gfx1250__)
-      if constexpr (USE_TDM) {
-        using TdmWinP = opus::tdm<scalar_t, opus::seq<head_size, 1>>;
-        // ALWAYS issue exactly HEADS_PER_WAVE tiles. The dispatched wait below is a
-        // compile-time constant that assumes that many are outstanding; if the tail
-        // wave issued fewer, `s_wait_tensorcnt<HEADS_PER_WAVE-1-hh>` ("at most N
-        // still in flight") would already be satisfied and the consumer would read
-        // LDS before the copy landed. Out-of-range heads are clamped to a valid
-        // source and their slot is simply never read.
-        #pragma unroll
-        for (int hh = 0; hh < HEADS_PER_WAVE; ++hh) {
-          const int32_t ci_raw = combined_head_base + hh;
-          const int32_t ci = ci_raw > head_limit ? head_limit : ci_raw;
-          const scalar_t* src =
-              (ci == 0) ? (kv + static_cast<int64_t>(token_idx) * params.kv_stride_0)
-                        : (q + static_cast<int64_t>(token_idx) * params.q_stride_0
-                             + (ci - 1) * params.q_stride_1);
-          auto wp = opus::make_tdm<TdmWinP>(
-              static_cast<opus::u32_t>(my_lds_addr
-                  + static_cast<__UINTPTR_TYPE__>(hh * head_size) * sizeof(scalar_t)),
-              src, static_cast<opus::u32_t>(head_size), 1u,
-              opus::u64_t(head_size), 0u, 0u);
-          wp.async_load(0u);
-        }
-      }
-#endif
-
       // ---- one iteration per head this wave owns ----
       #pragma unroll
       for (int32_t hh = 0; hh < HEADS_PER_WAVE; ++hh) {
       const int32_t combined_head_idx = combined_head_base + hh;
       if (combined_head_idx > head_limit) break;
       const bool is_k_wave = (combined_head_idx == 0);  // V4 MQA: single K wave
-      // Slot this head's staged tile lives in.
-      [[maybe_unused]] const __UINTPTR_TYPE__ slot_addr =
-          my_lds_addr + static_cast<__UINTPTR_TYPE__>(hh * head_size) * sizeof(scalar_t);
 
       if (is_k_wave) {
         // ===== K: RMSNorm over head_dim, e8m0 group-quant nope, RoPE pe (bf16) =====
@@ -5572,11 +5527,7 @@ namespace aiter {
 
         // Load hoisting: issue the main K data load FIRST so its latency overlaps the
         // positions load + scalar setup below (instead of stacking after them).
-        // TDM tiles were all issued in the prologue; the non-TDM path loads here.
         opus_vec_i vec_kv;
-#if defined(__gfx1250__)
-        if constexpr (!USE_TDM)
-#endif
         {
           vec_kv =
             load_vector_nbytes<scalar_t, vec_size_i, in_chunk_bytes, IN_LOAD_AUX>(
@@ -5608,24 +5559,6 @@ namespace aiter {
         const bool is_nope_thread = (tid < static_cast<int32_t>(nope_vec));
         constexpr bool K_QUANT = (kv_dt != vllm::Fp8KVCacheDataType::kAuto);
         // (vec_kv / vec_k_weight already loaded above -- load hoisting)
-
-        // CONSUME this head's staged tile.
-#if defined(__gfx1250__)
-        if constexpr (USE_TDM) {
-        // Dispatched wait: head hh needs only its own tile, so heads hh+1.. stay in
-        // flight across this head's norm -> rope -> quant -> store chain. Waiting on
-        // 0 here would serialise every tile behind the first consumer.
-        switch (HEADS_PER_WAVE - 1 - hh) {
-          case 3:  opus::s_wait_tensorcnt<3>(); break;
-          case 2:  opus::s_wait_tensorcnt<2>(); break;
-          case 1:  opus::s_wait_tensorcnt<1>(); break;
-          default: opus::s_wait_tensorcnt<0>(); break;
-        }
-          vec_kv = *reinterpret_cast<const OPUS_LDS_ADDR opus_vec_i*>(
-              slot_addr + static_cast<__UINTPTR_TYPE__>(tid * vec_size_i)
-                          * sizeof(scalar_t));
-        }
-#endif
 
         // Per-thread partials: sum(x^2) over the row, and (quant only) amax(|x*w|)
         // over this thread's slice -- both on the RAW input (pre-norm), so the
@@ -5790,11 +5723,7 @@ namespace aiter {
 
       const scalar_t* q_ptr = q + token_q_base + q_head_idx * params.q_stride_1;
       auto q_buf = opus::make_gmem<scalar_t>(q_ptr, oob_i * sizeof(scalar_t));
-      // TDM tiles were all issued in the prologue; the non-TDM path loads here.
       opus_vec_i vec_q;
-#if defined(__gfx1250__)
-      if constexpr (!USE_TDM)
-#endif
       {
         vec_q =
           load_vector_nbytes<scalar_t, vec_size_i, in_chunk_bytes, IN_LOAD_AUX>(
@@ -5806,24 +5735,6 @@ namespace aiter {
       if constexpr (HAS_Q_WEIGHT) {
         vec_q_weight = *reinterpret_cast<const opus_vec_i*>(&q_weight[tid * vec_size_i]);
       }
-
-      // CONSUME this head's staged tile.
-#if defined(__gfx1250__)
-      if constexpr (USE_TDM) {
-      // Dispatched wait: head hh needs only its own tile, so heads hh+1.. stay in
-      // flight across this head's norm -> rope -> quant -> store chain. Waiting on
-      // 0 here would serialise every tile behind the first consumer.
-      switch (HEADS_PER_WAVE - 1 - hh) {
-        case 3:  opus::s_wait_tensorcnt<3>(); break;
-        case 2:  opus::s_wait_tensorcnt<2>(); break;
-        case 1:  opus::s_wait_tensorcnt<1>(); break;
-        default: opus::s_wait_tensorcnt<0>(); break;
-      }
-        vec_q = *reinterpret_cast<const OPUS_LDS_ADDR opus_vec_i*>(
-            slot_addr + static_cast<__UINTPTR_TYPE__>(tid * vec_size_i)
-                        * sizeof(scalar_t));
-      }
-#endif
 
       // Q quant only touches NOPE (PE stays bf16), so the group-amax is taken over
       // the RAW nope input (pre-norm, pre-RoPE) and fused with the row-sum butterfly.
@@ -6009,25 +5920,9 @@ namespace aiter {
       // Kept behind the knob because the machinery (prologue issue + dispatched
       // s_wait_tensorcnt, LDS slots) is correct and bit-exact, and is the right
       // starting point if the xlarge prefill tier is ever revisited.
-#ifndef AITER_FG_USE_TDM
-// Measured a real win at the XLARGE tier. Left OFF anyway: the same flag also reaches the DECODE tier, the other user of
-// the FG kernel, where TDM measured neutral-to-harmful -- the LDS round trip buys
-// nothing when a wave owns a single head, so there is no second tile to overlap
-// with, and a decode-latency regression outweighs the prefill gain. The knob
-// cannot separate the two tiers without a second FG instantiation. Turn on with
-// -DAITER_FG_USE_TDM=1 if only the xlarge prefill path matters; gate it per tier
-// before making it the default.
-#define AITER_FG_USE_TDM 0
-#endif
-      constexpr bool kUseTdm =
-#if defined(__gfx1250__)
-          (AITER_FG_USE_TDM != 0);
-#else
-          false;
-#endif
       #define DISPATCH_NEOX_FG(NEOX) \
         fuse_qk_norm_rope_finegrained_impl<scalar_t,cache_t,query_t, kv_dt, q_dt, NEOX, \
-            Q_GROUP_SIZE, Q_SCALE_FP32, HAS_Q_WEIGHT, HEAD_DIM, kUseTdm, HEADS_PER_WAVE>( \
+            Q_GROUP_SIZE, Q_SCALE_FP32, HAS_Q_WEIGHT, HEAD_DIM, HEADS_PER_WAVE>( \
             q, kv, k_pe_out, k_weight, q_weight, kv_cache, q_out, q_scale_raw, q_rope_out, positions, \
             cos_cache, sin_cache, eps, params, token_idx, combined_head_base, tid, \
             swa_nope, swa_rope, swa_block_tables, swa_dest_row, batch_id_per_token)
@@ -6640,13 +6535,9 @@ void fused_qk_norm_rope_group_quant(
           (num_tokens + tokens_per_block_val - 1) / tokens_per_block_val;
       dim3 grid(static_cast<unsigned>(fg_blocks_x), static_cast<unsigned>(fg_blocks_y));
       dim3 block(static_cast<unsigned>(tokens_per_block_val * warp_size));
-      // Dynamic LDS for TDM staging: one HEAD_DIM-element bf16 slot per wave in the
-      // block. Zero on non-gfx1250 arches (USE_TDM=false compiles out the extern).
-      const size_t fg_lds_bytes =
-          (get_gpu_arch() == "gfx1250")
-              ? static_cast<size_t>(tokens_per_block_val) * fg_heads_per_wave_val
-                    * 512 * sizeof(uint16_t)
-              : 0;
+      // The FG kernel loads straight to registers and stages nothing, so it asks for
+      // no dynamic shared memory.
+      const size_t fg_lds_bytes = 0;
       DISPATCH_BY_KV_CACHE_QUERY_DTYPE_OPUS_rmTorch(kv.dtype(), kv_cache_dtype, q_out_type,
                                         CALL_FUSED_QK_NORM_ROPE_FINEGRAINED);
     } else if (use_decode_path) {

@@ -92,7 +92,7 @@ All default to the original behaviour. Turn on with `-D<NAME>=<value>`.
 
 | knob | default | status |
 |---|---|---|
-| `AITER_FG_USE_TDM` | 0 | **Validated −11.32% at xlarge** (H=128 T=16384, 570.07→505.56, 3 clean pairs, sd 0.10pp) but the same flag reaches **decode**, where TDM is neutral-to-harmful (a wave owns one head, so there is no second tile to overlap). One unclean run had H=16 T=64 at 6.99→10.26 us. Needs a per-tier gate before it can default on. |
+| `AITER_FG_USE_TDM` | *removed* | Was a validated win at xlarge, but the same flag also reached decode, where the LDS round trip buys nothing (a wave owns one head, so there is no second tile to overlap) and it measured neutral-to-harmful. It could not be gated per tier without a second FG instantiation, and once xlarge stopped routing to FG at all it reached no path. Knob and the code it gated deleted; see git history to revive it. |
 | `AITER_COARSE_SCALE_ALL_LANES` | 0 | Never run. Drops the `tid % Q_REDUCE == 0` dedup on the Q scale store. |
 | `AITER_FG_TOKENS_PER_WG` | 1 | Measured noise (−1.68% / +3.55%, CIs cross zero). |
 | `AITER_FG_HEADS_PER_WAVE` | 1 | **Regression +20%** at decode (VGPR 66→86, occupancy 14→11, wave count halved). |
