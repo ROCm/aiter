@@ -76,8 +76,6 @@ from aiter.ops.flydsl.kernels.gemm_common_gfx1250 import make_lds_copy_ops
 from aiter.ops.flydsl.kernels.kernels_common import format_kernel_name, get_warp_size
 from aiter.ops.flydsl.kernels.moe_route_maps import DROPPED_ROUTE_ROW
 from aiter.ops.flydsl.kernels.quant_utils import emit_f32_to_e2m1, emit_mx_e8m0_scale
-from aiter.ops.flydsl.kernels.moe_route_maps import DROPPED_ROUTE_ROW
-from aiter.ops.flydsl.kernels.quant_utils import emit_f32_to_e2m1, emit_mx_e8m0_scale
 from aiter.ops.flydsl.kernels.tensor_shim import (
     AITER_FLYDSL_KERNARG_PRELOAD,
     AITER_FLYDSL_KERNARG_PRELOAD_COUNT,
@@ -1950,10 +1948,9 @@ def build_moe_token_multidest_quant_topk6_module(
                 # under this chunk's converts. Two slots mean chunk n+1 reuses
                 # chunk n-1's, hence the WAR barrier before the issue; the RAW
                 # barrier publishes chunk n, which only wave 0 waited on.
-                if const_expr(chunk == 0):
-                    if is_loader:
-                        _issue_hidden(0)
-                        tdm_ops.tensor_wait(0)
+                if const_expr(chunk == 0) and is_loader:
+                    _issue_hidden(0)
+                    tdm_ops.tensor_wait(0)
                 gpu.barrier()
                 if is_loader and const_expr(chunk + 1 < tdm_hidden_chunks):
                     _issue_hidden(chunk + 1)
