@@ -174,7 +174,9 @@ def kunroll_for(k, BK):
 
 
 def kas_c_k1_for(k):
-    return (k // 32) // 4 // 2
+    # A scales are e8m0_shuffle'd in groups of 8 columns, so the stride rounds
+    # up: k=384 has 12 valid scale columns padded to 16, not truncated to 8.
+    return ((k // 32) + 7) // 8
 
 
 def kbs_c_k1_for(k):

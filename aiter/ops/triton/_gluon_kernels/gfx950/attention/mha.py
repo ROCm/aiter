@@ -32,7 +32,10 @@ from aiter.ops.triton.utils._triton.mha_kernel_utils import (
     _compute_fp8_scaling_factors,
 )
 from aiter.ops.triton.utils._triton.pid_preprocessing import remap_xcd
-from aiter.ops.triton.utils.core import AITER_TRITON_CONFIGS_PATH, load_config_json
+from aiter.ops.triton.utils.config_utils import (
+    AITER_TRITON_CONFIGS_PATH,
+    load_config_json,
+)
 
 
 @gluon.constexpr_function

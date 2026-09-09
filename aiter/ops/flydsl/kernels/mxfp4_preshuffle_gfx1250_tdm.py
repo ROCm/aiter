@@ -12,7 +12,6 @@ from flydsl.expr import arith, const_expr, range_constexpr, rocdl, tdm_ops
 from flydsl.expr.typing import Constexpr, T
 from flydsl.expr.typing import Vector as Vec
 
-from aiter.ops.flydsl.kernels import vector
 from aiter.utility.mx_types import MxDtypeInt as MxDtype
 
 from .gemm_common_gfx1250 import (
@@ -1190,11 +1189,7 @@ def launch_gemm_a8w4_tdm(
                                     for sub in range_constexpr(2):
                                         sub_wn = half * 2 + sub
                                         wn = mx_blk * WN_PER_MX_BLOCK + sub_wn
-                                        packed_i32 = vector.extract(
-                                            packed_v2i32,
-                                            static_position=[sub],
-                                            dynamic_position=[],
-                                        )
+                                        packed_i32 = fx.Vector(packed_v2i32)[sub]
                                         col_fp8 = (wnb + wn * 16 + kgrp * 8) // 2
                                         lds_store_b32(
                                             stC_idx,
