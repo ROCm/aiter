@@ -34,6 +34,59 @@ def _xor16_f32(value):
     return fx.Float32(rocdl.permlanex16(T.f32, src, src, sel_lo, sel_hi, False, False))
 
 
+def _concat_wmma_operand(chunks):
+    v01 = chunks[0].shuffle(chunks[1], list(range(8)))
+    v23 = chunks[2].shuffle(chunks[3], list(range(8)))
+    return v01.shuffle(v23, list(range(16)))
+
+
+def _concat_wmma_operand_k64(chunks):
+    return chunks[0].shuffle(chunks[1], list(range(8)))
+
+
+def _concat_ds_tr8_b64(chunks):
+    v01 = chunks[0].shuffle(chunks[1], list(range(4)))
+    v23 = chunks[2].shuffle(chunks[3], list(range(4)))
+    return v01.shuffle(v23, list(range(8)))
+
+
+def _rmem_i32(n, value):
+    fragment = fx.make_rmem_tensor(n, fx.Int32)
+    fragment.store(value)
+    return fragment
+
+
+def make_fp8_wmma_atom(k):
+    return fx.make_mma_atom(
+        fx.rocdl.WMMA(
+            16,
+            16,
+            k,
+            fx.Float8E4M3FN,
+            fx.Float32,
+        )
+    )
+
+
+def _pack_fp8x4(values, base):
+    packed = rocdl.cvt_pk_fp8_f32(
+        T.i32,
+        values[base],
+        values[base + 1],
+        fx.Int32(0),
+        0,
+    )
+    return fx.Int32(
+        rocdl.cvt_pk_fp8_f32(
+            T.i32,
+            values[base + 2],
+            values[base + 3],
+            packed,
+            1,
+        )
+    )
+
+
 def _dwordx4_iter(ptr):
     return fx.recast_iter(
         fx.PointerType.get(fx.Int32.ir_type, ptr.memspace, 16),

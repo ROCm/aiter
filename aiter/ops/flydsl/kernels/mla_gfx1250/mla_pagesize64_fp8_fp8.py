@@ -14,7 +14,15 @@ from flydsl.expr.typing import Vector as Vec
 
 from ..gemm_common_gfx1250 import make_lds_copy_ops
 from ..tensor_shim import buf_copy_atom, buf_load_scalar, ptr_buf_tensor, ptr_rsrc
-from .mla_common import _xor16_f32
+from .mla_common import (
+    _concat_ds_tr8_b64,
+    _concat_wmma_operand,
+    _concat_wmma_operand_k64,
+    _pack_fp8x4,
+    _rmem_i32,
+    _xor16_f32,
+    make_fp8_wmma_atom,
+)
 
 BLOCK_THREADS = 128
 WAVE_SIZE = 32
@@ -200,38 +208,8 @@ def launch_mla_pagesize64_fp8_fp8(
         rope_chunk = lane_id & 3
         rocdl.sched_barrier(0)
 
-        # ----------------------------------------------
-        def _concat_wmma_operand(chunks):
-            v01 = chunks[0].shuffle(chunks[1], list(range(8)))
-            v23 = chunks[2].shuffle(chunks[3], list(range(8)))
-            return v01.shuffle(v23, list(range(16)))
-
-        def _concat_wmma_operand_k64(chunks):
-            return chunks[0].shuffle(chunks[1], list(range(8)))
-
-        def _rmem_i32(n, value):
-            fragment = fx.make_rmem_tensor(n, fx.Int32)
-            fragment.store(value)
-            return fragment
-
-        qk_wmma_k128 = fx.make_mma_atom(
-            fx.rocdl.WMMA(
-                16,
-                16,
-                128,
-                fx.Float8E4M3FN,
-                fx.Float32,
-            )
-        )
-        qk_wmma_k64 = fx.make_mma_atom(
-            fx.rocdl.WMMA(
-                16,
-                16,
-                64,
-                fx.Float8E4M3FN,
-                fx.Float32,
-            )
-        )
+        qk_wmma_k128 = make_fp8_wmma_atom(128)
+        qk_wmma_k64 = make_fp8_wmma_atom(64)
         score_scale = softmax_scale * q_scale_t[0] * kv_scale_t[0]
         scale_log2 = score_scale * fx.Float32(LOG2E)
 
@@ -401,15 +379,7 @@ def launch_mla_pagesize64_fp8_fp8(
                             )
                         )
                     )
-                v01 = v_tr8_chunks[0].shuffle(
-                    v_tr8_chunks[1],
-                    list(range(4)),
-                )
-                v23 = v_tr8_chunks[2].shuffle(
-                    v_tr8_chunks[3],
-                    list(range(4)),
-                )
-                v_vector = v01.shuffle(v23, list(range(PV_ACC_DWORDS)))
+                v_vector = _concat_ds_tr8_b64(v_tr8_chunks)
                 sanitized_v = v_vector
                 if const_expr(mask_tail):
                     sanitized_v = Vec.from_elements(
@@ -700,21 +670,7 @@ def launch_mla_pagesize64_fp8_fp8(
             packed_probability_words = []
             for word in range_constexpr(PACKED_PROB_WORDS):
                 base = word * 4
-                packed = rocdl.cvt_pk_fp8_f32(
-                    T.i32,
-                    probabilities[base],
-                    probabilities[base + 1],
-                    fx.Int32(0),
-                    0,
-                )
-                packed = rocdl.cvt_pk_fp8_f32(
-                    T.i32,
-                    probabilities[base + 2],
-                    probabilities[base + 3],
-                    packed,
-                    1,
-                )
-                packed_probability_words.append(fx.Int32(packed))
+                packed_probability_words.append(_pack_fp8x4(probabilities, base))
 
             if future_page < page_end:
                 future_stage = (page_iteration + 3) % KV_NUM_STAGES

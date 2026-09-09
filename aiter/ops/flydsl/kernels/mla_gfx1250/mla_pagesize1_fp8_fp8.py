@@ -19,9 +19,15 @@ from ..mega_moe_gfx1250.tdm_gather_shim import (
 )
 from ..tensor_shim import buf_load_scalar, ptr_rsrc
 from .mla_common import (
+    _concat_ds_tr8_b64,
+    _concat_wmma_operand,
+    _concat_wmma_operand_k64,
     _dwordx4_iter,
     _instruction_prefetch,
+    _pack_fp8x4,
+    _rmem_i32,
     _xor16_f32,
+    make_fp8_wmma_atom,
     make_global_load_b128,
 )
 
@@ -195,37 +201,8 @@ def launch_mla_pagesize1_fp8_fp8(
             """First token index of the quarter this wave reads at `step`."""
             return (kv_start_quarter ^ const_expr(step)) * KV_QUARTER_TOKENS
 
-        def _concat_wmma_operand(chunks):
-            v01 = chunks[0].shuffle(chunks[1], list(range(8)))
-            v23 = chunks[2].shuffle(chunks[3], list(range(8)))
-            return v01.shuffle(v23, list(range(16)))
-
-        def _concat_wmma_operand_k64(chunks):
-            return chunks[0].shuffle(chunks[1], list(range(8)))
-
-        def _rmem_i32(n, value):
-            fragment = fx.make_rmem_tensor(n, fx.Int32)
-            fragment.store(value)
-            return fragment
-
-        qk_wmma_k128 = fx.make_mma_atom(
-            fx.rocdl.WMMA(
-                16,
-                16,
-                128,
-                fx.Float8E4M3FN,
-                fx.Float32,
-            )
-        )
-        qk_wmma_k64 = fx.make_mma_atom(
-            fx.rocdl.WMMA(
-                16,
-                16,
-                64,
-                fx.Float8E4M3FN,
-                fx.Float32,
-            )
-        )
+        qk_wmma_k128 = make_fp8_wmma_atom(128)
+        qk_wmma_k64 = make_fp8_wmma_atom(64)
 
         zero_indices = [fx.Int32(0) for _ in range_constexpr(KV_GATHER_ROWS_PER_WAVE)]
         # One descriptor covers the whole 576 B page row: nope then rope.
@@ -362,9 +339,7 @@ def launch_mla_pagesize1_fp8_fp8(
                         )
                     )
                 )
-            v01 = chunks[0].shuffle(chunks[1], list(range(4)))
-            v23 = chunks[2].shuffle(chunks[3], list(range(4)))
-            return v01.shuffle(v23, list(range(PV_ACC_DWORDS)))
+            return _concat_ds_tr8_b64(chunks)
 
         def accumulate_pending_pv(
             raw_slot,
@@ -583,21 +558,7 @@ def launch_mla_pagesize1_fp8_fp8(
             packed_words = []
             for word in range_constexpr(PACKED_PROB_WORDS):
                 base = word * 4
-                packed = rocdl.cvt_pk_fp8_f32(
-                    T.i32,
-                    probabilities[base],
-                    probabilities[base + 1],
-                    fx.Int32(0),
-                    0,
-                )
-                packed = rocdl.cvt_pk_fp8_f32(
-                    T.i32,
-                    probabilities[base + 2],
-                    probabilities[base + 3],
-                    packed,
-                    1,
-                )
-                packed_words.append(fx.Int32(packed))
+                packed_words.append(_pack_fp8x4(probabilities, base))
 
             packed_probability_words = Vec.from_elements(packed_words, fx.Int32)
 
