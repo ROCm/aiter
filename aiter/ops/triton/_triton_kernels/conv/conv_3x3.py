@@ -7,20 +7,21 @@ import triton.language as tl
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
 from aiter.ops.triton.utils.conv_config_utils import get_conv_config
 
-from ..activation import _gelu_tanh, _relu, _relu6
-from .helpers import CONV_AUTOTUNE_ENABLED
+from ..activation import _apply_activation_from_str
 
 
-def _get_config_nhwc(shape_key=None, M=None):
-    if CONV_AUTOTUNE_ENABLED:
-        return {}
-    return get_conv_config("CONV-3X3-NHWC", shape_key=shape_key, M=M)
+def _get_config_nhwc(shape_key=None, M=None, variants=()):
+    return get_conv_config("CONV-3X3-NHWC", shape_key=shape_key, M=M, variants=variants)
 
 
-def _get_config_cblocked(shape_key=None, M=None):
-    if CONV_AUTOTUNE_ENABLED:
-        return {}
-    return get_conv_config("CONV-3X3-CBLOCKED", shape_key=shape_key, M=M)
+def _get_config_cblocked(shape_key=None, M=None, variants=()):
+    return get_conv_config(
+        "CONV-3X3-CBLOCKED", shape_key=shape_key, M=M, variants=variants
+    )
+
+
+def _get_config_nchw(shape_key=None, M=None, variants=()):
+    return get_conv_config("CONV-3X3-NCHW", shape_key=shape_key, M=M, variants=variants)
 
 
 _conv2d_3x3_nhwc_kernel_repr = make_kernel_repr(
@@ -45,6 +46,20 @@ _conv2d_3x3_cblocked_kernel_repr = make_kernel_repr(
         "GROUP_SIZE_M",
         "HAS_BIAS",
         "ACTIVATION",
+    ],
+)
+
+
+_conv2d_3x3_nchw_kernel_repr = make_kernel_repr(
+    "_conv2d_3x3_nchw_kernel",
+    [
+        "BLOCK_M",
+        "BLOCK_N",
+        "BLOCK_K",
+        "GROUP_SIZE_M",
+        "HAS_BIAS",
+        "ACTIVATION",
+        "ROW_ALIGNED",
     ],
 )
 
@@ -156,15 +171,10 @@ def _conv2d_3x3_nhwc_kernel(
 
     # Epilogue: bias + activation + store
     if HAS_BIAS:
-        b = tl.load(BIAS + offs_n, mask=offs_n < K_out, other=0.0)
+        b = tl.load(BIAS + offs_n, mask=offs_n < K_out, other=0.0).to(tl.float32)
         acc += b[None, :]
 
-    if ACTIVATION == "relu":
-        acc = _relu(acc)
-    elif ACTIVATION == "relu6":
-        acc = _relu6(acc)
-    elif ACTIVATION == "gelu":
-        acc = _gelu_tanh(acc)
+    acc = _apply_activation_from_str(acc, ACTIVATION)
 
     y_ptrs = (
         Y
@@ -300,15 +310,10 @@ def _conv2d_3x3_cblocked_kernel(
 
     # Epilogue: bias + activation + store
     if HAS_BIAS:
-        b = tl.load(BIAS + offs_n, mask=offs_n < K_out, other=0.0)
+        b = tl.load(BIAS + offs_n, mask=offs_n < K_out, other=0.0).to(tl.float32)
         acc += b[None, :]
 
-    if ACTIVATION == "relu":
-        acc = _relu(acc)
-    elif ACTIVATION == "relu6":
-        acc = _relu6(acc)
-    elif ACTIVATION == "gelu":
-        acc = _gelu_tanh(acc)
+    acc = _apply_activation_from_str(acc, ACTIVATION)
 
     y_ptrs = (
         Y
@@ -320,116 +325,127 @@ def _conv2d_3x3_cblocked_kernel(
     tl.store(y_ptrs, acc, mask=(m_mask[:, None] & kout_mask[None, :]))
 
 
-# Autotune search spaces (used when AITER_TRITON_CONV_AUTOTUNE=1).
-AUTOTUNE_3x3_NHWC_CONFIGS = [
-    triton.Config(
-        {"BLOCK_M": 128, "BLOCK_N": 128, "BLOCK_K": 64, "GROUP_SIZE_M": 8},
-        num_warps=8,
-        num_stages=1,
-    ),
-    triton.Config(
-        {"BLOCK_M": 128, "BLOCK_N": 64, "BLOCK_K": 64, "GROUP_SIZE_M": 8},
-        num_warps=4,
-        num_stages=1,
-    ),
-    triton.Config(
-        {"BLOCK_M": 64, "BLOCK_N": 128, "BLOCK_K": 64, "GROUP_SIZE_M": 8},
-        num_warps=4,
-        num_stages=1,
-    ),
-    triton.Config(
-        {"BLOCK_M": 64, "BLOCK_N": 64, "BLOCK_K": 64, "GROUP_SIZE_M": 4},
-        num_warps=4,
-        num_stages=1,
-    ),
-    triton.Config(
-        {"BLOCK_M": 64, "BLOCK_N": 64, "BLOCK_K": 32, "GROUP_SIZE_M": 4},
-        num_warps=4,
-        num_stages=1,
-    ),
-    # gfx1100 (RDNA3): smaller tiles / fewer warps.
-    triton.Config(
-        {"BLOCK_M": 32, "BLOCK_N": 32, "BLOCK_K": 64, "GROUP_SIZE_M": 4},
-        num_warps=2,
-        num_stages=1,
-    ),
-    triton.Config(
-        {"BLOCK_M": 32, "BLOCK_N": 64, "BLOCK_K": 64, "GROUP_SIZE_M": 4},
-        num_warps=4,
-        num_stages=1,
-    ),
-    triton.Config(
-        {"BLOCK_M": 64, "BLOCK_N": 32, "BLOCK_K": 64, "GROUP_SIZE_M": 4},
-        num_warps=4,
-        num_stages=1,
-    ),
-    triton.Config(
-        {"BLOCK_M": 64, "BLOCK_N": 64, "BLOCK_K": 64, "GROUP_SIZE_M": 4},
-        num_warps=2,
-        num_stages=1,
-    ),
-]
+@triton.jit(repr=_conv2d_3x3_nchw_kernel_repr)
+def _conv2d_3x3_nchw_kernel(
+    X,
+    W,
+    BIAS,
+    Y,
+    N,
+    C: tl.constexpr,
+    H: tl.constexpr,
+    W_in: tl.constexpr,
+    K_out: tl.constexpr,
+    P: tl.constexpr,
+    Q: tl.constexpr,
+    C_pad: tl.constexpr,
+    stride_h,
+    stride_w,
+    pad_h,
+    pad_w,
+    dil_h,
+    dil_w,
+    M_total,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    GROUP_SIZE_M: tl.constexpr,
+    HAS_BIAS: tl.constexpr,
+    ACTIVATION: tl.constexpr,
+    ROW_ALIGNED: tl.constexpr,
+):
+    """3x3 convolution reading contiguous NCHW without an activation pack.
 
-AUTOTUNE_3x3_CBLOCKED_CONFIGS = [
-    triton.Config(
-        {"BLOCK_M": 64, "BLOCK_N": 128, "BLOCK_K": 64, "GROUP_SIZE_M": 8},
-        num_warps=4,
-        num_stages=1,
-    ),
-    triton.Config(
-        {"BLOCK_M": 64, "BLOCK_N": 64, "BLOCK_K": 64, "GROUP_SIZE_M": 4},
-        num_warps=4,
-        num_stages=1,
-    ),
-    triton.Config(
-        {"BLOCK_M": 64, "BLOCK_N": 64, "BLOCK_K": 128, "GROUP_SIZE_M": 4},
-        num_warps=4,
-        num_stages=1,
-    ),
-    triton.Config(
-        {"BLOCK_M": 128, "BLOCK_N": 64, "BLOCK_K": 64, "GROUP_SIZE_M": 8},
-        num_warps=4,
-        num_stages=1,
-    ),
-    triton.Config(
-        {"BLOCK_M": 128, "BLOCK_N": 128, "BLOCK_K": 64, "GROUP_SIZE_M": 8},
-        num_warps=8,
-        num_stages=1,
-    ),
-    # gfx1100 (RDNA3): smaller tiles / fewer warps. BLOCK_K kept <= Cb (64) to
-    # preserve coalesced channel loads (see DESIGN.md §5.3).
-    triton.Config(
-        {"BLOCK_M": 32, "BLOCK_N": 32, "BLOCK_K": 64, "GROUP_SIZE_M": 4},
-        num_warps=2,
-        num_stages=1,
-    ),
-    triton.Config(
-        {"BLOCK_M": 32, "BLOCK_N": 64, "BLOCK_K": 64, "GROUP_SIZE_M": 4},
-        num_warps=4,
-        num_stages=1,
-    ),
-    triton.Config(
-        {"BLOCK_M": 64, "BLOCK_N": 32, "BLOCK_K": 64, "GROUP_SIZE_M": 4},
-        num_warps=4,
-        num_stages=1,
-    ),
-    triton.Config(
-        {"BLOCK_M": 64, "BLOCK_N": 64, "BLOCK_K": 64, "GROUP_SIZE_M": 4},
-        num_warps=2,
-        num_stages=1,
-    ),
-]
+    The dot operands are transposed so the pixel dimension, rather than the
+    channel dimension, is contiguous across lanes. Weight padding is masked;
+    the input keeps its true C-sized batch stride and is never channel-padded.
+    """
+    stride_x_w: tl.constexpr = 1
+    stride_x_h: tl.constexpr = W_in
+    stride_x_c: tl.constexpr = H * W_in
+    stride_x_n: tl.constexpr = C * H * W_in
+    stride_w_c: tl.constexpr = 1
+    stride_w_rs: tl.constexpr = C_pad
+    stride_w_kout: tl.constexpr = 9 * C_pad
+    stride_y_q: tl.constexpr = 1
+    stride_y_p: tl.constexpr = Q
+    stride_y_k: tl.constexpr = P * Q
+    stride_y_n: tl.constexpr = K_out * P * Q
 
+    pid = tl.program_id(axis=0)
+    num_pid_m = tl.cdiv(M_total, BLOCK_M)
+    num_pid_n = tl.cdiv(K_out, BLOCK_N)
+    num_pid_in_group = GROUP_SIZE_M * num_pid_n
+    group_id = pid // num_pid_in_group
+    first_pid_m = group_id * GROUP_SIZE_M
+    group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
+    pid_m = first_pid_m + ((pid % num_pid_in_group) % group_size_m)
+    pid_n = (pid % num_pid_in_group) // group_size_m
 
-if CONV_AUTOTUNE_ENABLED:
-    _conv2d_3x3_nhwc_kernel = triton.autotune(
-        configs=AUTOTUNE_3x3_NHWC_CONFIGS,
-        key=["M_total", "K_out", "C_pad"],
-        cache_results=True,
-    )(_conv2d_3x3_nhwc_kernel)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_k = tl.arange(0, BLOCK_K)
+    kout_mask = offs_n < K_out
 
-    _conv2d_3x3_cblocked_kernel = triton.autotune(
-        configs=AUTOTUNE_3x3_CBLOCKED_CONFIGS,
-        key=["M_total", "K_out", "C_pad"],
-        cache_results=True,
-    )(_conv2d_3x3_cblocked_kernel)
+    if ROW_ALIGNED:
+        row = (pid_m * BLOCK_M) // Q
+        q_idx = (pid_m * BLOCK_M - row * Q) + tl.arange(0, BLOCK_M)
+        p_idx = (row % P) + tl.zeros((BLOCK_M,), dtype=tl.int32)
+        n_idx = (row // P) + tl.zeros((BLOCK_M,), dtype=tl.int32)
+        m_mask = tl.full((BLOCK_M,), 1, dtype=tl.int1)
+    else:
+        offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+        m_mask = offs_m < M_total
+        n_idx = offs_m // (P * Q)
+        pq = offs_m % (P * Q)
+        p_idx = pq // Q
+        q_idx = pq % Q
+    n_valid = n_idx < N
+
+    base_ih = p_idx * stride_h - pad_h
+    base_iw = q_idx * stride_w - pad_w
+    stride_x_dh = dil_h * stride_x_h
+    stride_x_dw = dil_w * stride_x_w
+    x_base = X + n_idx * stride_x_n + base_ih * stride_x_h + base_iw
+    w_base = W + offs_n * stride_w_kout
+    acc = tl.zeros((BLOCK_N, BLOCK_M), dtype=tl.float32)
+
+    for r in tl.static_range(3):
+        ih = base_ih + r * dil_h
+        valid_ih = n_valid & (ih >= 0) & (ih < H)
+        for s in tl.static_range(3):
+            rs_idx = r * 3 + s
+            iw = base_iw + s * dil_w
+            spatial_valid = valid_ih & (iw >= 0) & (iw < W_in)
+            x_tap = x_base + r * stride_x_dh + s * stride_x_dw
+
+            for k0 in range(0, C_pad, BLOCK_K):
+                k_offs = k0 + offs_k
+                k_mask = k_offs < C
+                x_ptrs = x_tap[None, :] + k_offs[:, None] * stride_x_c
+                w_ptrs = (
+                    w_base[:, None]
+                    + rs_idx * stride_w_rs
+                    + k_offs[None, :] * stride_w_c
+                )
+                x_tile = tl.load(
+                    x_ptrs, mask=spatial_valid[None, :] & k_mask[:, None], other=0.0
+                )
+                w_tile = tl.load(
+                    w_ptrs, mask=kout_mask[:, None] & k_mask[None, :], other=0.0
+                )
+                acc = tl.dot(w_tile, x_tile, acc=acc)
+
+    if HAS_BIAS:
+        b = tl.load(BIAS + offs_n, mask=kout_mask, other=0.0).to(tl.float32)
+        acc += b[:, None]
+
+    acc = _apply_activation_from_str(acc, ACTIVATION)
+
+    y_ptrs = (
+        Y
+        + n_idx[None, :] * stride_y_n
+        + offs_n[:, None] * stride_y_k
+        + p_idx[None, :] * stride_y_p
+        + q_idx[None, :] * stride_y_q
+    )
+    tl.store(y_ptrs, acc, mask=(kout_mask[:, None] & m_mask[None, :]))

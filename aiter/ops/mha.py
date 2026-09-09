@@ -7,7 +7,13 @@ from typing import Any
 import torch
 from torch import Generator, Tensor
 
-from ..jit.core import AITER_META_DIR, CK_DIR, ENABLE_CK, compile_ops
+from ..jit.core import (
+    AITER_META_DIR,
+    CK_DIR,
+    ENABLE_CK,
+    compile_ops,
+    is_experimental_enabled,
+)
 from ..jit.utils.chip_info import get_cu_num, get_gfx
 from ..jit.utils.mha_recipes import (
     compose_mha_fwd_variant_suffix_and_filter,
@@ -2824,6 +2830,35 @@ def flash_attn_func(
             The output of softmax (possibly with different scaling). It also encodes the dropout
             pattern (negative means that location was dropped, nonnegative means it was kept).
     """
+    # FlyDSL path returns result if supported, None otherwise. window_size[2] (sink
+    # size) is unsupported: the FlyDSL gate rejects it, and this screen keeps it off
+    # the path so a sink-token request is never silently dropped.
+    if (
+        cu_seqlens_q is None
+        and cu_seqlens_kv is None
+        and num_splits <= 1
+        and (len(window_size) < 3 or window_size[2] == 0)
+    ):
+        from .flydsl.fmha_kernels import flydsl_flash_attn_batch_func
+
+        _flydsl_result = flydsl_flash_attn_batch_func(
+            q,
+            k,
+            v,
+            softmax_scale=softmax_scale,
+            causal=causal,
+            return_lse=return_lse,
+            dropout_p=dropout_p,
+            window_size=window_size,
+            bias=bias,
+            alibi_slopes=alibi_slopes,
+            deterministic=deterministic,
+            return_attn_probs=return_attn_probs,
+            sink=sink_ptr,
+        )
+        if _flydsl_result is not None:
+            return _flydsl_result
+
     if not ENABLE_CK:
         from .triton.attention.mha import flash_attn_func as flash_attn_func_triton
 
@@ -3651,6 +3686,10 @@ def flash_attn_varlen_func(
         nhead_k = k.shape[-2]
         if hdim_q not in (64, 128) or hdim_v != hdim_q:
             return False
+        # Experimental FlyDSL m32x8 kernel owns the 128/128 path when enabled;
+        # yield so it reaches flydsl_flash_attn_varlen_func below.
+        if hdim_q == 128 and is_experimental_enabled():
+            return False
         if nhead_q % nhead_k != 0:
             return False
         if not causal or dropout_p != 0.0 or logits_soft_cap != 0.0:
@@ -3698,32 +3737,35 @@ def flash_attn_varlen_func(
             sink_ptr,
         )
 
-    # FlyDSL path returns result if supported, None otherwise.
-    from .flydsl.fmha_kernels import flydsl_flash_attn_varlen_func
+    # FlyDSL path returns result if supported, None otherwise. window_size[2] (sink
+    # size) is unsupported: the FlyDSL gate rejects it, and this screen keeps it off
+    # the path so a sink-token request is never silently dropped.
+    if len(window_size) < 3 or window_size[2] == 0:
+        from .flydsl.fmha_kernels import flydsl_flash_attn_varlen_func
 
-    _flydsl_result = flydsl_flash_attn_varlen_func(
-        q,
-        k,
-        v,
-        cu_seqlens_q,
-        cu_seqlens_k,
-        max_seqlen_q,
-        max_seqlen_k,
-        softmax_scale=softmax_scale,
-        causal=causal,
-        return_lse=return_lse,
-        dropout_p=dropout_p,
-        window_size=window_size,
-        bias=bias,
-        alibi_slopes=alibi_slopes,
-        deterministic=deterministic,
-        return_attn_probs=return_attn_probs,
-        block_table=block_table,
-        out=out,
-        sink=sink_ptr,
-    )
-    if _flydsl_result is not None:
-        return _flydsl_result
+        _flydsl_result = flydsl_flash_attn_varlen_func(
+            q,
+            k,
+            v,
+            cu_seqlens_q,
+            cu_seqlens_k,
+            max_seqlen_q,
+            max_seqlen_k,
+            softmax_scale=softmax_scale,
+            causal=causal,
+            return_lse=return_lse,
+            dropout_p=dropout_p,
+            window_size=window_size,
+            bias=bias,
+            alibi_slopes=alibi_slopes,
+            deterministic=deterministic,
+            return_attn_probs=return_attn_probs,
+            block_table=block_table,
+            out=out,
+            sink=sink_ptr,
+        )
+        if _flydsl_result is not None:
+            return _flydsl_result
 
     if not ENABLE_CK:
         from .triton.attention.mha import (

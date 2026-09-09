@@ -236,12 +236,6 @@ def test_backend_matches_reference(cu, with_is, backend):
     if not torch.cuda.is_available():
         pytest.skip("needs GPU")
 
-    if backend == "flydsl":
-        from aiter.ops.flydsl.causal_conv1d_flydsl import is_flydsl_available
-
-        if not is_flydsl_available():
-            pytest.skip("flydsl not available")
-
     x, w, b, cs, ci, hi, qsl = make_inputs(cu, with_initial_state=with_is)
     ref_q, ref_k, ref_v, ref_cs = torch_reference(
         x, w, b, cs.clone(), qsl, ci, hi, K_DIM, V_DIM
@@ -278,11 +272,6 @@ def test_backend_matches_reference(cu, with_is, backend):
 def test_backend_accepts_causal_conv_prefill_metadata(backend):
     if not torch.cuda.is_available():
         pytest.skip("needs GPU")
-    if backend == "flydsl":
-        from aiter.ops.flydsl.causal_conv1d_flydsl import is_flydsl_available
-
-        if not is_flydsl_available():
-            pytest.skip("flydsl not available")
 
     from aiter.ops.prefill_batch_metadata import (
         build_causal_conv_prefill_metadata,
@@ -479,11 +468,7 @@ def qsl_to(qsl):
 
 if __name__ == "__main__":
     torch.manual_seed(0)
-    from aiter.ops.flydsl.causal_conv1d_flydsl import is_flydsl_available
-
-    backends = ["hip", "triton2d", "triton"] + (
-        ["flydsl"] if is_flydsl_available() else []
-    )
+    backends = ["hip", "triton2d", "triton", "flydsl"]
     for backend in backends:
         print(f"\n=== backend={backend} ===")
         for cu in SHAPES:

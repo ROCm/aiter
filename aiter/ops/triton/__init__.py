@@ -3,6 +3,7 @@
 
 import importlib.util
 import sys
+import warnings
 from types import SimpleNamespace
 
 # Try to import quant module
@@ -52,6 +53,20 @@ These following help implement backward-compatibility
 for modules that were reorganized so that external repos (like sglang for example),
 which depend on the old module names, can still import it the old "way" of importing.
 """
+# Paths that only exist for backward compatibility and are on their way out.
+_DEPRECATED_COMPAT_PATHS = ("gluon.gemm_a8w8", "gluon.gemm_a8w8_blockscale")
+
+
+def _warn_if_deprecated(name, new_path):
+    if name in _DEPRECATED_COMPAT_PATHS:
+        warnings.warn(
+            f"aiter.ops.triton.{name} has moved to {new_path}; this path "
+            "will be removed in a future release.",
+            DeprecationWarning,
+            stacklevel=3,
+        )
+
+
 # This is a mapping of the old module names to the new module names
 _BACKWARD_COMPAT_MAP = {
     # Batched GEMM modules (gemm/batched/)
@@ -71,6 +86,8 @@ _BACKWARD_COMPAT_MAP = {
     "gemm_a8w8_blockscale": "gemm.basic.gemm_a8w8_blockscale",
     "gemm_a8w8_per_token_scale": "gemm.basic.gemm_a8w8_per_token_scale",
     "gemm_a8w8": "gemm.basic.gemm_a8w8",
+    "gluon.gemm_a8w8": "gemm.basic.gemm_a8w8",
+    "gluon.gemm_a8w8_blockscale": "gemm.basic.gemm_a8w8_blockscale",
     "gemm_a8wfp4": "gemm.basic.gemm_a8wfp4",
     "gemm_afp4wfp4_pre_quant_atomic": "gemm.basic.gemm_afp4wfp4_pre_quant_atomic",
     "gemm_afp4wfp4": "gemm.basic.gemm_afp4wfp4",
@@ -123,11 +140,11 @@ _BACKWARD_COMPAT_MAP = {
     "fused_qkv_split_qk_rope": "rope.fused_qkv_split_qk_rope",
     # Utils modules (utils/)
     "common_utils": "utils.common_utils",
-    "core": "utils.core",
+    "config_utils": "utils.config_utils",
     "device_info": "utils.device_info",
     "gmm_common": "utils.gmm_common",
     "logger": "utils.logger",
-    "mha_kernel_utils": "utils.mha_kernel_utils",
+    "mha_kernel_utils": "utils._triton.mha_kernel_utils",
     "moe_common": "utils.moe_common",
     "types": "utils.types",
     # Quant modules (quant/)
@@ -148,6 +165,7 @@ def __getattr__(name):
     """
     if name in _BACKWARD_COMPAT_MAP:
         new_path = f"aiter.ops.triton.{_BACKWARD_COMPAT_MAP[name]}"
+        _warn_if_deprecated(name, new_path)
         module = importlib.import_module(new_path)
         sys.modules[f"aiter.ops.triton.{name}"] = module
         return module
@@ -161,10 +179,11 @@ def _backward_compat_find_spec(fullname, path, target=None):
      from aiter.ops.triton.gemm_afp4wfp4 import gemm_afp4wfp4
      import aiter.ops.triton.gemm_afp4wfp4
     """
-    if fullname.startswith("aiter.ops.triton.") and fullname.count(".") == 3:
-        name = fullname.split(".")[-1]
+    if fullname.startswith("aiter.ops.triton."):
+        name = fullname[len("aiter.ops.triton.") :]
         if name in _BACKWARD_COMPAT_MAP:
             new_path = f"aiter.ops.triton.{_BACKWARD_COMPAT_MAP[name]}"
+            _warn_if_deprecated(name, new_path)
             try:
                 sys.modules[fullname] = importlib.import_module(new_path)
                 return importlib.util.find_spec(new_path)

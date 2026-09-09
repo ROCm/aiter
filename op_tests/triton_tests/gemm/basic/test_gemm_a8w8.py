@@ -1,18 +1,17 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
+import functools
+import importlib
+import sys
+
 import pytest
 import torch
 import torch.nn.functional as F
 
 from aiter.ops.shuffle import shuffle_weight
 from aiter.ops.triton.gemm.basic.gemm_a8w8 import gemm_a8w8 as triton_gemm_a8w8
-from aiter.ops.triton.gluon.gemm_a8w8 import (
-    gemm_a8w8 as gluon_gemm_a8w8,
-)
-from aiter.ops.triton.gluon.gemm_a8w8 import (
-    gemm_a8w8_preshuffle as gluon_gemm_a8w8_preshuffle,
-)
+from aiter.ops.triton.gemm.basic.gemm_a8w8 import gemm_a8w8_preshuffle
 from aiter.ops.triton.utils._triton import arch_info
 from aiter.ops.triton.utils.gemm_config_utils import (
     compute_splitk_params,
@@ -168,7 +167,7 @@ def test_gemm_fp8(in_dtype, m, n, k, impl: str):
 
     if impl in ["gluon", "gluon_shuffle"] and DEVICE_ARCH != "gfx950":
         pytest.skip(
-            "Gluon implementation is not supported on this device (requires CDNA4)."
+            "Gluon implementation is not supported on this device (requires gfx950)."
         )
 
     if impl == "gluon_shuffle" and (n % 16 != 0 or k % 32 != 0):
@@ -193,9 +192,9 @@ def test_gemm_fp8(in_dtype, m, n, k, impl: str):
     if impl == "triton":
         impl = triton_gemm_a8w8
     elif impl == "gluon":
-        impl = gluon_gemm_a8w8
+        impl = functools.partial(triton_gemm_a8w8, backend="gluon")
     elif impl == "gluon_shuffle":
-        impl = gluon_gemm_a8w8_preshuffle
+        impl = gemm_a8w8_preshuffle
     else:
         raise ValueError(f"Unknown implementation: {impl}")
     b = run_triton(x, weight_triton, x_scale, w_scale, bias, out_dtype, y, impl)
@@ -229,7 +228,7 @@ def test_gemm_int8(out_dtype, m, n, k, layout, output, impl: str):
 
     if impl in ["gluon", "gluon_shuffle"] and DEVICE_ARCH != "gfx950":
         pytest.skip(
-            "Gluon implementation is not supported on this device (requires CDNA4)."
+            "Gluon implementation is not supported on this device (requires gfx950)."
         )
 
     if impl == "gluon_shuffle" and (n % 16 != 0 or k % 32 != 0):
@@ -254,9 +253,9 @@ def test_gemm_int8(out_dtype, m, n, k, layout, output, impl: str):
     if impl == "triton":
         impl = triton_gemm_a8w8
     elif impl == "gluon":
-        impl = gluon_gemm_a8w8
+        impl = functools.partial(triton_gemm_a8w8, backend="gluon")
     elif impl == "gluon_shuffle":
-        impl = gluon_gemm_a8w8_preshuffle
+        impl = gemm_a8w8_preshuffle
     else:
         raise ValueError(f"Unknown implementation: {impl}")
     b = run_triton(x, weight_triton, x_scale, w_scale, bias, out_dtype, y, impl)
@@ -377,3 +376,14 @@ def test_gemm_splitk_skip_reduce(in_dtype, out_dtype, m, n, k, num_ksplit):
 
     b = y_pp.sum(dim=0).to(out_dtype)
     torch.testing.assert_close(a, b, atol=0.02, rtol=1e-2)
+
+
+def test_legacy_gluon_import_path_warns():
+    """The pre-move path still resolves here, but tells callers to move on."""
+    legacy = "aiter.ops.triton.gluon.gemm_a8w8"
+    sys.modules.pop(legacy, None)
+
+    with pytest.warns(DeprecationWarning, match="has moved to"):
+        mod = importlib.import_module(legacy)
+
+    assert mod.gemm_a8w8.__module__ == "aiter.ops.triton.gemm.basic.gemm_a8w8"

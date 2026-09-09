@@ -625,6 +625,21 @@ def test_heterogeneous_moe_matches_precision_oracles(
         assert torch.equal(
             forced, forced_repeat
         ), f"forced-reduce output changed on repeat {repeat + 1}"
+
+    # A caller-provided buffer is the tensor returned, and holds the result.
+    out_buf = torch.full_like(forced, -7.0)
+    forced_into_buf = fused_moe(
+        context["hidden"],
+        weights.routed_w1,
+        weights.routed_w2,
+        context["all_weight"],
+        context["all_ids"],
+        **context["hetero_kwargs"],
+        output=out_buf,
+    )
+    assert forced_into_buf is out_buf, "output buffer was not the tensor returned"
+    assert torch.equal(forced, out_buf), "output buffer holds a different result"
+
     high_precision, routed_high, shared_high = _torch_heterogeneous_reference(
         profile, weights, context
     )
@@ -906,7 +921,6 @@ def _mock_dsv4_i384_fhmoe_metadata(monkeypatch: pytest.MonkeyPatch):
     fused_moe_module = importlib.import_module("aiter.fused_moe")
     monkeypatch.setattr(fused_moe_module, "get_cu_num", lambda: 256)
     monkeypatch.setattr(fused_moe_module, "get_gfx_runtime", lambda: "gfx950")
-    monkeypatch.setattr(fused_moe_module, "is_flydsl_available", lambda: True)
     monkeypatch.delenv("AITER_BYPASS_TUNE_CONFIG", raising=False)
     fused_moe_module.get_2stage_cfgs.cache_clear()
     fused_moe_module.cfg_2stages_by_file.clear()
@@ -1099,7 +1113,6 @@ def test_dsv4_i384_fhmoe_uses_dedicated_config(
     config_path = Path(__file__).resolve().parents[1] / "aiter/configs/tuned_fhmoe.csv"
     monkeypatch.setattr(fused_moe_module, "get_cu_num", lambda: 256)
     monkeypatch.setattr(fused_moe_module, "get_gfx_runtime", lambda: "gfx950")
-    monkeypatch.setattr(fused_moe_module, "is_flydsl_available", lambda: True)
     fused_moe_module.get_2stage_cfgs.cache_clear()
     fused_moe_module.cfg_2stages_by_file.clear()
 
@@ -1153,7 +1166,6 @@ def test_dsv4_i384_fhmoe_config_requires_exact_bucket(
 
     monkeypatch.setattr(fused_moe_module, "get_cu_num", lambda: 256)
     monkeypatch.setattr(fused_moe_module, "get_gfx_runtime", lambda: "gfx950")
-    monkeypatch.setattr(fused_moe_module, "is_flydsl_available", lambda: True)
     monkeypatch.setenv("AITER_ONLINE_TUNE", "1")
     fused_moe_module.get_2stage_cfgs.cache_clear()
     fused_moe_module.cfg_2stages_by_file.clear()

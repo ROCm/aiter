@@ -7,14 +7,11 @@ import triton.language as tl
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
 from aiter.ops.triton.utils.conv_config_utils import get_conv_config
 
-from ..activation import _gelu_tanh, _relu, _relu6
-from .helpers import CONV_AUTOTUNE_ENABLED
+from ..activation import _apply_activation_from_str
 
 
-def _get_config(shape_key=None, M=None):
-    if CONV_AUTOTUNE_ENABLED:
-        return {}
-    return get_conv_config("CONV-1X1", shape_key=shape_key, M=M)
+def _get_config(shape_key=None, M=None, variants=()):
+    return get_conv_config("CONV-1X1", shape_key=shape_key, M=M, variants=variants)
 
 
 _conv2d_1x1_kernel_repr = make_kernel_repr(
@@ -148,16 +145,11 @@ def _conv2d_1x1_kernel(
 
     # Bias
     if HAS_BIAS:
-        b = tl.load(BIAS + offs_n, mask=kout_mask, other=0.0)
+        b = tl.load(BIAS + offs_n, mask=kout_mask, other=0.0).to(tl.float32)
         acc += b[None, :]
 
     # Activation
-    if ACTIVATION == "relu":
-        acc = _relu(acc)
-    elif ACTIVATION == "relu6":
-        acc = _relu6(acc)
-    elif ACTIVATION == "gelu":
-        acc = _gelu_tanh(acc)
+    acc = _apply_activation_from_str(acc, ACTIVATION)
 
     # Store output: Y[n, k, p, q]
     y_ptrs = (
@@ -168,77 +160,3 @@ def _conv2d_1x1_kernel(
         + q_idx * stride_y_q
     )
     tl.store(y_ptrs, acc, mask=(m_mask[:, None] & kout_mask[None, :]))
-
-
-# Autotune search space (used when AITER_TRITON_CONV_AUTOTUNE=1).
-AUTOTUNE_1x1_CONFIGS = [
-    triton.Config(
-        {"BLOCK_M": 64, "BLOCK_N": 256, "BLOCK_K": 64, "GROUP_SIZE_M": 8},
-        num_warps=8,
-        num_stages=1,
-    ),
-    triton.Config(
-        {"BLOCK_M": 128, "BLOCK_N": 128, "BLOCK_K": 32, "GROUP_SIZE_M": 4},
-        num_warps=8,
-        num_stages=1,
-    ),
-    triton.Config(
-        {"BLOCK_M": 64, "BLOCK_N": 64, "BLOCK_K": 32, "GROUP_SIZE_M": 4},
-        num_warps=4,
-        num_stages=1,
-    ),
-    triton.Config(
-        {"BLOCK_M": 128, "BLOCK_N": 128, "BLOCK_K": 64, "GROUP_SIZE_M": 8},
-        num_warps=8,
-        num_stages=1,
-    ),
-    triton.Config(
-        {"BLOCK_M": 64, "BLOCK_N": 64, "BLOCK_K": 64, "GROUP_SIZE_M": 4},
-        num_warps=4,
-        num_stages=1,
-    ),
-    triton.Config(
-        {"BLOCK_M": 128, "BLOCK_N": 256, "BLOCK_K": 64, "GROUP_SIZE_M": 8},
-        num_warps=8,
-        num_stages=1,
-    ),
-    triton.Config(
-        {"BLOCK_M": 64, "BLOCK_N": 128, "BLOCK_K": 64, "GROUP_SIZE_M": 8},
-        num_warps=4,
-        num_stages=1,
-    ),
-    # gfx1100 (RDNA3): smaller tiles / fewer warps for the many small conv shapes.
-    triton.Config(
-        {"BLOCK_M": 32, "BLOCK_N": 32, "BLOCK_K": 64, "GROUP_SIZE_M": 4},
-        num_warps=2,
-        num_stages=1,
-    ),
-    triton.Config(
-        {"BLOCK_M": 32, "BLOCK_N": 64, "BLOCK_K": 64, "GROUP_SIZE_M": 4},
-        num_warps=4,
-        num_stages=1,
-    ),
-    triton.Config(
-        {"BLOCK_M": 64, "BLOCK_N": 32, "BLOCK_K": 64, "GROUP_SIZE_M": 4},
-        num_warps=4,
-        num_stages=1,
-    ),
-    triton.Config(
-        {"BLOCK_M": 64, "BLOCK_N": 64, "BLOCK_K": 64, "GROUP_SIZE_M": 4},
-        num_warps=2,
-        num_stages=1,
-    ),
-    triton.Config(
-        {"BLOCK_M": 32, "BLOCK_N": 32, "BLOCK_K": 32, "GROUP_SIZE_M": 4},
-        num_warps=2,
-        num_stages=1,
-    ),
-]
-
-
-if CONV_AUTOTUNE_ENABLED:
-    _conv2d_1x1_kernel = triton.autotune(
-        configs=AUTOTUNE_1x1_CONFIGS,
-        key=["M_total", "K_out", "C"],
-        cache_results=True,
-    )(_conv2d_1x1_kernel)
