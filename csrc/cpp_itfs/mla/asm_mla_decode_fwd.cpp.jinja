@@ -90,6 +90,7 @@ void {{func_name}}(void* Q,                 //   [num_seqs, num_heads, head_size
                     int output_stride_1,
                     void* stream
                     ){
+    require_gfx1250_asm_or_throw("{{kernel_name}}"); // gate A0 before load
     static AiterAsmKernelFast impl("{{kernel_name}}", hsaco);
     constexpr int page_size = {{page_size}};
     uint32_t log2_page = (uint32_t)log2f(page_size);

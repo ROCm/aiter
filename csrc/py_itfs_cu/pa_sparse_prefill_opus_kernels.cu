@@ -374,10 +374,15 @@ constexpr const char* kGfx1250A16W16Co =
     "mla_v4_opus/mla_prefill_a16w16_16mx4_64nx1.co";
 constexpr const char* kGfx1250A8W8Co = "mla_v4_opus/mla_prefill_a8w8_16mx4_64nx1.co";
 
-// aiter's prebuilt-code-object loader. Its name comes from the hand-written
-// assembly kernels it was introduced for; these code objects are compiler
-// output, but the load-and-launch-by-symbol path is the same.
-using PrebuiltKernel = AiterAsmKernel;
+// OPUS-managed prebuilt code objects: reuse AiterAsmKernel's file loader but opt
+// OUT of the gfx1250 B0-only asm gate (arch coverage is the OPUS layer's job).
+struct PrebuiltKernel : AiterAsmKernel
+{
+    PrebuiltKernel(const char* kernel_name, const char* hsaco_path)
+        : AiterAsmKernel(kernel_name, hsaco_path, AiterAsmKernel::SkipGfx1250Gate{})
+    {
+    }
+};
 
 // Largest cluster width that evenly divides grid.y. A cluster that does not
 // divide grid.y would gather through a masked peer set and silently corrupt the

@@ -13,6 +13,7 @@ import triton.language as tl
 import aiter
 from aiter import dtypes
 from aiter.jit.core import is_experimental_enabled
+from aiter.jit.utils.asm_guard import require_gfx1250_asm
 from aiter.jit.utils.chip_info import get_cu_num, get_gfx
 from aiter.ops.attention import get_mla_decode_fwd_max_splits
 
@@ -548,6 +549,7 @@ def mla_decode_fwd(
     cp_rank=0,
     causal=True,
 ):
+    require_gfx1250_asm("mla_decode_stage1_asm_fwd")
     device = q.device
     assert logit_cap <= 0, f"{logit_cap=} is not support yet"
     if kv_buffer.dtype != torch.uint8:
@@ -1161,6 +1163,7 @@ def mla_prefill_fwd(
     logit_cap=0.0,
     num_kv_splits=None,  # for experts only!!!
 ):
+    require_gfx1250_asm("mla_prefill_asm_fwd")
     device = q.device
     _num_page, _page_size, _nhead_kv, qk_head_dim = kv_buffer.shape
     assert logit_cap <= 0, f"{logit_cap=} is not support yet"
@@ -1215,6 +1218,7 @@ def mla_prefill_ps_fwd(
     k_scale: torch.Tensor | None = None,
     v_scale: torch.Tensor | None = None,
 ) -> None:
+    require_gfx1250_asm("mla_prefill_ps_asm_fwd")
     device = Q.device
     total_s, nhead, v_head_dim = output.shape
     if softmax_scale is None:
@@ -1298,7 +1302,6 @@ def _mla_prefill_reduce_kernel(
 
     All heads are uniformly split and reduced together.
     """
-
     group_id = tl.program_id(0)
     head_id = tl.program_id(1)
     tok_offset = tl.program_id(2)  # q_tile
@@ -1651,6 +1654,7 @@ def mla_decode_fwd_v4_nm(
       value is shared across ALL q_token positions.
 
     """
+    require_gfx1250_asm("mla_decode_v4_asm")
     num_seqs = qo_indptr.shape[0] - 1
     num_heads = q.size(1)
     v_head_dim = output.size(2)

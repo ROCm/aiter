@@ -183,6 +183,56 @@ extern "C" void __hipRegisterFunction(void* module,
                                       void* wSize) noexcept;
 } // namespace aiter_detail
 
+// ---- gfx1250 asm B0-only gate ------------------------------------------------
+// Gates the shipped asm code objects only; the OPUS .co path is not gated.
+
+// Soft (non-aborting): false only when the device is confirmed gfx1250 A0
+// (asicRevision 0). Undeterminable arch -> true (the load-site gate is the hard
+// stop). Callers also use it to pick a fallback path (e.g. fmha_v3_bwd -> CK).
+static inline bool is_gfx1250_asm_supported()
+{
+    int dev;
+    if(hipGetDevice(&dev) != hipSuccess)
+        return true; // cannot tell -> do not over-block
+    hipDeviceProp_t prop;
+    if(hipGetDeviceProperties(&prop, dev) != hipSuccess)
+        return true;
+    std::string arch  = prop.gcnArchName;
+    size_t colon_pos  = arch.find(':');
+    if(colon_pos != std::string::npos)
+        arch = arch.substr(0, colon_pos);
+    if(arch != "gfx1250")
+        return true;
+    return prop.asicRevision >= 1; // gfx1250: shipped asm is B0+ only
+}
+
+// Kernels verified to ALSO run on gfx1250 A0, matched by EXACT name. Empty
+// today (all shipped gfx1250 asm is B0-only); add an exact kernel name to allow.
+static inline bool is_gfx1250_asm_a0_ok(const char* kernel_name)
+{
+    if(kernel_name == nullptr)
+        return false;
+    static const char* const kA0AllowList[] = {
+        nullptr, // sentinel — keep last; add "exact_kernel_name" entries above
+    };
+    const std::string_view name{kernel_name};
+    for(const char* const* p = kA0AllowList; *p != nullptr; ++p)
+        if(name == *p)
+            return true;
+    return false;
+}
+
+// Hard stop for asm load sites: THROWS (never std::abort()) on gfx1250 A0 so
+// pybind/ctypes callers get a Python RuntimeError, not a SIGABRT.
+[[maybe_unused]] static inline void require_gfx1250_asm_or_throw(const char* kernel_name)
+{
+    if(is_gfx1250_asm_supported() || is_gfx1250_asm_a0_ok(kernel_name))
+        return;
+    throw std::runtime_error(
+        std::string(kernel_name ? kernel_name : "<unknown>") +
+        " asm code object targets gfx1250 B0+; running device is gfx1250 A0.");
+}
+
 namespace {
 
 class AiterAsmKernelFast
@@ -421,7 +471,18 @@ class AiterAsmKernel : private AiterAsmKernelFast
     }
 
     public:
+    // Opt-out tag for OPUS-managed .co that reuse this loader but are not gated.
+    struct SkipGfx1250Gate
+    {
+    };
+
     AiterAsmKernel(const char* kernel_name, const char* hsaco_path)
+    {
+        require_gfx1250_asm_or_throw(kernel_name);
+        init(kernel_name, load_hsaco_file(kernel_name, hsaco_path));
+    };
+
+    AiterAsmKernel(const char* kernel_name, const char* hsaco_path, SkipGfx1250Gate)
     {
         init(kernel_name, load_hsaco_file(kernel_name, hsaco_path));
     };
@@ -464,6 +525,16 @@ static inline bool is_fp8_ocp_arch()
         if(arch == a)
             return true;
     return false;
+}
+
+// Silicon stepping of the current device: 0=A0, 1=B0, 2=C0, ...
+static inline int get_asic_revision()
+{
+    int dev;
+    hipDeviceProp_t dev_prop;
+    HIP_CALL(hipGetDevice(&dev));
+    HIP_CALL(hipGetDeviceProperties(&dev_prop, dev));
+    return dev_prop.asicRevision;
 }
 
 static uint32_t get_num_cu_func()
