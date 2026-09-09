@@ -451,13 +451,16 @@ def get_worker_count_for(work_count: int) -> int:
 
 
 def configure_worker_subprocesses() -> None:
-    """Force compiler descendants of a process-pool worker to one job."""
+    """Set one-job AITER/CMake/Make budgets and numerical runtime env hints.
+
+    AITER passes its Ninja budget explicitly via -j; Ninja does not read
+    NINJAFLAGS. These settings do not constrain arbitrary Ninja invocations.
+    """
     os.environ[_WORKER_ENV] = "1"
     os.environ.update(
         {
             "CMAKE_BUILD_PARALLEL_LEVEL": "1",
             "MAKEFLAGS": "-j1",
-            "NINJAFLAGS": "-j1",
             "OMP_NUM_THREADS": "1",
             "OPENBLAS_NUM_THREADS": "1",
             "MKL_NUM_THREADS": "1",

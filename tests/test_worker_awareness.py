@@ -2,6 +2,7 @@ import ast
 import inspect
 import os
 import pathlib
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -432,12 +433,13 @@ class WorkerAwarenessTest(unittest.TestCase):
             self.assertEqual(get_worker_count(), 4)
             self.assertNotIn("AITER_MAX_JOBS", os.environ)
 
-    def test_worker_descendants_are_forced_to_one_job(self):
+    def test_worker_configures_supported_build_controls(self):
         with patch.dict(
             os.environ,
             {
                 "AITER_MAX_JOBS": "23",
                 "MAX_JOBS": "64",
+                "NINJAFLAGS": "-j99",
             },
             clear=True,
         ):
@@ -446,7 +448,7 @@ class WorkerAwarenessTest(unittest.TestCase):
             self.assertEqual(os.environ["MAX_JOBS"], "64")
             self.assertEqual(os.environ["CMAKE_BUILD_PARALLEL_LEVEL"], "1")
             self.assertEqual(os.environ["MAKEFLAGS"], "-j1")
-            self.assertEqual(os.environ["NINJAFLAGS"], "-j1")
+            self.assertEqual(os.environ["NINJAFLAGS"], "-j99")
 
     def test_work_capped_worker_count_never_returns_zero(self):
         with patch.dict(os.environ, {"AITER_MAX_JOBS": "19"}, clear=True), patch.object(
@@ -455,14 +457,49 @@ class WorkerAwarenessTest(unittest.TestCase):
             self.assertEqual(get_worker_count_for(0), 1)
             self.assertEqual(get_worker_count_for(3), 3)
 
-    def test_one_job_reaches_all_descendant_controls(self):
+    def test_worker_does_not_set_unsupported_ninja_environment(self):
         with patch.dict(os.environ, {}, clear=True):
             configure_worker_subprocesses()
             self.assertEqual(os.environ["AITER_MAX_JOBS"], "1")
             self.assertEqual(os.environ["CMAKE_BUILD_PARALLEL_LEVEL"], "1")
             self.assertEqual(os.environ["MAKEFLAGS"], "-j1")
-            self.assertEqual(os.environ["NINJAFLAGS"], "-j1")
+            self.assertNotIn("NINJAFLAGS", os.environ)
             self.assertEqual(os.environ["OMP_NUM_THREADS"], "1")
+
+    def test_worker_ninja_limit_is_passed_explicitly(self):
+        # Load the production launch functions without importing torch/ROCm.
+        source = _REPO_ROOT / "aiter/jit/utils/cpp_extension.py"
+        tree = ast.parse(source.read_text())
+        functions = [
+            node
+            for node in tree.body
+            if isinstance(node, ast.FunctionDef)
+            and node.name in {"_get_num_workers", "_run_ninja_build"}
+        ]
+        namespace = {
+            "os": os,
+            "sys": sys,
+            "subprocess": subprocess,
+            "get_compile_worker_count": get_compile_worker_count,
+        }
+        exec(  # noqa: S102 - Execute only functions from the checked-in source.
+            compile(ast.Module(body=functions, type_ignores=[]), str(source), "exec"),
+            namespace,
+        )
+        for flags in (None, "-j99"):
+            with self.subTest(ninjaflags=flags), patch.dict(
+                os.environ, {"MAX_JOBS": "64"}, clear=True
+            ), patch.object(
+                worker_limits, "_automatic_worker_snapshot", return_value=(8, 8, None)
+            ), patch.object(
+                subprocess, "run"
+            ) as run:
+                if flags is not None:
+                    os.environ["NINJAFLAGS"] = flags
+                configure_worker_subprocesses()
+                namespace["_run_ninja_build"]("/tmp/build", False, "build failed")
+                self.assertEqual(run.call_args.args[0], ["ninja", "-v", "-j", "1"])
+                self.assertEqual(run.call_args.kwargs["env"].get("NINJAFLAGS"), flags)
 
 
 if __name__ == "__main__":

@@ -168,7 +168,7 @@ For an AITER-owned compile, worker-ceiling precedence is:
 
 The compatibility paths never change `MAX_JOBS`, and both explicit and legacy ceilings remain clamped by the live CPU and memory budgets. The runtime lookup occurs only at the AITER-owned compiler boundary, not during `import aiter` or generic worker-policy calls.
 
-Process-pool workers force nested AITER, Ninja, CMake, Make, OpenMP, BLAS, and NumExpr compilation fanout to one.
+Process-pool workers set the AITER compilation budget to one; AITER’s Ninja launcher enforces that budget with an explicit `-j 1` argument. Ninja does not read `NINJAFLAGS`, and arbitrary Ninja invocations are not constrained by these environment settings. Workers also set CMake/Make parallelism controls and one-thread environment hints for OpenMP, BLAS, and NumExpr; numerical runtimes must read those hints before initialization.
 
 Cgroup-memory diagnostics compare the memory budget with the CPU budget after applying the requested worker ceiling. A warning is emitted when memory reduces that budget to three workers or fewer, or by at least a factor of four. Repeated warnings are suppressed unless the budget halves or reaches one worker, with a 60-second minimum interval. Recovery resets the reporting baseline without bypassing that interval. These diagnostics do not change worker selection or discount reclaimable page cache.
 
