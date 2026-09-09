@@ -149,6 +149,26 @@ def fmin_f32(a, b):
     return _fx.Float32(arith.minnumf(_raw(a), _raw(b)))
 
 
+def htanh_f32(x):
+    """Evaluate tanh with gfx1250's native ``v_tanh_f32`` instruction."""
+    import flydsl.expr as _fx
+
+    return _fx.Float32(
+        llvm_dialect.call_intrinsic(T.f32, "llvm.amdgcn.tanh.f32", [_raw(x)], [], [])
+    )
+
+
+def hfma_f32(a, b, c):
+    """Evaluate ``a * b + c`` with one fused f32 operation."""
+    import flydsl.expr as _fx
+
+    return _fx.Float32(
+        llvm_dialect.call_intrinsic(
+            T.f32, "llvm.fma.f32", [_raw(a), _raw(b), _raw(c)], [], []
+        )
+    )
+
+
 def fclamp_f32(x, lo, hi):
     """Scalar f32 clamp via v_med3_num_f32."""
     import flydsl.expr as _fx
@@ -161,17 +181,15 @@ def fused_silu_swiglu_elem(g, u, *, swiglu, limit_f32, neg_limit_f32):
     import flydsl.expr as _fx
 
     _one = _fx.Float32(1.0)
+    _half = _fx.Float32(0.5)
     g = fmin_f32(g, limit_f32)
     u = fclamp_f32(u, neg_limit_f32, limit_f32)
+    m = g * _half
     if swiglu:
-        nlog2e = _fx.Float32(-1.702 * LOG2E)
-        exp_val = _fx.Float32(rocdl.exp2(T.f32, _raw(g * nlog2e)))
-        sig = _fx.Float32(rocdl.rcp(T.f32, _one + exp_val))
-        return g * sig * (u + _one)
-    nlog2e = _fx.Float32(-LOG2E)
-    exp_val = _fx.Float32(rocdl.exp2(T.f32, _raw(g * nlog2e)))
-    sig = _fx.Float32(rocdl.rcp(T.f32, _one + exp_val))
-    return g * sig * u
+        tanh_val = htanh_f32(m * _fx.Float32(1.702))
+        return hfma_f32(m, tanh_val, m) * (u + _one)
+    tanh_val = htanh_f32(m)
+    return hfma_f32(m, tanh_val, m) * u
 
 
 def _tanh_f32(x, tanh_mul):
@@ -294,7 +312,7 @@ def batched_situv2(pairs, *, consts, range_constexpr):
 
 
 def batched_silu_swiglu(pairs, *, swiglu, limit_f32, neg_limit_f32, range_constexpr):
-    """Batched silu/swiglu with pipelined exp2/rcp for better TRANS utilisation.
+    """Batched silu/swiglu using gfx1250's native tanh instruction.
 
     Args:
         pairs: list of (gate, up) f32 value pairs.
@@ -308,37 +326,36 @@ def batched_silu_swiglu(pairs, *, swiglu, limit_f32, neg_limit_f32, range_conste
     import flydsl.expr as _fx
 
     _one = _fx.Float32(1.0)
-    nlog2e = _fx.Float32((-1.702 * LOG2E) if swiglu else (-LOG2E))
+    _half = _fx.Float32(0.5)
+    _tanh_arg_mul = _fx.Float32(1.702)
     N = len(pairs)
-    # Stage 1: clamp + exp2
-    gs, us, exp_vals = [], [], []
+    # Keep the stages separate so independent tanh instructions can occupy the
+    # TRANS pipeline before their dependent FMAs are issued.
+    ms, us = [], []
     for i in range_constexpr(N):
         g = fmin_f32(pairs[i][0], limit_f32)
         u = fclamp_f32(pairs[i][1], neg_limit_f32, limit_f32)
-        gs.append(g)
+        ms.append(g * _half)
         us.append(u)
     rocdl.sched_barrier(0)
+
+    tanh_vals = []
     for i in range_constexpr(N):
-        exp_val = _fx.Float32(rocdl.exp2(T.f32, _raw(gs[i] * nlog2e)))
-        exp_vals.append(exp_val)
-    # Stage 2a: add 1+exp
+        tanh_arg = ms[i] * _tanh_arg_mul if swiglu else ms[i]
+        tanh_vals.append(htanh_f32(tanh_arg))
     rocdl.sched_barrier(0)
-    sum_vals = []
+
+    gate_vals = []
     for i in range_constexpr(N):
-        sum_vals.append(_one + exp_vals[i])
-    # Stage 2b: rcp
+        gate_vals.append(hfma_f32(ms[i], tanh_vals[i], ms[i]))
     rocdl.sched_barrier(0)
-    rcp_vals = []
-    for i in range_constexpr(N):
-        rcp_vals.append(_fx.Float32(rocdl.rcp(T.f32, sum_vals[i])))
-    # Stage 3: final mul
-    rocdl.sched_barrier(0)
+
     results = []
     for i in range_constexpr(N):
         if swiglu:
-            results.append(gs[i] * rcp_vals[i] * (us[i] + _one))
+            results.append(gate_vals[i] * (us[i] + _one))
         else:
-            results.append(gs[i] * rcp_vals[i] * us[i])
+            results.append(gate_vals[i] * us[i])
     return results
 
 
