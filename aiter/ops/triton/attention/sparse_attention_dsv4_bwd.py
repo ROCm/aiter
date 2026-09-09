@@ -26,7 +26,7 @@ Pipeline (five kernels + one torch reduction), per rank chunk:
 
 ``lse`` and ``o`` come from the forward. The merged Gluon prefill kernel produces both::
 
-    from aiter.ops.triton.gluon.mla_gluon import mla_gluon
+    from aiter.ops.triton.attention.mla import mla_gluon
     o, lse = mla_gluon(..., has_pe=False, attn_sink=sink, return_lse=True)
 
 Its ``lse`` is sink-inclusive (the sink is folded into ``e_max``/``e_sum`` before

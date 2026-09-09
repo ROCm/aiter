@@ -54,7 +54,11 @@ for modules that were reorganized so that external repos (like sglang for exampl
 which depend on the old module names, can still import it the old "way" of importing.
 """
 # Paths that only exist for backward compatibility and are on their way out.
-_DEPRECATED_COMPAT_PATHS = ("gluon.gemm_a8w8", "gluon.gemm_a8w8_blockscale")
+_DEPRECATED_COMPAT_PATHS = (
+    "gluon.gemm_a8w8",
+    "gluon.gemm_a8w8_blockscale",
+    "gluon.mla_gluon",
+)
 
 
 def _warn_if_deprecated(name, new_path):
@@ -116,6 +120,7 @@ _BACKWARD_COMPAT_MAP = {
     "mha": "attention.mha",
     "mla_decode": "attention.mla_decode",
     "mla_decode_rope": "attention.mla_decode_rope",
+    "gluon.mla_gluon": "attention.mla",
     "pa_decode": "attention.pa_decode",
     "pa_mqa_logits": "attention.pa_mqa_logits",
     "pa_prefill": "attention.pa_prefill",

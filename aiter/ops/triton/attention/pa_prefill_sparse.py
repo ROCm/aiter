@@ -27,7 +27,7 @@ from aiter.ops.triton._gluon_kernels.gfx1250.attention.pa_prefill_sparse import 
 from aiter.ops.triton._triton_kernels.attention.sparse_attention_dsv4 import (
     _sparse_attn_prefill_kernel,
 )
-from aiter.ops.triton.gluon.mla_gluon import (
+from aiter.ops.triton.attention.mla import (
     mla_gluon as gluon_mla_sparse_prefill,
 )
 from aiter.ops.triton.utils._triton import arch_info

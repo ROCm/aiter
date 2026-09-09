@@ -14,9 +14,15 @@ from aiter.ops.triton._triton_kernels.attention.mla import (
 from aiter.ops.triton._triton_kernels.attention.mla import (
     _mla_prefill_fwd_kernel as triton_mla_prefill_fwd_kernel,
 )
-from aiter.ops.triton.utils.device_info import get_num_sms
+from aiter.ops.triton._triton_kernels.attention.mla import (
+    _mla_softmax_reducev_kernel as triton_mla_softmax_reducev_kernel,
+)
+from aiter.ops.triton.utils.device_info import get_num_sms, get_num_xcds
 
 try:
+    from aiter.ops.triton._gluon_kernels.gfx950.attention.mla import (
+        _mla_gluon as _gluon_mla_gfx950_kernel,
+    )
     from aiter.ops.triton._gluon_kernels.gfx1250.attention.mla import (
         _mla_decode_fwd_kernel as gluon_mla_decode_fwd_kernel,
     )
@@ -34,6 +40,7 @@ except:  # noqa: E722
     gluon_mla_decode_fwd_kernel_non_pipelined = None
     gluon_mla_decode_fwd_kernel = None
     gluon_mla_decode_fwd_reduce_kernel = None
+    _gluon_mla_gfx950_kernel = None
 
 from aiter.ops.triton.utils._triton import arch_info
 from aiter.ops.triton.utils.types import e4m3_dtype
@@ -41,6 +48,8 @@ from aiter.ops.triton.utils.types import e4m3_dtype
 DEVICE_ARCH = arch_info.get_arch()
 IS_DEVICE_ARCH_GFX12 = DEVICE_ARCH in ("gfx1250",)
 WARP_SIZE = 32 if IS_DEVICE_ARCH_GFX12 else 64
+
+_GLUON_SUPPORTED_ARCHS = ("gfx950",)
 
 
 def select_2d_config(
@@ -524,3 +533,313 @@ def mla_decode_fwd(
         **reduce_config,
     )
     return out
+
+
+def mla_gluon(
+    q_nope,  # [batch, nhead, kv_lora_rank] or MTP [batch, qlen, nhead, kv_lora_rank]
+    q_pe,  # [batch, nhead, qk_rope_head_dim] or MTP [batch, qlen, nhead, qk_rope_head_dim]
+    # Shared: kv_c=[N, kv_lora_rank+qk_rope_head_dim], k_pe=None, kv_pe_offset=kv_lora_rank
+    # Split:  kv_c=[N, kv_lora_rank], k_pe=[N, qk_rope_head_dim], kv_pe_offset=0
+    kv_c,
+    # final output [batch, nhead, kv_lora_rank] or MTP [batch, qlen, nhead, kv_lora_rank].
+    o,
+    page_table,  # 2D: block_table [batch, max_seqlen] | 1D: kv_indices [total_kv]
+    seq_info,  # 2D: cache_seqlens [batch]           | 1D: kv_indptr [batch+1]
+    sm_scale,
+    k_pe=None,
+    kv_pe_offset=512,
+    use_2d_view=True,
+    kv_scale=1.0,
+    min_kv_seq_len=1,
+    return_lse=False,
+    has_pe=True,
+    attn_sink=None,  # [nhead] fp32 per-head sink bias, None means no sink
+):
+    """Unified Gluon MLA entry (gfx950 / CDNA4) — decode and DeepSeek V4 sparse prefill.
+
+    `mla_gluon` supports the full decode (stage-1 + stage-2 reduce, or the stage-1-only
+    fast path when NUM_KV_SPLITS==1) and writes the final attention into the
+    caller's `o`.
+
+    MTP (Multi-Token Prediction): pass 4-D q_nope/q_pe/o shaped
+    [batch, qlen, nhead, dim]. qlen is a runtime value (one compiled kernel
+    serves any qlen). Each query position q_pos attends KV [0, seq_len-qlen+q_pos]
+    (causal tail). The plain-decode 3-D path ([batch, nhead, dim], qlen=1) is
+    unchanged. Implementation: q_pos is an extra grid axis, so KV is currently
+    re-read per q_pos, but those re-reads are mostly served from L2/MALL cache so
+    the path is efficient at ctx<=16384.
+
+    return_lse=False (default): returns (o, None).
+
+    return_lse=True: additionally returns the merged log-sum-exp, a separate
+        fp32 tensor [batch, qlen, nhead]
+
+    DSv4 Sparse prefill packs NoPE and RoPE in to one contiguous row (448+64).
+    To run DSv4 prefill, it requires has_pe=False, prepares valid Q / K in q_nope / kv_c,
+    and attn_sink, q_pe / k_pe are unused placeholders.
+    """
+    if k_pe is None:
+        k_pe = kv_c
+
+    # Accept plain decode (3-D, qlen=1) or MTP (4-D, [batch, qlen, nhead, dim]).
+    # DSv4 sparse prefill (has_pe=False) always uses the 3-D path.
+    assert q_nope.dim() in (3, 4), f"q_nope must be 3-D or 4-D, got {q_nope.dim()}-D"
+    IS_MTP = q_nope.dim() == 4
+    if IS_MTP:
+        batch_size, qlen, nhead, head_dim_ckv = q_nope.shape
+    else:
+        batch_size, nhead, head_dim_ckv = q_nope.shape
+        qlen = 1
+    # Decode carries a real q_pe [.., 64];
+    # DSV4 prefill (HAS_PE=False) has no PE, so q_pe may be None and RoPE head_dim is the fixed 64.
+    head_dim_kpe = q_pe.shape[-1] if has_pe else 64
+    if not has_pe:
+        q_pe = q_nope
+        k_pe = kv_c
+        kv_pe_offset = 0
+        use_2d_view = False
+
+    assert (
+        arch_info.get_arch() in _GLUON_SUPPORTED_ARCHS
+    ), f"mla_gluon requires one of {_GLUON_SUPPORTED_ARCHS}, got {arch_info.get_arch()}"
+    assert (
+        head_dim_ckv == 512
+    ), f"mla_gluon requires head_dim_ckv=512, got {head_dim_ckv}"
+    assert head_dim_kpe == 64, f"mla_gluon requires head_dim_kpe=64, got {head_dim_kpe}"
+
+    # attn sink: decode never sets one; prefill may pass a per-head [H] bias.
+    has_attn_sink = attn_sink is not None
+    if attn_sink is None:
+        attn_sink = torch.empty(1, device=o.device, dtype=torch.float32)  # dummy ptr
+
+    # Pick regime by (nhead, kv dtype). MTP (qlen>1) uses the grid-axis path:
+    # q_pos is grid axis 2, so each query position is a separate program.
+    if nhead in (64, 128):
+        REGIME = "bh64"
+    elif 1 <= nhead <= 96:
+        # bh16 path: heads are tiled into cdiv(nhead, 16) blocks of BLOCK_H=16 on
+        # grid axis 2 (alongside q_pos). nhead <= 16 is a single block (unchanged);
+        # nhead > 16 (e.g. 96) adds head-block programs. A partial last block
+        # (nhead % 16 != 0) masks OOB heads on Q load / O store.
+        if kv_c.dtype == torch.bfloat16:
+            REGIME = "bh16bn64"
+        elif kv_c.dtype == torch.float8_e4m3fn:  # gfx950 fp8 (e4m3fn, not e4m3fnuz)
+            REGIME = "bh16bn128"
+        else:
+            raise AssertionError(
+                f"mla_gluon[bh16*] requires kv_c.dtype in (bfloat16, float8_e4m3fn), got {kv_c.dtype}"
+            )
+    else:
+        raise AssertionError(
+            f"mla_gluon requires nhead <= 96 [bh16bn128/bh16bn64] or nhead in (64,128) [bh64], got {nhead}"
+        )
+
+    PAGE_SIZE = 1
+
+    if REGIME == "bh64":
+        BLOCK_H, BLOCK_N = 64, 64
+        NUM_XCDS = get_num_xcds()
+        # Auto-pick NUM_KV_SPLITS so the launch fills ~256 workgroups (one wave on
+        # MI350). For the supported (batch, nhead) matrix the result is in {1, 2, 4}.
+        base_grid = (
+            NUM_XCDS * triton.cdiv(nhead, BLOCK_H) * qlen * (batch_size // NUM_XCDS)
+        )
+        NUM_KV_SPLITS = max(1, triton.next_power_of_2(triton.cdiv(256, base_grid)))
+
+        assert (
+            batch_size % 64 == 0
+        ), f"mla_gluon[bh64] requires batch_size divisible by 64, got {batch_size}"
+        # gl.assume(num_iter > 3) inside the kernel requires every split to have
+        # > 3*BLOCK_N tokens. Smallest split (last) for batch length s is
+        # s - (k-1)*ceil(s/k); a sufficient bound is min_kv_seq_len > k*(3*BLOCK_N + k).
+        min_kv_seq_len_required = NUM_KV_SPLITS * (3 * BLOCK_N + NUM_KV_SPLITS)
+        assert (
+            min_kv_seq_len > min_kv_seq_len_required
+        ), f"mla_gluon[bh64] requires min_kv_seq_len > {min_kv_seq_len_required} (NUM_KV_SPLITS={NUM_KV_SPLITS}), got {min_kv_seq_len}"
+        assert (
+            q_nope.dtype == torch.bfloat16 and q_pe.dtype == torch.bfloat16
+        ), f"q_nope/q_pe must be bf16, got {q_nope.dtype}/{q_pe.dtype}"
+        assert (
+            kv_c.dtype == torch.bfloat16 and k_pe.dtype == torch.bfloat16
+        ), f"kv_c/k_pe must be bf16, got {kv_c.dtype}/{k_pe.dtype}"
+    else:  # bh16bn128 (fp8 KV) or bh16bn64 (bf16 KV)
+        BLOCK_H = 16
+        BLOCK_N = 128 if REGIME == "bh16bn128" else 64
+        kv_dtype = torch.float8_e4m3fn if REGIME == "bh16bn128" else torch.bfloat16
+        NUM_XCDS = 1  # unused by 2-D split grid mapping
+        NUM_M_BLOCKS = triton.cdiv(nhead, BLOCK_H)
+        NUM_KV_SPLITS = max(1, 256 // (batch_size * qlen * NUM_M_BLOCKS))
+        assert (
+            q_nope.dtype == torch.bfloat16 and q_pe.dtype == torch.bfloat16
+        ), f"q_nope/q_pe must be bf16, got {q_nope.dtype}/{q_pe.dtype}"
+        assert (
+            kv_c.dtype == kv_dtype and k_pe.dtype == kv_dtype
+        ), f"kv_c/k_pe must be {kv_dtype}, got {kv_c.dtype}/{k_pe.dtype}"
+
+    # buffer_load uses scalar base + 32-bit offsets, limiting addressable range.
+    # For KV caches > 2 GB the kernel falls back to global_load (64-bit pointers).
+    max_kv_bytes = kv_c.shape[0] * kv_c.stride(0) * kv_c.element_size()
+    within_2gb = max_kv_bytes <= 0x80000000  # 2 GB
+
+    # Normalized Q strides: (batch, q_pos, head). For plain decode (3-D) the
+    # q_pos stride is 0 and q_pos is always 0, so the kernel address math is
+    # identical to before.
+    if IS_MTP:
+        stride_q_nope_bs, stride_q_nope_s, stride_q_nope_h = q_nope.stride()[:3]
+        stride_q_pe_bs, stride_q_pe_s, stride_q_pe_h = q_pe.stride()[:3]
+        stride_o_b_final, stride_o_s_final, stride_o_h_final = o.stride()[:3]
+    else:
+        stride_q_nope_bs, stride_q_nope_s, stride_q_nope_h = (
+            q_nope.stride(0),
+            0,
+            q_nope.stride(1),
+        )
+        stride_q_pe_bs, stride_q_pe_s, stride_q_pe_h = q_pe.stride(0), 0, q_pe.stride(1)
+        stride_o_b_final, stride_o_s_final, stride_o_h_final = (
+            o.stride(0),
+            0,
+            o.stride(1),
+        )
+
+    if NUM_KV_SPLITS == 1:
+        # Fast path: stage-1 writes the final attention (and lse) directly to o.
+        # View o with an explicit (q_pos, split) layout so stage-1 strides are uniform.
+        if IS_MTP:
+            logits_buf = o.view(batch_size, qlen, nhead, NUM_KV_SPLITS, head_dim_ckv)
+        else:
+            logits_buf = o.view(batch_size, 1, nhead, NUM_KV_SPLITS, head_dim_ckv)
+        mid_lse = None
+        stride_mid_lse_b = stride_mid_lse_s = stride_mid_lse_h = (
+            stride_mid_lse_split
+        ) = 0
+    else:
+        # stage-1 -> per-split (acc, lse); stage-2 reduces into o.
+        logits_buf = torch.empty(
+            (batch_size, qlen, nhead, NUM_KV_SPLITS, head_dim_ckv),
+            dtype=o.dtype,
+            device=o.device,
+        )
+        mid_lse = torch.empty(
+            (batch_size, qlen, nhead, NUM_KV_SPLITS),
+            dtype=torch.float32,
+            device=o.device,
+        )
+        stride_mid_lse_b, stride_mid_lse_s, stride_mid_lse_h, stride_mid_lse_split = (
+            mid_lse.stride()
+        )
+
+    # logits_buf is [batch, qlen, nhead, split, dim] in both paths; reuse its
+    # strides for stage-1's O write (fast path aliases o, so this stays correct).
+    stride_o_b, stride_o_s, stride_o_h, stride_o_split, _ = logits_buf.stride()
+
+    if return_lse:
+        final_lse = torch.empty(
+            (batch_size, qlen, nhead), dtype=torch.float32, device=q_nope.device
+        )
+        stride_final_lse_b, stride_final_lse_s, stride_final_lse_h = final_lse.stride()
+    else:
+        final_lse = None
+        stride_final_lse_b, stride_final_lse_s, stride_final_lse_h = 0, 0, 0
+
+    if REGIME == "bh64":
+        grid = (
+            NUM_XCDS,
+            triton.cdiv(nhead, BLOCK_H) * qlen,
+            (batch_size // NUM_XCDS) * NUM_KV_SPLITS,
+        )
+    else:
+        # Grid axis 2 carries (head_block, q_pos): cdiv(nhead, BLOCK_H) head blocks
+        # times qlen query positions. For nhead <= 16 this is just qlen (one head
+        # block), i.e. the original grid-axis MTP mapping.
+        grid = (batch_size, NUM_KV_SPLITS, triton.cdiv(nhead, BLOCK_H) * qlen)
+    stride_page_bs = page_table.stride(0) if use_2d_view else 0
+
+    _gluon_mla_gfx950_kernel[grid](
+        q_nope,
+        q_pe,
+        kv_c,
+        k_pe,
+        page_table,
+        seq_info,
+        logits_buf,
+        attn_sink,
+        sm_scale,
+        kv_scale,
+        stride_q_nope_bs,
+        stride_q_nope_s,
+        stride_q_nope_h,
+        stride_q_pe_bs,
+        stride_q_pe_s,
+        stride_q_pe_h,
+        kv_c.stride(-2),
+        k_pe.stride(-2),
+        stride_page_bs,
+        stride_o_b,
+        stride_o_s,
+        stride_o_h,
+        stride_o_split,
+        mid_lse,
+        stride_mid_lse_b,
+        stride_mid_lse_s,
+        stride_mid_lse_h,
+        stride_mid_lse_split,
+        final_lse,
+        stride_final_lse_b,
+        stride_final_lse_s,
+        stride_final_lse_h,
+        BLOCK_H=BLOCK_H,
+        BLOCK_N=BLOCK_N,
+        NUM_KV_SPLITS=NUM_KV_SPLITS,
+        PAGE_SIZE=PAGE_SIZE,
+        HEAD_DIM_CKV=head_dim_ckv,
+        HEAD_DIM_KPE=head_dim_kpe,
+        KV_PE_OFFSET=kv_pe_offset,
+        USE_2D_VIEW=use_2d_view,
+        WITHIN_2GB=within_2gb,
+        NUM_XCDS=NUM_XCDS,
+        NHEAD=nhead,
+        REGIME=REGIME,
+        RETURN_LSE=return_lse,
+        QLEN=qlen,
+        HAS_PE=has_pe,
+        HAS_ATTN_SINK=has_attn_sink,
+    )
+
+    if NUM_KV_SPLITS == 1:
+        # Fast path: stage-1 already wrote o (and lse) directly.
+        return o, final_lse
+
+    # Stage-2: reduce per-split (acc, lse) into o (and lse when return_lse).
+    # grid axis 2 is q_pos (qlen). o uses the caller's layout (3-D or 4-D).
+    grid_reduce = (batch_size, nhead, qlen)
+    sl_b, sl_qs, sl_h, sl_split, _ = logits_buf.stride()
+    triton_mla_softmax_reducev_kernel[grid_reduce](
+        logits_buf,
+        mid_lse,
+        o,
+        final_lse,
+        seq_info,
+        sl_b,
+        sl_qs,
+        sl_h,
+        sl_split,
+        stride_mid_lse_b,
+        stride_mid_lse_s,
+        stride_mid_lse_h,
+        stride_mid_lse_split,
+        stride_o_b_final,
+        stride_o_s_final,
+        stride_o_h_final,
+        stride_final_lse_b,
+        stride_final_lse_s,
+        stride_final_lse_h,
+        NUM_KV_SPLITS=NUM_KV_SPLITS,
+        HEAD_DIM_CKV=head_dim_ckv,
+        HAS_FINAL_LSE=return_lse,
+        USE_2D_VIEW=use_2d_view,
+        BLOCK_S=min(64, triton.next_power_of_2(NUM_KV_SPLITS)),
+        BLOCK_N=BLOCK_N,
+        num_warps=8,
+    )
+
+    return o, final_lse

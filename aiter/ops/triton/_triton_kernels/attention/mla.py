@@ -755,3 +755,96 @@ def _mla_decode_fwd_reduce_kernel(
         + tl.arange(0, KV_LORA_RANK)
     )
     tl.store(output_ptr + output_offset, acc.to(output_ptr.type.element_ty))
+
+
+# fmt: off
+@triton.jit
+def _mla_softmax_reducev_kernel(
+    Logits,
+    Mid_lse,
+    O,
+    Final_lse,
+    B_seq_len,  # same seq_info as the decode kernel to derive empty kv splits
+    stride_l_b,
+    stride_l_qs,  # MTP: q_pos (qlen) stride; 0 when QLEN==1
+    stride_l_h,
+    stride_l_s,
+    stride_ml_b,
+    stride_ml_qs,  # MTP: q_pos stride; 0 when QLEN==1
+    stride_ml_h,
+    stride_ml_s,
+    stride_o_b,
+    stride_o_qs,  # MTP: q_pos stride; 0 when QLEN==1
+    stride_o_h,
+    stride_fl_b,
+    stride_fl_qs,  # MTP: q_pos stride; 0 when QLEN==1
+    stride_fl_h,
+    NUM_KV_SPLITS: tl.constexpr,
+    HEAD_DIM_CKV: tl.constexpr,
+    HAS_FINAL_LSE: tl.constexpr,
+    USE_2D_VIEW: tl.constexpr,
+    BLOCK_S: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+):
+    cur_batch = tl.program_id(0)
+    cur_head = tl.program_id(1)
+    q_pos = tl.program_id(2)
+
+    # Recompute the seq len exactly as stage-1 did: it early-returns on empty
+    # splits, leaving their logits_buf / mid_lse slots uninitialised.
+    if USE_2D_VIEW:
+        cur_batch_seq_len = tl.load(B_seq_len + cur_batch)
+    else:
+        batch_page_start = tl.load(B_seq_len + cur_batch)
+        cur_batch_seq_len = tl.load(B_seq_len + cur_batch + 1) - batch_page_start
+    # Mirror stage-1's partition (see _mla_gluon) so both stages agree on how many
+    # splits actually hold data. Splits >= active were early-returned by stage-1
+    # and never written; they are masked out of the reduce below.
+    kv_len_per_split = tl.maximum(BLOCK_N, cur_batch_seq_len // NUM_KV_SPLITS)
+    active_kv_splits = tl.minimum(
+        tl.cdiv(cur_batch_seq_len, kv_len_per_split), NUM_KV_SPLITS
+    )
+
+    offs_d_ckv = tl.arange(0, HEAD_DIM_CKV)
+    offs_s = tl.arange(0, BLOCK_S)
+    base_l = cur_batch * stride_l_b + q_pos * stride_l_qs + cur_head * stride_l_h
+    base_ml = cur_batch * stride_ml_b + q_pos * stride_ml_qs + cur_head * stride_ml_h
+
+    e_sum = 0.0
+    e_max = -float("inf")
+    acc = tl.zeros([HEAD_DIM_CKV], dtype=tl.float32)
+
+    # The LSE merge is associative, so reduce BLOCK_S splits at a time as a
+    # vectorized tile, bounded by active_kv_splits rather than the launched budget.
+    for start in range(0, active_kv_splits, BLOCK_S):
+        s_ids = start + offs_s  # [BLOCK_S]
+        s_mask = s_ids < active_kv_splits
+        lse = tl.load(
+            Mid_lse + base_ml + s_ids * stride_ml_s, mask=s_mask, other=-float("inf")
+        )  # [BLOCK_S]
+        logits = tl.load(
+            Logits + base_l + s_ids[:, None] * stride_l_s + offs_d_ckv[None, :],
+            mask=s_mask[:, None],
+            other=0.0,
+        )  # [BLOCK_S, HEAD_DIM_CKV]
+
+        tile_max = tl.max(lse, axis=0)  # scalar; masked/empty splits are -inf
+        n_e_max = tl.maximum(e_max, tile_max)
+        old_scale = tl.where(e_max == -float("inf"), 0.0, tl.exp(e_max - n_e_max))
+        w = tl.where(lse == -float("inf"), 0.0, tl.exp(lse - n_e_max))  # [BLOCK_S]
+        logits = tl.where(lse[:, None] == -float("inf"), 0.0, logits)
+        acc = acc * old_scale + tl.sum(w[:, None] * logits, axis=0)
+        e_sum = e_sum * old_scale + tl.sum(w, axis=0)
+        e_max = n_e_max
+
+    out = acc / e_sum if e_sum > 0.0 else tl.zeros([HEAD_DIM_CKV], dtype=tl.float32)
+    tl.store(
+        O + cur_batch * stride_o_b + q_pos * stride_o_qs + cur_head * stride_o_h + offs_d_ckv,
+        out,
+    )
+    if HAS_FINAL_LSE:
+        tl.store(
+            Final_lse + cur_batch * stride_fl_b + q_pos * stride_fl_qs + cur_head * stride_fl_h,
+            e_max + tl.log(e_sum),
+        )
+# fmt: on
