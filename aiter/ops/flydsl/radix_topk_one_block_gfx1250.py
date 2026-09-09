@@ -10,6 +10,7 @@ import torch
 from aiter.jit.utils.chip_info import get_gfx
 
 from .kernels.radix_topk_one_block_gfx1250 import (
+    _COMPACT_CAPACITY,
     build_radix_topk_one_block_gfx1250_module,
 )
 from .kernels.tensor_shim import _run_compiled
@@ -216,7 +217,6 @@ def radix_topk_one_block_gfx1250(
     stride1: int,
     k: int = 2048,
     stable: bool = False,
-    max_effective_row_len: int | None = None,
 ) -> None:
     """Write per-row TopK indices and optional values."""
     _validate_call(
@@ -235,19 +235,15 @@ def radix_topk_one_block_gfx1250(
     if num_rows == 0:
         return
 
-    if max_effective_row_len is None:
-        max_effective_row_len = logits.shape[1]
-    if not 0 <= max_effective_row_len <= logits.shape[1]:
-        raise ValueError(
-            "max_effective_row_len must be in [0, logits.shape[1]]"
-        )
-    block_threads = 256 if max_effective_row_len <= 4096 else 1024
+    short_rows = logits.shape[1] <= _COMPACT_CAPACITY
+    block_threads = 256 if short_rows else 1024
     stream = torch.cuda.current_stream(logits.device)
     launcher = build_radix_topk_one_block_gfx1250_module(
         k,
         block_threads=block_threads,
         write_values=values is not None,
         stable=stable,
+        short_rows=short_rows,
     )
     _run_compiled(
         launcher,

@@ -5,6 +5,7 @@
 
 Short rows cache ordered keys in LDS. Long rows compact the selected radix
 bucket, while stable modes add deterministic index ordering and tie-breaking.
+Short-row specializations omit the long-row arena and streaming path.
 """
 
 from functools import cache
@@ -69,7 +70,9 @@ def build_radix_topk_one_block_gfx1250_module(
     block_threads: int = 1024,
     write_values: bool = False,
     stable: bool = False,
+    short_rows: bool = False,
 ):
+    """Build a kernel; short_rows requires every effective row length <= 4096."""
     if k <= 0:
         raise ValueError("k must be positive")
     if block_threads not in (256, 1024):
@@ -82,9 +85,12 @@ def build_radix_topk_one_block_gfx1250_module(
     later_bins_per_thread = _LATER_BUCKETS // block_threads
     short_bins_per_thread = _SHORT_HIGH_BUCKETS // block_threads
     full_key_vector_steps = ((_COMPACT_CAPACITY // _VEC) + block_threads - 1) // block_threads
-    stable_sort_enabled = stable and block_threads == 1024 and k <= 2048
+    stable_sort_enabled = (
+        stable and not short_rows and block_threads == 1024 and k <= 2048
+    )
     stable_sort_capacity = 1 << (k - 1).bit_length() if stable_sort_enabled else 1
     stable_stage_capacity = k if stable_sort_enabled else 1
+    stable_data_columns = 1 + int(write_values)
     stable_sort_items_per_thread = (stable_sort_capacity + block_threads - 1) // block_threads
     stable_sort_sizes, stable_sort_strides = _build_bitonic_schedule(stable_sort_capacity)
     output_vector_count = k // _VEC
@@ -102,8 +108,7 @@ def build_radix_topk_one_block_gfx1250_module(
         histogram: fx.Array[fx.Int32, _LATER_BUCKETS, 16]
         candidate_keys: fx.Array[fx.Int32, _COMPACT_CAPACITY, 16]
         candidate_indices: fx.Array[fx.Int32, _COMPACT_CAPACITY, 16]
-        stable_keys: fx.Array[fx.Int32, stable_stage_capacity, 16]
-        stable_indices: fx.Array[fx.Int32, stable_stage_capacity, 16]
+        stable_data: fx.Array[fx.Int32, stable_stage_capacity * stable_data_columns, 16]
 
     @fx.struct
     class ShortPass1Storage:
@@ -116,15 +121,18 @@ def build_radix_topk_one_block_gfx1250_module(
         long_later: LongLaterStorage
         short_pass1: ShortPass1Storage
 
+    shared_arena_type = ShortPass1Storage if short_rows else ArenaStorage
+    row_variant = "short" if short_rows else "mixed"
+
     @fx.struct
     class SharedStorage:
-        arena: ArenaStorage
+        arena: shared_arena_type
         scan: fx.Array[fx.Int32, num_waves * 2, 16]
         metadata: fx.Array[fx.Int32, _METADATA_SIZE, 16]
 
     @flyc.kernel(
         name=(
-            f"radix_topk_one_block_gfx1250_k{k}_b{block_threads}"
+            f"radix_topk_one_block_gfx1250_{row_variant}_k{k}_b{block_threads}"
             f"_v{int(write_values)}_s{int(stable)}"
         ),
         known_block_size=[block_threads, 1, 1],
@@ -184,39 +192,45 @@ def build_radix_topk_one_block_gfx1250_module(
         # LDS views
         storage = fx.SharedAllocator().allocate(SharedStorage)
 
-        # Long-row arena
-        long_histogram_matrix = storage.arena.long_pass1.histograms.peek().view(
-            fx.make_layout((_PASS1_HISTOGRAM_STAGES, _HIGH_BUCKETS), (_HIGH_BUCKETS, 1))
-        )
-        long_histograms = (
-            fx.slice(long_histogram_matrix, (0, None)),
-            fx.slice(long_histogram_matrix, (1, None)),
-        )
-        histogram = storage.arena.long_later.histogram.peek().view(
-            fx.make_layout(_LATER_BUCKETS, 1)
-        )
-        candidate_keys = storage.arena.long_later.candidate_keys.peek().view(
-            fx.make_layout(_COMPACT_CAPACITY, 1)
-        )
-        candidate_indices = storage.arena.long_later.candidate_indices.peek().view(
-            fx.make_layout(_COMPACT_CAPACITY, 1)
-        )
-        stable_keys = storage.arena.long_later.stable_keys.peek().view(
-            fx.make_layout(stable_stage_capacity, 1)
-        )
-        stable_indices = storage.arena.long_later.stable_indices.peek().view(
-            fx.make_layout(stable_stage_capacity, 1)
-        )
+        if const_expr(short_rows):
+            short_storage = storage.arena
+        else:
+            long_histogram_matrix = storage.arena.long_pass1.histograms.peek().view(
+                fx.make_layout((_PASS1_HISTOGRAM_STAGES, _HIGH_BUCKETS), (_HIGH_BUCKETS, 1))
+            )
+            long_histograms = (
+                fx.slice(long_histogram_matrix, (0, None)),
+                fx.slice(long_histogram_matrix, (1, None)),
+            )
+            histogram = storage.arena.long_later.histogram.peek().view(
+                fx.make_layout(_LATER_BUCKETS, 1)
+            )
+            candidate_keys = storage.arena.long_later.candidate_keys.peek().view(
+                fx.make_layout(_COMPACT_CAPACITY, 1)
+            )
+            candidate_indices = storage.arena.long_later.candidate_indices.peek().view(
+                fx.make_layout(_COMPACT_CAPACITY, 1)
+            )
+            stable_data = storage.arena.long_later.stable_data.peek().view(
+                fx.make_layout(
+                    (stable_stage_capacity, stable_data_columns), (1, stable_stage_capacity)
+                )
+            )
+            stable_indices = fx.slice(stable_data, (None, 0))
+            stable_keys = stable_indices
+            if const_expr(write_values):
+                stable_keys = fx.slice(stable_data, (None, 1))
+            short_storage = storage.arena.short_pass1
 
         # Short-row arena
-        short_histogram_matrix = storage.arena.short_pass1.histograms.peek().view(
+        short_histogram_matrix = short_storage.histograms.peek().view(
             fx.make_layout((_PASS1_HISTOGRAM_STAGES, _SHORT_HIGH_BUCKETS), (_SHORT_HIGH_BUCKETS, 1))
         )
         short_histograms = (
             fx.slice(short_histogram_matrix, (0, None)),
             fx.slice(short_histogram_matrix, (1, None)),
         )
-        full_keys = storage.arena.short_pass1.full_keys.peek().view(
+        full_keys = short_storage.full_keys.peek().view(
             fx.make_layout(_COMPACT_CAPACITY, 1)
         )
         full_key_tiles = fx.logical_divide(full_keys, fx.make_layout(_VEC, 1))
@@ -261,12 +275,6 @@ def build_radix_topk_one_block_gfx1250_module(
                     row_indices[out_pos] = row_start + col
                     if const_expr(write_values):
                         row_values[out_pos] = ordered_value(key)
-
-        def scatter_equal_row(key, row_indices, row_values):
-            for pos in range(tid, top_k, block_size):
-                row_indices[pos] = row_start + pos
-                if const_expr(write_values):
-                    row_values[pos] = ordered_value(key)
 
         def reset_scatter_counters(metadata, reset_above=True):
             if tid == 0:
@@ -1183,23 +1191,28 @@ def build_radix_topk_one_block_gfx1250_module(
                 metadata[tid] = zero
             gpu.barrier()
 
-            if row_len <= fx.Int32(_COMPACT_CAPACITY):
+            if const_expr(short_rows):
                 run_cached_path(
                     short_histograms, full_keys, row_indices, row_values, scan, metadata
                 )
             else:
-                run_streaming_path(
-                    long_histograms,
-                    histogram,
-                    candidate_keys,
-                    candidate_indices,
-                    stable_keys,
-                    stable_indices,
-                    row_indices,
-                    row_values,
-                    scan,
-                    metadata,
-                )
+                if row_len <= fx.Int32(_COMPACT_CAPACITY):
+                    run_cached_path(
+                        short_histograms, full_keys, row_indices, row_values, scan, metadata
+                    )
+                else:
+                    run_streaming_path(
+                        long_histograms,
+                        histogram,
+                        candidate_keys,
+                        candidate_indices,
+                        stable_keys,
+                        stable_indices,
+                        row_indices,
+                        row_values,
+                        scan,
+                        metadata,
+                    )
 
     @flyc.jit
     def launch_radix_topk_one_block_gfx1250(
