@@ -43,25 +43,23 @@ from aiter.ops.flydsl.kernels.gemm_common_gfx1250 import (
 from .config import (
     _WAVE_SIZE as WAVE,
 )
+from .types import COMBINE_SCALE_BLOCK as SCALE_BLOCK
 
-# MX combine wire format, mirrored from the gemm2 scatter epilogue: a slot is a
-# payload plane of hidden fp8 (or half that many fp4) bytes followed by a scale
-# plane of hidden/32 e8m0 bytes. Keep in sync with EP_SCALE_BLOCK in
-# mxfp4_preshuffle_gfx1250_tdm.py.
-#
-# CHUNK_ELEMS is this kernel's own lane-tile unit, not a wire structure.
+# The reduce's slicing granularity along hidden; chunks_per_iter of these make
+# one TDM row. Not a wire structure -- both planes are flat and a chunk is just
+# an index into them. 256 is the smallest size that keeps a chunk's payload a
+# whole cache line on every wire (fp4 128B, fp8 256B, bf16 512B) and its scale
+# slice a whole dword, which the dword-rounded e8m0 read in reduce_tile needs.
 CHUNK_ELEMS = 256
-SCALE_BLOCK = 32
 # Elements each lane reduces per round. On the MXFP8 wire 16 fp8 sit inside one
 # 32-element MX block, so a round needs exactly one scale byte.
 LANE_BYTES = 16
+
 
 # The cross-device xdb barrier is combine's own, not shared with dispatch's: it
 # waits on monotonic per-rank phase slots, while dispatch gates on a grid-wide
 # disp_bar count and then hands each peer its recv_num. Different state, so nothing
 # to factor out.
-
-
 def _make_combine_fused_sync(
     *,
     rank,
@@ -111,10 +109,6 @@ def _make_combine_fused_sync(
                 window.lsa_ptr(my_lsa_rank, off_xdb_mem)
             ) + fx.Int64(tid) * fx.Int64(8)
             comm_ops.spin_until_ge_i64(xdb_peer_slot, phase)
-        # The spin above is a relaxed load, so nothing invalidates this rank's
-        # stale comb_inp lines from the previous forward. Pair the peers'
-        # system-scope release stores with an acquire here.
-        comm_ops.fence_system_acquire()
 
     @flyc.jit
     def run(
@@ -130,6 +124,27 @@ def _make_combine_fused_sync(
         )
 
     return run
+
+
+# gfx1250 gives a workgroup 320KB of LDS; the reduce runs 512 blocks on 256 CUs,
+# so staying under half of that keeps the 2-blocks-per-CU occupancy.
+COMBINE_LDS_BUDGET = 160 * 1024
+
+
+def combine_reduce_lds_bytes(
+    *, experts_per_token, quant_bits, tokens_per_block, chunks_per_iter
+):
+    """LDS a (T, C) reduce tile needs, both sides double-buffered.
+
+    Duplicates the accounting in ``_make_combine_fused_reduce``; keep the two in
+    step.
+    """
+    chunk_bytes = CHUNK_ELEMS * quant_bits // 8 if quant_bits else CHUNK_ELEMS * 2
+    if quant_bits:
+        chunk_bytes += CHUNK_ELEMS // SCALE_BLOCK
+    in_tile = tokens_per_block * experts_per_token * chunks_per_iter * chunk_bytes
+    out_tile = tokens_per_block * chunks_per_iter * CHUNK_ELEMS * 2
+    return 2 * (in_tile + out_tile)
 
 
 def _make_combine_fused_reduce(
@@ -203,6 +218,15 @@ def _make_combine_fused_reduce(
             f"={SLOTS} must be a multiple of the block's lane count ({lanes})"
         )
     ROUNDS = SLOTS // lanes
+    # How a TDM copy splits rows over its warps is not visible from here, so
+    # require a split with no remainder. With the lane count derived from the
+    # tile this is chunks_per_iter dividing 2*topk. The store side is left
+    # unchecked: it moves topk times less and its rows can be fewer than warps.
+    if IN_ROWS % warp_num_per_block:
+        raise ValueError(
+            f"the tile's {IN_ROWS} input rows (tokens_per_block*topk) must split "
+            f"evenly over the block's {warp_num_per_block} warps"
+        )
     # Two tiles on both sides, so at any point the next trip's load and the
     # previous trip's store are in flight across this trip's dequantize. A single
     # output tile exposes the store latency instead: the wait that frees the tile
@@ -213,18 +237,18 @@ def _make_combine_fused_reduce(
     IN_TILE_BYTES = IN_ROWS * (P_ROW_BYTES + S_ROW_BYTES)
     OUT_TILE_BYTES = T_TOK * OUT_ROW_BYTES
     LDS_BYTES = IN_BUFS * IN_TILE_BYTES + OUT_BUFS * OUT_TILE_BYTES
-    # gfx1250 gives a workgroup 320KB of LDS; the reduce runs 512 blocks on 256
-    # CUs, so staying under half of that keeps the 2-blocks-per-CU occupancy.
-    if LDS_BYTES > 160 * 1024:
+    if LDS_BYTES > COMBINE_LDS_BUDGET:
         raise ValueError(
-            f"combine LDS tile is {LDS_BYTES} bytes, over the 160KB budget"
+            f"combine LDS tile is {LDS_BYTES} bytes, over the "
+            f"{COMBINE_LDS_BUDGET // 1024}KB budget"
         )
 
     slot_stride = slot_stride_nbytes
     iters_per_tok = n_chunks // C_CHK
     # A trip issues one load per plane and then one store, so the wait that
     # hands this trip its input tile must leave the prefetch's loads and the
-    # previous trip's store in flight.
+    # previous trip's store in flight. This rests on TDM ops retiring in issue
+    # order, so that a count names an exact prefix of the issue stream.
     WAIT_N = (2 if quant_bits else 1) + 1
 
     def _dequant_pk8(packed, e8m0_i32):

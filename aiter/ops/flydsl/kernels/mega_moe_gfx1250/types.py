@@ -8,6 +8,17 @@ from math import prod
 
 import torch
 
+# The MX combine wire, shared by the gemm2 scatter epilogue that writes it
+# (mxfp4_preshuffle_gfx1250_tdm.py) and the reduce that reads it (combine.py).
+# A slot is a payload plane of hidden fp8 bytes -- or half that many fp4 bytes --
+# followed by a scale plane of hidden/COMBINE_SCALE_BLOCK e8m0 bytes.
+#
+# Both plane bases stay cache-line aligned -- the payload plane is a multiple of
+# 128 bytes and the slot stride is a power of two -- and that must not slip: an
+# earlier 272-byte chunk pitch started every row mid-line and cost 123us/layer at
+# 16k tokens/rank despite moving 41% fewer bytes.
+COMBINE_SCALE_BLOCK = 32
+
 _DTYPE_INFO = {
     torch.int8: ("|i1", 1, None),
     torch.int16: ("<i2", 2, None),

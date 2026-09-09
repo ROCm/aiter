@@ -28,6 +28,7 @@ from .mega_moe_gfx1250.tdm_gather_shim import (
     make_tensor_gather_descriptor,
     tensor_store_gather,
 )
+from .mega_moe_gfx1250.types import COMBINE_SCALE_BLOCK
 from .quant_utils import (
     emit_amax_e8m0_native_scale,
     emit_cvt_scalef32_pk8_fp4_bf16,
@@ -42,19 +43,14 @@ from .tensor_shim import (
 
 TDM_DESCRIPTOR_VERSION = 1
 
-# MXFP8 combine wire format (``ep_quant_bits``): a slot holds two planes, N
-# payload bytes followed by N/32 e8m0 scale bytes. The block is 32 elements,
-# fixed rather than tied to tile_n so the wire does not drift with the GEMM
-# tuning table.
-#
-# Both plane bases stay cache-line aligned -- N is a multiple of 128 and the slot
-# stride is a power of two -- and that must not slip: an earlier 272-byte chunk
-# pitch started every row mid-line and cost 123us/layer at 16k tokens/rank
-# despite moving 41% fewer bytes.
-EP_SCALE_BLOCK = 32
+EP_SCALE_BLOCK = COMBINE_SCALE_BLOCK
 # GEMM2 has no activation, so one acc holds 8 f32 -> 2 wn subtiles per lane give
 # 16 values, and the two kgrp halves merge into the full 32-element MX block.
 WN_PER_MX_BLOCK_EP = 2
+# The staging loop emits one e8m0 per WN_PER_MX_BLOCK_EP subtiles of 16 columns
+# and the wire reads one per EP_SCALE_BLOCK columns; drift and the scale plane
+# silently describes the wrong columns.
+assert WN_PER_MX_BLOCK_EP * 16 == EP_SCALE_BLOCK
 
 
 @flyc.jit
