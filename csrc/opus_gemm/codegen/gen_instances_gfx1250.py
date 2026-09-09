@@ -29,31 +29,68 @@ PIPELINE_HEADER_MAP = {
     "a16w16_clusterlaunch_tdm_splitk_fuse": (
         "gfx1250/opus_gemm_pipeline_a16w16_clusterlaunch_tdm_splitk_fuse_gfx1250.cuh"
     ),
+    # 4wave_co has a real pipeline header, but NOTHING in the JIT build may
+    # include it: it uses pin builtins a release toolchain does not have, and
+    # its device code comes from a pre-built .co instead. Point the entry at the
+    # traits header so any generic consumer of this map stays on safe ground --
+    # the co emit below never uses it at all.
+    "a16w16_4wave_co": "gfx1250/opus_gemm_traits_a16w16_gfx1250.cuh",
+    "a16w16_4wave_wl_co": "gfx1250/opus_gemm_traits_a16w16_gfx1250.cuh",
 }
 
 TRAITS_HEADER_MAP = {
     "a16w16_cluster_tdm_splitk_ws": "gfx1250/opus_gemm_traits_a16w16_gfx1250.cuh",
     "a16w16_clusterlaunch_tdm_splitk_ws": "gfx1250/opus_gemm_traits_a16w16_gfx1250.cuh",
     "a16w16_clusterlaunch_tdm_splitk_fuse": "gfx1250/opus_gemm_traits_a16w16_gfx1250.cuh",
+    "a16w16_4wave_co": "gfx1250/opus_gemm_traits_a16w16_gfx1250.cuh",
+    "a16w16_4wave_wl_co": "gfx1250/opus_gemm_traits_a16w16_gfx1250.cuh",
 }
 
 KERNEL_FUNC_MAP = {
     "a16w16_cluster_tdm_splitk_ws": "gemm_a16w16_cluster_tdm_splitk_ws_kernel_gfx1250",
     "a16w16_clusterlaunch_tdm_splitk_ws": "gemm_a16w16_clusterlaunch_tdm_splitk_ws_kernel_gfx1250",
     "a16w16_clusterlaunch_tdm_splitk_fuse": "gemm_a16w16_splitk_fuse_kernel_gfx1250",
+    # Device-side body name. The JIT never instantiates it (the .co does); it is
+    # here because gen_instance() resolves this map for every kid, and because
+    # build_co.py reads it to spell the stub TU's call.
+    "a16w16_4wave_co": "gemm_a16w16_4wave_compute_body_gfx1250",
+    "a16w16_4wave_wl_co": "gemm_a16w16_4wave_wl_body_gfx1250",
 }
 
 TRAITS_NAME_MAP = {
     "a16w16_cluster_tdm_splitk_ws": "opus_cluster_tdm_splitk_ws_traits_gfx1250",
     "a16w16_clusterlaunch_tdm_splitk_ws": "opus_cluster_tdm_splitk_ws_traits_gfx1250",
     "a16w16_clusterlaunch_tdm_splitk_fuse": "opus_cluster_tdm_splitk_ws_traits_gfx1250",
+    "a16w16_4wave_co": "opus_a16w16_4wave_compute_traits_gfx1250",
+    "a16w16_4wave_wl_co": "opus_a16w16_4wave_wl_traits_gfx1250",
 }
 
 KARGS_NAME_MAP = {
     "a16w16_cluster_tdm_splitk_ws": "opus_gemm_cluster_tdm_ws_kargs_gfx1250",
     "a16w16_clusterlaunch_tdm_splitk_ws": "opus_gemm_cluster_tdm_ws_kargs_gfx1250",
     "a16w16_clusterlaunch_tdm_splitk_fuse": "opus_gemm_splitk_fuse_kargs_gfx1250",
+    "a16w16_4wave_co": "opus_gemm_4wave_compute_kargs_gfx1250",
+    "a16w16_4wave_wl_co": "opus_gemm_4wave_compute_kargs_gfx1250",
 }
+
+
+# 4wave_co traits argument list, shared by the JIT launcher emit below and the
+# offline stub TU (gen_co/build_co.py imports this). One spelling, so the .co's
+# baked traits and the host launcher's tile constants cannot disagree.
+def co_traits_args(k):
+    d_a, d_b, d_c, d_acc = k.co_dtypes
+    return (
+        f"{k.BLOCK_SIZE}, {k.B_M}, {k.B_N}, {k.B_K}, {k.num_slots}, "
+        f"{d_a}, {d_b}, {d_c}, {d_acc}, "
+        f"{k.cluster_wg_m}, {k.cluster_wg_n}"
+        # The wave-layout family takes two more: how the 4 waves tile the block.
+        + (
+            f", {k.co_wave_layout[0]}, {k.co_wave_layout[1]}"
+            if k.kernel_tag == "a16w16_4wave_wl_co"
+            else ""
+        )
+    )
+
 
 # fuse workspace storage dtype -> (C type, byte size) for the fuse kernel instantiation.
 _FUSE_WS_CTYPE = {"bf16_t": ("__bf16", 2), "fp32_t": ("float", 4)}
@@ -61,21 +98,21 @@ _FUSE_WS_CTYPE = {"bf16_t": ("__bf16", 2), "fp32_t": ("float", 4)}
 
 def splitk_reduce_extra_device_instantiations():
     # gfx1250 only: fp32 bias with a bf16 output (D_OUT=__bf16, D_BIAS=float).
-    # The main kernel writes a bf16 workspace, so an fp32 bias folds in fp32 in
+    # The main kernel writes the partial workspace, so an fp32 bias folds in fp32 in
     # the reduce before the cast to bf16. The baseline instantiations cover the
     # matched-dtype cases; this adds the bf16-out + fp32-bias mix. Emitted for
     # every compile-time split_k (0=runtime fallback, 1..16=unrolled) and
-    # HAS_OOB, with the bf16 workspace dtype (D_WS=__bf16). Same kernel NAME/ABI.
-    out = (
-        "// fp32-bias + bf16-out (gfx1250 f32 bias support), per split_k + D_WS=bf16\n"
-    )
-    for has_oob in ("true", "false"):
-        for sk in range(17):
-            out += (
-                f"template __global__ void splitk_reduce_kernel_gfx1250<8, 128, __bf16, true,  float,  {has_oob}, {sk}, __bf16>(\n"
-                "    const void*, __bf16*, int, int, int, int, int, int,\n"
-                "    const float*,  int);\n"
-            )
+    # HAS_OOB, and for BOTH partial types -- which one a kid uses is its
+    # splitk_workspace_dtype, so both have to exist. Same kernel NAME/ABI.
+    out = "// fp32-bias + bf16-out (gfx1250 f32 bias support), per split_k + D_WS\n"
+    for d_ws in ("__bf16", "float"):
+        for has_oob in ("true", "false"):
+            for sk in range(17):
+                out += (
+                    f"template __global__ void splitk_reduce_kernel_gfx1250<8, 128, __bf16, true,  float,  {has_oob}, {sk}, {d_ws}>(\n"
+                    "    const void*, __bf16*, int, int, int, int, int, int,\n"
+                    "    const float*,  int);\n"
+                )
     return out
 
 
@@ -258,9 +295,21 @@ void
     std::optional<aiter_tensor_t> bias,
     int splitK)
 {{{{
-    static_assert(std::is_same<D_C, fp32_t>::value,
-        "cluster_tdm_splitk_ws main kernel writes an fp32 workspace; D_C must "
-        "be fp32_t (Y can be bf16 or fp32; the reduce kernel handles the cast)");
+    // D_C is the split-K PARTIAL type (this kernel stores it, the reduce below
+    // reads it and casts to Y), picked per kid by splitk_workspace_dtype. Y is
+    // independent and may be bf16 or fp32 either way.
+    static_assert(std::is_same<D_C, fp32_t>::value || std::is_same<D_C, bf16_t>::value,
+        "cluster_tdm_splitk_ws split-K partial must be fp32_t or bf16_t");
+
+    // The host sizes this buffer from the kid table's splitk_workspace_dtype
+    // while D_C was baked in at build time, so a .so that is stale with respect
+    // to the table makes the two disagree. Catch it here: unchecked, a narrower
+    // buffer than D_C is a GPU page fault with no hint of where it came from.
+    AITER_CHECK(workspace.element_size() == sizeof(D_C),
+        "split-K workspace is ", workspace.element_size(),
+        "-byte but this kernel stores ", sizeof(D_C),
+        "-byte partials -- rebuild module_deepgemm_opus after changing "
+        "splitk_workspace_dtype");
 
     int batch = XQ.size(0);
     int M = XQ.size(1);
@@ -338,7 +387,9 @@ void
 
     {kernel_func}<Traits><<<grid_main, block_main, 0, stream>>>(kargs);
 
-    // Reduce reads the bf16 split-K workspace the main kernel wrote (D_WS=__bf16),
+    // Reduce reads the split-K workspace the main kernel wrote. D_C is that
+    // partial type for BOTH ends -- the main kernel stores Traits::DataC and
+    // this reads the same D_C -- so a per-kid choice cannot desynchronise them,
     // re-accumulates in fp32, folds bias, casts to Y dtype. split_k is dispatched
     // to a compile-time (unrolled) reduce instance by the launch helper.
     if (Y.dtype() == AITER_DTYPE_bf16) {{{{
@@ -346,29 +397,29 @@ void
         if (ptr_bias_ && bias_is_fp32_) {{{{
             // fp32 bias + bf16 output: fold the exact fp32 bias in the
             // reduce (D_BIAS=float), then cast the fp32 sum to bf16.
-            opus_splitk_reduce_launch_gfx1250<REDUCE_VEC, REDUCE_BS, __bf16, true, float, {has_oob_str}, __bf16>(
+            opus_splitk_reduce_launch_gfx1250<REDUCE_VEC, REDUCE_BS, __bf16, true, float, {has_oob_str}, D_C>(
                 grid_reduce, block_reduce, stream,
                 ws_ptr_, y_ptr, split_k, M, N, 1, padded_M, padded_N,
                 reinterpret_cast<const float*>(ptr_bias_), stride_bias_batch_);
         }}}} else if (ptr_bias_) {{{{
-            opus_splitk_reduce_launch_gfx1250<REDUCE_VEC, REDUCE_BS, __bf16, true, __bf16, {has_oob_str}, __bf16>(
+            opus_splitk_reduce_launch_gfx1250<REDUCE_VEC, REDUCE_BS, __bf16, true, __bf16, {has_oob_str}, D_C>(
                 grid_reduce, block_reduce, stream,
                 ws_ptr_, y_ptr, split_k, M, N, 1, padded_M, padded_N,
                 reinterpret_cast<const __bf16*>(ptr_bias_), stride_bias_batch_);
         }}}} else {{{{
-            opus_splitk_reduce_launch_gfx1250<REDUCE_VEC, REDUCE_BS, __bf16, false, __bf16, {has_oob_str}, __bf16>(
+            opus_splitk_reduce_launch_gfx1250<REDUCE_VEC, REDUCE_BS, __bf16, false, __bf16, {has_oob_str}, D_C>(
                 grid_reduce, block_reduce, stream,
                 ws_ptr_, y_ptr, split_k, M, N, 1, padded_M, padded_N, nullptr, 0);
         }}}}
     }}}} else {{{{
         float* y_ptr = reinterpret_cast<float*>(Y.data_ptr());
         if (ptr_bias_) {{{{
-            opus_splitk_reduce_launch_gfx1250<REDUCE_VEC, REDUCE_BS, float, true, float, {has_oob_str}, __bf16>(
+            opus_splitk_reduce_launch_gfx1250<REDUCE_VEC, REDUCE_BS, float, true, float, {has_oob_str}, D_C>(
                 grid_reduce, block_reduce, stream,
                 ws_ptr_, y_ptr, split_k, M, N, 1, padded_M, padded_N,
                 reinterpret_cast<const float*>(ptr_bias_), stride_bias_batch_);
         }}}} else {{{{
-            opus_splitk_reduce_launch_gfx1250<REDUCE_VEC, REDUCE_BS, float, false, float, {has_oob_str}, __bf16>(
+            opus_splitk_reduce_launch_gfx1250<REDUCE_VEC, REDUCE_BS, float, false, float, {has_oob_str}, D_C>(
                 grid_reduce, block_reduce, stream,
                 ws_ptr_, y_ptr, split_k, M, N, 1, padded_M, padded_N, nullptr, 0);
         }}}}
@@ -378,8 +429,20 @@ void
 """
     Path(os.path.join(cg.impl_path, f"{k.name}.cuh")).write_text(INSTANCE_IMPL)
 
-    # Main kernel: only <fp32_t> is instantiated (writes the fp32 workspace).
-    for CDtype in k.output_dtypes:
+    # The kid's template slot is the split-K PARTIAL type (traits D_C), not its
+    # output dtype -- the reduce decides the output. Instantiate the partial type
+    # the kid declares, since the dispatch table now references it by that type
+    # and the host sizes the workspace from the same field. The fuse family keeps
+    # output_dtypes: it reduces in-kernel and never lands a partial for us.
+    _ws_partial_tags = (
+        "a16w16_cluster_tdm_splitk_ws",
+        "a16w16_clusterlaunch_tdm_splitk_ws",
+    )
+    if k.kernel_tag in _ws_partial_tags:
+        inst_dtypes = (getattr(k, "splitk_workspace_dtype", "fp32_t"),)
+    else:
+        inst_dtypes = tuple(k.output_dtypes)
+    for CDtype in inst_dtypes:
         host_decl = (
             f"template void\n"
             f"{k.name}<{CDtype}>(\n"
@@ -610,7 +673,174 @@ void
         )
 
 
+def gen_4wave_co_instance(
+    cg,
+    k,
+    traits_header,
+    da,
+    db,
+    traits_name,
+    kargs_name,
+    **_unused,
+):
+    """gfx1250 symmetric 4-wave compute launcher emit -- PRE-COMPILED .co kid.
+
+    This is the one emit that does not produce a device kernel. It differs from
+    an ordinary kid in three places:
+
+      * the launcher takes the ordinary 5-arg a16w16 signature, NOT the 6-arg
+        workspace-carrying one the gfx1250 split-K kids use: this pipeline has
+        no split-K, no partial buffer and no reduce kernel, so there is nothing
+        to put in a workspace. It therefore dispatches through its own pair of
+        tables (opus_a16w16_co_tune_dispatch_gfx1250 by kid,
+        opus_a16w16_co_dispatch_gfx1250 by shape) rather than the arch's shared
+        ones. A split-K .co variant would move back to the workspace ABI.
+
+      * it includes the TRAITS header only, never the pipeline header. The
+        launcher needs nothing but Traits::kBlockM-style constants, and pulling
+        the pipeline in would drag TDM builtins and pin builtins into a release
+        compile unit that cannot handle them.
+      * it appends NOTHING to cg._device_instantiations, so gen_instances.py's
+        `{name}_C{dtype}.device.cu` loop skips this kid entirely. That single
+        omission IS the compile bypass; everything downstream (manifest, tune
+        lookup, dispatch, tuned CSV) is unchanged.
+
+    The device side is loaded at runtime from gen_co/gfx1250/{k.name}.co, whose
+    filename and extern "C" symbol both equal the launcher name, so no sidecar
+    is needed to connect them. The whole family -- tile, cluster, VGPR budget,
+    launch bounds, device flags -- comes from gen_co/co_kernels.json.
+    """
+    traits_alias = f"""
+// Baked as a plain (non-template) alias rather than being parameterised on the
+// launcher's D_C, so it can never be instantiated with a configuration the .co
+// was not built for.
+using {k.name}_Traits = {traits_name}<{co_traits_args(k)}>;
+"""
+
+    INSTANCE_IMPL = f"""// SPDX-License-Identifier: MIT
+// Copyright (C) 2025-2026, Advanced Micro Devices, Inc. All rights reserved.
+//
+// Auto-generated. Do not edit. See codegen/gen_instances_gfx1250.py.
+//
+// Pre-compiled (.co) kid: no device TU is emitted for this launcher. The kernel
+// image is built offline by csrc/opus_gemm/gen_co/build_co.py.
+#pragma once
+#if !defined(__HIP_DEVICE_COMPILE__) && !defined(__HIPCC_RTC__)
+#include "aiter_tensor.h"
+#include "aiter_stream.h"
+#include <optional>
+#endif
+// Traits only -- see the emit docstring. There is deliberately no
+// OPUS_FUSED_HOST_TU branch and no pipeline include: this header is identical
+// on every pass.
+#include "{traits_header}"
+{traits_alias}
+#if !defined(__HIP_DEVICE_COMPILE__) && !defined(__HIPCC_RTC__)
+#include "gfx1250/opus_co_launch_gfx1250.cuh"
+
+template <typename D_C>
+void
+{k.name}(
+    aiter_tensor_t &XQ,
+    aiter_tensor_t &WQ,
+    aiter_tensor_t &Y,
+    std::optional<aiter_tensor_t> bias,
+    int splitK)
+{{
+    static_assert(std::is_same<D_C, bf16_t>::value,
+        "the 4wave_co kernel writes bf16 C directly -- there is no reduce "
+        "kernel and no fp32 workspace slot to dispatch through");
+
+    int batch = XQ.size(0);
+    int M = XQ.size(1);
+    int N = WQ.size(1);
+    int K = XQ.size(2);
+
+    using Traits = {k.name}_Traits;
+
+    AITER_CHECK(Y.dtype() == AITER_DTYPE_bf16,
+        "4wave_co writes bf16 C directly (no reduce kernel to cast): Y must be "
+        "bf16, got ", AiterDtype_to_str(Y.dtype()));
+    AITER_CHECK(!bias.has_value(), "4wave_co does not support bias");
+    AITER_CHECK(splitK <= 1,
+        "4wave_co has no split-K (got splitK=", splitK, ")");
+    AITER_CHECK(M >= 1 && N >= 1 && K >= 1 && batch >= 1,
+        "M, N, K, batch must be >= 1");
+    // No M/N/K alignment guard, and deliberately so. Every tail is handled by
+    // the TDM descriptor: tdm::make_descriptor() clamps EVERY dimension with
+    // saturating_sub(extent, origin), and the C store window's fastest axis IS
+    // N, so the hardware writes min(B_N, n - col) columns of each row. Ragged
+    // M and ragged K ride the same mechanism.
+    //
+    // (An earlier revision asserted N % B_N == 0 on the theory that the
+    // epilogue bounded the store by bytes-remaining-in-the-matrix and an N tail
+    // would spill into the next row. That is make_gmem's num_records semantics,
+    // not the TDM's -- this pipeline builds no gmem descriptor at all.)
+
+    {kargs_name} kargs{{}};
+    kargs.ptr_a = XQ.data_ptr();
+    kargs.ptr_b = WQ.data_ptr();
+    kargs.ptr_c = Y.data_ptr();
+    kargs.m = M; kargs.n = N; kargs.k = K;
+    kargs.stride_a       = XQ.stride(1);
+    kargs.stride_b       = WQ.stride(1);
+    kargs.stride_c       = N;
+    // 64-bit: a batch stride is an ELEMENT count over a whole matrix, so it
+    // passes 2^31 at 4 GiB of bf16 and the kernel offsets by it per batch.
+    kargs.stride_a_batch = XQ.stride(0);
+    kargs.stride_b_batch = WQ.stride(0);
+    // kargs carries no batch count (grid.z is it) and no C batch stride (the
+    // kernel derives m * stride_c), which is what keeps the struct at 64 B.
+
+    // Round the tile counts up to whole clusters: the runtime rejects a cluster
+    // launch whose grid is not a multiple of the cluster dims, so a half-full
+    // cluster does not exist and the surplus workgroups WILL be dispatched. The
+    // kernel absorbs them -- they fail the tile bound check and leave right
+    // after the one cluster-scope barrier they owe their peers, having touched
+    // neither LDS nor the TDM. So any (M, N) is launchable with any cluster
+    // dims, and there is deliberately no divisibility AITER_CHECK here.
+    int grid_m = (M + Traits::kBlockM - 1) / Traits::kBlockM;
+    int grid_n = (N + Traits::kBlockN - 1) / Traits::kBlockN;
+    grid_m = (grid_m + Traits::kClusterWgM - 1) / Traits::kClusterWgM * Traits::kClusterWgM;
+    grid_n = (grid_n + Traits::kClusterWgN - 1) / Traits::kClusterWgN * Traits::kClusterWgN;
+
+    // Resolved (file read + module registration) on first call only: the symbol
+    // is this launcher's own name, so one static per launcher is exact.
+    static AiterAsmKernelFast& kernel = opus_gfx1250_co::co_kernel("{k.name}");
+
+    // One launch covers the whole batch (grid.z), unlike the ws pipeline's host
+    // batch loop: the kernel offsets A/B/C by workgroup_id_z * stride_*_batch.
+    opus_co_launch_gfx1250<Traits>(
+        kernel,
+        dim3(grid_m, grid_n, batch),
+        dim3(Traits::BLOCK_SIZE),
+        kargs,
+        aiter::getCurrentHIPStream());
+}}
+#endif // launcher only on regular host pass
+"""
+    Path(os.path.join(cg.impl_path, f"{k.name}.cuh")).write_text(INSTANCE_IMPL)
+
+    # Host launcher only. NOTHING is appended to cg._device_instantiations --
+    # that omission is the whole bypass (see the docstring).
+    for CDtype in k.output_dtypes:
+        host_decl = (
+            f"template void\n"
+            f"{k.name}<{CDtype}>(\n"
+            f"    aiter_tensor_t &XQ,\n"
+            f"    aiter_tensor_t &WQ,\n"
+            f"    aiter_tensor_t &Y,\n"
+            f"    std::optional<aiter_tensor_t>,\n"
+            f"    int);\n"
+        )
+        cg._host_instantiations.append(
+            {"kid_name": k.name, "dtype": CDtype, "host_decl": host_decl}
+        )
+
+
 # ---------- Self-register at import time ----------
+register_emit("gfx1250", "a16w16_4wave_co", gen_4wave_co_instance)
+register_emit("gfx1250", "a16w16_4wave_wl_co", gen_4wave_co_instance)
 register_emit(
     "gfx1250", "a16w16_cluster_tdm_splitk_ws", gen_cluster_tdm_splitk_ws_instance
 )

@@ -22,15 +22,6 @@ from ..jit.utils.torch_guard import torch_compile_guard
 from ..ops.gemm_op_common import get_padded_m
 from ..utility import dtypes
 
-
-def is_flydsl_available():
-    try:
-        from ..ops.flydsl.utils import is_flydsl_available as _is_flydsl_available
-    except ImportError:
-        return False
-    return _is_flydsl_available()
-
-
 aiter_lib = Library("aiter", "FRAGMENT")
 
 
@@ -139,14 +130,16 @@ def gemm_a8w8_bpreshuffle_cktile(
 
 def _parse_flydsl_kernel_name(kernel_name: str):
     """Parse a flydsl kernelName into ``(tile_m, tile_n, tile_k, async_copy,
-    waves_per_eu, xcd_swizzle, lds_stage, scheduler)``, or None on failure.
-    Legacy names lacking the xcd/lds/scheduler tokens default them to
-    ``0``/``2``/``"Default"``.
+    waves_per_eu, xcd_swizzle, lds_stage, scheduler, k_split)``, or None on
+    failure. Legacy names lacking the xcd/lds/scheduler tokens default them to
+    ``0``/``2``/``"Default"``; the ``_ksN`` split-K suffix is only emitted for
+    k_split > 1, so every previously tuned name still parses to k_split=1.
     """
     import re
 
     m = re.match(
-        r"flydsl_bpreshuflle_(\d+)x(\d+)x(\d+)_\w+_\w+_\w+_(\d+)x(\d+)(?:x(\d+))?(?:x(\d+))?(?:_([A-Za-z][A-Za-z0-9]*))?$",
+        r"flydsl_bpreshuflle_(\d+)x(\d+)x(\d+)_\w+_\w+_\w+_(\d+)x(\d+)(?:x(\d+))?(?:x(\d+))?"
+        r"(?:_(?!ks\d+$)([A-Za-z][A-Za-z0-9]*))?(?:_ks(\d+))?$",
         kernel_name,
     )
     if m is None:
@@ -155,7 +148,8 @@ def _parse_flydsl_kernel_name(kernel_name: str):
     xcd_swizzle = int(m.group(6)) if m.group(6) else 0
     lds_stage = int(m.group(7)) if m.group(7) else 2
     scheduler = m.group(8) if m.group(8) else "Default"
-    return (tm, tn, tk, acp, wpe, xcd_swizzle, lds_stage, scheduler)
+    k_split = int(m.group(9)) if m.group(9) else 1
+    return (tm, tn, tk, acp, wpe, xcd_swizzle, lds_stage, scheduler, k_split)
 
 
 def gemm_a8w8_bpreshuffle_flydsl(
@@ -187,7 +181,7 @@ def gemm_a8w8_bpreshuffle_flydsl(
     parsed = _parse_flydsl_kernel_name(kernel_name)
     if parsed is None:
         return gemm_a8w8_bpreshuffle_ck(XQ, WQ, x_scale, w_scale, Out)
-    tm, tn, tk, acp, wpe, xcd_swizzle, lds_stage, scheduler = parsed
+    tm, tn, tk, acp, wpe, xcd_swizzle, lds_stage, scheduler, k_split = parsed
 
     flydsl_preshuffle_gemm_a8(
         XQ.contiguous(),
@@ -203,6 +197,7 @@ def gemm_a8w8_bpreshuffle_flydsl(
         xcd_swizzle,
         lds_stage=lds_stage,
         enable_scheduler=str(scheduler).lower() != "off",
+        split_k=k_split,
     )
     return Out
 
@@ -750,12 +745,12 @@ def gemm_a8w8_bpreshuffle(
             return gemm_a8w8_bpreshuffle_ck(XQ, WQ, x_scale, w_scale, Y, splitK)
         elif libtype == "cktile":
             return gemm_a8w8_bpreshuffle_cktile(XQ, WQ, x_scale, w_scale, Y, splitK)
-        elif libtype == "flydsl" and is_flydsl_available():
+        elif libtype == "flydsl":
             if w_k > k:
                 XQ = F.pad(XQ.contiguous(), (0, w_k - k), value=0)
             return gemm_a8w8_bpreshuffle_flydsl(XQ, WQ, x_scale, w_scale, Y, config)
 
-    if get_gfx() == "gfx1250" and is_flydsl_available():
+    if get_gfx() == "gfx1250":
         from ..ops.flydsl.gemm_tune.flydsl_gemm_a8w8_bpreshuffle_wmma_common import (
             kernel_fits_shape,
             kernels_list,
@@ -985,10 +980,6 @@ def gemm_a8w8_blockscale_bpreshuffle(
                 is_x_scale_transposed=True,
                 backend=backend,
             )
-        if not is_flydsl_available():
-            raise RuntimeError(
-                "gfx1250 mxfp8_128 bpreshuffle (fp8_e8m0 scales) requires FlyDSL"
-            )
         if config is not None and config["libtype"] == "flydsl":
             return gemm_a8w8_mxfp8_128_bpreshuffle_flydsl(
                 XQ, WQ, x_scale, w_scale, Y, config
@@ -1111,7 +1102,7 @@ def gemm_a8w8_blockscale_bpreshuffle(
             return opus_gemm_a8w8_blockscale_bpreshuffle_tune(
                 XQ, WQ, x_scale, w_scale, Y, kernelId=kernelId
             )
-        elif libtype == "flydsl" and is_flydsl_available():
+        elif libtype == "flydsl":
             return gemm_a8w8_mxfp8_128_bpreshuffle_flydsl(
                 XQ, WQ, x_scale, w_scale, Y, config
             )

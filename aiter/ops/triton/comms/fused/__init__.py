@@ -13,7 +13,7 @@ Examples:
 - reduce_scatter + gemm + all_gather
 """
 
-from .reduce_scatter_rmsnorm_quant_all_gather import (
+from aiter.ops.triton.comms.fused.reduce_scatter_rmsnorm_quant_all_gather import (
     reduce_scatter_rmsnorm_quant_all_gather,
 )
 

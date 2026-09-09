@@ -14,6 +14,12 @@ _DTYPE_INFO = {
     torch.int32: ("<i4", 4, None),
     torch.float32: ("<f4", 4, None),
     torch.bfloat16: ("<u1", 2, torch.bfloat16),
+    # The quantizing wires: an fp8 payload views as fp8, an fp4 one as raw bytes
+    # (its row width is in BYTES, not features), and both e8m0 scale rows are
+    # bytes. Same byte-view-then-reinterpret shape as bf16, one byte per element.
+    torch.uint8: ("|u1", 1, None),
+    torch.float8_e4m3fn: ("<u1", 1, torch.float8_e4m3fn),
+    torch.float8_e4m3fnuz: ("<u1", 1, torch.float8_e4m3fnuz),
 }
 
 

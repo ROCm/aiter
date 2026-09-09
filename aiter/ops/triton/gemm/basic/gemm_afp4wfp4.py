@@ -39,6 +39,10 @@ def get_splitk(K: int, BLOCK_SIZE_K: int, NUM_KSPLIT: int):
     # heuristics for make "EVEN_K == True" as much as possible
     NUM_KSPLIT_STEP = 2
     BLOCK_SIZE_K_STEP = 2
+    # Both decrements floor-divide, so they must be clamped: a NUM_KSPLIT below
+    # NUM_KSPLIT_STEP would go to 0 and the next cdiv(K, NUM_KSPLIT) would
+    # divide by zero, and BLOCK_SIZE_K can fall under the 16 that
+    # compute_splitk_params() enforces everywhere else.
     SPLITK_BLOCK_SIZE = (
         triton.cdiv((2 * triton.cdiv(K, NUM_KSPLIT)), BLOCK_SIZE_K) * BLOCK_SIZE_K
     )
@@ -50,14 +54,14 @@ def get_splitk(K: int, BLOCK_SIZE_K: int, NUM_KSPLIT: int):
         ):
             break
         elif K % (SPLITK_BLOCK_SIZE // 2) != 0 and NUM_KSPLIT > 1:
-            NUM_KSPLIT = NUM_KSPLIT // NUM_KSPLIT_STEP
+            NUM_KSPLIT = max(NUM_KSPLIT // NUM_KSPLIT_STEP, 1)
         elif SPLITK_BLOCK_SIZE % BLOCK_SIZE_K != 0:
             if NUM_KSPLIT > 1:
-                NUM_KSPLIT = NUM_KSPLIT // NUM_KSPLIT_STEP
+                NUM_KSPLIT = max(NUM_KSPLIT // NUM_KSPLIT_STEP, 1)
             elif BLOCK_SIZE_K > 16:
-                BLOCK_SIZE_K = BLOCK_SIZE_K // BLOCK_SIZE_K_STEP
+                BLOCK_SIZE_K = max(BLOCK_SIZE_K // BLOCK_SIZE_K_STEP, 16)
         elif K % (BLOCK_SIZE_K // 2) != 0 and BLOCK_SIZE_K > 16:
-            BLOCK_SIZE_K = BLOCK_SIZE_K // BLOCK_SIZE_K_STEP
+            BLOCK_SIZE_K = max(BLOCK_SIZE_K // BLOCK_SIZE_K_STEP, 16)
         else:
             break
 
@@ -417,7 +421,6 @@ def gemm_afp4wfp4_preshuffled_scales(
     return y
 
 
-# TODO: Split-K support
 def gemm_afp4wfp4_preshuffle(
     x_fp4: torch.Tensor,
     w_preshuf: torch.Tensor,
@@ -558,7 +561,7 @@ def gemm_afp4wfp4_preshuffle(
 
     if config["NUM_KSPLIT"] > 1:
         SPLITK_BLOCK_SIZE, BLOCK_SIZE_K, NUM_KSPLIT = get_splitk(
-            K_elems, config["BLOCK_SIZE_K"], config["NUM_KSPLIT"]
+            K_bytes, config["BLOCK_SIZE_K"], config["NUM_KSPLIT"]
         )
 
         config["SPLITK_BLOCK_SIZE"] = SPLITK_BLOCK_SIZE
@@ -607,7 +610,7 @@ def gemm_afp4wfp4_preshuffle(
         w_scales,
         M,
         N,
-        K_elems,
+        K_bytes,
         x_fp4.stride(0),
         x_fp4.stride(1),
         w_preshuf.stride(0),
@@ -630,7 +633,7 @@ def gemm_afp4wfp4_preshuffle(
         # NOTE: REDUCE_BLOCK_SIZE_N=16 gives best perf with fp32 partials and
         # REDUCE_BLOCK_SIZE_N=128 gives best perf with bf16 partials
         REDUCE_BLOCK_SIZE_N = 128 if _USE_GEMM_SPLITK_BF16 else 64
-        ACTUAL_KSPLIT = triton.cdiv(K_elems, (config["SPLITK_BLOCK_SIZE"] // 2))
+        ACTUAL_KSPLIT = triton.cdiv(K_bytes, (config["SPLITK_BLOCK_SIZE"] // 2))
 
         grid_reduce = (
             triton.cdiv(M, REDUCE_BLOCK_SIZE_M),
