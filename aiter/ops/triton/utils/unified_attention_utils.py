@@ -182,7 +182,9 @@ def compute_segment_params(config: dict, params) -> dict:
     prgms = max(1, params.num_2d_prgms)
     # this is specific to gfx950 gluon as the num waves depends on mfma dim there
     if mfma_dim:
-        num_waves = max(1, triton.next_power_of_2(params.num_queries_per_kv) // mfma_dim)
+        num_waves = max(
+            1, triton.next_power_of_2(params.num_queries_per_kv) // mfma_dim
+        )
         budget //= num_waves
     share = triton.cdiv(budget, prgms)
     if limit <= min_tiles or share < min_share:
