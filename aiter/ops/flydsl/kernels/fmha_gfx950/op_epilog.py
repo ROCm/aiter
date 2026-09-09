@@ -8,12 +8,17 @@ import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl._mlir import ir
 from flydsl._mlir.dialects import llvm
-from flydsl.expr import gpu, range_constexpr, rocdl
+from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import T
 from flydsl.expr.typing import Vector as Vec
 from flydsl.expr.utils.arith import _to_raw as as_mlir_value
 
-from aiter.ops.flydsl.kernels.fmha_gfx950.pipeline import DualwaveFp8KernelContext
+from aiter.ops.flydsl.kernels.fmha_gfx950.pipeline import (
+    DualwaveFp8KernelContext,
+    _lse_store,
+    _lse_value,
+    _make_ws_rsrc,
+)
 
 
 class DualwaveFp8StoreHelper(DualwaveFp8KernelContext):
@@ -52,13 +57,41 @@ class DualwaveFp8StoreHelper(DualwaveFp8KernelContext):
             [fx.Int32(w) for w in self._packed_o_128_dwords(v_o, dc, g)], fx.Int32
         )
 
-    def store_final_o(self, v_o, q_row):
+    def store_lse_row(self, m_row, l_row, q_row):
+        # Dense LSE is [B, H, Sq] (per-batch slice); varlen is [H, total_q]
+        # (per-head slice). lse_stride_h is Sq resp. total_q.
+        traits = self.traits
+        if const_expr(traits.VARLEN):
+            slice_elems = self.lse_stride_h_v
+            slice_off = self.q_head_idx * slice_elems
+            local = self.q_tok_base + q_row
+        else:
+            slice_elems = traits.NUM_HEADS_Q * self.lse_stride_h_v
+            slice_off = self.batch_idx * slice_elems
+            local = self.q_head_idx * self.lse_stride_h_v + q_row
+        lse_rsrc = _make_ws_rsrc(
+            fx.Int64(fx.ptrtoint(fx.get_iter(self.LSE))), slice_off * 4, slice_elems * 4
+        )
+        _lse_store(
+            lse_rsrc,
+            _lse_value(
+                fx.Float32(m_row) * self.c_logit_scale, l_row, traits, self.fm_fast
+            ),
+            local,
+            slice_elems,
+            q_row < self.seqlen_q_v,
+            self.lane < 32,
+        )
+
+    def store_final_o(self, v_o, q_row, m_row=None, l_row=None):
         for dc in range_constexpr(self.traits.D_CHUNKS):
             for g in range_constexpr(2):
                 o_pack = self._packed_o_128_vec(v_o, dc, g)
                 d_col = (dc * self.traits.D_CHUNK) + (2 * g + self.lane_div_32) * 8
                 o_global = self.global_idx_o(q_row, d_col)
                 self.buffer_store_128(o_pack, o_global)
+        if const_expr(self.traits.RETURN_LSE):
+            self.store_lse_row(m_row, l_row, q_row)
 
     def store_splitk_partial_o(self, v_o, m_row, l_row, q_row):
         m_row = fx.Float32(m_row) * self.c_logit_scale

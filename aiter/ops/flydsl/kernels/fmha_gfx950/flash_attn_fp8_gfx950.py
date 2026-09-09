@@ -51,6 +51,7 @@ def build_flash_attn_dualwave_swp_fp8_module(
     cross_seqlen=False,
     block_m=256,
     batch_interleave_group=1,
+    return_lse=False,
 ):
     """Build the gfx950 dual-wave fp8 launcher (dense, packed varlen, or split-K)."""
     gpu_arch = get_hip_arch()
@@ -85,6 +86,7 @@ def build_flash_attn_dualwave_swp_fp8_module(
         varlen=varlen,
         cross_seqlen=cross_seqlen,
         batch_interleave_group=batch_interleave_group,
+        return_lse=return_lse,
     )
     # Builder-level aliases used by SharedStorage and the launch/compile wrappers.
     SPLITK = traits.SPLITK
@@ -93,6 +95,7 @@ def build_flash_attn_dualwave_swp_fp8_module(
     HEAD_DIM = traits.HEAD_DIM
     NUM_HEADS_Q = traits.NUM_HEADS_Q
     BATCH_INTERLEAVE_GROUP = traits.BATCH_INTERLEAVE_GROUP
+    RETURN_LSE = traits.RETURN_LSE
     DEFAULT_STRIDE_Q_N = traits.DEFAULT_STRIDE_Q_N
     DEFAULT_STRIDE_O_N = traits.DEFAULT_STRIDE_O_N
     DEFAULT_STRIDE_KV_N = traits.DEFAULT_STRIDE_KV_N
@@ -121,11 +124,13 @@ def build_flash_attn_dualwave_swp_fp8_module(
         QDescale: fx.Tensor,
         KDescale: fx.Tensor,
         VDescale: fx.Tensor,
+        LSE: fx.Tensor,
         seq_len: fx.Int32,
         seq_len_kv: fx.Int32,
         stride_q_n: fx.Int32,
         stride_kv_n: fx.Int32,
         head_dim_runtime: fx.Int32,
+        lse_stride_h: fx.Int32,
     ):
         ctx = DualwaveFp8KernelContext(
             traits,
@@ -139,11 +144,13 @@ def build_flash_attn_dualwave_swp_fp8_module(
             QDescale,
             KDescale,
             VDescale,
+            LSE,
             seq_len,
             seq_len_kv,
             stride_q_n,
             stride_kv_n,
             head_dim_runtime,
+            lse_stride_h,
         )
         ctx.init_types_and_constants()
         ctx.init_runtime_indices()
@@ -331,7 +338,7 @@ def build_flash_attn_dualwave_swp_fp8_module(
         softmax_helper.scale_o(v_o, inv_l)
         rocdl.s_barrier()
         if const_expr(not SPLITK):
-            output_store.store_final_o(v_o, q_row)
+            output_store.store_final_o(v_o, q_row, m_row, l_row)
         else:
             output_store.store_splitk_partial_o(v_o, m_row, l_row, q_row)
             output_store.store_empty_split()
@@ -347,12 +354,22 @@ def build_flash_attn_dualwave_swp_fp8_module(
         O: fx.Tensor,
         WS: fx.Tensor,
         CuSeqQ: fx.Tensor,
+        LSE: fx.Tensor,
         batch_size: fx.Int32,
         seq_len: fx.Int32,
         stride_o_n: fx.Int32,
+        lse_stride_h: fx.Int32,
     ):
         ctx = DualwaveSplitKCombineContext(
-            traits, O, WS, batch_size, seq_len, stride_o_n, CuSeqQ=CuSeqQ
+            traits,
+            O,
+            WS,
+            batch_size,
+            seq_len,
+            stride_o_n,
+            CuSeqQ=CuSeqQ,
+            LSE=LSE,
+            lse_stride_h=lse_stride_h,
         )
         ctx.init_types_and_constants()
         ctx.init_runtime_indices()
@@ -364,6 +381,8 @@ def build_flash_attn_dualwave_swp_fp8_module(
         m_s, l_s = combine.load_ml_rows()
         m_max = combine.reduce_m_max(m_s)
         acc, den = combine.accumulate_splits(m_s, l_s, m_max)
+        if const_expr(RETURN_LSE):
+            combine.store_lse(m_max, den)
         o_pack = combine.pack_output(acc, den)
         combine.store_output(o_pack)
 
@@ -379,12 +398,14 @@ def build_flash_attn_dualwave_swp_fp8_module(
         QDescale: fx.Tensor,
         KDescale: fx.Tensor,
         VDescale: fx.Tensor,
+        LSE: fx.Tensor,
         batch_size: fx.Int32,
         seq_len: fx.Int32,
         seq_len_kv: fx.Int32,
         stride_q_n: fx.Int32,
         stride_kv_n: fx.Int32,
         head_dim_runtime: fx.Int32,
+        lse_stride_h: fx.Int32,
         stream: fx.Stream = fx.Stream(None),  # noqa: B008  framework idiom
     ):
         # Make shape/mode traits visible to the JIT cache key.
@@ -419,11 +440,13 @@ def build_flash_attn_dualwave_swp_fp8_module(
             QDescale,
             KDescale,
             VDescale,
+            LSE,
             seq_len,
             seq_len_kv,
             stride_q_n,
             stride_kv_n,
             head_dim_runtime,
+            lse_stride_h,
             value_attrs={
                 "rocdl.waves_per_eu": 1,
                 "rocdl.flat_work_group_size": f"{BLOCK_SIZE},{BLOCK_SIZE}",
@@ -445,7 +468,7 @@ def build_flash_attn_dualwave_swp_fp8_module(
             else:
                 stride_o_n = fx.Int32(DEFAULT_STRIDE_O_N)
             flash_attn_splitk_combine_kernel(
-                O, Workspace, CuSeqQ, batch_size, seq_len, stride_o_n
+                O, Workspace, CuSeqQ, LSE, batch_size, seq_len, stride_o_n, lse_stride_h
             ).launch(
                 grid=(combine_blocks, bs_idx, 1),
                 block=(COMBINE_BLOCK, 1, 1),
@@ -482,6 +505,8 @@ def build_flash_attn_dualwave_swp_fp8_module(
         q_descale=None,
         k_descale=None,
         v_descale=None,
+        lse=None,
+        lse_stride_h=0,
         stream=None,
     ):
         """Normalise the launch arguments shared by the run and compile paths."""
@@ -503,6 +528,9 @@ def build_flash_attn_dualwave_swp_fp8_module(
             raise ValueError(
                 "num_kv_splits > 1 requires a fp32 workspace (see dualwave_splitk_workspace_elems)"
             )
+        # O is bf16 and would be corrupted by the fp32 LSE stores.
+        if RETURN_LSE and lse is None:
+            raise ValueError("return_lse=True requires a fp32 lse tensor")
         ws = workspace if SPLITK else O
         return (
             Q,
@@ -515,12 +543,14 @@ def build_flash_attn_dualwave_swp_fp8_module(
             O if q_descale is None else q_descale,
             O if k_descale is None else k_descale,
             O if v_descale is None else v_descale,
+            O if lse is None else lse,
             batch_size,
             seq_len,
             seq_len_kv,
             stride_q_n,
             stride_kv_n,
             head_dim_runtime,
+            lse_stride_h,
             fx.Stream(stream),
         )
 

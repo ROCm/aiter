@@ -141,6 +141,7 @@ def _build_fp8(
     num_kv_splits: int = 1,
     block_m: int = 256,
     batch_interleave_group: int = 1,
+    return_lse: bool = False,
 ):
     """Build (and cache) the gfx950 fp8 launcher (dense, packed varlen, or split-K)."""
     from aiter.ops.flydsl.kernels.fmha_gfx950.flash_attn_fp8_gfx950 import (
@@ -163,6 +164,7 @@ def _build_fp8(
         num_kv_splits=num_kv_splits,
         block_m=block_m,
         batch_interleave_group=batch_interleave_group,
+        return_lse=return_lse,
     )
 
 
@@ -184,12 +186,14 @@ def flydsl_flash_attn_fp8_func(
     k_descale: torch.Tensor | None = None,
     v_descale: torch.Tensor | None = None,
     out: torch.Tensor | None = None,
+    return_lse: bool = False,
+    lse: torch.Tensor | None = None,
     daz: bool = True,
     dualwave_swp_lazy_rescale: bool = True,
     dualwave_swp_setprio: bool = True,
     dualwave_swp_enable_stagger: bool = True,
     stream: torch.cuda.Stream | None = None,
-) -> torch.Tensor:
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """Run the gfx950 DUALWAVE_SWP fp8 flash attention forward.
 
     Args:
@@ -208,6 +212,9 @@ def flydsl_flash_attn_fp8_func(
         fp8_block_m: Pin the tile height to 128 or 256. ``None`` autotunes it.
         q_descale / k_descale / v_descale: fp32 shape-[1] descales, required.
         out: Optional pre-allocated bf16 output of shape ``q.shape[:-1] + (Dv,)``.
+        return_lse: Also return the fp32 log-sum-exp of the softmax logits.
+        lse: Optional pre-allocated fp32 LSE buffer; allocated here when None.
+            Dense: ``[B, H, Sq]``. Varlen: ``[H, total_q]``.
         daz: Enable denormals-are-zero.
         dualwave_swp_lazy_rescale: Enable lazy online softmax rescale.
         dualwave_swp_setprio: Enable s_setprio scheduling hints.
@@ -215,7 +222,8 @@ def flydsl_flash_attn_fp8_func(
         stream: CUDA/HIP stream to launch on.
 
     Returns:
-        bf16 output tensor of shape ``q.shape[:-1] + (v.shape[-1],)``.
+        bf16 output tensor of shape ``q.shape[:-1] + (v.shape[-1],)``, or
+        ``(out, lse)`` when ``return_lse``.
     """
     if not (q.is_cuda and k.is_cuda and v.is_cuda):
         raise ValueError("flydsl_flash_attn_fp8_func: q/k/v must be CUDA tensors")
@@ -263,6 +271,7 @@ def flydsl_flash_attn_fp8_func(
             "q_descale": q_descale,
             "k_descale": k_descale,
             "v_descale": v_descale,
+            "return_lse": return_lse,
             "daz": daz,
             "dualwave_swp_lazy_rescale": dualwave_swp_lazy_rescale,
             "dualwave_swp_setprio": dualwave_swp_setprio,
@@ -275,6 +284,12 @@ def flydsl_flash_attn_fp8_func(
             out = torch.empty(
                 q.shape[:-1] + (v.shape[-1],), dtype=torch.bfloat16, device=q.device
             )
+        if return_lse and lse is None:
+            lse = torch.empty(
+                (q.shape[0], q.shape[2], q.shape[1]),
+                dtype=torch.float32,
+                device=q.device,
+            )
         for i in range(q.shape[0]):
             sl = slice(i, i + 1)
             flydsl_flash_attn_fp8_func(
@@ -282,9 +297,10 @@ def flydsl_flash_attn_fp8_func(
                 k[sl].contiguous(),
                 v[sl].contiguous(),
                 out=out[sl],
+                lse=lse[sl] if return_lse else None,
                 **kw,
             )
-        return out
+        return (out, lse) if return_lse else out
 
     if any(x is None for x in (q_descale, k_descale, v_descale)):
         raise ValueError(
@@ -432,6 +448,7 @@ def flydsl_flash_attn_fp8_func(
             batch_interleave_group=_fp8_batch_interleave_group(
                 B, causal, cross, int(num_kv_splits)
             ),
+            return_lse=return_lse,
         )
 
         _out_shape = tuple(q.shape[:-1]) + (Dv,)
@@ -451,6 +468,25 @@ def flydsl_flash_attn_fp8_func(
                 f"{tuple(out.stride())} for shape {tuple(out.shape)}"
             )
 
+        # Dense LSE is [B, H, Sq]; varlen is [H, total_q] (aiter's convention).
+        if return_lse:
+            _lse_shape = (H, int(q.shape[0])) if varlen else (B, H, Sq)
+            if lse is None:
+                lse = torch.empty(_lse_shape, dtype=torch.float32, device=q.device)
+            elif tuple(lse.shape) != _lse_shape:
+                raise ValueError(
+                    f"flydsl_flash_attn_fp8_func: lse must be {_lse_shape}, got {tuple(lse.shape)}"
+                )
+            elif lse.dtype != torch.float32:
+                raise ValueError(
+                    f"flydsl_flash_attn_fp8_func: lse must be float32, got {lse.dtype}"
+                )
+            elif not lse.is_contiguous():
+                raise ValueError(
+                    "flydsl_flash_attn_fp8_func: lse must be contiguous, got strides "
+                    f"{tuple(lse.stride())} for shape {tuple(lse.shape)}"
+                )
+
         # The fp8 gfx950 module takes flattened Q/K/V/O plus descale kwargs.
         q_flat = q.contiguous().view(-1)
         k_flat = k.contiguous().view(-1)
@@ -463,6 +499,9 @@ def flydsl_flash_attn_fp8_func(
             "k_descale": k_descale,
             "v_descale": v_descale,
         }
+        if return_lse:
+            kwargs["lse"] = lse.view(-1)
+            kwargs["lse_stride_h"] = _lse_shape[-1]
         if splitk:
             _ws = torch.empty(ws_elems, dtype=torch.float32, device=q.device)
             if stream is not None:
@@ -477,5 +516,7 @@ def flydsl_flash_attn_fp8_func(
         exe(q_flat, k_flat, v_flat, o_flat, B, Sq, **kwargs)
         if stream is not None:
             out.record_stream(launch_stream)
+            if return_lse:
+                lse.record_stream(launch_stream)
 
-    return out
+    return (out, lse) if return_lse else out

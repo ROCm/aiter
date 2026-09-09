@@ -14,8 +14,9 @@ from flydsl.expr.utils.arith import _to_raw as as_mlir_value
 
 from aiter.ops.flydsl.kernels import buffer_ops
 from aiter.ops.flydsl.kernels.fmha_gfx950.pipeline import (
-    _LOG2E,
     _cu_load,
+    _lse_store,
+    _lse_value,
     _make_ws_rsrc,
 )
 
@@ -31,9 +32,9 @@ class DualwaveSplitKCombineContext:
         batch_size=None,
         seq_len=None,
         stride_o_n=None,
-        LSE=None,
-        Sink=None,
         CuSeqQ=None,
+        LSE=None,
+        lse_stride_h=None,
     ):
         if isinstance(traits_or_ctx, DualwaveSplitKCombineContext):
             self.__dict__.update(traits_or_ctx.__dict__)
@@ -44,9 +45,9 @@ class DualwaveSplitKCombineContext:
         self.traits = traits_or_ctx
         self.O = O
         self.WS = WS
-        self.LSE = LSE
-        self.Sink = Sink
         self.CuSeqQ = CuSeqQ
+        self.LSE = LSE
+        self.lse_stride_h = lse_stride_h
         self.batch_size = batch_size
         self.seq_len = seq_len
         self.stride_o_n = stride_o_n
@@ -56,11 +57,11 @@ class DualwaveSplitKCombineContext:
         self.fm_fast = fx.arith.FastMathFlags.fast
         self.c_zero_f = fx.Float32(0.0)
         self.c_zero_v4f32 = Vec.filled(4, 0.0, fx.Float32)
-        # LSE store folds the log2->ln conversion (m_max is sm_scale*log2e-scaled).
-        self.c_ln2_f = fx.Float32(1.0 / _LOG2E)
 
     def init_runtime_indices(self):
         self.seq_len_v = fx.Index(self.seq_len)
+        if const_expr(self.traits.RETURN_LSE):
+            self.lse_stride_h_v = fx.Index(self.lse_stride_h)
         self.stride_o_n_v = fx.Index(self.stride_o_n)
         self.batch_size_v = fx.Index(self.batch_size)
 
@@ -106,6 +107,8 @@ class DualwaveSplitKCombineContext:
             _cu_v1i32 = Vec.make_type(1, fx.Int32)
             q_tok_base = _cu_load(_cuq_div, self.batch_idx, _cu_atom, _cu_v1i32)
             q_tok_end = _cu_load(_cuq_div, self.batch_idx + 1, _cu_atom, _cu_v1i32)
+            self.q_tok_base = q_tok_base
+            self.seqlen_q_b = q_tok_end - q_tok_base
             batch_byte_off = q_tok_base * self.stride_o_n_v * 2
             nrec_bytes = (q_tok_end - q_tok_base) * self.stride_o_n_v * 2
         else:
@@ -217,6 +220,32 @@ class DualwaveSplitKCombineHelper(DualwaveSplitKCombineContext):
         lo = rocdl.cvt_pk_bf16_f32(out4[0], out4[1])
         hi = rocdl.cvt_pk_bf16_f32(out4[2], out4[3])
         return Vec.from_elements([fx.Int32(lo), fx.Int32(hi)], fx.Int32)
+
+    def store_lse(self, m_max, den):
+        # Dense LSE is [B, H, Sq] (per-batch slice); varlen is [H, total_q]
+        # (per-head slice). lse_stride_h is Sq resp. total_q.
+        traits = self.traits
+        if const_expr(traits.VARLEN):
+            slice_elems = self.lse_stride_h_v
+            slice_off = self.q_head_idx * slice_elems
+            local = self.q_tok_base + self.seq_idx
+            in_range = self.row_valid & (self.seq_idx < self.seqlen_q_b)
+        else:
+            slice_elems = traits.NUM_HEADS_Q * self.lse_stride_h_v
+            slice_off = self.batch_idx * slice_elems
+            local = self.q_head_idx * self.lse_stride_h_v + self.seq_idx
+            in_range = self.row_valid
+        lse_rsrc = _make_ws_rsrc(
+            fx.Int64(fx.ptrtoint(fx.get_iter(self.LSE))), slice_off * 4, slice_elems * 4
+        )
+        _lse_store(
+            lse_rsrc,
+            _lse_value(m_max, den, traits, self.fm_fast),
+            local,
+            slice_elems,
+            in_range,
+            self.col == 0,
+        )
 
     def store_output(self, o_pack):
         o_global = (

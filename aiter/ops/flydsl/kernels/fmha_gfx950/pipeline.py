@@ -19,6 +19,10 @@ from flydsl.expr.utils.arith import _to_raw as as_mlir_value
 from aiter.ops.flydsl.kernels import buffer_ops
 
 _LOG2E = host_math.log2(host_math.e)
+_LN2 = 1.0 / _LOG2E
+
+# log2 of e4m3's largest finite value, 448.
+_P_HEADROOM_LOG2 = 8.807354922057604
 
 
 LDS_BYTES_GFX950 = 160 * 1024
@@ -265,6 +269,37 @@ def _make_ws_rsrc(ws_base_i64, byte_offset, nrec_bytes):
     )
 
 
+def p_headroom_log2(traits):
+    """Exponent bias `sub_m` folds into P, so l_row carries a 2**this factor."""
+    h = _P_HEADROOM_LOG2
+    if traits.DUALWAVE_SWP_LAZY_RESCALE:
+        h -= traits.DUALWAVE_SWP_RESCALE_THRESHOLD
+    return max(0.0, h)
+
+
+def _lse_value(m_scaled, l_row, traits, fm_fast):
+    """LSE = m*ln2 + ln(l) - headroom*ln2, undoing the P headroom l_row carries.
+
+    ``m_scaled`` is the row max already multiplied by ``c_logit_scale`` (log2
+    domain, softmax scale folded); the result is a natural log.
+    """
+    bias = fx.Float32(-p_headroom_log2(traits) * _LN2)
+    return (
+        fx.Float32(m_scaled) * fx.Float32(_LN2)
+        + fx.log(fx.Float32(l_row), fastmath=fm_fast)
+        + bias
+    )
+
+
+def _lse_store(lse_rsrc, lse_val, local_idx, oob_idx, in_range, is_writer):
+    """One writer per row; everyone else aims past num_records, which drops it."""
+    off_row = in_range.select(local_idx, oob_idx)
+    off = fx.Index(is_writer.select(off_row, oob_idx))
+    buffer_ops.buffer_store(
+        as_mlir_value(fx.Float32(lse_val)), lse_rsrc, as_mlir_value(fx.Int32(off))
+    )
+
+
 def _buffer_load_128(elem_index, _load_atom_128, q_div, q_load_i32x4_type):
     """128-bit global->register load (buffer_load_dwordx4) from Q."""
     return fly.copy_atom_call_ssa(
@@ -356,6 +391,7 @@ class DualwaveSwpFp8Traits:
     SCHED_DS_READ_MASK: int
     NEG_INF_F32_BITS: int
     BATCH_INTERLEAVE_GROUP: int = 1
+    RETURN_LSE: bool = False
 
     @property
     def cache_tag(self):
@@ -382,6 +418,7 @@ class DualwaveSwpFp8Traits:
             self.VARLEN,
             self.CROSS_SEQLEN,
             self.BATCH_INTERLEAVE_GROUP,
+            self.RETURN_LSE,
         )
 
 
@@ -401,6 +438,7 @@ def _make_dualwave_swp_fp8_traits(
     varlen=False,
     cross_seqlen=False,
     batch_interleave_group=1,
+    return_lse=False,
 ):
     """Build gfx950 DUALWAVE_SWP fp8 compile-time layout traits.
 
@@ -545,6 +583,7 @@ def _make_dualwave_swp_fp8_traits(
         SCHED_DS_READ_MASK=0x100,
         NEG_INF_F32_BITS=0xFF800000,
         BATCH_INTERLEAVE_GROUP=int(batch_interleave_group),
+        RETURN_LSE=bool(return_lse),
     )
 
 
@@ -643,11 +682,13 @@ class DualwaveFp8KernelContext:
         QDescale=None,
         KDescale=None,
         VDescale=None,
+        LSE=None,
         seq_len=None,
         seq_len_kv=None,
         stride_q_n=None,
         stride_kv_n=None,
         head_dim_runtime=None,
+        lse_stride_h=None,
     ):
         if isinstance(traits_or_ctx, DualwaveFp8KernelContext):
             self.__dict__.update(traits_or_ctx.__dict__)
@@ -665,11 +706,13 @@ class DualwaveFp8KernelContext:
         self.QDescale = QDescale
         self.KDescale = KDescale
         self.VDescale = VDescale
+        self.LSE = LSE
         self.seq_len = seq_len
         self.seq_len_kv = seq_len_kv
         self.stride_q_n = stride_q_n
         self.stride_kv_n = stride_kv_n
         self.head_dim_runtime = head_dim_runtime
+        self.lse_stride_h = lse_stride_h
 
     def init_types_and_constants(self):
         traits = self.traits
@@ -689,6 +732,8 @@ class DualwaveFp8KernelContext:
         traits = self.traits
         self.seq_len_v = fx.Index(self.seq_len)
         self.seq_len_kv_v = fx.Index(self.seq_len_kv)
+        if const_expr(traits.RETURN_LSE):
+            self.lse_stride_h_v = fx.Index(self.lse_stride_h)
         self.stride_q_n_v = fx.Index(self.stride_q_n)
         self.stride_kv_n_v = fx.Index(self.stride_kv_n)
         if traits.HEAD_DIM_V == traits.HEAD_DIM:

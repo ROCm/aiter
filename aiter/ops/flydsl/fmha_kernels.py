@@ -239,7 +239,6 @@ def _fp8_gfx950_supported(
     v,
     *,
     softmax_scale,
-    return_lse,
     dropout_p,
     window_size,
     bias,
@@ -286,7 +285,6 @@ def _fp8_gfx950_supported(
         k.shape[-1] == qk_hdim
         and nkv > 0
         and nq % nkv == 0
-        and not return_lse
         and dropout_p == 0.0
         and all(w < 0 for w in window_size[:2])
         and (len(window_size) < 3 or window_size[2] == 0)
@@ -335,7 +333,6 @@ def flydsl_flash_attn_varlen_func(
         k,
         v,
         softmax_scale=softmax_scale,
-        return_lse=return_lse,
         dropout_p=dropout_p,
         window_size=window_size,
         bias=bias,
@@ -364,6 +361,7 @@ def flydsl_flash_attn_varlen_func(
             k_descale=k_descale,
             v_descale=v_descale,
             out=out,
+            return_lse=return_lse,
         )
 
     # FlyDSL m32x8 serves plain MHA plus attention-sink and sliding-window; other
@@ -459,7 +457,6 @@ def flydsl_flash_attn_batch_func(
         k,
         v,
         softmax_scale=softmax_scale,
-        return_lse=return_lse,
         dropout_p=dropout_p,
         window_size=window_size,
         bias=bias,
@@ -483,6 +480,7 @@ def flydsl_flash_attn_batch_func(
             k_descale=k_descale,
             v_descale=v_descale,
             out=out,
+            return_lse=return_lse,
         )
 
     # BSHD routes to the m32x8 kernel. D_v=128. D_qk 128/192 are

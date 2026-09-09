@@ -303,6 +303,8 @@ FP8_DTYPE = torch.float8_e4m3fn
 # Fixed fp8 correctness gate; fp8 is lossy, so these are absolute bounds.
 FP8_MAX_ERR = 5e-2
 FP8_MIN_COS = 0.98
+# LSE is fp32 all the way out; this bounds it well above the observed 5e-5.
+FP8_LSE_MAX_ERR = 5e-4
 FP8_UNIFORM_RANGE = (-1.0, 1.0)
 FP8_SEED = 123
 
@@ -363,6 +365,23 @@ def _ref_attention(q, k, v, causal):
     # A fully-masked row softmaxes to NaN; the kernel writes zeros there.
     probs = torch.nan_to_num(probs, nan=0.0)
     return torch.matmul(probs, v_t).transpose(1, 2)
+
+
+def _ref_lse(q, k, causal):
+    """fp64 log-sum-exp of the same logits ``_ref_attention`` softmaxes, as [B, H, Sq]."""
+    q_t, k_t = (t.transpose(1, 2).double() for t in (q, k))
+    nh_q, nh_kv = q_t.shape[1], k_t.shape[1]
+    if nh_q != nh_kv:
+        k_t = k_t.repeat_interleave(nh_q // nh_kv, dim=1)
+    Sq, D = q_t.shape[2], q_t.shape[3]
+    Skv = k_t.shape[2]
+    scores = torch.matmul(q_t, k_t.transpose(-1, -2)) / math.sqrt(D)
+    if causal:
+        delta = Skv - Sq
+        q_idx = torch.arange(Sq, device=q.device).view(-1, 1)
+        k_idx = torch.arange(Skv, device=q.device).view(1, -1)
+        scores = scores.masked_fill(k_idx > q_idx + delta, float("-inf"))
+    return torch.logsumexp(scores, dim=-1).float()
 
 
 def _run_fp8_shape(
@@ -686,9 +705,9 @@ def test_fp8_rejected_head_dims_raise_before_launch(head_dim, head_dim_v, match)
 def test_fp8_auto_split_kv_writes_every_row(batch, seq_len, num_heads):
     """Auto split-K must not drop the tail of the combine grid."""
     D = 128
-    assert (batch * num_heads * seq_len) % (
-        256 // (D // 4)
-    ) != 0, "shape would not exercise the tail"
+    assert (batch * num_heads * seq_len) % (256 // (D // 4)) != 0, (
+        "shape would not exercise the tail"
+    )
     torch.manual_seed(0)
     q, k, v = (
         torch.randn(batch, seq_len, num_heads, D, device="cuda", dtype=torch.bfloat16)
@@ -696,9 +715,9 @@ def test_fp8_auto_split_kv_writes_every_row(batch, seq_len, num_heads):
         for _ in range(3)
     )
     out = _run_fp8_into_nan_out(q, k, v, D, causal=False, num_kv_heads=num_heads)
-    assert not torch.isnan(
-        out
-    ).any(), f"{int(torch.isnan(out).any(-1).sum())} output rows were never written"
+    assert not torch.isnan(out).any(), (
+        f"{int(torch.isnan(out).any(-1).sum())} output rows were never written"
+    )
 
 
 @_gfx950_only
@@ -730,9 +749,9 @@ def test_fp8_varlen_split_kv_respects_batch_boundaries(seq_len, num_heads, head_
         "cross_seqlen": False,
     }
     split = _run_fp8_into_nan_out(q, k, v, head_dim_v, num_kv_splits=2, **kw)
-    assert not torch.isnan(
-        split
-    ).any(), f"{int(torch.isnan(split).any(-1).sum())} output rows were never written"
+    assert not torch.isnan(split).any(), (
+        f"{int(torch.isnan(split).any(-1).sum())} output rows were never written"
+    )
     unsplit = _run_fp8_into_nan_out(q, k, v, head_dim_v, num_kv_splits=1, **kw)
     torch.testing.assert_close(split.float(), unsplit.float(), rtol=2e-2, atol=2e-2)
 
@@ -1069,7 +1088,6 @@ def test_fp8_dispatch_varlen_routes_to_gfx950(causal):
     [
         pytest.param({}, id="no_descales"),
         pytest.param({"softmax_scale": 0.5}, id="custom_softmax_scale"),
-        pytest.param({"return_lse": True}, id="return_lse"),
         pytest.param({"dropout_p": 0.1}, id="dropout"),
         pytest.param({"window_size": (128, 0)}, id="sliding_window"),
         pytest.param({"window_size": (-1, -1, 4)}, id="sink_size"),
@@ -1099,6 +1117,163 @@ def test_fp8_dispatch_rejects_unsupported(unsupported):
         kw = {}
 
     assert flydsl_flash_attn_batch_func(q, k, v, causal=True, **kw) is None
+
+
+@_gfx950_only
+@pytest.mark.parametrize(
+    "causal, B, S, Skv, H, H_KV, D, Dv, splits",
+    [
+        (True, 2, 256, 256, 8, 8, 128, 128, None),
+        (False, 2, 256, 256, 8, 8, 128, 128, None),
+        (True, 1, 512, 1024, 16, 2, 128, 128, None),
+        (True, 1, 384, 384, 12, 12, 192, 128, None),
+        (True, 1, 128, 512, 8, 8, 192, 192, None),
+        (True, 1, 1024, 4096, 8, 1, 128, 128, 4),
+        (False, 2, 512, 512, 8, 8, 128, 128, 2),
+        (True, 1, 512, 2048, 12, 12, 192, 128, 4),
+    ],
+)
+def test_fp8_return_lse_dense(causal, B, S, Skv, H, H_KV, D, Dv, splits):
+    """Dense LSE is [B, H, Sq] fp32 and matches an fp64 logsumexp of the same logits.
+
+    Also pins that asking for LSE leaves O bit-identical: RETURN_LSE is a
+    compile-time trait, so the O path must be the same code either way.
+    """
+    from aiter.ops.flydsl.kernels.flash_attn_func_fp8_gfx950 import (
+        flydsl_flash_attn_fp8_func,
+    )
+
+    torch.manual_seed(0)
+
+    def _t(*shape):
+        return torch.empty(*shape, dtype=torch.bfloat16, device="cuda").uniform_(
+            *FP8_UNIFORM_RANGE
+        )
+
+    q, q_s = _fp8_quant(_t(B, S, H, D))
+    k, k_s = _fp8_quant(_t(B, Skv, H_KV, D))
+    v, v_s = _fp8_quant(_t(B, Skv, H_KV, Dv))
+    kw = {
+        "causal": causal,
+        "num_kv_heads": H_KV,
+        "num_kv_splits": splits,
+        "q_descale": q_s,
+        "k_descale": k_s,
+        "v_descale": v_s,
+    }
+    out, lse = flydsl_flash_attn_fp8_func(q, k, v, return_lse=True, **kw)
+    out_only = flydsl_flash_attn_fp8_func(q, k, v, **kw)
+    torch.cuda.synchronize()
+
+    assert lse.shape == (B, H, S)
+    assert lse.dtype == torch.float32
+    assert torch.equal(out, out_only), "return_lse must not perturb O"
+
+    ref = _ref_lse(_fp8_dequant(q, q_s), _fp8_dequant(k, k_s), causal)
+    assert (lse - ref).abs().max().item() < FP8_LSE_MAX_ERR
+
+
+@_gfx950_only
+@pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize(
+    "vl_q, vl_kv, H, H_KV, D, Dv, splits",
+    [
+        ([300, 500], [300, 500], 8, 8, 128, 128, None),
+        ([300, 500], [1024, 2048], 12, 2, 192, 128, None),
+        ([512, 512], [4096, 4096], 8, 8, 128, 128, 4),
+    ],
+)
+def test_fp8_return_lse_varlen(causal, vl_q, vl_kv, H, H_KV, D, Dv, splits):
+    """Packed THD LSE is [H, total_q] fp32, per aiter's varlen convention."""
+    from aiter.ops.flydsl.kernels.flash_attn_func_fp8_gfx950 import (
+        flydsl_flash_attn_fp8_func,
+    )
+
+    torch.manual_seed(0)
+    cuq = [0]
+    cukv = [0]
+    for a, b in zip(vl_q, vl_kv):
+        cuq.append(cuq[-1] + a)
+        cukv.append(cukv[-1] + b)
+
+    def _t(*shape):
+        return torch.empty(*shape, dtype=torch.bfloat16, device="cuda").uniform_(
+            *FP8_UNIFORM_RANGE
+        )
+
+    q, q_s = _fp8_quant(_t(cuq[-1], H, D))
+    k, k_s = _fp8_quant(_t(cukv[-1], H_KV, D))
+    v, v_s = _fp8_quant(_t(cukv[-1], H_KV, Dv))
+    cross = any(a != b for a, b in zip(vl_q, vl_kv))
+    kw = {
+        "causal": causal,
+        "num_kv_heads": H_KV,
+        "num_kv_splits": splits,
+        "q_descale": q_s,
+        "k_descale": k_s,
+        "v_descale": v_s,
+        "cu_seqlens_q": torch.tensor(cuq, dtype=torch.int32, device="cuda"),
+        "cu_seqlens_kv": torch.tensor(cukv, dtype=torch.int32, device="cuda"),
+        "max_seqlen_q": max(vl_q),
+        "max_seqlen_kv": max(vl_kv),
+        "cross_seqlen": cross,
+    }
+    out, lse = flydsl_flash_attn_fp8_func(q, k, v, return_lse=True, **kw)
+    out_only = flydsl_flash_attn_fp8_func(q, k, v, **kw)
+    torch.cuda.synchronize()
+
+    assert lse.shape == (H, cuq[-1])
+    assert lse.dtype == torch.float32
+    assert torch.equal(out, out_only), "return_lse must not perturb O"
+
+    q_r, k_r = _fp8_dequant(q, q_s), _fp8_dequant(k, k_s)
+    for b in range(len(vl_q)):
+        ref = _ref_lse(
+            q_r[cuq[b] : cuq[b + 1]].unsqueeze(0),
+            k_r[cukv[b] : cukv[b + 1]].unsqueeze(0),
+            causal,
+        )[0]
+        got = lse[:, cuq[b] : cuq[b + 1]]
+        assert (got - ref).abs().max().item() < FP8_LSE_MAX_ERR
+
+
+@_gfx950_only
+@pytest.mark.parametrize("causal", [False, True])
+def test_fp8_dispatch_return_lse(causal):
+    """``return_lse`` now routes to gfx950 fp8 instead of falling through."""
+    from aiter.ops.flydsl.fmha_kernels import (
+        flydsl_flash_attn_batch_func,
+        flydsl_flash_attn_varlen_func,
+    )
+
+    B, S, H, D = 2, 1024, 8, 128
+    q, k, v, d = _fp8_dispatch_inputs(B, S, H, D)
+    out, lse = flydsl_flash_attn_batch_func(
+        q, k, v, causal=causal, return_lse=True, **d
+    )
+    assert out.shape == (B, S, H, D)
+    assert lse.shape == (B, H, S)
+    ref = _ref_lse(
+        _fp8_dequant(q, d["q_descale"]), _fp8_dequant(k, d["k_descale"]), causal
+    )
+    assert (lse - ref).abs().max().item() < FP8_LSE_MAX_ERR
+
+    qv, kv, vv, dv = _fp8_dispatch_inputs(B, S, H, D, varlen=True)
+    cu = torch.tensor([0, 400, B * S], dtype=torch.int32, device="cuda")
+    out_v, lse_v = flydsl_flash_attn_varlen_func(
+        qv,
+        kv,
+        vv,
+        cu,
+        cu,
+        B * S - 400,
+        B * S - 400,
+        causal=causal,
+        return_lse=True,
+        **dv,
+    )
+    assert out_v.shape == (B * S, H, D)
+    assert lse_v.shape == (H, B * S)
 
 
 @_gfx950_only

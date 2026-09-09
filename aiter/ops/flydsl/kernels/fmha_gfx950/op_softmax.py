@@ -8,7 +8,7 @@ import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl._mlir import ir
 from flydsl._mlir.dialects import llvm
-from flydsl.expr import arith, const_expr, range_constexpr, rocdl
+from flydsl.expr import arith, range_constexpr, rocdl
 from flydsl.expr.typing import T
 from flydsl.expr.utils.arith import _to_raw as as_mlir_value
 
@@ -27,6 +27,7 @@ from aiter.ops.flydsl.kernels.fmha_gfx950.pipeline import (
     _score_pair_max,
     _score_pair_sum,
     _score_pair_to_lists,
+    p_headroom_log2,
 )
 
 
@@ -131,9 +132,6 @@ class DualwaveFp8SoftmaxHelper(DualwaveFp8KernelContext):
     def floor_masked_max(self, row_max):
         return fx.maxnumf(row_max, self.c_neg_floor)
 
-    # log2 of e4m3's largest finite value, 448.
-    _P_HEADROOM_LOG2 = 8.807354922057604
-
     def sub_m(self, v_s, row_max):
         # P is cast to e4m3, whose smallest subnormal is 2**-9, so a softmax
         # over thousands of keys loses its tail to flush-to-zero -- while l_row,
@@ -144,9 +142,7 @@ class DualwaveFp8SoftmaxHelper(DualwaveFp8KernelContext):
         # Available headroom is bounded by how large exp2 gets: the lazy path
         # holds the running max until a tile exceeds it by RESCALE_THRESHOLD, so
         # exp2 <= 2**THRESHOLD there; the eager path rebases every tile.
-        headroom = self._P_HEADROOM_LOG2
-        if const_expr(self.traits.DUALWAVE_SWP_LAZY_RESCALE):
-            headroom -= self.traits.DUALWAVE_SWP_RESCALE_THRESHOLD
+        headroom = p_headroom_log2(self.traits)
         bias = fx.Float32(headroom) if headroom > 0.0 else None
         return _scale_sub_score_pair(
             v_s, row_max, self.c_logit_scale, self.c_zero_f, self.fm_fast, bias
