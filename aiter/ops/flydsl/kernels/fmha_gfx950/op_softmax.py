@@ -20,6 +20,7 @@ from aiter.ops.flydsl.kernels.fmha_gfx950.pipeline import (
     _attn_mask_vec2_imm,
     _causal_pair_thresholds,
     _exp2_score_slice,
+    _p_headroom_log2,
     _read_exec_i64,
     _scale_o_accs,
     _scale_sub_score_pair,
@@ -27,7 +28,6 @@ from aiter.ops.flydsl.kernels.fmha_gfx950.pipeline import (
     _score_pair_max,
     _score_pair_sum,
     _score_pair_to_lists,
-    p_headroom_log2,
 )
 
 
@@ -142,7 +142,7 @@ class DualwaveFp8SoftmaxHelper(DualwaveFp8KernelContext):
         # Available headroom is bounded by how large exp2 gets: the lazy path
         # holds the running max until a tile exceeds it by RESCALE_THRESHOLD, so
         # exp2 <= 2**THRESHOLD there; the eager path rebases every tile.
-        headroom = p_headroom_log2(self.traits)
+        headroom = _p_headroom_log2(self.traits)
         bias = fx.Float32(headroom) if headroom > 0.0 else None
         return _scale_sub_score_pair(
             v_s, row_max, self.c_logit_scale, self.c_zero_f, self.fm_fast, bias

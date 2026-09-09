@@ -15,9 +15,8 @@ from flydsl.expr.utils.arith import _to_raw as as_mlir_value
 from aiter.ops.flydsl.kernels import buffer_ops
 from aiter.ops.flydsl.kernels.fmha_gfx950.pipeline import (
     _cu_load,
-    _lse_store,
-    _lse_value,
     _make_ws_rsrc,
+    _store_lse,
 )
 
 
@@ -222,30 +221,11 @@ class DualwaveSplitKCombineHelper(DualwaveSplitKCombineContext):
         return Vec.from_elements([fx.Int32(lo), fx.Int32(hi)], fx.Int32)
 
     def store_lse(self, m_max, den):
-        # Dense LSE is [B, H, Sq] (per-batch slice); varlen is [H, total_q]
-        # (per-head slice). lse_stride_h is Sq resp. total_q.
-        traits = self.traits
-        if const_expr(traits.VARLEN):
-            slice_elems = self.lse_stride_h_v
-            slice_off = self.q_head_idx * slice_elems
-            local = self.q_tok_base + self.seq_idx
-            in_range = self.row_valid & (self.seq_idx < self.seqlen_q_b)
-        else:
-            slice_elems = traits.NUM_HEADS_Q * self.lse_stride_h_v
-            slice_off = self.batch_idx * slice_elems
-            local = self.q_head_idx * self.lse_stride_h_v + self.seq_idx
-            in_range = self.row_valid
-        lse_rsrc = _make_ws_rsrc(
-            fx.Int64(fx.ptrtoint(fx.get_iter(self.LSE))), slice_off * 4, slice_elems * 4
-        )
-        _lse_store(
-            lse_rsrc,
-            _lse_value(m_max, den, traits, self.fm_fast),
-            local,
-            slice_elems,
-            in_range,
-            self.col == 0,
-        )
+        # row_valid only bounds seq_idx by max_seqlen_q; varlen batches are shorter.
+        in_range = self.row_valid
+        if const_expr(self.traits.VARLEN):
+            in_range = in_range & (self.seq_idx < self.seqlen_q_b)
+        _store_lse(self, self.seq_idx, m_max, den, in_range, self.col == 0)
 
     def store_output(self, o_pack):
         o_global = (

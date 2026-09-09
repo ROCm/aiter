@@ -269,7 +269,7 @@ def _make_ws_rsrc(ws_base_i64, byte_offset, nrec_bytes):
     )
 
 
-def p_headroom_log2(traits):
+def _p_headroom_log2(traits):
     """Exponent bias `sub_m` folds into P, so l_row carries a 2**this factor."""
     h = _P_HEADROOM_LOG2
     if traits.DUALWAVE_SWP_LAZY_RESCALE:
@@ -277,27 +277,34 @@ def p_headroom_log2(traits):
     return max(0.0, h)
 
 
-def _lse_value(m_scaled, l_row, traits, fm_fast):
+def _store_lse(ctx, row, m_scaled, l_row, in_range, is_writer):
     """LSE = m*ln2 + ln(l) - headroom*ln2, undoing the P headroom l_row carries.
 
-    ``m_scaled`` is the row max already multiplied by ``c_logit_scale`` (log2
-    domain, softmax scale folded); the result is a natural log.
+    ``m_scaled`` is the row max already scaled by ``c_logit_scale`` (log2 domain,
+    softmax scale folded); the result is a natural log. Dense LSE is [B, H, Sq]
+    (per-batch slice), varlen [H, total_q] (per-head), so lse_stride_h is Sq resp.
+    total_q. One writer per row; everyone else aims past num_records, which drops
+    the store.
     """
-    bias = fx.Float32(-p_headroom_log2(traits) * _LN2)
-    return (
+    traits = ctx.traits
+    if const_expr(traits.VARLEN):
+        slice_elems = ctx.lse_stride_h_v
+        slice_off = ctx.q_head_idx * slice_elems
+        local = ctx.q_tok_base + row
+    else:
+        slice_elems = traits.NUM_HEADS_Q * ctx.lse_stride_h_v
+        slice_off = ctx.batch_idx * slice_elems
+        local = ctx.q_head_idx * ctx.lse_stride_h_v + row
+    lse_rsrc = _make_ws_rsrc(
+        fx.Int64(fx.ptrtoint(fx.get_iter(ctx.LSE))), slice_off * 4, slice_elems * 4
+    )
+    lse = (
         fx.Float32(m_scaled) * fx.Float32(_LN2)
-        + fx.log(fx.Float32(l_row), fastmath=fm_fast)
-        + bias
+        + fx.log(fx.Float32(l_row), fastmath=ctx.fm_fast)
+        + fx.Float32(-_p_headroom_log2(traits) * _LN2)
     )
-
-
-def _lse_store(lse_rsrc, lse_val, local_idx, oob_idx, in_range, is_writer):
-    """One writer per row; everyone else aims past num_records, which drops it."""
-    off_row = in_range.select(local_idx, oob_idx)
-    off = fx.Index(is_writer.select(off_row, oob_idx))
-    buffer_ops.buffer_store(
-        as_mlir_value(fx.Float32(lse_val)), lse_rsrc, as_mlir_value(fx.Int32(off))
-    )
+    off = is_writer.select(in_range.select(local, slice_elems), slice_elems)
+    buffer_ops.buffer_store(lse.ir_value(), lse_rsrc, fx.Int32(off).ir_value())
 
 
 def _buffer_load_128(elem_index, _load_atom_128, q_div, q_load_i32x4_type):
@@ -875,7 +882,7 @@ class DualwaveFp8KernelContext:
             )
             return fx.Float32(Vec(_v, (1,), fx.Float32)[0])
 
-        head_dim_f32 = fx.Float32(fx.Int32(self.head_dim_runtime))
+        head_dim_f32 = fx.Float32(self.head_dim_runtime)
         c_log2e_f = fx.Float32(_LOG2E)
         c_sm_scale_log2e = fx.rsqrt(head_dim_f32, fastmath=self.fm_fast) * c_log2e_f
         _qd = _load_scale_scalar(self.QDescale)
