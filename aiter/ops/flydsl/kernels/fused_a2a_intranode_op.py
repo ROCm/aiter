@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import functools
+import math
 import os
 
 import flydsl.compiler as flyc
@@ -58,6 +59,10 @@ class FusedA2AIntraNodeOp:
     (outputs, (q_scales, k_scales, v_scales)); explicit return_mode overrides the env.
     The legacy "fp8" return-mode name also selects raw bytes for int8.
     Scales follow the receive layout with one E8M0 byte per 32 adjacent values.
+    FUSED_A2A_V4_OUTPUT=1 selects MHA V4 MXFP4 Q/K bytes (not V); per-role
+    FUSED_A2A_V4_OUTPUT_Q/K/V overrides are available. Requires raw return.
+    Q is BSHD; K uses padded 128-token, four-plane tiles; both scales are BSH4.
+    V4 Q/K always rotate, and Q folds the explicit softmax_scale * log2(e).
     All ranks must use the same mode and serialize calls on one stream.
     """
 
@@ -74,6 +79,7 @@ class FusedA2AIntraNodeOp:
         split=False,
         quant=False,
         return_mode=None,
+        softmax_scale=None,
     ):
         self.quant = quant or os.environ.get("FUSED_A2A_QUANT", "0") == "1"
         self.hadamard = self.quant and os.environ.get("FUSED_A2A_HADAMARD", "0") == "1"
@@ -95,6 +101,33 @@ class FusedA2AIntraNodeOp:
             raise ValueError(
                 f"expected return_mode 'bf16' or 'fp8', got {self.return_mode}"
             )
+        v4_default = os.environ.get("FUSED_A2A_V4_OUTPUT", "0") == "1"
+        self.v4_output = tuple(
+            (
+                role.lower()
+                if os.environ.get(
+                    f"FUSED_A2A_V4_OUTPUT_{role}", str(int(v4_default and role != "V"))
+                )
+                == "1"
+                else ""
+            )
+            for role in "QKV"
+        )
+        if any(self.v4_output):
+            if not self.quant or self.return_mode != "fp8":
+                raise ValueError("V4 output requires quant=True and return_mode='fp8'")
+            if self.v4_output[2] or any(
+                mode and codec != "mxfp4"
+                for mode, codec in zip(self.v4_output, self.codecs)
+            ):
+                raise ValueError("V4 output currently supports only MXFP4 Q/K")
+        if self.v4_output[0] and (
+            softmax_scale is None
+            or not math.isfinite(softmax_scale)
+            or softmax_scale <= 0
+        ):
+            raise ValueError("V4 Q requires an explicit positive finite softmax_scale")
+        q_multiplier = softmax_scale * math.log2(math.e) if self.v4_output[0] else 1.0
         if dtype != torch.bfloat16 and not (self.quant and dtype == torch.uint8):
             raise ValueError(
                 f"expected torch.bfloat16 or torch.uint8 with quant enabled, got {dtype}"
@@ -136,13 +169,18 @@ class FusedA2AIntraNodeOp:
         self.shape = tuple(shape)
         self.dtype = torch.bfloat16
         self.peer_numel = numel // world_size
+        payload_sizes = tuple(
+            (
+                (shape[2] // world_size) * ((shape[1] * world_size + 127) // 128) * 8192
+                if mode == "k"
+                else (_transport_bytes(numel, codec) if self.quant else numel)
+            )
+            for mode, codec in zip(self.v4_output, self.codecs)
+        )
         self.outputs_sets = tuple(
             tuple(
-                mori_shmem_create_tensor(
-                    (_transport_bytes(numel, codec) if self.quant else numel,),
-                    payload_dtype,
-                )
-                for codec in self.codecs
+                mori_shmem_create_tensor((size,), payload_dtype)
+                for size in payload_sizes
             )
             for _ in range(2)
         )
@@ -217,6 +255,8 @@ class FusedA2AIntraNodeOp:
                 quant=self.quant,
                 codec=self.codecs[i] if self.split else self.codecs,
                 hadamard=self.hadamard and (not self.split or i < 2),
+                v4_output=self.v4_output[i] if self.split else self.v4_output,
+                q_multiplier=q_multiplier,
                 element_size=element_size,
                 return_mode=self.return_mode,
             )

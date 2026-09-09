@@ -24,7 +24,7 @@ from .communication_ops_utils import (
 )
 from .quant_utils import emit_f32_to_e2m1, emit_f32_to_e2m3, emit_mx_e8m0_scale
 
-_JIT_SCHEMA_VERSION = "v19-qk-hadamard"
+_JIT_SCHEMA_VERSION = "v20-v4-mxfp4-qk"
 _TRANSPORT_CHUNK_BYTES = 16
 _PUSH_PIPELINE_DEPTH = 16
 _OUT_CHANNEL_DEPTH = 1
@@ -204,6 +204,8 @@ def make_fused_a2a_kernel(
     quant=False,
     codec="e4m3",
     hadamard=False,
+    v4_output="",
+    q_multiplier=1.0,
     element_size=2,
 ):
     row_nbytes = head_dim * element_size
@@ -213,8 +215,21 @@ def make_fused_a2a_kernel(
         )
 
     codecs = (codec,) * 3 if isinstance(codec, str) else codec
+    formats = (v4_output,) * 3 if isinstance(v4_output, str) else v4_output
     heads_local = heads // npes
     seq_full = seq_len * npes
+    k_tiles = (seq_full + 127) // 128
+
+    def v4_word_offset(head, seq, chunk, mode):
+        if mode == "k":
+            return (
+                (head * k_tiles + seq // 128) * 2048
+                + (chunk // 4) * 512
+                + (seq % 128) * 4
+                + chunk % 4
+            )
+        return (seq * heads_local + head) * 16 + chunk
+
     # Source chunks remain bf16-sized even when the wire payload is quantized.
     elements_per_chunk = _TRANSPORT_CHUNK_BYTES // 2
     chunks_per_row = head_dim // elements_per_chunk
@@ -311,7 +326,7 @@ def make_fused_a2a_kernel(
                 )
             return result
 
-        def process_qk(rsrc_input, rsrc_norm, p2p_bases, addr_p2p_scale, codec):
+        def process_qk(rsrc_input, rsrc_norm, p2p_bases, addr_p2p_scale, codec, mode):
             wire_bytes = _transport_bytes(8, codec) if quant else 16
             wire_words = wire_bytes // 4
             row_nbytes = head_dim * wire_bytes // 8
@@ -385,8 +400,19 @@ def make_fused_a2a_kernel(
                             )
                             rotated[2 * pair] = even * cos_even - odd * sin_odd
                             rotated[2 * pair + 1] = even * sin_odd + odd * cos_even
-                        if const_expr(hadamard):
+                        if const_expr(mode):
+                            # Match the BF16 input boundary of the V4 HIP packers.
+                            rotated = [
+                                value.to(fx.BFloat16).to(fx.Float32)
+                                for value in rotated
+                            ]
+                        if const_expr(hadamard or mode):
                             rotated = _hadamard_head(rotated, lane, head_dim)
+                        if const_expr(mode):
+                            multiplier = q_multiplier if mode == "q" else 1.0
+                            rotated = (
+                                (rotated * multiplier).to(fx.BFloat16).to(fx.Float32)
+                            )
                         if const_expr(quant):
                             amax = fx.Float32(0.0)
                             for i in range_constexpr(vec):
@@ -428,9 +454,15 @@ def make_fused_a2a_kernel(
                                 local_head = head % heads_local
                                 dst_row = local_head * seq_full + rank * seq_len + seq
                                 peer_base = fx.memref_load(p2p_bases, dest_pe)
-                                dst_addr = fx.Uint64(
-                                    peer_base + fx.Int64(dst_row * row_nbytes)
+                                dst_byte = (
+                                    v4_word_offset(
+                                        local_head, rank * seq_len + seq, 0, mode
+                                    )
+                                    * 4
+                                    if mode
+                                    else dst_row * row_nbytes
                                 )
+                                dst_addr = fx.Uint64(peer_base + fx.Int64(dst_byte))
                                 dst_addr_lo = readfirstlane(T.i32, fx.Uint32(dst_addr))
                                 dst_addr_hi = readfirstlane(
                                     T.i32, fx.Uint32(dst_addr >> 32)
@@ -439,17 +471,24 @@ def make_fused_a2a_kernel(
                                     fx.Uint64(dst_addr_hi) << 32
                                 ) | fx.Uint64(dst_addr_lo)
                                 rsrc_dst = create_buffer_resource_from_addr(
-                                    uniform_dst_addr, num_records_bytes=row_nbytes
+                                    uniform_dst_addr,
+                                    num_records_bytes=(
+                                        6160 if mode == "k" else row_nbytes
+                                    ),
                                 )
                                 if const_expr(quant and codec == "mxfp6"):
                                     _store_fp6(
                                         outputs[batch_idx], rsrc_dst, lane_in_group
                                     )
                                 else:
+                                    store_word = (
+                                        (lane_in_group // 4) * 512 + lane_in_group % 4
+                                        if mode == "k"
+                                        else lane_in_group
+                                        * (wire_words if quant else 8)
+                                    )
                                     buffer_store(
-                                        outputs[batch_idx],
-                                        rsrc_dst,
-                                        lane_in_group * (wire_words if quant else 8),
+                                        outputs[batch_idx], rsrc_dst, store_word
                                     )
                                 if const_expr(quant):
                                     scale_base = buffer_load(
@@ -458,9 +497,15 @@ def make_fused_a2a_kernel(
                                         vec_width=1,
                                         dtype=T.i64,
                                     )
+                                    scale_row = (
+                                        (rank * seq_len + seq) * heads_local
+                                        + local_head
+                                        if mode
+                                        else dst_row
+                                    )
                                     scale_addr = fx.Uint64(
                                         scale_base
-                                        + fx.Int64(dst_row * (head_dim // 32))
+                                        + fx.Int64(scale_row * (head_dim // 32))
                                     )
                                     scale_lo = readfirstlane(
                                         T.i32, fx.Uint32(scale_addr)
@@ -482,7 +527,9 @@ def make_fused_a2a_kernel(
                                             lane_in_group // 4,
                                         )
 
-        def transport(input_rsrc, p2p_bases, addr_p2p_scale, codec, rotate=False):
+        def transport(
+            input_rsrc, p2p_bases, addr_p2p_scale, codec, rotate=False, mode=""
+        ):
             wire_bytes = _transport_bytes(8, codec) if quant else 16
             wire_words = wire_bytes // 4
             peer_chunks = total_chunks // npes
@@ -498,7 +545,11 @@ def make_fused_a2a_kernel(
             )
             rsrc_dst = create_buffer_resource_from_addr(
                 uniform_peer_base,
-                num_records_bytes=total_chunks * wire_bytes,
+                num_records_bytes=(
+                    heads_local * k_tiles * 8192
+                    if mode == "k"
+                    else total_chunks * wire_bytes
+                ),
             )
             if const_expr(quant):
                 rsrc_p2p_scale = create_buffer_resource_from_addr(addr_p2p_scale)
@@ -538,8 +589,13 @@ def make_fused_a2a_kernel(
                     )
                     if const_expr(quant):
                         decoded = fx.Vector(raw).bitcast(fx.BFloat16).to(fx.Float32)
-                        if const_expr(rotate):
+                        if const_expr(rotate or mode):
                             decoded = _hadamard_head(decoded, lane, head_dim)
+                        if const_expr(mode):
+                            multiplier = q_multiplier if mode == "q" else 1.0
+                            decoded = (
+                                (decoded * multiplier).to(fx.BFloat16).to(fx.Float32)
+                            )
                         amax = fx.Float32(0.0)
                         for i in range_constexpr(elements_per_chunk):
                             amax = amax.maximumf(fmath.absf(decoded[i]))
@@ -569,11 +625,22 @@ def make_fused_a2a_kernel(
                         + row_chunk
                     )
                     destinations.append(
-                        dst_chunk
-                        if quant and codec == "mxfp6"
-                        else dst_chunk * wire_words
+                        v4_word_offset(
+                            local_head, rank * seq_len + seq, row_chunk, mode
+                        )
+                        if mode
+                        else (
+                            dst_chunk
+                            if quant and codec == "mxfp6"
+                            else dst_chunk * wire_words
+                        )
                     )
-                    scale_destinations.append(dst_chunk // 4)
+                    scale_destinations.append(
+                        ((rank * seq_len + seq) * heads_local + local_head) * 4
+                        + row_chunk // 4
+                        if mode
+                        else dst_chunk // 4
+                    )
                     valid_values.append(valid)
                 for batch_idx in range_constexpr(_PUSH_PIPELINE_DEPTH):
                     if valid_values[batch_idx]:
@@ -596,17 +663,39 @@ def make_fused_a2a_kernel(
 
         if const_expr(fuse_norm_rope):
             process_qk(
-                rsrc_input_q, rsrc_norm_q, p2p_bases_q, addr_p2p_scale_q, codecs[0]
+                rsrc_input_q,
+                rsrc_norm_q,
+                p2p_bases_q,
+                addr_p2p_scale_q,
+                codecs[0],
+                formats[0],
             )
             if const_expr(not split):
                 process_qk(
-                    rsrc_input_k, rsrc_norm_k, p2p_bases_k, addr_p2p_scale_k, codecs[1]
+                    rsrc_input_k,
+                    rsrc_norm_k,
+                    p2p_bases_k,
+                    addr_p2p_scale_k,
+                    codecs[1],
+                    formats[1],
                 )
         else:
-            transport(rsrc_input_q, p2p_bases_q, addr_p2p_scale_q, codecs[0], hadamard)
+            transport(
+                rsrc_input_q,
+                p2p_bases_q,
+                addr_p2p_scale_q,
+                codecs[0],
+                hadamard,
+                formats[0],
+            )
             if const_expr(not split):
                 transport(
-                    rsrc_input_k, p2p_bases_k, addr_p2p_scale_k, codecs[1], hadamard
+                    rsrc_input_k,
+                    p2p_bases_k,
+                    addr_p2p_scale_k,
+                    codecs[1],
+                    hadamard,
+                    formats[1],
                 )
         if const_expr(not split):
             transport(rsrc_input_v, p2p_bases_v, addr_p2p_scale_v, codecs[2])
@@ -729,6 +818,8 @@ def make_fused_a2a_jit(
     quant=False,
     codec="e4m3",
     hadamard=False,
+    v4_output="",
+    q_multiplier=1.0,
     element_size=2,
     return_mode="bf16",
 ):
@@ -745,6 +836,8 @@ def make_fused_a2a_jit(
         quant=quant,
         codec=codec,
         hadamard=hadamard,
+        v4_output=v4_output,
+        q_multiplier=q_multiplier,
         element_size=element_size,
     )
     key = (
@@ -760,6 +853,8 @@ def make_fused_a2a_jit(
         quant,
         codec,
         hadamard,
+        v4_output,
+        q_multiplier,
         element_size,
         return_mode,
         _JIT_SCHEMA_VERSION,

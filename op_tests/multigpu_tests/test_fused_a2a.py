@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import math
 import os
 import socket
 
@@ -332,11 +333,11 @@ def _assert_quantized(
     return _assert_quantized_values(actual, reference, oracle, label)
 
 
-def _assert_fused_fp6_scales(actual, reference, reference_amax, label):
+def _assert_fused_fp6_scales(actual, reference, reference_amax, label, max_value=7.5):
     different = actual != reference
     delta = (actual.int() - reference.int()).abs()
     lower = torch.minimum(actual, reference).float()
-    threshold = 7.5 * torch.exp2(lower - 127.0)
+    threshold = max_value * torch.exp2(lower - 127.0)
     relative_distance = (reference_amax - threshold).abs() / threshold
     # E8M0 steps at amax / 7.5 powers of two. Different FP32 reduction orders
     # can straddle that threshold; neither ordering is intrinsically more correct.
@@ -513,7 +514,138 @@ def _check_hadamard_transport(rank, world_size, device, a2a_references):
         os.environ.pop(f"FUSED_A2A_CODEC_{role}", None)
 
 
-def _run_rank(rank, world_size, port):
+def _check_v4_output(rank, world_size, device):
+    from aiter.ops.mha_v4 import quantize_mxfp4_k, quantize_mxfp4_q
+
+    # Partial tiles, exact tiles, and a rank boundary inside a second K tile.
+    cases = ((17, False, False), (32, True, False), (33, False, True), (17, True, True))
+    heads, head_dim = 8, 128
+    local_heads = heads // world_size
+    os.environ["FUSED_A2A_V4_OUTPUT"] = "1"
+    os.environ["FUSED_A2A_HADAMARD"] = "0"
+    for role in "QKV":
+        os.environ[f"FUSED_A2A_CODEC_{role}"] = "mxfp4" if role != "V" else "e4m3"
+    for seq_len, split, fused in cases:
+        softmax_scale = 0.125 if split else head_dim**-0.5
+        inputs = [
+            _sequence_major_input(rank + 19 * role, heads, seq_len, head_dim, device)
+            for role in range(3)
+        ]
+        # Nonrandom rows expose head/token permutations, zero scales and nibble signs.
+        for role, value in enumerate(inputs):
+            value[:, 0].zero_()
+            value[:, 1] = (
+                (torch.arange(heads * head_dim, device=device) % 31 - 15).reshape(
+                    heads, head_dim
+                )
+                * (rank + role + 1)
+                / 16
+            )
+        norm_q = torch.ones(heads * head_dim, dtype=torch.bfloat16, device=device)
+        norm_k = norm_q.clone()
+        angles = torch.arange(seq_len, device=device).view(1, -1, 1, 1) / 100
+        cos = angles.cos().expand(1, seq_len, 1, head_dim).contiguous()
+        sin = angles.sin().expand_as(cos).contiguous()
+        transformed = [
+            _norm_rope(value, weight, cos, sin) if fused else value
+            for value, weight in zip(inputs[:2], (norm_q, norm_k))
+        ]
+        references = []
+        for role, source in enumerate(transformed):
+            gathered = [torch.empty_like(source) for _ in range(world_size)]
+            dist.all_gather(gathered, source)
+            full = torch.cat(gathered, dim=1)[
+                :, :, rank * local_heads : (rank + 1) * local_heads
+            ].contiguous()
+            multiplier = softmax_scale * math.log2(math.e) if role == 0 else 1.0
+            payload, scales = (
+                quantize_mxfp4_q(full, multiplier)
+                if role == 0
+                else quantize_mxfp4_k(full)
+            )
+            rotated = (
+                (full.float() @ _hadamard_matrix(128, device)) * 128**-0.5 * multiplier
+            )
+            amax = (
+                rotated.to(torch.bfloat16)
+                .float()
+                .reshape(*scales.shape, 32)
+                .abs()
+                .amax(-1)
+            )
+            references.append((payload, scales, amax))
+        op = FusedA2AIntraNodeOp(
+            rank=rank,
+            world_size=world_size,
+            shape=inputs[0].shape,
+            fuse_norm_rope=fused,
+            split=split,
+            quant=True,
+            return_mode="fp8",
+            softmax_scale=softmax_scale,
+        )
+        counts = [0, 0]
+        for epoch in range(3):
+            payloads, scales = op(*inputs, norm_q, norm_k, cos, sin)
+            torch.cuda.synchronize()
+            for role, (expected, expected_scales, amax) in enumerate(references):
+                label = f"V4 {'QK'[role]} S={seq_len} split={split} fused={fused} rank={rank} epoch={epoch}"
+                actual_scales = scales[role].view_as(expected_scales)
+                ties, total = _assert_fused_fp6_scales(
+                    actual_scales, expected_scales, amax, label, max_value=6.0
+                )
+                counts[0] += ties
+                counts[1] += total
+                same_scale = actual_scales == expected_scales
+                if role == 0:
+                    byte_mask = same_scale.repeat_interleave(16, -1).flatten()
+                else:
+                    tiles = (seq_len * world_size + 127) // 128
+                    padded = torch.zeros(
+                        (1, local_heads, tiles * 128, 4),
+                        dtype=torch.bool,
+                        device=device,
+                    )
+                    padded[:, :, : seq_len * world_size] = same_scale.transpose(1, 2)
+                    byte_mask = (
+                        padded.reshape(1, local_heads, tiles, 128, 4)
+                        .transpose(-1, -2)
+                        .unsqueeze(-1)
+                        .expand(-1, -1, -1, -1, -1, 16)
+                        .reshape(-1)
+                    )
+                    # The HIP oracle leaves padding uninitialized; the V4 ABI requires zeros.
+                    actual_rows = (
+                        payloads[role]
+                        .view(1, local_heads, tiles, 4, 128, 16)
+                        .transpose(3, 4)
+                        .reshape(1, local_heads, tiles * 128, 64)
+                    )
+                    padding = actual_rows[:, :, seq_len * world_size :]
+                    _assert_equal(
+                        padding, torch.zeros_like(padding), f"{label} padding"
+                    )
+                assert payloads[role].numel() == expected.numel(), label
+                _assert_equal(
+                    payloads[role][byte_mask], expected.flatten()[byte_mask], label
+                )
+            dist.barrier()
+        totals = torch.tensor(counts, dtype=torch.int64, device=device)
+        dist.all_reduce(totals)
+        if rank == 0:
+            print(
+                f"PASS V4 MXFP4 Q/K S={seq_len} split={split} fused={fused} epochs=3 scale-ties={totals[0].item()}/{totals[1].item()}",
+                flush=True,
+            )
+    for name in (
+        "FUSED_A2A_V4_OUTPUT",
+        "FUSED_A2A_HADAMARD",
+        *(f"FUSED_A2A_CODEC_{r}" for r in "QKV"),
+    ):
+        os.environ.pop(name, None)
+
+
+def _run_rank(rank, world_size, port, v4_only=False):
     torch.cuda.set_device(rank)
     device = torch.device("cuda", rank)
     codec = os.environ.get("FUSED_A2A_CODEC", "e4m3")
@@ -529,6 +661,9 @@ def _run_rank(rank, world_size, port):
         cpu_group = dist.new_group(backend="gloo")
         torch._C._distributed_c10d._register_process_group("mori", cpu_group)
         ms.shmem_torch_process_group_init("mori")
+        _check_v4_output(rank, world_size, device)
+        if v4_only:
+            return
 
         for case_name, heads, seq_len, head_dim in _CASES:
             q = _sequence_major_input(rank, heads, seq_len, head_dim, device)
@@ -1039,13 +1174,29 @@ def main():
     _check_hadamard_precision()
     _check_fp6_converters()
     mp.spawn(_run_rank, args=(_WORLD_SIZE, _free_port()), nprocs=_WORLD_SIZE, join=True)
-    passed = 9 + sum(
+    passed = 13 + sum(
         12 + 3 * (name == "small") + int(_WORLD_SIZE >= 2) + 2 * len(_CODEC_ROWS)
         for name, *_ in _CASES
     )
     skipped = len(_CASES) * int(_WORLD_SIZE < 2)
     print(f"{passed} passed, {skipped} skipped on {arch}")
     return 0
+
+
+def test_fused_a2a_v4_output(capfd):
+    if not torch.cuda.is_available():
+        pytest.skip("fused_a2a requires ROCm GPUs")
+    if get_gfx_runtime() != "gfx950":
+        pytest.skip("MHA V4 MXFP4 requires gfx950")
+    if torch.cuda.device_count() < _WORLD_SIZE:
+        pytest.skip(f"fused_a2a requires {_WORLD_SIZE} visible GPUs")
+    with capfd.disabled():
+        mp.spawn(
+            _run_rank,
+            args=(_WORLD_SIZE, _free_port(), True),
+            nprocs=_WORLD_SIZE,
+            join=True,
+        )
 
 
 def test_fused_a2a(capfd):
