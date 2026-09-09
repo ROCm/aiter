@@ -45,10 +45,13 @@ TDM_DESCRIPTOR_VERSION = 1
 MMA_GROUP = int(os.environ.get("AITER_FLYDSL_MMA_GROUP", "10"))
 MMA_FIRST_GROUP = int(os.environ.get("AITER_FLYDSL_MMA_FIRST_GROUP", MMA_GROUP))
 DS_FIRST_N = int(os.environ.get("AITER_FLYDSL_DS_FIRST_N", "0"))
+WMMA_COLUMN_MAJOR = int(os.environ.get("AITER_FLYDSL_WMMA_COLUMN_MAJOR", "0"))
 if MMA_GROUP < 1 or MMA_FIRST_GROUP < 1:
     raise ValueError("AITER_FLYDSL_MMA_GROUP values must be positive")
 if DS_FIRST_N < 0:
     raise ValueError("AITER_FLYDSL_DS_FIRST_N must be non-negative")
+if WMMA_COLUMN_MAJOR not in (0, 1):
+    raise ValueError("AITER_FLYDSL_WMMA_COLUMN_MAJOR must be 0 or 1")
 
 
 @flyc.jit
@@ -157,6 +160,7 @@ def launch_gemm_a8w4_tdm(
         MMA_GROUP,
         MMA_FIRST_GROUP,
         DS_FIRST_N,
+        WMMA_COLUMN_MAJOR,
     )
     _ = cache_tag
     if enable_ep_scatter:
@@ -242,12 +246,13 @@ def launch_gemm_a8w4_tdm(
         else f"_mg{MMA_FIRST_GROUP}x{MMA_GROUP}"
     )
     _ds_first = f"_dsfirst{DS_FIRST_N}" if DS_FIRST_N else ""
+    _column_major = "_colmma" if WMMA_COLUMN_MAJOR else ""
     _kname = (
         f"a8w4_tdm_{_afp}"
         f"_t{tile_m}x{tile_n}x{tile_k}_w{m_warp}x{n_warp}"
         f"_b{num_buffers}_K{K}"
         f"{_grouped}{_act}{_bias}{_qout}{_cl}{_next_stage}{_waves_per_tensor}"
-        f"{_mma_group}{_ds_first}{_ep}"
+        f"{_mma_group}{_ds_first}{_column_major}{_ep}"
     )
 
     @flyc.kernel(name=_kname, known_block_size=[block, 1, 1])
@@ -688,9 +693,15 @@ def launch_gemm_a8w4_tdm(
         FENCE_COVER_MMA = 8
 
         def mma_rows(wm_list, act, wt, sa_k, sb_k):
-            for i in range_constexpr(len(wm_list)):
-                wm = wm_list[i]
-                for wn_raw in range_constexpr(wmma_n_rep):
+            for outer in range_constexpr(
+                wmma_n_rep if WMMA_COLUMN_MAJOR else len(wm_list)
+            ):
+                for inner in range_constexpr(
+                    len(wm_list) if WMMA_COLUMN_MAJOR else wmma_n_rep
+                ):
+                    i = inner if WMMA_COLUMN_MAJOR else outer
+                    wm = wm_list[i]
+                    wn_raw = outer if WMMA_COLUMN_MAJOR else inner
                     wn = (wmma_n_rep - 1 - wn_raw) if (wm % 2 == 1) else wn_raw
                     idx = wm * wmma_n_rep + wn
                     if const_expr(a_is_fp4):
@@ -785,9 +796,14 @@ def launch_gemm_a8w4_tdm(
             if const_expr(load_nxt_fn is not None and not reuse_cur_rmem):
                 load_nxt_fn()
             sa_k, sb_k = cur_rmem.sa.load(), cur_rmem.sb.load()
-            mma_rows(FRONT, cur_rmem.a[:front_wm], cur_rmem.b, sa_k, sb_k)
-            if const_expr(len(BACK) > 0):
-                mma_rows(BACK, cur_rmem.a[front_wm:], cur_rmem.b, sa_k, sb_k)
+            if const_expr(WMMA_COLUMN_MAJOR):
+                mma_rows(
+                    list(range(wmma_m_rep)), cur_rmem.a, cur_rmem.b, sa_k, sb_k
+                )
+            else:
+                mma_rows(FRONT, cur_rmem.a[:front_wm], cur_rmem.b, sa_k, sb_k)
+                if const_expr(len(BACK) > 0):
+                    mma_rows(BACK, cur_rmem.a[front_wm:], cur_rmem.b, sa_k, sb_k)
             if const_expr(reuse_cur_rmem):
                 load_nxt_fn()
 
