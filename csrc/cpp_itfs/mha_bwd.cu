@@ -484,9 +484,13 @@ float fmha_v3_bwd(mha_bwd_args a, const ck_tile::stream_config& s)
                                                                          dqdkdv_cfgs,
                                                                          post_cfgs);
 
-    if((pre_kernel == "") || (dqdkdv_kernel == "") || (need_post_processing && (post_kernel == "")))
+    if((pre_kernel == "") || (dqdkdv_kernel == ""))
     {
         return -1;
+    }
+    if(need_post_processing && (post_kernel == ""))
+    {
+        need_post_processing = false;
     }
 
     int ts_odo;
