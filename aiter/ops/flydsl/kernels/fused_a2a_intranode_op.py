@@ -90,9 +90,9 @@ class FusedA2AIntraNodeOp:
             os.environ.get(f"FUSED_A2A_CODEC_{role}", self.codec) for role in "QKV"
         )
         for codec in (self.codec, *self.codecs):
-            if codec not in ("e4m3", "int8", "mxfp4", "mxfp6"):
+            if codec not in ("e4m3", "int8", "mxfp4", "mxfp6", "mxfp8"):
                 raise ValueError(
-                    f"expected codec 'e4m3', 'int8', 'mxfp4', or 'mxfp6', got {codec}"
+                    f"expected codec 'e4m3', 'int8', 'mxfp4', 'mxfp6', or 'mxfp8', got {codec}"
                 )
         self.return_mode = (
             os.environ.get("FUSED_A2A_QUANT_RETURN", "bf16")
@@ -121,10 +121,10 @@ class FusedA2AIntraNodeOp:
             if any(
                 mode
                 and codec != "mxfp4"
-                and not (mode in ("q", "k") and codec == "mxfp6")
+                and not (mode in ("q", "k") and codec in ("mxfp6", "mxfp8"))
                 for mode, codec in zip(self.v4_output, self.codecs)
             ):
-                raise ValueError("V4 output supports MXFP4 Q/K/V and MXFP6 Q/K")
+                raise ValueError("V4 output supports MXFP4 Q/K/V and MXFP6/MXFP8 Q/K")
         self.split = split or os.environ.get("FUSED_A2A_SPLIT", "0") == "1"
         if self.v4_output[2] and not self.split:
             raise ValueError("V4 V output requires split=True")
@@ -188,7 +188,7 @@ class FusedA2AIntraNodeOp:
                     if mode == "k" and codec == "mxfp6"
                     else 64 if mode == "v" else 0
                 )
-                if mode in ("k", "v")
+                if mode in ("k", "v") and codec != "mxfp8"
                 else (_transport_bytes(numel, codec) if self.quant else numel)
             )
             for mode, codec in zip(self.v4_output, self.codecs)

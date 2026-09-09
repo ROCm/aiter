@@ -24,7 +24,7 @@ from .communication_ops_utils import (
 )
 from .quant_utils import emit_f32_to_e2m1, emit_f32_to_e2m3, emit_mx_e8m0_scale
 
-_JIT_SCHEMA_VERSION = "v23-v4-mxfp6-qk"
+_JIT_SCHEMA_VERSION = "v24-v4-mxfp8-qk"
 _TRANSPORT_CHUNK_BYTES = 16
 _PUSH_PIPELINE_DEPTH = 16
 _OUT_CHANNEL_DEPTH = 1
@@ -90,6 +90,13 @@ def _pack_transport_pair(first, second, codec):
         T.i32, first.ir_value(), second.ir_value(), fx.Int32(0).ir_value(), 0
     )
     return fx.Int32(word).to(fx.Int16)
+
+
+def _v4_fp8_scale(amax):
+    # Match rotate_activation_mxfp8_quant, not native transport's RoundUp.
+    exponent = ((amax.bitcast(fx.Int32) + 0x00200000) & 0x7F800000) >> 23
+    scale = (exponent > 8).select(exponent - 8, fx.Int32(0))
+    return (exponent == 255).select(fx.Int32(254), scale)
 
 
 def _v4_fp6_scale(amax):
@@ -297,6 +304,8 @@ def make_fused_a2a_kernel(
     k_tiles = (seq_full + 127) // 128
 
     def v4_word_offset(head, seq, chunk, mode, codec):
+        if codec == "mxfp8":
+            return (seq * heads_local + head) * 32 + chunk * 2
         if codec == "mxfp6" and mode == "k":
             return (head * k_tiles + seq // 128) * 4352
         if codec == "mxfp6":
@@ -493,6 +502,8 @@ def make_fused_a2a_kernel(
                             ]
                         if const_expr(hadamard or mode):
                             rotated = _hadamard_head(rotated, lane, head_dim)
+                        if const_expr(mode and codec == "mxfp8"):
+                            rotated = rotated.to(fx.BFloat16).to(fx.Float32)
                         if const_expr(mode):
                             multiplier = q_multiplier if mode == "q" else 1.0
                             rotated = (
@@ -508,7 +519,11 @@ def make_fused_a2a_kernel(
                             scale = (
                                 _v4_fp6_scale(amax)
                                 if mode and codec == "mxfp6"
-                                else _transport_scale(amax, codec)
+                                else (
+                                    _v4_fp8_scale(amax)
+                                    if mode and codec == "mxfp8"
+                                    else _transport_scale(amax, codec)
+                                )
                             )
                             reciprocal = ((fx.Int32(254) - scale) << 23).bitcast(
                                 fx.Float32
@@ -575,7 +590,11 @@ def make_fused_a2a_kernel(
                                     num_records_bytes=(
                                         heads_local * k_tiles * 17408
                                         if mode == "k" and codec == "mxfp6"
-                                        else 6160 if mode == "k" else row_nbytes
+                                        else (
+                                            6160
+                                            if mode == "k" and codec == "mxfp4"
+                                            else row_nbytes
+                                        )
                                     ),
                                 )
                                 if const_expr(mode == "k" and codec == "mxfp6"):
@@ -602,7 +621,7 @@ def make_fused_a2a_kernel(
                                 else:
                                     store_word = (
                                         (lane_in_group // 4) * 512 + lane_in_group % 4
-                                        if mode == "k"
+                                        if mode == "k" and codec == "mxfp4"
                                         else lane_in_group
                                         * (wire_words if quant else 8)
                                     )
@@ -666,7 +685,7 @@ def make_fused_a2a_kernel(
                 uniform_peer_base,
                 num_records_bytes=(
                     heads_local * k_tiles * (17408 if codec == "mxfp6" else 8192)
-                    if mode == "k"
+                    if mode == "k" and codec != "mxfp8"
                     else total_chunks * wire_bytes
                 ),
             )
@@ -710,6 +729,8 @@ def make_fused_a2a_kernel(
                         decoded = fx.Vector(raw).bitcast(fx.BFloat16).to(fx.Float32)
                         if const_expr(rotate or mode):
                             decoded = _hadamard_head(decoded, lane, head_dim)
+                        if const_expr(mode and codec == "mxfp8"):
+                            decoded = decoded.to(fx.BFloat16).to(fx.Float32)
                         if const_expr(mode):
                             multiplier = q_multiplier if mode == "q" else 1.0
                             decoded = (
@@ -726,7 +747,11 @@ def make_fused_a2a_kernel(
                         scale = (
                             _v4_fp6_scale(amax)
                             if mode and codec == "mxfp6"
-                            else _transport_scale(amax, codec)
+                            else (
+                                _v4_fp8_scale(amax)
+                                if mode and codec == "mxfp8"
+                                else _transport_scale(amax, codec)
+                            )
                         )
                         reciprocal = ((fx.Int32(254) - scale) << 23).bitcast(fx.Float32)
                         packed = []

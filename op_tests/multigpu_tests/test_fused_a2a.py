@@ -577,6 +577,8 @@ def _check_v4_output(rank, world_size, device, q_codec="mxfp4", k_codec="mxfp4")
         quantize_mxfp4_q,
         quantize_mxfp6_k,
         quantize_mxfp6_q,
+        quantize_mxfp8_k,
+        quantize_mxfp8_q,
     )
 
     # Partial tiles, exact tiles, and a rank boundary inside a second K tile.
@@ -617,7 +619,9 @@ def _check_v4_output(rank, world_size, device, q_codec="mxfp4", k_codec="mxfp4")
                     weight,
                     cos,
                     sin,
-                    fused_rounding=(q_codec == "mxfp6" or k_codec == "mxfp6"),
+                    fused_rounding=(
+                        q_codec in ("mxfp6", "mxfp8") or k_codec in ("mxfp6", "mxfp8")
+                    ),
                 )
                 if fused
                 else value
@@ -633,13 +637,21 @@ def _check_v4_output(rank, world_size, device, q_codec="mxfp4", k_codec="mxfp4")
             ].contiguous()
             multiplier = softmax_scale * math.log2(math.e) if role == 0 else 1.0
             payload, scales = (
-                (quantize_mxfp6_q if q_codec == "mxfp6" else quantize_mxfp4_q)(
-                    full, multiplier
-                )
+                (
+                    {
+                        "mxfp4": quantize_mxfp4_q,
+                        "mxfp6": quantize_mxfp6_q,
+                        "mxfp8": quantize_mxfp8_q,
+                    }[q_codec]
+                )(full, multiplier)
                 if role == 0
-                else (quantize_mxfp6_k if k_codec == "mxfp6" else quantize_mxfp4_k)(
-                    full
-                )
+                else (
+                    {
+                        "mxfp4": quantize_mxfp4_k,
+                        "mxfp6": quantize_mxfp6_k,
+                        "mxfp8": quantize_mxfp8_k,
+                    }[k_codec]
+                )(full)
             )
             if role == 1 and k_codec == "mxfp6":
                 _, scales = mxfp6_k_view(
@@ -675,7 +687,7 @@ def _check_v4_output(rank, world_size, device, q_codec="mxfp4", k_codec="mxfp4")
                 actual_scales = scales[role][: expected_scales.numel()].view_as(
                     expected_scales
                 )
-                if (q_codec if role == 0 else k_codec) == "mxfp6":
+                if (q_codec if role == 0 else k_codec) in ("mxfp6", "mxfp8"):
                     _assert_equal(actual_scales, expected_scales, f"{label} scales")
                     ties, total = 0, actual_scales.numel()
                 else:
@@ -693,6 +705,11 @@ def _check_v4_output(rank, world_size, device, q_codec="mxfp4", k_codec="mxfp4")
                     slack = scales[role][expected_scales.numel() :]
                     _assert_equal(
                         slack, torch.zeros_like(slack), f"{label} scale slack"
+                    )
+                    continue
+                if (q_codec if role == 0 else k_codec) == "mxfp8":
+                    _assert_equal(
+                        payloads[role], expected.view(torch.uint8).flatten(), label
                     )
                     continue
                 if role == 0:
@@ -1015,6 +1032,7 @@ def _run_rank(
             return
         _check_v4_output(rank, world_size, device)
         _check_v4_output(rank, world_size, device, q_codec="mxfp6", k_codec="mxfp6")
+        _check_v4_output(rank, world_size, device, q_codec="mxfp8", k_codec="mxfp8")
         _check_v4_v_output(rank, world_size, device)
         if v4_only:
             return
