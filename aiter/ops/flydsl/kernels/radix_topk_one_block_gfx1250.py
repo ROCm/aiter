@@ -75,8 +75,9 @@ def build_radix_topk_one_block_gfx1250_module(
     write_values: bool = False,
     stable: bool = False,
     short_rows: bool = False,
+    is_decode: bool = False,
 ):
-    """Build a kernel specialized for the caller's row-length bounds.
+    """Build a prefill/decode kernel specialized for the row-length bounds.
 
     short_rows requires every effective row length <= 4096.
     """
@@ -150,7 +151,8 @@ def build_radix_topk_one_block_gfx1250_module(
 
     @flyc.kernel(
         name=(
-            f"radix_topk_one_block_gfx1250_{row_variant}_k{k}_b{block_threads}"
+            f"radix_topk_one_block_gfx1250_{'decode' if is_decode else 'prefill'}"
+            f"_{row_variant}_k{k}_b{block_threads}"
             f"_v{int(write_values)}_s{int(stable)}"
         ),
         known_block_size=[block_threads, 1, 1],
@@ -161,6 +163,8 @@ def build_radix_topk_one_block_gfx1250_module(
         row_ends: fx.Tensor,
         indices: fx.Tensor,
         value_output: fx.Tensor,
+        width: fx.Int32,
+        next_n: fx.Int32,
     ):
         row = fx.Int32(fx.block_idx.x)
         tid = fx.thread_idx.x
@@ -175,8 +179,17 @@ def build_radix_topk_one_block_gfx1250_module(
         sign_bit = fx.Int32(-2147483648)
 
         # Row bounds
-        row_start = row_starts[row]
-        row_len = row_ends[row] - row_start
+        if const_expr(is_decode):
+            request = row // next_n
+            offset = row % next_n
+            row_start = zero
+            row_end = row_ends[request] - next_n + offset + one
+            row_end = (row_end < zero).select(zero, row_end)
+            row_end = (row_end > width).select(width, row_end)
+        else:
+            row_start = row_starts[row]
+            row_end = row_ends[row]
+        row_len = row_end - row_start
         full_vector_count = row_len // vec_width
 
         # Input and output views
@@ -1345,11 +1358,13 @@ def build_radix_topk_one_block_gfx1250_module(
         row_ends: fx.Tensor,
         indices: fx.Tensor,
         values: fx.Tensor,
+        width: fx.Int32,
+        next_n: fx.Int32,
         rows_m: fx.Int32,
         stream: fx.Stream,
     ):
         radix_topk_one_block_gfx1250_kernel(
-            input, row_starts, row_ends, indices, values
+            input, row_starts, row_ends, indices, values, width, next_n
         ).launch(grid=(rows_m, 1, 1), block=(block_threads, 1, 1), stream=stream)
 
     return launch_radix_topk_one_block_gfx1250

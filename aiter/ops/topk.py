@@ -411,7 +411,7 @@ def top_k_per_row_prefill(
         and get_gfx() == "gfx1250"
         and not use_mulblocks
     ):
-        return flydsl_radix_topk_one_block_gfx1250(
+        return flydsl_radix_topk_one_block_gfx1250_prefill(
             logits,
             rowStarts,
             rowEnds,
@@ -445,7 +445,7 @@ def top_k_per_row_prefill(
     )
 
 
-def flydsl_radix_topk_one_block_gfx1250(
+def flydsl_radix_topk_one_block_gfx1250_prefill(
     logits: torch.Tensor,
     rowStarts: torch.Tensor,
     rowEnds: torch.Tensor,
@@ -457,7 +457,7 @@ def flydsl_radix_topk_one_block_gfx1250(
     k: int = 2048,
     stable: bool = False,
 ) -> None:
-    """Use the FlyDSL gfx1250 one-block radix TopK kernel."""
+    """Use the FlyDSL gfx1250 one-block radix TopK kernel for prefill."""
     from .flydsl.radix_topk_one_block_gfx1250 import (
         radix_topk_one_block_gfx1250 as _impl,
     )
@@ -473,6 +473,39 @@ def flydsl_radix_topk_one_block_gfx1250(
         stride1,
         k,
         stable,
+    )
+
+
+def flydsl_radix_topk_one_block_gfx1250_decode(
+    logits: torch.Tensor,
+    next_n: int,
+    seqLens: torch.Tensor,
+    indices: torch.Tensor,
+    numRows: int,
+    stride0: int,
+    stride1: int,
+    k: int = 2048,
+    stable: bool = False,
+    values: torch.Tensor | None = None,
+) -> None:
+    """Use the FlyDSL gfx1250 one-block radix TopK kernel for decode."""
+    from .flydsl.radix_topk_one_block_gfx1250 import (
+        radix_topk_one_block_gfx1250 as _impl,
+    )
+
+    return _impl(
+        logits,
+        None,
+        seqLens,
+        indices,
+        values,
+        numRows,
+        stride0,
+        stride1,
+        k,
+        stable,
+        is_decode=True,
+        next_n=next_n,
     )
 
 
