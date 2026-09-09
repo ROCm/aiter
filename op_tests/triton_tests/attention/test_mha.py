@@ -30,6 +30,48 @@ logger = logging.getLogger(__name__)
 DEBUG_MODE = False
 
 
+# Keep backend-specific head domains coupled to avoid unsupported cross-products.
+def _backend_head_cases(backend, head_pairs, head_sizes):
+    return [
+        pytest.param(
+            backend,
+            num_q_heads,
+            num_k_heads,
+            head_size,
+            id=f"{backend}-{num_q_heads}-{num_k_heads}-{head_size}",
+        )
+        for num_q_heads, num_k_heads in head_pairs
+        for head_size in head_sizes
+    ]
+
+
+_MHA_BACKEND_HEAD_CASES = [
+    *_backend_head_cases(
+        "triton",
+        ((1, 1), (8, 8), (48, 8)),
+        (64, 128),
+    ),
+    *_backend_head_cases(
+        "gluon",
+        ((1, 1), (8, 1), (64, 8)),
+        (33, 64, 128),
+    ),
+]
+
+_MHA_VARLEN_BACKEND_HEAD_CASES = [
+    *_backend_head_cases(
+        "triton",
+        ((1, 1), (16, 16), (2, 1), (48, 8)),
+        (8, 32, 128),
+    ),
+    *_backend_head_cases(
+        "gluon",
+        ((1, 1), (8, 1), (16, 16), (64, 8)),
+        (8, 32, 33, 128),
+    ),
+]
+
+
 def _test_mha_impl(
     BATCH: int,
     SEQLEN_Q: int,
@@ -112,9 +154,11 @@ def _test_mha_impl(
     "SEQLEN_Q, SEQLEN_K",
     [(1, 1), (128, 128), (32, 16), (64, 128), (2048, 2048)],
 )
-@pytest.mark.parametrize("NUM_Q_HEADS, NUM_K_HEADS", [(1, 1), (8, 8), (48, 8)])
-@pytest.mark.parametrize("HEAD_SZ", [64, 128])
 @pytest.mark.parametrize("CAUSAL", [(True), (False)])
+@pytest.mark.parametrize(
+    "backend, NUM_Q_HEADS, NUM_K_HEADS, HEAD_SZ",
+    _MHA_BACKEND_HEAD_CASES,
+)
 def test_mha(
     BATCH: int,
     SEQLEN_Q: int,
@@ -123,6 +167,7 @@ def test_mha(
     NUM_K_HEADS: int,
     HEAD_SZ: int,
     CAUSAL: bool,
+    backend: str,
     dtype=torch.bfloat16,
 ):
     _test_mha_impl(
@@ -136,41 +181,7 @@ def test_mha(
         RETURN_LSE=False,
         RETURN_SOFTMAX=False,
         CAUSAL=CAUSAL,
-        backend="triton",
-        dtype=dtype,
-    )
-
-
-@pytest.mark.parametrize("BATCH", [1, 30, 50])
-@pytest.mark.parametrize(
-    "SEQLEN_Q, SEQLEN_K",
-    [(1, 1), (128, 128), (32, 16), (64, 128), (2048, 2048)],
-)
-@pytest.mark.parametrize("NUM_Q_HEADS, NUM_K_HEADS", [(1, 1), (8, 1), (64, 8)])
-@pytest.mark.parametrize("HEAD_SZ", [33, 64, 128])
-@pytest.mark.parametrize("CAUSAL", [(True), (False)])
-def test_mha_gluon(
-    BATCH: int,
-    SEQLEN_Q: int,
-    SEQLEN_K: int,
-    NUM_Q_HEADS: int,
-    NUM_K_HEADS: int,
-    HEAD_SZ: int,
-    CAUSAL: bool,
-    dtype=torch.bfloat16,
-):
-    _test_mha_impl(
-        BATCH,
-        SEQLEN_Q,
-        SEQLEN_K,
-        NUM_Q_HEADS,
-        NUM_K_HEADS,
-        HEAD_SZ,
-        DROPOUT=0.0,
-        RETURN_LSE=False,
-        RETURN_SOFTMAX=False,
-        CAUSAL=CAUSAL,
-        backend="gluon",
+        backend=backend,
         dtype=dtype,
     )
 
@@ -599,11 +610,11 @@ def _test_mha_varlen_impl(
     "SEQLEN_Q, SEQLEN_K",
     [(1, 1), (128, 128), (32, 16), (64, 128), (2048, 2048)],
 )
-@pytest.mark.parametrize(
-    "NUM_Q_HEADS, NUM_K_HEADS", [(1, 1), (16, 16), (2, 1), (48, 8)]
-)
-@pytest.mark.parametrize("HEAD_SZ", [8, 32, 128])
 @pytest.mark.parametrize("CAUSAL", [(True), (False)])
+@pytest.mark.parametrize(
+    "backend, NUM_Q_HEADS, NUM_K_HEADS, HEAD_SZ",
+    _MHA_VARLEN_BACKEND_HEAD_CASES,
+)
 def test_mha_varlen(
     BATCH: int,
     SEQLEN_Q: int,
@@ -612,6 +623,7 @@ def test_mha_varlen(
     NUM_K_HEADS: int,
     HEAD_SZ: int,
     CAUSAL: bool,
+    backend: str,
     dtype=torch.bfloat16,
 ):
     _test_mha_varlen_impl(
@@ -625,43 +637,7 @@ def test_mha_varlen(
         RETURN_LSE=False,
         RETURN_SOFTMAX=False,
         CAUSAL=CAUSAL,
-        backend="triton",
-        dtype=dtype,
-    )
-
-
-@pytest.mark.parametrize("BATCH", [1, 4, 30, 50])
-@pytest.mark.parametrize(
-    "SEQLEN_Q, SEQLEN_K",
-    [(1, 1), (128, 128), (32, 16), (64, 128), (2048, 2048)],
-)
-@pytest.mark.parametrize(
-    "NUM_Q_HEADS, NUM_K_HEADS", [(1, 1), (8, 1), (16, 16), (64, 8)]
-)
-@pytest.mark.parametrize("HEAD_SZ", [8, 32, 33, 128])
-@pytest.mark.parametrize("CAUSAL", [(True), (False)])
-def test_mha_varlen_gluon(
-    BATCH: int,
-    SEQLEN_Q: int,
-    SEQLEN_K: int,
-    NUM_Q_HEADS: int,
-    NUM_K_HEADS: int,
-    HEAD_SZ: int,
-    CAUSAL: bool,
-    dtype=torch.bfloat16,
-):
-    _test_mha_varlen_impl(
-        BATCH,
-        SEQLEN_Q,
-        SEQLEN_K,
-        NUM_Q_HEADS,
-        NUM_K_HEADS,
-        HEAD_SZ,
-        DROPOUT=0.0,
-        RETURN_LSE=False,
-        RETURN_SOFTMAX=False,
-        CAUSAL=CAUSAL,
-        backend="gluon",
+        backend=backend,
         dtype=dtype,
     )
 
