@@ -98,9 +98,8 @@ def _na3d_flash_fwd(
     """
     pid_q = tl.program_id(0)
     pid_bnh = tl.program_id(1)
-    H64 = H.to(tl.int64)
     W64 = W.to(tl.int64)
-    HW = H64 * W64
+    HW = H * W64  # promotes to int64
 
     # Decompose pid_q into (t,h) row and W-block within that row.
     W_blocks = (W + BLOCK_Q - 1) // BLOCK_Q  # programs per (t,h) row

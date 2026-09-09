@@ -269,6 +269,9 @@ _DEFAULT_SHAPES = [
     # because 32 < BLOCK_Q + KW - 1 = 16 + 27 - 1 = 42. Only the 32/64 configs
     # survive; exercises large-KW masking and the W-boundary of BLOCK_KV=64.
     (1, 4, 8, 32, 4, 64, 3, 5, 27),
+    # H=1 degenerate case: Triton specialises runtime args equal to 1 to a Python
+    # constexpr (no .to() method), crashing H.to(tl.int64). KH=1 is required (KH<=H).
+    (1, 4, 1, 32, 4, 64, 3, 1, 5),
 ]
 
 
@@ -287,6 +290,7 @@ _SDPA_FAST_SHAPES = [
     (1, 16, 16, 16, 4, 64, 11, 11, 11),  # edge: W == 16         (SEQ = 4 096)
     (2, 16, 16, 32, 4, 64, 3, 5, 5),  # edge: B > 1           (SEQ = 8 192)
     (1, 4, 8, 32, 4, 64, 3, 5, 27),  # edge: KW=27>17, BLOCK_Q=32 only (SEQ = 1 024)
+    (1, 4, 1, 32, 4, 64, 3, 1, 5),  # edge: H=1, Triton constexpr   (SEQ = 128)
 ]
 
 
