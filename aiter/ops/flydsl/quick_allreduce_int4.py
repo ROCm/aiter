@@ -13,7 +13,6 @@ from flydsl.expr.typing import Int32, Int64, Stream
 
 from aiter.jit.utils.chip_info import get_gfx_runtime
 
-from .quick_allreduce_int4_ipc import UncachedIpcHeap
 from .kernels.quick_allreduce_int4 import (
     DEFAULT_GRID_CAP,
     SUPER_TILES,
@@ -24,6 +23,7 @@ from .kernels.quick_allreduce_int4 import (
     make_quick_allreduce_int4_kernel,
 )
 from .kernels.tensor_shim import _run_compiled
+from .quick_allreduce_int4_ipc import UncachedIpcHeap
 
 _SUPPORTED_ARCHS = ("gfx942", "gfx950")
 
@@ -257,7 +257,9 @@ class QuickAllReduceInt4:
             raise ValueError("QuickAllReduceInt4 requires 16-byte-aligned input/output")
         live_bytes = int(inp.numel()) * int(inp.element_size())
         if live_bytes > 0xFFFFFFFF:
-            raise ValueError("QuickAllReduceInt4 payload must not exceed the 4 GiB buffer window")
+            raise ValueError(
+                "QuickAllReduceInt4 payload must not exceed the 4 GiB buffer window"
+            )
         if live_bytes % 16 != 0:
             raise ValueError("byte size must be a multiple of 16 (8 bf16)")
         if int(out.numel()) * int(out.element_size()) != live_bytes:

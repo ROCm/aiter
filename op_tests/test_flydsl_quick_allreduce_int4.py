@@ -46,12 +46,12 @@ pytest.importorskip("flydsl")
 
 set_start_method("spawn", force=True)
 
-from aiter.ops.flydsl.quick_allreduce_int4 import DEFAULT_GRID_CAP
 from aiter.ops.flydsl.kernels.quick_allreduce_int4 import (
     SUPPORTED_WORLDS,
     TILE_BYTES,
     WORLD,
 )
+from aiter.ops.flydsl.quick_allreduce_int4 import DEFAULT_GRID_CAP
 
 try:
     ARCH = get_gfx_runtime()
@@ -334,7 +334,9 @@ def _spawn(
     finally:
         pool.join()
     if len(ranks) != world_size:
-        raise RuntimeError(f"QuickAllReduceInt4 gathered {len(ranks)} ranks, expected {world_size}")
+        raise RuntimeError(
+            f"QuickAllReduceInt4 gathered {len(ranks)} ranks, expected {world_size}"
+        )
     return ranks
 
 
@@ -508,14 +510,18 @@ def main():
 
     for dtype in args.dtype:
         if dtype != dtypes.bf16:
-            aiter.logger.warning("QuickAllReduceInt4 payload is bf16; skipping %s", dtype)
+            aiter.logger.warning(
+                "QuickAllReduceInt4 payload is bf16; skipping %s", dtype
+            )
             continue
         df = []
         for tp, batch, mnk in itertools.product(args.tp, args.batch, args.mnk):
             if batch != 1:
                 continue
             if tp not in SUPPORTED_WORLDS:
-                aiter.logger.warning("QuickAllReduceInt4 unsupported world_size=%s; skipping", tp)
+                aiter.logger.warning(
+                    "QuickAllReduceInt4 unsupported world_size=%s; skipping", tp
+                )
                 continue
             if n_gpu < tp:
                 aiter.logger.warning(
