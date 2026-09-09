@@ -22,9 +22,9 @@ from .communication_ops_utils import (
     fence_system_acquire,
     store_i64_global_system,
 )
-from .quant_utils import emit_mx_e8m0_scale
+from .quant_utils import emit_f32_to_e2m1, emit_mx_e8m0_scale
 
-_JIT_SCHEMA_VERSION = "v16-v-quant-int8"
+_JIT_SCHEMA_VERSION = "v17-per-role-mxfp4"
 _TRANSPORT_CHUNK_BYTES = 16
 _PUSH_PIPELINE_DEPTH = 16
 _OUT_CHANNEL_DEPTH = 1
@@ -62,7 +62,7 @@ def _transport_scale(amax, codec):
         emit_mx_e8m0_scale(
             amax.ir_value(),
             mode=MxScaleRoundModeInt.RoundUp,
-            dtype=MxDtypeInt.FP8_E4M3,
+            dtype=(MxDtypeInt.FP4_E2M1 if codec == "mxfp4" else MxDtypeInt.FP8_E4M3),
         )
     )
 
@@ -70,15 +70,40 @@ def _transport_scale(amax, codec):
 def _pack_transport_pair(first, second, codec):
     if codec == "int8":
         return _pack_int8_pair(first, second)
+    if codec == "mxfp4":
+        low = fx.Int32(emit_f32_to_e2m1(first.ir_value()))
+        high = fx.Int32(emit_f32_to_e2m1(second.ir_value()))
+        return low | (high << 4)
     word = fx.rocdl.cvt_pk_fp8_f32(
         T.i32, first.ir_value(), second.ir_value(), fx.Int32(0).ir_value(), 0
     )
     return fx.Int32(word).to(fx.Int16)
 
 
+def _pack_transport_words(pairs, codec):
+    if codec == "mxfp4":
+        word = pairs[0]
+        for i in range(1, 4):
+            word = word | (pairs[i] << (8 * i))
+        return word
+    return fx.Vector.from_elements(pairs, fx.Int16).bitcast(fx.Int32)
+
+
 def _unpack_transport_pair(word, high, codec):
     if codec == "int8":
         return _unpack_int8_pair(word, high)
+    if codec == "mxfp4":
+        values = []
+        for i in range(2):
+            nibble = (word >> (int(high) * 8 + i * 4)) & 15
+            magnitude = nibble & 7
+            # E2M1's positive levels are 0, .5, 1, 1.5, 2, 3, 4, 6.
+            exponent = magnitude >> 1
+            normal = ((exponent + 126) << 23) | ((magnitude & 1) << 22)
+            bits = (magnitude < 2).select(magnitude * 0x3F000000, normal)
+            bits = bits | ((nibble & 8) << 28)
+            values.append(bits.bitcast(fx.Float32))
+        return fx.Vector.from_elements(values, fx.Float32)
     return fx.Vector(fx.rocdl.cvt_pk_f32_fp8(T.f32x2, word, high))
 
 
@@ -103,9 +128,10 @@ def make_fused_a2a_kernel(
             f"head row must be {_TRANSPORT_CHUNK_BYTES}-byte aligned, got {row_nbytes}"
         )
 
+    codecs = (codec,) * 3 if isinstance(codec, str) else codec
     heads_local = heads // npes
     seq_full = seq_len * npes
-    # Source chunks remain bf16-sized even when the wire payload is fp8.
+    # Source chunks remain bf16-sized even when the wire payload is quantized.
     elements_per_chunk = _TRANSPORT_CHUNK_BYTES // 2
     chunks_per_row = head_dim // elements_per_chunk
     chunk_words = _TRANSPORT_CHUNK_BYTES // 4
@@ -201,7 +227,9 @@ def make_fused_a2a_kernel(
                 )
             return result
 
-        def process_qk(rsrc_input, rsrc_norm, p2p_bases, addr_p2p_scale):
+        def process_qk(rsrc_input, rsrc_norm, p2p_bases, addr_p2p_scale, codec):
+            wire_words = (1 if codec == "mxfp4" else 2) if quant else chunk_words
+            row_nbytes = head_dim * wire_words // 2
             rsrc_p2p_scale = create_buffer_resource_from_addr(addr_p2p_scale)
             for seq in range(global_warp_id, seq_len, global_warp_num):
                 tiles = []
@@ -292,11 +320,7 @@ def make_fused_a2a_kernel(
                                         codec,
                                     )
                                 )
-                            outputs.append(
-                                fx.Vector.from_elements(packed, dtype=fx.Int16).bitcast(
-                                    fx.Int32
-                                )
-                            )
+                            outputs.append(_pack_transport_words(packed, codec))
                             scales.append(scale.to(fx.Int8))
                         else:
                             outputs.append(
@@ -333,7 +357,7 @@ def make_fused_a2a_kernel(
                                 buffer_store(
                                     outputs[batch_idx],
                                     rsrc_dst,
-                                    lane_in_group * (2 if quant else 8),
+                                    lane_in_group * (wire_words if quant else 8),
                                 )
                                 if const_expr(quant):
                                     scale_base = buffer_load(
@@ -366,7 +390,8 @@ def make_fused_a2a_kernel(
                                             lane_in_group // 4,
                                         )
 
-        def transport(input_rsrc, p2p_bases, addr_p2p_scale):
+        def transport(input_rsrc, p2p_bases, addr_p2p_scale, codec):
+            wire_words = (1 if codec == "mxfp4" else 2) if quant else chunk_words
             peer_chunks = total_chunks // npes
             peer_group_count = (peer_chunks + 63) // 64
             peer_warp_num = global_warp_num // npes
@@ -380,7 +405,7 @@ def make_fused_a2a_kernel(
             )
             rsrc_dst = create_buffer_resource_from_addr(
                 uniform_peer_base,
-                num_records_bytes=total_chunks * elements_per_chunk * element_size,
+                num_records_bytes=total_chunks * wire_words * 4,
             )
             if const_expr(quant):
                 rsrc_p2p_scale = create_buffer_resource_from_addr(addr_p2p_scale)
@@ -439,11 +464,7 @@ def make_fused_a2a_kernel(
                                     codec,
                                 )
                             )
-                        values.append(
-                            fx.Vector.from_elements(packed, dtype=fx.Int16).bitcast(
-                                fx.Int32
-                            )
-                        )
+                        values.append(_pack_transport_words(packed, codec))
                         scales.append(scale.to(fx.Int8))
                     else:
                         values.append(raw)
@@ -452,7 +473,7 @@ def make_fused_a2a_kernel(
                         + (rank * seq_len + seq) * chunks_per_row
                         + row_chunk
                     )
-                    destinations.append(dst_chunk * (2 if quant else chunk_words))
+                    destinations.append(dst_chunk * wire_words)
                     scale_destinations.append(dst_chunk // 4)
                     valid_values.append(valid)
                 for batch_idx in range_constexpr(_PUSH_PIPELINE_DEPTH):
@@ -470,15 +491,19 @@ def make_fused_a2a_kernel(
                                 )
 
         if const_expr(fuse_norm_rope):
-            process_qk(rsrc_input_q, rsrc_norm_q, p2p_bases_q, addr_p2p_scale_q)
+            process_qk(
+                rsrc_input_q, rsrc_norm_q, p2p_bases_q, addr_p2p_scale_q, codecs[0]
+            )
             if const_expr(not split):
-                process_qk(rsrc_input_k, rsrc_norm_k, p2p_bases_k, addr_p2p_scale_k)
+                process_qk(
+                    rsrc_input_k, rsrc_norm_k, p2p_bases_k, addr_p2p_scale_k, codecs[1]
+                )
         else:
-            transport(rsrc_input_q, p2p_bases_q, addr_p2p_scale_q)
+            transport(rsrc_input_q, p2p_bases_q, addr_p2p_scale_q, codecs[0])
             if const_expr(not split):
-                transport(rsrc_input_k, p2p_bases_k, addr_p2p_scale_k)
+                transport(rsrc_input_k, p2p_bases_k, addr_p2p_scale_k, codecs[1])
         if const_expr(not split):
-            transport(rsrc_input_v, p2p_bases_v, addr_p2p_scale_v)
+            transport(rsrc_input_v, p2p_bases_v, addr_p2p_scale_v, codecs[2])
 
         fx.rocdl.s_waitcnt(vmcnt=0)
 
@@ -715,7 +740,58 @@ def make_fused_a2a_jit(
 def make_fused_a2a_dequant_jit(*, numel, return_mode="bf16", codec="e4m3"):
     block_threads = 256
     vec = 8
-    key = (numel, return_mode, codec, _JIT_SCHEMA_VERSION)
+    codecs = (codec,) * 3 if isinstance(codec, str) else codec
+    key = (numel, return_mode, codecs, _JIT_SCHEMA_VERSION)
+
+    @flyc.jit
+    def dequant_one(
+        addr_payload: fx.Int64,
+        addr_scale: fx.Int64,
+        addr_out: fx.Int64,
+        role_codec: fx.Constexpr[str],
+    ):
+        packing = 2 if role_codec == "mxfp4" else 1
+        payload = create_buffer_resource_from_addr(
+            addr_payload, num_records_bytes=numel // packing
+        )
+        scales = create_buffer_resource_from_addr(
+            addr_scale, num_records_bytes=numel // 32
+        )
+        output = create_buffer_resource_from_addr(addr_out, num_records_bytes=numel * 2)
+        offset = fx.Int32(
+            (fx.gpu.block_id("x") * block_threads + fx.gpu.thread_id("x")) * vec
+        )
+        if offset < numel:
+            words = (
+                fx.Vector.from_elements(
+                    [buffer_load(payload, offset // 8, vec_width=1, dtype=T.i32)],
+                    fx.Int32,
+                )
+                if const_expr(packing == 2)
+                else fx.Vector(
+                    buffer_load(payload, offset // 4, vec_width=2, dtype=T.i32)
+                )
+            )
+            # Four neighboring lanes share a scale; four scales fit in one dword.
+            scale_index = offset // 32
+            scale_word = fx.Uint32(
+                buffer_load(scales, scale_index // 4, vec_width=1, dtype=T.i32)
+            )
+            exponent = (scale_word >> ((scale_index % 4) * 8)) & 255
+            scale_bits = (exponent == 0).select(fx.Uint32(0x00400000), exponent << 23)
+            scale_bits = (exponent == 255).select(fx.Uint32(0x7FC00000), scale_bits)
+            scale = scale_bits.bitcast(fx.Float32)
+            values = []
+            for pair_index in range_constexpr(vec // 2):
+                pair = _unpack_transport_pair(
+                    words[pair_index // (2 * packing)],
+                    pair_index % 4 if packing == 2 else bool(pair_index % 2),
+                    role_codec,
+                )
+                values.append(pair[0] * scale)
+                values.append(pair[1] * scale)
+            bf16 = fx.Vector.from_elements(values, fx.Float32).to(fx.BFloat16)
+            buffer_store(bf16, output, offset)
 
     @flyc.kernel(known_block_size=[block_threads, 1, 1])
     def fused_a2a_dequant(
@@ -730,44 +806,14 @@ def make_fused_a2a_dequant_jit(*, numel, return_mode="bf16", codec="e4m3"):
         addr_out_v: fx.Int64,
     ):
         tensor_id = fx.gpu.block_id("y")
-        is_q = tensor_id == 0
-        is_k = tensor_id == 1
-        payload = create_buffer_resource_from_addr(
-            is_q.select(addr_q, is_k.select(addr_k, addr_v)), num_records_bytes=numel
-        )
-        scales = create_buffer_resource_from_addr(
-            is_q.select(addr_scale_q, is_k.select(addr_scale_k, addr_scale_v)),
-            num_records_bytes=numel // 32,
-        )
-        output = create_buffer_resource_from_addr(
-            is_q.select(addr_out_q, is_k.select(addr_out_k, addr_out_v)),
-            num_records_bytes=numel * 2,
-        )
-        offset = fx.Int32(
-            (fx.gpu.block_id("x") * block_threads + fx.gpu.thread_id("x")) * vec
-        )
-        if offset < numel:
-            words = fx.Vector(
-                buffer_load(payload, offset // 4, vec_width=2, dtype=T.i32)
-            )
-            # Four neighboring lanes share a scale; four scales fit in one dword.
-            scale_index = offset // 32
-            scale_word = fx.Uint32(
-                buffer_load(scales, scale_index // 4, vec_width=1, dtype=T.i32)
-            )
-            exponent = (scale_word >> ((scale_index % 4) * 8)) & 255
-            scale_bits = (exponent == 0).select(fx.Uint32(0x00400000), exponent << 23)
-            scale_bits = (exponent == 255).select(fx.Uint32(0x7FC00000), scale_bits)
-            scale = scale_bits.bitcast(fx.Float32)
-            values = []
-            for pair_index in range_constexpr(vec // 2):
-                pair = _unpack_transport_pair(
-                    words[pair_index // 2], bool(pair_index % 2), codec
+        for role in range_constexpr(3):
+            if tensor_id == role:
+                dequant_one(
+                    (addr_q, addr_k, addr_v)[role],
+                    (addr_scale_q, addr_scale_k, addr_scale_v)[role],
+                    (addr_out_q, addr_out_k, addr_out_v)[role],
+                    codecs[role],
                 )
-                values.append(pair[0] * scale)
-                values.append(pair[1] * scale)
-            bf16 = fx.Vector.from_elements(values, fx.Float32).to(fx.BFloat16)
-            buffer_store(bf16, output, offset)
 
     @flyc.jit
     def launch(

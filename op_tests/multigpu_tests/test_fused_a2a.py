@@ -1,12 +1,15 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026 Advanced Micro Devices, Inc. All rights reserved.
 
-"""Multi-rank correctness for combined/split Ulysses in-hop and world-8 out-hop."""
+"""Multi-rank correctness for combined/split Ulysses in-hop and out-hop."""
 
 from __future__ import annotations
 
 import os
 import socket
+
+# The full codec sweep retains symmetric allocations until shmem_finalize.
+os.environ.setdefault("MORI_SHMEM_HEAP_SIZE", "12G")
 
 import mori.shmem as ms
 import pytest
@@ -21,7 +24,15 @@ from aiter.ops.flydsl.kernels.fused_a2a_intranode_op import (
     FusedA2AOutIntraNodeOp,
 )
 
-_WORLD_SIZE = int(os.environ.get("FUSED_A2A_WORLD_SIZE", "8"))
+_WORLD_SIZE = int(os.environ.get("FUSED_A2A_WORLD_SIZE", "4"))
+_CODEC_ROWS = (
+    ("int8", ("int8", "int8", "int8")),
+    ("i8fp8", ("int8", "int8", "e4m3")),
+    ("fp8", ("e4m3", "e4m3", "e4m3")),
+    ("mxfp4", ("mxfp4", "mxfp4", "e4m3")),
+    ("f4f4", ("mxfp4", "mxfp4", "mxfp4")),
+    ("mixed", ("int8", "e4m3", "mxfp4")),
+)
 _CASES = (
     ("small", 8, 17, 128),
     ("deployed", 40, 9419, 128),
@@ -89,11 +100,41 @@ def _mx_int8_reference(values):
     return payload.view(torch.uint8).reshape_as(values), exponent.to(torch.uint8)
 
 
+def _mx_fp4_reference(values):
+    """Nearest E2M1 level, ties to even nibble, with RoundUp E8M0 scaling."""
+    blocks = values.float().reshape(*values.shape[:-1], -1, 32)
+    amax = blocks.abs().amax(dim=-1)
+    inv_max = torch.tensor(0x3E2AAAAB, dtype=torch.int32, device=values.device).view(
+        torch.float32
+    )
+    bits = (amax * inv_max).view(torch.int32)
+    exponent = (((bits >> 23) & 255) + ((bits & 0x7FFFFF) != 0).int()).clamp(0, 255)
+    reciprocal = ((254 - exponent) << 23).view(torch.float32)
+    scaled = blocks * reciprocal.unsqueeze(-1)
+    magnitude = scaled.abs()
+    nibble = torch.zeros_like(magnitude, dtype=torch.uint8)
+    for i, midpoint in enumerate((0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0)):
+        above = magnitude >= midpoint if i % 2 else magnitude > midpoint
+        nibble += above.to(torch.uint8)
+    nibble |= torch.signbit(scaled).to(torch.uint8) << 3
+    nibble = nibble.reshape(*values.shape[:-1], values.shape[-1])
+    payload = nibble[..., 0::2] | (nibble[..., 1::2] << 4)
+    return payload, exponent.to(torch.uint8)
+
+
 def _dequantize(payload, scales, dtype=torch.float32, codec="e4m3"):
-    value_dtype = torch.int8 if codec == "int8" else torch.float8_e4m3fn
-    blocks = payload.view(value_dtype).float().reshape(*scales.shape, 32)
+    if codec == "mxfp4":
+        nibble = torch.stack((payload & 15, payload >> 4), dim=-1).long()
+        levels = torch.tensor(
+            [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0], device=payload.device
+        )
+        values = levels[nibble & 7] * torch.where(nibble & 8 != 0, -1.0, 1.0)
+    else:
+        value_dtype = torch.int8 if codec == "int8" else torch.float8_e4m3fn
+        values = payload.view(value_dtype).float()
+    blocks = values.reshape(*scales.shape, 32)
     scale = torch.exp2(scales.float() - 127)
-    return (blocks * scale.unsqueeze(-1)).reshape_as(payload).to(dtype)
+    return (blocks * scale.unsqueeze(-1)).flatten(-2).to(dtype)
 
 
 def _assert_quantized(
@@ -403,6 +444,106 @@ def _run_rank(rank, world_size, port):
                             flush=True,
                         )
 
+            quantizers = {
+                "int8": _mx_int8_reference,
+                "e4m3": _mx_fp8_reference,
+                "mxfp4": _mx_fp4_reference,
+            }
+            for row_name, codecs in _CODEC_ROWS:
+                for role, role_codec in zip("QKV", codecs, strict=True):
+                    os.environ[f"FUSED_A2A_CODEC_{role}"] = role_codec
+                quantized = [
+                    quantizers[role_codec](input_tensor)
+                    for input_tensor, role_codec in zip(inputs, codecs, strict=True)
+                ]
+                payload_references = [
+                    a2a_references(
+                        [payload],
+                        heads_local,
+                        seq_len,
+                        head_dim // (2 if role_codec == "mxfp4" else 1),
+                    )[0]
+                    for (payload, _), role_codec in zip(quantized, codecs, strict=True)
+                ]
+                scale_references = a2a_references(
+                    [scale for _, scale in quantized],
+                    heads_local,
+                    seq_len,
+                    head_dim // 32,
+                )
+                modes = [(True, "fp8"), (True, "bf16")]
+                if case_name == "small" and row_name == "mixed":
+                    modes.append((False, "bf16"))
+                for split, return_mode in modes:
+                    op = FusedA2AIntraNodeOp(
+                        rank=rank,
+                        world_size=world_size,
+                        shape=q.shape,
+                        fuse_norm_rope=False,
+                        split=split,
+                        quant=True,
+                        return_mode=return_mode,
+                    )
+                    for epoch in range(3):
+                        result = op(*inputs)
+                        torch.cuda.synchronize()
+                        payloads = (
+                            result[0]
+                            if return_mode == "fp8"
+                            else op.outputs_sets[epoch % 2]
+                        )
+                        scales = (
+                            result[1]
+                            if return_mode == "fp8"
+                            else op.scales_sets[epoch % 2]
+                        )
+                        for i, role_codec in enumerate(codecs):
+                            label = f"{case_name} {row_name} {return_mode} {'qkv'[i]} rank={rank} epoch={epoch}"
+                            expected_payload = payload_references[i]
+                            assert (
+                                payloads[i].numel() == expected_payload.numel()
+                            ), label
+                            assert payloads[i].dtype == torch.uint8, label
+                            _assert_equal(
+                                payloads[i].view_as(expected_payload),
+                                expected_payload,
+                                label,
+                            )
+                            _assert_equal(
+                                scales[i].view_as(scale_references[i]),
+                                scale_references[i],
+                                label,
+                            )
+                            reference = _dequantize(
+                                expected_payload, scale_references[i], codec=role_codec
+                            )
+                            actual = (
+                                _dequantize(
+                                    payloads[i],
+                                    scales[i].view_as(scale_references[i]),
+                                    codec=role_codec,
+                                )
+                                if return_mode == "fp8"
+                                else result[i].view(expected_shape)
+                            )
+                            if return_mode == "bf16":
+                                assert actual.dtype == torch.bfloat16, label
+                                reference = reference.to(torch.bfloat16)
+                            _assert_equal(actual, reference, label)
+                            _assert_quantized_values(
+                                actual, reference, transport_references[i], label
+                            )
+                        dist.barrier()
+                    if rank == 0:
+                        print(
+                            f"PASS {case_name} row={row_name} codecs={codecs} split={split} "
+                            f"norm_rope=False return={return_mode}: payload/scales=byte-identical "
+                            "dequant=bit-exact epochs=3",
+                            flush=True,
+                        )
+            for role in "QKV":
+                os.environ.pop(f"FUSED_A2A_CODEC_{role}", None)
+
             if world_size >= 2:
                 out_input = references[0].contiguous()
                 out_packed = out_input.permute(2, 0, 1, 3).contiguous()
@@ -410,7 +551,17 @@ def _run_rank(rank, world_size, port):
                     funcol.all_to_all_single(
                         out_packed.view(-1), None, None, dist.group.WORLD
                     )
-                ).view(1, seq_len, heads, head_dim)
+                ).view(world_size, seq_len, heads_local, head_dim)
+                # The wrapper returns [B,H_total,S_local,D]; each received peer
+                # chunk is sequence-major and must be transposed before joining heads.
+                out_reference = out_reference.permute(0, 2, 1, 3).reshape(
+                    1, heads, seq_len, head_dim
+                )
+                _assert_equal(
+                    out_reference.transpose(1, 2),
+                    transformed[0],
+                    f"{case_name} inverse reference rank {rank}",
+                )
                 out_op = FusedA2AOutIntraNodeOp(
                     rank=rank,
                     world_size=world_size,
@@ -452,7 +603,8 @@ def main():
 
     mp.spawn(_run_rank, args=(_WORLD_SIZE, _free_port()), nprocs=_WORLD_SIZE, join=True)
     passed = sum(
-        8 + 2 * (name == "small") + int(_WORLD_SIZE >= 2) for name, *_ in _CASES
+        8 + 3 * (name == "small") + int(_WORLD_SIZE >= 2) + 2 * len(_CODEC_ROWS)
+        for name, *_ in _CASES
     )
     skipped = len(_CASES) * int(_WORLD_SIZE < 2)
     print(f"{passed} passed, {skipped} skipped on {arch}")
