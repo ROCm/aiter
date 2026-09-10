@@ -116,7 +116,7 @@ def get_recommended_splits(num_sequences, num_kv_heads, split_kv_blocks=1):
         num_sm, num_sequences * num_kv_heads * split_kv_blocks
     )
     max_context_partition_num *= split_kv_blocks
-    return min(max_context_partition_num, 8)
+    return min(max_context_partition_num, 128)
 
 
 DS_WRITE = gl.constexpr(0x200)
