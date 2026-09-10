@@ -38,6 +38,7 @@ import itertools
 import torch
 import triton
 
+from aiter.ops.triton.utils._triton import arch_info
 from aiter.ops.triton.utils.config_utils import (
     USE_LRU_CACHE,
     load_config_json,
@@ -213,8 +214,10 @@ def _axis_values(
     }
 
 
-def _load(op: str, backend, arch) -> tuple:
+def _load(op: str, backend, arch: str | None) -> tuple:
     """Return ``(table, axes, cfg_dir)`` for one op."""
+    if arch is None:
+        arch = arch_info.get_arch()
     cfg_dir = resolve_config_dir(
         "attention", _CONFIG_NAME, backend=backend, arch=_ARCH_ALIAS.get(arch, arch)
     )
