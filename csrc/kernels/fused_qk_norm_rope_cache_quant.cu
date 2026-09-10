@@ -6066,6 +6066,19 @@ void fused_qk_norm_rope_group_quant(
   AITER_CHECK(k_weight.size(0) == head_dim, "k_weight size must match head_dim");
   AITER_CHECK(kv.stride(-1) == 1, "kv stride(-1) must be equal to 1");
 
+  // Every one of these is reinterpret_cast to KV_T at the launch site, and KV_T is
+  // deduced from kv.dtype() alone -- so a mismatch here is not a conversion, it is
+  // a silent reinterpretation of the bytes. The dispatch instantiates float for
+  // fp32 and 2-byte types otherwise, so mixing widths also misreads the strides.
+  AITER_CHECK(q.dtype() == kv.dtype(),
+              "q dtype must match kv dtype, got ", q.dtype(), " vs ", kv.dtype());
+  AITER_CHECK(k_weight.dtype() == kv.dtype(),
+              "k_weight dtype must match kv dtype");
+  AITER_CHECK(cos_cache.dtype() == kv.dtype() && sin_cache.dtype() == kv.dtype(),
+              "cos/sin cache dtype must match kv dtype");
+  AITER_CHECK(k_rope_buff.dtype() == kv.dtype(),
+              "k_rope_buff dtype must match kv dtype");
+
   // --- Validate Q-quant / q_weight options ---
   const bool has_q_weight = q_weight.has_value();
   if (has_q_weight) {
@@ -6428,9 +6441,14 @@ void fused_qk_norm_rope_group_quant(
     auto launch_coarse = [&](auto tokens_per_block_tag, auto q_tdm_depth_tag) {
       constexpr int tokens_per_block_val = decltype(tokens_per_block_tag)::value;
       constexpr int q_tdm_depth_val      = decltype(q_tdm_depth_tag)::value;
+      // Element size must track scalar_t, not a fixed 2 bytes. The kernel indexes
+      // the ring as `wave_in_blk * Q_TDM_DEPTH * head_size * sizeof(scalar_t)`,
+      // and the dispatch below instantiates scalar_t = float when kv is fp32, so a
+      // hard-coded uint16_t under-allocates by 2x and puts the last wave's slots
+      // outside the allocation. scalar_t is KV_T, which comes from kv.dtype().
       const size_t coarse_lds_bytes =
           static_cast<size_t>(tokens_per_block_val) * q_tdm_depth_val
-          * 512 * sizeof(uint16_t);
+          * head_dim_val * kv.element_size();
       dim3 grid((num_tokens + tokens_per_block_val - 1) / tokens_per_block_val,
                 1 + num_q_waves);
       dim3 block(tokens_per_block_val * warp_size);
