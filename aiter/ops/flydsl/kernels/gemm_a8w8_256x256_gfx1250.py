@@ -24,6 +24,7 @@ from .gemm_common_gfx1250 import (
 )
 from .gfx1250_cluster import compute_mcast_masks
 from .kernels_common import format_kernel_name
+from .splitk_epilogue_gfx1250 import emit_atomic_splitk_epilogue
 from .tensor_shim import (
     AITER_FLYDSL_KERNARG_PRELOAD,
     AITER_FLYDSL_KERNARG_PRELOAD_COUNT,
@@ -44,6 +45,8 @@ def launch_gemm_a8w8_256x256(
     stride_ascale_k: fx.Int32,
     i32_lda: fx.Int32,
     i32_ldc: fx.Int32,
+    arg_flag: fx.Pointer,
+    i32_epoch: fx.Int32,
     tile_m: Constexpr[int],
     tile_n: Constexpr[int],
     tile_k: Constexpr[int],
@@ -58,6 +61,8 @@ def launch_gemm_a8w8_256x256(
     split_k: Constexpr[int] = 1,
     a_preshuffle: Constexpr[bool] = False,
     persistent_n_tiles: Constexpr[int] = 1,
+    fused_splitk: Constexpr[bool] = False,
+    bounded_m: Constexpr[bool] = True,
 ):
     """N must be a multiple of ``tile_n * cluster_n``; M is unrestricted (a
     multiple of 2 when ``a_preshuffle``); K must be divisible by 128 and at
@@ -144,6 +149,8 @@ def launch_gemm_a8w8_256x256(
         f"_cm{cluster_m}_cn{cluster_n}"
         + ("_apre" if a_preshuffle else "")
         + (f"_ps{persistent_n_tiles}" if persistent_n_tiles > 1 else "")
+        + ("_fsk" if fused_splitk and split_k > 1 else "")
+        + ("b" if fused_splitk and split_k > 1 and bounded_m else "")
     )
 
     def _run_tile(
@@ -158,6 +165,8 @@ def launch_gemm_a8w8_256x256(
         i32_stride_ascale_k: fx.Int32,
         i32_lda: fx.Int32,
         i32_ldc: fx.Int32,
+        arg_flag: fx.Pointer,
+        i32_epoch: fx.Int32,
         tile_idx=0,
     ):
         K_TILES = i32_k // (tile_k * split_k)
@@ -212,6 +221,12 @@ def launch_gemm_a8w8_256x256(
             return _view(fx.add_offset(base, off), shape, stride)
 
         oc = fx.Float16 if out_is_f16 else fx.BFloat16
+        _atomic_c = fused_splitk and split_k > 1
+        if const_expr(_atomic_c):
+            _flat_tile = bid_y * fx.Int32(fx.grid_dim.x) * fx.Int32(
+                fx.grid_dim.z
+            ) // split_k + (m_chunk * fx.Int32(fx.grid_dim.x) + bid_x)
+
         gA_base = fx.recast_iter(fx.Int8, arg_a)
         gB_base = fx.recast_iter(fx.Int8, arg_b)
 
@@ -948,7 +963,7 @@ def launch_gemm_a8w8_256x256(
                 )
         workgroup_barrier(use_cluster=False)
         c_off_rt = blk_m64 * ldc64 + blk_n64
-        if const_expr(split_k > 1):
+        if const_expr(split_k > 1 and not _atomic_c):
             c_off_rt = c_off_rt + fx.Int64(split_idx) * fx.Int64(i32_m) * ldc64
         gC_base = fx.recast_iter(
             fx.PointerType.get(oc.ir_type, arg_c.address_space),
@@ -966,17 +981,38 @@ def launch_gemm_a8w8_256x256(
             strides=[ldc64, None],
             num_warps=num_waves,
         )
-        fx.copy(
-            atomC,
-            _view(
-                fx.recast_iter(oc, base_ptr),
-                (tile_m, C_LDS_ROW),
-                (C_LDS_ROW, 1),
-            ),
-            gtC,
-        )
-        if const_expr(persistent_n_tiles == 1):
-            tdm_ops.tensor_wait(0)
+        if const_expr(_atomic_c):
+            emit_atomic_splitk_epilogue(
+                elem=oc,
+                tid=tid,
+                block=block,
+                tile_m=tile_m,
+                tile_n=tile_n,
+                c_lds_row=C_LDS_ROW,
+                lds_base_ptr=base_ptr,
+                gc_base=gC_base,
+                c_off_rt=c_off_rt,
+                ldc64=ldc64,
+                split_k=split_k,
+                split_idx=split_idx,
+                mn_oob=mn_oob,
+                bounded_m=bounded_m,
+                flat_tile=_flat_tile,
+                arg_flag=arg_flag,
+                i32_epoch=i32_epoch,
+            )
+        else:
+            fx.copy(
+                atomC,
+                _view(
+                    fx.recast_iter(oc, base_ptr),
+                    (tile_m, C_LDS_ROW),
+                    (C_LDS_ROW, 1),
+                ),
+                gtC,
+            )
+            if const_expr(persistent_n_tiles == 1):
+                tdm_ops.tensor_wait(0)
 
     @flyc.kernel(name=kernel_name, known_block_size=[block, 1, 1])
     def kernel_gemm_a8w8_256x256(
@@ -991,6 +1027,8 @@ def launch_gemm_a8w8_256x256(
         i32_stride_ascale_k: fx.Int32,
         i32_lda: fx.Int32,
         i32_ldc: fx.Int32,
+        arg_flag: fx.Pointer,
+        i32_epoch: fx.Int32,
     ):
         tile_args = (
             arg_c,
@@ -1004,6 +1042,8 @@ def launch_gemm_a8w8_256x256(
             i32_stride_ascale_k,
             i32_lda,
             i32_ldc,
+            arg_flag,
+            i32_epoch,
         )
         if const_expr(persistent_n_tiles == 1):
             _run_tile(*tile_args)
@@ -1040,6 +1080,8 @@ def launch_gemm_a8w8_256x256(
         stride_ascale_k,
         i32_lda,
         i32_ldc,
+        arg_flag,
+        i32_epoch,
         value_attrs={"rocdl.cluster_dims": f"{cluster_m},{cluster_n},1"},
     ).launch(
         grid=grid_arg,

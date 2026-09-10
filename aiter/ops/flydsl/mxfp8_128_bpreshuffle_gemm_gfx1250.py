@@ -10,6 +10,7 @@ fp32-scale blockscale GEMM).
 
 from __future__ import annotations
 
+import functools
 import re
 
 import torch
@@ -29,6 +30,36 @@ COMPUTE_WMMA_NAME_PREFIX = "flydsl_mxfp8_128_bpreshuffle_compute_wmma"
 _SUPPORTED_NUM_BUFFERS = (2, 3, 4)
 _OUT_DTYPE_NAME = {torch.bfloat16: "bf16", torch.float16: "f16"}
 _MAX_SPLIT_K = 8
+SPLIT_K_FLAG_MAX_LEN = 8192
+_EPOCH = 0
+
+
+@functools.lru_cache(maxsize=128)
+def get_split_k_flags(stream, device):
+    """Per-(stream, device) split-K flag slots."""
+    return torch.zeros(SPLIT_K_FLAG_MAX_LEN, dtype=torch.int32, device=device)
+
+
+def _next_epoch() -> int:
+    global _EPOCH
+    _EPOCH += 1
+    if _EPOCH >= 0x7FFFFFFF:  # never collides with the 0 the buffer starts at
+        _EPOCH = 1
+    return _EPOCH
+
+
+def splitk_epilogue_flags(M, N, tile_m, tile_n, cluster_m, split_k, cu_num):
+    """Return ``(fused_splitk, bounded_m)`` for one launch."""
+    wgs = _splitk_grid_wgs(M, N, tile_m, tile_n, cluster_m, split_k)
+    fused = split_k > 1 and wgs <= SPLIT_K_FLAG_MAX_LEN and wgs <= cu_num
+    return fused, bool(M % tile_m)
+
+
+def _splitk_grid_wgs(M, N, tile_m, tile_n, cluster_m, split_k) -> int:
+    """Workgroups the split-K grid launches, matching the launch exactly."""
+    gx = max(1, (M + tile_m - 1) // tile_m)
+    gx = ((gx + cluster_m - 1) // cluster_m) * cluster_m
+    return gx * ((N + tile_n - 1) // tile_n) * split_k
 
 
 def _lazy_import():
@@ -263,15 +294,27 @@ def _run_mxfp8_128_preshuffle_gemm_a8_gfx1250(
 
     lda = XQ.stride(0)
     ldc = Out.stride(0)
+    torch_stream = torch.cuda.current_stream(device=XQ.device)
+    stream = _fx.Stream(torch_stream)
+    _atomic_splitk, bounded_m = splitk_epilogue_flags(
+        M,
+        N,
+        tile_m,
+        tile_n,
+        cluster_m,
+        split_k,
+        torch.cuda.get_device_properties(XQ.device).multi_processor_count,
+    )
+    flag = get_split_k_flags(torch_stream.cuda_stream, XQ.device)
+    epoch = _next_epoch() if _atomic_splitk else 0
     partials = (
         torch.empty((split_k, M, ldc), dtype=Out.dtype, device=Out.device)
-        if split_k > 1
+        if split_k > 1 and not _atomic_splitk
         else None
     )
     gemm_out = Out if partials is None else partials
     out_is_f16 = 1 if out_dtype == "f16" else 0
 
-    stream = _fx.Stream(torch.cuda.current_stream(device=XQ.device))
     launch_args = (
         _ptr_arg(gemm_out),
         _ptr_arg(XQ),
@@ -298,9 +341,29 @@ def _run_mxfp8_128_preshuffle_gemm_a8_gfx1250(
     )
     launch = _launch_gemm_a8w8_compute_bound if compute_bound else _launch_gemm_a8w8
     if compute_bound:
-        launch(*launch_args, BLOCK_K, split_k, a_preshuffle, persistent_n_tiles)
+        cb_args = launch_args[:12] + (_ptr_arg(flag), epoch) + launch_args[12:]
+        launch(
+            *cb_args,
+            BLOCK_K,
+            split_k,
+            a_preshuffle,
+            persistent_n_tiles,
+            _atomic_splitk,
+            bounded_m,
+        )
     else:
-        launch(*launch_args, BLOCK_K, split_k, False, 0, 1, a_preshuffle)
+        nc_args = launch_args[:12] + (_ptr_arg(flag), epoch) + launch_args[12:]
+        launch(
+            *nc_args,
+            BLOCK_K,
+            split_k,
+            False,
+            0,
+            1,
+            a_preshuffle,
+            _atomic_splitk,
+            bounded_m,
+        )
     if partials is not None:
         dense = ldc == N
         _run_compiled(
@@ -422,8 +485,8 @@ def run_gemm_a8w8_mxfp8_128_bpreshuffle_gfx1250(
             "a_preshuffle, but the caller did not declare a preshuffled A. The "
             "tuned-config dispatch forwards the model's row-major activation, so "
             "this kernel would read it as (2, 128)-tiled and return wrong results. "
-            "Feed it shuffle_mxfp8fp4_a(A) and pass a_is_preshuffled=True "
-            '(config key "a_preshuffled_input") to opt in.'
+            "Feed it shuffle_mxfp8fp4_a(A) and pass a_is_preshuffled=True, or "
+            "call gemm_a8w8_blockscale_apreshuffle, to opt in."
         )
     return _run_mxfp8_128_preshuffle_gemm_a8_gfx1250(
         XQ,
