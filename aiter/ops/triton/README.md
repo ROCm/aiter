@@ -50,6 +50,33 @@ import from the categorized path** (`aiter.ops.triton.gemm.basic.gemm_a16w16`).
 
 ---
 
+## Framework portability — what may import `torch`
+
+`utils/_triton/` is the torch-free half of the shared machinery. The split
+exists so the Triton kernels and their tuned configs can be imported — or
+snapshotted into another repo — by a framework that is not PyTorch. The live
+case is JAX-Triton (ROCm-supported), where the tensors are created by JAX and
+handed to the same `@triton.jit` kernel.
+
+| Layer | May import `torch`? |
+| ----- | ------------------- |
+| `utils/_triton/` — arch info, `kernel_repr`, pid preprocessing, kernel-side helpers | **No** |
+| Config loading (`utils/config_utils.py`, the `*_config_utils.py` family modules) and `configs/*.json` | **No** |
+| Kernel modules under `_triton_kernels/` and `_gluon_kernels/` | **No** for new modules — a jit body cannot call torch anyway; keep host-side allocation and dtype glue in the wrapper. Modules that already import torch are grandfathered. |
+| `utils/` torch helpers (`shuffle.py`, `types.py`, `common_utils.py`, ...) and every public wrapper | **Yes** — this is where torch belongs |
+
+- A helper both sides need is split, not duplicated: the torch-free part under
+  `utils/_triton/`, the torch part in `utils/`. `moe_common.py` exists in both
+  places for exactly this reason.
+- `utils/_triton/tunning/` is exempt — those are standalone tuning harnesses
+  that run in a PyTorch environment, not part of the importable surface.
+- Non-PyTorch users still write their own wrappers. Their framework creates
+  the tensors, so allocation, dtype and layout checks, and the launch belong
+  to them; what crosses the boundary from AITER is the kernel plus its tuned
+  config, not the wrapper.
+
+---
+
 ## Tuned configs
 
 ### One layout, one path builder

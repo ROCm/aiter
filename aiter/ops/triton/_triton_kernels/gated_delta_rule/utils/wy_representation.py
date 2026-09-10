@@ -13,12 +13,14 @@ import torch
 import triton
 import triton.language as tl
 
-from ..gated_delta_rule_utils import (
+from aiter.ops.triton._triton_kernels.gated_delta_rule.gated_delta_rule_utils import (
     autotune_cache_kwargs,
     gated_delta_rule_autotune_configs,
 )
-from .index import prepare_chunk_indices
-from .op import exp
+from aiter.ops.triton._triton_kernels.gated_delta_rule.utils.index import (
+    prepare_chunk_indices,
+)
+from aiter.ops.triton._triton_kernels.gated_delta_rule.utils.op import exp
 
 
 @triton.heuristics(
