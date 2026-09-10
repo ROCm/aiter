@@ -280,6 +280,20 @@ def _resolve_build_targets():
         return None
 
 
+def _report_unmatched_targets(tune_df, targets):
+    """Name a build target the combined tuned rows do not cover."""
+    if not targets or not {"gfx", "cu_num"} <= set(tune_df.columns):
+        return
+    missing = unmatched_targets(tune_df, targets)
+    if missing:
+        print(
+            f"[opus gen_instances] no tuned rows for build target(s) "
+            f"{', '.join(missing)}; every shape there falls back to the "
+            f"heuristic. Tune those targets, or drop them from "
+            f"AITER_GPU_TARGETS / GPU_ARCHS."
+        )
+
+
 def _filter_opus_df_for_targets(tune_df, targets):
     if not targets:
         return tune_df
@@ -291,12 +305,6 @@ def _filter_opus_df_for_targets(tune_df, targets):
             gfx_col.isna(), gfx_col.astype(str).str.strip().str.lower()
         )
     if {"gfx", "cu_num"} <= columns:
-        missing = unmatched_targets(tune_df, targets)
-        if missing:
-            print(
-                f"[opus gen_instances] no tuned rows for build target(s) "
-                f"{', '.join(missing)}; those shapes fall back to the heuristic."
-            )
         has_gfx = tune_df["gfx"].notna() & tune_df["gfx"].ne("")
         has_cu = tune_df["cu_num"].notna()
         if (has_gfx & has_cu).all():
@@ -1433,6 +1441,7 @@ def get_tune_dict(tune_dict_csv):
         # builder does not have. get_build_targets() falls back to the live GPU
         # when no target is named, which is the previous behaviour.
         targets = _resolve_build_targets()
+        _report_unmatched_targets(tune_df, targets)
         tune_df = _filter_opus_df_for_targets(tune_df, targets).reset_index()
         # Accept either the legacy "kernelId" column or the new "solidx" column.
         kids = _tune_df_kids(tune_df)
