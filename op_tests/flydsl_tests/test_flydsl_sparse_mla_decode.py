@@ -268,6 +268,16 @@ def test_sparse_mla_decode_rejects_ambiguous_kv_rank3_shape():
         flydsl_sparse_mla_decode(q, bad_kv, indices, out, 1.0 / math.sqrt(DIM))
 
 
+def test_sparse_mla_decode_rejects_an_empty_kv_pool():
+    """A zero-row pool reaches the kernel as a null pointer and faults it."""
+    case = next(item for item in CASES if item.name == "degen_k1")
+    q, kv, indices = _build_case(case)
+    out = torch.empty((case.seq, H, DV), device=q.device, dtype=torch.bfloat16)
+    empty = kv[:0].contiguous()
+    with pytest.raises(ValueError, match="at least one row"):
+        flydsl_sparse_mla_decode(q, empty, indices, out, 1.0 / math.sqrt(DIM))
+
+
 def test_sparse_mla_decode_accepts_singleton_kv_rank3_shape():
     case = next(item for item in CASES if item.name == "degen_k1")
     q, kv, indices = _build_case(case)

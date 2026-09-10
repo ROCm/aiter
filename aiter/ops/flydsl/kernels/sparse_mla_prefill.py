@@ -820,6 +820,11 @@ def flydsl_sparse_mla_prefill(
         raise ValueError(
             "kv must be contiguous float8_e4m3fn on the same device as q_nope"
         )
+    # An empty pool gives the buffer descriptor a null base and faults the
+    # kernel outright. Every index into it is out of range anyway, so there is
+    # nothing to attend to; say so here rather than let the GPU say it.
+    if kv.shape[0] == 0:
+        raise ValueError("kv must have at least one row, got an empty pool")
     # The launcher hands the kernel `kv.view(torch.int8).reshape(-1)`, whose
     # extent the shim packs into a signed 32-bit shape field, so an int8 view
     # past 2 GiB raises a bare `'i' format requires -2147483648 <= number <=
@@ -860,6 +865,14 @@ def flydsl_sparse_mla_prefill(
             dtype=torch.bfloat16,
             device=device,
         )
+
+    # A chunked-prefill scheduler can hand over an empty chunk. Everything
+    # above still validates, so a wrong-shaped `out` is caught either way;
+    # only the launch is skipped. Without this the argument pack raises a
+    # bare setStorage error on the zero-length q pointer, and further down
+    # `_prefill_splits` would divide by the token count.
+    if num_tokens == 0:
+        return out
 
     n_splits = _prefill_splits(num_tokens, device)
     # The kernel reads `q` at the caller's head count either way. Partials are

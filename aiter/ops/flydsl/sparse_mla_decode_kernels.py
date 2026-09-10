@@ -136,6 +136,10 @@ def _validate_sparse_decode_inputs(
         raise ValueError(
             f"kv must have shape [P,{DIM}] or [P,1,{DIM}], got {tuple(kv.shape)}"
         )
+    # An empty pool hands the kernel a null base pointer and faults it. Every
+    # index into it is out of range anyway, so there is nothing to attend to.
+    if int(kv.shape[0]) == 0:
+        raise ValueError("kv must have at least one row, got an empty pool")
     if out is not None and (out.ndim != 3 or tuple(out.shape) != (seq, heads, DV)):
         raise ValueError(
             f"out must have shape [{seq},{heads},{DV}], got {tuple(out.shape)}"
