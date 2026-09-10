@@ -969,7 +969,7 @@ def _fused_moe_impl(
     # same a16w4 FlyDSL kernels (see cktile_mxfp4_ok in get_2stage_cfgs), so it
     # inherits their constraints and has to be validated here too -- otherwise
     # the re-routed shape reaches a kernel that cannot honour the request. The
-    # trailing three terms mirror get_2stage_cfgs' _flydsl_can_take_over: when
+    # trailing four terms mirror get_2stage_cfgs' _flydsl_can_take_over: when
     # they do not hold the shape stays on CK-Tile and must not be rejected here.
     _is_a16w4_swiglu_rerouted = (
         quant_type == QuantType.per_1x32
@@ -977,6 +977,7 @@ def _fused_moe_impl(
         and q_dtype_a == dtypes.bf16
         and activation == ActivationType.Swiglu
         and inter_dim % 256 != 0
+        and inter_dim % 128 == 0
         and isShuffled
         and isG1U1
         and not doweight_stage1
@@ -2777,10 +2778,19 @@ def get_2stage_cfgs(
     # preconditions shared by the a16w4 (bf16 A) and a4w4/a8w4 (fp4/fp8 A)
     # branches below; note fp16 A has no FlyDSL mxfp4 kernel here, so it keeps
     # its current routing.
+    #
+    # inter_dim % 128 is one of those preconditions: both FlyDSL gemm1 ports
+    # require 2*D_INTER to be a multiple of 256 (moe_2stage_a16wmix/gemm1.py
+    # and mxfp4_gemm1_kernels.py), i.e. a 128-aligned inter_dim, and assert
+    # otherwise. A shape that is neither 128- nor 256-aligned therefore stays
+    # on CK-Tile and keeps the wrong result this guard exists to avoid; there
+    # is no backend here that computes it correctly, and crashing in the
+    # kernel would not make it one.
     _flydsl_can_take_over = (
         dtype in [dtypes.bf16, dtypes.fp16]
         and q_type == QuantType.per_1x32
         and q_dtype_a in (dtypes.bf16, dtypes.fp4x2, dtypes.fp8)
+        and inter_dim % 128 == 0
         and is_shuffled
         and use_g1u1
         and not doweight_stage1

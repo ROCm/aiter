@@ -11,6 +11,11 @@ result -- no error, no NaN, only wrong numbers. ``get_2stage_cfgs`` therefore
 steers those shapes onto the FlyDSL a16w4 kernels, which are correct at any
 128-aligned ``inter_dim``.
 
+An ``inter_dim`` that is not 128-aligned either is mis-indexed by CK-Tile just
+the same, but no FlyDSL gemm1 port accepts it -- they require
+``2*D_INTER % 256 == 0`` -- so it is left on CK-Tile rather than re-routed into
+a kernel assertion. That is a deliberate gap, and the dispatch test pins it.
+
 Two tests, deliberately split by what they need:
 
 * ``test_mxfp4_swiglu_dispatch_by_inter_dim_alignment`` only inspects the
@@ -57,6 +62,11 @@ _SKIP = pytest.mark.skipif(
 NON_256_ALIGNED = [128, 384, 640]
 # inter_dim values CK-Tile handles correctly and must keep.
 ALIGNED_256 = [256, 512, 768]
+# CK-Tile mis-indexes these too, but no FlyDSL gemm1 port accepts them either:
+# both require 2*D_INTER % 256 == 0, i.e. a 128-aligned inter_dim. Re-routing
+# them would trade a wrong answer for an assertion inside the kernel, so they
+# stay on CK-Tile. Here to pin that decision, not to endorse the result.
+NON_128_ALIGNED = [192, 320]
 
 MODEL_DIM = 6144
 E = 32
@@ -101,19 +111,20 @@ def _dispatch(inter_dim):
 
 
 @_SKIP
-@pytest.mark.parametrize("inter_dim", NON_256_ALIGNED + ALIGNED_256)
+@pytest.mark.parametrize("inter_dim", NON_256_ALIGNED + ALIGNED_256 + NON_128_ALIGNED)
 def test_mxfp4_swiglu_dispatch_by_inter_dim_alignment(inter_dim):
-    """Only non-256-aligned inter_dim is steered off CK-Tile.
+    """Only a 128-aligned, non-256-aligned inter_dim is steered off CK-Tile.
 
     Compiles nothing, so this is the assertion that survives a FlyDSL version
     the local toolchain cannot build.
     """
     meta = _dispatch(inter_dim)
     got = (_stage_backend(meta.stage1), _stage_backend(meta.stage2))
-    want = "flydsl" if inter_dim % 256 else "cktile"
+    want = "flydsl" if inter_dim % 256 and inter_dim % 128 == 0 else "cktile"
 
     assert got == (want, want), (
-        f"inter_dim={inter_dim} (256-aligned={not inter_dim % 256}): "
+        f"inter_dim={inter_dim} (256-aligned={not inter_dim % 256}, "
+        f"128-aligned={not inter_dim % 128}): "
         f"expected both stages on {want}, got stage1={got[0]} stage2={got[1]}"
     )
 
