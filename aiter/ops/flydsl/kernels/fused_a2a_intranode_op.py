@@ -65,9 +65,10 @@ class FusedA2AIntraNodeOp:
     scales in gather order and permuted 128-token tiles with 64B slack.
     E4M3 V uses BSHD bytes and one float32 descale per destination tensor;
     one extra launch exchanges send-side partial maxima before quantization.
-    INT8/MXFP8 Q/K are BSHD; low-bit K uses padded tiles. MX Q/K scales are BSH4.
-    INT8 Q/K use split launches and per-tensor F32 descales, without Hadamard
-    rotation or a Q multiplier. MX Q/K rotate and Q folds softmax_scale * log2(e).
+    INT8/FP8/MXFP8 Q/K are BSHD; low-bit K uses padded tiles. MX scales are BSH4.
+    INT8/FP8 Q/K use split launches and per-tensor F32 descales, with no Q
+    multiplier. FP8 Q/K rotate; INT8 do not. MX Q/K rotate and Q folds
+    softmax_scale * log2(e).
     All ranks must use the same mode and serialize calls on one stream.
     """
 
@@ -124,12 +125,14 @@ class FusedA2AIntraNodeOp:
             if any(
                 mode
                 and codec != "mxfp4"
-                and not (mode in ("q", "k") and codec in ("mxfp6", "mxfp8", "int8"))
+                and not (
+                    mode in ("q", "k") and codec in ("mxfp6", "mxfp8", "int8", "e4m3")
+                )
                 and not (mode == "v" and codec == "e4m3")
                 for mode, codec in zip(self.v4_output, self.codecs)
             ):
                 raise ValueError(
-                    "V4 output supports MXFP4 Q/K/V, MXFP6/MXFP8/INT8 Q/K and FP8 V"
+                    "V4 output supports MXFP4 Q/K/V, MXFP6/MXFP8/INT8/FP8 Q/K and FP8 V"
                 )
         self.split = split or os.environ.get("FUSED_A2A_SPLIT", "0") == "1"
         if self.v4_output[2] and not self.split:
@@ -142,7 +145,7 @@ class FusedA2AIntraNodeOp:
             raise ValueError("V4 Q requires an explicit positive finite softmax_scale")
         q_multiplier = (
             softmax_scale * math.log2(math.e)
-            if self.v4_output[0] and self.codecs[0] != "int8"
+            if self.v4_output[0] and self.codecs[0] not in ("int8", "e4m3")
             else 1.0
         )
         if dtype != torch.bfloat16 and not (self.quant and dtype == torch.uint8):
@@ -212,7 +215,7 @@ class FusedA2AIntraNodeOp:
         )
         self.v4_per_tensor = tuple(
             (mode == "v" and codec == "e4m3")
-            or (mode in ("q", "k") and codec == "int8")
+            or (mode in ("q", "k") and codec in ("int8", "e4m3"))
             for mode, codec in zip(self.v4_output, self.codecs)
         )
         if any(self.v4_per_tensor) and not self.split:

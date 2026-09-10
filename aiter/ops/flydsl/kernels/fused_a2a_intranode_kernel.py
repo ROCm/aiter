@@ -24,7 +24,7 @@ from .communication_ops_utils import (
 )
 from .quant_utils import emit_f32_to_e2m1, emit_f32_to_e2m3, emit_mx_e8m0_scale
 
-_JIT_SCHEMA_VERSION = "v26-v4-int8-qk"
+_JIT_SCHEMA_VERSION = "v27-v4-fp8-qk"
 _TRANSPORT_CHUNK_BYTES = 16
 _PUSH_PIPELINE_DEPTH = 16
 _OUT_CHANNEL_DEPTH = 1
@@ -831,7 +831,7 @@ def make_fused_a2a_kernel(
                                 )
 
         @flyc.jit
-        def transport_v4_int8_qk():
+        def transport_v4_per_tensor_qk():
             dest_pe = global_warp_id % npes
             peer_warp = global_warp_id // npes
             peer_warps = global_warp_num // npes
@@ -854,7 +854,7 @@ def make_fused_a2a_kernel(
                 maximum = fx.Float32(result)
                 for shift in (32, 16, 8, 4, 2, 1):
                     maximum = maximum.maximumf(maximum.shuffle_xor(shift, 64))
-                scale = maximum / fx.Float32(127.0)
+                scale = maximum / fx.Float32(127.0 if codecs[0] == "int8" else 448.0)
                 scale = (scale > 0.0).select(scale, fx.Float32(1.0))
                 if (dest_pe == rank) & (peer_warp == 0) & (lane == 0):
                     buffer_store(scale, local_scales, 0)
@@ -931,11 +931,26 @@ def make_fused_a2a_kernel(
                                 else sin_hi[2 * pair - 3]
                             )
                             even, odd = scaled[2 * pair], scaled[2 * pair + 1]
-                            rotated.extend([even * c - odd * s, even * s + odd * c])
-                        # INT8 consumes the raw BF16 norm/RoPE boundary, without
-                        # Hadamard rotation or the MX Q-multiplier fold.
+                            if const_expr(codecs[0] == "e4m3"):
+                                rotated.extend(
+                                    [
+                                        fx.Float32(fmath.fma(even, c, -(odd * s))),
+                                        fx.Float32(fmath.fma(even, s, odd * c)),
+                                    ]
+                                )
+                            else:
+                                rotated.extend([even * c - odd * s, even * s + odd * c])
+                        # Both packers consume the BF16 norm/RoPE boundary.
                         values = (
                             fx.Vector.from_elements(rotated, fx.Float32)
+                            .to(fx.BFloat16)
+                            .to(fx.Float32)
+                        )
+                    if const_expr(codecs[0] == "e4m3"):
+                        # quantize_fp8_rotated materializes BF16 after normalized WHT;
+                        # neither per-tensor recipe folds the MX Q multiplier.
+                        values = (
+                            _hadamard_head(values, lane, head_dim)
                             .to(fx.BFloat16)
                             .to(fx.Float32)
                         )
@@ -948,8 +963,16 @@ def make_fused_a2a_kernel(
                             )
                     else:
                         pairs = [
-                            _pack_int8_pair(
-                                values[2 * i] / scale, values[2 * i + 1] / scale
+                            (
+                                _pack_int8_pair(
+                                    values[2 * i] / scale, values[2 * i + 1] / scale
+                                )
+                                if codecs[0] == "int8"
+                                else _pack_transport_pair(
+                                    values[2 * i] * (fx.Float32(1.0) / scale),
+                                    values[2 * i + 1] * (fx.Float32(1.0) / scale),
+                                    "e4m3",
+                                )
                             )
                             for i in range(4)
                         ]
@@ -959,7 +982,7 @@ def make_fused_a2a_kernel(
                                 + head % heads_local
                             ) * 16 + lane % 16
                             buffer_store(
-                                _pack_transport_words(pairs, "int8"),
+                                _pack_transport_words(pairs, codecs[0]),
                                 output,
                                 destination * 2,
                             )
@@ -1204,8 +1227,8 @@ def make_fused_a2a_kernel(
                         # All waves finish reading the reduction before its next use.
                         fx.barrier()
 
-        if const_expr(formats[0] in ("q", "k") and codecs[0] == "int8"):
-            transport_v4_int8_qk()
+        if const_expr(formats[0] in ("q", "k") and codecs[0] in ("int8", "e4m3")):
+            transport_v4_per_tensor_qk()
         elif const_expr(formats[0] == "v" and codecs[0] == "e4m3"):
             transport_v4_fp8_v()
         elif const_expr(formats[0] == "v"):
