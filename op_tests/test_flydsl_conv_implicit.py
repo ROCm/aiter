@@ -8,15 +8,22 @@ Two sweeps, one table each. The first covers the keyword surface: the entry poin
 dispatches 1D/2D/3D off the filter rank, so every rank is here along with stride,
 padding (incl. "same"), dilation, groups, bias and split-K.
 
-The second is the Wan2.1 video VAE's real encode shapes -- the causal Conv3d calls
-that carry a feature cache and so cannot be rewritten as 2-D. Those are 67.7% of
-one encode's convolutions and the reason a 3-D kernel is needed at all; see
-`docs_flydsl_conv_0826/wan21_vae_conv3d_shapes.md` for how they were derived.
+The rest are the shapes two real VAEs run, traced rather than assumed:
+
+* Wan2.1, the causal Conv3d calls carrying a feature cache -- 440 of one encode's
+  650 convolutions, and the reason a 3-D kernel is needed at all.
+* Wan2.1, the remaining resamplers and pointwise layers, so the three tables
+  together account for every convolution one encode performs.
+* Qwen-Image, which is the same architecture run at T=1. There the causal Conv3d
+  collapses to an exact conv2d and the model never calls a 3-D kernel, so those
+  rows are conv2d -- testing them as conv3d would measure something else.
+
+See `docs_flydsl_conv_0826/wan21_vae_conv3d_shapes.md` for the derivation.
 
 Usage::
 
     python op_tests/test_flydsl_conv_implicit.py
-    python op_tests/test_flydsl_conv_implicit.py -c down_0_1 down_3_4  # hot shapes
+    python op_tests/test_flydsl_conv_implicit.py -c down_0_1 res_96_1024  # hot shapes
 """
 
 import argparse
@@ -66,6 +73,96 @@ WAN_VAE_CONV3D = [
     ("conv_out", (1, 384, 3, 62, 106), (32, 384, 3, 3, 3), 20),
 ]
 
+# Wan2.1 VAE encoder -- everything else one encode runs, so the table covers all
+# 650 calls rather than only the 440 that need the 3-D kernel.
+#
+# `plain2d` are WanResample's spatial downsamplers. WanResample folds time into
+# batch, so these are ordinary nn.Conv2d over N*T images, and the ZeroPad2d((0,1,0,1))
+# ahead of them is a separate Sequential entry -- hence the odd 481x833 input and
+# padding=0. vae_conv_video does replace these (1.19-1.86x at Wan resolutions).
+#
+# `pointwise` have a spatial kernel of 1: the two time_conv (3x1x1), the residual
+# conv_shortcut, mid_block attention's qkv/proj, and quant_conv. min_spatial_kernel
+# leaves them on torch because they measure 0.88-1.05x through the kernel; they are
+# here to keep that decision backed by numbers instead of assumed.
+#
+# The `_t1` rows are the first chunk (1 frame, no cache) and so run once per encode
+# against 20 for the rest -- a different batch/time extent, hence a separate shape.
+#
+# name  bucket  x (N,C[,T],H,W)  weight  stride  padding  calls/encode
+WAN_VAE_AUX = [
+    ("resample_96_t1", "plain2d", (1, 96, 481, 833), (96, 96, 3, 3), 2, 0, 1),
+    ("resample_96", "plain2d", (4, 96, 481, 833), (96, 96, 3, 3), 2, 0, 20),
+    ("resample_192_t1", "plain2d", (1, 192, 241, 417), (192, 192, 3, 3), 2, 0, 1),
+    ("resample_192", "plain2d", (4, 192, 241, 417), (192, 192, 3, 3), 2, 0, 20),
+    ("resample_384_t1", "plain2d", (1, 384, 121, 209), (384, 384, 3, 3), 2, 0, 1),
+    ("resample_384", "plain2d", (2, 384, 121, 209), (384, 384, 3, 3), 2, 0, 20),
+    ("shortcut_96_t1", "pointwise", (1, 96, 1, 240, 416), (192, 96, 1, 1, 1), 1, 0, 1),
+    ("shortcut_96", "pointwise", (1, 96, 4, 240, 416), (192, 96, 1, 1, 1), 1, 0, 20),
+    (
+        "shortcut_192_t1",
+        "pointwise",
+        (1, 192, 1, 120, 208),
+        (384, 192, 1, 1, 1),
+        1,
+        0,
+        1,
+    ),
+    ("shortcut_192", "pointwise", (1, 192, 2, 120, 208), (384, 192, 1, 1, 1), 1, 0, 20),
+    (
+        "time_conv_192",
+        "pointwise",
+        (1, 192, 5, 120, 208),
+        (192, 192, 3, 1, 1),
+        (2, 1, 1),
+        0,
+        20,
+    ),
+    (
+        "time_conv_384",
+        "pointwise",
+        (1, 384, 3, 60, 104),
+        (384, 384, 3, 1, 1),
+        (2, 1, 1),
+        0,
+        20,
+    ),
+    ("attn_qkv", "pointwise", (1, 384, 60, 104), (1152, 384, 1, 1), 1, 0, 21),
+    ("attn_proj", "pointwise", (1, 384, 60, 104), (384, 384, 1, 1), 1, 0, 21),
+    ("quant_conv", "pointwise", (1, 32, 21, 60, 104), (32, 32, 1, 1, 1), 1, 0, 1),
+]
+
+# Qwen-Image VAE -- the same architecture as Wan's (identical vae/config.json:
+# base_dim 96, dim_mult [1,2,4,4], temperal_downsample [F,T,T]), fine-tuned and run
+# at T=1. That degeneracy is the whole story: with one frame and no cache, every
+# time slice of the filter but the last multiplies zeros, so lumen_vae_conv rebinds
+# forward to an exact 2-D convolution
+#
+#     conv3d(causal_pad(x), w) == conv2d(x[:,:,0], w[:,:,-1])
+#
+# and the model never runs a 3-D kernel. These are therefore conv2d shapes with
+# ordinary padding=1 -- the input is NOT pre-padded, unlike Wan's T>1 calls above.
+# Testing them as conv3d would measure something the model does not do.
+#
+# Traced from Qwen/Qwen-Image vae/config.json at 1024x1024, encode and decode
+# together: 52 calls collapsing to 10 distinct shapes (the encoder and decoder
+# resnets share most of them). The 6 plain Conv2d resamplers and 9 pointwise layers
+# are skipped by vae_conv (image mode), so they are not here.
+#
+# name  x (N,C,H,W)  weight (K,C,3,3)  calls/encode+decode
+QWEN_VAE_CONV2D = [
+    ("enc_conv_in", (1, 3, 1024, 1024), (96, 3, 3, 3), 1),
+    ("res_96_1024", (1, 96, 1024, 1024), (96, 96, 3, 3), 10),
+    ("down_96_192", (1, 96, 512, 512), (192, 96, 3, 3), 1),
+    ("res_192_512", (1, 192, 512, 512), (192, 192, 3, 3), 9),
+    ("down_192_384", (1, 192, 256, 256), (384, 192, 3, 3), 2),
+    ("res_384_256", (1, 384, 256, 256), (384, 384, 3, 3), 8),
+    ("res_384_128", (1, 384, 128, 128), (384, 384, 3, 3), 18),
+    ("enc_conv_out", (1, 384, 128, 128), (32, 384, 3, 3), 1),
+    ("dec_conv_in", (1, 16, 128, 128), (384, 16, 3, 3), 1),
+    ("dec_conv_out", (1, 96, 1024, 1024), (3, 96, 3, 3), 1),
+]
+
 
 def _ref(x, w, bias, rank, **kw):
     fn = {1: F.conv1d, 2: F.conv2d, 3: F.conv3d}[rank]
@@ -86,27 +183,36 @@ def test_conv_implicit(case, rank, xshape, wshape, dtype, kw, ref_kw=None, bias=
     return {"case": case, "dtype": str(dtype), "us": us, "err": err}
 
 
-@benchmark()
-def test_wan_vae_conv3d(case, xshape, wshape, dtype, calls):
+def _bench_vs_torch(case, xshape, wshape, dtype, calls, stride=1, padding=0):
+    """One model shape, both kernels, as the row of a summary table.
+
+    Rank comes off the filter. Every VAE convolution here carries a bias. torch is
+    a candidate rather than only the reference: MIOpen is the baseline the Lumen
+    patch replaces, so its number belongs in the table.
+    """
     torch.manual_seed(0)
+    rank = len(wshape) - 2
     x = torch.randn(xshape, device="cuda", dtype=dtype)
     w = torch.randn(wshape, device="cuda", dtype=dtype)
-    # Every WanCausalConv3d carries a bias, and the module already padded x, so
-    # the real call is padding=0 / stride=1 / dilation=1.
     b = torch.randn(wshape[0], device="cuda", dtype=dtype)
 
-    ref = _ref(x, w, b, 3)
-    m = ref.shape[0] * ref.shape[2] * ref.shape[3] * ref.shape[4]
+    kw = {"stride": stride, "padding": padding}
+    ref = _ref(x, w, b, rank, **kw)
+
+    m = ref.shape[0]
+    for d in ref.shape[2:]:
+        m *= d
     n = wshape[0]
-    k = wshape[1] * wshape[2] * wshape[3] * wshape[4]
+    k = wshape[1]
+    for d in wshape[2:]:
+        k *= d
     flops = 2 * m * n * k
     nbytes = (x.numel() + w.numel() + ref.numel()) * x.element_size()
 
+    torch_conv = {1: F.conv1d, 2: F.conv2d, 3: F.conv3d}[rank]
     candidates = {
-        # torch is a kernel under test here, not just the reference: MIOpen's
-        # conv3d is the baseline vae_conv_video replaces.
-        "torch": lambda: F.conv3d(x, w, b),
-        "flydsl": lambda: flydsl_conv_implicit(x, w, b),
+        "torch": lambda: torch_conv(x, w, b, **kw),
+        "flydsl": lambda: flydsl_conv_implicit(x, w, b, **kw),
     }
 
     ret = {"gfx": get_gfx(), "M": m, "N": n, "K": k}
@@ -115,13 +221,30 @@ def test_wan_vae_conv3d(case, xshape, wshape, dtype, calls):
         ret[f"{name} us"] = us
         ret[f"{name} TFLOPS"] = flops / us / 1e6
         ret[f"{name} TB/s"] = nbytes / us / 1e6
-        # Time the whole encode's worth of this shape, so the rows add up to the
-        # T>1 share of one encode rather than to a single call.
+        # Weight the row by how often one encode runs this shape, so the column
+        # sums to that bucket's share of an encode instead of to a single call.
         ret[f"{name} ms/encode"] = us * calls / 1e3
         ret[f"{name} err"] = checkAllclose(
             ref.to(dtypes.fp32), out.to(dtypes.fp32), msg=f"{case} {name}: ", **TOL
         )
     return ret
+
+
+@benchmark()
+def test_wan_vae_conv3d(case, xshape, wshape, dtype, calls):
+    # WanCausalConv3d padded x itself, so padding=0 / stride=1.
+    return _bench_vs_torch(case, xshape, wshape, dtype, calls)
+
+
+@benchmark()
+def test_wan_vae_aux(case, bucket, xshape, wshape, stride, padding, dtype, calls):
+    return _bench_vs_torch(case, xshape, wshape, dtype, calls, stride, padding)
+
+
+@benchmark()
+def test_qwen_vae_conv2d(case, xshape, wshape, dtype, calls):
+    # The T=1 rewrite hands conv2d the unpadded input and the module's spatial pad.
+    return _bench_vs_torch(case, xshape, wshape, dtype, calls, padding=1)
 
 
 def summarize(title, rows):
@@ -143,10 +266,13 @@ def main():
         "-c",
         "--cases",
         nargs="*",
-        default=[c[0] for c in WAN_VAE_CONV3D],
-        help="Wan VAE conv3d cases to sweep",
+        default=None,
+        help="restrict the model sweeps to these case names (default: all)",
     )
     args = p.parse_args()
+
+    def wanted(case):
+        return args.cases is None or case in args.cases
 
     for name in args.dtype:
         dtype = dtypes.bf16 if name == "bf16" else dtypes.fp16
@@ -211,9 +337,23 @@ def main():
         rows = [
             test_wan_vae_conv3d(case, xshape, wshape, dtype, calls)
             for case, xshape, wshape, calls in WAN_VAE_CONV3D
-            if case in args.cases
+            if wanted(case)
         ]
         summarize(f"Wan2.1 VAE encode, T>1/cached conv3d ({name})", rows)
+
+        rows = [
+            test_wan_vae_aux(case, bucket, xshape, wshape, stride, pad, dtype, calls)
+            for case, bucket, xshape, wshape, stride, pad, calls in WAN_VAE_AUX
+            if wanted(case)
+        ]
+        summarize(f"Wan2.1 VAE encode, resamplers and pointwise ({name})", rows)
+
+        rows = [
+            test_qwen_vae_conv2d(case, xshape, wshape, dtype, calls)
+            for case, xshape, wshape, calls in QWEN_VAE_CONV2D
+            if wanted(case)
+        ]
+        summarize(f"Qwen-Image VAE encode+decode, T=1 rewritten conv2d ({name})", rows)
 
 
 if __name__ == "__main__":
