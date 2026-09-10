@@ -159,6 +159,7 @@ def issue_a_load_lds_dt(
     KH_TILE_A,
     K_BYTES,
     BM=32,
+    resolved_rows=(),
 ):
     """A->LDS DMA for one K-tile; gemm2 A is the already-sorted row, OOB-zero via the flat buffer view bounds."""
     lanes_per_row = KH_TILE_A // 16  # 8 (fp4) / 16 (fp8)
@@ -192,7 +193,8 @@ def issue_a_load_lds_dt(
             if const_expr(is_f8)
             else lds_swizzle_mask(lds_row + a_lane_row, KH_TILE_A)
         )
-        car = m_row + lds_row + a_lane_row  # direct sorted row
+        sorted_row = m_row + lds_row + a_lane_row
+        car = resolved_rows[g] if const_expr(len(resolved_rows) > 0) else sorted_row
         voffset = (lane_col ^ mask) + car * K_BYTES
         off = fx.Int32(slot * (BM * KH_TILE_A)) + lds_row * KH_TILE_A
         # The byte offset is non-negative and 4-byte aligned; avoid signed-division fixup VGPRs.

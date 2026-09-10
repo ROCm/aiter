@@ -63,6 +63,10 @@ def atomic_bf16_epilog(
     emit_thunks=None,
     lds_ready=False,
     enable_bias=False,
+    output_n_base=0,
+    output_width=None,
+    reduce_store_cache_modifier=None,
+    route_guard=False,
 ):
     if SBM is None:
         SBM = BM
@@ -92,7 +96,11 @@ def atomic_bf16_epilog(
     tx_i32 = fx.Int32(gpu.thread_id("x"))
     m_lane = tx_i32 // EPI_LANES
     n_lane = tx_i32 % EPI_LANES
-    store_vec = 2
+    if reduce_store_cache_modifier is not None and (
+        not use_reduce or route_out_fp8 or enable_bias or g2_defer_weight
+    ):
+        raise ValueError("custom BF16 store policies require unweighted reduce output")
+    store_vec = 8 if reduce_store_cache_modifier is not None else 2
     store_group_n = EPI_LANES * store_vec
     col_start = n_lane * store_vec
     wave_n = BN // 4
@@ -114,6 +122,13 @@ def atomic_bf16_epilog(
     load_i32 = fx.make_copy_atom(fx.rocdl.BufferCopy32b(), Int32)
     load_f32 = fx.make_copy_atom(fx.rocdl.BufferCopy32b(), Float32)
     atomic_bf16x2 = fx.make_copy_atom(fx.rocdl.BufferAtomicPkAdd(BFloat16), BFloat16)
+    reduce_bf16x8 = (
+        fx.make_copy_atom(
+            fx.rocdl.BufferCopy128b(reduce_store_cache_modifier), BFloat16
+        )
+        if reduce_store_cache_modifier is not None
+        else None
+    )
     store_i32 = fx.make_copy_atom(fx.rocdl.BufferCopy32b(STORE_CACHE_MODIFIER), Int32)
     store_i8 = fx.make_copy_atom(fx.rocdl.BufferCopy8b(STORE_CACHE_MODIFIER), Int8)
 
@@ -205,14 +220,22 @@ def atomic_bf16_epilog(
             # reduce out_row can reach tokens*topk (large-M) so compute the element base in i64 (atomic i32 path byte-identical).
             out_row = fx.Int64(token_id * fx.Int32(topk) + (packed[mr] >> fx.Int32(24)))
             if const_expr(route_out_fp8):
-                row_pitch = N_OUT + _udiv(N_OUT, fx.Int32(g2_scale_blk))
+                if const_expr(output_width is None):
+                    row_pitch = N_OUT + _udiv(N_OUT, fx.Int32(g2_scale_blk))
+                else:
+                    ow = fx.Int32(output_width)
+                    row_pitch = ow + _udiv(ow, fx.Int32(g2_scale_blk))
                 if const_expr(g2_out_pitch_align > 0):
                     al = fx.Int32(g2_out_pitch_align)
                     row_pitch = ((row_pitch + al - fx.Int32(1)) // al) * al
                 row_base_addr = out_row * fx.Int64(row_pitch)
-            else:
+            elif const_expr(output_width is None):
                 row_base_addr = out_row * fx.Int64(N_OUT) + fx.Int64(
                     n_block_idx * BN + col_start
+                )
+            else:
+                row_base_addr = out_row * fx.Int64(fx.Int32(output_width)) + fx.Int64(
+                    n_block_idx * BN + col_start - fx.Int32(output_n_base)
                 )
         else:
             out_row = token_id
@@ -319,7 +342,17 @@ def atomic_bf16_epilog(
                     emit_stores(col_g0, words, e8m0)
 
                 def emit_stores(col_g0, words, e8m0, rg=rg):
-                    row_val_off = row_base_addr + fx.Int64(col_g0)
+                    store_col = (
+                        col_g0
+                        if const_expr(output_width is None)
+                        else col_g0 - fx.Int32(output_n_base)
+                    )
+                    row_extent = (
+                        N_OUT
+                        if const_expr(output_width is None)
+                        else fx.Int32(output_width)
+                    )
+                    row_val_off = row_base_addr + fx.Int64(store_col)
                     packed_frag = fx.make_rmem_tensor(1, Int32)
                     for d in range_constexpr(len(words)):
                         packed_frag.store(Vec(words[d]).bitcast(Int32))
@@ -330,8 +363,8 @@ def atomic_bf16_epilog(
                         )
                     scale_off = (
                         row_base_addr
-                        + fx.Int64(N_OUT)
-                        + fx.Int64(_udiv(col_g0, fx.Int32(g2_scale_blk)))
+                        + fx.Int64(row_extent)
+                        + fx.Int64(_udiv(store_col, fx.Int32(g2_scale_blk)))
                     )
                     scale_frag = fx.make_rmem_tensor(1, Int8)
                     scale_frag.store(Vec.from_elements([e8m0.to(Int8)], Int8))
@@ -343,6 +376,40 @@ def atomic_bf16_epilog(
                         store_route_group(col_lane8)
 
                 store_route_group_if_valid(col_lane8)
+        elif const_expr(reduce_store_cache_modifier is not None):
+            for s in range_constexpr(BN // store_group_n):
+                idx0 = row_in_block * BN + col_start + s * store_group_n
+                if const_expr(g2_bf16_lds):
+                    pk = Vec(
+                        lds_vec_load(
+                            lds_acc_base,
+                            idx0 * 2,
+                            Vec.make_type(store_vec, BFloat16),
+                            BFloat16,
+                            align=16,
+                        )
+                    )
+                else:
+                    values = Vec(
+                        lds_vec_load(
+                            lds_acc_base,
+                            idx0 * 4,
+                            Vec.make_type(store_vec, Float32),
+                            Float32,
+                            align=16,
+                        )
+                    )
+                    pk = Vec.from_elements(
+                        [
+                            fx.Float32(values[i]) * weight[mr]
+                            for i in range_constexpr(8)
+                        ],
+                        Float32,
+                    ).to(BFloat16)
+                out_off = row_base_addr + fx.Int64(s * store_group_n)
+                out_frag = fx.make_rmem_tensor(store_vec, BFloat16)
+                out_frag.store(pk)
+                fx.copy(reduce_bf16x8, out_frag, out_bf16[None, out_off])
         else:
             for s in range_constexpr(BN // store_group_n):
                 # adjacent ee=0,1 contiguous -> one 2-wide load.
@@ -406,8 +473,13 @@ def atomic_bf16_epilog(
 
         @flyc.jit
         def store_if_valid(token_id, mr):
-            if token_id < i32_M:
-                store_one_mr(mr)
+            if const_expr(route_guard):
+                route_slot = packed[mr] >> fx.Int32(24)
+                if token_id < i32_M and route_slot < fx.Int32(topk):
+                    store_one_mr(mr)
+            else:
+                if token_id < i32_M:
+                    store_one_mr(mr)
 
         store_if_valid(token_id, mr)
 

@@ -80,6 +80,11 @@ def gemm2_body_v2(
     g2_apre=False,
     enable_bias=False,
     nonatomic=False,
+    reduce_store_cache_modifier=None,
+    resolved_input_rows=(),
+    output_n_base=0,
+    output_width=None,
+    route_guard=False,
 ):
     # GEMM2 double-buffers B weight and scale one tile ahead. bhoist issues that
     # prefetch above the LDS barrier; ascale_pf prefetches A-scale one tile ahead.
@@ -131,7 +136,10 @@ def gemm2_body_v2(
     lds_acc_base = lds_base_i32
     mma_atoms = scale_mma_atoms(a_dtype, b_dtype)
 
-    aq_num_records = fx.Int64(i32_max_m_blocks) * fx.Int64(BM * K_BYTES)
+    if const_expr(len(resolved_input_rows) > 0):
+        aq_num_records = fx.Int64(i32_M) * fx.Int64(topk) * fx.Int64(K_BYTES)
+    else:
+        aq_num_records = fx.Int64(i32_max_m_blocks) * fx.Int64(BM * K_BYTES)
     A_NDW = 8 if is_f8_a else 4
     a_frags = [
         [fx.make_rmem_tensor(A_NDW, Int32) for _ in range_constexpr(kHalves)]
@@ -152,6 +160,7 @@ def gemm2_body_v2(
             KH_TILE_A,
             K_BYTES,
             BM=BM,
+            resolved_rows=resolved_input_rows,
         )
 
     def issue_a_ds_read(slot):
@@ -174,7 +183,12 @@ def gemm2_body_v2(
 
     asc_per_mb = fx.Int32(kScaleSubBlocks) * kAS_per_chunk_dw * fx.Int32(4)
     asc_num = fx.Int64(i32_max_m_blocks) * fx.Int64(asc_per_mb)
-    scale_chunk0 = m_block_idx if const_expr(is_bm16) else m_row // 32
+    if const_expr(len(resolved_input_rows) > 0):
+        scale_chunk0 = (
+            m_block_idx if const_expr(is_bm16 and SBM == BM) else m_row // fx.Int32(32)
+        )
+    else:
+        scale_chunk0 = m_block_idx if const_expr(is_bm16) else m_row // 32
 
     def make_ascale_view(sub):
         base_dw = (scale_chunk0 + fx.Int32(sub)) * kAS_per_chunk_dw
@@ -194,7 +208,7 @@ def gemm2_body_v2(
         return _scale_chunk_tile(kt, tilesPerScaleChunk)
 
     def load_a_scale_tile(kt):
-        return _load_a_scale_tile(
+        out = _load_a_scale_tile(
             kt,
             sc_copy_atom,
             ascale_views,
@@ -204,6 +218,13 @@ def gemm2_body_v2(
             lane_mod_16,
             tilesPerScaleChunk,
         )
+        if const_expr(len(resolved_input_rows) > 0 and is_bm16 and SBM != BM):
+            scale_shift = ((m_row // 16) & fx.Int32(1)) * fx.Int32(8)
+            shifted = []
+            for s in out:
+                shifted.append(s.shrui(scale_shift) & fx.Int32(0x00FF00FF))
+            out = shifted
+        return out
 
     # B-weight + B-scale: global->register, streamed per K-tile (not LDS-staged).
     # b128 weight copy atom; cache modifier 2=nontemporal, 0=default.
@@ -382,10 +403,16 @@ def gemm2_body_v2(
             g2_scale_blk=g2_scale_blk,
             g2_epi_lanes=g2_epi_lanes,
             enable_bias=enable_bias,
+            output_n_base=output_n_base,
+            output_width=output_width,
+            reduce_store_cache_modifier=reduce_store_cache_modifier,
+            route_guard=route_guard,
             **kw,
         )
 
-    g2_interleave = const_expr(g2_kstatic and g2_bf16_lds and not nonatomic)
+    g2_interleave = const_expr(
+        g2_kstatic and g2_bf16_lds and not nonatomic and output_width is None
+    )
     epi_thunks = [] if const_expr(g2_interleave) else None
     if const_expr(g2_interleave):
         _epilog(c_frags, emit_thunks=epi_thunks)
