@@ -69,6 +69,12 @@ SLIDING_WINDOW_OPTIONS = [0, 128]
 COMPUTE_TYPES_QUANT_Q_AND_KV_OPTIONS = []
 PS_OPTIONS = [True, False]
 
+# Repro switch, not for merge. Every ps=True case takes its split count from
+# get_recommended_splits, which ends in min(..., 8), so nothing in this suite can
+# reach the PS reduce path meant for more than 64 partitions -- the suite and the
+# production heuristic share the same blind spot. Set to None for stock behaviour.
+REPRO_FORCE_SPLITS = 128
+
 CASE_SET_NAME_OPTIONS = [
     "normal_accuracy",
     "sliding_window_accuracy",
@@ -1438,6 +1444,8 @@ def run_pa_gluon_test(
         max_context_partition_num = get_recommended_splits(
             num_seqs, num_kv_heads, split_kv_blocks
         )
+        if REPRO_FORCE_SPLITS is not None:
+            max_context_partition_num = REPRO_FORCE_SPLITS
     elif sliding_window > 0 and block_size == 1024:
         max_context_partition_num = (
             triton.cdiv(sliding_window, context_partition_size) + 1
