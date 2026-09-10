@@ -11,6 +11,7 @@ output is bf16. Dense, packed-varlen and split-K.
 from __future__ import annotations
 
 import functools
+import math
 
 import torch
 
@@ -203,6 +204,7 @@ def flydsl_flash_attn_fp8_func(
     k: torch.Tensor,
     v: torch.Tensor,
     *,
+    softmax_scale: float | None = None,
     causal: bool = True,
     num_kv_heads: int | None = None,
     cu_seqlens_q: torch.Tensor | None = None,
@@ -231,6 +233,8 @@ def flydsl_flash_attn_fp8_func(
            Dense: ``[B, Sq, H, D]`` (BSHD). Varlen: ``[total_q, H, D]`` (packed).
         k: Key tensor. Dense: ``[B, Skv, Hkv, D]``. Varlen: ``[total_kv, Hkv, D]``.
         v: Value tensor, same shape as k except the last dim may be ``Dv != D``.
+        softmax_scale: Positive, finite scale applied to QK logits, independent
+            of the Q/K descales. Defaults to ``1 / sqrt(q.shape[-1])``.
         causal: Bottom-right aligned causal mask when True.
         num_kv_heads: KV head count for GQA/MQA; defaults to k's head count.
         cu_seqlens_q / cu_seqlens_kv: Int32 ``[B+1]`` cumulative token counts (varlen).
@@ -291,6 +295,7 @@ def flydsl_flash_attn_fp8_func(
                 "or use bf16."
             )
         kw = {
+            "softmax_scale": softmax_scale,
             "causal": causal,
             "num_kv_heads": num_kv_heads,
             "max_seqlen_q": max_seqlen_q,
@@ -409,6 +414,13 @@ def flydsl_flash_attn_fp8_func(
             f"flydsl_flash_attn_fp8_func: head_dim ({D}) must be >= 64 and a multiple of 32"
         )
 
+    if softmax_scale is None:
+        softmax_scale = D**-0.5
+    if not math.isfinite(softmax_scale) or softmax_scale <= 0:
+        raise ValueError(
+            "flydsl_flash_attn_fp8_func: softmax_scale must be positive and finite"
+        )
+
     Dv = int(v.shape[-1])
     if k.shape[-1] != D:
         raise ValueError(
@@ -525,6 +537,7 @@ def flydsl_flash_attn_fp8_func(
 
         kwargs = {
             "stream": launch_stream,
+            "softmax_scale": softmax_scale,
             "q_descale": q_descale,
             "k_descale": k_descale,
             "v_descale": v_descale,
