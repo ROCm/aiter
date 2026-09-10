@@ -4,8 +4,8 @@
 // OPUS-based sparse paged prefill attention for DeepSeek-V4 (gfx950, gfx1250).
 // Self-contained, single-header:
 //   * Public API (always visible).
-//   * Host plumbing (`pa_sparse_prefill_kargs` / `pa_prefill_*_traits<...>`) inside the
-//     `PA_SPARSE_PREFILL_OPUS_IMPL` guard.
+//   * Host plumbing (`opus_mla_v4_prefill_kargs` / `opus_mla_v4_prefill_*_traits<...>`) inside the
+//     `OPUS_MLA_V4_PREFILL_IMPL` guard.
 //   * Device kernel template inside the same guard on the `__HIP_DEVICE_COMPILE__`
 //     pass, host pass falls back to an empty stub for `__device_stub__` symbols.
 
@@ -30,28 +30,28 @@
 // One entry point per target: gfx950 runs the kernel compiled from the device
 // templates below, gfx1250 runs a prebuilt code object. The Python layer picks
 // one based on the running GPU.
-void pa_sparse_prefill_gfx950_opus_fwd(aiter_tensor_t& q,
-                                       aiter_tensor_t& unified_kv,
-                                       aiter_tensor_t& kv_indices_prefix,
-                                       aiter_tensor_t& kv_indptr_prefix,
-                                       aiter_tensor_t& kv,
-                                       aiter_tensor_t& kv_indices_extend,
-                                       aiter_tensor_t& kv_indptr_extend,
-                                       aiter_tensor_t& attn_sink,
-                                       aiter_tensor_t& out,
-                                       float softmax_scale);
+void opus_mla_v4_prefill_a16w16_gfx950_fwd(aiter_tensor_t& q,
+                                           aiter_tensor_t& unified_kv,
+                                           aiter_tensor_t& kv_indices_prefix,
+                                           aiter_tensor_t& kv_indptr_prefix,
+                                           aiter_tensor_t& kv,
+                                           aiter_tensor_t& kv_indices_extend,
+                                           aiter_tensor_t& kv_indptr_extend,
+                                           aiter_tensor_t& attn_sink,
+                                           aiter_tensor_t& out,
+                                           float softmax_scale);
 
 // gfx1250: only the bf16 variant is built into the code object.
-void pa_sparse_prefill_gfx1250_opus_fwd(aiter_tensor_t& q,
-                                        aiter_tensor_t& unified_kv,
-                                        aiter_tensor_t& kv_indices_prefix,
-                                        aiter_tensor_t& kv_indptr_prefix,
-                                        aiter_tensor_t& kv,
-                                        aiter_tensor_t& kv_indices_extend,
-                                        aiter_tensor_t& kv_indptr_extend,
-                                        aiter_tensor_t& attn_sink,
-                                        aiter_tensor_t& out,
-                                        float softmax_scale);
+void opus_mla_v4_prefill_a16w16_gfx1250_fwd(aiter_tensor_t& q,
+                                            aiter_tensor_t& unified_kv,
+                                            aiter_tensor_t& kv_indices_prefix,
+                                            aiter_tensor_t& kv_indptr_prefix,
+                                            aiter_tensor_t& kv,
+                                            aiter_tensor_t& kv_indices_extend,
+                                            aiter_tensor_t& kv_indptr_extend,
+                                            aiter_tensor_t& attn_sink,
+                                            aiter_tensor_t& out,
+                                            float softmax_scale);
 
 // Public API: split-precision prefill attention for DeepSeek-V4 DSA.
 //
@@ -72,35 +72,35 @@ void pa_sparse_prefill_gfx1250_opus_fwd(aiter_tensor_t& q,
 //   attn_sink          : [H] fp32 (per-head softmax-denominator bias)
 //   out                : [N, H, 512] bf16 (caller-allocated)
 // `softmax_scale` is forwarded to the kernel as-is (no implicit 1/sqrt(D)).
-void pa_sparse_prefill_fp8_gfx950_opus_fwd(aiter_tensor_t& q_nope,
-                                           aiter_tensor_t& q_rope,
-                                           aiter_tensor_t& unified_kv_nope,
-                                           aiter_tensor_t& unified_kv_rope,
-                                           aiter_tensor_t& kv_indices_prefix,
-                                           aiter_tensor_t& kv_indptr_prefix,
-                                           aiter_tensor_t& kv_nope,
-                                           aiter_tensor_t& kv_rope,
-                                           aiter_tensor_t& kv_indices_extend,
-                                           aiter_tensor_t& kv_indptr_extend,
-                                           aiter_tensor_t& attn_sink,
-                                           aiter_tensor_t& out,
-                                           float softmax_scale);
+void opus_mla_v4_prefill_a8w8_gfx950_fwd(aiter_tensor_t& q_nope,
+                                         aiter_tensor_t& q_rope,
+                                         aiter_tensor_t& unified_kv_nope,
+                                         aiter_tensor_t& unified_kv_rope,
+                                         aiter_tensor_t& kv_indices_prefix,
+                                         aiter_tensor_t& kv_indptr_prefix,
+                                         aiter_tensor_t& kv_nope,
+                                         aiter_tensor_t& kv_rope,
+                                         aiter_tensor_t& kv_indices_extend,
+                                         aiter_tensor_t& kv_indptr_extend,
+                                         aiter_tensor_t& attn_sink,
+                                         aiter_tensor_t& out,
+                                         float softmax_scale);
 
-void pa_sparse_prefill_fp8_gfx1250_opus_fwd(aiter_tensor_t& q_nope,
-                                            aiter_tensor_t& q_rope,
-                                            aiter_tensor_t& unified_kv_nope,
-                                            aiter_tensor_t& unified_kv_rope,
-                                            aiter_tensor_t& kv_indices_prefix,
-                                            aiter_tensor_t& kv_indptr_prefix,
-                                            aiter_tensor_t& kv_nope,
-                                            aiter_tensor_t& kv_rope,
-                                            aiter_tensor_t& kv_indices_extend,
-                                            aiter_tensor_t& kv_indptr_extend,
-                                            aiter_tensor_t& attn_sink,
-                                            aiter_tensor_t& out,
-                                            float softmax_scale);
+void opus_mla_v4_prefill_a8w8_gfx1250_fwd(aiter_tensor_t& q_nope,
+                                          aiter_tensor_t& q_rope,
+                                          aiter_tensor_t& unified_kv_nope,
+                                          aiter_tensor_t& unified_kv_rope,
+                                          aiter_tensor_t& kv_indices_prefix,
+                                          aiter_tensor_t& kv_indptr_prefix,
+                                          aiter_tensor_t& kv_nope,
+                                          aiter_tensor_t& kv_rope,
+                                          aiter_tensor_t& kv_indices_extend,
+                                          aiter_tensor_t& kv_indptr_extend,
+                                          aiter_tensor_t& attn_sink,
+                                          aiter_tensor_t& out,
+                                          float softmax_scale);
 
-#ifdef PA_SPARSE_PREFILL_OPUS_IMPL
+#ifdef OPUS_MLA_V4_PREFILL_IMPL
 // ============================================================================
 // Implementation section - only compiled in the .cu translation unit
 // ============================================================================
@@ -112,7 +112,7 @@ using fp8_t  = _BitInt(8);
 using bf8_t  = unsigned _BitInt(8);
 
 // Kernel arguments.
-struct pa_sparse_prefill_kargs
+struct opus_mla_v4_prefill_kargs
 {
     const void* __restrict__ q_ptr;          // [N, H, D]
     const void* __restrict__ unified_kv_ptr; // [total_pages, D], prefix source
@@ -135,7 +135,7 @@ struct pa_sparse_prefill_kargs
 };
 
 // Kernel arguments for the split-precision (NoPE fp8 / RoPE bf16) DSA prefill.
-struct pa_fp8_kargs
+struct opus_mla_v4_prefill_fp8_kargs
 {
     const void* __restrict__ q_nope_ptr;          // [N, H, D_NOPE_PADDED] fp8
     const void* __restrict__ q_rope_ptr;          // [N, H, D_ROPE]        bf16
@@ -171,7 +171,7 @@ template <int Q_TILE_SIZE_  = 16,
           int D_TILE_SIZE_  = 512,
           int NUM_WARPS_    = 8,
           typename D_ATTN_  = bf16_t>
-struct pa_prefill_16mx8_32nx1_traits
+struct opus_mla_v4_prefill_a16w16_16mx8_32nx1_traits
 {
     static constexpr int Q_TILE_SIZE  = Q_TILE_SIZE_;
     static constexpr int KV_TILE_SIZE = KV_TILE_SIZE_;
@@ -235,7 +235,7 @@ template <int Q_TILE_SIZE_  = 16,
           int D_TILE_SIZE_  = 512,
           int NUM_WARPS_    = 4,
           typename D_ATTN_  = bf16_t>
-struct pa_prefill_16mx1_16nx4_traits
+struct opus_mla_v4_prefill_a16w16_16mx1_16nx4_traits
 {
     static constexpr int Q_TILE_SIZE  = Q_TILE_SIZE_;
     static constexpr int KV_TILE_SIZE = KV_TILE_SIZE_;
@@ -304,7 +304,7 @@ template <int Q_TILE_SIZE_  = 16,
           typename D_NOPE_  = fp8_t,
           typename D_ROPE_  = bf16_t,
           typename D_OUT_   = bf16_t>
-struct pa_16mx8_32nx1_fp8_traits
+struct opus_mla_v4_prefill_a8w8_16mx8_32nx1_traits
 {
     static constexpr int Q_TILE_SIZE  = Q_TILE_SIZE_;
     static constexpr int KV_TILE_SIZE = KV_TILE_SIZE_;
@@ -403,7 +403,7 @@ template <int Q_TILE_SIZE_  = 16,
           typename D_NOPE_  = fp8_t,
           typename D_ROPE_  = bf16_t,
           typename D_OUT_   = bf16_t>
-struct pa_16mx1_16nx4_fp8_traits
+struct opus_mla_v4_prefill_a8w8_16mx1_16nx4_traits
 {
     static constexpr int Q_TILE_SIZE  = Q_TILE_SIZE_;
     static constexpr int KV_TILE_SIZE = KV_TILE_SIZE_;
@@ -474,36 +474,37 @@ __host__ __device__ inline int ceil_div(int a, int b) { return (a + b - 1) / b; 
 
 // Device kernel templates — declared here, defined in the device pass below.
 template <class Traits>
-__global__ void pa_prefill_16mx8_32nx1_kernel(pa_sparse_prefill_kargs kargs);
+__global__ void opus_mla_v4_prefill_a16w16_16mx8_32nx1_kernel(opus_mla_v4_prefill_kargs kargs);
 template <class Traits>
-__global__ void pa_prefill_16mx1_16nx4_kernel(pa_sparse_prefill_kargs kargs);
+__global__ void opus_mla_v4_prefill_a16w16_16mx1_16nx4_kernel(opus_mla_v4_prefill_kargs kargs);
 template <class Traits>
-__global__ void pa_prefill_16mx8_32nx1_fp8_kernel(pa_fp8_kargs kargs);
+__global__ void opus_mla_v4_prefill_a8w8_16mx8_32nx1_kernel(opus_mla_v4_prefill_fp8_kargs kargs);
 template <class Traits>
-__global__ void pa_prefill_16mx1_16nx4_fp8_kernel(pa_fp8_kargs kargs);
+__global__ void opus_mla_v4_prefill_a8w8_16mx1_16nx4_kernel(opus_mla_v4_prefill_fp8_kargs kargs);
 
 // Pull in the device kernel template bodies only on the gfx950 device pass.
 #if !defined(__HIP_DEVICE_COMPILE__) || !defined(__gfx950__)
 template <class Traits>
-__global__ void pa_prefill_16mx8_32nx1_kernel(pa_sparse_prefill_kargs)
+__global__ void opus_mla_v4_prefill_a16w16_16mx8_32nx1_kernel(opus_mla_v4_prefill_kargs)
 {
 }
 template <class Traits>
-__global__ void pa_prefill_16mx1_16nx4_kernel(pa_sparse_prefill_kargs)
+__global__ void opus_mla_v4_prefill_a16w16_16mx1_16nx4_kernel(opus_mla_v4_prefill_kargs)
 {
 }
 template <class Traits>
-__global__ void pa_prefill_16mx8_32nx1_fp8_kernel(pa_fp8_kargs)
+__global__ void opus_mla_v4_prefill_a8w8_16mx8_32nx1_kernel(opus_mla_v4_prefill_fp8_kargs)
 {
 }
 template <class Traits>
-__global__ void pa_prefill_16mx1_16nx4_fp8_kernel(pa_fp8_kargs)
+__global__ void opus_mla_v4_prefill_a8w8_16mx1_16nx4_kernel(opus_mla_v4_prefill_fp8_kargs)
 {
 }
 #else
 // =============================================================================
 // Device-side kernel implementation (gfx950 OPUS, D=512).
-// `pa_sparse_prefill_kargs` / `pa_prefill_*_traits<...>` are provided by the host plumbing above.
+// `opus_mla_v4_prefill_kargs` / `opus_mla_v4_prefill_*_traits<...>` are provided by the
+// host plumbing above.
 // =============================================================================
 #include <opus/opus.hpp>
 #include <bit>
@@ -537,15 +538,15 @@ __device__ inline void global_load(const D* g_base, void* smem_base,
 #if defined(__HIP_DEVICE_COMPILE__) && defined(__gfx950__)
         const unsigned int m0_val = m0_base + m0_fix;
         const char* addr = src;   // asm operands do not odr-use, so name it inside the lambda
-        #define PA_GLOBAL_LOAD_LDS(mnemonic)                                                \
+        #define OPUS_MLA_V4_GLOBAL_LOAD_LDS(mnemonic)                                       \
             asm volatile("s_mov_b32 m0, %0\n\ts_nop 0\n\t" mnemonic " %1, off offset:%2"    \
                          :: "s"(m0_val), "v"(addr), "n"(g_delta) : "memory")
-        if      constexpr (BYTES == 16) PA_GLOBAL_LOAD_LDS("global_load_lds_dwordx4");
-        else if constexpr (BYTES == 12) PA_GLOBAL_LOAD_LDS("global_load_lds_dwordx3");
-        else if constexpr (BYTES ==  4) PA_GLOBAL_LOAD_LDS("global_load_lds_dword");
-        else if constexpr (BYTES ==  2) PA_GLOBAL_LOAD_LDS("global_load_lds_ushort");
-        else                            PA_GLOBAL_LOAD_LDS("global_load_lds_ubyte");
-        #undef PA_GLOBAL_LOAD_LDS
+        if      constexpr (BYTES == 16) OPUS_MLA_V4_GLOBAL_LOAD_LDS("global_load_lds_dwordx4");
+        else if constexpr (BYTES == 12) OPUS_MLA_V4_GLOBAL_LOAD_LDS("global_load_lds_dwordx3");
+        else if constexpr (BYTES ==  4) OPUS_MLA_V4_GLOBAL_LOAD_LDS("global_load_lds_dword");
+        else if constexpr (BYTES ==  2) OPUS_MLA_V4_GLOBAL_LOAD_LDS("global_load_lds_ushort");
+        else                            OPUS_MLA_V4_GLOBAL_LOAD_LDS("global_load_lds_ubyte");
+        #undef OPUS_MLA_V4_GLOBAL_LOAD_LDS
 #else
         *reinterpret_cast<OPUS_LDS_ADDR opus::vector_t<D, VEC>*>(
             s_ptr + s_os[i.value] * static_cast<int>(sizeof(D))) =
@@ -580,7 +581,7 @@ __device__ inline auto global_load(const D* g_base, opus::index_t os) {
 // =============================================================================
 // Variant 16mx8_32nx1 (T_M=NUM_WARPS, T_N=1) — used when H > 32.
 // =============================================================================
-namespace pa_16mx8_32nx1 {
+namespace opus_mla_v4_prefill_a16w16_16mx8_32nx1 {
 
 constexpr int MFMA_MASK    = 0x08;
 constexpr int VALU_MASK    = 0x02;
@@ -916,15 +917,15 @@ __device__ inline void attn_mask_oob_value(V& v_v, int valid_kv_len, int kv_tile
 }
 
 template<class Traits>
-__device__ void pa_prefill_accum_le2_tiles(pa_sparse_prefill_kargs kargs,
-                                           const void* kv_ptr,
-                                           const int* kv_indices, int page_idx_begin, int valid_kv_len, int num_kv_tiles,
-                                           char* smem_kv_buf,
-                                           opus::vector_t<typename Traits::D_ATTN, Traits::Q_TILE_SIZE * Traits::D_TILE_SIZE / Traits::WARP_SIZE>& v_q,
-                                           opus::vector_t<typename Traits::D_ACC,  Traits::Q_TILE_SIZE * Traits::D_TILE_SIZE / Traits::WARP_SIZE>& v_o,
-                                           typename Traits::D_ACC& m_row,
-                                           typename Traits::D_ACC& l_row,
-                                           typename Traits::D_ACC temperature_scale) {
+__device__ void mla_v4_prefill_accum_le2_tiles(opus_mla_v4_prefill_kargs kargs,
+                                               const void* kv_ptr,
+                                               const int* kv_indices, int page_idx_begin, int valid_kv_len, int num_kv_tiles,
+                                               char* smem_kv_buf,
+                                               opus::vector_t<typename Traits::D_ATTN, Traits::Q_TILE_SIZE * Traits::D_TILE_SIZE / Traits::WARP_SIZE>& v_q,
+                                               opus::vector_t<typename Traits::D_ACC,  Traits::Q_TILE_SIZE * Traits::D_TILE_SIZE / Traits::WARP_SIZE>& v_o,
+                                               typename Traits::D_ACC& m_row,
+                                               typename Traits::D_ACC& l_row,
+                                               typename Traits::D_ACC temperature_scale) {
     using namespace opus;
     using T = opus::remove_cvref_t<Traits>;
     using D_ATTN = typename T::D_ATTN;
@@ -1039,15 +1040,15 @@ __device__ void pa_prefill_accum_le2_tiles(pa_sparse_prefill_kargs kargs,
 }
 
 template<class Traits, bool OddTail>
-__device__ void pa_prefill_accum_pipelined(pa_sparse_prefill_kargs kargs,
-                                           const void* kv_ptr,
-                                           const int* kv_indices, int page_idx_begin, int valid_kv_len, int num_kv_tiles,
-                                           char* smem_kv_buf,
-                                           opus::vector_t<typename Traits::D_ATTN, Traits::Q_TILE_SIZE * Traits::D_TILE_SIZE / Traits::WARP_SIZE>& v_q,
-                                           opus::vector_t<typename Traits::D_ACC,  Traits::Q_TILE_SIZE * Traits::D_TILE_SIZE / Traits::WARP_SIZE>& v_o,
-                                           typename Traits::D_ACC& m_row,
-                                           typename Traits::D_ACC& l_row,
-                                           typename Traits::D_ACC temperature_scale) {
+__device__ void mla_v4_prefill_accum_pipelined(opus_mla_v4_prefill_kargs kargs,
+                                               const void* kv_ptr,
+                                               const int* kv_indices, int page_idx_begin, int valid_kv_len, int num_kv_tiles,
+                                               char* smem_kv_buf,
+                                               opus::vector_t<typename Traits::D_ATTN, Traits::Q_TILE_SIZE * Traits::D_TILE_SIZE / Traits::WARP_SIZE>& v_q,
+                                               opus::vector_t<typename Traits::D_ACC,  Traits::Q_TILE_SIZE * Traits::D_TILE_SIZE / Traits::WARP_SIZE>& v_o,
+                                               typename Traits::D_ACC& m_row,
+                                               typename Traits::D_ACC& l_row,
+                                               typename Traits::D_ACC temperature_scale) {
     using namespace opus;
     using T = opus::remove_cvref_t<Traits>;
     using D_ATTN = typename T::D_ATTN;
@@ -1600,13 +1601,13 @@ __device__ void pa_prefill_accum_pipelined(pa_sparse_prefill_kargs kargs,
     }
 }
 
-} // namespace pa_16mx8_32nx1
+} // namespace opus_mla_v4_prefill_a16w16_16mx8_32nx1
 
 // ─── PA kernel: template on traits; K/V in shared, Q in registers, Flash Attention online softmax ───
 template<class Traits>
-__global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void pa_prefill_16mx8_32nx1_kernel(pa_sparse_prefill_kargs kargs) {
+__global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void opus_mla_v4_prefill_a16w16_16mx8_32nx1_kernel(opus_mla_v4_prefill_kargs kargs) {
     using namespace opus;
-    using namespace pa_16mx8_32nx1;
+    using namespace opus_mla_v4_prefill_a16w16_16mx8_32nx1;
     using T = opus::remove_cvref_t<Traits>;
     using D_ATTN = typename T::D_ATTN;
     using D_ACC = typename T::D_ACC;
@@ -1647,13 +1648,13 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void pa_prefill_16mx8_32nx1_
         const int num_kv_tiles   = ceil_div(valid_kv_len, T::KV_TILE_SIZE);
 
         if (num_kv_tiles <= 2) {
-            pa_prefill_accum_le2_tiles<Traits>(kargs, kargs.unified_kv_ptr, kargs.kv_indices_prefix, page_idx_begin, valid_kv_len, num_kv_tiles, smem_kv_buf, v_q, v_o, m_row, l_row, temperature_scale);
+            mla_v4_prefill_accum_le2_tiles<Traits>(kargs, kargs.unified_kv_ptr, kargs.kv_indices_prefix, page_idx_begin, valid_kv_len, num_kv_tiles, smem_kv_buf, v_q, v_o, m_row, l_row, temperature_scale);
         }
         if (num_kv_tiles > 2 && num_kv_tiles & 1) {
-            pa_prefill_accum_pipelined<Traits, true>(kargs, kargs.unified_kv_ptr, kargs.kv_indices_prefix, page_idx_begin, valid_kv_len, num_kv_tiles, smem_kv_buf, v_q, v_o, m_row, l_row, temperature_scale);
+            mla_v4_prefill_accum_pipelined<Traits, true>(kargs, kargs.unified_kv_ptr, kargs.kv_indices_prefix, page_idx_begin, valid_kv_len, num_kv_tiles, smem_kv_buf, v_q, v_o, m_row, l_row, temperature_scale);
         }
         if (num_kv_tiles > 2 && !(num_kv_tiles & 1)) {
-            pa_prefill_accum_pipelined<Traits, false>(kargs, kargs.unified_kv_ptr, kargs.kv_indices_prefix, page_idx_begin, valid_kv_len, num_kv_tiles, smem_kv_buf, v_q, v_o, m_row, l_row, temperature_scale);
+            mla_v4_prefill_accum_pipelined<Traits, false>(kargs, kargs.unified_kv_ptr, kargs.kv_indices_prefix, page_idx_begin, valid_kv_len, num_kv_tiles, smem_kv_buf, v_q, v_o, m_row, l_row, temperature_scale);
         }
     }
 
@@ -1667,13 +1668,13 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void pa_prefill_16mx8_32nx1_
         const int num_kv_tiles   = ceil_div(valid_kv_len, T::KV_TILE_SIZE);
 
         if (num_kv_tiles <= 2) {
-            pa_prefill_accum_le2_tiles<Traits>(kargs, kargs.kv_ptr, kargs.kv_indices_extend, page_idx_begin, valid_kv_len, num_kv_tiles, smem_kv_buf, v_q, v_o, m_row, l_row, temperature_scale);
+            mla_v4_prefill_accum_le2_tiles<Traits>(kargs, kargs.kv_ptr, kargs.kv_indices_extend, page_idx_begin, valid_kv_len, num_kv_tiles, smem_kv_buf, v_q, v_o, m_row, l_row, temperature_scale);
         }
         if (num_kv_tiles > 2 && num_kv_tiles & 1) {
-            pa_prefill_accum_pipelined<Traits, true>(kargs, kargs.kv_ptr, kargs.kv_indices_extend, page_idx_begin, valid_kv_len, num_kv_tiles, smem_kv_buf, v_q, v_o, m_row, l_row, temperature_scale);
+            mla_v4_prefill_accum_pipelined<Traits, true>(kargs, kargs.kv_ptr, kargs.kv_indices_extend, page_idx_begin, valid_kv_len, num_kv_tiles, smem_kv_buf, v_q, v_o, m_row, l_row, temperature_scale);
         }
         if (num_kv_tiles > 2 && !(num_kv_tiles & 1)) {
-            pa_prefill_accum_pipelined<Traits, false>(kargs, kargs.kv_ptr, kargs.kv_indices_extend, page_idx_begin, valid_kv_len, num_kv_tiles, smem_kv_buf, v_q, v_o, m_row, l_row, temperature_scale);
+            mla_v4_prefill_accum_pipelined<Traits, false>(kargs, kargs.kv_ptr, kargs.kv_indices_extend, page_idx_begin, valid_kv_len, num_kv_tiles, smem_kv_buf, v_q, v_o, m_row, l_row, temperature_scale);
         }
     }
 
@@ -1700,7 +1701,7 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void pa_prefill_16mx8_32nx1_
 // =============================================================================
 // Variant 16mx1_16nx4 (T_M=1, T_N=NUM_WARPS) — used when H <= 32.
 // =============================================================================
-namespace pa_16mx1_16nx4 {
+namespace opus_mla_v4_prefill_a16w16_16mx1_16nx4 {
 
 // Create layout for loading Q matrix from global memory
 template<class T>
@@ -2004,14 +2005,14 @@ __device__ inline void attn_mask_oob_value(V& v_v, int valid_kv_len, int kv_tile
 }
 
 template<class Traits, class VQ, class VO>
-__device__ void pa_prefill_16mx1_16nx4_pipeline(pa_sparse_prefill_kargs kargs,
-                                                const void* kv_ptr,
-                                                const int* kv_indices, int page_idx_begin, int valid_kv_len, int num_kv_tiles,
-                                                char* smem_kv, char* smem_ml, char* smem_p,
-                                                VQ& v_q, VO& v_o,
-                                                typename Traits::D_ACC& m_row,
-                                                typename Traits::D_ACC& l_row,
-                                                typename Traits::D_ACC temperature_scale) {
+__device__ void mla_v4_prefill_accum_pipelined(opus_mla_v4_prefill_kargs kargs,
+                                               const void* kv_ptr,
+                                               const int* kv_indices, int page_idx_begin, int valid_kv_len, int num_kv_tiles,
+                                               char* smem_kv, char* smem_ml, char* smem_p,
+                                               VQ& v_q, VO& v_o,
+                                               typename Traits::D_ACC& m_row,
+                                               typename Traits::D_ACC& l_row,
+                                               typename Traits::D_ACC temperature_scale) {
     using namespace opus;
     using T = opus::remove_cvref_t<Traits>;
     using D_ATTN = typename T::D_ATTN;
@@ -2098,13 +2099,13 @@ __device__ void pa_prefill_16mx1_16nx4_pipeline(pa_sparse_prefill_kargs kargs,
     }
 }
 
-} // namespace pa_16mx1_16nx4
+} // namespace opus_mla_v4_prefill_a16w16_16mx1_16nx4
 
 // ─── PA kernel: template on traits; K/V in shared, Q in registers, Flash Attention online softmax ───
 template<class Traits>
-__global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void pa_prefill_16mx1_16nx4_kernel(pa_sparse_prefill_kargs kargs) {
+__global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void opus_mla_v4_prefill_a16w16_16mx1_16nx4_kernel(opus_mla_v4_prefill_kargs kargs) {
     using namespace opus;
-    using namespace pa_16mx1_16nx4;
+    using namespace opus_mla_v4_prefill_a16w16_16mx1_16nx4;
     using T = opus::remove_cvref_t<Traits>;
     using D_ATTN = typename T::D_ATTN;
     using D_ACC = typename T::D_ACC;
@@ -2145,7 +2146,7 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void pa_prefill_16mx1_16nx4_
         const int valid_kv_len   = page_idx_end - page_idx_begin;
         const int num_kv_tiles   = ceil_div(valid_kv_len, T::KV_TILE_SIZE);
 
-        pa_prefill_16mx1_16nx4_pipeline<Traits>(kargs, kargs.unified_kv_ptr, kargs.kv_indices_prefix, page_idx_begin, valid_kv_len, num_kv_tiles, smem_kv, smem_ml, smem_p, v_q, v_o, m_row, l_row, temperature_scale);
+        mla_v4_prefill_accum_pipelined<Traits>(kargs, kargs.unified_kv_ptr, kargs.kv_indices_prefix, page_idx_begin, valid_kv_len, num_kv_tiles, smem_kv, smem_ml, smem_p, v_q, v_o, m_row, l_row, temperature_scale);
     }
 
     __builtin_amdgcn_s_barrier();
@@ -2157,7 +2158,7 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void pa_prefill_16mx1_16nx4_
         const int valid_kv_len   = page_idx_end - page_idx_begin;
         const int num_kv_tiles   = ceil_div(valid_kv_len, T::KV_TILE_SIZE);
 
-        pa_prefill_16mx1_16nx4_pipeline<Traits>(kargs, kargs.kv_ptr, kargs.kv_indices_extend, page_idx_begin, valid_kv_len, num_kv_tiles, smem_kv, smem_ml, smem_p, v_q, v_o, m_row, l_row, temperature_scale);
+        mla_v4_prefill_accum_pipelined<Traits>(kargs, kargs.kv_ptr, kargs.kv_indices_extend, page_idx_begin, valid_kv_len, num_kv_tiles, smem_kv, smem_ml, smem_p, v_q, v_o, m_row, l_row, temperature_scale);
     }
 
     // ──── Sink finalization, normalize O, and store to gmem ────
@@ -2180,7 +2181,7 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void pa_prefill_16mx1_16nx4_
 // =============================================================================
 // Variant 16mx8_32nx1 fp8 (split NoPE fp8 / RoPE bf16, T_M=NUM_WARPS, T_N=1) — used when H > 32.
 // =============================================================================
-namespace pa_16mx8_32nx1_fp8 {
+namespace opus_mla_v4_prefill_a8w8_16mx8_32nx1 {
 
 constexpr int MFMA_MASK    = 0x08;
 constexpr int VALU_MASK    = 0x02;
@@ -2708,8 +2709,8 @@ __device__ inline void attn_mask_oob_value(V& v_v, int valid_kv_len, int kv_tile
 }
 
 template<class Traits, class VQN, class VQR, class VO>
-__device__ void pa_prefill_16mx8_32nx1_fp8_le2_tiles(
-        pa_fp8_kargs kargs, const void* kv_nope_ptr, const void* kv_rope_ptr,
+__device__ void mla_v4_prefill_accum_le2_tiles(
+        opus_mla_v4_prefill_fp8_kargs kargs, const void* kv_nope_ptr, const void* kv_rope_ptr,
         const int* kv_indices,
         int page_idx_begin, int valid_kv_len, int num_kv_tiles,
         char* smem_kv,
@@ -2907,8 +2908,8 @@ __device__ void pa_prefill_16mx8_32nx1_fp8_le2_tiles(
 }
 
 template<class Traits, bool OddTail, class VQN, class VQR, class VO>
-__device__ void pa_prefill_16mx8_32nx1_fp8_pipelined(
-        pa_fp8_kargs kargs, const void* kv_nope_ptr, const void* kv_rope_ptr,
+__device__ void mla_v4_prefill_accum_pipelined(
+        opus_mla_v4_prefill_fp8_kargs kargs, const void* kv_nope_ptr, const void* kv_rope_ptr,
         const int* kv_indices,
         int page_idx_begin, int valid_kv_len, int num_kv_tiles,
         char* smem_kv,
@@ -3600,13 +3601,13 @@ __device__ void pa_prefill_16mx8_32nx1_fp8_pipelined(
     }
 }
 
-} // namespace pa_16mx8_32nx1_fp8
+} // namespace opus_mla_v4_prefill_a8w8_16mx8_32nx1
 
 
 template<class Traits>
-__global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void pa_prefill_16mx8_32nx1_fp8_kernel(pa_fp8_kargs kargs) {
+__global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void opus_mla_v4_prefill_a8w8_16mx8_32nx1_kernel(opus_mla_v4_prefill_fp8_kargs kargs) {
     using namespace opus;
-    using namespace pa_16mx8_32nx1_fp8;
+    using namespace opus_mla_v4_prefill_a8w8_16mx8_32nx1;
     using T = opus::remove_cvref_t<Traits>;
     using D_NOPE = typename T::D_NOPE;
     using D_ROPE = typename T::D_ROPE;
@@ -3662,7 +3663,7 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void pa_prefill_16mx8_32nx1_
         const int num_kv_tiles   = ceil_div(valid_kv_len, T::KV_TILE_SIZE);
 
         if (num_kv_tiles <= 2) {
-            pa_prefill_16mx8_32nx1_fp8_le2_tiles<Traits>(
+            mla_v4_prefill_accum_le2_tiles<Traits>(
                 kargs, kargs.unified_kv_nope_ptr, kargs.unified_kv_rope_ptr, kargs.kv_indices_prefix,
                 page_idx_begin, valid_kv_len, num_kv_tiles,
                 smem_kv,
@@ -3670,7 +3671,7 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void pa_prefill_16mx8_32nx1_
                 temperature_scale);
         }
         if (num_kv_tiles > 2 && num_kv_tiles & 1) {
-            pa_prefill_16mx8_32nx1_fp8_pipelined<Traits, true>(
+            mla_v4_prefill_accum_pipelined<Traits, true>(
                 kargs, kargs.unified_kv_nope_ptr, kargs.unified_kv_rope_ptr, kargs.kv_indices_prefix,
                 page_idx_begin, valid_kv_len, num_kv_tiles,
                 smem_kv,
@@ -3678,7 +3679,7 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void pa_prefill_16mx8_32nx1_
                 temperature_scale);
         }
         if (num_kv_tiles > 2 && !(num_kv_tiles & 1)) {
-            pa_prefill_16mx8_32nx1_fp8_pipelined<Traits, false>(
+            mla_v4_prefill_accum_pipelined<Traits, false>(
                 kargs, kargs.unified_kv_nope_ptr, kargs.unified_kv_rope_ptr, kargs.kv_indices_prefix,
                 page_idx_begin, valid_kv_len, num_kv_tiles,
                 smem_kv,
@@ -3697,7 +3698,7 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void pa_prefill_16mx8_32nx1_
         const int num_kv_tiles   = ceil_div(valid_kv_len, T::KV_TILE_SIZE);
 
         if (num_kv_tiles <= 2) {
-            pa_prefill_16mx8_32nx1_fp8_le2_tiles<Traits>(
+            mla_v4_prefill_accum_le2_tiles<Traits>(
                 kargs, kargs.kv_nope_ptr, kargs.kv_rope_ptr, kargs.kv_indices_extend,
                 page_idx_begin, valid_kv_len, num_kv_tiles,
                 smem_kv,
@@ -3705,7 +3706,7 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void pa_prefill_16mx8_32nx1_
                 temperature_scale);
         }
         if (num_kv_tiles > 2 && num_kv_tiles & 1) {
-            pa_prefill_16mx8_32nx1_fp8_pipelined<Traits, true>(
+            mla_v4_prefill_accum_pipelined<Traits, true>(
                 kargs, kargs.kv_nope_ptr, kargs.kv_rope_ptr, kargs.kv_indices_extend,
                 page_idx_begin, valid_kv_len, num_kv_tiles,
                 smem_kv,
@@ -3713,7 +3714,7 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void pa_prefill_16mx8_32nx1_
                 temperature_scale);
         }
         if (num_kv_tiles > 2 && !(num_kv_tiles & 1)) {
-            pa_prefill_16mx8_32nx1_fp8_pipelined<Traits, false>(
+            mla_v4_prefill_accum_pipelined<Traits, false>(
                 kargs, kargs.kv_nope_ptr, kargs.kv_rope_ptr, kargs.kv_indices_extend,
                 page_idx_begin, valid_kv_len, num_kv_tiles,
                 smem_kv,
@@ -3746,7 +3747,7 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void pa_prefill_16mx8_32nx1_
 // =============================================================================
 // Variant 16mx1_16nx4 fp8 (T_M=1, T_N=NUM_WARPS) — split NoPE fp8 / RoPE bf16.
 // =============================================================================
-namespace pa_16mx1_16nx4_fp8 {
+namespace opus_mla_v4_prefill_a8w8_16mx1_16nx4 {
 
 template<class T>
 __device__ inline auto make_layout_q_nope(int lane_id) {
@@ -4098,8 +4099,8 @@ __device__ inline void reorder_mxscl_for_opsel(V& v) {
 }
 
 template<class Traits, class VQN, class VQR, class VO>
-__device__ void pa_prefill_16mx1_16nx4_fp8_pipeline(
-        pa_fp8_kargs kargs, const void* kv_nope_ptr, const void* kv_rope_ptr,
+__device__ void mla_v4_prefill_accum_pipelined(
+        opus_mla_v4_prefill_fp8_kargs kargs, const void* kv_nope_ptr, const void* kv_rope_ptr,
         const int* kv_indices,
         int page_idx_begin, int valid_kv_len, int num_kv_tiles,
         char* smem_kv, char* smem_ml, char* smem_p,
@@ -4248,12 +4249,12 @@ __device__ void pa_prefill_16mx1_16nx4_fp8_pipeline(
     }
 }
 
-} // namespace pa_16mx1_16nx4_fp8
+} // namespace opus_mla_v4_prefill_a8w8_16mx1_16nx4
 
 template<class Traits>
-__global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void pa_prefill_16mx1_16nx4_fp8_kernel(pa_fp8_kargs kargs) {
+__global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void opus_mla_v4_prefill_a8w8_16mx1_16nx4_kernel(opus_mla_v4_prefill_fp8_kargs kargs) {
     using namespace opus;
-    using namespace pa_16mx1_16nx4_fp8;
+    using namespace opus_mla_v4_prefill_a8w8_16mx1_16nx4;
     using T = opus::remove_cvref_t<Traits>;
     using D_NOPE = typename T::D_NOPE;
     using D_ROPE = typename T::D_ROPE;
@@ -4309,7 +4310,7 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void pa_prefill_16mx1_16nx4_
         const int valid_kv_len   = page_idx_end - page_idx_begin;
         const int num_kv_tiles   = ceil_div(valid_kv_len, T::KV_TILE_SIZE);
 
-        pa_prefill_16mx1_16nx4_fp8_pipeline<Traits>(
+        mla_v4_prefill_accum_pipelined<Traits>(
             kargs, kargs.unified_kv_nope_ptr, kargs.unified_kv_rope_ptr, kargs.kv_indices_prefix,
             page_idx_begin, valid_kv_len, num_kv_tiles,
             smem_kv, smem_ml, smem_p,
@@ -4326,7 +4327,7 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void pa_prefill_16mx1_16nx4_
         const int valid_kv_len   = page_idx_end - page_idx_begin;
         const int num_kv_tiles   = ceil_div(valid_kv_len, T::KV_TILE_SIZE);
 
-        pa_prefill_16mx1_16nx4_fp8_pipeline<Traits>(
+        mla_v4_prefill_accum_pipelined<Traits>(
             kargs, kargs.kv_nope_ptr, kargs.kv_rope_ptr, kargs.kv_indices_extend,
             page_idx_begin, valid_kv_len, num_kv_tiles,
             smem_kv, smem_ml, smem_p,
@@ -4354,4 +4355,4 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void pa_prefill_16mx1_16nx4_
 }
 #endif
 
-#endif // PA_SPARSE_PREFILL_OPUS_IMPL
+#endif // OPUS_MLA_V4_PREFILL_IMPL
