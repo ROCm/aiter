@@ -110,6 +110,15 @@ _EPI_PAD = int(os.environ.get("AITER_EPI_PAD", "0"))
 # footprint cut; gemm2 is 45.6 KB, has never been modal, and only pays the
 # staggering loss (+9%) for a fix it does not need.
 _SINGLE_PARITY = int(os.environ.get("AITER_A4W4_SINGLE_PARITY", "0"))
+# Which of the two schedules to keep when collapsing to one. They are not
+# interchangeable -- each pairs the four WMMA quadrants with a different DS
+# producer group, so one may feed the dscnt ledger better than the other.
+_PARITY_SEL = int(os.environ.get("AITER_A4W4_PARITY_SEL", "0"))
+# Emit the (fully unrolled) drain ONCE while keeping both rolled steady
+# schedules. Cuts the parity duplication where it is pure code and almost no
+# runtime -- the drain is num_buffers of the K_TILES -- instead of giving up the
+# steady-state staggering the way _SINGLE_PARITY does.
+_DRAIN_SINGLE = int(os.environ.get("AITER_A4W4_DRAIN_SINGLE", "0"))
 
 # Emit the fp4 LDS stores of one activation group under ONE `kgrp == 0` exec
 # mask instead of one per store site. `kgrp = lane // 16` is a runtime lane
@@ -508,8 +517,9 @@ def launch_gemm_a4w4_moe(
     _bias = "_bias" if has_bias else ""
     _probe = f"_probe{_EPI_PROBE}" if _EPI_PROBE else ""
     _probe += f"_pad{_EPI_PAD}" if _EPI_PAD else ""
-    _probe += "_sp1" if _sp_on else ""
+    _probe += (f"_sp1p{_PARITY_SEL}" if _PARITY_SEL else "_sp1") if _sp_on else ""
     _probe += "_fsm" if _EPI_FUSE_STORE_MASK else ""
+    _probe += "_ds1" if (_DRAIN_SINGLE and not _sp_on) else ""
     _epi = f"_eb{_EPI_ACT_BLKS}{'' if _EPI_ACT_BARRIERS else 'nb'}"
     _epi += "_th" if _EPI_HW_TANH else ""
     _epi += f"_wm{_EPI_ACT_WM}"
@@ -1076,7 +1086,10 @@ def launch_gemm_a4w4_moe(
 
             n_steady = K_TILES - num_buffers
 
-            def _run_all(parity):
+            def _run_steady(parity):
+                # `range` (not range_constexpr) -- the @kernel rewriter turns
+                # this into a runtime scf.for, so the steady state is ONE rolled
+                # body per parity. The drain below is the unrolled part.
                 for rev in range(n_steady // num_buffers):
                     do_sync = (rev % cluster_sync_revs) == (cluster_sync_revs - 1)
                     for s in range_constexpr(num_buffers):
@@ -1094,6 +1107,14 @@ def launch_gemm_a4w4_moe(
                         )
                     if do_sync:
                         cluster.cluster_barrier()
+
+            def _run_drain(parity):
+                # Fully unrolled (num_buffers stages with per-stage fence counts
+                # and has_next), so this is the parity-duplicated code that the
+                # rolled steady loop is not. It covers only num_buffers of the
+                # K_TILES, while the LDS staggering that the two schedules buy
+                # is a steady-state effect -- so it is the cheapest place to
+                # give up the duplication. See _DRAIN_SINGLE.
                 for j in range_constexpr(num_buffers):
                     # No refills left, so the drain ratchets the TDM allowance
                     # down: stage j seeds slot j+1, whose prologue load must
@@ -1118,13 +1139,25 @@ def launch_gemm_a4w4_moe(
             # one schedule for both waves trades LDS staggering for roughly half
             # the footprint; AITER_A4W4_SINGLE_PARITY=1 measures that trade.
             if const_expr(_sp_on):
-                _run_all(0)
+                _run_steady(_PARITY_SEL)
+                _run_drain(_PARITY_SEL)
+            elif const_expr(_DRAIN_SINGLE):
+                # Keep both steady schedules (that is where the staggering pays)
+                # but emit the drain once.
+                wave_parity = fx.Int32(rocdl.readfirstlane(T.i32, wave % 2))
+                if wave_parity == 0:
+                    _run_steady(0)
+                else:
+                    _run_steady(1)
+                _run_drain(_PARITY_SEL)
             else:
                 wave_parity = fx.Int32(rocdl.readfirstlane(T.i32, wave % 2))
                 if wave_parity == 0:
-                    _run_all(0)
+                    _run_steady(0)
+                    _run_drain(0)
                 else:
-                    _run_all(1)
+                    _run_steady(1)
+                    _run_drain(1)
 
             rocdl.s_wait_dscnt(0)
             # acc (wm, wn) is 32 N-cols x 16 M-rows: lane holds M = wm*16+lane16
