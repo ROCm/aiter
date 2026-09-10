@@ -48,7 +48,9 @@ _SPLIT_TOKEN_LIMIT = 96
 # decode reducer accepts at most 33 splits.
 _MAX_SPLITS = min(_TOPK // _BLOCK_N, 33)
 _SPLIT_CAP = 16
-_SPLIT_CHOICES = tuple(s for s in (1, 2, 4, 8, 16, 32) if s <= _MAX_SPLITS)
+_SPLIT_CHOICES = tuple(
+    s for s in (1, 2, 4, 8, 16, 32) if s <= min(_MAX_SPLITS, _SPLIT_CAP)
+)
 
 
 def _prefill_splits(num_tokens: int, device) -> int:
@@ -138,6 +140,7 @@ def _compile_sparse_mla_prefill(n_splits: int = 1):
         scale_log2e: fx.Float32,
         q_heads: fx.Int32,
         out_heads: fx.Int32,
+        num_kv_rows: fx.Int32,
     ):
         f32 = T.f32
         neg_inf = fx.Float32(arith.constant(float("-inf"), type=f32))
@@ -238,6 +241,25 @@ def _compile_sparse_mla_prefill(n_splits: int = 1):
         key_slot_col = 8 * (lane_col // 4) + (lane_col % 4)
         key_slot_group = 8 * lane_group
 
+        def bounded(vec):
+            """Fold the upper bound into the sentinel the score mask already honours.
+
+            `kv` reaches the kernel as a buffer view whose `num_records` is the
+            descriptor maximum, not the tensor's length, so hardware bounds
+            checking does not catch a row past the end -- the load reaches
+            unmapped memory and faults the queue. Mask here, once, and both the
+            KV address below and the score mask downstream follow.
+            """
+            return fx.Vector.from_elements(
+                [
+                    ((vec[i] >= fx.Int32(0)) & (vec[i] < num_kv_rows)).select(
+                        vec[i], fx.Int32(-1)
+                    )
+                    for i in range_constexpr(4)
+                ],
+                fx.Int32,
+            )
+
         # Stage indices once to avoid repeating scattered VMEM loads in the key loop.
         if const_expr(keys_per_split >= _NUM_THREADS * 4):
             for iteration in range_constexpr(keys_per_split // (_NUM_THREADS * 4)):
@@ -245,7 +267,7 @@ def _compile_sparse_mla_prefill(n_splits: int = 1):
                 _lds_store_i32x4(
                     indices_base,
                     fx.Int32(element) * 4,
-                    load_i32_vector4(indices_divided, index_row + element),
+                    bounded(load_i32_vector4(indices_divided, index_row + element)),
                 )
         else:
             # Fewer keys than the block can load four-wide in one sweep; the
@@ -255,7 +277,7 @@ def _compile_sparse_mla_prefill(n_splits: int = 1):
                 _lds_store_i32x4(
                     indices_base,
                     fx.Int32(element) * 4,
-                    load_i32_vector4(indices_divided, index_row + element),
+                    bounded(load_i32_vector4(indices_divided, index_row + element)),
                 )
         fx.barrier()
 
@@ -643,6 +665,7 @@ def _compile_sparse_mla_prefill(n_splits: int = 1):
         scale_log2e: fx.Float32,
         q_heads: fx.Int32,
         out_heads: fx.Int32,
+        num_kv_rows: fx.Int32,
         num_tokens: fx.Int32,
         stream: fx.Stream,
     ):
@@ -660,6 +683,7 @@ def _compile_sparse_mla_prefill(n_splits: int = 1):
             scale_log2e,
             q_heads,
             out_heads,
+            num_kv_rows,
             value_attrs={
                 "rocdl.waves_per_eu": _WAVES_PER_EU,
                 "rocdl.flat_work_group_size": f"{_NUM_THREADS},{_NUM_THREADS}",
@@ -856,6 +880,7 @@ def flydsl_sparse_mla_prefill(
             float(softmax_scale) * _LOG2E,
             int(heads),
             int(out_heads),
+            int(kv.shape[0]),
             int(num_tokens),
             fx.Stream(torch.cuda.current_stream(device=device)),
         )
