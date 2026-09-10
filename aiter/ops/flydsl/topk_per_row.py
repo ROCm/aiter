@@ -27,8 +27,6 @@ _SUPPORTED_ARCHES = ("gfx942", "gfx950", "gfx1250")
 # Match the first batch band; None is the final catch-all band. Within each
 # band, wider rows use multi-block. Physical width avoids reading CUDA bounds.
 _OneBlockDispatchBands = tuple[tuple[int | None, int], ...]
-# Untuned arches keep the previous single 20k cutoff.
-_UNTUNED_ONE_BLOCK_DISPATCH_BANDS: _OneBlockDispatchBands = ((None, 20_000),)
 
 _ONE_BLOCK_DISPATCH_BANDS: dict[str, _OneBlockDispatchBands] = {
     "gfx950": (
@@ -319,7 +317,7 @@ def is_flydsl_top_k_per_row_prefill_supported(
 
 def _should_use_one_block(arch: str, num_rows: int, width: int) -> bool:
     """Select one-block within the row-width limit of the matching batch band."""
-    bands = _ONE_BLOCK_DISPATCH_BANDS.get(arch, _UNTUNED_ONE_BLOCK_DISPATCH_BANDS)
+    bands = _ONE_BLOCK_DISPATCH_BANDS[arch]
     for max_batch_size, max_row_width in bands:
         if max_batch_size is None or num_rows <= max_batch_size:
             return width <= max_row_width
