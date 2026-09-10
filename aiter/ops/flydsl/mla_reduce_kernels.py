@@ -388,17 +388,17 @@ def _compile_sparse_decode_direct_combine(ni: int, fine: bool):
     return launch
 
 
-def _use_fine_decode_combine(seq: int, ni: int, num_cu: int) -> bool:
+def _use_fine_decode_combine(seq: int, num_cu: int) -> bool:
     """Slice Dv while the coarse grid would leave the device under-occupied.
 
     Coarse runs `seq * 16` blocks of 64 threads, so a short decode fills a
     fraction of the machine and walks every split serially; fine runs 64
     blocks per row at a quarter of the bytes per lane. Fine's only real cost
-    is recomputing the `ni`-wide LSE butterfly per Dv slice, which starts to
-    matter once coarse already saturates. Test that, and nothing else: the
-    previous form gated on `seq * 64` against `num_cu`, which excluded exactly
-    the short sequences fine helps most, and its `ni > 16` term kept it off
-    every merged shape as well.
+    is recomputing the LSE butterfly per Dv slice, which starts to matter only
+    once coarse already saturates. The split count is deliberately not an
+    input: the previous form gated on `seq * 64` against `num_cu`, which
+    excluded exactly the short sequences fine helps most, and its `ni > 16`
+    term kept it off every merged shape as well.
     """
     return seq * 16 < 2 * num_cu
 
@@ -456,7 +456,7 @@ def _flydsl_sparse_mla_decode_combine(
     num_cu = torch.cuda.get_device_properties(
         final_output.device.index
     ).multi_processor_count
-    fine = _use_fine_decode_combine(seq, ni, num_cu)
+    fine = _use_fine_decode_combine(seq, num_cu)
     direct = _require_warm(
         (ni, fine), "combine", lambda: _compile_sparse_decode_direct_combine(ni, fine)
     )
