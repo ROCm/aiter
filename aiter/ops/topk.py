@@ -28,6 +28,9 @@ def topk_gating_fwd(
 
 
 _VALID_SCORE_FUNCS = {"sqrtsoftplus", "sigmoid", "softmax"}
+# Downstream (vLLM) refuses the softmax fast path unless this is True:
+# older AITER accepted need_renorm for softmax but silently forced it off.
+TOPK_GATING_SOFTMAX_RENORMALIZES = True
 
 
 def _valid_bias_dtypes(gating_dtype: torch.dtype) -> tuple[torch.dtype, ...]:
