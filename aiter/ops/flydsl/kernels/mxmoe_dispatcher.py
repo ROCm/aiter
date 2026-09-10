@@ -592,10 +592,20 @@ def _g2_prefetch_ids_eligible(
     M_logical, NE, topk, D_HIDDEN, D_INTER, BM, BN, BK, a_dtype, b_dtype,
     epilog, out_dtype,
 ):
+    """Whether the id-prefetch gemm2 variant applies.
+
+    Every condition below is a property of the compiled tile / dtype contract,
+    not of a particular model. The original gate also pinned NE/topk/hidden/
+    inter and an M_logical allowlist, but those were an artifact of which rows
+    of the kimi-k3 tuned CSV happened to select the BM128 reduce tile -- with
+    that CSV, 4096 and 32768 were the only tokens whose kernelName2 was
+    t128x256x128_reduce, so the allowlist restated the tile condition rather
+    than adding one. Keeping only the structural conditions lets any tuned
+    shape that lands on the same tile pick the variant up.
+    """
+    del M_logical, NE, topk, D_HIDDEN, D_INTER  # shape-independent by design
     return (
-        M_logical in (4096, 32768)
-        and (NE, topk, D_HIDDEN, D_INTER) == (896, 16, 3584, 384)
-        and (BM, BN, BK) == (128, 256, 128)
+        (BM, BN, BK) == (128, 256, 128)
         and a_dtype == b_dtype == "fp4"
         and epilog == "reduce"
         and str(out_dtype).strip().lower() == "fp8"
