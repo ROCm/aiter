@@ -16,10 +16,12 @@ contiguous run into exactly one peer's inbox:
 The ring pays for that schedule is accuracy: its reduce-scatter lap
 requantizes the *running partial sum* ``N-1`` times where the mesh requantizes
 once, and the partial's extremum grows with the number of contributions folded
-into it. Hence the two codec knobs. Widening the reduce-scatter lap to INT6 improves 
-accuracy with the cost of using slightly more bandwidth. The all-gather lap forwards 
-the bytes it received untouched, so it contributes exactly one quantization and stays 
+into it. Hence the two codec knobs. Widening the reduce-scatter lap to INT6 improves
+accuracy with the cost of using slightly more bandwidth. The all-gather lap forwards
+the bytes it received untouched, so it contributes exactly one quantization and stays
 INT4 unless asked otherwise by env variable AITER_ALL_REDUCE_CODEC.
+
+A third wire format, ``"fp16"``, is a lossless passthrough. Mainly for testing.
 """
 
 import flydsl.compiler as flyc
@@ -39,7 +41,6 @@ from .qr_int_codec import (
     _codec_load,
     _codec_quant,
     _scale_from_word,
-    hi2_slot_of,
     scale_slot_of,
     thread_lane,
 )
@@ -96,8 +97,8 @@ RING_ST_LADDER = (
 # what INT6 is for, while the all-gather lap forwards the bytes it received
 # without touching them (see ``_op_substep``) and so contributes exactly one
 # quantization -- the one at op ``N``, where this rank's chunk is final.
-RS_CODECS = ("int4", "int6")
-AG_CODECS = ("int4", "int6")
+RS_CODECS = ("int4", "int6", "fp16")
+AG_CODECS = ("int4", "int6", "fp16")
 
 # 64 quads of 4 lanes; one quad writes one 64 B fabric sector.
 QUADS_PER_BLOCK = BLOCK // QUAD_LANES
@@ -260,10 +261,6 @@ def make_qr_int4_ring_kernel(
         quad, lane_in_quad = fx.idx2crd(lane, quad_layout).unpack()
         quad_id = wave * fx.Int32(QUADS_PER_WAVE) + quad
 
-        # Threads 2t and 2t+1 share one i32 of the INT6 2-bit plane; the even
-        # one stores it.
-        hi2_leader, hi2_slot = hi2_slot_of(tid)
-
         hbm_layout = fx.make_layout(
             (num_tiles, ATOMS, BLOCK * 4),
             (TILE_I32, BLOCK * 4, 1),
@@ -385,24 +382,19 @@ def make_qr_int4_ring_kernel(
             fx.copy(hbm_copy_atom, frag, dst)
 
         def _lds_write_packet(codec, j, words, scale_word, is_leader):
-            """Stage one packet of *codec* into the row this hop will send.
-            """
+            """Stage one packet of *codec* into the row this hop will send."""
             pack = pack_views[codec.name]
             row = fx.Int32(j)
-            fx.memref_store(words[0], pack, (row, tid))
-            if codec.n_words == 2:  # noqa: SIM102
-                if hi2_leader:
+            for (off, pred), word in zip(codec.plane_slots(tid), words):
+                if pred:
+                    fx.memref_store(word, pack, (row, off))
+            if codec.has_scale:  # noqa: SIM102
+                if is_leader:
                     fx.memref_store(
-                        words[1],
+                        scale_word,
                         pack,
-                        (row, fx.Int32(codec.hi2_i32_off) + hi2_slot),
+                        (row, fx.Int32(codec.scale_i32_off) + scale_slot),
                     )
-            if is_leader:
-                fx.memref_store(
-                    scale_word,
-                    pack,
-                    (row, fx.Int32(codec.scale_i32_off) + scale_slot),
-                )
 
         def _recv_raw(codec, step, sub, j):
             """This rank's inbox slot for *step*, exactly as the predecessor wrote it.

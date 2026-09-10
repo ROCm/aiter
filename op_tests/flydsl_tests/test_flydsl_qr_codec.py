@@ -42,6 +42,12 @@ import flydsl.expr as fx
 from flydsl.expr import gpu, rocdl
 from flydsl.expr.typing import Int32, Int64, Stream, T
 
+from aiter.ops.flydsl.kernels.qr_int4_kernel import MESH_CODECS, make_qr_int4_kernel
+from aiter.ops.flydsl.kernels.qr_int4_ring_kernel import (
+    AG_CODECS,
+    RS_CODECS,
+    make_qr_int4_ring_kernel,
+)
 from aiter.ops.flydsl.kernels.qr_int_codec import (
     CODECS,
     _atom_bf16_to_f16,
@@ -51,7 +57,6 @@ from aiter.ops.flydsl.kernels.qr_int_codec import (
     _codec_load,
     _codec_quant,
     _scale_from_word,
-    hi2_slot_of,
     scale_slot_of,
     thread_lane,
 )
@@ -95,7 +100,6 @@ def make_codec_roundtrip_kernel(codec_name: str, via_memory: bool = True):
 
         _wave, lane = thread_lane(tid)
         scale_slot, pair_in_slot = scale_slot_of(tid)
-        hi2_leader, hi2_slot = hi2_slot_of(tid)
 
         in_ptr = _global_i32_ptr(inp_ptr)
         out_ptr_g = _global_i32_ptr(out_ptr)
@@ -124,16 +128,16 @@ def make_codec_roundtrip_kernel(codec_name: str, via_memory: bool = True):
             return fx.Int32(fx.ptr_load(smem_ptr + off))
 
         def _write_packet(words, scale_word, is_leader):
-            fx.memref_store(words[0], pack, (row0, tid))
-            if codec.n_words == 2:  # noqa: SIM102
-                if hi2_leader:
+            for (off, pred), word in zip(codec.plane_slots(tid), words):
+                if pred:
+                    fx.memref_store(word, pack, (row0, off))
+            if codec.has_scale:  # noqa: SIM102
+                if is_leader:
                     fx.memref_store(
-                        words[1], pack, (row0, fx.Int32(codec.hi2_i32_off) + hi2_slot)
+                        scale_word,
+                        pack,
+                        (row0, fx.Int32(codec.scale_i32_off) + scale_slot),
                     )
-            if is_leader:
-                fx.memref_store(
-                    scale_word, pack, (row0, fx.Int32(codec.scale_i32_off) + scale_slot)
-                )
 
         def _row_via_memory(row):
             words, scale_word, leader = _codec_quant(codec, _load_atom(row), lane, tid)
@@ -413,6 +417,22 @@ def test_extremum_below_e4m3_floor_can_zero_the_whole_group(codec_name):
     assert float(zeroed[0]) == 0.0, (
         f"expected the sub-floor extremum to zero this group; got {float(zeroed[0])}"
     )
+
+
+# fp16 is the passthrough wire format used to test the reduce-scatter/
+# all-gather transport in isolation.
+
+def test_fp16_codec_roundtrip_is_identity():
+    x = _payload(n_tiles=2, seed=53)
+    y = codec_roundtrip(x, "fp16")
+    assert torch.equal(x, y), "fp16 passthrough must not alter a single bit"
+
+
+def test_fp16_codec_memory_path_matches_register_path():
+    x = _payload(n_tiles=2, seed=59)
+    through_lds = codec_roundtrip(x, "fp16", via_memory=True)
+    in_regs = codec_roundtrip(x, "fp16", via_memory=False)
+    assert torch.equal(through_lds, in_regs)
 
 
 def _resolve(monkeypatch, algorithm, world_size, env=None, rs=None, ag=None):

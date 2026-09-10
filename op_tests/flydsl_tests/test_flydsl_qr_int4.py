@@ -180,14 +180,23 @@ def _run_rank(args) -> None:
         world_size=args.tp,
         algorithm=args.algorithm,
         # Left unpinned for the ring so QRInt4 walks RING_ST_LADDER -- that is
-        # the configuration production runs, and the one worth testing.
-        **({} if args.algorithm == "ring" else {"super_tile": args.super_tile}),
+        # the configuration production runs, and the one worth testing. The
+        # transport tests (fp16 codec) pin it explicitly instead.
+        **(
+            {"super_tile": args.super_tile}
+            if (args.algorithm != "ring" or args.pin_super_tile)
+            else {}
+        ),
         grid_cap=args.grid_cap,
         # The case list deliberately includes sub-threshold shapes (8x1024 is
         # 16 KiB, well under MIN_PAYLOAD_BYTES) to cover the partial-tile path.
-        # That floor is a deployment policy about when INT4 is worth its SQNR,
-        # not a correctness bound, so it has no business gating these tests.
         min_bytes=0,
+        # None means "let QRInt4 default it" -- the env-var codec mechanism
+        # (AITER_ALL_REDUCE_CODEC, set by _spawn's `codec` arg) still applies.
+        # Explicit here only for the lap-isolation test, which needs the two
+        # laps to differ and the env var cannot express that.
+        rs_codec=args.rs_codec,
+        ag_codec=args.ag_codec,
     )
     compile_tokens = min(512, max(args.tokens))
     compile_hidden = max(args.hiddens)
@@ -203,13 +212,25 @@ def _run_rank(args) -> None:
     rows = []
     for tokens, hidden in zip(args.tokens, args.hiddens, strict=True):
         gen = torch.Generator().manual_seed(1234 + rank)
-        src = torch.randn(tokens, hidden, generator=gen, dtype=torch.float32) * 0.1
-        if args.fill == "degenerate":
-            # Half the rows exactly zero, half far below the E4M3 magnitude
-            # floor of 2^-7. Both drive the group extremum to (or under) zero,
-            # which is where the encode reciprocal blows up.
-            src[0::2] = 0.0
-            src[1::2] *= 1e-8
+        if args.fill == "exact":
+            # Grid of 1/16, magnitude < 0.5: exact in both bf16 and fp16, and
+            # every partial sum over up to 8 ranks stays exact in both too
+            # (integer multiple of 1/16, magnitude <= 4 -- 7 significant bits).
+            # Paired with codec="fp16" this makes the whole reduce lossless,
+            # so the result is bit-identical to the fp32 reference regardless
+            # of accumulation order.
+            src = torch.randint(-8, 8, (tokens, hidden), generator=gen).float() * (
+                2.0**-4
+            )
+        else:
+            src = torch.randn(tokens, hidden, generator=gen, dtype=torch.float32) * 0.1
+            if args.fill == "degenerate":
+                # Half the rows exactly zero, half far below the E4M3
+                # magnitude floor of 2^-7. Both drive the group extremum to
+                # (or under) zero, which is where the encode reciprocal blows
+                # up.
+                src[0::2] = 0.0
+                src[1::2] *= 1e-8
         inp = src.to(device=device, dtype=torch.bfloat16)
         out = torch.empty_like(inp)
         ref = inp.to(torch.float32)
@@ -223,6 +244,13 @@ def _run_rank(args) -> None:
         got = out.to(torch.float32)
         nbytes = int(inp.numel()) * int(inp.element_size())
         tiles = max(1, (nbytes + TILE_BYTES - 1) // TILE_BYTES)
+        mismatch = got != ref
+        n_mismatch = int(mismatch.sum().item())
+        first_bad = -1
+        if n_mismatch:
+            bad_idx = torch.nonzero(mismatch.reshape(-1), as_tuple=False)
+            first_bad = int(bad_idx[0].item())
+        diff = (got - ref).abs()
         row = {
             "tokens": tokens,
             "hidden": hidden,
@@ -239,6 +267,10 @@ def _run_rank(args) -> None:
             "st_used": fly._pick_st(tiles, nbytes),
             "sqnr_db": _sqnr_db(got, ref),
             "rel_mae": _rel_mae(got, ref),
+            "n_mismatch": n_mismatch,
+            "max_abs_err": float(diff.max().item()) if diff.numel() else 0.0,
+            "first_bad": first_bad,
+            "allclose": bool(torch.allclose(got, ref, rtol=1e-2, atol=8e-3)),
             "us": None,
         }
         if args.time_it:
@@ -275,6 +307,9 @@ def _spawn(
     algorithm: str = "mesh",
     codec: str | None = None,
     fill: str = "randn",
+    rs_codec: str | None = None,
+    ag_codec: str | None = None,
+    pin_super_tile: bool = False,
 ) -> list[list[dict]]:
     # HIP QR/fused-AR use multiprocessing.Pool from ``python3`` __main__.
     # This file is also collected by pytest, and FlyDSL JIT needs a fresh
@@ -327,6 +362,12 @@ def _spawn(
             "--fill",
             fill,
         ]
+        if rs_codec is not None:
+            cmd += ["--rs-codec", rs_codec]
+        if ag_codec is not None:
+            cmd += ["--ag-codec", ag_codec]
+        if pin_super_tile:
+            cmd.append("--pin-super-tile")
         if time_it:
             cmd.append("--time-it")
         if rank == 0:
@@ -471,6 +512,166 @@ def test_qr_int4_degenerate_inputs(algorithm):
         assert rows, f"rank {rank}: no rows"
         for row in rows:
             assert math.isfinite(row["rel_mae"]), f"rank {rank}: {row}"
+
+
+# Transport-in-isolation tests: codec="fp16" is a lossless passthrough wire
+# format, so these gate on closeness to the reference rather than on SQNR. 
+# They exercise chunk/slot addressing, the flag protocol, the super-tile loop 
+# and the accumulate order.
+#
+# (world_size, tokens, hidden, super_tile, label). ``super_tile`` is pinned
+# explicitly (via pin_super_tile=True below) for both schedules, including
+# the ring.
+_EXACT_CASES = (
+    (8, 8, 1024, 1, "partial-tile"),
+    (8, 512, 5120, 1, "st1"),
+    (8, 4096, 4096, 8, "st8-multi-tile"),
+    (4, 512, 5120, 1, "tp4-st1"),
+    (4, 4096, 4096, 8, "tp4-st8"),
+    (2, 512, 5120, 1, "tp2-st1"),
+)
+
+# Same shapes, one per world size, for the randn/allclose variant.
+_ALLCLOSE_CASES = tuple(c for c in _EXACT_CASES if c[3] == 1 and c[2] == 5120)
+
+
+def _assert_exact(
+    ranks: list[list[dict]],
+    *,
+    tokens: int,
+    hidden: int,
+    world_size: int,
+    label: str,
+    mode: str,
+) -> dict:
+    """Gate on bit-exactness (``mode="exact"``) or allclose (``mode="randn"``).
+
+    Deliberately does not check ``st_used`` against a predicted value the way
+    ``_assert_sqnr`` does -- these tests pin ``super_tile`` explicitly, so
+    there is nothing to predict, and the point here is the transport, not the
+    super-tile selection policy (already covered elsewhere).
+    """
+    if len(ranks) != world_size:
+        raise AssertionError(
+            f"{label}: gathered {len(ranks)} ranks, expected {world_size}"
+        )
+    fails = []
+    for rank, rows in enumerate(ranks):
+        if not rows:
+            fails.append(f"rank {rank}: no rows")
+            continue
+        row = rows[0]
+        if mode == "exact":
+            if row["n_mismatch"] != 0:
+                fails.append(
+                    f"rank {rank}: {row['n_mismatch']} mismatched elements, "
+                    f"max |err| {row['max_abs_err']:.3e}, "
+                    f"first bad flat index {row['first_bad']}"
+                )
+        elif not row["allclose"]:
+            fails.append(
+                f"rank {rank}: not allclose, max |err| {row['max_abs_err']:.3e}"
+            )
+    if fails:
+        codecs = ranks[0][0]
+        raise AssertionError(
+            f"{label} tp={world_size} tokens={tokens} hidden={hidden} "
+            f"rs={codecs.get('rs_codec')} ag={codecs.get('ag_codec')}: "
+            + "; ".join(fails)
+        )
+    return ranks[0][0]
+
+
+@pytest.mark.parametrize("algorithm", ("mesh", "ring"))
+@pytest.mark.parametrize("world_size,tokens,hidden,super_tile,label", _EXACT_CASES)
+def test_qr_transport_bit_exact(
+    world_size, tokens, hidden, super_tile, label, algorithm
+):
+    """fp16 wire, exact-grid input: bit-identical to the fp32 reference.
+    """
+    ranks = _spawn(
+        world_size,
+        [(tokens, hidden)],
+        time_it=False,
+        algorithm=algorithm,
+        super_tile=super_tile,
+        grid_cap=64,
+        codec="fp16",
+        fill="exact",
+        pin_super_tile=True,
+    )
+    _assert_exact(
+        ranks,
+        tokens=tokens,
+        hidden=hidden,
+        world_size=world_size,
+        label=f"{label}/{algorithm}/fp16-exact",
+        mode="exact",
+    )
+
+
+@pytest.mark.parametrize("algorithm", ("mesh", "ring"))
+@pytest.mark.parametrize("world_size,tokens,hidden,super_tile,label", _ALLCLOSE_CASES)
+def test_qr_transport_allclose(
+    world_size, tokens, hidden, super_tile, label, algorithm
+):
+    """fp16 wire, realistic randn input: allclose to the fp32 reference.
+
+    Tolerance is dominated by the bf16 output rounding plus fp16 accumulation.
+    """
+    ranks = _spawn(
+        world_size,
+        [(tokens, hidden)],
+        time_it=False,
+        algorithm=algorithm,
+        super_tile=super_tile,
+        grid_cap=64,
+        codec="fp16",
+        fill="randn",
+        pin_super_tile=True,
+    )
+    _assert_exact(
+        ranks,
+        tokens=tokens,
+        hidden=hidden,
+        world_size=world_size,
+        label=f"{label}/{algorithm}/fp16-randn",
+        mode="randn",
+    )
+
+
+@pytest.mark.parametrize("rs_codec,ag_codec", (("fp16", "int4"), ("int4", "fp16")))
+def test_qr_ring_lap_isolation(rs_codec, ag_codec):
+    """Ring only, one lap fp16 and the other int4: names the guilty lap.
+
+    With only one lap lossy, a healthy transport still clears the SQNR floor,
+    so a failure here points at whichever lap is still quantized.
+    """
+    ranks = _spawn(
+        8,
+        [(512, 5120)],
+        time_it=False,
+        algorithm="ring",
+        super_tile=1,
+        grid_cap=64,
+        rs_codec=rs_codec,
+        ag_codec=ag_codec,
+        pin_super_tile=True,
+    )
+    fails = []
+    for rank, rows in enumerate(ranks):
+        row = rows[0]
+        if row["sqnr_db"] < SQNR_MIN_DB_TP8_INT4_RING:
+            fails.append(
+                f"rank {rank}: SQNR {row['sqnr_db']:.2f} dB < "
+                f"{SQNR_MIN_DB_TP8_INT4_RING}"
+            )
+        if row["rs_codec"] != rs_codec or row["ag_codec"] != ag_codec:
+            fails.append(
+                f"rank {rank}: resolved codecs {row['rs_codec']}/{row['ag_codec']} "
+                f"!= requested {rs_codec}/{ag_codec}"
+            )
+    assert not fails, "; ".join(fails)
 
 
 @benchmark()
@@ -623,7 +824,12 @@ if __name__ == "__main__":
     parser.add_argument("--algorithm", default="mesh")
     parser.add_argument("--super-tile", type=int, default=SUPER_TILE)
     parser.add_argument("--grid-cap", type=int, default=DEFAULT_GRID_CAP)
-    parser.add_argument("--fill", default="randn", choices=("randn", "degenerate"))
+    parser.add_argument(
+        "--fill", default="randn", choices=("randn", "degenerate", "exact")
+    )
+    parser.add_argument("--rs-codec", default=None)
+    parser.add_argument("--ag-codec", default=None)
+    parser.add_argument("--pin-super-tile", action="store_true")
     parser.add_argument("--time-it", action="store_true")
     parser.add_argument("--out", default=None)
     known, rest = parser.parse_known_args()

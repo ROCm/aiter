@@ -30,7 +30,7 @@ from aiter.dist.parallel_state import in_the_same_node_as
 from aiter.jit.utils.chip_info import get_gfx_runtime
 
 from .qr_int4_ipc import UncachedIpcHeap
-from .qr_int4_kernel import SUPER_TILES, make_qr_int4_kernel
+from .qr_int4_kernel import MESH_CODECS, SUPER_TILES, make_qr_int4_kernel
 from .qr_int4_ring_kernel import (
     AG_CODECS,
     RING_ST_LADDER,
@@ -144,12 +144,18 @@ class _Algorithm:
 def _build_mesh(
     *, world_size, rank, super_tile, grid, inbox_memory, rs_codec, ag_codec
 ):
-    del rank, rs_codec, ag_codec  # a runtime kernel argument; and not mesh knobs
+    del rank  # a runtime kernel argument, not a mesh build knob
+    if rs_codec != ag_codec:
+        raise ValueError(
+            f"mesh algorithm has one wire format for both laps, got "
+            f"rs_codec={rs_codec!r} != ag_codec={ag_codec!r}"
+        )
     return make_qr_int4_kernel(
         world_size=world_size,
         super_tile=super_tile,
         grid=grid,
         inbox_memory=inbox_memory,
+        codec=rs_codec,
     )
 
 
@@ -158,8 +164,8 @@ ALGORITHMS = {
         name="mesh",
         build=_build_mesh,
         super_tiles=SUPER_TILES,
-        rs_codecs=("int4",),
-        ag_codecs=("int4",),
+        rs_codecs=MESH_CODECS,
+        ag_codecs=MESH_CODECS,
         min_bytes=MIN_PAYLOAD_BYTES,
         min_batch_blocks=_MIN_BATCH_BLOCKS,
         default_super_tile=8,
@@ -248,10 +254,9 @@ def _resolve_codecs(algo, world_size, rs_codec, ag_codec):
             _warn_codec_unavailable(algo.name, label, env, default)
         return default
 
-    return (
-        _pick(rs_codec, rs_default, algo.rs_codecs, "rs_codec"),
-        _pick(ag_codec, ag_default, algo.ag_codecs, "ag_codec"),
-    )
+    resolved_rs = _pick(rs_codec, rs_default, algo.rs_codecs, "rs_codec")
+    resolved_ag = _pick(ag_codec, ag_default, algo.ag_codecs, "ag_codec")
+    return resolved_rs, resolved_ag
 
 # KFD io-link type for xGMI, from include/uapi/linux/kfd_sysfs.h. PCIe is 2.
 _HSA_IOLINK_TYPE_XGMI = 11

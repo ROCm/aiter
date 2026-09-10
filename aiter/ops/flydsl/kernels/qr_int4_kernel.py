@@ -3,13 +3,13 @@
 
 """gfx942/gfx950 TP∈{2,4,8} INT4 **mesh** all-reduce.
 
-Topology of each lap: every rank pushes directly to all ``N-1`` peers, twice. 
+Topology of each lap: every rank pushes directly to all ``N-1`` peers, twice.
 
 INT4 nibble: [-8,+7], −1/8, 4 B/thread, 1152 B rank-tile. Scale is
 group-16 signed E4M3 in the 128 B region. Super-tile ST∈{1,8}; host
 uses ST=1 when ``num_tiles ≤ GRID``. Payload HBM is bf16; in-kernel
 math is packed fp16. Each rank owns ``ATOMS / world_size`` atoms of a
-tile (8 GPUs → 1, 4 → 2, 2 → 4); LDS stays ``ATOMS * 1152``.
+tile (8 GPUs → 1, 4 → 2, 2 → 4); LDS stays ``ATOMS * rank_tile_bytes``.
 
 """
 
@@ -21,14 +21,12 @@ from flydsl.expr.typing import Int32, Int64, Stream, T
 
 from . import buffer_ops
 from .qr_int_codec import (
-    INT4,
-    N_SECTORS,
-    RANK_TILE_BYTES,
-    RANK_TILE_I32,
+    CODECS,
     _atom_bf16_to_f16,
     _atom_f16_to_bf16,
     _clamp_fp16_overflow,
     _codec_dequant,
+    _codec_load,
     _codec_quant,
     _scale_from_word,
     scale_slot_of,
@@ -58,12 +56,8 @@ PHASES = 2
 PHASE_REDUCE_SCATTER = 0
 PHASE_ALL_GATHER = 1
 SUPER_TILES = (1, 8)
-# dest × rank_atoms == ATOMS for every supported world size.
-PACK_I32 = ATOMS * RANK_TILE_I32
-LDS_BYTES = ATOMS * RANK_TILE_BYTES
-
-
-PackStorage = make_pack_storage(PACK_I32)
+# Wire formats the mesh can build.
+MESH_CODECS = ("int4", "fp16")
 
 
 def make_qr_int4_kernel(
@@ -72,6 +66,7 @@ def make_qr_int4_kernel(
     super_tile: int = 1,
     grid: int,
     inbox_memory: str = "uncached",
+    codec: str = "int4",
 ):
     if world_size not in SUPPORTED_WORLDS:
         raise ValueError(
@@ -81,18 +76,14 @@ def make_qr_int4_kernel(
         raise ValueError(
             f"inbox_memory must be one of {tuple(_INBOX_POLICY)}, got {inbox_memory!r}"
         )
+    if codec not in MESH_CODECS:
+        raise ValueError(f"codec must be one of {MESH_CODECS}, got {codec!r}")
+    c = CODECS[codec]
     policy = _INBOX_POLICY[inbox_memory]
     payload_policy = policy["payload"]
     flag_policy = policy["flag"]
     release_writeback = policy["writeback"]
     recv_policy = policy["recv"]
-    # Strides for the (peer, sector) fanout, resolved here rather than in the
-    # kernel body: bindings made inside an `if` do not survive FlyDSL's trace,
-    # which is why the body pre-assigns before conditionally overwriting.
-    if policy["fanout"] == "peer":
-        int4_stride, scale_stride = (8, 1), (2, 1)
-    else:
-        int4_stride, scale_stride = (1, world_size), (1, world_size)
     if ATOMS % world_size != 0:
         raise ValueError(f"ATOMS={ATOMS} is not divisible by world_size={world_size}")
     if super_tile not in SUPER_TILES:
@@ -102,11 +93,26 @@ def make_qr_int4_kernel(
     # Each rank owns this many 16-byte atoms of a 32 KiB tile
     # (8 GPUs → 1, 4 → 2, 2 → 4). LDS still holds all ATOMS atoms.
     rank_atoms = ATOMS // world_size
-    # Last-sector pad is ST * rank_atoms * RANK_TILE_I32 after the ST tiles.
-    rank_payload_i32 = rank_atoms * RANK_TILE_I32
+    # Last-sector pad is ST * rank_atoms * rank_tile_i32 after the ST tiles.
+    rank_payload_i32 = rank_atoms * c.rank_tile_i32
     release_i32_off = super_tile * rank_payload_i32
     wire_tile_i32 = release_i32_off + 16
     wire_tile_bytes = wire_tile_i32 * 4
+
+    # A rank-tile's sectors, in stripes of up to 8 (a workgroup has 64 quads,
+    # and world_size*8 of them cover one full stripe at TP8). INT4 is 8+8+2;
+    # fp16, with no scale tail, is eight full stripes. One fanout layout per
+    # distinct stripe width.
+    stripes = [(b, min(8, c.n_sectors - b)) for b in range(0, c.n_sectors, 8)]
+    _fanout_stride = {
+        w: (w, 1) if policy["fanout"] == "peer" else (1, world_size)
+        for w in {width for _, width in stripes}
+    }
+
+    # dest × rank_atoms == ATOMS for every supported world size.
+    pack_i32 = ATOMS * c.rank_tile_i32
+    lds_bytes = ATOMS * c.rank_tile_bytes
+    PackStorage = make_pack_storage(pack_i32)
 
     flags_i32 = PHASES * grid * world_size
 
@@ -130,10 +136,10 @@ def make_qr_int4_kernel(
         quad, lane_in_quad = fx.idx2crd(lane, quad_layout).unpack()
         quad_id = wave * fx.Int32(QUADS_PER_WAVE) + quad
 
-        pack_layout = fx.make_layout((ATOMS, RANK_TILE_I32), (RANK_TILE_I32, 1))
-        # 64 B NT sectors of one 1152 B rank-tile: (sector, lane-in-quad)
-        # -> i32 start of the dwordx4. Isolated NT store stays explicit.
-        nt_own_layout = fx.make_layout((N_SECTORS, QUAD_LANES), (16, 4))
+        pack_layout = fx.make_layout((ATOMS, c.rank_tile_i32), (c.rank_tile_i32, 1))
+        # 64 B NT sectors of one rank-tile: (sector, lane-in-quad) -> i32
+        # start of the dwordx4. Isolated NT store stays explicit.
+        nt_own_layout = fx.make_layout((c.n_sectors, QUAD_LANES), (16, 4))
         # Remote NT fanout stays explicit global_store_dwordx4 nt.
         hbm_layout = fx.make_layout(
             (num_tiles, ATOMS, BLOCK * 4),
@@ -148,11 +154,9 @@ def make_qr_int4_kernel(
         ).get_slice(tid)
         # Four group-16 E4M3 bytes share the i32 slot eight threads already own.
         scale_slot, pair_in_slot = scale_slot_of(tid)
-        # Rank-tile = 18 × 64 B Infinity Fabric sectors: 16 INT4 then 2 E4M3.
-        # A workgroup has 64 quads. A stripe of 8 sectors needs world_size*8
-        # quads (64 at 8 GPUs); leftover quads sit idle (always on the
-        # 2-sector scale tail, and on the INT4 stripes when world_size < 8).
-        # Cover 18 as 8+8+2.
+        # A workgroup has 64 quads. A stripe of up to 8 sectors needs
+        # world_size*8 quads (64 at 8 GPUs); leftover quads sit idle (always on
+        # a narrower tail stripe, and on every stripe when world_size < 8).
         #
         # Which axis runs fastest across consecutive quads is a fabric
         # question. "sector": consecutive quads target consecutive peers of
@@ -162,8 +166,10 @@ def make_qr_int4_kernel(
         # destination a 512 B contiguous run. PCIe wants that -- interleaving
         # destinations every 64 B costs ~1.5x against >=256 B runs (36.25 vs
         # 54.03 GB/s measured on MI350P).
-        fanout_int4_stripe = fx.make_layout((world_size, 8), int4_stride)
-        fanout_scale_stripe = fx.make_layout((world_size, 2), scale_stride)
+        fanout_layouts = {
+            w: fx.make_layout((world_size, w), stride)
+            for w, stride in _fanout_stride.items()
+        }
         color_layout = fx.make_layout((grid,), (1,))
         wire_slot_layout = fx.make_layout(
             (PHASES, grid, world_size, super_tile),
@@ -251,13 +257,14 @@ def make_qr_int4_kernel(
                 fx.copy(hbm_copy_atom, frag, dst)
 
         def _lds_write_packet(slot, words, scale, is_leader):
-            # INT4 only, so one payload word and no 2-bit plane. The ring is
-            # where the multi-plane store lives.
-            fx.memref_store(words[0], pack, (slot, tid))
-            if is_leader:
-                fx.memref_store(
-                    scale, pack, (slot, fx.Int32(INT4.scale_i32_off) + scale_slot)
-                )
+            for (off, pred), word in zip(c.plane_slots(tid), words):
+                if pred:
+                    fx.memref_store(word, pack, (slot, off))
+            if c.has_scale:  # noqa: SIM102
+                if is_leader:
+                    fx.memref_store(
+                        scale, pack, (slot, fx.Int32(c.scale_i32_off) + scale_slot)
+                    )
 
         def _pack_reduce_scatter(atoms):
             """Quantize each destination's slice of this tile into LDS.
@@ -269,7 +276,7 @@ def make_qr_int4_kernel(
             for dest in range_constexpr(world_size):
                 for k in range_constexpr(rank_atoms):
                     words, scale, is_leader = _codec_quant(
-                        INT4, atoms[dest * rank_atoms + k], lane, tid
+                        c, atoms[dest * rank_atoms + k], lane, tid
                     )
                     _lds_write_packet(
                         fx.Int32(dest * rank_atoms + k), words, scale, is_leader
@@ -283,7 +290,7 @@ def make_qr_int4_kernel(
             NT fanout can push them into every peer's all-gather inbox.
             """
             for k in range_constexpr(rank_atoms):
-                words, scale, is_leader = _codec_quant(INT4, accs[k], lane, tid)
+                words, scale, is_leader = _codec_quant(c, accs[k], lane, tid)
                 for dest in range_constexpr(world_size):
                     _lds_write_packet(
                         fx.Int32(dest * rank_atoms + k), words, scale, is_leader
@@ -292,21 +299,18 @@ def make_qr_int4_kernel(
         def _fanout_nt(phase, inbox_src, sub):
             """NT-store one rank-tile from LDS to every peer's inbox.
 
-            Three lockstep stripes cover the 18 sectors: INT4 [0, 8), INT4
-            [8, 16), E4M3 [16, 18). ``stripe * 8`` is the first sector of
-            each stripe (16 for the scale tail).
+            Lockstep stripes of up to 8 sectors cover the rank-tile: INT4 is
+            8+8+2 (16 nibble sectors then the 2-sector E4M3 tail), fp16 is
+            eight full stripes. ``sector_base`` is the first sector of each
+            stripe.
             """
             for k in range_constexpr(rank_atoms):
-                for stripe in range_constexpr(3):
-                    is_scale_tail = stripe == 2
-                    n_sectors = 2 if is_scale_tail else 8
-                    fanout = (
-                        fanout_scale_stripe if is_scale_tail else fanout_int4_stripe
-                    )
-                    n_quads = fx.Int32(world_size * n_sectors)
+                for sector_base, width in stripes:
+                    fanout = fanout_layouts[width]
+                    n_quads = fx.Int32(world_size * width)
                     safe = (quad_id < n_quads).select(quad_id, fx.Int32(0))
                     peer, sector_in_stripe = fx.idx2crd(safe, fanout).unpack()
-                    sector = fx.Int32(stripe * 8) + sector_in_stripe
+                    sector = fx.Int32(sector_base) + sector_in_stripe
                     if quad_id < n_quads:
                         vec_idx = fx.get_scalar(
                             fx.crd2idx((sector, lane_in_quad), nt_own_layout)
@@ -315,7 +319,7 @@ def make_qr_int4_kernel(
                         wire_idx = vec_idx
                         if rank_atoms != 1:
                             pack_peer = peer * fx.Int32(rank_atoms) + fx.Int32(k)
-                            wire_idx = vec_idx + fx.Int32(k * RANK_TILE_I32)
+                            wire_idx = vec_idx + fx.Int32(k * c.rank_tile_i32)
                         # 4xi32 NT vector cannot go through the i32 pack view.
                         v4 = fx.ptr_load(
                             smem_ptr + _pack_off(pack_peer, vec_idx),
@@ -392,17 +396,15 @@ def make_qr_int4_kernel(
             _acquire_inbox()
 
         def _recv_quantized(phase, src, sub, k=0):
-            # Packed dword is at base+tid; scale dword is 1024 B later at a
-            # group slot. They are not adjacent, so they cannot share one
-            # vector load.
             base = _sub_tile_i32(phase, src, sub)
             if k:
-                base = base + fx.Int32(k * RANK_TILE_I32)
-            packed = _load_i32_nt(self_rsrc, base + tid, recv_policy)
-            word = _load_i32_nt(
-                self_rsrc, base + fx.Int32(INT4.scale_i32_off) + scale_slot, recv_policy
-            )
-            return (packed,), _scale_from_word(INT4, word, pair_in_slot)
+                base = base + fx.Int32(k * c.rank_tile_i32)
+
+            def _get(off):
+                return _load_i32_nt(self_rsrc, base + off, recv_policy)
+
+            words, word = _codec_load(c, _get, tid, scale_slot)
+            return words, _scale_from_word(c, word, pair_in_slot)
 
         def _reduce_scattered(sub):
             """Dequant-accumulate every peer's reduce-scatter packet for *sub*."""
@@ -413,9 +415,9 @@ def make_qr_int4_kernel(
                         PHASE_REDUCE_SCATTER, fx.Int32(src), sub, k
                     )
                     if accs[k] is None:
-                        accs[k] = _codec_dequant(INT4, words, scale, tid)
+                        accs[k] = _codec_dequant(c, words, scale, tid)
                     else:
-                        accs[k] = _codec_dequant(INT4, words, scale, tid, accs[k])
+                        accs[k] = _codec_dequant(c, words, scale, tid, accs[k])
             return accs
 
         def _recv_all_gather(sub):
@@ -426,7 +428,7 @@ def make_qr_int4_kernel(
                     words, scale = _recv_quantized(
                         PHASE_ALL_GATHER, fx.Int32(src), sub, k
                     )
-                    gathered.append(_codec_dequant(INT4, words, scale, tid))
+                    gathered.append(_codec_dequant(c, words, scale, tid))
             return gathered
 
         # Stride by the *launched* grid, not the compile-time cap. The host
@@ -538,10 +540,10 @@ def make_qr_int4_kernel(
             stream=stream,
         )
 
-    # The inbox memory type changes the emitted store policy, so it has to be
-    # part of the symbol name -- two variants that differ only in cache bits
-    # must not collide in the JIT cache.
-    tag = f"ws{world_size}_st{super_tile}_{inbox_memory}"
+    # The inbox memory type and wire codec both change the emitted code, so
+    # both have to be part of the symbol name -- two variants that differ only
+    # in cache bits or wire format must not collide in the JIT cache.
+    tag = f"ws{world_size}_st{super_tile}_{inbox_memory}_{codec}"
     launch_qr_int4.func.__name__ = f"launch_qr_int4_{tag}"
     try:
         qr_int4.func.__name__ = f"qr_int4_{tag}"
@@ -551,14 +553,15 @@ def make_qr_int4_kernel(
         "launch": launch_qr_int4,
         "flags_bytes": flags_i32 * 4,
         "data_bytes": PHASES * grid * world_size * wire_tile_bytes,
-        "lds_bytes": LDS_BYTES,
+        "lds_bytes": lds_bytes,
         "tile_bytes": TILE_BYTES,
         "tile_fp16": TILE_FP16,
-        "rank_tile_bytes": RANK_TILE_BYTES,
+        "rank_tile_bytes": c.rank_tile_bytes,
         "wire_tile_bytes": wire_tile_bytes,
         "super_tile": super_tile,
         "world_size": world_size,
         "inbox_memory": inbox_memory,
+        "codec": codec,
         "payload_policy": payload_policy,
         "flag_policy": flag_policy,
         "release_writeback": release_writeback,
