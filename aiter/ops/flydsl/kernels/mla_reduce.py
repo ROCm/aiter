@@ -134,6 +134,26 @@ def _load_partial_out(buf, row, head_idx, tid, vec):
     return elems
 
 
+def _narrow_numeric_t(name: str):
+    """Resolve a 2-byte partial-output element type."""
+    if name in ("bf16", "bfloat16"):
+        return fx.BFloat16
+    if name in ("fp16", "f16", "float16", "half"):
+        return fx.Float16
+    raise ValueError(f"Unsupported partial dtype: {name}")
+
+
+def _load_partial_out_narrow(buf, row, head_idx, tid, vec, numeric_t):
+    """Load VEC packed 2-byte partials and widen them to fp32 registers."""
+    atom = _out_copy_atom(vec, numeric_t)
+    reg_layout = fx.make_layout(vec, 1)
+    row_tiled = fx.logical_divide(fx.slice(buf, (row, head_idx, None)), reg_layout)
+    frag = fx.make_rmem_tensor(reg_layout, numeric_t)
+    fx.copy_atom_call(atom, fx.slice(row_tiled, (None, tid)), frag)
+    v = frag.load()
+    return [v[i].to(fx.Float32) for i in fx.range_constexpr(vec)]
+
+
 def _out_copy_atom(vec: int, out_numeric_t):
     """Widest legal buffer copy atom for a VEC-element output fragment.
 
