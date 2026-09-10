@@ -923,6 +923,11 @@ def _precompile_a16w4_to_cache(
                 tile_n=g2_tile_n,
                 tile_k=g2_tile_k,
                 w_dtype=b_dtype,
+                epilog=(
+                    "reduce"
+                    if b_dtype == "int4" and kwargs.get("mode") == "reduce"
+                    else "atomic"
+                ),
                 **common,
             )
 
