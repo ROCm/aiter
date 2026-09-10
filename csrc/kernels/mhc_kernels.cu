@@ -504,7 +504,7 @@ namespace aiter {
             if (n_idx == 0) {                                                                     \
                 for (int i = 0; i < vec_tile; i++)                                                \
                     sqrsum_part += v_af[i] * v_af[i];                                             \
-            }                                                                                     
+            }
 #define MHC_PRE_X_CONSUME_W32(BUF)                                                                \
             if (n_idx == 0) {                                                                     \
                 for (int i = 0; i < vec_tile; i++) {                                              \

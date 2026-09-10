@@ -20,10 +20,19 @@ p.add_argument("-m", type=int, default=2048)
 p.add_argument("-n", "--hidden_size", type=int, default=7168)
 p.add_argument("--hc_mult", type=int, default=4)
 p.add_argument("--iters", type=int, default=1)
-p.add_argument("--w_preshuffle_bf16", action=argparse.BooleanOptionalAction, default=True)
-p.add_argument("--res_preshuffle", "--res_shuffle", action=argparse.BooleanOptionalAction, default=False)
+p.add_argument(
+    "--w_preshuffle_bf16", action=argparse.BooleanOptionalAction, default=True
+)
+p.add_argument(
+    "--res_preshuffle",
+    "--res_shuffle",
+    action=argparse.BooleanOptionalAction,
+    default=False,
+)
 p.add_argument("--fuse_rmsnorm", action="store_true", default=True)
-p.add_argument("--warmup", type=int, default=200, help="--bench: warm-up dispatches before timing")
+p.add_argument(
+    "--warmup", type=int, default=200, help="--bench: warm-up dispatches before timing"
+)
 p.add_argument(
     "--bench",
     action="store_true",
@@ -48,13 +57,13 @@ hc_scale = torch.randn((3,), dtype=dtypes.fp32) * 0.1
 hc_base = torch.randn((hc_mult3,), dtype=dtypes.fp32) * 0.1
 norm_weight = torch.randn(hidden_size, dtype=dtypes.bf16) if a.fuse_rmsnorm else None
 
-kwargs = dict(
-    rms_eps=1e-6,
-    hc_pre_eps=1e-6,
-    hc_sinkhorn_eps=1e-6,
-    hc_post_mult_value=2.0,
-    sinkhorn_repeat=20,
-)
+kwargs = {
+    "rms_eps": 1e-6,
+    "hc_pre_eps": 1e-6,
+    "hc_sinkhorn_eps": 1e-6,
+    "hc_post_mult_value": 2.0,
+    "sinkhorn_repeat": 20,
+}
 if a.fuse_rmsnorm:
     kwargs["norm_weight"] = norm_weight
     kwargs["norm_eps"] = 1e-6
@@ -98,9 +107,13 @@ if a.bench:
     torch.cuda.synchronize()
 
     _, us = run_perftest(aiter.mhc_fused_post_pre, *args_pos, **call)
-    print(f"BENCH us={us:.4f} m={m} hidden={hidden_size} w_preshuffle_bf16={pack_flag} res_preshuffle={int(a.res_preshuffle)}")
+    print(
+        f"BENCH us={us:.4f} m={m} hidden={hidden_size} w_preshuffle_bf16={pack_flag} res_preshuffle={int(a.res_preshuffle)}"
+    )
 else:
     for _ in range(a.iters):
         aiter.mhc_fused_post_pre(*args_pos, **call)
     torch.cuda.synchronize()
-    print(f"done: m={m} hidden={hidden_size} w_preshuffle_bf16={pack_flag} res_preshuffle={int(a.res_preshuffle)} iters={a.iters}")
+    print(
+        f"done: m={m} hidden={hidden_size} w_preshuffle_bf16={pack_flag} res_preshuffle={int(a.res_preshuffle)} iters={a.iters}"
+    )
