@@ -9,15 +9,17 @@ dispatch.
 **In scope:** `aiter/ops/flydsl/kernels/warp_decode_moe.py`,
 `aiter/ops/flydsl/warp_decode_moe.py`. Tests only as a gate, not as a rewrite.
 
-**Out of scope:** layout-algebra rewrite of packed FP8/FP4 weight dwords;
-MFMA/`fx.gemm`; LDS/`SharedAllocator` (this kernel has no LDS); ticket benches
-and CK harness.
+**Out of scope (this track):** describing packed FP8/FP4 as *unpacked* element
+layouts; `fx.gemm` / MFMA; LDS/`SharedAllocator`; ticket benches and CK harness.
+Preshuffled i32-kpack views are a **follow-on** (below), not subtasks 1–5.
 
 Work the subtasks **in order**. Later items assume earlier ones have landed.
 Each subtask is surgical and behavior-preserving: verify correctness (and a
 spot-check of median kernel time) before starting the next.
 
 ## Locked decisions
+
+These locks apply to **this track** (subtasks 1–5), not the follow-on.
 
 - **Test environment:** run all tests/benches in **`flydsl_venv`** **GPU 1**
   (`HIP_VISIBLE_DEVICES=1`).
@@ -130,3 +132,32 @@ one FP8 and one MXFP4 bench spot-check are unchanged within noise.
 - Changing GPU from the locked `HIP_VISIBLE_DEVICES=1`.
 - Mass-comment cleanup as its own commit unless a subtask’s diff is unreadable
   without it.
+
+## Follow-on (not this track): preshuffled pack, still `v_dot2`
+
+After 1–5, optionally make warp-decode **consume the same preshuffled weight
+buffer** as the MFMA MoE kernels (`mxmoe_gemm_v2` / a16w-mix `make_preshuffle_b_layout`).
+
+**Chosen mapping**
+
+- Layout of the **pack**: `fx.make_view` + `fx.make_layout` over **i32 (or byte)
+  kpack** modes (`klane`, `nlane`, K-tile, kpack, …), then `make_buffer_tensor`
+  / `fx.copy` of dword tiles — the same contract as tiled-MMA B, not a
+  `Float8`/`Float4` element grid.
+- **New lane→kpack map:** wave 64 still owns one (or `kh_per_warp`) output
+  scalar(s); each lane’s K-chunk is gathered from preshuffle slots instead of
+  a K-contiguous row (`w_row * (H//4) + k_base//4`).
+- **Compute stays `v_dot2`** (`cvt_scalef32_pk_bf16_{fp8,fp4}` + G7 drain). Do
+  not switch to `fx.gemm` / scaled MFMA in this follow-on (small-M padding is
+  still the ticket’s reason to avoid matrix cores).
+
+**Still out of scope even then**
+
+- Unpacked e4m3/e2m1 global layouts.
+- Requiring activations to be preshuffled; only **weights** need the shared B
+  layout unless a later decision says otherwise.
+
+**Done when (follow-on):** warp-decode matches today’s numerics on the
+preshuffled buffer the MFMA path already uses (no extra unpack staging);
+op_test covers both the current K-contiguous path (until retired) and the
+preshuffled path; one FP8 and one MXFP4 decode bench spot-check.
