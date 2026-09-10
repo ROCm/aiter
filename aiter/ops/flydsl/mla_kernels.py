@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-import flydsl.compiler as flyc
 import flydsl.expr as fx
 import torch
 from flydsl.runtime.device import get_rocm_arch
@@ -16,19 +15,7 @@ __all__ = [
     "flydsl_mla_pagesize64_fp8_fp8",
 ]
 
-
-_DECODE_PAGE_SIZE = 64
-_DECODE_NUM_Q_HEADS = (64, 128)
-# At or below this the kernel runs two waves that split the PV output dim rather
-# than the heads, which leaves each wave holding only part of a head's output
-# row. The single-split fast path writes bf16 straight out and has not been
-# validated for that, so these head counts always take the split-merge path.
-_DECODE_NARROW_HEADS = 32
-# Heads one block covers. Head counts above this are spread over the grid, and
-# each of those head groups reads the whole KV cache, which is what makes the
-# achieved bandwidth of a heads=128 launch twice its unique-byte figure. Read by
-# op_tests/_bench_flydsl_vs_gluon.py to model traffic.
-_DECODE_HEADS_PER_BLOCK = 64
+_PAGESIZE1_NUM_Q_HEADS = (16, 128)
 
 
 def _require(condition, message):
@@ -59,12 +46,15 @@ def _require_layout(name, tensor, dtype, shape=None):
 def _validate_pagesize1_inputs(
     split_data,
     split_lse,
+    final_output,
     q,
     kv_buffer,
     kv_page_indices,
     work_indptr,
     work_info,
     softmax_scale,
+    max_seqlen_q,
+    causal,
 ):
     arch = str(get_rocm_arch() or "").split(":", 1)[0]
     _require_runtime(
@@ -72,11 +62,31 @@ def _validate_pagesize1_inputs(
         f"expected gfx1250, got {arch or 'unknown'}",
     )
     softmax_scale = float(softmax_scale)
-    batch = q.size(0)
-    _require_layout("q", q, torch.float8_e4m3fn, (batch, 128, 576))
+    max_seqlen_q = int(max_seqlen_q)
+    _require(
+        max_seqlen_q in (1, 2, 3, 4),
+        f"max_seqlen_q: expected one of [1, 2, 3, 4], got {max_seqlen_q}",
+    )
+    total_q = q.size(0)
+    num_q_heads = q.size(1)
+    _require(
+        num_q_heads in _PAGESIZE1_NUM_Q_HEADS,
+        f"q: expected one of {list(_PAGESIZE1_NUM_Q_HEADS)} heads, "
+        f"got {num_q_heads}",
+    )
+    _require(
+        num_q_heads == 16 or max_seqlen_q == 1,
+        "q: 128 heads only support max_seqlen_q=1",
+    )
+    _require_layout("q", q, torch.float8_e4m3fn, (total_q, num_q_heads, 576))
     _require_layout("kv_buffer", kv_buffer, torch.float8_e4m3fn, (None, 1, 1, 576))
-    _require_layout("split_data", split_data, torch.float32, (None, 128, 512))
-    _require_layout("split_lse", split_lse, torch.float32, (split_data.size(0), 128))
+    _require_layout("split_data", split_data, torch.float32, (None, num_q_heads, 512))
+    _require_layout(
+        "split_lse", split_lse, torch.float32, (split_data.size(0), num_q_heads)
+    )
+    _require_layout(
+        "final_output", final_output, torch.bfloat16, (total_q, num_q_heads, 512)
+    )
     _require_layout("kv_page_indices", kv_page_indices, torch.int32)
     _require_layout("work_indptr", work_indptr, torch.int32)
     _require_layout("work_info", work_info, torch.int32, (None, 8))
@@ -84,12 +94,20 @@ def _validate_pagesize1_inputs(
     properties = torch.cuda.get_device_properties(q.device)
     lds_size = getattr(properties, "shared_memory_per_multiprocessor", None)
     lds_size = int(lds_size) if lds_size is not None else get_lds_capacity_bytes(arch)
-    return work_indptr.numel() - 1, lds_size, softmax_scale
+    return (
+        work_indptr.numel() - 1,
+        lds_size,
+        softmax_scale,
+        num_q_heads,
+        max_seqlen_q,
+        int(bool(causal)),
+    )
 
 
 def flydsl_mla_pagesize1_fp8_fp8(
     split_data,
     split_lse,
+    final_output,
     q,
     kv_buffer,
     kv_page_indices,
@@ -97,17 +115,29 @@ def flydsl_mla_pagesize1_fp8_fp8(
     work_info,
     softmax_scale,
     *,
+    max_seqlen_q=1,
+    causal=False,
     stream=None,
 ):
-    num_cus, lds_size, softmax_scale = _validate_pagesize1_inputs(
+    (
+        num_cus,
+        lds_size,
+        softmax_scale,
+        num_q_heads,
+        max_seqlen_q,
+        causal,
+    ) = _validate_pagesize1_inputs(
         split_data,
         split_lse,
+        final_output,
         q,
         kv_buffer,
         kv_page_indices,
         work_indptr,
         work_info,
         softmax_scale,
+        max_seqlen_q,
+        causal,
     )
     from .kernels.mla_gfx1250.mla_pagesize1_fp8_fp8 import (
         launch_mla_pagesize1_fp8_fp8,
@@ -118,7 +148,7 @@ def flydsl_mla_pagesize1_fp8_fp8(
     launch_mla_pagesize1_fp8_fp8(
         ptr_arg(split_data, fx.Float32),
         ptr_arg(split_lse, fx.Float32),
-        flyc.from_c_void_p(fx.BFloat16, None),
+        ptr_arg(final_output, fx.BFloat16),
         ptr_arg(q, fx.Int8),
         ptr_arg(kv_buffer, fx.Int8),
         ptr_arg(kv_page_indices, fx.Int32),
@@ -126,6 +156,9 @@ def flydsl_mla_pagesize1_fp8_fp8(
         ptr_arg(work_info, fx.Int32),
         softmax_scale,
         kv_buffer.size(0),
+        num_q_heads,
+        max_seqlen_q,
+        causal,
         num_cus,
         lds_size,
         stream=stream,
