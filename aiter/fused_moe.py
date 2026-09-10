@@ -2929,9 +2929,9 @@ def get_2stage_cfgs(
                 f"activation {configured_act!r} does not match runtime "
                 f"{expected_act!r}"
             )
-        elif swiglu_limit is not None and expected_act != "swiglu":
+        elif swiglu_limit and expected_act != "swiglu":
             # MXMOE's _activation_mul_batch consumes the limit for swiglu only;
-            # silu/situv2 would ignore it while the torch reference clamps.
+            # zero is the existing no-clamp sentinel on non-SwiGLU paths.
             reject_reason = (
                 f"MXMOE cannot apply swiglu_limit={swiglu_limit!r} to "
                 f"activation {expected_act!r}"
