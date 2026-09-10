@@ -21,6 +21,7 @@ import argparse
 import pytest
 import torch
 
+import aiter
 from aiter import dtypes
 from aiter.jit.utils.chip_info import get_gfx
 from aiter.ops.flydsl.gather_kv_b_proj import gather_kv_b_proj_flydsl
@@ -35,8 +36,10 @@ KV_PE_DIM = 64
 QK_NOPE_HEAD_DIM = 128
 V_HEAD_DIM = 128
 
+SUPPORTED_GFX = ("gfx950",)
+
 _SKIP = pytest.mark.skipif(
-    get_gfx() not in ("gfx950",),
+    get_gfx() not in SUPPORTED_GFX,
     reason="gfx950 FlyDSL required",
 )
 
@@ -438,7 +441,13 @@ def _bench(num_tokens, n_heads):
     return us_tri, us_fly, tflops, out_gb
 
 
-if __name__ == "__main__":
+def main():
+    if get_gfx() not in SUPPORTED_GFX:
+        aiter.logger.warning(
+            "FlyDSL gather_kv_b_proj unsupported on %s; skipping", get_gfx()
+        )
+        return
+
     parser = argparse.ArgumentParser()
     parser.add_argument("-heads", type=int, default=12, help="tp_k_head_num")
     args = parser.parse_args()
@@ -454,3 +463,7 @@ if __name__ == "__main__":
         print(
             f"| {m} | {us_t:.2f} | {us_f:.2f} | {us_t / us_f:.2f}x | {tf:.1f} | {gb:.1f} |"
         )
+
+
+if __name__ == "__main__":
+    main()
