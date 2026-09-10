@@ -9,15 +9,30 @@ dispatch.
 **In scope:** `aiter/ops/flydsl/kernels/warp_decode_moe.py`,
 `aiter/ops/flydsl/warp_decode_moe.py`. Tests only as a gate, not as a rewrite.
 
-**Out of scope:** layout-algebra rewrite of packed FP8/FP4 weight dwords;
-MFMA/`fx.gemm`; LDS/`SharedAllocator` (this kernel has no LDS); ticket benches
-and CK harness.
+**Out of scope (this track):** describing packed FP8/FP4 as *unpacked* element
+layouts; `fx.gemm` / MFMA; LDS/`SharedAllocator`; ticket benches and CK harness.
+Preshuffled i32-kpack views are a **follow-on** (below), not subtasks 1–5.
 
 Work the subtasks **in order**. Later items assume earlier ones have landed.
 Each subtask is surgical and behavior-preserving: verify correctness (and a
 spot-check of median kernel time) before starting the next.
 
+## Progress
+
+Track here as work lands (leave unchecked until that item is done). Per-subtask
+gates: op_test with `FLYDSL_RUNTIME_ENABLE_CACHE=0` on GPU 1; plus a G9/667
+spot-check when the hot loop or wait/reduce path changed.
+
+- [ ] 1. Mechanical `fx.*` surface
+- [ ] 2. Reuse `tensor_shim._run_compiled`
+- [ ] 3. `atomic_add_f32` without hardcoded LLVM address space
+- [ ] 4. Single definition path for `const_expr` if/else
+- [ ] 5. Buffer views + layouts for *unpacked* tensors only
+- [ ] Follow-on: preshuffled pack, still `v_dot2` (not this track)
+
 ## Locked decisions
+
+These locks apply to **this track** (subtasks 1–5), not the follow-on.
 
 - **Test environment:** run all tests/benches in **`flydsl_venv`** **GPU 1**
   (`HIP_VISIBLE_DEVICES=1`).
@@ -48,21 +63,20 @@ spot-check of median kernel time) before starting the next.
 
 Replace legacy spellings that the authoring skill already maps 1:1.
 
-- `fx.thread_idx.x` / `fx.block_idx.x` → `gpu.thread_id("x")` / `gpu.block_id("x")`
-  (import `gpu` from `flydsl.expr`).
-- `wave_reduce_add_f32`: `gpu.ShuffleOp` + `arith.AddFOp` → typed
-  `fx.Float32` + `.shuffle_xor(fx.Int32(sh), fx.Int32(64))` then `+`. XOR
-  butterfly order may stay `(1, 2, 4, 8, 16, 32)` (equivalent to the skill’s
-  high-to-low list).
-- `vector.extract` in `load_i32_words` and `dot2_f32_bf16_scalar` →
-  `fx.Vector(v)[i]`.
-- Prefer `fx.Vector(...).bitcast(...)` / `fx.Int32(...)` over raw
-  `arith.ExtFOp` / `ExtUIOp` / `ShLIOp` / `ConstantOp` and `llvm.bitcast` where
-  a vector or typed numeric already exists. Leave `llvm.inline_asm` for
-  `v_dot2`.
-
-**Done when:** no `thread_idx`/`block_idx`/`vector.extract` in the kernel file;
-reduce uses `shuffle_xor`; existing op_test still passes.
+- [ ] `fx.thread_idx.x` / `fx.block_idx.x` → `gpu.thread_id("x")` / `gpu.block_id("x")`
+      (import `gpu` from `flydsl.expr`).
+- [ ] `wave_reduce_add_f32`: `gpu.ShuffleOp` + `arith.AddFOp` → typed
+      `fx.Float32` + `.shuffle_xor(fx.Int32(sh), fx.Int32(64))` then `+`. XOR
+      butterfly order may stay `(1, 2, 4, 8, 16, 32)` (equivalent to the skill’s
+      high-to-low list).
+- [ ] `vector.extract` in `load_i32_words` and `dot2_f32_bf16_scalar` →
+      `fx.Vector(v)[i]`.
+- [ ] Prefer `fx.Vector(...).bitcast(...)` / `fx.Int32(...)` over raw
+      `arith.ExtFOp` / `ExtUIOp` / `ShLIOp` / `ConstantOp` and `llvm.bitcast` where
+      a vector or typed numeric already exists. Leave `llvm.inline_asm` for
+      `v_dot2`.
+- [ ] **Done when:** no `thread_idx`/`block_idx`/`vector.extract` in the kernel file;
+      reduce uses `shuffle_xor`; existing op_test still passes.
 
 ### 2. Reuse `tensor_shim._run_compiled`
 
@@ -72,8 +86,10 @@ Delete the local `_run` in `aiter/ops/flydsl/warp_decode_moe.py`. Import
 `_run_compiled(launcher, *args)` (or the shim’s documented `*args` form) —
 do **not** add a second copy.
 
-**Done when:** grep shows a single `_run_compiled` definition (in
-`tensor_shim.py` only); all warp-decode launches go through it.
+- [ ] Delete local `_run`; import `_run_compiled` from `tensor_shim`.
+- [ ] All warp-decode launches go through it.
+- [ ] **Done when:** grep shows a single `_run_compiled` definition (in
+      `tensor_shim.py` only); all warp-decode launches go through it.
 
 ### 3. `atomic_add_f32` without hardcoded LLVM address space
 
@@ -82,27 +98,29 @@ Replace `llvm.IntToPtrOp` on `!llvm.ptr<1>` with `fx.to_llvm_ptr` /
 `AtomicRMWOp(fadd, syncscope="agent")` if there is still no typed wrapper;
 localize that remaining dialect call.
 
-**Done when:** no hardcoded `<1>` / `IntToPtrOp` in this file; split-K
-`k_batch > 1` down path still matches the non-split path (same op_test cases).
+- [ ] Replace `llvm.IntToPtrOp` / `!llvm.ptr<1>` with `fx.to_llvm_ptr` /
+      `ptr.llvm_ptr`.
+- [ ] **Done when:** no hardcoded `<1>` / `IntToPtrOp` in this file; split-K
+      `k_batch > 1` down path still matches the non-split path (same op_test cases).
 
 ### 4. Single definition path for `const_expr` if/else
 
 The frontend restriction: do not define values inside `if/else` and use them
 after the branch. Specialize or flatten:
 
-- `build_gate_up_fp8_module`: `block2d` vs pertensor/pertoken both define
-  `gate_acc` / `up_acc` then silu uses them.
-- Nested `const_expr(use_i64_base)` that defines `*_rsrc` / `w_word_base`
-  used in the K loop (gate_up FP8/FP8-act, down FP8).
-- `const_expr(split_k)` is side-effect-only (atomic vs store) — either leave
-  it or split into two epilogue helpers; no SSA live-out.
+- [ ] `build_gate_up_fp8_module`: `block2d` vs pertensor/pertoken both define
+      `gate_acc` / `up_acc` then silu uses them.
+- [ ] Nested `const_expr(use_i64_base)` that defines `*_rsrc` / `w_word_base`
+      used in the K loop (gate_up FP8/FP8-act, down FP8).
+- [ ] `const_expr(split_k)` is side-effect-only (atomic vs store) — either leave
+      it or split into two epilogue helpers; no SSA live-out.
 
 Prefer two builders or a local `@flyc.jit` dispatch over `scf.IfOp`. Runtime
 `if lane == 0:` stores stay as-is.
 
-**Done when:** no kernel uses a value first assigned only inside a
-`const_expr` if/else arm; op_test covers both `block2d` and i64-base (large
-`E*I*H`) paths.
+- [ ] **Done when:** no kernel uses a value first assigned only inside a
+      `const_expr` if/else arm; op_test covers both `block2d` and i64-base (large
+      `E*I*H`) paths.
 
 ### 5. Buffer views + layouts for *unpacked* tensors only
 
@@ -110,18 +128,18 @@ Only after 1–4. Move **unpacked** tensors onto `fx.rocdl.make_buffer_tensor` +
 `fx.make_view` + `fx.copy` (or a documented `buffer_ops` exception with a
 comment):
 
-- BF16 activations / intermediate / outputs
-- f32 scales (pertensor / pertoken / block2d)
-- `router_ids` (i32), `router_wts` (f32)
+- [ ] BF16 activations / intermediate / outputs
+- [ ] f32 scales (pertensor / pertoken / block2d)
+- [ ] `router_ids` (i32), `router_wts` (f32)
 
 **Keep** packed i32 weight/activation word loads (`load_i32_words`, FP8/FP4
 dwords) and `_ptr_rsrc_off` (K3 i64 expert base) on `buffer_ops` until there
 is an i64-base `make_buffer_tensor` equivalent. Do not invent a fake TV layout
 for a mandatory packed-dword swizzle.
 
-**Done when:** unpacked loads/stores go through buffer-resource views; packed
-dword path is explicitly commented as the leftover legacy exception; op_test +
-one FP8 and one MXFP4 bench spot-check are unchanged within noise.
+- [ ] **Done when:** unpacked loads/stores go through buffer-resource views; packed
+      dword path is explicitly commented as the leftover legacy exception; op_test +
+      one FP8 and one MXFP4 bench spot-check are unchanged within noise.
 
 ## Non-goals (do not pull into this plan)
 
@@ -130,3 +148,32 @@ one FP8 and one MXFP4 bench spot-check are unchanged within noise.
 - Changing GPU from the locked `HIP_VISIBLE_DEVICES=1`.
 - Mass-comment cleanup as its own commit unless a subtask’s diff is unreadable
   without it.
+
+## Follow-on (not this track): preshuffled pack, still `v_dot2`
+
+After 1–5, optionally make warp-decode **consume the same preshuffled weight
+buffer** as the MFMA MoE kernels (`mxmoe_gemm_v2` / a16w-mix `make_preshuffle_b_layout`).
+
+**Chosen mapping**
+
+- [ ] Layout of the **pack**: `fx.make_view` + `fx.make_layout` over **i32 (or byte)
+      kpack** modes (`klane`, `nlane`, K-tile, kpack, …), then `make_buffer_tensor`
+      / `fx.copy` of dword tiles — the same contract as tiled-MMA B, not a
+      `Float8`/`Float4` element grid.
+- [ ] **New lane→kpack map:** wave 64 still owns one (or `kh_per_warp`) output
+      scalar(s); each lane’s K-chunk is gathered from preshuffle slots instead of
+      a K-contiguous row (`w_row * (H//4) + k_base//4`).
+- [ ] **Compute stays `v_dot2`** (`cvt_scalef32_pk_bf16_{fp8,fp4}` + G7 drain). Do
+      not switch to `fx.gemm` / scaled MFMA in this follow-on (small-M padding is
+      still the ticket’s reason to avoid matrix cores).
+
+**Still out of scope even then**
+
+- Unpacked e4m3/e2m1 global layouts.
+- Requiring activations to be preshuffled; only **weights** need the shared B
+  layout unless a later decision says otherwise.
+
+- [ ] **Done when (follow-on):** warp-decode matches today’s numerics on the
+      preshuffled buffer the MFMA path already uses (no extra unpack staging);
+      op_test covers both the current K-contiguous path (until retired) and the
+      preshuffled path; one FP8 and one MXFP4 decode bench spot-check.
