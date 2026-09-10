@@ -20,6 +20,7 @@ from .buffer_ops import buffer_load, buffer_store, create_buffer_resource_from_a
 from .communication_ops_utils import (
     atomic_add_global_at,
     fence_system_acquire,
+    spin_until_ge_i64,
     store_i64_global_system,
 )
 from .quant_utils import emit_f32_to_e2m1, emit_f32_to_e2m3, emit_mx_e8m0_scale
@@ -1295,7 +1296,7 @@ def make_fused_a2a_kernel(
 
         if tid < npes:
             peer_slot = addr_xdb_mem + fx.Int64(tid) * 8
-            mori_shmem.uint64_wait_until_equals(peer_slot, xdb_cur_flag)
+            spin_until_ge_i64(peer_slot, xdb_cur_flag)
             fence_system_acquire()
         fx.barrier()
 
@@ -1733,7 +1734,7 @@ def make_fused_a2a_out_kernel(
 
         if tid < npes:
             peer_slot = addr_xdb_mem + fx.Int64(tid) * 8
-            mori_shmem.uint64_wait_until_equals(peer_slot, xdb_cur_flag)
+            spin_until_ge_i64(peer_slot, xdb_cur_flag)
             fence_system_acquire()
         fx.barrier()
 
