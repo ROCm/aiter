@@ -1,6 +1,7 @@
 SILOTIGER-667 -- follow-on / open TODO tracks. Ticket of record: SILOTIGER-667.md.
-The completed FP8/FP4 baseline + G9 CK comparison are done and not repeated here; every remaining
-open item is consolidated below, self-contained.
+The completed FP8/FP4 baseline, G9 CK comparison, and Full-MoE / AITER-default comparison are done
+and not repeated here. CK FP4 gate_up fast path will not be implemented (do not re-open). Every
+remaining open item is consolidated below, self-contained.
 Conventions (still in force): run tests/benches in flydsl_venv (triton 3.6) on GPU 6
 (HIP_VISIBLE_DEVICES=6) for clean cold-HBM numbers; perf only via run_perftest (IQR-trimmed device
 time) with cold-HBM rotation over disjoint expert groups; FlyDSL kernels live in
@@ -11,104 +12,15 @@ f32 scale operand -- pass scale=1 for arbitrary per-tensor/per-token scales and 
 into the f32 accumulator AFTER dot2; feed only power-of-two (e8m0) block scales through the convert's
 scale operand.
 Tracks:
-  (1) Full-MoE / AITER-default comparison.
-  (2) CK FP4 gate_up fast path (upstream CK; surfaced by the CK-vs-torch cross-check).
-  (3) FlyDSL FP8-down block2d scaled-convert fold (+ offline weight prepack / layout contract).
-  (4) Activation-input datatypes (plain FP8 + MXFP8 activations).
-  (5) Epilogue & shape generality (SiTU-GLU epilogue + short-INTER Qwen TP2/TP4).
-  (6) Portability: gfx942 FP8/FP4 path (arch-specific converts).
-  (7) Occupancy / L2-locality perf levers (open research; so-far no-win).
-  (8) Kimi-K3 faithful op (integration; depends on tracks 4 + 5).
+  (1) FlyDSL FP8-down block2d scaled-convert fold (+ offline weight prepack / layout contract).
+  (2) Activation-input datatypes (plain FP8 + MXFP8 activations).
+  (3) Epilogue & shape generality (SiTU-GLU epilogue + short-INTER Qwen TP2/TP4).
+  (4) Portability: gfx942 FP8/FP4 path (arch-specific converts).
+  (5) Occupancy / L2-locality perf levers (open research; so-far no-win).
+  (6) Kimi-K3 faithful op (integration; depends on tracks 2 + 3).
 CLOSED no-wins (do NOT re-open without a regime change -- both are launch/memory-latency-floor
 bound at decode): split-K (G5, live impl archived on samaario/warp-decode-moe-splitk-attic) and
 LDS n_waves cooperative caching (G6, closed by feasibility analysis).
-
-=== Full-MoE / AITER track (complementary to the per-stage FlyDSL-vs-CK G9 plan) ===
-This track answers "how does FlyDSL compare vs whatever AITER dispatches by default",
-at the FULL fused-MoE level (routing + gate_up + activation + down), distinct from the
-per-stage cold FlyDSL-vs-CK comparison. Anchor = the existing reference script
-/workspaces/rocm-libraries/bench/bench_moe_warp_decode.py.
-- extend bench_moe_warp_decode.py with FlyDSL paths.
-    Context: that script already does the expensive full-MoE plumbing -- builds shared
-    weights, prepacks into BOTH the AITER fused layout (shuffle_weight (16,16), w1/w2
-    concat, 128x128 block quant) and the warp-decode flat scale layout, runs
-    fused_topk + aiter.fused_moe (the DEFAULT dispatch, QuantType.per_1x128), a
-    warp_decode_ext (bartified reference) FP8/BF16 path, a torch_moe_blockscale
-    reference + correctness (cos/err), per-stage timings, GB/s, ratio, CSV. So we ADD
-    FlyDSL as another path rather than build a harness. Est ~1-2 days (mostly wrappers +
-    scale/signature reconcile + env), vs ~4-6 to build from scratch.
-    Sub-steps:
-    - Add FlyDSL path wrappers mirroring wd_bf16_moe_block / down, calling the registered
-      aiter.ops.flydsl entries. Op mapping:
-        wd_bf16 gate_up (BF16 act x FP8 w) <-> flydsl_warp_decode_gate_up (block2d).
-        down <-> flydsl_warp_decode_down_reduce (block2d).
-        FP4 gate_up/down (flydsl_..._fp4) -> NEW columns the script lacks.
-        wd_fp8 gate_up is FP8-ACTIVATION x FP8-w -> the FlyDSL peer now EXISTS
-          (flydsl_warp_decode_gate_up_fp8act, block-scaled FP8 act; see track 4); wire it in.
-    - Reconcile signatures + scale layout: FlyDSL uses w_scale_mode="block2d",
-      scale_block=(128,128), out=; verify the script's w_*_scale_wd ([E*N/128, K/128])
-      matches FlyDSL's block2d expectation; confirm router_ids i32 / router_wts f32.
-    - Reconcile the environment (MAIN RISK): the script imports a locally-built
-      warp_decode_ext in the default env; FlyDSL needs flydsl_venv (triton 3.6). Need ONE
-      env with aiter+fused_moe + warp_decode_ext + flydsl importable together.
-    - Result is a 3-(or-4-)way table: AITER default vs warp_decode_ext (ref) vs FlyDSL
-      (+ CK if later merged); reuse default-vs-default config policy + provenance/variance.
-- REVISIT: warm-ish cold semantics of bench_moe_warp_decode.py (don't forget).
-    The script builds weights once per shape and reuses them across B/iters with a fixed
-    router (fused_topk on random gating) and run_perftest's default rotation -> selected
-    experts stay MALL-resident where they fit == WARM-ish, same caveat as CK's default
-    (before "flip CK to cold"). For decode realism the weight reads should be COLD.
-    Possibly worth revisiting: apply the same treatment as the FlyDSL cold harness
-    (oversized pool + router rotation over disjoint expert groups, or a cache flush) so
-    the full-MoE numbers are cold too; at minimum, label the regime in the output.
-
-=== CK FP4 gate_up fast path track (upstream CK kernel work; surfaced by the CK-vs-torch cross-check) ===
-This track builds the missing fast packed-FP4 gate_up path in CK. It is UPSTREAM CK work
-(rocm-libraries branch users/samremes/ck/warp-decode, commit 62e30c9098), not aiter, so it
-needs a CK build + a PR to that branch -- distinct from this ticket's harness. Motivation:
-the ticket's own #1 remaining item ("FP4 gate_up ... biggest remaining ~2x decode win"), and
-the harness CK-vs-torch cross-check (tickets/667/harness/validate.py, gated by CK_WD_VALIDATE)
-could only validate gate_up_fp4 as
-INFORMATIONAL: CK's gate_up FP4 runs the SLOW packed *scalar* path (dot2/NPerWarp=2 reject
-packed FP4) whose tiled make_naive_tensor_view weight layout is swizzled -> value-set matches
-(value_set_cos ~0.99) but output positions are permuted. down_fp4_h2 already has the fast path
-and validates exactly (cos 0.999999), so it is the drop-in template.
-Est ~1.5-2 days for a correct first cut; ~3-5 days for correct + competitive (~2x), the
-tuning tail being the variable part. Anchor template = the down FP4 dot2 fast path in
-projects/composablekernel/include/ck_tile/ops/warp_decode/kernel/warp_decode_down_reduce_kernel.hpp
-(is_packed_w && kUseDot2 branches, 1-output and kHPerWarp==2/H2).
-    Sub-steps:
-    - Add a gate_up packed+dot2 branch mirroring down-H2: raw 128-bit packed loads
-      (__builtin_memcpy, NOT load_tile) so a lane owns kVector contiguous FP4 along HIDDEN;
-      fp4x2_to_bf16x2 + dot2_bf16_packed_raw_nonop into TWO accumulator sets (gate = x.wg,
-      up = x.wu) sharing one loaded activation x (the down-H2 "two rows, one shared
-      activation" structure); one dot2 drain; reuse the existing silu(gate)*up epilogue.
-      Bonus: raw-load natural ordering fixes the swizzled output layout, so the result plugs
-      straight into the CK-vs-torch validator (validate.py) as a GATED cos~0.999999 cell. Est ~1-1.5 d.
-    - Relax IsSupportedArgument (warp_decode_gate_up_kernel.hpp): currently rejects
-      NPerWarp=2 && kUseDot2 && pk_fp4_t, and the dot2 body has static_assert(!is_packed_w).
-      Carve out the new legal packed+dot2 gate_up config + add divisibility asserts
-      (HIDDEN % (warp_size*kVector), etc.). Est ~0.5 d.
-    - Wire type aliases / bench / dispatch / autotune: kVector 8/16/32 variants (8 = FP4 fast
-      lane chunk, 32 = wide single-transaction), hook into ck_bench_warp_decode.cpp and the
-      FlyDSL/AITER dispatch. Est ~0.5 d.
-    - Correctness gate ("gate on accuracy", per ticket): validate via the CK_WD_VALIDATE harness
-      (tickets/667/harness: CK_WD_VALIDATE + validate.py). Once natural-ordered, move
-      gate_up_fp4 from informational to a gated cos cell; watch silu sensitivity near 0. ~0.5 d.
-    - Perf tune to actually hit ~2x (THE VARIABLE PART): accumulator count (4 vs 8), enough
-      in-flight packed loads per wave (the H2 "double the loads" lever), possibly the
-      software-pipelined prefetch already listed for down B=1. ~1-2 d.
-    - OPTIONAL / decide up front: offline FP4 weight prepack + versioned layout contract
-      (K3 report technique; ticket notes it is cheapest to introduce alongside FP4 gate_up
-      rather than retrofit). Adds ~1-2 d + a layout-contract decision; a first fast path can
-      ship without it (like down did).
-    Cross-refs: SILOTIGER-667.md "Remaining/untried" #1 + "Datatypes targeted"
-    ("MXFP4 only on the slow scalar path so far"). The harness CK-vs-torch cross-check (validate.py)
-    already confirmed CK's FP4 DOWN path is numerically exact (cos 0.999999) while CK's gate_up FP4
-    stays on the slow scalar path -- the exact gap this track closes.
-- REVISIT: once the fast path lands, the ticket's "refreshed head-to-head with down_fp4_h2
-    (and FP4 gate_up once built)" measurement (AITER-fmoe-comparison section) becomes possible --
-    re-run the G9 compare so the gate_up|fp4 cells reflect the fast path, not the slow scalar one.
 
 === FlyDSL FP8-down block2d scaled-convert fold track (aiter kernel work; surfaced by the g9 caveat) ===
 This track attacks the FP8-down block2d(128,128) cost that the g9_compare.md header flags as a
@@ -145,15 +57,15 @@ if the independent-partials variant is also needed. Anchor = the identity-scale 
       bytes arrive in the order the packed convert + lane mapping want, and to co-locate the e8m0/
       f32 microscale with the block it covers -- removing shift/mask/shuffle from the inner loop
       entirely (superset of the in-kernel convert-fold above). Needs a DECLARED, VERSIONED prepack
-      layout contract (not the implicit expert-major weight-tensor assumption). Cheapest to introduce
-      alongside the FP4 gate_up prepack (track 2's OPTIONAL bullet) rather than retrofit; applies to
-      both the FlyDSL and CK paths. Est ~1-2 d + a layout-contract decision.
+      layout contract (not the implicit expert-major weight-tensor assumption). Do this on the
+      FlyDSL path; do not wait on a CK FP4 gate_up prepack (that track will not be implemented).
+      Est ~1-2 d + a layout-contract decision.
     Cross-refs: g9_compare.md config-policy header ("FP8-down ratio is a CK-favored lower bound:
     block2d(128,128) costs FlyDSL ~10-38% vs pertensor (B1)"); SILOTIGER-667.md comment "Notes from
     the publicly released K3 technical report" (offline weight permutation + push dequant into the
-    packed scaled-convert -- "the difference between a regression and a win"); track 2 OPTIONAL
-    prepack bullet. (The ~10-38% down block2d-vs-pertensor cost was an A/B measurement at iters=1000,
-    worst at minimax B=1; gate_up was neutral.)
+    packed scaled-convert -- "the difference between a regression and a win"). (The ~10-38% down
+    block2d-vs-pertensor cost was an A/B measurement at iters=1000, worst at minimax B=1; gate_up
+    was neutral.)
 
 === Activation-input datatypes track: plain FP8 + MXFP8 activations (aiter kernel work) ===
 This track fills the remaining ACTIVATION-side datatype targets. The ticket's "Datatypes targeted"
@@ -166,7 +78,7 @@ dot2). That is the scaffold; two variants remain:
       gate_up, so callers pass bf16 x and the kernel quantizes on the way in.
   (b) MXFP8 (block-scaled) activation -- e8m0 microscale on x, the activation-side mirror of the
       MXFP4 weight path (power-of-two -> applied IN the convert, exact). Distinct from (a); required
-      for a faithful Kimi-K3 (track 8).
+      for a faithful Kimi-K3 (track 6).
 Est ~1 d for (a), ~1-1.5 d for (b).
     Sub-steps:
     - (a) Add a per-tensor/per-token x_scale path to gate_up (fold after dot2, scale=1 in the
@@ -199,7 +111,7 @@ separately; only bundled here for TODO tidiness.
       tile; handle the sub-wave butterfly reduce; wire Qwen TP2/TP4 presets. Est ~1-2 d.
     - Coverage: flip the coverage-matrix Qwen TP2/TP4 rows from unsupported to covered once (b) lands.
     Cross-refs: SILOTIGER-667.md "Tuning knobs" (kLanesPerOutput = short-INTER subgroup) and the
-    reference shapes (Qwen3Next TP1/2/4, INTER 512/256/128); K3 hidden_act == "situ" (track 8).
+    reference shapes (Qwen3Next TP1/2/4, INTER 512/256/128); K3 hidden_act == "situ" (track 6).
 
 === Portability track: gfx942 FP8/FP4 path (aiter kernel work; G4 tail) ===
 The BF16 path already ships a gfx942 fallback: use_dot2=False scalar-f32 (dot2_f32_bf16_scalar +
@@ -248,7 +160,7 @@ LIKELY no-wins too. Kept for provenance; pursue only if a regime with real cross
     for the sibling GEMM-decode kernels). G5 split-K live impl archived on
     samaario/warp-decode-moe-splitk-attic (see the CLOSED no-wins note in the header).
 
-=== Kimi-K3 faithful op track (integration; DEPENDS on tracks 4 + 5) ===
+=== Kimi-K3 faithful op track (integration; DEPENDS on tracks 2 + 3) ===
 Bench/tune target (suggested by a colleague). K3 is a LATENT MoE: the 7168 hidden is projected to a
 3584-wide latent and the routed experts run ON the latent, so the warp-decode routed-expert GEMM uses
 HIDDEN(contract) = 3584 (NOT 7168), INTER = 3072, E = 896, TOPK = 16, MXFP4 weights + MXFP8
@@ -256,14 +168,14 @@ activations, hidden_act == "situ" (SiTU-GLU). Public dims from arXiv 2607.24653 
 (first in-repo record of these dims; no kimi/k3 preset exists yet). PREREQS ALREADY DONE: MXFP4
 weights (landed); E=896 addressing (a K3 Tier-2 per-expert i64 base -- E=896 repro cos 0.999999);
 dims divisible for the current kernels (gate_up 3584 % 512 == 0 -> kv8; down 3072 % 1024 == 0 ->
-kv16, H2 ok). REMAINING PREREQS: MXFP8 activation (track 4b) + SiTU-GLU epilogue (track 5a).
+kv16, H2 ok). REMAINING PREREQS: MXFP8 activation (track 2b) + SiTU-GLU epilogue (track 3a).
     Sub-steps:
     - Add a Kimi-K3 shape preset (H_contract=3584, I=3072, E=896, TOPK=16).
-    - Wire MXFP8 act (track 4) + SiTU-GLU (track 5) into a K3 gate_up/down config; correctness vs a
+    - Wire MXFP8 act (track 2) + SiTU-GLU (track 3) into a K3 gate_up/down config; correctness vs a
       torch ref at E=896 (cos gate).
     - Cold-HBM bench/tune at K3 dims x B; feed into the G9 CK compare IF a CK K3 peer is built.
     - The 2 SHARED experts run dense on the full 7168 -- OUT OF SCOPE for the routed warp-decode path.
     - Verify against the SHIPPED K3 weights before publishing any numbers.
     Cross-refs: SILOTIGER-667.md comment "Notes from the publicly released K3 technical report"
-    (design corroboration + the lane-teams / offline-permutation techniques); tracks 4 (MXFP8) +
-    5 (SiTU-GLU) here.
+    (design corroboration + the lane-teams / offline-permutation techniques); tracks 2 (MXFP8) +
+    3 (SiTU-GLU) here.
