@@ -65,10 +65,31 @@ namespace aiter {
 #endif
 
 
-    // Float index of the 4-float run holding hi(K0 .. K0+7); the matching lo run is +8.
-    // Valid for any K0 that is a multiple of 8 -- every consumer's fragment start is.
+    // ---- packed BF16 fn layout (w_preshuffle_bf16) ----
+    // fn is stored block-interleaved: one block of mhc_fn_kb consecutive k elements
+    // occupies mhc_fn_kb floats, hi in the first half, lo in the second. A lane's fn
+    // fragment must therefore cover a WHOLE block, i.e.
+    //     vec_tile = tile_k / (warp_size / mfma_m)  >=  mhc_fn_kb.
+    //
+    // The block size is per-arch because that inequality binds differently per wave:
+    //   wave32 (gfx1250): vec_tile = tile_k/2 = 16 at tile_k=32, and its WMMA path
+    //     consumes a whole 16-float block as two verbatim fragments -- keep kb=16.
+    //   wave64 (gfx9):    vec_tile = tile_k/4 =  8 at tile_k=32. kb=16 would not fit,
+    //     which is what forced tile_k>=64 (and, before that, read the lo half past the
+    //     end of the register tile). kb=8 makes tile_k=32 legal again.
+    // Packer and consumer are compiled for the same arch, so they always agree.
+#if defined(__gfx1250__)
+    static constexpr int mhc_fn_kb = 16;
+#else
+    static constexpr int mhc_fn_kb = 8;
+#endif
+    static constexpr int mhc_fn_lo_off = mhc_fn_kb / 2;  // floats from hi run to lo run
+
+    // Float index of the 4-float run holding hi(K0 .. K0+7); the matching lo run is
+    // mhc_fn_lo_off floats later. Valid for any K0 that is a multiple of 8 -- every
+    // consumer's fragment start is. Device-side only (the constant is arch-dependent).
     __host__ __device__ constexpr inline int mhc_fn_hi_float(int K0) {
-        return (K0 / 16) * 16 + (K0 % 16) / 2;
+        return (K0 / mhc_fn_kb) * mhc_fn_kb + (K0 % mhc_fn_kb) / 2;
     }
 
     // ---- pre-shuffled residual layout (res_preshuffle) ----
@@ -148,9 +169,10 @@ namespace aiter {
         uint16_t* out16 = reinterpret_cast<uint16_t*>(fn_packed);
         const int64_t n_row = i / hc_hidden_size;
         const int64_t k = i % hc_hidden_size;
-        const int64_t base = n_row * (2 * (int64_t)hc_hidden_size) + (k / 16) * 32 + (k % 16);
-        out16[base]      = (uint16_t)hi_bits;
-        out16[base + 16] = (uint16_t)lo_bits;
+        const int64_t base = n_row * (2 * (int64_t)hc_hidden_size)
+                           + (k / mhc_fn_kb) * (2 * mhc_fn_kb) + (k % mhc_fn_kb);
+        out16[base]              = (uint16_t)hi_bits;
+        out16[base + mhc_fn_kb]  = (uint16_t)lo_bits;
     }
 
     // The packed hi/lo are encoded as bf16 -- the activation/MFMA element type the gemm
@@ -579,8 +601,8 @@ namespace aiter {
         // K_wanted = c*32 + (lane/mfma_n)*8 + e, exactly the K that x's v_a[c*8+e] holds,
         // so mfma_f32_16x16x32_bf16(fn, x_chunk) contracts the matching 32 K.
         static constexpr int n_chunks_bf16 = vec_tile / 8;
-        static_assert(!mhc_bf16_mma_avail || vec_tile % 8 == 0,
-                      "bf16 path needs vec_tile a multiple of 8");
+        static_assert(!mhc_bf16_mma_avail || vec_tile % mhc_fn_kb == 0,
+                      "bf16 path needs vec_tile a multiple of mhc_fn_kb");
 #if MHC_BF16_MFMA   // wave64 CDNA bf16 MFMA (gfx942 chained-K16 / gfx950 native K32)
         // Block-interleaved fn: this chunk's 8 logical K are consecutive from
         // K0 = 8*(c*mfma_k + lane/mfma_n), so hi(K0..K0+7) occupies the 4 consecutive
@@ -602,7 +624,7 @@ namespace aiter {
                     #pragma unroll
                     for (int t = 0; t < 4; t++) {
                         hi_raw[n][t] = *(s_fn_rd_ptr + fn_row * tile_k + ((hi_f + t) ^ mask));
-                        lo_raw[n][t] = *(s_fn_rd_ptr + fn_row * tile_k + ((hi_f + 8 + t) ^ mask));
+                        lo_raw[n][t] = *(s_fn_rd_ptr + fn_row * tile_k + ((hi_f + mhc_fn_lo_off + t) ^ mask));
                     }
                 } else {
                     // fn_vec_size == 4 pairs with fn_xor_shift == 2, so the mask's low two
@@ -610,7 +632,7 @@ namespace aiter {
                     *reinterpret_cast<fp32x4_t*>(hi_raw[n]) = *(reinterpret_cast<fp32x4_t*>(
                         s_fn_rd_ptr + fn_row * tile_k + (hi_f ^ mask)));
                     *reinterpret_cast<fp32x4_t*>(lo_raw[n]) = *(reinterpret_cast<fp32x4_t*>(
-                        s_fn_rd_ptr + fn_row * tile_k + ((hi_f + 8) ^ mask)));
+                        s_fn_rd_ptr + fn_row * tile_k + ((hi_f + mhc_fn_lo_off) ^ mask)));
                 }
             }
         };
@@ -672,8 +694,8 @@ namespace aiter {
         // position, so x_bf[c][i] = v_a[c*16+i]; fn is read at kk=c*16+i with the same
         // wave32 K_wanted the fp32 path uses, so fn_frag[i] and x_frag[i] share K.
         static constexpr int n_chunks_bf16_w32 = vec_tile / 16;
-        static_assert(!mhc_bf16_mma_avail || vec_tile % 16 == 0,
-                      "wave32 bf16 needs vec_tile a multiple of 16");
+        static_assert(!mhc_bf16_mma_avail || vec_tile % mhc_fn_kb == 0,
+                      "wave32 bf16 needs vec_tile a multiple of mhc_fn_kb");
         // Block-interleaved fn. The 16 logical K of one wave32 fragment are TWO runs of 8:
         //   run r (r=0,1):  K0 = k_group*8 + 32*c + 16*r
         // (x_vec_size=8, interleave_size=2). Each run's hi is 4 consecutive floats at
@@ -702,14 +724,14 @@ namespace aiter {
                                 s_fn_rd_ptr + fn_row * tile_k + (hi_f ^ mask));
                         *reinterpret_cast<f32x4_*>(lo_raw[n] + r * 4) =
                             *reinterpret_cast<const f32x4_*>(
-                                s_fn_rd_ptr + fn_row * tile_k + ((hi_f + 8) ^ mask));
+                                s_fn_rd_ptr + fn_row * tile_k + ((hi_f + mhc_fn_lo_off) ^ mask));
                     } else {
                         #pragma unroll
                         for (int t = 0; t < 4; t++) {
                             hi_raw[n][r * 4 + t] =
                                 *(s_fn_rd_ptr + fn_row * tile_k + ((hi_f + t) ^ mask));
                             lo_raw[n][r * 4 + t] =
-                                *(s_fn_rd_ptr + fn_row * tile_k + ((hi_f + 8 + t) ^ mask));
+                                *(s_fn_rd_ptr + fn_row * tile_k + ((hi_f + mhc_fn_lo_off + t) ^ mask));
                         }
                     }
                 }
@@ -2633,6 +2655,12 @@ namespace aiter {
         static constexpr int m_repeat = tile_m / mfma_m;
         static constexpr int band_mk = mfma_m * tile_k;
         static constexpr int vec_tile = tile_k / (warp_size / mfma_m);
+        // The packed-BF16 fn fragment must cover a whole interleave block; this is the
+        // guard the fused gemm was missing, and its absence read the lo half past the
+        // end of the register tile (silently: next_residual stayed correct while
+        // post/comb/layer_input went to NaN).
+        static_assert(!(w_preshuffle_bf16 && mhc_bf16_mma_avail) || vec_tile % mhc_fn_kb == 0,
+                      "packed BF16 fn needs vec_tile a multiple of mhc_fn_kb");
         static constexpr int repeat_n = tile_n / mfma_n;
         static constexpr int mma_pack_size = warp_size == 64 ? 1 : 2;
         using fp32xtile = opus::vector_t<float, vec_tile>;
@@ -3122,14 +3150,16 @@ namespace aiter {
                         for(int n = 0; n < repeat_n; n++) {
                             opus::vector_t<opus::bf16_t, ds_read_vec> fn_hi8, fn_lo8;
                             {
-                                // Fragment is 8 bf16 = 4 floats; block j/2 is [8 f32 hi][8 f32 lo]
-                                // and the wanted half sits at (j%2)*4 inside each.
+                                // Fragment is 8 bf16 = 4 floats of hi plus 4 of lo.
+                                // mhc_fn_hi_float locates the hi run for this j inside
+                                // the lane's window; the lo run is mhc_fn_lo_off later.
+                                // (At kb=16 that is the old (j/2)*16 + (j%2)*4.)
                                 using f32x4 = opus::vector_t<float, 4>;
-                                const int off = (j / 2) * 16 + (j % 2) * 4;
+                                const int off = mhc_fn_hi_float(j * ds_read_vec);
                                 f32x4 hi_raw, lo_raw;
                                 for (int e = 0; e < 4; e++) {
                                     hi_raw[e] = v_fn[n][off + e];
-                                    lo_raw[e] = v_fn[n][off + 8 + e];
+                                    lo_raw[e] = v_fn[n][off + mhc_fn_lo_off + e];
                                 }
                                 fn_hi8 = __builtin_bit_cast(opus::vector_t<opus::bf16_t, 8>, hi_raw);
                                 fn_lo8 = __builtin_bit_cast(opus::vector_t<opus::bf16_t, 8>, lo_raw);
@@ -3171,11 +3201,11 @@ namespace aiter {
                                     // sub-register extract/insert -- the very shift+mask this
                                     // layout exists to remove.
                                     using f32x8 = opus::vector_t<float, 8>;
-                                    const int off = ((j - 1) * ds_read_vec / 16) * 16;
+                                    const int off = mhc_fn_hi_float((j - 1) * ds_read_vec);
                                     f32x8 hi_raw, lo_raw;
                                     for (int e = 0; e < 8; e++) {
                                         hi_raw[e] = v_fn[n][off + e];
-                                        lo_raw[e] = v_fn[n][off + 8 + e];
+                                        lo_raw[e] = v_fn[n][off + mhc_fn_lo_off + e];
                                     }
                                     fn_hi = __builtin_bit_cast(opus::vector_t<opus::bf16_t, 16>, hi_raw);
                                     fn_lo = __builtin_bit_cast(opus::vector_t<opus::bf16_t, 16>, lo_raw);
