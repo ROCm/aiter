@@ -23,6 +23,9 @@ def _require_gfx950_flydsl():
 
 
 def _make_case(num_tokens, num_pages=4096, seed=1234):
+    # `device="cpu"` is load-bearing, not redundant: a CPU generator against
+    # the ambient default device raises, and importing any sibling test in
+    # this directory sets that default to cuda for the whole session.
     generator = torch.Generator(device="cpu").manual_seed(seed)
     q = torch.randn(
         num_tokens,
@@ -30,16 +33,18 @@ def _make_case(num_tokens, num_pages=4096, seed=1234):
         _HEAD_DIM,
         generator=generator,
         dtype=torch.float32,
+        device="cpu",
     ).to(torch.float8_e4m3fn)
-    kv = torch.randn(num_pages, _HEAD_DIM, generator=generator, dtype=torch.float32).to(
-        torch.float8_e4m3fn
-    )
+    kv = torch.randn(
+        num_pages, _HEAD_DIM, generator=generator, dtype=torch.float32, device="cpu"
+    ).to(torch.float8_e4m3fn)
     indices = torch.randint(
         0,
         num_pages,
         (num_tokens, _TOPK),
         generator=generator,
         dtype=torch.int32,
+        device="cpu",
     )
     indices[:, -64:] = -1
     q = q.cuda()
@@ -205,3 +210,47 @@ def test_flydsl_sparse_mla_prefill_masks_out_of_range_rows(bad_row: int):
     expected = flydsl_sparse_mla_prefill(q_nope, q_rope, kv, sentinel, _SOFTMAX_SCALE)
     torch.cuda.synchronize()
     assert torch.equal(actual, expected)
+
+
+def test_flydsl_sparse_mla_prefill_accepts_an_empty_chunk():
+    """A chunked-prefill scheduler can hand over zero tokens."""
+    _require_gfx950_flydsl()
+    from aiter.ops.flydsl import flydsl_sparse_mla_prefill
+
+    q_nope, q_rope, kv, indices = _make_case(0)
+    out = flydsl_sparse_mla_prefill(q_nope, q_rope, kv, indices, _SOFTMAX_SCALE)
+    torch.cuda.synchronize()
+    assert out.shape == (0, _NUM_HEADS, _V_HEAD_DIM)
+    assert out.dtype == torch.bfloat16
+
+    # `out=` is still shape-checked, and the caller's own buffer comes back.
+    own = torch.empty(0, _NUM_HEADS, _V_HEAD_DIM, dtype=torch.bfloat16, device="cuda")
+    assert (
+        flydsl_sparse_mla_prefill(q_nope, q_rope, kv, indices, _SOFTMAX_SCALE, out=own)
+        is own
+    )
+    with pytest.raises(ValueError, match="out must have shape"):
+        flydsl_sparse_mla_prefill(
+            q_nope,
+            q_rope,
+            kv,
+            indices,
+            _SOFTMAX_SCALE,
+            out=torch.empty(0, 8, _V_HEAD_DIM, dtype=torch.bfloat16, device="cuda"),
+        )
+
+
+def test_flydsl_sparse_mla_prefill_rejects_an_empty_kv_pool():
+    """A zero-row pool leaves the buffer descriptor with a null base.
+
+    Every index into it is out of range, so there is nothing to attend to --
+    but the kernel faults the queue instead of returning the masked answer,
+    which takes the process down rather than raising.
+    """
+    _require_gfx950_flydsl()
+    from aiter.ops.flydsl import flydsl_sparse_mla_prefill
+
+    q_nope, q_rope, _, indices = _make_case(4)
+    empty = torch.empty(0, _HEAD_DIM, dtype=torch.float8_e4m3fn, device="cuda")
+    with pytest.raises(ValueError, match="at least one row"):
+        flydsl_sparse_mla_prefill(q_nope, q_rope, empty, indices, _SOFTMAX_SCALE)
