@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""gfx1250 one-block radix TopK with one block per input row.
+"""Wave32/wave64 radix TopK with one block per input row.
 
 Short rows cache ordered keys in LDS. Long rows compact the selected radix
 bucket; stable modes preserve index ordering and tie-breaking.
@@ -17,7 +17,6 @@ from flydsl.expr import const_expr, gpu, range_constexpr
 from .kernels_common import atomic_add_i32
 from .topk_per_row_decode import _load_f32x4, _warp_inclusive_prefix_i32
 
-_WAVE_SIZE = 32
 _VEC = 4
 _LOAD_UNROLL = 4
 _PASS1_HISTOGRAM_REPLICAS = 2
@@ -69,26 +68,31 @@ def _build_bitonic_schedule(capacity: int) -> tuple[tuple[int, ...], ...]:
 
 
 @cache
-def build_radix_topk_one_block_gfx1250_module(
+def build_radix_topk_one_block_module(
     k: int,
     block_threads: int = 1024,
     write_values: bool = False,
     stable: bool = False,
     short_rows: bool = False,
     is_decode: bool = False,
+    *,
+    wave_size: int,
 ):
     """Build a prefill/decode kernel specialized for the row-length bounds.
 
     short_rows requires every effective row length <= 4096.
+    wave_size must match the target architecture and is part of the cache key.
     """
     if k <= 0:
         raise ValueError("k must be positive")
-    if block_threads not in (256, 1024):
-        raise ValueError("block_threads must be 256 or 1024")
+    if block_threads not in (256, 512, 1024):
+        raise ValueError("block_threads must be 256, 512 or 1024")
+    if wave_size not in (32, 64):
+        raise ValueError("wave_size must be 32 or 64")
     if block_threads * _VEC > _PACKED_COUNT_MASK:
         raise ValueError("one scan tile exceeds the packed count range")
 
-    num_waves = block_threads // _WAVE_SIZE
+    num_waves = block_threads // wave_size
     high_bins_per_thread = _HIGH_BUCKETS // block_threads
     later_bins_per_thread = _LATER_BUCKETS // block_threads
     short_bins_per_thread = _SHORT_HIGH_BUCKETS // block_threads
@@ -151,13 +155,13 @@ def build_radix_topk_one_block_gfx1250_module(
 
     @flyc.kernel(
         name=(
-            f"radix_topk_one_block_gfx1250_{'decode' if is_decode else 'prefill'}"
-            f"_{row_variant}_k{k}_b{block_threads}"
+            f"radix_topk_one_block_{'decode' if is_decode else 'prefill'}"
+            f"_{row_variant}_k{k}_b{block_threads}_w{wave_size}"
             f"_v{int(write_values)}_s{int(stable)}"
         ),
         known_block_size=[block_threads, 1, 1],
     )
-    def radix_topk_one_block_gfx1250_kernel(
+    def radix_topk_one_block_kernel(
         input: fx.Tensor,
         row_starts: fx.Tensor,
         row_ends: fx.Tensor,
@@ -168,8 +172,8 @@ def build_radix_topk_one_block_gfx1250_module(
     ):
         row = fx.Int32(fx.block_idx.x)
         tid = fx.thread_idx.x
-        lane = tid % _WAVE_SIZE
-        wave = tid // _WAVE_SIZE
+        lane = tid % wave_size
+        wave = tid // wave_size
 
         zero = fx.Int32(0)
         one = fx.Int32(1)
@@ -355,11 +359,9 @@ def build_radix_topk_one_block_gfx1250_module(
             gpu.barrier()
 
         def block_excl_prefix_i32(packed_local, scan):
-            packed_inclusive = _warp_inclusive_prefix_i32(
-                packed_local, lane, _WAVE_SIZE
-            )
+            packed_inclusive = _warp_inclusive_prefix_i32(packed_local, lane, wave_size)
             packed_exclusive = packed_inclusive - packed_local
-            if lane == _WAVE_SIZE - 1:
+            if lane == wave_size - 1:
                 scan[wave] = packed_inclusive
             gpu.barrier()
 
@@ -367,7 +369,7 @@ def build_radix_topk_one_block_gfx1250_module(
                 wave_val = zero
                 if lane < num_waves:
                     wave_val = scan[lane]
-                wave_inclusive = _warp_inclusive_prefix_i32(wave_val, lane, _WAVE_SIZE)
+                wave_inclusive = _warp_inclusive_prefix_i32(wave_val, lane, wave_size)
                 wave_exclusive = wave_inclusive - wave_val
                 if lane < num_waves:
                     scan[lane] = wave_exclusive
@@ -400,10 +402,10 @@ def build_radix_topk_one_block_gfx1250_module(
                     count = count + replicas[replica][first_bin + item]
                 counts[item] = count
                 local_total = local_total + count
-            wave_inclusive = _warp_inclusive_prefix_i32(local_total, lane, _WAVE_SIZE)
+            wave_inclusive = _warp_inclusive_prefix_i32(local_total, lane, wave_size)
             wave_exclusive = wave_inclusive - local_total
 
-            if lane == _WAVE_SIZE - 1:
+            if lane == wave_size - 1:
                 scan[wave] = wave_inclusive
             gpu.barrier()
 
@@ -412,8 +414,7 @@ def build_radix_topk_one_block_gfx1250_module(
                 safe_lane = active.select(lane, zero)
                 wave_total = active.select(scan[safe_lane], zero)
                 wave_prefix = (
-                    _warp_inclusive_prefix_i32(wave_total, lane, _WAVE_SIZE)
-                    - wave_total
+                    _warp_inclusive_prefix_i32(wave_total, lane, wave_size) - wave_total
                 )
                 if active:
                     scan[lane + num_waves] = wave_prefix
@@ -585,7 +586,7 @@ def build_radix_topk_one_block_gfx1250_module(
                 stride = stable_sort_strides[stage]
                 # Keep wave-local compare/exchanges in registers. Only a
                 # cross-wave partner needs LDS and workgroup synchronization.
-                if const_expr(stride >= _WAVE_SIZE):
+                if const_expr(stride >= wave_size):
                     for item in range_constexpr(stable_sort_items_per_thread):
                         pos = tid + item * block_threads
                         if pos < fx.Int32(stable_sort_capacity):
@@ -600,11 +601,11 @@ def build_radix_topk_one_block_gfx1250_module(
                     left_value = local_values[item]
                     right = fx.Int32(2147483647)
                     right_value = zero
-                    if const_expr(stride < _WAVE_SIZE):
-                        right = left.shuffle_xor(fx.Int32(stride), fx.Int32(_WAVE_SIZE))
+                    if const_expr(stride < wave_size):
+                        right = left.shuffle_xor(fx.Int32(stride), fx.Int32(wave_size))
                         if const_expr(write_values):
                             right_value = left_value.shuffle_xor(
-                                fx.Int32(stride), fx.Int32(_WAVE_SIZE)
+                                fx.Int32(stride), fx.Int32(wave_size)
                             )
                     else:
                         if pos < fx.Int32(stable_sort_capacity):
@@ -620,7 +621,7 @@ def build_radix_topk_one_block_gfx1250_module(
                     if const_expr(write_values):
                         local_values[item] = swap.select(right_value, left_value)
 
-                if const_expr(stride >= _WAVE_SIZE):
+                if const_expr(stride >= wave_size):
                     # Finish every LDS read before another wave can overwrite it.
                     gpu.barrier()
 
@@ -924,7 +925,7 @@ def build_radix_topk_one_block_gfx1250_module(
                 short_bins_per_thread,
                 scan,
                 metadata,
-                replicas=histograms[1:] if block_threads == 1024 else (),
+                replicas=histograms[1:] if block_threads != 256 else (),
             )
 
             remaining_k = top_k - metadata[_FIRST_ABOVE]
@@ -1350,7 +1351,7 @@ def build_radix_topk_one_block_gfx1250_module(
                     )
 
     @flyc.jit
-    def launch_radix_topk_one_block_gfx1250(
+    def launch_radix_topk_one_block(
         input: fx.Tensor,
         row_starts: fx.Tensor,
         row_ends: fx.Tensor,
@@ -1361,8 +1362,8 @@ def build_radix_topk_one_block_gfx1250_module(
         rows_m: fx.Int32,
         stream: fx.Stream,
     ):
-        radix_topk_one_block_gfx1250_kernel(
+        radix_topk_one_block_kernel(
             input, row_starts, row_ends, indices, values, width, next_n
         ).launch(grid=(rows_m, 1, 1), block=(block_threads, 1, 1), stream=stream)
 
-    return launch_radix_topk_one_block_gfx1250
+    return launch_radix_topk_one_block

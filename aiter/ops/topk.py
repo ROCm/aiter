@@ -402,16 +402,16 @@ def top_k_per_row_prefill(
     When stable=True, the one-block path is forced with deterministic,
     ascending-index ordered, smallest-index tie-breaking emit so every
     tensor-parallel rank selects and orders an identical KV set; the caller sizes
-    the workspace for the ob path in that case. On gfx1250, calls that would use
-    the HIP one-block path are dispatched to the FlyDSL one-block kernel unless
-    AITER_DISABLE_FLYDSL_TOPK_PREFILL is enabled."""
+    the workspace for the ob path in that case. On gfx942, gfx950 and gfx1250,
+    calls that would use the HIP one-block path are dispatched to the FlyDSL
+    one-block kernel unless AITER_DISABLE_FLYDSL_TOPK_PREFILL is enabled."""
     use_mulblocks = not stable and topk_use_mulblocks(numRows, stride0)
     if (
         not _FLYDSL_TOPK_PREFILL_DISABLED
-        and get_gfx() == "gfx1250"
+        and get_gfx() in ("gfx942", "gfx950", "gfx1250")
         and not use_mulblocks
     ):
-        return flydsl_radix_topk_one_block_gfx1250_prefill(
+        return flydsl_radix_topk_one_block_prefill(
             logits,
             rowStarts,
             rowEnds,
@@ -445,7 +445,7 @@ def top_k_per_row_prefill(
     )
 
 
-def flydsl_radix_topk_one_block_gfx1250_prefill(
+def flydsl_radix_topk_one_block_prefill(
     logits: torch.Tensor,
     rowStarts: torch.Tensor,
     rowEnds: torch.Tensor,
@@ -457,9 +457,9 @@ def flydsl_radix_topk_one_block_gfx1250_prefill(
     k: int = 2048,
     stable: bool = False,
 ) -> None:
-    """Use the FlyDSL gfx1250 one-block radix TopK kernel for prefill."""
-    from .flydsl.radix_topk_one_block_gfx1250 import (
-        radix_topk_one_block_gfx1250 as _impl,
+    """Use the FlyDSL one-block radix TopK kernel for prefill."""
+    from .flydsl.radix_topk_one_block import (
+        radix_topk_one_block as _impl,
     )
 
     return _impl(
@@ -476,7 +476,7 @@ def flydsl_radix_topk_one_block_gfx1250_prefill(
     )
 
 
-def flydsl_radix_topk_one_block_gfx1250_decode(
+def flydsl_radix_topk_one_block_decode(
     logits: torch.Tensor,
     next_n: int,
     seqLens: torch.Tensor,
@@ -488,9 +488,9 @@ def flydsl_radix_topk_one_block_gfx1250_decode(
     stable: bool = False,
     values: torch.Tensor | None = None,
 ) -> None:
-    """Use the FlyDSL gfx1250 one-block radix TopK kernel for decode."""
-    from .flydsl.radix_topk_one_block_gfx1250 import (
-        radix_topk_one_block_gfx1250 as _impl,
+    """Use the FlyDSL one-block radix TopK kernel for decode."""
+    from .flydsl.radix_topk_one_block import (
+        radix_topk_one_block as _impl,
     )
 
     return _impl(

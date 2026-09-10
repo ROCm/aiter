@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""FlyDSL gfx1250 one-block radix TopK interface."""
+"""FlyDSL one-block radix TopK interface for gfx942, gfx950 and gfx1250."""
 
 from functools import lru_cache
 
@@ -9,14 +9,15 @@ import torch
 
 from aiter.jit.utils.chip_info import get_gfx
 
-from .kernels.radix_topk_one_block_gfx1250 import (
+from .kernels.kernels_common import get_warp_size
+from .kernels.radix_topk_one_block import (
     _COMPACT_CAPACITY,
-    build_radix_topk_one_block_gfx1250_module,
+    build_radix_topk_one_block_module,
 )
 from .kernels.tensor_shim import _run_compiled
 
 _MAX_BUFFER_ROW_ELEMENTS = ((1 << 32) - 1) // torch.float32.itemsize
-_SUPPORTED_ARCHES = ("gfx1250",)
+_SUPPORTED_ARCHES = ("gfx942", "gfx950", "gfx1250")
 # The measured short-row crossover on gfx1250 is between 256 and 512 rows.
 _SHORT_ROWS_1024_THREAD_MAX_ROWS = 256
 
@@ -170,7 +171,7 @@ def _is_call_supported(
     return True
 
 
-def is_radix_topk_one_block_gfx1250_supported(
+def is_radix_topk_one_block_supported(
     logits: torch.Tensor,
     row_starts: torch.Tensor,
     row_ends: torch.Tensor,
@@ -181,7 +182,7 @@ def is_radix_topk_one_block_gfx1250_supported(
     k: int,
     values: torch.Tensor | None = None,
 ) -> bool:
-    """Return whether the call can use the gfx1250 one-block kernel."""
+    """Return whether the call can use the one-block radix kernel."""
     return _is_call_supported(
         _tensor_signature(logits),
         _tensor_signature(row_starts),
@@ -195,7 +196,7 @@ def is_radix_topk_one_block_gfx1250_supported(
     )
 
 
-def radix_topk_one_block_gfx1250(
+def radix_topk_one_block(
     logits: torch.Tensor,
     row_starts: torch.Tensor | None,
     row_ends: torch.Tensor,
@@ -242,8 +243,11 @@ def radix_topk_one_block_gfx1250(
         )
         kernel_row_starts = row_starts
 
-    if get_gfx() not in _SUPPORTED_ARCHES:
-        raise ValueError("FlyDSL one-block radix TopK currently supports gfx1250 only")
+    arch = get_gfx()
+    if arch not in _SUPPORTED_ARCHES:
+        raise ValueError(
+            "FlyDSL one-block radix TopK supports gfx942, gfx950 and gfx1250"
+        )
     if num_rows == 0:
         return
 
@@ -253,13 +257,14 @@ def radix_topk_one_block_gfx1250(
         1024 if not short_rows or num_rows <= _SHORT_ROWS_1024_THREAD_MAX_ROWS else 256
     )
     stream = torch.cuda.current_stream(logits.device)
-    launcher = build_radix_topk_one_block_gfx1250_module(
+    launcher = build_radix_topk_one_block_module(
         k,
         block_threads=block_threads,
         write_values=values is not None,
         stable=stable,
         short_rows=short_rows,
         is_decode=is_decode,
+        wave_size=get_warp_size(arch),
     )
     _run_compiled(
         launcher,
