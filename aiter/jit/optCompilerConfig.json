@@ -1418,7 +1418,8 @@
         "extra_include": [],
         "verbose": "False",
         "blob_gen_cmd": [
-            "f'{AITER_META_DIR}/hsa/codegen.py -m fmha_v3_fwd --output_dir {{}}'"
+            "f'{AITER_META_DIR}/hsa/codegen.py -m fmha_v3_fwd --output_dir {{}}'",
+            "f'{AITER_META_DIR}/hsa/codegen.py -m fmha_hd192_split --output_dir {{}}'"
         ]
     },
     "module_fmha_v4_fwd": {

@@ -361,4 +361,7 @@ __attribute__((visibility("default"))) float mha_fwd(mha_fwd_args args,
                                                      const ck_tile::stream_config& s);
 
 float fmha_fwd_v3(mha_fwd_args a, const ck_tile::stream_config& s);
+float fmha_fwd_v3_split(mha_fwd_args a,
+                        int num_splits,
+                        const ck_tile::stream_config& s);
 } // namespace aiter

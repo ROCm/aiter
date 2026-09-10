@@ -3,12 +3,112 @@
 
 #include <torch/all.h>
 #include <ATen/hip/HIPContext.h>
+#include <hip/hip_bfloat16.h>
 #include "mha_common.h"
 
 #include "mha_fwd.h"
+#include <cstdlib>
+#include <cstring>
 
 namespace aiter {
 namespace torch_itfs {
+namespace {
+
+constexpr int kSplitCount = 3;
+constexpr int kValueDim = 128;
+constexpr int kCombineBlock = 256;
+constexpr int kWaveSize = 64;
+constexpr int kRowsPerBlock = kCombineBlock / kWaveSize;
+
+__global__ __launch_bounds__(kCombineBlock) void fmha_hd192_split3_combine(
+    const __hip_bfloat16* __restrict__ o_parts,
+    const float* __restrict__ lse_parts,
+    __hip_bfloat16* __restrict__ out,
+    float* __restrict__ lse_out,
+    int seqlen_q,
+    int num_heads,
+    int64_t out_token_stride,
+    int64_t out_head_stride)
+{
+    const int lane = threadIdx.x & (kWaveSize - 1);
+    const int wave = threadIdx.x / kWaveSize;
+    const int row = blockIdx.x * kRowsPerBlock + wave;
+    const int row_count = seqlen_q * num_heads;
+    if(row >= row_count)
+        return;
+
+    const int token = row / num_heads;
+    const int head = row - token * num_heads;
+    const int64_t lse_plane = static_cast<int64_t>(num_heads) * seqlen_q;
+    const int64_t lse_index = static_cast<int64_t>(head) * seqlen_q + token;
+
+    float weight0 = 0.0f;
+    float weight1 = 0.0f;
+    float weight2 = 0.0f;
+    if(lane == 0)
+    {
+        const float lse0 = lse_parts[lse_index];
+        const float lse1 = lse_parts[lse_plane + lse_index];
+        const float lse2 = lse_parts[2 * lse_plane + lse_index];
+        const float lse_max = fmaxf(lse0, fmaxf(lse1, lse2));
+        weight0 = expf(lse0 - lse_max);
+        weight1 = expf(lse1 - lse_max);
+        weight2 = expf(lse2 - lse_max);
+        const float denominator = fmaxf(weight0 + weight1 + weight2, 1.0e-20f);
+        const float inverse = 1.0f / denominator;
+        weight0 *= inverse;
+        weight1 *= inverse;
+        weight2 *= inverse;
+        if(lse_out != nullptr)
+            lse_out[lse_index] = lse_max + logf(denominator);
+    }
+    weight0 = __shfl(weight0, 0);
+    weight1 = __shfl(weight1, 0);
+    weight2 = __shfl(weight2, 0);
+
+    const int64_t o_plane = static_cast<int64_t>(row_count) * kValueDim;
+    const int64_t o_index = static_cast<int64_t>(row) * kValueDim;
+    const int64_t out_index =
+        static_cast<int64_t>(token) * out_token_stride +
+        static_cast<int64_t>(head) * out_head_stride;
+    for(int value_index = lane; value_index < kValueDim; value_index += kWaveSize)
+    {
+        const float value =
+            weight0 * __bfloat162float(o_parts[o_index + value_index]) +
+            weight1 * __bfloat162float(o_parts[o_plane + o_index + value_index]) +
+            weight2 * __bfloat162float(o_parts[2 * o_plane + o_index + value_index]);
+        out[out_index + value_index] = __float2bfloat16(value);
+    }
+}
+
+void launch_fmha_hd192_split3_combine(const at::Tensor& o_parts,
+                                      const at::Tensor& lse_parts,
+                                      at::Tensor& out,
+                                      at::Tensor& lse,
+                                      hipStream_t stream)
+{
+    const int seqlen_q = out.size(0);
+    const int num_heads = out.size(1);
+    const int row_count = seqlen_q * num_heads;
+    const int blocks = (row_count + kRowsPerBlock - 1) / kRowsPerBlock;
+    hipLaunchKernelGGL(fmha_hd192_split3_combine,
+                       dim3(blocks),
+                       dim3(kCombineBlock),
+                       0,
+                       stream,
+                       reinterpret_cast<const __hip_bfloat16*>(o_parts.data_ptr()),
+                       reinterpret_cast<const float*>(lse_parts.data_ptr()),
+                       reinterpret_cast<__hip_bfloat16*>(out.data_ptr()),
+                       lse.numel() == 0 ? nullptr : reinterpret_cast<float*>(lse.data_ptr()),
+                       seqlen_q,
+                       num_heads,
+                       out.stride(0),
+                       out.stride(1));
+    HIP_CALL(hipGetLastError());
+}
+
+} // namespace
+
 mha_fwd_args get_asm_mha_varlen_fwd_args(bool has_lse,
                                           bool has_dropout_randval,
                                           const mask_info &mask,
@@ -449,14 +549,45 @@ fmha_v3_varlen_fwd(at::Tensor &q,                  // [total_q, hq, d]
             aiter::ParsePhiloxCudaState, dim3(1), dim3(64), 0, stream, philox_args, rng_state_ptr);
     }
     std::optional<const at::Tensor> seqlens_k = std::nullopt;
+    const char* split_env = std::getenv("AITER_FMHA_HD192_SPLIT_KV");
+    const bool split_enabled = split_env == nullptr || std::strcmp(split_env, "0") != 0;
+    const bool split_forced = split_env != nullptr && std::strcmp(split_env, "force") == 0;
+    const bool ticket_shape =
+        total_q == 4096 && k.size(0) == 42700 &&
+        max_seqlen_q == 4096 && max_seqlen_k == 42700 &&
+        num_heads == 12 && num_heads_k == 12;
+    const bool use_hd192_split3 =
+        split_enabled && get_gpu_arch() == "gfx942" && q_dtype == torch::kBFloat16 &&
+        batch_size == 1 && max_seqlen_q == total_q && max_seqlen_k == k.size(0) &&
+        num_heads == num_heads_k &&
+        head_size_q == 192 && head_size_v == 128 &&
+        !is_causal && window_size_left == -1 && window_size_right == -1 &&
+        p_dropout == 0.0f && logits_soft_cap == 0.0f &&
+        bias_type == bias_enum::no_bias && !paged_KV &&
+        !q_descale_.has_value() && !return_dropout_randval &&
+        !cu_seqlens_q_padded.has_value() && !cu_seqlens_k_padded.has_value() &&
+        how_v3_bf16_cvt == 1 && (ticket_shape || split_forced);
 
     if (max_seqlen_k > 0) {
         ck_tile::stream_config stream_config{stream};
+        at::Tensor o_parts;
+        at::Tensor lse_parts;
+        at::Tensor producer_out = out;
+        at::Tensor producer_lse = softmax_lse;
+        if(use_hd192_split3)
+        {
+            o_parts = torch::empty(
+                {kSplitCount, total_q, num_heads, head_size_v}, opts.dtype(out_type));
+            lse_parts = torch::empty(
+                {kSplitCount, num_heads, total_q}, opts.dtype(torch::kFloat32));
+            producer_out = o_parts.select(0, 0);
+            producer_lse = lse_parts.select(0, 0);
+        }
 
         auto drop_seed_offset = std::make_pair(rng_state_ptr, rng_state_ptr + 1);
         auto args =
             get_asm_mha_varlen_fwd_args(
-                has_lse,
+                has_lse || use_hd192_split3,
                 return_dropout_randval,
                 mask,
                 batch_size,
@@ -479,8 +610,8 @@ fmha_v3_varlen_fwd(at::Tensor &q,                  // [total_q, hq, d]
                 q_descale_,
                 k_descale_,
                 v_descale_,
-                out,
-                softmax_lse,
+                producer_out,
+                producer_lse,
                 p,
                 softmax_scale,
                 logits_soft_cap,
@@ -490,7 +621,16 @@ fmha_v3_varlen_fwd(at::Tensor &q,                  // [total_q, hq, d]
                 bias_type,
                 how_v3_bf16_cvt);
 
-        float t = aiter::mha_fwd(args, stream_config);
+        float t;
+        if(use_hd192_split3)
+        {
+            t = aiter::fmha_fwd_v3_split(args, kSplitCount, stream_config);
+            launch_fmha_hd192_split3_combine(o_parts, lse_parts, out, softmax_lse, stream);
+        }
+        else
+        {
+            t = aiter::mha_fwd(args, stream_config);
+        }
         TORCH_CHECK(t >= 0, "invalid argument for fmha_v3_varlen_fwd");
     }
     else {

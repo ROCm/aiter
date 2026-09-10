@@ -269,6 +269,47 @@ float fmha_fwd_v3(mha_fwd_args a, const ck_tile::stream_config& s)
         impl_ptr->launch_kernel({args_ptr, arg_size_ptr, gdx, gdy, gdz, bdx, 1, 1, s_.stream_id_});
     });
 }
+
+float fmha_fwd_v3_split(mha_fwd_args a,
+                        int num_splits,
+                        const ck_tile::stream_config& s)
+{
+    constexpr const char* kernel_name =
+        "_ZN5aiter40fmha_fwd_hd192x128_bf16_rtna_group_splitE";
+    constexpr const char* co_name =
+        "fmha_hd192_split/fwd_hd192x128_bf16_rtna_group_split.co";
+
+    AITER_CHECK(get_gpu_arch() == "gfx942", "fmha_fwd_v3_split requires gfx942");
+    AITER_CHECK(a.data_type == "bf16" && a.is_group_mode && a.batch == 1 &&
+                    a.hdim_q == 192 && a.hdim_v == 128 && a.nhead_q == a.nhead_k &&
+                    a.mask_type == 0 && a.bias_type == 0 && a.p_drop == 0.0f &&
+                    num_splits >= 2 && num_splits <= 8,
+                "invalid argument for fmha_fwd_v3_split");
+
+    fmha_fwd_v3_args args;
+    init_fmha_fwd_v3_args(args, a, 128, "gfx942");
+    const int kv_tiles    = (a.seqlen_k + 31) / 32;
+    const int split_tiles = (kv_tiles + num_splits - 1) / num_splits;
+    AITER_CHECK(split_tiles * (num_splits - 1) < kv_tiles,
+                "split partition would contain an empty final split");
+    args.s_v_Bs = split_tiles * 32;
+    args.s_o_Bs = a.seqlen_q * args.s_o_Seqs;
+    args.s_lse  = 1;
+
+    size_t arg_size = sizeof(args);
+    static AiterAsmKernel kernel{kernel_name, co_name};
+    const int q_tiles = (a.seqlen_q + 127) / 128;
+    kernel.launch_kernel({&args,
+                          &arg_size,
+                          a.nhead_q,
+                          num_splits,
+                          q_tiles,
+                          256,
+                          1,
+                          1,
+                          s.stream_id_});
+    return 0.0f;
+}
 #endif
 
 #if FAV2_ON
