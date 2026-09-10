@@ -19,7 +19,18 @@ all-reduce is fastest at this shape, and what does it cost in accuracy".
 | ``qr_int4``   | quick-reduce, 4-bit codec               | int4     | no  |
 | ``qr_int3``   | quick-reduce, 3-bit codec (TP2 only)    | int3     | no  |
 | ``fly_int4``  | FlyDSL mesh INT4 (ROCm/aiter#4970)      | int4     | no  |
+| ``fly_int4_ring`` | FlyDSL ring, same two-shot volume   | int4/int6| no  |
+| ``fly_1stage``| FlyDSL exact one-shot                   | bf16     | yes |
 | ``rccl``      | ``dist.all_reduce``                     | bf16/fp16| yes |
+
+The three ``fly_*`` families are the ones with a dispatch question open: which
+of them wins is a function of payload size, and so is which variant wins inside
+each. Every ``fly_*`` key above is joined by pinned tuning rows
+(``fly_int4_ring_st16``, ``fly_1stage_a4``, ...) whose only purpose is to be
+swept against the auto rows. A key names a *policy*, not a binary -- the auto
+rows walk a size ladder -- so the ``variant`` column and the ``kernel variants``
+table report the JIT symbol that actually ran at each shape, super-tile and
+block count included.
 
 Candidates are skipped (an ``n/a`` cell in the latency/accuracy/busbw/roofline
 tables, or no column at all when nothing in the sweep could run them) where
@@ -114,6 +125,18 @@ Examples::
     python3 op_tests/multigpu_tests/bench_comm_allreduce.py -o /tmp/ar_before.md
     #   ... change the kernel, rebuild, then -o /tmp/ar_after.md and diff the two.
 
+    # dispatch-threshold sweep: a byte ladder too long for a command line, and
+    # a CSV of the raw numbers to fit against. The default shape list jumps
+    # 168 KiB -> 1.75 MiB -> 14 MiB and both family crossovers hide in those
+    # gaps; AITER_BENCH_FLY1S_MAX_KB lifts the one-shot's policy ceiling so its
+    # rows survive past where the crossover might be rather than stopping short
+    # of it. See op_tests/multigpu_tests/shapes/README.md.
+    AITER_BENCH_FLY1S_MAX_KB=8192 \
+    python3 op_tests/multigpu_tests/bench_comm_allreduce.py -tp 4 \
+        -c fly_int4 fly_int4_ring fly_1stage fly_1stage_a4 \
+        --shape-csv op_tests/multigpu_tests/shapes/ar_sweep_a_small.csv \
+        -o /tmp/ar_a_small_tp4.md --output-csv /tmp/ar_a_small_tp4.csv
+
     # profiling entrypoint: few iters, per-rank chrome trace
     HIP_VISIBLE_DEVICES=6,7 python3 op_tests/multigpu_tests/bench_comm_allreduce.py \
         -tp 2 -s 8,7168 --iters 20 --profile
@@ -155,6 +178,7 @@ import argparse
 import logging
 import math
 import os
+import re
 import subprocess
 import sys
 from dataclasses import dataclass
@@ -220,9 +244,11 @@ _FP8_MIN_NUMEL = 128 * 2048
 if is_flydsl_available():
     from aiter.ops.flydsl import QRInt4
     from aiter.ops.flydsl.kernels.qr_1stage import (
-        MAX_PAYLOAD_BYTES as _FLY1S_MAX_BYTES,
+        OneShotAllReduce,
     )
-    from aiter.ops.flydsl.kernels.qr_1stage import OneShotAllReduce
+    from aiter.ops.flydsl.kernels.qr_1stage import (
+        max_payload_bytes as _fly1s_max_bytes,
+    )
     from aiter.ops.flydsl.kernels.qr_int4 import (
         ALGORITHMS,
         MIN_PAYLOAD_BYTES,
@@ -235,7 +261,7 @@ else:
     QRInt4 = None
     OneShotAllReduce = None
     MIN_PAYLOAD_BYTES = 0
-    _FLY1S_MAX_BYTES = 0
+    _fly1s_max_bytes = None
     ALGORITHMS = {}
     _resolve_codecs = None
     has_xgmi_peer_links = None
@@ -308,6 +334,15 @@ class Candidate:
     # own IPC inbox, so two rows can differ only in tuning.
     super_tile: int | None = None
     grid_cap: int | None = None
+    # Wire format per lap, family == "fly". None means QRInt4's own per-world
+    # default, which is *not* constant across the sweep: the ring's
+    # reduce-scatter lap widens to INT6 at TP8 (_RS_INT6_MIN_WORLD) because it
+    # requantizes N-1 times. That is the right production default and the wrong
+    # thing to leave floating in a crossover sweep -- a TP4-vs-TP8 comparison
+    # would then differ in schedule *and* codec at once, and neither column
+    # would say which moved the number. Pin these to hold the wire constant.
+    rs_codec: str | None = None
+    ag_codec: str | None = None
     # OneShotAllReduce tuning knobs, family == "fly1s". Same rule: a distinct
     # value means a distinct engine with its own inbox.
     atoms: int | None = None
@@ -316,7 +351,13 @@ class Candidate:
     @property
     def fly_cfg(self) -> tuple:
         """Identity of the QRInt4 engine this candidate needs."""
-        return (self.algorithm, self.super_tile, self.grid_cap)
+        return (
+            self.algorithm,
+            self.super_tile,
+            self.grid_cap,
+            self.rs_codec,
+            self.ag_codec,
+        )
 
     @property
     def fly1s_cfg(self) -> tuple:
@@ -339,11 +380,23 @@ CANDIDATES = (
     Candidate("qr_int4", "qr", 14.0, False, quant="INT4"),  # 18.3 / 18.3
     Candidate("qr_int3", "qr", 8.0, False, quant="INT3"),  # 12.2 / 12.2
     Candidate("fly_int4", "fly", 15.0, False),  # 19.2 / n/a
+    # Mesh tuning rows. The mesh is the one schedule with *no* size ladder --
+    # `_Algorithm.st_ladder` is empty for it, so ST=8 (falling back to 1 when a
+    # payload has fewer than 8 tiles) runs at every size, and the default grid
+    # cap of 1216 is never revisited. These two rows are what decides whether
+    # that is right or merely untested: `st1` pins the fallback at every size,
+    # `g128` holds ST at the default and moves only the block ceiling, to the
+    # same 128 the ring's rungs use.
+    Candidate("fly_int4_st1", "fly", 15.0, False, super_tile=1),
+    Candidate("fly_int4_g128", "fly", 15.0, False, grid_cap=128),
     # Exact FlyDSL one-shot: no codec, fp32 accumulate, one rounding, so it
     # lands at the same bf16 floor as cdr and shares its 40 dB gate and its
     # `exact=True` checkAllclose. Decode-only -- it pushes the whole payload to
     # every peer, so it is gated *above* by MAX_PAYLOAD_BYTES rather than below
     # like the quantized rows.
+    # Auto: no pinned knobs, so OneShotAllReduce walks ONESHOT_LADDER and picks
+    # by payload size at launch. This is what production gets; the pinned rows
+    # below are what it is fitted against.
     Candidate("fly_1stage", "fly1s", 40.0, True),  # 55 / n/a
     # Block-count sweep. The TP8 data says cdr runs 7-8x more blocks than
     # cdr_naive at no measurable cost, which is evidence *against* the
@@ -363,6 +416,17 @@ CANDIDATES = (
     # handing each destination a contiguous run. Expected to matter on xGMI,
     # where the native packet is 64 B, and to lose on PCIe.
     Candidate("fly_1stage_fa", "fly1s", 40.0, True, fanout="atom"),
+    # Cross terms. The single-knob rows above were swept one at a time, and the
+    # TP8 data says the winners are not separable: `a4` wins nearly everywhere
+    # at TP8 while `fa` wins at TP2/TP4 small, so the combination is unmeasured
+    # and is exactly what a per-world ladder would want to pick. `g128` lifts
+    # the block ceiling above the 64 default, which only binds once a payload
+    # has more than 64 tiles -- 256 KiB at atoms=1, past where the current
+    # 192 KiB policy ceiling stops the sweep looking.
+    Candidate("fly_1stage_a2_fa", "fly1s", 40.0, True, atoms=2, fanout="atom"),
+    Candidate("fly_1stage_a4_fa", "fly1s", 40.0, True, atoms=4, fanout="atom"),
+    Candidate("fly_1stage_g128", "fly1s", 40.0, True, grid_cap=128),
+    Candidate("fly_1stage_a4_g128", "fly1s", 40.0, True, atoms=4, grid_cap=128),
     # Same kernel family, ring schedule. Its floor is lower than fly_int4's
     # because the ring's reduce-scatter lap requantizes N-1 times where the mesh
     # requantizes once; measured 18.7 dB at TP4 (against 19.2), and *better*
@@ -414,6 +478,36 @@ CANDIDATES = (
         algorithm="ring",
         super_tile=32,
         grid_cap=128,
+    ),
+    # The same two rungs with the reduce-scatter lap pinned to INT6. The rows
+    # above leave `rs_codec=None`, i.e. QRInt4's per-world default, which is
+    # INT4 below TP8 and INT6 at TP8 -- so the TP4 and TP8 reports are not
+    # comparing the same wire, and the TP8 ring's 21.6 dB against TP4's 18.7 is
+    # a codec difference reported as a schedule difference. These rows hold the
+    # wire constant across world sizes; read them against the INT4 rows at the
+    # same ST to price what the wider RS lap costs in latency. Same 14 dB floor
+    # -- INT6 only ever lands above INT4, so it cannot be the row that trips.
+    Candidate(
+        "fly_int4_ring_st8_int6",
+        "fly",
+        14.0,
+        False,
+        algorithm="ring",
+        super_tile=8,
+        grid_cap=128,
+        rs_codec="int6",
+        ag_codec="int4",
+    ),
+    Candidate(
+        "fly_int4_ring_st32_int6",
+        "fly",
+        14.0,
+        False,
+        algorithm="ring",
+        super_tile=32,
+        grid_cap=128,
+        rs_codec="int6",
+        ag_codec="int4",
     ),
     Candidate("rccl", "rccl", 40.0, True),  # 51 / 69
 )
@@ -488,12 +582,12 @@ def applicable(cand: Candidate, world_size: int, dtype, numel: int, nbytes: int)
             and get_gfx() in _FLY_ARCHS
             and world_size in _FLY_WORLDS
             and dtype == dtypes.bf16
-            and nbytes <= _fly1s_ceiling()
+            and nbytes <= _fly1s_ceiling(world_size)
         )
     return True  # rccl
 
 
-def _fly1s_ceiling() -> int:
+def _fly1s_ceiling(world_size: int) -> int:
     """Payload ceiling for the one-shot rows, overridable for the sweep.
 
     ``MAX_PAYLOAD_BYTES`` is a *policy*, not a correctness limit -- the kernel
@@ -502,7 +596,9 @@ def _fly1s_ceiling() -> int:
     editing the shipped constant.
     """
     kb = os.environ.get("AITER_BENCH_FLY1S_MAX_KB")
-    return int(kb) << 10 if kb else _FLY1S_MAX_BYTES
+    if kb:
+        return int(kb) << 10
+    return 0 if _fly1s_max_bytes is None else _fly1s_max_bytes(world_size)
 
 
 def sqnr_db(got: torch.Tensor, ref: torch.Tensor) -> float:
@@ -542,6 +638,51 @@ DSV4_HIDDEN = 7168
 L_SHAPE = [
     (m, DSV4_HIDDEN) for m in (1, 2, 4, 5, 6, 8, 11, 12, 128, 1024, 4096, 4681, 8192)
 ]
+
+
+def load_shapes_csv(path: str) -> list[tuple[int, int]]:
+    """``(M, K)`` pairs from a CSV, for sweeps too long to put on a command line.
+
+    ``M`` and ``K`` columns, uppercase, any extra columns ignored -- the same
+    contract as ``test_gemm_a8w8_blockscale.py``'s ``--csv``, so a shape file is
+    readable across the op_tests. An extra ``label`` column is conventional here
+    for naming what a row is probing; it is carried nowhere and exists for
+    whoever reads the file.
+
+    The point is the dispatch sweeps: the crossovers this benchmark exists to
+    find sit between the shapes ``L_SHAPE`` measures, and bracketing them takes
+    ~50 sizes per world size. That is a file, not an argument list, and it wants
+    to be committed next to the report it produced so the run is reproducible.
+
+    Duplicates are dropped preserving order rather than silently timed twice.
+    """
+    p = Path(path)
+    if not p.exists():
+        raise FileNotFoundError(f"shape CSV not found: {p}")
+    df = pd.read_csv(p)
+    missing = {"M", "K"} - set(df.columns)
+    if missing:
+        raise ValueError(
+            f"{p}: missing column(s) {sorted(missing)}; expected M,K "
+            f"(got {list(df.columns)})"
+        )
+    shapes = []
+    for i, row in df.iterrows():
+        m, k = int(row["M"]), int(row["K"])
+        if m < 1 or k < 1:
+            raise ValueError(f"{p} row {i}: M and K must be positive, got {m},{k}")
+        # Every custom path requires a 16 B-aligned payload and would be
+        # silently dropped to the rccl-only row by `applicable()`. Refuse the
+        # shape instead: in a shape file that is a typo, not a request.
+        nbytes = m * k * 2
+        if nbytes % 16 != 0:
+            raise ValueError(
+                f"{p} row {i}: {m}x{k} is {nbytes} B at 2 B/element, not a "
+                "multiple of 16; every candidate but rccl would be skipped"
+            )
+        shapes.append((m, k))
+    return list(dict.fromkeys(shapes))
+
 
 # Mirrors the C++ dispatch cited in the module docstring, so the `kernel` column
 # is a prediction, not an observation. Kept in sync by hand -- after touching the
@@ -637,6 +778,74 @@ def production_path(ca_comm, qr_comm, x, world_size: int, prod_regime: str | Non
         nbytes = x.numel() * x.element_size()
         return f"cdr:{predicted_kernel(world_size, nbytes)}"
     return "rccl"
+
+
+def _variant_of(cand: Candidate, fly, fly1s, nbytes: int) -> str | None:
+    """The kernel *cand* would actually run at *nbytes*, or None.
+
+    Only the flydsl families can answer this: their engines expose the JIT
+    symbol their factory stamped on the launch wrapper, which names every
+    compile-time knob. The other families dispatch inside C++ or inside RCCL and
+    have nothing equivalent to report, so they get ``n/a`` rather than a guess.
+    """
+    eng = (
+        fly.get(cand.fly_cfg)
+        if cand.family == "fly"
+        else fly1s.get(cand.fly1s_cfg)
+        if cand.family == "fly1s"
+        else None
+    )
+    return eng.variant(int(nbytes)) if eng is not None else None
+
+
+# The ring bakes its rank into the kernel at compile time, so its symbol carries
+# an ``_r<n>_`` field and every rank legitimately reports a different string for
+# the same variant. Collapse that one field before comparing.
+_RANK_FIELD = re.compile(r"_r\d+_")
+
+
+def _agree_variant(per_rank) -> str | None:
+    """One variant string for a row, or a flag that the ranks disagreed.
+
+    Every rank must be running the same variant of the same kernel; if they are
+    not, a latency taken as ``max`` over ranks is comparing two different
+    binaries and the row is meaningless. That is not hypothetical -- the ring
+    compiles per rank -- so it is checked rather than assumed, and a
+    disagreement is reported in the cell instead of being averaged away.
+    """
+    seen = {_RANK_FIELD.sub("_r*_", v) for v in per_rank if v is not None}
+    if not seen:
+        return None
+    if len(seen) > 1:
+        logger.warning("ranks disagree on the kernel variant: %s", sorted(seen))
+        return "MIXED: " + " | ".join(sorted(seen))
+    return seen.pop()
+
+
+def _cfg_order(cfg: tuple) -> tuple:
+    """Total order over engine-config tuples, for a deterministic build order.
+
+    Every engine does its own IPC handle exchange, which is a collective, so
+    ranks disagreeing on the construction order deadlock. The tuples mix
+    ``None`` ("constructor default") with ints and strings, and ``None`` does
+    not order against either, so sort on ``(is-set, string form)`` per field
+    rather than on the tuple itself. String form because a single key has to
+    cover ``super_tile`` (int) and ``rs_codec`` (str) in the same position
+    across the two families -- the order only has to be *stable*, not
+    numerically meaningful.
+    """
+    return tuple(x for f in cfg for x in ((f is not None), f"{f}"))
+
+
+def _fly_kwargs(cfg: tuple, names: tuple) -> dict:
+    """Non-``None`` fields of *cfg* as constructor kwargs, named by *names*.
+
+    ``None`` means "leave the constructor default alone", which is not the same
+    as passing the default explicitly: ``QRInt4`` distinguishes an unset
+    ``super_tile`` (walk the ladder) from a pinned one (this value at every
+    size), and an unset codec from a pinned one.
+    """
+    return {n: v for n, v in zip(names, cfg) if v is not None}
 
 
 def _build_thunks(cands, *, ca_comm, qr_comm, fly, fly1s, group, x):
@@ -787,6 +996,10 @@ def _bench_shape(
             )
         ret[f"{cand.key}_us"] = us
         ret[f"{cand.key}_sqnr"] = sqnr
+        # Resolved after the run, not before: for a ladder-driven engine the
+        # variant is a function of the payload, and asking the engine is the
+        # only way to learn which rung this size took.
+        ret[f"{cand.key}_variant"] = _variant_of(cand, fly, fly1s, nbytes)
 
     if profile:
         dist.barrier(group=group)
@@ -861,20 +1074,16 @@ def _worker(
     dist.all_reduce(torch.zeros(1, device=device), group=group)
     torch.cuda.synchronize()
 
-    fly = {}  # QRInt4 schedule name -> engine
-    # One engine per distinct (schedule, super_tile, grid_cap): each owns its
-    # own IPC inbox, whose layout depends on all three. Sorted so every rank
-    # performs its handle exchanges in the same sequence -- the exchange is a
-    # collective, so a differing order across ranks deadlocks.
+    fly = {}  # QRInt4 config tuple -> engine
+    # One engine per distinct (schedule, super_tile, grid_cap, rs_codec,
+    # ag_codec): each owns its own IPC inbox, whose layout depends on all five.
+    # Sorted so every rank performs its handle exchanges in the same sequence --
+    # the exchange is a collective, so a differing order across ranks deadlocks.
     # ``None`` means "constructor default" and does not order against an int,
     # so sort on a total key rather than the tuple itself.
     wanted_cfgs = sorted(
         {c.fly_cfg for c in CANDIDATES if c.family == "fly" and c.key in keys},
-        key=lambda c: (
-            c[0],
-            -1 if c[1] is None else c[1],
-            -1 if c[2] is None else c[2],
-        ),
+        key=_cfg_order,
     )
     if (
         wanted_cfgs
@@ -884,23 +1093,19 @@ def _worker(
         and dtype == dtypes.bf16
     ):
         for cfg in wanted_cfgs:
-            algo, st, cap = cfg
             # QRInt4 exchanges IPC handles via broadcast_object_list, so it
             # needs the gloo (CPU) group -- it rejects an NCCL group outright.
-            kw = {}
-            if st is not None:
-                kw["super_tile"] = st
-            if cap is not None:
-                kw["grid_cap"] = cap
             fly[cfg] = QRInt4(
                 group=tp_group.cpu_group,
                 device=device,
                 rank=rank,
                 world_size=tp_size,
-                algorithm=algo,
+                algorithm=cfg[0],
                 # Measure every size the sweep asks for.
                 min_bytes=0,
-                **kw,
+                **_fly_kwargs(
+                    cfg[1:], ("super_tile", "grid_cap", "rs_codec", "ag_codec")
+                ),
             )
         # compile() is itself a collective launch on every super-tile engine and
         # builds all of them, so one call at any shape keeps the JIT out of
@@ -917,11 +1122,7 @@ def _worker(
     # exchange is a collective.
     wanted_1s = sorted(
         {c.fly1s_cfg for c in CANDIDATES if c.family == "fly1s" and c.key in keys},
-        key=lambda c: (
-            -1 if c[0] is None else c[0],
-            -1 if c[1] is None else c[1],
-            "" if c[2] is None else c[2],
-        ),
+        key=_cfg_order,
     )
     if (
         wanted_1s
@@ -931,20 +1132,13 @@ def _worker(
         and dtype == dtypes.bf16
     ):
         for cfg in wanted_1s:
-            atoms, cap, fan = cfg
-            kw = {}
-            if atoms is not None:
-                kw["atoms"] = atoms
-            if cap is not None:
-                kw["grid_cap"] = cap
-            if fan is not None:
-                kw["fanout"] = fan
+            kw = _fly_kwargs(cfg, ("atoms", "grid_cap", "fanout"))
             fly1s[cfg] = OneShotAllReduce(
                 group=tp_group.cpu_group,
                 device=device,
                 rank=rank,
                 world_size=tp_size,
-                max_bytes=_fly1s_ceiling(),
+                max_bytes=_fly1s_ceiling(tp_size),
                 **kw,
             )
         warm = torch.zeros((8, DSV4_HIDDEN), dtype=dtypes.bf16, device=device)
@@ -952,6 +1146,27 @@ def _worker(
             dist.barrier(group=group)
             fly1s[cfg].compile(warm, torch.empty_like(warm))
         del warm
+
+    # Every fly candidate is a distinct engine with a distinct IPC inbox, and
+    # they are all live at once for the whole sweep. A wide tuning sweep is
+    # therefore holding a fixed cost on the device before a single payload is
+    # allocated -- and the inbox scales with ST * grid, so the ring's high rungs
+    # dominate it. Report it here, where it is attributable to the candidate
+    # list, rather than letting it surface as an OOM on the largest shape.
+    if fly or fly1s:
+        per_engine = sorted(
+            [(f"fly{cfg}", eng.inbox_bytes) for cfg, eng in fly.items()]
+            + [(f"fly1s{cfg}", eng.inbox_bytes) for cfg, eng in fly1s.items()],
+            key=lambda kv: -kv[1],
+        )
+        total = sum(b for _, b in per_engine)
+        logger.info(
+            "rank %d: %d flydsl engine(s), %.1f MiB of IPC inbox; largest: %s",
+            rank,
+            len(per_engine),
+            total / 2**20,
+            ", ".join(f"{k} {b / 2**20:.1f} MiB" for k, b in per_engine[:3]),
+        )
 
     try:
         rows = [
@@ -1016,6 +1231,21 @@ def _row(tp_size, tokens, hidden, dtype, rank_rets):
         _, busbw, _ = collective_bw(nbytes, us, tp_size, row["kernel"])
         row[f"{cand.key} us"] = us
         row[f"{cand.key} busbw GB/s"] = busbw
+        # Median across ranks, for fitting dispatch thresholds. `us` above is
+        # the right *reporting* metric -- the model waits on the slowest rank --
+        # but it is also the noisiest, since it takes the worst of N samples and
+        # a single straggler moves it by tens of microseconds (see `spread us`).
+        # A threshold fitted against that noise lands in the wrong place; a
+        # threshold is a question about the kernel, not about arrival skew.
+        #
+        # Upper median on an even rank count, deliberately -- it errs towards
+        # the metric above rather than away from it. At TP2 that makes this
+        # column identical to `us` by construction; there are only two samples
+        # and nothing to reject.
+        row[f"{cand.key} median us"] = sorted(per_rank)[len(per_rank) // 2]
+        row[f"{cand.key} variant"] = _agree_variant(
+            [r.get(f"{cand.key}_variant") for r in rank_rets]
+        )
         row[f"{cand.key} SQNR dB"] = min(r[f"{cand.key}_sqnr"] for r in rank_rets)
         # Rank spread, per candidate. Reported for every row rather than only
         # for PRIMARY: skew is mostly a property of the barrier, but not
@@ -1248,11 +1478,20 @@ def case_tables(df, keys, baseline: str):
             spread = r.get(f"{k} spread us")
             if spread is not None and pd.notna(spread):
                 row["spread us"] = spread
+            # The kernel that actually ran, where the candidate can say. A
+            # candidate key like `fly_int4_ring` names a *policy*, not a binary:
+            # it walks a size ladder and picks a different super-tile per shape.
+            # Without this column the report cannot distinguish "the auto row
+            # chose well here" from "the auto row happened to agree with a
+            # pinned row", which is the whole question a ladder fit asks.
+            variant = r.get(f"{k} variant")
+            if variant is not None and pd.notna(variant):
+                row["variant"] = variant
             rows.append(row)
         if not rows:
             rows = [{"candidate": "-", "us": float("nan")}]
         cdf = pd.DataFrame(rows)
-        _mark_na(cdf, ["spread us"])
+        _mark_na(cdf, ["spread us", "variant"])
         tables.append((title, cdf))
     return tables
 
@@ -1588,11 +1827,35 @@ def _fly_floor_note(world_sizes) -> str:
                 continue
             algo = ALGORITHMS[algorithm]
             rs_codec, ag_codec = _resolve_codecs(algo, ws, None, None)
-            floor = algo.floor_bytes(rs_codec)
+            # World-keyed since the ring floor was measured; the codec is still
+            # printed because it is what the wire actually carries at this TP.
+            floor = algo.floor_bytes(ws)
             parts.append(
                 f"{algorithm}/tp{ws} {floor >> 10} KiB (rs={rs_codec} ag={ag_codec})"
             )
     return "; ".join(parts) or "n/a"
+
+
+def _write_raw_csv(path, df, dtype_name: str, per_dtype: bool) -> None:
+    """Dump the un-collapsed dataframe for one dtype.
+
+    The markdown tables answer "which candidate won"; this answers "what were
+    all the numbers", which is what fitting a dispatch threshold needs -- the
+    losers matter as much as the winner, because the threshold sits where two
+    curves cross and both have to be in hand to find it. ``_nbytes`` rides along
+    (it is deliberately absent from ``ID_COLUMNS``, so no printed table carries
+    the exact byte count) because that is the axis a threshold is expressed on.
+
+    One file per dtype: the frame is rebuilt per dtype, and a single path would
+    have the last one silently overwrite the rest.
+    """
+    out = Path(path)
+    if per_dtype:
+        out = out.with_name(f"{out.stem}_{dtype_name}{out.suffix or '.csv'}")
+    if out.parent and not out.parent.exists():
+        out.parent.mkdir(parents=True, exist_ok=True)
+    df.to_csv(out, index=False)
+    logger.info("wrote %s (%d row(s) x %d column(s))", out, len(df), len(df.columns))
 
 
 def _write_report(
@@ -1703,6 +1966,14 @@ def main():
         nargs="*",
         default=L_SHAPE,
         help="(tokens, hidden) pairs, e.g. -s 8,7168 4096,7168",
+    )
+    parser.add_argument(
+        "--shape-csv",
+        metavar="PATH",
+        default=None,
+        help="read (tokens, hidden) pairs from a CSV with M,K columns instead\n"
+        "of -s/--shape. For the dispatch sweeps, whose ~50 sizes per world size\n"
+        "do not fit on a command line; see op_tests/multigpu_tests/shapes/.",
     )
     parser.add_argument(
         "-d",
@@ -1828,7 +2099,30 @@ def main():
         help="also write the summary tables to PATH as markdown, with a\n"
         "provenance header (arch, iters, command). Overwrites PATH.",
     )
+    parser.add_argument(
+        "--output-csv",
+        metavar="PATH",
+        default=None,
+        help="also write the raw per-shape dataframe to PATH as CSV: every\n"
+        "candidate's us, median us, SQNR, busbw, spread and kernel variant,\n"
+        "plus the exact byte count. This is the machine-readable form the\n"
+        "dispatch-threshold fitting reads; the markdown is for humans. One file\n"
+        "per dtype -- PATH gets the dtype inserted before its suffix when the\n"
+        "sweep covers more than one.",
+    )
     args = parser.parse_args()
+    if args.shape_csv is not None:
+        if args.shape is not L_SHAPE:
+            parser.error("--shape-csv and -s/--shape are mutually exclusive")
+        args.shape = load_shapes_csv(args.shape_csv)
+        sizes = [m * k * 2 for m, k in args.shape]
+        logger.info(
+            "loaded %d shape(s) from %s, %.4g KiB to %.4g KiB",
+            len(args.shape),
+            args.shape_csv,
+            min(sizes) / 1024,
+            max(sizes) / 1024,
+        )
 
     tps = args.tp if args.tp else [4]
     tps = [t for t in tps if t <= visible]
@@ -1945,6 +2239,13 @@ def main():
         sections.append((case_title, case_md))
 
         tables = []
+        # Which binary each candidate ran, per shape. Only the flydsl families
+        # can report it, so the table is skipped entirely when none are in the
+        # sweep rather than printed as a wall of `n/a`.
+        if any(f"{k} variant" in df.columns for k in keys):
+            tables.append(
+                (f"{dtype_name} kernel variants", metric_table(df, "variant", keys))
+            )
         if args.busbw:
             tables.append((f"{dtype_name} busbw", metric_table(df, "busbw GB/s", keys)))
         if measured is not None:
@@ -1956,6 +2257,9 @@ def main():
             md = table.to_markdown(index=False, floatfmt=".4g", missingval="n/a")
             logger.info("all-reduce %s (markdown):\n%s", title, md)
             sections.append((title, md))
+
+        if args.output_csv:
+            _write_raw_csv(args.output_csv, df, dtype_name, len(args.dtype) > 1)
 
     if args.output:
         _write_report(args.output, sections, args, visible, prod_regime, roofline_cus)

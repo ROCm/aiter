@@ -119,6 +119,43 @@ DEFAULT_ATOMS = 1
 SUPPORTED_ATOMS = (1, 2, 4)
 DEFAULT_GRID_CAP = 64
 
+# Per-world-size tuning ladder: ``(min_bytes, atoms, grid_cap, fanout)`` rungs,
+# ascending, in the idiom of ``RING_ST_LADDER``. The host builds one engine per
+# rung and selects by payload size at launch.
+#
+# Every world size currently needs exactly **one** rung, which is a result and
+# not an oversight. The one-shot is only ever dispatched below its family
+# boundary -- 512 KiB at TP2, 96 KiB at TP4, 48 KiB at TP8 (see
+# ``qr_ar_policy``) -- and across so narrow a window one configuration is within
+# 8.5% (TP2), 6.4% (TP4) and 0.4% (TP8) of a per-shape oracle. Fitting over the
+# whole sweep instead suggests a second rung at 64-192 KiB, but at TP8 that
+# boundary sits *four times* above anything this schedule is dispatched at; it
+# would be an engine and an IPC inbox for payloads that never arrive.
+#
+# The shape of the answer differs by world size and that is the point:
+#   TP2  atoms=4  -- fattest tile, because at N=2 there is wire volume to spare
+#                    and the payload runs far enough up to want fewer flags.
+#   TP4  atoms=1  -- narrowest tile and a *smaller* grid cap; this window tops
+#                    out at 96 KiB, where the schedule is flag-bound and blocks
+#                    are worth more than tile width.
+#   TP8  atoms=4  -- the fattest tile again, for the opposite reason: the window
+#                    is only 48 KiB wide, the fanout is to 7 peers, and cutting
+#                    the flag count matters more than the handful of blocks lost.
+#
+# Fitted on MI350P/PCIe; see op_tests/dump_data/sweep/RESULTS.md.
+ONESHOT_LADDER = {
+    2: ((0, 4, 128, "peer"),),
+    4: ((0, 1, 32, "peer"),),
+    8: ((0, 4, 64, "peer"),),
+}
+
+
+def oneshot_ladder(world_size: int):
+    """Rungs for *world_size*, or a single default rung for an unlisted one."""
+    return ONESHOT_LADDER.get(
+        int(world_size), ((0, DEFAULT_ATOMS, DEFAULT_GRID_CAP, "peer"),)
+    )
+
 # Inbox slots are indexed by ``colour & 1``. Two buffers is exactly enough to
 # let one rank run a whole call ahead of another without overwriting a slot the
 # straggler has not read.

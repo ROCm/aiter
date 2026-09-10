@@ -12,7 +12,6 @@ the codec, which is why the two are separate modules.
 """
 
 import logging
-import os
 
 import flydsl.expr as fx
 from flydsl._mlir import ir

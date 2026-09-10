@@ -30,7 +30,12 @@ from aiter.dist.parallel_state import in_the_same_node_as
 from aiter.jit.utils.chip_info import get_gfx_runtime
 
 from .qr_int4_ipc import UncachedIpcHeap
-from .qr_int4_kernel import MESH_CODECS, SUPER_TILES, make_qr_int4_kernel
+from .qr_int4_kernel import (
+    MESH_CODECS,
+    MESH_ST_LADDER,
+    SUPER_TILES,
+    make_qr_int4_kernel,
+)
 from .qr_int4_ring_kernel import (
     AG_CODECS,
     RING_ST_LADDER,
@@ -91,14 +96,24 @@ MIN_PAYLOAD_BYTES = 128 << 10
 # fences, which is only a good trade once there are enough fences to matter.
 _MIN_BATCH_BLOCKS = 32
 
-# Size floor for the ring algorithm.
-# TODO: Measure the eaxct crossover between mesh and ring.
-_RING_INT4_MIN_PAYLOAD_BYTES = 12 << 20
-_RING_INT6_MIN_PAYLOAD_BYTES = 16 << 20
-_RING_MIN_PAYLOAD_BYTES_BY_RS_CODEC = {
-    "int4": _RING_INT4_MIN_PAYLOAD_BYTES,
-    "int6": _RING_INT6_MIN_PAYLOAD_BYTES,
+# Size floor for the ring algorithm, i.e. where the mesh stops winning.
+#
+# This used to be keyed on the reduce-scatter codec (12 MiB INT4 / 16 MiB INT6)
+# and world-independent, with a TODO to measure it. Measured now, and the codec
+# turns out not to be the variable that moves it -- world size is. See
+# ``qr_ar_policy.FAMILY_POLICY``, whose ``mesh_max`` these mirror; the numbers
+# come from the same fit.
+#
+# Note this is only the *standalone* guard rail: it is what ``QRInt4`` refuses
+# below when someone constructs one directly with ``algorithm="ring"``.
+# Production dispatch does not consult it -- ``FlyDSLAllReduce`` owns the real
+# boundary, which is additionally keyed on link type.
+_RING_MIN_PAYLOAD_BYTES_BY_WORLD = {
+    2: 4 << 20,
+    4: 12 << 20,
+    8: 12 << 20,
 }
+_RING_DEFAULT_MIN_PAYLOAD_BYTES = 12 << 20
 
 
 @dataclass(frozen=True)
@@ -127,18 +142,32 @@ class _Algorithm:
     min_bytes: int
     min_batch_blocks: int
     default_super_tile: int
-    # Per-reduce-scatter-codec override of ``min_bytes``. Empty means the codec
-    # does not move the floor, which is true of any schedule with one wire
-    # format. See ``_RING_MIN_PAYLOAD_BYTES_BY_RS_CODEC``.
-    min_bytes_by_rs_codec: tuple[tuple[str, int], ...] = ()
+    # Per-world-size override of ``min_bytes``. Empty means the world does not
+    # move this schedule's floor, which is true of the mesh -- it is gated from
+    # below by accuracy, which does not depend on N. The ring's floor is where
+    # the mesh stops winning, which very much does. See
+    # ``_RING_MIN_PAYLOAD_BYTES_BY_WORLD``.
+    min_bytes_by_world: tuple[tuple[int, int], ...] = ()
 
-    def floor_bytes(self, rs_codec: str) -> int:
-        return dict(self.min_bytes_by_rs_codec).get(rs_codec, self.min_bytes)
-    # ``(min_payload_bytes, super_tile, grid_cap)`` rungs, ascending. Empty means
-    # "one super-tile for every size", which is what the mesh does. When it is
-    # non-empty and the caller did not pin ``super_tile``, QRInt4 builds an
+    def floor_bytes(self, world_size: int) -> int:
+        return dict(self.min_bytes_by_world).get(int(world_size), self.min_bytes)
+
+    # ``world_size -> ((min_payload_bytes, super_tile, grid_cap), ...)``,
+    # ascending. When the caller did not pin ``super_tile``, QRInt4 builds an
     # engine per rung and selects by payload size at launch.
-    st_ladder: tuple[tuple[int, int, int], ...] = ()
+    #
+    # Keyed on world size because the rungs genuinely move with it: publishes
+    # per rank are ``num_tiles / ST * 2(N-1)``, so the batching crossover
+    # arrives sooner the wider the world. Empty means "one super-tile for every
+    # size"; no schedule uses that any more, but the code path stays because
+    # pinning ``super_tile`` still collapses to it.
+    st_ladder: dict[int, tuple[tuple[int, int, int], ...]] | None = None
+
+    def ladder_for(self, world_size: int) -> tuple[tuple[int, int, int], ...]:
+        """Rungs for *world_size*; ``()`` when this schedule has no ladder."""
+        if not self.st_ladder:
+            return ()
+        return self.st_ladder.get(int(world_size), ())
 
 
 def _build_mesh(
@@ -169,6 +198,7 @@ ALGORITHMS = {
         min_bytes=MIN_PAYLOAD_BYTES,
         min_batch_blocks=_MIN_BATCH_BLOCKS,
         default_super_tile=8,
+        st_ladder=MESH_ST_LADDER,
     ),
     "ring": _Algorithm(
         name="ring",
@@ -176,11 +206,11 @@ ALGORITHMS = {
         super_tiles=RING_SUPER_TILES,
         rs_codecs=RS_CODECS,
         ag_codecs=AG_CODECS,
-        min_bytes=_RING_INT4_MIN_PAYLOAD_BYTES,
+        min_bytes=_RING_DEFAULT_MIN_PAYLOAD_BYTES,
         min_batch_blocks=_MIN_BATCH_BLOCKS,
         default_super_tile=8,
         st_ladder=RING_ST_LADDER,
-        min_bytes_by_rs_codec=tuple(_RING_MIN_PAYLOAD_BYTES_BY_RS_CODEC.items()),
+        min_bytes_by_world=tuple(_RING_MIN_PAYLOAD_BYTES_BY_WORLD.items()),
     ),
 }
 DEFAULT_ALGORITHM = "mesh"
@@ -340,6 +370,26 @@ def _validate_ipc_process_group(group, *, rank: int) -> None:
             "QRInt4 does not support multi-node process groups: HIP IPC "
             f"handles are node-local (ranks not on rank 0's node: {off_node})."
         )
+
+
+def kernel_symbol(launch) -> str:
+    """The JIT symbol a kernel factory stamped on its launch wrapper.
+
+    Every factory names its wrapper ``launch_<kernel>_<tag>``, where the tag
+    carries every compile-time knob that changes the emitted code -- world size,
+    super-tile, inbox memory, wire format, and for the ring the rank as well
+    (``qr_int4_ring_kernel.py:710``). That string is the only place the *actual*
+    variant that ran is written down, so a benchmark reporting a candidate alias
+    like ``fly_int4_ring_st16`` cannot say which binary it timed, and an "auto"
+    row that walks a size ladder cannot say anything at all.
+
+    Falls back to ``"?"`` rather than raising: this is reporting metadata, and a
+    flydsl build that stops exposing ``.func`` should not take a sweep down.
+    """
+    name = getattr(getattr(launch, "func", None), "__name__", None)
+    if not name:
+        return "?"
+    return name.removeprefix("launch_")
 
 
 class _StEngine:
@@ -541,9 +591,10 @@ class QRInt4:
         # cap is a no-op (the rung cap is already sized so ``_grid_x`` never
         # binds over that rung's payload range), while lowering it constrains
         # the wire buffer, which is what a caller passing it usually wants.
-        if algo.st_ladder and not pinned_st:
-            rungs = [(st, min(rung_cap, cap)) for _, st, rung_cap in algo.st_ladder]
-            ladder = algo.st_ladder
+        world_ladder = algo.ladder_for(world_size)
+        if world_ladder and not pinned_st:
+            rungs = [(st, min(rung_cap, cap)) for _, st, rung_cap in world_ladder]
+            ladder = world_ladder
         else:
             rungs = [(super_tile, cap)]
             ladder = ()
@@ -570,7 +621,7 @@ class QRInt4:
         )
         
         self.min_bytes = (
-            algo.floor_bytes(rs_codec) if min_bytes is None else int(min_bytes)
+            algo.floor_bytes(self.world_size) if min_bytes is None else int(min_bytes)
         )
         if self.min_bytes < 0:
             raise ValueError(f"min_bytes must be non-negative, got {self.min_bytes}")
@@ -610,6 +661,19 @@ class QRInt4:
         self.tile_fp16 = primary.tile_fp16
         self.rank_tile_bytes = primary.rank_tile_bytes
         self.wire_tile_bytes = primary.wire_tile_bytes
+
+    @property
+    def inbox_bytes(self) -> int:
+        """IPC inbox bytes this object holds on *this* rank, across every rung.
+
+        ``buf_bytes`` is the primary engine's alone, which understates a
+        ladder-driven object by however many rungs it built. The total is what
+        actually has to fit: the wire buffer is
+        ``2(N-1) * grid * (ST * rank_atoms * tile + 64)``, so a high rung is
+        large on its own and a sweep holding several tuning variants live at
+        once is the realistic way to exhaust a device.
+        """
+        return sum(eng.buf_bytes for eng in self._by_st.values())
 
     def _ladder_st(self, live_bytes: int) -> int:
         """Super-tile the ladder assigns to a *live_bytes* payload.
@@ -740,6 +804,21 @@ class QRInt4:
         for eng in self._by_st.values():
             eng.close()
         self._by_st = {}
+
+    def variant(self, nbytes: int) -> str:
+        """Identity of the binary an *nbytes* payload would actually run.
+
+        ``<jit symbol>/g<grid_cap>/x<grid_x>``. Resolves the super-tile through
+        the same ``_pick_st`` the launch path uses, so for a ladder-driven
+        engine this is the only way to see which rung a given size takes --
+        ``super_tile`` on the object is the *nominal* value, not the one a
+        particular payload gets. Pure: builds nothing and launches nothing.
+        """
+        live_bytes = int(nbytes)
+        num_tiles = max(1, (live_bytes + TILE_BYTES - 1) // TILE_BYTES)
+        eng = self._by_st[self._pick_st(num_tiles, live_bytes)]
+        grid_x = self._grid_x(num_tiles, eng.super_tile, eng.grid)
+        return f"{kernel_symbol(eng.launch)}/g{eng.grid}/x{grid_x}"
 
     def is_beneficial(self, nbytes: int) -> bool:
         """Whether *nbytes* is large enough for this kernel to be worth using.

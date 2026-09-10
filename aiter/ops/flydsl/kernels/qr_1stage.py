@@ -5,7 +5,7 @@
 
 Public type ``OneShotAllReduce``. Decode-only by policy: one round and no
 grid-wide barrier, paid for with ``(N-1)*S`` of wire volume against the
-mesh's ``2(N-1)/N*S``. 
+mesh's ``2(N-1)/N*S``.
 """
 
 from __future__ import annotations
@@ -26,21 +26,44 @@ from .qr_1stage_kernel import (
     DEFAULT_SPIN_SLEEP,
     SUPPORTED_ATOMS,
     make_qr_1stage_kernel,
+    oneshot_ladder,
 )
+from .qr_ar_policy import FAMILY_POLICY
 from .qr_int4 import (
     _SUPPORTED_ARCHS,
     _cuda_index,
     _resolve_inbox_flags,
-    _validate_ipc_process_group,
     _StEngine,
+    _validate_ipc_process_group,
+    kernel_symbol,
 )
 from .qr_int_shared import SUPPORTED_WORLDS
 
 logger = logging.getLogger("aiter")
 
-# Largest payload this kernel should be asked to move.
-# TODO: Measure the cross-over as a function of the world size.
+# Largest payload this kernel should be asked to move, per world size.
+#
+# This was one world-independent constant, 192 KiB, with a TODO to measure the
+# crossover as a function of world size. Measured, and the world size is not a
+# refinement here -- it is the whole story. The one-shot moves ``(N-1)*S`` where
+# a two-shot moves ``2(N-1)/N*S``, a ratio of ``N/2``: at TP2 the two are equal
+# and this schedule stays ahead to 512 KiB, at TP8 it is pushing 4x the bytes
+# and is done by 48 KiB. 192 KiB was wrong in both directions at once.
+#
+# Mirrors ``qr_ar_policy``'s exact-mode one-shot window rather than restating
+# it, since a standalone caller of this class gets the same default the
+# dispatcher would pick for it. PCIe is the conservative read: its ceilings are
+# at or below the (unmeasured) xGMI placeholders at every world size, so a host
+# this table cannot classify is not over-served.
+MAX_PAYLOAD_BYTES_BY_WORLD = {
+    ws: FAMILY_POLICY[("pcie", ws)].oneshot_max_exact for ws in (2, 4, 8)
+}
+# For an unlisted world size; also what the old constant was.
 MAX_PAYLOAD_BYTES = 192 << 10
+
+
+def max_payload_bytes(world_size: int) -> int:
+    return MAX_PAYLOAD_BYTES_BY_WORLD.get(int(world_size), MAX_PAYLOAD_BYTES)
 
 
 class OneShotAllReduce:
@@ -49,11 +72,17 @@ class OneShotAllReduce:
     Requires a non-NCCL, single-node process group for IPC metadata exchange,
     the same constraint ``QRInt4`` has and for the same reason.
 
-    ``atoms`` and ``grid_cap`` are the tuning surface. Both change the block
-    count for a given payload, which is the knob the TP8 data says is *not*
-    obviously important -- ``cross_device_reduce`` runs 7-8x more blocks than
-    the naive path at no measurable cost -- so they are exposed to be swept
-    rather than pinned to a guess. See docs/qr_1stage.md §6.3.
+    ``atoms``, ``grid_cap`` and ``fanout`` are the tuning surface. Leave all
+    three ``None`` -- the default -- to get ``ONESHOT_LADDER``, which sites them
+    per world size from measurement; this is what production gets. Naming any
+    one of them pins a single configuration at every payload size instead, which
+    is what the benchmark's pinned rows and the tuning sweeps want. A ladder
+    builds one engine, and one IPC inbox, per rung.
+
+    ``max_bytes`` is the payload above which ``allreduce`` refuses to run,
+    defaulting to this world size's entry in ``MAX_PAYLOAD_BYTES_BY_WORLD``.
+    That ceiling is the point of the class: wire volume is ``(N-1)*S`` against a
+    two-shot's ``2(N-1)/N*S``, so where it stops paying is a function of ``N``.
 
     ``inbox_memory`` follows ``QRInt4``: ``"auto"`` picks ``uncached`` on xGMI
     hosts and ``finegrained`` on PCIe ones from the KFD topology, because
@@ -67,10 +96,10 @@ class OneShotAllReduce:
         device,
         rank: int,
         world_size: int,
-        atoms: int = DEFAULT_ATOMS,
+        atoms: int | None = None,
         grid_cap: int | None = None,
         inbox_memory: str = "auto",
-        fanout: str = DEFAULT_FANOUT,
+        fanout: str | None = None,
         max_bytes: int | None = None,
         probe: str = "full",
         spin_sleep: int = DEFAULT_SPIN_SLEEP,
@@ -79,6 +108,18 @@ class OneShotAllReduce:
             raise ValueError(
                 f"world_size must be one of {SUPPORTED_WORLDS}, got {world_size}"
             )
+        # ``None`` on all three tuning knobs means "walk ONESHOT_LADDER", the
+        # same contract ``QRInt4`` gives ``super_tile``. Naming *any* of them
+        # pins a single configuration at every size, because a half-pinned
+        # ladder -- rungs that move ``atoms`` while honouring a caller's
+        # ``fanout`` -- is a thing nobody asked for and nobody could reason
+        # about. The benchmark's pinned rows and the tuning sweeps take that
+        # branch; production takes the ladder.
+        pinned = atoms is not None or grid_cap is not None or fanout is not None
+        if atoms is None:
+            atoms = DEFAULT_ATOMS
+        if fanout is None:
+            fanout = DEFAULT_FANOUT
         if atoms not in SUPPORTED_ATOMS:
             raise ValueError(f"atoms must be one of {SUPPORTED_ATOMS}, got {atoms!r}")
         group_world = dist.get_world_size(group=group)
@@ -106,40 +147,90 @@ class OneShotAllReduce:
         self._device_index = _cuda_index(device)
         self.rank = int(rank)
         self.world_size = int(world_size)
-        self.atoms = int(atoms)
         self.inbox_memory = resolved_inbox
-        self.fanout = fanout
-        self.max_bytes = MAX_PAYLOAD_BYTES if max_bytes is None else int(max_bytes)
+        self.max_bytes = (
+            max_payload_bytes(world_size) if max_bytes is None else int(max_bytes)
+        )
         self.probe = probe
         self.spin_sleep = int(spin_sleep)
 
-        spec = make_qr_1stage_kernel(
-            world_size=self.world_size,
-            atoms=self.atoms,
-            grid=cap,
-            inbox_memory=resolved_inbox,
-            fanout=fanout,
-            probe=probe,
-            spin_sleep=int(spin_sleep),
-        )
-        self._eng = _StEngine(
-            spec=spec,
-            group=group,
-            rank=self.rank,
-            world_size=self.world_size,
-            inbox_flags=inbox_flags,
-            device_index=self._device_index,
-        )
+        # ``(min_bytes, atoms, grid_cap, fanout)`` rungs, ascending. Pinning
+        # collapses to a single rung at floor 0. ``grid_cap`` stays a *ceiling*
+        # rather than a pin, matching QRInt4: lowering it constrains every rung,
+        # raising it above a rung's own cap is a no-op.
+        if pinned:
+            self._ladder = ((0, int(atoms), cap, fanout),)
+        else:
+            self._ladder = tuple(
+                (floor, a, min(rung_cap, cap), f)
+                for floor, a, rung_cap, f in oneshot_ladder(world_size)
+            )
+
+        # One engine per distinct rung config, built in a fixed sorted order:
+        # each does its own IPC handle exchange, which is a collective, so ranks
+        # disagreeing on the order would deadlock.
+        self._by_cfg = {}
+        for _floor, a, c, f in self._ladder:
+            key = (int(a), int(c), f)
+            if key in self._by_cfg:
+                continue
+            spec = make_qr_1stage_kernel(
+                world_size=self.world_size,
+                atoms=key[0],
+                grid=key[1],
+                inbox_memory=resolved_inbox,
+                fanout=key[2],
+                probe=probe,
+                spin_sleep=int(spin_sleep),
+            )
+            self._by_cfg[key] = (
+                _StEngine(
+                    spec=spec,
+                    group=group,
+                    rank=self.rank,
+                    world_size=self.world_size,
+                    inbox_flags=inbox_flags,
+                    device_index=self._device_index,
+                ),
+                spec,
+            )
+
+        # Lowest rung's shape, reported as this object's own. With a pinned
+        # config that is the only rung and these are exact; with a ladder they
+        # describe the smallest payloads, which is what a caller inspecting
+        # ``tile_bytes`` is almost always asking about.
+        first = (int(self._ladder[0][1]), int(self._ladder[0][2]), self._ladder[0][3])
+        eng, spec = self._by_cfg[first]
+        self.atoms = first[0]
+        self.grid_cap = first[1]
+        self.fanout = first[2]
         self.tile_bytes = spec["tile_bytes"]
         self.wire_tile_bytes = spec["wire_tile_bytes"]
-        self.buf_bytes = self._eng.buf_bytes
-        self.grid_cap = cap
+        self.buf_bytes = eng.buf_bytes
 
-    def _num_tiles(self, live_bytes: int) -> int:
-        return max(1, (live_bytes + self.tile_bytes - 1) // self.tile_bytes)
+    @property
+    def inbox_bytes(self) -> int:
+        """IPC inbox bytes this object holds on this rank, across every rung.
 
-    def _grid_x(self, num_tiles: int) -> int:
-        return max(1, min(num_tiles, self.grid_cap))
+        Named to match ``QRInt4.inbox_bytes`` so a caller holding a mixed bag of
+        engines can total them without a type test.
+        """
+        return sum(eng.buf_bytes for eng, _ in self._by_cfg.values())
+
+    def _pick_cfg(self, live_bytes: int):
+        """``(atoms, grid_cap, fanout)`` the ladder assigns to *live_bytes*."""
+        chosen = self._ladder[0]
+        for rung in self._ladder:
+            if live_bytes >= rung[0]:
+                chosen = rung
+        return (int(chosen[1]), int(chosen[2]), chosen[3])
+
+    def _num_tiles(self, live_bytes: int, tile_bytes: int | None = None) -> int:
+        tb = self.tile_bytes if tile_bytes is None else tile_bytes
+        return max(1, (live_bytes + tb - 1) // tb)
+
+    def _grid_x(self, num_tiles: int, grid_cap: int | None = None) -> int:
+        return max(1, min(num_tiles, self.grid_cap if grid_cap is None else grid_cap))
 
     def _check_payload(self, inp, out) -> int:
         if not isinstance(inp, torch.Tensor) or not isinstance(out, torch.Tensor):
@@ -165,10 +256,10 @@ class OneShotAllReduce:
             raise ValueError("inp/out byte size mismatch")
         return live_bytes
 
-    def _launch(self, inp, out, stream) -> None:
+    def _launch_eng(self, eng, spec, inp, out, stream) -> None:
         live_bytes = int(inp.numel()) * int(inp.element_size())
-        num_tiles = self._num_tiles(live_bytes)
-        grid_x = self._grid_x(num_tiles)
+        num_tiles = self._num_tiles(live_bytes, spec["tile_bytes"])
+        grid_x = self._grid_x(num_tiles, spec["grid"])
         if stream is None:
             stream = Stream(None)
         args = (
@@ -177,22 +268,46 @@ class OneShotAllReduce:
             Int32(num_tiles),
             Int64(int(inp.data_ptr())),
             Int64(int(out.data_ptr())),
-            Int64(int(self._eng._gpu_peer_ptrs)),
-            Int64(int(self._eng._colors)),
+            Int64(int(eng._gpu_peer_ptrs)),
+            Int64(int(eng._colors)),
             Int32(grid_x),
             stream,
         )
-        if self._eng.compiled is None:
+        if eng.compiled is None:
             # flyc.compile also launches, so this path is a real collective.
-            self._eng.compiled = flyc.compile(self._eng.launch, *args)
+            eng.compiled = flyc.compile(eng.launch, *args)
         else:
-            self._eng.compiled(*args)
+            eng.compiled(*args)
+
+    def _launch(self, inp, out, stream) -> None:
+        live_bytes = int(inp.numel()) * int(inp.element_size())
+        eng, spec = self._by_cfg[self._pick_cfg(live_bytes)]
+        self._launch_eng(eng, spec, inp, out, stream)
 
     def compile(self, inp, out, stream=None) -> None:
-        """Eager-JIT the binary. A real collective -- every rank must call it
-        with the same shape, and ``out`` is overwritten."""
+        """Eager-JIT every rung's binary.
+
+        A real collective -- every rank must call it with the same shape, and
+        ``out`` is overwritten. Every rung is launched, not just the one this
+        shape selects, so a later payload that picks a different rung does not
+        JIT in the middle of a collective.
+        """
         self._check_payload(inp, out)
-        self._launch(inp, out, stream)
+        for eng, spec in self._by_cfg.values():
+            self._launch_eng(eng, spec, inp, out, stream)
+
+    def variant(self, nbytes: int) -> str:
+        """Identity of the binary an *nbytes* payload would run.
+
+        ``<jit symbol>/g<grid_cap>/x<grid_x>``, matching ``QRInt4.variant``.
+        Resolves the rung through the same ``_pick_cfg`` the launch path uses,
+        so for a ladder-driven engine this is the only way to see which rung a
+        given size takes.
+        """
+        cfg = self._pick_cfg(int(nbytes))
+        eng, spec = self._by_cfg[cfg]
+        grid_x = self._grid_x(self._num_tiles(int(nbytes), spec["tile_bytes"]), cfg[1])
+        return f"{kernel_symbol(eng.launch)}/g{cfg[1]}/x{grid_x}"
 
     def is_beneficial(self, nbytes: int) -> bool:
         return int(nbytes) <= self.max_bytes
@@ -217,6 +332,6 @@ class OneShotAllReduce:
         self._launch(inp, out, stream)
 
     def close(self):
-        if self._eng is not None:
-            self._eng.close()
-            self._eng = None
+        for eng, _ in self._by_cfg.values():
+            eng.close()
+        self._by_cfg = {}

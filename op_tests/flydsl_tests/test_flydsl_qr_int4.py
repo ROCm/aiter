@@ -44,7 +44,7 @@ from aiter.test_common import benchmark, run_perftest
 pytest.importorskip("flydsl")
 
 from aiter.ops.flydsl.kernels.qr_int4 import DEFAULT_GRID_CAP
-from aiter.ops.flydsl.kernels.qr_int4_ring_kernel import RING_ST_LADDER
+from aiter.ops.flydsl.kernels.qr_int4_ring_kernel import ring_st_ladder
 from aiter.ops.flydsl.kernels.qr_int_shared import (
     SUPPORTED_WORLDS,
     TILE_BYTES,
@@ -106,6 +106,7 @@ def _pick_st(
     hidden: int,
     requested: int = SUPER_TILE,
     *,
+    world_size: int,
     grid_cap: int = DEFAULT_GRID_CAP,
     inbox_memory: str = "uncached",
     algorithm: str = "mesh",
@@ -120,15 +121,17 @@ def _pick_st(
 
     The payload one, ring only: publishes per rank are
     ``num_tiles / ST * 2(N-1)``, so a bigger payload wants a bigger super-tile.
-    ``RING_ST_LADDER`` holds the sited rungs. The tests construct QRInt4 without
-    pinning ``super_tile``, so the ring walks that ladder and ``requested`` does
-    not apply to it.
+    ``RING_ST_LADDER`` holds the sited rungs, keyed by world size -- the
+    batching crossover moves with N because publishes per rank carry a
+    ``2(N-1)`` factor. The tests construct QRInt4 without pinning
+    ``super_tile``, so the ring walks that ladder and ``requested`` does not
+    apply to it.
     """
     tiles = _num_tiles(tokens, hidden)
     if algorithm == "ring":
         nbytes = tokens * hidden * 2
         requested = 1
-        for floor, rung_st, _cap in RING_ST_LADDER:
+        for floor, rung_st, _cap in ring_st_ladder(world_size):
             if nbytes >= floor:
                 requested = rung_st
     if requested == 1:
@@ -447,6 +450,7 @@ def _assert_sqnr(
     expected_st = _pick_st(
         tokens,
         hidden,
+        world_size=world_size,
         grid_cap=ranks[0][0]["grid_cap"],
         inbox_memory=ranks[0][0]["inbox_memory"],
         algorithm=algorithm,
