@@ -13,12 +13,14 @@ import torch
 import triton
 import triton.language as tl
 
-from ..gated_delta_rule_utils import (
+from aiter.ops.triton._triton_kernels.gated_delta_rule.gated_delta_rule_utils import (
     autotune_cache_kwargs,
     check_shared_mem,
     input_guard,
 )
-from .index import prepare_chunk_indices
+from aiter.ops.triton._triton_kernels.gated_delta_rule.utils.index import (
+    prepare_chunk_indices,
+)
 
 BS_LIST = [32, 64] if check_shared_mem() else [16, 32]
 

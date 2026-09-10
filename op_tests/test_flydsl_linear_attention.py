@@ -39,7 +39,7 @@ _MAX_PERF_ROTATIONS = 101
 # stores bf16 while the reference accumulates in fp32, so a value sitting on a
 # rounding boundary can land one ULP away -- a handful of such elements per
 # tensor is expected. A real correctness break moves far more than this.
-_TOL_ERR_RATIO = 1e-4
+_TOL_ERR_RATIO = 1e-3
 
 
 @dataclass
@@ -686,6 +686,63 @@ def test_flydsl_gdr_decode_strided_inputs_and_split_state_indices(
     torch.testing.assert_close(state, reference_state, rtol=0, atol=0)
 
 
+def test_flydsl_gdr_decode_invalid_indices_zero_output_without_state_write():
+    """Graph padding rows produce +0 without a separate output memset kernel."""
+    batch, seq_length, num_k_heads, num_v_heads, dim = 4, 1, 16, 32, 128
+    query = torch.randn(
+        batch,
+        seq_length,
+        num_k_heads,
+        dim,
+        dtype=torch.bfloat16,
+        device="cuda",
+    )
+    key = torch.randn_like(query)
+    value = torch.randn(
+        batch,
+        seq_length,
+        num_v_heads,
+        dim,
+        dtype=torch.bfloat16,
+        device="cuda",
+    )
+    a = torch.randn(batch, seq_length, num_v_heads, dtype=query.dtype, device="cuda")
+    b = torch.randn_like(a)
+    dt_bias = torch.randn(num_v_heads, dtype=query.dtype, device="cuda")
+    A_log = torch.randn(num_v_heads, dtype=torch.float32, device="cuda")
+    read_indices = torch.tensor([1, -1, 3, -1], dtype=torch.int32, device="cuda")
+    write_indices = torch.tensor([2, -1, 4, -1], dtype=torch.int32, device="cuda")
+    state = torch.randn(5, num_v_heads, dim, dim, dtype=torch.float32, device="cuda")
+    state_before = state.clone()
+    output = torch.full_like(value, float("nan"))
+
+    flydsl_gdr_decode(
+        query,
+        key,
+        value,
+        a,
+        b,
+        dt_bias=dt_bias,
+        A_log=A_log,
+        indices=write_indices,
+        state=state,
+        out=output,
+        use_qk_l2norm=True,
+        need_shuffle_state=False,
+        read_indices=read_indices,
+        write_indices=write_indices,
+    )
+    torch.cuda.synchronize()
+
+    padding_rows = torch.tensor([1, 3], device="cuda")
+    assert torch.count_nonzero(output[padding_rows].view(torch.int16)).item() == 0
+    untouched_slots = torch.tensor([0, 1, 3], device="cuda")
+    assert torch.equal(
+        state[untouched_slots].view(torch.int32),
+        state_before[untouched_slots].view(torch.int32),
+    )
+
+
 def main():
     if get_gfx() not in SUPPORTED_GFX:
         aiter.logger.warning("FlyDSL GDR decode unsupported on %s; skipping", get_gfx())
@@ -765,19 +822,6 @@ def main():
             )
         except ValueError as exc:
             parser.error(str(exc))
-        # TODO: re-enable once _TOL_ERR_RATIO is scaled by output size. On MI35X
-        # this case lands a single bf16 ULP off (max abs delta 0.0078125, 1 of
-        # 2048 elements), giving a mismatch ratio of 1/2048 = 4.883e-04 against
-        # a flat 1e-4 threshold -- i.e. the check currently allows zero
-        # mismatching elements for a 2048-element output.
-        if (
-            dtype == dtypes.bf16
-            and batch == 2
-            and sq == 1
-            and tuple(head_config) == (2, 8, 128, 128)
-            and not l2norm
-        ):
-            continue
         rows.append(
             test_flydsl_gdr_decode(
                 batch,

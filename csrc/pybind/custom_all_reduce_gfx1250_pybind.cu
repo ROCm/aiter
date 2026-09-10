@@ -4,7 +4,7 @@
 #include "aiter_stream.h"
 #include "custom_all_reduce_gfx1250.h"
 
-PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
+PYBIND11_MODULE(AITER_EXTENSION_NAME, m)
 {
     m.def("_set_current_hip_stream",
           [](int64_t stream_ptr) { aiter::setCurrentHIPStream((hipStream_t)stream_ptr); },
