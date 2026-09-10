@@ -563,6 +563,74 @@ def get_inter_dim(w1_shape, w2_shape):
     return E, model_dim, inter_dim
 
 
+def _use_flydsl_a4w4_prefill(
+    hidden_states,
+    w1,
+    w2,
+    *,
+    quant_type,
+    activation,
+    swiglu_limit,
+    gate_mode,
+    expert_mask,
+    doweight_stage1,
+    a1_scale,
+    a2_scale,
+    bias1,
+    bias2,
+    beta,
+    linear_beta,
+    num_local_tokens,
+    hidden_pad,
+    intermediate_pad,
+    dtype,
+):
+    """Whether ``kernels/moe_a4w4_prefill`` handles this call.
+
+    It replaces the sort / stage-1 / intermediate-quant / stage-2 kernels of the
+    per_1x32 fp4 chain for the plain swiglu-OAI MoE, produces the same bits and
+    is 1.1-1.3x faster from ``MIN_PREFILL_TOKENS`` up. Anything it does not
+    implement -- EP, bias, situ activations, padding, pre-quantized activations,
+    a non-bf16 output -- returns False and falls through to the normal dispatch,
+    as does every batch outside its range: below ``MIN_PREFILL_TOKENS`` aiter's
+    small-batch configuration is faster. ``AITER_FLYDSL_A4W4_PREFILL=0`` opts
+    out entirely.
+    """
+    if os.environ.get("AITER_FLYDSL_A4W4_PREFILL", "1") != "1":
+        return False
+    if get_gfx() != "gfx950" or quant_type != QuantType.per_1x32:
+        return False
+    if w1.dtype != dtypes.fp4x2 or w2.dtype != dtypes.fp4x2:
+        return False
+    if activation != ActivationType.Swiglu or GateMode(gate_mode) != GateMode.SEPARATED:
+        return False
+    if swiglu_limit != 7.0:  # gemm1 bakes in swiglu-OAI alpha 1.702 / limit 7
+        return False
+    if beta not in (None, 1.0) or linear_beta is not None:
+        return False
+    if expert_mask is not None or num_local_tokens is not None or doweight_stage1:
+        return False
+    if any(t is not None for t in (a1_scale, a2_scale, bias1, bias2)):
+        return False
+    if hidden_pad or intermediate_pad:
+        return False
+    if dtype not in (None, dtypes.bf16) or hidden_states.dtype != dtypes.bf16:
+        return False
+    if hidden_states.dim() != 2 or not hidden_states.is_contiguous():
+        return False
+
+    from aiter.ops.flydsl.kernels.moe_a4w4_prefill import (
+        MAX_PREFILL_TOKENS,
+        MIN_PREFILL_TOKENS,
+        supports_shapes,
+    )
+
+    if not MIN_PREFILL_TOKENS <= hidden_states.shape[0] <= MAX_PREFILL_TOKENS:
+        return False
+    _, model_dim, inter_dim = get_inter_dim(w1.shape, w2.shape)
+    return supports_shapes(model_dim, inter_dim)
+
+
 def fused_moe(
     hidden_states,
     w1,  # [expert(local_expert:EP), inter_dim*2, dim] N,K
@@ -644,6 +712,50 @@ def fused_moe(
             shared_w2_scale=shared_w2_scale,
             shared_expert_id=shared_expert_id,
             output=output,
+        )
+    if stage2_scatter is None and _use_flydsl_a4w4_prefill(
+        hidden_states,
+        w1,
+        w2,
+        quant_type=quant_type,
+        activation=activation,
+        swiglu_limit=swiglu_limit,
+        gate_mode=gate_mode,
+        expert_mask=expert_mask,
+        doweight_stage1=doweight_stage1,
+        a1_scale=a1_scale,
+        a2_scale=a2_scale,
+        bias1=bias1,
+        bias2=bias2,
+        beta=beta,
+        linear_beta=linear_beta,
+        num_local_tokens=num_local_tokens,
+        hidden_pad=hidden_pad,
+        intermediate_pad=intermediate_pad,
+        dtype=dtype,
+    ):
+        from aiter.ops.flydsl.kernels.moe_a4w4_prefill import a4w4_prefill_moe
+
+        E, model_dim, inter_dim = get_inter_dim(w1.shape, w2.shape)
+        if output is not None:
+            _validate_output_buffer_metadata(
+                output,
+                (hidden_states.shape[0], model_dim),
+                dtypes.bf16,
+                hidden_states.device,
+            )
+        return a4w4_prefill_moe(
+            hidden_states,
+            w1,
+            w1_scale,
+            w2,
+            w2_scale,
+            topk_weight,
+            topk_ids,
+            hidden_size=model_dim,
+            intermediate_size=inter_dim,
+            num_experts=E,
+            out=output,
         )
     if not block_size_M:
         block_size_M = -1
