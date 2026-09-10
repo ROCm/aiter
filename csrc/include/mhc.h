@@ -10,9 +10,9 @@ namespace aiter {
 void mhc_pre_gemm_sqrsum(aiter_tensor_t& out,    // (split_k, m, hc_mult3) / (m, hc_mult3)
                          aiter_tensor_t& sqrsum, // (split_k, m) / (m)
                          aiter_tensor_t& x,      // (m, hc_hidden_size)
-                         aiter_tensor_t& fn,     // (hc_mult3, hc_hidden_size) fp32; packed int32 when is_w_preshuffle_bf16
+                         aiter_tensor_t& fn,     // (hc_mult3, hc_hidden_size) fp32; packed int32 when w_preshuffle_bf16
                          int tile_k = 128,
-                         int is_w_preshuffle_bf16 = 0);
+                         int w_preshuffle_bf16 = 0);
 // Pre-convert fn (fp32) into packed int32 BF16 hi/lo weights for the gemm paths.
 void mhc_pre_convert_fn(aiter_tensor_t& fn_packed, // (hc_mult3, hc_hidden_size) int32 out
                         aiter_tensor_t& fn);       // (hc_mult3, hc_hidden_size) fp32 in
@@ -78,11 +78,11 @@ void mhc_fused_post_pre_gemm_sqrsum(
     aiter_tensor_t& post_layer_mix,  // (m, hc_mult)
     aiter_tensor_t& comb_res_mix,    // (m, hc_mult, hc_mult)
     aiter_tensor_t& fn,              // (hc_mult3, hc_mult * hidden_size) fp32; packed int32
-                                     // when is_res_w_preshuffle_bf16
+                                     // when w_preshuffle_bf16
     int tile_m                       = 16,
     int tile_n                       = 32,
     int tile_k                       = 32,
-    // 1: bf16 hi/lo fn gemm, and residual_in / next_residual are in the
-    // pre-shuffled resS[k/KS][head][row][k%KS] layout.
-    int is_res_w_preshuffle_bf16     = 0);
+    // Independent compute and residual-layout controls.
+    int w_preshuffle_bf16           = 0,
+    int res_preshuffle              = 0); // shuffled residuals require gfx1250
 } // namespace aiter

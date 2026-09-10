@@ -20,10 +20,8 @@ p.add_argument("-m", type=int, default=2048)
 p.add_argument("-n", "--hidden_size", type=int, default=7168)
 p.add_argument("--hc_mult", type=int, default=4)
 p.add_argument("--iters", type=int, default=1)
-p.add_argument("--res_w_preshuffle_bf16", action="store_true", default=True)
-p.add_argument(
-    "--no_res_w_preshuffle_bf16", dest="res_w_preshuffle_bf16", action="store_false"
-)
+p.add_argument("--w_preshuffle_bf16", action=argparse.BooleanOptionalAction, default=True)
+p.add_argument("--res_preshuffle", "--res_shuffle", action=argparse.BooleanOptionalAction, default=False)
 p.add_argument("--fuse_rmsnorm", action="store_true", default=True)
 p.add_argument("--warmup", type=int, default=200, help="--bench: warm-up dispatches before timing")
 p.add_argument(
@@ -61,21 +59,21 @@ if a.fuse_rmsnorm:
     kwargs["norm_weight"] = norm_weight
     kwargs["norm_eps"] = 1e-6
 
-pack_flag = 1 if a.res_w_preshuffle_bf16 else 0
-if pack_flag:
-    from aiter.ops.mhc import MHC_RES_SHUFFLE, mhc_pre_convert_fn, mhc_res_shuffle
+from aiter.ops.mhc import mhc_pre_convert_fn, mhc_res_shuffle
 
+pack_flag = int(a.w_preshuffle_bf16)
+if pack_flag:
     fn_gemm = torch.empty(hc_mult3, hc_hidden_size, dtype=torch.int32)
     mhc_pre_convert_fn(fn_gemm, fn)
-    # The flag also switches residual_in/next_residual to the pre-shuffled layout.
-    if MHC_RES_SHUFFLE:
-        residual_in = mhc_res_shuffle(residual_in)
 else:
     fn_gemm = fn
+if a.res_preshuffle:
+    residual_in = mhc_res_shuffle(residual_in)
 
 call = dict(
     force_fused=True,
-    is_res_w_preshuffle_bf16=pack_flag,
+    w_preshuffle_bf16=a.w_preshuffle_bf16,
+    res_preshuffle=a.res_preshuffle,
     **kwargs,
 )
 args_pos = (
@@ -100,9 +98,9 @@ if a.bench:
     torch.cuda.synchronize()
 
     _, us = run_perftest(aiter.mhc_fused_post_pre, *args_pos, **call)
-    print(f"BENCH us={us:.4f} m={m} hidden={hidden_size} preshuffle={pack_flag}")
+    print(f"BENCH us={us:.4f} m={m} hidden={hidden_size} w_preshuffle_bf16={pack_flag} res_preshuffle={int(a.res_preshuffle)}")
 else:
     for _ in range(a.iters):
         aiter.mhc_fused_post_pre(*args_pos, **call)
     torch.cuda.synchronize()
-    print(f"done: m={m} hidden={hidden_size} preshuffle={pack_flag} iters={a.iters}")
+    print(f"done: m={m} hidden={hidden_size} w_preshuffle_bf16={pack_flag} res_preshuffle={int(a.res_preshuffle)} iters={a.iters}")

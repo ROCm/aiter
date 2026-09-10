@@ -527,7 +527,7 @@ def test_mhc_pre(
     ret["hip_us"] = hip_us
 
     # bf16 GEMM path: pre-pack fn (fp32) -> int32 (hi<<16|lo) ONCE via mhc_pre_convert_fn
-    # (fn are constant weights), then run mhc_pre with is_w_preshuffle_bf16=1 so the gemm
+    # (fn are constant weights), then run mhc_pre with w_preshuffle_bf16=1 so the gemm
     # bit-extracts hi/lo instead of recomputing the fp32->bf16 split per (m_block, k).
     # On gfx950 this uses the native bf16 MFMA; gfx1250 the wave32 bf16 WMMA (UNVERIFIED).
     if w_preshuffle_bf16:
@@ -547,7 +547,7 @@ def test_mhc_pre(
             fn_packed,
             hc_scale,
             hc_base,
-            is_w_preshuffle_bf16=1,
+            w_preshuffle_bf16=1,
             **hip_kwargs,
         )
         ret["hip_bf16_err"] = checkAllclose(
@@ -794,13 +794,13 @@ def test_mhc_post_pre(
     hc_mult,
     fuse_rmsnorm=False,
     large_m=False,
-    res_w_preshuffle_bf16=False,
+    w_preshuffle_bf16=False,
+    res_preshuffle=False,
 ):
     """Fused mhc_post + mhc_pre: HIP ``mhc_fused_post_pre`` vs ref / unfused HIP / Triton.
 
-    --res_w_preshuffle_bf16 toggles the gemm compute for ALL HIP paths (unfused, fused, large_m):
-    on -> pre-packed BF16 hi/lo compute; off -> fp32.
-    Only the fused path additionally switches the residual to a shuffled layout.
+    --w_preshuffle_bf16 selects packed BF16 hi/lo compute for all HIP paths.
+    --res_shuffle independently selects the fused residual input/output layout.
     """
     if hidden_size < 512:
         aiter.logger.info(
@@ -857,37 +857,23 @@ def test_mhc_post_pre(
     if fuse_rmsnorm:
         hip_kwargs["norm_weight"] = norm_weight
 
-    ret = {"fuse_rmsnorm": fuse_rmsnorm, "res_w_preshuffle_bf16": res_w_preshuffle_bf16}
+    from aiter.ops.mhc import mhc_pre_convert_fn, mhc_res_shuffle, mhc_res_unshuffle
 
-    # --res_w_preshuffle_bf16 toggles the gemm compute for all HIP paths: on -> pre-pack fn (fp32)
-    # into int32 BF16 hi/lo ONCE via mhc_pre_convert_fn and enable BF16 GEMM so
-    # the gemm bit-extracts hi/lo (gfx950 native bf16 MFMA; gfx1250 wave32 bf16 WMMA,
-    # UNVERIFIED; other arches fall back to fp32); off -> plain fp32 fn.
-    if res_w_preshuffle_bf16:
-        from aiter.ops.mhc import (
-            MHC_RES_SHUFFLE,
-            mhc_pre_convert_fn,
-            mhc_res_shuffle,
-            mhc_res_unshuffle,
-        )
-
-        fn_gemm = torch.empty(
-            fn.shape[0], fn.shape[1], dtype=torch.int32, device=fn.device
-        )
+    packed = w_preshuffle_bf16
+    shuffled = res_preshuffle
+    ret = {
+        "fuse_rmsnorm": fuse_rmsnorm,
+        "w_preshuffle_bf16": bool(packed),
+        "res_preshuffle": bool(shuffled),
+    }
+    pack_flag = int(packed)
+    # Pack weights and change residual layout independently, outside the timed call.
+    if packed:
+        fn_gemm = torch.empty_like(fn, dtype=torch.int32)
         mhc_pre_convert_fn(fn_gemm, fn)
-        pack_flag = 1
-        # The flag also switches the residual to the pre-shuffled layout
-        # res[k/KS][head][row][k%KS], which only the fused path understands. Convert at
-        # the call boundary here; in a real stack the conversion disappears because
-        # next_residual feeds the next layer's residual_in already shuffled. The unfused
-        # reference path below keeps the plain layout.
-        residual_in_fused = (
-            mhc_res_shuffle(residual_in) if MHC_RES_SHUFFLE else residual_in
-        )
     else:
         fn_gemm = fn
-        pack_flag = 0
-        residual_in_fused = residual_in
+    residual_in_fused = mhc_res_shuffle(residual_in) if shuffled else residual_in
 
     (
         post_mix_unfused,
@@ -903,7 +889,7 @@ def test_mhc_post_pre(
         fn_gemm,
         hc_scale,
         hc_base,
-        is_w_preshuffle_bf16=pack_flag,
+        w_preshuffle_bf16=pack_flag,
         **hip_kwargs,
     )
 
@@ -922,7 +908,8 @@ def test_mhc_post_pre(
         hc_scale,
         hc_base,
         force_fused=True,
-        is_res_w_preshuffle_bf16=pack_flag,
+        w_preshuffle_bf16=w_preshuffle_bf16,
+        res_preshuffle=res_preshuffle,
         **hip_kwargs,
     )
 
@@ -932,7 +919,7 @@ def test_mhc_post_pre(
         layer_input_ref, layer_input_unfused, msg="unfused/layer_input"
     )
     checkAllclose(next_residual_ref, next_residual_unfused, msg="unfused/next_residual")
-    if res_w_preshuffle_bf16 and MHC_RES_SHUFFLE:
+    if shuffled:
         next_residual_fused = mhc_res_unshuffle(next_residual_fused)
     checkAllclose(post_mix_ref, post_mix_fused, msg="fused/post_mix")
     checkAllclose(comb_mix_ref, comb_mix_fused, msg="fused/comb_mix")
@@ -1015,7 +1002,8 @@ def test_mhc_post_pre(
                 fn_gemm,
                 hc_scale,
                 hc_base,
-                is_res_w_preshuffle_bf16=pack_flag,
+                w_preshuffle_bf16=w_preshuffle_bf16,
+                res_preshuffle=False,
                 **hip_kwargs,
             )
             ret["large_m_us"] = large_m_us
@@ -1054,10 +1042,10 @@ parser.add_argument(
     "--hidden_size",
     type=int,
     nargs="*",
-    choices=[1280, 2560, 4096, 7168],
-    default=[1280, 2560, 4096, 7168],
+    choices=[4096, 5120, 7168],
+    default=[4096, 5120, 7168],
     help="""hidden_size.
-    e.g.: -hidden_size 1024""",
+    e.g.: -n 5120""",
 )
 _mode_group = parser.add_mutually_exclusive_group()
 _mode_group.add_argument(
@@ -1077,17 +1065,24 @@ parser.add_argument(
     "(gfx950, M>1024, mhc_fused_post_pre_large_m).",
 )
 parser.add_argument(
-    "--res_w_preshuffle_bf16",
-    action="store_true",
-    help="Pre-shuffled weight + residual bf16 path. fn is converted once by "
-    "mhc_pre_convert_fn into block-interleaved bf16 hi/lo (fn[n][k/16][0|1][k%16]) and the "
-    "gemm contracts it with two bf16 MMAs, no per-element unpacking; the fused path's "
-    "residual_in/next_residual additionally use resS[k/KS][head][row][k%KS] (converted at "
-    "the call boundary here). gfx950 native bf16 MFMA; gfx1250 wave32 bf16 WMMA; other "
-    "arches fall back to fp32.",
+    "--w_preshuffle_bf16",
+    action=argparse.BooleanOptionalAction,
+    default=False,
+    help="Enable BF16 hi/lo GEMM with pre-packed weights, independently of residual layout.",
+)
+parser.add_argument(
+    "--res_shuffle",
+    "--res_preshuffle",
+    dest="res_preshuffle",
+    action=argparse.BooleanOptionalAction,
+    default=False,
+    help="Use shuffled residual input/output in the fused path (gfx1250 only), "
+    "independently of GEMM compute.",
 )
 
 args = parser.parse_args()
+if not args.hc_head and args.res_preshuffle and get_gfx_runtime() != "gfx1250":
+    parser.error("residual shuffle is only supported on gfx1250; use --no-res_shuffle")
 
 df = []
 for dtype in args.dtype:
@@ -1100,7 +1095,7 @@ for dtype in args.dtype:
                     hc_mult=hc_mult,
                     test_hc_head=args.hc_head,
                     fuse_rmsnorm=args.fuse_rmsnorm,
-                    w_preshuffle_bf16=args.res_w_preshuffle_bf16,
+                    w_preshuffle_bf16=args.w_preshuffle_bf16,
                 )
                 df.append(ret)
 df = pd.DataFrame(df)
@@ -1130,7 +1125,8 @@ if not args.hc_head:
                         hc_mult=hc_mult,
                         fuse_rmsnorm=args.fuse_rmsnorm,
                         large_m=args.largeM,
-                        res_w_preshuffle_bf16=args.res_w_preshuffle_bf16,
+                        w_preshuffle_bf16=args.w_preshuffle_bf16,
+                        res_preshuffle=args.res_preshuffle,
                     )
                     if ret.get("skipped"):
                         continue
