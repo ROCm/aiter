@@ -87,8 +87,7 @@ def test_sparse_mla_decode_split_major_policy(seq: int, groups: int, expected: b
     assert _use_split_major(seq, groups, num_cu=256) is expected
 
 
-@pytest.mark.parametrize("splits", (8, 16, 32))
-def test_sparse_mla_decode_reducer_policy(splits: int):
+def test_sparse_mla_decode_reducer_policy():
     """Fine mode may switch off once as `seq` grows, and never back on.
 
     The coarse reducer's grid grows monotonically with `seq`, so the choice
@@ -99,7 +98,7 @@ def test_sparse_mla_decode_reducer_policy(splits: int):
     inside the band could not see it.
     """
     num_cu = 256
-    picks = [_use_fine_decode_combine(s, splits, num_cu) for s in range(1, 129)]
+    picks = [_use_fine_decode_combine(s, num_cu) for s in range(1, 129)]
     assert picks[0] is True, "a 1-row decode must not run the coarse reducer"
     assert picks[-1] is False, "fine must give way once coarse saturates"
     flips = sum(a is not b for a, b in itertools.pairwise(picks))

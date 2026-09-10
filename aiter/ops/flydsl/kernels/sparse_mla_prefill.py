@@ -89,7 +89,10 @@ def _prefill_splits(num_tokens: int, device) -> int:
         return 1
     num_cu = torch.cuda.get_device_properties(device).multi_processor_count
     want = min(2 * num_cu // num_tokens, _SPLIT_CAP)
-    return max(s for s in _SPLIT_CHOICES if s <= want)
+    # `default` is load-bearing on a partitioned device: CPX mode divides the
+    # part into eight, and under 48 CUs `want` reaches 0 at 96 tokens, where
+    # the unguarded `max` would raise instead of settling on one split.
+    return max((s for s in _SPLIT_CHOICES if s <= want), default=1)
 
 
 def _raw(value):

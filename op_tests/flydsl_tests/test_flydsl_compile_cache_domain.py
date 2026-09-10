@@ -52,7 +52,7 @@ class TestCompileCacheDomain(unittest.TestCase):
     def test_combine_cache_covers_its_key_domain(self):
         # Keyed on (ni, fine), so the ni range alone under-counts it by 2x.
         keys = {
-            (ni, _use_fine_decode_combine(seq, ni, cu))
+            (ni, _use_fine_decode_combine(seq, cu))
             for cu in CU_COUNTS
             for seq in range(1, SEQ_MAX + 1)
             for ni in range(1, NI_MAX + 1)
