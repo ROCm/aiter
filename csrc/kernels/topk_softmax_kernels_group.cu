@@ -1237,6 +1237,10 @@ void biased_grouped_topk(const aiter_tensor_t& gating_output,   // [num_tokens, 
     int topk            = topk_ids.size(1);
     size_t stride_gating = gating_output.stride(0);
     size_t stride_tk    = topk_ids.stride(0);
+    AITER_CHECK(topk_weights.dtype() == AITER_DTYPE_fp32,
+                "topk_weights must be float32");
+    AITER_CHECK(topk_ids.dtype() == AITER_DTYPE_i32,
+                "topk_ids must be int32");
     AITER_CHECK(gating_output.stride(1) == 1, "gating_output last dimension must be contiguous");
     AITER_CHECK(topk_grp >= 1 && topk_grp <= num_expert_group,
                 "topk_grp must be in [1, num_expert_group], but got topk_grp=",
@@ -1287,6 +1291,10 @@ void grouped_topk(const aiter_tensor_t& gating_output, // [num_tokens, num_exper
     size_t stride_gating = gating_output.stride(0);
     size_t stride_tk     = topk_ids.stride(0);
     const aiter_tensor_t& correction_bias = topk_ids;
+    AITER_CHECK(topk_weights.dtype() == AITER_DTYPE_fp32,
+                "topk_weights must be float32");
+    AITER_CHECK(topk_ids.dtype() == AITER_DTYPE_i32,
+                "topk_ids must be int32");
     AITER_CHECK(gating_output.stride(1) == 1, "gating_output last dimension must be contiguous");
     AITER_CHECK(topk_grp >= 1 && topk_grp <= num_expert_group,
                 "topk_grp must be in [1, num_expert_group], but got topk_grp=",

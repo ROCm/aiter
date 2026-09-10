@@ -1390,7 +1390,9 @@ def get_split_k_buffers(stream, device):
 
 
 def _dynamic_tensor_arg(tensor, leading_dim):
-    return flyc.from_dlpack(tensor).mark_layout_dynamic(leading_dim=leading_dim)
+    return flyc.from_dlpack(tensor.detach()).mark_layout_dynamic(
+        leading_dim=leading_dim
+    )
 
 
 def gemm_a16w16(
