@@ -258,7 +258,11 @@ float fmha_fwd_v3(mha_fwd_args a, const ck_tile::stream_config& s)
     size_t arg_size = sizeof(args);
     init_fmha_fwd_v3_args(args, a, cfg.ts_qo, arch_id);
 
-    int bdx              = (a.hdim_q == 192 && a.hdim_v == 128) ? 256 : 512;
+    int bdx = 512;
+    if(a.hdim_q == 192 && a.hdim_v == 128)
+        bdx = 256;
+    if(arch_id == "gfx950" && a.hdim_q == 256 && a.data_type == "bf16")
+        bdx = 256;
     auto [gdx, gdy, gdz] = get_grid_dim(a, cfg.ts_qo, arch_id);
 
     return ck_tile::launch_kernel(s, [=](const ck_tile::stream_config& s_) mutable {
