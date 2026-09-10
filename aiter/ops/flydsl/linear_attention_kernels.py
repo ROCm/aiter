@@ -6,11 +6,11 @@
 from __future__ import annotations
 
 import csv
-import os
-from pathlib import Path
 
 import torch
 from flydsl.runtime.device import get_rocm_arch
+
+from aiter.jit.core import AITER_CONFIGS
 
 from .kernels.gdr_decode import create_vk_gdr_decode_kernel
 from .kernels.tensor_shim import _run_compiled, get_dtype_str
@@ -41,8 +41,7 @@ def get_default_kwargs(
     global GDR_GLOBAL_CONFIG_MAP
     if GDR_GLOBAL_CONFIG_MAP is None:
         _dict = {}
-        fname = os.path.join(Path(__file__).resolve().parent, "gdr_decode_tuned.csv")
-        with open(fname, "r", encoding="utf-8") as f:
+        with open(AITER_CONFIGS.AITER_CONFIG_GDR_DECODE_FILE, encoding="utf-8") as f:
             reader = csv.DictReader(f)
             for row in reader:
                 obj = dict(row)
@@ -191,3 +190,8 @@ def flydsl_gdr_decode(
     if need_shuffle_state:
         state_ = state_.permute(0, 1, 3, 2).contiguous()
         state.copy_(state_)
+
+
+# Consumers may safely allocate ``out`` with ``torch.empty``: the fused kernel
+# writes positive zero for every negative-index graph-padding row.
+flydsl_gdr_decode.zeroes_invalid_output = True
