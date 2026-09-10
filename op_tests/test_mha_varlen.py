@@ -579,9 +579,14 @@ def test_flash_attn_varlen_func(
         reorder_ops=True,
     )
 
-    out_diff = (out - out_ref).abs().max().item()
+    abs_diff = (out - out_ref).abs()
+    out_diff = abs_diff.max().item()
     ref_diff = (out_pt - out_ref).abs().max().item()
+    max_val = max(out.abs().max().item(), out_ref.abs().max().item(), 1e-7)
+    nrms = (abs_diff / max_val).pow(2).mean().sqrt().item()
     print(f"Output max diff: {out_diff}")
+    print(f"Output mean diff: {abs_diff.mean().item()}")
+    print(f"Output NRMS: {nrms}")
     print(f"Output Pytorch max diff: {ref_diff}")
     out_tol = max(4 * ref_diff, 0.01)
     assert out_diff <= out_tol, f"forward diff {out_diff} exceeds tolerance {out_tol}"
