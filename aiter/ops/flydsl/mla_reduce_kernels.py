@@ -389,9 +389,18 @@ def _compile_sparse_decode_direct_combine(ni: int, fine: bool):
 
 
 def _use_fine_decode_combine(seq: int, ni: int, num_cu: int) -> bool:
-    """Select the Dv-sliced reducer only over its measured occupancy window."""
-    fine_ctas = seq * 64
-    return ni > 16 and num_cu <= fine_ctas <= 3 * num_cu
+    """Slice Dv while the coarse grid would leave the device under-occupied.
+
+    Coarse runs `seq * 16` blocks of 64 threads, so a short decode fills a
+    fraction of the machine and walks every split serially; fine runs 64
+    blocks per row at a quarter of the bytes per lane. Fine's only real cost
+    is recomputing the `ni`-wide LSE butterfly per Dv slice, which starts to
+    matter once coarse already saturates. Test that, and nothing else: the
+    previous form gated on `seq * 64` against `num_cu`, which excluded exactly
+    the short sequences fine helps most, and its `ni > 16` term kept it off
+    every merged shape as well.
+    """
+    return seq * 16 < 2 * num_cu
 
 
 def _require_warm(key, what: str) -> None:

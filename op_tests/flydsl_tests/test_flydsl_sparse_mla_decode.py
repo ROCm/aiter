@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import itertools
 import math
 from dataclasses import dataclass
 
@@ -86,12 +87,23 @@ def test_sparse_mla_decode_split_major_policy(seq: int, groups: int, expected: b
     assert _use_split_major(seq, groups, num_cu=256) is expected
 
 
-@pytest.mark.parametrize(
-    ("seq", "splits", "expected"),
-    ((1, 32, False), (4, 32, True), (8, 32, True), (12, 16, False), (13, 32, False)),
-)
-def test_sparse_mla_decode_reducer_policy(seq: int, splits: int, expected: bool):
-    assert _use_fine_decode_combine(seq, splits, num_cu=256) is expected
+@pytest.mark.parametrize("splits", (8, 16, 32))
+def test_sparse_mla_decode_reducer_policy(splits: int):
+    """Fine mode may switch off once as `seq` grows, and never back on.
+
+    The coarse reducer's grid grows monotonically with `seq`, so the choice
+    between it and the Dv-sliced one has exactly one crossing. Asserting the
+    shape rather than a table of values is what catches the failure mode this
+    replaced: a policy expressed as a *band* left both the short sequences and
+    the long ones on the under-occupied path, and a table of sampled points
+    inside the band could not see it.
+    """
+    num_cu = 256
+    picks = [_use_fine_decode_combine(s, splits, num_cu) for s in range(1, 129)]
+    assert picks[0] is True, "a 1-row decode must not run the coarse reducer"
+    assert picks[-1] is False, "fine must give way once coarse saturates"
+    flips = sum(a is not b for a, b in itertools.pairwise(picks))
+    assert flips == 1, f"policy is not monotone in seq: {flips} transitions"
 
 
 def _snr_db(actual: torch.Tensor, ref: torch.Tensor) -> float:
