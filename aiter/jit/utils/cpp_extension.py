@@ -207,7 +207,7 @@ def _read_hip_header_version(include_dir: str) -> tuple[int, int] | None:
     try:
         with open(version_header) as header:
             content = header.read()
-    except OSError:
+    except (OSError, UnicodeError):
         return None
 
     major = re.search(
@@ -221,24 +221,27 @@ def _read_hip_header_version(include_dir: str) -> tuple[int, int] | None:
     return int(major.group(1)), int(minor.group(1))
 
 
-def _find_matching_system_rocm_include(
-    compiler_version: tuple[int, ...] | None,
-) -> str | None:
-    """Find compatible system development headers for a Python ROCm compiler.
-
-    Python ROCm SDK entry points can make ROCM_HOME resolve to the virtual
-    environment even when the matching development headers were installed by
-    the system package manager. Only use the alternatives-managed system tree
-    when it contains rocPRIM and its HIP major/minor version matches the active
-    compiler. This avoids silently mixing incompatible ROCm releases.
-    """
-    if compiler_version is None:
-        return None
+def _find_matching_system_rocm_include() -> str | None:
+    """Use system rocPRIM headers only if their HIP version matches hipcc."""
     if not os.path.isfile(os.path.join(_SYSTEM_ROCM_INCLUDE, _ROCPRIM_HEADER)):
         return None
-
     header_version = _read_hip_header_version(_SYSTEM_ROCM_INCLUDE)
-    if header_version != tuple(compiler_version[:2]):
+    if header_version is None:
+        return None
+
+    # ROCM_VERSION can come from an unrelated hipconfig on PATH or even the
+    # system headers themselves. Query the compiler used by the build instead.
+    try:
+        output = subprocess.check_output(
+            [_join_rocm_home("bin", "hipcc"), "--version"],
+            text=True,
+            stderr=subprocess.STDOUT,
+            timeout=10,
+        )
+    except (OSError, subprocess.SubprocessError, UnicodeError):
+        return None
+    version = re.search(r"HIP version:\s*(\d+)\.(\d+)\b", output)
+    if version is None or header_version != tuple(map(int, version.groups())):
         return None
     return _SYSTEM_ROCM_INCLUDE
 
@@ -1065,8 +1068,8 @@ def include_paths(cuda: bool = False) -> list[str]:
         if not any(
             os.path.isfile(os.path.join(path, _ROCPRIM_HEADER)) for path in paths
         ):
-            system_include = _find_matching_system_rocm_include(ROCM_VERSION)
-            if system_include is not None and system_include not in paths:
+            system_include = _find_matching_system_rocm_include()
+            if system_include is not None:
                 paths.append(system_include)
     return paths
 
