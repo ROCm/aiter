@@ -111,8 +111,8 @@ def test_gemm(
             dtypes.fp8
         )
     else:
-        x = bench_init.fill_fp8((m, k), data_init, generator)
-        weight = bench_init.fill_fp8((n, k), data_init, generator)
+        x = bench_init.fill_fp8((m, k), data_init, generator, dtype=dtypes.fp8)
+        weight = bench_init.fill_fp8((n, k), data_init, generator, dtype=dtypes.fp8)
 
     if scale_init == "constant":
         x_scale_raw = torch.full(

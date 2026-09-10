@@ -966,22 +966,31 @@ def fill_fp4(shape, dist, gen, *, uniform=FP4_UNIFORM, device="cuda", constant=0
     return out
 
 
-def fill_fp8(shape, dist, gen, *, uniform=FP8_UNIFORM, device="cuda", constant=0.5):
+def fill_fp8(
+    shape,
+    dist,
+    gen,
+    *,
+    dtype=FP8_E4M3,
+    uniform=FP8_UNIFORM,
+    device="cuda",
+    constant=0.5,
+):
     """MXFP8 on-wire: e4m3 tensor of ``shape``."""
     dist = _canon_dist(dist, DATA_DISTS)
     if dist == "zero":
-        return torch.zeros(shape, dtype=FP8_E4M3, device=device)
+        return torch.zeros(shape, dtype=dtype, device=device)
     if dist == "constant":
         return torch.full(
             shape, float(constant), dtype=torch.float32, device=device
-        ).to(FP8_E4M3)
+        ).to(dtype)
     if len(shape) != 2:
         v = _sample_data_f32(
             shape, dist, gen, lo=uniform[0], hi=uniform[1], device=device
         )
-        return v.to(FP8_E4M3)
+        return v.to(dtype)
     rows, cols = shape
-    out = torch.empty(shape, dtype=FP8_E4M3, device=device)
+    out = torch.empty(shape, dtype=dtype, device=device)
     for r0, r1 in _row_chunks(rows, cols):
         v = _sample_data_f32(
             (r1 - r0, cols),
@@ -991,7 +1000,7 @@ def fill_fp8(shape, dist, gen, *, uniform=FP8_UNIFORM, device="cuda", constant=0
             hi=uniform[1],
             device=device,
         )
-        out[r0:r1] = v.to(FP8_E4M3)
+        out[r0:r1] = v.to(dtype)
         del v
     return out
 
