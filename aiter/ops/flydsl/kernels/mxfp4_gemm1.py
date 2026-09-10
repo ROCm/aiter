@@ -117,7 +117,10 @@ def _gemm1_body(
     k_wave=1,
     epi_splits=1,
     split_khalves=False,
+    k_stages=None,
 ):
+    _KS = kStages if k_stages is None else k_stages
+
     # A-code tile bytes/row: fp4 packs 2 codes/byte (BK/2); fp8 is 1 B/elem (BK).
     KH_TILE = BK if a_dtype == "fp8" else BK // 2
     K_HALF = k_half_for(K)
@@ -136,9 +139,9 @@ def _gemm1_body(
     OUT_AS_PER_CHUNK_DW = out_as_per_chunk_dw_for(inter)
     OUT_ROW_BYTES = inter if out_dtype == "fp8" else k_g2_half_for(inter)
     kAStages, kSubBlocks, kMChunks, _ = _bm_constants(
-        BM, BN, KH_TILE, K_TILES_TOTAL, k_wave, epi_splits
+        BM, BN, KH_TILE, K_TILES_TOTAL, k_wave, epi_splits, _KS
     )
-    kUnroll = K_TILES_PER_WAVE - kStages
+    kUnroll = K_TILES_PER_WAVE - _KS
 
     k_split = (
         a_dtype == "fp4"
@@ -299,8 +302,8 @@ def _gemm1_body(
         for i in range_constexpr(kMChunks):
             for J in range_constexpr(N_REPS):
                 accm[i][J].store(fx.Vector.filled(4, 0.0, fx.Float32))
-    b = [[[None, None] for _ in range(N_REPS)] for _ in range(kStages)]
-    b_scale_v = [[None, None] for _ in range(kStages)]
+    b = [[[None, None] for _ in range(N_REPS)] for _ in range(_KS)]
+    b_scale_v = [[None, None] for _ in range(_KS)]
 
     # s_aq as flat i32, divided into 4-element (128-bit) and 1-element tiles.
     s_aq_i32_flat = fx.make_view(
@@ -961,22 +964,22 @@ def _gemm1_body(
         bh = [[None] * N_REPS for _ in range(2)]
         a_regs = [None] * a_reg_depth
         issue_a_scale_load()
-        for S in range_constexpr(kStages):
+        for S in range_constexpr(_KS):
             issue_a_load_lds(S, global_k_tile(S))
         rocdl.sched_barrier(0)
-        for S in range_constexpr(kStages):
+        for S in range_constexpr(_KS):
             issue_b_scale_load(b_scale_v[S], global_k_tile(S))
         for h in range_constexpr(2):
             for j in range_constexpr(N_REPS):
                 issue_b_load_half(bh[h], global_k_tile(0), j, h)
         for d in range_constexpr(a_reg_depth):
-            if const_expr(kStages + d < K_TILES_PER_WAVE):
-                a_regs[d] = issue_a_load_reg(global_k_tile(kStages + d))
+            if const_expr(_KS + d < K_TILES_PER_WAVE):
+                a_regs[d] = issue_a_load_reg(global_k_tile(_KS + d))
 
         for KT in range_constexpr(K_TILES_PER_WAVE):
             read_slot = KT % kAStages
-            slot_b = KT % kStages
-            wt = KT + kStages
+            slot_b = KT % _KS
+            wt = KT + _KS
             gpu.barrier()
             asc_cur = issue_a_scale_ds_read(global_k_tile(KT))
             if const_expr(wt < K_TILES_PER_WAVE):
@@ -1014,7 +1017,7 @@ def _gemm1_body(
                 inline_quant_load_kt(0, global_k_tile(0), cached_row_inline),
                 inline_quant_load_kt(1, global_k_tile(0), cached_row_inline),
             )
-        for K_C_LOCAL in range_constexpr(kStages):
+        for K_C_LOCAL in range_constexpr(_KS):
             K_C = global_k_tile(K_C_LOCAL)
             if const_expr(inline_quant):
                 scale_accum = fx.Int32(0)
@@ -1057,18 +1060,18 @@ def _gemm1_body(
                 issue_b_scale_load(b_scale_v[K_C_LOCAL], K_C)
         if const_expr(_relax_prologue):
             rocdl.sched_barrier(0)
-            for K_C_LOCAL in range_constexpr(kStages):
+            for K_C_LOCAL in range_constexpr(_KS):
                 K_C = global_k_tile(K_C_LOCAL)
                 for j in range_constexpr(N_REPS):
                     issue_b_load_j(b[K_C_LOCAL], K_C, j)
                 issue_b_scale_load(b_scale_v[K_C_LOCAL], K_C)
 
         for OFFSET in range_constexpr(kUnroll):
-            K_C_LOCAL = kStages + OFFSET
+            K_C_LOCAL = _KS + OFFSET
             K_C = global_k_tile(K_C_LOCAL)
             read_slot = OFFSET % kAStages
             write_slot = K_C_LOCAL % kAStages
-            slot_b = OFFSET % kStages
+            slot_b = OFFSET % _KS
             if const_expr(inline_quant and prefetch_hidden):
                 h_v0, h_v1 = hidden_prefetch
                 if const_expr(OFFSET + 1 < kUnroll):
@@ -1078,11 +1081,11 @@ def _gemm1_body(
                     )
             gpu.barrier()
             if const_expr(BM == 128):
-                asc_cur = issue_a_scale_ds_read(K_C - kStages)
+                asc_cur = issue_a_scale_ds_read(K_C - _KS)
                 a_cur = issue_a_ds_read(read_slot)
             else:
                 a_cur = issue_a_ds_read(read_slot)
-                asc_cur = issue_a_scale_ds_read(K_C - kStages)
+                asc_cur = issue_a_scale_ds_read(K_C - _KS)
             if const_expr(not inline_quant):
                 issue_a_load_lds(write_slot, K_C)
             if const_expr(inline_quant and not prefetch_hidden):
@@ -1106,8 +1109,8 @@ def _gemm1_body(
                 )
                 inline_quant_pack_write(K_C, scale_accum)
 
-        for S in range_constexpr(kStages):
-            kt_local = K_TILES_PER_WAVE - kStages + S
+        for S in range_constexpr(_KS):
+            kt_local = K_TILES_PER_WAVE - _KS + S
             kt = global_k_tile(kt_local)
             gpu.barrier()
             if const_expr(BM == 128):
@@ -1118,10 +1121,10 @@ def _gemm1_body(
                 asc_cur = issue_a_scale_ds_read(kt)
             for J in range_constexpr(N_REPS):
                 mfma_cluster(
-                    b[kt_local % kStages],
+                    b[kt_local % _KS],
                     a_cur,
                     asc_cur,
-                    b_scale_v[kt_local % kStages],
+                    b_scale_v[kt_local % _KS],
                     J,
                 )
 
@@ -1535,8 +1538,8 @@ def _gemm1_body(
                 store_scales()
 
 
-def _bm_constants(BM, BN, KH_TILE, K_TILES_TOTAL, k_wave=1, epi_splits=1):
-    kAStages = kStages + 1
+def _bm_constants(BM, BN, KH_TILE, K_TILES_TOTAL, k_wave=1, epi_splits=1, k_stages=None):
+    kAStages = (kStages if k_stages is None else k_stages) + 1
     kSubBlocks = 1 if BM < 32 else BM // 32
     kMChunks = kmchunks_for(BM)
     s_aq_bytes = k_wave * kAStages * BM * KH_TILE
@@ -1544,6 +1547,51 @@ def _bm_constants(BM, BN, KH_TILE, K_TILES_TOTAL, k_wave=1, epi_splits=1):
     lds_acc_bytes = k_wave * lds_acc_bytes_for(BM // epi_splits, BN + ACC_LDS_PAD_DW)
     lds_bytes = max(s_aq_bytes + s_asc_bytes, lds_acc_bytes)
     return kAStages, kSubBlocks, kMChunks, lds_bytes
+
+
+# Measured 2-workgroup/CU residency cliff on gfx950 (MI355X), token 4096,
+# BM128/BN256 situv2 a4w4: LDS/WG 65KB -> occupancy 21.2% (2 WG), 76KB ->
+# occupancy 11.6% (1 WG). rocprofv3 MfmaUtil/OccupancyPercent, isolated JIT
+# caches per variant.
+LDS_2WG_LIMIT = 65 * 1024
+
+
+MIN_N_BLOCKS_FOR_SHALLOW_K = 4
+
+
+def default_k_stages(BM, BN, KH_TILE, K_TILES_TOTAL, N_OUT, k_wave=1, epi_splits=1):
+    """Pick the deepest K pipeline that still fits two workgroups per CU.
+
+    lds_bytes = max(s_aq + s_asc, lds_acc). s_asc (the resident A-scale buffer)
+    grows linearly with K, so at K=7168 the A-staging half alone is 76KB and
+    epi_splits can no longer pull the tile under the 65KB residency cliff --
+    the epilogue split then buys nothing (measured 1.00x on (7168,2048,NE=48,
+    topk=8) vs 1.13x on (3584,384,NE=896,topk=16)). Dropping to kStages=1
+    trades one A stage for the second workgroup: measured 631.94us -> 582.49us
+    stage1 at 4096 tokens, occupancy 11.66% -> 22.32%, strict accuracy passes.
+
+    Shapes that already fit (kimi3) keep the deeper pipeline: forcing kStages=1
+    there costs 2.4% (260.75us -> 267.26us).
+
+    The trade only pays when a workgroup's A tile is reused across enough N
+    blocks to hide the shallower A pipeline. Measured on kimik2 (7168, NE=385,
+    topk=9, BM128, silu), stage1 at 4096/8192 tokens, deep -> shallow:
+
+        inter 1024 (8 N blocks):  575.50/877.44 -> 567.30/850.92   (-1.4%/-3.0%)
+        inter  512 (4 N blocks):  308.98/487.01 -> 303.37/454.77   (-1.8%/-6.6%)
+        inter  256 (2 N blocks):  170.70/260.11 -> 181.03/286.31   (+6.0%/+10.1%)
+
+    so shapes with fewer than MIN_N_BLOCKS_FOR_SHALLOW_K N blocks keep kStages.
+    """
+    if N_OUT // BN < MIN_N_BLOCKS_FOR_SHALLOW_K:
+        return kStages
+    for ks in range(kStages, 0, -1):
+        if K_TILES_TOTAL // k_wave < ks:
+            continue
+        *_, lds = _bm_constants(BM, BN, KH_TILE, K_TILES_TOTAL, k_wave, epi_splits, ks)
+        if lds <= LDS_2WG_LIMIT:
+            return ks
+    return kStages
 
 
 def default_epi_splits(BM, BN, k_wave=1, num_waves=4):
@@ -1577,6 +1625,7 @@ def compile_gemm1_a4w4_port(
     num_waves=4,
     k_wave=1,
     epi_splits=None,
+    k_stages=None,
     split_khalves=False,
 ):
     if a_dtype not in ("fp4", "fp8"):
@@ -1660,8 +1709,16 @@ def compile_gemm1_a4w4_port(
             kmchunks_for(BM) % epi_splits == 0 and (BM // 16) % epi_splits == 0
         ), f"epi_splits={epi_splits} does not divide BM={BM} evenly"
 
+    if k_stages is None:
+        k_stages = default_k_stages(
+            BM, BN, KH_TILE, K_TILES_TOTAL, N_OUT, k_wave, epi_splits
+        )
+    assert 1 <= k_stages <= K_TILES_TOTAL // k_wave, (
+        f"k_stages must be in [1, {K_TILES_TOTAL // k_wave}], got {k_stages}"
+    )
+
     _, _, _, lds_bytes = _bm_constants(
-        BM, BN, KH_TILE, K_TILES_TOTAL, k_wave, epi_splits
+        BM, BN, KH_TILE, K_TILES_TOTAL, k_wave, epi_splits, k_stages
     )
 
     variant_tag = "iq" if inline_quant else ("nt" if use_nt else "cached")
@@ -1795,6 +1852,7 @@ def compile_gemm1_a4w4_port(
                 k_wave=k_wave,
                 epi_splits=epi_splits,
                 split_khalves=split_khalves,
+                k_stages=k_stages,
             )
 
         if bx_i32 < bound:
