@@ -162,7 +162,7 @@ def _make_inputs(
 
 
 @benchmark()
-def test_mla_v4_triton_staged(
+def bench_mla_v4_triton_staged(
     gqa_ratio,
     batch,
     kv_seq_lens,
@@ -227,7 +227,7 @@ def test_mla_v4_triton_staged(
 
 
 @benchmark()
-def test_mla_v4_triton_perf(
+def bench_mla_v4_triton_perf(
     gqa_ratio,
     batch,
     kv_seq_lens,

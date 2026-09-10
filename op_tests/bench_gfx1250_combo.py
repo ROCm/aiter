@@ -1755,7 +1755,7 @@ def run_mla_v4_decode(args):
                         data_init,
                         args.seed,
                     )
-                    tri = mla_v4_triton_mod.test_mla_v4_triton_staged(
+                    tri = mla_v4_triton_mod.bench_mla_v4_triton_staged(
                         gqa_ratio=gqa,
                         batch=batch,
                         kv_seq_lens=ctx,
