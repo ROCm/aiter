@@ -563,6 +563,25 @@ def test_a16w16_launch_plan_preserves_split_k_limits(arch, kid, K, split_k, erro
         )
 
 
+def test_gfx1250_split_k_reducer_row_limit():
+    from csrc.opus_gemm.opus_gemm_common import (
+        gfx1250_clusterlaunch_kernels_list,
+        gfx1250_kernels_list,
+    )
+
+    for instances in (gfx1250_kernels_list, gfx1250_clusterlaunch_kernels_list):
+        assert instances
+        kid = min(instances)
+        instance = instances[kid]
+        args = _a16_policy_args("gfx1250", 65535, instance.B_N, 2 * instance.B_K)
+        plan = _get_cached_a16w16_launch_plan(**args, kid=kid, split_k=2)
+        assert plan.workspace_spec.dtype == torch.float32
+
+        args["M"] = 65536
+        with pytest.raises(ValueError, match="requires M <= 65535"):
+            _get_cached_a16w16_launch_plan(**args, kid=kid, split_k=2)
+
+
 def test_global_a16_stale_opus_row_keeps_framework_fallback(monkeypatch):
     import aiter.tuned_gemm as tuned
 

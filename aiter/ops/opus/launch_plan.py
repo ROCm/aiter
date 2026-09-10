@@ -55,15 +55,10 @@ class A16W16LaunchPlan:
 def _supports_a16w16_shape(
     instance: OpusGemmInstance,
     *,
-    registry_arch: str,
     M: int,
     N: int,
     K: int,
-    batch: int,
 ) -> bool:
-    if registry_arch == GFX1250 and batch != 1:
-        return False
-
     if instance.kernel_tag == _GFX1250_FUSED_SPLITK_TAG:
         split_k = int(instance.fuse_split_k)
         n_cluster = int(instance.fuse_m_cluster)
@@ -302,14 +297,7 @@ def _build_a16w16_launch_plan(
             "opus_gemm_a16w16_launch: gfx1250 workspace kids require "
             f"batch=1; got batch={batch}"
         )
-    if not _supports_a16w16_shape(
-        instance,
-        registry_arch=registry_arch,
-        M=M,
-        N=N,
-        K=K,
-        batch=batch,
-    ):
+    if not _supports_a16w16_shape(instance, M=M, N=N, K=K):
         raise ValueError(
             f"OPUS kid {resolved_kid} is incompatible with "
             f"shape (batch={batch}, M={M}, N={N}, K={K})"

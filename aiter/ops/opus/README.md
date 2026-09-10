@@ -151,8 +151,9 @@ opus_bmm(XQ_b, WQ_b, Y_b, kid=200, split_k=2)
 ```
 
 `opus_gemm` requires 2D tensors; `opus_bmm` requires batch-first 3D tensors.
-Inputs are K-contiguous and `Y` is N-contiguous. Current gfx1250 kernels still
-require BMM batch one. Exact instances can impose additional tile, output
+Inputs are K-contiguous and `Y` is N-contiguous. gfx1250 two-stage workspace
+kernels require BMM batch one; pre-built CO kernels support batched inputs.
+Exact instances can impose additional tile, output
 dtype, bias, or K-loop constraints. The BMM example is a direct exact-API call;
 there is no current `batched_gemm_bf16_OPUS` high-level wrapper.
 
@@ -403,7 +404,8 @@ explicit environment value overrides it for testing locally rebuilt images.
 
 ## Build-time subset compile
 
-Tuned CSV and the compiled-kids sidecar are build inputs only. Their valid
+Tuned CSVs, the last successful compiled-kids sidecar, and additional tuner
+candidates passed through `--extra_kids` are build inputs only. Their valid
 non-BMM OPUS ids are unioned with:
 
 - `DEFAULT_COMPILED_KIDS_BY_ARCH`, the exact-id compile floor containing every
@@ -417,6 +419,26 @@ subset build produces an uncompiled-id error. A gfx950 build emits all 45
 MXFP8 BMM routes as one deduplicated family so every registered BMM id remains
 exact-routable. A gfx1250 build keeps all 219 available CO host launchers in its
 default compile floor; their device code remains in the packaged `.co` files.
+The sidecar records all emitted ids, including the deduplicated BMM family.
+An explicit `--extra_kids` request that is unknown, outside the target
+architectures, or excluded by `--kernel_tag` fails codegen before the sidecar
+is updated.
+
+The canonical sidecar is `{bd_dir}/compiled_kids_opus.json`, outside the
+per-module build directory so it survives `clear_build`. Tuners synchronously
+build candidates before spawning workers. They pass requests through
+`--extra_kids` without expanding the canonical sidecar in advance. JIT uses
+`blob.staging` for generated working files, installs the binary, then publishes
+the generated sidecar and a receipt binding its contents to that binary.
+Runtime exact dispatch does not read this sidecar.
+
+A tuner skips rebuilding only when the sidecar and its receipt match the
+required kids and installed binary. Missing or stale metadata triggers a
+rebuild. An explicit `AITER_REBUILD` request runs once in the parent even on
+a cache hit; successful preparation sets `AITER_REBUILD=0` for workers. A
+failed compile restores the original environment and preserves the previous
+successful metadata. See [transactional JIT cache](../../../docs/jit_cache.md)
+for recovery and storage requirements.
 
 ## Migration
 

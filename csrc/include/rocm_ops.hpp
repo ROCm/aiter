@@ -1687,6 +1687,19 @@ namespace py = pybind11;
           py::arg("block_m"),                                            \
           py::arg("group_size")     = 32,                                \
           py::arg("sorted_weights") = py::none());                       \
+    m.def("fused_dynamic_mx_quant_moe_sort_hip_bounded",                 \
+          &aiter::fused_dynamic_mx_quant_moe_sort_hip_bounded,           \
+          py::arg("out"),                                                \
+          py::arg("scales"),                                             \
+          py::arg("input"),                                              \
+          py::arg("sorted_ids"),                                         \
+          py::arg("num_valid_ids"),                                      \
+          py::arg("token_num"),                                          \
+          py::arg("block_m"),                                            \
+          py::arg("total_routes"),                                       \
+          py::arg("num_experts_upper_bound"),                            \
+          py::arg("group_size")     = 32,                                \
+          py::arg("sorted_weights") = py::none());                       \
     m.def("mxfp4_moe_sort_hip",                                          \
           &aiter::mxfp4_moe_sort_hip,                                    \
           py::arg("out_scale"),                                          \
@@ -2727,7 +2740,14 @@ namespace py = pybind11;
           py::arg("NE"),                      \
           py::arg("TOPK"),                    \
           py::arg("D_HIDDEN"),                \
-          py::arg("MB"));
+          py::arg("MB"));                     \
+    m.def("_mxfp4_moe_sort_internal_is_supported", \
+          &mxfp4_moe_sort_internal_is_supported,   \
+          py::arg("NE"),                           \
+          py::arg("TOPK"),                         \
+          py::arg("D_HIDDEN"),                     \
+          py::arg("MB"),                           \
+          py::arg("zero_init"));
 
 #define MLA_HK_V32_PYBIND               \
     m.def("hk_mla_v32_decode_fwd",      \

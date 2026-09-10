@@ -15,7 +15,12 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from aiter.ops.opus import opus_gemm
+from aiter.ops.opus import (
+    gemm_a16w16_opus,
+    gemm_op_a16w16,
+    opus_bmm,
+    opus_gemm,
+)
 from aiter.ops.opus._arch import GFX1250, SUPPORTED_OPUS_ARCHES
 from aiter.ops.opus.launch_plan import _get_cached_a16w16_launch_plan
 from csrc.opus_gemm.opus_gemm_common import (
@@ -161,8 +166,49 @@ def test_gfx1250_co_registry_and_launch_contract():
         _co_plan(kid, output_dtype=torch.float32)
     with pytest.raises(ValueError, match="does not support bias"):
         _co_plan(kid, has_bias=True)
-    with pytest.raises(ValueError, match="incompatible with shape"):
-        _co_plan(kid, batch=2)
+
+
+@pytest.mark.parametrize("entry", ("opus_bmm", "gemm_a16w16_opus"))
+@pytest.mark.parametrize("split_k", (0, 1))
+@pytest.mark.parametrize(
+    "kid", sorted(GFX1250_4WAVE_CO_KIDS), ids=lambda kid: f"kid-{kid}"
+)
+def test_gfx1250_co_bmm_reaches_exact_launch(kid, split_k, entry, monkeypatch):
+    calls = []
+
+    def capture(XQ, WQ, Y, bias, workspace, launched_kid, launch_split_k):
+        calls.append((XQ, WQ, Y, bias, workspace, launched_kid, launch_split_k))
+
+    monkeypatch.setattr(gemm_op_a16w16, "_device_arch_and_cu", lambda _: (GFX1250, 80))
+    monkeypatch.setattr(gemm_op_a16w16, "_opus_gemm_a16w16_launch_raw", capture)
+    A = torch.empty((2, 64, 512), device="meta", dtype=torch.bfloat16)
+    B = torch.empty((2, 64, 512), device="meta", dtype=torch.bfloat16)
+    Y = torch.empty((2, 64, 64), device="meta", dtype=torch.bfloat16)
+
+    if entry == "opus_bmm":
+        actual = opus_bmm(A, B, Y, kid=kid, split_k=split_k)
+    else:
+        actual = gemm_a16w16_opus(A, B, kernelId=kid, splitK=split_k, out=Y)
+
+    assert actual is Y
+    assert len(calls) == 1
+    XQ, WQ, output, bias, workspace, launched_kid, launch_split_k = calls[0]
+    assert XQ is A and WQ is B and output is Y
+    assert bias is None and workspace is None
+    assert (launched_kid, launch_split_k) == (kid, split_k)
+
+
+@pytest.mark.parametrize(
+    "kid",
+    sorted(
+        kid
+        for kid in SPLITK_KIDS
+        if get_kernel_instance(GFX1250, "a16w16", kid) is not None
+    ),
+)
+def test_gfx1250_workspace_kids_reject_bmm(kid):
+    with pytest.raises(ValueError, match="workspace kids require batch=1"):
+        _co_plan(kid, M=1, batch=2)
 
 
 def test_gfx1250_co_assets_and_host_only_codegen(tmp_path, monkeypatch):

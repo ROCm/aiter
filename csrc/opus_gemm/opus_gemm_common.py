@@ -2052,11 +2052,14 @@ def _opus_sidecar_path():
 
     Lives in ``{bd_dir}/`` (one level above the per-module build dir) so
     it survives ``aiter.jit.core.clear_build("module_deepgemm_opus")`` --
-    which ``build_module()`` calls when ``AITER_REBUILD == 1`` -- and is
-    therefore the canonical "what kids should be in the next .so" source
-    that ``gen_instances.py`` consumes. The tuner expands this sidecar
-    BEFORE triggering the rebuild; if it lived inside the build dir,
-    clear_build would wipe it out before gen_instances could read it.
+    which ``build_module()`` calls when ``AITER_REBUILD == 1`` -- and
+    seeds the last successfully compiled set into the next codegen.
+    The tuner passes new candidates through ``--extra_kids``; it does not
+    advance this file before compiling. JIT atomically copies the generated
+    sidecar back here after installing the .so, independently of source-cache
+    publication. Its adjacent ``.receipt`` binds the contents to that binary;
+    the tuner requires both to match before skipping a rebuild. Runtime exact
+    dispatch resolves the caller-selected kid without reading this file.
     """
     # Import lazily to avoid circular import at module load (aiter imports
     # opus_gemm_common, opus_gemm_common imports aiter.jit.core).

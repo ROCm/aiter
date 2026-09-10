@@ -1135,12 +1135,19 @@ if __name__ == "__main__":
             "Path to the subset-compile sidecar (JSON list of int kids). "
             "Defaults to {working_path}/compiled_kids.json. The sidecar "
             "captures the union of CSV opus rows + previous sidecar "
-            "contents + DEFAULT_COMPILED_KIDS so subsequent rebuilds "
-            "are idempotent (no rebuild if every required kid is already "
-            "in the .so). gradlib's GemmTuner and opus_gemm_tune.py "
-            "expand this sidecar in tuner-startup to add new kids before "
-            "triggering an AITER_REBUILD."
+            "contents + extra kids + DEFAULT_COMPILED_KIDS and mandatory "
+            "family kids. JIT supplies a "
+            "staged copy and publishes it after successful compilation. "
+            "Tuners pass new candidates with --extra_kids."
         ),
+    )
+
+    parser.add_argument(
+        "--extra_kids",
+        nargs="*",
+        type=int,
+        default=[],
+        help="Additional tuner candidates for this build; persisted only after success.",
     )
 
     # Legacy --tune_file alias kept for backward compat with any existing
@@ -1228,14 +1235,16 @@ if __name__ == "__main__":
         try:
             with open(sidecar_path) as f:
                 sidecar_kids = {int(x) for x in json.load(f)}
-        except (OSError, ValueError):
+        except (OSError, ValueError, TypeError):
             sidecar_kids = set()
 
     # The compile set: union, intersected with valid kernels_list entries.
     # MXFP8 BMM launchers are emitted as one gfx950 family below and deduplicated
     # by generated symbol name, so they never participate in the per-kid subset.
     valid_kids = set(kernels_list.keys())
-    S = (csv_kids | sidecar_kids | set(DEFAULT_COMPILED_KIDS)) & valid_kids
+    S = (
+        csv_kids | sidecar_kids | set(args.extra_kids) | set(DEFAULT_COMPILED_KIDS)
+    ) & valid_kids
     S -= set(BMM_MXSCALE_KIDS)
 
     # Per-arch filter: drop kids whose arch_prefix is not in the target build set.
@@ -1317,13 +1326,30 @@ if __name__ == "__main__":
         f"in csrc/opus_gemm/opus_gemm_common.py."
     )
 
+    # The sidecar and request validation describe every emitted route, including
+    # BMM ids whose shared symbols are generated outside the per-kid subset.
+    bmm_kids = (
+        BMM_MXSCALE_KIDS
+        if target_arches is None or "gfx950" in target_arches
+        else frozenset()
+    )
+    compiled_kids = S | bmm_kids
+    missing_requested = set(args.extra_kids) - compiled_kids
+    if missing_requested:
+        parser.error(
+            "cannot compile requested --extra_kids "
+            f"{sorted(missing_requested)}: unknown kernel, outside target arches "
+            f"{sorted(target_arches) if target_arches is not None else 'all'}, "
+            "or excluded by --kernel_tag"
+        )
+
     # Build the per-kid dict that drives codegen.
     kdict = {kid: kernels_list[kid] for kid in sorted(S)}
 
     # All 45 BMM ids are exact-routable in the canonical registry.  Several ids
     # intentionally share one device geometry, so key this codegen-only merge by
     # symbol name to emit each host/device specialization once.
-    if target_arches is None or "gfx950" in target_arches:
+    if bmm_kids:
         for family in a8w8_mxscale_bmm_kernel_lists:
             for instance in family.values():
                 kdict[instance.name] = instance
@@ -1333,17 +1359,22 @@ if __name__ == "__main__":
         f"(sources: CSV={len(S & csv_kids)}, "
         f"sidecar={len(S & sidecar_kids)}, "
         f"default-compiled={len(S & required_default)}, "
-        f"mandatory-a8={len(S & mandatory_a8_kids)})"
+        f"mandatory-a8={len(S & mandatory_a8_kids)}, "
+        f"extra={len(S & set(args.extra_kids))}); "
+        f"always-emitted-bmm={len(bmm_kids)}"
     )
 
     codegen = opus_gemm_codegen(args.working_path, args.tune)
     codegen.gen_instances(kdict)
 
-    # Persist the expanded compile set so subsequent rebuilds reuse it.
+    # Write the generated set inside staging. JIT publishes it to bd_dir only
+    # after the binary is installed, so a failed compile cannot advance it.
     try:
         os.makedirs(os.path.dirname(sidecar_path) or ".", exist_ok=True)
     except OSError:
         pass
     with open(sidecar_path, "w") as f:
-        json.dump(sorted(S), f)
-    print(f"[opus gen_instances] wrote sidecar with {len(S)} kids: {sidecar_path}")
+        json.dump(sorted(compiled_kids), f)
+    print(
+        f"[opus gen_instances] wrote sidecar with {len(compiled_kids)} kids: {sidecar_path}"
+    )
