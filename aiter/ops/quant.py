@@ -929,6 +929,19 @@ def fused_dynamic_mx_quant_moe_sort_hip_bounded(
 
 
 @compile_ops("module_quant", develop=True)
+def fused_dynamic_mxfp8_quant_moe_route_hip(
+    out: torch.Tensor,
+    scales: torch.Tensor,
+    input: torch.Tensor,
+    reverse_sorted: torch.Tensor,
+    token_num: int,
+    topk: int,
+    group_size: int = 32,
+) -> None:
+    """Quantize each token once and scatter its e8m0 scale to routed rows."""
+
+
+@compile_ops("module_quant", develop=True)
 def quant_mxfp4(
     inp: torch.Tensor,
     out_packed: torch.Tensor,
@@ -1170,6 +1183,44 @@ def fused_dynamic_mx_quant_moe_sort(
         mxfp4_moe_sort_hip(
             scale, scale_per_token, sorted_ids, num_valid_ids, token_num, N
         )
+    return out, scale
+
+
+def fused_dynamic_mxfp8_quant_moe_route(
+    input: torch.Tensor,
+    sorted_ids: torch.Tensor,
+    reverse_sorted: torch.Tensor,
+    token_num: int,
+    topk: int,
+    group_size: int = 32,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Quantize token-major BF16/FP16 input once and scatter scales by route."""
+    if input.shape[0] != token_num:
+        raise ValueError(
+            f"stage1 input rows ({input.shape[0]}) must equal token_num ({token_num})"
+        )
+    if sorted_ids.device != input.device or reverse_sorted.device != input.device:
+        raise ValueError("input, sorted_ids, and reverse_sorted must share a device")
+    if reverse_sorted.dtype != dtypes.i32 or reverse_sorted.numel() < token_num * topk:
+        raise ValueError(
+            "reverse_sorted must be a contiguous int32 tensor with token_num*topk entries"
+        )
+    if not reverse_sorted.is_contiguous():
+        raise ValueError("reverse_sorted must be contiguous")
+    if group_size != 32:
+        raise ValueError(f"only group_size=32 is supported, got {group_size}")
+
+    cols = input.shape[-1]
+    scale_cols = ((cols + group_size - 1) // group_size + 7) // 8 * 8
+    out = torch.empty((token_num, cols), dtype=dtypes.fp8, device=input.device)
+    scale = torch.empty(
+        ((sorted_ids.shape[0] + 31) // 32 * 32, scale_cols),
+        dtype=dtypes.fp8_e8m0,
+        device=input.device,
+    )
+    fused_dynamic_mxfp8_quant_moe_route_hip(
+        out, scale, input, reverse_sorted, token_num, topk, group_size
+    )
     return out, scale
 
 

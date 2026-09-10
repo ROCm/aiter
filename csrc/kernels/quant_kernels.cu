@@ -1902,6 +1902,93 @@ __global__ void fused_mx_quant_moe_sort_kernel(
     }
 }
 
+template <typename DTYPE_I, int block_size, int thread_data_size = 16>
+__global__ void fused_mxfp8_quant_moe_route_kernel(
+    opus::fp8_t* __restrict__ out,
+    uint8_t* __restrict__ scale,
+    DTYPE_I const* __restrict__ input,
+    int32_t const* __restrict__ reverse_sorted,
+    const int32_t num_tokens,
+    const int32_t topk,
+    const int32_t cols,
+    const int32_t group_size,
+    const int32_t scale_rows,
+    const int32_t input_stride,
+    const int32_t num_col_tiles)
+{
+    const int32_t token_idx  = blockIdx.x / num_col_tiles;
+    const int32_t col_tile   = blockIdx.x % num_col_tiles;
+    const int32_t col_offset = col_tile * block_size * thread_data_size;
+    if(token_idx >= num_tokens)
+    {
+        return;
+    }
+
+    const int32_t num_thread_per_group = group_size / thread_data_size;
+    const int32_t scale_k =
+        col_offset / group_size + threadIdx.x / num_thread_per_group;
+    const int32_t tile_cols = min(cols - col_offset, block_size * thread_data_size);
+    static constexpr int32_t vec_size_i =
+        thread_data_size == 0 ? 16 / sizeof(DTYPE_I) : thread_data_size;
+    static constexpr int32_t load_chunk_bytes =
+        (sizeof(DTYPE_I) * vec_size_i % 16 == 0
+             ? 16
+             : (sizeof(DTYPE_I) * vec_size_i % 8 == 0 ? 8 : 4));
+    using vec_i = opus::vector_t<DTYPE_I, vec_size_i>;
+    using vec_f = opus::vector_t<float, vec_size_i>;
+
+    const int32_t scaleN_valid = (cols + group_size - 1) / group_size;
+    const int32_t scaleN_pad   = ((scaleN_valid + 7) / 8) * 8;
+    auto buffer_input = opus::make_gmem<DTYPE_I>(
+        input + static_cast<int64_t>(token_idx) * input_stride + col_offset,
+        tile_cols * sizeof(DTYPE_I));
+    vec_i vec_input = load_vector_nbytes<DTYPE_I, vec_size_i, load_chunk_bytes, RT>(
+        buffer_input, threadIdx.x * vec_size_i);
+    vec_f vec_input_f;
+    float* input_f_ptr = reinterpret_cast<float*>(&vec_input_f);
+    float absMax       = 1e-10f;
+#pragma unroll
+    for(int j = 0; j < vec_size_i; j++)
+    {
+        vec_input_f[j] = static_cast<float>(vec_input[j]);
+        absMax         = max(absMax, abs(vec_input_f[j]));
+    }
+    absMax = multithread_reduce(absMax, aiter::Max(), num_thread_per_group);
+
+    constexpr aiter::MxDtype kHwFp8Dtype =
+#if defined(__gfx942__)
+        aiter::MxDtype::FP8_E4M3_FNUZ;
+#else
+        aiter::MxDtype::FP8_E4M3;
+#endif
+    const float row_scale =
+        aiter::fp_f32_to_e8m0_scale<aiter::kDefaultMxScaleRoundMode, kHwFp8Dtype>(
+            absMax);
+
+    if(threadIdx.x % num_thread_per_group == 0 && scale_k < scaleN_valid)
+    {
+        const uint8_t bs_e8m0 =
+            (__builtin_bit_cast(uint32_t, row_scale) >> 23) & 0xFF;
+        for(int32_t route = 0; route < topk; route++)
+        {
+            const int32_t sorted_row = reverse_sorted[token_idx * topk + route];
+            if(sorted_row >= 0 && sorted_row < scale_rows)
+            {
+                const int32_t addr =
+                    aiter::mx_scale_shuffle_idx(scaleN_pad, sorted_row, scale_k);
+                scale[addr] = bs_e8m0;
+            }
+        }
+    }
+
+    scaled_quant_vgpr_impl<float, opus::fp8_t, thread_data_size>(
+        out + static_cast<int64_t>(token_idx) * cols + col_offset,
+        input_f_ptr,
+        &row_scale,
+        tile_cols,
+        0);
+}
+
 
 #define FUSED_MX_QUANT_MOE_SORT_KERNEL_IMPL(DTYPE_O, THREAD_DATA, BLOCK_SIZE)                       \
     AITER_DISPATCH_FLOATING16_TYPES_rmTorch(input.dtype(), "fused_mx_quant_moe_sort_kernel", [&] {  \
@@ -2076,6 +2163,85 @@ void fused_dynamic_mx_quant_moe_sort_hip_bounded(aiter_tensor_t& output,
                                              group_size,
                                              sorted_weights,
                                              padded_rows_upper_bound);
+}
+
+void fused_dynamic_mxfp8_quant_moe_route_hip(aiter_tensor_t& output,
+                                             aiter_tensor_t& scale,
+                                             const aiter_tensor_t& input,
+                                             const aiter_tensor_t& reverse_sorted,
+                                             int token_num,
+                                             int topk,
+                                             int group_size)
+{
+    AITER_CHECK(output.dtype() == AITER_DTYPE_fp8, __func__, " output must be fp8");
+    AITER_CHECK(reverse_sorted.dtype() == AITER_DTYPE_i32,
+                __func__,
+                " reverse_sorted must be int32");
+    AITER_CHECK(scale.dtype() == AITER_DTYPE_fp8_e8m0 ||
+                    scale.dtype() == AITER_DTYPE_u8,
+                __func__,
+                " scale must use byte e8m0 storage");
+    AITER_CHECK(output.device_id == input.device_id &&
+                    scale.device_id == input.device_id &&
+                    reverse_sorted.device_id == input.device_id,
+                __func__,
+                " all tensors must be on the same device");
+    AITER_CHECK(reverse_sorted.numel() >= static_cast<int64_t>(token_num) * topk,
+                __func__,
+                " reverse_sorted is too small");
+    AITER_CHECK(token_num > 0, __func__, " token_num must be positive");
+    AITER_CHECK(topk > 0, __func__, " topk must be positive");
+    AITER_CHECK(group_size == 32, __func__, " only group_size=32 is supported");
+    AITER_CHECK(output.is_contiguous() && scale.is_contiguous() &&
+                    reverse_sorted.is_contiguous(),
+                __func__,
+                " output, scale, and reverse_sorted must be contiguous");
+    AITER_CHECK(input.stride(-1) == 1, __func__, " input rows must be contiguous");
+
+    const int cols         = input.size(-1);
+    const int input_stride = input.stride(-2);
+    const int scale_rows   = scale.size(0);
+    const int scale_cols   = (cols / group_size + 7) / 8 * 8;
+    AITER_CHECK(input.size(0) >= token_num, __func__, " input has too few rows");
+    AITER_CHECK(scale_rows > 0, __func__, " scale must have at least one row");
+    AITER_CHECK(output.numel() >= static_cast<int64_t>(token_num) * cols,
+                __func__,
+                " output is too small");
+    AITER_CHECK(scale.dim() == 2 && scale.size(1) >= scale_cols,
+                __func__,
+                " scale has insufficient columns");
+    AITER_CHECK(scale.numel() >= static_cast<int64_t>(scale_rows) * scale_cols,
+                __func__,
+                " scale storage is too small");
+    AITER_CHECK(cols % group_size == 0, __func__, " input width must be group aligned");
+    static constexpr int route_block_size = 256;
+    static constexpr int route_thread_data = 8;
+    static constexpr int cols_per_block = route_block_size * route_thread_data;
+    const int num_col_tiles = (cols + cols_per_block - 1) / cols_per_block;
+    HipDeviceGuard device_guard(input.device_id);
+    const hipStream_t stream = aiter::getCurrentHIPStream();
+    AITER_DISPATCH_FLOATING16_TYPES_rmTorch(
+        input.dtype(), "fused_mxfp8_quant_moe_route_kernel", [&] {
+            using input_dtype = typename aiter::hip2opus<scalar_t>::type;
+            fused_mxfp8_quant_moe_route_kernel<
+                input_dtype,
+                route_block_size,
+                route_thread_data>
+                <<<dim3(token_num * num_col_tiles),
+                   dim3(route_block_size),
+                   0,
+                   stream>>>(reinterpret_cast<opus::fp8_t*>(output.data_ptr()),
+                             reinterpret_cast<uint8_t*>(scale.data_ptr()),
+                             reinterpret_cast<input_dtype const*>(input.data_ptr()),
+                             reinterpret_cast<int32_t const*>(reverse_sorted.data_ptr()),
+                             token_num,
+                             topk,
+                             cols,
+                             group_size,
+                             scale_rows,
+                             input_stride,
+                             num_col_tiles);
+        });
 }
 
 // Perf gate threshold for the coalesced LDS-staged store path in

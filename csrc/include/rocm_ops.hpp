@@ -1710,6 +1710,15 @@ namespace py = pybind11;
           py::arg("num_experts_upper_bound"),                            \
           py::arg("group_size")     = 32,                                \
           py::arg("sorted_weights") = py::none());                       \
+    m.def("fused_dynamic_mxfp8_quant_moe_route_hip",                     \
+          &aiter::fused_dynamic_mxfp8_quant_moe_route_hip,               \
+          py::arg("out"),                                                \
+          py::arg("scales"),                                             \
+          py::arg("input"),                                              \
+          py::arg("reverse_sorted"),                                     \
+          py::arg("token_num"),                                          \
+          py::arg("topk"),                                               \
+          py::arg("group_size") = 32);                                   \
     m.def("mxfp4_moe_sort_hip",                                          \
           &aiter::mxfp4_moe_sort_hip,                                    \
           py::arg("out_scale"),                                          \

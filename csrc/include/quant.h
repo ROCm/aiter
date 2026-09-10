@@ -129,6 +129,15 @@ void fused_dynamic_mx_quant_moe_sort_hip_bounded(
     int group_size = 32,
     std::optional<aiter_tensor_t> sorted_weights = std::nullopt);
 
+void fused_dynamic_mxfp8_quant_moe_route_hip(
+    aiter_tensor_t& out,
+    aiter_tensor_t& scales,
+    const aiter_tensor_t& input,
+    const aiter_tensor_t& reverse_sorted,
+    int token_num,
+    int topk,
+    int group_size = 32);
+
 void mxfp4_moe_sort_hip(aiter_tensor_t& out_scale,
                          const aiter_tensor_t& scale,
                          const aiter_tensor_t& sorted_ids,
