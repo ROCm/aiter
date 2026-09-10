@@ -97,6 +97,38 @@ class MegaMoEV2:
         if os.environ.get("AITER_MEGA_MOE_PRELOAD", "0") == "1":
             self.preload_aot_bundles()
 
+    def _validate_weight_tensor(self, name, tensor, expected_numel):
+        if not tensor.is_cuda:
+            raise ValueError(f"{name} must be a CUDA tensor")
+        if tensor.device != self.dev:
+            raise ValueError(f"{name}.device={tensor.device} must match {self.dev}")
+        if tensor.element_size() != 1:
+            raise ValueError(f"{name} must use a packed one-byte dtype, got {tensor.dtype}")
+        if tensor.numel() != expected_numel:
+            raise ValueError(
+                f"{name}.numel()={tensor.numel()} does not match expected {expected_numel}"
+            )
+        if not tensor.is_contiguous():
+            raise ValueError(f"{name} must be contiguous")
+        return tensor.view(torch.uint8)
+
+    def set_weights(self, w1, w1_scale, w2, w2_scale):
+        """Rebind local expert weights without rebuilding shared workspaces."""
+        epr, hidden, inter = self.epr, self.model_dim, self.inter_dim
+        self._s1_w1 = self._validate_weight_tensor(
+            "w1", w1, epr * 2 * inter * hidden // 2
+        )
+        self._s1_w1_scale = self._validate_weight_tensor(
+            "w1_scale", w1_scale, epr * 2 * inter * hidden // 32
+        )
+        self.w2 = self._validate_weight_tensor(
+            "w2", w2, epr * hidden * inter // 2
+        )
+        self.w2_scale = self._validate_weight_tensor(
+            "w2_scale", w2_scale, epr * hidden * inter // 32
+        )
+        return self
+
     def preload_aot_bundles(self):
         """Load the paired Stage1 and Stage2 production bundles."""
         self.preload_stage1_bundle()
