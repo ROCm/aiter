@@ -1,4 +1,3 @@
-#!/usr/bin/env python
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
@@ -35,12 +34,19 @@ that no valid position was zeroed.
 import pytest
 import torch
 
-from aiter.ops.shuffle import shuffle_weight
 from aiter.ops.triton.attention.pa_mqa_logits import (
     deepgemm_fp8_paged_mqa_logits,
     deepgemm_fp8_paged_mqa_logits_schedule,
 )
+from aiter.ops.triton.utils._triton import arch_info
+from aiter.ops.triton.utils.shuffle import shuffle_weight
 from aiter.ops.triton.utils.types import get_fp8_e4m3_dtype
+
+# The VarCtx Gluon branch (_gluon_..._preshuffle_varctx) runs only on CDNA
+# gfx942/gfx950. On gfx1250 the wrapper discards VarCtxSchedule and falls back to
+# the non-VarCtx path, so the regression would pass vacuously there.
+DEVICE_ARCH = arch_info.get_arch()
+_VARCTX_ARCHS = ("gfx942", "gfx950")
 
 dev = "cuda"
 SEED = 256
@@ -131,7 +137,10 @@ def _run(q, kvc, w, ctx_lens, block_tables, t_max, vcs):
     return out
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a ROCm GPU")
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or DEVICE_ARCH not in _VARCTX_ARCHS,
+    reason=f"VarCtx Gluon path requires gfx942/gfx950; got {DEVICE_ARCH}",
+)
 @pytest.mark.parametrize("batch", [256])
 def test_varctx_kv_read_offset_no_overflow(batch):
     ctx_list = _variable_ctx(batch)
