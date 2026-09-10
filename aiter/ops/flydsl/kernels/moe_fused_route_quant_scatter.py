@@ -98,13 +98,10 @@ BLOCK_THREADS = 256
 # It only has to exceed any real buffer, and stays under 2 GiB because the
 # descriptor builder sign-extends the size to 64 bits.
 _SCALE_RSRC_MAX_BYTES = 0x7FFFFFFF
-# Deepest TDM staging worth pipelining. The curve is a bowl: one chunk is worse
-# than no staging at all (the prologue waits on the whole row with nothing to
-# overlap), and past four the per-chunk tensor_wait and two CTA barriers cost
-# more than the smaller transfer saves. Measured on DSV4 (7168, topk 6, fp4,
-# gfx1250) at 16384 tokens -- 1: 59.4 us, 2: 50.7, 4: 47.4, 7: 46.7, 14: 48.1,
-# 28: 53.4, none: 48.1. Four and seven are a wash, and four divides every
-# model_dim's iteration count we ship, so one depth serves them all.
+# TDM staging depth. One chunk is degenerate -- the prologue waits on the whole
+# row with nothing to overlap -- and past four the per-chunk tensor_wait and two
+# CTA barriers outweigh the smaller transfer. Four also divides every shipped
+# model_dim's iteration count, so one depth serves them all.
 _TOKEN_MULTIDEST_TDM_CHUNKS = 4
 # The K-split aims for this many blocks per CU; past that it stops paying.
 _TOKEN_MULTIDEST_BLOCKS_PER_CU = 4
@@ -1833,12 +1830,10 @@ def token_multidest_ksplit(
     """How many ways to split the row's K groups over ``grid.y``.
 
     One warp per token gives only ``token_num / warps_per_block`` blocks, so a
-    decode-sized batch leaves most of the GPU idle. Splitting K widens the grid
-    at no extra work, and the measured optimum is simply "enough blocks":
-    every token count from 8 to 32768 is fastest at the split that first brings
-    the grid to about ``_TOKEN_MULTIDEST_TARGET_BLOCKS``, after which the deeper
-    split only multiplies the per-block route setup. Splitting also costs the
-    TDM staging pipeline, which is why it stops once the grid is wide enough.
+    decode-sized batch leaves most of the GPU idle; splitting K widens the grid
+    without duplicating any work. Splitting further than that only multiplies
+    the per-block route setup, and it costs the staging pipeline, so it stops
+    once the grid is wide enough.
     """
     from aiter.jit.utils.chip_info import get_cu_num
 
@@ -1846,7 +1841,6 @@ def token_multidest_ksplit(
     grid = -(-token_num // L.warps_per_block)
     target = (get_cu_num() or 256) * _TOKEN_MULTIDEST_BLOCKS_PER_CU
     want = -(-target // max(grid, 1))
-    # Largest divisor of the row that stays within the cap and the target.
     best = 1
     for n in range(1, min(want, _TOKEN_MULTIDEST_MAX_KSPLIT) + 1):
         if L.block_iters % n == 0:
@@ -1860,12 +1854,9 @@ def token_multidest_tdm_chunks(
     """TDM staging depth: the deepest the row's geometry allows, up to the tuned one.
 
     A chunk has to cover a whole number of wave iterations and stay 16 B
-    aligned, so the depth comes from the row's divisors rather than a constant.
-    The tuned depth divides 7168's 28 iterations, 4096's 16 and 2048's 8 alike,
-    but the search still has to run for a row those do not fit.
-
-    A K-split block has too few iterations left to pay for a pipeline, and the
-    builder drops staging for it anyway; say so here so the two agree.
+    aligned, so the depth has to come from the row's divisors rather than a
+    constant. A K-split block has too few iterations left to pay for a pipeline
+    and the builder drops staging for it, so report that here too.
     """
     if ksplit > 1:
         return 0
@@ -1910,11 +1901,8 @@ def build_moe_token_multidest_quant_topk6_module(
     dst_scale_dwords_per_row = L.dst_scale_dwords_per_row
     row_iters = L.block_iters
     amax_shuffle_dists = L.amax_shuffle_dists
-    # One warp per token only reaches token_num/warps_per_block blocks, which
-    # starves the CUs at decode-sized batches. Splitting the row's K groups over
-    # grid.y restores the parallelism without restoring the per-route requant:
-    # an MX block scale covers 32 contiguous elements, so K slices are wholly
-    # independent -- no cross-block reduction, only a wider grid.
+    # Splitting the row's K groups over grid.y is safe because an MX block scale
+    # covers 32 contiguous elements: the slices need no cross-block reduction.
     if row_iters % ksplit:
         raise ValueError(
             f"ksplit={ksplit} must divide the row's {row_iters} wave iterations"

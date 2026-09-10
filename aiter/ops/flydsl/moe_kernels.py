@@ -2988,12 +2988,9 @@ def _get_compiled_fused_quant_preshuffle(
 
 
 _ROUTEKS_KSPLIT_GRID_THRESHOLD = 512
-# Below this the route-ksplit kernel wins. Both now split along K, so what is
-# left is that one warp per token cannot fill a grid out of a handful of tokens
-# whatever the split, while one warp per route starts with topk times as many.
-# Measured on DSV4 (7168, topk 6, fp4, gfx1250), route-ksplit vs multidest --
-# 8: 2.44 vs 3.14 us, 32: 3.26 vs 3.04, 64: 3.43 vs 3.09, 256: 6.40 vs 4.15,
-# 512: 10.24 vs 5.90, 4096: 31.85 vs 22.86.
+# Below this the route-ksplit kernel wins: both split along K, but one warp per
+# token cannot fill a grid out of a handful of tokens whatever the split, while
+# one warp per route starts with topk times as many.
 _TOKEN_MULTIDEST_MIN_TOKENS = 64
 
 
