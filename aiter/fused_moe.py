@@ -2107,7 +2107,7 @@ def _flydsl_v2_stage2_wrapper(
     reverse_sorted=None,
     **_kwargs,
 ):
-    from aiter.ops.flydsl.kernels.mxmoe_dispatcher import (
+    from aiter.ops.flydsl.kernels.mxmoe_g2 import (
         _validate_v2_gemm2_dtypes,
         mxfp4_moe_gemm2,
     )

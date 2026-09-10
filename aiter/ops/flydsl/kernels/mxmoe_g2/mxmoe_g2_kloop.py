@@ -9,7 +9,7 @@ from flydsl.expr.typing import Float32, Int32, T
 from flydsl.expr.typing import Vector as Vec
 from flydsl.expr.typing import as_ir_value as _raw
 
-from .mxfp4_gemm_common import (
+from ..mxfp4_gemm_common import (
     _udiv,
     global_typed_ptr,
     kBS_stride_k0_dw,

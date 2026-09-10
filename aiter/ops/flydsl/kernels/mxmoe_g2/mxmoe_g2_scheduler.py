@@ -7,7 +7,7 @@ import flydsl.expr as fx
 from flydsl.expr import const_expr, gpu, rocdl
 from flydsl.expr.typing import T
 
-from .mxfp4_gemm_common import _udiv, global_typed_ptr
+from ..mxfp4_gemm_common import _udiv, global_typed_ptr
 
 
 def _flat_persistent_tile(pid, bound):

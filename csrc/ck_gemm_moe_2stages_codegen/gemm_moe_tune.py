@@ -1053,7 +1053,7 @@ class FmoeTuner(TunerCommon):
         topk,
         kparams,
     ):
-        from aiter.ops.flydsl.kernels.mxmoe_dispatcher import mxfp4_moe_gemm2
+        from aiter.ops.flydsl.kernels.mxmoe_g2 import mxfp4_moe_gemm2
 
         token = ref2.shape[0]
         epilog = kparams["epilog"]

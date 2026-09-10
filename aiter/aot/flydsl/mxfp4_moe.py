@@ -288,7 +288,7 @@ def _compile_stage2(job):
 def _compile_v2_stage2(job):
     import torch
 
-    from aiter.ops.flydsl.kernels.mxmoe_dispatcher import mxfp4_moe_gemm2
+    from aiter.ops.flydsl.kernels.mxmoe_g2 import mxfp4_moe_gemm2
 
     d = _dummy()
     bias = _dummy(max(256, job["NE"] * job["N_OUT"] * 4))

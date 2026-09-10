@@ -11,13 +11,13 @@ from flydsl.expr.typing import Int8, T
 
 from aiter.jit.utils.chip_info import get_cu_num
 
-from .mxfp4_gemm_common import (
+from ..mxfp4_gemm_common import (
     kStages,
 )
 from .mxmoe_g2_atoms import issue_a_load_lds_dt
 from .mxmoe_g2_kloop import gemm2_body_v2
 from .mxmoe_g2_scheduler import g2_launch_grid_x, schedule_g2_tiles
-from .tensor_shim import _run_compiled as run_compiled
+from ..tensor_shim import _run_compiled as run_compiled
 
 __all__ = [
     "compile_gemm2_a4w4_port",
@@ -116,7 +116,7 @@ def compile_gemm2_a4w4_port(
         raise AssertionError("out_dtype='fp8' is supported only with epilog='reduce'")
     g2_kstatic = bool(g2_kstatic)
     if g2_kstatic and route_out_fp8:
-        from .mxfp4_gemm_common import FP8OUT_PITCH_ALIGN, FP8OUT_SCALE_BLK
+        from ..mxfp4_gemm_common import FP8OUT_PITCH_ALIGN, FP8OUT_SCALE_BLK
 
         g2_defer_weight = True
         g2_out_pitch_align = FP8OUT_PITCH_ALIGN
