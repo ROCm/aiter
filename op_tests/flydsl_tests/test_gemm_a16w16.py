@@ -12,13 +12,13 @@ import torch.nn.functional as F
 import aiter
 from aiter import dtypes
 from aiter.jit.utils.chip_info import get_gfx
-from aiter.ops.flydsl.gemm_a16w16_gfx1250 import gemm_a16w16 as flydsl_gemm_a16w16
+from aiter.ops.flydsl.gemm_kernels import flydsl_hgemm
 from aiter.ops.triton.gemm.basic.gemm_a16w16 import gemm_a16w16 as triton_gemm_a16w16
 from aiter.test_common import benchmark, checkAllclose, run_perftest
 
 torch.set_default_device("cuda")
 
-SUPPORTED_GFX = ["gfx1250"]
+SUPPORTED_GFX = ["gfx950", "gfx1250"]
 LAYOUTS = ["TN", "TT", "NN", "NT"]
 ACTIVATIONS = {
     "gelu": F.gelu,
@@ -28,6 +28,67 @@ ACTIVATIONS = {
     "relu": F.relu,
 }
 SENTINEL = 4096.0
+
+DEFAULT_MNK = {
+    "gfx1250": [
+        (64, 64, 64),
+        (256, 256, 256),
+        (32, 256, 128),
+        (256, 32, 128),
+        (128, 128, 1024),
+        (1024, 128, 128),
+        (100, 190, 256),
+        (129, 257, 512),
+        (128, 192, 48),
+        (65, 190, 1000),
+        (64, 5120, 2880),
+        (64, 2880, 4096),
+        (64, 128, 2880),
+    ],
+    "gfx950": [
+        (8, 4096, 4096),
+        (64, 4096, 4096),
+        (256, 4096, 4096),
+        (1024, 1024, 1024),
+        (32, 384, 7168),
+        (8, 7168, 2048),
+    ],
+}
+DEFAULT_CONFIGS = {
+    "gfx1250": [
+        (64, 5120, 2880, 64, 64, 256, 4, 2, 4, 2, 1),
+        (64, 2880, 4096, 64, 64, 128, 4, 2, 6, 4, 1),
+        (64, 128, 2880, 16, 16, 256, 1, 1, 3, 6, 1),
+        (128, 128, 512, 64, 64, 128, 2, 2, 2, 2, 0),
+        (128, 128, 512, 64, 64, 128, 2, 2, 2, 4, 0),
+        (64, 64, 768, 64, 64, 128, 2, 2, 2, 3, 0),
+        (64, 64, 768, 64, 64, 128, 2, 2, 2, 6, 0),
+        (128, 256, 1024, 64, 64, 128, 2, 2, 2, 4, 0),
+        (256, 128, 1024, 32, 32, 128, 2, 2, 2, 8, 0),
+        (128, 128, 1024, 64, 64, 128, 2, 2, 3, 4, 0),
+        (64, 64, 576, 64, 64, 64, 2, 2, 2, 2, 0),
+        (64, 100, 512, 64, 64, 64, 2, 2, 2, 2, 0),
+        (100, 100, 256, 128, 128, 32, 2, 4, 3, 1, 0),
+        (129, 257, 512, 128, 128, 32, 2, 4, 3, 1, 0),
+        (65, 190, 256, 128, 128, 32, 2, 4, 3, 1, 0),
+        (250, 120, 512, 64, 64, 128, 2, 2, 2, 1, 0),
+        (33, 65, 256, 32, 32, 128, 2, 2, 3, 1, 0),
+        (64, 64, 1024, 32, 32, 128, 2, 2, 3, 1, 0),
+        (128, 128, 1024, 128, 128, 32, 2, 4, 3, 1, 1),
+    ],
+    "gfx950": [
+        (64, 4096, 4096, 32, 32, 128, 2, 2, 6, 1, 0),
+        (128, 4096, 4096, 32, 64, 128, 1, 4, 4, 1, 0),
+        (256, 4096, 4096, 64, 64, 128, 4, 2, 4, 1, 0),
+        (512, 4096, 4096, 64, 128, 64, 2, 4, 5, 1, 0),
+        (1024, 4096, 4096, 128, 128, 64, 2, 4, 4, 1, 0),
+        (1024, 1024, 1024, 64, 64, 64, 1, 4, 4, 1, 0),
+        (2048, 2048, 2048, 128, 128, 64, 2, 4, 4, 1, 0),
+        (4096, 4096, 4096, 256, 256, 64, 2, 4, 2, 1, 1),
+        (8, 7168, 2048, 16, 16, 64, 1, 1, 8, 1, 0),
+        (32, 14336, 4096, 32, 64, 128, 2, 2, 5, 1, 0),
+    ],
+}
 
 
 def generate_inputs(m, n, k, dtype, layout="TN", bias=False):
@@ -55,7 +116,6 @@ def run_torch(x, w, bias=None, activation=None, dtype=dtypes.bf16):
 
 
 def run_candidates(candidates, ref, m, n, k, in_bytes, out_bytes, msg):
-    # [m,k] @ [n,k]^T: FLOPs = 2*m*n*k; bytes = x + w read, y written.
     flops = 2 * m * n * k
     nbytes = (m * k + n * k) * in_bytes + m * n * out_bytes
     ret = {"gfx": get_gfx()}
@@ -80,10 +140,7 @@ def test_gemm_a16w16(m, n, k, dtype, layout):
     x, w, _ = generate_inputs(m, n, k, dtype, layout)
     ref = run_torch(x, w, dtype=dtype)
     candidates = {
-        "flydsl": lambda: flydsl_gemm_a16w16(x, w, dtype=dtype),
-        "flydsl_cb": lambda: flydsl_gemm_a16w16(
-            x, w, dtype=dtype, variant="compute_bound"
-        ),
+        "flydsl": lambda: flydsl_hgemm(x, w, out_dtype=dtype),
         "triton": lambda: triton_gemm_a16w16(x, w, dtype=dtype),
     }
     return run_candidates(
@@ -93,12 +150,12 @@ def test_gemm_a16w16(m, n, k, dtype, layout):
 
 @benchmark()
 def test_gemm_a16w16_fused(m, n, k, dtype, activation, bias):
+    from aiter.ops.flydsl.gemm_a16w16_gfx1250 import gemm_a16w16
+
     x, w, b = generate_inputs(m, n, k, dtype, bias=bias)
     ref = run_torch(x, w, b, activation, dtype)
     candidates = {
-        "flydsl": lambda: flydsl_gemm_a16w16(
-            x, w, bias=b, dtype=dtype, activation=activation
-        ),
+        "flydsl": lambda: gemm_a16w16(x, w, bias=b, dtype=dtype, activation=activation),
         "triton": lambda: triton_gemm_a16w16(
             x, w, bias=b, dtype=dtype, activation=activation
         ),
@@ -122,34 +179,36 @@ def test_gemm_a16w16_config(
     k,
     dtype,
     otype,
-    tile_m,
-    tile_n,
-    tile_k,
-    m_warp,
-    n_warp,
-    num_buffers,
+    block_m,
+    block_n,
+    block_k,
+    m_waves,
+    n_waves,
+    stages,
     split_k,
     unroll,
 ):
     x, w, _ = generate_inputs(m, n, k, dtype)
     ref = run_torch(x, w, dtype=otype)
-    parent = torch.full((m + tile_m, n + tile_n), SENTINEL, dtype=otype)
+    parent = torch.full((m + block_m, n + block_n), SENTINEL, dtype=otype)
     y = parent[:m, :n]
     cfg = {
-        "dtype": otype,
-        "y": y,
-        "tile_m": tile_m,
-        "tile_n": tile_n,
-        "tile_k": tile_k,
-        "m_warp": m_warp,
-        "n_warp": n_warp,
-        "num_buffers": num_buffers,
+        "out": y,
+        "out_dtype": otype,
+        "block_m": block_m,
+        "block_n": block_n,
+        "block_k": block_k,
+        "stages": stages,
         "split_k": split_k,
-        "main_loop_unroll": bool(unroll),
+        "m_waves": m_waves,
+        "n_waves": n_waves,
+        "k_waves": 1,
+        "group_m": 0,
+        "policy": "ht" if unroll else "ft",
     }
-    assert flydsl_gemm_a16w16(x, w, **cfg) is y
+    assert flydsl_hgemm(x, w, **cfg) is y
     candidates = {
-        "flydsl": lambda: flydsl_gemm_a16w16(x, w, **cfg),
+        "flydsl": lambda: flydsl_hgemm(x, w, **cfg),
         "triton": lambda: triton_gemm_a16w16(x, w, dtype=otype),
     }
     ret = run_candidates(
@@ -175,10 +234,9 @@ def summarize(name, rows):
 
 
 def main():
-    if get_gfx() not in SUPPORTED_GFX:
-        aiter.logger.warning(
-            "flydsl gemm_a16w16 needs gfx1250; skipping on %s", get_gfx()
-        )
+    gfx = get_gfx()
+    if gfx not in SUPPORTED_GFX:
+        aiter.logger.warning("flydsl a16w16 gemm unsupported on %s; skipping", gfx)
         return
 
     parser = argparse.ArgumentParser(
@@ -213,21 +271,7 @@ def main():
         "--mnk",
         type=dtypes.str2tuple,
         nargs="*",
-        default=[
-            (64, 64, 64),  # single tile
-            (256, 256, 256),  # aligned multi-tile
-            (32, 256, 128),  # m < tile_m
-            (256, 32, 128),  # n < tile_n
-            (128, 128, 1024),  # long main loop + drain
-            (1024, 128, 128),
-            (100, 190, 256),  # ragged m/n
-            (129, 257, 512),  # one past a tile boundary
-            (128, 192, 48),  # ragged k, K < 2 * tile_k
-            (65, 190, 1000),  # ragged m/n/k
-            (64, 5120, 2880),
-            (64, 2880, 4096),
-            (64, 128, 2880),
-        ],
+        default=DEFAULT_MNK[gfx],
         help="""Shape of mnk.
         e.g.: -s 64,5120,2880""",
     )
@@ -249,7 +293,7 @@ def main():
         choices=list(ACTIVATIONS),
         nargs="*",
         default=list(ACTIVATIONS),
-        help="""Fused epilogue activation.
+        help="""Fused epilogue activation (gfx1250 kernel only).
         e.g.: -a gelu silu""",
     )
     parser.add_argument(
@@ -265,33 +309,10 @@ def main():
         "--config",
         type=dtypes.str2tuple,
         nargs="*",
-        default=[
-            (64, 5120, 2880, 64, 64, 256, 4, 2, 4, 2, 1),
-            (64, 2880, 4096, 64, 64, 128, 4, 2, 6, 4, 1),
-            (64, 128, 2880, 16, 16, 256, 1, 1, 3, 6, 1),
-            # split-K: k-tiles per split from 1 up to 4, num_buffers 2 and 3
-            (128, 128, 512, 64, 64, 128, 2, 2, 2, 2, 0),
-            (128, 128, 512, 64, 64, 128, 2, 2, 2, 4, 0),
-            (64, 64, 768, 64, 64, 128, 2, 2, 2, 3, 0),
-            (64, 64, 768, 64, 64, 128, 2, 2, 2, 6, 0),
-            (128, 256, 1024, 64, 64, 128, 2, 2, 2, 4, 0),
-            (256, 128, 1024, 32, 32, 128, 2, 2, 2, 8, 0),
-            (128, 128, 1024, 64, 64, 128, 2, 2, 3, 4, 0),
-            (64, 64, 576, 64, 64, 64, 2, 2, 2, 2, 0),  # ragged k per split
-            (64, 100, 512, 64, 64, 64, 2, 2, 2, 2, 0),  # ragged n + split-K
-            # ragged m/n edge tiles at each tile size
-            (100, 100, 256, 128, 128, 32, 2, 4, 3, 1, 0),
-            (129, 257, 512, 128, 128, 32, 2, 4, 3, 1, 0),
-            (65, 190, 256, 128, 128, 32, 2, 4, 3, 1, 0),
-            (250, 120, 512, 64, 64, 128, 2, 2, 2, 1, 0),
-            (33, 65, 256, 32, 32, 128, 2, 2, 3, 1, 0),
-            (64, 64, 1024, 32, 32, 128, 2, 2, 3, 1, 0),
-            # default tile with main-loop unroll
-            (128, 128, 1024, 128, 128, 32, 2, 4, 3, 1, 1),
-        ],
-        help="""Explicit kernel config as
-        m,n,k,tile_m,tile_n,tile_k,m_warp,n_warp,num_buffers,split_k,unroll
-        (the fields a tuned flydsl_a16w16_gfx1250_* kernel name encodes).
+        default=DEFAULT_CONFIGS[gfx],
+        help="""Explicit flydsl_hgemm config as
+        m,n,k,block_m,block_n,block_k,m_waves,n_waves,stages,split_k,unroll
+        (unroll=1 -> policy ht; the fields of a tuned flydsl_hgemm_* csv name).
         e.g.: -c 64,5120,2880,64,64,256,4,2,4,2,1""",
     )
     args = parser.parse_args()
@@ -304,15 +325,21 @@ def main():
                 for layout, (m, n, k) in itertools.product(args.layout, args.mnk)
             ],
         )
-        summarize(
-            "gemm_a16w16 fused epilogue",
-            [
-                test_gemm_a16w16_fused(m, n, k, dtype, act, bias)
-                for act, bias, (m, n, k) in itertools.product(
-                    args.activation, args.bias, args.mnk
-                )
-            ],
-        )
+        if gfx == "gfx1250":
+            summarize(
+                "gemm_a16w16 fused epilogue",
+                [
+                    test_gemm_a16w16_fused(m, n, k, dtype, act, bias)
+                    for act, bias, (m, n, k) in itertools.product(
+                        args.activation, args.bias, args.mnk
+                    )
+                ],
+            )
+        else:
+            aiter.logger.warning(
+                "%s: skipping fused-epilogue table (activation fusion is gfx1250-only)",
+                gfx,
+            )
         summarize(
             "gemm_a16w16 kernel config",
             [

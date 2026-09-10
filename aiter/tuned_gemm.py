@@ -158,18 +158,11 @@ def get_GEMM_A16W16_config(
         )
         if config is not None:
             if config["libtype"] == "flydsl":
-                if gfx == "gfx1250":
-                    from aiter.ops.flydsl.gemm_a16w16_gfx1250 import (
-                        parse_kernel_name,
+                flydsl_config = (
+                    _get_flydsl_gemm_kernels().get_flydsl_hgemm_kernel_params(
+                        config["kernelName"]
                     )
-
-                    flydsl_config = parse_kernel_name(config["kernelName"])
-                else:
-                    flydsl_config = (
-                        _get_flydsl_gemm_kernels().get_flydsl_hgemm_kernel_params(
-                            config["kernelName"]
-                        )
-                    )
+                )
                 # None means the tuned CSV names a kernel absent from this
                 # catalog version; it is unrelated to FlyDSL import availability.
                 if flydsl_config is None:
@@ -491,13 +484,6 @@ def flydsl_gemm(
     assert (
         scale_a is None and scale_b is None and scale_c is None
     ), "FlyDSL hgemm does not support scaling yet."
-    # gfx1250 runs the FlyDSL a16w16 WMMA kernel; other archs use the hgemm path.
-    if get_gfx() == "gfx1250":
-        from aiter.ops.flydsl.gemm_a16w16_gfx1250 import run_gemm_a16w16_gfx1250
-
-        return run_gemm_a16w16_gfx1250(
-            inp, weights, bias, otype or inp.dtype, config["kernelName"]
-        )
     flydsl_gemm_kernels = _get_flydsl_gemm_kernels()
     flydsl_config = flydsl_gemm_kernels.get_flydsl_hgemm_kernel_params(
         config["kernelName"]

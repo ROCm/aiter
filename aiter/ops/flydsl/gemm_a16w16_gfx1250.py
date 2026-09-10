@@ -6,7 +6,6 @@
 from __future__ import annotations
 
 import functools
-import re
 
 import torch
 
@@ -79,40 +78,7 @@ def _cached_launcher(*cfg):
     return _compile_gemm_a16w16(**dict(zip(_CFG_KEYS, cfg)))
 
 
-# flydsl_a16w16_gfx1250_t{tm}x{tn}x{tk}_mw{mw}_nw{nw}_nb{nb}_sk{sk}_unroll{0|1}
-_KERNEL_NAME_RE = re.compile(
-    r"^flydsl_a16w16_gfx1250_"
-    r"t(?P<tile_m>\d+)x(?P<tile_n>\d+)x(?P<tile_k>\d+)_"
-    r"mw(?P<m_warp>\d+)_nw(?P<n_warp>\d+)_"
-    r"nb(?P<num_buffers>\d+)_sk(?P<split_k>\d+)_unroll(?P<main_loop_unroll>[01])$"
-)
-
-
-def parse_kernel_name(name: str):
-    """Parse a flydsl_a16w16_gfx1250_ kernelName into its config dict, or None."""
-    m = _KERNEL_NAME_RE.fullmatch(name)
-    if m is None:
-        return None
-    cfg = {k: int(v) for k, v in m.groupdict().items()}
-    cfg["main_loop_unroll"] = bool(cfg["main_loop_unroll"])
-    return cfg
-
-
-def run_gemm_a16w16_gfx1250(
-    x: torch.Tensor,
-    w: torch.Tensor,
-    bias: torch.Tensor | None,
-    dtype: torch.dtype,
-    kernel_name: str,
-) -> torch.Tensor:
-    """Dispatch entry: decode a tuned kernelName and run the kernel."""
-    cfg = parse_kernel_name(kernel_name)
-    if cfg is None:
-        raise ValueError(f"[FlyDSL gfx1250] unrecognised kernelName: {kernel_name!r}")
-    return gemm_a16w16(x, w, bias=bias, dtype=dtype, **cfg)
-
-
-_SPLIT_K_MAX_TILES = 1 << 16
+_SPLIT_K_MAX_TILES = 4096
 
 
 @functools.cache
@@ -181,9 +147,11 @@ def gemm_a16w16(
     sem = _split_k_counters(x.device, stream)
     if split_k > 1:
         tiles = ((M + tile_m - 1) // tile_m) * ((N + tile_n - 1) // tile_n)
-        assert (
-            tiles <= sem.numel()
-        ), f"gemm_a16w16: split_k needs {tiles} tile counters, max {sem.numel()}"
+        if tiles > _SPLIT_K_MAX_TILES:
+            raise RuntimeError(
+                f"[FlyDSL gfx1250] split_k needs {tiles} tile counters, "
+                f"more than {_SPLIT_K_MAX_TILES}"
+            )
         m_pad = ((M + tile_m - 1) // tile_m) * tile_m
         n_pad = ((N + tile_n - 1) // tile_n) * tile_n
         ws = torch.empty((split_k, m_pad, n_pad), device=x.device, dtype=torch.float32)
@@ -238,4 +206,4 @@ def gemm_a16w16(
     return y_buf
 
 
-__all__ = ["gemm_a16w16", "parse_kernel_name", "run_gemm_a16w16_gfx1250"]
+__all__ = ["gemm_a16w16"]
