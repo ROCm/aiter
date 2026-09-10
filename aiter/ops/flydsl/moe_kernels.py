@@ -2992,24 +2992,29 @@ _ROUTEKS_KSPLIT_GRID_THRESHOLD = 512
 # token cannot fill a grid out of a handful of tokens whatever the split, while
 # one warp per route starts with topk times as many.
 _TOKEN_MULTIDEST_MIN_TOKENS = 64
+# Every destination costs a buffer descriptor held live across the store pass,
+# so the saving stops being free once they crowd the register budget.
+_TOKEN_MULTIDEST_MAX_TOPK = 8
 
 
 @functools.cache
-def _get_compiled_token_multidest_quant_topk6(
+def _get_compiled_token_multidest_quant(
     feat_dim: int,
     wmma_rep: int,
+    topk: int,
     quant_mode: str,
     row_major_scale: bool = False,
-    tdm_hidden_chunks: int = 7,
+    tdm_hidden_chunks: int = 4,
     ksplit: int = 1,
 ):
     from aiter.ops.flydsl.kernels.moe_fused_route_quant_scatter import (
-        build_moe_token_multidest_quant_topk6_module,
+        build_moe_token_multidest_quant_module,
     )
 
-    return build_moe_token_multidest_quant_topk6_module(
+    return build_moe_token_multidest_quant_module(
         feat_dim=feat_dim,
         wmma_rep=wmma_rep,
+        topk=topk,
         quant_mode=quant_mode,
         row_major_scale=row_major_scale,
         tdm_hidden_chunks=tdm_hidden_chunks,
@@ -3165,15 +3170,15 @@ def flydsl_moe_fused_quant_preshuffle(
             not prequantized
             and not remap_rows
             and num_valid_routes is None
-            and int(source_topk) == 6
+            and 1 < int(source_topk) <= _TOKEN_MULTIDEST_MAX_TOPK
             and token_num >= _TOKEN_MULTIDEST_MIN_TOKENS
             and os.environ.get("AITER_FLYDSL_TOKEN_MULTIDEST_QUANT", "1")
             in ("1", "true", "True")
         )
         if row_major_scale and not use_token_multidest:
             raise ValueError(
-                "row_major_scale is only implemented on the topk=6 "
-                "token-multidest quant path"
+                "row_major_scale is only implemented on the token-multidest "
+                "quant path"
             )
         if use_token_multidest:
             from aiter.ops.flydsl.kernels.moe_fused_route_quant_scatter import (
@@ -3184,9 +3189,10 @@ def flydsl_moe_fused_quant_preshuffle(
             md_ksplit = token_multidest_ksplit(
                 feat_dim, wmma_rep, quant_mode, token_num
             )
-            launch = _get_compiled_token_multidest_quant_topk6(
+            launch = _get_compiled_token_multidest_quant(
                 feat_dim=feat_dim,
                 wmma_rep=wmma_rep,
+                topk=int(source_topk),
                 quant_mode=quant_mode,
                 row_major_scale=bool(row_major_scale),
                 tdm_hidden_chunks=token_multidest_tdm_chunks(

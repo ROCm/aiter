@@ -1867,19 +1867,22 @@ def token_multidest_tdm_chunks(
     return 0
 
 
-def build_moe_token_multidest_quant_topk6_module(
+def build_moe_token_multidest_quant_module(
     feat_dim: int,
     wmma_rep: int,
+    topk: int,
     quant_mode: str = "fp4",
     row_major_scale: bool = False,
     tdm_hidden_chunks: int = _TOKEN_MULTIDEST_TDM_CHUNKS,
     ksplit: int = 1,
 ):
-    """Quantize each token once and scatter the result to its six routed rows.
+    """Quantize each token once and scatter the result to its ``topk`` routed rows.
 
-    This is the large-batch DSV4 specialization. The route-indexed kernel
-    quantizes the same hidden row once per route; this kernel uses one warp per
-    token, computes the MX payload/e8m0 row once, then emits six destinations.
+    The route-indexed kernel quantizes the same hidden row once per route; this
+    one uses a warp per token, computes the MX payload/e8m0 row once, then emits
+    every destination. What it saves therefore grows with ``topk``, while what
+    it costs -- one buffer descriptor per destination held live across the store
+    pass -- grows with it too.
     """
     L = _quant_layout(feat_dim, quant_mode, wmma_rep)
     if not L.use_pk8:
@@ -1926,7 +1929,7 @@ def build_moe_token_multidest_quant_topk6_module(
     scale_pack_dwords = row_major_scale and lanes_per_mx_block == 4
     scale_vec4 = scale_pack_dwords and block_iters % 2 == 0
     module_name = (
-        f"moe_token_multidest_quant_topk6_fd{feat_dim}_r{wmma_rep}"
+        f"moe_token_multidest_quant_k{topk}_fd{feat_dim}_r{wmma_rep}"
         f"_{quant_mode}_{L.native_tag}"
         f"{'_rmscale' if row_major_scale else ''}"
         f"{'_scpk' if scale_pack_dwords else ''}"
@@ -1949,7 +1952,6 @@ def build_moe_token_multidest_quant_topk6_module(
         c0_i32 = arith.constant(0, type=i32)
         c1_i32 = arith.constant(1, type=i32)
         c4_i32 = arith.constant(4, type=i32)
-        c6_i32 = arith.constant(6, type=i32)
         c16_i32 = arith.constant(16, type=i32)
         c23_i32 = arith.constant(23, type=i32)
         c254_i32 = arith.constant(254, type=i32)
@@ -2052,12 +2054,12 @@ def build_moe_token_multidest_quant_topk6_module(
         )
         if token0 < fx.Uint32(token_num):
             rows_t = ptr_buf_tensor(topids_to_rows)
-            route0 = token_eff * c6_i32
+            route0 = token_eff * arith.constant(topk, type=i32)
             # Scalar loads: the route is wave-uniform, and landing each row in
             # an SGPR is what keeps its destination descriptor uniform too.
             rows = [
                 fx.Uint32(buf_scalar_load(rows_t, route0 + arith.constant(k, type=i32)))
-                for k in range_constexpr(6)
+                for k in range_constexpr(topk)
             ]
             scales = [
                 _token_multidest_scale_base(
