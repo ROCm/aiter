@@ -38,6 +38,7 @@ from flydsl.expr import math as fxmath
 from flydsl.expr.typing import BFloat16
 
 from aiter.ops.flydsl.kernels import buffer_ops
+from aiter.ops.flydsl.kernels.tensor_shim import ptr_buf_tensor
 
 WARP_SIZE = 64
 # Butterfly-reduce shifts for a full 64-lane wave (low -> high).
@@ -63,6 +64,11 @@ def _ptr_rsrc_off(ptr, byte_off_i64):
     """
     base = fx.Int64(fx.ptrtoint(ptr)) + fx.Int64(byte_off_i64)
     return buffer_ops.create_buffer_resource_from_addr(base)
+
+
+def _bf16_out_view(ptr):
+    """Unpacked BF16 output as a buffer-resource view; ``t[i]`` is one element."""
+    return ptr_buf_tensor(ptr, fx.BFloat16)
 
 
 def dot2_f32_bf16(a_i32, b_i32, acc_f32, *, serialize: bool = True):
@@ -217,6 +223,10 @@ def load_i32_words(rsrc, word0, n):
 
     Coalescing the per-word scalar loads into ``vec4``/``vec2`` buffer transactions
     is the main memory-throughput win for the warp-decode inner loop.
+
+    Packed dword path (weights and K-loop activations / intermediate): stays on
+    ``buffer_ops`` until there is an i64-base ``make_buffer_tensor`` equivalent.
+    Unpacked BF16 **outputs** use :func:`_bf16_out_view` instead.
     """
     out = []
     i = 0
@@ -533,7 +543,7 @@ def build_gate_up_fp8_module(
         # single BF16 scalar (avoids 64x redundant global stores). The reduce
         # must run on all lanes (cross-lane shuffles), so it stays outside the store.
         out_off = (token_b * top_k + expert_k) * inter + neuron_j
-        out_rsrc = _ptr_rsrc(out_ptr)
+        out_t = _bf16_out_view(out_ptr)
 
         if const_expr(block2d):
             # Block2D<BN,BK> scales vary along K, so fold each K-block's scale into
@@ -578,9 +588,7 @@ def build_gate_up_fp8_module(
             gate_acc = fx.Float32(wave_reduce_add_f32(gate_acc_l.ir_value()))
             up_acc = fx.Float32(wave_reduce_add_f32(up_acc_l.ir_value()))
             if lane == 0:
-                buffer_ops.buffer_store(
-                    BFloat16(_silu_mul(gate_acc, up_acc)).ir_value(), out_rsrc, out_off
-                )
+                out_t[out_off] = BFloat16(_silu_mul(gate_acc, up_acc))
         else:
             # G7 ILP: collect every (iter, pair) contribution, then drain each stream
             # through `dot2_acc` independent accumulators (single scale after reduce =>
@@ -622,9 +630,7 @@ def build_gate_up_fp8_module(
             gate_acc = fx.Float32(gate_sum) * fx.Float32(gs)
             up_acc = fx.Float32(up_sum) * fx.Float32(us)
             if lane == 0:
-                buffer_ops.buffer_store(
-                    BFloat16(_silu_mul(gate_acc, up_acc)).ir_value(), out_rsrc, out_off
-                )
+                out_t[out_off] = BFloat16(_silu_mul(gate_acc, up_acc))
 
     @flyc.jit
     def _launch(
@@ -786,9 +792,9 @@ def build_gate_up_fp8_act_module(
         out_val = _silu_mul(gate_acc, up_acc)
 
         out_off = (token_b * top_k + expert_k) * inter + neuron_j
-        out_rsrc = _ptr_rsrc(out_ptr)
+        out_t = _bf16_out_view(out_ptr)
         if lane == 0:
-            buffer_ops.buffer_store(BFloat16(out_val).ir_value(), out_rsrc, out_off)
+            out_t[out_off] = BFloat16(out_val)
 
     @flyc.jit
     def _launch(
@@ -1036,14 +1042,10 @@ def build_down_reduce_fp8_module(
                 for h in range_constexpr(kh_per_warp):
                     atomic_add_f32(y_ptr, token_b * hidden + out_j0 + h, y_sum[h])
         else:
-            y_rsrc = _ptr_rsrc(y_ptr)
+            y_t = _bf16_out_view(y_ptr)
             if lane == 0:
                 for h in range_constexpr(kh_per_warp):
-                    buffer_ops.buffer_store(
-                        BFloat16(y_sum[h]).ir_value(),
-                        y_rsrc,
-                        token_b * hidden + out_j0 + h,
-                    )
+                    y_t[token_b * hidden + out_j0 + h] = BFloat16(y_sum[h])
 
     @flyc.jit
     def _launch(
@@ -1208,9 +1210,9 @@ def build_gate_up_fp4_module(
         out_val = _silu_mul(gate_acc, up_acc)
 
         out_off = (token_b * top_k + expert_k) * inter + neuron_j
-        out_rsrc = _ptr_rsrc(out_ptr)
+        out_t = _bf16_out_view(out_ptr)
         if lane == 0:
-            buffer_ops.buffer_store(BFloat16(out_val).ir_value(), out_rsrc, out_off)
+            out_t[out_off] = BFloat16(out_val)
 
     @flyc.jit
     def _launch(
@@ -1441,12 +1443,10 @@ def build_down_reduce_fp4_module(
             fx.Float32(wave_reduce_add_f32(acc[h].ir_value()))
             for h in range(kh_per_warp)
         ]
-        y_rsrc = _ptr_rsrc(y_ptr)
+        y_t = _bf16_out_view(y_ptr)
         if lane == 0:
             for h in range_constexpr(kh_per_warp):
-                buffer_ops.buffer_store(
-                    BFloat16(y_sum[h]).ir_value(), y_rsrc, token_b * hidden + out_j0 + h
-                )
+                y_t[token_b * hidden + out_j0 + h] = BFloat16(y_sum[h])
 
     @flyc.jit
     def _launch(
@@ -1566,9 +1566,9 @@ def build_gate_up_bf16_module(
         out_val = _silu_mul(gate_acc, up_acc)
 
         out_off = (token_b * top_k + expert_k) * inter + neuron_j
-        out_rsrc = _ptr_rsrc(out_ptr)
+        out_t = _bf16_out_view(out_ptr)
         if lane == 0:
-            buffer_ops.buffer_store(BFloat16(out_val).ir_value(), out_rsrc, out_off)
+            out_t[out_off] = BFloat16(out_val)
 
     @flyc.jit
     def _launch(
@@ -1687,12 +1687,10 @@ def build_down_reduce_bf16_module(
             fx.Float32(wave_reduce_add_f32(acc[h].ir_value()))
             for h in range(kh_per_warp)
         ]
-        y_rsrc = _ptr_rsrc(y_ptr)
+        y_t = _bf16_out_view(y_ptr)
         if lane == 0:
             for h in range_constexpr(kh_per_warp):
-                buffer_ops.buffer_store(
-                    BFloat16(y_sum[h]).ir_value(), y_rsrc, token_b * hidden + out_j0 + h
-                )
+                y_t[token_b * hidden + out_j0 + h] = BFloat16(y_sum[h])
 
     @flyc.jit
     def _launch(
