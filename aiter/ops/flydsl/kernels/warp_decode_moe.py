@@ -38,7 +38,7 @@ from flydsl.expr import math as fxmath
 from flydsl.expr.typing import BFloat16
 
 from aiter.ops.flydsl.kernels import buffer_ops
-from aiter.ops.flydsl.kernels.tensor_shim import ptr_buf_tensor
+from aiter.ops.flydsl.kernels.tensor_shim import buf_copy_load, ptr_buf_tensor
 
 WARP_SIZE = 64
 # Butterfly-reduce shifts for a full 64-lane wave (low -> high).
@@ -69,6 +69,16 @@ def _ptr_rsrc_off(ptr, byte_off_i64):
 def _bf16_out_view(ptr):
     """Unpacked BF16 output as a buffer-resource view; ``t[i]`` is one element."""
     return ptr_buf_tensor(ptr, fx.BFloat16)
+
+
+def _f32_view(ptr):
+    """Unpacked f32 scale tensor as a buffer-resource view; ``t[i]`` is one element."""
+    return ptr_buf_tensor(ptr, fx.Float32)
+
+
+def _f32_load(t, idx):
+    """Scalar f32 load at element ``idx`` (``BufferCopy32b`` / ``fx.copy``)."""
+    return buf_copy_load(t, fx.Int32(idx), fx.Float32)
 
 
 def dot2_f32_bf16(a_i32, b_i32, acc_f32, *, serialize: bool = True):
@@ -325,13 +335,10 @@ def _scale_elem_off(w_row, per_token_scale):
     return fx.Int32(0)
 
 
-def _fp8_down_row_scales(wds_rsrc, w_row, kh_per_warp, per_token_scale):
+def _fp8_down_row_scales(wds_t, w_row, kh_per_warp, per_token_scale):
     if per_token_scale:
-        return [
-            buffer_ops.buffer_load(wds_rsrc, w_row[h], vec_width=1, dtype=T.f32())
-            for h in range(kh_per_warp)
-        ]
-    ds0 = buffer_ops.buffer_load(wds_rsrc, fx.Int32(0), vec_width=1, dtype=T.f32())
+        return [_f32_load(wds_t, w_row[h]) for h in range(kh_per_warp)]
+    ds0 = _f32_load(wds_t, 0)
     return [ds0 for _ in range(kh_per_warp)]
 
 
@@ -537,8 +544,8 @@ def build_gate_up_fp8_module(
         )
 
         one_f32 = fx.Float32(1.0).ir_value()
-        wgs_rsrc = _ptr_rsrc(wgs_ptr)
-        wus_rsrc = _ptr_rsrc(wus_ptr)
+        wgs_t = _f32_view(wgs_ptr)
+        wus_t = _f32_view(wus_ptr)
         # Every lane holds the identical reduced result; only lane 0 writes the
         # single BF16 scalar (avoids 64x redundant global stores). The reduce
         # must run on all lanes (cross-lane shuffles), so it stays outside the store.
@@ -577,12 +584,8 @@ def build_gate_up_fp8_module(
                     up_pairs_i, dot2_acc=dot2_acc, serialize=serialize_dot2
                 )
                 sidx = fx.Int32(row_blk * scale_cols_g + k_base // scale_bk)
-                gs_i = buffer_ops.buffer_load(
-                    wgs_rsrc, sidx, vec_width=1, dtype=T.f32()
-                )
-                us_i = buffer_ops.buffer_load(
-                    wus_rsrc, sidx, vec_width=1, dtype=T.f32()
-                )
+                gs_i = _f32_load(wgs_t, sidx)
+                us_i = _f32_load(wus_t, sidx)
                 gate_acc_l = gate_acc_l + fx.Float32(gd) * fx.Float32(gs_i)
                 up_acc_l = up_acc_l + fx.Float32(ud) * fx.Float32(us_i)
             gate_acc = fx.Float32(wave_reduce_add_f32(gate_acc_l.ir_value()))
@@ -625,8 +628,8 @@ def build_gate_up_fp8_module(
 
             # Weight scales (PerTensor -> p[0]; PerToken -> p[w_row]).
             scale_off = _scale_elem_off(w_row, per_token_scale)
-            gs = buffer_ops.buffer_load(wgs_rsrc, scale_off, vec_width=1, dtype=T.f32())
-            us = buffer_ops.buffer_load(wus_rsrc, scale_off, vec_width=1, dtype=T.f32())
+            gs = _f32_load(wgs_t, scale_off)
+            us = _f32_load(wus_t, scale_off)
             gate_acc = fx.Float32(gate_sum) * fx.Float32(gs)
             up_acc = fx.Float32(up_sum) * fx.Float32(us)
             if lane == 0:
@@ -740,7 +743,7 @@ def build_gate_up_fp8_act_module(
         w_row = e * inter + neuron_j
 
         x_rsrc = _ptr_rsrc(x_ptr)
-        xs_rsrc = _ptr_rsrc(xs_ptr)
+        xs_t = _f32_view(xs_ptr)
         wg_rsrc, wu_rsrc, w_word_base = _fp8_gate_up_weight_views(
             wg_ptr,
             wu_ptr,
@@ -753,8 +756,8 @@ def build_gate_up_fp8_act_module(
         )
 
         one_f32 = fx.Float32(1.0).ir_value()
-        wgs_rsrc = _ptr_rsrc(wgs_ptr)
-        wus_rsrc = _ptr_rsrc(wus_ptr)
+        wgs_t = _f32_view(wgs_ptr)
+        wus_t = _f32_view(wus_ptr)
 
         row_blk = w_row // scale_bn
         gate_acc_l = fx.Float32(0.0)
@@ -779,9 +782,9 @@ def build_gate_up_fp8_act_module(
                 ud = dot2_f32_bf16(x_i32, u_i32, ud, serialize=serialize_dot2)
             sidx = fx.Int32(row_blk * scale_cols_g + k_base // scale_bk)
             xsidx = fx.Int32(token_b * scale_cols_x + k_base // scale_bxk)
-            gs_i = buffer_ops.buffer_load(wgs_rsrc, sidx, vec_width=1, dtype=T.f32())
-            us_i = buffer_ops.buffer_load(wus_rsrc, sidx, vec_width=1, dtype=T.f32())
-            xs_i = buffer_ops.buffer_load(xs_rsrc, xsidx, vec_width=1, dtype=T.f32())
+            gs_i = _f32_load(wgs_t, sidx)
+            us_i = _f32_load(wus_t, sidx)
+            xs_i = _f32_load(xs_t, xsidx)
             gate_acc_l = gate_acc_l + fx.Float32(gd) * (
                 fx.Float32(gs_i) * fx.Float32(xs_i)
             )
@@ -928,7 +931,7 @@ def build_down_reduce_fp8_module(
 
         inter_rsrc = _ptr_rsrc(inter_ptr)
         wd_rsrc = _ptr_rsrc(wd_ptr)
-        wds_rsrc = _ptr_rsrc(wds_ptr)
+        wds_t = _f32_view(wds_ptr)
         rid_rsrc = _ptr_rsrc(rid_ptr)
         rwt_rsrc = _ptr_rsrc(rwt_ptr)
 
@@ -986,14 +989,12 @@ def build_down_reduce_fp8_module(
                             pairs_i, dot2_acc=dot2_acc, serialize=serialize_dot2
                         )
                         sidx = fx.Int32(w_row[h] // scale_bn * scale_cols_d + col_blk)
-                        ds_i = buffer_ops.buffer_load(
-                            wds_rsrc, sidx, vec_width=1, dtype=T.f32()
-                        )
+                        ds_i = _f32_load(wds_t, sidx)
                         acc[h] = acc[h] + fx.Float32(dot_i) * (
                             fx.Float32(rw) * fx.Float32(ds_i)
                         )
             else:
-                ds = _fp8_down_row_scales(wds_rsrc, w_row, kh_per_warp, per_token_scale)
+                ds = _fp8_down_row_scales(wds_t, w_row, kh_per_warp, per_token_scale)
 
                 # G7 ILP: collect every (iter, pair) per output h, then drain each
                 # through `dot2_acc` accumulators across the whole K-range (the scale
