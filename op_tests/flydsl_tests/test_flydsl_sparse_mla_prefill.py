@@ -177,3 +177,31 @@ def test_flydsl_sparse_mla_prefill_pads_narrow_head_counts(heads: int):
     full = flydsl_sparse_mla_prefill(q_nope, q_rope, kv, indices, _SOFTMAX_SCALE)
     torch.cuda.synchronize()
     assert torch.equal(narrow, full[:, :heads])
+
+
+@pytest.mark.parametrize("bad_row", (4096, 1 << 20, 1 << 28, -5))
+def test_flydsl_sparse_mla_prefill_masks_out_of_range_rows(bad_row: int):
+    """An index past the KV pool must be masked, not dereferenced.
+
+    `kv` reaches the kernel as a buffer view whose `num_records` is the
+    descriptor maximum rather than the tensor's length, so the hardware bound
+    does not catch a row past the end -- before this was masked, every value
+    below faulted the queue outright.
+    """
+    _require_gfx950_flydsl()
+    from aiter.ops.flydsl import flydsl_sparse_mla_prefill
+
+    q_nope, q_rope, kv, indices = _make_case(4, num_pages=4096)
+    masked = indices.clone()
+    masked[:, :64] = bad_row
+    actual = flydsl_sparse_mla_prefill(q_nope, q_rope, kv, masked, _SOFTMAX_SCALE)
+    torch.cuda.synchronize()
+    assert torch.isfinite(actual.float()).all()
+
+    # A negative sentinel already had to be dropped, so an out-of-range row
+    # must land on exactly the same output as one spelled -1.
+    sentinel = indices.clone()
+    sentinel[:, :64] = -1
+    expected = flydsl_sparse_mla_prefill(q_nope, q_rope, kv, sentinel, _SOFTMAX_SCALE)
+    torch.cuda.synchronize()
+    assert torch.equal(actual, expected)
