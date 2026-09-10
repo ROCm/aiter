@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 
-import functools
 from dataclasses import dataclass
 from typing import Any
 
@@ -10,6 +9,8 @@ import flydsl.expr as fx
 import torch
 from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.runtime.device import get_rocm_arch
+
+from aiter.utility.graph_buffers import per_stream_buffers_shared_by_graphs
 
 from .common import run_cached
 from .gemm_a16w16_gfx950_utils import (
@@ -1380,8 +1381,8 @@ def assert_no_k_tail(k: int, kwargs: dict):
         )
 
 
-@functools.lru_cache(maxsize=128)
-def get_split_k_buffers(stream, device):
+@per_stream_buffers_shared_by_graphs
+def get_split_k_buffers(device):
     semaphore = torch.zeros(
         (SPLIT_K_SEMAPHORE_MAX_LEN,), dtype=torch.int32, device=device
     )
@@ -1531,7 +1532,7 @@ def gemm_a16w16(
 
     param = make_gemm_a16w16_param_and_validate(m, n, k, kwargs)
     assert param is not None, "unsupported gemm_a16w16_gfx950 shape/config"
-    semaphore, signal = get_split_k_buffers(stream, device)
+    semaphore, signal = get_split_k_buffers(device)
     a_arg = _dynamic_tensor_arg(a, 0 if a_is_transposed else 1)
     b_arg = _dynamic_tensor_arg(b, 0 if b_is_transposed else 1)
     out_arg = _dynamic_tensor_arg(out, 1)

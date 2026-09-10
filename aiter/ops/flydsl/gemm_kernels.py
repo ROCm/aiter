@@ -14,6 +14,7 @@ from torch import Tensor
 
 from aiter import logger
 from aiter.jit.utils.chip_info import get_gfx
+from aiter.utility.graph_buffers import per_stream_buffers_shared_by_graphs
 
 from .kernels.gemm_a16w16_gfx950 import (
     SPLIT_K_SEMAPHORE_MAX_LEN,
@@ -210,11 +211,8 @@ PRESHUFFLE_SPLIT_K_WORKSPACE_ELEMS = (
 )
 
 
-@functools.lru_cache(maxsize=128)
-def _get_preshuffle_split_buffers(
-    device: torch.device,
-    stream: torch.cuda.Stream,
-) -> tuple[Tensor, Tensor]:
+@per_stream_buffers_shared_by_graphs
+def _get_preshuffle_split_buffers(device: torch.device) -> tuple[Tensor, Tensor]:
     # Safe to reuse: launches on a stream are ordered and the reduction hands
     # the semaphore back zeroed.
     workspace = torch.empty(
@@ -332,9 +330,7 @@ def flydsl_preshuffle_gemm_a8(
     dummy_bias = torch.empty(0, dtype=Out.dtype, device=Out.device)
     if split_k > 1:
         _check_preshuffle_split_capacity(m, n, tile_m, tile_n, split_k)
-        workspace, semaphore = _get_preshuffle_split_buffers(
-            Out.device, torch.cuda.current_stream(device=Out.device)
-        )
+        workspace, semaphore = _get_preshuffle_split_buffers(Out.device)
     else:
         workspace = out_contig
         # dtype is part of the executable's cache signature, so this must match

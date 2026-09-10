@@ -1,12 +1,11 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-import functools
-
 import torch
 from torch import Tensor
 
 from ..jit.core import compile_ops
+from ..utility.graph_buffers import per_stream_buffers_shared_by_graphs
 
 
 @compile_ops(
@@ -33,29 +32,15 @@ _SEMA_SHAPE = (16, 64)
 ASM_SPLITK_MAX_GRID = _SEMA_SHAPE[0] * _SEMA_SHAPE[1]
 
 
-@functools.lru_cache(maxsize=64)
-def _get_semaphore_workspace_keyed(device: torch.device, stream_id: int) -> Tensor:
-    return torch.zeros(_SEMA_SHAPE, dtype=torch.uint32, device=device)
-
-
+@per_stream_buffers_shared_by_graphs
 def get_semaphore_workspace(device: torch.device) -> Tensor:
-    """Return a per-(device, stream) zero-initialized semaphore workspace.
+    """Return a zero-initialized semaphore workspace for SplitK a16w16 ASM.
 
-    SplitK a16w16 ASM kernels use an atomic-counter protocol where the last
-    workgroup performs the reduction phase. Concurrent launches on different
-    streams must not share the same atomic counter, or the counts get mixed
-    and the reduction phase never fires (deadlock).
-
-    Reuse across launches on the same stream relies on the kernel resetting
-    the counter to zero after the reduction completes; do not call this from
-    callers that violate that invariant.
-
-    Workspace size is small (~4 KB) and stream count per process is typically
-    < 8, so the LRU cap of 64 leaves plenty of headroom before any in-flight
-    workspace risks being evicted.
+    The kernels use an atomic-counter protocol where the last workgroup runs
+    the reduction phase and resets the counter to zero, so a cached workspace
+    can be reused; do not call from paths that violate that invariant.
     """
-    stream = torch.cuda.current_stream(device)
-    return _get_semaphore_workspace_keyed(device, stream.cuda_stream)
+    return torch.zeros(_SEMA_SHAPE, dtype=torch.uint32, device=device)
 
 
 def gemm_a16w16_asm(
