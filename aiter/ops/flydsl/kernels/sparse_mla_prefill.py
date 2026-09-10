@@ -15,7 +15,6 @@ from flydsl.expr import math as fly_math
 from flydsl.expr.typing import T
 from flydsl.expr.typing import Vector as Vec
 
-from aiter.jit.utils.chip_info import get_gfx
 from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled
 
 # Hardware and instruction shape. The QK atom is 16x16x128 and the PV atom
@@ -759,15 +758,19 @@ def flydsl_sparse_mla_prefill(
     out: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Run sparse MLA for Q ``[T,16,512+64]`` and 2048 indices per token."""
-    if get_gfx() != "gfx950":
-        raise RuntimeError(
-            f"flydsl_sparse_mla_prefill requires gfx950, got {get_gfx()}"
-        )
-    # device below is taken FROM q_nope, so the per-tensor device checks only
+    # `device` below is taken FROM q_nope, so the per-tensor device checks only
     # prove the inputs agree with each other -- an all-CPU call would pass them
     # and fail much later inside torch.cuda.device(). Anchor on q_nope here.
     if not isinstance(q_nope, torch.Tensor) or not q_nope.is_cuda:
         raise ValueError("q_nope must be a CUDA tensor")
+    # Gate on the device this call actually runs on, the way the decode entry
+    # does. `get_gfx()` answers from GPU_ARCHS when it is set, and a multi-arch
+    # build ("gfx942;gfx950") makes it report the last entry whatever the part
+    # is -- chip_info says as much, and points runtime dispatch elsewhere.
+    props = torch.cuda.get_device_properties(q_nope.device)
+    arch = str(getattr(props, "gcnArchName", "")).split(":")[0]
+    if arch != "gfx950":
+        raise RuntimeError(f"flydsl_sparse_mla_prefill requires gfx950, got {arch}")
     if q_nope.ndim != 3:
         raise ValueError(f"q_nope must be rank 3, got rank {q_nope.ndim}")
     # The MFMA tile is 16 rows wide, so the kernel always runs 16 head
