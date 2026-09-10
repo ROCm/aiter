@@ -10,26 +10,34 @@ import flydsl.expr as fx
 from flydsl.expr import math as fly_math
 from flydsl.expr.typing import T
 
-H = 16
+# Hardware and instruction shape. Both MFMA atoms below are 16x16x*, and the
+# lane map ties one head to one MFMA row, so the kernel always runs 16 head
+# slots -- `H` is that tile width, not the model's head count. A model with
+# fewer heads is read in place through the `q_heads` argument.
+WAVE_SIZE = 64
+MFMA_M = 16
+MFMA_N = 16
+H = MFMA_M
+PARTIAL_WAVES = 4
+PARTIAL_THREADS = WAVE_SIZE * PARTIAL_WAVES
+# Each wave owns one 16-key QK tile, so a block covers `PARTIAL_WAVES` of them.
+BLOCK_I = PARTIAL_WAVES * MFMA_N
+
+# Model shape (GLM-5.2 absorbed MLA).
 DV = 512
 DT = 64
 DIM = DV + DT
-BLOCK_I = 64
 FP8_MAX = 448.0
-PARTIAL_THREADS = 256
-PARTIAL_WAVES = 4
-PITCH = DV + 16
-WAVE_SIZE = 64
-# Both MFMA atoms below are 16x16x*, so one tile covers 16 heads and 16 Dv
-# columns. The lane map, the LDS pitches and the unroll counts all follow from
-# that; assert rather than let a changed constant silently mis-address.
-MFMA_N = 16
+
+# Derived layout. `LDS_BANK_PAD` keeps the transposed V reads off a single
+# bank; it is a byte pad, unrelated to the MFMA tile that happens to match it.
+LDS_BANK_PAD = 16
+PITCH = DV + LDS_BANK_PAD
 LANE_GROUPS = WAVE_SIZE // H
 DV_CHUNKS = DV // 128
 DV_TILES_PER_WAVE = (DV // MFMA_N) // PARTIAL_WAVES
 Q_LANE_BYTES = DIM // LANE_GROUPS
-assert H == MFMA_N, "the lane map ties one head to one MFMA row"
-assert PARTIAL_THREADS == WAVE_SIZE * PARTIAL_WAVES
+assert WAVE_SIZE % H == 0, "the lane map splits a wave into whole head groups"
 assert DV % (MFMA_N * PARTIAL_WAVES) == 0 and DV % 128 == 0
 assert DIM % LANE_GROUPS == 0 and DT == DIM - DV
 
