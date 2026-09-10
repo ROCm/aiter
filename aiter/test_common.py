@@ -219,7 +219,9 @@ def perftest(
                 fn_name = getattr(func, "__name__", "kernel")
                 skipped = {
                     name.strip()
-                    for name in os.environ.get("AITER_SMI_SKIP_FUNCTIONS", "").split(",")
+                    for name in os.environ.get("AITER_SMI_SKIP_FUNCTIONS", "").split(
+                        ","
+                    )
                     if name.strip()
                 }
                 if fn_name in skipped:

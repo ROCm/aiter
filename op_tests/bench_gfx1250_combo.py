@@ -261,7 +261,7 @@ import tempfile
 import time
 import warnings
 
-from smi_monitor import GpuMonitor, SMI_RESULT_PREFIX
+from smi_monitor import SMI_RESULT_PREFIX, GpuMonitor
 
 warnings.filterwarnings("ignore")
 
@@ -345,6 +345,8 @@ def _without_smi(env):
         if key.startswith("AITER_SMI_"):
             clean.pop(key)
     return clean
+
+
 # a16w16 N shapes at K=7168: attention/router projections, then lm_head twice
 # (129280 is the DeepSeek vocab, 32320 is that sharded over TP4).
 _A16W16_NS = (64, 384, 1024, 2048, 32320, 129280)
@@ -470,9 +472,7 @@ _SCORE_QK_KV_LENGTHS = (
 # Two things remain outside coverage, both worth remembering: decode-side M
 # below 256, and the 11 tuned rows that are the only shapes dispatching to
 # gluon. This is a way around the UT bug, not a fix for it.
-_A8W8_BLOCKSCALE_TOKENS = _tokens(
-    (256, 512, 1024, 2048, 4096, 8192, 16384, 65536)
-)
+_A8W8_BLOCKSCALE_TOKENS = _tokens((256, 512, 1024, 2048, 4096, 8192, 16384, 65536))
 # Decode carries one token per sequence, so this axis is the batch, not a token
 # count; past 1024 it stops being a shape the model runs, hence its own default
 # rather than _TOKENS. AITER_BENCH_TOKENS overrides it like everywhere else.
@@ -498,9 +498,7 @@ _MLA_PREFILL_TOKENS = _tokens((1024, 2048, 4096, 8192, 16384))
 # and asks for 7.5 GB. That is a per_rank_vmm the UT never passes, not something
 # MORI_SHMEM_HEAP_SIZE reaches. Keep the tier in the sweep so the limitation is
 # visible in the structured failure output rather than silently unmeasured.
-_MEGA_MOE_TOKENS = _tokens(
-    (1, 16, 32, 64, 128, 256, 512, 1024, 2048, 16384, 65536)
-)
+_MEGA_MOE_TOKENS = _tokens((1, 16, 32, 64, 128, 256, 512, 1024, 2048, 16384, 65536))
 # What dispatch puts on the wire; combine is always bf16, so anything but bf16
 # is an asymmetric pair. fp4 is the wire DSv4 actually serves on -- the receiver
 # hands the payload straight to the expert GEMM as its A operand, and that GEMM
@@ -850,7 +848,7 @@ def _keep_going(label):
         # not inherit them.
         try:
             torch.cuda.empty_cache()
-        except Exception:  # noqa: BLE001 - cleanup must not mask the failure
+        except Exception:  # noqa: BLE001, S110 - cleanup must not mask the failure
             pass
 
 
@@ -877,8 +875,19 @@ def _pin_arch(env):
     return env
 
 
-def _run_child(name, cmd, cwd, env=None, extract=None, timeout=None, tail=30,
-               kernels=True, smi=True, outer_smi=False, structured=False):
+def _run_child(
+    name,
+    cmd,
+    cwd,
+    env=None,
+    extract=None,
+    timeout=None,
+    tail=30,
+    kernels=True,
+    smi=True,
+    outer_smi=False,
+    structured=False,
+):
     """Run a child UT with its output captured and surface only its results.
 
     Child UTs print their own progress, aiter INFO lines and (with FlyDSL) a
@@ -909,16 +918,27 @@ def _run_child(name, cmd, cwd, env=None, extract=None, timeout=None, tail=30,
         monitor_start = time.perf_counter()
     try:
         proc = subprocess.run(
-            cmd, cwd=cwd, env=env, text=True, timeout=timeout,
-            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            cmd,
+            cwd=cwd,
+            env=env,
+            check=False,
+            text=True,
+            timeout=timeout,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
         )
     except subprocess.TimeoutExpired as exc:
         captured = exc.output or ""
         if structured:
-            _print_table(name, [{
-                "err_msg": f"timed out after {timeout}s",
-                "output_tail": "\n".join(captured.splitlines()[-tail:]),
-            }])
+            _print_table(
+                name,
+                [
+                    {
+                        "err_msg": f"timed out after {timeout}s",
+                        "output_tail": "\n".join(captured.splitlines()[-tail:]),
+                    }
+                ],
+            )
             _note_failure(name, f"timed out after {timeout}s")
             return
         print(f"\n===== {name} =====", flush=True)
@@ -945,9 +965,7 @@ def _run_child(name, cmd, cwd, env=None, extract=None, timeout=None, tail=30,
                 ),
                 "metrics": monitor.summary(),
             }
-            _collect_smi_rows(
-                [SMI_RESULT_PREFIX + json.dumps(record, sort_keys=True)]
-            )
+            _collect_smi_rows([SMI_RESULT_PREFIX + json.dumps(record, sort_keys=True)])
     lines = proc.stdout.splitlines()
     _collect_smi_rows(lines)
     # `results` decides whether the op reported anything; the kernel digest is
@@ -965,11 +983,16 @@ def _run_child(name, cmd, cwd, env=None, extract=None, timeout=None, tail=30,
                 if proc.returncode != 0
                 else "no JSON result tables recognised"
             )
-            _print_table(name, [{
-                "exit_code": proc.returncode,
-                "err_msg": reason,
-                "output_tail": "\n".join(lines[-tail:]),
-            }])
+            _print_table(
+                name,
+                [
+                    {
+                        "exit_code": proc.returncode,
+                        "err_msg": reason,
+                        "output_tail": "\n".join(lines[-tail:]),
+                    }
+                ],
+            )
         if proc.returncode != 0:
             _note_failure(name, f"child exited {proc.returncode}")
         elif not results:
@@ -1220,17 +1243,23 @@ def run_a16w16(args):
     _unused_scale_init(args, "a16w16")
     data_inits = args.data_init or ["norm"]
     generators = {dist: make_generator(args.seed) for dist in data_inits}
-    for data_init, M, n in itertools.product(
-        data_inits, _A16W16_MS, _A16W16_NS
-    ):
+    for data_init, M, n in itertools.product(data_inits, _A16W16_MS, _A16W16_NS):
         # N=32320/129280 is lm_head (the DeepSeek vocab, whole and TP4-sharded).
         # See _A16W16_WIDE_N: this is the one shape rule left here, and it is
         # about what DSv4 runs, not about what the kernel can do.
         if n > _A16W16_WIDE_N and M > _A16W16_WIDE_N_MAX_M:
-            rows.append({"data_init": data_init, "seed": args.seed,
-                         "batch": batch, "M": M, "N": n, "K": K,
-                         "err_msg": f"skipped: N>{_A16W16_WIDE_N} is lm_head, "
-                                    f"capped at M<={_A16W16_WIDE_N_MAX_M}"})
+            rows.append(
+                {
+                    "data_init": data_init,
+                    "seed": args.seed,
+                    "batch": batch,
+                    "M": M,
+                    "N": n,
+                    "K": K,
+                    "err_msg": f"skipped: N>{_A16W16_WIDE_N} is lm_head, "
+                    f"capped at M<={_A16W16_WIDE_N_MAX_M}",
+                }
+            )
             continue
         # Exercise the same backend selected by the global tuned CSV rather than
         # forcing every shape through the Opus-only regression helper.
@@ -1249,9 +1278,7 @@ def run_a16w16(args):
                 dtype=torch.bfloat16,
                 device="cuda",
             )
-            ref = torch.einsum("bmk,nk->bmn", A.float(), B.float()).to(
-                torch.bfloat16
-            )
+            ref = torch.einsum("bmk,nk->bmn", A.float(), B.float()).to(torch.bfloat16)
             with _smi_case(
                 f"a16w16/batch={batch}/M={M}/N={n}/K={K}/"
                 f"data={data_init}/seed={args.seed}"
@@ -1274,21 +1301,36 @@ def run_a16w16(args):
                     atol=0.5,
                 )
         except Exception as exc:  # noqa: BLE001 - one shape must not end the sweep
-            rows.append({"data_init": data_init, "seed": args.seed,
-                         "batch": batch, "M": M, "N": n, "K": K,
-                         "err_msg": f"{type(exc).__name__}: {exc}"})
+            rows.append(
+                {
+                    "data_init": data_init,
+                    "seed": args.seed,
+                    "batch": batch,
+                    "M": M,
+                    "N": n,
+                    "K": K,
+                    "err_msg": f"{type(exc).__name__}: {exc}",
+                }
+            )
             continue
         captured = box[0].splitlines()
-        row = {"data_init": data_init, "seed": args.seed,
-               "batch": batch, "M": M, "N": n, "K": K,
-               "us": float(us),
-               "TFLOPS": 2.0 * batch * M * n * K / float(us) / 1e6,
-               "err": err}
+        row = {
+            "data_init": data_init,
+            "seed": args.seed,
+            "batch": batch,
+            "M": M,
+            "N": n,
+            "K": K,
+            "us": float(us),
+            "TFLOPS": 2.0 * batch * M * n * K / float(us) / 1e6,
+            "err": err,
+        }
         # float(): checkAllclose returns a bare 0 for a clean compare but a
         # numpy/torch scalar for a mismatch, and only one of those formats.
         if err is not None and float(err) > _A16W16_MAX_ERR:
-            row["err_msg"] = (f"WRONG RESULT: err={float(err):g} "
-                              f"> {_A16W16_MAX_ERR:g}")
+            row["err_msg"] = (
+                f"WRONG RESULT: err={float(err):g} " f"> {_A16W16_MAX_ERR:g}"
+            )
             _note_failure(f"a16w16 M={M} N={n} K={K}", row["err_msg"])
         # Which kernel served this shape: the selected backend alone does not
         # identify the concrete kernel that reached the GPU.
@@ -1297,8 +1339,18 @@ def run_a16w16(args):
     _print_table(
         "gemm_a16w16_tuned (DSv4)",
         rows,
-        keep=["data_init", "seed", "batch", "M", "N", "K", "us", "TFLOPS",
-              "kernel", "err"],
+        keep=[
+            "data_init",
+            "seed",
+            "batch",
+            "M",
+            "N",
+            "K",
+            "us",
+            "TFLOPS",
+            "kernel",
+            "err",
+        ],
     )
 
 
@@ -1383,6 +1435,7 @@ def run_mega_moe(args):
 def run_mhc(args):
     """Run the DSv4 mHC fused-RMSNorm benchmark at M=512, N=7168."""
     _unused_scale_init(args, "mhc")
+
     def run_case(tokens, data_inits, label):
         _run_child(
             label,
@@ -1511,9 +1564,7 @@ def run_mori_ep(args):
             "HIDDEN": env.get("HIDDEN", "7168"),
             "TOPK": env.get("TOPK", "6"),
             "EPR": env.get("EPR", "96"),
-            "SWEEP": env.get(
-                "TOKENS", "64,128,256,512,1024,2048,4096,8192,16384"
-            ),
+            "SWEEP": env.get("TOKENS", "64,128,256,512,1024,2048,4096,8192,16384"),
             "ITERS": env.get("ITERS", "200"),
             "WARMUP": "10",
             "MODES": env.get("MODES", "eager,graph"),
@@ -1672,9 +1723,7 @@ def run_mla_v4_decode(args):
     mla_v4_triton_mod._PERF["num_iters"] = iters
     mla_v4_triton_mod._PERF["num_warmup"] = warmup
     default_shapes = (
-        _MLA_V4_DSV4_SHAPES
-        if args.suite == "dsv4"
-        else _MLA_V4_KARGPRELD_SHAPES
+        _MLA_V4_DSV4_SHAPES if args.suite == "dsv4" else _MLA_V4_KARGPRELD_SHAPES
     )
     shapes = args.mla_v4_kargpreld_shapes or default_shapes
     data_inits = args.data_init or ["norm"]
@@ -1738,6 +1787,7 @@ def run_mla_v4_decode(args):
 def run_inverse_rope(args):
     """Run DSv4 inverse RoPE + group quant at TP1/TP4 attention shapes."""
     _unused_scale_init(args, "inverse_rope")
+
     # -b is (n_local_heads, n_local_groups); 128,16 and 32,4 are V4-Pro at TP1
     # and TP4. The UT defaults to the two smallest configs instead, which never
     # reach these model shapes, so name them explicitly.
@@ -2051,24 +2101,24 @@ def main():
         p.error("--smi-duration must be positive")
 
     if args.smi_monitor:
-        smi_output = tempfile.NamedTemporaryFile(
+        with tempfile.NamedTemporaryFile(
             prefix="aiter_smi_", suffix=".jsonl", delete=False
-        )
-        smi_output.close()
+        ) as smi_output:
+            smi_output_path = smi_output.name
         os.environ.update(
             {
                 "AITER_SMI_MONITOR": "1",
                 "AITER_SMI_DEVICE": str(args.smi_device),
                 "AITER_SMI_INTERVAL": str(args.smi_interval),
                 "AITER_SMI_DURATION": str(args.smi_duration),
-                "AITER_SMI_OUTPUT_PATH": smi_output.name,
+                "AITER_SMI_OUTPUT_PATH": smi_output_path,
                 # Reference implementations timed by a few legacy UTs are not
                 # hardware candidates and must not produce telemetry rows.
                 "AITER_SMI_SKIP_FUNCTIONS": "run_torch,run_torch2",
             }
         )
     else:
-        smi_output = None
+        smi_output_path = None
         os.environ.pop("AITER_SMI_MONITOR", None)
 
     args.suite = "dsv4" if args.dsv4 else "perf"
@@ -2084,24 +2134,37 @@ def main():
 
     if args.smi_monitor:
         try:
-            with open(smi_output.name, encoding="utf-8") as output:
+            with open(smi_output_path, encoding="utf-8") as output:
                 _collect_smi_rows(output)
         finally:
-            os.unlink(smi_output.name)
+            os.unlink(smi_output_path)
         _print_table(
             f"amdsmi per benchmark case (device={args.smi_device}, "
             f"interval={args.smi_interval}s, min_duration={args.smi_duration}s)",
             _SMI_ROWS,
             keep=[
-                "case", "rank", "device", "duration_s", "launches", "samples",
+                "case",
+                "rank",
+                "device",
+                "duration_s",
+                "launches",
+                "samples",
                 "sample_status",
-                "metric", "min", "mean", "median", "max", "n",
+                "metric",
+                "min",
+                "mean",
+                "median",
+                "max",
+                "n",
             ],
         )
 
     if _FAILURES:
-        print(f"\n===== {len(_FAILURES)} failed, "
-              f"{len(selected_ops)} ops selected =====", flush=True)
+        print(
+            f"\n===== {len(_FAILURES)} failed, "
+            f"{len(selected_ops)} ops selected =====",
+            flush=True,
+        )
         for label, why in _FAILURES:
             print(f"  {label}: {why}", flush=True)
         sys.exit(1)

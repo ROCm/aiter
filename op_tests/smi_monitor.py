@@ -57,6 +57,7 @@ def _import_amdsmi():
         if added_path:
             sys.path.remove(_ROCM_AMDSMI_PATH)
 
+
 try:
     amdsmi = _import_amdsmi()
 
@@ -257,7 +258,9 @@ class GpuMonitor:
                 _ensure_amdsmi_initialized()
                 self._handle = self._device_index
         except BaseException as error:
-            raise RuntimeError(f"failed to initialize amdsmi monitor: {error}") from error
+            raise RuntimeError(
+                f"failed to initialize amdsmi monitor: {error}"
+            ) from error
         self._thread = threading.Thread(target=self._poll_loop, daemon=True)
         self._thread.start()
         if not self._ready_event.wait(timeout=10.0):
@@ -296,9 +299,7 @@ class GpuMonitor:
         result: dict = {}
         for key in sorted(keys):
             vals = sorted(
-                s[key]
-                for s in samples
-                if s.get(key) is not None and s[key] != "N/A"
+                s[key] for s in samples if s.get(key) is not None and s[key] != "N/A"
             )
             if not vals:
                 continue
@@ -437,7 +438,9 @@ def replay_with_smi(
     }
     expected_samples = max(1, int(duration_s / interval_s))
     result["sample_status"] = (
-        "ok" if len(monitor.samples) >= max(2, expected_samples // 2) else "insufficient"
+        "ok"
+        if len(monitor.samples) >= max(2, expected_samples // 2)
+        else "insufficient"
     )
     # A shared JSONL sink survives fd silencing and child processes. Standalone
     # UT runs without a sink still get a machine-readable stdout record.

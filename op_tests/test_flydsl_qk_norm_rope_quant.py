@@ -667,9 +667,9 @@ def test_flydsl_swa_write(
         int((swa_kv != sentinel).any(dim=1).sum()) == n_written
     ), f"{mode}: a skipped token still reached the pool"
     assert (pool[:G] == sentinel).all(), f"{mode}: scatter wrote BEFORE the pool"
-    assert (pool[G + num_rows :] == sentinel).all(), (
-        f"{mode}: scatter wrote PAST the pool"
-    )
+    assert (
+        pool[G + num_rows :] == sentinel
+    ).all(), f"{mode}: scatter wrote PAST the pool"
 
     # The scatter must not perturb the primary outputs.
     ref_q, ref_kv, _, _ = flydsl_qk_norm_rope_quant(

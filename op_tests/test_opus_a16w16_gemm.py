@@ -538,7 +538,9 @@ if __name__ == "__main__":
     gen = make_generator(args.seed)
     # add_data_init_args makes --data-init a list (nargs="*"); a16w16 sweeps a
     # single operand dist, so take the first entry.
-    data_init = args.data_init[0] if isinstance(args.data_init, list) else args.data_init
+    data_init = (
+        args.data_init[0] if isinstance(args.data_init, list) else args.data_init
+    )
     init_kwargs = {
         "dist": data_init,
         "gen": gen,

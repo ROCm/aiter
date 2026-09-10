@@ -942,12 +942,14 @@ def _aggregate_prof_table(prof, dist_ctx, per_layer_denom=1.0, row_limit=200):
         table_rows.append(row)
     return {
         "rows": table_rows,
-        "summary": [{
-            "world_size": world,
-            "profiled_kernels": len(rows),
-            "total_self_device_us": total_self,
-            "device_us_per_layer": dev_per_layer,
-        }],
+        "summary": [
+            {
+                "world_size": world,
+                "profiled_kernels": len(rows),
+                "total_self_device_us": total_self,
+                "device_us_per_layer": dev_per_layer,
+            }
+        ],
     }
 
 
@@ -979,6 +981,7 @@ def _stage2_overlap_rate(kernel_rows, idim):
     base, fused = kernel_rows.get("base"), kernel_rows.get("fused")
     if not base or not fused:
         return None
+
     def is_gemm2(name):
         return f"_K{idim}_" in name
 

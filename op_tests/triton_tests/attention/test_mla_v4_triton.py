@@ -121,9 +121,7 @@ def _make_inputs(
     unified_kv = (
         fill((total_pages, D), data_init, gen, dtype=dtype, device=device) * 0.5
     )
-    attn_sink = (
-        fill((H,), data_init, gen, dtype=torch.float32, device=device) * 0.1
-    )
+    attn_sink = fill((H,), data_init, gen, dtype=torch.float32, device=device) * 0.1
 
     # Per-token kv_len: fixed or random in [1, kv_len_per_token].
     if variable_len:

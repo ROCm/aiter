@@ -327,20 +327,13 @@ def _make_inputs(
         .mul_(0.5)
     ).to(dtype)
     unified_kv = (
-        fill(
-            (total_pages, d), data_init, gen, dtype=torch.float32, device=device
-        )
-        * 0.5
+        fill((total_pages, d), data_init, gen, dtype=torch.float32, device=device) * 0.5
     ).to(dtype)
     kv = (
-        fill(
-            (total_tokens, d), data_init, gen, dtype=torch.float32, device=device
-        )
+        fill((total_tokens, d), data_init, gen, dtype=torch.float32, device=device)
         * 0.5
     ).to(dtype)
-    attn_sink = (
-        fill((h,), data_init, gen, dtype=torch.float32, device=device) * 0.25
-    )
+    attn_sink = fill((h,), data_init, gen, dtype=torch.float32, device=device) * 0.25
 
     def _csr(total_rows: int, seed_offset: int):
         if mode == "sparse":
@@ -419,9 +412,7 @@ def _make_inputs_fp8(
     ukn, ukr, ukv_fp32 = _streams(total_pages)
     kn, kr, kv_fp32 = _streams(total_tokens)
 
-    attn_sink = (
-        fill((h,), data_init, gen, dtype=torch.float32, device=device) * 0.25
-    )
+    attn_sink = fill((h,), data_init, gen, dtype=torch.float32, device=device) * 0.25
 
     def _csr(total_rows: int, seed_offset: int):
         if mode == "sparse":
@@ -844,9 +835,7 @@ if __name__ == "__main__":
         if drop_cols:
             df = df.drop(columns=drop_cols)
         # Column order otherwise follows whichever row first ran a backend.
-        lead = [
-            c for c in ("prec", "mode", "data_init", "h", "n") if c in df.columns
-        ]
+        lead = [c for c in ("prec", "mode", "data_init", "h", "n") if c in df.columns]
         rest = [c for c in df.columns if c not in lead]
         metrics = [c for b in _BACKENDS for c in rest if c.startswith(f"{b} ")]
         df = df[lead + [c for c in rest if c not in metrics] + metrics]
