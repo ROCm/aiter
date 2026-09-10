@@ -26,28 +26,6 @@ def _flydsl_gdr_enabled() -> bool:
     return os.environ.get("AITER_GDR_FLYDSL", "") == "1"
 
 
-def _uniform_draft_window(cu_seqlens: torch.Tensor | None, total_tokens: int) -> int:
-    """Draft length if every sequence has the same one, else -1.
-
-    The FlyDSL kernel bakes the window into the kernel it builds, so it can only
-    take a packed batch that unflattens to ``[N, T, ...]``. A ragged batch is a
-    different kernel per row, so it stays on Triton.
-    """
-    if cu_seqlens is None:
-        return -1
-    # One device-to-host copy; the window has to be known on the host to pick
-    # the kernel, so the comparisons are done here rather than one .item() each.
-    lens = (cu_seqlens[1:] - cu_seqlens[:-1]).to("cpu")
-    if lens.numel() == 0:
-        return -1
-    first = int(lens[0])
-    if first <= 0 or int(lens.min()) != first or int(lens.max()) != first:
-        return -1
-    if first * lens.numel() != total_tokens:
-        return -1
-    return first
-
-
 def _try_flydsl_mtp(
     *,
     A_log,
@@ -70,6 +48,7 @@ def _try_flydsl_mtp(
     use_qk_l2norm_in_kernel,
     is_kda,
     core_attn_out,
+    draft_window,
 ):
     """Route a speculative-verify call to the FlyDSL chain kernel, or decline.
 
@@ -99,7 +78,9 @@ def _try_flydsl_mtp(
     # The launch writes `out` at the operands' dtype, while the Triton path
     # writes into whatever it is handed.
     if core_attn_out is not None and (
-        core_attn_out.dtype != qkv.dtype or core_attn_out.device != qkv.device
+        core_attn_out.dtype != qkv.dtype
+        or core_attn_out.device != qkv.device
+        or not core_attn_out.is_contiguous()
     ):
         return None
     # The gating constants are compiled into the kernel, so only the default
@@ -108,17 +89,30 @@ def _try_flydsl_mtp(
         return None
     if scale is not None and abs(float(scale) - head_k_dim**-0.5) > 1e-12:
         return None
-    if qkv.is_cuda and torch.cuda.is_current_stream_capturing():
-        return None
+    if qkv.is_cuda:
+        with torch.cuda.device(qkv.device):
+            if torch.cuda.is_current_stream_capturing():
+                return None
 
-    total_tokens = qkv.shape[0]
-    window = _uniform_draft_window(cu_seqlens, total_tokens)
-    if window <= 0:
+    if not isinstance(draft_window, int) or draft_window <= 0 or cu_seqlens is None:
         return None
-    n_seq = total_tokens // window
+    total_tokens = qkv.shape[0]
+    n_seq = ssm_state_indices.shape[0]
+    if (
+        ssm_state_indices.shape[1] != draft_window
+        or n_seq * draft_window != total_tokens
+        or cu_seqlens.numel() != n_seq + 1
+    ):
+        return None
+    window = draft_window
 
     H = key_dim // head_k_dim
     HV = value_dim // head_v_dim
+    if (
+        core_attn_out is not None
+        and core_attn_out.numel() < total_tokens * HV * head_v_dim
+    ):
+        return None
     stride_qkv_l = qkv.stride(0)
     base = qkv.storage_offset()
 
@@ -151,11 +145,11 @@ def _try_flydsl_mtp(
 
     from aiter.ops.flydsl.linear_attention_kernels import (
         _flydsl_gdr_mtp_supported,
-        flydsl_gdr_mtp,
+        _launch_flydsl_gdr_mtp,
     )
 
-    idx = ssm_state_indices.to(torch.int32)
-    nacc = num_accepted_tokens.to(torch.int32)
+    idx = ssm_state_indices
+    nacc = num_accepted_tokens
     if not _flydsl_gdr_mtp_supported(q, k, v, initial_state, idx, nacc):
         return None
     if a_view.dtype != qkv.dtype or b_view.dtype != qkv.dtype:
@@ -170,7 +164,7 @@ def _try_flydsl_mtp(
         if core_attn_out is not None
         else qkv.new_empty(n_seq, window, HV, head_v_dim)
     )
-    flydsl_gdr_mtp(
+    _launch_flydsl_gdr_mtp(
         query=q,
         key=k,
         value=v,
@@ -210,9 +204,12 @@ def fused_rearrange_sigmoid_gated_delta_rule(
     use_qk_l2norm_in_kernel: bool = False,
     is_kda: bool = False,
     core_attn_out: torch.Tensor | None = None,
+    draft_window: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """
-    Fused Triton sigmoid-gated delta rule over packed QKV (decode-oriented).
+    """Fused sigmoid-gated delta rule over packed QKV.
+
+    ``draft_window`` is host metadata required for FlyDSL dispatch. FlyDSL
+    falls back to Triton during CUDA Graph capture.
     """
     # Spelled as raised ``AssertionError``s rather than ``assert`` statements,
     # keeping the type a caller may already handle while ``python -O`` can no
@@ -258,6 +255,7 @@ def fused_rearrange_sigmoid_gated_delta_rule(
             use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
             is_kda=is_kda,
             core_attn_out=core_attn_out,
+            draft_window=draft_window,
         )
         if routed is not None:
             return routed

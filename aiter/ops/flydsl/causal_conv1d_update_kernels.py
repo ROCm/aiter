@@ -321,12 +321,30 @@ def _shapes_supported(
     return conv_state.size(2) >= state_len_eff and _is_supported_arch(x.device)
 
 
+def _index_supported(t, x, dims, *, contiguous=False):
+    return t is None or (
+        t.dtype == torch.int32
+        and t.device == x.device
+        and t.dim() in dims
+        and (not contiguous or t.is_contiguous())
+    )
+
+
+def _require_index(name, t, x, dims, *, contiguous=False):
+    if not _index_supported(t, x, dims, contiguous=contiguous):
+        layout = " contiguous" if contiguous else ""
+        raise ValueError(
+            f"`{name}` must be{layout} int32 on {x.device} with rank in {dims}."
+        )
+
+
 def _causal_conv1d_update_flydsl_supported(
     x: torch.Tensor,
     conv_state: torch.Tensor,
     weight: torch.Tensor,
     *,
     bias: torch.Tensor | None = None,
+    conv_state_indices: torch.Tensor | None = None,
     num_accepted_tokens: torch.Tensor | None = None,
     query_start_loc: torch.Tensor | None = None,
     max_query_len: int = -1,
@@ -338,7 +356,16 @@ def _causal_conv1d_update_flydsl_supported(
     Every mode of vLLM's Triton kernel is covered, so only shapes and dtypes are
     screened.
     """
-    del block_idx_last_scheduled_token, initial_state_idx  # supported
+    if not all(
+        (
+            _index_supported(conv_state_indices, x, (1, 2)),
+            _index_supported(num_accepted_tokens, x, (1,), contiguous=True),
+            _index_supported(query_start_loc, x, (1,), contiguous=True),
+            _index_supported(block_idx_last_scheduled_token, x, (1,), contiguous=True),
+            _index_supported(initial_state_idx, x, (1,), contiguous=True),
+        )
+    ):
+        return False
     return _shapes_supported(
         x,
         conv_state,
@@ -357,9 +384,14 @@ def _causal_conv1d_update_sglang_flydsl_supported(
     weight: torch.Tensor,
     *,
     bias: torch.Tensor | None = None,
+    conv_state_indices: torch.Tensor | None = None,
     num_accept_tokens: torch.Tensor | None = None,
     cache_seqlens: torch.Tensor | None = None,
     intermediate_conv_window: torch.Tensor | None = None,
+    intermediate_state_indices: torch.Tensor | None = None,
+    retrieve_next_token: torch.Tensor | None = None,
+    retrieve_next_sibling: torch.Tensor | None = None,
+    retrieve_parent_token: torch.Tensor | None = None,
 ) -> bool:
     """Whether ``causal_conv1d_update_sglang_flydsl`` can serve this problem.
 
@@ -371,6 +403,17 @@ def _causal_conv1d_update_sglang_flydsl_supported(
     if intermediate_conv_window is not None and (
         intermediate_conv_window.dtype != x.dtype
         or intermediate_conv_window.device != x.device
+    ):
+        return False
+    if not all(
+        (
+            _index_supported(conv_state_indices, x, (1,)),
+            _index_supported(num_accept_tokens, x, (1,), contiguous=True),
+            _index_supported(intermediate_state_indices, x, (1,)),
+            _index_supported(retrieve_next_token, x, (2,)),
+            _index_supported(retrieve_next_sibling, x, (2,)),
+            _index_supported(retrieve_parent_token, x, (2,)),
+        )
     ):
         return False
     return _shapes_supported(
@@ -477,6 +520,17 @@ def causal_conv1d_update_flydsl(
     silu = _resolve_activation(activation)
 
     _require_in_scope(x, conv_state, weight, bias, "causal_conv1d_update_flydsl")
+    _require_index("conv_state_indices", conv_state_indices, x, (1, 2))
+    _require_index("num_accepted_tokens", num_accepted_tokens, x, (1,), contiguous=True)
+    _require_index("query_start_loc", query_start_loc, x, (1,), contiguous=True)
+    _require_index(
+        "block_idx_last_scheduled_token",
+        block_idx_last_scheduled_token,
+        x,
+        (1,),
+        contiguous=True,
+    )
+    _require_index("initial_state_idx", initial_state_idx, x, (1,), contiguous=True)
 
     if out is None:
         out = x  # upstream overwrites the input rather than allocating
@@ -682,6 +736,12 @@ def causal_conv1d_update_sglang_flydsl(
     silu = _resolve_activation(activation)
 
     _require_in_scope(x, conv_state, weight, bias, "causal_conv1d_update_sglang_flydsl")
+    _require_index("conv_state_indices", conv_state_indices, x, (1,))
+    _require_index("num_accept_tokens", num_accept_tokens, x, (1,), contiguous=True)
+    _require_index("intermediate_state_indices", intermediate_state_indices, x, (1,))
+    _require_index("retrieve_next_token", retrieve_next_token, x, (2,))
+    _require_index("retrieve_next_sibling", retrieve_next_sibling, x, (2,))
+    _require_index("retrieve_parent_token", retrieve_parent_token, x, (2,))
     if intermediate_conv_window is not None:
         if intermediate_conv_window.device != x.device:
             raise ValueError(

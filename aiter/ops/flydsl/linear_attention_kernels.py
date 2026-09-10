@@ -451,12 +451,20 @@ _SUPPORTED_STATE_DTYPES = (torch.float32, torch.bfloat16)
 _SUPPORTED_ARCHS = ("gfx942", "gfx950")
 
 
-def _is_supported_arch(device: torch.device) -> bool:
+@functools.cache
+def _is_supported_arch_index(index: int) -> bool:
     try:
-        arch = str(torch.cuda.get_device_properties(device).gcnArchName)
+        arch = str(torch.cuda.get_device_properties(index).gcnArchName)
     except Exception:  # noqa: BLE001 - no live device, meta/CPU tensor
         return False
     return arch.split(":")[0] in _SUPPORTED_ARCHS
+
+
+def _is_supported_arch(device: torch.device) -> bool:
+    if device.type != "cuda":
+        return False
+    index = device.index if device.index is not None else torch.cuda.current_device()
+    return _is_supported_arch_index(index)
 
 
 def _unit_strided(t: torch.Tensor) -> bool:
@@ -714,6 +722,16 @@ def _mtp_common_checks(query, key, value, a, b, dt_bias, A_log, state, out):
             f"{state.stride()}. Shuffling it here would copy the whole pool, "
             "which costs more than the kernel it feeds."
         )
+    expected = (*query.shape[:2], value.shape[-2], value.shape[-1])
+    if out.shape != expected or not out.is_contiguous():
+        raise ValueError(f"`out` must be contiguous with shape {expected}.")
+
+
+def _mtp_stream(query, stream):
+    stream = torch.cuda.current_stream(query.device) if stream is None else stream
+    if stream.device != query.device:
+        raise ValueError(f"`stream` must be on {query.device}; got {stream.device}.")
+    return stream
 
 
 def _mtp_launch(
@@ -829,6 +847,47 @@ def _mtp_launch(
             )
 
 
+def _launch_flydsl_gdr_mtp(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    a: torch.Tensor,
+    b: torch.Tensor,
+    dt_bias: torch.Tensor,
+    A_log: torch.Tensor,
+    state: torch.Tensor,
+    out: torch.Tensor,
+    ssm_state_indices: torch.Tensor,
+    num_accepted_tokens: torch.Tensor,
+    use_qk_l2norm: bool = False,
+    stream: torch.cuda.Stream = None,
+    min_live_slot: int = 1,
+):
+    stream = _mtp_stream(query, stream)
+    _mtp_launch(
+        mode=MTP_MODE_CHAIN,
+        query=query,
+        key=key,
+        value=value,
+        a=a,
+        b=b,
+        dt_bias=dt_bias,
+        A_log=A_log,
+        state=state,
+        out=out,
+        state_indices=ssm_state_indices.contiguous(),
+        num_accepted=num_accepted_tokens.contiguous(),
+        inter_indices=None,
+        parent_tokens=None,
+        inter_buffer=None,
+        use_qk_l2norm=use_qk_l2norm,
+        min_live_slot=min_live_slot,
+        has_tree=False,
+        disable_state_update=False,
+        stream=stream,
+    )
+
+
 def flydsl_gdr_mtp(
     query: torch.Tensor,
     key: torch.Tensor,
@@ -857,8 +916,6 @@ def flydsl_gdr_mtp(
     either is skipped entirely, so slot 0 must not be handed out as a live
     slot.
     """
-    if stream is None:
-        stream = torch.cuda.current_stream()
     _mtp_common_checks(query, key, value, a, b, dt_bias, A_log, state, out)
     _require_index(
         "ssm_state_indices",
@@ -871,28 +928,21 @@ def flydsl_gdr_mtp(
     _require_index("num_accepted_tokens", num_accepted_tokens, query)
     if min_live_slot not in (0, 1):
         raise ValueError(f"`min_live_slot` must be 0 or 1; got {min_live_slot}.")
-
-    _mtp_launch(
-        mode=MTP_MODE_CHAIN,
-        query=query,
-        key=key,
-        value=value,
-        a=a,
-        b=b,
-        dt_bias=dt_bias,
-        A_log=A_log,
-        state=state,
-        out=out,
-        state_indices=ssm_state_indices.contiguous(),
-        num_accepted=num_accepted_tokens.contiguous(),
-        inter_indices=None,
-        parent_tokens=None,
-        inter_buffer=None,
-        use_qk_l2norm=use_qk_l2norm,
-        min_live_slot=min_live_slot,
-        has_tree=False,
-        disable_state_update=False,
-        stream=stream,
+    _launch_flydsl_gdr_mtp(
+        query,
+        key,
+        value,
+        a,
+        b,
+        dt_bias,
+        A_log,
+        state,
+        out,
+        ssm_state_indices,
+        num_accepted_tokens,
+        use_qk_l2norm,
+        stream,
+        min_live_slot,
     )
 
 
@@ -923,9 +973,8 @@ def flydsl_gdr_mtp_sglang(
     the same computation as a parent map of ``t - 1``. ``disable_state_update``
     leaves the pool untouched, which is what a verify pass wants.
     """
-    if stream is None:
-        stream = torch.cuda.current_stream()
     _mtp_common_checks(query, key, value, a, b, dt_bias, A_log, state, out)
+    stream = _mtp_stream(query, stream)
     seqlen = query.shape[1]
     _require_index("initial_state_indices", initial_state_indices, query, dims=1)
     if (intermediate_states_buffer is None) != (intermediate_state_indices is None):

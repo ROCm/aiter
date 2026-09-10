@@ -625,6 +625,51 @@ def test_dispatch_seam_falls_through_when_out_of_scope():
     _assert_bit_exact("seam fp32", "output (fell through)", out_on, out_off)
     _assert_bit_exact("seam fp32", "conv_state (fell through)", state_on, state_off)
 
+    t = _sglang_problem(2, 64, 4, 1, spec=False, save_inter=False, tree=False)
+    t["indices"] = torch.tensor([1, 2], dtype=torch.int64, device=DEVICE)
+    assert not _causal_conv1d_update_sglang_flydsl_supported(
+        t["x"], t["conv_state"], t["weight"], conv_state_indices=t["indices"]
+    )
+    out_off, state_off, _, _ = _call_triton_entry(t, 2, 1, False, flydsl=False)
+    out_on, state_on, _, _ = _call_triton_entry(t, 2, 1, False, flydsl=True)
+    _assert_bit_exact("seam int64 index", "output", out_on, out_off)
+    _assert_bit_exact("seam int64 index", "conv_state", state_on, state_off)
+
+
+@pytest.mark.parametrize(
+    "interface,name,dims",
+    [
+        ("sglang", "conv_state_indices", 1),
+        ("sglang", "num_accept_tokens", 1),
+        ("sglang", "intermediate_state_indices", 1),
+        ("sglang", "retrieve_next_token", 2),
+        ("sglang", "retrieve_next_sibling", 2),
+        ("sglang", "retrieve_parent_token", 2),
+        ("vllm", "conv_state_indices", 1),
+        ("vllm", "num_accepted_tokens", 1),
+        ("vllm", "query_start_loc", 1),
+        ("vllm", "block_idx_last_scheduled_token", 1),
+        ("vllm", "initial_state_idx", 1),
+    ],
+)
+def test_flydsl_rejects_non_int32_indices(interface, name, dims):
+    t = _make_inputs(2, 64, 4, 2, spec=True, seed=37)
+    good = torch.zeros(2, dtype=torch.int32, device=DEVICE)
+    kwargs = {name: torch.zeros((2,) * dims, dtype=torch.int64, device=DEVICE)}
+    if name == "query_start_loc":
+        kwargs["conv_state_indices"] = good
+    elif name == "block_idx_last_scheduled_token":
+        kwargs["initial_state_idx"] = good
+    elif name == "initial_state_idx":
+        kwargs["block_idx_last_scheduled_token"] = good
+    fn = (
+        causal_conv1d_update_sglang_flydsl
+        if interface == "sglang"
+        else causal_conv1d_update_flydsl
+    )
+    with pytest.raises(ValueError, match=name):
+        fn(t["x"], t["conv_state"], t["weight"], **kwargs)
+
 
 _VARLEN_CASES = [
     (4, 3, True, (3, 1, 2, 3)),

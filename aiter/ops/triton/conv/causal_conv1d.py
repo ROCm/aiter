@@ -284,6 +284,7 @@ def causal_conv1d_update(
                 conv_state,
                 weight,
                 bias=bias,
+                conv_state_indices=conv_state_indices,
                 num_accept_tokens=num_accepted_tokens,
                 cache_seqlens=cache_seqlens,
                 intermediate_conv_window=intermediate_conv_window,

@@ -9,6 +9,7 @@ import argparse
 import itertools
 import os
 import sys
+import timeit
 from typing import NamedTuple
 
 import pandas as pd
@@ -427,9 +428,11 @@ def _oracle_sglang(
     )
 
 
-def _run_flydsl_chain(p: _Problem, *, use_qk_l2norm=True, inplace=False):
+def _run_flydsl_chain(
+    p: _Problem, *, use_qk_l2norm=True, inplace=False, out=None, stream=None
+):
     pool = p.pool if inplace else p.pool.clone()
-    out = torch.empty_like(p.v)
+    out = torch.empty_like(p.v) if out is None else out
     flydsl_gdr_mtp(
         query=p.q,
         key=p.k,
@@ -443,6 +446,7 @@ def _run_flydsl_chain(p: _Problem, *, use_qk_l2norm=True, inplace=False):
         ssm_state_indices=p.chain_indices,
         num_accepted_tokens=p.num_accepted,
         use_qk_l2norm=use_qk_l2norm,
+        stream=stream,
     )
     return out, pool
 
@@ -553,6 +557,7 @@ def _check_chain_case(
         seed=batch * 131 + seqlen * 7 + len(accepted),
         dtype=dtype,
         state_dtype=state_dtype,
+        accepted=accepted,
     )
     label = f"chain b{batch} s{seqlen} {accepted} {_DTYPE_NAME[dtype]}"
     ref = _oracle_vllm(p, use_qk_l2norm=use_qk_l2norm)
@@ -687,7 +692,7 @@ def test_sglang_disable_state_update_leaves_the_pool_alone():
 # -- the dispatch seam ----------------------------------------------------
 
 
-def _triton_caller(p: _Problem, *, flydsl, inplace=False):
+def _triton_caller(p: _Problem, *, flydsl, inplace=False, set_env=True):
     B, T = p.batch, p.seqlen
     H, HV, K, V = p.num_k_heads, p.num_v_heads, p.head_k_dim, p.head_v_dim
     tokens = B * T
@@ -705,8 +710,9 @@ def _triton_caller(p: _Problem, *, flydsl, inplace=False):
     core = torch.empty(tokens, HV, V, device=DEVICE, dtype=p.q.dtype)
 
     def run():
-        prev = os.environ.get("AITER_GDR_FLYDSL")
-        os.environ["AITER_GDR_FLYDSL"] = "1" if flydsl else "0"
+        prev = os.environ.get("AITER_GDR_FLYDSL") if set_env else None
+        if set_env:
+            os.environ["AITER_GDR_FLYDSL"] = "1" if flydsl else "0"
         try:
             out, _ = fused_rearrange_sigmoid_gated_delta_rule(
                 A_log=p.A_log,
@@ -725,11 +731,12 @@ def _triton_caller(p: _Problem, *, flydsl, inplace=False):
                 num_accepted_tokens=p.num_accepted,
                 use_qk_l2norm_in_kernel=True,
                 core_attn_out=core,
+                draft_window=p.seqlen if flydsl else None,
             )
         finally:
-            if prev is None:
+            if set_env and prev is None:
                 os.environ.pop("AITER_GDR_FLYDSL", None)
-            else:
+            elif set_env:
                 os.environ["AITER_GDR_FLYDSL"] = prev
         return out
 
@@ -786,6 +793,35 @@ def test_dispatch_seam_routes_to_flydsl():
     assert not torch.equal(pool[1], slot_zero.pool[1])
 
 
+def test_mtp_rejects_noncontiguous_output():
+    p = _make_problem(2, 2, seed=67)
+    backing = torch.full(
+        (*p.v.shape[:-1], p.head_v_dim * 2), 123, device=DEVICE, dtype=p.v.dtype
+    )
+    out = backing[..., ::2]
+    before = backing.clone()
+    with pytest.raises(ValueError, match="`out` must be contiguous"):
+        _run_flydsl_chain(p, out=out)
+    assert torch.equal(backing, before)
+
+
+@pytest.mark.skipif(torch.cuda.device_count() < 2, reason="requires two GPUs")
+def test_mtp_stream_uses_the_input_device(monkeypatch):
+    p = _make_problem(2, 2, seed=71)
+    p = _Problem(*(x.to("cuda:1") if isinstance(x, torch.Tensor) else x for x in p))
+    captured = {}
+    monkeypatch.setattr(
+        "aiter.ops.flydsl.linear_attention_kernels._mtp_launch",
+        lambda **kwargs: captured.update(kwargs),
+    )
+    with torch.cuda.device(0):
+        _run_flydsl_chain(p)
+        assert captured["stream"].device == p.q.device
+        wrong = torch.cuda.Stream(device=0)
+        with pytest.raises(ValueError, match="`stream` must be on"):
+            _run_flydsl_chain(p, stream=wrong)
+
+
 BENCH_MODES = ("vllm_chain", "sglang_chain", "sglang_tree")
 
 
@@ -798,6 +834,16 @@ def _bench_bytes(p: _Problem):
     ) * p.q.element_size()
     out = p.v.numel() * p.v.element_size()
     return state + qkv + out
+
+
+def _wall_us(fn, warmup=20, iterations=101):
+    for _ in range(warmup):
+        fn()
+    torch.cuda.synchronize()
+    samples = timeit.repeat(
+        lambda: (fn(), torch.cuda.synchronize()), repeat=iterations, number=1
+    )
+    return float(pd.Series(samples).median() * 1e6)
 
 
 @benchmark()
@@ -828,7 +874,18 @@ def test_gdr_mtp_perf(
         ref = _torch_ref(p, mode)
         pool_fly = p.pool.clone()
         pool_vllm = p.pool.clone()
+        pool_public = p.pool.clone()
+        pool_public_off = p.pool.clone()
         p_fly = p._replace(pool=pool_fly)
+        call_public, _ = _triton_caller(
+            p._replace(pool=pool_public), flydsl=True, inplace=True, set_env=False
+        )
+        call_public_off, _ = _triton_caller(
+            p._replace(pool=pool_public_off),
+            flydsl=False,
+            inplace=True,
+            set_env=False,
+        )
 
         def call_flydsl():
             return _run_flydsl_chain(p_fly, inplace=True)[0]
@@ -838,8 +895,10 @@ def test_gdr_mtp_perf(
 
         # Triton is excluded: its state-index contract differs from vLLM MTP.
         candidates = {
-            "flydsl": call_flydsl,
-            "vllm": call_vllm,
+            "flydsl_direct": call_flydsl,
+            "public_entry_flydsl": call_public,
+            "public_entry_triton": call_public_off,
+            "vllm_reference": call_vllm,
         }
     else:
         ref = _torch_ref(p, mode, parents)
@@ -895,15 +954,25 @@ def test_gdr_mtp_perf(
         "state_dtype": _STATE_DTYPE_NAME[state_dtype],
     }
     for name, fn in candidates.items():
-        out, _ = run_perftest(
-            fn,
-            num_iters=1,
-            num_warmup=0,
-            num_rotate_args=1,
-            use_cuda_event=True,
-        )
-        _, us = run_perftest(fn, num_rotate_args=1)
+        previous = os.environ.get("AITER_GDR_FLYDSL")
+        public_env = {
+            "public_entry_flydsl": "1",
+            "public_entry_triton": "0",
+        }.get(name)
+        if public_env is not None:
+            os.environ["AITER_GDR_FLYDSL"] = public_env
+        try:
+            out = fn().clone()
+            torch.cuda.synchronize()
+            _, us = run_perftest(fn, num_rotate_args=1)
+            wall_us = _wall_us(fn)
+        finally:
+            if public_env is not None and previous is None:
+                os.environ.pop("AITER_GDR_FLYDSL", None)
+            elif public_env is not None:
+                os.environ["AITER_GDR_FLYDSL"] = previous
         ret[f"{name} us"] = us
+        ret[f"{name} wall us"] = wall_us
         ret[f"{name} TFLOPS"] = flops / us / 1e6
         ret[f"{name} TB/s"] = nbytes / us / 1e6
         ret[f"{name} err"] = checkAllclose(
