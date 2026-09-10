@@ -6419,7 +6419,7 @@ void fused_qk_norm_rope_group_quant(
       && ((!has_tdm && use_xlarge_prefill)
           || (!has_tdm && use_large_prefill
               && num_heads >= FG_MANY_HEADS_MIN)
-          || use_decode_path);
+          || (!has_tdm && use_decode_path));
   auto launch_all = [&](auto group_size_tag, auto scale_fp32_tag, auto has_qw_tag) {
     constexpr int  head_dim_val      = 512;
     constexpr int  q_group_size_val  = decltype(group_size_tag)::value;
