@@ -549,6 +549,15 @@ void moe_fused_gate(const aiter_tensor_t& input,
     const int out_stride            = topk_ids.stride(0);
     AITER_CHECK(topk_weights.stride(0) == out_stride,
                 "topk_weights and topk_ids must have the same stride in dim 0");
+    // The launcher reinterpret_casts these to float*/int32_t*, so a wider
+    // buffer is written 4 bytes per element and the rest keeps whatever the
+    // caller allocated -- a partially written tensor that still looks valid.
+    AITER_CHECK(topk_weights.dtype() == AITER_DTYPE_fp32,
+                "topk_weights must be float32, got ",
+                AiterDtype_to_str(topk_weights.dtype()));
+    AITER_CHECK(topk_ids.dtype() == AITER_DTYPE_i32,
+                "topk_ids must be int32, got ",
+                AiterDtype_to_str(topk_ids.dtype()));
 
     // Compute grid dimensions based on runtime value for num_expert_group.
     int64_t rows_per_warp = std::max<int64_t>(1, WARP_SIZE / num_expert_group);
