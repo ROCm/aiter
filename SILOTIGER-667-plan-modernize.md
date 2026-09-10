@@ -132,7 +132,7 @@ comment):
   - [x] unpacked BF16 **outputs** (`out` / `y` stores via `ptr_buf_tensor`)
   - [ ] K-loop activations / intermediate stay on `load_i32_words` (packed dword exception)
 - [x] f32 scales (pertensor / pertoken / block2d; FP8-act `x_scale`)
-- [ ] `router_ids` (i32), `router_wts` (f32)
+- [x] `router_ids` (i32), `router_wts` (f32)
 
 **Keep** packed i32 weight/activation word loads (`load_i32_words`, FP8/FP4
 dwords) and `_ptr_rsrc_off` (K3 i64 expert base) on `buffer_ops` until there

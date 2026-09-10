@@ -81,6 +81,16 @@ def _f32_load(t, idx):
     return buf_copy_load(t, fx.Int32(idx), fx.Float32)
 
 
+def _i32_view(ptr):
+    """Unpacked i32 tensor as a buffer-resource view; ``t[i]`` is one element."""
+    return ptr_buf_tensor(ptr, fx.Int32)
+
+
+def _i32_load(t, idx):
+    """Scalar i32 load at element ``idx`` (``BufferCopy32b`` / ``fx.copy``)."""
+    return buf_copy_load(t, fx.Int32(idx), fx.Int32)
+
+
 def dot2_f32_bf16(a_i32, b_i32, acc_f32, *, serialize: bool = True):
     """``d = a.lo*b.lo + a.hi*b.hi + acc`` via one ``v_dot2_f32_bf16``.
 
@@ -520,12 +530,8 @@ def build_gate_up_fp8_module(
         expert_k = d % top_k
         token_b = d // top_k
 
-        rid_rsrc = _ptr_rsrc(rid_ptr)
-        e = fx.Int32(
-            buffer_ops.buffer_load(
-                rid_rsrc, token_b * top_k + expert_k, vec_width=1, dtype=T.i32()
-            )
-        )
+        rid_t = _i32_view(rid_ptr)
+        e = fx.Int32(_i32_load(rid_t, token_b * top_k + expert_k))
         w_row = e * inter + neuron_j
 
         x_rsrc = _ptr_rsrc(x_ptr)
@@ -734,12 +740,8 @@ def build_gate_up_fp8_act_module(
         expert_k = d % top_k
         token_b = d // top_k
 
-        rid_rsrc = _ptr_rsrc(rid_ptr)
-        e = fx.Int32(
-            buffer_ops.buffer_load(
-                rid_rsrc, token_b * top_k + expert_k, vec_width=1, dtype=T.i32()
-            )
-        )
+        rid_t = _i32_view(rid_ptr)
+        e = fx.Int32(_i32_load(rid_t, token_b * top_k + expert_k))
         w_row = e * inter + neuron_j
 
         x_rsrc = _ptr_rsrc(x_ptr)
@@ -932,18 +934,16 @@ def build_down_reduce_fp8_module(
         inter_rsrc = _ptr_rsrc(inter_ptr)
         wd_rsrc = _ptr_rsrc(wd_ptr)
         wds_t = _f32_view(wds_ptr)
-        rid_rsrc = _ptr_rsrc(rid_ptr)
-        rwt_rsrc = _ptr_rsrc(rwt_ptr)
+        rid_t = _i32_view(rid_ptr)
+        rwt_t = _f32_view(rwt_ptr)
 
         one_f32 = fx.Float32(1.0).ir_value()
         acc = [fx.Float32(0.0) for _ in range(kh_per_warp)]
 
         for k in range_constexpr(top_k):
             ridx = token_b * top_k + k
-            e = fx.Int32(
-                buffer_ops.buffer_load(rid_rsrc, ridx, vec_width=1, dtype=T.i32())
-            )
-            rw = buffer_ops.buffer_load(rwt_rsrc, ridx, vec_width=1, dtype=T.f32())
+            e = fx.Int32(_i32_load(rid_t, ridx))
+            rw = _f32_load(rwt_t, ridx)
             w_row = [e * hidden + out_j0 + h for h in range(kh_per_warp)]
             # Tier-2 (E*H*I >= 2^31): fold the per-expert base into the descriptor
             # as i64 so the in-expert dword base stays i32-safe; else whole-pool.
@@ -1156,12 +1156,8 @@ def build_gate_up_fp4_module(
         expert_k = d % top_k
         token_b = d // top_k
 
-        rid_rsrc = _ptr_rsrc(rid_ptr)
-        e = fx.Int32(
-            buffer_ops.buffer_load(
-                rid_rsrc, token_b * top_k + expert_k, vec_width=1, dtype=T.i32()
-            )
-        )
+        rid_t = _i32_view(rid_ptr)
+        e = fx.Int32(_i32_load(rid_t, token_b * top_k + expert_k))
         w_row = e * inter + neuron_j
         row_blk = w_row // scale_bn
 
@@ -1335,17 +1331,15 @@ def build_down_reduce_fp4_module(
         inter_rsrc = _ptr_rsrc(inter_ptr)
         wd_rsrc = _ptr_rsrc(wd_ptr)
         wds_rsrc = _ptr_rsrc(wds_ptr)
-        rid_rsrc = _ptr_rsrc(rid_ptr)
-        rwt_rsrc = _ptr_rsrc(rwt_ptr)
+        rid_t = _i32_view(rid_ptr)
+        rwt_t = _f32_view(rwt_ptr)
 
         acc = [fx.Float32(0.0) for _ in range(kh_per_warp)]
 
         for k in range_constexpr(top_k):
             ridx = token_b * top_k + k
-            e = fx.Int32(
-                buffer_ops.buffer_load(rid_rsrc, ridx, vec_width=1, dtype=T.i32())
-            )
-            rw = buffer_ops.buffer_load(rwt_rsrc, ridx, vec_width=1, dtype=T.f32())
+            e = fx.Int32(_i32_load(rid_t, ridx))
+            rw = _f32_load(rwt_t, ridx)
             w_row = [e * hidden + out_j0 + h for h in range(kh_per_warp)]
 
             # G7 ILP: collect every (iter, pair) contribution for each output h
@@ -1522,12 +1516,8 @@ def build_gate_up_bf16_module(
         expert_k = d % top_k
         token_b = d // top_k
 
-        rid_rsrc = _ptr_rsrc(rid_ptr)
-        e = fx.Int32(
-            buffer_ops.buffer_load(
-                rid_rsrc, token_b * top_k + expert_k, vec_width=1, dtype=T.i32()
-            )
-        )
+        rid_t = _i32_view(rid_ptr)
+        e = fx.Int32(_i32_load(rid_t, token_b * top_k + expert_k))
         w_row = e * inter + neuron_j
 
         x_rsrc = _ptr_rsrc(x_ptr)
@@ -1646,17 +1636,15 @@ def build_down_reduce_bf16_module(
 
         inter_rsrc = _ptr_rsrc(inter_ptr)
         wd_rsrc = _ptr_rsrc(wd_ptr)
-        rid_rsrc = _ptr_rsrc(rid_ptr)
-        rwt_rsrc = _ptr_rsrc(rwt_ptr)
+        rid_t = _i32_view(rid_ptr)
+        rwt_t = _f32_view(rwt_ptr)
 
         acc = [fx.Float32(0.0) for _ in range(kh_per_warp)]
 
         for k in range_constexpr(top_k):
             ridx = token_b * top_k + k
-            e = fx.Int32(
-                buffer_ops.buffer_load(rid_rsrc, ridx, vec_width=1, dtype=T.i32())
-            )
-            rw = buffer_ops.buffer_load(rwt_rsrc, ridx, vec_width=1, dtype=T.f32())
+            e = fx.Int32(_i32_load(rid_t, ridx))
+            rw = _f32_load(rwt_t, ridx)
             w_row = [e * hidden + out_j0 + h for h in range(kh_per_warp)]
 
             dot = [fx.Float32(0.0).ir_value() for _ in range(kh_per_warp)]
