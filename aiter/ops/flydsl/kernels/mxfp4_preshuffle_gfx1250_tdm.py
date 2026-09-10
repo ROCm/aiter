@@ -48,6 +48,9 @@ MMA_FIRST_GROUP = int(os.environ.get("AITER_FLYDSL_MMA_FIRST_GROUP", MMA_GROUP))
 DS_FIRST_N = int(os.environ.get("AITER_FLYDSL_DS_FIRST_N", "0"))
 WMMA_COLUMN_MAJOR = int(os.environ.get("AITER_FLYDSL_WMMA_COLUMN_MAJOR", "0"))
 SCALE_LO256 = int(os.environ.get("AITER_FLYDSL_SCALE_LO256", "0"))
+EXPLICIT_VGPR_PARTITION = int(
+    os.environ.get("AITER_FLYDSL_EXPLICIT_VGPR_PARTITION", "0")
+)
 if MMA_GROUP < 1 or MMA_FIRST_GROUP < 1:
     raise ValueError("AITER_FLYDSL_MMA_GROUP values must be positive")
 if DS_FIRST_N < 0:
@@ -56,6 +59,8 @@ if WMMA_COLUMN_MAJOR not in (0, 1):
     raise ValueError("AITER_FLYDSL_WMMA_COLUMN_MAJOR must be 0 or 1")
 if SCALE_LO256 not in (0, 1, 2):
     raise ValueError("AITER_FLYDSL_SCALE_LO256 must be 0, 1, or 2")
+if EXPLICIT_VGPR_PARTITION not in (0, 1):
+    raise ValueError("AITER_FLYDSL_EXPLICIT_VGPR_PARTITION must be 0 or 1")
 
 
 @flyc.jit
@@ -166,6 +171,7 @@ def launch_gemm_a8w4_tdm(
         DS_FIRST_N,
         WMMA_COLUMN_MAJOR,
         SCALE_LO256,
+        EXPLICIT_VGPR_PARTITION,
     )
     _ = cache_tag
     if enable_ep_scatter:
@@ -253,12 +259,14 @@ def launch_gemm_a8w4_tdm(
     _ds_first = f"_dsfirst{DS_FIRST_N}" if DS_FIRST_N else ""
     _column_major = "_colmma" if WMMA_COLUMN_MAJOR else ""
     _scale_lo256 = f"_slo256m{SCALE_LO256}" if SCALE_LO256 else ""
+    _explicit_vgpr_partition = "_regpart" if EXPLICIT_VGPR_PARTITION else ""
     _kname = (
         f"a8w4_tdm_{_afp}"
         f"_t{tile_m}x{tile_n}x{tile_k}_w{m_warp}x{n_warp}"
         f"_b{num_buffers}_K{K}"
         f"{_grouped}{_act}{_bias}{_qout}{_cl}{_next_stage}{_waves_per_tensor}"
-        f"{_mma_group}{_ds_first}{_column_major}{_scale_lo256}{_ep}"
+        f"{_mma_group}{_ds_first}{_column_major}{_scale_lo256}"
+        f"{_explicit_vgpr_partition}{_ep}"
     )
 
     @flyc.kernel(name=_kname, known_block_size=[block, 1, 1])
@@ -687,6 +695,14 @@ def launch_gemm_a8w4_tdm(
             fx.make_rmem_tensor(WMMA_VECTOR_DWORDS, fx.Float32)
             for _ in range_constexpr(n_acc)
         ]
+        if const_expr(EXPLICIT_VGPR_PARTITION):
+            assert n_acc * WMMA_VECTOR_DWORDS <= 512
+            for idx in range_constexpr(n_acc):
+                fx.set_register(
+                    c_frags[idx],
+                    register_class=fx.rocdl.VGPR,
+                    start=512 + idx * WMMA_VECTOR_DWORDS,
+                )
         for cf in c_frags:
             cf.store(fx.constant_vector(0.0, T.vec(WMMA_VECTOR_DWORDS, T.f32)))
 
@@ -761,7 +777,7 @@ def launch_gemm_a8w4_tdm(
         SA_WIDTH, SB_WIDTH = max(2, sa_pairs), max(2, sb_pairs)
         RmemSlot = namedtuple("RmemSlot", "a b sa sb")
 
-        def make_rmem_slot():
+        def make_rmem_slot(slot_idx):
             """Registers holding one k128 of A/B/scales, like c_frags.
 
             The k-tile loop is a runtime scf.for, so the tile boundary cannot
@@ -769,22 +785,42 @@ def launch_gemm_a8w4_tdm(
             width-1 rmem vector leaves a poison lane under SSA promotion, and
             tile_m=16 gives wmma_m_rep == 1, so a scale slot is at least 2 wide.
             """
+            a = [
+                fx.make_rmem_tensor(ACT_NDW, fx.Int32)
+                for _ in range_constexpr(wmma_m_rep)
+            ]
+            b = [
+                fx.make_rmem_tensor(WMMA_VECTOR_DWORDS, fx.Int32)
+                for _ in range_constexpr(wmma_n_rep)
+            ]
+            if const_expr(EXPLICIT_VGPR_PARTITION):
+                slot_width = (
+                    wmma_m_rep * ACT_NDW
+                    + wmma_n_rep * WMMA_VECTOR_DWORDS
+                )
+                assert slot_width <= 128
+                reg = 256 + slot_idx * 128
+                for wm in range_constexpr(wmma_m_rep):
+                    fx.set_register(
+                        a[wm], register_class=fx.rocdl.VGPR, start=reg
+                    )
+                    reg += ACT_NDW
+                for wn in range_constexpr(wmma_n_rep):
+                    fx.set_register(
+                        b[wn], register_class=fx.rocdl.VGPR, start=reg
+                    )
+                    reg += WMMA_VECTOR_DWORDS
+                assert reg <= 256 + (slot_idx + 1) * 128
             return RmemSlot(
-                a=[
-                    fx.make_rmem_tensor(ACT_NDW, fx.Int32)
-                    for _ in range_constexpr(wmma_m_rep)
-                ],
-                b=[
-                    fx.make_rmem_tensor(WMMA_VECTOR_DWORDS, fx.Int32)
-                    for _ in range_constexpr(wmma_n_rep)
-                ],
+                a=a,
+                b=b,
                 sa=fx.make_rmem_tensor(SA_WIDTH, fx.Int32),
                 sb=fx.make_rmem_tensor(SB_WIDTH, fx.Int32),
             )
 
         # Two slots: the k-tile loop is a runtime scf.for, so the tile boundary
         # cannot carry a Python value, and a prefetch needs a slot no WMMA reads.
-        rmem_slots = [make_rmem_slot() for _ in range_constexpr(2)]
+        rmem_slots = [make_rmem_slot(i) for i in range_constexpr(2)]
 
         def load_lds_data(slot, lds_addr, ksl):
             """Load one k128 from precomputed LDS bases into ``slot``."""
@@ -1581,3 +1617,6 @@ launch_gemm_a8w4_tdm.compile_hints["llvm_options"] = {
     "amdgpu-kernarg-preload": AITER_FLYDSL_KERNARG_PRELOAD,
     "amdgpu-kernarg-preload-count": AITER_FLYDSL_KERNARG_PRELOAD_COUNT,
 }
+if EXPLICIT_VGPR_PARTITION:
+    launch_gemm_a8w4_tdm.compile_hints["waves_per_eu"] = 1
+    launch_gemm_a8w4_tdm.compile_hints["maxnreg"] = 1024
