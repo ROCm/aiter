@@ -1,7 +1,13 @@
+"""AOT-compile sampling kernels; this module does not perform token sampling."""
+
 import concurrent.futures
-import os
 from collections import namedtuple
 
+from aiter_worker_limits import (
+    adopt_legacy_max_jobs,
+    configure_worker_subprocesses,
+    get_worker_count_for,
+)
 from csrc.cpp_itfs.sampling.top_k_renorm_probs import (
     compile as top_k_renorm_probs_compile,
 )
@@ -28,18 +34,22 @@ TopKTopPSamplingConfig = namedtuple(
 )
 
 
-def process_top_k_renorm_config(config):
-    return top_k_renorm_probs_compile(config.vec_size)
+def process_top_k_renorm_config(config) -> None:
+    # The compiled ctypes function is process-local; only success/failure
+    # should cross the ProcessPoolExecutor boundary.
+    top_k_renorm_probs_compile(config.vec_size)
 
 
-def process_top_p_sampling_config(config):
-    return top_p_sampling_from_probs_compile(config.vec_size, config.deterministic)
+def process_top_p_sampling_config(config) -> None:
+    # The compiled ctypes function is process-local; only success/failure
+    # should cross the ProcessPoolExecutor boundary.
+    top_p_sampling_from_probs_compile(config.vec_size, config.deterministic)
 
 
-def process_top_k_top_p_sampling_config(config):
-    return top_k_top_p_sampling_from_probs_compile(
-        config.vec_size, config.deterministic
-    )
+def process_top_k_top_p_sampling_config(config) -> None:
+    # The compiled ctypes function is process-local; only success/failure
+    # should cross the ProcessPoolExecutor boundary.
+    top_k_top_p_sampling_from_probs_compile(config.vec_size, config.deterministic)
 
 
 def main():
@@ -77,14 +87,33 @@ def main():
                 )
             )
 
-    max_jobs = int(os.environ.get("MAX_JOBS", os.cpu_count() or 16))
+    config_count = sum(
+        len(configs)
+        for configs in (
+            top_k_renorm_configs,
+            top_p_sampling_configs,
+            top_k_top_p_sampling_configs,
+        )
+    )
+    max_jobs = get_worker_count_for(config_count)
 
-    # Process all configs in parallel
-    with concurrent.futures.ProcessPoolExecutor(max_workers=max_jobs) as executor:
-        executor.map(process_top_k_renorm_config, top_k_renorm_configs)
-        executor.map(process_top_p_sampling_config, top_p_sampling_configs)
-        executor.map(process_top_k_top_p_sampling_config, top_k_top_p_sampling_configs)
+    # Submit every kernel family before consuming results so all variants may
+    # compile concurrently. Consuming each iterator still propagates failures.
+    with concurrent.futures.ProcessPoolExecutor(
+        max_workers=max_jobs, initializer=configure_worker_subprocesses
+    ) as executor:
+        result_iterators = (
+            executor.map(process_top_k_renorm_config, top_k_renorm_configs),
+            executor.map(process_top_p_sampling_config, top_p_sampling_configs),
+            executor.map(
+                process_top_k_top_p_sampling_config,
+                top_k_top_p_sampling_configs,
+            ),
+        )
+        for results in result_iterators:
+            list(results)
 
 
 if __name__ == "__main__":
+    adopt_legacy_max_jobs()
     main()

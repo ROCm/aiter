@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# split_tests.sh — shards tests in op_tests/triton_tests
+# split_tests.sh — shards Aiter and Triton tests
 # N shards, shards with similar total test time
 
 # Usage:
@@ -50,7 +50,9 @@ TEST_DIR="${TEST_DIR%/}"
 # scan test files in TEST_DIR
 # ------------------------------
 if [[ "$TEST_TYPE" == "aiter" ]]; then
-    mapfile -t ALL_FILES < <(find "$TEST_DIR" -maxdepth 1 -name 'test_*.py' -type f | LC_ALL=C sort)
+    mapfile -t ALL_FILES < <(
+        find "$TEST_DIR" -maxdepth 1 -name 'test_*.py' -type f | LC_ALL=C sort
+    )
 elif [[ "$TEST_TYPE" == "triton" ]]; then
     mapfile -t ALL_FILES < <(find "$TEST_DIR" -name 'test_*.py' -type f | LC_ALL=C sort)
 fi

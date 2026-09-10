@@ -81,9 +81,25 @@ Environment Variables
    * - ``PREBUILD_KERNELS``
      - ``0`` = JIT only, ``1`` = core kernels, ``2`` = inference kernels, ``3`` = MHA only
      - ``0``
-   * - ``MAX_JOBS``
-     - Max parallel compilation threads
-     - Auto-calculated
+   * - ``AITER_MAX_JOBS``
+     - Optional AITER-local parallel compilation ceiling. Plain AITER imports
+       ignore generic ``MAX_JOBS`` from parent frameworks. At the AITER-owned
+       runtime JIT compile boundary, a valid ``MAX_JOBS`` is used as a
+       non-mutating legacy ceiling when ``AITER_MAX_JOBS`` is unset. For
+       backward compatibility, AITER-owned standalone build entrypoints adopt
+       a valid positive ``MAX_JOBS`` in that case and emit a ``FutureWarning``.
+       Live CPU and memory limits are recalculated on every policy call and
+       always clamp either ceiling.
+     - Minimum of 80% of process-available CPUs and effective host/container
+       available-memory capacity
+
+For an AITER-owned compile, worker-ceiling precedence is explicit
+``AITER_MAX_JOBS`` first, then a valid positive legacy ``MAX_JOBS``, then
+automatic sizing. Runtime JIT reads the legacy value without modifying either
+variable. Standalone package/setup builds, AOT CLIs, and standalone PA-Gluon or
+OPUS builders adopt it into ``AITER_MAX_JOBS`` and emit a ``FutureWarning``.
+Explicit and legacy values are ceilings only: live CPU and memory budgets
+always clamp them. Plain imports do not perform any legacy lookup.
 
 Example Configurations
 """"""""""""""""""""""

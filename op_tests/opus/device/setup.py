@@ -10,15 +10,23 @@ Usage:
     python setup.py --clean  # remove built artifacts
 """
 
+import argparse
 import os
 import subprocess
 import sys
 import time
 
 _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
-_REPO_CSRC = os.path.normpath(
-    os.path.join(_THIS_DIR, "..", "..", "..", "csrc", "include")
+_REPO_ROOT = os.path.normpath(os.path.join(_THIS_DIR, "..", "..", ".."))
+_REPO_CSRC = os.path.normpath(os.path.join(_REPO_ROOT, "csrc", "include"))
+sys.path.insert(0, _REPO_ROOT)
+
+from aiter_worker_limits import (
+    adopt_legacy_max_jobs,
+    configure_worker_subprocesses,
+    get_worker_count_for,
 )
+
 _SO_NAME = "opus_device_test.so"
 
 _CU_SOURCES = [
@@ -126,12 +134,6 @@ def build(verbose=False, jobs=None):
     arch = _detect_arch()
     so_path = os.path.join(_THIS_DIR, _SO_NAME)
 
-    if jobs is None:
-        jobs = min(len(_CU_SOURCES), os.cpu_count() or 4)
-
-    if verbose:
-        print(f"[setup] arch={arch}, jobs={jobs}")
-
     # Per-arch skip list: kernels that use builtins not available on the
     # target arch. Skipped at .so build time so the rest of the suite
     # still links; the Python harness sees the missing extern "C" launcher
@@ -170,9 +172,16 @@ def build(verbose=False, jobs=None):
         obj = os.path.join(_THIS_DIR, s.replace(".cu", ".o"))
         extra = ["-mwavefrontsize64"] if s in _W64_SOURCES else []
         tasks.append((src, obj, hipcc, arch, verbose, extra))
+    worker_budget = get_worker_count_for(len(tasks))
+    jobs = worker_budget if jobs is None else min(worker_budget, max(1, int(jobs)))
+
+    if verbose:
+        print(f"[setup] arch={arch}, jobs={jobs}")
 
     objs = []
-    with ProcessPoolExecutor(max_workers=jobs) as pool:
+    with ProcessPoolExecutor(
+        max_workers=jobs, initializer=configure_worker_subprocesses
+    ) as pool:
         futures = {pool.submit(_compile_one, t): t for t in tasks}
         for fut in as_completed(futures):
             name, ms = fut.result()
@@ -241,16 +250,25 @@ def clean():
         print("Nothing to clean.")
 
 
-if __name__ == "__main__":
-    if "--clean" in sys.argv:
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--clean", action="store_true")
+    parser.add_argument("--verbose", "-v", action="store_true")
+    parser.add_argument(
+        "--jobs",
+        "-j",
+        type=int,
+        default=None,
+        help="Optional worker ceiling, further clamped by AITER CPU/memory limits; "
+        "non-positive values select one worker",
+    )
+    args = parser.parse_args()
+    if args.clean:
         clean()
     else:
-        verbose = "-v" in sys.argv or "--verbose" in sys.argv
-        jobs = None
-        for arg in sys.argv[1:]:
-            if arg.startswith("-j"):
-                try:
-                    jobs = int(arg[2:])
-                except ValueError:
-                    pass
-        build(verbose=verbose, jobs=jobs)
+        build(verbose=args.verbose, jobs=args.jobs)
+
+
+if __name__ == "__main__":
+    adopt_legacy_max_jobs()
+    main()

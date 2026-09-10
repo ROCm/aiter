@@ -23,6 +23,22 @@ def _wait_for_release(release, value):
     return value
 
 
+class TestGpuProcessCount(unittest.TestCase):
+
+    @classmethod
+    def setUpClass(cls):
+        cls.tuner = importlib.import_module("aiter.utility.mp_tuner")
+
+    def test_default_uses_all_visible_gpus(self):
+        self.assertEqual(self.tuner._resolve_tuner_process_count(4, 0), 4)
+
+    def test_explicit_process_count_selects_that_many_gpus(self):
+        self.assertEqual(self.tuner._resolve_tuner_process_count(4, 2), 2)
+
+    def test_excessive_process_count_is_capped_by_visible_gpus(self):
+        self.assertEqual(self.tuner._resolve_tuner_process_count(4, 23), 4)
+
+
 class FakeAsyncResult:
     """Simulates multiprocessing.AsyncResult for testing polling logic."""
 

@@ -20,6 +20,8 @@ from functools import cache, lru_cache, partial
 from jinja2 import Template
 from packaging.version import Version, parse
 
+from aiter_worker_limits import get_worker_count_for
+
 
 def get_git_commit_id_short():
     """??? commit ID (?? 7 ???)"""
@@ -90,6 +92,11 @@ build: $(OBJS)
 clean:
 	rm -f $(TARGET) $(OBJS)
 """)
+
+
+def _make_build_command(source_count: int) -> list[str]:
+    """Build with the live AITER budget, including nested-worker limits."""
+    return ["make", "build", f"-j{get_worker_count_for(source_count)}"]
 
 
 def mp_lock(
@@ -250,7 +257,7 @@ def compile_lib(src_file, folder, includes=None, sources=None, cxxflags=None):
         with open(f"{sub_build_dir}/Makefile", "w") as f:
             f.write(makefile_file)
         subprocess.run(
-            ["make", "build", f"-j{len(sources)}"],
+            _make_build_command(len(sources)),
             cwd=sub_build_dir,
             shell=False,
             capture_output=AITER_LOG_MORE < 2,
