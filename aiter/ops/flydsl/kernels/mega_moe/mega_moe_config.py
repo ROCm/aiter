@@ -36,6 +36,7 @@ GLM52_MODEL_DIM = 6144
 GLM52_INTER_DIM = 2048
 GLM52_EXPERTS_PER_RANK = 32
 GLM52_DECODE_MTPR = 256
+GLM52_TOPK = 8
 # Compact route metadata dedicates ten bits to the global expert/group segment.
 # Under the EP8 protocol this admits 8 * 127 expert segments plus 8 group
 # segments.  The next expert would require segment 1024 and cannot be encoded.
@@ -420,6 +421,7 @@ def select_mega_moe_config(
     model_dim: int = 7168,
     inter_dim: int = 3072,
     world_size: int = 8,
+    topk: int = 6,
 ) -> MegaMoEConfig:
     if mtpr <= 0 or mtpr & (mtpr - 1):
         raise ValueError(f"mtpr={mtpr} must be a positive power of two")
@@ -429,6 +431,8 @@ def select_mega_moe_config(
         raise ValueError(f"experts_per_rank must be positive, got {experts_per_rank}")
     if not 0 < world_size <= 8:
         raise ValueError(f"world_size must be in [1, 8], got {world_size}")
+    if not 0 < topk <= 16:
+        raise ValueError(f"topk must be in [1, 16], got {topk}")
     if model_dim <= 0 or inter_dim <= 0:
         raise ValueError(f"invalid model shape {model_dim}x{inter_dim}")
     if experts_per_rank > MAX_FANOUT_EXPERTS_PER_RANK:
@@ -457,6 +461,7 @@ def select_mega_moe_config(
         and experts_per_rank == GLM52_EXPERTS_PER_RANK
         and model_dim == GLM52_MODEL_DIM
         and inter_dim == GLM52_INTER_DIM
+        and topk == GLM52_TOPK
         and bucket <= GLM52_DECODE_MTPR
     ):
         return _select_glm52_ep8_decode(bucket)
@@ -477,6 +482,7 @@ def build_mega_moe_bundle_plan(
     model_dim: int = 7168,
     inter_dim: int = 3072,
     world_size: int = 8,
+    topk: int = 6,
 ) -> MegaMoEBundlePlan:
     """Deduplicate variants while keeping Stage1/Stage2 selection atomic."""
     if mtpr <= 0 or mtpr & (mtpr - 1):
@@ -503,6 +509,7 @@ def build_mega_moe_bundle_plan(
             model_dim=model_dim,
             inter_dim=inter_dim,
             world_size=world_size,
+            topk=topk,
         )
         stage1_key = stage1_bundle_identity(config.stage1)
         stage1_id = stage1_ids.setdefault(stage1_key, len(stage1_variants))

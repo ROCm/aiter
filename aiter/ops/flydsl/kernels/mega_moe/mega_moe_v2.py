@@ -60,6 +60,7 @@ class MegaMoEV2:
             model_dim=self.model_dim,
             inter_dim=self.inter_dim,
             world_size=self.world_size,
+            topk=self.topk,
         )
         self._active_bundle_entry = None
         self._initial_fanout_masks = tuple(int(mask) for mask in fanout_masks)

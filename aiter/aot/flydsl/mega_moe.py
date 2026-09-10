@@ -452,6 +452,7 @@ def compile_one_config(**job):
             model_dim=model_dim,
             inter_dim=inter_dim,
             world_size=world_size,
+            topk=topk,
         )
         with compile_only_env(), override_env("FLYDSL_GPU_ARCH", "gfx950"):
             if job["stage"] == 1:

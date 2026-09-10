@@ -29,6 +29,7 @@ def test_glm52_ep8_decode_specialization():
             experts_per_rank=32,
             model_dim=6144,
             inter_dim=2048,
+            topk=8,
         )
         assert (
             config.stage1.num_dispatch_cu,
@@ -40,7 +41,7 @@ def test_glm52_ep8_decode_specialization():
         assert config.stage2.persist_cu == (192 if tokens <= 128 else 128)
 
 
-def test_glm52_policy_is_shape_and_ep_specific():
+def test_glm52_policy_is_shape_ep_and_topk_specific():
     ep4 = select_mega_moe_config(
         24,
         256,
@@ -48,6 +49,7 @@ def test_glm52_policy_is_shape_and_ep_specific():
         model_dim=6144,
         inter_dim=2048,
         world_size=4,
+        topk=8,
     )
     other_shape = select_mega_moe_config(
         24,
@@ -55,6 +57,7 @@ def test_glm52_policy_is_shape_and_ep_specific():
         experts_per_rank=32,
         model_dim=7168,
         inter_dim=3072,
+        topk=8,
     )
     other_mtpr = select_mega_moe_config(
         24,
@@ -62,13 +65,24 @@ def test_glm52_policy_is_shape_and_ep_specific():
         experts_per_rank=32,
         model_dim=6144,
         inter_dim=2048,
+        topk=8,
+    )
+    other_topk = select_mega_moe_config(
+        24,
+        256,
+        experts_per_rank=32,
+        model_dim=6144,
+        inter_dim=2048,
+        topk=6,
     )
     assert ep4.stage1.num_dispatch_cu == 32
     assert other_shape.stage1.num_dispatch_cu == 32
     assert other_mtpr.stage1.num_dispatch_cu == 32
+    assert other_topk.stage1.num_dispatch_cu == 32
     assert ep4.stage2.block_n == 256
     assert other_shape.stage2.block_n == 256
     assert other_mtpr.stage2.block_n == 256
+    assert other_topk.stage2.block_n == 256
 
 
 def test_glm52_bundle_supports_zero_token_rank():
@@ -77,6 +91,7 @@ def test_glm52_bundle_supports_zero_token_rank():
         experts_per_rank=32,
         model_dim=6144,
         inter_dim=2048,
+        topk=8,
     )
     assert not plan.fixed_slot_dispatch
     assert plan.entry_for_tokens(0) == plan.entry_for_tokens(1)
@@ -109,6 +124,7 @@ def test_glm52_ep8_combine_geometry_table():
         experts_per_rank=32,
         model_dim=6144,
         inter_dim=2048,
+        topk=8,
     )
     assert set(_combine_aot_identities(plan, table, 256)) == {
         (64, 4, False),
