@@ -106,6 +106,18 @@ for file in "${sharded_files[@]}"; do
                 _ "$file"
             )
             ;;
+        op_tests/multigpu_tests/test_comm_fused_moe.py)
+            {
+                echo "Running comm-fused MoE production validation on 8 GPUs when supported"
+            } | tee -a latest_test.log
+            test_cmd=(
+                timeout 60m
+                torchrun
+                --standalone
+                --nproc_per_node=8
+                "$file"
+            )
+            ;;
         op_tests/test_mla_persistent.py|op_tests/test_mla_persistent_round_robin.py)
             {
                 echo "Using AITER_MLA_DECODE_PERSISTENT_MAX_BATCH=0 for $file"
