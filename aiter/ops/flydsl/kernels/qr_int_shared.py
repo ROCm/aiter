@@ -4,8 +4,7 @@
 """Transport assets shared by every QRInt4 schedule.
 
 Tile geometry, the inbox cache-policy table, the peer store/load primitives and
-the LDS staging factory. No quantization lives here -- that is
-``qr_int_codec``.
+the LDS staging factory.
 
 The mesh, ring and one-shot kernels all build on this module, and they must
 agree byte for byte on what it defines. ``qr_1stage_kernel`` uses it *without*
@@ -45,15 +44,6 @@ I32_BYTES = 4
 # backend renames for CDNA: bit 0 (GLC) prints as `sc0`, bit 1 (SLC) as `nt`,
 # bit 4 (SCC) as `sc1`. Bit 2 exists in the encoding but CDNA has no use for
 # it, so it is dropped and emits nothing.
-#
-# These were previously 1/2/4, which is the bit order the names suggest but not
-# the one the hardware uses. The consequence was silent and invisible from the
-# source: `_CM_SC1` emitted `nt` (a hint, not a bypass) and `_CM_NT` emitted no
-# modifier at all. It only shows up in the disassembly -- every other coherence
-# op in this file is inline asm and so was unaffected.
-#
-# Verified against the gfx950 backend: aux 1 -> `sc0`, 2 -> `nt`, 4 -> (none),
-# 16 -> `sc1`, 17 -> `sc0 sc1`, 18 -> `nt sc1`.
 _CM_SC0 = 1
 _CM_NT = 2
 _CM_SC1 = 16
@@ -106,19 +96,11 @@ _INBOX_POLICY = {
     # only one where a peer write can actually sit in the writer's L2 and be
     # combined with its neighbours before going out on the wire.
     #
-    # This is worth spelling out because the fine-grained entry above was built
-    # on the opposite belief. ROCm documents fine-grained coherence as *bought
-    # by giving up caching* -- the pages are marked write-uncached on CDNA -- so
-    # a design that picks "finegrained" in order to get L2 write-combining is
-    # asking for a behaviour the page tables have disabled. Coarse-grained is
-    # what that design actually wanted.
-    #
-    # The cost is that nothing is coherent for free. The payload stores are
-    # plain (no `nt`) so lines stay dirty in L2; `buffer_wbl2` at the publish
-    # point is what puts them on the wire; the flag goes out write-through so
-    # the peer's spin sees it after the payload; and the reader must bypass
-    # both its caches (`sc0 sc1`) rather than trust `nt`, which is only a hint
-    # and can be answered from a stale line.
+    # The payload stores are plain (no `nt`) so lines stay dirty in L2; 
+    # `buffer_wbl2` at the publish point is what puts them on the wire; 
+    # the flag goes out write-through so the peer's spin sees it after the payload; 
+    # and the reader must bypass both its caches (`sc0 sc1`) rather than trust `nt`, 
+    # which is only a hint and can be answered from a stale line.
     "default": {
         "payload": "",
         "flag": "sc0 sc1",
@@ -128,25 +110,6 @@ _INBOX_POLICY = {
     },
 }
 FANOUT_ORDERS = ("sector", "peer")
-
-# Experiment hooks: override a fine-grained policy field from the environment.
-# The fine-grained fanout depends on L2 write-combining the 64 B peer stores
-# into large bursts, and whether `nt` lets a line linger long enough to be
-# combined is a property of the memory system, not of this kernel -- so it has
-# to be measured on the host it will run on rather than assumed. Unset means
-# the table above stands.
-for _field, _var in (
-    ("payload", "AITER_QRINT4_PAYLOAD_POLICY"),
-    ("flag", "AITER_QRINT4_FLAG_POLICY"),
-    ("writeback", "AITER_QRINT4_WRITEBACK_POLICY"),
-    ("fanout", "AITER_QRINT4_FANOUT"),
-):
-    _val = os.environ.get(_var)
-    if _val is not None:
-        _INBOX_POLICY["finegrained"][_field] = (
-            None if _val.lower() in ("none", "") and _field == "writeback" else _val
-        )
-        logger.warning("QRInt4: %s overridden to %r by %s", _field, _val, _var)
 
 
 def has_release_fence(inbox_memory: str) -> bool:
@@ -196,13 +159,6 @@ def _store_v4i32_peer(addr_i64, data, policy):
     its only consumer. Both emit ``global_store_dwordx4 ... {policy}``, so a
     change to that encoding has to be made in both places.
     """
-    # TODO: no native cache-policy (nt / sc0 sc1) attribute exists yet on
-    # fly.ptr_store, so *policy* is currently ignored.
-    # ptr_ty = fx.PointerType.get(
-    #     fx.Vector.make_type(4, fx.Int32), address_space=fx.AddressSpace.Global
-    # )
-    # ptr = fx.inttoptr(ptr_ty, addr_i64)
-    # fx.ptr_store(data, ptr)
     ptr_ty = ir.Type.parse("!llvm.ptr<1>")
     ptr = llvm.IntToPtrOp(ptr_ty, as_ir_value(addr_i64)).result
     llvm.InlineAsmOp(

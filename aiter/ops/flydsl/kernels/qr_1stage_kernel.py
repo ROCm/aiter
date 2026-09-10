@@ -116,12 +116,6 @@ DEFAULT_ATOMS = 1
 # ``_store_v4i32_peer_multi`` below, which now carries the
 # whole fanout in one asm block. Passes at TP2 and TP4 for 1, 2 and 4 including
 # the run-ahead loop.
-#
-# Correct is not the same as useful: 2 and 4 are both measurably SLOWER than 1
-# at every decode shape (TP4/xGMI, ~+3 and ~+7 us), because a fatter tile buys
-# fewer blocks and this kernel is already short of them -- atoms=4 at M=1 is a
-# single block. They stay supported so the lever is testable at other payload
-# sizes and world sizes; 1 remains the default.
 SUPPORTED_ATOMS = (1, 2, 4)
 DEFAULT_GRID_CAP = 64
 
@@ -156,14 +150,6 @@ DEFAULT_FANOUT = "peer"
 PROBE_MODES = ("full", "sync")
 
 # ``s_sleep`` interval for the flag spin, 0 to spin flat out.
-#
-# Measured and left off. TP4/xGMI, m in {1,4,8,16}: 1 and 2 land within
-# +-0.35 us of no backoff, which is under this bench's noise, and 32 is
-# consistently *worse* at every shape (+0.3 to +0.6 us). That is what the floor
-# probe predicts -- the whole handshake is only 1.5-2.5 us of an ~11.6 us wall
-# at m=1, so there is nothing here to win. Kept as a knob rather than deleted
-# because the interesting case is TP8, where arrival skew and flag traffic are
-# both much worse and none of this has been measured.
 DEFAULT_SPIN_SLEEP = 0
 
 
