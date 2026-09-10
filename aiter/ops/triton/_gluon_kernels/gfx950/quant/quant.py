@@ -1,3 +1,7 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
+
+import triton
 from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
 
@@ -268,3 +272,155 @@ def gluon_dynamic_mxfp4_quant_kernel_gfx950(
 
             x = x_next
             x_block_ptr = x_block_ptr_next
+
+
+@gluon.jit
+def _mxfp8_quant_op(
+    x,
+    BLOCK_SIZE_N: gl.constexpr,
+    BLOCK_SIZE_M: gl.constexpr,
+    MXFP8_QUANT_BLOCK_SIZE: gl.constexpr,
+):
+    """
+    Converts x (bf16) [BLOCK_SIZE_M, BLOCK_SIZE_N] to fp8 e4m3 via
+    gl.amd.cdna4.scaled_downcast, computing the per-32-element e8m0 scale
+    ourselves. No packing (1 output byte/element), so amax is a plain
+    reshape+max reduction -- no evens/odds split needed like MXFP4.
+    """
+    NUM_QUANT_BLOCKS: gl.constexpr = BLOCK_SIZE_N // MXFP8_QUANT_BLOCK_SIZE
+    x_grouped = x.reshape(BLOCK_SIZE_M, NUM_QUANT_BLOCKS, MXFP8_QUANT_BLOCK_SIZE)
+    amax = gl.max(gl.abs(x_grouped), axis=-1, keep_dims=True).to(gl.float32)
+    amax = amax.to(gl.int32, bitcast=True)
+    amax = (amax + 0x200000).to(gl.uint32, bitcast=True) & 0xFF800000
+    amax = amax.to(gl.float32, bitcast=True)
+    # e4m3's max representable value is 2**8 * 1.75, so the unbiased exponent
+    # offset is -8 (vs MXFP4/e2m1's -2).
+    scale_e8m0_unbiased = gl.log2(amax).floor() - 8
+    scale_e8m0_unbiased = gl.maximum(-127, gl.minimum(scale_e8m0_unbiased, 127))
+    bs_e8m0 = scale_e8m0_unbiased.to(gl.uint8) + 127
+    bs_e8m0 = bs_e8m0.reshape(BLOCK_SIZE_M, NUM_QUANT_BLOCKS)
+
+    x_fp8 = gl.amd.cdna4.scaled_downcast(x, bs_e8m0, "e4m3", axis=1)
+
+    return x_fp8, bs_e8m0
+
+
+@triton.heuristics(
+    {
+        "EVEN_M_N": lambda args: args["M"] % args["BLOCK_SIZE_M"] == 0
+        and args["N"] % (args["BLOCK_SIZE_N"] * args["NUM_ITER"]) == 0,
+    }
+)
+@gluon.jit
+def gluon_dynamic_mxfp8_quant_kernel_gfx950(
+    x_ptr,
+    x_fp8_ptr,
+    bs_ptr,
+    stride_x_m_in,
+    stride_x_n_in,
+    stride_x_fp8_m_in,
+    stride_x_fp8_n_in,
+    stride_bs_m_in,
+    stride_bs_n_in,
+    M,
+    N,
+    BLOCK_SIZE_M: gl.constexpr,
+    BLOCK_SIZE_N: gl.constexpr,
+    NUM_ITER: gl.constexpr,
+    num_warps: gl.constexpr,
+    MXFP8_QUANT_BLOCK_SIZE: gl.constexpr,
+    EVEN_M_N: gl.constexpr,
+):
+    pid_m = gl.program_id(0)
+    start_n = gl.program_id(1) * NUM_ITER
+    # cast strides to int64, in case M*N > max int32
+    stride_x_m = gl.cast(stride_x_m_in, gl.int64)
+    stride_x_n = gl.cast(stride_x_n_in, gl.int64)
+    stride_x_fp8_m = gl.cast(stride_x_fp8_m_in, gl.int64)
+    stride_x_fp8_n = gl.cast(stride_x_fp8_n_in, gl.int64)
+    stride_bs_m = gl.cast(stride_bs_m_in, gl.int64)
+    stride_bs_n = gl.cast(stride_bs_n_in, gl.int64)
+
+    NUM_QUANT_BLOCKS: gl.constexpr = BLOCK_SIZE_N // MXFP8_QUANT_BLOCK_SIZE
+    # Same warp-axis heuristic as the MXFP4 kernel (size_per_thread=[1,8],
+    # threads_per_warp=[8,8] -> 8 rows/warp along M or 64 cols/warp along N).
+    WARPS_M: gl.constexpr = num_warps if (BLOCK_SIZE_M // 8) >= num_warps else 1
+    WARPS_N: gl.constexpr = num_warps // WARPS_M
+    layout: gl.constexpr = gl.BlockedLayout(
+        size_per_thread=[1, 8],
+        threads_per_warp=[8, 8],
+        warps_per_cta=[WARPS_M, WARPS_N],
+        order=[1, 0],
+    )
+
+    end_n = min(start_n + NUM_ITER, N)
+
+    local_m = gl.arange(0, BLOCK_SIZE_M, layout=gl.SliceLayout(1, layout))
+    local_n = gl.arange(0, BLOCK_SIZE_N, layout=gl.SliceLayout(0, layout))
+    x_offs = local_m[:, None] * stride_x_m_in + local_n[None, :] * stride_x_n_in
+    if not EVEN_M_N:
+        x_offs_m = pid_m * BLOCK_SIZE_M + local_m
+
+    for pid_n in range(start_n, end_n):
+        x_block_ptr = (
+            x_ptr
+            + (pid_m * BLOCK_SIZE_M).to(gl.int64) * stride_x_m
+            + (pid_n * BLOCK_SIZE_N).to(gl.int64) * stride_x_n
+        )
+        if EVEN_M_N:
+            x = gl.amd.cdna4.buffer_load(x_block_ptr, x_offs, cache=".cg")
+        else:
+            x_offs_n = pid_n * BLOCK_SIZE_N + local_n
+            x_mask = (x_offs_m < M)[:, None] & (x_offs_n < N)[None, :]
+            x = gl.amd.cdna4.buffer_load(x_block_ptr, x_offs, mask=x_mask, cache=".cg")
+
+        out_tensor, bs_e8m0 = _mxfp8_quant_op(
+            x, BLOCK_SIZE_N, BLOCK_SIZE_M, MXFP8_QUANT_BLOCK_SIZE
+        )
+
+        # Output is elementwise fp8 (1 byte/elem, not packed), so unlike MXFP4
+        # the output N-extent equals BLOCK_SIZE_N (not BLOCK_SIZE_N // 2).
+        out_m_local = gl.arange(0, BLOCK_SIZE_M)
+        out_n_local = gl.arange(0, BLOCK_SIZE_N)
+        out_offs_m = pid_m * BLOCK_SIZE_M + out_m_local
+        out_offs_n = pid_n * BLOCK_SIZE_N + out_n_local
+        out_block_offset = (pid_m * BLOCK_SIZE_M).to(gl.int64) * stride_x_fp8_m + (
+            pid_n * BLOCK_SIZE_N
+        ).to(gl.int64) * stride_x_fp8_n
+        out_block_ptr = x_fp8_ptr + out_block_offset
+        out_offs = (
+            out_m_local[:, None] * stride_x_fp8_m_in
+            + out_n_local[None, :] * stride_x_fp8_n_in
+        )
+
+        if EVEN_M_N:
+            gl.amd.cdna4.buffer_store(out_tensor, out_block_ptr, out_offs)
+        else:
+            out_mask = (out_offs_m < M)[:, None] & (out_offs_n < N)[None, :]
+            gl.amd.cdna4.buffer_store(
+                out_tensor, out_block_ptr, out_offs, mask=out_mask
+            )
+
+        bs_m_local = gl.arange(0, BLOCK_SIZE_M)
+        bs_n_local = gl.arange(0, NUM_QUANT_BLOCKS)
+        bs_offs_m = pid_m * BLOCK_SIZE_M + bs_m_local
+        bs_offs_n = pid_n * NUM_QUANT_BLOCKS + bs_n_local
+        bs_block_offset = (pid_m * BLOCK_SIZE_M).to(gl.int64) * stride_bs_m + (
+            pid_n * NUM_QUANT_BLOCKS
+        ).to(gl.int64) * stride_bs_n
+        bs_block_ptr = bs_ptr + bs_block_offset
+        bs_offs = (
+            bs_m_local[:, None] * stride_bs_m_in + bs_n_local[None, :] * stride_bs_n_in
+        )
+        if EVEN_M_N:
+            gl.amd.cdna4.buffer_store(bs_e8m0, bs_block_ptr, bs_offs)
+        else:
+            bs_mask = (bs_offs_m < M)[:, None] & (
+                bs_offs_n < (N + MXFP8_QUANT_BLOCK_SIZE - 1) // MXFP8_QUANT_BLOCK_SIZE
+            )[None, :]
+            gl.amd.cdna4.buffer_store(
+                bs_e8m0,
+                bs_block_ptr,
+                bs_offs,
+                mask=bs_mask,
+            )

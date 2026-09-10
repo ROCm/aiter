@@ -226,6 +226,13 @@ def torch_dequant_nvfp4(
         (256, 32),
         (160, 40),
         (280, 20),
+        # A few shapes spanning bench_quant_mxfp4_fp8.py's default range, plus
+        # non-power-of-2 shapes in between.
+        (8, 1024),
+        (2048, 3072),
+        (16384, 7168),
+        (6000, 5000),
+        (3333, 4004),
     ],
 )
 @pytest.mark.parametrize("dtype", [torch.bfloat16])

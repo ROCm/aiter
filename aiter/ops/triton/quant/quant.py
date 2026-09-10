@@ -6,9 +6,7 @@ import triton
 
 from aiter.ops.triton._gluon_kernels.gfx950.quant.quant import (
     gluon_dynamic_mxfp4_quant_kernel_gfx950,
-)
-from aiter.ops.triton._gluon_kernels.gfx1250.quant.quant import (
-    gluon_dynamic_mxfp4_quant_kernel_gfx1250,
+    gluon_dynamic_mxfp8_quant_kernel_gfx950,
 )
 from aiter.ops.triton._triton_kernels.quant.quant import (
     _dynamic_mxfp4_quant_kernel,
@@ -24,6 +22,7 @@ from aiter.ops.triton._triton_kernels.quant.quant import (
     _static_per_tensor_quant_fp8_i8_kernel,
 )
 from aiter.ops.triton.utils._triton import arch_info
+from aiter.ops.triton.utils.config_utils import load_config_json, resolve_config_dir
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 from aiter.ops.triton.utils.types import e4m3_dtype
 
@@ -169,6 +168,9 @@ def dynamic_mxfp4_quant(
             - etc.
     Returns:
         A tuple of (x_fp4, blockscale_e8m0).
+
+    On gfx950 with bf16 input, dispatches to a Gluon kernel using the native
+    hw-cvt instruction; other dtypes/archs use the plain Triton kernel.
     """
     _LOGGER.info(f"DYNAMIC_MXFP4_QUANT: x={tuple(x.shape)}")
     # Assume x is 2D-Tensor for now
@@ -185,44 +187,48 @@ def dynamic_mxfp4_quant(
         device=x.device,
     ).T
 
-    # for large N values
-    if M <= 32:
-        NUM_ITER = 1
-        BLOCK_SIZE_M = triton.next_power_of_2(M)
-        BLOCK_SIZE_N = 4096 // BLOCK_SIZE_M
-        NUM_WARPS = 4
-        NUM_STAGES = 1
-    else:
-        NUM_ITER = 2
-        BLOCK_SIZE_M = 64
-        BLOCK_SIZE_N = 64
-        NUM_WARPS = 4
-        NUM_STAGES = 2
-
-        if N <= 16384:
-            BLOCK_SIZE_M = 32
-            BLOCK_SIZE_N = 256
-
-    # for small N values
-    if N <= 1024:
-        NUM_ITER = 1
-        NUM_STAGES = 1
-        NUM_WARPS = 4
-        BLOCK_SIZE_N = min(128, triton.next_power_of_2(N))
-        # BLOCK_SIZE_N needs to be multiple of 32
-        BLOCK_SIZE_N = max(32, BLOCK_SIZE_N)
-        BLOCK_SIZE_M = min(32, triton.next_power_of_2(M))
-
-    grid = (
-        triton.cdiv(M, BLOCK_SIZE_M),
-        triton.cdiv(N, BLOCK_SIZE_N * NUM_ITER),
-    )
-    even_m_n = (M % BLOCK_SIZE_M == 0) and (N % (BLOCK_SIZE_N * NUM_ITER) == 0)
-
     # The gfx950 Gluon kernel dropped its sw (manual bit-manipulation)
     # fallback and always uses the hw-cvt instruction, which only supports
     # bf16 -- non-bf16 input falls through to the plain Triton path below.
     if arch_info.get_arch() == "gfx950" and x.dtype == torch.bfloat16:
+        cfg_dir = resolve_config_dir("quant", "MXFP4_QUANT", backend="gluon")
+        tuned = load_config_json(f"{cfg_dir}/DEFAULT.json")
+
+        if M <= 32:
+            bucket = tuned["M_LEQ_32"]
+            NUM_ITER = bucket["NUM_ITER"]
+            NUM_WARPS = bucket["NUM_WARPS"]
+            NUM_STAGES = bucket["NUM_STAGES"]
+            BLOCK_SIZE_M = triton.next_power_of_2(M)
+            BLOCK_SIZE_N = 4096 // BLOCK_SIZE_M
+        else:
+            bucket = tuned["default"]
+            NUM_ITER = bucket["NUM_ITER"]
+            BLOCK_SIZE_M = bucket["BLOCK_SIZE_M"]
+            BLOCK_SIZE_N = bucket["BLOCK_SIZE_N"]
+            NUM_WARPS = bucket["NUM_WARPS"]
+            NUM_STAGES = bucket["NUM_STAGES"]
+
+            if N <= 16384:
+                bucket = tuned["N_LEQ_16384"]
+                BLOCK_SIZE_M = bucket["BLOCK_SIZE_M"]
+                BLOCK_SIZE_N = bucket["BLOCK_SIZE_N"]
+
+        if N <= 1024:
+            bucket = tuned["N_LEQ_1024"]
+            NUM_ITER = bucket["NUM_ITER"]
+            NUM_WARPS = bucket["NUM_WARPS"]
+            NUM_STAGES = bucket["NUM_STAGES"]
+            # BLOCK_SIZE_N needs to be multiple of 32
+            BLOCK_SIZE_N = max(32, min(128, triton.next_power_of_2(N)))
+            BLOCK_SIZE_M = min(32, triton.next_power_of_2(M))
+
+        grid = (
+            triton.cdiv(M, BLOCK_SIZE_M),
+            triton.cdiv(N, BLOCK_SIZE_N * NUM_ITER),
+        )
+        even_m_n = (M % BLOCK_SIZE_M == 0) and (N % (BLOCK_SIZE_N * NUM_ITER) == 0)
+
         gluon_dynamic_mxfp4_quant_kernel_gfx950[grid](
             x,
             x_fp4,
@@ -243,27 +249,41 @@ def dynamic_mxfp4_quant(
             waves_per_eu=0,
         )
 
-    elif arch_info.get_arch() == "gfx1250":
-        gluon_dynamic_mxfp4_quant_kernel_gfx1250[grid](
-            x,
-            x_fp4,
-            blockscale_e8m0,
-            *x.stride(),
-            *x_fp4.stride(),
-            *blockscale_e8m0.stride(),
-            M=M,
-            N=N,
-            MXFP4_QUANT_BLOCK_SIZE=MXFP4_QUANT_BLOCK_SIZE,
-            EVEN_M_N=even_m_n,
-            SCALING_MODE=0,
-            NUM_ITER=NUM_ITER,
-            BLOCK_SIZE_M=BLOCK_SIZE_M,
-            BLOCK_SIZE_N=BLOCK_SIZE_N,
-            NUM_STAGES=NUM_STAGES,
-            num_warps=NUM_WARPS,
-            waves_per_eu=0,
-        )
     else:
+        # for large N values
+        if M <= 32:
+            NUM_ITER = 1
+            BLOCK_SIZE_M = triton.next_power_of_2(M)
+            BLOCK_SIZE_N = 4096 // BLOCK_SIZE_M
+            NUM_WARPS = 4
+            NUM_STAGES = 1
+        else:
+            NUM_ITER = 2
+            BLOCK_SIZE_M = 64
+            BLOCK_SIZE_N = 64
+            NUM_WARPS = 4
+            NUM_STAGES = 2
+
+            if N <= 16384:
+                BLOCK_SIZE_M = 32
+                BLOCK_SIZE_N = 256
+
+        # for small N values
+        if N <= 1024:
+            NUM_ITER = 1
+            NUM_STAGES = 1
+            NUM_WARPS = 4
+            BLOCK_SIZE_N = min(128, triton.next_power_of_2(N))
+            # BLOCK_SIZE_N needs to be multiple of 32
+            BLOCK_SIZE_N = max(32, BLOCK_SIZE_N)
+            BLOCK_SIZE_M = min(32, triton.next_power_of_2(M))
+
+        grid = (
+            triton.cdiv(M, BLOCK_SIZE_M),
+            triton.cdiv(N, BLOCK_SIZE_N * NUM_ITER),
+        )
+        even_m_n = (M % BLOCK_SIZE_M == 0) and (N % (BLOCK_SIZE_N * NUM_ITER) == 0)
+
         _dynamic_mxfp4_quant_kernel[grid](
             x,
             x_fp4,
@@ -305,6 +325,10 @@ def dynamic_mxfp8_quant(
         Tuple of:
             y: FP8 tensor of shape x.shape.
             s: e8m0 (uint8) scale tensor of shape (..., K // 32).
+
+    On gfx950 with bf16 input and quant_dtype=torch.float8_e4m3fn, dispatches to
+    a Gluon kernel using the native hw-cvt instruction; other combinations use
+    the plain Triton kernel.
     """
     assert x.dim() >= 2, f"x must be at least 2D, got {x.dim()}"
     orig_shape = x.shape
@@ -324,27 +348,90 @@ def dynamic_mxfp8_quant(
         assert scale.shape == (M, Ns), f"scale shape {scale.shape} != ({M},{Ns})"
         assert scale.dtype == torch.uint8
 
-    BLOCK_SIZE_N = triton.next_power_of_2(K)
-    # Bound launch overhead on large token-head batches; the kernel loops rows by stride.
-    NUM_PRGMS = min(M, 32768)
-    grid = (NUM_PRGMS,)
+    if (
+        arch_info.get_arch() == "gfx950"
+        and x.dtype == torch.bfloat16
+        and quant_dtype == torch.float8_e4m3fn
+    ):
+        cfg_dir = resolve_config_dir("quant", "MXFP8_QUANT", backend="gluon")
+        tuned = load_config_json(f"{cfg_dir}/DEFAULT.json")
 
-    _dynamic_mxfp8_quant_kernel[grid](
-        x2d,
-        y,
-        scale,
-        M,
-        K,
-        x2d.stride(0),
-        x2d.stride(1),
-        y.stride(0),
-        y.stride(1),
-        scale.stride(0),
-        scale.stride(1),
-        BLOCK_SIZE_N=BLOCK_SIZE_N,
-        QUANT_BLOCK_SIZE=_MXFP8_QUANT_BLOCK_SIZE,
-        NUM_PRGMS=NUM_PRGMS,
-    )
+        if M <= 32:
+            cfg = dict(tuned["M_LEQ_32"])
+            cfg["BLOCK_SIZE_M"] = triton.next_power_of_2(M)
+            cfg["BLOCK_SIZE_N"] = max(
+                32, min(4096 // cfg["BLOCK_SIZE_M"], triton.next_power_of_2(K))
+            )
+        else:
+            cfg = dict(tuned["default"])
+            if K <= 16384:
+                cfg.update(tuned["K_LEQ_16384"])
+                if M >= 8192:
+                    # Larger M benefits from bigger, fewer tiles.
+                    cfg.update(tuned["K_LEQ_16384_M_GEQ_8192"])
+                if K > 4096 and M >= 1024:
+                    # Wider K wants a bigger BLOCK_SIZE_N / fewer warps, but
+                    # only once M is large enough (regresses at M<1024 or
+                    # K<=4096).
+                    cfg.update(tuned["K_GT_4096_M_GEQ_1024"])
+
+        if K <= 1024:
+            # Narrow K: uncap BLOCK_SIZE_N to next_pow2(K) instead of capping
+            # at 128; drop NUM_WARPS once M is large enough to keep occupancy
+            # up despite grid_N collapsing to 1.
+            cfg.update(
+                tuned["K_LEQ_1024_M_GEQ_8192"] if M >= 8192 else tuned["K_LEQ_1024"]
+            )
+            cfg["BLOCK_SIZE_N"] = max(32, min(1024, triton.next_power_of_2(K)))
+
+        NUM_ITER = cfg["NUM_ITER"]
+        BLOCK_SIZE_M = cfg["BLOCK_SIZE_M"]
+        BLOCK_SIZE_N = cfg["BLOCK_SIZE_N"]
+        NUM_WARPS = cfg["NUM_WARPS"]
+
+        grid = (
+            triton.cdiv(M, BLOCK_SIZE_M),
+            triton.cdiv(K, BLOCK_SIZE_N * NUM_ITER),
+        )
+
+        gluon_dynamic_mxfp8_quant_kernel_gfx950[grid](
+            x2d,
+            y,
+            scale,
+            *x2d.stride(),
+            *y.stride(),
+            *scale.stride(),
+            M=M,
+            N=K,
+            BLOCK_SIZE_M=BLOCK_SIZE_M,
+            BLOCK_SIZE_N=BLOCK_SIZE_N,
+            NUM_ITER=NUM_ITER,
+            MXFP8_QUANT_BLOCK_SIZE=_MXFP8_QUANT_BLOCK_SIZE,
+            num_warps=NUM_WARPS,
+            waves_per_eu=0,
+        )
+    else:
+        BLOCK_SIZE_N = triton.next_power_of_2(K)
+        # Bound launch overhead on large token-head batches; the kernel loops rows by stride.
+        NUM_PRGMS = min(M, 32768)
+        grid = (NUM_PRGMS,)
+
+        _dynamic_mxfp8_quant_kernel[grid](
+            x2d,
+            y,
+            scale,
+            M,
+            K,
+            x2d.stride(0),
+            x2d.stride(1),
+            y.stride(0),
+            y.stride(1),
+            scale.stride(0),
+            scale.stride(1),
+            BLOCK_SIZE_N=BLOCK_SIZE_N,
+            QUANT_BLOCK_SIZE=_MXFP8_QUANT_BLOCK_SIZE,
+            NUM_PRGMS=NUM_PRGMS,
+        )
 
     y = y.view(*orig_shape[:-1], K)
     s = scale.view(*orig_shape[:-1], Ns)
