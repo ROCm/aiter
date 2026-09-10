@@ -31,6 +31,53 @@ _PUSH_PIPELINE_DEPTH = 16
 _OUT_CHANNEL_DEPTH = 1
 
 
+def make_fused_a2a_reuse_jit(*, rank, npes):
+    """Gate parity reuse on stream-ordered consumer completion at every rank."""
+
+    @flyc.kernel(known_block_size=[64, 1, 1])
+    def fused_a2a_reuse_barrier(
+        addr_ready_mem: fx.Int64,
+        addr_p2p_ready_mem: fx.Int64,
+        addr_ready_flag: fx.Int64,
+    ):
+        tid = fx.thread_idx.x
+        rsrc_p2p_ready = create_buffer_resource_from_addr(
+            addr_p2p_ready_mem, num_records_bytes=npes * 8
+        )
+        rsrc_ready_flag = create_buffer_resource_from_addr(
+            addr_ready_flag, num_records_bytes=8
+        )
+        generation = buffer_load(rsrc_ready_flag, 0, vec_width=1, dtype=T.i64)
+        if tid < npes:
+            remote_slot = (
+                buffer_load(rsrc_p2p_ready, tid, vec_width=1, dtype=T.i64)
+                + fx.Int64(rank) * 8
+            )
+            # Reaching this kernel drains earlier consumers on this stream.
+            store_i64_global_system(remote_slot, generation)
+            spin_until_ge_i64(addr_ready_mem + fx.Int64(tid) * 8, generation)
+            fence_system_acquire()
+        fx.barrier()
+        if tid == 0:
+            atomic_add_global_at(addr_ready_flag, fx.Int64(1))
+
+    key = (rank, npes, _JIT_SCHEMA_VERSION)
+
+    @flyc.jit
+    def launch(
+        addr_ready_mem: fx.Int64,
+        addr_p2p_ready_mem: fx.Int64,
+        addr_ready_flag: fx.Int64,
+        stream: Stream = Stream(None),  # noqa: B008
+    ):
+        _ = key
+        fused_a2a_reuse_barrier(
+            addr_ready_mem, addr_p2p_ready_mem, addr_ready_flag
+        ).launch(grid=(1, 1, 1), block=(64, 1, 1), stream=stream)
+
+    return launch
+
+
 def _int8_e8m0_scale(amax):
     # Match the symmetric INT8 codec's floor and exponent cap, not MXFP8's.
     need = (amax / fx.Float32(127.0)).maximumf(fx.Float32(1.0e-30))

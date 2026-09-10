@@ -22,6 +22,7 @@ from .fused_a2a_intranode_kernel import (
     make_fused_a2a_dequant_jit,
     make_fused_a2a_jit,
     make_fused_a2a_out_jit,
+    make_fused_a2a_reuse_jit,
 )
 
 _DEFAULT_BLOCK_NUM = 128
@@ -70,6 +71,8 @@ class FusedA2AIntraNodeOp:
     multiplier. FP8 Q/K rotate; INT8 do not. MX Q/K rotate and Q folds
     softmax_scale * log2(e).
     All ranks must use the same mode and serialize calls on one stream.
+    Consumers must finish on that stream before the next call reusing their
+    parity (two calls later); cross-stream consumers require an explicit join.
     """
 
     def __init__(
@@ -274,6 +277,13 @@ class FusedA2AIntraNodeOp:
                 numel=numel, return_mode=self.return_mode, codec=self.codecs
             )
         self.xdb_mem = mori_shmem_create_tensor((world_size,), torch.int64)
+        # Consumer-drain readiness is separate from producer-complete flags.
+        self.reuse_mem_sets = tuple(
+            mori_shmem_create_tensor((world_size,), torch.int64) for _ in range(2)
+        )
+        for ready_mem in self.reuse_mem_sets:
+            ready_mem.zero_()
+        self.reuse_flags = torch.ones(2, dtype=torch.int64, device=self.output.device)
         for scales in self.scales_sets:
             for scale, mode, codec in zip(scales, self.v4_output, self.codecs):
                 if mode == "k" and codec == "mxfp6":
@@ -303,8 +313,14 @@ class FusedA2AIntraNodeOp:
         self.p2p_xdb_mem = _build_p2p_table(
             self.xdb_mem, rank, world_size, self.output.device
         )
+        self.p2p_reuse_mem_sets = tuple(
+            _build_p2p_table(ready_mem, rank, world_size, self.output.device)
+            for ready_mem in self.reuse_mem_sets
+        )
         ms.shmem_barrier_all()
         self._epoch = 0
+        self._reuse_launch = make_fused_a2a_reuse_jit(rank=rank, npes=world_size)
+        self._reuse_compiled = None
 
         self.fuse_norm_rope = fuse_norm_rope
         roles = (
@@ -406,6 +422,21 @@ class FusedA2AIntraNodeOp:
         parity = self._epoch % 2
         outputs = self.outputs_sets[parity]
         stream = Stream(torch.cuda.current_stream() if stream is None else stream)
+        # Gate all writes, including per-tensor amax exchange, on consumer drain.
+        reuse_args = (
+            self.reuse_mem_sets[parity].data_ptr(),
+            self.p2p_reuse_mem_sets[parity].data_ptr(),
+            self.reuse_flags.data_ptr() + parity * self.reuse_flags.element_size(),
+            stream,
+        )
+        if self._reuse_compiled is None:
+            self._reuse_compiled = flyc.compile(
+                self._reuse_launch,
+                *(fx.Int64(arg) for arg in reuse_args[:-1]),
+                reuse_args[-1],
+            )
+        else:
+            self._reuse_compiled(*reuse_args)
         sync_args = (
             self.xdb_mem.data_ptr(),
             self.p2p_xdb_mem.data_ptr(),
