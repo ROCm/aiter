@@ -9,6 +9,7 @@ from collections import namedtuple
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
+from flydsl._mlir.dialects import llvm as llvm_dialect
 from flydsl.expr import arith, const_expr, range_constexpr, rocdl, tdm_ops
 from flydsl.expr.typing import Constexpr, T
 from flydsl.expr.typing import Vector as Vec
@@ -46,12 +47,15 @@ MMA_GROUP = int(os.environ.get("AITER_FLYDSL_MMA_GROUP", "10"))
 MMA_FIRST_GROUP = int(os.environ.get("AITER_FLYDSL_MMA_FIRST_GROUP", MMA_GROUP))
 DS_FIRST_N = int(os.environ.get("AITER_FLYDSL_DS_FIRST_N", "0"))
 WMMA_COLUMN_MAJOR = int(os.environ.get("AITER_FLYDSL_WMMA_COLUMN_MAJOR", "0"))
+SCALE_LO256 = int(os.environ.get("AITER_FLYDSL_SCALE_LO256", "0"))
 if MMA_GROUP < 1 or MMA_FIRST_GROUP < 1:
     raise ValueError("AITER_FLYDSL_MMA_GROUP values must be positive")
 if DS_FIRST_N < 0:
     raise ValueError("AITER_FLYDSL_DS_FIRST_N must be non-negative")
 if WMMA_COLUMN_MAJOR not in (0, 1):
     raise ValueError("AITER_FLYDSL_WMMA_COLUMN_MAJOR must be 0 or 1")
+if SCALE_LO256 not in (0, 1, 2):
+    raise ValueError("AITER_FLYDSL_SCALE_LO256 must be 0, 1, or 2")
 
 
 @flyc.jit
@@ -161,6 +165,7 @@ def launch_gemm_a8w4_tdm(
         MMA_FIRST_GROUP,
         DS_FIRST_N,
         WMMA_COLUMN_MAJOR,
+        SCALE_LO256,
     )
     _ = cache_tag
     if enable_ep_scatter:
@@ -247,12 +252,13 @@ def launch_gemm_a8w4_tdm(
     )
     _ds_first = f"_dsfirst{DS_FIRST_N}" if DS_FIRST_N else ""
     _column_major = "_colmma" if WMMA_COLUMN_MAJOR else ""
+    _scale_lo256 = f"_slo256m{SCALE_LO256}" if SCALE_LO256 else ""
     _kname = (
         f"a8w4_tdm_{_afp}"
         f"_t{tile_m}x{tile_n}x{tile_k}_w{m_warp}x{n_warp}"
         f"_b{num_buffers}_K{K}"
         f"{_grouped}{_act}{_bias}{_qout}{_cl}{_next_stage}{_waves_per_tensor}"
-        f"{_mma_group}{_ds_first}{_column_major}{_ep}"
+        f"{_mma_group}{_ds_first}{_column_major}{_scale_lo256}{_ep}"
     )
 
     @flyc.kernel(name=_kname, known_block_size=[block, 1, 1])
@@ -692,6 +698,18 @@ def launch_gemm_a8w4_tdm(
         # REUSE fence; the prefetch reads interleave evenly over the rest.
         FENCE_COVER_MMA = 8
 
+        def scale_lo256(value):
+            raw = value.ir_value()
+            return fx.Int32(
+                llvm_dialect.inline_asm(
+                    raw.type,
+                    [raw],
+                    "",
+                    "=v,0",
+                    has_side_effects=False,
+                )
+            )
+
         def mma_rows(wm_list, act, wt, sa_k, sb_k):
             for outer in range_constexpr(
                 wmma_n_rep if WMMA_COLUMN_MAJOR else len(wm_list)
@@ -704,6 +722,11 @@ def launch_gemm_a8w4_tdm(
                     wn_raw = outer if WMMA_COLUMN_MAJOR else inner
                     wn = (wmma_n_rep - 1 - wn_raw) if (wm % 2 == 1) else wn_raw
                     idx = wm * wmma_n_rep + wn
+                    scale_a = sb_k[wn if a_is_fp4 else wn // 2]
+                    scale_b = sa_k[wm // 2]
+                    if const_expr(SCALE_LO256 == 2):
+                        scale_a = scale_lo256(scale_a)
+                        scale_b = scale_lo256(scale_b)
                     if const_expr(a_is_fp4):
                         c_frags[idx].store(
                             rocdl.wmma_scale_f32_32x16x128_f4(
@@ -711,8 +734,8 @@ def launch_gemm_a8w4_tdm(
                                 wt[wn].load().ir_value(),
                                 act[i].load().ir_value(),
                                 c_frags[idx].load().ir_value(),
-                                sb_k[wn],
-                                sa_k[wm // 2],
+                                scale_a,
+                                scale_b,
                                 scaleAType=0,
                                 scaleBType=wm % 2,
                             )
@@ -724,8 +747,8 @@ def launch_gemm_a8w4_tdm(
                             wt[wn],
                             act[i],
                             c_frags[idx],
-                            scale_a=sb_k[wn // 2],
-                            scale_b=sa_k[wm // 2],
+                            scale_a=scale_a,
+                            scale_b=scale_b,
                         )
 
         DS_A = 2 if a_is_fp4 else 4
@@ -796,6 +819,31 @@ def launch_gemm_a8w4_tdm(
             if const_expr(load_nxt_fn is not None and not reuse_cur_rmem):
                 load_nxt_fn()
             sa_k, sb_k = cur_rmem.sa.load(), cur_rmem.sb.load()
+            if const_expr(SCALE_LO256 == 1):
+                # On gfx1250 LLVM maps the inline-asm "v" constraint to an
+                # aligned Lo256 VGPR class.  Tying input/output preserves the
+                # values while giving current scales a short, explicit low-bank
+                # interval immediately before their constrained WMMA uses.
+                sa_v = sa_k.ir_value()
+                sb_v = sb_k.ir_value()
+                sa_k = Vec(
+                    llvm_dialect.inline_asm(
+                        sa_v.type,
+                        [sa_v],
+                        "",
+                        "=v,0",
+                        has_side_effects=False,
+                    )
+                )
+                sb_k = Vec(
+                    llvm_dialect.inline_asm(
+                        sb_v.type,
+                        [sb_v],
+                        "",
+                        "=v,0",
+                        has_side_effects=False,
+                    )
+                )
             if const_expr(WMMA_COLUMN_MAJOR):
                 mma_rows(
                     list(range(wmma_m_rep)), cur_rmem.a, cur_rmem.b, sa_k, sb_k

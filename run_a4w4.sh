@@ -9,6 +9,7 @@
   AITER_FLYDSL_MMA_GROUP=${AITER_FLYDSL_MMA_GROUP:-10} \
   AITER_FLYDSL_DS_FIRST_N=${AITER_FLYDSL_DS_FIRST_N:-1} \
   AITER_FLYDSL_WMMA_COLUMN_MAJOR=${AITER_FLYDSL_WMMA_COLUMN_MAJOR:-1} \
+  AITER_FLYDSL_SCALE_LO256=${AITER_FLYDSL_SCALE_LO256:-2} \
   python3 -u op_tests/test_flydsl_grouped_gemm_gfx1250.py \
     --scenario kernel \
     --data-format a4w4 \
