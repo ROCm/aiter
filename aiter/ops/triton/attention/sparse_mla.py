@@ -79,20 +79,22 @@ def _infer_cache_format(kv, d_qk, kv_lora_rank, qk_rope_head_dim, kv_scale):
         assert kv_scale.dtype == torch.float32
         u8 = kv.view(torch.uint8)
         fnuz = kv.dtype == torch.float8_e4m3fnuz
-        return "tensor", u8, u8, kv_scale.reshape(1), 1, fnuz
+        return "fp8_scalar", u8, u8, kv_scale.reshape(1), 1, fnuz
     if (
         kv.ndim == 3
         and kv.element_size() == 1
         and kv.shape[2]
         == kv_lora_rank + 4 * (kv_lora_rank // 128) + 2 * qk_rope_head_dim
     ):
-        # vLLM fp8_ds_mla: 512 fp8 | 4 f32 per-128 scales | 64 bf16 rope = 656 B
+        # fp8_dsv32_mla: 512 fp8 | 4 f32 per-128 scales | 64 bf16 rope = 656 B.
+        # This is vLLM's fp8_ds_mla on V3.2 / Kimi-K3; the same vLLM name also
+        # covers V4's 584 B layout (fp8_dsv4_mla), hence the explicit generation.
         u8 = kv if kv.dtype == torch.uint8 else kv.view(torch.uint8)
         assert (
             u8.stride(2) == 1 and u8.stride(1) == u8.shape[2]
-        ), "fp8_ds_mla rows must be contiguous 656-byte records"
+        ), "fp8_dsv32_mla rows must be contiguous 656-byte records"
         return (
-            "dsmla",
+            "fp8_dsv32_mla",
             u8,
             u8.view(torch.bfloat16),
             u8.view(torch.float32),
@@ -163,9 +165,9 @@ def _resolve_dot_precision(dot_precision: str, fmt: str, fp8_fnuz: bool) -> bool
         )
     if dot_precision == "bf16":
         return False
-    if fmt == "dsmla":
+    if fmt == "fp8_dsv32_mla":
         raise ValueError(
-            "dot_precision='fp8' does not support the fp8_ds_mla cache."
+            "dot_precision='fp8' does not support the fp8_dsv32_mla cache."
             "Use dot_precision='bf16'."
         )
     if fmt == "bf16":
@@ -205,7 +207,8 @@ def sparse_mla_fwd(
             the QK contraction becomes a single dot over kv_lora_rank.
         kv_buffer: the KV pool [nb, block, R] / [slots, 1, 1, R] /
             [slots, R] in bf16, the same shapes in fp8 (+ scalar
-            kv_scale), or [nb, block, 656] uint8 (vLLM ``fp8_ds_mla``).
+            kv_scale), or [nb, block, 656] uint8 (``fp8_dsv32_mla``, which is
+            vLLM's ``fp8_ds_mla`` on DeepSeek-V3.2 / Kimi-K3).
         kv_indptr: ``[C + 1]`` int32 prefix sum of per-query index counts.
         kv_indices: flat int32 GLOBAL slot ids into the pool.
         softmax_scale: the layer's softmax scale.
@@ -394,7 +397,7 @@ def sparse_mla_fwd(
         part_m,
         part_l,
         part_acc,
-        scl,  # f32 side-channel: k_scale ("tensor") / f32 view ("dsmla")
+        scl,  # f32 side-channel: k_scale ("fp8_scalar") / f32 view ("fp8_dsv32_mla")
         scl,
         float(softmax_scale),
         q.stride(0),

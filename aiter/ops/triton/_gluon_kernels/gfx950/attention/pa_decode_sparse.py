@@ -14,20 +14,22 @@ One kernel serves two geometries, selected by the ROPE_SEPARATE constexpr:
         K-only rope and the QK contraction chains a second MFMA into the first.
         The KV buffer is the entire V in both geometries.
 
-Cache formats (Fmt.KIND), per segment:
+Cache formats (Fmt.KIND), per segment. The two packed kinds are both vLLM's
+``--kv-cache-dtype fp8_ds_mla``, which is one name for two byte layouts
+distinguished by model generation, so they carry the generation instead:
 
-    "bf16"     full-row bf16
-    "dsv4"     448 fp8 | 64 bf16 rope (576 B rows) + 8 B UE8M0-per-64 trailer
-    "uniform"  whole-row fp8 + separate f32 per-64 kv_scales
-    "tensor"   whole-row fp8 + a single per-tensor f32 scale (k_scale). The
-               scale never touches the tile loop: K-side folds into qk_scale,
-               V-side into p.
-    "dsmla"    vLLM fp8_ds_mla: 512 fp8 | 4 f32 per-128 scales | 64 bf16 rope
-               (656 B rows); requires ROPE_SEPARATE.
-
-Launchers:
-aiter/ops/triton/attention/pa_decode_sparse.py (DSv4 / uniform pool) and
-aiter/ops/triton/attention/sparse_mla.py (separated-rope MLA).
+    "bf16"            full-row bf16
+    "fp8_scalar"      whole-row fp8 + a single per-tensor f32 scale (k_scale).
+                      The scale never touches the tile loop: K-side folds into
+                      qk_scale, V-side into p.
+    "fp8_g64"         whole-row fp8 + separate f32 per-64 kv_scales
+    "fp8_dsv4_mla"    DeepSeek-V4, 584 B per token: 448 fp8 | 64 bf16 rope
+                      (576 B data rows) + an 8 B UE8M0-per-64 trailer after the
+                      block's rows (7 scales + 1 B pad). Rope lives inside the
+                      512-wide head dim, so V is the whole row.
+    "fp8_dsv32_mla"   DeepSeek-V3.2 (also Kimi-K3), 656 B per token, token-major
+                      records: 512 fp8 | 4 f32 per-128 scales | 64 bf16 rope.
+                      Rope is appended, so this requires ROPE_SEPARATE.
 """
 
 from triton.experimental import gluon
@@ -253,7 +255,7 @@ class Cfg:
     HAS_INVALID: gl.constexpr
     HEAD_ALIGNED: gl.constexpr
     IDX_BUFFER_LOAD: gl.constexpr
-    FP8_MFMA: gl.constexpr  # "tensor" only: feed the matrix core the cache's
+    FP8_MFMA: gl.constexpr  # "fp8_scalar" only: feed the matrix core the cache's
     # own fp8 instead of dequantizing to bf16
     # Cache policy per load site
     GATHER_CACHE: gl.constexpr
@@ -454,7 +456,9 @@ class Cfg:
 class Fmt:
     """Compile-time description of one segment's cache format."""
 
-    KIND: gl.constexpr  # "bf16" | "dsv4" | "uniform" | "tensor" | "dsmla"
+    # "bf16" | "fp8_scalar" | "fp8_g64"
+    # | "fp8_dsv4_mla" (584 B/token) | "fp8_dsv32_mla" (656 B/token)
+    KIND: gl.constexpr
     IS_FP8: gl.constexpr  # pipeline select: prefetched fp8 loop vs bf16 loop
     BLOCK_SIZE: gl.constexpr
     USE_BUFFER_LOAD: gl.constexpr
@@ -501,7 +505,7 @@ class Fmt:
 
         KV_DIM = cfg.KV_DIM.value
         ROPE_DIM = cfg.ROPE_DIM.value
-        GROUP = 128 if KIND == "dsmla" else 64
+        GROUP = 128 if KIND == "fp8_dsv32_mla" else 64
         NG = KV_DIM // GROUP
         self.GROUP = gl.constexpr(GROUP)
         self.NG = gl.constexpr(NG)
@@ -527,16 +531,16 @@ class Fmt:
 
         # dsv4 row: [NOPE_DIM fp8 | ROPE_DIM bf16] + 8 B UE8M0 per token after
         # the block; dsmla row: [KV_DIM fp8 | NG f32 | ROPE_DIM bf16] inline.
-        if KIND == "dsv4":
+        if KIND == "fp8_dsv4_mla":
             TOK_U8 = NOPE_DIM + 2 * ROPE_DIM  # 448 + 128 = 576
-        elif KIND == "dsmla":
+        elif KIND == "fp8_dsv32_mla":
             TOK_U8 = KV_DIM + 4 * NG + 2 * ROPE_DIM  # 512 + 16 + 128 = 656
         else:
             TOK_U8 = 0
         self.TOK_U8 = gl.constexpr(TOK_U8)
         self.TOK_U16 = gl.constexpr(TOK_U8 // 2)
         self.ROPE_U16_OFF = gl.constexpr(
-            (NOPE_DIM // 2) if KIND == "dsv4" else ((KV_DIM + 4 * NG) // 2)
+            (NOPE_DIM // 2) if KIND == "fp8_dsv4_mla" else ((KV_DIM + 4 * NG) // 2)
         )
         self.SCL_TRAILER_U8 = gl.constexpr(8)
         self.TOK_F32 = gl.constexpr(TOK_U8 // 4)
@@ -544,7 +548,7 @@ class Fmt:
         # Flat formats gather in cache elements: KV_DIM wide, plus the appended
         # rope when the geometry separates it.
         self.TOK_EL = gl.constexpr(
-            KV_DIM + (ROPE_DIM if cfg.ROPE_SEPARATE.value and KIND != "uniform" else 0)
+            KV_DIM + (ROPE_DIM if cfg.ROPE_SEPARATE.value and KIND != "fp8_g64" else 0)
         )
 
 
@@ -554,12 +558,12 @@ class Seg:
     """Runtime context of one segment. Pointer roles by format ("--" = unused
     duplicate):
 
-        KIND      cache_ptr        alt_ptr                  scl_ptr
-        bf16      --               bf16 cache               --
-        dsv4      u8 cache         bf16 view of the cache   --
-        uniform   u8 cache         f32 per-64 kv_scales     --
-        tensor    u8 cache         --                       f32 scalar k_scale
-        dsmla     u8 cache         bf16 view (rope tail)    f32 view (scales)
+        KIND             cache_ptr   alt_ptr                 scl_ptr
+        bf16             --          bf16 cache              --
+        fp8_scalar       u8 cache    --                      f32 scalar k_scale
+        fp8_g64          u8 cache    f32 per-64 kv_scales    --
+        fp8_dsv4_mla     u8 cache    bf16 view of the cache  --
+        fp8_dsv32_mla    u8 cache    bf16 view (rope tail)   f32 view (scales)
     """
 
     fmt: Fmt
@@ -589,7 +593,7 @@ class Seg:
 def _deq_store(x_u8, sc, kv_smem, off, cfg, fmt, AXIS: gl.constexpr):
     """Dequant one fp8 slab into kv_smem[:, off:off+W]. Dequant stays in f32
     (gfx950 has no bf16 multiply). sc: raw UE8M0 byte (dsv4), f32 scale
-    (uniform/dsmla), or unused ("tensor": bare fp8 -> bf16 convert)."""
+    (uniform/dsmla), or unused ("fp8_scalar": bare fp8 -> bf16 convert)."""
     if fmt.ASM_DEQ:
         # x_u8 is the int16 view here (see _gather_full), so its column count is W8/2.
         W8: gl.constexpr = x_u8.shape[1] * 2
@@ -603,10 +607,10 @@ def _deq_store(x_u8, sc, kv_smem, off, cfg, fmt, AXIS: gl.constexpr):
         else:
             kv_smem.slice(off, x_u8.shape[0], dim=0).store(val)
     else:
-        if fmt.KIND == "tensor":
+        if fmt.KIND == "fp8_scalar":
             val = _fp8_to_bf16(x_u8, fmt.FP8_FNUZ)
         else:
-            if fmt.KIND == "uniform" or fmt.KIND == "dsmla":
+            if fmt.KIND == "fp8_g64" or fmt.KIND == "fp8_dsv32_mla":
                 scale = sc
             else:
                 scale = gl.exp2(sc.to(gl.float32) - 127.0)
@@ -897,7 +901,7 @@ def _gather_full(
         False,
         cfg.UNI_TILE,
     )
-    if fmt.KIND == "uniform":
+    if fmt.KIND == "fp8_g64":
         NGRP: gl.constexpr = cfg.KV_DIM // 64
         x_u8 = _cache_load(
             seg.cache_ptr,
@@ -914,7 +918,7 @@ def _gather_full(
             CACHE=cfg.GATHER_CACHE,
         )
         k_rope = x_u8  # no rope side-channel -> DCE'd
-    elif fmt.KIND == "tensor":
+    elif fmt.KIND == "fp8_scalar":
         # Per-tensor scale is folded outside the loop (qk_scale / p), so this
         # is a bare gather; the K-only rope tail follows when separated.
         x_u8 = _cache_load(
@@ -944,7 +948,7 @@ def _gather_full(
             )
         else:
             k_rope = x_u8  # rope lives inside the KV buffer -> DCE'd
-    elif fmt.KIND == "dsmla":
+    elif fmt.KIND == "fp8_dsv32_mla":
         nope_row = bg * cs0 + pg * fmt.TOK_U8
         scl_row = bg * (cs0 // 4) + pg * fmt.TOK_F32 + fmt.SCL_F32_OFF
         # Scales issue before the bulk fp8: vmcnt is one in-order FIFO, so
@@ -994,7 +998,7 @@ def _gather_full(
             fmt.USE_BUFFER_LOAD,
             CACHE=cfg.GATHER_CACHE,
         )
-    else:  # "dsv4"
+    else:  # "fp8_dsv4_mla"
         nope_row = bg * cs0 + pg * fmt.TOK_U8
         scl_row = bg * cs0 + fmt.BLOCK_SIZE * fmt.TOK_U8 + pg * fmt.SCL_TRAILER_U8
         # Scales first (vmcnt FIFO; see the dsmla branch).
@@ -1061,7 +1065,7 @@ def _gather_full(
 @gluon.jit
 def _stage(cfg, seg, x_u8, sc, k_rope, kv_smem, rope_smem):
     """Write one prefetched tile into the LDS buffer(s). The KV buffer is always the
-    full KV_DIM-wide dequant: "dsv4" gathers KV_DIM bytes too, the last 64 being
+    full KV_DIM-wide dequant: "fp8_dsv4_mla" gathers KV_DIM bytes too, the last 64 being
     bf16 rope read as garbage fp8 and overwritten by the slice-store below, so
     the gather stays pow-2 wide."""
     fmt = seg.fmt
@@ -1074,13 +1078,13 @@ def _stage(cfg, seg, x_u8, sc, k_rope, kv_smem, rope_smem):
             rope_smem.store(k_rope.to(gl.float8e4nv, bitcast=True))
     else:
         _deq_store_tile(x_u8, sc, kv_smem, cfg, fmt)
-        if fmt.KIND == "dsv4":
+        if fmt.KIND == "fp8_dsv4_mla":
             kv_smem.slice(fmt.NOPE_DIM, cfg.ROPE_DIM, dim=1).store(k_rope)
-        elif fmt.KIND == "dsmla":
+        elif fmt.KIND == "fp8_dsv32_mla":
             rope_smem.store(k_rope)
-        elif fmt.KIND == "tensor" and cfg.ROPE_SEPARATE:
+        elif fmt.KIND == "fp8_scalar" and cfg.ROPE_SEPARATE:
             rope_smem.store(_fp8_to_bf16(k_rope, fmt.FP8_FNUZ))
-        # "uniform": the whole head is one fp8 tile; nothing else to store.
+        # "fp8_g64": the whole head is one fp8 tile; nothing else to store.
 
 
 @gluon.jit
@@ -1178,7 +1182,7 @@ def _qkpv_lds(
             ]
         S = gl.where(col_mask, S, neg_inf)
     # Online softmax in the base-2 exponent domain; m_i carries qk_scale
-    # (= scale * log2e [* k_scale for "tensor"]). max commutes with a positive
+    # (= scale * log2e [* k_scale for "fp8_scalar"]). max commutes with a positive
     # scale, so scale the row max instead of every element of S; what is left,
     # S * qk_scale - m_new, lowers to one FMA, and -inf columns stay -inf.
     m_block = _rmax(S, 1) * qk_scale
@@ -1193,9 +1197,9 @@ def _qkpv_lds(
         v = kv_smem.load(cfg.v_layout)
     if cfg.ASYNC_LDS:
         v = v.to(gl.float8e4nv, bitcast=True)
-    # "tensor": V was staged as raw fp8 code points; apply the per-tensor scale
+    # "fp8_scalar": V was staged as raw fp8 code points; apply the per-tensor scale
     # on the small side (p) and leave l scale-free: out = sum(p*s*V)/l exactly.
-    if seg.fmt.KIND == "tensor" and not cfg.FP8_MFMA:
+    if seg.fmt.KIND == "fp8_scalar" and not cfg.FP8_MFMA:
         p = p * v_scale
     if cfg.FP8_MFMA:
         p_dot = gl.convert_layout(p.to(gl.float8e4nv), cfg.p_layout)
@@ -1257,7 +1261,7 @@ def _decode_tile(
     if MASKED:
         valid_g = gl.convert_layout(valid1d, gl.SliceLayout(1, cfg.gather_l))
 
-    if fmt.KIND == "uniform":
+    if fmt.KIND == "fp8_g64":
         NGRP: gl.constexpr = cfg.KV_DIM // 64
         kv_row = block_idx_g * cs0 + pos_g * cfg.KV_DIM
         scl_row = block_idx_g * NGRP
@@ -1297,7 +1301,7 @@ def _decode_tile(
                 CACHE=cfg.GATHER_CACHE,
             )
         _deq_store_tile(x_u8, sc, kv_smem, cfg, fmt)
-    elif fmt.KIND == "dsv4":
+    elif fmt.KIND == "fp8_dsv4_mla":
         nope_row = block_idx_g * cs0 + pos_g * fmt.TOK_U8
         scl_row = (
             block_idx_g * cs0 + fmt.BLOCK_SIZE * fmt.TOK_U8 + pos_g * fmt.SCL_TRAILER_U8
@@ -1504,7 +1508,7 @@ def _decode_tile(
     l_new = l_i * alpha + gl.sum(p, axis=1)
 
     v = kv_smem.load(cfg.v_layout)  # [BLOCK_K, KV_DIM]
-    if seg.fmt.KIND == "tensor":
+    if seg.fmt.KIND == "fp8_scalar":
         p = p * v_scale  # per-tensor V scale on the small side (see _qkpv)
     p_dot = gl.convert_layout(p.to(gl.bfloat16), cfg.p_layout)
     alpha_pv = gl.convert_layout(alpha, gl.SliceLayout(1, cfg.pv_layout))
@@ -1681,7 +1685,7 @@ def _pa_decode_sparse(
     # cache pointers are the same allocation under different element types;
     # which of them is live depends on the format (see Seg).
     main_cache_ptr,  # main (SWA) cache, u8 view
-    main_cache_bf16_ptr,  # bf16 view of it, or the f32 scale pool ("uniform")
+    main_cache_bf16_ptr,  # bf16 view of it, or the f32 scale pool ("fp8_g64")
     main_indices_ptr,  # [nnz_main] int32 row ids
     main_indptr_ptr,  # [C + 1] int32
     extra_cache_ptr,  # top-k segment; aliases main when HAS_EXTRA=False
@@ -1695,8 +1699,8 @@ def _pa_decode_sparse(
     part_m_ptr,  # [C, NUM_SPLITS, H] f32 row max, base-2 domain
     part_l_ptr,  # [C, NUM_SPLITS, H] f32 row sum
     part_acc_ptr,  # [C, NUM_SPLITS, H, S] bf16 or f32, un-normalized
-    # f32 side-channel per segment: scalar k_scale ("tensor") or f32 cache view
-    # ("dsmla"). None elides the argument, keeping other formats' kernarg
+    # f32 side-channel per segment: scalar k_scale ("fp8_scalar") or f32 cache view
+    # ("fp8_dsv32_mla"). None elides the argument, keeping other formats' kernarg
     # layouts unchanged.
     main_scl_ptr,
     extra_scl_ptr,
@@ -1777,20 +1781,20 @@ def _pa_decode_sparse(
     un-normalized partials for the reduce kernel."""
     NUM_WARPS: gl.constexpr = gl.num_warps()
     gl.static_assert(
-        UNI_TILE or (MAIN_FMT != "tensor" and MAIN_FMT != "dsmla"),
+        UNI_TILE or (MAIN_FMT != "fp8_scalar" and MAIN_FMT != "fp8_dsv32_mla"),
         "tensor/dsmla formats require UNI_TILE=1",
     )
     gl.static_assert(
-        UNI_TILE or (EXTRA_FMT != "tensor" and EXTRA_FMT != "dsmla"),
+        UNI_TILE or (EXTRA_FMT != "fp8_scalar" and EXTRA_FMT != "fp8_dsv32_mla"),
         "tensor/dsmla formats require UNI_TILE=1",
     )
     gl.static_assert(
-        (not ROPE_SEPARATE) or (MAIN_FMT != "dsv4" and MAIN_FMT != "uniform"),
+        (not ROPE_SEPARATE) or (MAIN_FMT != "fp8_dsv4_mla" and MAIN_FMT != "fp8_g64"),
         "dsv4/uniform formats carry rope inside the KV buffer (ROPE_SEPARATE=False)",
     )
     gl.static_assert(
-        MAIN_FMT != "dsmla" or ROPE_SEPARATE,
-        "fp8_ds_mla is a separated-rope (MLA) format",
+        MAIN_FMT != "fp8_dsv32_mla" or ROPE_SEPARATE,
+        "fp8_dsv32_mla is a separated-rope (MLA) format",
     )
     # No rope means no rope buffer, and the packed formats all define a rope tail.
     gl.static_assert(
@@ -1800,14 +1804,18 @@ def _pa_decode_sparse(
     gl.static_assert(
         ROPE_DIM > 0
         or (
-            MAIN_FMT != "dsv4"
-            and MAIN_FMT != "dsmla"
-            and (not HAS_EXTRA or (EXTRA_FMT != "dsv4" and EXTRA_FMT != "dsmla"))
+            MAIN_FMT != "fp8_dsv4_mla"
+            and MAIN_FMT != "fp8_dsv32_mla"
+            and (
+                not HAS_EXTRA
+                or (EXTRA_FMT != "fp8_dsv4_mla" and EXTRA_FMT != "fp8_dsv32_mla")
+            )
         ),
-        "dsv4/fp8_ds_mla rows carry a rope tail; ROPE_DIM=0 is inconsistent",
+        "fp8_dsv4_mla/fp8_dsv32_mla rows carry a rope tail; ROPE_DIM=0 is "
+        "inconsistent",
     )
     gl.static_assert(
-        (not ASM_DEQ) or MAIN_FMT == "dsv4" or EXTRA_FMT == "dsv4",
+        (not ASM_DEQ) or MAIN_FMT == "fp8_dsv4_mla" or EXTRA_FMT == "fp8_dsv4_mla",
         "ASM_DEQ is the dsv4 E8M0 dequant",
     )
     # The fp8 path needs one positive scalar scale per cache, since that is what
@@ -1815,7 +1823,7 @@ def _pa_decode_sparse(
     # core reads.
     gl.static_assert(
         (not FP8_MFMA)
-        or (MAIN_FMT == "tensor" and (not HAS_EXTRA or EXTRA_FMT == "tensor")),
+        or (MAIN_FMT == "fp8_scalar" and (not HAS_EXTRA or EXTRA_FMT == "fp8_scalar")),
         "FP8_MFMA requires the per-tensor fp8 format on every segment",
     )
     gl.static_assert(not (FP8_MFMA and FP8_FNUZ), "FP8_MFMA is OCP e4m3 only")
@@ -1869,7 +1877,7 @@ def _pa_decode_sparse(
         MAIN_BLOCK_SIZE,
         MAIN_USE_BUFFER_LOAD,
         FP8_FNUZ,
-        ASM_DEQ and MAIN_FMT == "dsv4",
+        ASM_DEQ and MAIN_FMT == "fp8_dsv4_mla",
         NOPE_DIM,
         NOPE_CHUNK,
         CHUNK_AXIS,
@@ -1880,7 +1888,7 @@ def _pa_decode_sparse(
         EXTRA_BLOCK_SIZE,
         EXTRA_USE_BUFFER_LOAD,
         FP8_FNUZ,
-        ASM_DEQ and EXTRA_FMT == "dsv4",
+        ASM_DEQ and EXTRA_FMT == "fp8_dsv4_mla",
         NOPE_DIM,
         NOPE_CHUNK,
         CHUNK_AXIS,
@@ -1907,13 +1915,13 @@ def _pa_decode_sparse(
     qk_scale = scale * RCP_LN2
     main_qk_scale = qk_scale
     main_v_scale = 1.0
-    if MAIN_FMT == "tensor":
+    if MAIN_FMT == "fp8_scalar":
         main_k_scale = gl.load(main_scl_ptr)
         main_qk_scale = qk_scale * main_k_scale
         main_v_scale = main_k_scale
     extra_qk_scale = qk_scale
     extra_v_scale = 1.0
-    if HAS_EXTRA and EXTRA_FMT == "tensor":
+    if HAS_EXTRA and EXTRA_FMT == "fp8_scalar":
         extra_k_scale = gl.load(extra_scl_ptr)
         extra_qk_scale = qk_scale * extra_k_scale
         extra_v_scale = extra_k_scale
@@ -2051,7 +2059,7 @@ def _pa_decode_sparse(
         main_fmt,
         main_cache_ptr,
         main_cache_bf16_ptr,
-        main_scl_ptr if (MAIN_FMT == "dsmla") else main_cache_ptr,
+        main_scl_ptr if (MAIN_FMT == "fp8_dsv32_mla") else main_cache_ptr,
         main_indices_ptr,
         main_start,
         main_cs0,
@@ -2100,7 +2108,7 @@ def _pa_decode_sparse(
             extra_fmt,
             extra_cache_ptr,
             extra_cache_bf16_ptr,
-            extra_scl_ptr if (EXTRA_FMT == "dsmla") else extra_cache_ptr,
+            extra_scl_ptr if (EXTRA_FMT == "fp8_dsv32_mla") else extra_cache_ptr,
             extra_indices_ptr,
             extra_start,
             extra_cs0,

@@ -1,17 +1,10 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Sparse paged-decode attention over a unified KV pool with per-token paged
-indices. See ``_triton_kernels/attention/pa_decode_sparse.py`` for the
-kernels' caller contract.
+"""Sparse paged-decode attention over a unified or split KV pool with per-token paged
+indices.
 
-This module exposes ``pa_decode_sparse`` — a 3D split-K + widened-BLOCK_H
-+ pipelined-K-loop variant suitable for sparse decode (e.g. V4 top-k gather)
-where each token's K range is an unordered subset of a unified KV pool.
-
-On gfx950 (CDNA4) DeepSeek-V4 sparse-MLA decode has a dedicated gluon
-implementation (bottom of this module): ``pa_decode_sparse`` routes all formats
-to the merged ``_pa_decode_sparse_gfx950_gluon`` driver.
+TODO: add details once API has settled
 """
 
 import math
@@ -110,7 +103,8 @@ def pa_decode_sparse(
             two-loop's second (top-k) cache + index set; must be None otherwise.
 
     On gfx950 the DSv4 gluon driver handles this: a 3D ``unified_kv`` selects the
-    packed fp8_ds_mla / bf16 block cache (``extra_*`` = the two-loop), a 2D one the
+    packed fp8_dsv4_mla (584 B rows) / bf16 block cache (``extra_*`` = the
+    two-loop), a 2D one the
     uniform pool (``kv_scales`` present = fp8). ``kv_splits``/``skip_reduce`` are
     honored; ``block_h`` and fp16 ``q`` fall through to the triton path.
 
@@ -134,7 +128,7 @@ def pa_decode_sparse(
         raise RuntimeError(f"pa_decode_sparse expects fp16/bf16 q, got {q.dtype}")
 
     # gfx950: route to the merged DSv4 sparse-MLA gluon driver. Format is inferred
-    # from the cache: 3D -> packed fp8_ds_mla / bf16 block cache (optional SWA+top-k
+    # from the cache: 3D -> packed fp8_dsv4_mla / bf16 block cache (optional SWA+top-k
     # two-loop via extra_*); 2D -> uniform pool (OCP fp8 + fp32 kv_scales, or bf16).
     # kv_splits and skip_reduce are honored here; block_h and fp16 q fall through to
     # the triton path below (the gluon kernel is bf16-only: bf16 LDS + bf16 MFMA).
@@ -474,7 +468,7 @@ def _pa_decode_sparse_gfx950_gluon(
     fp8_fnuz=False,
 ):
     """Merged gfx950 gluon DSv4 sparse-MLA decode driver. Format from cache.ndim:
-    3D [nb, block, ...] -> packed fp8_ds_mla (uint8: 448 NoPE fp8 e4m3 OCP +
+    3D [nb, block, 584] -> packed fp8_dsv4_mla (uint8: 448 NoPE fp8 e4m3 OCP +
                            embedded UE8M0 per-64 scale + 64 RoPE bf16) or a bf16
                            block cache; pass extra_* for the SWA+top-k two-loop,
                            else a single segment.
@@ -510,7 +504,7 @@ def _pa_decode_sparse_gfx950_gluon(
     if cache.ndim == 2:
         # uniform pool: one fp8 gather over the whole head + separate fp32 scales,
         # or bf16. page_size=1 -> block_idx=slot, pos=0; scales ride the bf16 ptr.
-        UNIFORM = True
+        FLAT_POOL = True
         main_is_fp8 = cache.dtype == torch.uint8
         if main_is_fp8:
             assert cache_scales is not None and cache_scales.dtype == torch.float32
@@ -532,8 +526,10 @@ def _pa_decode_sparse_gfx950_gluon(
         avg_main = indices.numel() / max(1, num_queries)  # one segment; no extra
         avg_extra = 0.0
     else:
-        # packed fp8_ds_mla [nb, block, 584] (embedded scale) or bf16 block cache.
-        UNIFORM = False
+        # packed fp8_dsv4_mla [nb, block, 584] (UE8M0 block trailer) or bf16 block
+        # cache. NB: vLLM's fp8_ds_mla also names the 656 B V3.2 layout, which is
+        # fp8_dsv32_mla and reaches the kernel through sparse_mla.py instead.
+        FLAT_POOL = False
         main_is_fp8 = cache.dtype == torch.uint8
         main_bf16 = cache.view(torch.bfloat16) if main_is_fp8 else cache
         has_extra = (
@@ -556,12 +552,12 @@ def _pa_decode_sparse_gfx950_gluon(
         avg_extra = extra_indices.numel() / max(1, num_queries) if has_extra else 0.0
 
     # Kernel-side cache-format tags (kernel shared with sparse_mla.py).
-    if UNIFORM:
-        main_fmt = "uniform" if main_is_fp8 else "bf16"
+    if FLAT_POOL:
+        main_fmt = "fp8_g64" if main_is_fp8 else "bf16"
         extra_fmt = main_fmt
     else:
-        main_fmt = "dsv4" if main_is_fp8 else "bf16"
-        extra_fmt = "dsv4" if extra_is_fp8 else "bf16"
+        main_fmt = "fp8_dsv4_mla" if main_is_fp8 else "bf16"
+        extra_fmt = "fp8_dsv4_mla" if extra_is_fp8 else "bf16"
 
     # Alignment hint for the page strides so row gathers can vectorize: the largest
     # power of 2 (<= 16) dividing both.
@@ -656,7 +652,7 @@ def _pa_decode_sparse_gfx950_gluon(
     adaptive_splits = num_splits > 1
 
     # Fuse the fp8 x E8M0 dequant into v_cvt_scalef32_pk_bf16_fp8 via inline asm
-    asm_deq = one_wg_per_cu and not UNIFORM and not fp8_fnuz and main_is_fp8
+    asm_deq = one_wg_per_cu and not FLAT_POOL and not fp8_fnuz and main_is_fp8
 
     # Grid dim 0 varies fastest and XCD assignment is round-robin over the linear
     # workgroup id, so the axis order decides what shares an XCD's L2.
