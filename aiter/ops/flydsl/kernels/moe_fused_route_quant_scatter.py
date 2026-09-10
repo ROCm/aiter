@@ -93,6 +93,17 @@ from aiter.utility.mx_types import (
 
 BLOCK_THREADS = 256
 ELEMS_PER_LANE = 2  # bf16 columns each lane quantizes -> 1 fp4 byte / 2 fp8 bytes
+
+# Non-temporal (SLC / streaming) cache hint for the prequantized copy path. The
+# payload/scale SOURCES (the EP dispatch buffers) and the e8m0 SOURCE are each read
+# exactly once by this kernel, so a streaming load avoids polluting L2 with data
+# that has no reuse (matches ``b_aux = 2 if use_nt`` in the mxfp4 gemms /
+# ``_SLC_CACHE = 2`` in the dispatch/combine kernel). The payload DEST is re-read
+# by the downstream grouped GEMM, so its store keeps the default (temporal) policy
+# to stay resident in L2; flip ``_PREQUANT_NT_STORE`` only if the working set is
+# proven to exceed L2 (then the eviction is free and NT cuts write pollution).
+_PREQUANT_NT_LOAD = 2
+_PREQUANT_NT_STORE = 0
 LANES_PER_MX_BLOCK = 32 // ELEMS_PER_LANE  # 16 lanes cover one 32-element MX block
 
 # Architectures with native scaled-pack f32->fp4/fp8 conversion
@@ -586,19 +597,8 @@ def _emit_prequant_copy_preshuffle(c: SimpleNamespace) -> None:
     )
     total_chunks = payload_bytes_per_row // 16  # 16 B (dwordx4) per lane per chunk
     n_iter = (total_chunks + 31) // 32
-    # Two passes: issue all loads first (keep them in flight) then all stores, so
-    # the copy is memory-latency-bound on parallel loads, not on a load->store
-    # dependency chain. n_iter is small (7 for fd7168) -> bounded register live set.
-    payload_chunks = []
-    for it in range_constexpr(n_iter):
-        chunk_idx = arith.constant(it * 32, type=i32) + lane
-        # load offset is in i32 elements (4 dwords / 16 B chunk); store is in bytes.
-        v = buffer_ops.buffer_load(src_rsrc, chunk_idx * c4, vec_width=4, dtype=i32)
-        payload_chunks.append((chunk_idx, v))
-    for chunk_idx, v in payload_chunks:
-        buffer_ops.buffer_store(v, dst_rsrc, chunk_idx * c16, offset_is_bytes=True)
 
-    # ---- e8m0 scale scatter: 4 blocks -> 1 destination dword ----
+    # ---- e8m0 scale source resource (loaded together with the payload below) ----
     src_scale_rsrc = buffer_ops.create_buffer_resource_from_addr(
         c.src_scale_base + fx.Uint64(c.feat_row_i32) * c.src_scale_bytes_per_row,
         num_records_bytes=c.src_scale_bytes_per_row,
@@ -609,14 +609,39 @@ def _emit_prequant_copy_preshuffle(c: SimpleNamespace) -> None:
     scale_row_dword_base = dst.scale_row_dword_base
     scale_t_i32 = c.scale_t_i32
     n_sc_iter = (n_scale_dwords + 31) // 32
-    # Same two-pass structure: cluster the scale dword loads, then the stores.
+
+    # Overlap the two independent streams. The payload copy and the e8m0 scale
+    # scatter share no data, so issuing *all* their loads first (payload dwordx4 +
+    # scale dword, streaming/NT since each source is read once) keeps the scale
+    # load latency hidden under the payload loads instead of starting only after
+    # the payload stores retire. Stores follow once the loads return. Live set:
+    # n_iter v4i32 + n_sc_iter i32 (7*4 + 2 = 30 VGPR for fd7168) -- still below
+    # the quant path's footprint, so occupancy holds.
+    payload_chunks = []
+    for it in range_constexpr(n_iter):
+        chunk_idx = arith.constant(it * 32, type=i32) + lane
+        # load offset is in i32 elements (4 dwords / 16 B chunk); store is in bytes.
+        v = buffer_ops.buffer_load(
+            src_rsrc, chunk_idx * c4, vec_width=4, dtype=i32,
+            cache_modifier=_PREQUANT_NT_LOAD,
+        )
+        payload_chunks.append((chunk_idx, v))
     scale_chunks = []
     for it in range_constexpr(n_sc_iter):
         g = arith.constant(it * 32, type=i32) + lane
         # element offset g -> byte g*4: the 4 contiguous src e8m0 bytes for this
         # scale dword, in the destination's byte order (see docstring).
-        src_dword = buffer_ops.buffer_load(src_scale_rsrc, g, vec_width=1, dtype=i32)
+        src_dword = buffer_ops.buffer_load(
+            src_scale_rsrc, g, vec_width=1, dtype=i32,
+            cache_modifier=_PREQUANT_NT_LOAD,
+        )
         scale_chunks.append((g, src_dword))
+
+    for chunk_idx, v in payload_chunks:
+        buffer_ops.buffer_store(
+            v, dst_rsrc, chunk_idx * c16, offset_is_bytes=True,
+            cache_modifier=_PREQUANT_NT_STORE,
+        )
     for g, src_dword in scale_chunks:
         dst_dword_idx = scale_row_dword_base + g * c_stride
 
