@@ -594,9 +594,7 @@ def get_mhc_pre_splitk_large_m(
     """Split-K policy for gfx950 large-M post_pre kernel (M > 1024)."""
     if get_gfx_runtime() == "gfx950" and m >= 8192 and hc_hidden_size % (8 * 64) == 0:
         return 8, 64
-    return get_mhc_pre_splitk(
-        m, hc_hidden_size, w_preshuffle_bf16=w_preshuffle_bf16
-    )
+    return get_mhc_pre_splitk(m, hc_hidden_size, w_preshuffle_bf16=w_preshuffle_bf16)
 
 
 @compile_ops("module_mhc", develop=True)
@@ -797,7 +795,12 @@ def mhc_fused_post_pre(
         )
         return post_mix, comb_mix, layer_input_out, next_residual
 
-    if force_fused and not res_preshuffle and arch == "gfx950" and m > fused_m_upper_bound:
+    if (
+        force_fused
+        and not res_preshuffle
+        and arch == "gfx950"
+        and m > fused_m_upper_bound
+    ):
         return mhc_fused_post_pre_large_m(
             layer_input,
             residual_in,

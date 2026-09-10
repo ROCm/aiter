@@ -460,7 +460,12 @@ def mhc_pre_norm_split_hip(
 
 @benchmark()
 def test_mhc_pre(
-    m, hidden_size, hc_mult, test_hc_head=False, fuse_rmsnorm=False, w_preshuffle_bf16=False
+    m,
+    hidden_size,
+    hc_mult,
+    test_hc_head=False,
+    fuse_rmsnorm=False,
+    w_preshuffle_bf16=False,
 ):
     if fuse_rmsnorm and test_hc_head:
         raise ValueError("fuse_rmsnorm and hc_head are mutually exclusive")
