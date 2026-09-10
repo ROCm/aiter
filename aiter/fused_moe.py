@@ -177,6 +177,10 @@ def _adaptive_moe_sort(
         if atomic
         else torch.empty((0, 0), dtype=moebuf_dtype, device=device)
     )
+    # BM16 sort fuses output zeroing; three-stage sort only sorts.
+    # Atomic GEMM2 needs a zeroed destination on every invocation.
+    if atomic and BM != 16:
+        moe_buf.zero_()
     empty_bf16 = _empty_bf16(device)
     bf16_zero = moe_buf if (atomic and (BM == 16 or skip_quant)) else empty_bf16
 
