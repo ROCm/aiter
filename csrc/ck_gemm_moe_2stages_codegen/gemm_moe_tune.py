@@ -6173,7 +6173,7 @@ class Mxfp4FlydslTuner(FmoeTuner):
     # _g1_variants enumerates the cross-product and lets the kernel's own
     # _assert_supported reject the rest instead of duplicating that logic.
     _G1_BN = (64, 128, 256)
-    _G1_XCD_SWIZZLE = (0, 2, 4)
+    _G1_XCD_SWIZZLE = (0, 1, 2, 4)
     _G1_K_WAVE = (1, 2, 4)
     _G1_NUM_WAVES = (4, 2)
 

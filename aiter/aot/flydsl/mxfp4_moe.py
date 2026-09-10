@@ -29,6 +29,7 @@ DEFAULT_CSVS = sorted(
     set(
         glob.glob(f"{_MODEL_CONFIG_DIR}/*_fp4_tuned_fmoe.csv")
         + glob.glob(f"{_MODEL_CONFIG_DIR}/*_fp8fp4_tuned_fmoe.csv")
+        + glob.glob(f"{_MODEL_CONFIG_DIR}/*_a16w4_tuned_fmoe.csv")
         + glob.glob(f"{_MODEL_CONFIG_DIR}/*_a4w4_tuned_fmoe.csv")
         + glob.glob(f"{_MODEL_CONFIG_DIR}/*_a8w4_tuned_fmoe.csv")
     )
