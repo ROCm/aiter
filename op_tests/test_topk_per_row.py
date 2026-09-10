@@ -166,7 +166,9 @@ def run_top_k_per_row_prefill(
     Run the top_k_per_row kernel.
     """
     if flydsl:
-        return aiter.flydsl_radix_topk_one_block_prefill(
+        from aiter.ops.flydsl.topk_per_row import flydsl_top_k_per_row_prefill
+
+        return flydsl_top_k_per_row_prefill(
             logits,
             row_starts,
             row_ends,
@@ -216,19 +218,6 @@ def run_top_k_per_row_decode(
     """
     if flydsl:
         assert not fast, "fast and flydsl cannot both be enabled"
-        if get_gfx() in ("gfx942", "gfx950", "gfx1250"):
-            return aiter.flydsl_radix_topk_one_block_decode(
-                logits,
-                next_n,
-                seqLens,
-                indices,
-                numRows,
-                stride0,
-                stride1,
-                k,
-                stable,
-                values,
-            )
         return aiter.flydsl_top_k_per_row_decode(
             logits,
             next_n,
@@ -455,7 +444,7 @@ def test_mb_workspace_reuse():
     for call_idx, seed in enumerate((11, 22, 33)):
         logits = create_random_logits(row_starts, row_ends, torch.float32, seed)
         indices = torch.empty((num_rows, top_k), dtype=torch.int32, device="cuda")
-        aiter.top_k_per_row_prefill(
+        aiter._top_k_per_row_prefill(
             logits,
             row_starts,
             row_ends,
@@ -464,7 +453,12 @@ def test_mb_workspace_reuse():
             num_rows,
             logits.stride(0),
             logits.stride(1),
-            k=top_k,
+            top_k,
+            aiter.get_topk_mb_workspace(
+                logits.device,
+                aiter.topk_mb_workspace_size(num_rows, stride0, top_k, False),
+            ),
+            False,
         )
         ref = logits.topk(min(top_k, max_end), dim=-1)[1]
         mask = (ref >= 0) & ((ref - (row_ends - row_starts)[:, None]) < 0)
