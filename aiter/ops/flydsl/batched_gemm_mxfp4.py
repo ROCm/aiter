@@ -17,7 +17,7 @@ import os
 
 import torch
 
-from aiter.jit.utils.chip_info import get_gfx
+from aiter.jit.utils.chip_info import get_gfx, get_gfx_runtime
 
 from .kernels.tensor_shim import ptr_arg
 
@@ -733,7 +733,11 @@ def pick_mx_tiles(
     tuned = MX_TUNED_TILES.get((M, N, K, a_dtype))
     if tuned is not None:
         return _checked(tuned, "MX_TUNED_TILES")
-    key = (get_gfx(), _cu_count(), M, N, K, a_dtype)
+    # get_gfx_runtime, not get_gfx: get_gfx honours the GPU_ARCHS build variable,
+    # so with GPU_ARCHS set to anything but the live device every tuned row would
+    # miss and silently fall through to the heuristic. chip_info designates
+    # get_gfx_runtime for exactly this -- "selecting tuned kernels".
+    key = (get_gfx_runtime(), _cu_count(), M, N, K, a_dtype)
     tuned = _load_mx_tuned_csv().get(key)
     if tuned is not None:
         return _checked(tuned, f"{_mx_tuned_csv()} row {key}")

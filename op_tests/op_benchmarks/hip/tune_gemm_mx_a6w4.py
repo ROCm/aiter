@@ -97,7 +97,10 @@ def _out_path() -> str:
     copy under /tmp when model_configs/ tables are present."""
     from aiter.jit.core import AITER_CONFIG_GEMM_A6W4
 
-    return os.path.normpath(AITER_CONFIG_GEMM_A6W4)
+    # The override may be a pathsep-separated list; write the first entry, as
+    # base_tuner.get_out_file does. Without the split the whole list becomes one
+    # composite filename.
+    return os.path.normpath(AITER_CONFIG_GEMM_A6W4.split(os.pathsep)[0])
 
 
 def _write(rows) -> None:

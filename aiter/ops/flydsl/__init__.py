@@ -42,6 +42,7 @@ _LAZY_IMPORTS = {
         ".kernels.mqa_logits.fp8_mqa_logits",
         "flydsl_fp8_mqa_logits",
     ),
+    "flydsl_gemm_mxfp4": (".batched_gemm_mxfp4", "flydsl_gemm_mxfp4"),
     "flydsl_hgemm": (".gemm_kernels", "flydsl_hgemm"),
     "flydsl_hstu_attention_fwd": (
         ".hstu_attention_kernels",
@@ -79,6 +80,7 @@ __all__ = [
     "compute_varqlen_windows",
     "flydsl_flash_attn_func",
     "flydsl_fp8_mqa_logits",
+    "flydsl_gemm_mxfp4",
     "flydsl_hgemm",
     "flydsl_hstu_attention_fwd",
     "flydsl_mla_reduce_v1",
