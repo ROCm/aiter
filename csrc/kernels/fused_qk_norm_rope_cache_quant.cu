@@ -6317,7 +6317,10 @@ void fused_qk_norm_rope_group_quant(
   //    wave count falls faster than the per-wave work drops. A threshold that
   //    also keys on H is the likely next refinement, but that needs more shapes
   //    than this change was measured against.
-  constexpr int LARGE_PREFILL_THRESHOLD  = 16;   // med    -> large  (blocks/CU)
+  const std::string gpu_arch = get_gpu_arch();
+  const bool has_tdm = gpu_arch == "gfx1250";
+  const int LARGE_PREFILL_THRESHOLD =
+      has_tdm ? 16 : 48;  // med -> large (blocks/CU)
   // large -> xlarge at 64 blocks/CU, not 300.
   //
   // This moves T=2048 (88 blocks/CU) and T=4096 (176) at H=128 from HPW=8 to
@@ -6329,7 +6332,8 @@ void fused_qk_norm_rope_group_quant(
   // but its CI straddles zero, so treat it as "not worse", not a second win.
   //
   // T=2048 was the worst cell in the size sweep, which is what pointed at the tier.
-  constexpr int XLARGE_PREFILL_THRESHOLD = 64;  // large  -> xlarge (blocks/CU)
+  const int XLARGE_PREFILL_THRESHOLD =
+      has_tdm ? 64 : 300;  // large -> xlarge (blocks/CU)
 
   const bool use_decode_path    = (prefill_blocks_med < MIN_OVERSUBSCRIPTION * num_CUs);
   const bool use_xlarge_prefill = !use_decode_path
@@ -6410,16 +6414,39 @@ void fused_qk_norm_rope_group_quant(
   // chase, cos/sin setup and descriptor build. Coarse gives a wave HPW=8 heads and
   // amortises all of that. Gated on the arch so gfx950/MI355 keeps the routing that
   // was measured there.
-  const bool fg_many_heads_ok = (get_gpu_arch() != "gfx1250");
   const bool use_finegrained =
       (num_tokens <= 65535)
-      && ((use_large_prefill && num_heads >= FG_MANY_HEADS_MIN && fg_many_heads_ok)
+      && ((!has_tdm && use_xlarge_prefill)
+          || (!has_tdm && use_large_prefill
+              && num_heads >= FG_MANY_HEADS_MIN)
           || use_decode_path);
   auto launch_all = [&](auto group_size_tag, auto scale_fp32_tag, auto has_qw_tag) {
     constexpr int  head_dim_val      = 512;
     constexpr int  q_group_size_val  = decltype(group_size_tag)::value;
     constexpr bool q_scale_fp32_val  = decltype(scale_fp32_tag)::value;
     constexpr bool has_q_weight_val  = decltype(has_qw_tag)::value;
+    auto launch_coarse = [&](auto tokens_per_block_tag, auto q_tdm_depth_tag) {
+      constexpr int tokens_per_block_val = decltype(tokens_per_block_tag)::value;
+      constexpr int q_tdm_depth_val      = decltype(q_tdm_depth_tag)::value;
+      const size_t coarse_lds_bytes =
+          static_cast<size_t>(tokens_per_block_val) * q_tdm_depth_val
+          * 512 * sizeof(uint16_t);
+      dim3 grid((num_tokens + tokens_per_block_val - 1) / tokens_per_block_val,
+                1 + num_q_waves);
+      dim3 block(tokens_per_block_val * warp_size);
+      DISPATCH_BY_KV_CACHE_QUERY_DTYPE_OPUS_rmTorch(
+          kv.dtype(), kv_cache_dtype, q_out_type,
+          CALL_FUSED_QK_NORM_ROPE_GROUP_QUANT_CACHE);
+    };
+    auto launch_coarse_for_arch = [&](auto tokens_per_block_tag) {
+      if (has_tdm) {
+        launch_coarse(
+            tokens_per_block_tag,
+            std::integral_constant<int, kCoarseQTdmDepth>{});
+      } else {
+        launch_coarse(tokens_per_block_tag, std::integral_constant<int, 0>{});
+      }
+    };
     if (use_finegrained) {
       // One wave per (token, head): grid.x = ceil((num_heads+1)/HEADS_PER_BLOCK)
       // (head 0 = K, 1.. = Q), grid.y = token. (num_tokens <= 65535 for V4 prefill
@@ -6495,68 +6522,10 @@ void fused_qk_norm_rope_group_quant(
       DISPATCH_BY_KV_CACHE_QUERY_DTYPE_OPUS_rmTorch(kv.dtype(), kv_cache_dtype, q_out_type,
                                         CALL_FUSED_QK_NORM_ROPE_FINEGRAINED);
     } else if (use_decode_path) {
-      constexpr int tokens_per_block_val = 1;
-      // Depth of the Q-head TDM prefetch ring in the coarse kernel (0 = off).
-      // Targets prefill: ATT at T=16384 (78 waves) puts s_wait_loadcnt at 57.9%
-      // of the wave while FETCH_SIZE is 1.089x ideal, i.e. traffic is at the
-      // floor and the serial load -> wave_reduce -> store chain leaves MLP at 1.
-      // gfx1250-only; the LDS ring costs DEPTH*512*2 B per wave.
-      //
-      // DEPTH=2, not 3: every extra ring slot costs LDS and therefore residency,
-      // and at 2 the overlap is already there. Paired A/B at T=16384 H=128 G=64 put
-      // 3 -> 2 as a win, and the full sweep had 27 of 28 shapes faster and none
-      // slower; the earlier H=32 sweep in 93aaf800 agrees. Retested after the ring
-      // stopped re-reading the last head on its tail refills -- which was the main
-      // reason a deeper ring cost anything -- and DEPTH=3 is still neutral.
-      //
-      // DO NOT go to DEPTH=1: it is a data race, not a tuning choice. Iteration i
-      // reads LDS slot (i % DEPTH) and then issues the refill TDM into that SAME
-      // slot for head i+DEPTH. At DEPTH>=2 the refill is not awaited until DEPTH-1
-      // iterations later, so the ds_read has long since sampled; at DEPTH=1 the
-      // next iteration's s_wait_tensorcnt<0> closes the window immediately and the
-      // async write races the read. err_q goes 1.36e-07 -> 0.964 at every prefill
-      // tier. See 508a86ac, which reverted 93aaf800 for exactly this.
-      //
-      // DEPTH=2 correctness verified before shipping (the condition 508a86ac
-      // attached to it): full sweep err_q max 5.45e-07 -- the same values the
-      // DEPTH=3 baseline produces -- and 40/40 SWA checks byte-exact.
-      constexpr int q_tdm_depth_val = kCoarseQTdmDepth;
-      if constexpr (q_tdm_depth_val > 0) {
-        AITER_CHECK(get_gpu_arch() == "gfx1250",
-                    "the coarse Q TDM ring is gfx1250-only; got ",
-                    get_gpu_arch());
-      }
-      const size_t coarse_lds_bytes =
-          (q_tdm_depth_val > 0 && get_gpu_arch() == "gfx1250")
-              ? static_cast<size_t>(tokens_per_block_val) * q_tdm_depth_val
-                    * 512 * sizeof(uint16_t)
-              : 0;
-      dim3 grid((num_tokens + tokens_per_block_val - 1) / tokens_per_block_val, 1 + num_q_waves);
-      dim3 block(tokens_per_block_val * warp_size);
-      DISPATCH_BY_KV_CACHE_QUERY_DTYPE_OPUS_rmTorch(kv.dtype(), kv_cache_dtype, q_out_type,
-                                        CALL_FUSED_QK_NORM_ROPE_GROUP_QUANT_CACHE);
+      launch_coarse_for_arch(std::integral_constant<int, 1>{});
     } else {
-      constexpr int tokens_per_block_val = 4;
-      // Depth of the Q-head TDM prefetch ring in the coarse kernel (0 = off).
-      // Targets prefill: ATT at T=16384 (78 waves) puts s_wait_loadcnt at 57.9%
-      // of the wave while FETCH_SIZE is 1.089x ideal, i.e. traffic is at the
-      // floor and the serial load -> wave_reduce -> store chain leaves MLP at 1.
-      // gfx1250-only; the LDS ring costs DEPTH*512*2 B per wave.
-      constexpr int q_tdm_depth_val = kCoarseQTdmDepth;
-      if constexpr (q_tdm_depth_val > 0) {
-        AITER_CHECK(get_gpu_arch() == "gfx1250",
-                    "the coarse Q TDM ring is gfx1250-only; got ",
-                    get_gpu_arch());
-      }
-      const size_t coarse_lds_bytes =
-          (q_tdm_depth_val > 0 && get_gpu_arch() == "gfx1250")
-              ? static_cast<size_t>(tokens_per_block_val) * q_tdm_depth_val
-                    * 512 * sizeof(uint16_t)
-              : 0;
-      dim3 grid((num_tokens + tokens_per_block_val - 1) / tokens_per_block_val, 1 + num_q_waves);
-      dim3 block(tokens_per_block_val * warp_size);
-      DISPATCH_BY_KV_CACHE_QUERY_DTYPE_OPUS_rmTorch(kv.dtype(), kv_cache_dtype, q_out_type,
-                                        CALL_FUSED_QK_NORM_ROPE_GROUP_QUANT_CACHE);
+      launch_coarse_for_arch(
+          std::integral_constant<int, PREFILL_TOKENS_PER_BLOCK>{});
     }
   };
 
