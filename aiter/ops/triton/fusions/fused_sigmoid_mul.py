@@ -12,14 +12,21 @@ import triton
 from aiter.ops.triton._triton_kernels.fusions.fused_sigmoid_mul import (
     _fused_sigmoid_mul_kernel,
 )
+from aiter.ops.triton.utils._triton.arch_info import get_arch
+from aiter.ops.triton.utils.config_utils import (
+    AITER_TRITON_CONFIGS_PATH,
+    load_config_json,
+)
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 
 _LOGGER = AiterTritonLogger()
 
 __all__ = ["fused_sigmoid_mul"]
 
-_BLOCK_SIZE_N = 4096
-_NUM_WARPS = 4
+
+def _get_config() -> dict:
+    base = f"{AITER_TRITON_CONFIGS_PATH}/{get_arch()}/triton/fusions/fused_sigmoid_mul"
+    return dict(load_config_json(f"{base}/DEFAULT.json", required=True)["any"])
 
 
 def fused_sigmoid_mul(
@@ -45,9 +52,11 @@ def fused_sigmoid_mul(
 
     assert x.is_cuda, "x must be a CUDA tensor"
     assert gate.device == x.device, "x and gate must be on the same device"
-    assert x.dtype in (torch.float16, torch.bfloat16, torch.float32), (
-        f"unsupported dtype: {x.dtype}"
-    )
+    assert x.dtype in (
+        torch.float16,
+        torch.bfloat16,
+        torch.float32,
+    ), f"unsupported dtype: {x.dtype}"
     assert x.shape == gate.shape, f"shape mismatch: {x.shape} vs {gate.shape}"
     assert x.dtype == gate.dtype, f"dtype mismatch: {x.dtype} vs {gate.dtype}"
     assert x.is_contiguous(), "x must be contiguous"
@@ -65,13 +74,16 @@ def fused_sigmoid_mul(
     if N == 0:
         return out
 
-    _fused_sigmoid_mul_kernel[(triton.cdiv(N, _BLOCK_SIZE_N),)](
+    config = _get_config()
+    BLOCK_SIZE_N = config.pop("BLOCK_SIZE_N")
+
+    _fused_sigmoid_mul_kernel[(triton.cdiv(N, BLOCK_SIZE_N),)](
         x,
         gate,
         out,
         N,
-        BLOCK_SIZE_N=_BLOCK_SIZE_N,
-        NEED_MASK=N % _BLOCK_SIZE_N != 0,
-        num_warps=_NUM_WARPS,
+        BLOCK_SIZE_N=BLOCK_SIZE_N,
+        NEED_MASK=N % BLOCK_SIZE_N != 0,
+        **config,
     )
     return out
