@@ -118,7 +118,11 @@ _PARITY_SEL = int(os.environ.get("AITER_A4W4_PARITY_SEL", "0"))
 # schedules. Cuts the parity duplication where it is pure code and almost no
 # runtime -- the drain is num_buffers of the K_TILES -- instead of giving up the
 # steady-state staggering the way _SINGLE_PARITY does.
-_DRAIN_SINGLE = int(os.environ.get("AITER_A4W4_DRAIN_SINGLE", "0"))
+# DEFAULT ON -- this is what keeps `.text` under the instruction-cache threshold
+# and the timing single-moded. Set AITER_A4W4_DRAIN_SINGLE=0 to restore the
+# per-parity drain. Keeps the `_ds1` name tag when on, for the same cache reason
+# as _EPI_FUSE_STORE_MASK.
+_DRAIN_SINGLE = int(os.environ.get("AITER_A4W4_DRAIN_SINGLE", "1"))
 
 # Emit the fp4 LDS stores of one activation group under ONE `kgrp == 0` exec
 # mask instead of one per store site. `kgrp = lane // 16` is a runtime lane
@@ -127,7 +131,11 @@ _DRAIN_SINGLE = int(os.environ.get("AITER_A4W4_DRAIN_SINGLE", "0"))
 # mask, which the compiler cannot merge across traced branch regions. The
 # compute stays at full exec because the pk8 peer exchange (permlanex16) needs
 # both half-waves live; only the stores are deferred and masked once.
-_EPI_FUSE_STORE_MASK = int(os.environ.get("AITER_EPI_FUSE_STORE", "0"))
+# DEFAULT ON. Set AITER_EPI_FUSE_STORE=0 to get the per-site masks back for an
+# A/B. The kernel name keeps the `_fsm` tag either way, so a build from before
+# this became the default can never be served from the JIT cache under the same
+# name.
+_EPI_FUSE_STORE_MASK = int(os.environ.get("AITER_EPI_FUSE_STORE", "1"))
 
 # Exchange the kgrp peer's half of each pk8 group as 2 packed bf16 dwords
 # instead of 4 loose f32 lanes -- see the comment at the pack site.
