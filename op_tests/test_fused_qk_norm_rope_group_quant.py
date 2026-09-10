@@ -56,19 +56,28 @@ _DEV = "cuda"
 # kernel. The fused SWA scatter rides the same HIP op, so no extra gate.
 SUPPORTED_GFX = ["gfx942", "gfx950", "gfx1250"]
 PE_BYTE_OFFSET = 464
-# Peak HBM bandwidth per arch, for the "%peak" perf column only.
-# This was a bare MI355X constant, which silently overstated every other card:
-# on gfx1250 (20 TB/s spec) it reported 94% peak where the real figure is 42%,
-# i.e. 2.2x high -- enough to make a kernel with plenty of headroom look finished.
-# gfx1250's own achievable ceiling on a 2:1 read/write mix is ~17.9 TB/s (bus
-# turnaround costs ~15% before any kernel code runs), so treat >85% of the spec
-# number below as unreachable rather than as a target.
-_PEAK_BW_BY_GFX = {
-    "gfx942": 5300.0,   # MI300X HBM3
-    "gfx950": 8000.0,   # MI355X HBM3e
-    "gfx1250": 20000.0,
-}
-_PEAK_BW_GBPS = _PEAK_BW_BY_GFX.get(get_gfx(), 8000.0)
+# No "%peak" column: a datasheet peak is not a ceiling this kernel can be measured
+# against, and reporting one against it is actively misleading.
+#
+# The spec number is read/write agnostic, but the two are not interchangeable --
+# gfx1250 measures 15.13 TB/s reading and 10.58 TB/s writing, so the reachable
+# ceiling depends on the shape's own mix. At the V4 contract's 63/37 split the
+# kernel sits at 100.0% of what the card can do while reading 66% of the spec
+# figure, which invites a hunt for headroom that is not there.
+#
+# It is worse at small sizes, where dispatch ramp and drain dominate: T=512 H=32
+# reports 24.5% of spec, yet its transfer runs at 13.06 TB/s against 13.07 for the
+# largest shape -- the whole gap is ~3.3 us of fixed cost, not bandwidth.
+#
+# The GB/s column below is the honest figure. To find out whether a kernel is
+# actually at the floor, measure the card's read and write bandwidth with the
+# kernel itself: build variants that suppress the output stores behind a
+# runtime-false predicate the compiler cannot fold (so the loads and the maths
+# stay live), and fit `T = read/BW_r + write/BW_w` to the all-stores,
+# some-stores and no-stores timings. Verify such a build by its OUTPUT, not its
+# ISA -- the predicate is wave-uniform, so the compiler emits a branch that skips
+# the stores rather than deleting them, and the static store count is unchanged.
+
 # Pin the arg-rotation count. Left to itself, run_perftest derives it from
 # `free_memory` at call time, so two candidates timed in one process rotate a
 # different number of times, land in different L2 states, and their `us`
@@ -379,7 +388,6 @@ def test_fused_qk_norm_rope_group_quant(
         "flydsl_us": (round(fly_us, 3) if fly_us == fly_us else None),  # noqa: PLR0124
         "hip/flydsl": (round(ratio, 3) if ratio == ratio else None),  # noqa: PLR0124
         "GB/s": round(gbps, 0),
-        "%peak": round(gbps / _PEAK_BW_GBPS * 100, 1),
         "err_q": err_q,
         "err_k": err_k,
         "err_kpe": err_kpe,
