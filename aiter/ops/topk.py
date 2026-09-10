@@ -382,14 +382,45 @@ _FLYDSL_TOPK_PREFILL_DISABLED = os.environ.get(
 _FLYDSL_TOPK_DECODE_DISABLED = os.environ.get(
     "AITER_DISABLE_FLYDSL_TOPK_DECODE", "0"
 ) in ("1", "true", "True", "yes", "YES")
-_FLYDSL_TOPK_HIP_FALLBACK: dict[str, int] = {
-    "gfx942": 128,
+# (minimum width, maximum width, minimum rows, maximum rows), with inclusive
+# bounds. None means unbounded. gfx942 retains its existing
+# rows >= 128 behavior; gfx1250 only includes phase-independent regressions.
+_TopkHipFallbackGate = tuple[
+    int,
+    int | None,
+    int,
+    int | None,
+]
+_FLYDSL_TOPK_HIP_FALLBACK: dict[str, tuple[_TopkHipFallbackGate, ...]] = {
+    "gfx942": ((0, None, 128, None),),
+    # On gfx1250, the FlyDSL multi-block kernel is slower than HIP for some
+    # shapes. Keep those calls on HIP until the multi-block path is optimized.
+    "gfx1250": (
+        (65_536, None, 1, 2),
+        (98_304, None, 3, 23),
+        (131_073, 200_000, 68, 79),
+        (163_841, 200_000, 90, 96),
+    ),
 }
 
 
-def _prefer_hip_topk(num_rows: int) -> bool:
-    min_rows = _FLYDSL_TOPK_HIP_FALLBACK.get(get_gfx())
-    return min_rows is not None and num_rows >= min_rows
+def _prefer_hip_topk(num_rows: int, width: int) -> bool:
+    """Return whether this architecture/shape stays on the HIP fallback."""
+    gates = _FLYDSL_TOPK_HIP_FALLBACK.get(get_gfx(), ())
+    for (
+        min_width,
+        max_width,
+        min_rows,
+        max_rows,
+    ) in gates:
+        if (
+            min_width <= width
+            and (max_width is None or width <= max_width)
+            and min_rows <= num_rows
+            and (max_rows is None or num_rows <= max_rows)
+        ):
+            return True
+    return False
 
 
 def _should_use_flydsl_topk_prefill(
@@ -403,7 +434,10 @@ def _should_use_flydsl_topk_prefill(
     stride1: int,
     k: int,
 ) -> bool:
-    if _FLYDSL_TOPK_PREFILL_DISABLED or _prefer_hip_topk(num_rows):
+    if _FLYDSL_TOPK_PREFILL_DISABLED or _prefer_hip_topk(
+        num_rows,
+        logits.shape[1],
+    ):
         return False
     from .flydsl.topk_per_row import is_flydsl_top_k_per_row_prefill_supported
 
@@ -431,7 +465,10 @@ def _should_use_flydsl_topk_decode(
     k: int,
     values: torch.Tensor | None = None,
 ) -> bool:
-    if _FLYDSL_TOPK_DECODE_DISABLED or _prefer_hip_topk(num_rows):
+    if _FLYDSL_TOPK_DECODE_DISABLED or _prefer_hip_topk(
+        num_rows,
+        logits.shape[1],
+    ):
         return False
     from .flydsl.topk_per_row import is_flydsl_top_k_per_row_decode_supported
 
