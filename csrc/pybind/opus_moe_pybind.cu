@@ -7,7 +7,7 @@
 #include "aiter_stream.h"
 #include "opus_moe.h"
 
-PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
+PYBIND11_MODULE(AITER_EXTENSION_NAME, m)
 {
     AITER_SET_STREAM_PYBIND
     OPUS_MOE_PYBIND;
