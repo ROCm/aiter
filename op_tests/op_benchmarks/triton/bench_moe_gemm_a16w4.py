@@ -17,7 +17,6 @@ from aiter.ops.triton.moe.moe_routing.routing import routing
 from aiter.ops.triton.moe.quant_moe import downcast_to_mxfp
 from aiter.ops.triton.utils._triton.arch_info import (
     get_arch,
-    is_mx_scale_preshuffling_avail,
 )
 from aiter.ops.triton.utils.shuffle import shuffle_scale_moe
 
@@ -142,15 +141,13 @@ def compute_roofline(
 
 def check_and_shuffle_scales(scale, N, K):
     if N % 32 == 0 and K % (32 * 8) == 0:
-        if is_mx_scale_preshuffling_avail():
-            scale = shuffle_scale_moe(
-                scale, arch=get_arch(), preshuffle_factor=32, scale_kwidth=8
-            )
-            if get_arch() == "gfx1250":
-                swizzle_mx_scale = "GFX1250_SCALE"
-            else:
-                swizzle_mx_scale = "CDNA4_SCALE"
-        return scale, swizzle_mx_scale
+        return shuffle_scale_moe(
+            scale,
+            arch=get_arch(),
+            preshuffle_factor=32,
+            scale_kwidth=8,
+            return_layout=True,
+        )
     else:
         return scale, None
 

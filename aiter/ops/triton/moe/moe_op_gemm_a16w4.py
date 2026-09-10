@@ -88,6 +88,7 @@ def allocate_output(
     return matmul_output, final_output
 
 
+# TODO Refactor config logic and use JSON files
 def get_kernel_config_triton(m, n, k, routing_data):
     block_m = routing_data.block_m
     group_m = 4
@@ -140,7 +141,6 @@ def get_kernel_config_triton(m, n, k, routing_data):
         "matrix_instr_nonkdim": 16,
         "kpack": 1,
     }
-    # print(f"m,n,k=({m},{n},{k}), ret={ret}")
     return ret
 
 
@@ -158,8 +158,6 @@ def get_kernel_config_gluon_gfx950_pipelined(m, n, k, routing_data):
     if block_m == 16:
         block_n = 128
         num_warps = 4
-        # tile_per_warp = [1,1]
-        # matrix_instr_nonkdim = 32
         tile_per_warp = [1, 1]
         matrix_instr_nonkdim = 32
 
@@ -207,7 +205,6 @@ def get_kernel_config_gluon_gfx950_pipelined(m, n, k, routing_data):
         "tile_per_warp0": tile_per_warp[0],
         "tile_per_warp1": tile_per_warp[1],
     }
-    # print(f"m,n,k=({m},{n},{k}), ret={ret}")
     return ret
 
 
@@ -221,7 +218,6 @@ def get_kernel_config_gluon_gfx950(m, n, k, routing_data):
     split_k = 1
     block_k = 256
     matrix_instr_nonkdim = 32
-    # matrix_instr_nonkdim = 16
 
     if block_m == 16:
         block_n = 128
@@ -273,7 +269,6 @@ def get_kernel_config_gluon_gfx950(m, n, k, routing_data):
         "tile_per_warp0": tile_per_warp[0],
         "tile_per_warp1": tile_per_warp[1],
     }
-    # print(f"m,n,k=({m},{n},{k}), ret={ret}")
     return ret
 
 
@@ -411,6 +406,19 @@ def moe_gemm_a16w4(
         "gluon",
     ), f"Unknown backend '{backend}', must be 'triton' or 'gluon'"
 
+    if get_arch() == "gfx1250":
+        assert swizzle_mx_scale in (
+            None,
+            "GFX1250_SCALE",
+        ), f"swizzle_mx_scale should be 'None' or 'GFX1250_SCALE', got {swizzle_mx_scale}"
+    elif get_arch() == "gfx950":
+        assert swizzle_mx_scale in (
+            None,
+            "CDNA4_SCALE",
+        ), f"swizzle_mx_scale should be 'None' or 'CDNA4_SCALE', got {swizzle_mx_scale}"
+    else:
+        assert swizzle_mx_scale is None, "swizzle_mx_scale should be None"
+
     _LOGGER.info(
         "MOE_GEMM_A16W4: x=%s w=%s w_scales=%s swizzle_mx_scale=%s backend=%s",
         x.shape,
@@ -434,17 +442,15 @@ def moe_gemm_a16w4(
     if unpadded_K and block_m == 16:
         K = unpadded_K
 
-    if backend == "gluon":
-        w_scales_kernel = w_scales.transpose(1, 2)
-
     # compute optimization flags
     if backend == "gluon":
         use_pipelined_gluon = False
+
         if get_arch() == "gfx1250":
             config = get_kernel_config_gluon_gfx1250(M, N, K, routing_data)
         elif get_arch() == "gfx950":
             # Currently on gfx950, gluon kernels requires that swizzling is enabled
-            # and K % 256 == 0. Otherwise, fallback to Triton backend
+            # and K % 256 == 0. Otherwise, fallback to Triton
             mask_k_limit = K % 256
             if mask_k_limit != 0 or swizzle_mx_scale is None:
                 backend = "triton"
@@ -461,6 +467,9 @@ def moe_gemm_a16w4(
 
     else:
         config = get_kernel_config_triton(M, N, K, routing_data)
+
+    if backend == "gluon":
+        w_scales_kernel = w_scales.transpose(1, 2)
 
     if apply_swiglu and config["split_k"] > 1:
         apply_swiglu_matmul = False
