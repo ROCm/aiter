@@ -98,9 +98,15 @@ BLOCK_THREADS = 256
 # It only has to exceed any real buffer, and stays under 2 GiB because the
 # descriptor builder sign-extends the size to 64 bits.
 _SCALE_RSRC_MAX_BYTES = 0x7FFFFFFF
-# Deepest TDM staging worth pipelining, and how far the K-split may go. The
-# split aims for this many blocks per CU; past that it stops paying.
-_TOKEN_MULTIDEST_TDM_CHUNKS = 7
+# Deepest TDM staging worth pipelining. The curve is a bowl: one chunk is worse
+# than no staging at all (the prologue waits on the whole row with nothing to
+# overlap), and past four the per-chunk tensor_wait and two CTA barriers cost
+# more than the smaller transfer saves. Measured on DSV4 (7168, topk 6, fp4,
+# gfx1250) at 16384 tokens -- 1: 59.4 us, 2: 50.7, 4: 47.4, 7: 46.7, 14: 48.1,
+# 28: 53.4, none: 48.1. Four and seven are a wash, and four divides every
+# model_dim's iteration count we ship, so one depth serves them all.
+_TOKEN_MULTIDEST_TDM_CHUNKS = 4
+# The K-split aims for this many blocks per CU; past that it stops paying.
 _TOKEN_MULTIDEST_BLOCKS_PER_CU = 4
 _TOKEN_MULTIDEST_MAX_KSPLIT = 14
 ELEMS_PER_LANE = 2  # bf16 columns each lane quantizes -> 1 fp4 byte / 2 fp8 bytes
@@ -1854,9 +1860,9 @@ def token_multidest_tdm_chunks(
     """TDM staging depth: the deepest the row's geometry allows, up to the tuned one.
 
     A chunk has to cover a whole number of wave iterations and stay 16 B
-    aligned, so the depth comes from the row's divisors rather than a constant:
-    the tuned 7 fits model_dim 7168's 28 iterations but does not divide the 16
-    of model_dim 4096 at all.
+    aligned, so the depth comes from the row's divisors rather than a constant.
+    The tuned depth divides 7168's 28 iterations, 4096's 16 and 2048's 8 alike,
+    but the search still has to run for a row those do not fit.
 
     A K-split block has too few iterations left to pay for a pipeline, and the
     builder drops staging for it anyway; say so here so the two agree.
