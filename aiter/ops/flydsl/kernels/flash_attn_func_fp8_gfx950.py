@@ -133,12 +133,11 @@ def _fp8_auto_kv_splits(
         # only right while the shape leaves enough of the machine idle for the
         # split to fill; a shape already at full occupancy just pays for a second
         # round and a combine launch.
-        if wgs * _FP8_AUTOSPLIT_SPLIT2_OCCUPANCY > kv_tiles * num_cu:
+        if 2 * wgs <= num_cu:
+            return 2
+        if kv_tiles * num_cu < _FP8_AUTOSPLIT_SPLIT2_OCCUPANCY * wgs * batch:
             return 1
-        interleaved = (
-            _fp8_batch_interleave_group(batch, causal, seqlen_q != seqlen_kv, 1) > 1
-        )
-        return 1 if wgs == num_cu and interleaved else 2
+        return 2
 
     def makespan(splits: int) -> float:
         n = wgs * splits

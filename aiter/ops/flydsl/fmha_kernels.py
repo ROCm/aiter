@@ -257,19 +257,25 @@ def _fp8_gfx950_supported(
     and writes bf16. Reject anything else so it falls through rather than
     silently dropping the feature.
     """
+    if q.dtype is not torch.float8_e4m3fn or q_descale is None:
+        return False
+
     from ...jit.utils.chip_info import get_gfx
 
     if get_gfx() != "gfx950":
         return False
-    if not (q.dtype == k.dtype == v.dtype == torch.float8_e4m3fn):
+    if not (k.dtype == v.dtype == torch.float8_e4m3fn):
         return False
     if out is not None and (out.dtype != torch.bfloat16 or not out.is_contiguous()):
+        return False
+    if not (q.is_cuda and k.device == q.device and v.device == q.device):
         return False
     if any(
         s is None
         or not torch.is_tensor(s)
         or s.dtype != torch.float32
         or s.numel() != 1
+        or s.device != q.device
         for s in (q_descale, k_descale, v_descale)
     ):
         return False
@@ -328,22 +334,26 @@ def flydsl_flash_attn_varlen_func(
     from ...jit.core import is_experimental_enabled
     from ...jit.utils.chip_info import get_gfx
 
-    if q.dim() == 3 and _fp8_gfx950_supported(
-        q,
-        k,
-        v,
-        softmax_scale=softmax_scale,
-        dropout_p=dropout_p,
-        window_size=window_size,
-        bias=bias,
-        alibi_slopes=alibi_slopes,
-        sink=sink,
-        return_attn_probs=return_attn_probs,
-        block_table=block_table,
-        q_descale=q_descale,
-        k_descale=k_descale,
-        v_descale=v_descale,
-        out=out,
+    if (
+        q.dtype is torch.float8_e4m3fn
+        and q.dim() == 3
+        and _fp8_gfx950_supported(
+            q,
+            k,
+            v,
+            softmax_scale=softmax_scale,
+            dropout_p=dropout_p,
+            window_size=window_size,
+            bias=bias,
+            alibi_slopes=alibi_slopes,
+            sink=sink,
+            return_attn_probs=return_attn_probs,
+            block_table=block_table,
+            q_descale=q_descale,
+            k_descale=k_descale,
+            v_descale=v_descale,
+            out=out,
+        )
     ):
         from .kernels.flash_attn_func_fp8_gfx950 import flydsl_flash_attn_fp8_func
 
@@ -452,22 +462,26 @@ def flydsl_flash_attn_batch_func(
     from ...jit.core import is_experimental_enabled
     from ...jit.utils.chip_info import get_gfx
 
-    if q.dim() == 4 and _fp8_gfx950_supported(
-        q,
-        k,
-        v,
-        softmax_scale=softmax_scale,
-        dropout_p=dropout_p,
-        window_size=window_size,
-        bias=bias,
-        alibi_slopes=alibi_slopes,
-        sink=sink,
-        return_attn_probs=return_attn_probs,
-        block_table=None,
-        q_descale=q_descale,
-        k_descale=k_descale,
-        v_descale=v_descale,
-        out=out,
+    if (
+        q.dtype is torch.float8_e4m3fn
+        and q.dim() == 4
+        and _fp8_gfx950_supported(
+            q,
+            k,
+            v,
+            softmax_scale=softmax_scale,
+            dropout_p=dropout_p,
+            window_size=window_size,
+            bias=bias,
+            alibi_slopes=alibi_slopes,
+            sink=sink,
+            return_attn_probs=return_attn_probs,
+            block_table=None,
+            q_descale=q_descale,
+            k_descale=k_descale,
+            v_descale=v_descale,
+            out=out,
+        )
     ):
         from .kernels.flash_attn_func_fp8_gfx950 import flydsl_flash_attn_fp8_func
 

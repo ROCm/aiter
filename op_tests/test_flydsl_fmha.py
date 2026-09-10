@@ -300,13 +300,18 @@ def test_flydsl_fmha_rejects_device_mismatch():
 # error measured is the kernel's, not the quantizer's.
 
 FP8_DTYPE = torch.float8_e4m3fn
-# Fixed fp8 correctness gate; fp8 is lossy, so these are absolute bounds.
-FP8_MAX_ERR = 5e-2
+FP8_REL_ERR = 8e-2
 FP8_MIN_COS = 0.98
-# LSE is fp32 all the way out; this bounds it well above the observed 5e-5.
-FP8_LSE_MAX_ERR = 5e-4
+FP8_LSE_REL_ERR = 1e-4
 FP8_UNIFORM_RANGE = (-1.0, 1.0)
 FP8_SEED = 123
+
+
+def _fp8_rel_err(got, ref, floor=0.0):
+    scale = max(ref.abs().max().item(), floor)
+    err = (got - ref).abs().max().item()
+    return (err / scale if scale > 0 else err), err, scale
+
 
 _FP8_HEADS = 12
 _FP8_D, _FP8_DV = 192, 128
@@ -402,7 +407,11 @@ def _assert_lse_matches(got, ref):
     )
     live = ~dead
     if live.any():
-        assert (got[live] - ref[live]).abs().max().item() < FP8_LSE_MAX_ERR
+        rel, err, scale = _fp8_rel_err(got[live], ref[live], floor=1.0)
+        assert rel < FP8_LSE_REL_ERR, (
+            f"fp8 LSE gate: rel_err={rel:.3e} (< {FP8_LSE_REL_ERR}), "
+            f"abs_err={err:.3e}, |lse|max={scale:.3e}"
+        )
 
 
 def _run_fp8_shape(
@@ -505,14 +514,15 @@ def _run_fp8_shape(
         ref = _ref_attention(q_r, k_r, v_r, causal)
 
     got = out.float()
-    max_err = (got - ref).abs().max().item()
+    rel_err, max_err, scale = _fp8_rel_err(got, ref)
     min_cos = (
         F.cosine_similarity(got.reshape(-1, Dv), ref.reshape(-1, Dv), dim=1)
         .min()
         .item()
     )
-    assert max_err < FP8_MAX_ERR and min_cos > FP8_MIN_COS, (
-        f"fp8 gate: max_err={max_err:.3e} (< {FP8_MAX_ERR}), "
+    assert rel_err < FP8_REL_ERR and min_cos > FP8_MIN_COS, (
+        f"fp8 gate: rel_err={rel_err:.3e} (< {FP8_REL_ERR}), "
+        f"max_err={max_err:.3e}, ref_amax={scale:.3e}, "
         f"min_cos={min_cos:.5f} (> {FP8_MIN_COS})"
     )
     return out
@@ -1025,12 +1035,7 @@ def test_fp8_split_result_survives_a_non_current_stream(monkeypatch):
 
 
 def _fp8_dispatch_inputs(B=2, S=1024, H=8, D=128, varlen=False):
-    """Quantized inputs for the dispatch tests.
-
-    Uniform(-1, 1) rather than normal: FP8_MAX_ERR is an *absolute* bound, and
-    randn's wider dynamic range pushes the bf16 output ULP past it at the same
-    relative accuracy. This is the distribution the gate is calibrated for.
-    """
+    """Quantized inputs for the dispatch tests."""
     torch.manual_seed(0)
     shape = (B * S, H, D) if varlen else (B, S, H, D)
 
@@ -1065,7 +1070,7 @@ def test_fp8_dispatch_batch_routes_to_gfx950(causal):
         causal,
     )
     cos = F.cosine_similarity(out.float().reshape(-1, D), ref.reshape(-1, D), dim=1)
-    assert (out.float() - ref).abs().max().item() < FP8_MAX_ERR
+    assert _fp8_rel_err(out.float(), ref)[0] < FP8_REL_ERR
     assert cos.min().item() > FP8_MIN_COS
 
 
@@ -1099,7 +1104,7 @@ def test_fp8_dispatch_varlen_routes_to_gfx950(causal):
             causal,
         ).squeeze(0)
     cos = F.cosine_similarity(out.float().reshape(-1, D), ref.reshape(-1, D), dim=1)
-    assert (out.float() - ref).abs().max().item() < FP8_MAX_ERR
+    assert _fp8_rel_err(out.float(), ref)[0] < FP8_REL_ERR
     assert cos.min().item() > FP8_MIN_COS
 
 
@@ -1115,6 +1120,8 @@ def test_fp8_dispatch_varlen_routes_to_gfx950(causal):
         pytest.param({"alibi_slopes": "H_f32"}, id="alibi"),
         pytest.param({"sink": "H_f32"}, id="sink"),
         pytest.param({"out": "fp8_out"}, id="non_bf16_out"),
+        pytest.param({"q_descale": "cpu_scale"}, id="descale_on_cpu"),
+        pytest.param({"k_descale": "cpu_scale"}, id="k_descale_on_cpu"),
     ],
 )
 def test_fp8_dispatch_rejects_unsupported(unsupported):
@@ -1131,6 +1138,7 @@ def test_fp8_dispatch_rejects_unsupported(unsupported):
     materialise = {
         "H_f32": lambda: torch.zeros(H, device="cuda", dtype=torch.float32),
         "fp8_out": lambda: torch.empty(B, S, H, D, device="cuda", dtype=FP8_DTYPE),
+        "cpu_scale": lambda: torch.ones(1, device="cpu", dtype=torch.float32),
     }
     for key, val in unsupported.items():
         kw[key] = materialise[val]() if val in materialise else val
@@ -1138,6 +1146,79 @@ def test_fp8_dispatch_rejects_unsupported(unsupported):
         kw = {}
 
     assert flydsl_flash_attn_batch_func(q, k, v, causal=True, **kw) is None
+
+
+@_gfx950_only
+@pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize(
+    "dist",
+    [
+        pytest.param("uniform", id="uniform_pm1"),
+        pytest.param("normal", id="randn"),
+        pytest.param("normal_x8", id="randn_x8"),
+    ],
+)
+def test_fp8_gate_is_scale_invariant(dist, causal):
+    """The accuracy gate must track the kernel, not the magnitude of the inputs."""
+    from aiter.ops.flydsl.kernels.flash_attn_func_fp8_gfx950 import (
+        flydsl_flash_attn_fp8_func,
+    )
+
+    B, S, H, D = 1, 2048, 8, 128
+    torch.manual_seed(FP8_SEED)
+
+    def _t():
+        if dist == "uniform":
+            return torch.empty(
+                B, S, H, D, dtype=torch.bfloat16, device="cuda"
+            ).uniform_(*FP8_UNIFORM_RANGE)
+        x = torch.randn(B, S, H, D, dtype=torch.bfloat16, device="cuda")
+        return x * 8 if dist == "normal_x8" else x
+
+    q, q_s = _fp8_quant(_t())
+    k, k_s = _fp8_quant(_t())
+    v, v_s = _fp8_quant(_t())
+    out, lse = flydsl_flash_attn_fp8_func(
+        q,
+        k,
+        v,
+        causal=causal,
+        q_descale=q_s,
+        k_descale=k_s,
+        v_descale=v_s,
+        return_lse=True,
+    )
+    q_r, k_r, v_r = (
+        _fp8_dequant(q, q_s),
+        _fp8_dequant(k, k_s),
+        _fp8_dequant(v, v_s),
+    )
+    ref = _ref_attention(q_r, k_r, v_r, causal)
+    rel_err, max_err, scale = _fp8_rel_err(out.float(), ref)
+    cos = F.cosine_similarity(
+        out.float().reshape(-1, D), ref.reshape(-1, D), dim=1
+    ).min()
+    assert rel_err < FP8_REL_ERR and cos.item() > FP8_MIN_COS, (
+        f"fp8 gate ({dist}, causal={causal}): rel_err={rel_err:.3e} "
+        f"(< {FP8_REL_ERR}), max_err={max_err:.3e}, ref_amax={scale:.3e}, "
+        f"min_cos={cos.item():.5f}"
+    )
+
+    _assert_lse_matches(lse, _ref_lse(q_r, k_r, causal))
+
+
+@_gfx950_only
+def test_fp8_dispatch_rejects_descale_on_another_device():
+    """A descale on a different CUDA device falls through instead of raising."""
+    if torch.cuda.device_count() < 2:
+        pytest.skip("requires >=2 visible GPUs")
+
+    from aiter.ops.flydsl.fmha_kernels import flydsl_flash_attn_batch_func
+
+    B, S, H, D = 2, 512, 8, 128
+    q, k, v, d = _fp8_dispatch_inputs(B, S, H, D)
+    d["q_descale"] = d["q_descale"].to("cuda:1")
+    assert flydsl_flash_attn_batch_func(q, k, v, causal=True, **d) is None
 
 
 @_gfx950_only
@@ -1407,7 +1488,7 @@ def test_fp8_dispatch_return_lse(causal):
     ref = _ref_lse(
         _fp8_dequant(q, d["q_descale"]), _fp8_dequant(k, d["k_descale"]), causal
     )
-    assert (lse - ref).abs().max().item() < FP8_LSE_MAX_ERR
+    assert _fp8_rel_err(lse, ref, floor=1.0)[0] < FP8_LSE_REL_ERR
 
     qv, kv, vv, dv = _fp8_dispatch_inputs(B, S, H, D, varlen=True)
     cu = torch.tensor([0, 400, B * S], dtype=torch.int32, device="cuda")
