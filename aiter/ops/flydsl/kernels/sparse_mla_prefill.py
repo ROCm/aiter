@@ -18,22 +18,40 @@ from flydsl.expr.typing import Vector as Vec
 from aiter.jit.utils.chip_info import get_gfx
 from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled
 
-_NUM_HEADS = 16
+# Hardware and instruction shape. The QK atom is 16x16x128 and the PV atom
+# 16x16x32, and the lane map ties one head to one MFMA row, so the kernel
+# always runs 16 head slots -- `_NUM_HEADS` is that tile width, not the
+# model's head count. Fewer heads are read in place via the `q_heads` argument.
+_WAVE_SIZE = 64
+_MFMA_M = 16
+_MFMA_N = 16
+_PV_MFMA_K = 32
+_NUM_HEADS = _MFMA_M
+_NUM_WAVES = 4
+_NUM_THREADS = _WAVE_SIZE * _NUM_WAVES
+_WAVES_PER_EU = 2
+# Each wave owns one 16-key QK tile, so a block covers `_NUM_WAVES` of them.
+_BLOCK_N = _NUM_WAVES * _MFMA_N
+
+# Model shape (GLM-5.2 absorbed MLA).
 _V_HEAD_DIM = 512
 _ROPE_HEAD_DIM = 64
 _HEAD_DIM = _V_HEAD_DIM + _ROPE_HEAD_DIM
 _TOPK = 2048
-_BLOCK_N = 64
-_NUM_WAVES = 4
-_WAVES_PER_EU = 2
-_NUM_THREADS = 64 * _NUM_WAVES
-_NUM_QK_TILES = _BLOCK_N // 16
-_QK_TILES_PER_WAVE = _NUM_QK_TILES // _NUM_WAVES
-_DV_TILES_PER_WAVE = (_V_HEAD_DIM // 16) // _NUM_WAVES
-_PV_K_STEPS = _BLOCK_N // 32
-_KV_LDS_PITCH = _V_HEAD_DIM + 16
 _FP8_MAX = 448.0
 _LOG2E = 1.4426950408889634
+
+# Derived layout. `_LDS_BANK_PAD` keeps the transposed V reads off a single
+# bank; it is a byte pad, unrelated to the MFMA tile that happens to match it.
+_LDS_BANK_PAD = 16
+_KV_LDS_PITCH = _V_HEAD_DIM + _LDS_BANK_PAD
+_NUM_QK_TILES = _BLOCK_N // _MFMA_N
+_QK_TILES_PER_WAVE = _NUM_QK_TILES // _NUM_WAVES
+_DV_TILES_PER_WAVE = (_V_HEAD_DIM // _MFMA_N) // _NUM_WAVES
+_PV_K_STEPS = _BLOCK_N // _PV_MFMA_K
+assert _WAVE_SIZE % _NUM_HEADS == 0
+assert _V_HEAD_DIM % (_MFMA_N * _NUM_WAVES) == 0
+
 _INT32_MAX = 2**31 - 1
 # `out` reaches the kernel as `out.reshape(-1)`, whose extent is packed as a
 # signed 32-bit shape field, and the store index `output_base + dv_offset` is
@@ -41,15 +59,18 @@ _INT32_MAX = 2**31 - 1
 # cap the token count at the same place.
 _MAX_TOKENS = _INT32_MAX // (_NUM_HEADS * _V_HEAD_DIM)
 # One CTA covers one token, so `num_tokens` alone caps how much of the machine
-# a prefill can use: a 1-token call leaves 255 of 256 CUs idle. Past this many
-# tokens the grid already fills the device and splitting only adds a reduce.
+# a prefill can use: a 1-token call leaves 255 of 256 CUs idle. The bound is
+# the shared decode reducer's supported row count, not a tuning constant --
+# splitting past it would need that scope widened first.
 _SPLIT_TOKEN_LIMIT = 96
 # `_BLOCK_N` keys is the smallest slice one CTA can process, and the shared
 # decode reducer accepts at most 33 splits.
 _MAX_SPLITS = min(_TOPK // _BLOCK_N, 33)
 _SPLIT_CAP = 16
 _SPLIT_CHOICES = tuple(
-    s for s in (1, 2, 4, 8, 16, 32) if s <= min(_MAX_SPLITS, _SPLIT_CAP)
+    1 << b
+    for b in range(_SPLIT_CAP.bit_length())
+    if (1 << b) <= min(_MAX_SPLITS, _SPLIT_CAP)
 )
 
 
