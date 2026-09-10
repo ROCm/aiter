@@ -13,6 +13,7 @@ from flydsl.expr.typing import (
 from flydsl.expr.typing import Vector as Vec
 from flydsl.expr.typing import as_ir_value as _raw
 
+from ..mxfp4_gemm_common import _lds_swizzle_mask as lds_swizzle_mask
 from ..mxfp4_gemm_common import (
     _udiv,
     flat_buffer_view,
@@ -21,7 +22,6 @@ from ..mxfp4_gemm_common import (
     lds_swizzle_mask_f8,
     lds_vec_load,
 )
-from ..mxfp4_gemm_common import _lds_swizzle_mask as lds_swizzle_mask
 
 
 def bq_view(

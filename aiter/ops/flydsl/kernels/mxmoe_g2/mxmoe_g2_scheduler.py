@@ -84,9 +84,7 @@ def g2_launch_grid_x(
     """Host-side grid.x: persist_flat uses a CU-sized grid when work is large."""
     if const_expr(persist_flat):
         total_work = i32_max_m_blocks * num_n_blocks
-        return (total_work > fx.Int32(4 * cu_num)).select(
-            fx.Int32(cu_num), total_work
-        )
+        return (total_work > fx.Int32(4 * cu_num)).select(fx.Int32(cu_num), total_work)
     return i32_grid_blocks * num_n_blocks
 
 

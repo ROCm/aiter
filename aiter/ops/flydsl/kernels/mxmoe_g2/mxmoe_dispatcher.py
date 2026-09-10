@@ -15,10 +15,10 @@ from ..mxfp4_gemm_common import (
     global_typed_ptr,
     kStages,
 )
+from ..tensor_shim import _run_compiled as run_compiled
 from .mxmoe_g2_atoms import issue_a_load_lds_dt
 from .mxmoe_g2_kloop import gemm2_body_v2
 from .mxmoe_g2_scheduler import g2_launch_grid_x, schedule_g2_tiles
-from ..tensor_shim import _run_compiled as run_compiled
 
 __all__ = [
     "compile_gemm2_a4w4_port",
@@ -252,9 +252,7 @@ def compile_gemm2_a4w4_port(
     sblk_tag = f"_sblk{g2_scale_blk}" if (route_out_fp8 and g2_scale_blk != 8) else ""
     out_tag = "_fp8out" if route_out_fp8 else ""
     compact_tag = "_weighted_compact_s8" if compact_route else ""
-    route_guard_tag = (
-        "_routeguard" if (_composition is not None and use_reduce) else ""
-    )
+    route_guard_tag = "_routeguard" if (_composition is not None and use_reduce) else ""
     tile_tag = "" if (BN, BK) == (256, 256) else f"_bn{BN}_bk{BK}"
     bias_tag = "_bias" if enable_bias else ""
     g2_epi_lanes = _pick_epi_lanes(BM, BN, route_out_fp8, g2_scale_blk)

@@ -9,7 +9,7 @@ from .mxmoe_dispatcher import (
 )
 
 __all__ = [
+    "_validate_v2_gemm2_dtypes",
     "compile_gemm2_a4w4_port",
     "mxfp4_moe_gemm2",
-    "_validate_v2_gemm2_dtypes",
 ]
