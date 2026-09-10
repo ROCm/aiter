@@ -325,7 +325,7 @@ def _moe_gemm_a16w4(
     offs_w_n_scale = (
         pid_n * SCALE_BLOCK_N
         + gl.arange(0, SCALE_BLOCK_N, gl.SliceLayout(1, LOAD_LAYOUT_WS))
-    ) % N
+    ) % (N // PRESHUFFLE_FACTOR)
     offs_w_n_scale = tl.max_contiguous(
         tl.multiple_of(offs_w_n_scale, SCALE_BLOCK_N), SCALE_BLOCK_N
     )
