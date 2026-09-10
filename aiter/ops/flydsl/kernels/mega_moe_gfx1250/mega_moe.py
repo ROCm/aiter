@@ -370,18 +370,6 @@ class MegaMoEGfx1250:
         gfx = get_gfx()
         if gfx != "gfx1250":
             raise RuntimeError(f"MegaMoEGfx1250 requires gfx1250, got {gfx}")
-        try:
-            from aiter.ops.flydsl.grouped_moe_gfx1250 import (
-                grouped_gemm_gfx1250_a8w4,
-            )
-        except ImportError as exc:
-            raise RuntimeError(
-                "MegaMoE fused stage2 scatter requires the grouped A8W4 kernel"
-            ) from exc
-        if not callable(grouped_gemm_gfx1250_a8w4):
-            raise TypeError(
-                "MegaMoE fused stage2 scatter requires the grouped A8W4 kernel"
-            )
         if world_size <= 0:
             raise ValueError(f"world_size must be positive, got {world_size}")
         if experts <= 0:

@@ -68,6 +68,26 @@ def get_gfx():
     return GFX_MAP.get(gfx_num, "unknown")
 
 
+_LDS_CAPACITY_BYTES = {
+    "gfx90a": 64 * 1024,
+    "gfx942": 64 * 1024,
+    "gfx950": 160 * 1024,
+    "gfx1100": 64 * 1024,
+    "gfx1151": 64 * 1024,
+    "gfx1201": 64 * 1024,
+    "gfx1250": 320 * 1024,
+}
+
+
+def get_lds_capacity_bytes(gfx: str | None = None) -> int:
+    """Return the architectural LDS capacity for one workgroup."""
+    arch = (gfx or get_gfx()).split(":", 1)[0].lower()
+    try:
+        return _LDS_CAPACITY_BYTES[arch]
+    except KeyError as exc:
+        raise ValueError(f"Unknown LDS capacity for architecture {arch!r}") from exc
+
+
 @functools.lru_cache(maxsize=1)
 def get_gfx_runtime() -> str:
     """Return the arch of the live GPU, always via rocminfo.
@@ -374,7 +394,13 @@ def write_name_keyed_lookup_header(
 
 
 def write_lookup_header(
-    output_path, kernels_dict, lookup_head, lookup_template, lookup_end, istune=False
+    output_path,
+    kernels_dict,
+    lookup_head,
+    lookup_template,
+    lookup_end,
+    istune=False,
+    extra_format_args=None,
 ):
     """Write a C++ GEMM dispatch lookup header from a kernels_dict.
 
@@ -396,7 +422,16 @@ def write_lookup_header(
         lookup_template: String with {MNK} and {kernel_name} placeholders.
         lookup_end:      String written after the loop (closes the macro / #endif).
         istune:          True when generating the tune-mode lookup (int kernelId keys).
+        extra_format_args: Optional callable returning additional format arguments
+                           for a kernel instance.
     """
+
+    def format_entry(key_value, kernel):
+        format_args = {"MNK": key_value, "kernel_name": kernel.name}
+        if extra_format_args is not None:
+            format_args.update(extra_format_args(kernel))
+        return lookup_template.format(**format_args)
+
     with open(output_path, "w") as f:
         f.write(lookup_head)
         for key, k in kernels_dict.items():
@@ -407,14 +442,9 @@ def write_lookup_header(
                 cpp_key = (
                     '{"' + key[0] + '", ' + ", ".join(str(x) for x in key[1:]) + "}"
                 )
-                f.write(
-                    lookup_template.format(
-                        MNK=cpp_key,
-                        kernel_name=k.name,
-                    )
-                )
+                f.write(format_entry(cpp_key, k))
             elif istune and isinstance(key, int) and key >= 0:
-                f.write(lookup_template.format(MNK=key, kernel_name=k.name))
+                f.write(format_entry(key, k))
         f.write(lookup_end)
 
 

@@ -2,7 +2,7 @@
 // Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 //
 // OPUS-based GQA flash-attention (head dim D=128) for gfx950.
-// Single-header, IMPL-guarded (mirrors pa_sparse_prefill_opus.h):
+// Single-header, IMPL-guarded (mirrors mla_v4_prefill_opus.h):
 //   * Public API (always visible).
 //   * Kernel args / traits + device kernel template inside the
 //     `FMHA_FWD_HD128_BF16_OPUS_IMPL` guard. On the gfx950 device pass the real kernel template
