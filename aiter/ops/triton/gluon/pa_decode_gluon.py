@@ -4764,7 +4764,9 @@ def compile_pa_decode_ps_reduce_flydsl(
                 acc = acc + part_logits * weight
         else:
             global_max = c_neg_inf
-            for chunk_base in range(0, max_context_partition_num, block_threads):
+            for chunk_base in range_constexpr(
+                0, max_context_partition_num, block_threads
+            ):
                 chunk_size = min(block_threads, max_context_partition_num - chunk_base)
                 c_chunk_size = arith.constant(chunk_size, type=T.i32)
                 c_chunk_base = arith.constant(chunk_base, type=T.i32)
@@ -4789,7 +4791,9 @@ def compile_pa_decode_ps_reduce_flydsl(
                 c_zero_f,
             )
             global_exp_sum = c_zero_f
-            for chunk_base in range(0, max_context_partition_num, block_threads):
+            for chunk_base in range_constexpr(
+                0, max_context_partition_num, block_threads
+            ):
                 chunk_size = min(block_threads, max_context_partition_num - chunk_base)
                 c_chunk_size = arith.constant(chunk_size, type=T.i32)
                 c_chunk_base = arith.constant(chunk_base, type=T.i32)
@@ -4846,7 +4850,9 @@ def compile_pa_decode_ps_reduce_flydsl(
                 c_one_f,
             )
 
-            for chunk_base in range(0, max_context_partition_num, block_threads):
+            for chunk_base in range_constexpr(
+                0, max_context_partition_num, block_threads
+            ):
                 chunk_size = min(block_threads, max_context_partition_num - chunk_base)
                 c_chunk_size = arith.constant(chunk_size, type=T.i32)
                 c_chunk_base = arith.constant(chunk_base, type=T.i32)
@@ -5131,9 +5137,6 @@ def _paged_attention_decode_v2_reduce_kernel_wrapper(
                 query_group_size=query_group_size,
                 head_size=head_size,
                 context_partition_num=context_partition_num,
-                # Was the `fx.Stream(None)` parameter default; passed explicitly
-                # now that the default is gone. fx.Stream(None) is the default queue.
-                stream=fx.Stream(None),
             )
             return
         except ImportError:
