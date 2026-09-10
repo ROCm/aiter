@@ -42,6 +42,19 @@ def _gate_exp(x, USE_EXP2: tl.constexpr):
     return tl.math.exp2(x) if USE_EXP2 else exp(x)
 
 
+def _validate_contiguous_layout(
+    tensor: torch.Tensor,
+    name: str,
+    expected_shape: tuple[int, ...],
+    layout: str,
+) -> None:
+    if tensor.shape != expected_shape or not tensor.is_contiguous():
+        raise ValueError(
+            f"{layout} `{name}` must have shape {expected_shape} and contiguous "
+            f"storage, got shape={tuple(tensor.shape)}, strides={tensor.stride()}."
+        )
+
+
 @triton.heuristics(
     {
         "USE_G": lambda args: args["g"] is not None,
@@ -958,7 +971,7 @@ def chunk_gated_delta_rule_fwd_h_opt(
 
 # =====================================================================
 # opt_vk variant: h layout [V, K] (transposed from opt's [K, V])
-# All other layouts (k, w, u, v_new) are identical to opt.
+# k/gk keep the opt layout; w/u/g/v_new may specialize for token-major storage.
 # =====================================================================
 
 
@@ -982,7 +995,7 @@ def chunk_gated_delta_rule_fwd_h_opt(
             for BV in [16, 32, 64]
         ]
     ),
-    key=["H", "K", "V", "BT", "IS_VARLEN"],
+    key=["H", "K", "V", "BT", "IS_VARLEN", "INPUT_HEAD_MAJOR"],
     use_cuda_graph=USE_CUDA_GRAPH,
     **autotune_cache_kwargs,
 )
@@ -1015,6 +1028,7 @@ def chunk_gated_delta_rule_fwd_kernel_h_opt_vk(
     SAVE_NEW_VALUE: tl.constexpr,
     IS_VARLEN: tl.constexpr,
     USE_STATE_INDICES: tl.constexpr,
+    INPUT_HEAD_MAJOR: tl.constexpr,
     USE_EXP2: tl.constexpr = False,
 ):
     i_v, i_nh = tl.program_id(0), tl.program_id(1)
@@ -1049,19 +1063,26 @@ def chunk_gated_delta_rule_fwd_kernel_h_opt_vk(
 
     h += (boh * H + i_h).to(tl.int64) * V * K
     k += (bos * Hg + i_h // (H // Hg)).to(tl.int64) * K
-    if IS_VARLEN:
-        v += (i_h * T_flat + bos).to(tl.int64) * V
-        w += (i_h * T_flat + bos).to(tl.int64) * K
-    else:
-        v += ((i_n * H + i_h) * T_flat).to(tl.int64) * V
-        w += ((i_n * H + i_h) * T_flat).to(tl.int64) * K
-    stride_v = V
-    stride_w = K
-    if SAVE_NEW_VALUE:
+    # Flatten the shared B/H/T or B/T/H prefix of w, v, v_new, and g.
+    if INPUT_HEAD_MAJOR:
         if IS_VARLEN:
-            v_new += (i_h * T_flat + bos).to(tl.int64) * V
+            row_offset = i_h * T_flat + bos
         else:
-            v_new += ((i_n * H + i_h) * T_flat).to(tl.int64) * V
+            row_offset = (i_n * H + i_h) * T_flat
+        stride_v = V
+        stride_w = K
+    else:
+        if IS_VARLEN:
+            row_offset = bos * H + i_h
+        else:
+            row_offset = i_n * T_flat * H + i_h
+        stride_v = H * V
+        stride_w = H * K
+    row_offset = row_offset.to(tl.int64)
+    v += row_offset * V
+    w += row_offset * K
+    if SAVE_NEW_VALUE:
+        v_new += row_offset * V
     stride_h = H * V * K
     stride_k = Hg * K
     # `i_ss * H + i_h` == `i_nh` on the dense path; the int64 cast happens before
@@ -1072,10 +1093,8 @@ def chunk_gated_delta_rule_fwd_kernel_h_opt_vk(
         ht = ht + (i_ss * H + i_h).to(tl.int64) * V * K
 
     if USE_G:
-        if IS_VARLEN:
-            g += (i_h * T_flat + bos).to(tl.int64)
-        else:
-            g += ((i_n * H + i_h) * T_flat).to(tl.int64)
+        g += row_offset
+        stride_g = 1 if INPUT_HEAD_MAJOR else H
 
     o_v = i_v * BV + tl.arange(0, BV)
     m_v = o_v < V
@@ -1144,14 +1163,14 @@ def chunk_gated_delta_rule_fwd_kernel_h_opt_vk(
         b_v = tl.load(p_v, mask=m_tv, other=0.0) - b_v
 
         if SAVE_NEW_VALUE:
-            p_vn = v_new + o_t[:, None] * V + o_v[None, :]
+            p_vn = v_new + o_t[:, None] * stride_v + o_v[None, :]
             tl.store(p_vn, b_v.to(p_vn.dtype.element_ty), mask=m_tv)
 
         last_idx = min((i_t + 1) * BT, T) - 1
         if USE_G:
             m_t = (i_t * BT + tl.arange(0, BT)) < T
-            b_g_last = tl.load(g + last_idx)
-            p_g = g + o_t
+            b_g_last = tl.load(g + last_idx * stride_g)
+            p_g = g + o_t * stride_g
             b_g = tl.load(p_g, mask=m_t, other=0.0)
             if USE_EXP2:
                 b_v = b_v * tl.where(m_t, tl.math.exp2(b_g_last - b_g), 0)[:, None]
@@ -1246,6 +1265,8 @@ def chunk_gated_delta_rule_fwd_h_opt_vk(
     save_new_value: bool = True,
     cu_seqlens: torch.LongTensor | None = None,
     use_exp2: bool = True,
+    gk_log2_scaled: bool = False,
+    input_head_major: bool = True,
     state_dtype: torch.dtype | None = None,
     num_decodes: int = 0,
     num_decode_tokens: int = 0,
@@ -1253,16 +1274,18 @@ def chunk_gated_delta_rule_fwd_h_opt_vk(
     inplace_final_state: bool | None = None,
     prefill_metadata: GatedDeltaRulePrefillMetadata | None = None,
     snapshot_dtype: torch.dtype | None = None,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
+) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
     """
     Optimized hidden state forward with h layout [V, K].
 
-    w and u are expected in head-major contiguous layout [B, H, T, K] / [B, H, T, V].
+    w/u/v_new use head-major [B, H, T, D] by default and token-major
+    [B, T, H, D] when input_head_major=False. g follows the selected prefix;
+    k/gk keep their existing token-major [B, T, Hg, K] layout.
     initial_state/final_state: [N, H, V, K].
     h snapshots: [B, NT, H, V, K].
-    v_new output is [B, H, T_flat, V].
-    `g` is expected in head-major layout [B, H, T].
     use_exp2 selects whether cumulative gates are interpreted in log2 space.
+    gk_log2_scaled=True declares that gk is already scaled by log2(e), avoiding
+    a redundant conversion for callers that own gate preprocessing.
     state_dtype selects the initial/final hidden-state dtype (`fp32` or `bf16`);
     defaults to fp32. snapshot_dtype independently selects the temporary chunk
     snapshot dtype and defaults to k.dtype. The kernel accumulates in fp32 and
@@ -1285,9 +1308,28 @@ def chunk_gated_delta_rule_fwd_h_opt_vk(
     B, T, Hg, K = k.shape
     BT = chunk_size
 
-    H = w.shape[1]
+    if w.ndim != 4 or u.ndim != 4:
+        raise ValueError(
+            f"`w` and `u` must be 4-D, got w.shape={tuple(w.shape)} and "
+            f"u.shape={tuple(u.shape)}."
+        )
     V = u.shape[-1]
-    T_flat = w.shape[2]
+    if input_head_major:
+        H = w.shape[1]
+        expected_w_shape = (B, H, T, K)
+        expected_u_shape = (B, H, T, V)
+        expected_g_shape = (B, H, T)
+        layout = "head-major"
+    else:
+        H = w.shape[2]
+        expected_w_shape = (B, T, H, K)
+        expected_u_shape = (B, T, H, V)
+        expected_g_shape = (B, T, H)
+        layout = "token-major"
+    _validate_contiguous_layout(w, "w", expected_w_shape, layout)
+    _validate_contiguous_layout(u, "u", expected_u_shape, layout)
+    if g is not None:
+        _validate_contiguous_layout(g, "g", expected_g_shape, layout)
 
     if cu_seqlens is not None:
         if prefill_metadata is not None:
@@ -1376,7 +1418,7 @@ def chunk_gated_delta_rule_fwd_h_opt_vk(
 
     if gk is not None:
         gk = gk.contiguous()
-        if use_exp2:
+        if use_exp2 and not gk_log2_scaled:
             # gk is expressed in natural-log space, so pre-scale it for exp2 kernels.
             gk = gk * RCP_LN2
 
@@ -1389,7 +1431,12 @@ def chunk_gated_delta_rule_fwd_h_opt_vk(
         final_state = initial_state
     else:
         final_state = k.new_empty(N, H, V, K, dtype=_state_dtype)
-    v_new = k.new_empty(B, H, T_flat, V, dtype=u.dtype) if save_new_value else None
+    if not save_new_value:
+        v_new = None
+    elif input_head_major:
+        v_new = k.new_empty(B, H, T, V, dtype=u.dtype)
+    else:
+        v_new = k.new_empty(B, T, H, V, dtype=u.dtype)
 
     def grid(meta):
         return (triton.cdiv(V, meta["BV"]), N * H)
@@ -1408,12 +1455,13 @@ def chunk_gated_delta_rule_fwd_h_opt_vk(
         cu_seqlens=kernel_cu_seqlens,
         chunk_offsets=chunk_offsets,
         T=T,
-        T_flat=T_flat,
+        T_flat=T,
         H=H,
         Hg=Hg,
         K=K,
         V=V,
         BT=BT,
+        INPUT_HEAD_MAJOR=input_head_major,
         USE_EXP2=use_exp2,
     )
     return h, v_new, final_state

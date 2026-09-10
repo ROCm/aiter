@@ -23,6 +23,7 @@ from aiter.ops.triton._triton_kernels.gated_delta_rule.decode.fused_sigmoid_gati
 from aiter.ops.triton._triton_kernels.gated_delta_rule.gated_delta_rule_utils import (
     IS_AMD,
     IS_INTEL_ALCHEMIST,
+    RCP_LN2,
     assert_close,
     device,
 )
@@ -1006,6 +1007,82 @@ def test_chunk_opt_varlen_hip(
     assert tri_ht.dtype == state_dtype
     assert_close("o", ref.float(), tri.float(), tol)
     assert_close("ht", ref_ht.float(), tri_ht.transpose(-1, -2).float(), tol)
+
+
+@pytest.mark.parametrize("variable_length", [False, True])
+def test_chunk_opt_vk_token_major_gk_log2_scaled(variable_length: bool):
+    """Token-major inputs match the established head-major ABI exactly."""
+    torch.manual_seed(42)
+    B, T, H, D = (1, 128, 4, 128) if variable_length else (2, 64, 4, 128)
+    N = 2
+    k = torch.randn(B, T, H, D, dtype=torch.bfloat16, device=device)
+    w_token = torch.randn(B, T, H, D, dtype=torch.bfloat16, device=device)
+    u_token = torch.randn(B, T, H, D, dtype=torch.bfloat16, device=device)
+    w_head = w_token.permute(0, 2, 1, 3).contiguous()
+    u_head = u_token.permute(0, 2, 1, 3).contiguous()
+    g_token = -torch.rand(B, T, H, dtype=torch.float32, device=device)
+    g_head = g_token.permute(0, 2, 1).contiguous()
+    gk_natural = -torch.rand(B, T, H, D, dtype=torch.float32, device=device)
+    gk_log2 = gk_natural * RCP_LN2
+    h0 = torch.randn(N, H, D, D, dtype=torch.float32, device=device)
+    cu_seqlens = (
+        torch.tensor([0, 47, T], dtype=torch.int64, device=device)
+        if variable_length
+        else None
+    )
+
+    h_ref, v_ref, final_ref = chunk_gated_delta_rule_fwd_h_opt_vk(
+        k=k,
+        w=w_head,
+        u=u_head,
+        g=g_head,
+        gk=gk_natural,
+        initial_state=h0,
+        output_final_state=True,
+        cu_seqlens=cu_seqlens,
+        use_exp2=True,
+    )
+    h_got, v_got, final_got = chunk_gated_delta_rule_fwd_h_opt_vk(
+        k=k,
+        w=w_token,
+        u=u_token,
+        g=g_token,
+        gk=gk_log2,
+        initial_state=h0,
+        output_final_state=True,
+        cu_seqlens=cu_seqlens,
+        use_exp2=True,
+        gk_log2_scaled=True,
+        input_head_major=False,
+    )
+
+    assert torch.equal(h_got, h_ref)
+    assert v_got.is_contiguous()
+    assert torch.equal(v_got, v_ref.permute(0, 2, 1, 3))
+    assert torch.equal(final_got, final_ref)
+
+
+def test_chunk_opt_vk_rejects_invalid_layout():
+    """Layout mismatches fail before launching the raw-pointer kernel."""
+    fwd = chunk_gated_delta_rule_fwd_h_opt_vk
+    B, T, H, D = 1, 64, 4, 128
+    k = torch.empty(B, T, H, D, dtype=torch.bfloat16, device=device)
+    w_token = torch.empty_like(k)
+    u_token = torch.empty_like(k)
+
+    w_head = w_token.permute(0, 2, 1, 3).contiguous()
+    u_head = u_token.permute(0, 2, 1, 3).contiguous()
+    with pytest.raises(ValueError, match="token-major `w` must have shape"):
+        fwd(k, w_head, u_head, input_head_major=False)
+
+    # Keep token-major shape, but make token/head strides non-contiguous.
+    w_noncontiguous = w_token.transpose(1, 2).contiguous().transpose(1, 2)
+    with pytest.raises(ValueError, match="token-major `w` must have shape"):
+        fwd(k, w_noncontiguous, u_token, input_head_major=False)
+
+    g_head = torch.empty(B, H, T, dtype=torch.float32, device=device)
+    with pytest.raises(ValueError, match="token-major `g` must have shape"):
+        fwd(k, w_token, u_token, g=g_head, input_head_major=False)
 
 
 @pytest.mark.parametrize(
