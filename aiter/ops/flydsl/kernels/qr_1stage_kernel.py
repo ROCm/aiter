@@ -20,7 +20,7 @@ import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl._mlir import ir
 from flydsl._mlir.dialects import llvm
-from flydsl.expr import gpu, range_constexpr, rocdl
+from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import Int32, Int64, Stream, T, as_ir_value
 
 from . import buffer_ops
@@ -384,7 +384,7 @@ def make_qr_1stage_kernel(
             """
             rocdl.s_waitcnt(vmcnt=0)
             gpu.barrier()
-            if release_writeback is not None:
+            if const_expr(release_writeback is not None):
                 llvm.InlineAsmOp(None, [], release_writeback, "", has_side_effects=True)
                 rocdl.s_waitcnt(vmcnt=0)
             # 4 lanes, one dwordx4 each -> the 64 B sector, unrolled over the
@@ -432,7 +432,7 @@ def make_qr_1stage_kernel(
                 # payload reads, once, after the join.
                 current = _load_i32_at(flag_rsrc, fx.Int32(0), _RECV_POLICY)
                 while current != color:
-                    if spin_sleep:
+                    if const_expr(spin_sleep):
                         # Back off between polls. Each iteration is a load that
                         # bypasses both caches, and under arrival skew that runs
                         # for the whole skew window against the same line the
@@ -443,7 +443,7 @@ def make_qr_1stage_kernel(
                     current = _load_i32_at(flag_rsrc, fx.Int32(0), _RECV_POLICY)
             gpu.barrier()
             rocdl.s_waitcnt(vmcnt=0)
-            if release_writeback is not None:
+            if const_expr(release_writeback is not None):
                 llvm.InlineAsmOp(None, [], release_writeback, "", has_side_effects=True)
                 rocdl.s_waitcnt(vmcnt=0)
             _acquire_inbox()
@@ -484,12 +484,12 @@ def make_qr_1stage_kernel(
             # touched, so the wall time is the launch path plus the flag round
             # trip plus rank-arrival skew. Nothing this schedule does to the
             # data movement can go below it. Output is garbage.
-            if probe == "full":
+            if const_expr(probe == "full"):
                 my_atoms = _load_tile(tile)
                 _fanout(parity, my_atoms)
             _publish(parity, color)
             _wait(parity, color)
-            if probe == "full":
+            if const_expr(probe == "full"):
                 _store_tile(tile, _reduce(parity))
             color = color + fx.Int32(1)
             if color == fx.Int32(0):  # 0 is the unset sentinel

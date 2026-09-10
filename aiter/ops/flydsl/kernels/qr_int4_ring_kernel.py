@@ -27,7 +27,7 @@ A third wire format, ``"fp16"``, is a lossless passthrough. Mainly for testing.
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl._mlir.dialects import llvm
-from flydsl.expr import gpu, range_constexpr, rocdl
+from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import Int32, Int64, Stream, T
 
 from . import buffer_ops
@@ -388,7 +388,7 @@ def make_qr_int4_ring_kernel(
             for (off, pred), word in zip(codec.plane_slots(tid), words):
                 if pred:
                     fx.memref_store(word, pack, (row, off))
-            if codec.has_scale:  # noqa: SIM102
+            if const_expr(codec.has_scale):  # noqa: SIM102
                 if is_leader:
                     fx.memref_store(
                         scale_word,
@@ -465,7 +465,7 @@ def make_qr_int4_ring_kernel(
             """
             rocdl.s_waitcnt(vmcnt=0)
             gpu.barrier()
-            if release_writeback is not None:
+            if const_expr(release_writeback is not None):
                 llvm.InlineAsmOp(None, [], release_writeback, "", has_side_effects=True)
                 rocdl.s_waitcnt(vmcnt=0)
             if quad_id == fx.Int32(0):
@@ -555,13 +555,13 @@ def make_qr_int4_ring_kernel(
             c_in = step_codec[k - 2] if k >= 2 else None
             c_out = step_codec[k - 1] if k <= steps else None
 
-            if k == 1:
+            if const_expr(k == 1):
                 # Pipeline fill: nothing to receive, push our own contribution.
                 atoms = _load_chunk_atoms(tile, chunk)
                 for j in range_constexpr(rank_atoms):
                     words, word, leader = _codec_quant(c_out, atoms[j], lane, tid)
                     _lds_write_packet(c_out, j, words, word, leader)
-            elif k < world_size:
+            elif const_expr(k < world_size):
                 # Reduce-scatter: add our contribution to the running partial.
                 atoms = _load_chunk_atoms(tile, chunk)
                 for j in range_constexpr(rank_atoms):
@@ -571,7 +571,7 @@ def make_qr_int4_ring_kernel(
                     )
                     words, word, leader = _codec_quant(c_out, acc, lane, tid)
                     _lds_write_packet(c_out, j, words, word, leader)
-            elif k == world_size:
+            elif const_expr(k == world_size):
                 # Last reduce, and the seam: c_in is the reduce-scatter codec,
                 # c_out the all-gather one. Every rank has now contributed, so
                 # this is the final sum for our own chunk: store it from the
@@ -588,7 +588,7 @@ def make_qr_int4_ring_kernel(
                     _store_chunk_atom(tile, chunk, j, acc)
                     words, word, leader = _codec_quant(c_out, acc, lane, tid)
                     _lds_write_packet(c_out, j, words, word, leader)
-            elif k < n_ops:
+            elif const_expr(k < n_ops):
                 # All-gather: the chunk is already final, so decode it for our
                 # own output and forward the bytes we received unmodified. Not
                 # dequantizing-and-requantizing is what keeps this lap free of
@@ -633,14 +633,14 @@ def make_qr_int4_ring_kernel(
             """
             for _ki in range_constexpr(n_ops):
                 k = _ki + 1
-                if k >= 2:
+                if const_expr(k >= 2):
                     _wait(k - 2, color)
                 else:
                     pass  # op 1 is a pure send: there is nothing to wait for
                 for s in range(fx.Int32(0), n_this, fx.Int32(1)):
                     tile = bid + (i + s) * n_blocks
                     _op_substep(k, tile, s)
-                    if k <= steps:
+                    if const_expr(k <= steps):
                         gpu.barrier()
                         _fanout_to_next(k - 1, s)
                         if (s + fx.Int32(1)) < n_this:
@@ -651,7 +651,7 @@ def make_qr_int4_ring_kernel(
                             gpu.barrier()
                     else:
                         pass  # the last op receives only
-                if k <= steps:
+                if const_expr(k <= steps):
                     _publish(k - 1, color)
                 else:
                     pass

@@ -16,7 +16,7 @@ tile (8 GPUs → 1, 4 → 2, 2 → 4); LDS stays ``ATOMS * rank_tile_bytes``.
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl._mlir.dialects import llvm
-from flydsl.expr import gpu, range_constexpr, rocdl
+from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import Int32, Int64, Stream, T
 
 from . import buffer_ops
@@ -260,7 +260,7 @@ def make_qr_int4_kernel(
             for (off, pred), word in zip(c.plane_slots(tid), words):
                 if pred:
                     fx.memref_store(word, pack, (slot, off))
-            if c.has_scale:  # noqa: SIM102
+            if const_expr(c.has_scale):  # noqa: SIM102
                 if is_leader:
                     fx.memref_store(
                         scale, pack, (slot, fx.Int32(c.scale_i32_off) + scale_slot)
@@ -317,7 +317,7 @@ def make_qr_int4_kernel(
                         )
                         pack_peer = peer
                         wire_idx = vec_idx
-                        if rank_atoms != 1:
+                        if const_expr(rank_atoms != 1):
                             pack_peer = peer * fx.Int32(rank_atoms) + fx.Int32(k)
                             wire_idx = vec_idx + fx.Int32(k * c.rank_tile_i32)
                         # 4xi32 NT vector cannot go through the i32 pack view.
@@ -354,7 +354,7 @@ def make_qr_int4_kernel(
             """
             rocdl.s_waitcnt(vmcnt=0)
             gpu.barrier()
-            if release_writeback is not None:
+            if const_expr(release_writeback is not None):
                 llvm.InlineAsmOp(None, [], release_writeback, "", has_side_effects=True)
                 rocdl.s_waitcnt(vmcnt=0)
             limit = fx.Int32(world_size)
@@ -397,7 +397,7 @@ def make_qr_int4_kernel(
 
         def _recv_quantized(phase, src, sub, k=0):
             base = _sub_tile_i32(phase, src, sub)
-            if k:
+            if const_expr(k):
                 base = base + fx.Int32(k * c.rank_tile_i32)
 
             def _get(off):
@@ -438,7 +438,7 @@ def make_qr_int4_kernel(
         # sizes the wire slots and colour array, so n_blocks <= grid always.
         n_block_tiles = (num_tiles - bid + n_blocks - fx.Int32(1)) // n_blocks
         color = _load_color()
-        if super_tile == 1:
+        if const_expr(super_tile == 1):
             for i in range(fx.Int32(0), n_block_tiles, fx.Int32(1)):
                 tile = bid + i * n_blocks
                 atoms = _load_tile_atoms(tile)
