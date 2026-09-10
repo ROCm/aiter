@@ -57,8 +57,10 @@ def _prefill_splits(num_tokens: int, device) -> int:
     Two CTAs per CU rather than one: a single CTA per CU leaves the gather
     latency exposed, and measured 64- and 96-token prefills are 9-25% faster
     at the oversubscribed count. The cap is where the reducer starts costing
-    more than the extra parallelism returns, and it also bounds how much
-    precision the BF16 partials give up.
+    more than the extra parallelism returns. Splitting is accuracy-neutral on
+    scores with realistic structure -- 16 splits measures +0.04 to +0.30 dB
+    against one -- and only costs about 1 dB when the softmax is near uniform,
+    which Gaussian test inputs produce and real top-k selection does not.
     """
     if num_tokens > _SPLIT_TOKEN_LIMIT:
         return 1
@@ -119,7 +121,7 @@ def _compile_sparse_mla_prefill(n_splits: int = 1):
         row_sum: fx.Array[fx.Float32, _NUM_WAVES * 16, 16]
 
     @flyc.kernel(
-        name="flydsl_sparse_mla_prefill_fp8_gfx950",
+        name=f"flydsl_sparse_mla_prefill_fp8_gfx950_s{n_splits}",
         known_block_size=[_NUM_THREADS, 1, 1],
     )
     def kernel(
@@ -134,6 +136,8 @@ def _compile_sparse_mla_prefill(n_splits: int = 1):
         q_rope_token_stride: fx.Int32,
         q_rope_head_stride: fx.Int32,
         scale_log2e: fx.Float32,
+        q_heads: fx.Int32,
+        out_heads: fx.Int32,
     ):
         f32 = T.f32
         neg_inf = fx.Float32(arith.constant(float("-inf"), type=f32))
@@ -195,8 +199,14 @@ def _compile_sparse_mla_prefill(n_splits: int = 1):
 
         # Stage one shared Q copy, distributing its four nope chunks across waves.
         # The existing index barrier also makes this copy visible before QK begins.
-        q_base = token * q_token_stride + lane_col * q_head_stride
-        q_rope_base = token * q_rope_token_stride + lane_col * q_rope_head_stride
+        # A model with fewer heads than the 16-row MFMA tile is read in place
+        # rather than staged into a padded copy. Rows past `q_heads` re-read
+        # head 0 -- in bounds, finite, and dropped by the store predicate --
+        # which costs MFMA lanes the shape could not fill anyway.
+        live_head = lane_col < q_heads
+        safe_head = live_head.select(lane_col, fx.Int32(0))
+        q_base = token * q_token_stride + safe_head * q_head_stride
+        q_rope_base = token * q_rope_token_stride + safe_head * q_rope_head_stride
         q_stage_head = lane_col * _HEAD_DIM
         q_stage_chunk = wave
         q_stage_offset = 128 * q_stage_chunk + 16 * lane_group
@@ -584,18 +594,19 @@ def _compile_sparse_mla_prefill(n_splits: int = 1):
             out_row = token
         else:
             out_row = token * fx.Int32(n_splits) + split
-        output_base = (out_row * _NUM_HEADS + lane_col) * _V_HEAD_DIM
-        for tile in range_constexpr(_DV_TILES_PER_WAVE):
-            dv_offset = (
-                fx.Int32((wave * _DV_TILES_PER_WAVE + tile) * 16) + 4 * lane_group
-            )
-            output_fragment = fx.make_rmem_tensor(fx.make_layout(4, 1), fx.BFloat16)
-            output_fragment.store((accumulators[tile] * inverse4).to(fx.BFloat16))
-            fx.copy(
-                store_bf16x4,
-                output_fragment,
-                fx.slice(out_divided, (None, output_base + dv_offset)),
-            )
+        output_base = (out_row * out_heads + lane_col) * _V_HEAD_DIM
+        if lane_col < out_heads:
+            for tile in range_constexpr(_DV_TILES_PER_WAVE):
+                dv_offset = (
+                    fx.Int32((wave * _DV_TILES_PER_WAVE + tile) * 16) + 4 * lane_group
+                )
+                output_fragment = fx.make_rmem_tensor(fx.make_layout(4, 1), fx.BFloat16)
+                output_fragment.store((accumulators[tile] * inverse4).to(fx.BFloat16))
+                fx.copy(
+                    store_bf16x4,
+                    output_fragment,
+                    fx.slice(out_divided, (None, output_base + dv_offset)),
+                )
 
         # Partials are stored already normalised by their own denominator, so
         # the reducer needs the base-2 LSE to re-weight them. Matches the
@@ -630,6 +641,8 @@ def _compile_sparse_mla_prefill(n_splits: int = 1):
         q_rope_token_stride: fx.Int32,
         q_rope_head_stride: fx.Int32,
         scale_log2e: fx.Float32,
+        q_heads: fx.Int32,
+        out_heads: fx.Int32,
         num_tokens: fx.Int32,
         stream: fx.Stream,
     ):
@@ -645,6 +658,8 @@ def _compile_sparse_mla_prefill(n_splits: int = 1):
             q_rope_token_stride,
             q_rope_head_stride,
             scale_log2e,
+            q_heads,
+            out_heads,
             value_attrs={
                 "rocdl.waves_per_eu": _WAVES_PER_EU,
                 "rocdl.flat_work_group_size": f"{_NUM_THREADS},{_NUM_THREADS}",
@@ -707,6 +722,12 @@ def flydsl_sparse_mla_prefill(
         raise ValueError("q_nope must be a CUDA tensor")
     if q_nope.ndim != 3:
         raise ValueError(f"q_nope must be rank 3, got rank {q_nope.ndim}")
+    # The MFMA tile is 16 rows wide, so the kernel always runs `_NUM_HEADS`.
+    # A model with fewer -- GLM-5.2 at TP8 has 8 -- is padded up rather than
+    # refused; those rows occupy lanes the shape cannot fill anyway.
+    heads = int(q_nope.shape[1])
+    if not 1 <= heads <= _NUM_HEADS:
+        raise ValueError(f"q_nope must have 1..{_NUM_HEADS} heads, got {heads}")
     num_tokens = q_nope.shape[0]
     # Past this the flydsl shim raises a bare struct.error from the argument
     # pack, several frames below the caller. Say which limit was hit instead.
@@ -721,7 +742,7 @@ def flydsl_sparse_mla_prefill(
     _require_tensor(
         q_nope,
         name="q_nope",
-        shape=(num_tokens, _NUM_HEADS, _V_HEAD_DIM),
+        shape=(num_tokens, heads, _V_HEAD_DIM),
         dtype=fp8_dtype,
         device=device,
         contiguous=False,
@@ -730,7 +751,7 @@ def flydsl_sparse_mla_prefill(
     _require_tensor(
         q_rope,
         name="q_rope",
-        shape=(num_tokens, _NUM_HEADS, _ROPE_HEAD_DIM),
+        shape=(num_tokens, heads, _ROPE_HEAD_DIM),
         dtype=fp8_dtype,
         device=device,
         contiguous=False,
@@ -777,7 +798,7 @@ def flydsl_sparse_mla_prefill(
     )
     if out is None:
         out = torch.empty(
-            (num_tokens, _NUM_HEADS, _V_HEAD_DIM),
+            (num_tokens, heads, _V_HEAD_DIM),
             dtype=torch.bfloat16,
             device=device,
         )
@@ -785,16 +806,29 @@ def flydsl_sparse_mla_prefill(
         _require_tensor(
             out,
             name="out",
-            shape=(num_tokens, _NUM_HEADS, _V_HEAD_DIM),
+            shape=(num_tokens, heads, _V_HEAD_DIM),
             dtype=torch.bfloat16,
             device=device,
         )
 
     n_splits = _prefill_splits(num_tokens, device)
+    # The kernel reads `q` at the caller's head count either way. Partials are
+    # a different matter: the shared reducer only takes the full 16, so a
+    # narrow split-K call writes them wide and narrows at the end.
+    out_heads = heads
+    narrow_final = None
     if n_splits == 1:
         # Single split writes the final answer directly; `lse` stays unread.
         kernel_out, partial_lse = out, out
     else:
+        if heads != _NUM_HEADS:
+            out_heads = _NUM_HEADS
+            narrow_final = out
+            out = torch.empty(
+                (num_tokens, _NUM_HEADS, _V_HEAD_DIM),
+                dtype=torch.bfloat16,
+                device=device,
+            )
         kernel_out = torch.empty(
             (1, num_tokens, n_splits, _NUM_HEADS, _V_HEAD_DIM),
             dtype=torch.bfloat16,
@@ -820,6 +854,8 @@ def flydsl_sparse_mla_prefill(
             int(q_rope.stride(0) // 4),
             int(q_rope.stride(1) // 4),
             float(softmax_scale) * _LOG2E,
+            int(heads),
+            int(out_heads),
             int(num_tokens),
             fx.Stream(torch.cuda.current_stream(device=device)),
         )
@@ -833,6 +869,9 @@ def flydsl_sparse_mla_prefill(
             partial_lse,
             out.view(1, num_tokens, _NUM_HEADS, _V_HEAD_DIM),
         )
+    if narrow_final is not None:
+        narrow_final.copy_(out[:, :heads])
+        return narrow_final
     return out
 
 

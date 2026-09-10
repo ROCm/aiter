@@ -17,22 +17,26 @@ from .mla_reduce_kernels import _flydsl_sparse_mla_decode_combine
 _WARM_KEYS: dict[str, set] = {}
 
 
-def _require_warm(key, what: str) -> None:
-    """Refuse to JIT a cold variant inside a graph capture.
+def _require_warm(key, what: str, compile_fn):
+    """Compile a variant outside graph capture, recording only success.
 
     Compiling runs MLIR, hipModuleLoad and disk IO; doing that between
     capture_begin and capture_end is not legal and does not fail cleanly.
-    Every (seq, width) bucket must be run eagerly once first.
+    Every (seq, width) bucket must be run eagerly once first. The key is
+    recorded after `compile_fn` returns, so a compile that raises leaves the
+    variant cold and the next capture still refuses it.
     """
     seen = _WARM_KEYS.setdefault(what, set())
     if key in seen:
-        return
+        return compile_fn()
     if torch.cuda.is_current_stream_capturing():
         raise RuntimeError(
             f"sparse MLA decode: {what} variant {key} is not compiled and this "
             "stream is capturing. Run this shape once outside the capture first."
         )
+    compiled = compile_fn()
     seen.add(key)
+    return compiled
 
 
 def _pick_inner_iter(seq: int, ng_total: int) -> int:
@@ -108,8 +112,15 @@ def _validate_sparse_decode_inputs(
     if out is not None:
         _require_cuda_tensor("out", out, dtype=torch.bfloat16)
 
-    if q.ndim != 3 or tuple(q.shape[1:]) != (H, DIM):
-        raise ValueError(f"q must have shape [seq,{H},{DIM}], got {tuple(q.shape)}")
+    # The MFMA tile is 16 rows wide, so the kernel always runs `H` heads. A
+    # model with fewer -- GLM-5.2 at TP8 has 8 -- is padded up rather than
+    # refused; the wasted rows cost MFMA lanes the shape cannot fill anyway.
+    if q.ndim != 3 or int(q.shape[2]) != DIM or not 1 <= int(q.shape[1]) <= H:
+        raise ValueError(
+            f"q must have shape [seq,heads,{DIM}] with 1 <= heads <= {H}, "
+            f"got {tuple(q.shape)}"
+        )
+    heads = int(q.shape[1])
     seq = int(q.shape[0])
     # seq is runtime; kernels are compiled per split count `ng`, not per seq.
     if not 1 <= seq <= 96:
@@ -121,9 +132,9 @@ def _validate_sparse_decode_inputs(
         raise ValueError(
             f"kv must have shape [P,{DIM}] or [P,1,{DIM}], got {tuple(kv.shape)}"
         )
-    if out is not None and (out.ndim != 3 or tuple(out.shape) != (seq, H, DV)):
+    if out is not None and (out.ndim != 3 or tuple(out.shape) != (seq, heads, DV)):
         raise ValueError(
-            f"out must have shape [{seq},{H},{DV}], got {tuple(out.shape)}"
+            f"out must have shape [{seq},{heads},{DV}], got {tuple(out.shape)}"
         )
     if (
         q.device != kv.device
@@ -146,7 +157,7 @@ def _validate_sparse_decode_inputs(
     arch = str(torch.cuda.get_device_properties(q.device).gcnArchName).split(":")[0]
     if arch != "gfx950":
         raise ValueError(f"FlyDSL sparse MLA decode is gated to gfx950, got {arch}")
-    return seq, ng
+    return seq, ng, heads
 
 
 def _validate_workspace(
@@ -187,9 +198,12 @@ def _launch_partial(
     n_groups = _partial_groups(ng, inner_iter)
     num_cu = int(torch.cuda.get_device_properties(q.device).multi_processor_count)
     split_major = _use_split_major(int(q.shape[0]), n_groups, num_cu)
-    _require_warm((ng, inner_iter, split_major), "partial")
-    launch = compile_sparse_mla_partial(
-        ng, inner_iter=inner_iter, split_major=split_major
+    launch = _require_warm(
+        (ng, inner_iter, split_major),
+        "partial",
+        lambda: compile_sparse_mla_partial(
+            ng, inner_iter=inner_iter, split_major=split_major
+        ),
     )
     _run_compiled(
         launch,
@@ -201,6 +215,7 @@ def _launch_partial(
         float(sm_scale) * math.log2(math.e),
         int(q.shape[0]),
         int(kv.reshape(-1, DIM).shape[0]),
+        int(q.shape[1]),
         fx.Stream(torch.cuda.current_stream(q.device)),
     )
 
@@ -221,7 +236,14 @@ def flydsl_sparse_mla_decode(
     capturing the call in a HIP graph. If they are omitted, temporary scratch is
     allocated eagerly for convenience.
     """
-    seq, ng = _validate_sparse_decode_inputs(q, kv, indices, out)
+    seq, ng, heads = _validate_sparse_decode_inputs(q, kv, indices, out)
+    # The producer reads `q` at the caller's head count, but the partials and
+    # the shared reducer are fixed at the 16-row tile, so a narrow call still
+    # narrows once at the end.
+    narrow_final = None
+    if heads != H:
+        narrow_final = out
+        out = out.new_empty((seq, H, DV))
     inner_iter = _pick_inner_iter(seq, ng)
     ng_partial = _partial_groups(ng, inner_iter)
     if (partial_output is None) != (partial_lse is None):
@@ -260,6 +282,9 @@ def flydsl_sparse_mla_decode(
         partial_lse.unsqueeze(0),
         out.unsqueeze(0),
     )
+    if narrow_final is not None:
+        narrow_final.copy_(out[:, :heads])
+        return narrow_final
     return out
 
 

@@ -403,10 +403,10 @@ def _use_fine_decode_combine(seq: int, ni: int, num_cu: int) -> bool:
     return seq * 16 < 2 * num_cu
 
 
-def _require_warm(key, what: str) -> None:
+def _require_warm(key, what: str, compile_fn):
     from aiter.ops.flydsl.sparse_mla_decode_kernels import _require_warm as _rw
 
-    _rw(key, what)
+    return _rw(key, what, compile_fn)
 
 
 def _flydsl_sparse_mla_decode_combine(
@@ -458,8 +458,9 @@ def _flydsl_sparse_mla_decode_combine(
         final_output.device.index
     ).multi_processor_count
     fine = _use_fine_decode_combine(seq, ni, num_cu)
-    _require_warm((ni, fine), "combine")
-    direct = _compile_sparse_decode_direct_combine(ni, fine)
+    direct = _require_warm(
+        (ni, fine), "combine", lambda: _compile_sparse_decode_direct_combine(ni, fine)
+    )
     _run_compiled(
         direct,
         _pointer_arg(partial_output, torch.bfloat16),
