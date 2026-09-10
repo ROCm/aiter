@@ -923,8 +923,10 @@ def get_2stage_cfgs(
             ksplit = cfg["ksplit"]
         else:
             ksplit = 0
-        kernelName1 = cfg["kernelName1"]
-        kernelName2 = cfg["kernelName2"]
+        kernelName1 = cfg.get("kernelName1", "")
+        kernelName2 = cfg.get("kernelName2", "")
+        kernelName1 = kernelName1 if isinstance(kernelName1, str) else ""
+        kernelName2 = kernelName2 if isinstance(kernelName2, str) else ""
         run_1stage = cfg.get("run_1stage", False)
         if not is_shuffled and not run_1stage:
             logger.warning(
@@ -942,6 +944,21 @@ def get_2stage_cfgs(
         from aiter.fused_moe_asmjit_aot import fused_moe_asmjit_aot
         return MOEMetadata(None, None, block_m, ksplit, run_1stage,
                            stage0=functools.partial(fused_moe_asmjit_aot, config_string = kernelName1.split("__")[1]))
+
+    if kernelName1.startswith("impl__flydsl_gfx942__"):
+        from aiter.ops.flydsl.fused_moe_gfx942 import run_flydsl_moe_gfx942
+
+        return MOEMetadata(
+            None,
+            None,
+            block_m,
+            ksplit,
+            run_1stage,
+            stage0=functools.partial(
+                run_flydsl_moe_gfx942,
+                config_string=kernelName1.split("__", 2)[2],
+            ),
+        )
 
     def get_block_m() -> int:
         if q_dtype_a == dtypes.fp8:
