@@ -32,14 +32,56 @@ def mhc_pre_convert_fn(
 ) -> None: ...
 
 
-def mhc_pre_convert_fn_ref(fn: torch.Tensor) -> torch.Tensor:
-    """Torch equivalent of the HIP ``mhc_pre_convert_fn`` kernel: pack fp32 fn into
-    int32 dwords (hi = bf16(fn) in [31:16], lo = bf16(fn - fp32(hi)) in [15:0])."""
+def mhc_fn_kb(arch: str | None = None) -> int:
+    """k elements per hi/lo interleave block in the packed BF16 ``fn`` layout.
+
+    A lane's fn fragment must cover a whole block, i.e.
+    ``vec_tile = tile_k / (warp_size / 16) >= kb``. wave32 reaches 16 at tile_k=32
+    and its WMMA path consumes a whole 16-float block as two verbatim fragments;
+    wave64 only reaches 8 there, so it uses 8-element blocks and keeps tile_k=32.
+
+    MUST stay in lockstep with ``mhc_fn_kb`` in csrc/kernels/mhc_kernels.cu.
+    """
+    if arch is None:
+        arch = get_gfx_runtime()
+    return 16 if arch == "gfx1250" else 8
+
+
+def mhc_shuffle_fn(fn: torch.Tensor, arch: str | None = None) -> torch.Tensor:
+    """Pack FP32 ``fn`` into the layout the ``w_preshuffle_bf16`` GEMM reads.
+
+    Each FP32 weight is split into ``hi = bf16(fn)`` and ``lo = bf16(fn - fp32(hi))``;
+    bf16 shares fp32's 8-bit exponent, so ``lo`` keeps its magnitude and
+    ``hi*x + lo*x`` reconstructs the FP32 product at BF16 MFMA rate.
+
+    The pair is stored block-interleaved. Viewing the (hc_mult3, hc_hidden_size) int32
+    output as uint16, for ``kb = mhc_fn_kb()``::
+
+        hi(k) at  row * 2 * hc_hidden_size + (k // kb) * 2 * kb + (k % kb)
+        lo(k) at  the same index + kb
+
+    so one block of ``kb`` consecutive k occupies ``kb`` floats -- hi in the first
+    half, lo in the second. Element count and row stride are unchanged.
+
+    ``arch`` defaults to the runtime GPU. Pass it explicitly only to build a layout
+    for a different target than the one this process is running on.
+    """
+    assert fn.dtype == torch.float32, f"fn must be fp32, got {fn.dtype}"
+    kb = mhc_fn_kb(arch)
+    n_row, k = fn.shape
+    assert k % kb == 0, f"hc_hidden_size {k} must be divisible by mhc_fn_kb {kb}"
+    fn = fn.contiguous()
     hi = fn.to(torch.bfloat16)
     lo = (fn - hi.to(torch.float32)).to(torch.bfloat16)
-    hi_bits = hi.view(torch.int16).to(torch.int32) & 0xFFFF
-    lo_bits = lo.view(torch.int16).to(torch.int32) & 0xFFFF
-    return ((hi_bits << 16) | lo_bits).to(torch.int32).contiguous()
+    out16 = torch.empty(n_row, 2 * k, dtype=torch.int16, device=fn.device)
+    blocks = out16.view(n_row, k // kb, 2, kb)
+    blocks[:, :, 0, :] = hi.view(torch.int16).view(n_row, k // kb, kb)
+    blocks[:, :, 1, :] = lo.view(torch.int16).view(n_row, k // kb, kb)
+    return out16.view(torch.int32)
+
+
+# Back-compat name; the HIP kernel and this must produce identical bytes.
+mhc_pre_convert_fn_ref = mhc_shuffle_fn
 
 
 @compile_ops("module_mhc", develop=True)
