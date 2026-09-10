@@ -438,9 +438,8 @@ def _flydsl_sparse_mla_decode_combine(
         raise ValueError("final_output shape does not match partial_output")
     if not (partial_output.device == partial_lse.device == final_output.device):
         raise ValueError("all sparse decode tensors must be on the same device")
-    arch = str(torch.cuda.get_device_properties(final_output.device).gcnArchName).split(
-        ":"
-    )[0]
+    props = torch.cuda.get_device_properties(final_output.device)
+    arch = str(getattr(props, "gcnArchName", "")).split(":")[0]
     if arch != "gfx950":
         raise ValueError(
             f"sparse decode BF16-direct reduce is gated to gfx950, got {arch}"

@@ -105,7 +105,7 @@ def _validate_sparse_decode_inputs(
     kv: torch.Tensor,
     indices: torch.Tensor,
     out: torch.Tensor | None,
-) -> tuple[int, int]:
+) -> tuple[int, int, int]:
     _require_cuda_tensor("q", q, dtype=torch.float8_e4m3fn)
     _require_cuda_tensor("kv", kv, dtype=torch.float8_e4m3fn)
     _require_cuda_tensor("indices", indices, dtype=torch.int32)
@@ -154,7 +154,10 @@ def _validate_sparse_decode_inputs(
     if not 1 <= ng <= 33:
         raise ValueError(f"supported split count is 1..33, got {ng}")
 
-    arch = str(torch.cuda.get_device_properties(q.device).gcnArchName).split(":")[0]
+    # A CUDA build has no `gcnArchName`, so read it defensively: the gate
+    # should refuse the device, not raise AttributeError from inside it.
+    props = torch.cuda.get_device_properties(q.device)
+    arch = str(getattr(props, "gcnArchName", "")).split(":")[0]
     if arch != "gfx950":
         raise ValueError(f"FlyDSL sparse MLA decode is gated to gfx950, got {arch}")
     return seq, ng, heads
