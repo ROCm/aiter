@@ -6,11 +6,23 @@ import torch
 import triton
 
 from aiter.ops.triton.gemm.batched.batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant import (
+    _is_gluon_available,
     batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant,
 )
 from aiter.ops.triton.utils.types import get_fp8_dtypes, str_to_torch_dtype
 
 e5m2_type, e4m3_type = get_fp8_dtypes()
+
+
+def is_gluon_supported():
+    """The gluon batched-a8w8 kernel is only available on supported archs (gfx1250)."""
+    return _is_gluon_available()
+
+
+def _skip_unsupported_backend(backend):
+    """gluon only exists on gfx1250; the triton backend is available everywhere."""
+    if backend == "gluon" and not is_gluon_supported():
+        pytest.skip("Gluon backend not supported on this architecture")
 
 
 def generate_batched_gemm_a16w8_inputs(
@@ -95,6 +107,7 @@ def run_triton(
     dtype=torch.bfloat16,
     y=None,
     transpose_bm=False,
+    backend=None,
 ):
     return batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant(
         x,
@@ -105,6 +118,7 @@ def run_triton(
         dtype=dtype,
         YQ=y,
         transpose_bm=transpose_bm,
+        backend=backend,
     )
 
 
@@ -158,9 +172,11 @@ def get_x_vals():
         for transpose_bm in [True, False]
     ],
 )
+@pytest.mark.parametrize("backend", ["triton", "gluon"])
 def test_batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant(
-    dtype, b, m, n, k, group_size, has_bias, output, transpose_bm
+    dtype, b, m, n, k, group_size, has_bias, output, transpose_bm, backend
 ):
+    _skip_unsupported_backend(backend)
     torch.cuda.empty_cache()  # Helps avoid hangs in large tests
 
     dtype = str_to_torch_dtype[dtype]
@@ -177,6 +193,7 @@ def test_batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant
         dtype=dtype,
         y=y,
         transpose_bm=transpose_bm,
+        backend=backend,
     )
 
     triton.testing.assert_close(a, b, atol=0.1, rtol=0.1)

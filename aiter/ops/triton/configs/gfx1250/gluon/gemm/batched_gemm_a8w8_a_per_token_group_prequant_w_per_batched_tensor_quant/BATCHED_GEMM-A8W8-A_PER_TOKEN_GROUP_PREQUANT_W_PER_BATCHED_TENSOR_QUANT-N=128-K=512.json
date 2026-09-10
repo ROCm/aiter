@@ -1,0 +1,20 @@
+{
+    "M_LEQ_64": {
+        "BLOCK_SIZE_M": 16,
+        "BLOCK_SIZE_N": 32,
+        "BLOCK_SIZE_K": 256,
+        "NUM_BUFFERS": 2,
+        "num_warps": 2,
+        "waves_per_eu": 0,
+        "QUANT_IN_DOT": 1
+    },
+    "any": {
+        "BLOCK_SIZE_M": 64,
+        "BLOCK_SIZE_N": 128,
+        "BLOCK_SIZE_K": 128,
+        "NUM_BUFFERS": 2,
+        "num_warps": 1,
+        "waves_per_eu": 0,
+        "QUANT_IN_DOT": 1
+    }
+}

@@ -40,7 +40,17 @@ for config in config_list:
     def fn(config=config):
         ############################################################
         # <run API>
-        gemm_a8w8(x, weight_triton, x_scale, w_scale, None, dtype, y, config=config)
+        gemm_a8w8(
+            x,
+            weight_triton,
+            x_scale,
+            w_scale,
+            None,
+            dtype,
+            y,
+            config=config,
+            backend="triton",
+        )
         ############################################################
 
     run_profile(fn)

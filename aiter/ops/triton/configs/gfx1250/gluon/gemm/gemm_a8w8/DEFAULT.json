@@ -1,0 +1,54 @@
+{
+    "M_LEQ_16": {
+        "BLOCK_M": 16,
+        "BLOCK_N": 32,
+        "BLOCK_K": 256,
+        "NUM_BUFFERS": 4,
+        "GROUP_SIZE_M": 1,
+        "num_warps": 2,
+        "WARPS_N": 2,
+        "INSTR_K": 128,
+        "kernel_type": "compute_bound",
+        "USE_TDM_STORE": true,
+        "NUM_KSPLIT": 1
+    },
+    "M_LEQ_64": {
+        "BLOCK_M": 64,
+        "BLOCK_N": 64,
+        "BLOCK_K": 256,
+        "NUM_BUFFERS": 3,
+        "GROUP_SIZE_M": 1,
+        "num_warps": 4,
+        "WARPS_N": 2,
+        "INSTR_K": 128,
+        "kernel_type": "compute_bound",
+        "USE_TDM_STORE": true,
+        "NUM_KSPLIT": 1
+    },
+    "M_LEQ_512": {
+        "BLOCK_M": 128,
+        "BLOCK_N": 128,
+        "BLOCK_K": 256,
+        "NUM_BUFFERS": 3,
+        "GROUP_SIZE_M": 8,
+        "num_warps": 4,
+        "WARPS_N": 2,
+        "INSTR_K": 128,
+        "kernel_type": "bandwidth_bound",
+        "USE_TDM_STORE": true,
+        "NUM_KSPLIT": 1
+    },
+    "any": {
+        "BLOCK_M": 128,
+        "BLOCK_N": 128,
+        "BLOCK_K": 256,
+        "NUM_BUFFERS": 3,
+        "GROUP_SIZE_M": 8,
+        "num_warps": 4,
+        "WARPS_N": 2,
+        "INSTR_K": 128,
+        "kernel_type": "compute_bound",
+        "USE_TDM_STORE": true,
+        "NUM_KSPLIT": 1
+    }
+}
