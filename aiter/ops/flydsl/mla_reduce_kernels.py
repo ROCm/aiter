@@ -394,6 +394,12 @@ def _use_fine_decode_combine(seq: int, ni: int, num_cu: int) -> bool:
     return ni > 16 and num_cu <= fine_ctas <= 3 * num_cu
 
 
+def _require_warm(key, what: str) -> None:
+    from aiter.ops.flydsl.sparse_mla_decode_kernels import _require_warm as _rw
+
+    _rw(key, what)
+
+
 def _flydsl_sparse_mla_decode_combine(
     partial_output: torch.Tensor,
     partial_lse: torch.Tensor,
@@ -443,6 +449,7 @@ def _flydsl_sparse_mla_decode_combine(
         final_output.device.index
     ).multi_processor_count
     fine = _use_fine_decode_combine(seq, ni, num_cu)
+    _require_warm((ni, fine), "combine")
     direct = _compile_sparse_decode_direct_combine(ni, fine)
     _run_compiled(
         direct,
@@ -468,11 +475,16 @@ def _resolve_actual_max_splits(reduce_indptr: torch.Tensor) -> int | None:
 
     def _live(entry):
         """True while the cached entry still describes this exact allocation."""
-        ref, cached_ptr, _ = entry
+        ref, cached_base, _ = entry
         if ref is None:
             return False
         storage = ref()
-        return storage is not None and storage.data_ptr() == cached_ptr
+        # The weakref is what detects recycling: a live UntypedStorage keeps its
+        # address, so this comparison never fails on its own. It is here to
+        # catch a base that moved. Compare base against base -- reduce_indptr
+        # may be a view whose data_ptr() sits past the storage base, and
+        # comparing those two would miss on every capture-time lookup.
+        return storage is not None and storage.data_ptr() == cached_base
 
     if torch.cuda.is_current_stream_capturing():
         entry = cache.get(key)
@@ -489,7 +501,9 @@ def _resolve_actual_max_splits(reduce_indptr: torch.Tensor) -> int | None:
     val = derive_actual_max_splits(reduce_indptr)
     if key in cache:
         cache.move_to_end(key)
-    cache[key] = (_storage_ref(reduce_indptr), ptr, val)
+    ref = _storage_ref(reduce_indptr)
+    base = ref().data_ptr() if ref is not None and ref() is not None else ptr
+    cache[key] = (ref, base, val)
     if len(cache) > _ACTUAL_MAX_SPLITS_CACHE_CAP:
         cache.popitem(last=False)
     return val

@@ -4,7 +4,6 @@
 """gfx950 FP8 sparse-MLA prefill specialized for the GLM-5.2 shape."""
 
 import functools
-import struct
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
@@ -12,6 +11,7 @@ import torch
 from flydsl._mlir import ir
 from flydsl._mlir.dialects import llvm as _llvm
 from flydsl.expr import arith, const_expr, range_constexpr, rocdl
+from flydsl.expr import math as fly_math
 from flydsl.expr.typing import T
 from flydsl.expr.typing import Vector as Vec
 
@@ -35,6 +35,36 @@ _KV_LDS_PITCH = _V_HEAD_DIM + 16
 _FP8_MAX = 448.0
 _LOG2E = 1.4426950408889634
 _INT32_MAX = 2**31 - 1
+# `out` reaches the kernel as `out.reshape(-1)`, whose extent is packed as a
+# signed 32-bit shape field, and the store index `output_base + dv_offset` is
+# an Int32 whose largest value is that same extent minus one. Both therefore
+# cap the token count at the same place.
+_MAX_TOKENS = _INT32_MAX // (_NUM_HEADS * _V_HEAD_DIM)
+# One CTA covers one token, so `num_tokens` alone caps how much of the machine
+# a prefill can use: a 1-token call leaves 255 of 256 CUs idle. Past this many
+# tokens the grid already fills the device and splitting only adds a reduce.
+_SPLIT_TOKEN_LIMIT = 96
+# `_BLOCK_N` keys is the smallest slice one CTA can process, and the shared
+# decode reducer accepts at most 33 splits.
+_MAX_SPLITS = min(_TOPK // _BLOCK_N, 33)
+_SPLIT_CAP = 16
+_SPLIT_CHOICES = tuple(s for s in (1, 2, 4, 8, 16, 32) if s <= _MAX_SPLITS)
+
+
+def _prefill_splits(num_tokens: int, device) -> int:
+    """CTAs per token, so a short prefill still reaches most of the device.
+
+    Two CTAs per CU rather than one: a single CTA per CU leaves the gather
+    latency exposed, and measured 64- and 96-token prefills are 9-25% faster
+    at the oversubscribed count. The cap is where the reducer starts costing
+    more than the extra parallelism returns, and it also bounds how much
+    precision the BF16 partials give up.
+    """
+    if num_tokens > _SPLIT_TOKEN_LIMIT:
+        return 1
+    num_cu = torch.cuda.get_device_properties(device).multi_processor_count
+    want = min(2 * num_cu // num_tokens, _SPLIT_CAP)
+    return max(s for s in _SPLIT_CHOICES if s <= want)
 
 
 def _raw(value):
@@ -74,15 +104,16 @@ def _key_slot(tile, row):
     return 32 * (tile >> 1) + 8 * (row >> 2) + 4 * (tile & 1) + (row & 3)
 
 
-@functools.lru_cache(maxsize=1)
-def _compile_sparse_mla_prefill():
+@functools.lru_cache(maxsize=len(_SPLIT_CHOICES))
+def _compile_sparse_mla_prefill(n_splits: int = 1):
+    keys_per_split = _TOPK // n_splits
     lds_v_size = _BLOCK_N * _KV_LDS_PITCH
     lds_p_size = 64 * 48
 
     @fx.struct
     class SharedStorage:
         values: fx.Array[fx.Uint8, lds_v_size, 16]
-        indices: fx.Array[fx.Int32, _TOPK, 16]
+        indices: fx.Array[fx.Int32, keys_per_split, 16]
         probabilities: fx.Array[fx.Uint8, lds_p_size, 16]
         row_max: fx.Array[fx.Float32, _NUM_WAVES * 16, 16]
         row_sum: fx.Array[fx.Float32, _NUM_WAVES * 16, 16]
@@ -97,14 +128,14 @@ def _compile_sparse_mla_prefill():
         kv: fx.Tensor,
         indices: fx.Tensor,
         out: fx.Tensor,
+        lse: fx.Tensor,
         q_token_stride: fx.Int32,
         q_head_stride: fx.Int32,
         q_rope_token_stride: fx.Int32,
         q_rope_head_stride: fx.Int32,
-        scale_bits: fx.Int32,
+        scale_log2e: fx.Float32,
     ):
         f32 = T.f32
-        scale_log2e = fx.Float32(arith.ArithValue(_raw(scale_bits)).bitcast(f32))
         neg_inf = fx.Float32(arith.constant(float("-inf"), type=f32))
         zero_f = fx.Float32(arith.constant(0.0, type=f32))
         zero4 = Vec.filled(4, 0.0, fx.Float32)
@@ -116,8 +147,13 @@ def _compile_sparse_mla_prefill():
         pv_mma = fx.make_mma_atom(fx.rocdl.MFMA(16, 16, 32, fx.Float8E4M3FN))
         load_i32x4 = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), fx.Int32)
         store_bf16x4 = fx.make_copy_atom(fx.rocdl.BufferCopy64b(), fx.BFloat16)
+        store_f32 = fx.make_copy_atom(fx.rocdl.BufferCopy32b(), fx.Float32)
 
-        token = fx.block_idx.x
+        if const_expr(n_splits == 1):
+            token = fx.block_idx.x
+        else:
+            token = fx.block_idx.x // fx.Int32(n_splits)
+            split = fx.block_idx.x % fx.Int32(n_splits)
         thread = fx.thread_idx.x
         wave = thread // 64
         lane = thread % 64
@@ -134,12 +170,16 @@ def _compile_sparse_mla_prefill():
         kv_buffer = _flat_buffer_tensor(kv, T.i32, 4, 1 << 28)
         indices_buffer = _flat_buffer_tensor(indices, T.i32, 4, 1 << 28)
         out_buffer = _flat_buffer_tensor(out, T.bf16, 2, 1 << 29)
+        if const_expr(n_splits > 1):
+            lse_buffer = _flat_buffer_tensor(lse, T.f32, 4, 1 << 28)
         scalar_layout = fx.make_layout(1, 1)
         q_divided = fx.logical_divide(q_buffer, scalar_layout)
         q_rope_divided = fx.logical_divide(q_rope_buffer, scalar_layout)
         kv_divided = fx.logical_divide(kv_buffer, scalar_layout)
         indices_divided = fx.logical_divide(indices_buffer, scalar_layout)
         out_divided = fx.logical_divide(out_buffer, scalar_layout)
+        if const_expr(n_splits > 1):
+            lse_divided = fx.logical_divide(lse_buffer, scalar_layout)
 
         def load_i32_vector4(divided, element):
             fragment = fx.make_rmem_tensor(fx.make_layout(4, 1), fx.Int32)
@@ -183,17 +223,30 @@ def _compile_sparse_mla_prefill():
             lane_col % 2
         )
         index_row = token * _TOPK
+        if const_expr(n_splits > 1):
+            index_row = index_row + split * fx.Int32(keys_per_split)
         key_slot_col = 8 * (lane_col // 4) + (lane_col % 4)
         key_slot_group = 8 * lane_group
 
         # Stage indices once to avoid repeating scattered VMEM loads in the key loop.
-        for iteration in range_constexpr(_TOPK // (_NUM_THREADS * 4)):
-            element = thread * 4 + iteration * (_NUM_THREADS * 4)
-            _lds_store_i32x4(
-                indices_base,
-                fx.Int32(element) * 4,
-                load_i32_vector4(indices_divided, index_row + element),
-            )
+        if const_expr(keys_per_split >= _NUM_THREADS * 4):
+            for iteration in range_constexpr(keys_per_split // (_NUM_THREADS * 4)):
+                element = thread * 4 + iteration * (_NUM_THREADS * 4)
+                _lds_store_i32x4(
+                    indices_base,
+                    fx.Int32(element) * 4,
+                    load_i32_vector4(indices_divided, index_row + element),
+                )
+        else:
+            # Fewer keys than the block can load four-wide in one sweep; the
+            # leading `keys_per_split // 4` threads cover the slice alone.
+            if thread < fx.Int32(keys_per_split // 4):
+                element = thread * 4
+                _lds_store_i32x4(
+                    indices_base,
+                    fx.Int32(element) * 4,
+                    load_i32_vector4(indices_divided, index_row + element),
+                )
         fx.barrier()
 
         q_fragments = []
@@ -242,7 +295,9 @@ def _compile_sparse_mla_prefill():
         ]
         loop_result = init
 
-        for key_start_iv, state in range(0, fx.Int32(_TOPK), _BLOCK_N, init=init):
+        for key_start_iv, state in range(
+            0, fx.Int32(keys_per_split), _BLOCK_N, init=init
+        ):
             key_start = fx.Int32(key_start_iv)
             running_max = fx.Float32(state[0])
             running_sum = fx.Float32(state[1])
@@ -357,7 +412,7 @@ def _compile_sparse_mla_prefill():
                 return fx.Float32(_llvm.intr_maxnum(_raw(left), _raw(right)))
 
             def cross_lane_pair(value, xor_mask):
-                bits = arith.ArithValue(_raw(value)).bitcast(T.i32)
+                bits = value.bitcast(fx.Int32)
                 op = (
                     rocdl.permlane16_swap
                     if const_expr(xor_mask == 16)
@@ -367,8 +422,8 @@ def _compile_sparse_mla_prefill():
                 first = _llvm.extractvalue(i32_type, pair, [0])
                 second = _llvm.extractvalue(i32_type, pair, [1])
                 return (
-                    fx.Float32(arith.ArithValue(first).bitcast(T.f32)),
-                    fx.Float32(arith.ArithValue(second).bitcast(T.f32)),
+                    fx.Int32(first).bitcast(fx.Float32),
+                    fx.Int32(second).bitcast(fx.Float32),
                 )
 
             tile_max = scores[0][0]
@@ -525,7 +580,11 @@ def _compile_sparse_mla_prefill():
         )
         inverse4 = Vec.from_elements([inverse] * 4, dtype=fx.Float32)
 
-        output_base = (token * _NUM_HEADS + lane_col) * _V_HEAD_DIM
+        if const_expr(n_splits == 1):
+            out_row = token
+        else:
+            out_row = token * fx.Int32(n_splits) + split
+        output_base = (out_row * _NUM_HEADS + lane_col) * _V_HEAD_DIM
         for tile in range_constexpr(_DV_TILES_PER_WAVE):
             dv_offset = (
                 fx.Int32((wave * _DV_TILES_PER_WAVE + tile) * 16) + 4 * lane_group
@@ -538,6 +597,26 @@ def _compile_sparse_mla_prefill():
                 fx.slice(out_divided, (None, output_base + dv_offset)),
             )
 
+        # Partials are stored already normalised by their own denominator, so
+        # the reducer needs the base-2 LSE to re-weight them. Matches the
+        # sparse-decode producer, including its empty-slice sentinel.
+        if const_expr(n_splits > 1):
+            # One lane per head publishes it, and every wave holds the same
+            # row max and denominator by this point.
+            lse_lane = (wave == fx.Int32(0)) & (lane < fx.Int32(16))
+            if lse_lane:
+                running_max = fx.Float32(loop_result[0])
+                lse_value = (total_sum > zero_f).select(
+                    fly_math.log2(total_sum) + running_max, fx.Float32(-(2**30))
+                )
+                lse_fragment = fx.make_rmem_tensor(fx.make_layout(1, 1), fx.Float32)
+                lse_fragment.store(Vec.from_elements([lse_value], dtype=fx.Float32))
+                fx.copy(
+                    store_f32,
+                    lse_fragment,
+                    fx.slice(lse_divided, (None, out_row * _NUM_HEADS + lane_col)),
+                )
+
     @flyc.jit
     def launch(
         q_nope: fx.Tensor,
@@ -545,11 +624,12 @@ def _compile_sparse_mla_prefill():
         kv: fx.Tensor,
         indices: fx.Tensor,
         out: fx.Tensor,
+        lse: fx.Tensor,
         q_token_stride: fx.Int32,
         q_head_stride: fx.Int32,
         q_rope_token_stride: fx.Int32,
         q_rope_head_stride: fx.Int32,
-        scale_bits: fx.Int32,
+        scale_log2e: fx.Float32,
         num_tokens: fx.Int32,
         stream: fx.Stream,
     ):
@@ -559,17 +639,18 @@ def _compile_sparse_mla_prefill():
             kv,
             indices,
             out,
+            lse,
             q_token_stride,
             q_head_stride,
             q_rope_token_stride,
             q_rope_head_stride,
-            scale_bits,
+            scale_log2e,
             value_attrs={
                 "rocdl.waves_per_eu": _WAVES_PER_EU,
                 "rocdl.flat_work_group_size": f"{_NUM_THREADS},{_NUM_THREADS}",
             },
         ).launch(
-            grid=(num_tokens, 1, 1),
+            grid=(num_tokens * n_splits, 1, 1),
             block=(_NUM_THREADS, 1, 1),
             stream=stream,
         )
@@ -578,6 +659,8 @@ def _compile_sparse_mla_prefill():
 
 
 def _require_tensor(tensor, *, name, shape, dtype, device, contiguous=True):
+    if not isinstance(tensor, torch.Tensor):
+        raise TypeError(f"{name} must be a torch.Tensor, got {type(tensor).__name__}")
     if tensor.dtype != dtype:
         raise ValueError(f"{name} must have dtype {dtype}, got {tensor.dtype}")
     if tuple(tensor.shape) != tuple(shape):
@@ -617,9 +700,22 @@ def flydsl_sparse_mla_prefill(
         raise RuntimeError(
             f"flydsl_sparse_mla_prefill requires gfx950, got {get_gfx()}"
         )
+    # device below is taken FROM q_nope, so the per-tensor device checks only
+    # prove the inputs agree with each other -- an all-CPU call would pass them
+    # and fail much later inside torch.cuda.device(). Anchor on q_nope here.
+    if not isinstance(q_nope, torch.Tensor) or not q_nope.is_cuda:
+        raise ValueError("q_nope must be a CUDA tensor")
     if q_nope.ndim != 3:
         raise ValueError(f"q_nope must be rank 3, got rank {q_nope.ndim}")
     num_tokens = q_nope.shape[0]
+    # Past this the flydsl shim raises a bare struct.error from the argument
+    # pack, several frames below the caller. Say which limit was hit instead.
+    if num_tokens > _MAX_TOKENS:
+        raise ValueError(
+            f"num_tokens is {num_tokens}; sparse MLA prefill indexes `out` "
+            f"through a 32-bit element count and supports at most "
+            f"{_MAX_TOKENS} tokens per call"
+        )
     device = q_nope.device
     fp8_dtype = torch.float8_e4m3fn
     _require_tensor(
@@ -694,24 +790,48 @@ def flydsl_sparse_mla_prefill(
             device=device,
         )
 
-    scale_bits = struct.unpack("<i", struct.pack("<f", float(softmax_scale) * _LOG2E))[
-        0
-    ]
+    n_splits = _prefill_splits(num_tokens, device)
+    if n_splits == 1:
+        # Single split writes the final answer directly; `lse` stays unread.
+        kernel_out, partial_lse = out, out
+    else:
+        kernel_out = torch.empty(
+            (1, num_tokens, n_splits, _NUM_HEADS, _V_HEAD_DIM),
+            dtype=torch.bfloat16,
+            device=device,
+        )
+        partial_lse = torch.empty(
+            (1, num_tokens, n_splits, _NUM_HEADS),
+            dtype=torch.float32,
+            device=device,
+        )
+
     with torch.cuda.device(device):
         _run_compiled(
-            _compile_sparse_mla_prefill(),
+            _compile_sparse_mla_prefill(n_splits),
             _pointer_tensor(q_nope),
             _pointer_tensor(q_rope),
             kv.view(torch.int8).reshape(-1),
             indices.reshape(-1),
-            out.reshape(-1),
+            kernel_out.reshape(-1),
+            partial_lse.reshape(-1),
             int(q_nope.stride(0) // 4),
             int(q_nope.stride(1) // 4),
             int(q_rope.stride(0) // 4),
             int(q_rope.stride(1) // 4),
-            scale_bits,
+            float(softmax_scale) * _LOG2E,
             int(num_tokens),
             fx.Stream(torch.cuda.current_stream(device=device)),
+        )
+    if n_splits > 1:
+        from aiter.ops.flydsl.mla_reduce_kernels import (
+            _flydsl_sparse_mla_decode_combine,
+        )
+
+        _flydsl_sparse_mla_decode_combine(
+            kernel_out,
+            partial_lse,
+            out.view(1, num_tokens, _NUM_HEADS, _V_HEAD_DIM),
         )
     return out
 
