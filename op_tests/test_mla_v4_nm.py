@@ -2217,6 +2217,22 @@ def _decode_packed(inputs, q_packed, q_rope, kv_packed, kv_rope, gqa_ratio, spli
     return output
 
 
+def _decode_poisoned(ctx, lo, hi, fill, target):
+    """Decode `ctx`'s inputs with packed-row bytes [lo, hi) overwritten by `fill`.
+
+    `target` selects which side is poisoned: "q", "kv" or "both". The originals
+    are cloned per call so each range is measured against the same baseline.
+    """
+    q, kv = ctx["q"].clone(), ctx["kv"].clone()
+    if target in ("q", "both"):
+        q.view(torch.uint8)[..., lo:hi] = fill
+    if target in ("kv", "both"):
+        kv.view(torch.uint8)[..., lo:hi] = fill
+    return _decode_packed(
+        ctx["inputs"], q, ctx["q_rope"], kv, ctx["kv_rope"], ctx["gqa"], ctx["splits"]
+    )
+
+
 @needs_gfx950
 def test_v4_nm_packed_byte_ranges():
     """Each packed-row byte range is read, or ignored, exactly as the layout says.
@@ -2251,27 +2267,29 @@ def test_v4_nm_packed_byte_ranges():
         )
         q0, q_rope = _native_to_2buff_for_asm(inputs["q_bf16"])
         kv0, kv_rope = _native_to_2buff_for_asm(inputs["kv_bf16"])
-        q_rope, kv_rope = q_rope.contiguous(), kv_rope.contiguous()
-        base = _decode_packed(inputs, q0, q_rope, kv0, kv_rope, gqa, splits)
+        ctx = {
+            "inputs": inputs,
+            "q": q0,
+            "kv": kv0,
+            "q_rope": q_rope.contiguous(),
+            "kv_rope": kv_rope.contiguous(),
+            "gqa": gqa,
+            "splits": splits,
+        }
+        base = _decode_packed(
+            inputs, q0, ctx["q_rope"], kv0, ctx["kv_rope"], gqa, splits
+        )
         assert torch.isfinite(base).all(), (
             f"gqa={gqa}: baseline decode is not finite; the poison comparisons "
             "below would be meaningless."
         )
-
-        def poisoned(lo, hi, fill, target):
-            q, kv = q0.clone(), kv0.clone()
-            if target in ("q", "both"):
-                q.view(torch.uint8)[..., lo:hi] = fill
-            if target in ("kv", "both"):
-                kv.view(torch.uint8)[..., lo:hi] = fill
-            return _decode_packed(inputs, q, q_rope, kv, kv_rope, gqa, splits)
 
         # 0xFF is the e8m0 NaN encoding (the byte pattern that broke the model);
         # 0xA5 is an arbitrary non-NaN fill, to catch a read that merely skews.
         for label, lo, hi in inert_ranges:
             for fill in (0xFF, 0xA5):
                 for target in ("q", "kv", "both"):
-                    out = poisoned(lo, hi, fill, target)
+                    out = _decode_poisoned(ctx, lo, hi, fill, target)
                     assert torch.isfinite(out).all(), (
                         f"gqa={gqa}: poisoning {label} of {target} with "
                         f"0x{fill:02X} produced non-finite output — the kernel "
@@ -2288,7 +2306,7 @@ def test_v4_nm_packed_byte_ranges():
                     )
 
         for target in ("q", "kv"):
-            out = poisoned(scale_off, pad_off, 0xFF, target)
+            out = _decode_poisoned(ctx, scale_off, pad_off, 0xFF, target)
             assert not torch.equal(out, base), (
                 f"gqa={gqa}: poisoning the LIVE scale bytes "
                 f"[{scale_off}, {pad_off}) of {target} left the output "
