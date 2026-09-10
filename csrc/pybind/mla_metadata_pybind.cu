@@ -5,4 +5,4 @@
 #include "mla_metadata.h"
 #include "rocm_ops.hpp"
 
-PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) { MLA_METADATA_PYBIND; }
+PYBIND11_MODULE(AITER_EXTENSION_NAME, m) { MLA_METADATA_PYBIND; }

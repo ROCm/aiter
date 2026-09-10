@@ -14,7 +14,7 @@ import torch
 import triton
 import triton.language as tl
 
-from ..gated_delta_rule_utils import (
+from aiter.ops.triton._triton_kernels.gated_delta_rule.gated_delta_rule_utils import (
     IS_AMD,
     IS_NVIDIA_HOPPER,
     RCP_LN2,
@@ -23,13 +23,13 @@ from ..gated_delta_rule_utils import (
     check_shared_mem,
     gated_delta_rule_autotune_configs,
 )
-from ..utils import (
+from aiter.ops.triton._triton_kernels.gated_delta_rule.utils import (
     GatedDeltaRulePrefillMetadata,
     prepare_chunk_indices,
     prepare_chunk_offsets,
     prepare_rebased_cu_seqlens,
 )
-from ..utils.op import exp
+from aiter.ops.triton._triton_kernels.gated_delta_rule.utils.op import exp
 
 NUM_WARPS = [2, 4] if IS_NVIDIA_HOPPER else [2, 4, 8, 16]
 # Workaround: AMD ROCm Triton compiler fails with num_stages=4 in stream pipeline
