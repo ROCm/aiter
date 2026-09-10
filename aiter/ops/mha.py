@@ -1085,6 +1085,7 @@ def gen_fmha_v3_varlen_fwd_fake_tensor(
     gen: torch.Generator | None = None,
     cu_seqlens_q_padded: torch.Tensor | None = None,
     cu_seqlens_k_padded: torch.Tensor | None = None,
+    num_splits: int = 0,
 ) -> tuple[Tensor, Tensor, Tensor, Tensor]:
     device = q.device
     dtype = q.dtype
@@ -1152,6 +1153,7 @@ def fmha_v3_varlen_fwd(
     gen: torch.Generator | None = None,
     cu_seqlens_q_padded: torch.Tensor | None = None,
     cu_seqlens_k_padded: torch.Tensor | None = None,
+    num_splits: int = 0,
 ) -> tuple[Tensor, Tensor, Tensor, Tensor]: ...
 
 
@@ -2930,6 +2932,7 @@ def _flash_attn_varlen_forward(
     out: torch.Tensor | None = None,
     zero_tensors: bool = False,
     sink_ptr: Tensor | None = None,
+    num_splits: int = 0,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     _, nhead_q, hdim_q = q.shape
     batch_size = cu_seqlens_q.numel() - 1
@@ -3048,6 +3051,18 @@ def _flash_attn_varlen_forward(
         ret = ret and (max_seqlen_q > 0 and max_seqlen_k > 0)
         return ret
 
+    splitkv_requested = (
+        num_splits >= 2
+        and get_gfx() == "gfx942"
+        and q.dtype == dtypes.bf16
+        and hdim_q == 192
+        and hdim_v == 128
+    )
+    if splitkv_requested and not can_impl_fmha_v3_fwd():
+        raise ValueError(
+            "num_splits >= 2 requires the gfx942 D_QK=192/D_V=128 varlen ASM path"
+        )
+
     q, k, v = [maybe_contiguous(x) for x in (q, k, v)]
 
     if can_impl_fmha_fwd_hd192_v128_bf16_opus_varlen():
@@ -3133,6 +3148,7 @@ def _flash_attn_varlen_forward(
             None,
             cu_seqlens_q_padded,
             cu_seqlens_k_padded,
+            num_splits,
             # custom_build_args={"md_name": md_name, "blob_gen_cmd": blob_gen_cmd},
         )
     else:
@@ -3408,6 +3424,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
         is_v3_atomic_fp32: bool | None = True,
         how_v3_bf16_cvt: int | None = 1,
         sink_ptr=None,
+        num_splits: int = 0,
     ):
         is_grad = is_grad_enabled and any(x.requires_grad for x in [q, k, v])
         if softmax_scale is None:
@@ -3448,6 +3465,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
             block_table=block_table,
             out=out,
             sink_ptr=sink_ptr,
+            num_splits=num_splits,
         )
         if is_grad:
             assert return_lse
@@ -3552,6 +3570,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
         # sink_ptr (fwd-only sink scores; not differentiable via autograd.
         #           bwd sink gradient d_sink is computed inside mha_varlen_bwd kernel,
         #           not returned here as a positional gradient.)
+        # num_splits (forward dispatch only)
         # We only have gradients for q,k,v (dq,dk,dv) and possibly bias (dbias). Others are None.
         return (
             dq,  # q
@@ -3580,6 +3599,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
             None,  # is_v3_atomic_fp32
             None,  # how_v3_bf16_cvt
             None,  # sink_ptr (not differentiable; bwd uses sink/d_sink args separately)
+            None,  # num_splits
         )
 
 
@@ -3608,6 +3628,7 @@ def flash_attn_varlen_func(
     cu_seqlens_q_padded: torch.Tensor | None = None,
     cu_seqlens_k_padded: torch.Tensor | None = None,
     sink_ptr: Tensor | None = None,
+    num_splits: int = 0,
 ):
     if block_table is not None and (
         cu_seqlens_q_padded is not None or cu_seqlens_k_padded is not None
@@ -3663,6 +3684,9 @@ def flash_attn_varlen_func(
         return_attn_probs: bool. Whether to return the attention probabilities. This option is for
            testing only. The returned probabilities are not guaranteed to be correct
            (they might not have the right scaling).
+        num_splits: int. Split-KV count for the gfx942 D_QK=192/D_V=128 varlen
+            ASM path. 0 selects the measured default, 1 disables split-KV, and
+            2 through 8 request an exact split count. Other paths ignore it.
     Return:
         out: (total, nheads, headdim_v).
         softmax_lse [optional, if return_attn_probs=True]: (nheads, total_q_seqlen). The
@@ -3672,6 +3696,24 @@ def flash_attn_varlen_func(
             The output of softmax (possibly with different scaling). It also encodes the dropout
             pattern (negative means that location was dropped, nonnegative means it was kept).
     """
+    assert 0 <= num_splits <= 8, f"num_splits must be in [0, 8], got {num_splits}"
+    splitkv_shape = (
+        get_gfx() == "gfx942"
+        and q.dtype == dtypes.bf16
+        and q.shape[-1] == 192
+        and v.shape[-1] == 128
+    )
+    auto_splitkv_shape = (
+        q.shape[0] == 4096
+        and k.shape[0] == 42700
+        and max_seqlen_q == 4096
+        and max_seqlen_k == 42700
+        and q.shape[-2] == 12
+        and k.shape[-2] == 12
+    )
+    prefer_asm_splitkv = num_splits != 0 or (
+        splitkv_shape and auto_splitkv_shape
+    )
 
     # Try the PR3039 gfx1250 prefill ASM path before FlyDSL can claim it.
     def can_try_gfx1250_fmha_fwd_with_sink_varlen_asm():
@@ -3735,12 +3777,13 @@ def flash_attn_varlen_func(
             True,
             how_v3_bf16_cvt,
             sink_ptr,
+            num_splits,
         )
 
     # FlyDSL path returns result if supported, None otherwise. window_size[2] (sink
     # size) is unsupported: the FlyDSL gate rejects it, and this screen keeps it off
     # the path so a sink-token request is never silently dropped.
-    if len(window_size) < 3 or window_size[2] == 0:
+    if not prefer_asm_splitkv and (len(window_size) < 3 or window_size[2] == 0):
         from .flydsl.fmha_kernels import flydsl_flash_attn_varlen_func
 
         _flydsl_result = flydsl_flash_attn_varlen_func(
@@ -3767,7 +3810,7 @@ def flash_attn_varlen_func(
         if _flydsl_result is not None:
             return _flydsl_result
 
-    if not ENABLE_CK:
+    if not ENABLE_CK and not prefer_asm_splitkv:
         from .triton.attention.mha import (
             flash_attn_varlen_func as flash_attn_varlen_func_triton,
         )
@@ -3820,6 +3863,7 @@ def flash_attn_varlen_func(
         True,
         how_v3_bf16_cvt,
         sink_ptr,
+        num_splits,
     )
 
 

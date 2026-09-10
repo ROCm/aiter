@@ -1590,6 +1590,7 @@
     "module_fmha_v3_varlen_fwd": {
         "srcs": [
             "f'{AITER_CSRC_DIR}/kernels/mha_common.cu'",
+            "f'{AITER_CSRC_DIR}/kernels/fmha_fwd_v3_splitkv_combine.cu'",
             "f'{AITER_CSRC_DIR}/py_itfs_cu/asm_mha_varlen_fwd.cu'",
             "f'{AITER_CSRC_DIR}/pybind/mha_varlen_fwd_asm_pybind.cu'",
             "f'{AITER_CSRC_DIR}/cpp_itfs/mha_fwd.cu'"

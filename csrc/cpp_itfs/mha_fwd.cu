@@ -269,6 +269,70 @@ float fmha_fwd_v3(mha_fwd_args a, const ck_tile::stream_config& s)
         impl_ptr->launch_kernel({args_ptr, arg_size_ptr, gdx, gdy, gdz, bdx, 1, 1, s_.stream_id_});
     });
 }
+
+float fmha_fwd_v3_splitkv(mha_fwd_args a,
+                          int num_splits,
+                          const ck_tile::stream_config& stream_config)
+{
+    const std::string arch = get_gpu_arch();
+    AITER_CHECK(arch == "gfx942" && !is_mi308_device(),
+                "fmha_fwd_v3_splitkv requires a gfx942 MI300-family device");
+    AITER_CHECK(a.data_type == "bf16" && a.is_group_mode && a.batch == 1 && a.hdim_q == 192 &&
+                    a.hdim_v == 128 && a.nhead_q == a.nhead_k && a.mask_type == 0 &&
+                    a.bias_type == 0 && a.p_drop == 0.0f &&
+                    num_splits >= kFmhaHd192SplitKvMinSplits &&
+                    num_splits <= kFmhaHd192SplitKvMaxSplits,
+                "invalid argument for fmha_fwd_v3_splitkv");
+
+    const fmha_v3_fwdConfig* selected = nullptr;
+    for(const auto& entry : cfg_fmha_splitkv)
+    {
+        const auto& cfg = entry.second;
+        if(cfg.arch == arch && num_splits >= cfg.min_splits && num_splits <= cfg.max_splits)
+        {
+            selected = &cfg;
+            break;
+        }
+    }
+    AITER_CHECK(selected != nullptr, "no matching fmha_fwd_v3_splitkv code object");
+
+    fmha_fwd_v3_args args;
+    init_fmha_fwd_v3_args(args, a, 128, arch);
+    const int kv_tiles    = (a.seqlen_k + 31) / 32;
+    const int split_tiles = (kv_tiles + num_splits - 1) / num_splits;
+    AITER_CHECK(split_tiles * (num_splits - 1) < kv_tiles,
+                "split partition would contain an empty final split");
+
+    // This variant maps grid Y to the split ID, s_v_Bs to keys per split,
+    // and s_o_Bs to the byte stride between split-major output planes.
+    args.s_v_Bs = split_tiles * 32;
+    args.s_o_Bs = a.seqlen_q * args.s_o_Seqs;
+    args.s_lse  = 1;
+
+    static SynchronizedCache<std::string_view, AiterAsmKernel> kernels;
+    const std::string co_name = get_kernel_co_name(selected->co_name, arch);
+    AiterAsmKernel* kernel    = &kernels.get_or_create(selected->knl_name, [&]() {
+        return AiterAsmKernel(selected->knl_name.c_str(), co_name.c_str());
+    });
+
+    size_t arg_size   = sizeof(args);
+    const int q_tiles = (a.seqlen_q + 127) / 128;
+    return ck_tile::launch_kernel(stream_config,
+                                  [=](const ck_tile::stream_config& stream_config_) mutable {
+                                      void* args_ptr       = &args;
+                                      size_t* arg_size_ptr = &arg_size;
+                                      kernel->launch_kernel({args_ptr,
+                                                             arg_size_ptr,
+                                                             a.nhead_q,
+                                                             num_splits,
+                                                             q_tiles,
+                                                             256,
+                                                             1,
+                                                             1,
+                                                             stream_config_.stream_id_});
+                                  });
+}
+
 #endif
 
 #if FAV2_ON

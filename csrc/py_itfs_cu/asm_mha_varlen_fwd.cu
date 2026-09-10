@@ -9,6 +9,7 @@
 
 namespace aiter {
 namespace torch_itfs {
+
 mha_fwd_args get_asm_mha_varlen_fwd_args(bool has_lse,
                                           bool has_dropout_randval,
                                           const mask_info &mask,
@@ -266,7 +267,8 @@ fmha_v3_varlen_fwd(at::Tensor &q,                  // [total_q, hq, d]
                std::optional<const at::Tensor> v_descale_,    // [1] or [b, h_k]
                std::optional<at::Generator> gen_,
                std::optional<const at::Tensor> cu_seqlens_q_padded,   // [b+1]
-               std::optional<const at::Tensor> cu_seqlens_k_padded)   // [b+1])
+               std::optional<const at::Tensor> cu_seqlens_k_padded,   // [b+1]
+               int num_splits)
 {
     auto q_dtype = q.dtype();
     bool is_qkv_fp8 = q_dtype == at::ScalarType::Float8_e4m3fn || q_dtype == at::ScalarType::Float8_e4m3fnuz;
@@ -449,14 +451,66 @@ fmha_v3_varlen_fwd(at::Tensor &q,                  // [total_q, hq, d]
             aiter::ParsePhiloxCudaState, dim3(1), dim3(64), 0, stream, philox_args, rng_state_ptr);
     }
     std::optional<const at::Tensor> seqlens_k = std::nullopt;
+    TORCH_CHECK(num_splits >= 0 && num_splits <= kFmhaHd192SplitKvMaxSplits,
+                "num_splits must be between 0 and ",
+                kFmhaHd192SplitKvMaxSplits);
+    const bool split_auto   = num_splits == 0;
+    const bool split_forced = num_splits >= kFmhaHd192SplitKvMinSplits;
+    const bool auto_splitkv_shape =
+        total_q == 4096 && k.size(0) == 42700 &&
+        max_seqlen_q == 4096 && max_seqlen_k == 42700 &&
+        num_heads == 12 && num_heads_k == 12;
+    const bool split_requested = split_forced || (split_auto && auto_splitkv_shape);
+    const bool splitkv_compatible =
+        split_requested && get_gpu_arch() == "gfx942" &&
+        q_dtype == torch::kBFloat16 && !is_mi308_device() &&
+        batch_size == 1 && max_seqlen_q == total_q && max_seqlen_k == k.size(0) &&
+        num_heads == num_heads_k &&
+        head_size_q == 192 && head_size_v == 128 &&
+        !is_causal && window_size_left == -1 && window_size_right == -1 &&
+        p_dropout == 0.0f && logits_soft_cap == 0.0f &&
+        bias_type == bias_enum::no_bias && !paged_KV &&
+        !q_descale_.has_value() && !return_dropout_randval &&
+        !cu_seqlens_q_padded.has_value() && !cu_seqlens_k_padded.has_value() &&
+        how_v3_bf16_cvt == 1;
+    TORCH_CHECK(!split_forced || splitkv_compatible,
+                "forced gfx942 hd192 split-KV request is incompatible with this input");
+    num_splits =
+        splitkv_compatible
+            ? (split_auto ? (auto_splitkv_shape ? 3 : 1) : num_splits)
+            : 1;
+    const bool use_hd192_splitkv = num_splits > 1;
+    if(use_hd192_splitkv)
+    {
+        const int kv_tiles    = (max_seqlen_k + 31) / 32;
+        const int split_tiles = (kv_tiles + num_splits - 1) / num_splits;
+        TORCH_CHECK(split_tiles * (num_splits - 1) < kv_tiles,
+                    "num_splits=",
+                    num_splits,
+                    " would create an empty final KV partition for seqlen_k=",
+                    max_seqlen_k);
+    }
 
     if (max_seqlen_k > 0) {
         ck_tile::stream_config stream_config{stream};
+        at::Tensor o_parts;
+        at::Tensor lse_parts;
+        at::Tensor producer_out = out;
+        at::Tensor producer_lse = softmax_lse;
+        if(use_hd192_splitkv)
+        {
+            o_parts = torch::empty(
+                {num_splits, total_q, num_heads, head_size_v}, opts.dtype(out_type));
+            lse_parts = torch::empty(
+                {num_splits, num_heads, total_q}, opts.dtype(torch::kFloat32));
+            producer_out = o_parts.select(0, 0);
+            producer_lse = lse_parts.select(0, 0);
+        }
 
         auto drop_seed_offset = std::make_pair(rng_state_ptr, rng_state_ptr + 1);
         auto args =
             get_asm_mha_varlen_fwd_args(
-                has_lse,
+                has_lse || use_hd192_splitkv,
                 return_dropout_randval,
                 mask,
                 batch_size,
@@ -479,8 +533,8 @@ fmha_v3_varlen_fwd(at::Tensor &q,                  // [total_q, hq, d]
                 q_descale_,
                 k_descale_,
                 v_descale_,
-                out,
-                softmax_lse,
+                producer_out,
+                producer_lse,
                 p,
                 softmax_scale,
                 logits_soft_cap,
@@ -490,7 +544,26 @@ fmha_v3_varlen_fwd(at::Tensor &q,                  // [total_q, hq, d]
                 bias_type,
                 how_v3_bf16_cvt);
 
-        float t = aiter::mha_fwd(args, stream_config);
+        float t;
+        if(use_hd192_splitkv)
+        {
+            t = aiter::fmha_fwd_v3_splitkv(args, num_splits, stream_config);
+            aiter::launch_fmha_fwd_v3_splitkv_combine(
+                o_parts.data_ptr(),
+                lse_parts.data_ptr(),
+                out.data_ptr(),
+                softmax_lse.numel() == 0 ? nullptr : softmax_lse.data_ptr(),
+                total_q,
+                num_heads,
+                num_splits,
+                out.stride(0),
+                out.stride(1),
+                stream);
+        }
+        else
+        {
+            t = aiter::mha_fwd(args, stream_config);
+        }
         TORCH_CHECK(t >= 0, "invalid argument for fmha_v3_varlen_fwd");
     }
     else {

@@ -1182,7 +1182,8 @@ namespace py = pybind11;
           py::arg("v_descale")           = std::nullopt, \
           py::arg("gen")                 = std::nullopt, \
           py::arg("cu_seqlens_q_padded") = std::nullopt, \
-          py::arg("cu_seqlens_k_padded") = std::nullopt);
+          py::arg("cu_seqlens_k_padded") = std::nullopt, \
+          py::arg("num_splits")          = 0);
 
 #define MHA_VARLEN_BWD_PYBIND                            \
     m.def("mha_varlen_bwd",                              \
