@@ -307,35 +307,41 @@ def _calc_diff(x, y):
 
 
 # Accuracy budget, measured on gfx1250 (2 ranks, 1024 tok/rank, 7168x3072, E=384,
-# topk=6, --combine fused --combine_quant mxfp8 -- the worst of the six
-# quant x combine scenarios).
+# topk=6, --combine fused).
 #
 # _calc_diff is ||x-y||^2 / (||x||^2 + ||y||^2), a SQUARED error, and the per-layer
 # errors accumulate as a random walk: r ~ sqrt(L) makes r^2 ~ L, so the metric grows
 # about linearly in the layer count, then saturates as it approaches the bound.
-# Measured (mxfp8 wire on; it costs a flat +32% on a8w4 and +1.6% on a4w4):
+# Measured:
 #
-#             L=1       L=2       L=4       L=8
-#   a4w4   0.021877  0.042683  0.080897  0.144881
-#   a8w4   0.001433  0.002871  0.005742  0.011369
+#                   L=1       L=2       L=4       L=8
+#   a4w4 mxfp8   0.021877  0.042683  0.080897  0.144881
+#   a8w4 mxfp8   0.001433  0.002871  0.005742  0.011369
+#   a4w4 mxfp4   0.028256  0.054782  0.102433  0.179518
+#   a8w4 mxfp4   0.007935  0.015777  0.030955  0.059003
 #
-# slope * L / (1 + sat * L) reproduces both rows within 1%, so scaling that curve
+# slope * L / (1 + sat * L) reproduces every row within 1%, so scaling that curve
 # keeps the SAME headroom at every layer count. A flat tol cannot: 0.1 rejects a
 # healthy 8-layer a4w4 run (0.145) yet passes anything at all on a8w4.
-_ACC_TOL = {  # quant key -> (per-layer slope, saturation)
-    "a4w4_mxfp4": (0.0225, 0.031),
-    "a8w4_mxfp4": (0.00143, 0.0012),
+#
+# The wire has to key the table alongside the quant: e2m1 keeps ~3 effective bits,
+# which costs a8w4 5.5x -- its GEMM baseline is small enough that the wire dominates
+# it -- against 1.3x on a4w4. mxfp8 in turn costs a flat +32% on a8w4 and +1.6% on
+# a4w4 over a bf16 wire, so bf16 rides the mxfp8 row.
+_ACC_TOL = {  # (quant key, combine wire) -> (per-layer slope, saturation)
+    ("a4w4_mxfp4", "mxfp8"): (0.0225, 0.031),
+    ("a8w4_mxfp4", "mxfp8"): (0.00143, 0.0012),
+    ("a4w4_mxfp4", "mxfp4"): (0.0296, 0.04),
+    ("a8w4_mxfp4", "mxfp4"): (0.0081, 0.012),
 }
 _ACC_TOL_SAFETY = 1.5
-# The table was calibrated with the mxfp8 wire; --combine_quant mxfp4 is NOT
-# covered by it -- e2m1 keeps ~3 effective bits, so it overshoots these numbers,
-# worst on a8w4 whose baseline is small enough that the wire dominates it. Pin
-# an explicit --logits_tol when running mxfp4.
 
 
-def default_logits_tol(quant_key, n_layers):
+def default_logits_tol(quant_key, combine_quant, n_layers):
     # Per-quant tol for an n_layers chain; see _ACC_TOL for the calibration.
-    slope, sat = _ACC_TOL[quant_key]
+    # --combine base puts nothing on the wire, and --combine_quant none puts bf16;
+    # both stay under the mxfp8 curve.
+    slope, sat = _ACC_TOL[quant_key, "mxfp4" if combine_quant == "mxfp4" else "mxfp8"]
     return _ACC_TOL_SAFETY * slope * n_layers / (1.0 + sat * n_layers)
 
 
@@ -887,7 +893,7 @@ def main():
     if args.acc_verify:
         auto_tol = args.logits_tol is None
         tol = (
-            default_logits_tol(args.quant_type, n_layers)
+            default_logits_tol(args.quant_type, args.combine_quant, n_layers)
             if auto_tol
             else args.logits_tol
         )
@@ -952,8 +958,8 @@ def _parse_args():
         "--logits_tol",
         type=float,
         default=None,
-        help="end-to-end accuracy tol; default: the per-quant budget for --layers "
-        "(see _ACC_TOL)",
+        help="end-to-end accuracy tol; default: the budget for --layers at this "
+        "quant and combine wire (see _ACC_TOL)",
     )
     p.add_argument(
         "--acc_verify", type=int, default=1, help="run fp32 reference accuracy check"
