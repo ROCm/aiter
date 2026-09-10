@@ -78,6 +78,14 @@ def _validate_output_aux(output_aux):
         )
 
 
+def _override_output_aux(metadata, output_aux):
+    """Override the aux sorter only for configs that already emit aux data."""
+    _validate_output_aux(output_aux)
+    if not output_aux or not metadata.output_aux:
+        return metadata
+    return replace(metadata, output_aux=output_aux)
+
+
 def _aux_uses_opus(output_aux, block_size, routed_rows=None, num_experts=None):
     """Pick the auxiliary sort: Opus (one CTA per expert) or the fused one.
 
@@ -1254,9 +1262,7 @@ def _fused_moe_impl(
             metadata = _resolve_metadata(disable_inline_sort=True)
             use_inline_sort = False
 
-    if output_aux:
-        _validate_output_aux(output_aux)
-        metadata = replace(metadata, output_aux=output_aux)
+    metadata = _override_output_aux(metadata, output_aux)
 
     block_size_M = metadata.block_m if block_size_M is None else block_size_M
     # Ensure block_size_M is int (metadata.block_m from CSV may be float)
@@ -3693,8 +3699,7 @@ def fused_moe_2stages(
     )
     if _metadata_transform is not None:
         metadata = _metadata_transform(metadata)
-    if output_aux:
-        metadata = replace(metadata, output_aux=output_aux)
+    metadata = _override_output_aux(metadata, output_aux)
     if (
         getattr(metadata.stage1, "func", metadata.stage1) is _mxfp4_a4w4_stage1_fw
         and metadata.output_aux == AUX_SORT_OPUS

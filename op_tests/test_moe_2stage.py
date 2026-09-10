@@ -775,10 +775,9 @@ parser.add_argument(
     "--output-aux",
     choices=["threestage", "opus"],
     default="",
-    help="Select the auxiliary-sort backend passed to fused_moe(output_aux=...). "
-    "Requires a compatible auxiliary-sort config. 'opus' selects the Opus "
-    "sorter; 'threestage' selects the port's sort. Omitting this option keeps "
-    "the configured backend.",
+    help="Override the auxiliary-sort backend for configs that already emit "
+    "auxiliary route data. 'opus' selects the Opus sorter; 'threestage' "
+    "selects the port's sort. Other configs keep their default path.",
 )
 
 args = parser.parse_args()
