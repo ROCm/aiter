@@ -20,9 +20,11 @@ from aiter.ops.triton.attention.mha_v3 import (
     flash_attn_fp8_func,
     flash_attn_varlen_fp8_func,
 )
+from aiter.ops.triton.utils.types import get_fp8_e4m3_dtype
 from aiter.test_mha_common import (
     generate_qkv,
     generate_random_padding_mask,
+    quantize_fp8_per_bh,
 )
 from op_tests.op_benchmarks.triton.utils.argparse import get_parser
 from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
@@ -44,6 +46,7 @@ class BenchRun:
     profile_dir: str | None
     print_vgpr: bool
     bench_torch: bool
+    backend: str = "triton"
 
 
 VALID_FUNCTIONS = {"fwd", "bwd", "fwd_varlen", "bwd_varlen", "fwd_kvcache"}
@@ -182,6 +185,7 @@ def _make_attn_fn(q, k, v, **kw):
         return_lse=kw["return_lse"],
         return_attn_probs=kw["return_attn_probs"],
         sink=kw["sink"],
+        backend=kw.get("backend"),
     )
 
 
@@ -201,6 +205,7 @@ def _make_varlen_fn(q, k, v, **kw):
         return_lse=kw["return_lse"],
         return_attn_probs=kw["return_attn_probs"],
         sink=kw["sink"],
+        backend=kw.get("backend"),
     )
 
 
@@ -258,8 +263,61 @@ _MAKE_FN_FP8 = {
 }
 
 
-def get_make_fn(function: str, dtype: str) -> Callable:
+# Gluon fp8 entry points
+# Unlike mha_v3's fp8 wrappers, which take high-precision inputs and quantize on
+# every call, the gluon kernel takes pre-quantized fp8 q/k/v plus descales.
+def _make_fp8_gluon_fn(q, k, v, **kw):
+    fp8_dtype = get_fp8_e4m3_dtype()
+    q_fp8, q_descale = quantize_fp8_per_bh(q, fp8_dtype)
+    k_fp8, k_descale = quantize_fp8_per_bh(k, fp8_dtype)
+    v_fp8, v_descale = quantize_fp8_per_bh(v, fp8_dtype)
+    return lambda: flash_attn_func(
+        q_fp8,
+        k_fp8,
+        v_fp8,
+        softmax_scale=kw["sm_scale"],
+        causal=kw["causal"],
+        window_size=kw.get("window_size", (-1, -1)),
+        q_descale=q_descale,
+        k_descale=k_descale,
+        v_descale=v_descale,
+        backend="gluon",
+    )
+
+
+def _make_fp8_varlen_gluon_fn(q, k, v, **kw):
+    fp8_dtype = get_fp8_e4m3_dtype()
+    q_fp8, q_descale = quantize_fp8_per_bh(q, fp8_dtype, kw["cu_seqlens_q"])
+    k_fp8, k_descale = quantize_fp8_per_bh(k, fp8_dtype, kw["cu_seqlens_k"])
+    v_fp8, v_descale = quantize_fp8_per_bh(v, fp8_dtype, kw["cu_seqlens_k"])
+    return lambda: flash_attn_varlen_func(
+        q_fp8,
+        k_fp8,
+        v_fp8,
+        kw["cu_seqlens_q"],
+        kw["cu_seqlens_k"],
+        kw["max_seqlen_q"],
+        kw["max_seqlen_k"],
+        softmax_scale=kw["sm_scale"],
+        causal=kw["causal"],
+        window_size=kw.get("window_size", (-1, -1)),
+        q_descale=q_descale,
+        k_descale=k_descale,
+        v_descale=v_descale,
+        backend="gluon",
+    )
+
+
+_MAKE_FN_FP8_GLUON = {
+    "fwd": _make_fp8_gluon_fn,
+    "fwd_varlen": _make_fp8_varlen_gluon_fn,
+}
+
+
+def get_make_fn(function: str, dtype: str, backend: str = "triton") -> Callable:
     if dtype == "fp8":
+        if backend == "gluon":
+            return _MAKE_FN_FP8_GLUON[function]
         return _MAKE_FN_FP8[function]
     return _MAKE_FN[function]
 
@@ -274,7 +332,7 @@ def make_workloads(
 ) -> tuple[list[tuple], list[tuple]]:
     """Generate realistic workloads from vLLM scheduler parameters.
 
-    Prefill: batch × sq = num_tokens (token budget per step).
+    Prefill: batch x sq = num_tokens (token budget per step).
     Decode: batch = min(num_tokens, max_num_seqs), sq=1.
     Returns (prefill_workloads, decode_workloads).
     Each entry is (batch, sq, sk, causal, functions).
@@ -465,7 +523,7 @@ def _filter_by_memory(configs: list[BenchConfig]) -> list[BenchConfig]:
     for c in configs:
         if c.estimated_memory > limit:
             print(
-                f"[SKIP] {c} — {c.estimated_memory / 1e9:.1f}GB exceeds {vram // 1024**3}GB VRAM",
+                f"[SKIP] {c} -- {c.estimated_memory / 1e9:.1f}GB exceeds {vram // 1024**3}GB VRAM",
                 flush=True,
             )
         else:
@@ -584,8 +642,10 @@ def run_benchmark(run: BenchRun):
         is_bwd = function.startswith("bwd")
         is_varlen = "varlen" in function
         is_decode = function == "fwd_kvcache"
+        is_gluon = run.backend == "gluon"
         requires_grad = is_bwd
-        return_lse = True
+        # The Gluon backend is forward-only and returns just the output tensor.
+        return_lse = not is_gluon
         return_attn_probs = False
         has_pe = D_HEAD > D_HEAD_V
         # Dense iff BOTH bounds are off (-1); either set = a window (matches the kernel's
@@ -594,19 +654,27 @@ def run_benchmark(run: BenchRun):
         window_size = (window_size_left, window_size_right)
         if impl != "default":
             mha_set_impl(impl)
-        # SWA runs on the dao_ai path (any dtype) and the fp8 path (routes to FA3, which
-        # has it); only native non-fp8 lacks it (left-only, right rejected). Skip that
-        # combo cleanly rather than hard-error mid-sweep.
-        if has_sliding_window and impl != "dao_ai" and dtype != "fp8":
+        # SWA runs on the dao_ai path (any dtype), the fp8 path (routes to FA3, which
+        # has it) and the Gluon backend; only native non-fp8 triton lacks it (left-only,
+        # right rejected). Skip that combo cleanly rather than hard-error mid-sweep.
+        if has_sliding_window and not is_gluon and impl != "dao_ai" and dtype != "fp8":
             warnings.warn(
                 "Skipping: sliding window needs -impl dao_ai (or an fp8 dtype)."
             )
             return 0
+        if is_gluon and window_size_right >= 0:
+            warnings.warn("Skipping: Gluon backend does not support a right window.")
+            return 0
         if (fused or dtype == "fp8") and (has_pe or run.sink):
             warnings.warn("Skipping: PE or sink not supported with fused bwd / fp8.")
             return 0
+        # The Gluon kernel is forward-only and has no KV cache path
+        # (see aiter.ops.triton.attention.mha gluon backend).
+        if is_gluon and (is_bwd or is_decode):
+            warnings.warn("Skipping: Gluon backend only supports fwd / fwd_varlen.")
+            return 0
         mha_set_use_fused_bwd_kernel(fused)
-        make_fn = get_make_fn(function, dtype)
+        make_fn = get_make_fn(function, dtype, run.backend)
 
         # Default softmax scale to match standard attention
         if sm_scale is None:
@@ -714,6 +782,7 @@ def run_benchmark(run: BenchRun):
                 "window_size": window_size,
                 "has_pe": has_pe,
                 "has_sink": run.sink,
+                "backend": run.backend,
                 "cu_seqlens_q": cu_seqlens_q,
                 "cu_seqlens_k": cu_seqlens_k,
                 "max_seqlen_q": max_seqlen_q,
@@ -743,6 +812,7 @@ def run_benchmark(run: BenchRun):
                 "window_size": window_size,
                 "has_pe": has_pe,
                 "has_sink": run.sink,
+                "backend": run.backend,
             }
             fn = make_fn(q_input, k_input, v_input, **fn_kwargs)
             if fn is None:
@@ -954,6 +1024,14 @@ def parse_args(args: list[str] | None = None) -> BenchRun:
         default=-1,
         help="right sliding window size (-1 = no right bound)",
     )
+    parser.add_argument(
+        "-backend",
+        type=str,
+        default="triton",
+        choices=["triton", "gluon"],
+        help="Attention backend: 'triton' (default) or 'gluon' "
+        "(forward-only gfx950 kernel; only fwd / fwd_varlen).",
+    )
     parsed = parser.parse_args(args=args)
 
     # Validate dtypes
@@ -1056,6 +1134,7 @@ def parse_args(args: list[str] | None = None) -> BenchRun:
         profile_dir=parsed.profile,
         print_vgpr=parsed.print_vgpr,
         bench_torch=parsed.bench_torch,
+        backend=parsed.backend,
     )
 
 

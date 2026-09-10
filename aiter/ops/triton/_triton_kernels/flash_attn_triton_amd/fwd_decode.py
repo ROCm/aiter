@@ -5,8 +5,8 @@ import torch
 import triton
 import triton.language as tl
 
-from .common import apply_rotary
-from .utils import (
+from aiter.ops.triton._triton_kernels.flash_attn_triton_amd.common import apply_rotary
+from aiter.ops.triton._triton_kernels.flash_attn_triton_amd.utils import (
     AUTOTUNE,
     DEBUG,
     AutotuneMode,

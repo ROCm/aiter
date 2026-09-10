@@ -8,11 +8,15 @@ Gated Delta Rule Decode Operations (Forward Only).
 This module provides optimized Triton kernels for decode/inference operations.
 """
 
-from .fused_rearrange_sigmoid_gdr import (
+from aiter.ops.triton._triton_kernels.gated_delta_rule.decode.fused_rearrange_sigmoid_gdr import (
     fused_rearrange_sigmoid_gated_delta_rule_update_kernel,
 )
-from .fused_recurrent import _fused_recurrent_gated_delta_rule_fwd_kernel
-from .fused_sigmoid_gating_recurrent import fused_sigmoid_gating_delta_rule_update
+from aiter.ops.triton._triton_kernels.gated_delta_rule.decode.fused_recurrent import (
+    _fused_recurrent_gated_delta_rule_fwd_kernel,
+)
+from aiter.ops.triton._triton_kernels.gated_delta_rule.decode.fused_sigmoid_gating_recurrent import (
+    fused_sigmoid_gating_delta_rule_update,
+)
 
 __all__ = [
     "_fused_recurrent_gated_delta_rule_fwd_kernel",

@@ -15,14 +15,18 @@ import torch
 import triton
 import triton.language as tl
 
-from ..gated_delta_rule_utils import (
+from aiter.ops.triton._triton_kernels.gated_delta_rule.gated_delta_rule_utils import (
     IS_TMA_SUPPORTED,
     autotune_cache_kwargs,
     gated_delta_rule_autotune_configs,
     input_guard,
 )
-from .index import prepare_chunk_indices
-from .op import make_tensor_descriptor
+from aiter.ops.triton._triton_kernels.gated_delta_rule.utils.index import (
+    prepare_chunk_indices,
+)
+from aiter.ops.triton._triton_kernels.gated_delta_rule.utils.op import (
+    make_tensor_descriptor,
+)
 
 FLA_TRIL_PRECISION = os.environ.get("FLA_TRIL_PRECISION", "ieee")
 assert FLA_TRIL_PRECISION in [
