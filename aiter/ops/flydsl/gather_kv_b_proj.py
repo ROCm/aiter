@@ -171,14 +171,20 @@ def gather_kv_b_proj_flydsl(
     """Fused gather + kv_b_proj + rope copy. Writes k_prefix / v_prefix in place.
 
     For fp8 outputs, ``k_out_scale`` and ``v_out_scale`` are required fp32
-    single-element device tensors containing positive, finite *descales*:
-    ``out = saturate_e4m3(projection / out_scale)`` and the consumer reconstructs
-    ``out.float() * out_scale``. K's scale also applies to its RoPE columns.
+    single-element device tensors containing positive, finite *descales* with
+    finite fp32 reciprocals. The epilogue computes ``inv_scale = fp32(1 / scale)``
+    once, then ``out = saturate_e4m3(fp32(projection * inv_scale))``; this can
+    round differently from direct division at E4M3 rounding boundaries.
+    The consumer reconstructs ``out.float() * scale``. K's RoPE columns use
+    ``saturate_e4m3(fp32(cache_rope * fp32(k_scale * inv_k_out_scale)))``.
     Scaling/conversion happens directly from fp32 in the epilogue, with no
     intermediate bf16 output or amax/quantization launch. The caller chooses
     the scales (for example from calibration); this is not dynamic quantization.
     Scale values are not copied to the host or checked at runtime, so this API
-    remains graph-capture safe. BF16 outputs must omit both output scales.
+    remains graph-capture safe. Invalid scales can silently produce NaN K/V
+    (for example, a zero scale makes zero inputs evaluate as ``0 * inf``),
+    which can propagate through downstream attention; saturation does not
+    sanitize NaNs. BF16 outputs must omit both output scales.
 
     ``kv_indptr`` and ``kv_prefix_sum_context_lens`` are accepted but unused --
     with page_size 1 the output row index *is* the token index, which is why the
@@ -355,8 +361,10 @@ def gather_kv_b_proj_flydsl(
         k_scale.reshape(-1).to(torch.float32).contiguous(),
         _as_i8(k_prefix).view(-1),
         _as_i8(v_prefix).view(-1),
-        (k_out_scale if output_fp8 else k_scale).reshape(-1),
-        (v_out_scale if output_fp8 else k_scale).reshape(-1),
+        # BF16 uses compile-time unity placeholders, with no scale pointers
+        # in the generated ABI and no extra allocation or device launch.
+        k_out_scale.reshape(-1) if output_fp8 else 1.0,
+        v_out_scale.reshape(-1) if output_fp8 else 1.0,
         m_rows,
         fx.Stream(torch.cuda.current_stream(device=k_buffer.device)),
     )

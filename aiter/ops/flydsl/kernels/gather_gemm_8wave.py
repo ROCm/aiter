@@ -509,6 +509,10 @@ def compile_gather_kv_b_proj_8w(
         B_lds_next_0: fx.Array[fx.Float8E4M3FN, b_lds_size, 16]
         B_lds_next_1: fx.Array[fx.Float8E4M3FN, b_lds_size, 16]
 
+    # BF16 has no output-scale device arguments. Compile-time unity sentinels
+    # cannot accidentally alias the activation scale in a later epilogue edit.
+    OutputScaleArg = fx.Tensor if output_fp8 else fx.Constexpr[float]
+
     @flyc.kernel(name=_kname, known_block_size=[512, 1, 1])
     def kernel_gather(
         KV_cache: fx.Tensor,
@@ -518,8 +522,8 @@ def compile_gather_kv_b_proj_8w(
         K_scale: fx.Tensor,
         K_prefix: fx.Tensor,
         V_prefix: fx.Tensor,
-        K_out_scale: fx.Tensor,
-        V_out_scale: fx.Tensor,
+        K_out_scale: OutputScaleArg,
+        V_out_scale: OutputScaleArg,
         m_rows: fx.Int32,
     ):
         F8_IR_t = fx.Float8E4M3FN.ir_type
@@ -776,8 +780,8 @@ def compile_gather_kv_b_proj_8w(
         K_scale: fx.Tensor,
         K_prefix: fx.Tensor,
         V_prefix: fx.Tensor,
-        K_out_scale: fx.Tensor,
-        V_out_scale: fx.Tensor,
+        K_out_scale: OutputScaleArg,
+        V_out_scale: OutputScaleArg,
         m_rows: fx.Int32,
         stream: fx.Stream,
     ):
