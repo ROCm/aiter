@@ -269,6 +269,7 @@ def _is_mxfp4_inline_sort(metadata):
             and not metadata.prequant
             and metadata.fuse_quant == "fp4"
             and p1["inline_quant"]
+            and metadata.stage1.keywords.get("act", "silu") == p1["activation"]
             and p2 is not None
             and int(metadata.block_m) == p1["BM"]
             and p2["sort_block_m"] == p1["BM"]
@@ -1894,6 +1895,7 @@ def _mxfp4_a4w4_stage1(
     use_nt=False,
     interleave=False,
     act="silu",
+    swiglu_limit=None,
     situ_beta=1.0,
     situ_linear_beta=1.0,
 ):
@@ -1967,6 +1969,7 @@ def _mxfp4_a4w4_stage1(
         interleave=interleave,
         xcd_swizzle=_xcd1,
         act=act,
+        swiglu_limit=swiglu_limit,
         situ_beta=situ_beta,
         situ_linear_beta=situ_linear_beta,
     )
@@ -2132,6 +2135,7 @@ def _mxfp4_a4w4_stage1_fw(
     moe_buf=None,
     interleave=False,
     act="silu",
+    swiglu_limit=None,
     situ_beta=1.0,
     situ_linear_beta=1.0,
     **_kwargs,
@@ -2179,6 +2183,7 @@ def _mxfp4_a4w4_stage1_fw(
         use_nt=p1["use_nt"],
         interleave=interleave,
         act=act,
+        swiglu_limit=swiglu_limit,
         situ_beta=situ_beta,
         situ_linear_beta=situ_linear_beta,
     )
@@ -2445,14 +2450,17 @@ def _make_mxfp4_metadata(
     run_1stage=False,
 ):
     try:
-        parsed_block_m = _parse_mxfp4_g1_kname(kernel_name1)["BM"]
+        parsed_g1 = _parse_mxfp4_g1_kname(kernel_name1)
+        parsed_block_m = parsed_g1["BM"]
     except (KeyError, TypeError, ValueError):
+        parsed_g1 = {"activation": "silu"}
         parsed_block_m = BLOCK_SIZE_M
     return MOEMetadata(
         stage1=functools.partial(
             _mxfp4_a4w4_stage1_fw,
             kernelName1=kernel_name1,
             interleave=(gate_mode == GateMode.INTERLEAVE),
+            act=parsed_g1["activation"],
         ),
         stage2=functools.partial(_mxfp4_a4w4_stage2_fw, kernelName2=kernel_name2),
         block_m=parsed_block_m if block_m is None else int(block_m),
@@ -2720,6 +2728,14 @@ def get_2stage_cfgs(
         elif _disable_inline_sort and _is_inline_sort_cfg(kn1, kn2):
             cfg = None
             logger.warning("[fused_moe] discarding tuned inline-sort config")
+        elif _is_inline_sort_cfg(kn1, kn2) and (
+            activation == ActivationType.Swiglu
+        ) != (_parse_mxfp4_g1_kname(kn1)["activation"] == "swiglu"):
+            cfg = None
+            logger.warning(
+                "[fused_moe] discarding inline-sort config with mismatched "
+                "activation tag"
+            )
         elif _is_inline_sort_cfg(kn1, kn2) and (is_ep or has_stage2_bias):
             cfg = None
             unsupported = "expert_mask" if is_ep else "bias2"
@@ -3600,15 +3616,21 @@ def fused_moe_2stages(
         extra_stage1_args["situ_linear_beta"] = (
             1.0 if linear_beta is None else float(linear_beta)
         )
-    elif stage1_func is _mxfp4_a4w4_stage1_fw and activation == ActivationType.Situv2:
-        # mxmoe stage1 takes SiTUv2 as a compile-time act plus runtime betas.
-        extra_stage1_args["act"] = "situv2"
-        extra_stage1_args["situ_beta"] = (
-            DEFAULT_SITUV2_BETA if beta is None else float(beta)
-        )
-        extra_stage1_args["situ_linear_beta"] = (
-            DEFAULT_SITUV2_LINEAR_BETA if linear_beta is None else float(linear_beta)
-        )
+    elif stage1_func is _mxfp4_a4w4_stage1_fw:
+        if activation == ActivationType.Swiglu:
+            if metadata.stage1.keywords.get("act") != "swiglu":
+                raise RuntimeError("SwiGLU mxmoe stage1 requires a tagged kernel")
+            extra_stage1_args["swiglu_limit"] = swiglu_limit
+        elif activation == ActivationType.Situv2:
+            extra_stage1_args["act"] = "situv2"
+            extra_stage1_args["situ_beta"] = (
+                DEFAULT_SITUV2_BETA if beta is None else float(beta)
+            )
+            extra_stage1_args["situ_linear_beta"] = (
+                DEFAULT_SITUV2_LINEAR_BETA
+                if linear_beta is None
+                else float(linear_beta)
+            )
     elif stage1_func is _opus_a8w4_stage1_wrapper:
         if metadata.skip_inter_quant:
             extra_stage1_args["output_sorted"] = True

@@ -3,6 +3,7 @@
 
 
 import functools
+import math
 
 import torch
 
@@ -94,6 +95,7 @@ def flydsl_mxfp4_gemm1(
     interleave=False,
     xcd_swizzle=0,
     act="silu",
+    swiglu_limit=None,
     situ_beta=1.0,
     situ_linear_beta=1.0,
     stream=None,
@@ -109,12 +111,19 @@ def flydsl_mxfp4_gemm1(
         BN=BN,
         BK=BK,
     )
+    if act not in ("silu", "situv2", "swiglu"):
+        raise ValueError(f"unsupported activation variant {act!r}")
     if act == "situv2" and (float(situ_beta) <= 0.0 or float(situ_linear_beta) <= 0.0):
         # The epilogue takes their reciprocals; non-positive betas give inf/NaN.
         raise ValueError(
             "situ_beta/situ_linear_beta must be > 0, got "
             f"{situ_beta!r}/{situ_linear_beta!r}"
         )
+    runtime_beta = float(situ_beta)
+    if act == "swiglu":
+        runtime_beta = 7.0 if swiglu_limit is None else float(swiglu_limit)
+        if runtime_beta < 0.0 or math.isnan(runtime_beta):
+            raise ValueError(f"swiglu_limit must be non-negative, got {swiglu_limit!r}")
     from .kernels.mxfp4_gemm1 import gemm1_grid
 
     launch = _get_compiled_mxfp4_gemm1_port(
@@ -147,7 +156,7 @@ def flydsl_mxfp4_gemm1(
             inter_sorted_quant.data_ptr(),
             inter_sorted_shuffled_scale.data_ptr(),
             hidden_states.data_ptr(),
-            float(situ_beta),
+            runtime_beta,
             float(situ_linear_beta),
             torch.cuda.current_stream() if stream is None else stream,
         ),

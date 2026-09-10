@@ -26,6 +26,7 @@ _MODEL_CONFIG_DIR = f"{AITER_ROOT_DIR}/aiter/configs/model_configs"
 # glob misses gets no AOT job at all and JITs on the first inference call.
 DEFAULT_CSVS = sorted(
     set(glob.glob(f"{_MODEL_CONFIG_DIR}/*_fp4_tuned_fmoe.csv"))
+    | set(glob.glob(f"{_MODEL_CONFIG_DIR}/*_a16w4_tuned_fmoe.csv"))
     | set(glob.glob(f"{_MODEL_CONFIG_DIR}/*_a4w4_tuned_fmoe.csv"))
     | set(glob.glob(f"{_MODEL_CONFIG_DIR}/*_a8w4_tuned_fmoe.csv"))
 )
@@ -93,6 +94,7 @@ def parse_csv(csv_path: str):
     from aiter.ops.flydsl.mxfp4_gemm2_kernels import _epilog_of
     from aiter.ops.flydsl.mxfp4_kname import (
         _is_mxfp4_kname,
+        _normalize_mxfp4_activation,
         _parse_mxfp4_g1_kname,
         _parse_mxfp4_g2_kname,
         parse_flydsl_v2_gemm2_kernel,
@@ -110,8 +112,6 @@ def parse_csv(csv_path: str):
 
     with open(csv_path, newline="") as f:
         for row in csv.DictReader(f):
-            activation = str(row.get("act_type", "")).split(".")[-1].strip().lower()
-            activation = "situv2" if activation == "situv2" else "silu"
             topk = int(row["topk"])
             # Shape comes from CSV columns; layout-v2 uses the exact K.
             model_dim = int(row["model_dim"])
@@ -128,7 +128,13 @@ def parse_csv(csv_path: str):
 
             kn1 = (row.get("kernelName1") or "").strip()
             if _is_mxfp4_kname(kn1):
+                activation = _normalize_mxfp4_activation(row.get("act_type", ""))
                 p1 = _parse_mxfp4_g1_kname(kn1)
+                if (activation == "swiglu") != (p1["activation"] == "swiglu"):
+                    raise ValueError(
+                        f"activation mismatch: row={activation!r}, "
+                        f"kernel={p1['activation']!r}"
+                    )
                 _add(
                     {
                         "stage": 1,
