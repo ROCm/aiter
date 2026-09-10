@@ -484,7 +484,7 @@ def mhc_pre_fake(
     return post_mix, comb_mix, layer_input
 
 
-@torch_compile_guard(gen_fake=mhc_pre_fake)
+@torch_compile_guard(mutates_args=[], gen_fake=mhc_pre_fake)
 def mhc_pre(
     residual: torch.Tensor,
     fn: torch.Tensor,
@@ -647,7 +647,7 @@ def mhc_fused_post_pre_fake(
     return post_mix, comb_mix, layer_input_out, next_residual
 
 
-@torch_compile_guard(gen_fake=mhc_fused_post_pre_fake)
+@torch_compile_guard(mutates_args=[], gen_fake=mhc_fused_post_pre_fake)
 def mhc_fused_post_pre_large_m(
     layer_input: torch.Tensor,
     residual_in: torch.Tensor,
@@ -715,7 +715,7 @@ def mhc_fused_post_pre_large_m(
     return post_mix, comb_mix, layer_input_out, next_residual
 
 
-@torch_compile_guard(gen_fake=mhc_fused_post_pre_fake)
+@torch_compile_guard(mutates_args=[], gen_fake=mhc_fused_post_pre_fake)
 def mhc_fused_post_pre(
     layer_input: torch.Tensor,
     residual_in: torch.Tensor,
