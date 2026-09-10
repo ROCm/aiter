@@ -181,10 +181,13 @@ def compile_sparse_mla_partial(
         ]
 
         for k_i in fx.range_constexpr(inner_iter):
-            # Preserve the direct reducer's XOR tree: for ng=32 and
-            # inner_iter=2, merge (0,16), (1,17), ... rather than adjacent
-            # rows.  This removes one real partial row per pair while
-            # matching the reducer's first active shuffle level.
+            # For ng=32 and inner_iter=2 this merges (0,16), (1,17), ... rather
+            # than adjacent rows, removing one real partial row per pair. The
+            # pairing is otherwise free: the reducer's max and sum trees are an
+            # unconditional six-level butterfly over all 64 lanes, masked only
+            # on their inputs, so which tiles a producer pre-paired changes
+            # rounding order and nothing else. What adjacent pairing would buy
+            # is contiguous index entries per CTA instead of 1024 apart.
             tile = split + fx.Int32(k_i * n_groups)
             index_offset = (
                 fx.Int64(tok) * (ng * BLOCK_I)

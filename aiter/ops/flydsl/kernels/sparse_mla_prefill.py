@@ -77,9 +77,9 @@ _SPLIT_CHOICES = tuple(
 def _prefill_splits(num_tokens: int, device) -> int:
     """CTAs per token, so a short prefill still reaches most of the device.
 
-    Two CTAs per CU rather than one: a single CTA per CU leaves the gather
-    latency exposed, and measured 64- and 96-token prefills are 9-25% faster
-    at the oversubscribed count. The cap is where the reducer starts costing
+    Target two CTAs per CU rather than one: below that the grid does not even
+    cover the device -- 96 tokens at 2 splits is 192 CTAs against 256 CUs --
+    and measured 64- and 96-token prefills are 9-25% faster once it does. The cap is where the reducer starts costing
     more than the extra parallelism returns. Splitting is accuracy-neutral on
     scores with realistic structure -- 16 splits measures +0.04 to +0.30 dB
     against one -- and only costs about 1 dB when the softmax is near uniform,
@@ -767,9 +767,10 @@ def flydsl_sparse_mla_prefill(
         raise ValueError("q_nope must be a CUDA tensor")
     if q_nope.ndim != 3:
         raise ValueError(f"q_nope must be rank 3, got rank {q_nope.ndim}")
-    # The MFMA tile is 16 rows wide, so the kernel always runs `_NUM_HEADS`.
-    # A model with fewer -- GLM-5.2 at TP8 has 8 -- is padded up rather than
-    # refused; those rows occupy lanes the shape cannot fill anyway.
+    # The MFMA tile is 16 rows wide, so the kernel always runs 16 head
+    # slots. A model with fewer -- GLM-5.2 at TP8 has 8 -- is read in place
+    # at its own row stride, not staged into a padded copy; the slots past
+    # it re-read head 0 and are dropped downstream.
     heads = int(q_nope.shape[1])
     if not 1 <= heads <= _NUM_HEADS:
         raise ValueError(f"q_nope must have 1..{_NUM_HEADS} heads, got {heads}")
@@ -813,13 +814,11 @@ def flydsl_sparse_mla_prefill(
         raise ValueError(
             "kv must be contiguous float8_e4m3fn on the same device as q_nope"
         )
-    # The launcher hands the kernel `kv.view(torch.int8).reshape(-1)`, and the
-    # extent of that tensor is packed as a 32-bit int. Past 2 GiB the pack
-    # itself raises `'i' format requires -2147483648 <= number <= 2147483647`
-    # from inside the shim -- and the launch that follows faults the GPU rather
-    # than failing cleanly. Decode does not share the limit: it passes kv as a
-    # bare pointer. Say so here instead of letting a caller discover it as a
-    # memory access fault.
+    # The launcher hands the kernel `kv.view(torch.int8).reshape(-1)`, whose
+    # extent the shim packs into a signed 32-bit shape field, so an int8 view
+    # past 2 GiB raises a bare `'i' format requires -2147483648 <= number <=
+    # 2147483647` several frames below the caller. Name the limit here instead.
+    # Decode has no such bound: it passes kv as a plain pointer.
     kv_bytes = kv.numel() * kv.element_size()
     if kv_bytes > _INT32_MAX:
         raise ValueError(
