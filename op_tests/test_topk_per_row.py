@@ -166,7 +166,7 @@ def run_top_k_per_row_prefill(
     Run the top_k_per_row kernel.
     """
     if flydsl:
-        return aiter.flydsl_radix_topk_one_block_gfx1250_prefill(
+        return aiter.flydsl_radix_topk_one_block_prefill(
             logits,
             row_starts,
             row_ends,
@@ -216,8 +216,8 @@ def run_top_k_per_row_decode(
     """
     if flydsl:
         assert not fast, "fast and flydsl cannot both be enabled"
-        if get_gfx() == "gfx1250":
-            return aiter.flydsl_radix_topk_one_block_gfx1250_decode(
+        if get_gfx() in ("gfx942", "gfx950", "gfx1250"):
+            return aiter.flydsl_radix_topk_one_block_decode(
                 logits,
                 next_n,
                 seqLens,
@@ -548,7 +548,7 @@ test_mb_workspace_reuse()
 
 
 df = []
-prefill_flydsl_available = get_gfx() == "gfx1250"
+prefill_flydsl_available = get_gfx() in ("gfx942", "gfx950", "gfx1250")
 for data_generation in args.data_generation:
     for m in args.context_len:
         for k in args.top_k:
