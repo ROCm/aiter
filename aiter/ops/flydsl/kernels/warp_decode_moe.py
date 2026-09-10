@@ -31,9 +31,9 @@ from __future__ import annotations
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl._mlir import ir
-from flydsl._mlir.dialects import gpu, llvm
+from flydsl._mlir.dialects import llvm
 from flydsl._mlir.extras import types as T
-from flydsl.expr import const_expr, range_constexpr
+from flydsl.expr import const_expr, gpu, range_constexpr
 from flydsl.expr import math as fxmath
 from flydsl.expr.typing import BFloat16
 
@@ -128,9 +128,8 @@ def dot2_f32_bf16_scalar(a_i32, b_i32, acc_f32):
     add reassociation only, so a forced-scalar run on gfx950 validates the fallback math.
     ``acc_f32`` is an f32 ``ir.Value``; returns the updated f32 ``ir.Value``.
     """
-    bf16x2_ty = ir.VectorType.get([2], T.bf16())
-    a_vec = fx.Vector(llvm.bitcast(bf16x2_ty, a_i32))
-    b_vec = fx.Vector(llvm.bitcast(bf16x2_ty, b_i32))
+    a_vec = fx.Vector.from_elements([fx.Int32(a_i32)], fx.Int32).bitcast(fx.BFloat16)
+    b_vec = fx.Vector.from_elements([fx.Int32(b_i32)], fx.Int32).bitcast(fx.BFloat16)
     acc = fx.Float32(acc_f32)
     acc = acc + a_vec[0].to(fx.Float32) * b_vec[0].to(fx.Float32)
     acc = acc + a_vec[1].to(fx.Float32) * b_vec[1].to(fx.Float32)
@@ -202,16 +201,13 @@ def e8m0_byte_to_f32(byte_val):
     range (bytes 1..254); the ``0`` / ``0xFF`` specials are never produced for
     real MXFP4 weights.
     """
-    from flydsl._mlir.dialects import arith as std_arith
-
-    byte_i32 = std_arith.ExtUIOp(T.i32(), byte_val).result
-    shifted = std_arith.ShLIOp(byte_i32, _i32_const(23)).result
-    return llvm.bitcast(T.f32(), shifted)
+    byte_i32 = fx.Int32(byte_val) & fx.Int32(0xFF)
+    return (byte_i32 << fx.Int32(23)).bitcast(fx.Float32).ir_value()
 
 
 def bf16x2_to_i32(pair_vec):
     """Reinterpret a ``vector<2xbf16>`` as an i32 (dot2 packs 2 bf16 per VGPR)."""
-    return llvm.bitcast(T.i32(), pair_vec)
+    return fx.Vector(pair_vec).bitcast(fx.Int32)[0].ir_value()
 
 
 def load_i32_words(rsrc, word0, n):
@@ -241,22 +237,12 @@ def load_i32_words(rsrc, word0, n):
     return out
 
 
-def _i32_const(value: int):
-    from flydsl._mlir.dialects import arith as std_arith
-
-    return std_arith.ConstantOp(T.i32(), ir.IntegerAttr.get(T.i32(), value)).result
-
-
 def wave_reduce_add_f32(val_f32):
     """Full 64-lane butterfly sum; every lane returns the total (raw f32)."""
-    from flydsl._mlir.dialects import arith as std_arith
-
-    width = _i32_const(WARP_SIZE)
-    w = val_f32
+    val = fx.Float32(val_f32)
     for sh in _REDUCE_SHIFTS:
-        peer = gpu.ShuffleOp(w, _i32_const(sh), width, mode="xor").shuffleResult
-        w = std_arith.AddFOp(w, peer).result
-    return w
+        val = val + val.shuffle_xor(fx.Int32(sh), fx.Int32(WARP_SIZE))
+    return val.ir_value()
 
 
 def atomic_add_f32(ptr, elem_off, val_f32):
@@ -304,7 +290,7 @@ def build_warp_decode_primitives_module(*, serialize_dot2: bool = True):
         red_in_ptr: fx.Pointer,
         out_red_ptr: fx.Pointer,
     ):
-        lane = fx.thread_idx.x
+        lane = gpu.thread_id("x")
 
         a_rsrc = _ptr_rsrc(a_ptr)
         b_rsrc = _ptr_rsrc(b_ptr)
@@ -452,8 +438,8 @@ def build_gate_up_fp8_module(
         rid_ptr: fx.Pointer,
         out_ptr: fx.Pointer,
     ):
-        bid = fx.block_idx.x
-        lane = fx.thread_idx.x
+        bid = gpu.block_id("x")
+        lane = gpu.thread_id("x")
 
         neuron_j = bid % inter
         d = bid // inter
@@ -678,8 +664,8 @@ def build_gate_up_fp8_act_module(
         rid_ptr: fx.Pointer,
         out_ptr: fx.Pointer,
     ):
-        bid = fx.block_idx.x
-        lane = fx.thread_idx.x
+        bid = gpu.block_id("x")
+        lane = gpu.thread_id("x")
 
         neuron_j = bid % inter
         d = bid // inter
@@ -874,8 +860,8 @@ def build_down_reduce_fp8_module(
         rwt_ptr: fx.Pointer,
         y_ptr: fx.Pointer,
     ):
-        bid = fx.block_idx.x
-        lane = fx.thread_idx.x
+        bid = gpu.block_id("x")
+        lane = gpu.thread_id("x")
 
         # Split-K: the low `k_batch` bids share an output but cover disjoint INTER
         # sub-ranges (kb).  For k_batch==1, kb==0 and this is the plain layout.
@@ -1117,8 +1103,8 @@ def build_gate_up_fp4_module(
         rid_ptr: fx.Pointer,
         out_ptr: fx.Pointer,
     ):
-        bid = fx.block_idx.x
-        lane = fx.thread_idx.x
+        bid = gpu.block_id("x")
+        lane = gpu.thread_id("x")
 
         neuron_j = bid % inter
         d = bid // inter
@@ -1306,8 +1292,8 @@ def build_down_reduce_fp4_module(
         rwt_ptr: fx.Pointer,
         y_ptr: fx.Pointer,
     ):
-        bid = fx.block_idx.x
-        lane = fx.thread_idx.x
+        bid = gpu.block_id("x")
+        lane = gpu.thread_id("x")
 
         col = bid % n_cols
         token_b = bid // n_cols
@@ -1503,8 +1489,8 @@ def build_gate_up_bf16_module(
         rid_ptr: fx.Pointer,
         out_ptr: fx.Pointer,
     ):
-        bid = fx.block_idx.x
-        lane = fx.thread_idx.x
+        bid = gpu.block_id("x")
+        lane = gpu.thread_id("x")
 
         neuron_j = bid % inter
         d = bid // inter
@@ -1629,8 +1615,8 @@ def build_down_reduce_bf16_module(
         rwt_ptr: fx.Pointer,
         y_ptr: fx.Pointer,
     ):
-        bid = fx.block_idx.x
-        lane = fx.thread_idx.x
+        bid = gpu.block_id("x")
+        lane = gpu.thread_id("x")
 
         col = bid % n_cols
         token_b = bid // n_cols
