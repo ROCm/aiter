@@ -33,7 +33,7 @@ from .mxmoe_g2_atoms import (
     scale_view,
     shift_scale_word as _shift_scale_word,
 )
-from .mxmoe_g2_epilog import atomic_bf16_epilog
+from .mxmoe_g2_epilog import atomic_bf16_epilog, nonatomic_bf16_epilog
 
 
 @flyc.jit
@@ -53,14 +53,13 @@ def gemm2_body_v2(
     lane,
     wave,
     arg_aq,
-    i32_inter,
-    i32_hidden,
     *,
     BM,
     BN=256,
     BK=256,
     use_nt,
-    INTER_MAX,
+    D_INTER,
+    D_HIDDEN,
     g2_kstatic=False,
     aStages,
     a_slot_alias=False,
@@ -80,6 +79,7 @@ def gemm2_body_v2(
     g2_epi_lanes=None,
     g2_apre=False,
     enable_bias=False,
+    nonatomic=False,
 ):
     # GEMM2 double-buffers B weight and scale one tile ahead. bhoist issues that
     # prefetch above the LDS barrier; ascale_pf prefetches A-scale one tile ahead.
@@ -100,20 +100,16 @@ def gemm2_body_v2(
     a_pack = 1 if is_f8_a else 2
     KH_TILE_A = BK // a_pack
     slot_bytes = BM * KH_TILE_A
-    # Contraction K = inter_dim runtime (i32_inter); INTER_MAX caps compile-time view/fragment bounds.
-    K_rt = fx.Int32(i32_inter)
-    K_BYTES = _udiv(K_rt, fx.Int32(a_pack))
-    kc_rt = _udiv(K_rt + fx.Int32(255), fx.Int32(256))
-    K_TILES_RT = _udiv(K_rt, fx.Int32(BK))
-    kAS_per_chunk_dw = kc_rt * fx.Int32(64)
-    kBS_stride_n0_dw = kc_rt * fx.Int32(64)
-    # N_OUT = model_dim/hidden is the gemm2 output N dim; runtime via i32_hidden (no K-loop dependency).
-    N_OUT_rt = fx.Int32(i32_hidden)
-    kbs_per_expert_dw = _udiv(N_OUT_rt, fx.Int32(32)) * kBS_stride_n0_dw
-    num_n_blocks = _udiv(N_OUT_rt, fx.Int32(BN))
-    KH4 = _udiv(K_rt, fx.Int32(4 if is_f8_b else 8))
-    K_TILES_MAX = INTER_MAX // BK
-    K_SCALE_CHUNKS_MAX = (INTER_MAX + 255) // 256
+    # Contraction K / output N are compile-time D_INTER / D_HIDDEN.
+    K_BYTES = D_INTER // a_pack
+    K_TILES = D_INTER // BK
+    K_SCALE_CHUNKS = (D_INTER + 255) // 256
+    kAS_per_chunk_dw = K_SCALE_CHUNKS * 64
+    kBS_stride_n0_dw = K_SCALE_CHUNKS * 64
+    N_OUT = D_HIDDEN
+    num_n_blocks = D_HIDDEN // BN
+    kbs_per_expert_dw = (D_HIDDEN // 32) * kBS_stride_n0_dw
+    KH4 = D_INTER // (4 if is_f8_b else 8)
 
     # block -> (m_block_idx, n_block_idx); e = sorted_expert_ids[SBM-padded sort block] (SBM==BM: sort_block==m_block_idx).
     if const_expr(mn_idx is not None):
@@ -186,7 +182,7 @@ def gemm2_body_v2(
         return scale_view(
             arg_ascale,
             base_dw,
-            K_SCALE_CHUNKS_MAX,
+            K_SCALE_CHUNKS,
             k0_stride_dw=64,
             num_records_bytes=nrec,
         )
@@ -218,16 +214,16 @@ def gemm2_body_v2(
         if const_expr(is_f8_b):
             return bq_view_fp8(
                 arg_bq,
-                e * N_OUT_rt + col,
+                e * N_OUT + col,
                 KH4,
-                K_TILES_MAX,
+                K_TILES,
                 kHalves,
             )
         return bq_view(
             arg_bq,
-            e * N_OUT_rt + col,
+            e * N_OUT + col,
             KH4,
-            K_TILES_MAX,
+            K_TILES,
             kHalves,
         )
 
@@ -238,7 +234,7 @@ def gemm2_body_v2(
         scale_view(
             arg_bscale,
             e * kbs_per_expert_dw + (mni_base + mw) * kBS_stride_n0_dw,
-            K_SCALE_CHUNKS_MAX,
+            K_SCALE_CHUNKS,
             k0_stride_dw=kBS_stride_k0_dw,
         )
         for mw in range_constexpr(nPairs)
@@ -374,7 +370,7 @@ def gemm2_body_v2(
             lane,
             i32_M,
             BM,
-            N_OUT_rt,
+            N_OUT,
             BN=BN,
             use_reduce=use_reduce,
             topk=topk,
@@ -389,13 +385,13 @@ def gemm2_body_v2(
             **kw,
         )
 
-    g2_interleave = const_expr(g2_kstatic and g2_bf16_lds)
+    g2_interleave = const_expr(g2_kstatic and g2_bf16_lds and not nonatomic)
     epi_thunks = [] if const_expr(g2_interleave) else None
     if const_expr(g2_interleave):
         _epilog(c_frags, emit_thunks=epi_thunks)
 
     if const_expr(g2_kstatic):
-        KT = K_TILES_MAX
+        KT = K_TILES
         for i in range_constexpr(kMChunks):
             for J in range_constexpr(numAccN):
                 c_frags[i][J].store(zero4)
@@ -531,7 +527,7 @@ def gemm2_body_v2(
         def prefetch_next_b(kt_rt):
             # Prefetch NEXT tile's B; if none, copy current through (rotate_b_carry state, unused after loop).
             nxt_b = kt_rt + fx.Int32(1)
-            if nxt_b < K_TILES_RT:
+            if nxt_b < K_TILES:
                 issue_b_load_into(nxt_bqf, nxt_bsf, nxt_b)
                 if const_expr(g2_ascale_pf):
                     issue_a_scale_load_into(nxt_saf, nxt_b)
@@ -547,7 +543,7 @@ def gemm2_body_v2(
 
         for kt_iv, state in range(
             fx.Int32(0),
-            K_TILES_RT,
+            fx.Int32(K_TILES),
             fx.Int32(1),
             init=load_carry(),
         ):
@@ -560,7 +556,7 @@ def gemm2_body_v2(
             nxt_a = kt_rt + fx.Int32(kStages)
             if const_expr(a_slot_alias):
                 gpu.barrier()  # outside the runtime if: barriers must be uniform
-            if nxt_a < K_TILES_RT:
+            if nxt_a < K_TILES:
                 issue_a_load_lds(nxt_a % fx.Int32(aStages), nxt_a)
             if const_expr(g2_ascale_pf):
                 sa = [
@@ -579,7 +575,19 @@ def gemm2_body_v2(
             results = yield yield_carry()
         store_carry(results)
 
-    if const_expr(g2_interleave):
+    if const_expr(nonatomic):
+        nonatomic_bf16_epilog(
+            [[c_frags[i][J].load() for J in range(numAccN)] for i in range(kMChunks)],
+            arg_out,
+            m_row,
+            n_block_idx,
+            wave,
+            lane,
+            N_OUT,
+            BN,
+            kMChunks,
+        )
+    elif const_expr(g2_interleave):
         rocdl.s_waitcnt(lgkmcnt=0)
         gpu.barrier()
         _epilog(None, lds_ready=True)

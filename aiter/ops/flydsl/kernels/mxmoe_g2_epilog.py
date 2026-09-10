@@ -412,4 +412,17 @@ def atomic_bf16_epilog(
         store_if_valid(token_id, mr)
 
 
-gemm2_epilog = atomic_bf16_epilog
+def nonatomic_bf16_epilog(
+    accm, arg_out, m_row, n_block_idx, wave, lane, N_OUT, BN, kMChunks
+):
+    """Unweighted store into ``flat_out[sorted_row, hidden]`` (epilog=scatter); host scatter_reduce applies weights."""
+    numAccN = (BN // 4) // 16
+    row_base = m_row + (lane // 16) * 4
+    gn_base = n_block_idx * BN + wave * (BN // 4) + (lane % 16)
+    out_ptr = global_typed_ptr(arg_out, T.bf16, align=2)
+    for i in range_constexpr(kMChunks):
+        for J in range_constexpr(numAccN):
+            vec = Vec(accm[i][J])
+            for v in range_constexpr(4):
+                bf = Vec.from_elements([vec[v]], Float32).to(BFloat16)
+                out_ptr[(row_base + i * 16 + v) * N_OUT + gn_base + J * 16] = bf[0]

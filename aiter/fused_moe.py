@@ -2033,6 +2033,7 @@ def _mxfp4_a4w4_stage2_fw(
             a2_scale=a2_scale,
             sorted_weights=sorted_weights,
             block_m=block_m,
+            reverse_sorted=reverse_sorted,
         )
     out = _mxfp4_a4w4_stage2(
         inter_states,
@@ -2103,6 +2104,7 @@ def _flydsl_v2_stage2_wrapper(
     expert_mask=None,
     topk_ids=None,
     topk_weights=None,
+    reverse_sorted=None,
     **_kwargs,
 ):
     from aiter.ops.flydsl.kernels.mxmoe_dispatcher import (
@@ -2132,7 +2134,17 @@ def _flydsl_v2_stage2_wrapper(
     _defer_w = _s2_fp8_inter and _kstatic
     _fp8_scale_blk = None
     _fp8_pitch_align = None
-    if epilog == "reduce":
+    if epilog == "scatter":
+        if reverse_sorted is None or sorted_weights is None:
+            raise ValueError(
+                "epilog='scatter' FlyDSL GEMM2 requires reverse_sorted and sorted_weights"
+            )
+        target = torch.empty(
+            (max_sorted, model_dim_runtime),
+            dtype=out.dtype,
+            device=out.device,
+        )
+    elif epilog == "reduce":
         if _s2_fp8_inter:
             from aiter.ops.flydsl.kernels.mxfp4_gemm_common import (
                 FP8OUT_PITCH_ALIGN,
@@ -2197,11 +2209,22 @@ def _flydsl_v2_stage2_wrapper(
         epilog=epilog,
         SBM=sbm,
         persist=cfg["persist"],
-        g2_bf16_lds=cfg["bf16_lds"],
         g2_spart=cfg["spart"],
         out_dtype="fp8" if _s2_fp8_inter else "bf16",
         bias=bias2,
     )
+    if epilog == "scatter":
+        aiter.mxfp4_moe_scatter_reduce(
+            flat_out=target,
+            reverse_sorted=reverse_sorted,
+            sorted_weights=sorted_weights,
+            out=out,
+            NE=num_experts,
+            TOPK=topk,
+            D_HIDDEN=model_dim_runtime,
+            MB=bm,
+        )
+        return out
     if epilog == "reduce":
         from aiter.ops.flydsl.moe_kernels import _run_moe_reduction
 
@@ -2694,6 +2717,7 @@ def get_2stage_cfgs(
             stage2_func = functools.partial(
                 _flydsl_v2_stage2_wrapper,
                 kernelName=kernelName2,
+                kernelName2=kernelName2,
                 model_dim=model_dim,
                 inter_dim=inter_dim,
                 num_experts=expert,
@@ -2733,6 +2757,9 @@ def get_2stage_cfgs(
         if flydsl_v2_stage2_cfg is not None:
             stage1_func.keywords["out_dtype"] = flydsl_v2_stage2_cfg["a_dtype"]
             _fuse_quant = flydsl_v2_stage2_cfg["a_dtype"]
+            v2_scatter = flydsl_v2_stage2_cfg["epilog"] == "scatter"
+        else:
+            v2_scatter = False
         return MOEMetadata(
             stage1_func,
             stage2_func,
@@ -2743,6 +2770,7 @@ def get_2stage_cfgs(
             fuse_quant=_fuse_quant,
             stage2_has_bias=enable_bias and (is_flydsl2 or is_cktile2),
             skip_inter_quant="_moe2_layout_" in str(kernelName2),
+            output_aux=v2_scatter,
             **route_bucket_metadata,
         )
     if (

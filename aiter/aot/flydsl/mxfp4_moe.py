@@ -56,11 +56,11 @@ def _job_key(job: dict) -> tuple:
             job["topk"] if job["epilog"] == "reduce" else 1,
             job["SBM"],
             job["persist"],
-            job["cu_num"] if job["persist"] else 0,
+            job.get("persist_flat", False),
+            job["cu_num"] if (job["persist"] or job.get("persist_flat")) else 0,
             job["out_dtype"],
             job.get("enable_bias", False),
             job.get("g2_spart"),
-            job.get("g2_bf16_lds"),
         )
     if job["stage"] == 1:
         return (
@@ -170,6 +170,7 @@ def parse_csv(csv_path: str):
                             "topk": topk,
                             "SBM": v2_g2["sort_block_m"] or bm,
                             "persist": v2_g2["persist"],
+                            "persist_flat": v2_g2["epilog"] == "scatter",
                             "cu_num": int(row.get("cu_num", "0") or "0"),
                             "a_dtype": v2_g2["a_dtype"],
                             "b_dtype": v2_g2["b_dtype"],
@@ -178,7 +179,6 @@ def parse_csv(csv_path: str):
                             # In the compiled kernel tag: must match the runtime
                             # wrapper or the AOT entry is keyed differently.
                             "g2_spart": v2_g2["spart"],
-                            "g2_bf16_lds": v2_g2["bf16_lds"],
                         }
                     )
             elif _is_mxfp4_kname(kn2):
@@ -293,11 +293,15 @@ def _compile_v2_stage2(job):
     d = _dummy()
     bias = _dummy(max(256, job["NE"] * job["N_OUT"] * 4))
     max_sorted = job["BM"]
-    if job["persist"]:
+    if job["persist"] or job.get("persist_flat"):
         max_sorted = max(max_sorted, job["cu_num"] * job["BM"])
     is_fp8_route_out = job["epilog"] == "reduce" and job["out_dtype"] == "fp8"
     out = torch.empty((job["BM"], job["N_OUT"]), dtype=torch.bfloat16, device="cpu")
-    if job["epilog"] == "reduce":
+    if job["epilog"] == "scatter":
+        target = torch.empty(
+            (max_sorted, job["N_OUT"]), dtype=torch.bfloat16, device="cpu"
+        )
+    elif job["epilog"] == "reduce":
         if is_fp8_route_out:
             from aiter.ops.flydsl.kernels.mxfp4_gemm_common import fp8out_row_bytes
 
@@ -346,7 +350,6 @@ def _compile_v2_stage2(job):
         n_sorted_padded=max_sorted,
         out_dtype=job["out_dtype"],
         g2_spart=job.get("g2_spart"),
-        g2_bf16_lds=job.get("g2_bf16_lds"),
         bias=bias if job.get("enable_bias", False) else None,
         stream=0,
     )
