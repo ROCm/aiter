@@ -19,6 +19,19 @@ FP8_MAX = 448.0
 PARTIAL_THREADS = 256
 PARTIAL_WAVES = 4
 PITCH = DV + 16
+WAVE_SIZE = 64
+# Both MFMA atoms below are 16x16x*, so one tile covers 16 heads and 16 Dv
+# columns. The lane map, the LDS pitches and the unroll counts all follow from
+# that; assert rather than let a changed constant silently mis-address.
+MFMA_N = 16
+LANE_GROUPS = WAVE_SIZE // H
+DV_CHUNKS = DV // 128
+DV_TILES_PER_WAVE = (DV // MFMA_N) // PARTIAL_WAVES
+Q_LANE_BYTES = DIM // LANE_GROUPS
+assert H == MFMA_N, "the lane map ties one head to one MFMA row"
+assert PARTIAL_THREADS == WAVE_SIZE * PARTIAL_WAVES
+assert DV % (MFMA_N * PARTIAL_WAVES) == 0 and DV % 128 == 0
+assert DIM % LANE_GROUPS == 0 and DT == DIM - DV
 
 
 def _exp2(value):
@@ -50,7 +63,7 @@ def compile_sparse_mla_partial(
         rsum: fx.Array[fx.Float32, PARTIAL_WAVES * H, 16]
         plds: fx.Array[fx.Uint8, BLOCK_I * H, 16]
         ilds: fx.Array[fx.Int32, BLOCK_I, 16]
-        qlds: fx.Array[fx.Uint8, 64 * 144, 16]
+        qlds: fx.Array[fx.Uint8, WAVE_SIZE * Q_LANE_BYTES, 16]
 
     attrs = {"rocdl.waves_per_eu": int(waves_per_eu)}
 
@@ -70,14 +83,15 @@ def compile_sparse_mla_partial(
         scale_log2e: fx.Float32,
         seq: fx.Int32,
         num_kv_rows: fx.Int32,
+        q_heads: fx.Int32,
     ):
         v16u8_t = fx.Vector.make_type(16, fx.Uint8)
         v2i32_t = fx.Vector.make_type(2, fx.Int32)
         tid = fx.Int32(fx.thread_idx.x)
-        wave = tid // fx.Int32(64)
-        lane = tid % fx.Int32(64)
-        group = lane // fx.Int32(16)
-        head = lane % fx.Int32(16)
+        wave = tid // fx.Int32(WAVE_SIZE)
+        lane = tid % fx.Int32(WAVE_SIZE)
+        group = lane // fx.Int32(H)
+        head = lane % fx.Int32(H)
         owner = fx.Int32(fx.block_idx.x)
         if fx.const_expr(split_major):
             split = owner // seq
@@ -107,8 +121,13 @@ def compile_sparse_mla_partial(
             )
 
         # Wave zero publishes Q once; every wave reuses its lane-major LDS view.
-        q_base = (fx.Int64(tok) * H + fx.Int64(head)) * DIM
-        qlane = lds.qlds.ptr + lane * fx.Int32(144)
+        # A model with fewer heads than the 16-row MFMA tile is read in place
+        # rather than staged into a padded copy: `q_heads` is the caller's row
+        # stride and rows past it re-read head 0, which is in bounds and finite.
+        # The partials stay 16 wide because the shared reducer only takes 16.
+        safe_head = (head < q_heads).select(head, fx.Int32(0))
+        q_base = (fx.Int64(tok) * fx.Int64(q_heads) + fx.Int64(safe_head)) * DIM
+        qlane = lds.qlds.ptr + lane * fx.Int32(Q_LANE_BYTES)
         if wave == fx.Int32(0):
             for cc in fx.range_constexpr(4):
                 lo = load16(q_ptr, q_base + cc * 128 + fx.Int64(group) * 16)
@@ -149,7 +168,8 @@ def compile_sparse_mla_partial(
         running_max = fx.Float32(float("-inf"))
         running_denom = fx.Float32(0.0)
         running_acc = [
-            fx.Vector.filled(4, 0.0, fx.Float32) for _ in fx.range_constexpr(8)
+            fx.Vector.filled(4, 0.0, fx.Float32)
+            for _ in fx.range_constexpr(DV_TILES_PER_WAVE)
         ]
 
         for k_i in fx.range_constexpr(inner_iter):
@@ -224,12 +244,12 @@ def compile_sparse_mla_partial(
             for r in fx.range_constexpr(4):
                 local_max = local_max.maximumf(qk[r])
             local_max = local_max.maximumf(
-                local_max.shuffle_xor(fx.Int32(16), fx.Int32(64))
+                local_max.shuffle_xor(fx.Int32(H), fx.Int32(WAVE_SIZE))
             )
             local_max = local_max.maximumf(
-                local_max.shuffle_xor(fx.Int32(32), fx.Int32(64))
+                local_max.shuffle_xor(fx.Int32(2 * H), fx.Int32(WAVE_SIZE))
             )
-            if lane < fx.Int32(16):
+            if lane < fx.Int32(H):
                 lds.rmax[wave * fx.Int32(H) + head] = local_max
             fx.gpu.barrier()
 
@@ -262,9 +282,11 @@ def compile_sparse_mla_partial(
                 fx.Vector.from_elements([packed], fx.Int32).bitcast(fx.Uint8),
                 lds.plds.ptr + lane * fx.Int32(H) + wave * fx.Int32(4),
             )
-            prob_sum = prob_sum + prob_sum.shuffle_xor(fx.Int32(16), fx.Int32(64))
-            prob_sum = prob_sum + prob_sum.shuffle_xor(fx.Int32(32), fx.Int32(64))
-            if lane < fx.Int32(16):
+            prob_sum = prob_sum + prob_sum.shuffle_xor(fx.Int32(H), fx.Int32(WAVE_SIZE))
+            prob_sum = prob_sum + prob_sum.shuffle_xor(
+                fx.Int32(2 * H), fx.Int32(WAVE_SIZE)
+            )
+            if lane < fx.Int32(H):
                 lds.rsum[wave * fx.Int32(H) + head] = prob_sum
             fx.gpu.barrier()
 
@@ -308,8 +330,8 @@ def compile_sparse_mla_partial(
             trbase = (fx.Int32(8) * group + head // fx.Int32(2)) * PITCH + fx.Int32(
                 8
             ) * (head % fx.Int32(2))
-            for j in fx.range_constexpr(8):
-                dv_base = (wave * fx.Int32(8) + fx.Int32(j)) * 16
+            for j in fx.range_constexpr(DV_TILES_PER_WAVE):
+                dv_base = (wave * fx.Int32(DV_TILES_PER_WAVE) + fx.Int32(j)) * MFMA_N
                 acc_fragment = fx.make_rmem_tensor(4, fx.Float32)
                 acc_fragment.store(fx.Vector.filled(4, 0.0, fx.Float32))
                 for half in fx.range_constexpr(2):
@@ -362,7 +384,7 @@ def compile_sparse_mla_partial(
                 if fx.const_expr(k_i + 1 < inner_iter):
                     fx.gpu.barrier()
 
-        if (wave == fx.Int32(0)) & (lane < fx.Int32(16)):
+        if (wave == fx.Int32(0)) & (lane < fx.Int32(H)):
             if fx.const_expr(inner_iter == 1):
                 lse = (tile_denom == fx.Float32(0.0)).select(
                     fx.Float32(-(2**30)), fly_math.log2(tile_denom) + tile_max
@@ -384,6 +406,7 @@ def compile_sparse_mla_partial(
         scale_log2e: fx.Float32,
         seq: fx.Int32,
         num_kv_rows: fx.Int32,
+        q_heads: fx.Int32,
         stream: fx.Stream,
     ):
         kernel(
@@ -395,6 +418,7 @@ def compile_sparse_mla_partial(
             scale_log2e,
             seq,
             num_kv_rows,
+            q_heads,
         ).launch(
             grid=(seq * fx.Int32(n_groups), 1, 1),
             block=(PARTIAL_THREADS, 1, 1),

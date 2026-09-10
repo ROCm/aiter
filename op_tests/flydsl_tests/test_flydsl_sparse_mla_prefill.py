@@ -151,3 +151,29 @@ def test_prefill_rejects_kv_above_the_32bit_extent():
             indices=indices,
             softmax_scale=1.0,
         )
+
+
+@pytest.mark.parametrize("heads", (1, 8, 15))
+def test_flydsl_sparse_mla_prefill_pads_narrow_head_counts(heads: int):
+    """Fewer heads than the MFMA tile are padded, not refused.
+
+    GLM-5.2 at TP8 has 8 heads per rank, half the 16-row tile. The padded
+    rows must not disturb the real ones, and the result must come back at the
+    caller's head count rather than the kernel's.
+    """
+    _require_gfx950_flydsl()
+    from aiter.ops.flydsl import flydsl_sparse_mla_prefill
+
+    q_nope, q_rope, kv, indices = _make_case(64)
+    narrow_nope = q_nope[:, :heads].contiguous()
+    narrow_rope = q_rope[:, :heads].contiguous()
+    narrow = flydsl_sparse_mla_prefill(
+        narrow_nope, narrow_rope, kv, indices, _SOFTMAX_SCALE
+    )
+    assert tuple(narrow.shape) == (64, heads, _V_HEAD_DIM)
+
+    # The same heads, run at the kernel's native width, must agree exactly:
+    # padding changes which lanes are busy, never the arithmetic of a row.
+    full = flydsl_sparse_mla_prefill(q_nope, q_rope, kv, indices, _SOFTMAX_SCALE)
+    torch.cuda.synchronize()
+    assert torch.equal(narrow, full[:, :heads])
