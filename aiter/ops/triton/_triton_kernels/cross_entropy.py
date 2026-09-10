@@ -1,29 +1,40 @@
-###############################################################################
-# Copyright (c) 2025, Advanced Micro Devices, Inc. All rights reserved.
-#
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 # Adapted from TransformerEngine's Triton cross-entropy kernels.
 # Original copyright: NVIDIA CORPORATION & AFFILIATES.
-###############################################################################
 
 """Triton JIT kernels for vocab-parallel cross-entropy loss.
 
 Three kernels are provided:
 
-1. ``online_softmax_kernel`` — per-rank online softmax to compute local
+1. ``_ce_local_softmax_stats_kernel`` — per-rank online softmax to compute local
    ``max``, ``denominator``, and ``X_y`` (the logit at the target index).
-2. ``cross_entropy_kernel`` — merges per-rank softmax stats (after
+2. ``_ce_fused_loss_grad_kernel`` — merges per-rank softmax stats (after
    ``all_gather``), computes the loss, and writes the gradient into the
    logits tensor in-place.
-3. ``element_mul_kernel`` — element-wise multiply for the backward pass
+3. ``_ce_grad_scale_kernel`` — element-wise multiply for the backward pass
    (scales the stored gradient by ``grad_output``).
 """
 
 import triton
 import triton.language as tl
 
+from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
 
-@triton.jit
-def online_softmax_kernel(
+# repr keys are the integer/bool constexprs that select the compiled variant;
+# label_smoothing (a float) is intentionally excluded — a fractional value would
+# put a "." in the trace name.
+_ce_local_softmax_stats_kernel_repr = make_kernel_repr(
+    "_ce_local_softmax_stats_kernel", ["BLOCK_SIZE"]
+)
+_ce_fused_loss_grad_kernel_repr = make_kernel_repr(
+    "_ce_fused_loss_grad_kernel", ["BLOCK_SIZE", "reduce_loss"]
+)
+_ce_grad_scale_kernel_repr = make_kernel_repr("_ce_grad_scale_kernel", ["BLOCK_SIZE"])
+
+
+@triton.jit(repr=_ce_local_softmax_stats_kernel_repr)
+def _ce_local_softmax_stats_kernel(
     X_ptr,
     X_stride,
     Y_ptr,
@@ -74,8 +85,8 @@ def online_softmax_kernel(
     tl.store(m_d_Xy_ptr + base + 2 * m_d_Xy_stride, X_y)
 
 
-@triton.jit
-def cross_entropy_kernel(
+@triton.jit(repr=_ce_fused_loss_grad_kernel_repr)
+def _ce_fused_loss_grad_kernel(
     X_ptr,
     X_stride,
     Y_ptr,
@@ -89,6 +100,7 @@ def cross_entropy_kernel(
     ignore_idx,
     n_cols,
     n_rows,
+    n_valid_ptr,
     reduce_loss: tl.constexpr,
     label_smoothing: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
@@ -101,8 +113,13 @@ def cross_entropy_kernel(
     - Writes the softmax-based gradient into *X* in-place.
     - Stores the scalar loss for the row.
 
-    Supports ``label_smoothing`` (``0`` = standard CE) and
-    ``reduce_loss`` (``True`` = average over non-ignored rows).
+    ``reduce_loss=True`` normalizes the *gradient* by ``n_valid`` (the number
+    of non-ignored rows, read from ``n_valid_ptr``) so that it matches a
+    mean-over-non-ignored reduction; ``n_rows`` is retained only for the
+    all-gather stride offset. ``label_smoothing`` (``0`` = standard CE) is
+    only correct for ``world_size == 1``: ``scaled_x_sum`` is collected from
+    the local vocab shard alone, so smoothing under tensor parallelism is
+    unsupported.
     """
     pid = tl.program_id(0).to(tl.int64)
     X_ptr += pid * X_stride
@@ -131,10 +148,25 @@ def cross_entropy_kernel(
             m_new - tl.maximum(m, m_new)
         )
         m = tl.maximum(m, m_new)
+        # Recover the target logit by max across ranks: only the owning rank
+        # loaded the real X_y; every other rank wrote -inf (see the stats
+        # kernel), so the max picks the true value. A genuinely -inf target
+        # logit (a masked vocab entry) is indistinguishable from "not my
+        # shard" — an accepted limitation of the sentinel.
         ori_Xy = tl.maximum(ori_Xy, Xy_new)
+
+    n_valid: tl.float32 = 1.0
+    if reduce_loss:
+        n_valid = tl.load(n_valid_ptr).to(tl.float32)
 
     eps = label_smoothing / (n_cols * world_size)
     scaled_x_sum: tl.float32 = 0.0
+
+    # local_y: target column offset within this rank's shard.
+    # When y is not on this rank, local_y falls outside [0, n_cols), so no lane
+    # in tl.arange(0, BLOCK_SIZE) will ever equal it and the correction below
+    # adds 0 everywhere — no explicit rank guard is needed.
+    local_y = y - rank * n_cols
 
     for i in range(0, n_cols, BLOCK_SIZE):
         offs = i + tl.arange(0, BLOCK_SIZE)
@@ -144,33 +176,28 @@ def cross_entropy_kernel(
         if label_smoothing > 0:
             scaled_x_sum += tl.sum(tl.where(offs < n_cols, -eps * blk, 0.0))
         if reduce_loss:
-            blk = (tl.exp(blk - m) / d - eps) / n_rows
+            blk = (tl.exp(blk - m) / d - eps) / n_valid
         else:
             blk = tl.exp(blk - m) / d - eps
+        # Apply the target-column correction in-register: avoids a debug_barrier,
+        # an extra global load/store, and the bf16 rounding that would occur if
+        # the corrected value were written and re-read through global memory.
+        if reduce_loss:
+            blk += tl.where(offs == local_y, -(1 - label_smoothing) / n_valid, 0.0)
+        else:
+            blk += tl.where(offs == local_y, -(1 - label_smoothing), 0.0)
         tl.store(X_ptr + offs, blk.to(grad_dtype), mask=offs < n_cols)
-
-    tl.debug_barrier()
 
     loss = -(ori_Xy - m - tl.log(d))
     if label_smoothing > 0:
         smooth = scaled_x_sum + label_smoothing * (m + tl.log(d))
         loss = loss * (1 - label_smoothing) + smooth
 
-    vocab_start = rank * n_cols
-    vocab_end = (rank + 1) * n_cols
-    if y >= vocab_start and y < vocab_end:
-        Xy_grad = tl.load(X_ptr + y - vocab_start)
-        if reduce_loss:
-            Xy_grad += -(1 - label_smoothing) / n_rows
-        else:
-            Xy_grad += -(1 - label_smoothing)
-        tl.store(X_ptr + y - vocab_start, Xy_grad)
-
     tl.store(loss_ptr, loss)
 
 
-@triton.jit
-def element_mul_kernel(
+@triton.jit(repr=_ce_grad_scale_kernel_repr)
+def _ce_grad_scale_kernel(
     X_ptr,
     X_stride,
     grad_ptr,

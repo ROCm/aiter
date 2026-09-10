@@ -18,7 +18,7 @@ from flydsl._mlir.dialects import llvm
 from flydsl.expr import arith, const_expr, gpu, ptrtoint, range_constexpr
 from flydsl.expr.typing import Int32, T
 
-from aiter.ops.flydsl.kernels import buffer_ops
+from aiter.ops.flydsl.kernels.kernels_common import create_llvm_ptr
 from aiter.ops.flydsl.kernels.tensor_shim import (
     AITER_FLYDSL_KERNARG_PRELOAD,
     AITER_FLYDSL_KERNARG_PRELOAD_COUNT,
@@ -596,16 +596,12 @@ def build_moe_route_psum_fused_module():
         # The atomic needs a raw addrspace(3) pointer, so the counter array's
         # base is taken as an integer here; SharedAllocator has already folded
         # its offset in, leaving only the per-expert element offset to add.
-        # (fx.to_llvm_ptr would be the current spelling, but it needs a newer
-        # fly dialect than the pinned LLVM build exposes.)
+        # create_llvm_ptr builds the addrspace(3) pointer via fx.to_llvm_ptr.
         cnt_base_i64 = fx.Int64(fx.ptrtoint(lds_cnt))
         numel_i32 = fx.Uint32(numel)
         for route_i32 in range(tid, numel_i32, MAX_EXPERTS_PER_BLOCK):
             e = topk_p[route_i32]
-            ptr = buffer_ops.create_llvm_ptr(
-                cnt_base_i64 + fx.Int64(e) * 4, address_space=3
-            )
-            ptr = ptr._value if hasattr(ptr, "_value") else ptr
+            ptr = create_llvm_ptr(cnt_base_i64 + fx.Int64(e) * 4, 3)
             slot = llvm.AtomicRMWOp(
                 llvm.AtomicBinOp.add,
                 ptr,

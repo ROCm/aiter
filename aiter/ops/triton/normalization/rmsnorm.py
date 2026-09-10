@@ -10,7 +10,6 @@ from aiter.ops.triton._triton_kernels.normalization.rmsnorm import (
     _quant_rms_norm_kernel,
     _rms_norm_kernel,
     _rmsnorm_bwd_dg_reduce_triton,
-    _rmsnorm_bwd_kernel_large_m_small_n,
     _rmsnorm_bwd_triton,
     _rmsnorm_kernel_large_m_small_n,
 )
@@ -112,42 +111,6 @@ def _rmsnorm_backward(dz, x, gamma, rsigma):
     dgamma = torch.empty_like(gamma_)
 
     M, N = x_.shape
-
-    if _should_use_large_m_small_n(M, N):
-        # Row-parallel tiling for large-M / small-N (q/k per-head norm). Avoids
-        # the generic kernel's get_num_sms()-capped grid that serializes rows.
-        BLOCK_N = triton.next_power_of_2(N)
-        BLOCK_M = max(min(16384 // BLOCK_N, 32), 8)
-        num_prgms = triton.cdiv(M, BLOCK_M)
-        dg_tmp = torch.empty(num_prgms, N, device="cuda", dtype=torch.float32)
-        _rmsnorm_bwd_kernel_large_m_small_n[(num_prgms,)](
-            dz_,
-            x_,
-            gamma_,
-            rsigma_,
-            dx,
-            dg_tmp,
-            x_.stride(0),
-            dz_.stride(0),
-            M,
-            N,
-            BLOCK_M=BLOCK_M,
-            BLOCK_N=BLOCK_N,
-            num_warps=8,
-            num_stages=2,
-        )
-        grid_reduce = lambda meta: [triton.cdiv(N, meta["BLOCK_SIZE_N"])]
-        _rmsnorm_bwd_dg_reduce_triton[grid_reduce](
-            dg_tmp,
-            dgamma,
-            dg_tmp.stride(0),
-            dg_tmp.shape[0],
-            dg_tmp.shape[1],
-            BLOCK_SIZE_M=128,
-            BLOCK_SIZE_N=64,
-        )
-        return dx, dgamma
-
     blk_size = block_size(x_)
     USE_BLOCKED = use_blocked(x_)
     NUM_PRGMS = num_programs(x_)

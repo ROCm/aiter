@@ -4,16 +4,18 @@ Keep helper naming consistent with other kernel helpers (e.g. `mfma_preshuffle_p
 but this module is intentionally small and MLIR-dialect facing.
 """
 
+from collections.abc import Callable
+from threading import Lock
+from typing import Any
+
 import flydsl.expr as fx
 from flydsl._mlir import ir
-from flydsl._mlir.dialects import arith as _std_arith
 from flydsl._mlir.dialects import builtin
 from flydsl._mlir.dialects import gpu as _gpu
 from flydsl._mlir.dialects import llvm as _llvm
+from flydsl.expr import as_ir_value
 from flydsl.expr.typing import T
 from flydsl.runtime.device import get_rocm_arch, is_rdna_arch
-
-from aiter.ops.flydsl.kernels import buffer_ops
 
 
 def format_kernel_name(name: str) -> str:
@@ -25,6 +27,26 @@ def format_kernel_name(name: str) -> str:
     ``.amdhsa_kernel`` directive and the whole module fails to link.
     """
     return name.replace("-", "_")
+
+
+def uint32_to_int32(x: int) -> int:
+    """Return the signed int32 value with the same low 32-bit pattern."""
+    return x - (1 << 32) if x >= (1 << 31) else x
+
+
+def atomic_add_i32(memref, val, offset, syncscope):
+    """Atomically add an int32 value and return the previous value."""
+    ptr = fx.to_llvm_ptr(fx.get_iter(memref) + offset)
+    val = fx.Int32(val) if isinstance(val, int) else val
+    old = _llvm.AtomicRMWOp(
+        _llvm.AtomicBinOp.add,
+        ptr,
+        as_ir_value(val),
+        _llvm.AtomicOrdering.monotonic,
+        syncscope=syncscope,
+        alignment=4,
+    ).result
+    return fx.Int32(old)
 
 
 def get_warp_size(arch=None):
@@ -92,20 +114,69 @@ def dtype_to_elem_type(dtype_str: str):
     )
 
 
-def _create_llvm_ptr(value, address_space: int = 1):
-    value = buffer_ops._unwrap_value(value)
-    if isinstance(value.type, ir.IndexType):
-        i64_type = T.i64
-        value = buffer_ops._unwrap_value(_std_arith.IndexCastOp(i64_type, value).result)
-    ptr_type = ir.Type.parse(f"!llvm.ptr<{address_space}>")
-    return _llvm.IntToPtrOp(ptr_type, value).result
+# LLVM address-space numbers as fx spaces: Global(1) and Shared, which is 2 in
+# fx terms but lowers to !llvm.ptr<3>. to_llvm_ptr resolves it, so the backend's
+# number never appears at a call site.
+FX_ADDRESS_SPACE = {1: fx.AddressSpace.Global, 3: fx.AddressSpace.Shared}
+
+
+def create_llvm_ptr(value, address_space=1):
+    """Raw ``!llvm.ptr<n>`` at *value*, for ops that need one directly.
+
+    The atomicrmw builder and the plain llvm load/store take a raw pointer,
+    which no layout op produces, so the address is formed by hand here.
+    """
+    # Accept either the LLVM number (1 global / 3 LDS) or an fx.AddressSpace,
+    # so a caller cannot silently pass the wrong one.
+    space = FX_ADDRESS_SPACE.get(address_space, address_space)
+    pt = fx.PointerType.get(fx.Int32.ir_type, address_space=space, alignment=4)
+    ptr = fx.to_llvm_ptr(fx.inttoptr(pt, value))
+    return ptr._value if hasattr(ptr, "_value") else ptr
 
 
 def stream_ptr_to_async_token(stream_ptr_value, loc=None, ip=None):
-    stream_llvm_ptr = _create_llvm_ptr(stream_ptr_value)
+    stream_llvm_ptr = create_llvm_ptr(stream_ptr_value)
 
     async_token_type = _gpu.AsyncTokenType.get()
     cast_op = builtin.UnrealizedConversionCastOp(
         [async_token_type], [stream_llvm_ptr], loc=loc, ip=ip
     )
     return cast_op.results[0]
+
+
+_compiled_cache_lock = Lock()
+
+
+def run_cached(
+    jit_func: Any,
+    *compile_args: Any,
+    constexpr_param: Any,
+    compiler: Callable[..., Any],
+    dispatch_args: tuple[Any, ...],
+) -> Any:
+    """Cache a layout-dynamic FlyDSL dispatcher by constexpr param."""
+    cache_key = constexpr_param.__cache_signature__()
+    compiled_cache = getattr(jit_func, "_compiled_cache", None)
+    if compiled_cache is not None:
+        compiled = compiled_cache.get(cache_key)
+        if compiled is not None:
+            compiled(*dispatch_args)
+            return compiled
+
+    dispatch_after_wait = False
+    with _compiled_cache_lock:
+        compiled_cache = getattr(jit_func, "_compiled_cache", None)
+        if compiled_cache is None:
+            compiled_cache = {}
+            jit_func._compiled_cache = compiled_cache
+
+        compiled = compiled_cache.get(cache_key)
+        if compiled is None:
+            compiled = compiler(jit_func, *compile_args)
+            compiled_cache[cache_key] = compiled
+        else:
+            dispatch_after_wait = True
+
+    if dispatch_after_wait:
+        compiled(*dispatch_args)
+    return compiled
