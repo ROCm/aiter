@@ -2,7 +2,6 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 import argparse
-import functools
 import os
 import sys
 
@@ -17,47 +16,13 @@ from einops import repeat as eirp
 
 import aiter
 from aiter import dtypes
-from aiter.jit.core import AITER_CONFIGS
-from aiter.jit.utils.chip_info import get_gfx_runtime as get_gfx
-from aiter.ops.gemm_op_a8w8 import (
-    gemm_a8w8_blockscale_ck,
-    gemm_a8w8_blockscale_cktile,
-    gemm_a8w8_mxfp8_128_bpreshuffle_flydsl,
-    get_CKGEMM_config,
-)
+from aiter.ops.gemm_op_a8w8 import gemm_a8w8_blockscale_ck, gemm_a8w8_blockscale_cktile
 from aiter.ops.shuffle import shuffle_mxfp8fp4_a, shuffle_weight
 from aiter.test_common import benchmark, checkAllclose, perftest
 from aiter.utility import fp4_utils
 
 block_shape = (128, 128)
 TEST_NUM_ITERS = 100
-
-# Not under aiter/configs/: those feed the production dispatch, which hands the
-# kernel a row-major A and so must never select an "_apre" kernel.
-APRE_CONFIG_FILE = os.path.join(
-    os.path.dirname(os.path.abspath(__file__)),
-    "configs",
-    "flydsl_a8w8_apre_tuned_gemm.csv",
-)
-
-
-@functools.lru_cache(maxsize=1)
-def _apre_configs():
-    if not os.path.exists(APRE_CONFIG_FILE):
-        return {}
-    df = pd.read_csv(APRE_CONFIG_FILE)
-    df = df[df["gfx"] == get_gfx()]
-    return {(r.M, r.N, r.K): r.kernelName for r in df.itertuples()}
-
-
-def apre_kernel_name(m, n, k, tuned_name):
-    """Best a_preshuffle kernel for this shape, else the tuned config with the
-    flag flipped."""
-    cached = _apre_configs().get((m, n, k))
-    if cached:
-        return cached
-    base, sep, ps = tuned_name.partition("_ps")
-    return base + "_apre" + sep + ps
 
 
 @perftest(num_iters=TEST_NUM_ITERS)
@@ -102,18 +67,11 @@ def run_gemm_bpreshuffle(x, weightshuffle, x_scale, w_scale, dtype=dtypes.bf16):
 
 
 @perftest(num_iters=TEST_NUM_ITERS)
-def run_gemm_flydsl(x, weightshuffle, x_scale, w_scale, dtype, kernel_name):
-    # Out is allocated here, as gemm_a8w8_blockscale_bpreshuffle does internally:
-    # perftest rotates deep copies of its arguments to defeat L2 reuse, so an out
-    # buffer passed in would inflate that working set (64MB at n=65536).
-    out = torch.empty(x.shape[0], weightshuffle.shape[0], dtype=dtype, device=x.device)
-    return gemm_a8w8_mxfp8_128_bpreshuffle_flydsl(
-        x,
-        weightshuffle,
-        x_scale,
-        w_scale,
-        out,
-        {"kernelName": kernel_name, "a_preshuffled_input": True},
+def run_gemm_abpreshuffle(
+    x_shuffled, weightshuffle, x_scale, w_scale, dtype=dtypes.bf16
+):
+    return aiter.gemm_a8w8_blockscale_abpreshuffle(
+        x_shuffled, weightshuffle, x_scale, w_scale, dtype
     )
 
 
@@ -137,43 +95,17 @@ def run_triton(x, weightshuffle, x_scale, w_scale, dtype=dtypes.bf16, backend=No
     )
 
 
-# Input initialization modes. "random" is the historical init (uniform / 10, random
-# per-block scales) and stresses accuracy; "const" fills A/B with a single exactly
-# representable fp8 value and neutral (1.0) scales, so the numbers are deterministic
-# and free of denormal/outlier effects -- the init used for stable perf comparison.
-CONST_VAL = 0.5
-
-
-def make_inputs(init, m, n, k, scale_m, scale_n, scale_k):
-    if init == "const":
-        x = torch.full((m, k), CONST_VAL, dtype=dtypes.fp32, device="cuda").to(
-            dtypes.fp8
-        )
-        weight = torch.full((n, k), CONST_VAL, dtype=dtypes.fp32, device="cuda").to(
-            dtypes.fp8
-        )
-        x_scale = torch.ones([scale_m, scale_k], dtype=dtypes.fp32, device="cuda")
-        w_scale = torch.ones([scale_n, scale_k], dtype=dtypes.fp32, device="cuda")
-    else:
-        x = (torch.rand((m, k), dtype=dtypes.fp32, device="cuda") / 10).to(dtypes.fp8)
-        weight = (torch.rand((n, k), dtype=dtypes.fp32, device="cuda") / 10).to(
-            dtypes.fp8
-        )
-        x_scale = torch.rand([scale_m, scale_k], dtype=dtypes.fp32, device="cuda")
-        w_scale = torch.rand([scale_n, scale_k], dtype=dtypes.fp32, device="cuda")
-    return x, weight, x_scale, w_scale
-
-
 @benchmark()
-def test_gemm(
-    dtype, m, n, k, ck_preshuffle=True, use_flydsl=False, init="random", apre=False
-):
+def test_gemm(dtype, m, n, k, ck_preshuffle=True, use_flydsl=False, apre=False):
     ret = {}
     block_shape_n, block_shape_k = block_shape
     scale_m = m
     scale_n = (n + block_shape_n - 1) // block_shape_n
     scale_k = (k + block_shape_k - 1) // block_shape_k
-    x, weight, x_scale, w_scale = make_inputs(init, m, n, k, scale_m, scale_n, scale_k)
+    x = (torch.rand((m, k), dtype=dtypes.fp32, device="cuda") / 10).to(dtypes.fp8)
+    weight = (torch.rand((n, k), dtype=dtypes.fp32, device="cuda") / 10).to(dtypes.fp8)
+    x_scale = torch.rand([scale_m, scale_k], dtype=dtypes.fp32, device="cuda")
+    w_scale = torch.rand([scale_n, scale_k], dtype=dtypes.fp32, device="cuda")
     use_flydsl_fp8_scale = use_flydsl and ck_preshuffle
     if use_flydsl_fp8_scale:
         FP8_E4M3_MAX = 448.0
@@ -209,38 +141,15 @@ def test_gemm(
     ret["ck TB/s"] = (x.nbytes + weight.nbytes) / avg_b / 1e6
     ret["ck err"] = err_ck
 
-    # A-preshuffle candidate, measured against the "ck" columns: on gfx1250 with
-    # e8m0 scales that dispatch lands on the same FlyDSL kernel, so "ck" is the
-    # apre=0 baseline. a_preshuffle changes which config is optimal, so the
-    # candidate comes from APRE_CONFIG_FILE rather than the apre=0 winner with
-    # the flag flipped. Needs a tuned FlyDSL row and an even M.
-    if use_flydsl_fp8_scale and apre:
-        cfg = get_CKGEMM_config(
-            m, n, k, AITER_CONFIGS.AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_BPRESHUFFLE_FILE
+    if apre and use_flydsl_fp8_scale and m % 2 == 0:
+        e, avg_e = run_gemm_abpreshuffle(
+            shuffle_mxfp8fp4_a(x), gemm_weight, gemm_x_scale, w_scale, dtype
         )
-        knl = str(cfg.get("kernelName", "")) if cfg is not None else ""
-        if knl and cfg.get("libtype") == "flydsl" and m % 2 == 0:
-            e, avg_e = run_gemm_flydsl(
-                shuffle_mxfp8fp4_a(x),
-                gemm_weight,
-                gemm_x_scale,
-                w_scale,
-                dtype,
-                apre_kernel_name(m, n, k, knl),
-            )
-            ret["apre us"] = avg_e
-            ret["apre TFLOPS"] = m * n * k * 2 / avg_e / 1e6
-            ret["apre TB/s"] = (x.nbytes + weight.nbytes) / avg_e / 1e6
-            ret["apre err"] = checkAllclose(a, e, msg="apre", catastrophic_check=True)
-        else:
-            aiter.logger.warning(
-                "skipping apre for M=%s N=%s K=%s (tuned flydsl row=%s, M even=%s)",
-                m,
-                n,
-                k,
-                bool(knl) and cfg.get("libtype") == "flydsl",
-                m % 2 == 0,
-            )
+        ret["apre us"] = avg_e
+        ret["apre TFLOPS"] = m * n * k * 2 / avg_e / 1e6
+        ret["apre TB/s"] = (x.nbytes + weight.nbytes) / avg_e / 1e6
+        ret["apre err"] = checkAllclose(a, e, msg="apre", catastrophic_check=True)
+        ret["apre/ck"] = avg_e / avg_b
 
     if not use_flydsl_fp8_scale:
         tag = "asm"
@@ -440,17 +349,6 @@ parser.add_argument(
         or --apre True False""",
 )
 parser.add_argument(
-    "--init",
-    type=str,
-    nargs="*",
-    choices=["const", "random"],
-    default=["const", "random"],
-    help="""input init mode(s); default runs both.
-    const  = x/weight filled with 0.5 and neutral (1.0) scales (deterministic)
-    random = uniform(0,1)/10 data with random per-block scales
-    e.g.: --init const""",
-)
-parser.add_argument(
     "--csv",
     type=str,
     default=None,
@@ -487,39 +385,35 @@ if args.csv is not None:
     shapes_df = pd.read_csv(args.csv)
     print(f"Loaded {len(shapes_df)} shapes from {args.csv}", flush=True)
     for dtype in args.dtype:
-        for init in args.init:
-            for preshuffle in l_preshuffle:
-                for apre in l_apre:
-                    for _, row in shapes_df.iterrows():
+        for preshuffle in l_preshuffle:
+            for apre in l_apre:
+                for _, row in shapes_df.iterrows():
+                    ret = test_gemm(
+                        dtype,
+                        int(row["M"]),
+                        int(row["N"]),
+                        int(row["K"]),
+                        ck_preshuffle=preshuffle,
+                        use_flydsl=args.flydsl,
+                        apre=apre,
+                    )
+                    df.append(ret)
+else:
+    for dtype in args.dtype:
+        for m in args.m:
+            for n, k in args.nk:
+                for ck_p in l_preshuffle:
+                    for apre in l_apre:
                         ret = test_gemm(
                             dtype,
-                            int(row["M"]),
-                            int(row["N"]),
-                            int(row["K"]),
-                            ck_preshuffle=preshuffle,
+                            m,
+                            n,
+                            k,
+                            ck_preshuffle=ck_p,
                             use_flydsl=args.flydsl,
-                            init=init,
                             apre=apre,
                         )
                         df.append(ret)
-else:
-    for dtype in args.dtype:
-        for init in args.init:
-            for m in args.m:
-                for n, k in args.nk:
-                    for ck_p in l_preshuffle:
-                        for apre in l_apre:
-                            ret = test_gemm(
-                                dtype,
-                                m,
-                                n,
-                                k,
-                                ck_preshuffle=ck_p,
-                                use_flydsl=args.flydsl,
-                                init=init,
-                                apre=apre,
-                            )
-                            df.append(ret)
 
 df = pd.DataFrame(df)
 

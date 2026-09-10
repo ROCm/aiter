@@ -21,6 +21,9 @@ from aiter.ops.flydsl.kernels.gemm_common_gfx1250 import (
 )
 from aiter.ops.flydsl.kernels.gfx1250_cluster import compute_mcast_masks
 from aiter.ops.flydsl.kernels.kernels_common import format_kernel_name
+from aiter.ops.flydsl.kernels.splitk_epilogue_gfx1250 import (
+    emit_atomic_splitk_epilogue,
+)
 from aiter.ops.flydsl.kernels.tensor_shim import (
     AITER_FLYDSL_KERNARG_PRELOAD,
     AITER_FLYDSL_KERNARG_PRELOAD_COUNT,
@@ -41,6 +44,8 @@ def launch_gemm_a8w8(
     stride_ascale_k: fx.Int32,
     i32_lda: fx.Int32,
     i32_ldc: fx.Int32,
+    arg_flag: fx.Pointer,
+    i32_epoch: fx.Int32,
     tile_m: Constexpr[int],
     tile_n: Constexpr[int],
     tile_k: Constexpr[int],
@@ -57,6 +62,8 @@ def launch_gemm_a8w8(
     preload_ks: Constexpr[int] = 0,
     batch: fx.Int32 = 1,
     a_preshuffle: Constexpr[bool] = False,
+    fused_splitk: Constexpr[bool] = False,
+    bounded_m: Constexpr[bool] = True,
 ):
     mx32 = is_mxscale and block_size == 32
     mx128 = is_mxscale and block_size == 128
@@ -157,6 +164,7 @@ def launch_gemm_a8w8(
         )
     use_quadrant = (wmma_m_rep % 2 == 0) and (wmma_n_rep % 2 == 0) and (n_acc >= 8)
     scale_tag = "mx32" if mx32 else ("mx128" if mx128 else "ptpc")
+    _atomic_c = fused_splitk and split_k > 1
     kernel_name = format_kernel_name(
         f"{'batched_' if batched else ''}gemm_a8w8_{scale_tag}"
         f"_t{tile_m}x{tile_n}x{tile_k}"
@@ -165,6 +173,8 @@ def launch_gemm_a8w8(
         + ("_mbn" if batched else "")
         + (f"_pre{preload_ks}" if preload else "")
         + ("_apre" if a_preshuffle else "")
+        + ("_fsk" if fused_splitk and split_k > 1 else "")
+        + ("b" if fused_splitk and split_k > 1 and bounded_m else "")
     )
 
     @flyc.kernel(name=kernel_name, known_block_size=[block, 1, 1])
@@ -180,6 +190,8 @@ def launch_gemm_a8w8(
         i32_stride_ascale_k: fx.Int32,
         i32_lda: fx.Int32,
         i32_ldc: fx.Int32,
+        arg_flag: fx.Pointer,
+        i32_epoch: fx.Int32,
     ):
         K_TILES = i32_k // (tile_k * split_k)
         k64 = fx.Int64(i32_k)
@@ -776,22 +788,47 @@ def launch_gemm_a8w8(
         c_off_rt = blk_m64 * ldc64 + blk_n64
         if const_expr(batched):
             c_off_rt = c_off_rt + bz64 * fx.Int64(i32_n)
-        if const_expr(split_k > 1):
+        if const_expr(split_k > 1 and not _atomic_c):
             c_off_rt = c_off_rt + fx.Int64(bid_z) * fx.Int64(i32_m) * ldc64
-        gtC = _gv(gC_base, c_off_rt, (tile_m, C_LDS_ROW), (C_LDS_ROW, 1))
-        atomC = fx.rocdl.make_tdm_atom(
-            gtC,
-            [mn_oob, tile_n if C_PAD else None],
-            strides=[ldc64, None],
-            num_warps=num_waves,
-            early_timeout=False,
-        )
-        fx.copy(
-            atomC,
-            _lv(fx.recast_iter(out_cls, base_ptr), (tile_m, C_LDS_ROW), (C_LDS_ROW, 1)),
-            gtC,
-        )
-        tdm_ops.tensor_wait(0)
+        if const_expr(_atomic_c):
+            emit_atomic_splitk_epilogue(
+                elem=out_cls,
+                tid=tid,
+                block=block,
+                tile_m=tile_m,
+                tile_n=tile_n,
+                c_lds_row=C_LDS_ROW,
+                lds_base_ptr=base_ptr,
+                gc_base=gC_base,
+                c_off_rt=c_off_rt,
+                ldc64=ldc64,
+                split_k=split_k,
+                split_idx=bid_z,
+                mn_oob=mn_oob,
+                bounded_m=bounded_m,
+                flat_tile=bid_y * fx.Int32(fx.grid_dim.x) + bid_x,
+                arg_flag=arg_flag,
+                i32_epoch=i32_epoch,
+            )
+        else:
+            gtC = _gv(gC_base, c_off_rt, (tile_m, C_LDS_ROW), (C_LDS_ROW, 1))
+            atomC = fx.rocdl.make_tdm_atom(
+                gtC,
+                [mn_oob, tile_n if C_PAD else None],
+                strides=[ldc64, None],
+                num_warps=num_waves,
+                early_timeout=False,
+            )
+            fx.copy(
+                atomC,
+                _lv(
+                    fx.recast_iter(out_cls, base_ptr),
+                    (tile_m, C_LDS_ROW),
+                    (C_LDS_ROW, 1),
+                ),
+                gtC,
+            )
+            tdm_ops.tensor_wait(0)
 
     gx = (i32_m + (tile_m - 1)) // tile_m
     gy = (N + (tile_n - 1)) // tile_n
@@ -810,6 +847,8 @@ def launch_gemm_a8w8(
         stride_ascale_k,
         i32_lda,
         i32_ldc,
+        arg_flag,
+        i32_epoch,
         value_attrs={
             "rocdl.cluster_dims": f"{cluster_m},{cluster_n},1" if use_cluster else None
         },
