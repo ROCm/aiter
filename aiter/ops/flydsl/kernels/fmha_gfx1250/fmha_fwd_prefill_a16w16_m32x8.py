@@ -884,6 +884,7 @@ def _core_attention(
     # loop, and prologue K/V loads target slot 0. slot_bytes >= Q footprint by
     # construction (see above), so Q always fits in slot 1. ----
     q_lds_base = lds_base + fx.Int32(slot_bytes)
+    q_lds_warp = q_lds_base + warp_idx * fx.Int32(q_mgr.warp_lds_size_in_byte())
 
     q_mgr.load_q_to_vgpr_part1(
         ptr_Q=ptr_Q,
@@ -895,7 +896,7 @@ def _core_attention(
         block_x=fx.Int32(gpu.block_id("x")),
         warp_idx=warp_idx,
         lane_idx=lane_idx,
-        ptr_lds=q_lds_base,
+        ptr_lds_warp=q_lds_warp,
     )
 
     # ---- This WG's KV tiles span relative kv [start_tile*n_block, kv_len_wg).
@@ -1434,6 +1435,7 @@ def _core_attention(
     # take ptr_O and build their own store descriptor internally (V1 a bounded buffer
     # resource for the masked buffer_store; V2 the TDM store atom with HW OOB drop).
     o_lds_base = _k_lds_buf(non_cur_pp)
+    o_lds_warp = o_lds_base + warp_idx * fx.Int32(o_mgr.warp_lds_size_in_byte())
     for qt in range(R):
         # Normalize this q-tile's O by its running denom d, then reshape+store to VRAM.
         # o_final[dt] lane l elem si = sum_kv P[q,kv] V[kv, dt*16+(l//16)*8+si]
@@ -1464,7 +1466,7 @@ def _core_attention(
             block_x=block_x,
             warp_idx=warp_idx,
             lane_idx=lane_idx,
-            ptr_lds=o_lds_base,
+            ptr_lds_warp=o_lds_warp,
             o_frags=o_norm,
             qtile=qt,
         )

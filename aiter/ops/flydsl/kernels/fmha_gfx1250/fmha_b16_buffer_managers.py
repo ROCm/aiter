@@ -284,6 +284,10 @@ class QManager16bV1:
         """LDS bytes the caller must reserve for Q staging (all waves)."""
         return self.num_waves * self._warp_stride
 
+    def warp_lds_size_in_byte(self):
+        """LDS bytes of ONE wave's private Q region; the caller strides ``ptr_lds_warp`` by it."""
+        return self._warp_stride
+
     def _lds_byte(self, row, col_chunk, tile):
         """Swizzled LDS byte offset (within a warp region) for a 8-col b128 chunk."""
         sw = col_chunk ^ (row // 4)  # 4x4 subtile XOR swizzle
@@ -381,7 +385,7 @@ class QManager16bV1:
         block_x,  # fx.Int32: this workgroup's grid-x tile index
         warp_idx,
         lane_idx,
-        ptr_lds,  # fx.Int32: base byte addr of the caller's Q allocation
+        ptr_lds_warp,  # fx.Int32: byte base of THIS warp's Q region (caller-placed)
     ):
         """Part 1 of the Q load: compute all global/LDS offsets (stashed as members),
         then issue the prime chunk of async global->LDS loads. A trailing
@@ -393,14 +397,13 @@ class QManager16bV1:
         issued qt-major then tile-major so part2's global asynccnt countdown matches
         the completion order (fully-resident when R>1)."""
         R = self.q_tiles_per_wave
-        warp_base = ptr_lds + warp_idx * self._warp_stride
         warp_row0_wave = block_x * self.block_m + warp_idx * (R * _WMMA_M)
 
         self._q_gptrs = []
         self._q_lds_wr_ptrs = []
         self._q_ds_ptrs = []
         for qt in fx.range_constexpr(R):
-            lds_q_base = warp_base + qt * self._tile_stride
+            lds_q_base = ptr_lds_warp + qt * self._tile_stride
             warp_row0 = warp_row0_wave + qt * _WMMA_M
             # All address VALU up front (2 async b128 + 2 ds_load per tile).
             gptrs, lds_wr_ptrs = self.global_load_ptrs(
@@ -1098,6 +1101,10 @@ class QManager16bV2:
     def get_lds_size_in_byte(self):
         return self.block_m * self.row_bytes
 
+    def warp_lds_size_in_byte(self):
+        """LDS bytes of ONE wave's private Q region; the caller strides ``ptr_lds_warp`` by it."""
+        return self.rows_per_warp * self.row_bytes
+
     def load_q_to_vgpr_part1(
         self,
         *,
@@ -1110,12 +1117,11 @@ class QManager16bV2:
         block_x,
         warp_idx,
         lane_idx,
-        ptr_lds,
+        ptr_lds_warp,  # fx.Int32: byte base of THIS warp's Q region (caller-placed)
     ):
-        """Issue this wave's per-warp TDM copy of its ``rows_per_warp x qk_hdim`` Q tile into its
-        private LDS region at ``ptr_lds + warp_idx*rows_per_warp*row_bytes``. ``stride_q_seq``/
-        ``stride_q_head`` are in ELEMENTS (host convention). Drain + read in ``load_q_to_vgpr_part2``.
-        """
+        """Issue this wave's per-warp TDM copy of its ``rows_per_warp x qk_hdim`` Q tile into the
+        caller-placed private region ``ptr_lds_warp``. ``stride_q_seq``/``stride_q_head`` are in
+        ELEMENTS (host convention). Drain + read in ``load_q_to_vgpr_part2``."""
         gqa = self.gqa_ratio
         # A wave holds rows_per_warp contiguous packed rows (seq outer, head inner).
         # When gqa <= rows_per_warp it spans num_seq=rows_per_warp/gqa whole head-groups
@@ -1142,7 +1148,7 @@ class QManager16bV2:
             head0
         ) * fx.Int64(stride_q_head)
         base_iter = fx.get_iter(ptr_Q)
-        warp_region = ptr_lds + warp_idx * fx.Int32(self.rows_per_warp * self.row_bytes)
+        warp_region = ptr_lds_warp
         lds_ptr_ty = fx.PointerType.get(
             elem_ty=self.elem_dtype.ir_type,
             address_space=fx.AddressSpace.Shared,
@@ -1558,6 +1564,10 @@ class OManager16bV1:
         """LDS bytes the caller must reserve for O staging (all waves, whole ring)."""
         return self.num_waves * self._warp_stride
 
+    def warp_lds_size_in_byte(self):
+        """LDS bytes of ONE wave's private O region; the caller strides ``ptr_lds_warp`` by it."""
+        return self._warp_stride
+
     def _lds_byte(self, slot_idx, q_row, d_col):
         """Swizzled LDS byte offset (within a warp region) of ring-slot ``slot_idx``'s
         O(q_row, d_col) (``d_col`` is slot-local, in [0, cols_per_tile))."""
@@ -1582,7 +1592,7 @@ class OManager16bV1:
         block_x,  # fx.Int32: this workgroup's grid-x tile index
         warp_idx,
         lane_idx,
-        ptr_lds,  # fx.Int32: base byte addr of the caller's O staging allocation
+        ptr_lds_warp,  # fx.Int32: byte base of THIS warp's O region (caller-placed)
         o_frags,  # list[d_tiles] of v8 f32 (pre-normalized) WMMA accumulators
         qtile=0,  # which of this wave's q_tiles_per_wave tiles this call stores
     ):
@@ -1608,7 +1618,7 @@ class OManager16bV1:
         o_rsrc = buffer_ops.create_buffer_resource(
             ptr_O, num_records_bytes=arith.unwrap(o_num_records_bytes)
         )
-        lds_warp = ptr_lds + warp_idx * self._warp_stride
+        lds_warp = ptr_lds_warp
         q_st = lane_idx % _WMMA_M
         d_half = (lane_idx // _WMMA_M) * _CHUNK_ELEMS  # 0 or 8
         v8_ty = fx.Vector.make_type(_CHUNK_ELEMS, self.elem_dtype)
@@ -1748,6 +1758,10 @@ class OManager16bV2:
     def get_lds_size_in_byte(self):
         return self.num_waves * self.rows_per_warp * self.row_bytes
 
+    def warp_lds_size_in_byte(self):
+        """LDS bytes of ONE wave's private O region; the caller strides ``ptr_lds_warp`` by it."""
+        return self.rows_per_warp * self.row_bytes
+
     def store_o_to_vram(
         self,
         *,
@@ -1761,7 +1775,7 @@ class OManager16bV2:
         block_x,
         warp_idx,
         lane_idx,
-        ptr_lds,
+        ptr_lds_warp,  # fx.Int32: byte base of THIS warp's O region (caller-placed)
         o_frags,
         qtile=0,
     ):
@@ -1773,7 +1787,7 @@ class OManager16bV2:
                 f"expected {self.d_tiles} O frags (v_hdim//{_WMMA_M}); got {len(o_frags)}"
             )
         gqa = self.gqa_ratio
-        warp_region = ptr_lds + warp_idx * fx.Int32(self.rows_per_warp * self.row_bytes)
+        warp_region = ptr_lds_warp
         tile_lds = warp_region + fx.Int32(qtile * _WMMA_M * self.row_bytes)
 
         # (1) Accumulator -> row-major padded LDS. lane_base = tile + (l%16)*row_bytes + (l//16)*16;
@@ -1911,6 +1925,10 @@ class OManager16bV3:
     def get_lds_size_in_byte(self):
         return self.num_waves * self.rows_per_warp * self.row_bytes
 
+    def warp_lds_size_in_byte(self):
+        """LDS bytes of ONE wave's private O region; the caller strides ``ptr_lds_warp`` by it."""
+        return self.rows_per_warp * self.row_bytes
+
     def store_o_to_vram(
         self,
         *,
@@ -1924,7 +1942,7 @@ class OManager16bV3:
         block_x,
         warp_idx,
         lane_idx,
-        ptr_lds,
+        ptr_lds_warp,  # fx.Int32: byte base of THIS warp's O region (caller-placed)
         o_frags,
         qtile=0,
     ):
@@ -1937,7 +1955,7 @@ class OManager16bV3:
         """
         if len(o_frags) != self.d_tiles:
             raise ValueError(f"expected {self.d_tiles} O frags; got {len(o_frags)}")
-        warp_region = ptr_lds + warp_idx * fx.Int32(self.rows_per_warp * self.row_bytes)
+        warp_region = ptr_lds_warp
         tile_lds = warp_region + fx.Int32(qtile * _WMMA_M * self.row_bytes)
 
         # (1) Per call: cvt fp32->bf16 + compute LDS write pointers (no issue yet). Stash.
