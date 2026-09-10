@@ -876,13 +876,9 @@ def _moe_gemm_a4w4_prefill(
 
     if PRELOAD_X_SCALES:
         if GatherIndx is None:
-            gl.amd.gfx1250.tdm.async_load(
-                xs_slab_desc, [offs_x_m, 0], x_scales_slab
-            )
+            gl.amd.gfx1250.tdm.async_load(xs_slab_desc, [offs_x_m, 0], x_scales_slab)
         else:
-            gl.amd.gfx1250.tdm.async_gather(
-                xs_slab_desc, offs_x_m, x_scales_slab
-            )
+            gl.amd.gfx1250.tdm.async_gather(xs_slab_desc, offs_x_m, x_scales_slab)
 
     # prologue: fill NUM_BUFFERS LDS slots via TDM
     for _ in gl.static_range(NUM_BUFFERS):
@@ -951,9 +947,7 @@ def _moe_gemm_a4w4_prefill(
 
     if L2_PREFETCH_DISTANCE > 0:
         for pf_j in gl.static_range(L2_PREFETCH_DISTANCE):
-            gl.amd.gfx1250.tdm.prefetch(
-                w_desc, [offs_w_n, pf_j * SHUFFLED_BLOCK_K_W]
-            )
+            gl.amd.gfx1250.tdm.prefetch(w_desc, [offs_w_n, pf_j * SHUFFLED_BLOCK_K_W])
 
     # preload tile 0 from LDS into registers
     gl.amd.gfx1250.tdm.async_wait((NUM_BUFFERS - 1) * NUM_TDM_OPS)

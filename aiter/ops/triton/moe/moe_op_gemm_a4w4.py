@@ -26,6 +26,7 @@ from aiter.ops.triton.moe.reduce import (
 from aiter.ops.triton.utils._triton.arch_info import get_arch
 from aiter.ops.triton.utils.gemm_config_utils import pick_gemm_num_stages
 from aiter.ops.triton.utils.moe_config_utils import get_moe_dispatch
+
 _LDS_BYTES_PER_WGP = 327680
 
 
@@ -595,15 +596,12 @@ def moe_gemm_a4w4(
             triton.cdiv(K, config["block_k"]) < config["num_buffers"]
         )
         XS_SLAB_MAX_BYTES = 32 * 1024
-        xs_slab_cols = triton.next_power_of_2(
-            triton.cdiv(K, MXFP4_QUANT_BLOCK_SIZE)
-        )
+        xs_slab_cols = triton.next_power_of_2(triton.cdiv(K, MXFP4_QUANT_BLOCK_SIZE))
         x_scales_preload = (
             not clamp_bounds
             and config["block_m"] <= 32
             and K > 1024
-            and config["block_m"] * (config["block_k"] // MXFP4_QUANT_BLOCK_SIZE)
-            <= 256
+            and config["block_m"] * (config["block_k"] // MXFP4_QUANT_BLOCK_SIZE) <= 256
             and config["block_m"] * xs_slab_cols <= XS_SLAB_MAX_BYTES
             and config["num_ctas"] == 1
         )
@@ -630,8 +628,8 @@ def moe_gemm_a4w4(
         num_k_iter = triton.cdiv(K, config["block_k"])
         l2_prefetch_distance = 4
         if (
-            num_k_iter < 4 * l2_prefetch_distance or
-            config["num_buffers"] + l2_prefetch_distance - 1 >= num_k_iter
+            num_k_iter < 4 * l2_prefetch_distance
+            or config["num_buffers"] + l2_prefetch_distance - 1 >= num_k_iter
         ):
             l2_prefetch_distance = 0
         # launch gluon kernel
