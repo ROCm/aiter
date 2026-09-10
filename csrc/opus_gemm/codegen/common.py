@@ -36,7 +36,7 @@ _GFX942_A16W16_TAGS = (
 # launcher signature and their own dispatch table, because none of them needs
 # the workspace argument the gfx1250 split-K families carry. A future split-K
 # .co family would drop out of this tuple and back into the workspace ABI.
-_A16W16_CO_TAGS = ("a16w16_4wave_co", "a16w16_4wave_wl_co")
+_A16W16_CO_TAGS = ("a16w16_4wave_co", "a16w16_4wave_wl_co", "a16w16_4wave_wlr_co")
 
 _A16W16_TAGS = (
     "a16w16",
