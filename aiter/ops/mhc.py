@@ -21,7 +21,7 @@ def mhc_pre_gemm_sqrsum(
     x: Tensor,
     fn: Tensor,
     tile_k: int = 128,  # 64 or 128
-    is_w_preshuffle_bf16: int = 0,  # 1: fn is pre-packed BF16 hi/lo from mhc_pre_convert_fn
+    w_preshuffle_bf16: int = 0,  # 1: fn is pre-packed BF16 hi/lo from mhc_pre_convert_fn
 ) -> None: ...
 
 
@@ -82,17 +82,22 @@ def mhc_pre_big_fuse_rmsnorm(
 ) -> None: ...
 
 
-# Pre-shuffled residual layout used by the fused post+pre path when
-# is_res_w_preshuffle_bf16 is set (kernel-side constant: mhc_res_ks).
+# Pre-shuffled residual layout selected independently with res_preshuffle=1
+# (kernel-side tile width: mhc_res_ks).
 #   resS[k // KS][head][row][k % KS]  <-  res[row][head][k]
 # The tensor keeps its (m, hc_mult, hidden_size) shape and element count; only the
 # order of the elements inside the buffer changes. Both the gemm's residual read and
 # its next_residual write use this layout, so it stays internal to a stack of layers:
 # only the first residual in and the last one out need converting.
 MHC_RES_KS = 32
-# ABLATION KNOB: 0 keeps the plain residual layout while leaving the bf16 fn gemm on.
-# Must be kept in lockstep with mhc_res_shuffle in csrc/kernels/mhc_kernels.cu.
-MHC_RES_SHUFFLE = 1
+
+
+def _check_mhc_res_preshuffle_arch(shuffled: bool, arch: str) -> None:
+    if shuffled and arch != "gfx1250":
+        raise ValueError(
+            f"res_preshuffle=1 is only supported on gfx1250, got {arch}; "
+            "use res_preshuffle=0 (BF16 compute is controlled independently)"
+        )
 
 
 def mhc_res_shuffle(residual: torch.Tensor) -> torch.Tensor:
@@ -121,7 +126,7 @@ def mhc_res_unshuffle(shuffled: torch.Tensor) -> torch.Tensor:
 
 @functools.lru_cache(maxsize=1024)
 def get_mhc_pre_splitk(
-    m: int, hc_hidden_size: int, is_w_preshuffle_bf16: bool = False
+    m: int, hc_hidden_size: int, w_preshuffle_bf16: bool = False
 ) -> tuple[int, int]:
     prefetch_stages = 2
     tile_m = 16 * 4
@@ -131,7 +136,7 @@ def get_mhc_pre_splitk(
     # workgroups improve latency hiding for large M without changing FP32 tuning.
     prefill_tg_factor = (
         8
-        if is_w_preshuffle_bf16
+        if w_preshuffle_bf16
         and arch == "gfx1250"
         and num_cu == 256
         and m >= 2048
@@ -292,6 +297,34 @@ def _mhc_fused_config_gfx1250_256(m, hidden_size, num_cu):
     return splitk, tile_m, tile_n, tile_k
 
 
+def _mhc_fused_bf16_shuffled_config_gfx1250_256(m, hidden_size, config):
+    """GEMM + RMSNorm reduction tuning for packed weights and shuffled residuals.
+
+    Measured on gfx1250/256 CU for N=4096/7168. Keep the prior policy for
+    unaligned/tail shapes; the tuned ranges cover M=32..16384 in steps of 32.
+    Plain residuals and FP32 GEMM retain their independent existing policy.
+    """
+    if hidden_size not in (4096, 7168) or not 32 <= m <= 16384 or m % 32:
+        return config
+    split_k, tile_m, tile_n, tile_k = config
+    if hidden_size == 7168:
+        if m <= 96:
+            split_k, tile_m = 112, 16
+        elif m <= 256:
+            split_k, tile_m = 112, 32
+        elif m <= 384 or 512 < m <= 640:
+            split_k, tile_m = 56, 32
+        elif 640 < m <= 1024:
+            # The direct-store pipeline favors tile_m=32 in this range.
+            split_k, tile_m = 32, 32
+    elif 128 < m <= 384 or 512 < m <= 640:
+        split_k, tile_m = 64, 32
+    # Extend tile_m=64 to M>=2048 only when the grid fills whole CU waves.
+    if m >= 2048 and m % 64 == 0 and ((m // 64) * split_k) % 256 == 0:
+        tile_m = 64
+    return split_k, tile_m, tile_n, tile_k
+
+
 def _mhc_fused_config_default(m, hidden_size, num_cu):
     """Generic fallback for untuned chips: pick (split_k, tile_k) by the occupancy
     scoring search (how many thread-groups fit vs. how many the device can run at
@@ -345,24 +378,28 @@ _MHC_FUSED_POST_PRE_CONFIG = {
 
 @functools.lru_cache(maxsize=1024)
 def get_mhc_fused_post_pre_config(
-    m: int, hidden_size: int, is_res_w_preshuffle_bf16: bool = False
+    m: int,
+    hidden_size: int,
+    w_preshuffle_bf16: bool = False,
+    res_preshuffle: bool = False,
 ) -> tuple[int, int, int, int]:
     """Select (split_k, tile_m, tile_n, tile_k) for the fused post+pre GEMM.
 
     Looks up a per-chip tuned policy keyed by (gfx_arch, cu_num); falls back to a
-    conservative default for untuned chips. Packed BF16 decode uses a separate
-    adjustment for the direct-store pipeline. K = hidden_size per stream.
+    conservative default for untuned chips. Packed BF16 with shuffled residuals
+    has separate GEMM + reduction tuning. K = hidden_size per stream.
     """
     num_cu = get_cu_num()
     try:
         arch = get_gfx_runtime()
     except Exception:  # noqa: BLE001
         arch = "unknown"
+    _check_mhc_res_preshuffle_arch(res_preshuffle, arch)
     policy = _MHC_FUSED_POST_PRE_CONFIG.get((arch, num_cu), _mhc_fused_config_default)
     split_k, tile_m, tile_n, tile_k = policy(m, hidden_size, num_cu)
     if (
-        is_res_w_preshuffle_bf16
-        and MHC_RES_SHUFFLE
+        w_preshuffle_bf16
+        and res_preshuffle
         and arch == "gfx1250"
         and num_cu == 256
         and 1 <= m <= 1024
@@ -373,6 +410,10 @@ def get_mhc_fused_post_pre_config(
             tile_m = 16
         elif hidden_size == 4096 and 960 < m:
             split_k = 16
+    if w_preshuffle_bf16 and res_preshuffle and arch == "gfx1250" and num_cu == 256:
+        return _mhc_fused_bf16_shuffled_config_gfx1250_256(
+            m, hidden_size, (split_k, tile_m, tile_n, tile_k)
+        )
     return split_k, tile_m, tile_n, tile_k
 
 
@@ -389,7 +430,7 @@ def mhc_pre_fake(
     norm_weight: torch.Tensor | None = None,
     norm_eps: float = 1e-6,
     large_m_splitk: bool = False,
-    is_w_preshuffle_bf16: int = 0,
+    w_preshuffle_bf16: int = 0,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     m = residual.size(0)
     hc_mult = residual.size(1)
@@ -415,7 +456,7 @@ def mhc_pre(
     norm_weight: torch.Tensor | None = None,
     norm_eps: float = 1e-6,
     large_m_splitk: bool = False,
-    is_w_preshuffle_bf16: int = 0,  # 1: fn is pre-packed BF16 hi/lo from mhc_pre_convert_fn
+    w_preshuffle_bf16: int = 0,  # 1: fn is pre-packed BF16 hi/lo from mhc_pre_convert_fn
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     m = residual.size(0)
     hc_mult = residual.size(1)
@@ -426,14 +467,14 @@ def mhc_pre(
     )
     hc_hidden_size = hc_mult * hidden_size
     # The tuned packed-weight policy targets the standard four-stream pre GEMM.
-    packed_config = bool(is_w_preshuffle_bf16) and hc_mult == 4 and hc_mult3 == 24
+    packed_config = bool(w_preshuffle_bf16) and hc_mult == 4 and hc_mult3 == 24
     if large_m_splitk:
         selected_splitk, selected_tile_k = get_mhc_pre_splitk_large_m(
-            m, hc_hidden_size, is_w_preshuffle_bf16=packed_config
+            m, hc_hidden_size, w_preshuffle_bf16=packed_config
         )
     else:
         selected_splitk, selected_tile_k = get_mhc_pre_splitk(
-            m, hc_hidden_size, is_w_preshuffle_bf16=packed_config
+            m, hc_hidden_size, w_preshuffle_bf16=packed_config
         )
     device = residual.device
     out_pad = torch.empty(
@@ -448,7 +489,7 @@ def mhc_pre(
         residual,
         fn,
         selected_tile_k,
-        is_w_preshuffle_bf16=is_w_preshuffle_bf16,
+        w_preshuffle_bf16=w_preshuffle_bf16,
     )
     # out = out.sum(0)
     # sqrsum = sqrsum.sum(0)
@@ -506,13 +547,13 @@ def mhc_post(
 
 
 def get_mhc_pre_splitk_large_m(
-    m: int, hc_hidden_size: int, is_w_preshuffle_bf16: bool = False
+    m: int, hc_hidden_size: int, w_preshuffle_bf16: bool = False
 ) -> tuple[int, int]:
     """Split-K policy for gfx950 large-M post_pre kernel (M > 1024)."""
     if get_gfx_runtime() == "gfx950" and m >= 8192 and hc_hidden_size % (8 * 64) == 0:
         return 8, 64
     return get_mhc_pre_splitk(
-        m, hc_hidden_size, is_w_preshuffle_bf16=is_w_preshuffle_bf16
+        m, hc_hidden_size, w_preshuffle_bf16=w_preshuffle_bf16
     )
 
 
@@ -529,7 +570,8 @@ def mhc_fused_post_pre_gemm_sqrsum(
     tile_m: int = 16,  # 16, 32 or 64
     tile_n: int = 32,  # 16 or 32
     tile_k: int = 32,  # 32 or 64
-    is_res_w_preshuffle_bf16: int = 0,
+    w_preshuffle_bf16: int = 0,  # 0: FP32; 1: packed BF16 hi/lo
+    res_preshuffle: int = 0,  # 0: plain; 1: shuffled residual (gfx1250 only)
 ) -> None: ...
 
 
@@ -549,7 +591,8 @@ def mhc_fused_post_pre_fake(
     norm_weight: torch.Tensor | None = None,
     norm_eps: float = 1e-6,
     force_fused: bool = False,
-    is_res_w_preshuffle_bf16: int = 0,
+    w_preshuffle_bf16: bool = False,  # True: packed BF16 hi/lo
+    res_preshuffle: bool = False,  # True: shuffled residual (gfx1250 only)
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     m = layer_input.size(0)
     hc_mult = residual_in.size(1)
@@ -578,9 +621,15 @@ def mhc_fused_post_pre_large_m(
     sinkhorn_repeat: int = 20,
     norm_weight: torch.Tensor | None = None,
     norm_eps: float = 1e-6,
-    is_res_w_preshuffle_bf16: int = 0,
+    w_preshuffle_bf16: bool = False,  # True: packed BF16 hi/lo
+    res_preshuffle: bool = False,  # plain residuals only for this entry point
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """gfx950 large-M post+pre (M > 1024): upstream ``mhc_post`` + ``mhc_pre``."""
+    if res_preshuffle:
+        raise ValueError(
+            "mhc_fused_post_pre_large_m requires res_preshuffle=0; "
+            "shuffled residuals require mhc_fused_post_pre on gfx1250"
+        )
     m = residual_in.size(0)
 
     if post_layer_mix.ndim == 3 or not post_layer_mix.is_contiguous():
@@ -619,7 +668,7 @@ def mhc_fused_post_pre_large_m(
         norm_weight,
         norm_eps,
         large_m_splitk=True,
-        is_w_preshuffle_bf16=is_res_w_preshuffle_bf16,
+        w_preshuffle_bf16=int(w_preshuffle_bf16),
     )
     return post_mix, comb_mix, layer_input_out, next_residual
 
@@ -641,7 +690,8 @@ def mhc_fused_post_pre(
     norm_weight: torch.Tensor | None = None,
     norm_eps: float = 1e-6,
     force_fused: bool = False,
-    is_res_w_preshuffle_bf16: int = 0,
+    w_preshuffle_bf16: bool = False,  # True: packed BF16 hi/lo
+    res_preshuffle: bool = False,  # True: shuffled residual (gfx1250 only)
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Fused mhc_post + next mhc_pre (HIP), mirroring ``mhc_pre`` with post-step inputs.
 
@@ -653,29 +703,34 @@ def mhc_fused_post_pre(
     Returns ``(post_mix, comb_mix, layer_input_out, next_residual)`` -- next pre mixes,
     folded layer input, and the new residual stream for the following layer's post.
 
-    ``force_fused``: when True, always use the fused HIP kernel. When False (default),
-    use the fused path only for smaller ``m`` (threshold depends on the detected GPU arch);
-    larger ``m`` falls back to the unfused ``mhc_post`` + ``mhc_pre`` path.
+    ``force_fused``: when True, select the fused HIP path, except for the existing
+    gfx950 large-M post+pre specialization with plain residuals. When False
+    (default), larger ``m`` with plain residuals falls back to ``mhc_post`` +
+    ``mhc_pre`` (threshold depends on the detected GPU arch).
+    Shuffled residuals always use the fused kernel, which understands that layout.
+
+    ``w_preshuffle_bf16=True`` selects BF16 hi/lo compute and requires ``fn`` from
+    ``mhc_pre_convert_fn``. ``res_preshuffle=True`` independently declares that
+    ``residual_in`` is shuffled (gfx1250 only); ``next_residual`` uses the same
+    layout. Neither flag converts inputs. For BF16 with plain residuals, pass
+    ``w_preshuffle_bf16=True, res_preshuffle=False``.
+
+    Both flags are boolean, default to False, and are controlled independently.
     """
     m = layer_input.size(0)
     hc_mult = residual_in.size(1)
     hidden_size = residual_in.size(2)
     arch = get_gfx_runtime()
+    _check_mhc_res_preshuffle_arch(res_preshuffle, arch)
     fused_m_upper_bound = {
         "gfx950": 1024,
         "gfx942": 128,
         "gfx1250": 1024,
     }.get(arch, 1024)
 
-    # The pre-shuffled residual layout is produced and consumed only by
-    # mhc_fused_post_pre_gemm_sqrsum + mhc_pre_big_fuse{,_rmsnorm}. The fallbacks below
-    # go through mhc_post / the large_m kernel, which read res[row][head][k]; feeding
-    # them a shuffled tensor would silently compute garbage, so refuse instead.
-    assert not (is_res_w_preshuffle_bf16 and not force_fused and m >= fused_m_upper_bound), (
-        "is_res_w_preshuffle_bf16 requires the fused path (pass force_fused=True); "
-        f"m={m} >= fused_m_upper_bound={fused_m_upper_bound} would fall back to mhc_post + mhc_pre"
-    )
-    if not force_fused and m >= fused_m_upper_bound:
+    # Plain post/pre fallbacks cannot consume shuffled buffers. BF16 arithmetic
+    # itself is supported by both paths and must not prevent the fallback.
+    if not force_fused and not res_preshuffle and m >= fused_m_upper_bound:
         next_residual = torch.empty_like(residual_in)
         mhc_post(
             next_residual,
@@ -696,14 +751,11 @@ def mhc_fused_post_pre(
             sinkhorn_repeat,
             norm_weight,
             norm_eps,
-            is_w_preshuffle_bf16=is_res_w_preshuffle_bf16,
+            w_preshuffle_bf16=int(w_preshuffle_bf16),
         )
         return post_mix, comb_mix, layer_input_out, next_residual
 
-    assert not (
-        is_res_w_preshuffle_bf16 and force_fused and arch == "gfx950" and m > fused_m_upper_bound
-    ), "mhc_fused_post_pre_large_m does not implement the pre-shuffled residual layout"
-    if force_fused and arch == "gfx950" and m > fused_m_upper_bound:
+    if force_fused and not res_preshuffle and arch == "gfx950" and m > fused_m_upper_bound:
         return mhc_fused_post_pre_large_m(
             layer_input,
             residual_in,
@@ -719,7 +771,8 @@ def mhc_fused_post_pre(
             sinkhorn_repeat,
             norm_weight,
             norm_eps,
-            is_res_w_preshuffle_bf16=is_res_w_preshuffle_bf16,
+            w_preshuffle_bf16=w_preshuffle_bf16,
+            res_preshuffle=False,
         )
 
     assert layer_input.shape == (
@@ -750,7 +803,10 @@ def mhc_fused_post_pre(
 
     selected_splitk, selected_tile_m, selected_tile_n, selected_tile_k = (
         get_mhc_fused_post_pre_config(
-            m, hidden_size, is_res_w_preshuffle_bf16=bool(is_res_w_preshuffle_bf16)
+            m,
+            hidden_size,
+            w_preshuffle_bf16=w_preshuffle_bf16,
+            res_preshuffle=res_preshuffle,
         )
     )
     n_splits = selected_splitk
@@ -775,7 +831,8 @@ def mhc_fused_post_pre(
         selected_tile_m,
         selected_tile_n,
         selected_tile_k,
-        is_res_w_preshuffle_bf16,
+        w_preshuffle_bf16=int(w_preshuffle_bf16),
+        res_preshuffle=int(res_preshuffle),
     )
 
     post_mix = torch.empty(m, hc_mult, 1, dtype=dtypes.fp32, device=device)
@@ -798,7 +855,7 @@ def mhc_fused_post_pre(
             norm_eps,
             hc_post_mult_value,
             sinkhorn_repeat,
-            res_preshuffle=is_res_w_preshuffle_bf16 and MHC_RES_SHUFFLE,
+            res_preshuffle=int(res_preshuffle),
         )
     else:
         mhc_pre_big_fuse(
@@ -815,7 +872,7 @@ def mhc_fused_post_pre(
             hc_sinkhorn_eps,
             hc_post_mult_value,
             sinkhorn_repeat,
-            res_preshuffle=is_res_w_preshuffle_bf16 and MHC_RES_SHUFFLE,
+            res_preshuffle=int(res_preshuffle),
         )
 
     return post_mix, comb_mix, layer_input_out, next_residual

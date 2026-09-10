@@ -2501,7 +2501,7 @@ namespace py = pybind11;
           py::arg("x"),                           \
           py::arg("fn"),                          \
           py::arg("tile_k")          = 128,       \
-          py::arg("is_w_preshuffle_bf16") = 0);  \
+          py::arg("w_preshuffle_bf16") = 0);  \
     m.def("mhc_pre_convert_fn",                   \
           &aiter::mhc_pre_convert_fn,             \
           "mhc_pre_convert_fn",                   \
@@ -2566,7 +2566,8 @@ namespace py = pybind11;
           py::arg("tile_m")          = 16,        \
           py::arg("tile_n")          = 32,        \
           py::arg("tile_k")          = 32,        \
-          py::arg("is_res_w_preshuffle_bf16") = 0);
+          py::arg("w_preshuffle_bf16") = 0,    \
+          py::arg("res_preshuffle") = 0);
 #define CAUSAL_CONV1D_UPDATE_PYBIND                                            \
     m.def("causal_conv1d_update",                                              \
           &aiter::causal_conv1d_update,                                        \

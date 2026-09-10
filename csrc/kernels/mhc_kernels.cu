@@ -15,6 +15,16 @@
 
 
 namespace aiter {
+    // Validate on the current tensor device (after HipDeviceGuard), including
+    // direct calls to the GEMM and reduction bindings that bypass Python.
+    static void check_mhc_res_preshuffle_arch(bool shuffled) {
+        if (shuffled) {
+            const auto arch = get_gpu_arch();
+            AITER_CHECK(arch == "gfx1250",
+                        "res_preshuffle=1 is only supported on gfx1250, got ", arch,
+                        "; use res_preshuffle=0");
+        }
+    }
 #if defined(__gfx1250__)
     static constexpr bool mhc_async_load_oob_guard = true;
 #else
@@ -61,7 +71,7 @@ namespace aiter {
         return (K0 / 16) * 16 + (K0 % 16) / 2;
     }
 
-    // ---- pre-shuffled residual layout (is_res_w_preshuffle_bf16) ----
+    // ---- pre-shuffled residual layout (res_preshuffle) ----
     //   resS[k / KS][head][row][k % KS],  KS = mhc_res_ks
     //   strides: kb -> hc_mult*m*KS,  head -> m*KS,  row -> KS,  kk -> 1
     // KS is a fixed constant, deliberately NOT derived from tile_m/tile_k: the
@@ -76,10 +86,6 @@ namespace aiter {
     // KS = 8 / 16 / 32). mhc_nres_tdm_store is what removes that, and is what
     // makes KS=32 the tuned value.
     static constexpr int mhc_res_ks = 32;
-    // ABLATION KNOB: 0 keeps the plain residual layout while leaving the bf16 fn gemm on,
-    // so the shuffle's own contribution can be measured. Must be kept in lockstep with
-    // MHC_RES_SHUFFLE in aiter/ops/mhc.py.
-    static constexpr bool mhc_res_shuffle = true;
     // gfx1250 + shuffled residual only: stage next_residual through LDS and write it
     // out with one 4D TDM store mirroring the residual load, instead of a scattered
     // buffer_store_b128 per lane. Buys 460 -> 325 us on the gemm at KS=32; costs
@@ -222,7 +228,7 @@ namespace aiter {
     mma_f32_16x16x4_fma((a), (b), (c))
 #endif
 
-    template <typename DTYPE_I, int num_warps, int tile_m, int tile_n, int tile_k, bool is_w_preshuffle_bf16 = false, bool vector_fn_load = false>
+    template <typename DTYPE_I, int num_warps, int tile_m, int tile_n, int tile_k, bool w_preshuffle_bf16 = false, bool vector_fn_load = false>
     __global__ __launch_bounds__(num_warps *  opus::get_warp_size(), 2)
     void mhc_pre_gemm_sqrsum_kernel(
         float* out,
@@ -261,7 +267,7 @@ namespace aiter {
         // The LDS test keeps tile_k=128 -- 67584 B/workgroup, past the 64 KiB limit --
         // degrading to the per-lane load instead of failing to launch, should gfx1250
         // ever dispatch it (get_mhc_pre_splitk offers only 64 off gfx9).
-        static constexpr bool x_tdm = mhc_pre_x_tdm && is_w_preshuffle_bf16
+        static constexpr bool x_tdm = mhc_pre_x_tdm && w_preshuffle_bf16
                                       && (x_tdm_lds_bytes <= 64 * 1024);
 #else
         static constexpr bool x_tdm = false;
@@ -848,20 +854,20 @@ namespace aiter {
                 if constexpr (x_tdm) { lds_load_x_tile((k) + 2, (LDS_SLOT)); }                     \
             }                                                                                      \
         } while (0)
-        // is_w_preshuffle_bf16: bf16 hi/lo MFMA; otherwise fp32 MFMA. The bf16 body (and the
+        // w_preshuffle_bf16: bf16 hi/lo MFMA; otherwise fp32 MFMA. The bf16 body (and the
         // gfx950-only mfma_f32_16x16x32_bf16 builtin) exists only in the gfx950 device
         // pass; every other arch compiles the fp32 path unconditionally, so the flag is
         // a no-op there (falls back to fp32).
 #if MHC_BF16_MFMA
 #define MHC_PRE_GEMM_STEP(BUF, LDS_SLOT, k, DO_PREFETCH, X_WAIT)                    \
-        if constexpr (is_w_preshuffle_bf16) {                                   \
+        if constexpr (w_preshuffle_bf16) {                                   \
             GEMM_LOOP_BODY_BF16(BUF, LDS_SLOT, k, DO_PREFETCH);           \
         } else {                                                          \
             GEMM_LOOP_BODY(BUF, LDS_SLOT, k, DO_PREFETCH, X_WAIT);               \
         }
 #elif defined(__gfx1250__)
 #define MHC_PRE_GEMM_STEP(BUF, LDS_SLOT, k, DO_PREFETCH, X_WAIT)                    \
-        if constexpr (is_w_preshuffle_bf16) {                                   \
+        if constexpr (w_preshuffle_bf16) {                                   \
             GEMM_LOOP_BODY_BF16_W32(BUF, LDS_SLOT, k, DO_PREFETCH, X_WAIT);       \
         } else {                                                          \
             GEMM_LOOP_BODY(BUF, LDS_SLOT, k, DO_PREFETCH, X_WAIT);               \
@@ -963,9 +969,9 @@ namespace aiter {
         aiter_tensor_t& out, // (split_k, m, hc_mult3) / (m, hc_mult3)
         aiter_tensor_t& sqrsum, // (split_k, m) / (m)
         aiter_tensor_t& x, // (m, hc_hidden_size)
-        aiter_tensor_t& fn, // (hc_mult3, hc_hidden_size) fp32; packed int32 BF16 hi/lo when is_w_preshuffle_bf16
+        aiter_tensor_t& fn, // (hc_mult3, hc_hidden_size) fp32; packed int32 BF16 hi/lo when w_preshuffle_bf16
         int tile_k = 128,
-        int is_w_preshuffle_bf16 = 0
+        int w_preshuffle_bf16 = 0
     )
     {
         AITER_CHECK(out.size(0) == sqrsum.size(0), "out and sqrsum must have the same number of split_k or m");
@@ -984,7 +990,7 @@ namespace aiter {
         const HipDeviceGuard device_guard(x.device_id);
         const hipStream_t stream = aiter::getCurrentHIPStream();
 
-        if (is_w_preshuffle_bf16) {
+        if (w_preshuffle_bf16) {
 #define MHC_PRE_BF16 true
             MHC_PRE_GEMM_SQRSUM_KERNEL_DISPATCH(tile_k);
 #undef MHC_PRE_BF16
@@ -1441,6 +1447,7 @@ namespace aiter {
                     "pre-shuffled residual needs hidden_size divisible by mhc_res_ks");
 
         const HipDeviceGuard device_guard(layer_input.device_id);
+        check_mhc_res_preshuffle_arch(res_preshuffle != 0);
         const hipStream_t stream = aiter::getCurrentHIPStream();
         const int cu_num = get_num_cu_func();
 
@@ -2452,6 +2459,18 @@ namespace aiter {
         } else { \
             MHC_PRE_BIG_FUSE_RM_KERNEL_IMPL(5, 4, 2, 4096, 512, 512, true); \
         } \
+    } else if (hidden_size == 5120) { \
+        if (m < 4 * cu_num) { \
+            if (WARP_SIZE == 32) { \
+                MHC_PRE_BIG_FUSE_RM_KERNEL_IMPL(9, 4, 1, 5120, 1024, 1024, false); \
+            } else { \
+                MHC_PRE_BIG_FUSE_RM_KERNEL_IMPL(5, 4, 1, 5120, 1024, 1024, false); \
+            } \
+        } else if (m <= 8 * cu_num) { \
+            MHC_PRE_BIG_FUSE_RM_KERNEL_IMPL(5, 4, 2, 5120, 512, 512, false); \
+        } else { \
+            MHC_PRE_BIG_FUSE_RM_KERNEL_IMPL(5, 4, 2, 5120, 512, 512, true); \
+        } \
     } else if (hidden_size == 2560) { \
         if (m < 4 * cu_num) { \
             MHC_PRE_BIG_FUSE_RM_KERNEL_IMPL(5, 4, 1, 2560, 512, 512, false); \
@@ -2469,7 +2488,33 @@ namespace aiter {
             MHC_PRE_BIG_FUSE_RM_KERNEL_IMPL(3, 4, 2, 1280, 256, 128, true); \
         } \
     } else { \
-        AITER_CHECK(false, "hidden_size only supports 7168, 4096, 2560 and 1280"); \
+        AITER_CHECK(false, "hidden_size only supports 7168, 5120, 4096, 2560 and 1280"); \
+    }
+
+    // Shuffled residual reduction on gfx1250 (validated at the entry point).
+    // Changing the row and warp counts balances split-K reduction against
+    // shuffled residual reads; the kernels handle partial row blocks.
+#define MHC_PRE_BIG_FUSE_RM_SHUFFLED_DISPATCH(hidden) \
+    if (m > 256 && m <= 512) { \
+        MHC_PRE_BIG_FUSE_RM_KERNEL_IMPL(9, 4, 2, hidden, 1024, 512, false); \
+        return; \
+    } else if (hidden == 7168 && m > 512 && m <= 768) { \
+        MHC_PRE_BIG_FUSE_RM_KERNEL_IMPL(9, 4, 1, hidden, 1024, 512, false); \
+        return; \
+    } else if (m > 512 && m <= 1024) { \
+        if (hidden == 7168) { \
+            MHC_PRE_BIG_FUSE_RM_KERNEL_IMPL(9, 4, 2, hidden, 1024, 512, false); \
+        } else { \
+            MHC_PRE_BIG_FUSE_RM_KERNEL_IMPL(9, 4, 2, hidden, 512, 512, false); \
+        } \
+        return; \
+    } else if (m >= 2048) { \
+        if (m > 8 * cu_num) { \
+            MHC_PRE_BIG_FUSE_RM_KERNEL_IMPL(9, 4, 2, hidden, 512, 512, true); \
+        } else { \
+            MHC_PRE_BIG_FUSE_RM_KERNEL_IMPL(9, 4, 2, hidden, 512, 512, false); \
+        } \
+        return; \
     }
 
     void mhc_pre_big_fuse_rmsnorm(
@@ -2502,13 +2547,26 @@ namespace aiter {
                     "pre-shuffled residual needs hidden_size divisible by mhc_res_ks");
 
         const HipDeviceGuard device_guard(out.device_id);
+        check_mhc_res_preshuffle_arch(res_preshuffle != 0);
         const hipStream_t stream = aiter::getCurrentHIPStream();
         const int cu_num = get_num_cu_func();
         
+        if (res_preshuffle) {
+            if (hidden_size == 4096) {
+                MHC_PRE_BIG_FUSE_RM_SHUFFLED_DISPATCH(4096);
+            } else if (hidden_size == 5120) {
+                MHC_PRE_BIG_FUSE_RM_SHUFFLED_DISPATCH(5120);
+            } else if (hidden_size == 7168) {
+                MHC_PRE_BIG_FUSE_RM_SHUFFLED_DISPATCH(7168);
+            }
+        }
+        // Fall back to the default configuration, retaining res_preshuffle.
+        // Both dispatches launch kernels that support the requested layout.
         MHC_PRE_BIG_FUSE_RM_KERNEL_DISPATCH(m);
     }
+#undef MHC_PRE_BIG_FUSE_RM_SHUFFLED_DISPATCH
 
-    template <typename DTYPE_I, int num_warps, int hc_mult, int tile_m, int tile_n, int tile_k, bool store_nt, bool is_res_w_preshuffle_bf16 = false, bool decode_direct_store = false>
+    template <typename DTYPE_I, int num_warps, int hc_mult, int tile_m, int tile_n, int tile_k, bool store_nt, bool w_preshuffle_bf16 = false, bool decode_direct_store = false, bool res_preshuffle = false>
     __global__ __launch_bounds__(num_warps * opus::get_warp_size(), 1)
     void mhc_fused_post_pre_gemm_sqrsum_kernel(
         float* out,
@@ -2546,13 +2604,13 @@ namespace aiter {
         // num_warps > 2: the store must be issued by a warp that owns no TDM load
         // (warps 0/1 issue residual/x), or that warp would carry n_stages loads +
         // n_stages stores = 4 tensor ops in flight, over the per-wave limit of 3.
-        static constexpr bool nres_tdm = mhc_nres_tdm_store && is_res_w_preshuffle_bf16
-                                         && mhc_res_shuffle && (num_warps > 2) && !decode_direct_store;
+        static constexpr bool nres_tdm = mhc_nres_tdm_store && w_preshuffle_bf16
+                                         && res_preshuffle && (num_warps > 2) && !decode_direct_store;
 #else
         static constexpr bool nres_tdm = false;
 #endif
 #if defined(__gfx1250__)
-        static constexpr bool decode_pipeline = decode_direct_store && is_res_w_preshuffle_bf16 && mhc_res_shuffle;
+        static constexpr bool decode_pipeline = decode_direct_store && w_preshuffle_bf16 && res_preshuffle;
 #else
         static constexpr bool decode_pipeline = false;
 #endif
@@ -2587,7 +2645,7 @@ namespace aiter {
         int residual_stride = hc_hidden_size;
         int fn_stride = hc_hidden_size;
         // Pre-shuffled residual (see mhc_res_ks): resS[k/KS][head][row][k%KS].
-        static constexpr bool res_shuf = is_res_w_preshuffle_bf16 && mhc_res_shuffle;
+        static constexpr bool res_shuf = res_preshuffle;
         static constexpr int res_ks = mhc_res_ks;
         static_assert(tile_k % res_ks == 0, "tile_k must be divisible by mhc_res_ks");
         static constexpr int res_nkb = tile_k / res_ks;              // kb blocks per k-step
@@ -2899,7 +2957,7 @@ namespace aiter {
         auto compute_store_tile = [&](int i, int slot, fp32xfntile& v_fn) {
             DTYPE_I* s_x_rd_ptr = s_x + slot * tile_mk;
             DTYPE_I* s_residual_rd_ptr = s_residual + slot * (hc_mult * tile_mk);
-            static constexpr bool batch_lds = decode_pipeline || (mhc_bf16_mma_avail && warp_size == 32 && is_res_w_preshuffle_bf16 && res_shuf && tile_k == 32);
+            static constexpr bool batch_lds = decode_pipeline || (mhc_bf16_mma_avail && warp_size == 32 && w_preshuffle_bf16 && res_shuf && tile_k == 32);
             static constexpr int ds_read_vec = 16 / sizeof(DTYPE_I);
             static constexpr int step = ds_read_vec;
             static constexpr int band_j = band_mk / (warp_size * ds_read_vec);
@@ -3047,7 +3105,7 @@ namespace aiter {
                             res_kl + k_split_offset);
                     }
                     s_offset += step;
-                    if constexpr (is_res_w_preshuffle_bf16 && mhc_bf16_mma_avail) {
+                    if constexpr (w_preshuffle_bf16 && mhc_bf16_mma_avail) {
 #if MHC_BF16_MFMA
                         // bf16 MFMA (wave64 CDNA): one mfma_f32_16x16x32_bf16 contracts
                         // ds_read_vec (=8) K-elems/lane x 4 lane-groups = 32 K, replacing
@@ -3323,7 +3381,7 @@ namespace aiter {
         static constexpr int v_per_lane = m_repeat * repeat_n * ovec;
         // Interleave aligned four-float groups across lanes for vector LDS access.
         auto reduction_offset = [&](int head, int c) {
-            if constexpr (mhc_bf16_mma_avail && warp_size == 32 && is_res_w_preshuffle_bf16) {
+            if constexpr (mhc_bf16_mma_avail && warp_size == 32 && w_preshuffle_bf16) {
                 return head * warp_size * v_per_lane + (c / 4) * warp_size * 4
                      + lane_id * 4 + c % 4;
             } else {
@@ -3398,7 +3456,7 @@ namespace aiter {
                     "hidden_size must be divisible by tile_k * split_k"); \
         AITER_CHECK(hidden_size >= (tile_k * split_k), \
                     "hidden_size must be >= tile_k * split_k (>=1 k-tile per split)"); \
-        mhc_fused_post_pre_gemm_sqrsum_kernel<DTYPE_I, num_warps, 4, tile_m, tile_n, tile_k, store_nt, MHC_FUSED_BF16, decode_direct_store> \
+        mhc_fused_post_pre_gemm_sqrsum_kernel<DTYPE_I, num_warps, 4, tile_m, tile_n, tile_k, store_nt, use_bf16, decode_direct_store, use_res_shuffle> \
             <<<grid, block, 0, stream>>>( \
                 reinterpret_cast<float*>(gemm_out_mul.data_ptr()), \
                 reinterpret_cast<float*>(gemm_out_sqrsum.data_ptr()), \
@@ -3458,7 +3516,8 @@ namespace aiter {
         int tile_m = 16,
         int tile_n = 32,
         int tile_k = 32,
-        int is_res_w_preshuffle_bf16 = 0)
+        int w_preshuffle_bf16 = 0,
+        int res_preshuffle = 0)
     {
         int m = layer_input.size(0);
         int hidden_size = layer_input.size(1);
@@ -3509,28 +3568,39 @@ namespace aiter {
         const hipStream_t stream = aiter::getCurrentHIPStream();
         dim3 block(block_size);
 
-        if (is_res_w_preshuffle_bf16) {
-#define MHC_FUSED_BF16 true
-            // Packed BF16 decode: direct stores and the single-barrier pipeline
-            // support both row tile sizes throughout the measured decode range.
-            if (WARP_SIZE == 32 && cu_num == 256 && m > 0 && m <= 1024
-                && (hidden_size == 4096 || hidden_size == 7168)
-                && tile_n == 32 && tile_k == 32) {
-                if (tile_m == 16) {
-                    MHC_FUSED_POST_PRE_GEMM_SQRSUM_KERNEL_IMPL_(4, 16, 32, 32, false, true);
-                    return;
-                }
-                if (tile_m == 32) {
-                    MHC_FUSED_POST_PRE_GEMM_SQRSUM_KERNEL_IMPL_(4, 32, 32, 32, false, true);
-                    return;
+        AITER_CHECK((w_preshuffle_bf16 == 0 || w_preshuffle_bf16 == 1)
+                        && (res_preshuffle == 0 || res_preshuffle == 1),
+                    "w_preshuffle_bf16 and res_preshuffle must be 0 or 1");
+        const bool packed = w_preshuffle_bf16;
+        const bool shuffled = res_preshuffle;
+        check_mhc_res_preshuffle_arch(shuffled);
+        auto dispatch = [&](auto bf16_tag, auto shuffle_tag) {
+            constexpr bool use_bf16 = decltype(bf16_tag)::value;
+            constexpr bool use_res_shuffle = decltype(shuffle_tag)::value;
+            if constexpr (use_bf16 && use_res_shuffle) {
+                // Packed BF16 decode: direct stores and the single-barrier pipeline
+                // support both row tile sizes throughout the measured decode range.
+                if (WARP_SIZE == 32 && cu_num == 256 && m > 0 && m <= 1024
+                    && (hidden_size == 4096 || hidden_size == 7168)
+                    && tile_n == 32 && tile_k == 32) {
+                    if (tile_m == 16) {
+                        MHC_FUSED_POST_PRE_GEMM_SQRSUM_KERNEL_IMPL_(4, 16, 32, 32, false, true);
+                        return;
+                    }
+                    if (tile_m == 32) {
+                        MHC_FUSED_POST_PRE_GEMM_SQRSUM_KERNEL_IMPL_(4, 32, 32, 32, false, true);
+                        return;
+                    }
                 }
             }
             MHC_FUSED_POST_PRE_GEMM_SQRSUM_KERNEL_DISPATCH(tile_k);
-#undef MHC_FUSED_BF16
+        };
+        if (packed) {
+            if (shuffled) dispatch(std::true_type{}, std::true_type{});
+            else dispatch(std::true_type{}, std::false_type{});
         } else {
-#define MHC_FUSED_BF16 false
-            MHC_FUSED_POST_PRE_GEMM_SQRSUM_KERNEL_DISPATCH(tile_k);
-#undef MHC_FUSED_BF16
+            if (shuffled) dispatch(std::false_type{}, std::true_type{});
+            else dispatch(std::false_type{}, std::false_type{});
         }
     }
 
