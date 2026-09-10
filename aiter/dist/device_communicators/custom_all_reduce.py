@@ -882,10 +882,10 @@ class CustomAllreduce:
 
         props = torch.cuda.get_device_properties(device)
         gcn_arch = getattr(props, "gcnArchName", "")
-        if "gfx1250" in gcn_arch and world_size > 4:
+        if "gfx1250" in gcn_arch and world_size > 8:
             raise RuntimeError(
                 f"gfx1250 (MI450) custom allreduce only supports "
-                f"world_size <= 4, got world_size={world_size}. "
+                f"world_size <= 8, got world_size={world_size}. "
                 f"RCCL fallback is also not available on this platform."
             )
 
