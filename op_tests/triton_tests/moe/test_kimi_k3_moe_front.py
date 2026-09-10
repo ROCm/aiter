@@ -137,7 +137,11 @@ def test_merge_weights_preserves_native_row_order():
     )
 
 
-@pytest.mark.parametrize("m", [1, 7, 14, 16])
+# 1, 7, 14 and 16 are the single-sequence and small-batch decode shapes. 32
+# through 192 are the MTP decode bucket: with num_speculative_tokens=3 a
+# pure-decode step submits num_seqs * 4 tokens, so a server serving 8 to 48
+# concurrent sequences lands here rather than in the 1..16 range.
+@pytest.mark.parametrize("m", [1, 7, 14, 16, 32, 48, 64, 80, 96, 112, 128, 192])
 def test_decode_full_front_matches_reference(m: int):
     generator = torch.Generator(device="cuda").manual_seed(20260908)
     hidden_states = torch.randn(
