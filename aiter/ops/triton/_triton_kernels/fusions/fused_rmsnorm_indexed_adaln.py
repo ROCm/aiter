@@ -4,8 +4,15 @@
 import triton
 import triton.language as tl
 
+from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
 
-@triton.jit
+_fused_rmsnorm_indexed_adaln_repr = make_kernel_repr(
+    "_fused_rmsnorm_indexed_adaln_kernel",
+    ["BLOCK_M", "BLOCK_N", "ROUND_INTERMEDIATE"],
+)
+
+
+@triton.jit(repr=_fused_rmsnorm_indexed_adaln_repr)
 def _fused_rmsnorm_indexed_adaln_kernel(
     out_ptr,
     x_ptr,
