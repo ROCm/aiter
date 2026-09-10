@@ -27,7 +27,7 @@ try:
     from flydsl._mlir import ir
     from flydsl._mlir.dialects import arith as _mlir_arith
     from flydsl.compiler.kernel_function import CompilationContext
-    from flydsl.expr import arith, gpu, range_constexpr, rocdl
+    from flydsl.expr import arith, const_expr, gpu, range_constexpr, rocdl
     from flydsl.expr.typing import Int32, T
     from flydsl.runtime.device import get_rocm_arch as get_hip_arch
     from flydsl.utils.smem_allocator import SmemAllocator, SmemPtr
@@ -41,6 +41,7 @@ except Exception:  # noqa: BLE001
     gpu = None
     rocdl = None
     buffer_ops = None
+    const_expr = None
     range_constexpr = None
     T = None
     Int32 = None
@@ -4504,6 +4505,16 @@ def _flydsl_dtype_str(dtype: torch.dtype) -> str:
     raise ValueError(f"Unsupported FlyDSL dtype: {dtype!r}")
 
 
+def _flydsl_smem_load(ptr, index):
+    """Load through a SmemPtr without making it dynamic control-flow state."""
+    return ptr.load([index])
+
+
+def _flydsl_smem_store(ptr, value, index):
+    """Store through a SmemPtr without making it dynamic control-flow state."""
+    ptr.store(value, [index])
+
+
 @lru_cache(maxsize=256)
 def compile_pa_decode_ps_reduce_flydsl(
     *,
@@ -4525,6 +4536,10 @@ def compile_pa_decode_ps_reduce_flydsl(
     block_threads = head_size
     assert block_threads > 0, "head_size must be positive"
     assert block_threads <= 1024, "head_size must fit in one workgroup"
+    # The block reduction uses full 64-lane shuffles. A partial final wave can
+    # read inactive lanes, so let the wrapper select Triton for those shapes.
+    if block_threads % FLYDSL_WARP_SIZE != 0:
+        raise ImportError("FlyDSL PS reduce requires head_size to be a multiple of 64")
     reduce_width = (
         1
         if max_context_partition_num <= 1
@@ -4566,7 +4581,7 @@ def compile_pa_decode_ps_reduce_flydsl(
         smem_base = allocator.get_base()
         red_scratch = SmemPtr(smem_base, red_off, T.f32, shape=(red_slots,))
         red_scratch.get()
-        if max_context_partition_num > FLYDSL_WARP_SIZE:
+        if const_expr(max_context_partition_num > FLYDSL_WARP_SIZE):
             part_weights_lds = SmemPtr(
                 smem_base, part_weights_off, T.f32, shape=(max_context_partition_num,)
             )
@@ -4576,7 +4591,7 @@ def compile_pa_decode_ps_reduce_flydsl(
         es_rsrc = buffer_ops.create_buffer_resource(exp_sums_ptr, max_size=True)
         ml_rsrc = buffer_ops.create_buffer_resource(max_logits_ptr, max_size=True)
         logits_rsrc = buffer_ops.create_buffer_resource(logits_ptr, max_size=True)
-        if use_sinks:
+        if const_expr(use_sinks):
             sink_rsrc = buffer_ops.create_buffer_resource(sink_token_ptr, max_size=True)
 
         c_zero_f = arith.constant(0.0, type=T.f32)
@@ -4610,43 +4625,45 @@ def compile_pa_decode_ps_reduce_flydsl(
             return red
 
         def _block_reduce(val, mode):
-            if red_slots == 1:
+            if const_expr(red_slots == 1):
                 return (
                     _wave_reduce_max_full(val)
-                    if mode == "max"
+                    if const_expr(mode == "max")
                     else _wave_reduce_sum_full(val)
                 )
 
-            neutral = c_neg_inf if mode == "max" else c_zero_f
+            neutral = c_neg_inf if const_expr(mode == "max") else c_zero_f
             w = (
                 _wave_reduce_max_full(val)
-                if mode == "max"
+                if const_expr(mode == "max")
                 else _wave_reduce_sum_full(val)
             )
 
             if arith.cmpi(arith.CmpIPredicate.eq, lane, c_zero_i):
                 wave_idx = arith.index_cast(T.index, wave)
-                red_scratch.store(w, [wave_idx])
+                _flydsl_smem_store(red_scratch, w, wave_idx)
             gpu.barrier()
 
             if arith.cmpi(arith.CmpIPredicate.eq, wave, c_zero_i):
                 in_range = arith.cmpi(arith.CmpIPredicate.slt, lane, c_red_slots)
                 lane_safe = arith.select(in_range, lane, c_zero_i)
                 lane_safe_idx = arith.index_cast(T.index, lane_safe)
-                red_val = red_scratch.load([lane_safe_idx])
+                red_val = _flydsl_smem_load(red_scratch, lane_safe_idx)
                 red_val = arith.select(in_range, red_val, neutral)
                 red_val = (
                     _wave_reduce_max_full(red_val)
-                    if mode == "max"
+                    if const_expr(mode == "max")
                     else _wave_reduce_sum_full(red_val)
                 )
                 if arith.cmpi(arith.CmpIPredicate.eq, lane, c_zero_i):
-                    red_scratch.store(red_val, [arith.constant(0, index=True)])
+                    _flydsl_smem_store(
+                        red_scratch, red_val, arith.constant(0, index=True)
+                    )
             gpu.barrier()
 
-            return red_scratch.load([arith.constant(0, index=True)])
+            return _flydsl_smem_load(red_scratch, arith.constant(0, index=True))
 
-        if max_context_partition_num <= FLYDSL_WARP_SIZE:
+        if const_expr(max_context_partition_num <= FLYDSL_WARP_SIZE):
             c_part_num = arith.constant(max_context_partition_num, type=T.i32)
             c_reduce_width = arith.constant(reduce_width, type=T.i32)
             c_four = arith.constant(4, type=T.i32)
@@ -4702,13 +4719,13 @@ def compile_pa_decode_ps_reduce_flydsl(
             )
             scaled_sum = part_sum * part_scale
             global_exp_sum = _wave_reduce_sum(scaled_sum)
-            if use_sinks:
+            if const_expr(use_sinks):
                 sink_off = kv_head_idx * c_qgs + group_idx
-                if sink_dtype_str == "f32":
+                if const_expr(sink_dtype_str == "f32"):
                     sink_value = buffer_ops.buffer_load(
                         sink_rsrc, sink_off, vec_width=1, dtype=T.f32
                     )
-                elif sink_dtype_str == "f16":
+                elif const_expr(sink_dtype_str == "f16"):
                     sink_value_raw = buffer_ops.buffer_load(
                         sink_rsrc, sink_off, vec_width=1, dtype=T.f16
                     )
@@ -4730,7 +4747,7 @@ def compile_pa_decode_ps_reduce_flydsl(
                 c_one_f,
             )
             weight_local = scaled_sum / safe_global_exp_sum
-            weight_local_i32 = arith.bitcast(T.i32, weight_local)
+            weight_local_i32 = arith.bitcast(T.i32, arith.unwrap(weight_local))
 
             acc = c_zero_f
             for part_idx in range_constexpr(max_context_partition_num):
@@ -4747,11 +4764,11 @@ def compile_pa_decode_ps_reduce_flydsl(
                     + eqgs_idx * stride_logits_group
                     + tid
                 )
-                if logits_dtype_str == "f32":
+                if const_expr(logits_dtype_str == "f32"):
                     part_logits = buffer_ops.buffer_load(
                         logits_rsrc, logits_off, vec_width=1, dtype=T.f32
                     )
-                elif logits_dtype_str == "f16":
+                elif const_expr(logits_dtype_str == "f16"):
                     part_logits_raw = buffer_ops.buffer_load(
                         logits_rsrc, logits_off, vec_width=1, dtype=T.f16
                     )
@@ -4764,7 +4781,9 @@ def compile_pa_decode_ps_reduce_flydsl(
                 acc = acc + part_logits * weight
         else:
             global_max = c_neg_inf
-            for chunk_base in range(0, max_context_partition_num, block_threads):
+            for chunk_base in range_constexpr(
+                0, max_context_partition_num, block_threads
+            ):
                 chunk_size = min(block_threads, max_context_partition_num - chunk_base)
                 c_chunk_size = arith.constant(chunk_size, type=T.i32)
                 c_chunk_base = arith.constant(chunk_base, type=T.i32)
@@ -4789,7 +4808,9 @@ def compile_pa_decode_ps_reduce_flydsl(
                 c_zero_f,
             )
             global_exp_sum = c_zero_f
-            for chunk_base in range(0, max_context_partition_num, block_threads):
+            for chunk_base in range_constexpr(
+                0, max_context_partition_num, block_threads
+            ):
                 chunk_size = min(block_threads, max_context_partition_num - chunk_base)
                 c_chunk_size = arith.constant(chunk_size, type=T.i32)
                 c_chunk_base = arith.constant(chunk_base, type=T.i32)
@@ -4817,13 +4838,13 @@ def compile_pa_decode_ps_reduce_flydsl(
                 chunk_sum = _block_reduce(part_sum * part_scale, "sum")
                 global_exp_sum = global_exp_sum + chunk_sum
 
-            if use_sinks:
+            if const_expr(use_sinks):
                 sink_off = kv_head_idx * c_qgs + group_idx
-                if sink_dtype_str == "f32":
+                if const_expr(sink_dtype_str == "f32"):
                     sink_value = buffer_ops.buffer_load(
                         sink_rsrc, sink_off, vec_width=1, dtype=T.f32
                     )
-                elif sink_dtype_str == "f16":
+                elif const_expr(sink_dtype_str == "f16"):
                     sink_value_raw = buffer_ops.buffer_load(
                         sink_rsrc, sink_off, vec_width=1, dtype=T.f16
                     )
@@ -4846,7 +4867,9 @@ def compile_pa_decode_ps_reduce_flydsl(
                 c_one_f,
             )
 
-            for chunk_base in range(0, max_context_partition_num, block_threads):
+            for chunk_base in range_constexpr(
+                0, max_context_partition_num, block_threads
+            ):
                 chunk_size = min(block_threads, max_context_partition_num - chunk_base)
                 c_chunk_size = arith.constant(chunk_size, type=T.i32)
                 c_chunk_base = arith.constant(chunk_base, type=T.i32)
@@ -4874,7 +4897,7 @@ def compile_pa_decode_ps_reduce_flydsl(
                     )
                     weight = (part_sum * part_scale) / safe_global_exp_sum
                     part_idx_idx = arith.index_cast(T.index, part_i32)
-                    part_weights_lds.store(weight, [part_idx_idx])
+                    _flydsl_smem_store(part_weights_lds, weight, part_idx_idx)
 
             gpu.barrier()
 
@@ -4882,7 +4905,7 @@ def compile_pa_decode_ps_reduce_flydsl(
             for part_idx in range_constexpr(max_context_partition_num):
                 part_i32 = arith.constant(part_idx, type=T.i32)
                 part_idx_idx = arith.constant(part_idx, index=True)
-                weight = part_weights_lds.load([part_idx_idx])
+                weight = _flydsl_smem_load(part_weights_lds, part_idx_idx)
                 logits_off = (
                     batch_idx * stride_logits_seq
                     + kv_head_idx * stride_logits_head
@@ -4890,11 +4913,11 @@ def compile_pa_decode_ps_reduce_flydsl(
                     + eqgs_idx * stride_logits_group
                     + tid
                 )
-                if logits_dtype_str == "f32":
+                if const_expr(logits_dtype_str == "f32"):
                     part_logits = buffer_ops.buffer_load(
                         logits_rsrc, logits_off, vec_width=1, dtype=T.f32
                     )
-                elif logits_dtype_str == "f16":
+                elif const_expr(logits_dtype_str == "f16"):
                     part_logits_raw = buffer_ops.buffer_load(
                         logits_rsrc, logits_off, vec_width=1, dtype=T.f16
                     )
@@ -4915,9 +4938,9 @@ def compile_pa_decode_ps_reduce_flydsl(
             + group_idx * stride_output_group_size
             + tid
         )
-        if output_dtype_str == "f32":
+        if const_expr(output_dtype_str == "f32"):
             out_val = acc
-        elif output_dtype_str == "f16":
+        elif const_expr(output_dtype_str == "f16"):
             out_val = arith.trunc_f(T.f16, acc)
         else:
             out_val = arith.trunc_f(T.bf16, acc)
@@ -5131,9 +5154,6 @@ def _paged_attention_decode_v2_reduce_kernel_wrapper(
                 query_group_size=query_group_size,
                 head_size=head_size,
                 context_partition_num=context_partition_num,
-                # Was the `fx.Stream(None)` parameter default; passed explicitly
-                # now that the default is gone. fx.Stream(None) is the default queue.
-                stream=fx.Stream(None),
             )
             return
         except ImportError:
