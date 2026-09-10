@@ -32,10 +32,7 @@ def _load_torch_hstu_reference():
     except ModuleNotFoundError as exc:
         missing = exc.name or ""
         if not (
-            missing == "triton_tests"
-            or missing.startswith("triton_tests.")
-            or missing == "op_tests"
-            or missing.startswith("op_tests.")
+            missing == "triton_tests" or missing.startswith(("triton_tests.", "op_tests.")) or missing == "op_tests"
         ):
             raise
 
