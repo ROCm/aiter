@@ -168,6 +168,12 @@ def pick_block_c(N: int) -> int:
 # AITER_FLYDSL_MXFP4_GEMM_INTERLEAVE=0 for the plain cluster.
 _INTERLEAVE = os.environ.get("AITER_FLYDSL_MXFP4_GEMM_INTERLEAVE", "1") != "0"
 
+# gfx950 XCD count, and the band width in TILES an XCD owns contiguously.
+# AITER_FLYDSL_MXFP4_GEMM_XCD_SPAN is in M-blocks; the band is that times the
+# column-tile count, so a band is a run of whole row tiles. 0 disables the remap.
+N_XCD = 8
+_XCD_SPAN = int(os.environ.get("AITER_FLYDSL_MXFP4_GEMM_XCD_SPAN", "4"))
+
 
 def _mfma_scale_agpr(a, b, sa, sb, acc):
     """fp4 16x16x128 scaled MFMA with the accumulator pinned in AGPR (=a,...,0)
@@ -238,6 +244,10 @@ def _compile(K: int, N: int, E: int, BLOCK_C: int):
     """
     assert K % 128 == 0, f"K ({K}) must be a multiple of 128 (MFMA K-sub-block)"
     assert BLOCK_C in (128, 256), f"BLOCK_C {BLOCK_C} not supported"
+
+    # An XCD's contiguous run, in TILES: _XCD_SPAN row-tiles' worth of column
+    # tiles, so a band is whole row tiles and an XCD's A reads stay together.
+    _XCD_BAND = _XCD_SPAN * (-(-N // BLOCK_C))
 
     K_BYTES = K // FP4_PER_BYTE
     # Steps of 256 fp4. A trailing 128 (K % 256 == 128, e.g. DSV3's 1408)
@@ -345,6 +355,7 @@ def _compile(K: int, N: int, E: int, BLOCK_C: int):
         A_scale: fx.Tensor,
         B_scale: fx.Tensor,
         OFFS: fx.Tensor,
+        n_blocks_rt: fx.Int32,
         n_c_tiles: fx.Int32,
         out_m: fx.Int32,
         out_n: fx.Int32,
@@ -357,6 +368,27 @@ def _compile(K: int, N: int, E: int, BLOCK_C: int):
         # uniform across experts. Only this mapping and the epilogue mask
         # care that the groups are ragged.
         bid = fx.block_idx.x
+        # XCD band remap. gfx950 has 8 XCDs with a private L2 each, and blocks
+        # go to XCDs round-robin by index. A plain `bid // n_c` mapping puts
+        # consecutive column tiles of ONE row tile on DIFFERENT XCDs, so every
+        # XCD pulls the same A rows and each expert's B slab is smeared across
+        # all eight L2s. Banding gives an XCD a contiguous run of `band` tiles,
+        # which for a band that divides a group's tile count keeps that XCD's
+        # reads inside one expert slab.
+        #
+        # This is a permutation of block -> tile and nothing else: the identity
+        # tail keeps it a bijection, so every (slot, c_base) pair is still
+        # covered exactly once and the result cannot change.
+        if const_expr(_XCD_BAND > 0 and N_XCD > 1):
+            _span = const_expr(N_XCD * _XCD_BAND)
+            _local = ArithValue(bid) // fx.Int32(N_XCD)
+            _xcd = ArithValue(bid) - _local * fx.Int32(N_XCD)
+            _rnd = ArithValue(_local) // fx.Int32(_XCD_BAND)
+            _mapped = (ArithValue(_rnd) * fx.Int32(N_XCD) + _xcd) * fx.Int32(
+                _XCD_BAND
+            ) + (ArithValue(_local) - ArithValue(_rnd) * fx.Int32(_XCD_BAND))
+            _whole = (ArithValue(n_blocks_rt) // fx.Int32(_span)) * fx.Int32(_span)
+            bid = arith.select(ArithValue(bid) < _whole, _mapped, bid)
         slot = ArithValue(bid) // n_c_tiles  # which row tile overall
         c_base = (ArithValue(bid) % n_c_tiles) * fx.Int32(BLOCK_C)
 
@@ -851,6 +883,7 @@ def _compile(K: int, N: int, E: int, BLOCK_C: int):
             A_scale,
             B_scale,
             OFFS,
+            n_blocks,
             n_c_tiles,
             out_m,
             out_n,
