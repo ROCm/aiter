@@ -484,9 +484,13 @@ float fmha_v3_bwd(mha_bwd_args a, const ck_tile::stream_config& s)
                                                                          dqdkdv_cfgs,
                                                                          post_cfgs);
 
-    if((pre_kernel == "") || (dqdkdv_kernel == "") || (need_post_processing && (post_kernel == "")))
+    if((pre_kernel == "") || (dqdkdv_kernel == ""))
     {
         return -1;
+    }
+    if(need_post_processing && (post_kernel == ""))
+    {
+        need_post_processing = false;
     }
 
     int ts_odo;
@@ -689,7 +693,7 @@ float fmha_v3_bwd(mha_bwd_args a, const ck_tile::stream_config& s)
 
     auto dqdkdv_kernel_launch = [&]() {
         arg_size                  = sizeof(dqdkdv_args);
-        int bdx = (arch_id == "gfx1250") ? 128 : 256;
+        int bdx = (arch_id == "gfx1250") ? 128 : (a.hdim_q >= 256 ? 512 : 256);
         int gdx = (a.max_seqlen_k + ts_kv - 1) / ts_kv;
         int gdy = a.nhead_q;
         int gdz = a.batch;

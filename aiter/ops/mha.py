@@ -3295,12 +3295,17 @@ def _flash_attn_varlen_backward(
         ret &= deterministic == False
         ret &= hdim_q == hdim_v
         ret &= nhead_q % nhead_k == 0
-        ret &= hdim_q > 64 and hdim_q <= 128 and hdim_q % 8 == 0
+        ret &= hdim_q > 64 and hdim_q <= 256 and hdim_q % 8 == 0
         ret &= not swa
+        if hdim_q == 256:
+            ret &= not causal
 
         return ret
 
     can_impl_fmha_v3_bwd_ = can_impl_fmha_v3_bwd() or can_impl_fmha_v3_bwd_gfx950()
+    # gfx950 hd256 backward uses a16 (atomic32=0)
+    if get_gfx() == "gfx950" and hdim_q == 256:
+        is_v3_atomic_fp32 = False
     # dq, dk, dv are allocated by us so they should already be contiguous
     dout, q, k, v, out = [maybe_contiguous(x) for x in (dout, q, k, v, out)]
 
