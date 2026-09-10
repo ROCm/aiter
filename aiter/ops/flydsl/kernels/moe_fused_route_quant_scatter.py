@@ -98,13 +98,10 @@ BLOCK_THREADS = 256
 # It only has to exceed any real buffer, and stays under 2 GiB because the
 # descriptor builder sign-extends the size to 64 bits.
 _SCALE_RSRC_MAX_BYTES = 0x7FFFFFFF
-# TDM staging depth for the token-multidest quant, and the token count below
-# which a shallower pipeline is faster (see ``token_multidest_tdm_chunks``).
+# Deepest TDM staging worth pipelining, and how far the K-split may go. The
+# split aims for this many blocks per CU; past that it stops paying.
 _TOKEN_MULTIDEST_TDM_CHUNKS = 7
-_TOKEN_MULTIDEST_SHALLOW_TDM_MAX_TOKENS = 4096
-# Grid width the K-split aims for, and how far it may split to get there. The
-# target is ~4x the 256 CUs of a gfx1250; past it the split stops paying.
-_TOKEN_MULTIDEST_TARGET_BLOCKS = 1024
+_TOKEN_MULTIDEST_BLOCKS_PER_CU = 4
 _TOKEN_MULTIDEST_MAX_KSPLIT = 14
 ELEMS_PER_LANE = 2  # bf16 columns each lane quantizes -> 1 fp4 byte / 2 fp8 bytes
 LANES_PER_MX_BLOCK = 32 // ELEMS_PER_LANE  # 16 lanes cover one 32-element MX block
@@ -1837,9 +1834,12 @@ def token_multidest_ksplit(
     split only multiplies the per-block route setup. Splitting also costs the
     TDM staging pipeline, which is why it stops once the grid is wide enough.
     """
+    from aiter.jit.utils.chip_info import get_cu_num
+
     L = _quant_layout(feat_dim, quant_mode, wmma_rep)
     grid = -(-token_num // L.warps_per_block)
-    want = -(-_TOKEN_MULTIDEST_TARGET_BLOCKS // max(grid, 1))
+    target = (get_cu_num() or 256) * _TOKEN_MULTIDEST_BLOCKS_PER_CU
+    want = -(-target // max(grid, 1))
     # Largest divisor of the row that stays within the cap and the target.
     best = 1
     for n in range(1, min(want, _TOKEN_MULTIDEST_MAX_KSPLIT) + 1):
@@ -1849,27 +1849,25 @@ def token_multidest_ksplit(
 
 
 def token_multidest_tdm_chunks(
-    feat_dim: int, wmma_rep: int, quant_mode: str, token_num: int
+    feat_dim: int, wmma_rep: int, quant_mode: str, ksplit: int = 1
 ) -> int:
-    """TDM staging depth for ``token_num`` tokens.
+    """TDM staging depth: the deepest the row's geometry allows, up to the tuned one.
 
-    Each chunk costs a ``tensor_wait`` and two CTA barriers, and at low token
-    counts there are too few blocks in flight for other waves to cover them: a
-    shallow pipeline wins until the grid is large enough to hide the deep one.
-    Measured on DSV4 (7168, topk 6, fp4, gfx1250), 2 chunks against 7 --
-    512 tokens 7.31 vs 9.33 us, 2048 10.67 vs 12.22, 4096 16.14 vs 16.86,
-    16384 50.75 vs 46.72.
+    A chunk has to cover a whole number of wave iterations and stay 16 B
+    aligned, so the depth comes from the row's divisors rather than a constant:
+    the tuned 7 fits model_dim 7168's 28 iterations but does not divide the 16
+    of model_dim 4096 at all.
 
-    Falls back to the deep default whenever the shallow depth does not divide
-    the row evenly, so the geometry constraint stays in one place: the builder's.
+    A K-split block has too few iterations left to pay for a pipeline, and the
+    builder drops staging for it anyway; say so here so the two agree.
     """
+    if ksplit > 1:
+        return 0
     L = _quant_layout(feat_dim, quant_mode, wmma_rep)
-    shallow = 2
-    if token_num <= _TOKEN_MULTIDEST_SHALLOW_TDM_MAX_TOKENS and (
-        L.block_iters % shallow == 0 and (feat_dim * 2) % (shallow * 16) == 0
-    ):
-        return shallow
-    return _TOKEN_MULTIDEST_TDM_CHUNKS
+    for n in range(min(_TOKEN_MULTIDEST_TDM_CHUNKS, L.block_iters), 0, -1):
+        if L.block_iters % n == 0 and (feat_dim * 2) % (n * 16) == 0:
+            return n
+    return 0
 
 
 def build_moe_token_multidest_quant_topk6_module(

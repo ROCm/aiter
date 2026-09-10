@@ -3184,17 +3184,18 @@ def flydsl_moe_fused_quant_preshuffle(
                 token_multidest_tdm_chunks,
             )
 
+            md_ksplit = token_multidest_ksplit(
+                feat_dim, wmma_rep, quant_mode, token_num
+            )
             launch = _get_compiled_token_multidest_quant_topk6(
                 feat_dim=feat_dim,
                 wmma_rep=wmma_rep,
                 quant_mode=quant_mode,
                 row_major_scale=bool(row_major_scale),
                 tdm_hidden_chunks=token_multidest_tdm_chunks(
-                    feat_dim, wmma_rep, quant_mode, token_num
+                    feat_dim, wmma_rep, quant_mode, md_ksplit
                 ),
-                ksplit=token_multidest_ksplit(
-                    feat_dim, wmma_rep, quant_mode, token_num
-                ),
+                ksplit=md_ksplit,
             )
             token_grid = (token_num + warps_per_block - 1) // warps_per_block
             launch(
