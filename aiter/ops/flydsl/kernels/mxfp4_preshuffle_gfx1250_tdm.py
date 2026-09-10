@@ -180,8 +180,6 @@ def launch_gemm_a8w4_tdm(
         # env overrides (*_N2) bypass it.
         if tile_n % 256 != 0:
             raise ValueError(f"ep_quant_bits requires tile_n % 256 == 0, got {tile_n}")
-        # Each MX block is WN_PER_MX_BLOCK_EP wn-subtiles wide (2 kgrp halves
-        # merged by the shuffle_xor(16) inside emit_amax_e8m0_native_scale).
         if (tile_n // n_warp // 16) % WN_PER_MX_BLOCK_EP != 0:
             raise ValueError(
                 "ep_quant_bits requires wmma_n_rep % "
@@ -1319,14 +1317,24 @@ def launch_gemm_a8w4_tdm(
                         ].bitcast(fx.Float32)
                         for wm in range_constexpr(wmma_m_rep)
                     ]
+
+                def _biased_acc(wm, wn, col_rel):
+                    acc = Vec(accs[wm * output_n_rep + wn])
+                    if const_expr(has_bias):
+                        acc = acc + Vec(
+                            fx.ptr_load(
+                                bias_map + expert * i32_n + col_rel,
+                                result_type=T.vec(8, out_elem),
+                            )
+                        ).to(fx.Float32)
+                    return acc
+
                 if const_expr(ep_quant_bits):
-                    # MX staging. The per-32 block amax is reduced across the
-                    # kgrp lane pair by the shuffle_xor(16) inside
-                    # emit_amax_e8m0_native_scale, so quantization has to happen
-                    # HERE, in registers: once the values reach LDS they are
-                    # scattered by column and can no longer be reduced. What
-                    # lands in LDS is already wire bytes, so the TDM store below
-                    # is a pure move.
+                    # MX staging. The per-32 block amax is reduced across the kgrp
+                    # lane pair by the shuffle_xor(16) inside
+                    # emit_amax_e8m0_native_scale, so quantization has to happen HERE,
+                    # in registers: once the values reach LDS they are scattered by
+                    # column and can no longer be reduced.
                     _v2i32_ty = T.vec(2, T.i32)
                     _mx_dt = (
                         MxDtype.FP8_E4M3 if ep_quant_bits == 8 else MxDtype.FP4_E2M1
@@ -1348,14 +1356,7 @@ def launch_gemm_a8w4_tdm(
                             for sub_wn in range_constexpr(WN_PER_MX_BLOCK_EP):
                                 wn = mx_blk * WN_PER_MX_BLOCK_EP + sub_wn
                                 col_rel = wnb + wn * 16 + kgrp * 8
-                                acc = Vec(accs[wm * output_n_rep + wn])
-                                if const_expr(has_bias):
-                                    acc = acc + Vec(
-                                        fx.ptr_load(
-                                            bias_map + expert * i32_n + col_rel,
-                                            result_type=T.vec(8, out_elem),
-                                        )
-                                    ).to(fx.Float32)
+                                acc = _biased_acc(wm, wn, col_rel)
                                 # Weight before quantizing: combine sums unweighted.
                                 for i in range_constexpr(8):
                                     _vals.append(acc[i] * _wf)
@@ -1416,14 +1417,7 @@ def launch_gemm_a8w4_tdm(
                         row_rel = wmb + wm * 16 + lane16
                         for wn in range_constexpr(output_n_rep):
                             col_rel = wnb + wn * 16 + kgrp * 8
-                            acc = Vec(accs[wm * output_n_rep + wn])
-                            if const_expr(has_bias):
-                                acc = acc + Vec(
-                                    fx.ptr_load(
-                                        bias_map + expert * i32_n + col_rel,
-                                        result_type=T.vec(8, out_elem),
-                                    )
-                                ).to(fx.Float32)
+                            acc = _biased_acc(wm, wn, col_rel)
                             if const_expr(stage1_act):
                                 if const_expr(is_situv2):
                                     act_vals = [
@@ -1488,10 +1482,8 @@ def launch_gemm_a8w4_tdm(
                 # pe*K + slot over the single base lsa_ptr(0, off). perRankSize is
                 # measured in-kernel from the lsa_ptr stride. Each wave issues the
                 # gather-stores for its row groups, 8 rows per instruction.
-                # Quantized rows carry the payload plane; the scale plane is a
-                # second store into the same slots at a plane-base offset. The
-                # descriptor addresses the payload plane in bytes on both wires,
-                # so a 4-bit element just halves the row length.
+                # Quantized rows are addressed in bytes, so a 4-bit element just
+                # halves the row length; the scale plane rides a second store.
                 elem_bytes = 1 if ep_quant_bits else 2
                 _row_elems = C_ROW_BYTES if ep_quant_bits else STORE_N
                 _lds_row_elems = _lds_row_bytes if ep_quant_bits else STORE_PITCH
@@ -1527,10 +1519,9 @@ def launch_gemm_a8w4_tdm(
                     # element on the fp8 wire, half that on fp4.
                     _elem_div = 8 // ep_quant_bits
                     _gboff = blk_n64 // _elem_div
-                    # The scale plane starts one payload plane (N*bits/8 bytes)
-                    # into the slot; blk_n is a multiple of tile_n, itself a
-                    # multiple of the scale block, so the tile's scale run starts
-                    # whole.
+                    # The scale plane starts one payload plane into the slot; blk_n
+                    # is a multiple of tile_n, itself a multiple of the scale block,
+                    # so the tile's scale run starts whole.
                     _gboff_s = n64 // _elem_div + blk_n64 // EP_SCALE_BLOCK
                 else:
                     _gboff = blk_n * elem_bytes
@@ -1570,8 +1561,6 @@ def launch_gemm_a8w4_tdm(
                         )
                         tensor_store_gather(desc)
                         if const_expr(ep_quant_bits):
-                            # Same rows and slot stride as the payload store;
-                            # only the plane base and the row width differ.
                             desc_s = make_tensor_gather_descriptor(
                                 _comb_view,
                                 _lds_c,
