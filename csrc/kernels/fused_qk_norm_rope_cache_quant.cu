@@ -5964,12 +5964,19 @@ namespace aiter {
 
 } // namespace aiter
 
-// Unified macro for fused QK norm + RoPE + group quant + cache kernel
-// Requires the following constexpr/locals in scope at the call site:
-//   head_dim_val, tokens_per_block_val, q_group_size_val, q_scale_fp32_val, has_q_weight_val
-//   q_weight_ptr (scalar_t*, may be nullptr), q_scale_ptr (void*, may be nullptr)
-//   swa_nope_ptr (CACHE_T*, may be nullptr), swa_rope_ptr (scalar_t*, may be nullptr),
-//   swa_block_tables_ptr / swa_bid_ptr (const int32_t*, may be nullptr)
+// Unified macro for the coarse fused QK norm + RoPE + group quant + cache kernel.
+// Requires in scope at the call site:
+//   template args  head_dim_val, tokens_per_block_val, q_group_size_val,
+//                  q_scale_fp32_val, has_q_weight_val, q_tdm_depth_val
+//   launch config  grid, block, coarse_lds_bytes, stream
+//   kernel args    mla_params, eps, is_neox, and the tensors q, kv, k_rope_buff,
+//                  k_weight, k_nope_scale_buff, q_nope_scale_buff, positions,
+//                  cos_cache, sin_cache
+//   pointers       q_weight_ptr (scalar_t*), q_scale_ptr (void*),
+//                  q_rope_out_ptr (scalar_t*), swa_nope_ptr (CACHE_T*),
+//                  swa_rope_ptr (scalar_t*), and swa_block_tables_ptr /
+//                  swa_dest_row_ptr / swa_bid_ptr (const int32_t*)
+//                  -- every pointer in this group may be nullptr
 #define CALL_FUSED_QK_NORM_ROPE_GROUP_QUANT_CACHE(KV_T, CACHE_T, QUERY_T, KV_DTYPE, Q_DTYPE)   \
          aiter::fuse_qk_norm_rope_group_quant_cache_kernel<KV_T, CACHE_T, QUERY_T, KV_DTYPE, Q_DTYPE, \
                  q_group_size_val, q_scale_fp32_val, has_q_weight_val, head_dim_val, tokens_per_block_val, \
@@ -5997,7 +6004,10 @@ namespace aiter {
                  reinterpret_cast<const int32_t*>(swa_bid_ptr));
 
 // Fine-grained launcher (1 wave / (token,head); grid=(num_tokens,num_heads+1), block=64).
-// Same arg list / scope requirements as the coarse macro above.
+// Same scope requirements as the coarse macro above, except that it takes
+// fg_heads_per_wave_val in place of q_tdm_depth_val and fg_lds_bytes in place of
+// coarse_lds_bytes. The kernel args are the same set in a different order: this
+// kernel takes eps / mla_params / is_neox after the cos/sin caches, not first.
 #define CALL_FUSED_QK_NORM_ROPE_FINEGRAINED(KV_T, CACHE_T, QUERY_T, KV_DTYPE, Q_DTYPE)   \
          aiter::fuse_qk_norm_rope_finegrained_kernel<KV_T, CACHE_T, QUERY_T, KV_DTYPE, Q_DTYPE, \
                  q_group_size_val, q_scale_fp32_val, has_q_weight_val, head_dim_val, tokens_per_block_val, \
