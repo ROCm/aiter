@@ -29,20 +29,7 @@ _SUPPORTED_ARCHES = ("gfx942", "gfx950", "gfx1250")
 _OneBlockDispatchBands = tuple[tuple[int | None, int], ...]
 # Untuned arches keep the previous single 20k cutoff.
 _UNTUNED_ONE_BLOCK_DISPATCH_BANDS: _OneBlockDispatchBands = ((None, 20_000),)
-# gfx950 CUDAGraph A/B. Small batches cannot amortize the multi-block launch
-# chain, so one-block stays wider. Batch 1-2: unordered still prefers one
-# through 49152 (65536 already loses on k>=2048). Batch 3-8: all modes prefer
-# one through 28672; 32768 only loses on k=2048 stable+values. Large batches
-# keep one-block for occupancy.
-# gfx942 CUDAGraph A/B (same protocol). Multi stays ~23-32us at batch 1-8, so
-# small batches keep one-block past the tight-mode flip. Batch 1-2: unordered
-# k>=2048 prefers one through 40960 (49152 already ~0.95). Batch 3-8: all
-# modes prefer one through 28672; keep 32768 so unordered 8x32768 stays
-# one-block. Batch 16 all-mode last width is 65536. Batch >=17 occupancy beats
-# the launch chain.
-# gfx1250 has sharper occupancy steps because multi-block launches 16 chunks
-# per row. Tight k=2048/4096 stable+values modes set the conservative valleys;
-# neighboring bands stay wider when their geometric mean favors one-block.
+
 _ONE_BLOCK_DISPATCH_BANDS: dict[str, _OneBlockDispatchBands] = {
     "gfx950": (
         (2, 49_152),
@@ -56,8 +43,11 @@ _ONE_BLOCK_DISPATCH_BANDS: dict[str, _OneBlockDispatchBands] = {
     ),
     "gfx942": (
         (2, 40_960),
+        (4, 28_672),
+        (6, 40_960),
         (8, 32_768),
         (16, 65_536),
+        (32, 327_680),
         (None, _MAX_BUFFER_ROW_ELEMENTS),
     ),
     "gfx1250": (
