@@ -1159,6 +1159,59 @@ def fmha_v3_varlen_fwd(
 ) -> tuple[Tensor, Tensor, Tensor, Tensor]: ...
 
 
+def gen_fmha_v3_varlen_splitkv_fwd_fake_tensor(
+    q: Tensor,
+    k: Tensor,
+    v: Tensor,
+    cu_seqlens_q: Tensor,
+    cu_seqlens_k: Tensor,
+    max_seqlen_q: int,
+    max_seqlen_k: int,
+    softmax_scale: float,
+    return_softmax_lse: bool,
+    num_splits: int,
+) -> tuple[Tensor, Tensor, Tensor, Tensor]:
+    return gen_fmha_v3_varlen_fwd_fake_tensor(
+        q,
+        k,
+        v,
+        cu_seqlens_q,
+        cu_seqlens_k,
+        max_seqlen_q,
+        max_seqlen_k,
+        0,
+        0.0,
+        softmax_scale,
+        0.0,
+        False,
+        False,
+        -1,
+        -1,
+        return_softmax_lse,
+        False,
+        1,
+    )
+
+
+@compile_ops(
+    "module_fmha_v3_varlen_fwd",
+    fc_name="fmha_v3_varlen_splitkv_fwd",
+    gen_fake=gen_fmha_v3_varlen_splitkv_fwd_fake_tensor,
+)
+def _fmha_v3_varlen_splitkv_fwd(
+    q: Tensor,
+    k: Tensor,
+    v: Tensor,
+    cu_seqlens_q: Tensor,
+    cu_seqlens_k: Tensor,
+    max_seqlen_q: int,
+    max_seqlen_k: int,
+    softmax_scale: float,
+    return_softmax_lse: bool,
+    num_splits: int,
+) -> tuple[Tensor, Tensor, Tensor, Tensor]: ...
+
+
 def cmdGenFunc_mha_bwd(
     dout: Tensor,
     q: Tensor,
