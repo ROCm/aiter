@@ -1,7 +1,11 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""FlyDSL variable-length decode TopK."""
+"""Multi-block radix TopK: one row is split across chunks and several launches.
+
+Histogram, reduce/select, and gather/stable-write run as separate kernels.
+Supports decode (seq_lens / next_n) and prefill (row_starts / row_ends).
+"""
 
 from functools import cache
 
@@ -47,9 +51,10 @@ _STATE_WRITE_COUNTER = 3
 _STATE_EQ_COUNTER = 4
 _STATE_DIRECT = 5
 _STATE_SIZE = 6
+_MAX_ROW_ELEMENTS = ((1 << 32) - 1) // 4
 
 
-def topk_per_row_decode_workspace_shapes(rows: int, stable: bool):
+def radix_topk_multi_block_workspace_shapes(rows: int, stable: bool):
     hist_bins = (1 << _RADIX_BITS) + 2 * int(stable)
     return (rows, _CHUNKS_PER_ROW, hist_bins), (rows, _STATE_SIZE)
 
@@ -62,12 +67,38 @@ def _f32_to_ord(val):
     return is_nan.select(fx.Int32(0x7FFFFFFF), ords)
 
 
+def _row_bounds(row, row_starts, row_ends, width, next_n, is_decode):
+    """Return (row_start, row_len) for decode MTP rows or prefill [start, end)."""
+    if const_expr(is_decode):
+        request = row // next_n
+        offset = row % next_n
+        row_start = fx.Int32(0)
+        row_end = row_ends[request] - next_n + offset + 1
+        row_end = (row_end < fx.Int32(0)).select(fx.Int32(0), row_end)
+        row_end = (row_end > width).select(width, row_end)
+    else:
+        row_start = row_starts[row]
+        row_end = row_ends[row]
+    row_len = row_end - row_start
+    row_len = (row_len < fx.Int32(0)).select(fx.Int32(0), row_len)
+    return row_start, row_len
+
+
 def _row_length(row, row_ends, width, next_n):
-    request = row // next_n
-    offset = row % next_n
-    row_len = row_ends[request] - next_n + offset + 1
-    row_len = (row_len < 0).select(fx.Int32(0), row_len)
-    return (row_len > width).select(width, row_len)
+    _, row_len = _row_bounds(row, row_ends, row_ends, width, next_n, True)
+    return row_len
+
+
+def _row_input_tiles(input, row, row_start, row_len):
+    physical_row = fx.slice(input, (row, None))
+    input_row = fx.rocdl.make_buffer_tensor(
+        fx.make_view(
+            fx.add_offset(fx.get_iter(physical_row), row_start),
+            fx.make_layout(_MAX_ROW_ELEMENTS, 1),
+        ),
+        num_records_bytes=fx.Int64(row_len) * fx.Int64(4),
+    )
+    return fx.logical_divide(input_row, fx.make_layout(_VEC, 1))
 
 
 def _load_f32x4(tensor, vec_idx):
@@ -151,11 +182,12 @@ def _make_stable_write_storage(num_waves: int):
 
 
 @cache
-def build_topk_per_row_decode_module(
+def build_radix_topk_multi_block_module(
     k: int,
     stable: bool,
     wave_size: int,
     write_values: bool = False,
+    is_decode: bool = True,
 ):
     """Build a multi-launch radix TopK with runtime row width and MTP geometry."""
     if wave_size not in (32, 64):
@@ -176,10 +208,15 @@ def build_topk_per_row_decode_module(
     fused_prefix_threads = fused_prefix_num_waves * wave_size
     vecs_per_grid_step = chunks_per_row * block_threads
     output_steps = (k + block_threads - 1) // block_threads
+    phase = "decode" if is_decode else "prefill"
 
-    @flyc.kernel(known_block_size=[block_threads, 1, 1])
-    def histogram_kernel(
+    @flyc.kernel(
+        name=f"radix_topk_multi_block_{phase}_hist_k{k}_s{int(stable)}_v{int(write_values)}",
+        known_block_size=[block_threads, 1, 1],
+    )
+    def radix_topk_multi_block_histogram_kernel(
         input: fx.Tensor,
+        row_starts: fx.Tensor,
         row_ends: fx.Tensor,
         indices: fx.Tensor,
         values: fx.Tensor,
@@ -203,13 +240,12 @@ def build_topk_per_row_decode_module(
         chunk = fx.block_idx.y
         tid = fx.thread_idx.x
 
-        input_buffer = fx.rocdl.make_buffer_tensor(input, max_size=False)
-        input_rsrc = fx.logical_divide(
-            fx.slice(input_buffer, (row, None)), fx.make_layout(_VEC, 1)
+        row_start, row_len = _row_bounds(
+            row, row_starts, row_ends, n, next_n, is_decode
         )
+        input_rsrc = _row_input_tiles(input, row, row_start, row_len)
         row_indices = fx.slice(indices, (row, None))
         row_values = fx.slice(values, (row, None))
-        row_len = _row_length(row, row_ends, n, next_n)
         direct = row_len <= fx.Int32(k)
         row_state = fx.slice(state, (row, None))
         chunk_hist = fx.slice(partial_hist, (row, chunk, None))
@@ -223,10 +259,12 @@ def build_topk_per_row_decode_module(
                 out_pos = fx.Int32(output_step * block_threads) + fx.Int32(tid)
                 if out_pos < fx.Int32(k):
                     valid = out_pos < row_len
-                    row_indices[out_pos] = valid.select(out_pos, fx.Int32(-1))
+                    row_indices[out_pos] = valid.select(
+                        out_pos + row_start, fx.Int32(-1)
+                    )
                     if const_expr(write_values):
                         row_values[out_pos] = valid.select(
-                            input[row, out_pos],
+                            input[row, out_pos + row_start],
                             fx.Float32(float("-inf")),
                         )
         storage = fx.SharedAllocator().allocate(
@@ -323,8 +361,11 @@ def build_topk_per_row_decode_module(
                 if hist_bin < num_bins:
                     chunk_hist[hist_bin] = s_hist[hist_bin]
 
-    @flyc.kernel(known_block_size=[reduce_threads, 1, 1])
-    def reduce_select_kernel(
+    @flyc.kernel(
+        name=f"radix_topk_multi_block_{phase}_reduce_k{k}_s{int(stable)}",
+        known_block_size=[reduce_threads, 1, 1],
+    )
+    def radix_topk_multi_block_reduce_kernel(
         partial_hist: fx.Tensor,
         state: fx.Tensor,
         shift: fx.Int32,
@@ -424,9 +465,13 @@ def build_topk_per_row_decode_module(
                     row_state[_STATE_REMAINING_K] = remaining_k - bin_elems_above
                 bin_elems_above = bin_elems_above + bin_count
 
-    @flyc.kernel(known_block_size=[block_threads, 1, 1])
-    def gather_kernel(
+    @flyc.kernel(
+        name=f"radix_topk_multi_block_{phase}_gather_k{k}_v{int(write_values)}",
+        known_block_size=[block_threads, 1, 1],
+    )
+    def radix_topk_multi_block_gather_kernel(
         input: fx.Tensor,
+        row_starts: fx.Tensor,
         row_ends: fx.Tensor,
         indices: fx.Tensor,
         values: fx.Tensor,
@@ -440,11 +485,10 @@ def build_topk_per_row_decode_module(
         chunk = fx.block_idx.y
         tid = fx.thread_idx.x
 
-        input_buffer = fx.rocdl.make_buffer_tensor(input, max_size=False)
-        input_rsrc = fx.logical_divide(
-            fx.slice(input_buffer, (row, None)), fx.make_layout(_VEC, 1)
+        row_start, row_len = _row_bounds(
+            row, row_starts, row_ends, n, next_n, is_decode
         )
-        row_len = _row_length(row, row_ends, n, next_n)
+        input_rsrc = _row_input_tiles(input, row, row_start, row_len)
         row_indices = fx.slice(indices, (row, None))
         row_values = fx.slice(values, (row, None))
         row_state = fx.slice(state, (row, None))
@@ -534,18 +578,21 @@ def build_topk_per_row_decode_module(
                 if local_pos < s_above_count[0]:
                     out_pos = s_above_base[0] + local_pos
                     idx = s_above_idxs[local_pos]
-                    row_indices[out_pos] = idx
+                    row_indices[out_pos] = idx + row_start
                     if const_expr(write_values):
-                        row_values[out_pos] = input[row, idx]
+                        row_values[out_pos] = input[row, idx + row_start]
                 if local_pos < s_equal_count[0]:
                     out_pos = s_equal_base[0] + local_pos
                     idx = s_equal_idxs[local_pos]
-                    row_indices[out_pos] = idx
+                    row_indices[out_pos] = idx + row_start
                     if const_expr(write_values):
-                        row_values[out_pos] = input[row, idx]
+                        row_values[out_pos] = input[row, idx + row_start]
 
-    @flyc.kernel(known_block_size=[fused_prefix_threads, 1, 1])
-    def stable_count_prefix_kernel(
+    @flyc.kernel(
+        name=f"radix_topk_multi_block_{phase}_stable_prefix_k{k}",
+        known_block_size=[fused_prefix_threads, 1, 1],
+    )
+    def radix_topk_multi_block_stable_prefix_kernel(
         partial_hist: fx.Tensor,
         state: fx.Tensor,
     ):
@@ -600,9 +647,13 @@ def build_topk_per_row_decode_module(
                     partial_hist[row, lane, stable_above_bin] = above_prefix
                     partial_hist[row, lane, stable_equal_bin] = equal_prefix
 
-    @flyc.kernel(known_block_size=[block_threads, 1, 1])
-    def stable_write_kernel(
+    @flyc.kernel(
+        name=f"radix_topk_multi_block_{phase}_stable_write_k{k}_v{int(write_values)}",
+        known_block_size=[block_threads, 1, 1],
+    )
+    def radix_topk_multi_block_stable_write_kernel(
         input: fx.Tensor,
+        row_starts: fx.Tensor,
         row_ends: fx.Tensor,
         indices: fx.Tensor,
         values: fx.Tensor,
@@ -620,13 +671,12 @@ def build_topk_per_row_decode_module(
         chunk_i32 = fx.Int32(chunk)
         tid_i32 = fx.Int32(tid)
 
-        input_buffer = fx.rocdl.make_buffer_tensor(input, max_size=False)
-        input_rsrc = fx.logical_divide(
-            fx.slice(input_buffer, (row_i32, None)), fx.make_layout(_VEC, 1)
+        row_start, row_len = _row_bounds(
+            row_i32, row_starts, row_ends, n, next_n, is_decode
         )
+        input_rsrc = _row_input_tiles(input, row_i32, row_start, row_len)
         row_indices = fx.slice(indices, (row, None))
         row_values = fx.slice(values, (row, None))
-        row_len = _row_length(row_i32, row_ends, n, next_n)
 
         if chunk_i32 == 0 and row_len < fx.Int32(k):
             for output_step in range_constexpr(output_steps):
@@ -707,13 +757,13 @@ def build_topk_per_row_decode_module(
                 accepted_before = (my_equal < remaining_k).select(my_equal, remaining_k)
                 out_pos = my_above + accepted_before
                 if cls == 2:
-                    row_indices[out_pos] = col
+                    row_indices[out_pos] = col + row_start
                     if const_expr(write_values):
                         row_values[out_pos] = selected_values[vi]
                     my_above = my_above + 1
                 elif cls == 1:
                     if my_equal < remaining_k:
-                        row_indices[out_pos] = col
+                        row_indices[out_pos] = col + row_start
                         if const_expr(write_values):
                             row_values[out_pos] = selected_values[vi]
                     my_equal = my_equal + 1
@@ -789,8 +839,9 @@ def build_topk_per_row_decode_module(
             gpu.barrier()
 
     @flyc.jit
-    def launch_topk_per_row_decode(
+    def launch_radix_topk_multi_block(
         input: fx.Tensor,
+        row_starts: fx.Tensor,
         row_ends: fx.Tensor,
         indices: fx.Tensor,
         values: fx.Tensor,
@@ -814,8 +865,9 @@ def build_topk_per_row_decode_module(
             previous_mask = 0 if pass_idx == 0 else (1 << previous_radix_bits) - 1
             previous_xor = 1 << (previous_radix_bits - 1) if pass_idx == 1 else 0
             previous_num_bins = 0 if pass_idx == 0 else 1 << previous_radix_bits
-            histogram = histogram_kernel(
+            histogram = radix_topk_multi_block_histogram_kernel(
                 input,
+                row_starts,
                 row_ends,
                 indices,
                 values,
@@ -840,7 +892,7 @@ def build_topk_per_row_decode_module(
                 block=(block_threads, 1, 1),
                 stream=stream,
             )
-            reduce_select = reduce_select_kernel(
+            reduce_select = radix_topk_multi_block_reduce_kernel(
                 partial_hist,
                 state,
                 fx.Int32(shift),
@@ -856,14 +908,15 @@ def build_topk_per_row_decode_module(
             )
 
         if stable:
-            stable_count_prefix = stable_count_prefix_kernel(partial_hist, state)
+            stable_count_prefix = radix_topk_multi_block_stable_prefix_kernel(partial_hist, state)
             stable_count_prefix.launch(
                 grid=(rows_m, 1, 1),
                 block=(fused_prefix_threads, 1, 1),
                 stream=stream,
             )
-            stable_write = stable_write_kernel(
+            stable_write = radix_topk_multi_block_stable_write_kernel(
                 input,
+                row_starts,
                 row_ends,
                 indices,
                 values,
@@ -880,8 +933,9 @@ def build_topk_per_row_decode_module(
                 stream=stream,
             )
         else:
-            gather = gather_kernel(
+            gather = radix_topk_multi_block_gather_kernel(
                 input,
+                row_starts,
                 row_ends,
                 indices,
                 values,
@@ -897,4 +951,4 @@ def build_topk_per_row_decode_module(
                 stream=stream,
             )
 
-    return launch_topk_per_row_decode
+    return launch_radix_topk_multi_block

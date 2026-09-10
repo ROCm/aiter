@@ -15,7 +15,7 @@ import flydsl.expr as fx
 from flydsl.expr import const_expr, gpu, range_constexpr
 
 from .kernels_common import atomic_add_i32
-from .topk_per_row_decode import _load_f32x4, _warp_inclusive_prefix_i32
+from .radix_topk_multi_block import _load_f32x4, _warp_inclusive_prefix_i32
 
 _VEC = 4
 _LOAD_UNROLL = 4

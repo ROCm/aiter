@@ -9,7 +9,7 @@ import os
 import torch
 
 from ..jit.core import compile_ops
-from ..jit.utils.chip_info import get_cu_num, get_gfx
+from ..jit.utils.chip_info import get_cu_num
 from ..utility import dtypes
 
 
@@ -379,6 +379,65 @@ def get_topk_scratch_workspace(device: torch.device, size: int) -> torch.Tensor:
 _FLYDSL_TOPK_PREFILL_DISABLED = os.environ.get(
     "AITER_DISABLE_FLYDSL_TOPK_PREFILL", "0"
 ) in ("1", "true", "True", "yes", "YES")
+_FLYDSL_TOPK_DECODE_DISABLED = os.environ.get(
+    "AITER_DISABLE_FLYDSL_TOPK_DECODE", "0"
+) in ("1", "true", "True", "yes", "YES")
+
+
+def _should_use_flydsl_topk_prefill(
+    logits: torch.Tensor,
+    row_starts: torch.Tensor,
+    row_ends: torch.Tensor,
+    indices: torch.Tensor,
+    values: torch.Tensor | None,
+    num_rows: int,
+    stride0: int,
+    stride1: int,
+    k: int,
+) -> bool:
+    if _FLYDSL_TOPK_PREFILL_DISABLED:
+        return False
+    from .flydsl.topk_per_row import is_flydsl_top_k_per_row_prefill_supported
+
+    return is_flydsl_top_k_per_row_prefill_supported(
+        logits,
+        row_starts,
+        row_ends,
+        indices,
+        num_rows,
+        stride0,
+        stride1,
+        k,
+        values,
+    )
+
+
+def _should_use_flydsl_topk_decode(
+    logits: torch.Tensor,
+    next_n: int,
+    seq_lens: torch.Tensor,
+    indices: torch.Tensor,
+    num_rows: int,
+    stride0: int,
+    stride1: int,
+    k: int,
+    values: torch.Tensor | None = None,
+) -> bool:
+    if _FLYDSL_TOPK_DECODE_DISABLED:
+        return False
+    from .flydsl.topk_per_row import is_flydsl_top_k_per_row_decode_supported
+
+    return is_flydsl_top_k_per_row_decode_supported(
+        logits,
+        next_n,
+        seq_lens,
+        indices,
+        num_rows,
+        stride0,
+        stride1,
+        k,
+        values,
+    )
 
 
 def top_k_per_row_prefill(
@@ -393,25 +452,31 @@ def top_k_per_row_prefill(
     k: int = 2048,
     stable: bool = False,
 ) -> None:
-    """Per-row top-k (prefill). Both the multi-block and one-block paths run on a
-    caller-provided workspace allocated (and cached) on the Python side, so the
-    C++ kernels never allocate device scratch. The mb path needs a zeroed,
-    self-reset buffer (get_topk_mb_workspace); the ob path uses plain scratch
-    (get_topk_scratch_workspace).
+    """Per-row top-k (prefill), with workspace managed on the Python side.
 
-    When stable=True, the one-block path is forced with deterministic,
-    ascending-index ordered, smallest-index tie-breaking emit so every
-    tensor-parallel rank selects and orders an identical KV set; the caller sizes
-    the workspace for the ob path in that case. On gfx942, gfx950 and gfx1250,
-    calls that would use the HIP one-block path are dispatched to the FlyDSL
-    one-block kernel unless AITER_DISABLE_FLYDSL_TOPK_PREFILL is enabled."""
-    use_mulblocks = not stable and topk_use_mulblocks(numRows, stride0)
-    if (
-        not _FLYDSL_TOPK_PREFILL_DISABLED
-        and get_gfx() in ("gfx942", "gfx950", "gfx1250")
-        and not use_mulblocks
+    On gfx942, gfx950 and gfx1250, FlyDSL is the default unless
+    AITER_DISABLE_FLYDSL_TOPK_PREFILL is enabled. FlyDSL selects one-block or
+    multi-block using its batch and row-width bands. HIP remains the fallback.
+
+    Stable output is ordered by ascending index with smallest-index tie-breaking
+    so every tensor-parallel rank selects and orders an identical KV set.
+    """
+    if _should_use_flydsl_topk_prefill(
+        logits,
+        rowStarts,
+        rowEnds,
+        indices,
+        values,
+        numRows,
+        stride0,
+        stride1,
+        k,
     ):
-        return flydsl_radix_topk_one_block_prefill(
+        from .flydsl.topk_per_row import (
+            flydsl_top_k_per_row_prefill as _flydsl_top_k_per_row_prefill,
+        )
+
+        return _flydsl_top_k_per_row_prefill(
             logits,
             rowStarts,
             rowEnds,
@@ -424,6 +489,7 @@ def top_k_per_row_prefill(
             stable,
         )
 
+    use_mulblocks = not stable and topk_use_mulblocks(numRows, stride0)
     if use_mulblocks:
         size = topk_mb_workspace_size(numRows, stride0, k, False)
         workspace = get_topk_mb_workspace(logits.device, size)
@@ -442,70 +508,6 @@ def top_k_per_row_prefill(
         k,
         workspace,
         stable,
-    )
-
-
-def flydsl_radix_topk_one_block_prefill(
-    logits: torch.Tensor,
-    rowStarts: torch.Tensor,
-    rowEnds: torch.Tensor,
-    indices: torch.Tensor,
-    values: torch.Tensor | None,
-    numRows: int,
-    stride0: int,
-    stride1: int,
-    k: int = 2048,
-    stable: bool = False,
-) -> None:
-    """Use the FlyDSL one-block radix TopK kernel for prefill."""
-    from .flydsl.radix_topk_one_block import (
-        radix_topk_one_block as _impl,
-    )
-
-    return _impl(
-        logits,
-        rowStarts,
-        rowEnds,
-        indices,
-        values,
-        numRows,
-        stride0,
-        stride1,
-        k,
-        stable,
-    )
-
-
-def flydsl_radix_topk_one_block_decode(
-    logits: torch.Tensor,
-    next_n: int,
-    seqLens: torch.Tensor,
-    indices: torch.Tensor,
-    numRows: int,
-    stride0: int,
-    stride1: int,
-    k: int = 2048,
-    stable: bool = False,
-    values: torch.Tensor | None = None,
-) -> None:
-    """Use the FlyDSL one-block radix TopK kernel for decode."""
-    from .flydsl.radix_topk_one_block import (
-        radix_topk_one_block as _impl,
-    )
-
-    return _impl(
-        logits,
-        None,
-        seqLens,
-        indices,
-        values,
-        numRows,
-        stride0,
-        stride1,
-        k,
-        stable,
-        is_decode=True,
-        next_n=next_n,
     )
 
 
@@ -536,98 +538,6 @@ def _top_k_per_row_decode(
     stable: bool = False,
     values: torch.Tensor | None = None,
 ) -> None: ...
-
-
-_FLYDSL_TOPK_DECODE_DISABLED = os.environ.get(
-    "AITER_DISABLE_FLYDSL_TOPK_DECODE", "0"
-) in ("1", "true", "True", "yes", "YES")
-
-# Dispatch uses physical width because seq_lens is device-resident; padded rows
-# with short effective lengths may therefore enter a long-row gate.
-# (minimum width, maximum width, maximum rows), with inclusive bounds.
-_FLYDSL_TOPK_DECODE_GATES = {
-    "gfx942": {
-        True: (
-            (0, 20_000, 64),
-            (131_072, None, 16),
-        ),
-        False: ((524_288, None, 32),),
-    },
-    "gfx950": {
-        True: (
-            (0, 20_000, 128),
-            (32_768, 65_535, 16),
-            (65_536, None, 32),
-        ),
-        False: ((131_072, None, 32),),
-    },
-}
-_FLYDSL_TOPK_DECODE_KS = (512, 1024, 2048, 4096)
-
-
-@functools.lru_cache(maxsize=128)
-def _flydsl_topk_decode_shape_supported(
-    arch: str,
-    stable: bool,
-    width: int,
-    num_rows: int,
-    k: int,
-) -> bool:
-    if k not in _FLYDSL_TOPK_DECODE_KS:
-        return False
-    return any(
-        min_width <= width
-        and (max_width is None or width <= max_width)
-        and 0 < num_rows <= max_rows
-        for min_width, max_width, max_rows in _FLYDSL_TOPK_DECODE_GATES[arch][stable]
-    )
-
-
-def _should_use_flydsl_topk_decode(
-    logits: torch.Tensor,
-    next_n: int,
-    seq_lens: torch.Tensor,
-    indices: torch.Tensor,
-    num_rows: int,
-    stride0: int,
-    stride1: int,
-    k: int,
-    stable: bool,
-    values: torch.Tensor | None = None,
-) -> bool:
-    if (
-        _FLYDSL_TOPK_DECODE_DISABLED
-        or not isinstance(logits, torch.Tensor)
-        or logits.ndim != 2
-    ):
-        return False
-
-    arch = get_gfx()
-    if arch not in _FLYDSL_TOPK_DECODE_GATES:
-        return False
-
-    if not _flydsl_topk_decode_shape_supported(
-        arch,
-        stable,
-        logits.shape[1],
-        num_rows,
-        k,
-    ):
-        return False
-
-    from .flydsl.topk_per_row import is_flydsl_top_k_per_row_decode_supported
-
-    return is_flydsl_top_k_per_row_decode_supported(
-        logits,
-        next_n,
-        seq_lens,
-        indices,
-        num_rows,
-        stride0,
-        stride1,
-        k,
-        values,
-    )
 
 
 def _hip_top_k_per_row_decode(
@@ -671,9 +581,12 @@ def top_k_per_row_decode(
     stable: bool = False,
     values: torch.Tensor | None = None,
 ) -> None:
-    """Per-row top-k (decode). Always uses the one-block kernel; the scratch
-    workspace is allocated + cached on the Python side and passed in, so the C++
-    side never allocates device scratch.
+    """Per-row top-k (decode), with workspace managed on the Python side.
+
+    On gfx942, gfx950 and gfx1250, FlyDSL is the default unless
+    AITER_DISABLE_FLYDSL_TOPK_DECODE is enabled. FlyDSL selects one-block or
+    multi-block using its batch and row-width bands. HIP one-block remains the
+    fallback.
 
     When stable=True, the deterministic ascending-ordered, smallest-index
     tie-break emit is used so every TP rank selects and orders an identical
@@ -692,7 +605,6 @@ def top_k_per_row_decode(
         stride0,
         stride1,
         k,
-        stable,
         values,
     ):
         return flydsl_top_k_per_row_decode(
@@ -790,11 +702,7 @@ def flydsl_top_k_per_row_decode(
     stable: bool = False,
     values: torch.Tensor | None = None,
 ) -> None:
-    """FlyDSL per-row decode TopK with the same call shape as the HIP interface.
-
-    This path is optimized for long-context decode, where its multi-CTA radix
-    selection typically outperforms the HIP one-block implementation.
-    """
+    """FlyDSL decode TopK with shared one-block / multi-block dispatch."""
     from .flydsl.topk_per_row import (
         flydsl_top_k_per_row_decode as _flydsl_top_k_per_row_decode,
     )
