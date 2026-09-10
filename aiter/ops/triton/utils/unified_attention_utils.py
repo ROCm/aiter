@@ -159,12 +159,7 @@ def _lookup(table: dict, axes: tuple, values: dict) -> tuple:
 # against one shape family, so whether that suits a deployment is its own call.
 _OPT_IN = ".OPT_IN"
 
-_USE_OPT_IN = os.environ.get("AITER_TRITON_UA_FAST_PATH", "") not in (
-    "",
-    "0",
-    "false",
-    "False",
-)
+_USE_OPT_IN = os.environ.get("AITER_TRITON_UA_FAST_PATH", "") == "1"
 
 _LARGE_KV = "LARGE_KV"
 
