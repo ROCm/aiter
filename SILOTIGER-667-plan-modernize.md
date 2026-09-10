@@ -26,7 +26,7 @@ spot-check when the hot loop or wait/reduce path changed.
 - [x] 1. Mechanical `fx.*` surface
 - [x] 2. Reuse `tensor_shim._run_compiled`
 - [x] 3. `atomic_add_f32` without hardcoded LLVM address space
-- [ ] 4. Single definition path for `const_expr` if/else
+- [x] 4. Single definition path for `const_expr` if/else
 - [ ] 5. Buffer views + layouts for *unpacked* tensors only
 - [ ] Follow-on: preshuffled pack, still `v_dot2` (not this track)
 
@@ -108,17 +108,17 @@ localize that remaining dialect call.
 The frontend restriction: do not define values inside `if/else` and use them
 after the branch. Specialize or flatten:
 
-- [ ] `build_gate_up_fp8_module`: `block2d` vs pertensor/pertoken both define
+- [x] `build_gate_up_fp8_module`: `block2d` vs pertensor/pertoken both define
       `gate_acc` / `up_acc` then silu uses them.
-- [ ] Nested `const_expr(use_i64_base)` that defines `*_rsrc` / `w_word_base`
+- [x] Nested `const_expr(use_i64_base)` that defines `*_rsrc` / `w_word_base`
       used in the K loop (gate_up FP8/FP8-act, down FP8).
-- [ ] `const_expr(split_k)` is side-effect-only (atomic vs store) — either leave
+- [x] `const_expr(split_k)` is side-effect-only (atomic vs store) — either leave
       it or split into two epilogue helpers; no SSA live-out.
 
 Prefer two builders or a local `@flyc.jit` dispatch over `scf.IfOp`. Runtime
 `if lane == 0:` stores stay as-is.
 
-- [ ] **Done when:** no kernel uses a value first assigned only inside a
+- [x] **Done when:** no kernel uses a value first assigned only inside a
       `const_expr` if/else arm; op_test covers both `block2d` and i64-base (large
       `E*I*H`) paths.
 

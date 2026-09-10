@@ -268,6 +268,63 @@ def atomic_add_f32(ptr, elem_off, val_f32):
     )
 
 
+def _silu_mul(gate_acc, up_acc):
+    """``silu(gate_acc) * up_acc``; both args are ``fx.Float32``."""
+    sig = fx.Float32(1.0) / (fx.Float32(1.0) + fxmath.exp(fx.Float32(0.0) - gate_acc))
+    return gate_acc * sig * up_acc
+
+
+def _fp8_gate_up_weight_views(
+    wg_ptr, wu_ptr, e, neuron_j, w_row, *, use_i64_base, bytes_per_expert, hidden
+):
+    """FP8 gate/up resources + dword base; i64 per-expert or whole-pool."""
+    if use_i64_base:
+        ebase = fx.Int64(e) * fx.Int64(bytes_per_expert)
+        return (
+            _ptr_rsrc_off(wg_ptr, ebase),
+            _ptr_rsrc_off(wu_ptr, ebase),
+            neuron_j * (hidden // 4),
+        )
+    return _ptr_rsrc(wg_ptr), _ptr_rsrc(wu_ptr), w_row * (hidden // 4)
+
+
+def _fp8_down_weight_view(
+    wd_ptr,
+    wd_rsrc,
+    e,
+    out_j0,
+    w_row,
+    *,
+    use_i64_base,
+    bytes_per_expert,
+    inter,
+    kh_per_warp,
+):
+    """FP8 down resource + per-output dword bases; i64 per-expert or whole-pool."""
+    if use_i64_base:
+        ebase = fx.Int64(e) * fx.Int64(bytes_per_expert)
+        wd_rsrc_e = _ptr_rsrc_off(wd_ptr, ebase)
+        w_word_base = [(out_j0 + h) * (inter // 4) for h in range(kh_per_warp)]
+        return wd_rsrc_e, w_word_base
+    return wd_rsrc, [w_row[h] * (inter // 4) for h in range(kh_per_warp)]
+
+
+def _scale_elem_off(w_row, per_token_scale):
+    if per_token_scale:
+        return w_row
+    return fx.Int32(0)
+
+
+def _fp8_down_row_scales(wds_rsrc, w_row, kh_per_warp, per_token_scale):
+    if per_token_scale:
+        return [
+            buffer_ops.buffer_load(wds_rsrc, w_row[h], vec_width=1, dtype=T.f32())
+            for h in range(kh_per_warp)
+        ]
+    ds0 = buffer_ops.buffer_load(wds_rsrc, fx.Int32(0), vec_width=1, dtype=T.f32())
+    return [ds0 for _ in range(kh_per_warp)]
+
+
 # -------------------------------------------------------------------------
 # Phase 1 primitive-validation kernel + launcher
 # -------------------------------------------------------------------------
@@ -425,9 +482,7 @@ def build_gate_up_fp8_module(
     # K3 Tier-2 guard: only pay the i64 per-expert base when the FP8 weight pool
     # (E*INTER*HIDDEN bytes) exceeds the i32 byte range; keep the i32-safe fast
     # path (and all smaller shapes) on whole-pool addressing.
-    use_i64_base = const_expr(
-        num_experts is not None and num_experts * inter * hidden >= 2**31
-    )
+    use_i64_base = num_experts is not None and num_experts * inter * hidden >= 2**31
     bytes_per_expert = inter * hidden  # fp8 = 1 byte/elem
 
     @flyc.kernel
@@ -460,19 +515,25 @@ def build_gate_up_fp8_module(
         # Tier-2 (E*I*H >= 2^31): fold the per-expert base into the descriptor as
         # i64 and address weights by the i32-safe in-expert dword base; otherwise
         # keep whole-pool addressing (w_word_base carries the full w_row offset).
-        if const_expr(use_i64_base):
-            ebase = fx.Int64(e) * fx.Int64(bytes_per_expert)
-            wg_rsrc = _ptr_rsrc_off(wg_ptr, ebase)
-            wu_rsrc = _ptr_rsrc_off(wu_ptr, ebase)
-            w_word_base = neuron_j * (hidden // 4)
-        else:
-            wg_rsrc = _ptr_rsrc(wg_ptr)
-            wu_rsrc = _ptr_rsrc(wu_ptr)
-            w_word_base = w_row * (hidden // 4)
+        wg_rsrc, wu_rsrc, w_word_base = _fp8_gate_up_weight_views(
+            wg_ptr,
+            wu_ptr,
+            e,
+            neuron_j,
+            w_row,
+            use_i64_base=use_i64_base,
+            bytes_per_expert=bytes_per_expert,
+            hidden=hidden,
+        )
 
         one_f32 = fx.Float32(1.0).ir_value()
         wgs_rsrc = _ptr_rsrc(wgs_ptr)
         wus_rsrc = _ptr_rsrc(wus_ptr)
+        # Every lane holds the identical reduced result; only lane 0 writes the
+        # single BF16 scalar (avoids 64x redundant global stores). The reduce
+        # must run on all lanes (cross-lane shuffles), so it stays outside the store.
+        out_off = (token_b * top_k + expert_k) * inter + neuron_j
+        out_rsrc = _ptr_rsrc(out_ptr)
 
         if const_expr(block2d):
             # Block2D<BN,BK> scales vary along K, so fold each K-block's scale into
@@ -516,6 +577,10 @@ def build_gate_up_fp8_module(
                 up_acc_l = up_acc_l + fx.Float32(ud) * fx.Float32(us_i)
             gate_acc = fx.Float32(wave_reduce_add_f32(gate_acc_l.ir_value()))
             up_acc = fx.Float32(wave_reduce_add_f32(up_acc_l.ir_value()))
+            if lane == 0:
+                buffer_ops.buffer_store(
+                    BFloat16(_silu_mul(gate_acc, up_acc)).ir_value(), out_rsrc, out_off
+                )
         else:
             # G7 ILP: collect every (iter, pair) contribution, then drain each stream
             # through `dot2_acc` independent accumulators (single scale after reduce =>
@@ -551,27 +616,15 @@ def build_gate_up_fp8_module(
             up_sum = wave_reduce_add_f32(up_dot)
 
             # Weight scales (PerTensor -> p[0]; PerToken -> p[w_row]).
-            if const_expr(per_token_scale):
-                scale_off = w_row
-            else:
-                scale_off = fx.Int32(0)
+            scale_off = _scale_elem_off(w_row, per_token_scale)
             gs = buffer_ops.buffer_load(wgs_rsrc, scale_off, vec_width=1, dtype=T.f32())
             us = buffer_ops.buffer_load(wus_rsrc, scale_off, vec_width=1, dtype=T.f32())
             gate_acc = fx.Float32(gate_sum) * fx.Float32(gs)
             up_acc = fx.Float32(up_sum) * fx.Float32(us)
-
-        sig = fx.Float32(1.0) / (
-            fx.Float32(1.0) + fxmath.exp(fx.Float32(0.0) - gate_acc)
-        )
-        out_val = gate_acc * sig * up_acc
-
-        # Every lane holds the identical reduced result; only lane 0 writes the
-        # single BF16 scalar (avoids 64x redundant global stores). The reduce
-        # above must run on all lanes (cross-lane shuffles), so it stays outside.
-        out_off = (token_b * top_k + expert_k) * inter + neuron_j
-        out_rsrc = _ptr_rsrc(out_ptr)
-        if lane == 0:
-            buffer_ops.buffer_store(BFloat16(out_val).ir_value(), out_rsrc, out_off)
+            if lane == 0:
+                buffer_ops.buffer_store(
+                    BFloat16(_silu_mul(gate_acc, up_acc)).ir_value(), out_rsrc, out_off
+                )
 
     @flyc.jit
     def _launch(
@@ -650,9 +703,7 @@ def build_gate_up_fp8_act_module(
     scale_cols_x = hidden // scale_bxk
     # K3 Tier-2: fold the per-expert i64 base when the FP8 weight pool exceeds the
     # i32 byte range (see build_gate_up_fp8_module / B5).
-    use_i64_base = const_expr(
-        num_experts is not None and num_experts * inter * hidden >= 2**31
-    )
+    use_i64_base = num_experts is not None and num_experts * inter * hidden >= 2**31
     bytes_per_expert = inter * hidden  # fp8 = 1 byte/elem
 
     @flyc.kernel
@@ -684,15 +735,16 @@ def build_gate_up_fp8_act_module(
 
         x_rsrc = _ptr_rsrc(x_ptr)
         xs_rsrc = _ptr_rsrc(xs_ptr)
-        if const_expr(use_i64_base):
-            ebase = fx.Int64(e) * fx.Int64(bytes_per_expert)
-            wg_rsrc = _ptr_rsrc_off(wg_ptr, ebase)
-            wu_rsrc = _ptr_rsrc_off(wu_ptr, ebase)
-            w_word_base = neuron_j * (hidden // 4)
-        else:
-            wg_rsrc = _ptr_rsrc(wg_ptr)
-            wu_rsrc = _ptr_rsrc(wu_ptr)
-            w_word_base = w_row * (hidden // 4)
+        wg_rsrc, wu_rsrc, w_word_base = _fp8_gate_up_weight_views(
+            wg_ptr,
+            wu_ptr,
+            e,
+            neuron_j,
+            w_row,
+            use_i64_base=use_i64_base,
+            bytes_per_expert=bytes_per_expert,
+            hidden=hidden,
+        )
 
         one_f32 = fx.Float32(1.0).ir_value()
         wgs_rsrc = _ptr_rsrc(wgs_ptr)
@@ -731,10 +783,7 @@ def build_gate_up_fp8_act_module(
         gate_acc = fx.Float32(wave_reduce_add_f32(gate_acc_l.ir_value()))
         up_acc = fx.Float32(wave_reduce_add_f32(up_acc_l.ir_value()))
 
-        sig = fx.Float32(1.0) / (
-            fx.Float32(1.0) + fxmath.exp(fx.Float32(0.0) - gate_acc)
-        )
-        out_val = gate_acc * sig * up_acc
+        out_val = _silu_mul(gate_acc, up_acc)
 
         out_off = (token_b * top_k + expert_k) * inter + neuron_j
         out_rsrc = _ptr_rsrc(out_ptr)
@@ -848,9 +897,7 @@ def build_down_reduce_fp8_module(
     scale_cols_d = (inter // scale_bk) if w_scale_mode == "block2d" else 0
     # K3 Tier-2 guard: only pay the i64 per-expert base when the FP8 weight pool
     # (E*HIDDEN*INTER bytes) exceeds the i32 byte range.
-    use_i64_base = const_expr(
-        num_experts is not None and num_experts * hidden * inter >= 2**31
-    )
+    use_i64_base = num_experts is not None and num_experts * hidden * inter >= 2**31
     bytes_per_expert = hidden * inter  # fp8 = 1 byte/elem
 
     @flyc.kernel
@@ -891,13 +938,17 @@ def build_down_reduce_fp8_module(
             w_row = [e * hidden + out_j0 + h for h in range(kh_per_warp)]
             # Tier-2 (E*H*I >= 2^31): fold the per-expert base into the descriptor
             # as i64 so the in-expert dword base stays i32-safe; else whole-pool.
-            if const_expr(use_i64_base):
-                ebase = fx.Int64(e) * fx.Int64(bytes_per_expert)
-                wd_rsrc_e = _ptr_rsrc_off(wd_ptr, ebase)
-                w_word_base = [(out_j0 + h) * (inter // 4) for h in range(kh_per_warp)]
-            else:
-                wd_rsrc_e = wd_rsrc
-                w_word_base = [w_row[h] * (inter // 4) for h in range(kh_per_warp)]
+            wd_rsrc_e, w_word_base = _fp8_down_weight_view(
+                wd_ptr,
+                wd_rsrc,
+                e,
+                out_j0,
+                w_row,
+                use_i64_base=use_i64_base,
+                bytes_per_expert=bytes_per_expert,
+                inter=inter,
+                kh_per_warp=kh_per_warp,
+            )
 
             if const_expr(block2d):
                 # Block2D<BN,BK> scale varies along K -> fold each K-block's
@@ -936,18 +987,7 @@ def build_down_reduce_fp8_module(
                             fx.Float32(rw) * fx.Float32(ds_i)
                         )
             else:
-                if const_expr(per_token_scale):
-                    ds = [
-                        buffer_ops.buffer_load(
-                            wds_rsrc, w_row[h], vec_width=1, dtype=T.f32()
-                        )
-                        for h in range(kh_per_warp)
-                    ]
-                else:
-                    ds0 = buffer_ops.buffer_load(
-                        wds_rsrc, fx.Int32(0), vec_width=1, dtype=T.f32()
-                    )
-                    ds = [ds0 for _ in range(kh_per_warp)]
+                ds = _fp8_down_row_scales(wds_rsrc, w_row, kh_per_warp, per_token_scale)
 
                 # G7 ILP: collect every (iter, pair) per output h, then drain each
                 # through `dot2_acc` accumulators across the whole K-range (the scale
@@ -1157,27 +1197,15 @@ def build_gate_up_fp4_module(
                 gate_pairs.append((x_i32, g_i32))
                 up_pairs.append((x_i32, u_i32))
 
-        if const_expr(dot2_acc > 1):
-            gate_dot = dot2_f32_bf16_drain(gate_pairs, n_acc=dot2_acc)
-            up_dot = dot2_f32_bf16_drain(up_pairs, n_acc=dot2_acc)
-        else:
-            gate_dot = fx.Float32(0.0).ir_value()
-            up_dot = fx.Float32(0.0).ir_value()
-            for idx in range_constexpr(len(gate_pairs)):
-                xg_i32, g_i32 = gate_pairs[idx]
-                xu_i32, u_i32 = up_pairs[idx]
-                gate_dot = dot2_f32_bf16(
-                    xg_i32, g_i32, gate_dot, serialize=serialize_dot2
-                )
-                up_dot = dot2_f32_bf16(xu_i32, u_i32, up_dot, serialize=serialize_dot2)
+        gate_dot = drain_or_chain(
+            gate_pairs, dot2_acc=dot2_acc, serialize=serialize_dot2
+        )
+        up_dot = drain_or_chain(up_pairs, dot2_acc=dot2_acc, serialize=serialize_dot2)
 
         gate_acc = fx.Float32(wave_reduce_add_f32(gate_dot))
         up_acc = fx.Float32(wave_reduce_add_f32(up_dot))
 
-        sig = fx.Float32(1.0) / (
-            fx.Float32(1.0) + fxmath.exp(fx.Float32(0.0) - gate_acc)
-        )
-        out_val = gate_acc * sig * up_acc
+        out_val = _silu_mul(gate_acc, up_acc)
 
         out_off = (token_b * top_k + expert_k) * inter + neuron_j
         out_rsrc = _ptr_rsrc(out_ptr)
@@ -1402,15 +1430,9 @@ def build_down_reduce_fp4_module(
                             pairs_h[h].append((aw[ipair], d_i32))
 
             for h in range_constexpr(kh_per_warp):
-                if const_expr(dot2_acc > 1):
-                    dot_h = dot2_f32_bf16_drain(pairs_h[h], n_acc=dot2_acc)
-                else:
-                    dot_h = fx.Float32(0.0).ir_value()
-                    for idx in range_constexpr(len(pairs_h[h])):
-                        a_i32, d_i32 = pairs_h[h][idx]
-                        dot_h = dot2_f32_bf16(
-                            a_i32, d_i32, dot_h, serialize=serialize_dot2
-                        )
+                dot_h = drain_or_chain(
+                    pairs_h[h], dot2_acc=dot2_acc, serialize=serialize_dot2
+                )
                 # router_wt is lane-uniform; the block scale is already in the
                 # converted weights, so only fold rw here.
                 acc[h] = acc[h] + fx.Float32(dot_h) * fx.Float32(rw)
@@ -1541,10 +1563,7 @@ def build_gate_up_bf16_module(
 
         gate_acc = fx.Float32(wave_reduce_add_f32(gate_dot))
         up_acc = fx.Float32(wave_reduce_add_f32(up_dot))
-        sig = fx.Float32(1.0) / (
-            fx.Float32(1.0) + fxmath.exp(fx.Float32(0.0) - gate_acc)
-        )
-        out_val = gate_acc * sig * up_acc
+        out_val = _silu_mul(gate_acc, up_acc)
 
         out_off = (token_b * top_k + expert_k) * inter + neuron_j
         out_rsrc = _ptr_rsrc(out_ptr)
