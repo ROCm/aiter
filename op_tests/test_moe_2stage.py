@@ -475,7 +475,6 @@ def test_fmoe(
         "beta": beta,
         "linear_beta": linear_beta,
         "gate_mode": gateMode,
-        "output_aux": args.output_aux,
     }
 
     if kernel_bench:
@@ -769,15 +768,6 @@ parser.add_argument(
     "in fp32 so the a2 mxfp4 amax is taken over fp32 (mirrors the fused asm "
     "kernel, which computes amax on the in-register fp32 silu result, instead "
     "of the bf16 round-trip the 2-stage flydsl/torch path does). Default: bf16.",
-)
-
-parser.add_argument(
-    "--output-aux",
-    choices=["threestage", "opus"],
-    default="",
-    help="Override the auxiliary-sort backend for configs that already emit "
-    "auxiliary route data. 'opus' selects the Opus sorter; 'threestage' "
-    "selects the port's sort. Other configs keep their default path.",
 )
 
 args = parser.parse_args()

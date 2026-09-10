@@ -66,24 +66,7 @@ _USE_FLYDSL_MOE_SORTING = os.environ.get("AITER_USE_FLYDSL_MOE_SORTING", "0") ==
 # Adaptive sort has no shape fallback, so output_aux is limited to generated shapes.
 _MOE_SORT_BACKEND = os.environ.get("AITER_MOE_SORT_BACKEND", "auto").lower()
 
-AUX_SORT_THREESTAGE = "threestage"
 AUX_SORT_OPUS = "opus"
-
-
-def _validate_output_aux(output_aux):
-    if output_aux and output_aux not in (AUX_SORT_THREESTAGE, AUX_SORT_OPUS):
-        raise ValueError(
-            f"unknown output_aux {output_aux!r}; expected "
-            f"{AUX_SORT_THREESTAGE!r} or {AUX_SORT_OPUS!r}"
-        )
-
-
-def _override_output_aux(metadata, output_aux):
-    """Override the aux sorter only for configs that already emit aux data."""
-    _validate_output_aux(output_aux)
-    if not output_aux or not metadata.output_aux:
-        return metadata
-    return replace(metadata, output_aux=output_aux)
 
 
 def _aux_uses_opus(output_aux, block_size, routed_rows=None, num_experts=None):
@@ -761,7 +744,6 @@ def fused_moe(
     shared_w2_scale: torch.Tensor | None = None,
     shared_expert_id: int = -1,
     stage2_scatter: Stage2ScatterContext | None = None,
-    output_aux: str = "",
     # Optional [M, model_dim] destination for the result, to save the caller a
     # copy. Must be contiguous, match shape/dtype/device and not overlap
     # hidden_states, or the call raises; when given it is what gets returned.
@@ -849,7 +831,6 @@ def fused_moe(
         ),
         ep_world_size=stage2_scatter.world_size if enable_ep_scatter else 0,
         ep_source_token_map=scatter_source_map,
-        output_aux=output_aux,
         output=output,
     )
 
@@ -888,7 +869,6 @@ def fused_moe_fake(
     ep_max_tokens_per_rank: int = 0,
     ep_world_size: int = 0,
     ep_source_token_map: torch.Tensor | None = None,
-    output_aux: str = "",
     output: torch.Tensor | None = None,
 ) -> torch.Tensor:
     device = topk_ids.device
@@ -946,7 +926,6 @@ def fused_moe_(
     ep_max_tokens_per_rank: int = 0,
     ep_world_size: int = 0,
     ep_source_token_map: torch.Tensor | None = None,
-    output_aux: str = "",
     output: torch.Tensor | None = None,
 ) -> torch.Tensor:
     stage2_scatter = None
@@ -986,7 +965,6 @@ def fused_moe_(
         linear_beta=linear_beta,
         gate_mode=gate_mode,
         stage2_scatter=stage2_scatter,
-        output_aux=output_aux,
         output=output,
     )
 
@@ -1018,7 +996,6 @@ def _fused_moe_impl(
     linear_beta: float | None = None,
     gate_mode: str = GateMode.SEPARATED.value,
     stage2_scatter: Stage2ScatterContext | None = None,
-    output_aux: str = "",
     output: torch.Tensor | None = None,
     *,
     _q_dtype_a: torch.dtype | None = None,
@@ -1262,8 +1239,6 @@ def _fused_moe_impl(
             metadata = _resolve_metadata(disable_inline_sort=True)
             use_inline_sort = False
 
-    metadata = _override_output_aux(metadata, output_aux)
-
     block_size_M = metadata.block_m if block_size_M is None else block_size_M
     # Ensure block_size_M is int (metadata.block_m from CSV may be float)
     if block_size_M is not None:
@@ -1299,7 +1274,7 @@ def _fused_moe_impl(
         _kn2 = _stage2_kwargs.get("kernelName2") or _stage2_kwargs.get("kernelName", "")
         _atomic = parse_g2_kname_any(_kn2)["atomic"]
         # BM16's adaptive sort already emits routes and zeroes the output without
-        # quantizing. Keep the Opus crossover and explicit backend overrides.
+        # quantizing. Keep the Opus crossover for the configured aux pipeline.
         sorting_ret = moe_sorting(
             topk_ids,
             topk_weight,
@@ -1428,7 +1403,6 @@ def _fused_moe_impl(
             _metadata_config_file=_metadata_config_file,
             _stage1_extra_args=_stage1_extra_args,
             _stage2_extra_args=_stage2_extra_args,
-            output_aux=metadata.output_aux,
             output=output,
             _stage2_override=_stage2_override,
             routing_num_experts=global_E,
@@ -3645,12 +3619,10 @@ def fused_moe_2stages(
     _metadata_config_file: str | None = None,
     _stage1_extra_args: dict | None = None,
     _stage2_extra_args: dict | None = None,
-    output_aux: bool | str = False,
     output=None,
     _stage2_override: Callable | None = None,
     routing_num_experts: int | None = None,
 ):
-    _validate_output_aux(output_aux)
     quant_func = get_quant(quant_type)
     gate_mode = GateMode(gate_mode)
     token_num, _ = hidden_states.shape
@@ -3699,7 +3671,6 @@ def fused_moe_2stages(
     )
     if _metadata_transform is not None:
         metadata = _metadata_transform(metadata)
-    metadata = _override_output_aux(metadata, output_aux)
     if (
         getattr(metadata.stage1, "func", metadata.stage1) is _mxfp4_a4w4_stage1_fw
         and metadata.output_aux == AUX_SORT_OPUS
@@ -3712,8 +3683,7 @@ def fused_moe_2stages(
         and int(metadata.block_m) != 16
     ):
         # Main's fused prequant already writes the E8M0 scale layout consumed by
-        # replacement GEMM1. Only Opus takes this path; an explicit threestage
-        # override retains the original quant + sort_scales pipeline.
+        # replacement GEMM1 on the default Opus auxiliary path.
         metadata = replace(metadata, prequant=True)
     if not metadata.prequant:
         a1 = hidden_states
