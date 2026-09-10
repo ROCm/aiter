@@ -3,10 +3,10 @@
         "BLOCK_M": 16,
         "BLOCK_N": 16,
         "BLOCK_K": 512,
-        "NUM_BUFFERS": 2,
+        "NUM_BUFFERS": 5,
         "GROUP_SIZE_M": 1,
-        "num_warps": 2,
-        "WARPS_N": 2,
+        "num_warps": 1,
+        "WARPS_N": 4,
         "INSTR_K": 128,
         "kernel_type": "bandwidth_bound",
         "USE_TDM_STORE": true,
@@ -22,6 +22,19 @@
         "WARPS_N": 2,
         "INSTR_K": 128,
         "kernel_type": "bandwidth_bound",
+        "USE_TDM_STORE": true,
+        "NUM_KSPLIT": 1
+    },
+    "M_LEQ_64": {
+        "BLOCK_M": 64,
+        "BLOCK_N": 32,
+        "BLOCK_K": 512,
+        "NUM_BUFFERS": 3,
+        "GROUP_SIZE_M": 1,
+        "num_warps": 4,
+        "WARPS_N": 1,
+        "INSTR_K": 128,
+        "kernel_type": "compute_bound",
         "USE_TDM_STORE": true,
         "NUM_KSPLIT": 1
     }
