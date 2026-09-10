@@ -191,8 +191,13 @@ def compile_gemm2_a4w4_port(
             "a8w4/fp8-A gemm2 persist is not supported (known-broken F2 path: cos=0 at large M). "
             "Use persist only with a_dtype='fp4', persist_flat, or run a8w4 with persist=False."
         )
-    persist_tag = "" if not persist else f"_persist_cu{cu_num}"
-    persist_tag += "_pflat" if persist_flat else ""
+    # Exclusive scheduler tags (mxmoe_g2_scheduler): persist-flat | persist-M | one-shot.
+    if persist_flat:
+        persist_tag = f"_pflat_cu{cu_num}"
+    elif persist:
+        persist_tag = f"_persist_cu{cu_num}"
+    else:
+        persist_tag = ""
     bh_tag = "_bhoist" if g2_bhoist else ""
     apf_tag = "_apf" if g2_ascale_pf else ""
     spart_tag = f"_spart{g2_group_num}x{g2_m01}" if g2_spart > 0 else ""
