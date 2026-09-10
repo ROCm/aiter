@@ -7,6 +7,7 @@ import torch
 from torch import Tensor
 
 from ..jit.core import compile_ops
+from ..utility.graph_alloc import persistent_alloc
 
 
 @compile_ops(
@@ -35,7 +36,10 @@ ASM_SPLITK_MAX_GRID = _SEMA_SHAPE[0] * _SEMA_SHAPE[1]
 
 @functools.lru_cache(maxsize=64)
 def _get_semaphore_workspace_keyed(device: torch.device, stream_id: int) -> Tensor:
-    return torch.zeros(_SEMA_SHAPE, dtype=torch.uint32, device=device)
+    # Allocated from a private MemPool because this key can first miss inside a
+    # CUDA graph capture -- see persistent_alloc.
+    with persistent_alloc(device):
+        return torch.zeros(_SEMA_SHAPE, dtype=torch.uint32, device=device)
 
 
 # A graph records launches, not the allocation that zeroed the counter. Give
