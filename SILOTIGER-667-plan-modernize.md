@@ -129,6 +129,8 @@ Only after 1–4. Move **unpacked** tensors onto `fx.rocdl.make_buffer_tensor` +
 comment):
 
 - [ ] BF16 activations / intermediate / outputs
+  - [x] unpacked BF16 **outputs** (`out` / `y` stores via `ptr_buf_tensor`)
+  - [ ] K-loop activations / intermediate stay on `load_i32_words` (packed dword exception)
 - [ ] f32 scales (pertensor / pertoken / block2d)
 - [ ] `router_ids` (i32), `router_wts` (f32)
 
