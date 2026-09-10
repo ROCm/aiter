@@ -915,7 +915,6 @@ def compute_block_masking(
 @triton.autotune(
     configs=fwd_prefill_autotune_configs,
     key=FWD_PREFILL_AUTOTUNE_KEYS,
-    use_cuda_graph=True,
 )
 @triton.jit
 def attn_fwd(
