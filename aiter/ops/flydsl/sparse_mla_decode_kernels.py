@@ -42,10 +42,13 @@ def _require_warm(key, what: str, compile_fn):
 def _pick_inner_iter(seq: int, ng_total: int) -> int:
     """Return the producer grouping factor for this shape.
 
-    Merge adjacent 64-key tiles only while the reduced producer grid still has
-    enough CTAs to cover the GPU. This keeps small decode batches on the
-    lower-latency one-tile path and lets wide/large decode cases reduce scratch
-    traffic and combine work without a shape whitelist.
+    Merging adjacent 64-key tiles halves the producer grid and doubles the
+    serial depth per CTA, which trades concurrency for scratch traffic and
+    combine work. The floors below are measured thresholds, not a coverage
+    guarantee: 192 is under a 256-CU part, so the first merge does leave the
+    device short, and seq=12 and 16 are correspondingly the weakest points
+    against a Triton baseline. Raising the floors is a separate change --
+    it would need the reducer policy revisited with it.
     """
     inner_iter = 1
     while inner_iter < 4:
@@ -112,9 +115,10 @@ def _validate_sparse_decode_inputs(
     if out is not None:
         _require_cuda_tensor("out", out, dtype=torch.bfloat16)
 
-    # The MFMA tile is 16 rows wide, so the kernel always runs `H` heads. A
-    # model with fewer -- GLM-5.2 at TP8 has 8 -- is padded up rather than
-    # refused; the wasted rows cost MFMA lanes the shape cannot fill anyway.
+    # The MFMA tile is 16 rows wide, so the kernel always runs 16 head
+    # slots. A model with fewer -- GLM-5.2 at TP8 has 8 -- is read in place
+    # at its own row stride, not staged into a padded copy; the slots past
+    # it re-read head 0 and are dropped downstream.
     if q.ndim != 3 or int(q.shape[2]) != DIM or not 1 <= int(q.shape[1]) <= H:
         raise ValueError(
             f"q must have shape [seq,heads,{DIM}] with 1 <= heads <= {H}, "
