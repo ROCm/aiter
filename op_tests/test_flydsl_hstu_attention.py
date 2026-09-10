@@ -30,8 +30,16 @@ def _load_torch_hstu_reference():
     try:
         from triton_tests.utils.hstu_attention_ref import torch_hstu_attention
     except ModuleNotFoundError as exc:
-        if exc.name != "triton_tests":
+        if exc.name not in {"triton_tests", "op_tests"}:
             raise
+
+        import sys
+        from pathlib import Path
+
+        repo_root = Path(__file__).resolve().parents[1]
+        if str(repo_root) not in sys.path:
+            sys.path.insert(0, str(repo_root))
+
         from op_tests.triton_tests.utils.hstu_attention_ref import torch_hstu_attention
 
     return torch_hstu_attention
