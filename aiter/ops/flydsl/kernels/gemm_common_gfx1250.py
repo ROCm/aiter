@@ -64,6 +64,32 @@ def make_sgpr_opaque(val_i32):
     return op.res
 
 
+def emit_icache_pad(n_nops):
+    """Emit ``n_nops`` executed-but-useless ``s_nop`` -- an I-cache probe ONLY.
+
+    Diagnostic for the trimodal-timing hunt: modality tracks the kernel's
+    ``.text`` size, not which epilogue components are enabled, which points at
+    the WGP-shared instruction cache. To test that causally we need to grow the
+    EXECUTED code footprint without changing the work. Dead code at the end of
+    the kernel would not do -- it is never fetched, so it never occupies a cache
+    line (it would only widen the descriptor's `.amdhsa_inst_pref_size`).
+
+    ``s_nop`` is 4 bytes and one cycle, so this buys ~4 bytes of instruction
+    footprint per ~1 cycle of runtime -- the cheapest padding available.
+    ``has_side_effects`` keeps the block from being dead-code-eliminated.
+    """
+    if n_nops <= 0:
+        return
+    llvm_dialect.InlineAsmOp(
+        res=None,
+        operands_=[],
+        asm_string="\n".join(["s_nop 0"] * int(n_nops)),
+        constraints="",
+        has_side_effects=True,
+        is_align_stack=False,
+    )
+
+
 def make_vgpr_opaque(val):
     """Return ``val`` unchanged but forced to live in a VGPR.
 

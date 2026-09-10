@@ -31,6 +31,7 @@ the pairwise-matched multicast loads never deadlock.
 
 import glob
 import math
+import os
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
@@ -45,6 +46,7 @@ from aiter.utility.mx_types import MxDtypeInt as MxDtype
 
 from .gemm_common_gfx1250 import (
     LOG2E,
+    emit_icache_pad,
     lds_store_b16_raw,
     make_sgpr_opaque,
     make_vgpr_opaque,
@@ -85,7 +87,38 @@ SUPPORTED_CLUSTER = (2, 2)
 #   2  drop the sigmoid (mul 0.5 + v_tanh + v_fma); keep clamp and the *u mul
 #   4  drop the amax / e8m0 block scale (constant scale instead)
 #   8  drop the cross-lane peer fetch (v_permlanex16, duplicate own instead)
-_EPI_PROBE = 0
+#   Env-overridable (AITER_EPI_PROBE) purely for sweeps: the value is baked into
+#   the kernel name as `_probeN`, so each setting gets its own JIT cache entry --
+#   the usual "a kernel-local os.environ read does not enter the cache key" trap
+#   does not apply here. Default stays 0 = correct output.
+_EPI_PROBE = int(os.environ.get("AITER_EPI_PROBE", "0"))
+
+# I-CACHE PROBE ONLY (AITER_EPI_PAD, default 0 = off). Executed-but-useless
+# s_nop emitted per epilogue batch, to grow the kernel's .text without changing
+# the work. Modality tracks .text size (threshold ~56 KB of the 64 KB WGP
+# instruction cache), and this is the causal test of that: padding a FLAT build
+# past the threshold should make it modal. Output stays numerically CORRECT --
+# unlike _EPI_PROBE, this only adds nops.
+_EPI_PAD = int(os.environ.get("AITER_EPI_PAD", "0"))
+
+# Emit ONE wave-parity main-loop schedule instead of two (default 0 = keep both,
+# the shipped behaviour). Halves the main loop's instruction footprint at the
+# cost of the even/odd LDS staggering -- see the call site.
+#   0 = off, 1 = every kernel, 2 = ONLY the fp4-quant kernel (gemm1).
+# 2 is the useful setting: gemm1 carries the fp4 activation epilogue and lands
+# at 61.6 KB, over the ~56 KB instruction-cache threshold, so it needs the
+# footprint cut; gemm2 is 45.6 KB, has never been modal, and only pays the
+# staggering loss (+9%) for a fix it does not need.
+_SINGLE_PARITY = int(os.environ.get("AITER_A4W4_SINGLE_PARITY", "0"))
+
+# Emit the fp4 LDS stores of one activation group under ONE `kgrp == 0` exec
+# mask instead of one per store site. `kgrp = lane // 16` is a runtime lane
+# predicate, so the `elif kgrp == 0` inside the fully unrolled store loop became
+# 64 separate s_and_saveexec/s_cbranch_execz regions -- all with the IDENTICAL
+# mask, which the compiler cannot merge across traced branch regions. The
+# compute stays at full exec because the pk8 peer exchange (permlanex16) needs
+# both half-waves live; only the stores are deferred and masked once.
+_EPI_FUSE_STORE_MASK = int(os.environ.get("AITER_EPI_FUSE_STORE", "0"))
 
 # Exchange the kgrp peer's half of each pk8 group as 2 packed bf16 dwords
 # instead of 4 loose f32 lanes -- see the comment at the pack site.
@@ -274,13 +307,18 @@ def _swizzled_blk(bid_x, bid_y, bid_z, cluster_m, cluster_n, tile_m, tile_n, wgm
     num_cl_n = fx.grid_dim.y // cluster_n
     # Linear cluster id in dispatch order: x fastest, then y, then z.
     cid = (bid_z * num_cl_n + cl_y) * cl_per_run + cl_x
+    # wgm is a compile-time constexpr, so this is plain Python control flow (no
+    # FlyDSL traced branch). wgm < 0 -> grouping width |wgm|, no round-robin
+    # inversion (effect 2 only, phase-insensitive).
+    invert = wgm > 0
+    grp_w = wgm if wgm > 0 else -wgm
     m_cl, n_cl = _xcd_cluster_swizzle(
-        cid, cl_per_run * fx.grid_dim.z, num_cl_n, wgm, num_xcds()
+        cid, cl_per_run * fx.grid_dim.z, num_cl_n, grp_w, num_xcds(), invert
     )
     return (m_cl * cluster_m + lx) * tile_m, (n_cl * cluster_n + ly) * tile_n
 
 
-def _xcd_cluster_swizzle(cid, num_cl_m, num_cl_n, wgm, n_xcds):
+def _xcd_cluster_swizzle(cid, num_cl_m, num_cl_n, wgm, n_xcds, invert=True):
     """Remap a linear CLUSTER id to ``(m_cluster, n_cluster)`` for L2 reuse.
 
     Cluster-granular on purpose: a cluster is never split, so peers keep sharing
@@ -297,11 +335,18 @@ def _xcd_cluster_swizzle(cid, num_cl_m, num_cl_n, wgm, n_xcds):
        A/B stay resident across the sweep.
     """
     num_cl = num_cl_m * num_cl_n
-    xcd = cid % n_xcds
-    intra = cid // n_xcds
-    base = num_cl // n_xcds
-    extra = num_cl - base * n_xcds
-    cid2 = xcd * base + (xcd < extra).select(xcd, extra) + intra
+    if invert:
+        # Effect 1: undo the dispatcher's assumed `cid % n_xcds` round-robin so
+        # clusters sharing an XCD get consecutive ids.
+        xcd = cid % n_xcds
+        intra = cid // n_xcds
+        base = num_cl // n_xcds
+        extra = num_cl - base * n_xcds
+        cid2 = xcd * base + (xcd < extra).select(xcd, extra) + intra
+    else:
+        # Effect 2 only: keep dispatch order, just regroup below. Robust to any
+        # gid->XCD mapping (DeepGEMM-style).
+        cid2 = cid
 
     span = wgm * num_cl_n
     grp = cid2 // span
@@ -369,7 +414,12 @@ def launch_gemm_a4w4_moe(
     # 0 = off (the raw row-major map). >0 selects the XCD-aware tile order and
     # is the group width in M-clusters, matching the repo's xcd_swizzle
     # convention (gemm_a8w8_8wave, moe_kernels) where the value IS the wgm.
-    assert xcd_swizzle >= 0, f"xcd_swizzle={xcd_swizzle} must be >= 0"
+    # <0 = the SAME M-cluster grouping with width |value| but WITHOUT the
+    # round-robin inversion (effect 2 only): a DeepGEMM-style phase-insensitive
+    # order that makes consecutive cluster ids form a compact tile block no
+    # matter how the dispatcher spreads them over XCDs. Used to isolate whether
+    # the inversion (which assumes a `% n_xcds` mapping this part may not use)
+    # is what regresses -- see _xcd_cluster_swizzle.
 
     cluster_sync_revs = 8
     m_run_max, m_run_min = 32, 8
@@ -448,10 +498,18 @@ def launch_gemm_a4w4_moe(
         "is rejected before launch."
     )
 
+    # Per-kernel, so it must be in the name: under mode 2 gemm1 gets the single
+    # schedule and gemm2 does not, and they would otherwise differ only by K.
+    _sp_on = _SINGLE_PARITY == 1 or (
+        _SINGLE_PARITY == 2 and bool(stage1_quant_out)
+    )
     _act = f"_act{stage1_act}" if stage1_act else ""
     _qout = f"_q{stage1_quant_out}r{quant_wmma_rep}" if stage1_quant_out else ""
     _bias = "_bias" if has_bias else ""
     _probe = f"_probe{_EPI_PROBE}" if _EPI_PROBE else ""
+    _probe += f"_pad{_EPI_PAD}" if _EPI_PAD else ""
+    _probe += "_sp1" if _sp_on else ""
+    _probe += "_fsm" if _EPI_FUSE_STORE_MASK else ""
     _epi = f"_eb{_EPI_ACT_BLKS}{'' if _EPI_ACT_BARRIERS else 'nb'}"
     _epi += "_th" if _EPI_HW_TANH else ""
     _epi += f"_wm{_EPI_ACT_WM}"
@@ -464,7 +522,7 @@ def launch_gemm_a4w4_moe(
         f"a4w4_quad_t{tile_m}x{tile_n}x{tile_k}_w{m_warp}x{n_warp}"
         f"_b{num_buffers}_K{K}_e{n_experts}"
         f"{_act}{_bias}{_qout}_cl{cluster_m}x{cluster_n}{_probe}{_epi}"
-        f"{f'_xcd{xcd_swizzle}' if xcd_swizzle else ''}"
+        f"{('_xcd%s%d' % ('g' if xcd_swizzle < 0 else '', abs(xcd_swizzle))) if xcd_swizzle else ''}"
     )
 
     @flyc.kernel(name=_kname, known_block_size=[block, 1, 1])
@@ -1052,11 +1110,21 @@ def launch_gemm_a4w4_moe(
                         parity,
                     )
 
-            wave_parity = fx.Int32(rocdl.readfirstlane(T.i32, wave % 2))
-            if wave_parity == 0:
+            # The two wave-parity schedules are permutations of the same four
+            # WMMA quadrants, staggered so even/odd waves do not hit the same
+            # LDS banks at the same time. They also DOUBLE the main loop's code,
+            # and the main loop is ~50 KB of a 64 KB WGP instruction cache --
+            # which is what drives the trimodal timing (see _EPI_PAD). Emitting
+            # one schedule for both waves trades LDS staggering for roughly half
+            # the footprint; AITER_A4W4_SINGLE_PARITY=1 measures that trade.
+            if const_expr(_sp_on):
                 _run_all(0)
             else:
-                _run_all(1)
+                wave_parity = fx.Int32(rocdl.readfirstlane(T.i32, wave % 2))
+                if wave_parity == 0:
+                    _run_all(0)
+                else:
+                    _run_all(1)
 
             rocdl.s_wait_dscnt(0)
             # acc (wm, wn) is 32 N-cols x 16 M-rows: lane holds M = wm*16+lane16
@@ -1146,6 +1214,13 @@ def launch_gemm_a4w4_moe(
                         e8m0_bytes = {}
                         mx_blk_is = {}
                         for grp in range_constexpr(N_MX_BLKS // _EPI_ACT_BLKS):
+                            # I-cache probe: spread the padding through the
+                            # executed epilogue, not bunched at one site.
+                            if const_expr(_EPI_PAD):
+                                emit_icache_pad(_EPI_PAD)
+                            # Deferred fp4 stores for this group, flushed under a
+                            # single exec mask below -- see _EPI_FUSE_STORE_MASK.
+                            fp4_stores = []
                             pairs = []
                             for wi in range_constexpr(WM_G):
                                 wm = wm0 * WM_G + wi
@@ -1316,6 +1391,13 @@ def launch_gemm_a4w4_moe(
                                                 + fx.Int32(kgrp) * 2,
                                                 packed_i32,
                                             )
+                                        elif const_expr(_EPI_FUSE_STORE_MASK):
+                                            fp4_stores.append(
+                                                (
+                                                    row_rel * STORE_N + col_fp4,
+                                                    packed_i32,
+                                                )
+                                            )
                                         elif kgrp == 0:
                                             lds_store_b32(
                                                 stC_idx,
@@ -1324,6 +1406,20 @@ def launch_gemm_a4w4_moe(
                                                     [packed_i32], fx.Int32
                                                 ),
                                             )
+
+                            # One exec region for the whole group's stores, in
+                            # place of one per store site. The addresses and the
+                            # packed values were all produced above at full exec.
+                            if const_expr(_EPI_FUSE_STORE_MASK):
+                                if is_kgrp0:
+                                    for _st_idx, _st_val in fp4_stores:
+                                        lds_store_b32(
+                                            stC_idx,
+                                            _st_idx,
+                                            Vec.from_elements(
+                                                [_st_val], fx.Int32
+                                            ),
+                                        )
 
                         # Preshuffled e8m0 scale: one branch per 16-row block.
                         for wi in range_constexpr(WM_G):
