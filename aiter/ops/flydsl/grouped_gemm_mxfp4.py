@@ -26,8 +26,8 @@ def _read_quad_cluster() -> tuple[int, int]:
     hardware can actually co-schedule the requested cluster is a separate,
     ungated question -- some valid-on-paper shapes still hang.
     """
-    m = int(os.environ.get("AITER_A4W4_QUAD_CLUSTER_M", "4"))
-    n = int(os.environ.get("AITER_A4W4_QUAD_CLUSTER_N", "4"))
+    m = int(os.environ.get("AITER_A4W4_QUAD_CLUSTER_M", "2"))
+    n = int(os.environ.get("AITER_A4W4_QUAD_CLUSTER_N", "2"))
     if m < 1 or n < 1:
         raise ValueError(f"AITER_A4W4_QUAD_CLUSTER_{{M,N}} must be >= 1, got {m}x{n}")
     if m * n > 32:

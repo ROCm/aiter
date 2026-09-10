@@ -811,6 +811,31 @@ def _grouped_a8w4_tdm_moe(
     )
 
     if kernel_bench_callable is not None:
+        if os.environ.get("AITER_ADDR_DEBUG", "0") == "1":
+            import sys as _sys
+
+            def _a(name, t):
+                try:
+                    p = t.data_ptr()
+                except Exception:
+                    return f"{name}=NA"
+                return f"{name}=0x{p:x}"
+
+            _fields = [
+                ("g1_out", a2_payload if _fuse_quant else y),
+                ("g1_A", a1_payload),
+                ("g1_B", w1_u8),
+                ("g1_As", a1_scale),
+                ("g1_Bs", w1s_i32),
+                ("psum", psum),
+                ("g2_out", grouped_out),
+                ("g2_A", a2_payload),
+                ("g2_B", w2_u8),
+            ]
+            _sys.stderr.write(
+                "ADDRDBG " + " ".join(_a(n, t) for n, t in _fields) + "\n"
+            )
+            _sys.stderr.flush()
         if _fuse_quant:
             kernel_bench_callable.append(
                 (
