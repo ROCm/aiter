@@ -40,6 +40,9 @@ _UNTUNED_ONE_BLOCK_DISPATCH_BANDS: _OneBlockDispatchBands = ((None, 20_000),)
 # modes prefer one through 28672; keep 32768 so unordered 8x32768 stays
 # one-block. Batch 16 all-mode last width is 65536. Batch >=17 occupancy beats
 # the launch chain.
+# gfx1250 has sharper occupancy steps because multi-block launches 16 chunks
+# per row. Tight k=2048/4096 stable+values modes set the conservative valleys;
+# neighboring bands stay wider when their geometric mean favors one-block.
 _ONE_BLOCK_DISPATCH_BANDS: dict[str, _OneBlockDispatchBands] = {
     "gfx950": (
         (2, 49_152),
@@ -57,7 +60,19 @@ _ONE_BLOCK_DISPATCH_BANDS: dict[str, _OneBlockDispatchBands] = {
         (16, 65_536),
         (None, _MAX_BUFFER_ROW_ELEMENTS),
     ),
-    "gfx1250": _UNTUNED_ONE_BLOCK_DISPATCH_BANDS,
+    "gfx1250": (
+        (2, 65_536),
+        (12, 40_960),
+        (17, 81_920),
+        (24, 49_152),
+        (54, 81_920),
+        (67, 200_000),
+        (79, 131_072),
+        (89, 500_000),
+        (96, 163_840),
+        (103, 500_000),
+        (None, _MAX_BUFFER_ROW_ELEMENTS),
+    ),
 }
 _SHORT_ROWS_1024_THREAD_MAX_ROWS = 256
 

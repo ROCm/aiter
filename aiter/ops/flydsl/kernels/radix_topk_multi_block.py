@@ -89,7 +89,8 @@ def _row_length(row, row_ends, width, next_n):
     return row_len
 
 
-def _row_input_tiles(input, row, row_start, row_len):
+def _row_input_views(input, row, row_start, row_len):
+    # Keep vector loads within the row bound; use input_row for the scalar tail.
     physical_row = fx.slice(input, (row, None))
     input_row = fx.rocdl.make_buffer_tensor(
         fx.make_view(
@@ -98,7 +99,7 @@ def _row_input_tiles(input, row, row_start, row_len):
         ),
         num_records_bytes=fx.Int64(row_len) * fx.Int64(4),
     )
-    return fx.logical_divide(input_row, fx.make_layout(_VEC, 1))
+    return input_row, fx.logical_divide(input_row, fx.make_layout(_VEC, 1))
 
 
 def _load_f32x4(tensor, vec_idx):
@@ -175,8 +176,6 @@ def _make_stable_write_storage(num_waves: int):
     class StableWriteStorage:
         above_scan: Array[Int32, num_waves + 1, 16]
         equal_scan: Array[Int32, num_waves + 1, 16]
-        above_running: Array[Int32, 1, 4]
-        equal_running: Array[Int32, 1, 4]
 
     return StableWriteStorage
 
@@ -243,7 +242,7 @@ def build_radix_topk_multi_block_module(
         row_start, row_len = _row_bounds(
             row, row_starts, row_ends, n, next_n, is_decode
         )
-        input_rsrc = _row_input_tiles(input, row, row_start, row_len)
+        input_row, input_rsrc = _row_input_views(input, row, row_start, row_len)
         row_indices = fx.slice(indices, (row, None))
         row_values = fx.slice(values, (row, None))
         direct = row_len <= fx.Int32(k)
@@ -322,24 +321,27 @@ def build_radix_topk_multi_block_module(
                 prefix = row_state[_STATE_PREFIX]
                 decided_mask = row_state[_STATE_MASK]
 
+            def accumulate_value(value):
+                ords = _f32_to_ord(value)
+                if first_pass != 0 or (ords & decided_mask) == prefix:
+                    byte_val = ((ords >> shift) & radix_mask) ^ xor_val
+                    atomic_add_i32(s_hist, 1, byte_val, "workgroup")
+
             def accumulate_vector(vec_idx):
                 rvals = _load_f32x4(input_rsrc, vec_idx)
                 for vi in range_constexpr(_VEC):
-                    col = vec_idx * fx.Int32(_VEC) + fx.Int32(vi)
-                    if col < row_len:
-                        ords = _f32_to_ord(rvals[vi])
-                        if first_pass != 0 or (ords & decided_mask) == prefix:
-                            byte_val = ((ords >> shift) & radix_mask) ^ xor_val
-                            atomic_add_i32(s_hist, 1, byte_val, "workgroup")
+                    accumulate_value(rvals[vi])
 
-            row_vectors = (row_len + fx.Int32(_VEC - 1)) // fx.Int32(_VEC)
+            full_row_vectors = row_len // fx.Int32(_VEC)
             if stable:
                 vectors_per_chunk = (
-                    row_vectors + fx.Int32(chunks_per_row - 1)
+                    full_row_vectors + fx.Int32(chunks_per_row - 1)
                 ) // fx.Int32(chunks_per_row)
                 vector_start = chunk * vectors_per_chunk
                 vector_end = vector_start + vectors_per_chunk
-                vector_end = (vector_end < row_vectors).select(vector_end, row_vectors)
+                vector_end = (vector_end < full_row_vectors).select(
+                    vector_end, full_row_vectors
+                )
                 for vec_idx in range(
                     vector_start + tid,
                     vector_end,
@@ -349,10 +351,14 @@ def build_radix_topk_multi_block_module(
             else:
                 for vec_idx in range(
                     chunk * fx.Int32(block_threads) + tid,
-                    row_vectors,
+                    full_row_vectors,
                     fx.Int32(vecs_per_grid_step),
                 ):
                     accumulate_vector(vec_idx)
+            tail_chunk = fx.Int32(chunks_per_row - 1 if stable else 0)
+            tail_col = full_row_vectors * fx.Int32(_VEC) + tid
+            if chunk == tail_chunk and tail_col < row_len:
+                accumulate_value(input_row[tail_col])
             gpu.barrier()
             for hist_item in range_constexpr(
                 (num_bins + block_threads - 1) // block_threads
@@ -488,7 +494,7 @@ def build_radix_topk_multi_block_module(
         row_start, row_len = _row_bounds(
             row, row_starts, row_ends, n, next_n, is_decode
         )
-        input_rsrc = _row_input_tiles(input, row, row_start, row_len)
+        input_row, input_rsrc = _row_input_views(input, row, row_start, row_len)
         row_indices = fx.slice(indices, (row, None))
         row_values = fx.slice(values, (row, None))
         row_state = fx.slice(state, (row, None))
@@ -530,23 +536,25 @@ def build_radix_topk_multi_block_module(
                     equal_idxs[pos] = idx
 
         if row_state[_STATE_DIRECT] == 0:
-            row_vectors = (row_len + fx.Int32(_VEC - 1)) // fx.Int32(_VEC)
+            full_row_vectors = row_len // fx.Int32(_VEC)
             for vec_idx in range(
                 chunk * fx.Int32(block_threads) + tid,
-                row_vectors,
+                full_row_vectors,
                 fx.Int32(vecs_per_grid_step),
             ):
                 base = vec_idx * fx.Int32(_VEC)
                 rvals = _load_f32x4(input_rsrc, vec_idx)
                 for vi in range_constexpr(_VEC):
                     col = base + fx.Int32(vi)
-                    if col < row_len:
-                        gather_value(
-                            rvals[vi],
-                            col,
-                            s_above_idxs,
-                            s_equal_idxs,
-                        )
+                    gather_value(rvals[vi], col, s_above_idxs, s_equal_idxs)
+            tail_col = full_row_vectors * fx.Int32(_VEC) + tid
+            if chunk == 0 and tail_col < row_len:
+                gather_value(
+                    input_row[tail_col],
+                    tail_col,
+                    s_above_idxs,
+                    s_equal_idxs,
+                )
             gpu.barrier()
 
             if tid == 0:
@@ -674,7 +682,7 @@ def build_radix_topk_multi_block_module(
         row_start, row_len = _row_bounds(
             row_i32, row_starts, row_ends, n, next_n, is_decode
         )
-        input_rsrc = _row_input_tiles(input, row_i32, row_start, row_len)
+        input_row, input_rsrc = _row_input_views(input, row_i32, row_start, row_len)
         row_indices = fx.slice(indices, (row, None))
         row_values = fx.slice(values, (row, None))
 
@@ -701,8 +709,6 @@ def build_radix_topk_multi_block_module(
         s_equal_scan = storage.equal_scan.peek().view(
             fx.make_layout(block_num_waves + 1, 1)
         )
-        s_above_running = storage.above_running.peek().view(fx.make_layout(1, 1))
-        s_equal_running = storage.equal_running.peek().view(fx.make_layout(1, 1))
 
         def block_exclusive_prefix_i32_pair(first, second, first_scan, second_scan):
             lane = tid_i32 % fx.Int32(wave_size)
@@ -768,18 +774,19 @@ def build_radix_topk_multi_block_module(
                             row_values[out_pos] = selected_values[vi]
                     my_equal = my_equal + 1
 
-        if tid == 0:
-            s_above_running[0] = 0
-            s_equal_running[0] = 0
-        gpu.barrier()
+        # The scan returns the same totals to every thread; no LDS counters needed.
+        above_running = fx.Int32(0)
+        equal_running = fx.Int32(0)
 
-        row_vectors = (row_len + fx.Int32(_VEC - 1)) // fx.Int32(_VEC)
-        vectors_per_chunk = (row_vectors + fx.Int32(chunks_per_row - 1)) // fx.Int32(
-            chunks_per_row
-        )
+        full_row_vectors = row_len // fx.Int32(_VEC)
+        vectors_per_chunk = (
+            full_row_vectors + fx.Int32(chunks_per_row - 1)
+        ) // fx.Int32(chunks_per_row)
         vector_start = chunk_i32 * vectors_per_chunk
         vector_end = vector_start + vectors_per_chunk
-        vector_end = (vector_end < row_vectors).select(vector_end, row_vectors)
+        vector_end = (vector_end < full_row_vectors).select(
+            vector_end, full_row_vectors
+        )
         chunk_vectors = vector_end - vector_start
         num_steps = (chunk_vectors + fx.Int32(block_threads - 1)) // fx.Int32(
             block_threads
@@ -795,14 +802,12 @@ def build_radix_topk_multi_block_module(
             local_above = fx.Int32(0)
             local_equal = fx.Int32(0)
             for vi in range_constexpr(_VEC):
-                col = base + fx.Int32(vi)
                 ords = _f32_to_ord(rvals[vi])
-                active = active_vector & (col < row_len)
-                above = active.select(
+                above = active_vector.select(
                     (ords > threshold).select(fx.Int32(1), fx.Int32(0)),
                     fx.Int32(0),
                 )
-                equal = active.select(
+                equal = active_vector.select(
                     (ords == threshold).select(fx.Int32(1), fx.Int32(0)),
                     fx.Int32(0),
                 )
@@ -821,8 +826,8 @@ def build_radix_topk_multi_block_module(
                 s_above_scan,
                 s_equal_scan,
             )
-            my_above = above_prefix + s_above_running[0] + local_above_prefix
-            my_equal = equal_prefix + s_equal_running[0] + local_equal_prefix
+            my_above = above_prefix + above_running + local_above_prefix
+            my_equal = equal_prefix + equal_running + local_equal_prefix
             write_outputs(
                 row_indices,
                 row_values,
@@ -833,10 +838,35 @@ def build_radix_topk_multi_block_module(
                 my_above,
                 my_equal,
             )
-            if tid == 0:
-                s_above_running[0] = s_above_running[0] + local_above_total
-                s_equal_running[0] = s_equal_running[0] + local_equal_total
+            above_running = above_running + local_above_total
+            equal_running = equal_running + local_equal_total
             gpu.barrier()
+
+        tail_start = full_row_vectors * fx.Int32(_VEC)
+        # At most three elements remain. One thread preserves their index order.
+        if direct == 0 and chunk_i32 == fx.Int32(chunks_per_row - 1) and tid == 0:
+            my_above = above_prefix + above_running
+            my_equal = equal_prefix + equal_running
+            for tail_item in range_constexpr(_VEC - 1):
+                col = tail_start + fx.Int32(tail_item)
+                if col < row_len:
+                    value = input_row[col]
+                    ords = _f32_to_ord(value)
+                    accepted_before = (my_equal < remaining_k).select(
+                        my_equal, remaining_k
+                    )
+                    out_pos = my_above + accepted_before
+                    if ords > threshold:
+                        row_indices[out_pos] = col + row_start
+                        if const_expr(write_values):
+                            row_values[out_pos] = value
+                        my_above = my_above + 1
+                    elif ords == threshold:
+                        if my_equal < remaining_k:
+                            row_indices[out_pos] = col + row_start
+                            if const_expr(write_values):
+                                row_values[out_pos] = value
+                        my_equal = my_equal + 1
 
     @flyc.jit
     def launch_radix_topk_multi_block(
@@ -908,7 +938,9 @@ def build_radix_topk_multi_block_module(
             )
 
         if stable:
-            stable_count_prefix = radix_topk_multi_block_stable_prefix_kernel(partial_hist, state)
+            stable_count_prefix = radix_topk_multi_block_stable_prefix_kernel(
+                partial_hist, state
+            )
             stable_count_prefix.launch(
                 grid=(rows_m, 1, 1),
                 block=(fused_prefix_threads, 1, 1),
