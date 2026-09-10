@@ -2,12 +2,15 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 
-import math
-
 from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
 from triton.language.extra.hip import libdevice
 
+from aiter.ops.triton._gluon_kernels.common.utils import (
+    exp_scaled,
+    sigmoid,
+    softplus,
+)
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
 
 _TDM = gl.amd.gfx1250.tdm
@@ -41,21 +44,6 @@ def _k_row_layout(K, SK, NUM_WARPS):
 @gluon.constexpr_function
 def _v_row_layout(ROWS, SK, NUM_WARPS):
     return gl.BlockedLayout([1, ROWS], [SK, 32 // SK], [1, NUM_WARPS], [1, 0])
-
-
-@gluon.jit
-def _exp_scaled(scale, x):
-    return gl.exp2((scale * math.log2(math.e)) * x)
-
-
-@gluon.jit
-def _softplus(x):
-    return gl.where(x < 20.0, gl.log(1.0 + gl.exp(x)), x)
-
-
-@gluon.jit
-def _sigmoid(x):
-    return 0.5 + 0.5 * libdevice.tanh(0.5 * x)
 
 
 @gluon.jit
@@ -197,13 +185,13 @@ def _process_token(
         else:
             if HAS_DT_BIAS:
                 g = g + b_bias
-            a = _exp_scaled(-a_exp, _softplus(g))
+            a = exp_scaled(-a_exp, softplus(g))
     else:
         a = gl.exp(g)
 
     b = br.to(gl.float32)
     if APPLY_BETA_SIGMOID:
-        b = _sigmoid(b)
+        b = sigmoid(b)
         if ALLOW_NEG_EIGVAL:
             b = b * 2.0
     return a, kv, qv, vv, b
