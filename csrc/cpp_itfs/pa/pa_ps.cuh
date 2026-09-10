@@ -107,6 +107,12 @@ __device__ __forceinline__ void pa_ps_buffer_store(__amdgpu_buffer_rsrc_t rsrc,
 template <int OFFSET>
 __device__ __forceinline__ float pa_ps_ds_swizzle_xor(float value)
 {
+    if constexpr(OFFSET == 32)
+    {
+        // ds_swizzle is confined to a 32-lane row. Use a wave shuffle for the
+        // cross-row exchange required by a 64-lane reduction.
+        return __shfl_xor(value, OFFSET, kPaPsReduceWarpSize);
+    }
     const int value_bits = __builtin_bit_cast(int, value);
     const int swizzled_bits =
         __builtin_amdgcn_ds_swizzle(value_bits, (OFFSET << 10) | 0x1f);
