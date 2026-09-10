@@ -3122,6 +3122,104 @@ def get_2stage_cfgs(
         and use_g1u1
         and not doweight_stage1
     )
+    # a4w4 SiTUv2 shapes that the generated Opus aux kernels cover are served by
+    # the MXMOE port (flydsl_mxmoe_g1_a4w4_* + flydsl_moe2_layout_*), which is
+    # where the k-split software pipeline, the split epilogue, the AGPR
+    # accumulator and the cached e8m0 route-out store live. Without a tuned row
+    # the old flydsl_moe1/moe2 port below would be picked instead and none of
+    # those apply, so pick a heuristic MXMOE pair here and keep the old port as
+    # the fallback for shapes the aux kernels do not cover.
+    _mxmoe_fallback_ok = (
+        dtype in [dtypes.bf16, dtypes.fp16]
+        and q_type == QuantType.per_1x32
+        and activation == ActivationType.Situv2
+        and q_dtype_a == dtypes.fp4x2
+        and q_dtype_w == dtypes.fp4x2
+        and is_shuffled
+        and use_g1u1
+        and not doweight_stage1
+        and gate_mode != GateMode.INTERLEAVE
+        and not (has_stage1_bias or has_stage2_bias)
+        and situ_beta == situ_linear_beta == 1.0
+        and hidden_pad == 0
+        and intermediate_pad == 0
+        and model_dim % 256 == 0
+        and aiter.is_mxfp4_moe_shape_supported(expert, model_dim, inter_dim, topk)
+        and os.environ.get("AITER_MXMOE_FALLBACK", "1") == "1"
+    )
+    if _mxmoe_fallback_ok:
+        # BM tiers mirror the old port's: small token counts cannot fill a wide
+        # sort block, large ones amortize it. BN/BK are fixed at the only tile
+        # the a4w4 GEMM1 supports for these BMs, and GEMM2 re-tiles the same
+        # sort block with BK picked from inter_dim.
+        # Measured on 7168x2048/E48/topk8: BM128 wins from 512 tokens up (at
+        # 512 by 17% end-to-end over BM64, at 1024 by 3.6%, and the margin is
+        # almost entirely GEMM2 -- a wider sort block gives it far fewer, far
+        # fuller blocks). Below that the padding waste flips it and BM64 wins
+        # (at 256 by 11%). BM32 was last at every token count tried, so it is
+        # not a tier.
+        _bm = 64 if token < 512 else 128
+        # GEMM2 reduces over inter_dim, so BK just has to divide it. BK128 beat
+        # BK256 by ~1.35x on every measured a4w4 SiTUv2 point (the shorter K loop
+        # leaves more blocks to spread over the CUs), so prefer it and only fall
+        # back to 256 for an inter_dim that BK128 cannot tile.
+        _g2_tk = 128 if inter_dim % 128 == 0 else 256
+        # GEMM1's xcd_swizzle groups `swizzle` consecutive m-blocks against one
+        # n-block (mxfp4_gemm1.py _xcd), so a group shares one B tile. B is
+        # indexed by (expert, n_block), so that reuse only lands while the
+        # group stays inside a single expert -- past the expert boundary the B
+        # tile changes and the reuse is gone. Hence the m-blocks an expert
+        # occupies is a ceiling on a useful swizzle.
+        #
+        # It is not the whole story: a group is swizzle*NUM_N_BLOCKS
+        # workgroups, and too large a group starves the grid's tail. On
+        # 7168x2048/E48/topk8 (6 m-blocks per expert at 4k tokens, 11 at 8k)
+        # a swizzle of 6 was the measured peak at *both* token counts -- a
+        # sharp one, with 5 and 9 clearly worse -- so the ceiling binds at 4k
+        # and the group-size limit binds at 8k. 6 beat the previously
+        # hardcoded 4 by 4.2%/6.2%. Kimi has 1 m-block per expert and lands on
+        # 1, which is what its tuned CSV picked by search.
+        _rows_per_expert = -(-token * topk // expert)
+        _g1_swz = min(6, max(1, -(-_rows_per_expert // _bm)))
+        # swizzle 1 is exactly what the unswizzled path already does.
+        _g1_sfx = f"_xcd{_g1_swz}" if _g1_swz > 1 else ""
+        # A persistent GEMM2 launches exactly one workgroup per CU and loops
+        # over tiles, so it only pays off once there are enough tiles for the
+        # loop to amortize its own setup and for the tail to be a small share
+        # of the whole. On 7168x2048/E48/topk8 that crossover sits between
+        # 2048 and 4096 tokens, and it is not a marginal call on either side:
+        # measured GEMM2 persist-vs-not is -13% at 512, -7.2% at 1024, -1.7%
+        # at 2048, then +4.6% at 4096 and +3.1% at 8192.
+        _g2_persist = "_persist" if _bm == 128 and token >= 4096 else ""
+        # The spatial partition helps everywhere it has enough blocks to
+        # partition and costs ~1-2% below that (at 1024, 149.68 -> 153.22 us),
+        # so it turns on one tier earlier than persist does.
+        _g2_sfx = "_sp402" if _bm == 128 and token >= 2048 else ""
+        _kn1 = f"flydsl_mxmoe_g1_a4w4_{_bm}x256x256_situv2{_g1_sfx}"
+        _kn2 = (
+            f"flydsl_moe2_layout_afp4_wfp4_bf16_t{_bm}x256x{_g2_tk}"
+            f"_reduce{_g2_persist}_sbm{_bm}{_g2_sfx}"
+        )
+        logger.warning(
+            f"[fused_moe] no tuned FlyDSL config for {keys}, "
+            f"using heuristic MXMOE fallback (kn1={_kn1!r}, kn2={_kn2!r})"
+        )
+        return MOEMetadata(
+            stage1=functools.partial(
+                _mxfp4_a4w4_stage1_fw,
+                kernelName1=_kn1,
+                interleave=False,
+            ),
+            stage2=functools.partial(
+                _mxfp4_a4w4_stage2_fw,
+                kernelName2=_kn2,
+            ),
+            block_m=_bm,
+            ksplit=0,
+            fuse_quant="fp4",
+            output_aux=AUX_SORT_OPUS,
+            prequant=False,
+        )
     if use_mxfp4_flydsl:
         from aiter.ops.flydsl.moe_kernels import (
             flydsl_kernel_name,

@@ -354,6 +354,7 @@ def build_flydslv2_gemm2_name(
     sbm=0,
     tn=256,
     tk=256,
+    spart=None,
 ):
     """Build a v2 layout GEMM2 name matching ``_FLYDSL_V2_GEMM2_RE``."""
     name = (
@@ -365,6 +366,8 @@ def build_flydslv2_gemm2_name(
         name += "_nt"
     if sbm:
         name += f"_sbm{sbm}"
+    if spart:
+        name += f"_sp{int(spart)}"
     return name
 
 
@@ -375,8 +378,14 @@ def get_flydsl_stage2_v2_kernels(
     block_m,
     model_dim=None,
     inter_dim=None,
+    sparts=(None,),
 ):
-    """Return v2 layout GEMM2 candidates, optionally filtered for a shape."""
+    """Return v2 layout GEMM2 candidates, optionally filtered for a shape.
+
+    ``sparts`` enumerates spatial-partitioner encodings (``GroupNum*100 + M01``)
+    to emit as ``_sp<N>`` variants; ``None`` means "leave it at the dispatcher
+    default" and produces the bare name.
+    """
     kernels = {}
     valid_pairs = {("fp4", "fp4"), ("fp8", "fp4"), ("fp8", "fp8")}
     if (a_dtype, b_dtype) not in valid_pairs:
@@ -400,32 +409,35 @@ def get_flydsl_stage2_v2_kernels(
                 for epilog in ("atomic", "reduce"):
                     for use_nt in (True, False):
                         for persist in persists:
-                            name = build_flydslv2_gemm2_name(
-                                a_dtype,
-                                b_dtype,
-                                out_dtype,
-                                tm=tm,
-                                tn=tn,
-                                tk=tk,
-                                epilog=epilog,
-                                persist=persist,
-                                use_nt=use_nt,
-                                sbm=block_m,
-                            )
-                            kernels[name] = {
-                                "stage": 2,
-                                "a_dtype": a_dtype,
-                                "b_dtype": b_dtype,
-                                "out_dtype": out_dtype,
-                                "tile_m": tm,
-                                "tile_n": tn,
-                                "tile_k": tk,
-                                "epilog": epilog,
-                                "use_nt": use_nt,
-                                "persist": persist,
-                                "sort_block_m": block_m,
-                                "v2": True,
-                            }
+                            for spart in sparts:
+                                name = build_flydslv2_gemm2_name(
+                                    a_dtype,
+                                    b_dtype,
+                                    out_dtype,
+                                    tm=tm,
+                                    tn=tn,
+                                    tk=tk,
+                                    epilog=epilog,
+                                    persist=persist,
+                                    use_nt=use_nt,
+                                    sbm=block_m,
+                                    spart=spart,
+                                )
+                                kernels[name] = {
+                                    "stage": 2,
+                                    "a_dtype": a_dtype,
+                                    "b_dtype": b_dtype,
+                                    "out_dtype": out_dtype,
+                                    "tile_m": tm,
+                                    "tile_n": tn,
+                                    "tile_k": tk,
+                                    "epilog": epilog,
+                                    "use_nt": use_nt,
+                                    "persist": persist,
+                                    "sort_block_m": block_m,
+                                    "spart": spart,
+                                    "v2": True,
+                                }
     return kernels
 
 
