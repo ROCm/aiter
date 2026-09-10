@@ -7,15 +7,38 @@ applyTo: "aiter/ops/triton/**,op_tests/triton_tests/**,op_tests/op_benchmarks/tr
 When a change violates one of these rules, flag it and point the author to the
 relevant rule — reviewers may not know these conventions yet.
 
+## PR scope — one concern per PR
+
+- **A new kernel goes in its own PR.** Flag any PR that adds a new kernel
+  together with unrelated work — a refactor, a cleanup, config retuning, or a
+  fix to a different kernel — and ask for the new kernel to be split into a
+  dedicated PR. A new kernel's own PR still carries its wrapper, unit test and
+  benchmark (see *Tests and benchmarks*); those belong to the kernel and are
+  not separate concerns.
+- Keep PRs small and easy to review: one concern each, as granular as the
+  change allows. Flag a PR that solves two or three independent problems at
+  once — a bug fix plus a refactor, a new op plus a cleanup, retuning plus an
+  API change — even when every individual change is correct.
+- When flagging scope, name the specific part that should move out and say it
+  belongs in a follow-up PR, so the author knows what to split rather than
+  only that the PR is too large.
+
 ## Reuse before adding
 
 Always prefer reusing existing code over adding new code. Before a PR adds a
 helper, kernel, or utility, the existing ones should have been checked:
-`utils/` (config loading, shuffling, arch info, logging, `kernel_repr`),
-`_triton_kernels/common/` (shared split-K reduce), and existing kernels and
-test helpers. Flag new code that duplicates functionality already in the
-tree, even partially — the fix is to extend or import the existing
-implementation, not to add a parallel copy.
+`utils/` (`config_utils` and the per-family `*_config_utils` loaders,
+shuffling, arch info, logging, `kernel_repr`), `_triton_kernels/common/`
+(shared split-K reduce), and existing kernels and test helpers. Flag new code
+that duplicates functionality already in the tree, even partially — the fix is
+to extend or import the existing implementation, not to add a parallel copy.
+
+`utils/` is layered on purpose: `config_utils.py` holds the shared core
+(`resolve_config_dir`, `load_config_json`, the path constants) and each family
+keeps its own loader module (`gemm_config_utils`, `conv_config_utils`,
+`mhc_config_utils`, `moe_config_utils`, `tuned_config_utils`) on top of it.
+Flag a function given a second home — a re-export, a wrapper that only
+forwards to another module, or a copy of a core helper inside a family module.
 
 ## Folder structure and imports
 
@@ -44,37 +67,62 @@ and tuned JSON in `configs/`. Flag:
   only absolute imports (`from aiter.ops.triton.<...> import ...`) are
   allowed.
 
+## Framework portability — torch stays out of `utils/_triton/`
+
+`utils/_triton/` and the config loaders are torch-free so the kernels and
+their tuned configs can be imported by a framework that is not PyTorch
+(JAX-Triton is the live case). Flag:
+
+- `import torch`, `from torch import ...` or any `torch.` use added to a
+  module under `utils/_triton/`. The torch-using half belongs in `utils/` —
+  split the helper rather than duplicating it (`moe_common.py` already lives
+  on both sides). `utils/_triton/tunning/` is exempt: standalone tuning
+  harnesses, not importable library code.
+- torch newly introduced into config resolution (`utils/config_utils.py` or a
+  `*_config_utils.py` family module) — loading a tuned config must not
+  require torch.
+- A new kernel module under `_triton_kernels/` or `_gluon_kernels/` that
+  imports torch, or a first torch import added to one that is currently
+  torch-free. A jit body cannot call torch; what drags it in is host-side
+  glue — `torch.Tensor` annotations, dtype constants, `torch.empty`
+  allocations — and that belongs in the public wrapper. Kernel modules that
+  already import torch are grandfathered.
+
 ## Tuned configs: JSON placement and naming
 
-The config tree is mid-migration from a legacy flat layout
-(`configs/gemm/<arch>-<NAME>.json`) to a nested layout
-(`configs/<arch>/<backend>/<op>/<d_type>/`, e.g.
-`configs/gfx950/triton/gemm/gemm_afp4wfp4/DEFAULT.json`). The legacy layout is
-deprecated. Flag:
+Every tuned config lives in one nested layout:
+`configs/<arch>/<backend>/<op>/<d_type>/`, e.g.
+`configs/gfx950/triton/gemm/gemm_afp4wfp4/DEFAULT.json`. `<op>` is `gemm`,
+`moe`, `conv`, `mhc`, `attention`, `gmm` or `fusions`; `<d_type>` is
+`config_name.lower().replace("-", "_")`. The flat arch-prefixed directories
+and every fallback that reached them are gone. Flag:
 
-- A new GEMM config JSON added under legacy `configs/gemm/` when the family
-  already has a nested `<arch>/<backend>/gemm/<d_type>/` directory, or a brand
-  new family added to the legacy layout instead of the nested one.
-- A config family split across the two layouts (e.g. `DEFAULT.json` nested but
-  new specialized files in `configs/gemm/`, or vice versa). The directory
-  probe in `get_gemm_config()` picks ONE directory — files in the losing
-  directory are silently ignored. Families move wholesale or not at all.
+- A config JSON added outside `configs/<arch>/<backend>/<op>/<d_type>/` — a
+  re-created `configs/gemm/`, `configs/moe/` or `configs/conv/` directory, or
+  a loose file at the top of `configs/`. Nothing resolves there any more.
 - An arch prefix on a filename inside `configs/<arch>/...` (wrong:
-  `configs/gfx950/triton/gemm/x/gfx950-GEMM-X.json`), or a nested default file
-  named anything other than exactly `DEFAULT.json`.
-- A specialized file added to a nested `<d_type>/` directory that contains no
-  `DEFAULT.json` — the resolver probes only for the default, so the whole
-  directory is invisible.
-- Any MOE config created or moved under `<arch>/<backend>/moe/`. No MOE
-  resolver for the nested layout exists yet; MOE configs stay in
-  `configs/moe/` with the arch prefix (see `configs/CLAUDE.md` §5).
-- Deleting or renaming `.gitkeep` placeholder directories under `configs/`.
+  `configs/gfx950/triton/gemm/x/gfx950-GEMM-X.json`), or a default file named
+  anything other than exactly `DEFAULT.json`.
+- A specialized file added to a `<d_type>/` directory that contains no
+  `DEFAULT.json`, for a family whose loader requires the default — the load
+  raises for every shape, not just the unspecialized ones.
+- A family's files split across two `<d_type>/` directories that differ only
+  by the `_dtype_dir()` fold (`GEMM-FOO-BAR` and `GEMM-FOO_BAR` collide; two
+  spellings of one family must not both exist).
 - A config file that is both moved and content-edited in the same commit —
-  migrations must be pure `git mv` renames, content changes in a follow-up.
-- `kpack` in a config file for gfx950 or a newer arch. Triton's AMD backend
-  deprecates `kpack` starting from gfx950 — it warns and force-overrides
-  `kpack = 1` there, and the parameter is slated for removal. Only gfx942
-  configs may still carry `kpack`.
+  moves must be pure `git mv` renames, content changes in a follow-up.
+- A new `.gitkeep` under `configs/`. A `<d_type>/` directory is created
+  populated; the few `.gitkeep` files left from the migration are inert
+  leftovers, not placeholders to maintain.
+- A new arch directory seeded from another arch without the copy being
+  byte-identical and called out in the commit message. The one seeding rule in
+  force is gfx950 → gfx1250, triton only — never into a gluon directory, never
+  backwards into gfx950.
+- `kpack` newly added to a gfx950 config. Triton's AMD backend deprecates
+  `kpack` on CDNA4 — it warns and force-overrides `kpack = 1` there, and the
+  parameter is slated for removal. The gfx950 tree is clean of it; gfx942 may
+  still carry it, and existing RDNA (gfx1151/gfx1201/gfx1250) entries predate
+  the rule, so flag additions rather than the entries already there.
 - Checked-in files under `configs/gemm/aot/` or `configs/paged_mqa_logits/aot/`
   — these are runtime AOT caches, never committed.
 
@@ -90,11 +138,26 @@ Flag, inside GEMM-family config JSON:
   `BLOCK_SIZE_K`, `GROUP_SIZE_M`, `num_warps`, `num_stages`, `waves_per_eu`,
   `matrix_instr_nonkdim`, `cache_modifier`, `NUM_KSPLIT`. (Loader backfill of
   `NUM_KSPLIT`/`cache_modifier` is a last resort, not a license to omit.)
-- MOE-scheme keys (`small_M`/`medium_M`/`large_M`) in a GEMM config or GEMM
-  `M_LEQ_x`/`M_GEQ_y` keys in a MOE config — the schemes must not mix.
+- MOE dispatch keys (`bm<block_m>_n<N>_k<K>`) in a GEMM config or GEMM
+  `M_LEQ_x`/`M_GEQ_y` keys in a MOE dispatch table — the schemes must not mix.
 - For `*AFP4WFP4*` specialized filenames: `K` must be the logical K
   (`2 * K_bytes`) — the wrapper doubles K before lookup, so a file named by
   the packed byte width will never resolve.
+
+And inside MOE dispatch tables:
+
+- A newly tuned gluon dispatch shape that does not carry all six `m2bucket`
+  suffixes (`tiny`, `small`, `medium`, `medium2`, `large`, `xlarge`) — a
+  missing bucket falls through to `bm<block_m>_any` and silently loses that
+  shape's tuning for that M range. (Existing entries are unevenly covered;
+  flag new gaps, not the ones already shipped.)
+- A gluon dispatch file with no `bm<block_m>_any` tier for a `block_m` it
+  otherwise covers: that tier is the last resort for an unmeasured shape.
+- A `BLOCK_SIZE_M` / `block_m` key inside a dispatch entry — `block_m` is the
+  dispatch key (routing decides it), not a tunable.
+- Triton-shaped entry keys (`BLOCK_SIZE_N`, `num_stages`, ...) in a gluon
+  dispatch file or gluon-shaped keys (`block_n`, `num_buffers`,
+  `persistent_iters`) in a triton one — the two paths read disjoint params.
 
 ## Python-side config hygiene
 
@@ -105,6 +168,12 @@ values for either backend live in JSON, never in Python. Flag:
   inline dict literals with `BLOCK_SIZE_*`/`num_warps`/`waves_per_eu` keys,
   arch-conditional tuning constants, or hardcoded fallback configs. The fix is
   always in the JSON file, not the Python.
+- A kernel-level `_get_config()` whose `backend` parameter defaults to `None`
+  (or any value outside `("triton", "gluon")`) — `None` is not a backend and
+  `resolve_config_dir()` asserts on it, so the kernel raises the moment a
+  caller omits the argument. Kernel-level helpers default to `"triton"`;
+  public wrappers that expose `backend: str | None = None` must normalize it
+  before calling down.
 - A new or modified Triton or Gluon GEMM `_get_config()` that does anything
   beyond calling `get_gemm_config(...)` with the appropriate backend selection
   (plus `compute_splitk_params()` for split-K kernels), and that does not
@@ -125,13 +194,24 @@ values for either backend live in JSON, never in Python. Flag:
   re-tune.
 - Raw config-file reads — `json.load(open(...))` or function-attribute caches
   like `_get_config._config_dict` — instead of
-  `aiter.ops.triton.utils.core.load_config_json` (which caches per path,
-  including negative results) or the resolvers `get_gemm_config` /
-  `get_tuned_kernel_config`. All hand-rolled loaders were deliberately
-  removed; do not add them back.
-- New hand-built config paths (`f"{AITER_TRITON_CONFIGS_PATH}/..."`) where
-  `get_gemm_config()` / `get_tuned_kernel_config()` would work — hand-built
-  paths break silently when the family migrates to the nested layout.
+  `aiter.ops.triton.utils.config_utils.load_config_json` (which caches per
+  path, including negative results) or a family loader. All hand-rolled
+  loaders were deliberately removed; do not add them back.
+- Mutating the dict returned by `load_config_json()` — it is the shared cached
+  object. Copy first (`dict(...)` for flat entries, `copy.deepcopy` for nested
+  ones); the family loaders already copy on the caller's behalf.
+- New hand-built config paths (`f"{AITER_TRITON_CONFIGS_PATH}/..."`) where a
+  family loader or `resolve_config_dir()` would work — a hand-built path is a
+  second place the layout is encoded, and it skips the argument validation
+  that makes a wrong value fail closed.
+- A second MOE config reader. `utils/moe_config_utils.py::get_moe_dispatch` is
+  the only MOE fetcher; flag any new MOE path built by hand, any direct
+  `load_config_json` on a `moe/` file, and any reintroduced per-wrapper MOE
+  loader.
+- A new arch- or backend-fallback chain inside a loader (try this arch, then
+  that one; try triton, then gluon). Resolution is deterministic. MHC's gfx942
+  fallback is the one documented exception and it goes through the `arch=`
+  override, not through a probe.
 
 ## Weight & scale shuffling — must come from `utils/shuffle.py`
 
@@ -193,10 +273,32 @@ All weight/scale pre-shuffle helpers are unified in
   if int(DEVICE_ARCH.split("MI")[1]) >= 350: ...
   ```
 
+- Device handling: allocate on the input's device, never a hardcoded
+  `"cuda"`. `device="cuda"` resolves to the process's current default device,
+  so a wrapper whose inputs live on `cuda:3` allocates its output or
+  workspace on `cuda:0` — a cross-device error at best, the wrong GPU at
+  worst. Flag new `device="cuda"`, `torch.device("cuda")` and `.cuda()` in
+  wrappers and kernel launch code:
+
+  ```python
+  # Correct
+  y = torch.empty(shape, dtype=x.dtype, device=x.device)
+  # Wrong
+  y = torch.empty(shape, dtype=x.dtype, device="cuda")
+  ```
+
+  Docstring examples and tests that build their own inputs may keep
+  `device="cuda"`; the rule is about library code deriving the device from
+  the tensors it was handed.
 - Flag new public wrapper functions without a docstring covering: what the
   kernel computes, the arguments (including which config parameters apply),
   the return value, and special considerations (layout expectations,
   unsupported options).
+- Keep comments and docstrings concise. Flag padded or hard-to-follow prose:
+  multi-paragraph docstrings that restate the code, tutorial-style
+  explanations of Triton basics, narration of what the next line does, or
+  commented-out code left behind. A comment earns its place by explaining
+  *why* — a non-obvious constraint, a layout requirement, an arch quirk.
 
 ## Tests and benchmarks
 
@@ -214,6 +316,16 @@ All weight/scale pre-shuffle helpers are unified in
   config dicts (`BLOCK_SIZE_*`, `num_warps`, `waves_per_eu`, ...) or passes
   literal `config=` overrides to a wrapper. Tests exercise the wrapper's own
   config resolution — tuning values live only in `configs/` JSON.
+- Unit tests assert, they do not dump. Flag `print(...)` of tensors, shapes,
+  or timings and any ad-hoc `if __name__ == "__main__"` reporting block in a
+  test file: correctness is checked with asserts
+  (`torch.testing.assert_close` and friends) so a regression fails the test
+  instead of needing a human to read the log. Some older tests still print —
+  flag new dumps, not the ones already there.
+- No autotuning in unit tests: flag `@triton.autotune`, an autotune config
+  sweep, or a loop over tile sizes inside a test. Tests exercise the config
+  the wrapper resolves for the shape; tuning belongs in the tuning scripts
+  and benchmarks.
 - Benchmarks live in `op_tests/op_benchmarks/triton/` as `bench_<op>.py`,
   structured like the existing files. The config and shuffle rules above
   apply to them too: no hardcoded tuning dicts, shuffles imported from

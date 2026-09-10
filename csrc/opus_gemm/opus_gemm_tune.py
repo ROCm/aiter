@@ -91,7 +91,6 @@ from opus_gemm_common import (
     GFX1250_SPLITK_FUSE_ENABLED,
     GFX1250_SPLITK_FUSE_KID_OF,
     GFX1250_SPLITK_FUSE_KIDS,
-    HEURISTIC_DEFAULT_KIDS,
     NON_SPLITK_KIDS,
     SPLITK_KIDS,
     _opus_sidecar_path,
@@ -108,6 +107,7 @@ from opus_gemm_common import (
     a16w16_persistent_kernels_list_nooob,
     gfx942_nosplit_kernels_list,
     gfx942_splitk_kernels_list,
+    gfx1250_4wave_co_kernels_list,
     gfx1250_clusterlaunch_kernels_list,
     gfx1250_kernels_list,
     gfx1250_splitk_fuse_kernels_list,
@@ -248,6 +248,15 @@ def gfx1250_splitK_window(M, N, K, cu_num, k_inst, base_candidates):
     return [min(nz, key=_dist)]
 
 
+# Pre-compiled (.co) candidate filter. The family is 12 tiles x up to 16 cluster
+# dims x 3 wave layouts = 204 kids, and it used to go into every sweep whole.
+# Scored against measured per-kid latency on 18 shapes (square, wide-N, narrow-N,
+# M=1, ragged, K-tail), the knee is at 5 cluster dims and 4 tiles; one step of
+# headroom on each keeps the measured winner for 17 of the 18 and costs 0.16% on
+# the last, while cutting the sweep 3.2x.
+GFX1250_CO_TOP_TILES = 6
+GFX1250_CO_TOP_CLUSTERS = 6
+
 GFX1250_FUSE_TOP_SPLITK = 3  # best-N split_k (by grid-occupancy fit) per fuse tile
 
 
@@ -330,7 +339,7 @@ def _gfx1250_cluster_waste(gx: int, gy: int, cwm: int, cwn: int) -> float:
     return (launched - gx * gy) / launched
 
 
-def _gfx1250_cluster_dims_for_grid(gx, gy, avail, top_clusters):
+def _gfx1250_cluster_dims_for_grid(gx, gy, avail, top_clusters, cu_num=0):
     """Rank the (cwm, cwn) worth benchmarking for a gx x gy tile grid.
 
     ``avail`` maps (cwm, cwn) -> kid for one tile. Returns the selected dims,
@@ -344,6 +353,14 @@ def _gfx1250_cluster_dims_for_grid(gx, gy, avail, top_clusters):
     nothing does, only the tightest-fitting dims stay, so a shape that cannot
     fill any cluster still gets its least-wasteful candidate benchmarked.
 
+    Both of those read the surplus workgroups as cost, which holds only once the
+    launch is big enough for them to displace real work. Pass ``cu_num`` to lift
+    them while the whole launch still fits one machine's worth: there the dead
+    workgroups displace nothing and the wider multicast is free. Measured on the
+    .co family, 129x257x384 on a 64x64 tile is a 3x5 grid whose fastest kid is
+    c4x4 -- vetoed without this, for 4.9%. Left off (0) by default so the
+    clusterlaunch sweep keeps the behaviour it was tuned with.
+
     Ranking is by waste first (bucketed, so a fit within a bucket does not
     outrank a bigger multicast group over a rounding crumb), then by the size of
     the multicast group, then by how well the cluster's aspect matches the tile
@@ -355,14 +372,19 @@ def _gfx1250_cluster_dims_for_grid(gx, gy, avail, top_clusters):
     11.2 us against 13.3 us for 4x2, and 1x4 (11.4 us) beats both 2x2 (13.9 us)
     and 4x1 (20.1 us).
     """
+
+    def _free(cwm, cwn):
+        return cu_num > 0 and _round_up(gx, cwm) * _round_up(gy, cwn) <= cu_num
+
     feas = [
         (_gfx1250_cluster_waste(gx, gy, cwm, cwn), cwm, cwn)
         for (cwm, cwn) in avail
-        if cwm <= gx and cwn <= gy
+        if (cwm <= gx and cwn <= gy) or _free(cwm, cwn)
     ]
     if not feas:
         return []
-    within = [f for f in feas if f[0] <= GFX1250_MAX_CLUSTER_WASTE]
+    max_waste = 1.0 if _free(1, 1) else GFX1250_MAX_CLUSTER_WASTE
+    within = [f for f in feas if f[0] <= max_waste]
     if not within:
         tightest = min(f[0] for f in feas)
         within = [f for f in feas if f[0] <= tightest]
@@ -376,6 +398,52 @@ def _gfx1250_cluster_dims_for_grid(gx, gy, avail, top_clusters):
         )
     )
     return [(cwm, cwn) for _w, cwm, cwn in within[:top_clusters]]
+
+
+# tile -> cluster dims -> [kid]. Built once; the wave layouts (and any future
+# VGPR budgets) of one (tile, cluster) stay together because nothing host-side
+# can rank them -- which of them wins is exactly what the sweep is for.
+_GFX1250_CO_BY_TILE: dict = {}
+for _kid, _k in gfx1250_4wave_co_kernels_list.items():
+    _GFX1250_CO_BY_TILE.setdefault((_k.B_M, _k.B_N, _k.B_K), {}).setdefault(
+        (_k.cluster_wg_m, _k.cluster_wg_n), []
+    ).append(_kid)
+
+
+def _gfx1250_co_candidates(
+    M,
+    N,
+    K,
+    cu_num,
+    top_tiles=GFX1250_CO_TOP_TILES,
+    top_clusters=GFX1250_CO_TOP_CLUSTERS,
+):
+    """Pre-compiled (.co) kids worth benchmarking for this shape.
+
+    Same shape as the plain/clusterlaunch selection -- top-N tiles by
+    grid-occupancy fit, then top-N cluster dims per tile -- with one difference
+    that matters: this family has NO split-K, so its grid is exactly
+    ceil(M/B_M) * ceil(N/B_N) and the tile score has nothing to minimise over.
+
+    Every tile carries a c1x1 entry and c1x1 is feasible for any non-empty grid,
+    so a selected tile always contributes at least one kid.
+    """
+
+    def _tile_score(t):
+        bm, bn, _bk = t
+        return _gfx1250_occ_cost(_ceil_div(M, bm) * _ceil_div(N, bn), cu_num)
+
+    tiles = sorted(_GFX1250_CO_BY_TILE, key=lambda t: (_tile_score(t), t))
+    out: set[int] = set()
+    for t in tiles[:top_tiles]:
+        bm, bn, _bk = t
+        gx, gy = _ceil_div(M, bm), _ceil_div(N, bn)
+        avail = _GFX1250_CO_BY_TILE[t]
+        for dims in _gfx1250_cluster_dims_for_grid(
+            gx, gy, avail, top_clusters, cu_num=cu_num
+        ):
+            out.update(avail[dims])
+    return out
 
 
 def _gfx1250_select_candidates(
@@ -435,6 +503,12 @@ def _gfx1250_select_candidates(
     # the sweep is 496 kids (28 plain + 468 clusterlaunch) and not ~1.9k.
     if GFX1250_SPLITK_FUSE_ENABLED:
         sel |= _gfx1250_fuse_candidates(M, N, K, cu_num)
+
+    # Pre-compiled (.co) kids. These used to go in wholesale, on the reading that
+    # the family was a handful of hand-picked variants with nothing for a tile
+    # ranking to choose between. It is now a swept 12-tile x 16-cluster x
+    # 3-layout space, so it gets the same treatment as the rest.
+    sel |= _gfx1250_co_candidates(M, N, K, cu_num)
     return frozenset(sel)
 
 
@@ -454,6 +528,12 @@ def candidate_splitK(M: int, N: int, K: int, batch: int, cu_num: int, k_inst):
     range. We compute the same per-slice budget the host reject uses and
     silently drop any split_k that would push workspace past 4 GiB.
     """
+    # Pre-compiled (.co) kids have no split-K at all: no workspace, no partials,
+    # no reduce kernel, and the launcher AITER_CHECKs splitK <= 1. Probing any
+    # other value would just collect exceptions.
+    if k_inst.kernel_tag == "a16w16_4wave_co":
+        return [0]
+
     B_K = k_inst.B_K
     total_iters = _ceil_div(K, B_K)
     # gfx1250 cluster/TDM split-K triple-buffers but tolerates any k_steps>=1
@@ -476,7 +556,9 @@ def candidate_splitK(M: int, N: int, K: int, batch: int, cu_num: int, k_inst):
     # Workspace 4 GiB cap.
     padded_M = _ceil_div(M, k_inst.B_M) * k_inst.B_M
     padded_N = _ceil_div(N, k_inst.B_N) * k_inst.B_N
-    per_slice_bytes = batch * padded_M * padded_N * 4
+    per_slice_bytes = (
+        batch * padded_M * padded_N * (2 if _kid_uses_bf16_workspace(k_inst) else 4)
+    )
     UINT32_MAX_BYTES = (1 << 32) - 1
     if per_slice_bytes > 0:
         ws_cap = UINT32_MAX_BYTES // per_slice_bytes
@@ -556,6 +638,33 @@ def kid_rejects_shape(k_inst, M, N, K):
             splitk main kernel's mask_va_tail cover both edge cases, so
             splitk is safe for any (M, N, K).
     """
+    # The gfx1250 _ws reduce launches as dim3(ceil(N, VEC*BLOCK), M, 1) and
+    # grid.y is capped at 65535. Past that it does not fail, it writes garbage:
+    # at M=65536 the output is NaN, while the same shape on a .co kid (no reduce)
+    # is exact, and M >= 65537 does not launch at all ("invalid configuration
+    # argument"). Tuning one tends to take the box down with it. The fuse family
+    # reduces in-kernel and is unaffected. The generated launcher re-checks, for
+    # a tuned CSV that predates this.
+    if M > 65535 and _kid_launches_reduce(k_inst):
+        return True
+
+    # Pre-compiled (.co) kids: answered first, because almost none of the rules
+    # below apply to them. The pipeline builds NO buffer resource at all (it is
+    # the only a16w16 pipeline with zero make_gmem -- A, B and C all ride TDM
+    # descriptors with 64-bit base and stride), so the 4 GiB filter underneath
+    # is not merely satisfied, it is inapplicable. Every tail is handled by the
+    # D#'s per-dimension saturating clamp, so no M/N/K alignment is required
+    # either. What IS required: the batch strides are int64 but m/n/k are int,
+    # and the traits assert the tile it was compiled for.
+    # Both .co families, not just the compute one: they share the launcher and
+    # the no-buffer-resource pipeline, so the same reasoning applies. Naming only
+    # a16w16_4wave_co let a16w16_4wave_wl_co fall through to the rules below,
+    # where the gfx942 bf16-workspace whitelist rejected all 140 of its kids at
+    # any N outside that table (384, 32320, 129280) -- silently, since a missing
+    # candidate looks the same as a candidate that lost.
+    if k_inst.kernel_tag in _A16W16_CO_TAGS:
+        return M < 1 or N < 1 or K < 1
+
     # 4 GiB buffer-resource filter. Legacy a16w16 kids build a single
     # AMDGPU buffer-resource per tensor (A/B/C), whose `num_records` field
     # is 32-bit -- any of the three exceeding UINT32_MAX bytes wraps and
@@ -578,7 +687,16 @@ def kid_rejects_shape(k_inst, M, N, K):
     B_K = k_inst.B_K
     loops = _ceil_div(K, B_K)
 
-    if _kid_uses_bf16_workspace(k_inst):
+    # BF16WS_EXACT_REDUCE_SHAPES is a gfx942 artifact: that family's bf16-workspace
+    # reduce was only ever validated on the handful of N in the table, so anything
+    # else is refused. It keyed on "uses a bf16 workspace" alone, which was
+    # equivalent to "is a gfx942 bf16-ws kid" only while every gfx1250 _ws kid
+    # declared an fp32 partial. Once those switched to bf16 the rule started
+    # rejecting them too, and since the table is all powers of two it wiped out
+    # the whole _ws family at N=384 / 32320 / 129280 -- at N=384 that left 6 of
+    # 106 candidates, all one tile. The gfx1250 _ws reduce handles a ragged N
+    # through its tail path, so scope the rule to the family it was written for.
+    if _kid_uses_bf16_workspace(k_inst) and k_inst.kernel_tag not in _WS_SPLITK_TAGS:
         padded_N = _ceil_div(N, k_inst.B_N) * k_inst.B_N
         if loops < 2 or K % B_K != 0 or padded_N != N:
             return True
@@ -876,12 +994,32 @@ def candidate_kids_for_shape(M, N, K, bias, cu_num):
         pass  # unknown arch -> keep legacy multi-arch behaviour
 
     # Step 6: drop known-bad kids permanently.
-    cands = cands - _OPUS_PERMA_BAD_KIDS
-    return cands
+    return cands - _OPUS_PERMA_BAD_KIDS
 
 
 # Kids we never want tuner to probe.
 _OPUS_PERMA_BAD_KIDS = frozenset()
+
+
+# The two families that stage a split-K partial the reduce then reads. The fuse
+# family reduces in-kernel, so its workspace dtype is its own business.
+_WS_SPLITK_TAGS = frozenset(
+    {"a16w16_cluster_tdm_splitk_ws", "a16w16_clusterlaunch_tdm_splitk_ws"}
+)
+
+# The pre-compiled (.co) families. Mirrors codegen/common.py:_A16W16_CO_TAGS.
+_A16W16_CO_TAGS = frozenset({"a16w16_4wave_co", "a16w16_4wave_wl_co"})
+
+
+def _kid_launches_reduce(k_inst):
+    """True for the gfx1250 families whose launcher runs splitk_reduce separately.
+
+    The gfx942 _sk families and flatmm_splitk launch the same reduce with the
+    same grid.y, so the 65535 cap is theirs too -- they are left alone here
+    only because this change is scoped to gfx1250. The fuse family reduces
+    in-kernel and launches nothing.
+    """
+    return getattr(k_inst, "kernel_tag", "") in _WS_SPLITK_TAGS
 
 
 def _ensure_kids_compiled(candidate_kids):
@@ -890,14 +1028,14 @@ def _ensure_kids_compiled(candidate_kids):
 
     Reads the subset-compile sidecar at ``_opus_sidecar_path()`` (lives in
     ``$JIT_BUILD/`` so it survives clear_build). If any kid in
-    ``candidate_kids`` (or in ``HEURISTIC_DEFAULT_KIDS``) is missing from
-    the sidecar, this function:
+    ``candidate_kids`` (or in ``HEURISTIC_DEFAULT_KIDS``) is missing, or its
+    receipt does not match the installed .so, this function:
 
-    1. Atomically expands the sidecar to the union of the existing
-       contents, the new candidates, and the heuristic defaults.
-    2. Clears the aiter.jit.core in-process module caches and removes
-       the on-disk .so so the next ``@compile_ops("module_deepgemm_opus")``
-       call rebuilds from scratch (the codegen step re-reads the sidecar).
+    1. Passes the new candidates as ``--extra_kids`` to codegen. The last
+       successful sidecar remains intact until the new binary is installed.
+    2. Clears the aiter.jit.core in-process module caches and requests a
+       synchronous rebuild, which removes the old .so and re-reads the
+       successful sidecar as a seed for codegen.
     3. **Synchronously triggers the rebuild here** by calling
        build_module() directly so subsequent ``mp_tuner`` spawn-ed
        children inherit a .so on disk that already contains every
@@ -911,9 +1049,10 @@ def _ensure_kids_compiled(candidate_kids):
     Two race vectors are explicitly defended against:
 
     A. **Concurrent GemmTuner / parent processes** (multi-GPU multi-script):
-       sidecar read + expand + write + build is wrapped in a ``FileBaton``
+       request + build + successful metadata publication is wrapped in a
+       ``FileBaton``
        (`$JIT_BUILD/lock_ensure_kids_opus`). One parent runs the full
-       expand+build; the rest spin on the baton, then re-read the sidecar
+       expand+build; the rest spin on the baton, then recheck the sidecar receipt
        (it may already contain what they need, in which case they skip).
 
     B. **mp_tuner spawn-ed children inheriting `AITER_REBUILD=1`**:
@@ -925,24 +1064,26 @@ def _ensure_kids_compiled(candidate_kids):
        baked, and the rest then race against an in-flight build,
        producing intermittent `FileNotFoundError` / partial ELF errors.
        To shut this off we **also clear `os.environ["AITER_REBUILD"]`**
-       once our synchronous build succeeds, so every spawn child
+       once our synchronous build succeeds or a current binary is reused,
+       so every spawn child
        inherits a clean env (read: `AITER_REBUILD=0`) and goes straight
-       to `dlopen()` of the .so we just produced. The original env is
-       restored on the parent process only after this call returns;
-       the parent itself does not need the rebuild flag past this
+       to `dlopen()` of the ready .so. On build failure the original env is
+       restored; on success only the parent's in-process flag is restored.
+       The parent itself does not need the rebuild flag past this
        point because we already added ``module_deepgemm_opus`` to
        ``rebuilded_list``.
 
     Returns
     -------
     bool
-        True if a rebuild was triggered (sidecar grew), False if every
+        True if a rebuild was triggered, False if every
         required kid was already compiled.
     """
     from opus_gemm_common import heuristic_kids_for_arch
 
     from aiter.jit import core as _jit_core
     from aiter.jit.utils.file_baton import FileBaton
+    from aiter.jit.utils.jit_cache import compiled_kids_are_current
 
     candidate_kids = frozenset(int(k) for k in candidate_kids)
     # Restrict the heuristic-default kid set to the running GPU's arch.
@@ -952,7 +1093,14 @@ def _ensure_kids_compiled(candidate_kids):
         _run_arch = get_gfx_runtime().lower()
         _heuristic = heuristic_kids_for_arch({_run_arch})
     except Exception:  # noqa: BLE001
-        _heuristic = HEURISTIC_DEFAULT_KIDS  # unknown -> multi-arch fallback
+        # A runtime probe can fail in a prebuild environment with explicit
+        # targets. Do not require off-arch defaults in that case.
+        _target_arches = {
+            arch.strip().lower()
+            for arch in os.getenv("GPU_ARCHS", "native").split(";")
+            if arch.strip() and arch.strip().lower() != "native"
+        }
+        _heuristic = heuristic_kids_for_arch(_target_arches or None)
     required = candidate_kids | _heuristic
 
     def _read_sidecar(path):
@@ -961,14 +1109,27 @@ def _ensure_kids_compiled(candidate_kids):
         try:
             with open(path) as f:
                 return set(json.load(f))
-        except (OSError, ValueError):
+        except (OSError, ValueError, TypeError):
             return set()
 
     sidecar = _opus_sidecar_path()
+    artifact = os.path.join(_jit_core.get_user_jit_dir(), "module_deepgemm_opus.so")
+    rebuild_requested = _jit_core.AITER_REBUILD or int(os.getenv("AITER_REBUILD", "0"))
+    force_rebuild = (
+        rebuild_requested and "module_deepgemm_opus" not in _jit_core.rebuilded_list
+    )
 
-    # Fast path: no lock needed if we are already a strict subset of whatever sidecar happens to be
-    # on disk.
-    if required <= _read_sidecar(sidecar):
+    def _reuse_current_binary():
+        # A receipt proves kid membership, not that a user-requested source
+        # rebuild has run. Honor that request once in this parent before spawn.
+        if force_rebuild or not compiled_kids_are_current(sidecar, artifact, required):
+            return False
+        os.environ["AITER_REBUILD"] = "0"
+        return True
+
+    # A bare sidecar may come from an old version or a failed build. Require
+    # successful metadata for the currently installed artifact, not membership alone.
+    if _reuse_current_binary():
         return False
 
     os.makedirs(_jit_core.bd_dir, exist_ok=True)
@@ -979,7 +1140,7 @@ def _ensure_kids_compiled(candidate_kids):
         # A peer parent (multi-GPU / multi-process tune harness) is already extending the sidecar +
         # rebuilding.
         baton.wait()
-        if required <= _read_sidecar(sidecar):
+        if _reuse_current_binary():
             return False
         # Peer's expand didn't cover us (rare: peer's `required` set was
         # disjoint from ours). Re-enter to extend further.
@@ -988,23 +1149,13 @@ def _ensure_kids_compiled(candidate_kids):
     try:
         compiled = _read_sidecar(sidecar)
         missing = required - compiled
-        if not missing:
+        if _reuse_current_binary():
             # Another writer beat us inside the critical section.
             return False
 
         sys.stderr.write(
-            f"[opus _ensure_kids_compiled] need to add {len(missing)} kids "
-            f"to sidecar (existing={len(compiled)}, target={len(compiled | required)})\n"
-        )
-
-        # Persist the expanded set.
-        new_set = sorted(compiled | required)
-        os.makedirs(os.path.dirname(sidecar), exist_ok=True)
-        with open(sidecar, "w") as f:
-            json.dump(new_set, f)
-        sys.stderr.write(
-            f"[opus _ensure_kids_compiled] wrote sidecar at {sidecar} with "
-            f"{len(new_set)} kids; triggering build...\n"
+            f"[opus _ensure_kids_compiled] rebuilding with {len(missing)} new kids "
+            f"(existing={len(compiled)}, target={len(compiled | required)})\n"
         )
 
         # Force a JIT rebuild scoped to JUST this build call.
@@ -1025,35 +1176,29 @@ def _ensure_kids_compiled(candidate_kids):
             _mds.clear()
         # Reset rebuilded_list (used by compile_ops to track "we already rebuilt this once in this process").
         _jit_core.rebuilded_list = ["module_aiter_enum"]
-        # Reset the in-process torch JIT extension versioner so the second synchronous rebuild here
-        # (sidecar grew between shape N and N+1...
-        try:
-            import sys as _sys
-
-            for _modname in ("cpp_extension", "aiter.jit.utils.cpp_extension"):
-                _mod = _sys.modules.get(_modname)
-                if _mod is None:
-                    continue
-                _jev = getattr(_mod, "JIT_EXTENSION_VERSIONER", None)
-                if _jev is None:
-                    continue
-                _entries = getattr(_jev, "entries", None)
-                if isinstance(_entries, dict):
-                    _entries.pop("module_deepgemm_opus", None)
-        except Exception:  # noqa: BLE001,S110
-            pass
+        # build_module uses fixed target names and always enters incremental
+        # Ninja checks; no tuner-specific versioner reset is needed.
 
         # Synchronously drive the rebuild in this (parent) process so that mp_tuner's spawn-ed children
         # see a fully-baked .so on disk and...
         _build_exc = None
+        _build_succeeded = False
         try:
             d_args = _jit_core.get_args_of_build("module_deepgemm_opus")
+            # Keep requests in this build invocation: clear_build cannot erase
+            # them, and a concurrent publisher cannot overwrite them. Codegen
+            # unions them with the current canonical seed under the build lock.
+            blob_gen_cmd = (
+                d_args["blob_gen_cmd"]
+                + " --extra_kids "
+                + " ".join(str(kid) for kid in sorted(candidate_kids))
+            )
             _jit_core.build_module(
                 md_name="module_deepgemm_opus",
                 srcs=d_args["srcs"],
                 flags_extra_cc=d_args["flags_extra_cc"],
                 flags_extra_hip=d_args["flags_extra_hip"],
-                blob_gen_cmd=d_args["blob_gen_cmd"],
+                blob_gen_cmd=blob_gen_cmd,
                 extra_include=d_args["extra_include"],
                 extra_ldflags=d_args["extra_ldflags"],
                 verbose=d_args.get("verbose", False),
@@ -1063,9 +1208,13 @@ def _ensure_kids_compiled(candidate_kids):
                 third_party=d_args.get("third_party", []),
                 hipify=d_args.get("hipify", False),
                 flags_extra_hip_per_source=d_args.get("flags_extra_hip_per_source", {}),
+                # A runtime builder may hold the module lock without our extra
+                # kids. Waiting for it is not evidence that our request ran.
+                build_after_wait=True,
             )
             if "module_deepgemm_opus" not in _jit_core.rebuilded_list:
                 _jit_core.rebuilded_list.append("module_deepgemm_opus")
+            _build_succeeded = True
         except Exception as exc:  # noqa: BLE001
             _build_exc = exc
             import traceback
@@ -1089,9 +1238,9 @@ def _ensure_kids_compiled(candidate_kids):
             # Restore in-process flag for the parent (mp_tuner children
             # spawn from os.environ, not from this in-process value).
             _jit_core.AITER_REBUILD = _prev_rebuild
-            # For children: if build succeeded, force AITER_REBUILD=0 in env so spawned workers go straight
-            # to dlopen(); if build failed, res...
-            if _build_exc is None:
+            # Clear the child flag only after success. KeyboardInterrupt and
+            # SystemExit bypass the Exception handler but must restore it too.
+            if _build_succeeded:
                 os.environ["AITER_REBUILD"] = "0"
             else:
                 if _prev_rebuild_env is None:
@@ -1102,9 +1251,8 @@ def _ensure_kids_compiled(candidate_kids):
         if _build_exc is not None:
             raise RuntimeError(
                 "opus_gemm subset-compile rebuild failed; see hipcc / "
-                "codegen error in stderr above. The expanded sidecar "
-                "has already been written (rerun will pick up where "
-                "this left off)."
+                "codegen error in stderr above. The successful sidecar "
+                "has not been advanced; rerun to retry the requested kids."
             ) from _build_exc
 
         return True
@@ -1149,6 +1297,7 @@ a16w16_all_kernels = {
     **gfx1250_kernels_list,
     **gfx1250_clusterlaunch_kernels_list,
     **gfx1250_splitk_fuse_kernels_list,
+    **gfx1250_4wave_co_kernels_list,
 }
 
 # Arch-filter the kid enumeration so the tuner only dispatches kids whose pipeline body has a
@@ -2000,9 +2149,9 @@ class OpusGemmA16W16Tuner(GemmCommonTuner):
             opus_candidate_kids |= shape_cands
         if opus_candidate_kids and _ensure_kids_compiled(opus_candidate_kids):
             logger.info(
-                f"opus_gemm_tune: expanded subset-compile sidecar to cover "
+                f"opus_gemm_tune: synchronously rebuilt the module to cover "
                 f"{len(opus_candidate_kids)} candidate kids; "
-                f"module_deepgemm_opus will rebuild on next call."
+                f"module_deepgemm_opus is ready for spawned workers."
             )
 
         # mp_tuner.worker calls `run_perftest(func, *args, **kwargs)` with the func/kwargs we provide here.

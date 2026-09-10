@@ -3,7 +3,7 @@
 #include "rocm_ops.hpp"
 #include "torch/mha_varlen_bwd.h"
 
-PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
+PYBIND11_MODULE(AITER_EXTENSION_NAME, m)
 {
     MHA_VARLEN_BWD_PYBIND;
 }

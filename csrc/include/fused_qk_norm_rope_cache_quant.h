@@ -54,7 +54,8 @@ void fused_qk_norm_rope_cache_pts_quant_shuffle(aiter_tensor_t& qkv,
                                                 bool use_shuffle_layout,
                                                 int64_t block_size,
                                                 int64_t x,
-                                                int64_t rotary_dim = 0);
+                                                int64_t rotary_dim = 0,
+                                                bool v_norm        = false);
 
 void fused_qk_norm_rope_2way(aiter_tensor_t& q0,
                              aiter_tensor_t& k0,
