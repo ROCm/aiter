@@ -5,7 +5,7 @@
 
 Supported: fp8 KV cache (OCP e4m3), fp8 weight in either row-major or
 ``shuffle_weight((16,16))`` layout, per-output-row *or* 128x128 block weight
-scale, per-tensor activation scale, page_size 1, bf16 outputs, gfx950.
+scale, per-tensor activation scale, page_size 1, bf16 or scaled fp8 outputs, gfx950.
 """
 
 import functools
@@ -98,6 +98,7 @@ def compile_gather_kv_b_proj(
     xcd_swizzle: int,
     weight_preshuffle: bool,
     per_row_scale: bool,
+    output_fp8: bool = False,
 ):
     """Compile (and memoize) a gather+proj launcher."""
     _validate(
@@ -116,6 +117,7 @@ def compile_gather_kv_b_proj(
         xcd_swizzle=int(xcd_swizzle),
         weight_preshuffle=bool(weight_preshuffle),
         per_row_scale=bool(per_row_scale),
+        output_fp8=bool(output_fp8),
     )
 
 
@@ -154,8 +156,8 @@ def gather_kv_b_proj_flydsl(
     kv_prefix_sum_context_lens: Tensor,  # unused, see kv_indptr
     kv_proj_weight: Tensor,  # [n_heads*256, 512] fp8, shuffle_weight(w, (16,16))
     kv_proj_scale: Tensor,  # [n_heads*256] or [n_heads*256, 1] fp32, per-row
-    k_prefix: Tensor,  # [total_kv, n_heads, 192] bf16, written in place
-    v_prefix: Tensor,  # [total_kv, n_heads, 128] bf16, written in place
+    k_prefix: Tensor,  # [total_kv, n_heads, 192] bf16 or fp8, written in place
+    v_prefix: Tensor,  # [total_kv, n_heads, 128] bf16 or fp8, written in place
     *,
     num_tokens: int | None = None,
     weight_preshuffle: bool = True,
@@ -163,8 +165,20 @@ def gather_kv_b_proj_flydsl(
     block_m: int = 256,
     waves_per_eu: int = 2,
     xcd_swizzle: int | None = None,
+    k_out_scale: Tensor | None = None,
+    v_out_scale: Tensor | None = None,
 ) -> None:
     """Fused gather + kv_b_proj + rope copy. Writes k_prefix / v_prefix in place.
+
+    For fp8 outputs, ``k_out_scale`` and ``v_out_scale`` are required fp32
+    single-element device tensors containing positive, finite *descales*:
+    ``out = saturate_e4m3(projection / out_scale)`` and the consumer reconstructs
+    ``out.float() * out_scale``. K's scale also applies to its RoPE columns.
+    Scaling/conversion happens directly from fp32 in the epilogue, with no
+    intermediate bf16 output or amax/quantization launch. The caller chooses
+    the scales (for example from calibration); this is not dynamic quantization.
+    Scale values are not copied to the host or checked at runtime, so this API
+    remains graph-capture safe. BF16 outputs must omit both output scales.
 
     ``kv_indptr`` and ``kv_prefix_sum_context_lens`` are accepted but unused --
     with page_size 1 the output row index *is* the token index, which is why the
@@ -222,8 +236,32 @@ def gather_kv_b_proj_flydsl(
             f"[FlyDSL gather_kv_b_proj] outputs must be 3-D, got "
             f"{tuple(k_prefix.shape)}, {tuple(v_prefix.shape)}"
         )
-    if k_prefix.dtype != torch.bfloat16 or v_prefix.dtype != torch.bfloat16:
-        raise ValueError("[FlyDSL gather_kv_b_proj] outputs must be bf16")
+    output_fp8 = k_prefix.dtype == torch.float8_e4m3fn
+    if (
+        k_prefix.dtype not in (torch.bfloat16, torch.float8_e4m3fn)
+        or v_prefix.dtype != k_prefix.dtype
+    ):
+        raise ValueError(
+            "[FlyDSL gather_kv_b_proj] outputs must both be bf16 or float8_e4m3fn"
+        )
+    for name, t in (("k_prefix", k_prefix), ("v_prefix", v_prefix)):
+        if not t.is_contiguous() or t.device != k_buffer.device:
+            raise ValueError(
+                f"[FlyDSL gather_kv_b_proj] {name} must be contiguous and on the cache device"
+            )
+    for name, t in (("k_out_scale", k_out_scale), ("v_out_scale", v_out_scale)):
+        if output_fp8:
+            if (
+                t is None
+                or t.dtype != torch.float32
+                or t.numel() != 1
+                or t.device != k_buffer.device
+            ):
+                raise ValueError(
+                    f"[FlyDSL gather_kv_b_proj] {name} must be a single fp32 descale on the cache device for fp8 outputs"
+                )
+        elif t is not None:
+            raise ValueError(f"[FlyDSL gather_kv_b_proj] {name} requires fp8 outputs")
 
     total_kv, n_heads, kp_dim = k_prefix.shape
     total_kv_v, n_heads_v, v_dim = v_prefix.shape
@@ -305,6 +343,7 @@ def gather_kv_b_proj_flydsl(
         xcd_swizzle=int(xcd_swizzle),
         weight_preshuffle=bool(weight_preshuffle),
         per_row_scale=bool(per_row_scale),
+        output_fp8=bool(output_fp8),
     )
 
     _run_compiled(
@@ -314,8 +353,10 @@ def gather_kv_b_proj_flydsl(
         _as_i8(kv_proj_weight.contiguous()).view(-1),
         scale.contiguous(),
         k_scale.reshape(-1).to(torch.float32).contiguous(),
-        k_prefix.view(-1),
-        v_prefix.view(-1),
+        _as_i8(k_prefix).view(-1),
+        _as_i8(v_prefix).view(-1),
+        (k_out_scale if output_fp8 else k_scale).reshape(-1),
+        (v_out_scale if output_fp8 else k_scale).reshape(-1),
         m_rows,
         fx.Stream(torch.cuda.current_stream(device=k_buffer.device)),
     )
