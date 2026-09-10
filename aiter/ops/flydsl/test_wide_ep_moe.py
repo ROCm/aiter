@@ -68,7 +68,12 @@ class TestWideEpMoeContext:
 
 
 class TestWideEpMoe:
-    """EP16 quantized dispatch/compute/combine implementation using MORI."""
+    """EP16 quantized dispatch/compute/combine implementation using MORI.
+
+    ``swiglu_limit`` is forwarded to the GEMM1 activation: 0 disables clamping.
+    Pass the model's value explicitly (DSV4-Pro uses 10.0). Keep this setting
+    fixed for the lifetime of the instance, including captured graph replays.
+    """
 
     def __init__(
         self, *, rank, world_size, model_dim, inter_dim, experts, topk, quant,
@@ -124,6 +129,8 @@ class TestWideEpMoe:
         self.activation_dtype = dtypes.fp4x2 if quant == "a4w4" else dtypes.fp8
         self.mega_scheme = mega_scheme
         self.swiglu_limit = float(swiglu_limit)
+        if not self.swiglu_limit >= 0:
+            raise ValueError("swiglu_limit must be non-negative and not NaN")
         self.capacity_mtpr = 1 << (self.mtpr - 1).bit_length()
         self.dev = torch.device("cuda", torch.cuda.current_device())
         self.w1 = w1
@@ -258,6 +265,7 @@ class TestWideEpMoe:
             dispatched.tokens, self.w1, self.w2, dispatched.weights, dispatched.expert_ids,
             expert_mask=self.expert_mask, activation=self.activation,
             gate_mode=self.gate_mode.value, quant_type=QuantType.per_1x32,
+            swiglu_limit=self.swiglu_limit,
             w1_scale=self.w1_scale, w2_scale=self.w2_scale, a1_scale=dispatched.scales,
             num_local_tokens=dispatched.num_tokens[:1].to(dtypes.i32), dtype=torch.bfloat16,
         )
