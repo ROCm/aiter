@@ -34,6 +34,12 @@ _UNTUNED_ONE_BLOCK_DISPATCH_BANDS: _OneBlockDispatchBands = ((None, 20_000),)
 # through 49152 (65536 already loses on k>=2048). Batch 3-8: all modes prefer
 # one through 28672; 32768 only loses on k=2048 stable+values. Large batches
 # keep one-block for occupancy.
+# gfx942 CUDAGraph A/B (same protocol). Multi stays ~23-32us at batch 1-8, so
+# small batches keep one-block past the tight-mode flip. Batch 1-2: unordered
+# k>=2048 prefers one through 40960 (49152 already ~0.95). Batch 3-8: all
+# modes prefer one through 28672; keep 32768 so unordered 8x32768 stays
+# one-block. Batch 16 all-mode last width is 65536. Batch >=17 occupancy beats
+# the launch chain.
 _ONE_BLOCK_DISPATCH_BANDS: dict[str, _OneBlockDispatchBands] = {
     "gfx950": (
         (2, 49_152),
@@ -45,7 +51,12 @@ _ONE_BLOCK_DISPATCH_BANDS: dict[str, _OneBlockDispatchBands] = {
         (128, 131_072),
         (None, _MAX_BUFFER_ROW_ELEMENTS),
     ),
-    "gfx942": _UNTUNED_ONE_BLOCK_DISPATCH_BANDS,
+    "gfx942": (
+        (2, 40_960),
+        (8, 32_768),
+        (16, 65_536),
+        (None, _MAX_BUFFER_ROW_ELEMENTS),
+    ),
     "gfx1250": _UNTUNED_ONE_BLOCK_DISPATCH_BANDS,
 }
 _SHORT_ROWS_1024_THREAD_MAX_ROWS = 256

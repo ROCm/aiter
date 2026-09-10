@@ -9,7 +9,7 @@ import os
 import torch
 
 from ..jit.core import compile_ops
-from ..jit.utils.chip_info import get_cu_num
+from ..jit.utils.chip_info import get_cu_num, get_gfx
 from ..utility import dtypes
 
 
@@ -382,6 +382,14 @@ _FLYDSL_TOPK_PREFILL_DISABLED = os.environ.get(
 _FLYDSL_TOPK_DECODE_DISABLED = os.environ.get(
     "AITER_DISABLE_FLYDSL_TOPK_DECODE", "0"
 ) in ("1", "true", "True", "yes", "YES")
+_FLYDSL_TOPK_HIP_FALLBACK: dict[str, int] = {
+    "gfx942": 128,
+}
+
+
+def _prefer_hip_topk(num_rows: int) -> bool:
+    min_rows = _FLYDSL_TOPK_HIP_FALLBACK.get(get_gfx())
+    return min_rows is not None and num_rows >= min_rows
 
 
 def _should_use_flydsl_topk_prefill(
@@ -395,7 +403,7 @@ def _should_use_flydsl_topk_prefill(
     stride1: int,
     k: int,
 ) -> bool:
-    if _FLYDSL_TOPK_PREFILL_DISABLED:
+    if _FLYDSL_TOPK_PREFILL_DISABLED or _prefer_hip_topk(num_rows):
         return False
     from .flydsl.topk_per_row import is_flydsl_top_k_per_row_prefill_supported
 
@@ -423,7 +431,7 @@ def _should_use_flydsl_topk_decode(
     k: int,
     values: torch.Tensor | None = None,
 ) -> bool:
-    if _FLYDSL_TOPK_DECODE_DISABLED:
+    if _FLYDSL_TOPK_DECODE_DISABLED or _prefer_hip_topk(num_rows):
         return False
     from .flydsl.topk_per_row import is_flydsl_top_k_per_row_decode_supported
 
