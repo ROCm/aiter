@@ -116,7 +116,7 @@ def get_recommended_splits(num_sequences, num_kv_heads, split_kv_blocks=1):
         num_sm, num_sequences * num_kv_heads * split_kv_blocks
     )
     max_context_partition_num *= split_kv_blocks
-    return min(max_context_partition_num, 128)
+    return 128
 
 
 DS_WRITE = gl.constexpr(0x200)
@@ -4661,7 +4661,9 @@ def compile_pa_decode_ps_reduce_flydsl(
                     )
             gpu.barrier()
 
-            return _flydsl_smem_load(red_scratch, arith.constant(0, index=True))
+            result = _flydsl_smem_load(red_scratch, arith.constant(0, index=True))
+            gpu.barrier()
+            return result
 
         if const_expr(max_context_partition_num <= FLYDSL_WARP_SIZE):
             c_part_num = arith.constant(max_context_partition_num, type=T.i32)
