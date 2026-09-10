@@ -5,7 +5,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from . import _get_compiled
+from op_tests.triton_tests.torch_compile import _get_compiled
 
 
 def torch_softmax(x, dim=-1):
