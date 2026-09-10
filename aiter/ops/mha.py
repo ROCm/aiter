@@ -2978,6 +2978,13 @@ def _flash_attn_varlen_forward(
             (hdim_q == 128 and hdim_v == 128)
             or (hdim_q == 192 and hdim_v == 128)
             or (hdim_q == 256 and hdim_v == 256 and is_fmha_v3_fp8())
+            or (
+                hdim_q == 256
+                and hdim_v == 256
+                and q.dtype == dtypes.bf16
+                and get_gfx() == "gfx950"
+                and not causal
+            )
         )
         ret = ret and (nhead_q % nhead_k == 0)
         ret = ret and (not swa)
