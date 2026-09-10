@@ -2,18 +2,18 @@ import torch
 import triton
 import triton.language as tl
 
-from ..gated_delta_rule_utils import (
+from aiter.ops.triton._triton_kernels.gated_delta_rule.gated_delta_rule_utils import (
     IS_AMD,
     RCP_LN2,
     autotune_cache_kwargs,
     gated_delta_rule_autotune_configs,
 )
-from ..utils import (
+from aiter.ops.triton._triton_kernels.gated_delta_rule.utils import (
     GatedDeltaRulePrefillMetadata,
     prepare_chunk_indices,
     prepare_rebased_cu_seqlens,
 )
-from ..utils.op import exp
+from aiter.ops.triton._triton_kernels.gated_delta_rule.utils.op import exp
 
 
 @triton.jit
