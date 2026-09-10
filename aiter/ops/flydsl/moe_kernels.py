@@ -2988,7 +2988,13 @@ def _get_compiled_fused_quant_preshuffle(
 
 
 _ROUTEKS_KSPLIT_GRID_THRESHOLD = 512
-_TOKEN_MULTIDEST_MIN_TOKENS = 4096
+# Below this the route-ksplit kernel wins. Both now split along K, so what is
+# left is that one warp per token cannot fill a grid out of a handful of tokens
+# whatever the split, while one warp per route starts with topk times as many.
+# Measured on DSV4 (7168, topk 6, fp4, gfx1250), route-ksplit vs multidest --
+# 8: 2.44 vs 3.14 us, 32: 3.26 vs 3.04, 64: 3.43 vs 3.09, 256: 6.40 vs 4.15,
+# 512: 10.24 vs 5.90, 4096: 31.85 vs 22.86.
+_TOKEN_MULTIDEST_MIN_TOKENS = 64
 
 
 @functools.cache
@@ -2997,6 +3003,8 @@ def _get_compiled_token_multidest_quant_topk6(
     wmma_rep: int,
     quant_mode: str,
     row_major_scale: bool = False,
+    tdm_hidden_chunks: int = 7,
+    ksplit: int = 1,
 ):
     from aiter.ops.flydsl.kernels.moe_fused_route_quant_scatter import (
         build_moe_token_multidest_quant_topk6_module,
@@ -3007,6 +3015,8 @@ def _get_compiled_token_multidest_quant_topk6(
         wmma_rep=wmma_rep,
         quant_mode=quant_mode,
         row_major_scale=row_major_scale,
+        tdm_hidden_chunks=tdm_hidden_chunks,
+        ksplit=ksplit,
     )
 
 
@@ -3169,11 +3179,22 @@ def flydsl_moe_fused_quant_preshuffle(
                 "token-multidest quant path"
             )
         if use_token_multidest:
+            from aiter.ops.flydsl.kernels.moe_fused_route_quant_scatter import (
+                token_multidest_ksplit,
+                token_multidest_tdm_chunks,
+            )
+
             launch = _get_compiled_token_multidest_quant_topk6(
                 feat_dim=feat_dim,
                 wmma_rep=wmma_rep,
                 quant_mode=quant_mode,
                 row_major_scale=bool(row_major_scale),
+                tdm_hidden_chunks=token_multidest_tdm_chunks(
+                    feat_dim, wmma_rep, quant_mode, token_num
+                ),
+                ksplit=token_multidest_ksplit(
+                    feat_dim, wmma_rep, quant_mode, token_num
+                ),
             )
             token_grid = (token_num + warps_per_block - 1) // warps_per_block
             launch(

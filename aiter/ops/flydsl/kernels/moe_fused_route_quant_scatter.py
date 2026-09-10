@@ -98,6 +98,14 @@ BLOCK_THREADS = 256
 # It only has to exceed any real buffer, and stays under 2 GiB because the
 # descriptor builder sign-extends the size to 64 bits.
 _SCALE_RSRC_MAX_BYTES = 0x7FFFFFFF
+# TDM staging depth for the token-multidest quant, and the token count below
+# which a shallower pipeline is faster (see ``token_multidest_tdm_chunks``).
+_TOKEN_MULTIDEST_TDM_CHUNKS = 7
+_TOKEN_MULTIDEST_SHALLOW_TDM_MAX_TOKENS = 4096
+# Grid width the K-split aims for, and how far it may split to get there. The
+# target is ~4x the 256 CUs of a gfx1250; past it the split stops paying.
+_TOKEN_MULTIDEST_TARGET_BLOCKS = 1024
+_TOKEN_MULTIDEST_MAX_KSPLIT = 14
 ELEMS_PER_LANE = 2  # bf16 columns each lane quantizes -> 1 fp4 byte / 2 fp8 bytes
 LANES_PER_MX_BLOCK = 32 // ELEMS_PER_LANE  # 16 lanes cover one 32-element MX block
 
@@ -1816,12 +1824,61 @@ def _token_multidest_scale_base(
     )
 
 
+def token_multidest_ksplit(
+    feat_dim: int, wmma_rep: int, quant_mode: str, token_num: int
+) -> int:
+    """How many ways to split the row's K groups over ``grid.y``.
+
+    One warp per token gives only ``token_num / warps_per_block`` blocks, so a
+    decode-sized batch leaves most of the GPU idle. Splitting K widens the grid
+    at no extra work, and the measured optimum is simply "enough blocks":
+    every token count from 8 to 32768 is fastest at the split that first brings
+    the grid to about ``_TOKEN_MULTIDEST_TARGET_BLOCKS``, after which the deeper
+    split only multiplies the per-block route setup. Splitting also costs the
+    TDM staging pipeline, which is why it stops once the grid is wide enough.
+    """
+    L = _quant_layout(feat_dim, quant_mode, wmma_rep)
+    grid = -(-token_num // L.warps_per_block)
+    want = -(-_TOKEN_MULTIDEST_TARGET_BLOCKS // max(grid, 1))
+    # Largest divisor of the row that stays within the cap and the target.
+    best = 1
+    for n in range(1, min(want, _TOKEN_MULTIDEST_MAX_KSPLIT) + 1):
+        if L.block_iters % n == 0:
+            best = n
+    return best
+
+
+def token_multidest_tdm_chunks(
+    feat_dim: int, wmma_rep: int, quant_mode: str, token_num: int
+) -> int:
+    """TDM staging depth for ``token_num`` tokens.
+
+    Each chunk costs a ``tensor_wait`` and two CTA barriers, and at low token
+    counts there are too few blocks in flight for other waves to cover them: a
+    shallow pipeline wins until the grid is large enough to hide the deep one.
+    Measured on DSV4 (7168, topk 6, fp4, gfx1250), 2 chunks against 7 --
+    512 tokens 7.31 vs 9.33 us, 2048 10.67 vs 12.22, 4096 16.14 vs 16.86,
+    16384 50.75 vs 46.72.
+
+    Falls back to the deep default whenever the shallow depth does not divide
+    the row evenly, so the geometry constraint stays in one place: the builder's.
+    """
+    L = _quant_layout(feat_dim, quant_mode, wmma_rep)
+    shallow = 2
+    if token_num <= _TOKEN_MULTIDEST_SHALLOW_TDM_MAX_TOKENS and (
+        L.block_iters % shallow == 0 and (feat_dim * 2) % (shallow * 16) == 0
+    ):
+        return shallow
+    return _TOKEN_MULTIDEST_TDM_CHUNKS
+
+
 def build_moe_token_multidest_quant_topk6_module(
     feat_dim: int,
     wmma_rep: int,
     quant_mode: str = "fp4",
     row_major_scale: bool = False,
-    tdm_hidden_chunks: int = 7,
+    tdm_hidden_chunks: int = _TOKEN_MULTIDEST_TDM_CHUNKS,
+    ksplit: int = 1,
 ):
     """Quantize each token once and scatter the result to its six routed rows.
 
@@ -1847,8 +1904,22 @@ def build_moe_token_multidest_quant_topk6_module(
     mx_blocks_per_row = L.mx_blocks_per_row
     rows_per_tile = L.rows_per_tile
     dst_scale_dwords_per_row = L.dst_scale_dwords_per_row
-    block_iters = L.block_iters
+    row_iters = L.block_iters
     amax_shuffle_dists = L.amax_shuffle_dists
+    # One warp per token only reaches token_num/warps_per_block blocks, which
+    # starves the CUs at decode-sized batches. Splitting the row's K groups over
+    # grid.y restores the parallelism without restoring the per-route requant:
+    # an MX block scale covers 32 contiguous elements, so K slices are wholly
+    # independent -- no cross-block reduction, only a wider grid.
+    if row_iters % ksplit:
+        raise ValueError(
+            f"ksplit={ksplit} must divide the row's {row_iters} wave iterations"
+        )
+    block_iters = row_iters // ksplit
+    # The staged chunks are a pipeline over the *block's* iterations, and a
+    # split block has too few left to pay for one.
+    if ksplit > 1:
+        tdm_hidden_chunks = 0
     if tdm_hidden_chunks and (
         block_iters % tdm_hidden_chunks or (feat_dim * 2) % (tdm_hidden_chunks * 16)
     ):
@@ -1869,6 +1940,7 @@ def build_moe_token_multidest_quant_topk6_module(
         f"{'_scpk' if scale_pack_dwords else ''}"
         f"{'_scv4' if scale_vec4 else ''}"
         f"{f'_hidtdm{tdm_hidden_chunks}' if tdm_hidden_chunks else ''}"
+        f"{f'_ks{ksplit}' if ksplit > 1 else ''}"
     )
 
     @flyc.kernel(name=module_name, known_block_size=[BLOCK_THREADS, 1, 1])
@@ -2065,6 +2137,11 @@ def build_moe_token_multidest_quant_topk6_module(
                 hidden_slot_bytes=hslot,
                 scale_pack_dwords=scale_pack_dwords,
                 scale_vec4=scale_vec4,
+                mx_group_base=(
+                    fx.Uint32(fx.block_idx.y) * arith.constant(block_iters, type=i32)
+                    if const_expr(ksplit > 1)
+                    else None
+                ),
             )
             _emit_quant_block_loop(qc)
 
@@ -2081,7 +2158,11 @@ def build_moe_token_multidest_quant_topk6_module(
         token_multidest_kernel(
             hidden, grouped_payload, grouped_scale, topids_to_rows, token_num
         ).launch(
-            grid=(arith.index_cast(T.index, grid_blocks), 1, 1),
+            grid=(
+                arith.index_cast(T.index, grid_blocks),
+                arith.index_cast(T.index, arith.constant(ksplit, type=T.i32)),
+                1,
+            ),
             block=(BLOCK_THREADS, 1, 1),
             stream=stream,
         )
