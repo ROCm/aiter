@@ -31,7 +31,6 @@ import sys
 import time
 
 import torch
-
 from tune_gemm_mx_a6w4 import BATCH_SIZES, SHAPES
 
 ITERS, WARMUP = 20, 5
@@ -146,7 +145,8 @@ def main() -> int:
                                       for p in order if p != "bf16"))
         print(f"{'M':>5} " + " ".join(f"{p:>10}" for p in order))
         for M in BATCH_SIZES:
-            us = {p: _bench(lambda p=p, M=M: runners[p](M)) for p in order}
+            us = {p: _bench(lambda p=p, M=M, runners=runners: runners[p](M))
+                  for p in order}
             fastest = min(us, key=us.get)
             cells = []
             for p in order:

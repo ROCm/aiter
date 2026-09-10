@@ -44,6 +44,33 @@ SHAPES = [
     ("q38.o_proj", 5120, 6144),
     ("q38.gate_up", 34816, 5120),
     ("q38.down", 5120, 17408),
+    # Shapes aiter already tunes for in the nearest MX sibling table,
+    # a4w4_blockscale_untuned_gemm.csv (same MXFP4 weight family), that satisfy
+    # this kernel's N%64 / K%256 constraints. Kept in the same table so a6w4 is
+    # tuned over the same shape set as a4w4 rather than a private one.
+    ("dsv3.kv_a", 576, 7168),
+    ("dsv3.q_a", 1536, 7168),
+    ("dsv3.qkv_a", 2112, 7168),
+    ("dsv3.o_proj", 7168, 256),
+    ("dsv3.gate_up", 512, 7168),
+    ("l405b.qkv", 1280, 8192),
+    ("l405b.o_proj", 8192, 1024),
+    ("l405b.mlp", 16384, 16384),
+    ("l405b.down", 16384, 53248),
+    ("l405b.gate_up", 18432, 16384),
+    ("l405b.vocab", 106496, 16384),
+    # Remaining same-family pairs, from the per-model a4w4_blockscale tables
+    # (dsv3, kimik3, q3vl). Same MXFP4 weights, so the same shapes matter here.
+    ("dsv3.down", 7168, 4608),
+    ("dsv3.up", 9216, 7168),
+    ("kimik3.o_proj", 7168, 3584),
+    ("kimik3.gate_up", 3584, 7168),
+    ("q3vl.qkv", 1280, 4096),
+    ("q3vl.gate_up_s", 2304, 4096),
+    ("q3vl.o_proj", 4096, 1024),
+    ("q3vl.down_s", 4096, 2048),
+    ("q3vl.gate_up", 4608, 4096),
+    ("q3vl.up", 9216, 4096),
 ]
 BATCH_SIZES = [1, 2, 4, 8, 16, 32, 64, 128, 256, 512]
 TILES = list(itertools.product((32, 64, 128, 256), (64, 128, 256), (128, 256)))
@@ -62,6 +89,26 @@ def _bench(fn) -> float:
         torch.cuda.synchronize()
         best = min(best, (time.perf_counter() - t0) / ITERS * 1e6)
     return best
+
+
+def _out_path() -> str:
+    """The canonical table, i.e. AITER_CONFIG_GEMM_A6W4 -- deliberately not
+    AITER_CONFIGS.AITER_CONFIG_GEMM_A6W4_FILE, which may resolve to a merged
+    copy under /tmp when model_configs/ tables are present."""
+    from aiter.jit.core import AITER_CONFIG_GEMM_A6W4
+
+    return os.path.normpath(AITER_CONFIG_GEMM_A6W4)
+
+
+def _write(rows) -> None:
+    with open(_out_path(), "w", newline="") as fh:
+        # lineterminator: csv.writer defaults to CRLF, and every other table in
+        # aiter/configs/ is LF.
+        wr = csv.writer(fh, lineterminator="\n")
+        wr.writerow(["gfx", "cu_num", "M", "N", "K", "a_dtype", "tile_m",
+                     "tile_n", "tile_k", "us", "tflops",
+                     "gain_vs_heuristic_pct"])
+        wr.writerows(rows)
 
 
 def main() -> int:
@@ -93,7 +140,11 @@ def main() -> int:
             quant = {M: bg.quant_mx_act(x_max[:M].contiguous(), a_dtype)
                      for M in BATCH_SIZES}
 
-            def run(M, tiles):
+            # Every free variable here is a loop variable, so bind them as
+            # defaults: a late-binding closure would silently benchmark the
+            # last shape/dtype of the sweep for every earlier one.
+            def run(M, tiles, quant=quant, w_codes=w_codes,
+                    w_scales=w_scales, N=N, a_dtype=a_dtype):
                 a_codes, a_scales = quant[M]
                 return bg.flydsl_gemm_mxfp4(
                     a_codes, w_codes, a_scales, w_scales, N, torch.bfloat16,
@@ -107,8 +158,8 @@ def main() -> int:
                 try:  # one compile per (N, K, tiles, a_dtype)
                     run(BATCH_SIZES[-1], tiles)
                     torch.cuda.synchronize()
-                except Exception:  # noqa: BLE001
-                    continue
+                except Exception:  # noqa: BLE001,S112
+                    continue  # tile combo this shape/dtype cannot compile
                 for M in BATCH_SIZES:
                     us = _bench(lambda M=M, tiles=tiles: run(M, tiles))
                     if us < best[M][0]:
@@ -122,7 +173,7 @@ def main() -> int:
                 if tiles == heur:
                     dropped += 1
                     continue
-                h_us = _bench(lambda: run(M, heur))
+                h_us = _bench(lambda M=M, heur=heur: run(M, heur))
                 gain = (h_us / us - 1) * 100
                 if gain <= args.keep_pct:
                     dropped += 1
@@ -131,27 +182,19 @@ def main() -> int:
                              f"{2 * M * N * K / (us / 1e6) / 1e12:.2f}",
                              f"{gain:.1f}"])
             print(f"  {label:<20} {a_dtype}  kept so far {len(kept)}", flush=True)
+        # Checkpoint after each shape: the full sweep is hours of JIT
+        # compilation, and losing all of it to a timeout is not worth the
+        # handful of writes this costs.
+        if not args.dry_run:
+            _write(sorted(kept, key=lambda r: (r[5], r[3], r[4], r[2])))
 
     kept.sort(key=lambda r: (r[5], r[3], r[4], r[2]))
     print(f"\nkept {len(kept)} rows (>{args.keep_pct}% over heuristic), "
           f"dropped {dropped}")
     if args.dry_run:
         return 0
-    # The canonical table, i.e. AITER_CONFIG_GEMM_A6W4 -- deliberately not
-    # AITER_CONFIGS.AITER_CONFIG_GEMM_A6W4_FILE, which may resolve to a merged
-    # copy under /tmp when model_configs/ tables are present.
-    from aiter.jit.core import AITER_CONFIG_GEMM_A6W4
-
-    out = os.path.normpath(AITER_CONFIG_GEMM_A6W4)
-    with open(out, "w", newline="") as fh:
-        # lineterminator: csv.writer defaults to CRLF, and every other table in
-        # aiter/configs/ is LF.
-        wr = csv.writer(fh, lineterminator="\n")
-        wr.writerow(["gfx", "cu_num", "M", "N", "K", "a_dtype", "tile_m",
-                     "tile_n", "tile_k", "us", "tflops",
-                     "gain_vs_heuristic_pct"])
-        wr.writerows(kept)
-    print(f"wrote {out}")
+    _write(kept)
+    print(f"wrote {_out_path()}")
     return 0
 
 
