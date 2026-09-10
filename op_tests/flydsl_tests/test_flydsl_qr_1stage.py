@@ -187,7 +187,7 @@ def _run_rank(args) -> None:
             failures.append(f"run-ahead loop: {bad} bad checks of {checks}")
     else:
         for m, hidden in zip(args.tokens, args.hiddens, strict=True):
-            failures += _check(m, hidden, f"{m}x{hidden}")
+            failures.append(_check(m, hidden, f"{m}x{hidden}"))
 
     gathered = [None] * args.tp
     dist.all_gather_object(gathered, failures)
@@ -208,7 +208,7 @@ def _spawn(
     fanout: str = DEFAULT_FANOUT,
     mode: str = "shapes",
     iters: int = RUN_AHEAD_ITERS,
-) -> list[list[str]]:
+) -> list:
     if world_size not in SUPPORTED_WORLDS:
         raise ValueError(f"unsupported world_size={world_size}")
     n_gpu = torch.cuda.device_count()
@@ -291,11 +291,38 @@ def _spawn(
     return ranks
 
 
+# One `_spawn` call per group of shapes that share every axis baked
+# into the compiled kernel as a Python-level constant.
+_BATCH_CACHE: dict[tuple, dict[tuple[int, int], list]] = {}
+
+
+def _index_by_shape(ranks: list, pairs: list[tuple[int, int]]) -> dict[tuple[int, int], list]:
+    """Reshape `_spawn`'s per-rank, per-shape bad-lists into a per-shape view.
+
+    ``ranks[r]`` holds one bad-list per pair, in ``pairs`` order (``_run_rank``'s
+    "shapes" branch appends in that order). Slicing out one shape's bad-list
+    from every rank reproduces exactly what a single-shape ``_spawn`` call
+    would have returned for that rank.
+    """
+    return {pair: [rank_shapes[i] for rank_shapes in ranks] for i, pair in enumerate(pairs)}
+
+
+def _batch_cache_lookup(key: tuple, pairs: list[tuple[int, int]]) -> dict:
+    """One ``_spawn`` call per `key`, all shapes computed at once."""
+    if key not in _BATCH_CACHE:
+        ranks = _spawn(key[0], pairs)
+        _BATCH_CACHE[key] = _index_by_shape(ranks, pairs)
+    return _BATCH_CACHE[key]
+
+
 @pytest.mark.parametrize("world_size", SUPPORTED_WORLDS)
 @pytest.mark.parametrize("m,hidden,label", _SHAPE_CASES)
 def test_qr_1stage_sqnr_and_bitidentity(m, hidden, label, world_size):
-    ranks = _spawn(world_size, [(m, hidden)])
-    for rank, bad in enumerate(ranks):
+    """Every shape in `_SHAPE_CASES` rides one spawn per world_size -- see `_batch_cache_lookup`."""
+    group_pairs = [(mm, hh) for mm, hh, _ in _SHAPE_CASES]
+    batch = _batch_cache_lookup((world_size, "shapes"), group_pairs)
+    bad_per_rank = batch[(m, hidden)]
+    for rank, bad in enumerate(bad_per_rank):
         assert not bad, f"{label}, tp={world_size}, rank {rank}: " + "; ".join(bad)
 
 
@@ -328,7 +355,12 @@ def main():
     ranks = _spawn(
         args.tp, pairs, atoms=args.atoms, grid_cap=args.grid_cap, fanout=args.fanout
     )
-    failures = [f"rank {r}: {bad}" for r, bad in enumerate(ranks) if bad]
+    failures = [
+        f"rank {r}: {bad}"
+        for r, shape_bads in enumerate(ranks)
+        for bad in shape_bads
+        if bad
+    ]
 
     run_ahead_ranks = _spawn(
         args.tp,

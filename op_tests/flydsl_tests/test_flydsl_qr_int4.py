@@ -408,6 +408,32 @@ def _spawn(
     return ranks
 
 
+# Run multiple cases in a single spawn and cache the results.
+# This means that the first test execution takes a long time and the rest are fast.
+_BATCH_CACHE: dict[tuple, dict[tuple[int, int], list[list[dict]]]] = {}
+
+
+def _index_by_shape(
+    ranks: list[list[dict]], pairs: list[tuple[int, int]]
+) -> dict[tuple[int, int], list[list[dict]]]:
+    """Reshape `_spawn`'s per-rank row list into a per-shape view.
+
+    ``ranks[r]`` holds one row per pair, in ``pairs`` order (``_run_rank``'s
+    loop appends in that order). Slicing out one shape's row from every rank
+    reproduces exactly the ``ranks`` shape a single-shape ``_spawn`` call
+    would have returned, so ``_assert_sqnr``/``_assert_exact`` need no changes.
+    """
+    return {pair: [[rank_rows[i]] for rank_rows in ranks] for i, pair in enumerate(pairs)}
+
+
+def _batch_cache_lookup(key: tuple, pairs: list[tuple[int, int]], **spawn_kwargs) -> dict:
+    """One ``_spawn`` call per `key`, memoized for the rest of the pytest session."""
+    if key not in _BATCH_CACHE:
+        ranks = _spawn(key[0], pairs, **spawn_kwargs)
+        _BATCH_CACHE[key] = _index_by_shape(ranks, pairs)
+    return _BATCH_CACHE[key]
+
+
 def _assert_sqnr(
     ranks: list[list[dict]],
     *,
@@ -456,8 +482,16 @@ def _assert_sqnr(
 @pytest.mark.parametrize("algorithm", ("mesh", "ring"))
 @pytest.mark.parametrize("world_size,tokens,hidden,label", _PYTEST_CASES)
 def test_qr_int4_sqnr_vs_fp32_allreduce(world_size, tokens, hidden, label, algorithm):
-    """Shipping configuration: no codec pinned, so the per-N default applies."""
-    ranks = _spawn(world_size, [(tokens, hidden)], time_it=False, algorithm=algorithm)
+    """Shipping configuration: no codec pinned, so the per-N default applies.
+
+    Every case here that shares (world_size, algorithm) rides one spawn --
+    see ``_batch_cache_lookup``.
+    """
+    group_pairs = [(t, h) for ws, t, h, _ in _PYTEST_CASES if ws == world_size]
+    batch = _batch_cache_lookup(
+        (world_size, "sqnr", algorithm), group_pairs, time_it=False, algorithm=algorithm
+    )
+    ranks = batch[(tokens, hidden)]
     _assert_sqnr(
         ranks,
         tokens=tokens,
@@ -481,9 +515,11 @@ def test_qr_int4_ring_tp8_int4_codec(tokens, hidden, label):
     -- INT4 at TP8 is ~3 dB under that by construction, which is the whole
     reason the default is INT6 there.
     """
-    ranks = _spawn(
-        8, [(tokens, hidden)], time_it=False, algorithm="ring", codec="int4"
+    group_pairs = [(t, h) for ws, t, h, _ in _PYTEST_CASES if ws == 8]
+    batch = _batch_cache_lookup(
+        (8, "ring_int4_tp8"), group_pairs, time_it=False, algorithm="ring", codec="int4"
     )
+    ranks = batch[(tokens, hidden)]
     row = _assert_sqnr(
         ranks,
         tokens=tokens,
@@ -588,10 +624,17 @@ def test_qr_transport_bit_exact(
     world_size, tokens, hidden, super_tile, label, algorithm
 ):
     """fp16 wire, exact-grid input: bit-identical to the fp32 reference.
+
+    Grouped by (world_size, algorithm, super_tile) -- a pinned super_tile is a
+    Python-level kernel constant here, so it has to be part of the batch key
+    alongside world_size/algorithm (see ``_batch_cache_lookup``).
     """
-    ranks = _spawn(
-        world_size,
-        [(tokens, hidden)],
+    group_pairs = [
+        (t, h) for ws, t, h, st, _ in _EXACT_CASES if ws == world_size and st == super_tile
+    ]
+    batch = _batch_cache_lookup(
+        (world_size, "bit_exact", algorithm, super_tile),
+        group_pairs,
         time_it=False,
         algorithm=algorithm,
         super_tile=super_tile,
@@ -600,6 +643,7 @@ def test_qr_transport_bit_exact(
         fill="exact",
         pin_super_tile=True,
     )
+    ranks = batch[(tokens, hidden)]
     _assert_exact(
         ranks,
         tokens=tokens,
