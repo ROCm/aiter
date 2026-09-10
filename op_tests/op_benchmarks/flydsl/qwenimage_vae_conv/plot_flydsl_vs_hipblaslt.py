@@ -194,7 +194,9 @@ fig.text(
     0.012,
     f"深色为剪枝器修复后，浅色为修复前；条尾百分比是本次修复的增益，"
     f"「HTI」标记修复后重新选中 half-tile-interleaved 的 shape。"
-    f"17 个 GEMM shape 中 {len(ok)} 个有可用配置，其中 {nwin} 个跑赢 hipBLASLt。",
+    f"17 个 GEMM shape 中 {len(ok)} 个有可用配置，其中 {nwin} 个跑赢 hipBLASLt。"
+    " 每侧为空闲机上四次交替调优取优（原始值见 CSV 的 *_reps 列）：7 提速 0 回退，"
+    "几何平均 1.114×，其中解锁 HTI 的 5 个为 1.174×。",
     color=NEUTRAL,
     fontsize=8,
 )
