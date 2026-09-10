@@ -14,6 +14,26 @@ from .kernels.sparse_mla_decode import BLOCK_I, DIM, DV, H, compile_sparse_mla_p
 from .kernels.tensor_shim import _run_compiled, ptr_arg
 from .mla_reduce_kernels import _flydsl_sparse_mla_decode_combine
 
+_WARM_KEYS: dict[str, set] = {}
+
+
+def _require_warm(key, what: str) -> None:
+    """Refuse to JIT a cold variant inside a graph capture.
+
+    Compiling runs MLIR, hipModuleLoad and disk IO; doing that between
+    capture_begin and capture_end is not legal and does not fail cleanly.
+    Every (seq, width) bucket must be run eagerly once first.
+    """
+    seen = _WARM_KEYS.setdefault(what, set())
+    if key in seen:
+        return
+    if torch.cuda.is_current_stream_capturing():
+        raise RuntimeError(
+            f"sparse MLA decode: {what} variant {key} is not compiled and this "
+            "stream is capturing. Run this shape once outside the capture first."
+        )
+    seen.add(key)
+
 
 def _pick_inner_iter(seq: int, ng_total: int) -> int:
     """Return the producer grouping factor for this shape.
@@ -167,6 +187,7 @@ def _launch_partial(
     n_groups = _partial_groups(ng, inner_iter)
     num_cu = int(torch.cuda.get_device_properties(q.device).multi_processor_count)
     split_major = _use_split_major(int(q.shape[0]), n_groups, num_cu)
+    _require_warm((ng, inner_iter, split_major), "partial")
     launch = compile_sparse_mla_partial(
         ng, inner_iter=inner_iter, split_major=split_major
     )
@@ -179,6 +200,7 @@ def _launch_partial(
         ptr_arg(partial_lse, fx.Float32),
         float(sm_scale) * math.log2(math.e),
         int(q.shape[0]),
+        int(kv.reshape(-1, DIM).shape[0]),
         fx.Stream(torch.cuda.current_stream(q.device)),
     )
 
