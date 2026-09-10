@@ -15,14 +15,18 @@ from flydsl.expr.typing import T
 _NON_WRITER_LANE_OFF = 1 << 30
 
 
-def _i32_buffer(ptr, width=1):
+def _i32_buffer(ptr, width=1, elem_offset=None):
     """OOB-checked global i32 buffer-tensor over ``ptr`` (mirrors a max_size V#).
 
     ``width`` shapes it ``(N, width)`` so a per-``width`` row can be sliced and
     vector-copied; ``width=1`` gives a flat tensor for scalar ``[idx]`` loads.
+    ``elem_offset`` is folded into the 64-bit base pointer before creating the
+    descriptor, keeping subsequent V# offsets below the 32-bit hardware limit.
     """
     src = fx.get_iter(ptr)
     it = fx.recast_iter(fx.PointerType.get(T.i32, src.memspace, 4), src)
+    if elem_offset is not None:
+        it = fx.add_offset(it, fx.Int64(elem_offset))
     if width == 1:
         lay = fx.make_layout((1 << 30,), (1,))
     else:
