@@ -2871,6 +2871,10 @@ def get_2stage_cfgs(
         and q_dtype_a == dtypes.fp4x2
         and isinstance(kernelName2, str)
         and kernelName2.startswith("flydsl_moe2_layout_afp4_")
+        # Only the mixed_moe stage1 honours out_dtype; the mxmoe port always emits
+        # fp4, so rewriting its stage2 to fp8 misreads the intermediate's stride.
+        and isinstance(kernelName1, str)
+        and kernelName1.startswith("flydsl_moe1_")
     ):
         # Keep fp4 activations into gemm1 but hand gemm2 an fp8 intermediate. The v2
         # stage2 a_dtype is what drives stage1's out_dtype, so swapping the name over
