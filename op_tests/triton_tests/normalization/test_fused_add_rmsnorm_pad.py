@@ -45,7 +45,7 @@ def test_mul_add(
     has_res: bool,
     pad_to_multiple: int,
     dtype,
-    backend: str,
+    backend: str | None,
 ):
 
     if backend == "gluon" and get_arch() != "gfx1250":
