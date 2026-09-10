@@ -346,6 +346,7 @@ def gated_rmsnorm_fp8_per_token_quant_reference_impl(
     weight: torch.Tensor,
     eps: float,
     quant_dtype,
+    use_sigmoid: bool = False,
 ):
     """Reference that matches the fused HIP kernel math and per-token quant path."""
     if quant_dtype == torch.float8_e4m3fnuz:
@@ -362,7 +363,10 @@ def gated_rmsnorm_fp8_per_token_quant_reference_impl(
     normed = x.float() * inv_std
     normed = normed * weight.float().view(1, 1, -1)
 
-    gated = normed * silu(z.float())  # [num_tokens, num_heads, head_dim]
+    if use_sigmoid:
+        gated = normed * torch.sigmoid(z.float())
+    else:
+        gated = normed * silu(z.float())  # [num_tokens, num_heads, head_dim]
     flat = gated.reshape(num_tokens, -1)  # [num_tokens, num_heads*head_dim]
 
     # One scale per token across the whole row.
@@ -376,14 +380,14 @@ def gated_rmsnorm_fp8_per_token_quant_reference_impl(
 
 
 @perftest()
-def run_reference(x, z, weight, eps, quant_dtype):
+def run_reference(x, z, weight, eps, quant_dtype, use_sigmoid: bool = False):
     return gated_rmsnorm_fp8_per_token_quant_reference_impl(
-        x, z, weight, eps, quant_dtype
+        x, z, weight, eps, quant_dtype, use_sigmoid
     )
 
 
 @perftest()
-def run_hip(x, z, weight, eps, quant_dtype):
+def run_hip(x, z, weight, eps, quant_dtype, use_sigmoid: bool = False):
     from aiter.ops.gated_rmsnorm_fp8_per_token_quant import (
         gated_rmsnorm_fp8_per_token_quant,
     )
@@ -394,7 +398,7 @@ def run_hip(x, z, weight, eps, quant_dtype):
     )
     scales = torch.empty((num_tokens,), dtype=torch.float32, device=x.device)
 
-    gated_rmsnorm_fp8_per_token_quant(out_quant, scales, x, z, weight, eps)
+    gated_rmsnorm_fp8_per_token_quant(out_quant, scales, x, z, weight, eps, use_sigmoid)
     return out_quant, scales
 
 
@@ -415,6 +419,7 @@ def test_gated_rmsnorm_fp8_per_token_quant(
     dtype: torch.dtype,
     eps: float = 1e-6,
     quant_dtype=dtypes.fp8,
+    use_sigmoid: bool = False,
 ):
     torch.manual_seed(42)
     device = "cuda"
@@ -430,13 +435,14 @@ def test_gated_rmsnorm_fp8_per_token_quant(
     print("Test Configuration:")
     print(f"  Shape: [{num_tokens}, {num_heads}, {head_dim}]")
     print(f"  dtype: {dtype}, quant_dtype: {quant_dtype}, eps: {eps}")
+    print(f"  use_sigmoid: {use_sigmoid}")
     print(f"{'='*80}")
 
     (ref_quant, ref_scales), ref_time = run_reference(
-        x.clone(), z.clone(), weight, eps, quant_dtype
+        x.clone(), z.clone(), weight, eps, quant_dtype, use_sigmoid
     )
     (hip_quant, hip_scales), hip_time = run_hip(
-        x.clone(), z.clone(), weight, eps, quant_dtype
+        x.clone(), z.clone(), weight, eps, quant_dtype, use_sigmoid
     )
 
     ref_bw = calculate_bandwidth_per_token(num_tokens, num_heads, head_dim, ref_time)
@@ -528,15 +534,18 @@ if __name__ == "__main__":
     results = []
     for quant_dtype in quant_dtypes:
         for num_tokens, num_heads, head_dim in test_configs:
-            r = test_gated_rmsnorm_fp8_per_token_quant(
-                num_tokens=num_tokens,
-                num_heads=num_heads,
-                head_dim=head_dim,
-                dtype=dtype,
-                quant_dtype=quant_dtype,
-            )
-            r["quant_dtype"] = str(quant_dtype)
-            results.append(r)
+            for use_sigmoid in [False, True]:
+                r = test_gated_rmsnorm_fp8_per_token_quant(
+                    num_tokens=num_tokens,
+                    num_heads=num_heads,
+                    head_dim=head_dim,
+                    dtype=dtype,
+                    quant_dtype=quant_dtype,
+                    use_sigmoid=use_sigmoid,
+                )
+                r["quant_dtype"] = str(quant_dtype)
+                r["use_sigmoid"] = use_sigmoid
+                results.append(r)
 
     df = pd.DataFrame(results)
     aiter.logger.info(
