@@ -38,8 +38,7 @@ import torch
 import aiter.ops.triton.conv.conv2d as conv2d_module
 from aiter.ops.triton.utils import conv_config_utils
 from aiter.ops.triton.utils._triton.arch_info import get_arch
-
-from ._helpers import (
+from op_tests.triton_tests.conv._helpers import (
     ALL_SUPPORTED_ARCHS,
     ORDERED_METHODS,
     TestSuite,
