@@ -25,7 +25,7 @@ spot-check when the hot loop or wait/reduce path changed.
 
 - [x] 1. Mechanical `fx.*` surface
 - [x] 2. Reuse `tensor_shim._run_compiled`
-- [ ] 3. `atomic_add_f32` without hardcoded LLVM address space
+- [x] 3. `atomic_add_f32` without hardcoded LLVM address space
 - [ ] 4. Single definition path for `const_expr` if/else
 - [ ] 5. Buffer views + layouts for *unpacked* tensors only
 - [ ] Follow-on: preshuffled pack, still `v_dot2` (not this track)
@@ -98,9 +98,9 @@ Replace `llvm.IntToPtrOp` on `!llvm.ptr<1>` with `fx.to_llvm_ptr` /
 `AtomicRMWOp(fadd, syncscope="agent")` if there is still no typed wrapper;
 localize that remaining dialect call.
 
-- [ ] Replace `llvm.IntToPtrOp` / `!llvm.ptr<1>` with `fx.to_llvm_ptr` /
+- [x] Replace `llvm.IntToPtrOp` / `!llvm.ptr<1>` with `fx.to_llvm_ptr` /
       `ptr.llvm_ptr`.
-- [ ] **Done when:** no hardcoded `<1>` / `IntToPtrOp` in this file; split-K
+- [x] **Done when:** no hardcoded `<1>` / `IntToPtrOp` in this file; split-K
       `k_batch > 1` down path still matches the non-split path (same op_test cases).
 
 ### 4. Single definition path for `const_expr` if/else
