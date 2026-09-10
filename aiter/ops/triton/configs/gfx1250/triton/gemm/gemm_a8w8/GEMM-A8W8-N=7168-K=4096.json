@@ -11,14 +11,14 @@
         "cache_modifier": null
     },
     "M_LEQ_64": {
-        "BLOCK_SIZE_M": 32,
-        "BLOCK_SIZE_N": 32,
+        "BLOCK_SIZE_M": 64,
+        "BLOCK_SIZE_N": 16,
         "BLOCK_SIZE_K": 512,
         "GROUP_SIZE_M": 1,
         "NUM_KSPLIT": 1,
         "num_warps": 4,
         "num_stages": 2,
-        "waves_per_eu": 2,
+        "waves_per_eu": 0,
         "cache_modifier": ".cg"
     },
     "any": {
