@@ -6,8 +6,8 @@ import torch
 
 from aiter.jit.utils.chip_info import get_gfx_runtime
 from aiter.ops.triton.kimi_k3_moe_front import (
-    kimi_k3_moe_front_large_m_bf16,
     kimi_k3_moe_front_bf16_epilogue,
+    kimi_k3_moe_front_large_m_bf16,
     merge_kimi_k3_moe_front_weights,
 )
 
