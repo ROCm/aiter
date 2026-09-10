@@ -173,6 +173,12 @@ QK_LAG = 4
 PV_RING = 16
 PV_LAG = 4
 
+# Independent LDS sub-buffers one K (or V) tile is split across. The CALLER places them
+# (_k_lds_bufs/_v_lds_bufs) and the managers read the count off the list length, so this
+# constant never reaches a manager. 1 == today's single contiguous block (IR-identical);
+# >1 lets the halves of a tile be loaded and waited on separately (V2/TDM only).
+KV_LDS_SPLITS = 1
+
 # NOTE: the remaining tiling constants (chunk sizes, K/V write-tile + V swizzle
 # granularity) live inside fmha_b16_buffer_managers.py — they are intrinsic to the
 # managers' LDS layouts, so the kernel no longer declares them here.
@@ -841,6 +847,11 @@ def _core_attention(
     k_blk_bytes = max(k_mgr.get_lds_size_in_byte(), MIN_KV_BLK_BYTES)
     v_blk_bytes = max(v_mgr.get_lds_size_in_byte(), MIN_KV_BLK_BYTES)
     slot_bytes = max(k_blk_bytes + v_blk_bytes, q_mgr.get_lds_size_in_byte())
+    # Splits are spread over the (floored) block, so a split base is >= split_bytes
+    # apart -- a stray immediate lands in padding, not on a neighbour's live rows.
+    assert k_blk_bytes % KV_LDS_SPLITS == 0 and v_blk_bytes % KV_LDS_SPLITS == 0
+    k_split_stride = k_blk_bytes // KV_LDS_SPLITS
+    v_split_stride = v_blk_bytes // KV_LDS_SPLITS
 
     def _k_lds_buf(
         pp,
@@ -853,6 +864,18 @@ def _core_attention(
         if isinstance(pp, int):
             pp = fx.Int32(pp)
         return lds_base + pp * fx.Int32(slot_bytes) + fx.Int32(k_blk_bytes)
+
+    def _split_list(base, stride):  # the KV_LDS_SPLITS sub-buffer bases of one block
+        return [
+            base if s == 0 else base + fx.Int32(s * stride)
+            for s in range(KV_LDS_SPLITS)
+        ]
+
+    def _k_lds_bufs(pp):
+        return _split_list(_k_lds_buf(pp), k_split_stride)
+
+    def _v_lds_bufs(pp):
+        return _split_list(_v_lds_buf(pp), v_split_stride)
 
     # ---- Q staging TIME-SHARES slot 1: Q's LDS base = slot-1 base (kv_base +
     # slot_bytes). Q is loaded + drained into VGPR in the prologue, then dead; the
@@ -938,7 +961,7 @@ def _core_attention(
         # V2: build the TDM copy views for the first tile (pure), run Q part2, then issue
         # the K/V TDM copies and drain with tensor_wait before the prologue barrier.
         k_views = k_mgr.load_views(
-            ptr_lds=_k_lds_buf(start_pp),
+            ptr_lds=_k_lds_bufs(start_pp),
             ptr_K=ptr_K,
             stride_k_seq=stride_k_seq,
             stride_k_head=stride_k_head,
@@ -947,7 +970,7 @@ def _core_attention(
             kv_valid=_kv_valid(start_row0),
         )
         v_views = v_mgr.load_views(
-            ptr_lds=_v_lds_buf(start_pp),
+            ptr_lds=_v_lds_bufs(start_pp),
             ptr_V=ptr_V,
             stride_v_seq=stride_v_seq,
             stride_v_head=stride_v_head,
@@ -1037,10 +1060,10 @@ def _core_attention(
     # swapped curr<->next each iteration (buffer selected by pointer). Base count per mgr
     # is manager-defined (V1: 2, V2: 1) — carried generically. Same machinery for V1/V2;
     # only the global->LDS ISSUE (_addr_phase/_prefetch/_drain) differs. ----
-    k_lds_ld_curr = k_mgr.ds_load_ptrs(ptr_lds=_k_lds_buf(0), lane_idx=lane_idx)
-    v_lds_ld_curr = v_mgr.ds_load_ptrs(ptr_lds=_v_lds_buf(0), lane_idx=lane_idx)
-    k_lds_ld_next = k_mgr.ds_load_ptrs(ptr_lds=_k_lds_buf(1), lane_idx=lane_idx)
-    v_lds_ld_next = v_mgr.ds_load_ptrs(ptr_lds=_v_lds_buf(1), lane_idx=lane_idx)
+    k_lds_ld_curr = k_mgr.ds_load_ptrs(ptr_lds=_k_lds_bufs(0), lane_idx=lane_idx)
+    v_lds_ld_curr = v_mgr.ds_load_ptrs(ptr_lds=_v_lds_bufs(0), lane_idx=lane_idx)
+    k_lds_ld_next = k_mgr.ds_load_ptrs(ptr_lds=_k_lds_bufs(1), lane_idx=lane_idx)
+    v_lds_ld_next = v_mgr.ds_load_ptrs(ptr_lds=_v_lds_bufs(1), lane_idx=lane_idx)
     _NKB = len(k_lds_ld_curr)  # ds bases per K buffer (V1: 2, V2: 1)
     _NVB = len(v_lds_ld_curr)
     _PTR_BASE = len(_init)
@@ -1102,7 +1125,7 @@ def _core_attention(
             # global/LDS pointer lists, for tile t+1's K/V into the nxt_pp buffer.
             if USE_TDM_LOADER:
                 k_views = k_mgr.load_views(
-                    ptr_lds=_k_lds_buf(nxt_pp),
+                    ptr_lds=_k_lds_bufs(nxt_pp),
                     ptr_K=ptr_K,
                     stride_k_seq=stride_k_seq,
                     stride_k_head=stride_k_head,
@@ -1111,7 +1134,7 @@ def _core_attention(
                     kv_valid=nxt_valid,
                 )
                 v_views = v_mgr.load_views(
-                    ptr_lds=_v_lds_buf(nxt_pp),
+                    ptr_lds=_v_lds_bufs(nxt_pp),
                     ptr_V=ptr_V,
                     stride_v_seq=stride_v_seq,
                     stride_v_head=stride_v_head,
