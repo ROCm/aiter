@@ -16,11 +16,10 @@ from __future__ import annotations
 
 import functools
 
-import flydsl.compiler as flyc
 import torch
 
 from aiter.jit.utils.chip_info import get_gfx
-from aiter.ops.flydsl.kernels.tensor_shim import ptr_arg
+from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled, ptr_arg
 from aiter.ops.flydsl.kernels.warp_decode_moe import (
     build_down_reduce_bf16_module,
     build_down_reduce_fp4_module,
@@ -241,16 +240,6 @@ def _auto_split_k_down(
     return 1
 
 
-def _run(launcher, args):
-    """JIT-compile on first call, then dispatch via the cached CompiledFunction."""
-    cf = getattr(launcher, "_cf", None)
-    if cf is None:
-        cf = flyc.compile(launcher, *args)
-        launcher._cf = cf
-    else:
-        cf(*args)
-
-
 def flydsl_warp_decode_gate_up(
     x: torch.Tensor,
     w_gate: torch.Tensor,
@@ -328,19 +317,17 @@ def flydsl_warp_decode_gate_up(
         dot2_acc,
     )
     grid_x = B * TOPK * INTER
-    _run(
+    _run_compiled(
         launcher,
-        (
-            ptr_arg(x),
-            ptr_arg(w_gate),
-            ptr_arg(w_up),
-            ptr_arg(w_gate_scale),
-            ptr_arg(w_up_scale),
-            ptr_arg(router_ids),
-            ptr_arg(out),
-            grid_x,
-            torch.cuda.current_stream(),
-        ),
+        ptr_arg(x),
+        ptr_arg(w_gate),
+        ptr_arg(w_up),
+        ptr_arg(w_gate_scale),
+        ptr_arg(w_up_scale),
+        ptr_arg(router_ids),
+        ptr_arg(out),
+        grid_x,
+        torch.cuda.current_stream(),
     )
     return out
 
@@ -406,20 +393,18 @@ def flydsl_warp_decode_gate_up_fp8act(
         HIDDEN, INTER, TOPK, kvector, serialize_dot2, scale_bn, scale_bk, E
     )
     grid_x = B * TOPK * INTER
-    _run(
+    _run_compiled(
         launcher,
-        (
-            ptr_arg(x),
-            ptr_arg(x_scale),
-            ptr_arg(w_gate),
-            ptr_arg(w_up),
-            ptr_arg(w_gate_scale),
-            ptr_arg(w_up_scale),
-            ptr_arg(router_ids),
-            ptr_arg(out),
-            grid_x,
-            torch.cuda.current_stream(),
-        ),
+        ptr_arg(x),
+        ptr_arg(x_scale),
+        ptr_arg(w_gate),
+        ptr_arg(w_up),
+        ptr_arg(w_gate_scale),
+        ptr_arg(w_up_scale),
+        ptr_arg(router_ids),
+        ptr_arg(out),
+        grid_x,
+        torch.cuda.current_stream(),
     )
     return out
 
@@ -491,19 +476,17 @@ def flydsl_warp_decode_gate_up_fp4(
         HIDDEN, INTER, TOPK, kvector, serialize_dot2, scale_bn, scale_bk, dot2_acc
     )
     grid_x = B * TOPK * INTER
-    _run(
+    _run_compiled(
         launcher,
-        (
-            ptr_arg(x),
-            ptr_arg(w_gate),
-            ptr_arg(w_up),
-            ptr_arg(w_gate_scale),
-            ptr_arg(w_up_scale),
-            ptr_arg(router_ids),
-            ptr_arg(out),
-            grid_x,
-            torch.cuda.current_stream(),
-        ),
+        ptr_arg(x),
+        ptr_arg(w_gate),
+        ptr_arg(w_up),
+        ptr_arg(w_gate_scale),
+        ptr_arg(w_up_scale),
+        ptr_arg(router_ids),
+        ptr_arg(out),
+        grid_x,
+        torch.cuda.current_stream(),
     )
     return out
 
@@ -613,18 +596,16 @@ def flydsl_warp_decode_down_reduce(
         else out
     )
     grid_x = B * (HIDDEN // kh_per_warp) * split_k
-    _run(
+    _run_compiled(
         launcher,
-        (
-            ptr_arg(intermediate),
-            ptr_arg(w_down),
-            ptr_arg(w_down_scale),
-            ptr_arg(router_ids),
-            ptr_arg(router_wts),
-            ptr_arg(y_target),
-            grid_x,
-            torch.cuda.current_stream(),
-        ),
+        ptr_arg(intermediate),
+        ptr_arg(w_down),
+        ptr_arg(w_down_scale),
+        ptr_arg(router_ids),
+        ptr_arg(router_wts),
+        ptr_arg(y_target),
+        grid_x,
+        torch.cuda.current_stream(),
     )
     if split_k > 1:
         out.copy_(y_target)  # FP32 accumulator -> bf16 finalize (v1; fold later)
@@ -680,17 +661,15 @@ def flydsl_warp_decode_gate_up_bf16(
 
     launcher = _get_gate_up_bf16(HIDDEN, INTER, TOPK, kvector, serialize_dot2, use_dot2)
     grid_x = B * TOPK * INTER
-    _run(
+    _run_compiled(
         launcher,
-        (
-            ptr_arg(x),
-            ptr_arg(w_gate),
-            ptr_arg(w_up),
-            ptr_arg(router_ids),
-            ptr_arg(out),
-            grid_x,
-            torch.cuda.current_stream(),
-        ),
+        ptr_arg(x),
+        ptr_arg(w_gate),
+        ptr_arg(w_up),
+        ptr_arg(router_ids),
+        ptr_arg(out),
+        grid_x,
+        torch.cuda.current_stream(),
     )
     return out
 
@@ -750,17 +729,15 @@ def flydsl_warp_decode_down_reduce_bf16(
         INTER, HIDDEN, TOPK, kvector, serialize_dot2, kh_per_warp, use_dot2
     )
     grid_x = B * (HIDDEN // kh_per_warp)
-    _run(
+    _run_compiled(
         launcher,
-        (
-            ptr_arg(intermediate),
-            ptr_arg(w_down),
-            ptr_arg(router_ids),
-            ptr_arg(router_wts),
-            ptr_arg(out),
-            grid_x,
-            torch.cuda.current_stream(),
-        ),
+        ptr_arg(intermediate),
+        ptr_arg(w_down),
+        ptr_arg(router_ids),
+        ptr_arg(router_wts),
+        ptr_arg(out),
+        grid_x,
+        torch.cuda.current_stream(),
     )
     return out
 
@@ -861,18 +838,16 @@ def flydsl_warp_decode_down_reduce_fp4(
         prefetch,
     )
     grid_x = B * (HIDDEN // kh_per_warp)
-    _run(
+    _run_compiled(
         launcher,
-        (
-            ptr_arg(intermediate),
-            ptr_arg(w_down),
-            ptr_arg(w_down_scale),
-            ptr_arg(router_ids),
-            ptr_arg(router_wts),
-            ptr_arg(out),
-            grid_x,
-            torch.cuda.current_stream(),
-        ),
+        ptr_arg(intermediate),
+        ptr_arg(w_down),
+        ptr_arg(w_down_scale),
+        ptr_arg(router_ids),
+        ptr_arg(router_wts),
+        ptr_arg(out),
+        grid_x,
+        torch.cuda.current_stream(),
     )
     return out
 

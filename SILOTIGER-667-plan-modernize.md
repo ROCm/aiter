@@ -24,7 +24,7 @@ gates: op_test with `FLYDSL_RUNTIME_ENABLE_CACHE=0` on GPU 1; plus a G9/667
 spot-check when the hot loop or wait/reduce path changed.
 
 - [x] 1. Mechanical `fx.*` surface
-- [ ] 2. Reuse `tensor_shim._run_compiled`
+- [x] 2. Reuse `tensor_shim._run_compiled`
 - [ ] 3. `atomic_add_f32` without hardcoded LLVM address space
 - [ ] 4. Single definition path for `const_expr` if/else
 - [ ] 5. Buffer views + layouts for *unpacked* tensors only
@@ -86,9 +86,9 @@ Delete the local `_run` in `aiter/ops/flydsl/warp_decode_moe.py`. Import
 `_run_compiled(launcher, *args)` (or the shim’s documented `*args` form) —
 do **not** add a second copy.
 
-- [ ] Delete local `_run`; import `_run_compiled` from `tensor_shim`.
-- [ ] All warp-decode launches go through it.
-- [ ] **Done when:** grep shows a single `_run_compiled` definition (in
+- [x] Delete local `_run`; import `_run_compiled` from `tensor_shim`.
+- [x] All warp-decode launches go through it.
+- [x] **Done when:** grep shows a single `_run_compiled` definition (in
       `tensor_shim.py` only); all warp-decode launches go through it.
 
 ### 3. `atomic_add_f32` without hardcoded LLVM address space
