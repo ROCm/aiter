@@ -2035,6 +2035,410 @@ def test_v4_nm_gqa16_qrope_oob_guardpage():
     )
 
 
+def _assert_bitwise_repeatable(
+    gqa_ratio,
+    kv_seq_lens,
+    batch,
+    num_kv_splits,
+    reps=6,
+    seed=0,
+):
+    """Launch the same decode `reps` times and require bit-identical output.
+
+    The kernel is deterministic by construction: fixed inputs, a fixed split
+    count and a fixed reduction order, so every launch must return the same
+    bits. A divergence means a workgroup consumed state it did not produce —
+    stale LDS, a missing wait, or a racing write — never rounding.
+
+    Tolerance checks cannot stand in for this. A faulting workgroup corrupts
+    one (seq, split) tile, which is ~1% of the elements at these shapes, so
+    cos_diff stays around 4e-05 against the torch reference and every
+    tolerance gate in this file still passes while individual outputs move by
+    more than 0.1 in absolute terms.
+
+    `num_kv_splits` is explicit rather than auto-picked: get_meta_param's
+    choice depends on an occupancy heuristic that may change, and a shape that
+    silently collapses to a single split stops exercising the cross-split path
+    where the corruption was first seen.
+    """
+    assert kv_seq_lens // num_kv_splits >= 32, (
+        f"kv_seq_lens // num_kv_splits = {kv_seq_lens // num_kv_splits} < SUB_KV=32; "
+        "pick a shape whose smallest split holds a full pass."
+    )
+
+    inputs = _build_bf16_inputs(
+        batch=batch,
+        kv_seq_lens=kv_seq_lens,
+        q_seq_logical=1,
+        seed=seed,
+        gqa_ratio=gqa_ratio,
+    )
+    sm_scale = 1.0 / (_QUANT_D**0.5)
+    q_packed, q_rope = _native_to_2buff_for_asm(inputs["q_bf16"])
+    kv_packed, kv_rope = _native_to_2buff_for_asm(inputs["kv_bf16"])
+    q_rope, kv_rope = q_rope.contiguous(), kv_rope.contiguous()
+
+    total_q = inputs["q_bf16"].size(0)
+    num_seqs = inputs["qo_indptr"].size(0) - 1
+    num_heads = NUM_KV_HEADS * gqa_ratio
+    split_indptr = torch.tensor(
+        [i * num_kv_splits for i in range(num_seqs + 1)],
+        dtype=torch.int32,
+        device="cuda",
+    )
+
+    outs = []
+    for _ in range(reps):
+        # Fresh zeroed buffers per rep: reusing them would let a workgroup that
+        # skips its write inherit the previous launch's correct result.
+        output_buf = torch.zeros(
+            (total_q, gqa_ratio, V_HEAD_DIM), dtype=dtypes.bf16, device="cuda"
+        )
+        logits_buf = torch.zeros(
+            (total_q, num_kv_splits, num_heads, V_HEAD_DIM),
+            dtype=dtypes.fp32,
+            device="cuda",
+        )
+        lse_buf = torch.zeros(
+            (total_q, num_kv_splits, num_heads, 1), dtype=dtypes.fp32, device="cuda"
+        )
+        aiter.mla.mla_decode_fwd_v4_nm(
+            q=q_packed,
+            qrope=q_rope,
+            kv_buffer=kv_packed,
+            kvrope=kv_rope,
+            output=output_buf,
+            qo_indptr=inputs["qo_indptr"],
+            kv_indptr=inputs["kv_indptr"],
+            kv_page_indices=inputs["kv_page_indices"],
+            kv_last_page_lens=inputs["kv_last_page_lens"],
+            split_indptr=split_indptr,
+            max_seqlen_q=inputs["max_seqlen_q"],
+            sink=inputs["sink"],
+            sm_scale=sm_scale,
+            out_16_nosplit=0,
+            num_kv_splits=num_kv_splits,
+            logits=logits_buf,
+            attn_lse=lse_buf,
+        )
+        torch.cuda.synchronize()
+        # The wrapper derives out_16_nosplit from the split count (mla.py), so
+        # `output` is the buffer it populated in either regime.
+        outs.append(output_buf.clone())
+
+    ref = outs[0]
+    per_seq = ref[0].numel()
+    for i, out in enumerate(outs[1:], 1):
+        if torch.equal(out, ref):
+            continue
+        differing = (out != ref).reshape(ref.size(0), -1)
+        bad_seqs = torch.nonzero(differing.sum(1)).flatten().tolist()
+        worst = float((out.float() - ref.float()).abs().max())
+        raise AssertionError(
+            f"v4 nm decode is not repeatable at gqa={gqa_ratio} "
+            f"kv_seq_lens={kv_seq_lens} batch={batch} "
+            f"num_kv_splits={num_kv_splits}: launch {i} of {reps} differs from "
+            f"the first.\n"
+            f"  sequences affected: {len(bad_seqs)} of {ref.size(0)} "
+            f"(indices {bad_seqs[:8]}{'...' if len(bad_seqs) > 8 else ''})\n"
+            f"  elements differing: {int(differing.sum())} "
+            f"({per_seq} per sequence)\n"
+            f"  max absolute delta: {worst:.3e}\n"
+            "Whole-tile divergence points at a workgroup reading state it did "
+            "not write; see the kernel's LDS producer/consumer pairing."
+        )
+
+
+@needs_gfx950
+def test_v4_nm_bitwise_repeatability():
+    """Repeated identical decodes must be bit-identical, on the split path.
+
+    batch=288 x 4 splits launches more workgroups than the GPU has CUs, so
+    workgroups get recycled onto a CU that another one just vacated — the
+    condition under which a kernel that reads uninitialised LDS picks up the
+    previous tenant's data. Shapes at or below one workgroup per CU miss it.
+    """
+    _assert_bitwise_repeatable(
+        gqa_ratio=64, kv_seq_lens=1024, batch=288, num_kv_splits=4
+    )
+
+
+@needs_gfx950
+def test_v4_nm_bitwise_repeatability_gqa128():
+    """Same repeatability contract for the gqa=128 entry point.
+
+    gqa=128 launches two workgroups per (seq, split) instead of one, doubling
+    the workgroup count at a given batch and giving the tile a different LDS
+    footprint, so it can expose a race the gqa=64 tiling happens to hide.
+    """
+    _assert_bitwise_repeatable(
+        gqa_ratio=128, kv_seq_lens=1024, batch=288, num_kv_splits=4
+    )
+
+
+def _decode_packed(inputs, q_packed, q_rope, kv_packed, kv_rope, gqa_ratio, splits):
+    """One decode into freshly zeroed buffers; returns the BF16 output tensor."""
+    total_q = inputs["q_bf16"].size(0)
+    num_seqs = inputs["qo_indptr"].size(0) - 1
+    num_heads = NUM_KV_HEADS * gqa_ratio
+    output = torch.zeros(
+        (total_q, gqa_ratio, V_HEAD_DIM), dtype=dtypes.bf16, device="cuda"
+    )
+    logits = torch.zeros(
+        (total_q, splits, num_heads, V_HEAD_DIM), dtype=dtypes.fp32, device="cuda"
+    )
+    lse = torch.zeros((total_q, splits, num_heads, 1), dtype=dtypes.fp32, device="cuda")
+    aiter.mla.mla_decode_fwd_v4_nm(
+        q=q_packed,
+        qrope=q_rope,
+        kv_buffer=kv_packed,
+        kvrope=kv_rope,
+        output=output,
+        qo_indptr=inputs["qo_indptr"],
+        kv_indptr=inputs["kv_indptr"],
+        kv_page_indices=inputs["kv_page_indices"],
+        kv_last_page_lens=inputs["kv_last_page_lens"],
+        split_indptr=torch.tensor(
+            [i * splits for i in range(num_seqs + 1)],
+            dtype=torch.int32,
+            device="cuda",
+        ),
+        max_seqlen_q=inputs["max_seqlen_q"],
+        sink=inputs["sink"],
+        sm_scale=1.0 / (_QUANT_D**0.5),
+        out_16_nosplit=0,
+        num_kv_splits=splits,
+        logits=logits,
+        attn_lse=lse,
+    )
+    torch.cuda.synchronize()
+    # The wrapper derives out_16_nosplit from the split count, so `output` is the
+    # buffer it populated in either regime.
+    return output
+
+
+@needs_gfx950
+def test_v4_nm_packed_byte_ranges():
+    """Each packed-row byte range is read, or ignored, exactly as the layout says.
+
+    Row layout: [ nope 448 fp8 | scale 14 e8m0 | pad 50 ] = 512 B. Bytes 448-461
+    are live; 462-511 are padding the kernel must never touch.
+
+    test_v4_nm_packed_pad_poison already fills the whole padding at once, which
+    cannot tell "reads nothing past 461" from "reads 462 but not 463" — and the
+    shipped bug was exactly a 2-byte over-read into 462/463, where 0xFF is the
+    e8m0 NaN encoding. So the ranges are poisoned separately.
+
+    The scale range is poisoned too, as a liveness control: it MUST change the
+    result. Without it a kernel that ignored the scales entirely would sail
+    through every padding assertion here.
+
+    Comparison is bitwise against an unpoisoned baseline rather than a
+    tolerance, because "the kernel did not read these bytes" admits no drift.
+    """
+    scale_off = _QUANT_D_NOPE  # 448
+    pad_off = _QUANT_D_NOPE + _QUANT_NUM_SCALE_BYTES  # 462
+    inert_ranges = (
+        ("over-read pair 462:464", pad_off, pad_off + 2),
+        ("padding tail 464:512", pad_off + 2, _QUANT_D),
+        ("whole padding 462:512", pad_off, _QUANT_D),
+    )
+    splits = 4
+
+    for gqa in (64, 128):
+        inputs = _build_bf16_inputs(
+            batch=8, kv_seq_lens=1024, q_seq_logical=1, seed=0, gqa_ratio=gqa
+        )
+        q0, q_rope = _native_to_2buff_for_asm(inputs["q_bf16"])
+        kv0, kv_rope = _native_to_2buff_for_asm(inputs["kv_bf16"])
+        q_rope, kv_rope = q_rope.contiguous(), kv_rope.contiguous()
+        base = _decode_packed(inputs, q0, q_rope, kv0, kv_rope, gqa, splits)
+        assert torch.isfinite(base).all(), (
+            f"gqa={gqa}: baseline decode is not finite; the poison comparisons "
+            "below would be meaningless."
+        )
+
+        def poisoned(lo, hi, fill, target):
+            q, kv = q0.clone(), kv0.clone()
+            if target in ("q", "both"):
+                q.view(torch.uint8)[..., lo:hi] = fill
+            if target in ("kv", "both"):
+                kv.view(torch.uint8)[..., lo:hi] = fill
+            return _decode_packed(inputs, q, q_rope, kv, kv_rope, gqa, splits)
+
+        # 0xFF is the e8m0 NaN encoding (the byte pattern that broke the model);
+        # 0xA5 is an arbitrary non-NaN fill, to catch a read that merely skews.
+        for label, lo, hi in inert_ranges:
+            for fill in (0xFF, 0xA5):
+                for target in ("q", "kv", "both"):
+                    out = poisoned(lo, hi, fill, target)
+                    assert torch.isfinite(out).all(), (
+                        f"gqa={gqa}: poisoning {label} of {target} with "
+                        f"0x{fill:02X} produced non-finite output — the kernel "
+                        f"read packed-row bytes [{lo}, {hi}) that are padding."
+                    )
+                    n_diff = int((out != base).sum())
+                    assert n_diff == 0, (
+                        f"gqa={gqa}: poisoning {label} of {target} with "
+                        f"0x{fill:02X} changed {n_diff} of {out.numel()} output "
+                        f"elements (max delta "
+                        f"{float((out.float() - base.float()).abs().max()):.3e}). "
+                        f"Packed-row bytes [{lo}, {hi}) are padding and must not "
+                        "reach the result."
+                    )
+
+        for target in ("q", "kv"):
+            out = poisoned(scale_off, pad_off, 0xFF, target)
+            assert not torch.equal(out, base), (
+                f"gqa={gqa}: poisoning the LIVE scale bytes "
+                f"[{scale_off}, {pad_off}) of {target} left the output "
+                "unchanged. The kernel is not reading the e8m0 scales at all, "
+                "so the padding assertions above prove nothing."
+            )
+
+
+def _cos_diff(a, b):
+    """1 - cosine similarity; 0 when the two tensors point the same way."""
+    a, b = a.float().flatten(), b.float().flatten()
+    return float(1.0 - (a @ b) / (a.norm() * b.norm()).clamp_min(1e-12))
+
+
+def _assert_tail_kv_shape(kv_seq_lens, batch, num_kv_splits, gqa_ratio, reps=4):
+    """Accuracy and repeatability at a kv length with a remainder past the tile.
+
+    The inner loop consumes SUB_KV=32 tokens per pass, so a kv length that is
+    not a multiple of 32 makes every workgroup run a short final pass, and
+    splitting gives each split its own ragged tail. Both the accuracy of that
+    tail and its synchronisation are checked here: a tail that races shows up as
+    run-to-run divergence well before it moves a tolerance.
+
+    The tolerance compare alone would not prove the tail was processed. At
+    kv=1041 the 17 leftover tokens carry ~1.6% of the attention mass, so a
+    kernel that dropped them entirely still lands at an 0.0014 error ratio —
+    inside the 0.02 the check allows. So the result is also compared against a
+    reference built over only the tile-aligned prefix, and the kernel must sit
+    far closer to the full-length reference than to that truncated one. That
+    ratio is ~2000x when the tail is handled and ~1x when it is dropped, which
+    makes it a verdict rather than a threshold to calibrate.
+    """
+    assert kv_seq_lens % 32, f"kv_seq_lens={kv_seq_lens} divides the tile; no tail"
+    assert kv_seq_lens // num_kv_splits >= 32, (
+        f"smallest split = {kv_seq_lens // num_kv_splits} < SUB_KV=32: that "
+        "split drops its tail, which the operator does not support."
+    )
+
+    inputs = _build_bf16_inputs(
+        batch=batch,
+        kv_seq_lens=kv_seq_lens,
+        q_seq_logical=1,
+        seed=0,
+        gqa_ratio=gqa_ratio,
+    )
+    q_packed, q_rope = _native_to_2buff_for_asm(inputs["q_bf16"])
+    kv_packed, kv_rope = _native_to_2buff_for_asm(inputs["kv_bf16"])
+    q_rope, kv_rope = q_rope.contiguous(), kv_rope.contiguous()
+
+    # Same fp8 bytes the kernel reads, so the gap is kernel math, not quant noise.
+    out_ref, _ = _torch_attn_decode_fp8_dequant_ref(
+        q_packed,
+        q_rope,
+        kv_packed,
+        kv_rope,
+        inputs["qo_indptr"],
+        inputs["kv_indptr"],
+        inputs["kv_page_indices"],
+        inputs["kv_last_page_lens"],
+        1.0 / (_QUANT_D**0.5),
+        attn_sink=inputs["sink"],
+    )
+
+    outs = [
+        _decode_packed(
+            inputs, q_packed, q_rope, kv_packed, kv_rope, gqa_ratio, num_kv_splits
+        )
+        for _ in range(reps)
+    ]
+    shape = (
+        f"kv_seq_lens={kv_seq_lens} (tail {kv_seq_lens % 32}) batch={batch} "
+        f"num_kv_splits={num_kv_splits} gqa={gqa_ratio}"
+    )
+    assert torch.isfinite(outs[0]).all(), f"non-finite output at {shape}"
+
+    err = checkAllclose(
+        out_ref.float(),
+        outs[0].float(),
+        rtol=3e-2,
+        atol=3e-2,
+        tol_err_ratio=0.02,
+        msg=f"mla_v4_nm tail shape [fp8_dequant_ref vs asm] {shape}",
+    )
+    assert (err or 0) < 0.02, f"tail-shape accuracy failed at {shape}: err={err}"
+
+    # Reference over the tile-aligned prefix only: what a kernel that skipped
+    # the ragged final pass would converge to.
+    aligned = kv_seq_lens - kv_seq_lens % 32
+    ref_trunc, _ = _torch_attn_decode_fp8_dequant_ref(
+        q_packed,
+        q_rope,
+        kv_packed,
+        kv_rope,
+        inputs["qo_indptr"],
+        torch.arange(batch + 1, dtype=torch.int32, device="cuda") * aligned,
+        torch.cat(
+            [
+                inputs["kv_page_indices"][i * kv_seq_lens : i * kv_seq_lens + aligned]
+                for i in range(batch)
+            ]
+        ),
+        inputs["kv_last_page_lens"],
+        1.0 / (_QUANT_D**0.5),
+        attn_sink=inputs["sink"],
+    )
+    d_full = _cos_diff(out_ref, outs[0])
+    d_trunc = _cos_diff(ref_trunc, outs[0])
+    assert d_trunc > 100 * d_full, (
+        f"tail was not processed at {shape}: the result is {d_full:.3e} from "
+        f"the full-length reference but {d_trunc:.3e} from one truncated to "
+        f"{aligned} tokens. A kernel that handles the {kv_seq_lens % 32}-token "
+        "tail sits orders of magnitude closer to the full reference; these two "
+        "being comparable means the tail was dropped or mis-weighted."
+    )
+
+    for i, out in enumerate(outs[1:], 1):
+        assert torch.equal(out, outs[0]), (
+            f"tail shape is not repeatable at {shape}: launch {i} of {reps} "
+            f"differs from the first in {int((out != outs[0]).sum())} elements "
+            f"(max delta {float((out.float() - outs[0].float()).abs().max()):.3e})."
+        )
+
+
+@needs_gfx950
+def test_v4_nm_kv_tail_not_tile_multiple():
+    """kv lengths with a remainder past the 32-token tile, at several split counts.
+
+    The existing ragged tests vary kv per sequence; this varies the tile
+    remainder instead, and pairs each length with the split counts that stress
+    the tail differently: one split leaves the whole remainder to a single pass,
+    while kv//32 splits hand every split a 32-token slice plus the leftover.
+
+    kv=1041 at 32 splits is the extreme — a 17-token remainder spread across the
+    maximum number of splits the guard allows.
+    """
+    for kv_seq_lens, num_kv_splits in (
+        (34, 1),
+        (102, 3),
+        (200, 6),
+        (1041, 1),
+        (1041, 32),
+    ):
+        _assert_tail_kv_shape(
+            kv_seq_lens=kv_seq_lens,
+            batch=256,
+            num_kv_splits=num_kv_splits,
+            gqa_ratio=64,
+        )
+
+
 if __name__ == "__main__":
     import argparse
     import itertools
