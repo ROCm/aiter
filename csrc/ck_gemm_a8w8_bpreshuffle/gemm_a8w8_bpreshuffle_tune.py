@@ -728,9 +728,7 @@ class GemmA8W8BpreShuffleTuner(GemmCommonTuner):
         # allocation: with -o2 (profile of every candidate) a 42-shape x ~600
         # candidate run spends hours here AFTER all GPU work is done.
         if rows:
-            resultdf = pd.concat(
-                [pd.DataFrame(r) for r in rows], ignore_index=True
-            )
+            resultdf = pd.concat([pd.DataFrame(r) for r in rows], ignore_index=True)
         return resultdf
 
     def run_config(self, args):
