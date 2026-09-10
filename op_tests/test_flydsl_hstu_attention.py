@@ -30,7 +30,13 @@ def _load_torch_hstu_reference():
     try:
         from triton_tests.utils.hstu_attention_ref import torch_hstu_attention
     except ModuleNotFoundError as exc:
-        if exc.name not in {"triton_tests", "op_tests"}:
+        missing = exc.name or ""
+        if not (
+            missing == "triton_tests"
+            or missing.startswith("triton_tests.")
+            or missing == "op_tests"
+            or missing.startswith("op_tests.")
+        ):
             raise
 
         import sys
