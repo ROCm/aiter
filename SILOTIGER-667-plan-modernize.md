@@ -23,7 +23,7 @@ Track here as work lands (leave unchecked until that item is done). Per-subtask
 gates: op_test with `FLYDSL_RUNTIME_ENABLE_CACHE=0` on GPU 1; plus a G9/667
 spot-check when the hot loop or wait/reduce path changed.
 
-- [ ] 1. Mechanical `fx.*` surface
+- [x] 1. Mechanical `fx.*` surface
 - [ ] 2. Reuse `tensor_shim._run_compiled`
 - [ ] 3. `atomic_add_f32` without hardcoded LLVM address space
 - [ ] 4. Single definition path for `const_expr` if/else
@@ -63,19 +63,19 @@ These locks apply to **this track** (subtasks 1–5), not the follow-on.
 
 Replace legacy spellings that the authoring skill already maps 1:1.
 
-- [ ] `fx.thread_idx.x` / `fx.block_idx.x` → `gpu.thread_id("x")` / `gpu.block_id("x")`
+- [x] `fx.thread_idx.x` / `fx.block_idx.x` → `gpu.thread_id("x")` / `gpu.block_id("x")`
       (import `gpu` from `flydsl.expr`).
-- [ ] `wave_reduce_add_f32`: `gpu.ShuffleOp` + `arith.AddFOp` → typed
+- [x] `wave_reduce_add_f32`: `gpu.ShuffleOp` + `arith.AddFOp` → typed
       `fx.Float32` + `.shuffle_xor(fx.Int32(sh), fx.Int32(64))` then `+`. XOR
       butterfly order may stay `(1, 2, 4, 8, 16, 32)` (equivalent to the skill’s
       high-to-low list).
-- [ ] `vector.extract` in `load_i32_words` and `dot2_f32_bf16_scalar` →
+- [x] `vector.extract` in `load_i32_words` and `dot2_f32_bf16_scalar` →
       `fx.Vector(v)[i]`.
-- [ ] Prefer `fx.Vector(...).bitcast(...)` / `fx.Int32(...)` over raw
+- [x] Prefer `fx.Vector(...).bitcast(...)` / `fx.Int32(...)` over raw
       `arith.ExtFOp` / `ExtUIOp` / `ShLIOp` / `ConstantOp` and `llvm.bitcast` where
       a vector or typed numeric already exists. Leave `llvm.inline_asm` for
       `v_dot2`.
-- [ ] **Done when:** no `thread_idx`/`block_idx`/`vector.extract` in the kernel file;
+- [x] **Done when:** no `thread_idx`/`block_idx`/`vector.extract` in the kernel file;
       reduce uses `shuffle_xor`; existing op_test still passes.
 
 ### 2. Reuse `tensor_shim._run_compiled`
