@@ -252,9 +252,11 @@ def atomic_add_f32(ptr, elem_off, val_f32):
     pre-zeroed); ``elem_off`` is the f32 element index; ``val_f32`` the fx.Float32 to
     add.  Mirrors the ``llvm.AtomicRMWOp(fadd, ..., syncscope="agent")`` epilogue used
     by the split-K GEMMs (small_m_hgemm / splitk_hgemm)."""
-    ptr_ty = ir.Type.parse("!llvm.ptr<1>")
     addr = fx.Int64(fx.ptrtoint(ptr)) + fx.Int64(elem_off) * fx.Int64(4)
-    p = llvm.IntToPtrOp(ptr_ty, addr.ir_value()).result
+    ptr_ty = fx.PointerType.get(
+        fx.Float32.ir_type, address_space=fx.AddressSpace.Global, alignment=4
+    )
+    p = fx.to_llvm_ptr(fx.inttoptr(ptr_ty, addr))
     p = p._value if hasattr(p, "_value") else p
     llvm.AtomicRMWOp(
         llvm.AtomicBinOp.fadd,
