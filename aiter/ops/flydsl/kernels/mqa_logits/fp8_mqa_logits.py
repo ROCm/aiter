@@ -212,8 +212,8 @@ def _build_kernel_mfma_r_w(
                     result = result | (cleaned << shift)
                 return result
 
-            lo_64 = fx.Int64(_fix_i32(lo_i32))
-            hi_64 = fx.Int64(_fix_i32(hi_i32)) << 32
+            lo_64 = fx.Int64(fx.Uint32(_fix_i32(lo_i32)))
+            hi_64 = fx.Int64(fx.Uint32(_fix_i32(hi_i32))) << 32
             return (lo_64 | hi_64).ir_value()
 
         # Preload window bounds, Q frags, and weights for all RPB rows.
