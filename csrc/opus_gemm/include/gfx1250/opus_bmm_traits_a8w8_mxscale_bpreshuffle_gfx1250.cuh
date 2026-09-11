@@ -206,6 +206,21 @@ struct opus_bmm_a8w8_mxscale_bpreshuffle_traits_gfx1250 {
     static constexpr int kWarp  = 32;                       // gfx1250 wave size
     static constexpr int kWarpRt = opus::get_warp_size();    // 32 device / 64 host
     static constexpr int kNumWaves = BLOCK_SIZE / kWarp;
+
+    // BLOCK_SIZE ALSO SETS THE VGPR BUDGET, which is easy to miss when sizing a
+    // tile from its fragment count alone. A CU has 4 SIMDs and 1024 VGPRs per
+    // SIMD (wave32), and the busiest SIMD hosts ceil(kNumWaves / 4) waves, so
+    //     per-wave budget = 1024 / ceil(kNumWaves / 4), rounded down to 8
+    // 128 thr (4 waves) -> 1024   192 (6) -> 512   256 (8) -> 512
+    // 320 thr (10 waves) -> 336   384 (12) -> 336
+    // A wave count that does not divide 4 pays the ROUNDED-UP price for
+    // parallelism it does not get: 10 waves buys 2.5 waves/SIMD and is charged
+    // for 3, which is why kid21's 320 threads cap at 336 against the 448 its own
+    // fragment arithmetic asks for -- 1313 VGPR spills, measured. Prefer 128 or
+    // 256; 256 is the sweet spot at 2 waves/SIMD and a 512 budget.
+    //
+    // Every tile that spills today sits exactly at this cap, so read a slow
+    // sweep cell against the budget before blaming the tile shape.
     static constexpr bool kNoSpec = NO_SPEC_;
     // 0 under NO_SPEC_: no dedicated loader waves, every wave computes. Then
     // kNumConsumerWaves == kNumWaves, and the kTileM/kTileN derivation together
@@ -1467,6 +1482,14 @@ using opus_bmm_a8w8_mxscale_bpreshuffle_tile_pf_n256_gfx1250 =
 // VGPR, exactly kid22's footprint, while covering FOUR TIMES kid22's output
 // tile. The same tile on 1x8 costs 544 and is what the earlier kid21 measured
 // at 9x slower.
+//
+// THAT 448 IS NOT AVAILABLE HERE. 320 threads is 10 waves, so the busiest SIMD
+// takes 3 and the budget is 336 (see the kNumWaves block above) -- the shortfall
+// compiles to 1313 VGPR spills. This tile is therefore NOT a clean read on
+// whether the 2D grid pays; it prices the grid and a spilling inner loop
+// together. kid28/30 are the same geometry done inside the budget (8 waves,
+// no producers, 500 VGPR of 512, zero spills), and they are what the blocked
+// heuristic dispatches.
 //
 // B_K is 128, not 256: at slots=3 (the only ring depth the producer implements)
 // a 256x256x256 tile needs 396 KB of LDS against a 320 KB budget. 3*256*144 +
