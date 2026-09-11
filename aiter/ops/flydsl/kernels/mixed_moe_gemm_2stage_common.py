@@ -94,6 +94,42 @@ def _barrier(vmcnt=63, lgkmcnt=63):
 # HEAD generic path uses `barrier`; a16w4 uses `_barrier`.
 barrier = _barrier
 
+_MAX_SIGNED_BUFFER_BYTES = 1 << 31
+
+
+def _check_moe_weight_addressing_limits(
+    *,
+    stage: str,
+    per_expert_w_bytes: int,
+    shared_w_bytes: int,
+    scale_w_bytes: int,
+    shared_scale_w_bytes: int,
+) -> None:
+    if per_expert_w_bytes >= _MAX_SIGNED_BUFFER_BYTES:
+        raise ValueError(
+            f"{stage} routed raw weight per expert is {per_expert_w_bytes} bytes; "
+            f"it must be smaller than {_MAX_SIGNED_BUFFER_BYTES} bytes for signed "
+            "32-bit buffer coordinates"
+        )
+    if shared_w_bytes >= _MAX_SIGNED_BUFFER_BYTES:
+        raise ValueError(
+            f"{stage} shared raw weight is {shared_w_bytes} bytes; "
+            f"it must be smaller than {_MAX_SIGNED_BUFFER_BYTES} bytes for signed "
+            "32-bit buffer coordinates"
+        )
+    if scale_w_bytes >= _MAX_SIGNED_BUFFER_BYTES:
+        raise ValueError(
+            f"{stage} global routed weight scale buffer is {scale_w_bytes} bytes; "
+            f"it must be smaller than {_MAX_SIGNED_BUFFER_BYTES} bytes for signed "
+            "32-bit buffer coordinates"
+        )
+    if shared_scale_w_bytes >= _MAX_SIGNED_BUFFER_BYTES:
+        raise ValueError(
+            f"{stage} global shared weight scale buffer is {shared_scale_w_bytes} bytes; "
+            f"it must be smaller than {_MAX_SIGNED_BUFFER_BYTES} bytes for signed "
+            "32-bit buffer coordinates"
+        )
+
 
 def compile_mixed_moe_gemm1_common(
     *,
@@ -325,6 +361,17 @@ def compile_mixed_moe_gemm1_common(
     w_nbytes = (experts * (2 * inter_dim) * model_dim * w_elem_bytes) // w_elem_pack
     shared_w_nbytes = (2 * inter_dim) * model_dim
     bias_nbytes = experts * (2 * inter_dim) * 4
+    scale_w_nbytes = experts * (2 * inter_dim) * (model_dim // 32)
+    shared_scale_w_nbytes = (
+        ((2 * inter_dim + 255) // 256) * 256 * ((model_dim // 32 + 7) // 8) * 8
+    )
+    _check_moe_weight_addressing_limits(
+        stage="common stage1",
+        per_expert_w_bytes=w_nbytes // experts,
+        shared_w_bytes=shared_w_nbytes if heterogeneous_b else 0,
+        scale_w_bytes=scale_w_nbytes,
+        shared_scale_w_bytes=shared_scale_w_nbytes if heterogeneous_b else 0,
+    )
 
     e_vec_s1 = min(tile_n // 32, 8)
     if need_quant:
@@ -3395,12 +3442,27 @@ def compile_mixed_moe_gemm2_common(
     w_elem_bytes = 1
     w_elem_pack = 2 if is_f4_b else 1
     w_nbytes = (experts * model_dim * inter_dim * w_elem_bytes) // w_elem_pack
+    per_expert_w_bytes = w_nbytes // experts
+    # Small tensors use one global resource. Larger tensors use expert-local
+    # resources once expert offsets can set the sign bit of a 32-bit coordinate.
+    rebase_routed_w = w_nbytes >= (1 << 31)
     shared_w_nbytes = model_dim * inter_dim
     # #3476: host e8m0_shuffle pads scale group-N up to a multiple of 8, i.e.
     # 128- but not 256-aligned (e.g. 384) read OOB scales -> garbage e8m0 -> NaN.
     scale_k_padded = (inter_dim + 255) // 256 * 256
     scale_kblk_padded = scale_k_padded // 32
     bias_nbytes = experts * model_dim * 4
+    scale_w_nbytes = experts * model_dim * scale_kblk_padded
+    shared_scale_w_nbytes = (
+        ((model_dim + 255) // 256) * 256 * ((scale_kblk_padded + 7) // 8) * 8
+    )
+    _check_moe_weight_addressing_limits(
+        stage="common stage2",
+        per_expert_w_bytes=w_nbytes // experts,
+        shared_w_bytes=shared_w_nbytes if heterogeneous_b else 0,
+        scale_w_bytes=scale_w_nbytes,
+        shared_scale_w_bytes=shared_scale_w_nbytes if heterogeneous_b else 0,
+    )
 
     def x_elem_type():
         if const_expr(is_f4_b):
@@ -3645,7 +3707,8 @@ def compile_mixed_moe_gemm2_common(
             x_nbytes_i32 = fx.Int32(x_nbytes_idx)
             x_rsrc = ptr_buffer_resource(arg_x, x_nbytes_i32)
 
-            w_rsrc = ptr_buffer_resource(arg_w, w_nbytes)
+            if const_expr(not rebase_routed_w):
+                w_rsrc = ptr_buffer_resource(arg_w, w_nbytes)
             shared_w_rsrc = ptr_buffer_resource(arg_shared_w, shared_w_nbytes)
 
             out_elem_bytes = 1 if need_fp8_out else (4 if out_is_f32 else 2)
@@ -3783,6 +3846,15 @@ def compile_mixed_moe_gemm2_common(
                 else:
                     weight_expert_off_idx = expert_off_idx
                     weight_scale_rsrc = sw_rsrc
+                    if const_expr(rebase_routed_w):
+                        w_rsrc_e = buffer_ops.create_buffer_resource_from_addr(
+                            fx.Int64(fx.ptrtoint(arg_w)) + fx.Int64(expert_b_base),
+                            num_records_bytes=per_expert_w_bytes,
+                        )
+                        w_expert_off = arith.index(0)
+                    else:
+                        w_rsrc_e = w_rsrc
+                        w_expert_off = expert_b_base
 
                 def mixed_b_mfma(
                     a128,
@@ -4039,16 +4111,16 @@ def compile_mixed_moe_gemm2_common(
                         return s0, s1, s2, s3
 
                     b0, b1 = load_cell(
-                        w_rsrc,
-                        expert_b_base,
+                        w_rsrc_e,
+                        w_expert_off,
                         b_stride_n0,
                         w_elem_type(),
                         routed_k0_base,
                     )
                     if const_expr(is_f8_b):
                         b2, b3 = load_cell(
-                            w_rsrc,
-                            expert_b_base,
+                            w_rsrc_e,
+                            w_expert_off,
                             b_stride_n0,
                             w_elem_type(),
                             routed_k0_base + arith.index(1),

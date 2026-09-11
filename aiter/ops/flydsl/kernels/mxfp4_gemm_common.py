@@ -13,6 +13,24 @@ from . import dpp_utils
 
 kStages = 2
 kBS_stride_k0_dw = 64
+_MAX_SIGNED_BUFFER_BYTES = 1 << 31
+
+
+def check_weight_addressing_limits(
+    *, stage: str, per_expert_w_bytes: int, scale_w_bytes: int
+) -> None:
+    if per_expert_w_bytes >= _MAX_SIGNED_BUFFER_BYTES:
+        raise ValueError(
+            f"{stage} raw weight per expert is {per_expert_w_bytes} bytes; "
+            f"it must be smaller than {_MAX_SIGNED_BUFFER_BYTES} bytes for signed "
+            "32-bit buffer coordinates"
+        )
+    if scale_w_bytes >= _MAX_SIGNED_BUFFER_BYTES:
+        raise ValueError(
+            f"{stage} global weight scale buffer is {scale_w_bytes} bytes; "
+            f"it must be smaller than {_MAX_SIGNED_BUFFER_BYTES} bytes for signed "
+            "32-bit buffer coordinates"
+        )
 
 
 def _raw(v):

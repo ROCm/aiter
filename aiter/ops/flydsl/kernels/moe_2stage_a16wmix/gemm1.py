@@ -16,6 +16,7 @@ from aiter.ops.flydsl.kernels.tensor_shim import _to_raw as _raw
 
 from .utils import (
     _BCol,
+    _check_weight_addressing_limits,
     _global_i32_at,
     _mma_bf16,
     _udiv,
@@ -181,6 +182,7 @@ def _gemm1_body_a16w4(
     col_g_list = []
     cols_gate, cols_up = [], []
     _guint = w_layout == "guinterleave"
+    _rebase_w = w_dtype == "bf16" or NE * N_OUT * (K // 2) >= (1 << 31)
     for ni in range_constexpr(num_acc_n):
         _ni16 = fx.Int32(ni * 16)
         col_blk = by_n + n_tile_base + _ni16
@@ -192,7 +194,10 @@ def _gemm1_body_a16w4(
             # a SHARED dword (np = 0 gate / 1 up). K indexing is unchanged vs standard
             # (verified byte-identical; only the N term differs). mxfp4 only.
             n0_local = col_blk // fx.Int32(16)
-            blk_gate = e * fx.Int32(N_OUT // 16) + n0_local * fx.Int32(2)
+            if const_expr(_rebase_w):
+                blk_gate = n0_local * fx.Int32(2)
+            else:
+                blk_gate = e * fx.Int32(N_OUT // 16) + n0_local * fx.Int32(2)
             scale_mni = e * fx.Int32(N_OUT // 32) + n0_local
             cols_gate.append(
                 _BCol(blk_gate, lane_mod_16, sc_blk=scale_mni, sc_pack=fx.Int32(0))
@@ -425,6 +430,10 @@ def compile_gemm1_a16w4_port(
     _K = D_HIDDEN
     _INTER = D_INTER
     _N_OUT = 2 * _INTER
+    if w_dtype != "int4":
+        _check_weight_addressing_limits(
+            stage="A16W4 stage1", w_dtype=w_dtype, n_out=_N_OUT, k=_K, experts=NE
+        )
     assert _K % TILE_K == 0, f"D_HIDDEN (K) must be a multiple of {TILE_K}, got {_K}"
     assert (
         _K % (k_wave * TILE_K) == 0

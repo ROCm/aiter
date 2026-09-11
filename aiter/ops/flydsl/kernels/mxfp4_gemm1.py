@@ -19,6 +19,7 @@ from .mxfp4_gemm_common import (
     _umax_i32,
     bq_bytes_for,
     bscale_bytes_for,
+    check_weight_addressing_limits,
     k_half_for,
     k_tiles_total_for,
     kas_per_chunk_dw_for,
@@ -243,7 +244,16 @@ def _gemm1_body(
             _global_i32_buffer_view(addr_i64, num_bytes), fx.make_layout(tile_elems, 1)
         )
 
-    bq_tiles = _global_i32_buffer_tiles(arg_bq, BQ_BYTES, 4)
+    BQ_PER_EXPERT = BQ_BYTES // NE
+    BQ_USE_GLOBAL_RESOURCE = BQ_BYTES < (1 << 31)
+    if const_expr(BQ_USE_GLOBAL_RESOURCE):
+        bq_tiles = _global_i32_buffer_tiles(arg_bq, BQ_BYTES, 4)
+    else:
+        # Larger allocations keep the expert displacement in the 64-bit base
+        # address so the buffer offset and bound remain expert-relative.
+        bq_tiles = _global_i32_buffer_tiles(
+            arg_bq + fx.Int64(e) * fx.Int64(BQ_PER_EXPERT), BQ_PER_EXPERT, 4
+        )
     bq_copy_atom = fx.make_copy_atom(fx.rocdl.BufferCopy128b(b_aux), fx.Int32)
     bq_reg_lay = fx.make_layout(4, 1)
 
@@ -295,7 +305,10 @@ def _gemm1_body(
             g = tile_il & fx.Int32(1)
             n0 = tile_il >> fx.Int32(1)
             col = (g * fx.Int32(N0_HALF) + n0) * fx.Int32(16)
-        v = (e * fx.Int32(N_OUT) + col) * fx.Int32(K_HALF)
+        if const_expr(BQ_USE_GLOBAL_RESOURCE):
+            v = (e * fx.Int32(N_OUT) + col) * fx.Int32(K_HALF)
+        else:
+            v = col * fx.Int32(K_HALF)
         b_load_s_base.append(rocdl.readfirstlane(T.i32, v))
 
     # -- b_scale_s_base / _hi (HIP 418-429) -----------------------------------
@@ -843,6 +856,11 @@ def compile_gemm1_a4w4_port(
         _N_OUT % BN == 0
     ), f"2*D_INTER (N_OUT) must be a multiple of {BN}, got {_N_OUT}"
     _NE = NE
+    check_weight_addressing_limits(
+        stage="MXFP4 stage1",
+        per_expert_w_bytes=bq_bytes_for(_NE, _N_OUT, _K) // _NE,
+        scale_w_bytes=bscale_bytes_for(_NE, _N_OUT, _K),
+    )
     _K_TILES_TOTAL = k_tiles_total_for(_K, BK)
     _NUM_N_BLOCKS = num_n_blocks_for(_N_OUT, BN)
 

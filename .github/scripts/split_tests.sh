@@ -83,6 +83,7 @@ if [[ "$TEST_TYPE" == "aiter" ]]; then
     FILE_TIMES[op_tests/test_gated_delta_rule.py]=322
     FILE_TIMES[op_tests/test_concat_cache_mla.py]=277
     FILE_TIMES[op_tests/test_moe_topk_gating.py]=238
+    FILE_TIMES[op_tests/test_flydsl_moe_4gib_addressing.py]=200
     FILE_TIMES[op_tests/test_mha_native_splitkv.py]=186
     FILE_TIMES[op_tests/test_pa_mtp.py]=160
     FILE_TIMES[op_tests/test_moe_dp_share_expert.py]=126
@@ -329,6 +330,7 @@ declare -A MEMORY_WEIGHT_FLOOR
 if [[ "$TEST_TYPE" == "aiter" ]]; then
     MEMORY_WEIGHT_FLOOR[op_tests/test_flydsl_causal_conv1d_update.py]=300
     MEMORY_WEIGHT_FLOOR[op_tests/test_flydsl_gdr_mtp.py]=300
+    MEMORY_WEIGHT_FLOOR[op_tests/test_flydsl_moe_4gib_addressing.py]=300
     MEMORY_WEIGHT_FLOOR[op_tests/test_flydsl_qk_norm_rope_quant.py]=300
     MEMORY_WEIGHT_FLOOR[op_tests/test_kvcache.py]=300
     MEMORY_WEIGHT_FLOOR[op_tests/test_mla_prefill_ps.py]=300
