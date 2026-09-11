@@ -651,9 +651,7 @@ def launch_gemm_a8w4_tdm(
                 if const_expr(j.gather is not None):
                     # Shape is the written extent, stride the padded pitch --
                     # same split as the contiguous path's destination view.
-                    lds_c = lds_view(
-                        pa + j.lds_off, (j.outer, j.inner), (j.lds_row, 1)
-                    )
+                    lds_c = lds_view(pa + j.lds_off, (j.outer, j.inner), (j.lds_row, 1))
                     desc = make_tensor_gather_descriptor(
                         j.gt,
                         lds_c,

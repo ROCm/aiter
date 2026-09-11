@@ -266,8 +266,11 @@ def build_moe_gather_preshuffle_scale_lds_module(
     # loses more to occupancy than contiguity wins).
     _lds_budget = int(os.environ.get("AITER_PRESHUF_LDS_BUDGET", "32768"))
     k_chunk = max(
-        (c for c in range(1, src_dwords + 1) if src_dwords % c == 0
-         and rows_per_tile * (c + 1) * 4 <= _lds_budget),
+        (
+            c
+            for c in range(1, src_dwords + 1)
+            if src_dwords % c == 0 and rows_per_tile * (c + 1) * 4 <= _lds_budget
+        ),
         default=1,
     )
     k_chunks = src_dwords // k_chunk
@@ -346,9 +349,7 @@ def build_moe_gather_preshuffle_scale_lds_module(
                 t2 = unit // 16
                 w = t2 % wmma_rep
                 sd = t2 // wmma_rep
-                dst_off = (
-                    tile_dword_base + ((sd_base + sd) * wmma_rep + w) * 16 + lane
-                )
+                dst_off = tile_dword_base + ((sd_base + sd) * wmma_rep + w) * 16 + lane
                 for j in range_constexpr(VEC):
                     dst_p[dst_off + j] = lds_p[(w * 16 + lane + j) * lds_pitch + sd]
 

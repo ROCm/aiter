@@ -384,9 +384,7 @@ def _emit_quant_block_loop(c: SimpleNamespace) -> None:
     # the same register saving (measured 33.7 -> 25.9 us compact, 78.1 -> 80.1
     # scattered, at 16384 tokens).
     early_payload_store = (
-        len(dst_payload) == 1
-        if _EARLY_PAYLOAD_STORE is None
-        else _EARLY_PAYLOAD_STORE
+        len(dst_payload) == 1 if _EARLY_PAYLOAD_STORE is None else _EARLY_PAYLOAD_STORE
     )
 
     def _mx_block_of(it):
@@ -2141,9 +2139,7 @@ def build_moe_token_multidest_quant_module(
             if const_expr(_COMPACT_A):
                 payload_dests = [SimpleNamespace(payload_row_i32=token_eff)]
             else:
-                payload_dests = [
-                    SimpleNamespace(payload_row_i32=row) for row in rows
-                ]
+                payload_dests = [SimpleNamespace(payload_row_i32=row) for row in rows]
             if const_expr(_COMPACT_SCALE):
                 # Row-major by construction: the compact buffer is
                 # (token, feat_dim//32), which is what the row-major scale
