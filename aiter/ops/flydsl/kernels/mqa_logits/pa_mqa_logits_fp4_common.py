@@ -7,6 +7,13 @@ from __future__ import annotations
 import flydsl.expr as fx
 from flydsl.expr.typing import T
 
+# Offset that parks a non-writer lane outside any window's num_records. Must be
+# a constant, not a multiple of the window length: a token below a non-zero
+# `local_start` has a negative base offset, and adding the length to that lands
+# back inside the window. Big enough that no in-range offset reaches it, small
+# enough not to overflow i32 when added to one.
+_NON_WRITER_LANE_OFF = 1 << 30
+
 
 def _i32_buffer(ptr, width=1):
     """OOB-checked global i32 buffer-tensor over ``ptr`` (mirrors a max_size V#).

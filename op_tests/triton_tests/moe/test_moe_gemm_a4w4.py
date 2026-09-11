@@ -226,6 +226,8 @@ class Case:
             Case(16, 1024, 1024, 128, 4, preshuffle_weights=True),
             Case(1024, 7168, 2048, 256, 8, hbm_swizzling=True, preshuffle_weights=True),
             Case(256, 1024, 1024, 8, 4, preshuffle_weights=True),
+            Case(16, 1536, 7168, 256, 8, hbm_swizzling=True, preshuffle_weights=True),
+            Case(16, 7168, 768, 256, 8, hbm_swizzling=True, preshuffle_weights=True),
         ]
     ],
 )
@@ -318,9 +320,12 @@ def test_op(
             swizzle_mx_scale = "GFX1250_SCALE"
             w_scale_tri = preshuffle_moe_wscale(w_scale_tri)
         elif get_arch() == "gfx950":
-            swizzle_mx_scale = "CDNA4_SCALE"
-            w_scale_tri = shuffle_scale_moe(
-                w_scale_tri, arch="gfx950", preshuffle_factor=32, scale_kwidth=8
+            w_scale_tri, swizzle_mx_scale = shuffle_scale_moe(
+                w_scale_tri,
+                arch="gfx950",
+                preshuffle_factor=32,
+                scale_kwidth=8,
+                return_layout=True,
             )
         else:
             assert False, "Unsupported architecture"

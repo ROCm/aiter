@@ -39,17 +39,10 @@ import torch
 import aiter
 from aiter import dtypes
 from aiter.jit.utils.chip_info import get_gfx
+from aiter.ops.flydsl import flydsl_qk_norm_rope_quant
 from aiter.test_common import benchmark, checkAllclose, run_perftest
 from aiter.utility.fp4_utils import f32_to_mx_e8m0_scale
 from aiter.utility.mx_types import MxDtypeInt, MxScaleRoundModeInt
-
-try:
-    from aiter.ops.flydsl import flydsl_qk_norm_rope_quant
-
-    _FLYDSL_IMPORT_ERROR = None
-except Exception as e:  # noqa: BLE001
-    flydsl_qk_norm_rope_quant = None
-    _FLYDSL_IMPORT_ERROR = e
 
 torch.set_default_device("cuda")
 
@@ -61,10 +54,30 @@ _FP8_MX_DTYPE = (
 _DEV = "cuda"
 # Positive allow-list: an unknown new card must not silently run an unbuilt
 # kernel. The fused SWA scatter rides the same HIP op, so no extra gate.
-SUPPORTED_GFX = ["gfx942", "gfx950"]
+SUPPORTED_GFX = ["gfx942", "gfx950", "gfx1250"]
 PE_BYTE_OFFSET = 464
-# MI355X HBM3e peak. Used only for the "%peak" perf column.
-_PEAK_BW_GBPS = 8000.0
+# No "%peak" column: a datasheet peak is not a ceiling this kernel can be measured
+# against, and reporting one against it is actively misleading.
+#
+# The spec number is read/write agnostic, but the two are not interchangeable --
+# gfx1250 measures 15.13 TB/s reading and 10.58 TB/s writing, so the reachable
+# ceiling depends on the shape's own mix. At the V4 contract's 63/37 split the
+# kernel sits at 100.0% of what the card can do while reading 66% of the spec
+# figure, which invites a hunt for headroom that is not there.
+#
+# It is worse at small sizes, where dispatch ramp and drain dominate: T=512 H=32
+# reports 24.5% of spec, yet its transfer runs at 13.06 TB/s against 13.07 for the
+# largest shape -- the whole gap is ~3.3 us of fixed cost, not bandwidth.
+#
+# The GB/s column below is the honest figure. To find out whether a kernel is
+# actually at the floor, measure the card's read and write bandwidth with the
+# kernel itself: build variants that suppress the output stores behind a
+# runtime-false predicate the compiler cannot fold (so the loads and the maths
+# stay live), and fit `T = read/BW_r + write/BW_w` to the all-stores,
+# some-stores and no-stores timings. Verify such a build by its OUTPUT, not its
+# ISA -- the predicate is wave-uniform, so the compiler emits a branch that skips
+# the stores rather than deleting them, and the static store count is unchanged.
+
 # Pin the arg-rotation count. Left to itself, run_perftest derives it from
 # `free_memory` at call time, so two candidates timed in one process rotate a
 # different number of times, land in different L2 states, and their `us`
@@ -329,7 +342,7 @@ def test_fused_qk_norm_rope_group_quant(
     #   q_fp8=False -> flydsl bf16 (quant off)  [both write bf16 Q]
     # (comparing bf16-Q against fp8-flydsl would just measure the 2x Q write.)
     fly_us = float("nan")
-    if compare_flydsl and flydsl_qk_norm_rope_quant is not None:
+    if compare_flydsl:
         try:
             _, fly_us = run_perftest(
                 flydsl_qk_norm_rope_quant,
@@ -375,7 +388,6 @@ def test_fused_qk_norm_rope_group_quant(
         "flydsl_us": (round(fly_us, 3) if fly_us == fly_us else None),  # noqa: PLR0124
         "hip/flydsl": (round(ratio, 3) if ratio == ratio else None),  # noqa: PLR0124
         "GB/s": round(gbps, 0),
-        "%peak": round(gbps / _PEAK_BW_GBPS * 100, 1),
         "err_q": err_q,
         "err_k": err_k,
         "err_kpe": err_kpe,
@@ -699,30 +711,29 @@ def test_fused_qk_norm_rope_group_quant_swa(T, H, D, RD, *, is_neox, q_fp8, G, G
     # moves less K-write traffic (bf16 512B vs our 448+14 fp8 + 128 bf16), so treat the
     # ratio as indicative of kernel efficiency, not a same-output benchmark.
     fly_us = float("nan")
-    if flydsl_qk_norm_rope_quant is not None:
-        try:
-            swa_kv_fly = torch.zeros(num_rows, D, dtype=torch.bfloat16, device=_DEV)
-            _, fly_us = run_perftest(
-                flydsl_qk_norm_rope_quant,
-                q.view(T, H * D),
-                kv.view(T, D),
-                kw,
-                cos,
-                sin,
-                pos,
-                num_q_heads=H,
-                head_dim=D,
-                rope_head_dim=RD,
-                quant=False,
-                scale_dtype="fp32",
-                swa_kv=swa_kv_fly,
-                batch_id_per_token=bid,
-                swa_block_tables=swa_block_tables,
-                swa_block_size=block_size,
-                num_rotate_args=_ROTATE,
-            )
-        except Exception:  # noqa: BLE001
-            fly_us = float("nan")
+    try:
+        swa_kv_fly = torch.zeros(num_rows, D, dtype=torch.bfloat16, device=_DEV)
+        _, fly_us = run_perftest(
+            flydsl_qk_norm_rope_quant,
+            q.view(T, H * D),
+            kv.view(T, D),
+            kw,
+            cos,
+            sin,
+            pos,
+            num_q_heads=H,
+            head_dim=D,
+            rope_head_dim=RD,
+            quant=False,
+            scale_dtype="fp32",
+            swa_kv=swa_kv_fly,
+            batch_id_per_token=bid,
+            swa_block_tables=swa_block_tables,
+            swa_block_size=block_size,
+            num_rotate_args=_ROTATE,
+        )
+    except Exception:  # noqa: BLE001
+        fly_us = float("nan")
     # RMSNorm ~4 flop/elem + GPT-J RoPE ~3 flop/elem over the RD tail, on the Q
     # and K rows alike. Bytes: read q+kv, write the fp8 entry (+dup e8m0) and
     # the bf16 rope buffer, plus the scattered SWA rows.
@@ -824,12 +835,6 @@ def main():
         help="skip the fused paged-SWA write test.",
     )
     args = parser.parse_args()
-
-    if not args.no_flydsl and _FLYDSL_IMPORT_ERROR is not None:
-        aiter.logger.warning(
-            "flydsl comparison disabled: %s. Use --no-flydsl to silence this warning.",
-            _FLYDSL_IMPORT_ERROR,
-        )
 
     neox_modes = [False, True] if args.neox else [False]
 

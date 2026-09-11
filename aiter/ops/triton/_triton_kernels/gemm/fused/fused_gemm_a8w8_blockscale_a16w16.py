@@ -4,8 +4,26 @@
 import triton
 import triton.language as tl
 
+from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
 from aiter.ops.triton.utils._triton.pid_preprocessing import pid_grid, remap_xcd
 from aiter.ops.triton.utils.gemm_config_utils import get_gemm_config
+
+_fused_gemm_a8w8_blockscale_a16w16_repr = make_kernel_repr(
+    "_fused_gemm_a8w8_blockscale_a16w16_kernel",
+    [
+        "BLOCK_SIZE_M",
+        "BLOCK_SIZE_N",
+        "BLOCK_SIZE_K",
+        "GROUP_SIZE_M",
+        "NUM_KSPLIT",
+        "SPLITK_BLOCK_SIZE",
+        "EVEN_K",
+        "ADD_BIAS_FP8",
+        "ADD_BIAS_BF16",
+        "SKIP_REDUCE",
+        "cache_modifier",
+    ],
+)
 
 
 @triton.heuristics(
@@ -17,7 +35,7 @@ from aiter.ops.triton.utils.gemm_config_utils import get_gemm_config
         * triton.cdiv(args["N_bf16"], args["BLOCK_SIZE_N"]),
     }
 )
-@triton.jit
+@triton.jit(repr=_fused_gemm_a8w8_blockscale_a16w16_repr)
 def _fused_gemm_a8w8_blockscale_a16w16_kernel(
     # Pointers to matrices
     a_fp8_ptr,
@@ -252,7 +270,20 @@ def _fused_gemm_a8w8_blockscale_a16w16_kernel(
             tl.store(c_bf16_ptrs, c_bf16, mask=c_bf16_mask)
 
 
-@triton.jit
+_fused_gemm_a8w8_blockscale_a16w16_reduce_repr = make_kernel_repr(
+    "_fused_gemm_a8w8_blockscale_a16w16_reduce_kernel",
+    [
+        "BLOCK_SIZE_M",
+        "BLOCK_SIZE_N",
+        "ACTUAL_KSPLIT",
+        "MAX_KSPLIT",
+        "ADD_BIAS_FP8",
+        "ADD_BIAS_BF16",
+    ],
+)
+
+
+@triton.jit(repr=_fused_gemm_a8w8_blockscale_a16w16_reduce_repr)
 def _fused_gemm_a8w8_blockscale_a16w16_reduce_kernel(
     bias_fp8_ptr,
     c_fp8_in_ptr,
