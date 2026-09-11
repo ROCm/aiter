@@ -838,7 +838,7 @@ def flydsl_hstu_attention_bwd(
     block_n: int | None = None,
     num_waves: int | None = None,
     waves_per_eu: int | None = None,
-    sort_by_length: bool = False,
+    sort_by_length: bool = True,
     stream: torch.cuda.Stream | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """HSTU attention backward: returns (dq, dk, dv).
