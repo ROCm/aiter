@@ -3,7 +3,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 # ruff: noqa: EXE005, I001
-"""Architecture-selected FlyDSL grouped GEMM test entry point.
+"""Architecture-selected FlyDSL MoE test entry point.
 
 The original gfx950 GUI A8W4 and gfx1250 TDM grouped-MoE suites live unchanged
 in separate ``get_gfx()`` branches below. Only the matching branch is imported
@@ -37,8 +37,8 @@ if _GFX == "gfx950":
     inter=640) and FlyDSL stage2 / E2E with GUI preshuffle on gfx950.
 
     Usage:
-        pytest op_tests/flydsl_tests/test_flydsl_moe_a8w4.py -q
-        pytest op_tests/flydsl_tests/test_flydsl_moe_a8w4.py -k tile_k
+        pytest op_tests/flydsl_tests/test_flydsl_moe.py -q
+        pytest op_tests/flydsl_tests/test_flydsl_moe.py -k tile_k
     """
 
 
@@ -988,7 +988,7 @@ elif _GFX == "gfx1250" or _FORCE_GFX1250:
     ``AITER_USE_GROUPED_GEMM=1`` env (set automatically by the runner below).
 
     Pytest covers a small correctness case for each format. Direct execution
-    (``python op_tests/test_flydsl_grouped_gemm_gfx1250.py``) runs a
+    (``python op_tests/flydsl_tests/test_flydsl_moe.py``) runs a
     DeepSeek-style perf bench (``--scenario bench``, end-to-end fused_moe), a
     per-kernel bench that times gemm1 and gemm2 in isolation
     (``--scenario kernel``), a tiny correctness check
@@ -2390,5 +2390,5 @@ elif _GFX == "gfx1250" or _FORCE_GFX1250:
         main()
 
 elif __name__ == "__main__":
-    print(f"Skipping grouped GEMM test: requires gfx950 or gfx1250, got {_GFX}")
+    print(f"Skipping FlyDSL MoE test: requires gfx950 or gfx1250, got {_GFX}")
 # fmt: on
