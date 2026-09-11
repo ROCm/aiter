@@ -3,6 +3,8 @@
 #include "asm_fmha_v3_bwd_configs.hpp"
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
+#include <fstream>
 #include <string>
 #include <vector>
 
@@ -376,6 +378,22 @@ float mha_bwd(mha_bwd_args a, const ck_tile::stream_config& s)
 #endif
 }
 
+// _perf.co is a scope:cu rebuild of the dqdkdv kernel exposing the same symbol.
+std::string dqdkdv_co_name(const std::string& co_name, const std::string& arch_id)
+{
+    static const bool perf = []() {
+        const char* e = std::getenv("AITER_FMHA_BWD_PERF_CO");
+        return e != nullptr && e[0] != '\0' && e[0] != '0';
+    }();
+    const char* asm_dir = perf ? std::getenv("AITER_ASM_DIR") : nullptr;
+    if(asm_dir == nullptr)
+        return co_name;
+
+    std::string perf_co = co_name.substr(0, co_name.size() - 3) + "_perf.co";
+    std::string path    = std::string(asm_dir) + "/" + arch_id + "/" + perf_co;
+    return std::ifstream(path).good() ? perf_co : co_name;
+}
+
 float fmha_v3_bwd(mha_bwd_args a, const ck_tile::stream_config& s)
 {
     std::string arch_id = get_gpu_arch();
@@ -519,13 +537,13 @@ float fmha_v3_bwd(mha_bwd_args a, const ck_tile::stream_config& s)
     auto it_dqdkdv = dqdkdv_cfgs->find(dqdkdv_kernel);
     if(it_dqdkdv != dqdkdv_cfgs->end())
     {
-        const auto& cfg     = it_dqdkdv->second;
-        const char* name    = cfg.knl_name.c_str();
-        const char* co_name = cfg.co_name.c_str();
-        ts_kv               = cfg.ts;
+        const auto& cfg           = it_dqdkdv->second;
+        const char* name          = cfg.knl_name.c_str();
+        const std::string co_name = dqdkdv_co_name(cfg.co_name, arch_id);
+        ts_kv                     = cfg.ts;
 
-        impl_ptr_dqdkdv =
-            &impl_ptr_map.get_or_create(name, [&]() { return AiterAsmKernel(name, co_name); });
+        impl_ptr_dqdkdv = &impl_ptr_map.get_or_create(
+            name, [&]() { return AiterAsmKernel(name, co_name.c_str()); });
     }
     else
     {
