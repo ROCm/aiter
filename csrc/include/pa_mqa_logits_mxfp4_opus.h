@@ -644,7 +644,11 @@ void pa_mqa_logits_mxfp4_kernel(opus_mqa_logits_kargs kargs) {
     auto relu_nt = [&](sfrag& accs) {
         opus::static_for<MT * EC>([&](auto ic) {
             constexpr int i = ic.value;
-            accs[i] = accs[i] > 0.0f ? accs[i] : 0.0f;
+            // IEEE-754-2019 `maximum`, which propagates NaN. The ternary
+            // `x > 0.f ? x : 0.f` is a select that turns a NaN logit into 0, and the
+            // indexer's KV scale pool does carry 0xFF (NaN) e8m0 bytes.
+            // Needs `-fno-finite-math-only` or `-ffast-math` folds it back.
+            accs[i] = __builtin_elementwise_maximum(accs[i], 0.0f);
         });
     };
 

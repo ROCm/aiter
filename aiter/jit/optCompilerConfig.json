@@ -1402,6 +1402,7 @@
         "flags_extra_cc": [],
         "flags_extra_hip": [
             "'-ffast-math'",
+            "'-fno-finite-math-only'",
             "'-mllvm -enable-post-misched=1'"
         ],
         "extra_ldflags": "None",

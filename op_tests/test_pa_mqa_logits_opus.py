@@ -538,6 +538,111 @@ def check_decode(bs, next_n, context_lens, seed, block_k, label, local_ends=None
     }  # fmt: skip
 
 
+def poison_kv_rows(kv_scale, block_tables, row_in_seq):
+    """A copy of `kv_scale` with row `row_in_seq` of EVERY batch set to 0xFF (NaN).
+
+    Every batch, because the block tables differ per batch and poisoning only batch 0's
+    would leave the others as an untested control.
+
+    Poisoned by MARKING in the natural layout and pushing the mark through
+    `scale_to_opus`, rather than by computing where those four bytes land. The
+    permutation is the thing under test's own ABI; rederiving it here would let the test
+    and the kernel agree on the wrong offsets.
+    """
+    mark = torch.zeros(
+        block_tables.numel() * KV_BLOCK_SIZE, BLOCKS_ROW, dtype=torch.uint8, device=dev
+    )
+    blk = block_tables[:, row_in_seq // KV_BLOCK_SIZE].long()
+    mark[blk * KV_BLOCK_SIZE + row_in_seq % KV_BLOCK_SIZE] = 1
+    out = kv_scale.clone()
+    out[scale_to_opus(mark, KV_BLOCK_SIZE) != 0] = 0xFF
+    return out
+
+
+def check_nan_scale(entry, bs, next_n, ends, seed, block_k, label, kv_row=0):
+    """A NaN E8M0 scale must reach the logits of every row that attends its KV row.
+
+    E8M0 0xFF is NaN and an E2M1 nibble cannot encode one, so a NaN scale is the only
+    way a non-finite value enters this kernel -- and the relu decides whether it comes
+    out again. Written as `x > 0.f ? x : 0.f` the relu is a compare-and-select and
+    silently returns 0 for a NaN input, which is indistinguishable downstream from a KV
+    row that genuinely scored zero; written as `maximum` it propagates. The kernel
+    promises the latter, and only under `-fno-finite-math-only` -- `-ffast-math` alone
+    lets the compiler assume no operand is NaN and fold the builtin back to a select.
+
+    Asserted as an exact SET, not a count: every row whose window contains `kv_row` has
+    a non-finite logit there, no other in-window cell is non-finite, and out-of-window
+    is still the -inf pre-fill. A kernel that propagated NaN too far would pass a count.
+    """
+    total_q = bs * next_n
+    assert len(ends) == total_q
+    inp = build_inputs(bs, max(max(ends), 1), total_q, block_k, seed)
+    rb = torch.tensor([b for b in range(bs) for _ in range(next_n)],
+                      dtype=torch.int32, device=dev)  # fmt: skip
+    ls = torch.zeros(total_q, dtype=torch.int32, device=dev)
+    le = torch.tensor(ends, dtype=torch.int32, device=dev)
+
+    kvs = poison_kv_rows(inp.kv_scale, inp.block_tables, kv_row)
+
+    if entry == "prefill":
+        out = pa_mqa_logits_mxfp4_prefill(
+            inp.q_packed, inp.q_scale, inp.kv_cache, kvs, inp.block_tables,
+            inp.weights, rb, ls, le, inp.max_seq_len,
+            weight_scale=WEIGHT_SCALE, block_k=block_k, kv_block_size=KV_BLOCK_SIZE,
+        )  # fmt: skip
+    else:
+        out = pa_mqa_logits_mxfp4_decode(
+            inp.q_packed, inp.q_scale, inp.kv_cache, kvs, inp.block_tables,
+            inp.weights, le, inp.max_seq_len, next_n,
+            split_ctx_len=inp.max_seq_len, weight_scale=WEIGHT_SCALE,
+            block_k=block_k, kv_block_size=KV_BLOCK_SIZE,
+        )  # fmt: skip
+    torch.cuda.synchronize()
+
+    col = torch.arange(out.shape[1], device=dev).unsqueeze(0)
+    inside = (col >= ls.unsqueeze(1)) & (col < le.unsqueeze(1))
+    want = inside & (col == kv_row)
+    got = inside & ~torch.isfinite(out)
+    n_want, n_got = int(want.sum()), int(got.sum())
+    exact = bool(torch.equal(want, got))
+    oob = oob_is_neginf(out, rb, ls, le)
+    return {
+        "case": label, "entry": entry, "block_k": block_k, "rows": total_q,
+        "max_win": int(le.max()), "expect nan": n_want, "got nan": n_got,
+        "exact set": exact, "oob -inf": oob, "pass": exact and oob,
+    }  # fmt: skip
+
+
+def run_nan_scale():
+    """`check_nan_scale` over both entry points, both block_k, and a window edge case.
+
+    Separate from `run_corner` because its pass condition is the opposite one: these
+    cases REQUIRE non-finite in-window cells, so `window_is_written` -- which every
+    corner case asserts -- is deliberately false here.
+    """
+    oks = []
+    for block_k in COMPILED_BLOCK_KS:
+        # Ragged windows, all containing KV row 0.
+        oks.append(check_nan_scale("prefill", 2, 3, [50, 120, 200, 40, 100, 180],
+                                   20, block_k, "prefill, nan at kv row 0"))  # fmt: skip
+        # A window that EXCLUDES the poisoned row (le == 0 contributes nothing, and
+        # `kv_row` past `le` must leave the row finite) -- the control that says the
+        # NaN is not simply smeared across the output.
+        oks.append(check_nan_scale("prefill", 1, 4, [0, 1, 2, 3],
+                                   21, block_k, "prefill, nan at kv row 2",
+                                   kv_row=2))  # fmt: skip
+        # Decode, where a window spans several KV splits and only one holds the row.
+        oks.append(check_nan_scale("decode", 2, 4, [200, 201, 202, 203,
+                                                    block_k * 2 + 1] + [130] * 3,
+                                   22, block_k, "decode, nan at kv row 0"))  # fmt: skip
+    df = pd.DataFrame(oks)
+    aiter.logger.info(
+        "MXFP4 MQA logits NaN E8M0 scale propagation, %d/%d pass (markdown):\n%s",
+        int(df["pass"].sum()), len(df), df.to_markdown(index=False),
+    )  # fmt: skip
+    return bool(df["pass"].all())
+
+
 def run_corner():
     """Cases chosen to hit the pipeline and window corners, all on random data.
 
@@ -786,6 +891,7 @@ def main():
     args = parser.parse_args()
 
     ok = run_corner()
+    ok = run_nan_scale() and ok
 
     rows = [test_prefill(bs) for bs in args.batch]
     aiter.logger.info(
