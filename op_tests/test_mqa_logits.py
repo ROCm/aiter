@@ -31,9 +31,10 @@ the kernel, not the quantization -- a non-zero `err` column is a real bug.
 import argparse
 import itertools
 
-import aiter
 import pandas as pd
 import torch
+
+import aiter
 from aiter import dtypes
 from aiter.jit.utils.chip_info import get_gfx
 from aiter.ops.shuffle import shuffle_weight
@@ -175,9 +176,9 @@ def test_mqa_logits_prefill(m, n, num_heads, head_dim, clean_logits):
         out, us = run_perftest(fn, num_rotate_args=_rotate_args(read_bytes))
         got = out[rows]
         if clean_logits:
-            assert torch.equal(got == -float("inf"), ~inside), (
-                f"{name}: window mask mismatch (m={m}, n={n}, h={num_heads})"
-            )
+            assert torch.equal(
+                got == -float("inf"), ~inside
+            ), f"{name}: window mask mismatch (m={m}, n={n}, h={num_heads})"
         # clean_logits=False leaves everything outside the window untouched, so
         # only in-window elements are defined either way.
         err = checkAllclose(
