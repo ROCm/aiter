@@ -579,22 +579,22 @@ def _compile_mxfp8_128_wmma_to_cache(
         ):
             variant_args = launch_args[:-3] + (variant_cm, cluster_n, True)
             if compute_bound:
-                # bake exactly the epilogue variant the runtime will ask for
-                fused_splitk, bounded_m = splitk_epilogue_flags(
+                fused_splitk, row_bounded = splitk_epilogue_flags(
                     m, n, tile_m, tile_n, variant_cm, split_k, cu_num, True
                 )
                 cb_args = (
                     variant_args[:12] + (_ptr_view_safe(flag),) + variant_args[12:]
                 )
-                launch(
-                    *cb_args,
-                    SCALE_BLOCK_SIZE,
-                    split_k,
-                    a_preshuffle,
-                    persistent_n_tiles,
-                    fused_splitk,
-                    bounded_m,
-                )
+                for bounded_m in ((False, True) if fused_splitk else (row_bounded,)):
+                    launch(
+                        *cb_args,
+                        SCALE_BLOCK_SIZE,
+                        split_k,
+                        a_preshuffle,
+                        persistent_n_tiles,
+                        fused_splitk,
+                        bounded_m,
+                    )
             else:
                 launch(
                     *variant_args,
@@ -738,6 +738,7 @@ def compile_one_config(
                     m=m,
                     n=n,
                     k=k,
+                    cu_num=cu_num,
                     **kwargs,
                 )
             elif kind == "ptpc_wmma":

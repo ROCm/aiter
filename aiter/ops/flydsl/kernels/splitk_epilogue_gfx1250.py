@@ -96,12 +96,23 @@ def emit_atomic_splitk_epilogue(
 
         return _f
 
+    @functools.lru_cache(maxsize=8)
+    def _group_emitter(binop, unroll, row_step):
+        @flyc.jit
+        def _f(gptrs, vecs, first_row, last_row):
+            if last_row < mn_oob:  # whole group live: straight line
+                for u in range_constexpr(unroll):
+                    _emit_row(binop, gptrs[u], vecs[u])
+            elif first_row < mn_oob:  # the one straddling group
+                for u in range_constexpr(unroll):
+                    _bounded_emitter(binop)(gptrs[u], vecs[u], first_row + u * row_step)
+            # else: every row of this group is past mn_oob -- emit nothing
+
+        return _f
+
     def _emit_rows(binop, row_base, bounded):
         n_iter = ch_rows // rows_per_iter
         unroll = min(EPI_UNROLL, n_iter)
-        # Row offsets are uniform, so the compiler would strength-reduce the
-        # per-row addresses into a serial s_add_nc_u64 chain (41% of the epilogue
-        # on nb4).  Precomputed independent deltas avoid it.
         row_delta = [
             fx.Int64(u * rows_per_iter) * ldc64 for u in range_constexpr(unroll)
         ]
@@ -124,13 +135,19 @@ def emit_atomic_splitk_epilogue(
                 )
                 for u in range_constexpr(unroll)
             ]
-            for u in range_constexpr(unroll):
-                gptr = fx.add_offset(
-                    gc_base, base_off + grp_delta[blk_i] + row_delta[u]
+            if const_expr(bounded):
+                gptrs = [
+                    fx.add_offset(gc_base, base_off + grp_delta[blk_i] + row_delta[u])
+                    for u in range_constexpr(unroll)
+                ]
+                _group_emitter(binop, unroll, rows_per_iter)(
+                    gptrs, vecs, rows[0], rows[-1]
                 )
-                if const_expr(bounded):
-                    _bounded_emitter(binop)(gptr, vecs[u], rows[u])
-                else:
+            else:
+                for u in range_constexpr(unroll):
+                    gptr = fx.add_offset(
+                        gc_base, base_off + grp_delta[blk_i] + row_delta[u]
+                    )
                     _emit_row(binop, gptr, vecs[u])
 
     @flyc.jit
