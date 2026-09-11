@@ -52,7 +52,6 @@ def perftest(
     num_rotate_args=0,
     needTrace=False,
     use_cuda_event=False,
-    return_kernel_times=False,
 ):
     def decorator(func):
         def wrapper(*args, **kwargs):
@@ -92,8 +91,6 @@ def perftest(
                 avg = np.mean(latencies) * 1000
                 logger.info(f"avg: {avg} us/iter from cuda.Event")
                 if use_cuda_event:
-                    if return_kernel_times:
-                        return data, avg, {}
                     return data, avg
 
             with tpf.profile(
@@ -111,16 +108,7 @@ def perftest(
                 data = run_iters_rotate(num_iters, func, rotate_args)
                 torch.cuda.synchronize()
                 torch.cuda.empty_cache()
-            kernel_times = {}
-            perf_result = get_trace_perf(
-                prof,
-                num_iters,
-                return_kernel_times=return_kernel_times,
-            )
-            if return_kernel_times:
-                avg, kernel_times = perf_result
-            else:
-                avg = perf_result
+            avg = get_trace_perf(prof, num_iters)
 
             if testGraph:
                 graph = torch.cuda.CUDAGraph()
@@ -136,8 +124,6 @@ def perftest(
                 avg = get_trace_perf(prof, num_iters)
                 logger.info(f"avg: {avg} us/iter with hipgraph")
 
-            if return_kernel_times:
-                return data, avg, kernel_times
             return data, avg
 
         return wrapper
@@ -226,7 +212,6 @@ def run_perftest(
     num_rotate_args=0,
     needTrace=False,
     use_cuda_event=False,
-    return_kernel_times=False,
     **kwargs,
 ):
     @perftest(
@@ -236,7 +221,6 @@ def run_perftest(
         num_rotate_args=num_rotate_args,
         needTrace=needTrace,
         use_cuda_event=use_cuda_event,
-        return_kernel_times=return_kernel_times,
     )
     def worker(*args, **kwargs):
         return func(*args, **kwargs)
@@ -340,7 +324,7 @@ def post_process_data(df, num_iters, warm_iter=1):
     return list(indices), out_range_num + warm_iter + num_iters - act_iters
 
 
-def get_trace_perf(prof, num_iters, return_kernel_times=False):
+def get_trace_perf(prof, num_iters):
     assert num_iters > 1
     warm_iter = 1
     num_iters -= warm_iter
@@ -409,14 +393,6 @@ def get_trace_perf(prof, num_iters, return_kernel_times=False):
     if df.empty:
         logger.info("no valida data after post process!")
 
-    kernel_times = {}
-    if return_kernel_times and not df.empty:
-        device_df = df[df["device_type"] == "CUDA"]
-        kernel_times = {
-            str(row["name"]): float(row["device_time_sum"]) / actual_iters
-            for _, row in device_df.iterrows()
-        }
-
     avg_name = "[avg us/iter]"
     for el in timerList:
         if el == "host_time_sum":
@@ -428,10 +404,7 @@ def get_trace_perf(prof, num_iters, return_kernel_times=False):
         pd.set_option("display.max_colwidth", 90)
         pd.set_option("display.float_format", "{:,.1f}".format)
         logger.info(f"{df}")
-    avg = df.at[avg_name, "device_time_sum"]
-    if return_kernel_times:
-        return avg, kernel_times
-    return avg
+    return df.at[avg_name, "device_time_sum"]
 
 
 _CATASTROPHIC_REL_THRESHOLD = 0.5
