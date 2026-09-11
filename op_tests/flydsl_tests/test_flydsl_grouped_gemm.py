@@ -13,7 +13,7 @@ grouped GEMM launcher directly. The grouped path is opted-in via the
 ``AITER_USE_GROUPED_GEMM=1`` env (set automatically by the runner below).
 
 Pytest covers a small correctness case for each format. Direct execution
-(``python op_tests/test_flydsl_grouped_gemm.py``) runs a
+(``python op_tests/flydsl_tests/test_flydsl_grouped_gemm.py``) runs a
 DeepSeek-style perf bench (``--scenario bench``, end-to-end fused_moe), a
 per-kernel bench that times gemm1 and gemm2 in isolation
 (``--scenario kernel``), a tiny correctness check
