@@ -207,13 +207,6 @@ def gemm_a16w16_persistent_kernel_(
                 (BLOCK_M, BLOCK_N), dtype=gl.float32, layout=WMMA_LAYOUT
             )
 
-            if ADD_BIAS and pid_k == 0:
-                offs_bias = n_off + gl.arange(
-                    0, BLOCK_N, layout=gl.SliceLayout(0, WMMA_LAYOUT)
-                )
-                bias_vals = gl.load(bias_ptr + offs_bias, mask=offs_bias < N, other=0.0)
-                accumulator = accumulator + bias_vals[None, :]
-
             # prologue
             for _ in gl.static_range(NUM_BUFFERS - 1):
                 gl.amd.gfx1250.tdm.async_load(
@@ -525,13 +518,6 @@ def gemm_a16w16_persistent_bandwidth_bound_large_kernel_(
             accumulator = gl.zeros(
                 (BLOCK_M, BLOCK_N), dtype=gl.float32, layout=WMMA_LAYOUT
             )
-
-            if ADD_BIAS and pid_k == 0:
-                offs_bias = n_off + gl.arange(
-                    0, BLOCK_N, layout=gl.SliceLayout(0, WMMA_LAYOUT)
-                )
-                bias_vals = gl.load(bias_ptr + offs_bias, mask=offs_bias < N, other=0.0)
-                accumulator = accumulator + bias_vals[None, :]
 
             # prologue: fill pipeline with NUM_BUFFERS - 1 TDM loads
             for _ in gl.static_range(NUM_BUFFERS - 1):
@@ -845,13 +831,6 @@ def gemm_a16w16_persistent_compute_bound_kernel_(
         compute_idx = 0
 
         accumulator = gl.zeros((BLOCK_M, BLOCK_N), dtype=gl.float32, layout=WMMA_LAYOUT)
-        if ADD_BIAS and pid_k == 0:
-            offs_bias = n_off + gl.arange(
-                0, BLOCK_N, layout=gl.SliceLayout(0, WMMA_LAYOUT)
-            )
-            bias_vals = gl.load(bias_ptr + offs_bias, mask=offs_bias < N, other=0.0)
-            accumulator = accumulator + bias_vals[None, :]
-
         gl.amd.gfx1250.tdm.async_wait((PD - 1) * 2)
 
         cur_a = gl.amd.cdna4.async_copy.load_shared_relaxed(

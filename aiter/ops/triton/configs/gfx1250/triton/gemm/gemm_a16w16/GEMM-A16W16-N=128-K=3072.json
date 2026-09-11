@@ -1,11 +1,11 @@
 {
     "any": {
-        "num_warps": 2,
         "BLOCK_SIZE_M": 16,
         "BLOCK_SIZE_N": 32,
         "BLOCK_SIZE_K": 256,
+        "num_warps": 2,
         "GROUP_SIZE_M": 1,
-        "cache_modifier": null,
-        "NUM_KSPLIT": 1
+        "NUM_KSPLIT": 1,
+        "cache_modifier": null
     }
 }

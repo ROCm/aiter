@@ -114,8 +114,21 @@ def gemm_a16w16_(
         "gluon",
     ), f"Unknown backend '{backend}', must be 'triton' or 'gluon'"
 
+    assert x.shape[1] == w.shape[1], (
+        f"x is (M, K)={tuple(x.shape)} and w is "
+        f"(N, K)={tuple(w.shape)}, K must match"
+    )
+
+    assert x.dtype in (
+        torch.float16,
+        torch.bfloat16,
+    ), f"Activations (x) must be fp16 or bf16, got {x.dtype}"
+    assert w.dtype in (
+        torch.float16,
+        torch.bfloat16,
+    ), f"Weights (w) must be fp16 or bf16, got {w.dtype}"
+
     if persistent:
-        assert x.shape[1] == w.shape[1], "Incompatible matrix shapes."
         assert not skip_reduce, (
             "persistent=True does not support skip_reduce; the persistent kernels "
             "have no split-K path to leave unreduced"
@@ -123,11 +136,8 @@ def gemm_a16w16_(
         M, K = x.shape
         N, _ = w.shape
 
-        # WGs hard set to 256 for gfx1250, otherwise arch-dependent
-        if get_arch() in ("gfx1250",):
-            NUM_WGS = 256
-        else:
-            NUM_WGS = torch.cuda.get_device_properties(x.device).multi_processor_count
+        # Should be 256 for gfx12
+        NUM_WGS = torch.cuda.get_device_properties(x.device).multi_processor_count
 
         if config is None:
             config, _ = get_gemm_config(
@@ -146,17 +156,10 @@ def gemm_a16w16_(
             )
 
             _LOGGER.info(
-                f"GEMM_A16W16 [gluon/gfx1250, persistent]: x={tuple(x.shape)} "
-                f"w={tuple(w.shape)}"
+                "GEMM_A16W16 [gluon/gfx1250, persistent]: x=%s w=%s",
+                x.shape,
+                w.shape,
             )
-            assert x.dtype in (
-                torch.float16,
-                torch.bfloat16,
-            ), f"Activations (x) must be fp16 or bf16, got {x.dtype}"
-            assert w.dtype in (
-                torch.float16,
-                torch.bfloat16,
-            ), f"Weights (w) must be fp16 or bf16, got {w.dtype}"
 
             kernel_type_from_config = config.pop("kernel_type", None)
             if kernel_type_from_config is not None:
@@ -222,7 +225,9 @@ def gemm_a16w16_(
             )
 
             _LOGGER.info(
-                f"GEMM_A16W16 [gluon, persistent]: x={tuple(x.shape)} w={tuple(w.shape)}"
+                "GEMM_A16W16 [gluon, persistent]: x=%s w=%s",
+                x.shape,
+                w.shape,
             )
 
             # sgpr spills to 0
@@ -232,9 +237,7 @@ def gemm_a16w16_(
 
             out_ptr = y if NUM_KSPLIT == 1 else y_pp
 
-            NUM_SMS = 256
-
-            _GLUON_PERSISTENT_KERNEL_MAP[kernel_type][(NUM_SMS,)](
+            _GLUON_PERSISTENT_KERNEL_MAP[kernel_type][(NUM_WGS,)](
                 x,
                 w,
                 bias,
@@ -263,7 +266,7 @@ def gemm_a16w16_(
                 USE_ACTIVATION=activation is not None,
                 ADD_BIAS=(bias is not None),
                 SKIP_REDUCE=bool(skip_reduce),
-                NUM_SMS=NUM_SMS,
+                NUM_SMS=NUM_WGS,
                 NUM_PID_N=num_pid_n,
                 num_warps=num_warps,
                 num_stages=num_stages,
@@ -308,7 +311,9 @@ def gemm_a16w16_(
             return y
 
         _LOGGER.info(
-            f"GEMM_A16W16 [triton, persistent]: x={tuple(x.shape)} w={tuple(w.shape)}"
+            "GEMM_A16W16 [triton, persistent]: x=%s w=%s",
+            x.shape,
+            w.shape,
         )
 
         w = w.T
@@ -345,7 +350,7 @@ def gemm_a16w16_(
         )
 
         return y
-
+     
     if backend == "gluon":
         assert (
             _is_gluon_available()
@@ -360,18 +365,12 @@ def gemm_a16w16_(
             kernel_type in _KERNEL_MAP
         ), f"Unknown kernel_type '{kernel_type}', must be one of {list(_KERNEL_MAP.keys())}"
         _LOGGER.info(
-            f"GEMM_A16W16 [gluon/gfx1250]: x={tuple(x.shape)} w={tuple(w.shape)} "
-            f"kernel={kernel_type}"
+            "GEMM_A16W16 [gluon/gfx1250]: x=%s w=%s kernel=%s",
+            x.shape,
+            w.shape,
+            kernel_type,
         )
-        assert x.dtype in (
-            torch.float16,
-            torch.bfloat16,
-        ), f"Activations (x) must be fp16 or bf16, got {x.dtype}"
-        assert w.dtype in (
-            torch.float16,
-            torch.bfloat16,
-        ), f"Weights (w) must be fp16 or bf16, got {w.dtype}"
-        assert x.shape[1] == w.shape[1], "Incompatible matrix shapes."
+       
 
         M, K = x.shape
         N, _ = w.shape
@@ -398,9 +397,14 @@ def gemm_a16w16_(
             if depth_cap < _MIN_BUFFERS[kernel_type]:
                 needed = _MIN_BUFFERS[kernel_type] + _DEPTH_SLACK.get(kernel_type, 0)
                 _LOGGER.warning(
-                    f"GEMM_A16W16 [gluon/gfx1250]: kernel_type='{kernel_type}' needs "
-                    f"num_k_tiles>={needed} but num_k_tiles={num_k_tiles} "
-                    f"(K={K}, BLOCK_K={BLOCK_K}); falling back to kernel_type='bandwidth_bound'."
+                    "GEMM_A16W16 [gluon/gfx1250]: kernel_type='%s' needs "
+                    "num_k_tiles>=%s but num_k_tiles=%s (K=%s, BLOCK_K=%s); "
+                    "defaults to kernel_type='bandwidth_bound'.",
+                    kernel_type,
+                    needed,
+                    num_k_tiles,
+                    K,
+                    BLOCK_K,
                 )
                 kernel_type = "bandwidth_bound"
                 depth_cap = num_k_tiles
@@ -438,7 +442,9 @@ def gemm_a16w16_(
         grid = (triton.cdiv(M, BLOCK_M) * triton.cdiv(N, BLOCK_N), 1)
 
         _LOGGER.info(
-            f"GEMM_A16W16 [gluon, non-persistent]: x={tuple(x.shape)} w={tuple(w.shape)}"
+            "GEMM_A16W16 [gluon, non-persistent]: x=%s w=%s",
+            x.shape,
+            w.shape,
         )
 
         _KERNEL_MAP[kernel_type][grid](
@@ -473,9 +479,7 @@ def gemm_a16w16_(
 
         return y
 
-    _LOGGER.info(f"GEMM_A16W16 [triton]: x={tuple(x.shape)} w={tuple(w.shape)}")
-
-    assert x.shape[1] == w.shape[1], "Incompatible matrix shapes."
+    _LOGGER.info("GEMM_A16W16 [triton]: x=%s w=%s", x.shape, w.shape)
 
     M, K = x.shape
     N, K = w.shape

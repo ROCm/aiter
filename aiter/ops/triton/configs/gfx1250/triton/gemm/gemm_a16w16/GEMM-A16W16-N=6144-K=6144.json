@@ -1,29 +1,29 @@
 {
     "M_LEQ_512": {
-        "num_warps": 4,
         "BLOCK_SIZE_M": 128,
         "BLOCK_SIZE_N": 256,
         "BLOCK_SIZE_K": 64,
+        "num_warps": 4,
         "GROUP_SIZE_M": 1,
-        "cache_modifier": null,
-        "NUM_KSPLIT": 1
+        "NUM_KSPLIT": 1,
+        "cache_modifier": null
     },
     "M_LEQ_2048": {
-        "num_warps": 8,
         "BLOCK_SIZE_M": 256,
         "BLOCK_SIZE_N": 128,
         "BLOCK_SIZE_K": 128,
+        "num_warps": 8,
         "GROUP_SIZE_M": 1,
-        "cache_modifier": null,
-        "NUM_KSPLIT": 1
+        "NUM_KSPLIT": 1,
+        "cache_modifier": null
     },
     "any": {
-        "num_warps": 8,
         "BLOCK_SIZE_M": 256,
         "BLOCK_SIZE_N": 256,
         "BLOCK_SIZE_K": 64,
+        "num_warps": 8,
         "GROUP_SIZE_M": 1,
-        "cache_modifier": null,
-        "NUM_KSPLIT": 1
+        "NUM_KSPLIT": 1,
+        "cache_modifier": null
     }
 }

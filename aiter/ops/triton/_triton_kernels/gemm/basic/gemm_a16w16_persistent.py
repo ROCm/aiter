@@ -84,6 +84,11 @@ def gemm_a16w16_persistent_kernel_(
     tl.assume(stride_ck > 0)
     tl.assume(stride_cm > 0)
     tl.assume(stride_cn > 0)
+    tl.assume(M > 0)
+    tl.assume(N > 0)
+    tl.assume(K > 0)
+    tl.assume(num_tiles > 0)
+    tl.assume(NUM_WGS > 0)
 
     start_pid = tl.program_id(axis=0)
     num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)

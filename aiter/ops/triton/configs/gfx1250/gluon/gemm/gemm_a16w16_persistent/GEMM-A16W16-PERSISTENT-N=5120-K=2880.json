@@ -30,9 +30,9 @@
         "NUM_BUFFERS": 2,
         "num_warps": 2,
         "GROUP_SIZE_M": 1,
+        "num_stages": 1,
         "NUM_KSPLIT": 1,
-        "kernel_type": "compute_bound",
-        "num_stages": 1
+        "kernel_type": "compute_bound"
     },
     "any": {
         "BLOCK_M": 256,
@@ -41,9 +41,9 @@
         "NUM_BUFFERS": 4,
         "num_warps": 4,
         "GROUP_SIZE_M": 3,
-        "NUM_KSPLIT": 1,
-        "kernel_type": "compute_bound",
         "num_stages": 1,
-        "waves_per_eu": 1
+        "waves_per_eu": 1,
+        "NUM_KSPLIT": 1,
+        "kernel_type": "compute_bound"
     }
 }

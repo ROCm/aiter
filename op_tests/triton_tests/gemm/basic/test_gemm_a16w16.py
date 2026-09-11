@@ -235,7 +235,7 @@ def test_gemm_a16w16_persistent_output(M: int, N: int, K: int, layout, output, b
 
     if output:
         triton_out = gemm_a16w16(
-            x, w, None, torch.bfloat16, y, backend=backend, persistent=True
+            x, w, dtype=torch.bfloat16, y=y, backend=backend, persistent=True
         )
     else:
         triton_out = gemm_a16w16(
