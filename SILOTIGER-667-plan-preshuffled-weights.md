@@ -32,7 +32,7 @@ spot-check when the hot loop or wait/reduce path changed.
 - [x] 1. Host API: opt-in `k_contiguous` | `preshuffled` (default `k_contiguous`)
 - [x] 2. Pin the preshuffle contract per dtype (same helper fused MoE uses)
 - [x] 3. i32/byte kpack views + i64 expert base on the `preshuffled` path
-- [ ] 4. Lane→kpack gather map (wave still owns output scalars; `v_dot2`)
+- [x] 4. Lane→kpack gather map (wave still owns output scalars; `v_dot2`)
 - [ ] 5. Op_test both layouts; fail loudly on illegal `preshuffled` shapes
 
 ## Locked decisions
@@ -123,8 +123,7 @@ the fused **w2** helper (`gate_up=False`), not fused stage1
 | MXFP4 | `shuffle_weight_a16w4(w, 16, False)` | a16wmix `layout_b` `(N/16, (K/2)/64, 4, 16, 16)` | 16 | 1 (bytes) | INTER / HIDDEN `% 16 == 0` | `HIDDEN//2` / `INTER//2` `% 64 == 0` (unpacked K `% 128`) |
 
 Host wrappers reject any other N/K on `weight_layout='preshuffled'` (do not
-guess from strides). Legal `preshuffled` shapes still raise *not implemented*
-until subtasks 3–4.
+guess from strides).
 
 - [x] Document the permutation + kpack size per weight dtype (gate/up vs down
       N/K: INTER vs HIDDEN).
@@ -148,11 +147,9 @@ modernization item moves it. Do not block `preshuffled` B on that.
 - [x] **Done when:** no fake unpacked FP8/FP4 element layout; expert base is
       folded, in-expert offsets i32-safe.
 
-Host still rejects `weight_layout='preshuffled'` until subtask 4 (lane map +
-numerics vs fused-MoE buffers). Builders take compile-time `preshuffled=`;
-the kpack path is covered by the in-expert load probe. Do **not** `if
-preshuffled` in the `@flyc.kernel` body (SSA live-out / `w_word_base`
-`NameError`); dispatch in Python helpers that return a complete bundle.
+Builders take compile-time `preshuffled=`. Do **not** `if preshuffled` in the
+`@flyc.kernel` body (SSA live-out / `w_word_base` `NameError`); dispatch in
+Python helpers that return a complete bundle.
 
 ### 4. Lane→kpack gather map (still `v_dot2`)
 
@@ -165,11 +162,15 @@ Specialize at compile time (`const_expr(preshuffled)` / two builders). Flatten
 address math so nothing is defined only inside a `const_expr` if/else and
 used after the branch.
 
-- [ ] New lane→kpack map for gate/up and down.
-- [ ] Compute stays `v_dot2` (`cvt_scalef32_pk_bf16_{fp8,fp4}` + G7 drain).
-- [ ] **Done when:** `preshuffled` B matches today’s numerics on the
+- [x] New lane→kpack map for gate/up and down.
+- [x] Compute stays `v_dot2` (`cvt_scalef32_pk_bf16_{fp8,fp4}` + G7 drain).
+- [x] **Done when:** `preshuffled` B matches today’s numerics on the
       preshuffled buffer the MFMA path already uses (no extra unpack staging);
       `k_contiguous` path still matches existing op_test.
+
+`_logical_nk_to_kpack_i32` is the lane gather (logical `(n, k_packed)` → kpack
+crd). Host passes `preshuffled=True` into `_get_*` / builders; callers supply
+already-shuffled tensors (`shuffle_weight` / `shuffle_weight_a16w4(..., False)`).
 
 ### 5. Op_test both layouts; fail loudly on illegal `preshuffled` shapes
 

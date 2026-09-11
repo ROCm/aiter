@@ -118,12 +118,8 @@ def _require_preshuffled_b_shape(
         )
 
 
-def _reject_unimplemented_preshuffle(weight_layout: WeightLayout) -> None:
-    if weight_layout is WeightLayout.PRESHUFFLED:
-        raise ValueError(
-            "weight_layout='preshuffled' is not implemented yet; "
-            f"use weight_layout={WeightLayout.K_CONTIGUOUS.value!r}"
-        )
+def _preshuffled_flag(weight_layout: WeightLayout) -> bool:
+    return weight_layout is WeightLayout.PRESHUFFLED
 
 
 def _default_use_dot2() -> bool:
@@ -151,6 +147,7 @@ def _get_gate_up(
     scale_bk,
     num_experts,
     dot2_acc,
+    preshuffled,
 ):
     return build_gate_up_fp8_module(
         hidden,
@@ -163,6 +160,7 @@ def _get_gate_up(
         scale_bk=scale_bk,
         num_experts=num_experts,
         dot2_acc=dot2_acc,
+        preshuffled=preshuffled,
     )
 
 
@@ -180,6 +178,7 @@ def _get_down_reduce(
     k_batch,
     num_experts,
     dot2_acc,
+    preshuffled,
 ):
     return build_down_reduce_fp8_module(
         inter,
@@ -194,12 +193,21 @@ def _get_down_reduce(
         k_batch=k_batch,
         num_experts=num_experts,
         dot2_acc=dot2_acc,
+        preshuffled=preshuffled,
     )
 
 
 @functools.lru_cache(maxsize=64)
 def _get_gate_up_fp8_act(
-    hidden, inter, top_k, kvector, serialize_dot2, scale_bn, scale_bk, num_experts
+    hidden,
+    inter,
+    top_k,
+    kvector,
+    serialize_dot2,
+    scale_bn,
+    scale_bk,
+    num_experts,
+    preshuffled,
 ):
     return build_gate_up_fp8_act_module(
         hidden,
@@ -210,11 +218,14 @@ def _get_gate_up_fp8_act(
         scale_bn=scale_bn,
         scale_bk=scale_bk,
         num_experts=num_experts,
+        preshuffled=preshuffled,
     )
 
 
 @functools.lru_cache(maxsize=64)
-def _get_gate_up_bf16(hidden, inter, top_k, kvector, serialize_dot2, use_dot2):
+def _get_gate_up_bf16(
+    hidden, inter, top_k, kvector, serialize_dot2, use_dot2, preshuffled
+):
     return build_gate_up_bf16_module(
         hidden,
         inter,
@@ -222,12 +233,13 @@ def _get_gate_up_bf16(hidden, inter, top_k, kvector, serialize_dot2, use_dot2):
         kvector=kvector,
         serialize_dot2=serialize_dot2,
         use_dot2=use_dot2,
+        preshuffled=preshuffled,
     )
 
 
 @functools.lru_cache(maxsize=64)
 def _get_down_reduce_bf16(
-    inter, hidden, top_k, kvector, serialize_dot2, kh_per_warp, use_dot2
+    inter, hidden, top_k, kvector, serialize_dot2, kh_per_warp, use_dot2, preshuffled
 ):
     return build_down_reduce_bf16_module(
         inter,
@@ -237,12 +249,21 @@ def _get_down_reduce_bf16(
         serialize_dot2=serialize_dot2,
         kh_per_warp=kh_per_warp,
         use_dot2=use_dot2,
+        preshuffled=preshuffled,
     )
 
 
 @functools.lru_cache(maxsize=64)
 def _get_gate_up_fp4(
-    hidden, inter, top_k, kvector, serialize_dot2, scale_bn, scale_bk, dot2_acc
+    hidden,
+    inter,
+    top_k,
+    kvector,
+    serialize_dot2,
+    scale_bn,
+    scale_bk,
+    dot2_acc,
+    preshuffled,
 ):
     return build_gate_up_fp4_module(
         hidden,
@@ -253,6 +274,7 @@ def _get_gate_up_fp4(
         scale_bn=scale_bn,
         scale_bk=scale_bk,
         dot2_acc=dot2_acc,
+        preshuffled=preshuffled,
     )
 
 
@@ -268,6 +290,7 @@ def _get_down_reduce_fp4(
     kh_per_warp,
     dot2_acc,
     prefetch,
+    preshuffled,
 ):
     return build_down_reduce_fp4_module(
         inter,
@@ -280,6 +303,7 @@ def _get_down_reduce_fp4(
         kh_per_warp=kh_per_warp,
         dot2_acc=dot2_acc,
         prefetch=prefetch,
+        preshuffled=preshuffled,
     )
 
 
@@ -372,8 +396,9 @@ def flydsl_warp_decode_gate_up(
         dot2_acc:     G7 dot2 ILP -- number of independent f32 accumulators for the
                       s_nop-free multi-accumulator dot2 (>1 enables the drain form;
                       1 = serialized ``s_nop 2`` baseline). Correctness-invariant.
-        weight_layout: ``k_contiguous`` (default) or ``preshuffled`` (fused-MoE B;
-            not implemented yet). Never inferred from strides.
+        weight_layout: ``k_contiguous`` (default) or ``preshuffled`` (fused-MoE B
+            from ``shuffle_weight`` / ``shuffle_weight_a16w4``). Never inferred
+            from strides.
         out:          optional [B, TOPK, INTER] bfloat16 output buffer.
 
     Returns:
@@ -397,8 +422,6 @@ def flydsl_warp_decode_gate_up(
         spec=_PRESHUFFLE_FP8,
         what="w_gate/w_up",
     )
-    _reject_unimplemented_preshuffle(weight_layout)
-
     scale_bn = scale_bk = None
     if w_scale_mode == "block2d":
         if scale_block is None:
@@ -422,6 +445,7 @@ def flydsl_warp_decode_gate_up(
         scale_bk,
         E,
         dot2_acc,
+        _preshuffled_flag(weight_layout),
     )
     grid_x = B * TOPK * INTER
     _run_compiled(
@@ -472,8 +496,9 @@ def flydsl_warp_decode_gate_up_fp8act(
             [(E*INTER)//BN * HIDDEN//BK] over (row-block, K-block).
         scale_block:  (BN, BK) weight-scale block dims (default (128,128)).
         x_scale_bk:   activation-scale K-block (default 128, CK ``kBXK``).
-        weight_layout: ``k_contiguous`` (default) or ``preshuffled`` (fused-MoE B;
-            not implemented yet). Never inferred from strides.
+        weight_layout: ``k_contiguous`` (default) or ``preshuffled`` (fused-MoE B
+            from ``shuffle_weight`` / ``shuffle_weight_a16w4``). Never inferred
+            from strides.
         out:          optional [B, TOPK, INTER] bfloat16 output buffer.
 
     Returns:
@@ -495,8 +520,6 @@ def flydsl_warp_decode_gate_up_fp8act(
         spec=_PRESHUFFLE_FP8,
         what="w_gate/w_up",
     )
-    _reject_unimplemented_preshuffle(weight_layout)
-
     scale_bn, scale_bk = int(scale_block[0]), int(scale_block[1])
     assert (E * INTER) % scale_bn == 0, "(E*INTER) must be divisible by BN"
     assert HIDDEN % scale_bk == 0, "HIDDEN must be divisible by BK"
@@ -510,7 +533,15 @@ def flydsl_warp_decode_gate_up_fp8act(
         out = torch.empty((B, TOPK, INTER), dtype=torch.bfloat16, device=x.device)
 
     launcher = _get_gate_up_fp8_act(
-        HIDDEN, INTER, TOPK, kvector, serialize_dot2, scale_bn, scale_bk, E
+        HIDDEN,
+        INTER,
+        TOPK,
+        kvector,
+        serialize_dot2,
+        scale_bn,
+        scale_bk,
+        E,
+        _preshuffled_flag(weight_layout),
     )
     grid_x = B * TOPK * INTER
     _run_compiled(
@@ -566,8 +597,9 @@ def flydsl_warp_decode_gate_up_fp4(
             occupancy-bound); ``>1`` enables the s_nop-free ILP path (see builder).
         kvector:      elements/lane/iter; ``None`` auto-picks the largest that tiles
             HIDDEN (32/16/8, see :func:`pick_kvector_fp4`). Override for A/B.
-        weight_layout: ``k_contiguous`` (default) or ``preshuffled`` (fused-MoE B;
-            not implemented yet). Never inferred from strides.
+        weight_layout: ``k_contiguous`` (default) or ``preshuffled`` (fused-MoE B
+            from ``shuffle_weight`` / ``shuffle_weight_a16w4``). Never inferred
+            from strides.
         out:          optional [B, TOPK, INTER] bfloat16 output buffer.
 
     Returns:
@@ -593,8 +625,6 @@ def flydsl_warp_decode_gate_up_fp4(
         spec=_PRESHUFFLE_MXFP4,
         what="w_gate/w_up",
     )
-    _reject_unimplemented_preshuffle(weight_layout)
-
     scale_bn, scale_bk = int(scale_block[0]), int(scale_block[1])
     assert (E * INTER) % scale_bn == 0, "(E*INTER) must be divisible by BN"
     assert HIDDEN % scale_bk == 0, "HIDDEN must be divisible by BK"
@@ -605,7 +635,15 @@ def flydsl_warp_decode_gate_up_fp4(
         out = torch.empty((B, TOPK, INTER), dtype=torch.bfloat16, device=x.device)
 
     launcher = _get_gate_up_fp4(
-        HIDDEN, INTER, TOPK, kvector, serialize_dot2, scale_bn, scale_bk, dot2_acc
+        HIDDEN,
+        INTER,
+        TOPK,
+        kvector,
+        serialize_dot2,
+        scale_bn,
+        scale_bk,
+        dot2_acc,
+        _preshuffled_flag(weight_layout),
     )
     grid_x = B * TOPK * INTER
     _run_compiled(
@@ -671,8 +709,9 @@ def flydsl_warp_decode_down_reduce(
         dot2_acc:     G7 dot2 ILP -- number of independent f32 accumulators for the
             s_nop-free multi-accumulator dot2 (>1 enables the drain form; 1 =
             serialized ``s_nop 2`` baseline). Correctness-invariant.
-        weight_layout: ``k_contiguous`` (default) or ``preshuffled`` (fused-MoE B;
-            not implemented yet). Never inferred from strides.
+        weight_layout: ``k_contiguous`` (default) or ``preshuffled`` (fused-MoE B
+            from ``shuffle_weight`` / ``shuffle_weight_a16w4``). Never inferred
+            from strides.
         out:          optional [B, HIDDEN] bfloat16 output buffer.
 
     Returns:
@@ -697,8 +736,6 @@ def flydsl_warp_decode_down_reduce(
         spec=_PRESHUFFLE_FP8,
         what="w_down",
     )
-    _reject_unimplemented_preshuffle(weight_layout)
-
     scale_bn = scale_bk = None
     if w_scale_mode == "block2d":
         if scale_block is None:
@@ -732,6 +769,7 @@ def flydsl_warp_decode_down_reduce(
         split_k,
         E,
         dot2_acc,
+        _preshuffled_flag(weight_layout),
     )
     # Split-K writes FP32 partials via atomic-add into a caller-zeroed accumulator;
     # the plain path stores bf16 directly to `out` (Locked decision, main plan ?1.2).
@@ -784,8 +822,9 @@ def flydsl_warp_decode_gate_up_bf16(
                       ``False`` the arch-agnostic scalar-f32 fallback (gfx942 path),
                       ``None`` auto-selects by arch. Forced ``False`` on gfx950 validates
                       the fallback math against the dot2 path.
-        weight_layout: ``k_contiguous`` (default) or ``preshuffled`` (fused-MoE B;
-            not implemented yet). Never inferred from strides.
+        weight_layout: ``k_contiguous`` (default) or ``preshuffled`` (fused-MoE B
+            from ``shuffle_weight`` / ``shuffle_weight_a16w4``). Never inferred
+            from strides.
         out:          optional [B, TOPK, INTER] bfloat16 output buffer.
 
     Returns:
@@ -809,15 +848,21 @@ def flydsl_warp_decode_gate_up_bf16(
         spec=_PRESHUFFLE_BF16,
         what="w_gate/w_up",
     )
-    _reject_unimplemented_preshuffle(weight_layout)
-
     if use_dot2 is None:
         use_dot2 = _default_use_dot2()
     kvector = pick_kvector(HIDDEN)
     if out is None:
         out = torch.empty((B, TOPK, INTER), dtype=torch.bfloat16, device=x.device)
 
-    launcher = _get_gate_up_bf16(HIDDEN, INTER, TOPK, kvector, serialize_dot2, use_dot2)
+    launcher = _get_gate_up_bf16(
+        HIDDEN,
+        INTER,
+        TOPK,
+        kvector,
+        serialize_dot2,
+        use_dot2,
+        _preshuffled_flag(weight_layout),
+    )
     grid_x = B * TOPK * INTER
     _run_compiled(
         launcher,
@@ -860,8 +905,9 @@ def flydsl_warp_decode_down_reduce_bf16(
                       ``False`` the arch-agnostic scalar-f32 fallback (gfx942 path),
                       ``None`` auto-selects by arch. Forced ``False`` on gfx950 validates
                       the fallback math against the dot2 path.
-        weight_layout: ``k_contiguous`` (default) or ``preshuffled`` (fused-MoE B;
-            not implemented yet). Never inferred from strides.
+        weight_layout: ``k_contiguous`` (default) or ``preshuffled`` (fused-MoE B
+            from ``shuffle_weight`` / ``shuffle_weight_a16w4``). Never inferred
+            from strides.
         out:          optional [B, HIDDEN] bfloat16 output buffer.
 
     Returns:
@@ -884,8 +930,6 @@ def flydsl_warp_decode_down_reduce_bf16(
         spec=_PRESHUFFLE_BF16,
         what="w_down",
     )
-    _reject_unimplemented_preshuffle(weight_layout)
-
     if kh_per_warp is None:
         kh_per_warp = 2 if HIDDEN % 2 == 0 else 1
     assert HIDDEN % kh_per_warp == 0, "HIDDEN must be divisible by kh_per_warp"
@@ -897,7 +941,14 @@ def flydsl_warp_decode_down_reduce_bf16(
         out = torch.empty((B, HIDDEN), dtype=torch.bfloat16, device=intermediate.device)
 
     launcher = _get_down_reduce_bf16(
-        INTER, HIDDEN, TOPK, kvector, serialize_dot2, kh_per_warp, use_dot2
+        INTER,
+        HIDDEN,
+        TOPK,
+        kvector,
+        serialize_dot2,
+        kh_per_warp,
+        use_dot2,
+        _preshuffled_flag(weight_layout),
     )
     grid_x = B * (HIDDEN // kh_per_warp)
     _run_compiled(
@@ -954,8 +1005,9 @@ def flydsl_warp_decode_down_reduce_fp4(
             INTER (32/16/8, see :func:`pick_kvector_fp4`). Override for A/B.
         prefetch:     G8 software prefetch -- hoist all weight/scale loads ahead of
             the converts (default off; A/B lever for B=1 cold-HBM).
-        weight_layout: ``k_contiguous`` (default) or ``preshuffled`` (fused-MoE B;
-            not implemented yet). Never inferred from strides.
+        weight_layout: ``k_contiguous`` (default) or ``preshuffled`` (fused-MoE B
+            from ``shuffle_weight`` / ``shuffle_weight_a16w4``). Never inferred
+            from strides.
         out:          optional [B, HIDDEN] bfloat16 output buffer.
 
     Returns:
@@ -998,8 +1050,6 @@ def flydsl_warp_decode_down_reduce_fp4(
         spec=_PRESHUFFLE_MXFP4,
         what="w_down",
     )
-    _reject_unimplemented_preshuffle(weight_layout)
-
     if kh_per_warp is None:
         kh_per_warp = 2 if HIDDEN % 2 == 0 else 1
     assert HIDDEN % kh_per_warp == 0, "HIDDEN must be divisible by kh_per_warp"
@@ -1020,6 +1070,7 @@ def flydsl_warp_decode_down_reduce_fp4(
         kh_per_warp,
         dot2_acc,
         prefetch,
+        _preshuffled_flag(weight_layout),
     )
     grid_x = B * (HIDDEN // kh_per_warp)
     _run_compiled(
@@ -1073,7 +1124,7 @@ def flydsl_warp_decode_moe(
       (or packed along HIDDEN), and ``w_down`` is ``[E, HIDDEN, INTER]``
       (or packed along INTER).
     * ``preshuffled``: the fused-MoE B layout from ``shuffle_weight`` /
-      ``make_preshuffle_b_layout``. Not implemented yet.
+      ``make_preshuffle_b_layout`` (MXFP4: ``shuffle_weight_a16w4(..., False)``).
 
     This wrapper does not sort routing metadata.
 
@@ -1128,8 +1179,6 @@ def flydsl_warp_decode_moe(
             spec=spec,
             what="w_down",
         )
-        _reject_unimplemented_preshuffle(weight_layout)
-
     if w_gate.dtype == torch.bfloat16:
         if any(s is not None for s in (w_gate_scale, w_up_scale, w_down_scale)):
             raise ValueError("BF16 warp-decode weights do not take weight scales")

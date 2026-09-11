@@ -1122,20 +1122,12 @@ def test_combined_moe_rejects_stage_weight_layout_kwargs():
         )
 
 
-def test_weight_layout_rejects_preshuffled_and_unknown():
-    """preshuffled is opt-in but unimplemented until later subtasks."""
+def test_weight_layout_rejects_unknown():
+    """Layout is an explicit flag; unknown names are not inferred."""
     x = torch.empty((1, 512), dtype=torch.bfloat16, device="cuda")
     w = torch.empty((1, 512, 512), dtype=torch.bfloat16, device="cuda")
     ids = torch.zeros((1, 1), dtype=torch.int32, device="cuda")
     weights = torch.ones((1, 1), dtype=torch.float32, device="cuda")
-    with pytest.raises(ValueError, match="not implemented yet"):
-        flydsl_warp_decode_moe(x, w, w, w, ids, weights, weight_layout="preshuffled")
-    with pytest.raises(ValueError, match="not implemented yet"):
-        flydsl_warp_decode_moe(
-            x, w, w, w, ids, weights, weight_layout=WeightLayout.PRESHUFFLED
-        )
-    with pytest.raises(ValueError, match="not implemented yet"):
-        flydsl_warp_decode_gate_up(x, w, w, ids, w, w, weight_layout="preshuffled")
     with pytest.raises(ValueError, match="unsupported weight_layout"):
         flydsl_warp_decode_moe(x, w, w, w, ids, weights, weight_layout="logical")
 
@@ -1224,6 +1216,154 @@ def test_preshuffled_expert_kpack_view_loads_one_dword():
     torch.cuda.synchronize()
     ref = w[expert, n_idx].view(torch.int32)[k_packed // 4].item()
     assert int(out[0].item()) == ref
+
+
+def _shuffle_warp_decode_b(w, *, mxfp4: bool = False):
+    """Host-side fused-MoE B permute; kernel must not shuffle."""
+    if mxfp4:
+        from aiter.ops.shuffle import shuffle_weight_a16w4
+
+        return shuffle_weight_a16w4(w, 16, False).contiguous()
+    from aiter.ops.shuffle import shuffle_weight
+
+    return shuffle_weight(w, layout=(16, 16)).contiguous()
+
+
+def _assert_match_k_contiguous(out_k, out_p, *, what: str, thresh: float = 0.999):
+    torch.cuda.synchronize()
+    cos = _cosine(out_k, out_p)
+    print(f"[preshuffled {what}] cos_vs_k_contiguous={cos:.6f}")
+    assert cos >= thresh, f"{what}: preshuffled vs k_contiguous cos={cos:.6f}"
+
+
+@pytest.mark.skipif(not _HAS_FP8, reason="torch build lacks float8_e4m3fn")
+def test_preshuffled_fp8_gate_up_matches_k_contiguous():
+    """Lane kpack gather on shuffled B matches k_contiguous v_dot2."""
+    _name, B, HIDDEN, INTER, E, TOPK, mode, scale_block = GATE_UP_CASES[2]
+    x, w_gate, w_up, router_ids, wgs, wus = _gen_gate_up(
+        B, HIDDEN, INTER, E, TOPK, mode, scale_block
+    )
+    out_k = flydsl_warp_decode_gate_up(x, w_gate, w_up, router_ids, wgs, wus)
+    out_p = flydsl_warp_decode_gate_up(
+        x,
+        _shuffle_warp_decode_b(w_gate),
+        _shuffle_warp_decode_b(w_up),
+        router_ids,
+        wgs,
+        wus,
+        weight_layout=WeightLayout.PRESHUFFLED,
+    )
+    _assert_match_k_contiguous(out_k, out_p, what="fp8 gate_up")
+
+
+@pytest.mark.skipif(not _HAS_FP8, reason="torch build lacks float8_e4m3fn")
+def test_preshuffled_fp8_down_matches_k_contiguous():
+    _name, B, INTER, HIDDEN, E, TOPK, mode, scale_block = DOWN_CASES[2]
+    inter, w_down, router_ids, router_wts, wds = _gen_down(
+        B, INTER, HIDDEN, E, TOPK, mode, scale_block
+    )
+    out_k = flydsl_warp_decode_down_reduce(
+        inter, w_down, router_ids, router_wts, wds, w_scale_mode=mode
+    )
+    out_p = flydsl_warp_decode_down_reduce(
+        inter,
+        _shuffle_warp_decode_b(w_down),
+        router_ids,
+        router_wts,
+        wds,
+        w_scale_mode=mode,
+        weight_layout=WeightLayout.PRESHUFFLED,
+    )
+    _assert_match_k_contiguous(out_k, out_p, what="fp8 down")
+
+
+@pytest.mark.skipif(not _HAS_FP8, reason="torch build lacks float8_e4m3fn")
+def test_preshuffled_fp8_combined_matches_k_contiguous():
+    """HIDDEN=INTER=512 tiles kVector and is legal N-major kpack on both stages."""
+    B, HIDDEN, INTER, E, TOPK = 1, 512, 512, 2, 1
+    x, w_gate, w_up, router_ids, wgs, wus = _gen_gate_up(
+        B, HIDDEN, INTER, E, TOPK, "pertensor"
+    )
+    _, w_down, _, router_wts, wds = _gen_down(B, INTER, HIDDEN, E, TOPK, "pertensor")
+    out_k = flydsl_warp_decode_moe(
+        x, w_gate, w_up, w_down, router_ids, router_wts, wgs, wus, wds
+    )
+    out_p = flydsl_warp_decode_moe(
+        x,
+        _shuffle_warp_decode_b(w_gate),
+        _shuffle_warp_decode_b(w_up),
+        _shuffle_warp_decode_b(w_down),
+        router_ids,
+        router_wts,
+        wgs,
+        wus,
+        wds,
+        weight_layout=WeightLayout.PRESHUFFLED,
+    )
+    _assert_match_k_contiguous(out_k, out_p, what="fp8 combined")
+
+
+def test_preshuffled_bf16_matches_k_contiguous():
+    B, HIDDEN, INTER, E, TOPK = 1, 512, 256, 8, 2
+    x, w_gate, w_up, router_ids = _gen_bf16_gate_up(B, HIDDEN, INTER, E, TOPK)
+    inter, w_down, _, router_wts = _gen_bf16_down(B, 512, 256, E, TOPK)
+    g_k = flydsl_warp_decode_gate_up_bf16(x, w_gate, w_up, router_ids)
+    g_p = flydsl_warp_decode_gate_up_bf16(
+        x,
+        _shuffle_warp_decode_b(w_gate),
+        _shuffle_warp_decode_b(w_up),
+        router_ids,
+        weight_layout=WeightLayout.PRESHUFFLED,
+    )
+    _assert_match_k_contiguous(g_k, g_p, what="bf16 gate_up")
+    d_k = flydsl_warp_decode_down_reduce_bf16(inter, w_down, router_ids, router_wts)
+    d_p = flydsl_warp_decode_down_reduce_bf16(
+        inter,
+        _shuffle_warp_decode_b(w_down),
+        router_ids,
+        router_wts,
+        weight_layout=WeightLayout.PRESHUFFLED,
+    )
+    _assert_match_k_contiguous(d_k, d_p, what="bf16 down")
+
+
+def test_preshuffled_fp4_matches_k_contiguous():
+    B, HIDDEN, INTER, E, TOPK, kvector = GATE_UP_FP4_CASES[0][1:]
+    x, w_gate, w_up, wgs, wus, router_ids, _gdeq, _udeq = _gen_gate_up_fp4(
+        B, HIDDEN, INTER, E, TOPK
+    )
+    g_k = flydsl_warp_decode_gate_up_fp4(
+        x, w_gate, w_up, router_ids, wgs, wus, kvector=kvector
+    )
+    g_p = flydsl_warp_decode_gate_up_fp4(
+        x,
+        _shuffle_warp_decode_b(w_gate, mxfp4=True),
+        _shuffle_warp_decode_b(w_up, mxfp4=True),
+        router_ids,
+        wgs,
+        wus,
+        kvector=kvector,
+        weight_layout=WeightLayout.PRESHUFFLED,
+    )
+    _assert_match_k_contiguous(g_k, g_p, what="fp4 gate_up")
+    name, B, INTER, HIDDEN, E, TOPK, kvector = DOWN_FP4_CASES[0]
+    del name
+    inter, w_down, w_scale, router_ids, router_wts, _deq = _gen_down_fp4(
+        B, INTER, HIDDEN, E, TOPK
+    )
+    d_k = flydsl_warp_decode_down_reduce_fp4(
+        inter, w_down, router_ids, router_wts, w_scale, kvector=kvector
+    )
+    d_p = flydsl_warp_decode_down_reduce_fp4(
+        inter,
+        _shuffle_warp_decode_b(w_down, mxfp4=True),
+        router_ids,
+        router_wts,
+        w_scale,
+        kvector=kvector,
+        weight_layout=WeightLayout.PRESHUFFLED,
+    )
+    _assert_match_k_contiguous(d_k, d_p, what="fp4 down")
 
 
 # -------------------------------------------------------------------------

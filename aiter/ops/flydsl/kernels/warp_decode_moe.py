@@ -142,7 +142,8 @@ def _kpack_load_i32(t, n, k_packed, *, elem_bytes: int):
         n, k_packed, elem_bytes=elem_bytes
     )
     tile = fx.slice(t, (n0, k0, klane, nlane, None))
-    return buf_copy_load(tile, ki)
+    val = buf_copy_load(tile, ki, fx.Int32)
+    return fx.Int32(val).ir_value()
 
 
 def _bf16_out_view(ptr):
