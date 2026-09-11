@@ -125,8 +125,17 @@ LDS_SLOT_BYTES = 64 * 1024
 
 DEFAULT_N_BLOCK = 64
 
-# Ping-pong K LDS buffers the main loop rotates through (double-buffered prefetch).
-N_KV_PP = 2
+# K|V LDS slots the main loop rotates through. 3 slots => prefetch distance 2: the
+# copy for tile i+2 is issued in body i, so two bodies cover its global->LDS latency.
+N_KV_PP = 3
+# Steady-state KV fence depth. True leaves tile t+1's copies in flight across the body
+# (the point of distance-2 prefetch); False drains every body, so only one tile is ever
+# outstanding. MEASURED case 10 @ init=fixed=0.25, 4-5 runs each (the box is ~2% noisy
+# now that the clocks are not pinned): partial min/med 1301/1317 us, full 1281/1293 --
+# partial loses ~1.5%. With 3 slots it has two of them under TDM writes while a third is
+# read, and that write traffic costs more than the extra latency cover buys. Revisit at
+# stage 4, where K/V producer specialization cuts the descriptor count.
+KV_PARTIAL_FENCE = False
 
 # log2(e): exp(x) = exp2(x * LOG2E). Softmax uses the native ISA exp2 intrinsic.
 LOG2E = 1.4426950408889634
@@ -176,7 +185,7 @@ PV_RING = 16
 PV_LAG = 4
 
 # Independent LDS sub-buffers one K (or V) tile is split across. The CALLER places them
-# (_k_lds_bufs/_v_lds_bufs) and the managers read the count off the list length, so this
+# (_k_bufs_at/_v_bufs_at) and the managers read the count off the list length, so this
 # constant never reaches a manager. 1 == today's single contiguous block (IR-identical);
 # >1 lets the halves of a tile be loaded and waited on separately (V2/TDM only).
 KV_LDS_SPLITS = 1
@@ -201,6 +210,36 @@ def _lane_id():
     return fx.Int32(
         rocdl_dialect.mbcnt_lo(T.i32, fx.Int32(-1).ir_value(), fx.Int32(0).ir_value())
     )
+
+
+def _kv_wait(num_tensorcnt=-1, num_asynccnt=-1):
+    """Retire outstanding K/V global->LDS copies down to the given per-counter depths.
+
+    A counter is waited only if the caller names it; the default -1 emits nothing for it.
+    Naming both is what lets a mixed loader pair (e.g. a V1 K manager on ``asynccnt`` with
+    a V2 V manager on ``tensorcnt``) share one fence. The counts are the CALLER's: each is
+    how many of THIS wave's copies may stay in flight past the wait."""
+    if num_tensorcnt >= 0:
+        tdm_ops.tensor_wait(num_tensorcnt)
+    if num_asynccnt >= 0:
+        rocdl.s_wait_asynccnt(num_asynccnt)
+
+
+def _kv_drain_depths(num_tensorcnt, num_asynccnt):
+    """The same counters a steady-state fence names, but fully drained."""
+    return (0 if num_tensorcnt >= 0 else -1, 0 if num_asynccnt >= 0 else -1)
+
+
+def _kv_fence(num_tensorcnt=-1, num_asynccnt=-1):
+    """``_kv_wait``, then publish the retired copies workgroup-wide.
+
+    The ``s_barrier`` is what publishes a wave's share of a tile to its peers -- the
+    counters only bound the issuing wave's own copies -- and it doubles as the WAR wall
+    for the slot about to be written."""
+    _kv_wait(num_tensorcnt, num_asynccnt)
+    rocdl.sched_barrier(0)
+    gpu.barrier()
+    rocdl.sched_barrier(0)
 
 
 def _load_seqlen_pair(ptr_tensor, idx):
@@ -807,11 +846,9 @@ def _core_attention(
     lane_idx = _lane_id()
     kv_head, q_head_idx, seq_idx = _packed_tile_indices(gqa_ratio, warp_idx, lane_idx)
 
-    # K/V staging: N_KV_PP ping-pong slots ([K.pp0|V.pp0][K.pp1|V.pp1]), blocks floored
-    # at 64KB. O reuses a non-current slot; Q time-shares slot 1, so the slot must also
-    # be >= the Q staging footprint (at qk_hdim=256 that exceeds K|V+128KB -> we grow the
-    # slot, "allocating additional space for K|V"; still occupancy=1). slot_bytes is
-    # compile-time (no allocation; lds_base is passed in).
+    # K/V staging: N_KV_PP slots of LDS_SLOT_BYTES each, slot i at lds_base + i*stride,
+    # laid out [K.i | V.i]. Q time-shares slots 1.. and O stages past all the slots; both
+    # are dead whenever a tile occupies the same bytes.
     if USE_TDM_LOADER:
         q_mgr = QManager16bV2(
             qk_hdim=qk_hdim,
@@ -876,8 +913,14 @@ def _core_attention(
             for s in range(KV_LDS_SPLITS)
         ]
 
+    def _k_bufs_at(slot):  # K sub-buffer bases of the slot starting at byte ``slot``
+        return _split_list(slot, k_split_stride)
+
+    def _v_bufs_at(slot):
+        return _split_list(slot + fx.Int32(k_blk_bytes), v_split_stride)
+
     def _k_lds_bufs(pp):
-        return _split_list(_k_lds_buf(pp), k_split_stride)
+        return _k_bufs_at(_k_lds_buf(pp))
 
     def _v_lds_bufs(pp):
         return _split_list(_v_lds_buf(pp), v_split_stride)
@@ -935,11 +978,12 @@ def _core_attention(
     # defensive min() keeps start_tile a valid buffer index even for an over-launched
     # WG whose whole band is empty (its per-element masks zero the work anyway).
     num_tiles = fx.ceildiv(kv_len_wg, fx.Int32(n_block))
+    last_tile = num_tiles - fx.Int32(1)  # always carries the kv_len tail
     if mask_left:
         wg_min_seq = (block_x * fx.Int32(BLOCK_M)) // fx.Int32(gqa_ratio)
         kv_lo = fx.max(wg_min_seq + causal_off - window_left, fx.Int32(0))
         start_tile = kv_lo // fx.Int32(n_block)
-        start_tile = fx.min(start_tile, fx.Int32(num_tiles) - fx.Int32(1))
+        start_tile = fx.min(start_tile, last_tile)
     else:
         start_tile = fx.Int32(0)
 
@@ -960,77 +1004,107 @@ def _core_attention(
     # (2) KMgr param calc — pure address arithmetic (no memory op), hoisted into the
     # Q global-load shadow.
     #
-    # Ping-pong parity is LOCAL to this WG's tile stream: the prologue always loads the
-    # first tile (start_tile) into buffer 0, and the main loop selects buffers by the
-    # 0-based LOCAL iteration index (not the absolute tile index), so start_tile parity
-    # is irrelevant. This lets the 2x-unrolled loop pick buffers at COMPILE time (even
-    # local iter -> buffer 0, odd -> buffer 1) and reach buffer 1 from buffer-0 ds_load
-    # pointers via a constant immediate offset.
-    start_pp = 0
+    # Slot rotation is LOCAL to this WG's tile stream: the prologue loads start_tile into
+    # slot 0 and start_tile+1 into slot 1, and the loop carries the slot bases as
+    # iter_args (rotated in the yield), so start_tile is irrelevant to the placement and
+    # no runtime "% N_KV_PP" is ever evaluated.
     start_row0 = start_tile * fx.Int32(n_block)
+    nx1_row0 = start_row0 + fx.Int32(n_block)
+    has_nx1 = start_tile + fx.Int32(1) < fx.Int32(num_tiles)
     if USE_TDM_LOADER:
-        # V2: build the TDM copy views for the first tile (pure), run Q part2, then issue
-        # the K/V TDM copies and drain with tensor_wait before the prologue barrier.
-        k_views = k_mgr.load_views(
-            ptr_lds=_k_lds_bufs(start_pp),
-            ptr_K=ptr_K,
-            stride_k_seq=stride_k_seq,
-            stride_k_head=stride_k_head,
-            kv_head=kv_head,
-            kv_row0=kv_start + start_row0,
-            kv_valid=_kv_valid(start_row0),
-        )
-        v_views = v_mgr.load_views(
-            ptr_lds=_v_lds_bufs(start_pp),
-            ptr_V=ptr_V,
-            stride_v_seq=stride_v_seq,
-            stride_v_head=stride_v_head,
-            kv_head=kv_head,
-            kv_row0=kv_start + start_row0,
-            kv_valid=_kv_valid(start_row0),
-        )
+        # V2: build the TDM copy views for tiles 0 and 1 (pure), run Q part2, fence Q's
+        # LDS dead, then issue both tiles' copies and drain before the loop.
+        def _kv_views(slot, row0):
+            return (
+                k_mgr.load_views(
+                    ptr_lds=_k_bufs_at(slot),
+                    ptr_K=ptr_K,
+                    stride_k_seq=stride_k_seq,
+                    stride_k_head=stride_k_head,
+                    kv_head=kv_head,
+                    kv_row0=kv_start + row0,
+                    kv_valid=_kv_valid(row0),
+                ),
+                v_mgr.load_views(
+                    ptr_lds=_v_bufs_at(slot),
+                    ptr_V=ptr_V,
+                    stride_v_seq=stride_v_seq,
+                    stride_v_head=stride_v_head,
+                    kv_head=kv_head,
+                    kv_row0=kv_start + row0,
+                    kv_valid=_kv_valid(row0),
+                ),
+            )
+
+        def _issue_views(kv):
+            for _v in kv[0]:
+                fx.copy_atom_call(*_v)
+            for _v in kv[1]:
+                fx.copy_atom_call(*_v)
+
+        kv0 = _kv_views(_k_lds_buf(0), start_row0)
+        kv1 = _kv_views(_k_lds_buf(1), nx1_row0)
+        num_tdm_copies = len(kv0[0]) + len(kv0[1])
+        num_async_copies = -1  # nothing increments asynccnt under TDM
+        _kv_drain = _kv_drain_depths(num_tdm_copies, num_async_copies)
         q_frags = q_mgr.load_q_to_vgpr_part2(scale=softmax_scale)
-        for _v in k_views:
-            fx.copy_atom_call(*_v)
-        for _v in v_views:
-            fx.copy_atom_call(*_v)
-        tdm_ops.tensor_wait(0)
-        rocdl.s_wait_dscnt(0)  # Q's ds_loads retired: its LDS is now dead
+        # Q's ds_loads must be RETIRED, not just issued, before the barrier that releases
+        # the tile-1 copies: tile 1 lands on Q's slot, gpu.barrier() does not retire LDS
+        # reads, and Q's atom is per-wave while a tile's is cooperative (wave A's Q region
+        # is written by wave B's share of tile 1).
+        rocdl.s_wait_dscnt(0)
         gpu.barrier()
+        _issue_views(kv0)
+        scf_if_dispatch(has_nx1, lambda: _issue_views(kv1))
+        _kv_fence(*_kv_drain)
     else:
-        k_gptrs, k_lds_ptrs, k_imm_offs = k_mgr.global_load_ptrs(
-            ptr_lds=_k_lds_buf(start_pp),
-            ptr_K=ptr_K,
-            stride_k_seq=stride_k_seq,
-            stride_k_head=stride_k_head,
-            kv_head=kv_head,
-            kv_row0=kv_start + start_row0,
-            kv_valid=_kv_valid(start_row0),
-            warp_idx=warp_idx,
-            lane_idx=lane_idx,
-        )
-        v_gptrs, v_lds_ptrs, v_imm_offs = v_mgr.global_load_ptrs(
-            ptr_lds=_v_lds_buf(start_pp),
-            ptr_V=ptr_V,
-            stride_v_seq=stride_v_seq,
-            stride_v_head=stride_v_head,
-            kv_head=kv_head,
-            kv_row0=kv_start + start_row0,
-            kv_valid=_kv_valid(start_row0),
-            warp_idx=warp_idx,
-            lane_idx=lane_idx,
-        )
+
+        def _kv_ptrs(slot, row0):
+            return (
+                k_mgr.global_load_ptrs(
+                    ptr_lds=slot,
+                    ptr_K=ptr_K,
+                    stride_k_seq=stride_k_seq,
+                    stride_k_head=stride_k_head,
+                    kv_head=kv_head,
+                    kv_row0=kv_start + row0,
+                    kv_valid=_kv_valid(row0),
+                    warp_idx=warp_idx,
+                    lane_idx=lane_idx,
+                ),
+                v_mgr.global_load_ptrs(
+                    ptr_lds=slot + fx.Int32(k_blk_bytes),
+                    ptr_V=ptr_V,
+                    stride_v_seq=stride_v_seq,
+                    stride_v_head=stride_v_head,
+                    kv_head=kv_head,
+                    kv_row0=kv_start + row0,
+                    kv_valid=_kv_valid(row0),
+                    warp_idx=warp_idx,
+                    lane_idx=lane_idx,
+                ),
+            )
+
+        def _issue_ptrs(kv):
+            (k_g, k_l, k_i), (v_g, v_l, v_i) = kv
+            _async_load_to_lds(k_g, k_l, cluster=True, imm_offs=k_i)
+            _async_load_to_lds(v_g, v_l, cluster=True, imm_offs=v_i)
+
+        kv0 = _kv_ptrs(_k_lds_buf(0), start_row0)
+        kv1 = _kv_ptrs(_k_lds_buf(1), nx1_row0)
+        num_tdm_copies = -1  # nothing increments tensorcnt under V1
+        num_async_copies = 0  # V1 has no per-tile count: its counter fully drains
+        _kv_drain = _kv_drain_depths(num_tdm_copies, num_async_copies)
         # (3) QMgr part2 — Q ds_load LDS->VGPR (drains the part1 Q async), issued AHEAD of
         # the cluster_loads so its Q-scaling reg reuse leaves the load shadow.
         q_frags = q_mgr.load_q_to_vgpr_part2(scale=softmax_scale)
-        # (4)+(5) Issue K then V cluster_loads LAST as ONE packed burst before the compiler
-        # reuses their source address VGPRs (part2 clobbers them). Only the cross-wave
-        # s_barrier is an immovable wall that packs the burst (mode-2 async-source-WAR fix).
-        _async_load_to_lds(k_gptrs, k_lds_ptrs, cluster=True, imm_offs=k_imm_offs)
-        _async_load_to_lds(v_gptrs, v_lds_ptrs, cluster=True, imm_offs=v_imm_offs)
-        rocdl.s_wait_asynccnt(0)
         rocdl.s_wait_dscnt(0)  # Q's ds_loads retired: its LDS is now dead
         gpu.barrier()
+        # (4)+(5) Issue the cluster_loads as ONE packed burst between two barriers, before
+        # the compiler reuses their source address VGPRs (mode-2 async-source-WAR fix).
+        _issue_ptrs(kv0)
+        scf_if_dispatch(has_nx1, lambda: _issue_ptrs(kv1))
+        _kv_fence(*_kv_drain)
 
     # (7) Loop init — MOVED to after the prologue barrier (ordering experiment). Online-
     # softmax seed + O accumulators (iter_args) and loop bounds.
@@ -1069,29 +1143,41 @@ def _core_attention(
             _raw(d_init[qt]),
         ] + [_raw(fx.Vector.filled(8, 0.0, fx.Float32)) for _ in range(d_tiles)]
 
-    # ---- ds_load LDS base pointers for both ping-pong buffers, carried as iter_args and
-    # swapped curr<->next each iteration (buffer selected by pointer). Base count per mgr
-    # is manager-defined (V1: 2, V2: 1) — carried generically. Same machinery for V1/V2;
-    # only the global->LDS ISSUE (_addr_phase/_prefetch/_drain) differs. ----
-    k_lds_ld_curr = k_mgr.ds_load_ptrs(ptr_lds=_k_lds_bufs(0), lane_idx=lane_idx)
-    v_lds_ld_curr = v_mgr.ds_load_ptrs(ptr_lds=_v_lds_bufs(0), lane_idx=lane_idx)
-    k_lds_ld_next = k_mgr.ds_load_ptrs(ptr_lds=_k_lds_bufs(1), lane_idx=lane_idx)
-    v_lds_ld_next = v_mgr.ds_load_ptrs(ptr_lds=_v_lds_bufs(1), lane_idx=lane_idx)
-    _NKB = len(k_lds_ld_curr)  # ds bases per K buffer (V1: 2, V2: 1)
-    _NVB = len(v_lds_ld_curr)
+    # ---- One ds_load base-pointer set per slot plus the slot's byte base, all carried as
+    # iter_args and LEFT-ROTATED in the yield: iteration i reads set 0 (= tile i) and
+    # writes tile i+2 at byte base 2 (= slot i+2 == slot i-1). Rotation is pure register
+    # renaming, so no runtime "% N_KV_PP" is ever evaluated. Base count per mgr is
+    # manager-defined (V1: 2, V2: 1) — carried generically; the global->LDS ISSUE is the
+    # only piece that branches on the loader. ----
+    k_lds_ld = [
+        k_mgr.ds_load_ptrs(ptr_lds=_k_lds_bufs(i), lane_idx=lane_idx)
+        for i in range(N_KV_PP)
+    ]
+    v_lds_ld = [
+        v_mgr.ds_load_ptrs(ptr_lds=_v_lds_bufs(i), lane_idx=lane_idx)
+        for i in range(N_KV_PP)
+    ]
+    _NKB = len(k_lds_ld[0])  # ds bases per K buffer (V1: 2, V2: 1)
+    _NVB = len(v_lds_ld[0])
     _PTR_BASE = len(_init)
-    _init = _init + k_lds_ld_curr + k_lds_ld_next + v_lds_ld_curr + v_lds_ld_next
+    for i in range(N_KV_PP):
+        _init = _init + k_lds_ld[i]
+    _VB0 = len(_init)
+    for i in range(N_KV_PP):
+        _init = _init + v_lds_ld[i]
+    _SLOT_BASE = len(_init)
+    _init = _init + [_raw(_k_lds_buf(i)) for i in range(N_KV_PP)]
 
     # ========================================================================
-    # Main KV loop -- stream tiles [start_tile, num_tiles) through the N_KV_PP ping-pong
-    # ring, one tile per iteration. The buffer is selected by the carried curr ds
-    # pointers, swapped curr<->next at the end of each `main_loop`.
+    # Main KV loop -- stream tiles [start_tile, num_tiles) through the N_KV_PP slots, one
+    # tile per iteration. The slot is selected by the carried ds pointers / slot bases,
+    # left-rotated at the end of each `main_loop`.
     #
-    # Each `main_loop` call is one tile: it drains outstanding async + barriers (its KV
-    # is then GUARANTEED resident -- start_tile from the prologue, every later tile from
-    # the previous call's top-of-body bulk prefetch into the OTHER buffer), issues the
-    # tile t+1 prefetch UP FRONT into the other buffer, then computes QK->softmax->PV on
-    # its own buffer while that async copy runs, drained at the next call's top.
+    # Each `main_loop` call is one tile: it fences outstanding copies down to one tile's
+    # worth (its own KV is then resident -- tiles 0/1 from the prologue, every later tile
+    # from the body two iterations back), issues the tile t+2 prefetch UP FRONT into the
+    # oldest slot, then computes QK->softmax->PV on its own slot while BOTH that copy and
+    # tile t+1's keep running. Two bodies cover each copy's global->LDS latency.
     #
     # TODO(perf): go finer still -- per-write-tile async_load interleaved between the
     # QK/softmax/PV ops (order tuned by thread trace) rather than one bulk burst.
@@ -1100,11 +1186,6 @@ def _core_attention(
         # mask_left/mask_right/kv_len shadow the closure flags: the caller splits the
         # tile stream into a mask-free clean region + boundary loops and passes None for
         # any edge this sub-loop provably doesn't cross (compile-time gate).
-        #
-        # Runtime ping-pong: this tile reads its curr buffer (carried curr pointers); the
-        # tile t+1 prefetch writes the next buffer, and curr<->next are swapped in the yield.
-        nxt_pp = (t - start_tile + fx.Int32(1)) % fx.Int32(2)
-
         kv_tile_start = t * fx.Int32(
             n_block
         )  # this tile's first (batch-relative) kv row
@@ -1117,94 +1198,100 @@ def _core_attention(
             [fx.Vector(state[qt * _QS + 2 + dt]) for dt in range(d_tiles)]
             for qt in range(R)
         ]
-        k_curr = list(state[_PTR_BASE + 0 * _NKB : _PTR_BASE + 1 * _NKB])
-        k_next = list(state[_PTR_BASE + 1 * _NKB : _PTR_BASE + 2 * _NKB])
-        _VB0 = _PTR_BASE + 2 * _NKB
-        v_curr = list(state[_VB0 + 0 * _NVB : _VB0 + 1 * _NVB])
-        v_next = list(state[_VB0 + 1 * _NVB : _VB0 + 2 * _NVB])
+        k_slots = [
+            list(state[_PTR_BASE + i * _NKB : _PTR_BASE + (i + 1) * _NKB])
+            for i in range(N_KV_PP)
+        ]
+        v_slots = [
+            list(state[_VB0 + i * _NVB : _VB0 + (i + 1) * _NVB])
+            for i in range(N_KV_PP)
+        ]
+        slot_of = [fx.Int32(state[_SLOT_BASE + i]) for i in range(N_KV_PP)]
+        k_curr, v_curr = k_slots[0], v_slots[0]
+        wr_slot = slot_of[N_KV_PP - 1]  # tile t+2's target == slot t-1, oldest
 
         # Warp-specialized preamble: same pieces, ordered so the SIMD-mate pair (i / i+4)
         # staggers K load against the global->LDS prefetch. Correctness is
         # warp-type-independent (each wave reads its own resident K under the workgroup
-        # barrier); the stagger is perf-only. The READ (the K ring head) and ping-pong
-        # pointer machinery are UNIFORM; only the global->LDS ISSUE branches by
-        # USE_TDM_LOADER (V1 cluster_load_async / V2 TDM copy).
-        nxt = t + fx.Int32(1)
-        nxt_row0 = nxt * fx.Int32(n_block)
-        nxt_valid = _kv_valid(nxt_row0)
+        # barrier); the stagger is perf-only. The READ (the K ring head) and the slot
+        # rotation are UNIFORM; only the global->LDS ISSUE branches by USE_TDM_LOADER
+        # (V1 cluster_load_async / V2 TDM copy).
+        # Tile prefetched by this body (distance N_KV_PP-1), CLAMPED to the last tile
+        # rather than guarded off past the end. Every body then issues exactly one tile's
+        # copies, so the fence count is uniform and the last iteration needs no peel --
+        # peeling it cost 5.5% on case 10 (a third trace of this body), against ~2 dead
+        # L2-resident tile loads per workgroup here. The clamped re-load lands in a slot
+        # nobody reads again, and O stages past all the slots.
+        pf = fx.min(t + fx.Int32(N_KV_PP - 1), last_tile)
+        pf_row0 = pf * fx.Int32(n_block)
+        pf_valid = _kv_valid(pf_row0)
 
         def _addr_phase():
             # Pure (no memory op) -> hoistable: V2 the TDM copy views, V1 the per-lane
-            # global/LDS pointer lists, for tile t+1's K/V into the nxt_pp buffer.
+            # global/LDS pointer lists, for tile ``pf``'s K/V into the oldest slot.
             if USE_TDM_LOADER:
                 k_views = k_mgr.load_views(
-                    ptr_lds=_k_lds_bufs(nxt_pp),
+                    ptr_lds=_k_bufs_at(wr_slot),
                     ptr_K=ptr_K,
                     stride_k_seq=stride_k_seq,
                     stride_k_head=stride_k_head,
                     kv_head=kv_head,
-                    kv_row0=kv_start + nxt_row0,
-                    kv_valid=nxt_valid,
+                    kv_row0=kv_start + pf_row0,
+                    kv_valid=pf_valid,
                 )
                 v_views = v_mgr.load_views(
-                    ptr_lds=_v_lds_bufs(nxt_pp),
+                    ptr_lds=_v_bufs_at(wr_slot),
                     ptr_V=ptr_V,
                     stride_v_seq=stride_v_seq,
                     stride_v_head=stride_v_head,
                     kv_head=kv_head,
-                    kv_row0=kv_start + nxt_row0,
-                    kv_valid=nxt_valid,
+                    kv_row0=kv_start + pf_row0,
+                    kv_valid=pf_valid,
                 )
                 return (k_views, v_views)
             k_g, k_l, k_i = k_mgr.global_load_ptrs(
-                ptr_lds=_k_lds_buf(nxt_pp),
+                ptr_lds=wr_slot,
                 ptr_K=ptr_K,
                 stride_k_seq=stride_k_seq,
                 stride_k_head=stride_k_head,
                 kv_head=kv_head,
-                kv_row0=kv_start + nxt_row0,
-                kv_valid=nxt_valid,
+                kv_row0=kv_start + pf_row0,
+                kv_valid=pf_valid,
                 warp_idx=warp_idx,
                 lane_idx=lane_idx,
             )
             v_g, v_l, v_i = v_mgr.global_load_ptrs(
-                ptr_lds=_v_lds_buf(nxt_pp),
+                ptr_lds=wr_slot + fx.Int32(k_blk_bytes),
                 ptr_V=ptr_V,
                 stride_v_seq=stride_v_seq,
                 stride_v_head=stride_v_head,
                 kv_head=kv_head,
-                kv_row0=kv_start + nxt_row0,
-                kv_valid=nxt_valid,
+                kv_row0=kv_start + pf_row0,
+                kv_valid=pf_valid,
                 warp_idx=warp_idx,
                 lane_idx=lane_idx,
             )
             return (k_g, k_l, k_i, v_g, v_l, v_i)
 
         def _drain_barrier():
-            if USE_TDM_LOADER:
-                tdm_ops.tensor_wait(0)
+            # Partial: leave tile t+1's copies (issued one body ago) in flight, so two
+            # bodies cover a copy. Full: only one tile is ever in flight.
+            if KV_PARTIAL_FENCE:
+                _kv_fence(num_tdm_copies, num_async_copies)
             else:
-                rocdl.s_wait_asynccnt(0)
-            rocdl.sched_barrier(0)
-            gpu.barrier()
-            rocdl.sched_barrier(0)
+                _kv_fence(*_kv_drain)
 
         def _prefetch(addr):
-            # Skip t+1 prefetch on the last tile: a dead copy into the O-epilogue slot
-            # races the epilogue O write across waves.
-            def _issue():
-                if USE_TDM_LOADER:
-                    k_views, v_views = addr
-                    for _v in k_views:
-                        fx.copy_atom_call(*_v)
-                    for _v in v_views:
-                        fx.copy_atom_call(*_v)
-                else:
-                    k_g, k_l, k_i, v_g, v_l, v_i = addr
-                    _async_load_to_lds(k_g, k_l, cluster=True, imm_offs=k_i)
-                    _async_load_to_lds(v_g, v_l, cluster=True, imm_offs=v_i)
-
-            scf_if_dispatch(nxt < fx.Int32(num_tiles), _issue)
+            if USE_TDM_LOADER:
+                k_views, v_views = addr
+                for _v in k_views:
+                    fx.copy_atom_call(*_v)
+                for _v in v_views:
+                    fx.copy_atom_call(*_v)
+            else:
+                k_g, k_l, k_i, v_g, v_l, v_i = addr
+                _async_load_to_lds(k_g, k_l, cluster=True, imm_offs=k_i)
+                _async_load_to_lds(v_g, v_l, cluster=True, imm_offs=v_i)
 
         # Address VALU up front (no barrier dependency) so it overlaps the drain; only
         # the async issue in _prefetch must stay after the barrier.
@@ -1321,28 +1408,31 @@ def _core_attention(
             o_acc_list=o_resc_list,
         )
 
-        # Yield state — R updated (m, d, O) groups, then the shared K/V ds pointers
-        # swapped curr<->next (4 s_swap_b32).
+        # Yield state — R updated (m, d, O) groups, then the K/V ds pointers and slot
+        # bases left-rotated by one so slot 0 is tile t+1's and the oldest rotates into
+        # the write position.
         out = []
         for qt in range(R):
             out += [_raw(m_new_list[qt]), _raw(d_new_list[qt])] + [
                 _raw(o) for o in o_new_list[qt]
             ]
-        # Swap curr<->next ds bases (manager-defined count each).
-        out += k_next + k_curr + v_next + v_curr
+        rot = list(range(1, N_KV_PP)) + [0]
+        for i in rot:
+            out += k_slots[i]
+        for i in rot:
+            out += v_slots[i]
+        out += [_raw(slot_of[i]) for i in rot]
         return out
 
     # ---- Stream tiles [start_tile, num_tiles) through 3 sub-loops split by the attention
     # band so interior tiles fully inside the band skip masking. clean_lo/clean_hi are
     # runtime split points, but the mask on/off per sub-loop is COMPILE-TIME (each loop
-    # traces main_loop once with fixed None-ness). Ping-pong swap state threads
-    # continuously through all three; buffer parity is by LOCAL iteration index, so the
-    # split leaves it intact.
+    # traces main_loop once with fixed None-ness). The rotation state threads continuously
+    # through all of them, so the split leaves the slot assignment intact.
     #   [start_tile, clean_lo) left boundary   (emitted only when mask_left)
     #   [clean_lo,   clean_hi) clean, no mask
     #   [clean_hi,   num_tiles)  right boundary + kv_len tail (last tile)
     num_iter = fx.Int32(num_tiles) - start_tile
-    last_tile = fx.Int32(num_tiles) - fx.Int32(1)  # last tile always carries the kv_len tail
 
     # clean_hi = first tile that could need RIGHT masking = the WG's earliest query's
     # diagonal tile ((min q_max + 1)//n_block). Kept <= last_tile so the tail tile stays in
@@ -1416,8 +1506,7 @@ def _core_attention(
     # lane pair) to finish softmax. OManager16b masks rows with seq >= q_len.
     # ========================================================================
     # O stages in its own region past the K|V slots, so no wave ever writes it in the
-    # loop -- no cross-wave barrier needed here. s_wait_asynccnt(0) is a pure no-op under
-    # TDM (nothing increments asynccnt); keep it for V1 as a defensive per-wave WAR guard.
+    # loop -- no cross-wave barrier needed here.
     # The R q-tiles serialize through the same O ring (s_wait_dscnt(0) between them).
     _OMgr = {"v1": OManager16bV1, "v2": OManager16bV2, "v3": OManager16bV3}[O_VARIANT]
     o_mgr = _OMgr(
@@ -1428,10 +1517,9 @@ def _core_attention(
         elem_dtype=elem_dtype,
     )
     _assert_lds_fits("O", N_KV_PP, o_mgr.get_lds_size_in_byte())
-    if not USE_TDM_LOADER:
-        rocdl.s_wait_asynccnt(
-            0
-        )  # V1-only WAR: retire inflight async loads before slot reuse
+    # The loop exits with the last two bodies' (clamped, dead) tile copies still in
+    # flight. They target slots O never touches, but they must not outlive the kernel.
+    _kv_wait(*_kv_drain)
     # O strides are in ELEMENTS (OManager multiplies by _BF16_BYTES itself). Both V1/V2
     # take ptr_O and build their own store descriptor internally (V1 a bounded buffer
     # resource for the masked buffer_store; V2 the TDM store atom with HW OOB drop).
