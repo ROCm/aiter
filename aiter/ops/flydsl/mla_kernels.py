@@ -53,6 +53,9 @@ def _validate_pagesize1_inputs(
     work_indptr,
     work_info,
     softmax_scale,
+    q_scale,
+    kv_scale,
+    final_lse,
     max_seqlen_q,
     causal,
 ):
@@ -90,6 +93,12 @@ def _validate_pagesize1_inputs(
     _require_layout("kv_page_indices", kv_page_indices, torch.int32)
     _require_layout("work_indptr", work_indptr, torch.int32)
     _require_layout("work_info", work_info, torch.int32, (None, 8))
+    for name, scale in (("q_scale", q_scale), ("kv_scale", kv_scale)):
+        _require(scale is not None, f"{name}: expected a float32 scalar tensor")
+    # Only the work items the planner left un-split write here; the ones it did
+    # split are the reduce's job. None means the caller wants no LSE at all.
+    if final_lse is not None:
+        _require_layout("final_lse", final_lse, torch.float32, (total_q, num_q_heads))
 
     properties = torch.cuda.get_device_properties(q.device)
     lds_size = getattr(properties, "shared_memory_per_multiprocessor", None)
@@ -101,6 +110,7 @@ def _validate_pagesize1_inputs(
         num_q_heads,
         max_seqlen_q,
         int(bool(causal)),
+        int(final_lse is not None),
     )
 
 
@@ -115,6 +125,9 @@ def flydsl_mla_pagesize1_fp8_fp8(
     work_info,
     softmax_scale,
     *,
+    q_scale,
+    kv_scale,
+    final_lse=None,
     max_seqlen_q=1,
     causal=False,
     stream=None,
@@ -126,6 +139,7 @@ def flydsl_mla_pagesize1_fp8_fp8(
         num_q_heads,
         max_seqlen_q,
         causal,
+        write_final_lse,
     ) = _validate_pagesize1_inputs(
         split_data,
         split_lse,
@@ -136,6 +150,9 @@ def flydsl_mla_pagesize1_fp8_fp8(
         work_indptr,
         work_info,
         softmax_scale,
+        q_scale,
+        kv_scale,
+        final_lse,
         max_seqlen_q,
         causal,
     )
@@ -149,16 +166,24 @@ def flydsl_mla_pagesize1_fp8_fp8(
         ptr_arg(split_data, fx.Float32),
         ptr_arg(split_lse, fx.Float32),
         ptr_arg(final_output, fx.BFloat16),
+        (
+            flyc.from_c_void_p(fx.Float32, 0)
+            if final_lse is None
+            else ptr_arg(final_lse, fx.Float32)
+        ),
         ptr_arg(q, fx.Int8),
         ptr_arg(kv_buffer, fx.Int8),
         ptr_arg(kv_page_indices, fx.Int32),
         ptr_arg(work_indptr, fx.Int32),
         ptr_arg(work_info, fx.Int32),
+        ptr_arg(q_scale, fx.Float32),
+        ptr_arg(kv_scale, fx.Float32),
         softmax_scale,
         kv_buffer.size(0),
         num_q_heads,
         max_seqlen_q,
         causal,
+        write_final_lse,
         num_cus,
         lds_size,
         stream=stream,

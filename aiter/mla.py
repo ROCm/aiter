@@ -750,7 +750,22 @@ def mla_decode_fwd(
             num_kv_splits = get_mla_decode_fwd_max_splits(
                 ori_nhead, max_seqlen_q, q.dtype, kv_buffer.dtype
             )
-        if (
+        use_flydsl_ps1 = (
+            os.environ.get("AITER_MLA_DECODE_PS1_FLYDSL", "0") == "1"
+            and get_gfx() == "gfx1250"
+            and page_size == 1
+            and q.dtype == dtypes.fp8
+            and kv_buffer.dtype == dtypes.fp8
+            and nhead in (16, 128)
+            and (nhead == 16 or max_seqlen_q == 1)
+            and cp_world_size == 1
+            and not intra_batch_mode
+            and q_scale is not None
+            and kv_scale is not None
+        )
+        if use_flydsl_ps1:
+            pass
+        elif (
             nhead == 16
             or (
                 get_gfx() == "gfx942"
@@ -892,7 +907,26 @@ def mla_decode_fwd(
             and kv_scale is not None
         )
 
-        if use_opus:
+        if use_flydsl_ps1:
+            from aiter.ops.flydsl.mla_kernels import flydsl_mla_pagesize1_fp8_fp8
+
+            flydsl_mla_pagesize1_fp8_fp8(
+                logits.view(-1, nhead, v_head_dim),
+                attn_lse.view(-1, nhead),
+                o,
+                q,
+                kv_buffer,
+                kv_indices,
+                work_indptr,
+                work_info_set,
+                sm_scale,
+                q_scale=q_scale,
+                kv_scale=kv_scale,
+                final_lse=final_lse,
+                max_seqlen_q=max_seqlen_q,
+                causal=causal,
+            )
+        elif use_opus:
             aiter.mla_decode_fwd_opus_stage1(
                 q,
                 kv_buffer,

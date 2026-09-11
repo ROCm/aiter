@@ -17,7 +17,7 @@ from ..mega_moe_gfx1250.tdm_gather_shim import (
     TDMGatherDescriptor,
     make_tensor_gather_descriptor,
 )
-from ..tensor_shim import buf_load_scalar, ptr_rsrc
+from ..tensor_shim import buf_load_scalar, ptr_buf_tensor, ptr_rsrc
 from .mla_common import (
     _concat_ds_tr8_b64,
     _concat_wmma_operand,
@@ -89,16 +89,20 @@ def launch_mla_pagesize1_fp8_fp8(
     ptr_r: fx.Pointer,
     ptr_lse: fx.Pointer,
     ptr_final: fx.Pointer,
+    ptr_final_lse: fx.Pointer,
     ptr_q: fx.Pointer,
     ptr_kv: fx.Pointer,
     kv_page_indices: fx.Pointer,
     work_indptr: fx.Pointer,
     work_info_set: fx.Pointer,
+    q_scale: fx.Pointer,
+    kv_scale: fx.Pointer,
     softmax_scale: fx.Float32,
     num_pages: fx.Int32,
     num_q_heads: fx.Constexpr[int],
     max_seqlen_q: fx.Constexpr[int],
     causal: fx.Constexpr[int],
+    write_final_lse: fx.Constexpr[int],
     num_cus: fx.Constexpr[int],
     lds_size: fx.Constexpr[int],
     stream: fx.Stream = _DEFAULT_STREAM,
@@ -112,11 +116,17 @@ def launch_mla_pagesize1_fp8_fp8(
         raise ValueError(
             "num_q_heads=128 only supports max_seqlen_q=1, " f"got {max_seqlen_q}"
         )
+    # 每个wave固定处理 head 16维度
     head_waves = num_q_heads // HEADS_PER_WAVE
+
     q_wave_slots = 1 if max_seqlen_q == 1 else 2 if max_seqlen_q == 2 else 4
+    # m方向的wave数
     m_waves = head_waves * q_wave_slots
+    # v dim方向的wave数
     dv_waves = NUM_WAVES // m_waves
+
     mask_every_tile = bool(causal) and max_seqlen_q > 1
+    # 512 / dv_waves = 每个v dim方向的wave处理多少个d tile
     pv_d_tiles_per_wave = PV_D_TILES // dv_waves
     pv_load_depth = min(PV_LOAD_DEPTH, pv_d_tiles_per_wave)
     q_row_stride = num_q_heads * Q_HEAD_STRIDE
@@ -131,11 +141,14 @@ def launch_mla_pagesize1_fp8_fp8(
         ptr_r: fx.Pointer,
         ptr_lse: fx.Pointer,
         ptr_final: fx.Pointer,
+        ptr_final_lse: fx.Pointer,
         ptr_q: fx.Pointer,
         ptr_kv: fx.Pointer,
         kv_page_indices: fx.Pointer,
         work_indptr: fx.Pointer,
         work_info_set: fx.Pointer,
+        q_scale: fx.Pointer,
+        kv_scale: fx.Pointer,
         softmax_scale: fx.Float32,
         num_pages: fx.Int32,
     ):
@@ -148,6 +161,11 @@ def launch_mla_pagesize1_fp8_fp8(
             | fx.FastMathFlags.afn
             | fx.FastMathFlags.reassoc
         )
+        q_scale_t = ptr_buf_tensor(q_scale, fx.Float32)
+        kv_scale_t = ptr_buf_tensor(kv_scale, fx.Float32)
+        q_descale = q_scale_t[0]
+        kv_descale = kv_scale_t[0]
+        score_scale = softmax_scale * q_descale * kv_descale
         rocdl.disable_xdl_arb_stall()
         _instruction_prefetch(INSTRUCTION_PREFETCH_PAGES)
 
@@ -199,10 +217,12 @@ def launch_mla_pagesize1_fp8_fp8(
         lane_id = tid & (WAVE_SIZE - 1)
         head_in_wave = lane_id & (HEADS_PER_WAVE - 1)
         lane_half = lane_id >> 4
+
         m_wave = wave_id // dv_waves
         dv_wave = wave_id % dv_waves
         q_pos = m_wave // head_waves
         head_wave = m_wave % head_waves
+        # thread id 转换为 head id
         head = head_wave * HEADS_PER_WAVE + head_in_wave
 
         kv_start_quarter = fx.Int32((wave_id & 1) | ((wave_id & 4) >> 1))
@@ -520,7 +540,7 @@ def launch_mla_pagesize1_fp8_fp8(
                     local_token = (
                         kv_quarter_token_base(n_tile) + lane_half * QK_ACC_DWORDS + i
                     )
-                    score = qk_accs[n_tile][i] * softmax_scale
+                    score = qk_accs[n_tile][i] * score_scale
                     if const_expr(mask_bounds):
                         valid_token = local_token < valid_count
                         tile_scores.append(valid_token.select(score, negative_inf))
@@ -568,7 +588,7 @@ def launch_mla_pagesize1_fp8_fp8(
                             )
                     else:
                         arg_vector = (
-                            qk_accs[n_tile] * softmax_scale + neg_new_max
+                            qk_accs[n_tile] * score_scale + neg_new_max
                         ) * fx.Float32(LOG2E)
                         probability_args = [
                             arg_vector[i] for i in range_constexpr(QK_ACC_DWORDS)
@@ -761,6 +781,7 @@ def launch_mla_pagesize1_fp8_fp8(
                 fx.Float32(rocdl.rcp(T.f32, running_sum.ir_value())),
                 fx.Float32(0.0),
             )
+            output_scale = inv_sum * kv_descale
 
             tdm_ops.tensor_wait(0)
             gpu.barrier()
@@ -771,7 +792,7 @@ def launch_mla_pagesize1_fp8_fp8(
                 for d_tile in range_constexpr(pv_d_tiles_per_wave):
                     global_d_tile = dv_wave * pv_d_tiles_per_wave + d_tile
                     output_values = [
-                        reg_output_accs[d_tile][i] * inv_sum
+                        reg_output_accs[d_tile][i] * output_scale
                         for i in range_constexpr(PV_ACC_DWORDS)
                     ]
                     row_base = (q_pos * num_q_heads + head) * (V_HEAD_DIM * elem_bytes)
@@ -830,6 +851,22 @@ def launch_mla_pagesize1_fp8_fp8(
                     global_view,
                 )
 
+            # Computed out here rather than under the guards below: the store is
+            # the only thing that may differ between the two destinations, and a
+            # branch that assigns would make the rewriter thread this loop's
+            # variables through a closure frame that cannot see them.
+            lse_value = has_mass.select(
+                running_max + fmath.log(running_sum),
+                fx.Float32(float("-inf")),
+            )
+
+            def write_lse(ptr_dst, row_base):
+                """Store this work item's log-sum-exp for its own q rows."""
+                if valid_q_pos:
+                    if dv_wave == 0:
+                        if lane_half == 0:
+                            ptr_dst[(row_base + q_pos) * num_q_heads + head] = lse_value
+
             writes_partial = partial_qo_loc >= fx.Int32(0)
             head_tile_elems = num_q_heads * V_HEAD_DIM
 
@@ -846,20 +883,17 @@ def launch_mla_pagesize1_fp8_fp8(
                     fx.Float32,
                     fx.Int64(partial_qo_loc) * head_tile_elems,
                 )
-                if valid_q_pos:
-                    if dv_wave == 0:
-                        if lane_half == 0:
-                            lse = has_mass.select(
-                                running_max + fmath.log(running_sum),
-                                fx.Float32(float("-inf")),
-                            )
-                            ptr_lse[(partial_qo_loc + q_pos) * num_q_heads + head] = lse
+                write_lse(ptr_lse, partial_qo_loc)
             else:
                 copy_output_to_global(
                     ptr_final,
                     fx.BFloat16,
                     fx.Int64(qo_start) * head_tile_elems,
                 )
+                # An un-split work item covers its whole KV run, so this is
+                # already the merged LSE; the reduce never revisits these rows.
+                if const_expr(write_final_lse):
+                    write_lse(ptr_final_lse, qo_start)
             tdm_ops.tensor_wait(0)
             gpu.barrier()
 
@@ -867,11 +901,14 @@ def launch_mla_pagesize1_fp8_fp8(
         ptr_r,
         ptr_lse,
         ptr_final,
+        ptr_final_lse,
         ptr_q,
         ptr_kv,
         kv_page_indices,
         work_indptr,
         work_info_set,
+        q_scale,
+        kv_scale,
         softmax_scale,
         num_pages,
     ).launch(
