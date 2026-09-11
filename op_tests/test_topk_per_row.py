@@ -444,7 +444,7 @@ def test_mb_workspace_reuse():
     for call_idx, seed in enumerate((11, 22, 33)):
         logits = create_random_logits(row_starts, row_ends, torch.float32, seed)
         indices = torch.empty((num_rows, top_k), dtype=torch.int32, device="cuda")
-        aiter._top_k_per_row_prefill(
+        aiter.top_k_per_row_prefill_hip(
             logits,
             row_starts,
             row_ends,
