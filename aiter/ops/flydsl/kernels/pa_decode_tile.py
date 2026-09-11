@@ -76,11 +76,10 @@ def compile_pa_decode_tile(
     roughly linearly with ``M_TILES``.
 
     Tokens at/after ``context_len`` still take part in the PV matmul with a zero
-    probability, so their V bytes must be finite: the MFMA does not treat a zero
-    operand as an annihilator (``0 * NaN == NaN``). Whole pages past the
-    sequence's extent are pinned to block 0 (see ``_load_phys_scalar``); the
-    remaining slots are the unwritten tail of the last page the sequence owns,
-    which the caller is expected to leave finite.
+    probability, but the MFMA does not treat a zero operand as an annihilator
+    (``0 * NaN == NaN``). Whole pages past the sequence's extent are pinned to
+    block 0 (see ``_load_phys_scalar``), and invalid V bytes in the final owned
+    page are zeroed in their packed integer representation before PV MFMA.
 
     ``wide_kv_addressing`` computes K/V element offsets in 64-bit. It is only
     correct-critical once a single cache tensor passes 2 GiB, where the i32
@@ -294,9 +293,6 @@ def compile_pa_decode_tile(
 
         def _k_load16(byte_off):
             return _k_load_fp8x16(byte_off).bitcast(fx.Int64)
-
-        def _v_load16(byte_off):
-            return _v_load_fp8x16(byte_off).bitcast(fx.Int64)
 
         context_len = fx.Int32(_ctxlen_load(seq)[0])
         # Bound block_tables to its real extent: the last (partial) 256-token tile
@@ -701,7 +697,7 @@ def compile_pa_decode_tile(
         NVOPS = TILE_TOK // MFMA_K  # 8 PV k_steps (256 tokens / K=32)
         STEPS_PER_PAGE = block_size // 16
 
-        def _v_ops(phys_row, vh):
+        def _v_ops(phys_row, vh, tile_valid):
             head_group = ((vh * VHE_SIZE) // 16) + warp
             head_element = head_group * 16 + lane16
             ops = []
@@ -720,11 +716,29 @@ def compile_pa_decode_tile(
                             n_kv * (head_dim * block_size),
                             (kv_h * head_dim + head_element) * block_size + step * 16,
                         )
-                    w = _v_load16(base)
+                    # Each dword holds four consecutive fp8 values. Keep the
+                    # 128-bit load intact, but zero bytes past context_len in
+                    # the final tile before they become PV MFMA operands.
+                    w = _v_load_fp8x16(base).bitcast(fx.Int32)
+                    if tile_valid < fx.Int32(TILE_TOK):
+                        full_dwords = fx.Int32(tile_valid).shrui(fx.Int32(2))
+                        valid_dwords = full_dwords - rgroup * fx.Int32(TOK_CHUNK // 4)
+                        tail_bytes = fx.Int32(tile_valid) & fx.Int32(3)
+                        tail_bits = tail_bytes * fx.Int32(8)
+                        tail_mask = (fx.Int32(1) << tail_bits) - fx.Int32(1)
+                        dword0 = (sub * STEPS_PER_PAGE + step) * 4
+                        masked_dwords = []
+                        for dword in range_constexpr(4):
+                            idx = fx.Int32(dword0 + dword)
+                            mask = (idx == valid_dwords).select(tail_mask, fx.Int32(0))
+                            mask = (idx < valid_dwords).select(fx.Int32(-1), mask)
+                            masked_dwords.append(fx.Int32(w[dword]) & mask)
+                        w = fx.Vector.from_elements(masked_dwords, dtype=fx.Int32)
+                    w64 = w.bitcast(fx.Int64)
                     if const_expr(block_size == 16):
                         # help the scheduler overlap the per-page gathered loads (see _k_ops)
                         fx.rocdl.sched_barrier(fx.rocdl.mask_vmem_rd)
-                    ops.extend([w[0], w[1]])
+                    ops.extend([w64[0], w64[1]])
             if const_expr(head_dim == 64):
                 fx.rocdl.sched_vmem(len(ops) // 2)
             return ops  # NVOPS i64, the 64-token contiguous run for this head
@@ -811,7 +825,8 @@ def compile_pa_decode_tile(
             v_vh_shared = None
             if const_expr(M_TILES > 1):
                 v_vh_shared = [
-                    _v_ops(v_page_cur, vh) for vh in range_constexpr(VHE_CHUNKS)
+                    _v_ops(v_page_cur, vh, tile_valid)
+                    for vh in range_constexpr(VHE_CHUNKS)
                 ]
 
             # q_scale doesn't depend on `m`; read the whole M_TILES-wide row once
@@ -1203,7 +1218,8 @@ def compile_pa_decode_tile(
                 # Single tile: batch both vh's V loads upfront (no sibling chain
                 # to hide the latency behind).
                 v_vh_batch = [
-                    _v_ops(v_page_cur, vh) for vh in range_constexpr(VHE_CHUNKS)
+                    _v_ops(v_page_cur, vh, tile_valid)
+                    for vh in range_constexpr(VHE_CHUNKS)
                 ]
                 for vh in range_constexpr(VHE_CHUNKS):
                     v_vh = v_vh_batch[vh]

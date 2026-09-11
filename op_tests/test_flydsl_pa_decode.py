@@ -470,6 +470,8 @@ def _adversarial_case(
     per_token=False,
     zero_query=False,
     poison_padding_blocks=False,
+    poison_tail=False,
+    trans_v=False,
     tail_value_scale=None,
     seed=0,
 ):
@@ -478,6 +480,8 @@ def _adversarial_case(
     ``poison_padding_blocks`` fills every block past the sequence's real extent
     with NaN and pads the block table out to reach them -- the entries a caller
     leaves behind, which the kernel must resolve to block 0 rather than follow.
+    ``poison_tail`` fills only the unwritten slots in the final owned page with
+    NaN; those bytes are physically addressable but logically outside context.
     """
     quant_dtype = _quant_dtype()
     generator = torch.Generator(device="cuda").manual_seed(seed)
@@ -501,11 +505,14 @@ def _adversarial_case(
     invalid = (torch.arange(tokens, device="cuda") >= context_length).view(
         blocks, 1, block_size, 1
     )
+    if poison_tail or poison_padding_blocks:
+        poison = torch.full_like(value, float("nan"), dtype=dtypes.fp32).to(quant_dtype)
+    if poison_tail:
+        value = torch.where(invalid.expand_as(value), poison, value)
     if poison_padding_blocks:
         padding = (torch.arange(tokens, device="cuda") >= owned * block_size).view(
             blocks, 1, block_size, 1
         )
-        poison = torch.full_like(value, float("nan"), dtype=dtypes.fp32).to(quant_dtype)
         value = torch.where(padding.expand_as(value), poison, value)
         key = torch.where(padding.expand_as(key), poison, key)
 
@@ -533,7 +540,14 @@ def _adversarial_case(
         .permute(0, 1, 3, 2, 4)
         .contiguous()
     )
-    value_cache = value.permute(0, 1, 3, 2).contiguous()
+    if trans_v:
+        value_cache = (
+            value.view(blocks, 1, block_size // 16, 16, head_dim)
+            .permute(0, 1, 2, 4, 3)
+            .contiguous()
+        )
+    else:
+        value_cache = value.permute(0, 1, 3, 2).contiguous()
     block_tables = torch.arange(blocks, dtype=dtypes.i32).reshape(1, blocks)
     context_lengths = torch.full((1,), context_length, dtype=dtypes.i32)
 
@@ -603,9 +617,7 @@ def test_block_table_padding_is_not_dereferenced(block_size, context_length):
     them get a zero probability, but the PV matmul still multiplies their V
     bytes (``0 * NaN == NaN``), so the page index itself has to be pinned.
 
-    Not covered here, by design: the unwritten tail of the last page the
-    sequence does own. Those slots are inside a real block and the caller is
-    expected to leave them finite.
+    The unwritten tail inside the last owned page is covered separately below.
     """
     _require_gpu()
     output, reference = _adversarial_case(
@@ -614,6 +626,35 @@ def test_block_table_padding_is_not_dereferenced(block_size, context_length):
         poison_padding_blocks=True,
     )
     _assert_matches(output, reference)
+
+
+@pytest.mark.parametrize("block_size,context_length", [(16, 17), (64, 257)])
+@pytest.mark.parametrize("query_length", [1, 4])
+@pytest.mark.parametrize("per_token", [False, True])
+@pytest.mark.parametrize("trans_v", [False, True])
+def test_last_owned_page_v_padding_is_ignored(
+    block_size, context_length, query_length, per_token, trans_v
+):
+    """NaN in the final owned page's unused V slots must not reach PV MFMA."""
+    _require_gpu()
+    clean, reference = _adversarial_case(
+        context_length=context_length,
+        block_size=block_size,
+        query_length=query_length,
+        per_token=per_token,
+        trans_v=trans_v,
+    )
+    poisoned, poisoned_reference = _adversarial_case(
+        context_length=context_length,
+        block_size=block_size,
+        query_length=query_length,
+        per_token=per_token,
+        poison_tail=True,
+        trans_v=trans_v,
+    )
+    _assert_matches(clean, reference)
+    _assert_matches(poisoned, poisoned_reference)
+    torch.testing.assert_close(poisoned, clean, rtol=0, atol=0)
 
 
 @pytest.mark.parametrize("query_length", [1, 4])
