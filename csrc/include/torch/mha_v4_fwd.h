@@ -22,7 +22,8 @@ void fmha_v4_fwd(const at::Tensor& q,
                  int64_t q_scale_mode,
                  int64_t k_scale_mode,
                  int64_t v_scale_mode,
-                 double softmax_scale);
+                 double softmax_scale,
+                 std::optional<at::Tensor> seqlens_k = std::nullopt);
 
 // Sorted block-sparse sibling. Same packed operands as fmha_v4_fwd, plus a ragged LUT.
 // Builds the work table internally (identity raster if lut_count is uniform, else LPT).

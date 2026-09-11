@@ -28,7 +28,8 @@ PYBIND11_MODULE(AITER_EXTENSION_NAME, m)
           py::arg("q_scale_mode"),
           py::arg("k_scale_mode"),
           py::arg("v_scale_mode"),
-          py::arg("softmax_scale"));
+          py::arg("softmax_scale"),
+          py::arg("seqlens_k") = std::nullopt);
     m.def("fmha_v4_fwd_sparse",
           &aiter::torch_itfs::fmha_v4_fwd_sparse,
           py::arg("q"),
