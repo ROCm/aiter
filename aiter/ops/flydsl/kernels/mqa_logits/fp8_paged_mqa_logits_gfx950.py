@@ -208,6 +208,8 @@ def _build_kernel():
         next_n_lens: fx.Tensor,
         batch_size: fx.Int32,
         split_kv: fx.Int32,
+        rows_per_batch: fx.Int32,
+        has_next_n_lens: fx.Int32,
         stride_q_batch: fx.Int32,
         max_block_len: fx.Int32,
         stride_out: fx.Int32,
@@ -229,7 +231,8 @@ def _build_kernel():
         table_t = GTensor(kv_indices, dtype=T.i32, shape=(-1,))
         nn_t = GTensor(next_n_lens, dtype=T.i32, shape=(-1,))
 
-        nn = fx.Int32(nn_t[pid_batch])
+        ragged_nn = imin(fx.Int32(nn_t[pid_batch]), rows_per_batch)
+        nn = (has_next_n_lens != 0).select(ragged_nn, rows_per_batch)
         context_len = fx.Int32(context_t[pid_batch])
         page_count = uceildiv(context_len, fx.Int32(KV_BLOCK_SIZE))
         pages_per_split = uceildiv(page_count, split_kv)
@@ -270,7 +273,7 @@ def _build_kernel():
 
             _guarded(pred, _copy_q)
 
-        w_batch_base = pid_batch * (MAX_NN * W_ROW_BYTES)
+        w_batch_base = pid_batch * (rows_per_batch * W_ROW_BYTES)
         ci_w = tid
         w_row = udiv(ci_w * 16, W_ROW_BYTES)
 
@@ -316,7 +319,9 @@ def _build_kernel():
                 _guarded(pred, _copy)
 
         def _store_logit(row, col, value):
-            out = _make_out_row_view(out_logits, stride_out, pid_batch * MAX_NN + row)
+            out = _make_out_row_view(
+                out_logits, stride_out, pid_batch * rows_per_batch + row
+            )
 
             def _write(_out=out, _col=col, _value=value):
                 _out[_col] = _value
@@ -425,6 +430,8 @@ def _build_kernel():
         grid_blocks,
         batch_size,
         split_kv,
+        rows_per_batch,
+        has_next_n_lens,
         stride_q_batch,
         max_block_len,
         stride_out,
@@ -441,6 +448,8 @@ def _build_kernel():
             next_n_lens,
             batch_size,
             split_kv,
+            rows_per_batch,
+            has_next_n_lens,
             stride_q_batch,
             max_block_len,
             stride_out,
@@ -476,21 +485,26 @@ def flydsl_fp8_paged_mqa_logits(
     TotalCuCount=None,
     stream=None,
 ):
-    """Ragged paged FP8 MQA logits for padded Q ``[B, 8, 32, 128]``."""
+    """Paged FP8 MQA logits for contiguous Q ``[B, next_n, 32, 128]``.
+
+    ``next_n`` may be 1..8. The compiled kernel reserves LDS for eight rows;
+    ``next_n_lens`` optionally selects fewer live rows per sequence.
+    """
     if get_gfx() != _GFX950:
         raise RuntimeError(f"gfx950 kernel requested on {get_gfx()}")
     if not Preshuffle:
         raise ValueError("requires Preshuffle=True")
     if q_fp8.ndim != 4:
         raise ValueError(f"q_fp8 must be rank 4, got shape {tuple(q_fp8.shape)}")
-    batch_size, max_nn, heads, head_dim = q_fp8.shape
-    if (max_nn, heads, head_dim, int(KVBlockSize)) != (
-        MAX_NN,
+    batch_size, next_n, heads, head_dim = q_fp8.shape
+    if not 1 <= next_n <= MAX_NN:
+        raise ValueError(f"q_fp8 next_n must be in 1..{MAX_NN}, got {next_n}")
+    if (heads, head_dim, int(KVBlockSize)) != (
         NUM_HEADS,
         HEAD_DIM,
         KV_BLOCK_SIZE,
     ):
-        raise ValueError("requires Q shape [B, 8, 32, 128] and KVBlockSize=64")
+        raise ValueError("requires Q shape [B, next_n, 32, 128] and KVBlockSize=64")
     if not q_fp8.is_contiguous():
         raise ValueError("q_fp8 must be contiguous")
     if q_fp8.dtype != get_fp8_e4m3_dtype():
@@ -500,21 +514,19 @@ def flydsl_fp8_paged_mqa_logits(
     _, block_size, one, index_dim = kv_cache.shape
     if (block_size, one, index_dim) != (KV_BLOCK_SIZE, 1, INDEX_DIM):
         raise ValueError(f"unexpected KV cache shape {tuple(kv_cache.shape)}")
-    if weights.shape != (batch_size * MAX_NN, NUM_HEADS):
-        raise ValueError(f"weights must have shape {(batch_size * MAX_NN, NUM_HEADS)}")
+    if weights.shape != (batch_size * next_n, NUM_HEADS):
+        raise ValueError(f"weights must have shape {(batch_size * next_n, NUM_HEADS)}")
     if not weights.is_contiguous() or weights.dtype != torch.float32:
         raise ValueError("weights must be contiguous float32")
+    if out_logits.shape[0] != batch_size * next_n:
+        raise ValueError(f"out_logits first dimension must be {batch_size * next_n}")
 
     context_lens = context_lens.reshape(batch_size)
     max_block_len = kv_indices.shape[-1]
     kv_indices = kv_indices.reshape(batch_size, max_block_len)
+    has_next_n_lens = next_n_lens is not None
     if next_n_lens is None:
-        next_n_lens = torch.full(
-            (batch_size,),
-            MAX_NN,
-            dtype=torch.int32,
-            device=q_fp8.device,
-        )
+        next_n_lens = context_lens
     next_n_lens = next_n_lens.reshape(batch_size)
     if next_n_lens.dtype != torch.int32 or next_n_lens.device != q_fp8.device:
         raise ValueError("next_n_lens must be int32 on the same device as q_fp8")
@@ -556,6 +568,8 @@ def flydsl_fp8_paged_mqa_logits(
             int(grid_blocks),
             int(batch_size),
             int(split_kv),
+            int(next_n),
+            int(has_next_n_lens),
             int(q_fp8.stride(0)),
             int(max_block_len),
             int(out_logits.stride(0)),

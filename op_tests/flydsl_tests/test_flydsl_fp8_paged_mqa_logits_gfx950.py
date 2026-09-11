@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Focused long-context tests for the gfx950 padded ragged LDS indexer."""
+"""Focused long-context tests for the gfx950 compact/ragged LDS indexer."""
 
 import argparse
 
