@@ -1761,6 +1761,42 @@ using opus_bmm_a8w8_mxscale_bpreshuffle_tile_fly256_nb4_gfx1250 =
         /*SF_A_LDS*/true, /*SF_B_LDS*/true,
         /*SF_A_TDM_KG*/0, /*SF_A_TDM_PAD*/16, /*TILE_M*/2, /*NO_SPEC*/true>;
 
+// kid34: FlyDSL's ACTUAL shape at the prefill point, which kid32/33 miss.
+//
+// Profiled side by side at b=8 m=2048 n=1024 k=4096, FlyDSL dispatches
+// batched_gemm_a8w8_mx128_t128x512x128_mw1_nw4_nb3 -- a 128x512 tile on a 1x4
+// wave grid -- and runs 35.4 us against kid30's 47.7. kid32/33 copied its wave
+// COUNT but kept this file's square 256x256 on a 2x2 grid, so they never tested
+// the part that differs: N is four times M and TILE_M is 1, so a wave owns a
+// full 128 rows and re-reads no A across its eight N steps.
+//
+// Both kernels are LDS-bound to one workgroup per CU, and OPUS already has the
+// HIGHER wave count there (8 vs 4, 216 VGPR vs 376) -- so the gap is per-wave
+// efficiency, not occupancy, and the tile shape is the untested variable.
+//
+// Fits: kTileM * kTileN == 4 == kNumWaves, B_M % 16 == 0, B_N % 64 == 0, and
+// the load split needs B_M % 2 and (B_N/16) % 2. At kExpN = 8 the wave's N span
+// is exactly GROUP_N, so kSfBUniformOverN stays true.
+//
+// MEASURED, AND IT LOSES. Against the better of kid30/31 at n=1024 k=4096 it
+// runs 1.05x-1.8x SLOWER across b 1..16 x m 256..4096 (worst at b=8 m=256 and
+// b=1 m=2048, best 0.95x at b=4 m=2048); output is bit-identical, so the tile
+// is correct, just slow. Keep it as the control it now is: copying FlyDSL's
+// exact tile, wave grid and ring depth does NOT reproduce its margin, so the
+// gap is not the tiling. Together with the occupancy reading above -- we
+// already run more waves per CU than FlyDSL and lose -- that leaves the inner
+// loop itself: FlyDSL sustains ~40 cycles per WMMA here against our ~53, so
+// what is left to find is a stall, not a shape. Do not re-test the shape.
+template <typename DataC>
+using opus_bmm_a8w8_mxscale_bpreshuffle_tile_ns128x512_gn128_sf_gfx1250 =
+    opus_bmm_a8w8_mxscale_bpreshuffle_traits_gfx1250<
+        /*BLOCK_SIZE*/128, /*B_M*/128, /*B_N*/512, /*B_K*/128,
+        /*LAYOUT*/opus_gfx1250_bmm::kLayoutTileN,
+        /*D_A*/opus::fp8_t, /*D_B*/opus::fp8_t, /*D_C*/DataC, /*D_ACC*/float,
+        /*GROUP_K*/128, /*NUM_SLOTS*/3, /*WG_PER_CU*/1, /*GROUP_N*/128,
+        /*SF_A_LDS*/true, /*SF_B_LDS*/true,
+        /*SF_A_TDM_KG*/0, /*SF_A_TDM_PAD*/16, /*TILE_M*/1, /*NO_SPEC*/true>;
+
 // -- smem -> register read layouts -----------------------------------------
 // Device-only in effect, but compiled on the host pass too so vtype_c matches.
 #if defined(__gfx1250__) || !defined(__HIP_DEVICE_COMPILE__)
