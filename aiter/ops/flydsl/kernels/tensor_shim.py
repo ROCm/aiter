@@ -37,6 +37,7 @@ AITER_FLYDSL_MOE_EXPERT_SCHEDULING_MODE = bool(
 
 _PRELOAD_COMPILE_LOCK = threading.RLock()
 
+
 def ptr_rsrc(ptr, num_records_bytes=None):
     """Convert an fx.Pointer kernel arg to a buffer resource for buffer_load/store.
 
