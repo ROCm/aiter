@@ -488,3 +488,51 @@ def test_flush_checkpoint(batch, Hloc):
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v", "-x"])
+
+
+@pytest.mark.parametrize("num_spec", [0, 3])
+def test_determinism(num_spec):
+    """Same input produces identical output and ssm state across runs."""
+    from aiter.ops.triton.gated_delta_net.fused_kda_decode_unified import (
+        fused_kda_decode_unified,
+    )
+
+    inp = _make_inputs(4, 12, num_spec=num_spec)
+    spec_kwargs = (
+        {
+            "num_accepted_tokens": inp["num_accepted_tokens"],
+            "conv_state_indices": inp["conv_state_indices"],
+        }
+        if num_spec
+        else {}
+    )
+    results = []
+    for _ in range(5):
+        fused_cs, fused_ss = inp["conv_state"].clone(), inp["state"].clone()
+        out = fused_kda_decode_unified(
+            inp["mixed_qkv"],
+            fused_cs,
+            inp["conv_weight"],
+            inp["gate"],
+            inp["beta"],
+            inp["out_gate"],
+            inp["A_log"],
+            inp["dt_bias"],
+            fused_ss,
+            inp["cu_seqlens"],
+            inp["norm_weight"],
+            1e-6,
+            D,
+            12,
+            -5.0,
+            state_indices=inp["state_indices"],
+            **spec_kwargs,
+        )
+        results.append((out.clone(), fused_ss.clone()))
+    for i in range(1, len(results)):
+        assert torch.equal(
+            results[0][0], results[i][0]
+        ), f"out: run 0 vs run {i} differ"
+        assert torch.equal(
+            results[0][1], results[i][1]
+        ), f"ssm_state: run 0 vs run {i} differ"
