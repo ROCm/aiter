@@ -13,6 +13,9 @@ FlyDSL/CK ratio table.  Design (see SILOTIGER-667-plan-bench.md):
     sides' raw times (``--method weight_stream`` default, or ``total_traffic``).
   * Both sides COLD: CK via ``CK_WD_ROTATE`` disjoint-expert rotation (A1);
     FlyDSL via its cold-HBM benches.  Default-vs-default config (D3).
+  * ``--flydsl-weight-layout`` selects only FlyDSL's weight addressing. Host
+    preshuffling is completed and synchronized before correctness/warmup/timing;
+    CK always consumes its k-contiguous weights.
   * D5 variance: clocks can't be pinned on this gfx950 (see plan D1), so each sweep
     is repeated ``--repeats`` times; the headline us is the per-cell median, with a
     spread%% column per side and a "noisy" flag when spread exceeds ``--noise-pct``.
@@ -32,6 +35,9 @@ Examples:
   # quick smoke (one shape, tiny iters, single pass)
   HIP_VISIBLE_DEVICES=6 ./flydsl_venv/bin/python tickets/667/harness/compare.py \
       --backend ck --shapes qwen3next --batches 1 --iters 30 --cold 5 --repeats 1
+  # same artifact schema, FlyDSL preshuffled vs CK k-contiguous
+  HIP_VISIBLE_DEVICES=6 ./flydsl_venv/bin/python tickets/667/harness/compare.py \
+      --backend ck --flydsl-weight-layout preshuffled
 """
 
 from __future__ import annotations
@@ -223,7 +229,7 @@ def load_flydsl_module():
     return mod
 
 
-def run_flydsl(mod, shapes, batches, iters, warmup, timing):
+def run_flydsl(mod, shapes, batches, iters, warmup, timing, weight_layout):
     """Call the cold benches and melt merged rows into per-cell {key -> (us, cos)}."""
     records = {}
     for name in shapes:
@@ -231,7 +237,15 @@ def run_flydsl(mod, shapes, batches, iters, warmup, timing):
         H, I, E, K = s["H"], s["I"], s["E"], s["K"]  # noqa: E741
         for B in batches:
             dn = mod.bench_down_cold(
-                B, I, H, E, K, timing=timing, num_iters=iters, num_warmup=warmup
+                B,
+                I,
+                H,
+                E,
+                K,
+                timing=timing,
+                num_iters=iters,
+                num_warmup=warmup,
+                weight_layout=weight_layout,
             )
             records[_key(H, I, E, K, B, "down", "fp4", None)] = (
                 dn.get("fp4_us"),
@@ -242,7 +256,15 @@ def run_flydsl(mod, shapes, batches, iters, warmup, timing):
                 dn.get("fp8_cos"),
             )
             gu = mod.bench_gate_up_cold(
-                B, H, I, E, K, timing=timing, num_iters=iters, num_warmup=warmup
+                B,
+                H,
+                I,
+                E,
+                K,
+                timing=timing,
+                num_iters=iters,
+                num_warmup=warmup,
+                weight_layout=weight_layout,
             )
             records[_key(H, I, E, K, B, "gate_up", "fp4", "bf16")] = (
                 gu.get("fp4_us"),
@@ -278,11 +300,13 @@ def run_backend_repeats(backend, shapes, batches, iters, cold, ck_bench, repeats
     raise ValueError(f"unsupported backend {backend!r}; choose from {BACKENDS}")
 
 
-def run_flydsl_repeats(mod, shapes, batches, iters, warmup, timing, repeats):
+def run_flydsl_repeats(
+    mod, shapes, batches, iters, warmup, timing, repeats, weight_layout
+):
     """Run the FlyDSL sweep `repeats` times; return {key -> ([us,...], cos)}."""
     agg: dict = {}
     for r in range(repeats):
-        records = run_flydsl(mod, shapes, batches, iters, warmup, timing)
+        records = run_flydsl(mod, shapes, batches, iters, warmup, timing, weight_layout)
         for k, (us, cos) in records.items():
             lst, _ = agg.setdefault(k, ([], cos))
             lst.append(us)
@@ -485,6 +509,12 @@ def main() -> int:
         "--timing", default="device", choices=["device", "cuda_event", "graph"]
     )
     ap.add_argument(
+        "--flydsl-weight-layout",
+        default="k_contiguous",
+        choices=["k_contiguous", "preshuffled"],
+        help="FlyDSL weight layout; CK remains k-contiguous (default: k_contiguous)",
+    )
+    ap.add_argument(
         "--method", default="weight_stream", choices=["weight_stream", "total_traffic"]
     )
     ap.add_argument("--ck-bench", default=os.environ.get("CK_BENCH", CK_BENCH_DEFAULT))
@@ -541,7 +571,14 @@ def main() -> int:
             args.repeats,
         )
         fly_records = run_flydsl_repeats(
-            mod, shapes, batches, args.iters, args.warmup, args.timing, args.repeats
+            mod,
+            shapes,
+            batches,
+            args.iters,
+            args.warmup,
+            args.timing,
+            args.repeats,
+            args.flydsl_weight_layout,
         )
     clk_summary = clk.summary()
 
@@ -557,11 +594,14 @@ def main() -> int:
         f"gfx={mod.get_gfx()}  aiter={_git_commit(REPO)}  "
         f"backend={args.backend}  ck_worktree={ck_worktree}",
         f"iters={args.iters} cold={args.cold} timing={args.timing} method={args.method} "
-        f"repeats={args.repeats}",
+        f"repeats={args.repeats} flydsl_weight_layout={args.flydsl_weight_layout} "
+        f"{args.backend}_weight_layout=k_contiguous",
         f"{args.backend} provenance: {peer_prov}",
         f"clocks: auto (unpinnable on this gfx950; D1) -- effective {clk_summary} on GPU "
         f"{gpu}; per-cell spread%% + noisy flag (>{args.noise_pct:.0f}%) capture drift (D5).",
-        "config policy (D3): default-vs-default. FlyDSL = library defaults, no overrides: "
+        "config policy (D3): default-vs-default except the explicit FlyDSL weight layout. "
+        f"FlyDSL weight_layout={args.flydsl_weight_layout}; other FlyDSL knobs use library "
+        "defaults: "
         "serialize_dot2=True, kh_per_warp=auto(2 when HIDDEN even), prefetch=False; "
         "down_fp4 dot2_acc=4, gate_up_fp4 dot2_acc=1 (G7: acc>1 ~4% slower for gate_up); "
         "down_fp8 split_k=1; FP8 w_scale=block2d(128,128) to match CK. "

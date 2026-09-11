@@ -214,6 +214,7 @@ def _layout_weights(weight_layout, *weights, mxfp4: bool = False):
         return weights
     return tuple(_shuffle_warp_decode_b(w, mxfp4=mxfp4) for w in weights)
 
+
 # name, B, HIDDEN, INTER, E, TOPK, w_scale_mode, scale_block (None | (BN, BK))
 GATE_UP_CASES = [
     ("h1024_i64_e4_tk2_pertensor", 2, 1024, 64, 4, 2, "pertensor", None),
@@ -428,9 +429,7 @@ def _ref_down(
     return y.to(torch.bfloat16)
 
 
-def _run_down_case(
-    case, *, cos_thresh=0.999, weight_layout=WeightLayout.K_CONTIGUOUS
-):
+def _run_down_case(case, *, cos_thresh=0.999, weight_layout=WeightLayout.K_CONTIGUOUS):
     name, B, INTER, HIDDEN, E, TOPK, mode, scale_block = case
     weight_layout = WeightLayout(weight_layout)
     print("=" * 78)
@@ -2247,7 +2246,17 @@ def _time_rotating(entry_fn, rid_list, num_iters, num_warmup, timing):
 
 
 @benchmark()
-def bench_down_cold(B, INTER, HIDDEN, E, TOPK, timing, num_iters, num_warmup):
+def bench_down_cold(
+    B,
+    INTER,
+    HIDDEN,
+    E,
+    TOPK,
+    timing,
+    num_iters,
+    num_warmup,
+    weight_layout=WeightLayout.K_CONTIGUOUS,
+):
     """Cold-HBM A/B: FP4 vs FP8 `down` at real E, router rotated over the pool.
 
     Returns one merged row (FP4 + FP8 side by side).  Metrics come from
@@ -2255,6 +2264,7 @@ def bench_down_cold(B, INTER, HIDDEN, E, TOPK, timing, num_iters, num_warmup):
     launch reads -- B*TOPK experts' rows (distinct experts per token, matching CK)
     -- so TB/s reflects real HBM bandwidth and scales with B.
     """
+    weight_layout = WeightLayout(weight_layout)
     device = torch.device("cuda")
     nchk = min(B, _COS_CHK_TOKENS)
     ehi = E * HIDDEN * INTER
@@ -2267,20 +2277,31 @@ def bench_down_cold(B, INTER, HIDDEN, E, TOPK, timing, num_iters, num_warmup):
     run_fp8 = HIDDEN * INTER < _COLD_FP8_LIMIT
 
     # ---- FP4 ----
-    inter, w_down, w_scale, rid_list, rwt = _gen_down_fp4_pool(
+    inter, w_down_raw, w_scale, rid_list, rwt = _gen_down_fp4_pool(
         B, INTER, HIDDEN, E, TOPK
     )
+    (w_down,) = _layout_weights(weight_layout, w_down_raw, mxfp4=True)
+    if weight_layout is WeightLayout.PRESHUFFLED:
+        torch.cuda.synchronize()  # Host preshuffle is setup, never timed.
     out = torch.empty((B, HIDDEN), dtype=torch.bfloat16, device=device)
     entry4 = lambda rid, inter=inter, w_down=w_down, w_scale=w_scale, out=out: flydsl_warp_decode_down_reduce_fp4(  # noqa: E731
-        inter, w_down, rid, rwt, w_scale, scale_block=(1, _MXFP4_BK), out=out
+        inter,
+        w_down,
+        rid,
+        rwt,
+        w_scale,
+        scale_block=(1, _MXFP4_BK),
+        weight_layout=weight_layout,
+        out=out,
     )
     got4 = entry4(rid_list[0])
     torch.cuda.synchronize()
     ref4 = _ref_down_fp4_pool(
-        inter[:nchk], w_down, w_scale, rid_list[0][:nchk], rwt[:nchk], HIDDEN
+        inter[:nchk], w_down_raw, w_scale, rid_list[0][:nchk], rwt[:nchk], HIDDEN
     )
     cos4 = _cosine(ref4, got4[:nchk])
     assert cos4 >= 0.99, f"down fp4 cold: correctness regression (cos={cos4:.4f})"
+    del w_down_raw
     _, us4 = _time_rotating(entry4, rid_list, num_iters, num_warmup, timing)
     m4 = compute_metrics("down", B, HIDDEN, INTER, TOPK, "fp4", us4)
     tbs4 = m4["TB/s"]
@@ -2289,9 +2310,12 @@ def bench_down_cold(B, INTER, HIDDEN, E, TOPK, timing, num_iters, num_warmup):
 
     # ---- FP8 (Block2D<128,128>, B1) -- K3 Tier-2 i64 base carries E*H*I >= 2^31 ----
     if run_fp8:
-        inter8, w_down8, w_scale8, rid_list8, rwt8 = _gen_down_fp8_pool(
+        inter8, w_down8_raw, w_scale8, rid_list8, rwt8 = _gen_down_fp8_pool(
             B, INTER, HIDDEN, E, TOPK
         )
+        (w_down8,) = _layout_weights(weight_layout, w_down8_raw)
+        if weight_layout is WeightLayout.PRESHUFFLED:
+            torch.cuda.synchronize()  # Host preshuffle is setup, never timed.
         out8 = torch.empty((B, HIDDEN), dtype=torch.bfloat16, device=device)
         entry8 = lambda rid, inter8=inter8, w_down8=w_down8, w_scale8=w_scale8, out8=out8: flydsl_warp_decode_down_reduce(  # noqa: E731
             inter8,
@@ -2301,15 +2325,22 @@ def bench_down_cold(B, INTER, HIDDEN, E, TOPK, timing, num_iters, num_warmup):
             w_scale8,
             w_scale_mode="block2d",
             scale_block=_FP8_SCALE_BLOCK,
+            weight_layout=weight_layout,
             out=out8,
         )
         got8 = entry8(rid_list8[0])
         torch.cuda.synchronize()
         ref8 = _ref_down_fp8_pool(
-            inter8[:nchk], w_down8, w_scale8, rid_list8[0][:nchk], rwt8[:nchk], HIDDEN
+            inter8[:nchk],
+            w_down8_raw,
+            w_scale8,
+            rid_list8[0][:nchk],
+            rwt8[:nchk],
+            HIDDEN,
         )
         cos8 = _cosine(ref8, got8[:nchk])
         assert cos8 >= 0.99, f"down fp8 cold: correctness regression (cos={cos8:.4f})"
+        del w_down8_raw
         _, us8 = _time_rotating(entry8, rid_list8, num_iters, num_warmup, timing)
         tbs8 = compute_metrics("down", B, HIDDEN, INTER, TOPK, "fp8", us8)["TB/s"]
         del inter8, w_down8, w_scale8, out8
@@ -2542,13 +2573,24 @@ def _ref_gate_up_fp8act_pool(
 
 
 @benchmark()
-def bench_gate_up_cold(B, HIDDEN, INTER, E, TOPK, timing, num_iters, num_warmup):
+def bench_gate_up_cold(
+    B,
+    HIDDEN,
+    INTER,
+    E,
+    TOPK,
+    timing,
+    num_iters,
+    num_warmup,
+    weight_layout=WeightLayout.K_CONTIGUOUS,
+):
     """Cold-HBM A/B: FP4 vs FP8 `gate_up` at real E, router rotated over the pool.
 
     Metrics come from ``compute_metrics(method="weight_stream")``, which counts the
     two weight streams (gate + up) a single launch reads for its B*TOPK experts
     (distinct per token, matching CK), so TB/s reflects real HBM bandwidth.
     """
+    weight_layout = WeightLayout(weight_layout)
     device = torch.device("cuda")
     nchk = min(B, _COS_CHK_TOKENS)
     ehi = E * INTER * HIDDEN
@@ -2561,18 +2603,32 @@ def bench_gate_up_cold(B, HIDDEN, INTER, E, TOPK, timing, num_iters, num_warmup)
     run_fp8 = INTER * HIDDEN < _COLD_FP8_LIMIT
 
     # ---- FP4 ----
-    x, wg, wgs, wu, wus, rid_list = _gen_gate_up_fp4_pool(B, HIDDEN, INTER, E, TOPK)
+    x, wg_raw, wgs, wu_raw, wus, rid_list = _gen_gate_up_fp4_pool(
+        B, HIDDEN, INTER, E, TOPK
+    )
+    wg, wu = _layout_weights(weight_layout, wg_raw, wu_raw, mxfp4=True)
+    if weight_layout is WeightLayout.PRESHUFFLED:
+        torch.cuda.synchronize()  # Host preshuffle is setup, never timed.
     out = torch.empty((B, TOPK, INTER), dtype=torch.bfloat16, device=device)
     entry4 = lambda rid, x=x, wg=wg, wgs=wgs, wu=wu, wus=wus, out=out: flydsl_warp_decode_gate_up_fp4(  # noqa: E731
-        x, wg, wu, rid, wgs, wus, scale_block=(1, _MXFP4_BK), out=out
+        x,
+        wg,
+        wu,
+        rid,
+        wgs,
+        wus,
+        scale_block=(1, _MXFP4_BK),
+        weight_layout=weight_layout,
+        out=out,
     )
     got4 = entry4(rid_list[0])
     torch.cuda.synchronize()
     ref4 = _ref_gate_up_fp4_pool(
-        x[:nchk], wg, wgs, wu, wus, rid_list[0][:nchk], INTER, HIDDEN
+        x[:nchk], wg_raw, wgs, wu_raw, wus, rid_list[0][:nchk], INTER, HIDDEN
     )
     cos4 = _cosine(ref4, got4[:nchk])
     assert cos4 >= 0.99, f"gate_up fp4 cold: correctness regression (cos={cos4:.4f})"
+    del wg_raw, wu_raw
     _, us4 = _time_rotating(entry4, rid_list, num_iters, num_warmup, timing)
     m4 = compute_metrics("gate_up", B, HIDDEN, INTER, TOPK, "fp4", us4)
     tbs4 = m4["TB/s"]
@@ -2581,9 +2637,12 @@ def bench_gate_up_cold(B, HIDDEN, INTER, E, TOPK, timing, num_iters, num_warmup)
 
     # ---- FP8 (Block2D<128,128>, B1) -- K3 Tier-2 i64 base carries E*I*H >= 2^31 ----
     if run_fp8:
-        x8, wg8, wgs8, wu8, wus8, rid_list8 = _gen_gate_up_fp8_pool(
+        x8, wg8_raw, wgs8, wu8_raw, wus8, rid_list8 = _gen_gate_up_fp8_pool(
             B, HIDDEN, INTER, E, TOPK
         )
+        wg8, wu8 = _layout_weights(weight_layout, wg8_raw, wu8_raw)
+        if weight_layout is WeightLayout.PRESHUFFLED:
+            torch.cuda.synchronize()  # Host preshuffle is setup, never timed.
         out8 = torch.empty((B, TOPK, INTER), dtype=torch.bfloat16, device=device)
         entry8 = lambda rid, x8=x8, wg8=wg8, wu8=wu8, wgs8=wgs8, wus8=wus8, out8=out8: flydsl_warp_decode_gate_up(  # noqa: E731
             x8,
@@ -2594,17 +2653,26 @@ def bench_gate_up_cold(B, HIDDEN, INTER, E, TOPK, timing, num_iters, num_warmup)
             wus8,
             w_scale_mode="block2d",
             scale_block=_FP8_SCALE_BLOCK,
+            weight_layout=weight_layout,
             out=out8,
         )
         got8 = entry8(rid_list8[0])
         torch.cuda.synchronize()
         ref8 = _ref_gate_up_fp8_pool(
-            x8[:nchk], wg8, wgs8, wu8, wus8, rid_list8[0][:nchk], INTER, HIDDEN
+            x8[:nchk],
+            wg8_raw,
+            wgs8,
+            wu8_raw,
+            wus8,
+            rid_list8[0][:nchk],
+            INTER,
+            HIDDEN,
         )
         cos8 = _cosine(ref8, got8[:nchk])
         assert (
             cos8 >= 0.99
         ), f"gate_up fp8 cold: correctness regression (cos={cos8:.4f})"
+        del wg8_raw, wu8_raw
         _, us8 = _time_rotating(entry8, rid_list8, num_iters, num_warmup, timing)
         tbs8 = compute_metrics("gate_up", B, HIDDEN, INTER, TOPK, "fp8", us8)["TB/s"]
         del x8, wg8, wu8, out8
@@ -2616,9 +2684,12 @@ def bench_gate_up_cold(B, HIDDEN, INTER, E, TOPK, timing, num_iters, num_warmup)
 
     # ---- FP8-activation (B4, CK gate_fp8_d2 peer): FP8 x + Block2D<1,128> x-scale --
     if run_fp8:
-        xa, xsa, wga, wgsa, wua, wusa, rid_lista = _gen_gate_up_fp8act_pool(
+        xa, xsa, wga_raw, wgsa, wua_raw, wusa, rid_lista = _gen_gate_up_fp8act_pool(
             B, HIDDEN, INTER, E, TOPK
         )
+        wga, wua = _layout_weights(weight_layout, wga_raw, wua_raw)
+        if weight_layout is WeightLayout.PRESHUFFLED:
+            torch.cuda.synchronize()  # Host preshuffle is setup, never timed.
         outa = torch.empty((B, TOPK, INTER), dtype=torch.bfloat16, device=device)
         entrya = lambda rid, xa=xa, xsa=xsa, wga=wga, wgsa=wgsa, wua=wua, wusa=wusa, outa=outa: flydsl_warp_decode_gate_up_fp8act(  # noqa: E731
             xa,
@@ -2629,17 +2700,27 @@ def bench_gate_up_cold(B, HIDDEN, INTER, E, TOPK, timing, num_iters, num_warmup)
             wgsa,
             wusa,
             scale_block=_FP8_SCALE_BLOCK,
+            weight_layout=weight_layout,
             out=outa,
         )
         gota = entrya(rid_lista[0])
         torch.cuda.synchronize()
         refa = _ref_gate_up_fp8act_pool(
-            xa[:nchk], xsa, wga, wgsa, wua, wusa, rid_lista[0][:nchk], INTER, HIDDEN
+            xa[:nchk],
+            xsa,
+            wga_raw,
+            wgsa,
+            wua_raw,
+            wusa,
+            rid_lista[0][:nchk],
+            INTER,
+            HIDDEN,
         )
         cosa = _cosine(refa, gota[:nchk])
         assert (
             cosa >= 0.99
         ), f"gate_up fp8-act cold: correctness regression (cos={cosa:.4f})"
+        del wga_raw, wua_raw
         _, usa = _time_rotating(entrya, rid_lista, num_iters, num_warmup, timing)
         tbsa = compute_metrics(
             "gate_up", B, HIDDEN, INTER, TOPK, "fp8", usa, act_dtype="fp8"

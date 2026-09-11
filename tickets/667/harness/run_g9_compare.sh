@@ -15,6 +15,9 @@
 #     --repeats N      D5 repeats for variance (default: 3)
 #     --iters N        timed iters (default: 1000, of-record per D1)
 #     --cold N         warmup/rotation iters (default: 20)
+#     --flydsl-weight-layout NAME
+#                     FlyDSL k_contiguous or preshuffled (default: k_contiguous);
+#                     CK always remains k-contiguous
 #     --out-prefix P   artifact path prefix (default: tickets/667/g9_compare; files are ${P}_${backend}.{md,csv})
 #     --                everything after is passed through to compare.py
 #
@@ -22,6 +25,7 @@
 #   bash run_g9_compare.sh                      # full of-record sweep -> tickets/667/g9_compare_ck.{md,csv}
 #   bash run_g9_compare.sh --build-ck           # rebuild CK first, then sweep
 #   bash run_g9_compare.sh --backend ck --repeats 5 -- --shapes qwen3next --batches 1,8
+#   bash run_g9_compare.sh --flydsl-weight-layout preshuffled  # same artifact paths; header records layouts
 #   bash run_g9_compare.sh --validate           # D7 numerical cross-check (no perf sweep)
 
 set -euo pipefail
@@ -40,6 +44,7 @@ VALIDATE=0
 REPEATS=3
 ITERS=1000
 COLD=20
+FLYDSL_WEIGHT_LAYOUT="k_contiguous"
 OUT_PREFIX="${REPO}/tickets/667/g9_compare"
 PASSTHRU=()
 
@@ -52,11 +57,17 @@ while [ $# -gt 0 ]; do
         --repeats)    REPEATS="$2"; shift 2 ;;
         --iters)      ITERS="$2"; shift 2 ;;
         --cold)       COLD="$2"; shift 2 ;;
+        --flydsl-weight-layout) FLYDSL_WEIGHT_LAYOUT="$2"; shift 2 ;;
         --out-prefix) OUT_PREFIX="$2"; shift 2 ;;
         --)           shift; PASSTHRU=("$@"); break ;;
         *) echo "unknown option: $1" >&2; exit 2 ;;
     esac
 done
+
+case "${FLYDSL_WEIGHT_LAYOUT}" in
+    k_contiguous|preshuffled) ;;
+    *) echo "invalid --flydsl-weight-layout: ${FLYDSL_WEIGHT_LAYOUT} (expected k_contiguous or preshuffled)" >&2; exit 2 ;;
+esac
 
 if [ ! -x "${VENV_PY}" ]; then
     echo "error: flydsl venv python not found at ${VENV_PY}" >&2
@@ -89,10 +100,12 @@ MD_OUT="${OUT_PREFIX}_${BACKEND}.md"
 CSV_OUT="${OUT_PREFIX}_${BACKEND}.csv"
 
 echo "==> G9 compare: gpu=${GPU} backend=${BACKEND} repeats=${REPEATS} iters=${ITERS} cold=${COLD}"
+echo "    layouts: FlyDSL=${FLYDSL_WEIGHT_LAYOUT} ${BACKEND}=k_contiguous"
 echo "    artifact -> ${MD_OUT} , ${CSV_OUT}"
 
 HIP_VISIBLE_DEVICES="${GPU}" "${VENV_PY}" "${COMPARE}" \
     --backend "${BACKEND}" \
+    --flydsl-weight-layout "${FLYDSL_WEIGHT_LAYOUT}" \
     --iters "${ITERS}" --cold "${COLD}" --repeats "${REPEATS}" \
     --md-out "${MD_OUT}" --csv-out "${CSV_OUT}" \
     "${PASSTHRU[@]}"
