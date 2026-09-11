@@ -3,7 +3,7 @@
 #include "rocm_ops.hpp"
 #include "gemm_a8w8.h"
 
-PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
+PYBIND11_MODULE(AITER_EXTENSION_NAME, m)
 {
     GEMM_A8W8_PYBIND;
 }
