@@ -21,37 +21,21 @@ from flydsl.expr.typing import Int32, Int64, Stream, T, as_ir_value
 
 from . import buffer_ops
 
-WORLD = 8  # Default value for world size
+WORLD = 8
 SUPPORTED_WORLDS = (2, 4, 8)
+SUPER_TILES = (1, 8)
+DEFAULT_GRID_CAP = 304 * 4
+
+# Shared by host tile math, LDS PackStorage, and the kernel factory.
 BLOCK = 256
 ATOMS = 8
-TILE_BYTES = BLOCK * ATOMS * 16
-TILE_I32 = TILE_BYTES // 4
-TILE_FP16 = TILE_BYTES // 2
-DEFAULT_GRID_CAP = 304 * 4
-PHASES = 2
-PHASE_REDUCE_SCATTER = 0
-PHASE_ALL_GATHER = 1
-RANK_TILE_BYTES = 1664
-RANK_TILE_I32 = RANK_TILE_BYTES // 4
-SUPER_TILES = (1, 8)
-# 1024 B q4 (256 i32) + 512 B dense q2 (128 i32) + 128 B fp16×2 scales (32 i32).
-Q2_I32_OFF = 256
-SCALE_I32_OFF = 384
-GROUP = 8
 WAVE = 64
-WAVES = 4
-# 4 lanes × 16 B = one 64 B NT sector. Not world_size.
-QUAD_LANES = 4
-QUADS_PER_WAVE = WAVE // QUAD_LANES
-N_SECTORS = RANK_TILE_BYTES // 64  # 26
-# dest × rank_atoms == ATOMS for every supported world size.
-PACK_I32 = ATOMS * RANK_TILE_I32
-LDS_BYTES = ATOMS * RANK_TILE_BYTES
-# Wire/inbox addresses are byte pointers; tile math is in i32 slots.
-I32_BYTES = 4
+GROUP = 8
+TILE_BYTES = BLOCK * ATOMS * 16
+RANK_TILE_BYTES = 1664
+PACK_I32 = ATOMS * (RANK_TILE_BYTES // 4)
 
-# Reuse INT4 residency table for first bring-up (same WG geometry).
+# (world_size, super_tile) → VGPR-limited workgroups per CU.
 _RESIDENT_WGS_PER_CU = {
     (2, 1): 3,
     (2, 8): 4,
@@ -73,19 +57,18 @@ def clamp_grid_cap(
     if requested < 1 or cu_count < 1:
         raise ValueError("grid_cap and cu_count must be positive")
     if arch not in ("gfx942", "gfx950"):
-        raise ValueError(f"qr_int6 has no residency measurement for {arch!r}")
+        raise ValueError(
+            f"quick_allreduce_int6 has no residency measurement for {arch!r}"
+        )
     try:
         resident = _RESIDENT_WGS_PER_CU[(int(world_size), int(super_tile))]
     except KeyError:
         raise ValueError(
-            f"qr_int6 has no residency measurement for {(world_size, super_tile)}"
+            "quick_allreduce_int6 has no residency measurement for "
+            f"{(world_size, super_tile)}"
         ) from None
     return min(int(requested), resident * int(cu_count))
 
-
-# gfx942 buffer aux: bit 1 = sc1 (bypass L2), bit 2 = NT.
-_CM_SC1 = 2
-_CM_NT = 4
 
 # HIP CodecQ6 half constants (packed f16x2 / i16x2 bit patterns).
 _K_MASK_000F = 0x000F000F
@@ -105,10 +88,6 @@ def _i32(vec):
     return vec.bitcast(fx.Int32)[0]
 
 
-def _minnumf(a, b):
-    return fx.Vector(fx.arith.minnumf(a, b), a.shape, a.dtype)
-
-
 def _clamp_fp16_overflow():
     """Saturate packed fp16 overflow to ±65504 instead of Inf.
 
@@ -117,10 +96,13 @@ def _clamp_fp16_overflow():
     to the max finite fp16. INT6 is already a saturating codec, so a rare
     overflow should not poison the all-reduce.
 
-    There is no FlyDSL wrapper; ``s_setreg_imm32_b32 0xdc1, 1`` writes
-    ``hwreg(HW_REG_MODE, offset=23, size=2)``.
+    FlyDSL has no MODE helper; ``llvm.amdgcn.s.setreg`` is the same
+    intrinsic ``rocdl.disable_xdl_arb_stall`` uses for a different bit.
     """
-    llvm.InlineAsmOp(None, [], "s_setreg_imm32_b32 0xdc1, 1", "", has_side_effects=True)
+    # hwreg(HW_REG_MODE, offset=23, size=2): id | (off<<6) | ((size-1)<<11)
+    imm = as_ir_value(fx.Int32(0xDC1))
+    val = as_ir_value(fx.Int32(1))
+    llvm.call_intrinsic(None, "llvm.amdgcn.s.setreg", [imm, val], [], [])
 
 
 def _shuffle_f16x2(vec, xor_off):
@@ -149,10 +131,10 @@ def _group_abs_max_f16(atom):
         _f16x2(atom[3]),
     )
     wmax = fx.maxnumf(fx.maxnumf(p0, p1), fx.maxnumf(p2, p3))
-    wmin = _minnumf(_minnumf(p0, p1), _minnumf(p2, p3))
+    wmin = fx.min(fx.min(p0, p1), fx.min(p2, p3))
     for off in (1, 2, 4):
         wmax = fx.maxnumf(wmax, _shuffle_f16x2(wmax, off))
-        wmin = _minnumf(wmin, _shuffle_f16x2(wmin, off))
+        wmin = fx.min(wmin, _shuffle_f16x2(wmin, off))
     return _packed_abs_max_f16(wmax, wmin)
 
 
@@ -160,9 +142,7 @@ def _rcp_f16x2(vec):
     """Per-lane reciprocal via f32 (HIP packed_rcp stand-in)."""
     lo = fx.Float32(1.0) / fx.Float32(vec[0])
     hi = fx.Float32(1.0) / fx.Float32(vec[1])
-    return fx.Vector.from_elements(
-        [lo.to(fx.Float16), hi.to(fx.Float16)], fx.Float16
-    )
+    return fx.Vector.from_elements([lo.to(fx.Float16), hi.to(fx.Float16)], fx.Float16)
 
 
 def _codec_quant(atom, tid):
@@ -175,7 +155,7 @@ def _codec_quant(atom, tid):
     bias = fx.Vector.filled(2, fx.Int16(32), fx.Int16)
     q = []
     for i in range_constexpr(4):
-        w = _minnumf(fx.maxnumf(_f16x2(atom[i]) * encoding, lo), hi)
+        w = fx.min(fx.maxnumf(_f16x2(atom[i]) * encoding, lo), hi)
         q.append(_i32(fx.roundeven(w).to(fx.Int16) + bias))
     mask = fx.Int32(_K_MASK_000F)
     q4w = (
@@ -189,12 +169,8 @@ def _codec_quant(atom, tid):
         tw = q[i]
         lo16 = tw & fx.Int32(0xFFFF)
         hi16 = tw.shrui(fx.Int32(16)) & fx.Int32(0xFFFF)
-        q2w = q2w | (
-            (lo16.shrui(fx.Int32(4)) & fx.Int32(3)) << fx.Int32(i * 4)
-        )
-        q2w = q2w | (
-            (hi16.shrui(fx.Int32(4)) & fx.Int32(3)) << fx.Int32(i * 4 + 2)
-        )
+        q2w = q2w | ((lo16.shrui(fx.Int32(4)) & fx.Int32(3)) << fx.Int32(i * 4))
+        q2w = q2w | ((hi16.shrui(fx.Int32(4)) & fx.Int32(3)) << fx.Int32(i * 4 + 2))
     is_leader = (tid % GROUP) == 0
     return q4w, q2w, _i32(decoding), is_leader
 
@@ -209,9 +185,7 @@ def _codec_dequant(q4w, q2w, scale, acc=None):
     q2 = q2w
     for _i in range_constexpr(4):
         q4_n = (q4 & mask) | bias_hi
-        q2_n = (q2 & fx.Int32(0x3)) | (
-            (q2 & fx.Int32(0xC)) << fx.Int32(14)
-        )
+        q2_n = (q2 & fx.Int32(0x3)) | ((q2 & fx.Int32(0xC)) << fx.Int32(14))
         q4 = q4.shrui(fx.Int32(4))
         q2 = q2.shrui(fx.Int32(4))
         dq = _f16x2(q4_n | (q2_n << fx.Int32(4))) + bias_lo
@@ -223,25 +197,7 @@ def _codec_dequant(q4w, q2w, scale, acc=None):
 
 
 def _i32_to_bytes(i32_off):
-    return fx.Int64(i32_off) * fx.Int64(I32_BYTES)
-
-
-def _to_sgpr_i64(addr):
-    """Copy a wave-uniform i64 from vector to scalar registers.
-
-    Buffer loads/stores need the descriptor in scalar registers. After
-    ``peers[rank]``, every lane holds the same pointer, but it sits in a
-    vector register, so LLVM cannot prove that. It then serializes the
-    wave: one lane at a time, copy that lane's pointer to a scalar
-    register, mask to that lane, issue the load, repeat. ``readfirstlane``
-    copies lane 0's value into a scalar register once so the whole wave
-    issues a single buffer op.
-
-    Do this at the inbox descriptor, not on the peer list: fanout stores
-    use a different peer per lane, so those addresses must stay in vector
-    registers. ``T.i64`` is the result type ``readfirstlane`` requires.
-    """
-    return fx.Int64(rocdl.readfirstlane(T.i64, as_ir_value(addr)))
+    return fx.Int64(i32_off) * fx.Int64(4)
 
 
 def _store_v4i32_nt_global(addr_i64, data):
@@ -251,44 +207,33 @@ def _store_v4i32_nt_global(addr_i64, data):
     4-wide group. A buffer-descriptor store wants the descriptor in scalar
     registers, so LLVM would serialize those lanes (one destination at a
     time). A flat global store takes the address from a vector register,
-    so all destinations issue together. ``nt`` skips L2; this is payload,
-    not a flag.
+    so all destinations issue together. ``nontemporal`` skips L2; this is
+    payload, not a flag. ``fx.ptr_store`` has no NT flag.
     """
     ptr_ty = ir.Type.parse("!llvm.ptr<1>")
     ptr = llvm.IntToPtrOp(ptr_ty, as_ir_value(addr_i64)).result
-    llvm.InlineAsmOp(
-        None,
-        [ptr, as_ir_value(data)],
-        "global_store_dwordx4 $0, $1, off nt",
-        "v,v",
-        has_side_effects=True,
-    )
-
-
-def _store_v4i32_release_global(addr_i64, data):
-    """Coherent 16 B store for the handshake color sector (not NT)."""
-    ptr_ty = ir.Type.parse("!llvm.ptr<1>")
-    ptr = llvm.IntToPtrOp(ptr_ty, as_ir_value(addr_i64)).result
-    llvm.InlineAsmOp(
-        None,
-        [ptr, as_ir_value(data)],
-        "global_store_dwordx4 $0, $1, off sc0 sc1",
-        "v,v",
-        has_side_effects=True,
-    )
+    llvm.StoreOp(as_ir_value(data), ptr, alignment=16, nontemporal=True)
 
 
 def _load_i32_nt(rsrc, elem_off):
     return fx.Int32(
         buffer_ops.buffer_load(
-            rsrc, elem_off, vec_width=1, dtype=T.i32, cache_modifier=_CM_NT
+            rsrc,
+            elem_off,
+            vec_width=1,
+            dtype=T.i32,
+            cache_modifier=4,  # NT
         )
     )
 
 
 def _load_i32_uncached(rsrc):
     val = buffer_ops.buffer_load(
-        rsrc, 0, vec_width=1, dtype=T.i32, cache_modifier=_CM_SC1
+        rsrc,
+        0,
+        vec_width=1,
+        dtype=T.i32,
+        cache_modifier=2,  # sc1, bypass L2
     )
     rocdl.s_waitcnt(vmcnt=0)
     return fx.Int32(val)
@@ -303,7 +248,9 @@ class PackStorage:
     pack: fx.Array[fx.Int32, PACK_I32, 16]
 
 
-def make_qr_int6_kernel(*, world_size: int = WORLD, super_tile: int = 1, grid: int):
+def make_quick_allreduce_int6_kernel(
+    *, world_size: int = WORLD, super_tile: int = 1, grid: int
+):
     if world_size not in SUPPORTED_WORLDS:
         raise ValueError(
             f"world_size must be one of {SUPPORTED_WORLDS}, got {world_size}"
@@ -314,6 +261,20 @@ def make_qr_int6_kernel(*, world_size: int = WORLD, super_tile: int = 1, grid: i
         raise ValueError(f"super_tile must be one of {SUPER_TILES}, got {super_tile!r}")
     if grid < 1:
         raise ValueError(f"grid must be positive, got {grid}")
+    PHASES = 2
+    PHASE_REDUCE_SCATTER = 0
+    PHASE_ALL_GATHER = 1
+    RANK_TILE_I32 = RANK_TILE_BYTES // 4
+    # 1024 B q4 + 512 B dense q2 + 128 B fp16×2 scales.
+    Q2_I32_OFF = 256
+    SCALE_I32_OFF = 384
+    WAVES = BLOCK // WAVE
+    QUAD_LANES = 4
+    QUADS_PER_WAVE = WAVE // QUAD_LANES
+    N_SECTORS = RANK_TILE_BYTES // 64
+    TILE_I32 = TILE_BYTES // 4
+    TILE_FP16 = TILE_BYTES // 2
+    LDS_BYTES = ATOMS * RANK_TILE_BYTES
     # Each rank owns this many 16-byte atoms of a 32 KiB tile
     # (8 GPUs → 1, 4 → 2, 2 → 4). LDS still holds all ATOMS atoms.
     rank_atoms = ATOMS // world_size
@@ -326,7 +287,7 @@ def make_qr_int6_kernel(*, world_size: int = WORLD, super_tile: int = 1, grid: i
     flags_i32 = PHASES * grid * world_size
 
     @flyc.kernel(known_block_size=[BLOCK, 1, 1])
-    def qr_int6(
+    def quick_allreduce_int6(
         rank: Int32,
         nbytes: Int64,
         num_tiles: Int32,
@@ -393,7 +354,7 @@ def make_qr_int6_kernel(*, world_size: int = WORLD, super_tile: int = 1, grid: i
         ]
         peer_vec = fx.Vector.from_elements(peers, dtype=fx.Int64)
         self_rsrc = buffer_ops.create_buffer_resource_from_addr(
-            _to_sgpr_i64(peer_vec[rank])
+            fx.Int64(rocdl.readfirstlane(T.i64, as_ir_value(peer_vec[rank])))
         )
         # inp/out are a 3-D i32 tensor consumed by TiledCopy (BufferCopy128b).
         # That API needs a FlyDSL buffer-backed tensor (layout + descriptor),
@@ -525,9 +486,7 @@ def make_qr_int6_kernel(*, world_size: int = WORLD, super_tile: int = 1, grid: i
             for stripe in range_constexpr(4):
                 is_scale_tail = stripe == 3
                 n_sectors = 2 if is_scale_tail else 8
-                fanout = (
-                    fanout_scale_stripe if is_scale_tail else fanout_main_stripe
-                )
+                fanout = fanout_scale_stripe if is_scale_tail else fanout_main_stripe
                 n_quads = fx.Int32(world_size * rank_atoms * n_sectors)
                 safe = (quad_id < n_quads).select(quad_id, fx.Int32(0))
                 peer, k, sector_in_stripe = fx.idx2crd(safe, fanout).unpack()
@@ -549,8 +508,8 @@ def make_qr_int6_kernel(*, world_size: int = WORLD, super_tile: int = 1, grid: i
                     _store_v4i32_nt_global(dest + byte_off, v4)
 
         def _publish(phase, inbox_src, color):
-            """Drain payload stores, then coherently publish the color sector."""
-            rocdl.s_waitcnt(vmcnt=0, lgkmcnt=0)
+            """Drain payload NT stores, then write *color* into every peer inbox."""
+            rocdl.s_waitcnt(vmcnt=0)
             gpu.barrier()
             limit = fx.Int32(world_size)
             safe = (quad_id < limit).select(quad_id, fx.Int32(0))
@@ -561,8 +520,7 @@ def make_qr_int6_kernel(*, world_size: int = WORLD, super_tile: int = 1, grid: i
                 byte_off = _i32_to_bytes(
                     _sub_tile_i32(phase, inbox_src, fx.Int32(0)) + vec_idx
                 )
-                _store_v4i32_release_global(dest + byte_off, v4)
-            rocdl.s_waitcnt(vmcnt=0)
+                _store_v4i32_nt_global(dest + byte_off, v4)
 
         def _wait_flag(flag_rsrc, color):
             current = _load_i32_uncached(flag_rsrc)
@@ -582,8 +540,6 @@ def make_qr_int6_kernel(*, world_size: int = WORLD, super_tile: int = 1, grid: i
                     color,
                 )
             gpu.barrier()
-            _invalidate_l1()
-            gpu.barrier()
 
         def _recv_quantized(phase, src, sub, k=0):
             base = _sub_tile_i32(phase, src, sub)
@@ -598,9 +554,7 @@ def make_qr_int6_kernel(*, world_size: int = WORLD, super_tile: int = 1, grid: i
                 q2_word & fx.Int32(0xFFFF),
             )
             scale = _f16x2(
-                _load_i32_nt(
-                    self_rsrc, base + fx.Int32(SCALE_I32_OFF) + scale_slot
-                )
+                _load_i32_nt(self_rsrc, base + fx.Int32(SCALE_I32_OFF) + scale_slot)
             )
             return q4w, q2w, scale
 
@@ -668,7 +622,7 @@ def make_qr_int6_kernel(*, world_size: int = WORLD, super_tile: int = 1, grid: i
                     gpu.barrier()
                     _fanout_nt(PHASE_REDUCE_SCATTER, rank, s)
                     if (s + fx.Int32(1)) < n_this:
-                        rocdl.s_waitcnt(vmcnt=0, lgkmcnt=0)
+                        rocdl.s_waitcnt(lgkmcnt=0)
                         gpu.barrier()
 
                 _publish(PHASE_REDUCE_SCATTER, rank, color)
@@ -680,7 +634,7 @@ def make_qr_int6_kernel(*, world_size: int = WORLD, super_tile: int = 1, grid: i
                     gpu.barrier()
                     _fanout_nt(PHASE_ALL_GATHER, rank, s)
                     if (s + fx.Int32(1)) < n_this:
-                        rocdl.s_waitcnt(vmcnt=0, lgkmcnt=0)
+                        rocdl.s_waitcnt(lgkmcnt=0)
                         gpu.barrier()
 
                 _publish(PHASE_ALL_GATHER, rank, color)
@@ -701,7 +655,7 @@ def make_qr_int6_kernel(*, world_size: int = WORLD, super_tile: int = 1, grid: i
     flat_wg = f"{BLOCK},{BLOCK}"
 
     @flyc.jit
-    def launch_qr_int6(
+    def launch_quick_allreduce_int6(
         rank: Int32,
         nbytes: Int64,
         num_tiles: Int32,
@@ -712,7 +666,7 @@ def make_qr_int6_kernel(*, world_size: int = WORLD, super_tile: int = 1, grid: i
         grid_x: Int32,
         stream: Stream = Stream(None),  # noqa: B008
     ):
-        qr_int6(
+        quick_allreduce_int6(
             rank,
             nbytes,
             num_tiles,
@@ -727,9 +681,11 @@ def make_qr_int6_kernel(*, world_size: int = WORLD, super_tile: int = 1, grid: i
             stream=stream,
         )
 
-    launch_qr_int6.func.__name__ = f"launch_qr_int6_ws{world_size}_st{super_tile}"
+    launch_quick_allreduce_int6.func.__name__ = (
+        f"launch_quick_allreduce_int6_ws{world_size}_st{super_tile}"
+    )
     return {
-        "launch": launch_qr_int6,
+        "launch": launch_quick_allreduce_int6,
         "flags_bytes": flags_i32 * 4,
         "data_bytes": PHASES * grid * world_size * wire_tile_bytes,
         "lds_bytes": LDS_BYTES,

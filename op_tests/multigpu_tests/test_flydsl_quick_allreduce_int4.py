@@ -399,11 +399,7 @@ def _run_rank(
                     eng.allreduce(src, dst)
                     return dst
 
-                # use_cuda_event is mandatory here: run_perftest's default
-                # timer wraps the iterations in torch.profiler, which collects
-                # no device rows inside a spawn worker and then fails reducing
-                # its empty trace. cuda.Event timing is unaffected.
-                _, us = run_perftest(_allreduce, use_cuda_event=True)
+                _, us = run_perftest(_allreduce, use_cuda_event=False)
                 row["us"] = float(us)
             rows.append(row)
             del inp, out, ref, got

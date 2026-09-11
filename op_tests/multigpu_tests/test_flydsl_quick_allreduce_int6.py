@@ -1,18 +1,21 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Runtime correctness for FlyDSL INT6 QuickReduce (``QRInt6``).
+"""Runtime correctness for FlyDSL INT6 quick all-reduce (``QuickAllReduceInt6``).
 
 Pytest collects validity cases only (no timing). ``python3`` this file
-runs an aiter-op-test ``@benchmark`` / markdown sweep. Each rank times
-``fly.allreduce`` with ``run_perftest`` after ``compile()``. The oracle
-is an untimed fp32 NCCL all-reduce of the same per-rank inputs. INT6 is
-lossy, so validity uses SQNR, a calibrated mismatch ratio, and a
-per-tile SQNR floor.
+runs an aiter-op-test ``@benchmark`` / markdown sweep. Every rank is a
+``multiprocessing`` spawn worker that builds its own
+``QuickAllReduceInt6`` engine, calls ``compile()``, and in the sweep
+times ``fly.allreduce`` with ``run_perftest``. The oracle is an untimed
+fp32 NCCL all-reduce of the same per-rank inputs. INT6 is lossy, so
+validity uses SQNR, a calibrated mismatch ratio, and a per-tile SQNR
+floor.
 
-5120 is a measured calibration width, not an ABI requirement. The kernel
-is gfx942/gfx950 TP∈{2,4,8}; other archs skip. Pytest skips a world size
-when fewer GPUs are visible than TP.
+hidden=5120 is the width the kernel was tuned on, not a shape the kernel
+requires. QuickAllReduceInt6 runs on gfx942/gfx950 at TP∈{2,4,8}; other
+archs skip, and pytest skips a world size when fewer GPUs are visible
+than TP.
 """
 
 from __future__ import annotations
@@ -22,12 +25,10 @@ import itertools
 import json
 import os
 import statistics
-import subprocess
 import sys
-import tempfile
-import time
+from multiprocessing import Pool, freeze_support, set_start_method
 
-_REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+_REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
 
@@ -43,12 +44,14 @@ from aiter.test_common import benchmark, checkAllclose, run_perftest
 
 pytest.importorskip("flydsl")
 
-from aiter.ops.flydsl.kernels.qr_int6 import DEFAULT_GRID_CAP
-from aiter.ops.flydsl.kernels.qr_int6_kernel import (
+set_start_method("spawn", force=True)
+
+from aiter.ops.flydsl.kernels.quick_allreduce_int6 import (
     SUPPORTED_WORLDS,
     TILE_BYTES,
     WORLD,
 )
+from aiter.ops.flydsl.quick_allreduce_int6 import DEFAULT_GRID_CAP
 
 try:
     ARCH = get_gfx_runtime()
@@ -68,13 +71,14 @@ TP = WORLD
 
 pytestmark = pytest.mark.skipif(
     ARCH not in SUPPORTED_ARCHS,
-    reason="QRInt6 requires an available gfx942 or gfx950 GPU",
+    reason="QuickAllReduceInt6 requires an available gfx942 or gfx950 GPU",
 )
 
 # Distinct correctness branches, not a tokens x hidden product.
-# hidden=5120 is calibration; 4096 proves the map is not width-locked.
-# (8, 1024) is a half-tile tail (TILE_BYTES = 32 KiB).
-# TP2/4: ST=1 calib plus one ST=8 case (num_tiles > grid_cap) each.
+# hidden=5120 is the calibrated width; hidden=4096 covers a width the tuning
+# was not fitted to. (8, 1024) is a payload smaller than one 32 KiB tile.
+# Every world size gets a super_tile=1 case and at least one super_tile=8
+# case, the latter sized so num_tiles exceeds the ST=1 grid.
 # Pytest skips a world size when fewer GPUs are visible than TP.
 _PYTEST_CASES = (
     (8, 8, 1024, "partial-tile"),
@@ -93,6 +97,16 @@ def _num_tiles(tokens: int, hidden: int) -> int:
     return max(1, (nbytes + TILE_BYTES - 1) // TILE_BYTES)
 
 
+def _make_inp(
+    tokens: int, hidden: int, *, rank: int, device: torch.device
+) -> torch.Tensor:
+    shape = (tokens, hidden)
+    gen = torch.Generator().manual_seed(1234 + rank)
+    return (torch.randn(shape, generator=gen, dtype=torch.float32) * 0.1).to(
+        device=device, dtype=torch.bfloat16
+    )
+
+
 def _pick_st(
     tokens: int,
     hidden: int,
@@ -100,6 +114,7 @@ def _pick_st(
     *,
     grid_cap: int = DEFAULT_GRID_CAP,
 ) -> int:
+    """Expected ST: the engine only uses ST>1 when tiles exceed its ST=1 grid."""
     tiles = _num_tiles(tokens, hidden)
     if requested == 1 or tiles > grid_cap:
         return requested
@@ -122,7 +137,7 @@ def _sqnr_db(got: torch.Tensor, reference: torch.Tensor) -> float:
 
 
 def _min_tile_sqnr_db(got: torch.Tensor, reference: torch.Tensor) -> float:
-    """Worst 32 KiB-tile SQNR. A dropped or stale tile is ~0 dB."""
+    """Worst 32 KiB-tile SQNR, so one unwritten tile cannot be averaged away."""
     tile_elems = TILE_BYTES // 2
     g = got.reshape(-1)
     r = reference.reshape(-1)
@@ -140,33 +155,46 @@ def _min_tile_sqnr_db(got: torch.Tensor, reference: torch.Tensor) -> float:
     return min(vals) if vals else _sqnr_db(got, reference)
 
 
-def _run_rank(args) -> None:
+def _run_rank(
+    rank: int,
+    tp: int,
+    init_method: str,
+    tokens: list[int],
+    hiddens: list[int],
+    super_tile: int,
+    grid_cap: int,
+    time_it: bool,
+) -> list[dict]:
     import torch.distributed as dist
 
-    from aiter.ops.flydsl import QRInt6
+    from aiter.ops.flydsl import QuickAllReduceInt6
 
-    rank = args.rank
     device = torch.device(f"cuda:{rank}")
     torch.cuda.set_device(device)
     dist.init_process_group(
         backend="nccl",
-        init_method=args.init_method,
-        world_size=args.tp,
+        init_method=init_method,
+        world_size=tp,
         rank=rank,
+        device_id=device,
     )
+    # QuickAllReduceInt6 exchanges IPC metadata over a non-NCCL group;
+    # NCCL stays for the fp32 reference all-reduce.
     gloo = dist.new_group(backend="gloo")
     group = dist.group.WORLD
 
-    fly = QRInt6(
+    fly = QuickAllReduceInt6(
         group=gloo,
         device=device,
         rank=rank,
-        world_size=args.tp,
-        super_tile=args.super_tile,
-        grid_cap=args.grid_cap,
+        world_size=tp,
+        super_tile=super_tile,
+        grid_cap=grid_cap,
     )
-    compile_tokens = min(512, max(args.tokens))
-    compile_hidden = max(args.hiddens)
+    # compile() launches every ST binary on this shape and all ranks must pass
+    # the same one, so keep the JIT buffer small at the widest hidden size.
+    compile_tokens = min(512, max(tokens))
+    compile_hidden = max(hiddens)
     compile_inp = torch.empty(
         (compile_tokens, compile_hidden), device=device, dtype=torch.bfloat16
     )
@@ -177,68 +205,60 @@ def _run_rank(args) -> None:
     del compile_inp, compile_out
 
     rows = []
-    for tokens, hidden in zip(args.tokens, args.hiddens, strict=True):
-        gen = torch.Generator().manual_seed(1234 + rank)
-        inp = (
-            torch.randn(tokens, hidden, generator=gen, dtype=torch.float32) * 0.1
-        ).to(device=device, dtype=torch.bfloat16)
-        out = torch.empty_like(inp)
-        ref = inp.to(torch.float32)
-        dist.all_reduce(ref, group=group)
+    try:
+        for ntok, hidden in zip(tokens, hiddens, strict=True):
+            inp = _make_inp(ntok, hidden, rank=rank, device=device)
+            ref = inp.to(torch.float32)
+            dist.all_reduce(ref, group=group)
+            dist.barrier()
 
-        dist.barrier()
-        out.zero_()
-        fly.allreduce(inp, out)
-        torch.cuda.synchronize()
-        got = out.to(torch.float32)
-        dist.barrier()
-        nbytes = int(inp.numel()) * int(inp.element_size())
-        tiles = max(1, (nbytes + TILE_BYTES - 1) // TILE_BYTES)
-        st_used = fly._pick_st(tiles)
-        st1 = fly._by_st.get(1, fly._by_st[st_used])
-        close_err = checkAllclose(
-            ref,
-            got,
-            rtol=CLOSE_RTOL,
-            atol=CLOSE_ATOL,
-            tol_err_ratio=CLOSE_ERR_RATIO,
-            printLog=False,
-            msg=f"qr_int6 rank {rank}",
-        )
-        row = {
-            "tokens": tokens,
-            "hidden": hidden,
-            "grid_cap": args.grid_cap,
-            "st1_grid": st1.grid,
-            "st_used": st_used,
-            "grid": fly._by_st[st_used].grid,
-            "sqnr_db": _sqnr_db(got, ref),
-            "min_tile_sqnr_db": _min_tile_sqnr_db(got, ref),
-            "err": close_err,
-            "us": None,
-        }
-        if args.time_it:
-            dist.barrier(group=group)
-            torch.cuda.synchronize()
+            out = torch.empty_like(inp)
+            fly.allreduce(inp, out)
+            got = out.to(torch.float32)
+            dist.barrier()
 
-            def _allreduce(eng=fly, src=inp, dst=out):
-                eng.allreduce(src, dst)
-                return dst
+            nbytes = int(inp.numel()) * int(inp.element_size())
+            n_tiles = max(1, (nbytes + TILE_BYTES - 1) // TILE_BYTES)
+            st_used = fly._pick_st(n_tiles)
+            st1 = fly._by_st.get(1, fly._by_st[st_used])
+            close_err = checkAllclose(
+                ref,
+                got,
+                rtol=CLOSE_RTOL,
+                atol=CLOSE_ATOL,
+                tol_err_ratio=CLOSE_ERR_RATIO,
+                printLog=False,
+                msg=f"quick_allreduce_int6 rank {rank}",
+            )
+            row = {
+                "tokens": ntok,
+                "hidden": hidden,
+                "grid_cap": grid_cap,
+                "st1_grid": int(st1.grid),
+                "st_used": int(st_used),
+                "grid": int(fly._by_st[st_used].grid),
+                "sqnr_db": _sqnr_db(got, ref),
+                "min_tile_sqnr_db": _min_tile_sqnr_db(got, ref),
+                "err": float(close_err),
+                "us": None,
+            }
+            if time_it:
+                dist.barrier(group=group)
+                torch.cuda.synchronize()
 
-            _, us = run_perftest(_allreduce)
-            row["us"] = us
-        rows.append(row)
-        del inp, out, ref, got
-        torch.cuda.empty_cache()
+                def _allreduce(eng=fly, src=inp, dst=out):
+                    eng.allreduce(src, dst)
+                    return dst
 
-    gathered = [None] * args.tp
-    dist.all_gather_object(gathered, rows, group=gloo)
-    if rank == 0 and args.out:
-        with open(args.out, "w") as fh:
-            json.dump({"ranks": gathered}, fh)
-    dist.barrier(group=group)
-    fly.close()
-    dist.destroy_process_group()
+                _, us = run_perftest(_allreduce, use_cuda_event=False)
+                row["us"] = float(us)
+            rows.append(row)
+            del inp, out, ref, got
+            torch.cuda.empty_cache()
+    finally:
+        fly.close()
+        dist.destroy_process_group()
+    return rows
 
 
 def _spawn(
@@ -249,83 +269,45 @@ def _spawn(
     super_tile: int = SUPER_TILE,
     grid_cap: int = DEFAULT_GRID_CAP,
 ) -> list[list[dict]]:
-    # HIP QR/fused-AR use multiprocessing.Pool from ``python3`` __main__.
-    # This file is also collected by pytest, and FlyDSL JIT needs a fresh
-    # interpreter per rank, so ranks are Popen of this file with --rank
-    # (not Pool / torchrun). Init method matches the HIP QR helpers.
     if world_size not in SUPPORTED_WORLDS:
         raise ValueError(f"unsupported world_size={world_size}")
     n_gpu = torch.cuda.device_count()
     if n_gpu < world_size:
-        pytest.skip(f"QRInt6 needs {world_size} GPUs, have {n_gpu}")
+        pytest.skip(f"QuickAllReduceInt6 needs {world_size} GPUs, have {n_gpu}")
     init_method = get_distributed_init_method(get_ip(), get_open_port())
-    out_path = os.path.join(tempfile.mkdtemp(prefix="flydsl_qr_int6_"), "rank0.json")
-    env = dict(os.environ)
-    env["PYTHONPATH"] = (
-        f"{_REPO_ROOT}:{env['PYTHONPATH']}" if env.get("PYTHONPATH") else _REPO_ROOT
-    )
-    env["PYTHONUNBUFFERED"] = "1"
-    env.setdefault("FLYDSL_GPU_ARCH", ARCH)
-    tokens = ",".join(str(t) for t, _ in pairs)
-    hiddens = ",".join(str(h) for _, h in pairs)
-    procs = []
-    logs = []
-    for rank in range(world_size):
-        cmd = [
-            sys.executable,
-            os.path.abspath(__file__),
-            "--rank",
-            str(rank),
-            "--init-method",
-            init_method,
-            "--tp",
-            str(world_size),
-            "--tokens",
-            tokens,
-            "--hiddens",
-            hiddens,
-            "--super-tile",
-            str(super_tile),
-            "--grid-cap",
-            str(grid_cap),
+    token_list = [t for t, _ in pairs]
+    hidden_list = [h for _, h in pairs]
+    timeout = float(os.environ.get("FLYDSL_QR_TIMEOUT", "3600"))
+    pool = Pool(processes=world_size)
+    try:
+        results = [
+            pool.apply_async(
+                _run_rank,
+                kwds={
+                    "rank": rank,
+                    "tp": world_size,
+                    "init_method": init_method,
+                    "tokens": token_list,
+                    "hiddens": hidden_list,
+                    "super_tile": super_tile,
+                    "grid_cap": grid_cap,
+                    "time_it": time_it,
+                },
+            )
+            for rank in range(world_size)
         ]
-        if time_it:
-            cmd.append("--time-it")
-        if rank == 0:
-            cmd += ["--out", out_path]
-        log = open(  # noqa: SIM115
-            f"/tmp/flydsl_qr_int6_tp{world_size}_rank{rank}.log",
-            "w",
-        )
-        procs.append(
-            subprocess.Popen(cmd, env=env, stdout=log, stderr=subprocess.STDOUT)
-        )
-        logs.append(log)
-    rc = 0
-    deadline = time.time() + float(os.environ.get("FLYDSL_QR_TIMEOUT", "3600"))
-    for proc in procs:
-        try:
-            rc |= proc.wait(timeout=max(1.0, deadline - time.time()))
-        except subprocess.TimeoutExpired:
-            proc.kill()
-            rc |= 1
-    for log in logs:
-        log.close()
-    if rc != 0:
-        tails = []
-        for rank in range(world_size):
-            path = f"/tmp/flydsl_qr_int6_tp{world_size}_rank{rank}.log"
-            try:
-                with open(path) as fh:
-                    tails.append(f"===== rank {rank} =====\n{fh.read()[-4000:]}")
-            except OSError:
-                pass
-        raise RuntimeError("QRInt6 ranks failed\n" + "\n".join(tails))
-    with open(out_path) as fh:
-        payload = json.load(fh)
-    ranks = payload["ranks"]
+        ranks = [fut.get(timeout=timeout) for fut in results]
+    except Exception:
+        pool.terminate()
+        raise
+    else:
+        pool.close()
+    finally:
+        pool.join()
     if len(ranks) != world_size:
-        raise RuntimeError(f"QRInt6 gathered {len(ranks)} ranks, expected {world_size}")
+        raise RuntimeError(
+            f"QuickAllReduceInt6 gathered {len(ranks)} ranks, expected {world_size}"
+        )
     return ranks
 
 
@@ -337,6 +319,8 @@ def _assert_validity(
     world_size: int,
     label: str,
 ) -> dict:
+    # The ST switch compares tiles against the ST=1 grid, which the engine
+    # clamps below the requested grid_cap for occupancy.
     st1_grid = ranks[0][0]["st1_grid"]
     expected_st = _pick_st(tokens, hidden, grid_cap=st1_grid)
     if len(ranks) != world_size:
@@ -360,8 +344,7 @@ def _assert_validity(
             )
         if row["err"] >= CLOSE_ERR_RATIO:
             fails.append(
-                f"rank {rank}: checkAllclose err {row['err']:.3f} "
-                f">= {CLOSE_ERR_RATIO}"
+                f"rank {rank}: checkAllclose err {row['err']:.3f} >= {CLOSE_ERR_RATIO}"
             )
     if fails:
         raise AssertionError(
@@ -372,7 +355,7 @@ def _assert_validity(
 
 
 @pytest.mark.parametrize("world_size,tokens,hidden,label", _PYTEST_CASES)
-def test_qr_int6_sqnr_vs_fp32_allreduce(world_size, tokens, hidden, label):
+def test_quick_allreduce_int6_sqnr_vs_fp32_allreduce(world_size, tokens, hidden, label):
     ranks = _spawn(world_size, [(tokens, hidden)], time_it=False)
     _assert_validity(
         ranks,
@@ -384,7 +367,7 @@ def test_qr_int6_sqnr_vs_fp32_allreduce(world_size, tokens, hidden, label):
 
 
 @benchmark()
-def test_qr_int6(tokens, hidden, dtype, tp, grid_cap=DEFAULT_GRID_CAP):
+def test_quick_allreduce_int6(tokens, hidden, dtype, tp, grid_cap=DEFAULT_GRID_CAP):
     ranks = _spawn(tp, [(tokens, hidden)], time_it=True, grid_cap=grid_cap)
     row = _assert_validity(
         ranks,
@@ -394,7 +377,7 @@ def test_qr_int6(tokens, hidden, dtype, tp, grid_cap=DEFAULT_GRID_CAP):
         label="bench",
     )
     nbytes = tokens * hidden * 2
-    # Reduce of tp ranks: (world-1) adds per element, plus INT6 codec ALU.
+    # (tp - 1) adds per element; codec ALU work is not counted.
     flops = tokens * hidden * (tp - 1)
     rank_us = [r[0]["us"] for r in ranks]
     us = statistics.median(rank_us)
@@ -411,12 +394,12 @@ def test_qr_int6(tokens, hidden, dtype, tp, grid_cap=DEFAULT_GRID_CAP):
     }
 
 
-test_qr_int6.__test__ = False
+test_quick_allreduce_int6.__test__ = False
 
 
 def main():
     if ARCH not in SUPPORTED_ARCHS:
-        aiter.logger.warning("QRInt6 unsupported on %s; skipping", ARCH)
+        aiter.logger.warning("QuickAllReduceInt6 unsupported on %s; skipping", ARCH)
         return
     n_gpu = torch.cuda.device_count()
 
@@ -438,7 +421,7 @@ def main():
         type=int,
         nargs="*",
         default=[1],
-        help="Unused (not batch). Values other than 1 are skipped.",
+        help="Not a QuickAllReduceInt6 dimension; only 1 runs, other values are skipped.",
     )
     parser.add_argument(
         "--tp",
@@ -457,37 +440,42 @@ def main():
             (9216, 5120),
             (32768, 5120),
         ],
-        help="(tokens, hidden) pairs. 5120 is calibration, not ABI.\n"
+        help="(tokens, hidden) pairs; hidden is free, 5120 is the tuned width.\n"
         "    e.g.: -s 512,5120 9216,5120",
     )
     parser.add_argument(
         "-o",
         "--out",
         default=None,
-        help="Optional JSON output path (rank-0 bench payload).",
+        help="Optional JSON output path for the sweep rows.",
     )
     parser.add_argument(
         "--grid-cap",
         type=int,
         default=DEFAULT_GRID_CAP,
-        help="Persistent launch/inbox block cap (default 304*4=1216, occupancy-clamped).",
+        help="Persistent-launch block cap; the engine clamps it to the\n"
+        "    measured resident workgroups per CU.",
     )
     args = parser.parse_args()
 
     for dtype in args.dtype:
         if dtype != dtypes.bf16:
-            aiter.logger.warning("QRInt6 payload is bf16; skipping %s", dtype)
+            aiter.logger.warning(
+                "QuickAllReduceInt6 payload is bf16; skipping %s", dtype
+            )
             continue
         df = []
         for tp, batch, mnk in itertools.product(args.tp, args.batch, args.mnk):
             if batch != 1:
                 continue
             if tp not in SUPPORTED_WORLDS:
-                aiter.logger.warning("QRInt6 unsupported world_size=%s; skipping", tp)
+                aiter.logger.warning(
+                    "QuickAllReduceInt6 unsupported world_size=%s; skipping", tp
+                )
                 continue
             if n_gpu < tp:
                 aiter.logger.warning(
-                    "QRInt6 needs %s GPUs, have %s; skipping tp=%s",
+                    "QuickAllReduceInt6 needs %s GPUs, have %s; skipping tp=%s",
                     tp,
                     n_gpu,
                     tp,
@@ -496,11 +484,15 @@ def main():
             if not isinstance(mnk, tuple) or len(mnk) < 2:
                 raise ValueError(f"-s expects tokens,hidden; got {mnk!r}")
             tokens, hidden = int(mnk[0]), int(mnk[1])
-            df.append(test_qr_int6(tokens, hidden, dtype, tp, grid_cap=args.grid_cap))
+            df.append(
+                test_quick_allreduce_int6(
+                    tokens, hidden, dtype, tp, grid_cap=args.grid_cap
+                )
+            )
         if df:
             table = pd.DataFrame(df)
             aiter.logger.info(
-                "flydsl QR INT6 summary (markdown):\n%s",
+                "flydsl quick allreduce INT6 summary (markdown):\n%s",
                 table.to_markdown(index=False),
             )
             if args.out:
@@ -513,7 +505,7 @@ def main():
                             "meta": {
                                 "gfx": ARCH,
                                 "grid_cap": args.grid_cap,
-                                "timer": "run_perftest",
+                                "timer": "run_perftest profiler",
                             },
                             "rows": df,
                         },
@@ -525,25 +517,5 @@ def main():
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(add_help=False)
-    parser.add_argument("--rank", type=int, default=None)
-    parser.add_argument("--init-method", default=None)
-    parser.add_argument("--tokens", default="")
-    parser.add_argument("--hiddens", default="")
-    parser.add_argument("--super-tile", type=int, default=SUPER_TILE)
-    parser.add_argument("--grid-cap", type=int, default=DEFAULT_GRID_CAP)
-    parser.add_argument("--time-it", action="store_true")
-    parser.add_argument("--out", default=None)
-    known, rest = parser.parse_known_args()
-    if known.rank is not None:
-        rank_parser = argparse.ArgumentParser()
-        rank_parser.add_argument("--tp", type=int, default=TP)
-        rank_args, _ = rank_parser.parse_known_args(rest)
-        known.tp = rank_args.tp
-        known.tokens = [int(t) for t in known.tokens.split(",") if t]
-        known.hiddens = [int(h) for h in known.hiddens.split(",") if h]
-        if len(known.tokens) != len(known.hiddens):
-            raise SystemExit("tokens and hiddens lists must match")
-        _run_rank(known)
-    else:
-        main()
+    freeze_support()
+    main()
