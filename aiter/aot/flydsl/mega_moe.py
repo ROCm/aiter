@@ -3,7 +3,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""AOT profile bundles for MegaMoE A8W4 deployment shapes."""
+"""AOT profile bundles for MegaMoE A8W4 and A4W4 deployment shapes."""
 
 from __future__ import annotations
 
@@ -21,6 +21,7 @@ from aiter.ops.flydsl.kernels.mega_moe.mega_moe_config import (
 )
 
 DEFAULT_MTPRS = (8192, 16384, 32768)
+DEFAULT_QUANTS = ("a8w4", "a4w4")
 # DeepSeek-V4-Pro deployment profiles: r0, r32, and r64 redundant experts.
 # Keep all three in the default AOT job set so the service never falls back to
 # an online compile merely because EPLB changes the physical expert count.
@@ -59,6 +60,7 @@ def default_jobs(
     mtprs=DEFAULT_MTPRS,
     experts_per_ranks=DEFAULT_EXPERTS_PER_RANKS,
     *,
+    quants=DEFAULT_QUANTS,
     world_size=WORLD_SIZE,
     topk=TOPK,
     model_dim=MODEL_DIM,
@@ -76,9 +78,10 @@ def default_jobs(
     return [
         {
             "kernel_name": (
-                f"mega_moe_stage{stage}_bundle_mtpr{mtpr}_epr{experts_per_rank}"
+                f"mega_moe_{quant}_stage{stage}_bundle_mtpr{mtpr}_epr{experts_per_rank}"
                 f"_rank{rank}{shape_suffix}"
             ),
+            "quant": quant,
             "stage": stage,
             "mtpr": mtpr,
             "experts_per_rank": experts_per_rank,
@@ -91,6 +94,7 @@ def default_jobs(
         }
         for mtpr in mtprs
         for experts_per_rank in experts_per_ranks
+        for quant in quants
         for rank in range(world_size)
         for stage in (1, 2)
     ]
@@ -106,6 +110,7 @@ def _compile_stage1(
     rank,
     plan,
     *,
+    a_dtype,
     world_size,
     topk,
     model_dim,
@@ -141,7 +146,8 @@ def _compile_stage1(
             config.prepare_quant_cu,
             (quant_groups + 511) // 512,
         )
-        for num_quant_cu in sorted({0, quant_blocks}):
+        quant_variants = {0} if a_dtype == "fp4" else {0, quant_blocks}
+        for num_quant_cu in sorted(quant_variants):
             identity = (
                 config.sort_block_m,
                 config.num_dispatch_cu,
@@ -182,9 +188,11 @@ def _compile_stage1(
     # the validation/per-stage benchmark invokes it to isolate Stage1 timing.
     quant_rows = 2
     quant_groups = quant_rows * scale_dim
-    _get_launcher(model_dim, "fp8")(
+    output_dtype = torch.uint8 if a_dtype == "fp4" else torch.float8_e4m3fn
+    output_dim = model_dim // 2 if a_dtype == "fp4" else model_dim
+    _get_launcher(model_dim, a_dtype)(
         _tensor((quant_rows, model_dim), torch.bfloat16),
-        _tensor((quant_rows, model_dim), torch.float8_e4m3fn),
+        _tensor((quant_rows, output_dim), output_dtype),
         _tensor((quant_rows, scale_dim), torch.uint8),
         quant_rows,
         (quant_groups + 63) // 64,
@@ -206,16 +214,22 @@ def _compile_stage1(
         tile_state_stride=tile_state_stride,
         variants=plan.stage1_variants,
         swiglu_limit=swiglu_limit,
+        a_dtype=a_dtype,
+        out_dtype=a_dtype,
     )
     launch(
-        _tensor((1, inter_dim), torch.float8_e4m3fn),
-        _tensor((1, model_dim), torch.float8_e4m3fn),
+        _tensor((1, inter_dim // 2 if a_dtype == "fp4" else inter_dim), output_dtype),
+        _tensor((1, output_dim), output_dtype),
         # Keep every non-unit dimension larger than one so FlyDSL records the
         # same contiguous-stride signature as the runtime weight tensor.  An
         # all-ones placeholder makes the first dimension look unit-strided and
         # produces an AOT cache key that the real tensor can never reuse.
         _tensor((2, 2, 2), torch.uint8),
-        _tensor((1, model_dim // 128), torch.int32),
+        (
+            _tensor((1, model_dim // 32), torch.uint8)
+            if a_dtype == "fp4"
+            else _tensor((1, model_dim // 128), torch.int32)
+        ),
         _tensor((2, 2), torch.uint8),
         _tensor((1,), torch.int32),
         _tensor((1,), torch.int32),
@@ -236,6 +250,7 @@ def _compile_stage2(
     rank,
     plan,
     *,
+    a_dtype,
     world_size,
     topk,
     model_dim,
@@ -278,6 +293,7 @@ def _compile_stage2(
             "cu_num": NUM_CU,
             "p2p_quant_type": key.p2p_quant,
             "fixed_slot_dispatch": plan.fixed_slot_dispatch,
+            "a_dtype": a_dtype,
         }
         residual = (
             replace(stage2, skew_cu=stage2.persist_cu)
@@ -296,8 +312,10 @@ def _compile_stage2(
             BK=residual.block_k,
             use_nt=residual.use_nt,
             g2_bhoist=residual.b_hoist,
+            g2_b2stage=residual.b2stage,
             g2_ascale_pf=residual.ascale_prefetch,
             g2_spart=residual.spatial_partition,
+            g2_deep_a_pipeline=residual.deep_a_pipeline,
             persist=residual.persist,
             persist_cu=residual.persist_cu,
             persist_strided=residual.persist_strided,
@@ -332,7 +350,10 @@ def _compile_stage2(
             use_nt=stage2.use_nt,
             cu_num=stage2.pair_cu,
             g2_bhoist=stage2.b_hoist,
+            g2_b2stage=stage2.b2stage,
             g2_ascale_pf=stage2.ascale_prefetch,
+            g2_deep_a_pipeline=stage2.deep_a_pipeline,
+            a_dtype=a_dtype,
         )
 
     # Stage2's production bundle includes the terminal fused combine kernels.
@@ -408,8 +429,10 @@ def compile_one_config(**job):
         model_dim = job.get("model_dim", MODEL_DIM)
         inter_dim = job.get("inter_dim", INTER_DIM)
         swiglu_limit = job.get("swiglu_limit", SWIGLU_LIMIT)
+        a_dtype = "fp4" if job["quant"] == "a4w4" else "fp8"
         plan = build_mega_moe_bundle_plan(
             job["mtpr"],
+            a_dtype=a_dtype,
             experts_per_rank=job["experts_per_rank"],
             model_dim=model_dim,
             inter_dim=inter_dim,
@@ -422,6 +445,7 @@ def compile_one_config(**job):
                     job["experts_per_rank"],
                     job["rank"],
                     plan,
+                    a_dtype=a_dtype,
                     world_size=world_size,
                     topk=topk,
                     model_dim=model_dim,
@@ -434,6 +458,7 @@ def compile_one_config(**job):
                     job["experts_per_rank"],
                     job["rank"],
                     plan,
+                    a_dtype=a_dtype,
                     world_size=world_size,
                     topk=topk,
                     model_dim=model_dim,
@@ -460,10 +485,17 @@ def main():
     parser.add_argument("--model-dim", type=int, default=MODEL_DIM)
     parser.add_argument("--inter-dim", type=int, default=INTER_DIM)
     parser.add_argument("--swiglu-limit", type=float, default=SWIGLU_LIMIT)
+    parser.add_argument(
+        "--quant",
+        nargs="+",
+        choices=DEFAULT_QUANTS,
+        default=list(DEFAULT_QUANTS),
+    )
     args = parser.parse_args()
     jobs = default_jobs(
         tuple(args.mtpr),
         tuple(args.experts_per_rank),
+        quants=tuple(args.quant),
         world_size=args.world_size,
         topk=args.topk,
         model_dim=args.model_dim,
