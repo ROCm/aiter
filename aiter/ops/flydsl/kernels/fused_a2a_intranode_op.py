@@ -385,8 +385,8 @@ class FusedA2AIntraNodeOp:
         Producers and prior consumers must be ordered before their side-stream
         reads/writes. The caller retains inputs until V completes on that stream.
         """
-        if not self.split or not self.quant or self.return_mode != "fp8":
-            raise ValueError("per-role submission requires packed split transport")
+        if not self.split or not self.quant or self.return_mode not in ("fp8", "bf16"):
+            raise ValueError("per-role submission requires quantized split transport")
         if role not in (0, 1, 2) or role != getattr(self, "_next_role", 0):
             raise ValueError("submit Q, K, V in order without interleaving trios")
         if input.dtype != self.dtype or tuple(input.shape) != self.shape:
@@ -452,6 +452,25 @@ class FusedA2AIntraNodeOp:
         self._submit_split_launch(role, args)
         self._next_role = (role + 1) % 3
         if role == 2:
+            if self.return_mode == "bf16":
+                bf16_outputs = self.bf16_outputs_sets[parity]
+                args = (
+                    *(output.data_ptr() for output in self.outputs_sets[parity]),
+                    *(scale.data_ptr() for scale in self.scales_sets[parity]),
+                    *(output.data_ptr() for output in bf16_outputs),
+                    stream,
+                )
+                # V completes the trio's receive-acquire handshake on this stream.
+                if self._dequant_compiled is None:
+                    self._dequant_compiled = flyc.compile(
+                        self._dequant_launch,
+                        *(fx.Int64(arg) for arg in args[:-1]),
+                        args[-1],
+                    )
+                else:
+                    self._dequant_compiled(*args)
+                self._epoch += 1
+                return bf16_outputs
             self._epoch += 1
             return self.outputs_sets[parity], self.scales_sets[parity]
         return None
