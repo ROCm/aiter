@@ -970,7 +970,17 @@ def _bench_shape(
         and not (c.family == "qr" and qr_comm is None)
         and not (c.family == "fly" and c.fly_cfg not in fly)
         and not (c.family == "fly1s" and c.fly1s_cfg not in fly1s)
-        and not (c.family == "flyauto" and flyauto is None)
+        # flyauto's window is dynamic (depends on AITER_FLY_AR_ACCURACY, only
+        # known once the object exists), unlike every other family's static
+        # applicable() check -- and under the default accuracy=exact policy it
+        # is a real "n/a" above oneshot_max, since that policy builds no
+        # mesh/ring engine at all. should_fly_all_reduce is the one predicate
+        # that already knows this; calling fly_all_reduce without checking it
+        # first is a KeyError on any shape past the ceiling.
+        and not (
+            c.family == "flyauto"
+            and (flyauto is None or not flyauto.should_fly_all_reduce(x))
+        )
     ]
     thunks, buffers = _build_thunks(
         cands,
@@ -1144,13 +1154,13 @@ def _worker(
                     cfg[1:], ("super_tile", "grid_cap", "rs_codec", "ag_codec")
                 ),
             )
-        # compile() is itself a collective launch on every super-tile engine and
-        # builds all of them, so one call at any shape keeps the JIT out of
-        # every timed region below.
+        # compile() JIT-compiles every super-tile engine without launching any
+        # of them (qr_int4.compile_only), so one call at any shape keeps every
+        # timed region below free of a first-call JIT stall.
         warm = torch.zeros((8, DSV4_HIDDEN), dtype=dtypes.bf16, device=device)
         for cfg in wanted_cfgs:
             dist.barrier(group=group)
-            fly[cfg].compile(warm, torch.empty_like(warm))
+            fly[cfg].compile_and_launch(warm, torch.empty_like(warm))
         del warm
 
     fly1s = {}  # (atoms, grid_cap, fanout) -> OneShotAllReduce engine
@@ -1181,7 +1191,7 @@ def _worker(
         warm = torch.zeros((8, DSV4_HIDDEN), dtype=dtypes.bf16, device=device)
         for cfg in wanted_1s:
             dist.barrier(group=group)
-            fly1s[cfg].compile(warm, torch.empty_like(warm))
+            fly1s[cfg].compile_and_launch(warm, torch.empty_like(warm))
         del warm
 
     # Production dispatch, built last so its three internal engines exchange
@@ -1218,9 +1228,19 @@ def _worker(
                 "ring": max(1, flyauto.policy.mesh_max // tok + 1),
             }
             for family, m in probes.items():
-                if flyauto.family_for(m * tok) != family:
-                    continue  # window too narrow to site a probe in
                 t = torch.zeros((m, DSV4_HIDDEN), dtype=dtypes.bf16, device=device)
+                # Both conditions matter: family_for's window math doesn't
+                # know about max_bytes, so past the ceiling (e.g. every
+                # payload above oneshot_max in the default accuracy=exact
+                # policy, which never builds a mesh/ring engine at all) it
+                # still names "mesh"/"ring" for a family this object never
+                # built -- should_fly_all_reduce is what actually gates on
+                # self._engines and is safe to trust here.
+                if flyauto.family_for(
+                    m * tok
+                ) != family or not flyauto.should_fly_all_reduce(t):
+                    del t
+                    continue  # window too narrow, or this policy never reaches `family`
                 dist.barrier(group=group)
                 flyauto.fly_all_reduce(t, out=torch.empty_like(t))
                 del t

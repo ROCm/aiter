@@ -11,9 +11,13 @@ Opt-in: unset ``AITER_FLY_AR`` leaves it disabled and the dispatch chain
 unchanged. Set ``AITER_FLY_AR=1`` to enable.
 
 The one-shot is bit-exact (fp32 accumulate, one bf16 rounding, comparable
-with ``cross_device_reduce``). The two-shot schedules quantize to INT4/INT6.
-The default policy keeps the exact schedule wherever it is within 10% of the fastest option.
-``AITER_FLY_AR_ACCURACY=fast`` enables fast kernels everywhere.
+with ``cross_device_reduce``); the two-shot schedules quantize to INT4/INT6.
+By default (``AITER_FLY_AR_ACCURACY=exact``) only the one-shot is ever
+reachable -- above its ceiling this path declines the payload rather than
+quantize it, so the caller falls through to whatever it would otherwise
+dispatch to. ``AITER_FLY_AR_ACCURACY=fast`` unlocks the mesh/ring schedules for
+larger payloads, quantized, still preferring the exact one-shot wherever that
+costs nothing.
 """
 
 from __future__ import annotations
@@ -62,8 +66,7 @@ class FlyDSLAllReduce:
         self._engines: dict[str, Any] = {}
         self.policy = None
 
-        if not _IMPORT_OK or policy.enabled() is not True:
-            # policy.enabled() is tristate, but only True enables.
+        if not _IMPORT_OK or not policy.enabled():
             return
         if not is_flydsl_available():
             logger.debug("FlyDSL all-reduce disabled: FlyDSL is unavailable.")
@@ -136,7 +139,7 @@ class FlyDSLAllReduce:
                 self._engines[family] = self._build(family)
         except Exception:
             # A partial build leaves this rank holding inboxes its peers may not
-            # have. Release them and stay disabled rather than dispatching into
+            # have. Release everything and stay disabled rather than dispatching into
             # a half-built set.
             logger.warning(
                 "FlyDSL all-reduce disabled: engine construction failed.",
@@ -190,8 +193,7 @@ class FlyDSLAllReduce:
         return policy.pick_family(int(nbytes), self.policy)
 
     def variant(self, nbytes: int) -> str:
-        """``<family>:<jit symbol>/g<cap>/x<blocks>`` for a payload of *nbytes*.
-        """
+        """``<family>:<jit symbol>/g<cap>/x<blocks>`` for a payload of *nbytes*."""
         family = self.family_for(int(nbytes))
         eng = self._engines.get(family)
         return f"{family}:{eng.variant(int(nbytes))}" if eng is not None else family

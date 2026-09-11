@@ -208,7 +208,7 @@ def _run_rank(args) -> None:
     )
     compile_out = torch.empty_like(compile_inp)
     dist.barrier()
-    fly.compile(compile_inp, compile_out)
+    fly.compile_and_launch(compile_inp, compile_out)
     dist.barrier()
     del compile_inp, compile_out
 

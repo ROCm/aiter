@@ -5,7 +5,7 @@
 
 Public type ``QRInt4``, with two interchangeable schedules selected by
 ``algorithm``. Both are two-shot -- reduce-scatter then all-gather -- so they
-are named for the topology of each lap instead: 
+are named for the topology of each lap instead:
 - ``"mesh"`` the default: fanout to all N-1 peers, twice.
 - ``"ring"`` 2(N-1) single-destination hops.
 Super-tile ST∈{1,8}. INT4 nibble or INT6 bit-plane pair, both with group-16
@@ -288,6 +288,7 @@ def _resolve_codecs(algo, world_size, rs_codec, ag_codec):
     resolved_ag = _pick(ag_codec, ag_default, algo.ag_codecs, "ag_codec")
     return resolved_rs, resolved_ag
 
+
 # KFD io-link type for xGMI, from include/uapi/linux/kfd_sysfs.h. PCIe is 2.
 _HSA_IOLINK_TYPE_XGMI = 11
 _KFD_NODES = Path("/sys/class/kfd/kfd/topology/nodes")
@@ -499,8 +500,8 @@ class QRInt4:
     ``rs_codec`` and ``ag_codec`` are the wire formats of the ring's two laps.
     The reduce-scatter lap is the only place the ring loses accuracy the mesh
     does not -- it requantizes ``N-1`` times where the mesh requantizes once --
-    so it defaults to ``"int6"`` at TP8 where we would otherwise lose too much acccuracy. 
-    The all-gather lap forwards bytes verbatim and contributes a single quantization, 
+    so it defaults to ``"int6"`` at TP8 where we would otherwise lose too much acccuracy.
+    The all-gather lap forwards bytes verbatim and contributes a single quantization,
     so it defaults to ``"int4"`` everywhere and widens only by request.
 
     Leave both ``None`` to get those defaults. ``AITER_ALL_REDUCE_CODEC=INT4``
@@ -562,9 +563,7 @@ class QRInt4:
                 f"super_tile must be one of {algo.super_tiles} for "
                 f"algorithm={algorithm!r}, got {super_tile!r}"
             )
-        rs_codec, ag_codec = _resolve_codecs(
-            algo, int(world_size), rs_codec, ag_codec
-        )
+        rs_codec, ag_codec = _resolve_codecs(algo, int(world_size), rs_codec, ag_codec)
         group_world = dist.get_world_size(group=group)
         group_rank = dist.get_rank(group=group)
         if group_world != int(world_size):
@@ -620,13 +619,12 @@ class QRInt4:
         self.ag_codec = ag_codec
         self._algo = algo
 
-        #self._batch_publishes = has_release_fence(resolved_inbox)
         self._batch_publishes = (
             has_release_fence(resolved_inbox)
             if batch_publishes is None
             else bool(batch_publishes)
         )
-        
+
         self.min_bytes = (
             algo.floor_bytes(self.world_size) if min_bytes is None else int(min_bytes)
         )
@@ -800,20 +798,19 @@ class QRInt4:
         else:
             eng.compiled(*args)
 
-    def compile(self, inp, out, stream=None) -> None:
-        """Eager-JIT every ST binary. Optional: first ``allreduce`` JIT-compiles the picked ST.
+    def compile_and_launch(self, inp, out=None, stream=None) -> None:
+        """Eager-JIT every ST binary and launch each of them once, for real,
+        against *inp*/*out*.
 
-        Default ST=8 also builds an ST=1 engine for ``num_tiles ≤ grid_cap``.
-        Skipping this method is correct for a single size class: that
-        ``allreduce`` calls ``flyc.compile`` for the chosen ST only, and a
-        later size that picks the other ST JIT-compiles then.
-
-        ``flyc.compile`` also launches, so this is a real collective: every
-        rank must call it with the same ``inp``/``out`` shape. The warmup
-        tensor may be small; we still launch every engine so a later
-        prefill-sized ``allreduce`` does not JIT mid-collective. ``out`` is
-        overwritten.
+        This runs every ST on the GPU -- ``out`` ends up holding whichever ST
+        ran last, and it is a real collective: every rank must call it with
+        the same shape. Used by ``bench_comm_allreduce.py`` and the flydsl op
+        tests to force a real warm launch before timing or correctness checks
+        begin. Production never calls this: it tolerates the first real call
+        paying a JIT-compile cost instead.
         """
+        if out is None:
+            out = torch.empty_like(inp)
         self._check_payload(inp, out)
         for eng in self._by_st.values():
             self._launch_eng(eng, inp, out, stream)

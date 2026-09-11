@@ -111,7 +111,7 @@ def _run_rank(args) -> None:
         max_bytes=1 << 30,
     )
     warm = torch.zeros(1, HIDDEN, dtype=torch.bfloat16, device=device)
-    eng.compile(warm, torch.empty_like(warm))
+    eng.compile_and_launch(warm, torch.empty_like(warm))
 
     def _check(m, hidden, tag):
         """One shape: accuracy against fp32, then bit-identity across ranks."""

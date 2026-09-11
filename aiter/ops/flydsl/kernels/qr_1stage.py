@@ -41,7 +41,7 @@ from .qr_int_shared import SUPPORTED_WORLDS
 
 logger = logging.getLogger("aiter")
 
-# Largest payload this kernel should be asked to move, per world size. 
+# Largest payload this kernel should be asked to move, per world size.
 MAX_PAYLOAD_BYTES_BY_WORLD = {
     ws: FAMILY_POLICY[("pcie", ws)].oneshot_max_exact for ws in SUPPORTED_WORLDS
 }
@@ -180,8 +180,7 @@ class OneShotAllReduce:
 
     @property
     def inbox_bytes(self) -> int:
-        """IPC inbox bytes this object holds on this rank, across every rung.
-        """
+        """IPC inbox bytes this object holds on this rank, across every rung."""
         return sum(eng.buf_bytes for eng, _ in self._by_cfg.values())
 
     def _pick_cfg(self, live_bytes: int):
@@ -251,14 +250,20 @@ class OneShotAllReduce:
         eng, spec = self._by_cfg[self._pick_cfg(live_bytes)]
         self._launch_eng(eng, spec, inp, out, stream)
 
-    def compile(self, inp, out, stream=None) -> None:
-        """Eager-JIT every rung's binary.
+    def compile_and_launch(self, inp, out=None, stream=None) -> None:
+        """Eager-JIT every rung's binary and launch each of them once, for
+        real, against *inp*/*out*.
 
-        A real collective -- every rank must call it with the same shape, and
-        ``out`` is overwritten. Every rung is launched, not just the one this
-        shape selects, so a later payload that picks a different rung does not
-        JIT in the middle of a collective.
+        This runs every rung on the GPU -- ``out`` ends up holding whichever
+        rung ran last, and it is a real collective: every rank must call it
+        with the same shape. Used by ``bench_comm_allreduce.py`` and the
+        flydsl op tests to force a real warm launch (and, for the tests, to
+        exercise the launch path directly) before timing or correctness
+        checks begin. Production never calls this: it tolerates the first
+        real call paying a JIT-compile cost instead.
         """
+        if out is None:
+            out = torch.empty_like(inp)
         self._check_payload(inp, out)
         for eng, spec in self._by_cfg.values():
             self._launch_eng(eng, spec, inp, out, stream)
@@ -284,7 +289,8 @@ class OneShotAllReduce:
             raise RuntimeError(
                 f"OneShotAllReduce was built with probe={self.probe!r}, a "
                 "measurement-only variant that does not move the payload and "
-                "computes a wrong answer. Use compile()/_launch() to time it."
+                "computes a wrong answer. Use compile_and_launch()/_launch() "
+                "to time it."
             )
         live_bytes = self._check_payload(inp, out)
         if not self.is_beneficial(live_bytes):
