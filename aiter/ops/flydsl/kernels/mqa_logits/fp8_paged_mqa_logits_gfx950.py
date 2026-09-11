@@ -145,24 +145,16 @@ def _load_weight_frag_lds(w_base, row, mi, lane_div_16):
 
 
 def _mfma_score(a_pack, b_pack):
-    result_ty = Vec.make_type(DREG, fx.Float32)
-    neutral = arith.constant(_NEUTRAL_E8M0, type=T.i32)
-    return Vec(
-        rocdl.mfma_scale_f32_16x16x128_f8f6f4(
-            result_ty,
-            [
-                a_pack,
-                b_pack,
-                Vec.filled(DREG, 0.0, fx.Float32),
-                0,
-                0,
-                0,
-                neutral,
-                0,
-                neutral,
-            ],
-        )
-    )
+    atom = fx.make_mma_atom(fx.rocdl.cdna4.MFMA_Scale(16, 16, 128, fx.Float8E4M3FN))
+    a_frag = fx.make_rmem_tensor(8, fx.Int32)
+    a_frag.store(Vec(a_pack))
+    b_frag = fx.make_rmem_tensor(8, fx.Int32)
+    b_frag.store(Vec(b_pack))
+    c_frag = fx.make_rmem_tensor(DREG, fx.Float32)
+    c_frag.store(Vec.filled(DREG, 0.0, fx.Float32))
+    ident = fx.Int32(_NEUTRAL_E8M0)
+    fx.gemm(atom, c_frag, a_frag, b_frag, c_frag, scale_a=ident, scale_b=ident)
+    return Vec(c_frag.load())
 
 
 def _reduce_scores(scores, weights, kv_scale):
