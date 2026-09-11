@@ -417,8 +417,8 @@ def test_fp8_paged_mqa_logits(
 
 _BASE = {
     "batch_size": 2,
-    "next_n": 2,
-    "heads": 64,
+    "next_n": 8,
+    "heads": 32,
     "head_dim": 128,
     "avg_kv_length": 1024,
     "q_dtype": "fnuz",
@@ -440,11 +440,7 @@ def _c(**kw):
 
 
 def default_cases():
-    cases = []
-    for heads in (32, 64):
-        for next_n in (1, 2):
-            cases.append(_c(heads=heads, next_n=next_n))
-    cases += [_c(batch_size=b, next_n=n) for b, n in ((1, 1), (1, 2), (4, 2), (8, 1))]
+    cases = [_c(batch_size=b) for b in (1, 2, 4, 8)]
     cases += [_c(avg_kv_length=kv) for kv in (128, 8192)]
     cases += [_c(split_kv=sk) for sk in (1, 4)]
     cases.append(_c(avg_kv_length=128, split_kv=4))
@@ -454,8 +450,8 @@ def default_cases():
 
 def exhaustive_cases():
     prod = itertools.product(
-        [(1, 1), (1, 2), (2, 1), (2, 2), (4, 2), (8, 1)],
-        [32, 64],
+        [(1, 8), (2, 8), (4, 8), (8, 8)],
+        [32],
         [128],
         [128, 1024, 8192],
         ["fnuz"],
@@ -614,8 +610,8 @@ def main():
         help="run a single-config timed loop (for rocprofv3 / isolation profiling)",
     )
     parser.add_argument("--batch", type=int, default=16)
-    parser.add_argument("--next-n", type=int, default=2)
-    parser.add_argument("--heads", type=int, default=64)
+    parser.add_argument("--next-n", type=int, default=8)
+    parser.add_argument("--heads", type=int, default=32)
     parser.add_argument("--head-dim", type=int, default=128)
     parser.add_argument("--kv-len", type=int, default=32768)
     parser.add_argument("--kv-block-size", type=int, default=64)
@@ -630,16 +626,8 @@ def main():
     args = parser.parse_args()
 
     if args.profile:
-        if (
-            args.kv_block_size != 64
-            or args.heads not in (32, 64)
-            or args.next_n
-            not in (
-                1,
-                2,
-            )
-        ):
-            raise SystemExit("kernel supports H in {32,64}, next_n in {1,2}, KVB=64")
+        if args.kv_block_size != 64 or args.heads != 32 or args.next_n != 8:
+            raise SystemExit("kernel requires H=32, padded next_n=8, KVB=64")
         run_profile(args)
         return
     if args.compare_gluon:
