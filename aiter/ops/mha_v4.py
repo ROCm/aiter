@@ -445,15 +445,17 @@ def _resolve_raw_recipe(
             f"Q={q_format.name}, K={k_format.name}, V={v_format.name}"
         )
 
-    # Sparse FP6-P recipes still use canonical V packing; align them when those rows are updated.
-    uses_dense_p_pack = not sparse and (
-        (kind == _RawRecipeKind.FP8 and v_format == AttentionFormat.MXFP6)
-        or (
-            kind == _RawRecipeKind.MXFP6
-            and v_format in (AttentionFormat.MXFP6, AttentionFormat.MXFP4)
-        )
+    # FP6-P rows need V repacked to match the FP6 P operand's K layout, or the kernel reads V rows
+    # in the wrong order. f8f6 ships that object for both modes; the MXFP6-Q sparse rows are still
+    # pre-FP6-P builds, so they stay on canonical V until those objects are rebuilt.
+    uses_fp6_p_pack = (
+        kind == _RawRecipeKind.FP8 and v_format == AttentionFormat.MXFP6
+    ) or (
+        not sparse
+        and kind == _RawRecipeKind.MXFP6
+        and v_format in (AttentionFormat.MXFP6, AttentionFormat.MXFP4)
     )
-    v_pack = AttentionPack.V_FOR_FP6_P if uses_dense_p_pack else AttentionPack.DEFAULT
+    v_pack = AttentionPack.V_FOR_FP6_P if uses_fp6_p_pack else AttentionPack.DEFAULT
     return _RawRecipePlan(kind, scale_modes, v_pack)
 
 

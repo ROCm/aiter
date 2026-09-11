@@ -1253,12 +1253,9 @@ def make_kernel_runner(
 
         q_quantized, q_descale = quantize_fp8_rotated(q_bshd)
         k_quantized, k_descale = quantize_fp8_rotated(k_bshd)
-        if block_lut is None:
-            v_quantized, v_descale = quantize_v_mxfp6_fp6_p(v_bshd)
-            v_pack = AttentionPack.V_FOR_FP6_P
-        else:
-            v_quantized, v_descale = quantize_v_mxfp6(v_bshd)
-            v_pack = AttentionPack.DEFAULT
+        # Both modes run the FP6 P pack, so both need V staged in the matching layout.
+        v_quantized, v_descale = quantize_v_mxfp6_fp6_p(v_bshd)
+        v_pack = AttentionPack.V_FOR_FP6_P
         return lambda: launch_mha_v4_packed(
             q_quantized,
             k_quantized,
