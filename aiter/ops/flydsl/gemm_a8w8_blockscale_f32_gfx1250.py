@@ -47,9 +47,18 @@ def _p(t):
                 torch.bfloat16: _fx.BFloat16,
                 torch.float16: _fx.Float16,
                 torch.float32: _fx.Float32,
+                torch.int32: _fx.Int32,
             }
         )
     return _flyc.from_c_void_p(_FX_DTYPE[t.dtype], t.data_ptr())
+
+
+_SPLIT_K_MAX_TILES = 4096
+
+
+@functools.cache
+def _split_k_counters(device, stream):
+    return torch.zeros(_SPLIT_K_MAX_TILES, dtype=torch.int32, device=device)
 
 
 @functools.lru_cache(maxsize=1024)
@@ -123,22 +132,30 @@ def gemm_a8w8_blockscale(
         x_scale.stride(1) == 1 or scale_k == 1
     ), f"x_scale needs unit-stride K, got strides {tuple(x_scale.stride())}"
     assert w_scale.is_contiguous(), "w_scale must be contiguous"
-    _splitk_f32_accum = split_k > 1 and dtype in (torch.bfloat16, torch.float16)
-    buf_dtype = torch.float32 if _splitk_f32_accum else dtype
     _half_str = "fp16" if dtype == torch.float16 else "bf16"
-    out_dtype_str = "f32" if _splitk_f32_accum or dtype == torch.float32 else _half_str
+    out_dtype_str = "f32" if dtype == torch.float32 else _half_str
 
     if y is not None:
         assert y.shape == (M, N), f"y shape {y.shape} != ({M}, {N})"
         assert y.dtype == dtype, f"y dtype {y.dtype} != {dtype}"
-
-    _alloc = torch.zeros if split_k > 1 else torch.empty
-    if _splitk_f32_accum or y is None:
-        y_buf = _alloc((M, N), dtype=buf_dtype, device=x.device)
-    else:
         y_buf = y
-        if split_k > 1:
-            y_buf.zero_()
+    else:
+        y_buf = torch.empty((M, N), dtype=dtype, device=x.device)
+
+    stream = torch.cuda.current_stream(device=x.device)
+    sem = _split_k_counters(x.device, stream)
+    if split_k > 1:
+        tiles = ((M + tile_m - 1) // tile_m) * ((N + tile_n - 1) // tile_n)
+        if tiles > _SPLIT_K_MAX_TILES:
+            raise RuntimeError(
+                f"[FlyDSL gfx1250] split_k needs {tiles} tile counters, "
+                f"more than {_SPLIT_K_MAX_TILES}"
+            )
+        m_pad = ((M + tile_m - 1) // tile_m) * tile_m
+        n_pad = ((N + tile_n - 1) // tile_n) * tile_n
+        ws = torch.empty((split_k, m_pad, n_pad), device=x.device, dtype=torch.float32)
+    else:
+        ws = y_buf
 
     launcher = _cached_launcher(
         N,
@@ -164,7 +181,6 @@ def gemm_a8w8_blockscale(
     assert y_buf.stride(1) == 1, "output must have unit-stride N"
     ldc = y_buf.stride(0) if y_buf.shape[0] > 1 else y_buf.shape[1]
 
-    stream = torch.cuda.current_stream(device=x.device).cuda_stream
     _run_compiled(
         launcher,
         _p(y_buf),
@@ -172,21 +188,17 @@ def gemm_a8w8_blockscale(
         _p(w),
         _p(x_scale),
         _p(w_scale),
+        _p(ws),
+        _p(sem),
         M,
         N,
         ldc,
         lda,
         ldb,
         lds,
-        _fx.Stream(stream),
+        _fx.Stream(stream.cuda_stream),
     )
-
-    if not _splitk_f32_accum:
-        return y_buf
-    if y is not None:
-        y.copy_(y_buf)
-        return y
-    return y_buf.to(dtype)
+    return y_buf
 
 
 __all__ = ["gemm_a8w8_blockscale"]
