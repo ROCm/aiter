@@ -2876,9 +2876,6 @@ def get_2stage_cfgs(
         and isinstance(kernelName1, str)
         and kernelName1.startswith("flydsl_moe1_")
     ):
-        # Keep fp4 activations into gemm1 but hand gemm2 an fp8 intermediate. The v2
-        # stage2 a_dtype is what drives stage1's out_dtype, so swapping the name over
-        # is enough to move the whole intermediate path from fp4 to fp8.
         kernelName2 = kernelName2.replace("_afp4_", "_afp8_", 1)
 
     tag = f"({kernelName1=}, {kernelName2=})"
