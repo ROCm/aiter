@@ -173,5 +173,11 @@ if arch.startswith("gfx95"):
 else:
     candidate_kernels_cktile_dict = expand_blockpercu(kernels_list_942)
 
-# Name-based reverse lookup for get_tune_dict()
-candidate_kernels_by_name = {v.name: v for v in candidate_kernels_cktile_dict.values()}
+# Name-based reverse lookup for get_tune_dict().  Spans every arch list rather
+# than the selected one: a multi-arch build (GPU_ARCHS="gfx942;gfx950") keeps
+# tuned rows for all targets, while get_gfx() above resolves to a single arch.
+candidate_kernels_by_name = {
+    v.name: v
+    for kernels in (kernels_list_942, kernels_list_95x)
+    for v in expand_blockpercu(kernels).values()
+}
