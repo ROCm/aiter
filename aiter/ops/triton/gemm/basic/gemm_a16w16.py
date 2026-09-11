@@ -136,7 +136,6 @@ def gemm_a16w16_(
         M, K = x.shape
         N, _ = w.shape
 
-        # Should be 256 for gfx12
         NUM_WGS = torch.cuda.get_device_properties(x.device).multi_processor_count
 
         if config is None:
