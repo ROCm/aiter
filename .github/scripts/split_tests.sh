@@ -162,7 +162,7 @@ if [[ "$TEST_TYPE" == "aiter" ]]; then
     FILE_TIMES[op_tests/test_dsv4_rotate_quant.py]=7
     FILE_TIMES[op_tests/test_f4gemm.py]=7
     FILE_TIMES[op_tests/test_fhmoe.py]=7
-    FILE_TIMES[op_tests/test_flydsl_grouped_gemm.py]=7
+    FILE_TIMES[op_tests/test_flydsl_grouped_gemm_gfx1250.py]=7
     FILE_TIMES[op_tests/test_fmha_fwd_mxfp8_asm.py]=7
     FILE_TIMES[op_tests/test_fmha_fwd_with_sink_asm.py]=7
     FILE_TIMES[op_tests/test_fmha_fwd_with_sink_varlen_asm.py]=7
