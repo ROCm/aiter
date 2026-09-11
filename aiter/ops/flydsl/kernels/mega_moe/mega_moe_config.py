@@ -461,7 +461,14 @@ def _apply_a4_tuning(
                 config, stage1={"payload_chunk_rows": 1536}
             )
         elif bucket == 32768:
-            config = _replace_config(config, stage1={"payload_chunk_rows": 768})
+            # A4 takes a destination-wide indexed payload barrier here, so the
+            # producer phase cannot overlap the GEMM. Widen the dispatch grid
+            # and shorten the chunk so the barrier is reached sooner; under
+            # Zipf this is what bounds Stage1.
+            config = _replace_config(
+                config,
+                stage1={"payload_chunk_rows": 384, "num_dispatch_cu": 64},
+            )
         return config
 
     # These measured tables are V4-Pro-specific.
