@@ -3,10 +3,12 @@
 
 """Fused atomic split-K epilogue shared by the gfx1250 a8w8 GEMM kernels."""
 
+import functools
+
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl._mlir.dialects import llvm as llvm_dialect
-from flydsl.expr import const_expr, range_constexpr
+from flydsl.expr import const_expr, range_constexpr, rocdl
 from flydsl.expr.typing import T, as_ir_value
 
 from .gemm_common_gfx1250 import workgroup_barrier
@@ -16,6 +18,7 @@ EPI_UNROLL = 16
 # pk_add_bf16 is 32-bit: 2 elems/thread puts lane L at base + L*4, so one
 # instruction covers exactly one fully-written 128 B line.
 EPI_VEC = 2
+FLAG_STRIDE_I32 = 32
 
 
 def emit_atomic_splitk_epilogue(
@@ -36,7 +39,6 @@ def emit_atomic_splitk_epilogue(
     bounded_m,
     flat_tile,
     arg_flag,
-    i32_epoch,
 ):
     """Accumulate the LDS-staged C tile into C with device-scope atomics.
 
@@ -57,15 +59,10 @@ def emit_atomic_splitk_epilogue(
     cx = (fx.Int32(tid) % lanes_per_row) * EPI_VEC
     ch_rows = tile_m // split_k
     fp = fx.recast_iter(fx.PointerType.get(T.i32, arg_flag.address_space), arg_flag)
-    fbase = flat_tile * split_k
+    fbase = flat_tile * split_k * FLAG_STRIDE_I32
 
     def _flag_ptr(idx):
-        return fx.to_llvm_ptr(fx.add_offset(fp, fbase + idx))
-
-    @flyc.jit
-    def _emit_row_bounded(binop, gptr, vec, row):
-        if row < mn_oob:
-            _emit_row(binop, gptr, vec)
+        return fx.to_llvm_ptr(fx.add_offset(fp, fbase + idx * FLAG_STRIDE_I32))
 
     def _emit_row(binop, gptr, vec):
         for pi in range_constexpr(EPI_VEC // 2):
@@ -86,6 +83,18 @@ def emit_atomic_splitk_epilogue(
                 syncscope="agent",
                 alignment=4,
             )
+
+    @functools.lru_cache(maxsize=4)
+    def _bounded_emitter(binop):
+        """Close over ``binop`` -- passing it as a jit arg makes it a runtime
+        value on a later trace and breaks the const_expr test in _emit_row."""
+
+        @flyc.jit
+        def _f(gptr, vec, row):
+            if row < mn_oob:
+                _emit_row(binop, gptr, vec)
+
+        return _f
 
     def _emit_rows(binop, row_base, bounded):
         n_iter = ch_rows // rows_per_iter
@@ -120,7 +129,7 @@ def emit_atomic_splitk_epilogue(
                     gc_base, base_off + grp_delta[blk_i] + row_delta[u]
                 )
                 if const_expr(bounded):
-                    _emit_row_bounded(binop, gptr, vecs[u], rows[u])
+                    _bounded_emitter(binop)(gptr, vecs[u], rows[u])
                 else:
                     _emit_row(binop, gptr, vecs[u])
 
@@ -129,11 +138,24 @@ def emit_atomic_splitk_epilogue(
         if tid == fx.Int32(0):
             # monotonic suffices: GL2 already orders the device-scope atomics.
             llvm_dialect.StoreOp(
-                as_ir_value(i32_epoch),
+                as_ir_value(fx.Int32(split_k - 1)),
                 _flag_ptr(split_idx),
                 alignment=4,
                 ordering=llvm_dialect.AtomicOrdering.monotonic,
                 syncscope="agent",
+            )
+
+    @flyc.jit
+    def _release(cc):
+        """Count this WG off the peer's slot; the last one leaves it at 0."""
+        if tid == fx.Int32(0):
+            llvm_dialect.atomicrmw(
+                llvm_dialect.AtomicBinOp.add,
+                _flag_ptr(cc),
+                as_ir_value(fx.Int32(-1)),
+                llvm_dialect.AtomicOrdering.monotonic,
+                syncscope="agent",
+                alignment=4,
             )
 
     @flyc.jit
@@ -150,7 +172,7 @@ def emit_atomic_splitk_epilogue(
             )
 
         cur = _load()
-        while cur != i32_epoch:
+        while cur == fx.Int32(0):
             cur = _load()
 
     _emit_rows(llvm_dialect.AtomicBinOp.xchg, split_idx * ch_rows, bounded_m)
@@ -162,3 +184,7 @@ def emit_atomic_splitk_epilogue(
         # than tid0 polling behind a workgroup barrier.
         _spin(cc)
         _emit_rows(llvm_dialect.AtomicBinOp.fadd, cc * ch_rows, bounded_m)
+    rocdl.s_barrier_signal(-1)
+    rocdl.s_barrier_wait(-1)
+    for c in range_constexpr(1, split_k):
+        _release((split_idx + fx.Int32(c)) & fx.Int32(split_k - 1))

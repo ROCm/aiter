@@ -46,7 +46,6 @@ def launch_gemm_a8w8_256x256(
     i32_lda: fx.Int32,
     i32_ldc: fx.Int32,
     arg_flag: fx.Pointer,
-    i32_epoch: fx.Int32,
     tile_m: Constexpr[int],
     tile_n: Constexpr[int],
     tile_k: Constexpr[int],
@@ -164,7 +163,6 @@ def launch_gemm_a8w8_256x256(
         i32_lda: fx.Int32,
         i32_ldc: fx.Int32,
         arg_flag: fx.Pointer,
-        i32_epoch: fx.Int32,
         tile_idx=0,
     ):
         K_TILES = i32_k // (tile_k * split_k)
@@ -987,7 +985,6 @@ def launch_gemm_a8w8_256x256(
                 bounded_m=bounded_m,
                 flat_tile=_flat_tile,
                 arg_flag=arg_flag,
-                i32_epoch=i32_epoch,
             )
         else:
             fx.copy(
@@ -1016,7 +1013,6 @@ def launch_gemm_a8w8_256x256(
         i32_lda: fx.Int32,
         i32_ldc: fx.Int32,
         arg_flag: fx.Pointer,
-        i32_epoch: fx.Int32,
     ):
         tile_args = (
             arg_c,
@@ -1031,7 +1027,6 @@ def launch_gemm_a8w8_256x256(
             i32_lda,
             i32_ldc,
             arg_flag,
-            i32_epoch,
         )
         if const_expr(persistent_n_tiles == 1):
             _run_tile(*tile_args)
@@ -1069,7 +1064,6 @@ def launch_gemm_a8w8_256x256(
         i32_lda,
         i32_ldc,
         arg_flag,
-        i32_epoch,
         value_attrs={"rocdl.cluster_dims": f"{cluster_m},{cluster_n},1"},
     ).launch(
         grid=grid_arg,

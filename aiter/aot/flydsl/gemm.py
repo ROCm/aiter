@@ -584,10 +584,7 @@ def _compile_mxfp8_128_wmma_to_cache(
                     m, n, tile_m, tile_n, variant_cm, split_k, cu_num, True
                 )
                 cb_args = (
-                    variant_args[:12]
-                    # epoch value is irrelevant when compiling
-                    + (_ptr_view_safe(flag), 1)
-                    + variant_args[12:]
+                    variant_args[:12] + (_ptr_view_safe(flag),) + variant_args[12:]
                 )
                 launch(
                     *cb_args,
