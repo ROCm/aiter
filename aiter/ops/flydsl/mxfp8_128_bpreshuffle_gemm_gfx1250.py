@@ -310,7 +310,11 @@ def _run_mxfp8_128_preshuffle_gemm_a8_gfx1250(
         torch.cuda.get_device_properties(XQ.device).multi_processor_count,
         compute_bound,
     )
-    flag = get_split_k_flags(torch_stream.cuda_stream, XQ.device) if _atomic_splitk else Out
+    flag = (
+        get_split_k_flags(torch_stream.cuda_stream, XQ.device)
+        if _atomic_splitk
+        else Out
+    )
     partials = (
         torch.empty((split_k, M, ldc), dtype=Out.dtype, device=Out.device)
         if split_k > 1 and not _atomic_splitk
