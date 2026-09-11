@@ -96,6 +96,7 @@ else:
     from .ops.quant import *
     from .ops.gemm_op_a8w8 import *
     from .ops.gemm_op_a16w16 import *
+    from .ops.gemm_op_a16w4 import *
     from .ops.gemm_op_a4w4 import *
     from .ops.gemm_op_a6w6 import *
     from .ops.gemm_op_a8w4 import *
