@@ -25,6 +25,32 @@ _REF_ITERS = 5
 # Fraction of free HBM one case may claim before it is reported as skipped.
 _MEM_HEADROOM = 0.8
 
+# Peak allocation of create_random_logits, in units of the fp32 logits itself.
+# Budgeting 1x here would clear a cell that then dies allocating its own input,
+# which is the failure the guard exists to prevent.
+#   random    1x  -- one randn
+#   10LSBits  3x  -- randint, the masked temporary, and the or'd result
+#   mixed     4x  -- the above, plus a second randn and the torch.where result
+# Measured at M=64, N=1048576 with torch.cuda.max_memory_allocated: 1.03x,
+# 3.00x, 4.28x (the remainder is the boundary mask, accounted for separately).
+_GEN_PEAK_MULTIPLIER = {"random": 1.0, "10LSBits": 3.0, "mixed": 4.3}
+
+
+def _logits_bytes(num_rows: int, width: int, data_generation: str, dense: bool) -> int:
+    """Peak bytes create_random_logits needs for a [num_rows, width] fp32 tensor.
+
+    Staircase rows additionally materialise a [num_rows, width] bool mask to
+    fill each row's tail; equal-length rows have no tail and skip it.
+    """
+    logits = num_rows * width * 4
+    peak = logits * _GEN_PEAK_MULTIPLIER.get(data_generation, 1.0)
+    if not dense:
+        # The broadcast comparison materialises a bool the size of the logits,
+        # over an int32 column index.
+        peak += num_rows * width + width * 4
+    # Row bounds, plus slack for the allocator's block rounding.
+    return int(peak) + num_rows * 8 + (1 << 20)
+
 
 def _rotate_args(nbytes: int) -> int:
     """0 lets run_perftest size the rotation itself; 1 pins it to a single set."""
@@ -132,9 +158,13 @@ def create_random_logits(
         mask = torch.randint(0, 2, (row_starts.shape[0], 1), device="cuda").bool()
         logits = torch.where(mask, logits, logits_random)
 
-    # Mask each row's tail past its own row_end in one shot.
-    col = torch.arange(width, device=logits.device).unsqueeze(0)
-    logits.masked_fill_(col >= row_ends.to(logits.device).unsqueeze(1), float("-inf"))
+    # Mask each row's tail past its own row_end in one shot. Equal-length rows
+    # have no tail, and the broadcast would otherwise materialise a bool tensor
+    # the size of the logits (16 GiB at M=16384, N=1048576) only to fill nothing.
+    row_ends = row_ends.to(logits.device)
+    if int(row_ends.min()) < width:
+        col = torch.arange(width, device=logits.device, dtype=torch.int32).unsqueeze(0)
+        logits.masked_fill_(col >= row_ends.unsqueeze(1), float("-inf"))
     return logits
 
 
@@ -395,7 +425,10 @@ def test_top_k_per_row_prefill(
 
     # [16384, 1048576] fp32 is 64 GiB of logits alone. Skip the cell instead of
     # taking the whole sweep down with an OOM.
-    footprint = num_rows * width * 4 + num_rows * top_k * 4
+    footprint = (
+        _logits_bytes(num_rows, width, data_generation, dense_n is not None)
+        + num_rows * top_k * 4
+    )
     if not _fits_in_memory(footprint, _MEM_HEADROOM):
         ret["all_close"] = "skipped"
         ret["note"] = f"needs {_fmt_bytes(footprint)}"
@@ -467,7 +500,10 @@ def test_top_k_per_row_decode(
     width = max(context_len, top_k) if flydsl else context_len
     ret["width"] = width
 
-    footprint = num_rows * width * 4 + num_rows * top_k * (8 if write_values else 4)
+    # Decode rows differ by the next_n offset, so the mask is always built.
+    footprint = _logits_bytes(
+        num_rows, width, data_generation, dense=False
+    ) + num_rows * top_k * (8 if write_values else 4)
     if not _fits_in_memory(footprint, _MEM_HEADROOM):
         ret["all_close"] = "skipped"
         ret["note"] = f"needs {_fmt_bytes(footprint)}"
