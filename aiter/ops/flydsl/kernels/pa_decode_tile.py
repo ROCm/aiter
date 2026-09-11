@@ -1215,14 +1215,11 @@ def compile_pa_decode_tile(
                 corr_b = fx.Vector.from_elements(
                     [corr_reg], dtype=fx.Float32
                 ).broadcast_to(OP_ELEMS)
-                # Single tile: batch both vh's V loads upfront (no sibling chain
-                # to hide the latency behind).
-                v_vh_batch = [
-                    _v_ops(v_page_cur, vh, tile_valid)
-                    for vh in range_constexpr(VHE_CHUNKS)
-                ]
+                # Keep one V head chunk live at a time. Tail-byte masking adds
+                # short-lived temporaries, so batching every chunk here can push
+                # common single-tile specializations over a VGPR occupancy cliff.
                 for vh in range_constexpr(VHE_CHUNKS):
-                    v_vh = v_vh_batch[vh]
+                    v_vh = _v_ops(v_page_cur, vh, tile_valid)
                     acc = fx.Vector.filled(MFMA_ACC_ELEMS, 0.0, fx.Float32)
                     for s in range_constexpr(NVOPS):
                         acc = fx.rocdl.mfma_f32_16x16x32_fp8_fp8(
