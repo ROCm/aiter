@@ -49,6 +49,13 @@ KERNELS = ["flydsl", "triton"]
 # columns then are not comparable with each other.
 _ROTATE = 4
 
+# Timing loop size. This file is a correctness harness: 101 timed iterations per
+# row used to dominate a sweep's wall clock for a `us` column nobody reads here.
+# Default is now a token loop; `--bench` restores a converged one. Either way,
+# measure perf with op_tests/perf_mha_flydsl.py, not with this script.
+_ITERS = 3
+_WARMUP = 1
+
 
 # ============================================================================
 # Masks / reference
@@ -372,6 +379,8 @@ def test_mha_flydsl_varlen(
             return_lse and name == "flydsl",
             sink_t,
             num_rotate_args=_ROTATE,
+            num_iters=_ITERS,
+            num_warmup=_WARMUP,
         )
         # Only the flydsl call was asked for an LSE.
         if isinstance(data, (tuple, list)):
@@ -461,6 +470,8 @@ def test_mha_flydsl_batch(
         return_lse,
         sink_t,
         num_rotate_args=_ROTATE,
+        num_iters=_ITERS,
+        num_warmup=_WARMUP,
     )
     out, lse = data if return_lse else (data, None)
 
@@ -806,7 +817,19 @@ def main():
         "        ('i' rather than -1: argparse reads a leading -1 as a flag.)\n"
         "        e.g.: -w i,i 64,64 128,0 256,i i,256",
     )
+    parser.add_argument(
+        "--bench",
+        action="store_true",
+        help="Restore a converged timing loop (101 iters / 2 warmup) so the us and\n"
+        "        TFLOPS columns mean something. Off by default -- a correctness sweep\n"
+        "        pays for the compile and the allclose only.\n"
+        "        e.g.: --bench",
+    )
     args = parser.parse_args()
+
+    if args.bench:
+        global _ITERS, _WARMUP
+        _ITERS, _WARMUP = 101, 2
 
     causals = [bool(c) for c in args.causal]
     lses = [bool(e) for e in args.return_lse]
