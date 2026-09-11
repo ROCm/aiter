@@ -2,7 +2,6 @@
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 """Regression tests for runtime untuned-shape recording (no GPU required)."""
 
-import builtins
 import functools
 import multiprocessing
 import os
@@ -52,20 +51,52 @@ class TestUntunedShapes(unittest.TestCase):
         with open(path) as fh:
             self.assertEqual(fh.read(), "M,N,K\n1,2,3\n")
 
+    def test_same_process_deduplicates_rows(self):
+        row = {"M": 1, "N": 2, "K": 3}
+
+        untuned_shapes.record("a8w8_tuned_gemm.csv", row)
+        untuned_shapes.record("a8w8_tuned_gemm.csv", row)
+
+        path = os.path.join(self.tempdir.name, "a8w8_untuned_gemm.csv")
+        with open(path) as fh:
+            self.assertEqual(fh.read(), "M,N,K\n1,2,3\n")
+
+    def test_model_directory_groups_family_files(self):
+        model_dir = os.path.join(self.tempdir.name, "tuning", "glm-5.2")
+        tuned_files = (
+            "a8w8_tuned_gemm.csv",
+            "a8w8_bpreshuffle_tuned_gemm.csv",
+            "a8w8_blockscale_tuned_gemm.csv",
+            "a4w4_blockscale_tuned_gemm.csv",
+        )
+
+        with mock.patch.dict(os.environ, {"AITER_TUNE_GEMM_DIR": model_dir}):
+            paths = [untuned_shapes.untuned_path_for(path) for path in tuned_files]
+
+        self.assertEqual(
+            paths,
+            [
+                os.path.join(model_dir, path.replace("_tuned_", "_untuned_"))
+                for path in tuned_files
+            ],
+        )
+
     def test_failed_append_remains_retryable(self):
         row = {"M": 1, "N": 2, "K": 3}
         path = os.path.join(self.tempdir.name, "a8w8_untuned_gemm.csv")
-        real_open = builtins.open
+        real_append = untuned_shapes._append_line
         failed_once = False
 
-        def fail_first_append(file, mode="r", *args, **kwargs):
+        def fail_first_append(file, payload):
             nonlocal failed_once
-            if os.fspath(file) == path and mode == "a" and not failed_once:
+            if os.fspath(file) == path and not failed_once:
                 failed_once = True
                 raise OSError("transient failure")
-            return real_open(file, mode, *args, **kwargs)
+            return real_append(file, payload)
 
-        with mock.patch("builtins.open", side_effect=fail_first_append):
+        with mock.patch.object(
+            untuned_shapes, "_append_line", side_effect=fail_first_append
+        ):
             untuned_shapes.record("a8w8_tuned_gemm.csv", row)
 
         untuned_shapes.record("a8w8_tuned_gemm.csv", row)
@@ -76,17 +107,19 @@ class TestUntunedShapes(unittest.TestCase):
     def test_failed_initialization_remains_retryable(self):
         row = {"M": 1, "N": 2, "K": 3}
         path = os.path.join(self.tempdir.name, "a8w8_untuned_gemm.csv")
-        real_open = builtins.open
+        real_ensure_header = untuned_shapes._ensure_header
         failed_once = False
 
-        def fail_first_create(file, mode="r", *args, **kwargs):
+        def fail_first_create(file, cols):
             nonlocal failed_once
-            if os.fspath(file) == path and mode == "w" and not failed_once:
+            if os.fspath(file) == path and not failed_once:
                 failed_once = True
                 raise OSError("transient failure")
-            return real_open(file, mode, *args, **kwargs)
+            return real_ensure_header(file, cols)
 
-        with mock.patch("builtins.open", side_effect=fail_first_create):
+        with mock.patch.object(
+            untuned_shapes, "_ensure_header", side_effect=fail_first_create
+        ):
             untuned_shapes.record("a8w8_tuned_gemm.csv", row)
 
         self.assertNotIn(path, untuned_shapes._SEEN)
@@ -94,46 +127,20 @@ class TestUntunedShapes(unittest.TestCase):
         with open(path) as fh:
             self.assertEqual(fh.read(), "M,N,K\n1,2,3\n")
 
-    def test_partial_append_is_rolled_back_before_retry(self):
+    def test_append_uses_one_operating_system_write(self):
         row = {"M": 1, "N": 2, "K": 3}
         path = os.path.join(self.tempdir.name, "a8w8_untuned_gemm.csv")
-        real_open = builtins.open
-        failed_once = False
+        real_write = os.write
 
-        class PartialAppend:
-            def __init__(self, fh):
-                self.fh = fh
-
-            def __enter__(self):
-                self.fh.__enter__()
-                return self
-
-            def __exit__(self, *args):
-                return self.fh.__exit__(*args)
-
-            def write(self, text):
-                self.fh.write(text[:2])
-                self.fh.flush()
-                raise OSError("partial write")
-
-        def partially_write_first_row(file, mode="r", *args, **kwargs):
-            nonlocal failed_once
-            fh = real_open(file, mode, *args, **kwargs)
-            if os.fspath(file) == path and mode == "a" and not failed_once:
-                failed_once = True
-                return PartialAppend(fh)
-            return fh
-
-        with mock.patch("builtins.open", side_effect=partially_write_first_row):
+        with mock.patch.object(os, "write", wraps=real_write) as write:
             untuned_shapes.record("a8w8_tuned_gemm.csv", row)
 
-        with open(path) as fh:
-            self.assertEqual(fh.read(), "M,N,K\n")
-        untuned_shapes.record("a8w8_tuned_gemm.csv", row)
+        write.assert_called_once()
+        self.assertEqual(write.call_args.args[1], b"1,2,3\n")
         with open(path) as fh:
             self.assertEqual(fh.read(), "M,N,K\n1,2,3\n")
 
-    def test_processes_do_not_lose_or_duplicate_rows(self):
+    def test_processes_append_complete_rows_without_a_lock(self):
         shared = {"M": 1, "N": 2, "K": 3}
         processes = []
         for index in range(4):
@@ -151,8 +158,9 @@ class TestUntunedShapes(unittest.TestCase):
         with open(path) as fh:
             lines = fh.read().splitlines()
         self.assertEqual(lines[0], "M,N,K")
-        self.assertEqual(len(lines), 6)
+        self.assertEqual(len(lines), 9)
         self.assertEqual(len(set(lines[1:])), 5)
+        self.assertTrue(all(len(line.split(",")) == 3 for line in lines[1:]))
 
 
 class TestCachedLookupMissRecording(unittest.TestCase):

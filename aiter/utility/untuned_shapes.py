@@ -18,18 +18,21 @@ Environment:
     AITER_TUNE_GEMM=1        enable recording (same switch as the bf16 path)
     AITER_TUNE_GEMM_DIR=DIR  write there instead of ``aiter/configs``; useful
                              when the package directory is read-only or lives
-                             inside a container you would rather not reach into
+                             inside a container you would rather not reach into.
+                             Set this to a model-specific directory such as
+                             ``/tuning/glm-5.2`` to collect every GEMM family in
+                             one place.
 """
 
-import fcntl
 import os
+import tempfile
 import threading
 
 from aiter import logger
 
 _ENABLED = None
 _LOCK = threading.Lock()
-# file path -> {ordered column names, set of row tuples already written}
+# file path -> {ordered column names, process-local rows, separator state}
 _SEEN: dict = {}
 _THIS_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -60,76 +63,105 @@ def untuned_path_for(tuned_file: str) -> str:
 
 
 def record(tuned_file: str, row: dict) -> None:
-    """Append one missed shape, de-duplicated, in the tuner's input schema.
+    """Append one missed shape in the tuner's input schema.
 
-    Cheap enough for a dispatch path: a set lookup when the shape has been seen
-    before (the common case -- a serving run repeats the same shapes), and one
-    small append otherwise. Never raises: a read-only configs directory or a
-    full disk must not take down inference.
+    Rows are de-duplicated within this process. Different workers may append the
+    same row; the tuners already drop duplicates when reading their inputs. Each
+    new row is one ``O_APPEND`` write, so workers never need an interprocess lock
+    or a full-file duplicate scan. Never raises: a read-only output directory or
+    a full disk must not take down inference.
     """
     if not enabled():
         return
     try:
         path = untuned_path_for(tuned_file)
+        cols = list(row.keys())
         key = tuple(str(v) for v in row.values())
         with _LOCK:
             state = _SEEN.get(path)
             if state is not None and key in state["rows"]:
                 return
 
-            cols = list(row.keys())
             first_use = state is None
-            os.makedirs(os.path.dirname(path), exist_ok=True)
-            # _LOCK only covers threads in this process. Serving commonly has
-            # several worker processes writing the same collection, so protect
-            # initialization, the disk-level duplicate check, and append with
-            # an advisory interprocess lock as one transaction.
-            with open(path + ".lock", "a") as lock_fh:
-                fcntl.flock(lock_fh, fcntl.LOCK_EX)
-                existing = set()
-                if os.path.exists(path):
-                    with open(path) as fh:
-                        header = fh.readline().strip().split(",")
-                        if header == cols:
-                            for line in fh:
-                                line = line.strip()
-                                if line:
-                                    existing.add(tuple(line.split(",")))
-                        else:  # different schema on disk: start a fresh file
-                            os.replace(path, path + ".bak")
-                if not os.path.exists(path):
-                    with open(path, "w") as fh:
-                        fh.write(",".join(cols) + "\n")
+            if first_use:
+                os.makedirs(os.path.dirname(path), exist_ok=True)
+                needs_separator = _ensure_header(path, cols)
                 # Publish initialization state only after the directory and a
                 # valid CSV header exist, so a transient failure can recover.
-                state = _SEEN[path] = {"cols": cols, "rows": existing}
-                if first_use:
-                    logger.info(f"[AITER_TUNE_GEMM] recording untuned shapes to {path}")
-                if key in state["rows"]:
-                    return
-                needs_separator = os.path.getsize(path) > 0
-                if needs_separator:
-                    with open(path, "rb") as fh:
-                        fh.seek(-1, os.SEEK_END)
-                        needs_separator = fh.read(1) not in (b"\n", b"\r")
-                original_size = os.path.getsize(path)
-                try:
-                    with open(path, "a") as fh:
-                        if needs_separator:
-                            fh.write("\n")
-                        fh.write(",".join(key) + "\n")
-                except Exception:
-                    # write() and close() may fail after flushing only a prefix.
-                    # Restore the last known-good boundary while holding the
-                    # interprocess lock so the next dispatch can retry cleanly.
-                    try:
-                        with open(path, "r+b") as fh:
-                            fh.truncate(original_size)
-                    except OSError:
-                        pass
-                    raise
-                # Only cache a row after its append succeeds. A transient write
-                # failure must remain retryable on the next dispatch.
-                state["rows"].add(key)
+                state = _SEEN[path] = {
+                    "cols": cols,
+                    "rows": set(),
+                    "needs_separator": needs_separator,
+                }
+            elif state["cols"] != cols:
+                raise ValueError(
+                    f"schema for {path} changed from {state['cols']} to {cols}"
+                )
+
+            if first_use:
+                logger.info(f"[AITER_TUNE_GEMM] recording untuned shapes to {path}")
+
+            prefix = "\n" if state["needs_separator"] else ""
+            _append_line(path, (prefix + ",".join(key) + "\n").encode())
+            state["needs_separator"] = False
+            # Only cache a row after its append succeeds. A transient write
+            # failure must remain retryable on the next dispatch.
+            state["rows"].add(key)
     except Exception as e:  # noqa: BLE001 - never break dispatch over telemetry
         logger.warning(f"[AITER_TUNE_GEMM] could not record untuned shape: {e}")
+
+
+def _ensure_header(path: str, cols: list[str]) -> bool:
+    """Atomically publish a new header and validate an existing one once.
+
+    A temporary file plus ``link`` ensures another worker cannot observe an
+    empty destination between file creation and header write. Returns whether
+    the existing file needs a newline before its first appended row.
+    """
+    try:
+        fh = open(path, "rb")
+    except FileNotFoundError:
+        header = (",".join(cols) + "\n").encode()
+        fd, temp_path = tempfile.mkstemp(
+            dir=os.path.dirname(path),
+            prefix=f".{os.path.basename(path)}.",
+            suffix=".tmp",
+        )
+        try:
+            with os.fdopen(fd, "wb") as temp_fh:
+                temp_fh.write(header)
+            try:
+                os.link(temp_path, path)
+            except FileExistsError:
+                pass
+        finally:
+            try:
+                os.unlink(temp_path)
+            except FileNotFoundError:
+                pass
+        fh = open(path, "rb")
+
+    with fh:
+        disk_cols = fh.readline().rstrip(b"\r\n").decode().split(",")
+        if disk_cols != cols:
+            raise ValueError(
+                f"schema for {path} is {disk_cols}, expected {cols}; refusing to append"
+            )
+        fh.seek(0, os.SEEK_END)
+        if fh.tell() == 0:
+            return False
+        fh.seek(-1, os.SEEK_END)
+        return fh.read(1) not in (b"\n", b"\r")
+
+
+def _append_line(path: str, payload: bytes) -> None:
+    """Append a complete CSV row with one operating-system write."""
+    fd = os.open(path, os.O_WRONLY | os.O_APPEND)
+    try:
+        written = os.write(fd, payload)
+        if written != len(payload):
+            raise OSError(
+                f"short append to {path}: wrote {written}/{len(payload)} bytes"
+            )
+    finally:
+        os.close(fd)
