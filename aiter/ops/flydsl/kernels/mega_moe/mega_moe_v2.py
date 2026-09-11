@@ -194,12 +194,20 @@ class MegaMoEV2:
         prows = ((a2rows + 255) // 256) * 256
         pcols = (((inter_dim // 32) + 7) // 8) * 8
         self._s1_osd = torch.zeros(prows * pcols + inter_dim, dtype=torch.uint8, device=self.dev)
-        self._s1_quant_x = torch.empty(
-            self.mtpr,
-            self.model_dim,
-            dtype=torch.float8_e4m3fn,
-            device=self.dev,
-        )
+        if self._a_dtype == "fp4":
+            self._s1_quant_x = torch.empty(
+                self.mtpr,
+                self.model_dim // 2,
+                dtype=torch.uint8,
+                device=self.dev,
+            ).view(torch.float4_e2m1fn_x2)
+        else:
+            self._s1_quant_x = torch.empty(
+                self.mtpr,
+                self.model_dim,
+                dtype=torch.float8_e4m3fn,
+                device=self.dev,
+            )
         self._s1_quant_scale = torch.empty(
             self.mtpr,
             self._s1_scale_dim,
@@ -415,8 +423,7 @@ class MegaMoEV2:
                 config.prepare_quant_cu,
                 (quant_groups + 511) // 512,
             )
-            quant_variants = {0} if self._a_dtype == "fp4" else {0, quant_blocks}
-            for preload_quant_blocks in sorted(quant_variants):
+            for preload_quant_blocks in sorted({0, quant_blocks}):
                 self._s1_preload_prepare(
                     fx.Int64(self._s1_disp.data_ptr()),
                     fx.Int32(bucket),
@@ -437,6 +444,7 @@ class MegaMoEV2:
                     num_prepare_cu=prepare_blocks,
                     num_quant_cu=preload_quant_blocks,
                     quant_cu_capacity=self._s1_quant_cu_capacity,
+                    quant_mode=self._a_dtype,
                     model_dim=self.model_dim,
                     payload_chunk_rows=config.payload_chunk_rows,
                     tile_state_stride=self._s1_tile_state_stride,
@@ -546,6 +554,7 @@ class MegaMoEV2:
             num_prepare_cu=prepare_blocks,
             num_quant_cu=quant_blocks,
             quant_cu_capacity=self._s1_quant_cu_capacity,
+            quant_mode=self._a_dtype,
             model_dim=self.model_dim,
             payload_chunk_rows=config.payload_chunk_rows,
             tile_state_stride=self._s1_tile_state_stride,
@@ -742,7 +751,7 @@ class MegaMoEV2:
             raise ValueError("wts must be contiguous float32")
         if topk_ids.dtype != torch.int32 or not topk_ids.is_contiguous():
             raise ValueError("topk_ids must be contiguous int32")
-        if self._s1_fixed_slot or self._a_dtype == "fp4":
+        if self._s1_fixed_slot:
             x_q, scales = self.quantize(x_bf16)
             return self._run_joint(
                 x_q, scales, wts, topk_ids, run_tokens, stream, slice_output

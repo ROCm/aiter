@@ -498,6 +498,18 @@ def _apply_a4_tuning(
         if bucket <= 1024:
             config = _replace_config(config, stage1={"num_dispatch_cu": 32})
 
+        if bucket == 8:
+            # FP4 SBM32 contains exactly 256 16-byte A chunks. The 8-wave GEMM
+            # keeps its compute geometry while waves 0-3 perform async copies.
+            config = _replace_config(
+                config,
+                stage1={
+                    "sort_block_m": 32,
+                    "num_waves": 8,
+                    "async_a_copy": True,
+                },
+            )
+
         if bucket in (16, 32, 64, 128):
             config = _replace_config(
                 config,

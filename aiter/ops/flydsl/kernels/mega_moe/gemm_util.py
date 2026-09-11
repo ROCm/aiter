@@ -93,7 +93,12 @@ class ATileLoader:
         assert self._is_fp4 or a_dtype == "fp8"
         if const_expr(self._async_copy):
             assert total_threads % 64 == 0
-            assert (sort_block_m * (k_step_bytes // 16)) % total_threads == 0
+            total_chunks = sort_block_m * (k_step_bytes // 16)
+            assert total_chunks % 64 == 0
+            assert (
+                total_chunks < total_threads
+                or total_chunks % total_threads == 0
+            )
             assert row_bytes % 16 == 0 and k_step_bytes % 16 == 0
             self._dma_atom = fx.make_copy_atom(
                 fx.rocdl.BufferCopyLDS128b(),
@@ -206,42 +211,55 @@ class ATileLoader:
         )
         chunks_per_row = self._k_step_bytes // 16
         total_chunks = self._sort_block_m * chunks_per_row
+        copy_waves = min(total_chunks, self._total_threads) // 64
         for round_base in range_constexpr(
             0,
             total_chunks,
             self._total_threads,
         ):
-            physical = fx.Int32(round_base) + fx.Int32(self._tx)
-            row = physical // fx.Int32(chunks_per_row)
-            physical_chunk = physical % fx.Int32(chunks_per_row)
-            if const_expr(self._swizzle):
-                logical_chunk = (
-                    physical_chunk ^ ((row & fx.Int32(14)) >> fx.Int32(1))
-                    if const_expr(self._is_fp4)
-                    else physical_chunk ^ (row & fx.Int32(15))
-                )
-            else:
-                logical_chunk = physical_chunk
-            source_row = row
-            if const_expr(self._indexed_input):
-                source_index = round_base // self._total_threads
-                source_byte = self._chunks[source_index][1]
-                source_row = source_byte // fx.Int32(self._row_bytes)
-            src_byte = (
-                source_row * fx.Int32(self._row_bytes)
-                + koff
-                + logical_chunk * fx.Int32(16)
+            copy_active = (
+                self._wave < fx.Int32(copy_waves)
+                if const_expr(total_chunks < self._total_threads)
+                else fx.Boolean(True)
             )
-            src = fx.slice(
-                self._tile_dma,
-                (None, src_byte),
-            )
-            wave_base = base_bytes + fx.Int32((round_base + self._wave * 64) * 16)
-            dst = fx.make_view(
-                fx.add_offset(lds_elem, wave_base),
-                fx.make_layout(1, 1),
-            )
-            fx.copy(self._dma_atom, src, dst)
+            @flyc.jit
+            def issue_copy(active):
+                if active:
+                    physical = fx.Int32(round_base) + fx.Int32(self._tx)
+                    row = physical // fx.Int32(chunks_per_row)
+                    physical_chunk = physical % fx.Int32(chunks_per_row)
+                    if const_expr(self._swizzle):
+                        logical_chunk = (
+                            physical_chunk ^ ((row & fx.Int32(14)) >> fx.Int32(1))
+                            if const_expr(self._is_fp4)
+                            else physical_chunk ^ (row & fx.Int32(15))
+                        )
+                    else:
+                        logical_chunk = physical_chunk
+                    source_row = row
+                    if const_expr(self._indexed_input):
+                        source_index = round_base // self._total_threads
+                        source_byte = self._chunks[source_index][1]
+                        source_row = source_byte // fx.Int32(self._row_bytes)
+                    src_byte = (
+                        source_row * fx.Int32(self._row_bytes)
+                        + koff
+                        + logical_chunk * fx.Int32(16)
+                    )
+                    src = fx.slice(
+                        self._tile_dma,
+                        (None, src_byte),
+                    )
+                    wave_base = base_bytes + fx.Int32(
+                        (round_base + self._wave * 64) * 16
+                    )
+                    dst = fx.make_view(
+                        fx.add_offset(lds_elem, wave_base),
+                        fx.make_layout(1, 1),
+                    )
+                    fx.copy(self._dma_atom, src, dst)
+
+            issue_copy(copy_active)
 
 
 class AS2RLoader:

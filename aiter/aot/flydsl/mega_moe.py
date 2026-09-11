@@ -146,8 +146,7 @@ def _compile_stage1(
             config.prepare_quant_cu,
             (quant_groups + 511) // 512,
         )
-        quant_variants = {0} if a_dtype == "fp4" else {0, quant_blocks}
-        for num_quant_cu in sorted(quant_variants):
+        for num_quant_cu in sorted({0, quant_blocks}):
             identity = (
                 config.sort_block_m,
                 config.num_dispatch_cu,
@@ -178,6 +177,7 @@ def _compile_stage1(
                 num_prepare_cu=prepare_blocks,
                 num_quant_cu=num_quant_cu,
                 quant_cu_capacity=NUM_CU,
+                quant_mode=a_dtype,
                 model_dim=model_dim,
                 payload_chunk_rows=config.payload_chunk_rows,
                 tile_state_stride=tile_state_stride,
