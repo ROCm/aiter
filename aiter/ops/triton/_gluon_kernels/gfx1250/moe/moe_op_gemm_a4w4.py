@@ -20,8 +20,14 @@ _MOE_GEMM_A4W4_REPR_KEYS = [
     "EP_SCATTER",
 ]
 
+_MOE_GEMM_A4W4_PREFILL_REPR_KEYS = _MOE_GEMM_A4W4_REPR_KEYS + [
+    "PRELOAD_X_SCALES",
+    "XS_SLAB_COLS",
+    "L2_PREFETCH_DISTANCE",
+]
+
 _moe_gemm_a4w4_prefill_repr = make_kernel_repr(
-    "_moe_gemm_a4w4_prefill", _MOE_GEMM_A4W4_REPR_KEYS
+    "_moe_gemm_a4w4_prefill", _MOE_GEMM_A4W4_PREFILL_REPR_KEYS
 )
 
 _moe_gemm_a4w4_decode_repr = make_kernel_repr(

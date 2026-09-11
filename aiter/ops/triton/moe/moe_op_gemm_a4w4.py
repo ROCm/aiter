@@ -23,11 +23,10 @@ from aiter.ops.triton.moe.reduce import (
     scatter_grouped,
     validate_reduce_out,
 )
+from aiter.ops.triton.utils._triton import arch_info
 from aiter.ops.triton.utils._triton.arch_info import get_arch
 from aiter.ops.triton.utils.gemm_config_utils import pick_gemm_num_stages
 from aiter.ops.triton.utils.moe_config_utils import get_moe_dispatch
-
-_LDS_BYTES_PER_WGP = 327680
 
 
 def _prefill_lds_bytes(config, x_scales_preload, xs_slab_cols):
@@ -51,7 +50,8 @@ def _prefill_lds_bytes(config, x_scales_preload, xs_slab_cols):
 
 
 def _workgroups_per_wgp(lds_bytes):
-    return max(1, _LDS_BYTES_PER_WGP // max(1, lds_bytes))
+    cap = arch_info._LDS_CAP_BYTES[get_arch()]
+    return max(1, cap // max(1, lds_bytes))
 
 
 # -----------------------------------------------------------------------------
@@ -604,13 +604,10 @@ def moe_gemm_a4w4(
             and config["block_m"] * (config["block_k"] // MXFP4_QUANT_BLOCK_SIZE) <= 256
             and config["block_m"] * xs_slab_cols <= XS_SLAB_MAX_BYTES
             and config["num_ctas"] == 1
-        )
-        # Only vetoed for the layouts _prefill_lds_bytes actually models.
-        if (
-            x_scales_preload
             and preshuffle_weights
             and swizzle_mx_scale == "GFX1250_SCALE"
-        ):
+        )
+        if x_scales_preload:
             wgs_with = _workgroups_per_wgp(
                 _prefill_lds_bytes(config, True, xs_slab_cols)
             )
