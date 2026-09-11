@@ -588,12 +588,15 @@ def checkAllclose(
         return percent
 
 
-def assertAllclose(a, b, rtol=1e-2, atol=1e-2, max_err_ratio=1e-3, msg="", **kwargs):
+def assertAllclose(a, b, rtol=1e-2, atol=1e-2, tol_err_ratio=0.05, msg="", **kwargs):
     """checkAllclose only logs and returns the mismatch ratio; this variant fails
-    the test when more than max_err_ratio of the elements mismatch."""
-    ratio = checkAllclose(a, b, rtol=rtol, atol=atol, msg=msg, **kwargs)
+    the test when the mismatch ratio exceeds tol_err_ratio, i.e. exactly the
+    cases checkAllclose already reports as failed."""
+    ratio = checkAllclose(
+        a, b, rtol=rtol, atol=atol, tol_err_ratio=tol_err_ratio, msg=msg, **kwargs
+    )
     assert (
-        ratio <= max_err_ratio
+        ratio <= tol_err_ratio
     ), f"{msg}{ratio:.3%} of elements exceed atol={atol} rtol={rtol}"
     return ratio
 

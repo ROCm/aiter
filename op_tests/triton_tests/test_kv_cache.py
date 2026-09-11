@@ -155,7 +155,6 @@ def check_kv_buffer(
             atol=1e-1,
             rtol=1e-1,
             tol_err_ratio=0.05,
-            max_err_ratio=0.05,
             msg="NVFP4 kv_buffer lora dequant",
         )
         assertAllclose(
@@ -164,7 +163,6 @@ def check_kv_buffer(
             atol=1e-1,
             rtol=1e-1,
             tol_err_ratio=0.05,
-            max_err_ratio=0.05,
             msg="NVFP4 kv_buffer rope dequant",
         )
     elif shuffled_kv_cache:
