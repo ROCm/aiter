@@ -36,7 +36,13 @@ def _test_wide_ep_forward(
     # [agent] MORI's combine result aliases its external symmetric arena, which
     # is not owned by the cudagraph memory pool. Materialize exactly one
     # pool-owned public output; this replaces the ten inter-segment copies.
-    return op._forward_prequant_impl(x_quant, x_scale, topk_weight, topk_ids).clone()
+    return op._forward_prequant_impl(
+        x_quant,
+        x_scale,
+        topk_weight,
+        topk_ids,
+        static_local_tokens=True,
+    ).clone()
 
 
 @_test_wide_ep_forward.register_fake
@@ -252,7 +258,12 @@ class TestWideEpMoe:
         quant_mode = "fp4" if self.quant == "a4w4" else "fp8"
         return per_1x32_mx_quant(x_bf16, quant_mode=quant_mode)
 
-    def fused_moe(self, dispatched: TestWideEpMoeContext):
+    def fused_moe(
+        self,
+        dispatched: TestWideEpMoeContext,
+        *,
+        static_local_tokens: bool = False,
+    ):
         from aiter import QuantType, dtypes
         from aiter.fused_moe import fused_moe as run_fused_moe
 
@@ -261,14 +272,54 @@ class TestWideEpMoe:
             value = getattr(dispatched, name)
             if value.device != self.dev:
                 raise ValueError(f"dispatched.{name} must be on current device {self.dev}")
-        return run_fused_moe(
-            dispatched.tokens, self.w1, self.w2, dispatched.weights, dispatched.expert_ids,
-            expert_mask=self.expert_mask, activation=self.activation,
-            gate_mode=self.gate_mode.value, quant_type=QuantType.per_1x32,
+
+        common_kwargs = dict(
+            expert_mask=self.expert_mask,
+            activation=self.activation,
+            gate_mode=self.gate_mode.value,
+            quant_type=QuantType.per_1x32,
             swiglu_limit=self.swiglu_limit,
-            w1_scale=self.w1_scale, w2_scale=self.w2_scale, a1_scale=dispatched.scales,
-            num_local_tokens=dispatched.num_tokens[:1].to(dtypes.i32), dtype=torch.bfloat16,
+            w1_scale=self.w1_scale,
+            w2_scale=self.w2_scale,
+            dtype=torch.bfloat16,
         )
+        if static_local_tokens:
+            return run_fused_moe(
+                dispatched.tokens,
+                self.w1,
+                self.w2,
+                dispatched.weights,
+                dispatched.expert_ids,
+                a1_scale=dispatched.scales,
+                num_local_tokens=dispatched.num_tokens[:1].to(dtypes.i32),
+                **common_kwargs,
+            )
+
+        # Eager execution can use the real receive length. Keeping MORI's
+        # worst-case EP16 capacity here makes the fused stage-1 FP8 workspace
+        # exceed 2**32 elements for DSV4 (262144 * 6 * 3072), which truncates
+        # the quantized intermediate. Pad the correct valid result back to the
+        # static arena shape expected by combine.
+        num_tokens = int(dispatched.num_tokens[0].item())
+        output = torch.zeros(
+            (dispatched.tokens.shape[0], self.model_dim),
+            dtype=torch.bfloat16,
+            device=self.dev,
+        )
+        if num_tokens == 0:
+            return output
+        valid_output = run_fused_moe(
+            dispatched.tokens[:num_tokens].contiguous(),
+            self.w1,
+            self.w2,
+            dispatched.weights[:num_tokens].contiguous(),
+            dispatched.expert_ids[:num_tokens].contiguous(),
+            a1_scale=dispatched.scales[:num_tokens].contiguous(),
+            num_local_tokens=None,
+            **common_kwargs,
+        )
+        output[:num_tokens].copy_(valid_output)
+        return output
 
     def combine(self, local_output, dispatched: TestWideEpMoeContext):
         self._validate_active_dispatch(dispatched)
@@ -309,11 +360,21 @@ class TestWideEpMoe:
             )
         return self._forward_prequant_impl(x_quant, x_scale, weights, topk_ids)
 
-    def _forward_prequant_impl(self, x_quant, x_scale, weights, topk_ids):
+    def _forward_prequant_impl(
+        self,
+        x_quant,
+        x_scale,
+        weights,
+        topk_ids,
+        *,
+        static_local_tokens: bool = False,
+    ):
         dispatched = self.dispatch_prequant(x_quant, x_scale, weights, topk_ids)
         if os.environ.get("AITER_DEBUG_WIDE_EP", "0") == "1":
             print(f"[TestWideEpMoe rank={self.rank}] dispatch complete", flush=True)
-        local_output = self.fused_moe(dispatched)
+        local_output = self.fused_moe(
+            dispatched, static_local_tokens=static_local_tokens
+        )
         if os.environ.get("AITER_DEBUG_WIDE_EP", "0") == "1":
             print(f"[TestWideEpMoe rank={self.rank}] fused_moe complete", flush=True)
         output = self.combine(local_output, dispatched)[0]
