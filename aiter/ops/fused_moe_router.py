@@ -102,8 +102,10 @@ def fused_moe_router_workspace_size(max_tokens: int) -> int:
     """Workspace bytes needed to serve every ``M`` up to ``max_tokens``."""
 
 
-# Unbounded: an evicted entry frees a workspace that a captured CUDA graph may
-# still hold a baked pointer to
+# Unbounded: an evicted entry frees a workspace a captured CUDA graph may still
+# hold a baked pointer to. Keying on the stream pointer is safe -- two live
+# streams cannot share an address, and a reused one only re-serves scratch
+# nothing still reads.
 @functools.cache
 def _get_fused_moe_router_workspace_keyed(
     device: torch.device, stream_id: int, nbytes: int

@@ -702,10 +702,19 @@ def test_bias_dtype(bias_dtype):
     _assert_ok(errs, f"bias_dtype={bias_dtype}")
 
 
+# moe_buf reaches the entry unzeroed, so correctness rests on the kernel
+# writing every element. _run_case poisons it and _compare requires it clear,
+# over the shapes that change the block mapping: shared slots widen topk, EP
+# parks non-owners on the sentinel.
 @pytest.mark.parametrize("M", [1, 64, 128])
-def test_moe_buf_zero_fill(M):
-    errs, _ = _run_case(M, 320, 8, 16, dtypes.bf16, True, 1.0, None, True)
-    _assert_ok(errs, f"M={M} moe_buf")
+@pytest.mark.parametrize(
+    "ep,n_shared", [(None, 0), (None, 1), ((2, 4, True), 0), ((2, 4, True), 1)]
+)
+def test_moe_buf_zero_fill(M, ep, n_shared):
+    errs, _ = _run_case(
+        M, 320, 8, 16, dtypes.bf16, True, 1.0, ep, True, n_shared=n_shared
+    )
+    _assert_ok(errs, f"M={M} ep={ep} n_shared={n_shared} moe_buf")
 
 
 def test_barrier_rearms():
@@ -1279,6 +1288,100 @@ def test_shared_bad_args_rejected():
     narrow["tw"] = torch.zeros(M, topk, dtype=dtypes.fp32)
     with pytest.raises(RuntimeError):
         call(outs=narrow)
+
+
+def test_config_supported_scalar_gate():
+    """Limits knowable without tensors must decline at `config_supported`.
+
+    Backend selection calls it once; anything only `fused_moe_router_supported`
+    catches is re-checked every forward.
+    """
+    from aiter import ActivationType, QuantType
+    from aiter.fused_moe import fused_moe_router_config_supported
+    from aiter.ops.flydsl.moe_common import GateMode
+
+    ask = lambda **kw: fused_moe_router_config_supported(
+        **{
+            "hidden_dim": COLS,
+            "hidden_dtype": dtypes.bf16,
+            "w1_dtype": dtypes.fp4x2,
+            "quant_type": QuantType.per_1x32.value,
+            "activation": ActivationType.Silu.value,
+            "gate_mode": GateMode.SEPARATED.value,
+            **kw,
+        }
+    )
+    assert ask()
+    assert ask(num_fused_shared_experts=1)
+    # One wave of lanes past topk: a second shared row has nowhere to go, and
+    # the entry TORCH_CHECKs rather than declining.
+    assert not ask(num_fused_shared_experts=2)
+    assert not ask(num_fused_shared_experts=-1)
+    assert not ask(hidden_dim=2048)
+    assert not ask(hidden_dtype=dtypes.fp16)
+    assert not ask(activation=ActivationType.Gelu.value)
+    assert not ask(gate_mode=GateMode.INTERLEAVE.value)
+
+
+def test_global_num_experts_derivations():
+    """The three ways `fused_moe_router_supported` learns the gating width.
+
+    All must land on what `fused_moe_router` reads off gating_output, or the
+    `topk <= global_E` and cap checks guard the wrong quantity. Sized so only
+    global_E can trip them.
+    """
+    from aiter import ActivationType, QuantType
+    from aiter.fused_moe import FUSED_MOE_ROUTER_MAX_EXPERTS
+    from aiter.fused_moe import fused_moe_router_supported as ask
+
+    M, E, topk, n_shared = 16, 320, 8, 1
+    h = torch.randn(M, COLS, dtype=dtypes.bf16)
+    base = {
+        "quant_type": QuantType.per_1x32.value,
+        "activation": ActivationType.Silu.value,
+    }
+
+    def w(local_E):
+        return (
+            torch.empty(local_E, 512, COLS // 2, dtype=dtypes.fp4x2),
+            torch.empty(local_E, COLS, 128, dtype=dtypes.fp4x2),
+        )
+
+    # Explicit: taken as given, whatever the shapes imply.
+    w1, w2 = w(E)
+    assert ask(h, w1, w2, topk, global_num_experts=E, **base)
+    assert not ask(h, w1, w2, topk, global_num_experts=topk - 1, **base)
+    assert not ask(
+        h, w1, w2, topk, global_num_experts=FUSED_MOE_ROUTER_MAX_EXPERTS + 1, **base
+    )
+
+    # From the mask: spans routed + shared + sentinel, so both come off.
+    over = FUSED_MOE_ROUTER_MAX_EXPERTS + 1
+    w1, w2 = w(E // 4 + n_shared)
+    assert ask(
+        h,
+        w1,
+        w2,
+        topk,
+        expert_mask=_make_mask(E, 0, 4, n_shared=n_shared),
+        num_fused_shared_experts=n_shared,
+        **base,
+    )
+    assert not ask(
+        h,
+        w1,
+        w2,
+        topk,
+        expert_mask=_make_mask(over, 0, 4, n_shared=n_shared),
+        num_fused_shared_experts=n_shared,
+        **base,
+    )
+
+    # No mask: no EP, so w1 holds routed plus shared.
+    w1, w2 = w(E + n_shared)
+    assert ask(h, w1, w2, topk, num_fused_shared_experts=n_shared, **base)
+    w1, w2 = w(topk - 1 + n_shared)
+    assert not ask(h, w1, w2, topk, num_fused_shared_experts=n_shared, **base)
 
 
 def test_shared_supported_gate():
