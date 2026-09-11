@@ -25,6 +25,14 @@ sys.path.insert(0, f"{this_dir}/utils/")
 from chip_info import get_gfx, get_gfx_list, get_gfx_runtime
 from cpp_extension import _jit_compile, executable_path, get_hip_version
 from file_baton import FileBaton
+from jit_cache import (
+    atomic_copy,
+    publish_blob_sources,
+    publish_compiled_kids,
+    require_blob_generation,
+    snapshot_compiled_kids,
+    stage_blob_sources,
+)
 from torch_guard import torch_compile_guard
 
 AITER_REBUILD = int(os.environ.get("AITER_REBUILD", "0"))
@@ -53,9 +61,13 @@ def mp_lock(
     MainFunc: Callable,
     FinalFunc: Callable | None = None,
     WaitFunc: Callable | None = None,
+    build_after_wait: bool = False,
 ):
     """
     Using FileBaton for multiprocessing.
+
+    With build_after_wait, a peer completing does not satisfy this invocation:
+    acquire the lock and run MainFunc with our request-specific arguments.
     """
     baton = FileBaton(lockPath)
     while True:
@@ -71,7 +83,7 @@ def mp_lock(
         # wait() returns True if the holder released normally (work done),
         # or False if it broke a stale lock left by a dead/abandoned holder --
         # in which case we loop and try to acquire + build ourselves.
-        if baton.wait():
+        if baton.wait() and not build_after_wait:
             if WaitFunc is not None:
                 return WaitFunc()
             return None
@@ -116,6 +128,11 @@ AITER_CONFIG_GEMM_A8W8_BLOCKSCALE = os.getenv(
 AITER_CONFIG_FMOE = os.getenv(
     "AITER_CONFIG_FMOE",
     f"{AITER_ROOT_DIR}/aiter/configs/tuned_fmoe.csv",
+)
+
+AITER_CONFIG_COMM_FUSED_MOE = os.getenv(
+    "AITER_CONFIG_COMM_FUSED_MOE",
+    f"{AITER_ROOT_DIR}/aiter/configs/comm_fused_moe.csv",
 )
 
 AITER_CONFIG_FHMOE = os.getenv(
@@ -230,6 +247,14 @@ class AITER_CONFIG:
     def AITER_CONFIG_FMOE_FILE(self):
         return self.get_config_file(
             "AITER_CONFIG_FMOE", AITER_CONFIG_FMOE, "tuned_fmoe"
+        )
+
+    @property
+    def AITER_CONFIG_COMM_FUSED_MOE_FILE(self):
+        return self.get_config_file(
+            "AITER_CONFIG_COMM_FUSED_MOE",
+            AITER_CONFIG_COMM_FUSED_MOE,
+            "tuned_comm_fused_moe",
         )
 
     @property
@@ -696,6 +721,26 @@ def rename_cpp_to_cu(els, dst, hipify, recursive=False):
     return ret
 
 
+def _stage_blob_sources(
+    blob_gen_cmd, op_dir, src_dir, sources, hipify, seed_files=None
+):
+    """Generate JIT sources in a deterministic transactional working tree."""
+    staging_dir, token = stage_blob_sources(
+        blob_gen_cmd,
+        op_dir,
+        PY,
+        logger=logger,
+        log_commands=AITER_LOG_MORE > 0,
+        seed_files=seed_files,
+        return_token=True,
+    )
+    if staging_dir is None:
+        return sources, None, None
+    generated_sources = rename_cpp_to_cu([staging_dir], src_dir, hipify, recursive=True)
+    require_blob_generation(staging_dir, token)
+    return sources + generated_sources, staging_dir, token
+
+
 @torch_compile_guard()
 def check_numa_custom_op() -> None:
     numa_balance_set = os.popen("cat /proc/sys/kernel/numa_balancing").read().strip()
@@ -996,6 +1041,7 @@ def build_module(
     third_party,
     hipify=False,
     flags_extra_hip_per_source=None,
+    build_after_wait=False,
 ):
     os.makedirs(bd_dir, exist_ok=True)
     lock_path = f"{bd_dir}/lock_{md_name}"
@@ -1020,8 +1066,22 @@ def build_module(
         opbd_dir = f"{op_dir}/build"
         src_dir = f"{op_dir}/build/srcs"
         os.makedirs(src_dir, exist_ok=True)
-        if os.path.exists(f"{get_user_jit_dir()}/{target_name}"):
-            os.remove(f"{get_user_jit_dir()}/{target_name}")
+
+        def raise_build_error(error):
+            tag = f"\033[31mfailed jit build [{md_name}]\033[0m"
+            logger.error(
+                f"{tag}\u2193\u2193\u2193\u2193\u2193\u2193\u2193\u2193\u2193\u2193\n-->[History]: {{}}{tag}\u2191\u2191\u2191\u2191\u2191\u2191\u2191\u2191\u2191\u2191".format(
+                    re.sub(
+                        "error:",
+                        "\033[31merror:\033[0m",
+                        "-->".join(traceback.format_exception(*sys.exc_info())),
+                        flags=re.IGNORECASE,
+                    ),
+                )
+            )
+            raise RuntimeError(
+                f"[aiter] build [{md_name}] under {opbd_dir} failed !!!!!!"
+            ) from error
 
         sources = rename_cpp_to_cu(srcs, src_dir, hipify)
 
@@ -1114,21 +1174,35 @@ def build_module(
         flags_hip = [el for el in flags_hip if hip_flag_checker(el)]
         check_and_set_ninja_worker()
 
-        def exec_blob(blob_gen_cmd, op_dir, src_dir, sources):
-            if blob_gen_cmd:
-                blob_dir = f"{op_dir}/blob/"
-                os.makedirs(blob_dir, exist_ok=True)
-                if AITER_LOG_MORE:
-                    logger.info(f"exec_blob ---> {PY} {blob_gen_cmd.format(blob_dir)}")
-                os.system(f"{PY} {blob_gen_cmd.format(blob_dir)}")
-                sources += rename_cpp_to_cu([blob_dir], src_dir, hipify, recursive=True)
-            return sources
-
-        if isinstance(blob_gen_cmd, list):
-            for s_blob_gen_cmd in blob_gen_cmd:
-                sources = exec_blob(s_blob_gen_cmd, op_dir, src_dir, sources)
-        else:
-            sources = exec_blob(blob_gen_cmd, op_dir, src_dir, sources)
+        blob_dir = f"{op_dir}/blob"
+        staged_blob_dir = None
+        staged_token = None
+        compiled_kids_snapshot = None
+        seed_files = None
+        if md_name == "module_deepgemm_opus":
+            seed_files = [
+                (
+                    f"{bd_dir}/compiled_kids_opus.json",
+                    "compiled_kids_opus.json",
+                )
+            ]
+        try:
+            sources, staged_blob_dir, staged_token = _stage_blob_sources(
+                blob_gen_cmd,
+                op_dir,
+                src_dir,
+                sources,
+                hipify,
+                seed_files=seed_files,
+            )
+            if staged_blob_dir is not None and md_name == "module_deepgemm_opus":
+                compiled_kids_snapshot = snapshot_compiled_kids(
+                    f"{staged_blob_dir}/compiled_kids_opus.json"
+                )
+                require_blob_generation(staged_blob_dir, staged_token)
+        except Exception as error:  # noqa: BLE001
+            raise_build_error(error)
+        active_blob_dir = staged_blob_dir or blob_dir
 
         extra_include_paths = []
 
@@ -1157,7 +1231,7 @@ def build_module(
                 _extra_inc = [p for p in extra_include if os.path.isdir(str(p))]
             extra_include_paths += [
                 f"{AITER_CSRC_DIR}/include",
-                f"{op_dir}/blob",
+                active_blob_dir,
             ] + _extra_inc
             if not is_standalone and not torch_exclude:
                 extra_include_paths += [f"{AITER_CSRC_DIR}/include/torch"]
@@ -1181,6 +1255,12 @@ def build_module(
                 )
 
         try:
+
+            def validate_generation():
+                if staged_blob_dir is not None:
+                    require_blob_generation(staged_blob_dir, staged_token)
+
+            validate_generation()
             _jit_compile(
                 md_name,
                 sorted(set(sources)),
@@ -1196,28 +1276,52 @@ def build_module(
                 torch_exclude=torch_exclude,
                 hipify=hipify,
                 extra_cuda_cflags_per_source=flags_extra_hip_per_source,
+                # We install a stable module name. Let Ninja check incremental
+                # dependencies and retry failures, not the Python loader cache.
+                use_versioner=False,
             )
+            validate_generation()
             if is_python_module and not is_standalone:
-                shutil.copy(f"{opbd_dir}/{target_name}", f"{get_user_jit_dir()}")
+                artifact_path = f"{get_user_jit_dir()}/{target_name}"
             else:
-                shutil.copy(
-                    f"{opbd_dir}/{target_name}", f"{AITER_ROOT_DIR}/op_tests/cpp/mha"
-                )
-        except Exception as e:
-            tag = f"\033[31mfailed jit build [{md_name}]\033[0m"
-            logger.error(
-                f"{tag}\u2193\u2193\u2193\u2193\u2193\u2193\u2193\u2193\u2193\u2193\n-->[History]: {{}}{tag}\u2191\u2191\u2191\u2191\u2191\u2191\u2191\u2191\u2191\u2191".format(
-                    re.sub(
-                        "error:",
-                        "\033[31merror:\033[0m",
-                        "-->".join(traceback.format_exception(*sys.exc_info())),
-                        flags=re.IGNORECASE,
-                    ),
-                )
+                artifact_path = f"{AITER_ROOT_DIR}/op_tests/cpp/mha/{target_name}"
+            installed_identity = atomic_copy(
+                f"{opbd_dir}/{target_name}",
+                artifact_path,
+                validate=validate_generation,
             )
-            raise RuntimeError(
-                f"[aiter] build [{md_name}] under {opbd_dir} failed !!!!!!"
-            ) from e
+        except Exception as error:  # noqa: BLE001
+            raise_build_error(error)
+
+        if staged_blob_dir is not None:
+            if md_name == "module_deepgemm_opus":
+                try:
+                    publish_compiled_kids(
+                        compiled_kids_snapshot,
+                        f"{bd_dir}/compiled_kids_opus.json",
+                        artifact_path,
+                        installed_identity,
+                    )
+                except Exception:
+                    # A stale receipt cannot validate the newly installed .so.
+                    # Do not make a successful build fail because of metadata.
+                    logger.warning(
+                        "JIT build [%s] succeeded, but publishing its compiled-kid "
+                        "metadata failed; the tuner will revalidate by rebuilding",
+                        md_name,
+                        exc_info=AITER_LOG_MORE > 0,
+                    )
+            try:
+                publish_blob_sources(
+                    staged_blob_dir, blob_dir, expected_token=staged_token
+                )
+            except Exception:
+                logger.warning(
+                    "JIT build [%s] succeeded, but publishing its generated-source "
+                    "cache failed; keeping the installed artifact",
+                    md_name,
+                    exc_info=AITER_LOG_MORE > 0,
+                )
 
     def FinalFunc():
         logger.info(
@@ -1225,7 +1329,12 @@ def build_module(
             f"\033[32mfinish build [{md_name}], cost {time.perf_counter() - startTS:.1f}s \033[0m"
         )
 
-    mp_lock(lockPath=lock_path, MainFunc=MainFunc, FinalFunc=FinalFunc)
+    mp_lock(
+        lockPath=lock_path,
+        MainFunc=MainFunc,
+        FinalFunc=FinalFunc,
+        build_after_wait=build_after_wait,
+    )
 
 
 def _get_ck_exclude_modules():
