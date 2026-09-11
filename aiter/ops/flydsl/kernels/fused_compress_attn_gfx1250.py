@@ -2155,9 +2155,7 @@ def hca_per_n_config_gfx1250(
     """
     if plan_capacity <= 32:
         return 32, 16
-    is_prefill = (
-        num_input_tokens is not None and num_input_tokens >= 16 * plan_capacity
-    )
+    is_prefill = num_input_tokens is not None and num_input_tokens >= 16 * plan_capacity
     if is_prefill:
         if plan_capacity <= 96:
             return 32, 8

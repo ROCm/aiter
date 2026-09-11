@@ -151,9 +151,7 @@ def _build_compress_forward_kernel(
         ratio % k_split_num_waves == 0
     ), f"K={ratio} must divide evenly across {k_split_num_waves} waves"
     assert state_size >= ratio, f"state_size={state_size} must be >= K={ratio}"
-    assert (
-        not fuse_epilogue or epi_cfg is not None
-    ), "fuse_epilogue requires epi_cfg"
+    assert not fuse_epilogue or epi_cfg is not None, "fuse_epilogue requires epi_cfg"
     D = head_dim
     K = ratio
     DIM_FULL = D
@@ -938,7 +936,7 @@ def _emit_norm_rope_scatter(
         rms_weight_is_bf16,
         rms_eps,
         quant,
-        GROUP_SIZE_Q,
+        _GROUP_SIZE_Q,  # only reaches the ISA through RTS / log2_rts below
         RTS,
         log2_rts,
     ) = cfg
@@ -982,25 +980,19 @@ def _emit_norm_rope_scatter(
         # logical shift (tid_x_vec >= 0); fx Int32 >> is arithmetic.
         off_dw = fx.Int32((fx.Uint32(tid_x_vec.ir_value()) >> 1).ir_value())
         if const_expr(dwords == 1):
-            raw_s = buffer_ops.buffer_load(
-                rmsw_rsrc, off_dw, vec_width=1, dtype=i32
-            )
+            raw_s = buffer_ops.buffer_load(rmsw_rsrc, off_dw, vec_width=1, dtype=i32)
             raw = fx.Vector.from_elements([raw_s], dtype=fx.Int32)
             vec_bf16 = raw.bitcast(fx.BFloat16)
             rmsw_lane = [
-                vec_bf16[i].to(fx.Float32).ir_value()
-                for i in range_constexpr(VEC)
+                vec_bf16[i].to(fx.Float32).ir_value() for i in range_constexpr(VEC)
             ]
         elif const_expr(dwords <= 4):
             raw = fx.Vector(
-                buffer_ops.buffer_load(
-                    rmsw_rsrc, off_dw, vec_width=dwords, dtype=i32
-                )
+                buffer_ops.buffer_load(rmsw_rsrc, off_dw, vec_width=dwords, dtype=i32)
             )
             vec_bf16 = raw.bitcast(fx.BFloat16)
             rmsw_lane = [
-                vec_bf16[i].to(fx.Float32).ir_value()
-                for i in range_constexpr(VEC)
+                vec_bf16[i].to(fx.Float32).ir_value() for i in range_constexpr(VEC)
             ]
         else:
             # dwords > 4 (VEC=16 -> dwords=8): split into 2x dwordx4
@@ -1022,9 +1014,7 @@ def _emit_norm_rope_scatter(
     else:
         if const_expr(VEC <= 4):
             raw = fx.Vector(
-                buffer_ops.buffer_load(
-                    rmsw_rsrc, tid_x_vec, vec_width=VEC, dtype=f32
-                )
+                buffer_ops.buffer_load(rmsw_rsrc, tid_x_vec, vec_width=VEC, dtype=f32)
             )
             rmsw_lane = [raw[i].ir_value() for i in range(VEC)]
         else:
@@ -1093,12 +1083,10 @@ def _emit_norm_rope_scatter(
             )
         )
         cos_vals = [
-            cos_vec[i].to(fx.Float32).ir_value()
-            for i in range(PAIRS_PER_THREAD)
+            cos_vec[i].to(fx.Float32).ir_value() for i in range(PAIRS_PER_THREAD)
         ]
         sin_vals = [
-            sin_vec[i].to(fx.Float32).ir_value()
-            for i in range(PAIRS_PER_THREAD)
+            sin_vec[i].to(fx.Float32).ir_value() for i in range(PAIRS_PER_THREAD)
         ]
 
     rotated_lane = list(normed_lane)
@@ -1125,19 +1113,11 @@ def _emit_norm_rope_scatter(
     # -- Paged scatter dest (shared by bf16 / fp8) --
     # position >= 0 (active guard) -> unsigned div/rem (divui/remui).
     ci = fx.Int32((fx.Uint32(position) // ratio).ir_value())
-    block_in_seq = fx.Int32(
-        (fx.Uint32(ci.ir_value()) // k_per_block).ir_value()
-    )
-    slot_in_block = fx.Int32(
-        (fx.Uint32(ci.ir_value()) % k_per_block).ir_value()
-    )
+    block_in_seq = fx.Int32((fx.Uint32(ci.ir_value()) // k_per_block).ir_value())
+    slot_in_block = fx.Int32((fx.Uint32(ci.ir_value()) % k_per_block).ir_value())
     bt_rsrc = buffer_ops.create_buffer_resource(block_table, max_size=True)
-    bt_off = (
-        fx.Int32(batch_id) * fx.Int32(block_table_seq_stride) + block_in_seq
-    )
-    physical_block = buffer_ops.buffer_load(
-        bt_rsrc, bt_off, vec_width=1, dtype=i32
-    )
+    bt_off = fx.Int32(batch_id) * fx.Int32(block_table_seq_stride) + block_in_seq
+    physical_block = buffer_ops.buffer_load(bt_rsrc, bt_off, vec_width=1, dtype=i32)
     # The block term rides on the descriptor's base, not on the
     # 32-bit offset -- see `block_base_bytes_i64`.
     cache_base = slot_in_block * fx.Int32(kv_cache_token_stride)
@@ -1161,14 +1141,10 @@ def _emit_norm_rope_scatter(
             is_rope_t=is_rope_t,
             cache_base=cache_base.ir_value(),
             out_base_i64=fx.Int64(fx.ptrtoint(fx.get_iter(kv_cache)))
-            + fx.Int64(
-                block_base_bytes_i64(physical_block, kv_cache_block_stride, 1)
-            ),
+            + fx.Int64(block_base_bytes_i64(physical_block, kv_cache_block_stride, 1)),
             krope_base=_krope_base.ir_value(),
             krope_base_i64=fx.Int64(fx.ptrtoint(fx.get_iter(k_rope_buff)))
-            + fx.Int64(
-                block_base_bytes_i64(physical_block, krope_block_stride, 2)
-            ),
+            + fx.Int64(block_base_bytes_i64(physical_block, krope_block_stride, 2)),
             VEC=VEC,
             NOPE=NOPE,
             RTS=RTS,
@@ -1187,19 +1163,13 @@ def _emit_norm_rope_scatter(
         raw_vec = fx.Vector.from_elements(out_lane, dtype=fx.Float32)
         bf16_vec = raw_vec.truncf(out_vec_t)
         # logical shift (cache_off >= 0); fx Int32 >> is arithmetic.
-        cache_off_dw = fx.Int32(
-            (fx.Uint32(cache_off.ir_value()) >> 1).ir_value()
-        )
+        cache_off_dw = fx.Int32((fx.Uint32(cache_off.ir_value()) >> 1).ir_value())
         dwords = (VEC + 1) // 2
         bf16_as_i32 = bf16_vec.bitcast(fx.Int32)
         if const_expr(dwords == 1):
-            buffer_ops.buffer_store(
-                bf16_as_i32[0].ir_value(), out_rsrc, cache_off_dw
-            )
+            buffer_ops.buffer_store(bf16_as_i32[0].ir_value(), out_rsrc, cache_off_dw)
         elif const_expr(dwords <= 4):
-            buffer_ops.buffer_store(
-                bf16_as_i32.ir_value(), out_rsrc, cache_off_dw
-            )
+            buffer_ops.buffer_store(bf16_as_i32.ir_value(), out_rsrc, cache_off_dw)
         else:
             # dwords > 4 (VEC=16 -> dwords=8): split into 2x dwordx4.
             lo = fx.Vector.from_elements(
@@ -1338,6 +1308,7 @@ def _build_norm_rope_scatter_kernel(
                 krope_block_stride=krope_block_stride,
                 krope_token_stride=krope_token_stride,
             )
+
         if fx.Int32(position) >= 0:
             _body()
 
