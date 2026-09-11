@@ -435,6 +435,12 @@ def audit_auto(samples, slack: float, verbose: bool) -> int:
     only thing that asks whether the table, once compiled into engines and
     driven through the real dispatch path, still lands where the fit said.
 
+    The sweep this reads from must have been run with
+    ``--fly-accuracy fast`` (the bench's default): under ``exact`` mode
+    ``fly_auto`` never reaches the mesh/ring rungs, so it would only ever be
+    compared against the one-shot family and this audit would say nothing
+    about the two levels of heuristic it exists to check.
+
     Graded against the best pinned variant of *any* family, not just the family
     the policy chose, so a wrong family choice is caught as well as a wrong
     rung. Its own SQNR is not checked here -- the benchmark already asserts that
@@ -582,10 +588,10 @@ def main():
         "--audit-auto",
         action="store_true",
         help="instead of fitting, grade the `fly_auto` rows -- the shipped\n"
-        "dispatcher -- against the best pinned row at every shape, and exit\n"
-        "non-zero if any exceeds --ladder-slack. This is the end-to-end\n"
-        "acceptance test for the tables; run it on a sweep that includes\n"
-        "-c fly_auto alongside the pinned rows.",
+        "dispatcher, forced to accuracy=fast -- against the best pinned row at\n"
+        "every shape, and exit non-zero if any exceeds --ladder-slack. This is\n"
+        "the end-to-end acceptance test for the tables; run it on a sweep that\n"
+        "includes -c fly_auto alongside the pinned rows.",
     )
     ap.add_argument("--verbose", action="store_true", help="per-shape regret detail")
     args = ap.parse_args()

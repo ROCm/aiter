@@ -272,6 +272,16 @@ except Exception:  # noqa: BLE001
 # requires enabling it.
 _FLY_ENV = "AITER_FLY_AR"
 
+# AITER_FLY_AR_ACCURACY defaults to "exact", which never opens the mesh/ring
+# window at all -- past oneshot_max_exact the policy has no window and
+# should_fly_all_reduce simply declines the payload. `fly_auto`'s mode is a
+# bench CLI flag (--fly-accuracy, default "fast") rather than whatever the
+# launching shell happens to export, so a report's accuracy regime is always
+# what its own command line says.
+_FLY_ACCURACY_ENV = "AITER_FLY_AR_ACCURACY"
+_FLY_ACCURACY_CHOICES = ("fast", "exact")
+_FLY_ACCURACY_DEFAULT = "fast"
+
 
 def _peer_link_type() -> str:
     """GPU-to-GPU link type for the provenance header.
@@ -514,14 +524,20 @@ CANDIDATES = (
         rs_codec="int6",
         ag_codec="int4",
     ),
-    # Production dispatch: FlyDSLAllReduce picking a family per payload size,
-    # i.e. what a model actually gets with AITER_FLY_AR=1. The acceptance test
-    # for the whole heuristic -- it must stay within ~10% of the best pinned row
-    # at every shape, which is what `fit_allreduce_policy.py --audit-auto`
-    # checks. Its accuracy floor has to be the *quantized* one even though it is
-    # bit-exact at decode sizes: one row spans both accuracy classes because the
+    # Production dispatch: FlyDSLAllReduce picking a family per payload size.
+    # Its accuracy mode is the bench's own --fly-accuracy flag (default
+    # "fast", see `_FLY_ACCURACY_ENV`), not whatever AITER_FLY_AR_ACCURACY the
+    # launching shell happens to export -- at the shipped default of
+    # accuracy=exact this row's window is capped at oneshot_max_exact and the
+    # mesh/ring rungs are never reached at all (see allreduce_policy.resolve).
+    # The acceptance test for the whole heuristic -- it must stay within ~10%
+    # of the best pinned row at every shape, which is what
+    # `fit_allreduce_policy.py --audit-auto` checks (run with --fly-accuracy
+    # fast to exercise the full three-family policy). Its accuracy floor has
+    # to be the *quantized* one even in fast mode even though it is bit-exact
+    # at decode sizes: one row spans both accuracy classes because the
     # schedule changes underneath it, which is exactly the thing being tested.
-    Candidate("fly_auto", "flyauto", 14.0, False),  # 55 at decode / 18.7 at prefill
+    Candidate("fly_auto", "flyauto", 14.0, False),  # 55 at decode / 18.7 at prefill (fast)
     Candidate("rccl", "rccl", 40.0, True),  # 51 / 69
 )
 CANDIDATE_KEYS = [c.key for c in CANDIDATES]
@@ -1194,7 +1210,8 @@ def _worker(
     # Production dispatch, built last so its three internal engines exchange
     # handles after every pinned one -- the exchange is a collective and the
     # order has to match across ranks. It self-disables unless AITER_FLY_AR is
-    # set, which main() does when this row is in the sweep.
+    # set, which main() does when this row is in the sweep, alongside
+    # AITER_FLY_AR_ACCURACY from --fly-accuracy.
     flyauto = None
     if (
         any(c.family == "flyauto" and c.key in keys for c in CANDIDATES)
@@ -2095,6 +2112,17 @@ def main():
         default=None,
         help="restrict the candidate set (default: everything applicable)",
     )
+    parser.add_argument(
+        "--fly-accuracy",
+        choices=_FLY_ACCURACY_CHOICES,
+        default=_FLY_ACCURACY_DEFAULT,
+        help="AITER_FLY_AR_ACCURACY for the `fly_auto` row (ignored if it is\n"
+        "not in the sweep). 'fast' (default) opens the mesh/ring window past\n"
+        "the one-shot ceiling, so the row exercises the full three-family\n"
+        "policy at every shape. 'exact' matches the shipped production\n"
+        "default: only the one-shot is ever reachable, and `fly_auto` reads\n"
+        "n/a above oneshot_max_exact rather than quantizing.",
+    )
     parser.add_argument("--iters", type=int, default=101, help="timed iterations")
     parser.add_argument("--warmup", type=int, default=5, help="warmup iterations")
     parser.add_argument(
@@ -2256,6 +2284,10 @@ def main():
         # children inherit it. Unlike _QR_ENV this does not change `prod path`,
         # which reports the custom-AR/quick-reduce dispatch only.
         os.environ[_FLY_ENV] = "1"
+        # --fly-accuracy, not whatever accuracy mode the launching shell
+        # happens to have exported -- a report's accuracy regime should be
+        # exactly what its own command line says.
+        os.environ[_FLY_ACCURACY_ENV] = args.fly_accuracy
     prod_regime = os.environ.get(_QR_ENV)
     if any(c.family == "qr" for c in CANDIDATES if c.key in keys):
         os.environ[_QR_ENV] = _QR_ENABLING_REGIME
