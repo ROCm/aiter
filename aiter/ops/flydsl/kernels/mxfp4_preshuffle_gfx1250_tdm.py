@@ -221,9 +221,7 @@ def launch_gemm_a8w4_tdm(
     C_STORE_B = ((tile_m * (tile_n + store_pad) * 2 + 127) // 128) * 128
     AS_FULL_OFF = num_buffers * PITCH
     AS_FULL_B = ((AS_SUPERS * AS_FULL_INNER * 4 + 127) // 128) * 128
-    ARENA_B = max(
-        AS_FULL_OFF + (AS_FULL_B if tdm_as_in_prologue else 0), C_STORE_B
-    )
+    ARENA_B = max(AS_FULL_OFF + (AS_FULL_B if tdm_as_in_prologue else 0), C_STORE_B)
 
     # Quant epilogue compile-time constants.
     QUANT_ROWS_PER_TILE = quant_wmma_rep * 16
@@ -712,12 +710,7 @@ def launch_gemm_a8w4_tdm(
             off = (ksl * wmma_m_rep + sm * 2) * 16 * 4
             if const_expr(tdm_as_in_prologue):
                 as_base = ptr_to_idx(base_ptr) + AS_FULL_OFF
-                off = (
-                    off
-                    + wave_m * AS_FULL_INNER * 4
-                    + sa_lane * 4
-                    + kt * AS_INNER * 4
-                )
+                off = off + wave_m * AS_FULL_INNER * 4 + sa_lane * 4 + kt * AS_INNER * 4
                 return lds_load_b32(as_base, fx.Int32(off))[0]
             if const_expr(row_major_ascale):
                 off = (sm * SA_ROWS_PER_LOAD * SA_KDW + ksl) * 4
@@ -836,9 +829,7 @@ def launch_gemm_a8w4_tdm(
         def load_state(slot, buf, ksl, kt):
             """Load one k128 of ``buf``'s A/B/scales into ``slot``."""
             sb_v = [load_sb(buf, sn, ksl) for sn in range_constexpr(sb_pairs)]
-            sa_v = [
-                load_sa(buf, sm, ksl, kt) for sm in range_constexpr(sa_pairs)
-            ]
+            sa_v = [load_sa(buf, sm, ksl, kt) for sm in range_constexpr(sa_pairs)]
             slot.sb.store(Vec.from_elements(sb_v + sb_v[: SB_WIDTH - sb_pairs]))
             slot.sa.store(Vec.from_elements(sa_v + sa_v[: SA_WIDTH - sa_pairs]))
             for wn in range_constexpr(wmma_n_rep):
