@@ -28,7 +28,8 @@ spot-check when the hot loop or wait/reduce path changed.
 - [x] 3. `atomic_add_f32` without hardcoded LLVM address space
 - [x] 4. Single definition path for `const_expr` if/else
 - [ ] 5. Buffer views + layouts for *unpacked* tensors only
-- [ ] Follow-on: preshuffled pack, still `v_dot2` (not this track)
+- [ ] Follow-on: preshuffled pack, still `v_dot2` — living plan:
+      `SILOTIGER-667-plan-preshuffled-weights.md` (not this track)
 
 ## Locked decisions
 
@@ -153,29 +154,6 @@ for a mandatory packed-dword swizzle.
 
 ## Follow-on (not this track): preshuffled pack, still `v_dot2`
 
-After 1–5, optionally make warp-decode **consume the same preshuffled weight
-buffer** as the MFMA MoE kernels (`mxmoe_gemm_v2` / a16w-mix `make_preshuffle_b_layout`).
-
-**Chosen mapping**
-
-- [ ] Layout of the **pack**: `fx.make_view` + `fx.make_layout` over **i32 (or byte)
-      kpack** modes (`klane`, `nlane`, K-tile, kpack, …), then `make_buffer_tensor`
-      / `fx.copy` of dword tiles — the same contract as tiled-MMA B, not a
-      `Float8`/`Float4` element grid.
-- [ ] **New lane→kpack map:** wave 64 still owns one (or `kh_per_warp`) output
-      scalar(s); each lane’s K-chunk is gathered from preshuffle slots instead of
-      a K-contiguous row (`w_row * (H//4) + k_base//4`).
-- [ ] **Compute stays `v_dot2`** (`cvt_scalef32_pk_bf16_{fp8,fp4}` + G7 drain). Do
-      not switch to `fx.gemm` / scaled MFMA in this follow-on (small-M padding is
-      still the ticket’s reason to avoid matrix cores).
-
-**Still out of scope even then**
-
-- Unpacked e4m3/e2m1 global layouts.
-- Requiring activations to be preshuffled; only **weights** need the shared B
-  layout unless a later decision says otherwise.
-
-- [ ] **Done when (follow-on):** warp-decode matches today’s numerics on the
-      preshuffled buffer the MFMA path already uses (no extra unpack staging);
-      op_test covers both the current K-contiguous path (until retired) and the
-      preshuffled path; one FP8 and one MXFP4 decode bench spot-check.
+Moved to **`SILOTIGER-667-plan-preshuffled-weights.md`**: opt-in
+`k_contiguous` vs `preshuffled` B, same `v_dot2` math. Do not track
+preshuffled-weight checkboxes here.

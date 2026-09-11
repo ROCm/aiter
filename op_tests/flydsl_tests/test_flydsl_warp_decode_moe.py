@@ -184,6 +184,7 @@ def test_butterfly_reduce():
 # Phase 2 -- gate_up FP8 fast path (BF16 activation, FP8 e4m3 weights)
 # -------------------------------------------------------------------------
 from aiter.ops.flydsl.warp_decode_moe import (  # noqa: E402
+    WeightLayout,
     flydsl_warp_decode_down_reduce,
     flydsl_warp_decode_gate_up,
     flydsl_warp_decode_gate_up_fp8act,
@@ -1101,6 +1102,42 @@ def test_combined_moe_rejects_stage_out_kwargs():
             weights,
             gate_up_kwargs={"out": torch.empty_like(ids)},
         )
+
+
+def test_combined_moe_rejects_stage_weight_layout_kwargs():
+    """The combined wrapper owns weight_layout for both stages."""
+    x = torch.empty((1, 512), dtype=torch.bfloat16, device="cuda")
+    w = torch.empty((1, 512, 512), dtype=torch.bfloat16, device="cuda")
+    ids = torch.zeros((1, 1), dtype=torch.int32, device="cuda")
+    weights = torch.ones((1, 1), dtype=torch.float32, device="cuda")
+    with pytest.raises(ValueError, match="weight_layout="):
+        flydsl_warp_decode_moe(
+            x,
+            w,
+            w,
+            w,
+            ids,
+            weights,
+            gate_up_kwargs={"weight_layout": "k_contiguous"},
+        )
+
+
+def test_weight_layout_rejects_preshuffled_and_unknown():
+    """preshuffled is opt-in but unimplemented until later subtasks."""
+    x = torch.empty((1, 512), dtype=torch.bfloat16, device="cuda")
+    w = torch.empty((1, 512, 512), dtype=torch.bfloat16, device="cuda")
+    ids = torch.zeros((1, 1), dtype=torch.int32, device="cuda")
+    weights = torch.ones((1, 1), dtype=torch.float32, device="cuda")
+    with pytest.raises(ValueError, match="not implemented yet"):
+        flydsl_warp_decode_moe(x, w, w, w, ids, weights, weight_layout="preshuffled")
+    with pytest.raises(ValueError, match="not implemented yet"):
+        flydsl_warp_decode_moe(
+            x, w, w, w, ids, weights, weight_layout=WeightLayout.PRESHUFFLED
+        )
+    with pytest.raises(ValueError, match="not implemented yet"):
+        flydsl_warp_decode_gate_up(x, w, w, ids, w, w, weight_layout="preshuffled")
+    with pytest.raises(ValueError, match="unsupported weight_layout"):
+        flydsl_warp_decode_moe(x, w, w, w, ids, weights, weight_layout="logical")
 
 
 # -------------------------------------------------------------------------

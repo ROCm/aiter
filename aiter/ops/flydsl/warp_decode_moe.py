@@ -15,6 +15,7 @@ weights, PerTensor / PerToken weight scales).
 from __future__ import annotations
 
 import functools
+from enum import Enum
 
 import torch
 
@@ -30,6 +31,37 @@ from aiter.ops.flydsl.kernels.warp_decode_moe import (
     build_gate_up_fp8_module,
     pick_kvector,
 )
+
+
+class WeightLayout(str, Enum):
+    """How warp-decode MoE weights are stored in global memory.
+
+    K_CONTIGUOUS: staged ``[E, N, K]`` (or packed along K). Default.
+    PRESHUFFLED: fused-MoE B from ``shuffle_weight`` / ``make_preshuffle_b_layout``.
+    """
+
+    K_CONTIGUOUS = "k_contiguous"
+    PRESHUFFLED = "preshuffled"
+
+
+def _require_supported_weight_layout(
+    weight_layout: str | WeightLayout,
+) -> WeightLayout:
+    """Accept only an explicit layout flag; never infer from strides."""
+    try:
+        layout = WeightLayout(weight_layout)
+    except ValueError as error:
+        raise ValueError(
+            f"unsupported weight_layout: {weight_layout!r} "
+            f"(expected {WeightLayout.K_CONTIGUOUS.value!r} or "
+            f"{WeightLayout.PRESHUFFLED.value!r})"
+        ) from error
+    if layout is WeightLayout.PRESHUFFLED:
+        raise ValueError(
+            "weight_layout='preshuffled' is not implemented yet; "
+            f"use weight_layout={WeightLayout.K_CONTIGUOUS.value!r}"
+        )
+    return layout
 
 
 def _default_use_dot2() -> bool:
@@ -252,6 +284,7 @@ def flydsl_warp_decode_gate_up(
     scale_block: tuple[int, int] | None = None,
     serialize_dot2: bool = True,
     dot2_acc: int = 1,
+    weight_layout: str | WeightLayout = WeightLayout.K_CONTIGUOUS,
     out: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """gate_up stage of warp-decode MoE (BF16 activation, FP8 e4m3 weights).
@@ -265,7 +298,8 @@ def flydsl_warp_decode_gate_up(
 
     Args:
         x:            [B, HIDDEN] bfloat16 (row-major, contiguous).
-        w_gate/w_up:  [E, INTER, HIDDEN] float8_e4m3fn (row = e*INTER + j).
+        w_gate/w_up:  [E, INTER, HIDDEN] float8_e4m3fn (row = e*INTER + j)
+            when ``weight_layout='k_contiguous'``.
         router_ids:   [B, TOPK] int32.
         w_gate_scale/w_up_scale: float32 weight scales.  ``pertensor`` -> shape
             [1]; ``pertoken`` -> shape [E*INTER] (one per weight row);
@@ -276,11 +310,14 @@ def flydsl_warp_decode_gate_up(
         dot2_acc:     G7 dot2 ILP -- number of independent f32 accumulators for the
                       s_nop-free multi-accumulator dot2 (>1 enables the drain form;
                       1 = serialized ``s_nop 2`` baseline). Correctness-invariant.
+        weight_layout: ``k_contiguous`` (default) or ``preshuffled`` (fused-MoE B;
+            not implemented yet). Never inferred from strides.
         out:          optional [B, TOPK, INTER] bfloat16 output buffer.
 
     Returns:
         [B, TOPK, INTER] bfloat16 intermediate.
     """
+    weight_layout = _require_supported_weight_layout(weight_layout)
     if w_scale_mode not in ("pertensor", "pertoken", "block2d"):
         raise ValueError(f"unsupported w_scale_mode: {w_scale_mode!r}")
     assert x.dtype == torch.bfloat16, "activation must be bfloat16 for this path"
@@ -344,6 +381,7 @@ def flydsl_warp_decode_gate_up_fp8act(
     scale_block: tuple[int, int] = (128, 128),
     x_scale_bk: int = 128,
     serialize_dot2: bool = True,
+    weight_layout: str | WeightLayout = WeightLayout.K_CONTIGUOUS,
     out: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """gate_up stage with **FP8 activation** x FP8 weights (CK ``gate_fp8_d2`` peer).
@@ -355,7 +393,8 @@ def flydsl_warp_decode_gate_up_fp8act(
 
     Args:
         x:            [B, HIDDEN] float8_e4m3fn (row-major, contiguous).
-        w_gate/w_up:  [E, INTER, HIDDEN] float8_e4m3fn (row = e*INTER + j).
+        w_gate/w_up:  [E, INTER, HIDDEN] float8_e4m3fn (row = e*INTER + j)
+            when ``weight_layout='k_contiguous'``.
         router_ids:   [B, TOPK] int32.
         x_scale:      float32 activation scale, shape [B * HIDDEN//x_scale_bk]
             row-major over (token, K-block) -- Block2D<1, x_scale_bk>.
@@ -363,11 +402,14 @@ def flydsl_warp_decode_gate_up_fp8act(
             [(E*INTER)//BN * HIDDEN//BK] over (row-block, K-block).
         scale_block:  (BN, BK) weight-scale block dims (default (128,128)).
         x_scale_bk:   activation-scale K-block (default 128, CK ``kBXK``).
+        weight_layout: ``k_contiguous`` (default) or ``preshuffled`` (fused-MoE B;
+            not implemented yet). Never inferred from strides.
         out:          optional [B, TOPK, INTER] bfloat16 output buffer.
 
     Returns:
         [B, TOPK, INTER] bfloat16 intermediate.
     """
+    weight_layout = _require_supported_weight_layout(weight_layout)
     assert x.dtype == torch.float8_e4m3fn, "activation must be float8_e4m3fn"
     assert x.is_contiguous() and w_gate.is_contiguous() and w_up.is_contiguous()
     assert w_up.shape == w_gate.shape, "w_gate and w_up must share shape"
@@ -421,6 +463,7 @@ def flydsl_warp_decode_gate_up_fp4(
     serialize_dot2: bool = True,
     dot2_acc: int = 1,
     kvector: int | None = None,
+    weight_layout: str | WeightLayout = WeightLayout.K_CONTIGUOUS,
     out: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """gate_up stage with **MXFP4** weights (BF16 activation, FP4 e2m1 + E8M0).
@@ -432,8 +475,8 @@ def flydsl_warp_decode_gate_up_fp4(
     Args:
         x:            [B, HIDDEN] bfloat16 (row-major, contiguous).
         w_gate/w_up:  MXFP4 weights for [E, INTER, HIDDEN], packed 2 FP4/byte:
-            ``uint8`` [E, INTER, HIDDEN//2] (row = e*INTER + j). Logical HIDDEN
-            is taken from ``x``.
+            ``uint8`` [E, INTER, HIDDEN//2] (row = e*INTER + j) when
+            ``weight_layout='k_contiguous'``. Unpacked HIDDEN is taken from ``x``.
         router_ids:   [B, TOPK] int32.
         w_gate_scale/w_up_scale: ``uint8`` E8M0 block scales, each
             [(E*INTER)//BN, HIDDEN//BK] row-major over (weight-row-block, K-block),
@@ -445,11 +488,14 @@ def flydsl_warp_decode_gate_up_fp4(
             occupancy-bound); ``>1`` enables the s_nop-free ILP path (see builder).
         kvector:      elements/lane/iter; ``None`` auto-picks the largest that tiles
             HIDDEN (32/16/8, see :func:`pick_kvector_fp4`). Override for A/B.
+        weight_layout: ``k_contiguous`` (default) or ``preshuffled`` (fused-MoE B;
+            not implemented yet). Never inferred from strides.
         out:          optional [B, TOPK, INTER] bfloat16 output buffer.
 
     Returns:
         [B, TOPK, INTER] bfloat16 intermediate.
     """
+    weight_layout = _require_supported_weight_layout(weight_layout)
     assert x.dtype == torch.bfloat16, "activation must be bfloat16 for this path"
     assert x.is_contiguous() and w_gate.is_contiguous() and w_up.is_contiguous()
     assert w_gate.shape == w_up.shape, "w_gate and w_up must share shape"
@@ -504,6 +550,7 @@ def flydsl_warp_decode_down_reduce(
     kh_per_warp: int | None = None,
     split_k: int | str = 1,
     dot2_acc: int = 1,
+    weight_layout: str | WeightLayout = WeightLayout.K_CONTIGUOUS,
     out: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """down_reduce stage of warp-decode MoE (BF16 intermediate, FP8 e4m3 weights).
@@ -517,7 +564,8 @@ def flydsl_warp_decode_down_reduce(
 
     Args:
         intermediate: [B, TOPK, INTER] bfloat16 (row = b*TOPK + k, contiguous).
-        w_down:       [E, HIDDEN, INTER] float8_e4m3fn (row = e*HIDDEN + out_j).
+        w_down:       [E, HIDDEN, INTER] float8_e4m3fn (row = e*HIDDEN + out_j)
+            when ``weight_layout='k_contiguous'``.
         router_ids:   [B, TOPK] int32.
         router_wts:   [B, TOPK] float32 (normalized to sum 1 per token).
         w_down_scale: float32 weight scales.  ``pertensor`` -> [1];
@@ -537,11 +585,14 @@ def flydsl_warp_decode_down_reduce(
         dot2_acc:     G7 dot2 ILP -- number of independent f32 accumulators for the
             s_nop-free multi-accumulator dot2 (>1 enables the drain form; 1 =
             serialized ``s_nop 2`` baseline). Correctness-invariant.
+        weight_layout: ``k_contiguous`` (default) or ``preshuffled`` (fused-MoE B;
+            not implemented yet). Never inferred from strides.
         out:          optional [B, HIDDEN] bfloat16 output buffer.
 
     Returns:
         [B, HIDDEN] bfloat16 output.
     """
+    weight_layout = _require_supported_weight_layout(weight_layout)
     if w_scale_mode not in ("pertensor", "pertoken", "block2d"):
         raise ValueError(f"unsupported w_scale_mode: {w_scale_mode!r}")
     assert intermediate.dtype == torch.bfloat16, "intermediate must be bfloat16"
@@ -620,6 +671,7 @@ def flydsl_warp_decode_gate_up_bf16(
     *,
     serialize_dot2: bool = True,
     use_dot2: bool | None = None,
+    weight_layout: str | WeightLayout = WeightLayout.K_CONTIGUOUS,
     out: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """gate_up stage with **BF16 weights** (unquantized oracle; no scales).
@@ -631,17 +683,21 @@ def flydsl_warp_decode_gate_up_bf16(
 
     Args:
         x:            [B, HIDDEN] bfloat16.
-        w_gate/w_up:  [E, INTER, HIDDEN] bfloat16 (row = e*INTER + j).
+        w_gate/w_up:  [E, INTER, HIDDEN] bfloat16 (row = e*INTER + j)
+            when ``weight_layout='k_contiguous'``.
         router_ids:   [B, TOPK] int32.
         use_dot2:     force the compute path -- ``True`` uses ``v_dot2_f32_bf16`` (gfx950),
                       ``False`` the arch-agnostic scalar-f32 fallback (gfx942 path),
                       ``None`` auto-selects by arch. Forced ``False`` on gfx950 validates
                       the fallback math against the dot2 path.
+        weight_layout: ``k_contiguous`` (default) or ``preshuffled`` (fused-MoE B;
+            not implemented yet). Never inferred from strides.
         out:          optional [B, TOPK, INTER] bfloat16 output buffer.
 
     Returns:
         [B, TOPK, INTER] bfloat16 intermediate.
     """
+    weight_layout = _require_supported_weight_layout(weight_layout)
     assert x.dtype == torch.bfloat16, "activation must be bfloat16"
     assert w_gate.dtype == torch.bfloat16, "w_gate must be bfloat16 for this path"
     assert w_up.dtype == torch.bfloat16, "w_up must be bfloat16 for this path"
@@ -683,6 +739,7 @@ def flydsl_warp_decode_down_reduce_bf16(
     kh_per_warp: int | None = None,
     serialize_dot2: bool = True,
     use_dot2: bool | None = None,
+    weight_layout: str | WeightLayout = WeightLayout.K_CONTIGUOUS,
     out: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """down_reduce stage with **BF16 weights** (unquantized oracle; no scales).
@@ -692,7 +749,8 @@ def flydsl_warp_decode_down_reduce_bf16(
 
     Args:
         intermediate: [B, TOPK, INTER] bfloat16 (row = b*TOPK + k).
-        w_down:       [E, HIDDEN, INTER] bfloat16 (row = e*HIDDEN + out_j).
+        w_down:       [E, HIDDEN, INTER] bfloat16 (row = e*HIDDEN + out_j)
+            when ``weight_layout='k_contiguous'``.
         router_ids:   [B, TOPK] int32.
         router_wts:   [B, TOPK] float32 (normalized to sum 1 per token).
         kh_per_warp:  outputs per wave (defaults to 2 when HIDDEN is even, else 1).
@@ -700,11 +758,14 @@ def flydsl_warp_decode_down_reduce_bf16(
                       ``False`` the arch-agnostic scalar-f32 fallback (gfx942 path),
                       ``None`` auto-selects by arch. Forced ``False`` on gfx950 validates
                       the fallback math against the dot2 path.
+        weight_layout: ``k_contiguous`` (default) or ``preshuffled`` (fused-MoE B;
+            not implemented yet). Never inferred from strides.
         out:          optional [B, HIDDEN] bfloat16 output buffer.
 
     Returns:
         [B, HIDDEN] bfloat16 output.
     """
+    weight_layout = _require_supported_weight_layout(weight_layout)
     assert intermediate.dtype == torch.bfloat16, "intermediate must be bfloat16"
     assert w_down.dtype == torch.bfloat16, "w_down must be bfloat16 for this path"
     assert intermediate.is_contiguous() and w_down.is_contiguous()
@@ -755,6 +816,7 @@ def flydsl_warp_decode_down_reduce_fp4(
     dot2_acc: int = 4,
     kvector: int | None = None,
     prefetch: bool = False,
+    weight_layout: str | WeightLayout = WeightLayout.K_CONTIGUOUS,
     out: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """down_reduce stage with **MXFP4** weights (BF16 intermediate, FP4 e2m1 + E8M0).
@@ -767,8 +829,9 @@ def flydsl_warp_decode_down_reduce_fp4(
         intermediate: [B, TOPK, INTER] bfloat16 (row = b*TOPK + k, contiguous).
         w_down:       MXFP4 weights for [E, HIDDEN, INTER], packed 2 FP4/byte:
             a ``uint8`` tensor of [E, HIDDEN, INTER//2] (or any contiguous view
-            with that many bytes; row = e*HIDDEN + out_j). Logical INTER is taken
-            from ``intermediate``.
+            with that many bytes; row = e*HIDDEN + out_j) when
+            ``weight_layout='k_contiguous'``. Unpacked INTER is taken from
+            ``intermediate``.
         router_ids:   [B, TOPK] int32.
         router_wts:   [B, TOPK] float32 (normalized to sum 1 per token).
         w_down_scale: ``uint8`` E8M0 block scales, [(E*HIDDEN)//BN, INTER//BK]
@@ -781,11 +844,14 @@ def flydsl_warp_decode_down_reduce_fp4(
             INTER (32/16/8, see :func:`pick_kvector_fp4`). Override for A/B.
         prefetch:     G8 software prefetch -- hoist all weight/scale loads ahead of
             the converts (default off; A/B lever for B=1 cold-HBM).
+        weight_layout: ``k_contiguous`` (default) or ``preshuffled`` (fused-MoE B;
+            not implemented yet). Never inferred from strides.
         out:          optional [B, HIDDEN] bfloat16 output buffer.
 
     Returns:
         [B, HIDDEN] bfloat16 output.
     """
+    weight_layout = _require_supported_weight_layout(weight_layout)
     assert intermediate.dtype == torch.bfloat16, "intermediate must be bfloat16"
     assert intermediate.is_contiguous() and w_down.is_contiguous()
     assert router_wts.dtype == torch.float32, "router_wts must be float32"
@@ -871,6 +937,7 @@ def flydsl_warp_decode_moe(
     out: torch.Tensor | None = None,
     gate_up_kwargs: dict | None = None,
     down_reduce_kwargs: dict | None = None,
+    weight_layout: str | WeightLayout = WeightLayout.K_CONTIGUOUS,
 ) -> torch.Tensor:
     """Run both stages of an unsorted, split-weight warp-decode MoE.
 
@@ -882,17 +949,23 @@ def flydsl_warp_decode_moe(
     * Packed MXFP4 weights (``uint8`` or ``float4_e2m1fn_x2``) use the MXFP4
       kernels.
 
-    Weights retain the staged API's logical, K-contiguous layouts:
-    ``w_gate/w_up`` are ``[E, INTER, HIDDEN]`` (or packed along HIDDEN), and
-    ``w_down`` is ``[E, HIDDEN, INTER]`` (or packed along INTER). This wrapper
-    does not accept AITER's preshuffled fused-MoE layout and does not sort
-    routing metadata.
+    Weights use an explicit ``weight_layout`` (never inferred from strides):
+
+    * ``k_contiguous`` (default): ``w_gate/w_up`` are ``[E, INTER, HIDDEN]``
+      (or packed along HIDDEN), and ``w_down`` is ``[E, HIDDEN, INTER]``
+      (or packed along INTER).
+    * ``preshuffled``: the fused-MoE B layout from ``shuffle_weight`` /
+      ``make_preshuffle_b_layout``. Not implemented yet.
+
+    This wrapper does not sort routing metadata.
 
     ``intermediate`` and ``out`` let serving/benchmark callers reuse the
     ``[B, TOPK, INTER]`` and ``[B, HIDDEN]`` buffers respectively. Additional
     stage tuning options may be supplied through ``gate_up_kwargs`` and
-    ``down_reduce_kwargs``; the wrapper owns their ``out`` arguments.
+    ``down_reduce_kwargs``; the wrapper owns their ``out`` and
+    ``weight_layout`` arguments.
     """
+    weight_layout = _require_supported_weight_layout(weight_layout)
     assert (
         w_gate.dtype == w_up.dtype == w_down.dtype
     ), "w_gate, w_up, and w_down must have the same dtype"
@@ -904,6 +977,10 @@ def flydsl_warp_decode_moe(
     down_kwargs = dict(down_reduce_kwargs or {})
     if "out" in gate_kwargs or "out" in down_kwargs:
         raise ValueError("pass intermediate=/out= to flydsl_warp_decode_moe")
+    if "weight_layout" in gate_kwargs or "weight_layout" in down_kwargs:
+        raise ValueError("pass weight_layout= to flydsl_warp_decode_moe")
+    gate_kwargs["weight_layout"] = weight_layout
+    down_kwargs["weight_layout"] = weight_layout
 
     fp4_dtype = getattr(torch, "float4_e2m1fn_x2", None)
     is_fp4 = w_gate.dtype == torch.uint8 or (
