@@ -24,8 +24,14 @@ def load_instance_module(gfx):
         f"gemm_a8w8_blockscale_cktile_instance_{gfx}", INSTANCE_MODULE
     )
     module = importlib.util.module_from_spec(spec)
-    with patch.dict(sys.modules, {"chip_info": chip_info}):
-        spec.loader.exec_module(module)
+    saved_path = list(sys.path)
+    try:
+        with patch.dict(sys.modules, {"chip_info": chip_info}):
+            spec.loader.exec_module(module)
+    finally:
+        # Importing the instance module inserts aiter/jit/utils at sys.path[0],
+        # which would otherwise shadow imports for every later test in the run.
+        sys.path[:] = saved_path
     return module
 
 
