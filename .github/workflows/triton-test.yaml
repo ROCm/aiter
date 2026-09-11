@@ -257,13 +257,18 @@ jobs:
 
       - name: Triton Tests
         run: |
-          set -ex
+          set -exo pipefail
           echo "Running Triton Tests..."
+          mkdir -p test-reports
           docker exec -w /workspace triton_test mkdir -p test-reports
           # MI35X: skip the MHA-PE tests that fail an accuracy check on gfx950 with the coming Triton release.
-          docker exec -w /workspace triton_test pytest -v ${TRITON_TEST} \
+          # Unit tests must not autotune: surface any tuning and fail the job if it happened.
+          docker exec -e TRITON_PRINT_AUTOTUNING=1 -w /workspace triton_test pytest -v -s ${TRITON_TEST} \
             --deselect "op_tests/triton_tests/attention/test_mha_with_pe.py::test_mha_varlen_with_pe[triton-True-0.17-96-64-8-1-64-128]" \
-            --junitxml=test-reports/triton.xml
+            --junitxml=test-reports/triton.xml 2>&1 | tee test-reports/pytest.log
+          if grep -q "Triton autotuning for function" test-reports/pytest.log; then
+            echo "::error::runtime autotuning ran inside unit tests"; exit 1
+          fi
 
       - name: Upload test logs
         uses: actions/upload-artifact@v4
@@ -376,14 +381,19 @@ jobs:
 
       - name: Triton Tests
         run: |
-          set -ex
+          set -exo pipefail
           echo "Running Triton Tests..."
+          mkdir -p test-reports
           docker exec -w /workspace triton_test mkdir -p test-reports
           # MI300X: skip all shapes of the paged-prefill contexted_kv_attention tests that fail an accuracy check (and can hang the GPU) with the coming Triton release.
-          docker exec -w /workspace triton_test pytest -v ${TRITON_TEST} \
+          # Unit tests must not autotune: surface any tuning and fail the job if it happened.
+          docker exec -e TRITON_PRINT_AUTOTUNING=1 -w /workspace triton_test pytest -v -s ${TRITON_TEST} \
             --deselect "op_tests/triton_tests/attention/test_pa_prefill.py::test_contexted_kv_attention" \
             --deselect "op_tests/triton_tests/attention/test_chunked_pa_prefill.py::test_contexted_kv_attention" \
-            --junitxml=test-reports/triton.xml
+            --junitxml=test-reports/triton.xml 2>&1 | tee test-reports/pytest.log
+          if grep -q "Triton autotuning for function" test-reports/pytest.log; then
+            echo "::error::runtime autotuning ran inside unit tests"; exit 1
+          fi
 
       - name: Upload test logs
         uses: actions/upload-artifact@v4
