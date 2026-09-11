@@ -58,18 +58,48 @@ def barrier():
     ms.shmem_barrier_all()
 
 
-def make_inputs(tokens, rank, world, model_dim, experts, topk, route, hot_bias, device):
+def make_inputs(
+    tokens,
+    rank,
+    world,
+    model_dim,
+    experts,
+    topk,
+    route,
+    hot_bias,
+    zipf_alpha,
+    device,
+):
     local_experts = experts // world
     generator = torch.Generator(device=device).manual_seed(1234 + rank)
     x = torch.randn(
         (tokens, model_dim), dtype=torch.bfloat16, device=device, generator=generator
     )
-    scores = torch.randn(
-        (tokens, experts), dtype=torch.float32, device=device, generator=generator
-    )
+    if route == "zipf":
+        order_generator = torch.Generator(device=device).manual_seed(1234 + 19001)
+        permutation = torch.randperm(
+            experts, device=device, generator=order_generator
+        )
+        ranked = torch.arange(
+            1, experts + 1, dtype=torch.float32, device=device
+        ).pow(-float(zipf_alpha))
+        probabilities = torch.empty_like(ranked)
+        probabilities[permutation] = ranked
+        uniform = torch.rand(
+            (tokens, experts), dtype=torch.float32, device=device, generator=generator
+        )
+        scores = torch.log(probabilities)[None, :] - torch.log(
+            -torch.log(uniform.clamp_(1e-7, 1.0 - 1e-7))
+        )
+    else:
+        scores = torch.randn(
+            (tokens, experts), dtype=torch.float32, device=device, generator=generator
+        )
     if route == "hot-rank0":
         scores[:, :local_experts] += hot_bias
     values, ids = torch.topk(scores, topk, dim=-1)
+    if route == "zipf":
+        values = torch.zeros_like(values)
     if route in ("rank-balanced-hot", "rank-balanced-last", "rank-mixed-skew"):
         destination_scores = torch.rand(
             (tokens, world), device=device, generator=generator
@@ -185,11 +215,14 @@ def main():
     parser.add_argument("--inter-dim", type=int, default=INTER_DIM)
     parser.add_argument("--experts", type=int, default=EXPERTS)
     parser.add_argument("--topk", type=int, default=TOPK)
+    parser.add_argument("--quant", choices=("a4w4", "a8w4"), default="a4w4")
+    parser.add_argument("--swiglu-limit", type=float, default=SWIGLU_LIMIT)
     parser.add_argument("--iters", type=int, default=10)
     parser.add_argument(
         "--route",
         choices=(
             "uniform",
+            "zipf",
             "hot-rank0",
             "rank-balanced-hot",
             "rank-balanced-last",
@@ -198,6 +231,7 @@ def main():
         default="uniform",
     )
     parser.add_argument("--hot-bias", type=float, default=0.6)
+    parser.add_argument("--zipf-alpha", type=float, default=1.2)
     parser.add_argument("--stage2-strided", action="store_true")
     parser.add_argument("--stage2-persist-cu", type=int, default=0)
     parser.add_argument("--stage2-skew-cu", type=int, default=0)
@@ -236,6 +270,7 @@ def main():
         args.topk,
         args.route,
         args.hot_bias,
+        args.zipf_alpha,
         device,
     )
     route_counts = torch.zeros(world, dtype=torch.int64, device=device)
@@ -260,13 +295,13 @@ def main():
         inter_dim=args.inter_dim,
         experts=args.experts,
         topk=args.topk,
-        quant="a8w4",
+        quant=args.quant,
         w1=w1,
         w1_scale=w1_scale,
         w2=w2,
         w2_scale=w2_scale,
         max_tok_per_rank=args.mtpr,
-        swiglu_limit=SWIGLU_LIMIT,
+        swiglu_limit=args.swiglu_limit,
     )
     default_select_config = mega._select_config
     variant_select_config = None
@@ -468,6 +503,7 @@ def main():
             )
         print(
             f"[RESULT] route={args.route} hot_bias={args.hot_bias} tokens={tokens} "
+            f"quant={args.quant} "
             f"rank_tokens={rank_tokens or 'same'} mtpr={args.mtpr} "
             f"shape={args.model_dim}x{args.inter_dim} epr={local_experts} topk={args.topk} "
             f"mori_e2e={mori_ms[0]:.4f}/{mori_ms[1]:.4f}ms "

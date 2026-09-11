@@ -121,6 +121,19 @@ for file in "${sharded_files[@]}"; do
                 torchrun --standalone --nproc_per_node=8 "$1" \
                     --network v4_pro --quant a4w4 --bs-list 2,4,16,128,512 \
                     --iters 10 --accuracy-max-bs 512 --rtol 0.25 || exit_code=$?
+                torchrun --standalone --nproc_per_node=8 "$1" \
+                    --network r1_v3 --quant a8w4 --bs-list 128,512 \
+                    --max-tok-per-rank 8192 --iters 10 \
+                    --accuracy-max-bs 512 --rtol 0.10 || exit_code=$?
+                torchrun --standalone --nproc_per_node=8 "$1" \
+                    --network r1_v3 --quant a4w4 --routing-mode uniform \
+                    --bs-list 2,8,64,128,512 --max-tok-per-rank 8192 \
+                    --iters 10 --accuracy-max-bs 512 --rtol 0.25 || exit_code=$?
+                torchrun --standalone --nproc_per_node=8 "$1" \
+                    --network r1_v3 --quant a4w4 --routing-mode zipf \
+                    --zipf-alpha 1.2 --bs-list 2,8,64,128,512 \
+                    --max-tok-per-rank 8192 --iters 10 \
+                    --accuracy-max-bs 512 --rtol 0.25 || exit_code=$?
                 exit $exit_code'
                 _
                 "$file"

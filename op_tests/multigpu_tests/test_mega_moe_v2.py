@@ -37,6 +37,13 @@ NETWORKS = {
         "topk": 6,
         "swiglu_limit": 10.0,
     },
+    "r1_v3": {
+        "model_dim": 7168,
+        "inter_dim": 2048,
+        "experts": 256,
+        "topk": 8,
+        "swiglu_limit": 0.0,
+    },
     # Kimi-K3 routing/weight geometry.  This exercises topk16 and EP8/epr112;
     # the numerical reference intentionally keeps MegaMoEV2's current bounded
     # SwiGLU activation while the K3 activation integration remains separate.
@@ -97,6 +104,8 @@ def _make_inputs(
     seed,
     device,
     *,
+    routing_mode,
+    zipf_alpha,
     force_fanout_boundary,
     inject_invalid_route,
     force_padding_boundary,
@@ -105,10 +114,28 @@ def _make_inputs(
     x = torch.randn(
         (tokens, model_dim), dtype=torch.bfloat16, device=device, generator=generator
     )
-    scores = torch.randn(
-        (tokens, experts), dtype=torch.float32, device=device, generator=generator
-    )
+    if routing_mode == "zipf":
+        order_generator = torch.Generator(device=device).manual_seed(seed + 19001)
+        permutation = torch.randperm(
+            experts, device=device, generator=order_generator
+        )
+        ranked = torch.arange(
+            1, experts + 1, dtype=torch.float32, device=device
+        ).pow(-float(zipf_alpha))
+        probabilities = torch.empty_like(ranked)
+        probabilities[permutation] = ranked
+        uniform = torch.rand(
+            (tokens, experts), dtype=torch.float32, device=device, generator=generator
+        )
+        gumbel = -torch.log(-torch.log(uniform.clamp_(1e-7, 1.0 - 1e-7)))
+        scores = torch.log(probabilities)[None, :] + gumbel
+    else:
+        scores = torch.randn(
+            (tokens, experts), dtype=torch.float32, device=device, generator=generator
+        )
     values, ids = torch.topk(scores, topk, dim=-1)
+    if routing_mode == "zipf":
+        values = torch.zeros_like(values)
     if force_fanout_boundary or inject_invalid_route or force_padding_boundary:
         if topk != 16 or experts % dist.get_world_size():
             raise ValueError("fanout adversarial cases require topk=16 and EP")
@@ -448,6 +475,10 @@ def main():
     parser.add_argument("--bs-list", default="128")
     parser.add_argument("--iters", type=int, default=30)
     parser.add_argument("--seed", type=int, default=123)
+    parser.add_argument(
+        "--routing-mode", choices=("uniform", "zipf"), default="uniform"
+    )
+    parser.add_argument("--zipf-alpha", type=float, default=1.2)
     parser.add_argument("--accuracy-max-bs", type=int, default=128)
     parser.add_argument("--rtol", type=float)
     parser.add_argument("--max-tok-per-rank", type=int)
@@ -518,6 +549,8 @@ def main():
             rank,
             args.seed,
             device,
+            routing_mode=args.routing_mode,
+            zipf_alpha=args.zipf_alpha,
             force_fanout_boundary=args.force_fanout_boundary,
             inject_invalid_route=args.inject_invalid_route,
             force_padding_boundary=args.force_padding_boundary,

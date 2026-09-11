@@ -8,6 +8,7 @@ from functools import cache
 
 TOKEN_BUCKETS = (
     1,
+    2,
     4,
     8,
     16,
@@ -32,6 +33,7 @@ MAX_MTPR_CLASS = 32768
 INDEXED_PAYLOAD_MIN_MTPR = MAX_MTPR_CLASS
 INDEXED_PAYLOAD_MIN_SBM = 128
 REFERENCE_EXPERTS_PER_RANK = 48
+R1_EXPERTS_PER_RANK = 32
 # Compact route metadata dedicates ten bits to the global expert/group segment.
 # Under the EP8 protocol this admits 8 * 127 expert segments plus 8 group
 # segments.  The next expert would require segment 1024 and cannot be encoded.
@@ -425,6 +427,43 @@ def _apply_a4_tuning(
     if 256 <= tokens < 32768:
         config = _replace_config(config, stage1={"waves_per_eu_hint": 1})
 
+    if experts_per_rank == R1_EXPERTS_PER_RANK:
+        if bucket <= 128:
+            stage1_patch: dict[str, object] = {
+                "sort_block_m": 32,
+                "num_waves": 4,
+                "async_a_copy": False,
+            }
+            config = _replace_config(config, stage1=stage1_patch)
+        if mtpr == 8192:
+            r1_dispatch_cu = {
+                1: 160,
+                2: 128,
+                4: 128,
+                8: 32,
+                16: 128,
+                32: 128,
+                64: 96,
+                128: 160,
+                256: 96,
+                512: 160,
+                1024: 32,
+                2048: 64,
+                4096: 72,
+                8192: 96,
+            }[bucket]
+            stage1_patch = {"num_dispatch_cu": r1_dispatch_cu}
+            if bucket == 16:
+                stage1_patch["grid_mult"] = 2
+            config = _replace_config(config, stage1=stage1_patch)
+        elif bucket == 16384:
+            config = _replace_config(
+                config, stage1={"payload_chunk_rows": 1536}
+            )
+        elif bucket == 32768:
+            config = _replace_config(config, stage1={"payload_chunk_rows": 768})
+        return config
+
     # These measured tables are V4-Pro-specific.
     if experts_per_rank != REFERENCE_EXPERTS_PER_RANK:
         return config
@@ -474,6 +513,7 @@ def _apply_a4_tuning(
             )
 
         dispatch_cu = {
+            2: 128,
             4: 128,
             8: 32,
             16: 128,
@@ -549,13 +589,21 @@ def select_mega_moe_config(
             f"MegaMoE v2 fanout needs {total_segments} segments, exceeding "
             f"the {MAX_FANOUT_SEGMENTS}-segment route metadata limit"
         )
+    # Bucket 2 is an exact tuning identity, while its untuned A8 base remains
+    # bucket 1 so adding it does not change existing A8 geometry.
+    base_bucket = 1 if bucket == 2 else bucket
     config = _select_bucket_config(
-        bucket,
+        base_bucket,
         mtpr_class,
         model_dim,
         inter_dim,
         fixed_slot_dispatch,
     )
+    if experts_per_rank == R1_EXPERTS_PER_RANK and bucket == 8192:
+        config = _replace_config(
+            config,
+            stage2={"aligned_pair": False, "pair_cu": 0},
+        )
     if (
         a_dtype == ACTIVATION_FP4
         and bucket <= 128
