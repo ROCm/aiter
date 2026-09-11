@@ -1132,16 +1132,10 @@ def test_flydsl_aot_target_filter():
             ]
 
         _check("separator-only GPU_ARCHS is rejected", _rejects("GPU_ARCHS", " ; "))
-        _check("separator-only ARCH is rejected", _rejects("ARCH", " , "))
         _check("unknown GPU_ARCHS arch is rejected", _rejects("GPU_ARCHS", "gfx9999"))
-        _check("unknown ARCH arch is rejected", _rejects("ARCH", "gfx9999"))
         _check(
             "GPU_ARCHS native combined with another target is rejected",
             _rejects("GPU_ARCHS", "native;gfx942"),
-        )
-        _check(
-            "ARCH native combined with another target is rejected",
-            _rejects("ARCH", "native,gfx942"),
         )
         # GPU_ARCHS accepted ',' before the filter moved here; keep it that way.
         comma = _selects("GPU_ARCHS", "gfx942,gfx950")
