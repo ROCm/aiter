@@ -50,23 +50,6 @@ _REF_SCORE_BYTES = 1 << 30
 _REF_MAX_ROWS = 64
 
 
-def _shape_ok(batch_size, nheads, seqlen_q, seqlen_k):
-    """Drop combos that OOM'd on MI355X during the default sweep."""
-    if seqlen_k < seqlen_q:
-        return False
-    if seqlen_k >= 131072 and batch_size >= 64 and nheads >= 64:
-        return False
-    if seqlen_k >= 131072 and batch_size >= 128:
-        return False
-    if seqlen_k >= 65664 and batch_size >= 128 and nheads >= 64:
-        return False
-    if seqlen_k >= 65664 and batch_size >= 256:
-        return False
-    if batch_size >= 256 and nheads >= 64 and seqlen_q >= 16384:
-        return False
-    return True
-
-
 def _ref_rows(seqlen_q, batch, nheads, seqlen_k):
     budget = max(1, _REF_SCORE_BYTES // (max(batch, 1) * nheads * seqlen_k * 4))
     want = max(1, min(seqlen_q, _REF_MAX_ROWS, budget))
@@ -302,7 +285,7 @@ def main():
     for batch_size, nheads, seqlen_q, seqlen_k in itertools.product(
         args.batch_size, args.nheads, args.seqlen_q, args.seqlen_k
     ):
-        if not _shape_ok(batch_size, nheads, seqlen_q, seqlen_k):
+        if seqlen_k < seqlen_q:
             continue
         try:
             rows.append(
