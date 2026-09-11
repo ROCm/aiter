@@ -26,7 +26,7 @@ from aiter.ops.triton.utils.config_utils import (
 
 def autotune_enabled(family: str) -> bool:
     """``<FAMILY>_TRITON_AUTOTUNE=1`` opts a kernel family into runtime tuning; off by default."""
-    return os.getenv(f"{family}_TRITON_AUTOTUNE", "0").lower() in (
+    return os.getenv(f"{family}_TRITON_AUTOTUNE", "0").strip().lower() in (
         "1",
         "true",
         "yes",
@@ -41,6 +41,8 @@ def autotune_configs(
 ) -> list[triton.Config]:
     """Config list for ``@triton.autotune``: every candidate while the family tunes, else
     only ``default_config`` (or ``configs[0]``) so nothing is benchmarked at launch."""
+    # An empty list would hand Triton nothing to tune and make the configs[0] fallback raise.
+    assert configs, f"{family}: autotune_configs called with an empty config list"
     if autotune_enabled(family):
         return configs
     return [default_config if default_config is not None else configs[0]]
