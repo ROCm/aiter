@@ -82,6 +82,8 @@ def gluon_dynamic_mxfp4_quant_kernel_gfx1250(
         warps_per_cta=[1, num_warps],
         order=[1, 0],
     )
+    # 1D slice of blocked_layout along the N axis, for masking tail columns
+    gLayoutN: gl.constexpr = gl.SliceLayout(0, blocked_layout)
 
     # LDS ring buffer
     x_buffer = gl.allocate_shared_memory(
@@ -147,11 +149,22 @@ def gluon_dynamic_mxfp4_quant_kernel_gfx1250(
             .to(gl.float32)
         )
 
-        out_fp4, bs_e8m0 = _mxfp4_quant_op(
-            x_reg, BLOCK_SIZE_N, BLOCK_SIZE_M, MXFP4_QUANT_BLOCK_SIZE
-        )
-
         pid_n = start_n + compute_idx
+        if EVEN_M_N:
+            out_fp4, bs_e8m0 = _mxfp4_quant_op(
+                x_reg, BLOCK_SIZE_N, BLOCK_SIZE_M, MXFP4_QUANT_BLOCK_SIZE
+            )
+        else:
+            # Tail N-tile may have columns >= N whose LDS contents are stale
+            # ring-buffer garbage, not zero -- exclude them from the amax
+            # reduction (and downstream scaled_downcast input) or the e8m0
+            # scale for the whole quant-block gets corrupted.
+            col_valid = (pid_n * BLOCK_SIZE_N + gl.arange(0, BLOCK_SIZE_N, layout=gLayoutN)) < N
+            x_reg = gl.where(col_valid[None, :], x_reg, 0.0)
+            out_fp4, bs_e8m0 = _mxfp4_quant_op(
+                x_reg, BLOCK_SIZE_N, BLOCK_SIZE_M, MXFP4_QUANT_BLOCK_SIZE
+            )
+
         out_smem.store(out_fp4)
         gl.barrier()
         gl.amd.gfx1250.tdm.async_store(
@@ -188,11 +201,18 @@ def gluon_dynamic_mxfp4_quant_kernel_gfx1250(
             .to(gl.float32)
         )
 
-        out_fp4, bs_e8m0 = _mxfp4_quant_op(
-            x_reg, BLOCK_SIZE_N, BLOCK_SIZE_M, MXFP4_QUANT_BLOCK_SIZE
-        )
-
         pid_n = start_n + compute_idx
+        if EVEN_M_N:
+            out_fp4, bs_e8m0 = _mxfp4_quant_op(
+                x_reg, BLOCK_SIZE_N, BLOCK_SIZE_M, MXFP4_QUANT_BLOCK_SIZE
+            )
+        else:
+            col_valid = (pid_n * BLOCK_SIZE_N + gl.arange(0, BLOCK_SIZE_N, layout=gLayoutN)) < N
+            x_reg = gl.where(col_valid[None, :], x_reg, 0.0)
+            out_fp4, bs_e8m0 = _mxfp4_quant_op(
+                x_reg, BLOCK_SIZE_N, BLOCK_SIZE_M, MXFP4_QUANT_BLOCK_SIZE
+            )
+
         out_smem.store(out_fp4)
         gl.barrier()
         gl.amd.gfx1250.tdm.async_store(

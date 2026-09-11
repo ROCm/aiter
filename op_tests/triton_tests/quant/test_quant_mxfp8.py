@@ -73,10 +73,13 @@ def e8m0_to_f32(x: torch.Tensor) -> torch.Tensor:
         (128, 1024),
         (137, 64),  # non-power-of-2 M
         (256, 32),
-        (8192, 1024),
-        (8192, 7168),
-        (16384, 3072),
-        (32768, 7168),
+        # A few shapes spanning bench_quant_mxfp4_fp8.py's default range, plus
+        # non-power-of-2 shapes in between.
+        (8, 1024),
+        (2048, 3072),
+        (16384, 7168),
+        (6000, 5024),
+        (3333, 4064),
     ],
 )
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
