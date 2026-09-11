@@ -2819,18 +2819,25 @@ def get_2stage_cfgs(
         logger.warning(f"[fused_moe] {error}; using default heuristics.")
         cfg = None
         full_impl = None
-    if (
-        full_impl is not None
-        and kernel_name1.startswith("impl__flydsl_")
-        and not weights_shuffled
-    ):
-        cfg = None
-        full_impl = None
-        logger.warning(
-            f"[fused_moe] discarding FlyDSL whole-graph config for {keys}: "
-            "both w1 and w2 must be marked is_shuffled=True; using default "
-            "heuristics"
-        )
+    if full_impl is not None and kernel_name1.startswith("impl__flydsl_"):
+        unsupported = None
+        if not weights_shuffled:
+            unsupported = "both w1 and w2 must be marked is_shuffled=True"
+        elif has_stage2_bias:
+            unsupported = "stage2 bias"
+        elif hidden_pad or intermediate_pad:
+            unsupported = "hidden/intermediate padding"
+        elif gate_mode is not GateMode.SEPARATED:
+            unsupported = f"gate mode {gate_mode.value!r}"
+        elif activation not in (ActivationType.Silu, ActivationType.Swiglu):
+            unsupported = f"activation {activation}"
+        if unsupported is not None:
+            cfg = None
+            full_impl = None
+            logger.warning(
+                f"[fused_moe] discarding FlyDSL whole-graph config for {keys}: "
+                f"unsupported {unsupported}; using default heuristics"
+            )
     if is_ep and full_impl is not None:
         cfg = None
         full_impl = None
