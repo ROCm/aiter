@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
+# ruff: noqa: I001
 """Architecture-selected Mega MoE test entry point.
 
 The original gfx950 ``MegaMoEV2`` and gfx1250 ``MegaMoEGfx1250`` runners live
@@ -678,7 +679,7 @@ elif _GFX == "gfx1250":
     from aiter.fused_moe import fused_moe
     from aiter.ops.flydsl.moe_common import GateMode
     from aiter.ops.shuffle import moe_shuffle_scale, shuffle_weight
-    from aiter.test_common import add_data_init_args, fill, make_generator
+    from aiter.test_common import add_data_init_args, fill, make_generator, print_json_table
     from aiter.utility import fp4_utils
 
     try:
@@ -1620,11 +1621,15 @@ elif _GFX == "gfx1250":
 
 
     def _emit_table(name, rows, max_col_width=72):
-        """Print rows as an aligned frame for direct log inspection.
+        """Print the rows twice: an aligned frame for whoever opens the log, then the
+        one machine-readable line the benchmark driver consumes.
 
-        A single row is transposed; with several rows the columns that hold the
-        same value everywhere are hoisted into a one-line prefix, which keeps the
-        20+ config columns of the summary from repeating down the table.
+        Both render the same DataFrame -- print_json_table builds one anyway to
+        serialize it -- so the readable half costs nothing but keeps a 6 KB JSON line
+        from being the only view of a 21-kernel table. A single row is transposed;
+        with several rows the columns that hold the same value everywhere are hoisted
+        into a one-line prefix, which is what keeps the 20+ config columns of the
+        summary from repeating down the table.
 
         max_col_width fits a full TDM GEMM name (its tile/warp/buffer recipe plus the
         _prefetch / _epscatter suffix is the whole point of reading that table) while
@@ -1659,6 +1664,7 @@ elif _GFX == "gfx1250":
                     df.to_string(index=False, max_colwidth=max_col_width),
                     flush=True,
                 )
+        print_json_table(name, rows)
 
 
     def _device_shared_ffn(tokens, sw1, sw2):
