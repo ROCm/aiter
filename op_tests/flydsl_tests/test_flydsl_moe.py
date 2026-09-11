@@ -10,17 +10,9 @@ and collected on a given machine.
 
 from __future__ import annotations
 
-import os
-
 from aiter.jit.utils.chip_info import get_gfx
 
 _GFX = get_gfx()
-_FORCE_GFX1250 = os.environ.get("AITER_FORCE_GFX1250", "0") in (
-    "1",
-    "true",
-    "True",
-    "yes",
-)
 
 # Keep both original suites byte-for-byte apart from indentation and the nested
 # future imports removed above.
@@ -968,7 +960,7 @@ if _GFX == "gfx950":
             d["ref_stage2"].float(), out.float(), f"situv2_{gate_mode}_e2e_i{inter_dim}"
         )
 
-elif _GFX == "gfx1250" or _FORCE_GFX1250:
+elif _GFX == "gfx1250":
     # SPDX-License-Identifier: MIT
     # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
