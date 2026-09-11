@@ -685,10 +685,8 @@ def _grouped_a8w4_tdm_moe(
         source_topk=topk,
         num_valid_routes=_ep_nvr,
         prequantized_scale=src_a1_scale if _prequantized else None,
-        # A compact scale is row-major too, but per token rather than per
-        # grouped row, and its consumer is the preshuffle pass below rather than
-        # gemm1 -- so the quant pass writes row-major while gemm1 keeps reading
-        # the WMMA layout.
+        # Compact scale is row-major as well; gemm1 keeps reading the WMMA
+        # layout, which the preshuffle pass below rebuilds for it.
         row_major_scale=_row_major_ascale or _compact_scale_buf is not None,
         out_scale=_compact_scale_buf,
     )
