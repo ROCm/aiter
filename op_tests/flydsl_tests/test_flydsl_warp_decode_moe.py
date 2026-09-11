@@ -191,6 +191,29 @@ from aiter.ops.flydsl.warp_decode_moe import (  # noqa: E402
     flydsl_warp_decode_moe,
 )
 
+_WEIGHT_LAYOUTS = [
+    pytest.param(WeightLayout.K_CONTIGUOUS, id="k_contiguous"),
+    pytest.param(WeightLayout.PRESHUFFLED, id="preshuffled"),
+]
+
+
+def _shuffle_warp_decode_b(w, *, mxfp4: bool = False):
+    """Host-side fused-MoE B permute; the kernel must not shuffle."""
+    if mxfp4:
+        from aiter.ops.shuffle import shuffle_weight_a16w4
+
+        return shuffle_weight_a16w4(w, 16, False).contiguous()
+    from aiter.ops.shuffle import shuffle_weight
+
+    return shuffle_weight(w, layout=(16, 16)).contiguous()
+
+
+def _layout_weights(weight_layout, *weights, mxfp4: bool = False):
+    layout = WeightLayout(weight_layout)
+    if layout is WeightLayout.K_CONTIGUOUS:
+        return weights
+    return tuple(_shuffle_warp_decode_b(w, mxfp4=mxfp4) for w in weights)
+
 # name, B, HIDDEN, INTER, E, TOPK, w_scale_mode, scale_block (None | (BN, BK))
 GATE_UP_CASES = [
     ("h1024_i64_e4_tk2_pertensor", 2, 1024, 64, 4, 2, "pertensor", None),
@@ -291,22 +314,27 @@ def _cosine(a, b):
     ).item()
 
 
-def _run_gate_up_case(case, *, cos_thresh=0.999):
+def _run_gate_up_case(
+    case, *, cos_thresh=0.999, weight_layout=WeightLayout.K_CONTIGUOUS
+):
     name, B, HIDDEN, INTER, E, TOPK, mode, scale_block = case
+    weight_layout = WeightLayout(weight_layout)
     print("=" * 78)
-    print(f"[flydsl] warp-decode gate_up  case={name}")
+    print(f"[flydsl] warp-decode gate_up  case={name} layout={weight_layout.value}")
     x, w_gate, w_up, router_ids, wgs, wus = _gen_gate_up(
         B, HIDDEN, INTER, E, TOPK, mode, scale_block
     )
+    wg, wu = _layout_weights(weight_layout, w_gate, w_up)
     out = flydsl_warp_decode_gate_up(
         x,
-        w_gate,
-        w_up,
+        wg,
+        wu,
         router_ids,
         wgs,
         wus,
         w_scale_mode=mode,
         scale_block=scale_block,
+        weight_layout=weight_layout,
     )
     torch.cuda.synchronize()
     ref = _ref_gate_up(x, w_gate, w_up, router_ids, wgs, wus, mode, scale_block)
@@ -325,9 +353,10 @@ def _run_gate_up_case(case, *, cos_thresh=0.999):
 
 
 @pytest.mark.skipif(not _HAS_FP8, reason="torch build lacks float8_e4m3fn")
+@pytest.mark.parametrize("weight_layout", _WEIGHT_LAYOUTS)
 @pytest.mark.parametrize("case", [pytest.param(c, id=c[0]) for c in GATE_UP_CASES])
-def test_gate_up_fp8(case):
-    passed, _ = _run_gate_up_case(case)
+def test_gate_up_fp8(case, weight_layout):
+    passed, _ = _run_gate_up_case(case, weight_layout=weight_layout)
     assert passed
 
 
@@ -399,21 +428,26 @@ def _ref_down(
     return y.to(torch.bfloat16)
 
 
-def _run_down_case(case, *, cos_thresh=0.999):
+def _run_down_case(
+    case, *, cos_thresh=0.999, weight_layout=WeightLayout.K_CONTIGUOUS
+):
     name, B, INTER, HIDDEN, E, TOPK, mode, scale_block = case
+    weight_layout = WeightLayout(weight_layout)
     print("=" * 78)
-    print(f"[flydsl] warp-decode down_reduce  case={name}")
+    print(f"[flydsl] warp-decode down_reduce  case={name} layout={weight_layout.value}")
     inter, w_down, router_ids, router_wts, wds = _gen_down(
         B, INTER, HIDDEN, E, TOPK, mode, scale_block
     )
+    (wd,) = _layout_weights(weight_layout, w_down)
     out = flydsl_warp_decode_down_reduce(
         inter,
-        w_down,
+        wd,
         router_ids,
         router_wts,
         wds,
         w_scale_mode=mode,
         scale_block=scale_block,
+        weight_layout=weight_layout,
     )
     torch.cuda.synchronize()
     ref = _ref_down(inter, w_down, router_ids, router_wts, wds, mode, scale_block)
@@ -432,9 +466,10 @@ def _run_down_case(case, *, cos_thresh=0.999):
 
 
 @pytest.mark.skipif(not _HAS_FP8, reason="torch build lacks float8_e4m3fn")
+@pytest.mark.parametrize("weight_layout", _WEIGHT_LAYOUTS)
 @pytest.mark.parametrize("case", [pytest.param(c, id=c[0]) for c in DOWN_CASES])
-def test_down_reduce_fp8(case):
-    passed, _ = _run_down_case(case)
+def test_down_reduce_fp8(case, weight_layout):
+    passed, _ = _run_down_case(case, weight_layout=weight_layout)
     assert passed
 
 
@@ -694,21 +729,29 @@ def _ref_down_fp4(inter, w_deq, router_ids, router_wts):
     return y.to(torch.bfloat16)
 
 
-def _run_down_fp4_case(case, *, cos_thresh=0.99):
+def _run_down_fp4_case(
+    case, *, cos_thresh=0.99, weight_layout=WeightLayout.K_CONTIGUOUS
+):
     name, B, INTER, HIDDEN, E, TOPK, kvector = case
+    weight_layout = WeightLayout(weight_layout)
     print("=" * 78)
-    print(f"[flydsl] warp-decode down_reduce MXFP4  case={name}")
+    print(
+        f"[flydsl] warp-decode down_reduce MXFP4  case={name} "
+        f"layout={weight_layout.value}"
+    )
     inter, w_down, w_scale, router_ids, router_wts, w_deq = _gen_down_fp4(
         B, INTER, HIDDEN, E, TOPK
     )
+    (wd,) = _layout_weights(weight_layout, w_down, mxfp4=True)
     out = flydsl_warp_decode_down_reduce_fp4(
         inter,
-        w_down,
+        wd,
         router_ids,
         router_wts,
         w_scale,
         scale_block=(1, _MXFP4_BK),
         kvector=kvector,
+        weight_layout=weight_layout,
     )
     torch.cuda.synchronize()
     ref = _ref_down_fp4(inter, w_deq, router_ids, router_wts)
@@ -726,9 +769,10 @@ def _run_down_fp4_case(case, *, cos_thresh=0.99):
     return passed, cos
 
 
+@pytest.mark.parametrize("weight_layout", _WEIGHT_LAYOUTS)
 @pytest.mark.parametrize("case", [pytest.param(c, id=c[0]) for c in DOWN_FP4_CASES])
-def test_down_reduce_fp4(case):
-    passed, _ = _run_down_fp4_case(case)
+def test_down_reduce_fp4(case, weight_layout):
+    passed, _ = _run_down_fp4_case(case, weight_layout=weight_layout)
     assert passed
 
 
@@ -814,22 +858,29 @@ def _ref_gate_up_fp4(x, w_gate_deq, w_up_deq, router_ids):
     return out
 
 
-def _run_gate_up_fp4_case(case, *, cos_thresh=0.99):
+def _run_gate_up_fp4_case(
+    case, *, cos_thresh=0.99, weight_layout=WeightLayout.K_CONTIGUOUS
+):
     name, B, HIDDEN, INTER, E, TOPK, kvector = case
+    weight_layout = WeightLayout(weight_layout)
     print("=" * 78)
-    print(f"[flydsl] warp-decode gate_up MXFP4  case={name}")
+    print(
+        f"[flydsl] warp-decode gate_up MXFP4  case={name} layout={weight_layout.value}"
+    )
     x, w_gate, w_up, gs, us, router_ids, wg_deq, wu_deq = _gen_gate_up_fp4(
         B, HIDDEN, INTER, E, TOPK
     )
+    wg, wu = _layout_weights(weight_layout, w_gate, w_up, mxfp4=True)
     out = flydsl_warp_decode_gate_up_fp4(
         x,
-        w_gate,
-        w_up,
+        wg,
+        wu,
         router_ids,
         gs,
         us,
         scale_block=(1, _MXFP4_BK),
         kvector=kvector,
+        weight_layout=weight_layout,
     )
     torch.cuda.synchronize()
     ref = _ref_gate_up_fp4(x, wg_deq, wu_deq, router_ids)
@@ -847,9 +898,10 @@ def _run_gate_up_fp4_case(case, *, cos_thresh=0.99):
     return passed, cos
 
 
+@pytest.mark.parametrize("weight_layout", _WEIGHT_LAYOUTS)
 @pytest.mark.parametrize("case", [pytest.param(c, id=c[0]) for c in GATE_UP_FP4_CASES])
-def test_gate_up_fp4(case):
-    passed, _ = _run_gate_up_fp4_case(case)
+def test_gate_up_fp4(case, weight_layout):
+    passed, _ = _run_gate_up_fp4_case(case, weight_layout=weight_layout)
     assert passed
 
 
@@ -943,43 +995,61 @@ def _ref_bf16_down(inter, w_down, router_ids, router_wts):
     return y.to(torch.bfloat16)
 
 
+@pytest.mark.parametrize("weight_layout", _WEIGHT_LAYOUTS)
 @pytest.mark.parametrize("case", [pytest.param(c, id=c[0]) for c in BF16_GATE_UP_CASES])
-def test_gate_up_bf16(case):
+def test_gate_up_bf16(case, weight_layout):
     name, B, HIDDEN, INTER, E, TOPK = case
     x, w_gate, w_up, router_ids = _gen_bf16_gate_up(B, HIDDEN, INTER, E, TOPK)
-    out = flydsl_warp_decode_gate_up_bf16(x, w_gate, w_up, router_ids)
+    wg, wu = _layout_weights(weight_layout, w_gate, w_up)
+    out = flydsl_warp_decode_gate_up_bf16(
+        x, wg, wu, router_ids, weight_layout=weight_layout
+    )
     torch.cuda.synchronize()
     ref = _ref_bf16_gate_up(x, w_gate, w_up, router_ids)
     cos = _cosine(ref, out)
-    print(f"[bf16 gate_up {name}] cos={cos:.6f}")
+    print(f"[bf16 gate_up {name} {weight_layout.value}] cos={cos:.6f}")
     assert cos >= 0.99, f"bf16 gate_up {name}: cos={cos:.6f}"
 
 
+@pytest.mark.parametrize("weight_layout", _WEIGHT_LAYOUTS)
 @pytest.mark.parametrize("case", [pytest.param(c, id=c[0]) for c in BF16_DOWN_CASES])
-def test_down_reduce_bf16(case):
+def test_down_reduce_bf16(case, weight_layout):
     name, B, INTER, HIDDEN, E, TOPK = case
     inter, w_down, router_ids, router_wts = _gen_bf16_down(B, INTER, HIDDEN, E, TOPK)
-    out = flydsl_warp_decode_down_reduce_bf16(inter, w_down, router_ids, router_wts)
+    (wd,) = _layout_weights(weight_layout, w_down)
+    out = flydsl_warp_decode_down_reduce_bf16(
+        inter, wd, router_ids, router_wts, weight_layout=weight_layout
+    )
     torch.cuda.synchronize()
     ref = _ref_bf16_down(inter, w_down, router_ids, router_wts)
     cos = _cosine(ref, out)
-    print(f"[bf16 down {name}] cos={cos:.6f}")
+    print(f"[bf16 down {name} {weight_layout.value}] cos={cos:.6f}")
     assert cos >= 0.99, f"bf16 down {name}: cos={cos:.6f}"
 
 
+@pytest.mark.parametrize("weight_layout", _WEIGHT_LAYOUTS)
 @pytest.mark.parametrize("weight_kind", ["bf16", "fp8", "fp8act", "fp4"])
-def test_combined_moe_matches_explicit_stages(weight_kind):
+def test_combined_moe_matches_explicit_stages(weight_kind, weight_layout):
     """The public wrapper must be exactly the staged call, including out buffers."""
     B, HIDDEN, INTER, E, TOPK = 1, 512, 512, 2, 1
+    mxfp4 = weight_kind == "fp4"
     inter_out = torch.empty((B, TOPK, INTER), dtype=torch.bfloat16, device="cuda")
     final_out = torch.empty((B, HIDDEN), dtype=torch.bfloat16, device="cuda")
+    layout_kw = {"weight_layout": weight_layout}
+    if weight_kind in ("fp8", "fp8act") and not _HAS_FP8:
+        pytest.skip("torch build lacks float8_e4m3fn")
 
     if weight_kind == "bf16":
         x, w_gate, w_up, router_ids = _gen_bf16_gate_up(B, HIDDEN, INTER, E, TOPK)
         _, w_down, _, router_wts = _gen_bf16_down(B, INTER, HIDDEN, E, TOPK)
-        expected_inter = flydsl_warp_decode_gate_up_bf16(x, w_gate, w_up, router_ids)
+        w_gate, w_up, w_down = _layout_weights(
+            weight_layout, w_gate, w_up, w_down, mxfp4=mxfp4
+        )
+        expected_inter = flydsl_warp_decode_gate_up_bf16(
+            x, w_gate, w_up, router_ids, **layout_kw
+        )
         expected = flydsl_warp_decode_down_reduce_bf16(
-            expected_inter, w_down, router_ids, router_wts
+            expected_inter, w_down, router_ids, router_wts, **layout_kw
         )
         got = flydsl_warp_decode_moe(
             x,
@@ -990,6 +1060,7 @@ def test_combined_moe_matches_explicit_stages(weight_kind):
             router_wts,
             intermediate=inter_out,
             out=final_out,
+            **layout_kw,
         )
     elif weight_kind in ("fp8", "fp8act"):
         mode = "pertensor" if weight_kind == "fp8" else "block2d"
@@ -999,6 +1070,9 @@ def test_combined_moe_matches_explicit_stages(weight_kind):
         )
         _, w_down, _, router_wts, wds = _gen_down(
             B, INTER, HIDDEN, E, TOPK, mode, scale_block
+        )
+        w_gate, w_up, w_down = _layout_weights(
+            weight_layout, w_gate, w_up, w_down, mxfp4=False
         )
         x_scale = None
         if weight_kind == "fp8act":
@@ -1017,10 +1091,11 @@ def test_combined_moe_matches_explicit_stages(weight_kind):
                 wgs,
                 wus,
                 scale_block=scale_block,
+                **layout_kw,
             )
         else:
             expected_inter = flydsl_warp_decode_gate_up(
-                x, w_gate, w_up, router_ids, wgs, wus
+                x, w_gate, w_up, router_ids, wgs, wus, **layout_kw
             )
         expected = flydsl_warp_decode_down_reduce(
             expected_inter,
@@ -1030,6 +1105,7 @@ def test_combined_moe_matches_explicit_stages(weight_kind):
             wds,
             w_scale_mode=mode,
             scale_block=scale_block,
+            **layout_kw,
         )
         got = flydsl_warp_decode_moe(
             x,
@@ -1046,6 +1122,7 @@ def test_combined_moe_matches_explicit_stages(weight_kind):
             scale_block=scale_block,
             intermediate=inter_out,
             out=final_out,
+            **layout_kw,
         )
     else:
         (
@@ -1059,11 +1136,14 @@ def test_combined_moe_matches_explicit_stages(weight_kind):
             _,
         ) = _gen_gate_up_fp4(B, HIDDEN, INTER, E, TOPK)
         _, w_down, wds, _, router_wts, _ = _gen_down_fp4(B, INTER, HIDDEN, E, TOPK)
+        w_gate, w_up, w_down = _layout_weights(
+            weight_layout, w_gate, w_up, w_down, mxfp4=True
+        )
         expected_inter = flydsl_warp_decode_gate_up_fp4(
-            x, w_gate, w_up, router_ids, wgs, wus
+            x, w_gate, w_up, router_ids, wgs, wus, **layout_kw
         )
         expected = flydsl_warp_decode_down_reduce_fp4(
-            expected_inter, w_down, router_ids, router_wts, wds
+            expected_inter, w_down, router_ids, router_wts, wds, **layout_kw
         )
         got = flydsl_warp_decode_moe(
             x,
@@ -1077,6 +1157,7 @@ def test_combined_moe_matches_explicit_stages(weight_kind):
             wds,
             intermediate=inter_out,
             out=final_out,
+            **layout_kw,
         )
 
     assert got is final_out
@@ -1161,6 +1242,20 @@ def test_preshuffled_rejects_illegal_nk():
             weights,
             weight_layout="preshuffled",
         )
+    x64 = torch.empty((1, 64), dtype=torch.bfloat16, device="cuda")
+    w_fp4_k = torch.empty((1, 16, 32), dtype=torch.uint8, device="cuda")
+    ids64 = torch.zeros((1, 1), dtype=torch.int32, device="cuda")
+    sc = torch.zeros((16, 2), dtype=torch.uint8, device="cuda")
+    with pytest.raises(ValueError, match="packed K % 64"):
+        flydsl_warp_decode_gate_up_fp4(
+            x64,
+            w_fp4_k,
+            w_fp4_k,
+            ids64,
+            sc,
+            sc,
+            weight_layout="preshuffled",
+        )
 
 
 def _logical_nk_to_kpack_ints(n, k_packed, elem_bytes):
@@ -1216,17 +1311,6 @@ def test_preshuffled_expert_kpack_view_loads_one_dword():
     torch.cuda.synchronize()
     ref = w[expert, n_idx].view(torch.int32)[k_packed // 4].item()
     assert int(out[0].item()) == ref
-
-
-def _shuffle_warp_decode_b(w, *, mxfp4: bool = False):
-    """Host-side fused-MoE B permute; kernel must not shuffle."""
-    if mxfp4:
-        from aiter.ops.shuffle import shuffle_weight_a16w4
-
-        return shuffle_weight_a16w4(w, 16, False).contiguous()
-    from aiter.ops.shuffle import shuffle_weight
-
-    return shuffle_weight(w, layout=(16, 16)).contiguous()
 
 
 def _assert_match_k_contiguous(out_k, out_p, *, what: str, thresh: float = 0.999):
@@ -1364,6 +1448,99 @@ def test_preshuffled_fp4_matches_k_contiguous():
         weight_layout=WeightLayout.PRESHUFFLED,
     )
     _assert_match_k_contiguous(d_k, d_p, what="fp4 down")
+
+
+def _spot_bench_us(fn):
+    _, us = run_perftest(
+        fn,
+        num_iters=20,
+        num_warmup=5,
+        num_rotate_args=0,
+        use_cuda_event=True,
+    )
+    return us
+
+
+def test_layout_spot_bench_fp8_and_mxfp4():
+    """One FP8 and one MXFP4 decode timing row; preshuffled is recorded, not a gate."""
+    rows = []
+    if _HAS_FP8:
+        _name, B, HIDDEN, INTER, E, TOPK, mode, scale_block = GATE_UP_CASES[2]
+        x, w_gate, w_up, router_ids, wgs, wus = _gen_gate_up(
+            B, HIDDEN, INTER, E, TOPK, mode, scale_block
+        )
+        ref = _ref_gate_up(x, w_gate, w_up, router_ids, wgs, wus, mode, scale_block)
+        for layout in (WeightLayout.K_CONTIGUOUS, WeightLayout.PRESHUFFLED):
+            wg, wu = _layout_weights(layout, w_gate, w_up)
+            out = torch.empty((B, TOPK, INTER), dtype=torch.bfloat16, device=x.device)
+
+            def _fn(wg=wg, wu=wu, layout=layout, out=out):
+                return flydsl_warp_decode_gate_up(
+                    x,
+                    wg,
+                    wu,
+                    router_ids,
+                    wgs,
+                    wus,
+                    w_scale_mode=mode,
+                    scale_block=scale_block,
+                    weight_layout=layout,
+                    out=out,
+                )
+
+            us = _spot_bench_us(_fn)
+            got = _fn()
+            torch.cuda.synchronize()
+            cos = _cosine(ref, got)
+            assert cos >= 0.999, f"fp8 gate_up {layout.value}: cos={cos:.6f}"
+            rows.append(
+                {
+                    "op": "gate_up",
+                    "dtype": "fp8",
+                    "layout": layout.value,
+                    "us": round(us, 4),
+                    "cos": round(cos, 6),
+                }
+            )
+    _name, B, INTER, HIDDEN, E, TOPK, kvector = DOWN_FP4_CASES[0]
+    del _name
+    inter, w_down, w_scale, router_ids, router_wts, w_deq = _gen_down_fp4(
+        B, INTER, HIDDEN, E, TOPK
+    )
+    ref = _ref_down_fp4(inter, w_deq, router_ids, router_wts)
+    for layout in (WeightLayout.K_CONTIGUOUS, WeightLayout.PRESHUFFLED):
+        (wd,) = _layout_weights(layout, w_down, mxfp4=True)
+        out = torch.empty((B, HIDDEN), dtype=torch.bfloat16, device=inter.device)
+
+        def _fn(wd=wd, layout=layout, out=out):
+            return flydsl_warp_decode_down_reduce_fp4(
+                inter,
+                wd,
+                router_ids,
+                router_wts,
+                w_scale,
+                kvector=kvector,
+                weight_layout=layout,
+                out=out,
+            )
+
+        us = _spot_bench_us(_fn)
+        got = _fn()
+        torch.cuda.synchronize()
+        cos = _cosine(ref, got)
+        assert cos >= 0.99, f"fp4 down {layout.value}: cos={cos:.6f}"
+        rows.append(
+            {
+                "op": "down",
+                "dtype": "fp4",
+                "layout": layout.value,
+                "us": round(us, 4),
+                "cos": round(cos, 6),
+            }
+        )
+    table = _fmt_table(rows)
+    aiter.logger.info("warp-decode layout spot-check (cuda_event):\n%s", table)
+    print(table)
 
 
 # -------------------------------------------------------------------------
@@ -2614,9 +2791,10 @@ def main() -> int:
     print("=" * 78)
     gate_up_ok = True
     if _HAS_FP8:
-        for case in GATE_UP_CASES:
-            passed, _ = _run_gate_up_case(case)
-            gate_up_ok = gate_up_ok and passed
+        for layout in (WeightLayout.K_CONTIGUOUS, WeightLayout.PRESHUFFLED):
+            for case in GATE_UP_CASES:
+                passed, _ = _run_gate_up_case(case, weight_layout=layout)
+                gate_up_ok = gate_up_ok and passed
     else:
         print("  skipped (torch build lacks float8_e4m3fn)")
 
@@ -2625,9 +2803,10 @@ def main() -> int:
     print("=" * 78)
     down_ok = True
     if _HAS_FP8:
-        for case in DOWN_CASES:
-            passed, _ = _run_down_case(case)
-            down_ok = down_ok and passed
+        for layout in (WeightLayout.K_CONTIGUOUS, WeightLayout.PRESHUFFLED):
+            for case in DOWN_CASES:
+                passed, _ = _run_down_case(case, weight_layout=layout)
+                down_ok = down_ok and passed
     else:
         print("  skipped (torch build lacks float8_e4m3fn)")
 

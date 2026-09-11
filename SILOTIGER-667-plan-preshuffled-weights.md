@@ -33,7 +33,7 @@ spot-check when the hot loop or wait/reduce path changed.
 - [x] 2. Pin the preshuffle contract per dtype (same helper fused MoE uses)
 - [x] 3. i32/byte kpack views + i64 expert base on the `preshuffled` path
 - [x] 4. Lane→kpack gather map (wave still owns output scalars; `v_dot2`)
-- [ ] 5. Op_test both layouts; fail loudly on illegal `preshuffled` shapes
+- [x] 5. Op_test both layouts; fail loudly on illegal `preshuffled` shapes
 
 ## Locked decisions
 
@@ -178,13 +178,13 @@ Feed **already-preshuffled** tensors (reuse fused-MoE `shuffle_weight`). Do
 not preshuffle inside the kernel. Keep `k_contiguous` cases until that path
 is retired (not this track).
 
-- [ ] Op_test covers `k_contiguous` (existing) and `preshuffled` (new) for the
+- [x] Op_test covers `k_contiguous` (existing) and `preshuffled` (new) for the
       dtypes that have a pinned contract.
-- [ ] Illegal `preshuffled` shapes raise; default `"k_contiguous"` still runs
+- [x] Illegal `preshuffled` shapes raise; default `"k_contiguous"` still runs
       today’s decode shapes.
-- [ ] One FP8 and one MXFP4 decode bench spot-check (`k_contiguous` within
+- [x] One FP8 and one MXFP4 decode bench spot-check (`k_contiguous` within
       noise; `preshuffled` recorded, not a merge-gate vs `k_contiguous` µs).
-- [ ] **Done when:** full
+- [x] **Done when:** full
       `test_flydsl_warp_decode_moe.py` pass on GPU 1 with cache off; both
       layouts covered where the contract exists.
 
