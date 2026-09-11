@@ -37,7 +37,7 @@ from aiter.utility.mx_types import (
     MxDtypeInt as _D,
 )
 
-from .tensor_shim import GTensor, _run_compiled
+from .tensor_shim import GTensor, _run_compiled, ptr_buf_tensor
 
 
 def _imin(a, b):
@@ -986,9 +986,8 @@ def _build_kernel_w32(
                 addr_i64, num_records_bytes=num_records_bytes
             )
 
-        pos_rsrc = _ptr_buffer_resource(positions)
-        pos_val_i64 = buffer_ops.buffer_load(pos_rsrc, bid_t, vec_width=1, dtype=T.i64)
-        pos_i32 = fx.Int32(pos_val_i64.trunci(i32))
+        pos_t = ptr_buf_tensor(positions, fx.Int64)
+        pos_i32 = fx.Int32(pos_t[bid_t])
 
         rope_lay = fx.make_layout(PAIRS_PER_THREAD, 1)
         rope_atom = fx.make_copy_atom(fx.rocdl.BufferCopy(PAIRS_PER_THREAD * 16), 16)
@@ -1249,9 +1248,8 @@ def _build_kernel_w32(
                 swa_row_base = None
                 do_swa = None
                 if const_expr(kv_write):
-                    bid_rsrc = _ptr_buffer_resource(batch_id_per_token)
                     bid_i32 = fx.Int32(
-                        buffer_ops.buffer_load(bid_rsrc, bid_t, vec_width=1, dtype=i32)
+                        ptr_buf_tensor(batch_id_per_token, fx.Int32)[bid_t]
                     )
                     # A stale token carries a negative position. `divsi`/`remsi`
                     # truncate toward zero, so pos=-300 with block_size=128 gives
@@ -1904,7 +1902,7 @@ def _build_kernel_w32_tdm(
                 fx.Int64(fx.ptrtoint(ptr))
             )
 
-        pos_rsrc = _ptr_res(positions)
+        pos_t = ptr_buf_tensor(positions, fx.Int64)
 
         def _concat(chunks):
             v = chunks[0]
@@ -1930,19 +1928,15 @@ def _build_kernel_w32_tdm(
             )
 
         def load_pos(tok):
-            return fx.Int32(
-                buffer_ops.buffer_load(pos_rsrc, tok, vec_width=1, dtype=T.i64).trunci(
-                    i32
-                )
-            )
+            return fx.Int32(pos_t[tok])
 
         def load_cs(tok):
             """cos/sin for this token, as PAIRS-wide f32 vectors."""
             return _cs_from_pos(load_pos(tok))
 
         def issue_pos(tok):
-            """Fire position buffer_load (returns raw i64, no wait)."""
-            return buffer_ops.buffer_load(pos_rsrc, tok, vec_width=1, dtype=T.i64)
+            """Fire the position load (returns i64, no wait)."""
+            return pos_t[tok]
 
         def _cs_from_pos(pos_i32):
             """Load cos/sin given an already-resolved position value."""
