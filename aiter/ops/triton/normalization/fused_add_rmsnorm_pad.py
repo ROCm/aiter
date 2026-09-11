@@ -33,6 +33,23 @@ def fused_add_rmsnorm_pad(
     x_pad_to_multiple: int = 0,
     backend: str | None = None,
 ):
+    """
+    Fuses rmnsnorm, add, and padding into a single kernel.
+
+    Parameters:
+        x (torch.Tensor): Input tensor of shape (M, N)
+        weight (torch.Tensor): Weight tensor of shape (N, )
+        epsilon (float): Epsilon value for rmsnorm
+        res (torch.Tensor): Residual tensor of shape (M, N) (optional)
+        x_pad_to_multiple (int): Pad x to multiple of this value and return output of shape (M, N_out) (optional)
+        backend (str): Decides which kernel to use from the available options (triton or gluon) (optional)
+
+    Returns:
+        x (torch.Tensor): Output tensor of shape (M, N) if x_pad_to_multiple is 0, otherwise shape (M, N_out)
+        res_out (torch.Tensor): Residual output tensor of shape (M, N) (optional)
+
+    """
+
     M, N = x.shape
 
     if backend is None:
