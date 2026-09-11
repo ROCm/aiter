@@ -158,10 +158,8 @@ inline void check_shape_reduce_grid(int M)
 }
 }  // namespace opus_gfx1250_detail
 
-template <typename CDataType>
-inline opus_gfx1250_detail::OpusA16W16NoscaleKernel
-opus_dispatch_a16w16_gfx1250(int M, int N, int K, int batch, bool has_bias = false);
-
+// CDataType picks the table by output dtype. It is not the entry's
+// instantiation type: that slot holds the kid's split-K partial type.
 template <typename CDataType>
 inline opus_gfx1250_detail::OpusA16W16NoscaleKernel
 opus_lookup_a16w16_gfx1250(int M, int N, int K, bool allow_fallback = true);
@@ -195,6 +193,10 @@ opus_lookup_a16w16_gfx1250<fp32_t>(int M, int N, int K, bool allow_fallback)
         return e->func;
     return nullptr;
 }
+
+template <typename CDataType>
+inline opus_gfx1250_detail::OpusA16W16NoscaleKernel
+opus_dispatch_a16w16_gfx1250(int M, int N, int K, int batch, bool has_bias = false);
 
 template <>
 inline opus_gfx1250_detail::OpusA16W16NoscaleKernel

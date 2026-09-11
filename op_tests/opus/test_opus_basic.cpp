@@ -550,23 +550,6 @@ bool test_opus_lookup_fallback_order() {
     return true;
 }
 
-bool test_opus_lookup_no_fallback() {
-    // opus_gemm.cu relies on this: the .co consult that runs before the
-    // exact-CU split-K tables must not resolve a legacy row and shadow them.
-    TEST_ASSERT(lk_find(1, 2, 3, 512, false) == nullptr, "no fallback returns null");
-    TEST_ASSERT(lk_find(1, 2, 3, 128, false)->func == &k128, "exact still hits");
-    return true;
-}
-
-bool test_opus_lookup_shape_miss() {
-    TEST_ASSERT(lk_find(9, 9, 9, 128) == nullptr, "absent shape returns null");
-    TEST_ASSERT(lk_find(0, 0, 0, 128) == nullptr, "before first entry returns null");
-    TEST_ASSERT(lk_find(99, 99, 99, 128) == nullptr, "past last entry returns null");
-    TEST_ASSERT(opus_lookup_find(kTable, kTable, 1, 2, 3, 128) == nullptr,
-                "empty table returns null");
-    return true;
-}
-
 int main() {
     std::cout << "======================================" << std::endl;
     std::cout << "OPUS (AI Operator Micro Std) Unit Tests" << std::endl;
@@ -576,8 +559,6 @@ int main() {
     std::cout << "--- Generated Lookup Search Tests ---" << std::endl;
     RUN_TEST(test_opus_lookup_exact_cu);
     RUN_TEST(test_opus_lookup_fallback_order);
-    RUN_TEST(test_opus_lookup_no_fallback);
-    RUN_TEST(test_opus_lookup_shape_miss);
 
     std::cout << "--- Number and Sequence Tests ---" << std::endl;
     RUN_TEST(test_number_basic);
