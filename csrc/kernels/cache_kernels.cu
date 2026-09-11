@@ -1402,18 +1402,125 @@ __global__ void indexer_k_quant_and_cache_kernel(
     *kv_cache_vec       = aiter::scaled_cast<cache_t>(k_val, scale);
 }
 
+// FP4 (e2m1 + e8m0) output layout for the FlyDSL paged MQA-logits indexer kernels,
+// defined in aiter/ops/flydsl/kernels/mqa_logits/pa_mqa_logits_fp4.py. The same cache
+// is written from the DSv4 path by csrc/kernels/dsv4_rotate_quant.cu, so the offsets
+// below must track its kv_fp4_preshuffle_offset / kv_scale_preshuffle_offset helpers.
+constexpr int INDEXER_FP4_GROUP_SIZE = 32;
+
+// ceil(log2(amax / 6)) + 127, the e8m0 exponent that maps amax into e2m1 range.
+__device__ __forceinline__ uint8_t indexer_fp4_scale_e8m0(const float amax)
+{
+    constexpr float fp4_max     = static_cast<float>(opus::finfo<opus::fp4_t>::max());
+    constexpr float inv_fp4_max = 1.0f / fp4_max;
+    constexpr float eps_amax    = fp4_max * __builtin_bit_cast(float, 0x00800000u);
+
+    const uint32_t bits = __builtin_bit_cast(uint32_t, fmaxf(amax, eps_amax) * inv_fp4_max);
+    uint8_t exponent    = (bits >> 23) & 0xFF;
+    if(exponent == 0xFF)
+    {
+        return exponent;
+    }
+    if(bits & 0x7FFFFF)
+    {
+        exponent += 1;
+    }
+    return exponent;
+}
+
+__device__ __forceinline__ float indexer_fp4_scale_from_e8m0(const uint8_t scale_e8m0)
+{
+    return __builtin_bit_cast(float, static_cast<uint32_t>(scale_e8m0) << 23);
+}
+
+// Per page: dense [kv_block_size, k_tiles, 4, 16] permuted to [k_tiles, 4, kv_block_size, 16].
+__device__ __forceinline__ int64_t indexer_fp4_kv_data_offset(const int64_t block_idx,
+                                                              const int pos_in_block,
+                                                              const int packed_byte_idx,
+                                                              const int k_tiles,
+                                                              const int kv_block_size)
+{
+    constexpr int bytes_per_k_tile = 4 * 16;
+    const int k_tile               = packed_byte_idx / bytes_per_k_tile;
+    const int rem                  = packed_byte_idx % bytes_per_k_tile;
+    const int group4               = rem / 16;
+    const int sub16                = rem % 16;
+    return ((block_idx * k_tiles + k_tile) * 4 + group4) *
+               static_cast<int64_t>(kv_block_size) * 16 +
+           static_cast<int64_t>(pos_in_block) * 16 + sub16;
+}
+
+// Token axis interleaved so the reader's packed-dword load covers one token's N-tiles.
+__device__ __forceinline__ int64_t indexer_fp4_kv_scale_offset(const int64_t block_idx,
+                                                               const int pos_in_block,
+                                                               const int scale_group_idx,
+                                                               const int k_tiles,
+                                                               const int kv_block_size)
+{
+    const int k_tile          = scale_group_idx / 4;
+    const int group4          = scale_group_idx % 4;
+    const int tiles_per_block = kv_block_size / 16;
+    const int sflat = (pos_in_block % 16) * tiles_per_block + (pos_in_block / 16);
+    return ((block_idx * k_tiles + k_tile) * 4 + group4) *
+               static_cast<int64_t>(kv_block_size) +
+           sflat;
+}
+
+// Heads split into (m_tile, m_inner = 16) with m_tile innermost and padded to a
+// multiple of 4, so the reader can dword-load four m_tiles at once.
+__device__ __forceinline__ void indexer_fp4_store_q_scale(uint8_t* __restrict__ scale,
+                                                          const uint8_t scale_e8m0,
+                                                          const int64_t token_idx,
+                                                          const int head_idx,
+                                                          const int n_heads,
+                                                          const int group_idx,
+                                                          const int groups_per_row)
+{
+    const int m_tiles        = n_heads >> 4;
+    const int m_tiles_padded = (m_tiles + 3) & ~3;
+    const int m_tile         = head_idx >> 4;
+    const int m_inner        = head_idx & 15;
+
+    const int64_t tile_base =
+        ((token_idx * groups_per_row + group_idx) * 16 + m_inner) * m_tiles_padded;
+    scale[tile_base + m_tile] = scale_e8m0;
+
+    if(m_tiles_padded != m_tiles && m_tile == m_tiles - 1)
+    {
+        for(int pad_tile = m_tiles; pad_tile < m_tiles_padded; ++pad_tile)
+        {
+            scale[tile_base + pad_tile] = 0;
+        }
+    }
+}
+
+__device__ __forceinline__ uint8_t indexer_fp4_pack_pair(const float val,
+                                                         const float partner,
+                                                         const float scale)
+{
+    const opus::fp32x2_t pair = {val, partner};
+    return __builtin_bit_cast(uint8_t, scaled_cast<opus::fp4_t>(pair, scale));
+}
+
+template <bool FP4_OUT, typename cache_t>
+using indexer_qk_out_t = std::conditional_t<FP4_OUT, uint8_t, cache_t>;
+
+template <bool FP4_OUT, typename scalar_t>
+using indexer_weights_out_t = std::conditional_t<FP4_OUT, scalar_t, float>;
+
 template <typename scalar_t,
           typename cache_t,
           vllm::Fp8KVCacheDataType kv_dt,
           int HEAD_DIM,
-          int ROPE_DIM>
+          int ROPE_DIM,
+          bool FP4_OUT>
 __global__ void indexer_qk_rope_quant_and_cache_kernel(
     const scalar_t* __restrict__ q,           // [num_tokens, n_heads, head_dim]
-    cache_t* __restrict__ q_out,              // [num_tokens, n_heads, head_dim]
+    indexer_qk_out_t<FP4_OUT, cache_t>* __restrict__ q_out,
     const scalar_t* __restrict__ weights,     // [num_tokens, n_heads]
-    float* __restrict__ weights_out,          // [num_tokens, n_heads]
+    indexer_weights_out_t<FP4_OUT, scalar_t>* __restrict__ weights_out,
     const scalar_t* __restrict__ k,           // [num_tokens, head_dim]
-    cache_t* __restrict__ kv_cache,           // [num_blocks, block_size, cache_stride]
+    indexer_qk_out_t<FP4_OUT, cache_t>* __restrict__ kv_cache,
     const int64_t* __restrict__ slot_mapping, // [num_tokens]
     // fp32 to match caller's LN params (bf16 cast drops precision).
     const float* __restrict__ norm_weight,    // [head_dim]
@@ -1421,6 +1528,8 @@ __global__ void indexer_qk_rope_quant_and_cache_kernel(
     const int64_t* __restrict__ positions,    // [num_tokens]
     const scalar_t* __restrict__ cos_cache,   // [max_position, ..., rope_dim / 2]
     const scalar_t* __restrict__ sin_cache,   // [max_position, ..., rope_dim / 2]
+    uint8_t* __restrict__ q_scale_out,        // FP4 only
+    uint8_t* __restrict__ kv_cache_scale,     // FP4 only
     const int num_tokens,
     const int n_heads,
     const int quant_block_size,
@@ -1499,25 +1608,58 @@ __global__ void indexer_qk_rope_quant_and_cache_kernel(
         q_val = static_cast<float>(static_cast<scalar_t>(q_val));
     }
     auto max_func = [](float a, float b) { return fmaxf(a, b); };
-    float q_amax = fabsf(q_val);
-    q_amax = block_reduce<float, decltype(max_func), HEAD_DIM, true>(q_amax, max_func);
+    if constexpr(FP4_OUT)
+    {
+        const int group_idx = dim / INDEXER_FP4_GROUP_SIZE;
+        const float q_amax  = multithread_reduce<float, decltype(max_func)>(
+            fabsf(q_val), max_func, INDEXER_FP4_GROUP_SIZE);
+        const uint8_t q_scale_e8m0 = indexer_fp4_scale_e8m0(q_amax);
 
-    const float q_fp8_max = static_cast<float>(opus::finfo<cache_t>::max());
-    const float q_inv_fp8_max = 1.0f / q_fp8_max;
-    float q_scale             = fmaxf(q_amax, 1e-10f) * q_inv_fp8_max;
-    if(use_ue8m0)
-    {
-        q_scale = exp2f(ceilf(log2f(q_scale)));
+        const float q_partner = __shfl_down(q_val, 1);
+        if((dim & 1) == 0)
+        {
+            q_out[token_idx * q_out_stride_t + head_idx * q_out_stride_h +
+                  (dim / 2) * q_out_stride_d] = indexer_fp4_pack_pair(
+                q_val, q_partner, indexer_fp4_scale_from_e8m0(q_scale_e8m0));
+        }
+        if(dim % INDEXER_FP4_GROUP_SIZE == 0)
+        {
+            indexer_fp4_store_q_scale(q_scale_out,
+                                      q_scale_e8m0,
+                                      token_idx,
+                                      head_idx,
+                                      n_heads,
+                                      group_idx,
+                                      HEAD_DIM / INDEXER_FP4_GROUP_SIZE);
+        }
+        if(dim == 0)
+        {
+            weights_out[token_idx * weights_out_stride_t + head_idx * weights_out_stride_h] =
+                weights[token_idx * weights_stride_t + head_idx * weights_stride_h];
+        }
     }
-    const float q_inv_scale = 1.0f / q_scale;
-    q_out[token_idx * q_out_stride_t + head_idx * q_out_stride_h + dim * q_out_stride_d] =
-        opus::cast<cache_t>(q_val * q_inv_scale);
-    if(dim == 0)
+    else
     {
-        const float w = static_cast<float>(
-            weights[token_idx * weights_stride_t + head_idx * weights_stride_h]);
-        weights_out[token_idx * weights_out_stride_t + head_idx * weights_out_stride_h] =
-            w * q_scale * weights_scale;
+        float q_amax = fabsf(q_val);
+        q_amax = block_reduce<float, decltype(max_func), HEAD_DIM, true>(q_amax, max_func);
+
+        const float q_fp8_max = static_cast<float>(opus::finfo<cache_t>::max());
+        const float q_inv_fp8_max = 1.0f / q_fp8_max;
+        float q_scale             = fmaxf(q_amax, 1e-10f) * q_inv_fp8_max;
+        if(use_ue8m0)
+        {
+            q_scale = exp2f(ceilf(log2f(q_scale)));
+        }
+        const float q_inv_scale = 1.0f / q_scale;
+        q_out[token_idx * q_out_stride_t + head_idx * q_out_stride_h + dim * q_out_stride_d] =
+            opus::cast<cache_t>(q_val * q_inv_scale);
+        if(dim == 0)
+        {
+            const float w = static_cast<float>(
+                weights[token_idx * weights_stride_t + head_idx * weights_stride_h]);
+            weights_out[token_idx * weights_out_stride_t + head_idx * weights_out_stride_h] =
+                w * q_scale * weights_scale;
+        }
     }
 
     if(head_idx != 0 || slot_idx < 0)
@@ -1568,9 +1710,40 @@ __global__ void indexer_qk_rope_quant_and_cache_kernel(
     }
     __syncthreads();
 
+    if constexpr(FP4_OUT)
+    {
+        // cache_block_size carries kv_cache.size(3) in FP4 mode.
+        constexpr int K_TILES = HEAD_DIM / 128;
+        const float kv_val    = normed[dim];
+        const int group_idx   = dim / INDEXER_FP4_GROUP_SIZE;
+        const float k_amax    = multithread_reduce<float, decltype(max_func)>(
+            fabsf(kv_val), max_func, INDEXER_FP4_GROUP_SIZE);
+        const uint8_t k_scale_e8m0 = indexer_fp4_scale_e8m0(k_amax);
+
+        const int64_t fp4_block_idx = slot_idx / cache_block_size;
+        const int fp4_pos_in_block  = static_cast<int>(slot_idx % cache_block_size);
+
+        const float kv_partner = __shfl_down(kv_val, 1);
+        if((dim & 1) == 0)
+        {
+            kv_cache[indexer_fp4_kv_data_offset(
+                fp4_block_idx, fp4_pos_in_block, dim / 2, K_TILES, cache_block_size)] =
+                indexer_fp4_pack_pair(
+                    kv_val, kv_partner, indexer_fp4_scale_from_e8m0(k_scale_e8m0));
+        }
+        if(dim % INDEXER_FP4_GROUP_SIZE == 0)
+        {
+            kv_cache_scale[indexer_fp4_kv_scale_offset(
+                fp4_block_idx, fp4_pos_in_block, group_idx, K_TILES, cache_block_size)] =
+                k_scale_e8m0;
+        }
+        return;
+    }
+
     float k_amax = fabsf(normed[dim]);
     k_amax = block_reduce<float, decltype(max_func), HEAD_DIM, true>(k_amax, max_func);
 
+    const float q_fp8_max = static_cast<float>(opus::finfo<cache_t>::max());
     float k_scale = fmaxf(k_amax, 1e-4f) / q_fp8_max;
     if(use_ue8m0)
     {
@@ -3528,20 +3701,23 @@ void reshape_and_cache_flash(
                                      use_ue8m0,                                                   \
                                      do_preshuffle);
 
-#define CALL_INDEXER_QK_ROPE_QUANT_AND_CACHE(KV_T, CACHE_T, KV_DTYPE)                             \
-    aiter::indexer_qk_rope_quant_and_cache_kernel<KV_T, CACHE_T, KV_DTYPE, 128, 64>               \
+#define CALL_INDEXER_QK_ROPE_QUANT_AND_CACHE_IMPL(                                                \
+    KV_T, CACHE_T, KV_DTYPE, FP4_OUT, Q_OUT_T, W_OUT_T)                                           \
+    aiter::indexer_qk_rope_quant_and_cache_kernel<KV_T, CACHE_T, KV_DTYPE, 128, 64, FP4_OUT>      \
         <<<grid, block, 0, stream>>>(reinterpret_cast<KV_T*>(q.data_ptr()),                       \
-                                     reinterpret_cast<CACHE_T*>(q_out.data_ptr()),                \
+                                     reinterpret_cast<Q_OUT_T*>(q_out.data_ptr()),                \
                                      reinterpret_cast<KV_T*>(weights.data_ptr()),                  \
-                                     reinterpret_cast<float*>(weights_out.data_ptr()),             \
+                                     reinterpret_cast<W_OUT_T*>(weights_out.data_ptr()),           \
                                      reinterpret_cast<KV_T*>(k.data_ptr()),                       \
-                                     reinterpret_cast<CACHE_T*>(kv_cache.data_ptr()),             \
+                                     reinterpret_cast<Q_OUT_T*>(kv_cache.data_ptr()),             \
                                      reinterpret_cast<int64_t*>(slot_mapping.data_ptr()),          \
                                      reinterpret_cast<float*>(norm_weight.data_ptr()),             \
                                      reinterpret_cast<float*>(norm_bias.data_ptr()),               \
                                      reinterpret_cast<int64_t*>(positions.data_ptr()),             \
                                      reinterpret_cast<KV_T*>(cos_cache.data_ptr()),                \
                                      reinterpret_cast<KV_T*>(sin_cache.data_ptr()),                \
+                                     q_scale_out_ptr,                                             \
+                                     kv_cache_scale_ptr,                                          \
                                      num_tokens,                                                  \
                                      n_heads,                                                     \
                                      quant_block_size,                                            \
@@ -3568,6 +3744,12 @@ void reshape_and_cache_flash(
                                      is_neox,                                                      \
                                      max_position,                                                \
                                      compute_all_q_rope);
+
+#define CALL_INDEXER_QK_ROPE_QUANT_AND_CACHE(KV_T, CACHE_T, KV_DTYPE)                             \
+    CALL_INDEXER_QK_ROPE_QUANT_AND_CACHE_IMPL(KV_T, CACHE_T, KV_DTYPE, false, CACHE_T, float)
+
+#define CALL_INDEXER_QK_ROPE_QUANT_AND_CACHE_FP4(KV_T, CACHE_T, KV_DTYPE)                         \
+    CALL_INDEXER_QK_ROPE_QUANT_AND_CACHE_IMPL(KV_T, CACHE_T, KV_DTYPE, true, uint8_t, KV_T)
 
 #define CALL_CP_GATHER_INDEXER_K_QUANT_CACHE(BLOCK_Y_SIZE)          \
     aiter::cp_gather_indexer_k_quant_cache_kernel<8, BLOCK_Y_SIZE>  \
@@ -4066,14 +4248,23 @@ void indexer_qk_rope_quant_and_cache(
     double weights_scale,
     bool preshuffle,
     bool is_neox,
-    bool compute_all_q_rope)
+    bool compute_all_q_rope,
+    std::optional<aiter_tensor_t> q_scale_out,
+    std::optional<aiter_tensor_t> kv_cache_scale)
 {
+    const bool fp4_out = q_scale_out.has_value() || kv_cache_scale.has_value();
+    AITER_CHECK(!fp4_out || (q_scale_out.has_value() && kv_cache_scale.has_value()),
+                "fp4 output needs both q_scale_out and kv_cache_scale");
+    AITER_CHECK(!fp4_out || kv_cache.dim() == 5,
+                "fp4 kv_cache must be [num_blocks, k_tiles, 4, kv_block_size, 16], got dim ",
+                kv_cache.dim());
+
     int num_tokens       = std::min(k.size(0), slot_mapping.size(0));
     int head_dim         = k.size(1);
     int n_heads          = q.size(1);
     int rope_dim         = cos_cache.size(-1) * 2;
-    int cache_block_size = kv_cache.size(1);
-    int cache_stride     = kv_cache.size(2);
+    int cache_block_size = fp4_out ? kv_cache.size(3) : kv_cache.size(1);
+    int cache_stride     = fp4_out ? 0 : kv_cache.size(2);
     int max_position     = cos_cache.size(0);
     bool use_ue8m0       = scale_fmt == "ue8m0";
     bool do_preshuffle   = preshuffle;
@@ -4105,7 +4296,7 @@ void indexer_qk_rope_quant_and_cache(
     AITER_CHECK(q.size(2) == head_dim, "q head_dim must match k head_dim");
     AITER_CHECK(positions.size(0) >= num_tokens, "positions must cover all indexed tokens");
     AITER_CHECK(q_out.size(0) >= num_tokens && q_out.size(1) == n_heads &&
-                    q_out.size(2) == head_dim,
+                    q_out.size(2) == (fp4_out ? head_dim / 2 : head_dim),
                 "q_out must cover all indexed tokens");
     AITER_CHECK(weights.size(0) >= num_tokens && weights.size(1) == n_heads,
                 "weights must cover all indexed tokens");
@@ -4119,12 +4310,11 @@ void indexer_qk_rope_quant_and_cache(
                 "cos_cache and sin_cache last dimension must be contiguous");
     AITER_CHECK(head_dim == 128, "indexer fused qk cache only supports head_dim=128");
     AITER_CHECK(rope_dim == 64, "indexer fused qk cache only supports rope_dim=64");
-    AITER_CHECK(quant_block_size == head_dim,
-                "indexer fused qk cache only supports quant_block_size == head_dim");
+    AITER_CHECK(quant_block_size == (fp4_out ? INDEXER_FP4_GROUP_SIZE : head_dim),
+                fp4_out ? "fp4 indexer fused qk cache only supports quant_block_size == 32"
+                        : "indexer fused qk cache only supports quant_block_size == head_dim");
     AITER_CHECK(k.dtype() == q.dtype(), "k dtype must match q dtype");
-    AITER_CHECK(q_out.dtype() == AITER_DTYPE_fp8, "q_out dtype must be fp8");
     AITER_CHECK(weights.dtype() == q.dtype(), "weights dtype must match q dtype");
-    AITER_CHECK(weights_out.dtype() == AITER_DTYPE_fp32, "weights_out dtype must be fp32");
     AITER_CHECK(norm_weight.dtype() == AITER_DTYPE_fp32, "norm_weight dtype must be fp32");
     AITER_CHECK(norm_bias.dtype() == AITER_DTYPE_fp32, "norm_bias dtype must be fp32");
     AITER_CHECK(cos_cache.dtype() == q.dtype(), "cos_cache dtype must match q dtype");
@@ -4135,14 +4325,76 @@ void indexer_qk_rope_quant_and_cache(
     AITER_CHECK(norm_bias.dim() == 1, "norm_bias must be 1D");
     AITER_CHECK(norm_weight.is_contiguous(), "norm_weight must be contiguous");
     AITER_CHECK(norm_bias.is_contiguous(), "norm_bias must be contiguous");
-    if(preshuffle)
+
+    uint8_t* q_scale_out_ptr   = nullptr;
+    uint8_t* kv_cache_scale_ptr = nullptr;
+    if(fp4_out)
     {
-        AITER_CHECK(cache_block_size % 16 == 0,
-                    "preshuffle requires cache_block_size to be a multiple of 16, got ",
+        aiter_tensor_t& qs = q_scale_out.value();
+        aiter_tensor_t& ks = kv_cache_scale.value();
+        const int k_tiles  = head_dim / 128;
+        const int qs_pad   = ((n_heads / 16) + 3) & ~3;
+
+        AITER_CHECK(!preshuffle,
+                    "fp4 output always writes the pa_mqa_logits_fp4 preshuffled layout; "
+                    "the fp8-only preshuffle flag must be left unset");
+        AITER_CHECK(scale_fmt == "ue8m0", "fp4 output requires scale_fmt=\"ue8m0\", got ", scale_fmt);
+        AITER_CHECK(n_heads % 16 == 0,
+                    "fp4 output requires n_heads to be a multiple of 16, got ",
+                    n_heads);
+        AITER_CHECK(cache_block_size == 64,
+                    "fp4 output only supports kv_block_size=64 (kv_cache.size(3)), got ",
                     cache_block_size);
-        AITER_CHECK(head_dim % 16 == 0,
-                    "preshuffle requires head_dim to be a multiple of 16, got ",
-                    head_dim);
+        AITER_CHECK(kv_cache.size(1) == k_tiles && kv_cache.size(2) == 4 &&
+                        kv_cache.size(4) == 16,
+                    "fp4 kv_cache must be [num_blocks, ",
+                    k_tiles,
+                    ", 4, 64, 16]");
+        AITER_CHECK(ks.dim() == 4 && ks.size(0) == kv_cache.size(0) && ks.size(1) == k_tiles &&
+                        ks.size(2) == 4 && ks.size(3) == cache_block_size,
+                    "fp4 kv_cache_scale must be [num_blocks, ",
+                    k_tiles,
+                    ", 4, 64]");
+        AITER_CHECK(qs.dim() == 5 && qs.size(0) >= num_tokens && qs.size(1) == k_tiles &&
+                        qs.size(2) == 4 && qs.size(3) == 16 && qs.size(4) == qs_pad,
+                    "fp4 q_scale_out must be [num_tokens, ",
+                    k_tiles,
+                    ", 4, 16, ",
+                    qs_pad,
+                    "]");
+        AITER_CHECK(q.device_id == qs.device_id, "q and q_scale_out must be on the same device");
+        AITER_CHECK(q.device_id == ks.device_id,
+                    "q and kv_cache_scale must be on the same device");
+        AITER_CHECK(q_out.dtype() == AITER_DTYPE_u8 || q_out.dtype() == AITER_DTYPE_fp4x2,
+                    "fp4 q_out dtype must be u8 or fp4x2");
+        AITER_CHECK(kv_cache.dtype() == AITER_DTYPE_u8 || kv_cache.dtype() == AITER_DTYPE_fp4x2,
+                    "fp4 kv_cache dtype must be u8 or fp4x2");
+        AITER_CHECK(qs.dtype() == AITER_DTYPE_u8 || qs.dtype() == AITER_DTYPE_fp8_e8m0,
+                    "fp4 q_scale_out dtype must be u8 or fp8_e8m0");
+        AITER_CHECK(ks.dtype() == AITER_DTYPE_u8 || ks.dtype() == AITER_DTYPE_fp8_e8m0,
+                    "fp4 kv_cache_scale dtype must be u8 or fp8_e8m0");
+        AITER_CHECK(weights_out.dtype() == q.dtype(),
+                    "fp4 weights_out dtype must match q dtype");
+        AITER_CHECK(kv_cache.is_contiguous(), "fp4 kv_cache must be contiguous");
+        AITER_CHECK(ks.is_contiguous(), "fp4 kv_cache_scale must be contiguous");
+        AITER_CHECK(qs.is_contiguous(), "fp4 q_scale_out must be contiguous");
+
+        q_scale_out_ptr    = reinterpret_cast<uint8_t*>(qs.data_ptr());
+        kv_cache_scale_ptr = reinterpret_cast<uint8_t*>(ks.data_ptr());
+    }
+    else
+    {
+        AITER_CHECK(q_out.dtype() == AITER_DTYPE_fp8, "q_out dtype must be fp8");
+        AITER_CHECK(weights_out.dtype() == AITER_DTYPE_fp32, "weights_out dtype must be fp32");
+        if(preshuffle)
+        {
+            AITER_CHECK(cache_block_size % 16 == 0,
+                        "preshuffle requires cache_block_size to be a multiple of 16, got ",
+                        cache_block_size);
+            AITER_CHECK(head_dim % 16 == 0,
+                        "preshuffle requires head_dim to be a multiple of 16, got ",
+                        head_dim);
+        }
     }
 
     dim3 grid(num_tokens, n_heads);
@@ -4152,9 +4404,18 @@ void indexer_qk_rope_quant_and_cache(
     float eps = static_cast<float>(epsilon);
     float w_scale = static_cast<float>(weights_scale);
 
-    DISPATCH_BY_KV_CACHE_DTYPE_OPUS_rmTorch(k.dtype(),
-                                            "fp8_e4m3",
-                                            CALL_INDEXER_QK_ROPE_QUANT_AND_CACHE);
+    if(fp4_out)
+    {
+        DISPATCH_BY_KV_CACHE_DTYPE_OPUS_rmTorch(k.dtype(),
+                                                "fp8_e4m3",
+                                                CALL_INDEXER_QK_ROPE_QUANT_AND_CACHE_FP4);
+    }
+    else
+    {
+        DISPATCH_BY_KV_CACHE_DTYPE_OPUS_rmTorch(k.dtype(),
+                                                "fp8_e4m3",
+                                                CALL_INDEXER_QK_ROPE_QUANT_AND_CACHE);
+    }
 }
 
 // copy from vllm: https://github.com/vllm-project/vllm/blob/main/csrc/cache_kernels.cu

@@ -88,13 +88,19 @@ void indexer_k_quant_and_cache(aiter_tensor_t& k,            // [num_tokens, hea
                                const std::string& scale_fmt,
                                bool preshuffle = false);
 
+// Supplying q_scale_out and kv_cache_scale switches the op from its default FP8
+// output to the packed e2m1 + e8m0 layout that flydsl_pa_mqa_logits_fp4 reads.
+// weights_out changes meaning with the mode: fp32 with the per-(token, head)
+// q_scale folded in for FP8, q's dtype and unscaled for FP4, because the FP4
+// MQA-logits kernel applies the per-group Q scale itself.
 void indexer_qk_rope_quant_and_cache(
     aiter_tensor_t& q,            // [num_tokens, n_heads, head_dim]
-    aiter_tensor_t& q_out,        // [num_tokens, n_heads, head_dim]
+    aiter_tensor_t& q_out,        // [num_tokens, n_heads, head_dim] | fp4 [..., head_dim / 2]
     aiter_tensor_t& weights,      // [num_tokens, n_heads]
     aiter_tensor_t& weights_out,  // [num_tokens, n_heads]
     aiter_tensor_t& k,            // [num_tokens, head_dim]
     aiter_tensor_t& kv_cache,     // [num_blocks, block_size, cache_stride]
+                                  // | fp4 [num_blocks, k_tiles, 4, kv_block_size, 16]
     aiter_tensor_t& slot_mapping, // [num_tokens]
     aiter_tensor_t& norm_weight,  // [head_dim]
     aiter_tensor_t& norm_bias,    // [head_dim]
@@ -109,7 +115,11 @@ void indexer_qk_rope_quant_and_cache(
     bool is_neox = true,
     // false: slot<0 skips Q and K; true (DCP): compute Q for every row and
     // guard only the owner-specific K-cache write.
-    bool compute_all_q_rope = false);
+    bool compute_all_q_rope = false,
+    // [num_tokens, k_tiles, 4, 16, round_up(n_heads / 16, 4)] u8 e8m0
+    std::optional<aiter_tensor_t> q_scale_out = std::nullopt,
+    // [num_blocks, k_tiles, 4, kv_block_size] u8 e8m0
+    std::optional<aiter_tensor_t> kv_cache_scale = std::nullopt);
 
 void cp_gather_indexer_k_quant_cache(
     const aiter_tensor_t& kv_cache,     // [num_blocks, block_size, cache_stride]
