@@ -342,6 +342,7 @@ _dynamic_mxfp4_quant_repr = make_kernel_repr(
         "MXFP4_QUANT_BLOCK_SIZE",
         "EVEN_M_N",
         "SCALING_MODE",
+        "num_warps",
     ],
 )
 
@@ -372,6 +373,9 @@ def _dynamic_mxfp4_quant_kernel(
     MXFP4_QUANT_BLOCK_SIZE: tl.constexpr,
     EVEN_M_N: tl.constexpr,
     SCALING_MODE: tl.constexpr,
+    # Declared so the launch warp count reaches the repr and distinguishes the
+    # compiled artifacts; Triton still applies it as the launch option.
+    num_warps: tl.constexpr,
 ):
     pid_m = tl.program_id(0)
     start_n = tl.program_id(1) * NUM_ITER
