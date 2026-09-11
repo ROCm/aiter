@@ -374,7 +374,7 @@ def _per_1x32_mxfp4_quant(w):
 def _randn_or_const(shape, *, const_init, scale=1.0, dtype=dtypes.bf16, device="cuda"):
     """randn (scaled) by default; a constant VALUE tensor when const_init is set.
 
-    Mirrors flydsl_tests/test_flydsl_moe.py's --const-init: the const path
+    Mirrors test_flydsl_grouped_gemm.py's --const-init: the const path
     fills with VALUE exactly (the ``scale`` only applies to the random path)."""
     if const_init is not None:
         return torch.full(shape, float(const_init), dtype=dtype, device=device)
@@ -679,7 +679,7 @@ def test_fmoe_ep_mxfp4(
         # gugu (INTERLEAVE) stage1 layout so the EP path is routed through the
         # TDM batched GEMM (_grouped_a8w4_tdm_moe, gugu-only). gate/up are
         # row-interleaved ([g0,u0,g1,u1,...]) inside moe_shuffle_weight/scale,
-        # matching flydsl_tests/test_flydsl_moe.py.
+        # matching test_flydsl_grouped_gemm.py.
         w1_a = moe_shuffle_weight(
             w1_u8, experts_cnt=total_local, is_guinterleave=True, gate_up=True
         )
@@ -809,7 +809,7 @@ def test_fmoe_ep_mxfp4(
         # The grouped a8w4 path quantizes activations to fp8, so the reference
         # (bf16 activations) differs elementwise by more than atol/rtol=5e-2
         # even without EP. Use the grouped tests' cosine criterion instead
-        # (flydsl_tests/test_flydsl_moe.py: logits_diff < 0.01).
+        # (test_flydsl_grouped_gemm.py: logits_diff < 0.01).
         _logits_diff_tol = 0.01
         err = logits_diff
         _verdict = "PASSED" if logits_diff < _logits_diff_tol else "FAILED"
@@ -971,7 +971,7 @@ parser.add_argument(
     help="""initialize activations (input) and weights (w1/w2) to the constant
     VALUE instead of random values (mxfp4 EP tests only). Bare --const-init uses
     0.0 (zero-init). Routing scores stay random so expert selection is unchanged.
-    Mirrors flydsl_tests/test_flydsl_moe.py --const-init.""",
+    Mirrors test_flydsl_grouped_gemm.py --const-init.""",
 )
 
 args = parser.parse_args()

@@ -302,11 +302,11 @@ def _silence():
 with _silence():
     import pandas as pd
     import test_f4gemm as gemm_mod
+    import test_flydsl_grouped_gemm as moe_mod
     import test_fmha_fwd_with_sink_asm as mha_mod  # has __main__ guard
     import test_mla_v4_kargpreld as mla_v4_kargpreld_mod
     import test_mxfp8fp4gemm as f8gemm_mod
     import torch
-    from flydsl_tests import test_flydsl_moe as moe_mod
     from triton_tests.attention import test_mla_v4_triton as mla_v4_triton_mod
 
     import aiter
@@ -568,7 +568,7 @@ _MOE_KEEP = [
     "gemm2 GB/s",
     "kernel",
 ]
-# Fixed kernel-bench config (mirrors flydsl_tests/test_flydsl_moe.py --scenario kernel).
+# Fixed kernel-bench config (mirrors test_flydsl_grouped_gemm.py --scenario kernel).
 _MOE_DATA_FORMATS = ["a4w4", "a8w4"]
 _MOE_CONFIG = {
     "experts": 96,
