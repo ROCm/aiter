@@ -1,7 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (c) 2025 FlyDSL Project Contributors
-# Compile-time and per-wave DSL conditions must stay separate.
-# ruff: noqa: SIM102
 
 """8-wave MXFP8 matmul for AMD CDNA4 (gfx950 / MI355X)."""
 
@@ -520,7 +518,6 @@ def compile_mxfp8_gemm_8w(
             rocdl.s_setprio(0)
             rocdl.s_barrier()
 
-            # Accumulators are already scaled by the MFMA: convert and store.
             # Rejoin the staggered M wave groups before reusing LDS for the epilogue.
             if wave_m == 0:
                 rocdl.s_barrier()
