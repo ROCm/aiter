@@ -973,7 +973,7 @@ def launch_gemm_a8w4_tdm(
                 )
             # Post-compute wins for decode and for shallow pipelines: at
             # num_buffers<=2 mid-compute prefetches one tile and under-overlaps.
-            if const_expr(tile_m <= 64 or num_buffers <= 2):
+            if const_expr(tile_m <= 32 or num_buffers <= 2):
                 # Post-compute issue: better for decode (small tile_m).
                 for i in range_constexpr(num_buffers):
                     issue(i, i)
