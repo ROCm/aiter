@@ -183,7 +183,6 @@ def compile_mega_moe_stage1(
         and fuse_mtpr >= INDEXED_PAYLOAD_MIN_MTPR
         and sort_block_m >= INDEXED_PAYLOAD_MIN_SBM
     )
-    indexed_payload_barrier = indexed_payload and a_dtype == "fp4"
     source_rows = fz_npes * fz_mtpr + 1 if indexed_payload else 0
     if indexed_payload and source_rows * model_dim >= _BUFFER_OFFSET_ABI_BYTES:
         raise ValueError(
@@ -265,11 +264,6 @@ def compile_mega_moe_stage1(
         a_group_done = _disp_ptr(DispatchSlot.GROUP_DONE)
         a_payload_blocks_per_destination = _disp_ptr(DispatchSlot.PAYLOAD_BLOCKS_PER_DESTINATION)
         a_payload_chunks_per_destination = _disp_ptr(DispatchSlot.PAYLOAD_CHUNKS_PER_DESTINATION)
-        a_payload_done = fx.Int64(0)
-        p_payload_done = fx.Int64(0)
-        if const_expr(indexed_payload_barrier):
-            a_payload_done = _disp_ptr(DispatchSlot.PAYLOAD_DONE)
-            p_payload_done = _disp_ptr(DispatchSlot.P2P_PAYLOAD_DONE)
         a_launch_ready = fx.Int64(0)
         p_launch_ready = fx.Int64(0)
         if const_expr(fixed_slot_dispatch):
@@ -425,41 +419,6 @@ def compile_mega_moe_stage1(
                     tile_state_stride=tile_state_stride,
                     indexed_payload=indexed_payload,
                 )
-                if const_expr(indexed_payload_barrier):
-                    # This producer has drained every token/scale write for its
-                    # destination. Publish one system-scope contribution to the
-                    # destination rank's parity counter.
-                    if tid == fx.Int32(0):
-                        comm_ops.fence_system_release()
-                        payload_done_table = ptr_buf_tensor(
-                            p_payload_done, fx.Int64
-                        )
-                        remote_payload_done = payload_done_table[
-                            producer_destination
-                        ]
-                        comm_ops.atomic_add_system(
-                            remote_payload_done
-                            + fx.Int64(payload_parity) * fx.Int64(4),
-                            fx.Int32(1),
-                        )
-                    fx.barrier()
-        if const_expr(indexed_payload_barrier):
-            # One invocation contributes dispatch_blocks completions to every
-            # destination: npes source ranks times dispatch_blocks / npes
-            # producers per source. expected/npes is the monotonically
-            # increasing generation of this parity slot. A >= wait tolerates a
-            # faster peer reaching a later generation without reintroducing
-            # an ABA/reset hazard.
-            if tid == fx.Int32(0):
-                payload_generation = payload_expected // fx.Int32(fz_npes)
-                payload_target = payload_generation * fx.Int32(dispatch_blocks)
-                comm_ops.wait_i32_until_greater_than(
-                    a_payload_done
-                    + fx.Int64(payload_parity) * fx.Int64(4),
-                    payload_target - fx.Int32(1),
-                )
-                comm_ops.fence_system_acquire()
-            fx.barrier()
         if const_expr(fixed_slot_dispatch):
             if is_owner:
                 emit_direct_fixed_slot_finalize(

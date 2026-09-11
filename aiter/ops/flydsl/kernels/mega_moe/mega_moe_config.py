@@ -461,10 +461,6 @@ def _apply_a4_tuning(
                 config, stage1={"payload_chunk_rows": 1536}
             )
         elif bucket == 32768:
-            # A4 takes a destination-wide indexed payload barrier here, so the
-            # producer phase cannot overlap the GEMM. Widen the dispatch grid
-            # and shorten the chunk so the barrier is reached sooner; under
-            # Zipf this is what bounds Stage1.
             config = _replace_config(
                 config,
                 stage1={"payload_chunk_rows": 384, "num_dispatch_cu": 64},
@@ -652,6 +648,14 @@ def select_mega_moe_config(
             mtpr=mtpr,
             experts_per_rank=experts_per_rank,
         )
+        if (
+            mtpr >= INDEXED_PAYLOAD_MIN_MTPR
+            and config.stage1.sort_block_m >= INDEXED_PAYLOAD_MIN_SBM
+        ):
+            # FP4 packs one K step into 8 16-byte chunks, so a 16-lane direct
+            # global-to-LDS atom spans two rows. Indexed payload gives every
+            # row an independent source key, which that atom cannot express.
+            config = _replace_config(config, stage1={"async_a_copy": False})
     return config
 
 

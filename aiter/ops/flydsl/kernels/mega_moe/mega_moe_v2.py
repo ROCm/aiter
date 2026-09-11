@@ -314,10 +314,6 @@ class MegaMoEV2:
         workspace["ready_tile_epoch"] = op._sym((tile_state_blocks,), torch.int32)
         workspace["ready_tile_tail"] = op._sym((2,), torch.int32)
         workspace["payload_ready_rows"] = op._sym((1,), torch.int32)
-        # Monotonic, parity-keyed completion generations for the indexed
-        # payload barrier. Every source rank contributes
-        # num_dispatch_cu / world_size producers to each destination.
-        workspace["payload_done"] = op._sym((2,), torch.int32)
         ms.shmem_barrier_all()
         for name in (
             "bigcnt",
@@ -330,7 +326,6 @@ class MegaMoEV2:
             "ready_tile_epoch",
             "ready_tile_tail",
             "payload_ready_rows",
-            "payload_done",
         ):
             workspace[f"p2p_{name}"] = op._p2p_table(workspace[name])
         self._s1_dispatch_workspace = workspace
@@ -394,8 +389,6 @@ class MegaMoEV2:
             DispatchSlot.P2P_PAYLOAD_READY_ROWS: "p2p_payload_ready_rows",
             DispatchSlot.PAYLOAD_BLOCKS_PER_DESTINATION: "payload_blocks_per_destination",
             DispatchSlot.PAYLOAD_CHUNKS_PER_DESTINATION: "payload_chunks_per_destination",
-            DispatchSlot.PAYLOAD_DONE: "payload_done",
-            DispatchSlot.P2P_PAYLOAD_DONE: "p2p_payload_done",
         }
         for slot, name in op_slots.items():
             table[slot] = getattr(op, name).data_ptr()
