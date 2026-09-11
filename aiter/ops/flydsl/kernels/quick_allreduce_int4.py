@@ -75,7 +75,9 @@ PHASES = 2
 PHASE_REDUCE_SCATTER = 0
 PHASE_ALL_GATHER = 1
 
-# (world_size, super_tile) → VGPR-limited workgroups per CU.
+# (world_size, super_tile) → VGPR-limited workgroups per CU, measured on the
+# mesh kernel. Super-tile widens the live atom list, so residency falls as it
+# grows; world size narrows each rank's share of a tile, so it rises with N.
 _RESIDENT_WGS_PER_CU = {
     (2, 1): 3,
     (2, 8): 4,
@@ -99,6 +101,14 @@ def clamp_grid_cap(
     A persistent kernel deadlocks if it launches more workgroups than can be
     co-resident, so the cap has to respect VGPR-limited occupancy rather than
     the caller's wish.
+
+    An unmeasured *super_tile* -- the ring runs ST=16 and ST=32, which this
+    table does not cover -- falls back to the smallest measurement for that
+    world size rather than raising. Under-launching a persistent kernel is
+    always safe (each block simply loops over more tiles); over-launching is
+    the failure mode, so the fallback has to err small. An unknown *arch* or
+    *world_size* still raises, because there is nothing to be conservative
+    with.
     """
     if requested < 1 or cu_count < 1:
         raise ValueError("grid_cap and cu_count must be positive")
@@ -106,13 +116,16 @@ def clamp_grid_cap(
         raise ValueError(
             f"quick_allreduce_int4 has no residency measurement for {arch!r}"
         )
-    try:
-        resident = _RESIDENT_WGS_PER_CU[(int(world_size), int(super_tile))]
-    except KeyError:
-        raise ValueError(
-            "quick_allreduce_int4 has no residency measurement for "
-            f"{(world_size, super_tile)}"
-        ) from None
+    key = (int(world_size), int(super_tile))
+    resident = _RESIDENT_WGS_PER_CU.get(key)
+    if resident is None:
+        for_world = [v for (w, _st), v in _RESIDENT_WGS_PER_CU.items() if w == key[0]]
+        if not for_world:
+            raise ValueError(
+                "quick_allreduce_int4 has no residency measurement for "
+                f"world_size={world_size}"
+            )
+        resident = min(for_world)
     return min(int(requested), resident * int(cu_count))
 
 

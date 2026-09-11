@@ -3,10 +3,15 @@
 
 """Host launch for gfx942/gfx950 TP∈{2,4,8} INT4/INT6 all-reduce.
 
-Public type ``QuickAllReduceInt4``. The schedule is two-shot -- reduce-scatter
-then all-gather -- and is named for the topology of each lap: ``"mesh"`` fans
-out to all ``N-1`` peers, twice. Super-tile ST∈{1,8}. INT4 nibble or INT6
-bit-plane pair, both with group-16 E4M3 scales. Payload HBM is bf16.
+Public type ``QuickAllReduceInt4``, with two interchangeable schedules selected
+by ``algorithm``. Both are two-shot -- reduce-scatter then all-gather -- so
+they are named for the topology of each lap instead:
+
+* ``"mesh"`` the default: fanout to all N-1 peers, twice.
+* ``"ring"`` 2(N-1) single-destination hops.
+
+Super-tile ST∈{1,8} on the mesh, ST∈{1,8,16,32} on the ring. INT4 nibble or
+INT6 bit-plane pair, both with group-16 E4M3 scales. Payload HBM is bf16.
 """
 
 from __future__ import annotations
@@ -31,6 +36,13 @@ from .kernels.quick_allreduce_int4 import (
     SUPER_TILES,
     clamp_grid_cap,
     make_quick_allreduce_int4_kernel,
+)
+from .kernels.quick_allreduce_int4_ring import (
+    AG_CODECS,
+    RING_ST_LADDER,
+    RING_SUPER_TILES,
+    RS_CODECS,
+    make_quick_allreduce_int4_ring_kernel,
 )
 from .kernels.quick_allreduce_shared import (
     DEFAULT_GRID_CAP,
@@ -87,6 +99,24 @@ MIN_PAYLOAD_BYTES = 128 << 10
 # to matter.
 _MIN_BATCH_BLOCKS = 32
 
+# Size floor for the ring schedule, i.e. where the mesh stops winning.
+#
+# Keyed on world size rather than on the reduce-scatter codec: measurement says
+# the codec is not the variable that moves this boundary, N is. See
+# ``allreduce_policy.FAMILY_POLICY``, whose ``mesh_max`` these mirror; the
+# numbers come from the same fit.
+#
+# This is only the *standalone* guard rail -- what ``QuickAllReduceInt4``
+# refuses below when someone constructs one directly with ``algorithm="ring"``.
+# Production dispatch does not consult it; ``FlyDSLAllReduce`` owns the real
+# boundary, which is additionally keyed on link type.
+_RING_MIN_PAYLOAD_BYTES_BY_WORLD = {
+    2: 4 << 20,
+    4: 12 << 20,
+    8: 12 << 20,
+}
+_RING_DEFAULT_MIN_PAYLOAD_BYTES = 12 << 20
+
 
 @dataclass(frozen=True)
 class _Algorithm:
@@ -99,9 +129,11 @@ class _Algorithm:
     accepts, and where the size floor sits. That is this record.
 
     ``build`` is keyword-only and always receives ``rank``, ``rs_codec`` and
-    ``ag_codec``, whether or not a given schedule uses them. A schedule that
-    bakes ``rank`` in at compile time needs it as a Python constant; the mesh
-    takes it as a runtime kernel argument and ignores it here.
+    ``ag_codec``, whether or not a given schedule uses them. The ring bakes
+    ``rank`` in at compile time -- the chunk a step operates on is
+    ``(rank - step) % N``, which has to be a Python constant to index a
+    register-resident atom list -- while the mesh takes it as a runtime kernel
+    argument and ignores it here.
     """
 
     name: str
@@ -114,7 +146,9 @@ class _Algorithm:
     default_super_tile: int
     # Per-world-size override of ``min_bytes``. Empty means the world does not
     # move this schedule's floor, which is true of the mesh -- it is gated from
-    # below by accuracy, which does not depend on N.
+    # below by accuracy, which does not depend on N. The ring's floor is where
+    # the mesh stops winning, which very much does. See
+    # ``_RING_MIN_PAYLOAD_BYTES_BY_WORLD``.
     min_bytes_by_world: tuple[tuple[int, int], ...] = ()
 
     def floor_bytes(self, world_size: int) -> int:
@@ -169,13 +203,27 @@ ALGORITHMS = {
         default_super_tile=8,
         st_ladder=MESH_ST_LADDER,
     ),
+    "ring": _Algorithm(
+        name="ring",
+        build=make_quick_allreduce_int4_ring_kernel,
+        super_tiles=RING_SUPER_TILES,
+        rs_codecs=RS_CODECS,
+        ag_codecs=AG_CODECS,
+        min_bytes=_RING_DEFAULT_MIN_PAYLOAD_BYTES,
+        min_batch_blocks=_MIN_BATCH_BLOCKS,
+        default_super_tile=8,
+        st_ladder=RING_ST_LADDER,
+        min_bytes_by_world=tuple(_RING_MIN_PAYLOAD_BYTES_BY_WORLD.items()),
+    ),
 }
 DEFAULT_ALGORITHM = "mesh"
 
 # World size at which a schedule's reduce-scatter lap needs INT6 to clear the
-# 18 dB SQNR floor the schedules are held to. Only a schedule that requantizes
-# the running partial at every hop reaches it; the mesh requantizes once and
-# stays on INT4 at every world size.
+# 18 dB SQNR floor the schedules are held to.
+#
+# The ring's error grows with N -- it requantizes the running partial at every
+# hop, and the partial's extremum grows with the contributions folded in -- so
+# unlike the mesh it does not have one SQNR for every world size.
 _RS_INT6_MIN_WORLD = 8
 
 
@@ -457,15 +505,26 @@ class QuickAllReduceInt4:
 
     Requires a non-NCCL, single-node process group for IPC metadata exchange.
 
-    ``algorithm`` selects the schedule. It is two-shot -- reduce-scatter then
-    all-gather -- and named for the topology of each lap: ``"mesh"`` has each
-    rank push to every one of the ``N-1`` peers, twice. Two hops, optimal on a
-    meshed xGMI node.
+    ``algorithm`` selects the schedule. Both are two-shot -- reduce-scatter
+    then all-gather -- so they are named for the topology of each lap:
 
-    ``rs_codec`` and ``ag_codec`` are the wire formats of the two laps. The
-    mesh requantizes once and uses one format for both; leave them ``None`` to
-    get the per-world-size defaults. ``AITER_ALL_REDUCE_CODEC=INT4`` or
-    ``INT6`` overrides them process-wide, for both laps at once; an explicit
+    * ``"mesh"`` (default) -- each rank pushes to every one of the ``N-1``
+      peers, twice. Two hops. Optimal on a meshed xGMI node.
+    * ``"ring"`` -- ``2(N-1)`` hops, each a single contiguous run into exactly
+      one peer's inbox. Same wire volume (``2(N-1)/N`` of the payload), traded
+      for per-destination locality. Structurally worse at decode sizes and on
+      xGMI -- opt in deliberately.
+
+    ``rs_codec`` and ``ag_codec`` are the wire formats of the ring's two laps.
+    The reduce-scatter lap is the only place the ring loses accuracy the mesh
+    does not -- it requantizes ``N-1`` times where the mesh requantizes once --
+    so it defaults to ``"int6"`` at TP8, where INT4 would cost too much
+    accuracy. The all-gather lap forwards bytes verbatim and contributes a
+    single quantization, so it defaults to ``"int4"`` everywhere and widens
+    only by request.
+
+    Leave both ``None`` to get those defaults. ``AITER_ALL_REDUCE_CODEC=INT4``
+    or ``INT6`` overrides them process-wide, for both laps at once; an explicit
     argument here outranks the environment.
 
     ``inbox_memory`` selects how the IPC inbox is allocated:
@@ -511,7 +570,7 @@ class QuickAllReduceInt4:
                 f"algorithm must be one of {tuple(ALGORITHMS)}, got {algorithm!r}"
             )
         algo = ALGORITHMS[algorithm]
-        # ``None`` means "use the schedule's own policy": for the mesh that is
+        # ``None`` means "use the schedule's own policy", which for both is
         # the payload-size ladder. Passing a value pins one super-tile for
         # every size, which is what the benchmark variants and the tuning
         # sweeps do.
@@ -555,8 +614,9 @@ class QuickAllReduceInt4:
             rungs = [(st, min(rung_cap, cap)) for _, st, rung_cap in world_ladder]
             ladder = world_ladder
             # The schedule's ``default_super_tile`` describes the *unladdered*
-            # case and is not necessarily a rung. Take the bottom rung instead,
-            # so ``super_tile`` names an engine that exists --
+            # case and is not necessarily a rung: the TP8 ring runs ST=16 and
+            # ST=32 and never 8. Take the bottom rung instead, so
+            # ``super_tile`` names an engine that exists --
             # ``_by_st[self.super_tile]`` below indexes it directly, and
             # ``_pick_st`` falls back to it whenever the ladder does not apply.
             super_tile = ladder[0][1]
@@ -677,7 +737,8 @@ class QuickAllReduceInt4:
         Publishes per rank are ``num_tiles / ST * 2(N-1)`` and cost a full L2
         writeback each, so a bigger payload wants a bigger ST -- but ST also
         divides the block count, so it cannot simply be maximised. The rungs
-        and the measurements behind them are in ``MESH_ST_LADDER``.
+        and the measurements behind them are in ``MESH_ST_LADDER`` and
+        ``RING_ST_LADDER``.
         """
         st = self._by_st and min(self._by_st)
         for floor, rung_st, _cap in self._ladder:
