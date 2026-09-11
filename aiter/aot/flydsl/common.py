@@ -134,7 +134,7 @@ def override_env(var_name: str, value: str | None) -> Iterator[None]:
 def _filter_collected_aot_jobs(
     kind: OpKind, jobs: list[dict[str, Any]]
 ) -> list[dict[str, Any]]:
-    # GEMM only: parse_csv for the others keep just one of gfx/cu_num, 
+    # GEMM only: parse_csv for the others keep just one of gfx/cu_num,
     # so a (gfx, cu_num) filter would drop all of them.
     if kind is OpKind.GEMM:
         from .gemm import filter_jobs_for_build_targets
