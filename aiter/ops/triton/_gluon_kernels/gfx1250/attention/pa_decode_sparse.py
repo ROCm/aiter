@@ -770,13 +770,26 @@ def _pa_decode_sparse_reduce(
 
 
 @gluon.jit
-def _v4_group_scale(u8_ptr, slots, row_stride, col):
-    """The bf16 dequant scale of one 64-element quant group, broadcast over a
-    ``[BLOCK_K, GROUP_SIZE]`` tile.
+def _v4_group_scale(
+    kv_u8_smem,
+    col,
+    BLOCK_K: gl.constexpr,
+    col_layout: gl.constexpr,
+    group_layout: gl.constexpr,
+):
+    """The bf16 dequant scale of one 64-element quant group, as a ``[BLOCK_K]``
+    vector ready to broadcast over a ``[BLOCK_K, GROUP_SIZE]`` tile.
 
-    ``slots`` is already in ``SliceLayout(1, group_layout)``; every column of the
-    tile reads the same byte (``u8_ptr[slot * row_stride + col]``), so this
-    lowers to a single ``buffer_load_u8`` per thread.
+    Read out of the LDS tile the TDM gather already filled -- byte ``col`` of
+    each packed row -- so the scales cost no global traffic at all. They were
+    fetched as part of the 512-byte row whether we use them or not; loading
+    them a second time from global left `s_wait_loadcnt` at 12.6% of the
+    kernel's stall in an ATT trace.
+
+    Note ``col`` is 2-byte aligned, not 64-: a memdesc subslice takes any
+    offset. What is NOT allowed is ``memdesc_reshape`` of a subslice (NYI in
+    the MLIR lowering), so the [BLOCK_K, 1] slice is dropped to 1-D in
+    registers after the load rather than on the descriptor.
 
     E8M0 byte B -> bf16 2^(B-127) is a shift by construction: bf16's exponent
     field is the same 8 biased bits (B == 0 -> +0.0, the all-zero-tile
@@ -784,47 +797,53 @@ def _v4_group_scale(u8_ptr, slots, row_stride, col):
     -- fp8 e4m3 has 3 mantissa bits and the scale is a power of two -- and
     halves the multiply count (v_pk_mul_bf16).
     """
-    exps = gl.amd.cdna4.buffer_load(
-        ptr=u8_ptr,
-        offsets=(slots[:, None] * row_stride + col).to(gl.int32),
-    )
+    exps = gl.reshape(kv_u8_smem.slice(col, 1, dim=1).load(col_layout), [BLOCK_K])
+    exps = gl.convert_layout(exps, gl.SliceLayout(1, group_layout))
     return (exps.to(gl.uint16) << 7).to(gl.bfloat16, bitcast=True)
 
 
 @gluon.jit
 def _v4_dequant_tile(
-    kv_fp8_smem,
+    kv_u8_smem,
     kv_bf16_smem,
     rope_smem,
-    u8_ptr,
-    slots,
-    row_stride,
+    BLOCK_K: gl.constexpr,
+    col_layout: gl.constexpr,
     group_layout: gl.constexpr,
     rope_layout: gl.constexpr,
     NOPE_DIM: gl.constexpr,
     ROPE_DIM: gl.constexpr,
     GROUP_SIZE: gl.constexpr,
 ):
-    """packed-fp8 tile + gathered RoPE tile -> one bf16 ``[BLOCK_K, D]`` operand.
+    """packed tile + gathered RoPE tile -> one bf16 ``[BLOCK_K, D]`` operand.
 
     Walks the NoPE half one quant group at a time. GROUP_SIZE is the only
     power-of-two chunk that divides NOPE_DIM (448 = 7 x 64), and it is also the
-    width over which one E8M0 byte applies -- so the scale is loop-invariant
-    within a chunk and the transient fp8/bf16 tile stays ~6 VGPRs per thread,
+    width over which one E8M0 byte applies -- so the scale is a single
+    broadcast per chunk and the transient tile stays ~6 VGPRs per thread,
     which matters on top of an accumulator that already fills the register file.
+
+    Both the payload and its scale come out of the same LDS tile: the TDM
+    gather brought the whole 512-byte row in, scale bytes included. The tile is
+    held as uint8 so the scale region reads natively and the NoPE bytes are
+    bitcast to e4m3 -- an fp8-typed tile would reinterpret scale byte 0x7F
+    (the very common 2^0) as an e4m3 NaN.
 
     The trailing ``[NOPE_DIM, D)`` columns -- the packed row's scale and pad
     bytes -- are never dequantized at all: the RoPE store covers exactly that
-    range, so the e4m3-NaN scale bytes there can never reach a dot.
+    range, so those bytes can never reach a dot.
     """
     for g in tl.static_range(NOPE_DIM // GROUP_SIZE):
-        sc = _v4_group_scale(u8_ptr, slots, row_stride, NOPE_DIM + 2 * g)
+        sc = _v4_group_scale(
+            kv_u8_smem, NOPE_DIM + 2 * g, BLOCK_K, col_layout, group_layout
+        )
         raw = (
-            kv_fp8_smem.slice(g * GROUP_SIZE, GROUP_SIZE, dim=1)
+            kv_u8_smem.slice(g * GROUP_SIZE, GROUP_SIZE, dim=1)
             .load(group_layout)
+            .to(gl.float8e4nv, bitcast=True)
             .to(gl.bfloat16)
         )
-        kv_bf16_smem.slice(g * GROUP_SIZE, GROUP_SIZE, dim=1).store(raw * sc)
+        kv_bf16_smem.slice(g * GROUP_SIZE, GROUP_SIZE, dim=1).store(raw * sc[:, None])
     kv_bf16_smem.slice(NOPE_DIM, ROPE_DIM, dim=1).store(rope_smem.load(rope_layout))
 
 
@@ -847,8 +866,7 @@ def _pa_decode_sparse_v4_2buff(
     q_ptr,  # [T, H, D] fp8 packed (Q_PACKED) or bf16 NoPE||RoPE
     q_u8_ptr,  # uint8 alias of q_ptr (E8M0 scale bytes); dummy unless Q_PACKED
     q_rope_ptr,  # [T, H, ROPE_DIM] bf16;                 dummy unless Q_PACKED
-    unified_kv_ptr,  # [P, D] fp8 packed NoPE|scale|pad
-    kv_u8_ptr,  # uint8 alias of unified_kv_ptr (E8M0 scale bytes)
+    kv_u8_ptr,  # [P, D] packed NoPE|scale|pad, as raw bytes
     kv_rope_ptr,  # [P, ROPE_DIM] bf16
     kv_indices_ptr,
     kv_indptr_ptr,
@@ -961,7 +979,13 @@ def _pa_decode_sparse_v4_2buff(
         warps_per_cta=[num_warps, 1],
         order=[1, 0],
     )
-    scale_slot_layout: gl.constexpr = gl.SliceLayout(1, GROUP_BLOCKED_LAYOUT)
+    # [BLOCK_K, 1] reader for one column of E8M0 scale bytes out of the LDS tile
+    SCALE_COL_LAYOUT: gl.constexpr = gl.BlockedLayout(
+        size_per_thread=[1, 1],
+        threads_per_warp=[WARP_SIZE, 1],
+        warps_per_cta=[num_warps, 1],
+        order=[1, 0],
+    )
     # Q is dequantized once per program, so it takes the whole row at once;
     # holding one GROUP_SIZE group per thread keeps its scale gather uniform
     # too.
@@ -992,7 +1016,7 @@ def _pa_decode_sparse_v4_2buff(
     )
     slot_reg_layout: gl.constexpr = SLOT_BLOCKED_LAYOUT
 
-    kv_fp8_shared: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
+    kv_packed_shared: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
         [[BLOCK_D, 16]], [BLOCK_K, BLOCK_D], [1, 0]
     )
     kv_bf16_shared: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
@@ -1129,9 +1153,9 @@ def _pa_decode_sparse_v4_2buff(
     # ---- 2-stage pipeline (slots one tile ahead of the KV/RoPE gathers) ----
     NUM_BUFFERS: gl.constexpr = 2
     kv_bufs = gl.allocate_shared_memory(
-        unified_kv_ptr.dtype.element_ty,
+        gl.uint8,
         [NUM_BUFFERS, BLOCK_K, BLOCK_D],
-        kv_fp8_shared,
+        kv_packed_shared,
     )
     rope_bufs = gl.allocate_shared_memory(
         kv_rope_ptr.dtype.element_ty,
@@ -1149,11 +1173,11 @@ def _pa_decode_sparse_v4_2buff(
     )
 
     kv_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
-        base=unified_kv_ptr,
+        base=kv_u8_ptr,
         shape=[total_pages, BLOCK_D],
         strides=[kv_stride_n, 1],
         block_shape=[BLOCK_K, BLOCK_D],
-        layout=kv_fp8_shared,
+        layout=kv_packed_shared,
     )
     rope_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
         base=kv_rope_ptr,
@@ -1190,7 +1214,6 @@ def _pa_decode_sparse_v4_2buff(
         safe_slot_cur = slot_reg
     gl.amd.gfx1250.tdm.async_gather(kv_desc, safe_slot_cur, kv_bufs.index(0))
     gl.amd.gfx1250.tdm.async_gather(rope_desc, safe_slot_cur, rope_bufs.index(0))
-    cur_slots = gl.convert_layout(safe_slot_cur, scale_slot_layout)
 
     buf_idx: gl.int32 = 0
 
@@ -1225,7 +1248,6 @@ def _pa_decode_sparse_v4_2buff(
         gl.amd.gfx1250.tdm.async_gather(
             rope_desc, safe_next_slot, rope_bufs.index(async_idx)
         )
-        next_slots = gl.convert_layout(safe_next_slot, scale_slot_layout)
 
         # Retire KV[i] + RoPE[i]; slot[i+2], KV[i+1], RoPE[i+1] stay in flight.
         gl.amd.gfx1250.tdm.async_wait(3)
@@ -1235,9 +1257,8 @@ def _pa_decode_sparse_v4_2buff(
             kv_bufs.index(buf_idx),
             kv_bf16,
             rope_bufs.index(buf_idx),
-            kv_u8_ptr,
-            cur_slots,
-            kv_stride_n,
+            BLOCK_K,
+            SCALE_COL_LAYOUT,
             GROUP_BLOCKED_LAYOUT,
             ROPE_BLOCKED_LAYOUT,
             NOPE_DIM,
@@ -1277,7 +1298,6 @@ def _pa_decode_sparse_v4_2buff(
 
         if HAS_INVALID:
             cur_valid = next_valid
-        cur_slots = next_slots
         buf_idx = async_idx
 
     # ---- Epilogue: process final tile (tile_end - 1) ----
@@ -1294,9 +1314,8 @@ def _pa_decode_sparse_v4_2buff(
         kv_bufs.index(buf_idx),
         kv_bf16,
         rope_bufs.index(buf_idx),
-        kv_u8_ptr,
-        cur_slots,
-        kv_stride_n,
+        BLOCK_K,
+        SCALE_COL_LAYOUT,
         GROUP_BLOCKED_LAYOUT,
         ROPE_BLOCKED_LAYOUT,
         NOPE_DIM,

@@ -795,9 +795,10 @@ def _pa_decode_sparse_v4_2buff(
 
     out = torch.empty((T, H, D), dtype=torch.bfloat16, device=q.device)
 
-    # uint8 aliases: the E8M0 scale bytes live inside the packed rows, and an
-    # fp8-typed pointer would reinterpret them as e4m3 (byte 0x7F == scale 2^0
-    # is an e4m3 NaN).
+    # The kernel reads the packed pool as raw bytes: the E8M0 scale bytes live
+    # inside the rows, and an fp8-typed tile would reinterpret them as e4m3
+    # (byte 0x7F == scale 2^0 is an e4m3 NaN). The NoPE bytes are bitcast back
+    # to e4m3 in-kernel.
     kv_u8 = unified_kv.view(torch.uint8)
     q_u8 = q.view(torch.uint8) if q_packed else q
 
@@ -883,7 +884,6 @@ def _pa_decode_sparse_v4_2buff(
         q,
         q_u8,
         q_rope if q_packed else q,
-        unified_kv,
         kv_u8,
         unified_kv_rope,
         kv_indices,
