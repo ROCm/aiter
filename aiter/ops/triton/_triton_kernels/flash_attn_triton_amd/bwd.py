@@ -2744,7 +2744,6 @@ def _bwd_kernel_split_dq_noncausal(
 @triton.autotune(
     configs=preprocess_autotune_configs,
     key=PREPROCESS_AUTOTUNE_KEYS,
-    use_cuda_graph=True,
 )
 @triton.jit
 def _bwd_preprocess(
@@ -3310,7 +3309,6 @@ def _sliding_window_k_bounds(
 @triton.autotune(
     configs=causal_autotune_configs,
     key=CAUSAL_AUTOTUNE_KEYS,
-    use_cuda_graph=True,
 )
 @triton.jit
 def bwd_kernel_fused_causal(  # grid = (nheads_k, tl.cdiv(max_seqlen_q // BLOCK_M2), batch)
@@ -3932,7 +3930,6 @@ def bwd_kernel_fused_causal(  # grid = (nheads_k, tl.cdiv(max_seqlen_q // BLOCK_
 @triton.autotune(
     configs=noncausal_autotune_configs,
     key=NONCAUSAL_AUTOTUNE_KEYS,
-    use_cuda_graph=True,
 )
 @triton.jit
 def bwd_kernel_fused_noncausal(
