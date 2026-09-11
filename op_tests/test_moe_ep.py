@@ -439,7 +439,7 @@ def test_fmoe_ep_mxfp4(
     expert (routed or active shared), deduplicated to one buffer row per token.
     MORI returns that count as the device scalar `total_recv_t`, which ATOM
     forwards to fused_moe as `num_local_tokens` (mirrors
-    test_mega_moe_gfx1250.py's DeviceMoEPipeline._layer_step, where total_recv_t
+    test_mega_moe.py's DeviceMoEPipeline._layer_step, where total_recv_t
     comes straight from op.dispatch and feeds moe_forward's num_local_tokens).
 
     The dispatch buffer has `trim_M` rows with the full `topk` routing dimension.
@@ -623,7 +623,7 @@ def test_fmoe_ep_mxfp4(
         # total_recv_t: device scalar matching MORI's dispatch return; fused_moe
         # gets it as num_local_tokens and processes only the first total_recv rows,
         # skipping the padded tail (mirrors DeviceMoEPipeline._layer_step in
-        # test_mega_moe_gfx1250.py, where total_recv_t from op.dispatch feeds
+        # test_mega_moe.py, where total_recv_t from op.dispatch feeds
         # moe_forward's num_local_tokens).
         total_recv_t = torch.tensor([total_recv], dtype=dtypes.i32, device="cuda")
         num_local_tokens = total_recv_t

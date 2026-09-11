@@ -217,7 +217,7 @@ speedup and stage-2 overlap rate):
 
     MORI_V2_KERNEL_BACKEND=hip MEGA_DISPATCH=mori \
     torchrun --standalone --nproc_per_node=4 \
-      op_tests/multigpu_tests/test_mega_moe_gfx1250.py \
+      op_tests/multigpu_tests/test_mega_moe.py \
       -e 384 -k 6 -hd 7168 -id 3072 \
       --layers 61 -tpr 512 --combine both \
       --acc_verify 0 --profile_table 0
@@ -1372,7 +1372,7 @@ def run_mega_moe(args):
     # perRankSize=4294967296. Increase perRankVmmSize at ccoCommCreate". That
     # size is a ccoCommCreate argument with no environment variable behind it
     # (Communicator.DEFAULT_PER_RANK_VMM, 4 GiB), and
-    # test_mega_moe_gfx1250.py:512 calls Communicator.init() without passing it.
+    # test_mega_moe.py calls Communicator.init() without passing it.
     # MORI_SHMEM_HEAP_SIZE is read only in mori/src/shmem/init.cpp and feeds a
     # different allocator. The same error also prints "Hint: Increase via
     # MORI_SHMEM_HEAP_SIZE" -- that hint is what points the wrong way.
@@ -1381,7 +1381,7 @@ def run_mega_moe(args):
         "torchrun",
         "--standalone",
         "--nproc_per_node=4",
-        "op_tests/multigpu_tests/test_mega_moe_gfx1250.py",
+        "op_tests/multigpu_tests/test_mega_moe.py",
         "-e",
         "384",
         "-k",
