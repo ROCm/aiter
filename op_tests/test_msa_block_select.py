@@ -235,7 +235,7 @@ def test_topk(num_idx_heads: int, batch: int, ctx: int, query_len: int):
     return {"pass": "topk", "us": avg_us}
 
 
-l_num_idx_heads = [1, 2]
+l_num_idx_heads = [1, 2, 4, 8, 16]
 l_batch = [4, 8, 16, 32, 64, 128]
 l_ctx = [4096, 8192, 16384, 32768, 65536, 128000]
 l_query_len = [1, 4]
@@ -250,7 +250,7 @@ parser.add_argument(
     type=int,
     nargs="*",
     default=None,
-    help="Index heads per rank. Only 1 and 2 are built. e.g. -H 1 2",
+    help="Index heads per rank. Supported values: 1, 2, 4, 8, and 16",
 )
 parser.add_argument(
     "-b", "--batch", type=int, nargs="*", default=None, help="Requests per launch"

@@ -168,10 +168,20 @@ void launch_topk(SPARSE_TOPK_PARAMS)
 // scoring & topk kernel instantiation configuration tables
 // ---------------------------------------------------------------------------
 // (index heads, waves)
-#define SPARSE_DECODE_TABLE(F) F(1, 1) F(1, 2) F(1, 4) F(2, 1) F(2, 2) F(2, 4)
+#define SPARSE_DECODE_TABLE(F)              \
+    F(1, 1) F(1, 2) F(1, 4)                \
+    F(2, 1) F(2, 2) F(2, 4)                \
+    F(4, 1) F(4, 2) F(4, 4)                \
+    F(8, 1) F(8, 2) F(8, 4)                \
+    F(16, 1) F(16, 2) F(16, 4)
 
 // (index heads, query tiles)
-#define SPARSE_PREFILL_TABLE(F) F(1, 1) F(1, 2) F(1, 4) F(2, 1) F(2, 2) F(2, 4)
+#define SPARSE_PREFILL_TABLE(F)             \
+    F(1, 1) F(1, 2) F(1, 4)                \
+    F(2, 1) F(2, 2) F(2, 4)                \
+    F(4, 1) F(4, 2) F(4, 4)                \
+    F(8, 1) F(8, 2) F(8, 4)                \
+    F(16, 1) F(16, 2) F(16, 4)
 
 // (slots, waves)
 // clang-format off
