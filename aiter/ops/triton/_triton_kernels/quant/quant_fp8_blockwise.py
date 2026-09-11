@@ -12,7 +12,7 @@ from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
 # repr keys are the int constexprs that select the compiled variant; FP8_MAX
 # (a float) is omitted so a fractional value can't put a "." in the trace name.
 _quant_fp8_blockwise_kernel_repr = make_kernel_repr(
-    "quant_fp8_blockwise_kernel", ["BLOCK_SIZE", "AXIS", "DUAL"]
+    "quant_fp8_blockwise_kernel", ["BLOCK_SIZE", "AXIS", "DUAL", "SCALE_FMT"]
 )
 _quant_fp8_blockwise_segment_m_kernel_repr = make_kernel_repr(
     "quant_fp8_blockwise_segment_m_kernel", ["BLOCK_SIZE"]
@@ -41,6 +41,22 @@ def _compute_scale_and_quant(x_tile, x_tile_abs, axis, FP8_MAX):
     return x_fp8_tile, x_scales_tile
 
 
+# ue8m0 variant: the dequant scale is rounded up to a power of two so it fits
+# the e8m0 (biased-exponent byte) storage format. Returns the quantized tile
+# and that exponent byte. Mirrors DeepSeek's fast_round_scale: the 1e-4 amax
+# floor and the ceil(log2(amax / FP8_MAX)) rounding are part of the format.
+@triton.jit
+def _compute_scale_and_quant_ue8m0(x_tile, x_tile_abs, axis, FP8_MAX: tl.constexpr):
+    FP8_MAX_INV: tl.constexpr = 1.0 / FP8_MAX
+    x_tile_max = tl.max(x_tile_abs, axis=axis, keep_dims=True)
+    x_tile_max = tl.maximum(x_tile_max, 1e-4)
+    dequant_scale = x_tile_max * FP8_MAX_INV
+    dequant_exp = (dequant_scale.to(tl.uint32, bitcast=True) + 0x007FFFFF) & 0x7F800000
+    x_fp8_tile = x_tile / dequant_exp.to(tl.float32, bitcast=True)
+    x_fp8_tile = tl.clamp(x_fp8_tile, min=-FP8_MAX, max=FP8_MAX)
+    return x_fp8_tile, (dequant_exp >> 23).to(tl.uint8)
+
+
 # Blockwise quantize. AXIS selects the scale axis (1 = row-wise 1xBLOCK,
 # 0 = col-wise BLOCKx1). When DUAL, also emit the col-wise (axis=0) copy from
 # the same loaded tile — the activation-gradient path needs both directions.
@@ -57,6 +73,7 @@ def quant_fp8_blockwise_kernel(
     FP8_MAX: tl.constexpr,
     AXIS: tl.constexpr,
     DUAL: tl.constexpr,
+    SCALE_FMT: tl.constexpr = "fp32",
 ):
     pid_m = tl.program_id(axis=0)
     pid_n = tl.program_id(axis=1)
@@ -70,9 +87,15 @@ def quant_fp8_blockwise_kernel(
     x_tile_abs = tl.abs(x_tile)
 
     # Primary (AXIS) quantization.
-    x_fp8_tile, x_scales_tile = _compute_scale_and_quant(
-        x_tile, x_tile_abs, AXIS, FP8_MAX
-    )
+    if SCALE_FMT == "ue8m0":
+        x_fp8_tile, x_scales_out = _compute_scale_and_quant_ue8m0(
+            x_tile, x_tile_abs, AXIS, FP8_MAX
+        )
+    else:
+        x_fp8_tile, x_scales_tile = _compute_scale_and_quant(
+            x_tile, x_tile_abs, AXIS, FP8_MAX
+        )
+        x_scales_out = 1.0 / x_scales_tile
     tl.store(
         x_fp8_ptr + offs_m[:, None] * N + offs_n[None, :],
         x_fp8_tile.to(x_fp8_ptr.dtype.element_ty),
@@ -86,7 +109,7 @@ def quant_fp8_blockwise_kernel(
         scale_mask = offs_n < N
     tl.store(
         x_scales_ptr + scale_offs,
-        tl.reshape(1.0 / x_scales_tile, BLOCK_SIZE),
+        tl.reshape(x_scales_out, BLOCK_SIZE),
         mask=scale_mask,
     )
 

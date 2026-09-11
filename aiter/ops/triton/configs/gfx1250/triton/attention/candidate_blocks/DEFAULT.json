@@ -1,0 +1,17 @@
+{
+    "_candidate_block_scores_kernel": {
+        "BLOCKS_PER_TILE": 256,
+        "num_warps": 4,
+        "num_stages": 2
+    },
+    "_candidate_mask_scatter_kernel": {
+        "TOPK_TILE": 256,
+        "num_warps": 4,
+        "num_stages": 1
+    },
+    "_apply_candidate_mask_kernel": {
+        "TILE_W": 2048,
+        "num_warps": 4,
+        "num_stages": 2
+    }
+}

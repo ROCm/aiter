@@ -69,6 +69,19 @@ def _resolve_x_scale_strides(
     return x_scales.stride(0), x_scales.stride(1)
 
 
+def _check_w_scales(
+    w_scales: torch.Tensor, N: int, K: int, n_group: int, k_group: int
+) -> None:
+    """The kernel broadcasts one e8m0 byte over an (n_group, k_group) block."""
+    assert (
+        n_group % 32 == 0 and k_group % 32 == 0
+    ), f"w_scale_group_size must be multiples of 32, got ({n_group}, {k_group})"
+    expected = ((N + n_group - 1) // n_group, (K + k_group - 1) // k_group)
+    assert (
+        tuple(w_scales.shape[-2:]) == expected
+    ), f"w_scales must have shape {expected}, got {tuple(w_scales.shape)}"
+
+
 def gemm_afp8wfp8(
     x: torch.Tensor,
     w: torch.Tensor,
@@ -80,10 +93,11 @@ def gemm_afp8wfp8(
     skip_reduce: bool | None = False,
     x_scale_group_size: int = 128,
     is_x_scale_transposed: bool = False,
+    w_scale_group_size: tuple[int, int] = (128, 128),
 ) -> torch.Tensor:
     """
     Computes matrix multiplication Y = X @ W^T with FP8 activations and FP8
-    weights (e8m0 act scales, 128x128 e8m0 weight scales).
+    weights (e8m0 act scales, 2-D e8m0 weight block scales).
 
     Args:
         x: FP8 e4m3 (or uint8 view) input matrix with shape (M, K).
@@ -91,7 +105,8 @@ def gemm_afp8wfp8(
            transposed to (K, N) before the kernel call.
         x_scales: e8m0 (uint8) per-group scale for x with shape
            (M, K // x_scale_group_size).
-        w_scales: e8m0 (uint8) per-block scale for w with shape (N // 128, K // 128).
+        w_scales: e8m0 (uint8) per-block scale for w with shape
+           (ceil(N / w_scale_group_size[0]), ceil(K / w_scale_group_size[1])).
         dtype: Output dtype (BF16 or FP16). Default bf16.
         y: Optional pre-allocated output tensor with shape (M, N).
         config: Optional kernel-tuning dict. If None uses defaults.
@@ -99,6 +114,8 @@ def gemm_afp8wfp8(
            activations (default), 32 for MX activations.
         is_x_scale_transposed: x_scales bytes are column-major, i.e. logically
            (K // group, M). Default False (row-major).
+        w_scale_group_size: (N, K) extent of one weight scale block — (128, 128)
+           by default, (32, 32) for DeepSeek-V4.1-Flash dense weights.
 
     Returns:
         torch.Tensor: Output with shape (M, N).
@@ -109,6 +126,8 @@ def gemm_afp8wfp8(
     stride_asm, stride_ask = _resolve_x_scale_strides(
         x_scales, M, K, x_scale_group_size, is_x_scale_transposed
     )
+    w_scale_n_group, w_scale_k_group = w_scale_group_size
+    _check_w_scales(w_scales, N, K, w_scale_n_group, w_scale_k_group)
 
     # Transpose w to (K, N) for the kernel.
     w_t = w.T
@@ -119,6 +138,10 @@ def gemm_afp8wfp8(
         x = x.view(torch.uint8)
     if w_t.dtype != torch.uint8:
         w_t = w_t.view(torch.uint8)
+    if x_scales.dtype != torch.uint8:
+        x_scales = x_scales.view(torch.uint8)
+    if w_scales.dtype != torch.uint8:
+        w_scales = w_scales.view(torch.uint8)
 
     if config is None:
         config, _ = _get_config(M, N, K)
@@ -167,6 +190,8 @@ def gemm_afp8wfp8(
         w_scales.stride(0),
         w_scales.stride(1),
         A_SCALE_K_GROUP=x_scale_group_size,
+        B_SCALE_N_GROUP=w_scale_n_group,
+        B_SCALE_K_GROUP=w_scale_k_group,
         **config,
     )
 

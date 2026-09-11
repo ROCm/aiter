@@ -3,6 +3,7 @@
 """Python wrappers for FP8 block-wise quantization kernels."""
 
 import math
+from typing import Literal
 
 import torch
 
@@ -58,6 +59,7 @@ def quant_fp8_blockwise(
     fp8_max: float = _FP8_MAX,
     axis: int = 1,
     quant_dtype: torch.dtype = torch.float8_e4m3fnuz,
+    scale_fmt: Literal["fp32", "ue8m0"] = "fp32",
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Block-wise FP8 quantization of a 2-D tensor.
 
@@ -70,6 +72,10 @@ def quant_fp8_blockwise(
                     ``0`` = col-wise (one scale per col-block).
         quant_dtype: Output FP8 dtype (default: ``float8_e4m3fnuz`` for gfx942;
                     pass ``torch.float8_e4m3fn`` for gfx950 / OCP).
+        scale_fmt:  Scale format. ``"fp32"`` keeps the amax/fp8_max scale in
+                    float32. ``"ue8m0"`` rounds it up to a power of two and
+                    stores it as ``float8_e8m0fnu`` (requires an e4m3 output
+                    dtype); the amax floor is 1e-4 in that mode.
 
     Returns:
         ``(x_fp8, scales)`` where ``x_fp8`` is ``[M, N]`` ``quant_dtype`` and
@@ -81,31 +87,41 @@ def quant_fp8_blockwise(
         x.ndim == 2 and x.is_contiguous()
     ), f"expected 2-D contiguous input, got shape {x.shape} strides {x.stride()}"
     assert axis in (0, 1), f"axis must be 0 or 1, got {axis}"
+    assert scale_fmt in ("fp32", "ue8m0"), f"unknown scale_fmt {scale_fmt!r}"
+    if scale_fmt == "ue8m0":
+        assert quant_dtype in (
+            torch.float8_e4m3fn,
+            torch.float8_e4m3fnuz,
+        ), f"ue8m0 requires an fp8 e4m3 quant_dtype, got {quant_dtype}"
     _check_block_fp8(block_size, fp8_max, quant_dtype)
     M, N = x.shape
+    scale_dtype = torch.float8_e8m0fnu if scale_fmt == "ue8m0" else torch.float32
     x_fp8 = torch.empty_like(x, dtype=quant_dtype)
     if axis == 1:
         scales = torch.empty(
-            M, math.ceil(N / block_size), dtype=torch.float32, device=x.device
+            M, math.ceil(N / block_size), dtype=scale_dtype, device=x.device
         )
     else:
         scales = torch.empty(
-            math.ceil(M / block_size), N, dtype=torch.float32, device=x.device
+            math.ceil(M / block_size), N, dtype=scale_dtype, device=x.device
         )
+    # e8m0 is a raw exponent byte; the kernel writes it through a uint8 view.
+    scales_arg = scales.view(torch.uint8) if scale_fmt == "ue8m0" else scales
 
     grid = (math.ceil(M / block_size), math.ceil(N / block_size))
     quant_fp8_blockwise_kernel[grid](
         x,
         x_fp8,
-        scales,
+        scales_arg,
         x_fp8,  # col ptrs reuse primary buffers: DUAL=False is constexpr so
-        scales,  # Triton's dead-code elimination prunes the col stores entirely.
+        scales_arg,  # Triton's dead-code elimination prunes the col stores entirely.
         M,
         N,
         BLOCK_SIZE=block_size,
         FP8_MAX=fp8_max,
         AXIS=axis,
         DUAL=False,
+        SCALE_FMT=scale_fmt,
         **_launch_params(block_size),
     )
     return x_fp8, scales

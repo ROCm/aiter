@@ -16,6 +16,8 @@ _gemm_afp8wfp8_repr = make_kernel_repr(
         "BLOCK_SIZE_K",
         "GROUP_SIZE_M",
         "A_SCALE_K_GROUP",
+        "B_SCALE_N_GROUP",
+        "B_SCALE_K_GROUP",
         "num_warps",
         "num_stages",
         "waves_per_eu",
@@ -67,6 +69,8 @@ def _gemm_afp8wfp8_kernel(
     waves_per_eu: tl.constexpr,
     matrix_instr_nonkdim: tl.constexpr,
     cache_modifier: tl.constexpr,
+    B_SCALE_N_GROUP: tl.constexpr = 128,
+    B_SCALE_K_GROUP: tl.constexpr = 128,
 ):
     """
     Kernel for computing the matmul C = A x B.
@@ -76,8 +80,10 @@ def _gemm_afp8wfp8_kernel(
     coarser-than-32 scales are broadcast to the 32-element groups tl.dot_scaled
     requires. The caller folds a transposed scale buffer into stride_asm /
     stride_ask, so both layouts are handled here identically.
-    B_scales are stored compact e8m0 (uint8) with shape (N // 128, K // 128),
-    representing 128x128 weight blocks. Broadcast inside kernel to (N, K // 32).
+    B_scales are stored compact e8m0 (uint8) with shape
+    (N // B_SCALE_N_GROUP, K // B_SCALE_K_GROUP), representing
+    B_SCALE_N_GROUP x B_SCALE_K_GROUP weight blocks (128x128 by default, 32x32
+    for DeepSeek-V4.1-Flash). Broadcast inside kernel to (N, K // 32).
     A has shape (M, K), B has shape (K, N) and C has shape (M, N).
     Output dtype is determined by c_ptr (bf16 or fp16).
     When NUM_KSPLIT > 1, K is split into NUM_KSPLIT partitions of
@@ -117,8 +123,6 @@ def _gemm_afp8wfp8_kernel(
 
     # Scale group sizes
     SCALE_GROUP_SIZE: tl.constexpr = 32  # A: per 32 elements along K
-    B_SCALE_K_GROUP: tl.constexpr = 128  # B: per 128 along K
-    B_SCALE_N_GROUP: tl.constexpr = 128  # B: per 128 along N
 
     if (pid_k * SPLITK_BLOCK_SIZE) < K:
         # K-block iteration range for this split (absolute block indices).

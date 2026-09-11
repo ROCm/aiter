@@ -1,0 +1,14 @@
+{
+    "M_LEQ_4096": {
+        "BLOCK_D": 2048,
+        "num_warps": 8,
+        "num_stages": 1,
+        "waves_per_eu": 0
+    },
+    "any": {
+        "BLOCK_D": 2048,
+        "num_warps": 4,
+        "num_stages": 1,
+        "waves_per_eu": 0
+    }
+}

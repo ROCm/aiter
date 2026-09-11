@@ -22,8 +22,24 @@ _gemm_a8w8_blockscale_repr = make_kernel_repr(
         "EVEN_K",
         "GRID_MN",
         "cache_modifier",
+        "A_SCALE_E8M0",
+        "B_SCALE_E8M0",
     ],
 )
+
+
+# Block scales are either fp32 or a raw e8m0 exponent byte (value 2**(e-127),
+# which the shift reconstructs exactly). k_rem guards the scale groups past K
+# when the K tile is only partially valid.
+@triton.jit
+def _load_block_scale(ptrs, k_rem, IS_E8M0: tl.constexpr, EVEN_K: tl.constexpr):
+    if EVEN_K:
+        scale = tl.load(ptrs)
+    else:
+        scale = tl.load(ptrs, mask=k_rem > 0, other=0)
+    if IS_E8M0:
+        scale = (scale.to(tl.uint32) << 23).to(tl.float32, bitcast=True)
+    return scale
 
 
 @triton.heuristics(
@@ -73,6 +89,8 @@ def _gemm_a8w8_blockscale_kernel(
     GRID_MN: tl.constexpr,
     cache_modifier: tl.constexpr,
     num_stages: tl.constexpr,
+    A_SCALE_E8M0: tl.constexpr = False,
+    B_SCALE_E8M0: tl.constexpr = False,
 ):
     """
     Note: this is Triton jited function and not meant to be called directly. Call gemm_a8w8_blockscale function
@@ -90,7 +108,9 @@ def _gemm_a8w8_blockscale_kernel(
     *scale_k = (K + GROUP_K - 1) // GROUP_K
     **scale_n = (N + GROUP_N - 1) // GROUP_N
 
-    For this kernel implementation, GROUP_K must equal BLOCK_K.
+    BLOCK_SIZE_K must be a multiple of GROUP_K: one K tile applies
+    BLOCK_SIZE_K // GROUP_K successive scale steps. Scales are fp32, or raw
+    e8m0 exponent bytes when A_SCALE_E8M0 / B_SCALE_E8M0.
     """
 
     tl.assume(stride_am > 0)
@@ -132,8 +152,12 @@ def _gemm_a8w8_blockscale_kernel(
         num_k_iter = tl.cdiv(SPLITK_BLOCK_SIZE, BLOCK_SIZE_K)
         # ^ Number of K blocks within our split-K partition
 
+        # A K tile is walked one scale group at a time; the two coincide on the
+        # 128/fp32 path (NUM_KGROUPS == 1).
+        NUM_KGROUPS: tl.constexpr = BLOCK_SIZE_K // GROUP_K
+
         # Create pointers for first block of A and B input matrices
-        offs_k = tl.arange(0, BLOCK_SIZE_K)
+        offs_k = tl.arange(0, GROUP_K)
         offs_k_split = pid_k * SPLITK_BLOCK_SIZE + offs_k
         offs_am = (pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)) % M
         offs_bn = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)) % N
@@ -155,7 +179,6 @@ def _gemm_a8w8_blockscale_kernel(
             + offs_k_scale * stride_bscale_k
             + offs_b_scale_n * stride_bscale_n
         )
-        offs_ks_step = BLOCK_SIZE_K // GROUP_K
 
         acc_dtype = tl.float32 if c_ptr.type.element_ty != tl.int8 else tl.int32
         accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=acc_dtype)
@@ -163,31 +186,29 @@ def _gemm_a8w8_blockscale_kernel(
         for k in tl.range(
             pid_k * num_k_iter, (pid_k + 1) * num_k_iter, num_stages=num_stages
         ):
-            # Load the next block of A and B, generate a mask by checking the K dimension.
-            # If it is out of bounds, set it to 0.
-            if EVEN_K:
-                a = tl.load(a_ptrs)
-                b = tl.load(b_ptrs, cache_modifier=cache_modifier)
-            else:
-                a = tl.load(
-                    a_ptrs, mask=offs_k[None, :] < K - k * BLOCK_SIZE_K, other=0.0
-                )
-                b = tl.load(
-                    b_ptrs, mask=offs_k[:, None] < K - k * BLOCK_SIZE_K, other=0.0
-                )
+            for g in tl.static_range(NUM_KGROUPS):
+                # Load the next block of A and B, generate a mask by checking the K dimension.
+                # If it is out of bounds, set it to 0.
+                k_rem = K - k * BLOCK_SIZE_K - g * GROUP_K
+                if EVEN_K:
+                    a = tl.load(a_ptrs)
+                    b = tl.load(b_ptrs, cache_modifier=cache_modifier)
+                else:
+                    a = tl.load(a_ptrs, mask=offs_k[None, :] < k_rem, other=0.0)
+                    b = tl.load(b_ptrs, mask=offs_k[:, None] < k_rem, other=0.0)
 
-            a_scale = tl.load(a_scale_ptrs)
-            b_scale = tl.load(b_scale_ptrs)
+                a_scale = _load_block_scale(a_scale_ptrs, k_rem, A_SCALE_E8M0, EVEN_K)
+                b_scale = _load_block_scale(b_scale_ptrs, k_rem, B_SCALE_E8M0, EVEN_K)
 
-            # Perform dot operation and apply scale
-            accumulator += tl.dot(a, b) * a_scale[:, None] * b_scale[None, :]
+                # Perform dot operation and apply scale
+                accumulator += tl.dot(a, b) * a_scale[:, None] * b_scale[None, :]
 
-            # Advance the ptrs to the next K block.
-            a_ptrs += BLOCK_SIZE_K * stride_ak
-            b_ptrs += BLOCK_SIZE_K * stride_bk
+                # Advance the ptrs to the next K scale group.
+                a_ptrs += GROUP_K * stride_ak
+                b_ptrs += GROUP_K * stride_bk
 
-            a_scale_ptrs += offs_ks_step * stride_ascale_k
-            b_scale_ptrs += offs_ks_step * stride_bscale_k
+                a_scale_ptrs += stride_ascale_k
+                b_scale_ptrs += stride_bscale_k
 
         c = accumulator.to(c_ptr.type.element_ty)
 

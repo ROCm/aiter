@@ -1,0 +1,30 @@
+{
+    "M_LEQ_16": {
+        "BLOCK_H": 1,
+        "BLOCK_D": 256,
+        "num_warps": 1,
+        "num_stages": 1,
+        "waves_per_eu": 0
+    },
+    "M_LEQ_256": {
+        "BLOCK_H": 4,
+        "BLOCK_D": 256,
+        "num_warps": 1,
+        "num_stages": 1,
+        "waves_per_eu": 0
+    },
+    "M_LEQ_16384": {
+        "BLOCK_H": 8,
+        "BLOCK_D": 256,
+        "num_warps": 2,
+        "num_stages": 1,
+        "waves_per_eu": 0
+    },
+    "any": {
+        "BLOCK_H": 32,
+        "BLOCK_D": 256,
+        "num_warps": 2,
+        "num_stages": 1,
+        "waves_per_eu": 0
+    }
+}

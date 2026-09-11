@@ -20,6 +20,7 @@ from aiter.ops.triton._triton_kernels.gemm.basic.gemm_a8w8_blockscale import (
 from aiter.ops.triton._triton_kernels.gemm.basic.gemm_a8w8_blockscale import (
     _get_config,
 )
+from aiter.ops.triton.gemm.basic.gemm_afp8wfp8 import gemm_afp8wfp8
 from aiter.ops.triton.utils._triton.arch_info import get_arch
 from aiter.ops.triton.utils.gemm_config_utils import compute_splitk_params
 from aiter.ops.triton.utils.logger import AiterTritonLogger
@@ -64,6 +65,14 @@ def gemm_a8w8_blockscale(
 
     Returns:
         torch.Tensor: Output with shape (M, N).
+
+    The scale block sizes are inferred from the scale shapes. On the triton
+    backend the K group may be smaller than BLOCK_SIZE_K (e.g. the 32x32 ue8m0
+    weight blocks of DeepSeek-V4.1-Flash inside a 128-wide tile) and either
+    scale tensor may be float8_e8m0fnu instead of float32; the gluon backend
+    still requires 128-wide fp32 groups. When both scales are e8m0 and K is a
+    whole number of groups the call is served by gemm_afp8wfp8, whose
+    tl.dot_scaled kernel applies that format in the MFMA.
     """
     _LOGGER.info(
         f"GEMM_A8W8_BLOCKSCALE: x={tuple(x.shape)} w={tuple(w.shape)} x_scale={tuple(x_scale.shape)} w_scale={tuple(w_scale.shape)}"
@@ -75,9 +84,14 @@ def gemm_a8w8_blockscale(
     # Check constraints.
     assert x.shape[1] == w.shape[1], "Incompatible dimensions!!!"
 
-    # Transpose w and w_scale
-    w = w.T  # (K, N)
-    w_scale = w_scale.T  # (scale_k, scale_n)
+    # e8m0 scales are raw exponent bytes; the kernel reads them through a
+    # uint8 view (the view must happen before the transpose below).
+    a_scale_e8m0 = x_scale.dtype == torch.float8_e8m0fnu
+    b_scale_e8m0 = w_scale.dtype == torch.float8_e8m0fnu
+    if a_scale_e8m0:
+        x_scale = x_scale.view(torch.uint8)
+    if b_scale_e8m0:
+        w_scale = w_scale.view(torch.uint8)
 
     if backend is None:
         backend = "gluon" if get_arch() in _GLUON_DEFAULT_ARCHS else "triton"
@@ -91,6 +105,46 @@ def gemm_a8w8_blockscale(
         assert (
             get_arch() in _GLUON_SUPPORTED_ARCHS
         ), f"Gluon backend requires one of {_GLUON_SUPPORTED_ARCHS}, got '{get_arch()}'"
+        assert not (
+            a_scale_e8m0 or b_scale_e8m0
+        ), "e8m0 block scales require the triton backend"
+
+    if a_scale_e8m0 and b_scale_e8m0:
+        group_n = triton.next_power_of_2(triton.cdiv(N, w_scale.shape[0]))
+        group_k = triton.next_power_of_2(triton.cdiv(K, w_scale.shape[1]))
+        # e8m0 scales on both sides are what tl.dot_scaled consumes natively
+        # (one exponent byte per 32 K elements), so hand the whole tile to the
+        # scaled-MFMA kernel instead of re-scaling once per group below.
+        if K % group_k == 0 and group_k in (32, 128) and group_n % 32 == 0:
+            _LOGGER.info(
+                f"GEMM_A8W8_BLOCKSCALE: e8m0 {group_n}x{group_k} scales -> gemm_afp8wfp8"
+            )
+            if config is None:
+                # Both kernels take the same tuning keys, so keep this op's
+                # tuned tiles rather than the ones tuned for 128x128 weight
+                # blocks. gemm_afp8wfp8 rebuilds SPLITK_BLOCK_SIZE as
+                # cdiv(K, NUM_KSPLIT), which its kernel needs to be a whole
+                # number of K tiles; hand the tile over only when it is.
+                config, _ = _get_config(M, N, K, backend=backend)
+                compute_splitk_params(config, K)
+                if triton.cdiv(K, config["NUM_KSPLIT"]) % config["BLOCK_SIZE_K"]:
+                    config = None
+            return gemm_afp8wfp8(
+                x,
+                w,
+                x_scale,
+                w_scale,
+                dtype,
+                y,
+                config=config,
+                skip_reduce=skip_reduce,
+                x_scale_group_size=group_k,
+                w_scale_group_size=(group_n, group_k),
+            )
+
+    # Transpose w and w_scale
+    w = w.T  # (K, N)
+    w_scale = w_scale.T  # (scale_k, scale_n)
 
     if config is None:
         config, _ = _get_config(M, N, K, backend=backend)
@@ -121,9 +175,14 @@ def gemm_a8w8_blockscale(
         triton.cdiv(N, w_scale.shape[1])
     )  # scale_block_size_n
 
-    assert (
-        config["GROUP_K"] == config["BLOCK_SIZE_K"]
-    ), "GROUP_K must equal BLOCK_SIZE_K"
+    if backend == "gluon":
+        assert (
+            config["GROUP_K"] == config["BLOCK_SIZE_K"]
+        ), "GROUP_K must equal BLOCK_SIZE_K"
+    else:
+        assert (
+            config["BLOCK_SIZE_K"] % config["GROUP_K"] == 0
+        ), "BLOCK_SIZE_K must be a multiple of GROUP_K"
 
     # grid = (config["NUM_KSPLIT"], triton.cdiv(M, config["BLOCK_SIZE_M"]) * triton.cdiv(N, config["BLOCK_SIZE_N"]),)
     grid = lambda META: (
@@ -171,6 +230,8 @@ def gemm_a8w8_blockscale(
         )
     else:
         impl = triton_gemm_a8w8_blockscale_kernel
+        extra_constexpr["A_SCALE_E8M0"] = a_scale_e8m0
+        extra_constexpr["B_SCALE_E8M0"] = b_scale_e8m0
 
     impl[grid](
         x,
