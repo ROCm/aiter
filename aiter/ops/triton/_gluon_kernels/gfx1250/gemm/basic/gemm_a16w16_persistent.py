@@ -333,6 +333,8 @@ def gemm_a16w16_persistent_kernel_(
                 cur_b = next_b
                 compute_idx += 1
 
+            accumulator = gl.amd.gfx1250.wmma(cur_a, cur_b, accumulator)
+
             if ADD_BIAS and pid_k == 0 and WRITES_FINAL:
                 offs_bias = n_off + gl.arange(
                     0, BLOCK_N, layout=gl.SliceLayout(0, WMMA_LAYOUT)
