@@ -15,6 +15,7 @@ weights, PerTensor / PerToken weight scales).
 from __future__ import annotations
 
 import functools
+from dataclasses import dataclass
 from enum import Enum
 
 import torch
@@ -44,24 +45,85 @@ class WeightLayout(str, Enum):
     PRESHUFFLED = "preshuffled"
 
 
-def _require_supported_weight_layout(
-    weight_layout: str | WeightLayout,
-) -> WeightLayout:
+@dataclass(frozen=True)
+class _PreshuffleBSpec:
+    """Pinned fused-MoE B contract (CDNA ``shuffle_weight``, not gfx1250 WMMA).
+
+    Warp-decode keeps split ``w_gate`` / ``w_up`` / ``w_down``, so MXFP4 uses
+    ``shuffle_weight_a16w4(..., gate_up=False)`` (fused stage2 / w2), not the
+    fused stage1 ``gate_up=True`` helper on ``[E, 2*INTER, K]``.
+    """
+
+    helper: str
+    kpack_bytes: int
+    elem_bytes: int
+    n_multiple: int
+    packed_k_multiple: int
+
+
+# N-major ``make_preshuffle_b_layout`` / ``shuffle_weight`` permute (0,1,3,4,2,5).
+_PRESHUFFLE_FP8 = _PreshuffleBSpec(
+    helper="shuffle_weight(w, layout=(16, 16)); "
+    "make_preshuffle_b_layout(kpack_bytes=16, elem_bytes=1, k_major=False)",
+    kpack_bytes=16,
+    elem_bytes=1,
+    n_multiple=16,
+    packed_k_multiple=64,
+)
+_PRESHUFFLE_BF16 = _PreshuffleBSpec(
+    helper="shuffle_weight(w, layout=(16, 16)); "
+    "make_preshuffle_b_layout(kpack_bytes=16, elem_bytes=2, k_major=False)",
+    kpack_bytes=16,
+    elem_bytes=2,
+    n_multiple=16,
+    packed_k_multiple=32,
+)
+_PRESHUFFLE_MXFP4 = _PreshuffleBSpec(
+    helper="shuffle_weight_a16w4(w, 16, False); "
+    "a16wmix layout_b (N/16, (K/2)/64, klane=4, nlane=16, kpack=16)",
+    kpack_bytes=16,
+    elem_bytes=1,
+    n_multiple=16,
+    packed_k_multiple=64,
+)
+
+
+def _parse_weight_layout(weight_layout: str | WeightLayout) -> WeightLayout:
     """Accept only an explicit layout flag; never infer from strides."""
     try:
-        layout = WeightLayout(weight_layout)
+        return WeightLayout(weight_layout)
     except ValueError as error:
         raise ValueError(
             f"unsupported weight_layout: {weight_layout!r} "
             f"(expected {WeightLayout.K_CONTIGUOUS.value!r} or "
             f"{WeightLayout.PRESHUFFLED.value!r})"
         ) from error
-    if layout is WeightLayout.PRESHUFFLED:
+
+
+def _require_preshuffled_b_shape(
+    weight_layout: WeightLayout,
+    *,
+    n: int,
+    packed_k: int,
+    spec: _PreshuffleBSpec,
+    what: str,
+) -> None:
+    if weight_layout is WeightLayout.K_CONTIGUOUS:
+        return
+    if n % spec.n_multiple != 0 or packed_k % spec.packed_k_multiple != 0:
+        raise ValueError(
+            f"preshuffled {what} needs N % {spec.n_multiple} == 0 and "
+            f"packed K % {spec.packed_k_multiple} == 0, got N={n} "
+            f"packed_k={packed_k} ({spec.helper})"
+        )
+
+
+def _reject_unimplemented_preshuffle(weight_layout: WeightLayout) -> None:
+    if weight_layout is WeightLayout.PRESHUFFLED:
         raise ValueError(
             "weight_layout='preshuffled' is not implemented yet; "
             f"use weight_layout={WeightLayout.K_CONTIGUOUS.value!r}"
         )
-    return layout
 
 
 def _default_use_dot2() -> bool:
@@ -317,7 +379,7 @@ def flydsl_warp_decode_gate_up(
     Returns:
         [B, TOPK, INTER] bfloat16 intermediate.
     """
-    weight_layout = _require_supported_weight_layout(weight_layout)
+    weight_layout = _parse_weight_layout(weight_layout)
     if w_scale_mode not in ("pertensor", "pertoken", "block2d"):
         raise ValueError(f"unsupported w_scale_mode: {w_scale_mode!r}")
     assert x.dtype == torch.bfloat16, "activation must be bfloat16 for this path"
@@ -328,6 +390,14 @@ def flydsl_warp_decode_gate_up(
     assert Hk == HIDDEN, f"w_gate HIDDEN {Hk} != x HIDDEN {HIDDEN}"
     assert w_up.shape == w_gate.shape, "w_gate and w_up must share shape"
     TOPK = router_ids.shape[1]
+    _require_preshuffled_b_shape(
+        weight_layout,
+        n=INTER,
+        packed_k=HIDDEN,
+        spec=_PRESHUFFLE_FP8,
+        what="w_gate/w_up",
+    )
+    _reject_unimplemented_preshuffle(weight_layout)
 
     scale_bn = scale_bk = None
     if w_scale_mode == "block2d":
@@ -409,7 +479,7 @@ def flydsl_warp_decode_gate_up_fp8act(
     Returns:
         [B, TOPK, INTER] bfloat16 intermediate.
     """
-    weight_layout = _require_supported_weight_layout(weight_layout)
+    weight_layout = _parse_weight_layout(weight_layout)
     assert x.dtype == torch.float8_e4m3fn, "activation must be float8_e4m3fn"
     assert x.is_contiguous() and w_gate.is_contiguous() and w_up.is_contiguous()
     assert w_up.shape == w_gate.shape, "w_gate and w_up must share shape"
@@ -418,6 +488,14 @@ def flydsl_warp_decode_gate_up_fp8act(
     E, INTER, Hk = w_gate.shape
     assert Hk == HIDDEN, f"w_gate HIDDEN {Hk} != x HIDDEN {HIDDEN}"
     TOPK = router_ids.shape[1]
+    _require_preshuffled_b_shape(
+        weight_layout,
+        n=INTER,
+        packed_k=HIDDEN,
+        spec=_PRESHUFFLE_FP8,
+        what="w_gate/w_up",
+    )
+    _reject_unimplemented_preshuffle(weight_layout)
 
     scale_bn, scale_bk = int(scale_block[0]), int(scale_block[1])
     assert (E * INTER) % scale_bn == 0, "(E*INTER) must be divisible by BN"
@@ -495,7 +573,7 @@ def flydsl_warp_decode_gate_up_fp4(
     Returns:
         [B, TOPK, INTER] bfloat16 intermediate.
     """
-    weight_layout = _require_supported_weight_layout(weight_layout)
+    weight_layout = _parse_weight_layout(weight_layout)
     assert x.dtype == torch.bfloat16, "activation must be bfloat16 for this path"
     assert x.is_contiguous() and w_gate.is_contiguous() and w_up.is_contiguous()
     assert w_gate.shape == w_up.shape, "w_gate and w_up must share shape"
@@ -508,6 +586,14 @@ def flydsl_warp_decode_gate_up_fp4(
         packed_h == HIDDEN // 2
     ), f"w_gate last dim {packed_h} != HIDDEN//2 {HIDDEN // 2}"
     TOPK = router_ids.shape[1]
+    _require_preshuffled_b_shape(
+        weight_layout,
+        n=INTER,
+        packed_k=packed_h,
+        spec=_PRESHUFFLE_MXFP4,
+        what="w_gate/w_up",
+    )
+    _reject_unimplemented_preshuffle(weight_layout)
 
     scale_bn, scale_bk = int(scale_block[0]), int(scale_block[1])
     assert (E * INTER) % scale_bn == 0, "(E*INTER) must be divisible by BN"
@@ -592,7 +678,7 @@ def flydsl_warp_decode_down_reduce(
     Returns:
         [B, HIDDEN] bfloat16 output.
     """
-    weight_layout = _require_supported_weight_layout(weight_layout)
+    weight_layout = _parse_weight_layout(weight_layout)
     if w_scale_mode not in ("pertensor", "pertoken", "block2d"):
         raise ValueError(f"unsupported w_scale_mode: {w_scale_mode!r}")
     assert intermediate.dtype == torch.bfloat16, "intermediate must be bfloat16"
@@ -604,6 +690,14 @@ def flydsl_warp_decode_down_reduce(
     E, HIDDEN, Ik = w_down.shape
     assert Ik == INTER, f"w_down INTER {Ik} != intermediate INTER {INTER}"
     assert router_ids.shape == (B, TOPK), "router_ids must be [B, TOPK]"
+    _require_preshuffled_b_shape(
+        weight_layout,
+        n=HIDDEN,
+        packed_k=INTER,
+        spec=_PRESHUFFLE_FP8,
+        what="w_down",
+    )
+    _reject_unimplemented_preshuffle(weight_layout)
 
     scale_bn = scale_bk = None
     if w_scale_mode == "block2d":
@@ -697,7 +791,7 @@ def flydsl_warp_decode_gate_up_bf16(
     Returns:
         [B, TOPK, INTER] bfloat16 intermediate.
     """
-    weight_layout = _require_supported_weight_layout(weight_layout)
+    weight_layout = _parse_weight_layout(weight_layout)
     assert x.dtype == torch.bfloat16, "activation must be bfloat16"
     assert w_gate.dtype == torch.bfloat16, "w_gate must be bfloat16 for this path"
     assert w_up.dtype == torch.bfloat16, "w_up must be bfloat16 for this path"
@@ -708,6 +802,14 @@ def flydsl_warp_decode_gate_up_bf16(
     assert Hk == HIDDEN, f"w_gate HIDDEN {Hk} != x HIDDEN {HIDDEN}"
     assert w_up.shape == w_gate.shape, "w_gate and w_up must share shape"
     TOPK = router_ids.shape[1]
+    _require_preshuffled_b_shape(
+        weight_layout,
+        n=INTER,
+        packed_k=HIDDEN,
+        spec=_PRESHUFFLE_BF16,
+        what="w_gate/w_up",
+    )
+    _reject_unimplemented_preshuffle(weight_layout)
 
     if use_dot2 is None:
         use_dot2 = _default_use_dot2()
@@ -765,7 +867,7 @@ def flydsl_warp_decode_down_reduce_bf16(
     Returns:
         [B, HIDDEN] bfloat16 output.
     """
-    weight_layout = _require_supported_weight_layout(weight_layout)
+    weight_layout = _parse_weight_layout(weight_layout)
     assert intermediate.dtype == torch.bfloat16, "intermediate must be bfloat16"
     assert w_down.dtype == torch.bfloat16, "w_down must be bfloat16 for this path"
     assert intermediate.is_contiguous() and w_down.is_contiguous()
@@ -775,6 +877,14 @@ def flydsl_warp_decode_down_reduce_bf16(
     E, HIDDEN, Ik = w_down.shape
     assert Ik == INTER, f"w_down INTER {Ik} != intermediate INTER {INTER}"
     assert router_ids.shape == (B, TOPK), "router_ids must be [B, TOPK]"
+    _require_preshuffled_b_shape(
+        weight_layout,
+        n=HIDDEN,
+        packed_k=INTER,
+        spec=_PRESHUFFLE_BF16,
+        what="w_down",
+    )
+    _reject_unimplemented_preshuffle(weight_layout)
 
     if kh_per_warp is None:
         kh_per_warp = 2 if HIDDEN % 2 == 0 else 1
@@ -851,7 +961,7 @@ def flydsl_warp_decode_down_reduce_fp4(
     Returns:
         [B, HIDDEN] bfloat16 output.
     """
-    weight_layout = _require_supported_weight_layout(weight_layout)
+    weight_layout = _parse_weight_layout(weight_layout)
     assert intermediate.dtype == torch.bfloat16, "intermediate must be bfloat16"
     assert intermediate.is_contiguous() and w_down.is_contiguous()
     assert router_wts.dtype == torch.float32, "router_wts must be float32"
@@ -881,6 +991,14 @@ def flydsl_warp_decode_down_reduce_fp4(
         packed_inter == row_bytes
     ), f"w_down last dim {packed_inter} != INTER//2 {row_bytes}"
     assert E * HIDDEN == n_rows
+    _require_preshuffled_b_shape(
+        weight_layout,
+        n=HIDDEN,
+        packed_k=packed_inter,
+        spec=_PRESHUFFLE_MXFP4,
+        what="w_down",
+    )
+    _reject_unimplemented_preshuffle(weight_layout)
 
     if kh_per_warp is None:
         kh_per_warp = 2 if HIDDEN % 2 == 0 else 1
@@ -965,7 +1083,7 @@ def flydsl_warp_decode_moe(
     ``down_reduce_kwargs``; the wrapper owns their ``out`` and
     ``weight_layout`` arguments.
     """
-    weight_layout = _require_supported_weight_layout(weight_layout)
+    weight_layout = _parse_weight_layout(weight_layout)
     assert (
         w_gate.dtype == w_up.dtype == w_down.dtype
     ), "w_gate, w_up, and w_down must have the same dtype"
@@ -986,6 +1104,31 @@ def flydsl_warp_decode_moe(
     is_fp4 = w_gate.dtype == torch.uint8 or (
         fp4_dtype is not None and w_gate.dtype == fp4_dtype
     )
+
+    if w_gate.dtype == torch.bfloat16:
+        spec = _PRESHUFFLE_BF16
+    elif is_fp4:
+        spec = _PRESHUFFLE_MXFP4
+    elif w_gate.dtype == torch.float8_e4m3fn:
+        spec = _PRESHUFFLE_FP8
+    else:
+        spec = None
+    if spec is not None:
+        _require_preshuffled_b_shape(
+            weight_layout,
+            n=w_gate.shape[1],
+            packed_k=w_gate.shape[2],
+            spec=spec,
+            what="w_gate/w_up",
+        )
+        _require_preshuffled_b_shape(
+            weight_layout,
+            n=w_down.shape[1],
+            packed_k=w_down.shape[2],
+            spec=spec,
+            what="w_down",
+        )
+        _reject_unimplemented_preshuffle(weight_layout)
 
     if w_gate.dtype == torch.bfloat16:
         if any(s is not None for s in (w_gate_scale, w_up_scale, w_down_scale)):

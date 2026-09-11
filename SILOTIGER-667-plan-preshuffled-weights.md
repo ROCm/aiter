@@ -30,7 +30,7 @@ gates: op_test with `FLYDSL_RUNTIME_ENABLE_CACHE=0` on GPU 1; plus a G9/667
 spot-check when the hot loop or wait/reduce path changed.
 
 - [x] 1. Host API: opt-in `k_contiguous` | `preshuffled` (default `k_contiguous`)
-- [ ] 2. Pin the preshuffle contract per dtype (same helper fused MoE uses)
+- [x] 2. Pin the preshuffle contract per dtype (same helper fused MoE uses)
 - [ ] 3. i32/byte kpack views + i64 expert base on the `preshuffled` path
 - [ ] 4. Lane→kpack gather map (wave still owns output scalars; `v_dot2`)
 - [ ] 5. Op_test both layouts; fail loudly on illegal `preshuffled` shapes
@@ -110,10 +110,26 @@ Sharing fused-MoE **weights** does not automatically share **scale** buffers
 (block2d / E8M0 vs MFMA group scales). This track consumes `preshuffled` **B**
 only unless a later decision says otherwise.
 
-- [ ] Document the permutation + kpack size per weight dtype (gate/up vs down
+Pinned on CDNA (`aiter.ops.shuffle.shuffle_weight` / `make_preshuffle_b_layout`
+N-major, permute `(0,1,3,4,2,5)`). Not gfx1250 `shuffle_weight_gfx1250`.
+Warp-decode weights are **split** (`w_gate`, `w_up`, `w_down`), so MXFP4 uses
+the fused **w2** helper (`gate_up=False`), not fused stage1
+`shuffle_weight_a16w4(w1, 16, True)` on `[E, 2*INTER, K]`.
+
+| dtype | host helper | device layout | kpack_B | elem | N (gate / down) | packed K (last dim) |
+| --- | --- | --- | --- | --- | --- | --- |
+| FP8 e4m3 | `shuffle_weight(w, layout=(16, 16))` | `make_preshuffle_b_layout(..., kpack_bytes=16, elem_bytes=1, k_major=False)` | 16 | 1 | INTER / HIDDEN `% 16 == 0` | HIDDEN / INTER `% 64 == 0` |
+| BF16 | `shuffle_weight(w, layout=(16, 16))` | `make_preshuffle_b_layout(..., kpack_bytes=16, elem_bytes=2, k_major=False)` | 16 | 2 | INTER / HIDDEN `% 16 == 0` | HIDDEN / INTER `% 32 == 0` |
+| MXFP4 | `shuffle_weight_a16w4(w, 16, False)` | a16wmix `layout_b` `(N/16, (K/2)/64, 4, 16, 16)` | 16 | 1 (bytes) | INTER / HIDDEN `% 16 == 0` | `HIDDEN//2` / `INTER//2` `% 64 == 0` (unpacked K `% 128`) |
+
+Host wrappers reject any other N/K on `weight_layout='preshuffled'` (do not
+guess from strides). Legal `preshuffled` shapes still raise *not implemented*
+until subtasks 3–4.
+
+- [x] Document the permutation + kpack size per weight dtype (gate/up vs down
       N/K: INTER vs HIDDEN).
-- [ ] List shape constraints (N % 16, K packing) and reject the rest.
-- [ ] **Done when:** a short table in this file (or a kernel comment) names the
+- [x] List shape constraints (N % 16, K packing) and reject the rest.
+- [x] **Done when:** a short table in this file (or a kernel comment) names the
       exact layout helper per dtype; no ad-hoc second permutation.
 
 ### 3. i32/byte kpack views + i64 expert base on the `preshuffled` path

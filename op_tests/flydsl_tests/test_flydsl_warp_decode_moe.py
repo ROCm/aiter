@@ -1140,6 +1140,37 @@ def test_weight_layout_rejects_preshuffled_and_unknown():
         flydsl_warp_decode_moe(x, w, w, w, ids, weights, weight_layout="logical")
 
 
+def test_preshuffled_rejects_illegal_nk():
+    """Preshuffled B is fused-MoE kpack; k_contiguous INTER/HIDDEN may be illegal."""
+    ids = torch.zeros((1, 1), dtype=torch.int32, device="cuda")
+    weights = torch.ones((1, 1), dtype=torch.float32, device="cuda")
+    x = torch.empty((1, 512), dtype=torch.bfloat16, device="cuda")
+    w_gate = torch.empty((1, 32, 512), dtype=torch.float8_e4m3fn, device="cuda")
+    w_down = torch.empty((1, 512, 32), dtype=torch.float8_e4m3fn, device="cuda")
+    with pytest.raises(ValueError, match="packed K % 64"):
+        flydsl_warp_decode_moe(
+            x,
+            w_gate,
+            w_gate,
+            w_down,
+            ids,
+            weights,
+            weight_layout="preshuffled",
+        )
+    w_narrow = torch.empty((1, 8, 512), dtype=torch.bfloat16, device="cuda")
+    w_ok = torch.empty((1, 512, 512), dtype=torch.bfloat16, device="cuda")
+    with pytest.raises(ValueError, match="N % 16"):
+        flydsl_warp_decode_moe(
+            x,
+            w_narrow,
+            w_narrow,
+            w_ok,
+            ids,
+            weights,
+            weight_layout="preshuffled",
+        )
+
+
 # -------------------------------------------------------------------------
 # gfx942 scalar-f32 fallback (SILOTIGER-667 Phase C / G4).  The scalar path
 # (`use_dot2=False`) replaces `v_dot2_f32_bf16` (a gfx950 instruction) with pure
