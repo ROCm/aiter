@@ -170,6 +170,14 @@ BIG_NEG = -1.0e30
 # swizzled LDS); True = V2 (Q per-warp TDM; K/V TDM global->LDS; all row-major padded LDS, HW OOB,
 # fewer address VGPRs). Gates all three loaders (Q, K and V); O is selected separately by O_VARIANT.
 USE_TDM_LOADER = True
+
+# K/V producer specialization: the LO half issues every K copy, the HI half every V copy,
+# each as a num_warps = NUM_WAVES//2 TDM copy (the lowering takes a wave's row share from
+# wave_id % num_warps, so waves 4..7 cover the same tile waves 0..3 would). Halves the
+# copies each wave issues and each half's tensorcnt now tracks one operand; the drain
+# barrier still publishes both halves. Requires the TDM loader.
+KV_PRODUCER_SPLIT = True and USE_TDM_LOADER
+KV_PRODUCER_WARPS = NUM_WAVES // 2 if KV_PRODUCER_SPLIT else NUM_WAVES
 # O writer variant (decoupled from USE_TDM_LOADER): "v1" swizzled LDS + buffer_store (fastest so
 # far), "v2" TDM store (padding ignored -> contiguous LDS -> bank conflict, slow), "v3" padded LDS +
 # global_store_async_from_lds_b128.
@@ -1100,6 +1108,8 @@ def _core_attention(
     # only FINITE data in slot 0's V region -- its PV is the dead leading one, p == 0, and
     # 0 * NaN would poison O. Loading start_tile's V there is the cheapest such filler.
     start_row0 = start_tile * fx.Int32(n_block)
+    _mine_k = not KV_PRODUCER_SPLIT or warp_type == WarpType.LO_WARP
+    _mine_v = not KV_PRODUCER_SPLIT or warp_type == WarpType.HI_WARP
     if USE_TDM_LOADER:
         # V2: build the TDM copy views (pure), run Q part2, fence Q's LDS dead, then
         # issue the copies and drain before the loop.
@@ -1113,6 +1123,7 @@ def _core_attention(
                     kv_head=kv_head,
                     kv_row0=kv_start + row0,
                     kv_valid=_kv_valid(row0),
+                    num_warps=KV_PRODUCER_WARPS,
                 ),
                 v_mgr.load_views(
                     ptr_lds=_v_bufs_at(slot),
@@ -1122,18 +1133,23 @@ def _core_attention(
                     kv_head=kv_head,
                     kv_row0=kv_start + row0,
                     kv_valid=_kv_valid(row0),
+                    num_warps=KV_PRODUCER_WARPS,
                 ),
             )
 
         def _issue_views(kv):
-            for _v in kv[0]:
-                fx.copy_atom_call(*_v)
-            for _v in kv[1]:
-                fx.copy_atom_call(*_v)
+            if _mine_k:
+                for _v in kv[0]:
+                    fx.copy_atom_call(*_v)
+            if _mine_v:
+                for _v in kv[1]:
+                    fx.copy_atom_call(*_v)
 
         kv0 = _kv_views(_k_lds_buf(1), start_row0)
         kv_fill = _kv_views(_k_lds_buf(0), start_row0)
-        num_tdm_copies = len(kv0[0]) + len(kv0[1])
+        num_tdm_copies = (len(kv0[0]) if _mine_k else 0) + (
+            len(kv0[1]) if _mine_v else 0
+        )
         num_async_copies = -1  # nothing increments asynccnt under TDM
         _kv_drain = _kv_drain_depths(num_tdm_copies, num_async_copies)
         q_frags = q_mgr.load_q_to_vgpr_part2(scale=softmax_scale)
@@ -1144,8 +1160,9 @@ def _core_attention(
         rocdl.s_wait_dscnt(0)
         gpu.barrier()
         _issue_views(kv0)
-        for _v in kv_fill[1]:
-            fx.copy_atom_call(*_v)
+        if _mine_v:
+            for _v in kv_fill[1]:
+                fx.copy_atom_call(*_v)
         _kv_fence(*_kv_drain)
     else:
 
@@ -1364,6 +1381,7 @@ def _core_attention(
                     kv_head=kv_head,
                     kv_row0=kv_start + pf_row0,
                     kv_valid=pf_valid,
+                    num_warps=KV_PRODUCER_WARPS,
                 )
                 v_views = v_mgr.load_views(
                     ptr_lds=_v_bufs_at(wr_slot),
@@ -1373,6 +1391,7 @@ def _core_attention(
                     kv_head=kv_head,
                     kv_row0=kv_start + pf_row0,
                     kv_valid=pf_valid,
+                    num_warps=KV_PRODUCER_WARPS,
                 )
                 return (k_views, v_views)
             k_g, k_l, k_i = k_mgr.global_load_ptrs(
@@ -1410,10 +1429,12 @@ def _core_attention(
         def _prefetch(addr):
             if USE_TDM_LOADER:
                 k_views, v_views = addr
-                for _v in k_views:
-                    fx.copy_atom_call(*_v)
-                for _v in v_views:
-                    fx.copy_atom_call(*_v)
+                if _mine_k:
+                    for _v in k_views:
+                        fx.copy_atom_call(*_v)
+                if _mine_v:
+                    for _v in v_views:
+                        fx.copy_atom_call(*_v)
             else:
                 k_g, k_l, k_i, v_g, v_l, v_i = addr
                 _async_load_to_lds(k_g, k_l, cluster=True, imm_offs=k_i)
