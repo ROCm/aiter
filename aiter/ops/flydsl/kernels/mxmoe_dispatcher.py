@@ -490,6 +490,12 @@ def compile_gemm2_a4w4_port(
             i32_grid_blocks,
         ).launch(grid=(grid_x, 1, 1), block=(256, 1, 1), stream=stream)
 
+    # Measured at 136 VGPRs, which is one register class over the 128 needed for
+    # a second wave per SIMD: 256/136 -> 1 wave (11.2% occupancy, MfmaUtil 25.7%)
+    # vs gemm1's 128 -> 2 waves (22.2%, 51.1%). LDS is not the binding term here
+    # (64KB, and gemm1 runs 2 WGs at 65KB). Ask the compiler for the second wave.
+    launch_gemm2.compile_hints = {"waves_per_eu": 2}
+
     return launch_gemm2
 
 
