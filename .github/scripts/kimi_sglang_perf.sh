@@ -36,6 +36,8 @@ SLOG="$OUT/server.log"
 export SGLANG_USE_AITER=${SGLANG_USE_AITER:-1}
 export AITER_QUICK_REDUCE_QUANTIZATION=${AITER_QUICK_REDUCE_QUANTIZATION:-INT4}
 export SGLANG_AITER_FP8_PREFILL_ATTN=${SGLANG_AITER_FP8_PREFILL_ATTN:-0}
+# The CI container can expose only a restricted subset of the host CPUs.
+export SGLANG_SET_CPU_AFFINITY=0
 
 # Prefer a /models mount if the weights are pre-cached there, else use the path
 # as given (e.g. a local /data mount).

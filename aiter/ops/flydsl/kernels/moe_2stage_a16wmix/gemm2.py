@@ -5,11 +5,14 @@ import functools
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
+from flydsl._mlir.dialects import llvm
 from flydsl.expr import arith, const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import T
 from flydsl.expr.typing import Vector as Vec
 
 from aiter.ops.flydsl.kernels.mxfp4_gemm_common import (
+    _gep1,
+    _global_base_ptr1,
     global_typed_ptr,
     lds_typed_ptr,
     lds_vec_load,
@@ -48,6 +51,7 @@ def _atomic_bf16_epilog(
     BM,
     N_OUT,
     BN,
+    use_k16=False,
 ):
     _kMChunks = BM // 16
     M_REPS = BM // 8
@@ -75,9 +79,15 @@ def _atomic_bf16_epilog(
 
     load_i32 = fx.make_copy_atom(fx.rocdl.BufferCopy32b(), fx.Int32)
     load_f32 = fx.make_copy_atom(fx.rocdl.BufferCopy32b(), fx.Float32)
-    atomic_bf16x2 = fx.make_copy_atom(
-        fx.rocdl.BufferAtomicPkAdd(fx.BFloat16), fx.BFloat16
-    )
+    # gfx950+ has buffer_atomic_pk_add_bf16. gfx942 only has the global packed
+    # form; emitting the buffer op there is LLVM "Cannot select BUFFER_ATOMIC_FADD
+    # v2bf16" (same fork as moe_gemm_2stage / mxfp4_gemm2).
+    if const_expr(not use_k16):
+        atomic_bf16x2 = fx.make_copy_atom(
+            fx.rocdl.BufferAtomicPkAdd(fx.BFloat16), fx.BFloat16
+        )
+    else:
+        out_base = _global_base_ptr1(arg_out)
 
     def load_scalar(atom, src, index, elem_ty):
         frag = fx.make_rmem_tensor(1, elem_ty)
@@ -123,10 +133,129 @@ def _atomic_bf16_epilog(
                 pk = Vec.from_elements(
                     [v2[0] * weight[mr], v2[1] * weight[mr]], fx.Float32
                 ).to(fx.BFloat16)
+                out_off = row_base_addr + fx.Int32(s * 64)
+                if const_expr(use_k16):
+                    out_ptr = _gep1(out_base, out_off * fx.Int32(2))
+                    llvm.AtomicRMWOp(
+                        llvm.AtomicBinOp.fadd,
+                        out_ptr,
+                        _raw(pk),
+                        llvm.AtomicOrdering.monotonic,
+                        syncscope="agent",
+                        alignment=4,
+                    )
+                else:
+                    out_frag = fx.make_rmem_tensor(2, fx.BFloat16)
+                    out_frag.store(pk)
+                    fx.copy(atomic_bf16x2, out_frag, out_bf16[None, out_off])
+
+
+@flyc.jit
+def _reduce_bf16_epilog(
+    lds_acc_base_i32,
+    accm,
+    arg_out,
+    arg_stids,
+    arg_sweights,
+    m_row,
+    n_block_idx,
+    wave,
+    lane,
+    i32_M,
+    BM,
+    N_OUT,
+    BN,
+    TOPK,
+):
+    """Unique-row store into [token*topk+slot, N] for a follow-up moe_reduce.
+
+    Same 4-wave N-split / MFMA acc layout and BufferCopy loads/stores as
+    ``_atomic_bf16_epilog``. Writes routing-weighted bf16 into LDS, remaps to
+    (MLane=8, NLane=32), and buffer-stores — no atomics. Invalid/padded rows
+    are skipped; every valid (token, slot) is unique so a later topk sum is
+    race-free.
+    """
+    _kMChunks = BM // 16
+    M_REPS = BM // 8
+    _n_per_wave = BN // 4
+    num_acc_n = _n_per_wave // 16
+    _s_count = BN // 64
+    lane_div_16 = lane // fx.Int32(16)
+    lane_mod_16 = lane % fx.Int32(16)
+    lds_bf16 = lds_typed_ptr(lds_acc_base_i32, T.bf16)
+
+    tx_i32 = fx.Int32(gpu.thread_id("x"))
+    m_lane = tx_i32 // fx.Int32(32)
+    n_lane = tx_i32 % fx.Int32(32)
+    col_start = n_lane * fx.Int32(2)
+
+    def _flat_buffer(arg, elem_ty, align):
+        ptr = global_typed_ptr(arg, elem_ty, align=align)
+        view = fx.Tensor(fx.make_view(ptr, fx.make_layout((1, 1), (1, 1))))
+        return fx.rocdl.make_buffer_tensor(view, max_size=True)
+
+    stids = _flat_buffer(arg_stids, T.i32, 4)
+    sweights = _flat_buffer(arg_sweights, T.f32, 4)
+    out_bf16 = _flat_buffer(arg_out, T.bf16, 4)
+
+    load_i32 = fx.make_copy_atom(fx.rocdl.BufferCopy32b(), fx.Int32)
+    load_f32 = fx.make_copy_atom(fx.rocdl.BufferCopy32b(), fx.Float32)
+    store_bf16x2 = fx.make_copy_atom(fx.rocdl.BufferCopy32b(), fx.BFloat16)
+
+    def load_scalar(atom, src, index, elem_ty):
+        frag = fx.make_rmem_tensor(1, elem_ty)
+        fx.copy(atom, src[None, index], frag)
+        return Vec(frag.load())[0]
+
+    packed = []
+    for mr in range_constexpr(M_REPS):
+        sorted_pos = m_row + fx.Int32(mr * 8) + m_lane
+        packed.append(load_scalar(load_i32, stids, sorted_pos, fx.Int32))
+
+    for i in range_constexpr(_kMChunks):
+        row_base = fx.Int32(i * 16) + lane_div_16 * fx.Int32(4)
+        w0 = load_scalar(load_f32, sweights, m_row + row_base, fx.Float32)
+        w1 = load_scalar(load_f32, sweights, m_row + row_base + fx.Int32(1), fx.Float32)
+        w2 = load_scalar(load_f32, sweights, m_row + row_base + fx.Int32(2), fx.Float32)
+        w3 = load_scalar(load_f32, sweights, m_row + row_base + fx.Int32(3), fx.Float32)
+        for J in range_constexpr(num_acc_n):
+            col = wave * fx.Int32(_n_per_wave) + fx.Int32(J * 16) + lane_mod_16
+            vec = Vec(accm[i][J])
+            bf4 = Vec.from_elements(
+                [vec[0] * w0, vec[1] * w1, vec[2] * w2, vec[3] * w3],
+                fx.Float32,
+            ).to(fx.BFloat16)
+            for v in range_constexpr(4):
+                idx = (row_base + fx.Int32(v)) * fx.Int32(BN) + col
+                lds_bf16[idx] = bf4[v]
+
+    gpu.barrier()
+
+    for mr in range_constexpr(M_REPS):
+        row_in_block = fx.Int32(mr * 8) + m_lane
+        token_id = packed[mr] & fx.Int32(0x00FFFFFF)
+        slot = packed[mr] >> fx.Int32(24)
+        if token_id < i32_M:
+            row_base_addr = (
+                (token_id * fx.Int32(TOPK) + slot) * fx.Int32(N_OUT)
+                + n_block_idx * fx.Int32(BN)
+                + col_start
+            )
+            for s in range_constexpr(_s_count):
+                idx0 = row_in_block * fx.Int32(BN) + col_start + fx.Int32(s * 64)
+                pk = Vec(
+                    lds_vec_load(
+                        lds_acc_base_i32,
+                        idx0 * fx.Int32(2),
+                        Vec.make_type(2, fx.BFloat16),
+                        fx.BFloat16,
+                        align=4,
+                    )
+                )
                 out_frag = fx.make_rmem_tensor(2, fx.BFloat16)
                 out_frag.store(pk)
                 out_off = row_base_addr + fx.Int32(s * 64)
-                fx.copy(atomic_bf16x2, out_frag, out_bf16[None, out_off])
+                fx.copy(store_bf16x2, out_frag, out_bf16[None, out_off])
 
 
 def _gemm2_body_a16w4(
@@ -152,6 +281,8 @@ def _gemm2_body_a16w4(
     b_cache_mod=2,
     w_dtype="fp4",
     use_k16=False,
+    use_reduce=False,
+    topk=1,
 ):
     """a16w4/a16wi4/a16w16 stage2 body. K=inter_dim (contraction), N=model_dim (N_OUT).
 
@@ -262,29 +393,46 @@ def _gemm2_body_a16w4(
                     _mma(accm[mi][ni], a8, bb)
         gpu.barrier()
 
-    # ---- epilogue: atomic bf16 scatter (routing-weighted). K-loop done, so the A-LDS
-    # region (offset 0) is reused for the epilog's f32 acc staging.
     gpu.barrier()
     lds_acc_base_i32 = fx.Int32(fx.ptrtoint(lds_raw_ptr))
     accm_v = [
         [accm[i][J].load().ir_value() for J in range(num_acc_n)]
         for i in range(m_repeat)
     ]
-    _atomic_bf16_epilog(
-        lds_acc_base_i32,
-        accm_v,
-        arg_out,
-        arg_stids,
-        arg_sweights,
-        m_row,
-        n_block_idx,
-        wave,
-        lane,
-        i32_M,
-        BM,
-        N_OUT,
-        TILE_N,
-    )
+    if const_expr(use_reduce):
+        _reduce_bf16_epilog(
+            lds_acc_base_i32,
+            accm_v,
+            arg_out,
+            arg_stids,
+            arg_sweights,
+            m_row,
+            n_block_idx,
+            wave,
+            lane,
+            i32_M,
+            BM,
+            N_OUT,
+            TILE_N,
+            topk,
+        )
+    else:
+        _atomic_bf16_epilog(
+            lds_acc_base_i32,
+            accm_v,
+            arg_out,
+            arg_stids,
+            arg_sweights,
+            m_row,
+            n_block_idx,
+            wave,
+            lane,
+            i32_M,
+            BM,
+            N_OUT,
+            TILE_N,
+            use_k16,
+        )
 
 
 def gemm2_a16w4_grid(BM, *, N_OUT, TILE_N, max_m_blocks, persist=False):
@@ -315,11 +463,14 @@ def compile_gemm2_a16w4_port(
     w_dtype="fp4",
     persist=False,
     use_k16,
+    epilog="atomic",
+    topk=1,
 ):
     """a16w4/a16wi4/a16w16 (bf16 intermediate A x mxfp4/int4/bf16 W2) stage2 builder.
 
-    N_OUT = model_dim (down-proj output). D_INTER = inter_dim (contraction). Output
-    bf16 [tokens, model_dim] via atomic (routing-weighted) scatter.
+    N_OUT = model_dim (down-proj output). D_INTER = inter_dim (contraction).
+    ``epilog="atomic"``: routing-weighted scatter into [tokens, model_dim].
+    ``epilog="reduce"``: unique [token*topk+slot, N] rows (caller runs moe_reduce).
 
     ``xcd_swizzle`` (>0) bijectively round-robins the launch index across the 8 XCDs to
     balance per-XCD/HBM traffic (gemm2 is HBM-bound), + optional M-group swizzle for
@@ -330,7 +481,12 @@ def compile_gemm2_a16w4_port(
         "int4",
         "bf16",
     ), f"w_dtype must be 'mxfp4', 'int4' or 'bf16', got {w_dtype!r}"
-    # Arch-gate K=16 (gfx942) vs K=32 (gfx950); resolved by the caller and passed in.
+    if epilog not in ("atomic", "reduce"):
+        raise ValueError(f"epilog must be 'atomic' or 'reduce', got {epilog!r}")
+    _use_reduce = epilog == "reduce"
+    _topk = int(topk) if _use_reduce else 1
+    if _use_reduce and _topk < 1:
+        raise ValueError(f"reduce epilog requires topk>=1, got {_topk}")
     _use_k16 = use_k16
     _K = D_INTER
     assert _K % TILE_K == 0, f"D_INTER (K) must be a multiple of {TILE_K}, got {_K}"
@@ -352,10 +508,11 @@ def compile_gemm2_a16w4_port(
     _num_n_blocks = N_OUT // TILE_N
     KH_TILE_BYTES = TILE_K * 2
 
-    # LDS: A tile (BM x TILE_K bf16) then f32 accumulator region (BM x TILE_N f32).
     _a_bytes = BM * KH_TILE_BYTES
-    _acc_bytes = BM * TILE_N * 4  # f32 accumulator region
-    _lds_bytes = _a_bytes + _acc_bytes
+    if _use_reduce:
+        _lds_bytes = max(_a_bytes, BM * TILE_N * 2)
+    else:
+        _lds_bytes = _a_bytes + BM * TILE_N * 4
 
     _wd_tag = "" if w_dtype == "fp4" else f"_{w_dtype}"
     _name = f"gemm2_a16w4{_wd_tag}_port_ne{NE}_h{N_OUT}_i{_K}_bm{BM}_tn{TILE_N}"
@@ -367,6 +524,8 @@ def compile_gemm2_a16w4_port(
         _name += f"_w{waves_per_eu}"
     if persist:
         _name += "_persist"
+    if _use_reduce:
+        _name += f"_reduce_tk{_topk}"
 
     @fx.struct
     class SharedStorage:
@@ -443,6 +602,8 @@ def compile_gemm2_a16w4_port(
                 b_cache_mod=b_cache_mod,
                 w_dtype=w_dtype,
                 use_k16=_use_k16,
+                use_reduce=_use_reduce,
+                topk=_topk,
             )
 
         if const_expr(persist):
