@@ -53,6 +53,20 @@ def downcast_to_mxfp(
 
     If weight_quant_type is torch.float8_e4m3fn or torch.float8_e5m2, we output mxfp8 with the float8s are stored
     in their respective formats.
+
+    pow2_scale selects how the E8M0 block scale is derived, and the two schemes
+    are not interchangeable:
+
+    - False (default): amax / dtype_max, with the exponent rounded per
+      DEQUANT_SCALE_ROUNDING_MODE.
+    - True: amax rounded to a power of two first, then log2(amax).floor() - 2.
+      This matches dynamic_mxfp4_quant / dynamic_mxfp8_quant bit for bit, and is
+      the scheme quark's even_round produces.
+
+    The scales the two produce disagree on a meaningful fraction of blocks
+    (~13% for fp4, ~0.1% for fp8), so a tensor quantized with one must be
+    dequantized with the same one. DEQUANT_SCALE_ROUNDING_MODE is ignored when
+    pow2_scale is True.
     """
     ndim = src_tensor.ndim
     assert -ndim <= axis < ndim, f"Invalid axis {axis=}"

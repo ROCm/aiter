@@ -188,7 +188,10 @@ def dynamic_mxfp4_quant(
             - "even" (default): `even_round` in `quark.torch.quantization.utils`.
             - etc.
         x_fp4, blockscale_e8m0: Optional pre-allocated uint8 outputs, shaped
-            (M, N // 2) and (M, N // 32); allocated column-major when omitted.
+            (M, N // 2) and (M, ceil(N / 32)). N need not be a multiple of 32
+            (only (N // 2) % 2 == 0 is asserted); a trailing partial block still
+            gets its own scale column, so the scale width is the ceiling, not
+            N // 32. Allocated column-major when omitted.
     Returns:
         A tuple of (x_fp4, blockscale_e8m0).
     """
