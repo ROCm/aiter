@@ -28,7 +28,19 @@ void top_k_per_row_decode(const aiter_tensor_t& logits,
                           bool stable                             = false,
                           std::optional<aiter_tensor_t> values    = std::nullopt);
 
+void dsa_topk_transform(const aiter_tensor_t& logits,
+                        std::optional<aiter_tensor_t> rowStarts,
+                        const aiter_tensor_t& rowEnds,
+                        std::optional<aiter_tensor_t> pageTable,
+                        std::optional<aiter_tensor_t> ptRowMap,
+                        aiter_tensor_t& indices,
+                        int64_t numRows,
+                        int64_t pageSize = 1,
+                        int64_t k        = 2048,
+                        std::optional<aiter_tensor_t> workspace = std::nullopt);
+
 // Workspace-management queries exposed to Python (see get_topk_mb_workspace).
+int64_t dsa_topk_workspace_size(int64_t numRows, int64_t stride0);
 int64_t topk_mb_workspace_size(int64_t numRows, int64_t stride0, int64_t k, bool is_decode);
 int64_t topk_ob_workspace_size(int64_t numRows, int64_t stride0, int64_t k, bool is_decode);
 bool topk_use_mulblocks(int64_t numRows, int64_t stride0);

@@ -331,7 +331,11 @@ def topk_ob_workspace_size(
 def topk_use_mulblocks(numRows: int, stride0: int) -> bool: ...
 
 
-@functools.lru_cache(maxsize=16)
+# Unbounded on purpose: an LRU eviction here frees a tensor whose address may be
+# baked into a captured HIP graph, which is the same failure mode the coop path
+# had. The power-of-two bucketing below already caps the distinct sizes at
+# ~log2(max_size) per (device, stream), so the cache cannot grow without bound.
+@functools.cache
 def _get_topk_mb_workspace_keyed(
     device: torch.device, stream_id: int, size: int
 ) -> torch.Tensor:
@@ -360,6 +364,27 @@ def get_topk_mb_workspace(device: torch.device, size: int) -> torch.Tensor:
     alloc = 1 if size <= 1 else 1 << (int(size) - 1).bit_length()
     stream = torch.cuda.current_stream(device)
     return _get_topk_mb_workspace_keyed(device, stream.cuda_stream, alloc)
+
+
+@compile_ops("module_top_k_per_row", fc_name="dsa_topk_workspace_size")
+def _dsa_topk_workspace_size(numRows: int, stride0: int) -> int: ...
+
+
+# The row-split path's scratch is sized in C++ but owned here, so no kernel-side
+# static can be freed out from under a captured HIP graph. Everything below the
+# call site collapses into a single lru_cache lookup: the binding call, the
+# power-of-two bucketing and the tensor are all a pure function of
+# (device, stream, numRows, stride0), and this op is ~20-60 us, so a per-launch
+# round trip into C++ would be a visible fraction of it.
+@functools.cache
+def _dsa_topk_workspace(
+    device: torch.device, stream_id: int, numRows: int, stride0: int
+) -> torch.Tensor | None:
+    size = _dsa_topk_workspace_size(numRows, stride0)
+    if size <= 0:
+        return None
+    alloc = 1 if size <= 1 else 1 << (int(size) - 1).bit_length()
+    return _get_topk_mb_workspace_keyed(device, stream_id, alloc)
 
 
 def get_topk_scratch_workspace(device: torch.device, size: int) -> torch.Tensor:
@@ -430,6 +455,85 @@ def top_k_per_row_prefill_fast(
     stride0: int,
     stride1: int,
 ) -> None: ...
+
+
+@compile_ops("module_top_k_per_row", fc_name="dsa_topk_transform", develop=True)
+def _dsa_topk_transform(
+    logits: torch.Tensor,
+    rowStarts: torch.Tensor | None,
+    rowEnds: torch.Tensor,
+    pageTable: torch.Tensor | None,
+    ptRowMap: torch.Tensor | None,
+    indices: torch.Tensor,
+    numRows: int,
+    pageSize: int,
+    k: int,
+    workspace: torch.Tensor | None = None,
+) -> None: ...
+
+
+def dsa_topk_transform(
+    logits: torch.Tensor,
+    rowStarts: torch.Tensor | None,
+    rowEnds: torch.Tensor,
+    pageTable: torch.Tensor | None,
+    indices: torch.Tensor,
+    pageSize: int = 1,
+    k: int = 2048,
+    ptRowMap: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Per-row top-k of the DSA indexer logits, reported as physical KV slots.
+
+    This is the op sglang calls topk_transform: select the top ``k`` of each row
+    and map each winner through the page table,
+    ``pageTable[pos >> bits] << bits | (pos & mask)``, padding short rows with -1.
+    Both halves run in one kernel, so the [numRows, k] indices are written once and
+    never read back; sglang instead follows its top-k with a chain of tensor ops (a
+    score gather, two ``torch.where``, the page split, a ``torch.gather``, the
+    recombine and a ``masked_fill``).
+
+    ``pageTable`` is [ptRows, pages] int32 and ``pageSize`` must be a power of
+    two. Passing ``pageTable=None`` skips the mapping and emits raw positions in
+    the logits buffer's coordinates, which is a plain per-row top-k.
+    ``rowStarts=None`` means every row starts at 0, which is what decode wants and
+    what saves it a per-call zeros tensor.
+
+    ``ptRowMap`` is [numRows] int32 giving each logits row's page-table row. Decode
+    is one row per sequence, so ``ptRows == numRows``, the map is the identity and
+    it stays None. Speculative decoding is not: verify and draft-extend produce
+    several rows per sequence against a page table that still has one row each, and
+    ``ptRowMap`` is what lets those shapes use this op. It is an indirection inside
+    the kernel rather than an expanded table because at 100k context one
+    page_size=1 row is ~400 KB, so materialising ``bs * draft`` copies would cost
+    more bandwidth than the select itself.
+
+    ``k`` must be 2048 (GLM-5.2's ``index_topk``); the kernel is templated on it so
+    the emit bounds and the -1 padding stay compile-time.
+
+    Selection is exact except on rows whose values are close enough to collapse
+    into a single fp16 coarse key; see the coop kernel's refine_from_row. Ties are
+    broken by arrival order, so the emitted order is not deterministic across runs
+    and a caller needing rank order must sort.
+    """
+    num_rows = logits.shape[0]
+    _dsa_topk_transform(
+        logits,
+        rowStarts,
+        rowEnds,
+        pageTable,
+        ptRowMap,
+        indices,
+        num_rows,
+        pageSize,
+        k,
+        _dsa_topk_workspace(
+            logits.device,
+            torch.cuda.current_stream(logits.device).cuda_stream,
+            num_rows,
+            logits.stride(0),
+        ),
+    )
+    return indices
 
 
 @compile_ops("module_top_k_per_row", fc_name="top_k_per_row_decode", develop=True)
