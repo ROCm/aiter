@@ -805,7 +805,7 @@ def test_mhc_post_pre(
     """Fused mhc_post + mhc_pre: HIP ``mhc_fused_post_pre`` vs ref / unfused HIP / Triton.
 
     --w_preshuffle_bf16 selects packed BF16 hi/lo compute for all HIP paths.
-    --res_shuffle independently selects the fused residual input/output layout.
+    --res_shuffle requests the runtime fuse-aligned residual layout on gfx1250.
     """
     if hidden_size < 512:
         aiter.logger.info(
@@ -862,10 +862,15 @@ def test_mhc_post_pre(
     if fuse_rmsnorm:
         hip_kwargs["norm_weight"] = norm_weight
 
-    from aiter.ops.mhc import mhc_pre_convert_fn, mhc_res_shuffle, mhc_res_unshuffle
+    from aiter.ops.mhc import (
+        mhc_pre_convert_fn,
+        mhc_res_shuffle,
+        mhc_res_shuffle_enabled,
+        mhc_res_unshuffle,
+    )
 
     packed = w_preshuffle_bf16
-    shuffled = res_preshuffle
+    shuffled = res_preshuffle and mhc_res_shuffle_enabled(m)
     ret = {
         "fuse_rmsnorm": fuse_rmsnorm,
         "w_preshuffle_bf16": bool(packed),
@@ -1081,8 +1086,8 @@ parser.add_argument(
     dest="res_preshuffle",
     action=argparse.BooleanOptionalAction,
     default=False,
-    help="Use shuffled residual input/output in the fused path (gfx1250 only), "
-    "independently of GEMM compute.",
+    help="Request shuffled residual input/output when the runtime policy uses "
+    "the fused path (gfx1250 only), independently of GEMM compute.",
 )
 
 args = parser.parse_args()

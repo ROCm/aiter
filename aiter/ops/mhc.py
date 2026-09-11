@@ -132,6 +132,24 @@ def mhc_pre_big_fuse_rmsnorm(
 # its next_residual write use this layout, so it stays internal to a stack of layers:
 # only the first residual in and the last one out need converting.
 MHC_RES_KS = 32
+MHC_FUSED_POST_PRE_M_UPPER_BOUND = {
+    "gfx950": 1024,
+    "gfx942": 128,
+    "gfx1250": 1024,
+}
+
+
+def mhc_res_shuffle_enabled(m: int, arch: str | None = None) -> bool:
+    """Return whether the fused interface may use shuffled residuals.
+
+    Keep this exactly aligned with ``mhc_fused_post_pre``: that interface falls
+    back to standalone post + pre at and above the per-architecture bound, and
+    the standalone kernels consume the ordinary residual layout.
+    """
+    if arch is None:
+        arch = get_gfx_runtime()
+    fused_m_upper_bound = MHC_FUSED_POST_PRE_M_UPPER_BOUND.get(arch, 1024)
+    return arch == "gfx1250" and 0 < m < fused_m_upper_bound
 
 
 def _check_mhc_res_preshuffle_arch(shuffled: bool, arch: str) -> None:
@@ -142,6 +160,11 @@ def _check_mhc_res_preshuffle_arch(shuffled: bool, arch: str) -> None:
         )
 
 
+def mhc_res_layout_fake(residual: torch.Tensor) -> torch.Tensor:
+    return torch.empty_like(residual)
+
+
+@torch_compile_guard(mutates_args=[], gen_fake=mhc_res_layout_fake)
 def mhc_res_shuffle(residual: torch.Tensor) -> torch.Tensor:
     """res[row][head][k] -> resS[k//KS][head][row][k%KS], same shape."""
     m, hc_mult, hidden_size = residual.shape
@@ -154,6 +177,54 @@ def mhc_res_shuffle(residual: torch.Tensor) -> torch.Tensor:
     )
 
 
+def mhc_res_repeat_fake(
+    hidden_states: torch.Tensor,
+    hc_mult: int,
+    res_preshuffle: bool = False,
+) -> torch.Tensor:
+    return torch.empty(
+        hidden_states.size(0),
+        hc_mult,
+        hidden_states.size(1),
+        dtype=hidden_states.dtype,
+        device=hidden_states.device,
+    )
+
+
+@torch_compile_guard(mutates_args=[], gen_fake=mhc_res_repeat_fake)
+def mhc_res_repeat(
+    hidden_states: torch.Tensor,
+    hc_mult: int,
+    res_preshuffle: bool = False,
+) -> torch.Tensor:
+    """Repeat ``[m, hidden]`` into an mHC residual, optionally pre-shuffled.
+
+    The shuffled branch writes the kernel layout directly, avoiding an
+    intermediate ``[m, hc_mult, hidden]`` repeat followed by another full
+    shuffle copy.
+    """
+    assert hidden_states.ndim == 2, (
+        f"hidden_states must be 2D, got {tuple(hidden_states.shape)}"
+    )
+    assert hc_mult > 0, f"hc_mult must be positive, got {hc_mult}"
+    m, hidden_size = hidden_states.shape
+    if not res_preshuffle or not mhc_res_shuffle_enabled(m):
+        return hidden_states.unsqueeze(-2).repeat(1, hc_mult, 1)
+
+    assert hidden_size % MHC_RES_KS == 0, (
+        f"hidden_size {hidden_size} must be divisible by MHC_RES_KS {MHC_RES_KS}"
+    )
+    return (
+        hidden_states.reshape(m, hidden_size // MHC_RES_KS, MHC_RES_KS)
+        .permute(1, 0, 2)
+        .unsqueeze(1)
+        .expand(-1, hc_mult, -1, -1)
+        .contiguous()
+        .view(m, hc_mult, hidden_size)
+    )
+
+
+@torch_compile_guard(mutates_args=[], gen_fake=mhc_res_layout_fake)
 def mhc_res_unshuffle(shuffled: torch.Tensor) -> torch.Tensor:
     """Inverse of :func:`mhc_res_shuffle`."""
     m, hc_mult, hidden_size = shuffled.shape
@@ -473,6 +544,7 @@ def mhc_pre_fake(
     norm_eps: float = 1e-6,
     large_m_splitk: bool = False,
     w_preshuffle_bf16: int = 0,
+    res_preshuffle: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     m = residual.size(0)
     hc_mult = residual.size(1)
@@ -499,7 +571,10 @@ def mhc_pre(
     norm_eps: float = 1e-6,
     large_m_splitk: bool = False,
     w_preshuffle_bf16: int = 0,  # 1: fn is pre-packed BF16 hi/lo from mhc_pre_convert_fn
+    res_preshuffle: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    if res_preshuffle and mhc_res_shuffle_enabled(residual.size(0)):
+        residual = mhc_res_unshuffle(residual)
     m = residual.size(0)
     hc_mult = residual.size(1)
     hidden_size = residual.size(2)
@@ -524,7 +599,8 @@ def mhc_pre(
     )
     out = out_pad[:, :, :hc_mult3]
     sqrsum = torch.empty(selected_splitk, m, dtype=dtypes.fp32, device=device)
-    # The flag selects packed weights and BF16 compute; residual keeps its plain layout.
+    # The packed-weight flag selects BF16 compute. The public interface has
+    # already restored an ordinary residual layout when requested above.
     mhc_pre_gemm_sqrsum(
         out,
         sqrsum,
@@ -577,8 +653,8 @@ def mhc_pre(
     return post_mix, comb_mix, layer_input
 
 
-@compile_ops("module_mhc", develop=True)
-def mhc_post(
+@compile_ops("module_mhc", fc_name="mhc_post", develop=True)
+def _mhc_post(
     out: Tensor,
     x: Tensor,
     residual: Tensor,
@@ -586,6 +662,21 @@ def mhc_post(
     comb_res_mix: Tensor,
     store_nt: int = -1,
 ) -> None: ...
+
+
+@torch_compile_guard(mutates_args=["out"], gen_fake=lambda *args, **kwargs: None)
+def mhc_post(
+    out: torch.Tensor,
+    x: torch.Tensor,
+    residual: torch.Tensor,
+    post_layer_mix: torch.Tensor,
+    comb_res_mix: torch.Tensor,
+    store_nt: int = -1,
+    res_preshuffle: bool = False,
+) -> None:
+    if res_preshuffle and mhc_res_shuffle_enabled(residual.size(0)):
+        residual = mhc_res_unshuffle(residual)
+    _mhc_post(out, x, residual, post_layer_mix, comb_res_mix, store_nt)
 
 
 def get_mhc_pre_splitk_large_m(
@@ -747,12 +838,12 @@ def mhc_fused_post_pre(
     gfx950 large-M post+pre specialization with plain residuals. When False
     (default), larger ``m`` with plain residuals falls back to ``mhc_post`` +
     ``mhc_pre`` (threshold depends on the detected GPU arch).
-    Shuffled residuals always use the fused kernel, which understands that layout.
+    A ``res_preshuffle`` request uses that same fuse/unfuse boundary.
 
     ``w_preshuffle_bf16=True`` selects BF16 hi/lo compute and requires ``fn`` from
-    ``mhc_pre_convert_fn``. ``res_preshuffle=True`` independently declares that
-    ``residual_in`` is shuffled (gfx1250 only); ``next_residual`` uses the same
-    layout. Neither flag converts inputs. For BF16 with plain residuals, pass
+    ``mhc_pre_convert_fn``. ``res_preshuffle=True`` requests automatic shuffled
+    layout on gfx1250 only when runtime M selects the fused path; ``next_residual``
+    uses the same layout. For BF16 with plain residuals, pass
     ``w_preshuffle_bf16=True, res_preshuffle=False``.
 
     Both flags are boolean, default to False, and are controlled independently.
@@ -762,14 +853,10 @@ def mhc_fused_post_pre(
     hidden_size = residual_in.size(2)
     arch = get_gfx_runtime()
     _check_mhc_res_preshuffle_arch(res_preshuffle, arch)
-    fused_m_upper_bound = {
-        "gfx950": 1024,
-        "gfx942": 128,
-        "gfx1250": 1024,
-    }.get(arch, 1024)
+    res_preshuffle = res_preshuffle and mhc_res_shuffle_enabled(m, arch)
+    fused_m_upper_bound = MHC_FUSED_POST_PRE_M_UPPER_BOUND.get(arch, 1024)
 
-    # Plain post/pre fallbacks cannot consume shuffled buffers. BF16 arithmetic
-    # itself is supported by both paths and must not prevent the fallback.
+    # At the shared bound the input is already in ordinary layout.
     if not force_fused and not res_preshuffle and m >= fused_m_upper_bound:
         next_residual = torch.empty_like(residual_in)
         mhc_post(
