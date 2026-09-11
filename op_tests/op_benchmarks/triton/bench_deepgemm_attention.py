@@ -15,7 +15,13 @@ from aiter.ops.triton.attention.pa_mqa_logits import (
 )
 from aiter.ops.triton.utils._triton import arch_info
 from aiter.ops.triton.utils.types import get_fp8_e4m3_dtype
-from aiter.test_common import run_perftest
+from aiter.test_common import (
+    DATA_DISTS,
+    fill,
+    make_generator,
+    print_json_table,
+    run_perftest,
+)
 
 
 def cdiv(x: int, y: int) -> int:
@@ -189,16 +195,18 @@ def create_paged_mqa_logits_configs(args: argparse.Namespace):
     return configs
 
 
-def run_benchmark(args: argparse.Namespace):
+def run_benchmark(args: argparse.Namespace, data_init: str = "norm"):
     ChunkK = 128
     WavePerEU = 5
+    rows = []
 
     @triton.testing.perf_report(create_paged_mqa_logits_configs(args))
     def test_deepgemm_fp8_paged_mqa_logits(
         batch_size, next_n, heads, index_dim, avg_kv_length, kv_storage_kind
     ):
-        torch.manual_seed(0)
-        random.seed(0)
+        torch.manual_seed(args.seed)
+        random.seed(args.seed)
+        gen = make_generator(args.seed)
 
         max_model_len = 2 * avg_kv_length
         blocksize = args.blocksize if args.kv_preshuffle else 1
@@ -225,19 +233,22 @@ def run_benchmark(args: argparse.Namespace):
         )
         prefix_sum_context_lens[1:] = torch.cumsum(context_lens, dim=0)
 
-        q = torch.randn(
-            (batch_size, next_n, heads, index_dim),
-            device="cuda",
+        q = fill(
+            (batch_size * next_n * heads, index_dim),
+            data_init,
+            gen,
             dtype=torch.bfloat16,
-        )
-        kv_cache = torch.randn(
-            (num_blocks, blocksize, 1, index_dim),
-            device="cuda",
+        ).view(batch_size, next_n, heads, index_dim)
+        kv_cache = fill(
+            (num_blocks * blocksize, index_dim),
+            data_init,
+            gen,
             dtype=torch.bfloat16,
-        )
-        weights = torch.randn(
+        ).view(num_blocks, blocksize, 1, index_dim)
+        weights = fill(
             (batch_size * next_n, heads),
-            device="cuda",
+            data_init,
+            gen,
             dtype=torch.float32,
         )
 
@@ -273,7 +284,7 @@ def run_benchmark(args: argparse.Namespace):
         for i in range(batch_size):
             ctx_len = int(context_lens[i].item())
             kv_indices[prefix_sum_context_lens[i] : prefix_sum_context_lens[i + 1]] = (
-                torch.randperm(max_model_len, device="cuda")[:ctx_len]
+                torch.randperm(max_model_len, device="cuda", generator=gen)[:ctx_len]
             )
 
         if kv_storage_kind == "non_ragged_k":
@@ -369,6 +380,10 @@ def run_benchmark(args: argparse.Namespace):
         def calc_diff(x: torch.Tensor, y: torch.Tensor):
             x, y = x.double(), y.double()
             denominator = (x * x + y * y).sum()
+            # zero-init makes both logits tensors exactly zero. Treat that
+            # exact match as zero error instead of reporting 0/0 -> NaN.
+            if denominator == 0:
+                return torch.zeros_like(denominator)
             sim = 2 * (x * y).sum() / denominator
             return 1 - sim
 
@@ -410,9 +425,26 @@ def run_benchmark(args: argparse.Namespace):
 
             os.system("zip -r paged_mqa_logits_aot_kernel paged_mqa_logits")
 
+        rows.append(
+            {
+                "data_init": data_init,
+                "seed": args.seed,
+                "batch": batch_size,
+                "next_n": next_n,
+                "heads": heads,
+                "index_dim": index_dim,
+                "avg_kv_len": avg_kv_length,
+                "kv_storage": kv_storage_kind,
+                "blocksize": blocksize,
+                "latency_us": elapsed_us,
+                "TFLOPS": flops,
+                "logits_diff": float(logits_diff),
+            }
+        )
         return flops
 
-    test_deepgemm_fp8_paged_mqa_logits.run(print_data=True)
+    test_deepgemm_fp8_paged_mqa_logits.run(print_data=False)
+    print_json_table("paged_mqa_logits summary", rows)
 
 
 if __name__ == "__main__":
@@ -474,6 +506,21 @@ if __name__ == "__main__":
         action="store_true",
         help="Disable varctx schedule (only applies with --kv_preshuffle)",
     )
+    parser.add_argument(
+        "--data-init",
+        nargs="+",
+        choices=list(DATA_DISTS),
+        default=["norm"],
+        help="DATA initialization distribution(s) for Q, KV and weights",
+    )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=0,
+        help="RNG seed for input data and generated index tables (default: 0)",
+    )
 
     args = parser.parse_args()
-    run_benchmark(args)
+    for data_init in args.data_init:
+        print(f"data_init={data_init} seed={args.seed}")
+        run_benchmark(args, data_init=data_init)

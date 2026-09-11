@@ -240,7 +240,8 @@ void get_ps_metadata_v1(
     const int32_t         qlen_granularity,
     const int32_t         kvlen_granlarity,
     const int32_t         block_size,
-    const bool            is_causal)
+    const bool            is_causal,
+    const bool            need_lse)
 {
     // const HipDeviceGuard device_guard(pages_kv_indptr.device_id);
 
@@ -271,6 +272,7 @@ void get_ps_metadata_v1(
         qlen_granularity,
         kvlen_granlarity,
         block_size,
-        is_causal);
+        is_causal,
+        need_lse);
 
 }

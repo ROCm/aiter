@@ -17,20 +17,22 @@ Usage:
     python op_tests/test_flydsl_qk_norm_rope_quant.py
     python op_tests/test_flydsl_qk_norm_rope_quant.py -T 64 256 1024 -q fp8_1x128_e8m0
     python op_tests/test_flydsl_qk_norm_rope_quant.py --no-quant   # bf16 only
+    python op_tests/test_flydsl_qk_norm_rope_quant.py --init zero
+    python op_tests/test_flydsl_qk_norm_rope_quant.py --init constant --init-val 0.5
+    python op_tests/test_flydsl_qk_norm_rope_quant.py --seed 42 --init uniform --init-scale 0.2
 """
 
 import argparse
 import itertools
 import math
 
-import pandas as pd
 import torch
 
 import aiter
 from aiter import dtypes
 from aiter.jit.utils.chip_info import get_gfx
 from aiter.ops.flydsl import flydsl_qk_norm_rope_quant
-from aiter.test_common import benchmark, checkAllclose, run_perftest
+from aiter.test_common import benchmark, checkAllclose, print_json_table, run_perftest
 
 torch.set_default_device("cuda")
 
@@ -44,6 +46,21 @@ _EPS = 1e-6
 _SQRT2 = math.sqrt(2.0)
 _FP8_DTYPE = dtypes.fp8
 _FP8_MAX = float(torch.finfo(_FP8_DTYPE).max)
+
+# Data-initialisation modes
+_INIT_MODES = ("normal", "uniform", "zero", "constant")
+
+
+def _make_data(shape, *, dtype, device, mode="normal", scale=0.1, val=1.0):
+    """Create a data tensor in the requested initialisation mode."""
+    if mode == "zero":
+        return torch.zeros(shape, dtype=dtype, device=device)
+    if mode == "constant":
+        return torch.full(shape, val, dtype=dtype, device=device)
+    if mode == "uniform":
+        t = torch.empty(shape, dtype=torch.float32, device=device).uniform_(-1, 1)
+        return (t * scale).to(dtype)
+    return torch.randn(shape, dtype=dtype, device=device) * scale
 
 
 # ============================================================================
@@ -219,8 +236,12 @@ def test_flydsl_qk_norm_rope_quant(
     scale_dtype,
     q_weighted,
     quant,
+    seed=0,
+    init_mode="normal",
+    init_scale=0.1,
+    init_val=1.0,
 ):
-    torch.manual_seed(0)
+    torch.manual_seed(seed)
     device = torch.device("cuda")
 
     # Build cos/sin via a YaRN-style table covering all positions in T.
@@ -231,10 +252,17 @@ def test_flydsl_qk_norm_rope_quant(
     cos = freqs.cos().to(torch.bfloat16).contiguous()
     sin = freqs.sin().to(torch.bfloat16).contiguous()
 
-    q = torch.randn(T, H * D, dtype=torch.bfloat16, device=device) * 0.1
+    _ikw = {
+        "dtype": torch.bfloat16,
+        "device": device,
+        "mode": init_mode,
+        "scale": init_scale,
+        "val": init_val,
+    }
+    q = _make_data((T, H * D), **_ikw)
     # Mimic V4 KV split: kv = strided view into a wider tensor
     Q_LORA = 1536
-    qkv_a = torch.randn(T, Q_LORA + D, dtype=torch.bfloat16, device=device) * 0.1
+    qkv_a = _make_data((T, Q_LORA + D), **_ikw)
     _, kv = torch.split(qkv_a, [Q_LORA, D], dim=-1)
     kv_w = torch.randn(D, dtype=torch.bfloat16, device=device).abs() + 0.5
     q_w = (
@@ -525,8 +553,10 @@ def _build_swa_case(T, mode, *, device):
 
 
 @benchmark()
-def test_flydsl_swa_write(T, H, D, RD, mode):
-    torch.manual_seed(0)
+def test_flydsl_swa_write(
+    T, H, D, RD, mode, *, seed=0, init_mode="normal", init_scale=0.1, init_val=1.0
+):
+    torch.manual_seed(seed)
     device = torch.device("cuda")
 
     bid, pos, index_t, num_rows, dest = _build_swa_case(T, mode, device=device)
@@ -538,11 +568,18 @@ def test_flydsl_swa_write(T, H, D, RD, mode):
     cos = freqs.cos().to(torch.bfloat16).contiguous()
     sin = freqs.sin().to(torch.bfloat16).contiguous()
 
-    q = torch.randn(T, H * D, dtype=torch.bfloat16, device=device) * 0.1
+    _ikw = {
+        "dtype": torch.bfloat16,
+        "device": device,
+        "mode": init_mode,
+        "scale": init_scale,
+        "val": init_val,
+    }
+    q = _make_data((T, H * D), **_ikw)
     # Mimic the V4 KV split: kv is a strided view into a wider tensor, exactly
     # as the model hands it over.
     Q_LORA = 1536
-    qkv_a = torch.randn(T, Q_LORA + D, dtype=torch.bfloat16, device=device) * 0.1
+    qkv_a = _make_data((T, Q_LORA + D), **_ikw)
     _, kv = torch.split(qkv_a, [Q_LORA, D], dim=-1)
     kv_w = torch.randn(D, dtype=torch.bfloat16, device=device).abs() + 0.5
 
@@ -550,7 +587,14 @@ def test_flydsl_swa_write(T, H, D, RD, mode):
     # a write; they change no in-pool byte, so only a dirtied guard row can show
     # that one regressed.
     G = _SWA_GUARD_ROWS
-    pool = torch.zeros(G + num_rows + G, D, dtype=torch.bfloat16, device=device)
+    # A zero-filled pool cannot distinguish "the kernel wrote a zero row" from
+    # "the kernel skipped this row" when --init zero. Seed every row with an
+    # unreachable sentinel so the write-mask check remains valid for all data
+    # distributions.
+    sentinel = torch.finfo(torch.bfloat16).max
+    pool = torch.full(
+        (G + num_rows + G, D), sentinel, dtype=torch.bfloat16, device=device
+    )
     swa_kv = pool[G : G + num_rows]
     mode_kw = (
         {"swa_dest_rows": index_t}
@@ -598,7 +642,7 @@ def test_flydsl_swa_write(T, H, D, RD, mode):
 
     # The scatter is a verbatim copy of kv_out, so the reference IS kv_out
     # gathered onto the rows the addressing mode selects.
-    expected = torch.zeros_like(swa_kv)
+    expected = torch.full_like(swa_kv, sentinel)
     n_written = 0
     for t in range(T):
         if dest[t] < 0:
@@ -620,10 +664,12 @@ def test_flydsl_swa_write(T, H, D, RD, mode):
     )
     # A skipped token must reach NO row, not merely the right one.
     assert (
-        int((swa_kv != 0).any(dim=1).sum()) == n_written
+        int((swa_kv != sentinel).any(dim=1).sum()) == n_written
     ), f"{mode}: a skipped token still reached the pool"
-    assert not pool[:G].any(), f"{mode}: scatter wrote BEFORE the pool"
-    assert not pool[G + num_rows :].any(), f"{mode}: scatter wrote PAST the pool"
+    assert (pool[:G] == sentinel).all(), f"{mode}: scatter wrote BEFORE the pool"
+    assert (
+        pool[G + num_rows :] == sentinel
+    ).all(), f"{mode}: scatter wrote PAST the pool"
 
     # The scatter must not perturb the primary outputs.
     ref_q, ref_kv, _, _ = flydsl_qk_norm_rope_quant(
@@ -742,6 +788,31 @@ def main():
         action="store_true",
         help="bf16 only (ignore -q).",
     )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=0,
+        help="random seed for data initialisation (default: 0).",
+    )
+    parser.add_argument(
+        "--init",
+        type=str,
+        choices=list(_INIT_MODES),
+        default="normal",
+        help="data initialisation mode: normal, uniform, zero, constant (default: normal).",
+    )
+    parser.add_argument(
+        "--init-scale",
+        type=float,
+        default=0.1,
+        help="multiplicative scale for normal/uniform data (default: 0.1).",
+    )
+    parser.add_argument(
+        "--init-val",
+        type=float,
+        default=1.0,
+        help="fill value for constant mode (default: 1.0).",
+    )
     args = parser.parse_args()
 
     # Smoke-test the advertised 4D cos/sin layout once before sweeping.
@@ -749,6 +820,12 @@ def main():
 
     quant_keys = ["bf16"] if args.no_quant else args.quant
     qweight_modes = [False, True] if args.qweight else [False]
+    init_kw = {
+        "seed": args.seed,
+        "init_mode": args.init,
+        "init_scale": args.init_scale,
+        "init_val": args.init_val,
+    }
 
     rows = []
     for key, qw_mode, H, D, T in itertools.product(
@@ -765,12 +842,10 @@ def main():
                 scale_dtype=scale_dtype,
                 q_weighted=qw_mode,
                 quant=quant,
+                **init_kw,
             )
         )
-    aiter.logger.info(
-        "flydsl_qk_norm_rope_quant summary (markdown):\n%s",
-        pd.DataFrame(rows).to_markdown(index=False),
-    )
+    print_json_table("flydsl_qk_norm_rope_quant summary", rows)
 
     # Separate arg signature -> its own table (merging would scatter NaNs).
     # The scatter is decode-only and bf16-only; keep T in the decode range.
@@ -784,11 +859,8 @@ def main():
         # reserved for the out-of-window sentinel).
         [t for t in args.T if 8 <= t <= 96] or [16, 64],
     ):
-        swa_rows.append(test_flydsl_swa_write(T, H, D, args.RD, mode))
-    aiter.logger.info(
-        "flydsl_qk_norm_rope_quant fused SWA write summary (markdown):\n%s",
-        pd.DataFrame(swa_rows).to_markdown(index=False),
-    )
+        swa_rows.append(test_flydsl_swa_write(T, H, D, args.RD, mode, **init_kw))
+    print_json_table("flydsl_qk_norm_rope_quant fused SWA write summary", swa_rows)
 
 
 if __name__ == "__main__":
