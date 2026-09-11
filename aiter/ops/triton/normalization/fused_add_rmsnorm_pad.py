@@ -34,7 +34,7 @@ def fused_add_rmsnorm_pad(
     backend: str | None = None,
 ):
     """
-    Fuses rmnsnorm, add, and padding into a single kernel.
+    Fuses rmsnorm, add, and padding into a single kernel.
 
     Parameters:
         x (torch.Tensor): Input tensor of shape (M, N)
