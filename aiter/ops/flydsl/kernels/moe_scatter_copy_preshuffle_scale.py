@@ -83,7 +83,7 @@ def _emit_preshuffle_dword(gather, map_p, src_p, grow, sd, src_dwords):
     if gather:
         srow = map_p[grow]
         # -1 marks a padding row, so the test is signed.
-        valid = fx.Int32(srow) >= fx.Int32(0)
+        valid = srow >= fx.Int32(0)
         # Clamp offset in-bounds when padding, then zero the result.
         src_off = valid.select(fx.Uint32(srow) * src_dwords + sd, fx.Uint32(0))
         v_raw = src_p[src_off]
@@ -330,13 +330,13 @@ def build_moe_gather_preshuffle_scale_lds_module(
                 row = unit // k_chunk
                 sd = unit - row * k_chunk
                 srow = map_p[row_base + row]
-                valid = fx.Int32(srow) >= fx.Int32(0)
+                valid = srow >= fx.Int32(0)
                 # Clamp in-bounds when padding, then zero the value.
                 src_off = valid.select(
                     fx.Uint32(srow) * src_dwords + sd_base + sd, fx.Uint32(0)
                 )
                 for j in range_constexpr(VEC):
-                    v = fx.Int32(src_p[src_off + j])
+                    v = src_p[src_off + j]
                     lds_p[row * lds_pitch + sd + j] = valid.select(v, fx.Int32(0))
 
         gpu.barrier()

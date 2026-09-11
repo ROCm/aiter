@@ -426,7 +426,7 @@ def build_moe_row_to_token_module():
         if i < fx.Uint32(numel):
             row = ptr_buf_tensor(topids_to_rows)[i]
             # Dropped routes carry a negative sentinel and own no row.
-            if fx.Int32(row) >= fx.Int32(0):
+            if row >= fx.Int32(0):
                 ptr_buf_tensor(row_to_token)[fx.Uint32(row)] = fx.Int32(
                     i // fx.Uint32(topk)
                 )
