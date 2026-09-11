@@ -18,7 +18,6 @@ from aiter.ops.triton._triton_kernels.gated_delta_rule.gated_delta_rule_utils im
     IS_AMD,
     IS_NVIDIA_HOPPER,
     RCP_LN2,
-    USE_CUDA_GRAPH,
     autotune_cache_kwargs,
     check_shared_mem,
     gated_delta_rule_autotune_configs,
@@ -62,7 +61,6 @@ def _gate_exp(x, USE_EXP2: tl.constexpr):
         ]
     ),
     key=["H", "K", "V", "BT", "TRANSPOSE_STATE"],
-    use_cuda_graph=USE_CUDA_GRAPH,
     **autotune_cache_kwargs,
 )
 @triton.jit(do_not_specialize=["T"])
@@ -329,7 +327,6 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
         ]
     ),
     key=["H", "K", "V", "BT", "BV", "USE_G"],
-    use_cuda_graph=USE_CUDA_GRAPH,
     **autotune_cache_kwargs,
 )
 @triton.jit(do_not_specialize=["T"])
@@ -669,7 +666,6 @@ def chunk_gated_delta_rule_fwd_h(
         ]
     ),
     key=["H", "K", "V", "BT", "IS_VARLEN"],
-    use_cuda_graph=USE_CUDA_GRAPH,
     **autotune_cache_kwargs,
 )
 @triton.jit(do_not_specialize=["T", "T_flat"])
@@ -983,7 +979,6 @@ def chunk_gated_delta_rule_fwd_h_opt(
         ]
     ),
     key=["H", "K", "V", "BT", "IS_VARLEN"],
-    use_cuda_graph=USE_CUDA_GRAPH,
     **autotune_cache_kwargs,
 )
 @triton.jit(do_not_specialize=["T", "T_flat"])
