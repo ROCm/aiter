@@ -53,15 +53,19 @@ static constexpr const char* kDenseF4f4KernelName =
     "_ZN5aiter26fmha_fwd_hd128_f4f4_gfx950E";
 static constexpr const char* kDenseF4f4CoName =
     "fmha_v3_fwd/fwd_hd128_f4f4.co";
-// Dedicated one-wave, two-Q-pipeline f4f4 kernel. Unlike the cooperative
-// sibling above, this launch contract is always bdx=64 and persistent over
-// 64-row Q tiles.
+// Solo-ILP f4f4 kernel. The default is one wave over 64 Q rows. Experimental
+// cooperative builds set AITER_F4F4_SOLO_COOP_WAVES to 2 or 4; every wave
+// still owns two 32-row contexts, while the workgroup shares KV staging.
 static constexpr int kDenseF4f4SoloTileQ = 64;
 static constexpr int kDenseF4f4SoloBdx = 64;
 static constexpr const char* kDenseF4f4SoloKernelName =
     "_ZN5aiter31fmha_fwd_hd128_f4f4_solo_gfx950E";
 static constexpr const char* kDenseF4f4SoloCoName =
     "fmha_v3_fwd/fwd_hd128_f4f4_solo.co";
+static constexpr const char* kDenseF4f4SoloCoopCoName =
+    "fmha_v3_fwd/fwd_hd128_f4f4_solo_coop.co";
+static constexpr const char* kDenseF4f4SoloCoopF6CoName =
+    "fmha_v3_fwd/fwd_hd128_f4f4_solo_coop_f6.co";
 
 static uint32_t* get_dense_f4f4_solo_counter(int device, hipStream_t stream)
 {
@@ -471,11 +475,12 @@ float fmha_fwd_v3_f4f4(mha_fwd_sparse_args a, const ck_tile::stream_config& s)
     });
 }
 
-// Dedicated one-wave f4f4 solo launch. The kernel owns two 32-row Q contexts
-// per workgroup and persistently grid-strides over the flattened
-// (ceil(seqlen_q/64), nhead_q, batch) tile space. The standard dense 656-byte
-// kernarg is retained: ptr_lse @0x40 carries the atomic counter and s_lse
-// @0x100 carries the flattened tile count.
+// Solo-ILP launch. Each wave owns two 32-row Q contexts. The default object
+// has one wave/workgroup; a matched cooperative object may use two or four
+// waves sharing KV and therefore cover 128 or 256 rows. All modes persistently
+// grid-stride over their flattened (Q tile, head, batch) space. The standard
+// dense 656-byte kernarg is retained: ptr_lse @0x40 carries the atomic counter
+// and s_lse @0x100 carries the flattened tile count.
 float fmha_fwd_v3_f4f4_solo(mha_fwd_sparse_args a, const ck_tile::stream_config& s)
 {
     if(!a.use_asm_v3)
@@ -501,18 +506,42 @@ float fmha_fwd_v3_f4f4_solo(mha_fwd_sparse_args a, const ck_tile::stream_config&
         return 1;
     }
 
+    const char* coop_env = std::getenv("AITER_F4F4_SOLO_COOP_WAVES");
+    const int coop_waves = coop_env != nullptr ? std::atoi(coop_env) : 1;
+    if(coop_waves != 1 && coop_waves != 2 && coop_waves != 4)
+    {
+        AITER_LOG_WARNING("AITER_F4F4_SOLO_COOP_WAVES must be 1, 2, or 4");
+        return -1;
+    }
+    if(a.kv_block_indices_ptr != nullptr && coop_waves != 1)
+    {
+        AITER_LOG_WARNING("cooperative f4f4-solo does not yet support sparse LUT input");
+        return -1;
+    }
+    const char* direct_p_env = std::getenv("AITER_F4F4_V_DIRECT_P");
+    const bool direct_p = direct_p_env != nullptr && std::atoi(direct_p_env) != 0;
+    if(direct_p && coop_waves == 1)
+    {
+        AITER_LOG_WARNING("MXFP6 P currently requires the cooperative solo object");
+        return -1;
+    }
+    const int tile_q = kDenseF4f4SoloTileQ * coop_waves;
+    const int block_x = kDenseF4f4SoloBdx * coop_waves;
     const long long num_q_tiles =
-        (static_cast<long long>(a.seqlen_q) + kDenseF4f4SoloTileQ - 1) /
-        kDenseF4f4SoloTileQ;
+        (static_cast<long long>(a.seqlen_q) + tile_q - 1) / tile_q;
     const long long total =
         num_q_tiles * static_cast<long long>(a.nhead_q) * static_cast<long long>(a.batch);
     if(total == 0)
         return 0;
 
     static SynchronizedCache<std::string_view, AiterAsmKernel> impl_ptr_map;
+    const char* co_name = coop_waves == 1
+                              ? kDenseF4f4SoloCoName
+                              : (direct_p ? kDenseF4f4SoloCoopF6CoName
+                                          : kDenseF4f4SoloCoopCoName);
     AiterAsmKernel* impl_ptr = &impl_ptr_map.get_or_create(
-        kDenseF4f4SoloCoName,
-        [&]() { return AiterAsmKernel(kDenseF4f4SoloKernelName, kDenseF4f4SoloCoName); });
+        co_name,
+        [=]() { return AiterAsmKernel(kDenseF4f4SoloKernelName, co_name); });
 
     fmha_fwd_v3_sparse_args args{};
     // init_sparse_v3_args always fills the LUT tail; only the size decides whether it reaches the
@@ -533,7 +562,8 @@ float fmha_fwd_v3_f4f4_solo(mha_fwd_sparse_args a, const ck_tile::stream_config&
 
     const char* wgs_env = std::getenv("AITER_F4F4_SOLO_WGS");
     const long long override_wgs = wgs_env != nullptr ? std::atoll(wgs_env) : 0;
-    const long long default_wgs = static_cast<long long>(props.multiProcessorCount) * 4;
+    const long long default_wgs =
+        static_cast<long long>(props.multiProcessorCount) * (4 / coop_waves);
     const long long wanted_wgs = override_wgs > 0 ? override_wgs : default_wgs;
     const int launch_wgs = static_cast<int>(wanted_wgs < total ? wanted_wgs : total);
 
@@ -551,7 +581,7 @@ float fmha_fwd_v3_f4f4_solo(mha_fwd_sparse_args a, const ck_tile::stream_config&
         void* args_ptr = &args;
         size_t* arg_size_ptr = &arg_size;
         impl_ptr->launch_kernel({args_ptr, arg_size_ptr, launch_wgs, 1, 1,
-                                 kDenseF4f4SoloBdx, 1, 1, s_.stream_id_});
+                                 block_x, 1, 1, s_.stream_id_});
     });
 }
 

@@ -4981,9 +4981,13 @@ def flash_attn_f4f4_solo_pertensor_func(
     Q and all scale arithmetic match ``flash_attn_f4f4_pertensor_func``. K/V
     use the solo kernel's compact coalesced LDS-order images; their logical
     tensors are overlapping strided descriptors and must not be made
-    contiguous. This entry always loads ``fwd_hd128_f4f4_solo.co`` and
+    contiguous. By default this entry loads ``fwd_hd128_f4f4_solo.co`` and
     launches the dedicated solo symbol with bdx=64 over flattened 64-row Q
-    tiles. It does not depend on ``AITER_FMHA_SOLO``;
+    tiles. ``AITER_F4F4_SOLO_COOP_WAVES=2`` selects the matched
+    ``fwd_hd128_f4f4_solo_coop.co`` object, bdx=128 and 128-row Q tiles.
+    Adding ``AITER_F4F4_V_DIRECT_P=1`` selects the MXFP6-P object and its
+    matching direct-P V packing.
+    It does not depend on ``AITER_FMHA_SOLO``;
     ``AITER_F4F4_SOLO_WGS`` is only a test override for the persistent
     workgroup count.
 

@@ -316,20 +316,28 @@ def _apply_int8_q_smoothing(q, k, BLKQ, layout, sm_scale):
 _F4F4_V_KPERM_CACHE = {}
 
 
-def _f4f4_v_kperm(device):
-    """Cached int32 [64] 'meas' kv-column permutation for the f4f4 col-major V pack
-    (col c holds kv-token kperm[c]). Built once per device so it is not recreated per
-    call (and stays out of any CUDA-graph capture region)."""
-    kp = _F4F4_V_KPERM_CACHE.get(device)
+def _f4f4_v_base_kperm(device):
+    """Build the int32[64] base KV-column permutation for the F4F4 V pack."""
+    s = torch.arange(64, device=device)
+    j = s % 32
+    pi = 4 * (j // 8) + 16 * ((j // 4) % 2) + (j % 4)
+    tau64 = 32 * (s // 32) + pi
+    kperm = torch.empty(64, dtype=torch.long, device=device)
+    kperm[tau64] = s
+    return kperm
+
+
+def _f4f4_v_kperm(device, direct_p: bool = False):
+    key = (device, direct_p)
+    kp = _F4F4_V_KPERM_CACHE.get(key)
     if kp is None:
-        s = torch.arange(64, device=device)
-        j = s % 32
-        pi = 4 * (j // 8) + 16 * ((j // 4) % 2) + (j % 4)
-        tau64 = 32 * (s // 32) + pi
-        kperm = torch.empty(64, dtype=torch.long, device=device)
-        kperm[tau64] = s  # kperm[col] = tau64^{-1}(col)
-        kp = kperm.to(torch.int32).contiguous()
-        _F4F4_V_KPERM_CACHE[device] = kp
+        base = _f4f4_v_base_kperm(device)
+        if direct_p:
+            token = torch.arange(64, device=device)
+            sigma = (token & ~0x24) | ((token & 0x04) << 3) | ((token & 0x20) >> 3)
+            base = sigma[base]
+        kp = base.to(torch.int32).contiguous()
+        _F4F4_V_KPERM_CACHE[key] = kp
     return kp
 
 
@@ -410,11 +418,13 @@ def sage_quant_v_f4f4(v, layout="bshd"):
 @torch.library.custom_op("aiter::pack_v_mxfp4_colmajor_raw", mutates_args=())
 def pack_v_mxfp4_colmajor_raw(
     value: torch.Tensor,
+    direct_p: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Pack V into contiguous payload and ASM-order E8M0 scale buffers.
 
     Each 128-token tile contributes 512 scale bytes: four 32-token blocks times
-    128 channels, arranged in the gather order consumed by the F4F4/F6F4 kernels.
+    128 channels. ``direct_p`` selects the token order consumed by FP6-P
+    kernels that omit the in-kernel P re-seat.
     """
     batch, sequence, heads, head_dim = value.shape
     if head_dim != 128 or not value.is_contiguous():
@@ -431,7 +441,7 @@ def pack_v_mxfp4_colmajor_raw(
     )
     value_bhsd = value.permute(0, 2, 1, 3)
     payload = raw[: batch * heads * tiles * 8192].view(batch, heads, tiles * 8192)
-    kperm = _f4f4_v_kperm(value.device)
+    kperm = _f4f4_v_kperm(value.device, direct_p)
     sage_quant_v_mxfp4_colmajor_kernel[(batch * heads * tiles * 16,)](
         value_bhsd,
         payload,
@@ -455,7 +465,8 @@ def pack_v_mxfp4_colmajor_raw(
 
 
 @pack_v_mxfp4_colmajor_raw.register_fake
-def _pack_v_mxfp4_colmajor_raw_fake(value):
+def _pack_v_mxfp4_colmajor_raw_fake(value, direct_p=False):
+    del direct_p
     batch, sequence, heads, _ = value.shape
     tiles = fp4_v_padded_sequence(sequence) // FP4_V_TILE_TOKENS
     return (
@@ -466,11 +477,11 @@ def _pack_v_mxfp4_colmajor_raw_fake(value):
     )
 
 
-def sage_quant_v_mxfp4(value):
-    """Return true-MXFP4 V data view and kernel-ready E8M0 block-scale image."""
+def sage_quant_v_mxfp4(value, direct_p: bool = False):
+    """Return MXFP4 V data and scales, optionally in direct-P token order."""
     batch, sequence, heads, _ = value.shape
     padded_sequence = fp4_v_padded_sequence(sequence)
-    raw, scale = pack_v_mxfp4_colmajor_raw(value)
+    raw, scale = pack_v_mxfp4_colmajor_raw(value, direct_p)
     view = torch.as_strided(
         raw,
         (batch, sequence, heads, 128),
@@ -1536,5 +1547,11 @@ def sage_quant_f4f4_solo(
 
     q_fp4, q_scale = downcast_to_mxfp(q_rot, torch.uint8, axis=-1)
     k_fp4, k_scale = quantize_f4f4_solo_k(k_rot)
-    v_fp4, v_scale = quantize_f4f4_solo_v(v_bshd)
+    import os
+
+    direct_p = os.environ.get("AITER_F4F4_V_DIRECT_P", "0") != "0"
+    if direct_p:
+        v_fp4, v_scale = sage_quant_v_mxfp4(v_bshd, direct_p=True)
+    else:
+        v_fp4, v_scale = quantize_f4f4_solo_v(v_bshd)
     return q_fp4, q_scale, k_fp4, k_scale, v_fp4, v_scale, delta_s
