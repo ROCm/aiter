@@ -2658,5 +2658,72 @@ def main():
         )
 
 
+def _dense_reference(q, k, v, valid):
+    """Attention for one batch over its first `valid` keys, in BSHD."""
+    return torch.nn.functional.scaled_dot_product_attention(
+        q.permute(0, 2, 1, 3),
+        k[:, :valid].permute(0, 2, 1, 3),
+        v[:, :valid].permute(0, 2, 1, 3),
+    ).permute(0, 2, 1, 3)
+
+
+@pytest.mark.parametrize("lengths", [(300, 137), (512, 64), (1, 511), (65, 65)])
+def test_mha_v4_seqlens_k_attends_over_each_batch_length(lengths):
+    torch.manual_seed(41)
+    batch, sequence, heads = len(lengths), 512, 4
+    q = torch.randn((batch, sequence, heads, 128), device="cuda", dtype=torch.bfloat16)
+    k = torch.randn_like(q)
+    v = torch.randn_like(q)
+    seqlens_k = torch.tensor(lengths, device="cuda", dtype=torch.int32)
+
+    out = mha_v4(
+        q, k, v, AttentionFormat.BF16, AttentionFormat.BF16, AttentionFormat.BF16,
+        seqlens_k=seqlens_k,
+    )
+    torch.cuda.synchronize()
+
+    for b, valid in enumerate(lengths):
+        reference = _dense_reference(q[b : b + 1], k[b : b + 1], v[b : b + 1], valid)
+        cosine = torch.nn.functional.cosine_similarity(
+            out[b : b + 1].float().flatten(), reference.float().flatten(), dim=0
+        )
+        assert cosine > 0.99, f"batch {b} of {lengths}"
+
+
+def test_mha_v4_seqlens_k_at_full_length_is_the_dense_result():
+    """A null slot and a slot naming the whole key length must run the same code path."""
+    torch.manual_seed(41)
+    q = torch.randn((2, 512, 4, 128), device="cuda", dtype=torch.bfloat16)
+    k = torch.randn_like(q)
+    v = torch.randn_like(q)
+    formats = (AttentionFormat.BF16, AttentionFormat.BF16, AttentionFormat.BF16)
+
+    dense = mha_v4(q, k, v, *formats)
+    full = mha_v4(
+        q, k, v, *formats,
+        seqlens_k=torch.full((2,), 512, device="cuda", dtype=torch.int32),
+    )
+    torch.cuda.synchronize()
+    assert torch.equal(dense, full)
+
+
+def test_mha_v4_rejects_unusable_seqlens_k():
+    q = torch.randn((2, 256, 4, 128), device="cuda", dtype=torch.bfloat16)
+    formats = (AttentionFormat.BF16, AttentionFormat.BF16, AttentionFormat.BF16)
+
+    with pytest.raises(ValueError, match="int32"):
+        mha_v4(q, q, q, *formats,
+               seqlens_k=torch.ones(2, device="cuda", dtype=torch.int64))
+    with pytest.raises(ValueError, match="one entry per batch"):
+        mha_v4(q, q, q, *formats,
+               seqlens_k=torch.ones(1, device="cuda", dtype=torch.int32))
+    with pytest.raises(NotImplementedError, match="per-batch key lengths"):
+        mha_v4(q, q, q, AttentionFormat.INT8, AttentionFormat.INT8,
+               native_fp8_format(),
+               block_mask=torch.ones((2, 4, 1, 256 // mha_v4_kv_tile()),
+                                     device="cuda", dtype=torch.bool),
+               seqlens_k=torch.ones(2, device="cuda", dtype=torch.int32))
+
+
 if __name__ == "__main__":
     main()

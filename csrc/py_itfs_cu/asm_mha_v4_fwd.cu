@@ -817,7 +817,8 @@ void fmha_v4_fwd(const at::Tensor& q,
                  int64_t q_scale_mode,
                  int64_t k_scale_mode,
                  int64_t v_scale_mode,
-                 double softmax_scale)
+                 double softmax_scale,
+                 std::optional<at::Tensor> seqlens_k)
 {
     const MhaV4Recipe recipe{q_format,
                              k_format,
@@ -858,6 +859,22 @@ void fmha_v4_fwd(const at::Tensor& q,
                            shapes.nhead_q,
                            shapes.gqa_ratio,
                            softmax_scale);
+
+    // Per-batch key lengths are optional: the kernels read this slot only when it is non-null, so a
+    // dense launch leaves it zero rather than selecting a different code object.
+    if(seqlens_k.has_value())
+    {
+        TORCH_CHECK(seqlens_k->scalar_type() == at::kInt,
+                    "MHA v4 seqlens_k must be int32, got ",
+                    seqlens_k->scalar_type());
+        TORCH_CHECK(seqlens_k->is_contiguous(), "MHA v4 seqlens_k must be contiguous");
+        TORCH_CHECK(seqlens_k->numel() >= shapes.batch,
+                    "MHA v4 seqlens_k needs one entry per batch: got ",
+                    seqlens_k->numel(),
+                    " for batch ",
+                    shapes.batch);
+        args.ptr_kseq.value = seqlens_k->data_ptr();
+    }
 
     static SynchronizedCache<std::string, AiterAsmKernel> kernels;
     const std::string cache_key = arch + "|" + cfg.knl_name + "|" + cfg.co_name;

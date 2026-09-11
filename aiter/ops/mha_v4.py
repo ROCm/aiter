@@ -542,11 +542,12 @@ def _fmha_v4_fwd_fake(
     k_scale_mode: int,
     v_scale_mode: int,
     softmax_scale: float,
+    seqlens_k: Optional[Tensor],  # noqa: UP045
 ) -> None:
     del q, k, v, q_descale, k_descale, v_descale
     del q_format, k_format, v_format, v_pack
     del q_scale_mode, k_scale_mode, v_scale_mode, softmax_scale
-    del out
+    del out, seqlens_k
 
 
 @compile_ops(
@@ -570,6 +571,7 @@ def _fmha_v4_fwd(
     k_scale_mode: int,
     v_scale_mode: int,
     softmax_scale: float,
+    seqlens_k: Optional[Tensor],  # noqa: UP045
 ) -> None: ...
 
 
@@ -590,6 +592,7 @@ def _mha_v4_fwd_launch(
     k_scale_mode: int,
     v_scale_mode: int,
     softmax_scale: float,
+    seqlens_k: Optional[Tensor],  # noqa: UP045
 ) -> None:
     _fmha_v4_fwd(
         q,
@@ -607,6 +610,7 @@ def _mha_v4_fwd_launch(
         k_scale_mode,
         v_scale_mode,
         softmax_scale,
+        seqlens_k,
     )
 
 
@@ -627,10 +631,12 @@ def _mha_v4_fwd_launch_fake(
     k_scale_mode: int,
     v_scale_mode: int,
     softmax_scale: float,
+    seqlens_k: Optional[Tensor],  # noqa: UP045
 ) -> None:
     del q, k, v, q_descale, k_descale, v_descale, out
     del q_format, k_format, v_format, v_pack
     del q_scale_mode, k_scale_mode, v_scale_mode, softmax_scale
+    del seqlens_k
 
 
 def _fmha_v4_fwd_sparse_fake(
@@ -775,6 +781,7 @@ def mha_v4_packed(
     softmax_scale: Optional[float] = None,  # noqa: UP045
     out: Optional[Tensor] = None,  # noqa: UP045
     return_lse: bool = False,
+    seqlens_k: Optional[Tensor] = None,  # noqa: UP045
     kv_block_indices: Optional[Tensor] = None,  # noqa: UP045
     lut_start: Optional[Tensor] = None,  # noqa: UP045
     lut_count: Optional[Tensor] = None,  # noqa: UP045
@@ -832,6 +839,17 @@ def mha_v4_packed(
 
     if softmax_scale is None:
         softmax_scale = logical_head_dim**-0.5
+    if seqlens_k is not None:
+        if kv_block_indices is not None:
+            raise NotImplementedError(
+                "sorted-sparse MHA v4 does not accept per-batch key lengths yet"
+            )
+        if seqlens_k.dtype != torch.int32 or seqlens_k.device != q.device:
+            raise ValueError("seqlens_k must be an int32 tensor on the same device as Q")
+        if seqlens_k.numel() < batch:
+            raise ValueError("seqlens_k needs one entry per batch")
+        if not seqlens_k.is_contiguous():
+            raise ValueError("seqlens_k must be contiguous")
     if out is None:
         out = torch.empty(
             (batch, query_length, query_heads, logical_head_dim),
@@ -861,7 +879,7 @@ def mha_v4_packed(
         softmax_scale,
     )
     if lut is None:
-        _mha_v4_fwd_launch(*launch_args)
+        _mha_v4_fwd_launch(*launch_args, seqlens_k)
     else:
         if q_format == AttentionFormat.BF16:
             raise NotImplementedError(
@@ -1070,6 +1088,7 @@ def mha_v4(
     q_scale_mode: Optional[AttentionScaleMode] = None,  # noqa: UP045
     k_scale_mode: Optional[AttentionScaleMode] = None,  # noqa: UP045
     v_scale_mode: Optional[AttentionScaleMode] = None,  # noqa: UP045
+    seqlens_k: Optional[Tensor] = None,  # noqa: UP045
 ) -> Tensor:
     """Quantize BF16 BSHD operands and run non-causal MHA v4.
 
@@ -1227,6 +1246,7 @@ def mha_v4(
         out=out,
         return_lse=return_lse,
         v_pack=recipe.v_pack,
+        seqlens_k=seqlens_k,
         **packed_lut,
     )
 
