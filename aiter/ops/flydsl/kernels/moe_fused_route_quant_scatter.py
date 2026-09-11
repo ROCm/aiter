@@ -1622,7 +1622,6 @@ def build_moe_fused_quant_preshuffle_route_ksplit_module(
     mx_blocks_per_wave_iter = L.mx_blocks_per_wave_iter
     mx_blocks_per_row = L.mx_blocks_per_row
     rows_per_tile = L.rows_per_tile
-    scale_dwords_per_row = L.scale_dwords_per_row
     dst_scale_dwords_per_row = L.dst_scale_dwords_per_row
     block_iters = L.block_iters
     amax_shuffle_dists = L.amax_shuffle_dists
@@ -1687,7 +1686,6 @@ def build_moe_fused_quant_preshuffle_route_ksplit_module(
         c_payload_bytes_per_block = arith.constant(payload_bytes_per_block, type=i32)
         c_payload_bytes_per_lane = arith.constant(payload_bytes_per_lane, type=i32)
         c_dst_scale_dwords_per_row = arith.constant(dst_scale_dwords_per_row, type=i32)
-        c_scale_dwords_per_row = arith.constant(scale_dwords_per_row, type=i32)
         c_wmma_rep = arith.constant(wmma_rep, type=i32)
         c_rows_per_tile = arith.constant(rows_per_tile, type=i32)
         c_lanes_per_block = arith.constant(lanes_per_mx_block, type=i32)

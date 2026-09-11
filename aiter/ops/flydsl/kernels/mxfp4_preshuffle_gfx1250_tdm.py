@@ -163,12 +163,11 @@ def launch_gemm_a8w4_tdm(
         a_gather_rows,
     )
     _ = cache_tag
-    if a_gather_indexed:
-        # The gather descriptor carries 16-bit row indices.
-        if not 0 < a_gather_rows < 65536:
-            raise ValueError(
-                f"a_gather_indexed needs 0 < a_gather_rows < 65536, got {a_gather_rows}"
-            )
+    # The gather descriptor carries 16-bit row indices.
+    if a_gather_indexed and not 0 < a_gather_rows < 65536:
+        raise ValueError(
+            f"a_gather_indexed needs 0 < a_gather_rows < 65536, got {a_gather_rows}"
+        )
     if enable_ep_scatter:
         if stage1_act != 0:
             raise ValueError("enable_ep_scatter is gemm2-only (stage1_act must be 0)")
