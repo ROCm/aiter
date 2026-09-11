@@ -41,7 +41,7 @@ _TILE_K_OPTS = (128, 256, 512, 1024)
 _NUM_BUFFERS_OPTS = (2, 3, 4)
 _WARP_OPTS = ((1, 4), (2, 2), (4, 1))
 _CLUSTER_OPTS = ((1, 1),)
-_SPLIT_K = (1, 2, 4, 6, 8)
+_SPLIT_K = (1, 2, 4, 8)
 
 _COMPUTE_PROFILES = (
     (256, 256, 128, 2, 2, 4),

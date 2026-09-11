@@ -78,7 +78,7 @@ def launch_gemm_a8w8_256x256(
     assert (
         cluster_m >= 1 and cluster_n >= 1 and 1 < cluster_m * cluster_n <= 16
     ), f"cluster_m*cluster_n must be 2..16, got {cluster_m}x{cluster_n}"
-    assert split_k in (1, 2, 4, 6, 8), f"split_k must be 1/2/4/6/8, got {split_k}"
+    assert split_k in (1, 2, 4, 8), f"split_k must be 1/2/4/8, got {split_k}"
     assert (
         persistent_n_tiles >= 1
     ), f"persistent_n_tiles must be >= 1, got {persistent_n_tiles}"
@@ -110,9 +110,7 @@ def launch_gemm_a8w8_256x256(
     UNROLL = KPAIR * num_buffers
     SUPER_K = tile_k * KPAIR
     LDS_PAD_A = 16
-    # A-preshuffle: A is shuffle_mxfp8fp4_a-tiled, [M, K] -> [M/2, K/128, 2, 128],
-    # so the TDM walks tile_m/2 segments of 2*SUPER_K instead of tile_m of SUPER_K.
-    # Only A's LDS addressing changes; the WMMA fragment order does not.
+    # A-preshuffle: A is shuffle_mxfp8fp4_a-tiled, [M, K] -> [M/2, K/128, 2, 128]
     A_PAIR = 2 if a_preshuffle else 1
     assert not a_preshuffle or tile_m % 2 == 0, "a_preshuffle needs an even tile_m"
     A_LDS_ROWS = tile_m // A_PAIR
@@ -201,8 +199,6 @@ def launch_gemm_a8w8_256x256(
         blk_m64 = fx.Int64(blk_m)
         blk_n64 = fx.Int64(blk_n)
         mn_oob = i32_m - blk_m  # valid M rows (A / C)
-        # A's TDM bound is in row pairs; C and the A-scale stay on rows. Shift,
-        # not `// 2`, which flydsl lowers with a truncating-division fixup.
         a_oob = (mn_oob + 1) >> 1 if const_expr(a_preshuffle) else mn_oob
         sa_oob = (i32_m + 31) // 32 - blk_m // 32  # valid M-supers (scale-A)
 
@@ -231,8 +227,6 @@ def launch_gemm_a8w8_256x256(
         gB_base = fx.recast_iter(fx.Int8, arg_b)
 
         k_elem0 = kt_base * tile_k
-        # (blk_m/2)*(2*lda) == blk_m*lda, so lda stays the unshuffled K; only the
-        # split-K byte offset doubles, K element kk sitting at byte 2*kk of its pair.
         a_off0 = blk_m64 * lda64 + k_elem0 * A_PAIR
         b_off0 = (blk_n64 // 16) * Kp16 + k_elem0 * 16
         if const_expr(mx32):
@@ -487,13 +481,7 @@ def launch_gemm_a8w8_256x256(
             [],
         )
         sa_row, sb_col = wmb + lane, wnb + lane
-        # Fragment row `wmb + lane16 + idx*16`, K byte `par*128 + kgrp*16 + 32*j`.
-        # Preshuffled, that row is half (row%2) of pair (row//2)'s `par`-th 256B
-        # chunk, so 16 rows is 8 pairs and `par` steps 256B.
         if const_expr(a_preshuffle):
-            # warp_tile_m is a multiple of 16, so the pair index halves at compile
-            # time and lane16 alone decides parity: shift/mask, not `//` and `%`,
-            # which lower to a signed-division fixup.
             a_pair = wave_m * (warp_tile_m // 2) + (lane16 >> 1)
             a_byte = fx.index_cast(
                 T.index,
