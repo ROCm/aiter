@@ -197,12 +197,11 @@ class MegaMoEConfig:
                 f"dispatch_wire must be one of {_DISPATCH_WIRES}, "
                 f"got {self.dispatch_wire!r}"
             )
-        if self.is_quant_dispatch_wire and self.dispatch_backend != "mori":
-            # Only mori's kernel carries the scale row; this package's own
-            # dispatch has no channel for it.
+        if self.is_quant_dispatch_wire and self.dispatch_backend not in ("tdm", "mori"):
             raise ValueError(
                 f"dispatch_wire={self.dispatch_wire!r} requires "
-                f"dispatch_backend='mori' (got {self.dispatch_backend!r})"
+                "dispatch_backend='tdm' or 'mori' "
+                f"(got {self.dispatch_backend!r})"
             )
         if self.is_quant_dispatch_wire and self.hidden_dim % 32:
             raise ValueError(
@@ -306,6 +305,8 @@ class MegaMoEConfig:
         """
         if not self.is_quant_dispatch_wire:
             return 0
+        if self.dispatch_backend == "tdm":
+            return _align_up(self.dispatch_scale_nbytes, 128)
         try:
             from mori.ops.dispatch_combine_v2.hip_backend import scale_stride_bytes
         except ImportError as e:
@@ -743,25 +744,46 @@ class MegaMoEGfx1250:
         peer-major destTokId SoA there so META can ship each block's reserved run
         as a couple of contiguous TDM copies.
         """
-        elem_size = config.dispatch_token_nbytes // config.hidden_dim
+        payload_dim = config.dispatch_wire_elem_count
+        elem_size = config.dispatch_wire_spec.recv_dtype.itemsize
         stg_cap, slots = tdm_stage_capacity(
             npes=config.world_size, max_recv=config.max_recv
         )
-        self._tdm_stage = (
+        stage = [
             torch.empty(slots * config.topk, dtype=torch.int32, device=device),
             torch.empty(slots * config.topk, dtype=torch.int32, device=device),
             torch.empty(slots, dtype=torch.int32, device=device),
-        )
+        ]
+        if config.dispatch_scale_dst_nbytes:
+            stage.append(
+                torch.empty(
+                    slots * config.dispatch_scale_dst_nbytes,
+                    dtype=torch.uint8,
+                    device=device,
+                )
+            )
+        self._tdm_stage = tuple(stage)
+        for buf in self._tdm_stage:
+            if buf.data_ptr() % 128:
+                raise RuntimeError(
+                    "TDM staging allocations must be 128-byte aligned, got "
+                    f"0x{buf.data_ptr():x}"
+                )
+        # On a quantized wire the metadata batch grew by a scale row while the
+        # payload shrank, so the shared LDS tile is floored at the bf16 width.
+        slab_bytes = config.hidden_dim * 2 if config.is_quant_dispatch_wire else 0
         # A vector-tuned spec can name more warps than the payload tiles fit;
         # clamp the width but keep the tuned block count, which is what paces
         # the grid barrier, and keep the caller's spec as the variant key so the
         # runtime pick still resolves.
         max_warps = tdm_max_warps(
-            hidden_dim=config.hidden_dim,
+            hidden_dim=payload_dim,
             hidden_elem_size=elem_size,
             npes=config.world_size,
+            slab_bytes=slab_bytes,
         )
-        stg_idx, stg_wt, stg_src = self._tdm_stage
+        stg_idx, stg_wt, stg_src = self._tdm_stage[:3]
+        stg_scale = self._tdm_stage[3] if len(self._tdm_stage) > 3 else None
 
         def make_variant(kern):
             def launch(
@@ -789,6 +811,8 @@ class MegaMoEGfx1250:
                     stg_idx.data_ptr(),
                     stg_wt.data_ptr(),
                     stg_src.data_ptr(),
+                    stg_scale.data_ptr() if stg_scale is not None else 0,
+                    self._dispatch_sent_scales_ptr,
                     my_lsa_rank,
                     inp_cur_tok,
                     stream,
@@ -806,8 +830,9 @@ class MegaMoEGfx1250:
                     npes=config.world_size,
                     experts_per_rank=config.experts_per_rank,
                     experts_per_token=config.topk,
-                    hidden_dim=config.hidden_dim,
+                    hidden_dim=payload_dim,
                     hidden_elem_size=elem_size,
+                    slab_bytes=slab_bytes,
                     max_tok_per_rank=config.max_tokens_per_rank,
                     max_recv=config.max_recv,
                     off_tok_off=self._arena.offset("tok_off"),
@@ -816,6 +841,13 @@ class MegaMoEGfx1250:
                     off_out_idx=self._arena.offset("out_idx"),
                     off_out_wts=self._arena.offset("out_wts"),
                     off_out_tok=self._arena.offset("disp_out"),
+                    off_out_scales=(
+                        self._arena.offset("disp_out_scales")
+                        if config.dispatch_scale_dst_nbytes
+                        else 0
+                    ),
+                    scale_bytes=config.dispatch_scale_nbytes,
+                    scale_stride=config.dispatch_scale_dst_nbytes,
                     block_num=geom[0],
                     warp_num_per_block=geom[1],
                 )
