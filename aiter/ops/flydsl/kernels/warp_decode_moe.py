@@ -39,6 +39,7 @@ from flydsl.expr.typing import BFloat16
 
 from aiter.ops.flydsl.kernels import buffer_ops
 from aiter.ops.flydsl.kernels.tensor_shim import (
+    buf_copy_atom,
     buf_copy_load,
     buf_copy_store,
     ptr_buf_tensor,
@@ -138,12 +139,46 @@ def _preshuffled_expert_b_i32_tensor(ptr, expert, n_out, packed_k, elem_bytes):
 
 def _kpack_load_i32(t, n, k_packed, *, elem_bytes: int):
     """One dword from a preshuffled B kpack view via ``fx.copy`` (not ``t[i]``)."""
-    n0, k0, klane, nlane, ki = _logical_nk_to_kpack_i32(
-        n, k_packed, elem_bytes=elem_bytes
+    return _kpack_load_i32_words(t, n, k_packed, 1, elem_bytes=elem_bytes)[0]
+
+
+def _kpack_copy_ki(tile, ki, width: int):
+    """Load ``width`` consecutive inner-kpack dwords starting at ``ki``."""
+    if width == 1:
+        val = buf_copy_load(tile, ki, fx.Int32)
+        return [fx.Int32(val).ir_value()]
+    grouped = fx.logical_divide(tile, fx.make_layout(width, 1))
+    fragment = fx.make_rmem_tensor(width, fx.Int32)
+    fx.copy(
+        buf_copy_atom(width * 4, fx.Int32),
+        fx.slice(grouped, (None, ki // fx.Int32(width))),
+        fragment,
     )
-    tile = fx.slice(t, (n0, k0, klane, nlane, None))
-    val = buf_copy_load(tile, ki, fx.Int32)
-    return fx.Int32(val).ir_value()
+    vec = fx.Vector(fragment.load())
+    return [vec[j].ir_value() for j in range(width)]
+
+
+def _kpack_load_i32_words(t, n, k_packed0, n_words, *, elem_bytes: int):
+    """Consecutive logical dwords along inner ``ki`` (vec4/vec2 when they fit)."""
+    k_per_dword = 4 // elem_bytes
+    out = []
+    w = 0
+    while w < n_words:
+        remain = n_words - w
+        if remain >= 4:
+            width = 4
+        elif remain >= 2:
+            width = 2
+        else:
+            width = 1
+        k_packed = k_packed0 + w * k_per_dword
+        n0, k0, klane, nlane, ki = _logical_nk_to_kpack_i32(
+            n, k_packed, elem_bytes=elem_bytes
+        )
+        tile = fx.slice(t, (n0, k0, klane, nlane, None))
+        out.extend(_kpack_copy_ki(tile, ki, width))
+        w += width
+    return out
 
 
 def _bf16_out_view(ptr):
@@ -360,13 +395,9 @@ def _weight_i32_words(
 ):
     """Weight dwords: k_contiguous ``buffer_ops`` or preshuffled kpack ``fx.copy``."""
     if preshuffled:
-        k_per_dword = 4 // elem_bytes
-        return [
-            _kpack_load_i32(
-                view, n_idx, k_packed0 + w * k_per_dword, elem_bytes=elem_bytes
-            )
-            for w in range(n_words)
-        ]
+        return _kpack_load_i32_words(
+            view, n_idx, k_packed0, n_words, elem_bytes=elem_bytes
+        )
     return load_i32_words(rsrc, word0, n_words)
 
 
