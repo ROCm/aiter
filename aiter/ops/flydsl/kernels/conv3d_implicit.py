@@ -360,7 +360,10 @@ def _ncdhw_to_ndhwc(x, stream):
     return out
 
 
-@functools.lru_cache(maxsize=256)
+# One entry per (shape, launch config). A tuning sweep walks ~100 configs per
+# shape and several shapes land in the same worker process, so the upstream 256
+# would evict entries that the same process still needs.
+@functools.lru_cache(maxsize=1024)
 def compile_conv3d_implicit(
     n,
     c,
@@ -1133,6 +1136,93 @@ def _blocks(npq, kg, groups, tile):
     return ((npq + tile_m - 1) // tile_m) * groups * ((kg + tile_n - 1) // tile_n)
 
 
+# Column order of aiter/configs/conv3d_bf16_untuned.csv, and therefore of the
+# lookup key. Keep in sync with csrc/flydsl_conv3d/conv3d_tune.py::KEYS.
+TUNED_KEY_COLUMNS = (
+    "N",
+    "C",
+    "D",
+    "H",
+    "W",
+    "K",
+    "kT",
+    "kH",
+    "kW",
+    "stride_d",
+    "stride_h",
+    "stride_w",
+    "pad_d",
+    "pad_h",
+    "pad_w",
+    "dil_d",
+    "dil_h",
+    "dil_w",
+    "groups",
+    "bias",
+)
+_TUNED_RESULT_COLUMNS = ("tile_m", "tile_n", "wave_m", "wave_n", "wgm")
+
+
+@functools.lru_cache(maxsize=4)
+def _load_tuned_table(gfx, cu_num):
+    """Parse the tuned config CSV into ``{key_tuple: (tile, wgm)}``.
+
+    Returns an empty dict on any failure. A missing or malformed table must
+    degrade to the heuristic, never break a conv.
+    """
+    try:
+        import pandas as pd
+
+        from aiter.jit.core import AITER_CONFIGS
+
+        path = AITER_CONFIGS.AITER_CONFIG_CONV3D_BF16_FILE
+        if not path or not os.path.exists(path):
+            return {}
+        df = pd.read_csv(path)
+        df.columns = df.columns.str.strip()
+        missing = [
+            c
+            for c in (*TUNED_KEY_COLUMNS, *_TUNED_RESULT_COLUMNS, "gfx", "cu_num")
+            if c not in df.columns
+        ]
+        if missing:
+            return {}
+        df = df[(df["gfx"].astype(str) == str(gfx)) & (df["cu_num"] == cu_num)]
+
+        table = {}
+        for row in df.itertuples(index=False):
+            key = tuple(
+                bool(getattr(row, c)) if c == "bias" else int(getattr(row, c))
+                for c in TUNED_KEY_COLUMNS
+            )
+            table[key] = (
+                (
+                    int(row.tile_m),
+                    int(row.tile_n),
+                    int(row.wave_m),
+                    int(row.wave_n),
+                ),
+                int(row.wgm),
+            )
+        return table
+    except Exception:  # noqa: BLE001  a bad config table must never break a conv
+        return {}
+
+
+def _lookup_tuned_tile(key, device):
+    """Offline-tuned launch config for this exact problem, or None."""
+    if key is None:
+        return None
+    try:
+        props = torch.cuda.get_device_properties(device)
+        table = _load_tuned_table(
+            props.gcnArchName.split(":")[0], props.multi_processor_count
+        )
+    except Exception:  # noqa: BLE001  same: degrade to the heuristic
+        return None
+    return table.get(key)
+
+
 def _pick_tile(npq, k, groups, device):
     kg = k // groups
     target = TILE_MIN_WAVES_PER_CU * _num_cu(device)
@@ -1292,6 +1382,38 @@ def _conv3d_impl(
                     f"circular padding {p} must be <= input extent {ext} on spatial axis {ax}"
                 )
 
+    # Key into the offline-tuned config table. Captured here, before the padding
+    # and channel-padding paths below rewrite n/c/d/h/w, so that it describes the
+    # problem the caller asked for and matches the untuned CSV column order.
+    # Asymmetric padding cannot be expressed with one value per axis, so those
+    # calls fall through to the heuristic rather than matching a wrong row.
+    tuned_key = (
+        (
+            n,
+            c,
+            d,
+            h,
+            w,
+            k,
+            kt,
+            kh,
+            kw,
+            st,
+            sh,
+            sw,
+            pt,
+            ph,
+            pw,
+            dt,
+            dh,
+            dw,
+            groups,
+            bias is not None,
+        )
+        if padding_mode == "zeros" and pad_lo == pad_hi
+        else None
+    )
+
     if pad_lo != pad_hi:
         if padding_mode == "zeros":
             x, in_ndhwc = _pad_spatial(
@@ -1449,13 +1571,16 @@ def _conv3d_impl(
         chosen_tile = tuple(tile)
         chosen_wgm = 1 if forced_wgm is None else forced_wgm
     elif autotune or (autotune is None and _autotune_enabled()):
-        from kernels.conv.conv3d_autotune import (
-            BF16_CANDIDATES,
-            WGM_VALUES,
-            autotune_conv3d,
-        )
+        from aiter.ops.flydsl.conv3d_policy import get_flydsl_conv3d_configs
 
-        candidates = [(t, w) for t in BF16_CANDIDATES for w in WGM_VALUES]
+        from .conv3d_autotune import autotune_conv3d
+
+        candidates = [
+            ((tm, tn, wm, wn), g)
+            for tm, tn, wm, wn, g in get_flydsl_conv3d_configs(
+                npq, k // groups, groups, _num_cu(x.device)
+            )
+        ]
         best = autotune_conv3d(
             "bf16",
             shape,
@@ -1466,12 +1591,18 @@ def _conv3d_impl(
         )
         chosen_tile, chosen_wgm = best
     else:
-        chosen_tile = _pick_tile(npq, k, groups, x.device)
-        chosen_wgm = (
-            _pick_wgm(npq, k, groups, chosen_tile, x.device)
-            if forced_wgm is None
-            else forced_wgm
-        )
+        hit = _lookup_tuned_tile(tuned_key, x.device)
+        if hit is not None:
+            chosen_tile, chosen_wgm = hit
+            if forced_wgm is not None:
+                chosen_wgm = forced_wgm
+        else:
+            chosen_tile = _pick_tile(npq, k, groups, x.device)
+            chosen_wgm = (
+                _pick_wgm(npq, k, groups, chosen_tile, x.device)
+                if forced_wgm is None
+                else forced_wgm
+            )
 
     y, sk = _run(chosen_tile, chosen_wgm)
     if sk > 1:
