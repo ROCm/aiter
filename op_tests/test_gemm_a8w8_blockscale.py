@@ -19,7 +19,7 @@ from aiter import dtypes
 from aiter import test_common as bench_init
 from aiter.ops.gemm_op_a8w8 import gemm_a8w8_blockscale_ck, gemm_a8w8_blockscale_cktile
 from aiter.ops.shuffle import shuffle_weight
-from aiter.test_common import benchmark, checkAllclose, perftest, print_json_table
+from aiter.test_common import benchmark, checkAllclose, perftest
 from aiter.utility import fp4_utils
 
 block_shape = (128, 128)
@@ -455,7 +455,23 @@ else:
                         )
                         df.append(ret)
 
-print_json_table("gemm_a8w8_blockscale summary", df)
+df = pd.DataFrame(df)
+
+pd.set_option("display.max_columns", None)
+pd.set_option("display.width", None)
+pd.set_option("display.max_colwidth", None)
+pd.set_option("display.expand_frame_repr", False)
+
+print("\n" + "=" * 150)
+print("COMPLETE PERFORMANCE SUMMARY (All Columns)")
+print("=" * 150)
+print(df.to_string(index=False))
+print("=" * 150)
+
+aiter.logger.info(
+    "gemm_a8w8_blockscale summary (markdown):\n%s",
+    df.to_markdown(index=False),
+)
 
 # Correctness check: verify split-K produces matching results
 print("\nRunning split-K correctness checks ...")

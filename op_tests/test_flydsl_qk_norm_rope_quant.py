@@ -26,13 +26,14 @@ import argparse
 import itertools
 import math
 
+import pandas as pd
 import torch
 
 import aiter
 from aiter import dtypes
 from aiter.jit.utils.chip_info import get_gfx
 from aiter.ops.flydsl import flydsl_qk_norm_rope_quant
-from aiter.test_common import benchmark, checkAllclose, print_json_table, run_perftest
+from aiter.test_common import benchmark, checkAllclose, run_perftest
 
 torch.set_default_device("cuda")
 
@@ -845,7 +846,10 @@ def main():
                 **init_kw,
             )
         )
-    print_json_table("flydsl_qk_norm_rope_quant summary", rows)
+    aiter.logger.info(
+        "flydsl_qk_norm_rope_quant summary (markdown):\n%s",
+        pd.DataFrame(rows).to_markdown(index=False),
+    )
 
     # Separate arg signature -> its own table (merging would scatter NaNs).
     # The scatter is decode-only and bf16-only; keep T in the decode range.
@@ -860,7 +864,10 @@ def main():
         [t for t in args.T if 8 <= t <= 96] or [16, 64],
     ):
         swa_rows.append(test_flydsl_swa_write(T, H, D, args.RD, mode, **init_kw))
-    print_json_table("flydsl_qk_norm_rope_quant fused SWA write summary", swa_rows)
+    aiter.logger.info(
+        "flydsl_qk_norm_rope_quant fused SWA write summary (markdown):\n%s",
+        pd.DataFrame(swa_rows).to_markdown(index=False),
+    )
 
 
 if __name__ == "__main__":

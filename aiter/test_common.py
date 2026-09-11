@@ -2,7 +2,6 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 import copy
 import inspect
-import json
 import multiprocessing as mp
 import os
 from contextvars import ContextVar
@@ -24,31 +23,6 @@ _SMI_CALL_LABEL = ContextVar("aiter_smi_call_label", default=None)
 # pd.set_option("display.width", None)
 # pd.set_option("display.max_colwidth", None)
 # pd.set_option("display.expand_frame_repr", False)
-
-
-def print_json_table(name, rows, keep=None):
-    """Print benchmark rows as one record-oriented JSON object.
-
-    A single-line object is intentional: parent benchmark drivers can validate
-    and forward it without parsing pandas' human-readable table formats.
-    """
-    if isinstance(rows, pd.DataFrame):
-        df = rows.copy()
-    else:
-        df = pd.DataFrame([row for row in rows if row is not None])
-    if not df.empty:
-        df = df.replace("", pd.NA).dropna(axis=1, how="all")
-        if keep is not None:
-            cols = [column for column in keep if column in df.columns]
-            cols += [
-                column
-                for column in df.columns
-                if "err_msg" in column and column not in cols
-            ]
-            df = df[cols]
-    records = json.loads(df.to_json(orient="records"))
-    print(json.dumps({"name": name, "rows": records}), flush=True)
-
 
 def _smi_label_value(value):
     """Return a compact, stable label value, or None for opaque arguments."""

@@ -51,7 +51,6 @@ from aiter.test_common import (
     fill,
     make_generator,
     perftest,
-    print_json_table,
 )
 
 try:
@@ -839,6 +838,7 @@ if __name__ == "__main__":
         rest = [c for c in df.columns if c not in lead]
         metrics = [c for b in _BACKENDS for c in rest if c.startswith(f"{b} ")]
         df = df[lead + [c for c in rest if c not in metrics] + metrics]
-        print_json_table("pa_sparse_prefill summary", df)
+        print()
+        print(df.to_string(index=False, na_rep="-"))  # na_rep: backend not run
         sys.exit(0)
     sys.exit(0)
