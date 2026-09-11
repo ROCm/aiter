@@ -264,15 +264,25 @@ def _kv_drain_depths(num_tensorcnt, num_asynccnt):
     return (0 if num_tensorcnt >= 0 else -1, 0 if num_asynccnt >= 0 else -1)
 
 
-def _kv_fence(num_tensorcnt=-1, num_asynccnt=-1):
+def _kv_fence(num_tensorcnt=-1, num_asynccnt=-1, num_dscnt=None):
     """``_kv_wait``, then publish the retired copies workgroup-wide.
 
     The ``s_barrier`` is what publishes a wave's share of a tile to its peers -- the
     counters only bound the issuing wave's own copies -- and it doubles as the WAR wall
-    for the slot about to be written."""
+    for the slot about to be written.
+
+    ``num_dscnt`` is how many of this wave's LDS reads may stay in flight past the
+    barrier. ``None`` keeps ``gpu.barrier()``'s workgroup fence, which drains dscnt (and
+    storecnt) to 0. Name a depth to swap that for a bare signal/wait plus an explicit
+    partial wait, so a ring head issued just before the fence survives it."""
     _kv_wait(num_tensorcnt, num_asynccnt)
     rocdl.sched_barrier(0)
-    gpu.barrier()
+    if num_dscnt is None:
+        gpu.barrier()
+    else:
+        rocdl.s_wait_dscnt(num_dscnt)
+        rocdl_dialect.s_barrier_signal(-1)
+        rocdl_dialect.s_barrier_wait(-1)
     rocdl.sched_barrier(0)
 
 
@@ -870,6 +880,9 @@ def _pv_qk_gemm(
             )
             s_acc_list[qt][kv] = _wmma(k_frag, q_frags_list[qt][dt], acc)
 
+    # Raise wave priority for the whole WMMA stream: under anti-phase the other half is
+    # in its softmax VALU here, and the gemm half must win issue arbitration.
+    rocdl.s_setprio(1)
     _ring_drive(
         num_frag=num_vfrag + num_kfrag,
         emit=emit,
@@ -878,6 +891,7 @@ def _pv_qk_gemm(
         lag=lag,
         head=head,
     )
+    rocdl.s_setprio(0)
     return out_list, s_acc_list
 
 
@@ -1317,9 +1331,13 @@ def _core_attention(
     _NH = 0 if _lag_sm else min(PVQK_HEAD_CARRY, _NP)
     assert _NH <= 2 * _num_vfrag, "carried head must be V loads only"
     _HEAD_BASE = len(_init)
-    _init = _init + [
-        _raw(v_mgr.load_one_to_reg(v_lds_ld[0], j)) for j in range(_NH)
-    ]
+    _seed_head = []
+    for j in range(_NH):
+        # Same per-pair pin as ``_issue_head`` in the body.
+        _seed_head.append(_raw(v_mgr.load_one_to_reg(v_lds_ld[0], j)))
+        if len(_seed_head) % 2 == 0:
+            rocdl.sched_barrier(0)
+    _init = _init + _seed_head
 
     # ========================================================================
     # Main KV loop -- SOFTWARE-PIPELINED by one tile. The loop variable ``u`` is the
@@ -1449,10 +1467,16 @@ def _core_attention(
         def _drain_barrier():
             # Full drain: tile u must be RESIDENT here -- this body reads it as K.
             # KV_PARTIAL_FENCE is asserted off for that reason.
+            #
+            # dscnt is drained only to _NH: the leading half issues its ring head at the
+            # tail of the previous body, so a full drain here would retire it right before
+            # the gemm that wants it in flight. The gemm's own last ring fragment already
+            # took dscnt to 0, so every read older than the head is retired regardless --
+            # the WAR wall for the slot about to be written still holds.
             if KV_PARTIAL_FENCE:
-                _kv_fence(num_tdm_copies, num_async_copies)
+                _kv_fence(num_tdm_copies, num_async_copies, num_dscnt=_NH)
             else:
-                _kv_fence(*_kv_drain)
+                _kv_fence(*_kv_drain, num_dscnt=_NH)
 
         def _prefetch(addr):
             if USE_TDM_LOADER:
@@ -1483,37 +1507,23 @@ def _core_attention(
         def _pvqk_emit(j):
             return _v_emit(j) if j < 2 * num_vfrag else _k_emit(j - 2 * num_vfrag)
 
+        def _issue_head(emit, first, last, carried=()):
+            # Pin every fragment's load PAIR in place. The ring consumes loads 2i and
+            # 2i+1 for fragment i, but the scheduler scatters the 20-deep burst freely --
+            # in the dumps a partner load drifted 12+ slots back, so the wmma waited on
+            # most of the burst (s_wait_dscnt 0x9 / 0x7) instead of the ring's 0x12.
+            # NOT _keepalive -- that is a USE, so it drags an s_wait_dscnt 0x0 in with it.
+            out = list(carried)
+            for j in range(first, last):
+                out.append(emit(j))
+                if len(out) % 2 == 0:
+                    rocdl.sched_barrier(0)
+            return out
+
         def _pvqk_head():
             # The first _NH loads came from the previous body (issued under its softmax);
             # only the remainder is issued here.
-            return head_carry + [_v_emit(j) for j in range(_NH, _NP)]
-
-        if warp_type == WarpType.LO_WARP:
-            _drain_barrier()
-            pvqk_head = _pvqk_head()
-            _prefetch(addr)
-        else:
-            _drain_barrier()
-            _prefetch(addr)
-            pvqk_head = _pvqk_head()
-
-        # Fence the head out of the WMMA stream (no wmma<-ds_load bubble); the ring
-        # itself issues the s_wait_dscnt that covers each fragment.
-        rocdl.sched_barrier(0)
-
-        def _gemm_phase(p_in, o_in):
-            # GEMM2(u-1) then GEMM1(u) on one ring: O += P^T(u-1) @ V(u-1), then
-            # S^T = K(u) @ Q^T.
-            return _pv_qk_gemm(
-                v_emit=_v_emit,
-                k_emit=_k_emit,
-                p_list=p_in,
-                q_frags_list=q_frags,
-                v_hdim=v_hdim,
-                n_block=n_block,
-                o_acc_list=o_in,
-                head=pvqk_head,
-            )
+            return _issue_head(_v_emit, _NH, _NP, head_carry)
 
         def _softmax_phase(s_in, o_in):
             # Online softmax over tile ``sm_tile``'s kv axis, INDEPENDENTLY per q-tile.
@@ -1584,26 +1594,71 @@ def _core_attention(
             # The anti-phase wall: one half leaves the WMMA stream here as the other
             # enters it. Body count and barrier count are identical on both halves, so
             # the two never disagree on how many s_barriers this loop executes.
+            #
+            # Bare signal/wait, NOT gpu.barrier(): this is a scheduling rendezvous, not a
+            # memory publication. gpu.barrier() carries workgroup acquire/release fences
+            # that lower to s_wait_storecnt_dscnt 0x0, which would retire the ring head
+            # issued just above it -- the whole point of the head is to still be in flight
+            # when the ring's own s_wait_dscnt 0x12 picks it up fragment by fragment. LDS
+            # publication is already covered by _kv_fence's tensorcnt wait + gpu.barrier.
             if ANTI_PHASE:
                 rocdl.sched_barrier(0)
-                gpu.barrier()
+                rocdl_dialect.s_barrier_signal(-1)
+                rocdl_dialect.s_barrier_wait(-1)
                 rocdl.sched_barrier(0)
 
+        # GEMM2(u-1) then GEMM1(u) on one ring: O += P^T(u-1) @ V(u-1), then
+        # S^T = K(u) @ Q^T. sched_barrier fences the ring head out of the WMMA stream
+        # (no wmma<-ds_load bubble); the ring itself issues the per-fragment s_wait_dscnt.
         if _lag_sm:
+            _drain_barrier()
+            _prefetch(addr)
             p_list, m_new_list, d_new_list, o_resc = _softmax_phase(carry_prev, o_acc)
+            # Anchor the f32->bf16 P conversion in THIS block. Its only real use is the
+            # wmma stream past the barrier, so MachineSink (which ignores sched_barrier)
+            # sinks all 32 v_cvt_pk_bf16_f32 into the gemm and interleaves them with the
+            # WMMA. A side-effecting use here is a real use, so they stay put.
+            _keepalive([v for pt in p_list for v in pt])
+            rocdl.sched_barrier(0)
+            pvqk_head = _pvqk_head()
             _phase_barrier()
-            o_out, carry_next = _gemm_phase(p_list, o_resc)
+            o_out, carry_next = _pv_qk_gemm(
+                v_emit=_v_emit,
+                k_emit=_k_emit,
+                p_list=p_list,
+                q_frags_list=q_frags,
+                v_hdim=v_hdim,
+                n_block=n_block,
+                o_acc_list=o_resc,
+                head=pvqk_head,
+            )
             head_next = []
         else:
-            o_acc, s_list = _gemm_phase(carry_prev, o_acc)
+            _drain_barrier()
+            pvqk_head = _pvqk_head()
+            _prefetch(addr)
+            rocdl.sched_barrier(0)
+            o_acc, s_list = _pv_qk_gemm(
+                v_emit=_v_emit,
+                k_emit=_k_emit,
+                p_list=carry_prev,
+                q_frags_list=q_frags,
+                v_hdim=v_hdim,
+                n_block=n_block,
+                o_acc_list=o_acc,
+                head=pvqk_head,
+            )
             _phase_barrier()
-            # Next body's ring head: V(u) from the slot this body read K from -- resident
-            # and already fenced. Issued HERE so its LDS latency hides under the softmax
-            # VALU below, which is the window the software pipeline otherwise leaves empty.
-            rocdl.sched_barrier(0)
-            head_next = [v_mgr.load_one_to_reg(v_slots[1], j) for j in range(_NH)]
-            rocdl.sched_barrier(0)
             carry_next, m_new_list, d_new_list, o_out = _softmax_phase(s_list, o_acc)
+            # Next body's ring head: V(u) from the slot this body read K from -- resident
+            # and already fenced. Issued behind the softmax, mirroring the lagging half:
+            # both halves now issue the head immediately before the barrier that precedes
+            # the gemm consuming it.
+            rocdl.sched_barrier(0)
+            head_next = _issue_head(
+                lambda j: v_mgr.load_one_to_reg(v_slots[1], j), 0, _NH
+            )
+            rocdl.sched_barrier(0)
 
         # Yield state — R updated (m, d, O, P) groups, then the K/V ds pointers and slot
         # bases left-rotated by one so slot 0 holds tile u (next body's PV) and the oldest
