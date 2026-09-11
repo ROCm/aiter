@@ -35,12 +35,16 @@ def _rotate_args(nbytes: int) -> int:
     return 1 if nbytes > _ROTATE_MAX_BYTES else 0
 
 
+def _free_budget() -> float:
+    free, _total = torch.cuda.mem_get_info()
+    return free * _MEM_HEADROOM
+
+
 def _fits_in_memory(nbytes: int) -> bool:
     """Whether the cell's own tensors fit. run_perftest's rotation allocates on
     top of this -- up to num_iters copies of the input below _ROTATE_MAX_BYTES --
     but sizes itself to free memory, so it cannot be the thing that OOMs."""
-    free, _total = torch.cuda.mem_get_info()
-    return nbytes <= free * _MEM_HEADROOM
+    return nbytes <= _free_budget()
 
 
 def _fmt_bytes(nbytes: int) -> str:
@@ -387,44 +391,45 @@ def _reference_topk(
     return torch_indices.masked_fill(~mask, -1), us
 
 
-@benchmark()
-def test_top_k_per_row_prefill(
-    num_rows: int,
-    num_prefix: int,
-    top_k: int,
-    data_generation: str = "random",
-    dense_n: int | None = None,
-) -> dict:
-    """
-    Test topk_per_row_prefill.
-    """
-    ret = {}
-    torch.set_default_device("cuda:0")
-
-    width = dense_n if dense_n is not None else num_prefix + num_rows
-    ret["context_len"] = width
-
-    footprint = (
-        _logits_bytes(num_rows, width, data_generation, dense_n is not None)
+def _prefill_footprint(num_rows, width, top_k, data_generation, dense):
+    return (
+        _logits_bytes(num_rows, width, data_generation, dense)
         + num_rows * top_k * 4
         + _workspace_bytes(num_rows, width, top_k, decode=False)
     )
-    if not _fits_in_memory(footprint):
-        ret["all_close"] = "skipped"
-        ret["note"] = f"needs {_fmt_bytes(footprint)}"
-        ret["degenerate"] = _degenerate(width, top_k)
-        return ret
 
-    # Create test data
+
+def _rows_that_fit(num_rows, width, top_k, data_generation):
+    """Largest row count whose dense cell fits, 0 if even one row does not.
+
+    The footprint is monotonic in rows, so bisect it rather than modelling it.
+    """
+    if _prefill_footprint(1, width, top_k, data_generation, True) > _free_budget():
+        return 0
+    lo, hi = 1, num_rows
+    while lo < hi:
+        mid = (lo + hi + 1) // 2
+        if (
+            _prefill_footprint(mid, width, top_k, data_generation, True)
+            <= _free_budget()
+        ):
+            lo = mid
+        else:
+            hi = mid - 1
+    return lo
+
+
+def _run_prefill_block(num_rows, num_prefix, top_k, data_generation, dense_n, width):
+    """One [num_rows, width] cell: time the kernel, check it against torch.topk."""
     row_starts, row_ends = create_row_boundaries(num_rows, num_prefix, dense_n=dense_n)
     logits = create_random_logits(
         row_starts, row_ends, torch.float32, 42, data_generation
     )
-
-    # Create output tensors
     indices = torch.empty((num_rows, top_k), dtype=torch.int32, device="cuda")
+    footprint = _prefill_footprint(
+        num_rows, width, top_k, data_generation, dense_n is not None
+    )
 
-    # Run the kernel
     _, us = run_perftest(
         _prefill_kernel,
         logits,
@@ -439,24 +444,100 @@ def test_top_k_per_row_prefill(
         num_rotate_args=_rotate_args(footprint),
     )
 
-    # Run reference implementation
     run_ref = num_rows * width <= _REF_MAX_ELEMS
     torch_indices, torch_us = (
         _reference_topk(logits, row_starts, row_ends, top_k, time_it=True)
         if run_ref
         else (None, None)
     )
-
-    # Compare results
     if torch_indices is None:
-        ret["all_close"] = "skipped"
-        ret["note"] = "ref oom" if run_ref else f"ref > {_REF_MAX_ELEMS} elems"
+        ok = "skipped"
+        note = "ref oom" if run_ref else f"ref > {_REF_MAX_ELEMS} elems"
     else:
-        ret["all_close"] = compare_topk_results(
+        ok = compare_topk_results(
             logits, indices, torch_indices, row_starts, row_ends, top_k
         )
+        note = None
+    del logits, indices, torch_indices
+    return us, ok, torch_us, note
 
-    _perf_columns(ret, us, num_rows, width, top_k, torch_us=torch_us)
+
+@benchmark()
+def test_top_k_per_row_prefill(
+    num_rows: int,
+    num_prefix: int,
+    top_k: int,
+    data_generation: str = "random",
+    dense_n: int | None = None,
+    chunk_m: bool = False,
+) -> dict:
+    """
+    Test topk_per_row_prefill.
+    """
+    ret = {}
+    torch.set_default_device("cuda:0")
+
+    width = dense_n if dense_n is not None else num_prefix + num_rows
+    ret["context_len"] = width
+    dense = dense_n is not None
+    footprint = _prefill_footprint(num_rows, width, top_k, data_generation, dense)
+
+    rows_per_chunk = num_rows
+    if not _fits_in_memory(footprint):
+        # The op's own answer to a cell that does not fit is to cut M and run it
+        # in pieces, so offer that rather than only reporting the shape as lost.
+        # Chunking is dense-only: staircase row bounds are a function of the row
+        # index, so a chunk of them is a different problem.
+        rows_per_chunk = (
+            _rows_that_fit(num_rows, width, top_k, data_generation)
+            if chunk_m and dense
+            else 0
+        )
+        if rows_per_chunk == 0:
+            ret["all_close"] = "skipped"
+            ret["note"] = f"needs {_fmt_bytes(footprint)}"
+            ret["degenerate"] = _degenerate(width, top_k)
+            return ret
+
+    total_us = 0.0
+    total_torch_us = 0.0
+    timed_torch = True
+    verdicts = []
+    note = None
+    done = 0
+    while done < num_rows:
+        rows = min(rows_per_chunk, num_rows - done)
+        us, ok, torch_us, chunk_note = _run_prefill_block(
+            rows, num_prefix, top_k, data_generation, dense_n, width
+        )
+        total_us += us
+        if torch_us is None:
+            timed_torch = False
+        else:
+            total_torch_us += torch_us
+        verdicts.append(ok)
+        note = note or chunk_note
+        done += rows
+
+    chunks = len(verdicts)
+    if any(v == "skipped" for v in verdicts):
+        ret["all_close"] = "skipped"
+    else:
+        ret["all_close"] = all(verdicts)
+    if note:
+        ret["note"] = note
+    if chunks > 1:
+        ret["chunks"] = chunks
+        ret["note"] = f"M split {chunks}x{rows_per_chunk}"
+
+    _perf_columns(
+        ret,
+        total_us,
+        num_rows,
+        width,
+        top_k,
+        torch_us=total_torch_us if timed_torch else None,
+    )
     return ret
 
 
@@ -710,6 +791,18 @@ CI_DEFAULTS = {
     "prefill_n": [512, 1024, 4096, 16384, 65536, 262144, 1048576],
 }
 
+# The grid is powers of two so the cells are comparable; these are not, which
+# is the point. Odd M, a prime N, and N=5144 (not a multiple of 16) would all
+# pass unexercised otherwise. Run as a correctness pass, not a perf surface.
+IRREGULAR_SHAPES = [
+    (3, 1000, 512),
+    (5, 5144, 1024),
+    (7, 100003, 2048),
+    (1, 513, 512),
+    (17, 65537, 4096),
+    (100, 999983, 1024),
+]
+
 SWEEP_DEFAULTS = {
     **CI_DEFAULTS,
     "context_len": [512, 1024, 4096, 16384, 65536, 262144, 1048576],
@@ -815,6 +908,22 @@ parser.add_argument(
 )
 
 parser.add_argument(
+    "--chunk_m",
+    action="store_true",
+    help="""When a dense cell does not fit, split M into pieces that do and run
+    them in sequence, rather than reporting the shape as skipped. The row is
+    marked with its split, because the reported time is a sum over chunks and
+    not a single launch.""",
+)
+
+parser.add_argument(
+    "--skip_irregular",
+    action="store_true",
+    help="""Drop the non-power-of-two correctness pass that --sweep otherwise
+    appends to the prefill table.""",
+)
+
+parser.add_argument(
     "--sweep",
     action="store_true",
     help="""Sweep the M x N x top_k grid instead of the small CI defaults, and
@@ -863,7 +972,9 @@ for data_generation in args.data_generation:
                     if k > n:
                         continue
                     df.append(
-                        test_top_k_per_row_prefill(m, 0, k, data_generation, dense_n=n)
+                        test_top_k_per_row_prefill(
+                            m, 0, k, data_generation, dense_n=n, chunk_m=args.chunk_m
+                        )
                     )
         else:
             for m in args.context_len:
@@ -871,6 +982,14 @@ for data_generation in args.data_generation:
                     df.append(
                         test_top_k_per_row_prefill(m, num_prefix, k, data_generation)
                     )
+
+if args.sweep and not args.skip_irregular:
+    for m, n, k in IRREGULAR_SHAPES:
+        df.append(
+            test_top_k_per_row_prefill(
+                m, 0, k, args.data_generation[0], dense_n=n, chunk_m=args.chunk_m
+            )
+        )
 
 df = pd.DataFrame(df)
 df_md = df.to_markdown(index=False)
