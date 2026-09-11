@@ -2,7 +2,7 @@
 # Copyright (c) 2025 FlyDSL Project Contributors
 # Modifications Copyright (C) 2026 Advanced Micro Devices, Inc.
 
-"""Uncached HIP IPC helpers for the FlyDSL INT6 QuickReduce inbox."""
+"""Uncached HIP IPC helpers for the FlyDSL INT6 quick-allreduce inbox."""
 
 from __future__ import annotations
 
@@ -124,6 +124,12 @@ class UncachedIpcHeap:
 
     @classmethod
     def alloc_uncached(cls, size: int) -> int:
+        # hipIpcGetMemHandle on uncached allocs < 2 MiB requires a whole
+        # number of 4 KiB pages. Kernel layout still uses the unrounded size.
+        if size < 1:
+            raise ValueError(f"allocation size must be positive, got {size}")
+        page = 4096
+        size = (int(size) + page - 1) // page * page
         hip = cls._load_hip()
         buf = ctypes.c_void_p()
         err = hip.hipExtMallocWithFlags(

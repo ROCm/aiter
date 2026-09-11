@@ -13,17 +13,17 @@ from flydsl.expr.typing import Int32, Int64, Stream
 
 from aiter.jit.utils.chip_info import get_gfx_runtime
 
-from .qr_int6_ipc import UncachedIpcHeap
-from .qr_int6_kernel import (
+from .kernels.quick_allreduce_int6 import (
     DEFAULT_GRID_CAP,
     SUPER_TILES,
     SUPPORTED_WORLDS,
     TILE_BYTES,
     WORLD,
     clamp_grid_cap,
-    make_qr_int6_kernel,
+    make_quick_allreduce_int6_kernel,
 )
-from .tensor_shim import _run_compiled
+from .kernels.tensor_shim import _run_compiled
+from .quick_allreduce_int6_ipc import UncachedIpcHeap
 
 _SUPPORTED_ARCHS = ("gfx942", "gfx950")
 
@@ -31,7 +31,7 @@ _SUPPORTED_ARCHS = ("gfx942", "gfx950")
 def _cuda_index(device) -> int:
     if isinstance(device, torch.device):
         if device.type != "cuda":
-            raise ValueError(f"QRInt6 requires a CUDA device, got {device}")
+            raise ValueError(f"QuickAllReduceInt6 requires a CUDA device, got {device}")
         if device.index is None:
             return int(torch.cuda.current_device())
         return int(device.index)
@@ -47,7 +47,7 @@ def _validate_ipc_process_group(group, *, rank: int) -> None:
     backend = dist.get_backend(group)
     if backend == dist.Backend.NCCL:
         raise ValueError(
-            f"QRInt6 does not support NCCL process groups (got {backend!r} on "
+            f"QuickAllReduceInt6 does not support NCCL process groups (got {backend!r} on "
             f"group rank {rank}): IPC handle exchange requires CPU-side "
             "broadcast_object_list."
         )
@@ -56,7 +56,7 @@ def _validate_ipc_process_group(group, *, rank: int) -> None:
     if not all(same_node):
         off_node = [r for r, ok in enumerate(same_node) if not ok]
         raise RuntimeError(
-            "QRInt6 does not support multi-node process groups: HIP IPC "
+            "QuickAllReduceInt6 does not support multi-node process groups: HIP IPC "
             f"handles are node-local (ranks not on rank 0's node: {off_node})."
         )
 
@@ -134,8 +134,8 @@ class _StEngine:
             self._buf_ptr = None
 
 
-class QRInt6:
-    """IPC inbox + flag buffer and launch wrapper for ``qr_int6``.
+class QuickAllReduceInt6:
+    """IPC inbox + flag buffer and launch wrapper for ``quick_allreduce_int6``.
 
     Requires a non-NCCL, single-node process group for IPC metadata exchange.
     """
@@ -170,7 +170,7 @@ class QRInt6:
         arch = get_gfx_runtime()
         if arch not in _SUPPORTED_ARCHS:
             raise RuntimeError(
-                f"QRInt6 supports {', '.join(_SUPPORTED_ARCHS)}, got {arch}"
+                f"QuickAllReduceInt6 supports {', '.join(_SUPPORTED_ARCHS)}, got {arch}"
             )
         cap = DEFAULT_GRID_CAP if grid_cap is None else int(grid_cap)
         if cap < 1:
@@ -203,7 +203,7 @@ class QRInt6:
                 )
                 shared_grid = torch.tensor(grid, dtype=torch.int64)
                 dist.all_reduce(shared_grid, op=dist.ReduceOp.MIN, group=group)
-                spec = make_qr_int6_kernel(
+                spec = make_quick_allreduce_int6_kernel(
                     world_size=self.world_size,
                     super_tile=st,
                     grid=int(shared_grid.item()),
@@ -236,11 +236,11 @@ class QRInt6:
 
     def _check_payload(self, inp, out) -> int:
         if not isinstance(inp, torch.Tensor) or not isinstance(out, torch.Tensor):
-            raise TypeError("QRInt6 requires torch.Tensor input/output")
+            raise TypeError("QuickAllReduceInt6 requires torch.Tensor input/output")
         if inp.dtype != torch.bfloat16 or out.dtype != torch.bfloat16:
-            raise ValueError("QRInt6 supports bf16 input/output")
+            raise ValueError("QuickAllReduceInt6 supports bf16 input/output")
         if not inp.is_cuda or not out.is_cuda:
-            raise ValueError("QRInt6 requires CUDA tensors")
+            raise ValueError("QuickAllReduceInt6 requires CUDA tensors")
         if (
             inp.device.index != self._device_index
             or out.device.index != self._device_index
@@ -250,20 +250,22 @@ class QRInt6:
                 f"got {inp.device} / {out.device}"
             )
         if not inp.is_contiguous() or not out.is_contiguous():
-            raise ValueError("QRInt6 requires contiguous input/output")
+            raise ValueError("QuickAllReduceInt6 requires contiguous input/output")
         inp_ptr = int(inp.data_ptr())
         out_ptr = int(out.data_ptr())
         if inp_ptr % 16 != 0 or out_ptr % 16 != 0:
-            raise ValueError("QRInt6 requires 16-byte-aligned input/output")
+            raise ValueError("QuickAllReduceInt6 requires 16-byte-aligned input/output")
         live_bytes = int(inp.numel()) * int(inp.element_size())
         if live_bytes > 0xFFFFFFFF:
-            raise ValueError("QRInt6 payload must not exceed the 4 GiB buffer window")
+            raise ValueError(
+                "QuickAllReduceInt6 payload must not exceed the 4 GiB buffer window"
+            )
         if live_bytes % 16 != 0:
             raise ValueError("byte size must be a multiple of 16 (8 bf16)")
         if int(out.numel()) * int(out.element_size()) != live_bytes:
             raise ValueError("inp/out byte size mismatch")
         if max(inp_ptr, out_ptr) < min(inp_ptr + live_bytes, out_ptr + live_bytes):
-            raise ValueError("QRInt6 requires non-overlapping input/output")
+            raise ValueError("QuickAllReduceInt6 requires non-overlapping input/output")
         return live_bytes
 
     def _launch_args(
