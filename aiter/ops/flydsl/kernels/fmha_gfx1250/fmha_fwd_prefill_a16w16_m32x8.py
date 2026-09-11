@@ -178,6 +178,17 @@ USE_TDM_LOADER = True
 # barrier still publishes both halves. Requires the TDM loader.
 KV_PRODUCER_SPLIT = True and USE_TDM_LOADER
 KV_PRODUCER_WARPS = NUM_WAVES // 2 if KV_PRODUCER_SPLIT else NUM_WAVES
+
+# LO/HI anti-phase (FA3 ping-pong). Both halves run the same tile stream and the same
+# number of bodies and barriers; the HI half runs its two phases in the opposite order,
+#   LO body u:  gemm(u)                 | BAR | softmax(u)
+#   HI body u:  softmax(u-1) + rescale  | BAR | gemm(u)
+# so each barrier window has one half in the WMMA stream and the other in the softmax
+# VALU stream. HI carries s_acc across the back edge instead of P (and needs no carried
+# ring head -- its head hides under the softmax that opens its own body). Its dead
+# leading softmax(start-1) is neutralized by seeding s_acc to -inf, which is exactly the
+# fully-masked path (m_new = m_prev, corr = 1, P = 0, d unchanged).
+ANTI_PHASE = True
 # O writer variant (decoupled from USE_TDM_LOADER): "v1" swizzled LDS + buffer_store (fastest so
 # far), "v2" TDM store (padding ignored -> contiguous LDS -> bank conflict, slow), "v3" padded LDS +
 # global_store_async_from_lds_b128.
@@ -1236,6 +1247,9 @@ def _core_attention(
     # software pipeline: body u's PV consumes the P body u-1's softmax produced, so m/d/O
     # keep their offsets and the epilogue's indexing is untouched.
     _QS = 2 + d_tiles + NKV
+    # HI half runs softmax(u-1) before gemm(u), so its per-q-tile carry slot holds the
+    # f32 s_acc the next body's softmax consumes instead of the bf16 P. Same slot count.
+    _lag_sm = ANTI_PHASE and warp_type == WarpType.HI_WARP
     if has_sink:
         num_heads_q = gpu.grid_dim.y * fx.Int32(gqa_ratio)
         m_init = [
@@ -1258,7 +1272,14 @@ def _core_attention(
                 _raw(d_init[qt]),
             ]
             + [_raw(fx.Vector.filled(8, 0.0, fx.Float32)) for _ in range(d_tiles)]
-            + [_raw(fx.Vector.filled(8, 0.0, fx.Float32).to(elem_dtype)) for _ in range(NKV)]
+            + [
+                _raw(
+                    fx.Vector.filled(8, float("-inf"), fx.Float32)
+                    if _lag_sm
+                    else fx.Vector.filled(8, 0.0, fx.Float32).to(elem_dtype)
+                )
+                for _ in range(NKV)
+            ]
         )
 
     # ---- One ds_load base-pointer set per slot plus the slot's byte base, all carried as
@@ -1291,7 +1312,9 @@ def _core_attention(
     _num_kfrag = k_mgr.num_ds_loads() // 2
     _num_vfrag = v_mgr.num_ds_loads() // 2
     _NP = _ring_num_prefetch(_num_vfrag + _num_kfrag, PVQK_RING, PVQK_LAG)
-    _NH = min(PVQK_HEAD_CARRY, _NP)
+    # The lagging half opens its body with softmax, so its ring head is issued there and
+    # consumed after the barrier -- within one body, nothing to carry.
+    _NH = 0 if _lag_sm else min(PVQK_HEAD_CARRY, _NP)
     assert _NH <= 2 * _num_vfrag, "carried head must be V loads only"
     _HEAD_BASE = len(_init)
     _init = _init + [
@@ -1323,7 +1346,10 @@ def _core_attention(
         # tile stream into a mask-free clean region + boundary loops and passes None for
         # any edge this sub-loop provably doesn't cross (compile-time gate). The split
         # points are already expressed in SOFTMAX tiles, so they carry over unchanged.
-        kv_tile_start = u * fx.Int32(
+        # This body's SOFTMAX tile. The lagging half runs softmax one tile behind its
+        # gemm, so u-1 (never used past the masks; at u == 0 it only ever masks -inf).
+        sm_tile = u - fx.Int32(1) if _lag_sm else u
+        kv_tile_start = sm_tile * fx.Int32(
             n_block
         )  # softmax tile's first (batch-relative) kv row
 
@@ -1335,7 +1361,9 @@ def _core_attention(
             [fx.Vector(state[qt * _QS + 2 + dt]) for dt in range(d_tiles)]
             for qt in range(R)
         ]
-        p_prev = [
+        # Carried gemm/softmax hand-off: P(u-1) on the leading half, S(u-1) on the
+        # lagging one (same slot count, different element type).
+        carry_prev = [
             [fx.Vector(state[qt * _QS + 2 + d_tiles + kvt]) for kvt in range(NKV)]
             for qt in range(R)
         ]
@@ -1473,87 +1501,109 @@ def _core_attention(
         # itself issues the s_wait_dscnt that covers each fragment.
         rocdl.sched_barrier(0)
 
-        # ---- GEMM2(u-1) then GEMM1(u) on one ring: O += P^T(u-1) @ V(u-1) consuming the
-        # P carried across the back edge, then S^T = K(u) @ Q^T. ----
-        o_acc, s_list = _pv_qk_gemm(
-            v_emit=_v_emit,
-            k_emit=_k_emit,
-            p_list=p_prev,
-            q_frags_list=q_frags,
-            v_hdim=v_hdim,
-            n_block=n_block,
-            o_acc_list=o_acc,
-            head=pvqk_head,
-        )
+        def _gemm_phase(p_in, o_in):
+            # GEMM2(u-1) then GEMM1(u) on one ring: O += P^T(u-1) @ V(u-1), then
+            # S^T = K(u) @ Q^T.
+            return _pv_qk_gemm(
+                v_emit=_v_emit,
+                k_emit=_k_emit,
+                p_list=p_in,
+                q_frags_list=q_frags,
+                v_hdim=v_hdim,
+                n_block=n_block,
+                o_acc_list=o_in,
+                head=pvqk_head,
+            )
 
-        # Next body's ring head: V(u) from the slot this body read K from -- resident and
-        # already fenced. Issued HERE so its LDS latency hides under the softmax VALU
-        # below, which is the window the software pipeline otherwise leaves empty.
-        rocdl.sched_barrier(0)
-        head_next = [v_mgr.load_one_to_reg(v_slots[1], j) for j in range(_NH)]
-        rocdl.sched_barrier(0)
+        def _softmax_phase(s_in, o_in):
+            # Online softmax over tile ``sm_tile``'s kv axis, INDEPENDENTLY per q-tile.
+            # This lane's query (tile qt) attends [q_min, q_max] (batch-relative kv):
+            # q_max = seq+causal_off+window_right, q_min = seq+causal_off-window_left
+            # (causal_off = kv_len-q_len). None bounds are skipped -> a clean-region tile
+            # passes all-None and does zero per-element masking. kv_len is passed on the
+            # right-boundary sub-loop (folds the OOB tail into the q_max clamp / standalone
+            # tail mask), which is also what neutralizes the dead trailing softmax.
+            # K/V are shared, but each q-tile has its own S and running m/d. All R q-tiles
+            # go in ONE call so the rows' max/sum tree reductions emit INTERLEAVED (ILP).
+            q_max_list = [
+                seq_idx[qt] + causal_off + window_right if mask_right else None
+                for qt in range(R)
+            ]
+            q_min_list = [
+                seq_idx[qt] + causal_off - window_left if mask_left else None
+                for qt in range(R)
+            ]
+            p_list, m_new_list, d_new_list, corr_list, do_rescale_list = _softmax(
+                s_list=s_in,
+                m_prev_list=m_prev,
+                d_prev_list=d_prev,
+                lane_idx=lane_idx,
+                n_block=n_block,
+                kv_pos_base=kv_tile_start,
+                q_max_list=q_max_list,
+                q_min_list=q_min_list,
+                kv_len=kv_len,
+                elem_dtype=elem_dtype,
+            )
 
-        # ---- Softmax: online update over tile u's kv axis, INDEPENDENTLY per
-        # q-tile. This lane's query (tile qt) attends [q_min, q_max] (batch-relative
-        # kv): q_max = seq+causal_off+window_right, q_min = seq+causal_off-window_left
-        # (causal_off = kv_len-q_len). None bounds are skipped -> a clean-region tile
-        # passes all-None and does zero per-element masking. kv_len is passed on the
-        # right-boundary sub-loop (folds the OOB tail into the q_max clamp / standalone
-        # tail mask), which is also what neutralizes body num_tiles' dead softmax.
-        # K/V are shared, but each q-tile has its own S and running m/d. ----
-        # Softmax for ALL R q-tiles in ONE call so the rows' max/sum tree reductions emit
-        # INTERLEAVED (ILP): the rows are independent (own S, m, d) but share this tile's K/V.
-        q_max_list = [
-            seq_idx[qt] + causal_off + window_right if mask_right else None
-            for qt in range(R)
-        ]
-        q_min_list = [
-            seq_idx[qt] + causal_off - window_left if mask_left else None
-            for qt in range(R)
-        ]
-        p_list, m_new_list, d_new_list, corr_list, do_rescale_list = _softmax(
-            s_list=s_list,
-            m_prev_list=m_prev,
-            d_prev_list=d_prev,
-            lane_idx=lane_idx,
-            n_block=n_block,
-            kv_pos_base=kv_tile_start,
-            q_max_list=q_max_list,
-            q_min_list=q_min_list,
-            kv_len=kv_len,
-            elem_dtype=elem_dtype,
-        )
-
-        # ---- Rescale each q-tile's running O by tile u's corr. The rescale now CLOSES
-        # the body (O already carries PV(u-1)); the next body's PV accumulates onto the
-        # rescaled O, which is the same product as rescaling before the accumulate.
-        # When deferral is active (do_rescale is a wave-uniform i1) the wide
-        # `o_acc *= corr` multiply (d_tiles*8 f32/lane) is gated behind a non-divergent
-        # scf.if that fires only when the running max actually moved; on the stale path
-        # corr == 1 so the else-branch passes o_acc through untouched. do_rescale is
-        # None -> deferral compiled out, keep the unconditional multiply. Each q-tile
-        # decides its own deferred-rescale. ----
-        o_resc_list = []
-        for qt in range(R):
-            corr_vec = fx.Vector.from_elements(
-                [corr_list[qt]], fx.Float32
-            ).broadcast_to(8)
-            o_vecs = [fx.Vector(_ir(o_acc[qt][dt])) for dt in range(d_tiles)]
-            if do_rescale_list[qt] is None:
-                o_resc = [ov * corr_vec for ov in o_vecs]
-            else:
-                # Gate the wide multiply behind a wave-uniform scf.if (via the file's
-                # scf_if_dispatch idiom): the then-branch rescales, the omitted
-                # else-branch auto-passes o_acc through unchanged.
-                o_resc = list(
-                    scf_if_dispatch(
-                        do_rescale_list[qt],
-                        lambda *_a, _ov=o_vecs, _cv=corr_vec: [ov * _cv for ov in _ov],
-                        result_names=tuple(f"o{qt}_{dt}" for dt in range(d_tiles)),
-                        result_values=o_vecs,
+            # Rescale each q-tile's running O by this tile's corr. On the leading half the
+            # rescale CLOSES the body (O already carries PV(u-1)) and the next body's PV
+            # accumulates onto the rescaled O -- the same product as rescaling first. On
+            # the lagging half it precedes this body's own PV, which is the same identity.
+            # When deferral is active (do_rescale is a wave-uniform i1) the wide
+            # `o_acc *= corr` multiply (d_tiles*8 f32/lane) is gated behind a non-divergent
+            # scf.if that fires only when the running max actually moved; on the stale path
+            # corr == 1 so the else-branch passes o_acc through untouched. do_rescale is
+            # None -> deferral compiled out, keep the unconditional multiply.
+            o_resc_list = []
+            for qt in range(R):
+                corr_vec = fx.Vector.from_elements(
+                    [corr_list[qt]], fx.Float32
+                ).broadcast_to(8)
+                o_vecs = [fx.Vector(_ir(o_in[qt][dt])) for dt in range(d_tiles)]
+                if do_rescale_list[qt] is None:
+                    o_resc = [ov * corr_vec for ov in o_vecs]
+                else:
+                    # Gate the wide multiply behind a wave-uniform scf.if (via the file's
+                    # scf_if_dispatch idiom): the then-branch rescales, the omitted
+                    # else-branch auto-passes o_acc through unchanged.
+                    o_resc = list(
+                        scf_if_dispatch(
+                            do_rescale_list[qt],
+                            lambda *_a, _ov=o_vecs, _cv=corr_vec: [
+                                ov * _cv for ov in _ov
+                            ],
+                            result_names=tuple(f"o{qt}_{dt}" for dt in range(d_tiles)),
+                            result_values=o_vecs,
+                        )
                     )
-                )
-            o_resc_list.append(o_resc)
+                o_resc_list.append(o_resc)
+            return p_list, m_new_list, d_new_list, o_resc_list
+
+        def _phase_barrier():
+            # The anti-phase wall: one half leaves the WMMA stream here as the other
+            # enters it. Body count and barrier count are identical on both halves, so
+            # the two never disagree on how many s_barriers this loop executes.
+            if ANTI_PHASE:
+                rocdl.sched_barrier(0)
+                gpu.barrier()
+                rocdl.sched_barrier(0)
+
+        if _lag_sm:
+            p_list, m_new_list, d_new_list, o_resc = _softmax_phase(carry_prev, o_acc)
+            _phase_barrier()
+            o_out, carry_next = _gemm_phase(p_list, o_resc)
+            head_next = []
+        else:
+            o_acc, s_list = _gemm_phase(carry_prev, o_acc)
+            _phase_barrier()
+            # Next body's ring head: V(u) from the slot this body read K from -- resident
+            # and already fenced. Issued HERE so its LDS latency hides under the softmax
+            # VALU below, which is the window the software pipeline otherwise leaves empty.
+            rocdl.sched_barrier(0)
+            head_next = [v_mgr.load_one_to_reg(v_slots[1], j) for j in range(_NH)]
+            rocdl.sched_barrier(0)
+            carry_next, m_new_list, d_new_list, o_out = _softmax_phase(s_list, o_acc)
 
         # Yield state — R updated (m, d, O, P) groups, then the K/V ds pointers and slot
         # bases left-rotated by one so slot 0 holds tile u (next body's PV) and the oldest
@@ -1562,8 +1612,8 @@ def _core_attention(
         for qt in range(R):
             out += (
                 [_raw(m_new_list[qt]), _raw(d_new_list[qt])]
-                + [_raw(o) for o in o_resc_list[qt]]
-                + [_raw(pv) for pv in p_list[qt]]
+                + [_raw(o) for o in o_out[qt]]
+                + [_raw(cv) for cv in carry_next[qt]]
             )
         rot = list(range(1, N_KV_PP)) + [0]
         for i in rot:
@@ -1610,6 +1660,13 @@ def _core_attention(
     else:
         clean_lo = start_tile
     clean_lo = fx.min(fx.max(clean_lo, start_tile), clean_hi)
+    if mask_left and ANTI_PHASE:
+        # The lagging half's softmax tile is u-1, so the clean loop must start one body
+        # later or tile clean_lo-1 would cross the left edge unmasked. The left loop
+        # absorbs the extra body; over-masking a clean tile is a no-op. Only needed when
+        # a left loop exists at all -- with mask_left off, clean_lo == start_tile and
+        # shifting would drop the first body entirely.
+        clean_lo = fx.min(clean_lo + fx.Int32(1), clean_hi)
 
     def _run_tiles(state, lo_i32, hi_i32, *, mask_left, mask_right, kv_len):
         _lo = arith.index_cast(T.index, arith.unwrap(lo_i32))
