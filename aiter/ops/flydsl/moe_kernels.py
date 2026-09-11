@@ -3017,6 +3017,75 @@ def _get_compiled_fused_quant_preshuffle_route_ksplit(
     )
 
 
+# --- Debug: dump MoE decode inputs -------------------------------------------
+#
+# Off unless ``AITER_MOE_DUMP`` is set, so the steady-state cost is one env
+# lookup. Two independent capture points share this helper:
+#   * ``"moe_input"`` -- every input tensor of the MoE decode forward
+#     (``grouped_moe_gfx1250._grouped_a8w4_tdm_moe``).
+#   * ``"pq_kernel"`` -- the inputs of the prequantized routeks stage1 kernel
+#     (the ``moe_fused_quant_preshuffle_routeks_..._pqNNN`` module) launched
+#     inside that forward.
+# Both are gated identically:
+#   * decoding only -- a decode step feeds few tokens per forward, so
+#     ``tokens < AITER_MOE_DUMP_MAX_TOKENS`` (default 4096) is taken to mean
+#     "decode forward, not prefill".
+#   * first N layers only -- there is no layer index anywhere in this call path,
+#     so each capture point dumps its first ``AITER_MOE_DUMP_LAYERS`` (default 3)
+#     qualifying calls and then stops for the process lifetime. The MoE layers of
+#     one decode forward run in order, so those first three calls are decoder
+#     layers 0/1/2 of the first decode forward captured.
+# Each dump is a ``torch.save`` .pt (every input tensor + the scalar config)
+# under ``AITER_MOE_DUMP_DIR/<point>/`` (default ``./moe_dump``). Per-point layer
+# counters are independent so the two points never share a budget.
+_MOE_DUMP_STATE: dict[str, int] = {}
+
+
+def moe_debug_dump(point: str, tokens: int, tensors: dict, config: dict) -> None:
+    if not os.environ.get("AITER_MOE_DUMP"):
+        return
+    max_tokens = int(os.environ.get("AITER_MOE_DUMP_MAX_TOKENS", "4096"))
+    max_layers = int(os.environ.get("AITER_MOE_DUMP_LAYERS", "3"))
+    # Decoding heuristic: skip prefill (large token count) forwards.
+    if int(tokens) >= max_tokens:
+        return
+    idx = _MOE_DUMP_STATE.get(point, 0)
+    if idx >= max_layers:
+        return
+    _MOE_DUMP_STATE[point] = idx + 1
+
+    dump_dir = os.path.join(os.environ.get("AITER_MOE_DUMP_DIR", "./moe_dump"), point)
+    os.makedirs(dump_dir, exist_ok=True)
+    # tp/EP runs one process per rank, each with its own counter -- tag the file
+    # by rank (or pid) so the ranks do not clobber a shared ``layer0.pt``.
+    rank = (
+        os.environ.get("RANK")
+        or os.environ.get("LOCAL_RANK")
+        or os.environ.get("ATOM_RANK")
+        or str(os.getpid())
+    )
+    payload = {
+        "config": dict(config),
+        "tokens": int(tokens),
+        "rank": rank,
+        "layer": idx,  # 0-based call index == decoder layer within the forward
+    }
+    for name, val in tensors.items():
+        # .to("cpu", copy=True) copies host-side, off the kernel's stream, so the
+        # dump never perturbs the buffers the launch below reads.
+        payload[name] = (
+            val.detach().to("cpu", copy=True).contiguous()
+            if isinstance(val, torch.Tensor)
+            else val
+        )
+    path = os.path.join(dump_dir, f"{point}_rank{rank}_layer{idx}.pt")
+    torch.save(payload, path)
+    print(
+        f"[aiter] MoE dump[{point}] -> {path} "
+        f"(tokens={tokens}, rank={rank}, layer={idx})"
+    )
+
+
 def flydsl_moe_fused_quant_preshuffle(
     grouped_in: torch.Tensor,  # (E, max_m, feat_dim) or (E*max_m, feat_dim) bf16
     E: int,
@@ -3152,6 +3221,38 @@ def flydsl_moe_fused_quant_preshuffle(
             num_valid_routes_i32 = (
                 num_valid_routes.reshape(-1)[:1].to(device=device, dtype=torch.int32)
             ).contiguous()
+        # Debug dump of this kernel's inputs (prequantized routeks stage1). Only
+        # the prequantized branch is the ..._pqNNN kernel; the plain quant branch
+        # is a different module, so it is left untouched. No-op unless enabled.
+        if prequantized:
+            moe_debug_dump(
+                "pq_kernel",
+                tokens=int(prequantized_scale.shape[0]),
+                tensors={
+                    "grouped_in": grouped_in,
+                    "prequantized_scale": prequantized_scale,
+                    "topids_to_rows": topids_to_rows_i32,
+                    "row_starts": row_starts_i32,
+                    "num_valid_routes": num_valid_routes_i32,
+                },
+                config={
+                    "feat_dim": feat_dim,
+                    "wmma_rep": wmma_rep,
+                    "quant_mode": quant_mode,
+                    "source_topk": source_topk,
+                    "remap_rows": remap_rows,
+                    "ksplit": use_ksplit,
+                    "prequantized": prequantized,
+                    "src_scale_bytes_per_row": int(prequantized_scale.shape[-1]),
+                    "route_max_m": route_max_m_arg,
+                    "numel": numel,
+                    "grid_blocks": grid_blocks,
+                    "E": E,
+                    "max_m": max_m,
+                    "Pb": Pb,
+                    "Ws": Ws,
+                },
+            )
         launch(
             ptr_arg(grouped_in.contiguous().view(-1)),
             ptr_arg(out_payload.view(-1)),

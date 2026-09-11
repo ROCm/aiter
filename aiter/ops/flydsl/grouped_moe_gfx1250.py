@@ -456,11 +456,49 @@ def _grouped_a8w4_tdm_moe(
     from aiter.ops.flydsl.moe_kernels import (
         flydsl_moe_fused_quant_preshuffle,
         flydsl_moe_topids_to_rows,
+        moe_debug_dump,
     )
 
     device = hidden_states.device
     token_num, topk = topk_ids.shape
     enable_ep_scatter = stage2_scatter is not None
+
+    # Debug: dump every input of the MoE decode forward. No-op unless
+    # AITER_MOE_DUMP is set; gated to decoding (token_num < threshold) and the
+    # first few layers -- see moe_debug_dump. Weights are per-layer, so they are
+    # part of a self-contained replay of layers 0/1/2 and are dumped too.
+    moe_debug_dump(
+        "moe_input",
+        tokens=int(token_num),
+        tensors={
+            "hidden_states": hidden_states,
+            "w1": w1,
+            "w2": w2,
+            "topk_weight": topk_weight,
+            "topk_ids": topk_ids,
+            "w1_scale": w1_scale,
+            "w2_scale": w2_scale,
+            "bias1": bias1,
+            "bias2": bias2,
+            "a1_scale": a1_scale,
+            "expert_mask": expert_mask,
+            "num_local_tokens": num_local_tokens,
+        },
+        config={
+            "E": E,
+            "model_dim": model_dim,
+            "inter_dim": inter_dim,
+            "topk": int(topk),
+            "dtype": str(dtype),
+            "activation": str(activation),
+            "swiglu_limit": swiglu_limit,
+            "doweight_stage1": doweight_stage1,
+            "data_format": data_format,
+            "situ_beta": situ_beta,
+            "situ_linear_beta": situ_linear_beta,
+            "enable_ep_scatter": enable_ep_scatter,
+        },
+    )
     if tile_m2 is None:
         tile_m2 = tile_m
     if tile_n2 is None:
