@@ -348,12 +348,234 @@ def _dequant_kv_fp8(kv_fp8, kv_scales, group_size=_FP8_GROUP_SIZE):
     return (kv_f32 * scales_expanded).view(total_pages, D)
 
 
+# ---------------------------------------------------------------------------
+# DSv4 "2buff" packed-fp8 KV layout — byte-identical to what the gfx1250 MLA-v4
+# asm decode kernel reads (aiter.mla.mla_decode_fwd_v4_nm ->
+# _ZN5aiter35mla_a8w8_qh64_1tg_16mx4_64nx1_sparseE). Mirrors
+# op_tests/test_mla_v4_kargpreld.py::_native_to_2buff_for_asm and ATOM's
+# atom/model_ops/v4_kernels/v4_quant.py (V4_* constants):
+#
+#   packed row [512 B] = [ NoPE 448 x fp8-e4m3
+#                        | 14 E8M0 scale bytes, each 64-elt group's scale
+#                          written TWICE (s0,s0,s1,s1,...,s6,s6)
+#                        | 50 B pad ]
+#   rope plane [64] bf16, a separate tensor
+# ---------------------------------------------------------------------------
+
+_V4_DIM_NOPE = 448
+_V4_DIM_ROPE = 64
+_V4_DIM_QK = _V4_DIM_NOPE + _V4_DIM_ROPE  # 512
+_V4_TILE = 64
+_V4_NUM_TILES = _V4_DIM_NOPE // _V4_TILE  # 7
+_V4_FP8 = torch.float8_e4m3fn  # OCP e4m3, what the asm .co consumes
+
+
+def v4_pack_2buff(x_bf16):
+    """``[..., 512]`` bf16 (NoPE||RoPE) -> ``(packed [..., 512] fp8, rope [..., 64] bf16)``."""
+    assert x_bf16.shape[-1] == _V4_DIM_QK
+    lead = x_bf16.shape[:-1]
+    nope = x_bf16[..., :_V4_DIM_NOPE].float()
+    rope = x_bf16[..., _V4_DIM_NOPE:].contiguous()
+
+    tiled = nope.reshape(*lead, _V4_NUM_TILES, _V4_TILE)
+    fp8_max = float(torch.finfo(_V4_FP8).max)
+    # amax/fp8_max rounded UP to a power of two, exactly as E8M0 stores it.
+    scale = torch.pow(
+        2.0, torch.clamp_min(tiled.abs().amax(dim=-1) / fp8_max, 1e-4).log2().ceil()
+    )
+    nope_fp8 = (tiled / scale.unsqueeze(-1)).to(_V4_FP8).reshape(*lead, _V4_DIM_NOPE)
+    e8m0 = (scale.log2().round().to(torch.int32) + 127).clamp(0, 254).to(torch.uint8)
+
+    packed = torch.zeros((*lead, _V4_DIM_QK), dtype=torch.uint8, device=x_bf16.device)
+    packed[..., :_V4_DIM_NOPE] = nope_fp8.view(torch.uint8)
+    # the kernel reads each group's scale twice (its scaled-MMA blocks are 32
+    # elements wide, the quant group is 64), so duplicate every byte
+    packed[..., _V4_DIM_NOPE : _V4_DIM_NOPE + 2 * _V4_NUM_TILES] = (
+        e8m0.repeat_interleave(2, dim=-1)
+    )
+    return packed.view(_V4_FP8), rope
+
+
+def v4_unpack_2buff(packed, rope):
+    """Inverse of ``v4_pack_2buff`` -> ``[..., 512]`` bf16."""
+    lead = packed.shape[:-1]
+    u8 = packed.view(torch.uint8)
+    nope = (
+        u8[..., :_V4_DIM_NOPE]
+        .view(_V4_FP8)
+        .float()
+        .reshape(*lead, _V4_NUM_TILES, _V4_TILE)
+    )
+    # one byte per group: read the first of each duplicated pair
+    exps = u8[..., _V4_DIM_NOPE : _V4_DIM_NOPE + 2 * _V4_NUM_TILES : 2].to(torch.int32)
+    scale = torch.pow(2.0, (exps - 127).float())
+    out = torch.empty((*lead, _V4_DIM_QK), dtype=torch.bfloat16, device=packed.device)
+    out[..., :_V4_DIM_NOPE] = (
+        (nope * scale.unsqueeze(-1)).reshape(*lead, _V4_DIM_NOPE).to(torch.bfloat16)
+    )
+    out[..., _V4_DIM_NOPE:] = rope
+    return out
+
+
+@pytest.mark.parametrize("T", [1, 32, 512])
+@pytest.mark.parametrize("H", [16, 128])
+@pytest.mark.parametrize("D", [512])
+@pytest.mark.parametrize("kv_len", [136, 384])
+@pytest.mark.parametrize("var_len", [True, False])
+@pytest.mark.parametrize("q_packed", [True, False])
+def test_pa_decode_sparse_fp8_vs_reference(T, H, D, kv_len, var_len, q_packed):
+    """DSv4 2buff packed-fp8 KV pool, the layout the MLA-v4 asm decode kernel
+    reads. ``q_packed`` toggles full a8w8 parity (packed fp8 Q + bf16 RoPE
+    plane) against a8w16 (plain bf16 Q, fp8 KV)."""
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA required")
+    if arch_info.get_arch() != "gfx1250":
+        pytest.skip("the DSv4 2buff packed-fp8 path is gfx1250-only")
+
+    pages = T * kv_len
+    q_bf16, ukv_bf16, indices, indptr, sink, scale = _make_inputs(
+        T,
+        H,
+        D,
+        kv_len,
+        pages,
+        variable_len=var_len,
+    )
+
+    kv_packed, kv_rope = v4_pack_2buff(ukv_bf16)
+    if q_packed:
+        q_arg, q_rope = v4_pack_2buff(q_bf16)
+        q_ref = v4_unpack_2buff(q_arg, q_rope)
+    else:
+        q_arg, q_rope = q_bf16, None
+        q_ref = q_bf16
+
+    # Reference: dequantize exactly the bytes the kernel sees, then dense torch.
+    ukv_ref = v4_unpack_2buff(kv_packed, kv_rope)
+    ref = pa_decode_sparse_reference(q_ref, ukv_ref, indices, indptr, sink, scale)
+
+    out = pa_decode_sparse(
+        q_arg,
+        kv_packed,
+        indices,
+        indptr,
+        sink,
+        scale,
+        has_invalid=False,
+        unified_kv_rope=kv_rope,
+        q_rope=q_rope,
+    )
+
+    tol_err_ratio = 0.01
+    assert (
+        checkAllclose(
+            out.to(torch.bfloat16),
+            ref.to(torch.bfloat16),
+            atol=1e-2,
+            rtol=1e-2,
+            tol_err_ratio=tol_err_ratio,
+            msg="pa_decode_sparse v4 2buff output",
+        )
+        <= tol_err_ratio
+    )
+
+
+def _asm_v4_decode():
+    """The MLA-v4 asm decode entry, or None where it is not available.
+
+    It is dispatched from a prebuilt ``.co`` plus a row in
+    ``hsa/gfx1250/mla_v4/mla_v4_asm.csv``, so a tree without those assets (or a
+    host that is not gfx1250) simply has no asm side to compare against.
+    """
+    if arch_info.get_arch() != "gfx1250":
+        return None
+    try:
+        import aiter.mla
+    except ImportError:
+        return None
+    return getattr(aiter.mla, "mla_decode_fwd_v4_nm", None)
+
+
+@pytest.mark.parametrize("T", [1, 32, 512])
+@pytest.mark.parametrize("H", [128])
+@pytest.mark.parametrize("kv_len", [136, 384])
+def test_pa_decode_sparse_v4_2buff_vs_asm(T, H, kv_len):
+    """Hand the SAME packed buffers to the gluon kernel and to the MLA-v4 asm
+    decode kernel. This is the format check: if the gluon kernel read the
+    NoPE / scale / pad / RoPE regions differently the two would diverge."""
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA required")
+    mla_decode_fwd_v4_nm = _asm_v4_decode()
+    if mla_decode_fwd_v4_nm is None:
+        pytest.skip("MLA-v4 asm decode is not available in this tree")
+
+    D = _V4_DIM_QK
+    pages = T * kv_len
+    q_bf16, ukv_bf16, indices, indptr, sink, _ = _make_inputs(
+        T, H, D, kv_len, pages, variable_len=False
+    )
+    # the asm kernel hardcodes 1/sqrt(512) and ignores the argument
+    scale = float(D) ** -0.5
+
+    kv_packed, kv_rope = v4_pack_2buff(ukv_bf16)
+    q_packed, q_rope = v4_pack_2buff(q_bf16)
+
+    out_gluon = pa_decode_sparse(
+        q_packed,
+        kv_packed,
+        indices,
+        indptr,
+        sink,
+        scale,
+        has_invalid=False,
+        unified_kv_rope=kv_rope,
+        q_rope=q_rope,
+    )
+
+    # page_size=1, one query row per sequence (decode) -> qo_indptr = arange.
+    device = q_bf16.device
+    qo_indptr = torch.arange(0, T + 1, dtype=torch.int32, device=device)
+    out_asm = torch.empty((T, H, D), dtype=torch.bfloat16, device=device)
+    try:
+        mla_decode_fwd_v4_nm(
+            q_packed,
+            q_rope,
+            kv_packed.view(-1, 1, 1, D),
+            kv_rope.view(-1, 1, 1, _V4_DIM_ROPE),
+            out_asm,
+            qo_indptr,
+            indptr,
+            indices,
+            1,  # max_seqlen_q
+            sink=sink,
+            sm_scale=scale,
+        )
+    except RuntimeError as e:
+        # The csv only ships a .co for gqa in {16, 64, 128} at qSeqLen=1; a
+        # tree carrying a different subset has nothing to compare here.
+        pytest.skip(f"no MLA-v4 asm decode variant for gqa={H}: {e}")
+
+    tol_err_ratio = 0.01
+    assert (
+        checkAllclose(
+            out_gluon.float(),
+            out_asm.float(),
+            atol=2e-2,
+            rtol=2e-2,
+            tol_err_ratio=tol_err_ratio,
+            msg="pa_decode_sparse v4 2buff gluon vs asm",
+        )
+        <= tol_err_ratio
+    )
+
+
 @pytest.mark.parametrize("T", [1, 32])
 @pytest.mark.parametrize("H", [16])
 @pytest.mark.parametrize("D", [512])
 @pytest.mark.parametrize("kv_len", [100])
 @pytest.mark.parametrize("var_len", [True, False])
-def test_pa_decode_sparse_fp8_vs_reference(T, H, D, kv_len, var_len):
+def test_pa_decode_sparse_fp8_uniform_vs_reference(T, H, D, kv_len, var_len):
+    """Legacy 1buff uniform pool: whole-head fp8 + a separate fp32 kv_scales."""
     if not torch.cuda.is_available():
         pytest.skip("CUDA required")
 
