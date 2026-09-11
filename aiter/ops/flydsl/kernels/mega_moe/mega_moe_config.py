@@ -633,7 +633,7 @@ def select_mega_moe_config(
     if p2p_quant == P2P_QUANT_AUTO:
         desired_p2p = (
             P2P_QUANT_FP8_BLOCKWISE
-            if a_dtype == ACTIVATION_FP4 and mtpr >= P2P_FP8_MIN_MTPR
+            if mtpr >= P2P_FP8_MIN_MTPR
             else config.p2p_quant
         )
     else:
@@ -656,6 +656,12 @@ def select_mega_moe_config(
             # global-to-LDS atom spans two rows. Indexed payload gives every
             # row an independent source key, which that atom cannot express.
             config = _replace_config(config, stage1={"async_a_copy": False})
+    if config.stage2.aligned_pair and config.p2p_quant != P2P_QUANT_FP8_BLOCKWISE:
+        # The aligned-pair Stage2 kernel only emits the FP8 P2P row layout, so
+        # reject the combination here instead of at launch.
+        raise ValueError(
+            f"p2p_quant={config.p2p_quant!r} conflicts with aligned-pair Stage2"
+        )
     return config
 
 
