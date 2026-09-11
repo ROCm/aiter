@@ -623,8 +623,10 @@ def moe_gemm_a4w4(
         # prefetches before the K loop, so it only pays off once the loop is
         # long enough to absorb it -- hence the 4x rule.
         num_k_iter = triton.cdiv(K, config["block_k"])
-        l2_prefetch_distance = 4
-        if (
+        l2_prefetch_distance = (
+            4 if preshuffle_weights and swizzle_mx_scale == "GFX1250_SCALE" else 0
+        )
+        if l2_prefetch_distance and (
             num_k_iter < 4 * l2_prefetch_distance
             or config["num_buffers"] + l2_prefetch_distance - 1 >= num_k_iter
         ):
