@@ -11,6 +11,7 @@ from aiter.ops.topk import (
     topk_ob_workspace_size,
     topk_use_mulblocks,
 )
+from aiter.ops.topk_plain import topk_plain
 from aiter.test_common import benchmark, run_perftest
 
 # Argument rotation deep-copies every input to defeat L2. Past this the working
@@ -29,6 +30,10 @@ _MEM_HEADROOM = 0.8
 # randint, the masked temporary and the or'd result; mixed adds a second randn
 # and the where() output. Measured 1.00 / 3.00 / 4.28 at M=64, N=1048576.
 _GEN_PEAK_MULTIPLIER = {"random": 1.0, "10LSBits": 3.0, "mixed": 4.3}
+
+# topk_plain asserts k <= MAX_CAPACITY (topk_plain_kernels.cu:980) and the
+# assert aborts the process, so it cannot be called past it and recovered from.
+_PLAIN_MAX_K = 2048
 
 
 def _rotate_args(nbytes: int) -> int:
@@ -392,9 +397,10 @@ def _reference_topk(
 
 
 def _prefill_footprint(num_rows, width, top_k, data_generation, dense):
+    # top_k * 12: this kernel's indices, plus topk_plain's own ids and values.
     return (
         _logits_bytes(num_rows, width, data_generation, dense)
-        + num_rows * top_k * 4
+        + num_rows * top_k * 12
         + _workspace_bytes(num_rows, width, top_k, decode=False)
     )
 
@@ -419,7 +425,31 @@ def _rows_that_fit(num_rows, width, top_k, data_generation):
     return lo
 
 
-def _run_prefill_block(num_rows, num_prefix, top_k, data_generation, dense_n, width):
+def _time_topk_plain(logits, num_rows, width, top_k, footprint):
+    """The other entry point for a plain [M, N] top-k. It needs a values buffer
+    even when only indices are wanted, which is itself part of the comparison."""
+    ids = torch.empty((num_rows, top_k), dtype=torch.int32, device="cuda")
+    vals = torch.empty((num_rows, top_k), dtype=torch.float32, device="cuda")
+    empty = torch.tensor([], dtype=torch.int32, device="cuda")
+    _, us = run_perftest(
+        topk_plain,
+        logits,
+        ids,
+        vals,
+        top_k,
+        True,
+        empty,
+        empty,
+        -1,
+        1,
+        num_rotate_args=_rotate_args(footprint),
+    )
+    return us, ids
+
+
+def _run_prefill_block(
+    num_rows, num_prefix, top_k, data_generation, dense_n, width, with_plain=False
+):
     """One [num_rows, width] cell: time the kernel, check it against torch.topk."""
     row_starts, row_ends = create_row_boundaries(num_rows, num_prefix, dense_n=dense_n)
     logits = create_random_logits(
@@ -450,6 +480,12 @@ def _run_prefill_block(num_rows, num_prefix, top_k, data_generation, dense_n, wi
         if run_ref
         else (None, None)
     )
+    plain_us = None
+    if with_plain and top_k <= _PLAIN_MAX_K:
+        plain_us, plain_ids = _time_topk_plain(
+            logits, num_rows, width, top_k, footprint
+        )
+
     if torch_indices is None:
         ok = "skipped"
         note = "ref oom" if run_ref else f"ref > {_REF_MAX_ELEMS} elems"
@@ -457,9 +493,15 @@ def _run_prefill_block(num_rows, num_prefix, top_k, data_generation, dense_n, wi
         ok = compare_topk_results(
             logits, indices, torch_indices, row_starts, row_ends, top_k
         )
+        if with_plain and ok is True:
+            ok = compare_topk_results(
+                logits, plain_ids, torch_indices, row_starts, row_ends, top_k
+            )
+            if ok is not True:
+                ok = "plain mismatch"
         note = None
     del logits, indices, torch_indices
-    return us, ok, torch_us, note
+    return us, ok, torch_us, note, plain_us
 
 
 @benchmark()
@@ -470,6 +512,7 @@ def test_top_k_per_row_prefill(
     data_generation: str = "random",
     dense_n: int | None = None,
     chunk_m: bool = False,
+    with_plain: bool = False,
 ) -> dict:
     """
     Test topk_per_row_prefill.
@@ -501,20 +544,26 @@ def test_top_k_per_row_prefill(
 
     total_us = 0.0
     total_torch_us = 0.0
+    total_plain_us = 0.0
     timed_torch = True
+    timed_plain = with_plain
     verdicts = []
     note = None
     done = 0
     while done < num_rows:
         rows = min(rows_per_chunk, num_rows - done)
-        us, ok, torch_us, chunk_note = _run_prefill_block(
-            rows, num_prefix, top_k, data_generation, dense_n, width
+        us, ok, torch_us, chunk_note, plain_us = _run_prefill_block(
+            rows, num_prefix, top_k, data_generation, dense_n, width, with_plain
         )
         total_us += us
         if torch_us is None:
             timed_torch = False
         else:
             total_torch_us += torch_us
+        if plain_us is None:
+            timed_plain = False
+        else:
+            total_plain_us += plain_us
         verdicts.append(ok)
         note = note or chunk_note
         done += rows
@@ -538,6 +587,11 @@ def test_top_k_per_row_prefill(
         top_k,
         torch_us=total_torch_us if timed_torch else None,
     )
+    if with_plain and top_k > _PLAIN_MAX_K:
+        ret["plain us"] = f"n/a k>{_PLAIN_MAX_K}"
+    elif timed_plain:
+        ret["plain us"] = total_plain_us
+        ret["plain/aiter"] = total_plain_us / total_us
     return ret
 
 
@@ -803,12 +857,17 @@ IRREGULAR_SHAPES = [
     (100, 999983, 1024),
 ]
 
+_POW2_N = [512 << i for i in range(12)]  # 512 .. 1048576
+_POW2_M = [1 << i for i in range(15)]  # 1 .. 16384
+
 SWEEP_DEFAULTS = {
     **CI_DEFAULTS,
-    "context_len": [512, 1024, 4096, 16384, 65536, 262144, 1048576],
+    "context_len": _POW2_N,
     "top_k": [512, 1024, 2048, 4096],
-    "decode_batch_size": [1, 4, 16, 64, 256],
-    "next_n": [1, 2],
+    "decode_batch_size": _POW2_M,
+    "next_n": [1],
+    "prefill_rows": _POW2_M,
+    "prefill_n": _POW2_N,
 }
 
 
@@ -917,6 +976,13 @@ parser.add_argument(
 )
 
 parser.add_argument(
+    "--with_plain",
+    action="store_true",
+    help="""Also time aiter.topk_plain on the same logits and check it against
+    the same reference, as a second column in the prefill table.""",
+)
+
+parser.add_argument(
     "--skip_irregular",
     action="store_true",
     help="""Drop the non-power-of-two correctness pass that --sweep otherwise
@@ -973,7 +1039,13 @@ for data_generation in args.data_generation:
                         continue
                     df.append(
                         test_top_k_per_row_prefill(
-                            m, 0, k, data_generation, dense_n=n, chunk_m=args.chunk_m
+                            m,
+                            0,
+                            k,
+                            data_generation,
+                            dense_n=n,
+                            chunk_m=args.chunk_m,
+                            with_plain=args.with_plain,
                         )
                     )
         else:
@@ -987,7 +1059,13 @@ if args.sweep and not args.skip_irregular:
     for m, n, k in IRREGULAR_SHAPES:
         df.append(
             test_top_k_per_row_prefill(
-                m, 0, k, args.data_generation[0], dense_n=n, chunk_m=args.chunk_m
+                m,
+                0,
+                k,
+                args.data_generation[0],
+                dense_n=n,
+                chunk_m=args.chunk_m,
+                with_plain=args.with_plain,
             )
         )
 
