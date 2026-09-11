@@ -14,9 +14,9 @@ _PACK = 2  # fp4 micro-scale pack (per-32 E8M0): pack_M = pack_N = pack_K = 2
 
 
 @flyc.jit
-def _load_row_map_subgroup(row_map_rsrc, row_index, lane):
-    """Load one source row per 16-lane K-slice group and broadcast it."""
-    subgroup_lane = lane & fx.Int32(15)
+def _load_row_map_subgroup(row_map_rsrc, row_index, lane, subgroup_width):
+    """Load and broadcast one source row per K-step copy subgroup."""
+    subgroup_lane = lane % fx.Int32(subgroup_width)
     packed = fx.Int32(0)
     if subgroup_lane == fx.Int32(0):
         packed = row_map_rsrc[row_index]
@@ -150,6 +150,7 @@ class ATileLoader:
                     self._row_map_rsrc,
                     tile_row_base_i32 + row,
                     lane,
+                    chunks_per_row,
                 )
                 source_row = packed & fx.Int32(0xFFFFFF)
             row_byte = source_row * fx.Int32(self._row_bytes)
@@ -427,6 +428,7 @@ class AScaleLoader:
                             self._row_map_rsrc,
                             tile_row_base_i32 + row,
                             lane,
+                            padded_groups_per_row,
                         )
                         source_row = packed & fx.Int32(0xFFFFFF)
                         lin = row * fx.Int32(groups_per_row) + group

@@ -853,8 +853,10 @@ class MegaMoEV2:
             BK=stage2.block_k,
             use_nt=stage2.use_nt,
             g2_bhoist=stage2.b_hoist,
+            g2_b2stage=stage2.b2stage,
             g2_ascale_pf=stage2.ascale_prefetch,
             g2_spart=stage2.spatial_partition,
+            g2_deep_a_pipeline=stage2.deep_a_pipeline,
             persist=stage2.persist,
             persist_cu=stage2.persist_cu,
             persist_strided=stage2.persist_strided,
@@ -920,7 +922,9 @@ class MegaMoEV2:
             use_nt=stage2.use_nt,
             cu_num=stage2.pair_cu,
             g2_bhoist=stage2.b_hoist,
+            g2_b2stage=stage2.b2stage,
             g2_ascale_pf=stage2.ascale_prefetch,
+            g2_deep_a_pipeline=stage2.deep_a_pipeline,
             a_dtype=str(invariants["a_dtype"]),
         )
 

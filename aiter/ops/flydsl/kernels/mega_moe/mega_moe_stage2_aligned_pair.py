@@ -222,7 +222,8 @@ def compile_mega_moe_stage2_aligned_pair(*, model_dim: int, inter_dim: int,
     recv_cap: int, comb_inp_nbytes: int, BM: int = 32,
     SBM: int = 128, BN: int = 256, BK: int = 256, INTER_MAX: int = 8192,
     use_nt: bool = False, cu_num: int = 722, g2_bhoist=True,
-    g2_ascale_pf=True, a_dtype: str = "fp8"):
+    g2_b2stage: bool = False, g2_ascale_pf=True,
+    g2_deep_a_pipeline: bool = False, a_dtype: str = "fp8"):
 # fmt: on
     """Compile the production two-expert common-row Stage2 kernel."""
     arch = str(get_rocm_arch() or "")
@@ -246,9 +247,11 @@ def compile_mega_moe_stage2_aligned_pair(*, model_dim: int, inter_dim: int,
         )
     if a_dtype not in ("fp4", "fp8"):
         raise ValueError(f"a_dtype must be 'fp4' or 'fp8', got {a_dtype!r}")
+    if g2_deep_a_pipeline and not g2_b2stage:
+        raise ValueError("g2_deep_a_pipeline requires g2_b2stage=True")
     is_f8 = a_dtype == "fp8"
     a_pack = 1 if is_f8 else 2
-    a_stages = kStages + 1
+    a_stages = 4 if g2_deep_a_pipeline else kStages + 1
     compute_lds_bytes = _stage2_lds_bytes(BM, BN, BK, a_dtype, a_stages)
     second_compute_off = compute_lds_bytes
     lds_packed_a_off = compute_lds_bytes * 2
@@ -286,7 +289,8 @@ def compile_mega_moe_stage2_aligned_pair(*, model_dim: int, inter_dim: int,
     kernel_name = (
         f"megamoe_stage2_aligned_pair_runtime_t{BM}x{BN}x{BK}_cu{cu_num}"
         f"_seqacc4_sv{ALIGNED_PAIR_SCATTER_VEC}_ms1"
-        f"_a{a_dtype}_nt{int(use_nt)}_bh{int(g2_bhoist)}apf{int(g2_ascale_pf)}"
+        f"_a{a_dtype}_nt{int(use_nt)}_bh{int(g2_bhoist)}b2{int(g2_b2stage)}"
+        f"apf{int(g2_ascale_pf)}da{int(g2_deep_a_pipeline)}"
         "_rtv3_rq2_hw1"
     )
 
@@ -452,7 +456,8 @@ def compile_mega_moe_stage2_aligned_pair(*, model_dim: int, inter_dim: int,
                 i32_max_m_blocks, fx.Int32(0), lane, wave, i32_inter, i32_hidden,
                 fx.Int32(0), fx.Int32(0), BM=BM, BN=BN, BK=BK, use_nt=use_nt,
                 INTER_MAX=INTER_MAX, aStages=a_stages, a_dtype=a_dtype, SBM=BM,
-                g2_bhoist=g2_bhoist, g2_ascale_pf=g2_ascale_pf,
+                g2_bhoist=g2_bhoist, g2_b2stage=g2_b2stage,
+                g2_ascale_pf=g2_ascale_pf, g2_deep_a_pipeline=g2_deep_a_pipeline,
                 expert_offset=expert_offset, explicit_m_row=m_row_a,
                 explicit_n_block=n_block, explicit_expert=global_a)
             # fmt: on
@@ -468,7 +473,8 @@ def compile_mega_moe_stage2_aligned_pair(*, model_dim: int, inter_dim: int,
                 i32_max_m_blocks, fx.Int32(0), lane, wave, i32_inter, i32_hidden,
                 fx.Int32(0), fx.Int32(0), BM=BM, BN=BN, BK=BK, use_nt=use_nt,
                 INTER_MAX=INTER_MAX, aStages=a_stages, a_dtype=a_dtype, SBM=BM,
-                g2_bhoist=g2_bhoist, g2_ascale_pf=g2_ascale_pf,
+                g2_bhoist=g2_bhoist, g2_b2stage=g2_b2stage,
+                g2_ascale_pf=g2_ascale_pf, g2_deep_a_pipeline=g2_deep_a_pipeline,
                 expert_offset=expert_offset, explicit_m_row=m_row_b,
                 explicit_n_block=n_block, explicit_expert=global_b)
             _store_accumulator_tile(

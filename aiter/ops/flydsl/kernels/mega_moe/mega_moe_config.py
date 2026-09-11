@@ -98,6 +98,7 @@ class Stage2Config:
     skew_cu: int = 0
     block_k: int = 256
     b_hoist: bool = True
+    b2stage: bool = False
     ascale_prefetch: bool = True
     spatial_partition: int = 402
     bf16_lds: bool = False
@@ -105,6 +106,7 @@ class Stage2Config:
     pair_cu: int = 0
     pair_block_m: int = 32
     pair_block_n: int = 256
+    deep_a_pipeline: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -124,6 +126,8 @@ class MegaMoEConfig:
             raise ValueError(f"unsupported p2p_quant={self.p2p_quant!r}")
         if self.p2p_quant != "none" and self.stage2.bf16_lds:
             raise ValueError("FP8 P2P requires Stage2 bf16_lds=False")
+        if self.stage2.deep_a_pipeline and not self.stage2.b2stage:
+            raise ValueError("Stage2 deep_a_pipeline requires b2stage=True")
 
 
 @dataclass(frozen=True, slots=True)
@@ -382,6 +386,130 @@ def _select_bucket_config(
     return MegaMoEConfig(stage1=stage1, stage2=stage2, p2p_quant="none")
 
 
+def _replace_config(
+    config: MegaMoEConfig,
+    *,
+    stage1: dict[str, object] | None = None,
+    stage2: dict[str, object] | None = None,
+) -> MegaMoEConfig:
+    return replace(
+        config,
+        stage1=replace(config.stage1, **stage1) if stage1 else config.stage1,
+        stage2=replace(config.stage2, **stage2) if stage2 else config.stage2,
+    )
+
+
+def _apply_a4_tuning(
+    config: MegaMoEConfig,
+    *,
+    tokens: int,
+    bucket: int,
+    mtpr: int,
+    experts_per_rank: int,
+) -> MegaMoEConfig:
+    """Apply only A4W4 configurations validated on MI355X.
+
+    The unsafe BS8192 DCU/grid/chunk overrides are intentionally excluded.
+    """
+    if mtpr <= FIXED_SLOT_MAX_MTPR:
+        if bucket == 4:
+            config = _replace_config(config, stage1={"grid_mult": 4})
+        elif bucket == 16:
+            config = _replace_config(config, stage1={"grid_mult": 3})
+
+    if bucket <= 128 and config.stage1.async_a_copy:
+        # FP4 halves the A K-step bytes. SBM64 gives every thread at least one
+        # 16-byte async copy unless a validated synchronous patch below applies.
+        config = _replace_config(config, stage1={"sort_block_m": 64})
+
+    if 256 <= tokens < 32768:
+        config = _replace_config(config, stage1={"waves_per_eu_hint": 1})
+
+    # These measured tables are V4-Pro-specific.
+    if experts_per_rank != REFERENCE_EXPERTS_PER_RANK:
+        return config
+
+    if bucket == 32768:
+        # The indexed FP4 payload uses 8 copy lanes per 128-byte K step.
+        # Keep the corrected row-map subgroup on the register-copy path; the
+        # 16-lane async DMA atom cannot represent two independent source rows.
+        config = _replace_config(config, stage1={"async_a_copy": False})
+
+    bucket_stage1: dict[str, object] = {}
+    bucket_stage2: dict[str, object] = {}
+    if bucket == 512:
+        bucket_stage1 = {
+            "b_nt": 0,
+            "num_dispatch_cu": 160,
+        }
+    elif bucket == 1024:
+        bucket_stage1 = {"sort_block_m": 128, "num_dispatch_cu": 88}
+        bucket_stage2 = {"block_m": 64}
+    elif bucket == 4096:
+        bucket_stage1 = {"num_dispatch_cu": 72}
+    if bucket_stage1 or bucket_stage2:
+        config = _replace_config(
+            config,
+            stage1=bucket_stage1,
+            stage2=bucket_stage2,
+        )
+
+    if config.p2p_quant == P2P_QUANT_FP8_BLOCKWISE and bucket == 1024:
+        config = _replace_config(
+            config,
+            stage1={"grid_mult": 1},
+            stage2={"persist_cu": 224},
+        )
+
+    if mtpr == 8192:
+        if bucket <= 1024:
+            config = _replace_config(config, stage1={"num_dispatch_cu": 32})
+
+        if bucket in (16, 32, 64, 128):
+            config = _replace_config(
+                config,
+                stage1={
+                    "sort_block_m": 32,
+                    "tile_n": 256,
+                    "num_waves": 4,
+                    "grid_mult": 2 if bucket == 16 else 1,
+                    "mfma_amajor": False,
+                    "async_a_copy": False,
+                },
+                stage2={"block_m": 32},
+            )
+
+        dispatch_cu = {
+            4: 128,
+            8: 32,
+            16: 128,
+            32: 128,
+            64: 128,
+            128: 128,
+            256: 96,
+            512: 160,
+            4096: 72,
+        }.get(bucket)
+        if dispatch_cu is not None:
+            stage1_patch: dict[str, object] = {"num_dispatch_cu": dispatch_cu}
+            if bucket == 256:
+                stage1_patch["tile_n"] = 256
+            config = _replace_config(config, stage1=stage1_patch)
+
+    # The measured deep Stage2 path is enabled only for A4 and only where the
+    # base geometry uses BN256. A8 therefore remains byte-for-byte mainline.
+    if (
+        bucket >= 1024
+        and config.stage2.block_n == 256
+        and not config.stage2.aligned_pair
+    ):
+        config = _replace_config(
+            config,
+            stage2={"b2stage": True, "deep_a_pipeline": True},
+        )
+    return config
+
+
 def select_mega_moe_config(
     tokens: int,
     mtpr: int,
@@ -455,6 +583,14 @@ def select_mega_moe_config(
         desired_p2p = p2p_quant
     if desired_p2p != config.p2p_quant:
         config = replace(config, p2p_quant=desired_p2p)
+    if a_dtype == ACTIVATION_FP4:
+        config = _apply_a4_tuning(
+            config,
+            tokens=tokens,
+            bucket=bucket,
+            mtpr=mtpr,
+            experts_per_rank=experts_per_rank,
+        )
     return config
 
 
