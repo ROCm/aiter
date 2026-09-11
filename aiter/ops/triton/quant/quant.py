@@ -46,7 +46,6 @@ def static_per_tensor_quant_fp8_i8(
     qx: torch.Tensor,
     x_in: torch.Tensor,
     scale_in: torch.Tensor,
-    fast_convert: bool = True,
 ):
     """
     Quantizes tensor using the provided scale to int8 or fp8
@@ -55,9 +54,6 @@ def static_per_tensor_quant_fp8_i8(
     - qx: Output tensor of same shape as x_in. Must be fp8 or int8 dtype and allocated by the caller
     - x_in: Input tensor of shape (M, N).
     - scale_in: Input Scale tensor of shape (1,) and dtype fp32
-    - fast_convert: multiply by the reciprocal of the scale instead of dividing
-        by it. Cheaper, and differs from the division on a small fraction of
-        inputs; see the kernel.
 
     Returns:
     - qx: Quantized output values.
@@ -95,7 +91,6 @@ def static_per_tensor_quant_fp8_i8(
         q2d.stride(1),
         BLOCK_M=BLOCK_M,
         BLOCK_N=BLOCK_N,
-        FAST_CONVERT=fast_convert,
         num_warps=4,
     )
     return qx

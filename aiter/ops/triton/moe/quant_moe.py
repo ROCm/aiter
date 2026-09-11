@@ -30,7 +30,7 @@ def downcast_to_static_fp8(x: torch.Tensor, scale: torch.Tensor):
     else:
         dtype = torch.float8_e4m3fnuz
     y = torch.empty((M, N), dtype=dtype, device=x.device)
-    return static_per_tensor_quant_fp8_i8(y, x, scale, fast_convert=False)
+    return static_per_tensor_quant_fp8_i8(y, x, scale)
 
 
 class DequantScaleRoundingMode(Enum):

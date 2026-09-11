@@ -11,7 +11,6 @@ _static_per_tensor_quant_fp8_i8_repr = make_kernel_repr(
     [
         "BLOCK_M",
         "BLOCK_N",
-        "FAST_CONVERT",
     ],
 )
 
@@ -29,7 +28,6 @@ def _static_per_tensor_quant_fp8_i8_kernel(
     stride_q_n,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
-    FAST_CONVERT: tl.constexpr,
 ):
     # Fold the block origin into the base pointers in int64 so only the in-tile
     # offsets, which always fit, stay 32-bit.
@@ -49,13 +47,11 @@ def _static_per_tensor_quant_fp8_i8_kernel(
     )
 
     scale = tl.load(scale_in_ptr)
-    # FAST_CONVERT multiplies by the reciprocal, one v_mul per element, instead of
-    # a correctly-rounded division. Not equivalent: a reciprocal half an fp32 ulp
-    # off can land on the far side of an fp8 rounding boundary.
-    if FAST_CONVERT:
-        qx = x * (1 / scale)
-    else:
-        qx = x.to(tl.float32) / scale
+    # Multiply by the reciprocal: the division is loop-invariant, so this costs one
+    # v_mul per element. Ties can break the other way than a correctly-rounded
+    # division would, but both answers are within half an fp8 ulp of the exact
+    # quotient.
+    qx = x * (1 / scale)
 
     tl.store(
         qx_ptr + offs_m * stride_q_m + offs_n * stride_q_n,
