@@ -1022,6 +1022,7 @@ def _tdm_load_views(
     pad_elems,
     lds_base,
     elem_dtype,
+    num_warps=_DEFAULT_NUM_WAVES,
 ):
     """Build a LIST of ``(atom, g_view, lds_view)`` TDM global->LDS copies for one
     ``[num_rows, hdim]`` tile into a row-major padded (``hdim + pad_elems`` element row stride) LDS
@@ -1030,7 +1031,9 @@ def _tdm_load_views(
     segment ``(c0, w)`` copies global cols ``[c0, c0+w)`` -> LDS cols ``[c0, c0+w)`` with
     ``pad_interval=w``, ``pad_amount=(hdim+pad_elems - w)`` so the LDS row still advances by the
     padded stride. One segment for pow2 hdim (128/256), two for 192. Src base = ``ptr_x[row0, head]``;
-    per-row extent ``valid`` = HW OOB zero-fill; all 8 waves split the tile. Strides in ELEMENTS.
+    per-row extent ``valid`` = HW OOB zero-fill. ``num_warps`` waves split the tile by rows; the
+    lowering takes the row share from ``wave_id % num_warps``, so waves 4..7 issuing a
+    ``num_warps=4`` copy cover the same tile as waves 0..3. Strides in ELEMENTS.
     """
     row_elems = hdim + pad_elems
     off = fx.Int64(row0) * fx.Int64(stride_seq) + fx.Int64(head) * fx.Int64(stride_head)
@@ -1048,7 +1051,7 @@ def _tdm_load_views(
             g_view,
             [valid, None],
             strides=[stride_seq, None],
-            num_warps=_DEFAULT_NUM_WAVES,
+            num_warps=num_warps,
             pad_interval=w,
             pad_amount=row_elems - w,
         )
@@ -1251,7 +1254,16 @@ class KManager16bV2:
         return self.n_block * self.row_bytes
 
     def load_views(
-        self, *, ptr_lds, ptr_K, stride_k_seq, stride_k_head, kv_head, kv_row0, kv_valid
+        self,
+        *,
+        ptr_lds,
+        ptr_K,
+        stride_k_seq,
+        stride_k_head,
+        kv_head,
+        kv_row0,
+        kv_valid,
+        num_warps=None,
     ):
         """Return a LIST of ``(atom, g_view, lds_view)`` TDM copies for this block's K tile into the
         padded LDS at ``ptr_lds`` — one per pow2 hdim segment (1 for 128/256, 2 for 192) per LDS
@@ -1280,6 +1292,7 @@ class KManager16bV2:
                 pad_elems=_K_PAD_ELEMS,
                 lds_base=base,
                 elem_dtype=self.elem_dtype,
+                num_warps=self.num_waves if num_warps is None else num_warps,
             )
         return views
 
@@ -1376,7 +1389,16 @@ class VManager16bV2:
         return self.n_block * self.row_bytes
 
     def load_views(
-        self, *, ptr_lds, ptr_V, stride_v_seq, stride_v_head, kv_head, kv_row0, kv_valid
+        self,
+        *,
+        ptr_lds,
+        ptr_V,
+        stride_v_seq,
+        stride_v_head,
+        kv_head,
+        kv_row0,
+        kv_valid,
+        num_warps=None,
     ):
         """Return a LIST of ``(atom, g_view, lds_view)`` TDM copies for this block's V tile (v_hdim=128
         is pow2 -> one copy per LDS split). ``ptr_lds`` is one fx.Int32 byte base, or a list of
@@ -1404,6 +1426,7 @@ class VManager16bV2:
                 pad_elems=_V_PAD_ELEMS,
                 lds_base=base,
                 elem_dtype=self.elem_dtype,
+                num_warps=self.num_waves if num_warps is None else num_warps,
             )
         return views
 
