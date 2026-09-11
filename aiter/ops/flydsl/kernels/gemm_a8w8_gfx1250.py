@@ -68,9 +68,7 @@ def launch_gemm_a8w8(
     mx32 = is_mxscale and block_size == 32
     mx128 = is_mxscale and block_size == 128
     preload = preload_ks > 0
-    # A-preshuffle: A is shuffle_mxfp8fp4_a-tiled, [M, K] -> [M/2, K/128, 2, 128],
-    # so the TDM walks tile_m/2 segments of 2*tile_k instead of tile_m of tile_k.
-    # Only A's LDS addressing changes; the WMMA fragment order does not.
+    # A-preshuffle: A is shuffle_mxfp8fp4_a-tiled, [M, K] -> [M/2, K/128, 2, 128]
     A_PAIR = 2 if a_preshuffle else 1
     if a_preshuffle and batched:
         raise ValueError(
@@ -218,8 +216,6 @@ def launch_gemm_a8w8(
         blk_m64 = fx.Int64(blk_m)
         blk_n64 = fx.Int64(blk_n)
         mn_oob = i32_m - blk_m  # valid M rows (A / C, and mx128's per-row A-scale)
-        # A's TDM bound is in row pairs; C and the A-scale stay on rows. Shift,
-        # not `// 2`, which flydsl lowers with a truncating-division fixup.
         a_oob = (mn_oob + 1) >> 1 if const_expr(a_preshuffle) else mn_oob
         nb_oob = stride_ask64 = sa_oob = None
         if const_expr(mx32):
@@ -261,8 +257,6 @@ def launch_gemm_a8w8(
             b_off0 = b_off0 + bz64 * fx.Int64(i32_n) * k64
 
         W_A, W_B = 0, 1
-        # (blk_m/2)*(2*lda) == blk_m*lda, so a_off0 is unchanged and lda stays
-        # the unshuffled K.
         gA = _gv(gA_base, a_off0, (A_LDS_ROWS, A_TDM_ROW), (A_TDM_ROW, 1))
         atomA = fx.atom_set_value(
             fx.rocdl.make_tdm_atom(
@@ -414,11 +408,6 @@ def launch_gemm_a8w8(
         wmb = wave_m * warp_tile_m
         wnb = wave_n * warp_tile_n
 
-        # Hoisted out of load_a so the per-(wm, ks) part stays a Python int and
-        # folds into the ds_load immediate; inline it costs an address VGPR each.
-        # warp_tile_m and WMMA_M are multiples of 16, so the pair index halves at
-        # compile time and lane16 alone decides parity: shift/mask, not `//` and
-        # `%`, which lower to a signed-division fixup in the K loop.
         a_pair_base = (
             fx.Int64(
                 (wave_m * (warp_tile_m // 2) + (lane16 >> 1)) * A_LDS_ROW
@@ -431,8 +420,6 @@ def launch_gemm_a8w8(
 
         def load_a(buf, wm, ks):
             if const_expr(a_preshuffle):
-                # Byte kb = ks*128 + kgrp*16 + 32*j sits at chunk ks*256 of the
-                # row's pair, then that row's half of the chunk, then kb % 128.
                 b0 = a_pair_base
                 off0 = wm * ((WMMA_M // 2) * A_LDS_ROW) + ks * (2 * WMMA_K)
             else:

@@ -172,9 +172,16 @@ def test_gemm(
     ret["ck TB/s"] = (x.nbytes + weight.nbytes) / avg_b / 1e6
     ret["ck err"] = err_ck
 
-    if apre and use_flydsl_fp8_scale and m % 2 == 0:
+    if apre and use_flydsl_fp8_scale:
+        # A-preshuffle packs adjacent A row pairs, so an odd M needs A -- and only
+        # A -- padded to M+1 rows; x_scale and the result keep the true M.
+        if m % 2:
+            x_apre = torch.zeros((m + 1, k), dtype=x.dtype, device=x.device)
+            x_apre[:m] = x
+        else:
+            x_apre = x
         e, avg_e = run_gemm_abpreshuffle(
-            shuffle_mxfp8fp4_a(x), gemm_weight, gemm_x_scale, w_scale, dtype
+            shuffle_mxfp8fp4_a(x_apre), gemm_weight, gemm_x_scale, w_scale, dtype
         )
         ret["apre us"] = avg_e
         ret["apre TFLOPS"] = m * n * k * 2 / avg_e / 1e6
@@ -399,7 +406,8 @@ parser.add_argument(
     nargs="*",
     default=[False],
     help="""also measure the FlyDSL A-preshuffle candidate (requires --flydsl
-    --ck_preshuffle True and an even M). Sweeps like --ck_preshuffle.
+    --ck_preshuffle True). Odd M is padded to M+1 rows for A only.
+    Sweeps like --ck_preshuffle.
     e.g.: --apre True
         or --apre True False""",
 )

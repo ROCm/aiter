@@ -1139,7 +1139,21 @@ def _abpreshuffle_config_from_bpreshuffle(m: int, n: int, k: int) -> dict:
     return dict(config, kernelName=head + "_apre" + sep + tail)
 
 
-@torch_compile_guard(gen_fake=gemm_a8w8_blockscale_bpreshuffle_fake)
+def gemm_a8w8_blockscale_abpreshuffle_fake(
+    XQ: Tensor,
+    WQ: Tensor,
+    x_scale: Tensor,
+    w_scale: Tensor,
+    dtype: torch.dtype = dtypes.bf16,
+    out: Tensor | None = None,
+) -> Tensor:
+    # A is padded to an even row count, so XQ.shape[0] is M+1 for odd M.
+    if out is not None:
+        return out
+    return torch.empty(x_scale.shape[0], WQ.shape[0], dtype=dtype, device=XQ.device)
+
+
+@torch_compile_guard(gen_fake=gemm_a8w8_blockscale_abpreshuffle_fake)
 def gemm_a8w8_blockscale_abpreshuffle(
     XQ: Tensor,
     WQ: Tensor,
@@ -1155,14 +1169,34 @@ def gemm_a8w8_blockscale_abpreshuffle(
     :func:`gemm_a8w8_blockscale_bpreshuffle`.  Only the gfx1250 mxfp8_128 FlyDSL
     path implements it, so an unsupported operand set raises rather than silently
     computing a row-major result.
+
+    Odd M: ``shuffle_mxfp8fp4_a`` packs adjacent A row pairs, so the caller must
+    pad A to ``M + 1`` rows before shuffling (the kernel reads the last pair
+    whole).  A is the ONLY operand that is padded -- ``x_scale`` stays ``(M,
+    K//128)`` and the result stays ``(M, N)``, both with the true, odd M, which
+    is read from ``x_scale``.  The padded A row is loaded but never contributes:
+    its C row, its A row bound and its A-scale super are all clamped to M::
+
+        m_pad = m + (m & 1)
+        a = torch.zeros((m_pad, k), dtype=x.dtype, device=x.device)
+        a[:m] = x
+        y = gemm_a8w8_blockscale_abpreshuffle(
+            shuffle_mxfp8fp4_a(a), wq, x_scale, w_scale)   # y is (m, n)
     """
     assert dtype in [
         dtypes.bf16,
         dtypes.fp16,
     ], f"Output {dtype=} is currently not supported in gemm_a8w8"
-    m = XQ.shape[0]
+    m = x_scale.shape[0]
     n = WQ.shape[0]
     k = XQ.shape[1]
+    if XQ.shape[0] != m + (m & 1):
+        raise RuntimeError(
+            f"gemm_a8w8_blockscale_abpreshuffle: x_scale gives M={m}, so the "
+            f"preshuffled A must have {m + (m & 1)} rows, got {XQ.shape[0]}. "
+            "shuffle_mxfp8fp4_a packs adjacent row pairs, so an odd M must be "
+            "padded to M+1 rows before shuffling."
+        )
     if out is not None:
         assert out.shape == (m, n) and out.dtype == dtype and out.device == XQ.device, (
             f"gemm_a8w8_blockscale_abpreshuffle: out buffer {tuple(out.shape)}/"

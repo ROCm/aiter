@@ -51,7 +51,14 @@ def _next_epoch() -> int:
 def splitk_epilogue_flags(M, N, tile_m, tile_n, cluster_m, split_k, cu_num):
     """Return ``(fused_splitk, bounded_m)`` for one launch."""
     wgs = _splitk_grid_wgs(M, N, tile_m, tile_n, cluster_m, split_k)
-    fused = split_k > 1 and wgs <= SPLIT_K_FLAG_MAX_LEN and wgs <= cu_num
+    pow2 = split_k & (split_k - 1) == 0
+    fused = (
+        split_k > 1
+        and pow2
+        and tile_m % split_k == 0
+        and wgs <= SPLIT_K_FLAG_MAX_LEN
+        and wgs <= cu_num
+    )
     return fused, bool(M % tile_m)
 
 
@@ -176,7 +183,8 @@ def _run_mxfp8_128_preshuffle_gemm_a8_gfx1250(
     if XQ.element_size() != 1 or WQ.element_size() != 1:
         raise RuntimeError("[FlyDSL gfx1250 mxfp8_128] A/B must be 1-byte fp8 storage")
 
-    M, K = XQ.shape
+    a_rows, K = XQ.shape
+    M = Out.shape[0] if a_preshuffle else a_rows
     N = WQ.shape[0]
     if K != WQ.shape[1]:
         raise RuntimeError(
@@ -275,10 +283,12 @@ def _run_mxfp8_128_preshuffle_gemm_a8_gfx1250(
         persistent_n_tiles, N, tile_n, cluster_n, split_k, compute_bound
     )
 
-    if a_preshuffle and M % 2 != 0:
+    if a_preshuffle and a_rows != M + (M & 1):
         raise RuntimeError(
-            f"[FlyDSL gfx1250 mxfp8_128] a_preshuffle needs M % 2 == 0, got M={M}; "
-            "shuffle_mxfp8fp4_a pairs adjacent A rows"
+            f"[FlyDSL gfx1250 mxfp8_128] a_preshuffle needs A padded to an even "
+            f"row count: Out gives M={M}, so A must have {M + (M & 1)} rows, got "
+            f"{a_rows}.  The last A row pair is read whole, so an odd-M A buffer "
+            "would be a short read; pad A (not x_scale, not Out) before shuffling."
         )
 
     if not x_scale_transposed:
@@ -471,7 +481,8 @@ def run_gemm_a8w8_mxfp8_128_bpreshuffle_gfx1250(
     if allow_cluster_m_fallback:
         cfg["cluster_m"] = (
             resolve_cluster_m(
-                XQ.shape[0],
+                # true M: with a_preshuffle XQ is padded to an even row count
+                Out.shape[0] if cfg["a_preshuffle"] else XQ.shape[0],
                 cfg["tile_m"],
                 cfg["cluster_m"],
                 cfg["cluster_n"],
