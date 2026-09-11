@@ -300,7 +300,7 @@ def grouped_topk_torch(
 
 
 @compile_ops("module_top_k_per_row", fc_name="top_k_per_row_prefill", develop=True)
-def _top_k_per_row_prefill(
+def top_k_per_row_prefill_hip(
     logits: torch.Tensor,
     rowStarts: torch.Tensor,
     rowEnds: torch.Tensor,
@@ -541,7 +541,7 @@ def top_k_per_row_prefill(
     else:
         size = topk_ob_workspace_size(numRows, stride0, k, False)
         workspace = get_topk_scratch_workspace(logits.device, size)
-    return _top_k_per_row_prefill(
+    return top_k_per_row_prefill_hip(
         logits,
         rowStarts,
         rowEnds,
