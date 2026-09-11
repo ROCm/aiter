@@ -30,22 +30,13 @@ COMPUTE_WMMA_NAME_PREFIX = "flydsl_mxfp8_128_bpreshuffle_compute_wmma"
 _SUPPORTED_NUM_BUFFERS = (2, 3, 4)
 _OUT_DTYPE_NAME = {torch.bfloat16: "bf16", torch.float16: "f16"}
 _MAX_SPLIT_K = 8
-SPLIT_K_FLAG_MAX_LEN = 8192
-_EPOCH = 0
+SPLIT_K_FLAG_MAX_LEN = 65536  # i32 slots; each flag takes a whole 128 B line
 
 
 @functools.lru_cache(maxsize=128)
 def get_split_k_flags(stream, device):
     """Per-(stream, device) split-K flag slots."""
     return torch.zeros(SPLIT_K_FLAG_MAX_LEN, dtype=torch.int32, device=device)
-
-
-def _next_epoch() -> int:
-    global _EPOCH
-    _EPOCH += 1
-    if _EPOCH >= 0x7FFFFFFF:  # never collides with the 0 the buffer starts at
-        _EPOCH = 1
-    return _EPOCH
 
 
 def splitk_epilogue_flags(
@@ -59,7 +50,7 @@ def splitk_epilogue_flags(
         and split_k > 1
         and pow2
         and tile_m % split_k == 0
-        and wgs <= SPLIT_K_FLAG_MAX_LEN
+        and wgs * 32 <= SPLIT_K_FLAG_MAX_LEN
         and wgs <= cu_num
     )
     return fused, bool(M % tile_m)
@@ -320,7 +311,6 @@ def _run_mxfp8_128_preshuffle_gemm_a8_gfx1250(
         compute_bound,
     )
     flag = get_split_k_flags(torch_stream.cuda_stream, XQ.device)
-    epoch = _next_epoch() if _atomic_splitk else 0
     partials = (
         torch.empty((split_k, M, ldc), dtype=Out.dtype, device=Out.device)
         if split_k > 1 and not _atomic_splitk
@@ -355,7 +345,7 @@ def _run_mxfp8_128_preshuffle_gemm_a8_gfx1250(
     )
     launch = _launch_gemm_a8w8_compute_bound if compute_bound else _launch_gemm_a8w8
     if compute_bound:
-        cb_args = launch_args[:12] + (_ptr_arg(flag), epoch) + launch_args[12:]
+        cb_args = launch_args[:12] + (_ptr_arg(flag),) + launch_args[12:]
         launch(
             *cb_args,
             BLOCK_K,
