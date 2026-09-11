@@ -297,6 +297,7 @@ _BPRESHUF_TILE_BN = {
     0: (128, 128), 6: (16, 128), 7: (16, 256),
     27: (256, 256),                      # per-column prefill, wide
     28: (256, 256), 29: (128, 128),      # 128x128 blocked prefill
+    30: (256, 256), 31: (128, 128),      # ... and their scale-in-LDS siblings
 }
 # Largest m the decode tiles were swept at. Past it, kid0.
 _BPRESHUF_DECODE_M_MAX = 256
@@ -356,29 +357,31 @@ def _heuristic_bpreshuffle_kid(
     # were actually measured in rather than trusted outside it.
     cus = _cu_count()
     if blocked:
-        # Blocked-scale family. Only the prefill pair has been swept; the decode
-        # tiles at GROUP_N=128 (kid 8/9/10) are 16-row and were never measured
-        # against these, so a small m gets the narrow prefill tile rather than a
-        # guess at a decode one.
+        # Blocked-scale family. Re-swept on KERNEL time over batch 1..16 x
+        # m 1..4096 at n=1024 k=4096, all seven blocked-capable tiles
+        # (8/9/10/28/29/30/31) per cell.
         #
-        # kid28 is 256x256x128 and kid29 128x128x256, both non-specialized on 8
-        # waves. Swept over batch 1..16 x m 256..8192: every cell whose kid28
-        # grid reaches the CU count is a kid28 win by 1.50x-2.02x. At exactly
-        # half the CU count the band splits on batch -- kid28 still wins at
-        # b<=2 (1.62x at b=1 m=8192, 1.23x at b=2 m=4096) and loses at b>=8 --
-        # so that half is taken only for the narrow batches.
+        # kid28/29 -- the pair this used to choose between -- won ZERO of the 55
+        # cells. Their _sf siblings kid30/31 (same tiles, B's scale staged in
+        # LDS) beat them everywhere, and below the decode cut kid8/10 beat both.
         #
-        # The batch term is fitted to two cells and is NOT understood: b=1
-        # m=8192 and b=16 m=512 have the same kid29 grid, the same kid28 grid
-        # and the same total rows, yet kid29 runs 119.0 us on the first and
-        # 59.6 on the second. Something about a tall single-batch A is costing
-        # 2x and no counter here explains it. The margin is large enough to take
-        # and the mechanism is an open question.
-        bm28, bn28 = _BPRESHUF_TILE_BN[28]
-        wg28 = -(-m // bm28) * -(-n // bn28) * batch
-        if wg28 >= cus or (wg28 * 2 >= cus and batch <= 2):
-            return 28
-        return 29
+        # Decode cut: the 16-row tiles hold while m <= 128 AND m*batch <= 256.
+        # Past either bound their grid explodes -- at b=16 m=256 kid8 runs 129 us
+        # against kid31's 21. kid8 (16x64) takes m <= 16, kid10 (16x192) the rest
+        # of the band.
+        #
+        # Above it, kid30 (256x256) vs kid31 (128x128) splits on kid30's own
+        # workgroup count reaching HALF the CU count -- 13 of 13 cells, no batch
+        # term needed (unlike the kid28/29 rule this replaces, whose batch term
+        # was fitted to two cells and never understood).
+        #
+        # Names the measured winner in 48 of 55 cells; every miss is a near-tie
+        # it declines to chase (worst 6.7%, at b<=2 m=32 where kid8 edges kid10).
+        if m <= 128 and m * batch <= 256:
+            return 8 if m <= 16 else 10
+        bm30, bn30 = _BPRESHUF_TILE_BN[30]
+        wg30 = -(-m // bm30) * -(-n // bn30) * batch
+        return 30 if wg30 * 2 >= cus else 31
     if m > _BPRESHUF_DECODE_M_MAX:
         # Prefill. Two tiles, split on kid27's own workgroup count.
         #
