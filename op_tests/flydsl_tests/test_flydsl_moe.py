@@ -1,8 +1,6 @@
-#!/usr/bin/env python3
-
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
-# ruff: noqa: EXE005, I001
+# ruff: noqa: I001
 """Architecture-selected FlyDSL MoE test entry point.
 
 The original gfx950 GUI A8W4 and gfx1250 TDM grouped-MoE suites live unchanged
@@ -971,8 +969,6 @@ if _GFX == "gfx950":
         )
 
 elif _GFX == "gfx1250" or _FORCE_GFX1250:
-    #!/usr/bin/env python3
-
     # SPDX-License-Identifier: MIT
     # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
