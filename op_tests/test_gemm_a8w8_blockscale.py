@@ -154,7 +154,7 @@ def test_gemm(dtype, m, n, k, ck_preshuffle=True, use_flydsl=False, apre=False):
         )
         ret["apre us"] = avg_e
         ret["apre TFLOPS"] = m * n * k * 2 / avg_e / 1e6
-        ret["apre TB/s"] = (x.nbytes + weight.nbytes) / avg_e / 1e6
+        ret["apre TB/s"] = (x_apre.nbytes + weight.nbytes) / avg_e / 1e6
         ret["apre err"] = checkAllclose(a, e, msg="apre", catastrophic_check=True)
         ret["apre/ck"] = avg_e / avg_b
 

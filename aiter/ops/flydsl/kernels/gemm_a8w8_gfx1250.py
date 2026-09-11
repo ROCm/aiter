@@ -76,16 +76,6 @@ def launch_gemm_a8w8(
         raise ValueError(
             f"[FlyDSL gfx1250] a_preshuffle needs an even tile_m, got {tile_m}"
         )
-    # A-preshuffle doubles the TDM pad interval to A_PAIR*tile_k.  The gfx1250
-    # descriptor encodes log2(interval_in_dwords)-1 in 3 bits, so the interval
-    # caps at 1024 B for 1-byte elements -- tile_k=1024 overflows it once paired.
-    if a_preshuffle and A_PAIR * tile_k > _TDM_MAX_PAD_INTERVAL_BYTES:
-        raise ValueError(
-            f"[FlyDSL gfx1250] a_preshuffle needs tile_k <= "
-            f"{_TDM_MAX_PAD_INTERVAL_BYTES // 2}, got tile_k={tile_k}: the paired "
-            f"TDM pad interval {A_PAIR * tile_k} B exceeds the "
-            f"{_TDM_MAX_PAD_INTERVAL_BYTES} B the descriptor can encode"
-        )
     if batched and not (mx128 and split_k == 1):
         raise ValueError(
             "[FlyDSL gfx1250] the batched path needs mx128 and split_k==1, got "
@@ -118,7 +108,9 @@ def launch_gemm_a8w8(
     LDS_PAD_A = 16
     A_LDS_ROWS = tile_m // A_PAIR
     A_TDM_ROW = A_PAIR * tile_k
-    A_LDS_ROW = A_TDM_ROW + LDS_PAD_A
+    A_PAD_SPLIT = max(1, -(-A_TDM_ROW // _TDM_MAX_PAD_INTERVAL_BYTES))
+    A_PAD_INTERVAL = A_TDM_ROW // A_PAD_SPLIT
+    A_LDS_ROW = A_TDM_ROW + A_PAD_SPLIT * LDS_PAD_A
     B_LDS_ROW = tile_k * 16
     STAGE_A = ((A_LDS_ROWS * A_LDS_ROW + 15) // 16) * 16
     STAGE_B = (((tile_n // 16) * B_LDS_ROW + 15) // 16) * 16
@@ -266,7 +258,7 @@ def launch_gemm_a8w8(
                 [a_oob, None],
                 strides=[lda64 * A_PAIR, None],
                 num_warps=1,
-                pad_interval=A_TDM_ROW,
+                pad_interval=A_PAD_INTERVAL,
                 pad_amount=LDS_PAD_A,
                 early_timeout=True,
             ),
@@ -423,7 +415,11 @@ def launch_gemm_a8w8(
         def load_a(buf, wm, ks):
             if const_expr(a_preshuffle):
                 b0 = a_pair_base
-                off0 = wm * ((WMMA_M // 2) * A_LDS_ROW) + ks * (2 * WMMA_K)
+                off0 = (
+                    wm * ((WMMA_M // 2) * A_LDS_ROW)
+                    + ks * (2 * WMMA_K)
+                    + (ks * (2 * WMMA_K) // A_PAD_INTERVAL) * LDS_PAD_A
+                )
             else:
                 row = wmb + wm * 16 + lane16
                 b0 = fx.Int64(row * A_LDS_ROW + ks * WMMA_K + kgrp * 16)
