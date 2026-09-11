@@ -21,7 +21,6 @@ from .mega_moe_config import (
     Stage1Config,
     build_mega_moe_bundle_plan,
     fixed_stage1_epoch_slot_count,
-    resolve_mega_moe_config,
 )
 from .mega_moe_stage2_aligned_pair import ALIGNED_PAIR_SCATTER_VEC
 from .quant import per_1x32_mx_quant
@@ -30,10 +29,7 @@ __all__ = ["MegaMoEV2"]
 
 
 class MegaMoEV2:
-    """Fused dispatch, GEMM1, GEMM2, and combine with one in-flight launch.
-
-    Both A8W4 and A4W4 consume INTERLEAVE gate/up W1 weight and scale buffers.
-    """
+    """Fused dispatch, GEMM1, GEMM2, and combine with one in-flight launch per instance."""
 
     # fmt: off
     def __init__(self, *, rank: int, world_size: int, model_dim: int, inter_dim: int, experts: int, topk: int,
@@ -47,8 +43,6 @@ class MegaMoEV2:
             raise ValueError(f"experts={experts} must be divisible by world_size={world_size}")
         if max_tok_per_rank <= 0 or max_tok_per_rank & (max_tok_per_rank - 1):
             raise ValueError(f"max_tok_per_rank={max_tok_per_rank} must be a power of two")
-        if stage2_p2p_quant not in ("auto", "none", "fp8_blockwise_1x32"):
-            raise ValueError(f"unsupported stage2_p2p_quant={stage2_p2p_quant!r}")
         self.rank = int(rank)
         self.world_size = int(world_size)
         self.model_dim = int(model_dim)
@@ -60,14 +54,17 @@ class MegaMoEV2:
             raise ValueError(f"MegaMoEV2 topk must be in [1, 16], got {self.topk}")
         self.mtpr = int(max_tok_per_rank)
         self._a_dtype = "fp4" if quant == "a4w4" else "fp8"
-        self._a_torch_dtype = torch.float4_e2m1fn_x2 if self._a_dtype == "fp4" else torch.float8_e4m3fn
+        self._a_torch_dtype = (
+            torch.float4_e2m1fn_x2
+            if self._a_dtype == "fp4"
+            else torch.float8_e4m3fn
+        )
         self._a_view_dim = self.model_dim // 2 if self._a_dtype == "fp4" else self.model_dim
-        self._stage2_p2p_quant = stage2_p2p_quant
         self.swiglu_limit = float(swiglu_limit)
         self._bundle_plan = build_mega_moe_bundle_plan(
             self.mtpr,
             a_dtype=self._a_dtype,
-            p2p_quant=self._stage2_p2p_quant,
+            p2p_quant=stage2_p2p_quant,
             experts_per_rank=self.epr,
             model_dim=self.model_dim,
             inter_dim=self.inter_dim,
@@ -125,8 +122,6 @@ class MegaMoEV2:
         )
 
         self.sort_block_m = 32
-        # FlyDSL 0.3.1 does not expose torch.float4_e2m1fn_x2 as a memref
-        # element type; GEMM1 consumes the packed bytes through buffer resources.
         self._s1_w1 = w1.contiguous().view(torch.uint8)
         self._s1_w1_scale = w1_scale.contiguous().view(torch.uint8)
         op = self.comb_op._gm
@@ -173,22 +168,29 @@ class MegaMoEV2:
         v = op._ll_views()
         self._s1_rx = v["rx_em"]
         self._s1_scale_i32 = v["scale_em_i32"]
+        self._s1_rx_kernel = (
+            self._s1_rx.view(torch.uint8)
+            if self._a_dtype == "fp4"
+            else self._s1_rx
+        )
         self._s1_scale_kernel = (
             self._s1_scale_i32.view(torch.uint8)
             if self._a_dtype == "fp4"
             else self._s1_scale_i32
         )
-        self._s1_rx_kernel = self._s1_rx.view(torch.uint8) if self._a_dtype == "fp4" else self._s1_rx
 
         inter_dim = self.inter_dim
         a2rows = self._s1_nvm
         if self._a_dtype == "fp4":
-            self._s1_out = torch.zeros((a2rows, inter_dim // 2), dtype=torch.uint8, device=self.dev).view(
-                torch.float4_e2m1fn_x2
-            )
+            self._s1_out = torch.zeros(
+                (a2rows, inter_dim // 2), dtype=torch.uint8, device=self.dev
+            ).view(torch.float4_e2m1fn_x2)
+            self._s1_out_kernel = self._s1_out.view(torch.uint8)
         else:
-            self._s1_out = torch.zeros((a2rows, inter_dim), dtype=torch.float8_e4m3fn, device=self.dev)
-        self._s1_out_kernel = self._s1_out.view(torch.uint8) if self._a_dtype == "fp4" else self._s1_out
+            self._s1_out = torch.zeros(
+                (a2rows, inter_dim), dtype=torch.float8_e4m3fn, device=self.dev
+            )
+            self._s1_out_kernel = self._s1_out
         prows = ((a2rows + 255) // 256) * 256
         pcols = (((inter_dim // 32) + 7) // 8) * 8
         self._s1_osd = torch.zeros(prows * pcols + inter_dim, dtype=torch.uint8, device=self.dev)
@@ -204,7 +206,7 @@ class MegaMoEV2:
             dtype=torch.uint8,
             device=self.dev,
         )
-        self._build_dispatch_table()
+        self._build_v2_disp_table()
 
     def _allocate_dispatch_workspace(self, op, metadata_blocks):
         total_experts = self.world_size * self.epr
@@ -320,7 +322,7 @@ class MegaMoEV2:
             workspace[f"p2p_{name}"] = op._p2p_table(workspace[name])
         self._s1_dispatch_workspace = workspace
 
-    def _build_dispatch_table(self):
+    def _build_v2_disp_table(self):
         op = self._s1_op
         workspace = self._s1_dispatch_workspace
         table = [0] * DISPATCH_TABLE_SIZE
@@ -406,9 +408,8 @@ class MegaMoEV2:
                 config.prepare_quant_cu,
                 (quant_groups + 511) // 512,
             )
-            # Preload fused-quant and prequantized-input variants so both public
-            # forward paths remain AOT-only after warmup.
-            for preload_quant_blocks in sorted({0, quant_blocks}):
+            quant_variants = {0} if self._a_dtype == "fp4" else {0, quant_blocks}
+            for preload_quant_blocks in sorted(quant_variants):
                 self._s1_preload_prepare(
                     fx.Int64(self._s1_disp.data_ptr()),
                     fx.Int32(bucket),
@@ -473,18 +474,10 @@ class MegaMoEV2:
             a_dtype=self._a_dtype,
             out_dtype=self._a_dtype,
         )
+
     def _select_config(self, tokens: int) -> MegaMoEConfig:
         entry = self._bundle_plan.entry_for_tokens(tokens)
-        config = resolve_mega_moe_config(
-            tokens if tokens > 0 else 1,
-            self.mtpr,
-            self._stage2_p2p_quant,
-            a_dtype=self._a_dtype,
-            experts_per_rank=self.epr,
-            model_dim=self.model_dim,
-            inter_dim=self.inter_dim,
-            world_size=self.world_size,
-        )
+        config = entry.config
         self._active_bundle_entry = entry
         self._active_config = config
         return config
@@ -697,16 +690,9 @@ class MegaMoEV2:
         *,
         config=None,
         prepared=False,
-        config_tokens=None,
     ):
-        config_tokens = run_tokens if config_tokens is None else int(config_tokens)
-        if not run_tokens <= config_tokens <= self.mtpr:
-            raise ValueError(
-                f"expected run_tokens <= config_tokens <= mtpr, got "
-                f"{run_tokens} <= {config_tokens} <= {self.mtpr}"
-            )
         if config is None:
-            config = self._select_config(config_tokens)
+            config = self._select_config(run_tokens)
         self._run_fused_stage1(
             x,
             wts,
@@ -739,16 +725,7 @@ class MegaMoEV2:
             )
         return out_tok[:run_tokens] if slice_output else out_tok
 
-    def forward(
-        self,
-        x_bf16,
-        wts,
-        topk_ids,
-        *,
-        stream=None,
-        slice_output=True,
-        config_tokens=None,
-    ):
+    def forward(self, x_bf16, wts, topk_ids, *, stream=None, slice_output=True):
         run_tokens = int(x_bf16.shape[0])
         if run_tokens > self.mtpr:
             raise ValueError(f"run_tokens={run_tokens} > max_tok_per_rank={self.mtpr}")
@@ -758,21 +735,13 @@ class MegaMoEV2:
             raise ValueError("wts must be contiguous float32")
         if topk_ids.dtype != torch.int32 or not topk_ids.is_contiguous():
             raise ValueError("topk_ids must be contiguous int32")
-        config_tokens = run_tokens if config_tokens is None else int(config_tokens)
         if self._s1_fixed_slot or self._a_dtype == "fp4":
             x_q, scales = self.quantize(x_bf16)
             return self._run_joint(
-                x_q,
-                scales,
-                wts,
-                topk_ids,
-                run_tokens,
-                stream,
-                slice_output,
-                config_tokens=config_tokens,
+                x_q, scales, wts, topk_ids, run_tokens, stream, slice_output
             )
 
-        config = self._select_config(config_tokens)
+        config = self._select_config(run_tokens)
         prepare_stream = stream
         if prepare_stream is None:
             prepare_stream = fx.Stream(torch.cuda.current_stream().cuda_stream)
@@ -797,33 +766,13 @@ class MegaMoEV2:
             slice_output,
             config=config,
             prepared=True,
-            config_tokens=config_tokens,
         )
 
-    def forward_prequant(
-        self,
-        x_q,
-        scales,
-        wts,
-        topk_ids,
-        *,
-        stream=None,
-        slice_output=True,
-        config_tokens=None,
-    ):
+    def forward_prequant(self, x_q, scales, wts, topk_ids, *, stream=None, slice_output=True):
         run_tokens = int(x_q.shape[0])
         if run_tokens > self.mtpr:
             raise ValueError(f"run_tokens={run_tokens} > max_tok_per_rank={self.mtpr}")
-        return self._run_joint(
-            x_q,
-            scales,
-            wts,
-            topk_ids,
-            run_tokens,
-            stream,
-            slice_output,
-            config_tokens=config_tokens,
-        )
+        return self._run_joint(x_q, scales, wts, topk_ids, run_tokens, stream, slice_output)
 
     forward_bf16 = forward
     __call__ = forward
@@ -904,7 +853,6 @@ class MegaMoEV2:
             BK=stage2.block_k,
             use_nt=stage2.use_nt,
             g2_bhoist=stage2.b_hoist,
-            g2_b2stage=getattr(stage2, "b2stage", True),
             g2_ascale_pf=stage2.ascale_prefetch,
             g2_spart=stage2.spatial_partition,
             persist=stage2.persist,
@@ -912,7 +860,6 @@ class MegaMoEV2:
             persist_strided=stage2.persist_strided,
             skew_cu=stage2.skew_cu,
             g2_bf16_lds=stage2.bf16_lds,
-            g2_deep_a_pipeline=getattr(stage2, "deep_a_pipeline", False),
             runtime_pair_skip=runtime_pair_skip,
             scatter_vec=scatter_vec,
             **self._g2_invariants_by_quant[config.p2p_quant],
@@ -974,8 +921,6 @@ class MegaMoEV2:
             cu_num=stage2.pair_cu,
             g2_bhoist=stage2.b_hoist,
             g2_ascale_pf=stage2.ascale_prefetch,
-            g2_b2stage=getattr(stage2, "b2stage", True),
-            g2_deep_a_pipeline=getattr(stage2, "deep_a_pipeline", False),
             a_dtype=str(invariants["a_dtype"]),
         )
 

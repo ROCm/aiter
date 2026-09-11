@@ -34,6 +34,9 @@ from .mega_moe_config import (
     fixed_stage1_epoch_slot,
 )
 
+_SC0_CACHE = 1
+_BUFFER_OFFSET_ABI_BYTES = 1 << 32
+
 
 class _Stage1KernelSpec:
     __slots__ = ("block_x", "grid_x", "kernel", "waves_per_eu_hint")
@@ -47,10 +50,6 @@ class _Stage1KernelSpec:
 
 def ceildiv(a, b):
     return (a + b - 1) // b
-
-
-_SC0_CACHE = 1
-_BUFFER_OFFSET_ABI_BYTES = 1 << 32
 
 
 def _validate_fixed_slot_geometry(

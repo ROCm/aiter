@@ -461,23 +461,8 @@ def gemm1_kernel(
     swiglu_limit: float = 0.0,
 ):
     # fmt: on
-    """Run standalone MegaMoEV2 group GEMM1 and return ``(out, out_scale)``.
-
-    Args:
-        out: Output tensor
-        x: Input activation tensor
-        w: Weight tensor (must be torch.uint8 dtype)
-        scale_x: Input scale tensor
-        scale_w: Weight scale tensor (must be torch.uint8 dtype)
-        tile_row_base: Tile row base indices
-        expert_ids: Expert ID tensor
-        out_scale: Output scale tensor
-        num_valid: Number of valid tokens
-        stream: CUDA stream
-    """
+    """Run standalone MegaMoEV2 group GEMM1 and return ``(out, out_scale)``."""
     num_valid = int(num_valid)
-    assert w.dtype == torch.uint8, f"w must be torch.uint8, got {w.dtype}"
-    assert scale_w.dtype == torch.uint8, f"scale_w must be torch.uint8, got {scale_w.dtype}"
     if num_valid < 0 or num_valid % int(sort_block_m):
         raise ValueError("num_valid must be a non-negative multiple of sort_block_m")
     if num_valid == 0:
@@ -495,7 +480,8 @@ def gemm1_kernel(
         swiglu_limit=swiglu_limit,
     )
     _run_compiled(
-        launch, out, x, w, scale_x, scale_w, tile_row_base, expert_ids, out_scale,
+        launch, out, x, w.view(torch.uint8), scale_x, scale_w.view(torch.uint8),
+        tile_row_base, expert_ids, out_scale,
         fx.Int32(num_valid), fx.Int32(grid_x), stream,
     )
     return out, out_scale

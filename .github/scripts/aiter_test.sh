@@ -40,7 +40,6 @@ skip_tests=(
     "op_tests/multigpu_tests/test_communication.py"
     "op_tests/multigpu_tests/test_mori_all2all.py"
     "op_tests/multigpu_tests/test_fused_ar_rms.py"
-    "op_tests/multigpu_tests/test_mega_moe_v2.py"
     "op_tests/multigpu_tests/triton_test/test_reduce_scatter_all_gather.py"
     "op_tests/multigpu_tests/triton_test/test_fused_rs_rmsnorm_quant_ag.py"
 )
@@ -106,33 +105,9 @@ for file in "${sharded_files[@]}"; do
                 _ "$file"
             )
             ;;
-        op_tests/multigpu_tests/bench_mega_moe_v2.py)
-            {
-                echo "Running MegaMoEV2 versus Mori EP performance guards on 8 GPUs"
-            } | tee -a latest_test.log
-            test_cmd=(
-                env MORI_SOCKET_IFNAME=lo MORI_SHMEM_HEAP_SIZE=40G
-                timeout 60m
-                bash -c '
-                    set -euo pipefail
-                    bench=$1
-                    for spec in \
-                        "512 uniform 0.6" \
-                        "512 rank-mixed-skew 1.0" \
-                        "8192 uniform 0.6" \
-                        "8192 rank-mixed-skew 1.0"; do
-                        read -r tokens route bias <<< "$spec"
-                        torchrun --standalone --nproc_per_node=8 "$bench" \
-                            --tokens "$tokens" --mtpr 8192 --route "$route" \
-                            --hot-bias "$bias" --iters 20 --perf-guard
-                    done
-                '
-                _ "$file"
-            )
-            ;;
         op_tests/multigpu_tests/test_mega_moe_v2.py)
             {
-                echo "Running MegaMoEV2 v4_pro fixed-slot and compact coverage on 8 GPUs"
+                echo "Running MegaMoEV2 A8W4 and A4W4 coverage on 8 GPUs"
             } | tee -a latest_test.log
             test_cmd=(
                 env MORI_SHMEM_HEAP_SIZE=40G MORI_SOCKET_IFNAME=lo
@@ -140,11 +115,9 @@ for file in "${sharded_files[@]}"; do
                 bash -lc
                 'set -uo pipefail
                 exit_code=0
-                echo "=== Testing a8w4 ==="
                 torchrun --standalone --nproc_per_node=8 "$1" \
                     --network v4_pro --quant a8w4 --bs-list 128,512 \
                     --iters 10 --accuracy-max-bs 512 --rtol 0.10 || exit_code=$?
-                echo "=== Testing a4w4 ==="
                 torchrun --standalone --nproc_per_node=8 "$1" \
                     --network v4_pro --quant a4w4 --bs-list 2,4,16,128,512 \
                     --iters 10 --accuracy-max-bs 512 --rtol 0.25 || exit_code=$?

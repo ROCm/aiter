@@ -3,8 +3,6 @@
 
 """FlyDSL 1x32 MXFP4/MXFP8 quantization with E8M0 scales."""
 
-import functools
-
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 import torch
@@ -12,7 +10,7 @@ from flydsl.expr import const_expr, range_constexpr, rocdl
 from flydsl.expr import math as fmath
 from flydsl.expr.typing import ReductionOp, T
 
-from ..tensor_shim import _run_compiled, buf_copy_atom, ptr_buf_tensor
+from ..tensor_shim import buf_copy_atom, ptr_buf_tensor
 
 BLOCK = 64
 GROUP = 32
@@ -74,7 +72,6 @@ def emit_per_1x32_mx_fp8_group(in_buf, out_buf, scale_buf, group_id):
         )
 
 
-@functools.cache
 def build_per_1x32_mx_quant_module(n: int, quant_mode: str):
     """Return a @flyc.jit launcher for 1x32 MX quant of a [m, n] bf16 matrix."""
     assert n % 32 == 0, f"n={n} must be divisible by 32"
@@ -155,9 +152,16 @@ def build_per_1x32_mx_quant_module(n: int, quant_mode: str):
     return launch
 
 
+_LAUNCHER_CACHE = {}
+
+
 def _get_launcher(n: int, quant_mode: str):
-    """Compatibility entry point used by the MegaMoE AOT builder."""
-    return build_per_1x32_mx_quant_module(n, quant_mode)
+    key = (int(n), quant_mode)
+    launcher = _LAUNCHER_CACHE.get(key)
+    if launcher is None:
+        launcher = build_per_1x32_mx_quant_module(n, quant_mode)
+        _LAUNCHER_CACHE[key] = launcher
+    return launcher
 
 
 def per_1x32_mx_quant(x, quant_mode="fp4", stream=None):
@@ -178,14 +182,9 @@ def per_1x32_mx_quant(x, quant_mode="fp4", stream=None):
     fx_stream = fx.Stream(
         stream if stream is not None else torch.cuda.current_stream().cuda_stream
     )
-    _run_compiled(
-        build_per_1x32_mx_quant_module(n, quant_mode),
-        x,
-        y,
-        scale,
-        fx.Int32(m),
-        fx.Int32(grid_blocks),
-        fx_stream,
+    # Store FP4 as bytes and return the payload with aiter's packed FP4 dtype.
+    _get_launcher(n, quant_mode)(
+        x, y, scale, int(m), int(grid_blocks), stream=fx_stream
     )
     if quant_mode == "fp4":
         y = y.view(torch.float4_e2m1fn_x2)
@@ -195,7 +194,6 @@ def per_1x32_mx_quant(x, quant_mode="fp4", stream=None):
 SCALE_SORT_BLOCK = 256
 
 
-@functools.cache
 def build_mxfp4_moe_scale_sort_module(cols: int):
     """Build the sorted E8M0 scale-scatter launcher."""
     assert cols % GROUP == 0, f"cols={cols} must be divisible by {GROUP}"
@@ -274,24 +272,29 @@ def build_mxfp4_moe_scale_sort_module(cols: int):
     return launch
 
 
+_SCALE_SORT_CACHE = {}
+
+
 def mxfp4_moe_scale_sort(
     out_scale, scale, sorted_ids, num_valid, token_num, cols, stream=None
 ):
     """Scatter per-token E8M0 scales into the sorted GEMM1 layout."""
-    launcher = build_mxfp4_moe_scale_sort_module(int(cols))
+    launcher = _SCALE_SORT_CACHE.get(int(cols))
+    if launcher is None:
+        launcher = build_mxfp4_moe_scale_sort_module(int(cols))
+        _SCALE_SORT_CACHE[int(cols)] = launcher
     out_u8 = out_scale.view(torch.uint8)
     scale_u8 = scale.view(torch.uint8)
     grid_tiles = int(out_u8.shape[0]) // 32  # one block per 32-row preshuffle tile
     fx_stream = fx.Stream(
         stream if stream is not None else torch.cuda.current_stream().cuda_stream
     )
-    _run_compiled(
-        launcher,
+    launcher(
         scale_u8,
         sorted_ids,
         num_valid,
         out_u8,
-        fx.Int32(token_num),
-        fx.Int32(grid_tiles),
-        fx_stream,
+        int(token_num),
+        int(grid_tiles),
+        stream=fx_stream,
     )

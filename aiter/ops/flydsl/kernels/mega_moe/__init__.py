@@ -16,7 +16,6 @@ _LAZY = {
     "build_mega_moe_bundle_plan": "mega_moe_config",
     "compile_gemm1": "gemm1",
     "gemm1_kernel": "gemm1",
-    "resolve_mega_moe_config": "mega_moe_config",
     "select_mega_moe_config": "mega_moe_config",
 }
 

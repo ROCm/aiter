@@ -54,9 +54,8 @@ def _setup_dist():
     rank = int(os.environ.get("RANK", "0"))
     world = int(os.environ.get("WORLD_SIZE", "1"))
     local_rank = int(os.environ.get("LOCAL_RANK", rank))
-    device_index = local_rank + int(os.environ.get("AITER_CUDA_DEVICE_OFFSET", "0"))
-    torch.cuda.set_device(device_index)
-    device = torch.device("cuda", device_index)
+    torch.cuda.set_device(local_rank)
+    device = torch.device("cuda", local_rank)
     if not dist.is_initialized():
         dist.init_process_group("cpu:gloo,cuda:nccl", device_id=device)
     import torch._C._distributed_c10d as c10d
@@ -370,14 +369,13 @@ def _run_size(moe, x, weights, ids, ref_weights, args, rank, world, device):
         raise AssertionError(f"bs={tokens} CUDA Graph replay changed the output")
     sbm = int(moe._s1_active_tile_m)
     gemm2_bm = int(moe._g2_active_block_m)
-    grid_mult = int(moe._active_config.stage1.grid_mult)
     p2p_quant = moe._active_config.p2p_quant
     if rank == 0:
         print(
-            f"[MEGA] bs={tokens} relL2={rel_l2:.6f} "
+            f"[MEGA-V2] bs={tokens} relL2={rel_l2:.6f} "
             f"path={'fixed' if moe._s1_fixed_slot else 'compact'} "
             f"graph_replay=PASS "
-            f"p2p_quant={p2p_quant} SBM={sbm} G2_BM={gemm2_bm} GRID={grid_mult} "
+            f"p2p_quant={p2p_quant} SBM={sbm} G2_BM={gemm2_bm} "
             f"stage1={stage1_ms[0]:.4f}/{stage1_ms[1]:.4f}ms "
             f"stage2={stage2_ms[0]:.4f}/{stage2_ms[1]:.4f}ms "
             f"e2e={e2e_ms[0]:.4f}/{e2e_ms[1]:.4f}ms mean/max",
@@ -385,11 +383,11 @@ def _run_size(moe, x, weights, ids, ref_weights, args, rank, world, device):
         )
 
 
-def _run_burst(moe, x, weights, ids, depth, rank, config_tokens=None):
-    moe(x, weights, ids, config_tokens=config_tokens)
+def _run_burst(moe, x, weights, ids, depth, rank):
+    moe(x, weights, ids)
     _barrier()
     for _ in range(depth):
-        moe(x, weights, ids, config_tokens=config_tokens)
+        moe(x, weights, ids)
     torch.cuda.synchronize()
     if rank == 0:
         print(f"[BURST] completed={depth}/{depth}", flush=True)
@@ -460,7 +458,6 @@ def main():
     parser.add_argument("--force-fanout-boundary", action="store_true")
     parser.add_argument("--inject-invalid-route", action="store_true")
     parser.add_argument("--force-padding-boundary", action="store_true")
-    parser.add_argument("--forward-config-tokens", type=int)
     args = parser.parse_args()
     if (
         sum(
@@ -587,13 +584,7 @@ def main():
             local_ids = ids[:local_batch_size].contiguous()
             if args.burst_depth:
                 _run_burst(
-                    moe,
-                    local_x,
-                    local_weights,
-                    local_ids,
-                    args.burst_depth,
-                    rank,
-                    args.forward_config_tokens,
+                    moe, local_x, local_weights, local_ids, args.burst_depth, rank
                 )
             else:
                 _run_size(
