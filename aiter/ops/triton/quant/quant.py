@@ -267,7 +267,6 @@ def dynamic_mxfp4_quant(
         NUM_STAGES=NUM_STAGES,
         num_warps=NUM_WARPS,
         waves_per_eu=0,
-        num_stages=1,
     )
 
     return (x_fp4, blockscale_e8m0)
@@ -534,7 +533,6 @@ def dynamic_nvfp4_quant(
         NUM_STAGES=NUM_STAGES,
         num_warps=NUM_WARPS,
         waves_per_eu=0,
-        num_stages=1,
     )
 
     return x_fp4, blockscale_e4m3
