@@ -6,6 +6,7 @@ import os
 import re
 import sys
 import tempfile
+from argparse import ArgumentTypeError
 from pathlib import Path
 from typing import Any, ClassVar
 
@@ -78,6 +79,7 @@ from aiter.ops.shuffle import (
 )
 from aiter.utility import fp4_utils
 from aiter.utility.base_tuner import TunerCommon
+from aiter.utility.dtypes import str2ActivationType, str2Dtype
 from aiter.utility.fp4_utils import moe_mxfp4_sort
 from aiter.utility.mp_tuner import mp_tuner
 from csrc.ck_gemm_moe_2stages_codegen.mxfp4_v2_tune_utils import (
@@ -132,6 +134,30 @@ def _is_tune_excluded_kernel(kernel_name) -> bool:
     """True if ``kernel_name`` matches any excluded-kernel pattern."""
     name = str(kernel_name or "")
     return any(pat in name for pat in _TUNE_EXCLUDE_KERNEL_PATTERNS)
+
+
+def _parse_tuning_type(value):
+    if isinstance(value, (torch.dtype, ActivationType, QuantType)):
+        return value
+    if not isinstance(value, str):
+        raise ValueError(f"unsupported tuning type: {value!r}")  # noqa: TRY004
+
+    namespace, separator, name = value.strip().rpartition(".")
+    try:
+        if namespace == "torch" and separator:
+            parsed = getattr(torch, name)
+        elif namespace == "ActivationType" and separator:
+            parsed = str2ActivationType(name)
+        elif (namespace == "QuantType" and separator) or not separator:
+            parsed = str2Dtype(name)
+        else:
+            raise ValueError
+    except (ArgumentTypeError, AttributeError, TypeError, ValueError):
+        raise ValueError(f"unsupported tuning type: {value!r}") from None
+
+    if not isinstance(parsed, (torch.dtype, ActivationType, QuantType)):
+        raise ValueError(f"unsupported tuning type: {value!r}")  # noqa: TRY004
+    return parsed
 
 
 def _a16w_sorted_cos(ref, res, msg="", printLog=True):
@@ -6303,14 +6329,24 @@ class Mxfp4FlydslTuner(FmoeTuner):
         "config_env_name": "AITER_CONFIG_FMOE",
     }
 
+    #: Stage1 XCD swizzles to sweep; worth ~1% once the rows span enough blocks.
+    XCD_SWIZZLES: ClassVar[tuple[int, ...]] = (0, 4)
+
+    #: Key columns holding a torch dtype rather than a plain scalar.
+    DTYPE_KEYS: ClassVar[frozenset[str]] = frozenset(
+        {"dtype", "q_dtype_a", "q_dtype_w"}
+    )
+
     @staticmethod
-    def _g1_kname(bm, use_nt, inline_quant):
-        # flydsl_mxmoe_g1_a4w4_<BM>x256x256[_f16in][_nt]; see mxfp4_kname.py.
+    def _g1_kname(bm, use_nt, inline_quant, xcd=0):
+        # flydsl_mxmoe_g1_a4w4_<BM>x256x256[_f16in][_nt][_xcd<n>]; see mxfp4_kname.py.
         name = f"flydsl_mxmoe_g1_a4w4_{bm}x256x256"
         if inline_quant:
             name += "_f16in"
         if use_nt:
             name += "_nt"
+        if xcd:
+            name += f"_xcd{xcd}"
         return name
 
     @staticmethod
@@ -6354,8 +6390,11 @@ class Mxfp4FlydslTuner(FmoeTuner):
         g2_bms = {v[0] for v in G2}
         cands = []
         for bm in sorted({v[0] for v in G1}):
-            for _, n1, iq1 in sorted(v for v in G1 if v[0] == bm):
-                kn1 = self._g1_kname(bm, n1, iq1)
+            for kn1 in [
+                self._g1_kname(bm, n1, iq1, xcd)
+                for _, n1, iq1 in sorted(v for v in G1 if v[0] == bm)
+                for xcd in self.XCD_SWIZZLES
+            ]:
                 # (A) native mxmoe g2 candidates (flydsl_mxmoe_g2_a4w4_*).
                 if bm in g2_bms:
                     for _, n2, ep in sorted(v for v in G2 if v[0] == bm):
@@ -6416,7 +6455,7 @@ class Mxfp4FlydslTuner(FmoeTuner):
         return data
 
     @staticmethod
-    def _port_e2e(data, kn1, kn2, topk, ne, h, dtype):
+    def _port_e2e(data, kn1, kn2, topk, ne, h, dtype, act="silu"):
         # kn2 may name either gemm2 family (path B or native mxmoe).
         _g2 = parse_g2_kname_any(kn2)
         BM = _g2["BM"]
@@ -6448,6 +6487,10 @@ class Mxfp4FlydslTuner(FmoeTuner):
             kernelName1=kn1,
             m_indices=m_indices,
             moe_buf=moe_buf,
+            act=act,
+            # Betas match run_torch_moe_stage1's defaults; silu compiles them out.
+            situ_beta=DEFAULT_SITUV2_BETA,
+            situ_linear_beta=DEFAULT_SITUV2_LINEAR_BETA,
         )
         return _mxfp4_a4w4_stage2_fw(
             inter_q,
@@ -6502,29 +6545,43 @@ class Mxfp4FlydslTuner(FmoeTuner):
         token, topk = int(row["token"]), int(row["topk"])
         dtype = dtypes.bf16
         kn1, kn2 = candidate["kernelName1"], candidate["kernelName2"]
-        activation = (
-            ActivationType.Swiglu
-            if str(row["act_type"]).endswith("Swiglu")
-            else ActivationType.Silu
-        )
+        act_type = str(row["act_type"])
+        if act_type.endswith("Situv2"):
+            activation = ActivationType.Situv2
+        elif act_type.endswith("Swiglu"):
+            activation = ActivationType.Swiglu
+        else:
+            activation = ActivationType.Silu
+        # mxmoe stage1 emits silu or situv2; anything else tunes as silu.
+        act = "situv2" if activation == ActivationType.Situv2 else "silu"
         data = self._prepare_case(token, h, e, ne, topk, dtype)
-        out = self._port_e2e(data, kn1, kn2, topk, ne, h, dtype)
+        out = self._port_e2e(data, kn1, kn2, topk, ne, h, dtype, act)
         ref = self._torch_ref(data, topk, dtype, activation)
         err = cosine_diff_compare(ref, out, msg=f"port[{kn1}+{kn2}]")
         if err is None or float(err) > args.errRatio:
             raise RuntimeError(f"cosine err_ratio {err} > {args.errRatio}")
         _, us = run_perftest(
-            lambda: self._port_e2e(data, kn1, kn2, topk, ne, h, dtype),
+            lambda: self._port_e2e(data, kn1, kn2, topk, ne, h, dtype, act),
             num_warmup=int(args.warmup),
             num_iters=int(args.iters),
         )
         us = round(float(us), 4)
+        # The pair is timed as one unit, so the fused-MoE estimate in calculate()
+        # is the right roofline for it. Untuned rows keep dtypes as strings, while
+        # calculate() looks bpe up by torch dtype.
+        key = tuple(
+            _parse_tuning_type(row[col]) if col in self.DTYPE_KEYS else row[col]
+            for col in self.keys
+        )
+        tflops, bw = self.calculate((key, "", kn1, candidate["block_m"], us, err))
         candidate.update(
             {
                 "us1": us,
                 "us": us,
-                "err1": round(float(err), 6),
-                "err2": round(float(err), 6),
+                "err1": f"{float(err):.1%}",
+                "err2": f"{float(err):.1%}",
+                "tflops": tflops,
+                "bw": bw,
             }
         )
         return us
