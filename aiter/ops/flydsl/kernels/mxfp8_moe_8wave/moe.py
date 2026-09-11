@@ -34,15 +34,11 @@ def _store_factory(
         for i in range_constexpr(1, 8):
             base = (wave == i).select(fx.Int32(fx.ptrtoint(scratch[i])), base)
         ptr = fx.recast_iter(fx.BFloat16, fx.inttoptr(scratch[0].type, base))
-        width = 4 if transpose else 8
         out = fx.rocdl.make_buffer_tensor(
             C, max_size=False, num_records_bytes=fx.Int64(rows) * cols * 2
         )
-        out = fx.logical_divide(out, fx.make_layout(width, 1))
-        atom = fx.make_copy_atom(
-            fx.rocdl.BufferCopy64b() if transpose else fx.rocdl.BufferCopy128b(),
-            fx.BFloat16,
-        )
+        out = fx.logical_divide(out, fx.make_layout(8, 1))
+        atom = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), fx.BFloat16)
 
         def scratch_at(row, col, width):
             offset = row * tile_n + (col ^ ((row % (tile_n // 8)) * 8))
@@ -81,22 +77,22 @@ def _store_factory(
             if const_expr(activation):
                 base_col = base_col // 2
             if const_expr(transpose):
-                for step in range_constexpr(tile_m * tile_n // (64 * 16)):
-                    linear = lane * 16 + step * 64 * 16
+                for step in range_constexpr(tile_m * tile_n // (64 * 32)):
+                    linear = lane * 32 + step * 64 * 32
                     row, col = linear // (tile_n * 4) * 4, linear // 4 % tile_n
-                    values = fx.make_view(ptr + linear, fx.make_layout(16, 1)).load()
+                    values = fx.make_view(ptr + linear, fx.make_layout(32, 1)).load()
                     for i in range_constexpr(4):
-                        reg = fx.make_rmem_tensor(4, fx.BFloat16)
+                        reg = fx.make_rmem_tensor(8, fx.BFloat16)
                         reg.store(
                             Vec.from_elements(
-                                [values[i + j * 4] for j in range_constexpr(4)],
+                                [values[i + j * 4] for j in range_constexpr(8)],
                                 fx.BFloat16,
                             )
                         )
                         offset = (base_row + row + i) * cols + base_col + col
                         if const_expr(mask_n):
                             offset = (base_col + col < cols).select(offset, rows * cols)
-                        fx.copy(atom, reg, fx.slice(out, (None, offset // 4)))
+                        fx.copy(atom, reg, fx.slice(out, (None, offset // 8)))
             else:
                 for step in range_constexpr(tile_m * tile_n // (64 * 8)):
                     linear = lane * 8 + step * 64 * 8
