@@ -605,9 +605,14 @@ def _gate_all_variants(prefix, block_residual, score_weight, orw, fp8_dtype):
     N, D = prefix.shape
     add = torch.randn_like(prefix)
     add2 = torch.randn_like(prefix)
-    # A row-sliced view: same shape and dtype, but offset off the 16-byte grid.
-    wide = torch.randn(N, D + 1, dtype=prefix.dtype, device=prefix.device)
-    unaligned = wide[:, 1:]
+    # Same shape, dtype and contiguity as prefix, but a storage offset that puts
+    # the base off the 16-byte grid. Contiguity is the point: _fast_reshape2d
+    # copies a non-contiguous input into a fresh -- and therefore aligned --
+    # allocation, which would hand the kernel an aligned pointer again and stop
+    # exercising this axis at all. The assert keeps that from regressing silently.
+    flat = torch.randn(N * D + 1, dtype=prefix.dtype, device=prefix.device)
+    unaligned = flat[1:].view(N, D)
+    assert unaligned.is_contiguous() and unaligned.data_ptr() % 16 != 0
     for kwargs in (
         {},
         {"add_hidden": add},
