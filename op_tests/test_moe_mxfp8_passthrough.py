@@ -18,7 +18,7 @@ noise would also absorb a real defect. There is no quantizer noise to absorb.
 
 Scope, stated so it is not overclaimed: this pins the passthrough against the
 path it replaces. It is not an absolute-correctness test for the a8w4 MoE, which
-op_tests/test_moe_2stage.py and op_tests/flydsl_tests/test_flydsl_moe_a8w4.py
+op_tests/test_moe_2stage.py and op_tests/test_flydsl_grouped_gemm.py
 already cover against a torch reference.
 
 The harness mirrors how SGLang's MoRI dispatch calls this: per_1x32 MXFP4 expert

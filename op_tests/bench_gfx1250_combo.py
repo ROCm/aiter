@@ -298,7 +298,7 @@ def _silence():
 # Import aiter + the op-test modules quietly (import-time banners suppressed).
 with _silence():
     import test_f4gemm as gemm_mod
-    import test_flydsl_grouped_gemm_gfx1250 as moe_mod
+    import test_flydsl_grouped_gemm as moe_mod
     import test_fmha_fwd_with_sink_asm as mha_mod  # has __main__ guard
     import test_mla_v4_kargpreld as mla_v4_kargpreld_mod
     import test_mxfp8fp4gemm as f8gemm_mod
@@ -563,7 +563,7 @@ _MOE_KEEP = [
     "gemm2 GB/s",
     "kernel",
 ]
-# Fixed kernel-bench config (mirrors test_flydsl_grouped_gemm_gfx1250.py --scenario kernel).
+# Fixed kernel-bench config (mirrors test_flydsl_grouped_gemm.py --scenario kernel).
 _MOE_DATA_FORMATS = ["a4w4", "a8w4"]
 _MOE_CONFIG = {
     "experts": 96,
