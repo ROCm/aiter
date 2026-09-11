@@ -1,7 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (C) 2025-2026 FlyDSL Project Contributors
 
-"""gfx1250 page-size-1 FP8 persistent MLA decode stage-1 kernel."""
+"""gfx1250 page-size-1 FP8 persistent MLA decode stage-1 kernel.
+
+One wave always owns 16 Q heads, so the 8 waves of a block split as
+``head_waves * q_wave_slots`` in the M direction and the rest over the PV output
+dim. 16 heads cover max_seqlen_q 1-4; 32, 64 and 128 heads are decode-only
+(max_seqlen_q=1) because more head waves leave no waves for the M-direction
+query slots.
+"""
 
 import math
 
@@ -35,7 +42,7 @@ BLOCK_THREADS = 256
 WAVE_SIZE = 32
 NUM_WAVES = BLOCK_THREADS // WAVE_SIZE
 HEADS_PER_WAVE = 16
-SUPPORTED_NUM_Q_HEADS = (16, 128)
+SUPPORTED_NUM_Q_HEADS = (16, 32, 64, 128)
 QK_NOPE_HEAD_DIM = 512
 QK_ROPE_HEAD_DIM = 64
 QK_HEAD_DIM = QK_NOPE_HEAD_DIM + QK_ROPE_HEAD_DIM
@@ -112,21 +119,23 @@ def launch_mla_pagesize1_fp8_fp8(
             f"num_q_heads: expected one of {list(SUPPORTED_NUM_Q_HEADS)}, "
             f"got {num_q_heads}"
         )
-    if num_q_heads == 128 and max_seqlen_q != 1:
+    if num_q_heads != HEADS_PER_WAVE and max_seqlen_q != 1:
         raise ValueError(
-            "num_q_heads=128 only supports max_seqlen_q=1, " f"got {max_seqlen_q}"
+            f"num_q_heads={num_q_heads} only supports max_seqlen_q=1, "
+            f"got {max_seqlen_q}"
         )
-    # 每个wave固定处理 head 16维度
     head_waves = num_q_heads // HEADS_PER_WAVE
-
     q_wave_slots = 1 if max_seqlen_q == 1 else 2 if max_seqlen_q == 2 else 4
-    # m方向的wave数
     m_waves = head_waves * q_wave_slots
-    # v dim方向的wave数
+    if NUM_WAVES % m_waves != 0 or PV_D_TILES % (NUM_WAVES // m_waves) != 0:
+        raise ValueError(
+            f"num_q_heads={num_q_heads} with max_seqlen_q={max_seqlen_q} needs "
+            f"{m_waves} m-waves, which does not tile {NUM_WAVES} waves x "
+            f"{PV_D_TILES} output tiles"
+        )
     dv_waves = NUM_WAVES // m_waves
 
     mask_every_tile = bool(causal) and max_seqlen_q > 1
-    # 512 / dv_waves = 每个v dim方向的wave处理多少个d tile
     pv_d_tiles_per_wave = PV_D_TILES // dv_waves
     pv_load_depth = min(PV_LOAD_DEPTH, pv_d_tiles_per_wave)
     q_row_stride = num_q_heads * Q_HEAD_STRIDE
@@ -851,10 +860,6 @@ def launch_mla_pagesize1_fp8_fp8(
                     global_view,
                 )
 
-            # Computed out here rather than under the guards below: the store is
-            # the only thing that may differ between the two destinations, and a
-            # branch that assigns would make the rewriter thread this loop's
-            # variables through a closure frame that cannot see them.
             lse_value = has_mass.select(
                 running_max + fmath.log(running_sum),
                 fx.Float32(float("-inf")),

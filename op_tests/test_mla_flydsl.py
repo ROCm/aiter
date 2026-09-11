@@ -37,7 +37,7 @@ torch.set_default_device("cuda")
 
 SUPPORTED_GFX = ["gfx1250"]
 SUPPORTED_PAGE_SIZES = (1, 64)
-SUPPORTED_PS1_NUM_Q_HEADS = (16, 128)
+SUPPORTED_PS1_NUM_Q_HEADS = (16, 32, 64, 128)
 
 NUM_Q_HEADS = 128
 QK_NOPE_HEAD_DIM = 512
@@ -86,8 +86,10 @@ def _build_case_ps1(batch, ctx_len, num_q_heads, q_seq_len):
             f"unsupported page-size-1 num_q_heads={num_q_heads}; "
             f"expected one of {SUPPORTED_PS1_NUM_Q_HEADS}"
         )
-    if num_q_heads == 128 and q_seq_len != 1:
-        raise ValueError("page-size-1 128-head case only supports q_seq_len=1")
+    if num_q_heads != 16 and q_seq_len != 1:
+        raise ValueError(
+            f"page-size-1 {num_q_heads}-head case only supports q_seq_len=1"
+        )
 
     torch.manual_seed(_SEED + batch * 1009 + ctx_len * 17 + q_seq_len * 101)
     device = torch.device("cuda")
@@ -620,9 +622,10 @@ def main():
         "--num-heads",
         type=int,
         nargs="*",
-        default=[16, 128],
+        default=[16, 32, 64, 128],
         choices=SUPPORTED_PS1_NUM_Q_HEADS,
-        help="Q head counts for page_size=1. page_size=64 supports only 128.",
+        help="Q head counts for page_size=1. Only 16 heads run q_seq>1;\n"
+        "page_size=64 supports only 128.",
     )
     parser.add_argument(
         "--q-seq-len",

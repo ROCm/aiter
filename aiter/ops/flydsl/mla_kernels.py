@@ -15,7 +15,7 @@ __all__ = [
     "flydsl_mla_pagesize64_fp8_fp8",
 ]
 
-_PAGESIZE1_NUM_Q_HEADS = (16, 128)
+_PAGESIZE1_NUM_Q_HEADS = (16, 32, 64, 128)
 
 
 def _require(condition, message):
@@ -79,7 +79,7 @@ def _validate_pagesize1_inputs(
     )
     _require(
         num_q_heads == 16 or max_seqlen_q == 1,
-        "q: 128 heads only support max_seqlen_q=1",
+        f"q: {num_q_heads} heads only support max_seqlen_q=1",
     )
     _require_layout("q", q, torch.float8_e4m3fn, (total_q, num_q_heads, 576))
     _require_layout("kv_buffer", kv_buffer, torch.float8_e4m3fn, (None, 1, 1, 576))

@@ -756,7 +756,7 @@ def mla_decode_fwd(
             and page_size == 1
             and q.dtype == dtypes.fp8
             and kv_buffer.dtype == dtypes.fp8
-            and nhead in (16, 128)
+            and nhead in (16, 32, 64, 128)
             and (nhead == 16 or max_seqlen_q == 1)
             and cp_world_size == 1
             and not intra_batch_mode
