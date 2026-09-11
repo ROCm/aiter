@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
-
+import flydsl.compiler as flyc
 import flydsl.expr as fx
 import torch
 from flydsl.runtime.device import get_rocm_arch
