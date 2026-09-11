@@ -387,7 +387,9 @@ def compile_one_config(**job):
         f"{job['kernel_name']} NE={job['NE']} D_INTER={job['D_INTER']} BM={job['BM']}"
     )
     if job.get("v2_stage2"):
-        shape_str += f" out_dtype={job['out_dtype']}"
+        # N_OUT is already in _job_key; print it so AOT logs show per-model_dim
+        # compiles that share a CSV kernelName2.
+        shape_str += f" N_OUT={job['N_OUT']} out_dtype={job['out_dtype']}"
     result = {"kernel_name": job["kernel_name"], "stage": stage, "compile_time": None}
 
     t0 = time.time()

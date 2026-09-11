@@ -117,6 +117,8 @@ def compile_gemm2_a4w4_port(
         raise ValueError("a custom reduce-store cache policy requires a composition")
     use_reduce = epilog == "reduce"
     use_scatter = epilog == "scatter"
+    if use_scatter and BM != 128:
+        raise AssertionError(f"epilog='scatter' supports only BM=128 (got BM={BM})")
     out_dtype = str(out_dtype).strip().lower()
     if out_dtype not in ("bf16", "fp8"):
         raise AssertionError(f"out_dtype must be 'bf16' or 'fp8', got {out_dtype!r}")
@@ -219,10 +221,8 @@ def compile_gemm2_a4w4_port(
     # be removed later and persist will then select persist-flat.
     persist_flat = epilog == "scatter"
     persist = bool(persist or persist_flat)
-    # Extra composition tags stay empty on the default fused_moe / scatter path.
-    shared_scale_tag = (
-        "_shared_scale" if (_composition is not None and BM < 32 and SBM != BM) else ""
-    )
+    # BM16 tiles that share an SBM>BM sort block read one 32-row e8m0 word.
+    shared_scale_tag = "_shared_scale" if BM < 32 and SBM != BM else ""
     if persist and cu_num <= 0:
         raise AssertionError(f"persist=True requires cu_num>0, got {cu_num}")
     if persist and is_f8 and not persist_flat:

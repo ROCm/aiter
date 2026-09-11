@@ -197,12 +197,12 @@ def gemm2_body_v2(
 
     asc_per_mb = fx.Int32(kScaleSubBlocks) * kAS_per_chunk_dw * fx.Int32(4)
     asc_num = fx.Int64(i32_max_m_blocks) * fx.Int64(asc_per_mb)
-    if const_expr(len(resolved_input_rows) > 0):
-        scale_chunk0 = (
-            m_block_idx if const_expr(is_bm16 and SBM == BM) else m_row // fx.Int32(32)
-        )
-    else:
-        scale_chunk0 = m_block_idx if const_expr(is_bm16) else m_row // 32
+    # A-scale is one e8m0 word per 32-row chunk. BM16 + SBM==BM owns its own
+    # chunk (chunk == m_block_idx). BM16 + SBM>BM shares the sort-block word
+    # (chunk == m_row//32) and nibble-shifts the odd 16-row.
+    scale_chunk0 = (
+        m_block_idx if const_expr(is_bm16 and SBM == BM) else m_row // fx.Int32(32)
+    )
 
     def make_ascale_view(sub):
         base_dw = (scale_chunk0 + fx.Int32(sub)) * kAS_per_chunk_dw
@@ -232,7 +232,7 @@ def gemm2_body_v2(
             lane_mod_16,
             tilesPerScaleChunk,
         )
-        if const_expr(len(resolved_input_rows) > 0 and is_bm16 and SBM != BM):
+        if const_expr(is_bm16 and SBM != BM):
             scale_shift = ((m_row // 16) & fx.Int32(1)) * fx.Int32(8)
             shifted = []
             for s in out:
