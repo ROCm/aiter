@@ -24,6 +24,7 @@ _SMI_CALL_LABEL = ContextVar("aiter_smi_call_label", default=None)
 # pd.set_option("display.max_colwidth", None)
 # pd.set_option("display.expand_frame_repr", False)
 
+
 def _smi_label_value(value):
     """Return a compact, stable label value, or None for opaque arguments."""
     if isinstance(value, torch.Tensor):
