@@ -163,6 +163,7 @@ def _normalize_launch_stream(
         raise ValueError(f"`stream` must be on {device}, got {launch_stream.device}")
     return launch_stream
 
+
 def _validate_hgemm_bias(
     a: torch.Tensor,
     bias: torch.Tensor | None,
