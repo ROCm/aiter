@@ -248,7 +248,7 @@ def test_flydsl_stage2_a8w4_gui(inter_dim, seed):
 )
 @_SKIP_GFX950_FLYDSL
 def test_flydsl_v2_stage2_a8w4_full_tile(block_m, inter_dim, tile_k):
-    from aiter.ops.flydsl.kernels.mxmoe_g2 import mxfp4_moe_gemm2
+    from aiter.ops.flydsl.kernels.mxfpmoe import mxfp4_moe_gemm2
 
     torch.manual_seed(123)
     torch.cuda.manual_seed(123)

@@ -4,7 +4,7 @@
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 
-from ....mxmoe_g2 import compile_gemm2_a4w4_port
+from ....mxfpmoe import compile_gemm2_a4w4_port
 from .config import MegakernelConfig, WindowConfig
 
 _ROUTE_STORE_CACHE_MODIFIER = 0x10  # sc1
