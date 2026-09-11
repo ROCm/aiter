@@ -13,6 +13,14 @@ and reported as three rows, keyed by the `layer` column:
 over and over, so its weights stay cache-resident in a way the real layer does
 not. Compare like with like.
 
+--multi-gpu adds a fourth, `combine`, and changes where moe2's rows go: into
+mori's real combine staging window on the peer ranks, through the fused
+EP_SCATTER epilogue production compiles, instead of a local output buffer. It
+needs --ep > 1, that many GPUs, one --M, and torchrun --nproc-per-node=--ep.
+The DISPATCH is not simulated -- each rank keeps its own rows and fabricates the
+recv layout a dispatch would have produced -- so what it adds over plain --ep is
+the peer-memory write traffic and the cross-device barrier, not the all-to-all.
+
 --layers picks which of those are measured, e.g. `--layers moe1 moe2` to skip
 the back-to-back run, or `--layers moe1` for one projection on its own. The
 setup is unchanged either way (moe2 needs moe1's output to quantize, so layer 1
@@ -52,8 +60,10 @@ preshuffle.
 import argparse
 import csv
 import inspect
+import os
 from itertools import chain
 from pathlib import Path
+from types import SimpleNamespace
 
 import torch
 import triton
@@ -76,8 +86,10 @@ from aiter.ops.triton.moe.quant_moe import downcast_to_mxfp
 from aiter.ops.triton.utils._triton.arch_info import get_arch
 from aiter.ops.triton.utils.shuffle import moe_weight_decode_view, shuffle_scale_moe
 
-# measurable layers, in report order; see the module docstring
+# measurable layers, in report order; see the module docstring. "combine" only
+# exists under --multi-gpu, where there is a real mori combine to measure.
 LAYERS = ("moe1", "moe2", "total")
+MG_LAYERS = ("moe1", "moe2", "combine", "total")
 
 
 def compute_roofline(
@@ -103,11 +115,28 @@ def compute_roofline(
         args_list.insert(pos_index, val)
         return bench_fn(*args_list, **kwargs)
 
+    # Under --multi-gpu every rank shares one stdout, so nothing is printed
+    # where it is produced: each line is gathered and rank 0 emits the whole set
+    # in rank order, as ONE write. Printing per rank interleaves mid-line -- the
+    # banner alone was three writes -- and no amount of flushing fixes that.
+    mori = kwargs.get("mori")
+
+    def emit(line):
+        if mori is None:
+            print(line, flush=True)
+            return
+        lines = [None] * mori.world
+        mori.dist.all_gather_object(lines, line, group=mori.group)
+        if mori.rank == 0:
+            print(
+                "\n".join(f"[rank {r}] {ln}" for r, ln in enumerate(lines)),
+                flush=True,
+            )
+
     # collect performance data
     perfs = []
-    print("=========================================")
-    print(f"{out_path}...")
-    print("=========================================")
+    bar = "=" * 41
+    emit(f"{bar}\n{out_path}...\n{bar}" if mori is None else f"{out_path}")
 
     for val in intensity_proxy_values:
         perf = inject_proxy_and_call(val, args, kwargs)
@@ -121,7 +150,7 @@ def compute_roofline(
             f"{lp['bytes'] / lp['latency_ms'] * 1e-9:#.4g} TB/s"
             for name, lp in perf["layers"].items()
         )
-        print(
+        emit(
             f"{intensity_proxy_name}: {val:5d} | {groups} | "
             f"{perf['kernel']} block_m={perf['block_m']} "
             f"routed_experts={perf['routed_experts']}"
@@ -273,7 +302,7 @@ def pin_routed_experts(logits, n_routed, n_expts_act, balance=False):
     return masked, n_pinned, pool
 
 
-def ep_routing(logits, n_expts_act, n_expts_local):
+def ep_routing(logits, n_expts_act, n_expts_local, rank=0, ep_scatter_geometry=None):
     """
     Routing for ONE rank of an expert-parallel layer, from GLOBAL logits.
     """
@@ -292,7 +321,8 @@ def ep_routing(logits, n_expts_act, n_expts_local):
     # reads the global count back as `numel() - 1`, which is the convention ATOM
     # passes it.
     expert_map = torch.full((n_expts_tot + 1,), -1, dtype=torch.int32, device=dev)
-    expert_map[:n_expts_local] = torch.arange(
+    lo = rank * n_expts_local
+    expert_map[lo : lo + n_expts_local] = torch.arange(
         n_expts_local, dtype=torch.int32, device=dev
     )
 
@@ -306,7 +336,7 @@ def ep_routing(logits, n_expts_act, n_expts_local):
     # tensor, which is the form ep_sort_routing's row mask expects.
     num_local_tokens = torch.tensor([batch], dtype=torch.int32, device=dev)
 
-    hist_full, topk_indx, gate_indx, gate_scal, gate_valid, _ = ep_sort_routing(
+    hist_full, topk_indx, gate_indx, gate_scal, gate_valid, dst_row = ep_sort_routing(
         dispatch_weights,
         dispatch_ids,
         expert_map,
@@ -316,12 +346,119 @@ def ep_routing(logits, n_expts_act, n_expts_local):
         n_expts_act,
         n_gates,
         expt_data_bufs,
+        ep_scatter_geometry=ep_scatter_geometry,
     )
     # the tail bin holds the sentinel (non-local) count, which gets no tile
     hist = hist_full[:n_expts_local]
     expt_data = ExptData(hist, token_offs_raw, token_offs_pad, block_pid_map)
     rdata = RoutingData(block_m, gate_scal, hist, n_expts_local, n_expts_act, expt_data)
-    return rdata, topk_indx, gate_indx, gate_valid
+    return rdata, topk_indx, gate_indx, gate_valid, dst_row
+
+
+# ---------------------------------------------------------------------------
+# --multi-gpu: GEMM2 delivering into mori's real combine staging window
+# ---------------------------------------------------------------------------
+def init_mori_combine(rank, world, group, hidden, mtpr, inter, experts, topk):
+    """
+    The least mori that gives GEMM2 a real place to scatter to.
+    """
+    import torch.distributed as dist
+    from mori.cco import Communicator
+
+    from aiter import ActivationType, QuantType
+    from aiter.ops.flydsl.kernels.mega_moe_gfx1250 import MegaMoEGfx1250
+    from aiter.ops.flydsl.kernels.mega_moe_gfx1250.types import _from_gpu_ptr
+    from aiter.ops.flydsl.moe_common import GateMode
+
+    # ATOM's _cco_per_rank_vmm: every rank could send all its tokens to one peer
+    # (world * mtpr recv slots), times 2x headroom for tokens + combine buffers.
+    tok_bytes = mtpr * hidden * 2  # bf16 wire
+    win_bytes = world * tok_bytes * 2 + (1 << 24)
+    per_rank_vmm = 2 * win_bytes + (1 << 28)
+
+    # collective: rank 0 mints the id, everyone joins the same cco fabric
+    uid = Communicator.get_unique_id() if rank == 0 else None
+    objs = [uid]
+    dist.broadcast_object_list(objs, src=0, group=group)
+    comm = Communicator.init(world, rank, objs[0], per_rank_vmm=per_rank_vmm)
+    comm.barrier()
+
+    mega = MegaMoEGfx1250(
+        communicator=comm,
+        rank=rank,
+        world_size=world,
+        model_dim=hidden,
+        inter_dim=inter,
+        experts=experts,
+        topk=topk,
+        max_tokens_per_rank=mtpr,
+        activation=ActivationType.Silu,
+        gate_mode=GateMode.INTERLEAVE.value,
+        quant_type=QuantType.per_1x32,
+        swiglu_limit=10.0,
+    )
+    # Read once here, where every rank is aligned and a barrier follows:
+    # create_dev_comm() may be COLLECTIVE, so it cannot be done lazily from a
+    # per-rank branch. Same contract ATOM's init_mega_transport honours.
+    per_rank_size = int(comm.create_dev_comm().per_rank_size)
+    comm.barrier()
+
+    cfg = mega._config
+    slot_stride = cfg.combine_slot_stride_bytes
+    assert per_rank_size % slot_stride == 0, (
+        f"per_rank_size={per_rank_size} is not a multiple of the combine slot "
+        f"stride {slot_stride}; one row index cannot address both peer and slot"
+    )
+    peer_rows = per_rank_size // slot_stride
+    # local_ptr is this rank's alias of comb_inp; step back to peer 0's. Sized to
+    # end at the LAST peer's last slot, not a round world*peer_rows, whose tail
+    # would run past the flat space.
+    base = mega._arena.local_ptr("comb_inp") - cfg.rank * per_rank_size
+    rows = (cfg.world_size - 1) * peer_rows + cfg.max_tokens_per_rank * cfg.topk
+    stride_elems = slot_stride // 2  # bf16 wire
+    view = _from_gpu_ptr(base, (rows * stride_elems,), torch.bfloat16).as_strided(
+        (rows, cfg.hidden_dim), (stride_elems, 1)
+    )
+    return mega, view, peer_rows
+
+
+def mori_src_token_map(batch, world, dev):
+    return torch.arange(batch, dtype=torch.int32, device=dev)
+
+
+def do_bench_cudagraph_synced(fn, rep, group):
+    import torch.distributed as dist
+
+    with torch.cuda.stream(torch.cuda.Stream()):
+        fn()  # warmup
+        start, end = (torch.cuda.Event(enable_timing=True) for _ in range(2))
+        start.record()
+        for _ in range(5):
+            fn()
+        end.record()
+        torch.cuda.synchronize()
+        estimate_ms = start.elapsed_time(end) / 5
+
+        agreed = torch.tensor([estimate_ms], dtype=torch.float64)
+        dist.all_reduce(agreed, op=dist.ReduceOp.MAX, group=group)
+        estimate_ms = float(agreed[0])
+        n_repeat = 1000 if estimate_ms == 0 else max(1, int(rep / estimate_ms))
+
+        g = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(g):
+            for _ in range(n_repeat):
+                fn()
+        torch.cuda.synchronize()
+
+        times = []
+        for _ in range(10):
+            start, end = (torch.cuda.Event(enable_timing=True) for _ in range(2))
+            start.record()
+            g.replay()
+            end.record()
+            torch.cuda.synchronize()
+            times.append(start.elapsed_time(end) / n_repeat)
+    return sum(times) / len(times)
 
 
 def backend_name(backend=None):
@@ -356,9 +493,11 @@ def bench_mlp_single_weight_init(
     balance=False,
     fused_quant=False,
     ep=1,
+    mori=None,
 ):
-    rank = 0
-    dev = f"cuda:{rank}"
+    # mori is the --multi-gpu bundle from init_mori_combine (None = single rank)
+    rank = 0 if mori is None else mori.rank
+    dev = f"cuda:{torch.cuda.current_device()}"
 
     assert dim2 % TP == 0, f"{dim2=}, {TP=}, dim2 must be divisible by TP"
     # --experts TOTAL is the global count; this process holds one rank's shard.
@@ -368,6 +507,14 @@ def bench_mlp_single_weight_init(
         "equal shards"
     )
     n_expts_local = n_expts_tot // ep
+    if mori is not None:
+        assert (
+            ep == mori.world
+        ), f"--multi-gpu needs --ep == world size, {ep} != {mori.world}"
+        assert batch == mori.batch, (
+            "--multi-gpu sizes the symmetric arena from a single --M; got "
+            f"{batch} against the {mori.batch} it was built for"
+        )
     assert x_dtype == "mx4", f"FP4 (E2M1) is disabled for x_dtype, got {x_dtype}"
     assert w_dtype == "mx4", f"FP4 (E2M1) is disabled for x_dtype, got {w_dtype}"
     if preshuffle:
@@ -400,9 +547,16 @@ def bench_mlp_single_weight_init(
             "undoes; unset AITER_TRITON_USE_HERD"
         )
     assert layers, "at least one layer must be selected"
-    assert set(layers) <= set(LAYERS), f"unknown layer(s) in {layers=}"
+    _known = MG_LAYERS if mori is not None else LAYERS
+    assert set(layers) <= set(_known), f"unknown layer(s) in {layers=}"
 
     # -- init data --
+    if mori is not None:
+        # Every rank must agree on which rank owns each gate, or the staging
+        # window gets slots written twice and slots never written. Same seed ->
+        # same logits -> same routing; the ranks then differ only in which
+        # 1/ep slice of the experts they hold. See mori_src_token_map.
+        torch.manual_seed(0)
     # The router scores every GLOBAL expert (that is what picks the tile
     # geometry), but the expert weights are only this rank's shard.
     wg = torch.randn((dim1, n_expts_tot), device=dev)
@@ -434,12 +588,34 @@ def bench_mlp_single_weight_init(
             logits, routed_experts, n_expts_act, balance=balance
         )
     gate_valid = None
+    ep_scatter = None
     if ep == 1:
         rdata, gather_indx, scatter_indx = routing(logits, n_expts_act)
     else:
-        rdata, gather_indx, scatter_indx, gate_valid = ep_routing(
-            logits, n_expts_act, n_expts_local
+        geometry = None
+        if mori is not None:
+            from aiter.ops.triton.moe.moe_routing.routing import EpScatterGeometry
+
+            geometry = EpScatterGeometry(
+                src_token_map=mori_src_token_map(batch, mori.world, dev),
+                max_tokens_per_rank=batch // mori.world,
+                peer_rows=mori.peer_rows,
+            )
+        rdata, gather_indx, scatter_indx, gate_valid, dst_row = ep_routing(
+            logits,
+            n_expts_act,
+            n_expts_local,
+            rank=rank,
+            ep_scatter_geometry=geometry,
         )
+        if mori is not None:
+            from aiter.ops.triton.moe.reduce import EpCombineScatter
+
+            # GEMM2 stops reducing locally and places its un-reduced rows into
+            # the window instead -- straight from the epilogue (EP_SCATTER_1),
+            # which is what production compiles and what a local output buffer
+            # cannot show.
+            ep_scatter = EpCombineScatter(out=mori.view, dst_row=dst_row)
     x1, x1_scale = mxfp4_quant(x)
 
     def layer1():
@@ -481,17 +657,35 @@ def bench_mlp_single_weight_init(
             # under EP most gate slots belong to other ranks and no GEMM here
             # ever writes them; None (every gate live) is right for --ep 1
             gate_valid=gate_valid,
+            ep_scatter=ep_scatter,
             swizzle_mx_scale=swizzle_mx_scale2,
             preshuffle_weights=preshuffle,
             backend=backend,
         )
 
     y2 = layer2()
+
+    if mori is None:
+        combine = None
+    else:
+        from aiter.ops.flydsl.kernels.mega_moe_gfx1250.mega_moe import Routing
+
+        mega_routing = Routing(
+            token_count=batch // mori.world,
+            reverse_source_view=mori_src_token_map(batch, mori.world, dev),
+        )
+
+        def combine():
+            return mori.mega._combine(mega_routing)
+
+        combine()
     torch.cuda.synchronize()
 
     def both():
         layer1()
         layer2()
+        if combine is not None:
+            combine()
 
     # -- analytic FLOPs / bytes, matching run_moe_a4w4.py and the proton metadata
     # the kernel itself reports: 2*M*N*K per GEMM, and activations + routed-expert
@@ -533,20 +727,31 @@ def bench_mlp_single_weight_init(
     # keeping only what `layers` asked for (in LAYERS order, not argv order).
     # `total` is NOT moe1 + moe2 -- an isolated projection replays one kernel
     # over and over, so its weights stay hotter than they are in the real layer.
+    # insertion order is report order, so keep it in MG_LAYERS order
     to_bench = {
         "moe1": (layer1, moe1_flops, moe1_bytes),
         "moe2": (layer2, moe2_flops, moe2_bytes),
-        "total": (both, moe1_flops + moe2_flops, moe1_bytes + moe2_bytes),
     }
-    measured = {
-        name: {
-            "latency_ms": triton.testing.do_bench_cudagraph(f, rep=rep),
-            "flops": flops,
-            "bytes": byts,
-        }
-        for name, (f, flops, byts) in to_bench.items()
-        if name in layers
-    }
+    if combine is not None:
+        # no matmul in it; the traffic is topk staged slots in, one row out
+        mtpr = batch // mori.world
+        to_bench["combine"] = (combine, 0, mtpr * (n_expts_act + 1) * dim1 * 2)
+    to_bench["total"] = (both, moe1_flops + moe2_flops, moe1_bytes + moe2_bytes)
+
+    measured = {}
+    for name, (f, flops, byts) in to_bench.items():
+        if name not in layers:
+            continue
+        if mori is None:
+            latency_ms = triton.testing.do_bench_cudagraph(f, rep=rep)
+        else:
+            # Line the ranks up first: anything holding a cross-device barrier
+            # otherwise charges its peers' skew to whoever arrives early, and
+            # that lands in the warmup estimate that sets the replay count.
+            torch.cuda.synchronize()
+            mori.dist.barrier(group=mori.group)
+            latency_ms = do_bench_cudagraph_synced(f, rep, mori.group)
+        measured[name] = {"latency_ms": latency_ms, "flops": flops, "bytes": byts}
 
     return {
         "layers": measured,
@@ -574,6 +779,7 @@ def bench_mlp(
     balance=False,
     fused_quant=False,
     ep=1,
+    mori=None,
 ):
     all_results = []
     for i in range(num_weight_inits):
@@ -594,6 +800,7 @@ def bench_mlp(
             balance=balance,
             fused_quant=fused_quant,
             ep=ep,
+            mori=mori,
         )
         all_results.append(result)
 
@@ -633,6 +840,7 @@ def roofline_mlp(
     balance=False,
     fused_quant=False,
     ep=1,
+    mori=None,
     name="",
 ):
     # Put all outputs under logs/<name>/ and write a CSV file (not a directory-as-stem).
@@ -653,10 +861,14 @@ def roofline_mlp(
         stem += "-fusedquant"
     if ep > 1:
         stem += f"-ep{ep}"
+    if mori is not None:
+        # one file per rank: the ranks share a filesystem and their numbers
+        # differ (barrier skew is real signal, not noise to average away)
+        stem += f"-mori-rank{mori.rank}of{mori.world}"
     stem += f"-{backend_name(backend)}"
     if preshuffle:
         stem += "-preshuffled"
-    if tuple(layers) != LAYERS:
+    if tuple(layers) != (MG_LAYERS if mori is not None else LAYERS):
         # a partial run holds a subset of the rows, so give it its own file
         stem += "-layers=" + "+".join(layers)
     out_csv = out_dir / f"{stem}.csv"
@@ -678,6 +890,7 @@ def roofline_mlp(
         balance=balance,  # forwarded to bench_mlp via compute_roofline's **kwargs
         fused_quant=fused_quant,
         ep=ep,
+        mori=mori,
         bench_fn=bench_mlp,  # function to benchmark
         intensity_proxy_name="batch",  # intensity proxy name
         intensity_proxy_values=batch_sizes,  # intensity proxy values to sweep
@@ -783,14 +996,29 @@ def parse_args(args: list[str] | None = None):
         "i.e. random routing over all experts.",
     )
     parser.add_argument(
+        "--multi-gpu",
+        action="store_true",
+        default=False,
+        help="Have GEMM2 deliver its rows into mori's real combine staging "
+        "window -- PEER memory on the other EP ranks, through the fused "
+        "EP_SCATTER epilogue production compiles -- instead of a local output "
+        "buffer, and measure the mori combine that drains it as an extra "
+        "'combine' row. Needs --ep > 1, at least --ep visible GPUs, exactly one "
+        "--M, and torchrun with --nproc-per-node equal to --ep. Only GEMM2 and "
+        "the combine change; moe1 is untouched. The dispatch is NOT simulated: "
+        "each rank keeps its own rows and fabricates the recv layout a dispatch "
+        "would have produced, so what this adds over plain --ep is the peer-"
+        "memory write traffic and the cross-device barrier, not the all-to-all.",
+    )
+    parser.add_argument(
         "--layers",
         nargs="+",
-        choices=LAYERS,
-        default=list(LAYERS),
+        choices=MG_LAYERS,
+        default=None,
         help="Which layers to measure: moe1 (up projection), moe2 (down "
         "projection), total (both back to back). E.g. '--layers moe1 moe2' to "
         "skip the back-to-back run, or '--layers moe1' for one projection "
-        "alone. Default: all three.",
+        "alone. combine needs --multi-gpu. Default: all of them.",
     )
     parser.add_argument(
         "--rep",
@@ -829,6 +1057,62 @@ def main(args: list[str] | None = None) -> None:
         batch_sizes_moe = parsed_args.M
     quantized_dtypes = ["mx4", "mx4"]
 
+    all_layers = MG_LAYERS if parsed_args.multi_gpu else LAYERS
+    layers = parsed_args.layers if parsed_args.layers is not None else list(all_layers)
+    bad = set(layers) - set(all_layers)
+    assert not bad, f"{sorted(bad)} needs --multi-gpu"
+
+    mori = None
+    if parsed_args.multi_gpu:
+        import torch.distributed as dist
+
+        ep = parsed_args.ep
+        assert ep > 1, "--multi-gpu is only meaningful with --ep > 1"
+        assert torch.cuda.device_count() >= ep, (
+            f"--multi-gpu --ep {ep} needs at least {ep} GPUs, this machine has "
+            f"{torch.cuda.device_count()}"
+        )
+        assert len(batch_sizes_moe) == 1, (
+            "--multi-gpu sizes mori's symmetric arena once, so it takes exactly "
+            f"one --M; got {batch_sizes_moe}"
+        )
+        batch = batch_sizes_moe[0]
+        assert batch % ep == 0, (
+            f"--M {batch} must divide by --ep {ep}: a recv buffer holds "
+            "max_tokens_per_rank rows from each of ep peers"
+        )
+        rank = int(os.environ["RANK"])
+        world = int(os.environ["WORLD_SIZE"])
+        assert world == ep, (
+            f"--multi-gpu needs one process per EP rank: WORLD_SIZE={world} "
+            f"against --ep {ep}. Launch with torchrun --nproc-per-node={ep}."
+        )
+        torch.cuda.set_device(int(os.environ.get("LOCAL_RANK", rank)))
+        dist.init_process_group(
+            backend="cpu:gloo,cuda:nccl", rank=rank, world_size=world
+        )
+        group = dist.new_group(backend="gloo")
+        mega, view, peer_rows = init_mori_combine(
+            rank,
+            world,
+            group,
+            hidden=dim1,
+            mtpr=batch // world,
+            inter=dim2 // 2,
+            experts=total_experts,
+            topk=active_experts,
+        )
+        mori = SimpleNamespace(
+            mega=mega,
+            view=view,
+            peer_rows=peer_rows,
+            rank=rank,
+            world=world,
+            group=group,
+            batch=batch,
+            dist=dist,
+        )
+
     roofline_mlp(
         batch_sizes_moe,
         dim1,
@@ -850,12 +1134,18 @@ def main(args: list[str] | None = None) -> None:
         balance=parsed_args.balance,
         fused_quant=parsed_args.fused_quant,
         ep=parsed_args.ep,
+        mori=mori,
         rep=parsed_args.rep,
         # dedupe, keeping the canonical report order rather than argv order
-        layers=tuple(n for n in LAYERS if n in parsed_args.layers),
+        layers=tuple(n for n in all_layers if n in layers),
         num_weight_inits=parsed_args.num_weight_inits,
         name="moe_gemm_a4w4",
     )
+
+    if mori is not None:
+        mori.dist.barrier(group=mori.group)
+        mega.close()
+        mori.dist.destroy_process_group()
 
 
 if __name__ == "__main__":
