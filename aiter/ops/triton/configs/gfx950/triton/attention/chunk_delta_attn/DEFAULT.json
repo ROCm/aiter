@@ -4,5 +4,15 @@
         "BV": 128,
         "num_warps": 8,
         "num_stages": 3
+    },
+    "_flash_kda_segment_kernel_single_seg": {
+        "BW": 16,
+        "num_warps": 2,
+        "num_stages": 2
+    },
+    "_flash_kda_segment_kernel_multi_seg": {
+        "BW": 64,
+        "num_warps": 2,
+        "num_stages": 2
     }
 }

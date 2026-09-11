@@ -1,0 +1,10 @@
+{
+    "_sparse_attn_prefill_kernel": {
+        "BLOCK_H": 64,
+        "BLOCK_K": 16,
+        "waves_per_eu": 0,
+        "matrix_instr_nonkdim": 16,
+        "num_warps": 4,
+        "num_stages": 1
+    }
+}

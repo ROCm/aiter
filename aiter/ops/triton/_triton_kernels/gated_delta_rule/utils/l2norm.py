@@ -19,6 +19,7 @@ from aiter.ops.triton._triton_kernels.gated_delta_rule.gated_delta_rule_utils im
     autotune_cache_kwargs,
     input_guard,
 )
+from aiter.ops.triton.utils.tuned_config_utils import autotune_configs
 
 # Backward-pass autotune config space. Forward kernels deliberately do not
 # autotune (see ``l2norm_fwd_kernel`` for the rationale); only the bwd
@@ -66,9 +67,10 @@ def l2norm_fwd_kernel1(
 
 
 @triton.autotune(
-    configs=[
-        triton.Config({}, num_warps=num_warps) for num_warps in NUM_WARPS_AUTOTUNE
-    ],
+    configs=autotune_configs(
+        "GATED_DELTA_RULE",
+        [triton.Config({}, num_warps=num_warps) for num_warps in NUM_WARPS_AUTOTUNE],
+    ),
     key=["D"],
     **autotune_cache_kwargs,
 )
@@ -138,11 +140,14 @@ def l2norm_fwd_kernel(
 
 
 @triton.autotune(
-    configs=[
-        triton.Config({"BT": BT}, num_warps=num_warps)
-        for num_warps in [1, 2, 4, 8, 16]
-        for BT in BT_LIST
-    ],
+    configs=autotune_configs(
+        "GATED_DELTA_RULE",
+        [
+            triton.Config({"BT": BT}, num_warps=num_warps)
+            for num_warps in [1, 2, 4, 8, 16]
+            for BT in BT_LIST
+        ],
+    ),
     key=["D", "NB"],
     **autotune_cache_kwargs,
 )
