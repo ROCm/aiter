@@ -11,18 +11,17 @@ from flydsl.expr import const_expr, range_constexpr, rocdl
 from flydsl.expr.typing import Vector as Vec
 from flydsl.runtime.device import get_rocm_arch
 
-from ..kernels_common import get_warp_size
-from .gemm_utils import (
+from ..gemm_a8w8_8wave import (
     G2SLoader,
     S2RLoader,
-    StoreC,
+    _xcd_swizzle_any,
     ceildiv,
     compute_global_swizzle,
-    divmod,
     make_fp8_buffer_tensor,
     wait_barrier,
-    xcd_remap_pid,
 )
+from ..kernels_common import get_warp_size
+from ..mfma_preshuffle_pipeline import split_row_major_2d
 
 # 1 block = 512 threads = 8 waves (2 in M x 4 in N); the LDS budget below only
 # closes for this shape, see ``compile_mxfp8_gemm_8w``.
@@ -170,7 +169,7 @@ def compile_mxfp8_gemm_8w(
     b_preshuffled: bool = False,
     xcd_swizzle: int = 0,
     grouped: bool = False,
-    store_factory=None,
+    store_factory,
     logical_k: int | None = None,
     gather_a: bool = False,
     expert_block_m: int | None = None,
@@ -184,6 +183,9 @@ def compile_mxfp8_gemm_8w(
     takes ``expert_ids`` and ``row_map`` after the two scale tensors; the dense
     API is unchanged. ``gather_a`` reads A using the sorted-to-source row map.
     ``store_factory`` lets MoE reuse the compute pipeline with a fused epilogue.
+    ``b_k`` separates the packed weight stride from the padded A/scale stride.
+    ``dynamic_rows`` adds a GPU valid-row tensor after ``row_map``; c_m remains
+    the allocation/grid upper bound and inactive CTAs never read expert IDs.
     """
     arch = str(get_rocm_arch())
     assert arch.startswith(
@@ -275,14 +277,16 @@ def compile_mxfp8_gemm_8w(
         wave_m = wave_id // 4
         wave_n = wave_id % 4
         if const_expr(xcd_swizzle > 0):
-            block_m, block_n = xcd_remap_pid(
-                ceildiv(c_m, BLOCK_M),
-                n_blocks,
-                group_m=xcd_swizzle,
-                allow_ragged=grouped,
-            )
+            m_blocks = ceildiv(c_m, BLOCK_M)
+            block_m, block_n = _xcd_swizzle_any(m_blocks, n_blocks, xcd_swizzle)
+            simple_m, simple_n = split_row_major_2d(fx.block_idx.x, n_blocks)
+            use_simple = m_blocks * n_blocks < 1024
+            if const_expr(not grouped):
+                use_simple = use_simple | (m_blocks * n_blocks % 8 != 0)
+            block_m = use_simple.select(simple_m, block_m)
+            block_n = use_simple.select(simple_n, block_n)
         else:
-            block_m, block_n = divmod(fx.block_idx.x, n_blocks)
+            block_m, block_n = split_row_major_2d(fx.block_idx.x, n_blocks)
 
         active = fx.Int32(1)
         if const_expr(dynamic_rows):
@@ -335,24 +339,19 @@ def compile_mxfp8_gemm_8w(
             b_g2s = G2SLoader(b_div, gl_off_b, N_LDS_STEPS_B, F8_IR_t, wave_id)
             a_s2r = S2RLoader(wave_m, N_TILES_A)
             b_s2r = S2RLoader(wave_n, N_TILES_B)
-            if const_expr(store_factory is None):
-                store_c = StoreC(
-                    None, None, C, c_m, c_n, mfma.idx, N_TILES_A, N_TILES_B
-                )
-            else:
-                scratch = [
-                    a_cur0.ptr,
-                    a_cur1.ptr,
-                    a_next0.ptr,
-                    a_next1.ptr,
-                    b_cur0.ptr,
-                    b_cur1.ptr,
-                    b_next0.ptr,
-                    b_next1.ptr,
-                ]
-                store_c = store_factory(
-                    C, c_m, c_n, mfma.idx, N_TILES_A, N_TILES_B, scratch
-                )
+            scratch = [
+                a_cur0.ptr,
+                a_cur1.ptr,
+                a_next0.ptr,
+                a_next1.ptr,
+                b_cur0.ptr,
+                b_cur1.ptr,
+                b_next0.ptr,
+                b_next1.ptr,
+            ]
+            store_c = store_factory(
+                C, c_m, c_n, mfma.idx, N_TILES_A, N_TILES_B, scratch
+            )
 
             a_sc = ScalePreshuffledS2R(A_scale, c_m, K, N_TILES_A)
             b_scale_rows = (
@@ -522,22 +521,18 @@ def compile_mxfp8_gemm_8w(
             rocdl.s_barrier()
 
             # Accumulators are already scaled by the MFMA: convert and store.
-            if const_expr(store_factory is not None):
-                # The main loop deliberately staggers the two M wave groups by one
-                # barrier. Rejoin them before an epilogue shares LDS across waves.
-                if wave_m == 0:
-                    rocdl.s_barrier()
+            # Rejoin the staggered M wave groups before reusing LDS for the epilogue.
+            if wave_m == 0:
+                rocdl.s_barrier()
             wave_n_offset = wave_n * (N_TILES_B * 16)
             wave_m_offset = wave_m * (N_TILES_A * 16)
             base_row = block_m * BLOCK_M + wave_m_offset
             base_col = block_n * BLOCK_N + wave_n_offset
 
-            store_c.store(c00_frag, base_row + 0, base_col + 0)
-            store_c.store(c01_frag, base_row + 0, base_col + LDS_BLOCK_N)
-            store_c.store(c10_frag, base_row + LDS_BLOCK_M, base_col + 0)
-            store_c.store(c11_frag, base_row + LDS_BLOCK_M, base_col + LDS_BLOCK_N)
-            if const_expr(store_factory is not None):
-                store_c.finish(block_m * BLOCK_M, block_n * BLOCK_N)
+            store_c(c00_frag, base_row + 0, base_col + 0)
+            store_c(c01_frag, base_row + 0, base_col + LDS_BLOCK_N)
+            store_c(c10_frag, base_row + LDS_BLOCK_M, base_col + 0)
+            store_c(c11_frag, base_row + LDS_BLOCK_M, base_col + LDS_BLOCK_N)
 
     @flyc.jit
     def launch_gemm(

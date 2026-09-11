@@ -62,9 +62,9 @@ def _builder(kind, **kwargs):
 
 
 def _run(kind, args, **kwargs):
-    from .moe_kernels import _run_compiled
+    from .kernels.tensor_shim import _run_compiled
 
-    _run_compiled(_builder(kind, **kwargs), args)
+    _run_compiled(_builder(kind, **kwargs), *args)
 
 
 def _stream():
