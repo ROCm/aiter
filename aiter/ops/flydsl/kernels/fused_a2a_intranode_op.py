@@ -379,6 +379,102 @@ class FusedA2AIntraNodeOp:
         self._amax_compiled = [None] * len(self._amax_launches)
         self._compiled = [None] * len(self._launches)
 
+    def submit_role(self, role, input, norm=None, cos=None, sin=None, stream=None):
+        """Submit Q/K/V in order on one stream, retaining one parity for the trio.
+
+        Producers and prior consumers must be ordered before their side-stream
+        reads/writes. The caller retains inputs until V completes on that stream.
+        """
+        if not self.split or not self.quant or self.return_mode != "fp8":
+            raise ValueError("per-role submission requires packed split transport")
+        if role not in (0, 1, 2) or role != getattr(self, "_next_role", 0):
+            raise ValueError("submit Q, K, V in order without interleaving trios")
+        if input.dtype != self.dtype or tuple(input.shape) != self.shape:
+            raise ValueError(f"expected {self.dtype} input with shape {self.shape}")
+        if not input.is_cuda or not input.is_contiguous():
+            raise ValueError("input must be a contiguous CUDA tensor")
+        if self.fuse_norm_rope and role < 2:
+            hd = self.shape[2] * self.shape[3]
+            if (
+                norm is None
+                or norm.dtype != self.dtype
+                or tuple(norm.shape) != (hd,)
+                or not norm.is_cuda
+                or not norm.is_contiguous()
+            ):
+                raise ValueError("norm must be a contiguous CUDA bf16 head-row weight")
+            for table in (cos, sin):
+                if (
+                    table is None
+                    or table.dtype != torch.float32
+                    or tuple(table.shape) != (1, self.shape[1], 1, self.shape[3])
+                    or not table.is_cuda
+                    or not table.is_contiguous()
+                ):
+                    raise ValueError("RoPE tables must be contiguous CUDA fp32")
+        else:
+            norm = cos = sin = input
+        torch_stream = torch.cuda.current_stream() if stream is None else stream
+        if role and self._role_stream != torch_stream.cuda_stream:
+            raise ValueError("all roles must use the same stream")
+        self._role_stream = torch_stream.cuda_stream
+        stream = Stream(torch_stream)
+        parity = self._epoch % 2
+        if role == 0:
+            reuse_args = (
+                self.reuse_mem_sets[parity].data_ptr(),
+                self.p2p_reuse_mem_sets[parity].data_ptr(),
+                self.reuse_flags.data_ptr() + parity * self.reuse_flags.element_size(),
+                stream,
+            )
+            if self._reuse_compiled is None:
+                self._reuse_compiled = flyc.compile(
+                    self._reuse_launch,
+                    *(fx.Int64(arg) for arg in reuse_args[:-1]),
+                    reuse_args[-1],
+                )
+            else:
+                self._reuse_compiled(*reuse_args)
+        args = (
+            input.data_ptr(),
+            norm.data_ptr(),
+            cos.data_ptr(),
+            sin.data_ptr(),
+            self.p2p_outputs_sets[parity][role].data_ptr(),
+            self.p2p_scales_sets[parity][role].data_ptr(),
+            self.xdb_mem.data_ptr(),
+            self.p2p_xdb_mem.data_ptr(),
+            self.xdb_flag.data_ptr(),
+            self.grid_barrier.data_ptr(),
+            stream,
+        )
+        # Each existing split launch retains its complete receive-acquire handshake.
+        self._submit_split_launch(role, args)
+        self._next_role = (role + 1) % 3
+        if role == 2:
+            self._epoch += 1
+            return self.outputs_sets[parity], self.scales_sets[parity]
+        return None
+
+    def _submit_split_launch(self, i, args):
+        if self._amax_launches[i] is not None:
+            if self._amax_compiled[i] is None:
+                self._amax_compiled[i] = flyc.compile(
+                    self._amax_launches[i],
+                    *(fx.Int64(arg) for arg in args[:-1]),
+                    args[-1],
+                )
+            else:
+                self._amax_compiled[i](*args)
+        if self._compiled[i] is None:
+            self._compiled[i] = flyc.compile(
+                self._launches[i],
+                *(fx.Int64(arg) for arg in args[:-1]),
+                args[-1],
+            )
+        else:
+            self._compiled[i](*args)
+
     def __call__(
         self, q, k, v, norm_q=None, norm_k=None, cos=None, sin=None, stream=None
     ):
@@ -475,23 +571,7 @@ class FusedA2AIntraNodeOp:
                 ),
             )
         for i, args in enumerate(launch_args):
-            if self._amax_launches[i] is not None:
-                if self._amax_compiled[i] is None:
-                    self._amax_compiled[i] = flyc.compile(
-                        self._amax_launches[i],
-                        *(fx.Int64(arg) for arg in args[:-1]),
-                        args[-1],
-                    )
-                else:
-                    self._amax_compiled[i](*args)
-            if self._compiled[i] is None:
-                self._compiled[i] = flyc.compile(
-                    self._launches[i],
-                    *(fx.Int64(arg) for arg in args[:-1]),
-                    args[-1],
-                )
-            else:
-                self._compiled[i](*args)
+            self._submit_split_launch(i, args)
         if self._dequant_launch is not None:
             bf16_outputs = self.bf16_outputs_sets[parity]
             args = (
