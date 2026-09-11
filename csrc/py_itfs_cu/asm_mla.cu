@@ -977,7 +977,22 @@ void mla_decode_stage1_asm_fwd(
         }
     }
 
-    if (arch_id == "gfx950" && q_type == "bf16" && kv_type == "bf16" && persistent && (gqa_ratio * max_seqlen_q >= 128 || gqa_ratio > 64) && gqa_ratio != 48){
+    // gqa_ratio=96 packs 96 valid rows into the qh32 kernel's 128-row tile, so its 4th wave
+    // owns no valid Q row at all. The qh96 build is the same kernel with IDLE_WAVE_SKIP=1,
+    // which runs that wave at exec=0 (KV DMA only) to give back its share of LDS bandwidth.
+    // AITER_MLA_QH96=0 falls back to the shared qh32 kernel for A/B.
+    // AITER_MLA_QH96: 1 (default) qh96, 0 the shared qh32 kernel, 2 the qh96ctl A/B control
+    // build (same code, idle-wave mask disabled, so 1-vs-2 isolates the skip and 2-vs-0
+    // measures the code-layout shift). Measured on gfx950, bf16 gqa=96 qlen=4 ctx=8192:
+    // 5.5% / 10.6% / 7.7% faster than qh32 at batch 8 / 32 / 128, so this is unconditional.
+    const char* qh96_env = std::getenv("AITER_MLA_QH96");
+    const int qh96_mode  = (qh96_env == nullptr) ? 1 : std::atoi(qh96_env);
+    if (arch_id == "gfx950" && q_type == "bf16" && kv_type == "bf16" && persistent
+        && qh96_mode != 0 && gqa_ratio == 96 && max_seqlen_q <= 4 && config_causal == 1){
+        config_max_seqlen_q = 4;
+        config_gqa_ratio = (qh96_mode == 2) ? 97 : 96;
+        args.s_MQA = gqa_ratio;
+    } else if (arch_id == "gfx950" && q_type == "bf16" && kv_type == "bf16" && persistent && (gqa_ratio * max_seqlen_q >= 128 || gqa_ratio > 64) && gqa_ratio != 48){
         config_max_seqlen_q = 4;
         config_gqa_ratio = 32;
         args.s_MQA = gqa_ratio;

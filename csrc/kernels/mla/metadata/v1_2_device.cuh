@@ -52,8 +52,8 @@ mla_v12_effective_splits(const MlaMetadataV1KernelParameter& params, const int32
     {
         return params.num_splits;
     }
-    const float work = static_cast<float>(max(1, sum_blocks)) *
-                       static_cast<float>(max(1, params.num_splits));
+    const float work =
+        static_cast<float>(max(1, sum_blocks)) * static_cast<float>(max(1, params.num_splits));
     int32_t eff = static_cast<int32_t>(lrintf(MLA_V12_SPLIT_COEF * sqrtf(work)));
     return max(1, min(eff, params.num_splits));
 }
@@ -431,13 +431,8 @@ __launch_bounds__(opus::get_warp_size(), 1) __global__
 
     MlaWorkInfo* p_work_info_set = reinterpret_cast<MlaWorkInfo*>(params.p_work_info_set_raw);
 
-    const int32_t sum_blocks = mla_v12_compute_sum_blocks<Traits>(params,
-                                                                  qo_state,
-                                                                  p_lds_seqlens_qo,
-                                                                  p_lds_seqlens_kv,
-                                                                  ori_seqlen_qo,
-                                                                  num_batches,
-                                                                  lane_idx);
+    const int32_t sum_blocks = mla_v12_compute_sum_blocks<Traits>(
+        params, qo_state, p_lds_seqlens_qo, p_lds_seqlens_kv, ori_seqlen_qo, num_batches, lane_idx);
 
     if(lane_idx == 0)
     {
@@ -473,10 +468,37 @@ __launch_bounds__(opus::get_warp_size(), 1) __global__
     int32_t last_reduce_indptr = 0;
     bool cur_tail_done         = false;
 
+    const bool tile_major = params.tile_major_works && Traits::kQoSplits && QoState::is_unique() &&
+                            !Traits::kIsSparse && (params.qk_batch_ratio == 1);
+    const int32_t num_passes = tile_major ? mla_v12_num_qo_tiles<Traits>(params, qo_state, 0) : 1;
+    bool works_done          = (num_batches == 0);
+
+    auto kv_seqlen_of = [&](const int32_t bid) -> int32_t {
+        if constexpr(Traits::kLdsBatchInfo)
+        {
+            return p_lds_seqlens_kv[bid];
+        }
+        else
+        {
+            return params.p_seqlens_kv_indptr[bid + 1] - params.p_seqlens_kv_indptr[bid];
+        }
+    };
+
+    // A sweep boundary rewinds to batch 0, so the kv cursor has to be settable and not only
+    // advanceable. Relative to indptr[0], matching kn_get_mla_metadata_v1_2_parallel (the
+    // serial cursor above starts at 0 for batch 0, so both agree as long as indptr[0] == 0,
+    // which is how callers build it). kLdsBatchInfo has only the per-batch seqlens in LDS and
+    // no prefix array, but a sweep always restarts at batch 0, where the prefix is 0.
+    auto reset_kv_cursor_to_first = [&]() {
+        curr_kv_begin  = 0;
+        curr_kv_seqlen = kv_seqlen_of(0);
+        curr_kv_end    = curr_kv_seqlen;
+    };
+
     for(int32_t cid = 0; cid < params.num_cu; ++cid)
     {
         int32_t remain_payload = payload;
-        while(curr_batch < num_batches)
+        while(!works_done)
         {
             const int32_t num_qo_tiles = mla_v12_num_qo_tiles<Traits>(params, qo_state, curr_batch);
             const int32_t qo_tile_size =
@@ -593,50 +615,79 @@ __launch_bounds__(opus::get_warp_size(), 1) __global__
                 remain_payload -= (remain_kv_blocks + params.fixed_over_head_num_blocks);
 
                 // update state
-                curr_qo_tile_idx =
-                    (curr_qo_tile_idx == (num_qo_tiles - 1)) ? 0 : (curr_qo_tile_idx + 1);
-                if((Traits::kQoSplits == false) || (curr_qo_tile_idx == 0))
+                if(tile_major)
                 {
                     ++curr_batch;
-                    // same as curr_sub_head_idx = (curr_sub_head_idx + 1) % params.qk_batch_ratio;
-                    curr_sub_head_idx = (curr_sub_head_idx == (params.qk_batch_ratio - 1))
-                                            ? 0
-                                            : (curr_sub_head_idx + 1);
                     if(curr_batch < num_batches)
                     {
-                        if(curr_sub_head_idx == 0)
-                        {
-                            if constexpr(Traits::kLdsBatchInfo)
-                            {
-                                curr_kv_seqlen = p_lds_seqlens_kv[curr_batch];
-                            }
-                            else
-                            {
-                                const int32_t bid_ori =
-                                    Traits::kIsSparse
-                                        ? (curr_batch / ori_seqlen_qo / params.qk_batch_ratio)
-                                        : (curr_batch / params.qk_batch_ratio);
-                                curr_kv_seqlen = params.p_seqlens_kv_indptr[bid_ori + 1] -
-                                                 params.p_seqlens_kv_indptr[bid_ori];
-                                curr_kv_seqlen = Traits::kIsSparse
-                                                     ? min(curr_kv_seqlen, params.topk)
-                                                     : curr_kv_seqlen;
-                            }
-                            curr_kv_begin =
-                                Traits::kIsSparse ? (curr_kv_begin + params.topk) : curr_kv_end;
-                            curr_kv_end = curr_kv_begin + curr_kv_seqlen;
-                        }
-                        curr_kv_block    = 0;
-                        curr_n_split_idx = 0;
-                        cur_tail_done    = false;
+                        curr_kv_seqlen = kv_seqlen_of(curr_batch);
+                        curr_kv_begin  = curr_kv_end;
+                        curr_kv_end    = curr_kv_begin + curr_kv_seqlen;
                     }
-                }
-                else
-                {
+                    else
+                    {
+                        // sweep finished: rewind to batch 0 for the next qo tile
+                        ++curr_qo_tile_idx;
+                        curr_batch = 0;
+                        reset_kv_cursor_to_first();
+                        works_done = (curr_qo_tile_idx >= num_passes);
+                    }
                     curr_kv_block    = 0;
                     curr_n_split_idx = 0;
                     cur_tail_done    = false;
                 }
+                else
+                {
+                    curr_qo_tile_idx =
+                        (curr_qo_tile_idx == (num_qo_tiles - 1)) ? 0 : (curr_qo_tile_idx + 1);
+                    if((Traits::kQoSplits == false) || (curr_qo_tile_idx == 0))
+                    {
+                        ++curr_batch;
+                        // same as curr_sub_head_idx = (curr_sub_head_idx + 1) %
+                        // params.qk_batch_ratio;
+                        curr_sub_head_idx = (curr_sub_head_idx == (params.qk_batch_ratio - 1))
+                                                ? 0
+                                                : (curr_sub_head_idx + 1);
+                        if(curr_batch < num_batches)
+                        {
+                            if(curr_sub_head_idx == 0)
+                            {
+                                if constexpr(Traits::kLdsBatchInfo)
+                                {
+                                    curr_kv_seqlen = p_lds_seqlens_kv[curr_batch];
+                                }
+                                else
+                                {
+                                    const int32_t bid_ori =
+                                        Traits::kIsSparse
+                                            ? (curr_batch / ori_seqlen_qo / params.qk_batch_ratio)
+                                            : (curr_batch / params.qk_batch_ratio);
+                                    curr_kv_seqlen = params.p_seqlens_kv_indptr[bid_ori + 1] -
+                                                     params.p_seqlens_kv_indptr[bid_ori];
+                                    curr_kv_seqlen = Traits::kIsSparse
+                                                         ? min(curr_kv_seqlen, params.topk)
+                                                         : curr_kv_seqlen;
+                                }
+                                curr_kv_begin =
+                                    Traits::kIsSparse ? (curr_kv_begin + params.topk) : curr_kv_end;
+                                curr_kv_end = curr_kv_begin + curr_kv_seqlen;
+                            }
+                            curr_kv_block    = 0;
+                            curr_n_split_idx = 0;
+                            cur_tail_done    = false;
+                        }
+                        else
+                        {
+                            works_done = true;
+                        }
+                    }
+                    else
+                    {
+                        curr_kv_block    = 0;
+                        curr_n_split_idx = 0;
+                        cur_tail_done    = false;
+                    }
+                } // end of batch-major state update
             }
             else
             {
@@ -965,6 +1016,21 @@ void get_mla_metadata_v1_2_device(const aiter_tensor_t& seqlens_qo_indptr, // [b
     params.qk_batch_ratio               = qk_batch_ratio;
     params.fixed_over_head_num_blocks   = max(1, (16 + page_size - 1) / page_size);
     params.tail_done_threshold          = max_seqlen_qo;
+
+    // Only worth anything when a batch is split into several qo tiles that reread the same KV.
+    // num_heads*2 > kPackedQoLenPerWg (128 unless overridden below) is the condition
+    // mla_v12_num_qo_tiles uses to return one tile per q position, so that is when
+    // qo_tiles == max_seqlen_qo. The tile separation then works out to num_cu / qo_tiles CUs
+    // whatever num_batches is (see tile_major_works), and it lands on one XCD only when that is
+    // a multiple of num_xcd -- hence the num_cu % (num_xcd * qo_tiles) test rather than
+    // anything involving the batch count. AITER_MLA_TILE_MAJOR overrides for A/B.
+    params.num_xcd             = (arch_id == "gfx950") ? 8 : 1;
+    const int32_t qo_tiles     = (num_heads * 2 > 128) ? max_seqlen_qo : 1;
+    const char* tile_major_env = std::getenv("AITER_MLA_TILE_MAJOR");
+    params.tile_major_works    = (tile_major_env != nullptr)
+                                     ? (std::atoi(tile_major_env) != 0)
+                                     : ((qo_tiles > 1) && (topk < 0) && (params.num_xcd > 1) &&
+                                     (num_clusters % (params.num_xcd * qo_tiles) == 0));
 
     int32_t kPackedQoLenPerWg = 128;
     if((arch_id == "gfx950") && !q_is_fp8 && !kv_is_fp8 && (num_heads * max_seqlen_qo >= 64) &&

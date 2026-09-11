@@ -96,6 +96,17 @@ struct MlaMetadataV1KernelParameter
     // KV trim (batch_tail) so each work spans the full local kv; the kernel masks
     // on GLOBAL positions instead.
     bool is_cp_round_robin;
+    // Group the work emission by XCD instead of emitting a batch's qo tiles back to back.
+    // work_indptr is monotone, so emission order is also workgroup order, and the GPU hands out
+    // workgroups round-robin over its XCDs (wg % num_xcd == xcd, the rule the opus_gemm gfx950
+    // pipelines swizzle against). Batch-major puts a batch's qo tiles on consecutive
+    // workgroups, hence on different XCDs with separate L2s, so the KV -- which every tile of a
+    // batch reads byte for byte identically -- is fetched from memory once per tile. Emitting
+    // in groups of num_xcd batches puts a batch's tiles num_xcd works apart, which is a
+    // multiple of num_xcd CUs apart for any per-work CU count, i.e. on one XCD.
+    bool tile_major_works;
+    // XCDs the part exposes; 1 disables the grouping above. Workgroup -> XCD is round-robin.
+    int32_t num_xcd;
     int32_t fixed_over_head_num_blocks;
     int32_t tail_done_threshold;
 };
