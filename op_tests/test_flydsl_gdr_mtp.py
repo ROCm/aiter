@@ -21,6 +21,7 @@ from aiter import dtypes
 from aiter.jit.utils.chip_info import get_gfx
 from aiter.ops.flydsl.linear_attention_kernels import (
     _SUPPORTED_DTYPES,
+    _flydsl_gdr_mtp_supported,
     flydsl_gdr_mtp,
     flydsl_gdr_mtp_sglang,
 )
@@ -803,6 +804,33 @@ def test_mtp_rejects_noncontiguous_output():
     with pytest.raises(ValueError, match="`out` must be contiguous"):
         _run_flydsl_chain(p, out=out)
     assert torch.equal(backing, before)
+
+
+def test_mtp_rejects_invalid_snapshot_buffer():
+    p = _make_problem(2, 2, seed=69)
+    valid = torch.empty(
+        p.batch,
+        p.seqlen,
+        p.num_v_heads,
+        p.head_v_dim,
+        p.head_k_dim,
+        device=DEVICE,
+        dtype=p.pool.dtype,
+    )
+    invalid = [(valid.cpu(), "same device"), (valid.half(), "must have one of")]
+    if torch.cuda.device_count() > 1:
+        invalid.append((valid.to("cuda:1"), "same device"))
+
+    for inter, match in invalid:
+        with pytest.raises(ValueError, match=match):
+            _run_flydsl_sglang(p, save_inter=True, inter=inter)
+
+
+def test_mtp_dispatch_rejects_undersized_index_batches():
+    p = _make_problem(2, 2, seed=70)
+    args = (p.q, p.k, p.v, p.pool)
+    assert not _flydsl_gdr_mtp_supported(*args, p.chain_indices[:1], p.num_accepted)
+    assert not _flydsl_gdr_mtp_supported(*args, p.chain_indices, p.num_accepted[:1])
 
 
 @pytest.mark.skipif(torch.cuda.device_count() < 2, reason="requires two GPUs")

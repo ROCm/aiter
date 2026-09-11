@@ -558,11 +558,18 @@ def _flydsl_gdr_mtp_supported(
         return False
     if ssm_state_indices.dim() != 2:
         return False
-    if ssm_state_indices.shape[1] < query.shape[1]:
+    if (
+        ssm_state_indices.shape[0] != query.shape[0]
+        or ssm_state_indices.shape[1] < query.shape[1]
+    ):
         return False
     if ssm_state_indices.dtype != torch.int32:
         return False
-    if num_accepted_tokens.dtype != torch.int32:
+    if (
+        num_accepted_tokens.dim() != 1
+        or num_accepted_tokens.shape[0] != query.shape[0]
+        or num_accepted_tokens.dtype != torch.int32
+    ):
         return False
     if not _unit_strided(ssm_state_indices) or not _unit_strided(num_accepted_tokens):
         return False
@@ -988,6 +995,15 @@ def flydsl_gdr_mtp_sglang(
             "restarts each token from a snapshot, so there has to be one."
         )
     if intermediate_states_buffer is not None:
+        if intermediate_states_buffer.device != query.device:
+            raise ValueError(
+                "`intermediate_states_buffer` must be on the same device as `query`."
+            )
+        if intermediate_states_buffer.dtype not in _SUPPORTED_STATE_DTYPES:
+            raise ValueError(
+                "`intermediate_states_buffer` must have one of "
+                f"{_SUPPORTED_STATE_DTYPES}; got {intermediate_states_buffer.dtype}."
+            )
         got = tuple(intermediate_states_buffer.shape)
         want = (value.shape[-2], value.shape[-1], query.shape[-1])
         if len(got) != 5 or got[1] < seqlen or got[2:] != want:
