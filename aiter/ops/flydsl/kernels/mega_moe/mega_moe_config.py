@@ -429,12 +429,6 @@ def _apply_a4_tuning(
     if experts_per_rank != REFERENCE_EXPERTS_PER_RANK:
         return config
 
-    if bucket == 32768:
-        # The indexed FP4 payload uses 8 copy lanes per 128-byte K step.
-        # Keep the corrected row-map subgroup on the register-copy path; the
-        # 16-lane async DMA atom cannot represent two independent source rows.
-        config = _replace_config(config, stage1={"async_a_copy": False})
-
     bucket_stage1: dict[str, object] = {}
     bucket_stage2: dict[str, object] = {}
     if bucket == 512:

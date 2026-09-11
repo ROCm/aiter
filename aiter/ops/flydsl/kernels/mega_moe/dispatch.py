@@ -68,6 +68,11 @@ class DispatchSlot(IntEnum):
     P2P_TILE_EXPECTED = 50
     FANOUT_PAIR_CONFIG = 51
     BLOCK_HIST = 52
+    # Append-only ABI: indexed payload producers publish one completion per
+    # destination after all of their assigned copies have drained. Consumers
+    # wait on the local symmetric counter before reading source-indexed rows.
+    PAYLOAD_DONE = 53
+    P2P_PAYLOAD_DONE = 54
 
 
 DISPATCH_TABLE_SIZE = max(DispatchSlot) + 1
