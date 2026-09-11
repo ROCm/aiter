@@ -417,7 +417,14 @@ void bmm_a8w8_mxscale_bpreshuffle_kernel_gfx1250(opus_bmm_a8w8_mxscale_kargs_gfx
     // FREE/DATA handshake, and no barrier id past the 9 already in use (the
     // binit/bjs/bjsw chains silently alias anything above 9 to __nbar_9).
 
-    using Mma = opus::wmma<DataA, DataB, DataAcc, T::kWmmaM, T::kWmmaN, T::kWmmaK>;
+    // swap_ab puts B in SRC0 and A in SRC1 (scales swap to match), transposing the
+    // accumulator: a lane then holds one M row and kFragC CONSECUTIVE N columns, so
+    // the C store is one dwordx4 per fragment instead of kFragC scalar stores.
+    // Legal because A and B share an operand layout here (grpm_a == grpn_b,
+    // wave_m == wave_n). The call site is unchanged; the adaptor swaps internally.
+    using Mma = decltype(opus::make_wmma<DataA, DataB, DataAcc>(
+        opus::number<T::kWmmaM>{}, opus::number<T::kWmmaN>{},
+        opus::number<T::kWmmaK>{}, opus::wmma_adaptor_swap_ab{}));
     Mma mma;
     using FragA = opus::vector_t<opus::i32_t, 16>;   // 64 fp8 per lane
     using FragB = opus::vector_t<opus::i32_t, 16>;
@@ -732,26 +739,45 @@ void bmm_a8w8_mxscale_bpreshuffle_kernel_gfx1250(opus_bmm_a8w8_mxscale_kargs_gfx
         });
     }
 
-    // -- TODO(kernel) 3: C fragment map. UNVERIFIED. ------------------------
-    // Assumed wave32 WMMA 16x16 C layout: lane l holds column n = l % 16 and rows
-    // m = (l / 16) * 8 + i for i in 0..7. Scalar stores, because that map is one
-    // element per (lane, i) along N -- vectorise only after the probe.
+    // -- C fragment map. Derived from the shipped (verified) unswapped map, NOT
+    // from shape_c's tuple order, which does not pin it down. Operand-side the
+    // verified fact is: SRC1's output index = lane % 16, SRC0's = (lane/16)*8 + i.
+    // swap_ab makes SRC0 = B and SRC1 = A, hence
+    //     m = lane % kWmmaM,   n = (lane / kWmmaM) * kFragC + i
+    // so a lane's fragment is ONE contiguous kFragC run along N. The run stays
+    // inside one kWmmaN block and N % kWmmaN == 0 (launcher-enforced), so a single
+    // `col < n` test covers all kFragC columns and the 16 B store is aligned.
     __builtin_amdgcn_s_barrier();
     {
-        const int col_base = tile_col + wave_n * (T::kExpN * T::kWmmaN) + (lane_id % T::kWmmaN);
-        const int row_half = (lane_id / T::kWmmaN) * (T::kWmmaM / 2);
+        constexpr int kFragC  = (int)opus::size<FragC>();        // 8
+        constexpr int kCChunk = 16 / (int)sizeof(DataC);         // dwordx4 elements
+        constexpr int kVec    = kFragC < kCChunk ? kFragC : kCChunk;
+        static_assert(kFragC % kVec == 0, "C fragment must tile the vector store");
+        static_assert(T::kWmmaN == (Mma::warp_size / T::kWmmaM) * kFragC,
+                      "the lane's N run must tile one kWmmaN block exactly");
+        using CVec = opus::vector_t<DataC, kVec>;
+
+        const int row_base = tile_row + wave_m * (T::kExpM * T::kWmmaM) + lane_id % T::kWmmaM;
+        const int col_base = tile_col + wave_n * (T::kExpN * T::kWmmaN)
+                           + (lane_id / T::kWmmaM) * kFragC;
         opus::static_for<T::kExpM>([&](auto imN) __attribute__((always_inline)) {
             constexpr int im = decltype(imN)::value;
+            const int row = row_base + im * T::kWmmaM;
+            if (row >= kargs.m) return;
+            DataC* row_ptr = ptr_c + (size_t)row * kargs.stride_c;
             opus::static_for<T::kExpN>([&](auto inN) __attribute__((always_inline)) {
                 constexpr int in = decltype(inN)::value;
                 const int col = col_base + in * T::kWmmaN;
-                opus::static_for<T::kWmmaM / 2>([&](auto iN) __attribute__((always_inline)) {
-                    constexpr int i = decltype(iN)::value;
-                    const int row = tile_row + wave_m * (T::kExpM * T::kWmmaM)
-                                  + im * T::kWmmaM + row_half + i;
-                    if (row < kargs.m && col < kargs.n)
-                        ptr_c[(size_t)row * kargs.stride_c + col] =
-                            (DataC)acc[im][in][i];
+                if (col >= kargs.n) return;
+                auto reg_c = opus::cast<DataC>(acc[im][in]);
+                opus::static_for<kFragC / kVec>([&](auto cN) __attribute__((always_inline)) {
+                    constexpr int c = decltype(cN)::value;
+                    CVec v;
+                    opus::static_for<kVec>([&](auto eN) __attribute__((always_inline)) {
+                        constexpr int e = decltype(eN)::value;
+                        v[e] = reg_c[c * kVec + e];
+                    });
+                    *reinterpret_cast<CVec*>(row_ptr + col + c * kVec) = v;
                 });
             });
         });

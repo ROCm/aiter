@@ -80,6 +80,24 @@ def _e8m0(shape, seed):
     ).view(dtypes.fp8_e8m0)
 
 
+def _bias(g, n, mode):
+    """bf16 bias, or None. Values RAMP over n % 16 so that the kFragC columns one
+    C fragment covers are pairwise DISTINCT. That is the whole point: a constant
+    bias would pass even if the kernel broadcast a single column's value across
+    the fragment, which is exactly the shape of the pre-swap map's assumption.
+    Integers in [-8, 8) are exact in bf16, so the fp32 arm stays bit-exact.
+
+    mode "1d" -> [N], broadcast over batch (stride_bias_batch = 0)
+    mode "2d" -> [batch, N], which is what exercises stride_bias_batch
+    """
+    if mode is None:
+        return None
+    v = (torch.arange(n, device="cuda") % 16) - 8
+    if mode == "1d":
+        return v.to(dtypes.bf16).contiguous()
+    return torch.stack([v + 2 * i for i in range(g)]).to(dtypes.bf16).contiguous()
+
+
 def _ref_bmm(O, W, xs, ws):
     """fp64 reference. Scales are per (row/col, K-group), applied before the sum."""
     a = O.to(torch.float64)
@@ -124,17 +142,23 @@ def _run(O_in, W_shuf, xs_in, wsc, m, n, g, kid, splitK, mcwg, out_dtype, bias=N
     return Y
 
 
-# name,                m,   n,    k,   g, kid, mcwg
+# name,                m,   n,    k,   g, kid, mcwg, bias
 CASES = [
-    ("prefill kid0",   256, 256, 2048, 1, 0,  1),
-    ("prefill mcwg2",  256, 256, 2048, 1, 0,  2),   # B multicast across M-peers
-    ("prefill batch2", 256, 256, 2048, 2, 0,  1),   # the *_batch strides
-    ("prefill kid13",  256, 256, 2048, 1, 13, 1),   # A's scale panel in LDS
-    ("decode kid1",     16, 256, 4096, 1, 1,  1),
-    ("decode kid4",     16, 256, 4096, 1, 4,  1),   # 6-wave tile
-    ("decode batch4",   16, 128, 4096, 4, 1,  1),
-    ("K tail 2176",    256, 256, 2176, 1, 0,  1),   # partial B_K tile inside a split
-    ("masked M/N",      48,  48, 2048, 2, 0,  1),   # tile edges past m / n
+    ("prefill kid0",   256, 256, 2048, 1, 0,  1, None),
+    ("prefill mcwg2",  256, 256, 2048, 1, 0,  2, None),  # B multicast across M-peers
+    ("prefill batch2", 256, 256, 2048, 2, 0,  1, None),  # the *_batch strides
+    ("prefill kid13",  256, 256, 2048, 1, 13, 1, None),  # A's scale panel in LDS
+    ("decode kid1",     16, 256, 4096, 1, 1,  1, None),
+    ("decode kid4",     16, 256, 4096, 1, 4,  1, None),  # 6-wave tile
+    ("decode batch4",   16, 128, 4096, 4, 1,  1, None),
+    ("K tail 2176",    256, 256, 2176, 1, 0,  1, None),  # partial B_K tile inside a split
+    ("masked M/N",      48,  48, 2048, 2, 0,  1, None),  # tile edges past m / n
+    # Bias. Folded by the LAST split only, into fp32 acc, before the D_OUT cast --
+    # so the splitK sweep below is also asserting it is added ONCE, not per split.
+    ("bias 1d",        256, 256, 2048, 1, 0,  1, "1d"),
+    ("bias 2d batch2", 256, 256, 2048, 2, 0,  1, "2d"),  # stride_bias_batch
+    ("bias decode",     16, 256, 4096, 1, 1,  1, "1d"),  # 16x32 tile, different map
+    ("bias masked N",   48,  48, 2048, 2, 0,  1, "2d"),  # bias past n must read 0
 ]
 
 
@@ -152,9 +176,14 @@ def main() -> int:
     ):
         label = str(out_dtype).split(".")[-1]
         print(f"\n=== out={label}  rtol={rtol} atol={atol} ===")
-        for name, m, n, k, g, kid, mcwg in CASES:
+        for name, m, n, k, g, kid, mcwg, bmode in CASES:
             O_in, W_shuf, xs_in, wsc, ref = _build(m, n, k, g)
-            base = _run(O_in, W_shuf, xs_in, wsc, m, n, g, kid, 1, mcwg, out_dtype)
+            bias = _bias(g, n, bmode)
+            if bias is not None:
+                # [N] -> (1,1,N) and [batch,N] -> (1,batch,N) both broadcast over M.
+                ref = ref + bias.to(torch.float64)
+            base = _run(O_in, W_shuf, xs_in, wsc, m, n, g, kid, 1, mcwg, out_dtype,
+                        bias=bias)
             cells = []
             ok = True
             for sk in SPLITS:
@@ -162,7 +191,8 @@ def main() -> int:
                 if sk > (k + 255) // 256 or sk * mcwg > 16:
                     cells.append(f"sk{sk}:n/a")
                     continue
-                y = _run(O_in, W_shuf, xs_in, wsc, m, n, g, kid, sk, mcwg, out_dtype)
+                y = _run(O_in, W_shuf, xs_in, wsc, m, n, g, kid, sk, mcwg, out_dtype,
+                         bias=bias)
                 yd = y.to(torch.float64)
                 # Q2: against the fp64 reference.
                 bad_ref = int(((yd - ref).abs() > atol + rtol * ref.abs()).sum())

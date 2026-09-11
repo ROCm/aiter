@@ -483,16 +483,27 @@ __global__ __launch_bounds__(opus::remove_cvref_t<UserTraits>::BLOCK_SIZE, 1)
     const int wave_split = is_producer ? 0 : (wave_id - T::kNumProducerWaves);
     const int wave_m = (T::LAYOUT == opus_gfx1250_bmm::kLayoutTileM) ? wave_split : 0;
     const int wave_n = (T::LAYOUT == opus_gfx1250_bmm::kLayoutTileM) ? 0 : wave_split;
-    // First C column this lane owns. Hoisted with wave_m/wave_n because BOTH
-    // post-rejoin users need it -- the bias fold and the C store -- and they sit
-    // on opposite sides of the consumer branch's closing brace.
-    const int col_base = tile_col + wave_n * (T::kExpN * T::kWmmaN) + (lane_id % T::kWmmaN);
-
-    using Mma = opus::wmma<DataA, DataB, DataAcc, T::kWmmaM, T::kWmmaN, T::kWmmaK>;
+    // swap_ab puts B in SRC0 and A in SRC1 (scales swap to match), transposing the
+    // accumulator: a lane then holds one M row and kFragC CONSECUTIVE N columns, so
+    // the C store is one dwordx4 per fragment instead of kFragC scalar stores.
+    // Legal because A and B share an operand layout here (grpm_a == grpn_b,
+    // wave_m == wave_n). The call site is unchanged; the adaptor swaps internally.
+    using Mma = decltype(opus::make_wmma<DataA, DataB, DataAcc>(
+        opus::number<T::kWmmaM>{}, opus::number<T::kWmmaN>{},
+        opus::number<T::kWmmaK>{}, opus::wmma_adaptor_swap_ab{}));
     using FragA = opus::vector_t<opus::i32_t, 16>;   // 64 fp8 per lane
     using FragB = opus::vector_t<opus::i32_t, 16>;
     using FragC = typename Mma::vtype_c;             // 8 fp32 per lane
     constexpr int kFragC = (int)opus::size<FragC>(); // 8
+    constexpr int kNGrp  = Mma::warp_size / T::kWmmaM;  // N-groups a wave splits into
+
+    // First C row/column this lane owns (map derived at the C store below).
+    // Hoisted with wave_m/wave_n because BOTH post-rejoin users need them -- the
+    // bias fold and the C store -- and they sit on opposite sides of the consumer
+    // branch's closing brace.
+    const int row_base = tile_row + wave_m * (T::kExpM * T::kWmmaM) + lane_id % T::kWmmaM;
+    const int col_base = tile_col + wave_n * (T::kExpN * T::kWmmaN)
+                       + (lane_id / T::kWmmaM) * kFragC;
 
     // fp32 all the way to the store: the last split keeps its OWN partial in
     // fp32 (no DataWs round-trip) and sums the published ones into it, so the
@@ -1011,10 +1022,9 @@ __global__ __launch_bounds__(opus::remove_cvref_t<UserTraits>::BLOCK_SIZE, 1)
     }
 
     if (is_last && kargs.ptr_bias) {
-        // bf16 [N], broadcast over M. Every element of a C fragment sits in the
-        // SAME column (the map below walks rows with i, columns with in), so one
-        // scalar load per (im, in) covers all kFragC of them -- do not lift this
-        // into the i loop.
+        // bf16 [N], broadcast over M. A fragment's kFragC elements are kFragC
+        // CONSECUTIVE columns, so each takes its OWN bias -- this must NOT be
+        // hoisted out of the i loop the way the pre-swap single-column map allowed.
         const opus::bf16_t* pb = reinterpret_cast<const opus::bf16_t*>(kargs.ptr_bias)
                                  + (size_t)batch_id * kargs.stride_bias_batch;
         opus::static_for<T::kExpM>([&](auto imN) __attribute__((always_inline)) {
@@ -1022,12 +1032,13 @@ __global__ __launch_bounds__(opus::remove_cvref_t<UserTraits>::BLOCK_SIZE, 1)
             opus::static_for<T::kExpN>([&](auto inN) __attribute__((always_inline)) {
                 constexpr int in = decltype(inN)::value;
                 const int col    = col_base + in * T::kWmmaN;
-                // Columns past n have their C store dropped anyway; reading 0
-                // rather than clamping keeps a tail column from inheriting the
-                // last real column's bias in any future vectorised store.
-                const float b = (col < kargs.n) ? (float)pb[col] : 0.0f;
                 opus::static_for<kFragC>([&](auto iN) __attribute__((always_inline)) {
-                    acc[im][in][decltype(iN)::value] += b;
+                    constexpr int i = decltype(iN)::value;
+                    // Columns past n have their C store dropped anyway; reading 0
+                    // rather than clamping keeps a tail column from inheriting a
+                    // real column's bias.
+                    const float b = (col + i < kargs.n) ? (float)pb[col + i] : 0.0f;
+                    acc[im][in][i] += b;
                 });
             });
         });
@@ -1153,31 +1164,42 @@ __global__ __launch_bounds__(opus::remove_cvref_t<UserTraits>::BLOCK_SIZE, 1)
         }
     }
 
-    // -- TODO(kernel) 3: C fragment map. UNVERIFIED. ------------------------
-    // Assumed wave32 WMMA 16x16 C layout: lane l holds column n = l % 16 and rows
-    // m = (l / 16) * 8 + i for i in 0..7. Scalar stores, because that map is one
-    // element per (lane, i) along N -- vectorise only after the probe.
-    //
-    // Only the LAST split writes C, and only its consumer waves: `acc` now holds
-    // the full-K sum in fp32 and is cast to D_OUT exactly once, here.
-    //
-    // This is the one map the workspace path does NOT depend on -- the partial
-    // store/reduce uses the private lane-contiguous layout above -- so a probe
-    // that corrects this lambda does not invalidate the split-K plumbing.
+    // -- C fragment map. Derived from the shipped (verified) unswapped map, NOT
+    // from shape_c's tuple order, which does not pin it down. Operand-side the
+    // verified fact is: SRC1's output index = lane % 16, SRC0's = (lane/16)*8 + i.
+    // swap_ab makes SRC0 = B and SRC1 = A, hence
+    //     m = lane % kWmmaM,   n = (lane / kWmmaM) * kFragC + i
+    // so a lane's fragment is ONE contiguous kFragC run along N. The run stays
+    // inside one kWmmaN block and N % kWmmaN == 0 (launcher-enforced), so a single
+    // `col < n` test covers all kFragC columns and the 16 B store is aligned.
+    // Only the LAST split writes C; the workspace path uses its own lane-contiguous
+    // layout, so the swap leaves the split-K plumbing untouched.
     if (is_last && !is_producer) {
-        const int row_half = (lane_id / T::kWmmaN) * (T::kWmmaM / 2);
+        constexpr int kCChunk = 16 / (int)sizeof(D_OUT);     // dwordx4 elements
+        constexpr int kVec    = kFragC < kCChunk ? kFragC : kCChunk;
+        static_assert(kFragC % kVec == 0, "C fragment must tile the vector store");
+        static_assert(T::kWmmaN == (Mma::warp_size / T::kWmmaM) * kFragC,
+                      "the lane's N run must tile one kWmmaN block exactly");
+        using CVec = opus::vector_t<D_OUT, kVec>;
+
         opus::static_for<T::kExpM>([&](auto imN) __attribute__((always_inline)) {
             constexpr int im = decltype(imN)::value;
+            const int row = row_base + im * T::kWmmaM;
+            if (row >= kargs.m) return;
+            D_OUT* row_ptr = ptr_c + (size_t)row * kargs.stride_c;
             opus::static_for<T::kExpN>([&](auto inN) __attribute__((always_inline)) {
                 constexpr int in = decltype(inN)::value;
                 const int col = col_base + in * T::kWmmaN;
-                opus::static_for<T::kWmmaM / 2>([&](auto iN) __attribute__((always_inline)) {
-                    constexpr int i = decltype(iN)::value;
-                    const int row = tile_row + wave_m * (T::kExpM * T::kWmmaM)
-                                  + im * T::kWmmaM + row_half + i;
-                    if (row < kargs.m && col < kargs.n)
-                        ptr_c[(size_t)row * kargs.stride_c + col] =
-                            (D_OUT)acc[im][in][i];
+                if (col >= kargs.n) return;
+                auto reg_c = opus::cast<D_OUT>(acc[im][in]);
+                opus::static_for<kFragC / kVec>([&](auto cN) __attribute__((always_inline)) {
+                    constexpr int c = decltype(cN)::value;
+                    CVec v;
+                    opus::static_for<kVec>([&](auto eN) __attribute__((always_inline)) {
+                        constexpr int e = decltype(eN)::value;
+                        v[e] = reg_c[c * kVec + e];
+                    });
+                    *reinterpret_cast<CVec*>(row_ptr + col + c * kVec) = v;
                 });
             });
         });
