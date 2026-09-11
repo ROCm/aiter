@@ -2,7 +2,7 @@ import torch
 import triton
 import triton.language as tl
 
-from ..gated_delta_rule_utils import (
+from aiter.ops.triton._triton_kernels.gated_delta_rule.gated_delta_rule_utils import (
     autotune_cache_kwargs,
     gated_delta_rule_autotune_configs,
     input_guard,
