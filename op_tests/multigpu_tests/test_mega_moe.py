@@ -1447,7 +1447,7 @@ elif _GFX == "gfx1250":
         if os.environ.get("AITER_SMI_MONITOR", "0") != "1":
             return
 
-        from op_tests.smi_monitor import GpuMonitor, emit_smi_result
+        from aiter.smi_monitor import GpuMonitor, emit_smi_result
 
         interval_s = float(os.environ.get("AITER_SMI_INTERVAL", "0.05"))
         duration_s = float(os.environ.get("AITER_SMI_DURATION", "1.0"))

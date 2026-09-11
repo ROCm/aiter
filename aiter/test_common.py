@@ -227,14 +227,7 @@ def perftest(
                 if fn_name in skipped:
                     return data, avg
                 # Import lazily: normal library/test use has no amdsmi dependency.
-                # Combo and its child UTs run from the repository root, where the
-                # standalone op_tests monitor module is importable.
-                try:
-                    from op_tests.smi_monitor import replay_with_smi
-                except ModuleNotFoundError:
-                    # Direct ``python op_tests/foo.py`` puts op_tests itself,
-                    # rather than the repository root, at sys.path[0].
-                    from smi_monitor import replay_with_smi
+                from aiter.smi_monitor import replay_with_smi
 
                 if testGraph:
                     replay = graph.replay
