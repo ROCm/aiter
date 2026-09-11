@@ -255,7 +255,6 @@ def _attn_fwd_inner(
 @triton.autotune(
     configs=fwd_decode_splitk_configs,
     key=FWD_DECODE_AUTOTUNE_KEYS,
-    use_cuda_graph=True,
 )
 @triton.jit
 def _fwd_kernel_splitK(
@@ -692,7 +691,6 @@ FWD_DECODE_REDUCE_AUTOTUNE_KEYS = [
 @triton.autotune(
     configs=fwd_decode_reduce_configs,
     key=FWD_DECODE_REDUCE_AUTOTUNE_KEYS,
-    use_cuda_graph=True,
 )
 @triton.jit
 def _splitK_reduce(
