@@ -171,6 +171,11 @@ AITER_CONFIG_GEMM_BF16 = os.getenv(
     f"{AITER_ROOT_DIR}/aiter/configs/bf16_tuned_gemm.csv",
 )
 
+AITER_CONFIG_CONV3D_BF16 = os.getenv(
+    "AITER_CONFIG_CONV3D_BF16",
+    f"{AITER_ROOT_DIR}/aiter/configs/conv3d_bf16_tuned.csv",
+)
+
 AITER_CONFIG_GDR_DECODE = os.getenv(
     "AITER_CONFIG_GDR_DECODE",
     f"{AITER_ROOT_DIR}/aiter/configs/gdr_decode_tuned.csv",
@@ -287,6 +292,12 @@ class AITER_CONFIG:
     def AITER_CONFIG_GEMM_BF16_FILE(self):
         return self.get_config_file(
             "AITER_CONFIG_GEMM_BF16", AITER_CONFIG_GEMM_BF16, "bf16_tuned_gemm"
+        )
+
+    @property
+    def AITER_CONFIG_CONV3D_BF16_FILE(self):
+        return self.get_config_file(
+            "AITER_CONFIG_CONV3D_BF16", AITER_CONFIG_CONV3D_BF16, "conv3d_bf16_tuned"
         )
 
     @property
