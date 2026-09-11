@@ -11,7 +11,8 @@ dispatch.
 
 **Out of scope (this track):** describing packed FP8/FP4 as *unpacked* element
 layouts; `fx.gemm` / MFMA; LDS/`SharedAllocator`; ticket benches and CK harness.
-Preshuffled i32-kpack views are a **follow-on** (below), not subtasks 1–5.
+Preshuffled i32-kpack B (opt-in, still `v_dot2`) has landed; it is not
+subtasks 1–5.
 
 Work the subtasks **in order**. Later items assume earlier ones have landed.
 Each subtask is surgical and behavior-preserving: verify correctness (and a
@@ -28,12 +29,11 @@ spot-check when the hot loop or wait/reduce path changed.
 - [x] 3. `atomic_add_f32` without hardcoded LLVM address space
 - [x] 4. Single definition path for `const_expr` if/else
 - [ ] 5. Buffer views + layouts for *unpacked* tensors only
-- [ ] Follow-on: preshuffled pack, still `v_dot2` — living plan:
-      `SILOTIGER-667-plan-preshuffled-weights.md` (not this track)
+- [x] Follow-on: preshuffled pack, still `v_dot2` (landed; not this track)
 
 ## Locked decisions
 
-These locks apply to **this track** (subtasks 1–5), not the follow-on.
+These locks apply to **this track** (subtasks 1–5).
 
 - **Test environment:** run all tests/benches in **`flydsl_venv`** **GPU 1**
   (`HIP_VISIBLE_DEVICES=1`).
@@ -151,9 +151,4 @@ for a mandatory packed-dword swizzle.
 - Changing GPU from the locked `HIP_VISIBLE_DEVICES=1`.
 - Mass-comment cleanup as its own commit unless a subtask’s diff is unreadable
   without it.
-
-## Follow-on (not this track): preshuffled pack, still `v_dot2`
-
-Moved to **`SILOTIGER-667-plan-preshuffled-weights.md`**: opt-in
-`k_contiguous` vs `preshuffled` B, same `v_dot2` math. Do not track
-preshuffled-weight checkboxes here.
+- Opt-in `k_contiguous` / `preshuffled` B (already landed; still `v_dot2`).
