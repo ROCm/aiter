@@ -59,6 +59,25 @@ class Config:
             parse_bool(parts[3]),
         )
 
+    def unsupported_reason(self, problem: "_Problem") -> str | None:
+        if self.use_prefill and problem.gateup_dim % self.BLOCK_N != 0:
+            return (
+                f"gateup_dim={problem.gateup_dim} is not divisible by "
+                f"BLOCK_N={self.BLOCK_N}"
+            )
+        if self.use_prefill and problem.inter_dim % 64 != 0:
+            return (
+                f"inter_dim={problem.inter_dim} is not divisible by the "
+                "down BLOCK_K=64"
+            )
+        down_tiles = (problem.model_dim + 127) // 128
+        if self.use_prefill and down_tiles % 2 != 0:
+            return (
+                f"model_dim={problem.model_dim} produces {down_tiles} down tiles; "
+                "the prefill down kernel requires an even number of 128-wide tiles"
+            )
+        return None
+
 
 @dataclass(frozen=True)
 class _Problem:
@@ -220,7 +239,7 @@ def _run_prefill(
         0,
     )
     weight_dtype_str = "bf16" if w1.dtype == torch.bfloat16 else "fp8"
-    act_quant_type_str = "ptpc"
+    act_quant_type_str = problem.quant_type
     quant_func = (
         aiter.get_hip_quant(aiter.QuantType.per_Token)
         if quant_type == QuantType.per_Token
@@ -234,8 +253,6 @@ def _run_prefill(
             quant_dtype=w1.dtype,
             num_rows=None,
         )
-        if quant_type == QuantType.per_Tensor:
-            a_scale = a_scale.repeat(problem.batch, 1).contiguous()
         a_scale = a_scale.to(torch.float32).contiguous()
     else:
         gateup_in = hidden_states
@@ -302,6 +319,7 @@ def _run_prefill(
         stage="down",
         alg="prefill_1x4",
         E=problem.experts,
+        act_quant_type_str=act_quant_type_str,
     )
     _launch(
         down_kernel,
@@ -527,6 +545,12 @@ def run_flydsl_moe_gfx942(
 
     activation_str = "swiglu" if activation == ActivationType.Swiglu else "silu"
     problem = _Problem.from_inputs(hidden_states, w1, w2, topk_ids, quant_type)
+    unsupported_reason = config.unsupported_reason(problem)
+    if unsupported_reason is not None:
+        raise RuntimeError(
+            f"Unsupported gfx942 FlyDSL MoE config {config_string!r}: "
+            f"{unsupported_reason}"
+        )
     if config.use_prefill:
         return _run_prefill(
             hidden_states,
@@ -579,6 +603,14 @@ def run_flydsl_moe_gfx942_impl(
     request: FusedMoeRequest,
     config_string: str,
 ) -> torch.Tensor:
+    if request.bias1 is not None or request.bias2 is not None:
+        raise NotImplementedError(
+            "gfx942 FlyDSL whole-graph backend does not support per-expert bias"
+        )
+    if request.doweight_stage1:
+        raise NotImplementedError(
+            "gfx942 FlyDSL whole-graph backend does not support doweight_stage1=True"
+        )
     return run_flydsl_moe_gfx942(
         request.hidden_states,
         request.w1,

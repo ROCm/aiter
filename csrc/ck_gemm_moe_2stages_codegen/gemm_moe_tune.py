@@ -5911,6 +5911,11 @@ class FmoeTuner(TunerCommon):
             config_string="",
             swiglu_limit=None,
         ):
+            if doweight_stage1:
+                raise NotImplementedError(
+                    "gfx942 FlyDSL whole-graph tuning does not support "
+                    "doweight_stage1=True"
+                )
             return run_flydsl_moe_gfx942(
                 hidden_states,
                 w1,
@@ -5933,6 +5938,24 @@ class FmoeTuner(TunerCommon):
         RED = "\033[0;31m"
         END = "\033[0m"
         for config_string in get_tune_space():
+            config = Config.from_string(config_string)
+            eligible_indices = [
+                i
+                for i, row in self.untunedf.iterrows()
+                if not bool(row["doweight_stage1"])
+                and (
+                    not config.use_prefill
+                    or (
+                        int(row["inter_dim"]) * 2 % config.BLOCK_N == 0
+                        and int(row["inter_dim"]) % 64 == 0
+                        and ((int(row["model_dim"]) + 127) // 128) % 2 == 0
+                    )
+                )
+            ]
+            if not eligible_indices:
+                continue
+            all_untunedf = self.untunedf
+            self.untunedf = all_untunedf.iloc[eligible_indices].reset_index(drop=True)
             try:
                 results_cur = self.run_config(
                     args,
@@ -5944,7 +5967,9 @@ class FmoeTuner(TunerCommon):
             except Exception as e:  # noqa: BLE001
                 print(f"{RED}Error with config {config_string}: {e}{END}")
                 continue
-            block_m = Config.from_string(config_string).BLOCK_M
+            finally:
+                self.untunedf = all_untunedf
+            block_m = config.BLOCK_M
             ksplit = 0
             run_1stage = 0
             err1 = "0%"
@@ -5954,11 +5979,11 @@ class FmoeTuner(TunerCommon):
             )
             kernelName2 = ""
             xbf16 = 0
-            for i in range(len(self.untunedf)):
+            for result_index, i in enumerate(eligible_indices):
                 k = better_kernels[i]
-                e2e_us = results_cur[i]["e2e_us"]
-                status = results_cur[i]["status"]
-                err_ratio = results_cur[i].get("err_ratio", 0)
+                e2e_us = results_cur[result_index]["e2e_us"]
+                status = results_cur[result_index]["status"]
+                err_ratio = results_cur[result_index].get("err_ratio", 0)
                 # skip invalid kernel
                 if e2e_us < 0 or status != "ok":
                     print(

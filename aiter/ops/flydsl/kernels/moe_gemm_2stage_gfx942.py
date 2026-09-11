@@ -77,6 +77,13 @@ def compile_gemm(
             f"unsupported prefill quant combo (weight={weight_quant_type}, "
             f"act={act_quant_type})"
         )
+    if stage == "down" and alg == "prefill_1x4":
+        assert K % 64 == 0, f"down prefill requires K to be divisible by 64, got K={K}"
+        num_n_tiles = (N + BLOCK_TILE_SIZE_N - 1) // BLOCK_TILE_SIZE_N
+        assert num_n_tiles % 2 == 0, (
+            f"down prefill requires an even number of N tiles, got "
+            f"ceil({N}/{BLOCK_TILE_SIZE_N})={num_n_tiles}"
+        )
 
     if stage == "gateup" and alg == "splitk":
         assert (
@@ -809,6 +816,7 @@ def compile_gemm(
         rocdl.sched_barrier(0)
 
         # Main loop: 2x unrolled ping-pong (even iter uses buf 0, odd iter uses buf 1)
+        results = acc_init
         for k2, state in range(0, num_k_iters // 2, 1, init=[acc_init]):
             c_frag.store(state[0])
             k_base = fx.Int32(k2 * 2)
@@ -1234,6 +1242,7 @@ def compile_gemm(
         gpu.barrier()
 
         acc_init = [c_gate.load(), c_up.load()]
+        results = acc_init
         for iv, state in range(0, num_tiles // 2 - 1, 1, init=acc_init):
             c_gate.store(state[0])
             c_up.store(state[1])
@@ -2779,7 +2788,11 @@ def flydsl_quant_per_tensor(torch_dtype):
         worker_id = fx.block_idx.x
         num_workers = fx.grid_dim.x
 
-        inv_scale = fx.Float32(rocdl.rcp(T.f32, Amax[0]) * fx.Float32(fmax))
+        amax = fx.Float32(Amax[0])
+        inv_scale = (amax == fx.Float32(0.0)).select(
+            fx.Float32(0.0),
+            fx.Float32(rocdl.rcp(T.f32, amax) * fx.Float32(fmax)),
+        )
         copy_bits = 128
 
         ele0, _, neles = fxh.split_works(
