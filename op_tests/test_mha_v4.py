@@ -254,7 +254,7 @@ def test_mha_v4_bf16fp8_scale_recipe():
             AttentionFormat.MXFP6,
             True,
             _RawRecipeKind.FP8,
-            AttentionPack.DEFAULT,
+            AttentionPack.V_FOR_FP6_P,
         ),
         (
             AttentionFormat.MXFP4,
