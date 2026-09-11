@@ -96,6 +96,7 @@ def flydsl_grouped_gemm_a8w4_masked(
     ep_row_map=None,
     situ_beta=1.0,
     situ_linear_beta=1.0,
+    row_major_ascale=0,
 ):
     """Launches a contiguous-M grouped a8w4 GEMM on the TDM kernel."""
     from .kernels.mxfp4_preshuffle_gfx1250_tdm import launch_gemm_a8w4_tdm
@@ -164,5 +165,6 @@ def flydsl_grouped_gemm_a8w4_masked(
         arg_ep_row_map=ep_row_map_tensor,
         f32_situ_beta=float(situ_beta),
         f32_situ_linear_beta=float(situ_linear_beta),
+        row_major_ascale=int(row_major_ascale),
     )
     return out
