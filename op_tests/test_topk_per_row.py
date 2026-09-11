@@ -481,6 +481,7 @@ def _run_prefill_block(
         else (None, None)
     )
     plain_us = None
+    plain_ids = None
     if with_plain and top_k <= _PLAIN_MAX_K:
         plain_us, plain_ids = _time_topk_plain(
             logits, num_rows, width, top_k, footprint
@@ -493,7 +494,7 @@ def _run_prefill_block(
         ok = compare_topk_results(
             logits, indices, torch_indices, row_starts, row_ends, top_k
         )
-        if with_plain and ok is True:
+        if plain_ids is not None and ok is True:
             ok = compare_topk_results(
                 logits, plain_ids, torch_indices, row_starts, row_ends, top_k
             )
