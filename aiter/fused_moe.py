@@ -1202,7 +1202,9 @@ def _fused_moe_impl(
 
 # Token count above which routing is not fused. Fusing wins at decode shapes,
 # where the four-kernel preamble is a large part of MoE latency; above that the
-# GEMMs dominate
+# GEMMs dominate. Also bounds LDS: the entry TORCH_CHECKs a layout growing as
+# ~16 * M * (topk + n_shared); the worst supported corner breaches gfx950's
+# 160 KB at M=154, so raising this past ~153 needs that check mirrored here.
 FUSED_MOE_ROUTER_MAX_TOKENS = 128
 
 # Mirror fused_moe_router_entry.cu. Phase 1 selects within one wave and the
@@ -1225,6 +1227,9 @@ def fused_moe_router_arch_supported() -> bool:
 
     Split out of :func:`fused_moe_router_supported` so callers can check it
     before any tensor exists, e.g. when choosing a backend at startup.
+
+    Widening this list needs the LDS note on FUSED_MOE_ROUTER_MAX_TOKENS
+    re-checked: it assumes gfx950's 160 KB.
     """
     return get_gfx() == "gfx950"
 
@@ -1236,6 +1241,7 @@ def fused_moe_router_config_supported(
     quant_type: int = QuantType.No.value,
     activation: int = ActivationType.Silu.value,
     gate_mode: str = GateMode.SEPARATED.value,
+    num_fused_shared_experts: int = 0,
 ) -> bool:
     """Whether the shapes and dtypes of a config are fusable.
 
@@ -1251,6 +1257,9 @@ def fused_moe_router_config_supported(
         and w1_dtype == dtypes.fp4x2
         and hidden_dtype == dtypes.bf16
         and hidden_dim == 4096
+        # Phase 1 parks the shared rows on the lanes just past topk, within
+        # the one wave top-k selects in.
+        and 0 <= num_fused_shared_experts <= 1
     )
 
 
@@ -1271,6 +1280,7 @@ def fused_moe_router_supported(
     dtype: torch.dtype | None = None,
     expert_mask: torch.Tensor | None = None,
     num_fused_shared_experts: int = 0,
+    global_num_experts: int | None = None,
 ) -> bool:
     """Whether :func:`fused_moe_router` can serve this call.
 
@@ -1279,15 +1289,21 @@ def fused_moe_router_supported(
     token cap, the expert-group limit and the tuned-config check on top of
     :func:`fused_moe_router_config_supported`, so it depends on the actual
     call and has to be re-checked on every forward.
+
+    Args:
+        global_num_experts: the gating width. Pass it when known so this agrees
+            with :func:`fused_moe_router` by construction, not by shape math.
     """
-    # gating_output is not passed in, so derive global_E from the shapes. The
-    # mask spans every emitted id -- routed, then the shared slots, then the
-    # sentinel, which callers allocate whether or not shared fusion is on --
-    # so drop those trailing slots. Without a mask there is no EP and w1 holds
-    # routed plus shared.
+    # global_E is the gating row stride. The shape fallbacks below are exact
+    # only while num_redundant_experts == 0. The mask spans every emitted id --
+    # routed, then shared, then the sentinel, which callers allocate whether or
+    # not shared fusion is on -- so drop those. No mask means no EP, and w1
+    # holds routed plus shared.
     n_shared = num_fused_shared_experts
     local_E = w1.shape[0]
-    if expert_mask is not None:
+    if global_num_experts is not None:
+        global_E = global_num_experts
+    elif expert_mask is not None:
         global_E = expert_mask.numel() - n_shared - 1
     else:
         global_E = local_E - n_shared
@@ -1299,15 +1315,13 @@ def fused_moe_router_supported(
             quant_type=quant_type,
             activation=activation,
             gate_mode=gate_mode,
+            num_fused_shared_experts=n_shared,
         )
         and hidden_states.shape[0] <= FUSED_MOE_ROUTER_MAX_TOKENS
         # The kernel has no expert-group stage. 1/1 means "one group holding
         # every expert", which is the same as no grouping at all.
         and num_expert_group == 1
         and topk_group == 1
-        # Phase 1 places the shared rows on the lanes just past topk, within
-        # the one wave the top-k selects in.
-        and 0 <= n_shared <= 1
         and topk + n_shared <= FUSED_MOE_ROUTER_MAX_TOPK
         # Mirror the entry's expert-count checks. topk is global, so it goes
         # against global_E; only the shared rows live in this rank's w1.
@@ -1550,7 +1564,8 @@ def fused_moe_router(
     # The fused routing kernel now does that clear itself (passed as moe_buf
     # below), which removes a separate ~4.6us torch FillFunctor launch per MoE
     # block -- the launch the fusion exists to avoid. empty() is therefore
-    # correct here: the kernel writes every element before stage2 runs.
+    # correct here: the kernel writes every element before stage2 runs, which
+    # test_moe_buf_zero_fill pins with a poisoned buffer.
     moe_buf = torch.empty((M, model_dim), dtype=dtype, device=device)
 
     # Quantized stage1 input, sized as fused_dynamic_mx_quant_moe_sort does.
