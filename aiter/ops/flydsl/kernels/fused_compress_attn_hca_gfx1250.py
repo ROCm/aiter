@@ -25,7 +25,7 @@ import torch
 from flydsl._mlir.dialects import llvm
 from flydsl.expr import arith, const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr import math as fmath
-from flydsl.expr.arith import CmpFPredicate, CmpIPredicate
+from flydsl.expr.arith import CmpFPredicate
 from flydsl.expr.typing import Int32, Stream, T
 
 from aiter.ops.flydsl.kernels import buffer_ops
@@ -304,12 +304,7 @@ def _build_compress_forward_kernel(
                     raw_s = buffer_ops.buffer_load(rsrc, off_dw, vec_width=1, dtype=i32)
                     # logical shift for the hi-word extract too.
                     hi = fx.Int32((fx.Uint32(raw_s) >> 16).ir_value())
-                    lo_or_hi = arith.select(
-                        arith.cmpi(CmpIPredicate.eq, lane_in_dw.ir_value(), c_zero_i32),
-                        raw_s,
-                        hi.ir_value(),
-                    )
-                    lo16 = arith.andi(lo_or_hi, arith.constant(0xFFFF, type=i32))
+                    lo16 = (lane_in_dw == 0).select(fx.Int32(raw_s), hi) & 0xFFFF
                     lo16_v = fx.Vector.from_elements([lo16], dtype=fx.Int32)
                     bf16_pair = lo16_v.bitcast(fx.BFloat16)
                     # raw f32 for the explicit-fastmath float layer downstream.
@@ -387,9 +382,10 @@ def _build_compress_forward_kernel(
             def _issue_phase1_loads(k_i32):
                 """Phase 1 (state cache) loads. Returns (kv_list, sc_padded_list)
                 each of length VEC. Score is -inf when s < 0."""
-                s = (fx.Int32(position) - fx.Int32(K - 1) + fx.Int32(k_i32)).ir_value()
-                is_pad = arith.cmpi(CmpIPredicate.slt, s, c_zero_i32)
-                s_safe = fx.Int32(arith.select(is_pad, c_zero_i32, s))
+                s = fx.Int32(position) - fx.Int32(K - 1) + fx.Int32(k_i32)
+                # Raw i1: the score padding below selects over raw f32 values.
+                is_pad = (s < 0).ir_value()
+                s_safe = fx.Int32(arith.select(is_pad, c_zero_i32, s.ir_value()))
                 ring = fx.Int32((fx.Uint32(s_safe.ir_value()) % state_size).ir_value())
                 # Slot term already folded into the descriptor base.
                 base_kv_off = ring * fx.Int32(kv_state_pos_stride) + col_off_base
@@ -508,9 +504,7 @@ def _build_compress_forward_kernel(
                 k_i32 = k_start_i32 + j
                 # Wave-uniform (split and k_start are both wave-uniform) -> SGPR
                 # compare, one cndmask per element.
-                is_consumed = arith.cmpi(
-                    CmpIPredicate.slt, k_i32.ir_value(), split_i32.ir_value()
-                )
+                is_consumed = (k_i32 < split_i32).ir_value()
                 p2_kv, p2_sc, p2_ape = _issue_phase2_loads(k_i32)
                 p2_score = [
                     arith.select(
@@ -1047,11 +1041,8 @@ def _emit_norm_rope_scatter(
     sin_rsrc = buffer_ops.create_buffer_resource(sin_cache, max_size=True)
     cos_row_base = comp_pos_i32 * (RD // 2)
 
-    is_rope_t = arith.cmpi(
-        CmpIPredicate.sge,
-        tid.ir_value(),
-        arith.constant(ROPE_THREAD_LO, type=i32),
-    )
+    # Raw i1: consumed by the fp8 emitter and by selects over raw f32 lanes.
+    is_rope_t = (fx.Int32(tid) >= ROPE_THREAD_LO).ir_value()
     rope_rel_raw = fx.Int32(tid) - ROPE_THREAD_LO
     rope_rel = fx.max(rope_rel_raw, fx.Int32(0))
     cs_lo = rope_rel * PAIRS_PER_THREAD
