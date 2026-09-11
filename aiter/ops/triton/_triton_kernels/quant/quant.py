@@ -47,10 +47,8 @@ def _static_per_tensor_quant_fp8_i8_kernel(
     )
 
     scale = tl.load(scale_in_ptr)
-    # Multiply by the reciprocal: the division is loop-invariant, so this costs one
-    # v_mul per element. Ties can break the other way than a correctly-rounded
-    # division would, but both answers are within half an fp8 ulp of the exact
-    # quotient.
+    # This only applies NR on 1/scale which is much faster than NR on qx result,
+    # while not hurting accuracy substantially
     qx = x * (1 / scale)
 
     tl.store(
