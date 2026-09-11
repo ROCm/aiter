@@ -5,10 +5,23 @@ import glob
 import json
 import os
 import shutil
+import sys
 from pathlib import Path
 
 import pandas as pd
-import torch
+
+this_dir = os.path.dirname(os.path.abspath(__file__))
+# Imported by path, not through the `aiter` package: importing `aiter` here would
+# load a built module on a codegen path and give it a second copy of the arch
+# caches. csrc sits at the repo root in a checkout and under aiter_meta in an
+# installed wheel, so try both and take the one that is really there.
+for _root in (f"{this_dir}/../../", f"{this_dir}/../../../"):
+    JIT_UTILS_DIR = os.path.abspath(os.path.join(_root, "aiter", "jit", "utils"))
+    if os.path.isdir(JIT_UTILS_DIR):
+        sys.path.insert(0, JIT_UTILS_DIR)
+        break
+from build_targets import filter_tune_df, has_named_targets, unmatched_targets
+from chip_info import get_build_targets
 from codegen import gen_instances_gfx942 as _gfx942  # noqa: F401
 
 # Import for side-effect: each arch module self-registers into EMIT_REGISTRY
@@ -241,17 +254,94 @@ SPLITK_TAGS = {
     *_SPLITK,
 }
 
-_WS_PARTIAL_TAGS = {
-    "a16w16_cluster_tdm_splitk_ws",
-    "a16w16_clusterlaunch_tdm_splitk_ws",
+_WS_PARTIAL_ATTR_BY_TAG = {
+    "a16w16_cluster_tdm_splitk_ws": "splitk_workspace_dtype",
+    "a16w16_clusterlaunch_tdm_splitk_ws": "splitk_workspace_dtype",
+    "a16w16_clusterlaunch_tdm_splitk_fuse": "fuse_ws_dtype",
 }
+
+
+def _key_cu_num(mnk):
+    """cu_num from a get_tune_dict key. 0 for pre-cu_num keys: no device reports
+    it, so those entries resolve through opus_lookup_find's shape-only fallback.
+    """
+    return int(mnk[5]) if len(mnk) >= 6 else 0
+
+
+def _resolve_build_targets():
+    try:
+        return get_build_targets()
+    except RuntimeError:
+        # A GPU-less host with no explicit target keeps legacy unfiltered
+        # behavior. A malformed or otherwise unresolved named target is an
+        # actionable build configuration error.
+        if has_named_targets():
+            raise
+        return None
+
+
+def _report_unmatched_targets(tune_df, targets):
+    """Name a build target the combined tuned rows do not cover."""
+    if not targets or not {"gfx", "cu_num"} <= set(tune_df.columns):
+        return
+    missing = unmatched_targets(tune_df, targets)
+    if missing:
+        print(
+            f"[opus gen_instances] no tuned rows for build target(s) "
+            f"{', '.join(missing)}; every shape there falls back to the "
+            f"heuristic. Tune those targets, or drop them from "
+            f"AITER_GPU_TARGETS / GPU_ARCHS."
+        )
+
+
+def _filter_opus_df_for_targets(tune_df, targets):
+    if not targets:
+        return tune_df
+    columns = set(tune_df.columns)
+    if "gfx" in columns:
+        tune_df = tune_df.copy()
+        gfx_col = tune_df["gfx"]
+        tune_df["gfx"] = gfx_col.where(
+            gfx_col.isna(), gfx_col.astype(str).str.strip().str.lower()
+        )
+    if {"gfx", "cu_num"} <= columns:
+        has_gfx = tune_df["gfx"].notna() & tune_df["gfx"].ne("")
+        has_cu = tune_df["cu_num"].notna()
+        if (has_gfx & has_cu).all():
+            return filter_tune_df(tune_df, targets)
+        exact = False
+        for gfx, cu_num in targets:
+            exact |= (
+                has_gfx & has_cu & tune_df["gfx"].eq(gfx) & tune_df["cu_num"].eq(cu_num)
+            )
+        # Concatenating CSVs of different vintages leaves NaN in whichever
+        # target column the older one lacked. A row naming only its arch is
+        # still selectable, and keeping it preserves the shape-only fallback
+        # that opus_lookup_find resolves through a cu_num of 0. A row naming
+        # only a CU count is not: gfx950 and gfx1250 share a default of 256, so
+        # matching on the count alone can bake one arch's winner for the other.
+        # Those rows drop out, as they did before any of this filtering existed.
+        archs = {gfx for gfx, _ in targets}
+        gfx_only = has_gfx & ~has_cu & tune_df["gfx"].isin(archs)
+        return tune_df[exact | gfx_only | (~has_gfx & ~has_cu)]
+    if "gfx" in columns:
+        archs = {gfx for gfx, _ in targets}
+        return tune_df[tune_df["gfx"].isin(archs)]
+    # A cu_num-only or column-less legacy schema cannot be selected by target
+    # safely (a CU count alone is ambiguous across arches, as above), so pass it
+    # through unfiltered and let the kernel id and CU=0 shape fallback decide.
+    return tune_df
+
+
+_CTYPE_BYTES = {"bf16_t": 2, "fp32_t": 4}
 
 
 def _ws_partial_ctype(k):
     """The kid's split-K partial ctype, or None if its slot is a real dtype."""
-    if k.kernel_tag not in _WS_PARTIAL_TAGS:
+    attr = _WS_PARTIAL_ATTR_BY_TAG.get(k.kernel_tag)
+    if attr is None:
         return None
-    return getattr(k, "splitk_workspace_dtype", "fp32_t")
+    return getattr(k, attr, "fp32_t")
 
 
 TRAITS_NAME_MAP = {
@@ -591,7 +681,8 @@ class opus_gemm_codegen:
         Outdtype-aware bucketing
         ------------------------
         kernels_dict tuple keys carry the outdtype string in slot 3
-        ((M, N, K, outdtype_str, arch), produced by get_tune_dict). The BF16
+        ((M, N, K, outdtype_str, arch, cu_num), produced by get_tune_dict).
+        The BF16
         macro picks up rows whose outdtype is "torch.bfloat16" and the
         FP32 macro picks up rows whose outdtype is "torch.float32";
         same-(M,N,K) rows with different outdtypes therefore land in
@@ -618,27 +709,30 @@ class opus_gemm_codegen:
 //
 // Auto-generated. Do not edit. See gen_instances.py:gen_lookup_dict.
 //
-// Per-(CTYPE, arch) sorted flat arrays for (M,N,K)->kernel runtime dispatch.
-// Same (M,N,K) can resolve to different kernels in the BF16 vs FP32
-// tables because get_tune_dict keys winners on (M, N, K, outdtype_str, arch)
-// and gen_lookup_dict buckets the rows into per-(CTYPE, arch) macros below.
+// Per-(CTYPE, arch) sorted flat arrays for (M,N,K,cu_num)->kernel runtime
+// dispatch. Same (M,N,K) can resolve to different kernels in the BF16 vs FP32
+// tables because get_tune_dict keys winners on
+// (M, N, K, outdtype_str, arch, cu_num) and gen_lookup_dict buckets the rows
+// into per-(CTYPE, arch) macros below; cu_num stays in the entry so one build
+// can serve several CU counts of one arch.
 // splitk kids appear in either table with their dispatch template forced
 // to <fp32_t>; their traits pick the workspace dtype and the reduce
 // launcher writes the requested Y dtype.
 //
-// Lookup is std::lower_bound on the lex-ordered (M, N, K) key. See
-// opus_gemm_arch_gfx950.cuh for the dispatch wrapper.
+// Lookup is opus_lookup_find (opus_gemm_lookup_entry.cuh): std::lower_bound on
+// the lex-ordered (M, N, K, cu_num) key, then the device's cu_num within the
+// shape's block. See opus_gemm_arch_gfx950.cuh for the dispatch wrapper.
 """
 
         ENTRY_MATCH_CTYPE = """\
-    {{ {{{M}, {N}, {K}}}, &{kernel_name}<CTYPE> }},  \\
+    {{ {{{M}, {N}, {K}, {CU}}}, &{kernel_name}<CTYPE> }},  \\
 """
         ENTRY_FORCE_FP32 = """\
-    {{ {{{M}, {N}, {K}}}, &{kernel_name}<fp32_t> }}, \\
+    {{ {{{M}, {N}, {K}, {CU}}}, &{kernel_name}<fp32_t> }}, \\
 """
         # _ws families: the template slot is the split-K partial type, per-kid.
         ENTRY_WS_PARTIAL = """\
-    {{ {{{M}, {N}, {K}}}, &{kernel_name}<{ctype}> }}, \\
+    {{ {{{M}, {N}, {K}, {CU}}}, &{kernel_name}<{ctype}> }}, \\
 """
 
         # Map ctype short name -> CSV outdtype string emitted by the
@@ -683,22 +777,23 @@ class opus_gemm_codegen:
                         int(mnk[0]),
                         int(mnk[1]),
                         int(mnk[2]),
+                        _key_cu_num(mnk),
                         k.name,
                         is_splitk,
                         _ws_partial_ctype(k),
                     )
                 )
 
-            rows.sort(key=lambda r: (r[0], r[1], r[2]))
+            rows.sort(key=lambda r: (r[0], r[1], r[2], r[3]))
             n = len(rows)
-            for i, (M, N, K, name, is_splitk, ws_ctype) in enumerate(rows):
+            for i, (M, N, K, CU, name, is_splitk, ws_ctype) in enumerate(rows):
                 if ws_ctype is not None:
                     line = ENTRY_WS_PARTIAL.format(
-                        M=M, N=N, K=K, kernel_name=name, ctype=ws_ctype
+                        M=M, N=N, K=K, CU=CU, kernel_name=name, ctype=ws_ctype
                     )
                 else:
                     entry = ENTRY_FORCE_FP32 if is_splitk else ENTRY_MATCH_CTYPE
-                    line = entry.format(M=M, N=N, K=K, kernel_name=name)
+                    line = entry.format(M=M, N=N, K=K, CU=CU, kernel_name=name)
                 if i == n - 1:
                     # Last entry: drop the trailing `\` so the macro
                     # ends cleanly. Strip the line's continuation.
@@ -733,13 +828,20 @@ class opus_gemm_codegen:
                     if want is not None and str(mnk[3]) != want:
                         continue
                 rows.append(
-                    (int(mnk[0]), int(mnk[1]), int(mnk[2]), k.name, k.output_dtypes[0])
+                    (
+                        int(mnk[0]),
+                        int(mnk[1]),
+                        int(mnk[2]),
+                        _key_cu_num(mnk),
+                        k.name,
+                        k.output_dtypes[0],
+                    )
                 )
 
-            rows.sort(key=lambda r: (r[0], r[1], r[2]))
+            rows.sort(key=lambda r: (r[0], r[1], r[2], r[3]))
             n = len(rows)
-            for i, (M, N, K, name, ctype) in enumerate(rows):
-                line = f"    {{ {{{M}, {N}, {K}}}, &{name}<{ctype}> }}, \\\n"
+            for i, (M, N, K, CU, name, ctype) in enumerate(rows):
+                line = f"    {{ {{{M}, {N}, {K}, {CU}}}, &{name}<{ctype}> }}, \\\n"
                 if i == n - 1:
                     line = line.rstrip().rstrip("\\").rstrip() + "\n"
                 f.write(line)
@@ -1307,63 +1409,62 @@ def get_tune_dict(tune_dict_csv):
 
     Key layout
     ----------
-    Tuple keys: (M, N, K, outdtype_str, arch). Promoting outdtype into the
-    key is what lets a single (M, N, K) shape carry distinct winners for
+    Tuple keys: (M, N, K, outdtype_str, arch, cu_num). Promoting outdtype into
+    the key is what lets a single (M, N, K) shape carry distinct winners for
     bf16 vs fp32 output (the underlying main kernel hardware rules differ
     enough that the best kid is not always the same; e.g. fp32 output
     biases reduce-bound shapes toward larger split-K). gen_lookup_dict
     then writes outdtype="torch.bfloat16" rows only into the BF16 (M,N,K)
     map and outdtype="torch.float32" rows only into the FP32 (M,N,K) map.
 
-    arch is in the key for the same reason: the (M,N,K) tables are emitted
-    per arch, so a shape tuned on two arches has one winner per arch. With
-    arch out of the key, whichever CSV row was read last silently evicted
-    the other arch's winner and that arch fell back to its heuristic.
+    arch and cu_num are in the key for the same reason: the tables are emitted
+    per arch and carry cu_num in the C++ key, so a shape tuned on two arches or
+    on two SKUs of one arch has one winner per target. With either out of the
+    key, whichever CSV row was read last silently evicted the other target's
+    winner and that target fell back to its heuristic.
 
     Backwards compat
     ----------------
     Legacy CSVs without an `outdtype` column are interpreted as
-    bf16-output (matches what the tuner used to write). int keys from
+    bf16-output (matches what the tuner used to write); ones without a
+    `cu_num` column key on 0, which no device matches, so they resolve
+    through opus_lookup_find's shape-only fallback. int keys from
     default_kernels_dict are passed through untouched -- gen_lookup_dict
     skips them via the `isinstance(mnk, tuple) and mnk[0] > 0` guard.
     """
-    tune_dict = default_kernels_dict
+    tune_dict = dict(default_kernels_dict)
     if os.path.exists(tune_dict_csv):
         tune_df = pd.read_csv(tune_dict_csv)
-        cu_num = None
-        try:
-            if torch.cuda.is_available():
-                gpu = torch.cuda.current_device()
-                cu_num = torch.cuda.get_device_properties(gpu).multi_processor_count
-        except Exception:  # noqa: BLE001
-            # torch device enumeration is broken on some ROCm nightlies
-            # (device_count()==0 / "Invalid device id"); use rocminfo instead.
-            cu_num = None
-        if cu_num is None:
-            try:
-                from aiter.jit.utils.chip_info import get_cu_num as _rocminfo_cu_num
-
-                cu_num = _rocminfo_cu_num()
-            except Exception:  # noqa: BLE001
-                cu_num = None
-        if cu_num is not None:
-            tune_df = tune_df[tune_df["cu_num"] == cu_num].reset_index()
+        # Filter to the (gfx, cu_num) pairs this build targets, not to the build
+        # host. A build may legitimately bake for more than one SKU of an arch
+        # (AITER_GPU_TARGETS=gfx950:128;gfx950:256), and may target hardware the
+        # builder does not have. get_build_targets() falls back to the live GPU
+        # when no target is named, which is the previous behaviour.
+        targets = _resolve_build_targets()
+        _report_unmatched_targets(tune_df, targets)
+        tune_df = _filter_opus_df_for_targets(tune_df, targets).reset_index()
         # Accept either the legacy "kernelId" column or the new "solidx" column.
         kids = _tune_df_kids(tune_df)
         has_outdtype = "outdtype" in tune_df.columns
+        has_cu_num = "cu_num" in tune_df.columns
         for i in range(len(tune_df)):
             if kids is None or pd.isna(kids.loc[i]):
                 continue
             M = tune_df.loc[i, "M"]
             N = tune_df.loc[i, "N"]
             K = tune_df.loc[i, "K"]
+            outdtype_value = tune_df.loc[i, "outdtype"] if has_outdtype else None
             outdtype = (
-                str(tune_df.loc[i, "outdtype"]) if has_outdtype else "torch.bfloat16"
+                "torch.bfloat16"
+                if outdtype_value is None or pd.isna(outdtype_value)
+                else str(outdtype_value)
             )
+            cu_value = tune_df.loc[i, "cu_num"] if has_cu_num else None
+            cu_num = 0 if cu_value is None or pd.isna(cu_value) else int(cu_value)
             kid = int(kids.loc[i])
             if kid in kernels_list:
                 inst = kernels_list[kid]
-                tune_dict[(M, N, K, outdtype, _kid_arch_common(inst))] = inst
+                tune_dict[(M, N, K, outdtype, _kid_arch_common(inst), cu_num)] = inst
     return tune_dict
 
 
@@ -1375,6 +1476,41 @@ def _tune_df_kids(df):
         values = pd.to_numeric(df[col], errors="coerce")
         kids = values if kids is None else kids.fillna(values)
     return kids
+
+
+def _collect_csv_kids(csv_paths, targets):
+    csv_kids: set[int] = set()
+    for path in csv_paths:
+        try:
+            df = pd.read_csv(path)
+        except (pd.errors.EmptyDataError, FileNotFoundError):
+            continue
+        if "libtype" not in df.columns:
+            continue
+        df = df[df["libtype"] == "opus"]
+        if df.empty:
+            continue
+        df = _filter_opus_df_for_targets(df, targets)
+        if df.empty:
+            continue
+        kids = _tune_df_kids(df)
+        if kids is None:
+            continue
+        for value in kids.dropna().tolist():
+            try:
+                csv_kids.add(int(value))
+            except (TypeError, ValueError):
+                continue
+    return csv_kids
+
+
+def _build_target_arches(targets):
+    """Archs to compile kernels for, or None if none could be resolved.
+
+    Same resolution get_tune_dict filters rows with, so the kid set and the
+    lookup tables can never disagree about which arch the build serves.
+    """
+    return None if targets is None else {gfx.lower() for gfx, _ in targets}
 
 
 if __name__ == "__main__":
@@ -1489,26 +1625,9 @@ if __name__ == "__main__":
                 out.append(path)
         return out
 
-    csv_kids: set[int] = set()
+    targets = _resolve_build_targets()
     csv_paths = _expand_tune_paths(args.tune_files)
-    for path in csv_paths:
-        try:
-            df = pd.read_csv(path)
-        except (pd.errors.EmptyDataError, FileNotFoundError):
-            continue
-        if "libtype" not in df.columns:
-            continue
-        df = df[df["libtype"] == "opus"]
-        if df.empty:
-            continue
-        kids = _tune_df_kids(df)
-        if kids is None:
-            continue
-        for v in kids.dropna().tolist():
-            try:
-                csv_kids.add(int(v))
-            except (TypeError, ValueError):
-                continue
+    csv_kids = _collect_csv_kids(csv_paths, targets)
 
     sidecar_path = args.compiled_kids_sidecar or os.path.join(
         args.working_path, "compiled_kids.json"
@@ -1530,23 +1649,7 @@ if __name__ == "__main__":
     # Per-arch filter: drop kids whose arch_prefix is not in the target build set.
     _kid_arch = _kid_arch_common
 
-    target_arches = None
-    gpu_archs_env = os.getenv("GPU_ARCHS", "native").strip()
-    explicit = [
-        a.strip().lower()
-        for a in gpu_archs_env.split(";")
-        if a.strip() and a.strip().lower() != "native"
-    ]
-    if explicit:
-        target_arches = set(explicit)
-    else:
-        # GPU_ARCHS=native: probe live GPU; skip filter if rocminfo unavailable.
-        try:
-            from aiter.jit.utils.chip_info import get_gfx_runtime
-
-            target_arches = {get_gfx_runtime().lower()}
-        except Exception:  # noqa: BLE001
-            target_arches = None
+    target_arches = _build_target_arches(targets)
 
     if target_arches is not None:
         before = len(S)
@@ -1574,6 +1677,18 @@ if __name__ == "__main__":
         f.writelines(
             f"#define OPUS_BUILD_HAS_{a.upper()} 1\n" for a in archs_for_header
         )
+        # opus_gemm.cu sizes the gfx1250 split-K workspace as bf16; publish the
+        # widest partial any baked _ws_ kid stores so it can assert, not fault.
+        ws_bytes = max(
+            (
+                _CTYPE_BYTES[_ws_partial_ctype(kernels_list[kid])]
+                for kid in S
+                if _kid_arch(kernels_list[kid]) == "gfx1250"
+                and _ws_partial_ctype(kernels_list[kid]) is not None
+            ),
+            default=_CTYPE_BYTES["bf16_t"],
+        )
+        f.write(f"#define OPUS_GFX1250_WS_PARTIAL_BYTES {ws_bytes}\n")
 
     # gfx950 a8w8 (kid 1, 2) is only needed when the module is built with
     # gfx950 support. gfx942 has its own blockscale bpreshuffle A8W8 tune path.

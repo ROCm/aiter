@@ -79,6 +79,9 @@ OUT_FOLDER/
 
 # Large benchmark results - archive to Wiki or external storage
 op_tests/moe_benchmarking_profiling/results/*.csv
+op_tests/opus/test_opus_basic
+op_tests/opus/test_opus_fp4_device
+op_tests/opus/*.so
 scripts/results/*.csv
 
 # Opus tuned/untuned CSVs (moved to aiter/configs/bf16_tuned_gemm.csv with libtype='opus' filter;

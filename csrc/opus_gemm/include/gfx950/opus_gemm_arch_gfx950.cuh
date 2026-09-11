@@ -24,6 +24,7 @@
 
 #include "../opus_gemm_arch.cuh"
 #include "../opus_gemm_common.cuh"
+#include "../opus_gemm_lookup_entry.cuh"  // OpusLookupKey + opus_lookup_find
 #include "opus_gemm_heuristic_dispatch_gfx950.cuh"  // OpusA16W16NoscaleKernel + opus_a16w16_heuristic_kid_gfx950()
 #include "opus_gemm_lookup.h"                       // GENERATE_OPUS_LOOKUP_TABLE_{BF16,FP32}_GFX950
 #include "opus_gemm_a16w16_tune_lookup.h"           // GENERATE_A16W16_TUNE_LOOKUP_{BF16,FP32}_GFX950
@@ -43,38 +44,14 @@ namespace opus_gfx950_detail
 // a flat array of POD entries plus std::lower_bound costs essentially
 // nothing at parse time and matches the lookup at runtime in O(log N)
 // over 339 entries.
-// Nested {shape, func} aggregate matches the `{ {M, N, K}, &kernel }`
-// initializer the codegen emits. Splitting shape into its own struct
-// keeps the comparators small and gives gen_instances.py a stable
-// brace pattern to target.
-struct OpusA16W16Shape
-{
-    int M;
-    int N;
-    int K;
-};
-
+// Nested {shape, func} aggregate matches the `{ {M, N, K, CU}, &kernel }`
+// initializer the codegen emits. OpusLookupKey and the search over it are
+// shared with the other arches in opus_gemm_lookup_entry.cuh.
 struct OpusA16W16RuntimeEntry
 {
-    OpusA16W16Shape key;
+    OpusLookupKey key;
     OpusA16W16NoscaleKernel func;
 };
-
-// Lex order on (M, N, K). Used both during sorting (gen_instances.py
-// emits entries in lex order) and by std::lower_bound at lookup time.
-constexpr bool entry_less(const OpusA16W16RuntimeEntry& a,
-                          const OpusA16W16RuntimeEntry& b) noexcept
-{
-    if (a.key.M != b.key.M) return a.key.M < b.key.M;
-    if (a.key.N != b.key.N) return a.key.N < b.key.N;
-    return a.key.K < b.key.K;
-}
-
-constexpr bool entry_eq(const OpusA16W16RuntimeEntry& a,
-                        const OpusA16W16RuntimeEntry& b) noexcept
-{
-    return a.key.M == b.key.M && a.key.N == b.key.N && a.key.K == b.key.K;
-}
 
 // id -> kernel<CDataType>, same flat-array layout. Sorted by id (the
 // codegen always emits in ascending id order).
@@ -134,9 +111,10 @@ opus_a16w16_tune_dispatch_gfx950<bf16_t>(int id)
     constexpr size_t kSize = sizeof(kTune) / sizeof(kTune[0]);
     OpusA16W16TuneEntry needle{id, nullptr};
     auto it = std::lower_bound(kTune, kTune + kSize, needle, tune_entry_less);
-    AITER_CHECK(it != kTune + kSize && it->kid == id,
-                "Kernel id ", id,
-                " not found in a16w16 bf16 tune lookup table");
+    AITER_CHECK_OR_RAISE(aiter_detail::unbaked_kernel_error,
+                         it != kTune + kSize && it->kid == id,
+                         "Kernel id ", id,
+                         " not found in a16w16 bf16 tune lookup table");
     return it->func;
 }
 
@@ -151,9 +129,10 @@ opus_a16w16_tune_dispatch_gfx950<fp32_t>(int id)
     constexpr size_t kSize = sizeof(kTune) / sizeof(kTune[0]);
     OpusA16W16TuneEntry needle{id, nullptr};
     auto it = std::lower_bound(kTune, kTune + kSize, needle, tune_entry_less);
-    AITER_CHECK(it != kTune + kSize && it->kid == id,
-                "Kernel id ", id,
-                " not found in a16w16 fp32 tune lookup table");
+    AITER_CHECK_OR_RAISE(aiter_detail::unbaked_kernel_error,
+                         it != kTune + kSize && it->kid == id,
+                         "Kernel id ", id,
+                         " not found in a16w16 fp32 tune lookup table");
     return it->func;
 }
 
@@ -179,11 +158,10 @@ opus_dispatch_a16w16_gfx950<bf16_t>(int M, int N, int K, int batch, bool has_bia
         GENERATE_OPUS_LOOKUP_TABLE_BF16_GFX950(bf16_t)
     };
     constexpr size_t kSize = sizeof(kLookup) / sizeof(kLookup[0]);
-    OpusA16W16RuntimeEntry needle{{M, N, K}, nullptr};
-    auto it = std::lower_bound(kLookup, kLookup + kSize, needle, entry_less);
-    if (it != kLookup + kSize && entry_eq(*it, needle))
+    if (auto* e = opus_lookup_find(kLookup, kLookup + kSize, M, N, K,
+                                   opus_get_device_cu_num()))
     {
-        return it->func;
+        return e->func;
     }
     (void)batch;  // heuristic does not currently use batch.
     // 4 GiB buffer-resource guard. The heuristic returns one of
@@ -221,11 +199,10 @@ opus_dispatch_a16w16_gfx950<fp32_t>(int M, int N, int K, int batch, bool has_bia
         GENERATE_OPUS_LOOKUP_TABLE_FP32_GFX950(fp32_t)
     };
     constexpr size_t kSize = sizeof(kLookup) / sizeof(kLookup[0]);
-    OpusA16W16RuntimeEntry needle{{M, N, K}, nullptr};
-    auto it = std::lower_bound(kLookup, kLookup + kSize, needle, entry_less);
-    if (it != kLookup + kSize && entry_eq(*it, needle))
+    if (auto* e = opus_lookup_find(kLookup, kLookup + kSize, M, N, K,
+                                   opus_get_device_cu_num()))
     {
-        return it->func;
+        return e->func;
     }
     (void)batch;
     // 4 GiB buffer-resource guard (see <bf16_t> overload for rationale).

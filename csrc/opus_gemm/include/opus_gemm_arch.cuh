@@ -26,16 +26,20 @@ struct OpusArchInfo
     OpusGfxArch arch;
     std::string name;  // full gcnArchName, e.g. "gfx950:sramecc+:xnack-"
     int dev;
+    int cu_num;
 };
 }  // namespace opus_arch_detail
 
-// One-shot probe of the active CUDA device (one-device-per-process model).
+// Probe of the device this thread is bound to, cached per device ordinal so a
+// process that calls hipSetDevice does not keep the first device's arch and CU
+// count. Both select kernels, so a stale value runs another SKU's binary.
 inline const opus_arch_detail::OpusArchInfo &opus_get_arch_info()
 {
     using namespace opus_arch_detail;
-    static const OpusArchInfo info = []() {
-        int dev = -1;
-        AITER_CHECK(hipGetDevice(&dev) == hipSuccess, "opus_gemm: hipGetDevice failed");
+    static SynchronizedCache<int, OpusArchInfo> cache;
+    int dev = -1;
+    AITER_CHECK(hipGetDevice(&dev) == hipSuccess, "opus_gemm: hipGetDevice failed");
+    return cache.get_or_create(dev, [dev]() {
         hipDeviceProp_t prop{};
         AITER_CHECK(hipGetDeviceProperties(&prop, dev) == hipSuccess,
                     "opus_gemm: hipGetDeviceProperties failed");
@@ -53,12 +57,18 @@ inline const opus_arch_detail::OpusArchInfo &opus_get_arch_info()
         {
             a = OpusGfxArch::Gfx1250;
         }
-        return OpusArchInfo{a, std::move(name), dev};
-    }();
-    return info;
+        return OpusArchInfo{a, std::move(name), dev, prop.multiProcessorCount};
+    });
 }
 
 inline OpusGfxArch opus_get_gfx_arch()
 {
     return opus_get_arch_info().arch;
+}
+
+// CU count of the active device, matching the `cu_num` column the tuner stamps
+// on every row. Selects between the CU-count variants baked into one build.
+inline int opus_get_device_cu_num()
+{
+    return opus_get_arch_info().cu_num;
 }

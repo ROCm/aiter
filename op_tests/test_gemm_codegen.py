@@ -27,9 +27,11 @@ Usage:
 import contextlib
 import inspect
 import os
+import re
 import sys
 import tempfile
 import textwrap
+from unittest import mock
 
 # Ensure the repo-local aiter is imported, not any system/site-packages install.
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -232,6 +234,188 @@ def test_get_build_targets():
 # ---------------------------------------------------------------------------
 # Section 2: gen_instances filter — uses filter_tune_df from build_targets
 # ---------------------------------------------------------------------------
+
+
+def _tuned_rows(tune_dict):
+    """(M, gfx, cu_num, instance) for the shape-keyed rows of a tune dict.
+
+    get_tune_dict keys those on (M, N, K, outdtype, gfx, cu_num); int keys are
+    default_kernels_dict passthroughs. Unpacking asserts the arity, so a field
+    inserted into the key fails here instead of silently reading the wrong one.
+    """
+    for key, inst in tune_dict.items():
+        if isinstance(key, tuple) and key[0] > 0:
+            M, _N, _K, _outdtype, gfx, cu_num = key
+            yield M, gfx, cu_num, inst
+
+
+def _emits_pair(generated, cu_num, kernel_name):
+    """Whether the header maps a key ending in cu_num to kernel_name.
+
+    Matched as a pair rather than two substrings: independent checks pass even
+    if the emitter cross-wires a CU to another entry. Whitespace-tolerant so
+    reformatting the template is not a failure.
+    """
+    return re.search(
+        r"\{\s*1,\s*8,\s*16,\s*"
+        + str(cu_num)
+        + r"\s*\}[^&]*&\s*"
+        + re.escape(kernel_name),
+        generated,
+    )
+
+
+def test_opus_bakes_both_skus():
+    _section("1a. opus gen_instances — bakes every named (gfx, cu_num)")
+
+    orig_path = list(sys.path)
+    orig_modules = set(sys.modules)
+    orig_env = {
+        k: os.environ.pop(k, None) for k in ("AITER_GPU_TARGETS", "GPU_ARCHS", "CU_NUM")
+    }
+    try:
+        sys.path.insert(0, os.path.join(_REPO_ROOT, "csrc", "opus_gemm"))
+        try:
+            import gen_instances as opus
+        except Exception as e:  # noqa: BLE001
+            print(f"  SKIP  opus gen_instances not importable ({e})")
+            return
+        with tempfile.TemporaryDirectory() as tmp_dir:
+
+            # Both SKUs use the SAME (M, N, K) and different kernels: that is the
+            # case a cu_num-less key silently collapses to one winner.
+            eligible = [
+                k
+                for k in sorted(opus.kernels_list)
+                if opus.kernels_list[k].kernel_tag in opus.A16W16_TUNE_TAGS
+                and "bf16_t" in opus.kernels_list[k].output_dtypes
+            ]
+            arch_of = {k: opus._kid_arch_common(opus.kernels_list[k]) for k in eligible}
+            arch = arch_of[eligible[0]] if eligible else None
+            same_arch = [k for k in eligible if arch_of[k] == arch]
+            # Keep the same CU as an on-target row so a broken CU-only filter cannot
+            # accidentally make this assertion pass.
+            off_arch = next((k for k in eligible if arch_of[k] != arch), None)
+            # Preconditions are facts about this tree, so fail rather than skip: a
+            # silent skip reports the same green as thirteen passing checks.
+            _check(
+                "registry offers two same-arch and one off-arch bf16 a16w16 kernel",
+                len(same_arch) >= 2 and off_arch is not None,
+                f"eligible={len(eligible)} arch={arch} same_arch={len(same_arch)}",
+            )
+            if len(same_arch) < 2 or off_arch is None:
+                return
+            kid_256, kid_128 = same_arch[0], same_arch[1]
+
+            def _csv(name, content):
+                path = os.path.join(tmp_dir, name)
+                with open(path, "w") as f:
+                    f.write(textwrap.dedent(content).strip() + "\n")
+                return path
+
+            tmp_name = _csv(
+                "targets.csv",
+                f"""
+                gfx,cu_num,M,N,K,outdtype,libtype,solidx
+                {arch},256,1,8,16,torch.bfloat16,opus,{kid_256}
+                {arch},128,1,8,16,torch.bfloat16,opus,{kid_128}
+                {arch_of[off_arch]},128,3,8,16,torch.bfloat16,opus,{off_arch}
+                """,
+            )
+
+            compile_kids = opus._collect_csv_kids([tmp_name], [(arch, 128)])
+            _check(
+                "production OPUS compile set excludes off-CU and off-gfx kids",
+                compile_kids == {kid_128},
+                str(sorted(compile_kids)),
+            )
+
+            os.environ["AITER_GPU_TARGETS"] = f"{arch}:128;{arch}:256"
+            d = opus.get_tune_dict(tmp_name)
+            baked = {(gfx, cu): inst.name for _, gfx, cu, inst in _tuned_rows(d)}
+            _check(
+                f"AITER_GPU_TARGETS={arch}:128;{arch}:256 keeps both SKUs of one shape",
+                baked
+                == {
+                    (arch, 256): opus.kernels_list[kid_256].name,
+                    (arch, 128): opus.kernels_list[kid_128].name,
+                },
+                str(sorted(baked.items())),
+            )
+            opus.opus_gemm_codegen(tmp_dir).gen_lookup_dict(d)
+            with open(os.path.join(tmp_dir, "opus_gemm_lookup.h")) as f:
+                generated = f.read()
+            _check(
+                "generated a16w16 lookup pairs each CU with its own winner",
+                all(
+                    _emits_pair(generated, cu, opus.kernels_list[kid].name)
+                    for cu, kid in ((128, kid_128), (256, kid_256))
+                ),
+                generated,
+            )
+            _check(
+                "off-target row is dropped",
+                arch_of[off_arch] not in {gfx for gfx, _ in baked},
+                str(sorted(baked)),
+            )
+
+            os.environ["AITER_GPU_TARGETS"] = f"{arch}:128"
+            d = opus.get_tune_dict(tmp_name)
+            cus = {cu for _, _, cu, _ in _tuned_rows(d)}
+            _check(
+                f"AITER_GPU_TARGETS={arch}:128 bakes only the 128-CU row",
+                cus == {128},
+                str(sorted(cus)),
+            )
+
+            # A target with no rows must not raise, and must not smuggle others in.
+            os.environ["AITER_GPU_TARGETS"] = f"{arch}:64"
+            d = opus.get_tune_dict(tmp_name)
+            _check(
+                "a target with no tuned rows bakes nothing",
+                not list(_tuned_rows(d)),
+                str(sorted(k for k in d if isinstance(k, tuple))),
+            )
+
+            # Legacy rows without cu_num remain shape fallbacks (CU=0) instead of
+            # failing during target filtering.
+            legacy_tmp_name = _csv(
+                "legacy.csv",
+                f"""
+                gfx,cu_num,M,N,K,outdtype,solidx
+                {arch},128,2,8,16,torch.bfloat16,{kid_256}
+                {arch},,1,8,16,,{kid_128}
+                """,
+            )
+            os.environ["AITER_GPU_TARGETS"] = f"{arch}:128"
+            d = opus.get_tune_dict(legacy_tmp_name)
+            legacy_cus = {cu for _, _, cu, _ in _tuned_rows(d)}
+            _check(
+                "mixed-schema opus CSV retains exact and CU=0 fallback rows",
+                legacy_cus == {0, 128},
+                str(sorted(legacy_cus)),
+            )
+            os.environ.pop("AITER_GPU_TARGETS", None)
+            with mock.patch.object(
+                opus, "get_build_targets", side_effect=RuntimeError("no GPU or target")
+            ):
+                d = opus.get_tune_dict(legacy_tmp_name)
+            _check(
+                "GPU-less mixed-schema opus generation accepts NaN cu_num",
+                len(list(_tuned_rows(d))) == 2,
+            )
+
+    finally:
+        for name, val in orig_env.items():
+            if val is not None:
+                os.environ[name] = val
+            else:
+                os.environ.pop(name, None)
+        # csrc/*_gemm_*/ each ship their own gen_instances.py / codegen package;
+        # leaving this one on sys.path shadows the others for the rest of the run.
+        sys.path[:] = orig_path
+        for name in set(sys.modules) - orig_modules:
+            del sys.modules[name]
 
 
 def test_gen_instances_filter(
@@ -1033,6 +1217,7 @@ def test_unmatched_targets():
 
 if __name__ == "__main__":
     test_get_build_targets()
+    test_opus_bakes_both_skus()
     test_unmatched_targets()
     test_gen_instances_filter(
         csv_path=REPRO_CSV,

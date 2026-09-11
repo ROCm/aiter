@@ -17,6 +17,7 @@
 #include <cassert>
 #include <type_traits>
 #include "opus/opus.hpp"
+#include "opus_gemm_lookup_entry.cuh"
 
 // =============================================================================
 // Test Utilities
@@ -506,11 +507,58 @@ bool test_layout_basic() {
 // =============================================================================
 // Main
 // =============================================================================
+
+// =============================================================================
+// Generated-lookup search (opus_gemm_lookup_entry.cuh)
+// =============================================================================
+
+namespace {
+using LookupFn = int (*)();
+struct LookupEntry { OpusLookupKey key; LookupFn func; };
+
+int k128() { return 128; }
+int k256() { return 256; }
+int kLegacy() { return 0; }
+int kOther() { return -1; }
+
+// Emitted sorted on (M, N, K, cu_num), as gen_lookup_dict writes them.
+constexpr LookupEntry kTable[] = {
+    {{1, 2, 3, 0},   &kLegacy},
+    {{1, 2, 3, 128}, &k128},
+    {{1, 2, 3, 256}, &k256},
+    {{4, 5, 6, 128}, &kOther},
+};
+constexpr size_t kTableSize = sizeof(kTable) / sizeof(kTable[0]);
+
+const LookupEntry* lk_find(int M, int N, int K, int cu, bool fallback = true) {
+    return opus_lookup_find(kTable, kTable + kTableSize, M, N, K, cu, fallback);
+}
+}  // namespace
+
+bool test_opus_lookup_exact_cu() {
+    TEST_ASSERT(lk_find(1, 2, 3, 128)->func == &k128, "exact CU 128 wins");
+    TEST_ASSERT(lk_find(1, 2, 3, 256)->func == &k256, "exact CU 256 wins");
+    TEST_ASSERT(lk_find(4, 5, 6, 128)->func == &kOther, "second shape resolves");
+    return true;
+}
+
+bool test_opus_lookup_fallback_order() {
+    // Neither shape has a 512-CU row: one has a legacy row to fall back on,
+    // the other only its own CU rows.
+    TEST_ASSERT(lk_find(1, 2, 3, 512)->func == &kLegacy, "legacy CU=0 preferred");
+    TEST_ASSERT(lk_find(4, 5, 6, 512) == nullptr, "no legacy row misses");
+    return true;
+}
+
 int main() {
     std::cout << "======================================" << std::endl;
     std::cout << "OPUS (AI Operator Micro Std) Unit Tests" << std::endl;
     std::cout << "======================================" << std::endl;
     std::cout << std::endl;
+
+    std::cout << "--- Generated Lookup Search Tests ---" << std::endl;
+    RUN_TEST(test_opus_lookup_exact_cu);
+    RUN_TEST(test_opus_lookup_fallback_order);
 
     std::cout << "--- Number and Sequence Tests ---" << std::endl;
     RUN_TEST(test_number_basic);

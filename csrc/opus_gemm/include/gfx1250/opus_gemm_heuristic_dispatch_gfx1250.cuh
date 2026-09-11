@@ -18,6 +18,7 @@
 #include <optional>
 
 #include "aiter_tensor.h"  // aiter_tensor_t (torch-free)
+#include "../opus_gemm_lookup_entry.cuh"  // OpusLookupKey + opus_lookup_find
 
 // Shared flat-array dispatch POD types + comparators for gfx1250 (mirrors the
 // gfx950 set). gen_instances.py emits the tune / (M,N,K) lookup tables as
@@ -31,41 +32,17 @@ using OpusA16W16NoscaleKernel = void (*)(
     aiter_tensor_t &, aiter_tensor_t &,
     aiter_tensor_t &, aiter_tensor_t &, std::optional<aiter_tensor_t>, int);
 
-struct OpusA16W16Shape
-{
-    int M;
-    int N;
-    int K;
-};
-
 struct OpusA16W16RuntimeEntry
 {
-    OpusA16W16Shape key;
+    OpusLookupKey key;
     OpusA16W16NoscaleKernel func;
 };
 
-// Comparators are templated on the entry type rather than written once per
-// table: the entry types differ only in what they carry NEXT to the key (a
-// workspace-carrying function pointer, a workspace-free one, ...), and every
-// table is keyed the same way. Explicit template args at the call sites, since
-// std::lower_bound has no target type to deduce them from.
-//
-// Lex order on (M, N, K). Used both during sorting (gen_instances.py emits
-// entries in lex order) and by std::lower_bound at lookup time.
-template <typename Entry>
-constexpr bool shape_entry_less(const Entry& a, const Entry& b) noexcept
-{
-    if (a.key.M != b.key.M) return a.key.M < b.key.M;
-    if (a.key.N != b.key.N) return a.key.N < b.key.N;
-    return a.key.K < b.key.K;
-}
-
-template <typename Entry>
-constexpr bool shape_entry_eq(const Entry& a, const Entry& b) noexcept
-{
-    return a.key.M == b.key.M && a.key.N == b.key.N && a.key.K == b.key.K;
-}
-
+// Templated on the entry type rather than written once per table: the id-keyed
+// entry types differ only in what they carry NEXT to the kid (a
+// workspace-carrying function pointer, a workspace-free one, ...). Explicit
+// template args at the call sites, since std::lower_bound has no target type to
+// deduce them from.
 template <typename Entry>
 constexpr bool kid_entry_less(const Entry& a, const Entry& b) noexcept
 {
@@ -110,7 +87,7 @@ struct OpusA16W16CoTuneEntry
 
 struct OpusA16W16CoRuntimeEntry
 {
-    OpusA16W16Shape key;
+    OpusLookupKey key;
     OpusA16W16CoKernel func;
 };
 }  // namespace opus_gfx1250_detail

@@ -6,6 +6,7 @@
 
 #include "../opus_gemm_arch.cuh"
 #include "../opus_gemm_common.cuh"
+#include "../opus_gemm_lookup_entry.cuh"  // OpusLookupKey + opus_lookup_find
 #include "opus_gemm_heuristic_dispatch_gfx942.cuh"  // OpusA16W16NoscaleKernel + opus_a16w16_heuristic_dispatch_gfx942<>
 #include "opus_gemm_lookup.h"                       // GENERATE_OPUS_LOOKUP_TABLE_{BF16,FP32}_GFX942
 #include "opus_gemm_a16w16_tune_lookup.h"           // GENERATE_A16W16_TUNE_LOOKUP_{BF16,FP32}_GFX942
@@ -19,32 +20,11 @@
 
 namespace opus_gfx942_detail
 {
-struct OpusA16W16Shape
-{
-    int M;
-    int N;
-    int K;
-};
-
 struct OpusA16W16RuntimeEntry
 {
-    OpusA16W16Shape key;
+    OpusLookupKey key;
     OpusA16W16NoscaleKernel func;
 };
-
-constexpr bool entry_less(const OpusA16W16RuntimeEntry& a,
-                          const OpusA16W16RuntimeEntry& b) noexcept
-{
-    if (a.key.M != b.key.M) return a.key.M < b.key.M;
-    if (a.key.N != b.key.N) return a.key.N < b.key.N;
-    return a.key.K < b.key.K;
-}
-
-constexpr bool entry_eq(const OpusA16W16RuntimeEntry& a,
-                        const OpusA16W16RuntimeEntry& b) noexcept
-{
-    return a.key.M == b.key.M && a.key.N == b.key.N && a.key.K == b.key.K;
-}
 
 struct OpusA16W16TuneEntry
 {
@@ -92,11 +72,10 @@ opus_dispatch_a16w16_gfx942<bf16_t>(int M, int N, int K, int batch, bool has_bia
         GENERATE_OPUS_LOOKUP_TABLE_BF16_GFX942(bf16_t)
     };
     constexpr size_t kSize = sizeof(kLookup) / sizeof(kLookup[0]);
-    OpusA16W16RuntimeEntry needle{{M, N, K}, nullptr};
-    auto it = std::lower_bound(kLookup, kLookup + kSize, needle, entry_less);
-    if (it != kLookup + kSize && entry_eq(*it, needle))
+    if (auto* e = opus_lookup_find(kLookup, kLookup + kSize, M, N, K,
+                                   opus_get_device_cu_num()))
     {
-        return it->func;
+        return e->func;
     }
     return opus_a16w16_heuristic_dispatch_gfx942<bf16_t>(M, N, K, batch, has_bias);
 }
@@ -110,11 +89,10 @@ opus_dispatch_a16w16_gfx942<fp32_t>(int M, int N, int K, int batch, bool has_bia
         GENERATE_OPUS_LOOKUP_TABLE_FP32_GFX942(fp32_t)
     };
     constexpr size_t kSize = sizeof(kLookup) / sizeof(kLookup[0]);
-    OpusA16W16RuntimeEntry needle{{M, N, K}, nullptr};
-    auto it = std::lower_bound(kLookup, kLookup + kSize, needle, entry_less);
-    if (it != kLookup + kSize && entry_eq(*it, needle))
+    if (auto* e = opus_lookup_find(kLookup, kLookup + kSize, M, N, K,
+                                   opus_get_device_cu_num()))
     {
-        return it->func;
+        return e->func;
     }
     return opus_a16w16_heuristic_dispatch_gfx942<fp32_t>(M, N, K, batch, has_bias);
 }
@@ -136,9 +114,10 @@ opus_a16w16_tune_dispatch_gfx942<bf16_t>(int id)
     constexpr size_t kSize = sizeof(kTune) / sizeof(kTune[0]);
     OpusA16W16TuneEntry needle{id, nullptr};
     auto it = std::lower_bound(kTune, kTune + kSize, needle, tune_entry_less);
-    AITER_CHECK(it != kTune + kSize && it->kid == id,
-                "Kernel id ", id,
-                " not found in a16w16 bf16 tune lookup table (gfx942)");
+    AITER_CHECK_OR_RAISE(aiter_detail::unbaked_kernel_error,
+                         it != kTune + kSize && it->kid == id,
+                         "Kernel id ", id,
+                         " not found in a16w16 bf16 tune lookup table (gfx942)");
     return it->func;
 }
 
@@ -153,9 +132,10 @@ opus_a16w16_tune_dispatch_gfx942<fp32_t>(int id)
     constexpr size_t kSize = sizeof(kTune) / sizeof(kTune[0]);
     OpusA16W16TuneEntry needle{id, nullptr};
     auto it = std::lower_bound(kTune, kTune + kSize, needle, tune_entry_less);
-    AITER_CHECK(it != kTune + kSize && it->kid == id,
-                "Kernel id ", id,
-                " not found in a16w16 fp32 tune lookup table (gfx942)");
+    AITER_CHECK_OR_RAISE(aiter_detail::unbaked_kernel_error,
+                         it != kTune + kSize && it->kid == id,
+                         "Kernel id ", id,
+                         " not found in a16w16 fp32 tune lookup table (gfx942)");
     return it->func;
 }
 
@@ -174,8 +154,9 @@ opus_a8w8_tune_dispatch_gfx942(int id)
     constexpr size_t kSize = sizeof(kTune) / sizeof(kTune[0]);
     OpusA8W8TuneEntry needle{id, nullptr};
     auto it = std::lower_bound(kTune, kTune + kSize, needle, a8w8_tune_entry_less);
-    AITER_CHECK(it != kTune + kSize && it->kid == id,
-                "Kernel id ", id,
-                " not found in a8w8 bf16 tune lookup table (gfx942)");
+    AITER_CHECK_OR_RAISE(aiter_detail::unbaked_kernel_error,
+                         it != kTune + kSize && it->kid == id,
+                         "Kernel id ", id,
+                         " not found in a8w8 bf16 tune lookup table (gfx942)");
     return it->func;
 }

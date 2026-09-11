@@ -140,6 +140,13 @@ def gpu_archs_env_names() -> list[str]:
     return [a for a in archs if a != "native"]
 
 
+def has_named_targets() -> bool:
+    """True when AITER_GPU_TARGETS is set, or GPU_ARCHS names a non-native arch."""
+    if (os.getenv("AITER_GPU_TARGETS") or "").strip():
+        return True
+    return bool(gpu_archs_env_names())
+
+
 def get_build_targets_env() -> list[tuple[str, int]]:
     """Resolve build targets from env only. No live GPU detection.
 

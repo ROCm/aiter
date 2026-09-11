@@ -47,6 +47,7 @@ import pandas as pd
 import torch
 
 from aiter.jit.core import AITER_ROOT_DIR
+from aiter.jit.utils.chip_info import get_gfx_runtime
 
 # ---- Env / default paths --------------------------------------------------
 
@@ -65,6 +66,7 @@ OPUS_TUNED_CSV_GLOB = os.getenv("AITER_OPUS_TUNED_CSV_GLOB", _DEFAULT_TUNED_CSV_
 # ---- Tuned CSV lookup -----------------------------------------------------
 
 _KEY_COLUMNS = (
+    "gfx",
     "cu_num",
     "M",
     "N",
@@ -123,10 +125,14 @@ def _load_tuned_dict() -> dict:
         df = df[df["libtype"] == "opus"]
         if df.empty:
             continue
-        missing = [c for c in _KEY_COLUMNS if c not in df.columns]
+        missing = [c for c in _KEY_COLUMNS if c != "gfx" and c not in df.columns]
         if missing:
             # Malformed / partial-schema CSV. Skip rather than crash.
             continue
+        if "gfx" in df.columns:
+            df = df.assign(gfx=df["gfx"].fillna("").astype(str).str.strip().str.lower())
+        else:
+            df = df.assign(gfx="")
         frames.append(df)
 
     if not frames:
@@ -165,12 +171,14 @@ def _key_from_runtime(
     outdtype: torch.dtype,
     scaleAB: bool = False,
     bpreshuffle: bool = False,
+    gfx: str = "",
 ) -> tuple:
     """Build the 9-tuple lookup key using the current device's cu_num."""
     cu_num = torch.cuda.get_device_properties(
         torch.cuda.current_device()
     ).multi_processor_count
     return (
+        gfx,
         int(cu_num),
         int(M),
         int(N),
@@ -229,8 +237,14 @@ def lookup_tuned(
 
     Dict contains 'solidx' (kernelId), 'splitK', 'kernelName'.
     """
-    key = _key_from_runtime(M, N, K, bias, dtype, outdtype, scaleAB, bpreshuffle)
-    return _load_tuned_dict().get(key)
+    tuned = _load_tuned_dict()
+    key = _key_from_runtime(
+        M, N, K, bias, dtype, outdtype, scaleAB, bpreshuffle, get_gfx_runtime()
+    )
+    hit = tuned.get(key)
+    if hit is None:
+        hit = tuned.get(("",) + key[1:])
+    return hit
 
 
 __all__ = [
