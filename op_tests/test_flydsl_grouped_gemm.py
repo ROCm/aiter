@@ -2,2057 +2,2128 @@
 
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
+# ruff: noqa: EXE005, I001
+"""Architecture-selected FlyDSL grouped GEMM test entry point.
 
-"""FlyDSL grouped MoE GEMM tests for gfx950 and gfx1250.
-
-The gfx1250 suite covers two TDM formats through ``aiter.fused_moe``:
-
-* **a4w4** -- MXFP4 activations × MXFP4 weights (``w1.dtype = fp4x2``).
-* **a8w4** -- MXFP8 activations × MXFP4 weights (``w1.dtype = uint8``).
-
-Both go through the public ``fused_moe`` API; we never call the underlying
-grouped GEMM launcher directly. The grouped path is opted-in via the
-``AITER_USE_GROUPED_GEMM=1`` env (set automatically by the runner below).
-
-The gfx950 suite covers the GUI-preshuffled A8W4 stage1, stage2, and end-to-end
-paths. Tests select the matching suite with ``get_gfx()``.
-
-Direct execution on gfx1250
-(``python op_tests/test_flydsl_grouped_gemm.py``) runs a
-DeepSeek-style perf bench (``--scenario bench``, end-to-end fused_moe), a
-per-kernel bench that times gemm1 and gemm2 in isolation
-(``--scenario kernel``), a tiny correctness check
-(``--scenario verify``), or a full sweep of every setting in a tuned-config
-CSV (``--scenario csv``; defaults to ``aiter/configs/tuned_grouped_fmoe.csv``,
-one benched case per row, override the file with ``--csv-path``).
+The original gfx950 GUI A8W4 and gfx1250 TDM grouped-MoE suites live unchanged
+in separate ``get_gfx()`` branches below. Only the matching branch is imported
+and collected on a given machine.
 """
 
 from __future__ import annotations
 
-import argparse
-import csv
 import os
-import sys
-from contextlib import nullcontext
 
-import pytest
-import torch
-
-from aiter import ActivationType, QuantType, logger
-from aiter import test_common as bench_init
-from aiter.aot.flydsl.common import run_only_env
-from aiter.fused_moe import (
-    fused_moe,
-    fused_topk,
-    moe_sorting,
-    torch_moe_stage1,
-    torch_moe_stage2,
-)
 from aiter.jit.utils.chip_info import get_gfx
-from aiter.ops.flydsl.moe_common import GateMode, apply_gate_up
-from aiter.ops.flydsl.moe_kernels import (
-    pick_flydsl_stage2_tile_k,
-    resolve_flydsl_stage2_tile_k,
-)
-from aiter.ops.quant import (
-    mxfp4_moe_sort_fwd,
-    per_1x32_f4_quant,
-    per_1x32_f8_scale_f8_quant,
-)
-from aiter.ops.shuffle import (
-    moe_shuffle_scale,
-    moe_shuffle_weight,
-    shuffle_scale_a16w4,
-    shuffle_weight,
-    shuffle_weight_a16w4,
-)
-from aiter.test_common import checkAllclose
-from aiter.utility import dtypes, fp4_utils
-from aiter.utility.fp4_utils import e8m0_shuffle
 
-# Build every tensor straight on the device (like op_tests/test_moe_2stage.py) so
-# the test body has no `.cuda()` / `.float().cuda()` plumbing.
-torch.set_default_device("cuda")
-
-pytestmark = [pytest.mark.l2_device, pytest.mark.rocm_lower]
-
-# Routing: normal (random) by default; round-robin balanced only when
-# AITER_MOE_EXPERT_BALANCE=1 (mirrors op_tests/test_moe_2stage.py).
-AITER_MOE_EXPERT_BALANCE = (
-    os.environ.get("AITER_MOE_EXPERT_BALANCE", "False").lower() == "true"
+_GFX = get_gfx()
+_FORCE_GFX1250 = os.environ.get("AITER_FORCE_GFX1250", "0") in (
+    "1",
+    "true",
+    "True",
+    "yes",
 )
 
+# Keep both original suites byte-for-byte apart from indentation and the nested
+# future imports removed above.
+# fmt: off
+if _GFX == "gfx950":
+    # SPDX-License-Identifier: MIT
+    # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-# Force topk to activate only the first n experts (ids 0..n-1). 0 = unset.
-# Takes precedence over AITER_MOE_EXPERT_BALANCE when set (> 0).
-def parse_num_expert_activated():
-    try:
-        val = int(os.environ.get("AITER_MOE_NUM_EXPERT_ACTIVATED", "0"))
-    except ValueError:
-        raise ValueError("AITER_MOE_NUM_EXPERT_ACTIVATED must be an integer")
-    if val < 0:
-        raise ValueError(f"AITER_MOE_NUM_EXPERT_ACTIVATED must be >= 0, got {val}")
-    return val
+    """FlyDSL MOE a8w4 (fp8 activation, fp4 weight, GUI shuffle) regression tests.
 
+    Covers stage2 tile_k auto-resolve for non-256-aligned inter_dim (e.g. DSV4
+    inter=640) and FlyDSL stage2 / E2E with GUI preshuffle on gfx950.
 
-AITER_MOE_NUM_EXPERT_ACTIVATED = parse_num_expert_activated()
-
-SCALE_BLOCK = 32
-DEFAULT_SCALE_BYTE = 127  # e8m0 byte for 2^0 = 1.0
-_ACT_BY_NAME = {
-    "silu": ActivationType.Silu,
-    "swiglu": ActivationType.Swiglu,
-    "situv2": ActivationType.Situv2,
-}
-
-VERIFY_TOL_A4W4 = 0.02
-VERIFY_TOL_A8W4 = 0.02
-# Production MoE accuracy gate (matches op_tests/test_moe_2stage.py calc_diff):
-# logits_diff = ||x-y||^2 / (||x||^2 + ||y||^2).  rel_l2 is kept as an
-# informational print only; logits_diff < 0.01 is the actual pass/fail gate.
-LOGITS_DIFF_TOL = 0.01
-
-
-# ---------------------------------------------------------------------------
-# Environment / arch guards
-# ---------------------------------------------------------------------------
-def _require_gfx1250() -> None:
-    # AITER_FORCE_GFX1250=1 forces the grouped path on other archs (e.g. gfx942)
-    # to exercise the tiny operators with the GEMM mocked (default; pass
-    # --real-gemm to call the real gfx1250 kernel instead).
-    if os.environ.get("AITER_FORCE_GFX1250", "0") in ("1", "true", "True", "yes"):
-        return
-    gfx = get_gfx()
-    if gfx != "gfx1250":
-        pytest.skip(f"requires gfx1250, got {gfx!r}")
-
-
-def is_gfx1250() -> bool:
-    """True only on actual gfx1250 hardware. AITER_FORCE_GFX1250 does NOT count:
-    forcing the grouped path onto another arch (e.g. gfx942) still needs the GEMM
-    mocked, so real-gemm defaults on only when the real WMMA kernel can run."""
-    return get_gfx() == "gfx1250"
-
-
-# Weights/scales use the public shuffle APIs directly:
-#   shuffle_weight(b, layout=(16, 16))            -> FP4 TDM B layout (16-row x
-#       16-byte chunks) the grouped FlyDSL kernels consume.
-#   moe_shuffle_scale(s, experts_cnt=E) -> arch-aware MoE B-scale shuffle; on
-#       gfx1250 it folds to the grouped-only n32k4 e8m0 layout (shuffle_scale_n32k4).
-# ---------------------------------------------------------------------------
-# Reference: aiter's own ``torch_moe_stage1`` + ``torch_moe_stage2``
-# (high-precision fp32 baseline that decodes mxfp4/e8m0 internally and
-# evaluates the same swiglu+bias formula the grouped path uses). It still
-# diverges from the quantised grouped GEMM path by mxfp4/mxfp8 round noise
-# (~0.2 rel_l2 on random uint8 weights, ~0.02 on real model weights). The
-# point is to catch *catastrophic* regressions, not chase fp32 parity.
-# ---------------------------------------------------------------------------
-def _torch_moe_ref(
-    hidden: torch.Tensor,  # (T, K) bf16
-    w1_packed: torch.Tensor,  # (E, 2*I, K_pack) uint8 (GGUU)
-    w1_scale_raw: torch.Tensor,  # (E, 2*I, K//32) uint8 (raw e8m0)
-    w1_bias: torch.Tensor,  # (E, 2*I) fp32
-    w2_packed: torch.Tensor,  # (E, K, I_pack) uint8
-    w2_scale_raw: torch.Tensor,  # (E, K, I//32) uint8
-    w2_bias: torch.Tensor,  # (E, K) fp32
-    topk_w: torch.Tensor,  # (T, topk) bf16
-    topk_id: torch.Tensor,  # (T, topk) int32
-    *,
-    data_format: str,
-    activation: ActivationType,
-    swiglu_limit: float,
-    situ_beta: float,
-    situ_linear_beta: float,
-) -> torch.Tensor:
-    """Two-stage MoE reference reusing ``aiter.fused_moe.torch_moe_stage{1,2}``."""
-    if data_format not in ("a4w4", "a8w4"):
-        raise ValueError(f"data_format must be a4w4 or a8w4, got {data_format!r}")
-
-    def _per_1x32_fp8_dequant(x: torch.Tensor) -> torch.Tensor:
-        """Mirror grouped a8w4's per-block-32 MXFP8 input quant, then dequant."""
-        block = 32
-        dtype_max = 448.0
-        x_shape = x.shape
-        flat = x.contiguous().view(-1, x_shape[-1]).float()
-        blk = flat.view(-1, block)
-        blk = torch.nan_to_num(blk, nan=0.0, posinf=0.0, neginf=0.0)
-        max_abs = blk.abs().amax(dim=1)
-        scale_e8m0 = fp4_utils.f32_to_mx_e8m0_scale(
-            max_abs, dtype=fp4_utils.MxDtypeInt.FP8_E4M3
-        )
-        scale_f32 = fp4_utils.e8m0_to_f32(scale_e8m0)
-        scale_f32 = torch.nan_to_num(scale_f32, nan=1.0, posinf=1.0, neginf=1.0)
-        scale_f32[scale_f32 == 0] = 1.0
-        q_f32 = (blk / scale_f32.unsqueeze(1)).clamp(min=-dtype_max, max=dtype_max)
-        q = q_f32.contiguous().to(dtypes.fp8).to(torch.float32).view_as(blk)
-        return (q * scale_f32.unsqueeze(1)).view(x_shape).to(x.dtype)
-
-    w1_scale = w1_scale_raw.view(dtypes.fp8_e8m0)
-    w2_scale = w2_scale_raw.view(dtypes.fp8_e8m0)
-    if data_format == "a4w4":
-        # Match the grouped a4w4 path: stage1 input is MXFP4, not bf16.
-        stage1_hidden, stage1_hidden_scale = per_1x32_f4_quant(
-            hidden, quant_dtype=dtypes.fp4x2, shuffle=False
-        )
-    else:
-        # Match grouped a8w4: stage1 input is MXFP8 with per-1x32 e8m0 scale.
-        stage1_hidden, stage1_hidden_scale = _per_1x32_fp8_dequant(hidden), None
-    a2 = torch_moe_stage1(
-        stage1_hidden,
-        w1_packed,
-        w2_packed,
-        topk_w,
-        topk_id,
-        dtype=torch.bfloat16,
-        activation=activation,
-        quant_type=QuantType.per_1x32,
-        a1_scale=stage1_hidden_scale,
-        w1_scale=w1_scale,
-        w1_bias=w1_bias,
-        # swiglu_limit clamps gate/up for both SwiGLU and SiLU: the grouped
-        # FlyDSL epilogue now applies it in either branch, so the reference
-        # passes it through unconditionally to stay in sync.
-        swiglu_limit=swiglu_limit,
-        situ_beta=situ_beta,
-        situ_linear_beta=situ_linear_beta,
-    )
-    if data_format == "a4w4":
-        # Match the grouped a4w4 path again: stage2 input is MXFP4.
-        T, topk = topk_id.shape
-        inter = w2_packed.shape[-1] * 2
-        a2_q, a2_scale = per_1x32_f4_quant(
-            a2.contiguous().view(T * topk, inter),
-            quant_dtype=dtypes.fp4x2,
-            shuffle=False,
-        )
-        a2 = a2_q.view(T, topk, inter // 2)
-    else:
-        # Match grouped a8w4 stage2: per-block-32 MXFP8 quant + dequant.
-        # This matters for SiLU because the unclamped stage1 output can exceed
-        # fp8's unit-scale range; grouped now uses a real e8m0 block scale.
-        a2 = _per_1x32_fp8_dequant(a2)
-        a2_scale = None
-    out = torch_moe_stage2(
-        a2,
-        w1_packed,
-        w2_packed,
-        topk_w,
-        topk_id,
-        dtype=torch.bfloat16,
-        quant_type=QuantType.per_1x32,
-        w2_scale=w2_scale,
-        a2_scale=a2_scale,
-        w2_bias=w2_bias,
-        doweight=True,
-    )
-    return out
-
-
-# ---------------------------------------------------------------------------
-# Mock data builders
-# ---------------------------------------------------------------------------
-def _pattern_packed(
-    experts: int,
-    rows: int,
-    k_pack: int,
-    *,
-    data_init: str,
-    generator: torch.Generator,
-) -> torch.Tensor:
-    """Build packed MXFP4 weights with the shared benchmark initializer."""
-    if data_init == "constant":
-        return torch.full((experts, rows, k_pack), 0x11, dtype=torch.uint8)
-    packed = bench_init.fill_fp4((experts * rows, k_pack * 2), data_init, generator)
-    return packed.view(experts, rows, k_pack)
-
-
-def init_weight_scales(
-    experts: int,
-    rows: int,
-    n_blocks: int,
-    *,
-    scale_init: str,
-    generator: torch.Generator,
-) -> torch.Tensor:
-    """Build E8M0 weight scales with the shared benchmark initializer."""
-    if scale_init == "constant":
-        return torch.full(
-            (experts, rows, n_blocks), DEFAULT_SCALE_BYTE, dtype=torch.uint8
-        )
-    return bench_init.fill_scale_e8m0((experts, rows, n_blocks), scale_init, generator)
-
-
-def _init_hidden(
-    shape: tuple[int, int],
-    data_format: str,
-    data_init: str,
-    generator: torch.Generator,
-) -> torch.Tensor:
-    """Build BF16 activations using the selected low-precision data model."""
-    if data_init == "constant":
-        return torch.full(shape, 0.5, dtype=torch.bfloat16)
-    if data_format == "a4w4":
-        packed = bench_init.fill_fp4(shape, data_init, generator)
-        return fp4_utils.mxfp4_to_f32(packed).to(torch.bfloat16)
-    return bench_init.fill_fp8(shape, data_init, generator).to(torch.bfloat16)
-
-
-def _make_routing_score(tokens: int, experts: int, topk: int) -> torch.Tensor:
-    """Build the ``(tokens, experts)`` gating score honoring the routing env
-    controls: ``AITER_MOE_NUM_EXPERT_ACTIVATED=n`` (highest priority) activates
-    n randomly-chosen experts (round-robin balanced); ``AITER_MOE_EXPERT_BALANCE``
-    round-robins over all experts; otherwise random gating. Shared by the FlyDSL
-    (``_make_topk``) and gluon routing paths so both react to the same env."""
-    if AITER_MOE_NUM_EXPERT_ACTIVATED > 0:
-        n_act = AITER_MOE_NUM_EXPERT_ACTIVATED
-        if n_act < topk or n_act > experts or n_act > tokens * topk:
-            raise ValueError(
-                f"AITER_MOE_NUM_EXPERT_ACTIVATED={n_act} is invalid: must be in "
-                f"[topk={topk}, min(experts={experts}, tokens*topk={tokens * topk})]"
-            )
-        sel = torch.randperm(experts)[:n_act]  # random active expert ids
-        score = torch.full((tokens, experts), float("-inf"), dtype=torch.float32)
-        slot = torch.arange(tokens * topk) % n_act  # round-robin over active set
-        rows = torch.arange(tokens).repeat_interleave(topk)
-        score[rows, sel[slot]] = 1.0
-    elif AITER_MOE_EXPERT_BALANCE:
-        score = torch.zeros((tokens, experts), dtype=torch.float32)
-        start_col, end_col = 0, topk
-        for token_id in range(tokens):
-            score[token_id, start_col:end_col] = 1.0
-            start_col = end_col % experts
-            end_col = start_col + topk
-    else:
-        score = torch.randn((tokens, experts), dtype=torch.float32)
-    return score
-
-
-def _make_topk(
-    hidden_states: torch.Tensor, experts: int, topk: int
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Route via ``fused_topk``: normal (random gating) by default; round-robin
-    balanced gating when ``AITER_MOE_EXPERT_BALANCE=1`` (mirrors
-    op_tests/test_moe_2stage.py). ``AITER_MOE_NUM_EXPERT_ACTIVATED=n`` (highest
-    priority) restricts topk to the first n experts. Returns
-    ``(topk_ids, topk_weights)`` on the same device as ``hidden_states``."""
-    tokens = hidden_states.shape[0]
-    score = _make_routing_score(tokens, experts, topk)
-    topk_w, topk_id = fused_topk(hidden_states, score, topk, True)
-    return topk_id.to(torch.int32), topk_w
-
-
-def _gguu_to_gugu_rows(t: torch.Tensor) -> torch.Tensor:
-    """``(E, 2*I, ...)`` GGUU ``[g0..g_{I-1}, u0..u_{I-1}]`` -> GUGU ``[g0,u0,g1,u1,...]``."""
-    _E, two_inter = t.shape[:2]
-    inter = two_inter // 2
-    g = t[:, :inter]
-    u = t[:, inter:]
-    return torch.stack([g, u], dim=2).flatten(1, 2).contiguous()
-
-
-# ---------------------------------------------------------------------------
-# Core runner: build inputs, invoke fused_moe, optionally compare to ref
-# ---------------------------------------------------------------------------
-def _run_grouped_via_fused_moe(
-    *,
-    experts: int,
-    tokens: int,
-    topk: int,
-    model_dim: int,
-    inter_dim: int,
-    data_format: str,  # "a4w4" | "a8w4"
-    activation: ActivationType = ActivationType.Swiglu,
-    swiglu_limit: float = 7.0,
-    situ_beta: float = 4.0,
-    situ_linear_beta: float = 25.0,
-    use_bias: bool = True,
-    bench: bool = False,
-    kernel_bench: bool = False,
-    seed: int = 0,
-    warmup: int = 5,
-    iters: int = 101,
-    data_init: str = "uniform",
-    scale_init: str = "auto",
-) -> tuple[torch.Tensor, torch.Tensor, float | None, dict | None]:
-    """Build mxfp4 weights + routing, dispatch through ``fused_moe``.
-
-    Stage1 weights are always laid out GUGU (gate/up row-interleaved) paired
-    with ``GateMode.INTERLEAVE``, which is the only layout the TDM grouped
-    GEMM reads. The PyTorch reference evaluates the GGUU logical weights, so the
-    numerical result is unchanged.
-
-    Correctness is always checked against the reference. ``bench`` selects the
-    path that is validated and timed: when set, the output comes from
-    ``run_perftest`` in CUDA-graph mode (production path) and ``us`` is the graph
-    timing; otherwise the output is a single eager (graph-off) call and ``us`` is
-    None. ``kernel_bench`` instead times the gemm1/gemm2 kernels in isolation
-    (looping each launch alone) and returns their per-kernel us in ``kernel_us``.
-    Returns ``(out, ref, us_or_None, kernel_us_or_None)``.
+    Usage:
+        pytest op_tests/flydsl_tests/test_flydsl_moe_a8w4.py -q
+        pytest op_tests/flydsl_tests/test_flydsl_moe_a8w4.py -k tile_k
     """
-    if data_format not in ("a4w4", "a8w4"):
-        raise ValueError(f"data_format must be a4w4 or a8w4, got {data_format!r}")
 
-    K = model_dim
-    inter = inter_dim
-    K_pack = K // 2
-    inter_pack = inter // 2
 
-    # Logical weights/scale/bias: always GGUU (gate rows then up rows).
-    torch.manual_seed(seed)
-    generator = bench_init.make_generator(seed)
-    w1_logical = _pattern_packed(
-        experts,
-        2 * inter,
-        K_pack,
-        data_init=data_init,
-        generator=generator,
+    import os
+
+    import pytest
+    import torch
+
+    from aiter import ActivationType, QuantType, dtypes
+    from aiter.fused_moe import fused_topk, moe_sorting, torch_moe_stage1, torch_moe_stage2
+    from aiter.jit.utils.chip_info import get_gfx
+    from aiter.ops.flydsl.moe_kernels import (
+        pick_flydsl_stage2_tile_k,
+        resolve_flydsl_stage2_tile_k,
     )
-    w2_logical = _pattern_packed(
-        experts,
-        K,
-        inter_pack,
-        data_init=data_init,
-        generator=generator,
+    from aiter.ops.quant import (
+        mxfp4_moe_sort_fwd,
+        per_1x32_f4_quant,
+        per_1x32_f8_scale_f8_quant,
     )
-    w1_scale_raw = init_weight_scales(
-        experts,
-        2 * inter,
-        K // SCALE_BLOCK,
-        scale_init=scale_init,
-        generator=generator,
+    from aiter.ops.shuffle import shuffle_scale_a16w4, shuffle_weight, shuffle_weight_a16w4
+    from aiter.test_common import checkAllclose
+    from aiter.utility import fp4_utils
+    from aiter.utility.fp4_utils import e8m0_shuffle
+
+    Q_TYPE = QuantType.per_1x32
+
+    _SKIP_GFX950_FLYDSL = pytest.mark.skipif(
+        get_gfx() not in ("gfx950",),
+        reason="gfx950 FlyDSL required",
     )
-    w2_scale_raw = init_weight_scales(
-        experts,
-        K,
-        inter // SCALE_BLOCK,
-        scale_init=scale_init,
-        generator=generator,
-    )
-    if use_bias:
-        if data_init == "constant":
-            bias1 = torch.full((experts, 2 * inter), 0.5)
-            bias2 = torch.full((experts, K), 0.5)
-        else:
-            bias1 = (
-                torch.randn((experts, 2 * inter), generator=generator) * 1e-3
-            ).float()
-            bias2 = (torch.randn((experts, K), generator=generator) * 1e-3).float()
-    else:
-        bias1 = torch.zeros((experts, 2 * inter))
-        bias2 = torch.zeros((experts, K))
-    # Activations: bf16; fused_moe handles the dispatched quant internally.
-    hidden = _init_hidden((tokens, K), data_format, data_init, generator)
 
-    # Routing: normal (random) by default; balanced if AITER_MOE_EXPERT_BALANCE.
-    topk_id, topk_w = _make_topk(hidden, experts, topk)
-    topk_w = topk_w.to(torch.bfloat16)
 
-    # ---- prep grouped GEMM inputs ----
-    # Stage1 weight/scale/bias are rearranged to the physical GUGU layout;
-    # stage2 has no GUGU concept (single N=hidden GEMM).
-    bias1_phys = _gguu_to_gugu_rows(bias1)
-    gate_mode = GateMode.INTERLEAVE
+    def _inter_pad(inter_dim: int) -> int:
+        return ((inter_dim + 255) // 256 * 256) - inter_dim
 
-    # moe_shuffle_weight interleaves gate/up rows internally, so it takes the
-    # logical GGUU weight.
-    w1_grouped = moe_shuffle_weight(
-        w1_logical,
-        experts_cnt=experts,
-        is_guinterleave=True,
-        gate_up=True,
-    )
-    w2_grouped = moe_shuffle_weight(w2_logical, experts_cnt=experts)
-    # GUGU B-scale is built the production way: feed the RAW GGUU scale to
-    # moe_shuffle_scale(is_guinterleave=True), which interleaves gate/up rows
-    # then folds n32k4 (aiter.ops.shuffle.shuffle_scale_n32k4 end to end) --
-    # the weights/bias are row-interleaved above.
-    w1_scale = moe_shuffle_scale(
-        w1_scale_raw.contiguous(),
-        experts_cnt=experts,
-        is_guinterleave=True,
-        gate_up=True,
-    )
-    w2_scale = moe_shuffle_scale(w2_scale_raw.contiguous(), experts_cnt=experts)
 
-    if data_format == "a4w4":
-        w1_arg = w1_grouped.view(dtypes.fp4x2)
-        w2_arg = w2_grouped.view(dtypes.fp4x2)
-    else:  # a8w4
-        w1_arg = w1_grouped  # uint8 -> grouped helper sets q_dtype_a=fp8
-        w2_arg = w2_grouped
+    def _stage1_tile_k(model_dim: int) -> int:
+        return 512 if (model_dim % 512 == 0) else 256
 
-    def _call():  # the grouped path is auto-enabled on gfx1250
-        return fused_moe(
-            hidden,
-            w1_arg,
-            w2_arg,
-            topk_w,
-            topk_id,
-            activation=activation,
-            quant_type=QuantType.per_1x32,
+
+    def _check_close(ref, out, label, atol=1.0, rtol=0.05, max_err_ratio=0.05):
+        assert not out.isnan().any(), f"{label}: output has NaN"
+        assert not out.isinf().any(), f"{label}: output has Inf"
+        err = checkAllclose(ref, out, msg=label, atol=atol, rtol=rtol)
+        assert (
+            err == 0 or err <= max_err_ratio
+        ), f"{label}: checkAllclose failed (err={err}, max={max_err_ratio})"
+
+
+    def _generate_a8w4_gui_data(
+        token: int,
+        model_dim: int,
+        inter_dim: int,
+        E: int,
+        topk: int,
+        block_m: int,
+        seed: int = 0,
+        dtype=torch.bfloat16,
+    ):
+        torch.manual_seed(seed)
+        torch.cuda.manual_seed(seed)
+
+        inter_pad = _inter_pad(inter_dim)
+
+        inp = torch.randn(token, model_dim, dtype=dtype, device="cuda") / 4
+        w1 = torch.randn(E, inter_dim * 2, model_dim, dtype=dtype, device="cuda") / 4
+        w2 = torch.randn(E, model_dim, inter_dim, dtype=dtype, device="cuda") / 4
+        if inter_pad:
+            w1[:, -inter_pad:, :] = 0
+            w1[:, inter_dim - inter_pad : inter_dim, :] = 0
+            w2[:, :, -inter_pad:] = 0
+
+        score = torch.randn(token, E, dtype=dtype, device="cuda")
+        topk_weights, topk_ids = fused_topk(inp, score, topk, True)
+        sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, _ = moe_sorting(
+            topk_ids, topk_weights, E, model_dim, dtype, block_m
+        )
+
+        a_q, a_scale = per_1x32_f8_scale_f8_quant(
+            inp, quant_dtype=dtypes.fp8, scale_type=dtypes.fp8_e8m0
+        )
+        w1_q, w1_scale = per_1x32_f4_quant(w1, quant_dtype=dtypes.fp4x2)
+        w2_q, w2_scale = per_1x32_f4_quant(w2, quant_dtype=dtypes.fp4x2)
+        w1_q = w1_q.view(E, inter_dim * 2, model_dim // 2)
+        w2_q = w2_q.view(E, model_dim, inter_dim // 2)
+
+        ref_stage1 = torch_moe_stage1(
+            a_q,
+            w1_q,
+            w2_q,
+            topk_weights,
+            topk_ids,
+            dtype=dtype,
+            activation=ActivationType.Swiglu,
+            quant_type=Q_TYPE,
+            a1_scale=a_scale,
             w1_scale=w1_scale,
+        )
+        ref_stage2 = torch_moe_stage2(
+            ref_stage1,
+            w1_q,
+            w2_q,
+            topk_weights,
+            topk_ids,
+            dtype=dtype,
+            quant_type=Q_TYPE,
             w2_scale=w2_scale,
-            bias1=bias1_phys if use_bias else None,
-            bias2=bias2 if use_bias else None,
-            gate_mode=gate_mode.value,
-            dtype=dtypes.bf16,
-            swiglu_limit=swiglu_limit,
-            beta=situ_beta,
-            linear_beta=situ_linear_beta,
+            a2_scale=None,
+            doweight=True,
         )
 
-    torch.cuda.synchronize()
-    kernel_us = None
-    if kernel_bench:
-        # Kernel-bench: time gemm1 and gemm2 in isolation. One eager call
-        # populates the per-stage launch callables (and yields a correct ``out`` to
-        # verify); then loop each kernel alone. ``us`` (end-to-end) stays None.
-        from aiter.ops.flydsl import grouped_moe_gfx1250 as _grouped
-        from aiter.test_common import run_perftest
-
-        kernel_bench_callable: list = []
-        _grouped.kernel_bench_callable = kernel_bench_callable
-        try:
-            out = _call()
-        finally:
-            _grouped.kernel_bench_callable = None
-        us = None
-        kernel_us = {}
-        for _name, callable in kernel_bench_callable:
-            _, _us = run_perftest(
-                callable,
-                num_warmup=warmup,
-                num_iters=iters,
-                testGraph=False,
-            )
-            kernel_us[_name] = _us
-    elif bench:
-        # Bench: validate + time the CUDA-graph (production) path. The returned
-        # data is the graph-captured output.
-        from aiter.test_common import run_perftest
-
-        out, us = run_perftest(
-            _call, num_warmup=warmup, num_iters=iters, testGraph=False
+        a2_q, a2_scale = per_1x32_f8_scale_f8_quant(
+            ref_stage1, quant_dtype=dtypes.fp8, scale_type=dtypes.fp8_e8m0
         )
-    else:
-        # Verify: validate the eager (graph-off) path; no timing.
-        out = _call()
-        us = None
+        a2_q = a2_q.view(token, topk, inter_dim)
 
-    # Reference always uses GGUU logical inputs (layouts are numerically
-    # equivalent; only physical packing differs).
-    ref = _torch_moe_ref(
-        hidden,
-        w1_logical,
-        w1_scale_raw,
-        bias1,
-        w2_logical,
-        w2_scale_raw,
-        bias2,
-        topk_w,
-        topk_id,
-        data_format=data_format,
-        activation=activation,
-        swiglu_limit=swiglu_limit,
-        situ_beta=situ_beta,
-        situ_linear_beta=situ_linear_beta,
-    ).to(out.dtype)
-    return out, ref, us, kernel_us
+        a_scale_sort = mxfp4_moe_sort_fwd(
+            a_scale,
+            sorted_ids=sorted_ids,
+            num_valid_ids=num_valid_ids,
+            token_num=token,
+            cols=model_dim,
+        )
+        w1_shuf = shuffle_weight_a16w4(w1_q, 16, True)
+        w1_scale_shuf = shuffle_scale_a16w4(w1_scale, E, True)
+        w2_shuf = shuffle_weight_a16w4(w2_q, 16, False)
+        w2_scale_shuf = shuffle_scale_a16w4(w2_scale, E, False)
+        a2_scale_sort = mxfp4_moe_sort_fwd(
+            a2_scale,
+            sorted_ids=sorted_ids,
+            num_valid_ids=num_valid_ids,
+            token_num=token,
+            cols=inter_dim,
+        )
 
-
-def _rel_l2(actual: torch.Tensor, expected: torch.Tensor) -> float:
-    diff = (actual.float() - expected.float()).norm()
-    base = expected.float().norm().clamp(min=1e-12)
-    return float(diff / base)
-
-
-def _logits_diff(actual: torch.Tensor, expected: torch.Tensor) -> float:
-    """MoE accuracy metric from op_tests/test_moe_2stage.py (calc_diff):
-
-        1 - 2*<x,y>/(||x||^2 + ||y||^2)  ==  ||x-y||^2 / (||x||^2 + ||y||^2)
-
-    A magnitude-weighted cosine-style diff. Relation to rel_l2: when the two
-    norms match, logits_diff ~= rel_l2**2 / 2.  Production strict gate: < 0.01.
-    """
-    x = actual.double()
-    y = expected.double()
-    denom = (x * x + y * y).sum() + 1e-8
-    return float(((x - y) ** 2).sum() / denom)
+        return {
+            "inter_pad": inter_pad,
+            "topk": topk,
+            "a_q": a_q,
+            "a_scale_sort": a_scale_sort,
+            "w1_shuf": w1_shuf,
+            "w1_scale_shuf": w1_scale_shuf,
+            "w2_shuf": w2_shuf,
+            "w2_scale_shuf": w2_scale_shuf,
+            "a2_q": a2_q,
+            "a2_scale_sort": a2_scale_sort,
+            "sorted_ids": sorted_ids,
+            "sorted_weights": sorted_weights,
+            "sorted_expert_ids": sorted_expert_ids,
+            "num_valid_ids": num_valid_ids,
+            "ref_stage1": ref_stage1,
+            "ref_stage2": ref_stage2,
+            "token": token,
+            "inter_dim": inter_dim,
+            "model_dim": model_dim,
+        }
 
 
-def _gemm_work_metrics(
-    *,
-    experts: int,
-    tokens: int,
-    topk: int,
-    model_dim: int,
-    inter_dim: int,
-    data_format: str,
-) -> dict[str, tuple[float, float]]:
-    """Return conventional GEMM FLOPs and effective bytes for both stages.
+    @pytest.fixture(autouse=True)
+    def _a8w4_env():
+        old_bound = os.environ.get("AITER_BF16_FP8_MOE_BOUND")
+        old_aot = os.environ.get("FLYDSL_RUNTIME_RUN_ONLY")
+        os.environ["AITER_BF16_FP8_MOE_BOUND"] = "0"
+        os.environ.pop("FLYDSL_RUNTIME_RUN_ONLY", None)
+        yield
+        if old_bound is None:
+            os.environ.pop("AITER_BF16_FP8_MOE_BOUND", None)
+        else:
+            os.environ["AITER_BF16_FP8_MOE_BOUND"] = old_bound
+        if old_aot is None:
+            os.environ.pop("FLYDSL_RUNTIME_RUN_ONLY", None)
+        else:
+            os.environ["FLYDSL_RUNTIME_RUN_ONLY"] = old_aot
 
-    The byte model matches the grouped-MoE tuner: logical quantized inputs and
-    weights plus BF16 outputs. It excludes routing, quantization, scales, bias,
-    and other fused-MoE auxiliary traffic, so the reported bandwidth is an
-    effective GEMM bandwidth rather than measured HBM transactions.
-    """
-    input_bytes = 0.5 if data_format == "a4w4" else 1.0
-    weight_bytes = 0.5
-    output_bytes = 2.0
-    stage1_n = 2 * inter_dim
 
-    gemm1_flops = tokens * topk * stage1_n * model_dim * 2
-    gemm1_bytes = (
-        tokens * model_dim * input_bytes
-        + tokens * stage1_n * output_bytes
-        + experts * model_dim * stage1_n * weight_bytes
+    def test_pick_flydsl_stage2_tile_k():
+        assert pick_flydsl_stage2_tile_k(256) == 256
+        assert pick_flydsl_stage2_tile_k(512) == 256
+        assert pick_flydsl_stage2_tile_k(640) == 128
+        assert pick_flydsl_stage2_tile_k(384) == 128
+        assert pick_flydsl_stage2_tile_k(896) == 128
+        assert pick_flydsl_stage2_tile_k(1024) == 256
+        assert resolve_flydsl_stage2_tile_k(640, 256) == 128
+        assert resolve_flydsl_stage2_tile_k(256, 256) == 256
+        assert resolve_flydsl_stage2_tile_k(512, 128) == 128
+
+
+    @pytest.mark.parametrize(
+        "inter_dim,seed",
+        [
+            pytest.param(256, 101, id="i256"),
+            pytest.param(384, 102, id="i384"),
+            pytest.param(640, 0, id="i640_dsv4"),
+        ],
     )
-    gemm2_flops = tokens * topk * model_dim * inter_dim * 2
-    gemm2_bytes = (
-        tokens * topk * inter_dim * input_bytes
-        + tokens * model_dim * output_bytes
-        + experts * inter_dim * model_dim * weight_bytes
-    )
-    return {
-        "gemm1": (gemm1_flops, gemm1_bytes),
-        "gemm2": (gemm2_flops, gemm2_bytes),
-        "total": (gemm1_flops + gemm2_flops, gemm1_bytes + gemm2_bytes),
-    }
+    @_SKIP_GFX950_FLYDSL
+    def test_flydsl_stage2_a8w4_gui(inter_dim, seed):
+        from aiter.ops.flydsl.moe_kernels import flydsl_moe_stage2
 
-
-def _rates(
-    work: tuple[float, float], us: float | None
-) -> tuple[float | None, float | None]:
-    """Convert a (FLOPs, bytes) work estimate and microseconds to rates."""
-    if us is None or us <= 0:
-        return None, None
-    flops, data_bytes = work
-    return flops / us / 1e6, data_bytes / us / 1e3
-
-
-# ---------------------------------------------------------------------------
-# Pytest correctness suite
-# ---------------------------------------------------------------------------
-def run_moe(
-    data_format: str,
-    *,
-    experts: int = 4,
-    tokens: int = 8,
-    topk: int = 2,
-    model_dim: int = 512,
-    inter_dim: int = 512,
-    activation: ActivationType = ActivationType.Swiglu,
-    swiglu_limit: float = 7.0,
-    situ_beta: float = 4.0,
-    situ_linear_beta: float = 25.0,
-    use_bias: bool = True,
-    tol: float = VERIFY_TOL_A4W4,
-    raise_on_fail: bool = True,
-    bench: bool = False,
-    kernel_bench: bool = False,
-    warmup: int = 5,
-    iters: int = 101,
-    seed: int = 0,
-    data_init: str = "uniform",
-    scale_init: str = "auto",
-    check_aot_cache: bool = True,
-) -> dict:
-    """Compare grouped FlyDSL MoE vs a PyTorch fp32 ref. ``bench`` selects the
-    validated path: bench checks (and times) the CUDA-graph production path;
-    verify checks the eager path.
-
-    Correctness gate: production-consistent logits_diff < LOGITS_DIFF_TOL
-    (op_tests/test_moe_2stage.py).  rel_l2 (~= sqrt(2*logits_diff)) is printed
-    for reference only.  Returns a metrics dict (with ``us`` when benched).
-    """
-    _require_gfx1250()
-    act = {
-        ActivationType.Silu: "silu",
-        ActivationType.Swiglu: "swiglu",
-        ActivationType.Situv2: "situv2",
-    }[activation]
-    tag = f"{data_format} {act}"
-
-    # --- grouped FlyDSL vs PyTorch fp32 ref (graph path if bench, else eager) ---
-    run_only = run_only_env() if check_aot_cache else nullcontext()
-    with run_only:
-        out, ref, us, kernel_us = _run_grouped_via_fused_moe(
-            experts=experts,
-            tokens=tokens,
+        token, model_dim, E, topk, block_m = 16, 512, 8, 2, 32
+        data = _generate_a8w4_gui_data(
+            token, model_dim, inter_dim, E, topk, block_m, seed=seed
+        )
+        out = flydsl_moe_stage2(
+            inter_states=data["a2_q"],
+            w2=data["w2_shuf"],
+            sorted_token_ids=data["sorted_ids"],
+            sorted_expert_ids=data["sorted_expert_ids"],
+            num_valid_ids=data["num_valid_ids"],
             topk=topk,
+            tile_m=32,
+            tile_n=256,
+            tile_k=256,
+            a_dtype="fp8",
+            b_dtype="fp4",
+            out_dtype="bf16",
+            mode="atomic",
+            w2_scale=data["w2_scale_shuf"],
+            a2_scale=data["a2_scale_sort"],
+            sorted_weights=data["sorted_weights"],
+            inter_dim_pad=data["inter_pad"],
+            model_dim_pad=0,
+        )
+        torch.cuda.synchronize()
+        _check_close(data["ref_stage2"], out, f"stage2_a8w4_gui_i{inter_dim}")
+
+
+    @pytest.mark.parametrize("block_m", [16, 32, 64, 128])
+    @pytest.mark.parametrize(
+        ("inter_dim", "tile_k"),
+        [
+            pytest.param(384, 128, id="bk128"),
+            pytest.param(512, 256, id="bk256"),
+        ],
+    )
+    @_SKIP_GFX950_FLYDSL
+    def test_flydsl_v2_stage2_a8w4_full_tile(block_m, inter_dim, tile_k):
+        from aiter.ops.flydsl.kernels.mxmoe_dispatcher import mxfp4_moe_gemm2
+
+        torch.manual_seed(123)
+        torch.cuda.manual_seed(123)
+        token, model_dim, E, topk = block_m, 128, 1, 1
+        a2 = torch.randn((token, topk, inter_dim), dtype=torch.bfloat16, device="cuda") / 4
+        w1 = torch.zeros((E, inter_dim * 2, model_dim), dtype=torch.bfloat16, device="cuda")
+        w2 = torch.randn((E, model_dim, inter_dim), dtype=torch.bfloat16, device="cuda") / 4
+        topk_ids = torch.zeros((token, topk), dtype=torch.int32, device="cuda")
+        topk_weights = torch.ones((token, topk), dtype=torch.float32, device="cuda")
+        sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, _ = moe_sorting(
+            topk_ids, topk_weights, E, model_dim, torch.bfloat16, block_m
+        )
+
+        a2_q, a2_scale = per_1x32_f8_scale_f8_quant(
+            a2, quant_dtype=dtypes.fp8, scale_type=dtypes.fp8_e8m0
+        )
+        w1_q, _ = per_1x32_f4_quant(w1, quant_dtype=dtypes.fp4x2)
+        w2_q, w2_scale = per_1x32_f4_quant(w2, quant_dtype=dtypes.fp4x2)
+        w1_q = w1_q.view(E, inter_dim * 2, model_dim // 2)
+        w2_q = w2_q.view(E, model_dim, inter_dim // 2)
+
+        a2_dequant = (
+            a2_q.float().view(token, topk, inter_dim // 32, 32)
+            * fp4_utils.e8m0_to_f32(a2_scale).view(token, topk, inter_dim // 32, 1)
+        ).view(token, topk, inter_dim)
+        ref = torch_moe_stage2(
+            a2_dequant,
+            w1_q,
+            w2_q,
+            topk_weights,
+            topk_ids,
+            dtype=torch.bfloat16,
+            quant_type=Q_TYPE,
+            w2_scale=w2_scale,
+            a2_scale=None,
+            doweight=True,
+        )
+
+        a2_sorted = a2_q.reshape(token * topk, inter_dim)
+        a2_scale_sorted = mxfp4_moe_sort_fwd(
+            a2_scale,
+            sorted_ids=sorted_ids,
+            num_valid_ids=num_valid_ids,
+            token_num=token,
+            cols=inter_dim,
+        )
+        w2_shuffled = shuffle_weight_a16w4(w2_q, 16, False)
+        w2_scale_shuffled = shuffle_scale_a16w4(w2_scale, E, False)
+        out = torch.zeros((token, model_dim), dtype=torch.bfloat16, device="cuda")
+
+        mxfp4_moe_gemm2(
+            inter_sorted_quant=a2_sorted,
+            inter_sorted_shuffled_scale=a2_scale_sorted,
+            w2_u8=w2_shuffled,
+            w2_scale_u8=w2_scale_shuffled,
+            sorted_expert_ids=sorted_expert_ids,
+            cumsum_tensor=num_valid_ids,
+            sorted_token_ids=sorted_ids,
+            sorted_weights=sorted_weights,
+            out=out,
+            M_logical=token,
+            max_sorted=a2_sorted.shape[0],
+            NE=E,
+            D_HIDDEN=model_dim,
+            D_INTER=inter_dim,
+            topk=topk,
+            BM=block_m,
+            BN=128,
+            BK=tile_k,
+            use_nt=True,
+            a_dtype="fp8",
+            epilog="atomic",
+            SBM=block_m,
+            persist=False,
+        )
+        torch.cuda.synchronize()
+        _check_close(
+            ref.float(),
+            out.float(),
+            f"v2_stage2_a8w4_bm{block_m}_bk{tile_k}",
+        )
+
+
+    @_SKIP_GFX950_FLYDSL
+    def test_flydsl_stage2_fp8_ep_reduction():
+        from aiter.ops.flydsl.kernels.mxfp4_gemm_common import fp8out_row_bytes
+        from aiter.ops.flydsl.moe_kernels import _run_moe_reduction
+
+        token, topk, model_dim = 2, 4, 128
+        values = torch.tensor([1, 7, 2, 9], dtype=dtypes.fp8, device="cuda")
+        target = torch.empty(
+            (token * topk, fp8out_row_bytes(model_dim)), dtype=torch.uint8, device="cuda"
+        )
+        target[:, :model_dim] = values.repeat(token).view(torch.uint8)[:, None]
+        target[:, model_dim:] = 127  # E8M0 scale 1.0
+        expert_mask = torch.tensor([1, 0, 1, 0], dtype=torch.int32, device="cuda")
+        topk_ids = torch.arange(topk, dtype=torch.int32, device="cuda").repeat(token, 1)
+        out = torch.empty((token, model_dim), dtype=torch.bfloat16, device="cuda")
+
+        _run_moe_reduction(
+            target, out, token, topk, model_dim, expert_mask, topk_ids, is_fp8=True
+        )
+        torch.testing.assert_close(out, torch.full_like(out, 3.0))
+
+
+    @pytest.mark.parametrize("inter_dim", [256, 384, 640])
+    @_SKIP_GFX950_FLYDSL
+    def test_flydsl_e2e_a8w4_gui(inter_dim):
+        from aiter.ops.flydsl.moe_kernels import flydsl_moe_stage1, flydsl_moe_stage2
+
+        token, model_dim, E, topk, block_m, seed = 16, 512, 8, 2, 32, 0
+        data = _generate_a8w4_gui_data(
+            token, model_dim, inter_dim, E, topk, block_m, seed=seed
+        )
+        stage1_out = flydsl_moe_stage1(
+            a=data["a_q"],
+            w1=data["w1_shuf"],
+            sorted_token_ids=data["sorted_ids"],
+            sorted_expert_ids=data["sorted_expert_ids"],
+            num_valid_ids=data["num_valid_ids"],
+            topk=topk,
+            tile_m=32,
+            tile_n=256,
+            tile_k=_stage1_tile_k(model_dim),
+            a_dtype="fp8",
+            b_dtype="fp4",
+            out_dtype="bf16",
+            act="swiglu",
+            gate_mode="interleave",
+            w1_scale=data["w1_scale_shuf"],
+            a1_scale=data["a_scale_sort"],
+            inter_dim_pad=data["inter_pad"],
+            model_dim_pad=0,
+        )
+        a2_q, a2_scale = per_1x32_f8_scale_f8_quant(
+            stage1_out, quant_dtype=dtypes.fp8, scale_type=dtypes.fp8_e8m0
+        )
+        a2_q = a2_q.view(token, topk, inter_dim)
+        a2_scale_sort = mxfp4_moe_sort_fwd(
+            a2_scale,
+            sorted_ids=data["sorted_ids"],
+            num_valid_ids=data["num_valid_ids"],
+            token_num=token,
+            cols=inter_dim,
+        )
+        out = flydsl_moe_stage2(
+            inter_states=a2_q,
+            w2=data["w2_shuf"],
+            sorted_token_ids=data["sorted_ids"],
+            sorted_expert_ids=data["sorted_expert_ids"],
+            num_valid_ids=data["num_valid_ids"],
+            topk=topk,
+            tile_m=32,
+            tile_n=256,
+            tile_k=256,
+            a_dtype="fp8",
+            b_dtype="fp4",
+            out_dtype="bf16",
+            mode="atomic",
+            w2_scale=data["w2_scale_shuf"],
+            a2_scale=a2_scale_sort,
+            sorted_weights=data["sorted_weights"],
+            inter_dim_pad=data["inter_pad"],
+            model_dim_pad=0,
+        )
+        torch.cuda.synchronize()
+        _check_close(data["ref_stage2"], out, f"e2e_a8w4_gui_i{inter_dim}")
+
+
+    # ---------------------------------------------------------------------------
+    # SiTUv2 activation fused into the FlyDSL MXFP4 MoE stage1 (a8w4 + host ref).
+    # Migrated from the former test_flydsl_moe_situv2.py.
+    #
+    # SiTUv2 (fp32 intermediate, cast back at the end):
+    #     situ_g    = beta * tanh(gate / beta) * sigmoid(gate)
+    #     up_scaled = linear_beta * tanh(up / linear_beta)
+    #     out       = situ_g * up_scaled
+    # ---------------------------------------------------------------------------
+    SITUV2_BETA = 2.0
+    SITUV2_LINEAR_BETA = 1.5
+
+
+    def test_situv2_reference():
+        """Verify aiter.fused_moe.situv2 matches the closed-form SiTUv2 in fp32.
+
+        Host-only (no GPU / gfx950 required)."""
+        from aiter.fused_moe import situv2
+
+        torch.manual_seed(0)
+        d = 512
+        passed = True
+        for beta in (0.5, 1.0, 2.0):
+            for linear_beta in (0.5, 1.0, 2.0):
+                gate = torch.randn(4, d) * 3.0
+                up = torch.randn(4, d) * 3.0
+                got = situv2(gate, up, beta=beta, linear_beta=linear_beta)
+                g = gate.float()
+                u = up.float()
+                situ_g = beta * torch.tanh(g / beta) * torch.sigmoid(g)
+                up_scaled = linear_beta * torch.tanh(u / linear_beta)
+                expect = situ_g * up_scaled
+                max_delta = (got.float() - expect).abs().max().item()
+                ok = max_delta < 1e-5
+                passed = passed and ok
+        # Bounded intermediates property (mxfp4-friendly): |out| <= beta*linear_beta.
+        beta, linear_beta = 1.5, 0.8
+        gate = torch.randn(8, d) * 20.0
+        up = torch.randn(8, d) * 20.0
+        out = situv2(gate, up, beta=beta, linear_beta=linear_beta)
+        bound = beta * linear_beta + 1e-4
+        within = bool(out.abs().max().item() <= bound)
+        assert passed and within, "situv2 reference mismatch or bound violated"
+
+
+    # (token, model_dim, inter_dim, E, topk, block_m, tile_m, tile_n, tile_k,
+    #  gate_mode, out_dtype, seed, situ_beta, situ_linear_beta)
+    A8W4_SITUV2_VEC4_CASES = [
+        pytest.param(
+            16,
+            256,
+            128,
+            8,
+            2,
+            32,
+            32,
+            256,
+            256,
+            "separated",
+            "bf16",
+            1,
+            SITUV2_BETA,
+            SITUV2_LINEAR_BETA,
+            id="t16_sep_bf16_default_beta",
+        ),
+        pytest.param(
+            64,
+            512,
+            256,
+            16,
+            4,
+            32,
+            32,
+            256,
+            256,
+            "separated",
+            "bf16",
+            2,
+            SITUV2_BETA,
+            SITUV2_LINEAR_BETA,
+            id="t64_sep_bf16",
+        ),
+        pytest.param(
+            16,
+            256,
+            128,
+            8,
+            2,
+            64,
+            64,
+            128,
+            256,
+            "separated",
+            "bf16",
+            3,
+            SITUV2_BETA,
+            SITUV2_LINEAR_BETA,
+            id="tile64_n128_sep_bf16",
+        ),
+        pytest.param(
+            32,
+            256,
+            128,
+            8,
+            2,
+            32,
+            32,
+            128,
+            256,
+            "separated",
+            "f16",
+            4,
+            SITUV2_BETA,
+            SITUV2_LINEAR_BETA,
+            id="t32_sep_f16",
+        ),
+        pytest.param(
+            16,
+            256,
+            128,
+            8,
+            2,
+            32,
+            32,
+            256,
+            256,
+            "separated",
+            "bf16",
+            5,
+            1.0,
+            1.0,
+            id="t16_sep_bf16_unit_beta",
+        ),
+        pytest.param(
+            16,
+            256,
+            128,
+            8,
+            2,
+            32,
+            32,
+            256,
+            256,
+            "interleave",
+            "bf16",
+            6,
+            SITUV2_BETA,
+            SITUV2_LINEAR_BETA,
+            id="t16_interleave_bf16",
+        ),
+        pytest.param(
+            # non-256-aligned inter_dim (DSV4 TP8); exercises fix-k K-tiling.
+            64,
+            512,
+            640,
+            16,
+            4,
+            32,
+            32,
+            256,
+            256,
+            "interleave",
+            "bf16",
+            7,
+            SITUV2_BETA,
+            SITUV2_LINEAR_BETA,
+            id="t64_i640_interleave_bf16",
+        ),
+    ]
+
+
+    def _make_routes(hidden: torch.Tensor, experts: int, topk: int, block_m: int):
+        score = torch.randn(
+            (hidden.shape[0], experts), dtype=hidden.dtype, device=hidden.device
+        )
+        topk_weights, topk_ids = fused_topk(hidden, score, topk, True)
+        sorted_ids, _, sorted_expert_ids, num_valid_ids, _ = moe_sorting(
+            topk_ids, topk_weights, experts, hidden.shape[1], hidden.dtype, block_m
+        )
+        return topk_weights, topk_ids, sorted_ids, sorted_expert_ids, num_valid_ids
+
+
+    def _generate_a8w4_situv2_vec4_data(
+        token: int,
+        model_dim: int,
+        inter_dim: int,
+        E: int,
+        topk: int,
+        block_m: int,
+        *,
+        seed: int = 1,
+        dtype=torch.bfloat16,
+        situ_beta: float = SITUV2_BETA,
+        situ_linear_beta: float = SITUV2_LINEAR_BETA,
+        gate_mode: str = "separated",
+    ):
+        """a8w4 data for vec4 SiTUv2 epilogue (tile / gate_mode variants)."""
+        torch.manual_seed(seed)
+        torch.cuda.manual_seed(seed)
+
+        inp = torch.randn((token, model_dim), dtype=dtype, device="cuda") / 4
+        w1 = torch.randn((E, inter_dim * 2, model_dim), dtype=dtype, device="cuda") / 4
+        w2 = torch.randn((E, model_dim, inter_dim), dtype=dtype, device="cuda") / 4
+        topk_weights, topk_ids, sorted_ids, sorted_expert_ids, num_valid_ids = _make_routes(
+            inp, E, topk, block_m
+        )
+
+        a_q, a_scale = per_1x32_f8_scale_f8_quant(
+            inp, quant_dtype=dtypes.fp8, scale_type=dtypes.fp8_e8m0
+        )
+        w1_q, w1_scale = per_1x32_f4_quant(w1, quant_dtype=dtypes.fp4x2)
+        w1_q = w1_q.view(E, inter_dim * 2, model_dim // 2)
+        w2_q, _w2_scale = per_1x32_f4_quant(w2, quant_dtype=dtypes.fp4x2)
+        w2_q = w2_q.view(E, model_dim, inter_dim // 2)
+
+        ref_stage1 = torch_moe_stage1(
+            a_q,
+            w1_q,
+            w2_q,
+            topk_weights,
+            topk_ids,
+            dtype=dtype,
+            activation=ActivationType.Situv2,
+            quant_type=Q_TYPE,
+            a1_scale=a_scale,
+            w1_scale=w1_scale,
+            situ_beta=situ_beta,
+            situ_linear_beta=situ_linear_beta,
+        )
+        a_scale_sort = mxfp4_moe_sort_fwd(
+            a_scale,
+            sorted_ids=sorted_ids,
+            num_valid_ids=num_valid_ids,
+            token_num=token,
+            cols=model_dim,
+        )
+
+        w1_q_shuf = shuffle_weight(w1_q, (16, 16))
+        if gate_mode == "interleave":
+            w1_q_shuf = shuffle_weight(w1_q, (16, 16), is_guinterleave=True, gate_up=True)
+
+        return {
+            "ref_stage1": ref_stage1,
+            "a_q": a_q,
+            "a_scale_sort": a_scale_sort,
+            "w1_q_shuf": w1_q_shuf,
+            "w1_scale_shuf": e8m0_shuffle(w1_scale),
+            "sorted_ids": sorted_ids,
+            "sorted_expert_ids": sorted_expert_ids,
+            "num_valid_ids": num_valid_ids,
+            "topk": topk,
+        }
+
+
+    @pytest.mark.parametrize(
+        "token,model_dim,inter_dim,E,topk,block_m,tile_m,tile_n,tile_k,"
+        "gate_mode,out_dtype,seed,situ_beta,situ_linear_beta",
+        A8W4_SITUV2_VEC4_CASES,
+    )
+    @_SKIP_GFX950_FLYDSL
+    def test_flydsl_situv2_a8w4_stage1_vec4(
+        token,
+        model_dim,
+        inter_dim,
+        E,
+        topk,
+        block_m,
+        tile_m,
+        tile_n,
+        tile_k,
+        gate_mode,
+        out_dtype,
+        seed,
+        situ_beta,
+        situ_linear_beta,
+    ):
+        """a8w4 SiTUv2 stage1 via mixed_moe_gemm_2stage vec4 activation path."""
+        from aiter.ops.flydsl.moe_kernels import flydsl_moe_stage1
+
+        torch.set_default_device("cuda")
+        label = (
+            f"a8w4_situv2_vec4 token={token} tile={tile_m}x{tile_n}x{tile_k} "
+            f"gate={gate_mode} out={out_dtype} beta=({situ_beta},{situ_linear_beta})"
+        )
+        data = _generate_a8w4_situv2_vec4_data(
+            token=token,
             model_dim=model_dim,
             inter_dim=inter_dim,
+            E=E,
+            topk=topk,
+            block_m=block_m,
+            seed=seed,
+            situ_beta=situ_beta,
+            situ_linear_beta=situ_linear_beta,
+            gate_mode=gate_mode,
+        )
+        out = flydsl_moe_stage1(
+            a=data["a_q"],
+            w1=data["w1_q_shuf"],
+            sorted_token_ids=data["sorted_ids"],
+            sorted_expert_ids=data["sorted_expert_ids"],
+            num_valid_ids=data["num_valid_ids"],
+            topk=data["topk"],
+            tile_m=tile_m,
+            tile_n=tile_n,
+            tile_k=tile_k,
+            a_dtype="fp8",
+            b_dtype="fp4",
+            out_dtype=out_dtype,
+            act="situv2",
+            situ_beta=situ_beta,
+            situ_linear_beta=situ_linear_beta,
+            w1_scale=data["w1_scale_shuf"],
+            a1_scale=data["a_scale_sort"],
+            gate_mode=gate_mode,
+        )
+        torch.cuda.synchronize()
+        # ref is bf16 while out may be f16 (t32_sep_f16 case); compare in fp32.
+        _check_close(data["ref_stage1"].float(), out.float(), label)
+
+
+    # ---------------------------------------------------------------------------
+    # Regression: a8w4 SiTUv2 end-to-end (stage1 -> stage2) numeric check, both
+    # gate_modes, over 128-multiple inter_dim.
+    #
+    # Guards the non-256 inter_dim bug where stage1 tile_n was not downgraded for
+    # a8w4 (fp8 x mxfp4) -> OOB on the N (gate/up) axis -> ~30% wrong final output
+    # or GPU memfault at inter=384/640 (separated). The previous a8w4 suite only
+    # exercised inter=640 in INTERLEAVE mode, which masked this. Here we compare the
+    # FULL E2E output against the torch reference (not just NaN) across aligned
+    # (256/512) and non-256 (128/384/640) inter_dim, in BOTH separated and
+    # interleave gate_modes, on the no-pad path (kernel resolves tile_n internally).
+    # ---------------------------------------------------------------------------
+    def _generate_a8w4_situv2_e2e_data(
+        token,
+        model_dim,
+        inter_dim,
+        E,
+        topk,
+        block_m,
+        *,
+        seed=11,
+        gate_mode="separated",
+        situ_beta=SITUV2_BETA,
+        situ_linear_beta=SITUV2_LINEAR_BETA,
+        dtype=torch.bfloat16,
+    ):
+        torch.manual_seed(seed)
+        torch.cuda.manual_seed(seed)
+
+        inp = torch.randn((token, model_dim), dtype=dtype, device="cuda") / 4
+        w1 = torch.randn((E, inter_dim * 2, model_dim), dtype=dtype, device="cuda") / 4
+        w2 = torch.randn((E, model_dim, inter_dim), dtype=dtype, device="cuda") / 4
+
+        topk_weights, topk_ids, sorted_ids, sorted_expert_ids, num_valid_ids = _make_routes(
+            inp, E, topk, block_m
+        )
+        sorted_weights = moe_sorting(topk_ids, topk_weights, E, model_dim, dtype, block_m)[
+            1
+        ]
+
+        a_q, a_scale = per_1x32_f8_scale_f8_quant(
+            inp, quant_dtype=dtypes.fp8, scale_type=dtypes.fp8_e8m0
+        )
+        w1_q, w1_scale = per_1x32_f4_quant(w1, quant_dtype=dtypes.fp4x2)
+        w2_q, w2_scale = per_1x32_f4_quant(w2, quant_dtype=dtypes.fp4x2)
+        w1_q = w1_q.view(E, inter_dim * 2, model_dim // 2)
+        w2_q = w2_q.view(E, model_dim, inter_dim // 2)
+
+        ref1 = torch_moe_stage1(
+            a_q,
+            w1_q,
+            w2_q,
+            topk_weights,
+            topk_ids,
+            dtype=dtype,
+            activation=ActivationType.Situv2,
+            quant_type=Q_TYPE,
+            a1_scale=a_scale,
+            w1_scale=w1_scale,
+            situ_beta=situ_beta,
+            situ_linear_beta=situ_linear_beta,
+        )
+        ref2 = torch_moe_stage2(
+            ref1,
+            w1_q,
+            w2_q,
+            topk_weights,
+            topk_ids,
+            dtype=dtype,
+            quant_type=Q_TYPE,
+            w2_scale=w2_scale,
+            a2_scale=None,
+            doweight=True,
+        )
+
+        a_scale_sort = mxfp4_moe_sort_fwd(
+            a_scale,
+            sorted_ids=sorted_ids,
+            num_valid_ids=num_valid_ids,
+            token_num=token,
+            cols=model_dim,
+        )
+        # Interleave uses the a16w4-style GUI shuffle (shuffle_weight_a16w4 gate_up
+        # + shuffle_scale_a16w4). The shuffle_weight(is_guinterleave=...) variant is
+        # only approximately correct at stage1 and corrupts stage2 (~25% E2E error).
+        if gate_mode == "interleave":
+            w1_shuf = shuffle_weight_a16w4(w1_q, 16, True)
+            w1_scale_shuf = shuffle_scale_a16w4(w1_scale, E, True)
+        else:
+            w1_shuf = shuffle_weight(w1_q, (16, 16))
+            w1_scale_shuf = e8m0_shuffle(w1_scale)
+        return {
+            "token": token,
+            "inter_dim": inter_dim,
+            "topk": topk,
+            "a_q": a_q,
+            "a_scale_sort": a_scale_sort,
+            "w1_shuf": w1_shuf,
+            "w1_scale_shuf": w1_scale_shuf,
+            "w2_shuf": shuffle_weight_a16w4(w2_q, 16, False),
+            "w2_scale_shuf": shuffle_scale_a16w4(w2_scale, E, False),
+            "sorted_ids": sorted_ids,
+            "sorted_weights": sorted_weights,
+            "sorted_expert_ids": sorted_expert_ids,
+            "num_valid_ids": num_valid_ids,
+            "ref_stage1": ref1,
+            "ref_stage2": ref2,
+        }
+
+
+    # Both gate_modes. Separated is the production/customer SiTUv2 path (fused_moe
+    # routes SiTUv2 -> separated). Interleave uses the a16w4-style GUI weight shuffle
+    # (see generator); the earlier shuffle_weight(is_guinterleave) recipe corrupted
+    # stage2, which is a test-recipe issue, not a kernel bug.
+    @pytest.mark.parametrize("gate_mode", ["separated", "interleave"])
+    @pytest.mark.parametrize(
+        "inter_dim,seed",
+        [
+            pytest.param(128, 11, id="i128_non256"),
+            pytest.param(256, 12, id="i256_aligned"),
+            pytest.param(384, 13, id="i384_non256"),
+            pytest.param(512, 14, id="i512_aligned"),
+            pytest.param(640, 15, id="i640_non256"),
+        ],
+    )
+    @_SKIP_GFX950_FLYDSL
+    def test_flydsl_e2e_a8w4_situv2(inter_dim, seed, gate_mode):
+        """a8w4 SiTUv2 E2E (stage1->stage2), numeric vs torch ref.
+
+        Caller passes tile_n=256; the kernel must internally downgrade for non-256
+        inter_dim. Regression guard for the a8w4 separated non-256 OOB bug.
+        """
+        from aiter.ops.flydsl.moe_kernels import flydsl_moe_stage1, flydsl_moe_stage2
+
+        torch.set_default_device("cuda")
+        token, model_dim, E, topk, block_m = 1024, 512, 8, 2, 32
+        d = _generate_a8w4_situv2_e2e_data(
+            token, model_dim, inter_dim, E, topk, block_m, seed=seed, gate_mode=gate_mode
+        )
+        topk = d["topk"]
+
+        s1 = flydsl_moe_stage1(
+            a=d["a_q"],
+            w1=d["w1_shuf"],
+            sorted_token_ids=d["sorted_ids"],
+            sorted_expert_ids=d["sorted_expert_ids"],
+            num_valid_ids=d["num_valid_ids"],
+            topk=topk,
+            tile_m=32,
+            tile_n=256,
+            tile_k=256,
+            a_dtype="fp8",
+            b_dtype="fp4",
+            out_dtype="bf16",
+            act="situv2",
+            situ_beta=SITUV2_BETA,
+            situ_linear_beta=SITUV2_LINEAR_BETA,
+            w1_scale=d["w1_scale_shuf"],
+            a1_scale=d["a_scale_sort"],
+            gate_mode=gate_mode,
+        )
+        torch.cuda.synchronize()
+        _check_close(
+            d["ref_stage1"].float(), s1.float(), f"situv2_{gate_mode}_stage1_i{inter_dim}"
+        )
+
+        a2_q, a2_scale = per_1x32_f8_scale_f8_quant(
+            s1, quant_dtype=dtypes.fp8, scale_type=dtypes.fp8_e8m0
+        )
+        a2_q = a2_q.view(token, topk, inter_dim)
+        a2_scale_sort = mxfp4_moe_sort_fwd(
+            a2_scale,
+            sorted_ids=d["sorted_ids"],
+            num_valid_ids=d["num_valid_ids"],
+            token_num=token,
+            cols=inter_dim,
+        )
+        out = flydsl_moe_stage2(
+            inter_states=a2_q,
+            w2=d["w2_shuf"],
+            sorted_token_ids=d["sorted_ids"],
+            sorted_expert_ids=d["sorted_expert_ids"],
+            num_valid_ids=d["num_valid_ids"],
+            topk=topk,
+            tile_m=32,
+            tile_n=256,
+            tile_k=256,
+            a_dtype="fp8",
+            b_dtype="fp4",
+            out_dtype="bf16",
+            mode="atomic",
+            w2_scale=d["w2_scale_shuf"],
+            a2_scale=a2_scale_sort,
+            sorted_weights=d["sorted_weights"],
+            inter_dim_pad=0,
+            model_dim_pad=0,
+        )
+        torch.cuda.synchronize()
+        _check_close(
+            d["ref_stage2"].float(), out.float(), f"situv2_{gate_mode}_e2e_i{inter_dim}"
+        )
+
+elif _GFX == "gfx1250" or _FORCE_GFX1250:
+    #!/usr/bin/env python3
+
+    # SPDX-License-Identifier: MIT
+    # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
+
+    """gfx1250 grouped MoE GEMM tests through ``aiter.fused_moe``.
+
+    Two formats covered:
+
+    * **a4w4** -- MXFP4 activations × MXFP4 weights (``w1.dtype = fp4x2``).
+    * **a8w4** -- MXFP8 activations × MXFP4 weights (``w1.dtype = uint8``).
+
+    Both go through the public ``fused_moe`` API; we never call the underlying
+    grouped GEMM launcher directly. The grouped path is opted-in via the
+    ``AITER_USE_GROUPED_GEMM=1`` env (set automatically by the runner below).
+
+    Pytest covers a small correctness case for each format. Direct execution
+    (``python op_tests/test_flydsl_grouped_gemm_gfx1250.py``) runs a
+    DeepSeek-style perf bench (``--scenario bench``, end-to-end fused_moe), a
+    per-kernel bench that times gemm1 and gemm2 in isolation
+    (``--scenario kernel``), a tiny correctness check
+    (``--scenario verify``), or a full sweep of every setting in a tuned-config
+    CSV (``--scenario csv``; defaults to ``aiter/configs/tuned_grouped_fmoe.csv``,
+    one benched case per row, override the file with ``--csv-path``).
+    """
+
+
+    import argparse
+    import csv
+    import os
+    import sys
+    from contextlib import nullcontext
+
+    import pytest
+    import torch
+
+    from aiter import ActivationType, QuantType, logger
+    from aiter import test_common as bench_init
+    from aiter.aot.flydsl.common import run_only_env
+    from aiter.fused_moe import (
+        fused_moe,
+        fused_topk,
+        torch_moe_stage1,
+        torch_moe_stage2,
+    )
+    from aiter.ops.flydsl.moe_common import GateMode, apply_gate_up
+    from aiter.ops.quant import per_1x32_f4_quant
+    from aiter.ops.shuffle import moe_shuffle_scale, moe_shuffle_weight
+    from aiter.utility import dtypes, fp4_utils
+
+    # Build every tensor straight on the device (like op_tests/test_moe_2stage.py) so
+    # the test body has no `.cuda()` / `.float().cuda()` plumbing.
+    torch.set_default_device("cuda")
+
+    pytestmark = [pytest.mark.l2_device, pytest.mark.rocm_lower]
+
+    # Routing: normal (random) by default; round-robin balanced only when
+    # AITER_MOE_EXPERT_BALANCE=1 (mirrors op_tests/test_moe_2stage.py).
+    AITER_MOE_EXPERT_BALANCE = (
+        os.environ.get("AITER_MOE_EXPERT_BALANCE", "False").lower() == "true"
+    )
+
+
+    # Force topk to activate only the first n experts (ids 0..n-1). 0 = unset.
+    # Takes precedence over AITER_MOE_EXPERT_BALANCE when set (> 0).
+    def parse_num_expert_activated():
+        try:
+            val = int(os.environ.get("AITER_MOE_NUM_EXPERT_ACTIVATED", "0"))
+        except ValueError:
+            raise ValueError("AITER_MOE_NUM_EXPERT_ACTIVATED must be an integer")
+        if val < 0:
+            raise ValueError(f"AITER_MOE_NUM_EXPERT_ACTIVATED must be >= 0, got {val}")
+        return val
+
+
+    AITER_MOE_NUM_EXPERT_ACTIVATED = parse_num_expert_activated()
+
+    SCALE_BLOCK = 32
+    DEFAULT_SCALE_BYTE = 127  # e8m0 byte for 2^0 = 1.0
+    _ACT_BY_NAME = {
+        "silu": ActivationType.Silu,
+        "swiglu": ActivationType.Swiglu,
+        "situv2": ActivationType.Situv2,
+    }
+
+    VERIFY_TOL_A4W4 = 0.02
+    VERIFY_TOL_A8W4 = 0.02
+    # Production MoE accuracy gate (matches op_tests/test_moe_2stage.py calc_diff):
+    # logits_diff = ||x-y||^2 / (||x||^2 + ||y||^2).  rel_l2 is kept as an
+    # informational print only; logits_diff < 0.01 is the actual pass/fail gate.
+    LOGITS_DIFF_TOL = 0.01
+
+
+    # ---------------------------------------------------------------------------
+    # Environment / arch guards
+    # ---------------------------------------------------------------------------
+    def _require_gfx1250() -> None:
+        # AITER_FORCE_GFX1250=1 forces the grouped path on other archs (e.g. gfx942)
+        # to exercise the tiny operators with the GEMM mocked (default; pass
+        # --real-gemm to call the real gfx1250 kernel instead).
+        if os.environ.get("AITER_FORCE_GFX1250", "0") in ("1", "true", "True", "yes"):
+            return
+        try:
+            from flydsl.runtime.device import get_rocm_arch
+        except Exception as exc:  # noqa: BLE001
+            pytest.skip(f"FlyDSL not importable: {exc}")
+        arch = get_rocm_arch()
+        if "gfx1250" not in arch.lower():
+            pytest.skip(f"requires gfx1250, got {arch!r}")
+
+
+    def is_gfx1250() -> bool:
+        """True only on actual gfx1250 hardware. AITER_FORCE_GFX1250 does NOT count:
+        forcing the grouped path onto another arch (e.g. gfx942) still needs the GEMM
+        mocked, so real-gemm defaults on only when the real WMMA kernel can run."""
+        try:
+            from flydsl.runtime.device import get_rocm_arch
+
+            return "gfx1250" in get_rocm_arch().lower()
+        except Exception:  # noqa: BLE001
+            return False
+
+
+    # Weights/scales use the public shuffle APIs directly:
+    #   shuffle_weight(b, layout=(16, 16))            -> FP4 TDM B layout (16-row x
+    #       16-byte chunks) the grouped FlyDSL kernels consume.
+    #   moe_shuffle_scale(s, experts_cnt=E) -> arch-aware MoE B-scale shuffle; on
+    #       gfx1250 it folds to the grouped-only n32k4 e8m0 layout (shuffle_scale_n32k4).
+    # ---------------------------------------------------------------------------
+    # Reference: aiter's own ``torch_moe_stage1`` + ``torch_moe_stage2``
+    # (high-precision fp32 baseline that decodes mxfp4/e8m0 internally and
+    # evaluates the same swiglu+bias formula the grouped path uses). It still
+    # diverges from the quantised grouped GEMM path by mxfp4/mxfp8 round noise
+    # (~0.2 rel_l2 on random uint8 weights, ~0.02 on real model weights). The
+    # point is to catch *catastrophic* regressions, not chase fp32 parity.
+    # ---------------------------------------------------------------------------
+    def _torch_moe_ref(
+        hidden: torch.Tensor,  # (T, K) bf16
+        w1_packed: torch.Tensor,  # (E, 2*I, K_pack) uint8 (GGUU)
+        w1_scale_raw: torch.Tensor,  # (E, 2*I, K//32) uint8 (raw e8m0)
+        w1_bias: torch.Tensor,  # (E, 2*I) fp32
+        w2_packed: torch.Tensor,  # (E, K, I_pack) uint8
+        w2_scale_raw: torch.Tensor,  # (E, K, I//32) uint8
+        w2_bias: torch.Tensor,  # (E, K) fp32
+        topk_w: torch.Tensor,  # (T, topk) bf16
+        topk_id: torch.Tensor,  # (T, topk) int32
+        *,
+        data_format: str,
+        activation: ActivationType,
+        swiglu_limit: float,
+        situ_beta: float,
+        situ_linear_beta: float,
+    ) -> torch.Tensor:
+        """Two-stage MoE reference reusing ``aiter.fused_moe.torch_moe_stage{1,2}``."""
+        if data_format not in ("a4w4", "a8w4"):
+            raise ValueError(f"data_format must be a4w4 or a8w4, got {data_format!r}")
+
+        def _per_1x32_fp8_dequant(x: torch.Tensor) -> torch.Tensor:
+            """Mirror grouped a8w4's per-block-32 MXFP8 input quant, then dequant."""
+            block = 32
+            dtype_max = 448.0
+            x_shape = x.shape
+            flat = x.contiguous().view(-1, x_shape[-1]).float()
+            blk = flat.view(-1, block)
+            blk = torch.nan_to_num(blk, nan=0.0, posinf=0.0, neginf=0.0)
+            max_abs = blk.abs().amax(dim=1)
+            scale_e8m0 = fp4_utils.f32_to_mx_e8m0_scale(
+                max_abs, dtype=fp4_utils.MxDtypeInt.FP8_E4M3
+            )
+            scale_f32 = fp4_utils.e8m0_to_f32(scale_e8m0)
+            scale_f32 = torch.nan_to_num(scale_f32, nan=1.0, posinf=1.0, neginf=1.0)
+            scale_f32[scale_f32 == 0] = 1.0
+            q_f32 = (blk / scale_f32.unsqueeze(1)).clamp(min=-dtype_max, max=dtype_max)
+            q = q_f32.contiguous().to(dtypes.fp8).to(torch.float32).view_as(blk)
+            return (q * scale_f32.unsqueeze(1)).view(x_shape).to(x.dtype)
+
+        w1_scale = w1_scale_raw.view(dtypes.fp8_e8m0)
+        w2_scale = w2_scale_raw.view(dtypes.fp8_e8m0)
+        if data_format == "a4w4":
+            # Match the grouped a4w4 path: stage1 input is MXFP4, not bf16.
+            stage1_hidden, stage1_hidden_scale = per_1x32_f4_quant(
+                hidden, quant_dtype=dtypes.fp4x2, shuffle=False
+            )
+        else:
+            # Match grouped a8w4: stage1 input is MXFP8 with per-1x32 e8m0 scale.
+            stage1_hidden, stage1_hidden_scale = _per_1x32_fp8_dequant(hidden), None
+        a2 = torch_moe_stage1(
+            stage1_hidden,
+            w1_packed,
+            w2_packed,
+            topk_w,
+            topk_id,
+            dtype=torch.bfloat16,
+            activation=activation,
+            quant_type=QuantType.per_1x32,
+            a1_scale=stage1_hidden_scale,
+            w1_scale=w1_scale,
+            w1_bias=w1_bias,
+            # swiglu_limit clamps gate/up for both SwiGLU and SiLU: the grouped
+            # FlyDSL epilogue now applies it in either branch, so the reference
+            # passes it through unconditionally to stay in sync.
+            swiglu_limit=swiglu_limit,
+            situ_beta=situ_beta,
+            situ_linear_beta=situ_linear_beta,
+        )
+        if data_format == "a4w4":
+            # Match the grouped a4w4 path again: stage2 input is MXFP4.
+            T, topk = topk_id.shape
+            inter = w2_packed.shape[-1] * 2
+            a2_q, a2_scale = per_1x32_f4_quant(
+                a2.contiguous().view(T * topk, inter),
+                quant_dtype=dtypes.fp4x2,
+                shuffle=False,
+            )
+            a2 = a2_q.view(T, topk, inter // 2)
+        else:
+            # Match grouped a8w4 stage2: per-block-32 MXFP8 quant + dequant.
+            # This matters for SiLU because the unclamped stage1 output can exceed
+            # fp8's unit-scale range; grouped now uses a real e8m0 block scale.
+            a2 = _per_1x32_fp8_dequant(a2)
+            a2_scale = None
+        out = torch_moe_stage2(
+            a2,
+            w1_packed,
+            w2_packed,
+            topk_w,
+            topk_id,
+            dtype=torch.bfloat16,
+            quant_type=QuantType.per_1x32,
+            w2_scale=w2_scale,
+            a2_scale=a2_scale,
+            w2_bias=w2_bias,
+            doweight=True,
+        )
+        return out
+
+
+    # ---------------------------------------------------------------------------
+    # Mock data builders
+    # ---------------------------------------------------------------------------
+    def _pattern_packed(
+        experts: int,
+        rows: int,
+        k_pack: int,
+        *,
+        data_init: str,
+        generator: torch.Generator,
+    ) -> torch.Tensor:
+        """Build packed MXFP4 weights with the shared benchmark initializer."""
+        if data_init == "constant":
+            return torch.full((experts, rows, k_pack), 0x11, dtype=torch.uint8)
+        packed = bench_init.fill_fp4((experts * rows, k_pack * 2), data_init, generator)
+        return packed.view(experts, rows, k_pack)
+
+
+    def init_weight_scales(
+        experts: int,
+        rows: int,
+        n_blocks: int,
+        *,
+        scale_init: str,
+        generator: torch.Generator,
+    ) -> torch.Tensor:
+        """Build E8M0 weight scales with the shared benchmark initializer."""
+        if scale_init == "constant":
+            return torch.full(
+                (experts, rows, n_blocks), DEFAULT_SCALE_BYTE, dtype=torch.uint8
+            )
+        return bench_init.fill_scale_e8m0((experts, rows, n_blocks), scale_init, generator)
+
+
+    def _init_hidden(
+        shape: tuple[int, int],
+        data_format: str,
+        data_init: str,
+        generator: torch.Generator,
+    ) -> torch.Tensor:
+        """Build BF16 activations using the selected low-precision data model."""
+        if data_init == "constant":
+            return torch.full(shape, 0.5, dtype=torch.bfloat16)
+        if data_format == "a4w4":
+            packed = bench_init.fill_fp4(shape, data_init, generator)
+            return fp4_utils.mxfp4_to_f32(packed).to(torch.bfloat16)
+        return bench_init.fill_fp8(shape, data_init, generator).to(torch.bfloat16)
+
+
+    def _make_routing_score(tokens: int, experts: int, topk: int) -> torch.Tensor:
+        """Build the ``(tokens, experts)`` gating score honoring the routing env
+        controls: ``AITER_MOE_NUM_EXPERT_ACTIVATED=n`` (highest priority) activates
+        n randomly-chosen experts (round-robin balanced); ``AITER_MOE_EXPERT_BALANCE``
+        round-robins over all experts; otherwise random gating. Shared by the FlyDSL
+        (``_make_topk``) and gluon routing paths so both react to the same env."""
+        if AITER_MOE_NUM_EXPERT_ACTIVATED > 0:
+            n_act = AITER_MOE_NUM_EXPERT_ACTIVATED
+            if n_act < topk or n_act > experts or n_act > tokens * topk:
+                raise ValueError(
+                    f"AITER_MOE_NUM_EXPERT_ACTIVATED={n_act} is invalid: must be in "
+                    f"[topk={topk}, min(experts={experts}, tokens*topk={tokens * topk})]"
+                )
+            sel = torch.randperm(experts)[:n_act]  # random active expert ids
+            score = torch.full((tokens, experts), float("-inf"), dtype=torch.float32)
+            slot = torch.arange(tokens * topk) % n_act  # round-robin over active set
+            rows = torch.arange(tokens).repeat_interleave(topk)
+            score[rows, sel[slot]] = 1.0
+        elif AITER_MOE_EXPERT_BALANCE:
+            score = torch.zeros((tokens, experts), dtype=torch.float32)
+            start_col, end_col = 0, topk
+            for token_id in range(tokens):
+                score[token_id, start_col:end_col] = 1.0
+                start_col = end_col % experts
+                end_col = start_col + topk
+        else:
+            score = torch.randn((tokens, experts), dtype=torch.float32)
+        return score
+
+
+    def _make_topk(
+        hidden_states: torch.Tensor, experts: int, topk: int
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Route via ``fused_topk``: normal (random gating) by default; round-robin
+        balanced gating when ``AITER_MOE_EXPERT_BALANCE=1`` (mirrors
+        op_tests/test_moe_2stage.py). ``AITER_MOE_NUM_EXPERT_ACTIVATED=n`` (highest
+        priority) restricts topk to the first n experts. Returns
+        ``(topk_ids, topk_weights)`` on the same device as ``hidden_states``."""
+        tokens = hidden_states.shape[0]
+        score = _make_routing_score(tokens, experts, topk)
+        topk_w, topk_id = fused_topk(hidden_states, score, topk, True)
+        return topk_id.to(torch.int32), topk_w
+
+
+    def _gguu_to_gugu_rows(t: torch.Tensor) -> torch.Tensor:
+        """``(E, 2*I, ...)`` GGUU ``[g0..g_{I-1}, u0..u_{I-1}]`` -> GUGU ``[g0,u0,g1,u1,...]``."""
+        _E, two_inter = t.shape[:2]
+        inter = two_inter // 2
+        g = t[:, :inter]
+        u = t[:, inter:]
+        return torch.stack([g, u], dim=2).flatten(1, 2).contiguous()
+
+
+    # ---------------------------------------------------------------------------
+    # Core runner: build inputs, invoke fused_moe, optionally compare to ref
+    # ---------------------------------------------------------------------------
+    def _run_grouped_via_fused_moe(
+        *,
+        experts: int,
+        tokens: int,
+        topk: int,
+        model_dim: int,
+        inter_dim: int,
+        data_format: str,  # "a4w4" | "a8w4"
+        activation: ActivationType = ActivationType.Swiglu,
+        swiglu_limit: float = 7.0,
+        situ_beta: float = 4.0,
+        situ_linear_beta: float = 25.0,
+        use_bias: bool = True,
+        bench: bool = False,
+        kernel_bench: bool = False,
+        seed: int = 0,
+        warmup: int = 5,
+        iters: int = 101,
+        data_init: str = "uniform",
+        scale_init: str = "auto",
+    ) -> tuple[torch.Tensor, torch.Tensor, float | None, dict | None]:
+        """Build mxfp4 weights + routing, dispatch through ``fused_moe``.
+
+        Stage1 weights are always laid out GUGU (gate/up row-interleaved) paired
+        with ``GateMode.INTERLEAVE``, which is the only layout the TDM grouped
+        GEMM reads. The PyTorch reference evaluates the GGUU logical weights, so the
+        numerical result is unchanged.
+
+        Correctness is always checked against the reference. ``bench`` selects the
+        path that is validated and timed: when set, the output comes from
+        ``run_perftest`` in CUDA-graph mode (production path) and ``us`` is the graph
+        timing; otherwise the output is a single eager (graph-off) call and ``us`` is
+        None. ``kernel_bench`` instead times the gemm1/gemm2 kernels in isolation
+        (looping each launch alone) and returns their per-kernel us in ``kernel_us``.
+        Returns ``(out, ref, us_or_None, kernel_us_or_None)``.
+        """
+        if data_format not in ("a4w4", "a8w4"):
+            raise ValueError(f"data_format must be a4w4 or a8w4, got {data_format!r}")
+
+        K = model_dim
+        inter = inter_dim
+        K_pack = K // 2
+        inter_pack = inter // 2
+
+        # Logical weights/scale/bias: always GGUU (gate rows then up rows).
+        torch.manual_seed(seed)
+        generator = bench_init.make_generator(seed)
+        w1_logical = _pattern_packed(
+            experts,
+            2 * inter,
+            K_pack,
+            data_init=data_init,
+            generator=generator,
+        )
+        w2_logical = _pattern_packed(
+            experts,
+            K,
+            inter_pack,
+            data_init=data_init,
+            generator=generator,
+        )
+        w1_scale_raw = init_weight_scales(
+            experts,
+            2 * inter,
+            K // SCALE_BLOCK,
+            scale_init=scale_init,
+            generator=generator,
+        )
+        w2_scale_raw = init_weight_scales(
+            experts,
+            K,
+            inter // SCALE_BLOCK,
+            scale_init=scale_init,
+            generator=generator,
+        )
+        if use_bias:
+            if data_init == "constant":
+                bias1 = torch.full((experts, 2 * inter), 0.5)
+                bias2 = torch.full((experts, K), 0.5)
+            else:
+                bias1 = (
+                    torch.randn((experts, 2 * inter), generator=generator) * 1e-3
+                ).float()
+                bias2 = (torch.randn((experts, K), generator=generator) * 1e-3).float()
+        else:
+            bias1 = torch.zeros((experts, 2 * inter))
+            bias2 = torch.zeros((experts, K))
+        # Activations: bf16; fused_moe handles the dispatched quant internally.
+        hidden = _init_hidden((tokens, K), data_format, data_init, generator)
+
+        # Routing: normal (random) by default; balanced if AITER_MOE_EXPERT_BALANCE.
+        topk_id, topk_w = _make_topk(hidden, experts, topk)
+        topk_w = topk_w.to(torch.bfloat16)
+
+        # ---- prep grouped GEMM inputs ----
+        # Stage1 weight/scale/bias are rearranged to the physical GUGU layout;
+        # stage2 has no GUGU concept (single N=hidden GEMM).
+        bias1_phys = _gguu_to_gugu_rows(bias1)
+        gate_mode = GateMode.INTERLEAVE
+
+        # moe_shuffle_weight interleaves gate/up rows internally, so it takes the
+        # logical GGUU weight.
+        w1_grouped = moe_shuffle_weight(
+            w1_logical,
+            experts_cnt=experts,
+            is_guinterleave=True,
+            gate_up=True,
+        )
+        w2_grouped = moe_shuffle_weight(w2_logical, experts_cnt=experts)
+        # GUGU B-scale is built the production way: feed the RAW GGUU scale to
+        # moe_shuffle_scale(is_guinterleave=True), which interleaves gate/up rows
+        # then folds n32k4 (aiter.ops.shuffle.shuffle_scale_n32k4 end to end) --
+        # the weights/bias are row-interleaved above.
+        w1_scale = moe_shuffle_scale(
+            w1_scale_raw.contiguous(),
+            experts_cnt=experts,
+            is_guinterleave=True,
+            gate_up=True,
+        )
+        w2_scale = moe_shuffle_scale(w2_scale_raw.contiguous(), experts_cnt=experts)
+
+        if data_format == "a4w4":
+            w1_arg = w1_grouped.view(dtypes.fp4x2)
+            w2_arg = w2_grouped.view(dtypes.fp4x2)
+        else:  # a8w4
+            w1_arg = w1_grouped  # uint8 -> grouped helper sets q_dtype_a=fp8
+            w2_arg = w2_grouped
+
+        def _call():  # the grouped path is auto-enabled on gfx1250
+            return fused_moe(
+                hidden,
+                w1_arg,
+                w2_arg,
+                topk_w,
+                topk_id,
+                activation=activation,
+                quant_type=QuantType.per_1x32,
+                w1_scale=w1_scale,
+                w2_scale=w2_scale,
+                bias1=bias1_phys if use_bias else None,
+                bias2=bias2 if use_bias else None,
+                gate_mode=gate_mode.value,
+                dtype=dtypes.bf16,
+                swiglu_limit=swiglu_limit,
+                beta=situ_beta,
+                linear_beta=situ_linear_beta,
+            )
+
+        torch.cuda.synchronize()
+        kernel_us = None
+        if kernel_bench:
+            # Kernel-bench: time gemm1 and gemm2 in isolation. One eager call
+            # populates the per-stage launch callables (and yields a correct ``out`` to
+            # verify); then loop each kernel alone. ``us`` (end-to-end) stays None.
+            from aiter.ops.flydsl import grouped_moe_gfx1250 as _grouped
+            from aiter.test_common import run_perftest
+
+            kernel_bench_callable: list = []
+            _grouped.kernel_bench_callable = kernel_bench_callable
+            try:
+                out = _call()
+            finally:
+                _grouped.kernel_bench_callable = None
+            us = None
+            kernel_us = {}
+            for _name, callable in kernel_bench_callable:
+                _, _us = run_perftest(
+                    callable,
+                    num_warmup=warmup,
+                    num_iters=iters,
+                    testGraph=False,
+                )
+                kernel_us[_name] = _us
+        elif bench:
+            # Bench: validate + time the CUDA-graph (production) path. The returned
+            # data is the graph-captured output.
+            from aiter.test_common import run_perftest
+
+            out, us = run_perftest(
+                _call, num_warmup=warmup, num_iters=iters, testGraph=False
+            )
+        else:
+            # Verify: validate the eager (graph-off) path; no timing.
+            out = _call()
+            us = None
+
+        # Reference always uses GGUU logical inputs (layouts are numerically
+        # equivalent; only physical packing differs).
+        ref = _torch_moe_ref(
+            hidden,
+            w1_logical,
+            w1_scale_raw,
+            bias1,
+            w2_logical,
+            w2_scale_raw,
+            bias2,
+            topk_w,
+            topk_id,
             data_format=data_format,
             activation=activation,
             swiglu_limit=swiglu_limit,
             situ_beta=situ_beta,
             situ_linear_beta=situ_linear_beta,
-            use_bias=use_bias,
-            bench=bench,
-            kernel_bench=kernel_bench,
-            seed=seed,
-            warmup=warmup,
-            iters=iters,
-            data_init=data_init,
-            scale_init=scale_init,
-        )
-    mode = "kernel" if kernel_bench else ("graph" if bench else "eager")
-    ld = _logits_diff(out, ref)
-    rel = _rel_l2(out, ref)
-    print(
-        f"[sanity {tag}] {mode}: logits_diff={ld:.4e} rel_l2={rel:.4e} "
-        f"(gate<{LOGITS_DIFF_TOL}, ref_norm={float(ref.float().norm()):.4e})",
-        flush=True,
-    )
-    passed = ld < LOGITS_DIFF_TOL
-    if raise_on_fail:
-        assert (
-            passed
-        ), f"grouped {tag} {mode} vs ref logits_diff={ld:.4e} > {LOGITS_DIFF_TOL}"
-    metrics = {
-        "logits_diff": ld,
-        "rel_l2": rel,
-        "passed": passed,
-        "grouped_norm": float(out.float().norm()),
-        "ref_norm": float(ref.float().norm()),
-    }
+        ).to(out.dtype)
+        return out, ref, us, kernel_us
 
-    # --- perf (bench only): timed end-to-end inside _run_grouped_via_fused_moe ---
-    if bench:
-        work = _gemm_work_metrics(
-            experts=experts,
-            tokens=tokens,
-            topk=topk,
-            model_dim=model_dim,
-            inter_dim=inter_dim,
-            data_format=data_format,
+
+    def _rel_l2(actual: torch.Tensor, expected: torch.Tensor) -> float:
+        diff = (actual.float() - expected.float()).norm()
+        base = expected.float().norm().clamp(min=1e-12)
+        return float(diff / base)
+
+
+    def _logits_diff(actual: torch.Tensor, expected: torch.Tensor) -> float:
+        """MoE accuracy metric from op_tests/test_moe_2stage.py (calc_diff):
+
+            1 - 2*<x,y>/(||x||^2 + ||y||^2)  ==  ||x-y||^2 / (||x||^2 + ||y||^2)
+
+        A magnitude-weighted cosine-style diff. Relation to rel_l2: when the two
+        norms match, logits_diff ~= rel_l2**2 / 2.  Production strict gate: < 0.01.
+        """
+        x = actual.double()
+        y = expected.double()
+        denom = (x * x + y * y).sum() + 1e-8
+        return float(((x - y) ** 2).sum() / denom)
+
+
+    def _gemm_work_metrics(
+        *,
+        experts: int,
+        tokens: int,
+        topk: int,
+        model_dim: int,
+        inter_dim: int,
+        data_format: str,
+    ) -> dict[str, tuple[float, float]]:
+        """Return conventional GEMM FLOPs and effective bytes for both stages.
+
+        The byte model matches the grouped-MoE tuner: logical quantized inputs and
+        weights plus BF16 outputs. It excludes routing, quantization, scales, bias,
+        and other fused-MoE auxiliary traffic, so the reported bandwidth is an
+        effective GEMM bandwidth rather than measured HBM transactions.
+        """
+        input_bytes = 0.5 if data_format == "a4w4" else 1.0
+        weight_bytes = 0.5
+        output_bytes = 2.0
+        stage1_n = 2 * inter_dim
+
+        gemm1_flops = tokens * topk * stage1_n * model_dim * 2
+        gemm1_bytes = (
+            tokens * model_dim * input_bytes
+            + tokens * stage1_n * output_bytes
+            + experts * model_dim * stage1_n * weight_bytes
         )
-        tflops, bandwidth = _rates(work["total"], us)
+        gemm2_flops = tokens * topk * model_dim * inter_dim * 2
+        gemm2_bytes = (
+            tokens * topk * inter_dim * input_bytes
+            + tokens * model_dim * output_bytes
+            + experts * inter_dim * model_dim * weight_bytes
+        )
+        return {
+            "gemm1": (gemm1_flops, gemm1_bytes),
+            "gemm2": (gemm2_flops, gemm2_bytes),
+            "total": (gemm1_flops + gemm2_flops, gemm1_bytes + gemm2_bytes),
+        }
+
+
+    def _rates(
+        work: tuple[float, float], us: float | None
+    ) -> tuple[float | None, float | None]:
+        """Convert a (FLOPs, bytes) work estimate and microseconds to rates."""
+        if us is None or us <= 0:
+            return None, None
+        flops, data_bytes = work
+        return flops / us / 1e6, data_bytes / us / 1e3
+
+
+    # ---------------------------------------------------------------------------
+    # Pytest correctness suite
+    # ---------------------------------------------------------------------------
+    def run_moe(
+        data_format: str,
+        *,
+        experts: int = 4,
+        tokens: int = 8,
+        topk: int = 2,
+        model_dim: int = 512,
+        inter_dim: int = 512,
+        activation: ActivationType = ActivationType.Swiglu,
+        swiglu_limit: float = 7.0,
+        situ_beta: float = 4.0,
+        situ_linear_beta: float = 25.0,
+        use_bias: bool = True,
+        tol: float = VERIFY_TOL_A4W4,
+        raise_on_fail: bool = True,
+        bench: bool = False,
+        kernel_bench: bool = False,
+        warmup: int = 5,
+        iters: int = 101,
+        seed: int = 0,
+        data_init: str = "uniform",
+        scale_init: str = "auto",
+        check_aot_cache: bool = True,
+    ) -> dict:
+        """Compare grouped FlyDSL MoE vs a PyTorch fp32 ref. ``bench`` selects the
+        validated path: bench checks (and times) the CUDA-graph production path;
+        verify checks the eager path.
+
+        Correctness gate: production-consistent logits_diff < LOGITS_DIFF_TOL
+        (op_tests/test_moe_2stage.py).  rel_l2 (~= sqrt(2*logits_diff)) is printed
+        for reference only.  Returns a metrics dict (with ``us`` when benched).
+        """
+        _require_gfx1250()
+        act = {
+            ActivationType.Silu: "silu",
+            ActivationType.Swiglu: "swiglu",
+            ActivationType.Situv2: "situv2",
+        }[activation]
+        tag = f"{data_format} {act}"
+
+        # --- grouped FlyDSL vs PyTorch fp32 ref (graph path if bench, else eager) ---
+        run_only = run_only_env() if check_aot_cache else nullcontext()
+        with run_only:
+            out, ref, us, kernel_us = _run_grouped_via_fused_moe(
+                experts=experts,
+                tokens=tokens,
+                topk=topk,
+                model_dim=model_dim,
+                inter_dim=inter_dim,
+                data_format=data_format,
+                activation=activation,
+                swiglu_limit=swiglu_limit,
+                situ_beta=situ_beta,
+                situ_linear_beta=situ_linear_beta,
+                use_bias=use_bias,
+                bench=bench,
+                kernel_bench=kernel_bench,
+                seed=seed,
+                warmup=warmup,
+                iters=iters,
+                data_init=data_init,
+                scale_init=scale_init,
+            )
+        mode = "kernel" if kernel_bench else ("graph" if bench else "eager")
+        ld = _logits_diff(out, ref)
+        rel = _rel_l2(out, ref)
         print(
-            f"[bench {tag}] fused_moe end-to-end us = {us:.2f}, "
-            f"FLOPS = {work['total'][0]:.0f}, TFLOPS = {tflops:.2f}, "
-            f"Bandwidth = {bandwidth:.2f} GB/s (graph=True)",
+            f"[sanity {tag}] {mode}: logits_diff={ld:.4e} rel_l2={rel:.4e} "
+            f"(gate<{LOGITS_DIFF_TOL}, ref_norm={float(ref.float().norm()):.4e})",
             flush=True,
         )
-        metrics["us"] = us
-        metrics["flops"] = work["total"][0]
-        metrics["tflops"] = tflops
-        metrics["bandwidth_gbs"] = bandwidth
-    # --- perf (kernel-bench only): per-kernel gemm1/gemm2 timing (looped alone) ---
-    if kernel_bench:
-        kernel_us = kernel_us or {}
-        g1 = kernel_us.get("gemm1")
-        g2 = kernel_us.get("gemm2")
-        work = _gemm_work_metrics(
-            experts=experts,
-            tokens=tokens,
-            topk=topk,
-            model_dim=model_dim,
-            inter_dim=inter_dim,
-            data_format=data_format,
-        )
-        if g1 is None and g2 is None:
+        passed = ld < LOGITS_DIFF_TOL
+        if raise_on_fail:
+            assert (
+                passed
+            ), f"grouped {tag} {mode} vs ref logits_diff={ld:.4e} > {LOGITS_DIFF_TOL}"
+        metrics = {
+            "logits_diff": ld,
+            "rel_l2": rel,
+            "passed": passed,
+            "grouped_norm": float(out.float().norm()),
+            "ref_norm": float(ref.float().norm()),
+        }
+
+        # --- perf (bench only): timed end-to-end inside _run_grouped_via_fused_moe ---
+        if bench:
+            work = _gemm_work_metrics(
+                experts=experts,
+                tokens=tokens,
+                topk=topk,
+                model_dim=model_dim,
+                inter_dim=inter_dim,
+                data_format=data_format,
+            )
+            tflops, bandwidth = _rates(work["total"], us)
             print(
-                f"[kernel-bench {tag}] no grouped kernels captured "
-                "(grouped path not taken?)",
+                f"[bench {tag}] fused_moe end-to-end us = {us:.2f}, "
+                f"FLOPS = {work['total'][0]:.0f}, TFLOPS = {tflops:.2f}, "
+                f"Bandwidth = {bandwidth:.2f} GB/s (graph=True)",
                 flush=True,
             )
-        else:
-            for name, elapsed_us in (("gemm1", g1), ("gemm2", g2)):
-                if elapsed_us is None:
-                    print(f"[kernel-bench {tag}] {name}: n/a", flush=True)
-                    continue
-                tflops, bandwidth = _rates(work[name], elapsed_us)
+            metrics["us"] = us
+            metrics["flops"] = work["total"][0]
+            metrics["tflops"] = tflops
+            metrics["bandwidth_gbs"] = bandwidth
+        # --- perf (kernel-bench only): per-kernel gemm1/gemm2 timing (looped alone) ---
+        if kernel_bench:
+            kernel_us = kernel_us or {}
+            g1 = kernel_us.get("gemm1")
+            g2 = kernel_us.get("gemm2")
+            work = _gemm_work_metrics(
+                experts=experts,
+                tokens=tokens,
+                topk=topk,
+                model_dim=model_dim,
+                inter_dim=inter_dim,
+                data_format=data_format,
+            )
+            if g1 is None and g2 is None:
                 print(
-                    f"[kernel-bench {tag}] {name}: us = {elapsed_us:.2f}, "
-                    f"FLOPS = {work[name][0]:.0f}, TFLOPS = {tflops:.2f}, "
-                    f"Bandwidth = {bandwidth:.2f} GB/s",
+                    f"[kernel-bench {tag}] no grouped kernels captured "
+                    "(grouped path not taken?)",
                     flush=True,
                 )
-                metrics[f"{name}_flops"] = work[name][0]
-                metrics[f"{name}_tflops"] = tflops
-                metrics[f"{name}_bandwidth_gbs"] = bandwidth
-        metrics["gemm1_us"] = g1
-        metrics["gemm2_us"] = g2
-    return metrics
-
-
-# model_dim=512 (not the 256 default): the grouped kernel needs
-# num_k_tiles = (K // split_k) // tile_k >= 2, i.e. K >= 2*tile_k = 512.
-def test_grouped_a4w4_silu_matches_torch_ref():
-    run_moe(
-        "a4w4",
-        activation=ActivationType.Silu,
-        model_dim=512,
-        inter_dim=512,
-    )
-
-
-def test_grouped_a4w4_swiglu_matches_torch_ref():
-    run_moe(
-        "a4w4",
-        activation=ActivationType.Swiglu,
-        model_dim=512,
-        inter_dim=512,
-    )
-
-
-def test_situv2_activation_matches_torch():
-    torch.manual_seed(0)
-    gate = torch.randn(4, 32)
-    up = torch.randn(4, 32)
-    beta, linear_beta = 4.0, 25.0
-    expected = (
-        beta
-        * torch.tanh(gate / beta)
-        * torch.sigmoid(gate)
-        * linear_beta
-        * torch.tanh(up / linear_beta)
-    )
-    actual = apply_gate_up(
-        gate,
-        up,
-        "situv2",
-        situ_beta=beta,
-        situ_linear_beta=linear_beta,
-    )
-    torch.testing.assert_close(actual, expected)
-
-
-def test_grouped_a4w4_situv2_matches_torch_ref():
-    run_moe(
-        "a4w4",
-        activation=ActivationType.Situv2,
-        model_dim=512,
-        inter_dim=512,
-    )
-
-
-def test_grouped_a8w4_situv2_matches_torch_ref():
-    # a8w4 takes the fused stage1 quant epilogue (batched activation), which is
-    # a separate code path from a4w4's bf16 intermediate (element-wise).
-    run_moe(
-        "a8w4",
-        activation=ActivationType.Situv2,
-        model_dim=512,
-        inter_dim=512,
-        tol=VERIFY_TOL_A8W4,
-    )
-
-
-@pytest.mark.parametrize("activation", [ActivationType.Silu, ActivationType.Swiglu])
-def test_grouped_a4w4_swiglu_limit_clamps(activation):
-    run_moe("a4w4", activation=activation, swiglu_limit=1.0)
-
-
-# ---------------------------------------------------------------------------
-# Contiguous-M prefix scan
-#
-# The scan sits in front of every grouped MoE launch: it turns the per-expert
-# row counts into the tile-aligned starts/psum the GEMM schedules on, and
-# rewrites the route rows in place. It is also the one piece whose width is set
-# by the expert count rather than the token count, so it gets its own coverage
-# above and below the block size -- a wrong row here does not produce a bad
-# number, it produces an out-of-bounds write in whichever kernel consumes the
-# row next.
-# ---------------------------------------------------------------------------
-def _psum_ref(masked_m: torch.Tensor, tile_m: int):
-    """starts / psum / contiguous_m from a tile-aligned cumulative sum."""
-    aligned = ((masked_m + tile_m - 1) // tile_m) * tile_m
-    inclusive = torch.cumsum(aligned.to(torch.int64), 0)
-    starts = inclusive - aligned
-    return (
-        starts.to(torch.int32),
-        (starts + masked_m).to(torch.int32),
-        max(int(inclusive[-1]), tile_m),
-    )
-
-
-def _random_route_counts(experts: int, topk: int, tokens: int, seed: int = 0):
-    """Per-expert counts from a real (unbalanced) random routing."""
-    torch.manual_seed(seed)
-    topk = min(topk, experts)
-    topk_ids = torch.stack([torch.randperm(experts)[:topk] for _ in range(tokens)]).to(
-        torch.int32
-    )
-    counts = torch.bincount(topk_ids.reshape(-1).long(), minlength=experts)
-    return topk_ids, counts.to(torch.int32)
-
-
-# 512 is MAX_EXPERTS_PER_BLOCK: one thread per expert covers E up to that in a
-# single pass, and everything above it needs the chunked sweep. Kimi-K3 is 896.
-@pytest.mark.parametrize("experts", [8, 256, 512, 513, 896, 1024])
-def test_contiguous_psum_matches_cumsum(experts):
-    _require_gfx1250()
-    from aiter.ops.flydsl.grouped_moe_gfx1250 import contiguous_psum
-
-    tile_m = 64
-    _topk_ids, masked_m = _random_route_counts(experts, topk=16, tokens=128)
-    ref_starts, ref_psum, ref_total = _psum_ref(masked_m, tile_m)
-
-    starts, psum, contiguous_m = contiguous_psum(masked_m, experts, tile_m)
-    torch.cuda.synchronize()
-
-    bad = int((starts != ref_starts).sum())
-    assert bad == 0, (
-        f"E={experts}: {bad} experts have a wrong start, first at "
-        f"{int((starts != ref_starts).nonzero()[0][0])}"
-    )
-    assert torch.equal(psum, ref_psum), f"E={experts}: psum mismatch"
-    assert (
-        int(contiguous_m[0]) == ref_total
-    ), f"E={experts}: contiguous_m {int(contiguous_m[0])} != {ref_total}"
-
-
-@pytest.mark.parametrize("experts", [8, 256, 512, 513, 896, 1024])
-def test_contiguous_psum_remap_rows_stay_in_bounds(experts):
-    """The remap is what the MoE actually calls; an unscanned expert lands here
-    as a row index pointing outside the contiguous buffer."""
-    _require_gfx1250()
-    from aiter.ops.flydsl.grouped_moe_gfx1250 import contiguous_psum_remap
-
-    tile_m, topk, tokens = 64, 16, 128
-    topk_ids, masked_m = _random_route_counts(experts, topk, tokens)
-    ref_starts, _ref_psum, ref_total = _psum_ref(masked_m, tile_m)
-
-    # Masked layout: row = expert * max_m + slot, which is what
-    # flydsl_moe_topids_to_rows produces and the remap folds down.
-    flat = topk_ids.reshape(-1)
-    max_m = max(tile_m, ((flat.numel() + tile_m - 1) // tile_m) * tile_m)
-    slot = torch.zeros(experts, dtype=torch.int64)
-    rows = torch.empty(flat.numel(), dtype=torch.int32)
-    for i, e in enumerate(flat.tolist()):
-        rows[i] = e * max_m + int(slot[e])
-        slot[e] += 1
-
-    remapped = rows.clone()
-    contiguous_psum_remap(masked_m, remapped, experts, max_m, tile_m)
-    torch.cuda.synchronize()
-
-    expected = ref_starts[flat.long()].long() + (rows.long() - flat.long() * max_m)
-    assert torch.equal(remapped.long(), expected), f"E={experts}: row remap mismatch"
-    oob = int((remapped >= ref_total).sum())
-    assert oob == 0, (
-        f"E={experts}: {oob} remapped rows land outside the contiguous buffer "
-        f"(bound {ref_total}, max row {int(remapped.max())})"
-    )
-
-
-# ---------------------------------------------------------------------------
-# gfx950 FlyDSL grouped MoE regression suite
-# ---------------------------------------------------------------------------
-Q_TYPE = QuantType.per_1x32
-
-_SKIP_GFX950_FLYDSL = pytest.mark.skipif(
-    get_gfx() not in ("gfx950",),
-    reason="gfx950 FlyDSL required",
-)
-
-
-def _inter_pad(inter_dim: int) -> int:
-    return ((inter_dim + 255) // 256 * 256) - inter_dim
-
-
-def _stage1_tile_k(model_dim: int) -> int:
-    return 512 if (model_dim % 512 == 0) else 256
-
-
-def _check_close(ref, out, label, atol=1.0, rtol=0.05, max_err_ratio=0.05):
-    assert not out.isnan().any(), f"{label}: output has NaN"
-    assert not out.isinf().any(), f"{label}: output has Inf"
-    err = checkAllclose(ref, out, msg=label, atol=atol, rtol=rtol)
-    assert (
-        err == 0 or err <= max_err_ratio
-    ), f"{label}: checkAllclose failed (err={err}, max={max_err_ratio})"
-
-
-def _generate_a8w4_gui_data(
-    token: int,
-    model_dim: int,
-    inter_dim: int,
-    E: int,
-    topk: int,
-    block_m: int,
-    seed: int = 0,
-    dtype=torch.bfloat16,
-):
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed(seed)
-
-    inter_pad = _inter_pad(inter_dim)
-
-    inp = torch.randn(token, model_dim, dtype=dtype, device="cuda") / 4
-    w1 = torch.randn(E, inter_dim * 2, model_dim, dtype=dtype, device="cuda") / 4
-    w2 = torch.randn(E, model_dim, inter_dim, dtype=dtype, device="cuda") / 4
-    if inter_pad:
-        w1[:, -inter_pad:, :] = 0
-        w1[:, inter_dim - inter_pad : inter_dim, :] = 0
-        w2[:, :, -inter_pad:] = 0
-
-    score = torch.randn(token, E, dtype=dtype, device="cuda")
-    topk_weights, topk_ids = fused_topk(inp, score, topk, True)
-    sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, _ = moe_sorting(
-        topk_ids, topk_weights, E, model_dim, dtype, block_m
-    )
-
-    a_q, a_scale = per_1x32_f8_scale_f8_quant(
-        inp, quant_dtype=dtypes.fp8, scale_type=dtypes.fp8_e8m0
-    )
-    w1_q, w1_scale = per_1x32_f4_quant(w1, quant_dtype=dtypes.fp4x2)
-    w2_q, w2_scale = per_1x32_f4_quant(w2, quant_dtype=dtypes.fp4x2)
-    w1_q = w1_q.view(E, inter_dim * 2, model_dim // 2)
-    w2_q = w2_q.view(E, model_dim, inter_dim // 2)
-
-    ref_stage1 = torch_moe_stage1(
-        a_q,
-        w1_q,
-        w2_q,
-        topk_weights,
-        topk_ids,
-        dtype=dtype,
-        activation=ActivationType.Swiglu,
-        quant_type=Q_TYPE,
-        a1_scale=a_scale,
-        w1_scale=w1_scale,
-    )
-    ref_stage2 = torch_moe_stage2(
-        ref_stage1,
-        w1_q,
-        w2_q,
-        topk_weights,
-        topk_ids,
-        dtype=dtype,
-        quant_type=Q_TYPE,
-        w2_scale=w2_scale,
-        a2_scale=None,
-        doweight=True,
-    )
-
-    a2_q, a2_scale = per_1x32_f8_scale_f8_quant(
-        ref_stage1, quant_dtype=dtypes.fp8, scale_type=dtypes.fp8_e8m0
-    )
-    a2_q = a2_q.view(token, topk, inter_dim)
-
-    a_scale_sort = mxfp4_moe_sort_fwd(
-        a_scale,
-        sorted_ids=sorted_ids,
-        num_valid_ids=num_valid_ids,
-        token_num=token,
-        cols=model_dim,
-    )
-    w1_shuf = shuffle_weight_a16w4(w1_q, 16, True)
-    w1_scale_shuf = shuffle_scale_a16w4(w1_scale, E, True)
-    w2_shuf = shuffle_weight_a16w4(w2_q, 16, False)
-    w2_scale_shuf = shuffle_scale_a16w4(w2_scale, E, False)
-    a2_scale_sort = mxfp4_moe_sort_fwd(
-        a2_scale,
-        sorted_ids=sorted_ids,
-        num_valid_ids=num_valid_ids,
-        token_num=token,
-        cols=inter_dim,
-    )
-
-    return {
-        "inter_pad": inter_pad,
-        "topk": topk,
-        "a_q": a_q,
-        "a_scale_sort": a_scale_sort,
-        "w1_shuf": w1_shuf,
-        "w1_scale_shuf": w1_scale_shuf,
-        "w2_shuf": w2_shuf,
-        "w2_scale_shuf": w2_scale_shuf,
-        "a2_q": a2_q,
-        "a2_scale_sort": a2_scale_sort,
-        "sorted_ids": sorted_ids,
-        "sorted_weights": sorted_weights,
-        "sorted_expert_ids": sorted_expert_ids,
-        "num_valid_ids": num_valid_ids,
-        "ref_stage1": ref_stage1,
-        "ref_stage2": ref_stage2,
-        "token": token,
-        "inter_dim": inter_dim,
-        "model_dim": model_dim,
-    }
-
-
-@pytest.fixture(autouse=True)
-def _a8w4_env():
-    if get_gfx() != "gfx950":
-        yield
-        return
-    old_bound = os.environ.get("AITER_BF16_FP8_MOE_BOUND")
-    old_aot = os.environ.get("FLYDSL_RUNTIME_RUN_ONLY")
-    os.environ["AITER_BF16_FP8_MOE_BOUND"] = "0"
-    os.environ.pop("FLYDSL_RUNTIME_RUN_ONLY", None)
-    yield
-    if old_bound is None:
-        os.environ.pop("AITER_BF16_FP8_MOE_BOUND", None)
-    else:
-        os.environ["AITER_BF16_FP8_MOE_BOUND"] = old_bound
-    if old_aot is None:
-        os.environ.pop("FLYDSL_RUNTIME_RUN_ONLY", None)
-    else:
-        os.environ["FLYDSL_RUNTIME_RUN_ONLY"] = old_aot
-
-
-def test_pick_flydsl_stage2_tile_k():
-    assert pick_flydsl_stage2_tile_k(256) == 256
-    assert pick_flydsl_stage2_tile_k(512) == 256
-    assert pick_flydsl_stage2_tile_k(640) == 128
-    assert pick_flydsl_stage2_tile_k(384) == 128
-    assert pick_flydsl_stage2_tile_k(896) == 128
-    assert pick_flydsl_stage2_tile_k(1024) == 256
-    assert resolve_flydsl_stage2_tile_k(640, 256) == 128
-    assert resolve_flydsl_stage2_tile_k(256, 256) == 256
-    assert resolve_flydsl_stage2_tile_k(512, 128) == 128
-
-
-@pytest.mark.parametrize(
-    "inter_dim,seed",
-    [
-        pytest.param(256, 101, id="i256"),
-        pytest.param(384, 102, id="i384"),
-        pytest.param(640, 0, id="i640_dsv4"),
-    ],
-)
-@_SKIP_GFX950_FLYDSL
-def test_flydsl_stage2_a8w4_gui(inter_dim, seed):
-    from aiter.ops.flydsl.moe_kernels import flydsl_moe_stage2
-
-    token, model_dim, E, topk, block_m = 16, 512, 8, 2, 32
-    data = _generate_a8w4_gui_data(
-        token, model_dim, inter_dim, E, topk, block_m, seed=seed
-    )
-    out = flydsl_moe_stage2(
-        inter_states=data["a2_q"],
-        w2=data["w2_shuf"],
-        sorted_token_ids=data["sorted_ids"],
-        sorted_expert_ids=data["sorted_expert_ids"],
-        num_valid_ids=data["num_valid_ids"],
-        topk=topk,
-        tile_m=32,
-        tile_n=256,
-        tile_k=256,
-        a_dtype="fp8",
-        b_dtype="fp4",
-        out_dtype="bf16",
-        mode="atomic",
-        w2_scale=data["w2_scale_shuf"],
-        a2_scale=data["a2_scale_sort"],
-        sorted_weights=data["sorted_weights"],
-        inter_dim_pad=data["inter_pad"],
-        model_dim_pad=0,
-    )
-    torch.cuda.synchronize()
-    _check_close(data["ref_stage2"], out, f"stage2_a8w4_gui_i{inter_dim}")
-
-
-@pytest.mark.parametrize("block_m", [16, 32, 64, 128])
-@pytest.mark.parametrize(
-    ("inter_dim", "tile_k"),
-    [
-        pytest.param(384, 128, id="bk128"),
-        pytest.param(512, 256, id="bk256"),
-    ],
-)
-@_SKIP_GFX950_FLYDSL
-def test_flydsl_v2_stage2_a8w4_full_tile(block_m, inter_dim, tile_k):
-    from aiter.ops.flydsl.kernels.mxmoe_dispatcher import mxfp4_moe_gemm2
-
-    torch.manual_seed(123)
-    torch.cuda.manual_seed(123)
-    token, model_dim, E, topk = block_m, 128, 1, 1
-    a2 = torch.randn((token, topk, inter_dim), dtype=torch.bfloat16, device="cuda") / 4
-    w1 = torch.zeros((E, inter_dim * 2, model_dim), dtype=torch.bfloat16, device="cuda")
-    w2 = torch.randn((E, model_dim, inter_dim), dtype=torch.bfloat16, device="cuda") / 4
-    topk_ids = torch.zeros((token, topk), dtype=torch.int32, device="cuda")
-    topk_weights = torch.ones((token, topk), dtype=torch.float32, device="cuda")
-    sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, _ = moe_sorting(
-        topk_ids, topk_weights, E, model_dim, torch.bfloat16, block_m
-    )
-
-    a2_q, a2_scale = per_1x32_f8_scale_f8_quant(
-        a2, quant_dtype=dtypes.fp8, scale_type=dtypes.fp8_e8m0
-    )
-    w1_q, _ = per_1x32_f4_quant(w1, quant_dtype=dtypes.fp4x2)
-    w2_q, w2_scale = per_1x32_f4_quant(w2, quant_dtype=dtypes.fp4x2)
-    w1_q = w1_q.view(E, inter_dim * 2, model_dim // 2)
-    w2_q = w2_q.view(E, model_dim, inter_dim // 2)
-
-    a2_dequant = (
-        a2_q.float().view(token, topk, inter_dim // 32, 32)
-        * fp4_utils.e8m0_to_f32(a2_scale).view(token, topk, inter_dim // 32, 1)
-    ).view(token, topk, inter_dim)
-    ref = torch_moe_stage2(
-        a2_dequant,
-        w1_q,
-        w2_q,
-        topk_weights,
-        topk_ids,
-        dtype=torch.bfloat16,
-        quant_type=Q_TYPE,
-        w2_scale=w2_scale,
-        a2_scale=None,
-        doweight=True,
-    )
-
-    a2_sorted = a2_q.reshape(token * topk, inter_dim)
-    a2_scale_sorted = mxfp4_moe_sort_fwd(
-        a2_scale,
-        sorted_ids=sorted_ids,
-        num_valid_ids=num_valid_ids,
-        token_num=token,
-        cols=inter_dim,
-    )
-    w2_shuffled = shuffle_weight_a16w4(w2_q, 16, False)
-    w2_scale_shuffled = shuffle_scale_a16w4(w2_scale, E, False)
-    out = torch.zeros((token, model_dim), dtype=torch.bfloat16, device="cuda")
-
-    mxfp4_moe_gemm2(
-        inter_sorted_quant=a2_sorted,
-        inter_sorted_shuffled_scale=a2_scale_sorted,
-        w2_u8=w2_shuffled,
-        w2_scale_u8=w2_scale_shuffled,
-        sorted_expert_ids=sorted_expert_ids,
-        cumsum_tensor=num_valid_ids,
-        sorted_token_ids=sorted_ids,
-        sorted_weights=sorted_weights,
-        out=out,
-        M_logical=token,
-        max_sorted=a2_sorted.shape[0],
-        NE=E,
-        D_HIDDEN=model_dim,
-        D_INTER=inter_dim,
-        topk=topk,
-        BM=block_m,
-        BN=128,
-        BK=tile_k,
-        use_nt=True,
-        a_dtype="fp8",
-        epilog="atomic",
-        SBM=block_m,
-        persist=False,
-    )
-    torch.cuda.synchronize()
-    _check_close(
-        ref.float(),
-        out.float(),
-        f"v2_stage2_a8w4_bm{block_m}_bk{tile_k}",
-    )
-
-
-@_SKIP_GFX950_FLYDSL
-def test_flydsl_stage2_fp8_ep_reduction():
-    from aiter.ops.flydsl.kernels.mxfp4_gemm_common import fp8out_row_bytes
-    from aiter.ops.flydsl.moe_kernels import _run_moe_reduction
-
-    token, topk, model_dim = 2, 4, 128
-    values = torch.tensor([1, 7, 2, 9], dtype=dtypes.fp8, device="cuda")
-    target = torch.empty(
-        (token * topk, fp8out_row_bytes(model_dim)), dtype=torch.uint8, device="cuda"
-    )
-    target[:, :model_dim] = values.repeat(token).view(torch.uint8)[:, None]
-    target[:, model_dim:] = 127  # E8M0 scale 1.0
-    expert_mask = torch.tensor([1, 0, 1, 0], dtype=torch.int32, device="cuda")
-    topk_ids = torch.arange(topk, dtype=torch.int32, device="cuda").repeat(token, 1)
-    out = torch.empty((token, model_dim), dtype=torch.bfloat16, device="cuda")
-
-    _run_moe_reduction(
-        target, out, token, topk, model_dim, expert_mask, topk_ids, is_fp8=True
-    )
-    torch.testing.assert_close(out, torch.full_like(out, 3.0))
-
-
-@pytest.mark.parametrize("inter_dim", [256, 384, 640])
-@_SKIP_GFX950_FLYDSL
-def test_flydsl_e2e_a8w4_gui(inter_dim):
-    from aiter.ops.flydsl.moe_kernels import flydsl_moe_stage1, flydsl_moe_stage2
-
-    token, model_dim, E, topk, block_m, seed = 16, 512, 8, 2, 32, 0
-    data = _generate_a8w4_gui_data(
-        token, model_dim, inter_dim, E, topk, block_m, seed=seed
-    )
-    stage1_out = flydsl_moe_stage1(
-        a=data["a_q"],
-        w1=data["w1_shuf"],
-        sorted_token_ids=data["sorted_ids"],
-        sorted_expert_ids=data["sorted_expert_ids"],
-        num_valid_ids=data["num_valid_ids"],
-        topk=topk,
-        tile_m=32,
-        tile_n=256,
-        tile_k=_stage1_tile_k(model_dim),
-        a_dtype="fp8",
-        b_dtype="fp4",
-        out_dtype="bf16",
-        act="swiglu",
-        gate_mode="interleave",
-        w1_scale=data["w1_scale_shuf"],
-        a1_scale=data["a_scale_sort"],
-        inter_dim_pad=data["inter_pad"],
-        model_dim_pad=0,
-    )
-    a2_q, a2_scale = per_1x32_f8_scale_f8_quant(
-        stage1_out, quant_dtype=dtypes.fp8, scale_type=dtypes.fp8_e8m0
-    )
-    a2_q = a2_q.view(token, topk, inter_dim)
-    a2_scale_sort = mxfp4_moe_sort_fwd(
-        a2_scale,
-        sorted_ids=data["sorted_ids"],
-        num_valid_ids=data["num_valid_ids"],
-        token_num=token,
-        cols=inter_dim,
-    )
-    out = flydsl_moe_stage2(
-        inter_states=a2_q,
-        w2=data["w2_shuf"],
-        sorted_token_ids=data["sorted_ids"],
-        sorted_expert_ids=data["sorted_expert_ids"],
-        num_valid_ids=data["num_valid_ids"],
-        topk=topk,
-        tile_m=32,
-        tile_n=256,
-        tile_k=256,
-        a_dtype="fp8",
-        b_dtype="fp4",
-        out_dtype="bf16",
-        mode="atomic",
-        w2_scale=data["w2_scale_shuf"],
-        a2_scale=a2_scale_sort,
-        sorted_weights=data["sorted_weights"],
-        inter_dim_pad=data["inter_pad"],
-        model_dim_pad=0,
-    )
-    torch.cuda.synchronize()
-    _check_close(data["ref_stage2"], out, f"e2e_a8w4_gui_i{inter_dim}")
-
-
-# ---------------------------------------------------------------------------
-# SiTUv2 activation fused into the FlyDSL MXFP4 MoE stage1 (a8w4 + host ref).
-# Migrated from the former test_flydsl_moe_situv2.py.
-#
-# SiTUv2 (fp32 intermediate, cast back at the end):
-#     situ_g    = beta * tanh(gate / beta) * sigmoid(gate)
-#     up_scaled = linear_beta * tanh(up / linear_beta)
-#     out       = situ_g * up_scaled
-# ---------------------------------------------------------------------------
-SITUV2_BETA = 2.0
-SITUV2_LINEAR_BETA = 1.5
-
-
-def test_situv2_reference():
-    """Verify aiter.fused_moe.situv2 matches the closed-form SiTUv2 in fp32.
-
-    Host-only (no GPU / gfx950 required)."""
-    from aiter.fused_moe import situv2
-
-    torch.manual_seed(0)
-    d = 512
-    passed = True
-    for beta in (0.5, 1.0, 2.0):
-        for linear_beta in (0.5, 1.0, 2.0):
-            gate = torch.randn(4, d) * 3.0
-            up = torch.randn(4, d) * 3.0
-            got = situv2(gate, up, beta=beta, linear_beta=linear_beta)
-            g = gate.float()
-            u = up.float()
-            situ_g = beta * torch.tanh(g / beta) * torch.sigmoid(g)
-            up_scaled = linear_beta * torch.tanh(u / linear_beta)
-            expect = situ_g * up_scaled
-            max_delta = (got.float() - expect).abs().max().item()
-            ok = max_delta < 1e-5
-            passed = passed and ok
-    # Bounded intermediates property (mxfp4-friendly): |out| <= beta*linear_beta.
-    beta, linear_beta = 1.5, 0.8
-    gate = torch.randn(8, d) * 20.0
-    up = torch.randn(8, d) * 20.0
-    out = situv2(gate, up, beta=beta, linear_beta=linear_beta)
-    bound = beta * linear_beta + 1e-4
-    within = bool(out.abs().max().item() <= bound)
-    assert passed and within, "situv2 reference mismatch or bound violated"
-
-
-# (token, model_dim, inter_dim, E, topk, block_m, tile_m, tile_n, tile_k,
-#  gate_mode, out_dtype, seed, situ_beta, situ_linear_beta)
-A8W4_SITUV2_VEC4_CASES = [
-    pytest.param(
-        16,
-        256,
-        128,
-        8,
-        2,
-        32,
-        32,
-        256,
-        256,
-        "separated",
-        "bf16",
-        1,
-        SITUV2_BETA,
-        SITUV2_LINEAR_BETA,
-        id="t16_sep_bf16_default_beta",
-    ),
-    pytest.param(
-        64,
-        512,
-        256,
-        16,
-        4,
-        32,
-        32,
-        256,
-        256,
-        "separated",
-        "bf16",
-        2,
-        SITUV2_BETA,
-        SITUV2_LINEAR_BETA,
-        id="t64_sep_bf16",
-    ),
-    pytest.param(
-        16,
-        256,
-        128,
-        8,
-        2,
-        64,
-        64,
-        128,
-        256,
-        "separated",
-        "bf16",
-        3,
-        SITUV2_BETA,
-        SITUV2_LINEAR_BETA,
-        id="tile64_n128_sep_bf16",
-    ),
-    pytest.param(
-        32,
-        256,
-        128,
-        8,
-        2,
-        32,
-        32,
-        128,
-        256,
-        "separated",
-        "f16",
-        4,
-        SITUV2_BETA,
-        SITUV2_LINEAR_BETA,
-        id="t32_sep_f16",
-    ),
-    pytest.param(
-        16,
-        256,
-        128,
-        8,
-        2,
-        32,
-        32,
-        256,
-        256,
-        "separated",
-        "bf16",
-        5,
-        1.0,
-        1.0,
-        id="t16_sep_bf16_unit_beta",
-    ),
-    pytest.param(
-        16,
-        256,
-        128,
-        8,
-        2,
-        32,
-        32,
-        256,
-        256,
-        "interleave",
-        "bf16",
-        6,
-        SITUV2_BETA,
-        SITUV2_LINEAR_BETA,
-        id="t16_interleave_bf16",
-    ),
-    pytest.param(
-        # non-256-aligned inter_dim (DSV4 TP8); exercises fix-k K-tiling.
-        64,
-        512,
-        640,
-        16,
-        4,
-        32,
-        32,
-        256,
-        256,
-        "interleave",
-        "bf16",
-        7,
-        SITUV2_BETA,
-        SITUV2_LINEAR_BETA,
-        id="t64_i640_interleave_bf16",
-    ),
-]
-
-
-def _make_routes(hidden: torch.Tensor, experts: int, topk: int, block_m: int):
-    score = torch.randn(
-        (hidden.shape[0], experts), dtype=hidden.dtype, device=hidden.device
-    )
-    topk_weights, topk_ids = fused_topk(hidden, score, topk, True)
-    sorted_ids, _, sorted_expert_ids, num_valid_ids, _ = moe_sorting(
-        topk_ids, topk_weights, experts, hidden.shape[1], hidden.dtype, block_m
-    )
-    return topk_weights, topk_ids, sorted_ids, sorted_expert_ids, num_valid_ids
-
-
-def _generate_a8w4_situv2_vec4_data(
-    token: int,
-    model_dim: int,
-    inter_dim: int,
-    E: int,
-    topk: int,
-    block_m: int,
-    *,
-    seed: int = 1,
-    dtype=torch.bfloat16,
-    situ_beta: float = SITUV2_BETA,
-    situ_linear_beta: float = SITUV2_LINEAR_BETA,
-    gate_mode: str = "separated",
-):
-    """a8w4 data for vec4 SiTUv2 epilogue (tile / gate_mode variants)."""
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed(seed)
-
-    inp = torch.randn((token, model_dim), dtype=dtype, device="cuda") / 4
-    w1 = torch.randn((E, inter_dim * 2, model_dim), dtype=dtype, device="cuda") / 4
-    w2 = torch.randn((E, model_dim, inter_dim), dtype=dtype, device="cuda") / 4
-    topk_weights, topk_ids, sorted_ids, sorted_expert_ids, num_valid_ids = _make_routes(
-        inp, E, topk, block_m
-    )
-
-    a_q, a_scale = per_1x32_f8_scale_f8_quant(
-        inp, quant_dtype=dtypes.fp8, scale_type=dtypes.fp8_e8m0
-    )
-    w1_q, w1_scale = per_1x32_f4_quant(w1, quant_dtype=dtypes.fp4x2)
-    w1_q = w1_q.view(E, inter_dim * 2, model_dim // 2)
-    w2_q, _w2_scale = per_1x32_f4_quant(w2, quant_dtype=dtypes.fp4x2)
-    w2_q = w2_q.view(E, model_dim, inter_dim // 2)
-
-    ref_stage1 = torch_moe_stage1(
-        a_q,
-        w1_q,
-        w2_q,
-        topk_weights,
-        topk_ids,
-        dtype=dtype,
-        activation=ActivationType.Situv2,
-        quant_type=Q_TYPE,
-        a1_scale=a_scale,
-        w1_scale=w1_scale,
-        situ_beta=situ_beta,
-        situ_linear_beta=situ_linear_beta,
-    )
-    a_scale_sort = mxfp4_moe_sort_fwd(
-        a_scale,
-        sorted_ids=sorted_ids,
-        num_valid_ids=num_valid_ids,
-        token_num=token,
-        cols=model_dim,
-    )
-
-    w1_q_shuf = shuffle_weight(w1_q, (16, 16))
-    if gate_mode == "interleave":
-        w1_q_shuf = shuffle_weight(w1_q, (16, 16), is_guinterleave=True, gate_up=True)
-
-    return {
-        "ref_stage1": ref_stage1,
-        "a_q": a_q,
-        "a_scale_sort": a_scale_sort,
-        "w1_q_shuf": w1_q_shuf,
-        "w1_scale_shuf": e8m0_shuffle(w1_scale),
-        "sorted_ids": sorted_ids,
-        "sorted_expert_ids": sorted_expert_ids,
-        "num_valid_ids": num_valid_ids,
-        "topk": topk,
-    }
-
-
-@pytest.mark.parametrize(
-    "token,model_dim,inter_dim,E,topk,block_m,tile_m,tile_n,tile_k,"
-    "gate_mode,out_dtype,seed,situ_beta,situ_linear_beta",
-    A8W4_SITUV2_VEC4_CASES,
-)
-@_SKIP_GFX950_FLYDSL
-def test_flydsl_situv2_a8w4_stage1_vec4(
-    token,
-    model_dim,
-    inter_dim,
-    E,
-    topk,
-    block_m,
-    tile_m,
-    tile_n,
-    tile_k,
-    gate_mode,
-    out_dtype,
-    seed,
-    situ_beta,
-    situ_linear_beta,
-):
-    """a8w4 SiTUv2 stage1 via mixed_moe_gemm_2stage vec4 activation path."""
-    from aiter.ops.flydsl.moe_kernels import flydsl_moe_stage1
-
-    torch.set_default_device("cuda")
-    label = (
-        f"a8w4_situv2_vec4 token={token} tile={tile_m}x{tile_n}x{tile_k} "
-        f"gate={gate_mode} out={out_dtype} beta=({situ_beta},{situ_linear_beta})"
-    )
-    data = _generate_a8w4_situv2_vec4_data(
-        token=token,
-        model_dim=model_dim,
-        inter_dim=inter_dim,
-        E=E,
-        topk=topk,
-        block_m=block_m,
-        seed=seed,
-        situ_beta=situ_beta,
-        situ_linear_beta=situ_linear_beta,
-        gate_mode=gate_mode,
-    )
-    out = flydsl_moe_stage1(
-        a=data["a_q"],
-        w1=data["w1_q_shuf"],
-        sorted_token_ids=data["sorted_ids"],
-        sorted_expert_ids=data["sorted_expert_ids"],
-        num_valid_ids=data["num_valid_ids"],
-        topk=data["topk"],
-        tile_m=tile_m,
-        tile_n=tile_n,
-        tile_k=tile_k,
-        a_dtype="fp8",
-        b_dtype="fp4",
-        out_dtype=out_dtype,
-        act="situv2",
-        situ_beta=situ_beta,
-        situ_linear_beta=situ_linear_beta,
-        w1_scale=data["w1_scale_shuf"],
-        a1_scale=data["a_scale_sort"],
-        gate_mode=gate_mode,
-    )
-    torch.cuda.synchronize()
-    # ref is bf16 while out may be f16 (t32_sep_f16 case); compare in fp32.
-    _check_close(data["ref_stage1"].float(), out.float(), label)
-
-
-# ---------------------------------------------------------------------------
-# Regression: a8w4 SiTUv2 end-to-end (stage1 -> stage2) numeric check, both
-# gate_modes, over 128-multiple inter_dim.
-#
-# Guards the non-256 inter_dim bug where stage1 tile_n was not downgraded for
-# a8w4 (fp8 x mxfp4) -> OOB on the N (gate/up) axis -> ~30% wrong final output
-# or GPU memfault at inter=384/640 (separated). The previous a8w4 suite only
-# exercised inter=640 in INTERLEAVE mode, which masked this. Here we compare the
-# FULL E2E output against the torch reference (not just NaN) across aligned
-# (256/512) and non-256 (128/384/640) inter_dim, in BOTH separated and
-# interleave gate_modes, on the no-pad path (kernel resolves tile_n internally).
-# ---------------------------------------------------------------------------
-def _generate_a8w4_situv2_e2e_data(
-    token,
-    model_dim,
-    inter_dim,
-    E,
-    topk,
-    block_m,
-    *,
-    seed=11,
-    gate_mode="separated",
-    situ_beta=SITUV2_BETA,
-    situ_linear_beta=SITUV2_LINEAR_BETA,
-    dtype=torch.bfloat16,
-):
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed(seed)
-
-    inp = torch.randn((token, model_dim), dtype=dtype, device="cuda") / 4
-    w1 = torch.randn((E, inter_dim * 2, model_dim), dtype=dtype, device="cuda") / 4
-    w2 = torch.randn((E, model_dim, inter_dim), dtype=dtype, device="cuda") / 4
-
-    topk_weights, topk_ids, sorted_ids, sorted_expert_ids, num_valid_ids = _make_routes(
-        inp, E, topk, block_m
-    )
-    sorted_weights = moe_sorting(topk_ids, topk_weights, E, model_dim, dtype, block_m)[
-        1
-    ]
-
-    a_q, a_scale = per_1x32_f8_scale_f8_quant(
-        inp, quant_dtype=dtypes.fp8, scale_type=dtypes.fp8_e8m0
-    )
-    w1_q, w1_scale = per_1x32_f4_quant(w1, quant_dtype=dtypes.fp4x2)
-    w2_q, w2_scale = per_1x32_f4_quant(w2, quant_dtype=dtypes.fp4x2)
-    w1_q = w1_q.view(E, inter_dim * 2, model_dim // 2)
-    w2_q = w2_q.view(E, model_dim, inter_dim // 2)
-
-    ref1 = torch_moe_stage1(
-        a_q,
-        w1_q,
-        w2_q,
-        topk_weights,
-        topk_ids,
-        dtype=dtype,
-        activation=ActivationType.Situv2,
-        quant_type=Q_TYPE,
-        a1_scale=a_scale,
-        w1_scale=w1_scale,
-        situ_beta=situ_beta,
-        situ_linear_beta=situ_linear_beta,
-    )
-    ref2 = torch_moe_stage2(
-        ref1,
-        w1_q,
-        w2_q,
-        topk_weights,
-        topk_ids,
-        dtype=dtype,
-        quant_type=Q_TYPE,
-        w2_scale=w2_scale,
-        a2_scale=None,
-        doweight=True,
-    )
-
-    a_scale_sort = mxfp4_moe_sort_fwd(
-        a_scale,
-        sorted_ids=sorted_ids,
-        num_valid_ids=num_valid_ids,
-        token_num=token,
-        cols=model_dim,
-    )
-    # Interleave uses the a16w4-style GUI shuffle (shuffle_weight_a16w4 gate_up
-    # + shuffle_scale_a16w4). The shuffle_weight(is_guinterleave=...) variant is
-    # only approximately correct at stage1 and corrupts stage2 (~25% E2E error).
-    if gate_mode == "interleave":
-        w1_shuf = shuffle_weight_a16w4(w1_q, 16, True)
-        w1_scale_shuf = shuffle_scale_a16w4(w1_scale, E, True)
-    else:
-        w1_shuf = shuffle_weight(w1_q, (16, 16))
-        w1_scale_shuf = e8m0_shuffle(w1_scale)
-    return {
-        "token": token,
-        "inter_dim": inter_dim,
-        "topk": topk,
-        "a_q": a_q,
-        "a_scale_sort": a_scale_sort,
-        "w1_shuf": w1_shuf,
-        "w1_scale_shuf": w1_scale_shuf,
-        "w2_shuf": shuffle_weight_a16w4(w2_q, 16, False),
-        "w2_scale_shuf": shuffle_scale_a16w4(w2_scale, E, False),
-        "sorted_ids": sorted_ids,
-        "sorted_weights": sorted_weights,
-        "sorted_expert_ids": sorted_expert_ids,
-        "num_valid_ids": num_valid_ids,
-        "ref_stage1": ref1,
-        "ref_stage2": ref2,
-    }
-
-
-# Both gate_modes. Separated is the production/customer SiTUv2 path (fused_moe
-# routes SiTUv2 -> separated). Interleave uses the a16w4-style GUI weight shuffle
-# (see generator); the earlier shuffle_weight(is_guinterleave) recipe corrupted
-# stage2, which is a test-recipe issue, not a kernel bug.
-@pytest.mark.parametrize("gate_mode", ["separated", "interleave"])
-@pytest.mark.parametrize(
-    "inter_dim,seed",
-    [
-        pytest.param(128, 11, id="i128_non256"),
-        pytest.param(256, 12, id="i256_aligned"),
-        pytest.param(384, 13, id="i384_non256"),
-        pytest.param(512, 14, id="i512_aligned"),
-        pytest.param(640, 15, id="i640_non256"),
-    ],
-)
-@_SKIP_GFX950_FLYDSL
-def test_flydsl_e2e_a8w4_situv2(inter_dim, seed, gate_mode):
-    """a8w4 SiTUv2 E2E (stage1->stage2), numeric vs torch ref.
-
-    Caller passes tile_n=256; the kernel must internally downgrade for non-256
-    inter_dim. Regression guard for the a8w4 separated non-256 OOB bug.
-    """
-    from aiter.ops.flydsl.moe_kernels import flydsl_moe_stage1, flydsl_moe_stage2
-
-    torch.set_default_device("cuda")
-    token, model_dim, E, topk, block_m = 1024, 512, 8, 2, 32
-    d = _generate_a8w4_situv2_e2e_data(
-        token, model_dim, inter_dim, E, topk, block_m, seed=seed, gate_mode=gate_mode
-    )
-    topk = d["topk"]
-
-    s1 = flydsl_moe_stage1(
-        a=d["a_q"],
-        w1=d["w1_shuf"],
-        sorted_token_ids=d["sorted_ids"],
-        sorted_expert_ids=d["sorted_expert_ids"],
-        num_valid_ids=d["num_valid_ids"],
-        topk=topk,
-        tile_m=32,
-        tile_n=256,
-        tile_k=256,
-        a_dtype="fp8",
-        b_dtype="fp4",
-        out_dtype="bf16",
-        act="situv2",
-        situ_beta=SITUV2_BETA,
-        situ_linear_beta=SITUV2_LINEAR_BETA,
-        w1_scale=d["w1_scale_shuf"],
-        a1_scale=d["a_scale_sort"],
-        gate_mode=gate_mode,
-    )
-    torch.cuda.synchronize()
-    _check_close(
-        d["ref_stage1"].float(), s1.float(), f"situv2_{gate_mode}_stage1_i{inter_dim}"
-    )
-
-    a2_q, a2_scale = per_1x32_f8_scale_f8_quant(
-        s1, quant_dtype=dtypes.fp8, scale_type=dtypes.fp8_e8m0
-    )
-    a2_q = a2_q.view(token, topk, inter_dim)
-    a2_scale_sort = mxfp4_moe_sort_fwd(
-        a2_scale,
-        sorted_ids=d["sorted_ids"],
-        num_valid_ids=d["num_valid_ids"],
-        token_num=token,
-        cols=inter_dim,
-    )
-    out = flydsl_moe_stage2(
-        inter_states=a2_q,
-        w2=d["w2_shuf"],
-        sorted_token_ids=d["sorted_ids"],
-        sorted_expert_ids=d["sorted_expert_ids"],
-        num_valid_ids=d["num_valid_ids"],
-        topk=topk,
-        tile_m=32,
-        tile_n=256,
-        tile_k=256,
-        a_dtype="fp8",
-        b_dtype="fp4",
-        out_dtype="bf16",
-        mode="atomic",
-        w2_scale=d["w2_scale_shuf"],
-        a2_scale=a2_scale_sort,
-        sorted_weights=d["sorted_weights"],
-        inter_dim_pad=0,
-        model_dim_pad=0,
-    )
-    torch.cuda.synchronize()
-    _check_close(
-        d["ref_stage2"].float(), out.float(), f"situv2_{gate_mode}_e2e_i{inter_dim}"
-    )
-
-
-# ---------------------------------------------------------------------------
-# CLI
-# ---------------------------------------------------------------------------
-def _mock_grouped_gemm() -> None:
-    """Run the grouped MoE path without the gfx1250-only kernels.
-
-    Two patches let the tiny operators (route maps, scatter/gather, quant,
-    scale preshuffle, m-tile map, gather-reduce) run on any arch (e.g. gfx942
-    via AITER_FORCE_GFX1250=1):
-
-    1. Replace the TDM grouped GEMM with a no-op -- the GEMM executes
-       nothing; stage outputs are left as-is.
-    2. Route the fp4 a1/a2 quant through the Triton implementation, since the
-       HIP ``per_1x32_f4_quant_hip`` has no fp4x2 output support off gfx1250.
-
-    The library imports all these names at call time, so patching the source
-    modules is enough -- no library edits required.
-    """
-    import aiter.ops.flydsl.grouped_gemm_mxfp4 as grouped_gemm
-    import aiter.ops.quant as q
-
-    def _noop_gemm(*_a, **_k):
-        return None
-
-    grouped_gemm.flydsl_grouped_gemm_a8w4_masked = _noop_gemm
-
-    q.per_1x32_f4_quant_hip = q.per_1x32_f4_quant_triton
-
-
-def summarize(rows: list):
-    """Build a precision summary table from per-case metrics and print it.
-
-    Mirrors the pandas DataFrame reporting in op_tests/test_moe_2stage.py.
-    Returns the DataFrame (or the raw rows if pandas is unavailable).
-    """
-    if not rows:
-        return None
-    try:
-        import pandas as pd
-    except ImportError:
-        print("[precision summary] pandas not installed; raw rows:", flush=True)
-        for r in rows:
-            print(f"  {r}", flush=True)
-        return rows
-    df = pd.DataFrame(rows)
-    empty_perf_columns = [
-        column
-        for column in df.columns
-        if ("tflops" in column.lower() or "bandwidth" in column.lower())
-        and df[column].isna().all()
-    ]
-    df = df.drop(columns=empty_perf_columns)
-    try:
-        table = df.to_markdown(index=False)
-    except ImportError:
-        # to_markdown needs the optional `tabulate` package; plain fallback.
-        table = df.to_string(index=False)
-    print("\n[precision summary]\n" + table, flush=True)
-    return df
-
-
-def set_data_format(data_format: str) -> None:
-    """Select the grouped GEMM data format.
-
-    a8w4 needs ``AITER_FORCE_A8W4=1`` so ``fused_moe`` routes the a8w4 path
-    (see fused_moe.py); a4w4 needs it unset so the fp4x2 activation path is
-    taken. Toggled per-row so a mixed-format CSV sweep routes each case
-    correctly.
-    """
-    if data_format == "a8w4":
-        os.environ["AITER_FORCE_A8W4"] = "1"
-    else:
-        os.environ.pop("AITER_FORCE_A8W4", None)
-    logger.info("grouped GEMM data format: %s", data_format)
-
-
-# Default tuned-config CSV: <repo>/aiter/configs/tuned_grouped_fmoe.csv. Every
-# row is one grouped-MoE setting; the --scenario csv sweep runs them all.
-DEFAULT_CSV_PATH = os.path.normpath(
-    os.path.join(
-        os.path.dirname(__file__),
-        "..",
-        "aiter",
-        "configs",
-        "tuned_grouped_fmoe.csv",
-    )
-)
-
-
-def _csv_data_format(q_dtype_a: str) -> str:
-    """Map the CSV ``q_dtype_a`` column to this test's data_format tag.
-
-    fp8 activations -> a8w4 (MXFP8 x MXFP4); fp4 activations -> a4w4
-    (MXFP4 x MXFP4). Weights are MXFP4 either way.
-    """
-    a = q_dtype_a.strip()
-    if a in ("torch.float8_e4m3fn", "torch.float8_e4m3fnuz"):
-        return "a8w4"
-    if a in ("torch.float4_e2m1fn_x2",):
-        return "a4w4"
-    raise ValueError(f"unsupported q_dtype_a in CSV: {q_dtype_a!r}")
-
-
-def _csv_activation(act_type: str) -> ActivationType:
-    a = act_type.strip()
-    if a == "ActivationType.Swiglu":
-        return ActivationType.Swiglu
-    if a == "ActivationType.Silu":
-        return ActivationType.Silu
-    raise ValueError(f"unsupported act_type in CSV: {act_type!r}")
-
-
-def run_csv_scenario(args) -> None:
-    """Sweep every setting in a tuned_grouped_fmoe-style CSV.
-
-    Each CSV row (token, model_dim, inter_dim, expert, topk, act_type,
-    q_dtype_a) becomes one ``run_moe`` case. The GEMM
-    tuned config is looked up from the same CSV by the kernel via the problem
-    shape, so simply running each shape exercises its tuned setting.
-
-    Each row is benched (CUDA-graph end-to-end timing, production path) and its
-    correctness checked; one out-of-gate row is recorded rather than aborting
-    the sweep.
-    """
-    csv_path = args.csv_path or DEFAULT_CSV_PATH
-    if not os.path.isfile(csv_path):
-        raise SystemExit(f"CSV not found: {csv_path}")
-    print(f"[csv] sweeping settings from {csv_path}", flush=True)
-
-    with open(csv_path, newline="") as fh:
-        reader = csv.DictReader(fh)
-        csv_rows = list(reader)
-    if not csv_rows:
-        raise SystemExit(f"CSV has no data rows: {csv_path}")
-
-    activation_override = None
-    if args.act is not None:
-        activation_override = _ACT_BY_NAME[args.act]
-
-    rows = []
-    for idx, rec in enumerate(csv_rows):
+            else:
+                for name, elapsed_us in (("gemm1", g1), ("gemm2", g2)):
+                    if elapsed_us is None:
+                        print(f"[kernel-bench {tag}] {name}: n/a", flush=True)
+                        continue
+                    tflops, bandwidth = _rates(work[name], elapsed_us)
+                    print(
+                        f"[kernel-bench {tag}] {name}: us = {elapsed_us:.2f}, "
+                        f"FLOPS = {work[name][0]:.0f}, TFLOPS = {tflops:.2f}, "
+                        f"Bandwidth = {bandwidth:.2f} GB/s",
+                        flush=True,
+                    )
+                    metrics[f"{name}_flops"] = work[name][0]
+                    metrics[f"{name}_tflops"] = tflops
+                    metrics[f"{name}_bandwidth_gbs"] = bandwidth
+            metrics["gemm1_us"] = g1
+            metrics["gemm2_us"] = g2
+        return metrics
+
+
+    # model_dim=512 (not the 256 default): the grouped kernel needs
+    # num_k_tiles = (K // split_k) // tile_k >= 2, i.e. K >= 2*tile_k = 512.
+    def test_grouped_a4w4_silu_matches_torch_ref():
+        run_moe(
+            "a4w4",
+            activation=ActivationType.Silu,
+            model_dim=512,
+            inter_dim=512,
+        )
+
+
+    def test_grouped_a4w4_swiglu_matches_torch_ref():
+        run_moe(
+            "a4w4",
+            activation=ActivationType.Swiglu,
+            model_dim=512,
+            inter_dim=512,
+        )
+
+
+    def test_situv2_activation_matches_torch():
+        torch.manual_seed(0)
+        gate = torch.randn(4, 32)
+        up = torch.randn(4, 32)
+        beta, linear_beta = 4.0, 25.0
+        expected = (
+            beta
+            * torch.tanh(gate / beta)
+            * torch.sigmoid(gate)
+            * linear_beta
+            * torch.tanh(up / linear_beta)
+        )
+        actual = apply_gate_up(
+            gate,
+            up,
+            "situv2",
+            situ_beta=beta,
+            situ_linear_beta=linear_beta,
+        )
+        torch.testing.assert_close(actual, expected)
+
+
+    def test_grouped_a4w4_situv2_matches_torch_ref():
+        run_moe(
+            "a4w4",
+            activation=ActivationType.Situv2,
+            model_dim=512,
+            inter_dim=512,
+        )
+
+
+    def test_grouped_a8w4_situv2_matches_torch_ref():
+        # a8w4 takes the fused stage1 quant epilogue (batched activation), which is
+        # a separate code path from a4w4's bf16 intermediate (element-wise).
+        run_moe(
+            "a8w4",
+            activation=ActivationType.Situv2,
+            model_dim=512,
+            inter_dim=512,
+            tol=VERIFY_TOL_A8W4,
+        )
+
+
+    @pytest.mark.parametrize("activation", [ActivationType.Silu, ActivationType.Swiglu])
+    def test_grouped_a4w4_swiglu_limit_clamps(activation):
+        run_moe("a4w4", activation=activation, swiglu_limit=1.0)
+
+
+    # ---------------------------------------------------------------------------
+    # Contiguous-M prefix scan
+    #
+    # The scan sits in front of every grouped MoE launch: it turns the per-expert
+    # row counts into the tile-aligned starts/psum the GEMM schedules on, and
+    # rewrites the route rows in place. It is also the one piece whose width is set
+    # by the expert count rather than the token count, so it gets its own coverage
+    # above and below the block size -- a wrong row here does not produce a bad
+    # number, it produces an out-of-bounds write in whichever kernel consumes the
+    # row next.
+    # ---------------------------------------------------------------------------
+    def _psum_ref(masked_m: torch.Tensor, tile_m: int):
+        """starts / psum / contiguous_m from a tile-aligned cumulative sum."""
+        aligned = ((masked_m + tile_m - 1) // tile_m) * tile_m
+        inclusive = torch.cumsum(aligned.to(torch.int64), 0)
+        starts = inclusive - aligned
+        return (
+            starts.to(torch.int32),
+            (starts + masked_m).to(torch.int32),
+            max(int(inclusive[-1]), tile_m),
+        )
+
+
+    def _random_route_counts(experts: int, topk: int, tokens: int, seed: int = 0):
+        """Per-expert counts from a real (unbalanced) random routing."""
+        torch.manual_seed(seed)
+        topk = min(topk, experts)
+        topk_ids = torch.stack([torch.randperm(experts)[:topk] for _ in range(tokens)]).to(
+            torch.int32
+        )
+        counts = torch.bincount(topk_ids.reshape(-1).long(), minlength=experts)
+        return topk_ids, counts.to(torch.int32)
+
+
+    # 512 is MAX_EXPERTS_PER_BLOCK: one thread per expert covers E up to that in a
+    # single pass, and everything above it needs the chunked sweep. Kimi-K3 is 896.
+    @pytest.mark.parametrize("experts", [8, 256, 512, 513, 896, 1024])
+    def test_contiguous_psum_matches_cumsum(experts):
+        _require_gfx1250()
+        from aiter.ops.flydsl.grouped_moe_gfx1250 import contiguous_psum
+
+        tile_m = 64
+        _topk_ids, masked_m = _random_route_counts(experts, topk=16, tokens=128)
+        ref_starts, ref_psum, ref_total = _psum_ref(masked_m, tile_m)
+
+        starts, psum, contiguous_m = contiguous_psum(masked_m, experts, tile_m)
+        torch.cuda.synchronize()
+
+        bad = int((starts != ref_starts).sum())
+        assert bad == 0, (
+            f"E={experts}: {bad} experts have a wrong start, first at "
+            f"{int((starts != ref_starts).nonzero()[0][0])}"
+        )
+        assert torch.equal(psum, ref_psum), f"E={experts}: psum mismatch"
+        assert (
+            int(contiguous_m[0]) == ref_total
+        ), f"E={experts}: contiguous_m {int(contiguous_m[0])} != {ref_total}"
+
+
+    @pytest.mark.parametrize("experts", [8, 256, 512, 513, 896, 1024])
+    def test_contiguous_psum_remap_rows_stay_in_bounds(experts):
+        """The remap is what the MoE actually calls; an unscanned expert lands here
+        as a row index pointing outside the contiguous buffer."""
+        _require_gfx1250()
+        from aiter.ops.flydsl.grouped_moe_gfx1250 import contiguous_psum_remap
+
+        tile_m, topk, tokens = 64, 16, 128
+        topk_ids, masked_m = _random_route_counts(experts, topk, tokens)
+        ref_starts, _ref_psum, ref_total = _psum_ref(masked_m, tile_m)
+
+        # Masked layout: row = expert * max_m + slot, which is what
+        # flydsl_moe_topids_to_rows produces and the remap folds down.
+        flat = topk_ids.reshape(-1)
+        max_m = max(tile_m, ((flat.numel() + tile_m - 1) // tile_m) * tile_m)
+        slot = torch.zeros(experts, dtype=torch.int64)
+        rows = torch.empty(flat.numel(), dtype=torch.int32)
+        for i, e in enumerate(flat.tolist()):
+            rows[i] = e * max_m + int(slot[e])
+            slot[e] += 1
+
+        remapped = rows.clone()
+        contiguous_psum_remap(masked_m, remapped, experts, max_m, tile_m)
+        torch.cuda.synchronize()
+
+        expected = ref_starts[flat.long()].long() + (rows.long() - flat.long() * max_m)
+        assert torch.equal(remapped.long(), expected), f"E={experts}: row remap mismatch"
+        oob = int((remapped >= ref_total).sum())
+        assert oob == 0, (
+            f"E={experts}: {oob} remapped rows land outside the contiguous buffer "
+            f"(bound {ref_total}, max row {int(remapped.max())})"
+        )
+
+
+    # ---------------------------------------------------------------------------
+    # CLI
+    # ---------------------------------------------------------------------------
+    def _mock_grouped_gemm() -> None:
+        """Run the grouped MoE path without the gfx1250-only kernels.
+
+        Two patches let the tiny operators (route maps, scatter/gather, quant,
+        scale preshuffle, m-tile map, gather-reduce) run on any arch (e.g. gfx942
+        via AITER_FORCE_GFX1250=1):
+
+        1. Replace the TDM grouped GEMM with a no-op -- the GEMM executes
+           nothing; stage outputs are left as-is.
+        2. Route the fp4 a1/a2 quant through the Triton implementation, since the
+           HIP ``per_1x32_f4_quant_hip`` has no fp4x2 output support off gfx1250.
+
+        The library imports all these names at call time, so patching the source
+        modules is enough -- no library edits required.
+        """
+        import aiter.ops.flydsl.grouped_gemm_mxfp4 as grouped_gemm
+        import aiter.ops.quant as q
+
+        def _noop_gemm(*_a, **_k):
+            return None
+
+        grouped_gemm.flydsl_grouped_gemm_a8w4_masked = _noop_gemm
+
+        q.per_1x32_f4_quant_hip = q.per_1x32_f4_quant_triton
+
+
+    def summarize(rows: list):
+        """Build a precision summary table from per-case metrics and print it.
+
+        Mirrors the pandas DataFrame reporting in op_tests/test_moe_2stage.py.
+        Returns the DataFrame (or the raw rows if pandas is unavailable).
+        """
+        if not rows:
+            return None
         try:
-            tokens = int(rec["token"])
-            model_dim = int(rec["model_dim"])
-            inter_dim = int(rec["inter_dim"])
-            experts = int(rec["expert"])
-            topk = int(rec["topk"])
-            data_format = _csv_data_format(rec["q_dtype_a"])
-            activation = activation_override or _csv_activation(rec["act_type"])
-        except (KeyError, ValueError) as exc:
-            print(f"[csv] row {idx}: skipped ({exc})", flush=True)
-            continue
+            import pandas as pd
+        except ImportError:
+            print("[precision summary] pandas not installed; raw rows:", flush=True)
+            for r in rows:
+                print(f"  {r}", flush=True)
+            return rows
+        df = pd.DataFrame(rows)
+        empty_perf_columns = [
+            column
+            for column in df.columns
+            if ("tflops" in column.lower() or "bandwidth" in column.lower())
+            and df[column].isna().all()
+        ]
+        df = df.drop(columns=empty_perf_columns)
+        try:
+            table = df.to_markdown(index=False)
+        except ImportError:
+            # to_markdown needs the optional `tabulate` package; plain fallback.
+            table = df.to_string(index=False)
+        print("\n[precision summary]\n" + table, flush=True)
+        return df
 
-        # topk == -1 marks an EP row; run_moe is single-rank and has no EP setup.
-        if topk == -1:
-            print(f"[csv] row {idx}: skipped topk=-1 (EP row)", flush=True)
-            continue
 
-        # The grouped kernels need K/inter >= 512 (tile_k=256 -> two K tiles).
-        if model_dim < 512 or inter_dim < 512:
+    def set_data_format(data_format: str) -> None:
+        """Select the grouped GEMM data format.
+
+        a8w4 needs ``AITER_FORCE_A8W4=1`` so ``fused_moe`` routes the a8w4 path
+        (see fused_moe.py); a4w4 needs it unset so the fp4x2 activation path is
+        taken. Toggled per-row so a mixed-format CSV sweep routes each case
+        correctly.
+        """
+        if data_format == "a8w4":
+            os.environ["AITER_FORCE_A8W4"] = "1"
+        else:
+            os.environ.pop("AITER_FORCE_A8W4", None)
+        logger.info("grouped GEMM data format: %s", data_format)
+
+
+    # Default tuned-config CSV: <repo>/aiter/configs/tuned_grouped_fmoe.csv. Every
+    # row is one grouped-MoE setting; the --scenario csv sweep runs them all.
+    DEFAULT_CSV_PATH = os.path.normpath(
+        os.path.join(
+            os.path.dirname(__file__),
+            "..",
+            "aiter",
+            "configs",
+            "tuned_grouped_fmoe.csv",
+        )
+    )
+
+
+    def _csv_data_format(q_dtype_a: str) -> str:
+        """Map the CSV ``q_dtype_a`` column to this test's data_format tag.
+
+        fp8 activations -> a8w4 (MXFP8 x MXFP4); fp4 activations -> a4w4
+        (MXFP4 x MXFP4). Weights are MXFP4 either way.
+        """
+        a = q_dtype_a.strip()
+        if a in ("torch.float8_e4m3fn", "torch.float8_e4m3fnuz"):
+            return "a8w4"
+        if a in ("torch.float4_e2m1fn_x2",):
+            return "a4w4"
+        raise ValueError(f"unsupported q_dtype_a in CSV: {q_dtype_a!r}")
+
+
+    def _csv_activation(act_type: str) -> ActivationType:
+        a = act_type.strip()
+        if a == "ActivationType.Swiglu":
+            return ActivationType.Swiglu
+        if a == "ActivationType.Silu":
+            return ActivationType.Silu
+        raise ValueError(f"unsupported act_type in CSV: {act_type!r}")
+
+
+    def run_csv_scenario(args) -> None:
+        """Sweep every setting in a tuned_grouped_fmoe-style CSV.
+
+        Each CSV row (token, model_dim, inter_dim, expert, topk, act_type,
+        q_dtype_a) becomes one ``run_moe`` case. The GEMM
+        tuned config is looked up from the same CSV by the kernel via the problem
+        shape, so simply running each shape exercises its tuned setting.
+
+        Each row is benched (CUDA-graph end-to-end timing, production path) and its
+        correctness checked; one out-of-gate row is recorded rather than aborting
+        the sweep.
+        """
+        csv_path = args.csv_path or DEFAULT_CSV_PATH
+        if not os.path.isfile(csv_path):
+            raise SystemExit(f"CSV not found: {csv_path}")
+        print(f"[csv] sweeping settings from {csv_path}", flush=True)
+
+        with open(csv_path, newline="") as fh:
+            reader = csv.DictReader(fh)
+            csv_rows = list(reader)
+        if not csv_rows:
+            raise SystemExit(f"CSV has no data rows: {csv_path}")
+
+        activation_override = None
+        if args.act is not None:
+            activation_override = _ACT_BY_NAME[args.act]
+
+        rows = []
+        for idx, rec in enumerate(csv_rows):
+            try:
+                tokens = int(rec["token"])
+                model_dim = int(rec["model_dim"])
+                inter_dim = int(rec["inter_dim"])
+                experts = int(rec["expert"])
+                topk = int(rec["topk"])
+                data_format = _csv_data_format(rec["q_dtype_a"])
+                activation = activation_override or _csv_activation(rec["act_type"])
+            except (KeyError, ValueError) as exc:
+                print(f"[csv] row {idx}: skipped ({exc})", flush=True)
+                continue
+
+            # topk == -1 marks an EP row; run_moe is single-rank and has no EP setup.
+            if topk == -1:
+                print(f"[csv] row {idx}: skipped topk=-1 (EP row)", flush=True)
+                continue
+
+            # The grouped kernels need K/inter >= 512 (tile_k=256 -> two K tiles).
+            if model_dim < 512 or inter_dim < 512:
+                print(
+                    f"[csv] row {idx}: skipped model_dim={model_dim} "
+                    f"inter_dim={inter_dim} (< 512 grouped-kernel floor)",
+                    flush=True,
+                )
+                continue
+
+            act = "swiglu" if activation == ActivationType.Swiglu else "silu"
             print(
-                f"[csv] row {idx}: skipped model_dim={model_dim} "
-                f"inter_dim={inter_dim} (< 512 grouped-kernel floor)",
+                f"\n===== csv row {idx}: {data_format} {act} "
+                f"tokens={tokens} model_dim={model_dim} inter_dim={inter_dim} "
+                f"experts={experts} topk={topk} =====",
                 flush=True,
             )
-            continue
+            # Route each row to its format (a8w4 needs AITER_FORCE_A8W4=1).
+            set_data_format(data_format)
+            tol = VERIFY_TOL_A8W4 if data_format == "a8w4" else VERIFY_TOL_A4W4
+            for data_init, scale_init in args.init_pairs:
+                try:
+                    metrics = run_moe(
+                        data_format,
+                        experts=experts,
+                        tokens=tokens,
+                        topk=topk,
+                        model_dim=model_dim,
+                        inter_dim=inter_dim,
+                        tol=tol,
+                        activation=activation,
+                        swiglu_limit=args.swiglu_limit,
+                        use_bias=not args.no_bias,
+                        check_aot_cache=not args.no_check_aot_cache,
+                        raise_on_fail=False,
+                        bench=True,
+                        kernel_bench=False,
+                        warmup=args.warmup,
+                        iters=args.iters,
+                        seed=args.seed,
+                        data_init=data_init,
+                        scale_init=scale_init,
+                    )
+                except Exception as exc:  # noqa: BLE001 - record, keep sweeping
+                    print(f"[csv] row {idx}: ERROR {exc!r}", flush=True)
+                    rows.append(
+                        {
+                            "row": idx,
+                            "data_format": data_format,
+                            "act": act,
+                            "tokens": tokens,
+                            "model_dim": model_dim,
+                            "inter_dim": inter_dim,
+                            "experts": experts,
+                            "topk": topk,
+                            "data_init": data_init,
+                            "scale_init": scale_init,
+                            "seed": args.seed,
+                            "logits_diff": float("nan"),
+                            "rel_l2": float("nan"),
+                            "pass": False,
+                            "error": repr(exc),
+                            "us": None,
+                            "gemm1_us": None,
+                            "gemm2_us": None,
+                        }
+                    )
+                    continue
 
-        act = "swiglu" if activation == ActivationType.Swiglu else "silu"
-        print(
-            f"\n===== csv row {idx}: {data_format} {act} "
-            f"tokens={tokens} model_dim={model_dim} inter_dim={inter_dim} "
-            f"experts={experts} topk={topk} =====",
-            flush=True,
-        )
-        # Route each row to its format (a8w4 needs AITER_FORCE_A8W4=1).
-        set_data_format(data_format)
-        tol = VERIFY_TOL_A8W4 if data_format == "a8w4" else VERIFY_TOL_A4W4
-        for data_init, scale_init in args.init_pairs:
-            try:
-                metrics = run_moe(
-                    data_format,
-                    experts=experts,
-                    tokens=tokens,
-                    topk=topk,
-                    model_dim=model_dim,
-                    inter_dim=inter_dim,
-                    tol=tol,
-                    activation=activation,
-                    swiglu_limit=args.swiglu_limit,
-                    use_bias=not args.no_bias,
-                    check_aot_cache=not args.no_check_aot_cache,
-                    raise_on_fail=False,
-                    bench=True,
-                    kernel_bench=False,
-                    warmup=args.warmup,
-                    iters=args.iters,
-                    seed=args.seed,
-                    data_init=data_init,
-                    scale_init=scale_init,
-                )
-            except Exception as exc:  # noqa: BLE001 - record, keep sweeping
-                print(f"[csv] row {idx}: ERROR {exc!r}", flush=True)
                 rows.append(
                     {
                         "row": idx,
@@ -2066,278 +2137,258 @@ def run_csv_scenario(args) -> None:
                         "data_init": data_init,
                         "scale_init": scale_init,
                         "seed": args.seed,
-                        "logits_diff": float("nan"),
-                        "rel_l2": float("nan"),
-                        "pass": False,
-                        "error": repr(exc),
-                        "us": None,
-                        "gemm1_us": None,
-                        "gemm2_us": None,
+                        "logits_diff": metrics["logits_diff"],
+                        "rel_l2": metrics["rel_l2"],
+                        "pass": metrics["passed"],
+                        "error": None,
+                        "us": metrics.get("us"),
+                        "TFLOPS": metrics.get("tflops"),
+                        "Bandwidth (GB/s)": metrics.get("bandwidth_gbs"),
+                        "gemm1_us": metrics.get("gemm1_us"),
+                        "gemm2_us": metrics.get("gemm2_us"),
                     }
                 )
-                continue
 
-            rows.append(
-                {
-                    "row": idx,
-                    "data_format": data_format,
-                    "act": act,
-                    "tokens": tokens,
-                    "model_dim": model_dim,
-                    "inter_dim": inter_dim,
-                    "experts": experts,
-                    "topk": topk,
-                    "data_init": data_init,
-                    "scale_init": scale_init,
-                    "seed": args.seed,
-                    "logits_diff": metrics["logits_diff"],
-                    "rel_l2": metrics["rel_l2"],
-                    "pass": metrics["passed"],
-                    "error": None,
-                    "us": metrics.get("us"),
-                    "TFLOPS": metrics.get("tflops"),
-                    "Bandwidth (GB/s)": metrics.get("bandwidth_gbs"),
-                    "gemm1_us": metrics.get("gemm1_us"),
-                    "gemm2_us": metrics.get("gemm2_us"),
-                }
+        summarize(rows)
+        failed = [r for r in rows if not r["pass"]]
+        if failed:
+            details = "; ".join(
+                f"row={r['row']} {r['data_format']} {r['act']} "
+                f"tokens={r['tokens']} "
+                + (
+                    f"error={r['error']}"
+                    if r.get("error")
+                    else f"logits_diff={r['logits_diff']:.4e} rel_l2={r['rel_l2']:.4e}"
+                )
+                for r in failed
+            )
+            assert not failed, (
+                f"{len(failed)}/{len(rows)} CSV case(s) failed "
+                f"(gate {LOGITS_DIFF_TOL}): {details}"
             )
 
-    summarize(rows)
-    failed = [r for r in rows if not r["pass"]]
-    if failed:
-        details = "; ".join(
-            f"row={r['row']} {r['data_format']} {r['act']} "
-            f"tokens={r['tokens']} "
-            + (
-                f"error={r['error']}"
-                if r.get("error")
-                else f"logits_diff={r['logits_diff']:.4e} rel_l2={r['rel_l2']:.4e}"
+
+    def main() -> None:
+        if not is_gfx1250():
+            print("skipping: requires gfx1250")
+            sys.exit(0)
+        parser = argparse.ArgumentParser(description=__doc__)
+        parser.add_argument(
+            "--scenario",
+            choices=("bench", "verify", "kernel", "csv"),
+            default="bench",
+            help="bench: time fused_moe end-to-end (CUDA graph). verify: eager "
+            "correctness only. kernel: time the gemm1 and gemm2 kernels in "
+            "isolation (loop each launch alone). csv: sweep every setting in "
+            "--csv-path (one run_moe case per row).",
+        )
+        parser.add_argument(
+            "--csv-path",
+            default=None,
+            help="CSV of grouped-MoE settings to sweep with --scenario csv "
+            f"(default: {DEFAULT_CSV_PATH}). Each row is one case.",
+        )
+        parser.add_argument("--data-format", choices=("a4w4", "a8w4"), default="a8w4")
+        parser.add_argument("--experts", type=int, default=256)
+        parser.add_argument(
+            "--tokens",
+            type=int,
+            nargs="+",
+            default=[64],
+            metavar="N",
+            help="one or more space-separated token counts; the scenario runs "
+            "once per value, e.g. --tokens 64 128 256",
+        )
+        parser.add_argument("--topk", type=int, default=8)
+        parser.add_argument("--model-dim", type=int, default=7168)
+        parser.add_argument("--inter-dim", type=int, default=256)
+        parser.add_argument("--warmup", type=int, default=5)
+        parser.add_argument("--iters", type=int, default=101)
+        parser.add_argument(
+            "--data-init",
+            dest="data_init",
+            nargs="*",
+            choices=bench_init.DATA_DISTS,
+            default=None,
+            help="DATA initialization distribution(s), paired position-wise with "
+            "--scale-init (length-1 broadcasts). Default: constant uniform",
+        )
+        parser.add_argument(
+            "--seed",
+            type=int,
+            default=0,
+            help="RNG seed for data and routing (default: 0)",
+        )
+        parser.add_argument(
+            "--act",
+            choices=("silu", "swiglu", "situv2"),
+            default=None,
+            help="stage1 activation: silu => silu(gate)*up; "
+            "swiglu => gpt-oss swiglu with clamp/alpha/residual; "
+            "situv2 => Kimi-K3 SiTUv2 (see --situ-beta / --situ-linear-beta). "
+            "Default: swiglu "
+            "for bench/verify/kernel; for --scenario csv, unset means use each "
+            "row's act_type (pass --act to force one activation for all rows).",
+        )
+        parser.add_argument("--swiglu-limit", type=float, default=7.0)
+        parser.add_argument(
+            "--situ-beta",
+            type=float,
+            default=4.0,
+            help="SiTUv2 gate beta (Kimi-K3 activation_situ_beta).",
+        )
+        parser.add_argument(
+            "--situ-linear-beta",
+            type=float,
+            default=25.0,
+            help="SiTUv2 up beta (Kimi-K3 activation_situ_linear_beta).",
+        )
+        parser.add_argument(
+            "--no-bias",
+            action="store_true",
+            help="run with zero stage1/stage2 bias tensors",
+        )
+        parser.add_argument(
+            "--scale-init",
+            dest="scale_init",
+            nargs="*",
+            choices=bench_init.E8M0_SCALE_DISTS,
+            default=None,
+            help="E8M0 SCALE initialization distribution(s), paired position-wise "
+            "with --data-init (length-1 broadcasts). Default: constant auto",
+        )
+        parser.add_argument(
+            "--real-gemm",
+            action="store_true",
+            default=is_gfx1250(),
+            help="call the real grouped WMMA GEMM kernel. Default: True on gfx1250, "
+            "False elsewhere (mock the GEMM so the tiny operators run on any arch).",
+        )
+        parser.add_argument(
+            "--no-check-aot-cache",
+            action="store_true",
+            help="disable the default AOT cache-miss check. By default the test "
+            "runs in FlyDSL run-only mode (FLYDSL_RUNTIME_RUN_ONLY=1): kernels "
+            "load the AOT-precompiled artifact and never JIT-compile, so a cache "
+            "miss raises. Pass this flag to allow runtime JIT compilation.",
+        )
+        args = parser.parse_args()
+        data_init_list = args.data_init or ["constant", "uniform"]
+        scale_init_list = args.scale_init or ["constant", "auto"]
+        if len(data_init_list) == 1:
+            data_init_list *= len(scale_init_list)
+        if len(scale_init_list) == 1:
+            scale_init_list *= len(data_init_list)
+        if len(data_init_list) != len(scale_init_list):
+            parser.error(
+                "--data-init and --scale-init must have equal length "
+                "(or length 1 to broadcast)"
             )
-            for r in failed
-        )
-        assert not failed, (
-            f"{len(failed)}/{len(rows)} CSV case(s) failed "
-            f"(gate {LOGITS_DIFF_TOL}): {details}"
-        )
+        args.init_pairs = list(zip(data_init_list, scale_init_list))
+        if not args.real_gemm:
+            _mock_grouped_gemm()
 
+        # CSV sweep: settings come from the CSV, not the shape flags. Each row sets
+        # its own data format / shape, so skip the single-shape guards below.
+        if args.scenario == "csv":
+            run_csv_scenario(args)
+            return
 
-def main() -> None:
-    if not is_gfx1250():
-        print("skipping: requires gfx1250")
-        sys.exit(0)
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument(
-        "--scenario",
-        choices=("bench", "verify", "kernel", "csv"),
-        default="bench",
-        help="bench: time fused_moe end-to-end (CUDA graph). verify: eager "
-        "correctness only. kernel: time the gemm1 and gemm2 kernels in "
-        "isolation (loop each launch alone). csv: sweep every setting in "
-        "--csv-path (one run_moe case per row).",
-    )
-    parser.add_argument(
-        "--csv-path",
-        default=None,
-        help="CSV of grouped-MoE settings to sweep with --scenario csv "
-        f"(default: {DEFAULT_CSV_PATH}). Each row is one case.",
-    )
-    parser.add_argument("--data-format", choices=("a4w4", "a8w4"), default="a8w4")
-    parser.add_argument("--experts", type=int, default=256)
-    parser.add_argument(
-        "--tokens",
-        type=int,
-        nargs="+",
-        default=[64],
-        metavar="N",
-        help="one or more space-separated token counts; the scenario runs "
-        "once per value, e.g. --tokens 64 128 256",
-    )
-    parser.add_argument("--topk", type=int, default=8)
-    parser.add_argument("--model-dim", type=int, default=7168)
-    parser.add_argument("--inter-dim", type=int, default=256)
-    parser.add_argument("--warmup", type=int, default=5)
-    parser.add_argument("--iters", type=int, default=101)
-    parser.add_argument(
-        "--data-init",
-        dest="data_init",
-        nargs="*",
-        choices=bench_init.DATA_DISTS,
-        default=None,
-        help="DATA initialization distribution(s), paired position-wise with "
-        "--scale-init (length-1 broadcasts). Default: constant uniform",
-    )
-    parser.add_argument(
-        "--seed",
-        type=int,
-        default=0,
-        help="RNG seed for data and routing (default: 0)",
-    )
-    parser.add_argument(
-        "--act",
-        choices=("silu", "swiglu", "situv2"),
-        default=None,
-        help="stage1 activation: silu => silu(gate)*up; "
-        "swiglu => gpt-oss swiglu with clamp/alpha/residual; "
-        "situv2 => Kimi-K3 SiTUv2 (see --situ-beta / --situ-linear-beta). "
-        "Default: swiglu "
-        "for bench/verify/kernel; for --scenario csv, unset means use each "
-        "row's act_type (pass --act to force one activation for all rows).",
-    )
-    parser.add_argument("--swiglu-limit", type=float, default=7.0)
-    parser.add_argument(
-        "--situ-beta",
-        type=float,
-        default=4.0,
-        help="SiTUv2 gate beta (Kimi-K3 activation_situ_beta).",
-    )
-    parser.add_argument(
-        "--situ-linear-beta",
-        type=float,
-        default=25.0,
-        help="SiTUv2 up beta (Kimi-K3 activation_situ_linear_beta).",
-    )
-    parser.add_argument(
-        "--no-bias",
-        action="store_true",
-        help="run with zero stage1/stage2 bias tensors",
-    )
-    parser.add_argument(
-        "--scale-init",
-        dest="scale_init",
-        nargs="*",
-        choices=bench_init.E8M0_SCALE_DISTS,
-        default=None,
-        help="E8M0 SCALE initialization distribution(s), paired position-wise "
-        "with --data-init (length-1 broadcasts). Default: constant auto",
-    )
-    parser.add_argument(
-        "--real-gemm",
-        action="store_true",
-        default=is_gfx1250(),
-        help="call the real grouped WMMA GEMM kernel. Default: True on gfx1250, "
-        "False elsewhere (mock the GEMM so the tiny operators run on any arch).",
-    )
-    parser.add_argument(
-        "--no-check-aot-cache",
-        action="store_true",
-        help="disable the default AOT cache-miss check. By default the test "
-        "runs in FlyDSL run-only mode (FLYDSL_RUNTIME_RUN_ONLY=1): kernels "
-        "load the AOT-precompiled artifact and never JIT-compile, so a cache "
-        "miss raises. Pass this flag to allow runtime JIT compilation.",
-    )
-    args = parser.parse_args()
-    data_init_list = args.data_init or ["constant", "uniform"]
-    scale_init_list = args.scale_init or ["constant", "auto"]
-    if len(data_init_list) == 1:
-        data_init_list *= len(scale_init_list)
-    if len(scale_init_list) == 1:
-        scale_init_list *= len(data_init_list)
-    if len(data_init_list) != len(scale_init_list):
-        parser.error(
-            "--data-init and --scale-init must have equal length "
-            "(or length 1 to broadcast)"
-        )
-    args.init_pairs = list(zip(data_init_list, scale_init_list))
-    if not args.real_gemm:
-        _mock_grouped_gemm()
-
-    # CSV sweep: settings come from the CSV, not the shape flags. Each row sets
-    # its own data format / shape, so skip the single-shape guards below.
-    if args.scenario == "csv":
-        run_csv_scenario(args)
-        return
-
-    # The >=512 floor is a FlyDSL grouped-kernel constraint (tile_k=256 needs two
-    # K tiles).
-    if args.model_dim < 512 or args.inter_dim < 512:
-        raise SystemExit(
-            f"model_dim ({args.model_dim}) and inter_dim ({args.inter_dim}) must be "
-            "at least 512 for the grouped GEMM kernels (tile_k=256 requires at "
-            "least two K tiles)."
-        )
-
-    set_data_format(args.data_format)
-
-    # --tokens accepts one or more counts; run once per value. Each iteration
-    # sets args.tokens to a single int so run_moe reads it unchanged.
-    token_list = args.tokens if isinstance(args.tokens, list) else [args.tokens]
-    # None (unset) defaults to swiglu for the single-shape scenarios.
-    activation = _ACT_BY_NAME.get(args.act, ActivationType.Swiglu)
-    rows = []
-    for _tok in token_list:
-        args.tokens = _tok
-        if len(token_list) > 1:
-            print(f"\n===== tokens={_tok} =====", flush=True)
-
-        for data_init, scale_init in args.init_pairs:
-            tol = VERIFY_TOL_A8W4 if args.data_format == "a8w4" else VERIFY_TOL_A4W4
-            # raise_on_fail=False so one out-of-gate token does not abort the
-            # sweep; the failure is recorded and reported after the table.
-            metrics = run_moe(
-                args.data_format,
-                experts=args.experts,
-                tokens=args.tokens,
-                topk=args.topk,
-                model_dim=args.model_dim,
-                inter_dim=args.inter_dim,
-                tol=tol,
-                activation=activation,
-                swiglu_limit=args.swiglu_limit,
-                situ_beta=args.situ_beta,
-                situ_linear_beta=args.situ_linear_beta,
-                use_bias=not args.no_bias,
-                check_aot_cache=not args.no_check_aot_cache,
-                raise_on_fail=False,
-                bench=args.scenario == "bench",
-                kernel_bench=args.scenario == "kernel",
-                warmup=args.warmup,
-                iters=args.iters,
-                seed=args.seed,
-                data_init=data_init,
-                scale_init=scale_init,
-            )
-            rows.append(
-                {
-                    "data_format": args.data_format,
-                    "act": args.act,
-                    "data_init": data_init,
-                    "scale_init": scale_init,
-                    "seed": args.seed,
-                    "experts": args.experts,
-                    "tokens": _tok,
-                    "topk": args.topk,
-                    "model_dim": args.model_dim,
-                    "inter_dim": args.inter_dim,
-                    "logits_diff": metrics["logits_diff"],
-                    "rel_l2": metrics["rel_l2"],
-                    "pass": metrics["passed"],
-                    "us": metrics.get("us"),
-                    "TFLOPS": metrics.get("tflops"),
-                    "Bandwidth (GB/s)": metrics.get("bandwidth_gbs"),
-                    "gemm1_us": metrics.get("gemm1_us"),
-                    "gemm2_us": metrics.get("gemm2_us"),
-                    "gemm1_TFLOPS": metrics.get("gemm1_tflops"),
-                    "gemm1_Bandwidth (GB/s)": metrics.get("gemm1_bandwidth_gbs"),
-                    "gemm2_TFLOPS": metrics.get("gemm2_tflops"),
-                    "gemm2_Bandwidth (GB/s)": metrics.get("gemm2_bandwidth_gbs"),
-                }
+        # The >=512 floor is a FlyDSL grouped-kernel constraint (tile_k=256 needs two
+        # K tiles).
+        if args.model_dim < 512 or args.inter_dim < 512:
+            raise SystemExit(
+                f"model_dim ({args.model_dim}) and inter_dim ({args.inter_dim}) must be "
+                "at least 512 for the grouped GEMM kernels (tile_k=256 requires at "
+                "least two K tiles)."
             )
 
-    # Always print the summary table (verify and bench).
-    summarize(rows)
-    # Preserve CI semantics: non-zero exit if any case missed the accuracy gate.
-    failed = [r for r in rows if not r["pass"]]
-    if failed:
-        details = "; ".join(
-            f"tokens={r['tokens']} act={r['act']} "
-            f"logits_diff={r['logits_diff']:.4e} rel_l2={r['rel_l2']:.4e}"
-            for r in failed
-        )
-        assert not failed, (
-            f"{len(failed)}/{len(rows)} case(s) exceeded logits_diff "
-            f"gate {LOGITS_DIFF_TOL}: {details}"
-        )
+        set_data_format(args.data_format)
+
+        # --tokens accepts one or more counts; run once per value. Each iteration
+        # sets args.tokens to a single int so run_moe reads it unchanged.
+        token_list = args.tokens if isinstance(args.tokens, list) else [args.tokens]
+        # None (unset) defaults to swiglu for the single-shape scenarios.
+        activation = _ACT_BY_NAME.get(args.act, ActivationType.Swiglu)
+        rows = []
+        for _tok in token_list:
+            args.tokens = _tok
+            if len(token_list) > 1:
+                print(f"\n===== tokens={_tok} =====", flush=True)
+
+            for data_init, scale_init in args.init_pairs:
+                tol = VERIFY_TOL_A8W4 if args.data_format == "a8w4" else VERIFY_TOL_A4W4
+                # raise_on_fail=False so one out-of-gate token does not abort the
+                # sweep; the failure is recorded and reported after the table.
+                metrics = run_moe(
+                    args.data_format,
+                    experts=args.experts,
+                    tokens=args.tokens,
+                    topk=args.topk,
+                    model_dim=args.model_dim,
+                    inter_dim=args.inter_dim,
+                    tol=tol,
+                    activation=activation,
+                    swiglu_limit=args.swiglu_limit,
+                    situ_beta=args.situ_beta,
+                    situ_linear_beta=args.situ_linear_beta,
+                    use_bias=not args.no_bias,
+                    check_aot_cache=not args.no_check_aot_cache,
+                    raise_on_fail=False,
+                    bench=args.scenario == "bench",
+                    kernel_bench=args.scenario == "kernel",
+                    warmup=args.warmup,
+                    iters=args.iters,
+                    seed=args.seed,
+                    data_init=data_init,
+                    scale_init=scale_init,
+                )
+                rows.append(
+                    {
+                        "data_format": args.data_format,
+                        "act": args.act,
+                        "data_init": data_init,
+                        "scale_init": scale_init,
+                        "seed": args.seed,
+                        "experts": args.experts,
+                        "tokens": _tok,
+                        "topk": args.topk,
+                        "model_dim": args.model_dim,
+                        "inter_dim": args.inter_dim,
+                        "logits_diff": metrics["logits_diff"],
+                        "rel_l2": metrics["rel_l2"],
+                        "pass": metrics["passed"],
+                        "us": metrics.get("us"),
+                        "TFLOPS": metrics.get("tflops"),
+                        "Bandwidth (GB/s)": metrics.get("bandwidth_gbs"),
+                        "gemm1_us": metrics.get("gemm1_us"),
+                        "gemm2_us": metrics.get("gemm2_us"),
+                        "gemm1_TFLOPS": metrics.get("gemm1_tflops"),
+                        "gemm1_Bandwidth (GB/s)": metrics.get("gemm1_bandwidth_gbs"),
+                        "gemm2_TFLOPS": metrics.get("gemm2_tflops"),
+                        "gemm2_Bandwidth (GB/s)": metrics.get("gemm2_bandwidth_gbs"),
+                    }
+                )
+
+        # Always print the summary table (verify and bench).
+        summarize(rows)
+        # Preserve CI semantics: non-zero exit if any case missed the accuracy gate.
+        failed = [r for r in rows if not r["pass"]]
+        if failed:
+            details = "; ".join(
+                f"tokens={r['tokens']} act={r['act']} "
+                f"logits_diff={r['logits_diff']:.4e} rel_l2={r['rel_l2']:.4e}"
+                for r in failed
+            )
+            assert not failed, (
+                f"{len(failed)}/{len(rows)} case(s) exceeded logits_diff "
+                f"gate {LOGITS_DIFF_TOL}: {details}"
+            )
 
 
-if __name__ == "__main__":
-    main()
+    if __name__ == "__main__":
+        main()
+
+elif __name__ == "__main__":
+    print(f"Skipping grouped GEMM test: requires gfx950 or gfx1250, got {_GFX}")
+# fmt: on
