@@ -7,46 +7,11 @@ There are three schedules and the fastest one is a function of how many bytes
 are being reduced:
 
 * **one-shot** (``OneShotAllReduce``) -- one round, no grid-wide barrier, wire
-  volume ``(N-1)*S``. Exact: fp32 accumulate, one bf16 rounding, ~55 dB.
+  volume ``(N-1)*S``. Exact: fp32 accumulate, one bf16 rounding.
 * **mesh** (``QRInt4(algorithm="mesh")``) -- two-shot, fanout to all ``N-1``
-  peers twice, wire volume ``2(N-1)/N*S``, INT4 on the wire, ~19 dB.
+  peers twice, wire volume ``2(N-1)/N*S``, INT4 on the wire.
 * **ring** (``QRInt4(algorithm="ring")``) -- two-shot, ``2(N-1)`` hops, same
   wire volume as the mesh traded for per-destination locality.
-
-They are ordered by size on every fabric measured, so the whole family decision
-is **two thresholds per (link type, world size)** -- which is what this module
-is. Deliberately no runtime search, no probing, no first-call calibration: a
-collective on the critical path cannot afford to discover its own policy, and a
-table that a reviewer can read is worth more than a percent of latency.
-
-This module imports nothing from the kernels. It is data plus arithmetic, so
-the tables can be tested without a GPU, without flydsl, and without an IPC
-rendezvous -- see ``op_tests/flydsl_tests/test_flydsl_ar_policy.py``. The caller
-resolves the link type (``qr_int4.has_xgmi_peer_links``) and passes it in.
-
-Why the one-shot boundary has to be keyed on world size
--------------------------------------------------------
-
-The one-shot moves ``(N-1)*S`` where a two-shot moves ``2(N-1)/N*S`` -- a ratio
-of ``N/2``. At TP2 the two are *equal*, so the one-shot's single round and
-absent barrier win far up the size range; at TP8 it is pushing 4x the bytes and
-loses almost immediately. A single world-independent ceiling is wrong in both
-directions at once and cannot be fixed by moving it, which is what the 192 KiB
-constant this replaces was: 2.7x too low at TP2, 6x too high at TP8, and worth
-2.08x worst-case at TP8 against a per-shape oracle.
-
-Provenance
-----------
-
-The PCIe rows are fitted from a 52-point byte ladder (14 KiB .. 112 MiB, four
-points per octave) on an MI350P, by exhaustive search over round thresholds
-minimising worst-case regret against a per-shape oracle. Worst case 1.002x
-(TP2), 1.016x (TP4), 1.066x (TP8). Held out against hidden sizes 4096 and 8192
-at 1.000x, which is what justifies keying the table on bytes rather than on
-shape. See ``op_tests/dump_data/sweep/RESULTS.md`` and regenerate with
-``op_tests/multigpu_tests/fit_allreduce_policy.py``.
-
-**The xGMI rows are not measured.** See ``_XGMI_UNMEASURED`` below.
 """
 
 from __future__ import annotations
@@ -57,16 +22,12 @@ from dataclasses import dataclass
 
 logger = logging.getLogger("aiter")
 
-# Fabric between GPUs. Arch does not determine it: an MI350X (xGMI) and an
-# MI350P (PCIe-only) both report gfx950 and want different answers here, the
-# same reason ``inbox_memory="auto"`` reads the KFD topology.
+# Fabric between GPUs.
 LINKS = ("pcie", "xgmi")
 
 SUPPORTED_WORLDS = (2, 4, 8)
 
-# No ceiling. The ring's inbox is a fixed ring of wire slots sized by
-# ``ST * grid``, not by the payload, so a 112 MiB reduce costs no more memory
-# than a 1 MiB one and still beats RCCL by 2.8-4.0x at the top of the sweep.
+# No ceiling. The ring's inbox is a fixed ring of wire slots sized by ``ST * grid``.
 NO_MAX = 1 << 62
 
 
@@ -78,15 +39,8 @@ class FamilyPolicy:
     ``nbytes <= mesh_max``     -> mesh
     otherwise                  -> ring
 
-    ``oneshot_max_exact`` is the same boundary under the default
-    exactness-preferring policy: the largest payload at which the bit-exact
-    one-shot is still within ``EXACT_SLACK`` of the fastest quantized schedule.
-    It is always ``>= oneshot_max`` -- widening the window is the only thing
-    preferring exactness can do -- and on PCIe it is *equal* at TP2 and TP4,
-    i.e. keeping ~55 dB instead of ~19 dB costs nothing at all there.
-
     ``min_bytes`` is where this whole path starts being worth taking; below it
-    the caller should fall through to ``cross_device_reduce``.
+    the caller should fall through to other alternatives.
     """
 
     oneshot_max: int
@@ -109,46 +63,27 @@ class FamilyPolicy:
             )
 
 
-# How much latency the default policy will give up to keep the exact schedule.
-# The one-shot is bit-comparable with ``cross_device_reduce`` (~55 dB); the
-# quantized schedules are ~19 dB, which is ~11% relative error. 10% of a
-# microsecond-scale collective is a cheaper thing to spend than that.
-EXACT_SLACK = 1.10
-
-# Placeholder marker for the unmeasured rows, so the log line and the tests can
-# find them without duplicating the list.
-_XGMI_UNMEASURED = True
-
 FAMILY_POLICY: dict[tuple[str, int], FamilyPolicy] = {
-    # --- PCIe: measured, MI350P, 2026-09-10 ------------------------------
-    # TP2: the one-shot and the two-shots move *identical* wire volume
-    # ((N-1)*S == 2(N-1)/N*S at N=2), so the exact schedule stays ahead on its
-    # single round all the way to 512 KiB, and exactness is free.
+    # --- PCIe: Policy from measurements --------------------
     ("pcie", 2): FamilyPolicy(
         oneshot_max=512 << 10, oneshot_max_exact=512 << 10, mesh_max=4 << 20
     ),
     ("pcie", 4): FamilyPolicy(
         oneshot_max=96 << 10, oneshot_max_exact=96 << 10, mesh_max=12 << 20
     ),
-    # TP8 is the only row where preferring exactness costs anything: 32 -> 48 KiB
-    # for a worst case of 1.066x.
     ("pcie", 8): FamilyPolicy(
         oneshot_max=32 << 10, oneshot_max_exact=48 << 10, mesh_max=12 << 20
     ),
-    # --- xGMI: NOT MEASURED, conservative placeholder --------------------
+    # --- xGMI: Not yet measured, conservative placeholder --------------------
     #
-    # Deliberately conservative in the one direction that cannot regress
-    # anything: keep the one-shot inside its historical 192 KiB ceiling, and set
-    # ``mesh_max`` so the **ring is never auto-selected**. The mesh is the
-    # documented default on a meshed fabric and the ring is structurally worse
+    # Set ``mesh_max`` so the ring is never auto-selected. The mesh is the
+    # default algorithm on a meshed fabric and the ring is structurally worse
     # there -- it trades fanout for per-destination locality, which is what a
     # PCIe host wants and an xGMI host does not.
     #
     # The one-shot boundary above is the part most likely to be wrong. Its
     # driver, the ``N/2`` wire-volume ratio, is fabric-independent, but the
-    # constant is not: xGMI peer bandwidth is an order of magnitude higher, which
-    # moves where a launch-bound schedule stops winning. Replace these three rows
-    # from an MI350X sweep -- the fitting script and shape files already exist.
+    # constant is not: xGMI peer bandwidth is an order of magnitude higher.
     ("xgmi", 2): FamilyPolicy(
         oneshot_max=192 << 10, oneshot_max_exact=192 << 10, mesh_max=NO_MAX
     ),
@@ -160,13 +95,9 @@ FAMILY_POLICY: dict[tuple[str, int], FamilyPolicy] = {
     ),
 }
 
-# --- environment ---------------------------------------------------------
+# --- environment variables ---------------------------------------------------------
 #
-# The existing AITER_AR_1STAGE* / AITER_AR_QUANT_* variables belong to the fused
-# all-reduce + RMSNorm + mxfp4 path in communicator_cuda.py and name a different
-# kernel's 1-stage; they are deliberately not reused. AITER_ALL_REDUCE_CODEC
-# (qr_int4.py) still applies and is unchanged -- it selects the wire format,
-# which is orthogonal to the schedule chosen here.
+# TODO: can we re-use the existing AITER_AR_1STAGE* / AITER_AR_QUANT_* variables?
 
 ENABLE_VAR = "AITER_FLY_AR"
 ACCURACY_VAR = "AITER_FLY_AR_ACCURACY"
@@ -178,29 +109,25 @@ DEFAULT_ACCURACY = "exact"
 
 
 def _env_int(name: str) -> int | None:
-    """A non-negative override from *name*, or None. ``-1`` means "use the table".
-
-    Matches the house sentinel convention (``AITER_CUSTOM_AR_MAX_SIZE``). A value
-    that does not parse warns and is ignored rather than raising: a typo in an
-    environment variable should not take a model down at import.
-    """
+    """A non-negative override from *name*, or None. ``-1`` means "use the table"."""
     raw = os.environ.get(name)
     if raw is None or not raw.strip():
         return None
     try:
         val = int(raw)
     except ValueError:
-        logger.warning("QRInt4: ignoring %s=%r, expected an integer", name, raw)
+        logger.warning("FlyDSL QR: ignoring %s=%r, expected an integer", name, raw)
         return None
     return None if val < 0 else val
 
 
-def enabled() -> bool | None:
-    """Tristate ``AITER_FLY_AR``: True forces on, False forces off, None auto.
+def enabled() -> bool:
+    """Whether ``AITER_FLY_AR`` opts in to the FlyDSL all-reduce path.
 
-    Same idiom as ``AITER_AR_1STAGE`` in ``communicator_cuda.py``.
+    Opt-in only, and only ``"1"`` opts in -- unset, ``"0"`` and anything else
+    means disabled.
     """
-    return {"1": True, "0": False}.get(os.environ.get(ENABLE_VAR, "").strip())
+    return os.environ.get(ENABLE_VAR, "").strip() == "1"
 
 
 def accuracy_mode() -> str:
@@ -211,7 +138,7 @@ def accuracy_mode() -> str:
     mode = raw.strip().lower()
     if mode not in ACCURACY_MODES:
         logger.warning(
-            "QRInt4: ignoring %s=%r, expected one of %s",
+            "FlyDSL QR: ignoring %s=%r, expected one of %s",
             ACCURACY_VAR,
             raw,
             ACCURACY_MODES,
@@ -223,10 +150,22 @@ def accuracy_mode() -> str:
 def resolve(link: str, world_size: int, mode: str | None = None) -> FamilyPolicy:
     """The policy in force for a rank, environment overrides applied.
 
-    *mode* defaults to ``accuracy_mode()``. In ``"exact"`` the one-shot window is
-    ``oneshot_max_exact``; in ``"fast"`` it is ``oneshot_max``. Either way the
-    returned record has both fields set to the resolved value, so callers never
-    have to re-apply the mode.
+    *mode* defaults to ``accuracy_mode()``, and picks between two different
+    policies, not just two boundaries:
+
+    * ``"fast"`` -- the full three-family policy. One-shot up to
+      ``oneshot_max``, mesh/ring (quantized) beyond it.
+    * ``"exact"`` (default) -- **only** the one-shot is ever reachable, at its
+      widened ``oneshot_max_exact`` ceiling. Above that, this returns a policy
+      with no mesh/ring window at all (``mesh_max == max_bytes ==
+      oneshot_max``), so ``should_fly_all_reduce`` declines the payload and the
+      caller falls through to whatever it would otherwise dispatch to
+      (``cross_device_reduce``/RCCL) rather than silently quantizing.
+
+    ``AITER_FLY_AR_ONESHOT_MAX_BYTES`` applies in both modes -- it only moves
+    where the one-shot's own ceiling sits. ``AITER_FLY_AR_MESH_MAX_BYTES`` is
+    ignored (with a warning) in ``"exact"`` mode: honouring it would reopen the
+    mesh/ring window ``"exact"`` exists to close.
     """
     if link not in LINKS:
         raise ValueError(f"link must be one of {LINKS}, got {link!r}")
@@ -239,17 +178,30 @@ def resolve(link: str, world_size: int, mode: str | None = None) -> FamilyPolicy
     if mode not in ACCURACY_MODES:
         raise ValueError(f"mode must be one of {ACCURACY_MODES}, got {mode!r}")
 
-    one = base.oneshot_max_exact if mode == "exact" else base.oneshot_max
-    mesh = base.mesh_max
     override_one = _env_int(ONESHOT_MAX_VAR)
+
+    if mode == "exact":
+        one = base.oneshot_max_exact if override_one is None else override_one
+        if _env_int(MESH_MAX_VAR) is not None:
+            logger.warning(
+                "FlyDSL QR: ignoring %s in accuracy=exact mode -- exact mode "
+                "has no mesh/ring window to widen. Set %s=fast to use it.",
+                MESH_MAX_VAR,
+                ACCURACY_VAR,
+            )
+        return FamilyPolicy(
+            oneshot_max=one,
+            oneshot_max_exact=one,
+            mesh_max=one,
+            min_bytes=base.min_bytes,
+            max_bytes=one,
+        )
+
+    one = base.oneshot_max if override_one is None else override_one
+    mesh = base.mesh_max
     override_mesh = _env_int(MESH_MAX_VAR)
-    if override_one is not None:
-        one = override_one
     if override_mesh is not None:
         mesh = override_mesh
-    # An override can invert the ordering the families depend on. Clamp rather
-    # than raise -- someone pinning the one-shot ceiling above the ring floor
-    # means "give me the one-shot up to here", not "crash".
     mesh = max(mesh, one)
     return FamilyPolicy(
         oneshot_max=one,
@@ -268,14 +220,7 @@ def pick_family(nbytes: int, policy: FamilyPolicy) -> str:
 
 
 def families_reachable(policy: FamilyPolicy) -> tuple[str, ...]:
-    """Families a *policy* can ever select, in size order.
-
-    Engine construction is a collective IPC handle exchange and so cannot be
-    lazy -- every engine a rank might need has to be built up front, in an order
-    every rank agrees on. Building the ones the table can never reach would cost
-    an inbox and a JIT for nothing, which on xGMI (where ``mesh_max`` is
-    unbounded) is the whole ring.
-    """
+    """Families a *policy* can ever select, in size order."""
     out = []
     if policy.oneshot_max >= policy.min_bytes:
         out.append("oneshot")

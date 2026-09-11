@@ -407,6 +407,126 @@ def human(n: int) -> str:
     return f"{n} B"
 
 
+def same_work(a: str | None, b: str | None) -> bool:
+    """Whether two variant strings describe the same launch.
+
+    A variant reads ``<jit symbol>/g<grid_cap>/x<blocks>``. The symbol is the
+    binary and ``x`` is the launch geometry; ``g`` only sizes the IPC inbox and
+    is deliberately *not* part of the JIT tag, so two rows agreeing on symbol
+    and block count are running byte-identical work into differently-sized
+    buffers. Comparing the whole string would call that a difference and let the
+    audit attribute a measurement wobble to the dispatch policy.
+    """
+    if not a or not b:
+        return False
+
+    def key(v):
+        parts = v.split("/")
+        return (parts[0], parts[-1]) if len(parts) >= 2 else (v, "")
+
+    return key(a) == key(b)
+
+
+def audit_auto(samples, slack: float, verbose: bool) -> int:
+    """Grade the shipped dispatcher against the pinned rows. Returns failures.
+
+    ``fly_auto`` routes through ``FlyDSLAllReduce``, i.e. the tables as actually
+    shipped -- both levels of heuristic, resolved at launch. The pinned rows are
+    the oracle it is held to. This is the acceptance test for the whole
+    exercise: everything else in this script *fits* a table, and this is the
+    only thing that asks whether the table, once compiled into engines and
+    driven through the real dispatch path, still lands where the fit said.
+
+    Graded against the best pinned variant of *any* family, not just the family
+    the policy chose, so a wrong family choice is caught as well as a wrong
+    rung. Its own SQNR is not checked here -- the benchmark already asserts that
+    per row, and the interesting property is latency.
+    """
+    pinned = [
+        c.key
+        for f in FAMILIES
+        for c in BY_FAMILY[f]
+        if c.key not in AUTO_KEYS.get(f, ())
+    ]
+    tps = sorted({s.tp for s in samples})
+    failures = 0
+    for tp in tps:
+        sub = [s for s in samples if s.tp == tp and "fly_auto" in s.us]
+        if not sub:
+            logger.warning("## TP%d  fly_auto not measured -- nothing to audit", tp)
+            continue
+        rows = []
+        for s in sub:
+            best_key, best_us = best_in(s, pinned)
+            if best_key is None:
+                continue
+            # Did the policy pick the same *work* the winning row ran? The auto
+            # variant carries a "<family>:" prefix the pinned rows do not.
+            auto_v = s.variant.get("fly_auto", "?").split(":", 1)[-1]
+            rows.append(
+                (
+                    s.nbytes,
+                    s.hidden,
+                    s.us["fly_auto"] / best_us,
+                    best_key,
+                    auto_v,
+                    same_work(auto_v, s.variant.get(best_key)),
+                )
+            )
+        worst = max(rows, key=lambda r: r[2])
+        over = [r for r in rows if r[2] > slack]
+        # A row where auto ran the *identical kernel* to the one that "beat" it
+        # cannot be a policy error: there is no decision left to get wrong, so
+        # the gap is measurement. These collectives are barrier-synchronised and
+        # one straggler rank moves the whole reading -- in this sweep the same
+        # shapes flip which candidate reads high, and every such row carries a
+        # 25-70 us rank spread against ~2 us for its neighbours. Counted and
+        # shown separately rather than waved away or scored as a miss.
+        bad = [r for r in over if not r[5]]
+        noisy = [r for r in over if r[5]]
+        failures += len(bad)
+        logger.info(
+            "## TP%d  fly_auto vs best pinned: worst %.3fx at %s, mean %.3fx, "
+            "%d/%d real miss, %d same-kernel noise",
+            tp,
+            worst[2],
+            human(worst[0]),
+            sum(r[2] for r in rows) / len(rows),
+            len(bad),
+            len(rows),
+            len(noisy),
+        )
+        for nbytes, k, ratio, best_key, _v, _ in noisy:
+            logger.info(
+                "     noise %-10s K=%-5d %.3fx vs %s -- identical kernel",
+                human(nbytes),
+                k,
+                ratio,
+                best_key,
+            )
+        for nbytes, k, ratio, best_key, variant, _ in bad:
+            logger.warning(
+                "     MISS %-10s K=%-5d %.3fx vs %s   auto ran %s",
+                human(nbytes),
+                k,
+                ratio,
+                best_key,
+                variant,
+            )
+        if verbose:
+            for nbytes, k, ratio, best_key, variant, same in rows:
+                logger.info(
+                    "     %-10s K=%-5d %.3fx  best=%-24s same=%d auto=%s",
+                    human(nbytes),
+                    k,
+                    ratio,
+                    best_key,
+                    int(same),
+                    variant,
+                )
+    return failures
+
+
 def main():
     ap = argparse.ArgumentParser(
         formatter_class=argparse.RawTextHelpFormatter, description=__doc__
@@ -460,10 +580,32 @@ def main():
         "wrong key and nothing below it is trustworthy. Point it at the\n"
         "K-sensitivity sweep.",
     )
+    ap.add_argument(
+        "--audit-auto",
+        action="store_true",
+        help="instead of fitting, grade the `fly_auto` rows -- the shipped\n"
+        "dispatcher -- against the best pinned row at every shape, and exit\n"
+        "non-zero if any exceeds --ladder-slack. This is the end-to-end\n"
+        "acceptance test for the tables; run it on a sweep that includes\n"
+        "-c fly_auto alongside the pinned rows.",
+    )
     ap.add_argument("--verbose", action="store_true", help="per-shape regret detail")
     args = ap.parse_args()
 
     samples = load(args.csv, args.metric)
+    if args.audit_auto:
+        logger.info(
+            "# auditing fly_auto over %d shape(s), metric %r, tolerance %.0f%%\n",
+            len(samples),
+            args.metric,
+            (args.ladder_slack - 1) * 100,
+        )
+        n = audit_auto(samples, args.ladder_slack, args.verbose)
+        logger.info(
+            "\n%s",
+            f"FAILURES: {n}" if n else "PASS: every shape within tolerance",
+        )
+        raise SystemExit(1 if n else 0)
     holdout = load(args.holdout, args.metric) if args.holdout else []
     tps = sorted({s.tp for s in samples})
     logger.info(

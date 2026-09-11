@@ -595,6 +595,13 @@ class QRInt4:
         if world_ladder and not pinned_st:
             rungs = [(st, min(rung_cap, cap)) for _, st, rung_cap in world_ladder]
             ladder = world_ladder
+            # The schedule's ``default_super_tile`` describes the *unladdered*
+            # case and is not necessarily a rung: the TP8 ring runs ST=16 and
+            # ST=32 and never 8. Take the bottom rung instead, so ``super_tile``
+            # names an engine that exists -- ``_by_st[self.super_tile]`` below
+            # indexes it directly, and ``_pick_st`` falls back to it whenever
+            # the ladder does not apply.
+            super_tile = ladder[0][1]
         else:
             rungs = [(super_tile, cap)]
             ladder = ()
@@ -630,9 +637,20 @@ class QRInt4:
         # fewer tiles than the chosen super-tile. Engines are built in a fixed
         # order because each does its own IPC handle exchange, which is a
         # collective -- ranks disagreeing on the order would deadlock.
-        by_cap = {1: cap}
+        #
+        # The rungs go in first so an ST=1 that the ladder *sites* keeps its own
+        # cap. Only then is the fallback filled in, and at the smallest cap on
+        # the ladder rather than at the global default: the fallback fires only
+        # when a payload has fewer tiles than the super-tile it would otherwise
+        # take, so ``_grid_x`` there is bounded by that super-tile (<= 32) with
+        # a release fence, and by the chosen rung's own cap without one --
+        # under 128 either way. Seeding it with the 1216 default instead built a
+        # 194 MiB inbox to launch at most 32 blocks into, and did it on every
+        # QRInt4 ever constructed.
+        by_cap = {}
         for st, rung_cap in rungs:
             by_cap.setdefault(st, rung_cap)
+        by_cap.setdefault(1, min(by_cap.values()) if by_cap else cap)
         self._ladder = ladder
         self._by_st = {}
         for st in sorted(by_cap):

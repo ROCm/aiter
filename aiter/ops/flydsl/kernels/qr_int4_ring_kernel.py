@@ -85,19 +85,6 @@ RING_SUPER_TILES = (1, 8, 16, 32)
 
 # Payload-size ladder: ``(min_bytes, super_tile, grid_cap)``, ascending, per
 # world size.
-#
-# It used to be one world-independent tuple, ``((0,8,128), (18 MiB,16,128),
-# (64 MiB,32,128))``, sited from TP4 measurements. That is close to right at TP4
-# -- the refit moves the rungs to 24 and 48 MiB -- and wrong at TP8, which wants
-# ST=16 from the smallest ring-eligible payload and never wants ST=8 at all.
-# Publishes per rank are ``num_tiles / ST * 2(N-1)``, so the ``2(N-1)`` factor
-# means a wider world pays for every publish four times over at TP8 against TP2
-# and reaches the batching crossover that much sooner. A ladder that ignores
-# world size cannot express that.
-#
-# Fitted over each world's actual ring window (above ``mesh_max``, so 4 MiB at
-# TP2 and 12 MiB at TP4/TP8); worst case 1.047x / 1.051x / 1.004x. See
-# op_tests/dump_data/sweep/RESULTS.md.
 RING_ST_LADDER = {
     2: ((0, 8, 128), (24 << 20, 16, 128)),
     4: ((0, 8, 128), (24 << 20, 16, 128), (48 << 20, 32, 128)),

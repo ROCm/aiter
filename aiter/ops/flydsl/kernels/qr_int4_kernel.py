@@ -57,32 +57,17 @@ PHASE_REDUCE_SCATTER = 0
 PHASE_ALL_GATHER = 1
 SUPER_TILES = (1, 8)
 
-# Per-world-size tuning ladder: ``(min_bytes, super_tile, grid_cap)`` rungs,
-# ascending -- the same shape ``RING_ST_LADDER`` has, consumed by the same
-# ``_Algorithm.st_ladder`` machinery, which until now the mesh left empty.
+# Per-world-size tuning ladder: ``(min_bytes, super_tile, grid_cap)`` rungs.
 #
-# What the fit found, over the window the mesh is actually dispatched in
-# (between the one-shot's ceiling and the ring's floor):
-#   TP2  ST=1 everywhere. Worst case 1.000x -- the mesh's window here is only
-#        512 KiB .. 4 MiB, and across it ST=1's parallelism wins outright.
-#   TP4  ST=8 everywhere, 1.057x. The window is 96 KiB .. 12 MiB, wide enough
-#        that batching publishes pays across all of it.
-#   TP8  ST=1 up to 192 KiB then ST=8, 1.100x. Two rungs because 7 peers make a
-#        publish expensive enough that the crossover lands inside the window
-#        rather than at its edge. A third rung would buy 1.060x; not taken.
+#   TP2  ST=1 everywhere.
+#   TP4  ST=8 everywhere.
+#   TP8  ST=1 up to 768 KiB then ST=8.
 #
 # ``grid_cap`` is 128 on every rung, against the ``DEFAULT_GRID_CAP`` of 1216.
-# For the ST=1 rungs that is provably free rather than a trade: ``_grid_x``
-# returns ``min(num_tiles, cap)`` and the measured ``grid_x`` never exceeds 112
-# anywhere in those windows, so the launch is identical and only the inbox
-# shrinks -- from 194 MiB per rank to ~20 MiB. The grid is not part of the JIT
-# tag, so it is not even a different binary.
-#
-# Fitted on MI350P/PCIe; see op_tests/dump_data/sweep/RESULTS.md.
 MESH_ST_LADDER = {
     2: ((0, 1, 128),),
     4: ((0, 8, 128),),
-    8: ((0, 1, 128), (192 << 10, 8, 128)),
+    8: ((0, 1, 128), (768 << 10, 8, 128)),
 }
 # Wire formats the mesh can build.
 MESH_CODECS = ("int4", "fp16")

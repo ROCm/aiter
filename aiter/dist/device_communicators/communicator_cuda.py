@@ -103,10 +103,8 @@ class CudaCommunicator(DeviceCommunicatorBase):
             self.qr_comm = QuickAllReduce(group=self.cpu_group, device=self.device)
 
             # FlyDSL all-reduce family: exact one-shot / quantized mesh / ring,
-            # selected by payload size. Opt-in behind AITER_FLY_AR while its
-            # policy tables are PCIe-only; unset leaves the chain below
-            # unchanged. Self-disables on every unsupported condition, so this
-            # is safe to construct unconditionally.
+            # selected by payload size. Opt-in behind AITER_FLY_AR.
+            # Currently the policy tables are PCIe-only.
             from aiter.dist.device_communicators.flydsl_all_reduce import (
                 FlyDSLAllReduce,
             )
@@ -179,11 +177,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
         # FlyDSL first when enabled, then quick reduce, then custom allreduce,
         # and then pynccl. (quick reduce just for ROCM MI3*)
         #
-        # FlyDSL leads because it wins at every size measured on MI350P: against
-        # the fastest qr_* regime it is 1.2-1.7x at decode shapes and >20x at
-        # prefill, and its small-message schedule is bit-exact where every qr_*
-        # regime quantizes. It is opt-in (AITER_FLY_AR) and self-disabling, so
-        # an unset environment falls straight through to the order below.
+        # FlyDSL small-message schedule is bit-exact. 
         fly_comm = self.fly_comm
         if (
             fly_comm is not None

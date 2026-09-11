@@ -41,29 +41,14 @@ from .qr_int_shared import SUPPORTED_WORLDS
 
 logger = logging.getLogger("aiter")
 
-# Largest payload this kernel should be asked to move, per world size.
-#
-# This was one world-independent constant, 192 KiB, with a TODO to measure the
-# crossover as a function of world size. Measured, and the world size is not a
-# refinement here -- it is the whole story. The one-shot moves ``(N-1)*S`` where
-# a two-shot moves ``2(N-1)/N*S``, a ratio of ``N/2``: at TP2 the two are equal
-# and this schedule stays ahead to 512 KiB, at TP8 it is pushing 4x the bytes
-# and is done by 48 KiB. 192 KiB was wrong in both directions at once.
-#
-# Mirrors ``qr_ar_policy``'s exact-mode one-shot window rather than restating
-# it, since a standalone caller of this class gets the same default the
-# dispatcher would pick for it. PCIe is the conservative read: its ceilings are
-# at or below the (unmeasured) xGMI placeholders at every world size, so a host
-# this table cannot classify is not over-served.
+# Largest payload this kernel should be asked to move, per world size. 
 MAX_PAYLOAD_BYTES_BY_WORLD = {
-    ws: FAMILY_POLICY[("pcie", ws)].oneshot_max_exact for ws in (2, 4, 8)
+    ws: FAMILY_POLICY[("pcie", ws)].oneshot_max_exact for ws in SUPPORTED_WORLDS
 }
-# For an unlisted world size; also what the old constant was.
-MAX_PAYLOAD_BYTES = 192 << 10
 
 
 def max_payload_bytes(world_size: int) -> int:
-    return MAX_PAYLOAD_BYTES_BY_WORLD.get(int(world_size), MAX_PAYLOAD_BYTES)
+    return MAX_PAYLOAD_BYTES_BY_WORLD[int(world_size)]
 
 
 class OneShotAllReduce:
@@ -72,12 +57,7 @@ class OneShotAllReduce:
     Requires a non-NCCL, single-node process group for IPC metadata exchange,
     the same constraint ``QRInt4`` has and for the same reason.
 
-    ``atoms``, ``grid_cap`` and ``fanout`` are the tuning surface. Leave all
-    three ``None`` -- the default -- to get ``ONESHOT_LADDER``, which sites them
-    per world size from measurement; this is what production gets. Naming any
-    one of them pins a single configuration at every payload size instead, which
-    is what the benchmark's pinned rows and the tuning sweeps want. A ladder
-    builds one engine, and one IPC inbox, per rung.
+    ``atoms``, ``grid_cap`` and ``fanout`` are the tuning surface.
 
     ``max_bytes`` is the payload above which ``allreduce`` refuses to run,
     defaulting to this world size's entry in ``MAX_PAYLOAD_BYTES_BY_WORLD``.
@@ -108,13 +88,6 @@ class OneShotAllReduce:
             raise ValueError(
                 f"world_size must be one of {SUPPORTED_WORLDS}, got {world_size}"
             )
-        # ``None`` on all three tuning knobs means "walk ONESHOT_LADDER", the
-        # same contract ``QRInt4`` gives ``super_tile``. Naming *any* of them
-        # pins a single configuration at every size, because a half-pinned
-        # ladder -- rungs that move ``atoms`` while honouring a caller's
-        # ``fanout`` -- is a thing nobody asked for and nobody could reason
-        # about. The benchmark's pinned rows and the tuning sweeps take that
-        # branch; production takes the ladder.
         pinned = atoms is not None or grid_cap is not None or fanout is not None
         if atoms is None:
             atoms = DEFAULT_ATOMS
@@ -154,15 +127,12 @@ class OneShotAllReduce:
         self.probe = probe
         self.spin_sleep = int(spin_sleep)
 
-        # ``(min_bytes, atoms, grid_cap, fanout)`` rungs, ascending. Pinning
-        # collapses to a single rung at floor 0. ``grid_cap`` stays a *ceiling*
-        # rather than a pin, matching QRInt4: lowering it constrains every rung,
-        # raising it above a rung's own cap is a no-op.
         if pinned:
             self._ladder = ((0, int(atoms), cap, fanout),)
         else:
+            ceiling = cap if grid_cap is not None else None
             self._ladder = tuple(
-                (floor, a, min(rung_cap, cap), f)
+                (floor, a, rung_cap if ceiling is None else min(rung_cap, ceiling), f)
                 for floor, a, rung_cap, f in oneshot_ladder(world_size)
             )
 
@@ -211,9 +181,6 @@ class OneShotAllReduce:
     @property
     def inbox_bytes(self) -> int:
         """IPC inbox bytes this object holds on this rank, across every rung.
-
-        Named to match ``QRInt4.inbox_bytes`` so a caller holding a mixed bag of
-        engines can total them without a type test.
         """
         return sum(eng.buf_bytes for eng, _ in self._by_cfg.values())
 

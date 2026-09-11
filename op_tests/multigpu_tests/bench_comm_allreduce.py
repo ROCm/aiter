@@ -242,6 +242,7 @@ _FP8_MIN_NUMEL = 128 * 2048
 # SMEM_CAPACITY_MAP). Mirror that gate rather than a bare try/except so this
 # bench reports the same availability aiter does.
 if is_flydsl_available():
+    from aiter.dist.device_communicators.flydsl_all_reduce import FlyDSLAllReduce
     from aiter.ops.flydsl import QRInt4
     from aiter.ops.flydsl.kernels.qr_1stage import (
         OneShotAllReduce,
@@ -265,7 +266,14 @@ else:
     ALGORITHMS = {}
     _resolve_codecs = None
     has_xgmi_peer_links = None
+    FlyDSLAllReduce = None
     HAS_FLY_INT4 = False
+
+# FlyDSLAllReduce is opt-in and self-disabling; the bench turns it on for its
+# own `fly_auto` row the same way it forces a quick-reduce regime for the qr_*
+# rows, and for the same reason -- measuring a path production can reach
+# requires enabling it.
+_FLY_ENV = "AITER_FLY_AR"
 
 
 def _peer_link_type() -> str:
@@ -509,6 +517,14 @@ CANDIDATES = (
         rs_codec="int6",
         ag_codec="int4",
     ),
+    # Production dispatch: FlyDSLAllReduce picking a family per payload size,
+    # i.e. what a model actually gets with AITER_FLY_AR=1. The acceptance test
+    # for the whole heuristic -- it must stay within ~10% of the best pinned row
+    # at every shape, which is what `fit_allreduce_policy.py --audit-auto`
+    # checks. Its accuracy floor has to be the *quantized* one even though it is
+    # bit-exact at decode sizes: one row spans both accuracy classes because the
+    # schedule changes underneath it, which is exactly the thing being tested.
+    Candidate("fly_auto", "flyauto", 14.0, False),  # 55 at decode / 18.7 at prefill
     Candidate("rccl", "rccl", 40.0, True),  # 51 / 69
 )
 CANDIDATE_KEYS = [c.key for c in CANDIDATES]
@@ -568,6 +584,15 @@ def applicable(cand: Candidate, world_size: int, dtype, numel: int, nbytes: int)
     if cand.family == "fly":
         # Deliberately *not* gated on QRInt4's own payload floor, which the
         # engines here disable with min_bytes=0.
+        return (
+            HAS_FLY_INT4
+            and get_gfx() in _FLY_ARCHS
+            and world_size in _FLY_WORLDS
+            and dtype == dtypes.bf16
+        )
+    if cand.family == "flyauto":
+        # Gated by the dispatcher's own policy rather than by a constant here:
+        # the whole point of the row is that its window is the shipped one.
         return (
             HAS_FLY_INT4
             and get_gfx() in _FLY_ARCHS
@@ -780,7 +805,7 @@ def production_path(ca_comm, qr_comm, x, world_size: int, prod_regime: str | Non
     return "rccl"
 
 
-def _variant_of(cand: Candidate, fly, fly1s, nbytes: int) -> str | None:
+def _variant_of(cand: Candidate, fly, fly1s, flyauto, nbytes: int) -> str | None:
     """The kernel *cand* would actually run at *nbytes*, or None.
 
     Only the flydsl families can answer this: their engines expose the JIT
@@ -793,6 +818,8 @@ def _variant_of(cand: Candidate, fly, fly1s, nbytes: int) -> str | None:
         if cand.family == "fly"
         else fly1s.get(cand.fly1s_cfg)
         if cand.family == "fly1s"
+        else flyauto
+        if cand.family == "flyauto"
         else None
     )
     return eng.variant(int(nbytes)) if eng is not None else None
@@ -848,7 +875,7 @@ def _fly_kwargs(cfg: tuple, names: tuple) -> dict:
     return {n: v for n, v in zip(names, cfg) if v is not None}
 
 
-def _build_thunks(cands, *, ca_comm, qr_comm, fly, fly1s, group, x):
+def _build_thunks(cands, *, ca_comm, qr_comm, fly, fly1s, flyauto, group, x):
     """Zero-arg thunks, one per candidate, each returning the all-reduced tensor.
 
     Every candidate owns its output buffer so none of them alias, and the QR
@@ -893,6 +920,13 @@ def _build_thunks(cands, *, ca_comm, qr_comm, fly, fly1s, group, x):
                 return o
 
             thunks[cand.key] = _fly1s
+        elif cand.family == "flyauto":
+
+            def _flyauto(o=out, comm=flyauto):
+                comm.fly_all_reduce(x, out=o)
+                return o
+
+            thunks[cand.key] = _flyauto
         else:
 
             def _rccl(o=out):
@@ -919,6 +953,7 @@ def _bench_shape(
     qr_comm,
     fly,
     fly1s,
+    flyauto,
     keys,
     prod_regime,
 ):
@@ -935,6 +970,7 @@ def _bench_shape(
         and not (c.family == "qr" and qr_comm is None)
         and not (c.family == "fly" and c.fly_cfg not in fly)
         and not (c.family == "fly1s" and c.fly1s_cfg not in fly1s)
+        and not (c.family == "flyauto" and flyauto is None)
     ]
     thunks, buffers = _build_thunks(
         cands,
@@ -942,6 +978,7 @@ def _bench_shape(
         qr_comm=qr_comm,
         fly=fly,
         fly1s=fly1s,
+        flyauto=flyauto,
         group=group,
         x=x,
     )
@@ -999,7 +1036,7 @@ def _bench_shape(
         # Resolved after the run, not before: for a ladder-driven engine the
         # variant is a function of the payload, and asking the engine is the
         # only way to learn which rung this size took.
-        ret[f"{cand.key}_variant"] = _variant_of(cand, fly, fly1s, nbytes)
+        ret[f"{cand.key}_variant"] = _variant_of(cand, fly, fly1s, flyauto, nbytes)
 
     if profile:
         dist.barrier(group=group)
@@ -1147,16 +1184,58 @@ def _worker(
             fly1s[cfg].compile(warm, torch.empty_like(warm))
         del warm
 
+    # Production dispatch, built last so its three internal engines exchange
+    # handles after every pinned one -- the exchange is a collective and the
+    # order has to match across ranks. It self-disables unless AITER_FLY_AR is
+    # set, which main() does when this row is in the sweep.
+    flyauto = None
+    if (
+        any(c.family == "flyauto" and c.key in keys for c in CANDIDATES)
+        and HAS_FLY_INT4
+        and get_gfx() in _FLY_ARCHS
+        and tp_size in _FLY_WORLDS
+        and dtype == dtypes.bf16
+    ):
+        dist.barrier(group=group)
+        comm = FlyDSLAllReduce(group=tp_group.cpu_group, device=device)
+        if comm.disabled:
+            logger.warning(
+                "rank %d: fly_auto requested but FlyDSLAllReduce disabled "
+                "itself; its column will be absent",
+                rank,
+            )
+        else:
+            flyauto = comm
+            # One warm call per reachable family, so nothing JITs inside a
+            # timed region. A family is only compiled by a payload that reaches
+            # it, so the probes are sited just inside each window: at the
+            # one-shot ceiling, one token above it, and one token above the
+            # mesh ceiling.
+            tok = DSV4_HIDDEN * 2
+            probes = {
+                "oneshot": max(1, flyauto.policy.oneshot_max // tok),
+                "mesh": max(1, flyauto.policy.oneshot_max // tok + 1),
+                "ring": max(1, flyauto.policy.mesh_max // tok + 1),
+            }
+            for family, m in probes.items():
+                if flyauto.family_for(m * tok) != family:
+                    continue  # window too narrow to site a probe in
+                t = torch.zeros((m, DSV4_HIDDEN), dtype=dtypes.bf16, device=device)
+                dist.barrier(group=group)
+                flyauto.fly_all_reduce(t, out=torch.empty_like(t))
+                del t
+
     # Every fly candidate is a distinct engine with a distinct IPC inbox, and
     # they are all live at once for the whole sweep. A wide tuning sweep is
     # therefore holding a fixed cost on the device before a single payload is
     # allocated -- and the inbox scales with ST * grid, so the ring's high rungs
     # dominate it. Report it here, where it is attributable to the candidate
     # list, rather than letting it surface as an OOM on the largest shape.
-    if fly or fly1s:
+    if fly or fly1s or flyauto:
         per_engine = sorted(
             [(f"fly{cfg}", eng.inbox_bytes) for cfg, eng in fly.items()]
-            + [(f"fly1s{cfg}", eng.inbox_bytes) for cfg, eng in fly1s.items()],
+            + [(f"fly1s{cfg}", eng.inbox_bytes) for cfg, eng in fly1s.items()]
+            + ([("fly_auto", flyauto.inbox_bytes)] if flyauto else []),
             key=lambda kv: -kv[1],
         )
         total = sum(b for _, b in per_engine)
@@ -1184,6 +1263,7 @@ def _worker(
                 qr_comm=qr_comm,
                 fly=fly,
                 fly1s=fly1s,
+                flyauto=flyauto,
                 keys=keys,
                 prod_regime=prod_regime,
             )
@@ -1192,6 +1272,8 @@ def _worker(
     finally:
         for eng in fly.values():
             eng.close()
+        if flyauto is not None:
+            flyauto.close()
         if dist.is_initialized():
             destroy_model_parallel()
             destroy_distributed_environment()
@@ -1816,8 +1898,7 @@ def roofline_table(df, keys, measured):
 
 
 def _fly_floor_note(world_sizes) -> str:
-    """``QRInt4.allreduce``'s own size floor per (schedule, world size).
-    """
+    """``QRInt4.allreduce``'s own size floor per (schedule, world size)."""
     if not HAS_FLY_INT4:
         return "n/a"
     parts = []
@@ -2153,6 +2234,11 @@ def main():
             logger.info("TransferBench: using %s", roofline_bin)
     # Remember what the deployment would do before overriding the environment
     # for our own QR candidates; `prod path` is reported against this value.
+    if any(c.family == "flyauto" for c in CANDIDATES if c.key in keys):
+        # FlyDSLAllReduce is opt-in; set it before the ranks are spawned so the
+        # children inherit it. Unlike _QR_ENV this does not change `prod path`,
+        # which reports the custom-AR/quick-reduce dispatch only.
+        os.environ[_FLY_ENV] = "1"
     prod_regime = os.environ.get(_QR_ENV)
     if any(c.family == "qr" for c in CANDIDATES if c.key in keys):
         os.environ[_QR_ENV] = _QR_ENABLING_REGIME

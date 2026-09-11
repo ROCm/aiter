@@ -4,13 +4,7 @@
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 """Structural checks on the FlyDSL all-reduce dispatch tables.
 
-No GPU, no flydsl, no IPC rendezvous -- ``qr_ar_policy`` is deliberately pure
-data plus arithmetic so that the properties the dispatch *depends* on can be
-checked in a plain unit test. What it cannot check is whether the numbers are
-right; that is what the sweep and ``fit_allreduce_policy.py`` are for. What it
-can check is that the table is a well-formed partition, that the ladders line up
-with the windows they serve, and that the environment overrides do what they
-say -- all of which are ways the table could be silently broken by an edit.
+No GPU required.
 
 Run with ``pytest op_tests/flydsl_tests/test_flydsl_ar_policy.py``.
 """
@@ -91,8 +85,13 @@ def test_xgmi_never_selects_the_ring():
 
 @pytest.mark.parametrize("ws", WORLDS)
 def test_pick_family_is_monotone(ws):
-    """Family choice must never go backwards as the payload grows."""
-    p = P.resolve("pcie", ws, mode="exact")
+    """Family choice must never go backwards as the payload grows.
+
+    Three families only ever coexist in ``"fast"`` mode -- ``"exact"`` is
+    single-family by design (see ``test_exact_mode_is_oneshot_only``), so that
+    is the mode this checks the three-way monotonicity in.
+    """
+    p = P.resolve("pcie", ws, mode="fast")
     order = {"oneshot": 0, "mesh": 1, "ring": 2}
     seen = [order[P.pick_family(n, p)] for n in (1 << k for k in range(4, 31))]
     assert seen == sorted(seen)
@@ -137,7 +136,10 @@ def test_ladder_rungs_fall_inside_their_dispatch_window(ws):
     sweep, the TP8 one-shot ladder wanted a second rung at 192 KiB, four times
     above anything that schedule is dispatched at.
     """
-    p = P.resolve("pcie", ws, mode="exact")
+    # "fast" mode: exact mode has no mesh/ring window at all (mesh_max ==
+    # oneshot_max there by design), which would make every mesh rung above the
+    # smallest look like it fails this check for the wrong reason.
+    p = P.resolve("pcie", ws, mode="fast")
     for _floor, *_ in oneshot_ladder(ws)[1:]:
         assert _floor < p.oneshot_max, ("oneshot", ws, _floor)
     for floor, *_ in MESH_ST_LADDER[ws][1:]:
@@ -161,28 +163,58 @@ def test_accuracy_mode_env():
         assert P.accuracy_mode() == P.DEFAULT_ACCURACY
 
 
-def test_accuracy_mode_changes_only_the_oneshot_boundary():
+def test_exact_mode_is_oneshot_only():
+    """``"exact"`` is not just a wider one-shot boundary -- it is a different
+    policy shape. Above ``oneshot_max_exact`` there is no mesh/ring window at
+    all: ``mesh_max`` and ``max_bytes`` collapse onto ``oneshot_max``, so
+    ``should_fly_all_reduce`` declines any larger payload instead of routing
+    it to a quantized schedule. A caller who never touches
+    ``AITER_FLY_AR_ACCURACY`` gets bit-exact FlyDSL or no FlyDSL, never
+    quantized FlyDSL.
+    """
+    for link in P.LINKS:
+        for ws in WORLDS:
+            exact = P.resolve(link, ws, mode="exact")
+            assert exact.mesh_max == exact.oneshot_max
+            assert exact.max_bytes == exact.oneshot_max
+            assert P.families_reachable(exact) == ("oneshot",)
+            # oneshot_max itself is still the *wider* (oneshot_max_exact)
+            # boundary, same as before this policy shape existed.
+            fast = P.resolve(link, ws, mode="fast")
+            assert exact.oneshot_max >= fast.oneshot_max
+
+
+def test_fast_mode_still_prefers_exactness_where_free():
+    """``"fast"`` keeps the original two-boundary shape: one-shot up to
+    ``oneshot_max``, mesh/ring beyond it -- unaffected by ``"exact"`` existing
+    as a separate, stricter policy."""
     for ws in WORLDS:
-        fast = P.resolve("pcie", ws, mode="fast")
-        exact = P.resolve("pcie", ws, mode="exact")
-        assert exact.oneshot_max >= fast.oneshot_max
-        assert exact.mesh_max == fast.mesh_max
+        p = P.resolve("pcie", ws, mode="fast")
+        assert p.mesh_max > p.oneshot_max
+        assert p.max_bytes > p.mesh_max
 
 
-def test_enable_flag_is_tristate():
+def test_enable_flag_is_opt_in_only():
     with _env(AITER_FLY_AR="1"):
         assert P.enabled() is True
     with _env(AITER_FLY_AR="0"):
         assert P.enabled() is False
     with _env(AITER_FLY_AR=""):
-        assert P.enabled() is None
+        assert P.enabled() is False
+    with _env(AITER_FLY_AR="true"):
+        assert P.enabled() is False
 
 
 def test_byte_overrides():
+    # ONESHOT_MAX_VAR applies in both modes -- exact mode's default here is
+    # oneshot_max_exact (48 KiB for TP8/pcie), so leaving mode unset still
+    # exercises the override against a real baseline.
     with _env(AITER_FLY_AR_ONESHOT_MAX_BYTES="65536"):
         assert P.resolve("pcie", 8).oneshot_max == 65536
+    # MESH_MAX_VAR only has an effect in "fast" mode -- see
+    # test_exact_mode_ignores_mesh_max_override for the exact-mode case.
     with _env(AITER_FLY_AR_MESH_MAX_BYTES="1048576"):
-        assert P.resolve("pcie", 4).mesh_max == 1048576
+        assert P.resolve("pcie", 4, mode="fast").mesh_max == 1048576
     # -1 is the house sentinel for "unset, use the table".
     with _env(AITER_FLY_AR_ONESHOT_MAX_BYTES="-1"):
         assert P.resolve("pcie", 8).oneshot_max == (48 << 10)
@@ -191,11 +223,26 @@ def test_byte_overrides():
         assert P.resolve("pcie", 8).oneshot_max == (48 << 10)
 
 
+def test_exact_mode_ignores_mesh_max_override():
+    """Honouring ``AITER_FLY_AR_MESH_MAX_BYTES`` in exact mode would reopen the
+    mesh/ring window ``"exact"`` exists to close, so it is ignored there (with
+    a warning) rather than applied."""
+    with _env(AITER_FLY_AR_MESH_MAX_BYTES="1048576"):
+        p = P.resolve("pcie", 4, mode="exact")
+        assert p.mesh_max == p.oneshot_max
+        assert p.mesh_max != 1048576
+
+
 def test_override_cannot_invert_the_partition():
-    """Pushing the one-shot ceiling above the ring floor means "give me the
-    one-shot up to here", not "crash" -- the mesh window closes instead."""
+    """Pushing the one-shot ceiling above the mesh floor means "give me the
+    one-shot up to here", not "crash" -- the mesh window closes instead.
+
+    "fast" mode: exact mode already has no independent mesh window to invert
+    (mesh_max tracks oneshot_max unconditionally there), so this property is
+    only meaningful where the two boundaries are otherwise independent.
+    """
     with _env(AITER_FLY_AR_ONESHOT_MAX_BYTES=str(64 << 20)):
-        p = P.resolve("pcie", 4)
+        p = P.resolve("pcie", 4, mode="fast")
         assert p.mesh_max >= p.oneshot_max
         assert P.pick_family(1 << 20, p) == "oneshot"
 
