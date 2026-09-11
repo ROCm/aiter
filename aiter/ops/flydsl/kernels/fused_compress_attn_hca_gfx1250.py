@@ -57,9 +57,7 @@ _NEG_INF = float("-inf")
 _LOG2E = math.log2(math.e)
 
 
-# ============================================================================
-# Kernel A: compress_forward with multi-wave LDS K-split
-# ============================================================================
+# Kernel A: compress_forward with multi-wave LDS K-split.
 
 
 def _build_compress_forward_kernel(
@@ -232,7 +230,6 @@ def _build_compress_forward_kernel(
         wid = fx.Int32((fx.Uint32(tid) // BLOCK_THREADS).ir_value())  # -> [0, NW)
         lid = fx.Int32((fx.Uint32(tid) % BLOCK_THREADS).ir_value())  # -> [0, 32)
 
-        # -- Load plan row ----------------------------------------------
         plan_rsrc = buffer_ops.create_buffer_resource(plan, max_size=True)
         plan_vec = fx.Vector(
             buffer_ops.buffer_load(plan_rsrc, fx.Int32(pid) * 4, vec_width=4, dtype=i32)
@@ -440,7 +437,6 @@ def _build_compress_forward_kernel(
                     new_m.append(m_new)
                 return new_m, new_kv, new_w
 
-            # -- Wave's K range: [wid * K_PER_WAVE, (wid+1) * K_PER_WAVE) --
             k_start_i32 = wid * K_PER_WAVE
             k_end_i32 = k_start_i32 + K_PER_WAVE
 
@@ -453,7 +449,6 @@ def _build_compress_forward_kernel(
             # ``split`` = clamp(wl, k_start, k_end) gives the boundary;
             # both sub-loops are empty when their bound collapses, so any
             # of the three cases naturally falls out.
-            # split = clamp(window_len, k_start, k_end) -> signed int max/min.
             split_i32 = fx.min(fx.max(window_len, k_start_i32), k_end_i32)
 
             # State is 3*VEC scalars: m_lane[VEC] + kv_lane[VEC] + w_lane[VEC].
@@ -817,9 +812,8 @@ def _build_compress_forward_kernel(
     return launch_hca_compress_forward
 
 
-# ============================================================================
-# Kernel B: norm + rope + scatter (BF16, per-row)
-# ============================================================================
+# norm + rope + scatter: the emitter is shared between Kernel A's fused epilogue
+# and the standalone Kernel B kept for the unfused (HCA_FUSE=0) path.
 
 
 class _NormRopeScatterCfg(NamedTuple):
@@ -1348,9 +1342,7 @@ def _build_norm_rope_scatter_kernel(
     return launch_hca_norm_rope_scatter
 
 
-# ============================================================================
-# Cached compile + public API
-# ============================================================================
+# Cached compile + public API.
 
 
 # Fusing the epilogue into Kernel A removes a whole kernel launch and lets the
