@@ -350,7 +350,7 @@ def gemm_a16w16_(
         )
 
         return y
-     
+
     if backend == "gluon":
         assert (
             _is_gluon_available()
@@ -370,7 +370,6 @@ def gemm_a16w16_(
             w.shape,
             kernel_type,
         )
-       
 
         M, K = x.shape
         N, _ = w.shape
