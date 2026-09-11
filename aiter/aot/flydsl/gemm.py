@@ -32,7 +32,7 @@ Environment variables:
     GPU_ARCHS                 Arch list. Packaging resolves it with CU_NUM into
                               exact targets; the CLI keeps every job of that arch.
     CU_NUM                    Compute-unit count paired with GPU_ARCHS.
-    ARCH                      Legacy bare-arch filter.
+    ARCH                      Bare-arch filter on the CLI; packaging ignores it.
 """
 
 from __future__ import annotations
@@ -741,9 +741,16 @@ def _archs_from_env(value: str) -> set[str]:
     return archs
 
 
-def active_target_env() -> tuple[str, str] | None:
-    """The env var driving target selection, and its value."""
-    for var_name in ("AITER_GPU_TARGETS", "ARCH", "GPU_ARCHS"):
+def active_target_env(*, cli: bool = True) -> tuple[str, str] | None:
+    """The env var driving target selection, and its value.
+
+    ARCH is part of main()'s existing filter and is left there; the packaging
+    path reads only the two variables this filter introduces.
+    """
+    names = ["AITER_GPU_TARGETS", "GPU_ARCHS"]
+    if cli:
+        names.insert(1, "ARCH")
+    for var_name in names:
         value = (os.environ.get(var_name) or "").strip()
         if value:
             return var_name, value
@@ -763,10 +770,10 @@ def filter_jobs_for_build_targets(
 ) -> list[dict]:
     """Select the jobs to bake for the configured targets.
 
-    arch_wide selects on arch alone and ignores CU_NUM; otherwise GPU_ARCHS and
-    CU_NUM resolve to exact (gfx, cu_num) pairs.
+    arch_wide is main()'s selection: on arch alone, ignoring CU_NUM. Otherwise
+    GPU_ARCHS and CU_NUM resolve to exact (gfx, cu_num) pairs.
     """
-    active = active_target_env()
+    active = active_target_env(cli=arch_wide)
     if active is None:
         return jobs
     var_name, value = active
@@ -774,8 +781,8 @@ def filter_jobs_for_build_targets(
         # Not get_build_targets_env: it folds GPU_ARCHS in, and the two are
         # separate contracts here.
         selected, missing = _select_for_targets(jobs, _parse_gpu_targets_env())
-    elif arch_wide or var_name == "ARCH":
-        # ARCH names a bare arch and carries no CU count.
+    elif arch_wide:
+        # ARCH and a bare GPU_ARCHS name an arch and carry no CU count.
         try:
             archs = _archs_from_env(value)
         except ValueError as e:

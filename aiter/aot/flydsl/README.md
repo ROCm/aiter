@@ -87,9 +87,10 @@ python -m aiter.aot.flydsl.chunk_gdn_h --csv /path/to/tuned.csv
 > `FLYDSL_GPU_ARCH` in the shell does not change what gets built.
 
 `AITER_GPU_TARGETS=gfx950:128` is the exact `(gfx, cu_num)` form on both
-paths. `ARCH` always selects every GEMM job of that arch. `GPU_ARCHS` does
-that on the CLI (`CU_NUM` is ignored); packaging (`setup.py`) pairs it with
-`CU_NUM` into exact SKU pairs instead.
+paths. The other two differ by path. Running `python -m aiter.aot.flydsl.gemm`
+directly, `ARCH` selects every GEMM job of that arch and `GPU_ARCHS` does the
+same (`CU_NUM` is ignored); packaging (`setup.py`) reads no `ARCH` and pairs
+`GPU_ARCHS` with `CU_NUM` into exact SKU pairs instead.
 
 Example:
 
