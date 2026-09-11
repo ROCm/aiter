@@ -7,11 +7,13 @@ aiter-op-test skill keeps importable for exactly this kind of combination
 testing) and runs each over its own shape axes.
 
 Output discipline: combo-owned summaries and AITER child-UT summaries are
-printed as record-oriented JSON. Child JSON is validated and forwarded without
-parsing human-readable tables. MORI EP keeps its external tool output. All the
-underlying noise (per-config "calling ..." logs, JIT build output, aiter import
-banners, pandas/torch/ROCTracer warnings, including C-level fd writes) is
-silenced via os-level fd redirection while the kernels run.
+printed as human-readable tables by default. Pass ``--json`` to print
+record-oriented JSON instead. Child JSON remains the validated transport format
+between subprocess UTs and this driver; the driver renders it in the selected
+output format. MORI EP keeps its external tool output. All the underlying noise
+(per-config "calling ..." logs, JIT build output, aiter import banners,
+pandas/torch/ROCTracer warnings, including C-level fd writes) is silenced via
+os-level fd redirection while the kernels run.
 
 Run from the aiter repo root so `op_tests/` siblings import cleanly:
 
@@ -23,6 +25,7 @@ Run from the aiter repo root so `op_tests/` siblings import cleanly:
     python op_tests/bench_gfx1250_combo.py --perf --ops gemm      # F4GEMM
     python op_tests/bench_gfx1250_combo.py --perf --ops f8gemm    # F8GEMM
     python op_tests/bench_gfx1250_combo.py --perf --ops mla_v4_decode  # MLA v4 decode
+    python op_tests/bench_gfx1250_combo.py --perf --json          # machine-readable output
 
     # DeepSeek-V4 operators at the model shapes used by the DSv4 workload.
     python op_tests/bench_gfx1250_combo.py --dsv4                 # all DSv4 ops
@@ -297,6 +300,7 @@ def _silence():
 
 # Import aiter + the op-test modules quietly (import-time banners suppressed).
 with _silence():
+    import pandas as pd
     import test_f4gemm as gemm_mod
     import test_flydsl_grouped_gemm as moe_mod
     import test_fmha_fwd_with_sink_asm as mha_mod  # has __main__ guard
@@ -321,6 +325,7 @@ with _silence():
 
 SUPPORTED_GFX = ["gfx1250"]
 _SMI_ROWS = []
+_JSON_OUTPUT = False
 
 
 @contextlib.contextmanager
@@ -717,8 +722,31 @@ def _collect_smi_rows(lines):
 
 
 def _print_table(name, rows, keep=None):
-    """Print one named DataFrame as a JSON object with record-oriented rows."""
-    print_json_table(name, rows, keep=keep)
+    """Print one named result table in the requested presentation format."""
+    if _JSON_OUTPUT:
+        print_json_table(name, rows, keep=keep)
+        return
+
+    if isinstance(rows, pd.DataFrame):
+        df = rows.copy()
+    else:
+        df = pd.DataFrame([row for row in rows if row is not None])
+    if not df.empty:
+        df = df.replace("", pd.NA).dropna(axis=1, how="all")
+        if keep is not None:
+            columns = [column for column in keep if column in df.columns]
+            columns += [
+                column
+                for column in df.columns
+                if "err_msg" in column and column not in columns
+            ]
+            df = df[columns]
+
+    print(f"\n===== {name} =====", flush=True)
+    if df.empty:
+        print("(no rows)", flush=True)
+    else:
+        print(df.to_string(index=False, max_colwidth=None), flush=True)
 
 
 # Compiler / logger / IR-dump chatter the child UTs interleave with results.
@@ -974,7 +1002,9 @@ def _run_child(
     results = extract(lines)
     kernel_rows = _kernel_digest(lines) if kernels else []
     if structured:
-        print("\n".join(results), flush=True)
+        for result in results:
+            table = json.loads(result)
+            _print_table(table["name"], table["rows"])
         if kernel_rows:
             _print_table(f"{name} kernels", kernel_rows)
         if proc.returncode != 0 or not results:
@@ -1977,6 +2007,8 @@ DSV4_OPS = [
 
 
 def main():
+    global _JSON_OUTPUT
+
     if get_gfx() not in SUPPORTED_GFX:
         print(
             f"combo bench targets {SUPPORTED_GFX} only; current {get_gfx()} — skipping"
@@ -2036,6 +2068,11 @@ def main():
         help="RNG seed forwarded to supported ops (default: 0)",
     )
     p.add_argument(
+        "--json",
+        action="store_true",
+        help="print record-oriented JSON instead of human-readable tables",
+    )
+    p.add_argument(
         "--smi-monitor",
         action="store_true",
         help=(
@@ -2093,6 +2130,7 @@ def main():
         help="mla_v4_kargpreld warmup iterations (default: 2)",
     )
     args = p.parse_args()
+    _JSON_OUTPUT = args.json
     if args.smi_device < 0:
         p.error("--smi-device must be non-negative")
     if args.smi_interval <= 0:
