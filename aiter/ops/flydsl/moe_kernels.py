@@ -3003,7 +3003,6 @@ def _get_compiled_token_multidest_quant(
     wmma_rep: int,
     topk: int,
     quant_mode: str,
-    row_major_scale: bool = False,
     tdm_hidden_chunks: int = 4,
     ksplit: int = 1,
 ):
@@ -3016,7 +3015,6 @@ def _get_compiled_token_multidest_quant(
         wmma_rep=wmma_rep,
         topk=topk,
         quant_mode=quant_mode,
-        row_major_scale=row_major_scale,
         tdm_hidden_chunks=tdm_hidden_chunks,
         ksplit=ksplit,
     )
@@ -3069,10 +3067,6 @@ def flydsl_moe_fused_quant_preshuffle(
     # ``quant_mode``: the sender already quantized, so the kernel only scatters
     # + preshuffles.
     prequantized_scale: torch.Tensor | None = None,
-    # When True, write the e8m0 scale as (row, feat_dim//32) instead of the
-    # 16-row-interleaved WMMA form. The consuming GEMM must be built with
-    # row_major_ascale so it does the interleave on its LDS->register read.
-    row_major_scale: bool = False,
 ):
     """Fused grouped quant + e8m0 scale-preshuffle in one kernel pass.
 
@@ -3175,11 +3169,6 @@ def flydsl_moe_fused_quant_preshuffle(
             and os.environ.get("AITER_FLYDSL_TOKEN_MULTIDEST_QUANT", "1")
             in ("1", "true", "True")
         )
-        if row_major_scale and not use_token_multidest:
-            raise ValueError(
-                "row_major_scale is only implemented on the token-multidest "
-                "quant path"
-            )
         if use_token_multidest:
             from aiter.ops.flydsl.kernels.moe_fused_route_quant_scatter import (
                 token_multidest_ksplit,
@@ -3194,7 +3183,6 @@ def flydsl_moe_fused_quant_preshuffle(
                 wmma_rep=wmma_rep,
                 topk=int(source_topk),
                 quant_mode=quant_mode,
-                row_major_scale=bool(row_major_scale),
                 tdm_hidden_chunks=token_multidest_tdm_chunks(
                     feat_dim, wmma_rep, quant_mode, md_ksplit
                 ),
