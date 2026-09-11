@@ -245,6 +245,11 @@ import os
 # an explicitly-exported ENABLE_CK from the caller is respected.
 os.environ.setdefault("ENABLE_CK", "0")
 
+# Result rows use print()/print_json_table(), so AITER logger messages are not
+# part of the output contract. Keep stdout/stderr clean by default while still
+# allowing an explicit caller setting for debugging.
+os.environ.setdefault("AITER_LOG_LEVEL", "ERROR")
+
 # FlyDSL MoE env vars — must be set before importing aiter / moe test module.
 os.environ.setdefault("AITER_USE_GROUPED_GEMM", "1")
 os.environ.setdefault("AITER_GROUPED_DEBUG", "0")
