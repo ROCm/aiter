@@ -317,7 +317,7 @@ __device__ void reduce_lse_massive(const MlaReduceKernelV1Params& params,
     }
 }
 
-template <typename Traits, typename gmem_partial_t, typename gmem_final_t>
+template <typename Traits, typename gmem_final_t>
 __device__ void reduce_output_massive(const MlaReduceKernelV1Params& params,
                                       const int32_t seq_idx,
                                       const int32_t reduce_tile_start,
@@ -326,7 +326,6 @@ __device__ void reduce_output_massive(const MlaReduceKernelV1Params& params,
                                       const int32_t reduce_partial_map_1,
                                       const int32_t* p_lds_reduce_partial_map,
                                       const float* p_lds_lse_scale,
-                                      gmem_partial_t& g_partial_output,
                                       const int32_t partial_output_seq_byte_offset,
                                       gmem_final_t& g_final_output,
                                       const int32_t final_out_byte_offset_base)
@@ -339,11 +338,14 @@ __device__ void reduce_output_massive(const MlaReduceKernelV1Params& params,
     vec_f32_t reg_out = {0};
 
     auto load_output = [&](const int32_t reduce_partial_map) -> vec_f32_t {
-        const int32_t tile_byte_offset =
-            reduce_partial_map * int32_t(Traits::kNumHeadQ * Traits::kSizeDV * sizeof(float));
+        // readfirstlane: the slot is uniform across the block, but it comes from LDS, so tell
+        // the compiler that and keep the buffer descriptor in SGPRs (no waterfall).
+        const int64_t partial_o_elem = int64_t(__builtin_amdgcn_readfirstlane(reduce_partial_map)) *
+                                       Traits::kNumHeadQ * Traits::kSizeDV;
+        auto g_partial_output = opus::make_gmem<float>(
+            reinterpret_cast<float*>(params.p_partial_output) + partial_o_elem);
         return buf_load_vec<kVecWidth>(g_partial_output,
-                                       partial_output_seq_byte_offset + tile_byte_offset +
-                                           thread_byte_offset);
+                                       partial_output_seq_byte_offset + thread_byte_offset);
     };
 
     auto oaccu_0      = load_output(reduce_partial_map_0);
@@ -460,7 +462,9 @@ __device__ void mla_reduce_v1_impl_massive(const MlaReduceKernelV1Params& params
     __syncthreads();
 
     const int32_t reduce_partial_map_0 = p_lds_reduce_partial_map[0];
-    const int32_t reduce_partial_map_1 = p_lds_reduce_partial_map[1];
+    // slot [1] isn't loaded when num_splits == 1
+    const int32_t reduce_partial_map_1 =
+        (num_splits > 1) ? p_lds_reduce_partial_map[1] : reduce_partial_map_0;
     const MlaPartialTileInfo final_loc = [&]() {
         if(params.use_reduce_final_map)
         {
@@ -485,8 +489,6 @@ __device__ void mla_reduce_v1_impl_massive(const MlaReduceKernelV1Params& params
         head_idx * Traits::kSizeDV * int32_t(sizeof(float));
 
     // Create gmem descriptors from uniform kernel-arg pointers (SGPRs, no waterfall)
-    auto g_partial_output =
-        opus::make_gmem<float>(reinterpret_cast<float*>(params.p_partial_output));
     auto g_final_output = opus::make_gmem<out_t>(reinterpret_cast<out_t*>(params.p_final_output));
     auto g_partial_lse  = opus::make_gmem<float>(reinterpret_cast<float*>(params.p_partial_lse));
     auto g_final_lse    = opus::make_gmem<lse_t>(reinterpret_cast<lse_t*>(params.p_final_lse));
@@ -546,7 +548,6 @@ __device__ void mla_reduce_v1_impl_massive(const MlaReduceKernelV1Params& params
                                       reduce_partial_map_1,
                                       p_lds_reduce_partial_map,
                                       p_lds_lse_scale,
-                                      g_partial_output,
                                       partial_output_seq_byte_offset,
                                       g_final_output,
                                       final_out_byte_offset_base);
@@ -574,7 +575,9 @@ __device__ void mla_reduce_v1_impl_simple(const MlaReduceKernelV1Params& params,
     __syncthreads();
 
     const int32_t reduce_partial_map_0 = p_lds_reduce_partial_map[0];
-    const int32_t reduce_partial_map_1 = p_lds_reduce_partial_map[1];
+    // slot [1] isn't loaded when num_splits == 1
+    const int32_t reduce_partial_map_1 =
+        (num_splits > 1) ? p_lds_reduce_partial_map[1] : reduce_partial_map_0;
     const MlaPartialTileInfo final_loc = [&]() {
         if(params.use_reduce_final_map)
         {
@@ -599,11 +602,22 @@ __device__ void mla_reduce_v1_impl_simple(const MlaReduceKernelV1Params& params,
         head_idx * Traits::kSizeDV * int32_t(sizeof(float));
 
     // Create gmem descriptors from uniform kernel-arg pointers (SGPRs, no waterfall)
-    auto g_partial_output =
-        opus::make_gmem<float>(reinterpret_cast<float*>(params.p_partial_output));
     auto g_final_output = opus::make_gmem<out_t>(reinterpret_cast<out_t*>(params.p_final_output));
     auto g_partial_lse  = opus::make_gmem<float>(reinterpret_cast<float*>(params.p_partial_lse));
     auto g_final_lse    = opus::make_gmem<lse_t>(reinterpret_cast<lse_t*>(params.p_final_lse));
+
+    // The partial-slot output offset (slot * kNumHeadQ * kSizeDV * 4) can exceed 2^31, but the
+    // raw_buffer_load voffset is 32-bit. Fold it into the 64-bit base pointer per slot and keep
+    // only the small per-seq/per-thread offset in the voffset. The LSE offset stays 32-bit: it
+    // is kSizeDV times smaller, so wrapping it would need a partial pool larger than HBM.
+    // readfirstlane: the slot is uniform across the block, but it comes from LDS, so tell the
+    // compiler that and keep the buffer descriptor in SGPRs (no waterfall).
+    auto make_partial_output = [&](const int32_t slot) {
+        const int64_t elem =
+            int64_t(__builtin_amdgcn_readfirstlane(slot)) * Traits::kNumHeadQ * Traits::kSizeDV;
+        return opus::make_gmem<float>(reinterpret_cast<float*>(params.p_partial_output) + elem);
+    };
+    auto g_partial_output_0 = make_partial_output(reduce_partial_map_0);
     const int32_t final_out_byte_offset_base =
         head_idx * params.stride_h_o * int32_t(sizeof(out_t));
 
@@ -622,32 +636,25 @@ __device__ void mla_reduce_v1_impl_simple(const MlaReduceKernelV1Params& params,
             partial_output_head_byte_offset +
             local_seqlen_idx * Traits::kNumHeadQ * Traits::kSizeDV * int32_t(sizeof(float));
 
-        const int32_t reduce_tile_pos_lse_start = reduce_partial_map_0 * int32_t(Traits::kNumHeadQ);
-        const int32_t reduce_tile_pos_out_byte_start =
-            reduce_tile_pos_lse_start * Traits::kSizeDV * int32_t(sizeof(float));
-
         vec_f32_t reg_out = buf_load_vec<kVecWidth>(
-            g_partial_output,
-            partial_output_seq_byte_offset + reduce_tile_pos_out_byte_start + thread_byte_offset);
+            g_partial_output_0, partial_output_seq_byte_offset + thread_byte_offset);
 
         const float lse = g_partial_lse.template _load<1>(
-            partial_lse_seq_byte_offset + reduce_tile_pos_lse_start * int32_t(sizeof(float)))[0];
+            partial_lse_seq_byte_offset +
+            reduce_partial_map_0 * int32_t(Traits::kNumHeadQ * sizeof(float)))[0];
         float max_lse   = lse;
         float sum_e_lse = 1.0f;
 
         for(int32_t ti = reduce_tile_start + 1; ti < reduce_tile_end; ++ti)
         {
-            const int32_t reduce_tile_pos_lse =
-                p_lds_reduce_partial_map[ti - reduce_tile_start] * int32_t(Traits::kNumHeadQ);
-            const int32_t reduce_tile_pos_out_bytes =
-                reduce_tile_pos_lse * Traits::kSizeDV * int32_t(sizeof(float));
+            const int32_t slot       = p_lds_reduce_partial_map[ti - reduce_tile_start];
+            auto g_partial_output_ti = make_partial_output(slot);
 
             vec_f32_t oaccu = buf_load_vec<kVecWidth>(
-                g_partial_output,
-                partial_output_seq_byte_offset + reduce_tile_pos_out_bytes + thread_byte_offset);
+                g_partial_output_ti, partial_output_seq_byte_offset + thread_byte_offset);
 
             const float lse_val = g_partial_lse.template _load<1>(
-                partial_lse_seq_byte_offset + reduce_tile_pos_lse * int32_t(sizeof(float)))[0];
+                partial_lse_seq_byte_offset + slot * int32_t(Traits::kNumHeadQ * sizeof(float)))[0];
             const float new_max_lse = opus::max(max_lse, lse_val);
             const float old_scale   = expf(max_lse - new_max_lse);
             const float new_scale   = expf(lse_val - new_max_lse);
@@ -762,9 +769,11 @@ __launch_bounds__(Traits::kNumThreads, Traits::kOccupancy) __global__
                                                   p_lds);
             }
         }
-        // In theory, we can handle the case that #split = 1. However, it is meaningless and
-        // metadata should be in charge of getting rid of this kind of scenario.
-        else if(num_splits > 1)
+        // The -1 sentinel is only produced by the v1_0 decode metadata, where a single-split
+        // tile has no partial to reduce. On the PS path no -1 is written, so this reduces to
+        // num_splits >= 1 and every tile (including unsplit ones) gets a correct final_lse.
+        else if(num_splits > 1 ||
+                (num_splits == 1 && params.p_reduce_partial_map[reduce_tile_start] != -1))
         {
             mla_reduce_v1_impl_simple<Traits, lse_t, out_t>(
                 params, head_idx, block_idx, tile_idx, reduce_tile_start, reduce_tile_end, p_lds);
@@ -860,9 +869,11 @@ __launch_bounds__(Traits::kNumThreads, Traits::kOccupancy) __global__
                 p_lds);
         }
     }
-    // In theory, we can handle the case that #split = 1. However, it is meaningless and metadata
-    // should be in charge of getting rid of this kind of scenario.
-    else if(num_splits > 1)
+    // The -1 sentinel is only produced by the v1_0 decode metadata, where a single-split
+    // tile has no partial to reduce. On the PS path no -1 is written, so this reduces to
+    // num_splits >= 1 and every tile (including unsplit ones) gets a correct final_lse.
+    else if(num_splits > 1 ||
+            (num_splits == 1 && params.p_reduce_partial_map[reduce_tile_start] != -1))
     {
         mla_reduce_v1_impl_simple<Traits, lse_t, out_t>(
             params, head_idx, block_idx, tile_idx, reduce_tile_start, reduce_tile_end, p_lds);
@@ -994,13 +1005,18 @@ __global__ void kn_mla_reduce_v1_d64(const MlaReduceKernelV1Params params)
     const int32_t reduce_tile_start = params.p_reduce_indptr[tile_idx];
     const int32_t reduce_tile_end   = params.p_reduce_indptr[tile_idx + 1];
     const int32_t num_splits        = reduce_tile_end - reduce_tile_start;
-    if(num_splits <= 1)
+    // A single-split tile still needs reducing when it carries a real partial slot; see the
+    // matching guard in kn_mla_reduce_v1.
+    if(num_splits < 1 || (num_splits == 1 && params.p_reduce_partial_map[reduce_tile_start] == -1))
     {
         return;
     }
 
     const int32_t reduce_partial_map_0 = params.p_reduce_partial_map[reduce_tile_start];
-    const int32_t reduce_partial_map_1 = params.p_reduce_partial_map[reduce_tile_start + 1];
+    // slot [1] isn't valid when num_splits == 1
+    const int32_t reduce_partial_map_1 = (num_splits > 1)
+                                             ? params.p_reduce_partial_map[reduce_tile_start + 1]
+                                             : reduce_partial_map_0;
     const MlaPartialTileInfo final_loc = [&]() {
         if(params.use_reduce_final_map)
         {
@@ -1022,21 +1038,21 @@ __global__ void kn_mla_reduce_v1_d64(const MlaReduceKernelV1Params params)
     {
         const int32_t local_seqlen_idx = seq_idx - final_loc.q_start;
 
+        auto lse_offset_of = [&](const int32_t partial_idx) -> int64_t {
+            return int64_t(local_seqlen_idx + partial_idx) * Traits::kNumHeadQ + head_idx;
+        };
+
         float max_lse = -INFINITY;
         for(int32_t ti = reduce_tile_start; ti < reduce_tile_end; ++ti)
         {
-            const int32_t partial_idx = params.p_reduce_partial_map[ti];
-            const int32_t lse_offset =
-                (local_seqlen_idx + partial_idx) * Traits::kNumHeadQ + head_idx;
-            max_lse = opus::max(max_lse, partial_lse[lse_offset]);
+            const int64_t lse_offset = lse_offset_of(params.p_reduce_partial_map[ti]);
+            max_lse                  = opus::max(max_lse, partial_lse[lse_offset]);
         }
 
         float sum_e_lse = 0.f;
         for(int32_t ti = reduce_tile_start; ti < reduce_tile_end; ++ti)
         {
-            const int32_t partial_idx = params.p_reduce_partial_map[ti];
-            const int32_t lse_offset =
-                (local_seqlen_idx + partial_idx) * Traits::kNumHeadQ + head_idx;
+            const int64_t lse_offset = lse_offset_of(params.p_reduce_partial_map[ti]);
             sum_e_lse += expf(partial_lse[lse_offset] - max_lse);
         }
 
@@ -1047,23 +1063,19 @@ __global__ void kn_mla_reduce_v1_d64(const MlaReduceKernelV1Params params)
         float acc = 0.f;
         for(int32_t ti = reduce_tile_start; ti < reduce_tile_end; ++ti)
         {
-            const int32_t partial_idx = params.p_reduce_partial_map[ti];
-            const int32_t lse_offset =
-                (local_seqlen_idx + partial_idx) * Traits::kNumHeadQ + head_idx;
-            const float scale = expf(partial_lse[lse_offset] - global_lse);
-            const int32_t out_offset =
-                ((local_seqlen_idx + partial_idx) * Traits::kNumHeadQ + head_idx) * kHeadDim +
-                dim_idx;
+            const int64_t lse_offset = lse_offset_of(params.p_reduce_partial_map[ti]);
+            const float scale        = expf(partial_lse[lse_offset] - global_lse);
+            const int64_t out_offset = lse_offset * kHeadDim + dim_idx;
             acc += scale * partial_output[out_offset];
         }
 
-        const int32_t final_out_offset =
-            seq_idx * params.stride_s_o + head_idx * params.stride_h_o + dim_idx;
+        const int64_t final_out_offset =
+            int64_t(seq_idx) * params.stride_s_o + head_idx * params.stride_h_o + dim_idx;
         final_output[final_out_offset] = opus::cast<out_t>(acc);
 
         if(params.output_lse && dim_idx == 0)
         {
-            const int32_t final_lse_offset = seq_idx * Traits::kNumHeadQ + head_idx;
+            const int64_t final_lse_offset = int64_t(seq_idx) * Traits::kNumHeadQ + head_idx;
             final_lse[final_lse_offset]    = opus::cast<lse_t>(global_lse);
         }
     }
@@ -1235,6 +1247,27 @@ void mla_reduce_v1(
     const int32_t head_dim              = final_output.size(-1);
     const int32_t num_work_group_per_bh = get_num_work_group_per_bh(
         num_reduce_tile, max_seqlen_q, num_heads, dev_prop.multiProcessorCount);
+
+    // The final output/LSE stores use 32-bit byte offsets from the tensor base, so a span of
+    // 2 GiB or more would silently wrap. Partial-buffer offsets are folded into the 64-bit
+    // descriptor base and are not subject to this limit.
+    constexpr int64_t kMaxSpanBytes = int64_t(1) << 31;
+    const int64_t final_output_span_bytes =
+        ((int64_t(final_output.size(-3)) - 1) * final_output.stride(-3) +
+         (int64_t(final_output.size(-2)) - 1) * final_output.stride(-2) +
+         int64_t(final_output.size(-1))) *
+        int64_t(final_output.element_size());
+    AITER_CHECK(final_output_span_bytes < kMaxSpanBytes,
+                __func__,
+                ": final_output must span less than 2 GiB!");
+    if(output_lse)
+    {
+        const int64_t final_lse_span_bytes =
+            int64_t(final_lse.value().numel()) * int64_t(final_lse.value().element_size());
+        AITER_CHECK(final_lse_span_bytes < kMaxSpanBytes,
+                    __func__,
+                    ": final_lse must span less than 2 GiB!");
+    }
 
     if(num_reduce_tile > 0)
     {
