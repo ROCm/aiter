@@ -6,95 +6,84 @@ import torch
 
 import aiter
 from aiter.jit.utils.chip_info import get_gfx
+from aiter.ops.topk import (
+    topk_mb_workspace_size,
+    topk_ob_workspace_size,
+    topk_use_mulblocks,
+)
 from aiter.test_common import benchmark, run_perftest
 
-# Above this footprint, run_perftest's automatic argument rotation (deep copies
-# of every input, to defeat L2) costs GiBs and buys nothing: a multi-GiB logits
-# tensor already blows past a 4 MB L2 on its first pass.
+# Argument rotation deep-copies every input to defeat L2. Past this the working
+# set already exceeds L2, so pin the rotation to one set instead.
 _ROTATE_MAX_BYTES = 256 << 20
 
-# torch.topk is the correctness reference, but it is also the slowest thing in
-# the sweep: past a couple of G elements a single call runs for seconds. Beyond
-# this the reference is skipped and `all_close` reports "skipped" rather than
-# silently claiming a pass.
-_REF_MAX_ELEMS = 1 << 31
-
-# The reference only needs a stable number, not a tight one.
+# torch.topk costs ~37 ms per G element here (measured, linear in M*N), so the
+# largest swept cell is a few seconds of reference. Past this it is skipped and
+# all_close reports "skipped" rather than a pass it never ran.
+_REF_MAX_ELEMS = 1 << 34
 _REF_ITERS = 5
 
-# Fraction of free HBM one case may claim before it is reported as skipped.
 _MEM_HEADROOM = 0.8
 
-# Peak allocation of create_random_logits, in units of the fp32 logits itself.
-# Budgeting 1x here would clear a cell that then dies allocating its own input,
-# which is the failure the guard exists to prevent.
-#   random    1x  -- one randn
-#   10LSBits  3x  -- randint, the masked temporary, and the or'd result
-#   mixed     4x  -- the above, plus a second randn and the torch.where result
-# Measured at M=64, N=1048576 with torch.cuda.max_memory_allocated: 1.03x,
-# 3.00x, 4.28x (the remainder is the boundary mask, accounted for separately).
+# Peak of create_random_logits in units of the fp32 logits: 10LSBits holds the
+# randint, the masked temporary and the or'd result; mixed adds a second randn
+# and the where() output. Measured 1.00 / 3.00 / 4.28 at M=64, N=1048576.
 _GEN_PEAK_MULTIPLIER = {"random": 1.0, "10LSBits": 3.0, "mixed": 4.3}
 
 
-def _logits_bytes(num_rows: int, width: int, data_generation: str, dense: bool) -> int:
-    """Peak bytes create_random_logits needs for a [num_rows, width] fp32 tensor.
-
-    Staircase rows additionally materialise a [num_rows, width] bool mask to
-    fill each row's tail; equal-length rows have no tail and skip it.
-    """
-    logits = num_rows * width * 4
-    peak = logits * _GEN_PEAK_MULTIPLIER.get(data_generation, 1.0)
-    if not dense:
-        # The broadcast comparison materialises a bool the size of the logits,
-        # over an int32 column index.
-        peak += num_rows * width + width * 4
-    # Row bounds, plus slack for the allocator's block rounding.
-    return int(peak) + num_rows * 8 + (1 << 20)
-
-
 def _rotate_args(nbytes: int) -> int:
-    """0 lets run_perftest size the rotation itself; 1 pins it to a single set."""
     return 1 if nbytes > _ROTATE_MAX_BYTES else 0
 
 
-def _fits_in_memory(nbytes: int, headroom: float) -> bool:
-    """Whether an allocation of nbytes leaves the device some slack.
-
-    The sweep reaches shapes that cannot fit ([16384, 1048576] fp32 alone is
-    64 GiB), and a raw OOM would kill the whole run rather than the one cell.
-    """
+def _fits_in_memory(nbytes: int) -> bool:
+    """Whether the cell's own tensors fit. run_perftest's rotation allocates on
+    top of this -- up to num_iters copies of the input below _ROTATE_MAX_BYTES --
+    but sizes itself to free memory, so it cannot be the thing that OOMs."""
     free, _total = torch.cuda.mem_get_info()
-    return nbytes <= free * headroom
+    return nbytes <= free * _MEM_HEADROOM
 
 
 def _fmt_bytes(nbytes: int) -> str:
-    """GiB loses everything under ~50 MiB, which is most of the CI shapes."""
     if nbytes >= 2**30:
         return f"{nbytes / 2**30:.1f} GiB"
     return f"{nbytes / 2**20:.1f} MiB"
 
 
-def _traffic_bytes(num_rows: int, width: int, top_k: int, write_values: bool) -> int:
-    """Compulsory traffic: every logit read once, every output written once.
+def _logits_bytes(num_rows: int, width: int, data_generation: str, dense: bool) -> int:
+    """Peak bytes create_random_logits needs, including its temporaries.
 
-    The radix kernels make several passes over the logits, so achieved HBM
-    traffic is higher than this. The column is therefore a lower bound, useful
-    for comparing shapes against each other rather than against peak HBM.
+    Budgeting one tensor here would clear a cell that then dies allocating its
+    own input. Staircase rows additionally build a [num_rows, width] bool to
+    mask each row's tail; equal-length rows have no tail and skip it.
     """
-    per_out = 8 if write_values else 4
-    return num_rows * width * 4 + num_rows * top_k * per_out
+    logits = num_rows * width * 4
+    peak = logits * _GEN_PEAK_MULTIPLIER.get(data_generation, 1.0)
+    if not dense:
+        peak += num_rows * width + width * 4
+    return int(peak) + num_rows * 8 + (1 << 20)
+
+
+def _workspace_bytes(num_rows: int, width: int, top_k: int, decode: bool) -> int:
+    """Device scratch the kernel itself claims -- 12.5% of the logits, so 8 GiB
+    at the top of the sweep. Decode always takes the one-block path."""
+    if not decode and topk_use_mulblocks(num_rows, width):
+        return int(topk_mb_workspace_size(num_rows, width, top_k, False))
+    return int(topk_ob_workspace_size(num_rows, width, top_k, False))
 
 
 def _degenerate(width: int, top_k: int) -> bool:
-    """k >= width selects the whole row, so the kernel short-circuits.
-
-    These cells are legal input but not a meaningful bandwidth point: with no
-    selection left to do, `us` collapses and the compulsory-traffic model stops
-    describing what the kernel read, which shows up as a TB/s above what the
-    HBM can deliver. Flag them rather than drop them -- silently missing rows
-    read as untested.
-    """
+    """k >= width selects the whole row, so the kernel short-circuits and the
+    compulsory-traffic model stops describing it -- the reported TB/s exceeds
+    what HBM can deliver. Flagged rather than dropped: a missing row reads as
+    untested."""
     return top_k >= width
+
+
+def _traffic_bytes(num_rows: int, width: int, top_k: int, write_values: bool) -> int:
+    """Compulsory traffic: every logit read once, every output written once.
+    A lower bound -- radix select makes several passes over the logits."""
+    per_out = 8 if write_values else 4
+    return num_rows * width * 4 + num_rows * top_k * per_out
 
 
 def _perf_columns(
@@ -126,8 +115,7 @@ def create_random_logits(
     """Create random logits tensor for testing."""
     torch.manual_seed(seed)
     np.random.seed(seed)
-    # int(t.max()) is one device sync; Python's max(t) iterates the tensor
-    # and syncs once per row, which dominates the kernel at large num_rows.
+    # int(t.max()) is one sync; Python's max(t) is one per row.
     width = physical_width if physical_width is not None else int(row_ends.max())
     # Generate logits with some structure to make testing more meaningful
     if data_generation == "random":
@@ -158,9 +146,8 @@ def create_random_logits(
         mask = torch.randint(0, 2, (row_starts.shape[0], 1), device="cuda").bool()
         logits = torch.where(mask, logits, logits_random)
 
-    # Mask each row's tail past its own row_end in one shot. Equal-length rows
-    # have no tail, and the broadcast would otherwise materialise a bool tensor
-    # the size of the logits (16 GiB at M=16384, N=1048576) only to fill nothing.
+    # Equal-length rows have no tail; the broadcast would otherwise build a bool
+    # the size of the logits (16 GiB at M=16384, N=1048576) to fill nothing.
     row_ends = row_ends.to(logits.device)
     if int(row_ends.min()) < width:
         col = torch.arange(width, device=logits.device, dtype=torch.int32).unsqueeze(0)
@@ -215,20 +202,16 @@ def compare_topk_results(
     num_rows, width = logits.shape
     device = logits.device
 
-    # A row contributes min(top_k, row_length) real entries; the rest is padding.
     row_lens = (row_ends - row_starts).to(torch.int64).to(device)
     num_valid = row_lens.clamp(min=0, max=top_k).unsqueeze(1)
     pos = torch.arange(top_k, device=device).unsqueeze(0)
     valid = pos < num_valid
 
     cuda_idx = cuda_indices.to(torch.int64)[:, :top_k]
-    # Out-of-range in a real slot is a kernel bug, not a tie: report it rather
-    # than indexing with it (which would raise).
+    # Out of range in a real slot is a bug, not a tie -- and indexing would raise.
     if bool((((cuda_idx < 0) | (cuda_idx >= width)) & valid).any()):
         return False
 
-    # torch.topk is called with min(top_k, max_row_end) columns, so it can be
-    # narrower than top_k; pad it out so both sides share the slot layout.
     torch_idx = torch_indices.to(torch.int64)
     if torch_idx.shape[1] < top_k:
         torch_idx = torch.cat(
@@ -252,8 +235,7 @@ def compare_topk_results(
     torch_vals = torch.gather(logits, 1, torch_idx.clamp(0, width - 1))
     torch_vals = torch.where(valid & (torch_idx >= 0), torch_vals, neg_inf)
 
-    # allclose treats -inf == -inf as equal, so padded slots line up on both
-    # sides and a finite-vs-padding mismatch still fails.
+    # allclose treats -inf == -inf as equal, so padding lines up either side.
     if not torch.allclose(
         cuda_vals.sort(dim=1, descending=True).values,
         torch_vals.sort(dim=1, descending=True).values,
@@ -262,8 +244,7 @@ def compare_topk_results(
     ):
         return False
 
-    # The same key selected twice is a bug the value comparison alone can miss
-    # whenever the duplicated value also ties with the one it displaced.
+    # A key selected twice slips past the value check when it ties what it displaced.
     if top_k > 1:
         packed = torch.where(valid, cuda_idx, -1).sort(dim=1).values
         if bool(((packed[:, 1:] == packed[:, :-1]) & (packed[:, 1:] >= 0)).any()):
@@ -423,15 +404,15 @@ def test_top_k_per_row_prefill(
     width = dense_n if dense_n is not None else num_prefix + num_rows
     ret["context_len"] = width
 
-    # [16384, 1048576] fp32 is 64 GiB of logits alone. Skip the cell instead of
-    # taking the whole sweep down with an OOM.
     footprint = (
         _logits_bytes(num_rows, width, data_generation, dense_n is not None)
         + num_rows * top_k * 4
+        + _workspace_bytes(num_rows, width, top_k, decode=False)
     )
-    if not _fits_in_memory(footprint, _MEM_HEADROOM):
+    if not _fits_in_memory(footprint):
         ret["all_close"] = "skipped"
         ret["note"] = f"needs {_fmt_bytes(footprint)}"
+        ret["degenerate"] = _degenerate(width, top_k)
         return ret
 
     # Create test data
@@ -500,13 +481,15 @@ def test_top_k_per_row_decode(
     width = max(context_len, top_k) if flydsl else context_len
     ret["width"] = width
 
-    # Decode rows differ by the next_n offset, so the mask is always built.
-    footprint = _logits_bytes(
-        num_rows, width, data_generation, dense=False
-    ) + num_rows * top_k * (8 if write_values else 4)
-    if not _fits_in_memory(footprint, _MEM_HEADROOM):
+    footprint = (
+        _logits_bytes(num_rows, width, data_generation, dense=False)
+        + num_rows * top_k * (8 if write_values else 4)
+        + _workspace_bytes(num_rows, width, top_k, decode=True)
+    )
+    if not _fits_in_memory(footprint):
         ret["all_close"] = "skipped"
         ret["note"] = f"needs {_fmt_bytes(footprint)}"
+        ret["degenerate"] = _degenerate(width, top_k)
         ret["fast"] = fast
         return ret
 
@@ -632,7 +615,6 @@ def test_compare_topk_results():
             4,
             True,
         ),
-        # Real kernel bugs, each of which must be rejected.
         (
             "smaller value picked",
             descending,
@@ -716,9 +698,8 @@ def test_mb_workspace_reuse():
     print("[mb_workspace_reuse] PASS: 3 reused-buffer mb calls matched torch.topk")
 
 
-# CI runs this file bare (`python3 <file>`), so the no-flag defaults must stay
-# small. --sweep swaps in the M x N x top_k grid the indexer's top-k stage
-# actually serves; any axis given explicitly on the command line wins over both.
+# CI runs this file bare, so the no-flag defaults stay small. --sweep swaps in
+# the grid; an axis given on the command line wins over both.
 CI_DEFAULTS = {
     "context_len": [8, 128, 1024, 3072, 4096, 8192, 16384, 32768, 65536, 90000, 128000],
     "top_k": [512, 1024, 2048],
@@ -859,7 +840,6 @@ parser.add_argument(
 
 args = parser.parse_args()
 
-# An axis the user gave explicitly wins; otherwise --sweep picks the grid.
 _axis_defaults = SWEEP_DEFAULTS if args.sweep else CI_DEFAULTS
 for _axis, _default in _axis_defaults.items():
     if getattr(args, _axis) is None:
@@ -904,13 +884,10 @@ for data_generation in args.data_generation:
         for ctx in args.context_len:
             for k in args.top_k:
                 for n in args.next_n:
-                    # k > ctx is a short-row case worth testing (it exercises
-                    # the -1 padding), just not a perf cell worth a sweep slot.
+                    # k > ctx exercises the -1 padding; not a perf cell.
                     if args.sweep and k > ctx:
                         continue
                     if args.sweep:
-                        # One cell, one kernel: the stable/values/flydsl
-                        # variants are correctness knobs, not shape axes.
                         df.append(
                             test_top_k_per_row_decode(m, ctx, k, n, data_generation)
                         )
