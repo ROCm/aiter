@@ -1,0 +1,568 @@
+{
+  "stage1": {
+    "kernel": "kernel_gemm_0",
+    "invocation": "env PYTHONPATH=/root/aiter-mxfp8-8wave AITER_JIT_DIR=/root/aiter/aiter/jit python /root/aiter-mxfp8-8wave/csrc/ck_gemm_moe_2stages_codegen/profile_mxfp8_8wave.py --csv /tmp/flydsl_mxfp8_moe/after_four.csv --stage 1",
+    "profile_us": 880.4626,
+    "match_confidence": "heuristic",
+    "match_validation": "Only the selected native eight-wave GEMM was launched; source mapping points to AITER mxfp8_moe_8wave/gemm.py and ISA uses scaled FP8 MFMA.",
+    "capture": {
+      "tag": "big",
+      "shape": null,
+      "iter_range": "[1, [2-2]]",
+      "capture_rc": 0,
+      "capture_s": 20.9,
+      "kept_dir": "att/big/ui_output_agent_48183_dispatch_77",
+      "waves": 288,
+      "ins": 8318,
+      "mapped": 8317,
+      "mapped_pct": 100.0,
+      "arch_vgpr": 256,
+      "accum_vgpr": 0,
+      "occupancy_waves_per_cu": 8,
+      "top_stall_type": "barrier"
+    },
+    "source_mapping_pct": 100.0,
+    "memory": {
+      "l2_hit_rate": 66.2,
+      "partial_32b_frac": 0.0,
+      "ea0_read_bytes": 3385679360,
+      "achieved_hbm_gbs_rough": 1281.8,
+      "peak_hbm_gbs": 8000.0,
+      "calibrated": false,
+      "note": "absolute BW is an EA0-channel lower bound; trust the ratios + bubble taxonomy"
+    },
+    "lds": {
+      "bank_conflict_pct": null
+    },
+    "lds_bytes_per_cta": 131072,
+    "compute": {
+      "mfma_inst_frac": 0.277,
+      "inst_counts": {
+        "valu": 200575584.0,
+        "mfma": 76750848.0
+      }
+    },
+    "stall_taxonomy": {
+      "by_class": {
+        "barrier": {
+          "cycles": 11402000,
+          "pct": 30.82,
+          "rank": 1,
+          "is_bubble": true
+        },
+        "mfma": {
+          "cycles": 10421124,
+          "pct": 28.16,
+          "rank": 2,
+          "is_bubble": false
+        },
+        "vmcnt": {
+          "cycles": 6450972,
+          "pct": 17.43,
+          "rank": 3,
+          "is_bubble": true
+        },
+        "vmem_load": {
+          "cycles": 3300912,
+          "pct": 8.92,
+          "rank": 4,
+          "is_bubble": false
+        },
+        "lds": {
+          "cycles": 2583072,
+          "pct": 6.98,
+          "rank": 5,
+          "is_bubble": false
+        },
+        "valu": {
+          "cycles": 1223320,
+          "pct": 3.31,
+          "rank": 6,
+          "is_bubble": false
+        },
+        "salu": {
+          "cycles": 979032,
+          "pct": 2.65,
+          "rank": 7,
+          "is_bubble": false
+        },
+        "lgkmcnt": {
+          "cycles": 623420,
+          "pct": 1.68,
+          "rank": 8,
+          "is_bubble": true
+        },
+        "vmem_store": {
+          "cycles": 9780,
+          "pct": 0.03,
+          "rank": 9,
+          "is_bubble": false
+        },
+        "smem": {
+          "cycles": 7536,
+          "pct": 0.02,
+          "rank": 10,
+          "is_bubble": false
+        },
+        "branch": {
+          "cycles": 8,
+          "pct": 0.0,
+          "rank": 11,
+          "is_bubble": false
+        }
+      }
+    },
+    "hotspots": [
+      {
+        "code_line": 394,
+        "addr": "0x2094",
+        "inst": "s_waitcnt vmcnt(4)",
+        "class": "vmcnt",
+        "source": "/root/aiter-mxfp8-8wave/aiter/ops/flydsl/kernels/mxfp8_moe_8wave/gemm.py:289",
+        "hit": 288,
+        "latency": 336320,
+        "stall": 336320,
+        "idle": 0,
+        "stall_pct": 100.0,
+        "waitcnt_sources": [
+          {
+            "code_line": 319,
+            "inst": "buffer_load_dword v43, v12, s[16:19], 0 offen",
+            "source": "/root/aiter-mxfp8-8wave/aiter/ops/flydsl/kernels/mxfp8_moe_8wave/gemm.py:78"
+          },
+          {
+            "code_line": 320,
+            "inst": "buffer_load_dword v40, v14, s[16:19], 0 offen",
+            "source": "/root/aiter-mxfp8-8wave/aiter/ops/flydsl/kernels/mxfp8_moe_8wave/gemm.py:78"
+          },
+          {
+            "code_line": 321,
+            "inst": "buffer_load_dword v36, v5, s[16:19], 0 offen",
+            "source": "/root/aiter-mxfp8-8wave/aiter/ops/flydsl/kernels/mxfp8_moe_8wave/gemm.py:78"
+          },
+          {
+            "code_line": 322,
+            "inst": "buffer_load_dword v35, v15, s[16:19], 0 offen",
+            "source": "/root/aiter-mxfp8-8wave/aiter/ops/flydsl/kernels/mxfp8_moe_8wave/gemm.py:78"
+          },
+          {
+            "code_line": 350,
+            "inst": "buffer_load_dword v39, v5, s[12:15], 0 offen",
+            "source": "/root/aiter-mxfp8-8wave/aiter/ops/flydsl/kernels/mxfp8_moe_8wave/gemm.py:78"
+          },
+          {
+            "code_line": 351,
+            "inst": "buffer_load_dword v38, v7, s[12:15], 0 offen",
+            "source": "/root/aiter-mxfp8-8wave/aiter/ops/flydsl/kernels/mxfp8_moe_8wave/gemm.py:78"
+          },
+          {
+            "code_line": 360,
+            "inst": "buffer_load_dwordx4 v10, s[20:23], s27 offen lds",
+            "source": "/root/aiter-mxfp8-8wave/aiter/ops/flydsl/kernels/mxfp8_moe_8wave/gemm_utils.py:127"
+          },
+          {
+            "code_line": 364,
+            "inst": "buffer_load_dwordx4 v11, s[20:23], s27 offen lds",
+            "source": "/root/aiter-mxfp8-8wave/aiter/ops/flydsl/kernels/mxfp8_moe_8wave/gemm_utils.py:127"
+          },
+          {
+            "code_line": 367,
+            "inst": "buffer_load_dwordx4 v8, s[4:7], 0 offen lds",
+            "source": "/root/aiter-mxfp8-8wave/aiter/ops/flydsl/kernels/mxfp8_moe_8wave/gemm_utils.py:127"
+          },
+          {
+            "code_line": 370,
+            "inst": "buffer_load_dwordx4 v6, s[4:7], 0 offen lds",
+            "source": "/root/aiter-mxfp8-8wave/aiter/ops/flydsl/kernels/mxfp8_moe_8wave/gemm_utils.py:127"
+          }
+        ]
+      },
+      {
+        "code_line": 536,
+        "addr": "0x24e0",
+        "inst": "s_waitcnt vmcnt(2)",
+        "class": "vmcnt",
+        "source": "/root/aiter-mxfp8-8wave/aiter/ops/flydsl/kernels/mxfp8_moe_8wave/gemm.py:289",
+        "hit": 288,
+        "latency": 193860,
+        "stall": 193860,
+        "idle": 0,
+        "stall_pct": 100.0,
+        "waitcnt_sources": [
+          {
+            "code_line": 396,
+            "inst": "buffer_load_dwordx4 v10, s[8:11], s21 offen lds",
+            "source": "/root/aiter-mxfp8-8wave/aiter/ops/flydsl/kernels/mxfp8_moe_8wave/gemm_utils.py:127"
+          },
+          {
+            "code_line": 399,
+            "inst": "buffer_load_dwordx4 v11, s[8:11], s21 offen lds",
+            "source": "/root/aiter-mxfp8-8wave/aiter/ops/flydsl/kernels/mxfp8_moe_8wave/gemm_utils.py:127"
+          },
+          {
+            "code_line": 402,
+            "inst": "buffer_load_dwordx4 v8, s[4:7], s42 offen lds",
+            "source": "/root/aiter-mxfp8-8wave/aiter/ops/flydsl/kernels/mxfp8_moe_8wave/gemm_utils.py:127"
+          },
+          {
+            "code_line": 405,
+            "inst": "buffer_load_dwordx4 v6, s[4:7], s42 offen lds",
+            "source": "/root/aiter-mxfp8-8wave/aiter/ops/flydsl/kernels/mxfp8_moe_8wave/gemm_utils.py:127"
+          },
+          {
+            "code_line": 410,
+            "inst": "buffer_load_dwordx4 v10, s[8:11], s21 offen lds",
+            "source": "/root/aiter-mxfp8-8wave/aiter/ops/flydsl/kernels/mxfp8_moe_8wave/gemm_utils.py:127"
+          },
+          {
+            "code_line": 414,
+            "inst": "buffer_load_dwordx4 v11, s[8:11], s21 offen lds",
+            "source": "/root/aiter-mxfp8-8wave/aiter/ops/flydsl/kernels/mxfp8_moe_8wave/gemm_utils.py:127"
+          },
+          {
+            "code_line": 452,
+            "inst": "buffer_load_dwordx4 v4, s[4:7], s42 offen lds",
+            "source": "/root/aiter-mxfp8-8wave/aiter/ops/flydsl/kernels/mxfp8_moe_8wave/gemm_utils.py:127"
+          },
+          {
+            "code_line": 455,
+            "inst": "buffer_load_dwordx4 v2, s[4:7], s42 offen lds",
+            "source": "/root/aiter-mxfp8-8wave/aiter/ops/flydsl/kernels/mxfp8_moe_8wave/gemm_utils.py:127"
+          },
+          {
+            "code_line": 482,
+            "inst": "buffer_load_dwordx4 v10, s[8:11], s42 offen lds",
+            "source": "/root/aiter-mxfp8-8wave/aiter/ops/flydsl/kernels/mxfp8_moe_8wave/gemm_utils.py:127"
+          },
+          {
+            "code_line": 485,
+            "inst": "buffer_load_dwordx4 v11, s[8:11], s42 offen lds",
+            "source": "/root/aiter-mxfp8-8wave/aiter/ops/flydsl/kernels/mxfp8_moe_8wave/gemm_utils.py:127"
+          },
+          {
+            "code_line": 510,
+            "inst": "buffer_load_dwordx4 v8, s[4:7], s52 offen lds",
+            "source": "/root/aiter-mxfp8-8wave/aiter/ops/flydsl/kernels/mxfp8_moe_8wave/gemm_utils.py:127"
+          },
+          {
+            "code_line": 513,
+            "inst": "buffer_load_dwordx4 v6, s[4:7], s52 offen lds",
+            "source": "/root/aiter-mxfp8-8wave/aiter/ops/flydsl/kernels/mxfp8_moe_8wave/gemm_utils.py:127"
+          }
+        ]
+      },
+      {
+        "code_line": 531,
+        "addr": "0x24c4",
+        "inst": "s_barrier",
+        "class": "barrier",
+        "source": "/root/aiter-mxfp8-8wave/aiter/ops/flydsl/kernels/mxfp8_moe_8wave/gemm.py:289",
+        "hit": 288,
+        "latency": 179272,
+        "stall": 179272,
+        "idle": 0,
+        "stall_pct": 100.0
+      }
+    ],
+    "inst_mix": {
+      "valu": 0.298,
+      "salu": 0.191,
+      "mfma": 0.185,
+      "lds": 0.147,
+      "vmem_load": 0.064,
+      "lgkmcnt": 0.054,
+      "barrier": 0.046,
+      "vmcnt": 0.012,
+      "smem": 0.002,
+      "vmem_store": 0.001,
+      "branch": 0.0
+    }
+  },
+  "stage2": {
+    "kernel": "kernel_gemm_0",
+    "invocation": "env PYTHONPATH=/root/aiter-mxfp8-8wave AITER_JIT_DIR=/root/aiter/aiter/jit python /root/aiter-mxfp8-8wave/csrc/ck_gemm_moe_2stages_codegen/profile_mxfp8_8wave.py --csv /tmp/flydsl_mxfp8_moe/after_four.csv --stage 2",
+    "profile_us": 842.1564000000001,
+    "match_confidence": "heuristic",
+    "match_validation": "Only the selected native eight-wave GEMM was launched; source mapping points to AITER mxfp8_moe_8wave/gemm.py and ISA uses scaled FP8 MFMA.",
+    "capture": {
+      "tag": "big",
+      "shape": null,
+      "iter_range": "[1, [2-2]]",
+      "capture_rc": 0,
+      "capture_s": 14.8,
+      "kept_dir": "att/big/ui_output_agent_33196_dispatch_82",
+      "waves": 2368,
+      "ins": 1274,
+      "mapped": 1273,
+      "mapped_pct": 99.9,
+      "arch_vgpr": 251,
+      "accum_vgpr": 0,
+      "occupancy_waves_per_cu": 8,
+      "top_stall_type": "barrier"
+    },
+    "source_mapping_pct": 100.0,
+    "memory": {
+      "l2_hit_rate": 60.4,
+      "partial_32b_frac": 0.0,
+      "ea0_read_bytes": 1362927488,
+      "achieved_hbm_gbs_rough": 539.5,
+      "peak_hbm_gbs": 8000.0,
+      "calibrated": false,
+      "note": "absolute BW is an EA0-channel lower bound; trust the ratios + bubble taxonomy"
+    },
+    "lds": {
+      "bank_conflict_pct": null
+    },
+    "lds_bytes_per_cta": 131072,
+    "compute": {
+      "mfma_inst_frac": 0.123,
+      "inst_counts": {
+        "valu": 275258880.0,
+        "mfma": 38430720.0
+      }
+    },
+    "stall_taxonomy": {
+      "by_class": {
+        "barrier": {
+          "cycles": 10790920,
+          "pct": 29.39,
+          "rank": 1,
+          "is_bubble": true
+        },
+        "vmem_load": {
+          "cycles": 6352396,
+          "pct": 17.3,
+          "rank": 2,
+          "is_bubble": false
+        },
+        "vmcnt": {
+          "cycles": 6173072,
+          "pct": 16.82,
+          "rank": 3,
+          "is_bubble": true
+        },
+        "mfma": {
+          "cycles": 5571916,
+          "pct": 15.18,
+          "rank": 4,
+          "is_bubble": false
+        },
+        "lds": {
+          "cycles": 2520160,
+          "pct": 6.86,
+          "rank": 5,
+          "is_bubble": false
+        },
+        "valu": {
+          "cycles": 2109144,
+          "pct": 5.75,
+          "rank": 6,
+          "is_bubble": false
+        },
+        "lgkmcnt": {
+          "cycles": 1654260,
+          "pct": 4.51,
+          "rank": 7,
+          "is_bubble": true
+        },
+        "salu": {
+          "cycles": 1293252,
+          "pct": 3.52,
+          "rank": 8,
+          "is_bubble": false
+        },
+        "vmem_store": {
+          "cycles": 239676,
+          "pct": 0.65,
+          "rank": 9,
+          "is_bubble": false
+        },
+        "smem": {
+          "cycles": 5676,
+          "pct": 0.02,
+          "rank": 10,
+          "is_bubble": false
+        },
+        "branch": {
+          "cycles": 20,
+          "pct": 0.0,
+          "rank": 11,
+          "is_bubble": false
+        }
+      }
+    },
+    "hotspots": [
+      {
+        "code_line": 358,
+        "addr": "0x1fbc",
+        "inst": "s_waitcnt vmcnt(4)",
+        "class": "vmcnt",
+        "source": "/root/aiter-mxfp8-8wave/aiter/ops/flydsl/kernels/mxfp8_moe_8wave/gemm.py:289",
+        "hit": 2368,
+        "latency": 3736016,
+        "stall": 3736016,
+        "idle": 0,
+        "stall_pct": 100.0,
+        "waitcnt_sources": [
+          {
+            "code_line": 285,
+            "inst": "buffer_load_dword v11, v13, s[12:15], 0 offen",
+            "source": "/root/aiter-mxfp8-8wave/aiter/ops/flydsl/kernels/mxfp8_moe_8wave/gemm.py:78"
+          },
+          {
+            "code_line": 286,
+            "inst": "buffer_load_dword v10, v17, s[12:15], 0 offen",
+            "source": "/root/aiter-mxfp8-8wave/aiter/ops/flydsl/kernels/mxfp8_moe_8wave/gemm.py:78"
+          },
+          {
+            "code_line": 287,
+            "inst": "buffer_load_dword v5, v18, s[12:15], 0 offen",
+            "source": "/root/aiter-mxfp8-8wave/aiter/ops/flydsl/kernels/mxfp8_moe_8wave/gemm.py:78"
+          },
+          {
+            "code_line": 288,
+            "inst": "buffer_load_dword v4, v19, s[12:15], 0 offen",
+            "source": "/root/aiter-mxfp8-8wave/aiter/ops/flydsl/kernels/mxfp8_moe_8wave/gemm.py:78"
+          },
+          {
+            "code_line": 313,
+            "inst": "buffer_load_dword v9, v13, s[8:11], 0 offen",
+            "source": "/root/aiter-mxfp8-8wave/aiter/ops/flydsl/kernels/mxfp8_moe_8wave/gemm.py:78"
+          },
+          {
+            "code_line": 314,
+            "inst": "buffer_load_dword v6, v12, s[8:11], 0 offen",
+            "source": "/root/aiter-mxfp8-8wave/aiter/ops/flydsl/kernels/mxfp8_moe_8wave/gemm.py:78"
+          },
+          {
+            "code_line": 323,
+            "inst": "buffer_load_dwordx4 v15, s[20:23], s28 offen lds",
+            "source": "/root/aiter-mxfp8-8wave/aiter/ops/flydsl/kernels/mxfp8_moe_8wave/gemm_utils.py:127"
+          },
+          {
+            "code_line": 328,
+            "inst": "buffer_load_dwordx4 v14, s[20:23], s28 offen lds",
+            "source": "/root/aiter-mxfp8-8wave/aiter/ops/flydsl/kernels/mxfp8_moe_8wave/gemm_utils.py:127"
+          },
+          {
+            "code_line": 332,
+            "inst": "buffer_load_dwordx4 v3, s[4:7], s29 offen lds",
+            "source": "/root/aiter-mxfp8-8wave/aiter/ops/flydsl/kernels/mxfp8_moe_8wave/gemm_utils.py:127"
+          },
+          {
+            "code_line": 336,
+            "inst": "buffer_load_dwordx4 v2, s[4:7], s29 offen lds",
+            "source": "/root/aiter-mxfp8-8wave/aiter/ops/flydsl/kernels/mxfp8_moe_8wave/gemm_utils.py:127"
+          }
+        ]
+      },
+      {
+        "code_line": 497,
+        "addr": "0x2404",
+        "inst": "s_barrier",
+        "class": "barrier",
+        "source": "/root/aiter-mxfp8-8wave/aiter/ops/flydsl/kernels/mxfp8_moe_8wave/gemm.py:289",
+        "hit": 2368,
+        "latency": 1835916,
+        "stall": 1835916,
+        "idle": 12,
+        "stall_pct": 100.0
+      },
+      {
+        "code_line": 502,
+        "addr": "0x2420",
+        "inst": "s_waitcnt vmcnt(2)",
+        "class": "vmcnt",
+        "source": "/root/aiter-mxfp8-8wave/aiter/ops/flydsl/kernels/mxfp8_moe_8wave/gemm.py:289",
+        "hit": 2368,
+        "latency": 1664328,
+        "stall": 1664328,
+        "idle": 0,
+        "stall_pct": 100.0,
+        "waitcnt_sources": [
+          {
+            "code_line": 361,
+            "inst": "buffer_load_dwordx4 v15, s[16:19], s21 offen lds",
+            "source": "/root/aiter-mxfp8-8wave/aiter/ops/flydsl/kernels/mxfp8_moe_8wave/gemm_utils.py:127"
+          },
+          {
+            "code_line": 364,
+            "inst": "buffer_load_dwordx4 v14, s[16:19], s21 offen lds",
+            "source": "/root/aiter-mxfp8-8wave/aiter/ops/flydsl/kernels/mxfp8_moe_8wave/gemm_utils.py:127"
+          },
+          {
+            "code_line": 368,
+            "inst": "buffer_load_dwordx4 v3, s[4:7], s21 offen lds",
+            "source": "/root/aiter-mxfp8-8wave/aiter/ops/flydsl/kernels/mxfp8_moe_8wave/gemm_utils.py:127"
+          },
+          {
+            "code_line": 371,
+            "inst": "buffer_load_dwordx4 v2, s[4:7], s21 offen lds",
+            "source": "/root/aiter-mxfp8-8wave/aiter/ops/flydsl/kernels/mxfp8_moe_8wave/gemm_utils.py:127"
+          },
+          {
+            "code_line": 375,
+            "inst": "buffer_load_dwordx4 v15, s[16:19], s21 offen lds",
+            "source": "/root/aiter-mxfp8-8wave/aiter/ops/flydsl/kernels/mxfp8_moe_8wave/gemm_utils.py:127"
+          },
+          {
+            "code_line": 378,
+            "inst": "buffer_load_dwordx4 v14, s[16:19], s21 offen lds",
+            "source": "/root/aiter-mxfp8-8wave/aiter/ops/flydsl/kernels/mxfp8_moe_8wave/gemm_utils.py:127"
+          },
+          {
+            "code_line": 411,
+            "inst": "buffer_load_dwordx4 v3, s[4:7], s21 offen lds",
+            "source": "/root/aiter-mxfp8-8wave/aiter/ops/flydsl/kernels/mxfp8_moe_8wave/gemm_utils.py:127"
+          },
+          {
+            "code_line": 414,
+            "inst": "buffer_load_dwordx4 v2, s[4:7], s21 offen lds",
+            "source": "/root/aiter-mxfp8-8wave/aiter/ops/flydsl/kernels/mxfp8_moe_8wave/gemm_utils.py:127"
+          },
+          {
+            "code_line": 445,
+            "inst": "buffer_load_dwordx4 v15, s[16:19], s21 offen lds",
+            "source": "/root/aiter-mxfp8-8wave/aiter/ops/flydsl/kernels/mxfp8_moe_8wave/gemm_utils.py:127"
+          },
+          {
+            "code_line": 448,
+            "inst": "buffer_load_dwordx4 v14, s[16:19], s21 offen lds",
+            "source": "/root/aiter-mxfp8-8wave/aiter/ops/flydsl/kernels/mxfp8_moe_8wave/gemm_utils.py:127"
+          },
+          {
+            "code_line": 474,
+            "inst": "buffer_load_dwordx4 v3, s[4:7], s29 offen lds",
+            "source": "/root/aiter-mxfp8-8wave/aiter/ops/flydsl/kernels/mxfp8_moe_8wave/gemm_utils.py:127"
+          },
+          {
+            "code_line": 477,
+            "inst": "buffer_load_dwordx4 v2, s[4:7], s29 offen lds",
+            "source": "/root/aiter-mxfp8-8wave/aiter/ops/flydsl/kernels/mxfp8_moe_8wave/gemm_utils.py:127"
+          }
+        ]
+      }
+    ],
+    "inst_mix": {
+      "valu": 0.463,
+      "salu": 0.251,
+      "lds": 0.082,
+      "mfma": 0.075,
+      "lgkmcnt": 0.035,
+      "vmem_load": 0.028,
+      "vmem_store": 0.025,
+      "barrier": 0.02,
+      "smem": 0.01,
+      "vmcnt": 0.007,
+      "branch": 0.002
+    }
+  },
+  "limitations": [
+    "ATT and PMC are separate passes. Profile durations are not the 20-iteration pipeline benchmarks.",
+    "Stage 2 capture uses a synthetic sorted FP8 intermediate and real packed weights/routing of the target shape.",
+    "The counter tool infers BF16 from output; its automatic compute roofline is not used for this MXFP8 kernel.",
+    "EA0 bandwidth is an uncalibrated channel lower bound. LDS conflicts are unavailable.",
+    "Several control-flow debug locations collapse to the enclosing if active line. Instruction types and waitcnt producer edges identify the stalls; the predicate itself is not the barrier cost.",
+    "Paths and line numbers identify the capture snapshot before final import formatting. No compute algorithm changed after capture."
+  ]
+}

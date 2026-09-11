@@ -160,6 +160,10 @@ def get_flydsl_kernel_params(name: str) -> dict | None:
 
     Strips ``_kw{N}`` / ``_fp4`` / ``_fp8`` / ``_sbm{N}`` suffixes transparently.
     """
+    if "_mxfp8_8w_" in name:
+        from .mxfp8_moe_8wave import kernel_params
+
+        return kernel_params(name)
     params = _KERNEL_PARAMS.get(name)
     if params is not None:
         return params

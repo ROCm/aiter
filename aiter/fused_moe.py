@@ -2877,6 +2877,44 @@ def get_2stage_cfgs(
         else:
             return 16 if token < 2048 else 32 if token < 16384 else 64
 
+    if "_mxfp8_8w_" in str(kernelName1) or "_mxfp8_8w_" in str(kernelName2):
+        from aiter.ops.flydsl.mxfp8_moe_8wave import kernel_params, stage1, stage2
+
+        p1, p2 = kernel_params(kernelName1), kernel_params(kernelName2)
+        if not (
+            p1
+            and p1["stage"] == 1
+            and p2
+            and p2["stage"] == 2
+            and dtype == dtypes.bf16
+            and q_dtype_a == q_dtype_w == dtypes.fp8
+            and q_type == QuantType.per_1x32
+            and activation == ActivationType.Swiglu
+            and use_g1u1
+            and gate_mode == GateMode.INTERLEAVE
+            and not doweight_stage1
+            and not has_stage2_bias
+            and model_dim % 256 == 0
+            and inter_dim >= 256
+            and inter_dim % 128 == 0
+            and not hidden_pad
+            and not intermediate_pad
+            and block_m == 256
+        ):
+            raise ValueError(
+                "Unsupported shape or dtype for eight-wave MXFP8 MoE configuration"
+            )
+        return MOEMetadata(
+            functools.partial(stage1, kernelName=kernelName1),
+            functools.partial(stage2, kernelName=kernelName2),
+            256,
+            0,
+            prequant=False,
+            fuse_quant="fp8",
+            skip_inter_quant=True,
+            **route_bucket_metadata,
+        )
+
     if _is_mxfp4_kname(kernelName1) or _is_mxfp4_kname(kernelName2):
         # gate_mode is a runtime weight-layout property, not a tuning key: route
         # any a4w4 kernelName to the port; the bound interleave flag picks the
@@ -3562,7 +3600,7 @@ def fused_moe_2stages(
         and q_dtype_a == dtypes.bf16
         and getattr(metadata.stage1, "func", metadata.stage1) is _flydsl_stage1_wrapper
     )
-    if _is_a16w4_port:
+    if _is_a16w4_port or metadata.fuse_quant:
         a2 = None
     elif quant_type == QuantType.per_1x128 and metadata.stage1.func is asm_stage1:
         ratio = a1_scale.element_size() // a1.element_size()
@@ -3590,6 +3628,10 @@ def fused_moe_2stages(
                 extra_stage1_args["topk_ids"] = topk_ids
         if metadata.stage2_has_bias:
             extra_stage2_args["bias2"] = _normalize_bias_for_kernel(bias2)
+    if getattr(stage1_func, "_is_mxfp8_8wave_stage1", False):
+        if bias1 is not None:
+            raise ValueError("Eight-wave MXFP8 stage 1 does not support expert bias")
+        extra_stage1_args["swiglu_limit"] = swiglu_limit
     if stage1_func in (_flydsl_stage1_wrapper, _opus_a8w4_stage1_wrapper):
         extra_stage1_args["swiglu_limit"] = swiglu_limit
     if stage1_func is _flydsl_stage1_wrapper:

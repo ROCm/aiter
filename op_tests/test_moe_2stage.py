@@ -244,7 +244,7 @@ def test_fmoe(
     elif (
         qType == aiter.QuantType.per_1x32
         and reference_aq_dtype == dtypes.fp8
-        and WQDType == dtypes.fp4x2
+        and WQDType in (dtypes.fp4x2, dtypes.fp8)
     ):
         a1_qt, a1_scale = per_1x32_f8_scale_f8_quant(
             input, quant_dtype=dtypes.fp8, scale_type=dtypes.fp8_e8m0
@@ -255,10 +255,9 @@ def test_fmoe(
             and (AQDType in [dtypes.bf16, dtypes.fp16, dtypes.fp8])
             and WQDType == dtypes.fp4x2
         )
-        or is_mxfp8
         or qType == aiter.QuantType.per_1x32
         and WQDType == dtypes.i4x2
-    ):  # a16w4 & a8w4 & mxfp8
+    ):  # a16w4 and a16wi4 BF16 activation reference
         a1_qt = input.to(dtypes.bf16)
         a1_scale = None
     else:
@@ -425,7 +424,7 @@ def test_fmoe(
     elif (
         qType == aiter.QuantType.per_1x32
         and reference_aq_dtype == dtypes.fp8
-        and WQDType == dtypes.fp4x2
+        and WQDType in (dtypes.fp4x2, dtypes.fp8)
     ):
         a2_qt, a2_scale = per_1x32_f8_scale_f8_quant(
             out1_ref, quant_dtype=dtypes.fp8, scale_type=dtypes.fp8_e8m0
@@ -434,7 +433,7 @@ def test_fmoe(
         qType == aiter.QuantType.per_1x32
         and (AQDType in [dtypes.bf16, dtypes.fp16, dtypes.fp8])
         and (WQDType == dtypes.fp4x2)
-    ) or is_mxfp8:  # a16w4 & a8w4 & mxfp8
+    ):  # a16w4 & a8w4
         a2_qt = out1_ref
         a2_scale = None
     elif (
