@@ -44,6 +44,22 @@ NETWORKS = {
         "topk": 8,
         "swiglu_limit": 0.0,
     },
+    # Redundancy deployment profiles: v4_pro geometry with the r32/r64 expert
+    # counts that the AOT bundles compile but no stock network reaches.
+    "v4_pro_r32": {
+        "model_dim": 7168,
+        "inter_dim": 3072,
+        "experts": 416,
+        "topk": 6,
+        "swiglu_limit": 10.0,
+    },
+    "v4_pro_r64": {
+        "model_dim": 7168,
+        "inter_dim": 3072,
+        "experts": 448,
+        "topk": 6,
+        "swiglu_limit": 10.0,
+    },
     # Kimi-K3 routing/weight geometry.  This exercises topk16 and EP8/epr112;
     # the numerical reference intentionally keeps MegaMoEV2's current bounded
     # SwiGLU activation while the K3 activation integration remains separate.
