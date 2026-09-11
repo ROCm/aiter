@@ -4,7 +4,7 @@
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 
-from ....mxmoe_dispatcher import compile_gemm2_a4w4_port
+from ....mxfpmoe import compile_gemm2_a4w4_port
 from .config import MegakernelConfig, WindowConfig
 
 _ROUTE_STORE_CACHE_MODIFIER = 0x10  # sc1
@@ -33,9 +33,9 @@ def compile_megakernel_producer(config: MegakernelConfig, composition):
         BN=config.tile_n,
         BK=config.tile_k,
         use_nt=config.b_cache_modifier == 2,
-        HIDDEN_MAX=shape.model_dim,
+        D_HIDDEN=shape.model_dim,
         epilog=("atomic" if config.producer_mode == "atomic_shared" else "reduce"),
-        INTER_MAX=shape.inter_dim,
+        D_INTER=shape.inter_dim,
         a_dtype="fp8",
         b_dtype="fp4",
         topk=shape.topk,
@@ -68,9 +68,9 @@ def compile_window_producer(config: WindowConfig, window: int, composition):
         BM=config.tile_m,
         BN=config.tile_n,
         BK=config.tile_k,
-        HIDDEN_MAX=shape.model_dim,
+        D_HIDDEN=shape.model_dim,
         epilog="reduce",
-        INTER_MAX=shape.inter_dim,
+        D_INTER=shape.inter_dim,
         a_dtype="fp8",
         b_dtype="fp4",
         topk=shape.topk,
