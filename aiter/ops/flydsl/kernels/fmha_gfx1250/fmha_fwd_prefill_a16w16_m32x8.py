@@ -118,13 +118,15 @@ SUPPORTED_QK_HDIM = (128, 192, 256)
 
 # KV sequence block (columns of one QK GEMM tile). Configurable; 64 for now.
 N_BLOCK_CHOICES = (32, 64, 128, 256)
+# Fixed K|V slot stride: one 64 KB LDS segment per slot, independent of hdim/n_block.
+# The slot being read must not share a segment with the slots being written by
+# in-flight copies -- see gfx1250 LDS segment notes.
+LDS_SLOT_BYTES = 64 * 1024
+
 DEFAULT_N_BLOCK = 64
 
 # Ping-pong K LDS buffers the main loop rotates through (double-buffered prefetch).
 N_KV_PP = 2
-
-# Each K/V ping-pong block is floored to this many bytes (reserved headroom).
-MIN_KV_BLK_BYTES = 64 * 1024
 
 # log2(e): exp(x) = exp2(x * LOG2E). Softmax uses the native ISA exp2 intrinsic.
 LOG2E = 1.4426950408889634
@@ -844,11 +846,14 @@ def _core_attention(
         v_mgr = VManager16bV1(
             v_hdim=v_hdim, n_block=n_block, num_waves=NUM_WAVES, elem_dtype=elem_dtype
         )
-    k_blk_bytes = max(k_mgr.get_lds_size_in_byte(), MIN_KV_BLK_BYTES)
-    v_blk_bytes = max(v_mgr.get_lds_size_in_byte(), MIN_KV_BLK_BYTES)
-    slot_bytes = max(k_blk_bytes + v_blk_bytes, q_mgr.get_lds_size_in_byte())
-    # Splits are spread over the (floored) block, so a split base is >= split_bytes
-    # apart -- a stray immediate lands in padding, not on a neighbour's live rows.
+    k_blk_bytes = k_mgr.get_lds_size_in_byte()
+    v_blk_bytes = v_mgr.get_lds_size_in_byte()
+    slot_bytes = LDS_SLOT_BYTES
+    assert k_blk_bytes + v_blk_bytes <= slot_bytes, (
+        f"K|V stage {k_blk_bytes + v_blk_bytes}B exceeds the fixed slot {slot_bytes}B "
+        f"(qk_hdim={qk_hdim}, v_hdim={v_hdim}, n_block={n_block})"
+    )
+    assert N_KV_PP * slot_bytes <= get_lds_capacity_bytes("gfx1250")
     assert k_blk_bytes % KV_LDS_SPLITS == 0 and v_blk_bytes % KV_LDS_SPLITS == 0
     k_split_stride = k_blk_bytes // KV_LDS_SPLITS
     v_split_stride = v_blk_bytes // KV_LDS_SPLITS
@@ -877,13 +882,18 @@ def _core_attention(
     def _v_lds_bufs(pp):
         return _split_list(_v_lds_buf(pp), v_split_stride)
 
-    # ---- Q staging TIME-SHARES slot 1: Q's LDS base = slot-1 base (kv_base +
-    # slot_bytes). Q is loaded + drained into VGPR in the prologue, then dead; the
-    # main loop's first slot-1 prefetch reuses the region. Safe with zero new sync —
-    # the prologue drains Q (part2) -> s_wait_asynccnt(0) -> gpu.barrier() BEFORE the
-    # loop, and prologue K/V loads target slot 0. slot_bytes >= Q footprint by
-    # construction (see above), so Q always fits in slot 1. ----
+    def _assert_lds_fits(who, base_slot, nbytes):
+        total = base_slot * slot_bytes + nbytes
+        assert total <= get_lds_capacity_bytes("gfx1250"), (
+            f"{who} at slot {base_slot} needs {total}B, over LDS capacity"
+        )
+
+    # ---- Q time-shares slots 1.. : it is drained into VGPR and dead before the
+    # prologue issues any tile into them (s_wait_dscnt + barrier below). ----
+    _assert_lds_fits("Q", 1, q_mgr.get_lds_size_in_byte())
     q_lds_base = lds_base + fx.Int32(slot_bytes)
+    # ---- O stages past the K|V slots. ----
+    o_lds_base = lds_base + fx.Int32(N_KV_PP * slot_bytes)
     q_lds_warp = q_lds_base + warp_idx * fx.Int32(q_mgr.warp_lds_size_in_byte())
 
     q_mgr.load_q_to_vgpr_part1(
@@ -985,6 +995,7 @@ def _core_attention(
         for _v in v_views:
             fx.copy_atom_call(*_v)
         tdm_ops.tensor_wait(0)
+        rocdl.s_wait_dscnt(0)  # Q's ds_loads retired: its LDS is now dead
         gpu.barrier()
     else:
         k_gptrs, k_lds_ptrs, k_imm_offs = k_mgr.global_load_ptrs(
@@ -1018,6 +1029,7 @@ def _core_attention(
         _async_load_to_lds(k_gptrs, k_lds_ptrs, cluster=True, imm_offs=k_imm_offs)
         _async_load_to_lds(v_gptrs, v_lds_ptrs, cluster=True, imm_offs=v_imm_offs)
         rocdl.s_wait_asynccnt(0)
+        rocdl.s_wait_dscnt(0)  # Q's ds_loads retired: its LDS is now dead
         gpu.barrier()
 
     # (7) Loop init — MOVED to after the prologue barrier (ordering experiment). Online-
@@ -1403,18 +1415,10 @@ def _core_attention(
     # (unnormalized); divide by the per-query denom d (peer-consistent across the
     # lane pair) to finish softmax. OManager16b masks rows with seq >= q_len.
     # ========================================================================
-    # O staging reuses the NON-CURRENT K|V slot. Local-parity ring: num_iter tiles occupy
-    # local indices 0..num_iter-1, so the LAST tile lives in buffer (num_iter-1)%N_KV_PP and
-    # the free (non-current) slot is num_iter%N_KV_PP (base 0KB or 128KB). With the last
-    # iteration's dead prefetch skipped, no wave ever writes that slot near the end: the
-    # last load into it was local tile num_iter-2 (issued during local tile num_iter-3,
-    # consumed at num_iter-2), and the top-of-body barrier at local tile num_iter-1 already
-    # synchronized every wave past that read. So the slot is idle here -- no cross-wave
-    # barrier needed. Only the V1 loader issues async loads (asynccnt); under TDM (V2/V3)
-    # K/V/Q load via tensorcnt, so nothing increments asynccnt and s_wait_asynccnt(0) is a
-    # pure no-op -- keep it only for V1 as a defensive per-wave WAR guard (retire any
-    # still-inflight async load into this slot before O's LDS write). The R q-tiles
-    # serialize through the same O ring (s_wait_dscnt(0) between them).
+    # O stages in its own region past the K|V slots, so no wave ever writes it in the
+    # loop -- no cross-wave barrier needed here. s_wait_asynccnt(0) is a pure no-op under
+    # TDM (nothing increments asynccnt); keep it for V1 as a defensive per-wave WAR guard.
+    # The R q-tiles serialize through the same O ring (s_wait_dscnt(0) between them).
     _OMgr = {"v1": OManager16bV1, "v2": OManager16bV2, "v3": OManager16bV3}[O_VARIANT]
     o_mgr = _OMgr(
         v_hdim=v_hdim,
@@ -1423,10 +1427,7 @@ def _core_attention(
         q_tiles_per_wave=R,
         elem_dtype=elem_dtype,
     )
-    assert (
-        o_mgr.get_lds_size_in_byte() <= slot_bytes
-    ), f"O ring budget {o_mgr.get_lds_size_in_byte()}B exceeds K|V slot {slot_bytes}B"
-    non_cur_pp = num_iter % fx.Int32(N_KV_PP)
+    _assert_lds_fits("O", N_KV_PP, o_mgr.get_lds_size_in_byte())
     if not USE_TDM_LOADER:
         rocdl.s_wait_asynccnt(
             0
@@ -1434,7 +1435,6 @@ def _core_attention(
     # O strides are in ELEMENTS (OManager multiplies by _BF16_BYTES itself). Both V1/V2
     # take ptr_O and build their own store descriptor internally (V1 a bounded buffer
     # resource for the masked buffer_store; V2 the TDM store atom with HW OOB drop).
-    o_lds_base = _k_lds_buf(non_cur_pp)
     o_lds_warp = o_lds_base + warp_idx * fx.Int32(o_mgr.warp_lds_size_in_byte())
     for qt in range(R):
         # Normalize this q-tile's O by its running denom d, then reshape+store to VRAM.
