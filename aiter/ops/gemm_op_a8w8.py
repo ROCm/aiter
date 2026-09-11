@@ -2,6 +2,7 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 import functools
+import re
 
 import pandas as pd
 import torch
@@ -1122,6 +1123,11 @@ def gemm_a8w8_blockscale_bpreshuffle(
         ) from e
 
 
+# A-preshuffle doubles the TDM pad interval; gfx1250 encodes it in 3 bits, so the
+# paired interval must stay <= 1024 B for 1-byte A.
+_APRE_MAX_TILE_K = 512
+
+
 def _abpreshuffle_config_from_bpreshuffle(m: int, n: int, k: int) -> dict:
     """Fall back to the bpreshuffle winner for a shape with no A-preshuffle row.
 
@@ -1135,7 +1141,23 @@ def _abpreshuffle_config_from_bpreshuffle(m: int, n: int, k: int) -> dict:
         raise RuntimeError(
             f"gemm_a8w8_blockscale_abpreshuffle: no FlyDSL config for M={m}, N={n}, K={k}"
         )
-    head, sep, tail = str(config["kernelName"]).partition("_ps")
+    name = str(config["kernelName"])
+    # A-preshuffle pairs A rows, which doubles the TDM pad interval; the gfx1250
+    # descriptor encodes log2(interval/4)-1 in 3 bits, capping it at 1024 B. So a
+    # tile_k=1024 winner cannot carry _apre -- halve tile_k (still a divisor of K,
+    # and it only shrinks the A stage) rather than fail the whole call, since
+    # enabling A-preshuffle routes every M through here.
+    tm, tn, tk = (int(v) for v in re.search(r"_t(\d+)x(\d+)x(\d+)_", name).groups())
+    while tk > _APRE_MAX_TILE_K and tk % 2 == 0 and k % (tk // 2) == 0:
+        tk //= 2
+    if tk > _APRE_MAX_TILE_K:
+        raise RuntimeError(
+            f"gemm_a8w8_blockscale_abpreshuffle: no A-preshuffle-capable tile_k for "
+            f"M={m}, N={n}, K={k} (winner {name!r}); tile_k must be <= "
+            f"{_APRE_MAX_TILE_K} and divide K."
+        )
+    name = re.sub(r"_t\d+x\d+x\d+_", f"_t{tm}x{tn}x{tk}_", name, count=1)
+    head, sep, tail = name.partition("_ps")
     return dict(config, kernelName=head + "_apre" + sep + tail)
 
 
@@ -1190,6 +1212,14 @@ def gemm_a8w8_blockscale_abpreshuffle(
     m = x_scale.shape[0]
     n = WQ.shape[0]
     k = XQ.shape[1]
+    # The kernel reads A as row-major [rows, K] off lda=stride(0); a non-unit
+    # inner stride would be read as if it were packed and silently miscompute.
+    if XQ.stride(1) != 1 or not WQ.is_contiguous():
+        raise RuntimeError(
+            "gemm_a8w8_blockscale_abpreshuffle: XQ rows must be contiguous and WQ "
+            f"fully contiguous, got XQ.stride={tuple(XQ.stride())}, "
+            f"WQ.stride={tuple(WQ.stride())}"
+        )
     if XQ.shape[0] != m + (m & 1):
         raise RuntimeError(
             f"gemm_a8w8_blockscale_abpreshuffle: x_scale gives M={m}, so the "

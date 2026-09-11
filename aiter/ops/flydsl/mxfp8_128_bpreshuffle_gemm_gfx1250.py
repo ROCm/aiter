@@ -48,12 +48,15 @@ def _next_epoch() -> int:
     return _EPOCH
 
 
-def splitk_epilogue_flags(M, N, tile_m, tile_n, cluster_m, split_k, cu_num):
+def splitk_epilogue_flags(
+    M, N, tile_m, tile_n, cluster_m, split_k, cu_num, compute_bound
+):
     """Return ``(fused_splitk, bounded_m)`` for one launch."""
     wgs = _splitk_grid_wgs(M, N, tile_m, tile_n, cluster_m, split_k)
     pow2 = split_k & (split_k - 1) == 0
     fused = (
-        split_k > 1
+        compute_bound
+        and split_k > 1
         and pow2
         and tile_m % split_k == 0
         and wgs <= SPLIT_K_FLAG_MAX_LEN
@@ -314,6 +317,7 @@ def _run_mxfp8_128_preshuffle_gemm_a8_gfx1250(
         cluster_m,
         split_k,
         torch.cuda.get_device_properties(XQ.device).multi_processor_count,
+        compute_bound,
     )
     flag = get_split_k_flags(torch_stream.cuda_stream, XQ.device)
     epoch = _next_epoch() if _atomic_splitk else 0
@@ -362,18 +366,7 @@ def _run_mxfp8_128_preshuffle_gemm_a8_gfx1250(
             bounded_m,
         )
     else:
-        nc_args = launch_args[:12] + (_ptr_arg(flag), epoch) + launch_args[12:]
-        launch(
-            *nc_args,
-            BLOCK_K,
-            split_k,
-            False,
-            0,
-            1,
-            a_preshuffle,
-            _atomic_splitk,
-            bounded_m,
-        )
+        launch(*launch_args, BLOCK_K, split_k, False, 0, 1, a_preshuffle)
     if partials is not None:
         dense = ldc == N
         _run_compiled(
@@ -389,12 +382,14 @@ def _run_mxfp8_128_preshuffle_gemm_a8_gfx1250(
     return Out
 
 
-NAME_SUFFIX_RE = (
+BASE_NAME_SUFFIX_RE = (
     r"t(?P<tile_m>\d+)x(?P<tile_n>\d+)x(?P<tile_k>\d+)_"
     r"mw(?P<m_warp>\d+)_nw(?P<n_warp>\d+)_"
     r"nb(?P<num_buffers>\d+)_sk(?P<split_k>\d+)_"
     r"cm(?P<cluster_m>\d+)_cn(?P<cluster_n>\d+)"
-    r"(?P<a_preshuffle>_apre)?"
+)
+NAME_SUFFIX_RE = (
+    BASE_NAME_SUFFIX_RE + r"(?P<a_preshuffle>_apre)?"
     r"(?:_ps(?P<persistent_n_tiles>\d+))?$"
 )
 _KERNEL_NAME_RE = re.compile(rf"^{re.escape(WMMA_NAME_PREFIX)}_{NAME_SUFFIX_RE}")
@@ -497,7 +492,7 @@ def run_gemm_a8w8_mxfp8_128_bpreshuffle_gfx1250(
             "tuned-config dispatch forwards the model's row-major activation, so "
             "this kernel would read it as (2, 128)-tiled and return wrong results. "
             "Feed it shuffle_mxfp8fp4_a(A) and pass a_is_preshuffled=True, or "
-            "call gemm_a8w8_blockscale_apreshuffle, to opt in."
+            "call gemm_a8w8_blockscale_abpreshuffle, to opt in."
         )
     return _run_mxfp8_128_preshuffle_gemm_a8_gfx1250(
         XQ,

@@ -100,6 +100,7 @@ DEFAULT_CSVS = [
     AITER_CONFIGS.AITER_CONFIG_GEMM_A8W8_BPRESHUFFLE_FILE,
     AITER_CONFIGS.AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_FILE,
     AITER_CONFIGS.AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_BPRESHUFFLE_FILE,
+    AITER_CONFIGS.AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_ABPRESHUFFLE_FILE,
     AITER_CONFIGS.AITER_CONFIG_A8W8_BATCHED_GEMM_FILE,
     AITER_CONFIGS.AITER_CONFIG_BF16_BATCHED_GEMM_FILE,
     AITER_CONFIGS.AITER_CONFIG_GEMM_BF16_FILE,
@@ -557,8 +558,6 @@ def _compile_mxfp8_128_wmma_to_cache(
             a_scale.numel() // a_scale.stride(0),
             xq.stride(0),
             out.stride(0),
-            _ptr_view_safe(flag),
-            1,  # epoch: value is irrelevant when compiling
             tile_m,
             tile_n,
             tile_k,
@@ -579,13 +578,19 @@ def _compile_mxfp8_128_wmma_to_cache(
             cluster_m, cluster_n, compute_bound
         ):
             variant_args = launch_args[:-3] + (variant_cm, cluster_n, True)
-            # bake exactly the epilogue variant the runtime will ask for
-            fused_splitk, bounded_m = splitk_epilogue_flags(
-                m, n, tile_m, tile_n, variant_cm, split_k, cu_num
-            )
             if compute_bound:
+                # bake exactly the epilogue variant the runtime will ask for
+                fused_splitk, bounded_m = splitk_epilogue_flags(
+                    m, n, tile_m, tile_n, variant_cm, split_k, cu_num, True
+                )
+                cb_args = (
+                    variant_args[:12]
+                    # epoch value is irrelevant when compiling
+                    + (_ptr_view_safe(flag), 1)
+                    + variant_args[12:]
+                )
                 launch(
-                    *variant_args,
+                    *cb_args,
                     SCALE_BLOCK_SIZE,
                     split_k,
                     a_preshuffle,
@@ -602,8 +607,6 @@ def _compile_mxfp8_128_wmma_to_cache(
                     0,
                     1,
                     a_preshuffle,
-                    fused_splitk,
-                    bounded_m,
                 )
         if split_k > 1:
             compile_gemm_a8w8_splitk_reduce(split_k=split_k, out_dtype_str="bf16")(
@@ -648,8 +651,6 @@ def _compile_ptpc_wmma_to_cache(
     scale_a = torch.empty((max(m, 1),), device=dev, dtype=torch.float32)
     scale_b = torch.empty((max(n, 1),), device=dev, dtype=torch.float32)
     out = torch.empty((m, n), device=dev, dtype=torch.bfloat16)
-    # split-K flag slots: the kernel only indexes them, compile-only never runs
-    flag = torch.empty(SPLIT_K_FLAG_MAX_LEN, device=dev, dtype=torch.int32)
     stream = fx.Stream(0)
 
     with compile_only_env():
@@ -666,8 +667,6 @@ def _compile_ptpc_wmma_to_cache(
             0,
             xq.stride(0),
             out.stride(0),
-            _ptr_view_safe(flag),
-            1,  # epoch: value is irrelevant when compiling
             tile_m,
             tile_n,
             tile_k,
