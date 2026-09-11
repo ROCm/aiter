@@ -178,6 +178,7 @@ def causal_conv1d_split_qkv_triton_tile_fn(
     block_n: int = 32,
     num_warps: int = 4,
     metadata=None,
+    preserve_input_dtype: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """2D-tiled prefill causal conv1d with fused split q/k/v output.
 
@@ -186,7 +187,11 @@ def causal_conv1d_split_qkv_triton_tile_fn(
     x: [dim, cu_seqlen] bf16, channels packed ``[Q | K | V]``.
     weight: [dim, width] (width in {2,3,4}); conv_states: [lines, dim, width-1].
     Returns contiguous (q, k, v) of shapes [cu_seqlen, k_dim] / [cu_seqlen, v_dim].
+
+    preserve_input_dtype: return q/k/v in x's dtype to match vLLM
     """
+    # Cast back only when asked; a no-op when cache and activations share a dtype
+    out_dtype = x.dtype if preserve_input_dtype else conv_states.dtype
     x = x.to(conv_states.dtype)
     dim, cu_seqlen = x.shape
     _, width = weight.shape
@@ -255,7 +260,11 @@ def causal_conv1d_split_qkv_triton_tile_fn(
     value = torch.empty([cu_seqlen, v_dim], dtype=x.dtype, device=x.device)
 
     if tot == 0:
-        return query, key, value
+        return (
+            query.to(out_dtype),
+            key.to(out_dtype),
+            value.to(out_dtype),
+        )
 
     grid = (tot, triton.cdiv(dim, BLOCK_N))
     _causal_conv1d_fwd_split_qkv_tile_kernel[grid](
@@ -307,4 +316,8 @@ def causal_conv1d_split_qkv_triton_tile_fn(
         num_warps=num_warps,
         num_stages=1,
     )
-    return query, key, value
+    return (
+        query.to(out_dtype),
+        key.to(out_dtype),
+        value.to(out_dtype),
+    )

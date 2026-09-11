@@ -702,8 +702,13 @@ def checkAllclose(
             actual_max_delta, a, b, max_abs_delta, catastrophic_check
         )
 
+        # Real failures log at ERROR so they survive a WARNING-level logger (pytest);
+        # a mismatch within tol_err_ratio is accepted, so it stays at INFO like passed~.
+        report = (
+            logger.error if is_catastrophic or percent > tol_err_ratio else logger.info
+        )
         if is_catastrophic:
-            logger.info(
+            report(
                 f"""{msg}[checkAllclose {atol=} {rtol=} \033[31mcatastrophic!\033[0m] max abs delta {actual_max_delta:.4f}
     a    : {a.shape}
            {a_msked[:printNum]}
@@ -713,7 +718,7 @@ def checkAllclose(
            {delta[:printNum]}"""
             )
         elif percent > tol_err_ratio:
-            logger.info(f"""{msg}[checkAllclose {atol=} {rtol=} \033[31mfailed!\033[0m]
+            report(f"""{msg}[checkAllclose {atol=} {rtol=} \033[31mfailed!\033[0m]
     a    : {a.shape}
            {a_msked[:printNum]}
     b    : {b.shape}
@@ -721,10 +726,10 @@ def checkAllclose(
     delta:
            {delta[:printNum]}""")
         else:
-            logger.info(
+            report(
                 f"""{msg}[checkAllclose {atol=} {rtol=} \033[33mwarning!\033[0m] a and b results are not all close"""
             )
-        logger.info(
+        report(
             f"-->max abs delta:{delta.max()}, delta details: {percent:.1%} ({num} of {denom}) elements"
         )
         if is_catastrophic:
