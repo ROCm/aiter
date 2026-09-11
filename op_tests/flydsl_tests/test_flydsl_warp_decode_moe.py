@@ -1171,6 +1171,61 @@ def test_preshuffled_rejects_illegal_nk():
         )
 
 
+def _logical_nk_to_kpack_ints(n, k_packed, elem_bytes):
+    n0, nlane = divmod(n, 16)
+    if elem_bytes == 1:
+        k0, k_in = divmod(k_packed, 64)
+        klane, k_rest = divmod(k_in, 16)
+        ki = k_rest // 4
+    else:
+        k0, k_in = divmod(k_packed, 32)
+        klane, k_rest = divmod(k_in, 8)
+        ki = k_rest // 2
+    return n0, k0, klane, nlane, ki
+
+
+def test_nmajor_kpack_i32_layout_matches_shuffle_weight():
+    """In-expert crd2idx on the i32 kpack view matches shuffle_weight (16,16)."""
+    from aiter.ops.flydsl.kernels.warp_decode_moe import _nmajor_kpack_i32_layout
+    from aiter.ops.shuffle import shuffle_weight
+
+    e, n_out, packed_k, elem_bytes = 2, 16, 64, 1
+    w = torch.arange(e * n_out * packed_k, dtype=torch.uint8, device="cuda").reshape(
+        e, n_out, packed_k
+    )
+    sh = shuffle_weight(w, layout=(16, 16)).contiguous()
+    _, stride = _nmajor_kpack_i32_layout(n_out, packed_k, elem_bytes)
+    expert = 1
+    n_idx, k_packed = 3, 20
+    n0, k0, klane, nlane, ki = _logical_nk_to_kpack_ints(n_idx, k_packed, elem_bytes)
+    off = n0 * stride[0] + k0 * stride[1] + klane * stride[2] + nlane * stride[3] + ki
+    got = sh[expert].view(torch.int32).reshape(-1)[off].item()
+    ref = w[expert, n_idx].view(torch.int32)[k_packed // 4].item()
+    assert got == ref
+
+
+def test_preshuffled_expert_kpack_view_loads_one_dword():
+    """i64 expert fold + kpack make_buffer_tensor + fx.copy (subtask 3)."""
+    from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled, ptr_arg
+    from aiter.ops.flydsl.kernels.warp_decode_moe import build_preshuffled_b_load_module
+    from aiter.ops.shuffle import shuffle_weight
+
+    e, n_out, packed_k, elem_bytes = 2, 16, 64, 1
+    expert, n_idx, k_packed = 1, 3, 20
+    w = torch.arange(e * n_out * packed_k, dtype=torch.uint8, device="cuda").reshape(
+        e, n_out, packed_k
+    )
+    sh = shuffle_weight(w, layout=(16, 16)).contiguous()
+    out = torch.zeros(1, dtype=torch.int32, device="cuda")
+    launch = build_preshuffled_b_load_module(
+        n_out, packed_k, elem_bytes, expert, n_idx, k_packed
+    )
+    _run_compiled(launch, ptr_arg(sh), ptr_arg(out), torch.cuda.current_stream())
+    torch.cuda.synchronize()
+    ref = w[expert, n_idx].view(torch.int32)[k_packed // 4].item()
+    assert int(out[0].item()) == ref
+
+
 # -------------------------------------------------------------------------
 # gfx942 scalar-f32 fallback (SILOTIGER-667 Phase C / G4).  The scalar path
 # (`use_dot2=False`) replaces `v_dot2_f32_bf16` (a gfx950 instruction) with pure

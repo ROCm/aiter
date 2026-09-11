@@ -31,7 +31,7 @@ spot-check when the hot loop or wait/reduce path changed.
 
 - [x] 1. Host API: opt-in `k_contiguous` | `preshuffled` (default `k_contiguous`)
 - [x] 2. Pin the preshuffle contract per dtype (same helper fused MoE uses)
-- [ ] 3. i32/byte kpack views + i64 expert base on the `preshuffled` path
+- [x] 3. i32/byte kpack views + i64 expert base on the `preshuffled` path
 - [ ] 4. Lane→kpack gather map (wave still owns output scalars; `v_dot2`)
 - [ ] 5. Op_test both layouts; fail loudly on illegal `preshuffled` shapes
 
@@ -142,11 +142,17 @@ until subtasks 3–4.
 The `k_contiguous` path may keep `load_i32_words` + `buffer_ops` until a later
 modernization item moves it. Do not block `preshuffled` B on that.
 
-- [ ] `preshuffled` weight loads go through kpack buffer-resource views.
-- [ ] Large-E (i64 expert base) works on `preshuffled` B the same way as
+- [x] `preshuffled` weight loads go through kpack buffer-resource views.
+- [x] Large-E (i64 expert base) works on `preshuffled` B the same way as
       `k_contiguous`.
-- [ ] **Done when:** no fake unpacked FP8/FP4 element layout; expert base is
+- [x] **Done when:** no fake unpacked FP8/FP4 element layout; expert base is
       folded, in-expert offsets i32-safe.
+
+Host still rejects `weight_layout='preshuffled'` until subtask 4 (lane map +
+numerics vs fused-MoE buffers). Builders take compile-time `preshuffled=`;
+the kpack path is covered by the in-expert load probe. Do **not** `if
+preshuffled` in the `@flyc.kernel` body (SSA live-out / `w_word_base`
+`NameError`); dispatch in Python helpers that return a complete bundle.
 
 ### 4. Lane→kpack gather map (still `v_dot2`)
 

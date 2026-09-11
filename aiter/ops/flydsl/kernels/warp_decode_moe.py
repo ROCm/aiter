@@ -38,11 +38,19 @@ from flydsl.expr import math as fxmath
 from flydsl.expr.typing import BFloat16
 
 from aiter.ops.flydsl.kernels import buffer_ops
-from aiter.ops.flydsl.kernels.tensor_shim import buf_copy_load, ptr_buf_tensor
+from aiter.ops.flydsl.kernels.tensor_shim import (
+    buf_copy_load,
+    buf_copy_store,
+    ptr_buf_tensor,
+)
 
 WARP_SIZE = 64
 # Butterfly-reduce shifts for a full 64-lane wave (low -> high).
 _REDUCE_SHIFTS = (1, 2, 4, 8, 16, 32)
+
+# Preshuffled B (WeightLayout.PRESHUFFLED) is pinned on the host in
+# aiter.ops.flydsl.warp_decode_moe: CDNA shuffle_weight / make_preshuffle_b_layout
+# N-major (permute 0,1,3,4,2,5). Do not invent a second permutation here.
 
 
 # -------------------------------------------------------------------------
@@ -64,6 +72,77 @@ def _ptr_rsrc_off(ptr, byte_off_i64):
     """
     base = fx.Int64(fx.ptrtoint(ptr)) + fx.Int64(byte_off_i64)
     return buffer_ops.create_buffer_resource_from_addr(base)
+
+
+# N-major ``make_preshuffle_b_layout`` / ``shuffle_weight`` permute (0,1,3,4,2,5)
+# in **i32** elements (16B kpack = 4 dwords). ``packed_k`` is the k_contiguous
+# last dim (FP8 elems, BF16 elems, or MXFP4 bytes).
+_KPACK_I32 = 4
+_KPACK_NLANE = 16
+_KPACK_KLANE = 4
+
+
+def _nmajor_kpack_i32_layout(n_out: int, packed_k: int, elem_bytes: int):
+    """Shape/stride of one expert's preshuffled B as i32 kpack tiles."""
+    if elem_bytes not in (1, 2):
+        raise ValueError(f"elem_bytes must be 1 or 2, got {elem_bytes}")
+    k_tile = 64 if elem_bytes == 1 else 32
+    if n_out % _KPACK_NLANE != 0:
+        raise ValueError(f"N={n_out} must be divisible by {_KPACK_NLANE}")
+    if packed_k % k_tile != 0:
+        raise ValueError(f"packed_k={packed_k} must be divisible by {k_tile}")
+    k0 = packed_k // k_tile
+    stride_nlane = _KPACK_I32
+    stride_klane = _KPACK_NLANE * stride_nlane
+    stride_k0 = _KPACK_KLANE * stride_klane
+    stride_n0 = k0 * stride_k0
+    shape = (n_out // _KPACK_NLANE, k0, _KPACK_KLANE, _KPACK_NLANE, _KPACK_I32)
+    stride = (stride_n0, stride_k0, stride_klane, stride_nlane, 1)
+    return shape, stride
+
+
+def _logical_nk_to_kpack_i32(n, k_packed, *, elem_bytes: int):
+    """Map logical (N, packed-K) to (n0, k0, klane, nlane, ki) on the i32 view."""
+    n = fx.Int32(n)
+    k_packed = fx.Int32(k_packed)
+    n0 = n // fx.Int32(_KPACK_NLANE)
+    nlane = n % fx.Int32(_KPACK_NLANE)
+    if elem_bytes == 1:
+        k0 = k_packed // fx.Int32(64)
+        k_in = k_packed % fx.Int32(64)
+        klane = k_in // fx.Int32(16)
+        ki = (k_in % fx.Int32(16)) // fx.Int32(_KPACK_I32)
+    else:
+        k0 = k_packed // fx.Int32(32)
+        k_in = k_packed % fx.Int32(32)
+        klane = k_in // fx.Int32(8)
+        ki = (k_in % fx.Int32(8)) // fx.Int32(2)
+    return n0, k0, klane, nlane, ki
+
+
+def _preshuffled_expert_b_i32_tensor(ptr, expert, n_out, packed_k, elem_bytes):
+    """In-expert kpack ``make_buffer_tensor``; expert base is an i64 byte fold.
+
+    Does not invent an unpacked e4m3/e2m1 grid. In-expert dword offsets stay
+    i32-safe because the descriptor starts at this expert.
+    """
+    bytes_per_expert = n_out * packed_k * elem_bytes
+    base = fx.Int64(fx.ptrtoint(ptr)) + fx.Int64(expert) * fx.Int64(bytes_per_expert)
+    shape, stride = _nmajor_kpack_i32_layout(n_out, packed_k, elem_bytes)
+    pt = fx.PointerType.get(
+        fx.Int32.ir_type, address_space=fx.AddressSpace.Global, alignment=4
+    )
+    view = fx.make_view(fx.inttoptr(pt, base), fx.make_layout(shape, stride))
+    return fx.rocdl.make_buffer_tensor(view, num_records_bytes=bytes_per_expert)
+
+
+def _kpack_load_i32(t, n, k_packed, *, elem_bytes: int):
+    """One dword from a preshuffled B kpack view via ``fx.copy`` (not ``t[i]``)."""
+    n0, k0, klane, nlane, ki = _logical_nk_to_kpack_i32(
+        n, k_packed, elem_bytes=elem_bytes
+    )
+    tile = fx.slice(t, (n0, k0, klane, nlane, None))
+    return buf_copy_load(tile, ki)
 
 
 def _bf16_out_view(ptr):
@@ -267,6 +346,29 @@ def load_i32_words(rsrc, word0, n):
     return out
 
 
+def _weight_i32_words(
+    preshuffled,
+    n_words,
+    *,
+    rsrc=None,
+    word0=None,
+    view=None,
+    n_idx=None,
+    k_packed0=None,
+    elem_bytes=None,
+):
+    """Weight dwords: k_contiguous ``buffer_ops`` or preshuffled kpack ``fx.copy``."""
+    if preshuffled:
+        k_per_dword = 4 // elem_bytes
+        return [
+            _kpack_load_i32(
+                view, n_idx, k_packed0 + w * k_per_dword, elem_bytes=elem_bytes
+            )
+            for w in range(n_words)
+        ]
+    return load_i32_words(rsrc, word0, n_words)
+
+
 def wave_reduce_add_f32(val_f32):
     """Full 64-lane butterfly sum; every lane returns the total (raw f32)."""
     val = fx.Float32(val_f32)
@@ -350,6 +452,84 @@ def _fp8_down_row_scales(wds_t, w_row, kh_per_warp, per_token_scale):
         return [_f32_load(wds_t, w_row[h]) for h in range(kh_per_warp)]
     ds0 = _f32_load(wds_t, 0)
     return [ds0 for _ in range(kh_per_warp)]
+
+
+def _fp8_gate_up_weight_bundle(
+    preshuffled,
+    wg_ptr,
+    wu_ptr,
+    e,
+    neuron_j,
+    w_row,
+    *,
+    use_i64_base,
+    bytes_per_expert,
+    hidden,
+    inter,
+):
+    """Gate/up B views. Python ``if`` (not kernel SSA) so names are not live-outs."""
+    if preshuffled:
+        wg_b = _preshuffled_expert_b_i32_tensor(wg_ptr, e, inter, hidden, 1)
+        wu_b = _preshuffled_expert_b_i32_tensor(wu_ptr, e, inter, hidden, 1)
+        return wg_b, wu_b, None, None, fx.Int32(0)
+    wg_rsrc, wu_rsrc, w_word_base = _fp8_gate_up_weight_views(
+        wg_ptr,
+        wu_ptr,
+        e,
+        neuron_j,
+        w_row,
+        use_i64_base=use_i64_base,
+        bytes_per_expert=bytes_per_expert,
+        hidden=hidden,
+    )
+    return None, None, wg_rsrc, wu_rsrc, w_word_base
+
+
+def _fp8_down_weight_bundle(
+    preshuffled,
+    wd_ptr,
+    wd_rsrc,
+    e,
+    out_j0,
+    w_row,
+    *,
+    use_i64_base,
+    bytes_per_expert,
+    inter,
+    hidden,
+    kh_per_warp,
+):
+    """Down B view. Python ``if`` so ``w_word_base`` is not an SSA live-out."""
+    if preshuffled:
+        wd_b = _preshuffled_expert_b_i32_tensor(wd_ptr, e, hidden, inter, 1)
+        return wd_b, None, [fx.Int32(0) for _ in range(kh_per_warp)]
+    wd_rsrc_e, w_word_base = _fp8_down_weight_view(
+        wd_ptr,
+        wd_rsrc,
+        e,
+        out_j0,
+        w_row,
+        use_i64_base=use_i64_base,
+        bytes_per_expert=bytes_per_expert,
+        inter=inter,
+        kh_per_warp=kh_per_warp,
+    )
+    return None, wd_rsrc_e, w_word_base
+
+
+def _gate_up_weight_ptrs(preshuffled, wg_ptr, wu_ptr, e, n_out, packed_k, elem_bytes):
+    """Split or kpack gate/up pointers; Python ``if`` (not kernel SSA)."""
+    if preshuffled:
+        wg_b = _preshuffled_expert_b_i32_tensor(wg_ptr, e, n_out, packed_k, elem_bytes)
+        wu_b = _preshuffled_expert_b_i32_tensor(wu_ptr, e, n_out, packed_k, elem_bytes)
+        return wg_b, wu_b, None, None
+    return None, None, _ptr_rsrc(wg_ptr), _ptr_rsrc(wu_ptr)
+
+
+def _down_preshuffled_b(preshuffled, wd_ptr, e, n_out, packed_k, elem_bytes):
+    if preshuffled:
+        return _preshuffled_expert_b_i32_tensor(wd_ptr, e, n_out, packed_k, elem_bytes)
+    return None
 
 
 # -------------------------------------------------------------------------
@@ -439,6 +619,38 @@ def build_warp_decode_primitives_module(*, serialize_dot2: bool = True):
 
 
 # -------------------------------------------------------------------------
+# Preshuffled B probe (i64 expert fold + i32 kpack view + fx.copy)
+# -------------------------------------------------------------------------
+def build_preshuffled_b_load_module(
+    n_out: int,
+    packed_k: int,
+    elem_bytes: int,
+    expert: int,
+    n_idx: int,
+    k_packed: int,
+):
+    """Load one in-expert dword from preshuffled B (subtask 3 view/i64 fold)."""
+
+    @flyc.kernel
+    def _kernel(w_ptr: fx.Pointer, out_ptr: fx.Pointer):
+        t = _preshuffled_expert_b_i32_tensor(w_ptr, expert, n_out, packed_k, elem_bytes)
+        val = _kpack_load_i32(t, n_idx, k_packed, elem_bytes=elem_bytes)
+        out_t = ptr_buf_tensor(out_ptr, fx.Int32)
+        if gpu.thread_id("x") == 0:
+            buf_copy_store(out_t, 0, val)
+
+    @flyc.jit
+    def _launch(w_ptr: fx.Pointer, out_ptr: fx.Pointer, stream: fx.Stream):
+        _kernel(w_ptr, out_ptr).launch(
+            grid=(1, 1, 1),
+            block=(WARP_SIZE, 1, 1),
+            stream=stream,
+        )
+
+    return _launch
+
+
+# -------------------------------------------------------------------------
 # Phase 2 -- gate_up FP8 fast path (BF16 activation, FP8 e4m3 weights)
 # -------------------------------------------------------------------------
 def pick_kvector(hidden: int) -> int:
@@ -464,6 +676,7 @@ def build_gate_up_fp8_module(
     scale_bk: int | None = None,
     num_experts: int | None = None,
     dot2_acc: int = 1,
+    preshuffled: bool = False,
 ):
     """Build the gate_up FP8 launcher (BF16 activation, FP8 e4m3 weights).
 
@@ -535,10 +748,8 @@ def build_gate_up_fp8_module(
         w_row = e * inter + neuron_j
 
         x_rsrc = _ptr_rsrc(x_ptr)
-        # Tier-2 (E*I*H >= 2^31): fold the per-expert base into the descriptor as
-        # i64 and address weights by the i32-safe in-expert dword base; otherwise
-        # keep whole-pool addressing (w_word_base carries the full w_row offset).
-        wg_rsrc, wu_rsrc, w_word_base = _fp8_gate_up_weight_views(
+        wg_b, wu_b, wg_rsrc, wu_rsrc, w_word_base = _fp8_gate_up_weight_bundle(
+            preshuffled,
             wg_ptr,
             wu_ptr,
             e,
@@ -547,6 +758,7 @@ def build_gate_up_fp8_module(
             use_i64_base=use_i64_base,
             bytes_per_expert=bytes_per_expert,
             hidden=hidden,
+            inter=inter,
         )
 
         one_f32 = fx.Float32(1.0).ir_value()
@@ -570,8 +782,26 @@ def build_gate_up_fp8_module(
                 x_word0 = (token_b * hidden + k_base) // 2
                 w_word0 = w_word_base + k_base // 4
                 xw = load_i32_words(x_rsrc, x_word0, n_pairs)
-                gw = load_i32_words(wg_rsrc, w_word0, n_wwords)
-                uw = load_i32_words(wu_rsrc, w_word0, n_wwords)
+                gw = _weight_i32_words(
+                    preshuffled,
+                    n_wwords,
+                    rsrc=wg_rsrc,
+                    word0=w_word0,
+                    view=wg_b,
+                    n_idx=neuron_j,
+                    k_packed0=k_base,
+                    elem_bytes=1,
+                )
+                uw = _weight_i32_words(
+                    preshuffled,
+                    n_wwords,
+                    rsrc=wu_rsrc,
+                    word0=w_word0,
+                    view=wu_b,
+                    n_idx=neuron_j,
+                    k_packed0=k_base,
+                    elem_bytes=1,
+                )
                 gate_pairs_i = []
                 up_pairs_i = []
                 for ipair in range_constexpr(n_pairs):
@@ -612,8 +842,26 @@ def build_gate_up_fp8_module(
                 w_word0 = w_word_base + k_base // 4
                 # Coalesced 128-bit loads: n_pairs x dwords, n_wwords gate/up dwords.
                 xw = load_i32_words(x_rsrc, x_word0, n_pairs)
-                gw = load_i32_words(wg_rsrc, w_word0, n_wwords)
-                uw = load_i32_words(wu_rsrc, w_word0, n_wwords)
+                gw = _weight_i32_words(
+                    preshuffled,
+                    n_wwords,
+                    rsrc=wg_rsrc,
+                    word0=w_word0,
+                    view=wg_b,
+                    n_idx=neuron_j,
+                    k_packed0=k_base,
+                    elem_bytes=1,
+                )
+                uw = _weight_i32_words(
+                    preshuffled,
+                    n_wwords,
+                    rsrc=wu_rsrc,
+                    word0=w_word0,
+                    view=wu_b,
+                    n_idx=neuron_j,
+                    k_packed0=k_base,
+                    elem_bytes=1,
+                )
                 for ipair in range_constexpr(n_pairs):
                     w_word = ipair // 2
                     w_hi = (ipair % 2) == 1
@@ -676,6 +924,7 @@ def build_gate_up_fp8_act_module(
     scale_bk: int,
     scale_bxk: int | None = None,
     num_experts: int | None = None,
+    preshuffled: bool = False,
 ):
     """Build the gate_up launcher with **FP8 activation** (CK ``gate_fp8_d2`` peer).
 
@@ -746,7 +995,8 @@ def build_gate_up_fp8_act_module(
 
         x_rsrc = _ptr_rsrc(x_ptr)
         xs_t = _f32_view(xs_ptr)
-        wg_rsrc, wu_rsrc, w_word_base = _fp8_gate_up_weight_views(
+        wg_b, wu_b, wg_rsrc, wu_rsrc, w_word_base = _fp8_gate_up_weight_bundle(
+            preshuffled,
             wg_ptr,
             wu_ptr,
             e,
@@ -755,6 +1005,7 @@ def build_gate_up_fp8_act_module(
             use_i64_base=use_i64_base,
             bytes_per_expert=bytes_per_expert,
             hidden=hidden,
+            inter=inter,
         )
 
         one_f32 = fx.Float32(1.0).ir_value()
@@ -770,8 +1021,26 @@ def build_gate_up_fp8_act_module(
             x_word0 = (token_b * hidden + k_base) // 4
             w_word0 = w_word_base + k_base // 4
             xw = load_i32_words(x_rsrc, x_word0, n_wwords)
-            gw = load_i32_words(wg_rsrc, w_word0, n_wwords)
-            uw = load_i32_words(wu_rsrc, w_word0, n_wwords)
+            gw = _weight_i32_words(
+                preshuffled,
+                n_wwords,
+                rsrc=wg_rsrc,
+                word0=w_word0,
+                view=wg_b,
+                n_idx=neuron_j,
+                k_packed0=k_base,
+                elem_bytes=1,
+            )
+            uw = _weight_i32_words(
+                preshuffled,
+                n_wwords,
+                rsrc=wu_rsrc,
+                word0=w_word0,
+                view=wu_b,
+                n_idx=neuron_j,
+                k_packed0=k_base,
+                elem_bytes=1,
+            )
             gd = fx.Float32(0.0).ir_value()
             ud = fx.Float32(0.0).ir_value()
             for ipair in range_constexpr(n_pairs):
@@ -842,6 +1111,7 @@ def build_down_reduce_fp8_module(
     k_batch: int = 1,
     num_experts: int | None = None,
     dot2_acc: int = 1,
+    preshuffled: bool = False,
 ):
     """Build the down_reduce FP8 launcher (BF16 intermediate, FP8 e4m3 weights).
 
@@ -945,9 +1215,8 @@ def build_down_reduce_fp8_module(
             e = fx.Int32(_i32_load(rid_t, ridx))
             rw = _f32_load(rwt_t, ridx)
             w_row = [e * hidden + out_j0 + h for h in range(kh_per_warp)]
-            # Tier-2 (E*H*I >= 2^31): fold the per-expert base into the descriptor
-            # as i64 so the in-expert dword base stays i32-safe; else whole-pool.
-            wd_rsrc_e, w_word_base = _fp8_down_weight_view(
+            wd_b, wd_rsrc_e, w_word_base = _fp8_down_weight_bundle(
+                preshuffled,
                 wd_ptr,
                 wd_rsrc,
                 e,
@@ -956,6 +1225,7 @@ def build_down_reduce_fp8_module(
                 use_i64_base=use_i64_base,
                 bytes_per_expert=bytes_per_expert,
                 inter=inter,
+                hidden=hidden,
                 kh_per_warp=kh_per_warp,
             )
 
@@ -969,8 +1239,15 @@ def build_down_reduce_fp8_module(
                     # Shared activation load + kh independent weight loads in flight.
                     aw = load_i32_words(inter_rsrc, a_word0, n_pairs)
                     dw = [
-                        load_i32_words(
-                            wd_rsrc_e, w_word_base[h] + k_base // 4, n_wwords
+                        _weight_i32_words(
+                            preshuffled,
+                            n_wwords,
+                            rsrc=wd_rsrc_e,
+                            word0=w_word_base[h] + k_base // 4,
+                            view=wd_b,
+                            n_idx=out_j0 + h,
+                            k_packed0=k_base,
+                            elem_bytes=1,
                         )
                         for h in range(kh_per_warp)
                     ]
@@ -1007,8 +1284,15 @@ def build_down_reduce_fp8_module(
                     # Shared activation load + kh independent weight loads in flight.
                     aw = load_i32_words(inter_rsrc, a_word0, n_pairs)
                     dw = [
-                        load_i32_words(
-                            wd_rsrc_e, w_word_base[h] + k_base // 4, n_wwords
+                        _weight_i32_words(
+                            preshuffled,
+                            n_wwords,
+                            rsrc=wd_rsrc_e,
+                            word0=w_word_base[h] + k_base // 4,
+                            view=wd_b,
+                            n_idx=out_j0 + h,
+                            k_packed0=k_base,
+                            elem_bytes=1,
                         )
                         for h in range(kh_per_warp)
                     ]
@@ -1081,6 +1365,7 @@ def build_gate_up_fp4_module(
     scale_bn: int = 1,
     scale_bk: int = 32,
     dot2_acc: int = 1,
+    preshuffled: bool = False,
 ):
     """Build the gate_up MXFP4 launcher (BF16 activation, FP4 e2m1 weights).
 
@@ -1162,8 +1447,9 @@ def build_gate_up_fp4_module(
         row_blk = w_row // scale_bn
 
         x_rsrc = _ptr_rsrc(x_ptr)
-        wg_rsrc = _ptr_rsrc(wg_ptr)
-        wu_rsrc = _ptr_rsrc(wu_ptr)
+        wg_b, wu_b, wg_rsrc, wu_rsrc = _gate_up_weight_ptrs(
+            preshuffled, wg_ptr, wu_ptr, e, inter, hidden // 2, 1
+        )
         wgs_rsrc = _ptr_rsrc(wgs_ptr)
         wus_rsrc = _ptr_rsrc(wus_ptr)
 
@@ -1178,8 +1464,26 @@ def build_gate_up_fp4_module(
             x_word0 = (token_b * hidden + k_base) // 2
             w_word0 = w_row * (hidden // 8) + k_base // 8
             xw = load_i32_words(x_rsrc, x_word0, n_pairs)
-            gw = load_i32_words(wg_rsrc, w_word0, n_wwords)
-            uw = load_i32_words(wu_rsrc, w_word0, n_wwords)
+            gw = _weight_i32_words(
+                preshuffled,
+                n_wwords,
+                rsrc=wg_rsrc,
+                word0=w_word0,
+                view=wg_b,
+                n_idx=neuron_j,
+                k_packed0=k_base // 2,
+                elem_bytes=1,
+            )
+            uw = _weight_i32_words(
+                preshuffled,
+                n_wwords,
+                rsrc=wu_rsrc,
+                word0=w_word0,
+                view=wu_b,
+                n_idx=neuron_j,
+                k_packed0=k_base // 2,
+                elem_bytes=1,
+            )
             sidx = fx.Int32(row_blk * scale_cols + k_base // scale_bk)
             gs = e8m0_byte_to_f32(
                 buffer_ops.buffer_load(wgs_rsrc, sidx, vec_width=1, dtype=T.i8())
@@ -1247,6 +1551,7 @@ def build_down_reduce_fp4_module(
     kh_per_warp: int = 1,
     dot2_acc: int = 4,
     prefetch: bool = False,
+    preshuffled: bool = False,
 ):
     """Build the down_reduce MXFP4 launcher (BF16 intermediate, FP4 e2m1 weights).
 
@@ -1341,6 +1646,7 @@ def build_down_reduce_fp4_module(
             e = fx.Int32(_i32_load(rid_t, ridx))
             rw = _f32_load(rwt_t, ridx)
             w_row = [e * hidden + out_j0 + h for h in range(kh_per_warp)]
+            wd_b = _down_preshuffled_b(preshuffled, wd_ptr, e, hidden, inter // 2, 1)
 
             # G7 ILP: collect every (iter, pair) contribution for each output h
             # into one pair list, so the drain spreads them over `dot2_acc`
@@ -1361,8 +1667,15 @@ def build_down_reduce_fp4_module(
                     aw_all.append(load_i32_words(inter_rsrc, a_word0, n_pairs))
                     dw_all.append(
                         [
-                            load_i32_words(
-                                wd_rsrc, w_row[h] * (inter // 8) + k_base // 8, n_wwords
+                            _weight_i32_words(
+                                preshuffled,
+                                n_wwords,
+                                rsrc=wd_rsrc,
+                                word0=w_row[h] * (inter // 8) + k_base // 8,
+                                view=wd_b,
+                                n_idx=out_j0 + h,
+                                k_packed0=k_base // 2,
+                                elem_bytes=1,
                             )
                             for h in range(kh_per_warp)
                         ]
@@ -1404,8 +1717,15 @@ def build_down_reduce_fp4_module(
                     # Shared activation load + kh independent FP4 weight loads.
                     aw = load_i32_words(inter_rsrc, a_word0, n_pairs)
                     dw = [
-                        load_i32_words(
-                            wd_rsrc, w_row[h] * (inter // 8) + k_base // 8, n_wwords
+                        _weight_i32_words(
+                            preshuffled,
+                            n_wwords,
+                            rsrc=wd_rsrc,
+                            word0=w_row[h] * (inter // 8) + k_base // 8,
+                            view=wd_b,
+                            n_idx=out_j0 + h,
+                            k_packed0=k_base // 2,
+                            elem_bytes=1,
                         )
                         for h in range(kh_per_warp)
                     ]
@@ -1474,6 +1794,7 @@ def build_gate_up_bf16_module(
     kvector: int | None = None,
     serialize_dot2: bool = True,
     use_dot2: bool = True,
+    preshuffled: bool = False,
 ):
     """Build the gate_up launcher with **BF16 weights** (BF16 activation too).
 
@@ -1521,8 +1842,9 @@ def build_gate_up_bf16_module(
         w_row = e * inter + neuron_j
 
         x_rsrc = _ptr_rsrc(x_ptr)
-        wg_rsrc = _ptr_rsrc(wg_ptr)
-        wu_rsrc = _ptr_rsrc(wu_ptr)
+        wg_b, wu_b, wg_rsrc, wu_rsrc = _gate_up_weight_ptrs(
+            preshuffled, wg_ptr, wu_ptr, e, inter, hidden, 2
+        )
 
         gate_dot = fx.Float32(0.0).ir_value()
         up_dot = fx.Float32(0.0).ir_value()
@@ -1532,8 +1854,26 @@ def build_gate_up_bf16_module(
             # bf16 weights: 2 bf16/dword, so the word offset mirrors the activation.
             w_word0 = w_row * (hidden // 2) + k_base // 2
             xw = load_i32_words(x_rsrc, x_word0, n_pairs)
-            gw = load_i32_words(wg_rsrc, w_word0, n_pairs)
-            uw = load_i32_words(wu_rsrc, w_word0, n_pairs)
+            gw = _weight_i32_words(
+                preshuffled,
+                n_pairs,
+                rsrc=wg_rsrc,
+                word0=w_word0,
+                view=wg_b,
+                n_idx=neuron_j,
+                k_packed0=k_base,
+                elem_bytes=2,
+            )
+            uw = _weight_i32_words(
+                preshuffled,
+                n_pairs,
+                rsrc=wu_rsrc,
+                word0=w_word0,
+                view=wu_b,
+                n_idx=neuron_j,
+                k_packed0=k_base,
+                elem_bytes=2,
+            )
             for ipair in range_constexpr(n_pairs):
                 x_i32 = xw[ipair]
                 # No convert: the bf16 weight pair is already a dot2 operand.
@@ -1589,6 +1929,7 @@ def build_down_reduce_bf16_module(
     serialize_dot2: bool = True,
     kh_per_warp: int = 1,
     use_dot2: bool = True,
+    preshuffled: bool = False,
 ):
     """Build the down_reduce launcher with **BF16 weights** (BF16 intermediate too).
 
@@ -1646,6 +1987,7 @@ def build_down_reduce_bf16_module(
             e = fx.Int32(_i32_load(rid_t, ridx))
             rw = _f32_load(rwt_t, ridx)
             w_row = [e * hidden + out_j0 + h for h in range(kh_per_warp)]
+            wd_b = _down_preshuffled_b(preshuffled, wd_ptr, e, hidden, inter, 2)
 
             dot = [fx.Float32(0.0).ir_value() for _ in range(kh_per_warp)]
             for i in range_constexpr(num_iter):
@@ -1654,8 +1996,15 @@ def build_down_reduce_bf16_module(
                 a_word0 = (inter_row * inter + k_base) // 2
                 aw = load_i32_words(inter_rsrc, a_word0, n_pairs)
                 dw = [
-                    load_i32_words(
-                        wd_rsrc, w_row[h] * (inter // 2) + k_base // 2, n_pairs
+                    _weight_i32_words(
+                        preshuffled,
+                        n_pairs,
+                        rsrc=wd_rsrc,
+                        word0=w_row[h] * (inter // 2) + k_base // 2,
+                        view=wd_b,
+                        n_idx=out_j0 + h,
+                        k_packed0=k_base,
+                        elem_bytes=2,
                     )
                     for h in range(kh_per_warp)
                 ]
