@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (c) 2025 FlyDSL Project Contributors
 
-"""8-wave MXFP8 matmul for AMD CDNA4 (gfx950 / MI355X)."""
+"""8-wave MXFP8/A8W4 matmul for AMD CDNA4 (gfx950 / MI355X)."""
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
@@ -85,6 +85,18 @@ class ScalePreshuffledS2R:
         return words
 
 
+class PackedFp4S2R(S2RLoader):
+    """Read a packed 16x128 FP4 tile from the standard AITER weight layout."""
+
+    def load(self, lds_src, preshuffled=True):
+        fragments = []
+        for i in range_constexpr(self.n_tiles):
+            row = self.wave_idx * (self.n_tiles * 16) + i * 16 + self.lane_id % 16
+            offset = row // 16 * 1024 + row % 16 * 16 + self.lane_id // 16 * 256
+            fragments.append(self._vec_load_16xf8(lds_src, offset).bitcast(fx.Int32))
+        return fragments
+
+
 class MxMfma:
     """16x16x128 scaled-MFMA driver (bare atom: ``TiledMma`` has no ``set_value``).
 
@@ -94,7 +106,7 @@ class MxMfma:
     loop emits no byte-select instructions at all.
     """
 
-    def __init__(self, n_tiles_a, n_tiles_b):
+    def __init__(self, n_tiles_a, n_tiles_b, b_dtype="fp8"):
         # opsel = k_pack * 2 + tile_in_pair, so both operands share k_pack.
         self.atoms = {
             (kp * 2 + ia, kp * 2 + jb): fx.make_mma_atom(
@@ -103,6 +115,7 @@ class MxMfma:
                     16,
                     128,
                     fx.Float8E4M3FN,
+                    fx.Float4E2M1FN if b_dtype == "fp4" else fx.Float8E4M3FN,
                     opsel_a=kp * 2 + ia,
                     opsel_b=kp * 2 + jb,
                 )
@@ -114,12 +127,13 @@ class MxMfma:
         self.zero_value = Vec.filled(4, 0.0, fx.Float32)
         self.n_tiles_a = n_tiles_a
         self.n_tiles_b = n_tiles_b
+        self.b_words = 4 if b_dtype == "fp4" else 8
 
     def idx(self, i, j):
         return i * self.n_tiles_b + j
 
-    def _operand(self, value):
-        frag = fx.make_rmem_tensor(8, fx.Int32)
+    def _operand(self, value, words=8):
+        frag = fx.make_rmem_tensor(words, fx.Int32)
         frag.store(Vec(value))
         return frag
 
@@ -137,7 +151,9 @@ class MxMfma:
         assert len(c) == self.n_tiles_a * self.n_tiles_b
 
         a_frags = [self._operand(a[i]) for i in range_constexpr(self.n_tiles_a)]
-        b_frags = [self._operand(b[j]) for j in range_constexpr(self.n_tiles_b)]
+        b_frags = [
+            self._operand(b[j], self.b_words) for j in range_constexpr(self.n_tiles_b)
+        ]
         c_frags = [
             self._accum(c[i]) for i in range_constexpr(self.n_tiles_a * self.n_tiles_b)
         ]
@@ -173,15 +189,18 @@ def compile_mxfp8_gemm_8w(
     expert_block_m: int | None = None,
     b_k: int | None = None,
     dynamic_rows: bool = False,
+    b_dtype: str = "fp8",
 ):
-    """Build the MXFP8 launcher.
+    """Build an FP8-activation launcher with FP8 or packed FP4 weights.
 
     ``grouped`` accepts expert-sorted, 256-row-padded A and one expert ID per
     M tile. B and its scales contain consecutive experts. The grouped launcher
     takes ``expert_ids`` and ``row_map`` after the two scale tensors; the dense
     API is unchanged. ``gather_a`` reads A using the sorted-to-source row map.
     ``store_factory`` lets MoE reuse the compute pipeline with a fused epilogue.
-    ``b_k`` separates the packed weight stride from the padded A/scale stride.
+    ``b_dtype="fp4"`` uses E2M1 pairs in the standard 16x64-byte weight layout.
+    ``b_k`` is the logical weight stride before FP4 packing and can differ from
+    the padded A/scale stride.
     ``dynamic_rows`` adds a GPU valid-row tensor after ``row_map``; c_m remains
     the allocation/grid upper bound and inactive CTAs never read expert IDs.
     """
@@ -208,6 +227,10 @@ def compile_mxfp8_gemm_8w(
     b_k = K if b_k is None else b_k
     assert logical_k <= b_k <= K and b_k % 64 == 0
     assert not dynamic_rows or grouped
+    assert b_dtype in ("fp8", "fp4")
+    assert b_dtype != "fp4" or b_preshuffled
+    b_pack = 2 if b_dtype == "fp4" else 1
+    assert b_k % (64 * b_pack) == 0
     K_ITERS = logical_k // BLOCK_K
     # Scale words are addressed by K-pair, so K must contain a whole number of
     # them (K % 256 above already guarantees it).
@@ -219,10 +242,10 @@ def compile_mxfp8_gemm_8w(
     LDS_BLOCK_M = BLOCK_M // 2
     LDS_BLOCK_N = BLOCK_N // 2
     N_LDS_STEPS_A = LDS_BLOCK_M // 64
-    N_LDS_STEPS_B = LDS_BLOCK_N // 64
+    N_LDS_STEPS_B = LDS_BLOCK_N // (64 * b_pack)
 
     a_lds_size = LDS_BLOCK_M * BLOCK_K
-    b_lds_size = LDS_BLOCK_N * BLOCK_K
+    b_lds_size = LDS_BLOCK_N * BLOCK_K // b_pack
 
     A_GRP_ROWS = N_TILES_A * 16  # rows one wave_m owns inside one LDS half
     B_GRP_ROWS = N_TILES_B * 16
@@ -302,9 +325,9 @@ def compile_mxfp8_gemm_8w(
 
             A0_gl_offset = (block_m * BLOCK_M) * K
             A1_gl_offset = (block_m * BLOCK_M + LDS_BLOCK_M) * K
-            B_K_STEP = (2 * 1024) if b_preshuffled else BLOCK_K
-            B0_gl_offset = b_row * b_k
-            B1_gl_offset = (b_row + LDS_BLOCK_N) * b_k
+            B_K_STEP = ((2 * 1024) if b_preshuffled else BLOCK_K) // b_pack
+            B0_gl_offset = b_row * (b_k // b_pack)
+            B1_gl_offset = (b_row + LDS_BLOCK_N) * (b_k // b_pack)
 
             gA = make_fp8_buffer_tensor(A, F8_IR_t)
             gB = make_fp8_buffer_tensor(B_T, F8_IR_t)
@@ -314,9 +337,17 @@ def compile_mxfp8_gemm_8w(
             gl_off_a = compute_global_swizzle(
                 lane_id, wave_id, K, N_LDS_STEPS_A, preshuffled=False
             )
-            gl_off_b = compute_global_swizzle(
-                lane_id, wave_id, b_k, N_LDS_STEPS_B, preshuffled=b_preshuffled
-            )
+            if const_expr(b_dtype == "fp4"):
+                gl_off_b = [
+                    (wave_id + step * 8) * (b_k // 2 * 16)
+                    + lane_id % 16 * 16
+                    + lane_id // 16 * 256
+                    for step in range_constexpr(N_LDS_STEPS_B)
+                ]
+            else:
+                gl_off_b = compute_global_swizzle(
+                    lane_id, wave_id, b_k, N_LDS_STEPS_B, preshuffled=b_preshuffled
+                )
 
             gl_off_a1 = gl_off_a
             if const_expr(gather_a):
@@ -331,13 +362,13 @@ def compile_mxfp8_gemm_8w(
                 gl_off_a, gl_off_a1 = offsets
                 A0_gl_offset = A1_gl_offset = fx.Int32(0)
 
-            mfma = MxMfma(N_TILES_A, N_TILES_B)
+            mfma = MxMfma(N_TILES_A, N_TILES_B, b_dtype)
 
             a_g2s = G2SLoader(a_div, gl_off_a, N_LDS_STEPS_A, F8_IR_t, wave_id)
             a1_g2s = G2SLoader(a_div, gl_off_a1, N_LDS_STEPS_A, F8_IR_t, wave_id)
             b_g2s = G2SLoader(b_div, gl_off_b, N_LDS_STEPS_B, F8_IR_t, wave_id)
             a_s2r = S2RLoader(wave_m, N_TILES_A)
-            b_s2r = S2RLoader(wave_n, N_TILES_B)
+            b_s2r = (PackedFp4S2R if b_dtype == "fp4" else S2RLoader)(wave_n, N_TILES_B)
             scratch = [
                 a_cur0.ptr,
                 a_cur1.ptr,

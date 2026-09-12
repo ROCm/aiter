@@ -1,13 +1,15 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (c) 2026 FlyDSL Project Contributors
 
-"""Expert-grouped MXFP8 prefill GEMMs sharing the dense eight-wave pipeline.
+"""Expert-grouped MXFP8/A8W4 prefill GEMMs sharing the dense eight-wave pipeline.
 
 Output rows are sorted by expert and each expert is padded to 256 rows.
 Stage 1 can gather source-token A using ``row_map``; stage 2 uses sorted A. Weights use the
 dense kernel's 16x64 preshuffle and scales use ``shuffle_scale_w4``. For stage 1,
 interleave gate/up in groups of 16 rows before preshuffling. K is padded to 256
-(in particular, MiniMax M3 TP8's down projection uses K=512 for logical K=384).
+(MiniMax M3 and DeepSeek-V4 TP8 use K=512 for logical K=384).
+FP4 weights pack two E2M1 values per byte. Stage 1 supports clamped SwiGLU or
+standard SiLU; both paths keep BF16 partials before the FP32 routing reduction.
 """
 
 import flydsl.compiler as flyc
@@ -21,7 +23,12 @@ from .gemm import compile_mxfp8_gemm_8w
 
 
 def _store_factory(
-    *, activation=False, transpose=False, mask_n=False, swiglu_limit=7.0
+    *,
+    activation=False,
+    transpose=False,
+    mask_n=False,
+    swiglu_limit=7.0,
+    activation_type="swiglu",
 ):
     def factory(C, rows, cols, idx, n_tiles_a, n_tiles_b, scratch):
         cols = cols // 2 if activation else cols
@@ -61,15 +68,22 @@ def _store_factory(
                         for i in range_constexpr(4):
                             v = value[i]
                             if const_expr(activation):
-                                gate = fx.min(v, swiglu_limit)
-                                linear = fx.max(
-                                    fx.min(up[i], swiglu_limit), -swiglu_limit
-                                )
-                                v = (
-                                    gate
-                                    / (1.0 + fmath.exp(-1.702 * gate))
-                                    * (linear + 1.0)
-                                )
+                                gate, linear = v, up[i]
+                                if const_expr(
+                                    activation_type == "swiglu" or swiglu_limit
+                                ):
+                                    gate = fx.min(gate, swiglu_limit)
+                                    linear = fx.max(
+                                        fx.min(linear, swiglu_limit), -swiglu_limit
+                                    )
+                                if const_expr(activation_type == "swiglu"):
+                                    v = (
+                                        gate
+                                        / (1.0 + fmath.exp(-1.702 * gate))
+                                        * (linear + 1.0)
+                                    )
+                                else:
+                                    v = gate / (1.0 + fmath.exp(-gate)) * linear
                             scratch_at(row + i, col, 1).store(
                                 Vec.filled(1, v.to(fx.BFloat16), fx.BFloat16)
                             )
@@ -121,10 +135,15 @@ def compile_mxfp8_moe_gemm_8w(
     expert_block_m=256,
     b_k=None,
     dynamic_rows=False,
-    swiglu_limit=7.0,
+    swiglu_limit=None,
     activation=True,
+    activation_type="swiglu",
+    b_dtype="fp8",
 ):
-    """Return a grouped launcher; stage 1 fuses MiniMax's clamped SwiGLU.
+    """Return a grouped launcher with FP8 activations and FP8 or packed FP4 weights.
+
+    Stage 1 fuses clamped SwiGLU or standard SiLU, selected by activation_type.
+    A None swiglu_limit uses 7 for SwiGLU and disables clamping for SiLU.
 
     Arguments: A, packed B, BF16 C, shuffled A/B scales, expert_ids, row_map,
     padded_rows, projection_N, stream. Both padded_rows and projection_N must
@@ -133,6 +152,10 @@ def compile_mxfp8_moe_gemm_8w(
     """
     if stage not in (1, 2):
         raise ValueError(f"stage must be 1 or 2, got {stage}")
+    if activation_type not in ("swiglu", "silu"):
+        raise ValueError(f"Unsupported activation: {activation_type}")
+    if swiglu_limit is None:
+        swiglu_limit = 7.0 if activation_type == "swiglu" else 0.0
     return compile_mxfp8_gemm_8w(
         K=K,
         BLOCK_M=tile_m,
@@ -140,6 +163,7 @@ def compile_mxfp8_moe_gemm_8w(
         expert_block_m=expert_block_m,
         b_k=b_k,
         dynamic_rows=dynamic_rows,
+        b_dtype=b_dtype,
         b_preshuffled=True,
         xcd_swizzle=xcd_swizzle,
         grouped=True,
@@ -150,6 +174,7 @@ def compile_mxfp8_moe_gemm_8w(
             transpose=stage == 2,
             mask_n=tile_n == 512,
             swiglu_limit=swiglu_limit,
+            activation_type=activation_type,
         ),
     )
 

@@ -1,11 +1,13 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
-"""Eight-wave MXFP8 prefill adapter for the standard AITER sorted MoE ABI.
+"""Eight-wave MXFP8/A8W4 prefill adapter for the standard AITER sorted MoE ABI.
 
 Uses the existing G1U1 16x64 weight packing and E8M0 scale layout. Workspace
 bounds come from tensor shapes; the valid sorted row count stays on the GPU.
 Stage 1 returns sorted FP8 activations and scales; stage 2 reduces sorted BF16
-partials in FP32. Neither weight repacking nor host row-count readback is needed.
+partials in FP32. A8W4 names select packed E2M1 weights and standard SiLU.
+Neither weight repacking nor host row-count readback is needed. A8W4 remains
+opt-in: the existing DSV4 tuned kernels remain the default.
 """
 
 import functools
@@ -14,18 +16,21 @@ import re
 
 import torch
 
-_NAME = re.compile(r"flydsl_moe([12])_mxfp8_8w_t(256x256|128x512)_xcd([0-9]+)")
+_NAME = re.compile(r"flydsl_moe([12])_(mxfp8|a8w4)_8w_t(256x256|128x512)_xcd([0-9]+)")
 
 
-def kernel_name(stage, tile_m=256, tile_n=256, swizzle=1):
-    return f"flydsl_moe{stage}_mxfp8_8w_t{tile_m}x{tile_n}_xcd{swizzle}"
+def kernel_name(stage, tile_m=256, tile_n=256, swizzle=1, b_dtype="fp8"):
+    if b_dtype not in ("fp8", "fp4"):
+        raise ValueError(f"Unsupported weight dtype: {b_dtype}")
+    family = "a8w4" if b_dtype == "fp4" else "mxfp8"
+    return f"flydsl_moe{stage}_{family}_8w_t{tile_m}x{tile_n}_xcd{swizzle}"
 
 
 def kernel_params(name):
     match = _NAME.fullmatch(name or "")
     if match is None:
         return None
-    stage, tile, swizzle = match.groups()
+    stage, family, tile, swizzle = match.groups()
     tile_m, tile_n = map(int, tile.split("x"))
     if int(swizzle) not in (0, 1, 2, 3, 4, 8):
         raise ValueError(f"Unsupported MXFP8 eight-wave swizzle: {swizzle}")
@@ -39,7 +44,8 @@ def kernel_params(name):
         "mode": "reduce",
         "sort_block_m": 256,
         "a_dtype": "fp8",
-        "b_dtype": "fp8",
+        "b_dtype": "fp4" if family == "a8w4" else "fp8",
+        "activation_type": "silu" if family == "a8w4" else "swiglu",
         "out_dtype": "fp8" if int(stage) == 1 else "bf16",
     }
 
@@ -117,7 +123,7 @@ def stage1(
     swiglu_limit=None,
 ):
     params = kernel_params(kernelName)
-    if params is None or params["stage"] != 1 or block_m != 256:
+    if params is None or params["stage"] != 1 or block_m != params["sort_block_m"]:
         raise ValueError(
             f"Invalid eight-wave stage-1 configuration: {kernelName}, block_m={block_m}"
         )
@@ -126,7 +132,7 @@ def stage1(
             "Eight-wave MXFP8 prefill requires BF16 input and stage-2 routing weights"
         )
     tokens, hidden = hidden_states.shape
-    inter = w2.shape[-1]
+    inter = w2.shape[-1] * (2 if params["b_dtype"] == "fp4" else 1)
     rows, row_map, inverse = _routes(sorted_ids, num_valid_ids, tokens, topk)
     device = hidden_states.device
     aq = torch.empty((tokens, hidden), dtype=torch.int8, device=device)
@@ -165,7 +171,10 @@ def stage1(
         tile_m=params["tile_m"],
         tile_n=params["tile_n"],
         xcd_swizzle=params["xcd_swizzle"],
-        swiglu_limit=7.0 if swiglu_limit is None else float(swiglu_limit),
+        swiglu_limit=None if swiglu_limit is None else float(swiglu_limit),
+        activation_type=params["activation_type"],
+        b_dtype=params["b_dtype"],
+        expert_block_m=block_m,
     )
     _run(
         "quant",
@@ -202,12 +211,12 @@ def stage2(
     sorted_weights=None,
 ):
     params = kernel_params(kernelName)
-    if params is None or params["stage"] != 2 or block_m != 256:
+    if params is None or params["stage"] != 2 or block_m != params["sort_block_m"]:
         raise ValueError(
             f"Invalid eight-wave stage-2 configuration: {kernelName}, block_m={block_m}"
         )
     tokens, hidden = out.shape
-    inter = w2.shape[-1]
+    inter = w2.shape[-1] * (2 if params["b_dtype"] == "fp4" else 1)
     rows, row_map, inverse = _routes(sorted_ids, num_valid_ids, tokens, topk)
     partial = torch.empty((rows, hidden), dtype=torch.bfloat16, device=out.device)
     stream = _stream()
@@ -232,6 +241,9 @@ def stage2(
         stage=2,
         dynamic_rows=True,
         xcd_swizzle=params["xcd_swizzle"],
+        b_dtype=params["b_dtype"],
+        expert_block_m=block_m,
+        tile_m=params["tile_m"],
     )
     _run(
         "reduce",
@@ -250,12 +262,15 @@ stage2._is_flydsl_stage2 = True
 def precompile(kernelName, token_num, model_dim, inter_dim, experts, topk):
     """Compile through the runtime adapter using FakeTensorMode and COMPILE_ONLY."""
     params = kernel_params(kernelName)
+    if params is None:
+        raise ValueError(f"Invalid eight-wave kernel name: {kernelName}")
     tokens, hidden, inter = token_num, model_dim, inter_dim
+    pack = 2 if params["b_dtype"] == "fp4" else 1
     count = tokens * topk + experts * 256 - topk
     rows = (count + 255) // 256 * 256
     kwargs = {"device": "cpu"}
-    w1 = torch.empty((experts, 2 * inter, hidden), dtype=torch.int8, **kwargs)
-    w2 = torch.empty((experts, hidden, inter), dtype=torch.int8, **kwargs)
+    w1 = torch.empty((experts, 2 * inter, hidden // pack), dtype=torch.int8, **kwargs)
+    w2 = torch.empty((experts, hidden, inter // pack), dtype=torch.int8, **kwargs)
     ids = torch.empty(count, dtype=torch.int32, **kwargs)
     eids = torch.empty(rows // 256, dtype=torch.int32, **kwargs)
     valid = torch.empty(2, dtype=torch.int32, **kwargs)
