@@ -67,7 +67,13 @@ def _initialize_hipblaslt() -> None:
     hipb_create_extension()
 
 
-@functools.lru_cache(maxsize=16)
+# Sized to the caller's whitelist, which admits 28 distinct token counts; at 16
+# the M values a mixed decode/prefill server actually cycles through evict each
+# other. A miss is not expensive -- the tuned table itself is cached upstream, so
+# the cost is a few get_padded_m() extension calls -- and in the graphed decode
+# path it is paid at capture, not replay. This is just sizing the cache to the
+# set it exists to cover.
+@functools.lru_cache(maxsize=32)
 def _large_m_front_gemm_config(m: int) -> dict:
     from aiter.tuned_gemm import get_GEMM_A16W16_config
 
