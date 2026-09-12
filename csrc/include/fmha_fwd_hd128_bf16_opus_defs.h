@@ -42,10 +42,8 @@ struct opus_gqa_kargs {
     void* __restrict__ ptr_lse;
     int stride_lse_b;
     int stride_lse_h;
-    // Optional attention sinks: one fp32 learned logit per QUERY head, [H], unit stride.
-    // A sink behaves as one extra key that contributes to the softmax denominator but
-    // carries no value, so it only shifts the normalizer (see store_result in the
-    // kernel). nullptr => no sink. gpt-oss sets one on every attention layer.
+    // Optional attention sink: one fp32 logit per QUERY head, [H], unit stride -- a
+    // valueless extra key in the softmax denominator (see store_result). nullptr => none.
     const void* __restrict__ ptr_sink;
 };
 
@@ -84,13 +82,13 @@ struct opus_gqa_traits {
     static constexpr int T_N = 1;         // waves along N
     static constexpr int T_K = 1;         // waves along K
 
-    // MFMA base tile (D=128): bf16 32x32x16
+    // MFMA instruction shape: bf16 32x32x16.
     static constexpr int W_M = 32;
     static constexpr int W_N = 32;
     static constexpr int W_K = 16;
 
-    // D=128 covers the full head dim in one MMA (no D slicing).
-    static constexpr int SLICE_D = D_TILE_SIZE;  // == 128
+    // Each kernel instance covers the full head dim without an outer D-slicing loop.
+    static constexpr int SLICE_D = D_TILE_SIZE;
     static constexpr int NUM_D_SLICES = 1;
     static_assert(D_TILE_SIZE % SLICE_D == 0);
 
@@ -125,9 +123,9 @@ struct opus_gqa_traits {
     static constexpr int smem_padding_16B = 16 / sizeof(D_ATTN);
     static constexpr int smem_padding_64B = 64 / sizeof(D_ATTN);
 
-    // K/V smem padding: K uses 16B padding, V uses 64B padding. Tuned at D=128; kept
-    // identical at D=64 so the port is behaviour-preserving, but it is a tuning knob
-    // (bank-conflict behaviour differs when smem_d_rpt drops from 2 to 1).
+    // K/V smem padding (K 16B, V 64B), unchanged from D=128. These are not independent
+    // tuning knobs: the store/read layouts use the same constants and must change with
+    // the allocations or their addressing will diverge.
     static constexpr int smem_k_padding = smem_padding_16B;
     static constexpr int smem_v_padding = smem_padding_64B;
 
@@ -155,8 +153,8 @@ struct opus_gqa_traits {
     // D-generality guards: every derived count above must divide exactly, or the tiling
     // silently drops work. Checked here so a new D_TILE_SIZE fails at compile time.
     static_assert(D_TILE_SIZE % D_128B_SIZE == 0, "D_TILE_SIZE must be a multiple of 128B");
-    static_assert(SLICE_D % W_K == 0, "SLICE_D must divide the MFMA K (GEMM0_E_K)");
-    static_assert(SLICE_D % W_N == 0, "SLICE_D must divide the MFMA N (GEMM1_E_N)");
+    static_assert(SLICE_D % W_K == 0, "SLICE_D must be divisible by the MFMA K");
+    static_assert(SLICE_D % W_N == 0, "SLICE_D must be divisible by the MFMA N");
     static_assert((KV_TILE_SIZE * D_TILE_SIZE) % (BLOCK_SIZE * VEC_KV) == 0,
                   "K/V tile must divide evenly into whole-block vector loads");
     static_assert((GEMM0_E_N * GEMM0_E_K * W_N * W_K) % (WARP_SIZE * VEC_KV) == 0,

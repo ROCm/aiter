@@ -35,7 +35,7 @@ struct fmha_fwd_bf16_opus_args
     // nullptr => the kernel skips the log-sum-exp store entirely.
     void* lse_ptr = nullptr;
     // Optional attention sink: one fp32 logit per query head, [nhead]. nullptr => no sink.
-    // Symmetric (d128) kernel only; the d192/v128 kernel has no sink support.
+    // Symmetric D=64/128 kernels only; the d192/v128 kernel has no sink support.
     const void* sink_ptr = nullptr;
 
     // Group / varlen, int32, length batch+1. A null seqstart_q_ptr selects batch mode.
@@ -302,9 +302,8 @@ inline bool launch_d192_v128(const fmha_fwd_bf16_opus_args& a, hipStream_t strea
 
 // Launches the opus forward kernel that matches the argument head dims on `stream`.
 // Returns false when the input is outside what the kernels cover: a data type other than
-// bf16, a (hdim_q, hdim_v) other than (128,128) or (192,128), group mode asked of the
-// batch-only symmetric kernel, or (for the 128/128 kernel only) a kv extent past the
-// 32-bit async-load offset limit.
+// bf16, a (hdim_q, hdim_v) outside {(64,64), (128,128), (192,128)}, incomplete group
+// metadata, or (for a symmetric kernel) a KV extent past the 32-bit async-load limit.
 inline bool fmha_fwd_bf16_opus_launch(const fmha_fwd_bf16_opus_args& a, hipStream_t stream)
 {
     static const std::string arch_id = get_gpu_arch();
