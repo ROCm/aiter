@@ -9,7 +9,9 @@ BLOCK_M=16.
 
 These tests assert the *lookup decision* (matched key and BLOCK_M), not
 kernel output, so a regression in key canonicalization or candidate
-ordering is caught without launching a kernel.
+ordering is caught without launching a kernel. The lookup is pinned to
+the gfx942 table so the assertions hold on any machine the suite runs
+on (the composite keys are gfx942-only by design).
 """
 
 import pytest
@@ -39,7 +41,7 @@ def _matched_key(params):
         _lookup,
     )
 
-    table, axes, _ = _load("attn_2d", "triton", None)
+    table, axes, _ = _load("attn_2d", "triton", "gfx942")
     values = _axis_values(
         params.head_size,
         params.max_seqlen_q,
