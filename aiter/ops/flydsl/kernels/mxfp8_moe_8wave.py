@@ -19,7 +19,7 @@ from flydsl.expr import math as fmath
 from flydsl.expr.typing import ReductionOp, T
 from flydsl.expr.typing import Vector as Vec
 
-from .gemm import compile_mxfp8_gemm_8w
+from .gemm_mxfp8_8wave import compile_mxfp8_gemm_8w
 
 
 def _mxfp8_exponent(amax_bits):
@@ -52,6 +52,9 @@ def _store_factory(
     activation_type="swiglu",
     fuse_quant=False,
 ):
+    exponent_for_amax = _mxfp8_exponent
+    pack_fp8x8 = _pack_fp8x8
+
     def factory(C, rows, cols, idx, n_tiles_a, n_tiles_b, scratch):
         cols = cols // 2 if activation else cols
         tile_n = n_tiles_b * (8 if activation else 16)
@@ -111,11 +114,11 @@ def _store_factory(
                 )
                 amax_bits = fx.max(amax_bits, bits)
             amax_bits = fx.max(amax_bits, fx.gpu.shuffle_xor(amax_bits, 1, 64))
-            exponent = _mxfp8_exponent(amax_bits)
+            exponent = exponent_for_amax(amax_bits)
             scale = (exponent << 23).bitcast(fx.Float32)
             words = []
             for chunk in range_constexpr(2):
-                packed = _pack_fp8x8(values[chunk], scale)
+                packed = pack_fp8x8(values[chunk], scale)
                 words.extend([packed[0], packed[1]])
             reg = fx.make_rmem_tensor(16, fx.Int8)
             reg.store(Vec.from_elements(words, fx.Int32).bitcast(fx.Int8))

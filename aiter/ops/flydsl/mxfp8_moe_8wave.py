@@ -53,7 +53,7 @@ def kernel_params(name):
 
 @functools.lru_cache(maxsize=256)
 def _builder(kind, **kwargs):
-    from .kernels.mxfp8_moe_8wave.moe import (
+    from .kernels.mxfp8_moe_8wave import (
         compile_mxfp8_moe_gemm_8w,
         compile_mxfp8_moe_quant,
         compile_mxfp8_moe_reduce,

@@ -126,6 +126,8 @@ def make_g2s_loader(gl_src, gl_offsets, n_load_steps, lds_dtype, wave_id):
 def make_s2r_loader(wave_idx, n_tiles, *, packed_fp4=False):
     """Preserve FP8 register loads and use the same addressing helpers for FP4."""
 
+    pack = pack_i32x4_i32x8
+
     class S2RLoader:
         def __init__(self):
             self.lane_id = fx.thread_idx.x % 64
@@ -165,7 +167,7 @@ def make_s2r_loader(wave_idx, n_tiles, *, packed_fp4=False):
                         offset = row_swz * 128 + col_swz
                     v = self._vec_load_16xf8(lds_src, offset)
                     halves.append(v.bitcast(fx.Int32))
-                frag.append(pack_i32x4_i32x8(halves[0], halves[1]))
+                frag.append(pack(halves[0], halves[1]))
             return frag
 
         def load_one(self, lds_src, lds_offset):

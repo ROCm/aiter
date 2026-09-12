@@ -9,7 +9,7 @@ from flydsl.expr import const_expr, range_constexpr, rocdl
 from flydsl.expr.typing import Vector as Vec
 from flydsl.runtime.device import get_rocm_arch
 
-from ..gemm_a8w8_8wave import (
+from .gemm_a8w8_8wave import (
     _xcd_swizzle_any,
     ceildiv,
     compute_global_swizzle,
@@ -18,8 +18,8 @@ from ..gemm_a8w8_8wave import (
     make_s2r_loader,
     run_8wave_pipeline,
 )
-from ..kernels_common import get_warp_size
-from ..mfma_preshuffle_pipeline import split_row_major_2d
+from .kernels_common import get_warp_size
+from .mfma_preshuffle_pipeline import split_row_major_2d
 
 # 1 block = 512 threads = 8 waves (2 in M x 4 in N); the LDS budget below only
 # closes for this shape, see ``compile_mxfp8_gemm_8w``.
@@ -27,140 +27,154 @@ BLOCK_K = 128
 LDS_LIMIT_BYTES = 160 * 1024
 
 
-class ScalePreshuffledS2R:
-    """Coalesced reader for ``shuffle_scale_w4``-packed E8M0 -- no LDS staging."""
+def make_scale_preshuffled_s2r(scale_arg, rows, K, n_tiles):
+    class ScalePreshuffledS2R:
+        """Coalesced reader for ``shuffle_scale_w4``-packed E8M0 -- no LDS staging."""
 
-    def __init__(self, scale_arg, rows, K, n_tiles):
-        assert n_tiles % 2 == 0, "shuffle_scale_w4 pairs tiles two at a time"
-        self.n_pairs = n_tiles // 2
-        self.k1_stride = K // 256  # i32 groups of 64 per 32-row super-row
-        self.lane = fx.thread_idx.x % 64
-        # Same byte count as the raw layout, just permuted.
-        t_i8 = fx.rocdl.make_buffer_tensor(
-            scale_arg,
-            max_size=False,
-            num_records_bytes=fx.Int64(rows) * fx.Int64(K // 32),
-        )
-        i32_ptr = fx.PointerType.get(
-            elem_ty=fx.Int32.ir_type,
-            address_space=fx.rocdl.TargetAddressSpace.BufferDesc,
-            alignment=4,
-        )
-        iter_i32 = fx.recast_iter(i32_ptr, fx.get_iter(t_i8))
-        n_i32 = fx.Int32(rows) * fx.Int32(K // 128)
-        self.g_div = fx.logical_divide(
-            fx.Tensor(fx.make_view(iter_i32, fx.make_layout(n_i32, 1))),
-            fx.make_layout(1, 1),
-        )
-        self.atom = fx.make_copy_atom(fx.rocdl.BufferCopy32b(), fx.Int32)
-        # Two register sets: the caller prefetches the next K-pair while the
-        # current one is still feeding MFMAs.
-        self.regs = [
-            [
-                fx.make_rmem_tensor(fx.make_layout(1, 1), fx.Int32)
-                for _ in range_constexpr(self.n_pairs)
+        def __init__(self):
+            assert n_tiles % 2 == 0, "shuffle_scale_w4 pairs tiles two at a time"
+            self.n_pairs = n_tiles // 2
+            self.k1_stride = K // 256  # i32 groups of 64 per 32-row super-row
+            self.lane = fx.thread_idx.x % 64
+            # Same byte count as the raw layout, just permuted.
+            t_i8 = fx.rocdl.make_buffer_tensor(
+                scale_arg,
+                max_size=False,
+                num_records_bytes=fx.Int64(rows) * fx.Int64(K // 32),
+            )
+            i32_ptr = fx.PointerType.get(
+                elem_ty=fx.Int32.ir_type,
+                address_space=fx.rocdl.TargetAddressSpace.BufferDesc,
+                alignment=4,
+            )
+            iter_i32 = fx.recast_iter(i32_ptr, fx.get_iter(t_i8))
+            n_i32 = fx.Int32(rows) * fx.Int32(K // 128)
+            self.g_div = fx.logical_divide(
+                fx.Tensor(fx.make_view(iter_i32, fx.make_layout(n_i32, 1))),
+                fx.make_layout(1, 1),
+            )
+            self.atom = fx.make_copy_atom(fx.rocdl.BufferCopy32b(), fx.Int32)
+            # Two register sets: the caller prefetches the next K-pair while the
+            # current one is still feeding MFMAs.
+            self.regs = [
+                [
+                    fx.make_rmem_tensor(fx.make_layout(1, 1), fx.Int32)
+                    for _ in range_constexpr(self.n_pairs)
+                ]
+                for _ in range_constexpr(2)
             ]
-            for _ in range_constexpr(2)
-        ]
 
-    def read(self, row_base16, k):
-        """``n_tiles`` scale operands for K-step ``k``; tiles of a pair share one."""
-        k1 = k // 2  # compile-time; k % 2 is the k_pack the opsel encodes
-        regs = self.regs[k1 % 2]
-        words = []
-        for p in range_constexpr(self.n_pairs):
-            # row_base16 is even (wave offsets are multiples of 32 rows), so the
-            # 32-row super-row is row_base16 // 2 + p and n_pack is the tile parity.
-            n1 = row_base16 // 2 + p
-            base = fx.rocdl.readfirstlane(
-                fx.Int32.ir_type, (n1 * self.k1_stride + k1) * 64
-            )
-            fx.copy(
-                self.atom,
-                fx.slice(self.g_div, (None, fx.Int32(base) + self.lane)),
-                regs[p],
-            )
-            w = fx.Int32(regs[p].load()[0])
-            words += [w, w]
-        return words
-
-
-class MxMfma:
-    """16x16x128 scaled MFMA with per-tile packed scales and byte selectors.
-
-    One ``(opsel_a, opsel_b)`` atom per byte pair: in the ``shuffle_scale_w4``
-    layout a single i32 carries the E8M0 of two 16-row tiles x two K-steps, and
-    the byte is picked by ``opsel`` -- a compile-time atom field -- so the hot
-    loop emits no byte-select instructions at all.
-    """
-
-    def __init__(self, n_tiles_a, n_tiles_b, b_dtype="fp8"):
-        # opsel = k_pack * 2 + tile_in_pair, so both operands share k_pack.
-        self.atoms = {
-            (kp * 2 + ia, kp * 2 + jb): fx.make_mma_atom(
-                fx.rocdl.cdna4.MFMA_Scale(
-                    16,
-                    16,
-                    128,
-                    fx.Float8E4M3FN,
-                    fx.Float4E2M1FN if b_dtype == "fp4" else fx.Float8E4M3FN,
-                    opsel_a=kp * 2 + ia,
-                    opsel_b=kp * 2 + jb,
+        def read(self, row_base16, k):
+            """``n_tiles`` scale operands for K-step ``k``; tiles of a pair share one."""
+            k1 = k // 2  # compile-time; k % 2 is the k_pack the opsel encodes
+            regs = self.regs[k1 % 2]
+            words = []
+            for p in range_constexpr(self.n_pairs):
+                # row_base16 is even (wave offsets are multiples of 32 rows), so the
+                # 32-row super-row is row_base16 // 2 + p and n_pack is the tile parity.
+                n1 = row_base16 // 2 + p
+                base = fx.rocdl.readfirstlane(
+                    fx.Int32.ir_type, (n1 * self.k1_stride + k1) * 64
                 )
-            )
-            for kp in range_constexpr(2)
-            for ia in range_constexpr(2)
-            for jb in range_constexpr(2)
-        }
-        self.zero_value = Vec.filled(4, 0.0, fx.Float32)
-        self.n_tiles_a = n_tiles_a
-        self.n_tiles_b = n_tiles_b
-        self.b_words = 4 if b_dtype == "fp4" else 8
-
-    def idx(self, i, j):
-        return i * self.n_tiles_b + j
-
-    def _operand(self, value, words=8):
-        frag = fx.make_rmem_tensor(words, fx.Int32)
-        frag.store(Vec(value))
-        return frag
-
-    def _accum(self, value):
-        frag = fx.make_rmem_tensor(4, fx.Float32)
-        frag.store(Vec(value))
-        return frag
-
-    def _atom_for(self, k_pack, i, j):
-        return self.atoms[(k_pack * 2 + i % 2, k_pack * 2 + j % 2)]
-
-    def call(self, a, b, c, sa, sb, *, k_pack, set_prio=True):
-        assert len(a) == self.n_tiles_a and len(sa) == self.n_tiles_a
-        assert len(b) == self.n_tiles_b and len(sb) == self.n_tiles_b
-        assert len(c) == self.n_tiles_a * self.n_tiles_b
-
-        a_frags = [self._operand(a[i]) for i in range_constexpr(self.n_tiles_a)]
-        b_frags = [
-            self._operand(b[j], self.b_words) for j in range_constexpr(self.n_tiles_b)
-        ]
-        c_frags = [
-            self._accum(c[i]) for i in range_constexpr(self.n_tiles_a * self.n_tiles_b)
-        ]
-        if const_expr(set_prio):
-            rocdl.s_setprio(1)
-        for i in range_constexpr(self.n_tiles_a):
-            for j in range_constexpr(self.n_tiles_b):
-                cf = c_frags[self.idx(i, j)]
-                atom = self._atom_for(k_pack, i, j)
-                fx.gemm(
-                    atom, cf, a_frags[i], b_frags[j], cf, scale_a=sa[i], scale_b=sb[j]
+                fx.copy(
+                    self.atom,
+                    fx.slice(self.g_div, (None, fx.Int32(base) + self.lane)),
+                    regs[p],
                 )
-        if const_expr(set_prio):
-            rocdl.s_setprio(0)
-            rocdl.s_barrier()
-        return [
-            c_frags[i].load().ir_value()
-            for i in range_constexpr(self.n_tiles_a * self.n_tiles_b)
-        ]
+                w = fx.Int32(regs[p].load()[0])
+                words += [w, w]
+            return words
+
+    return ScalePreshuffledS2R()
+
+
+def make_mx_mfma(n_tiles_a, n_tiles_b, b_dtype="fp8"):
+    class MxMfma:
+        """16x16x128 scaled MFMA with per-tile packed scales and byte selectors.
+
+        One ``(opsel_a, opsel_b)`` atom per byte pair: in the ``shuffle_scale_w4``
+        layout a single i32 carries the E8M0 of two 16-row tiles x two K-steps, and
+        the byte is picked by ``opsel`` -- a compile-time atom field -- so the hot
+        loop emits no byte-select instructions at all.
+        """
+
+        def __init__(self):
+            # opsel = k_pack * 2 + tile_in_pair, so both operands share k_pack.
+            self.atoms = {
+                (kp * 2 + ia, kp * 2 + jb): fx.make_mma_atom(
+                    fx.rocdl.cdna4.MFMA_Scale(
+                        16,
+                        16,
+                        128,
+                        fx.Float8E4M3FN,
+                        fx.Float4E2M1FN if b_dtype == "fp4" else fx.Float8E4M3FN,
+                        opsel_a=kp * 2 + ia,
+                        opsel_b=kp * 2 + jb,
+                    )
+                )
+                for kp in range_constexpr(2)
+                for ia in range_constexpr(2)
+                for jb in range_constexpr(2)
+            }
+            self.zero_value = Vec.filled(4, 0.0, fx.Float32)
+            self.n_tiles_a = n_tiles_a
+            self.n_tiles_b = n_tiles_b
+            self.b_words = 4 if b_dtype == "fp4" else 8
+
+        def idx(self, i, j):
+            return i * self.n_tiles_b + j
+
+        def _operand(self, value, words=8):
+            frag = fx.make_rmem_tensor(words, fx.Int32)
+            frag.store(Vec(value))
+            return frag
+
+        def _accum(self, value):
+            frag = fx.make_rmem_tensor(4, fx.Float32)
+            frag.store(Vec(value))
+            return frag
+
+        def _atom_for(self, k_pack, i, j):
+            return self.atoms[(k_pack * 2 + i % 2, k_pack * 2 + j % 2)]
+
+        def call(self, a, b, c, sa, sb, *, k_pack, set_prio=True):
+            assert len(a) == self.n_tiles_a and len(sa) == self.n_tiles_a
+            assert len(b) == self.n_tiles_b and len(sb) == self.n_tiles_b
+            assert len(c) == self.n_tiles_a * self.n_tiles_b
+
+            a_frags = [self._operand(a[i]) for i in range_constexpr(self.n_tiles_a)]
+            b_frags = [
+                self._operand(b[j], self.b_words)
+                for j in range_constexpr(self.n_tiles_b)
+            ]
+            c_frags = [
+                self._accum(c[i])
+                for i in range_constexpr(self.n_tiles_a * self.n_tiles_b)
+            ]
+            if const_expr(set_prio):
+                rocdl.s_setprio(1)
+            for i in range_constexpr(self.n_tiles_a):
+                for j in range_constexpr(self.n_tiles_b):
+                    cf = c_frags[self.idx(i, j)]
+                    atom = self._atom_for(k_pack, i, j)
+                    fx.gemm(
+                        atom,
+                        cf,
+                        a_frags[i],
+                        b_frags[j],
+                        cf,
+                        scale_a=sa[i],
+                        scale_b=sb[j],
+                    )
+            if const_expr(set_prio):
+                rocdl.s_setprio(0)
+                rocdl.s_barrier()
+            return [
+                c_frags[i].load().ir_value()
+                for i in range_constexpr(self.n_tiles_a * self.n_tiles_b)
+            ]
+
+    return MxMfma()
 
 
 def make_mx_pipeline_mma(mfma, a_sc, b_sc, a_base16, b_base16, k_iters):
@@ -260,9 +274,6 @@ def compile_mxfp8_gemm_8w(
     b_pack = 2 if b_dtype == "fp4" else 1
     assert b_k % (64 * b_pack) == 0
     K_ITERS = logical_k // BLOCK_K
-    # FlyDSL 0.3.2 tracks cross-directory helpers captured by the kernel closure.
-    pipeline = run_8wave_pipeline
-    make_g2s, make_s2r = make_g2s_loader, make_s2r_loader
     # Scale words are addressed by K-pair, so K must contain a whole number of
     # them (K % 256 above already guarantees it).
 
@@ -392,13 +403,13 @@ def compile_mxfp8_gemm_8w(
                 gl_off_a, gl_off_a1 = offsets
                 A0_gl_offset = A1_gl_offset = fx.Int32(0)
 
-            mfma = MxMfma(N_TILES_A, N_TILES_B, b_dtype)
+            mfma = make_mx_mfma(N_TILES_A, N_TILES_B, b_dtype)
 
-            a_g2s = make_g2s(a_div, gl_off_a, N_LDS_STEPS_A, F8_IR_t, wave_id)
-            a1_g2s = make_g2s(a_div, gl_off_a1, N_LDS_STEPS_A, F8_IR_t, wave_id)
-            b_g2s = make_g2s(b_div, gl_off_b, N_LDS_STEPS_B, F8_IR_t, wave_id)
-            a_s2r = make_s2r(wave_m, N_TILES_A)
-            b_s2r = make_s2r(wave_n, N_TILES_B, packed_fp4=b_dtype == "fp4")
+            a_g2s = make_g2s_loader(a_div, gl_off_a, N_LDS_STEPS_A, F8_IR_t, wave_id)
+            a1_g2s = make_g2s_loader(a_div, gl_off_a1, N_LDS_STEPS_A, F8_IR_t, wave_id)
+            b_g2s = make_g2s_loader(b_div, gl_off_b, N_LDS_STEPS_B, F8_IR_t, wave_id)
+            a_s2r = make_s2r_loader(wave_m, N_TILES_A)
+            b_s2r = make_s2r_loader(wave_n, N_TILES_B, packed_fp4=b_dtype == "fp4")
             scratch = [
                 a_cur0.ptr,
                 a_cur1.ptr,
@@ -413,11 +424,11 @@ def compile_mxfp8_gemm_8w(
                 C, c_m, c_n, mfma.idx, N_TILES_A, N_TILES_B, scratch
             )
 
-            a_sc = ScalePreshuffledS2R(A_scale, c_m, K, N_TILES_A)
+            a_sc = make_scale_preshuffled_s2r(A_scale, c_m, K, N_TILES_A)
             b_scale_rows = (
                 fx.size(B_scale.shape).unpack() // (K // 32) if grouped else c_n
             )
-            b_sc = ScalePreshuffledS2R(B_scale, b_scale_rows, K, N_TILES_B)
+            b_sc = make_scale_preshuffled_s2r(B_scale, b_scale_rows, K, N_TILES_B)
             # 16-row tile index of each wave's first row, per LDS half.
             a_base16 = [
                 (block_m * BLOCK_M + h * LDS_BLOCK_M + wave_m * A_GRP_ROWS) // 16
@@ -444,7 +455,7 @@ def compile_mxfp8_gemm_8w(
             if wave_m == 1:
                 rocdl.s_barrier()
 
-            c00_frag, c01_frag, c10_frag, c11_frag = pipeline(
+            c00_frag, c01_frag, c10_frag, c11_frag = run_8wave_pipeline(
                 lds,
                 (a_g2s, a1_g2s),
                 b_g2s,
