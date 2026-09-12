@@ -28,16 +28,16 @@ spot-check when the hot loop or wait/reduce path changed.
 
 - [x] 1. FP8 native down, `k_batch=1`, 16-row TOPK-parallel waves — landed as
       the preshuffled FP8 default; Qwen B=1 vs gather accepted
-- [ ] 2. FP4 native down
+- [x] 2. FP4 native down — TOPK-parallel 16×4, same grid/epilogue as FP8
 - [ ] 3. BF16 native down
 - [ ] 4. Optional second N tile (32 rows) if 16 N is occupancy-bound
 - [ ] 5. Split-K last, only if extra waves over `k0` help
 
 **Landed:** TOPK-parallel 16×4 (`grid = B*TOPK*(HIDDEN/16)`, one expert per
-wave, `atomic_add_f32` into a zeroed FP32 `y`) is the preshuffled FP8 down
-default on legal tiles. Serial-TOPK (`grid = B*(HIDDEN/16)`) is abandoned
-(2.56× slower than gather at B=1,2). No INTER/grid cutoff: Qwen B=1 staying
-slower than gather is accepted. FP4/BF16 native are still later subtasks.
+wave, `atomic_add_f32` into a zeroed FP32 `y`) is the preshuffled FP8 **and
+FP4** down default on legal tiles. Serial-TOPK is abandoned. No INTER/grid
+cutoff. Qwen B=1 vs gather is accepted for FP8; FP4 Qwen B=1 **beats** gather.
+BF16 native is still later.
 
 ## Locked decisions
 
@@ -54,7 +54,7 @@ These locks apply to **this track** (subtasks 1–5).
   drain, `cvt_scalef32_pk_bf16_{fp8,fp4}`, and E8M0 `shl 23` stay.
 - **Gather remains the fallback** when HIDDEN % 16 or INTER is not a native
   kpack tile (FP8: INTER % 64; FP4: INTER % 128; BF16: INTER % 32), matching
-  gate/up. Legal-tile preshuffled FP8 down does **not** keep a gather cutoff
+  gate/up. Legal-tile preshuffled FP8/FP4 down does **not** keep a gather cutoff
   for small INTER or Qwen B=1.
 - **Do not fold native down into the k-contiguous builder body.** Early-return
   a dedicated `_build_down_*_preshuffled_native` (same pattern as gate/up).
@@ -131,13 +131,30 @@ then **0.74–0.95** from B=4. All-B geomean vs gather **0.53**, vs CK
 ### 2. FP4 native down
 
 Copy the FP8 native skeleton. `packed_k = INTER/2`, e8m0 applied in-convert
-(`scale_bk` multiple of 32, divides INTER). Same 16×4 map.
+(`scale_bk` multiple of 32, divides INTER). Same 16×4 map and TOPK-parallel
+grid.
 
-- [ ] `_build_down_fp4_preshuffled_native` + dispatch from
+- [x] `_build_down_fp4_preshuffled_native` + dispatch from
       `build_down_reduce_fp4_module`.
-- [ ] `test_preshuffled_fp4_matches_k_contiguous` down/combined still pass.
-- [ ] **Done when:** preshuffled FP4 down is kpack-native; gather only on
+- [x] `test_preshuffled_fp4_matches_k_contiguous` down/combined still pass.
+- [x] **Done when:** preshuffled FP4 down is kpack-native; gather only on
       illegal tiles.
+
+**G9 B=1,2 down FP4** (GPU 1, 100 iters, 3 repeats, clocks ~94 MHz, cos 1.0;
+`/tmp/g9_native_down_fp4_ck.{md,csv}`). Gather µs from the prior preshuffled
+sweep. Native is the default on INTER % 128 and HIDDEN % 16.
+
+| Shape | B | gather µs | native µs | n/gather | n/CK | %peak |
+|---|---:|---:|---:|---:|---:|---:|
+| DeepSeek-V3 | 1 | 38.61 | 27.70 | 0.72 | 0.98 | 28.2 |
+| DeepSeek-V3 | 2 | 72.16 | 46.62 | 0.65 | 1.29 | 33.5 |
+| MiniMax | 1 | 20.22 | 17.73 | 0.88 | 0.88 | 14.1 |
+| MiniMax | 2 | 25.26 | 20.38 | 0.81 | 0.89 | 24.6 |
+| Qwen3-Next | 1 | 10.44 | 9.39 | 0.90 | 0.88 | 7.4 |
+| Qwen3-Next | 2 | 12.35 | 10.09 | 0.82 | 0.92 | 13.8 |
+
+Geomean vs gather **0.79** (all six win, including Qwen B=1); vs CK **0.96**.
+DeepSeek B=2 is the only CK loss (1.29×). Land as the FP4 default; no cutoff.
 
 ### 3. BF16 native down
 
