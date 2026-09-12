@@ -64,6 +64,7 @@ from aiter.ops.flydsl.moe_kernels import (
     get_flydsl_stage2_v2_kernels,
 )
 from aiter.ops.flydsl.mxfp4_kname import (
+    _normalize_mxfp4_activation,
     _parse_mxfp4_g1_kname,
     parse_g2_kname_any,
 )
@@ -2146,6 +2147,7 @@ class FmoeTuner(TunerCommon):
         fuse_fp8=False,
         situ_beta=DEFAULT_SITUV2_BETA,
         situ_linear_beta=DEFAULT_SITUV2_LINEAR_BETA,
+        swiglu_limit=None,
         output_sorted=False,
     ):
         # a16wi4: convert int8 weights to i4x2 so reference function detects the right path
@@ -2170,6 +2172,7 @@ class FmoeTuner(TunerCommon):
             w1_scale=w1_scale,
             w1_bias=w1_bias,
             doweight=doweight_stage1,
+            swiglu_limit=swiglu_limit,
             situ_beta=situ_beta,
             situ_linear_beta=situ_linear_beta,
         )
@@ -6092,13 +6095,15 @@ class Mxfp4FlydslTuner(FmoeTuner):
     )
 
     @staticmethod
-    def _g1_kname(bm, use_nt, inline_quant, xcd=0):
-        # flydsl_mxmoe_g1_a4w4_<BM>x256x256[_f16in][_nt][_xcd<n>]; see mxfp4_kname.py.
+    def _g1_kname(bm, use_nt, inline_quant, xcd=0, activation="silu"):
+        # flydsl_mxmoe_g1_a4w4_<BM>x256x256[_f16in][_nt][_swiglu][_xcd<n>].
         name = f"flydsl_mxmoe_g1_a4w4_{bm}x256x256"
         if inline_quant:
             name += "_f16in"
         if use_nt:
             name += "_nt"
+        if activation == "swiglu":
+            name += "_swiglu"
         if xcd:
             name += f"_xcd{xcd}"
         return name
@@ -6141,12 +6146,17 @@ class Mxfp4FlydslTuner(FmoeTuner):
         from aiter.ops.flydsl.mxfp4_gemm1_kernels import _SUPPORTED as G1
         from aiter.ops.flydsl.mxfp4_gemm2_kernels import _SUPPORTED as G2
 
+        activation = _normalize_mxfp4_activation(row["act_type"])
+        # SwiGLU is deployed only through the BM16 inline-quant variant.
+        # Other mxmoe variants require shape-specific aux instances.
+        g1_variants = sorted(v for v in G1 if activation != "swiglu" or v[2])
         g2_bms = {v[0] for v in G2}
         cands = []
-        for bm in sorted({v[0] for v in G1}):
+        for bm in sorted({v[0] for v in g1_variants}):
             for kn1 in [
-                self._g1_kname(bm, n1, iq1, xcd)
-                for _, n1, iq1 in sorted(v for v in G1 if v[0] == bm)
+                self._g1_kname(bm, n1, iq1, xcd, activation)
+                for bm1, n1, iq1 in g1_variants
+                if bm1 == bm
                 for xcd in self.XCD_SWIZZLES
             ]:
                 # (A) native mxmoe g2 candidates (flydsl_mxmoe_g2_a4w4_*).
@@ -6209,7 +6219,7 @@ class Mxfp4FlydslTuner(FmoeTuner):
         return data
 
     @staticmethod
-    def _port_e2e(data, kn1, kn2, topk, ne, h, dtype, act="silu"):
+    def _port_e2e(data, kn1, kn2, topk, ne, h, dtype, act="silu", swiglu_limit=None):
         # kn2 may name either gemm2 family (path B or native mxmoe).
         _g2 = parse_g2_kname_any(kn2)
         BM = _g2["BM"]
@@ -6242,6 +6252,7 @@ class Mxfp4FlydslTuner(FmoeTuner):
             m_indices=m_indices,
             moe_buf=moe_buf,
             act=act,
+            swiglu_limit=swiglu_limit,
             # Betas match run_torch_moe_stage1's defaults; silu compiles them out.
             situ_beta=DEFAULT_SITUV2_BETA,
             situ_linear_beta=DEFAULT_SITUV2_LINEAR_BETA,
@@ -6264,7 +6275,7 @@ class Mxfp4FlydslTuner(FmoeTuner):
         )
 
     @staticmethod
-    def _torch_ref(data, topk, dtype, activation):
+    def _torch_ref(data, topk, dtype, activation, swiglu_limit=None):
         ref1 = FmoeTuner.run_torch_moe_stage1(
             data["a1_qt"],
             data["w1_qt"],
@@ -6278,6 +6289,7 @@ class Mxfp4FlydslTuner(FmoeTuner):
             quant_type=QuantType.per_1x32,
             doweight_stage1=False,
             topk=topk,
+            swiglu_limit=swiglu_limit,
         )
         return FmoeTuner.run_torch_moe_stage2(
             ref1,
@@ -6299,23 +6311,23 @@ class Mxfp4FlydslTuner(FmoeTuner):
         token, topk = int(row["token"]), int(row["topk"])
         dtype = dtypes.bf16
         kn1, kn2 = candidate["kernelName1"], candidate["kernelName2"]
-        act_type = str(row["act_type"])
-        if act_type.endswith("Situv2"):
-            activation = ActivationType.Situv2
-        elif act_type.endswith("Swiglu"):
-            activation = ActivationType.Swiglu
-        else:
-            activation = ActivationType.Silu
-        # mxmoe stage1 emits silu or situv2; anything else tunes as silu.
-        act = "situv2" if activation == ActivationType.Situv2 else "silu"
+        act = _normalize_mxfp4_activation(row["act_type"])
+        activation = {
+            "silu": ActivationType.Silu,
+            "situv2": ActivationType.Situv2,
+            "swiglu": ActivationType.Swiglu,
+        }[act]
+        swiglu_limit = 7.0 if act == "swiglu" else None
         data = self._prepare_case(token, h, e, ne, topk, dtype)
-        out = self._port_e2e(data, kn1, kn2, topk, ne, h, dtype, act)
-        ref = self._torch_ref(data, topk, dtype, activation)
+        out = self._port_e2e(data, kn1, kn2, topk, ne, h, dtype, act, swiglu_limit)
+        ref = self._torch_ref(data, topk, dtype, activation, swiglu_limit)
         err = cosine_diff_compare(ref, out, msg=f"port[{kn1}+{kn2}]")
         if err is None or float(err) > args.errRatio:
             raise RuntimeError(f"cosine err_ratio {err} > {args.errRatio}")
         _, us = run_perftest(
-            lambda: self._port_e2e(data, kn1, kn2, topk, ne, h, dtype, act),
+            lambda: self._port_e2e(
+                data, kn1, kn2, topk, ne, h, dtype, act, swiglu_limit
+            ),
             num_warmup=int(args.warmup),
             num_iters=int(args.iters),
         )

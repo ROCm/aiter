@@ -6,12 +6,13 @@
 #
 # Name: flydsl_mxmoe_g{1,2}_a4w4_<BM>x256x256[_flag...], lowercase. Shape is in
 # the CSV columns, not the name. g1 flags: f16in (inline act quant), nt (else
-# cached). g2 flags: atomic (else nonatomic), nt (atomic only), f4out / cshuffle.
+# cached), swiglu (else silu). g2 flags: atomic (else nonatomic), nt (atomic
+# only), f4out / cshuffle.
 
 import re
 
 _MXMOE_NUMERIC_TOKENS = {"SK": "kSplitK", "XCD": "xcd_swizzle"}
-_MXMOE_G1_FLAG_TOKENS = {"NT", "F16IN"}
+_MXMOE_G1_FLAG_TOKENS = {"NT", "F16IN", "SWIGLU"}
 _MXMOE_G2_FLAG_TOKENS = {"NT", "ATOMIC", "F4OUT", "CSHUFFLE"}
 _MXMOE_NUMERIC_RE = re.compile(r"^([A-Z]+)(\d+)$")
 _MXMOE_TILE_RE = re.compile(r"^(\d+)x(\d+)x(\d+)$")  # <BM>x<BN>x<BK>
@@ -22,6 +23,13 @@ _FLYDSL_V2_GEMM2_RE = re.compile(
     r"(?P<persist>_persist)?(?P<nt>_nt)?(?:_sbm(?P<sbm>\d+))?"
     r"(?P<bf16lds>_bf16lds)?(?:_sp(?P<sp>\d+))?$"
 )
+
+
+def _normalize_mxfp4_activation(value) -> str:
+    activation = str(value).split(".")[-1].strip().lower()
+    if activation not in ("silu", "situv2", "swiglu"):
+        raise ValueError(f"unsupported MXFP4 activation {value!r}")
+    return activation
 
 
 def _tokenize_mxfp4_kname(kname: str, stage: int, flag_tokens: set) -> dict:
@@ -60,6 +68,7 @@ def _parse_mxfp4_g1_kname(kname: str) -> dict:
         "inline_quant": "F16IN" in flags,
         "use_nt": "NT" in flags,
         "xcd_swizzle": nums.get("xcd_swizzle", 0),
+        "activation": "swiglu" if "SWIGLU" in flags else "silu",
     }
 
 

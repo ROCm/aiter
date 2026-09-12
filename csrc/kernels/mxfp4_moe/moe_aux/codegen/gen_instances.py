@@ -38,6 +38,9 @@ SHAPES = [
     (385, 7168, 512, 7),  # dsv4 NE=385 TOPK=7 (tp6/tp8)
     (257, 6144, 512, 9),  # GLM-5.2 TP=4 (256 routed + 1 shared -> topk 8+1, H=6144)
 ]
+INLINE_SORT_SHAPES = [(ne, h, topk) for ne, h, _inter, topk in SHAPES] + [
+    (129, 6144, 5)
+]
 
 
 # ── Instance record ────────────────────────────────────────────────────────
@@ -295,7 +298,7 @@ class mxfp4_moe_aux_codegen:
                 )
 
         # sort (inline_quant + zero_init): MB=16
-        for ne, h, e, topk in SHAPES:
+        for ne, h, topk in INLINE_SORT_SHAPES:
             for mb in (16,):
                 yield Instance(
                     f"aux_sortzi_NE{ne}_TOPK{topk}_MB{mb}_H{h}",
@@ -306,7 +309,7 @@ class mxfp4_moe_aux_codegen:
                 )
 
         # sort (inline_quant): MB=16
-        for ne, h, e, topk in SHAPES:
+        for ne, h, topk in INLINE_SORT_SHAPES:
             for mb in (16,):
                 yield Instance(
                     f"aux_sortonly_NE{ne}_TOPK{topk}_MB{mb}_H{h}",

@@ -117,8 +117,17 @@ def _tanh_batch(xs):
 
 
 def _activation_mul_batch(gs, us, act, situ_beta, situ_linear_beta):
-    sig = _sigmoid_batch(gs)
+    if const_expr(act == "swiglu"):
+        limit = situ_beta
+        neg_limit = -limit
+        gs = [(g > limit).select(limit, g) for g in gs]
+        us = [
+            (u > limit).select(limit, (u < neg_limit).select(neg_limit, u)) for u in us
+        ]
+        sig = _sigmoid_batch([g * fx.Float32(1.702) for g in gs])
+        return [gs[i] * sig[i] * (us[i] + fx.Float32(1.0)) for i in range(len(gs))]
     if const_expr(act == "situv2"):
+        sig = _sigmoid_batch(gs)
         beta_rcp = fx.Float32(rocdl.rcp(T.f32, _raw(situ_beta)))
         linear_beta_rcp = fx.Float32(rocdl.rcp(T.f32, _raw(situ_linear_beta)))
         gt = _tanh_batch([g * beta_rcp for g in gs])
@@ -127,6 +136,7 @@ def _activation_mul_batch(gs, us, act, situ_beta, situ_linear_beta):
             situ_beta * gt[i] * sig[i] * situ_linear_beta * ut[i]
             for i in range(len(gs))
         ]
+    sig = _sigmoid_batch(gs)
     return [gs[i] * sig[i] * us[i] for i in range(len(gs))]
 
 
@@ -820,7 +830,7 @@ def compile_gemm1_a4w4_port(
     xcd_swizzle=0,
     act="silu",
 ):
-    if act not in ("silu", "situv2"):
+    if act not in ("silu", "situv2", "swiglu"):
         raise ValueError(f"unsupported activation variant {act!r}")
     if (BM, use_nt, inline_quant) not in {
         (32, True, False),
@@ -853,8 +863,8 @@ def compile_gemm1_a4w4_port(
     # kernel/smem symbols (so KIMI and non-KIMI instances never collide).
     gu_tag = "il" if interleave else "sep"
     name_suffix = f"h{_K}_i{_INTER}_ne{_NE}_bm{BM}_{variant_tag}_{gu_tag}"
-    if act == "situv2":
-        name_suffix += "_situv2"
+    if act != "silu":
+        name_suffix += f"_{act}"
     if xcd_swizzle > 0:
         name_suffix += f"_xcd{xcd_swizzle}"
 
