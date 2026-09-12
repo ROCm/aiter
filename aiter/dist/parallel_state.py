@@ -1,0 +1,2433 @@
+# Copyright (C) Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2023-2026 The vLLM team.
+# Adapted from
+# https://github.com/NVIDIA/Megatron-LM/blob/main/megatron/core/parallel_state.py
+# Copyright (C) 2022-2026, NVIDIA CORPORATION. All rights reserved.
+"""vLLM distributed state.
+It takes over the control of the distributed environment from PyTorch.
+The typical workflow is:
+
+- call `init_distributed_environment` to initialize the distributed environment.
+- call `initialize_model_parallel` or `ensure_model_parallel_initialized` to
+ initialize the model parallel groups.
+
+- any code dealing with the distributed stuff
+
+- call `destroy_model_parallel` to destroy the model parallel groups.
+- call `destroy_distributed_environment` to destroy the distributed environment.
+
+If you only need to use the distributed environment without model/pipeline
+ parallelism, you can skip the model parallel initialization and destruction
+ steps.
+"""
+
+import contextlib
+import os
+import pickle
+import weakref
+from collections import namedtuple
+from collections.abc import Callable
+from contextlib import contextmanager, nullcontext
+from dataclasses import dataclass
+from multiprocessing import shared_memory
+from typing import Any, Optional
+from unittest.mock import patch
+
+import torch
+import torch.distributed
+from torch.distributed import Backend, ProcessGroup
+
+from aiter import logger, torch_compile_guard
+from aiter.dist.utils import env_flag
+
+
+def supports_custom_op():
+    return True
+
+
+@dataclass
+class GraphCaptureContext:
+    stream: torch.cuda.Stream
+
+
+TensorMetadata = namedtuple("TensorMetadata", ["device", "dtype", "size"])
+
+
+def _split_tensor_dict(
+    tensor_dict: dict[str, torch.Tensor | Any],
+) -> tuple[list[tuple[str, Any]], list[torch.Tensor]]:
+    """Split the tensor dictionary into two parts:
+    1. A list of (key, value) pairs. If the value is a tensor, it is replaced
+         by its metadata.
+    2. A list of tensors.
+    """
+    metadata_list: list[tuple[str, Any]] = []
+    tensor_list: list[torch.Tensor] = []
+    for key, value in tensor_dict.items():
+        if isinstance(value, torch.Tensor):
+            # Note: we cannot use `value.device` here,
+            # because it contains not only the device type but also the device
+            # index (e.g. "cuda:0"). We only need the device type.
+            # receiving side will set the device index.
+            device = value.device.type
+            metadata_list.append(
+                (key, TensorMetadata(device, value.dtype, value.size()))
+            )
+            tensor_list.append(value)
+        else:
+            metadata_list.append((key, value))
+    return metadata_list, tensor_list
+
+
+_group_name_counter: dict[str, int] = {}
+
+
+def _get_unique_name(name: str) -> str:
+    """Get a unique name for the group.
+    Example:
+    _get_unique_name("tp") -> "tp:0"
+    _get_unique_name("tp") -> "tp:1"
+    """
+    if name not in _group_name_counter:
+        _group_name_counter[name] = 0
+    newname = f"{name}:{_group_name_counter[name]}"
+    _group_name_counter[name] += 1
+    return newname
+
+
+_groups: dict[str, Callable[[], "GroupCoordinator"]] = {}
+
+
+def _register_group(group: "GroupCoordinator") -> None:
+    # looks like Python 3.8 does not understand `ReferenceType`
+    _groups[group.unique_name] = weakref.ref(group)  # type: ignore
+
+
+def all_reduce_fake(tensor: torch.Tensor, *args, **kwargs) -> torch.Tensor:
+    return torch.empty_like(tensor)
+
+
+# There is same name all_reduce in aiter.op, use Alias
+@torch_compile_guard(gen_fake=all_reduce_fake)
+def all_reduce_(
+    tensor: torch.Tensor,
+    group_name: str,
+    ca_use_new: bool,
+    ca_fp8_quant: bool,
+    prefill_support: bool = False,
+) -> torch.Tensor:
+    assert group_name in _groups, f"Group {group_name} is not found."
+    group = _groups[group_name]()
+    if group is None:
+        raise ValueError(f"Group {group_name} is destroyed.")
+    return group._all_reduce_out_place(
+        tensor, ca_use_new, ca_fp8_quant, prefill_support
+    )
+
+
+def fused_allreduce_rmsnorm_fake(
+    inp: torch.Tensor,
+    res_inp: torch.Tensor,
+    w: torch.Tensor,
+    eps: float,
+    group_name: str,
+    prefill_support: bool = False,
+    x_pad_to_multiple: int = 0,
+    gemma_norm: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    n = w.shape[-1]
+    if x_pad_to_multiple > 0:
+        n = ((n + x_pad_to_multiple - 1) // x_pad_to_multiple) * x_pad_to_multiple
+    out = torch.empty(inp.shape[:-1] + (n,), dtype=inp.dtype, device=inp.device)
+    return out, torch.empty_like(res_inp)
+
+
+@torch_compile_guard(gen_fake=fused_allreduce_rmsnorm_fake)
+def fused_allreduce_rmsnorm_(
+    inp: torch.Tensor,
+    res_inp: torch.Tensor,
+    w: torch.Tensor,
+    eps: float,
+    group_name: str,
+    prefill_support: bool = False,
+    x_pad_to_multiple: int = 0,
+    gemma_norm: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    assert group_name in _groups, f"Group {group_name} is not found."
+    group = _groups[group_name]()
+    if group is None:
+        raise ValueError(f"Group {group_name} is destroyed.")
+    return group._fused_allreduce_rmsnorm_out_place(
+        inp,
+        res_inp,
+        w,
+        eps,
+        prefill_support,
+        x_pad_to_multiple=x_pad_to_multiple,
+        gemma_norm=gemma_norm,
+    )
+
+
+def fused_allreduce_rmsnorm_quant_fake(
+    inp: torch.Tensor,
+    res_inp: torch.Tensor,
+    w: torch.Tensor,
+    eps: float,
+    group_name: str,
+    prefill_support: bool = False,
+    gemma_norm: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    # Real op returns (out_fp8, residual_out, scale). ``out`` is per-token FP8,
+    # NOT bf16 -- declare the correct dtype so torch.compile's assert_size_stride
+    # / dtype checks agree with the runtime tensor.
+    from aiter.utility.dtypes import fp8
+
+    del gemma_norm
+    return (
+        torch.empty_like(inp, dtype=fp8),
+        torch.empty_like(res_inp),
+        torch.empty(inp.shape[:-1] + (1,), dtype=torch.float32, device=inp.device),
+    )
+
+
+@torch_compile_guard(gen_fake=fused_allreduce_rmsnorm_quant_fake)
+def fused_allreduce_rmsnorm_quant_(
+    inp: torch.Tensor,
+    res_inp: torch.Tensor,
+    w: torch.Tensor,
+    eps: float,
+    group_name: str,
+    prefill_support: bool = False,
+    gemma_norm: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    assert group_name in _groups, f"Group {group_name} is not found."
+    group = _groups[group_name]()
+    if group is None:
+        raise ValueError(f"Group {group_name} is destroyed.")
+    return group._fused_allreduce_rmsnorm_quant_out_place(
+        inp, res_inp, w, eps, prefill_support, gemma_norm=gemma_norm
+    )
+
+
+def fused_allreduce_rmsnorm_quant_emit_bf16_fake(
+    inp: torch.Tensor,
+    res_inp: torch.Tensor,
+    w: torch.Tensor,
+    eps: float,
+    group_name: str,
+    prefill_support: bool = False,
+    gemma_norm: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    # Real op returns (out_fp8, residual_out, scale, bf16) -- the 4th tensor is
+    # the pre-quantization bf16/fp16 normed activation for v32 DSA indexer GEMMs.
+    from aiter.utility.dtypes import fp8
+
+    del gemma_norm
+    return (
+        torch.empty_like(inp, dtype=fp8),
+        torch.empty_like(res_inp),
+        torch.empty(inp.shape[:-1] + (1,), dtype=torch.float32, device=inp.device),
+        torch.empty_like(res_inp),
+    )
+
+
+@torch_compile_guard(gen_fake=fused_allreduce_rmsnorm_quant_emit_bf16_fake)
+def fused_allreduce_rmsnorm_quant_emit_bf16_(
+    inp: torch.Tensor,
+    res_inp: torch.Tensor,
+    w: torch.Tensor,
+    eps: float,
+    group_name: str,
+    prefill_support: bool = False,
+    gemma_norm: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    assert group_name in _groups, f"Group {group_name} is not found."
+    group = _groups[group_name]()
+    if group is None:
+        raise ValueError(f"Group {group_name} is destroyed.")
+    return group._fused_allreduce_rmsnorm_quant_out_place(
+        inp, res_inp, w, eps, prefill_support, gemma_norm=gemma_norm, emit_bf16=True
+    )
+
+
+def fused_allreduce_rmsnorm_quant_per_group_fake(
+    inp: torch.Tensor,
+    res_inp: torch.Tensor,
+    w: torch.Tensor,
+    eps: float,
+    group_name: str,
+    group_size: int = 128,
+    prefill_support: bool = False,
+    transpose_scale: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Meta/fake for the fused AR+RMSNorm+per-group-FP8-quant op.
+
+    Returns ``(out_fp8, residual_out, scale)``. The scale stride MUST match what
+    the real op returns AND what inductor lays out for the downstream preshuffle
+    GEMM consumer:
+      - transpose_scale=False: row-major (M, num_groups), stride (num_groups, 1)
+      - transpose_scale=True : column-major -- storage (num_groups, M) viewed
+        transposed to (M, num_groups), stride (1, M). This is the layout
+        ``gemm_a8w8_blockscale_preshuffle`` consumes, and (because the op has no
+        needs_fixed_stride_order tag on torch>=2.8) is also the layout inductor
+        re-strides the op output to; the fake must declare it to avoid an
+        assert_size_stride failure.
+    """
+    from aiter.utility.dtypes import fp8
+
+    M = inp.shape[0]
+    K = inp.shape[-1]
+    num_groups = K // group_size
+    out = torch.empty_like(inp, dtype=fp8)
+    res_out = torch.empty_like(res_inp)
+    if transpose_scale:
+        scale = torch.empty(
+            (num_groups, M), dtype=torch.float32, device=inp.device
+        ).transpose(0, 1)
+    else:
+        scale = torch.empty((M, num_groups), dtype=torch.float32, device=inp.device)
+    return out, res_out, scale
+
+
+@torch_compile_guard(gen_fake=fused_allreduce_rmsnorm_quant_per_group_fake)
+def fused_allreduce_rmsnorm_quant_per_group_(
+    inp: torch.Tensor,
+    res_inp: torch.Tensor,
+    w: torch.Tensor,
+    eps: float,
+    group_name: str,
+    group_size: int = 128,
+    prefill_support: bool = False,
+    transpose_scale: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    assert group_name in _groups, f"Group {group_name} is not found."
+    group = _groups[group_name]()
+    if group is None:
+        raise ValueError(f"Group {group_name} is destroyed.")
+    return group._fused_allreduce_rmsnorm_quant_per_group_out_place(
+        inp, res_inp, w, eps, group_size, prefill_support, transpose_scale
+    )
+
+
+def fused_allreduce_rmsnorm_quant_per_group_emit_bf16_fake(
+    inp: torch.Tensor,
+    res_inp: torch.Tensor,
+    w: torch.Tensor,
+    eps: float,
+    group_name: str,
+    group_size: int = 128,
+    prefill_support: bool = False,
+    transpose_scale: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Meta/fake for fused AR+RMSNorm+per-group-FP8-quant with emit_bf16.
+
+    Identical to ``fused_allreduce_rmsnorm_quant_per_group_fake`` (same
+    out/residual/scale shapes and scale-stride rules -- see that docstring)
+    but returns a 4th tensor: the pre-quantization bf16/fp16 normed activation
+    for v32 DSA indexer GEMMs (mirrors the per_token emit_bf16 fake).
+    """
+    from aiter.utility.dtypes import fp8
+
+    M = inp.shape[0]
+    K = inp.shape[-1]
+    num_groups = K // group_size
+    out = torch.empty_like(inp, dtype=fp8)
+    res_out = torch.empty_like(res_inp)
+    if transpose_scale:
+        scale = torch.empty(
+            (num_groups, M), dtype=torch.float32, device=inp.device
+        ).transpose(0, 1)
+    else:
+        scale = torch.empty((M, num_groups), dtype=torch.float32, device=inp.device)
+    bf16_out = torch.empty_like(res_inp)
+    return out, res_out, scale, bf16_out
+
+
+@torch_compile_guard(gen_fake=fused_allreduce_rmsnorm_quant_per_group_emit_bf16_fake)
+def fused_allreduce_rmsnorm_quant_per_group_emit_bf16_(
+    inp: torch.Tensor,
+    res_inp: torch.Tensor,
+    w: torch.Tensor,
+    eps: float,
+    group_name: str,
+    group_size: int = 128,
+    prefill_support: bool = False,
+    transpose_scale: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    assert group_name in _groups, f"Group {group_name} is not found."
+    group = _groups[group_name]()
+    if group is None:
+        raise ValueError(f"Group {group_name} is destroyed.")
+    return group._fused_allreduce_rmsnorm_quant_per_group_out_place(
+        inp,
+        res_inp,
+        w,
+        eps,
+        group_size,
+        prefill_support,
+        transpose_scale,
+        emit_bf16=True,
+    )
+
+
+def fused_qknorm_allreduce_fake(
+    qkv_in: torch.Tensor,
+    q_w: torch.Tensor,
+    k_w: torch.Tensor,
+    eps: float,
+    group_name: str,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    dtype = qkv_in.dtype
+    return (
+        torch.empty(
+            (qkv_in.shape[0], q_w.shape[-1]), dtype=dtype, device=qkv_in.device
+        ),
+        torch.empty(
+            (qkv_in.shape[0], k_w.shape[-1]), dtype=dtype, device=qkv_in.device
+        ),
+        torch.empty(
+            (qkv_in.shape[0], qkv_in.shape[1] - q_w.shape[-1] - k_w.shape[-1]),
+            dtype=dtype,
+            device=qkv_in.device,
+        ),
+    )
+
+
+def fused_qknorm_allreduce_rope_fake(
+    qkv_in: torch.Tensor,
+    q_w: torch.Tensor,
+    k_w: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    position_ids: torch.Tensor,
+    head_dim: int,
+    rotary_dim: int,
+    eps: float,
+    group_name: str,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    dtype = qkv_in.dtype
+    return (
+        torch.empty(
+            (qkv_in.shape[0], q_w.shape[-1]), dtype=dtype, device=qkv_in.device
+        ),
+        torch.empty(
+            (qkv_in.shape[0], k_w.shape[-1]), dtype=dtype, device=qkv_in.device
+        ),
+        torch.empty(
+            (qkv_in.shape[0], qkv_in.shape[1] - q_w.shape[-1] - k_w.shape[-1]),
+            dtype=dtype,
+            device=qkv_in.device,
+        ),
+    )
+
+
+@torch_compile_guard(gen_fake=fused_qknorm_allreduce_fake)
+def fused_qknorm_allreduce_(
+    qkv_in: torch.Tensor,
+    q_w: torch.Tensor,
+    k_w: torch.Tensor,
+    eps: float,
+    group_name: str,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    assert group_name in _groups, f"Group {group_name} is not found."
+    group = _groups[group_name]()
+    if group is None:
+        raise ValueError(f"Group {group_name} is destroyed.")
+    return group._fused_qknorm_allreduce_out_place(qkv_in, q_w, k_w, eps)
+
+
+@torch_compile_guard(gen_fake=fused_qknorm_allreduce_rope_fake)
+def fused_qknorm_allreduce_rope_(
+    qkv_in: torch.Tensor,
+    q_w: torch.Tensor,
+    k_w: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    position_ids: torch.Tensor,
+    head_dim: int,
+    rotary_dim: int,
+    eps: float,
+    group_name: str,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    assert group_name in _groups, f"Group {group_name} is not found."
+    group = _groups[group_name]()
+    if group is None:
+        raise ValueError(f"Group {group_name} is destroyed.")
+    return group._fused_qknorm_allreduce_rope_out_place(
+        qkv_in,
+        q_w,
+        k_w,
+        cos_sin_cache,
+        position_ids,
+        head_dim,
+        rotary_dim,
+        eps,
+    )
+
+
+if supports_custom_op():
+
+    # @torch.library.custom_op("aiter::outplace_all_gather", mutates_args=[])
+    def outplace_all_gather(
+        input: torch.Tensor, group_name: str, dim: int = 0
+    ) -> torch.Tensor:
+        assert group_name in _groups, f"Group {group_name} is not found."
+        group = _groups[group_name]()
+        if group is None:
+            raise ValueError(f"Group {group_name} is destroyed.")
+        return group._all_gather_out_place(input, dim)
+
+    def outplace_reduce_scatter(
+        input: torch.Tensor, output: torch.Tensor, group_name: str, dim: int
+    ) -> torch.Tensor:
+        assert group_name in _groups, f"Group {group_name} is not found."
+        group = _groups[group_name]()
+        if group is None:
+            raise ValueError(f"Group {group_name} is destroyed.")
+        return group._reduce_scatter_out_place(input, output, dim)
+
+
+class GroupCoordinator:
+    """
+    PyTorch ProcessGroup wrapper for a group of processes.
+    PyTorch ProcessGroup is bound to one specific communication backend,
+        e.g. NCCL, Gloo, MPI, etc.
+    GroupCoordinator takes charge of all the communication operations among
+        the processes in the group. It manages both CPU and device
+        communication.
+    """
+
+    # available attributes:
+    rank: int  # global rank
+    ranks: list[int]  # global ranks in the group
+    world_size: int  # size of the group
+    # difference between `local_rank` and `rank_in_group`:
+    # if we have a group of size 4 across two nodes:
+    # Process | Node | Rank | Local Rank | Rank in Group
+    #   0     |   0  |  0   |     0      |       0
+    #   1     |   0  |  1   |     1      |       1
+    #   2     |   1  |  2   |     0      |       2
+    #   3     |   1  |  3   |     1      |       3
+    local_rank: int  # local rank used to assign devices
+    rank_in_group: int  # rank inside the group
+    cpu_group: ProcessGroup  # group for CPU communication
+    device_group: ProcessGroup  # group for device communication
+    use_pynccl: bool  # a hint of whether to use PyNccl
+    use_custom_allreduce: bool  # a hint of whether to use CustomAllreduce
+    # communicators are only created for world size > 1
+    pynccl_comm: Any | None  # PyNccl communicator
+    ca_comm: Any | None  # Custom allreduce communicator
+    qr_comm: Any | None  # Quick allreduce communicator
+    mq_broadcaster: Any | None  # shared memory broadcaster
+    # Group this one borrows process groups / communicators from; None if it
+    # allocated its own.
+    reuse_from: "GroupCoordinator | None"
+    # Teardown ownership: a borrowed resource is destroyed only by its owner
+    # (a second destroy_process_group() raises). Set on both paths; no default.
+    _owns_cpu_group: bool
+    _owns_device_group: bool
+    _owns_device_communicator: bool
+
+    def __init__(
+        self,
+        group_ranks: list[list[int]],
+        local_rank: int,
+        torch_distributed_backend: str | Backend,
+        use_device_communicator: bool,  # whether to use device communicator
+        use_message_queue_broadcaster: bool = False,
+        group_name: str | None = None,
+        reuse_from: "GroupCoordinator | None" = None,
+        is_ep: bool = False,
+    ):
+        group_name = group_name or "anonymous"
+        self.unique_name = _get_unique_name(group_name)
+        _register_group(self)
+
+        self.rank = torch.distributed.get_rank()
+        self.local_rank = local_rank
+
+        self.reuse_from = reuse_from
+
+        # --- Acquire process groups: borrow from `reuse_from`, or create. -----
+        # Only acquisition differs; the shared tail below runs for both.
+        if reuse_from is not None:
+            # Identical-rank group: share the source's process groups and
+            # communicators instead of allocating a second set over the same
+            # ranks. Stays a distinct object with its own unique_name.
+            my_ranks = next((r for r in group_ranks if self.rank in r), None)
+            assert (
+                my_ranks is not None
+            ), f"{self.unique_name}: rank {self.rank} is in none of {group_ranks}"
+            # ranks/rank_in_group are inherited verbatim, so a source with a
+            # different rank list -- or the same one reordered -- silently
+            # addresses the wrong peers. Validate, don't trust the caller.
+            assert list(reuse_from.ranks) == list(my_ranks), (
+                f"{self.unique_name}: reuse_from {reuse_from.unique_name} spans "
+                f"{reuse_from.ranks}, but this group spans {my_ranks}"
+            )
+            assert reuse_from.local_rank == local_rank, (
+                f"{self.unique_name}: reuse_from {reuse_from.unique_name} has "
+                f"local_rank {reuse_from.local_rank}, this group has {local_rank}; "
+                "the inherited device would not match"
+            )
+            self.ranks = reuse_from.ranks
+            self.world_size = reuse_from.world_size
+            self.rank_in_group = reuse_from.rank_in_group
+            self.device_group = reuse_from.device_group
+            self.device = reuse_from.device
+            self._owns_device_group = False
+
+            if is_ep and use_device_communicator and self.world_size > 1:
+                # mori registers this group under a fixed name and bootstraps
+                # on it, assuming exclusive use. A gloo PG holds none of the
+                # NCCL/CA/QR buffers reuse saves, so EP keeps a private one.
+                self.cpu_group = None
+                for ranks in group_ranks:
+                    cpu_group = torch.distributed.new_group(ranks, backend="gloo")
+                    if self.rank in ranks:
+                        self.cpu_group = cpu_group
+                assert self.cpu_group is not None
+                self._owns_cpu_group = True
+            else:
+                self.cpu_group = reuse_from.cpu_group
+                self._owns_cpu_group = False
+        else:
+            self_device_group = None
+            self_cpu_group = None
+
+            for ranks in group_ranks:
+                device_group = torch.distributed.new_group(
+                    ranks, backend=torch_distributed_backend
+                )
+                # a group with `gloo` backend, to allow direct coordination
+                # between processes through the CPU.
+                cpu_group = torch.distributed.new_group(ranks, backend="gloo")
+                if self.rank in ranks:
+                    self.ranks = ranks
+                    self.world_size = len(ranks)
+                    self.rank_in_group = ranks.index(self.rank)
+                    self_device_group = device_group
+                    self_cpu_group = cpu_group
+
+            assert self_cpu_group is not None
+            assert self_device_group is not None
+
+            self.cpu_group = self_cpu_group
+            self.device_group = self_device_group
+            self.device = torch.device(f"cuda:{local_rank}")
+            self._owns_cpu_group = True
+            self._owns_device_group = True
+
+        # --- Shared tail: identical for borrowed and freshly created groups. --
+        self.use_device_communicator = use_device_communicator
+        logger.debug(
+            f"Initialized GroupCoordinator {self.unique_name} with "
+            f"ranks={self.ranks}, local_rank={self.local_rank}, "
+            f"world_size={self.world_size}, "
+            f"torch_distributed_backend={torch_distributed_backend}, "
+            f"use_device_communicator={self.use_device_communicator}, "
+            f"reuse_from={reuse_from.unique_name if reuse_from else None}"
+        )
+
+        self.device_communicator = None
+        self._owns_device_communicator = False
+        if use_device_communicator and self.world_size > 1:
+            src_dc = reuse_from.device_communicator if reuse_from is not None else None
+            if src_dc is not None and not is_ep:
+                # Non-EP collectives ignore unique_name: share it wholesale.
+                assert not src_dc.is_ep_communicator, (
+                    f"{self.unique_name}: refusing to share EP communicator "
+                    f"{src_dc.unique_name}; use_all2all / all2all_manager state "
+                    "is per-EP-group and must not be inherited by a non-EP group"
+                )
+                self.device_communicator = src_dc
+            else:
+                from .device_communicators.communicator_cuda import CudaCommunicator
+
+                # EP needs its own ep-named communicator (is_ep_communicator /
+                # use_all2all), but still shares handles via reuse_from.
+                self.device_communicator = CudaCommunicator(
+                    cpu_group=self.cpu_group,
+                    device=self.device,
+                    device_group=self.device_group,
+                    unique_name=self.unique_name,
+                    reuse_from=src_dc,
+                )
+                # Ours to destroy; for a borrower that only drops references.
+                self._owns_device_communicator = True
+
+        self.mq_broadcaster = None
+        if use_message_queue_broadcaster and self.world_size > 1:
+            if reuse_from is not None:
+                # The shm ring has a single write cursor and its
+                # broadcast_object path hard-asserts src == 0, so it cannot be
+                # shared. Unreachable today (TP is built first, never borrows).
+                raise NotImplementedError(
+                    f"{self.unique_name}: use_message_queue_broadcaster is not "
+                    "supported on a group that borrows another group's cpu_group"
+                )
+            from .shm_broadcast import MessageQueue
+
+            self.mq_broadcaster = MessageQueue.create_from_process_group(
+                self.cpu_group, 1 << 22, 6
+            )
+
+    @property
+    def first_rank(self):
+        """Return the global rank of the first process in the group"""
+        return self.ranks[0]
+
+    @property
+    def last_rank(self):
+        """Return the global rank of the last process in the group"""
+        return self.ranks[-1]
+
+    @property
+    def is_first_rank(self):
+        """Return whether the caller is the first process in the group"""
+        return self.rank == self.first_rank
+
+    @property
+    def is_last_rank(self):
+        """Return whether the caller is the last process in the group"""
+        return self.rank == self.last_rank
+
+    @property
+    def next_rank(self):
+        """Return the global rank of the process that follows the caller"""
+        rank_in_group = self.rank_in_group
+        world_size = self.world_size
+        return self.ranks[(rank_in_group + 1) % world_size]
+
+    @property
+    def prev_rank(self):
+        """Return the global rank of the process that precedes the caller"""
+        rank_in_group = self.rank_in_group
+        world_size = self.world_size
+        return self.ranks[(rank_in_group - 1) % world_size]
+
+    @contextmanager
+    def graph_capture(self, graph_capture_context: GraphCaptureContext | None = None):
+        if graph_capture_context is None:
+            stream = torch.cuda.Stream()
+            graph_capture_context = GraphCaptureContext(stream)
+        else:
+            stream = graph_capture_context.stream
+
+        # only cuda uses this function,
+        # so we don't abstract it into the base class
+        maybe_ca_context = nullcontext()
+        from aiter.dist.device_communicators.communicator_cuda import (
+            CudaCommunicator,
+        )
+
+        if self.device_communicator is not None:
+            assert isinstance(self.device_communicator, CudaCommunicator)
+            ca_comm = self.device_communicator.ca_comm
+            if ca_comm is not None:
+                maybe_ca_context = ca_comm.capture()  # type: ignore
+
+        # ensure all initialization operations complete before attempting to
+        # capture the graph on another stream
+        curr_stream = torch.cuda.current_stream()
+        if curr_stream != stream:
+            stream.wait_stream(curr_stream)
+
+        with torch.cuda.stream(stream), maybe_ca_context:
+            yield graph_capture_context
+
+    def all_reduce(
+        self,
+        input_: torch.Tensor,
+        ca_use_new: bool = True,
+        ca_fp8_quant: bool = False,
+        prefill_support: bool = False,
+    ) -> torch.Tensor:
+        """
+        User-facing all-reduce function before we actually call the
+        all-reduce operation.
+
+        We need this because Dynamo does not support passing an arbitrary
+        object (`self` in this case) to a custom op. We need to pass the
+         group name as a string, and then look up the group coordinator from
+         the group name, dispatch the all-reduce operation to the group
+         coordinator.
+
+        In addition, PyTorch custom ops do not support mutation or returning
+        a new tensor in the same op. So we always make the all-reduce operation
+        out-of-place.
+        """
+        # Bypass the function if we are using only 1 GPU.
+        if self.world_size == 1:
+            return input_
+
+        return all_reduce_(
+            input_,
+            group_name=self.unique_name,
+            ca_use_new=ca_use_new,
+            ca_fp8_quant=ca_fp8_quant,
+            prefill_support=prefill_support,
+        )
+
+    def _all_reduce_out_place(
+        self,
+        input_: torch.Tensor,
+        ca_use_new: bool,
+        ca_fp8_quant: bool,
+        prefill_support: bool = False,
+    ) -> torch.Tensor:
+        if self.device_communicator is None:
+            raise ValueError("No device communicator found")
+        return self.device_communicator.all_reduce(
+            input_, ca_use_new, ca_fp8_quant, prefill_support
+        )
+
+    def fused_allreduce_rmsnorm(
+        self,
+        input_: torch.Tensor,
+        residual_inp_: torch.Tensor,
+        weight_: torch.Tensor,
+        eps: float,
+        prefill_support: bool = False,
+        x_pad_to_multiple: int = 0,
+        gemma_norm: bool = False,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        return fused_allreduce_rmsnorm_(
+            input_,
+            residual_inp_,
+            weight_,
+            eps,
+            group_name=self.unique_name,
+            prefill_support=prefill_support,
+            x_pad_to_multiple=x_pad_to_multiple,
+            gemma_norm=gemma_norm,
+        )
+
+    def fused_allreduce_rmsnorm_quant(
+        self,
+        input_: torch.Tensor,
+        residual_inp_: torch.Tensor,
+        weight_: torch.Tensor,
+        eps: float,
+        prefill_support: bool = False,
+        quant_type: Any = "per_token",
+        group_size: int = 128,
+        emit_bf16: bool = False,
+        transpose_scale: bool = False,
+        gemma_norm: bool = False,
+    ):
+        # quant_type arrives already canonicalized to a string ("per_token"/
+        # "per_group"/"mxfp4") from the public API and the mxfp4 helper.
+        if quant_type == "per_token" and group_size == 128:
+            # Both paths go through torch.library-registered ops so they lower
+            # into the compiled graph (Dynamo-traceable + CUDAGraph-capturable).
+            # The emit_bf16 variant returns a 4th tensor (the pre-quant bf16
+            # normed output) for v32 DSA models whose indexer GEMMs need it.
+            if emit_bf16:
+                return fused_allreduce_rmsnorm_quant_emit_bf16_(
+                    input_,
+                    residual_inp_,
+                    weight_,
+                    eps,
+                    group_name=self.unique_name,
+                    prefill_support=prefill_support,
+                    gemma_norm=gemma_norm,
+                )
+            return fused_allreduce_rmsnorm_quant_(
+                input_,
+                residual_inp_,
+                weight_,
+                eps,
+                group_name=self.unique_name,
+                prefill_support=prefill_support,
+                gemma_norm=gemma_norm,
+            )
+        if self.device_communicator is None:
+            raise ValueError("No device communicator found")
+        return self.device_communicator.fused_allreduce_rmsnorm_quant(
+            input_,
+            residual_inp_,
+            weight_,
+            eps,
+            prefill_support,
+            quant_type=quant_type,
+            group_size=group_size,
+            emit_bf16=emit_bf16,
+            transpose_scale=transpose_scale,
+            gemma_norm=gemma_norm,
+        )
+
+    def fused_allreduce_rmsnorm_quant_per_group(
+        self,
+        input_: torch.Tensor,
+        residual_inp_: torch.Tensor,
+        weight_: torch.Tensor,
+        eps: float,
+        group_size: int = 128,
+        prefill_support: bool = False,
+        emit_bf16: bool = False,
+        transpose_scale: bool = False,
+    ):
+        if self.device_communicator is None:
+            raise ValueError("No device communicator found")
+        # Both the 3-output (fp8, residual, scale) and the 4-output emit_bf16
+        # (+ pre-quant bf16 normed activation) cases go through a
+        # torch.library-registered op so they are traceable under torch.compile
+        # / inductor (mirrors the per_token fast-path in
+        # fused_allreduce_rmsnorm_quant). Without this, the per_group call is a
+        # plain Python -> pybind chain that Dynamo cannot trace: on a fused-kernel
+        # miss it falls back to the raw pynccl all_reduce, which constructs a
+        # ctypes c_void_p and graph-breaks inside the compiled region (the
+        # backend is then invoked twice and asserts). v32 DSA models (GLM-5.x)
+        # call the emit_bf16 path from a compiled layernorm, so it must be
+        # wrapped too -- it is no longer eager-only.
+        if not emit_bf16:
+            return fused_allreduce_rmsnorm_quant_per_group_(
+                input_,
+                residual_inp_,
+                weight_,
+                eps,
+                group_name=self.unique_name,
+                group_size=group_size,
+                prefill_support=prefill_support,
+                transpose_scale=transpose_scale,
+            )
+        return fused_allreduce_rmsnorm_quant_per_group_emit_bf16_(
+            input_,
+            residual_inp_,
+            weight_,
+            eps,
+            group_name=self.unique_name,
+            group_size=group_size,
+            prefill_support=prefill_support,
+            transpose_scale=transpose_scale,
+        )
+
+    def fused_qknorm_allreduce(
+        self,
+        qkv_in: torch.Tensor,
+        q_w: torch.Tensor,
+        k_w: torch.Tensor,
+        eps: float,
+    ):
+        return fused_qknorm_allreduce_(
+            qkv_in,
+            q_w,
+            k_w,
+            eps,
+            group_name=self.unique_name,
+        )
+
+    def fused_qknorm_allreduce_rope(
+        self,
+        qkv_in: torch.Tensor,
+        q_w: torch.Tensor,
+        k_w: torch.Tensor,
+        cos_sin_cache: torch.Tensor,
+        position_ids: torch.Tensor,
+        head_dim: int,
+        rotary_dim: int,
+        eps: float,
+    ):
+        return fused_qknorm_allreduce_rope_(
+            qkv_in,
+            q_w,
+            k_w,
+            cos_sin_cache,
+            position_ids,
+            head_dim,
+            rotary_dim,
+            eps,
+            group_name=self.unique_name,
+        )
+
+    def fused_allreduce_rmsnorm_mxfp4_quant(
+        self,
+        input_: torch.Tensor,
+        residual_inp_: torch.Tensor,
+        weight_: torch.Tensor,
+        eps: float,
+        prefill_support: bool = False,
+        emit_bf16: bool = False,
+    ):
+        return self.fused_allreduce_rmsnorm_quant(
+            input_,
+            residual_inp_,
+            weight_,
+            eps,
+            prefill_support,
+            quant_type="mxfp4",
+            emit_bf16=emit_bf16,
+        )
+
+    def _fused_allreduce_rmsnorm_out_place(
+        self,
+        input_: torch.Tensor,
+        residual_inp_: torch.Tensor,
+        weight_: torch.Tensor,
+        eps: float,
+        prefill_support: bool = False,
+        x_pad_to_multiple: int = 0,
+        gemma_norm: bool = False,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if self.device_communicator is None:
+            raise ValueError("No device communicator found")
+        return self.device_communicator.fused_allreduce_rmsnorm(
+            input_,
+            residual_inp_,
+            weight_,
+            eps,
+            prefill_support,
+            x_pad_to_multiple=x_pad_to_multiple,
+            gemma_norm=gemma_norm,
+        )
+
+    def _fused_allreduce_rmsnorm_quant_out_place(
+        self,
+        input_: torch.Tensor,
+        residual_inp_: torch.Tensor,
+        weight_: torch.Tensor,
+        eps: float,
+        prefill_support: bool = False,
+        gemma_norm: bool = False,
+        emit_bf16: bool = False,
+    ):
+        if self.device_communicator is None:
+            raise ValueError("No device communicator found")
+        return self.device_communicator.fused_allreduce_rmsnorm_quant(
+            input_,
+            residual_inp_,
+            weight_,
+            eps,
+            prefill_support,
+            emit_bf16=emit_bf16,
+            gemma_norm=gemma_norm,
+        )
+
+    def _fused_allreduce_rmsnorm_quant_per_group_out_place(
+        self,
+        input_: torch.Tensor,
+        residual_inp_: torch.Tensor,
+        weight_: torch.Tensor,
+        eps: float,
+        group_size: int = 128,
+        prefill_support: bool = False,
+        transpose_scale: bool = False,
+        emit_bf16: bool = False,
+    ):
+        if self.device_communicator is None:
+            raise ValueError("No device communicator found")
+        return self.device_communicator.fused_allreduce_rmsnorm_quant_per_group(
+            input_,
+            residual_inp_,
+            weight_,
+            eps,
+            group_size=group_size,
+            prefill_support=prefill_support,
+            transpose_scale=transpose_scale,
+            emit_bf16=emit_bf16,
+        )
+
+    def _fused_qknorm_allreduce_out_place(
+        self,
+        qkv_in: torch.Tensor,
+        q_w: torch.Tensor,
+        k_w: torch.Tensor,
+        eps: float,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        if self.device_communicator is None:
+            raise ValueError("No device communicator found")
+        return self.device_communicator.fused_qknorm_allreduce(
+            qkv_in,
+            q_w,
+            k_w,
+            eps,
+        )
+
+    def _fused_qknorm_allreduce_rope_out_place(
+        self,
+        qkv_in: torch.Tensor,
+        q_w: torch.Tensor,
+        k_w: torch.Tensor,
+        cos_sin_cache: torch.Tensor,
+        position_ids: torch.Tensor,
+        head_dim: int,
+        rotary_dim: int,
+        eps: float,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        if self.device_communicator is None:
+            raise ValueError("No device communicator found")
+        return self.device_communicator.fused_qknorm_allreduce_rope(
+            qkv_in,
+            q_w,
+            k_w,
+            cos_sin_cache,
+            position_ids,
+            head_dim,
+            rotary_dim,
+            eps,
+        )
+
+    def _all_gather_out_place(self, input_: torch.Tensor, dim: int = 0) -> torch.Tensor:
+        ca_comm = self.device_communicator.ca_comm
+        assert ca_comm is not None
+        assert not ca_comm.disabled
+        out = ca_comm.custom_all_gather(input_, dim)
+        assert out is not None
+        return out
+
+    def custom_all_gather(self, input_: torch.Tensor) -> torch.Tensor:
+        return outplace_all_gather(input_, group_name=self.unique_name)
+
+    # didn't support dim in custom reduce_scatter
+    def _reduce_scatter_out_place(
+        self, input_: torch.Tensor, output_: torch.Tensor, dim: int = 0
+    ):
+        if self.device_communicator is None:
+            raise ValueError("No device communicator found")
+        return self.device_communicator.reduce_scatter(input_, output_, dim)
+
+    def reduce_scatter_tensor(
+        self,
+        input_: torch.Tensor,
+        use_custom: bool = True,
+        dim: int = 0,
+    ):
+        # return outplace_reduce_scatter(input_, group_name=self.unique_name, dim=dim)
+        world_size = self.world_size
+        assert world_size > 1, "error! world_size = 1"
+        ndim = input_.dim()
+        assert (
+            -ndim <= dim < ndim
+        ), f"Invalid dim ({dim}) for input tensor with shape {tuple(input_.shape)}"
+        if dim < 0:
+            dim += ndim
+        assert input_.shape[dim] % world_size == 0, (
+            f"input shape error, input.shape[{dim}]={input_.shape[dim]} "
+            f"is not divisible by world_size={world_size}"
+        )
+        # Output keeps the same rank/strides as input, only the scattered
+        # dim shrinks by world_size. Allocation is contiguous; the custom
+        # kernel writes elements in linear order into this layout, so no
+        # post-kernel reshape/copy is needed.
+        out_shape = (
+            input_.shape[:dim]
+            + (input_.shape[dim] // world_size,)
+            + input_.shape[dim + 1 :]
+        )
+
+        output_ = torch.empty(out_shape, dtype=input_.dtype, device=input_.device)
+        if use_custom:
+            outplace_reduce_scatter(
+                input_, output_, group_name=self.unique_name, dim=dim
+            )
+        else:
+            if dim != 0:
+                input_ = input_.movedim(dim, 0).contiguous()
+                tmp_out_shape = (input_.shape[0] // world_size,) + input_.shape[1:]
+                tmp_output = torch.empty(
+                    tmp_out_shape, dtype=input_.dtype, device=input_.device
+                )
+                torch.distributed.reduce_scatter_tensor(
+                    tmp_output, input_, group=self.device_group
+                )
+                output_ = tmp_output.movedim(0, dim).contiguous()
+            else:
+                torch.distributed.reduce_scatter_tensor(
+                    output_, input_, group=self.device_group
+                )
+        return output_
+
+    def reduce_scatter(self, input_: torch.Tensor, dim: int = 0) -> torch.Tensor:
+        if self.world_size == 1:
+            return input_
+        return self.reduce_scatter_tensor(input_, dim=dim)
+
+    def all_gather(
+        self,
+        input_: torch.Tensor,
+        use_custom: bool = False,
+        dim: int = -1,
+    ) -> torch.Tensor:
+        world_size = self.world_size
+        if world_size == 1:
+            return input_
+        assert (
+            -input_.dim() <= dim < input_.dim()
+        ), f"Invalid dim ({dim}) for input tensor with shape {input_.size()}"
+
+        if dim < 0:
+            dim += input_.dim()
+        input_size = input_.size()
+
+        is_last_dim = dim == input_.dim() - 1
+        can_use_custom = use_custom and (
+            dim == 0
+            or (is_last_dim and input_size[-1] * input_.element_size() % 16 == 0)
+        )
+
+        if can_use_custom:
+            return outplace_all_gather(input_, group_name=self.unique_name, dim=dim)
+
+        # NCCL path
+        output_tensor = torch.empty(
+            (world_size,) + input_size, dtype=input_.dtype, device=input_.device
+        )
+        torch.distributed.all_gather_into_tensor(
+            output_tensor, input_, group=self.device_group
+        )
+        output_tensor = output_tensor.movedim(0, dim)
+        output_tensor = output_tensor.reshape(
+            input_size[:dim] + (world_size * input_size[dim],) + input_size[dim + 1 :]
+        )
+        return output_tensor
+
+    def gather(
+        self, input_: torch.Tensor, dst: int = 0, dim: int = -1
+    ) -> torch.Tensor | None:
+        """
+        NOTE: We assume that the input tensor is on the same device across
+        all the ranks.
+        NOTE: `dst` is the local rank of the destination rank.
+        """
+        world_size = self.world_size
+        # Bypass the function if we are using only 1 GPU.
+        if world_size == 1:
+            return input_
+        assert (
+            -input_.dim() <= dim < input_.dim()
+        ), f"Invalid dim ({dim}) for input tensor with shape {input_.size()}"
+        if dim < 0:
+            # Convert negative dim to positive.
+            dim += input_.dim()
+        # Allocate output tensor.
+        if self.rank_in_group == dst:
+            gather_list = [torch.empty_like(input_) for _ in range(world_size)]
+        else:
+            gather_list = None
+        # Gather.
+        torch.distributed.gather(
+            input_, gather_list, dst=self.ranks[dst], group=self.device_group
+        )
+        if self.rank_in_group == dst:
+            output_tensor = torch.cat(gather_list, dim=dim)
+        else:
+            output_tensor = None
+        return output_tensor
+
+    def broadcast(self, input_: torch.Tensor, src: int = 0):
+        """Broadcast the input tensor.
+        NOTE: `src` is the local rank of the source rank.
+        """
+        assert src < self.world_size, f"Invalid src rank ({src})"
+
+        # Bypass the function if we are using only 1 GPU.
+        if self.world_size == 1:
+            return input_
+        # Broadcast.
+        torch.distributed.broadcast(
+            input_, src=self.ranks[src], group=self.device_group
+        )
+        return input_
+
+    def broadcast_object(self, obj: Any | None = None, src: int = 0):
+        """Broadcast the input object.
+        NOTE: `src` is the local rank of the source rank.
+        """
+        assert src < self.world_size, f"Invalid src rank ({src})"
+
+        # Bypass the function if we are using only 1 GPU.
+        if self.world_size == 1:
+            return obj
+        if self.mq_broadcaster is not None:
+            assert src == 0, "Message queue broadcaster only supports src=0"
+            return self.mq_broadcaster.broadcast_object(obj)
+        if self.rank_in_group == src:
+            torch.distributed.broadcast_object_list(
+                [obj], src=self.ranks[src], group=self.cpu_group
+            )
+            return obj
+        else:
+            recv = [None]
+            torch.distributed.broadcast_object_list(
+                recv, src=self.ranks[src], group=self.cpu_group
+            )
+            return recv[0]
+
+    def broadcast_object_list(
+        self, obj_list: list[Any], src: int = 0, group: ProcessGroup | None = None
+    ):
+        """Broadcast the input object list.
+        NOTE: `src` is the local rank of the source rank.
+        """
+        assert src < self.world_size, f"Invalid src rank ({src})"
+
+        # Bypass the function if we are using only 1 GPU.
+        if self.world_size == 1:
+            return obj_list
+        # Broadcast.
+        torch.distributed.broadcast_object_list(
+            obj_list, src=self.ranks[src], group=self.device_group
+        )
+        return obj_list
+
+    def send_object(self, obj: Any, dst: int) -> None:
+        """Send the input object list to the destination rank."""
+        """NOTE: `dst` is the local rank of the destination rank."""
+
+        assert dst < self.world_size, f"Invalid dst rank ({dst})"
+
+        assert dst != self.rank_in_group, (
+            "Invalid destination rank. Destination rank is the same "
+            "as the current rank."
+        )
+
+        # Serialize object to tensor and get the size as well
+        object_tensor = torch.frombuffer(pickle.dumps(obj), dtype=torch.uint8)
+
+        size_tensor = torch.tensor(
+            [object_tensor.numel()], dtype=torch.long, device="cpu"
+        )
+
+        # Send object size
+
+        torch.distributed.send(size_tensor, dst=self.ranks[dst], group=self.cpu_group)
+
+        # Send object
+        torch.distributed.send(object_tensor, dst=self.ranks[dst], group=self.cpu_group)
+
+    def recv_object(self, src: int) -> Any:
+        """Receive the input object list from the source rank."""
+        """NOTE: `src` is the local rank of the source rank."""
+
+        assert src < self.world_size, f"Invalid src rank ({src})"
+
+        assert (
+            src != self.rank_in_group
+        ), "Invalid source rank. Source rank is the same as the current rank."
+
+        size_tensor = torch.empty(1, dtype=torch.long, device="cpu")
+
+        # Receive object size
+        rank_size = torch.distributed.recv(
+            size_tensor, src=self.ranks[src], group=self.cpu_group
+        )
+
+        # Tensor to receive serialized objects into.
+        object_tensor = torch.empty(  # type: ignore[call-overload]
+            size_tensor.item(),  # type: ignore[arg-type]
+            dtype=torch.uint8,
+            device="cpu",
+        )
+
+        rank_object = torch.distributed.recv(
+            object_tensor, src=self.ranks[src], group=self.cpu_group
+        )
+
+        assert (
+            rank_object == rank_size
+        ), "Received object sender rank does not match the size sender rank."
+
+        obj = pickle.loads(object_tensor.numpy().tobytes())
+
+        return obj
+
+    def broadcast_tensor_dict(
+        self,
+        tensor_dict: dict[str, torch.Tensor | Any] | None = None,
+        src: int = 0,
+        group: ProcessGroup | None = None,
+        metadata_group: ProcessGroup | None = None,
+    ) -> dict[str, torch.Tensor | Any] | None:
+        """Broadcast the input tensor dictionary.
+        NOTE: `src` is the local rank of the source rank.
+        """
+        # Bypass the function if we are using only 1 GPU.
+        if not torch.distributed.is_initialized() or self.world_size == 1:
+            return tensor_dict
+
+        group = self.device_group
+        metadata_group = self.cpu_group
+        assert src < self.world_size, f"Invalid src rank ({src})"
+
+        rank_in_group = self.rank_in_group
+        if rank_in_group == src:
+            metadata_list: list[tuple[Any, Any]] = []
+            assert isinstance(
+                tensor_dict, dict
+            ), f"Expecting a dictionary, got {type(tensor_dict)}"
+            metadata_list, tensor_list = _split_tensor_dict(tensor_dict)
+            # `metadata_list` lives in CPU memory.
+            # `broadcast_object_list` has serialization & deserialization,
+            # all happening on CPU. Therefore, we can use the CPU group.
+            self.broadcast_object(metadata_list, src=src)
+            async_handles = []
+            for tensor in tensor_list:
+                if tensor.numel() == 0:
+                    # Skip broadcasting empty tensors.
+                    continue
+                if tensor.is_cpu:
+                    # use metadata_group for CPU tensors
+                    handle = torch.distributed.broadcast(
+                        tensor, src=self.ranks[src], group=metadata_group, async_op=True
+                    )
+                else:
+                    # use group for GPU tensors
+                    handle = torch.distributed.broadcast(
+                        tensor, src=self.ranks[src], group=group, async_op=True
+                    )
+                async_handles.append(handle)
+            for async_handle in async_handles:
+                async_handle.wait()
+
+        else:
+            metadata_list = self.broadcast_object(None, src=src)
+            tensor_dict = {}
+            async_handles = []
+            for key, value in metadata_list:
+                if isinstance(value, TensorMetadata):
+                    tensor = torch.empty(
+                        value.size, dtype=value.dtype, device=value.device
+                    )
+                    if tensor.numel() == 0:
+                        # Skip broadcasting empty tensors.
+                        tensor_dict[key] = tensor
+                        continue
+                    if tensor.is_cpu:
+                        # use metadata_group for CPU tensors
+                        handle = torch.distributed.broadcast(
+                            tensor,
+                            src=self.ranks[src],
+                            group=metadata_group,
+                            async_op=True,
+                        )
+                    else:
+                        # use group for GPU tensors
+                        handle = torch.distributed.broadcast(
+                            tensor, src=self.ranks[src], group=group, async_op=True
+                        )
+                    async_handles.append(handle)
+                    tensor_dict[key] = tensor
+                else:
+                    tensor_dict[key] = value
+            for async_handle in async_handles:
+                async_handle.wait()
+        return tensor_dict
+
+    def send_tensor_dict(
+        self,
+        tensor_dict: dict[str, torch.Tensor | Any],
+        dst: int | None = None,
+        all_gather_group: Optional["GroupCoordinator"] = None,
+    ) -> dict[str, torch.Tensor | Any] | None:
+        """Send the input tensor dictionary.
+        NOTE: `dst` is the local rank of the source rank.
+        """
+        # Bypass the function if we are using only 1 GPU.
+        if not torch.distributed.is_initialized() or self.world_size == 1:
+            return tensor_dict
+
+        all_gather_size = 1 if all_gather_group is None else all_gather_group.world_size
+        all_gather_rank = (
+            0 if all_gather_group is None else all_gather_group.rank_in_group
+        )
+
+        group = self.device_group
+        metadata_group = self.cpu_group
+
+        if dst is None:
+            dst = (self.rank_in_group + 1) % self.world_size
+        assert dst < self.world_size, f"Invalid dst rank ({dst})"
+
+        metadata_list: list[tuple[Any, Any]] = []
+        assert isinstance(
+            tensor_dict, dict
+        ), f"Expecting a dictionary, got {type(tensor_dict)}"
+        metadata_list, tensor_list = _split_tensor_dict(tensor_dict)
+        # `metadata_list` lives in CPU memory.
+        # `send_object_list` has serialization & deserialization,
+        # all happening on CPU. Therefore, we can use the CPU group.
+        self.send_object(metadata_list, dst=dst)
+        for tensor in tensor_list:
+            if tensor.numel() == 0:
+                # Skip sending empty tensors.
+                continue
+
+            # send-allgather: send only a slice, then do allgather.
+            if all_gather_group is not None and tensor.numel() % all_gather_size == 0:
+                tensor = tensor.reshape(all_gather_size, -1)[all_gather_rank]
+
+            if tensor.is_cpu:
+                # use metadata_group for CPU tensors
+                torch.distributed.send(
+                    tensor, dst=self.ranks[dst], group=metadata_group
+                )
+            else:
+                # use group for GPU tensors
+                torch.distributed.send(tensor, dst=self.ranks[dst], group=group)
+        return None
+
+    def recv_tensor_dict(
+        self,
+        src: int | None = None,
+        all_gather_group: Optional["GroupCoordinator"] = None,
+    ) -> dict[str, torch.Tensor | Any] | None:
+        """Recv the input tensor dictionary.
+        NOTE: `src` is the local rank of the source rank.
+        """
+        # Bypass the function if we are using only 1 GPU.
+        if not torch.distributed.is_initialized() or self.world_size == 1:
+            return None
+
+        all_gather_size = 1 if all_gather_group is None else all_gather_group.world_size
+        all_gather_rank = (
+            0 if all_gather_group is None else all_gather_group.rank_in_group
+        )
+
+        group = self.device_group
+        metadata_group = self.cpu_group
+
+        if src is None:
+            src = (self.rank_in_group - 1) % self.world_size
+        assert src < self.world_size, f"Invalid src rank ({src})"
+
+        recv_metadata_list = self.recv_object(src=src)
+        tensor_dict: dict[str, Any] = {}
+        for key, value in recv_metadata_list:
+            if isinstance(value, TensorMetadata):
+                tensor = torch.empty(value.size, dtype=value.dtype, device=value.device)
+                if tensor.numel() == 0:
+                    # Skip broadcasting empty tensors.
+                    tensor_dict[key] = tensor
+                    continue
+
+                # send-allgather: send only a slice, then do allgather.
+                use_all_gather = (
+                    all_gather_group is not None
+                    and tensor.numel() % all_gather_size == 0
+                )
+
+                if use_all_gather:
+                    orig_shape = tensor.shape
+                    tensor = tensor.reshape(all_gather_size, -1)[all_gather_rank]
+
+                if tensor.is_cpu:
+                    # use metadata_group for CPU tensors
+                    torch.distributed.recv(
+                        tensor, src=self.ranks[src], group=metadata_group
+                    )
+                else:
+                    # use group for GPU tensors
+                    torch.distributed.recv(tensor, src=self.ranks[src], group=group)
+                if use_all_gather:
+                    # do the allgather
+                    tensor = all_gather_group.all_gather(tensor, dim=0)  # type: ignore
+                    tensor = tensor.reshape(orig_shape)
+
+                tensor_dict[key] = tensor
+            else:
+                tensor_dict[key] = value
+        return tensor_dict
+
+    def barrier(self):
+        """Barrier synchronization among the group.
+        NOTE: don't use `device_group` here! `barrier` in NCCL is
+        terrible because it is internally a broadcast operation with
+        secretly created GPU tensors. It is easy to mess up the current
+        device. Use the CPU group instead.
+        """
+        torch.distributed.barrier(group=self.cpu_group)
+
+    def send(self, tensor: torch.Tensor, dst: int | None = None) -> None:
+        """Sends a tensor to the destination rank in a non-blocking way"""
+        """NOTE: `dst` is the local rank of the destination rank."""
+        if dst is None:
+            dst = (self.rank_in_group + 1) % self.world_size
+
+        pynccl_comm = self.pynccl_comm
+        if pynccl_comm is not None and not pynccl_comm.disabled:
+            pynccl_comm.send(tensor, dst)
+        else:
+            torch.distributed.send(tensor, self.ranks[dst], self.device_group)
+
+    def recv(
+        self, size: torch.Size, dtype: torch.dtype, src: int | None = None
+    ) -> torch.Tensor:
+        """Receives a tensor from the source rank."""
+        """NOTE: `src` is the local rank of the source rank."""
+        if src is None:
+            src = (self.rank_in_group - 1) % self.world_size
+
+        tensor = torch.empty(size, dtype=dtype, device=self.device)
+        pynccl_comm = self.pynccl_comm
+        if pynccl_comm is not None and not pynccl_comm.disabled:
+            pynccl_comm.recv(tensor, src)
+        else:
+            torch.distributed.recv(tensor, self.ranks[src], self.device_group)
+        return tensor
+
+    def prepare_communication_buffer_for_model(self, model: torch.nn.Module):
+        if self.device_communicator is not None:
+            self.device_communicator.prepare_communication_buffer_for_model(model)
+
+    def destroy(self):
+        """Release what this group owns.
+
+        A ``reuse_from`` group borrows its process groups and (unless EP) its
+        device_communicator; only the owner tears those down, since a second
+        destroy raises and aborts teardown part-way.
+        """
+        if hasattr(self, "device_group"):
+            if self._owns_device_group:
+                torch.distributed.destroy_process_group(self.device_group)
+            del self.device_group
+        if hasattr(self, "cpu_group"):
+            if self._owns_cpu_group:
+                torch.distributed.destroy_process_group(self.cpu_group)
+            del self.cpu_group
+        if self.device_communicator is not None:
+            if self._owns_device_communicator:
+                self.device_communicator.destroy()
+            # Drop it either way: a kept reference would route collectives into
+            # process groups that are destroyed by now.
+            self.device_communicator = None
+        if self.mq_broadcaster is not None:
+            self.mq_broadcaster = None
+
+
+_WORLD: GroupCoordinator | None = None
+
+
+def get_world_group() -> GroupCoordinator:
+    assert _WORLD is not None, "world group is not initialized"
+    return _WORLD
+
+
+def init_world_group(
+    ranks: list[int], local_rank: int, backend: str
+) -> GroupCoordinator:
+    return GroupCoordinator(
+        group_ranks=[ranks],
+        local_rank=local_rank,
+        torch_distributed_backend=backend,
+        use_device_communicator=False,
+        group_name="world",
+    )
+
+
+def init_model_parallel_group(
+    group_ranks: list[list[int]],
+    local_rank: int,
+    backend: str,
+    use_device_communicator: bool = True,
+    use_message_queue_broadcaster: bool = False,
+    group_name: str | None = None,
+    reuse_from: "GroupCoordinator | None" = None,
+    is_ep: bool = False,
+) -> GroupCoordinator:
+    return GroupCoordinator(
+        group_ranks=group_ranks,
+        local_rank=local_rank,
+        torch_distributed_backend=backend,
+        use_device_communicator=use_device_communicator,
+        use_message_queue_broadcaster=use_message_queue_broadcaster,
+        group_name=group_name,
+        reuse_from=reuse_from,
+        is_ep=is_ep,
+    )
+
+
+_TP: GroupCoordinator | None = None
+
+
+def get_tp_group() -> GroupCoordinator:
+    assert _TP is not None, "tensor model parallel group is not initialized"
+    return _TP
+
+
+# kept for backward compatibility
+get_tensor_model_parallel_group = get_tp_group
+
+_PCP: GroupCoordinator | None = None
+
+
+def get_pcp_group() -> GroupCoordinator:
+    assert _PCP is not None, "prefill context parallel group is not initialized"
+    return _PCP
+
+
+def get_prefill_context_model_parallel_world_size() -> int:
+    """Return world size for the prefill context parallel group."""
+    return get_pcp_group().world_size if _PCP is not None else 1
+
+
+def get_prefill_context_model_parallel_rank() -> int:
+    """Return my rank for the prefill context parallel group."""
+    return get_pcp_group().rank_in_group if _PCP is not None else 0
+
+
+_PP: GroupCoordinator | None = None
+
+
+def get_pp_group() -> GroupCoordinator:
+    assert _PP is not None, "pipeline model parallel group is not initialized"
+    return _PP
+
+
+_DP: GroupCoordinator | None = None
+
+
+def get_dp_group() -> GroupCoordinator:
+    assert _DP is not None, "data parallel group is not initialized"
+    return _DP
+
+
+_EP: GroupCoordinator | None = None
+
+
+def get_ep_group() -> GroupCoordinator:
+    assert _EP is not None, "expert parallel group is not initialized"
+    return _EP
+
+
+_DCP: GroupCoordinator | None = None
+
+
+def get_dcp_group() -> GroupCoordinator:
+    assert _DCP is not None, "decode context model parallel group is not initialized"
+    return _DCP
+
+
+def has_custom_group() -> bool:
+    """Return whether any custom group is initialized."""
+    return bool(_CUSTOM)
+
+
+class CustomGroupConfig:
+    """Configuration builder for custom communication groups.
+
+    Each group is defined by a rank list that can be:
+    - 1D List[int]: all ranks form a single communication group,
+      e.g. [0,1,2,3,4,5,6,7] -> one TP8 group
+    - 2D List[List[int]]: multiple independent subgroups,
+      e.g. [[0,1,2,3],[4,5,6,7]] -> two independent TP4 groups
+
+    Usage:
+        config = CustomGroupConfig()
+        config.add_group("tp_group", [[0,1,2,3],[4,5,6,7]])
+        config.add_group("dp_group", [[0,4],[1,5],[2,6],[3,7]])
+        ensure_model_parallel_initialized(..., custom_group_config=config.data())
+
+    Or pass a raw dict directly:
+        ensure_model_parallel_initialized(..., custom_group_config={
+            "tp_group": [[0,1,2,3],[4,5,6,7]],
+            "dp_group": [[0,4],[1,5],[2,6],[3,7]],
+        })
+    """
+
+    def __init__(self):
+        self._groups: dict[str, list] = {}
+
+    def add_group(
+        self,
+        name: str,
+        ranks: list,
+    ) -> "CustomGroupConfig":
+        assert name not in self._groups, f"custom group '{name}' already exists"
+        assert ranks, f"custom group '{name}': ranks list must not be empty"
+        self._groups[name] = ranks
+        return self
+
+    def data(self) -> dict[str, list]:
+        assert self._groups, "no custom groups have been added"
+        return dict(self._groups)
+
+
+_CUSTOM: dict[str, "GroupCoordinator"] = {}
+
+
+def get_custom_group(
+    name: str | None = None,
+) -> "GroupCoordinator | dict[str, GroupCoordinator]":
+    """Get custom group coordinator(s).
+
+    - If only one custom group is initialized, returns the GroupCoordinator
+      instance directly (name is optional).
+    - If multiple custom groups are initialized and name is None, returns the
+      full dict so the caller can select by name.
+    - If name is given, returns that specific GroupCoordinator.
+    """
+    assert _CUSTOM, "custom allreduce group is not initialized"
+    if name is not None:
+        assert name in _CUSTOM, (
+            f"custom group '{name}' not found, " f"available: {list(_CUSTOM.keys())}"
+        )
+        return _CUSTOM[name]
+    if len(_CUSTOM) == 1:
+        return next(iter(_CUSTOM.values()))
+    return dict(_CUSTOM)
+
+
+# kept for backward compatibility
+get_pipeline_model_parallel_group = get_pp_group
+
+
+@contextmanager
+def graph_capture():
+    """
+    `graph_capture` is a context manager which should surround the code that
+    is capturing the CUDA graph. Its main purpose is to ensure that the
+    some operations will be run after the graph is captured, before the graph
+    is replayed. It returns a `GraphCaptureContext` object which contains the
+    necessary data for the graph capture. Currently, it only contains the
+    stream that the graph capture is running on. This stream is set to the
+    current CUDA stream when the context manager is entered and reset to the
+    default stream when the context manager is exited. This is to ensure that
+    the graph capture is running on a separate stream from the default stream,
+    in order to explicitly distinguish the kernels to capture
+    from other kernels possibly launched on background in the default stream.
+    """
+    from contextlib import ExitStack
+
+    with ExitStack() as stack:
+        context = stack.enter_context(get_tp_group().graph_capture())
+        for group in (get_pp_group(), get_dp_group(), get_ep_group()):
+            if group is not None and group.device_communicator is not None:
+                stack.enter_context(group.graph_capture(context))
+            if _DCP is not None and _DCP.world_size > 1:
+                stack.enter_context(_DCP.graph_capture(context))
+        for group in _CUSTOM.values():
+            stack.enter_context(group.graph_capture(context))
+        yield context
+
+
+_ENABLE_CUSTOM_ALL_REDUCE = True
+
+
+def set_custom_all_reduce(enable: bool):
+    global _ENABLE_CUSTOM_ALL_REDUCE
+    _ENABLE_CUSTOM_ALL_REDUCE = enable
+
+
+def init_distributed_environment(
+    world_size: int = -1,
+    rank: int = -1,
+    distributed_init_method: str = "env://",
+    local_rank: int = -1,
+    backend: str = "nccl",
+    data_parallel_size: int = 1,
+    data_parallel_rank: int = 0,
+):
+    logger.debug(
+        "world_size=%d rank=%d local_rank=%d " "distributed_init_method=%s backend=%s",
+        world_size,
+        rank,
+        local_rank,
+        distributed_init_method,
+        backend,
+    )
+    if data_parallel_size > 1:
+        # Adjust the rank and world size for data parallel
+        rank = data_parallel_rank * world_size + rank
+        world_size = data_parallel_size * world_size
+    if not torch.distributed.is_initialized():
+        assert distributed_init_method is not None, (
+            "distributed_init_method must be provided when initializing "
+            "distributed environment"
+        )
+        if "HIP_VISIBLE_DEVICES" not in os.environ:
+            from .utils import update_environment_variables
+
+            update_environment_variables(
+                {"HIP_VISIBLE_DEVICES": (",".join(map(str, range(world_size))))}
+            )
+
+        torch.distributed.init_process_group(
+            backend=backend,
+            init_method=distributed_init_method,
+            world_size=world_size,
+            rank=rank,
+        )
+    # set the local rank
+    # local_rank is not available in torch ProcessGroup,
+    # see https://github.com/pytorch/pytorch/issues/122816
+    if local_rank == -1:
+        # local rank not set, this usually happens in single-node
+        # setting, where we can use rank as local rank
+        if distributed_init_method == "env://":
+            # local_rank = envs.LOCAL_RANK
+            local_rank = os.environ.get("LOCAL_RANK", rank)
+        else:
+            local_rank = rank
+    global _WORLD
+    if _WORLD is None:
+        ranks = list(range(torch.distributed.get_world_size()))
+        _WORLD = init_world_group(ranks, local_rank, backend)
+    else:
+        assert (
+            _WORLD.world_size == torch.distributed.get_world_size()
+        ), "world group already initialized with a different world size"
+
+
+def initialize_model_parallel(
+    tensor_model_parallel_size: int = 1,
+    pipeline_model_parallel_size: int = 1,
+    decode_context_model_parallel_size: int | None = 1,
+    backend: str | None = None,
+    data_parallel_size: int = 1,
+    prefill_context_model_parallel_size: int = 1,
+    custom_group_config: dict[str, list] | None = None,
+) -> None:
+    """
+    Initialize model parallel groups.
+
+    Arguments:
+        tensor_model_parallel_size: number of GPUs used for tensor model
+            parallelism.
+        pipeline_model_parallel_size: number of GPUs used for pipeline model
+            parallelism.
+        backend: name of torch distributed communication backend.
+        custom_group_config: optional dict mapping group names to rank lists.
+            Each value can be:
+            - 1D List[int]: all ranks form a single group,
+              e.g. [0,1,2,3,4,5,6,7]
+            - 2D List[List[int]]: multiple independent subgroups,
+              e.g. [[0,1,2,3],[4,5,6,7]]
+
+    Let's say we have a total of 8 GPUs denoted by g0 ... g7 and we
+    use 2 GPUs to parallelize the model tensor, and 4 GPUs to parallelize
+    the model pipeline. The present function will
+    create 4 tensor model-parallel groups and 2 pipeline model-parallel groups:
+        4 tensor model-parallel groups:
+            [g0, g1], [g2, g3], [g4, g5], [g6, g7]
+        2 pipeline model-parallel groups:
+            [g0, g2, g4, g6], [g1, g3, g5, g7]
+    Note that for efficiency, the caller should make sure adjacent ranks
+    are on the same DGX box. For example if we are using 2 DGX-1 boxes
+    with a total of 16 GPUs, rank 0 to 7 belong to the first box and
+    ranks 8 to 15 belong to the second box.
+
+    Environment:
+        AITER_REUSE_IDENTICAL_COMM_GROUPS (default off; 1/true/yes/on): a group
+            whose rank list exactly matches an already-built one borrows that
+            group's process groups and allreduce communicators instead of
+            allocating a second set (with tp == dcp == ep == world_size, DCP and
+            EP borrow TP). The groups stay distinct objects with their own
+            unique_name; EP keeps its own EP-named device_communicator and a
+            private CPU group. Borrowed resources are released only by their
+            owner, in destroy().
+
+    Collective: all ranks must call this together (it all_reduces to check that
+    they agree on the reuse flag).
+    """
+    # Get world size and rank. Ensure some consistencies.
+    assert torch.distributed.is_initialized()
+    world_size: int = torch.distributed.get_world_size()
+    rank = torch.distributed.get_rank()
+    backend = backend or torch.distributed.get_backend(get_world_group().device_group)
+
+    # data_parallel_size = 1
+    # from vllm.config import get_current_vllm_config
+
+    # config = get_current_vllm_config()
+    # if config is not None:
+    #     data_parallel_size = config.parallel_config.data_parallel_size
+
+    # the layout order is: ExternalDP x DP x PP x TP
+    # ExternalDP is the data parallel group that is not part of the model,
+    # every dp rank can generate independently (in verl integration).
+    # DP is the data parallel group that is part of the model,
+    # all the ranks in the same DP group should generate simultaneously,
+    # i.e. the `generate` call in the same DP group should be called together,
+    # otherwise it will cause deadlock.
+    # to get group_ranks for each dimension, transpose that dimension to the
+    # last dimension, then reshape to 2D, then unbind the last dimension
+    # the layout order is: ExternalDP x DP x PP x PCP x TP
+    # PCP (prefill context parallel) is an INDEPENDENT dimension that grows
+    # world_size (world = ... x pcp x tp), and sits just outside TP (mirrors
+    # vLLM's layout). It is NOT the commented-out DCP below, which reuses TP.
+    all_ranks = torch.arange(world_size).reshape(
+        -1,
+        data_parallel_size,
+        pipeline_model_parallel_size,
+        prefill_context_model_parallel_size,
+        tensor_model_parallel_size,
+    )
+
+    # When custom groups are provided, all communication goes through them
+    # (standard ops assert via _assert_no_custom_group). Skip expensive
+    # CudaCommunicator allocation for standard TP/PP/DP/EP groups.
+    need_std_comm = custom_group_config is None
+
+    # When on, a group whose rank list matches an earlier one shares its
+    # communicators instead of allocating duplicates.
+    reuse_identical_rank_groups = env_flag("AITER_REUSE_IDENTICAL_COMM_GROUPS")
+
+    # Declared here so the precondition reads below are legal (a name cannot
+    # be used before its `global`).
+    global _TP, _DCP, _PCP, _PP, _DP, _EP
+
+    # Before the collective below: a second (or partial-rank) call must keep
+    # failing fast and locally instead of blocking in gloo forever.
+    assert _TP is None, "tensor model parallel group is already initialized"
+    assert _DCP is None, "decode context model parallel group is already initialized"
+    assert _PCP is None, "prefill context parallel group is already initialized"
+    assert _PP is None, "pipeline model parallel group is already initialized"
+    assert _DP is None, "data parallel group is already initialized"
+    assert _EP is None, "expert parallel group is already initialized"
+    assert not _CUSTOM, "custom allreduce group is already initialized"
+
+    # Set on only some ranks, those ranks skip new_group() for DCP/EP while the
+    # rest call it, and the job deadlocks in init with no output. Check
+    # unanimity to turn that into an error -- but only where reuse can happen
+    # (need_std_comm False => guaranteed no-op, don't charge every startup).
+    if need_std_comm and world_size > 1:
+        _flag = torch.tensor(
+            [1 if reuse_identical_rank_groups else 0], dtype=torch.int64
+        )
+        torch.distributed.all_reduce(_flag, group=get_world_group().cpu_group)
+        _n_set = int(_flag.item())
+        if _n_set not in (0, world_size):
+            # Not an assert: `python -O` would strip this guard.
+            raise RuntimeError(
+                f"AITER_REUSE_IDENTICAL_COMM_GROUPS disagrees across ranks "
+                f"({_n_set}/{world_size} ranks have it enabled); it must be set "
+                "identically on every rank. Note it accepts 1/true/yes/on, so a "
+                "mixed launcher using different spellings is still unanimous."
+            )
+        if rank == 0:
+            logger.info(
+                f"AITER_REUSE_IDENTICAL_COMM_GROUPS resolved to "
+                f"{reuse_identical_rank_groups}"
+            )
+
+    # Dedup helper: a group whose rank set matches an already-built one reuses it
+    # (reuse_from). The first builder is the source. Only multi-rank groups are
+    # tracked (single-rank groups hold no communicator). No-op when the flag is off.
+    _local_rank = get_world_group().local_rank
+    _built_by_ranks: dict[tuple[int, ...], GroupCoordinator] = {}
+
+    def _build_group(group_name, group_ranks, use_message_queue_broadcaster=False):
+        group_ranks = [x.tolist() for x in group_ranks]
+        my_ranks = next((r for r in group_ranks if rank in r), None)
+        # Key on the ordered rank tuple, not the sorted set: a reusing group
+        # inherits the source's ranks/rank_in_group verbatim, so reuse is only
+        # correct when the rank *order* is identical. Two groups sharing the
+        # same rank set but a different order (e.g. a future non-ascending
+        # slice) must NOT collapse -- that would corrupt order-dependent ops
+        # (all_gather layout, reduce_scatter, send/recv neighbors).
+        key = tuple(my_ranks) if my_ranks is not None else None
+        dedup = (
+            reuse_identical_rank_groups
+            and need_std_comm
+            and key is not None
+            and len(my_ranks) > 1
+        )
+        source = _built_by_ranks.get(key) if dedup else None
+        group = init_model_parallel_group(
+            group_ranks,
+            _local_rank,
+            backend,
+            use_device_communicator=need_std_comm,
+            use_message_queue_broadcaster=use_message_queue_broadcaster,
+            group_name=group_name,
+            reuse_from=source,
+            # Pass the EP role explicitly rather than duplicating the
+            # "ep" in unique_name rule DeviceCommunicatorBase already owns; a
+            # missed EP group silently loses all2all and returns wrong outputs.
+            is_ep=group_name == "ep",
+        )
+        if dedup and source is None:
+            _built_by_ranks[key] = group
+        return group
+
+    # Build the tensor model-parallel groups.
+    group_ranks = all_ranks.view(-1, tensor_model_parallel_size).unbind(0)
+    # message queue broadcaster is only used in tensor model parallel group
+    _TP = _build_group("tp", group_ranks, use_message_queue_broadcaster=True)
+
+    # Build the DCP model-parallel groups.
+    # Note(hc): In the current implementation of decode context parallel,
+    # dcp_size must not exceed tp_size, because the world size does not
+    # change by DCP, it simply reuses the GPUs of TP group, and split one
+    # TP group into tp_size//dcp_size DCP groups.
+    group_ranks = all_ranks.reshape(-1, decode_context_model_parallel_size).unbind(0)
+    _DCP = _build_group("dcp", group_ranks)
+
+    # Build the prefill context-parallel (PCP) groups.
+    # PCP is an INDEPENDENT dimension (world = ... x pcp x tp), unlike the
+    # commented-out DCP above which reuses TP GPUs. PCP sits just outside TP,
+    # so transpose(3, 4) brings the PCP dim innermost. DO NOT touch _DCP.
+    group_ranks = (
+        all_ranks.transpose(3, 4)
+        .reshape(-1, prefill_context_model_parallel_size)
+        .unbind(0)
+    )
+    _PCP = _build_group("pcp", group_ranks)
+
+    # Build the pipeline model-parallel groups.
+    group_ranks = (
+        all_ranks.transpose(2, 4).reshape(-1, pipeline_model_parallel_size).unbind(0)
+    )
+    _PP = _build_group("pp", group_ranks)
+
+    group_ranks = all_ranks.transpose(1, 4).reshape(-1, data_parallel_size).unbind(0)
+    _DP = _build_group("dp", group_ranks)
+
+    group_ranks = (
+        all_ranks.transpose(1, 2)
+        .reshape(
+            -1,
+            data_parallel_size
+            * prefill_context_model_parallel_size
+            * tensor_model_parallel_size,
+        )
+        .unbind(0)
+    )
+    _EP = _build_group("ep", group_ranks)
+
+    # Build the custom allreduce group(s) (optional).
+    if custom_group_config is not None:
+        for gname, ranks in custom_group_config.items():
+            assert (
+                isinstance(ranks, list) and len(ranks) > 0
+            ), f"custom group '{gname}': value must be a non-empty list"
+
+            if all(isinstance(r, int) for r in ranks):
+                # 1D list: all ranks form a single group
+                group_ranks = [ranks]
+            elif all(isinstance(g, list) for g in ranks):
+                # 2D list: multiple independent subgroups
+                group_ranks = ranks
+                subgroup_size = len(group_ranks[0])
+                for g in group_ranks:
+                    assert len(g) == subgroup_size, (
+                        f"custom group '{gname}': all subgroups must "
+                        f"have the same size, expected {subgroup_size} "
+                        f"but got {len(g)}"
+                    )
+                    assert all(isinstance(r, int) for r in g), (
+                        f"custom group '{gname}': subgroup elements "
+                        f"must be integers"
+                    )
+            else:
+                raise AssertionError(
+                    f"custom group '{gname}': value must be List[int] "
+                    f"(1D) or List[List[int]] (2D)"
+                )
+
+            all_ranks_flat = [r for g in group_ranks for r in g]
+            assert len(all_ranks_flat) == world_size, (
+                f"custom group '{gname}': total ranks "
+                f"({len(all_ranks_flat)}) must equal world_size "
+                f"({world_size})"
+            )
+            assert (
+                len(set(all_ranks_flat)) == world_size
+            ), f"custom group '{gname}': contains duplicate ranks"
+            assert set(all_ranks_flat) == set(range(world_size)), (
+                f"custom group '{gname}': must cover all ranks " f"0..{world_size - 1}"
+            )
+
+            _CUSTOM[gname] = init_model_parallel_group(
+                group_ranks,
+                get_world_group().local_rank,
+                backend,
+                group_name=f"custom_{gname}",
+            )
+
+    logger.info(
+        "rank %s in world size %s is assigned as "
+        "DP rank %s, PP rank %s, PCP rank %s, TP rank %s, EP rank %s",
+        rank,
+        world_size,
+        _DP.rank_in_group,
+        _PP.rank_in_group,
+        _PCP.rank_in_group,
+        _TP.rank_in_group,
+        _EP.rank_in_group,
+    )
+
+
+def ensure_model_parallel_initialized(
+    tensor_model_parallel_size: int,
+    pipeline_model_parallel_size: int,
+    decode_context_model_parallel_size: int | None = 1,
+    backend: str | None = None,
+    data_parallel_size: int = 1,
+    prefill_context_model_parallel_size: int = 1,
+    custom_group_config: dict[str, list] | None = None,
+) -> None:
+    """Helper to initialize model parallel groups if they are not initialized,
+    or ensure tensor-parallel and pipeline-parallel sizes are equal to expected
+    values if the model parallel groups are initialized.
+    """
+    backend = backend or torch.distributed.get_backend(get_world_group().device_group)
+    if not model_parallel_is_initialized():
+        initialize_model_parallel(
+            tensor_model_parallel_size,
+            pipeline_model_parallel_size,
+            decode_context_model_parallel_size,
+            backend,
+            data_parallel_size,
+            prefill_context_model_parallel_size=prefill_context_model_parallel_size,
+            custom_group_config=custom_group_config,
+        )
+        return
+
+    assert get_tensor_model_parallel_world_size() == tensor_model_parallel_size, (
+        "tensor parallel group already initialized, but of unexpected size: "
+        f"{get_tensor_model_parallel_world_size()=} vs. "
+        f"{tensor_model_parallel_size=}"
+    )
+    pp_world_size = get_pp_group().world_size
+    assert pp_world_size == pipeline_model_parallel_size, (
+        "pipeline parallel group already initialized, but of unexpected size: "
+        f"{pp_world_size=} vs. "
+        f"{pipeline_model_parallel_size=}"
+    )
+
+
+def model_parallel_is_initialized():
+    """Check if tensor and pipeline parallel groups are initialized."""
+    return _TP is not None and _PP is not None
+
+
+_TP_STATE_PATCHED = False
+
+
+@contextmanager
+def patch_tensor_parallel_group(tp_group: GroupCoordinator):
+    """Patch the tp group temporarily until this function ends.
+
+    This method is for draft workers of speculative decoding to run draft model
+    with different tp degree from that of target model workers.
+
+    Args:
+        tp_group (GroupCoordinator): the tp group coordinator
+    """
+    global _TP_STATE_PATCHED
+    assert not _TP_STATE_PATCHED, "Should not call when it's already patched"
+
+    _TP_STATE_PATCHED = True
+    old_tp_group = get_tp_group()
+    global _TP
+    _TP = tp_group
+    try:
+        yield
+    finally:
+        # restore the original state
+        _TP_STATE_PATCHED = False
+        _TP = old_tp_group
+
+
+def get_tensor_model_parallel_world_size():
+    """Return world size for the tensor model parallel group."""
+    return get_tp_group().world_size
+
+
+def get_tensor_model_parallel_rank():
+    """Return my rank for the tensor model parallel group."""
+    return get_tp_group().rank_in_group
+
+
+def destroy_model_parallel():
+    """Set the groups to none and destroy them."""
+    global _TP
+    if _TP:
+        _TP.destroy()
+    _TP = None
+
+    global _PCP
+    if _PCP:
+        _PCP.destroy()
+    _PCP = None
+
+    global _PP
+    if _PP:
+        _PP.destroy()
+    _PP = None
+
+    global _DP
+    if _DP:
+        _DP.destroy()
+    _DP = None
+
+    global _EP
+    if _EP:
+        _EP.destroy()
+    _EP = None
+
+    global _DCP
+    if _DCP:
+        _DCP.destroy()
+    _DCP = None
+
+    global _CUSTOM
+    for group in _CUSTOM.values():
+        group.destroy()
+    _CUSTOM = {}
+
+
+def destroy_distributed_environment():
+    global _WORLD
+    if _WORLD:
+        _WORLD.destroy()
+    _WORLD = None
+    if torch.distributed.is_initialized():
+        torch.distributed.destroy_process_group()
+
+
+def in_the_same_node_as(pg: ProcessGroup, source_rank: int = 0) -> list[bool]:
+    """
+    This is a collective operation that returns if each rank is in the same node
+    as the source rank. It tests if processes are attached to the same
+    memory system (shared access to shared memory).
+    """
+    assert isinstance(pg, ProcessGroup), "pg should be a ProcessGroup instance."
+    assert (
+        torch.distributed.get_backend(pg) != torch.distributed.Backend.NCCL
+    ), "in_the_same_node_as should be tested with a non-NCCL group."
+    # local rank inside the group
+    rank = torch.distributed.get_rank(group=pg)
+    world_size = torch.distributed.get_world_size(group=pg)
+
+    # global ranks of the processes in the group
+    ranks = torch.distributed.get_process_group_ranks(pg)
+
+    # local tensor in each process to store the result
+    is_in_the_same_node = torch.tensor(
+        [0] * world_size, dtype=torch.int32, device="cpu"
+    )
+
+    magic_message = b"magic_message"
+    shm = None
+
+    try:
+        with contextlib.suppress(OSError):
+            if rank == source_rank:
+                # create a shared memory segment
+                shm = shared_memory.SharedMemory(create=True, size=128)
+                shm.buf[: len(magic_message)] = magic_message
+                torch.distributed.broadcast_object_list(
+                    [shm.name], src=ranks[source_rank], group=pg
+                )
+                is_in_the_same_node[rank] = 1
+            else:
+                # try to open the shared memory segment
+                recv = [None]
+                torch.distributed.broadcast_object_list(
+                    recv, src=ranks[source_rank], group=pg
+                )
+                name = recv[0]
+                # fix to https://stackoverflow.com/q/62748654/9191338
+                # Python incorrectly tracks shared memory even if it is not
+                # created by the process. The following patch is a workaround.
+                with patch(
+                    "multiprocessing.resource_tracker.register",
+                    lambda *args, **kwargs: None,
+                ):
+                    shm = shared_memory.SharedMemory(name=name)
+                if shm.buf[: len(magic_message)] == magic_message:
+                    is_in_the_same_node[rank] = 1
+    except Exception as e:  # noqa: BLE001
+        logger.error("Error ignored in is_in_the_same_node: %s", e)
+    finally:
+        if shm:
+            shm.close()
+
+    torch.distributed.barrier(group=pg)
+
+    # clean up the shared memory segment
+    with contextlib.suppress(OSError):
+        if rank == source_rank and shm:
+            shm.unlink()
+    torch.distributed.all_reduce(is_in_the_same_node, group=pg)
+
+    return [x == 1 for x in is_in_the_same_node.tolist()]
+
+
+def is_global_first_rank() -> bool:
+    """
+    Check if the current process is the first rank globally across all
+    parallelism strategies (PP, TP, DP, EP, etc.).
+
+    Unlike group-specific checks like `get_tensor_model_parallel_rank() == 0`
+    or `get_pp_group().is_first_rank`, this function checks the global rank
+    across all parallelism dimensions.
+
+    Returns:
+        bool: True if this is the global first rank (rank 0), False otherwise.
+              Returns True if distributed is not initialized (single process).
+    """
+    try:
+        # If world group is available, use it for the most accurate check
+        if _WORLD is not None:
+            return _WORLD.is_first_rank
+
+        # If torch distributed is not initialized, assume single process
+        if not torch.distributed.is_initialized():
+            return True
+
+        # Fallback to torch's global rank
+        return torch.distributed.get_rank() == 0
+
+    except Exception:  # noqa: BLE001
+        # If anything goes wrong, assume this is the first rank
+        return True
+
+
+def _node_count(pg: ProcessGroup) -> int:
+    """
+    Returns the total number of nodes in the process group.
+
+    Args:
+        pg: The process group to analyze
+
+    Returns:
+        int: The total number of nodes
+    """
+    assert isinstance(pg, ProcessGroup), "pg should be a ProcessGroup instance."
+    if isinstance(pg, ProcessGroup):
+        world_size = torch.distributed.get_world_size(group=pg)
+    else:
+        world_size = pg.world_size
+
+    if world_size == 1:
+        return 1
+
+    # Build node assignment map
+    node_assignment = [0] * world_size  # rank -> node_id
+    next_node_id = 0
+
+    for current_rank in range(world_size):
+        if node_assignment[current_rank] != 0:
+            continue  # Already assigned to a node
+
+        # Assign current rank to a new node
+        next_node_id += 1
+        node_assignment[current_rank] = next_node_id
+
+        # Find all ranks on the same node as current_rank
+        same_node_flags = in_the_same_node_as(pg, current_rank)
+        for other_rank, is_same_node in enumerate(same_node_flags):
+            if is_same_node and node_assignment[other_rank] == 0:
+                node_assignment[other_rank] = next_node_id
+
+    return next_node_id
+
+
+def prepare_communication_buffer_for_model(model: torch.nn.Module):
+    """Prepare the communication buffer for the model.
+    Traditional communication libraries like NCCL are almost
+    model agnostic. However, emerging new communication libraries like
+    MoE all2all (DeepEP) usually allocate the communication buffer
+    based on the model shape for optimal performance.
+    """
+    logger.debug(f"prepare_communication_buffer_for_model: {_TP} {_PP} {_DP} {_EP}")
+    if _TP is not None:
+        _TP.prepare_communication_buffer_for_model(model)
+    if _PP is not None:
+        _PP.prepare_communication_buffer_for_model(model)
+    if _DP is not None:
+        _DP.prepare_communication_buffer_for_model(model)
+    if _EP is not None:
+        _EP.prepare_communication_buffer_for_model(model)

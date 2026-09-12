@@ -1,0 +1,361 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2025, Advanced Micro Devices, Inc. All rights reserved.
+import argparse
+import os
+import shutil
+import sys
+from pathlib import Path
+
+import pandas as pd
+
+this_dir = os.path.dirname(os.path.abspath(__file__))
+AITER_CORE_DIR = (
+    os.path.join(os.path.abspath(f"{this_dir}/../../../"), "aiter/jit/utils")
+    if os.path.exists(
+        os.path.join(os.path.abspath(f"{this_dir}/../../../"), "aiter_meta")
+    )
+    else os.path.abspath(f"{this_dir}/../../aiter/jit/utils")
+)
+sys.path.insert(0, AITER_CORE_DIR)
+from chip_info import build_tune_dict, write_lookup_header
+from gemm_a8w8_bpreshuffle_cktile_common import (
+    DEFAULT_PIPELINE,
+    PIPELINE_IDS,
+    default_kernels_dict,
+    kernelInstance,
+    kernels_by_name,
+    kernels_list,
+)
+
+"""
+
+gemm_a8w8_bpreshuffle_cktile instance gen
+
+"""
+
+
+class gemm_a8w8_bpreshuffle_cktile_codegen:
+    def __init__(self, working_path, istune=False):
+        self.working_path = working_path
+        self.impl_path = os.path.join(working_path, "impl")
+        self.instances_path = os.path.join(working_path, "instances")
+        self.istune = istune
+
+    def gen_instance(self, k: kernelInstance):
+        pipeline = getattr(k, "sPipeline", DEFAULT_PIPELINE)
+        if pipeline not in PIPELINE_IDS:
+            raise ValueError(
+                f"{k.name}: unknown sPipeline {pipeline!r}, "
+                f"expected one of {sorted(PIPELINE_IDS)}"
+            )
+        pipeline_id = PIPELINE_IDS[pipeline]
+
+        def instance_content(pad_m: bool, pad_n: bool, pad_k: bool) -> str:
+            return f"""using FlatmmInstance = CustomConfig<
+            DDataType, EDataType,
+            {k.sTransposeC},{k.sUseStructuredSparsity}, {k.sTileParitionerGroupNum},
+            {k.sTileParitionerM01}, {k.sNumWaveGroups}, {k.sDoubleSmemBuffer},
+            {int(pad_m)},  {int(pad_n)},  {int(pad_k)},
+            {k.BlockPerCu},
+            {k.MTile}, {k.NTile}, {k.KTile},
+            {k.MWarp}, {k.NWarp}, {k.KWarp},
+            {k.MWTile}, {k.NWTile}, {k.KWTile},
+            ck_tile::GemmPipelineScheduler::{k.sScheduler},
+            {pipeline_id}>;
+        // Run kernel instance.
+        return gemm_a8w8_bpreshuffle_cktile_impl<DDataType, EDataType, FlatmmInstance>(XQ, WQ, x_scale, w_scale, Y, KBatch);
+"""
+
+        if pipeline != DEFAULT_PIPELINE:
+            # The quant route instantiates its traits with the pads clamped
+            # false (see gemm_calc_rowcol_wp_v2), so there is exactly one body
+            # and a non-divisible shape has to fail loudly instead of silently
+            # reading out of tile.
+            INSTANCE_IMPL_str = f"""// SPDX-License-Identifier: MIT
+// Copyright (c) 2024, Advanced Micro Devices, Inc. All rights reserved.
+
+#include "gemm_a8w8_bpreshuffle_cktile_common.cuh"
+
+template <typename DDataType, typename EDataType>
+torch::Tensor
+{k.name}(
+    torch::Tensor &XQ,
+    torch::Tensor &WQ,
+    torch::Tensor &x_scale,
+    torch::Tensor &w_scale,
+    torch::Tensor &Y,
+    int KBatch = 1
+    )
+{{
+    int M = size_to_dim_(XQ.dim() - 1, XQ.sizes());
+    int N = WQ.size(0);
+    int K = XQ.size(1);
+    TORCH_CHECK(M % {k.MTile} == 0 && N % {k.NTile} == 0 && K % {k.KTile} == 0,
+                "{k.name} runs unpadded: M/N/K must be divisible by the "
+                "tile ({k.MTile}, {k.NTile}, {k.KTile})");
+    {instance_content(False, False, False)}
+}}
+
+"""
+            Path(os.path.join(self.impl_path, f"{k.name}.cuh")).write_text(
+                INSTANCE_IMPL_str
+            )
+            self._gen_instance_registrations(k)
+            return
+
+        INSTANCE_IMPL = f"""// SPDX-License-Identifier: MIT
+// Copyright (c) 2024, Advanced Micro Devices, Inc. All rights reserved.
+
+#include "gemm_a8w8_bpreshuffle_cktile_common.cuh"
+
+template <typename DDataType, typename EDataType>
+torch::Tensor
+{k.name}(
+    torch::Tensor &XQ,
+    torch::Tensor &WQ,
+    torch::Tensor &x_scale,
+    torch::Tensor &w_scale,
+    torch::Tensor &Y,
+    int KBatch = 1
+    )
+{{{{
+    // The smallest kernel we have available. Works well for memory bound shapes.
+
+    // Check if this input needs to be padded.
+    int M = size_to_dim_(XQ.dim() - 1, XQ.sizes());
+    int N = WQ.size(0);
+    int K = XQ.size(1);
+    bool pad_m = M % {k.MTile} != 0;
+    bool pad_n = N % {k.NTile} != 0;
+    bool pad_k = K % ({k.KTile}) != 0;
+    if (pad_m && pad_n && pad_k)
+    {{{{
+        {{INSTANCE_CONTENT_pad_mnk}}
+    }}}}
+    else if (pad_m && pad_n)
+    {{{{
+        {{INSTANCE_CONTENT_pad_mn}}
+    }}}}
+    else if (pad_m && pad_k)
+    {{{{
+        {{INSTANCE_CONTENT_pad_mk}}
+    }}}}
+    else if (pad_n && pad_k)
+    {{{{
+        {{INSTANCE_CONTENT_pad_nk}}
+    }}}}
+    else if (pad_m)
+    {{{{
+        {{INSTANCE_CONTENT_pad_m}}
+    }}}}
+    else if (pad_n)
+    {{{{
+        {{INSTANCE_CONTENT_pad_n}}
+    }}}}
+    else if (pad_k)
+    {{{{
+        {{INSTANCE_CONTENT_pad_k}}
+    }}}}
+    else
+    {{{{
+        {{INSTANCE_CONTENT_nopad}}
+    }}}}
+}}}}
+
+"""
+
+        INSTANCE_CONTENT_nopad = instance_content(k.PadM, k.PadN, k.PadK)
+        instance_replacements = {
+            "INSTANCE_CONTENT_nopad": INSTANCE_CONTENT_nopad,
+            "INSTANCE_CONTENT_pad_m": instance_content(True, k.PadN, k.PadK),
+            "INSTANCE_CONTENT_pad_n": instance_content(k.PadM, True, k.PadK),
+            "INSTANCE_CONTENT_pad_k": instance_content(k.PadM, k.PadN, True),
+            "INSTANCE_CONTENT_pad_mn": instance_content(True, True, k.PadK),
+            "INSTANCE_CONTENT_pad_mk": instance_content(True, k.PadN, True),
+            "INSTANCE_CONTENT_pad_nk": instance_content(k.PadM, True, True),
+            "INSTANCE_CONTENT_pad_mnk": instance_content(True, True, True),
+        }
+        if self.istune:
+            INSTANCE_IMPL_str = INSTANCE_IMPL.format(**instance_replacements)
+        else:
+            INSTANCE_IMPL_str = INSTANCE_IMPL.format(**instance_replacements)
+
+        Path(os.path.join(self.impl_path, f"{k.name}.cuh")).write_text(
+            INSTANCE_IMPL_str
+        )
+
+        self._gen_instance_registrations(k)
+
+    def _gen_instance_registrations(self, k: kernelInstance):
+        INSTANCE_template = """// SPDX-License-Identifier: MIT
+// Copyright (c) 2025, Advanced Micro Devices, Inc. All rights reserved.
+
+#include "impl/{name}.cuh"
+
+template torch::Tensor
+{name}<{dtypes}>(
+    torch::Tensor &XQ,
+    torch::Tensor &WQ,
+    torch::Tensor &x_scale,
+    torch::Tensor &w_scale,
+    torch::Tensor &Y,
+    int KBatch
+    );
+
+"""
+        INSTANCE_dFP32_eBF16 = INSTANCE_template.format(name=k.name, dtypes="F32, B16")
+        INSTANCE_dFP32_eFP16 = INSTANCE_template.format(name=k.name, dtypes="F32, F16")
+        # TODO: dFP8_eFP8
+
+        if self.istune:
+            Path(
+                os.path.join(self.instances_path, f"{k.name}_dFP32_eBF16.cpp")
+            ).write_text(INSTANCE_dFP32_eBF16)
+        else:
+            Path(
+                os.path.join(self.instances_path, f"{k.name}_dFP32_eBF16.cpp")
+            ).write_text(INSTANCE_dFP32_eBF16)
+            Path(
+                os.path.join(self.instances_path, f"{k.name}_dFP32_eFP16.cpp")
+            ).write_text(INSTANCE_dFP32_eFP16)
+
+    def gen_lookup_dict(self, kernels_dict):
+        LOOKUP_head = """#pragma once
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2024, Advanced Micro Devices, Inc. All rights reserved.
+
+#ifdef USE_ROCM
+
+#define GENERATE_LOOKUP_TABLE(DTYPE, ETYPE)                                                                                      \\
+   {                                                                                                                             \\"""
+
+        if self.istune:
+            LOOKUP_template = """
+       {{{MNK},                                                                                                       \\
+        {kernel_name}<DTYPE, ETYPE>}},                                                                                \\"""
+            extra_format_args = None
+        else:
+            LOOKUP_template = """
+       {{{MNK},                                                                                                       \\
+        RowwiseDispatchEntry{{{kernel_name}<DTYPE, ETYPE>, {supports_m_padding}, {supports_k_padding}}}}},            \\"""
+
+            def extra_format_args(kernel):
+                return {
+                    "supports_m_padding": str(kernel.supports_m_padding).lower(),
+                    "supports_k_padding": str(kernel.supports_k_padding).lower(),
+                }
+
+        LOOKUP_end = """
+   }
+
+#endif // USE_ROCM
+"""
+        write_lookup_header(
+            os.path.join(self.working_path, "gemm_a8w8_bpreshuffle_cktile_lookup.h"),
+            kernels_dict,
+            LOOKUP_head,
+            LOOKUP_template,
+            LOOKUP_end,
+            self.istune,
+            extra_format_args=extra_format_args,
+        )
+
+    def gen_manifest_head(self, kernels_dict):
+        MAINFEST_head = """#pragma once
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2024, Advanced Micro Devices, Inc. All rights reserved.
+
+#ifdef USE_ROCM
+
+#include <cstdlib>
+
+#include <torch/extension.h>
+"""
+        MAINFEST_template = """
+template <typename DDataType, typename EDataType>
+torch::Tensor
+{kernel_name}(
+    torch::Tensor &XQ,
+    torch::Tensor &WQ,
+    torch::Tensor &x_scale,
+    torch::Tensor &w_scale,
+    torch::Tensor &Y,
+    int KBatch);
+"""
+        MAINFEST_end = """
+
+#endif // USE_ROCM
+"""
+
+        with open(
+            os.path.join(self.working_path, "gemm_a8w8_bpreshuffle_cktile_manifest.h"),
+            "w",
+        ) as f:
+            f.write(MAINFEST_head)
+            f.writelines(
+                MAINFEST_template.format(kernel_name=k.name)
+                for mnk, k in kernels_dict.items()
+            )
+            f.write(MAINFEST_end)
+
+    def gen_instances(self, kernels_dict):
+        if os.path.exists(self.impl_path):
+            shutil.rmtree(self.impl_path)
+        os.mkdir(self.impl_path)
+        if os.path.exists(self.instances_path):
+            shutil.rmtree(self.instances_path)
+        os.mkdir(self.instances_path)
+
+        for k in kernels_dict.values():
+            self.gen_instance(k)
+
+        self.gen_lookup_dict(kernels_dict)
+        self.gen_manifest_head(kernels_dict)
+
+
+def get_tune_dict(tune_dict_csv):
+    if os.path.exists(tune_dict_csv):
+        return build_tune_dict(
+            pd.read_csv(tune_dict_csv),
+            default_kernels_dict,
+            kernels_list,
+            libtype="cktile",
+            kernels_by_name=kernels_by_name,
+        )
+    return default_kernels_dict
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(
+        prog="generate",
+        description="gen API for CKTILE gemm a8w8 kernel",
+    )
+
+    # the directory for list_blobs/gen_blobs to write files into
+    parser.add_argument(
+        "-w",
+        "--working_path",
+        default="./",
+        required=False,
+        help="the path where all the blobs are going to be generated",
+    )
+
+    parser.add_argument(
+        "-f",
+        "--tune_file",
+        default="aiter/configs/a8w8_bpreshuffle_cktile_tuned_gemm.csv",
+        required=False,
+        help="tune_file include the result after run gemm_a8w8_bpreshuffle_cktile_tune.py",
+    )
+
+    parser.add_argument(
+        "--tune", action="store_true", required=False, help="generated tune instanses"
+    )
+
+    args = parser.parse_args()
+    codegen = gemm_a8w8_bpreshuffle_cktile_codegen(args.working_path, args.tune)
+
+    if args.tune:
+        codegen.gen_instances(kernels_list)
+    else:
+        codegen.gen_instances(get_tune_dict(args.tune_file))

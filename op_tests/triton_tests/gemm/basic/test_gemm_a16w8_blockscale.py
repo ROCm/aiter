@@ -1,0 +1,148 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
+
+import pytest
+import torch
+
+# from op_tests.triton_tests.test_fused_fp8_quant import per_token_fp8_group_quant
+import torch.nn.functional as F
+import triton
+
+from aiter.ops.shuffle import shuffle_weight
+from aiter.ops.triton.gemm.basic.gemm_a16w8_blockscale import (
+    gemm_a16w8_blockscale,
+    gemm_a16w8_blockscale_preshuffle,
+)
+from aiter.ops.triton.utils.types import get_fp8_dtypes, str_to_torch_dtype
+
+block_shape = (128, 128)
+
+
+def run_torch(x, weight, w_scale, dtype=torch.bfloat16):
+    block_shape_n, block_shape_k = block_shape
+    _m, k = x.shape
+    n = weight.shape[0]
+
+    # the pre-quant version now has accuracy issues
+    # x, x_scale = per_token_fp8_group_quant(x, weight.dtype, block_shape_k)
+    # x_scale = x_scale.repeat_interleave(block_shape_k, dim=1)
+    # x = x.to(x_scale.dtype) * x_scale[:m, :k]
+    # x = x.view(m, k)
+
+    w_scale = w_scale.repeat_interleave(block_shape_n, dim=0)
+    w_scale = w_scale.repeat_interleave(block_shape_k, dim=1)
+    weight = weight.to(w_scale.dtype) * w_scale[:n, :k]
+
+    out = F.linear(x.to(torch.float32), weight.to(torch.float32))
+
+    return out.to(dtype)
+
+
+def run_triton(impl, x, weight, w_scale, prequant, dtype=torch.bfloat16, y=None):
+    return impl(x, weight, w_scale, dtype, y, prequant=prequant)
+
+
+e5m2_type, e4m3_type = get_fp8_dtypes()
+
+
+def get_x_vals():
+    x_vals = [(1, 1, 1)]  # minimal case
+    x_vals += [(3, 5, 2)]  # irregular shape
+    x_vals += [(1024 * v, 1024 * v, 1024 * v) for v in (1, 2, 4, 5, 8)]
+    x_vals += [(2**i, 256, 7168) for i in range(5, 9)]  # DSR1 router GEMM
+    # GPT-OSS-120B attention projections
+    x_vals += [(2**i, 2880, 4096) for i in range(5, 9)]  # output projection
+    x_vals += [(v, 106496, 16384) for v in (256, 4096)]  # LL3 405B FC1
+    return x_vals
+
+
+def generate_gemm_a16w8_blockscale_inputs(
+    M: int,
+    N: int,
+    K: int,
+    block_shape_n: int,
+    block_shape_k: int,
+    dtype=torch.bfloat16,
+    layout: str = "TN",
+    output: bool = False,
+    shuffle: bool = False,
+):
+    """
+    The GEMM kernel expects:
+    - x: (M, K) -> row-major format
+    - w: (N, K) -> column-major format
+    """
+    torch.manual_seed(0)
+    scale_n = (N + block_shape_n - 1) // block_shape_n
+    scale_k = (K + block_shape_k - 1) // block_shape_k
+
+    if layout[0] == "T":
+        x = torch.randn((M, K), dtype=torch.bfloat16).cuda() / 10
+    else:
+        x = torch.randn((K, M), dtype=torch.bfloat16).cuda().T / 10
+
+    if layout[1] == "N":
+        weight = (torch.rand((N, K), dtype=torch.float16, device="cuda") / 10).to(
+            e4m3_type
+        )
+    else:
+        weight = (
+            (torch.rand((K, N), dtype=torch.float16, device="cuda") / 10)
+            .to(e4m3_type)
+            .T
+        )
+
+    w_scale = torch.rand([scale_n, scale_k], dtype=torch.float32, device="cuda")
+
+    if shuffle:
+        weight_shuffle_layout = (16, 16)
+        weight_shuffled = shuffle_weight(weight, weight_shuffle_layout).reshape(
+            weight.shape[0] // weight_shuffle_layout[0],
+            weight.shape[1] * weight_shuffle_layout[0],
+        )
+    else:
+        weight_shuffled = weight
+
+    y = None
+    if output:
+        y = torch.empty((M, N), dtype=dtype, device="cuda").cuda()
+
+    return x, weight, weight_shuffled, w_scale, y
+
+
+@pytest.mark.parametrize(
+    "dtype, M, N, K, output",
+    [
+        (dtype, *shape, output)
+        for output in [False]
+        for dtype in ["bf16"]
+        for shape in get_x_vals()
+    ],
+)
+@pytest.mark.parametrize("shuffle", [True, False])
+def test_gemm(dtype, M, N, K, output, shuffle):
+    prequant = False
+    block_shape_n, block_shape_k = block_shape
+
+    if shuffle and (N % 16 > 0 or K % 32 > 0):
+        pytest.skip(
+            "N has to be multiple of 16 and K has to be multiple of 32 for preshuffle cases"
+        )
+
+    dtype = str_to_torch_dtype[dtype]
+    x, weight, weight_triton, w_scale, y = generate_gemm_a16w8_blockscale_inputs(
+        M,
+        N,
+        K,
+        block_shape_n,
+        block_shape_k,
+        dtype=dtype,
+        output=output,
+        shuffle=shuffle,
+    )
+
+    a = run_torch(x, weight, w_scale, dtype)
+    impl = gemm_a16w8_blockscale_preshuffle if shuffle else gemm_a16w8_blockscale
+    b = run_triton(impl, x, weight_triton, w_scale, prequant, dtype, y)
+
+    triton.testing.assert_close(a, b, atol=0.1, rtol=0.1)

@@ -1,0 +1,847 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
+import torch
+import triton
+import triton.language as tl
+from torch import Tensor
+
+from . import dtypes
+from .mx_types import (
+    MX_DEFAULT_ROUND_MODE,
+    MxDtypeInt,
+    MxScaleRoundModeInt,
+)
+
+
+def f32_to_mxfp4(x):
+    FP4_EBITS, FP4_MBITS = 2, 1
+    x = _f32_to_floatx_unpacked(x.float(), FP4_EBITS, FP4_MBITS)
+    x = pack_uint4(x)
+    x = x.view(dtypes.fp4x2)  # to(fp32) for this datatype gives all 0 for torch...
+    # x = x.view(torch.uint8)
+    return x
+
+
+def mxfp4_to_f32(x):
+    if x.dtype == torch.float4_e2m1fn_x2:
+        x = x.view(torch.uint8)
+
+    # 2 because we pack fp4 in uint8.
+    x = x.repeat_interleave(2, dim=-1)
+    x[..., ::2] = x[..., ::2] & 0xF
+    x[..., 1::2] = x[..., 1::2] >> 4
+    mxfp4_list = [
+        0.0,
+        0.5,
+        1.0,
+        1.5,
+        2.0,
+        3.0,
+        4.0,
+        6.0,
+        -0.0,
+        -0.5,
+        -1.0,
+        -1.5,
+        -2.0,
+        -3.0,
+        -4.0,
+        -6.0,
+    ]
+    mxfp4_in_f32 = torch.tensor(mxfp4_list, dtype=torch.float32, device=x.device)
+    return mxfp4_in_f32[x.long()]
+
+
+# ---------------------------------------------------------------------------
+# MX-format E8M0 block-scale: generic + dtype-tagged API
+#
+# The four scale rounding modes (FLOOR / RCEIL / CEIL / EVEN) are dtype-
+# agnostic across the whole MX format family (mxfp4 / mxfp6 / mxfp8 /
+# mxint8). Only ``target_max_pow2`` / ``max_pos`` / ``mbits`` constants
+# differ between dtypes. This mirrors PyTorch torchao's
+# ``to_mx(scaling_mode, elem_dtype)`` design, the HIP-side
+# ``MxScaleRoundMode`` enum (csrc/include/mx_quant_utils.h) and the
+# FlyDSL IR-builder helpers in
+# ``aiter/ops/flydsl/kernels/quant_utils.py::emit_mx_e8m0_scale``.
+# ---------------------------------------------------------------------------
+
+
+# ``MxScaleRoundMode`` and ``MxDtype`` live in :mod:`aiter.utility.mx_types`
+# (single source of truth across HIP / Python ops / CPU ref / FlyDSL).
+# Per-MX-dtype constants. Tuple form: (target_max_pow2, max_pos, mbits)
+# - target_max_pow2 = log2(largest pow2 <= max_normal(dtype))
+# - max_pos = max_normal(dtype) (e.g. 6.0 for fp4 e2m1, 448.0 for fp8 e4m3)
+# - mbits = mantissa bits of the target dtype (used only by EVEN mode)
+# Keyed by bare int (MxDtypeInt) so this dict can be built at import time
+# without triggering the pybind11 JIT build of module_aiter_core -- same
+# pattern as ``aiter/ops/flydsl/kernels/quant_utils.py::_DTYPE_CFG``.
+_DTYPE_CFG = {
+    MxDtypeInt.FP4_E2M1: (2, 6.0, 1),  # OCP MXFP4 / DSv4 / FlashInfer
+    MxDtypeInt.FP8_E4M3: (8, 448.0, 3),  # OCP / NVIDIA H100 / gfx950+ (e4m3fn)
+    MxDtypeInt.FP8_E4M3_FNUZ: (7, 240.0, 3),  # AMD gfx942 hardware FP8 (e4m3fnuz)
+}
+
+
+def f32_to_mx_e8m0_scale(
+    amax: Tensor,
+    *,
+    mode: int = MX_DEFAULT_ROUND_MODE,
+    dtype: int = MxDtypeInt.FP4_E2M1,
+) -> Tensor:
+    """Compute the per-block E8M0 scale for an MX format (CPU torch ref).
+
+    Mirrors PyTorch torchao ``to_mx(scaling_mode, elem_dtype)`` semantics
+    1:1, and is the CPU-side analogue of the FlyDSL
+    :func:`aiter.ops.flydsl.kernels.quant_utils.emit_mx_e8m0_scale` IR
+    builder. The four rounding formulas are dtype-agnostic; ``dtype``
+    only selects ``target_max_pow2`` / ``max_pos`` / ``mbits`` constants
+    from :data:`_DTYPE_CFG`.
+
+    See :class:`MxScaleRoundMode` (``aiter.utility.mx_types``) for the four
+    formulas and cross-stack mapping (PyTorch torchao / NV / DSv4 /
+    FlashInfer / AMD Quark naming).
+
+    Args:
+        amax: f32 (or castable) non-negative tensor of per-block
+            ``max(|x|)`` values. Caller is responsible for the per-block
+            reduction **and** for taking abs -- negative inputs produce
+            undefined results in Even mode (bit-level rounding on a
+            negative f32 sign bit).
+        mode: ``MxScaleRoundMode`` int or pybind enum. Default ``RoundUp``
+            (industry consensus for MXFP4 and MXFP8).
+        dtype: ``MxDtype`` int or pybind enum. Default ``FP4_E2M1``.
+
+    Returns:
+        E8M0-encoded biased exponent tensor (``dtypes.fp8_e8m0``), same
+        shape as ``amax``. NaN/Inf inputs map to ``0xFF`` (E8M0 NaN).
+        Inputs near FLT_MAX may also map to ``0xFF`` after ceil rounding.
+    """
+    # Normalise int / pybind enum into a plain int -- pybind11 enum classes
+    # do not auto-compare equal to ``int`` (unlike ``IntEnum``), so callers
+    # passing ``mode=1`` would otherwise mis-dispatch.
+    mode_int = int(mode)
+    dtype_int = int(dtype)
+    if dtype_int not in _DTYPE_CFG:
+        raise ValueError(
+            f"f32_to_mx_e8m0_scale: unsupported dtype {dtype!r}; "
+            f"supported: {list(_DTYPE_CFG)}"
+        )
+    target_max_pow2, max_pos, mbits = _DTYPE_CFG[dtype_int]
+    target_pow2_factor = float(1 << target_max_pow2)  # 2^target_max_pow2
+
+    if mode_int == MxScaleRoundModeInt.RoundUp:
+        # ceil_pow2(amax / max_pos) -- NV / DSv4 / FlashInfer / torchao RCEIL.
+        return _f32_to_e8m0_ceil_impl(amax / max_pos)
+
+    if mode_int == MxScaleRoundModeInt.RoundDown:
+        # floor_pow2(amax) / 2^target_max_pow2 -- OCP MX / torchao FLOOR.
+        return _f32_to_e8m0_floor_impl(amax / target_pow2_factor)
+
+    if mode_int == MxScaleRoundModeInt.Ceil:
+        # ceil_pow2(amax) / 2^target_max_pow2 -- torchao CEIL.
+        return _f32_to_e8m0_ceil_impl(amax / target_pow2_factor)
+
+    if mode_int == MxScaleRoundModeInt.Even:
+        # round_pow2_special(amax) / 2^target_max_pow2 -- torchao EVEN /
+        # Quark EVEN. val_to_add is mantissa-precision-aware:
+        # FP4 (mbits=1) -> 0x200000 (1.5x threshold)
+        # FP8 e4m3 (mbits=3) -> 0x80000  (~1.0625x threshold).
+        val_to_add = 1 << (23 - mbits - 1)
+        u32 = amax.view(torch.int32)
+        rounded = (u32 + val_to_add) & 0xFF800000
+        rounded_f = rounded.view(torch.float32)
+        return _f32_to_e8m0_floor_impl(rounded_f / target_pow2_factor)
+
+    raise ValueError(
+        f"f32_to_mx_e8m0_scale: unknown mode {mode!r} "
+        f"(expected 0=RoundDown, 1=RoundUp, 2=Even, 3=Ceil)"
+    )
+
+
+def fp4_f32_to_e8m0_scale(amax: Tensor) -> Tensor:
+    """Default MXFP4 E8M0 block scale: NV ROUND_UP / RCEIL with FP4 E2M1.
+
+    Thin convenience alias for ``f32_to_mx_e8m0_scale(amax,
+    mode=RoundUp, dtype=FP4_E2M1)`` -- i.e. ``ceil_pow2(amax / 6)``,
+    the industry-default MXFP4 formula (DSv4 Pro / FlashInfer / torchao
+    RCEIL). 1:1 mirror of the HIP helper
+    ``aiter::fp4_f32_to_e8m0_scale`` in ``csrc/include/mx_quant_utils.h``.
+    """
+    return f32_to_mx_e8m0_scale(
+        amax, mode=MX_DEFAULT_ROUND_MODE, dtype=MxDtypeInt.FP4_E2M1
+    )
+
+
+# ---------------------------------------------------------------------------
+# Low-level implementation used by the generic dispatcher above.
+#
+# ``_f32_to_e8m0_floor_impl`` and ``_f32_to_e8m0_ceil_impl`` are the only
+# two primitives that touch the f32 bit pattern; they take an
+# already-divided value (``amax / divisor``) and emit the biased exponent.
+# ---------------------------------------------------------------------------
+
+
+def _f32_to_e8m0_floor_impl(x: Tensor) -> Tensor:
+    """Floor pow2 of x as E8M0 (caller passes ``amax / divisor``).
+
+    NaN/Inf inputs (biased exponent == 0xFF) pass through unchanged --
+    the floor operation is the identity on the exponent field.
+    """
+    u32 = x.view(torch.int32)
+    exponent = ((u32 >> 23) & 0xFF).view(torch.uint32).to(torch.uint8)
+    return exponent.view(dtypes.fp8_e8m0)
+
+
+def _f32_to_e8m0_ceil_impl(x: Tensor) -> Tensor:
+    """Ceil pow2 of x as E8M0 (caller passes ``amax / divisor``).
+
+    Bumps the biased exponent by 1 when any f32 mantissa bit is set,
+    except for NaN/Inf (exponent == 0xFF, kept as NaN); never rolls past
+    0xFF.
+    """
+    u32 = x.view(torch.int32)
+    exponent = ((u32 >> 23) & 0xFF).view(torch.uint32).to(torch.uint8)
+    nan_case = exponent == 0xFF
+    mantissa_nonzero = (u32 & 0x7FFFFF) != 0
+    nonmax_exp = exponent < 0xFF
+    bump = mantissa_nonzero & nonmax_exp
+    exponent = torch.where(bump, exponent + 1, exponent)
+    exponent[nan_case] = 0xFF
+    return exponent.view(dtypes.fp8_e8m0)
+
+
+def e8m0_to_f32(scale_e8m0_biased):
+    scale_e8m0_biased = scale_e8m0_biased.view(torch.uint8)
+    zero_case = scale_e8m0_biased == 0
+    nan_case = scale_e8m0_biased == 0xFF
+    scale_f32 = scale_e8m0_biased.to(torch.int32) << 23
+    scale_f32[zero_case] = 0x00400000
+    scale_f32[nan_case] = 0x7F800001
+    scale_f32 = scale_f32.view(dtypes.fp32)
+    return scale_f32
+
+
+def e8m0_shuffle(scale):
+    from aiter.ops.shuffle import shuffle_scale
+
+    return shuffle_scale(scale)
+
+
+def down_size(size):
+    assert size[-1] % 2 == 0, f"{size} last dim not divisible by two"
+    return (*size[:-1], size[-1] // 2)
+
+
+def pack_uint4(uint8_data) -> torch.Tensor:
+    # converting to uint8 for operations
+    shape = uint8_data.shape
+    assert shape[-1] % 2 == 0
+    uint8_data = uint8_data.contiguous().view(-1)
+    return (uint8_data[1::2] << 4 | uint8_data[::2]).view(down_size(shape))
+
+
+# copy-pasted from
+# https://github.com/pytorch/ao/blob/bc4f51da86956275da7db0da6e420c506df97820/torchao/prototype/custom_fp_utils.py#L27C1-L142C29
+def _n_ones(n: int) -> int:
+    return (1 << n) - 1
+
+
+EBITS_F32, MBITS_F32 = 8, 23
+F32_EXP_BIAS = _n_ones(EBITS_F32 - 1)
+
+
+# copy-pasted from
+# https://github.com/pytorch/ao/blob/bc4f51da86956275da7db0da6e420c506df97820/torchao/prototype/custom_fp_utils.py#L27C1-L142C29
+def _f32_to_floatx_unpacked(x: Tensor, ebits: int, mbits: int) -> Tensor:
+    """Convert FP32 numbers to sub-byte floating point numbers with the given
+    number of exponent and mantissa bits.
+
+    Input: torch.Tensor of dtype torch.float
+    Output: torch.Tensor of dtype torch.uint8, where the bit encoding is stored
+    in the least significant bits. e.g.
+      fp4: bits 0-3 empty and bits 4-7 in fp4_e2m1 encoding
+      fp6: bits 0-1 empty and bits 2-7 in fp6_e2m3 or fp6_e3m2 encoding
+
+    Note: there are no special values (NaN, inf) support in this code. Values
+    outside the representable range of Floatx after rounding are clamped to the
+    maximum Floatx magnitude (sign is preserved).
+
+    Code below is an adaptation of https://fburl.com/code/ciwofcg4
+
+    Background 1: last answer in https://stackoverflow.com/q/8981913
+    Background 2: Computer Organization and Design, RISC-V edition, Chapter 3.5
+    """
+    assert x.dtype == torch.float
+    assert 1 + ebits + mbits <= 8
+
+    # calculate constants
+    exp_bias = _n_ones(ebits - 1)
+    max_int = _n_ones(ebits + mbits)
+    sign_mask = 1 << (ebits + mbits)
+
+    # TODO document this better
+    magic_adder = _n_ones(MBITS_F32 - mbits - 1)
+
+    # all E bits and M bits are 1s
+    max_normal = 2 ** (_n_ones(ebits) - exp_bias) * (_n_ones(mbits + 1) / (2**mbits))
+
+    # E bits = 1, M bits = 0
+    min_normal = 2 ** (1 - exp_bias)
+
+    denorm_exp = (
+        # exp bias conversion between formats
+        (F32_EXP_BIAS - exp_bias)
+        # mantissa length difference between formats
+        + (MBITS_F32 - mbits)
+        # add one to encoded exponent for denormalized numbers
+        + 1
+    )
+    denorm_mask_int = denorm_exp << MBITS_F32
+
+    # reinterpret int32 as float32
+    denorm_mask_float = torch.tensor(denorm_mask_int, dtype=torch.int32).view(
+        torch.float32
+    )
+
+    # save the sign
+    # Note that we have torch.uint32, but some ops like cpu bit shifts
+    # do not work on it. So, we stay in int32.
+    x = x.view(torch.int32)
+    sign = x & 0x80000000
+
+    # set everything to positive, will add sign back at the end
+    x = x ^ sign
+
+    # TODO: can the branch floating point comparisons below be done without
+    # converting to float? probably but need to verify
+    x = x.view(torch.float)
+
+    # rewrite saturate/denorm/norm branches without explicit data dependent
+    # control flow, to be more compiler friendly
+    saturate_mask = x >= max_normal
+    denormal_mask = torch.logical_and(torch.logical_not(saturate_mask), x < min_normal)
+    normal_mask = torch.logical_not(torch.logical_or(saturate_mask, denormal_mask))
+
+    #
+    # branch 1: saturate to max val - handled later in the code which combines
+    #   the branches
+    #
+
+    #
+    # branch 2: to conversion to denormal as well as rounding up to normal
+    #
+    denormal_x = x + denorm_mask_float
+    denormal_x = denormal_x.view(torch.int32)
+    denormal_x -= denorm_mask_int
+    denormal_x = denormal_x.to(torch.uint8)
+
+    #
+    # branch 3: stay in normal range, adjust the exponent and round
+    #
+    normal_x = x.view(torch.int32)
+    # resulting mantissa is odd
+    mant_odd = (normal_x >> (MBITS_F32 - mbits)) & 1
+    # update exponent, rounding bias part 1
+    val_to_add = ((exp_bias - F32_EXP_BIAS) << MBITS_F32) + magic_adder
+    normal_x += val_to_add
+    # rounding bias part 2
+    normal_x += mant_odd
+    # take the bits!
+    normal_x = normal_x >> (MBITS_F32 - mbits)
+    normal_x = normal_x.to(torch.uint8)
+
+    #
+    # combine the branches
+    #
+    x = torch.full_like(x, max_int, dtype=torch.uint8)
+    x = torch.where(denormal_mask, denormal_x, x)
+    x = torch.where(normal_mask, normal_x, x)
+
+    # add sign back
+    sign_lp = sign >> (MBITS_F32 + EBITS_F32 - mbits - ebits)
+    sign_lp = sign_lp.to(torch.uint8)
+    # Right shift of a negative signed integer can fill the least significant
+    # bits with either 1s or 0s, depending on the implementation. Since PyTorch
+    # doesn't have an uint32 dtype, we mask out these bits to get just the
+    # f4 sign bit
+    sign_lp = sign_lp & sign_mask
+    x = x | sign_lp
+
+    return x.to(torch.uint8)
+
+
+@triton.jit
+def _dynamic_mxfp4_quant_kernel_asm_layout(
+    x_ptr,
+    x_fp4_ptr,
+    bs_ptr,
+    stride_x_m,
+    stride_x_n,
+    stride_x_fp4_m,
+    stride_x_fp4_n,
+    stride_bs_m,
+    stride_bs_n,
+    M: tl.constexpr,
+    N: tl.constexpr,
+    scaleN: tl.constexpr,
+    scaleM_pad: tl.constexpr,
+    scaleN_pad: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+    MXFP4_QUANT_BLOCK_SIZE: tl.constexpr,
+    SCALING_MODE: tl.constexpr,
+    SHUFFLE: tl.constexpr,
+):
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+
+    stride_x_m = tl.cast(stride_x_m, tl.int64)
+    stride_x_n = tl.cast(stride_x_n, tl.int64)
+    stride_x_fp4_m = tl.cast(stride_x_fp4_m, tl.int64)
+    stride_x_fp4_n = tl.cast(stride_x_fp4_n, tl.int64)
+
+    x_offs_m = pid_m * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    x_offs_n = pid_n * MXFP4_QUANT_BLOCK_SIZE + tl.arange(0, MXFP4_QUANT_BLOCK_SIZE)
+    x_offs = x_offs_m[:, None] * stride_x_m + x_offs_n[None, :] * stride_x_n
+    x_mask = (x_offs_m < M)[:, None] & (x_offs_n < N)[None, :]
+    x = tl.load(x_ptr + x_offs, mask=x_mask).to(tl.float32)
+
+    # Calculate scale
+    amax = tl.max(tl.abs(x), axis=1, keep_dims=True)
+    amax = amax.to(tl.int32, bitcast=True)
+    amax = (amax + 0x200000).to(tl.uint32, bitcast=True) & 0xFF800000
+    amax = amax.to(tl.float32, bitcast=True)
+    scale_e8m0_unbiased = tl.log2(amax).floor() - 2
+    scale_e8m0_unbiased = tl.clamp(scale_e8m0_unbiased, min=-127, max=127)
+    quant_scale = tl.exp2(-scale_e8m0_unbiased)
+
+    # Compute quantized x
+    qx = x * quant_scale
+
+    # blockscale_e8m0
+    bs_e8m0 = scale_e8m0_unbiased.to(tl.uint8) + 127
+
+    # Convert quantized fp32 tensor to uint32 before converting to mxfp4 format
+    # Note: MXFP4  S:1-bit, E:2-bit, M:1-bit
+    #   Zeros: S000 -> +/-0
+    #   Denormal Numbers: S001 -> +/- 0.5
+    #   Normal Numbers:
+    #           S010 -> +/- 1.0
+    #           S011 -> +/- 1.5
+    #           S100 -> +/- 2.0
+    #           S101 -> +/- 3.0
+    #           S110 -> +/- 4.0
+    #           S111 -> +/- 6.0
+    # FP4 format constants
+    EXP_BIAS_FP32: tl.constexpr = 127
+    EXP_BIAS_FP4: tl.constexpr = 1
+    EBITS_F32: tl.constexpr = 8
+    EBITS_FP4: tl.constexpr = 2
+    MBITS_F32: tl.constexpr = 23
+    MBITS_FP4: tl.constexpr = 1
+
+    max_normal: tl.constexpr = 6
+    min_normal: tl.constexpr = 1
+
+    qx = qx.to(tl.uint32, bitcast=True)
+
+    # Extract sign
+    s = qx & 0x80000000
+    # Set everything to positive, will add sign back at the end
+    qx = qx ^ s
+
+    qx_fp32 = qx.to(tl.float32, bitcast=True)
+    saturate_mask = qx_fp32 >= max_normal
+    denormal_mask = (not saturate_mask) & (qx_fp32 < min_normal)
+    normal_mask = not (saturate_mask | denormal_mask)
+
+    # Denormal numbers
+    denorm_exp: tl.constexpr = (
+        (EXP_BIAS_FP32 - EXP_BIAS_FP4) + (MBITS_F32 - MBITS_FP4) + 1
+    )
+    denorm_mask_int: tl.constexpr = denorm_exp << MBITS_F32
+    denorm_mask_float: tl.constexpr = tl.cast(denorm_mask_int, tl.float32, bitcast=True)
+
+    denormal_x = qx_fp32 + denorm_mask_float
+    denormal_x = denormal_x.to(tl.uint32, bitcast=True)
+    denormal_x -= denorm_mask_int
+    denormal_x = denormal_x.to(tl.uint8)
+
+    # Normal numbers
+    normal_x = qx
+    # resulting mantissa is odd
+    mant_odd = (normal_x >> (MBITS_F32 - MBITS_FP4)) & 1
+    # update exponent, rounding bias part 1
+    val_to_add = ((EXP_BIAS_FP4 - EXP_BIAS_FP32) << MBITS_F32) + (1 << 21) - 1
+    normal_x += val_to_add
+    # rounding bias part 2
+    normal_x += mant_odd
+    # take the bits!
+    normal_x = normal_x >> (MBITS_F32 - MBITS_FP4)
+    normal_x = normal_x.to(tl.uint8)
+
+    # Merge results
+    e2m1_value = tl.full(qx.type.get_block_shapes(), 0x7, dtype=tl.uint8)
+    e2m1_value = tl.where(normal_mask, normal_x, e2m1_value)
+    e2m1_value = tl.where(denormal_mask, denormal_x, e2m1_value)
+
+    # add sign back
+    sign_lp = s >> (MBITS_F32 + EBITS_F32 - MBITS_FP4 - EBITS_FP4)
+    sign_lp = sign_lp.to(tl.uint8)
+    e2m1_value = e2m1_value | sign_lp
+
+    e2m1_value = tl.reshape(e2m1_value, [BLOCK_SIZE, MXFP4_QUANT_BLOCK_SIZE // 2, 2])
+    evens, odds = tl.split(e2m1_value)
+    out_tensor = evens | (odds << 4)
+
+    out_offs_m = pid_m * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    out_offs_n = pid_n * MXFP4_QUANT_BLOCK_SIZE // 2 + tl.arange(
+        0, MXFP4_QUANT_BLOCK_SIZE // 2
+    )
+    out_offs = (
+        out_offs_m[:, None] * stride_x_fp4_m + out_offs_n[None, :] * stride_x_fp4_n
+    )
+    out_mask = (out_offs_m < M)[:, None] & (out_offs_n < (N // 2))[None, :]
+    tl.store(x_fp4_ptr + out_offs, out_tensor, mask=out_mask)
+
+    bs_offs_m = pid_m * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    bs_offs_n = pid_n
+
+    if SHUFFLE:
+        bs_offs_0 = bs_offs_m[:, None] // 32
+        bs_offs_1 = bs_offs_m[:, None] % 32
+        bs_offs_2 = bs_offs_1 % 16
+        bs_offs_1 = bs_offs_1 // 16
+        bs_offs_3 = bs_offs_n[None, :] // 8
+        bs_offs_4 = bs_offs_n[None, :] % 8
+        bs_offs_5 = bs_offs_4 % 4
+        bs_offs_4 = bs_offs_4 // 4
+        bs_offs = (
+            bs_offs_1
+            + bs_offs_4 * 2
+            + bs_offs_2 * 2 * 2
+            + bs_offs_5 * 2 * 2 * 16
+            + bs_offs_3 * 2 * 2 * 16 * 4
+            + bs_offs_0 * 2 * 16 * scaleN_pad
+        )
+        bs_mask1 = (bs_offs_m < M)[:, None] & (bs_offs_n < scaleN)[None, :]
+        bs_mask2 = (bs_offs_m < scaleM_pad)[:, None] & (bs_offs_n < scaleN_pad)[None, :]
+        bs_e8m0 = tl.where(bs_mask1, bs_e8m0, 0)
+        tl.store(bs_ptr + bs_offs, bs_e8m0, mask=bs_mask2)
+    else:
+        bs_offs = bs_offs_m[:, None] * stride_bs_m + bs_offs_n[None, :] * stride_bs_n
+        bs_mask = (bs_offs_m < M)[:, None] & (bs_offs_n < N)[None, :]
+        tl.store(bs_ptr + bs_offs, bs_e8m0, mask=bs_mask)
+
+
+def dynamic_mxfp4_quant(
+    x: torch.Tensor, scaling_mode: str = "even", shuffle: bool = False
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Quantize a tensor to MX FP4 format.
+
+    Args:
+        x: The input tensor, typically fp16 or bf16.
+        scaling_mode: The method to calculate MX block scaling.
+            - "even" (default): `even_round` in `quark.torch.quantization.utils`.
+            - etc.
+    Returns:
+        A tuple of (x_fp4, blockscale_e8m0).
+    """
+    # Assume x is 2D-Tensor for now
+    M, N = x.shape
+
+    assert (N // 2) % 2 == 0
+
+    # This is fixed by spec for MXFP4. Do not tune this.
+    # For performance, perhaps, we should look at passing multiple of 32 column blocks
+    # that a triton program can process
+    MXFP4_QUANT_BLOCK_SIZE = 32
+
+    x_fp4 = torch.empty((M, N // 2), dtype=torch.uint8, device=x.device)
+    scaleM = triton.cdiv(M, 32) * 32
+    scaleN_valid = triton.cdiv(N, MXFP4_QUANT_BLOCK_SIZE)
+    scaleN = triton.cdiv(scaleN_valid, 8) * 8
+    blockscale_e8m0 = torch.empty(
+        (
+            triton.cdiv(M, 256) * 256,
+            scaleN,
+        ),
+        dtype=torch.uint8,
+        device=x.device,
+    )
+
+    BLOCK_SIZE = 128
+    grid = (triton.cdiv(M, BLOCK_SIZE), scaleN)
+    _dynamic_mxfp4_quant_kernel_asm_layout[grid](
+        x,
+        x_fp4,
+        blockscale_e8m0,
+        *x.stride(),
+        *x_fp4.stride(),
+        *blockscale_e8m0.stride(),
+        M=M,
+        N=N,
+        scaleN=scaleN_valid,
+        scaleM_pad=scaleM,
+        scaleN_pad=scaleN,
+        BLOCK_SIZE=BLOCK_SIZE,
+        MXFP4_QUANT_BLOCK_SIZE=MXFP4_QUANT_BLOCK_SIZE,
+        SCALING_MODE=0,
+        SHUFFLE=shuffle,
+    )
+
+    if not shuffle:
+        # Trim the padding if not shuffled
+        blockscale_e8m0 = blockscale_e8m0[:M, :scaleN_valid].contiguous()
+
+    return (x_fp4.view(dtypes.fp4x2), blockscale_e8m0.view(dtypes.fp8_e8m0))
+
+
+@triton.jit
+def _moe_mxfp4_sort_kernel(
+    blockscale_e8m0_ptr,
+    sorted_ids_ptr,
+    num_valid_ids_ptr,
+    blockscale_e8m0_sorted_ptr,
+    stride_blockscale_e8m0_m: tl.int64,
+    stride_blockscale_e8m0_n: tl.int64,
+    stride_o3: tl.int64,
+    stride_o2: tl.int64,
+    stride_o1: tl.int64,
+    stride_o0: tl.int64,
+    token_num,
+    N_i,
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+    TOPK: tl.constexpr,
+):
+    """2D-grid kernel: one program per (M-tile, N-tile). Best for small token counts
+    where GPU needs many lightweight programs for parallelism."""
+    pid_m = tl.program_id(0) * 2
+    pid_n = tl.program_id(1) * 2
+    num_valid_ids = tl.load(num_valid_ids_ptr)
+    if pid_m * BLOCK_SIZE_M >= num_valid_ids:
+        return
+
+    out = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.uint32)
+    for m_idx in range(2):
+        m = m_idx * BLOCK_SIZE_M
+        sorted_ids_offs_m = pid_m * BLOCK_SIZE_M + m + tl.arange(0, BLOCK_SIZE_M)
+        sorted_ids_mask = sorted_ids_offs_m < num_valid_ids
+        raw_ids = tl.load(
+            sorted_ids_ptr + sorted_ids_offs_m, mask=sorted_ids_mask, other=token_num
+        )
+        token_ids = raw_ids & 0xFFFFFF
+        if TOPK == 1:
+            blockscale_e8m0_offs_m = token_ids
+        else:
+            blockscale_e8m0_offs_m = token_ids * TOPK + (raw_ids >> 24)
+        row_addrs = blockscale_e8m0_offs_m[:, None] * stride_blockscale_e8m0_m
+        row_mask = (token_ids < token_num)[:, None]
+
+        for n_idx in range(2):
+            i = m_idx + n_idx * 2
+            col_offs = (
+                pid_n * BLOCK_SIZE_N + n_idx * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+            )
+            gather_offs = row_addrs + col_offs[None, :] * stride_blockscale_e8m0_n
+            col_mask = (col_offs < N_i)[None, :]
+            sub = tl.load(
+                blockscale_e8m0_ptr + gather_offs,
+                mask=row_mask & col_mask,
+            ).to(tl.uint8, bitcast=True)
+            out = out | (sub.to(tl.uint32) << (i * 8))
+
+    offs_0 = tl.arange(0, BLOCK_SIZE_M)
+    offs_1 = tl.arange(0, BLOCK_SIZE_N)
+    offs = (
+        offs_0[:, None] * stride_o0
+        + offs_1[None, :] * stride_o1
+        + pid_n // 2 * stride_o2
+        + pid_m // 2 * stride_o3
+    )
+    tl.store(blockscale_e8m0_sorted_ptr + offs, out)
+
+
+@triton.jit
+def _moe_mxfp4_sort_kernel_fused_n(
+    blockscale_e8m0_ptr,
+    sorted_ids_ptr,
+    num_valid_ids_ptr,
+    blockscale_e8m0_sorted_ptr,
+    stride_blockscale_e8m0_m: tl.int64,
+    stride_blockscale_e8m0_n: tl.int64,
+    stride_o3: tl.int64,
+    stride_o2: tl.int64,
+    stride_o1: tl.int64,
+    stride_o0: tl.int64,
+    token_num,
+    N_i,
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+    TOPK: tl.constexpr,
+    N_TILES: tl.constexpr,
+):
+    """1D-grid kernel: one program handles ALL N-tiles for an M-tile group.
+    Loads sorted_ids once and reuses row addresses across all N-tiles.
+    Best for large token counts where gather bandwidth dominates."""
+    pid_m = tl.program_id(0) * 2
+    num_valid_ids = tl.load(num_valid_ids_ptr)
+    if pid_m * BLOCK_SIZE_M >= num_valid_ids:
+        return
+
+    # Pre-load sorted_ids for both m sub-blocks once.
+    offs_m0 = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+    raw_0 = tl.load(
+        sorted_ids_ptr + offs_m0, mask=offs_m0 < num_valid_ids, other=token_num
+    )
+    tid_0 = raw_0 & 0xFFFFFF
+    if TOPK == 1:
+        ridx_0 = tid_0
+    else:
+        ridx_0 = tid_0 * TOPK + (raw_0 >> 24)
+    raddr_0 = ridx_0[:, None] * stride_blockscale_e8m0_m
+    rmask_0 = (tid_0 < token_num)[:, None]
+
+    offs_m1 = offs_m0 + BLOCK_SIZE_M
+    raw_1 = tl.load(
+        sorted_ids_ptr + offs_m1, mask=offs_m1 < num_valid_ids, other=token_num
+    )
+    tid_1 = raw_1 & 0xFFFFFF
+    if TOPK == 1:
+        ridx_1 = tid_1
+    else:
+        ridx_1 = tid_1 * TOPK + (raw_1 >> 24)
+    raddr_1 = ridx_1[:, None] * stride_blockscale_e8m0_m
+    rmask_1 = (tid_1 < token_num)[:, None]
+
+    offs_row = tl.arange(0, BLOCK_SIZE_M)
+    offs_col = tl.arange(0, BLOCK_SIZE_N)
+    store_base = pid_m // 2 * stride_o3
+
+    for n_tile in range(N_TILES):
+        pid_n = n_tile * 2
+        out = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.uint32)
+
+        for m_idx in range(2):
+            if m_idx == 0:
+                cur_raddr = raddr_0
+                cur_rmask = rmask_0
+            else:
+                cur_raddr = raddr_1
+                cur_rmask = rmask_1
+
+            for n_idx in range(2):
+                i = m_idx + n_idx * 2
+                col_offs = (
+                    pid_n * BLOCK_SIZE_N
+                    + n_idx * BLOCK_SIZE_N
+                    + tl.arange(0, BLOCK_SIZE_N)
+                )
+                gather_offs = cur_raddr + col_offs[None, :] * stride_blockscale_e8m0_n
+                col_mask = (col_offs < N_i)[None, :]
+                sub = tl.load(
+                    blockscale_e8m0_ptr + gather_offs,
+                    mask=cur_rmask & col_mask,
+                ).to(tl.uint8, bitcast=True)
+                out = out | (sub.to(tl.uint32) << (i * 8))
+
+        store_offs = (
+            offs_row[:, None] * stride_o0
+            + offs_col[None, :] * stride_o1
+            + n_tile * stride_o2
+            + store_base
+        )
+        tl.store(blockscale_e8m0_sorted_ptr + store_offs, out)
+
+
+def moe_mxfp4_sort(
+    blockscale_e8m0: torch.Tensor,
+    sorted_ids: torch.Tensor,
+    num_valid_ids: torch.Tensor,
+    token_num: int,
+    block_size: int = 32,
+) -> torch.Tensor:
+    """
+    Sort the blockscale_e8m0 tensor based on the sorted_ids tensor.
+
+    Args:
+        blockscale_e8m0: The input tensor to be sorted.
+        sorted_ids: The indices used for sorting.
+
+    Returns:
+        A sorted tensor.
+    """
+    # This is fixed by spec for MXFP4. Do not tune this.
+    BLOCK_SIZE_M, BLOCK_SIZE_N = 32, 8
+    BLOCK_SIZE_M_u32, BLOCK_SIZE_N_u32 = 16, 4
+
+    # Assume blockscale_e8m0 is 2D-Tensor for now
+    topk = 1
+    if len(blockscale_e8m0.shape) == 3:
+        topk = blockscale_e8m0.shape[1]
+        blockscale_e8m0 = blockscale_e8m0.view(-1, blockscale_e8m0.shape[-1])
+    M_i, N_i_raw = blockscale_e8m0.shape
+    # Pad N up to BLOCK_SIZE_N so that downstream kernels (which expect a
+    # padded scale stride matching ``e8m0_shuffle``) see the same layout for
+    # any ``inter_dim/32`` value.  The padded columns are zero so they
+    # contribute zero scale (no extra signal) when read by the GEMM.
+    if N_i_raw % BLOCK_SIZE_N != 0:
+        padded_N_i = triton.cdiv(N_i_raw, BLOCK_SIZE_N) * BLOCK_SIZE_N
+        padded = torch.zeros(
+            (M_i, padded_N_i),
+            dtype=blockscale_e8m0.dtype,
+            device=blockscale_e8m0.device,
+        )
+        padded[:, :N_i_raw] = blockscale_e8m0
+        blockscale_e8m0 = padded
+    M_i, N_i = blockscale_e8m0.shape
+    M_o, N_o = sorted_ids.shape[0], N_i
+    assert (N_i // 2) % 2 == 0
+    assert block_size % BLOCK_SIZE_M == 0
+
+    blockscale_e8m0_sorted = torch.empty(
+        (
+            triton.cdiv(M_o, BLOCK_SIZE_M),
+            triton.cdiv(N_o, BLOCK_SIZE_N),
+            BLOCK_SIZE_N_u32,
+            BLOCK_SIZE_M_u32,
+        ),
+        dtype=torch.uint32,
+        device=blockscale_e8m0.device,
+    )  # .fill_(0)
+
+    # Dispatch threshold: for small token counts the 2D-grid kernel has better
+    # parallelism; for large token counts the fused-N kernel wins by reusing
+    # sorted_ids row addresses across all N tiles.
+    _FUSED_N_THRESHOLD = 2048
+
+    common_args = (
+        blockscale_e8m0.view(torch.uint8),
+        sorted_ids,
+        num_valid_ids,
+        blockscale_e8m0_sorted,
+        *blockscale_e8m0.stride(),
+        *blockscale_e8m0_sorted.stride(),
+    )
+    common_kwargs = {
+        "token_num": token_num,
+        "N_i": N_i,
+        "BLOCK_SIZE_M": BLOCK_SIZE_M // 2,
+        "BLOCK_SIZE_N": BLOCK_SIZE_N // 2,
+        "TOPK": topk,
+    }
+
+    if token_num > _FUSED_N_THRESHOLD:
+        N_TILES = triton.cdiv(N_i, BLOCK_SIZE_N)
+        grid = (triton.cdiv(M_o, BLOCK_SIZE_M),)
+        _moe_mxfp4_sort_kernel_fused_n[grid](
+            *common_args, **common_kwargs, N_TILES=N_TILES
+        )
+    else:
+        grid = (triton.cdiv(M_o, BLOCK_SIZE_M), triton.cdiv(N_i, BLOCK_SIZE_N))
+        _moe_mxfp4_sort_kernel[grid](*common_args, **common_kwargs)
+
+    # ``N_i`` was padded to a multiple of BLOCK_SIZE_N above, so ``N_o == N_i``
+    # is also a multiple of BLOCK_SIZE_N and the flat view is well-defined.
+    return blockscale_e8m0_sorted.view(dtypes.fp8_e8m0).view(-1, N_o)

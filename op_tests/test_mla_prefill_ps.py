@@ -1,0 +1,890 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
+
+import argparse
+import itertools
+import random
+import sys
+
+import numpy as np
+import pandas as pd
+import torch
+
+import aiter
+from aiter import dtypes, per_tensor_quant
+from aiter.jit.utils.chip_info import get_gfx
+from aiter.test_common import benchmark, checkAllclose, perftest
+
+# This test only supports gfx950, skip on gfx942
+if get_gfx() == "gfx942":
+    aiter.logger.info(
+        "Skipping test_mla_prefill_ps.py: only supported on gfx950, not gfx942"
+    )
+    sys.exit(0)
+
+torch.set_default_device("cuda")
+torch.set_printoptions(sci_mode=False)
+
+
+def _print_pass_rate(df, column, label):
+    if column not in df.columns:
+        return
+    counts = df[column].value_counts()
+    num_tests = counts.sum() - counts.get("skipped", 0)
+    if num_tests == 0:
+        aiter.logger.info(f"{label}: no tests ran")
+        return
+    num_passed = counts.get("passed", 0)
+    num_warning = counts.get("warning", 0)
+    num_failed = counts.get("failed", 0)
+    aiter.logger.info(
+        f"{label}: "
+        f"\033[32mpassed {num_passed}/{num_tests}({num_passed / num_tests * 100:.2f}%) "
+        f"\033[33mwarning {num_warning}/{num_tests}({num_warning / num_tests * 100:.2f}%) "
+        f"\033[31mfailed {num_failed}/{num_tests}({num_failed / num_tests * 100:.2f}%) \033[0m"
+    )
+
+
+def calculate_pass_rate(df):
+    _print_pass_rate(df, "acc result", "Output")
+    _print_pass_rate(df, "lse result", "LSE")
+    _print_pass_rate(df, "wrapper result", "mla_prefill_ps_fwd")
+
+
+def ref_masked_attention(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    scale: float,
+    dtype,
+    is_causal=True,
+    is_fp8_q=False,
+    is_fp8_kvc=False,
+    q_scale=None,
+    kv_scale=None,
+):
+    if is_fp8_q and q_scale is not None:
+        scale *= q_scale
+    if is_fp8_kvc and kv_scale is not None:
+        scale *= kv_scale
+
+    attn_weights = torch.einsum("qhd,khd->hqk", query.float(), key.float()) * scale
+    if is_causal:
+        s_q = query.shape[0]
+        s_k = key.shape[0]
+        attn_bias = torch.zeros(s_q, s_k, dtype=query.dtype)
+        temp_mask = torch.ones(s_q, s_k, dtype=torch.bool).tril(diagonal=s_k - s_q)
+        attn_bias.masked_fill_(temp_mask.logical_not(), float("-inf"))
+        attn_bias.to(query.dtype)
+        attn_weights += attn_bias
+
+    lse = attn_weights.logsumexp(dim=-1)
+
+    m = attn_weights.max(-1).values
+
+    attn_weights_exp = torch.exp(attn_weights - m.unsqueeze(-1))
+
+    attn_weights_l = attn_weights_exp.sum(-1)
+
+    if is_fp8_q:
+        attn_weights_fp8 = attn_weights_exp.to(dtype)
+        attn_weights_exp = attn_weights_fp8.to(torch.float)
+
+    out = torch.einsum("hqk,khd->qhd", attn_weights_exp.float(), value.float())
+
+    out = out / attn_weights_l.transpose(0, 1).unsqueeze(-1)
+
+    if is_fp8_kvc and kv_scale is not None:
+        out *= kv_scale
+    return out.to(dtype), lse
+
+
+def torch_mla_extend(
+    q,  # [total_q, nheads, headdim_q]
+    kvc_cache,  # [num_block * block_size, nhead_kv, qk_head_dim]
+    qo_indptr,
+    kv_indptr,
+    kv_indices,
+    softmax_scale,
+    kv_lora_rank,
+    qk_rope_head_dim,
+    dtype,
+    is_causal=True,
+    q_scale=None,
+    kv_scale=None,
+):
+    is_fp8_q = q.dtype == dtypes.fp8
+    is_fp8_kvc = kvc_cache.dtype == dtypes.fp8
+
+    if is_fp8_q:
+        q = q.to(torch.float)
+
+    if is_fp8_kvc:
+        kvc_cache = kvc_cache.to(torch.float)
+
+    qs = torch.tensor_split(q, qo_indptr.tolist()[1:])
+    kvc = torch.index_select(kvc_cache, 0, kv_indices)
+    kvs = torch.tensor_split(kvc, kv_indptr.tolist()[1:])
+    bs = qo_indptr.shape[0] - 1
+
+    os = []
+    lses = []
+    for i in range(bs):
+        kvc = kvs[i]
+        q = qs[i]
+        k = kvc
+        v, _ = torch.split(kvc, [kv_lora_rank, qk_rope_head_dim], dim=-1)
+
+        o, lse = ref_masked_attention(
+            q,
+            k,
+            v,
+            softmax_scale,
+            dtype,
+            is_causal=is_causal,
+            is_fp8_q=is_fp8_q,
+            is_fp8_kvc=is_fp8_kvc,
+            q_scale=q_scale,
+            kv_scale=kv_scale,
+        )
+        os.append(o)
+        lses.append(lse)
+    o = torch.concat(os)
+    lse = torch.concat(lses, dim=1)  # [nhead, total_q]
+    return o, lse
+
+
+@perftest()
+def run_aiter_mla_prefill_asm(
+    Q: torch.Tensor,
+    K: torch.Tensor,
+    V: torch.Tensor,
+    output: torch.Tensor,
+    qo_indptr: torch.Tensor,
+    kv_indptr: torch.Tensor,
+    kv_page_indices: torch.Tensor,
+    work_indptr: torch.Tensor,
+    work_info: torch.Tensor,
+    max_seqlen_q: int,
+    is_causal: bool,
+    softmax_scale: float,
+    logits: torch.Tensor,
+    attn_lse: torch.Tensor,
+    q_scale: torch.Tensor | None = None,
+    k_scale: torch.Tensor | None = None,
+    v_scale: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    aiter.mla_prefill_ps_asm_fwd(
+        Q,
+        K,
+        V,
+        qo_indptr,
+        kv_indptr,
+        kv_page_indices,
+        work_indptr,
+        work_info,
+        max_seqlen_q,
+        softmax_scale,
+        is_causal,
+        logits,
+        attn_lse,
+        output,
+        q_scale,
+        k_scale,
+        v_scale,
+    )
+    return output, logits, attn_lse
+
+
+@perftest()
+def run_aiter_mla_reduce(
+    logits: torch.Tensor,
+    attn_lse: torch.Tensor,
+    reduce_indptr: torch.Tensor,
+    reduce_final_map: torch.Tensor,
+    reduce_partial_map: torch.Tensor,
+    tile_q: int,
+    output: torch.Tensor,
+    final_lse: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    aiter.mla_reduce_v1(
+        logits,
+        attn_lse,
+        reduce_indptr,
+        reduce_final_map,
+        reduce_partial_map,
+        tile_q,
+        0,
+        output,
+        final_lse,
+    )
+    return output, final_lse
+
+
+@benchmark()
+def test_mla_prefill(
+    ctx_lens: int,
+    batch_size: int,
+    num_head: int,
+    qk_head_dim: int,
+    v_head_dim: int,
+    dtype: torch.dtype,
+    kv_dtype: torch.dtype,
+    block_size: int,
+    varlen: bool = False,
+    is_causal: bool = True,
+    qo_len: int | None = None,
+    need_lse: bool = True,
+    load_metadata: bool | None = False,
+    dump_metadata: bool | None = False,
+    profile_ps: bool | None = False,
+    skip_reference: bool | None = False,
+):
+    ret = {"qo_len": qo_len if qo_len is not None else ctx_lens}
+    out_dtype = torch.bfloat16
+    device = "cuda:0"
+    torch.set_default_device(device)
+    num_head_q = num_head
+    num_head_kv = num_head
+    assert num_head_q % num_head_kv == 0
+    gqa_ratio = num_head_q // num_head_kv
+    softmax_scale = 1.0 / (qk_head_dim**0.5)
+
+    qo_indptr = torch.zeros(batch_size + 1, dtype=torch.int)
+    kv_indptr = torch.zeros(batch_size + 1, dtype=torch.int)
+    seq_lens_kv = torch.empty(batch_size, dtype=torch.int)
+    if varlen:
+        # qo_len is the floor so a varlen draw can never violate qo_len <= kv_len below.
+        min_kv = 1 if qo_len is None else qo_len
+        for i in range(batch_size):
+            seq_lens_kv[i] = max(
+                min(random.normalvariate(ctx_lens, ctx_lens / 2), ctx_lens), min_kv
+            )
+    else:
+        seq_lens_kv.fill_(ctx_lens)
+    if qo_len is None:
+        seq_lens_qo = seq_lens_kv.clone()
+    else:
+        # Chunked-prefill regime: qo_len < kv_len, exercises non-causal context
+        # attention path where new queries attend to a longer cached context.
+        seq_lens_qo = torch.full((batch_size,), qo_len, dtype=torch.int)
+        assert (seq_lens_qo <= seq_lens_kv).all(), (
+            f"qo_len ({qo_len}) must be <= every seq_lens_kv "
+            f"(min={seq_lens_kv.min().item()})"
+        )
+    max_qlen = seq_lens_qo.max().item()
+
+    qo_indptr[1 : batch_size + 1] = torch.cumsum(seq_lens_qo, dim=0)
+    actual_blocks = (seq_lens_kv + block_size - 1) // block_size
+    kv_indptr[1 : batch_size + 1] = torch.cumsum(actual_blocks, dim=0)
+    num_blocks = kv_indptr[-1].item()
+    kv_indices = torch.randint(0, num_blocks, (num_blocks,), dtype=torch.int)
+
+    num_tokens = qo_indptr[-1].item()
+    Q_bf16 = torch.randn((num_tokens, num_head_q, qk_head_dim), dtype=torch.bfloat16)
+    # block_size = 1
+    K_bf16 = torch.randn((num_blocks, num_head_kv, qk_head_dim), dtype=torch.bfloat16)
+    V_bf16 = K_bf16[:, :, :v_head_dim].contiguous()
+
+    q_quant, q_scale = per_tensor_quant(Q_bf16, quant_dtype=dtype)
+    k_quant, k_scale = per_tensor_quant(K_bf16, quant_dtype=kv_dtype)
+    v_quant, v_scale = per_tensor_quant(V_bf16, quant_dtype=kv_dtype)
+
+    tile_q = 256
+    tile_kv = 128
+    qhead_granularity = gqa_ratio
+    qlen_granularity = tile_q // qhead_granularity
+    # TODO: enhance pre-allocation, current too loose for large context length
+    kvlen_granularity = max(tile_kv, block_size)
+    (
+        (work_meta_data_size, work_meta_data_type),
+        (work_indptr_size, work_indptr_type),
+        (work_info_size, work_info_type),
+        (reduce_indptr_size, reduce_indptr_type),
+        (reduce_final_map_size, reduce_final_map_type),
+        (reduce_partial_map_size, reduce_partial_map_type),
+    ) = aiter.get_ps_metadata_info_v1(
+        batch_size=batch_size,
+        num_head_k=num_head_kv,
+        max_qlen=max_qlen,
+        qlen_granularity=qlen_granularity,
+    )
+    work_metadata_ptrs = torch.empty(
+        work_meta_data_size, dtype=work_meta_data_type, device=device
+    )
+    work_indptr = torch.empty(work_indptr_size, dtype=work_indptr_type, device=device)
+    work_info = torch.empty(work_info_size, dtype=work_info_type, device=device)
+    reduce_indptr = torch.empty(
+        reduce_indptr_size, dtype=reduce_indptr_type, device=device
+    )
+    reduce_final_map = torch.empty(
+        reduce_final_map_size, dtype=reduce_final_map_type, device=device
+    )
+    reduce_partial_map = torch.empty(
+        reduce_partial_map_size, dtype=reduce_partial_map_type, device=device
+    )
+
+    metadata_map = {
+        "qo_indptr": qo_indptr,
+        "kv_indptr": kv_indptr,
+        "seq_lens_kv": seq_lens_kv,
+        "work_indptr": work_indptr,
+        "work_info": work_info,
+        "reduce_indptr": reduce_indptr,
+        "reduce_final_map": reduce_final_map,
+        "reduce_partial_map": reduce_partial_map,
+    }
+
+    if load_metadata:
+        for name, meta in metadata_map.items():
+            file_name = f"{name}.bin"
+            shape = meta.shape
+            array = np.fromfile(file_name, dtype=np.uint32)
+            meta = torch.from_numpy(array).reshape(shape)
+            torch.set_printoptions(threshold=999999, linewidth=120)
+            print(f"==>load {name} from {file_name}:\n{meta}")
+    else:
+        qo_indptr_cpu = qo_indptr.to("cpu")
+        kv_indptr_cpu = kv_indptr.to("cpu")
+        seq_lens_kv_cpu = seq_lens_kv.to("cpu")
+        # warmup for get_ps_metadata_v1
+        aiter.get_ps_metadata_v1(
+            qo_indptr_cpu,
+            kv_indptr_cpu,
+            seq_lens_kv_cpu,
+            gqa_ratio,
+            num_head_kv,
+            work_metadata_ptrs,
+            work_indptr,
+            work_info,
+            reduce_indptr,
+            reduce_final_map,
+            reduce_partial_map,
+            qhead_granularity=qhead_granularity,
+            qlen_granularity=qlen_granularity,
+            kvlen_granularity=kvlen_granularity,
+            block_size=block_size,
+            is_causal=is_causal,
+            need_lse=need_lse,
+        )
+        torch.cuda.synchronize()
+        start_event = torch.cuda.Event(enable_timing=True)
+        end_event = torch.cuda.Event(enable_timing=True)
+        start_event.record()
+        aiter.get_ps_metadata_v1(
+            qo_indptr_cpu,
+            kv_indptr_cpu,
+            seq_lens_kv_cpu,
+            gqa_ratio,
+            num_head_kv,
+            work_metadata_ptrs,
+            work_indptr,
+            work_info,
+            reduce_indptr,
+            reduce_final_map,
+            reduce_partial_map,
+            qhead_granularity=qhead_granularity,
+            qlen_granularity=qlen_granularity,
+            kvlen_granularity=kvlen_granularity,
+            block_size=block_size,
+            is_causal=is_causal,
+            need_lse=need_lse,
+        )
+        end_event.record()
+        end_event.synchronize()
+        us_metadata = start_event.elapsed_time(end_event) * 1000  # ms to us
+
+    if dump_metadata:
+        for name, meta in metadata_map.items():
+            file_name = f"{name}.bin"
+            torch.set_printoptions(threshold=99999999, linewidth=120)
+            print(f"==>dump {name} shape {meta.shape} to {file_name}:\n{meta}")
+            meta.cpu().numpy().astype(np.uint32).tofile(file_name)
+
+    output = torch.empty((num_tokens, num_head_q, v_head_dim), dtype=torch.bfloat16)
+
+    # Always run two-phase (asm + reduce) to get both output and final_lse
+    # for LSE validation, regardless of profile_ps.
+    total_s, nhead, _ = output.shape
+    tile_q = 256
+    logits = torch.empty(
+        (reduce_partial_map.size(0) * tile_q, nhead, v_head_dim),
+        dtype=dtypes.fp32,
+        device=device,
+    )
+    attn_lse = torch.empty(
+        (reduce_partial_map.size(0) * tile_q, nhead),
+        dtype=dtypes.fp32,
+        device=device,
+    )
+    # NaN sentinel: any NaN left after reduce is a row no tile ever wrote.
+    final_lse = torch.full(
+        (total_s, nhead), float("nan"), dtype=dtypes.fp32, device=device
+    )
+
+    out_mla_prefill_asm, us_mla_prefill_asm = run_aiter_mla_prefill_asm(
+        q_quant,
+        k_quant,
+        v_quant,
+        output,
+        qo_indptr,
+        kv_indptr,
+        kv_indices,
+        work_indptr,
+        work_info,
+        max_qlen,
+        is_causal,
+        softmax_scale,
+        logits,
+        attn_lse,
+        q_scale,
+        k_scale,
+        v_scale,
+    )
+    output, logits, attn_lse = out_mla_prefill_asm
+
+    out_reduce, us_reduce = run_aiter_mla_reduce(
+        logits,
+        attn_lse,
+        reduce_indptr,
+        reduce_final_map,
+        reduce_partial_map,
+        tile_q,
+        output,
+        final_lse,
+    )
+    output, final_lse = out_reduce
+    output = output.view(total_s, nhead, v_head_dim)
+
+    us_mla_prefill_ps = us_mla_prefill_asm + us_reduce
+    ret["us_mla_prefill_ps"] = us_mla_prefill_ps
+
+    # aiter.mla.mla_prefill_ps_fwd wraps the asm+reduce pair above and derives the
+    # partial buffer shapes itself, so check both stay in lockstep.
+    wrapper_output, wrapper_lse = aiter.mla.mla_prefill_ps_fwd(
+        q_quant,
+        k_quant,
+        v_quant,
+        torch.empty_like(output),
+        qo_indptr,
+        kv_indptr,
+        kv_indices,
+        work_indptr,
+        work_info,
+        max_qlen,
+        is_causal,
+        reduce_indptr=reduce_indptr,
+        reduce_final_map=reduce_final_map,
+        reduce_partial_map=reduce_partial_map,
+        softmax_scale=softmax_scale,
+        q_scale=q_scale,
+        k_scale=k_scale,
+        v_scale=v_scale,
+        return_lse=need_lse,
+    )
+    wrapper_err = checkAllclose(
+        output,
+        wrapper_output,
+        rtol=5e-2,
+        atol=5e-2,
+        msg="mla_prefill_ps_fwd[hand-rolled vs wrapper]: us......",
+    )
+    wrapper_status = "passed" if wrapper_err == 0 else "failed"
+    if need_lse:
+        if (
+            wrapper_lse is None
+            or wrapper_lse.shape != (total_s, nhead)
+            or wrapper_lse.dtype != dtypes.fp32
+        ):
+            aiter.logger.error(
+                "mla_prefill_ps_fwd: return_lse=True gave final_lse=%s, expected "
+                "shape %s dtype %s",
+                None if wrapper_lse is None else (wrapper_lse.shape, wrapper_lse.dtype),
+                (total_s, nhead),
+                dtypes.fp32,
+            )
+            wrapper_status = "failed"
+        elif (
+            checkAllclose(
+                final_lse,
+                wrapper_lse,
+                rtol=0,
+                atol=3e-2,
+                msg="mla_prefill_ps_fwd_lse[hand-rolled vs wrapper]: us......",
+            )
+            != 0
+        ):
+            wrapper_status = "failed"
+    elif wrapper_lse is not None:
+        aiter.logger.error(
+            "mla_prefill_ps_fwd: return_lse=False gave a non-None final_lse"
+        )
+        wrapper_status = "failed"
+    ret["wrapper result"] = wrapper_status
+
+    if profile_ps:
+        # calculate mla_prefill_ps kernel tflops
+        # for causal, only take the lower triangle(ops/2)
+        g_div = 2 if is_causal else 1
+        ops = (
+            2.0
+            * batch_size
+            * num_head_q
+            * (qo_len if qo_len is not None else ctx_lens)
+            * (qk_head_dim * ctx_lens + v_head_dim * ctx_lens)
+        ) / g_div
+        tflops_mla_prefill_asm = ops / us_mla_prefill_asm / (1e6)
+        # calulate reduce kernel bandwidth
+        # input: fp32 partial_out & partial_lse + int32 reduce_indptr, reduce_final_map & reduce_partial_map
+        # output: bf16 final_out & final_lse
+        allocate_input_bytes = (
+            logits.numel() * logits.element_size()
+            + attn_lse.numel() * attn_lse.element_size()
+            + reduce_indptr.numel() * reduce_indptr.element_size()
+            + reduce_final_map.numel() * reduce_final_map.element_size()
+            + reduce_partial_map.numel() * reduce_partial_map.element_size()
+        )
+        allocate_output_bytes = (
+            output.numel() * output.element_size()
+            + final_lse.numel() * final_lse.element_size()
+        )
+        allocate_bytes = allocate_input_bytes + allocate_output_bytes
+
+        effective_final_tiles = torch.argmax(reduce_indptr).item()
+        effective_partial_tiles = reduce_indptr[-1].item()
+        effective_input_bytes = (
+            effective_partial_tiles * qlen_granularity * num_head_q * (v_head_dim + 1)
+            + (effective_final_tiles + 1)
+            + (effective_final_tiles * 2)
+            + effective_partial_tiles
+        ) * 4
+        effective_output_bytes = (
+            effective_final_tiles * qlen_granularity * num_head_q * (v_head_dim + 1) * 2
+        )
+        effective_bytes = effective_input_bytes + effective_output_bytes
+        print(
+            f"effective_partial_tiles: {effective_partial_tiles}, allocate_partial_tiles: {reduce_partial_map.numel()}"
+        )
+        print(
+            f"effective_final_tiles: {effective_final_tiles}, allocate_final_tiles: {reduce_final_map.numel()}"
+        )
+        print(
+            f"effective_input_bytes: {effective_input_bytes}, allocate_input_bytes: {allocate_input_bytes}"
+        )
+        print(
+            f"effective_output_bytes: {effective_output_bytes}, allocate_output_bytes: {allocate_output_bytes}"
+        )
+        print(f"effective_bytes: {effective_bytes}, allocate_bytes: {allocate_bytes}")
+
+        reduce_bytes = effective_bytes
+        bw_reduce = (reduce_bytes / 1e12) / (us_reduce / (1e6))
+        # Store results
+        ret["us_metadata"] = us_metadata
+        ret["us_mla_prefill_ps"] = us_mla_prefill_ps
+        ret["us_mla_prefill_asm"] = us_mla_prefill_asm
+        ret["us_mla_prefill_asm_ratio"] = us_mla_prefill_asm / us_mla_prefill_ps
+        ret["tflops_mla_prefill_asm"] = tflops_mla_prefill_asm
+        ret["us_reduce"] = us_reduce
+        ret["us_reduce_ratio"] = us_reduce / us_mla_prefill_ps
+        ret["bw_reduce(TB/s)"] = bw_reduce if effective_final_tiles > 0 else 0
+
+    if not skip_reference:
+        # TODO: optimize reference implementation(too slow for large context length)
+        kv_buffer = K_bf16.view(-1, num_head_kv, qk_head_dim)
+        out_ref, lse_ref = torch_mla_extend(
+            Q_bf16,
+            kv_buffer,
+            qo_indptr,
+            kv_indptr,
+            kv_indices,
+            softmax_scale,
+            kv_lora_rank=v_head_dim,
+            qk_rope_head_dim=qk_head_dim - v_head_dim,
+            dtype=out_dtype,
+            is_causal=is_causal,
+        )
+
+        err = checkAllclose(
+            out_ref,
+            output,
+            rtol=5e-2,
+            atol=5e-2,
+            msg="mla_prefill_ps    [torch vs aiter_asm]: us......",
+        )
+        if err == 0:
+            status = "passed"
+        elif 0 < err <= 0.05:
+            status = "warning"
+        else:
+            status = "failed"
+        ret["err fp8"] = err
+        ret["acc result"] = status
+
+        # LSE validation: final_lse [total_q, nhead] vs lse_ref [nhead, total_q].
+        asm_lse = final_lse.transpose(0, 1)  # [nhead, total_q]
+        if not need_lse:
+            ret["err lse"] = 0
+            ret["lse result"] = "skipped"
+        else:
+            # final_lse was pre-filled with NaN, so a surviving NaN is a row no tile
+            # wrote. For a fully masked row the kernel emits +inf where torch gives -inf.
+            mask_err = None
+            num_unwritten = asm_lse.isnan().sum().item()
+            if num_unwritten > 0:
+                mask_err = f"{num_unwritten} final_lse entries were never written"
+            elif not torch.equal(asm_lse.isposinf(), lse_ref.isneginf()):
+                mask_err = "final_lse empty-row mask mismatch (kernel emits +inf)"
+            if mask_err is not None:
+                aiter.logger.error("mla_prefill_lse: %s", mask_err)
+
+            valid_mask = lse_ref.isfinite()
+            if valid_mask.any():
+                asm_lse_valid = asm_lse[valid_mask]
+                ref_lse_valid = lse_ref[valid_mask]
+                lse_err = checkAllclose(
+                    ref_lse_valid,
+                    asm_lse_valid,
+                    rtol=0,
+                    # fp8 rounding noise can give +-0.02, so keep tolerance just above this
+                    atol=3e-2,
+                    msg="mla_prefill_lse   [torch vs aiter_asm]: us......",
+                )
+                if lse_err == 0:
+                    lse_status = "passed"
+                elif 0 < lse_err <= 0.05:
+                    lse_status = "warning"
+                else:
+                    lse_status = "failed"
+                lse_diff = (asm_lse_valid - ref_lse_valid).abs()
+                ret["lse max_abs_diff"] = lse_diff.max().item()
+                ret["lse mean_abs_diff"] = lse_diff.mean().item()
+                lse_denom = ref_lse_valid.abs().clamp(min=1e-6)
+                lse_rel = lse_diff / lse_denom
+                ret["lse max_rel_err"] = lse_rel.max().item()
+                ret["lse mean_rel_err"] = lse_rel.mean().item()
+            else:
+                # All rows fully masked: the mask check above already validated every
+                # entry, so this is a genuine pass, not a vacuous one.
+                lse_err = 0
+                lse_status = "passed"
+            if mask_err is not None:
+                lse_status = "failed"
+            ret["err lse"] = lse_err
+            ret["lse result"] = lse_status
+
+    return ret
+
+
+parser = argparse.ArgumentParser(
+    formatter_class=argparse.RawTextHelpFormatter,
+    description="config input of test",
+)
+parser.add_argument(
+    "-qkh",
+    "--qk_head_dim",
+    type=int,
+    default=192,
+    help="""qk head dim = kv_lora_rank + qk_rope_head_dim.
+    e.g.: -qh 192""",
+)
+parser.add_argument(
+    "-vh",
+    "--v_head_dim",
+    type=int,
+    default=128,
+    help="""v head dim = kv_lora_rank.
+    e.g.: -vh 128""",
+)
+parser.add_argument(
+    "-blk",
+    "--block_size",
+    type=int,
+    nargs="*",
+    default=[1],
+    help="""Block size.
+    e.g.: -blk 1""",
+)
+parser.add_argument(
+    "-d",
+    "--dtype",
+    type=dtypes.str2Dtype,
+    choices=[dtypes.d_dtypes["fp8"]],
+    nargs="*",
+    default=[dtypes.d_dtypes["fp8"]],
+    metavar="{fp8}",
+    help="""Data type of Q.
+    e.g.: -d fp8""",
+)
+parser.add_argument(
+    "-kvd",
+    "--kv_dtype",
+    type=dtypes.str2Dtype,
+    choices=[dtypes.d_dtypes["fp8"]],
+    nargs="*",
+    default=[dtypes.d_dtypes["fp8"]],
+    metavar="{fp8}",
+    help="""Data type of KV.
+    e.g.: -kvd fp8""",
+)
+parser.add_argument(
+    "-c",
+    "--ctx_len",
+    type=int,
+    nargs="*",
+    default=[
+        21,
+        64,
+        256,
+        512,
+        1200,
+        3200,
+        5200,
+        8192,
+        10000,
+        16384,
+        # 90000,
+    ],
+    help="""Context length(for prefill, qo_len = kv_len = context_len).
+    e.g.: -c 21""",
+)
+parser.add_argument(
+    "-b",
+    "--batch_size",
+    nargs="*",
+    type=int,
+    default=[1, 4, 16],
+    help="""Batch size.
+    e.g.: -b 16""",
+)
+parser.add_argument(
+    "-n",
+    "--num_heads",
+    nargs="*",
+    type=int,
+    default=[1, 16],
+    help="""Number of heads(for mla prefill(MHA), num_head_q = num_head_kv).
+    e.g.: -n 1""",
+)
+parser.add_argument(
+    "--varlen",
+    type=dtypes.str2bool,
+    nargs="*",
+    default=[False],
+    help="""variable kv seqlens per batch. Default: [False].
+    e.g.: --varlen true  # [True]
+          --varlen true false  # [True, False]""",
+)
+parser.add_argument(
+    "--causal",
+    type=dtypes.str2bool,
+    nargs="*",
+    default=[True, False],
+    help="""enable causal mask. Default: [True, False].
+    e.g.: --causal true  # [True]
+          --causal false  # [False]""",
+)
+parser.add_argument(
+    "--qo_len",
+    type=lambda v: None if v.lower() == "none" else int(v),
+    nargs="*",
+    default=[None],
+    help="""Query length per sequence (chunked-prefill regime).
+    When unset or "none", qo_len = kv_len (square Q x K, original behavior).
+    When set, exercises the non-causal context-attention path used by vLLM
+    chunked prefill, where new queries attend to a longer cached context.
+    e.g.: --qo_len 64
+          --qo_len none 8 64""",
+)
+parser.add_argument(
+    "--load_metadata",
+    action="store_true",
+    help="""load metadata by metadata_map Default: False.
+    --load_metadata # True""",
+)
+parser.add_argument(
+    "--dump_metadata",
+    action="store_true",
+    help="""dump metadata by metadata_map. Default: False.
+    --dump_metadata # True""",
+)
+parser.add_argument(
+    "--profile",
+    action="store_true",
+    help="""Breakdown performance by each operation. Default: False.
+    --profile # True""",
+)
+parser.add_argument(
+    "--skip_reference",
+    action="store_true",
+    help="""skip reference implementation. Default: False.
+    --skip_reference # True""",
+)
+parser.add_argument(
+    "--need_lse",
+    type=dtypes.str2bool,
+    nargs="*",
+    default=[False, True],
+    help="""request final_lse from the PS scheduler. Default: both False and True.
+    True routes single-split tiles through reduce so final_lse is written;
+    False keeps the direct-to-O fast path and leaves final_lse unpopulated.
+    e.g.: --need_lse false""",
+)
+
+args = parser.parse_args()
+
+if args.profile:
+    l_ctx_len = [16384]
+    l_batch_size = [4, 16]
+    l_num_heads = [1]
+
+df = []
+for (
+    is_causal,
+    num_head,
+    dtype,
+    kv_dtype,
+    ctx_len,
+    batch_size,
+    block_size,
+    varlen,
+    qo_len,
+    need_lse,
+) in itertools.product(
+    args.causal,
+    args.num_heads,
+    args.dtype,
+    args.kv_dtype,
+    args.ctx_len,
+    args.batch_size,
+    args.block_size,
+    args.varlen,
+    args.qo_len,
+    args.need_lse,
+):
+    if qo_len is not None and qo_len > ctx_len:
+        # Skip invalid combos in the sweep rather than asserting mid-run.
+        continue
+    ret = test_mla_prefill(
+        ctx_len,
+        batch_size,
+        num_head,
+        args.qk_head_dim,
+        args.v_head_dim,
+        dtype,
+        kv_dtype,
+        block_size,
+        varlen,
+        is_causal,
+        qo_len=qo_len,
+        need_lse=need_lse,
+        load_metadata=args.load_metadata,
+        dump_metadata=args.dump_metadata,
+        profile_ps=args.profile,
+        skip_reference=args.skip_reference,
+    )
+    df.append(ret)
+df = pd.DataFrame(df)
+df_md = df.to_markdown(index=False)
+aiter.logger.info("mla_prefill_ps summary (markdown):\n%s", df_md)
+df.to_csv("mla_prefill_ps.csv")
+calculate_pass_rate(df)

@@ -1,0 +1,187 @@
+name: Sglang Downstream Test
+
+on:
+  push:
+    branches: [main]
+  schedule:
+    - cron: '0 17 * * *'
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review, labeled]
+    branches: [main]  # Triggers on PRs targeting `main`
+    paths-ignore:
+      - '**/*.md'
+      - 'docs/**'
+      - 'LICENSE'
+      - '.gitignore'
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+jobs:
+  ci_config:
+    if: >-
+      github.event_name != 'pull_request' ||
+      (github.event.pull_request.draft == false &&
+      (contains(github.event.pull_request.labels.*.name, 'ci:sglang') ||
+      contains(github.event.pull_request.labels.*.name, 'ci:all')))
+    uses: ./.github/workflows/ci-config.yaml
+
+  check-signal:
+    if: >-
+      github.event_name != 'pull_request' ||
+      (github.event.pull_request.draft == false &&
+      (contains(github.event.pull_request.labels.*.name, 'ci:sglang') ||
+      contains(github.event.pull_request.labels.*.name, 'ci:all')))
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Wait for Checks workflow
+        run: ./.github/scripts/check_signal.sh
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_SHA: ${{ github.sha }}
+
+  select-sglang-tests:
+    if: >-
+      github.event_name != 'pull_request' ||
+      (github.event.pull_request.draft == false &&
+      (contains(github.event.pull_request.labels.*.name, 'ci:sglang') ||
+      contains(github.event.pull_request.labels.*.name, 'ci:all')))
+    needs: [check-signal]
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.select.outputs.matrix }}
+      has_tests: ${{ steps.select.outputs.has_tests }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Select SGLang tests
+        id: select
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+        run: python3 ./.github/scripts/sglang_downstream.py select-tests
+
+  sglang:
+    if: needs.select-sglang-tests.outputs.has_tests == 'true'
+    name: Sglang ${{ matrix.model }} ${{ matrix.test_type }} (8 GPU)
+    needs: [check-signal, select-sglang-tests, ci_config]
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix: ${{ fromJSON(needs.select-sglang-tests.outputs.matrix) }}
+
+    env:
+      # Track SGLang AMD CI branch for https://github.com/ROCm/aiter/issues/2751.
+      SGL_BRANCH: amd/aiter-ci
+      GPU_ARCH: gfx950
+      SGLANG_CI_HOSTNAME_OVERRIDE: linux-mi35x-gpu-8
+      GITHUB_REPO_URL: ${{ github.event.pull_request.head.repo.clone_url || 'https://github.com/ROCm/aiter.git' }}
+      GITHUB_COMMIT_SHA: ${{ github.event.pull_request.head.sha || github.event.head_commit.id || github.sha }}
+
+    steps:
+      - name: Checkout aiter repo
+        uses: actions/checkout@v4
+
+      - name: Prepare sglang workspace
+        run: |
+          set -ex
+          SGLANG_WORKSPACE="${RUNNER_TEMP}/sglang-downstream"
+          rm -rf "${SGLANG_WORKSPACE}"
+          git clone --depth 1 -b ${SGL_BRANCH} https://github.com/sgl-project/sglang.git "${SGLANG_WORKSPACE}"
+          test -d "${SGLANG_WORKSPACE}/python/sglang/kernels/aot"
+          test -d "${SGLANG_WORKSPACE}/python"
+          echo "SGLANG_WORKSPACE=${SGLANG_WORKSPACE}" >> "${GITHUB_ENV}"
+
+      - name: Docker login
+        if: ${{ github.event_name != 'pull_request' || !github.event.pull_request.head.repo.fork }}
+        env:
+          DOCKER_USERNAME: ${{ secrets[needs.ci_config.outputs.docker_username_secret] }}
+          DOCKER_PASSWORD: ${{ secrets[needs.ci_config.outputs.docker_password_secret] }}
+        run: |
+          for attempt in 1 2 3; do
+            if echo "$DOCKER_PASSWORD" | docker login -u "$DOCKER_USERNAME" --password-stdin; then
+              echo "Docker login succeeded on attempt ${attempt}"
+              exit 0
+            fi
+            echo "Docker login attempt ${attempt} failed"
+            if [ "${attempt}" != 3 ]; then
+              sleep 10
+            fi
+          done
+          echo "Docker login failed after 3 attempts, continuing anyway"
+          exit 0
+
+      - name: Patch sglang CI scripts for aiter runners
+        run: python3 ./.github/scripts/sglang_downstream.py patch-sglang "${SGLANG_WORKSPACE}"
+
+      - name: Start CI container
+        run: |
+          set -ex
+          docker rm -f ci_sglang || true
+          cd "${SGLANG_WORKSPACE}"
+          GITHUB_WORKSPACE="${SGLANG_WORKSPACE}" HF_TOKEN="${{ secrets.HF_TOKEN_TEST }}" bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version rocm720
+          docker exec ci_sglang bash -lc 'pwd; ls -la /sglang-checkout; test -d /sglang-checkout/python/sglang/kernels/aot; test -d /sglang-checkout/python; test -d /models'
+
+      - name: Setup pip config
+        run: |
+          docker exec -u root ci_sglang bash -c "pip config set global.default-timeout 60"
+          docker exec -u root ci_sglang bash -c "pip config set global.retries 10"
+
+      - name: Install dependencies
+        run: |
+          cd "${SGLANG_WORKSPACE}"
+          bash scripts/ci/amd/amd_ci_install_dependency.sh --skip-aiter-build
+          bash scripts/ci/amd/amd_ci_exec.sh pip install tabulate
+          bash scripts/ci/amd/amd_ci_exec.sh pip install mistral-common "lm-eval[api]"
+
+      - name: Install aiter under test
+        id: install_aiter_under_test
+        run: |
+          set -ex
+          docker exec ci_sglang bash -lc "
+            set -ex
+            pip uninstall -y amd-aiter aiter || true
+            rm -rf /tmp/aiter-under-test
+            git clone '${GITHUB_REPO_URL}' /tmp/aiter-under-test
+            cd /tmp/aiter-under-test
+            git checkout '${GITHUB_COMMIT_SHA}'
+            git submodule sync --recursive
+            git submodule update --init --recursive
+            pip install -e .
+            # ./.github/scripts/install_triton.sh
+            pip show triton || true
+            pip show amd-aiter || pip show aiter
+          "
+
+      - name: ${{ matrix.test_type }} Test MI35x (8-GPU ${{ matrix.model }})
+        timeout-minutes: ${{ matrix.timeout_minutes }}
+        env:
+          TEST_SPEC: ${{ toJson(matrix) }}
+          EXTRA_EXEC_ARGS: ${{ matrix.extra_exec_args }}
+          TEST_COMMAND: ${{ matrix.test_command }}
+        run: |
+          set -ex
+          cd "${SGLANG_WORKSPACE}"
+          > github_summary.md
+          mapfile -t MODEL_ENV_ARGS < <(python3 "${GITHUB_WORKSPACE}/.github/scripts/sglang_downstream.py" model-env-args)
+          bash scripts/ci/amd/amd_ci_exec.sh -w "/sglang-checkout/test" \
+            -e GITHUB_STEP_SUMMARY="/sglang-checkout/github_summary.md" \
+            -e AITER_USE_SYSTEM_TRITON=1 \
+            -e SGLANG_SET_CPU_AFFINITY=0 \
+            "${MODEL_ENV_ARGS[@]}" \
+            ${EXTRA_EXEC_ARGS} \
+            ${TEST_COMMAND} || TEST_EXIT_CODE=$?
+          echo "$(<github_summary.md )" >> "$GITHUB_STEP_SUMMARY" || true
+          exit ${TEST_EXIT_CODE:-0}
+
+      - name: Clean Up
+        if: always()
+        run: |
+          docker rm -f ci_sglang || true
+          rm -rf "${SGLANG_WORKSPACE}" || true

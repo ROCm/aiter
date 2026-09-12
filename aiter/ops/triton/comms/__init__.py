@@ -1,0 +1,31 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2025, Advanced Micro Devices, Inc. All rights reserved.
+
+"""
+Triton-based communication primitives for AITER.
+
+This submodule contains communication operations implemented using Triton,
+including Iris-based GPU-initiated communication.
+
+If Iris is not available, importing this module will raise ImportError.
+"""
+
+# Import all Iris-based communication primitives
+# If Iris is not installed, this import will fail and the entire
+# aiter.ops.triton.comms module will be unavailable
+from aiter.ops.triton.comms.all_gather import all_gather
+from aiter.ops.triton.comms.fused import reduce_scatter_rmsnorm_quant_all_gather
+from aiter.ops.triton.comms.iris import IrisCommContext, calculate_heap_size
+from aiter.ops.triton.comms.reduce_scatter import reduce_scatter
+
+__all__ = [
+    "IRIS_COMM_AVAILABLE",
+    "IrisCommContext",
+    "all_gather",
+    "calculate_heap_size",
+    "reduce_scatter",
+    "reduce_scatter_rmsnorm_quant_all_gather",
+]
+
+# If we got here, Iris is available
+IRIS_COMM_AVAILABLE = True

@@ -1,0 +1,202 @@
+// SPDX-License-Identifier: MIT
+// Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
+#include <torch/all.h>
+#include <ATen/hip/HIPContext.h>
+#include <ATen/hip/impl/HIPGuardImplMasqueradingAsCUDA.h>
+#include "gemm_moe_ck2stages_lookup.h"
+#include "gemm_moe_ck2stages.h"
+#include "ck2stages_moe_stage1_heuristic_dispatch.hpp"
+#include "ck2stages_moe_stage2_heuristic_dispatch.hpp"
+#include "moe_ck.h"
+#include "aiter_logger.h"
+#include <cmath>
+
+using MoeKernelMap = std::unordered_map<std::string, MoeKernel>;
+
+// Map aiter ActivationType (stage1) to the CK stage1 activation op value.
+// CK act values: gelu=0, silu=1, swiglu(OAI swiglu_oai)=3, gelu_tanh_and_mul=4.
+// Value 2 is reserved.
+static inline int map_activation_to_ck_stage1(int activation)
+{
+    switch (static_cast<ActivationType>(activation))
+    {
+    case ActivationType::Silu:
+        return 1;
+    case ActivationType::Gelu:
+        return 0;
+    case ActivationType::Swiglu:
+        return 3;
+    case ActivationType::GeluTanh:
+        return 4;
+    default:
+        TORCH_CHECK(false, "Unsupported activation for ck_moe_stage1: ", activation);
+        return -1;
+    }
+}
+
+// API for user aiter.ck_moe_stage1(...)
+
+template <int stage = 1>
+MoeKernel moe_dispatch(std::string &kernelName, int block_m, int inter_dim, at::ScalarType x_dtype, at::ScalarType w_dtype, at::ScalarType y_dtype, int act_op, int quant_type, bool mul_routed_weight, bool is_shuffled)
+{
+    static const auto lookup = []
+    {
+        return MoeKernelMap{GENERATE_LOOKUP_TABLE()};
+    }();
+
+    if (kernelName != "")
+    {
+        auto it = lookup.find(kernelName);
+        if (it != lookup.end())
+        {
+            auto kernel = it->second;
+            return kernel;
+        }
+        AITER_LOG_WARNING("ck kernel not found: " << kernelName);
+    }
+    if constexpr (stage == 1)
+    {
+        return moe_stage1_heuristic_dispatch(block_m, inter_dim, x_dtype, w_dtype, y_dtype, act_op, quant_type, mul_routed_weight, is_shuffled);
+    }
+    else
+    {
+        return moe_stage2_heuristic_dispatch(block_m, inter_dim, x_dtype, w_dtype, y_dtype, 0, quant_type, mul_routed_weight, is_shuffled);
+    }
+}
+
+void ck_moe_stage1(torch::Tensor &hidden_states,     // [m, k], input token
+                   torch::Tensor &w1,                // [e, n, k]/[e, 2*n, k], pre-shuffle([e, nr, kr, w])
+                   torch::Tensor &w2,                // [expert, dim, inter_dim], pre-shuffle([e, nr, kr, w])
+                   torch::Tensor &sorted_token_ids,  // [max_num_tokens_padded]
+                   torch::Tensor &sorted_expert_ids, // [max_num_m_blocks]
+                   torch::Tensor &num_valid_ids,     // [1]
+                   torch::Tensor &out,               // [m * topk, inter_dim]
+                   int topk,
+                   std::string &kernelName,
+                   std::optional<torch::Tensor> w1_scale = std::nullopt, // [e, 1, n], gate(up) scale
+                   std::optional<torch::Tensor> a1_scale = std::nullopt, // [m, 1], token scale
+                   std::optional<int> block_m = 32,
+                   std::optional<torch::Tensor> sorted_weights = std::nullopt,
+                   int quant_type = 0,
+                   int activation = 0,
+                   std::optional<int> splitk = 1,
+                   bool nt = false,
+                   std::optional<std::string> dst_type = std::nullopt,
+                   bool is_shuffled = true)
+{
+    // std::cerr << __FILE__ << ":" << __LINE__ << " ck_moe_stage1 called!" << nt << " " << block_m.value() << std::endl;
+    const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(out));
+    at::hip::getCurrentHIPStream();
+    int32_t splitk_local = splitk.has_value() ? splitk.value() : 1;
+
+    if (splitk_local > 1)
+    {
+        TORCH_CHECK(out.dtype() == at::ScalarType::Float,
+                    "Out dtype only support Float when splitk_local > 1!")
+    }
+    else
+    {
+        TORCH_CHECK(out.dtype() == at::ScalarType::BFloat16 || out.dtype() == at::ScalarType::Half,
+                    "Out dtype only support BFloat16/Float16!")
+    }
+
+    int tokens = hidden_states.size(0);
+    int sorted_size = std::min(int64_t(tokens * topk * block_m.value()), sorted_token_ids.size(0));
+    int E = w1.size(0);
+    int N = w1.size(1) / 2;
+    int K = hidden_states.size(-1);
+    int MPerBlock = block_m.value();
+
+    void *hidden_states_ptr = hidden_states.data_ptr();
+    void *w1_ptr = w1.transpose(1, 2).data_ptr();
+    void *w2_ptr = w2.data_ptr();
+    void *sorted_token_ids_ptr = sorted_token_ids.data_ptr();
+    void *sorted_expert_ids_ptr = sorted_expert_ids.data_ptr();
+    void *num_valid_ids_ptr = num_valid_ids.data_ptr();
+    void *sorted_weights_ptr = sorted_weights.has_value() ? sorted_weights.value().data_ptr() : nullptr;
+    void *out_ptr = out.data_ptr();
+    void *w1_scale_ptr = w1_scale.has_value() ? w1_scale.value().data_ptr() : nullptr;
+    void *a1_scale_ptr = a1_scale.has_value() ? a1_scale.value().data_ptr() : nullptr;
+    bool MulRoutedWeight = sorted_weights.has_value();
+    if (!hidden_states_ptr || !w1_ptr || !w2_ptr || !sorted_token_ids_ptr || !sorted_expert_ids_ptr || !num_valid_ids_ptr || !out_ptr)
+    {
+        std::cerr << "detect null ptr !" << std::endl;
+        return;
+    }
+
+    if (hidden_states.dtype() == torch_fp4x2 && w1.dtype() == torch_fp4x2)
+    {
+        K *= 2;
+    }
+
+    activation = map_activation_to_ck_stage1(activation);
+
+    auto kernel = moe_dispatch<1>(kernelName, MPerBlock, N, hidden_states.dtype().toScalarType(), w1.dtype().toScalarType(), out.dtype().toScalarType(), activation, quant_type, MulRoutedWeight, is_shuffled);
+
+    kernel(at::hip::getCurrentHIPStream(),
+           tokens, sorted_size, N, K, topk,
+           hidden_states_ptr, w1_ptr, w2_ptr, sorted_token_ids_ptr, sorted_expert_ids_ptr, sorted_weights_ptr, num_valid_ids_ptr, out_ptr, w1_scale_ptr, a1_scale_ptr, splitk_local, nt);
+}
+
+void ck_moe_stage2(torch::Tensor &inter_states,      // [m, k], input token
+                   torch::Tensor &w1,                // [e, n, k]/[e, 2*n, k], pre-shuffle([e, nr, kr, w])
+                   torch::Tensor &w2,                // [expert, dim, inter_dim], pre-shuffle([e, nr, kr, w])
+                   torch::Tensor &sorted_token_ids,  // [max_num_tokens_padded]
+                   torch::Tensor &sorted_expert_ids, // [max_num_m_blocks]
+                   torch::Tensor &num_valid_ids,     // [1]
+                   torch::Tensor &out,               // [max_num_tokens_padded, inter_dim]
+                   int topk,
+                   std::string &kernelName,
+                   std::optional<torch::Tensor> w2_scale = std::nullopt, // [e, 1, n], gate(up) scale
+                   std::optional<torch::Tensor> a2_scale = std::nullopt, // [m, 1], token scale
+                   std::optional<int> block_m = 32,
+                   std::optional<torch::Tensor> sorted_weights = std::nullopt,
+                   int quant_type = 0,
+                   int activation = 0,
+                   std::optional<int> splitk = 1,
+                   bool nt = false,
+                   std::optional<std::string> dst_type = std::nullopt,
+                   bool is_shuffled = true)
+{
+    // std::cerr << __FILE__ << ":" << __LINE__ << " ck_moe_stage2 called!" << nt << " " << block_m.value() << std::endl;
+    TORCH_CHECK(out.dtype() == at::ScalarType::BFloat16 || out.dtype() == at::ScalarType::Half,
+                "Out dtype only support BFloat16/Float16!")
+
+    int32_t splitk_local = splitk.has_value() ? splitk.value() : 1;
+
+    int tokens = inter_states.size(0);
+    int sorted_size = std::min(int64_t(tokens * topk * block_m.value()), sorted_token_ids.size(0));
+    int E = w1.size(0);
+    int N = w2.size(1);
+    int K = inter_states.size(-1);
+    int MPerBlock = block_m.value();
+
+    void *inter_states_ptr = inter_states.data_ptr();
+    void *w1_ptr = w1.data_ptr();
+    void *w2_ptr = w2.data_ptr();
+    void *sorted_token_ids_ptr = sorted_token_ids.data_ptr();
+    void *sorted_expert_ids_ptr = sorted_expert_ids.data_ptr();
+    void *sorted_weights_ptr = sorted_weights.has_value() ? sorted_weights.value().data_ptr() : nullptr;
+    void *num_valid_ids_ptr = num_valid_ids.data_ptr();
+    void *out_ptr = out.data_ptr();
+    void *w2_scale_ptr = w2_scale.has_value() ? w2_scale.value().data_ptr() : nullptr;
+    void *a2_scale_ptr = a2_scale.has_value() ? a2_scale.value().data_ptr() : nullptr;
+    bool MulRoutedWeight = sorted_weights.has_value();
+
+    if (!inter_states_ptr || !w1_ptr || !w2_ptr || !sorted_token_ids_ptr || !sorted_expert_ids_ptr || !num_valid_ids_ptr || !out_ptr)
+    {
+        std::cerr << "detect null ptr !" << std::endl;
+        return;
+    }
+    if (inter_states.dtype() == torch_fp4x2 && w2.dtype() == torch_fp4x2)
+    {
+        K *= 2;
+    }
+
+    // stage2 does not apply an activation.
+    auto kernel = moe_dispatch<2>(kernelName, MPerBlock, K, inter_states.dtype().toScalarType(), w1.dtype().toScalarType(), out.dtype().toScalarType(), activation, quant_type, MulRoutedWeight, is_shuffled);
+
+    kernel(at::hip::getCurrentHIPStream(),
+           tokens, sorted_size, N, K, topk,
+           inter_states_ptr, w1_ptr, w2_ptr, sorted_token_ids_ptr, sorted_expert_ids_ptr, sorted_weights_ptr, num_valid_ids_ptr, out_ptr, w2_scale_ptr, a2_scale_ptr, splitk_local, nt);
+}

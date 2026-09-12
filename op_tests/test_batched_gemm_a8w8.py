@@ -1,0 +1,117 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
+
+import argparse
+
+import torch
+import torch.nn.functional as F
+
+import aiter
+from aiter import dtypes
+from aiter.test_common import checkAllclose, perftest
+
+
+@perftest(num_iters=5)
+def run_torch(x, weight, x_scale, w_scale, bias=None, dtype=dtypes.bf16):
+    B = x.size(0)
+    M = x.size(1)
+    N = weight.size(1)
+    out = torch.empty(B, M, N, dtype=dtypes.bf16, device="cuda")
+    for b in range(B):
+        b_x = F.linear(x[b, :, :].to(dtypes.fp32), weight[b, :, :].to(dtypes.fp32))
+        b_scale = torch.matmul(x_scale[b, :, :], w_scale[b, :, :])
+        b_out = torch.mul(b_x, b_scale)
+        if bias is not None:
+            b_out = b_out.to(bias[b, :, :]) + bias[b, :, :]
+        out[b, :, :] = b_out
+    return out.to(dtype)
+
+
+@perftest()
+def run_gemm_ck(x, weight, x_scale, w_scale, bias=None, dtype=dtypes.bf16):
+    return aiter.batched_gemm_a8w8_CK(x, weight, x_scale, w_scale, bias)
+
+
+def test_gemm(dtype, b, m, n, k):
+    dim = (b, m, n, k)
+    x = torch.randint(-20, 20, (b, m, k), dtype=dtypes.i8).cuda()
+    weight = torch.randint(-20, 20, (b, n, k), dtype=dtypes.i8).cuda()
+    x_scale = torch.rand([b, m, 1], dtype=dtypes.fp32).cuda() + 1e-6
+    w_scale = torch.rand([b, 1, n], dtype=dtypes.fp32).cuda() + 1e-6
+
+    a, avg_a = run_torch(x, weight, x_scale, w_scale, None, dtype)
+    b, avg_b = run_gemm_ck(x, weight, x_scale, w_scale, None, dtype)
+    msg = f"[perf] dim: {dim!s:<20} dtype: {dtype}, torch avg: {avg_a:<8.2f} us, ck avg: {avg_b:<8.2f} us, uplift: {avg_a/avg_b-1:<5.1%}"
+    checkAllclose(
+        a, b, msg="a,b: " + msg, rtol=1e-2, atol=0.01, catastrophic_check=True
+    )
+
+
+parser = argparse.ArgumentParser(
+    formatter_class=argparse.RawTextHelpFormatter,
+    description="config input of test",
+)
+parser.add_argument(
+    "-d",
+    "--dtype",
+    type=dtypes.str2Dtype,
+    choices=[dtypes.d_dtypes["bf16"]],
+    nargs="*",
+    default="bf16,",
+    metavar="{bf16}",
+    help="""Data type.
+    e.g.: -d bf16""",
+)
+parser.add_argument(
+    "-b",
+    "--batch",
+    type=int,
+    choices=[16],
+    nargs="*",
+    default=[16],
+    help="""Batch size.
+    e.g.: -b 16""",
+)
+parser.add_argument(
+    "-s",
+    "--mnk",
+    type=dtypes.str2tuple,
+    nargs="*",
+    default=[
+        (1, 1280, 8192),
+        (32, 1280, 8192),
+        (64, 1280, 8192),
+        (128, 1280, 8192),
+        (192, 1280, 8192),
+        (256, 1280, 8192),
+        (320, 1280, 8192),
+        (512, 1280, 8192),
+        (1024, 1280, 8192),
+        (2048, 1280, 8192),
+        (4096, 1280, 8192),
+        (8192, 1280, 8192),
+        (1, 8192, 1024),
+        (32, 8192, 1024),
+        (64, 8192, 1024),
+        (128, 8192, 1024),
+        (192, 8192, 1024),
+        (256, 8192, 1024),
+        (320, 8192, 1024),
+        (512, 8192, 1024),
+        (1024, 8192, 1024),
+        (2048, 8192, 1024),
+        (4096, 8192, 1024),
+        (8192, 8192, 1024),
+    ],
+    help="""Shape of mnk.
+    e.g.:   -s 1024,8192,1024
+            --mnk 1024,8192,1024""",
+)
+
+args = parser.parse_args()
+
+
+for dtype in args.dtype:
+    for b in args.batch:
+        for m, n, k in args.mnk:
+            test_gemm(dtype, b, m, n, k)

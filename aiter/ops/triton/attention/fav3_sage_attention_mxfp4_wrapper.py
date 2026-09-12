@@ -1,0 +1,387 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
+
+from __future__ import annotations
+
+import torch
+import triton
+
+import aiter
+from aiter.ops.triton._triton_kernels.attention.fav3_sage_attention import map_dims
+from aiter.ops.triton._triton_kernels.attention.fav3_sage_attention_mxfp4 import (
+    sage_fwd_mxfp4,
+)
+from aiter.ops.triton.quant.sage_attention_quant_wrappers import sage_quant_mxfp4
+from aiter.ops.triton.utils._triton import arch_info
+from aiter.ops.triton.utils.config_utils import load_config_json, resolve_config_dir
+
+_CONFIG_NAME = "FAV3_SAGE_MXFP4"
+_MXFP4_ARCH = "gfx950"
+
+
+_SAGE_FWD_MXFP4_TABLE = load_config_json(
+    resolve_config_dir("attention", _CONFIG_NAME, backend="triton", arch=_MXFP4_ARCH)
+    + "/DEFAULT.json"
+)
+
+
+def get_sage_fwd_configs_mxfp4():
+    """Returns tuned config for MXFP4 on supported architectures."""
+    arch = arch_info.get_arch()
+    # MXFP4 is primarily targeted at gfx950
+    if arch != _MXFP4_ARCH:
+        raise RuntimeError(f"MXFP4 is not supported on {arch}")
+    # The table is shared module state; copy before returning.
+    return dict(_SAGE_FWD_MXFP4_TABLE["fwd"])
+
+
+class _FAv3SageMXFP4WrapperFunc(torch.autograd.Function):
+    """
+    Sage Attention v2 MXFP4 wrapper maintaining high-precision I/O.
+    """
+
+    @staticmethod
+    def forward(
+        ctx,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        causal: bool,
+        layout: str = "bshd",
+        q_smooth: bool = False,
+        hadamard_rotation: bool = True,
+        config: dict | None = None,
+        R: torch.Tensor = None,
+        BLOCK_R: int = 128,
+        block_lut: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
+        return_lse: bool = False,
+        smooth_k: bool = True,
+    ):
+        bshd_map = [0, 1, 2, 3] if layout == "bshd" else [0, 2, 1, 3]
+        bhsd_map = [0, 2, 1, 3] if layout == "bshd" else [0, 1, 2, 3]
+        batch, seqlen_q, num_q_heads, head_dim = map_dims(q.shape, bshd_map)
+        _, seqlen_k, num_kv_heads, _ = map_dims(k.shape, bshd_map)
+
+        if config is None:
+            config = get_sage_fwd_configs_mxfp4()
+
+        FP8_TYPE = aiter.dtypes.fp8
+        FP8_MAX = torch.finfo(FP8_TYPE).max
+
+        assert hadamard_rotation, "hadamard_rotation=False not supported at the moment"
+        sq_result = sage_quant_mxfp4(
+            q,
+            k,
+            v,
+            FP8_TYPE,
+            FP8_MAX,
+            BLKQ=config["BLOCK_M"],
+            BLKK=64,
+            layout=layout,
+            R=R,
+            BLOCK_R=BLOCK_R,
+            q_smoothing=q_smooth,
+            smooth_k=smooth_k,
+            return_lse=return_lse,
+        )
+        if return_lse:
+            (
+                q_quantized,
+                q_descale,
+                k_quantized,
+                k_descale,
+                v_quantized,
+                v_descale,
+                delta_s,
+                sage_lse_delta,
+            ) = sq_result
+        else:
+            (
+                q_quantized,
+                q_descale,
+                k_quantized,
+                k_descale,
+                v_quantized,
+                v_descale,
+                delta_s,
+            ) = sq_result
+            sage_lse_delta = None
+        # TODO: fused quant has perf downgrade
+        # fused_sage_quant_mxfp4(
+        #     q,
+        #     k,
+        #     v,
+        #     hadamard_rotation=hadamard_rotation,
+        #     R=R,
+        #     BLOCK_M=config["BLOCK_M"],
+        #     BLOCK_R=BLOCK_R if R is None else R.shape[-1],
+        #     q_smoothing=q_smooth,
+        #     layout=layout,
+        # )
+
+        qd_mapped = map_dims(q_descale.shape, bhsd_map)
+        kd_mapped = map_dims(k_descale.shape, bhsd_map)
+
+        expected_q_ds = (batch, num_q_heads, seqlen_q, head_dim // 32)
+        expected_k_ds = (batch, num_kv_heads, seqlen_k, head_dim // 32)
+
+        assert tuple(qd_mapped) == expected_q_ds, "q_descale mismatch"
+        assert tuple(kd_mapped) == expected_k_ds, "k_descale mismatch"
+
+        if block_lut is not None:
+            kv_block_indices, lut_start, lut_count = block_lut
+            use_block_sparse = True
+            if causal:
+                raise NotImplementedError(
+                    "The Triton block-sparse attention path selected by block_lut "
+                    "does not support causal masking."
+                    "require causal=False."
+                )
+        else:
+            kv_block_indices = lut_start = lut_count = None
+            use_block_sparse = False
+
+        result = fav3_sage_mxfp4_func(
+            q=q_quantized,
+            k=k_quantized,
+            v=v_quantized,
+            q_descale=q_descale,
+            k_descale=k_descale,
+            v_descale=v_descale,
+            bias=delta_s,
+            causal=causal,
+            layout=layout,
+            config=config,
+            kv_block_indices=kv_block_indices,
+            lut_start=lut_start,
+            lut_count=lut_count,
+            use_block_sparse=use_block_sparse,
+            return_lse=return_lse,
+        )
+
+        if return_lse:
+            out, softmax_lse = result
+            # Recover the un-smoothed LSE. The kernel computed the LSE against
+            # (K - k_mean); adding delta = sm_scale * Q . k_mean^T shifts it
+            # back so it is consistent with a kernel call on un-smoothed K
+            # (required for correct ring-attention merging).
+            if sage_lse_delta is not None:
+                softmax_lse = softmax_lse + sage_lse_delta.to(softmax_lse.dtype)
+            return out, softmax_lse
+
+        return result
+
+    @staticmethod
+    def backward(ctx, dout: torch.Tensor):
+        # Backward remains unimplemented
+        assert False, "backward not implemented"
+        return (None,) * 12
+
+
+def fav3_sage_mxfp4_wrapper(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    causal: bool,
+    layout: str = "bshd",
+    q_smooth: bool = False,
+    hadamard_rotation: bool = False,
+    config: dict | None = None,
+    R: torch.Tensor = None,
+    BLOCK_R: int = 128,
+    block_lut: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
+    return_lse: bool = False,
+    smooth_k: bool = True,
+):
+    """High-precision entry point for MXFP4 SageAttention.
+
+    Args (additions):
+        return_lse: if True, also return softmax_lse of shape (B, H_q, S_q),
+            fp32, in natural log units. The wrapper internally adds the
+            K-smoothing compensation so the returned LSE is consistent with
+            FA-style ring-attention merging.
+        smooth_k: whether to apply SageAttention-style K smoothing (default
+            True). When False, no LSE compensation is needed.
+    """
+    for tensor, name in zip([q, k, v], ["q", "k", "v"]):
+        assert tensor.dtype in [
+            torch.float16,
+            torch.bfloat16,
+            torch.float32,
+        ], f"Expected high-precision for {name}, got {tensor.dtype}"
+
+    return _FAv3SageMXFP4WrapperFunc.apply(
+        q,
+        k,
+        v,
+        causal,
+        layout,
+        q_smooth,
+        hadamard_rotation,
+        config,
+        R,
+        BLOCK_R,
+        block_lut,
+        return_lse,
+        smooth_k,
+    )
+
+
+def fav3_sage_mxfp4_func(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    q_descale: torch.Tensor,
+    k_descale: torch.Tensor,
+    v_descale: torch.Tensor,
+    bias: torch.Tensor = None,
+    causal: bool = False,
+    layout: str = "bshd",
+    config: dict | None = None,
+    kv_block_indices: torch.Tensor | None = None,
+    lut_start: torch.Tensor | None = None,
+    lut_count: torch.Tensor | None = None,
+    use_block_sparse: bool = False,
+    return_lse: bool = False,
+):
+    """Direct MXFP4 kernel execution with unused parameters removed."""
+    bshd_map = [0, 1, 2, 3] if layout == "bshd" else [0, 2, 1, 3]
+    batch, seqlen_q, nheads_q, head_size_qk = map_dims(q.shape, bshd_map)
+
+    # MXFP4 head size adjustment (elements per byte)
+    head_size_qk *= 2
+    _, seqlen_k, nheads_k, _ = map_dims(k.shape, bshd_map)
+    _, _, _, head_size_v = map_dims(v.shape, bshd_map)
+
+    # Validations
+    assert q.dtype == torch.uint8 and k.dtype == torch.uint8, "MXFP4 Q/K must be uint8"
+    assert nheads_q % nheads_k == 0, "GQA/MQA ratio mismatch"
+    assert layout in ["bhsd", "bshd"], "Only bhsd and bshd supported for now."
+
+    if config is None:
+        config = get_sage_fwd_configs_mxfp4()
+
+    # Allocation
+    out = torch.zeros(
+        (q.shape[0], q.shape[1], q.shape[2], v.shape[-1]),
+        dtype=torch.bfloat16,
+        device=q.device,
+    )
+    softmax_lse = (
+        torch.empty((batch, nheads_q, seqlen_q), device=q.device, dtype=torch.float32)
+        if return_lse
+        else None
+    )
+
+    # Tensor Strides
+    stride_qb, stride_qm, stride_qh, _ = map_dims(q.stride(), bshd_map)
+    stride_kb, stride_kn, stride_kh, _ = map_dims(k.stride(), bshd_map)
+    stride_vb, stride_vn, stride_vh, _ = map_dims(v.stride(), bshd_map)
+    stride_ob, stride_om, stride_oh, _ = map_dims(out.stride(), bshd_map)
+
+    # delta s is the bias
+    if bias is not None:
+        USE_BIAS = True
+        stride_bz, stride_bh, stride_bm, stride_bn = bias.stride()
+    else:
+        USE_BIAS = False
+        stride_bz, stride_bm, stride_bh, stride_bn = 0, 0, 0, 0
+
+    # Descale Strides
+    stride_qsz, stride_qsm, stride_qsh, _ = map_dims(q_descale.stride(), bshd_map)
+    stride_ksz, stride_ksn, stride_ksh, _ = map_dims(k_descale.stride(), bshd_map)
+    stride_vsz, stride_vsh, _ = v_descale.stride()
+
+    # LSE strides (always (B, H_q, S_q) regardless of input layout)
+    stride_lse_z, stride_lse_h, stride_lse_m = (
+        softmax_lse.stride() if return_lse else (0, 0, 0)
+    )
+
+    # Kernel padding logic
+    padded_d_qk = max(16, 1 << (head_size_qk - 1).bit_length())
+    padded_d_v = max(16, 1 << (head_size_v - 1).bit_length())
+
+    # Block sparse logic
+    if use_block_sparse:
+        if kv_block_indices is None or lut_start is None or lut_count is None:
+            raise ValueError(
+                "kv_block_indices, lut_start, and lut_count must be provided "
+                "when use_block_sparse=True"
+            )
+        if causal:
+            raise NotImplementedError(
+                "The Triton block-sparse attention path selected by block_lut "
+                "does not support causal masking."
+                "require causal=False."
+            )
+    else:
+        kv_block_indices = torch.zeros(1, dtype=torch.int32, device=q.device)
+        lut_start = torch.zeros(1, dtype=torch.int32, device=q.device)
+        lut_count = torch.zeros(1, dtype=torch.int32, device=q.device)
+
+    def grid(META):
+        return (triton.cdiv(seqlen_q, META["BLOCK_M"]), nheads_q, batch)
+
+    sage_fwd_mxfp4[grid](
+        Q=q,
+        K=k,
+        V=v,
+        bias=bias,
+        Q_Descale=q_descale,
+        K_Descale=k_descale,
+        V_Descale=v_descale,
+        stride_qsz=stride_qsz,
+        stride_qsh=stride_qsh,
+        stride_qsm=stride_qsm,
+        stride_ksz=stride_ksz,
+        stride_ksh=stride_ksh,
+        stride_ksn=stride_ksn,
+        stride_vsz=stride_vsz,
+        stride_vsh=stride_vsh,
+        Out=out,
+        LSE=softmax_lse,
+        stride_qz=stride_qb,
+        stride_qh=stride_qh,
+        stride_qm=stride_qm,
+        stride_kz=stride_kb,
+        stride_kh=stride_kh,
+        stride_kn=stride_kn,
+        stride_vz=stride_vb,
+        stride_vh=stride_vh,
+        stride_vk=stride_vn,
+        stride_oz=stride_ob,
+        stride_oh=stride_oh,
+        stride_om=stride_om,
+        stride_bz=stride_bz,
+        stride_bh=stride_bh,
+        stride_bm=stride_bm,
+        stride_bn=stride_bn,  # Bias strides
+        stride_lse_z=stride_lse_z,
+        stride_lse_h=stride_lse_h,
+        stride_lse_m=stride_lse_m,
+        cu_seqlens_q=None,
+        cu_seqlens_k=None,
+        kv_block_indices=kv_block_indices,
+        lut_start=lut_start,
+        lut_count=lut_count,
+        Q_DTYPE_STR="e2m1",
+        K_DTYPE_STR="e2m1",
+        HQ=nheads_q,
+        HK=nheads_k,
+        ACTUAL_BLOCK_DMODEL_QK=head_size_qk,
+        ACTUAL_BLOCK_DMODEL_V=head_size_v,
+        MAX_SEQLENS_Q=seqlen_q,
+        MAX_SEQLENS_K=seqlen_k,
+        IS_VARLEN=False,
+        IS_CAUSAL=causal,
+        BLOCK_DMODEL_QK=padded_d_qk,
+        BLOCK_DMODEL_V=padded_d_v,
+        USE_BIAS=USE_BIAS,
+        USE_BLOCK_SPARSE=use_block_sparse,
+        RETURN_LSE=return_lse,
+        **config,
+    )
+
+    if return_lse:
+        return out, softmax_lse
+    return out

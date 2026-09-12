@@ -1,0 +1,2227 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
+
+import functools
+import importlib
+import json
+import logging
+import multiprocessing
+import os
+import re
+import shlex
+import shutil
+import sys
+import time
+import traceback
+import types
+import typing
+from collections.abc import Callable
+from typing import Any, Optional
+
+from packaging.version import Version, parse
+
+this_dir = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, f"{this_dir}/utils/")
+from chip_info import get_gfx, get_gfx_list, get_gfx_runtime
+from cpp_extension import _jit_compile, executable_path, get_hip_version
+from file_baton import FileBaton
+from jit_cache import (
+    atomic_copy,
+    publish_blob_sources,
+    publish_compiled_kids,
+    require_blob_generation,
+    snapshot_compiled_kids,
+    stage_blob_sources,
+)
+from torch_guard import torch_compile_guard
+
+AITER_REBUILD = int(os.environ.get("AITER_REBUILD", "0"))
+ENABLE_CK = int(os.environ.get("ENABLE_CK", "1")) != 0
+AITER_DISABLE_KERNARG_PRELOAD = (
+    int(os.environ.get("AITER_DISABLE_KERNARG_PRELOAD", "0")) != 0
+)
+
+
+def is_experimental_enabled() -> bool:
+    # Mirror the C++ side (atoi(...) != 0): treat unset and "0" as disabled,
+    # any other integer value as enabled. Non-numeric strings are treated as
+    # disabled to avoid accidentally turning on experimental code paths.
+    val = os.environ.get("AITER_ENABLE_EXPERIMENTAL", "0")
+    try:
+        return int(val) != 0
+    except ValueError:
+        return False
+
+
+aiter_lib = None
+
+
+def mp_lock(
+    lockPath: str,
+    MainFunc: Callable,
+    FinalFunc: Callable | None = None,
+    WaitFunc: Callable | None = None,
+    build_after_wait: bool = False,
+):
+    """
+    Using FileBaton for multiprocessing.
+
+    With build_after_wait, a peer completing does not satisfy this invocation:
+    acquire the lock and run MainFunc with our request-specific arguments.
+    """
+    baton = FileBaton(lockPath)
+    while True:
+        if baton.try_acquire():
+            try:
+                ret = MainFunc()
+            finally:
+                if FinalFunc is not None:
+                    FinalFunc()
+                baton.release()
+            return ret
+        # Could not acquire: another process holds the lock. Wait for it.
+        # wait() returns True if the holder released normally (work done),
+        # or False if it broke a stale lock left by a dead/abandoned holder --
+        # in which case we loop and try to acquire + build ourselves.
+        if baton.wait() and not build_after_wait:
+            if WaitFunc is not None:
+                return WaitFunc()
+            return None
+
+
+logger = logging.getLogger("aiter")
+
+PY = sys.executable
+this_dir = os.path.dirname(os.path.abspath(__file__))
+
+AITER_ROOT_DIR = os.path.abspath(f"{this_dir}/../../")
+AITER_LOG_MORE = int(os.getenv("AITER_LOG_MORE", "0"))
+AITER_LOG_TUNED_CONFIG = int(os.getenv("AITER_LOG_TUNED_CONFIG", "0"))
+
+
+# config_env start here
+AITER_CONFIG_GEMM_A4W4 = os.getenv(
+    "AITER_CONFIG_GEMM_A4W4",
+    f"{AITER_ROOT_DIR}/aiter/configs/a4w4_blockscale_tuned_gemm.csv",
+)
+
+AITER_CONFIG_GEMM_A6W6 = os.getenv(
+    "AITER_CONFIG_GEMM_A6W6",
+    f"{AITER_ROOT_DIR}/aiter/configs/a6w6_blockscale_tuned_gemm.csv",
+)
+
+AITER_CONFIG_GEMM_A8W8 = os.getenv(
+    "AITER_CONFIG_GEMM_A8W8",
+    f"{AITER_ROOT_DIR}/aiter/configs/a8w8_tuned_gemm.csv",
+)
+
+AITER_CONFIG_GEMM_A8W8_BPRESHUFFLE = os.getenv(
+    "AITER_CONFIG_GEMM_A8W8_BPRESHUFFLE",
+    f"{AITER_ROOT_DIR}/aiter/configs/a8w8_bpreshuffle_tuned_gemm.csv",
+)
+
+AITER_CONFIG_GEMM_A8W8_BLOCKSCALE = os.getenv(
+    "AITER_CONFIG_GEMM_A8W8_BLOCKSCALE",
+    f"{AITER_ROOT_DIR}/aiter/configs/a8w8_blockscale_tuned_gemm.csv",
+)
+
+AITER_CONFIG_FMOE = os.getenv(
+    "AITER_CONFIG_FMOE",
+    f"{AITER_ROOT_DIR}/aiter/configs/tuned_fmoe.csv",
+)
+
+AITER_CONFIG_COMM_FUSED_MOE = os.getenv(
+    "AITER_CONFIG_COMM_FUSED_MOE",
+    f"{AITER_ROOT_DIR}/aiter/configs/comm_fused_moe.csv",
+)
+
+AITER_CONFIG_FHMOE = os.getenv(
+    "AITER_CONFIG_FHMOE",
+    f"{AITER_ROOT_DIR}/aiter/configs/tuned_fhmoe.csv",
+)
+
+AITER_CONFIG_GROUPED_FMOE = os.getenv(
+    "AITER_CONFIG_GROUPED_FMOE",
+    f"{AITER_ROOT_DIR}/aiter/configs/tuned_grouped_fmoe.csv",
+)
+
+AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_BPRESHUFFLE = os.getenv(
+    "AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_BPRESHUFFLE",
+    f"{AITER_ROOT_DIR}/aiter/configs/a8w8_blockscale_bpreshuffle_tuned_gemm.csv",
+)
+
+AITER_CONFIG_A8W8_BATCHED_GEMM = os.getenv(
+    "AITER_CONFIG_A8W8_BATCHED_GEMM",
+    f"{AITER_ROOT_DIR}/aiter/configs/a8w8_tuned_batched_gemm.csv",
+)
+
+AITER_CONFIG_BF16_BATCHED_GEMM = os.getenv(
+    "AITER_CONFIG_BF16_BATCHED_GEMM",
+    f"{AITER_ROOT_DIR}/aiter/configs/bf16_tuned_batched_gemm.csv",
+)
+
+# fp8 e8m0 mxscale (block-scale) batched-GEMM tuned config. Its own family
+# (scale type baked into the filename, matching the a8w8_/bf16_ split) so a
+# future fp32 rowwise-scale variant lands in a separate CSV and never collides
+# on key. The scale type is identified by the filename alone. The
+# per-model tuned data currently lives under model_configs/ (e.g.
+# dsv4_batched_gemm_a8w8_blockscale_mxscale_tuned.csv), merged in at runtime by
+# get_config_file; this canonical path may not exist on disk.
+AITER_CONFIG_BATCHED_GEMM_A8W8_BLOCKSCALE_MXSCALE = os.getenv(
+    "AITER_CONFIG_BATCHED_GEMM_A8W8_BLOCKSCALE_MXSCALE",
+    f"{AITER_ROOT_DIR}/aiter/configs/batched_gemm_a8w8_blockscale_mxscale_tuned.csv",
+)
+
+AITER_CONFIG_BATCHED_GEMM_A8W8_BLOCKSCALE_MXSCALE_BPRESHUFFLE = os.getenv(
+    "AITER_CONFIG_BATCHED_GEMM_A8W8_BLOCKSCALE_MXSCALE_BPRESHUFFLE",
+    f"{AITER_ROOT_DIR}/aiter/configs/"
+    "batched_gemm_a8w8_blockscale_mxscale_bpreshuffle_tuned.csv",
+)
+
+AITER_CONFIG_GEMM_BF16 = os.getenv(
+    "AITER_CONFIG_GEMM_BF16",
+    f"{AITER_ROOT_DIR}/aiter/configs/bf16_tuned_gemm.csv",
+)
+
+# K5 opt BV tuned config. Per-model tuned rows live under model_configs/
+# (qwen3_5_*_chunk_gdn_h_opt_tuned.csv) and get merged into this canonical file by
+# get_config_file. It ships header-only: with no per-model table present
+# get_config_file returns this path as-is, and the opt AOT reads it, so it has to
+# be a readable csv rather than a missing path.
+AITER_CONFIG_GDN_K5_OPT = os.getenv(
+    "AITER_CONFIG_GDN_K5_OPT",
+    f"{AITER_ROOT_DIR}/aiter/configs/chunk_gdn_h_opt_tuned.csv",
+)
+
+AITER_CONFIG_DISPATCH_COMBINE_INTRANODE = os.getenv(
+    "AITER_CONFIG_DISPATCH_COMBINE_INTRANODE",
+    f"{AITER_ROOT_DIR}/aiter/configs/tuned_dispatch_combine_intranode.csv",
+)
+
+
+class AITER_CONFIG:
+    @property
+    def AITER_CONFIG_GEMM_A4W4_FILE(self):
+        return self.get_config_file(
+            "AITER_CONFIG_GEMM_A4W4",
+            AITER_CONFIG_GEMM_A4W4,
+            "a4w4_blockscale_tuned_gemm",
+        )
+
+    @property
+    def AITER_CONFIG_GEMM_A6W6_FILE(self):
+        return self.get_config_file(
+            "AITER_CONFIG_GEMM_A6W6",
+            AITER_CONFIG_GEMM_A6W6,
+            "a6w6_blockscale_tuned_gemm",
+        )
+
+    @property
+    def AITER_CONFIG_GEMM_A8W8_FILE(self):
+        return self.get_config_file(
+            "AITER_CONFIG_GEMM_A8W8", AITER_CONFIG_GEMM_A8W8, "a8w8_tuned_gemm"
+        )
+
+    @property
+    def AITER_CONFIG_GEMM_A8W8_BPRESHUFFLE_FILE(self):
+        return self.get_config_file(
+            "AITER_CONFIG_GEMM_A8W8_BPRESHUFFLE",
+            AITER_CONFIG_GEMM_A8W8_BPRESHUFFLE,
+            "a8w8_bpreshuffle_tuned_gemm",
+        )
+
+    @property
+    def AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_FILE(self):
+        return self.get_config_file(
+            "AITER_CONFIG_GEMM_A8W8_BLOCKSCALE",
+            AITER_CONFIG_GEMM_A8W8_BLOCKSCALE,
+            "a8w8_blockscale_tuned_gemm",
+        )
+
+    @property
+    def AITER_CONFIG_FMOE_FILE(self):
+        return self.get_config_file(
+            "AITER_CONFIG_FMOE", AITER_CONFIG_FMOE, "tuned_fmoe"
+        )
+
+    @property
+    def AITER_CONFIG_COMM_FUSED_MOE_FILE(self):
+        return self.get_config_file(
+            "AITER_CONFIG_COMM_FUSED_MOE",
+            AITER_CONFIG_COMM_FUSED_MOE,
+            "tuned_comm_fused_moe",
+        )
+
+    @property
+    def AITER_CONFIG_FHMOE_FILE(self):
+        return self.get_config_file(
+            "AITER_CONFIG_FHMOE", AITER_CONFIG_FHMOE, "tuned_fhmoe"
+        )
+
+    @property
+    def AITER_CONFIG_GROUPED_FMOE_FILE(self):
+        return self.get_config_file(
+            "AITER_CONFIG_GROUPED_FMOE",
+            AITER_CONFIG_GROUPED_FMOE,
+            "tuned_grouped_fmoe",
+        )
+
+    @property
+    def AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_BPRESHUFFLE_FILE(self):
+        return self.get_config_file(
+            "AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_BPRESHUFFLE",
+            AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_BPRESHUFFLE,
+            "a8w8_blockscale_bpreshuffle_tuned_gemm",
+        )
+
+    @property
+    def AITER_CONFIG_A8W8_BATCHED_GEMM_FILE(self):
+        return self.get_config_file(
+            "AITER_CONFIG_A8W8_BATCHED_GEMM",
+            AITER_CONFIG_A8W8_BATCHED_GEMM,
+            "a8w8_tuned_batched_gemm",
+        )
+
+    @property
+    def AITER_CONFIG_BF16_BATCHED_GEMM_FILE(self):
+        return self.get_config_file(
+            "AITER_CONFIG_BF16_BATCHED_GEMM",
+            AITER_CONFIG_BF16_BATCHED_GEMM,
+            "bf16_tuned_batched_gemm",
+        )
+
+    @property
+    def AITER_CONFIG_GEMM_BF16_FILE(self):
+        return self.get_config_file(
+            "AITER_CONFIG_GEMM_BF16", AITER_CONFIG_GEMM_BF16, "bf16_tuned_gemm"
+        )
+
+    @property
+    def AITER_CONFIG_GDN_K5_OPT_FILE(self):
+        return self.get_config_file(
+            "AITER_CONFIG_GDN_K5_OPT",
+            AITER_CONFIG_GDN_K5_OPT,
+            "chunk_gdn_h_opt_tuned",
+        )
+
+    @property
+    def AITER_CONFIG_DISPATCH_COMBINE_INTRANODE_FILE(self):
+        return self.get_config_file(
+            "AITER_CONFIG_DISPATCH_COMBINE_INTRANODE",
+            AITER_CONFIG_DISPATCH_COMBINE_INTRANODE,
+            "tuned_dispatch_combine_intranode",
+        )
+
+    @property
+    def AITER_CONFIG_BATCHED_GEMM_A8W8_BLOCKSCALE_MXSCALE_FILE(self):
+        return self.get_config_file(
+            "AITER_CONFIG_BATCHED_GEMM_A8W8_BLOCKSCALE_MXSCALE",
+            AITER_CONFIG_BATCHED_GEMM_A8W8_BLOCKSCALE_MXSCALE,
+            "batched_gemm_a8w8_blockscale_mxscale_tuned",
+        )
+
+    @property
+    def AITER_CONFIG_BATCHED_GEMM_A8W8_BLOCKSCALE_MXSCALE_BPRESHUFFLE_FILE(self):
+        return self.get_config_file(
+            "AITER_CONFIG_BATCHED_GEMM_A8W8_BLOCKSCALE_MXSCALE_BPRESHUFFLE",
+            AITER_CONFIG_BATCHED_GEMM_A8W8_BLOCKSCALE_MXSCALE_BPRESHUFFLE,
+            "batched_gemm_a8w8_blockscale_mxscale_bpreshuffle_tuned",
+        )
+
+    def update_config_files(self, file_path: str, merge_name: str):
+        path_list = file_path.split(os.pathsep) if file_path else []
+        if len(path_list) <= 1:
+            return file_path
+        source_pairs = []
+        ## merge config files
+        ##example: AITER_CONFIG_GEMM_A4W4="/path1:/path2"
+        import pandas as pd
+
+        for i, path in enumerate(path_list):
+            if not os.path.exists(path):
+                logger.info(f"path {i + 1}: {path} (not exist)")
+                continue
+
+            df = pd.read_csv(path)
+            source_pairs.append((path, df))
+
+        if not source_pairs:
+            raise FileNotFoundError(
+                f"No existing config files found in '{file_path}' "
+                f"when merging '{merge_name}'."
+            )
+
+        _FILL_DEFAULTS = {"xbf16": 0, "run_1stage": 0, "ksplit": 0}
+        all_cols = list(source_pairs[0][1].columns)
+        for _, df in source_pairs[1:]:
+            for c in df.columns:
+                if c not in all_cols:
+                    insert_before = "tflops" if "tflops" in all_cols else all_cols[-1]
+                    all_cols.insert(all_cols.index(insert_before), c)
+        for i, (path, df) in enumerate(source_pairs):
+            for c in all_cols:
+                if c not in df.columns:
+                    if c == "gfx" and "cu_num" in df.columns:
+                        # Legacy config without a gfx column: infer the arch from
+                        # cu_num (256->gfx950, 80/304->gfx942) so archs that share
+                        # a cu_num stay distinguishable after the merge.
+                        from aiter.jit.utils.chip_info import gfx_from_cu_num
+
+                        df[c] = df["cu_num"].map(gfx_from_cu_num)
+                    else:
+                        df[c] = _FILL_DEFAULTS.get(c, 0)
+            source_pairs[i] = (path, df[all_cols])
+
+        non_empty = [df for _, df in source_pairs if not df.empty]
+        merge_df = (
+            pd.concat(non_empty, ignore_index=True)
+            if non_empty
+            else source_pairs[0][1].iloc[0:0].copy()
+        )
+        has_tag = "_tag" in merge_df.columns
+        if has_tag:
+            merge_df["_tag"] = merge_df["_tag"].fillna("")
+
+        ## get keys from untuned file to drop_duplicates
+        # Turn the tuned-file base name into its untuned sibling by rewriting the
+        # LAST "tuned" token (handles both mid-string names like
+        # "a8w8_tuned_gemm" and trailing ones like "..._mxscale_tuned").
+        untuned_name = "untuned".join(merge_name.rsplit("tuned", 1))
+        untuned_path = f"{AITER_ROOT_DIR}/aiter/configs/{untuned_name}.csv"
+        if os.path.exists(untuned_path):
+            untunedf = pd.read_csv(untuned_path)
+            keys = untunedf.columns.to_list()
+            if "cu_num" not in keys:
+                keys.append("cu_num")
+            if "gfx" in merge_df.columns and "gfx" not in keys:
+                keys.append("gfx")
+            dedup_keys = keys + ["_tag"] if has_tag else keys
+            # Only key on columns actually present in the merged frame. Most
+            # families carry cu_num, but some (e.g. the mxscale batched-GEMM
+            # table) key on gfx and never carry cu_num; keeping a missing column
+            # in the subset would raise inside pandas' duplicated().
+            dedup_keys = [k for k in dedup_keys if k in merge_df.columns]
+            duplicated_mask = merge_df.duplicated(subset=dedup_keys, keep=False)
+            if duplicated_mask.any():
+                dup_count = int(duplicated_mask.sum())
+                dup_rows = merge_df[duplicated_mask].sort_values(dedup_keys)
+                if "us" not in merge_df.columns:
+                    raise RuntimeError(
+                        f"Found {dup_count} duplicate shape entries during merge of '{merge_name}'. "
+                        f"No 'us' column to determine best performing entry. "
+                        f"Please remove duplicates manually.\n"
+                        f"Duplicate rows:\n{dup_rows.to_string(index=False)}"
+                    )
+
+                # Auto-dedup: globally determine best row (lowest 'us') per shape
+                best_row_index = set(
+                    merge_df.sort_values("us", kind="stable")
+                    .drop_duplicates(subset=dedup_keys, keep="first")
+                    .index
+                )
+
+                saved_files = []
+                offset = 0
+                for src_path, src_df in source_pairs:
+                    start, end = offset, offset + len(src_df)
+                    offset = end
+                    file_rows = merge_df.iloc[start:end]
+                    new_src_df = file_rows[
+                        file_rows.index.isin(best_row_index)
+                    ].reset_index(drop=True)
+                    if len(new_src_df) < len(src_df):
+                        new_src_df.to_csv(src_path, index=False)
+                        saved_files.append(
+                            f"  {src_path}: {len(src_df)} -> {len(new_src_df)} rows"
+                        )
+                saved_info = (
+                    "\n".join(saved_files) if saved_files else "  (no files updated)"
+                )
+                raise RuntimeError(
+                    f"Found {dup_count} duplicate shape entries during merge of '{merge_name}'. "
+                    f"Auto-resolved by keeping best performing (lowest 'us') for each shape "
+                    f"and saved back to source config files. Please re-run.\n"
+                    f"Duplicate rows:\n{dup_rows.to_string(index=False)}\n"
+                    f"Updated files:\n{saved_info}"
+                )
+        else:
+            logger.warning(
+                f"Untuned config file not found: {untuned_path}. Using all columns for deduplication."
+            )
+
+        from pathlib import Path
+
+        config_path = Path("/tmp/aiter_configs/")
+        if not config_path.exists():
+            config_path.mkdir(parents=True, exist_ok=True)
+        new_file_path = f"{config_path}/{merge_name}.csv"
+        lock_path = f"{new_file_path}.lock"
+        tmp_file_path = f"{new_file_path}.tmp"
+
+        def write_config():
+            merge_df.to_csv(tmp_file_path, index=False)
+            os.replace(tmp_file_path, new_file_path)
+
+        mp_lock(lock_path, write_config)
+        return new_file_path
+
+    # Cache is keyed on (self, env_name, ...); this object is a
+    # process-lifetime singleton, so the retained reference is not a leak.
+    @functools.lru_cache(maxsize=20)  # noqa: B019
+    def get_config_file(self, env_name, default_file, tuned_file_name):
+        config_env_file = os.getenv(env_name)
+        # default_file = f"{AITER_ROOT_DIR}/aiter/configs/{tuned_file_name}.csv"
+        from pathlib import Path
+
+        if not config_env_file:
+            model_config_dir = Path(f"{AITER_ROOT_DIR}/aiter/configs/model_configs/")
+            op_tuned_file_list = [
+                p
+                for p in model_config_dir.glob(f"*{tuned_file_name}*.csv")
+                if (p.is_file() and "untuned" not in p.name)
+            ]
+
+            if not op_tuned_file_list:
+                config_file = default_file
+            else:
+                tuned_files = ":".join(str(p) for p in op_tuned_file_list)
+                tuned_files = default_file + ":" + tuned_files
+                logger.info(
+                    f"merge tuned file under model_configs/ and configs/ {tuned_files}"
+                )
+                config_file = self.update_config_files(tuned_files, tuned_file_name)
+        else:
+            config_file = self.update_config_files(config_env_file, tuned_file_name)
+            # print(f"get config file from environment ", config_file)
+        return config_file
+
+
+AITER_CONFIGS = AITER_CONFIG()
+# config_env end here
+
+find_aiter = importlib.util.find_spec("aiter")
+if find_aiter is not None:
+    if find_aiter.submodule_search_locations:
+        package_path = find_aiter.submodule_search_locations[0]
+    elif find_aiter.origin:
+        package_path = find_aiter.origin
+    package_path = os.path.dirname(package_path)
+    package_parent_path = os.path.dirname(package_path)
+
+    try:
+        with open(f"{this_dir}/../install_mode", "r") as f:
+            # develop mode
+            isDevelopMode = f.read().strip() == "develop"
+    except FileNotFoundError:
+        # pip install -e
+        isDevelopMode = True
+
+    if isDevelopMode:
+        AITER_META_DIR = AITER_ROOT_DIR
+    else:
+        AITER_META_DIR = os.path.abspath(f"{AITER_ROOT_DIR}/aiter_meta/")
+else:
+    AITER_META_DIR = AITER_ROOT_DIR
+    logger.warning("aiter is not installed.")
+
+# honor environment override and fallback if missing
+env_meta = os.environ.get("AITER_META_DIR")
+if env_meta:
+    AITER_META_DIR = os.path.abspath(env_meta)
+if not os.path.exists(os.path.join(AITER_META_DIR, "csrc")):
+    AITER_META_DIR = AITER_ROOT_DIR
+
+sys.path.insert(0, AITER_META_DIR)
+AITER_CSRC_DIR = f"{AITER_META_DIR}/csrc"
+AITER_GRADLIB_DIR = f"{AITER_META_DIR}/gradlib"
+gfxs = get_gfx_list()
+AITER_ASM_DIR = f"{AITER_META_DIR}/hsa/"
+os.environ["AITER_ASM_DIR"] = AITER_ASM_DIR
+# Pre-compiled opus code objects (csrc/opus_gemm/gen_co/<arch>/<symbol>.co).
+# Resolved HERE, at import time, for the same reason AITER_ASM_DIR is: the
+# module also carries -DOPUS_GEN_CO_DIR, but that macro is baked when the module
+# is COMPILED, which for a prebuilt wheel is the build tree's aiter_meta/ (a
+# directory setup.py deletes when it is done). Only an import-time value knows
+# where the files ended up after install. The C++ loader prefers this env var
+# over the macro, so an explicit user override still wins.
+OPUS_GEN_CO_DIR = f"{AITER_CSRC_DIR}/opus_gemm/gen_co"
+os.environ.setdefault("OPUS_GEN_CO_DIR", OPUS_GEN_CO_DIR)
+
+CK_3RDPARTY_DIR = os.environ.get(
+    "CK_DIR", f"{AITER_META_DIR}/3rdparty/composable_kernel"
+)
+CK_HELPER_DIR = f"{AITER_META_DIR}/3rdparty/ck_helper"
+CK_DIR = CK_3RDPARTY_DIR
+HIP_KITTENS_DIR = os.environ.get(
+    "HIP_KITTENS_DIR", f"{AITER_META_DIR}/3rdparty/HipKittens"
+)
+
+
+@functools.lru_cache(maxsize=1)
+def get_asm_dir():
+    return os.path.join(AITER_ASM_DIR, get_gfx())
+
+
+@functools.lru_cache(maxsize=1)
+def get_user_jit_dir() -> str:
+    if "AITER_JIT_DIR" in os.environ:
+        path = os.getenv("AITER_JIT_DIR", "")
+        os.makedirs(path, exist_ok=True)
+        sys.path.insert(0, path)
+        return path
+    else:
+        if os.access(this_dir, os.W_OK):
+            return this_dir
+    home_jit_dir = f"{os.path.expanduser('~')}/.aiter/{os.path.basename(this_dir)}"
+    if not os.path.exists(home_jit_dir):
+        shutil.copytree(this_dir, home_jit_dir)
+    return home_jit_dir
+
+
+bd_dir = f"{get_user_jit_dir()}/build"
+# copy ck to build, thus hippify under bd_dir
+if multiprocessing.current_process().name == "MainProcess":
+    os.makedirs(bd_dir, exist_ok=True)
+    # if os.path.exists(f"{bd_dir}/ck/library"):
+    #     shutil.rmtree(f"{bd_dir}/ck/library")
+# CK_DIR = f"{bd_dir}/ck"
+
+
+def validate_and_update_archs():
+    archs = os.getenv("GPU_ARCHS", "native").split(";")
+    archs = [arch.strip() for arch in archs]
+    # List of allowed architectures
+    allowed_archs = [
+        "native",
+        "gfx90a",
+        "gfx940",
+        "gfx941",
+        "gfx942",
+        "gfx1100",
+        "gfx1101",
+        "gfx1102",
+        "gfx1103",
+        "gfx1150",
+        "gfx1151",
+        "gfx1152",
+        "gfx1153",
+        "gfx1200",
+        "gfx1201",
+        "gfx1250",
+        "gfx950",
+        "gfx1250",
+    ]
+
+    # Validate if each element in archs is in allowed_archs
+    assert all(
+        arch in allowed_archs for arch in archs
+    ), f"One of GPU archs of {archs} is invalid or not supported"
+    return archs
+
+
+@functools.lru_cache
+def hip_flag_checker(flag_hip: str) -> bool:
+    import subprocess
+
+    cmd = (
+        [executable_path("hipcc")]
+        + flag_hip.split()
+        + ["-x", "hip", "-E", "-P", "/dev/null", "-o", "/dev/null"]
+    )
+    try:
+        subprocess.check_output(cmd, stderr=subprocess.DEVNULL)
+    except subprocess.CalledProcessError:
+        logger.warning(f"Current hipcc not support: {flag_hip}, skip it.")
+        return False
+    return True
+
+
+@functools.lru_cache
+def check_LLVM_MAIN_REVISION():
+    # for https://github.com/ROCm/ROCm/issues/5646 and https://github.com/ROCm/composable_kernel/pull/3469
+    # ck using following logic...
+    """#if LLVM_MAIN_REVISION < 554785
+    #define CK_TILE_HOST_DEVICE_EXTERN __host__ __device__
+    #else
+    #define CK_TILE_HOST_DEVICE_EXTERN"""
+    import subprocess
+
+    try:
+        hipcc = shlex.quote(executable_path("hipcc"))
+        cmd = f"""echo "#include <tuple>
+__host__ __device__ void func(){{std::tuple<int, int> t = std::tuple(1, 1);}}" | {hipcc} -x hip -P -c -Wno-unused-command-line-argument -o /dev/null -"""
+        subprocess.check_output(cmd, shell=True, text=True, stderr=subprocess.STDOUT)
+    except (subprocess.CalledProcessError, AssertionError):
+        return 554785
+    return 554785 - 1
+
+
+def check_and_set_ninja_worker():
+    max_num_jobs_cores = max(1, os.cpu_count() * 0.8)
+    import psutil
+
+    # calculate the maximum allowed NUM_JOBS based on free memory
+    free_memory_gb = psutil.virtual_memory().available / (1024**3)  # free memory in GB
+    max_num_jobs_memory = int(free_memory_gb / 0.5)  # assuming 0.5 GB per job
+
+    # pick lower value of jobs based on cores vs memory metric to minimize oom and swap usage during compilation
+    max_jobs = int(max(1, min(max_num_jobs_cores, max_num_jobs_memory)))
+    max_jobs_env = os.environ.get("MAX_JOBS")
+    if max_jobs_env is not None:
+        try:
+            max_processes = int(max_jobs_env)
+            # too large value
+            if max_processes > max_jobs:
+                os.environ["MAX_JOBS"] = str(max_jobs)
+        # error value
+        except ValueError:
+            os.environ["MAX_JOBS"] = str(max_jobs)
+    # none value
+    else:
+        os.environ["MAX_JOBS"] = str(max_jobs)
+
+
+def rename_cpp_to_cu(els, dst, hipify, recursive=False):
+    def do_rename_and_mv(name, src, dst, ret):
+        newName = name
+        if hipify:
+            if name.endswith((".cpp", ".cu")):
+                newName = name.replace(".cpp", ".cu")
+                ret.append(f"{dst}/{newName}")
+            shutil.copy(f"{src}/{name}", f"{dst}/{newName}")
+        else:
+            if name.endswith((".cpp", ".cu")):
+                ret.append(f"{src}/{newName}")
+
+    ret = []
+    for el in els:
+        if not os.path.exists(el):
+            logger.warning(f"---> {el} not exists!!!!!!")
+            continue
+        if os.path.isdir(el):
+            for entry in os.listdir(el):
+                if os.path.isdir(f"{el}/{entry}"):
+                    if recursive:
+                        ret += rename_cpp_to_cu(
+                            [f"{el}/{entry}"], dst, hipify, recursive
+                        )
+                    continue
+                do_rename_and_mv(entry, el, dst, ret)
+        else:
+            do_rename_and_mv(os.path.basename(el), os.path.dirname(el), dst, ret)
+    return ret
+
+
+def _stage_blob_sources(
+    blob_gen_cmd, op_dir, src_dir, sources, hipify, seed_files=None
+):
+    """Generate JIT sources in a deterministic transactional working tree."""
+    staging_dir, token = stage_blob_sources(
+        blob_gen_cmd,
+        op_dir,
+        PY,
+        logger=logger,
+        log_commands=AITER_LOG_MORE > 0,
+        seed_files=seed_files,
+        return_token=True,
+    )
+    if staging_dir is None:
+        return sources, None, None
+    generated_sources = rename_cpp_to_cu([staging_dir], src_dir, hipify, recursive=True)
+    require_blob_generation(staging_dir, token)
+    return sources + generated_sources, staging_dir, token
+
+
+@torch_compile_guard()
+def check_numa_custom_op() -> None:
+    numa_balance_set = os.popen("cat /proc/sys/kernel/numa_balancing").read().strip()
+    if numa_balance_set == "1":
+        logger.warning(
+            "WARNING: NUMA balancing is enabled, which may cause errors. "
+            "It is recommended to disable NUMA balancing by running \"sudo sh -c 'echo 0 > /proc/sys/kernel/numa_balancing'\" "
+            "for more details: https://rocm.docs.amd.com/en/latest/how-to/system-optimization/mi300x.html#disable-numa-auto-balancing"
+        )
+
+
+@functools.lru_cache
+def check_numa():
+    check_numa_custom_op()
+
+
+__mds = {}
+
+
+@torch_compile_guard()
+def get_module_custom_op(md_name: str) -> None:
+    if md_name not in __mds:
+        if "AITER_JIT_DIR" in os.environ:
+            __mds[md_name] = importlib.import_module(md_name)
+        else:
+            __mds[md_name] = importlib.import_module(f"{__package__}.{md_name}")
+        logger.info(f"import [{md_name}] under {__mds[md_name].__file__}")
+
+
+def _so_offload_archs(so_path):
+    # parse the gfx targets embedded in a built module .so from its clang
+    # offload-bundle entry ids (e.g. the 'gfx942' in '...amdhsa--gfx942').
+    # the .so is mmap'd, not read whole, since CK modules can be hundreds of MB.
+    # an empty set means host-only module, missing file, or unreadable.
+    import mmap
+
+    archs = set()
+    try:
+        with open(so_path, "rb") as f, mmap.mmap(
+            f.fileno(), 0, access=mmap.ACCESS_READ
+        ) as mm:
+            for m in re.finditer(rb"amdhsa--(gfx[0-9a-z]+)", mm):
+                archs.add(m.group(1).decode())
+    except (OSError, ValueError, OverflowError):
+        pass
+    return archs
+
+
+_PYBIND11_ABI_KEY_RE = re.compile(rb"__pybind11_internals_v[0-9A-Za-z_]+__")
+
+
+def _so_pybind11_abi_key(so_path):
+    # the key of pybind11's cross-module type registry, as embedded in a built
+    # .so. two extensions see the same registry only when this string matches
+    # byte for byte; it encodes the pybind11 internals version plus the compiler
+    # / stdlib / C++ ABI the module was built with. None means missing file or a
+    # module built without pybind11.
+    # find() first, then the regex: a plain scan over a several-hundred-MB CK
+    # module would otherwise touch every page just to reach one short string.
+    import mmap
+
+    try:
+        with open(so_path, "rb") as f, mmap.mmap(
+            f.fileno(), 0, access=mmap.ACCESS_READ
+        ) as mm:
+            pos = mm.find(b"__pybind11_internals_v")
+            if pos < 0:
+                return None
+            m = _PYBIND11_ABI_KEY_RE.match(mm, pos)
+            return m.group(0).decode() if m else None
+    except (OSError, ValueError, OverflowError):
+        return None
+
+
+@functools.lru_cache(maxsize=1024)
+def _pybind11_abi_keys(md_name, so_path, core_so_path):
+    # (module key, core key) when the two disagree, else None. lru_cached on the
+    # paths, so each .so is read at most once per process and the healthy answer
+    # costs one dict lookup. A module with no key at all (host-only, or built
+    # without pybind11) counts as agreeing: there is nothing to mismatch.
+    core_key = _so_pybind11_abi_key(core_so_path)
+    mod_key = _so_pybind11_abi_key(so_path)
+    if not core_key or not mod_key or core_key == mod_key:
+        return None
+    return (mod_key, core_key)
+
+
+def _raise_on_pybind11_abi_split(md_name, so_path, core_so_path, has_tensor_arg):
+    # aiter_tensor_t is registered exactly once, by module_aiter_core, and
+    # develop=True ops hand one of those objects to a different .so. That
+    # resolves only if both modules landed in the same pybind11 type registry,
+    # i.e. share the key above. When they do not, pybind11 sees an unregistered
+    # type and rejects the tensor arguments with a bare "incompatible function
+    # arguments", naming neither cause nor cure -- which is what PR #4847 hit and
+    # worked around by reverting a module to at::Tensor.
+    #
+    # The call is going to fail either way, so fail it here with the reason
+    # attached instead. Gated on an argument actually being a tensor: a mismatch
+    # only bites when an aiter_tensor_t has to cross, and a develop op called
+    # with none would otherwise still work.
+    keys = _pybind11_abi_keys(md_name, so_path, core_so_path)
+    if keys is None or not has_tensor_arg():
+        return
+    mod_key, core_key = keys
+    raise RuntimeError(
+        f"[{md_name}] was built against a different pybind11 ABI than "
+        f"module_aiter_core, so it cannot see the aiter_tensor_t registration "
+        f"and every tensor argument would be rejected:\n"
+        f"    {md_name}: {mod_key}\n"
+        f"      ({so_path})\n"
+        f"    module_aiter_core: {core_key}\n"
+        f"      ({core_so_path})\n"
+        f"The two .so files come from different build environments -- differing "
+        f"pybind11 version, C++ ABI, or one built against torch and one not. "
+        f"Rebuild both in one environment: AITER_REBUILD=1, or remove "
+        f"{get_user_jit_dir()} and let them rebuild."
+    )
+
+
+def _needs_arch_rebuild(md_name):
+    # a prebuilt .so is a valid host extension on any GPU, so importing one
+    # built for the wrong arch succeeds and only faults later at kernel launch.
+    # if the .so carries device code for other arches but NOT the running GPU,
+    # force a JIT rebuild for the native arch instead.
+    try:
+        cur = get_gfx_runtime()
+    except Exception:  # noqa: BLE001
+        # running arch undetectable (e.g. no GPU) -> keep normal behaviour
+        return False
+    so_path = os.path.join(get_user_jit_dir(), f"{md_name}.so")
+    built = _so_offload_archs(so_path)
+    if not built or cur in built:
+        return False
+    logger.warning(
+        f"[{md_name}] prebuilt .so targets {sorted(built)} but not the "
+        f"running arch {cur}; rebuilding for {cur}"
+    )
+    return True
+
+
+@functools.lru_cache(maxsize=1024)
+def get_module(md_name):
+    check_numa()
+    if _needs_arch_rebuild(md_name):
+        raise ModuleNotFoundError(md_name)
+    get_module_custom_op(md_name)
+    return __mds[md_name]
+
+
+rebuilded_list = []
+
+
+def clone_3rdparty(third_party: str) -> None:
+    def MainFunc():
+        if not os.path.exists(dir_path):
+            import subprocess
+
+            def check_git_version(required_major, required_minor):
+                try:
+                    output = subprocess.check_output(
+                        ["git", "--version"], text=True
+                    ).strip()
+                    import re
+
+                    m = re.search(r"(\d+)\.(\d+)", output)
+                    if m:
+                        major, minor = int(m.group(1)), int(m.group(2))
+                        return (major > required_major) or (
+                            major == required_major and minor >= required_minor
+                        )
+                except Exception as e:  # noqa: BLE001
+                    logger.warning(f"Failed to check git version: {e}")
+                return False
+
+            logger.info(f"Cloning 3rdparty {third_party} to {dir_path}")
+            # Check git version for --revision flag support (>=2.49)
+            if not check_git_version(2, 49):
+                logger.warning(
+                    "Your git version does not support the --revision flag (requires >=2.49). Slow path is used for cloning 3rdparty."
+                )
+                subprocess.call(
+                    [
+                        "git",
+                        "clone",
+                        "-q",
+                        third_party_info["url"],
+                        dir_path,
+                    ]
+                )
+                subprocess.call(
+                    [
+                        "git",
+                        "-C",
+                        dir_path,
+                        "reset",
+                        "-q",
+                        "--hard",
+                        third_party_info["commit"],
+                    ]
+                )
+                subprocess.call(
+                    [
+                        "git",
+                        "-C",
+                        dir_path,
+                        "submodule",
+                        "update",
+                        "-q",
+                        "--init",
+                        "--recursive",
+                    ]
+                )
+            else:
+                # Save current git config value for advice.detachedHead, set to false
+                prev_detached_head = None
+                try:
+                    try:
+                        prev_detached_head = subprocess.check_output(
+                            ["git", "config", "--get", "advice.detachedHead"], text=True
+                        ).strip()
+                    except subprocess.CalledProcessError:
+                        prev_detached_head = None  # not set before
+                    # Set to false before clone
+                    subprocess.call(
+                        ["git", "config", "--global", "advice.detachedHead", "false"]
+                    )
+
+                    subprocess.call(
+                        [
+                            "git",
+                            "clone",
+                            "-q",
+                            f"--revision={third_party_info['commit']}",
+                            "--depth=1",
+                            "--recurse-submodules",
+                            third_party_info["url"],
+                            dir_path,
+                        ]
+                    )
+                finally:
+                    # Restore config after clone
+                    if prev_detached_head is not None:
+                        subprocess.call(
+                            [
+                                "git",
+                                "config",
+                                "--global",
+                                "advice.detachedHead",
+                                prev_detached_head,
+                            ]
+                        )
+                    else:
+                        subprocess.call(
+                            [
+                                "git",
+                                "config",
+                                "--global",
+                                "--unset",
+                                "advice.detachedHead",
+                            ]
+                        )
+
+    if third_party == "HipKittens":
+        dir_path = HIP_KITTENS_DIR
+        third_party_info = {
+            "url": "https://github.com/HazyResearch/HipKittens.git",
+            "commit": "d3cd9b31cb0ff611ff64b5701f57ccdeb7712f39",
+        }
+    elif third_party == "ComposableKernel":
+        # TODO: ComposableKernel will be supported in the future
+        pass
+
+    if "third_party_info" in locals():
+        lock_path = f"{bd_dir}/lock_3rdparty_clone_{third_party}"
+        mp_lock(lockPath=lock_path, MainFunc=MainFunc)
+
+
+def rm_module(md_name):
+    os.system(f"rm -rf {get_user_jit_dir()}/{md_name}.so")
+
+
+def clear_build(md_name):
+    os.system(f"rm -rf {bd_dir}/{md_name}")
+
+
+def build_module(
+    md_name,
+    srcs,
+    flags_extra_cc,
+    flags_extra_hip,
+    blob_gen_cmd,
+    extra_include,
+    extra_ldflags,
+    verbose,
+    is_python_module,
+    is_standalone,
+    torch_exclude,
+    third_party,
+    hipify=False,
+    flags_extra_hip_per_source=None,
+    build_after_wait=False,
+):
+    os.makedirs(bd_dir, exist_ok=True)
+    lock_path = f"{bd_dir}/lock_{md_name}"
+    startTS = time.perf_counter()
+    target_name = f"{md_name}.so" if not is_standalone else md_name
+
+    for tp in third_party:
+        clone_3rdparty(tp)
+
+    def MainFunc():
+        if AITER_REBUILD == 1:
+            rm_module(md_name)
+            clear_build(md_name)
+        elif AITER_REBUILD >= 2:
+            rm_module(md_name)
+        op_dir = f"{bd_dir}/{md_name}"
+        logger.info(
+            f"[pid={os.getpid()} pname={multiprocessing.current_process().name}] "
+            f"start build [{md_name}] under {op_dir}"
+        )
+
+        opbd_dir = f"{op_dir}/build"
+        src_dir = f"{op_dir}/build/srcs"
+        os.makedirs(src_dir, exist_ok=True)
+
+        def raise_build_error(error):
+            tag = f"\033[31mfailed jit build [{md_name}]\033[0m"
+            logger.error(
+                f"{tag}\u2193\u2193\u2193\u2193\u2193\u2193\u2193\u2193\u2193\u2193\n-->[History]: {{}}{tag}\u2191\u2191\u2191\u2191\u2191\u2191\u2191\u2191\u2191\u2191".format(
+                    re.sub(
+                        "error:",
+                        "\033[31merror:\033[0m",
+                        "-->".join(traceback.format_exception(*sys.exc_info())),
+                        flags=re.IGNORECASE,
+                    ),
+                )
+            )
+            raise RuntimeError(
+                f"[aiter] build [{md_name}] under {opbd_dir} failed !!!!!!"
+            ) from error
+
+        sources = rename_cpp_to_cu(srcs, src_dir, hipify)
+
+        flags_cc = ["-O3", "-std=c++20", "-Wno-unknown-warning-option"]
+        flags_hip = [
+            "-DLEGACY_HIPBLAS_DIRECT",
+            "-DUSE_PROF_API=1",
+            "-D__HIP_PLATFORM_HCC__=1",
+            "-D__HIP_PLATFORM_AMD__=1",
+            "-U__HIP_NO_HALF_CONVERSIONS__",
+            "-U__HIP_NO_HALF_OPERATORS__",
+            # "-v --save-temps",
+            "-Wno-unused-result",
+            "-Wno-switch-bool",
+            "-Wno-vla-cxx-extension",
+            "-Wno-undefined-func-template",
+            "-Wno-macro-redefined",
+            "-Wno-missing-template-arg-list-after-template-kw",
+            "-fgpu-flush-denormals-to-zero",
+            f"-DDLLVM_MAIN_REVISION={check_LLVM_MAIN_REVISION()}",
+        ]
+        if not AITER_DISABLE_KERNARG_PRELOAD:
+            flags_hip += ["-mllvm --amdgpu-kernarg-preload-count=32"]
+
+        # Imitate https://github.com/ROCm/composable_kernel/blob/c8b6b64240e840a7decf76dfaa13c37da5294c4a/CMakeLists.txt#L190-L214
+        hip_version = parse(get_hip_version().split()[-1].rstrip("-").replace("-", "+"))
+        if hip_version <= Version("6.3.42132"):
+            flags_hip += ["-mllvm --amdgpu-enable-max-ilp-scheduling-strategy=1"]
+        if hip_version > Version("5.5.00000"):
+            flags_hip += ["-mllvm --lsr-drop-solution=1"]
+        if hip_version > Version("5.7.23302"):
+            flags_hip += ["-fno-offload-uniform-block"]
+        if hip_version > Version("6.1.40090"):
+            flags_hip += ["-mllvm -enable-post-misched=0"]
+        if hip_version > Version("6.2.41132"):
+            flags_hip += [
+                "-mllvm -amdgpu-early-inline-all=true",
+                "-mllvm -amdgpu-function-calls=false",
+            ]
+        if hip_version > Version("6.2.41133"):
+            flags_hip += ["-mllvm -amdgpu-coerce-illegal-types=1"]
+        if get_gfx() != "gfx942" and int(os.getenv("AITER_FP4x2", "1")) > 0:
+            flags_hip += ["-D__Float4_e2m1fn_x2"]
+        # Cluster launch is a HOST-side API question (hipDrvLaunchKernelEx +
+        # HIP_LAUNCH_CONFIG appear in ROCm 7.0), not a question about which GPU
+        # this machine has -- so the arch test must accept a cross-compile for
+        # gfx1250 the way the gfx1250 flags in optCompilerConfig.json already do.
+        # get_gfx() alone reads the LAST entry of a multi-arch GPU_ARCHS, which
+        # left "gfx1250;gfx942" building gfx1250 kernels whose cluster launch
+        # path was compiled out (AiterAsmKernelFast then rejects them at launch).
+        if (
+            get_gfx() == "gfx1250" or "gfx1250" in os.environ.get("GPU_ARCHS", "")
+        ) and hip_version >= Version("7.0.0"):
+            flags_hip += ["-DAITER_ENABLE_CLUSTER_LAUNCH"]
+
+        if not torch_exclude:
+            import torch
+
+            if hasattr(torch, "float4_e2m1fn_x2"):
+                flags_hip += ["-DTORCH_Float4_e2m1fn_x2"]
+
+        enable_ck = int(os.environ.get("ENABLE_CK", "1"))
+        if not any("ENABLE_CK" in f for f in flags_extra_cc):
+            flags_cc.append(f"-DENABLE_CK={enable_ck}")
+
+        enable_rope_positions_int32 = int(
+            os.environ.get("ENABLE_ROPE_POSITIONS_INT32", "0")
+        )
+        if not any("ENABLE_ROPE_POSITIONS_INT32" in f for f in flags_extra_cc):
+            flags_cc.append(
+                f"-DENABLE_ROPE_POSITIONS_INT32={enable_rope_positions_int32}"
+            )
+            flags_hip.append(
+                f"-DENABLE_ROPE_POSITIONS_INT32={enable_rope_positions_int32}"
+            )
+
+        # ASM kernel debug instrumentation (host prints + post-launch sync) in
+        # *.cu is compiled only when AITER_ASM_DEBUG=1, mirroring poc_kl's
+        # `compile-dbg` / -DASM_DEBUG. Default builds stay free of debug code.
+        if int(os.environ.get("AITER_ASM_DEBUG", "0")) != 0 and not any(
+            "ASM_DEBUG" in f for f in flags_extra_hip
+        ):
+            flags_hip.append("-DASM_DEBUG")
+
+        flags_cc += flags_extra_cc
+        flags_hip += flags_extra_hip
+        archs = validate_and_update_archs()
+        flags_hip += [f"--offload-arch={arch}" for arch in archs]
+        flags_hip = sorted(set(flags_hip))  # remove same flags
+        flags_hip = [el for el in flags_hip if hip_flag_checker(el)]
+        check_and_set_ninja_worker()
+
+        blob_dir = f"{op_dir}/blob"
+        staged_blob_dir = None
+        staged_token = None
+        compiled_kids_snapshot = None
+        seed_files = None
+        if md_name == "module_deepgemm_opus":
+            seed_files = [
+                (
+                    f"{bd_dir}/compiled_kids_opus.json",
+                    "compiled_kids_opus.json",
+                )
+            ]
+        try:
+            sources, staged_blob_dir, staged_token = _stage_blob_sources(
+                blob_gen_cmd,
+                op_dir,
+                src_dir,
+                sources,
+                hipify,
+                seed_files=seed_files,
+            )
+            if staged_blob_dir is not None and md_name == "module_deepgemm_opus":
+                compiled_kids_snapshot = snapshot_compiled_kids(
+                    f"{staged_blob_dir}/compiled_kids_opus.json"
+                )
+                require_blob_generation(staged_blob_dir, staged_token)
+        except Exception as error:  # noqa: BLE001
+            raise_build_error(error)
+        active_blob_dir = staged_blob_dir or blob_dir
+
+        extra_include_paths = []
+
+        _is_ckfree = not os.path.isdir(CK_3RDPARTY_DIR)
+        if not _is_ckfree:
+            extra_include_paths += [
+                f"{CK_HELPER_DIR}",
+                f"{CK_3RDPARTY_DIR}/include",
+                f"{CK_3RDPARTY_DIR}/library/include",
+            ]
+        else:
+            # When CK is not available, define AITER_CK_FREE for all modules
+            # so headers use lightweight shims instead of ck_tile/core.hpp
+            flags_cc.append("-DAITER_CK_FREE=1")
+
+        if os.path.isdir(HIP_KITTENS_DIR):
+            extra_include_paths += [
+                f"{HIP_KITTENS_DIR}/include",
+            ]
+
+        extra_include_paths = [p for p in extra_include_paths if os.path.isdir(str(p))]
+
+        if not hipify:
+            _extra_inc = extra_include
+            if _is_ckfree:
+                _extra_inc = [p for p in extra_include if os.path.isdir(str(p))]
+            extra_include_paths += [
+                f"{AITER_CSRC_DIR}/include",
+                active_blob_dir,
+            ] + _extra_inc
+            if not is_standalone and not torch_exclude:
+                extra_include_paths += [f"{AITER_CSRC_DIR}/include/torch"]
+        else:
+            old_bd_include_dir = f"{op_dir}/build/include"
+            extra_include_paths.append(old_bd_include_dir)
+            os.makedirs(old_bd_include_dir, exist_ok=True)
+            rename_cpp_to_cu(
+                [f"{AITER_CSRC_DIR}/include"] + extra_include,
+                old_bd_include_dir,
+                hipify,
+            )
+
+            if not is_standalone and not torch_exclude:
+                bd_include_dir = f"{op_dir}/build/include/torch"
+                os.makedirs(bd_include_dir, exist_ok=True)
+                rename_cpp_to_cu(
+                    [f"{AITER_CSRC_DIR}/include/torch"],
+                    bd_include_dir,
+                    hipify,
+                )
+
+        try:
+
+            def validate_generation():
+                if staged_blob_dir is not None:
+                    require_blob_generation(staged_blob_dir, staged_token)
+
+            validate_generation()
+            _jit_compile(
+                md_name,
+                sorted(set(sources)),
+                extra_cflags=flags_cc,
+                extra_cuda_cflags=flags_hip,
+                extra_ldflags=extra_ldflags,
+                extra_include_paths=extra_include_paths,
+                build_directory=opbd_dir,
+                verbose=verbose or AITER_LOG_MORE > 0,
+                with_cuda=True,
+                is_python_module=is_python_module,
+                is_standalone=is_standalone,
+                torch_exclude=torch_exclude,
+                hipify=hipify,
+                extra_cuda_cflags_per_source=flags_extra_hip_per_source,
+                # We install a stable module name. Let Ninja check incremental
+                # dependencies and retry failures, not the Python loader cache.
+                use_versioner=False,
+            )
+            validate_generation()
+            if is_python_module and not is_standalone:
+                artifact_path = f"{get_user_jit_dir()}/{target_name}"
+            else:
+                artifact_path = f"{AITER_ROOT_DIR}/op_tests/cpp/mha/{target_name}"
+            installed_identity = atomic_copy(
+                f"{opbd_dir}/{target_name}",
+                artifact_path,
+                validate=validate_generation,
+            )
+        except Exception as error:  # noqa: BLE001
+            raise_build_error(error)
+
+        if staged_blob_dir is not None:
+            if md_name == "module_deepgemm_opus":
+                try:
+                    publish_compiled_kids(
+                        compiled_kids_snapshot,
+                        f"{bd_dir}/compiled_kids_opus.json",
+                        artifact_path,
+                        installed_identity,
+                    )
+                except Exception:
+                    # A stale receipt cannot validate the newly installed .so.
+                    # Do not make a successful build fail because of metadata.
+                    logger.warning(
+                        "JIT build [%s] succeeded, but publishing its compiled-kid "
+                        "metadata failed; the tuner will revalidate by rebuilding",
+                        md_name,
+                        exc_info=AITER_LOG_MORE > 0,
+                    )
+            try:
+                publish_blob_sources(
+                    staged_blob_dir, blob_dir, expected_token=staged_token
+                )
+            except Exception:
+                logger.warning(
+                    "JIT build [%s] succeeded, but publishing its generated-source "
+                    "cache failed; keeping the installed artifact",
+                    md_name,
+                    exc_info=AITER_LOG_MORE > 0,
+                )
+
+    def FinalFunc():
+        logger.info(
+            f"[pid={os.getpid()} pname={multiprocessing.current_process().name}] "
+            f"\033[32mfinish build [{md_name}], cost {time.perf_counter() - startTS:.1f}s \033[0m"
+        )
+
+    mp_lock(
+        lockPath=lock_path,
+        MainFunc=MainFunc,
+        FinalFunc=FinalFunc,
+        build_after_wait=build_after_wait,
+    )
+
+
+def _get_ck_exclude_modules():
+    """Return set of module names that require CK and should be excluded in CK-free builds.
+
+    Combines two detection methods:
+    1. Config pattern matching -- modules whose optCompilerConfig.json entry references
+       CK_DIR, py_itfs_ck, gen_instances, or generate.py
+    2. Hardcoded list -- modules with deep ck_tile:: source-level dependencies that
+       aren't caught by config pattern matching
+
+    V3 ASM modules are exempted because they build with shim headers only.
+    """
+    cfg_path = os.path.join(this_dir, "optCompilerConfig.json")
+    try:
+        with open(cfg_path, "r", encoding="utf-8") as f:
+            config_data = json.load(f)
+    except Exception:  # noqa: BLE001
+        config_data = {}
+
+    # Pattern-matched CK modules
+    ck_patterns = ["CK_DIR", "py_itfs_ck", "gen_instances", "generate.py"]
+    ck_modules = set()
+    for mod_name, mod_cfg in config_data.items():
+        mod_str = json.dumps(mod_cfg)
+        if any(p in mod_str for p in ck_patterns):
+            ck_modules.add(mod_name)
+
+    # V3 ASM modules can build with shim headers -- exempt them
+    v3_flags = ["FAV3_ON", "ONLY_FAV3"]
+    for mod_name, mod_cfg in config_data.items():
+        flags_str = json.dumps(mod_cfg.get("flags_extra_cc", []))
+        if any(f in flags_str for f in v3_flags):
+            ck_modules.discard(mod_name)
+
+    # Modules with deep ck_tile:: source-level deps not caught by config patterns
+    ck_modules |= {
+        "module_activation",
+        "module_cache",
+        "module_fused_qk_norm_mrope_cache_quant_shuffle",
+        "module_fused_qk_norm_rope_cache_quant_shuffle",
+        "module_inverse_rope_group_quant",
+        "module_mla_metadata",
+        "module_mla_reduce",
+        "module_moe_asm",
+        "module_pa_metadata",
+        "module_ps_metadata",
+        "module_quant",
+        "module_rmsnorm_quant",
+        "module_rope_1c_uncached_fwd",
+        "module_rope_1c_uncached_bwd",
+        "module_rope_2c_uncached_fwd",
+        "module_rope_2c_uncached_bwd",
+        "module_rope_1c_cached_fwd",
+        "module_rope_1c_cached_bwd",
+        "module_rope_2c_cached_fwd",
+        "module_rope_2c_cached_bwd",
+        "module_rope_1c_thd_fwd",
+        "module_rope_1c_thd_bwd",
+        "module_rope_1c_2d_fwd",
+        "module_rope_1c_2d_bwd",
+        "module_rope_1c_cached_positions_fwd",
+        "module_rope_2c_cached_positions_fwd",
+        "module_rope_1c_cached_positions_offsets_fwd",
+        "module_rope_2c_cached_positions_offsets_fwd",
+        "module_sample",
+        "module_topk_plain",
+    }
+
+    return ck_modules
+
+
+def get_args_of_build(ops_name: str, exclude=None):
+    if exclude is None:
+        exclude = []
+    d_opt_build_args = {
+        "srcs": [],
+        "md_name": "",
+        "flags_extra_cc": [],
+        "flags_extra_hip": [],
+        "extra_ldflags": None,
+        "extra_include": [],
+        "verbose": False,
+        "is_python_module": True,
+        "is_standalone": False,
+        "torch_exclude": False,
+        "hip_clang_path": None,
+        "blob_gen_cmd": "",
+        "third_party": [],
+        # Optional per-source HIP flags. Maps a source path or fnmatch
+        # glob (e.g. "*_device.cu") to a list of additional flags that
+        # ninja will append to that single TU's $cuda_post_cflags. Used
+        # by opus_gemm to apply -D__HIPCC_RTC__ to kernel-only TUs while
+        # leaving dispatcher / pybind TUs untouched.
+        "flags_extra_hip_per_source": {},
+    }
+
+    def convert(d_ops: dict):
+        for k, val in d_ops.items():
+            # `flags_extra_hip_per_source` is a dict-valued field
+            # whose string elements are plain compile flags (no env-var
+            # interpolation, no `eval`). Pass it through unchanged.
+            if k == "flags_extra_hip_per_source":
+                continue
+            if isinstance(val, list):
+                for idx, el in enumerate(val):
+                    if isinstance(el, str):
+                        if "torch" in el:
+                            # Bound solely for the eval() below: these config
+                            # strings can reference torch (e.g.
+                            # torch.utils.cmake_prefix_path). Static analysis
+                            # cannot see that use, hence the noqa.
+                            import torch  # noqa: F401
+                        val[idx] = eval(el)
+                d_ops[k] = val
+            elif isinstance(val, str):
+                d_ops[k] = eval(val)
+            else:
+                pass
+
+        # Use a fresh copy so keys from previous modules don't leak
+        result = dict(d_opt_build_args)
+        result.update(d_ops)
+        return result
+
+    with open(this_dir + "/optCompilerConfig.json", "r") as file:
+        data = json.load(file)
+        if isinstance(data, dict):
+            # parse all ops, return list
+            if ops_name == "all":
+                # Auto-exclude CK-dependent modules in CK-free builds
+                if not os.path.isdir(CK_3RDPARTY_DIR):
+                    ck_excludes = _get_ck_exclude_modules()
+                    exclude = list(set(exclude) | ck_excludes)
+                    logger.info(
+                        f"[CK-free] Auto-excluding {len(ck_excludes)} CK-dependent modules"
+                    )
+                all_ops_list = []
+                d_all_ops = {
+                    "flags_extra_cc": [],
+                    "flags_extra_hip": [],
+                    "extra_include": [],
+                    "blob_gen_cmd": [],
+                }
+                # traverse opts
+                for op_name, d_ops in data.items():
+                    # Cannot contain tune ops
+                    if op_name.endswith("tune"):
+                        continue
+                    # exclude
+                    if op_name in exclude:
+                        continue
+                    single_ops = convert(d_ops)
+                    # exclude experimental ops if AITER_ENABLE_EXPERIMENTAL is not set
+                    if not is_experimental_enabled() and single_ops.get(
+                        "is_experimental", False
+                    ):
+                        continue
+                    d_single_ops = {
+                        "md_name": op_name,
+                        "srcs": single_ops["srcs"],
+                        "flags_extra_cc": single_ops["flags_extra_cc"],
+                        "flags_extra_hip": single_ops["flags_extra_hip"],
+                        "extra_ldflags": single_ops["extra_ldflags"],
+                        "extra_include": single_ops["extra_include"],
+                        "blob_gen_cmd": single_ops["blob_gen_cmd"],
+                        "third_party": single_ops["third_party"],
+                        "torch_exclude": single_ops["torch_exclude"],
+                    }
+                    for (  # noqa: PLC0206  loop mutates d_all_ops[k] by key while reading single_ops[k]; .items() does not help
+                        k
+                    ) in d_all_ops:
+                        if isinstance(single_ops[k], list):
+                            d_all_ops[k] += single_ops[k]
+                        elif isinstance(single_ops[k], str) and single_ops[k] != "":
+                            d_all_ops[k].append(single_ops[k])
+                    all_ops_list.append(d_single_ops)
+
+                return all_ops_list, d_all_ops
+            # no find opt_name in json.
+            elif data.get(ops_name) is None:
+                logger.warning(
+                    "Not found this operator ("
+                    + ops_name
+                    + ") in 'optCompilerConfig.json'. "
+                )
+                return d_opt_build_args
+            # parser single opt
+            else:
+                compile_ops_ = data.get(ops_name)
+                return convert(compile_ops_)
+        else:
+            logger.warning(
+                "ERROR: pls use dict_format to write 'optCompilerConfig.json'! "
+            )
+
+
+def _is_union(origin):
+    """Check for both typing.Union (Optional[X]) and types.UnionType (X | None)."""
+    return origin is typing.Union or origin is types.UnionType
+
+
+# Per-parameter conversion kinds, resolved once per op from the type hints (see
+# _ensure_loaded) so the per-call loop is an int compare instead of a fresh
+# typing.get_origin/get_args round trip. _ARG_SCALAR covers int/float/anything
+# else: with c_func.argtypes declared, ctypes converts the raw Python value.
+(
+    _ARG_TENSOR,
+    _ARG_OPT_TENSOR,
+    _ARG_OPT_INT,
+    _ARG_OPT_STR,
+    _ARG_STR,
+    _ARG_BOOL,
+    _ARG_SCALAR,
+) = range(7)
+
+
+def _ctypes_call(func, fc_name, md_name):
+    """Build a ctypes-based caller for a torch-free .so module.
+
+    Type-hint to C ABI mapping
+    -------------------------------------------------------
+    Python annotation     | ctypes type          | C type
+    ----------------------|----------------------|---------
+    Tensor                | POINTER(aiter_tensor_t) | aiter_tensor_t*
+    Optional[Tensor]      | POINTER(aiter_tensor_t) | aiter_tensor_t* (NULL if None)
+    int                   | c_int64              | int64_t
+    Optional[int]         | c_int64              | int64_t (-1 if None)
+    str                   | c_char_p             | char* (.encode())
+    Optional[str]         | c_char_p             | char* (NULL if None)
+    bool                  | c_int                | int   (0 / 1)
+    float                 | c_float              | float
+    (other)               | c_void_p             | void*
+    (auto-appended)       | c_void_p             | hipStream_t
+    -------------------------------------------------------
+    """
+    import ctypes
+    import inspect
+
+    import torch
+
+    from ..utility.dtypes import aiter_tensor_t, torch_to_aiter
+
+    # Avoid constructing a Python Stream object on every ctypes invocation.
+    # Keep the public API fallback for torch versions without the private raw
+    # stream getter, and preserve the first tensor's device selection.
+    raw_stream = getattr(torch._C, "_cuda_getCurrentRawStream", None)
+    if raw_stream is None:
+
+        def raw_stream(device_index):
+            return torch.cuda.current_stream(device_index).cuda_stream
+
+    current_device = torch.cuda.current_device
+
+    _cache = {}
+    _arg_checked = False
+    _sig = inspect.signature(func)
+    _hints = typing.get_type_hints(func)
+
+    def _ensure_loaded():
+        if _cache:
+            return
+        so_path = os.path.join(get_user_jit_dir(), f"{md_name}.so")
+        if not os.path.exists(so_path) or _needs_arch_rebuild(md_name):
+            d_args = get_args_of_build(md_name)
+            d_args["torch_exclude"] = True
+            build_module(
+                md_name,
+                d_args["srcs"],
+                d_args["flags_extra_cc"],
+                d_args["flags_extra_hip"],
+                d_args["blob_gen_cmd"],
+                d_args["extra_include"],
+                d_args["extra_ldflags"],
+                d_args["verbose"],
+                d_args["is_python_module"],
+                d_args["is_standalone"],
+                d_args["torch_exclude"],
+                d_args.get("third_party", []),
+                flags_extra_hip_per_source=d_args.get("flags_extra_hip_per_source", {}),
+            )
+        lib = ctypes.CDLL(so_path)
+        c_func = getattr(lib, fc_name)
+
+        def _opt_sym(name, argtypes=(), restype=None):
+            fn = getattr(lib, name, None)
+            if fn is not None:
+                fn.argtypes = list(argtypes)
+                fn.restype = restype
+            return fn
+
+        abi_fn = _opt_sym("aiter_ctypes_abi_version", restype=ctypes.c_int)
+        ctypes_abi_version = abi_fn() if abi_fn else 1
+        ctypes_status_mode = ctypes_abi_version >= 2
+        err_getter = _opt_sym("aiter_get_last_error", restype=ctypes.c_char_p)
+        err_clear = _opt_sym("aiter_clear_last_error")
+
+        ret_hint = _hints.get("return")
+        ctypes_data_return = ctypes_status_mode and ret_hint is int
+
+        if ctypes_status_mode or ret_hint is int:
+            c_func.restype = ctypes.c_int
+        elif ret_hint is float:
+            c_func.restype = ctypes.c_float
+        else:
+            c_func.restype = None
+
+        # `argtypes` and `kinds` are produced by the SAME pass over the type
+        # hints, so the ctypes type a parameter is declared as and the branch
+        # caller() takes for it can never drift apart. Hints are static, so this
+        # runs once per op instead of on every call.
+        argtypes = []
+        kinds = []
+        has_tensor = False
+        for pname in _sig.parameters:
+            hint = _hints.get(pname)
+            origin = typing.get_origin(hint)
+            type_args = typing.get_args(hint)
+            if hint is torch.Tensor:
+                argtypes.append(ctypes.POINTER(aiter_tensor_t))
+                kinds.append(_ARG_TENSOR)
+                has_tensor = True
+            elif _is_union(origin) and torch.Tensor in type_args:
+                argtypes.append(ctypes.POINTER(aiter_tensor_t))
+                kinds.append(_ARG_OPT_TENSOR)
+                has_tensor = True
+            elif _is_union(origin) and int in type_args:
+                argtypes.append(ctypes.c_int64)
+                kinds.append(_ARG_OPT_INT)
+            elif _is_union(origin) and str in type_args:
+                argtypes.append(ctypes.c_char_p)
+                kinds.append(_ARG_OPT_STR)
+            elif hint is str:
+                argtypes.append(ctypes.c_char_p)
+                kinds.append(_ARG_STR)
+            elif hint is bool:
+                argtypes.append(ctypes.c_int)
+                kinds.append(_ARG_BOOL)
+            elif hint is int:
+                argtypes.append(ctypes.c_int64)
+                kinds.append(_ARG_SCALAR)
+            elif hint is float:
+                argtypes.append(ctypes.c_float)
+                kinds.append(_ARG_SCALAR)
+            else:
+                argtypes.append(ctypes.c_void_p)
+                kinds.append(_ARG_SCALAR)
+        # hipStream_t: the caller always appends the current stream to the args, so the
+        # argtypes must always declare it -- otherwise ctypes takes the variadic path
+        # (ffi_prep_cif_var) for torch-free modules whose params are all non-tensor, which
+        # fails on stricter libffi builds.
+        argtypes.append(ctypes.c_void_p)  # hipStream_t
+        c_func.argtypes = argtypes
+
+        # Positional fast path in caller(): with no *args/**kwargs/keyword-only
+        # parameters, the values are already in parameter order, so inspect's
+        # binding machinery has nothing to figure out. Anything else (kwargs,
+        # too few args) falls back to _sig.bind so error messages and binding
+        # semantics stay exactly as they were.
+        params = list(_sig.parameters.values())
+        fast_ok = all(p.kind is inspect.Parameter.POSITIONAL_OR_KEYWORD for p in params)
+        empty = inspect.Parameter.empty
+
+        _cache["lib"] = lib
+        _cache["c_func"] = c_func
+        _cache["err_getter"] = err_getter
+        _cache["err_clear"] = err_clear
+        _cache["ctypes_status_mode"] = ctypes_status_mode
+        _cache["ctypes_data_return"] = ctypes_data_return
+        _cache["has_tensor"] = has_tensor
+        _cache["kinds"] = tuple(kinds)
+        _cache["names"] = tuple(_sig.parameters)
+        _cache["defaults"] = tuple(
+            None if p.default is empty else p.default for p in params
+        )
+        _cache["n_params"] = len(params)
+        _cache["n_required"] = sum(1 for p in params if p.default is empty)
+        _cache["fast_ok"] = fast_ok
+        # A NULL aiter_tensor_t* carries no state, so one instance is reused for
+        # every omitted Optional[Tensor] instead of allocating per call.
+        _cache["null_tensor"] = ctypes.POINTER(aiter_tensor_t)()
+
+    def _check_args_before_convert(bound_args, hints):
+        for pname, value in bound_args.items():
+            hint = hints.get(pname)
+            origin = typing.get_origin(hint)
+            type_args = typing.get_args(hint)
+
+            if hint is torch.Tensor:
+                if not isinstance(value, torch.Tensor):
+                    raise TypeError(
+                        f"{fc_name}: '{pname}' expects torch.Tensor, "
+                        f"got {type(value).__name__}"
+                    )
+            elif _is_union(origin) and torch.Tensor in type_args:
+                if value is not None and not isinstance(value, torch.Tensor):
+                    raise TypeError(
+                        f"{fc_name}: '{pname}' expects Optional[torch.Tensor], "
+                        f"got {type(value).__name__}"
+                    )
+            elif _is_union(origin) and int in type_args:
+                if value is not None and not isinstance(value, int):
+                    raise TypeError(
+                        f"{fc_name}: '{pname}' expects Optional[int], "
+                        f"got {type(value).__name__}"
+                    )
+            elif _is_union(origin) and str in type_args:
+                if value is not None and not isinstance(value, str):
+                    raise TypeError(
+                        f"{fc_name}: '{pname}' expects Optional[str], "
+                        f"got {type(value).__name__}"
+                    )
+            elif hint is str:
+                if not isinstance(value, str):
+                    raise TypeError(
+                        f"{fc_name}: '{pname}' expects str, got {type(value).__name__}"
+                    )
+            elif hint is bool:
+                if not isinstance(value, (bool, int)):
+                    raise TypeError(
+                        f"{fc_name}: '{pname}' expects bool, got {type(value).__name__}"
+                    )
+            elif hint is int:
+                if not isinstance(value, int):
+                    raise TypeError(
+                        f"{fc_name}: '{pname}' expects int, got {type(value).__name__}"
+                    )
+            elif hint is float and not isinstance(value, (float, int)):
+                raise TypeError(
+                    f"{fc_name}: '{pname}' expects float, "
+                    f"got {type(value).__name__}"
+                )
+
+    def caller(*args, **kwargs):
+        nonlocal _arg_checked
+        _ensure_loaded()
+        c_func = _cache["c_func"]
+        err_getter = _cache.get("err_getter")
+        err_clear = _cache.get("err_clear")
+        ctypes_status_mode = _cache.get("ctypes_status_mode", False)
+        ctypes_data_return = _cache.get("ctypes_data_return", False)
+
+        if AITER_LOG_MORE == 2:
+            from ..test_common import log_args
+
+            log_args(func, *args, **kwargs)
+
+        kinds = _cache["kinds"]
+        n_params = _cache["n_params"]
+        n_args = len(args)
+        if (
+            _cache["fast_ok"]
+            and not kwargs
+            and _cache["n_required"] <= n_args <= n_params
+        ):
+            # Already in parameter order; only the omitted tail needs defaults.
+            defaults = _cache["defaults"]
+            values = args if n_args == n_params else args + defaults[n_args:]
+        else:
+            # kwargs, a missing required arg, or an exotic signature -- let
+            # inspect do the binding (and raise the usual TypeError).
+            bound = _sig.bind(*args, **kwargs)
+            bound.apply_defaults()
+            values = tuple(bound.arguments.values())
+
+        if not _arg_checked:
+            _check_args_before_convert(dict(zip(_cache["names"], values)), _hints)
+            _arg_checked = True
+
+        c_args = []
+        aiter_refs = []
+        tensor_device = None
+        add_arg = c_args.append
+        keep_alive = aiter_refs.append
+
+        null_tensor = _cache["null_tensor"]
+
+        for kind, value in zip(kinds, values):
+            if kind == _ARG_SCALAR:
+                # int / float / anything else: c_func.argtypes drives the
+                # conversion, so the raw Python value goes straight through.
+                add_arg(value)
+            elif kind == _ARG_TENSOR:
+                if tensor_device is None:
+                    tensor_device = value.get_device()
+                at = torch_to_aiter(value)
+                keep_alive(at)
+                add_arg(ctypes.byref(at))
+            elif kind == _ARG_OPT_TENSOR:
+                if value is not None:
+                    if tensor_device is None:
+                        tensor_device = value.get_device()
+                    at = torch_to_aiter(value)
+                    keep_alive(at)
+                    add_arg(ctypes.byref(at))
+                else:
+                    add_arg(null_tensor)
+            elif kind == _ARG_OPT_INT:
+                add_arg(value if value is not None else -1)
+            elif kind == _ARG_OPT_STR:
+                add_arg(value.encode() if value is not None else None)
+            elif kind == _ARG_STR:
+                add_arg(value.encode())
+            else:  # _ARG_BOOL
+                add_arg(1 if value else 0)
+
+        if tensor_device is None:
+            tensor_device = current_device()
+        c_args.append(ctypes.c_void_p(raw_stream(tensor_device)))
+        if err_clear is not None:
+            err_clear()
+        ret = c_func(*c_args)
+
+        err_msg = None
+        if ctypes_status_mode and not ctypes_data_return and ret != 0:
+            err_msg = f"ctypes status={ret}"
+        if err_getter is not None:
+            raw = err_getter()
+            if raw:
+                err_msg = raw.decode(errors="replace")
+        if err_msg is not None:
+            if err_clear is not None:
+                err_clear()
+            raise RuntimeError(f"{fc_name} failed: {err_msg}")
+
+        if ctypes_data_return:
+            return ret
+        if ctypes_status_mode:
+            return None
+        return ret
+
+    return caller
+
+
+_pybind_develop_hooks_cache = None
+
+
+def _pybind_develop_hooks():
+    """Everything the develop=True pybind path needs, resolved once.
+
+    All four are per-call on that path -- the converter runs once per tensor
+    argument -- and importing them inside the wrapper meant a sys.modules round
+    trip each time for names that never change. aiter.utility.dtypes imports back
+    into this module, so binding them at import time is not an option either.
+    """
+    global _pybind_develop_hooks_cache
+    if _pybind_develop_hooks_cache is None:
+        import torch
+
+        from ..utility.dtypes import torch_to_aiter_pybind
+
+        # Hands back the same handle as current_stream().cuda_stream without
+        # building the Python Stream object to carry it. Private, so fall back to
+        # the public spelling rather than assume a torch version floor.
+        raw_stream = getattr(torch._C, "_cuda_getCurrentRawStream", None)
+        if raw_stream is None:
+
+            def raw_stream(_device_index):
+                return torch.cuda.current_stream().cuda_stream
+
+        _pybind_develop_hooks_cache = (
+            torch_to_aiter_pybind,
+            torch.Tensor,
+            raw_stream,
+            torch.cuda.current_device,
+        )
+    return _pybind_develop_hooks_cache
+
+
+def compile_ops(
+    _md_name: str,
+    fc_name: str | None = None,
+    gen_func: Callable[..., dict[str, Any]] | None = None,
+    gen_fake: Callable[..., Any] | None = None,
+    ffi_type: str = "pybind",
+    develop: bool = False,
+):
+    def decorator(func):
+        loadName = fc_name if fc_name is not None else func.__name__
+
+        if ffi_type == "ctypes":
+            ctypes_caller = _ctypes_call(func, loadName, _md_name)
+
+            @functools.wraps(func)
+            def ctypes_wrapper(*args, **kwargs):
+                return ctypes_caller(*args, **kwargs)
+
+            @torch_compile_guard(device="cuda", calling_func_=func)
+            def ctypes_custom_wrapper(*args, **kwargs):
+                return ctypes_wrapper(*args, **kwargs)
+
+            return ctypes_custom_wrapper
+
+        elif ffi_type == "pybind":
+            func.arg_checked = False
+
+            @functools.wraps(func)
+            def wrapper(*args, custom_build_args=None, **kwargs):
+
+                if custom_build_args is None:
+                    custom_build_args = {}
+                md_name = _md_name
+                try:
+                    module = None
+                    if gen_func is not None:
+                        custom_build_args.update(gen_func(*args, **kwargs))
+                    elif AITER_REBUILD and md_name not in rebuilded_list:
+                        rebuilded_list.append(md_name)
+                        raise ModuleNotFoundError("start rebuild")
+                    if module is None:
+                        md = custom_build_args.get("md_name", md_name)
+                        module = get_module(md)
+                except ModuleNotFoundError:
+                    d_args = get_args_of_build(md_name)
+                    d_args.update(custom_build_args)
+
+                    md_name = custom_build_args.get("md_name", md_name)
+
+                    srcs = d_args["srcs"]
+                    flags_extra_cc = d_args["flags_extra_cc"]
+                    flags_extra_hip = d_args["flags_extra_hip"]
+                    blob_gen_cmd = d_args["blob_gen_cmd"]
+                    extra_include = d_args["extra_include"]
+                    extra_ldflags = d_args["extra_ldflags"]
+                    verbose = d_args["verbose"]
+                    is_python_module = d_args["is_python_module"]
+                    is_standalone = d_args["is_standalone"]
+                    torch_exclude = d_args["torch_exclude"]
+                    hipify = d_args.get("hipify", False)
+                    hip_clang_path = d_args.get("hip_clang_path", None)
+                    third_party = d_args.get("third_party", [])
+                    prev_hip_clang_path = None
+                    if hip_clang_path is not None and os.path.exists(hip_clang_path):
+                        prev_hip_clang_path = os.environ.get("HIP_CLANG_PATH", None)
+                        os.environ["HIP_CLANG_PATH"] = hip_clang_path
+
+                    flags_extra_hip_per_source = d_args.get(
+                        "flags_extra_hip_per_source", {}
+                    )
+                    build_module(
+                        md_name,
+                        srcs,
+                        flags_extra_cc,
+                        flags_extra_hip,
+                        blob_gen_cmd,
+                        extra_include,
+                        extra_ldflags,
+                        verbose,
+                        is_python_module,
+                        is_standalone,
+                        torch_exclude,
+                        third_party,
+                        hipify,
+                        flags_extra_hip_per_source=flags_extra_hip_per_source,
+                    )
+
+                    if hip_clang_path is not None:
+                        if prev_hip_clang_path is not None:
+                            os.environ["HIP_CLANG_PATH"] = prev_hip_clang_path
+                        else:
+                            os.environ.pop("HIP_CLANG_PATH", None)
+
+                    if is_python_module:
+                        module = get_module(md_name)
+                    if md_name not in __mds:
+                        __mds[md_name] = module
+
+                if isinstance(module, types.ModuleType):
+                    op = getattr(module, loadName)
+                else:
+                    return None
+
+                def check_args():
+                    get_asm_dir()
+                    import inspect
+                    import re
+
+                    import torch
+
+                    enum_types = ["ActivationType", "QuantType", "MlaVersion"]
+
+                    if not op.__doc__.startswith("Members:"):
+                        doc_str = op.__doc__.split("\n")[0]
+                        doc_str = re.sub(r"<(.*?)\:.*?>", r"\g<1>", doc_str)
+                        doc_str = doc_str.replace("list[", "List[")
+                        doc_str = doc_str.replace("tuple[", "Tuple[")
+                        doc_str = doc_str.replace("collections.abc.Sequence[", "List[")
+                        doc_str = doc_str.replace("typing.SupportsInt", "int")
+                        doc_str = doc_str.replace("typing.SupportsFloat", "float")
+                        doc_str = re.sub(r"\s*\|\s*typing\.SupportsIndex", "", doc_str)
+                        pattern = r"([\w\.]+(?:\[[^\]]+\])?)\s*\|\s*None"
+                        doc_str = re.sub(pattern, r"Optional[\1]", doc_str)
+                        for el in enum_types:
+                            doc_str = re.sub(
+                                f" (module_)?aiter.*{el} ", f" {el} ", doc_str
+                            )
+                        doc_str = re.sub(
+                            r"(?:[\w.]+\.)?aiter_tensor_t",
+                            "aiter_tensor_t",
+                            doc_str,
+                        )
+                        try:
+                            aiter_tensor_t = get_module(
+                                "module_aiter_core"
+                            ).aiter_tensor_t
+                        except (
+                            Exception  # noqa: BLE001  blanket catch is intentional here
+                        ):
+                            aiter_tensor_t = object
+                        # Every name the doc_str rewriting above can emit has to
+                        # be bound here. `from aiter import *` in the exec below
+                        # is not a reliable source: it only ever supplied these
+                        # by accident, via submodules that happened to do
+                        # `from typing import ...` at module scope.
+                        namespace = {
+                            "List": list,
+                            "Tuple": tuple,
+                            "Optional": Optional,
+                            "torch": torch,
+                            "typing": typing,
+                            "aiter_tensor_t": aiter_tensor_t,
+                        }
+
+                        exec(  # noqa: S102
+                            f"from aiter import*\ndef {doc_str}: pass",
+                            namespace,
+                        )
+                        foo = namespace[doc_str.split("(")[0]]
+                        sig = inspect.signature(foo)
+                        func.__signature__ = sig
+                        ann = {k: v.annotation for k, v in sig.parameters.items()}
+                        ann["return"] = sig.return_annotation
+                        _tensor_types = (torch.Tensor,)
+                        if aiter_tensor_t is not object:
+                            _tensor_types = (torch.Tensor, aiter_tensor_t)
+
+                        def _is_tensor_like(obj):
+                            return isinstance(obj, _tensor_types)
+
+                        def _is_tensor_type(tp):
+                            return tp is torch.Tensor or (
+                                aiter_tensor_t is not object and tp is aiter_tensor_t
+                            )
+
+                        callargs = inspect.getcallargs(func, *args, **kwargs)
+                        for el, arg in callargs.items():
+                            expected_type = ann[el]
+                            got_type = type(arg)
+                            origin = typing.get_origin(expected_type)
+                            sub_t = typing.get_args(expected_type)
+
+                            if origin is None:
+                                if _is_tensor_type(expected_type) and _is_tensor_like(
+                                    arg
+                                ):
+                                    pass
+                                elif not isinstance(arg, expected_type) and not (
+                                    any(el in str(expected_type) for el in enum_types)
+                                    and isinstance(arg, int)
+                                ):
+                                    raise TypeError(
+                                        f"{loadName}: {el} needs to be {expected_type} but got {got_type}"
+                                    )
+                            elif origin is list:
+                                if not isinstance(arg, list):
+                                    raise TypeError(
+                                        f"{loadName}: {el} needs to be List[{sub_t}] but got {arg}"
+                                    )
+                            elif origin is typing.Union or origin is types.UnionType:
+                                if (
+                                    arg is not None
+                                    and not _is_tensor_like(arg)
+                                    and not isinstance(arg, sub_t)
+                                ):
+                                    raise TypeError(
+                                        f"{loadName}: {el} needs to be Optional[{sub_t}] but got {arg}"
+                                    )
+                            else:
+                                raise TypeError(f"Unsupported type: {expected_type}")
+
+                        func_hints = typing.get_type_hints(func)
+                        if ann["return"] is None:
+                            func_hints["return"] = None
+
+                        tensor_like_types = {torch.Tensor}
+                        if aiter_tensor_t is not object:
+                            tensor_like_types.add(aiter_tensor_t)
+
+                        enum_type_objs = tuple(
+                            namespace[el] for el in enum_types if el in namespace
+                        )
+
+                        def canonicalize_hint(hint):
+                            if hint in tensor_like_types:
+                                return ("tensor",)
+                            if hint in enum_type_objs:
+                                return int
+
+                            origin = typing.get_origin(hint)
+                            if origin in (list, list):
+                                return (
+                                    "list",
+                                    tuple(
+                                        canonicalize_hint(arg)
+                                        for arg in typing.get_args(hint)
+                                    ),
+                                )
+                            if origin is tuple:
+                                return (
+                                    "tuple",
+                                    tuple(
+                                        canonicalize_hint(arg)
+                                        for arg in typing.get_args(hint)
+                                    ),
+                                )
+                            if origin in (typing.Union, types.UnionType):
+                                return (
+                                    "union",
+                                    tuple(
+                                        sorted(
+                                            (
+                                                canonicalize_hint(arg)
+                                                for arg in typing.get_args(hint)
+                                            ),
+                                            key=repr,
+                                        )
+                                    ),
+                                )
+                            return hint
+
+                        canonical_ann = {
+                            key: canonicalize_hint(value) for key, value in ann.items()
+                        }
+                        canonical_func_hints = {
+                            key: canonicalize_hint(value)
+                            for key, value in func_hints.items()
+                        }
+
+                        if canonical_ann != canonical_func_hints:
+                            logger.warning(
+                                f"type hints mismatch, override to --> {doc_str}"
+                            )
+                    return True
+
+                if not func.arg_checked:
+                    func.arg_checked = check_args()
+
+                if AITER_LOG_MORE == 2:
+                    from ..test_common import log_args
+
+                    log_args(func, *args, **kwargs)
+                # develop=True: torch.Tensor -> pybind aiter_tensor_t before C++ (activation, CAR, ...).
+                if develop:
+                    convert, tensor_cls, raw_stream, current_device = (
+                        _pybind_develop_hooks()
+                    )
+
+                    # Both .so files are loaded by now, so their real paths are
+                    # known (a prebuilt module lives in the package dir, a JIT
+                    # one under the user jit dir; only __file__ tells them
+                    # apart). The scan of each .so happens once per process; the
+                    # tensor-argument sweep is passed as a thunk so it only runs
+                    # on the broken path.
+                    core_mod = __mds.get("module_aiter_core")
+                    if core_mod is not None:
+                        _raise_on_pybind11_abi_split(
+                            md_name,
+                            getattr(module, "__file__", "") or "",
+                            getattr(core_mod, "__file__", "") or "",
+                            lambda: any(
+                                isinstance(a, tensor_cls)
+                                for a in (*args, *kwargs.values())
+                            ),
+                        )
+
+                    args = tuple(
+                        convert(a) if isinstance(a, tensor_cls) else a for a in args
+                    )
+                    if kwargs:
+                        kwargs = {
+                            k: convert(v) if isinstance(v, tensor_cls) else v
+                            for k, v in kwargs.items()
+                        }
+
+                    module._set_current_hip_stream(raw_stream(current_device()))
+                return op(*args, **kwargs)
+
+            @torch_compile_guard(device="cuda", gen_fake=gen_fake, calling_func_=func)
+            def custom_wrapper(*args, **kwargs):
+                return wrapper(*args, **kwargs)
+
+            return custom_wrapper
+
+        else:
+            raise ValueError(
+                f"Unknown ffi_type: {ffi_type!r}, expected 'ctypes' or 'pybind'"
+            )
+
+    return decorator

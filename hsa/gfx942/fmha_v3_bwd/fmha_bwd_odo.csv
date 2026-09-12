@@ -1,0 +1,13 @@
+dtype,hdim_q,hdim_v,mask,atomic32,pssk,pddv,mode,bf16_cvt,ts_qo,ts,knl_name,co_name
+fp16,64,64,0,0,0,0,0,3,0,128,_ZN5aiter22fmha_bwd_hd64_odo_fp16E,bwd_hd64_odo_fp16.co
+fp16,64,64,0,0,0,0,1,3,0,128,_ZN5aiter28fmha_bwd_hd64_odo_fp16_groupE,bwd_hd64_odo_fp16_group.co
+bf16,64,64,0,0,0,0,0,3,0,128,_ZN5aiter22fmha_bwd_hd64_odo_bf16E,bwd_hd64_odo_bf16.co
+bf16,64,64,0,0,0,0,1,3,0,128,_ZN5aiter28fmha_bwd_hd64_odo_bf16_groupE,bwd_hd64_odo_bf16_group.co
+fp16,128,128,0,0,0,0,0,3,0,128,_ZN5aiter23fmha_bwd_hd128_odo_fp16E,bwd_hd128_odo_fp16.co
+fp16,128,128,0,0,0,0,1,3,0,128,_ZN5aiter29fmha_bwd_hd128_odo_fp16_groupE,bwd_hd128_odo_fp16_group.co
+bf16,128,128,0,0,0,0,0,3,0,128,_ZN5aiter23fmha_bwd_hd128_odo_bf16E,bwd_hd128_odo_bf16.co
+bf16,128,128,0,0,0,0,1,3,0,128,_ZN5aiter29fmha_bwd_hd128_odo_bf16_groupE,bwd_hd128_odo_bf16_group.co
+fp16,192,192,0,0,0,0,0,3,0,128,_ZN5aiter23fmha_bwd_hd192_odo_fp16E,bwd_hd192_odo_fp16.co
+fp16,192,192,0,0,0,0,1,3,0,128,_ZN5aiter29fmha_bwd_hd192_odo_fp16_groupE,bwd_hd192_odo_fp16_group.co
+bf16,192,192,0,0,0,0,0,3,0,128,_ZN5aiter23fmha_bwd_hd192_odo_bf16E,bwd_hd192_odo_bf16.co
+bf16,192,192,0,0,0,0,1,3,0,128,_ZN5aiter29fmha_bwd_hd192_odo_bf16_groupE,bwd_hd192_odo_bf16_group.co

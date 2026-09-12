@@ -1,0 +1,16 @@
+{
+    "fwd_grouped_kernel_stage1_rope": {
+        "BLOCK_N": 32,
+        "BLOCK_H": 16,
+        "num_stages": 1,
+        "waves_per_eu": 1, 
+        "matrix_instr_nonkdim": 16, 
+        "kpack": 2
+    },
+    "fwd_kernel_stage2": {
+        "num_stages": 2,
+        "waves_per_eu": 4, 
+        "matrix_instr_nonkdim": 16, 
+        "kpack": 2
+    }
+}

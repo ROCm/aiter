@@ -1,0 +1,396 @@
+// SPDX-License-Identifier: MIT
+// Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
+
+#include <torch/all.h>
+#include <ATen/hip/HIPContext.h>
+#include "mha_common.h"
+
+#include "mha_bwd.h"
+
+namespace aiter {
+namespace torch_itfs {
+std::vector<at::Tensor>
+fmha_v3_varlen_bwd(const at::Tensor &dout,                  // [total_q, hq, d_v]
+                   const at::Tensor &q,                     // [total_q, hq, d_q]
+                   const at::Tensor &k,                     // [total_k, hk, d_q]
+                   const at::Tensor &v,                     // [total_k, hk, d_v]
+                   const at::Tensor &out,                   // [total_q, hq, d_v]
+                   const at::Tensor &softmax_lse,           // [b, hq, sq]
+                   const at::Tensor &cu_seqlens_q,          // [b+1]
+                   const at::Tensor &cu_seqlens_k,          // [b+1]
+                   const int max_seqlen_q,
+                   const int max_seqlen_k,
+                   const float p_dropout,
+                   const float softmax_scale,
+                   const bool zero_tensors,
+                   const bool is_causal,
+                   int window_size_left,
+                   int window_size_right,
+                   const bool deterministic,
+                   bool is_v3_atomic_fp32,
+                   int how_v3_bf16_cvt,
+                   std::optional<at::Tensor> dq_,                 // [total_q, hq, d_q]
+                   std::optional<at::Tensor> dk_,                 // [total_k, hk, d_q]
+                   std::optional<at::Tensor> dv_,                 // [total_k, hk, d_v]
+                   std::optional<const at::Tensor> alibi_slopes_, // [hq] or [b, hq]
+                   std::optional<const at::Tensor> rng_state_,
+                   std::optional<at::Generator> gen_,
+                   std::optional<const at::Tensor> cu_seqlens_q_padded,
+                   std::optional<const at::Tensor> cu_seqlens_k_padded)
+{
+    if (is_causal) { window_size_right = 0; }
+
+    bool is_dropout = p_dropout > 0.0;
+
+    auto q_dtype = q.dtype();
+    TORCH_CHECK(q_dtype == torch::kFloat16 || q_dtype == torch::kBFloat16,
+                "FlashAttention only support fp16 and bf16 data type");
+
+    TORCH_CHECK(k.dtype() == q_dtype, "query and key must have the same dtype");
+    TORCH_CHECK(v.dtype() == q_dtype, "query and value must have the same dtype");
+    TORCH_CHECK(out.dtype() == q_dtype, "query and out must have the same dtype");
+    TORCH_CHECK(dout.dtype() == q_dtype, "query and dout must have the same dtype");
+    TORCH_CHECK(cu_seqlens_q.dtype() == torch::kInt32, "cu_seqlens_q must have dtype int32");
+    TORCH_CHECK(cu_seqlens_k.dtype() == torch::kInt32, "cu_seqlens_k must have dtype int32");
+    if (cu_seqlens_q_padded.has_value()) {
+        TORCH_CHECK(cu_seqlens_q_padded.value().dtype() == torch::kInt32, "cu_seqlens_q_padded must have dtype int32");
+        CHECK_CONTIGUOUS(cu_seqlens_q_padded.value());
+    }
+    if (cu_seqlens_k_padded.has_value()) {
+        TORCH_CHECK(cu_seqlens_k_padded.value().dtype() == torch::kInt32, "cu_seqlens_k_padded must have dtype int32");
+        CHECK_CONTIGUOUS(cu_seqlens_k_padded.value());
+    }
+    std::string q_dtype_str = q_dtype == torch::kFloat16 ? "fp16" : "bf16";
+
+    CHECK_DEVICE(q); CHECK_DEVICE(k); CHECK_DEVICE(v);
+    CHECK_DEVICE(out); CHECK_DEVICE(dout); CHECK_DEVICE(softmax_lse);
+    CHECK_DEVICE(cu_seqlens_q); CHECK_DEVICE(cu_seqlens_k);
+
+    TORCH_CHECK(q.stride(-1) == 1, "Input tensor must have contiguous last dimension");
+    TORCH_CHECK(k.stride(-1) == 1, "Input tensor must have contiguous last dimension");
+    TORCH_CHECK(v.stride(-1) == 1, "Input tensor must have contiguous last dimension");
+    TORCH_CHECK(out.stride(-1) == 1, "out tensor must have contiguous last dimension");
+    TORCH_CHECK(dout.stride(-1) == 1, "dout tensor must have contiguous last dimension");
+    CHECK_CONTIGUOUS(cu_seqlens_q);
+    CHECK_CONTIGUOUS(cu_seqlens_k);
+
+    const auto sizes = q.sizes();
+
+    const int total_q = sizes[0];
+    const int batch_size = cu_seqlens_q.numel() - 1;
+    const int num_heads = sizes[1];
+    const int head_size_q = sizes[2];
+    const int head_size_v = v.size(2);
+    const int total_k = k.size(0);
+    const int num_heads_k = k.size(1);
+    TORCH_CHECK(batch_size > 0, "batch size must be positive");
+    TORCH_CHECK(head_size_q % 8 == 0, "head_size_q should be a multiple of 8");
+    TORCH_CHECK(head_size_v % 8 == 0, "head_size_v should be a multiple of 8");
+    TORCH_CHECK(head_size_q <= 256, "CK FlashAttention backward only supports head dimension at most 256");
+    TORCH_CHECK(head_size_v <= 256, "CK FlashAttention backward only supports head dimension at most 256");
+    TORCH_CHECK(num_heads % num_heads_k == 0, "Number of heads in key/value must divide number of heads in query");
+
+    if (window_size_left >= max_seqlen_k) { window_size_left = -1; }
+    if (window_size_right >= max_seqlen_k) { window_size_right = -1; }
+
+    mask_info mask;
+    if (is_causal) {
+        std::string mask_identify = "b:" + std::to_string(window_size_left) + "," + "0";
+        mask = mask_info::decode(mask_identify, max_seqlen_q, max_seqlen_k); // casual
+    }
+    else if (window_size_left == -1 && window_size_right == -1) {
+        mask = mask_info::decode("0", max_seqlen_q, max_seqlen_k); // no mask
+    }
+    else {
+        // Local is the more general case where window_size_right >= 0 or window_size_left >= 0.
+        std::string mask_identify = "b:" + std::to_string(window_size_left) + "," + std::to_string(window_size_right);
+        mask = mask_info::decode(mask_identify, max_seqlen_q, max_seqlen_k); // local
+    }
+
+    // q, k, v, out had been padded in mha_fwd
+    // dq_, dk_, dv_ are also padded tensor
+    CHECK_SHAPE(q, total_q, num_heads, head_size_q);
+    CHECK_SHAPE(k, total_k, num_heads_k, head_size_q);
+    CHECK_SHAPE(v, total_k, num_heads_k, head_size_v);
+    CHECK_SHAPE(out, total_q, num_heads, head_size_v);
+    CHECK_SHAPE(dout, total_q, num_heads, head_size_v);
+    CHECK_SHAPE(cu_seqlens_q, batch_size + 1);
+    CHECK_SHAPE(cu_seqlens_k, batch_size + 1);
+
+    at::Tensor dq, dk, dv;
+    if (dq_.has_value()) {
+        dq = dq_.value();
+        TORCH_CHECK(dq.dtype() == q_dtype, "dq must have the same dtype as q");
+        CHECK_DEVICE(dq);
+        TORCH_CHECK(dq.stride(-1) == 1, "dq must have contiguous last dimension");
+        CHECK_SHAPE(dq, total_q, num_heads, head_size_q);
+    } else {
+        dq = torch::empty_like(q);
+    }
+    if (dk_.has_value()) {
+        dk = dk_.value();
+        TORCH_CHECK(dk.dtype() == q_dtype, "dk must have the same dtype as q");
+        CHECK_DEVICE(dk);
+        TORCH_CHECK(dk.stride(-1) == 1, "dk must have contiguous last dimension");
+        CHECK_SHAPE(dk, total_k, num_heads_k, head_size_q);
+    } else {
+        dk = torch::empty_like(k);
+    }
+    if (dv_.has_value()) {
+        dv = dv_.value();
+        TORCH_CHECK(dv.dtype() == q_dtype, "dv must have the same dtype as q");
+        CHECK_DEVICE(dv);
+        TORCH_CHECK(dv.stride(-1) == 1, "dv must have contiguous last dimension");
+        CHECK_SHAPE(dv, total_k, num_heads_k, head_size_v);
+    } else {
+        dv = torch::empty_like(v);
+    }
+
+    const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard{q.device()};
+    auto stream = at::hip::getCurrentHIPStream();
+
+    auto opts = q.options();
+    auto softmax_d = torch::empty({batch_size, num_heads, total_q}, opts.dtype(at::kFloat));
+
+    at::Tensor workspace;
+    auto workspace_alloc = [&workspace, opts](size_t bytes, bool zero_init) -> void* {
+        workspace = zero_init
+                        ? torch::zeros({static_cast<int64_t>(bytes)}, opts.dtype(at::kByte))
+                        : torch::empty({static_cast<int64_t>(bytes)}, opts.dtype(at::kByte));
+        return workspace.data_ptr();
+    };
+
+    at::Tensor dk_expanded, dv_expanded;
+    if (num_heads_k != num_heads) {  // MQA / GQA
+        dk_expanded = torch::empty({total_k, num_heads, head_size_q}, opts);
+        dv_expanded = torch::empty({total_k, num_heads, head_size_v}, opts);
+    } else {
+        dk_expanded = dk;
+        dv_expanded = dv;
+    }
+
+    if(zero_tensors) {
+        dq.zero_();
+        dk_expanded.zero_();
+        dv_expanded.zero_();
+        softmax_d.zero_();
+    }
+
+    bias_enum bias_type = alibi_slopes_.has_value() ? bias_enum::alibi : bias_enum::no_bias;
+
+    auto gen = at::get_generator_or_default<at::CUDAGeneratorImpl>(
+        gen_, at::cuda::detail::getDefaultCUDAGenerator());
+
+    int64_t counter_offset = batch_size * num_heads * ck_tile::get_warp_size();
+    at::Tensor rng_state;
+
+    if (rng_state_.has_value()) {
+        rng_state = rng_state_.value();
+    } else if(is_dropout) {
+        rng_state = torch::empty({2}, opts.dtype(torch::kInt64));
+        // See Note [Acquire lock when using random generators]
+        std::lock_guard<std::mutex> lock(gen->mutex_);
+        auto philox_args = gen->philox_cuda_state(counter_offset);
+        hipLaunchKernelGGL(
+            aiter::ParsePhiloxCudaState, dim3(1), dim3(64), 0, stream,
+            philox_args, reinterpret_cast<uint64_t*>(rng_state.data_ptr()));
+    } else {
+        rng_state = torch::empty({2}, opts.dtype(torch::kInt64));
+    }
+
+    if (max_seqlen_q > 0) {
+        auto rng_state_ptr = reinterpret_cast<uint64_t*>(rng_state.data_ptr());
+        auto drop_seed_offset = std::make_pair(rng_state_ptr, rng_state_ptr + 1);
+        ck_tile::stream_config stream_config{stream};
+
+        auto args = [=]() {
+            // q: (total_q, nheads, hdim_q)
+            ck_tile::index_t batch_stride_q = 0;
+            ck_tile::index_t stride_q = q.stride(0);
+            ck_tile::index_t nhead_stride_q = q.stride(1);
+
+            // k: (total_k, nheads_k, hdim_q)
+            ck_tile::index_t batch_stride_k = 0;
+            ck_tile::index_t stride_k = k.stride(0);
+            ck_tile::index_t nhead_stride_k = k.stride(1);
+
+            // v: (total_k, nheads_k, hdim_v)
+            ck_tile::index_t batch_stride_v = 0;
+            ck_tile::index_t stride_v = v.stride(0);
+            ck_tile::index_t nhead_stride_v = v.stride(1);
+
+            // o: (total_q, nheads, hdim_v)
+            ck_tile::index_t batch_stride_o = 0;
+            ck_tile::index_t stride_o = out.stride(0);
+            ck_tile::index_t nhead_stride_o = out.stride(1);
+
+            // lse: (nheads, total_q)
+            ck_tile::index_t batch_stride_lse = 0;
+            ck_tile::index_t nhead_stride_lse = softmax_lse.stride(0);
+
+            // do: (total_q, nheads, hdim)
+            ck_tile::index_t batch_stride_do = 0;
+            ck_tile::index_t stride_do = dout.stride(0);
+            ck_tile::index_t nhead_stride_do = dout.stride(1);
+
+            // d: (batch_size, nheads, max_seqlen_q)
+            // CK assume d share the same stride with lse
+
+            // dq: (total_q, nheads, hdim_q)
+            ck_tile::index_t batch_stride_dq = 0;
+            ck_tile::index_t stride_dq = dq.stride(0);
+            ck_tile::index_t nhead_stride_dq = dq.stride(1);
+
+
+            // dk_expanded: (total_k, nheads, hdim_q)
+            ck_tile::index_t batch_stride_dk = 0;
+            ck_tile::index_t stride_dk = dk_expanded.stride(0);
+            ck_tile::index_t nhead_stride_dk = dk_expanded.stride(1);
+
+            // dv_expanded: (total_k, nheads, hdim_v)
+            ck_tile::index_t batch_stride_dv = 0;
+            ck_tile::index_t stride_dv = dv_expanded.stride(0);
+            ck_tile::index_t nhead_stride_dv = dv_expanded.stride(1);
+
+            float p_undrop = 1.0 - p_dropout;
+
+            void *alibi_slopes_ptr = nullptr;
+            ck_tile::index_t stride_alibi_slopes = 0;
+
+            if (alibi_slopes_.has_value()) {
+                auto alibi_slopes = alibi_slopes_.value();
+                CHECK_DEVICE(alibi_slopes);
+                TORCH_CHECK(alibi_slopes.stride(-1) == 1, "ALiBi slopes tensor must have contiguous last dimension");
+                TORCH_CHECK(alibi_slopes.sizes() == torch::IntArrayRef({num_heads}) || alibi_slopes.sizes() == torch::IntArrayRef({batch_size, num_heads}));
+                alibi_slopes_ptr = alibi_slopes.data_ptr();
+                // alibi_slopes:(batch_size, nheads) or (nhead)
+                stride_alibi_slopes = alibi_slopes.dim() == 2 ? alibi_slopes.stride(0) : 0;
+            }
+
+            const void* seqstart_q_ptr = nullptr;
+            const void* seqstart_k_ptr = nullptr;
+            const void* cu_seqlen_q_ptr = nullptr;
+            const void* cu_seqlen_k_ptr = nullptr;
+
+            if (cu_seqlens_k_padded.has_value()) {
+                seqstart_k_ptr = cu_seqlens_k_padded.value().data_ptr();
+                cu_seqlen_k_ptr = cu_seqlens_k.data_ptr();
+            } else {
+                seqstart_k_ptr = cu_seqlens_k.data_ptr();
+            }
+
+            if (cu_seqlens_q_padded.has_value()) {
+                seqstart_q_ptr = cu_seqlens_q_padded.value().data_ptr();
+                cu_seqlen_q_ptr = cu_seqlens_q.data_ptr();
+            } else {
+                seqstart_q_ptr = cu_seqlens_q.data_ptr();
+            }
+
+            return mha_bwd_args{true, // use_v3
+                                is_v3_atomic_fp32, // is_v3_atomic_fp32
+                                how_v3_bf16_cvt, // how_v3_bf16_cvt
+                                false, // v3_api_check
+
+                                head_size_q,
+                                head_size_v,
+                                q_dtype_str,
+                                true, // mode
+                                static_cast<int>(mask.type),
+                                static_cast<int>(bias_type),
+                                false, // has_dbias
+                                p_dropout > 0,
+                                false,  // store_randval
+                                deterministic,
+
+                                q.data_ptr(),
+                                k.data_ptr(),
+                                v.data_ptr(),
+                                alibi_slopes_ptr, // bias
+                                out.data_ptr(),
+                                softmax_lse.data_ptr(),
+                                dout.data_ptr(),
+                                softmax_d.data_ptr(),
+                                nullptr, // rand_val
+                                dq.data_ptr(),
+                                dk_expanded.data_ptr(),
+                                dv_expanded.data_ptr(),
+                                nullptr, // dbias
+                                nullptr, // sink_ptr (not used in v3 asm path)
+                                nullptr, // d_sink_ptr (not used in v3 asm path)
+                                seqstart_q_ptr, // seqstart_q
+                                seqstart_k_ptr, // seqstart_k
+                                nullptr, // seqlen_q_ptr
+                                nullptr, // seqlen_k_ptr
+                                cu_seqlen_q_ptr, // cu_seqlen_q_ptr
+                                cu_seqlen_k_ptr, // cu_seqlen_k_ptr
+                                total_q,
+                                total_k,
+                                batch_size,
+                                max_seqlen_q, // max_seqlen_q
+                                max_seqlen_k, // max_seqlen_k
+                                num_heads, // nhead
+                                num_heads_k, // nhead_k
+                                softmax_scale,
+                                stride_q,
+                                stride_k,
+                                stride_v,
+                                stride_alibi_slopes,
+                                stride_o,
+                                0, // stride_randval
+                                stride_do,
+                                stride_dq,
+                                stride_dk,
+                                stride_dv,
+                                0, // stride_dbias, FA without bias
+                                nhead_stride_q,
+                                nhead_stride_k,
+                                nhead_stride_v,
+                                0, // nhead_stride_bias, FA without bias
+                                nhead_stride_o,
+                                0, // nhead_stride_randval
+                                nhead_stride_do,
+                                nhead_stride_lse,
+                                nhead_stride_dq,
+                                nhead_stride_dk,
+                                nhead_stride_dv,
+                                0, // nhead_stride_dbias, FA without dbias
+                                batch_stride_q,
+                                batch_stride_k,
+                                batch_stride_v,
+                                0  , // batch_stride_bias, FA without bias
+                                batch_stride_o,
+                                0, // batch_stride_randval
+                                batch_stride_do,
+                                batch_stride_lse,
+                                batch_stride_dq,
+                                batch_stride_dk,
+                                batch_stride_dv,
+                                0  , // batch_stride_dbias, FA without dbias
+                                mask.left,
+                                mask.right,
+                                p_dropout,
+                                p_undrop,
+                                drop_seed_offset,
+                                workspace_alloc};
+        }();
+
+        float t = aiter::mha_bwd(args, stream_config);
+        TORCH_CHECK(t >= 0, "invalid argument for fmha_v3_varlen_bwd");
+    } else {
+        // If seqlen_q == 0, then we have an empty tensor. We need to set the output to 0.
+        dk_expanded.zero_();
+        dv_expanded.zero_();
+        softmax_d.zero_();
+    }
+
+    // For MQA/GQA we need to sum dK and dV across the groups
+    if (num_heads_k != num_heads) {
+        at::sum_out(dk, at::reshape(dk_expanded, {total_k, num_heads_k, num_heads / num_heads_k, head_size_q}), {2});
+        at::sum_out(dv, at::reshape(dv_expanded, {total_k, num_heads_k, num_heads / num_heads_k, head_size_v}), {2});
+    }
+
+    return { dq, dk, dv, softmax_d };
+}
+
+} // namespace torch_itfs
+} // namespace aiter

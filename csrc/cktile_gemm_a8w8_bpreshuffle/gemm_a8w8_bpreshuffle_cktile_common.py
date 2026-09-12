@@ -1,0 +1,501 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+import os
+import sys
+from copy import copy
+from dataclasses import dataclass
+
+this_dir = os.path.dirname(os.path.abspath(__file__))
+AITER_CORE_DIR = os.path.abspath(f"{this_dir}/../../../")
+if os.path.exists(os.path.join(AITER_CORE_DIR, "aiter_meta")):
+    AITER_CORE_DIR = os.path.join(AITER_CORE_DIR, "aiter/jit/utils")  # pip install mode
+else:
+    AITER_CORE_DIR = os.path.abspath(
+        f"{this_dir}/../../aiter/jit/utils"
+    )  # develop mode
+sys.path.insert(0, AITER_CORE_DIR)
+
+from chip_info import get_gfx
+
+DEFAULT_PIPELINE = "flatmm_v1"
+
+# Python pipeline name -> the `sPipeline` template argument of CustomConfig in
+# include/gemm_a8w8_bpreshuffle_cktile_common.cuh. Keep the two in sync.
+PIPELINE_IDS = {
+    "flatmm_v1": 0,
+    "rowcol_wp_v2": 1,
+}
+
+
+@dataclass
+class kernelInstance:
+    sTransposeC: bool
+    sUseStructuredSparsity: bool
+    sTileParitionerGroupNum: int
+    sTileParitionerM01: int
+    sNumWaveGroups: int
+    sDoubleSmemBuffer: bool
+    PadM: bool
+    PadN: bool
+    PadK: bool
+    BlockPerCu: int
+    MTile: int
+    NTile: int
+    KTile: int
+    MWarp: int
+    NWarp: int
+    KWarp: int
+    MWTile: int
+    NWTile: int
+    KWTile: int
+    sScheduler: str
+    # Which device kernel/pipeline composition the instance runs on. The tile
+    # geometry above is shared; this selects what consumes it:
+    #
+    #  "flatmm_v1"    - ck_tile::FlatmmKernel + FlatmmPipelineAGmemBGmemCRegV1
+    #                   with the ScaleM/ScaleN epilogue. The historical (and
+    #                   default) cktile a8w8-bpreshuffle path.
+    #  "rowcol_wp_v2" - ck_tile::QuantGemmKernel in QuantType::RowColQuant mode
+    #                   driving WeightPreshufflePipelineAGmemBGmemCRegV2. Same
+    #                   host-side inputs as flatmm_v1 (B preshuffled with
+    #                   shuffle_weight(16, 16), per-token A scale (M,) and
+    #                   per-channel B scale (N,) applied natively by the
+    #                   kernel's RowCol scale windows -- no replication).
+    #                   Requires M/N/K divisible by the tile: the quant route
+    #                   is instantiated with the pads clamped false.
+    #
+    # The value is part of `name`, so a tuned-CSV row that selects a non-default
+    # pipeline stays self-describing and round-trips through
+    # chip_info.build_tune_dict()'s kernelName lookup.
+    sPipeline: str = DEFAULT_PIPELINE
+
+    @property
+    def supports_m_padding(self) -> bool:
+        return self.sPipeline == DEFAULT_PIPELINE
+
+    @property
+    def supports_k_padding(self) -> bool:
+        return self.sPipeline == DEFAULT_PIPELINE
+
+    @property
+    def name(self) -> str:
+        parts = [
+            "a8w8_bpreshuffle_cktile",
+            ("x").join(
+                str(x)
+                for x in [
+                    self.sTransposeC,
+                    self.sUseStructuredSparsity,
+                    self.sTileParitionerGroupNum,
+                    self.sTileParitionerM01,
+                    self.sNumWaveGroups,
+                    self.sDoubleSmemBuffer,
+                    self.PadM,
+                    self.PadN,
+                    self.PadK,
+                    self.BlockPerCu,
+                ]
+            ),
+            ("x").join(str(x) for x in [self.MTile, self.NTile, self.KTile]),
+            ("x").join(str(x) for x in [self.MWarp, self.NWarp, self.KWarp]),
+            ("x").join(str(x) for x in [self.MWTile, self.NWTile, self.KWTile]),
+            self.sScheduler.lower(),
+        ]
+        # Only non-default pipelines extend the name, so every already-tuned
+        # flatmm_v1 CSV row keeps matching byte-for-byte.
+        if self.sPipeline != DEFAULT_PIPELINE:
+            parts.append(self.sPipeline)
+        return ("_").join(parts)
+
+
+BLOCK_PER_CU_MAX = 4
+
+
+def expand_blockpercu(base_dict, max_bpc=BLOCK_PER_CU_MAX, field_name="BlockPerCu"):
+    """Expand kernel instances with BlockPerCu 1..max_bpc variants.
+
+    For each unique tile configuration (all fields except BlockPerCu),
+    creates variants for every BPC value in 1..max_bpc that doesn't
+    already exist in base_dict.
+    """
+    expanded = dict(base_dict)
+    configs = {}  # tile_config_key -> {bpc: id, ...}
+    for idx, k in base_dict.items():
+        key = tuple(v for f, v in vars(k).items() if f != field_name)
+        configs.setdefault(key, {})[getattr(k, field_name)] = idx
+    next_id = max(base_dict.keys()) + 1
+    for key, existing_bpcs in configs.items():
+        template = base_dict[next(iter(existing_bpcs.values()))]
+        for bpc in range(1, max_bpc + 1):
+            if bpc not in existing_bpcs:
+                inst = copy(template)
+                inst.BlockPerCu = bpc
+                expanded[next_id] = inst
+                next_id += 1
+    return expanded
+
+
+# fmt: off
+# kernels_list_str = '''
+kernels_list_942 = {
+    0: kernelInstance( 0, 0, 8, 4, 1, 0, 0, 0, 0, 1,   128,   128,   128,  1,  4,  1,   16,    16,    64, "Default"),
+    1: kernelInstance( 0, 0, 8, 4, 1, 0, 0, 0, 0, 1,   128,   128,   256,  1,  4,  1,   16,    16,    64, "Default"),
+    2: kernelInstance( 0, 0, 8, 4, 1, 0, 0, 0, 0, 1,   16,    64,    512,  1,  4,  1,   16,    16,    64, "Default"),
+    3: kernelInstance( 0, 0, 8, 4, 1, 0, 0, 0, 0, 1,   16,    128,   512,  1,  4,  1,   16,    16,    64, "Default"),
+    4: kernelInstance( 0, 0, 8, 4, 1, 0, 0, 0, 0, 1,   16,    256,   512,  1,  4,  1,   16,    16,    64, "Default"),
+    5: kernelInstance( 0, 0, 8, 4, 1, 0, 0, 0, 0, 1,   16,    64,    256,  1,  4,  1,   16,    16,    64, "Default"),
+    6: kernelInstance( 0, 0, 8, 4, 1, 0, 0, 0, 0, 1,   16,    128,   256,  1,  4,  1,   16,    16,    64, "Default"),
+    7: kernelInstance( 0, 0, 8, 4, 1, 0, 0, 0, 0, 1,   16,    256,   256,  1,  4,  1,   16,    16,    64, "Default"),
+    8: kernelInstance( 0, 0, 8, 4, 1, 0, 0, 0, 0, 1,   16,    512,   256,  1,  4,  1,   16,    16,    64, "Default"),
+    9: kernelInstance( 0, 0, 8, 4, 1, 0, 0, 0, 0, 1,   32,    64,    512,  1,  4,  1,   16,    16,    64, "Default"),
+    10: kernelInstance( 0, 0, 8, 4, 1, 0, 0, 0, 0, 1,  64,    256,   64,   1,  4,  1,   16,    16,    64, "Default"),
+    11: kernelInstance( 0, 0, 8, 4, 1, 0, 0, 0, 0, 1,  128,   64,   128,   1,  4,  1,   16,    16,    64, "Default"),
+    12: kernelInstance( 0, 0, 8, 4, 1, 0, 0, 0, 0, 1,  128,   64,   256,   1,  4,  1,   16,    16,    64, "Default"),
+    13: kernelInstance( 0, 0, 8, 4, 1, 0, 0, 0, 0, 1,  128,   128,   64,   1,  4,  1,   16,    16,    64, "Default"),
+    14: kernelInstance( 0, 0, 8, 4, 1, 0, 0, 0, 0, 1,  128,   256,   128,  1,  4,  1,   16,    16,    64, "Default"),
+    15: kernelInstance( 0, 0, 8, 4, 1, 0, 0, 0, 0, 1,   32,   64,    128,  1,  4,  1,   16,    16,    64, "Default"),
+    16: kernelInstance( 0, 0, 8, 4, 1, 0, 0, 0, 0, 1,   64,   64,    128,  1,  4,  1,   16,    16,    64, "Default"),
+    17: kernelInstance( 0, 0, 8, 4, 1, 0, 0, 0, 0, 1,   32,   128,   128,  1,  4,  1,   16,    16,    64, "Default"),
+    18: kernelInstance( 0, 0, 8, 4, 1, 0, 0, 0, 0, 1,   64,   128,   128,  1,  4,  1,   16,    16,    64, "Default"),
+    19: kernelInstance( 0, 0, 8, 4, 1, 0, 0, 0, 0, 1,   32,   256,   128,  1,  4,  1,   16,    16,    64, "Default"),
+    20: kernelInstance( 0, 0, 8, 4, 1, 0, 0, 0, 0, 1,   64,   256,   128,  1,  4,  1,   16,    16,    64, "Default"),
+    21: kernelInstance( 0, 0, 8, 4, 1, 0, 0, 0, 0, 1,   32,    64,   256,  1,  4,  1,   16,    16,    64, "Default"),
+    22: kernelInstance( 0, 0, 8, 4, 1, 0, 0, 0, 0, 1,   64,    64,   256,  1,  4,  1,   16,    16,    64, "Default"),
+    23: kernelInstance( 0, 0, 8, 4, 1, 0, 0, 0, 0, 1,   32,   128,   256,  1,  4,  1,   16,    16,    64, "Default"),
+    24: kernelInstance( 0, 0, 8, 4, 1, 0, 0, 0, 0, 1,   64,   128,   256,  1,  4,  1,   16,    16,    64, "Default"),
+    25: kernelInstance( 0, 0, 8, 4, 1, 0, 0, 0, 0, 1,   32,   192,   128,  1,  4,  1,   16,    16,    64, "Default"),
+    26: kernelInstance( 0, 0, 8, 4, 1, 0, 0, 0, 0, 1,   64,   192,   128,  1,  4,  1,   16,    16,    64, "Default"),
+    27: kernelInstance( 0, 0, 8, 4, 1, 0, 0, 0, 0, 1,   128,  192,   128,  1,  4,  1,   16,    16,    64, "Default"),
+    28: kernelInstance( 0, 0, 8, 4, 1, 0, 0, 0, 0, 2,   128,  128,   128,  1,  4,  1,   16,    16,    64, "Default"),
+    29: kernelInstance( 0, 0, 8, 4, 1, 0, 0, 0, 0, 2,   128,  128,   256,  1,  4,  1,   16,    16,    64, "Default"),
+    30: kernelInstance( 0, 0, 8, 4, 1, 0, 0, 0, 0, 2,   16,   64,    512,  1,  4,  1,   16,    16,    64, "Default"),
+    31: kernelInstance( 0, 0, 8, 4, 1, 0, 0, 0, 0, 2,   16,   128,   512,  1,  4,  1,   16,    16,    64, "Default"),
+    32: kernelInstance( 0, 0, 8, 4, 1, 0, 0, 0, 0, 2,   16,   256,   512,  1,  4,  1,   16,    16,    64, "Default"),
+    33: kernelInstance( 0, 0, 8, 4, 1, 0, 0, 0, 0, 2,   16,   64,    256,  1,  4,  1,   16,    16,    64, "Default"),
+    34: kernelInstance( 0, 0, 8, 4, 1, 0, 0, 0, 0, 2,   16,   128,   256,  1,  4,  1,   16,    16,    64, "Default"),
+    35: kernelInstance( 0, 0, 8, 4, 1, 0, 0, 0, 0, 2,   16,   256,   256,  1,  4,  1,   16,    16,    64, "Default"),
+    36: kernelInstance( 0, 0, 8, 4, 1, 0, 0, 0, 0, 2,   16,   512,   256,  1,  4,  1,   16,    16,    64, "Default"),
+    37: kernelInstance( 0, 0, 8, 4, 1, 0, 0, 0, 0, 2,   32,   64,    512,  1,  4,  1,   16,    16,    64, "Default"),
+    38: kernelInstance( 0, 0, 8, 4, 1, 0, 0, 0, 0, 2,  64,    256,   64,   1,  4,  1,   16,    16,    64, "Default"),
+    39: kernelInstance( 0, 0, 8, 4, 1, 0, 0, 0, 0, 2,  128,   64,   128,   1,  4,  1,   16,    16,    64, "Default"),
+    40: kernelInstance( 0, 0, 8, 4, 1, 0, 0, 0, 0, 2,  128,   64,   256,   1,  4,  1,   16,    16,    64, "Default"),
+    41: kernelInstance( 0, 0, 8, 4, 1, 0, 0, 0, 0, 2,  128,   128,   64,   1,  4,  1,   16,    16,    64, "Default"),
+    42: kernelInstance( 0, 0, 8, 4, 1, 0, 0, 0, 0, 2,  128,   256,   128,  1,  4,  1,   16,    16,    64, "Default"),
+    43: kernelInstance( 0, 0, 8, 4, 1, 0, 0, 0, 0, 2,   32,   64,    128,  1,  4,  1,   16,    16,    64, "Default"),
+    44: kernelInstance( 0, 0, 8, 4, 1, 0, 0, 0, 0, 2,   64,   64,    128,  1,  4,  1,   16,    16,    64, "Default"),
+    45: kernelInstance( 0, 0, 8, 4, 1, 0, 0, 0, 0, 2,   32,   128,   128,  1,  4,  1,   16,    16,    64, "Default"),
+    46: kernelInstance( 0, 0, 8, 4, 1, 0, 0, 0, 0, 2,   64,   128,   128,  1,  4,  1,   16,    16,    64, "Default"),
+    47: kernelInstance( 0, 0, 8, 4, 1, 0, 0, 0, 0, 2,   32,   256,   128,  1,  4,  1,   16,    16,    64, "Default"),
+    48: kernelInstance( 0, 0, 8, 4, 1, 0, 0, 0, 0, 2,   64,   256,   128,  1,  4,  1,   16,    16,    64, "Default"),
+    49: kernelInstance( 0, 0, 8, 4, 1, 0, 0, 0, 0, 2,   32,    64,   256,  1,  4,  1,   16,    16,    64, "Default"),
+    50: kernelInstance( 0, 0, 8, 4, 1, 0, 0, 0, 0, 2,   64,    64,   256,  1,  4,  1,   16,    16,    64, "Default"),
+    51: kernelInstance( 0, 0, 8, 4, 1, 0, 0, 0, 0, 2,   32,   128,   256,  1,  4,  1,   16,    16,    64, "Default"),
+    52: kernelInstance( 0, 0, 8, 4, 1, 0, 0, 0, 0, 2,   64,   128,   256,  1,  4,  1,   16,    16,    64, "Default"),
+    53: kernelInstance( 0, 0, 8, 4, 1, 0, 0, 0, 0, 2,   32,   192,   128,  1,  4,  1,   16,    16,    64, "Default"),
+    54: kernelInstance( 0, 0, 8, 4, 1, 0, 0, 0, 0, 2,   64,   192,   128,  1,  4,  1,   16,    16,    64, "Default"),
+    55: kernelInstance( 0, 0, 8, 4, 1, 0, 0, 0, 0, 2,   128,  192,   128,  1,  4,  1,   16,    16,    64, "Default"),
+    56: kernelInstance( 0, 0, 8, 4, 1, 0, 0, 0, 0, 1,   16,   192,   256,  1,  4,  1,   16,    16,    64, "Default"),
+    57: kernelInstance( 0, 0, 8, 4, 1, 0, 0, 0, 0, 1,   32,   192,   256,  1,  4,  1,   16,    16,    64, "Default"),
+    58: kernelInstance( 0, 0, 8, 4, 1, 0, 0, 0, 0, 1,   64,   192,   256,  1,  4,  1,   16,    16,    64, "Default"),
+    59: kernelInstance( 0, 0, 8, 4, 1, 0, 0, 0, 0, 1,   64,   256,   256,  1,  4,  1,   16,    16,    64, "Default"),
+    60: kernelInstance( 0, 0, 8, 4, 1, 0, 0, 0, 0, 1,   32,   256,   256,  1,  4,  1,   16,    16,    64, "Default"),
+    61: kernelInstance( 0, 0, 8, 4, 1, 0, 0, 0, 0, 1,   16,   512,   256,  1,  4,  1,   16,    16,    64, "Default"),
+    62: kernelInstance( 0, 0, 8, 4, 1, 0, 0, 0, 0, 1,   64,   256,   64,   1,  4,  1,   16,    16,    64, "Default"),
+    63: kernelInstance( 0, 0, 8, 4, 1, 0, 0, 0, 0, 1,   16,   256,   512,  1,  4,  1,   16,    16,    64, "Default"),
+    64: kernelInstance( 0, 0, 8, 4, 1, 0, 0, 0, 0, 1,   16,   256,   256,  1,  4,  1,   16,    16,    64, "Default"),
+    65: kernelInstance( 0, 0, 8, 4, 1, 0, 0, 0, 0, 2,   16,   192,   256,  1,  4,  1,   16,    16,    64, "Default"),
+    66: kernelInstance( 0, 0, 8, 4, 1, 0, 0, 0, 0, 2,   32,   192,   256,  1,  4,  1,   16,    16,    64, "Default"),
+    67: kernelInstance( 0, 0, 8, 4, 1, 0, 0, 0, 0, 2,   64,   192,   256,  1,  4,  1,   16,    16,    64, "Default"),
+    68: kernelInstance( 0, 0, 8, 4, 1, 0, 0, 0, 0, 2,   64,   256,   256,  1,  4,  1,   16,    16,    64, "Default"),
+    69: kernelInstance( 0, 0, 8, 4, 1, 0, 0, 0, 0, 2,   32,   256,   256,  1,  4,  1,   16,    16,    64, "Default"),
+    70: kernelInstance( 0, 0, 8, 4, 1, 0, 0, 0, 0, 2,   16,   512,   256,  1,  4,  1,   16,    16,    64, "Default"),
+    71: kernelInstance( 0, 0, 8, 4, 1, 0, 0, 0, 0, 2,   64,   256,    64,  1,  4,  1,   16,    16,    64, "Default"),
+    72: kernelInstance( 0, 0, 8, 4, 1, 0, 0, 0, 0, 2,   16,   256,   512,  1,  4,  1,   16,    16,    64, "Default"),
+    73: kernelInstance( 0, 0, 8, 4, 1, 0, 0, 0, 0, 2,   16,   256,   256,  1,  4,  1,   16,    16,    64, "Default"),
+    74: kernelInstance( 0, 0, 8, 4, 1, 0, 0, 0, 0, 1,   160,   192,   128, 1,  4,  1,   16,    16,    64, "Default"),
+    75: kernelInstance( 0, 0, 8, 4, 1, 0, 0, 0, 0, 1,   48,    128,   256, 1,  4,  1,   16,    16,    64, "Default"),
+    76: kernelInstance( 0, 0, 8, 4, 1, 0, 0, 0, 0, 1,   96,    192,   128, 1,  4,  1,   16,    16,    64, "Default"),
+    77: kernelInstance( 0, 0, 8, 4, 1, 0, 0, 0, 0, 1,   48,    192,   256, 1,  4,  1,   16,    16,    64, "Default"),
+    78: kernelInstance( 0, 0, 8, 4, 1, 0, 0, 0, 0, 1,   48,    64,    256, 1,  4,  1,   16,    16,    64, "Default"),
+    79: kernelInstance( 0, 0, 8, 4, 1, 0, 0, 0, 0, 1,   96,    64,    128, 1,  4,  1,   16,    16,    64, "Default"),
+    80: kernelInstance( 0, 0, 8, 4, 1, 0, 0, 0, 0, 1,   96,    128,   128, 1,  4,  1,   16,    16,    64, "Default"),
+    81: kernelInstance( 0, 0, 8, 4, 1, 0, 0, 0, 0, 1,   96,    192,   128, 1,  4,  1,   16,    16,    64, "Default"),
+    82: kernelInstance( 0, 0, 8, 4, 1, 0, 0, 0, 0, 1,   96,    256,   128, 1,  4,  1,   16,    16,    64, "Default"),
+    83: kernelInstance( 0, 0, 8, 4, 1, 0, 0, 0, 0, 1,   48,    64,    256, 1,  4,  1,   16,    16,    64, "Default"),
+    84: kernelInstance( 0, 0, 8, 4, 1, 0, 0, 0, 0, 1,   80,    64,    256, 1,  4,  1,   16,    16,    64, "Default"),
+    85: kernelInstance( 0, 0, 8, 4, 1, 0, 0, 0, 0, 1,   96,    64,    256, 1,  4,  1,   16,    16,    64, "Default"),
+    86: kernelInstance( 0, 0, 8, 4, 1, 0, 0, 0, 0, 1,   112,   128,   256, 1,  4,  1,   16,    16,    64, "Default"),
+    87: kernelInstance( 0, 0, 8, 4, 1, 0, 0, 0, 0, 1,   112,   64,    256, 1,  4,  1,   16,    16,    64, "Default"),
+    88: kernelInstance( 0, 0, 8, 4, 1, 0, 0, 0, 0, 1,   160,   192,   128, 1,  4,  1,   16,    16,    64, "Default"),
+    89: kernelInstance( 0, 0, 8, 4, 1, 0, 0, 0, 0, 1,   224,   192,   128, 1,  4,  1,   16,    16,    64, "Default"),
+    90: kernelInstance( 0, 0, 8, 4, 1, 0, 0, 0, 0, 1,   256,   192,   128, 1,  4,  1,   16,    16,    64, "Default"),
+    91: kernelInstance( 0, 0, 8, 4, 1, 0, 0, 0, 0, 1,   48,    256,   256, 1,  4,  1,   16,    16,    64, "Default"),
+    92: kernelInstance( 0, 0, 8, 4, 1, 0, 0, 0, 0, 1,   80,    128,   256, 1,  4,  1,   16,    16,    64, "Default"),
+    93: kernelInstance( 0, 0, 8, 4, 1, 0, 0, 0, 0, 1,   224,    64,   128, 1,  4,  1,   16,    16,    64, "Default"),
+    94: kernelInstance( 0, 0, 8, 4, 1, 0, 0, 0, 0, 1,   112,   192,   256, 1,  4,  1,   16,    16,    64, "Default"),
+    95: kernelInstance( 0, 0, 8, 4, 1, 0, 0, 0, 0, 1,   128,   192,   256, 1,  4,  1,   16,    16,    64, "Default"),
+    96: kernelInstance( 0, 0, 8, 4, 1, 0, 0, 0, 0, 1,   192,   128,   128, 1,  4,  1,   16,    16,    64, "Default"),
+    97: kernelInstance( 0, 0, 8, 4, 1, 0, 0, 0, 0, 1,   224,   128,   128, 1,  4,  1,   16,    16,    64, "Default"),
+    98: kernelInstance( 0, 0, 8, 4, 1, 0, 0, 0, 0, 1,   96,   192,   256,  1,  4,  1,   16,    16,    64, "Default"),
+    99: kernelInstance( 0, 0, 8, 4, 1, 0, 0, 0, 0, 1,   96,   128,   256,  1,  4,  1,   16,    16,    64, "Default"),
+    100: kernelInstance( 0, 0, 8, 4, 1, 0, 0, 0, 0, 1,  256,  128,   128,  1,  4,  1,   16,    16,    64, "Default"),
+    101: kernelInstance( 0, 0, 8, 4, 1, 0, 0, 0, 0, 1,  80,   256,   256,  1,  4,  1,   16,    16,    64, "Default"),
+    102: kernelInstance( 0, 0, 8, 4, 1, 0, 0, 0, 0, 1,  192,   64,   128,  1,  4,  1,   16,    16,    64, "Default"),
+    103: kernelInstance( 0, 0, 8, 4, 1, 0, 0, 0, 0, 1,  80,   192,   256,  1,  4,  1,   16,    16,    64, "Default"),
+    104: kernelInstance( 0, 0, 8, 4, 1, 0, 0, 0, 0, 1,  256,   64,   128,  1,  4,  1,   16,    16,    64, "Default"),
+    105: kernelInstance( 0, 0, 8, 4, 1, 0, 0, 0, 0, 1,  112,  256,   256,  1,  4,  1,   16,    16,    64, "Default"),
+    106: kernelInstance( 0, 0, 8, 4, 1, 0, 0, 0, 0, 1,  96,   256,   256,  1,  4,  1,   16,    16,    64, "Default"),
+    107: kernelInstance( 0, 0, 8, 4, 1, 0, 0, 0, 0, 2,  48,   128,   256,  1,  4,  1,   16,    16,    64, "Default"),
+    108: kernelInstance( 0, 0, 8, 4, 1, 0, 0, 0, 0, 2,  96,   192,   128,  1,  4,  1,   16,    16,    64, "Default"),
+    109: kernelInstance( 0, 0, 8, 4, 1, 0, 0, 0, 0, 2,  48,   192,   256,  1,  4,  1,   16,    16,    64, "Default"),
+    110: kernelInstance( 0, 0, 8, 4, 1, 0, 0, 0, 0, 2,  48,    64,   256,  1,  4,  1,   16,    16,    64, "Default"),
+    111: kernelInstance( 0, 0, 8, 4, 1, 0, 0, 0, 0, 2,  96,    64,   128,  1,  4,  1,   16,    16,    64, "Default"),
+    112: kernelInstance( 0, 0, 8, 4, 1, 0, 0, 0, 0, 2,   96,   128,  128,  1,  4,  1,   16,    16,    64, "Default"),
+    113: kernelInstance( 0, 0, 8, 4, 1, 0, 0, 0, 0, 2,   96,   256,  256,  1,  4,  1,   16,    16,    64, "Default"),
+    114: kernelInstance( 0, 0, 8, 4, 1, 0, 0, 0, 0, 2,   96,   192,  128,  1,  4,  1,   16,    16,    64, "Default"),
+    115: kernelInstance( 0, 0, 8, 4, 1, 0, 0, 0, 0, 2,   96,   256,  128,  1,  4,  1,   16,    16,    64, "Default"),
+    116: kernelInstance( 0, 0, 8, 4, 1, 0, 0, 0, 0, 2,   48,   64,   256,  1,  4,  1,   16,    16,    64, "Default"),
+    117: kernelInstance( 0, 0, 8, 4, 1, 0, 0, 0, 0, 2,   80,   64,   256,  1,  4,  1,   16,    16,    64, "Default"),
+    118: kernelInstance( 0, 0, 8, 4, 1, 0, 0, 0, 0, 2,   96,   64,   256,  1,  4,  1,   16,    16,    64, "Default"),
+    119: kernelInstance( 0, 0, 8, 4, 1, 0, 0, 0, 0, 2,   112,  128,  256,  1,  4,  1,   16,    16,    64, "Default"),
+    120: kernelInstance( 0, 0, 8, 4, 1, 0, 0, 0, 0, 2,   112,  64,   256,  1,  4,  1,   16,    16,    64, "Default"),
+    121: kernelInstance( 0, 0, 8, 4, 1, 0, 0, 0, 0, 2,   160,  192,  128,  1,  4,  1,   16,    16,    64, "Default"),
+    122: kernelInstance( 0, 0, 8, 4, 1, 0, 0, 0, 0, 2,   224,  192,  128,  1,  4,  1,   16,    16,    64, "Default"),
+    123: kernelInstance( 0, 0, 8, 4, 1, 0, 0, 0, 0, 2,   256,  192,  128,  1,  4,  1,   16,    16,    64, "Default"),
+    124: kernelInstance( 0, 0, 8, 4, 1, 0, 0, 0, 0, 2,   48,   256,  256,  1,  4,  1,   16,    16,    64, "Default"),
+    125: kernelInstance( 0, 0, 8, 4, 1, 0, 0, 0, 0, 2,   80,   128,  256,  1,  4,  1,   16,    16,    64, "Default"),
+    126: kernelInstance( 0, 0, 8, 4, 1, 0, 0, 0, 0, 2,   224,   64,  128,  1,  4,  1,   16,    16,    64, "Default"),
+    127: kernelInstance( 0, 0, 8, 4, 1, 0, 0, 0, 0, 2,   112,  192,  256,  1,  4,  1,   16,    16,    64, "Default"),
+    128: kernelInstance( 0, 0, 8, 4, 1, 0, 0, 0, 0, 2,   128,  192,  256,  1,  4,  1,   16,    16,    64, "Default"),
+    129: kernelInstance( 0, 0, 8, 4, 1, 0, 0, 0, 0, 2,   192,  128,  128,  1,  4,  1,   16,    16,    64, "Default"),
+    130: kernelInstance( 0, 0, 8, 4, 1, 0, 0, 0, 0, 2,   224,  128,  128,  1,  4,  1,   16,    16,    64, "Default"),
+    131: kernelInstance( 0, 0, 8, 4, 1, 0, 0, 0, 0, 2,   96,   192,  256,  1,  4,  1,   16,    16,    64, "Default"),
+    132: kernelInstance( 0, 0, 8, 4, 1, 0, 0, 0, 0, 2,   96,   128,  256,  1,  4,  1,   16,    16,    64, "Default"),
+    133: kernelInstance( 0, 0, 8, 4, 1, 0, 0, 0, 0, 2,   256,  128,  128,  1,  4,  1,   16,    16,    64, "Default"),
+    134: kernelInstance( 0, 0, 8, 4, 1, 0, 0, 0, 0, 2,   80,   256,  256,  1,  4,  1,   16,    16,    64, "Default"),
+    135: kernelInstance( 0, 0, 8, 4, 1, 0, 0, 0, 0, 2,   192,   64,  128,  1,  4,  1,   16,    16,    64, "Default"),
+    136: kernelInstance( 0, 0, 8, 4, 1, 0, 0, 0, 0, 2,   80,   192,  256,  1,  4,  1,   16,    16,    64, "Default"),
+    137: kernelInstance( 0, 0, 8, 4, 1, 0, 0, 0, 0, 2,   256,   64,  128,  1,  4,  1,   16,    16,    64, "Default"),
+    138: kernelInstance( 0, 0, 8, 4, 1, 0, 0, 0, 0, 2,   112,  256,  256,  1,  4,  1,   16,    16,    64, "Default"),
+
+}
+# '''
+
+default_kernels_dict_942 = {
+    (-1): kernelInstance(0, 0, 8, 4, 1, 0, 0, 0, 0, 1, 128,   128,   128,  1,  4,  1,   16,    16,    64, "Default"),
+    (-2):kernelInstance( 0, 0, 8, 4, 1, 0, 0, 0, 0, 1, 16,    64,    512,  1,  4,  1,   16,    16,    64, "Default"),
+    (-3):kernelInstance( 0, 0, 8, 4, 1, 0, 0, 0, 0, 1, 32,    64,    512,  1,  4,  1,   16,    16,    64, "Default"),
+    (-4):kernelInstance( 0, 0, 8, 4, 1, 0, 0, 0, 0, 1, 64,    256,   64,   1,  4,  1,   16,    16,    64, "Default"),
+    (-5):kernelInstance( 0, 0, 8, 4, 1, 0, 0, 0, 0, 1, 128,   128,   64,   1,  4,  1,   16,    16,    64, "Default"),
+    (-6):kernelInstance( 0, 0, 8, 4, 1, 0, 0, 0, 0, 1, 128,   64,   128,   1,  4,  1,   16,    16,    64, "Default"),
+    (-7):kernelInstance( 0, 0, 8, 4, 1, 0, 0, 0, 0, 1, 64,   256,   128,   1,  4,  1,   16,    16,    64, "Default"),
+}
+
+kernels_list_950 = {
+    0: kernelInstance( 0, 0, 8, 4, 1, 0, 0, 0, 0, 1,   128,   128,   128,  1,  4,  1,   16,    16,    128, "Default"),
+    1: kernelInstance( 0, 0, 8, 4, 1, 0, 0, 0, 0, 1,   128,   128,   256,  1,  4,  1,   16,    16,    128, "Default"),
+    2: kernelInstance( 0, 0, 8, 4, 1, 0, 0, 0, 0, 1,   16,    64,    512,  1,  4,  1,   16,    16,    128, "Default"),
+    3: kernelInstance( 0, 0, 8, 4, 1, 0, 0, 0, 0, 1,   16,    128,   512,  1,  4,  1,   16,    16,    128, "Default"),
+    4: kernelInstance( 0, 0, 8, 4, 1, 0, 0, 0, 0, 1,   16,    256,   512,  1,  4,  1,   16,    16,    128, "Default"),
+    5: kernelInstance( 0, 0, 8, 4, 1, 0, 0, 0, 0, 1,   16,    64,    256,  1,  4,  1,   16,    16,    128, "Default"),
+    6: kernelInstance( 0, 0, 8, 4, 1, 0, 0, 0, 0, 1,   16,    128,   256,  1,  4,  1,   16,    16,    128, "Default"),
+    7: kernelInstance( 0, 0, 8, 4, 1, 0, 0, 0, 0, 1,   16,    256,   256,  1,  4,  1,   16,    16,    128, "Default"),
+    8: kernelInstance( 0, 0, 8, 4, 1, 0, 0, 0, 0, 1,   16,    512,   256,  1,  4,  1,   16,    16,    128, "Default"),
+    9: kernelInstance( 0, 0, 8, 4, 1, 0, 0, 0, 0, 1,   32,    64,    512,  1,  4,  1,   16,    16,    128, "Default"),
+    10: kernelInstance( 0, 0, 8, 4, 1, 0, 0, 0, 0, 1,  256,   256,   128,  1,  4,  1,   16,    16,    128, "Default"),
+    11: kernelInstance( 0, 0, 8, 4, 1, 0, 0, 0, 0, 1,  128,   64,   128,   1,  4,  1,   16,    16,    128, "Default"),
+    12: kernelInstance( 0, 0, 8, 4, 1, 0, 0, 0, 0, 1,  128,   64,   256,   1,  4,  1,   16,    16,    128, "Default"),
+    13: kernelInstance( 0, 0, 8, 4, 1, 0, 0, 0, 0, 2,  256,  128,   128,   1,  4,  1,   16,    16,    128, "Default"),
+    14: kernelInstance( 0, 0, 8, 4, 1, 0, 0, 0, 0, 1,  128,   256,   128,  1,  4,  1,   16,    16,    128, "Default"),
+    15: kernelInstance( 0, 0, 8, 4, 1, 0, 0, 0, 0, 1,   32,   64,    128,  1,  4,  1,   16,    16,    128, "Default"),
+    16: kernelInstance( 0, 0, 8, 4, 1, 0, 0, 0, 0, 1,   64,   64,    128,  1,  4,  1,   16,    16,    128, "Default"),
+    17: kernelInstance( 0, 0, 8, 4, 1, 0, 0, 0, 0, 1,   32,   128,   128,  1,  4,  1,   16,    16,    128, "Default"),
+    18: kernelInstance( 0, 0, 8, 4, 1, 0, 0, 0, 0, 1,   64,   128,   128,  1,  4,  1,   16,    16,    128, "Default"),
+    19: kernelInstance( 0, 0, 8, 4, 1, 0, 0, 0, 0, 1,   32,   256,   128,  1,  4,  1,   16,    16,    128, "Default"),
+    20: kernelInstance( 0, 0, 8, 4, 1, 0, 0, 0, 0, 1,   64,   256,   128,  1,  4,  1,   16,    16,    128, "Default"),
+    21: kernelInstance( 0, 0, 8, 4, 1, 0, 0, 0, 0, 1,   32,    64,   256,  1,  4,  1,   16,    16,    128, "Default"),
+    22: kernelInstance( 0, 0, 8, 4, 1, 0, 0, 0, 0, 1,   64,    64,   256,  1,  4,  1,   16,    16,    128, "Default"),
+    23: kernelInstance( 0, 0, 8, 4, 1, 0, 0, 0, 0, 1,   32,   128,   256,  1,  4,  1,   16,    16,    128, "Default"),
+    24: kernelInstance( 0, 0, 8, 4, 1, 0, 0, 0, 0, 1,   64,   128,   256,  1,  4,  1,   16,    16,    128, "Default"),
+    25: kernelInstance( 0, 0, 8, 4, 1, 0, 0, 0, 0, 1,   32,   192,   128,  1,  4,  1,   16,    16,    128, "Default"),
+    26: kernelInstance( 0, 0, 8, 4, 1, 0, 0, 0, 0, 1,   64,   192,   128,  1,  4,  1,   16,    16,    128, "Default"),
+    27: kernelInstance( 0, 0, 8, 4, 1, 0, 0, 0, 0, 1,   128,  192,   128,  1,  4,  1,   16,    16,    128, "Default"),
+    28: kernelInstance( 0, 0, 8, 4, 1, 0, 0, 0, 0, 2,   128,  128,   128,  1,  4,  1,   16,    16,    128, "Default"),
+    29: kernelInstance( 0, 0, 8, 4, 1, 0, 0, 0, 0, 2,   128,  128,   256,  1,  4,  1,   16,    16,    128, "Default"),
+    30: kernelInstance( 0, 0, 8, 4, 1, 0, 0, 0, 0, 2,   16,   64,    512,  1,  4,  1,   16,    16,    128, "Default"),
+    31: kernelInstance( 0, 0, 8, 4, 1, 0, 0, 0, 0, 2,   16,   128,   512,  1,  4,  1,   16,    16,    128, "Default"),
+    32: kernelInstance( 0, 0, 8, 4, 1, 0, 0, 0, 0, 2,   16,   256,   512,  1,  4,  1,   16,    16,    128, "Default"),
+    33: kernelInstance( 0, 0, 8, 4, 1, 0, 0, 0, 0, 2,   16,   64,    256,  1,  4,  1,   16,    16,    128, "Default"),
+    34: kernelInstance( 0, 0, 8, 4, 1, 0, 0, 0, 0, 2,   16,   128,   256,  1,  4,  1,   16,    16,    128, "Default"),
+    35: kernelInstance( 0, 0, 8, 4, 1, 0, 0, 0, 0, 2,   16,   256,   256,  1,  4,  1,   16,    16,    128, "Default"),
+    36: kernelInstance( 0, 0, 8, 4, 1, 0, 0, 0, 0, 2,   16,   512,   256,  1,  4,  1,   16,    16,    128, "Default"),
+    37: kernelInstance( 0, 0, 8, 4, 1, 0, 0, 0, 0, 2,   32,   64,    512,  1,  4,  1,   16,    16,    128, "Default"),
+    38: kernelInstance( 0, 0, 8, 4, 1, 0, 0, 0, 0, 2,   192,   64,   128,  1,  4,  1,   16,    16,   128, "Default"),
+    39: kernelInstance( 0, 0, 8, 4, 1, 0, 0, 0, 0, 2,  128,   64,   128,   1,  4,  1,   16,    16,    128, "Default"),
+    40: kernelInstance( 0, 0, 8, 4, 1, 0, 0, 0, 0, 2,  128,   64,   256,   1,  4,  1,   16,    16,    128, "Default"),
+    41: kernelInstance( 0, 0, 8, 4, 1, 0, 0, 0, 0, 2,   80,   256,   256,  1,  4,  1,   16,    16,   128, "Default"),
+    42: kernelInstance( 0, 0, 8, 4, 1, 0, 0, 0, 0, 2,  128,   256,   128,  1,  4,  1,   16,    16,    128, "Default"),
+    43: kernelInstance( 0, 0, 8, 4, 1, 0, 0, 0, 0, 2,   32,   64,    128,  1,  4,  1,   16,    16,    128, "Default"),
+    44: kernelInstance( 0, 0, 8, 4, 1, 0, 0, 0, 0, 2,   64,   64,    128,  1,  4,  1,   16,    16,    128, "Default"),
+    45: kernelInstance( 0, 0, 8, 4, 1, 0, 0, 0, 0, 2,   32,   128,   128,  1,  4,  1,   16,    16,    128, "Default"),
+    46: kernelInstance( 0, 0, 8, 4, 1, 0, 0, 0, 0, 2,   64,   128,   128,  1,  4,  1,   16,    16,    128, "Default"),
+    47: kernelInstance( 0, 0, 8, 4, 1, 0, 0, 0, 0, 2,   32,   256,   128,  1,  4,  1,   16,    16,    128, "Default"),
+    48: kernelInstance( 0, 0, 8, 4, 1, 0, 0, 0, 0, 2,   64,   256,   128,  1,  4,  1,   16,    16,    128, "Default"),
+    49: kernelInstance( 0, 0, 8, 4, 1, 0, 0, 0, 0, 2,   32,    64,   256,  1,  4,  1,   16,    16,    128, "Default"),
+    50: kernelInstance( 0, 0, 8, 4, 1, 0, 0, 0, 0, 2,   64,    64,   256,  1,  4,  1,   16,    16,    128, "Default"),
+    51: kernelInstance( 0, 0, 8, 4, 1, 0, 0, 0, 0, 2,   32,   128,   256,  1,  4,  1,   16,    16,    128, "Default"),
+    52: kernelInstance( 0, 0, 8, 4, 1, 0, 0, 0, 0, 2,   64,   128,   256,  1,  4,  1,   16,    16,    128, "Default"),
+    53: kernelInstance( 0, 0, 8, 4, 1, 0, 0, 0, 0, 2,   32,   192,   128,  1,  4,  1,   16,    16,    128, "Default"),
+    54: kernelInstance( 0, 0, 8, 4, 1, 0, 0, 0, 0, 2,   64,   192,   128,  1,  4,  1,   16,    16,    128, "Default"),
+    55: kernelInstance( 0, 0, 8, 4, 1, 0, 0, 0, 0, 2,   128,  192,   128,  1,  4,  1,   16,    16,    128, "Default"),
+    56: kernelInstance( 0, 0, 8, 4, 1, 0, 0, 0, 0, 1,   16,   192,   256,  1,  4,  1,   16,    16,    128, "Default"),
+    57: kernelInstance( 0, 0, 8, 4, 1, 0, 0, 0, 0, 1,   32,   192,   256,  1,  4,  1,   16,    16,    128, "Default"),
+    58: kernelInstance( 0, 0, 8, 4, 1, 0, 0, 0, 0, 1,   64,   192,   256,  1,  4,  1,   16,    16,    128, "Default"),
+    59: kernelInstance( 0, 0, 8, 4, 1, 0, 0, 0, 0, 1,   64,   256,   256,  1,  4,  1,   16,    16,    128, "Default"),
+    60: kernelInstance( 0, 0, 8, 4, 1, 0, 0, 0, 0, 1,   32,   256,   256,  1,  4,  1,   16,    16,    128, "Default"),
+    61: kernelInstance( 0, 0, 8, 4, 1, 0, 0, 0, 0, 1,   16,   512,   256,  1,  4,  1,   16,    16,    128, "Default"),
+    62: kernelInstance( 0, 0, 8, 4, 1, 0, 0, 0, 0, 2,   80,   192,   256,  1,  4,  1,   16,    16,    128, "Default"),
+    63: kernelInstance( 0, 0, 8, 4, 1, 0, 0, 0, 0, 1,   16,   256,   512,  1,  4,  1,   16,    16,    128, "Default"),
+    64: kernelInstance( 0, 0, 8, 4, 1, 0, 0, 0, 0, 1,   16,   256,   256,  1,  4,  1,   16,    16,    128, "Default"),
+    65: kernelInstance( 0, 0, 8, 4, 1, 0, 0, 0, 0, 2,   16,   192,   256,  1,  4,  1,   16,    16,    128, "Default"),
+    66: kernelInstance( 0, 0, 8, 4, 1, 0, 0, 0, 0, 2,   32,   192,   256,  1,  4,  1,   16,    16,    128, "Default"),
+    67: kernelInstance( 0, 0, 8, 4, 1, 0, 0, 0, 0, 2,   64,   192,   256,  1,  4,  1,   16,    16,    128, "Default"),
+    68: kernelInstance( 0, 0, 8, 4, 1, 0, 0, 0, 0, 2,   64,   256,   256,  1,  4,  1,   16,    16,    128, "Default"),
+    69: kernelInstance( 0, 0, 8, 4, 1, 0, 0, 0, 0, 2,   32,   256,   256,  1,  4,  1,   16,    16,    128, "Default"),
+    70: kernelInstance( 0, 0, 8, 4, 1, 0, 0, 0, 0, 2,   16,   512,   256,  1,  4,  1,   16,    16,    128, "Default"),
+    71: kernelInstance( 0, 0, 8, 4, 1, 0, 0, 0, 0, 2,   256,   64,   128,  1,  4,  1,   16,    16,    128, "Default"),
+    72: kernelInstance( 0, 0, 8, 4, 1, 0, 0, 0, 0, 2,   16,   256,   512,  1,  4,  1,   16,    16,    128, "Default"),
+    73: kernelInstance( 0, 0, 8, 4, 1, 0, 0, 0, 0, 2,   16,   256,   256,  1,  4,  1,   16,    16,    128, "Default"),
+    74: kernelInstance( 0, 0, 8, 4, 1, 0, 0, 0, 0, 1,   160,   192,   128, 1,  4,  1,   16,    16,    128, "Default"),
+    75: kernelInstance( 0, 0, 8, 4, 1, 0, 0, 0, 0, 1,   48,    128,   256, 1,  4,  1,   16,    16,    128, "Default"),
+    76: kernelInstance( 0, 0, 8, 4, 1, 0, 0, 0, 0, 1,   96,    192,   128, 1,  4,  1,   16,    16,    128, "Default"),
+    77: kernelInstance( 0, 0, 8, 4, 1, 0, 0, 0, 0, 1,   48,    192,   256, 1,  4,  1,   16,    16,    128, "Default"),
+    78: kernelInstance( 0, 0, 8, 4, 1, 0, 0, 0, 0, 1,   48,    64,    256, 1,  4,  1,   16,    16,    128, "Default"),
+    79: kernelInstance( 0, 0, 8, 4, 1, 0, 0, 0, 0, 1,   96,    64,    128, 1,  4,  1,   16,    16,    128, "Default"),
+    80: kernelInstance( 0, 0, 8, 4, 1, 0, 0, 0, 0, 1,   96,    128,   128, 1,  4,  1,   16,    16,    128, "Default"),
+    81: kernelInstance( 0, 0, 8, 4, 1, 0, 0, 0, 0, 1,   96,    192,   128, 1,  4,  1,   16,    16,    128, "Default"),
+    82: kernelInstance( 0, 0, 8, 4, 1, 0, 0, 0, 0, 1,   96,    256,   128, 1,  4,  1,   16,    16,    128, "Default"),
+    83: kernelInstance( 0, 0, 8, 4, 1, 0, 0, 0, 0, 1,   48,    64,    256, 1,  4,  1,   16,    16,    128, "Default"),
+    84: kernelInstance( 0, 0, 8, 4, 1, 0, 0, 0, 0, 1,   80,    64,    256, 1,  4,  1,   16,    16,    128, "Default"),
+    85: kernelInstance( 0, 0, 8, 4, 1, 0, 0, 0, 0, 1,   96,    64,    256, 1,  4,  1,   16,    16,    128, "Default"),
+    86: kernelInstance( 0, 0, 8, 4, 1, 0, 0, 0, 0, 1,   112,   128,   256, 1,  4,  1,   16,    16,    128, "Default"),
+    87: kernelInstance( 0, 0, 8, 4, 1, 0, 0, 0, 0, 1,   112,   64,    256, 1,  4,  1,   16,    16,    128, "Default"),
+    88: kernelInstance( 0, 0, 8, 4, 1, 0, 0, 0, 0, 1,   160,   192,   128, 1,  4,  1,   16,    16,    128, "Default"),
+    89: kernelInstance( 0, 0, 8, 4, 1, 0, 0, 0, 0, 1,   224,   192,   128, 1,  4,  1,   16,    16,    128, "Default"),
+    90: kernelInstance( 0, 0, 8, 4, 1, 0, 0, 0, 0, 1,   256,   192,   128, 1,  4,  1,   16,    16,    128, "Default"),
+    91: kernelInstance( 0, 0, 8, 4, 1, 0, 0, 0, 0, 1,   48,    256,   256, 1,  4,  1,   16,    16,    128, "Default"),
+    92: kernelInstance( 0, 0, 8, 4, 1, 0, 0, 0, 0, 1,   80,    128,   256, 1,  4,  1,   16,    16,    128, "Default"),
+    93: kernelInstance( 0, 0, 8, 4, 1, 0, 0, 0, 0, 1,   224,    64,   128, 1,  4,  1,   16,    16,    128, "Default"),
+    94: kernelInstance( 0, 0, 8, 4, 1, 0, 0, 0, 0, 1,   112,   192,   256, 1,  4,  1,   16,    16,    128, "Default"),
+    95: kernelInstance( 0, 0, 8, 4, 1, 0, 0, 0, 0, 1,   128,   192,   256, 1,  4,  1,   16,    16,    128, "Default"),
+    96: kernelInstance( 0, 0, 8, 4, 1, 0, 0, 0, 0, 1,   192,   128,   128, 1,  4,  1,   16,    16,    128, "Default"),
+    97: kernelInstance( 0, 0, 8, 4, 1, 0, 0, 0, 0, 1,   224,   128,   128, 1,  4,  1,   16,    16,    128, "Default"),
+    98: kernelInstance( 0, 0, 8, 4, 1, 0, 0, 0, 0, 1,   96,   192,   256,  1,  4,  1,   16,    16,    128, "Default"),
+    99: kernelInstance( 0, 0, 8, 4, 1, 0, 0, 0, 0, 1,   96,   128,   256,  1,  4,  1,   16,    16,    128, "Default"),
+    100: kernelInstance( 0, 0, 8, 4, 1, 0, 0, 0, 0, 1,  256,  128,   128,  1,  4,  1,   16,    16,    128, "Default"),
+    101: kernelInstance( 0, 0, 8, 4, 1, 0, 0, 0, 0, 1,  80,   256,   256,  1,  4,  1,   16,    16,    128, "Default"),
+    102: kernelInstance( 0, 0, 8, 4, 1, 0, 0, 0, 0, 1,  192,   64,   128,  1,  4,  1,   16,    16,    128, "Default"),
+    103: kernelInstance( 0, 0, 8, 4, 1, 0, 0, 0, 0, 1,  80,   192,   256,  1,  4,  1,   16,    16,    128, "Default"),
+    104: kernelInstance( 0, 0, 8, 4, 1, 0, 0, 0, 0, 1,  256,   64,   128,  1,  4,  1,   16,    16,    128, "Default"),
+    105: kernelInstance( 0, 0, 8, 4, 1, 0, 0, 0, 0, 1,  112,  256,   256,  1,  4,  1,   16,    16,    128, "Default"),
+    106: kernelInstance( 0, 0, 8, 4, 1, 0, 0, 0, 0, 1,  96,   256,   256,  1,  4,  1,   16,    16,    128, "Default"),
+    107: kernelInstance( 0, 0, 8, 4, 1, 0, 0, 0, 0, 2,  48,   128,   256,  1,  4,  1,   16,    16,    128, "Default"),
+    108: kernelInstance( 0, 0, 8, 4, 1, 0, 0, 0, 0, 2,  96,   192,   128,  1,  4,  1,   16,    16,    128, "Default"),
+    109: kernelInstance( 0, 0, 8, 4, 1, 0, 0, 0, 0, 2,  48,   192,   256,  1,  4,  1,   16,    16,    128, "Default"),
+    110: kernelInstance( 0, 0, 8, 4, 1, 0, 0, 0, 0, 2,  48,    64,   256,  1,  4,  1,   16,    16,    128, "Default"),
+    111: kernelInstance( 0, 0, 8, 4, 1, 0, 0, 0, 0, 2,  96,    64,   128,  1,  4,  1,   16,    16,    128, "Default"),
+    112: kernelInstance( 0, 0, 8, 4, 1, 0, 0, 0, 0, 2,   96,   128,  128,  1,  4,  1,   16,    16,    128, "Default"),
+    113: kernelInstance( 0, 0, 8, 4, 1, 0, 0, 0, 0, 2,   96,   256,  256,  1,  4,  1,   16,    16,    128, "Default"),
+    114: kernelInstance( 0, 0, 8, 4, 1, 0, 0, 0, 0, 2,   96,   192,  128,  1,  4,  1,   16,    16,    128, "Default"),
+    115: kernelInstance( 0, 0, 8, 4, 1, 0, 0, 0, 0, 2,   96,   256,  128,  1,  4,  1,   16,    16,    128, "Default"),
+    116: kernelInstance( 0, 0, 8, 4, 1, 0, 0, 0, 0, 2,   48,   64,   256,  1,  4,  1,   16,    16,    128, "Default"),
+    117: kernelInstance( 0, 0, 8, 4, 1, 0, 0, 0, 0, 2,   80,   64,   256,  1,  4,  1,   16,    16,    128, "Default"),
+    118: kernelInstance( 0, 0, 8, 4, 1, 0, 0, 0, 0, 2,   96,   64,   256,  1,  4,  1,   16,    16,    128, "Default"),
+    119: kernelInstance( 0, 0, 8, 4, 1, 0, 0, 0, 0, 2,   112,  128,  256,  1,  4,  1,   16,    16,    128, "Default"),
+    120: kernelInstance( 0, 0, 8, 4, 1, 0, 0, 0, 0, 2,   112,  64,   256,  1,  4,  1,   16,    16,    128, "Default"),
+    121: kernelInstance( 0, 0, 8, 4, 1, 0, 0, 0, 0, 2,   160,  192,  128,  1,  4,  1,   16,    16,    128, "Default"),
+    122: kernelInstance( 0, 0, 8, 4, 1, 0, 0, 0, 0, 2,   224,  192,  128,  1,  4,  1,   16,    16,    128, "Default"),
+    123: kernelInstance( 0, 0, 8, 4, 1, 0, 0, 0, 0, 2,   256,  192,  128,  1,  4,  1,   16,    16,    128, "Default"),
+    124: kernelInstance( 0, 0, 8, 4, 1, 0, 0, 0, 0, 2,   48,   256,  256,  1,  4,  1,   16,    16,    128, "Default"),
+    125: kernelInstance( 0, 0, 8, 4, 1, 0, 0, 0, 0, 2,   80,   128,  256,  1,  4,  1,   16,    16,    128, "Default"),
+    126: kernelInstance( 0, 0, 8, 4, 1, 0, 0, 0, 0, 2,   224,   64,  128,  1,  4,  1,   16,    16,    128, "Default"),
+    127: kernelInstance( 0, 0, 8, 4, 1, 0, 0, 0, 0, 2,   112,  192,  256,  1,  4,  1,   16,    16,    128, "Default"),
+    128: kernelInstance( 0, 0, 8, 4, 1, 0, 0, 0, 0, 2,   128,  192,  256,  1,  4,  1,   16,    16,    128, "Default"),
+    129: kernelInstance( 0, 0, 8, 4, 1, 0, 0, 0, 0, 2,   192,  128,  128,  1,  4,  1,   16,    16,    128, "Default"),
+    130: kernelInstance( 0, 0, 8, 4, 1, 0, 0, 0, 0, 2,   224,  128,  128,  1,  4,  1,   16,    16,    128, "Default"),
+    131: kernelInstance( 0, 0, 8, 4, 1, 0, 0, 0, 0, 2,   96,   192,  256,  1,  4,  1,   16,    16,    128, "Default"),
+    132: kernelInstance( 0, 0, 8, 4, 1, 0, 0, 0, 0, 2,   96,   128,  256,  1,  4,  1,   16,    16,    128, "Default"),
+
+
+}
+
+# QuantGemmKernel(RowColQuant) x WeightPreshufflePipelineAGmemBGmemCRegV2.
+# Same host-side inputs as the flatmm_v1 table above (B preshuffled with
+# shuffle_weight(16, 16), native per-token/per-channel scales); only the
+# device-side composition differs.
+#
+# Kept in a SEPARATE table, appended after the flatmm table has been
+# BlockPerCu-expanded, so that adding a rowcol tile can never renumber an
+# existing flatmm kernelId. Ids here are local to this table.
+#
+# The quant route runs unpadded, so a tile is only a candidate where it divides
+# M, N and K. These are chosen to be divisible for the live GLM-5.2 N/K pairs
+# (N in {2688, 6144}, K in {6144, 12288}) -- note 2688 % 192 == 0 but
+# 2688 % 256 != 0, and no MTile divides M == 1.
+# fmt: off
+kernels_list_950_rowcol_wp_v2 = {
+    #   N_Tile == 128 family:
+    0: kernelInstance( 0, 0, 8, 4, 1, 0, 0, 0, 0, 1,   16,   128,   256,  1,  4,  1,   16,    16,    128, "Intrawave", "rowcol_wp_v2"),
+    1: kernelInstance( 0, 0, 8, 4, 1, 0, 0, 0, 0, 1,   32,   128,   256,  1,  4,  1,   16,    16,    128, "Intrawave", "rowcol_wp_v2"),
+    2: kernelInstance( 0, 0, 8, 4, 1, 0, 0, 0, 0, 1,   64,   128,   256,  1,  4,  1,   16,    16,    128, "Intrawave", "rowcol_wp_v2"),
+    3: kernelInstance( 0, 0, 8, 4, 1, 0, 0, 0, 0, 1,  128,   128,   128,  1,  4,  1,   16,    16,    128, "Intrawave", "rowcol_wp_v2"),
+    4: kernelInstance( 0, 0, 8, 4, 1, 0, 0, 0, 0, 1,  128,   128,   256,  1,  4,  1,   16,    16,    128, "Intrawave", "rowcol_wp_v2"),
+    5: kernelInstance( 0, 0, 8, 4, 1, 0, 0, 0, 0, 1,  128,   128,   256,  1,  4,  1,   16,    16,    128, "Default",   "rowcol_wp_v2"),
+    #   narrow-N / small-M, where 32-64 x 64 tiles lead at M <= 1024:
+    6: kernelInstance( 0, 0, 8, 4, 1, 0, 0, 0, 0, 1,   16,    64,   512,  1,  4,  1,   16,    16,    128, "Intrawave", "rowcol_wp_v2"),
+    7: kernelInstance( 0, 0, 8, 4, 1, 0, 0, 0, 0, 1,   32,    64,   512,  1,  4,  1,   16,    16,    128, "Intrawave", "rowcol_wp_v2"),
+    8: kernelInstance( 0, 0, 8, 4, 1, 0, 0, 0, 0, 1,   64,    64,   256,  1,  4,  1,   16,    16,    128, "Intrawave", "rowcol_wp_v2"),
+    #   wide-N / large-M, where 192-wide tiles lead at M >= 2048:
+    9: kernelInstance( 0, 0, 8, 4, 1, 0, 0, 0, 0, 1,  128,   192,   128,  1,  4,  1,   16,    16,    128, "Intrawave", "rowcol_wp_v2"),
+   10: kernelInstance( 0, 0, 8, 4, 1, 0, 0, 0, 0, 1,  256,   192,   128,  1,  4,  1,   16,    16,    128, "Intrawave", "rowcol_wp_v2"),
+}
+
+default_kernels_dict_950 = {
+    (-1): kernelInstance( 0, 0, 8, 4, 1, 0, 0, 0, 0,1, 128,   256,   256,  1,  4,  1,   16,    16,    128, "Default"),
+    (-2): kernelInstance( 0, 0, 8, 4, 1, 0, 0, 0, 0,1, 16,    64,    512,  1,  4,  1,   16,    16,    128, "Default"),
+    (-3): kernelInstance( 0, 0, 8, 4, 1, 0, 0, 0, 0,1, 32,    64,    512,  1,  4,  1,   16,    16,    128, "Default"),
+    (-4): kernelInstance( 0, 0, 8, 4, 1, 0, 0, 0, 0,1, 128,   128,   128,  1,  4,  1,   16,    16,    64, "Default"),
+}
+
+# fmt: on
+
+
+def append_expanded(base_expanded, extra):
+    """Append BlockPerCu-expanded `extra` after `base_expanded`, renumbering
+    only the appended entries.
+
+    Kernel ids are positional, so inserting into a table shifts every id after
+    the insertion point -- including the ids `expand_blockpercu` hands out.
+    Growing a secondary table (e.g. the rowcol_wp_v2 candidates) must not
+    renumber the primary one, so it is expanded on its own and appended.
+    """
+    out = dict(base_expanded)
+    next_id = max(out.keys()) + 1
+    for inst in expand_blockpercu(extra).values():
+        out[next_id] = inst
+        next_id += 1
+    return out
+
+
+arch = get_gfx()
+if arch == "gfx942":
+    kernels_list = expand_blockpercu(kernels_list_942)
+    default_kernels_dict = default_kernels_dict_942
+else:
+    kernels_list = append_expanded(
+        expand_blockpercu(kernels_list_950), kernels_list_950_rowcol_wp_v2
+    )
+    default_kernels_dict = default_kernels_dict_950
+
+# Name-based reverse lookup for get_tune_dict() — built once at import time
+kernels_by_name = {v.name: v for v in kernels_list.values()}

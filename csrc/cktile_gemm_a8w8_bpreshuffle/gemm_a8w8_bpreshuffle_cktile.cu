@@ -1,0 +1,136 @@
+// SPDX-License-Identifier: MIT
+// Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+
+#include "gemm_a8w8_bpreshuffle_cktile_common.cuh"
+#include "gemm_a8w8_bpreshuffle_cktile_lookup.h"
+#include "gemm_a8w8_bpreshuffle_cktile_manifest.h"
+#include "gemm_common.h"
+#include "gemm_dispatch_utils.h"
+#include <cmath>
+
+using RowwiseKernel = torch::Tensor (*)(
+    torch::Tensor&, torch::Tensor&, torch::Tensor&, torch::Tensor&, torch::Tensor&, int);
+
+struct RowwiseDispatchEntry
+{
+    RowwiseKernel kernel;
+    bool supports_m_padding;
+    bool supports_k_padding;
+};
+
+using RowwiseKernelMap = GemmDispatchMap<RowwiseDispatchEntry>;
+
+template <typename DDataType, typename EDataType = DDataType>
+RowwiseKernel rowwise_heuristic_dispatch(int M, int N, int K)
+{
+    // Use default kernel for all architectures
+    return a8w8_bpreshuffle_cktile_0x0x8x4x1x0x0x0x0x1_128x128x128_1x4x1_16x16x64_default<
+        DDataType, EDataType>;
+}
+
+// Helper function to return the next largest power of 2
+static constexpr int nextPow2(unsigned int num)
+{
+    if(num <= 1)
+        return 1;
+    return 1 << (CHAR_BIT * sizeof(num) - __builtin_clz(num - 1));
+}
+
+template <typename DDataType, typename EDataType = DDataType>
+RowwiseKernel rowwise_dispatch(int M, int N, int K, int lookup_k)
+{
+    // For a given shape, either find the best kernel via lookup or heuristic.
+    // For many small M shapes, we bucket them to the next largest kernel.
+    // This is fine since kernels are padded anyway.
+
+    static const auto lookup = [] {
+        if constexpr(std::is_same_v<EDataType, F16>)
+        {
+            return RowwiseKernelMap{GENERATE_LOOKUP_TABLE(DDataType, F16)};
+        }
+        else if constexpr(std::is_same_v<EDataType, B16>)
+        {
+            return RowwiseKernelMap{GENERATE_LOOKUP_TABLE(DDataType, B16)};
+        }
+        else
+        {
+            static_assert(false, "rowwise_dispatch used with unsupported dtype!");
+        }
+    }();
+
+    const int cu_num           = get_device_cu_num();
+    const std::string_view gfx = get_device_gfx();
+
+    // First check if this shape(M,N,K) is available in the direct lookup.
+    auto it = lookup.find({gfx, cu_num, M, N, lookup_k});
+    // If we found an optimal kernel, use it.
+    if(it != lookup.end() && (K == lookup_k || it->second.supports_k_padding))
+    {
+        return it->second.kernel;
+    }
+
+    int padded_m = M;
+
+    // Fine-grained search
+    padded_m = getPaddedM(M, N, lookup_k, 0);
+    // Second check if this shape(padded_m,N,K) is available in the direct lookup.
+    it = lookup.find({gfx, cu_num, padded_m, N, lookup_k});
+    // If we found an optimal kernel, use it.
+    if(it != lookup.end() && it->second.supports_m_padding &&
+       (K == lookup_k || it->second.supports_k_padding))
+    {
+        return it->second.kernel;
+    }
+
+    // Coarse-grained search
+    padded_m = getPaddedM(M, N, lookup_k, 1);
+    // Third check if this shape(padded_m,N,K) is available in the direct lookup.
+    it = lookup.find({gfx, cu_num, padded_m, N, lookup_k});
+    // If we found an optimal kernel, use it.
+    if(it != lookup.end() && it->second.supports_m_padding &&
+       (K == lookup_k || it->second.supports_k_padding))
+    {
+        return it->second.kernel;
+    }
+
+    // Otherwise, use heuristics.
+    return rowwise_heuristic_dispatch<DDataType, EDataType>(M, N, K);
+}
+
+torch::Tensor gemm_a8w8_bpreshuffle_cktile(torch::Tensor& XQ,
+                                           torch::Tensor& WQ,
+                                           torch::Tensor& x_scale,
+                                           torch::Tensor& w_scale,
+                                           torch::Tensor& Y,
+                                           int splitK)
+{
+    TORCH_CHECK(XQ.dtype() == WQ.dtype(), "Weights and activations should have the same dtype!");
+    TORCH_CHECK(x_scale.dtype() == w_scale.dtype(), "Scales should have the same dtype!");
+    TORCH_CHECK(splitK >= 0, "splitK must be non-negative!");
+
+    int M      = XQ.size(0);
+    int N      = WQ.size(0);
+    int K      = XQ.size(1);
+    int WQK    = WQ.size(1);
+    int KBatch = 1 << splitK;
+
+    TORCH_CHECK(WQK >= K,
+                "gemm_a8w8_bpreshuffle_cktile requires WQ K >= XQ K, got WQ K=",
+                WQK,
+                ", XQ K=",
+                K);
+
+    if(x_scale.dtype() == at::ScalarType::Float && Y.dtype() == at::ScalarType::Half)
+    {
+        rowwise_dispatch<F32, F16>(M, N, K, WQK)(XQ, WQ, x_scale, w_scale, Y, KBatch);
+    }
+    else if(x_scale.dtype() == at::ScalarType::Float && Y.dtype() == at::ScalarType::BFloat16)
+    {
+        rowwise_dispatch<F32, B16>(M, N, K, WQK)(XQ, WQ, x_scale, w_scale, Y, KBatch);
+    }
+    else
+    {
+        TORCH_CHECK(false, "Unsupported scales/output dtype!");
+    }
+    return Y;
+}

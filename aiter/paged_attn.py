@@ -1,0 +1,360 @@
+"""
+* Copyright (C) Advanced Micro Devices, Inc. All rights reserved.
+* Copyright (C) 2024-2025, The vLLM team.
+*
+* Licensed under the Apache License, Version 2.0 (the "License");
+* you may not use this file except in compliance with the License.
+* You may obtain a copy of the License at
+*
+*      http://www.apache.org/licenses/LICENSE-2.0
+*
+* Unless required by applicable law or agreed to in writing, software
+* distributed under the License is distributed on an "AS IS" BASIS,
+* WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+* See the License for the specific language governing permissions and
+* limitations under the License.
+"""
+
+from dataclasses import dataclass
+
+import torch
+
+import aiter as ops
+from aiter import dtypes
+
+
+# from vllm.utils import is_hip
+def is_hip():
+    return True
+
+
+# if HAS_TRITON:
+# from vllm.attention.ops.prefix_prefill import context_attention_fwd
+
+# Should be the same as PARTITION_SIZE in `paged_attention_v2_launcher`.
+_PARTITION_SIZE = 512 if not is_hip() else 1024
+_PARTITION_SIZE_ROCM = 256
+_DEVICE_PROPERTIES = torch.cuda.get_device_properties("cuda")
+_ON_NAVI = (
+    hasattr(_DEVICE_PROPERTIES, "gcnArchName")
+    and "gfx1" in torch.cuda.get_device_properties("cuda").gcnArchName
+)
+
+
+# page attention ops
+def paged_attention_v1(
+    out: torch.Tensor,
+    query: torch.Tensor,
+    key_cache: torch.Tensor,
+    value_cache: torch.Tensor,
+    num_kv_heads: int,
+    scale: float,
+    block_tables: torch.Tensor,
+    seq_lens: torch.Tensor,
+    block_size: int,
+    max_seq_len: int,
+    alibi_slopes: torch.Tensor | None,
+    kv_cache_dtype: str,
+    k_scale: float,
+    v_scale: float,
+    tp_rank: int = 0,
+    blocksparse_local_blocks: int = 0,
+    blocksparse_vert_stride: int = 0,
+    blocksparse_block_size: int = 64,
+    blocksparse_head_sliding_step: int = 0,
+) -> None:
+    ops.paged_attention_v1(
+        out,
+        query,
+        key_cache,
+        value_cache,
+        num_kv_heads,
+        scale,
+        block_tables,
+        seq_lens,
+        block_size,
+        max_seq_len,
+        alibi_slopes,
+        kv_cache_dtype,
+        k_scale,
+        v_scale,
+        tp_rank,
+        blocksparse_local_blocks,
+        blocksparse_vert_stride,
+        blocksparse_block_size,
+        blocksparse_head_sliding_step,
+    )
+
+
+def paged_attention_v2(
+    out: torch.Tensor,
+    exp_sum: torch.Tensor,
+    max_logits: torch.Tensor,
+    tmp_out: torch.Tensor,
+    query: torch.Tensor,
+    key_cache: torch.Tensor,
+    value_cache: torch.Tensor,
+    num_kv_heads: int,
+    scale: float,
+    block_tables: torch.Tensor,
+    seq_lens: torch.Tensor,
+    block_size: int,
+    max_seq_len: int,
+    alibi_slopes: torch.Tensor | None,
+    kv_cache_dtype: str,
+    k_scale: float,
+    v_scale: float,
+    tp_rank: int = 0,
+    blocksparse_local_blocks: int = 0,
+    blocksparse_vert_stride: int = 0,
+    blocksparse_block_size: int = 64,
+    blocksparse_head_sliding_step: int = 0,
+) -> None:
+    ops.paged_attention_v2(
+        out,
+        exp_sum,
+        max_logits,
+        tmp_out,
+        query,
+        key_cache,
+        value_cache,
+        num_kv_heads,
+        scale,
+        block_tables,
+        seq_lens,
+        block_size,
+        max_seq_len,
+        alibi_slopes,
+        kv_cache_dtype,
+        k_scale,
+        v_scale,
+        tp_rank,
+        blocksparse_local_blocks,
+        blocksparse_vert_stride,
+        blocksparse_block_size,
+        blocksparse_head_sliding_step,
+    )
+
+
+@dataclass
+class PagedAttentionMetadata:
+    """Metadata for PagedAttention."""
+
+    # (batch_size,). The length of sequences (entire tokens seen so far) per
+    # sequence.
+    seq_lens_tensor: torch.Tensor | None
+    # Maximum sequence length in the batch. 0 if it is prefill-only batch.
+    max_decode_seq_len: int
+    # (batch_size, max_blocks_per_seq).
+    # Block addresses per sequence. (Seq id -> list of physical block)
+    # E.g., [0, 1, 2] means tokens are stored in 0th, 1st, and 2nd blocks
+    # in the kv cache. Each block can contain up to block_size tokens.
+    # 2nd dimensions are padded up to max_blocks_per_seq if it is cuda-graph
+    # captured.
+    block_tables: torch.Tensor | None
+
+
+def _use_rocm_custom_paged_attention(
+    qtype: torch.dtype,
+    head_size: int,
+    block_size: int,
+    gqa_ratio: int,
+    max_seq_len: int,
+) -> bool:
+    # rocm custom page attention not support on navi (gfx1*)
+    return (
+        not _ON_NAVI and (gqa_ratio >= 1 and gqa_ratio <= 32) and max_seq_len <= 65536
+    )
+
+
+class PagedAttention:
+    @staticmethod
+    def get_supported_head_sizes() -> list[int]:
+        return [64, 80, 96, 112, 120, 128, 192, 256]
+
+    @staticmethod
+    def get_kv_cache_shape(
+        num_blocks: int,
+        block_size: int,
+        num_kv_heads: int,
+        head_size: int,
+    ) -> tuple[int, ...]:
+        return (2, num_blocks, block_size * num_kv_heads * head_size)
+
+    @staticmethod
+    def split_kv_cache(
+        kv_cache: torch.Tensor,
+        num_kv_heads: int,
+        head_size: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        x = 16 // kv_cache.element_size()
+        num_blocks = kv_cache.shape[1]
+
+        key_cache = kv_cache[0]
+        key_cache = key_cache.view(num_blocks, num_kv_heads, head_size // x, -1, x)
+        value_cache = kv_cache[1]
+        value_cache = value_cache.view(num_blocks, num_kv_heads, head_size, -1)
+        return key_cache, value_cache
+
+    @staticmethod
+    def write_to_paged_cache(
+        key: torch.Tensor,
+        value: torch.Tensor,
+        key_cache: torch.Tensor,
+        value_cache: torch.Tensor,
+        slot_mapping: torch.Tensor,
+        kv_cache_dtype: str,
+        k_scale: torch.Tensor,
+        v_scale: torch.Tensor,
+        asm_layout=False,
+    ) -> None:
+        ops.reshape_and_cache(
+            key,
+            value,
+            key_cache,
+            value_cache,
+            slot_mapping.flatten(),
+            kv_cache_dtype,
+            k_scale,
+            v_scale,
+            asm_layout,
+        )
+
+    @staticmethod
+    def forward_decode(
+        query: torch.Tensor,
+        key_cache: torch.Tensor,
+        value_cache: torch.Tensor,
+        block_tables: torch.Tensor,
+        seq_lens: torch.Tensor,
+        max_seq_len: int,
+        kv_cache_dtype: str,
+        num_kv_heads: int,
+        scale: float,
+        alibi_slopes: torch.Tensor | None,
+        k_scale: torch.Tensor,
+        v_scale: torch.Tensor,
+        q_scale: torch.Tensor | None = None,
+        tp_rank: int = 0,
+        blocksparse_local_blocks: int = 0,
+        blocksparse_vert_stride: int = 0,
+        blocksparse_block_size: int = 64,
+        blocksparse_head_sliding_step: int = 0,
+        fp8_out_scale=None,
+        mtp: int = 1,
+        output_dtype: torch.dtype = None,
+    ) -> torch.Tensor:
+        # Whether to use rocm custom paged attention or not
+        num_seqs, num_heads, head_size = query.shape
+        block_size = key_cache.size(3)
+        output = torch.empty_like(query, dtype=output_dtype)
+
+        max_num_partitions = (
+            max_seq_len + _PARTITION_SIZE_ROCM - 1
+        ) // _PARTITION_SIZE_ROCM
+        tmp_output = torch.empty(
+            size=(num_seqs, num_heads, max_num_partitions, head_size),
+            dtype=output.dtype,
+            device=output.device,
+        )
+        exp_sums = torch.empty(
+            size=(num_seqs, num_heads, max_num_partitions),
+            dtype=dtypes.fp32,
+            device=output.device,
+        )
+        max_logits = torch.empty_like(exp_sums)
+        cpa_fp8_out = False
+        if fp8_out_scale is not None:
+            output = torch.empty_like(output, dtype=dtypes.fp8)
+            cpa_fp8_out = True
+        if scale is None:
+            scale = float(1.0 / (head_size**0.5))
+        torch.ops.aiter.paged_attention_rocm(
+            output,
+            exp_sums,
+            max_logits,
+            tmp_output,
+            query,
+            key_cache,
+            value_cache,
+            num_kv_heads,
+            scale,
+            block_tables,
+            seq_lens,
+            block_size,
+            max_seq_len,
+            alibi_slopes,
+            kv_cache_dtype,
+            k_scale,
+            v_scale,
+            fp8_out_scale if cpa_fp8_out else None,
+            _PARTITION_SIZE_ROCM,
+            q_scale=q_scale,
+            mtp=mtp,
+        )
+        if cpa_fp8_out:
+            return output.view(num_seqs, num_heads * head_size)
+        return output
+
+    # @staticmethod
+    # def forward_prefix(
+    #     query: torch.Tensor,
+    #     key: torch.Tensor,
+    #     value: torch.Tensor,
+    #     kv_cache_dtype: str,
+    #     key_cache: torch.Tensor,
+    #     value_cache: torch.Tensor,
+    #     block_tables: torch.Tensor,
+    #     query_start_loc: torch.Tensor,
+    #     seq_lens_tensor: torch.Tensor,
+    #     context_lens: torch.Tensor,
+    #     max_query_len: int,
+    #     alibi_slopes: Optional[torch.Tensor],
+    #     sliding_window: Optional[int],
+    #     k_scale: float,
+    #     v_scale: float,
+    # ) -> torch.Tensor:
+    #     output = torch.empty_like(query)
+    #     context_attention_fwd(
+    #         query,
+    #         key,
+    #         value,
+    #         output,
+    #         kv_cache_dtype,
+    #         key_cache,
+    #         value_cache,
+    #         block_tables,
+    #         # query_start_loc is (batch_size + 1,)
+    #         query_start_loc[:-1],
+    #         seq_lens_tensor,
+    #         context_lens,
+    #         max_query_len,
+    #         k_scale,
+    #         v_scale,
+    #         alibi_slopes,
+    #         sliding_window,
+    #     )
+    #     return output
+
+    @staticmethod
+    def swap_blocks(
+        src_kv_cache: torch.Tensor,
+        dst_kv_cache: torch.Tensor,
+        src_to_dst: torch.Tensor,
+    ) -> None:
+        src_key_cache = src_kv_cache[0]
+        dst_key_cache = dst_kv_cache[0]
+        ops.swap_blocks(src_key_cache, dst_key_cache, src_to_dst)
+
+        src_value_cache = src_kv_cache[1]
+        dst_value_cache = dst_kv_cache[1]
+        ops.swap_blocks(src_value_cache, dst_value_cache, src_to_dst)
+
+    @staticmethod
+    def copy_blocks(
+        kv_caches: list[torch.Tensor],
+        src_to_dists: torch.Tensor,
+    ) -> None:
+        key_caches = [kv_cache[0] for kv_cache in kv_caches]
+        value_caches = [kv_cache[1] for kv_cache in kv_caches]
+        ops.copy_blocks(key_caches, value_caches, src_to_dists)

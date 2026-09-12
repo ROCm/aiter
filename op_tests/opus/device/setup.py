@@ -1,0 +1,256 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
+"""
+Build opus device-test kernels into a shared library via hipcc.
+No torch/pybind11 headers -- the .so exports only extern "C" functions,
+loaded at runtime via ctypes from test_opus_device.py.
+
+Usage:
+    python setup.py          # build opus_device_test.so
+    python setup.py --clean  # remove built artifacts
+"""
+
+import os
+import subprocess
+import sys
+import time
+
+_THIS_DIR = os.path.dirname(os.path.abspath(__file__))
+_REPO_CSRC = os.path.normpath(
+    os.path.join(_THIS_DIR, "..", "..", "..", "csrc", "include")
+)
+_SO_NAME = "opus_device_test.so"
+
+_CU_SOURCES = [
+    "test_mfma_f16.cu",
+    "test_mfma_f32.cu",
+    "test_mfma_f8.cu",
+    "test_mxfp.cu",
+    "test_wmma_f16.cu",
+    "test_wmma_f32.cu",
+    "test_wmma_f8.cu",
+    "test_wmma_scale.cu",
+    "test_mma_step_k.cu",
+    "test_load_store_if.cu",
+    "test_vector_add.cu",
+    "test_async_load.cu",
+    "test_tr_load_f16.cu",
+    "test_dtype_convert.cu",
+    "test_mdiv.cu",
+    "test_numeric_limits.cu",
+    "test_workgroup_barrier.cu",
+    "test_tdm_gfx1250.cu",
+    "test_finfo.cu",
+    "test_opus_gmem_gfx1201.cu",
+    "test_wmma_gfx1201.cu",
+    "test_wmma_gfx1201_w64.cu",
+    "test_wmma_gfx1201_tiled.cu",
+]
+
+# Sources requiring -mwavefrontsize64 (wave64 builtins).
+_W64_SOURCES = {"test_wmma_gfx1201_w64.cu"}
+
+
+def _detect_arch():
+    try:
+        out = subprocess.check_output(
+            ["rocminfo"], stderr=subprocess.DEVNULL, text=True
+        )
+        for line in out.splitlines():
+            if "gfx" in line and "Name:" in line:
+                name = line.split()[-1].strip()
+                if name.startswith("gfx"):
+                    return name
+    except Exception:  # noqa: BLE001,S110
+        pass
+    # rocminfo is not always installed, and falling straight through to "native" costs
+    # more than an unresolved arch string: the per-arch skip lists below are keyed by
+    # gfx name, so an undetected arch silently stops applying them. torch is already a
+    # hard requirement of the harness that loads the .so, and reports the same name.
+    try:
+        import torch
+
+        props = torch.cuda.get_device_properties(0)
+        name = getattr(props, "gcnArchName", "").split(":")[0]
+    except (ImportError, AttributeError, AssertionError, RuntimeError):
+        name = ""
+    if name.startswith("gfx"):
+        return name
+    return "native"
+
+
+def _find_hipcc():
+    rocm = os.environ.get("ROCM_PATH", "/opt/rocm")
+    candidate = os.path.join(rocm, "bin", "hipcc")
+    if os.path.isfile(candidate):
+        return candidate
+    try:
+        return subprocess.check_output(
+            ["which", "hipcc"], stderr=subprocess.DEVNULL, text=True
+        ).strip()
+    except Exception:  # noqa: BLE001,S110
+        pass
+    return "hipcc"
+
+
+def _compile_one(args):
+    """Compile a single .cu -> .o.  Used as a worker function for parallel builds."""
+    src, obj, hipcc, arch, verbose, *rest = args
+    extra_flags = rest[0] if rest else []
+    cmd = [
+        hipcc,
+        f"--offload-arch={arch}",
+        "-fPIC",
+        "-O3",
+        "-D__HIPCC_RTC__",
+        f"-I{_REPO_CSRC}",
+        f"-I{_THIS_DIR}",
+        *extra_flags,
+        "-c",
+        src,
+        "-o",
+        obj,
+    ]
+    if verbose:
+        print(f"[setup]   {os.path.basename(src)}")
+    t0 = time.monotonic()
+    subprocess.check_call(cmd)
+    elapsed_ms = int((time.monotonic() - t0) * 1000)
+    return os.path.basename(src), elapsed_ms
+
+
+def build(verbose=False, jobs=None):
+    from concurrent.futures import ProcessPoolExecutor, as_completed
+
+    hipcc = _find_hipcc()
+    arch = _detect_arch()
+    so_path = os.path.join(_THIS_DIR, _SO_NAME)
+
+    if jobs is None:
+        jobs = min(len(_CU_SOURCES), os.cpu_count() or 4)
+
+    if verbose:
+        print(f"[setup] arch={arch}, jobs={jobs}")
+
+    # Per-arch skip list: kernels that use builtins not available on the
+    # target arch. Skipped at .so build time so the rest of the suite
+    # still links; the Python harness sees the missing extern "C" launcher
+    # and reports SKIP for those tests.
+    _ARCH_SKIP_SOURCES = {
+        "gfx1250": {
+            # gfx1201 wave64 WMMA builtins; no gfx1250 spelling.
+            "test_wmma_gfx1201_w64.cu",
+            # opus.hpp's wmma<i8, i8, f32, 16, 16, 128> dispatch does not accept the
+            # scale operands the kernel passes.
+            "test_wmma_scale.cu",
+        },
+    }
+
+    # The inverse list: sources that build for one arch and no other. Stated positively
+    # because the alternative is naming every arch a kernel does NOT support, which is a
+    # list that silently goes wrong every time a new one appears.
+    _ARCH_ONLY_SOURCES = {
+        # The tensor DMA opcodes are gfx1250-only.
+        "test_tdm_gfx1250.cu": {"gfx1250"},
+    }
+
+    skip = set(_ARCH_SKIP_SOURCES.get(arch, set()))
+    skip |= {s for s, archs in _ARCH_ONLY_SOURCES.items() if arch not in archs}
+    sources = [s for s in _CU_SOURCES if s not in skip]
+    if verbose:
+        for s in sorted(skip):
+            print(f"[setup]   skip {s} (incompatible with arch={arch})")
+
+    t0 = time.monotonic()
+
+    # Parallel compile: each .cu -> .o
+    tasks = []
+    for s in sources:
+        src = os.path.join(_THIS_DIR, s)
+        obj = os.path.join(_THIS_DIR, s.replace(".cu", ".o"))
+        extra = ["-mwavefrontsize64"] if s in _W64_SOURCES else []
+        tasks.append((src, obj, hipcc, arch, verbose, extra))
+
+    objs = []
+    with ProcessPoolExecutor(max_workers=jobs) as pool:
+        futures = {pool.submit(_compile_one, t): t for t in tasks}
+        for fut in as_completed(futures):
+            name, ms = fut.result()
+            objs.append(futures[fut][1])  # .o path
+            if verbose:
+                print(f"[setup]   {name} done in {ms}ms")
+
+    compile_ms = int((time.monotonic() - t0) * 1000)
+
+    # Link: all .o -> .so
+    t_link = time.monotonic()
+    link_cmd = [
+        hipcc,
+        f"--offload-arch={arch}",
+        "-shared",
+        "-fPIC",
+        *objs,
+        "-o",
+        so_path,
+    ]
+    subprocess.check_call(link_cmd)
+    link_ms = int((time.monotonic() - t_link) * 1000)
+
+    total_ms = int((time.monotonic() - t0) * 1000)
+    print(
+        f"[setup] built {_SO_NAME} in {total_ms}ms "
+        f"(compile {compile_ms}ms, link {link_ms}ms, jobs={jobs})"
+    )
+
+    # Clean up .o files
+    for o in objs:
+        try:
+            os.remove(o)
+        except OSError:
+            pass
+
+    return so_path
+
+
+def clean():
+    import glob as g
+
+    removed = []
+    for pat in [
+        _SO_NAME,
+        "build/",
+        "*.egg-info/",
+        "opus_device_test*.so",
+        "opus_device_test*.pyd",
+        "*.o",
+    ]:
+        for p in g.glob(os.path.join(_THIS_DIR, pat)):
+            try:
+                if os.path.isdir(p):
+                    import shutil
+
+                    shutil.rmtree(p)
+                else:
+                    os.remove(p)
+                removed.append(os.path.basename(p))
+            except OSError:
+                pass
+    if removed:
+        print("Cleaned:", " ".join(removed))
+    else:
+        print("Nothing to clean.")
+
+
+if __name__ == "__main__":
+    if "--clean" in sys.argv:
+        clean()
+    else:
+        verbose = "-v" in sys.argv or "--verbose" in sys.argv
+        jobs = None
+        for arg in sys.argv[1:]:
+            if arg.startswith("-j"):
+                try:
+                    jobs = int(arg[2:])
+                except ValueError:
+                    pass
+        build(verbose=verbose, jobs=jobs)

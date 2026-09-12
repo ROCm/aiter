@@ -1,0 +1,17 @@
+#pragma once
+// SPDX-License-Identifier: MIT
+// Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+#include <torch/extension.h>
+
+void moe_sorting_fwd(torch::Tensor &topk_ids,              // [m, topk]
+                     torch::Tensor &topk_weights,          // [m, topk]
+                     torch::Tensor &sorted_token_ids,      // [max_num_tokens_padded]
+                     torch::Tensor &sorted_weights,        // [max_num_tokens_padded]
+                     torch::Tensor &sorted_expert_ids,     // [max_num_m_blocks]
+                     torch::Tensor &num_valid_ids, // [1]
+                     torch::Tensor &moe_buf,               // [max_num_tokens_padded]
+                     int num_experts,
+                     int unit_size,
+                     std::optional<torch::Tensor> local_expert_mask = std::nullopt,
+                     std::optional<torch::Tensor> num_local_tokens = std::nullopt,
+                     int dispatch_policy = 0);

@@ -1,0 +1,309 @@
+import ctypes
+import math
+
+from jinja2 import Template
+
+from csrc.cpp_itfs.utils import AITER_CORE_DIR, compile_template_op
+
+MD_NAME = "pa"
+
+with open(f"{AITER_CORE_DIR}/csrc/cpp_itfs/pa/pa.cpp.jinja", "r") as f:
+    src_template = Template(f.read())
+
+
+def compile(
+    gqa_ratio: int,
+    head_size: int,
+    npar_loops: int,
+    dtype: str,
+    kv_dtype: str,
+    fp8_kv_dtype: str,
+    out_dtype: str,
+    block_size: int,
+    alibi_enabled: str,
+    mtp: int = 1,
+    quant_method: str = "vllm::Fp8QuantMethod::kPerTensor",
+    v_shuffle: bool = False,
+    folder: str | None = None,
+):
+    return compile_template_op(
+        src_template,
+        MD_NAME,
+        [
+            f"{AITER_CORE_DIR}/csrc/cpp_itfs/utils.h",
+            f"{AITER_CORE_DIR}/csrc/cpp_itfs/pa/pa.cuh",
+            f"{AITER_CORE_DIR}/csrc/cpp_itfs/pa/pa_common.cuh",
+            f"{AITER_CORE_DIR}/csrc/cpp_itfs/pa/pa_kernels.cuh",
+            f"{AITER_CORE_DIR}/csrc/include",
+            f"{AITER_CORE_DIR}/csrc/include/ck_tile",
+        ],
+        gqa_ratio=gqa_ratio,
+        head_size=head_size,
+        npar_loops=npar_loops,
+        dtype=dtype,
+        kv_dtype=kv_dtype,
+        fp8_kv_dtype=fp8_kv_dtype,
+        out_dtype=out_dtype,
+        block_size=block_size,
+        alibi_enabled=alibi_enabled,
+        mtp=mtp,
+        quant_method=quant_method,
+        v_shuffle=v_shuffle,
+        folder=folder,
+    )
+
+
+def validate_paged_attention_rocm_buffers(
+    tmp_out,
+    exp_sums,
+    max_logits,
+    block_tables,
+    context_lens,
+    block_size,
+    max_context_len,
+    partition_size,
+):
+    op_name = "paged_attention_rocm"
+    max_num_partitions = math.ceil(max_context_len / partition_size)
+    # Use the launch-time upper bound rather than reading context_lens data.
+    # context_lens may live on GPU, and scalar extraction would force a sync
+    # and introduce tensor-data-dependent Python in torch.compile paths.
+    min_blocks_per_seq = math.ceil(max_context_len / block_size)
+
+    def _check_partition_dim(name, tensor):
+        if tensor.dim() < 3:
+            raise ValueError(
+                f"{op_name}: {name} must have shape "
+                f"[..., max_num_partitions, head_size], got {tuple(tensor.shape)}"
+            )
+        if tensor.size(2) < max_num_partitions:
+            raise ValueError(
+                f"{op_name}: {name}.size(2)={tensor.size(2)} is too small for "
+                f"max_context_len={max_context_len} and partition_size={partition_size}; "
+                f"need at least {max_num_partitions} partition slots"
+            )
+
+    _check_partition_dim("tmp_out", tmp_out)
+    _check_partition_dim("exp_sums", exp_sums)
+    _check_partition_dim("max_logits", max_logits)
+
+    if block_tables.dim() != 2:
+        raise ValueError(
+            f"{op_name}: block_tables must be 2D "
+            f"[num_seqs, max_num_blocks_per_seq], got {tuple(block_tables.shape)}"
+        )
+    if block_tables.size(1) < min_blocks_per_seq:
+        raise ValueError(
+            f"{op_name}: block_tables.size(1)={block_tables.size(1)} is too small "
+            f"for max_context_len={max_context_len} and block_size={block_size}; "
+            f"need at least {min_blocks_per_seq} block-table entries per sequence"
+        )
+    if context_lens.size(0) != block_tables.size(0):
+        raise ValueError(
+            f"{op_name}: context_lens.size(0)={context_lens.size(0)} must match "
+            f"block_tables.size(0)={block_tables.size(0)}"
+        )
+
+
+def paged_attention_rocm(
+    out,
+    exp_sums,
+    max_logits,
+    tmp_out,
+    query,
+    key_cache,
+    value_cache,
+    num_kv_heads,
+    scale,
+    block_tables,
+    context_lens,
+    block_size,
+    max_context_len,
+    alibi_slopes,
+    kv_cache_dtype,
+    key_scale=None,
+    value_scale=None,
+    fp8_out_scale=None,
+    partition_size=256,
+    mtp=1,
+    query_scale=None,
+):
+    import torch
+
+    from csrc.cpp_itfs.torch_utils import torch_to_c_types
+
+    validate_paged_attention_rocm_buffers(
+        tmp_out,
+        exp_sums,
+        max_logits,
+        block_tables,
+        context_lens,
+        block_size,
+        max_context_len,
+        partition_size,
+    )
+
+    dtype_map = {
+        torch.bfloat16: "__hip_bfloat16",
+        torch.float16: "_Float16",
+        torch.float8_e4m3fnuz: "uint8_t",
+        torch.float8_e4m3fn: "uint8_t",
+    }
+
+    warpSize = torch.cuda.get_device_properties(out.device).warp_size
+
+    dtype = dtype_map[query.dtype]
+    kv_dtype = dtype_map[key_cache.dtype]
+    out_dtype = dtype_map[out.dtype]
+
+    num_seqs = block_tables.size(0)
+    num_heads = query.size(1)
+    head_size = query.size(2)
+    q_stride = query.stride(0)
+    max_num_blocks_per_seq = block_tables.size(1)
+    kv_block_stride = key_cache.stride(0)
+    kv_head_stride = key_cache.stride(1)
+    gqa_ratio = int(num_heads / num_kv_heads)
+    max_num_partitions = math.ceil(max_context_len / partition_size)
+    npar_loops = math.ceil(max_num_partitions / warpSize)
+    v_shuffle = value_cache.dim() == 5
+
+    quant_method = "vllm::Fp8QuantMethod::kPerTensor"
+    if key_scale is not None and key_scale.numel() == (
+        key_cache.size(0) * block_size * num_kv_heads
+    ):
+        quant_method = "vllm::Fp8QuantMethod::kPerHead"
+
+    func = compile(
+        gqa_ratio,
+        head_size,
+        npar_loops,
+        dtype,
+        kv_dtype,
+        kv_cache_dtype,
+        out_dtype,
+        block_size,
+        "true" if alibi_slopes is not None else "false",
+        mtp,
+        quant_method,
+        v_shuffle,
+    )
+
+    alibi_slopes_ptr = (
+        ctypes.cast(alibi_slopes.data_ptr(), ctypes.POINTER(ctypes.c_float))
+        if alibi_slopes is not None
+        else ctypes.POINTER(ctypes.c_int)()
+    )
+
+    context_lens_ptr = ctypes.cast(
+        context_lens.data_ptr(), ctypes.POINTER(ctypes.c_int)
+    )
+    block_tables_ptr = ctypes.cast(
+        block_tables.data_ptr(), ctypes.POINTER(ctypes.c_int)
+    )
+
+    fp8_out_scale_ptr = (
+        ctypes.cast(fp8_out_scale.data_ptr(), ctypes.POINTER(ctypes.c_float))
+        if fp8_out_scale
+        else ctypes.POINTER(ctypes.c_int)()
+    )
+
+    (
+        out_ptr,
+        query_ptr,
+        key_cache_ptr,
+        value_cache_ptr,
+        exp_sums_ptr,
+        max_logits_ptr,
+        tmp_out_ptr,
+        scale,
+        num_seqs,
+        num_kv_heads,
+        num_heads,
+        max_num_blocks_per_seq,
+        max_context_len,
+        q_stride,
+        kv_block_stride,
+        kv_head_stride,
+        stream,
+    ) = torch_to_c_types(
+        out,
+        query,
+        key_cache,
+        value_cache,
+        exp_sums,
+        max_logits,
+        tmp_out,
+        scale,
+        num_seqs,
+        num_kv_heads,
+        num_heads,
+        max_num_blocks_per_seq,
+        max_context_len,
+        q_stride,
+        kv_block_stride,
+        kv_head_stride,
+        torch.cuda.current_stream(query.device),
+    )
+    q_scale_ptr = (
+        ctypes.cast(query_scale.data_ptr(), ctypes.POINTER(ctypes.c_float))
+        if query_scale is not None
+        else ctypes.POINTER(ctypes.c_int)()
+    )
+    k_scale_ptr = (
+        ctypes.cast(key_scale.data_ptr(), ctypes.POINTER(ctypes.c_float))
+        if key_scale is not None
+        else ctypes.POINTER(ctypes.c_int)()
+    )
+    v_scale_ptr = (
+        ctypes.cast(value_scale.data_ptr(), ctypes.POINTER(ctypes.c_float))
+        if value_scale is not None
+        else ctypes.POINTER(ctypes.c_int)()
+    )
+
+    func(
+        out_ptr,
+        exp_sums_ptr,
+        max_logits_ptr,
+        tmp_out_ptr,
+        query_ptr,
+        key_cache_ptr,
+        value_cache_ptr,
+        scale,
+        block_tables_ptr,
+        context_lens_ptr,
+        max_context_len,
+        num_seqs,
+        num_kv_heads,
+        num_heads,
+        max_num_blocks_per_seq,
+        q_stride,
+        kv_block_stride,
+        kv_head_stride,
+        alibi_slopes_ptr,
+        q_scale_ptr,
+        k_scale_ptr,
+        v_scale_ptr,
+        fp8_out_scale_ptr,
+        stream,
+    )
+    return out
+
+
+if __name__ == "__main__":
+    import argparse
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--gqa_ratio", type=int, required=True)
+    parser.add_argument("--head_size", type=int, required=True)
+    parser.add_argument("--npar_loops", type=int, required=True)
+    parser.add_argument("--dtype", type=str, required=True)
+    parser.add_argument("--kv_dtype", type=str, required=True)
+    parser.add_argument("--fp8_kv_dtype", type=str, required=True)
+    parser.add_argument("--out_dtype", type=str, required=True)
+    parser.add_argument("--block_size", type=int, required=True)
+    parser.add_argument("--alibi_enabled", type=str, required=True)
+    parser.add_argument("--mtp", type=int, default=1)
+    parser.add_argument("--folder", type=str, default=None)
+    args = parser.parse_args()
+    compile(**vars(args))

@@ -1,0 +1,121 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2018-2025, Advanced Micro Devices, Inc. All rights reserved.
+
+
+import math
+
+from jinja2 import Template
+
+from csrc.cpp_itfs.sampling.util import get_seed_and_offset
+from csrc.cpp_itfs.utils import AITER_CORE_DIR, compile_template_op, str_to_bool
+
+MD_NAME = "top_k_top_p_sampling_from_probs"
+
+with open(
+    f"{AITER_CORE_DIR}/csrc/cpp_itfs/sampling/top_k_top_p_sampling_from_probs.cpp.jinja",
+    "r",
+) as f:
+    src_template = Template(f.read())
+
+
+def compile(
+    vec_size: int,
+    deterministic: bool,
+    folder: str | None = None,
+):
+    return compile_template_op(
+        src_template,
+        MD_NAME,
+        [
+            f"{AITER_CORE_DIR}/csrc/cpp_itfs/utils.h",
+            f"{AITER_CORE_DIR}/csrc/cpp_itfs/sampling/sampling.cuh",
+            f"{AITER_CORE_DIR}/csrc/cpp_itfs/sampling/vec_dtypes.cuh",
+        ],
+        vec_size=vec_size,
+        deterministic=deterministic,
+        folder=folder,
+    )
+
+
+def top_k_top_p_sampling_from_probs(
+    probs,
+    indices,
+    maybe_top_k_arr,
+    top_k_val,
+    maybe_top_p_arr,
+    top_p_val,
+    deterministic=False,
+    generator=None,
+):
+    import torch
+
+    from csrc.cpp_itfs.torch_utils import torch_to_c_types
+
+    probs = probs.float()
+    top_p_val = float(top_p_val)
+    top_k_val = int(top_k_val)
+    maybe_top_k_arr = maybe_top_k_arr.int() if maybe_top_k_arr is not None else None
+    maybe_top_p_arr = maybe_top_p_arr.float() if maybe_top_p_arr is not None else None
+
+    batch_size = indices.size(0) if indices is not None else probs.size(0)
+    vocab_size = probs.size(1)
+    philox_seed, philox_offset = get_seed_and_offset(
+        batch_size * 32, generator, probs.device
+    )
+
+    output = torch.empty(batch_size, dtype=torch.int32, device=probs.device)
+    vec_size = math.gcd(16 // probs.element_size(), vocab_size)
+    func = compile(vec_size, deterministic)
+    (
+        probs_ptr,
+        output_ptr,
+        indices_ptr,
+        top_k_arr_ptr,
+        top_p_arr_ptr,
+        top_k_val,
+        top_p_val,
+        batch_size,
+        philox_seed,
+        philox_offset,
+        vocab_size,
+        stream,
+    ) = torch_to_c_types(
+        probs,
+        output,
+        indices,
+        maybe_top_k_arr,
+        maybe_top_p_arr,
+        top_k_val,
+        top_p_val,
+        batch_size,
+        philox_seed,
+        philox_offset,
+        vocab_size,
+        torch.cuda.current_stream(),
+    )
+    func(
+        probs_ptr,
+        output_ptr,
+        indices_ptr,
+        top_k_arr_ptr,
+        top_p_arr_ptr,
+        batch_size,
+        top_k_val,
+        top_p_val,
+        philox_seed,
+        philox_offset,
+        vocab_size,
+        stream,
+    )
+    return output
+
+
+if __name__ == "__main__":
+    import argparse
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--d", type=int, required=True)
+    parser.add_argument("--deterministic", type=str_to_bool, required=True)
+    parser.add_argument("--folder", type=str, default=None)
+    args = parser.parse_args()
+    compile(**vars(args))

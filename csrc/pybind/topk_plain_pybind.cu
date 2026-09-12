@@ -1,0 +1,11 @@
+/* SPDX-License-Identifier: MIT
+   Copyright (C) 2025, Advanced Micro Devices, Inc. All rights reserved.
+*/
+#include "topk_plain.h"
+#include "rocm_ops.hpp"
+#include "aiter_stream.h"
+
+PYBIND11_MODULE(AITER_EXTENSION_NAME, m)
+{
+    TOPK_PLAIN_PYBIND;
+}

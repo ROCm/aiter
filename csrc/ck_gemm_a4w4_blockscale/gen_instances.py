@@ -1,0 +1,339 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+import argparse
+import os
+import shutil
+import sys
+from pathlib import Path
+
+import pandas as pd
+
+this_dir = os.path.dirname(os.path.abspath(__file__))
+AITER_CORE_DIR = (
+    os.path.join(os.path.abspath(f"{this_dir}/../../../"), "aiter/jit/utils")
+    if os.path.exists(
+        os.path.join(os.path.abspath(f"{this_dir}/../../../"), "aiter_meta")
+    )
+    else os.path.abspath(f"{this_dir}/../../aiter/jit/utils")
+)
+sys.path.insert(0, AITER_CORE_DIR)
+from chip_info import (
+    build_tune_dict,
+    write_lookup_header,
+    write_name_keyed_lookup_header,
+)
+from gemm_a4w4_blockscale_common import (
+    default_kernels_dict,
+    kernelInstance,
+    kernels_by_name,
+    kernels_list,
+)
+
+"""
+
+a4w4_blockscale_gemm instance gen
+
+"""
+
+
+class gemm_a4w4_blockscale_codegen:
+    def __init__(self, working_path, istune=False):
+        self.working_path = working_path
+        self.impl_path = os.path.join(working_path, "impl")
+        self.instances_path = os.path.join(working_path, "instances")
+        self.istune = istune
+
+    def gen_instance(self, k: kernelInstance):
+        INSTANCE_IMPL = f"""// SPDX-License-Identifier: MIT
+// Copyright (c) 2025, Advanced Micro Devices, Inc. All rights reserved.
+
+#include "gemm_a4w4_blockscale_common.cuh"
+
+template <typename CDataType>
+torch::Tensor
+{k.name}(
+    torch::Tensor &XQ,
+    torch::Tensor &WQ,
+    torch::Tensor &x_scale,
+    torch::Tensor &w_scale,
+    torch::Tensor &Y,
+    int splitK
+    )
+{{{{
+    // The smallest kernel we have available. Works well for memory bound shapes.
+
+    // Check if this input needs to be padded.
+    int M = size_to_dim_(XQ.dim() - 1, XQ.sizes());
+    int N = WQ.size(0);
+    int K = WQ.size(1);
+    // TODO - padding
+    {{INSTANCE_CONTENT_nopad}}
+}}}}
+
+"""
+
+        INSTANCE_CONTENT_nobias = f"""using DeviceGemmInstance = DeviceGemmHelperF4BlockScale<
+            MFMA,
+            CDataType,
+            {k.BLOCK_SIZE},
+            {k.MPerBLOCK}, {k.NPerBLOCK}, {k.KPerBLOCK},
+            {k.AK1}, {k.BK1},
+            {k.MPerXDL}, {k.NPerXDL},
+            {k.WAVE_MAP_M}, {k.WAVE_MAP_N},
+            S<{(", ").join(str(x) for x in k.ABLOCK_TRANSFER)}>,
+            S<{(", ").join(str(x) for x in k.BBLOCK_TRANSFER)}>,
+            {k.CSHUFFLE_MX_PER_WAVE_PERSHUFFLE},
+            {k.CSHUFFLE_NX_PER_WAVE_PERSHUFFLE},
+            S<{(", ").join(str(x) for x in k.CBLOCK_TRANSFER)}>,
+            {k.CBLOCK_SPV},
+            ck::BlockGemmPipelineScheduler::{k.PIPELINE_Sched},
+            ck::BlockGemmPipelineVersion::v{k.PIPELINE_VERSION},
+            ck::tensor_operation::device::GemmSpecialization::{{GemmSpec}}>;
+        // Run kernel instance.
+        return gemm_a4w4_blockscale_impl<CDataType, DeviceGemmInstance>(XQ, WQ, x_scale, w_scale, Y, splitK);
+"""
+        if self.istune:
+            INSTANCE_IMPL_str = INSTANCE_IMPL.format(
+                INSTANCE_CONTENT_pad=(
+                    INSTANCE_CONTENT_nobias.format(GemmSpec="MNKPadding")
+                ),
+                INSTANCE_CONTENT_nopad=(
+                    INSTANCE_CONTENT_nobias.format(GemmSpec="Default")
+                ),
+            )
+        else:
+            INSTANCE_IMPL_str = INSTANCE_IMPL.format(
+                INSTANCE_CONTENT_pad=INSTANCE_CONTENT_nobias.format(
+                    GemmSpec="MNKPadding"
+                ),
+                INSTANCE_CONTENT_nopad=INSTANCE_CONTENT_nobias.format(
+                    GemmSpec="Default"
+                ),
+            )
+
+        Path(os.path.join(self.impl_path, f"{k.name}.cuh")).write_text(
+            INSTANCE_IMPL_str
+        )
+
+        INSTANCE_template = """// SPDX-License-Identifier: MIT
+// Copyright (c) 2025, Advanced Micro Devices, Inc. All rights reserved.
+
+#include "impl/{name}.cuh"
+
+template torch::Tensor
+{name}<{dtypes}>(
+    torch::Tensor &XQ,
+    torch::Tensor &WQ,
+    torch::Tensor &x_scale,
+    torch::Tensor &w_scale,
+    torch::Tensor &Y,
+    int splitK
+    );
+
+"""
+        INSTANCE_dFP32_eBF16 = INSTANCE_template.format(name=k.name, dtypes="B16")
+        INSTANCE_dFP32_eFP16 = INSTANCE_template.format(name=k.name, dtypes="F16")
+        # TODO: dFP8_eFP8
+
+        if self.istune:
+            Path(
+                os.path.join(self.instances_path, f"{k.name}_dBF16_eBF16.cpp")
+            ).write_text(INSTANCE_dFP32_eBF16)
+            Path(
+                os.path.join(self.instances_path, f"{k.name}_dFP32_eFP16.cpp")
+            ).write_text(INSTANCE_dFP32_eFP16)
+        else:
+            Path(
+                os.path.join(self.instances_path, f"{k.name}_dFP32_eBF16.cpp")
+            ).write_text(INSTANCE_dFP32_eBF16)
+            Path(
+                os.path.join(self.instances_path, f"{k.name}_dFP32_eFP16.cpp")
+            ).write_text(INSTANCE_dFP32_eFP16)
+
+    def gen_lookup_dict(self, kernels_dict):
+        """Generate the dispatch lookup header.
+
+        - Tune mode: kernelId-keyed table for *_tune.cu (unchanged).
+        - Non-tune mode: name-keyed registry for the Python-driven dispatch
+          in gemm_a4w4_blockscale.cu.
+        """
+        output_path = os.path.join(self.working_path, "gemm_a4w4_blockscale_lookup.h")
+
+        if self.istune:
+            LOOKUP_head = """#pragma once
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2025, Advanced Micro Devices, Inc. All rights reserved.
+
+#ifdef USE_ROCM
+
+#define GENERATE_LOOKUP_TABLE(CTYPE)                                                                                      \\
+   {                                                                                                                             \\"""
+
+            LOOKUP_template = """
+       {{{MNK},                                                                                                       \\
+        {kernel_name}<CTYPE>}},                       \\"""
+
+            LOOKUP_end = """
+   }
+
+#endif // USE_ROCM
+"""
+            write_lookup_header(
+                output_path,
+                kernels_dict,
+                LOOKUP_head,
+                LOOKUP_template,
+                LOOKUP_end,
+                self.istune,
+            )
+        else:
+            LOOKUP_head = """#pragma once
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2025, Advanced Micro Devices, Inc. All rights reserved.
+
+#ifdef USE_ROCM
+
+#define GENERATE_LOOKUP_TABLE(CTYPE)                                                                                      \\
+   {                                                                                                                             \\"""
+
+            LOOKUP_template = """
+       {{"{kernel_name}",                                                                                                       \\
+        {kernel_name}<CTYPE>}},                       \\"""
+
+            LOOKUP_end = """
+   }
+
+#endif // USE_ROCM
+"""
+            write_name_keyed_lookup_header(
+                output_path,
+                kernels_dict,
+                LOOKUP_head,
+                LOOKUP_template,
+                LOOKUP_end,
+            )
+
+    def gen_manifest_head(self, kernels_dict):
+        MAINFEST_head = """#pragma once
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2025, Advanced Micro Devices, Inc. All rights reserved.
+
+#ifdef USE_ROCM
+
+#include <cstdlib>
+
+#include <torch/extension.h>
+"""
+        MAINFEST_template = """
+template <typename CDataType>
+torch::Tensor
+{kernel_name}(
+    torch::Tensor &XQ,
+    torch::Tensor &WQ,
+    torch::Tensor &x_scale,
+    torch::Tensor &w_scale,
+    torch::Tensor &Y,
+    int splitK);
+"""
+        MAINFEST_end = """
+
+#endif // USE_ROCM
+"""
+
+        with open(
+            os.path.join(self.working_path, "gemm_a4w4_blockscale_manifest.h"), "w"
+        ) as f:
+            f.write(MAINFEST_head)
+            f.writelines(
+                MAINFEST_template.format(kernel_name=k.name)
+                for mnk, k in kernels_dict.items()
+            )
+            f.write(MAINFEST_end)
+
+    def gen_instances(self, kernels_dict):
+        if os.path.exists(self.impl_path):
+            shutil.rmtree(self.impl_path)
+        os.mkdir(self.impl_path)
+        if os.path.exists(self.instances_path):
+            shutil.rmtree(self.instances_path)
+        os.mkdir(self.instances_path)
+
+        for k in kernels_dict.values():
+            self.gen_instance(k)
+
+        self.gen_lookup_dict(kernels_dict)
+        self.gen_manifest_head(kernels_dict)
+
+
+def get_tune_dict(tune_dict_csv):
+    if os.path.exists(tune_dict_csv):
+        df = pd.read_csv(tune_dict_csv)
+        # The a4w4 tuned CSV mixes CK kernels and ASM kernels in one file with
+        # no libtype column.  The Python dispatcher in
+        # aiter/ops/gemm_op_a4w4.py routes ASM rows by
+        # kernelName.startswith("_ZN") (mangled C++ symbol of the ASM kernel);
+        # apply the same filter here so the CK codegen sees only CK rows and
+        # build_tune_dict's strict validation stays effective on genuine CK
+        # references.
+        df = df[~df["kernelName"].astype(str).str.startswith("_ZN")]
+        return build_tune_dict(
+            df,
+            default_kernels_dict,
+            kernels_list,
+            kernels_by_name=kernels_by_name,
+        )
+    return default_kernels_dict
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(
+        prog="generate",
+        description="gen API for CK gemm a4w4 kernel",
+    )
+
+    # the directory for list_blobs/gen_blobs to write files into
+    parser.add_argument(
+        "-w",
+        "--working_path",
+        default="./",
+        required=False,
+        help="the path where all the blobs are going to be generated",
+    )
+
+    parser.add_argument(
+        "-f",
+        "--tune_file",
+        default="aiter/configs/a4w4_blockscale_tuned_gemm.csv",
+        required=False,
+        help="tune_file include the result after run gemm_a4w4_tune.py",
+    )
+
+    parser.add_argument(
+        "--tune", action="store_true", required=False, help="generated tune instances"
+    )
+
+    # parser.add_argument(
+    #     "--out_type",
+    #     default="all",
+    #     required=False,
+    #     help="Specifie the type of scale\n \
+    #         all: [bf16, fp16] \n  \
+    #         bf16, fp16"
+    # )
+
+    # parser.add_argument(
+    #     "--scale_type",
+    #     default="all",
+    #     required=False,
+    #     help="Specifie the type of scale\n \
+    #         all: [fp32, same as out] \n  \
+    #         same: [same as out]"
+    # )
+
+    args = parser.parse_args()
+    codegen = gemm_a4w4_blockscale_codegen(args.working_path, args.tune)
+
+    if args.tune:
+        codegen.gen_instances(kernels_list)
+    else:
+        codegen.gen_instances(get_tune_dict(args.tune_file))

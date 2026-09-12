@@ -1,0 +1,668 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
+
+import functools
+
+import torch
+from torch import Tensor
+
+from ..jit.core import AITER_CSRC_DIR, compile_ops
+from ..utility import dtypes
+from .enum import ActivationType, QuantType
+
+torch.int4 = getattr(torch, "int4", torch.uint32)
+
+
+@compile_ops("module_moe_asm", fc_name="topk_softmax", develop=True)
+def _topk_softmax(
+    topk_weights: Tensor,
+    topk_indices: Tensor,
+    token_expert_indices: Tensor,
+    gating_output: Tensor,
+    softmax_workspace: Tensor,
+    need_renorm: bool,
+    num_shared_experts: int = 0,
+    shared_expert_scoring_func: str = "",
+) -> None: ...
+
+
+def topk_softmax(
+    topk_weights: Tensor,
+    topk_indices: Tensor,
+    token_expert_indices: Tensor,
+    gating_output: Tensor,
+    need_renorm: bool,
+    num_shared_experts: int = 0,
+    shared_expert_scoring_func: str = "",
+) -> None:
+    # The softmax workspace is only touched on the non-power-of-2 / >256-expert
+    # path, but is always allocated here (torch caching allocator) and passed in so
+    # the C side stays torch-free. Size logic mirrors the original C implementation.
+    num_experts_total = gating_output.shape[-1]
+    num_tokens = gating_output.numel() // num_experts_total
+    num_routing_experts = (
+        num_experts_total - num_shared_experts
+        if num_shared_experts > 0
+        else num_experts_total
+    )
+    is_pow_2 = (
+        num_routing_experts != 0
+        and (num_routing_experts & (num_routing_experts - 1)) == 0
+    )
+    needs_workspace = (not is_pow_2) or num_routing_experts > 256
+    workspace_size = num_tokens * num_routing_experts if needs_workspace else 0
+    softmax_workspace = torch.empty(
+        workspace_size, dtype=dtypes.fp32, device=gating_output.device
+    )
+    _topk_softmax(
+        topk_weights,
+        topk_indices,
+        token_expert_indices,
+        gating_output,
+        softmax_workspace,
+        need_renorm,
+        num_shared_experts,
+        shared_expert_scoring_func,
+    )
+
+
+@compile_ops(
+    "module_moe_topksoftmax_asm", fc_name="topk_softmax_asm", ffi_type="ctypes"
+)
+def topk_softmax_asm(
+    topk_weights: Tensor,
+    topk_indices: Tensor,
+    token_expert_indices: Tensor,
+    gating_output: Tensor,
+    need_renorm: bool,
+) -> None: ...
+
+
+@compile_ops("module_moe_topk_ck")
+def topk_sigmoid(
+    topk_weights: Tensor, topk_indices: Tensor, gating_output: Tensor
+) -> None: ...
+
+
+@compile_ops("module_moe_asm", fc_name="moe_sum", develop=True)
+def _moe_sum(input: Tensor, output: Tensor) -> None: ...
+
+
+def moe_sum(input: Tensor, output: Tensor) -> None:
+    # C side only implements topk in {2, 4, 5}; other topk values fall back to
+    # torch.sum on the Python side so the C side stays torch-free.
+    topk = input.shape[1]
+    if topk in (2, 4, 5):
+        _moe_sum(input, output)
+    else:
+        torch.sum(input, dim=1, out=output)
+
+
+@compile_ops("module_moe_asm", develop=True)
+def moe_align_block_size(
+    topk_ids: Tensor,
+    num_experts: int,
+    block_size: int,
+    sorted_token_ids: Tensor,
+    experts_ids: Tensor,
+    token_nums: Tensor,
+    num_tokens_post_pad: Tensor,
+) -> None: ...
+
+
+@compile_ops("module_moe_fmoe_asm", ffi_type="ctypes")
+def fmoe(
+    out: Tensor,
+    input: Tensor,
+    gate: Tensor,
+    down: Tensor,
+    sorted_token_ids: Tensor,
+    sorted_weights: Tensor,
+    sorted_expert_ids: Tensor,
+    num_valid_ids: Tensor,
+    topk: int,
+) -> None: ...
+
+
+@compile_ops("module_moe_fmoe_asm", ffi_type="ctypes")
+def fmoe_int8_g1u0(
+    out: Tensor,
+    input: Tensor,
+    gate: Tensor,
+    down: Tensor,
+    sorted_token_ids: Tensor,
+    sorted_weights: Tensor,
+    sorted_expert_ids: Tensor,
+    num_valid_ids: Tensor,
+    topk: int,
+    input_scale: Tensor,
+    fc1_scale: Tensor,
+    fc2_scale: Tensor,
+    fc2_smooth_scale: Tensor,
+    activation: int | None = ActivationType.Silu.value,
+) -> None: ...
+
+
+@compile_ops("module_moe_fmoe_asm", ffi_type="ctypes")
+def fmoe_g1u1(
+    out: Tensor,
+    input: Tensor,
+    gate: Tensor,
+    down: Tensor,
+    sorted_token_ids: Tensor,
+    sorted_weights: Tensor,
+    sorted_expert_ids: Tensor,
+    num_valid_ids: Tensor,
+    topk: int,
+    input_scale: Tensor,
+    fc1_scale: Tensor,
+    fc2_scale: Tensor,
+    kernelName: str | None = "",
+    fc2_smooth_scale: Tensor | None = None,
+    activation: int | None = ActivationType.Silu.value,
+) -> None: ...
+
+
+@compile_ops("module_moe_fmoe_asm", ffi_type="ctypes")
+def fmoe_g1u1_tkw1(
+    out: Tensor,
+    input: Tensor,
+    gate: Tensor,
+    down: Tensor,
+    sorted_token_ids: Tensor,
+    sorted_weights: Tensor,
+    sorted_expert_ids: Tensor,
+    num_valid_ids: Tensor,
+    topk: int,
+    input_scale: Tensor,
+    fc1_scale: Tensor,
+    fc2_scale: Tensor,
+    kernelName: str | None = "",
+    fc2_smooth_scale: Tensor | None = None,
+    activation: int | None = ActivationType.Silu.value,
+) -> None: ...
+
+
+@compile_ops("module_moe_fmoe_asm", ffi_type="ctypes")
+def fmoe_int8_g1u0_a16(
+    out: Tensor,
+    input: Tensor,  # bf16
+    gate: Tensor,
+    down: Tensor,
+    sorted_token_ids: Tensor,
+    sorted_weights: Tensor,
+    sorted_expert_ids: Tensor,
+    num_valid_ids: Tensor,
+    topk: int,
+    fc1_scale: Tensor,
+    fc2_scale: Tensor,
+    fc1_smooth_scale: Tensor,
+    fc2_smooth_scale: Tensor,
+    activation: int | None = ActivationType.Silu.value,
+) -> None: ...
+
+
+@compile_ops("module_moe_fmoe_asm", ffi_type="ctypes")
+def fmoe_g1u1_a16(
+    out: Tensor,
+    input: Tensor,  # bf16
+    gate: Tensor,
+    down: Tensor,
+    sorted_token_ids: Tensor,
+    sorted_weights: Tensor,
+    sorted_expert_ids: Tensor,
+    num_valid_ids: Tensor,
+    topk: int,
+    fc1_scale: Tensor,
+    fc2_scale: Tensor,
+    fc1_smooth_scale: Tensor,
+    fc2_smooth_scale: Tensor,
+    activation: int | None = ActivationType.Silu.value,
+) -> None: ...
+
+
+@compile_ops("module_moe_fmoe_asm", ffi_type="ctypes")
+def fmoe_fp8_blockscale_g1u1(
+    out: Tensor,
+    input: Tensor,
+    gate: Tensor,
+    down: Tensor,
+    sorted_token_ids: Tensor,
+    sorted_weights: Tensor,
+    sorted_expert_ids: Tensor,
+    num_valid_ids: Tensor,
+    topk: int,
+    input_scale: Tensor,
+    fc1_scale: Tensor,
+    fc2_scale: Tensor,
+    kernelName: str | None = "",
+    fc_scale_blkn: int = 128,
+    fc_scale_blkk: int = 128,
+    fc2_smooth_scale: Tensor | None = None,
+    activation: int | None = ActivationType.Silu.value,
+    block_size_M: int = 32,
+) -> None: ...
+
+
+@compile_ops("module_moe_fmoe_asm", ffi_type="ctypes")
+def moe_stage1_g1u1(
+    input: Tensor,
+    w1: Tensor,
+    w2: Tensor,
+    sorted_token_ids: Tensor,
+    sorted_expert_ids: Tensor,
+    num_valid_ids: Tensor,
+    out: Tensor,
+    inter_dim: int,
+    kernelName: str | None,
+    block_m: int,
+    ksplit: int = 0,
+    activation: int | None = ActivationType.Silu.value,
+    quant_type: int | None = QuantType.No.value,
+    a1_scale: Tensor | None = None,
+    w1_scale: Tensor | None = None,
+    sorted_weights: Tensor | None = None,
+) -> None: ...
+
+
+def cmdGenFunc_ck_moe_stage(
+    hidden_states: Tensor,
+    w1: Tensor,
+    w2: Tensor,
+    sorted_token_ids: Tensor,
+    sorted_expert_ids: Tensor,
+    num_valid_ids: Tensor,
+    out: Tensor,
+    topk: int,
+    kernelName: str | None = None,
+    w1_scale: Tensor | None = None,
+    a1_scale: Tensor | None = None,
+    block_m: int | None = 32,
+    sorted_weights: Tensor | None = None,
+    quant_type: int = 0,
+    activation: int = 0,
+    splitk: int = 1,
+    use_non_temporal_load: bool = False,
+    dst_type: str | None = None,
+    is_shuffled: bool = True,
+):
+
+    mul_routed_weight_stage = 2 if sorted_weights is None else 1
+    is_splitk = splitk > 1 and not kernelName
+    is_splitk = is_splitk or (bool(kernelName) and "Splitk" in kernelName)
+    outtype = str2dtype_dict[dst_type] if is_splitk else out.dtype
+    md_name, blob_gen_cmd = get_moe_stage_module(
+        hidden_states.dtype,
+        w1.dtype,
+        outtype,
+        activation,
+        quant_type,
+        mul_routed_weight_stage,
+        is_shuffled,
+        is_splitk,
+    )
+    return {
+        "md_name": md_name,
+        "blob_gen_cmd": blob_gen_cmd,
+    }
+
+
+def cmdGenFunc_ck_moe_stage2(
+    hidden_states: Tensor,
+    w1: Tensor,
+    w2: Tensor,
+    sorted_token_ids: Tensor,
+    sorted_expert_ids: Tensor,
+    num_valid_ids: Tensor,
+    out: Tensor,
+    topk: int,
+    kernelName: str | None = None,
+    w1_scale: Tensor | None = None,
+    a1_scale: Tensor | None = None,
+    block_m: int | None = 32,
+    sorted_weights: Tensor | None = None,
+    quant_type: int = 0,
+    activation: int = 0,
+    splitk: int = 1,
+    use_non_temporal_load: bool = False,
+    dst_type: str | None = None,
+    is_shuffled: bool = True,
+):
+
+    mul_routed_weight_stage = 1 if sorted_weights is None else 2
+    md_name, blob_gen_cmd = get_moe_stage_module(
+        hidden_states.dtype,
+        w1.dtype,
+        out.dtype,
+        activation,
+        quant_type,
+        mul_routed_weight_stage,
+        is_shuffled,
+    )
+    return {
+        "md_name": md_name,
+        "blob_gen_cmd": blob_gen_cmd,
+    }
+
+
+@compile_ops("module_moe_ck2stages", gen_func=cmdGenFunc_ck_moe_stage)
+def ck_moe_stage1(
+    hidden_states: Tensor,
+    w1: Tensor,
+    w2: Tensor,
+    sorted_token_ids: Tensor,
+    sorted_expert_ids: Tensor,
+    num_valid_ids: Tensor,
+    out: Tensor,
+    topk: int,
+    kernelName: str | None = None,
+    w1_scale: Tensor | None = None,
+    a1_scale: Tensor | None = None,
+    block_m: int | None = 32,
+    sorted_weights: Tensor | None = None,
+    quant_type: int = 0,
+    activation: int = 0,
+    splitk: int | None = 1,
+    use_non_temporal_load: bool = False,
+    dst_type: str | None = None,
+    is_shuffled: bool = True,
+) -> None: ...
+
+
+@compile_ops("module_moe_ck2stages", gen_func=cmdGenFunc_ck_moe_stage2)
+def ck_moe_stage2(
+    inter_states: Tensor,
+    w1: Tensor,
+    w2: Tensor,
+    sorted_token_ids: Tensor,
+    sorted_expert_ids: Tensor,
+    num_valid_ids: Tensor,
+    out: Tensor,
+    topk: int,
+    kernelName: str | None = None,
+    w2_scale: Tensor | None = None,
+    a2_scale: Tensor | None = None,
+    block_m: int | None = 32,
+    sorted_weights: Tensor | None = None,
+    quant_type: int = 0,
+    activation: int = 0,
+    splitk: int = 1,
+    use_non_temporal_load: bool = False,
+    dst_type: str | None = None,
+    is_shuffled: bool = True,
+) -> None: ...
+
+
+@compile_ops("module_moe_cktile2stages", fc_name="cktile_moe_gemm1")
+def moe_cktile2stages_gemm1_ck(
+    XQ: Tensor,
+    WQ: Tensor,
+    Y: Tensor,
+    sorted_ids: Tensor,
+    sorted_expert_ids: Tensor,
+    max_token_ids: Tensor,
+    topk: int,
+    n_padded_zeros: int | None = 0,
+    k_padded_zeros: int | None = 0,
+    topk_weight: Tensor | None = None,
+    x_scale: Tensor | None = None,
+    w_scale: Tensor | None = None,
+    exp_bias: Tensor | None = None,
+    activation: int | None = 0,
+    block_m: int | None = 32,
+    split_k: int | None = 1,
+    kernel_name: str = "",
+) -> Tensor: ...
+
+
+def moe_cktile2stages_gemm1(
+    XQ: Tensor,
+    WQ: Tensor,
+    Y: Tensor,
+    sorted_ids: Tensor,
+    sorted_expert_ids: Tensor,
+    max_token_ids: Tensor,
+    topk: int,
+    n_padded_zeros: int | None = 0,
+    k_padded_zeros: int | None = 0,
+    topk_weight: Tensor | None = None,
+    x_scale: Tensor | None = None,
+    w_scale: Tensor | None = None,
+    exp_bias: Tensor | None = None,
+    activation: int | None = 0,
+    block_m: int | None = 32,
+    split_k: int | None = 1,
+    kernel_name: str = "",
+):
+    return moe_cktile2stages_gemm1_ck(
+        XQ,
+        WQ,
+        Y,
+        sorted_ids,
+        sorted_expert_ids,
+        max_token_ids,
+        topk,
+        n_padded_zeros,
+        k_padded_zeros,
+        topk_weight,
+        x_scale,
+        w_scale,
+        exp_bias,
+        activation,
+        block_m,
+        split_k,
+        kernel_name,
+    )
+
+
+@compile_ops("module_moe_cktile2stages", fc_name="cktile_moe_gemm2")
+def moe_cktile2stages_gemm2_ck(
+    XQ: Tensor,
+    WQ: Tensor,
+    Y: Tensor,
+    sorted_ids: Tensor,
+    sorted_expert_ids: Tensor,
+    max_token_ids: Tensor,
+    topk: int,
+    n_padded_zeros: int | None = 0,
+    k_padded_zeros: int | None = 0,
+    topk_weight: Tensor | None = None,
+    x_scale: Tensor | None = None,
+    w_scale: Tensor | None = None,
+    exp_bias: Tensor | None = None,
+    activation: int | None = 0,
+    block_m: int | None = 32,
+    split_k: int | None = 1,
+    kernel_name: str = "",
+) -> Tensor: ...
+
+
+def moe_cktile2stages_gemm2(
+    XQ: Tensor,
+    WQ: Tensor,
+    Y: Tensor,
+    sorted_ids: Tensor,
+    sorted_expert_ids: Tensor,
+    max_token_ids: Tensor,
+    topk: int,
+    n_padded_zeros: int | None = 0,
+    k_padded_zeros: int | None = 0,
+    topk_weight: Tensor | None = None,
+    x_scale: Tensor | None = None,
+    w_scale: Tensor | None = None,
+    exp_bias: Tensor | None = None,
+    activation: int | None = 0,
+    block_m: int | None = 32,
+    split_k: int | None = 1,
+    kernel_name: str = "",
+):
+    return moe_cktile2stages_gemm2_ck(
+        XQ,
+        WQ,
+        Y,
+        sorted_ids,
+        sorted_expert_ids,
+        max_token_ids,
+        topk,
+        n_padded_zeros,
+        k_padded_zeros,
+        topk_weight,
+        x_scale,
+        w_scale,
+        exp_bias,
+        activation,
+        block_m,
+        split_k,
+        kernel_name,
+    )
+
+
+dtype2str_dict = {
+    dtypes.fp16: "f16",
+    dtypes.bf16: "b16",
+    dtypes.fp8: "f8",
+    dtypes.i8: "i8",
+    dtypes.fp4x2: "fp4x2",
+    torch.uint32: "i4",
+    torch.int4: "i4",
+}
+
+str2dtype_dict = {
+    "f16": dtypes.fp16,
+    "b16": dtypes.bf16,
+}
+
+
+@functools.lru_cache(maxsize=1024)
+def get_moe_stage_module(
+    input_dtype,
+    weight_dtype,
+    output_dtype,
+    activation,
+    quant_type,
+    mul_routed_weight_stage,
+    preshuffle_mode=False,
+    is_splitk=False,
+):
+    if isinstance(activation, int):
+        activation = ActivationType(activation)
+    if isinstance(quant_type, int):
+        quant_type = QuantType(quant_type)
+
+    Adtype = dtype2str_dict[input_dtype]
+    Bdtype = dtype2str_dict[weight_dtype]
+    Cdtype = dtype2str_dict[output_dtype]
+
+    preshuffle_str = ""
+    if preshuffle_mode and weight_dtype == dtypes.fp4x2:
+        preshuffle_str = "--preshuffle"
+
+    splitk_str = "--issplitk" if is_splitk else ""
+    quant_type = (
+        QuantType.per_1x128 if quant_type == QuantType.per_128x128 else quant_type
+    )
+    act = str(activation).split(".")[-1].lower()
+    quant_type = str(quant_type).split(".")[-1].lower()
+
+    parts = [
+        "module_moe_ck2stages",
+        Adtype,
+        Bdtype,
+        "preshuffle_on" if preshuffle_mode else "preshuffle_off",
+        Cdtype,
+        act,
+        quant_type,
+        f"mulWeightStage{mul_routed_weight_stage}",
+    ]
+    if is_splitk:
+        parts.append("splitk")
+    md_name = "_".join(parts)
+    blob_gen_cmd = [
+        f"{AITER_CSRC_DIR}/ck_gemm_moe_2stages_codegen/gen_instances.py -a {Adtype} -b {Bdtype} -c {Cdtype} -q {quant_type} -act {act} -m {mul_routed_weight_stage} {preshuffle_str} {splitk_str} -w {{}}"
+    ]
+
+    return md_name, blob_gen_cmd
+
+
+def ck_moe_stage1_fwd(
+    hidden_states: Tensor,
+    w1: Tensor,
+    w2: Tensor,
+    sorted_token_ids: Tensor,
+    sorted_expert_ids: Tensor,
+    num_valid_ids: Tensor,
+    out: Tensor,
+    topk: int,
+    kernelName: str = "",
+    w1_scale: Tensor | None = None,
+    a1_scale: Tensor | None = None,
+    block_m: int | None = 32,
+    sorted_weights: Tensor | None = None,
+    quant_type: QuantType = QuantType.No,
+    activation: ActivationType = ActivationType.Silu,
+    splitk: int | None = 1,
+    use_non_temporal_load: bool | None = False,
+    dst_type: torch.dtype | None = None,
+):
+    ck_moe_stage1(
+        hidden_states,
+        w1,
+        w2,
+        sorted_token_ids,
+        sorted_expert_ids,
+        num_valid_ids,
+        out,
+        topk,
+        kernelName,
+        w1_scale,
+        a1_scale,
+        block_m,
+        sorted_weights,
+        quant_type.value,
+        activation.value,
+        int(splitk) if splitk is not None else splitk,
+        use_non_temporal_load,
+        None if dst_type is None else dtype2str_dict[dst_type],
+        is_shuffled=getattr(w1, "is_shuffled", False),
+    )
+    return out
+
+
+def ck_moe_stage2_fwd(
+    inter_states: Tensor,
+    w1: Tensor,
+    w2: Tensor,
+    sorted_token_ids: Tensor,
+    sorted_expert_ids: Tensor,
+    num_valid_ids: Tensor,
+    out: Tensor,
+    topk: int,
+    kernelName: str = "",
+    w2_scale: Tensor | None = None,
+    a2_scale: Tensor | None = None,
+    block_m: int | None = 32,
+    sorted_weights: Tensor | None = None,
+    quant_type: QuantType = QuantType.No,
+    activation: ActivationType = ActivationType.Silu,
+    use_non_temporal_load: bool | None = False,
+):
+    ck_moe_stage2(
+        inter_states,
+        w1,
+        w2,
+        sorted_token_ids,
+        sorted_expert_ids,
+        num_valid_ids,
+        out,
+        topk,
+        kernelName,
+        w2_scale,
+        a2_scale,
+        block_m,
+        sorted_weights,
+        quant_type.value,
+        activation.value,
+        use_non_temporal_load=use_non_temporal_load,
+        is_shuffled=getattr(w2, "is_shuffled", False),
+    )
+    return out

@@ -1,0 +1,217 @@
+import functools
+import math
+from collections.abc import Callable
+
+import torch
+import triton
+
+from aiter.ops.triton.gemm.basic.gemm_a8w8_blockscale import (
+    gemm_a8w8_blockscale as triton_gemm_a8w8_blockscale,
+)
+from aiter.ops.triton.gemm.basic.gemm_a8w8_blockscale import (
+    gemm_a8w8_blockscale_preshuffle as triton_gemm_a8w8_blockscale_preshuffle,
+)
+from aiter.test_common import checkAllclose
+from op_tests.op_benchmarks.triton.utils.argparse import (
+    add_argparse_ff,
+    get_ff_args,
+    get_parser,
+)
+from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
+    get_caller_name_no_ext,
+    get_model_benchmark_object,
+    get_shape_benchmark_object,
+    print_vgpr,
+)
+from op_tests.triton_tests.gemm.basic.test_gemm_a8w8_blockscale import (
+    generate_gemm_a8w8_blockscale_inputs,
+    run_torch,
+)
+
+block_shape = (128, 128)
+
+
+def bench_gemm_fn(
+    M: int,
+    N: int,
+    K: int,
+    metric: str,
+    layout: str,
+    impl: Callable,
+    shuffle: bool = False,
+    test: bool = False,
+):
+    block_shape_n, block_shape_k = block_shape
+    c_dtype = torch.bfloat16
+
+    x, weight, weight_shuffled, x_scale, x_scale_shuffled, w_scale, y = (
+        generate_gemm_a8w8_blockscale_inputs(
+            M,
+            N,
+            K,
+            block_shape_n,
+            block_shape_k,
+            layout=layout,
+            output=True,
+            shuffle=shuffle,
+        )
+    )
+    if shuffle:
+        bench_weight = weight_shuffled
+        bench_x_scale = x_scale_shuffled
+    else:
+        bench_weight = weight
+        bench_x_scale = x_scale
+
+    if test:
+        ref = run_torch(x, weight, x_scale, w_scale, c_dtype)
+        out = impl(x, bench_weight, bench_x_scale, w_scale, c_dtype, y)
+        checkAllclose(ref, out, msg=f"M={M},N={N},K={K}")
+
+    # flops
+    flops = 2.0 * M * N * K
+    # memory transfer
+    mem_read = (M * K) * x.element_size() + (N * K) * weight.element_size()
+    mem_write = (M * N) * 2  # TODO: Fix for c_dtype != bf16
+    mem = mem_read + mem_write
+
+    ms = triton.testing.do_bench(
+        lambda: impl(x, bench_weight, bench_x_scale, w_scale, c_dtype, y),
+        warmup=25,
+        rep=100,
+    )
+
+    # Return exactly one scalar depending on which metric is active
+    if metric == "time":
+        return ms
+    elif metric == "throughput":
+        tflops = flops / ms * 1e-9
+        return tflops
+    elif metric == "bandwidth":
+        bandwidth = mem / (ms * 1e-3) * 1e-9  # GB/s
+        return bandwidth
+    else:
+        raise ValueError("Unknown metric: " + metric)
+
+
+def run_model_benchmark(args, impl):
+    """
+    Runs benchmark given a --model argument.
+    """
+    benchmark = get_model_benchmark_object(get_caller_name_no_ext(), args)
+
+    @triton.testing.perf_report([benchmark])
+    def bench_gemm_a8w8_blockscale(
+        M, hidden_dim, intermediate_dim, metric, layer, model_name=None, **kwargs
+    ):
+        """
+        Fc1:
+             M      K                  K           N          M       N
+        A = (B, hidden_dim) @ W = (hidden_dim, 2*int_dim) -> (B, 2*int_dim) -> gating -> (B, int_dim)
+
+        Fc2:
+             M     K               K          N          M       N
+        A = (B, int_dim) @ W = (int_dim, hidden_dim) -> (B, hidden_dim)
+
+        Tensor parallel splits across int_dim (N for fc1, K for fc2)
+        """
+        if layer == "fc1":
+            if args.no_glu:
+                N, K = intermediate_dim, hidden_dim
+            else:
+                N, K = intermediate_dim * 2, hidden_dim
+            # Divide N by tensor parallel
+            N = math.ceil(N / args.tp)
+        elif layer == "fc2":
+            N, K = hidden_dim, intermediate_dim
+            # Divide K by tensor parallel
+            K = math.ceil(K / args.tp)
+        # print(f"Layer: {layer}, M: {M}, N: {N}, K: {K}, hidden_dim: {hidden_dim}, intermediate_dim: {intermediate_dim}")
+
+        return bench_gemm_fn(
+            M, N, K, metric, args.layout, impl, shuffle=args.preshuffle, test=args.test
+        )
+
+    bench_gemm_a8w8_blockscale.run(save_path="." if args.o else None, print_data=True)
+
+
+def run_shape_benchmark(args, impl):
+    benchmark = get_shape_benchmark_object(get_caller_name_no_ext(), args)
+
+    @triton.testing.perf_report([benchmark])
+    def bench_gemm_a8w8_blockscale(M, N, K, metric, model_name=None, **kwargs):
+        # Divide N by tensor parallel
+        N = math.ceil(N / args.tp)
+        return bench_gemm_fn(
+            M, N, K, metric, args.layout, impl, shuffle=args.preshuffle, test=args.test
+        )
+
+    bench_gemm_a8w8_blockscale.run(save_path="." if args.o else None, print_data=True)
+
+
+def run_benchmark(args, defaults):
+    assert not (args.shape and args.model) or not (
+        args.shape and args.M
+    ), "User can specify --shape or --model MODEL -M VAL exclusively"
+    if args.gluon:
+        impl = functools.partial(triton_gemm_a8w8_blockscale, backend="gluon")
+    elif args.preshuffle:
+        impl = triton_gemm_a8w8_blockscale_preshuffle
+    else:
+        impl = triton_gemm_a8w8_blockscale
+    if args.model:
+        unsupported_args = []
+        for arg in unsupported_args:
+            if getattr(args, arg, None) != getattr(defaults, arg, None):
+                raise RuntimeError(
+                    f"Argument '{arg}' is not supported for benchmarking with the --model flag."
+                )
+        run_model_benchmark(args, impl)
+    else:
+        unsupported_args = [
+            "fc1",
+            "fc2",
+            "no_glu",
+        ]
+        for arg in unsupported_args:
+            if getattr(args, arg, None) != getattr(defaults, arg, None):
+                raise RuntimeError(
+                    f"Argument '{arg}' is not supported for benchmarking without the --model flag."
+                )
+        run_shape_benchmark(args, impl)
+
+
+def parse_args(args: list[str] | None = None):
+    parser = get_parser(kernel_name="A8W8 GEMM Blockscale")
+    parser = add_argparse_ff(parser)
+    parser.add_argument(
+        "-gluon",
+        action="store_true",
+        help="Use Gluon implementation (experimental, requires latest Triton from main)",
+    )
+    parser.add_argument(
+        "-preshuffle",
+        action="store_true",
+        help="Use preshuffle implementation",
+    )
+    parser.add_argument(
+        "-test",
+        action="store_true",
+        help="Run a correctness check for each benchmarked shape against a "
+        "torch reference (mirrors op_tests/test_gemm_a8w8_blockscale.py).",
+    )
+    return get_ff_args(parser, args=args)
+
+
+def main(args: list[str] | None = None) -> None:
+    parsed_args, defaults = parse_args(args=args)
+    if parsed_args.print_vgpr:
+        print("Retrieving VGPR usage for Triton kernels...")
+        fun = lambda: run_benchmark(parsed_args, defaults)
+        print_vgpr(fun, get_caller_name_no_ext())
+        return
+    run_benchmark(parsed_args, defaults)
+
+
+if __name__ == "__main__":
+    main()
