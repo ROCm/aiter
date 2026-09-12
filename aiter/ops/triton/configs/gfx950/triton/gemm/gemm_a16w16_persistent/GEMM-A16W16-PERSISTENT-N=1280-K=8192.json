@@ -30,7 +30,7 @@
         "num_warps": 4,
         "GROUP_SIZE_M": 1,
         "num_stages": 3,
-        "waves_per_eu": 8,
+        "waves_per_eu": 4,
         "NUM_KSPLIT": 1,
         "matrix_instr_nonkdim": 16,
         "cache_modifier": ".cg"
@@ -66,7 +66,7 @@
         "num_warps": 8,
         "GROUP_SIZE_M": 4,
         "num_stages": 3,
-        "waves_per_eu": 6,
+        "waves_per_eu": 4,
         "NUM_KSPLIT": 1,
         "matrix_instr_nonkdim": 16,
         "cache_modifier": ".cg"

@@ -1,9 +1,9 @@
 {
     "M_LEQ_8": {
         "BLOCK_SIZE_M": 16,
-        "BLOCK_SIZE_N": 32,
+        "BLOCK_SIZE_N": 16,
         "BLOCK_SIZE_K": 256,
-        "num_warps": 4,
+        "num_warps": 8,
         "GROUP_SIZE_M": 1,
         "num_stages": 3,
         "waves_per_eu": 8,
@@ -12,8 +12,8 @@
         "cache_modifier": ".cg"
     },
     "M_LEQ_16": {
-        "BLOCK_SIZE_M": 32,
-        "BLOCK_SIZE_N": 32,
+        "BLOCK_SIZE_M": 16,
+        "BLOCK_SIZE_N": 16,
         "BLOCK_SIZE_K": 256,
         "num_warps": 4,
         "GROUP_SIZE_M": 1,
@@ -27,7 +27,7 @@
         "BLOCK_SIZE_M": 32,
         "BLOCK_SIZE_N": 32,
         "BLOCK_SIZE_K": 256,
-        "num_warps": 4,
+        "num_warps": 8,
         "GROUP_SIZE_M": 1,
         "num_stages": 3,
         "waves_per_eu": 8,
@@ -39,7 +39,7 @@
         "BLOCK_SIZE_M": 64,
         "BLOCK_SIZE_N": 32,
         "BLOCK_SIZE_K": 256,
-        "num_warps": 4,
+        "num_warps": 8,
         "GROUP_SIZE_M": 4,
         "num_stages": 3,
         "waves_per_eu": 4,
