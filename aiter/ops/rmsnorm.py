@@ -430,6 +430,7 @@ def rmsnorm2d_fwd(
     epsilon: float,
     use_model_sensitive_rmsnorm: int = 0,
 ) -> Tensor:
+    weight = weight.to(input.dtype)
     return _rms_norm_fwd_dispatch(input, weight, epsilon, use_model_sensitive_rmsnorm)
 
 
@@ -446,6 +447,7 @@ def rmsnorm2d_fwd_with_add(
     gemma_norm: bool = False,
     use_model_sensitive_rmsnorm: int = 0,
 ) -> None:
+    weight = weight.to(input.dtype)
     if _use_hip_common(input, use_model_sensitive_rmsnorm):
         add_rmsnorm(  # fast HIP module_rmsnorm_quant
             out, input, residual_in, residual_out, weight, epsilon, gemma_norm
@@ -513,6 +515,7 @@ def rmsnorm2d_fwd_with_dynamicquant(
     group_size: int = 0,
     shuffle_scale: bool = False,
 ) -> None:
+    weight = weight.to(input.dtype)
     # e8m0 (1-byte) block scale is only produced by the HIP module_rmsnorm_quant
     # kernel; the opus dynamicquant backend only emits fp32 per-token scale, so an
     # e8m0 scale must be routed to rmsnorm_quant regardless of group_size.
@@ -544,6 +547,7 @@ def rmsnorm2d_fwd_with_add_dynamicquant(
     group_size: int = 0,
     shuffle_scale: bool = False,
 ) -> None:
+    weight = weight.to(input.dtype)
     # e8m0 (1-byte) block scale is only produced by the HIP module_rmsnorm_quant
     # kernel; the opus dynamicquant backend only emits fp32 per-token scale, so an
     # e8m0 scale must be routed to add_rmsnorm_quant regardless of group_size.
