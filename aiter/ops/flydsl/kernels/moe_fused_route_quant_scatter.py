@@ -530,18 +530,6 @@ def _emit_quant_block_loop(c: SimpleNamespace) -> None:
 
         quant_results.append((mx_block, payload_val, e8m0_scale))
 
-    if const_expr(getattr(c, "scale_vec4", False)):
-        # Payload per block as usual, but the row's e8m0 goes out 16 B at a
-        # time: the store pass has every block's result live, so two adjacent
-        # blocks' dwords pair into one dwordx4.
-        for mx_block, payload_val, _e8m0 in quant_results:
-            _emit_payload_stores(c, dst_payload, payload_val, mx_block)
-        for i in range_constexpr(0, len(quant_results), 2):
-            _emit_row_major_scale_vec4(
-                c, quant_results[i][0], quant_results[i][2], quant_results[i + 1][2]
-            )
-        return
-
     # Stores are a separate pass so the quant pass above stays one basic block and
     # its loads can cluster. That only works while the quant pass is branch-free:
     # a value defined inside a guarded region does not dominate this loop, so
@@ -565,29 +553,16 @@ def _emit_quant_result_stores(c, dst_payload, mx_block, payload_val, e8m0_scale)
     e8m0_byte = arith.trunci(T.i8, e8m0_scale)
     _emit_payload_stores(c, dst_payload, payload_val, mx_block)
 
-    row_major_scale = getattr(c, "row_major_scale", False)
-    if const_expr(row_major_scale and getattr(c, "scale_pack_dwords", False)):
-        _emit_row_major_scale_dwords(c, mx_block, scale_dword, e8m0_scale)
-        return
-
     # one e8m0 byte per block, written by the block's lead lane. This plain
     # helper is not AST-rewritten, so the runtime guard goes through a local
     # @flyc.jit dispatch (a bare Python ``if`` would eval the dynamic Boolean
     # as a host bool).
     def _store_lead_scale():
         for dst in c.dests:
-            if const_expr(row_major_scale):
-                # (row, feat_dim//32) bytes: each row's scales contiguous, so a
-                # warp's six destination writes stay within six rows instead of
-                # touching a fresh cache line per MX block.
-                dst_scale_byte = (
-                    dst.payload_row_i32 * c.c_scale_bytes_per_row + mx_block
-                )
-            else:
-                dst_scale_dword = (
-                    dst.scale_row_dword_base + scale_dword * c.c_wmma_rep * 16
-                )
-                dst_scale_byte = dst_scale_dword * c.c4_i32 + byte_in_dword
+            dst_scale_dword = (
+                dst.scale_row_dword_base + scale_dword * c.c_wmma_rep * 16
+            )
+            dst_scale_byte = dst_scale_dword * c.c4_i32 + byte_in_dword
             c.scale_t[dst_scale_byte] = e8m0_byte
 
     @flyc.jit
@@ -618,93 +593,6 @@ def _emit_payload_stores(c, dst_payload, payload_val, mx_block):
             cache_modifier=payload_cache,
             offset_is_bytes=True,
         )
-
-
-def _pack_block_group_dword(c, e8m0_scale):
-    """The dword of e8m0 bytes for the 4 MX blocks around this lane's block.
-
-    Only the lane holding block 4k ends up with them in the right order; the
-    caller predicates on that.
-    """
-    i32 = c.i32
-    v = ArithValue(arith.andi(e8m0_scale, arith.constant(0xFF, type=i32)))
-    p1 = ArithValue(v.shuffle_xor(c.c4_i32, c.c_wave))
-    half = v | (p1 << arith.constant(8, type=i32))
-    p2 = ArithValue(half.shuffle_xor(arith.constant(8, type=i32), c.c_wave))
-    return half | (p2 << arith.constant(16, type=i32))
-
-
-def _emit_row_major_scale_vec4(c, mx_block_lo, e8m0_lo, e8m0_hi):
-    """Two blocks' worth of row-major e8m0 (16 B) in one dwordx4 store.
-
-    ``mx_block_lo`` is the low iteration's block for this lane. Lane 4k*4 holds
-    the low dword of each pair and picks up its partner's upper dword with one
-    more xor-shuffle, so a single lane writes all 16 bytes.
-
-    Like the payload, the packed scale stays on the width-agnostic buffer_ops V#:
-    ``c.scale_t`` is a byte view, and this store is a dword-indexed dwordx4.
-    """
-    i32 = c.i32
-    lo = _pack_block_group_dword(c, e8m0_lo)
-    hi = _pack_block_group_dword(c, e8m0_hi)
-    lo_peer = ArithValue(lo).shuffle_xor(arith.constant(16, type=i32), c.c_wave)
-    hi_peer = ArithValue(hi).shuffle_xor(arith.constant(16, type=i32), c.c_wave)
-    quad = fx.Vector.from_elements(
-        [lo, lo_peer, hi, hi_peer], fx.Numeric.from_ir_type(i32)
-    )
-    scale_dword = fx.Uint32(mx_block_lo) // fx.Uint32(c.c4_i32)
-
-    def _store_quad():
-        for dst in c.dests:
-            buffer_ops.buffer_store(
-                quad,
-                c.scale_rsrc,
-                dst.payload_row_i32 * c.c_scale_dwords_per_row + scale_dword,
-            )
-
-    # Only lane 0 of the wave stores: it holds blocks 4k..4k+3 of both halves.
-    is_wave_lead = arith.andi(
-        fx.Int32(c.block_in_wave) == c.c0_i32,
-        c.is_block_lead,
-    )
-
-    @flyc.jit
-    def _dispatch_quad():
-        if is_wave_lead:
-            _store_quad()
-
-    _dispatch_quad()
-
-
-def _emit_row_major_scale_dwords(c, mx_block, scale_dword, e8m0_scale):
-    """Row-major e8m0 as one dword per 4 MX blocks instead of 4 byte stores.
-
-    Only the lane holding block 4k ends up with the bytes in the right order,
-    hence the ``block_in_wave % 4 == 0`` predicate.
-    """
-    i32 = c.i32
-    packed = _pack_block_group_dword(c, e8m0_scale)
-
-    def _store_packed():
-        for dst in c.dests:
-            # buffer_store scales the offset by the stored type, so index dwords.
-            buffer_ops.buffer_store(
-                packed,
-                c.scale_rsrc,
-                dst.payload_row_i32 * c.c_scale_dwords_per_row + scale_dword,
-            )
-
-    group_lead = arith.andi(
-        arith.andi(fx.Int32(c.block_in_wave), arith.constant(3, type=i32)) == c.c0_i32,
-        c.is_block_lead,
-    )
-
-    @flyc.jit
-    def _dispatch_packed():
-        if group_lead:
-            _store_packed()
-
-    _dispatch_packed()
 
 
 def _emit_quant_one_k_group(c: SimpleNamespace, mx_group) -> None:
@@ -1872,7 +1760,6 @@ def build_moe_token_multidest_quant_module(
     wmma_rep: int,
     topk: int,
     quant_mode: str = "fp4",
-    row_major_scale: bool = False,
     tdm_hidden_chunks: int = _TOKEN_MULTIDEST_TDM_CHUNKS,
     ksplit: int = 1,
 ):
@@ -1923,17 +1810,9 @@ def build_moe_token_multidest_quant_module(
             f"{block_iters} and leave a 16 B-aligned chunk of {feat_dim * 2} B"
         )
     hidden_chunk_bytes = feat_dim * 2 // tdm_hidden_chunks if tdm_hidden_chunks else 0
-    # Row-major e8m0 goes out packed: a dword per 4 MX blocks, widened to a
-    # dwordx4 per 8 when the block count pairs up. Both need the pk8 geometry
-    # (4 lanes per MX block) to assemble the bytes with xor-shuffles.
-    scale_pack_dwords = row_major_scale and lanes_per_mx_block == 4
-    scale_vec4 = scale_pack_dwords and block_iters % 2 == 0
     module_name = (
         f"moe_token_multidest_quant_k{topk}_fd{feat_dim}_r{wmma_rep}"
         f"_{quant_mode}_{L.native_tag}"
-        f"{'_rmscale' if row_major_scale else ''}"
-        f"{'_scpk' if scale_pack_dwords else ''}"
-        f"{'_scv4' if scale_vec4 else ''}"
         f"{f'_hidtdm{tdm_hidden_chunks}' if tdm_hidden_chunks else ''}"
         f"{f'_ks{ksplit}' if ksplit > 1 else ''}"
     )
@@ -1965,8 +1844,6 @@ def build_moe_token_multidest_quant_module(
         c_rows_per_tile = arith.constant(rows_per_tile, type=i32)
         c_lanes_per_block = arith.constant(lanes_per_mx_block, type=i32)
         c_elems_per_lane = arith.constant(elems_per_lane, type=i32)
-        c_scale_bytes_per_row = arith.constant(mx_blocks_per_row, type=i32)
-        c_scale_dwords_per_row = arith.constant(mx_blocks_per_row // 4, type=i32)
 
         tid = fx.Uint32(fx.thread_idx.x)
         bid = fx.Uint32(fx.block_idx.x)
@@ -2110,27 +1987,17 @@ def build_moe_token_multidest_quant_module(
                     SimpleNamespace(payload_row_i32=row, scale_row_dword_base=sc)
                     for row, sc in zip(rows, scales)
                 ],
-                # Byte view for the unpacked e8m0 store; the packed dword /
-                # dwordx4 row-major stores need a width-agnostic V# instead.
-                # Both carry the same zero-on-invalid bound.
+                # Zero-on-invalid bound: a dead token takes a zero-length
+                # descriptor rather than a branch.
                 scale_t=ptr_buf_tensor(
                     grouped_scale, fx.Int8, num_records_bytes=scale_records
                 ),
-                scale_rsrc=buffer_ops.create_buffer_resource_from_addr(
-                    fx.Int64(ptrtoint(grouped_scale)),
-                    num_records_bytes=scale_records,
-                ),
-                row_major_scale=row_major_scale,
-                c_scale_bytes_per_row=c_scale_bytes_per_row,
-                c_scale_dwords_per_row=c_scale_dwords_per_row,
                 hidden_chunks=max(1, tdm_hidden_chunks),
                 chunk_prefetch=chunk_prefetch,
                 hidden_lds_load=hidden_lds_load,
                 hidden_lds_idx=hidden_lds_idx,
                 hidden_lds_row_off=hidden_lds_row_off,
                 hidden_slot_bytes=hslot,
-                scale_pack_dwords=scale_pack_dwords,
-                scale_vec4=scale_vec4,
                 mx_group_base=(
                     fx.Uint32(fx.block_idx.y) * arith.constant(block_iters, type=i32)
                     if const_expr(ksplit > 1)
