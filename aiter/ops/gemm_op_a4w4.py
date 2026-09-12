@@ -12,6 +12,7 @@ from aiter.jit.utils.torch_guard import torch_compile_guard
 
 from ..jit.core import AITER_CONFIGS, AITER_LOG_TUNED_CONFIG, compile_ops
 from ..jit.utils.chip_info import get_cu_num
+from ..utility.untuned_shapes import record as _record_untuned_shape
 from ..jit.utils.chip_info import get_gfx_runtime as get_gfx
 from ..ops.gemm_op_common import get_padded_m
 from ..utility import dtypes
@@ -30,9 +31,10 @@ def compute_gemm_SplitK(M: int, N: int, K: int, tile_m: int, tile_n: int, tile_k
     return 3
 
 
+# Cache config resolution only; the public wrapper keeps miss recording
+# retryable when an earlier telemetry write failed.
 @functools.lru_cache(maxsize=1024)
-def get_GEMM_config(M: int, N: int, K: int):
-    tuned_file = AITER_CONFIGS.AITER_CONFIG_GEMM_A4W4_FILE
+def _get_GEMM_config_cached(M: int, N: int, K: int):
     if not hasattr(get_GEMM_config, "gemm_dict"):
         gemm_dict = pd.read_csv(
             AITER_CONFIGS.AITER_CONFIG_GEMM_A4W4_FILE
@@ -71,11 +73,32 @@ def get_GEMM_config(M: int, N: int, K: int):
                     f"shape is M:{M}, N:{N}, K:{K}, found padded_M: {padded_M}, N:{N}, K:{K} is tuned on cu_num = {cu_num} in {AITER_CONFIGS.AITER_CONFIG_GEMM_A4W4_FILE}, kernel name is {config['kernelName']}, splitK is {config['splitK']}!"
                 )
             break
-    else:
-        logger.info(
-            f"shape is M:{M}, N:{N}, K:{K}, not found tuned config in {tuned_file}, will use default config!"
-        )
     return config
+
+
+@functools.lru_cache(maxsize=1024)
+def _log_GEMM_miss_once(M: int, N: int, K: int, tuned_file):
+    logger.info(
+        f"shape is M:{M}, N:{N}, K:{K}, not found tuned config in {tuned_file}, will use default config!"
+    )
+
+
+def get_GEMM_config(M: int, N: int, K: int):
+    tuned_file = AITER_CONFIGS.AITER_CONFIG_GEMM_A4W4_FILE
+    config = _get_GEMM_config_cached(M, N, K)
+    if config is None:
+        _log_GEMM_miss_once(M, N, K, tuned_file)
+        _record_untuned_shape(tuned_file, {"M": M, "N": N, "K": K})
+    return config
+
+
+def _clear_GEMM_config_cache():
+    _get_GEMM_config_cached.cache_clear()
+    _log_GEMM_miss_once.cache_clear()
+
+
+get_GEMM_config.cache_clear = _clear_GEMM_config_cache
+get_GEMM_config.cache_info = _get_GEMM_config_cached.cache_info
 
 
 def _f4gemm_asm_dispatch(
