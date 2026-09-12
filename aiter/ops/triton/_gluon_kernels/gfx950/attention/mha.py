@@ -170,17 +170,17 @@ def _load_v(
 
 
 @gluon.jit
-def _store_k_smem(smemK, smemKpe, buf, k_tile, k_pe_tile, HAS_PE: gl.constexpr):
-    smemK.index(buf).store(k_tile)
+def _store_k_smem(smemK, smemKpe, k_tile, k_pe_tile, HAS_PE: gl.constexpr):
+    smemK.store(k_tile)
     if HAS_PE:
-        smemKpe.index(buf).store(k_pe_tile)
+        smemKpe.store(k_pe_tile)
 
 
 @gluon.jit
-def _load_k_smem(smemK, smemKpe, buf, dotK: gl.constexpr, HAS_PE: gl.constexpr):
-    k = smemK.index(buf).load(dotK)
+def _load_k_smem(smemK, smemKpe, dotK: gl.constexpr, HAS_PE: gl.constexpr):
+    k = smemK.load(dotK)
     if HAS_PE:
-        return k, smemKpe.index(buf).load(dotK)
+        return k, smemKpe.load(dotK)
     else:
         return k, None
 
@@ -251,12 +251,20 @@ def _attn_softmax_pv(
     qk,
     v,
     descale_v,
+    sd_base,
+    sd_offsets,
+    sd_q_mask,
+    offs_n,
+    start_n,
+    seqlen_k,
+    stride_sd_n,
     dotP: gl.constexpr,
     mfmaLayout: gl.constexpr,
     BLOCK_M: gl.constexpr,
     BLOCK_DMODEL_POW2: gl.constexpr,
     IS_FP8: gl.constexpr,
     FP8_MAX: gl.constexpr,
+    RETURN_SCORES: gl.constexpr,
 ):
     """Online-softmax rescale + P@V accumulation for one key block.
     Returns updated (acc, l_i, m_i)."""
@@ -265,6 +273,17 @@ def _attn_softmax_pv(
     p = gl.exp2(qk - m_ij[:, None])
     alpha = gl.exp2(m_i - m_ij)
     l_ij = gl.sum(p, 1)
+
+    if RETURN_SCORES:
+        # NOTE: the returned score is not the same as the reference because we
+        # need to adjust as we find new maxes per block. We are not doing that
+        p_mask = sd_q_mask[:, None] & ((start_n + offs_n)[None, :] < seqlen_k)
+        gl.amd.cdna4.buffer_store(
+            p.to(sd_base.dtype.element_ty),
+            ptr=sd_base + start_n * stride_sd_n,
+            offsets=sd_offsets,
+            mask=p_mask,
+        )
 
     acc = acc * alpha[:, None]
 
@@ -309,6 +328,10 @@ def _attn_fwd_inner(
     window_min,
     qk_scale,
     descale_v,
+    sd_base,
+    sd_offsets,
+    sd_q_mask,
+    stride_sd_n,
     mfmaLayout: gl.constexpr,
     dotK: gl.constexpr,
     dotP: gl.constexpr,
@@ -322,284 +345,25 @@ def _attn_fwd_inner(
     BLOCK_DMODEL_POW2: gl.constexpr,
     BLOCK_DMODEL_PE: gl.constexpr,
     HAS_PE: gl.constexpr,
-    NUM_KV_BUFFERS: gl.constexpr,
     IS_FP8: gl.constexpr,
     FP8_MAX: gl.constexpr,
     SLIDING_WINDOW: gl.constexpr,
+    RETURN_SCORES: gl.constexpr,
+    seqlen_q=None,
+    n_extra_tokens=None,
+    offs_m=None,
+    IS_CAUSAL: gl.constexpr = False,
+    MASK_STEPS: gl.constexpr = False,
 ):
-    """Software-pipelined online-softmax loop over the blocks that need no
-    boundary or causal mask (the sliding-window mask, if any, still applies).
+    """
+    Inner loop for attention forward pass computation.
     """
     PADDED_HEAD: gl.constexpr = BLOCK_DMODEL != BLOCK_DMODEL_POW2
 
-    if SLIDING_WINDOW > 0:
+    if MASK_STEPS or IS_CAUSAL or SLIDING_WINDOW > 0 or RETURN_SCORES:
         offs_n = gl.arange(0, BLOCK_N, layout=gl.SliceLayout(0, mfmaLayout))
     else:
         offs_n = None
-
-    n_iter = (block_max - block_min) // BLOCK_N
-
-    # Prologue
-    k_tile, k_pe_tile = _load_k(
-        k_base,
-        k_offsets,
-        k_pe_offsets,
-        block_min,
-        seqlen_k,
-        kLoadLayout,
-        kPeLoadLayout,
-        BLOCK_N,
-        BLOCK_DMODEL,
-        BLOCK_DMODEL_POW2,
-        BLOCK_DMODEL_PE,
-        False,
-        PADDED_HEAD,
-        HAS_PE,
-    )
-    v_tile = _load_v(
-        v_base,
-        v_offsets,
-        block_min,
-        seqlen_k,
-        vLoadLayout,
-        BLOCK_N,
-        BLOCK_DMODEL,
-        BLOCK_DMODEL_POW2,
-        False,
-        PADDED_HEAD,
-    )
-    _store_k_smem(smemK, smemKpe, 0, k_tile, k_pe_tile, HAS_PE)
-    smemV.index(0).store(v_tile)
-
-    if n_iter > 1:
-        k_tile, k_pe_tile = _load_k(
-            k_base + BLOCK_N * stride_kn,
-            k_offsets,
-            k_pe_offsets,
-            block_min + BLOCK_N,
-            seqlen_k,
-            kLoadLayout,
-            kPeLoadLayout,
-            BLOCK_N,
-            BLOCK_DMODEL,
-            BLOCK_DMODEL_POW2,
-            BLOCK_DMODEL_PE,
-            False,
-            PADDED_HEAD,
-            HAS_PE,
-        )
-        v_tile = _load_v(
-            v_base + BLOCK_N * stride_vn,
-            v_offsets,
-            block_min + BLOCK_N,
-            seqlen_k,
-            vLoadLayout,
-            BLOCK_N,
-            BLOCK_DMODEL,
-            BLOCK_DMODEL_POW2,
-            False,
-            PADDED_HEAD,
-        )
-        _store_k_smem(smemK, smemKpe, 1, k_tile, k_pe_tile, HAS_PE)
-        smemV.index(1).store(v_tile)
-
-    for i in range(n_iter - NUM_KV_BUFFERS):
-        buf = i % NUM_KV_BUFFERS
-
-        # Read block i
-        k, k_pe = _load_k_smem(smemK, smemKpe, buf, dotK, HAS_PE)
-        v = smemV.index(buf).load(dotV)
-
-        # Issue block i+2
-        k_pf, k_pe_pf = _load_k(
-            k_base + (i + 2) * BLOCK_N * stride_kn,
-            k_offsets,
-            k_pe_offsets,
-            block_min + (i + 2) * BLOCK_N,
-            seqlen_k,
-            kLoadLayout,
-            kPeLoadLayout,
-            BLOCK_N,
-            BLOCK_DMODEL,
-            BLOCK_DMODEL_POW2,
-            BLOCK_DMODEL_PE,
-            False,
-            PADDED_HEAD,
-            HAS_PE,
-        )
-        v_pf = _load_v(
-            v_base + (i + 2) * BLOCK_N * stride_vn,
-            v_offsets,
-            block_min + (i + 2) * BLOCK_N,
-            seqlen_k,
-            vLoadLayout,
-            BLOCK_N,
-            BLOCK_DMODEL,
-            BLOCK_DMODEL_POW2,
-            False,
-            PADDED_HEAD,
-        )
-
-        qk = _attn_qk(
-            q,
-            k,
-            q_pe,
-            k_pe,
-            block_min + i * BLOCK_N,
-            offs_n,
-            window_min,
-            qk_scale,
-            mfmaLayout=mfmaLayout,
-            BLOCK_M=BLOCK_M,
-            BLOCK_N=BLOCK_N,
-            HAS_PE=HAS_PE,
-            IS_FP8=IS_FP8,
-            SLIDING_WINDOW=SLIDING_WINDOW,
-        )
-
-        acc, l_i, m_i = _attn_softmax_pv(
-            acc,
-            l_i,
-            m_i,
-            qk,
-            v,
-            descale_v,
-            dotP,
-            mfmaLayout,
-            BLOCK_M,
-            BLOCK_DMODEL_POW2,
-            IS_FP8,
-            FP8_MAX,
-        )
-
-        # Store block i+2
-        _store_k_smem(smemK, smemKpe, buf, k_pf, k_pe_pf, HAS_PE)
-        smemV.index(buf).store(v_pf)
-
-    # Epilogue
-    if n_iter > 1:
-        buf = (n_iter - 2) % NUM_KV_BUFFERS
-        k, k_pe = _load_k_smem(smemK, smemKpe, buf, dotK, HAS_PE)
-        v = smemV.index(buf).load(dotV)
-        qk = _attn_qk(
-            q,
-            k,
-            q_pe,
-            k_pe,
-            block_min + (n_iter - 2) * BLOCK_N,
-            offs_n,
-            window_min,
-            qk_scale,
-            mfmaLayout=mfmaLayout,
-            BLOCK_M=BLOCK_M,
-            BLOCK_N=BLOCK_N,
-            HAS_PE=HAS_PE,
-            IS_FP8=IS_FP8,
-            SLIDING_WINDOW=SLIDING_WINDOW,
-        )
-        acc, l_i, m_i = _attn_softmax_pv(
-            acc,
-            l_i,
-            m_i,
-            qk,
-            v,
-            descale_v,
-            dotP,
-            mfmaLayout,
-            BLOCK_M,
-            BLOCK_DMODEL_POW2,
-            IS_FP8,
-            FP8_MAX,
-        )
-
-    buf = (n_iter - 1) % NUM_KV_BUFFERS
-    k, k_pe = _load_k_smem(smemK, smemKpe, buf, dotK, HAS_PE)
-    v = smemV.index(buf).load(dotV)
-    qk = _attn_qk(
-        q,
-        k,
-        q_pe,
-        k_pe,
-        block_min + (n_iter - 1) * BLOCK_N,
-        offs_n,
-        window_min,
-        qk_scale,
-        mfmaLayout=mfmaLayout,
-        BLOCK_M=BLOCK_M,
-        BLOCK_N=BLOCK_N,
-        HAS_PE=HAS_PE,
-        IS_FP8=IS_FP8,
-        SLIDING_WINDOW=SLIDING_WINDOW,
-    )
-    acc, l_i, m_i = _attn_softmax_pv(
-        acc,
-        l_i,
-        m_i,
-        qk,
-        v,
-        descale_v,
-        dotP,
-        mfmaLayout,
-        BLOCK_M,
-        BLOCK_DMODEL_POW2,
-        IS_FP8,
-        FP8_MAX,
-    )
-
-    return acc, l_i, m_i
-
-
-@gluon.jit
-def _attn_fwd_inner_masked(
-    acc,
-    l_i,
-    m_i,
-    q,
-    q_pe,
-    k_base,
-    k_offsets,
-    k_pe_offsets,
-    v_base,
-    v_offsets,
-    smemK,
-    smemKpe,
-    smemV,
-    stride_kn,
-    stride_vn,
-    seqlen_q,
-    seqlen_k,
-    block_min,
-    block_max,
-    n_extra_tokens,
-    offs_m,
-    window_min,
-    qk_scale,
-    descale_v,
-    mfmaLayout: gl.constexpr,
-    dotK: gl.constexpr,
-    dotP: gl.constexpr,
-    dotV: gl.constexpr,
-    kLoadLayout: gl.constexpr,
-    kPeLoadLayout: gl.constexpr,
-    vLoadLayout: gl.constexpr,
-    BLOCK_M: gl.constexpr,
-    BLOCK_N: gl.constexpr,
-    BLOCK_DMODEL: gl.constexpr,
-    BLOCK_DMODEL_POW2: gl.constexpr,
-    BLOCK_DMODEL_PE: gl.constexpr,
-    HAS_PE: gl.constexpr,
-    IS_CAUSAL: gl.constexpr,
-    MASK_STEPS: gl.constexpr,
-    IS_FP8: gl.constexpr,
-    FP8_MAX: gl.constexpr,
-    SLIDING_WINDOW: gl.constexpr,
-):
-    """Non-pipelined online-softmax loop over the boundary / causal (and, if
-    enabled, sliding-window) masked blocks.
-    """
-    PADDED_HEAD: gl.constexpr = BLOCK_DMODEL != BLOCK_DMODEL_POW2
-
-    offs_n = gl.arange(0, BLOCK_N, layout=gl.SliceLayout(0, mfmaLayout))
 
     n_iter = (block_max - block_min) // BLOCK_N
 
@@ -634,13 +398,13 @@ def _attn_fwd_inner_masked(
             MASK_STEPS,
             PADDED_HEAD,
         )
-        _store_k_smem(smemK, smemKpe, 0, k_tile, k_pe_tile, HAS_PE)
-        smemV.index(0).store(v_tile)
+        _store_k_smem(smemK, smemKpe, k_tile, k_pe_tile, HAS_PE)
+        smemV.store(v_tile)
         k_base += BLOCK_N * stride_kn
         v_base += BLOCK_N * stride_vn
 
-        k, k_pe = _load_k_smem(smemK, smemKpe, 0, dotK, HAS_PE)
-        v = smemV.index(0).load(dotV)
+        k, k_pe = _load_k_smem(smemK, smemKpe, dotK, HAS_PE)
+        v = smemV.load(dotV)
 
         qk = _attn_qk(
             q,
@@ -672,19 +436,27 @@ def _attn_fwd_inner_masked(
             qk,
             v,
             descale_v,
+            sd_base,
+            sd_offsets,
+            sd_q_mask,
+            offs_n,
+            start_n,
+            seqlen_k,
+            stride_sd_n,
             dotP,
             mfmaLayout,
             BLOCK_M,
             BLOCK_DMODEL_POW2,
             IS_FP8,
             FP8_MAX,
+            RETURN_SCORES,
         )
 
     return acc, l_i, m_i
 
 
 _attn_fwd_repr = make_kernel_repr(
-    "_attn_fwd",
+    "_attn_fwd_gluon",
     [
         "IS_CAUSAL",
         "NUM_Q_HEADS",
@@ -692,6 +464,8 @@ _attn_fwd_repr = make_kernel_repr(
         "BLOCK_M",
         "BLOCK_N",
         "BLOCK_DMODEL",
+        "RETURN_SCORES",
+        "HEAD_STRIDE_ALIGN",
         "IS_FP8",
         "VARLEN",
         "NUM_XCD",
@@ -708,6 +482,8 @@ def _attn_fwd(
     k_ptr,
     v_ptr,
     o_ptr,
+    softmax_lse_ptr,
+    s_dmask_ptr,
     descale_q_ptr,
     descale_k_ptr,
     descale_v_ptr,
@@ -733,6 +509,13 @@ def _attn_fwd(
     stride_oh_in,
     stride_om_in,
     stride_on_in,
+    stride_lse_z_in,
+    stride_lse_h_in,
+    stride_lse_m_in,
+    stride_sd_z_in,
+    stride_sd_h_in,
+    stride_sd_m_in,
+    stride_sd_n_in,
     stride_descale_q_z_in,
     stride_descale_k_z_in,
     stride_descale_v_z_in,
@@ -753,7 +536,8 @@ def _attn_fwd(
     FP8_MAX: gl.constexpr,
     ENABLE_SINK: gl.constexpr,
     SLIDING_WINDOW: gl.constexpr,
-    HEAD_STRIDE_ALIGNED_8: gl.constexpr = False,
+    RETURN_SCORES: gl.constexpr,
+    HEAD_STRIDE_ALIGN: gl.constexpr,
     num_warps: gl.constexpr = 4,
 ):
     RCP_LN2: gl.constexpr = 1.4426950408889634
@@ -789,6 +573,13 @@ def _attn_fwd(
         stride_oh = gl.cast(stride_oh_in, gl.int64)
         stride_om = gl.cast(stride_om_in, gl.int64)
         stride_on = gl.cast(stride_on_in, gl.int64)
+        stride_lse_z = gl.cast(stride_lse_z_in, gl.int64)
+        stride_lse_h = gl.cast(stride_lse_h_in, gl.int64)
+        stride_lse_m = gl.cast(stride_lse_m_in, gl.int64)
+        stride_sd_z = gl.cast(stride_sd_z_in, gl.int64)
+        stride_sd_h = gl.cast(stride_sd_h_in, gl.int64)
+        stride_sd_m = gl.cast(stride_sd_m_in, gl.int64)
+        stride_sd_n = gl.cast(stride_sd_n_in, gl.int64)
     else:
         stride_qz = stride_qz_in
         stride_qh = stride_qh_in
@@ -809,6 +600,13 @@ def _attn_fwd(
         stride_oh = stride_oh_in
         stride_om = stride_om_in
         stride_on = stride_on_in
+        stride_lse_z = stride_lse_z_in
+        stride_lse_h = stride_lse_h_in
+        stride_lse_m = stride_lse_m_in
+        stride_sd_z = stride_sd_z_in
+        stride_sd_h = stride_sd_h_in
+        stride_sd_m = stride_sd_m_in
+        stride_sd_n = stride_sd_n_in
 
     # program -> (batch, q_head, query block). SEQLEN_Q is the max query length,
     # so NUM_BLOCKS_M matches the launch grid in both fixed and varlen mode.
@@ -907,16 +705,15 @@ def _attn_fwd(
         kPeLoadLayout: gl.constexpr = None
         kPeSharedLayout: gl.constexpr = None
 
-    # When the caller guarantees Q/K/V head strides are multiples of 8 elements,
-    # the head-axis offset is 16-byte aligned; hinting the multiple lets AxisInfo
-    # widen the global loads.
+    # HEAD_STRIDE_ALIGN is the largest power of two (capped at the 128-bit load
+    # width) dividing every Q/K/V head-axis stride, in elements.
     qh_off = off_q_head * stride_qh
     kh_off = off_k_head * stride_kh
     vh_off = off_k_head * stride_vh
-    if HEAD_STRIDE_ALIGNED_8:
-        qh_off = gl.multiple_of(qh_off, 8)
-        kh_off = gl.multiple_of(kh_off, 8)
-        vh_off = gl.multiple_of(vh_off, 8)
+    if HEAD_STRIDE_ALIGN > 1:
+        qh_off = gl.multiple_of(qh_off, HEAD_STRIDE_ALIGN)
+        kh_off = gl.multiple_of(kh_off, HEAD_STRIDE_ALIGN)
+        vh_off = gl.multiple_of(vh_off, HEAD_STRIDE_ALIGN)
 
     # Load Q (stays resident for the whole key loop).
     offs_qm = gl.arange(0, BLOCK_M, layout=gl.SliceLayout(1, qLoadLayout))
@@ -993,21 +790,20 @@ def _attn_fwd(
     )
 
     # Shared-memory tiles for the K/V staging.
-    NUM_KV_BUFFERS: gl.constexpr = 2
     smemK = gl.allocate_shared_memory(
         k_ptr.dtype.element_ty,
-        [NUM_KV_BUFFERS, BLOCK_DMODEL_POW2, BLOCK_N],
+        [BLOCK_DMODEL_POW2, BLOCK_N],
         kSharedLayout,
     )
     smemV = gl.allocate_shared_memory(
         v_ptr.dtype.element_ty,
-        [NUM_KV_BUFFERS, BLOCK_N, BLOCK_DMODEL_POW2],
+        [BLOCK_N, BLOCK_DMODEL_POW2],
         vSharedLayout,
     )
     if HAS_PE:
         smemKpe = gl.allocate_shared_memory(
             k_ptr.dtype.element_ty,
-            [NUM_KV_BUFFERS, BLOCK_DMODEL_PE, BLOCK_N],
+            [BLOCK_DMODEL_PE, BLOCK_N],
             kPeSharedLayout,
         )
     else:
@@ -1048,6 +844,44 @@ def _attn_fwd(
     else:
         window_min = None
 
+    # softmax_lse
+    if softmax_lse_ptr is not None:
+        lse_base = (
+            softmax_lse_ptr
+            + off_z * stride_lse_z
+            + off_q_head * stride_lse_h
+            + cu_seqlens_q_start * stride_lse_m
+            + start_m * BLOCK_M * stride_lse_m
+        )
+        offs_lse = (
+            gl.arange(0, BLOCK_M, layout=gl.SliceLayout(1, mfmaLayout)) * stride_lse_m
+        ).to(gl.int32)
+        # If seqlen_q not multiple of BLOCK_M, we need to mask out the last few rows.
+        lse_mask = offs_m < seqlen_q
+    else:
+        lse_base = None
+        offs_lse = None
+        lse_mask = None
+
+    # s_dmask (return_scores)
+    if s_dmask_ptr is not None:
+        sd_base = (
+            s_dmask_ptr
+            + off_z * stride_sd_z
+            + off_q_head * stride_sd_h
+            + start_m * BLOCK_M * stride_sd_m
+        )
+        offs_sd_m = gl.arange(0, BLOCK_M, layout=gl.SliceLayout(1, mfmaLayout))
+        offs_sd_n = gl.arange(0, BLOCK_N, layout=gl.SliceLayout(0, mfmaLayout))
+        sd_offsets = (
+            offs_sd_m[:, None] * stride_sd_m + offs_sd_n[None, :] * stride_sd_n
+        ).to(gl.int32)
+        sd_q_mask = offs_m < seqlen_q
+    else:
+        sd_base = None
+        sd_offsets = None
+        sd_q_mask = None
+
     # Classify key blocks: full (no boundary/causal mask) vs masked.
     n_blocks = gl.cdiv(seqlen_k, BLOCK_N)
     if IS_CAUSAL:
@@ -1082,6 +916,14 @@ def _attn_fwd(
             if PADDED_HEAD_OUT:
                 o_mask = o_mask & (offs_od[None, :] < BLOCK_DMODEL_OUT)
             gl.amd.cdna4.buffer_store(zeros, ptr=o_base, offsets=o_offsets, mask=o_mask)
+
+            if softmax_lse_ptr is not None:
+                lse = gl.zeros(
+                    [BLOCK_M], dtype=gl.float32, layout=gl.SliceLayout(1, mfmaLayout)
+                )
+                gl.amd.cdna4.buffer_store(
+                    lse, ptr=lse_base, offsets=offs_lse, mask=lse_mask
+                )
             return
 
     n_extra_tokens = 0
@@ -1145,6 +987,10 @@ def _attn_fwd(
             window_min,
             qk_scale,
             descale_v,
+            sd_base,
+            sd_offsets,
+            sd_q_mask,
+            stride_sd_n,
             mfmaLayout=mfmaLayout,
             dotK=dotK,
             dotP=dotP,
@@ -1158,19 +1004,19 @@ def _attn_fwd(
             BLOCK_DMODEL_POW2=BLOCK_DMODEL_POW2,
             BLOCK_DMODEL_PE=BLOCK_DMODEL_PE,
             HAS_PE=HAS_PE,
-            NUM_KV_BUFFERS=NUM_KV_BUFFERS,
             IS_FP8=IS_FP8,
             FP8_MAX=FP8_MAX,
             SLIDING_WINDOW=SLIDING_WINDOW,
+            RETURN_SCORES=RETURN_SCORES,
         )
         block_min = block_max
         block_max = n_blocks * BLOCK_N
 
-    # Remaining blocks carry the boundary / causal masking (non-pipelined path).
+    # Remaining blocks carry the boundary / causal masking.
     if masked_blocks > 0:
         k_base += n_full_blocks * BLOCK_N * stride_kn
         v_base += n_full_blocks * BLOCK_N * stride_vn
-        acc, l_i, m_i = _attn_fwd_inner_masked(
+        acc, l_i, m_i = _attn_fwd_inner(
             acc,
             l_i,
             m_i,
@@ -1186,15 +1032,16 @@ def _attn_fwd(
             smemV,
             stride_kn,
             stride_vn,
-            seqlen_q,
             seqlen_k,
             block_min,
             block_max,
-            n_extra_tokens,
-            offs_m,
             window_min,
             qk_scale,
             descale_v,
+            sd_base,
+            sd_offsets,
+            sd_q_mask,
+            stride_sd_n,
             mfmaLayout=mfmaLayout,
             dotK=dotK,
             dotP=dotP,
@@ -1208,11 +1055,15 @@ def _attn_fwd(
             BLOCK_DMODEL_POW2=BLOCK_DMODEL_POW2,
             BLOCK_DMODEL_PE=BLOCK_DMODEL_PE,
             HAS_PE=HAS_PE,
-            IS_CAUSAL=IS_CAUSAL,
-            MASK_STEPS=True,
             IS_FP8=IS_FP8,
             FP8_MAX=FP8_MAX,
             SLIDING_WINDOW=SLIDING_WINDOW,
+            RETURN_SCORES=RETURN_SCORES,
+            seqlen_q=seqlen_q,
+            n_extra_tokens=n_extra_tokens,
+            offs_m=offs_m,
+            IS_CAUSAL=IS_CAUSAL,
+            MASK_STEPS=True,
         )
 
     # epilogue: normalize and write
@@ -1238,6 +1089,22 @@ def _attn_fwd(
             )
             out_ptrs_mask = mask_m_offsets[:, None] >= out_mask_boundary[None, :]
             acc = gl.where(out_ptrs_mask, acc, 0.0)
+
+    # write back LSE(Log Sum Exponents), the log of the normalization constant
+    if softmax_lse_ptr is not None:
+        LN2: gl.constexpr = 0.6931471824645996
+        # compute log-sum-exp in base 2 units
+        softmax_lse = m_i + gl.log2(l_i)
+        # convert back to natural units
+        softmax_lse = softmax_lse * LN2
+
+        if IS_CAUSAL:
+            # zero out nans caused by -infs when doing causal
+            softmax_lse = gl.where(offs_m < causal_start_idx, 0.0, softmax_lse)
+
+        gl.amd.cdna4.buffer_store(
+            softmax_lse, ptr=lse_base, offsets=offs_lse, mask=lse_mask
+        )
 
     out = acc.to(o_ptr.dtype.element_ty)
 
@@ -1269,11 +1136,9 @@ def _attn_fwd(
 
 
 def _get_config(is_fp8: bool, has_pe: bool = False):
-    if not hasattr(_get_config, "_config_dict"):
-        arch = arch_info.get_arch()
-        fpath = f"{AITER_TRITON_CONFIGS_PATH}/{arch}/gluon/attention/mha/mha.json"
-        _get_config._config_dict = load_config_json(fpath)
-    fwd_cfg = _get_config._config_dict["fwd"]
+    arch = arch_info.get_arch()
+    fpath = f"{AITER_TRITON_CONFIGS_PATH}/{arch}/gluon/attention/mha/mha.json"
+    fwd_cfg = load_config_json(fpath)["fwd"]
     # TODO: configs are not tuned
     if is_fp8:
         return fwd_cfg["fp8"]

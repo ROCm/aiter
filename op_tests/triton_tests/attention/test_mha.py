@@ -45,12 +45,7 @@ def _test_mha_impl(
     backend: str = "triton",
     dtype=torch.bfloat16,
 ):
-    skip_if_gluon_unsupported(
-        backend,
-        dropout_p=DROPOUT,
-        return_lse=RETURN_LSE,
-        return_attn_probs=RETURN_SOFTMAX,
-    )
+    skip_if_gluon_unsupported(backend, dropout_p=DROPOUT)
 
     torch.manual_seed(20)
     torch.cuda.empty_cache()
@@ -70,19 +65,17 @@ def _test_mha_impl(
         backend=backend,
     )
 
-    if RETURN_LSE:
-        assert len(triton_out) > 1
-        lse = triton_out[1]
-        if DEBUG_MODE:
+    lse = None
+    sd_mask = None
+    if RETURN_LSE or RETURN_SOFTMAX:
+        lse = triton_out[1] if RETURN_LSE else None
+        if RETURN_SOFTMAX:
+            sd_mask = triton_out[2] if RETURN_LSE else triton_out[1]
+        triton_out = triton_out[0]
+        if DEBUG_MODE and lse is not None:
             print(f"lse.shape={lse.shape}, lse={lse}")
 
     if DROPOUT > 0.0 and RETURN_SOFTMAX:
-        if RETURN_LSE:
-            assert len(triton_out) == 3
-            sd_mask = triton_out[2]
-        else:
-            assert len(triton_out) == 2
-            sd_mask = triton_out[1]
         dropout_mask = sd_mask >= 0
         if DEBUG_MODE:
             print(f"sd_mask.shape={sd_mask.shape}, sd_mask={sd_mask}")
@@ -90,15 +83,13 @@ def _test_mha_impl(
                 f"dropout_mask.shape={dropout_mask.shape}, dropout_mask={dropout_mask}"
             )
 
-    if RETURN_SOFTMAX or RETURN_LSE:
-        triton_out = triton_out[0]
     if DEBUG_MODE:
         print(f"triton_out.shape={triton_out.shape}, triton_out={triton_out}")
 
     torch_out = attention_ref(
         q, k, v, dropout_p=DROPOUT, dropout_mask=dropout_mask, causal=CAUSAL
     )
-    torch_out, attention_scores, _ = torch_out
+    torch_out, attention_scores, lse_ref = torch_out
     if DEBUG_MODE:
         print(f"torch_out.shape={torch_out.shape}, torch_out={torch_out}")
         print(
@@ -106,6 +97,24 @@ def _test_mha_impl(
         )
 
     torch.testing.assert_close(triton_out, torch_out, atol=1e-2, rtol=1e-2)
+
+    if RETURN_LSE:
+        # Fully-masked causal rows are -inf in the reference (and Triton) and 0
+        # in Gluon; compare only rows that attended at least one key.
+        finite = torch.isfinite(lse_ref)
+        torch.testing.assert_close(
+            lse[finite].float(), lse_ref[finite].float(), atol=1e-2, rtol=1e-2
+        )
+    if RETURN_SOFTMAX:
+        # Triton only writes S_dmask when dropout is on; Gluon fills it at
+        # dropout_p == 0 as well. The returned score is not the same as the reference because they
+        # are not adjusted as new maxes per block are found. So we just check the
+        # shape and dtype.
+        if sd_mask is None:
+            assert backend == "triton" and DROPOUT == 0.0
+        else:
+            assert sd_mask.dtype == torch.float32
+            assert sd_mask.shape == (BATCH, NUM_Q_HEADS, SEQLEN_Q, SEQLEN_K)
 
 
 @pytest.mark.parametrize("BATCH", [1, 30, 50])
@@ -320,6 +329,35 @@ def test_mha_with_dropout(
     )
 
 
+@pytest.mark.parametrize("backend", ["triton", "gluon"])
+@pytest.mark.parametrize("CAUSAL", [True, False])
+@pytest.mark.parametrize(
+    "RETURN_LSE, RETURN_SOFTMAX",
+    [(True, False), (False, True), (True, True)],
+)
+def test_mha_return_lse_softmax(
+    backend: str,
+    CAUSAL: bool,
+    RETURN_LSE: bool,
+    RETURN_SOFTMAX: bool,
+    dtype=torch.bfloat16,
+):
+    _test_mha_impl(
+        BATCH=2,
+        SEQLEN_Q=128,
+        SEQLEN_K=64,
+        NUM_Q_HEADS=8,
+        NUM_K_HEADS=2,
+        HEAD_SZ=64,
+        DROPOUT=0.0,
+        RETURN_LSE=RETURN_LSE,
+        RETURN_SOFTMAX=RETURN_SOFTMAX,
+        CAUSAL=CAUSAL,
+        backend=backend,
+        dtype=dtype,
+    )
+
+
 # LLaMA 3 405B config
 @pytest.mark.parametrize("backend", ["triton", "gluon"])
 def test_mha_int64_strides(
@@ -336,15 +374,10 @@ def test_mha_int64_strides(
     """
     In the absence of strides being int64, parts of the offset computation is done in 32 bit and overflows resulting in segfaults.
     """
-    # The Gluon backend is forward-only and cannot return LSE, so drop both for it.
-    is_gluon = backend == "gluon"
-    return_lse = not is_gluon
-    test_backward = test_backward and not is_gluon
-    skip_if_gluon_unsupported(
-        backend,
-        dropout_p=DROPOUT,
-        return_lse=return_lse,
-    )
+    # The Gluon backend is forward-only.
+    return_lse = True
+    test_backward = test_backward and backend != "gluon"
+    skip_if_gluon_unsupported(backend, dropout_p=DROPOUT)
 
     torch.cuda.empty_cache()
     torch.manual_seed(20)
@@ -407,7 +440,9 @@ def test_mha_int64_strides(
         return_lse=return_lse,
         backend=backend,
     )
-    triton_out = out[0] if return_lse else out
+    triton_out, lse = out
+    assert lse.dtype == torch.float32
+    assert lse.shape == (q.shape[0], NUM_Q_HEADS)
     if test_backward:
         triton_dq, triton_dk, triton_dv = torch.autograd.grad(
             triton_out, (q, k, v), do.clone()
@@ -435,12 +470,7 @@ def _test_mha_varlen_impl(
     backend: str = "triton",
     dtype=torch.bfloat16,
 ):
-    skip_if_gluon_unsupported(
-        backend,
-        dropout_p=DROPOUT,
-        return_lse=RETURN_LSE,
-        return_attn_probs=RETURN_SOFTMAX,
-    )
+    skip_if_gluon_unsupported(backend, dropout_p=DROPOUT)
 
     torch.set_printoptions(threshold=10000)
     torch.cuda.empty_cache()
@@ -505,20 +535,18 @@ def _test_mha_varlen_impl(
         backend=backend,
     )
 
-    if RETURN_LSE:
-        assert len(triton_out) > 1
-        lse = triton_out[1]
-        if DEBUG_MODE:
+    lse = None
+    sd_mask = None
+    if RETURN_LSE or RETURN_SOFTMAX:
+        lse = triton_out[1] if RETURN_LSE else None
+        if RETURN_SOFTMAX:
+            sd_mask = triton_out[2] if RETURN_LSE else triton_out[1]
+        triton_out = triton_out[0]
+        if DEBUG_MODE and lse is not None:
             print(f"lse.shape={lse.shape}, lse={lse}")
 
     dropout_mask = None
     if DROPOUT > 0.0 and RETURN_SOFTMAX:
-        if RETURN_LSE:
-            assert len(triton_out) == 3
-            sd_mask = triton_out[2]
-        else:
-            assert len(triton_out) == 2
-            sd_mask = triton_out[1]
         dropout_mask = sd_mask >= 0
         dropout_mask = pad_rearrange_dropout_mask(
             dropout_mask,
@@ -532,14 +560,10 @@ def _test_mha_varlen_impl(
         )
         dropout_mask = dropout_mask > 0
         if DEBUG_MODE:
-            # print(f"sd_mask.shape={sd_mask.shape}, sd_mask={sd_mask}")
             print(
                 f"dropout_mask.shape={dropout_mask.shape}, dropout_mask={dropout_mask}"
             )
-    if RETURN_SOFTMAX or RETURN_LSE:
-        triton_out = output_pad_fn(triton_out[0])
-    else:
-        triton_out = output_pad_fn(triton_out)
+    triton_out = output_pad_fn(triton_out)
     if DEBUG_MODE:
         print(f"triton_out.shape={triton_out.shape}, triton_out={triton_out}")
 
@@ -553,7 +577,7 @@ def _test_mha_varlen_impl(
         dropout_mask=dropout_mask,
         causal=CAUSAL,
     )
-    torch_out, attention_scores, _ = torch_out
+    torch_out, attention_scores, lse_ref = torch_out
 
     if DEBUG_MODE:
         print(f"torch_out.shape={torch_out.shape}, torch_out={torch_out}")
@@ -564,6 +588,25 @@ def _test_mha_varlen_impl(
     torch.testing.assert_close(
         triton_out, torch_out.to(triton_out.dtype), atol=1e-1, rtol=1e-1
     )
+
+    if RETURN_LSE:
+        lse_ref = torch.cat(
+            [
+                lse_ref[b, :, query_padding_mask[b]].transpose(0, 1)
+                for b in range(BATCH)
+            ],
+            dim=0,
+        )
+        finite = torch.isfinite(lse_ref)
+        torch.testing.assert_close(
+            lse[finite].float(), lse_ref[finite].float(), atol=1e-2, rtol=1e-2
+        )
+    if RETURN_SOFTMAX:
+        if sd_mask is None:
+            assert backend == "triton" and DROPOUT == 0.0
+        else:
+            assert sd_mask.dtype == torch.float32
+            assert sd_mask.shape == (BATCH, NUM_Q_HEADS, max_seqlen_q, max_seqlen_k)
 
 
 @pytest.mark.parametrize("BATCH", [1, 4, 30, 50])
@@ -634,6 +677,35 @@ def test_mha_varlen_with_dropout(
         RETURN_LSE=RETURN_LSE,
         RETURN_SOFTMAX=RETURN_SOFTMAX,
         CAUSAL=CAUSAL,
+        dtype=dtype,
+    )
+
+
+@pytest.mark.parametrize("backend", ["triton", "gluon"])
+@pytest.mark.parametrize("CAUSAL", [True, False])
+@pytest.mark.parametrize(
+    "RETURN_LSE, RETURN_SOFTMAX",
+    [(True, False), (False, True), (True, True)],
+)
+def test_mha_varlen_return_lse_softmax(
+    backend: str,
+    CAUSAL: bool,
+    RETURN_LSE: bool,
+    RETURN_SOFTMAX: bool,
+    dtype=torch.bfloat16,
+):
+    _test_mha_varlen_impl(
+        BATCH=2,
+        SEQLEN_Q=128,
+        SEQLEN_K=64,
+        NUM_Q_HEADS=8,
+        NUM_K_HEADS=2,
+        HEAD_SZ=64,
+        DROPOUT=0.0,
+        RETURN_LSE=RETURN_LSE,
+        RETURN_SOFTMAX=RETURN_SOFTMAX,
+        CAUSAL=CAUSAL,
+        backend=backend,
         dtype=dtype,
     )
 

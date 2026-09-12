@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
+import math
 import os
 import warnings
 from typing import Literal
@@ -129,14 +130,9 @@ def gluon_forward_unsupported_reason(
     dropout_p: float = 0.0,
     bias=None,
     alibi_slopes=None,
-    return_lse: bool = False,
-    return_attn_probs: bool = False,
     block_table=None,
 ):
-    """Reason (str) why the Gluon forward backend can't serve this config, else None.
-
-    Pass the feature flags for the support checks.
-    """
+    """Reason (str) why the Gluon forward backend can't serve this config, else None."""
     if not is_gluon_available():
         return (
             f"Gluon MHA backend requires one of {_GLUON_SUPPORTED_ARCHS} with "
@@ -148,53 +144,59 @@ def gluon_forward_unsupported_reason(
         return "Gluon MHA backend does not support attention bias"
     if alibi_slopes is not None:
         return "Gluon MHA backend does not support alibi slopes"
-    if return_lse:
-        return "Gluon MHA backend does not support returning LSE"
-    if return_attn_probs:
-        return "Gluon MHA backend does not support returning attention probabilities"
     if block_table is not None:
         return "Gluon MHA backend does not support paged KV (block_table)"
     return None
 
 
 def _gluon_flash_attn_forward(
-    q,
-    k,
-    v,
-    causal=False,
-    sm_scale=None,
-    o=None,
-    cu_seqlens_q=None,
-    cu_seqlens_k=None,
-    max_seqlen_q=None,
-    max_seqlen_k=None,
-    descale_q=None,
-    descale_k=None,
-    descale_v=None,
-    sink=None,
-    window_size=(-1, -1),
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    sm_scale: float,
+    causal: bool,
+    window_size: tuple[int, int],
+    return_lse: bool,
+    return_softmax: bool,
+    max_seqlen_q: int,
+    max_seqlen_k: int,
+    o: torch.Tensor | None = None,
+    cu_seqlens_q: torch.Tensor | None = None,
+    cu_seqlens_k: torch.Tensor | None = None,
+    descale_q: torch.Tensor | None = None,
+    descale_k: torch.Tensor | None = None,
+    descale_v: torch.Tensor | None = None,
+    sink: torch.Tensor | None = None,
     config: dict[str, any] | None = None,
-):
+) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
     """Validate + launch the Gluon forward kernel for both fixed-length (bshd)
     and varlen (thd) batches.
 
     Arguments:
         q, k, v: query / key / value tensors (layout per the mode above).
+        sm_scale: QK^T scale.
         causal: whether to apply a (bottom-right aligned) causal mask.
-        sm_scale: QK^T scale. Defaults to 1 / sqrt(head_dim_qk).
+        window_size: (left, right) local attention window. Only a left window is
+            supported, so right must be -1.
+        return_lse: allocate and write the log-sum-exp. When False the kernel
+            skips the LSE epilogue entirely.
+        return_softmax: also write out the per-block softmax probabilities.
+        max_seqlen_q/max_seqlen_k: max sequence lengths in the batch (varlen).
         o: optional preallocated output, shaped like q but with V's head dim.
             Defaults to a fresh tensor (fp32 for fp8).
         cu_seqlens_q/cu_seqlens_k: (batch + 1,) int32 cumulative lengths (varlen).
-        max_seqlen_q/max_seqlen_k: max sequence lengths in the batch (varlen).
         descale_q: (batch, num_q_heads) fp32 dequant scalars for q (fp8 only).
         descale_k/descale_v: (batch, num_k_heads) fp32 dequant scalars for k/v (fp8 only).
         sink: (num_q_heads,) attention sink logits, or None. Each one acts as an
             extra softmax column with no value vector.
-        window_size: (left, right) local attention window. Only a left window is
-            supported, so right must be -1.
     Return:
         o: same layout as q. Dtype is fp32 for fp8 inputs unless the caller passed
             an ``o`` of a different dtype, in which case that dtype is returned.
+        softmax_lse: fp32 log-sum-exp, shaped (batch, num_q_heads, max_seqlen_q)
+            for bshd and (total_q, num_q_heads) for varlen, or None when
+            ``return_lse`` is False.
+        s_dmask: fp32 (batch, num_q_heads, max_seqlen_q, max_seqlen_k) softmax
+            probabilities, or None when ``return_softmax`` is False.
     """
     varlen = cu_seqlens_q is not None
 
@@ -256,9 +258,6 @@ def _gluon_flash_attn_forward(
         sink.dim() == 1 and sink.shape[0] == num_q_heads
     ), "Sink must be 1D and have one element per query head."
 
-    if sm_scale is None:
-        sm_scale = qk_head_dim ** (-0.5)
-
     # Pad to a vectorizable head dim
     head_size_og = v_head_dim
     if head_size_og % 8 != 0:
@@ -290,6 +289,36 @@ def _gluon_flash_attn_forward(
             o.dtype == o_dtype
         ), f"Gluon MHA out dtype mismatch: expected {o_dtype}, got {o.dtype}"
 
+    # softmax_lse [batch, num_q_heads, seqlen_q] (bshd) or
+    # [total_q, num_q_heads] (varlen). Skip the buffer when the caller does
+    # not want LSE so the kernel can drop the epilogue store.
+    if return_lse:
+        if varlen:
+            softmax_lse = torch.zeros(
+                (q.shape[0], num_q_heads), device=q.device, dtype=torch.float32
+            )
+            lse_strides = (0, softmax_lse.stride(1), softmax_lse.stride(0))
+        else:
+            softmax_lse = torch.zeros(
+                (batch, num_q_heads, seqlen_q), device=q.device, dtype=torch.float32
+            )
+            lse_strides = softmax_lse.stride()
+    else:
+        softmax_lse = None
+        lse_strides = (0, 0, 0)
+
+    # s_dmask [batch, num_q_heads, seqlen_q, seqlen_k]
+    if return_softmax:
+        s_dmask = torch.zeros(
+            (batch, num_q_heads, seqlen_q, seqlen_k),
+            device=q.device,
+            dtype=torch.float32,
+        )
+        sd_strides = s_dmask.stride()
+    else:
+        s_dmask = None
+        sd_strides = (0, 0, 0, 0)
+
     if varlen:
         # (total_tokens, head, head_dim)
         q_strides = (0, q.stride(1), q.stride(0), q.stride(2))
@@ -319,9 +348,11 @@ def _gluon_flash_attn_forward(
     # assert (not IS_FP8) or (
     #     pe_head_dim % 64 == 0
     # ), "FP8 positional encoding requires the PE head size to be a multiple of 64."
-    head_stride_aligned_8 = (
-        q_strides[1] % 8 == 0 and k_strides[1] % 8 == 0 and v_strides[1] % 8 == 0
-    )
+
+    # Largest power of two, capped at the 128-bit load width, that divides every
+    # head-axis stride. gcd against a power of two can only return a power of two,
+    # so this is always a valid alignment hint for the kernel's head offsets.
+    head_stride_align = math.gcd(16, q_strides[1], k_strides[1], v_strides[1])
 
     grid = (batch * num_q_heads * triton.cdiv(seqlen_q, BLOCK_M), 1)
 
@@ -330,6 +361,8 @@ def _gluon_flash_attn_forward(
         k,
         v,
         o,
+        softmax_lse,
+        s_dmask,
         descale_q,
         descale_k,
         descale_v,
@@ -343,6 +376,8 @@ def _gluon_flash_attn_forward(
         *k_strides,
         *v_strides,
         *o_strides,
+        *lse_strides,
+        *sd_strides,
         descale_q.stride(0) if descale_q is not None else 0,
         descale_k.stride(0) if descale_k is not None else 0,
         descale_v.stride(0) if descale_v is not None else 0,
@@ -363,11 +398,12 @@ def _gluon_flash_attn_forward(
         FP8_MAX=FP8_MAX,
         ENABLE_SINK=sink is not None,
         SLIDING_WINDOW=sliding_window,
-        HEAD_STRIDE_ALIGNED_8=head_stride_aligned_8,
+        RETURN_SCORES=return_softmax,
+        HEAD_STRIDE_ALIGN=head_stride_align,
         **config,
     )
 
-    return o
+    return o, softmax_lse, s_dmask
 
 
 def _flash_attn_forward(
@@ -887,6 +923,7 @@ def flash_attn_func(
             is added to the attention score of query i and key j.
         deterministic: bool. Whether to use the deterministic implementation of the backward pass,
             which is slightly slower and uses more memory. The forward pass is always deterministic.
+        return_lse: bool. Whether to return the log-sum-exp of each attention row.
         return_attn_probs: bool. Whether to return the attention probabilities. This option is for
            testing only. The returned probabilities are not guaranteed to be correct
            (they might not have the right scaling).
@@ -896,13 +933,15 @@ def flash_attn_func(
             for q and (batch, num_k_heads) for k/v; the output is fp32.
         backend: "triton" (default) or "gluon". The "gluon" backend runs the
             forward-only gfx950 Gluon kernel and supports the base feature set
-            plus FP8, positional encoding, attention sink and a left sliding
-            window (no dropout/bias/alibi, no right window, no LSE/softmax return
-            and no backward pass). For FP8, pass pre-quantized fp8 q/k/v with
-            q_descale/k_descale/v_descale.
+            plus FP8, positional encoding, attention sink, a left sliding window
+            and return_lse/return_attn_probs (no dropout/bias/alibi, no right
+            window and no backward pass). For FP8, pass pre-quantized fp8 q/k/v
+            with q_descale/k_descale/v_descale. Note that the Gluon backend fills
+            in S_dmask even at dropout_p == 0, where the Triton backend leaves it
+            zeroed.
     Return:
         out: (batch_size, seqlen, nheads, headdim).
-        softmax_lse [optional, if return_attn_probs=True]: (batch_size, nheads, seqlen). The
+        softmax_lse [optional, if return_lse=True]: (batch_size, nheads, seqlen). The
             logsumexp of each row of the matrix QK^T * scaling (e.g., log of the softmax
             normalization factor).
         S_dmask [optional, if return_attn_probs=True]: (batch_size, nheads, seqlen, seqlen).
@@ -919,23 +958,34 @@ def flash_attn_func(
             dropout_p=dropout_p,
             bias=bias,
             alibi_slopes=alibi_slopes,
-            return_lse=return_lse,
-            return_attn_probs=return_attn_probs,
         )
-        assert reason is None, reason
-        return _gluon_flash_attn_forward(
+        if reason is not None:
+            raise ValueError(reason)
+        if softmax_scale is None:
+            softmax_scale = q.shape[-1] ** (-0.5)
+        out, softmax_lse, s_dmask = _gluon_flash_attn_forward(
             q,
             k,
             v,
+            softmax_scale,
             causal=causal,
-            sm_scale=softmax_scale,
+            window_size=window_size,
+            return_lse=return_lse,
+            return_softmax=return_attn_probs,
+            max_seqlen_q=q.shape[1],
+            max_seqlen_k=k.shape[1],
             descale_q=q_descale,
             descale_k=k_descale,
             descale_v=v_descale,
             sink=sink,
-            window_size=window_size,
             config=config,
         )
+        result = [out]
+        if return_lse:
+            result.append(softmax_lse)
+        if return_attn_probs:
+            result.append(s_dmask)
+        return result[0] if len(result) == 1 else tuple(result)
 
     return _FlashAttnFunc.apply(
         q,
@@ -1237,6 +1287,7 @@ def flash_attn_varlen_func(
             is added to the attention score of query i and key j.
         deterministic: bool. Whether to use the deterministic implementation of the backward pass,
             which is slightly slower and uses more memory. The forward pass is always deterministic.
+        return_lse: bool. Whether to return the log-sum-exp of each attention row.
         return_attn_probs: bool. Whether to return the attention probabilities. This option is for
            testing only. The returned probabilities are not guaranteed to be correct
            (they might not have the right scaling).
@@ -1246,13 +1297,15 @@ def flash_attn_varlen_func(
             for q and (batch, num_k_heads) for k/v; the output is fp32.
         backend: "triton" (default) or "gluon". The "gluon" backend runs the
             forward-only gfx950 Gluon kernel and supports the base feature set
-            plus FP8, positional encoding, attention sink and a left sliding
-            window (no dropout/bias/alibi, no right window, no LSE/softmax return
-            and no backward pass). For FP8, pass pre-quantized fp8 q/k/v with
-            q_descale/k_descale/v_descale.
+            plus FP8, positional encoding, attention sink, a left sliding window
+            and return_lse/return_attn_probs (no dropout/bias/alibi, no right
+            window and no backward pass). For FP8, pass pre-quantized fp8 q/k/v
+            with q_descale/k_descale/v_descale. Note that the Gluon backend fills
+            in S_dmask even at dropout_p == 0, where the Triton backend leaves it
+            zeroed.
     Return:
         out: (total, nheads, headdim).
-        softmax_lse [optional, if return_attn_probs=True]: (nheads, total_q_seqlen). The
+        softmax_lse [optional, if return_lse=True]: (total_q, nheads). The
             logsumexp of each row of the matrix QK^T * scaling (e.g., log of the softmax
             normalization factor).
         S_dmask [optional, if return_attn_probs=True]: (batch_size, nheads, seqlen, seqlen).
@@ -1269,29 +1322,38 @@ def flash_attn_varlen_func(
             dropout_p=dropout_p,
             bias=bias,
             alibi_slopes=alibi_slopes,
-            return_lse=return_lse,
-            return_attn_probs=return_attn_probs,
             block_table=block_table,
         )
-        assert reason is None, reason
-        return _gluon_flash_attn_forward(
+        if reason is not None:
+            raise ValueError(reason)
+        if softmax_scale is None:
+            softmax_scale = q.shape[-1] ** (-0.5)
+        attn_out, softmax_lse, s_dmask = _gluon_flash_attn_forward(
             q,
             k,
             v,
+            softmax_scale,
             causal=causal,
-            sm_scale=softmax_scale,
+            window_size=window_size,
+            return_lse=return_lse,
+            return_softmax=return_attn_probs,
+            max_seqlen_q=max_seqlen_q,
+            max_seqlen_k=max_seqlen_k,
             o=out,
             cu_seqlens_q=cu_seqlens_q,
             cu_seqlens_k=cu_seqlens_k,
-            max_seqlen_q=max_seqlen_q,
-            max_seqlen_k=max_seqlen_k,
             descale_q=q_descale,
             descale_k=k_descale,
             descale_v=v_descale,
             sink=sink,
-            window_size=window_size,
             config=config,
         )
+        result = [attn_out]
+        if return_lse:
+            result.append(softmax_lse)
+        if return_attn_probs:
+            result.append(s_dmask)
+        return result[0] if len(result) == 1 else tuple(result)
 
     return _FlashAttnVarlenFunc.apply(
         q,
