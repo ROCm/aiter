@@ -546,9 +546,11 @@ def get_trace_perf(prof, num_iters):
             df.at[avg_name, el] = df[el].sum() / actual_iters
     if int(os.environ.get("AITER_LOG_MORE", "0")):
         pd.set_option("display.expand_frame_repr", False)
-        pd.set_option("display.max_colwidth", 90)
         pd.set_option("display.float_format", "{:,.1f}".format)
-        logger.info(f"{df}")
+        # ``name`` is the only potentially long text column in this profiler
+        # table. Keep its full kernel symbol for downstream log parsers without
+        # changing pandas' process-wide column-width setting.
+        logger.info(df.to_string(max_colwidth=None))
     return df.at[avg_name, "device_time_sum"]
 
 
