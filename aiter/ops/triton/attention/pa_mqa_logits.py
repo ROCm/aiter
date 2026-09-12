@@ -460,6 +460,26 @@ def deepgemm_fp8_paged_mqa_logits_schedule(
     return safe_chunks_per_cta
 
 
+def _resolve_paged_mqa_split_kv(
+    SplitKV: int | None,
+    TotalCuCount: int,
+    TileQCount: int,
+    WavePerEU: int,
+    is_gfx1250: bool,
+) -> int:
+    if SplitKV is not None:
+        if isinstance(SplitKV, bool) or not isinstance(SplitKV, int) or SplitKV <= 0:
+            raise ValueError(f"SplitKV must be a positive integer, got {SplitKV!r}")
+        return SplitKV
+    return (
+        (max(1, TotalCuCount // TileQCount) + 4)
+        // 5
+        * 5
+        * WavePerEU
+        * (2 if is_gfx1250 else 1)
+    )
+
+
 def deepgemm_fp8_paged_mqa_logits(
     q_fp8: torch.Tensor,  # dtype = float8
     kv_cache,
@@ -474,7 +494,10 @@ def deepgemm_fp8_paged_mqa_logits(
     TotalCuCount: int | None = None,
     WavePerEU: int = 2,
     VarCtxSchedule: torch.Tensor = None,
+    SplitKV: int | None = None,
 ):
+    if SplitKV is not None and VarCtxSchedule is not None:
+        raise ValueError("SplitKV cannot be used with VarCtxSchedule")
     if TotalCuCount is None:
         TotalCuCount = get_num_sms()
     batch_size, next_n, heads, hidden_dim = q_fp8.size()
@@ -488,12 +511,12 @@ def deepgemm_fp8_paged_mqa_logits(
             WavePerEU = 1
 
     TileQCount = batch_size * next_n
-    SplitKV = (
-        (max(1, TotalCuCount // TileQCount) + 4)
-        // 5
-        * 5
-        * WavePerEU
-        * (2 if get_gfx() == "gfx1250" else 1)
+    SplitKV = _resolve_paged_mqa_split_kv(
+        SplitKV,
+        TotalCuCount,
+        TileQCount,
+        WavePerEU,
+        get_gfx() == "gfx1250",
     )
 
     assert ChunkK % KVBlockSize == 0 or KVBlockSize % ChunkK == 0
