@@ -236,12 +236,14 @@ void bmm_a8w8_mxscale_bpreshuffle_nospec_kernel_gfx1250(opus_bmm_a8w8_mxscale_ka
                        kargs.stride_sfb, smem_sfb, T::kSfBPanelRows,
                        (unsigned)((nb_max - sfb_nb_base) * kargs.stride_sfb + sf_kg));
         }
-        // s_barrier retires neither counter on its own: loadcnt for the global
-        // reads feeding the panels, dscnt for the ds_writes that publish them.
-        opus::s_wait_loadcnt<0>();
-        opus::s_wait_dscnt<0>();
+        // The waits and the barrier that publish these panels are NOT here --
+        // they sit after the ring prime, below. Waiting for the scale fetch
+        // before the first TDM has even been issued leaves the copy engine idle
+        // for the whole fill: ATT measured one 2629-cycle barrier in the
+        // prologue, 83% of this kernel's barrier time. Issuing the prime first
+        // overlaps the two, and the counters do not collide -- the panels are
+        // loadcnt/dscnt, the ring is tensorcnt.
     }
-    __builtin_amdgcn_s_barrier();
 
     // ---------------------------------------------------------------------
     // Per-wave loads. Waves [0, kLoadWavesA) own A row-slices, the rest own B
@@ -740,6 +742,15 @@ void bmm_a8w8_mxscale_bpreshuffle_nospec_kernel_gfx1250(opus_bmm_a8w8_mxscale_ka
         // slot is filled by the loop's own first pass.
         const int prime = opus_bmm_mx_min_i(k_steps, T::kNumSlots - 1);
         for (int i = 0; i < prime; ++i) issue_slot(i, i > 0);
+
+        // Now publish the scale panels filled above. s_barrier retires neither
+        // counter on its own: loadcnt for the global reads feeding them, dscnt
+        // for the ds_writes. Both had the prime's TDM issue to hide behind.
+        if constexpr (T::kSfACoop || T::kSfBLds) {
+            opus::s_wait_loadcnt<0>();
+            opus::s_wait_dscnt<0>();
+        }
+        __builtin_amdgcn_s_barrier();
 
         for (int k = 0; k < k_steps; ++k) {
             const int s = k % T::kNumSlots;
