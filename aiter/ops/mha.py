@@ -2999,8 +2999,10 @@ def _flash_attn_varlen_forward(
         # logits (per-Q-head fp32) supported; sink-token (sink_size) not.
         ret = get_gfx() == "gfx1250"
         ret = ret and (q.dtype == dtypes.bf16)
-        ret = ret and (hdim_q in (64, 128))
-        ret = ret and (hdim_v == hdim_q)
+        ret = ret and (
+            (hdim_q in (64, 128) and hdim_v == hdim_q)
+            or (hdim_q == 192 and hdim_v == 128)
+        )
         ret = ret and (nhead_q % nhead_k == 0)
         ret = ret and (not swa)
         ret = ret and (sink_size == 0)
@@ -3019,7 +3021,7 @@ def _flash_attn_varlen_forward(
         #   D64  (`_rxy_sink`) binaries compile ENABLE_SINK=1 and ALWAYS read
         #   SINK, so calling with sink_ptr=None would dereference a null pointer
         #   -- require an explicit sink for D64 and fall back to CK otherwise.
-        if hdim_q == 128:
+        if hdim_q in (128, 192):
             ret = ret and (sink_ptr is None)
         elif hdim_q == 64:
             ret = ret and (sink_ptr is not None)
@@ -3082,8 +3084,8 @@ def _flash_attn_varlen_forward(
         # and carries no strides.  softmax_scale is forwarded as-is (the kernel
         # applies it internally to Q·K^T).  sink_ptr is passed through verbatim;
         # `can_impl_fmha_fwd_with_sink_varlen_asm` already enforces the per-hdim
-        # (D128→no sink, D64→sink) contract so we never feed a null sink to a
-        # D64 binary that unconditionally reads it.
+        # (D128 / D192x128 → no sink, D64 → sink) contract so we never feed a
+        # null sink to a D64 binary that unconditionally reads it.
         out, lse_asm = fmha_fwd_with_sink_varlen_asm(
             q,
             k,
@@ -3684,7 +3686,8 @@ def flash_attn_varlen_func(
         hdim_v = v.shape[-1]
         nhead_q = q.shape[-2]
         nhead_k = k.shape[-2]
-        if hdim_q not in (64, 128) or hdim_v != hdim_q:
+        is_hd192x128 = hdim_q == 192 and hdim_v == 128
+        if not ((hdim_q in (64, 128) and hdim_v == hdim_q) or is_hd192x128):
             return False
         # Experimental FlyDSL m32x8 kernel owns the 128/128 path when enabled;
         # yield so it reaches flydsl_flash_attn_varlen_func below.
@@ -3692,7 +3695,9 @@ def flash_attn_varlen_func(
             return False
         if nhead_q % nhead_k != 0:
             return False
-        if not causal or dropout_p != 0.0 or logits_soft_cap != 0.0:
+        if dropout_p != 0.0 or logits_soft_cap != 0.0:
+            return False
+        if not causal and not is_hd192x128:
             return False
         if window_size[0] != -1 or window_size[1] != -1:
             return False
