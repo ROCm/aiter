@@ -250,6 +250,10 @@ os.environ.setdefault("AITER_USE_GROUPED_GEMM", "1")
 os.environ.setdefault("AITER_GROUPED_DEBUG", "0")
 os.environ.setdefault("FLYDSL_DUMP_IR", "1")
 os.environ.setdefault("AITER_LOG_MORE", "1")
+# Kernel names are recovered from the INFO-level profiler tables printed by
+# child UTs.  Pin the default before importing pytest-aware test packages,
+# which may otherwise lower the inherited child-process log level to WARNING.
+os.environ.setdefault("AITER_LOG_LEVEL", "INFO")
 os.environ.setdefault("AITER_MOE_EXPERT_BALANCE", "true")
 os.environ.setdefault("AITER_FLYDSL_MOE_EXPERT_SCHEDULING_MODE", "1")
 os.environ.setdefault("AITER_FORCE_GFX1250", "1")
