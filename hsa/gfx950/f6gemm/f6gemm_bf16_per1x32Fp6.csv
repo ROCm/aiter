@@ -4,3 +4,5 @@ tile_M,tile_N,block_size,splitK,bpreshuffle,pack_layout,swizzle_max_M,swizzle_ma
 256,256,256,0,0,mxfp6_c0c1_256_padk2,65536,16384,6144,f6gemm_dmabig_grp16_kernel_func,gemm_mxfp6_dmabig_grp16.co
 256,256,256,0,0,mxfp6_c0c1_256_padk2,262144,16384,6144,f6gemm_dmabig_grp64_kernel_func,gemm_mxfp6_dmabig_grp64.co
 256,256,256,0,0,mxfp6_c0c1_256_padk2,131072,16384,16384,f6gemm_dmabig_allk_kernel_func,gemm_mxfp6_dmabig_allk.co
+256,256,256,0,0,mxfp6_c0c1_256_padk2,131072,16384,6144,f6gemm_stnt_kernel_func,gemm_mxfp6_stnt.co
+256,256,256,0,0,mxfp6_c0c1_256_padk2,131072,16384,65536,f6gemm_stnt_allk_kernel_func,gemm_mxfp6_stnt_allk.co
