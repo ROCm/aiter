@@ -72,8 +72,8 @@ def init_compute_data(
     torch.manual_seed(0)
     in_m = m * (n_expts_act if gindx is None else 1)
     shape_x = (in_m, k)
-    x = alloc_rand(shape_x, device=device, dtype=act_dtype)
-    w = alloc_rand((n_expts_tot, k, n), device=device, dtype=weight_dtype)
+    x = alloc_rand(shape_x, device=device, dtype=act_dtype)  # row-major
+    w = alloc_rand((n_expts_tot, k, n), device=device, dtype=weight_dtype)  # row-major
     bias = alloc_rand((n_expts_tot, n), device=device, dtype=torch.float32)
     if has_y_gammas:
         gamma = 2 ** torch.randint(
@@ -175,6 +175,7 @@ class Case:
             Case(4, 4, 8, 2, 1),
             Case(4, 4, 8, 8, 2),
             Case(4, 4, 8, 128, 4),
+            Case(4, 32, 64, 128, 4),
             Case(4, 1024, 3072, 128, 4),
             Case(32, 6144, 3072, 128, 4),
             Case(16, 1024, 1024, 128, 4),
