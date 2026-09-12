@@ -35,6 +35,12 @@ while sharing their common operations. Folding an activation coefficient into
 `LOG2E` may also change where rounding happens. Avoid interleaving reciprocal
 operations into a previously staged batch without checking code generation.
 
+Preserve the math operation as well as its formula. A typed `.exp2()` emits
+`math.exp2`; its target lowering can include an underflow correction that a raw
+`rocdl.exp2` intrinsic omits. Match fastmath flags and exceptional-value behavior
+before sharing either implementation. Bitwise equality on a finite input sample
+does not prove these operations equivalent; inspect the generated instructions.
+
 Prefer `fx.ceildiv` for its matching typed division operation. The shared
 `kernels_common.ceildiv` expression `(n + d - 1) // d` instead preserves the
 caller's fixed-width additions when used with DSL integers. Those formulas can
