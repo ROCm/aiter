@@ -6,8 +6,13 @@
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 
-# Raw dialect, and the only one here: `global_load_lds` has no fx wrapper (the
-# expr/rocdl surface stops at the buffer form). Pointers still go through
+# Raw dialect, and the only one here. There IS an fx atom for global -> LDS,
+# `cdna4.GlobalLoadAsyncLDS128b`, but only the async one: it completes through
+# asyncmark / wait_asyncmark, while this pipeline's `wait_barrier` is a
+# hand-counted `s_waitcnt vmcnt(N)` covering A and B together. Tracking A one
+# way and B the other is how the MFMAs come to read stale LDS -- see BlockScale
+# below. `rocdl.global.load.lds` is the synchronous form and counts in vmcnt,
+# so the existing barrier keeps covering it. Pointers still go through
 # `fx.to_llvm_ptr`, so no address space is hardcoded.
 from flydsl._mlir.dialects import rocdl as _rocdl_d
 from flydsl.expr import T, const_expr, range_constexpr, rocdl
@@ -84,11 +89,11 @@ class _WideG2SLoader:
     per-tile rebase of ROCm/aiter#4473 works only for a scan. ``global_load_lds``
     is the same DMA on a per-lane 64-bit pointer.
 
-    Two things the copy atom did implicitly and this does by hand: lane ``i``
-    lands at ``lds_base + i*16``, and the K offset rides in the address, there
-    being no ``soffset`` -- safe only because nothing range-checks an origin
-    here. Nothing bounds the read either: a kv_indices entry outside the cache
-    faults instead of returning zeros.
+    Three things the copy atom did implicitly and this does by hand: lane ``i``
+    lands at ``lds_base + i*16``; the K offset rides in the address, there being
+    no ``soffset`` -- safe only because nothing range-checks an origin here; and
+    nothing bounds the read, so a kv_indices entry outside the cache faults
+    instead of returning zeros.
     """
 
     # 64 lanes x 16 B. Both sides count fp8 elements, which are 1 B, so this is
