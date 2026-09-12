@@ -17,11 +17,15 @@ from aiter.ops.flydsl.moe_common import GateMode
 from .combine import _make_combine_fused_reduce, _make_combine_fused_sync
 from .config import _WAVE_SIZE, _select_dispatch_config
 from .dispatch import _make_dispatch
+from .dispatch_tdm import _make_dispatch_tdm, tdm_max_warps, tdm_stage_capacity
 from .types import Stage2ScatterContext, _from_gpu_ptr
 
 __all__ = ["MegaMoEGfx1250"]
 
-_DISPATCH_BACKENDS = ("flydsl", "mori")
+# "flydsl": per-lane vec4 payload copies. "tdm": the same arena protocol with
+# the payload and the metadata moved by the gfx1250 Tensor Data Mover. "mori":
+# mori's HIP/JIT kernel through its EpDispatchPlan.
+_DISPATCH_BACKENDS = ("flydsl", "tdm", "mori")
 _MAX_WORLD_SIZE = 72
 _MAX_EXPERTS_PER_RANK = 512
 
@@ -193,12 +197,11 @@ class MegaMoEConfig:
                 f"dispatch_wire must be one of {_DISPATCH_WIRES}, "
                 f"got {self.dispatch_wire!r}"
             )
-        if self.is_quant_dispatch_wire and self.dispatch_backend != "mori":
-            # Only mori's kernel carries the scale row; this package's own
-            # dispatch has no channel for it.
+        if self.is_quant_dispatch_wire and self.dispatch_backend not in ("tdm", "mori"):
             raise ValueError(
                 f"dispatch_wire={self.dispatch_wire!r} requires "
-                f"dispatch_backend='mori' (got {self.dispatch_backend!r})"
+                "dispatch_backend='tdm' or 'mori' "
+                f"(got {self.dispatch_backend!r})"
             )
         if self.is_quant_dispatch_wire and self.hidden_dim % 32:
             raise ValueError(
@@ -235,6 +238,7 @@ class MegaMoEConfig:
             self.world_size,
             self.hidden_dim,
             self.topk,
+            tdm=self.dispatch_backend == "tdm",
         )
         if self.dispatch_block_num is None:
             self.dispatch_block_num = tuned["dispatch_block_num"]
@@ -301,6 +305,8 @@ class MegaMoEConfig:
         """
         if not self.is_quant_dispatch_wire:
             return 0
+        if self.dispatch_backend == "tdm":
+            return _align_up(self.dispatch_scale_nbytes, 128)
         try:
             from mori.ops.dispatch_combine_v2.hip_backend import scale_stride_bytes
         except ImportError as e:
@@ -678,6 +684,8 @@ class MegaMoEGfx1250:
         self._dispatch_specs = dispatch_specs
         if config.dispatch_backend == "mori":
             self._dispatch_variants = self._build_mori_dispatch(config)
+        elif config.dispatch_backend == "tdm":
+            self._dispatch_variants = self._build_tdm_dispatch(config, device)
         else:
             self._dispatch_variants = {
                 spec: _make_dispatch(
@@ -719,6 +727,133 @@ class MegaMoEGfx1250:
             npes=config.world_size,
             off_xdb_mem=self._arena.offset("cross_device_barrier"),
         )
+
+    def _build_tdm_dispatch(self, config: MegaMoEConfig, device) -> dict:
+        """The TDM dispatch, wearing `_make_dispatch`'s calling convention.
+
+        It leaves the same arena state the vector dispatch does (disp_out rows
+        at slot*hidden, out_idx/out_wts at slot*topk+k, recv_to_src_token as
+        src_pe*max_tok+src_tok), so gemm1, the gemm2 P2P scatter and the fused
+        combine are untouched. Only the recv SLOT a token lands in changes:
+        slots are reserved one atomic per (block, peer) and handed out
+        block-local, so a test comparing arena contents slot-by-slot against
+        the vector dispatch will differ.
+
+        The three staging arrays are this package's stand-in for the ``__device__``
+        BSS the HIP kernel keeps: FINALIZE gathers idx / weights / srcmap into a
+        peer-major destTokId SoA there so META can ship each block's reserved run
+        as a couple of contiguous TDM copies.
+        """
+        payload_dim = config.dispatch_wire_elem_count
+        elem_size = config.dispatch_wire_spec.recv_dtype.itemsize
+        stg_cap, slots = tdm_stage_capacity(
+            npes=config.world_size, max_recv=config.max_recv
+        )
+        stage = [
+            torch.empty(slots * config.topk, dtype=torch.int32, device=device),
+            torch.empty(slots * config.topk, dtype=torch.int32, device=device),
+            torch.empty(slots, dtype=torch.int32, device=device),
+        ]
+        if config.dispatch_scale_dst_nbytes:
+            stage.append(
+                torch.empty(
+                    slots * config.dispatch_scale_dst_nbytes,
+                    dtype=torch.uint8,
+                    device=device,
+                )
+            )
+        self._tdm_stage = tuple(stage)
+        for buf in self._tdm_stage:
+            if buf.data_ptr() % 128:
+                raise RuntimeError(
+                    "TDM staging allocations must be 128-byte aligned, got "
+                    f"0x{buf.data_ptr():x}"
+                )
+        # On a quantized wire the metadata batch grew by a scale row while the
+        # payload shrank, so the shared LDS tile is floored at the bf16 width.
+        slab_bytes = config.hidden_dim * 2 if config.is_quant_dispatch_wire else 0
+        # A vector-tuned spec can name more warps than the payload tiles fit;
+        # clamp the width but keep the tuned block count, which is what paces
+        # the grid barrier, and keep the caller's spec as the variant key so the
+        # runtime pick still resolves.
+        max_warps = tdm_max_warps(
+            hidden_dim=payload_dim,
+            hidden_elem_size=elem_size,
+            npes=config.world_size,
+            slab_bytes=slab_bytes,
+        )
+        stg_idx, stg_wt, stg_src = self._tdm_stage[:3]
+        stg_scale = self._tdm_stage[3] if len(self._tdm_stage) > 3 else None
+
+        def make_variant(kern):
+            def launch(
+                arena_handle,
+                addr_inp_tok,
+                addr_inp_idx,
+                addr_inp_wts,
+                addr_tok_map,
+                addr_dest_ctr,
+                addr_disp_bar,
+                addr_total_recv,
+                my_lsa_rank,
+                inp_cur_tok,
+                stream,
+            ):
+                kern(
+                    arena_handle,
+                    addr_inp_tok,
+                    addr_inp_idx,
+                    addr_inp_wts,
+                    addr_tok_map,
+                    addr_dest_ctr,
+                    addr_disp_bar,
+                    addr_total_recv,
+                    stg_idx.data_ptr(),
+                    stg_wt.data_ptr(),
+                    stg_src.data_ptr(),
+                    stg_scale.data_ptr() if stg_scale is not None else 0,
+                    self._dispatch_sent_scales_ptr,
+                    my_lsa_rank,
+                    inp_cur_tok,
+                    stream,
+                )
+
+            return launch
+
+        built = {}
+        variants = {}
+        for spec in self._dispatch_specs:
+            geom = (spec[0], min(spec[1], max_warps))
+            if geom not in built:
+                built[geom] = _make_dispatch_tdm(
+                    rank=config.rank,
+                    npes=config.world_size,
+                    experts_per_rank=config.experts_per_rank,
+                    experts_per_token=config.topk,
+                    hidden_dim=payload_dim,
+                    hidden_elem_size=elem_size,
+                    slab_bytes=slab_bytes,
+                    max_tok_per_rank=config.max_tokens_per_rank,
+                    max_recv=config.max_recv,
+                    off_tok_off=self._arena.offset("tok_off"),
+                    off_recv_num=self._arena.offset("recv_num"),
+                    off_tis=self._arena.offset("recv_to_src_token"),
+                    off_out_idx=self._arena.offset("out_idx"),
+                    off_out_wts=self._arena.offset("out_wts"),
+                    off_out_tok=self._arena.offset("disp_out"),
+                    off_out_scales=(
+                        self._arena.offset("disp_out_scales")
+                        if config.dispatch_scale_dst_nbytes
+                        else 0
+                    ),
+                    scale_bytes=config.dispatch_scale_nbytes,
+                    scale_stride=config.dispatch_scale_dst_nbytes,
+                    block_num=geom[0],
+                    warp_num_per_block=geom[1],
+                )
+            variants[spec] = make_variant(built[geom])
+        self._tdm_stage_capacity = stg_cap
+        return variants
 
     def _build_mori_dispatch(self, config: MegaMoEConfig) -> dict:
         """mori's HIP/JIT dispatch, wearing `_make_dispatch`'s calling convention.
