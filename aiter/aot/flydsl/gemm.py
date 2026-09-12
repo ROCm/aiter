@@ -583,7 +583,9 @@ def _compile_mxfp8_128_wmma_to_cache(
                     m, n, tile_m, tile_n, variant_cm, split_k, cu_num, True
                 )
                 cb_args = (
-                    variant_args[:12] + (_ptr_view_safe(flag),) + variant_args[12:]
+                    variant_args[:12]
+                    + (_ptr_view_safe(flag), _ptr_view_safe(out))
+                    + variant_args[12:]
                 )
                 for bounded_m in ((False, True) if fused_splitk else (row_bounded,)):
                     launch(

@@ -441,9 +441,10 @@ df_md = df.to_markdown(index=False)
 aiter.logger.info("gemm_a8w8_blockscale summary (markdown):\n%s", df_md)
 
 # Correctness check: verify split-K produces matching results
-print("\nRunning split-K correctness checks ...")
-for splitK in [1, 2]:
-    test_splitk_correctness(m=4, n=512, k=16384, splitK=splitK)
+if not args.flydsl:
+    print("\nRunning CK split-K correctness checks ...")
+    for splitK in [1, 2]:
+        test_splitk_correctness(m=4, n=512, k=16384, splitK=splitK)
 
 # Save results from benchmarks
 if args.output:

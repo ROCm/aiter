@@ -44,14 +44,9 @@ def splitk_epilogue_flags(
 ):
     """Return ``(fused_splitk, bounded_m)`` for one launch."""
     wgs = _splitk_grid_wgs(M, N, tile_m, tile_n, cluster_m, split_k)
-    pow2 = split_k & (split_k - 1) == 0
+    del cu_num  # Last-arrival reduction does not require a resident grid.
     fused = (
-        compute_bound
-        and split_k > 1
-        and pow2
-        and tile_m % split_k == 0
-        and wgs * 32 <= SPLIT_K_FLAG_MAX_LEN
-        and wgs <= cu_num
+        compute_bound and split_k > 1 and (wgs // split_k) * 32 <= SPLIT_K_FLAG_MAX_LEN
     )
     return fused, bool(M % tile_m)
 
@@ -300,7 +295,7 @@ def _run_mxfp8_128_preshuffle_gemm_a8_gfx1250(
     ldc = Out.stride(0)
     torch_stream = torch.cuda.current_stream(device=XQ.device)
     stream = _fx.Stream(torch_stream)
-    _atomic_splitk, bounded_m = splitk_epilogue_flags(
+    fused_splitk, bounded_m = splitk_epilogue_flags(
         M,
         N,
         tile_m,
@@ -311,13 +306,18 @@ def _run_mxfp8_128_preshuffle_gemm_a8_gfx1250(
         compute_bound,
     )
     flag = (
-        get_split_k_flags(torch_stream.cuda_stream, XQ.device)
-        if _atomic_splitk
-        else Out
+        get_split_k_flags(torch_stream.cuda_stream, XQ.device) if fused_splitk else Out
+    )
+    # Pack each tile's splits together so the reducer reads nearby cache lines.
+    # Round M up for the last tile; TDM bounds mask its unused rows.
+    partial_shape = (
+        (((M + tile_m - 1) // tile_m) * (N // tile_n), split_k, tile_m, tile_n)
+        if fused_splitk
+        else (split_k, M, ldc)
     )
     partials = (
-        torch.empty((split_k, M, ldc), dtype=Out.dtype, device=Out.device)
-        if split_k > 1 and not _atomic_splitk
+        torch.empty(partial_shape, dtype=Out.dtype, device=Out.device)
+        if split_k > 1
         else None
     )
     gemm_out = Out if partials is None else partials
@@ -349,19 +349,19 @@ def _run_mxfp8_128_preshuffle_gemm_a8_gfx1250(
     )
     launch = _launch_gemm_a8w8_compute_bound if compute_bound else _launch_gemm_a8w8
     if compute_bound:
-        cb_args = launch_args[:12] + (_ptr_arg(flag),) + launch_args[12:]
+        cb_args = launch_args[:12] + (_ptr_arg(flag), _ptr_arg(Out)) + launch_args[12:]
         launch(
             *cb_args,
             BLOCK_K,
             split_k,
             a_preshuffle,
             persistent_n_tiles,
-            _atomic_splitk,
+            fused_splitk,
             bounded_m,
         )
     else:
         launch(*launch_args, BLOCK_K, split_k, False, 0, 1, a_preshuffle)
-    if partials is not None:
+    if partials is not None and not fused_splitk:
         dense = ldc == N
         _run_compiled(
             _compile_splitk_reduce(split_k=split_k, out_dtype_str=out_dtype),
