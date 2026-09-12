@@ -47,6 +47,7 @@ from aiter.ops.flydsl.moe_common import GateMode, apply_gate_up
 from aiter.ops.quant import per_1x32_f4_quant
 from aiter.ops.shuffle import moe_shuffle_scale, moe_shuffle_weight
 from aiter.utility import dtypes, fp4_utils
+from op_tests import bench_init
 
 # Build every tensor straight on the device (like op_tests/test_moe_2stage.py) so
 # the test body has no `.cuda()` / `.float().cuda()` plumbing.
@@ -239,23 +240,49 @@ def _torch_moe_ref(
 # Mock data builders
 # ---------------------------------------------------------------------------
 def _pattern_packed(
-    experts: int, rows: int, k_pack: int, *, const_init: float | None = None
+    experts: int,
+    rows: int,
+    k_pack: int,
+    *,
+    data_init: str,
+    generator: torch.Generator,
 ) -> torch.Tensor:
-    """mxfp4 packed bytes ``(E, rows, k_pack) uint8`` from the global RNG."""
-    if const_init is not None:
-        return torch.full((experts, rows, k_pack), int(const_init), dtype=torch.uint8)
-    return torch.randint(0, 256, (experts, rows, k_pack), dtype=torch.uint8)
+    """Build packed MXFP4 weights with the shared benchmark initializer."""
+    if data_init == "constant":
+        return torch.full((experts, rows, k_pack), 0x11, dtype=torch.uint8)
+    packed = bench_init.fill_fp4((experts * rows, k_pack * 2), data_init, generator)
+    return packed.view(experts, rows, k_pack)
 
 
 def init_weight_scales(
-    experts: int, rows: int, n_blocks: int, *, const_init: float | None = None
+    experts: int,
+    rows: int,
+    n_blocks: int,
+    *,
+    scale_init: str,
+    generator: torch.Generator,
 ) -> torch.Tensor:
-    """Per-block e8m0 weight scale: random small scales (drawn from the global
-    RNG) so the n32k4 B-scale preshuffle layout is actually exercised."""
-    if const_init is not None:
-        return torch.full((experts, rows, n_blocks), int(const_init), dtype=torch.uint8)
-    r = torch.randint(0, 3, (experts, rows, n_blocks), dtype=torch.int16)
-    return (r + (DEFAULT_SCALE_BYTE - 1)).to(torch.uint8)
+    """Build E8M0 weight scales with the shared benchmark initializer."""
+    if scale_init == "constant":
+        return torch.full(
+            (experts, rows, n_blocks), DEFAULT_SCALE_BYTE, dtype=torch.uint8
+        )
+    return bench_init.fill_scale_e8m0((experts, rows, n_blocks), scale_init, generator)
+
+
+def _init_hidden(
+    shape: tuple[int, int],
+    data_format: str,
+    data_init: str,
+    generator: torch.Generator,
+) -> torch.Tensor:
+    """Build BF16 activations using the selected low-precision data model."""
+    if data_init == "constant":
+        return torch.full(shape, 0.5, dtype=torch.bfloat16)
+    if data_format == "a4w4":
+        packed = bench_init.fill_fp4(shape, data_init, generator)
+        return fp4_utils.mxfp4_to_f32(packed).to(torch.bfloat16)
+    return bench_init.fill_fp8(shape, data_init, generator).to(torch.bfloat16)
 
 
 def _make_routing_score(tokens: int, experts: int, topk: int) -> torch.Tensor:
@@ -332,7 +359,8 @@ def _run_grouped_via_fused_moe(
     seed: int = 0,
     warmup: int = 5,
     iters: int = 101,
-    const_init: float | None = None,
+    data_init: str = "uniform",
+    scale_init: str = "auto",
 ) -> tuple[torch.Tensor, torch.Tensor, float | None, dict | None]:
     """Build mxfp4 weights + routing, dispatch through ``fused_moe``.
 
@@ -358,31 +386,50 @@ def _run_grouped_via_fused_moe(
     inter_pack = inter // 2
 
     # Logical weights/scale/bias: always GGUU (gate rows then up rows).
-    # One global seed per case; every draw below uses the global RNG.
     torch.manual_seed(seed)
-    w1_logical = _pattern_packed(experts, 2 * inter, K_pack, const_init=const_init)
-    w2_logical = _pattern_packed(experts, K, inter_pack, const_init=const_init)
+    generator = bench_init.make_generator(seed)
+    w1_logical = _pattern_packed(
+        experts,
+        2 * inter,
+        K_pack,
+        data_init=data_init,
+        generator=generator,
+    )
+    w2_logical = _pattern_packed(
+        experts,
+        K,
+        inter_pack,
+        data_init=data_init,
+        generator=generator,
+    )
     w1_scale_raw = init_weight_scales(
-        experts, 2 * inter, K // SCALE_BLOCK, const_init=const_init
+        experts,
+        2 * inter,
+        K // SCALE_BLOCK,
+        scale_init=scale_init,
+        generator=generator,
     )
     w2_scale_raw = init_weight_scales(
-        experts, K, inter // SCALE_BLOCK, const_init=const_init
+        experts,
+        K,
+        inter // SCALE_BLOCK,
+        scale_init=scale_init,
+        generator=generator,
     )
     if use_bias:
-        if const_init is not None:
-            bias1 = torch.full((experts, 2 * inter), float(const_init))
-            bias2 = torch.full((experts, K), float(const_init))
+        if data_init == "constant":
+            bias1 = torch.full((experts, 2 * inter), 0.5)
+            bias2 = torch.full((experts, K), 0.5)
         else:
-            bias1 = (torch.randn((experts, 2 * inter)) * 1e-3).float()
-            bias2 = (torch.randn((experts, K)) * 1e-3).float()
+            bias1 = (
+                torch.randn((experts, 2 * inter), generator=generator) * 1e-3
+            ).float()
+            bias2 = (torch.randn((experts, K), generator=generator) * 1e-3).float()
     else:
         bias1 = torch.zeros((experts, 2 * inter))
         bias2 = torch.zeros((experts, K))
     # Activations: bf16; fused_moe handles the dispatched quant internally.
-    if const_init is not None:
-        hidden = torch.full((tokens, K), float(const_init), dtype=torch.bfloat16)
-    else:
-        hidden = (torch.randn((tokens, K)) * 0.5).to(torch.bfloat16)
+    hidden = _init_hidden((tokens, K), data_format, data_init, generator)
 
     # Routing: normal (random) by default; balanced if AITER_MOE_EXPERT_BALANCE.
     topk_id, topk_w = _make_topk(hidden, experts, topk)
@@ -521,6 +568,56 @@ def _logits_diff(actual: torch.Tensor, expected: torch.Tensor) -> float:
     return float(((x - y) ** 2).sum() / denom)
 
 
+def _gemm_work_metrics(
+    *,
+    experts: int,
+    tokens: int,
+    topk: int,
+    model_dim: int,
+    inter_dim: int,
+    data_format: str,
+) -> dict[str, tuple[float, float]]:
+    """Return conventional GEMM FLOPs and effective bytes for both stages.
+
+    The byte model matches the grouped-MoE tuner: logical quantized inputs and
+    weights plus BF16 outputs. It excludes routing, quantization, scales, bias,
+    and other fused-MoE auxiliary traffic, so the reported bandwidth is an
+    effective GEMM bandwidth rather than measured HBM transactions.
+    """
+    input_bytes = 0.5 if data_format == "a4w4" else 1.0
+    weight_bytes = 0.5
+    output_bytes = 2.0
+    stage1_n = 2 * inter_dim
+
+    gemm1_flops = tokens * topk * stage1_n * model_dim * 2
+    gemm1_bytes = (
+        tokens * model_dim * input_bytes
+        + tokens * stage1_n * output_bytes
+        + experts * model_dim * stage1_n * weight_bytes
+    )
+    gemm2_flops = tokens * topk * model_dim * inter_dim * 2
+    gemm2_bytes = (
+        tokens * topk * inter_dim * input_bytes
+        + tokens * model_dim * output_bytes
+        + experts * inter_dim * model_dim * weight_bytes
+    )
+    return {
+        "gemm1": (gemm1_flops, gemm1_bytes),
+        "gemm2": (gemm2_flops, gemm2_bytes),
+        "total": (gemm1_flops + gemm2_flops, gemm1_bytes + gemm2_bytes),
+    }
+
+
+def _rates(
+    work: tuple[float, float], us: float | None
+) -> tuple[float | None, float | None]:
+    """Convert a (FLOPs, bytes) work estimate and microseconds to rates."""
+    if us is None or us <= 0:
+        return None, None
+    flops, data_bytes = work
+    return flops / us / 1e6, data_bytes / us / 1e3
+
+
 # ---------------------------------------------------------------------------
 # Pytest correctness suite
 # ---------------------------------------------------------------------------
@@ -543,7 +640,9 @@ def run_moe(
     kernel_bench: bool = False,
     warmup: int = 5,
     iters: int = 101,
-    const_init: float | None = None,
+    seed: int = 0,
+    data_init: str = "uniform",
+    scale_init: str = "auto",
     check_aot_cache: bool = True,
 ) -> dict:
     """Compare grouped FlyDSL MoE vs a PyTorch fp32 ref. ``bench`` selects the
@@ -579,9 +678,11 @@ def run_moe(
             use_bias=use_bias,
             bench=bench,
             kernel_bench=kernel_bench,
+            seed=seed,
             warmup=warmup,
             iters=iters,
-            const_init=const_init,
+            data_init=data_init,
+            scale_init=scale_init,
         )
     mode = "kernel" if kernel_bench else ("graph" if bench else "eager")
     ld = _logits_diff(out, ref)
@@ -606,16 +707,38 @@ def run_moe(
 
     # --- perf (bench only): timed end-to-end inside _run_grouped_via_fused_moe ---
     if bench:
+        work = _gemm_work_metrics(
+            experts=experts,
+            tokens=tokens,
+            topk=topk,
+            model_dim=model_dim,
+            inter_dim=inter_dim,
+            data_format=data_format,
+        )
+        tflops, bandwidth = _rates(work["total"], us)
         print(
-            f"[bench {tag}] fused_moe end-to-end us = {us:.2f} (graph=True)",
+            f"[bench {tag}] fused_moe end-to-end us = {us:.2f}, "
+            f"FLOPS = {work['total'][0]:.0f}, TFLOPS = {tflops:.2f}, "
+            f"Bandwidth = {bandwidth:.2f} GB/s (graph=True)",
             flush=True,
         )
         metrics["us"] = us
+        metrics["flops"] = work["total"][0]
+        metrics["tflops"] = tflops
+        metrics["bandwidth_gbs"] = bandwidth
     # --- perf (kernel-bench only): per-kernel gemm1/gemm2 timing (looped alone) ---
     if kernel_bench:
         kernel_us = kernel_us or {}
         g1 = kernel_us.get("gemm1")
         g2 = kernel_us.get("gemm2")
+        work = _gemm_work_metrics(
+            experts=experts,
+            tokens=tokens,
+            topk=topk,
+            model_dim=model_dim,
+            inter_dim=inter_dim,
+            data_format=data_format,
+        )
         if g1 is None and g2 is None:
             print(
                 f"[kernel-bench {tag}] no grouped kernels captured "
@@ -623,12 +746,20 @@ def run_moe(
                 flush=True,
             )
         else:
-            g1s = "n/a" if g1 is None else f"{g1:.2f}"
-            g2s = "n/a" if g2 is None else f"{g2:.2f}"
-            print(
-                f"[kernel-bench {tag}] gemm1 us = {g1s} gemm2 us = {g2s}",
-                flush=True,
-            )
+            for name, elapsed_us in (("gemm1", g1), ("gemm2", g2)):
+                if elapsed_us is None:
+                    print(f"[kernel-bench {tag}] {name}: n/a", flush=True)
+                    continue
+                tflops, bandwidth = _rates(work[name], elapsed_us)
+                print(
+                    f"[kernel-bench {tag}] {name}: us = {elapsed_us:.2f}, "
+                    f"FLOPS = {work[name][0]:.0f}, TFLOPS = {tflops:.2f}, "
+                    f"Bandwidth = {bandwidth:.2f} GB/s",
+                    flush=True,
+                )
+                metrics[f"{name}_flops"] = work[name][0]
+                metrics[f"{name}_tflops"] = tflops
+                metrics[f"{name}_bandwidth_gbs"] = bandwidth
         metrics["gemm1_us"] = g1
         metrics["gemm2_us"] = g2
     return metrics
@@ -840,6 +971,13 @@ def summarize(rows: list):
             print(f"  {r}", flush=True)
         return rows
     df = pd.DataFrame(rows)
+    empty_perf_columns = [
+        column
+        for column in df.columns
+        if ("tflops" in column.lower() or "bandwidth" in column.lower())
+        and df[column].isna().all()
+    ]
+    df = df.drop(columns=empty_perf_columns)
     try:
         table = df.to_markdown(index=False)
     except ImportError:
@@ -965,28 +1103,55 @@ def run_csv_scenario(args) -> None:
         # Route each row to its format (a8w4 needs AITER_FORCE_A8W4=1).
         set_data_format(data_format)
         tol = VERIFY_TOL_A8W4 if data_format == "a8w4" else VERIFY_TOL_A4W4
-        try:
-            metrics = run_moe(
-                data_format,
-                experts=experts,
-                tokens=tokens,
-                topk=topk,
-                model_dim=model_dim,
-                inter_dim=inter_dim,
-                tol=tol,
-                activation=activation,
-                swiglu_limit=args.swiglu_limit,
-                use_bias=not args.no_bias,
-                check_aot_cache=not args.no_check_aot_cache,
-                raise_on_fail=False,
-                bench=True,
-                kernel_bench=False,
-                warmup=args.warmup,
-                iters=args.iters,
-                const_init=args.const_init,
-            )
-        except Exception as exc:  # noqa: BLE001 - record, keep sweeping
-            print(f"[csv] row {idx}: ERROR {exc!r}", flush=True)
+        for data_init, scale_init in args.init_pairs:
+            try:
+                metrics = run_moe(
+                    data_format,
+                    experts=experts,
+                    tokens=tokens,
+                    topk=topk,
+                    model_dim=model_dim,
+                    inter_dim=inter_dim,
+                    tol=tol,
+                    activation=activation,
+                    swiglu_limit=args.swiglu_limit,
+                    use_bias=not args.no_bias,
+                    check_aot_cache=not args.no_check_aot_cache,
+                    raise_on_fail=False,
+                    bench=True,
+                    kernel_bench=False,
+                    warmup=args.warmup,
+                    iters=args.iters,
+                    seed=args.seed,
+                    data_init=data_init,
+                    scale_init=scale_init,
+                )
+            except Exception as exc:  # noqa: BLE001 - record, keep sweeping
+                print(f"[csv] row {idx}: ERROR {exc!r}", flush=True)
+                rows.append(
+                    {
+                        "row": idx,
+                        "data_format": data_format,
+                        "act": act,
+                        "tokens": tokens,
+                        "model_dim": model_dim,
+                        "inter_dim": inter_dim,
+                        "experts": experts,
+                        "topk": topk,
+                        "data_init": data_init,
+                        "scale_init": scale_init,
+                        "seed": args.seed,
+                        "logits_diff": float("nan"),
+                        "rel_l2": float("nan"),
+                        "pass": False,
+                        "error": repr(exc),
+                        "us": None,
+                        "gemm1_us": None,
+                        "gemm2_us": None,
+                    }
+                )
+                continue
+
             rows.append(
                 {
                     "row": idx,
@@ -997,36 +1162,20 @@ def run_csv_scenario(args) -> None:
                     "inter_dim": inter_dim,
                     "experts": experts,
                     "topk": topk,
-                    "logits_diff": float("nan"),
-                    "rel_l2": float("nan"),
-                    "pass": False,
-                    "error": repr(exc),
-                    "us": None,
-                    "gemm1_us": None,
-                    "gemm2_us": None,
+                    "data_init": data_init,
+                    "scale_init": scale_init,
+                    "seed": args.seed,
+                    "logits_diff": metrics["logits_diff"],
+                    "rel_l2": metrics["rel_l2"],
+                    "pass": metrics["passed"],
+                    "error": None,
+                    "us": metrics.get("us"),
+                    "TFLOPS": metrics.get("tflops"),
+                    "Bandwidth (GB/s)": metrics.get("bandwidth_gbs"),
+                    "gemm1_us": metrics.get("gemm1_us"),
+                    "gemm2_us": metrics.get("gemm2_us"),
                 }
             )
-            continue
-
-        rows.append(
-            {
-                "row": idx,
-                "data_format": data_format,
-                "act": act,
-                "tokens": tokens,
-                "model_dim": model_dim,
-                "inter_dim": inter_dim,
-                "experts": experts,
-                "topk": topk,
-                "logits_diff": metrics["logits_diff"],
-                "rel_l2": metrics["rel_l2"],
-                "pass": metrics["passed"],
-                "error": None,
-                "us": metrics.get("us"),
-                "gemm1_us": metrics.get("gemm1_us"),
-                "gemm2_us": metrics.get("gemm2_us"),
-            }
-        )
 
     summarize(rows)
     failed = [r for r in rows if not r["pass"]]
@@ -1084,6 +1233,21 @@ def main() -> None:
     parser.add_argument("--warmup", type=int, default=5)
     parser.add_argument("--iters", type=int, default=101)
     parser.add_argument(
+        "--data-init",
+        dest="data_init",
+        nargs="*",
+        choices=bench_init.DATA_DISTS,
+        default=None,
+        help="DATA initialization distribution(s), paired position-wise with "
+        "--scale-init (length-1 broadcasts). Default: constant uniform",
+    )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=0,
+        help="RNG seed for data and routing (default: 0)",
+    )
+    parser.add_argument(
         "--act",
         choices=("silu", "swiglu", "situv2"),
         default=None,
@@ -1113,16 +1277,13 @@ def main() -> None:
         help="run with zero stage1/stage2 bias tensors",
     )
     parser.add_argument(
-        "--const-init",
-        type=float,
-        nargs="?",
-        const=0.0,
+        "--scale-init",
+        dest="scale_init",
+        nargs="*",
+        choices=bench_init.E8M0_SCALE_DISTS,
         default=None,
-        metavar="VALUE",
-        help="initialize activations (A), weights (B), weight scales (Bs), and "
-        "bias to the constant VALUE instead of random values. Bare --const-init "
-        "uses 0.0 (zero-init). uint8 tensors (weights, scales) are filled with "
-        "int(VALUE).",
+        help="E8M0 SCALE initialization distribution(s), paired position-wise "
+        "with --data-init (length-1 broadcasts). Default: constant auto",
     )
     parser.add_argument(
         "--real-gemm",
@@ -1140,6 +1301,18 @@ def main() -> None:
         "miss raises. Pass this flag to allow runtime JIT compilation.",
     )
     args = parser.parse_args()
+    data_init_list = args.data_init or ["constant", "uniform"]
+    scale_init_list = args.scale_init or ["constant", "auto"]
+    if len(data_init_list) == 1:
+        data_init_list *= len(scale_init_list)
+    if len(scale_init_list) == 1:
+        scale_init_list *= len(data_init_list)
+    if len(data_init_list) != len(scale_init_list):
+        parser.error(
+            "--data-init and --scale-init must have equal length "
+            "(or length 1 to broadcast)"
+        )
+    args.init_pairs = list(zip(data_init_list, scale_init_list))
     if not args.real_gemm:
         _mock_grouped_gemm()
 
@@ -1171,48 +1344,59 @@ def main() -> None:
         if len(token_list) > 1:
             print(f"\n===== tokens={_tok} =====", flush=True)
 
-        tol = VERIFY_TOL_A8W4 if args.data_format == "a8w4" else VERIFY_TOL_A4W4
-        # raise_on_fail=False so one out-of-gate token does not abort the
-        # sweep; the failure is recorded and reported after the table.
-        metrics = run_moe(
-            args.data_format,
-            experts=args.experts,
-            tokens=args.tokens,
-            topk=args.topk,
-            model_dim=args.model_dim,
-            inter_dim=args.inter_dim,
-            tol=tol,
-            activation=activation,
-            swiglu_limit=args.swiglu_limit,
-            situ_beta=args.situ_beta,
-            situ_linear_beta=args.situ_linear_beta,
-            use_bias=not args.no_bias,
-            check_aot_cache=not args.no_check_aot_cache,
-            raise_on_fail=False,
-            bench=args.scenario == "bench",
-            kernel_bench=args.scenario == "kernel",
-            warmup=args.warmup,
-            iters=args.iters,
-            const_init=args.const_init,
-        )
-        rows.append(
-            {
-                "data_format": args.data_format,
-                "act": args.act,
-                "init": "random" if args.const_init is None else "const",
-                "experts": args.experts,
-                "tokens": _tok,
-                "topk": args.topk,
-                "model_dim": args.model_dim,
-                "inter_dim": args.inter_dim,
-                "logits_diff": metrics["logits_diff"],
-                "rel_l2": metrics["rel_l2"],
-                "pass": metrics["passed"],
-                "us": metrics.get("us"),
-                "gemm1_us": metrics.get("gemm1_us"),
-                "gemm2_us": metrics.get("gemm2_us"),
-            }
-        )
+        for data_init, scale_init in args.init_pairs:
+            tol = VERIFY_TOL_A8W4 if args.data_format == "a8w4" else VERIFY_TOL_A4W4
+            # raise_on_fail=False so one out-of-gate token does not abort the
+            # sweep; the failure is recorded and reported after the table.
+            metrics = run_moe(
+                args.data_format,
+                experts=args.experts,
+                tokens=args.tokens,
+                topk=args.topk,
+                model_dim=args.model_dim,
+                inter_dim=args.inter_dim,
+                tol=tol,
+                activation=activation,
+                swiglu_limit=args.swiglu_limit,
+                situ_beta=args.situ_beta,
+                situ_linear_beta=args.situ_linear_beta,
+                use_bias=not args.no_bias,
+                check_aot_cache=not args.no_check_aot_cache,
+                raise_on_fail=False,
+                bench=args.scenario == "bench",
+                kernel_bench=args.scenario == "kernel",
+                warmup=args.warmup,
+                iters=args.iters,
+                seed=args.seed,
+                data_init=data_init,
+                scale_init=scale_init,
+            )
+            rows.append(
+                {
+                    "data_format": args.data_format,
+                    "act": args.act,
+                    "data_init": data_init,
+                    "scale_init": scale_init,
+                    "seed": args.seed,
+                    "experts": args.experts,
+                    "tokens": _tok,
+                    "topk": args.topk,
+                    "model_dim": args.model_dim,
+                    "inter_dim": args.inter_dim,
+                    "logits_diff": metrics["logits_diff"],
+                    "rel_l2": metrics["rel_l2"],
+                    "pass": metrics["passed"],
+                    "us": metrics.get("us"),
+                    "TFLOPS": metrics.get("tflops"),
+                    "Bandwidth (GB/s)": metrics.get("bandwidth_gbs"),
+                    "gemm1_us": metrics.get("gemm1_us"),
+                    "gemm2_us": metrics.get("gemm2_us"),
+                    "gemm1_TFLOPS": metrics.get("gemm1_tflops"),
+                    "gemm1_Bandwidth (GB/s)": metrics.get("gemm1_bandwidth_gbs"),
+                    "gemm2_TFLOPS": metrics.get("gemm2_tflops"),
+                    "gemm2_Bandwidth (GB/s)": metrics.get("gemm2_bandwidth_gbs"),
+                }
+            )
 
     # Always print the summary table (verify and bench).
     summarize(rows)

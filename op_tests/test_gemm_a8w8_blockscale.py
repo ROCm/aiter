@@ -20,6 +20,7 @@ from aiter.ops.gemm_op_a8w8 import gemm_a8w8_blockscale_ck, gemm_a8w8_blockscale
 from aiter.ops.shuffle import shuffle_weight
 from aiter.test_common import benchmark, checkAllclose, perftest
 from aiter.utility import fp4_utils
+from op_tests import bench_init
 
 block_shape = (128, 128)
 TEST_NUM_ITERS = 100
@@ -87,25 +88,53 @@ def run_triton(x, weightshuffle, x_scale, w_scale, dtype=dtypes.bf16, backend=No
 
 
 @benchmark()
-def test_gemm(dtype, m, n, k, ck_preshuffle=True, use_flydsl=False):
+def test_gemm(
+    dtype,
+    m,
+    n,
+    k,
+    ck_preshuffle=True,
+    use_flydsl=False,
+    data_init="uniform",
+    scale_init="auto",
+    seed=0,
+):
     ret = {}
     block_shape_n, block_shape_k = block_shape
     scale_m = m
     scale_n = (n + block_shape_n - 1) // block_shape_n
     scale_k = (k + block_shape_k - 1) // block_shape_k
-    x = (torch.rand((m, k), dtype=dtypes.fp32, device="cuda") / 10).to(dtypes.fp8)
-    weight = (torch.rand((n, k), dtype=dtypes.fp32, device="cuda") / 10).to(dtypes.fp8)
-    x_scale = torch.rand([scale_m, scale_k], dtype=dtypes.fp32, device="cuda")
-    w_scale = torch.rand([scale_n, scale_k], dtype=dtypes.fp32, device="cuda")
+    generator = bench_init.make_generator(seed)
+    if data_init == "constant":
+        x = torch.full((m, k), 0.5, dtype=dtypes.fp32, device="cuda").to(dtypes.fp8)
+        weight = torch.full((n, k), 0.5, dtype=dtypes.fp32, device="cuda").to(
+            dtypes.fp8
+        )
+    else:
+        x = bench_init.fill_fp8((m, k), data_init, generator)
+        weight = bench_init.fill_fp8((n, k), data_init, generator)
+
+    if scale_init == "constant":
+        x_scale_raw = torch.full(
+            (scale_m, scale_k), 0x7F, dtype=torch.uint8, device="cuda"
+        )
+        w_scale_raw = torch.full(
+            (scale_n, scale_k), 0x7F, dtype=torch.uint8, device="cuda"
+        )
+    else:
+        x_scale_raw = bench_init.fill_scale_e8m0(
+            (scale_m, scale_k), scale_init, generator
+        )
+        w_scale_raw = bench_init.fill_scale_e8m0(
+            (scale_n, scale_k), scale_init, generator
+        )
     use_flydsl_fp8_scale = use_flydsl and ck_preshuffle
     if use_flydsl_fp8_scale:
-        FP8_E4M3_MAX = 448.0
-        x_scale = fp4_utils.f32_to_mx_e8m0_scale(
-            x_scale * FP8_E4M3_MAX, dtype=fp4_utils.MxDtypeInt.FP8_E4M3
-        )
-        w_scale = fp4_utils.f32_to_mx_e8m0_scale(
-            w_scale * FP8_E4M3_MAX, dtype=fp4_utils.MxDtypeInt.FP8_E4M3
-        )
+        x_scale = x_scale_raw.view(dtypes.fp8_e8m0)
+        w_scale = w_scale_raw.view(dtypes.fp8_e8m0)
+    else:
+        x_scale = fp4_utils.e8m0_to_f32(x_scale_raw)
+        w_scale = fp4_utils.e8m0_to_f32(w_scale_raw)
 
     a, _ = run_torch(x, weight, x_scale, w_scale, dtype)
 
@@ -305,6 +334,30 @@ parser.add_argument(
     e.g.: -nk 24576,1536""",
 )
 parser.add_argument(
+    "--data-init",
+    dest="data_init",
+    nargs="*",
+    choices=bench_init.DATA_DISTS,
+    default=None,
+    help="DATA initialization distribution(s), paired position-wise with "
+    "--scale-init (length-1 broadcasts). Default: constant uniform",
+)
+parser.add_argument(
+    "--scale-init",
+    dest="scale_init",
+    nargs="*",
+    choices=bench_init.E8M0_SCALE_DISTS,
+    default=None,
+    help="E8M0 SCALE initialization distribution(s), paired position-wise "
+    "with --data-init (length-1 broadcasts). Default: constant auto",
+)
+parser.add_argument(
+    "--seed",
+    type=int,
+    default=0,
+    help="RNG seed for input, weight, and scales (default: 0)",
+)
+parser.add_argument(
     "--ck_preshuffle",
     type=dtypes.str2bool,
     nargs="*",
@@ -344,6 +397,19 @@ parser.add_argument(
 
 args = parser.parse_args()
 
+data_init_list = args.data_init or ["constant", "uniform"]
+scale_init_list = args.scale_init or ["constant", "auto"]
+if len(data_init_list) == 1:
+    data_init_list *= len(scale_init_list)
+if len(scale_init_list) == 1:
+    scale_init_list *= len(data_init_list)
+if len(data_init_list) != len(scale_init_list):
+    parser.error(
+        "--data-init and --scale-init must have equal length "
+        "(or length 1 to broadcast)"
+    )
+init_pairs = list(zip(data_init_list, scale_init_list))
+
 l_preshuffle = (
     args.ck_preshuffle if isinstance(args.ck_preshuffle, list) else [args.ck_preshuffle]
 )
@@ -356,25 +422,38 @@ if args.csv is not None:
     print(f"Loaded {len(shapes_df)} shapes from {args.csv}", flush=True)
     for dtype in args.dtype:
         for preshuffle in l_preshuffle:
-            for _, row in shapes_df.iterrows():
-                ret = test_gemm(
-                    dtype,
-                    int(row["M"]),
-                    int(row["N"]),
-                    int(row["K"]),
-                    ck_preshuffle=preshuffle,
-                    use_flydsl=args.flydsl,
-                )
-                df.append(ret)
+            for data_init, scale_init in init_pairs:
+                for _, row in shapes_df.iterrows():
+                    ret = test_gemm(
+                        dtype,
+                        int(row["M"]),
+                        int(row["N"]),
+                        int(row["K"]),
+                        ck_preshuffle=preshuffle,
+                        use_flydsl=args.flydsl,
+                        data_init=data_init,
+                        scale_init=scale_init,
+                        seed=args.seed,
+                    )
+                    df.append(ret)
 else:
     for dtype in args.dtype:
         for m in args.m:
             for n, k in args.nk:
                 for ck_p in l_preshuffle:
-                    ret = test_gemm(
-                        dtype, m, n, k, ck_preshuffle=ck_p, use_flydsl=args.flydsl
-                    )
-                    df.append(ret)
+                    for data_init, scale_init in init_pairs:
+                        ret = test_gemm(
+                            dtype,
+                            m,
+                            n,
+                            k,
+                            ck_preshuffle=ck_p,
+                            use_flydsl=args.flydsl,
+                            data_init=data_init,
+                            scale_init=scale_init,
+                            seed=args.seed,
+                        )
+                        df.append(ret)
 
 df = pd.DataFrame(df)
 
