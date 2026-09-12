@@ -285,9 +285,9 @@ def _run_stage1_mxfp4_port(weights, scales, probes, *, interleave: bool) -> None
 @pytest.mark.parametrize(
     "backend",
     [
-        pytest.param("wrapper", marks=_A16_GPU_ONLY),
-        pytest.param("direct", marks=_A16_GPU_ONLY),
-        pytest.param("guinterleave", marks=_A16_GPU_ONLY),
+        pytest.param("wrapper", marks=_GFX950_ONLY),
+        pytest.param("direct", marks=_GFX950_ONLY),
+        pytest.param("guinterleave", marks=_GFX950_ONLY),
         pytest.param("port", marks=_GFX950_ONLY),
         pytest.param("port_interleave", marks=_GFX950_ONLY),
     ],
@@ -432,9 +432,9 @@ def _run_stage2_wrapper(
 @pytest.mark.parametrize(
     "backend",
     [
-        pytest.param("a16_direct", marks=_A16_GPU_ONLY),
-        pytest.param("a16_direct_persistent", marks=_A16_GPU_ONLY),
-        pytest.param("a16_wrapper", marks=_A16_GPU_ONLY),
+        pytest.param("a16_direct", marks=_GFX950_ONLY),
+        pytest.param("a16_direct_persistent", marks=_GFX950_ONLY),
+        pytest.param("a16_wrapper", marks=_GFX950_ONLY),
         pytest.param("a4w4", marks=_GFX950_ONLY),
         pytest.param("a4w4_persistent", marks=_GFX950_ONLY),
         pytest.param("a8w4", marks=_GFX950_ONLY),
