@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# Copyright (c) 2025 FlyDSL Project Contributors
+# Copyright (C) 2025-2026 FlyDSL Project Contributors
 
 """MoE topk-reduction kernel (FlyDSL, layout API).
 
@@ -29,8 +29,8 @@ BLOCK = 256
 FP8_VEC = 8  # fp8 values per 64b buffer load (also the store granularity)
 
 
-@flyc.kernel
-def moe_reduction_kernel(
+@flyc.jit
+def _moe_reduction_body(
     X: fx.Pointer,
     Y: fx.Pointer,
     expert_mask: fx.Pointer,
@@ -183,8 +183,7 @@ def moe_reduction_kernel(
         fx.memref_store_vec(acc.truncf(vec_out) if is_16b else acc, ofrag)
         fx.copy(store_atom, ofrag, p_dst)
 
-    # Skip threads whose column group starts past model_dim (their loads would
-    # read the next row -- in-descriptor, wasted BW); only needed when TILE ∤ md.
+    # Skip column groups beyond model_dim.
     if const_expr(model_dim % TILE != 0):
         if fx.Int32(tile) * fx.Int32(TILE) + fx.Int32(tid) * fx.Int32(V) < fx.Int32(
             model_dim
@@ -237,17 +236,22 @@ def compile_moe_reduction(
     else:
         scale_blk, fp8_row_stride = FP8_VEC, model_dim
 
-    @flyc.jit
-    def launch(
+    kernel_name = (
+        f"moe_reduction_{dtype_str}_{out_tag}_t{topk}_n{model_dim}"
+        f"_m{int(use_mask)}e{num_experts if use_mask else 0}"
+        f"_w{int(use_weight)}_s{scale_blk}_r{fp8_row_stride}_b{block}"
+    )
+
+    @flyc.kernel(name=kernel_name, known_block_size=[block, 1, 1])
+    def reduction_kernel(
         X: fx.Pointer,
         Y: fx.Pointer,
         expert_mask: fx.Pointer,
         topk_ids: fx.Pointer,
         topk_weights: fx.Pointer,
         i32_m_tokens: fx.Int32,
-        stream: fx.Stream,
     ):
-        moe_reduction_kernel(
+        _moe_reduction_body(
             X,
             Y,
             expert_mask,
@@ -264,6 +268,25 @@ def compile_moe_reduction(
             scale_blk,
             fp8_row_stride,
             block,
+        )
+
+    @flyc.jit
+    def launch(
+        X: fx.Pointer,
+        Y: fx.Pointer,
+        expert_mask: fx.Pointer,
+        topk_ids: fx.Pointer,
+        topk_weights: fx.Pointer,
+        i32_m_tokens: fx.Int32,
+        stream: fx.Stream,
+    ):
+        reduction_kernel(
+            X,
+            Y,
+            expert_mask,
+            topk_ids,
+            topk_weights,
+            i32_m_tokens,
         ).launch(
             grid=(fx.Int64(i32_m_tokens), gy, 1), block=(block, 1, 1), stream=stream
         )
