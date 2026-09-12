@@ -33,3 +33,14 @@ def wvSplitKQ(
     scale_b: Tensor,
     CuCount: int,
 ) -> None: ...
+
+
+@compile_ops("module_custom", develop=True)
+def wvSplitKQ_pertoken(
+    in_a: Tensor,
+    in_b: Tensor,
+    out_c: Tensor,
+    scale_a: Tensor,
+    scale_b: Tensor,
+    CuCount: int,
+) -> None: ...

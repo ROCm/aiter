@@ -1786,6 +1786,8 @@ __global__ void __launch_bounds__(WvPrGrp* THRDS) wvSplitKQ_hf_sml_(const int K,
                                                                     scalar_t* C,
                                                                     const float* __restrict__ s_A,
                                                                     const float* __restrict__ s_B,
+                                                                    const int s_A_stride,
+                                                                    const int s_B_stride,
                                                                     const int _WvPrGrp,
                                                                     const int CuCount)
 {
@@ -1819,8 +1821,9 @@ __global__ void __launch_bounds__(WvPrGrp* THRDS) wvSplitKQ_hf_sml_(const int K,
 
     using floatx16 = __attribute__((__vector_size__(16 * sizeof(float)))) float;
     floatx16 sum[N][YTILE];
-    float sA = *s_A;
-    float sB = *s_B;
+    // Scales are read with a stride in the epilogue rather than hoisted here:
+    // stride 0 selects the single per-tensor value, stride 1 selects
+    // per-output-channel (s_A) and per-token (s_B) scales.
 
     while(m < M)
     {
@@ -1958,7 +1961,8 @@ __global__ void __launch_bounds__(WvPrGrp* THRDS) wvSplitKQ_hf_sml_(const int K,
             {
                 for(int y = 0; y < YTILE; y++)
                 {
-                    C[m + y + n * M] = __float2s<scalar_t>(sum[n][y][0] * sA * sB);
+                    C[m + y + n * M] = __float2s<scalar_t>(
+                        sum[n][y][0] * s_A[(m + y) * s_A_stride] * s_B[n * s_B_stride]);
                 }
             }
         }
@@ -1983,6 +1987,8 @@ __global__ void wvSplitKQ_hf_sml_(const int K,
                                   scalar_t* C,
                                   const float* __restrict__ s_A,
                                   const float* __restrict__ s_B,
+                                  const int s_A_stride,
+                                  const int s_B_stride,
                                   const int _WvPrGrp,
                                   const int CuCount)
 {
@@ -2007,6 +2013,8 @@ __global__ void __launch_bounds__(WvPrGrp* THRDS) wvSplitKQ_hf_(const int K,
                                                                 scalar_t* C,
                                                                 const float* __restrict__ s_A,
                                                                 const float* __restrict__ s_B,
+                                                                const int s_A_stride,
+                                                                const int s_B_stride,
                                                                 const int _WvPrGrp,
                                                                 const int CuCount)
 {
@@ -2040,8 +2048,9 @@ __global__ void __launch_bounds__(WvPrGrp* THRDS) wvSplitKQ_hf_(const int K,
 
     using floatx16 = __attribute__((__vector_size__(16 * sizeof(float)))) float;
     floatx16 sum[N][YTILE];
-    float sA = *s_A;
-    float sB = *s_B;
+    // Scales are read with a stride in the epilogue rather than hoisted here:
+    // stride 0 selects the single per-tensor value, stride 1 selects
+    // per-output-channel (s_A) and per-token (s_B) scales.
 
     while(m < M)
     {
@@ -2175,7 +2184,8 @@ __global__ void __launch_bounds__(WvPrGrp* THRDS) wvSplitKQ_hf_(const int K,
                 {
                     if(y + m >= M)
                         break; // To avoid mem access fault.
-                    C[m + y + n * M] = __float2s<scalar_t>(sum[n][y][0] * sA * sB);
+                    C[m + y + n * M] = __float2s<scalar_t>(
+                        sum[n][y][0] * s_A[(m + y) * s_A_stride] * s_B[n * s_B_stride]);
                 }
             }
         }
@@ -2200,6 +2210,8 @@ __global__ void wvSplitKQ_hf_(const int K,
                               scalar_t* C,
                               const float* __restrict__ s_A,
                               const float* __restrict__ s_B,
+                              const int s_A_stride,
+                              const int s_B_stride,
                               const int _WvPrGrp,
                               const int CuCount)
 {
@@ -2219,7 +2231,9 @@ void wvSplitKQ_(void* in_a,
                 hipStream_t stream,
                 const int CuCount,
                 const AiterDtype a_scalar_type,
-                const AiterDtype c_scalar_type)
+                const AiterDtype c_scalar_type,
+                const int s_A_stride,
+                const int s_B_stride)
 {
 #define WVSPLITKQ(_WvPrGrp, _YTILEs, _YTILEm, _YTILEb, _UNRLs, _UNRLm, _UNRLb, _N)                 \
     {                                                                                              \
@@ -2228,15 +2242,35 @@ void wvSplitKQ_(void* in_a,
         {                                                                                          \
             int __wvPrGrp = mindiv(M_in, CuCount * _YTILEs, _WvPrGrp);                             \
             wvSplitKQ_hf_sml_<fptype, fp8_t, 64, _YTILEs, _WvPrGrp, 16, _UNRLs, _N>                \
-                <<<grid, block, 0, stream>>>(                                                      \
-                    K_in, Kp_in, M_in, a_ptr, b_ptr, c_ptr, scale_a, scale_b, __wvPrGrp, CuCount); \
+                <<<grid, block, 0, stream>>>(K_in,                                                 \
+                                             Kp_in,                                                \
+                                             M_in,                                                 \
+                                             a_ptr,                                                \
+                                             b_ptr,                                                \
+                                             c_ptr,                                                \
+                                             scale_a,                                              \
+                                             scale_b,                                              \
+                                             s_A_stride,                                           \
+                                             s_B_stride,                                           \
+                                             __wvPrGrp,                                            \
+                                             CuCount);                                             \
         }                                                                                          \
         else                                                                                       \
         {                                                                                          \
             int __wvPrGrp = mindiv(M_in, CuCount * _YTILEm, _WvPrGrp);                             \
             wvSplitKQ_hf_<fptype, fp8_t, 64, _YTILEm, _WvPrGrp, 16, _UNRLm, _N>                    \
-                <<<grid, block, 0, stream>>>(                                                      \
-                    K_in, Kp_in, M_in, a_ptr, b_ptr, c_ptr, scale_a, scale_b, __wvPrGrp, CuCount); \
+                <<<grid, block, 0, stream>>>(K_in,                                                 \
+                                             Kp_in,                                                \
+                                             M_in,                                                 \
+                                             a_ptr,                                                \
+                                             b_ptr,                                                \
+                                             c_ptr,                                                \
+                                             scale_a,                                              \
+                                             scale_b,                                              \
+                                             s_A_stride,                                           \
+                                             s_B_stride,                                           \
+                                             __wvPrGrp,                                            \
+                                             CuCount);                                             \
         }                                                                                          \
     }
 
@@ -2251,8 +2285,8 @@ void wvSplitKQ_(void* in_a,
             {
             case 1: WVSPLITKQ(16, 2, 2, 2, 2, 2, 2, 1) break;
             case 2: WVSPLITKQ(16, 2, 2, 2, 2, 2, 2, 2) break;
-            case 3: WVSPLITKQ(16, 4, 7, 7, 1, 1, 1, 3) break;
-            case 4: WVSPLITKQ(16, 4, 7, 7, 1, 1, 1, 4) break;
+            case 3: WVSPLITKQ(16, 1, 7, 7, 2, 1, 1, 3) break;
+            case 4: WVSPLITKQ(16, 1, 7, 7, 2, 1, 1, 4) break;
             default:
                 throw std::runtime_error("Unsupported N value: " + std::to_string(M_in) + "," +
                                          std::to_string(K_in) + "," + std::to_string(N_in));

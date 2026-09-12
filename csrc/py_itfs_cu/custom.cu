@@ -151,7 +151,11 @@ void wvSplitKQ_(void* in_a,
                 hipStream_t stream,
                 const int CuCount                   = 1,
                 const AiterDtype a_scalar_type       = AITER_DTYPE_fp8,
-                const AiterDtype c_scalar_type       = AITER_DTYPE_fp16);
+                const AiterDtype c_scalar_type       = AITER_DTYPE_fp16,
+                // 0 = single per-tensor scale, 1 = per-output-channel (scale_a)
+                // and per-token (scale_b).
+                const int s_A_stride                 = 0,
+                const int s_B_stride                 = 0);
 void wvSplitKQ(aiter_tensor_t& in_a,
                aiter_tensor_t& in_b,
                aiter_tensor_t& out_c,
@@ -183,6 +187,47 @@ void wvSplitKQ(aiter_tensor_t& in_a,
                CuCount,
                in_a.dtype(),
                out_c.dtype());
+}
+
+// Same skinny FP8 GEMM as wvSplitKQ, but with per-output-channel weight scales
+// and per-token activation scales, which is what a dynamically per-token
+// quantized activation (e.g. Qwen3.5 GDN in_proj_ba) produces. Kept as a
+// separate entry point so existing per-tensor callers keep their exact path.
+void wvSplitKQ_pertoken(aiter_tensor_t& in_a,
+                        aiter_tensor_t& in_b,
+                        aiter_tensor_t& out_c,
+                        aiter_tensor_t& scale_a,
+                        aiter_tensor_t& scale_b,
+                        const int64_t CuCount)
+{
+    auto M  = in_a.size(0);
+    auto K  = in_a.size(1);
+    auto N  = in_b.size(0);
+    auto Kp = in_a.stride(0);
+    AITER_CHECK(K % 16 == 0, "k % 16 == 0");
+    AITER_CHECK(in_a.dtype() == in_b.dtype() && in_a.dtype() == AITER_DTYPE_fp8);
+    AITER_CHECK(out_c.dtype() == AITER_DTYPE_fp16 || out_c.dtype() == AITER_DTYPE_bf16);
+    AITER_CHECK(scale_a.numel() == M, "scale_a must hold one scale per output channel");
+    AITER_CHECK(scale_b.numel() == N, "scale_b must hold one scale per token");
+    auto scale_a_ptr = reinterpret_cast<float*>(scale_a.data_ptr());
+    auto scale_b_ptr = reinterpret_cast<float*>(scale_b.data_ptr());
+
+    HipDeviceGuard device_guard(in_a.device_id);
+    wvSplitKQ_(in_a.data_ptr(),
+               in_b.data_ptr(),
+               out_c.data_ptr(),
+               scale_a_ptr,
+               scale_b_ptr,
+               M,
+               K,
+               Kp,
+               N,
+               aiter::getCurrentHIPStream(),
+               CuCount,
+               in_a.dtype(),
+               out_c.dtype(),
+               /*s_A_stride=*/1,
+               /*s_B_stride=*/1);
 }
 
 void LLGemmZZ(void* in_a,
