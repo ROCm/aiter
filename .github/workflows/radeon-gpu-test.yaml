@@ -1,0 +1,280 @@
+name: Radeon GPU Test
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "aiter/ops/flydsl/**"
+      - "aiter/jit/**"
+      - "csrc/include/opus/**"
+      - "op_tests/flydsl_tests/**"
+      - "op_tests/opus/**"
+      - "requirements.txt"
+      - "pyproject.toml"
+      - "setup.py"
+      - ".github/runner-config.yml"
+      - ".github/scripts/aiter_gpu_visibility_check.sh"
+      - ".github/scripts/docker_pull_with_retry.sh"
+      - ".github/scripts/install_triton.sh"
+      - ".github/workflows/radeon-gpu-test.yaml"
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+    branches: [main]
+    paths:
+      - "aiter/ops/flydsl/**"
+      - "aiter/jit/**"
+      - "csrc/include/opus/**"
+      - "op_tests/flydsl_tests/**"
+      - "op_tests/opus/**"
+      - "requirements.txt"
+      - "pyproject.toml"
+      - "setup.py"
+      - ".github/runner-config.yml"
+      - ".github/scripts/aiter_gpu_visibility_check.sh"
+      - ".github/scripts/docker_pull_with_retry.sh"
+      - ".github/scripts/install_triton.sh"
+      - ".github/workflows/radeon-gpu-test.yaml"
+  schedule:
+    - cron: "30 22 * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+env:
+  DOCKER_IMAGE: "rocm/pytorch:latest"
+  GPU_ARCHS: "gfx1201"
+  AITER_BUILD_MAX_JOBS: "64"
+  FLYDSL_RUNTIME_CACHE_DIR: "/tmp/aiter-flydsl-ci-cache"
+
+jobs:
+  check-signal:
+    if: ${{ !github.event.pull_request || github.event.pull_request.draft == false }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Wait for Checks workflow
+        run: ./.github/scripts/check_signal.sh
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_SHA: ${{ github.sha }}
+
+  radeon-gfx1201:
+    if: ${{ !github.event.pull_request || github.event.pull_request.draft == false }}
+    name: Radeon gfx1201 FlyDSL FA
+    needs: check-signal
+    # Dedicated Radeon AI PRO R9700 runner label.
+    runs-on: [self-hosted, "9700"]
+    timeout-minutes: 120
+
+    steps:
+      - name: Prepare Radeon workspace
+        run: |
+          set -euo pipefail
+          docker rm -f aiter_radeon_test || true
+
+          if [ -d "${{ github.workspace }}" ]; then
+            if ! docker image inspect "${{ env.DOCKER_IMAGE }}" >/dev/null 2>&1; then
+              docker pull "${{ env.DOCKER_IMAGE }}"
+            fi
+
+            docker run --rm \
+              -v "${{ github.workspace }}:/workspace" \
+              --entrypoint bash \
+              ${{ env.DOCKER_IMAGE }} \
+              -lc "chown -R $(id -u):$(id -g) /workspace"
+          fi
+
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+
+      - name: Docker login
+        if: ${{ github.event_name != 'pull_request' || !github.event.pull_request.head.repo.fork }}
+        env:
+          DOCKER_PASSWORD: ${{ secrets.DOCKER_PASSWORD }}
+        run: |
+          for attempt in 1 2 3; do
+            if echo "$DOCKER_PASSWORD" | docker login -u rocmshared --password-stdin; then
+              echo "Docker login succeeded on attempt ${attempt}"
+              exit 0
+            fi
+            echo "Docker login attempt ${attempt} failed"
+            if [ "${attempt}" != 3 ]; then
+              sleep 10
+            fi
+          done
+          echo "Docker login failed after 3 attempts, continuing anyway"
+          exit 0
+
+      - name: Verify Radeon runner host
+        run: |
+          set -euo pipefail
+          actual_host="$(hostname)"
+          if [ "${actual_host}" != "amd-G7466-M6" ]; then
+            echo "::error::Expected runner host amd-G7466-M6, got ${actual_host}"
+            exit 1
+          fi
+          /opt/rocm/bin/rocm-smi --showproductname
+
+      - name: Pull base image
+        run: bash .github/scripts/docker_pull_with_retry.sh "${{ env.DOCKER_IMAGE }}"
+
+      - name: Start Radeon test container
+        run: |
+          set -ex
+          docker rm -f aiter_radeon_test || true
+
+          if [ -f "/etc/podinfo/gha-render-devices" ]; then
+            DEVICE_FLAG=$(cat /etc/podinfo/gha-render-devices)
+          else
+            DEVICE_FLAG="--device /dev/dri"
+          fi
+
+          docker run -dt \
+          --device=/dev/kfd $DEVICE_FLAG \
+          --shm-size=32G \
+          --network=host \
+          --group-add $(getent group render | cut -d: -f3) \
+          --group-add $(getent group video | cut -d: -f3) \
+          -e HIP_VISIBLE_DEVICES=0 \
+          -e CUDA_VISIBLE_DEVICES=0 \
+          -e GPU_ARCHS=${{ env.GPU_ARCHS }} \
+          -e MAX_JOBS=${{ env.AITER_BUILD_MAX_JOBS }} \
+          -e FLYDSL_RUNTIME_CACHE_DIR=${{ env.FLYDSL_RUNTIME_CACHE_DIR }} \
+          -e PYTHONDONTWRITEBYTECODE=1 \
+          -v "${{ github.workspace }}:/workspace" \
+          -w /workspace \
+          --name aiter_radeon_test \
+          ${{ env.DOCKER_IMAGE }}
+
+      - name: Check GPU visibility
+        run: |
+          set -euo pipefail
+          docker exec \
+            -w /workspace \
+            aiter_radeon_test \
+            bash -lc './.github/scripts/aiter_gpu_visibility_check.sh'
+
+      - name: Show Radeon test environment
+        run: |
+          set -ex
+          docker exec \
+            -w /workspace \
+            aiter_radeon_test \
+            bash -lc '
+              python3 -c "import torch; props = torch.cuda.get_device_properties(0); print(\"torch\", torch.__version__); print(\"device_count\", torch.cuda.device_count()); print(\"gcnArchName\", props.gcnArchName); print(\"name\", props.name); assert props.gcnArchName.lower().split(\":\")[0].startswith(\"gfx1201\"), props.gcnArchName"
+              hipcc --version | head -n 2
+            '
+
+      - name: Build and install Aiter wheel
+        timeout-minutes: 60
+        run: |
+          set -ex
+          docker exec \
+            -e GPU_ARCHS="${{ env.GPU_ARCHS }}" \
+            -e MAX_JOBS="${{ env.AITER_BUILD_MAX_JOBS }}" \
+            -w /workspace \
+            aiter_radeon_test \
+            bash -lc '
+              set -euo pipefail
+              exec > >(tee latest_aiter_wheel_install.log) 2>&1
+              start=$(date +%s)
+              git config --global --add safe.directory /workspace
+              python3 -m pip config set global.retries 15
+              python3 -m pip config set global.timeout 120
+              python3 -m pip install --upgrade pip
+              python3 -m pip uninstall -y amd-aiter aiter || true
+              python3 -m pip install -r requirements.txt
+              python3 -m pip install --upgrade pandas pyzmq einops numpy==1.26.2
+              python3 -m pip install --upgrade "pybind11>=3.0.1"
+              python3 -m pip install --upgrade "ninja>=1.11.1"
+              python3 -m pip install --upgrade setuptools_scm
+              python3 -m pip install tabulate
+              ./.github/scripts/install_triton.sh
+              rm -rf dist build aiter_meta ./*.egg-info
+              export PREBUILD_KERNELS=0
+              export GPU_ARCHS="${GPU_ARCHS}"
+              export MAX_JOBS="${MAX_JOBS}"
+              echo "Radeon FlyDSL flash-attention uses runtime FlyDSL compilation; CK/CDNA prebuild is not part of this gfx1201 lane."
+              echo "Building Aiter wheel with PREBUILD_KERNELS=${PREBUILD_KERNELS}, GPU_ARCHS=${GPU_ARCHS}, MAX_JOBS=${MAX_JOBS}"
+              python3 setup.py bdist_wheel 2>&1 | tee latest_aiter_wheel_build.log
+              AITER_WHEEL="$(ls -t dist/*.whl | head -1)"
+              test -n "${AITER_WHEEL}"
+              python3 -m pip install "${AITER_WHEEL}"
+              python3 -m pip show amd-aiter
+              python3 -m pip show flydsl
+              python3 -m pip show triton || true
+              python3 -c "import importlib.metadata as md, os, aiter; from aiter.ops.flydsl import flydsl_flash_attn_func, is_flydsl_available; print(\"aiter_file\", aiter.__file__); print(\"aiter_triton_only_env\", os.getenv(\"AITER_TRITON_ONLY\")); print(\"amd_aiter_version\", md.version(\"amd-aiter\")); print(\"flydsl_version\", md.version(\"flydsl\")); print(\"flydsl_available\", is_flydsl_available()); print(\"flydsl_flash_attn_func\", flydsl_flash_attn_func); assert os.getenv(\"AITER_TRITON_ONLY\") != \"1\""
+              end=$(date +%s)
+              echo "Aiter wheel build/install elapsed: $((end-start))s"
+            '
+
+      - name: OPUS gfx1201 tests
+        timeout-minutes: 30
+        run: |
+          set -ex
+          docker exec \
+            -w /workspace \
+            aiter_radeon_test \
+            bash -lc "set -o pipefail && ./op_tests/opus/run_tests.sh 2>&1 | tee latest_opus_test.log"
+
+      - name: Aiter FlyDSL gfx1201 flash-attention tests
+        timeout-minutes: 30
+        run: |
+          set -ex
+          docker exec \
+            -e FLYDSL_RUNTIME_CACHE_DIR="${{ env.FLYDSL_RUNTIME_CACHE_DIR }}" \
+            -w /workspace \
+            aiter_radeon_test \
+            bash -lc '
+              set -euo pipefail
+              exec > >(tee latest_flydsl_fmha_test.log) 2>&1
+              rm -rf "${FLYDSL_RUNTIME_CACHE_DIR}"
+              mkdir -p "${FLYDSL_RUNTIME_CACHE_DIR}"
+              echo "Using fresh FLYDSL_RUNTIME_CACHE_DIR=${FLYDSL_RUNTIME_CACHE_DIR}"
+              python3 -m pip show amd-aiter
+              python3 -m pip show flydsl
+              python3 -c "import torch; arch = torch.cuda.get_device_properties(0).gcnArchName; print(\"test_arch\", arch); assert arch.lower().split(\":\")[0].startswith(\"gfx1201\"), arch"
+              start=$(date +%s)
+              FLYDSL_RUNTIME_CACHE_DIR="${FLYDSL_RUNTIME_CACHE_DIR}" \
+              pytest -vv -s op_tests/flydsl_tests/test_flydsl_fmha.py -p no:cacheprovider --tb=short --disable-warnings
+              end=$(date +%s)
+              echo "FlyDSL fmha pytest elapsed: $((end-start))s"
+              find "${FLYDSL_RUNTIME_CACHE_DIR}" -maxdepth 4 -type f -printf "FLYDSL_CACHE %s %p\n" | sort
+              cache_files=$(find "${FLYDSL_RUNTIME_CACHE_DIR}" -type f | wc -l)
+              if [ "${cache_files}" -lt 1 ]; then
+                echo "::error::FlyDSL flash-attention test did not produce runtime cache files"
+                exit 1
+              fi
+              echo "FlyDSL runtime cache file count: ${cache_files}"
+            '
+
+      - name: Upload Radeon test logs
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: radeon-gfx1201-test-logs
+          path: |
+            latest_aiter_wheel_install.log
+            latest_aiter_wheel_build.log
+            latest_opus_test.log
+            latest_flydsl_fmha_test.log
+          if-no-files-found: warn
+          retention-days: 7
+
+      - name: Cleanup container
+        if: always()
+        run: |
+          if docker ps -a --format '{{.Names}}' | grep -qx aiter_radeon_test; then
+            docker exec -u 0 \
+              -w /workspace \
+              aiter_radeon_test \
+              bash -lc "chown -R $(id -u):$(id -g) /workspace" || true
+          fi
+
+          docker rm -f aiter_radeon_test || true
