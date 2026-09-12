@@ -12,7 +12,11 @@ import os
 import torch
 import triton
 
+from aiter.ops.triton.utils.config_utils import load_config_json, resolve_config_dir
+from aiter.ops.triton.utils.logger import AiterTritonLogger
 from aiter.ops.triton.utils.tuned_config_utils import get_tuned_kernel_config
+
+logger = AiterTritonLogger()
 
 SUPPORTS_AUTOTUNE_CACHE = (
     "cache_results" in inspect.signature(triton.autotune).parameters
@@ -38,12 +42,39 @@ def chunk_delta_attn_autotune_configs(
 
 
 def chunk_delta_attn_tuned_config(
-    kernel_name: str, fallback: triton.Config
+    kernel_name: str, fallback: triton.Config, backend: str = "triton"
 ) -> triton.Config:
-    """This family's tile for the current device, from its published config."""
+    """This family's tile for the current device, from its published config.
+
+    The backends keep separate files: a Gluon kernel's warp count has to agree
+    with the warps its layouts were built for, so the two are not
+    interchangeable and must not fall back to one another.
+    """
     return get_tuned_kernel_config(
-        "attention", "CHUNK_DELTA_ATTN", kernel_name, fallback
+        "attention", "CHUNK_DELTA_ATTN", kernel_name, fallback, backend=backend
     )
+
+
+def chunk_delta_attn_tuned_config_shortlist(
+    kernel_name: str, fallback: list, backend: str = "triton"
+) -> list:
+    cfg_dir = resolve_config_dir("attention", "CHUNK_DELTA_ATTN", backend=backend)
+    table = load_config_json(f"{cfg_dir}/DEFAULT.json", required=False) or {}
+    published = (table.get(kernel_name) or {}).get("candidates")
+    if not published:
+        logger.warning(
+            f"No tuned Triton schedules for kernel '{kernel_name}' in "
+            f"'{cfg_dir}/DEFAULT.json'; using fallback {fallback}"
+        )
+        return fallback
+    return [
+        triton.Config(
+            {k: v for k, v in entry.items() if k not in ("num_warps", "num_stages")},
+            num_warps=entry.get("num_warps"),
+            num_stages=entry.get("num_stages"),
+        )
+        for entry in published
+    ]
 
 
 RCP_LN2: float = math.log2(math.e)  # 1/ln(2), for log2-space gate arithmetic
