@@ -15,6 +15,7 @@ from .triton._triton_kernels.gated_delta_rule.utils.prefill_metadata import (
 )
 
 MD_NAME = "module_chunk_gdr_fwd_h"
+MD_NAME_WAVE32 = "module_chunk_gdr_fwd_h_wave32"
 RCP_LN2 = 1.4426950408889634
 
 _BV_FIXED_LDS_BYTES = 32 * 1024
@@ -93,6 +94,33 @@ def _get_varlen_host_metadata(chunk_offsets: torch.Tensor) -> tuple[int, int]:
 
 @compile_ops(MD_NAME, develop=True)
 def chunk_gated_delta_rule_fwd_h_hip(
+    k: Tensor,
+    w: Tensor,
+    u: Tensor,
+    g: Tensor,
+    gk: Tensor,
+    initial_state: Tensor,
+    initial_state_indices: Tensor,
+    cu_seqlens: Tensor,
+    chunk_offsets: Tensor,
+    h: Tensor,
+    v_new: Tensor,
+    final_state: Tensor,
+    selected_bv: int,
+    has_initial_state: bool,
+    output_final_state: bool,
+    save_new_value: bool,
+    use_exp2: bool,
+    g_head_major: bool,
+) -> None: ...
+
+
+@compile_ops(
+    MD_NAME_WAVE32,
+    fc_name="chunk_gated_delta_rule_fwd_h_hip",
+    develop=True,
+)
+def chunk_gated_delta_rule_fwd_h_hip_wave32(
     k: Tensor,
     w: Tensor,
     u: Tensor,
@@ -219,6 +247,7 @@ def chunk_gated_delta_rule_fwd_h_hip_fn(
     num_decodes: int = 0,
     num_decode_tokens: int = 0,
     snapshot_dtype: torch.dtype | None = None,
+    wave_size: int = 64,
 ) -> tuple[Tensor, Tensor | None, Tensor | None]:
     """
     HIP hidden-state forward with h layout [V, K] (K=128, V=128), always
@@ -245,6 +274,8 @@ def chunk_gated_delta_rule_fwd_h_hip_fn(
     """
     if chunk_size != 64:
         raise ValueError("HIP kernel requires chunk_size=64.")
+    if wave_size not in (32, 64):
+        raise ValueError("`wave_size` must be 32 or 64.")
     if k.shape[-1] != 128 or w.shape[-1] != 128 or u.shape[-1] != 128:
         raise ValueError("HIP kernel requires K=128 and V=128.")
     if any(t.dtype != torch.bfloat16 for t in (k, w, u)):
@@ -414,7 +445,12 @@ def chunk_gated_delta_rule_fwd_h_hip_fn(
     else:
         state_indices = torch.empty(0, device=k.device, dtype=torch.int32)
 
-    chunk_gated_delta_rule_fwd_h_hip(
+    kernel = (
+        chunk_gated_delta_rule_fwd_h_hip_wave32
+        if wave_size == 32
+        else chunk_gated_delta_rule_fwd_h_hip
+    )
+    kernel(
         k_hip,
         w_hip,
         u_hip,
