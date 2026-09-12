@@ -53,6 +53,7 @@ from aiter.ops.flydsl.moe_kernels import (
     runtime_swiglu_limit,
 )
 from aiter.ops.flydsl.mxfp4_kname import parse_flydsl_v2_gemm2_kernel
+from aiter.ops.flydsl.mxfp8_moe_8wave import is_kernel_name as _is_mxfp8_prefill_kname
 
 # Keep the default AOT coverage aligned with runtime config resolution.
 DEFAULT_CSVS = [
@@ -1065,7 +1066,7 @@ def compile_one_config(
                 override_env("FLYDSL_GPU_ARCH", aot_arch),
                 FakeTensorMode(),
             ):
-                if "_mxfp8_8w_" in kernel_name:
+                if _is_mxfp8_prefill_kname(kernel_name):
                     from aiter.ops.flydsl.mxfp8_moe_8wave import precompile
 
                     with compile_only_env():

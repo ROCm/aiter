@@ -1,11 +1,11 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
-"""Eight-wave MXFP8/A8W4 prefill adapter for the standard AITER sorted MoE ABI.
+"""MXFP8/A8W4 prefill adapter for the standard AITER sorted MoE ABI.
 
 Uses the existing G1U1 16x64 weight packing and E8M0 scale layout. Workspace
 bounds come from tensor shapes; the valid sorted row count stays on the GPU.
-Stage 1 returns sorted FP8 activations and scales; the A8W4 256x256 path fuses
-its output quantization. Stage 2 reduces sorted BF16 partials in FP32.
+Stage 1 returns sorted FP8 activations and scales. A8W4 256x256 and four-wave
+128x256 tiles fuse output quantization. Stage 2 reduces sorted BF16 partials in FP32.
 A8W4 names select packed E2M1 weights and standard SiLU.
 Neither weight repacking nor host row-count readback is needed. A8W4 remains
 opt-in: the existing DSV4 tuned kernels remain the default.
@@ -17,33 +17,65 @@ import re
 
 import torch
 
-_NAME = re.compile(r"flydsl_moe([12])_(mxfp8|a8w4)_8w_t(256x256|128x512)_xcd([0-9]+)")
+_NAME = re.compile(
+    r"flydsl_moe([12])_(mxfp8|a8w4)_([48])w_t(256x256|128x512|128x256)(?:_persistent([24]))?_xcd([0-9]+)"
+)
 
 
-def kernel_name(stage, tile_m=256, tile_n=256, swizzle=1, b_dtype="fp8"):
+def is_kernel_name(name):
+    """Recognize this adapter's namespace before validating a complete name."""
+    return any(
+        marker in str(name) for marker in ("_mxfp8_8w_", "_a8w4_8w_", "_a8w4_4w_")
+    )
+
+
+def kernel_name(
+    stage, tile_m=256, tile_n=256, swizzle=1, b_dtype="fp8", waves=8, persistent_tiles=0
+):
     if b_dtype not in ("fp8", "fp4"):
         raise ValueError(f"Unsupported weight dtype: {b_dtype}")
+    if persistent_tiles not in (0, 2, 4):
+        raise ValueError(f"Unsupported persistent tile count: {persistent_tiles}")
     family = "a8w4" if b_dtype == "fp4" else "mxfp8"
-    return f"flydsl_moe{stage}_{family}_8w_t{tile_m}x{tile_n}_xcd{swizzle}"
+    suffix = f"_persistent{persistent_tiles}" if persistent_tiles else ""
+    return (
+        f"flydsl_moe{stage}_{family}_{waves}w_t{tile_m}x{tile_n}{suffix}_xcd{swizzle}"
+    )
 
 
 def kernel_params(name):
     match = _NAME.fullmatch(name or "")
     if match is None:
         return None
-    stage, family, tile, swizzle = match.groups()
+    stage, family, waves, tile, persistent, swizzle = match.groups()
+    waves = int(waves)
     tile_m, tile_n = map(int, tile.split("x"))
     if int(swizzle) not in (0, 1, 2, 3, 4, 8):
         raise ValueError(f"Unsupported MXFP8 eight-wave swizzle: {swizzle}")
-    if int(stage) == 2 and tile_m != 256:
+    if persistent and (int(stage), family, waves, tile_m, tile_n) != (
+        2,
+        "mxfp8",
+        8,
+        256,
+        256,
+    ):
+        raise ValueError("Persistent prefill requires MXFP8 stage2 tile256x256")
+    if waves == 4:
+        if family != "a8w4" or (tile_m, tile_n) != (128, 256):
+            raise ValueError("Four-wave prefill requires A8W4 tile128x256")
+    elif (tile_m, tile_n) not in ((256, 256), (128, 512)):
+        raise ValueError("Eight-wave prefill requires tile256x256 or tile128x512")
+    if waves == 8 and int(stage) == 2 and tile_m != 256:
         raise ValueError("MXFP8 eight-wave stage 2 requires 256x256")
     return {
         "stage": int(stage),
+        "num_waves": waves,
+        "persistent_tiles": int(persistent) if persistent else 0,
         "tile_m": tile_m,
         "tile_n": tile_n,
         "xcd_swizzle": int(swizzle),
         "mode": "reduce",
-        "sort_block_m": 256,
+        "sort_block_m": 128 if waves == 4 else 256,
         "a_dtype": "fp8",
         "b_dtype": "fp4" if family == "a8w4" else "fp8",
         "activation_type": "silu" if family == "a8w4" else "swiglu",
@@ -53,6 +85,17 @@ def kernel_params(name):
 
 @functools.lru_cache(maxsize=256)
 def _builder(kind, **kwargs):
+    persistent_tiles = kwargs.pop("persistent_tiles", 0)
+    if kind == "gemm" and persistent_tiles:
+        from .kernels.mxfp8_moe_gemm2_persistent import (
+            compile_mxfp8_moe_gemm_persistent,
+        )
+
+        return compile_mxfp8_moe_gemm_persistent(m_tiles=persistent_tiles, **kwargs)
+    if kind == "gemm" and kwargs.pop("num_waves", 8) == 4:
+        from .kernels.mxfp8_moe_4wave import compile_mxfp8_moe_gemm_4w
+
+        return compile_mxfp8_moe_gemm_4w(**kwargs)
     from .kernels.mxfp8_moe_8wave import (
         compile_mxfp8_moe_gemm_8w,
         compile_mxfp8_moe_quant,
@@ -71,9 +114,13 @@ def _builder(kind, **kwargs):
 
 
 def _run(kind, args, **kwargs):
-    from .kernels.tensor_shim import _run_compiled
+    from .kernels.tensor_shim import _preload_compiled, _run_compiled
 
-    _run_compiled(_builder(kind, **kwargs), *args)
+    launch = _builder(kind, **kwargs)
+    if os.environ.get("COMPILE_ONLY") == "1":
+        _preload_compiled(launch, *args)
+    else:
+        _run_compiled(launch, *args)
 
 
 def _stream():
@@ -137,7 +184,9 @@ def stage1(
     tokens, hidden = hidden_states.shape
     inter = w2.shape[-1] * (2 if params["b_dtype"] == "fp4" else 1)
     device = hidden_states.device
-    fuse_quant = params["b_dtype"] == "fp4" and params["tile_m"] == 256
+    fuse_quant = params["b_dtype"] == "fp4" and (
+        params["tile_m"] == 256 or params["num_waves"] == 4
+    )
     kp = (inter + 255) // 256 * 256
     if params["b_dtype"] == "fp4":
         rows = (sorted_ids.numel() + 255) // 256 * 256
@@ -230,6 +279,7 @@ def stage1(
         b_dtype=params["b_dtype"],
         expert_block_m=block_m,
         fuse_quant=fuse_quant,
+        **({"num_waves": 4} if params["num_waves"] == 4 else {}),
     )
     if not fuse_quant:
         _run(
@@ -300,6 +350,12 @@ def stage2(
         b_dtype=params["b_dtype"],
         expert_block_m=block_m,
         tile_m=params["tile_m"],
+        **({"num_waves": 4} if params["num_waves"] == 4 else {}),
+        **(
+            {"persistent_tiles": params["persistent_tiles"]}
+            if params["persistent_tiles"]
+            else {}
+        ),
     )
     _run(
         "reduce",
@@ -322,13 +378,14 @@ def precompile(kernelName, token_num, model_dim, inter_dim, experts, topk):
         raise ValueError(f"Invalid eight-wave kernel name: {kernelName}")
     tokens, hidden, inter = token_num, model_dim, inter_dim
     pack = 2 if params["b_dtype"] == "fp4" else 1
-    count = tokens * topk + experts * 256 - topk
+    block_m = params["sort_block_m"]
+    count = tokens * topk + experts * block_m - topk
     rows = (count + 255) // 256 * 256
     kwargs = {"device": "cpu"}
     w1 = torch.empty((experts, 2 * inter, hidden // pack), dtype=torch.int8, **kwargs)
     w2 = torch.empty((experts, hidden, inter // pack), dtype=torch.int8, **kwargs)
     ids = torch.empty(count, dtype=torch.int32, **kwargs)
-    eids = torch.empty(rows // 256, dtype=torch.int32, **kwargs)
+    eids = torch.empty((count + block_m - 1) // block_m, dtype=torch.int32, **kwargs)
     valid = torch.empty(2, dtype=torch.int32, **kwargs)
     if params["stage"] == 1:
         x = torch.empty((tokens, hidden), dtype=torch.bfloat16, **kwargs)
@@ -344,7 +401,7 @@ def precompile(kernelName, token_num, model_dim, inter_dim, experts, topk):
             valid,
             None,
             topk,
-            block_m=256,
+            block_m=block_m,
             kernelName=kernelName,
             w1_scale=scale,
         )
@@ -364,7 +421,7 @@ def precompile(kernelName, token_num, model_dim, inter_dim, experts, topk):
             valid,
             out,
             topk,
-            block_m=256,
+            block_m=block_m,
             kernelName=kernelName,
             w2_scale=scale,
             a2_scale=ascale,

@@ -10,6 +10,7 @@ import re
 import torch
 
 from aiter.ops.flydsl.kernels.tensor_shim import ptr_arg
+from aiter.ops.flydsl.mxfp8_moe_8wave import is_kernel_name as _is_mxfp8_prefill_kname
 
 _KERNEL_PARAMS: dict[str, dict] = {}
 
@@ -160,7 +161,7 @@ def get_flydsl_kernel_params(name: str) -> dict | None:
 
     Strips ``_kw{N}`` / ``_fp4`` / ``_fp8`` / ``_sbm{N}`` suffixes transparently.
     """
-    if "_mxfp8_8w_" in name:
+    if _is_mxfp8_prefill_kname(name):
         from .mxfp8_moe_8wave import kernel_params
 
         return kernel_params(name)

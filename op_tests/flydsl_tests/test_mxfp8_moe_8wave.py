@@ -67,10 +67,24 @@ def reference(x, w1, w2, ids, weights, limit, b_dtype="fp8"):
     return (partial.float() * weights[..., None]).sum(1).bfloat16()
 
 
-@pytest.mark.parametrize("tile", [(256, 256), (128, 512)])
+@pytest.mark.parametrize(
+    "tile,waves,b_dtype,limit,persistent",
+    [
+        (tile, 8, b_dtype, limit, False)
+        for tile in [(256, 256), (128, 512)]
+        for b_dtype, limit in [("fp8", 5.0), ("fp8", 0.0), ("fp4", None)]
+    ]
+    + [((128, 256), 4, "fp4", None, False)]
+    + [
+        ((256, 256), 8, "fp8", limit, repeats)
+        for repeats in (2, 4)
+        for limit in (0.0, 5.0)
+    ],
+)
 @pytest.mark.parametrize("ep", [False, True])
-@pytest.mark.parametrize("b_dtype,limit", [("fp8", 5.0), ("fp8", 0.0), ("fp4", None)])
-def test_dynamic_routes_graph_and_packed_k384(tile, ep, b_dtype, limit):
+def test_dynamic_routes_graph_and_packed_k384(
+    tile, waves, ep, b_dtype, limit, persistent
+):
     torch.manual_seed(813)
     tokens, hidden, inter, experts, topk = 257, 512, 384, 7, 3
     x = torch.randn(tokens, hidden, device="cuda", dtype=torch.bfloat16) * 0.1
@@ -100,16 +114,27 @@ def test_dynamic_routes_graph_and_packed_k384(tile, ep, b_dtype, limit):
     ids = torch.rand(tokens, experts, device="cuda").topk(topk, -1).indices.int()
     weights = torch.rand(tokens, topk, device="cuda").softmax(-1)
     meta = fm.MOEMetadata(
-        functools.partial(stage1, kernelName=kernel_name(1, *tile, b_dtype=b_dtype)),
         functools.partial(
-            stage2, kernelName=kernel_name(2, swizzle=3, b_dtype=b_dtype)
+            stage1, kernelName=kernel_name(1, *tile, b_dtype=b_dtype, waves=waves)
         ),
-        256,
+        functools.partial(
+            stage2,
+            kernelName=kernel_name(
+                2,
+                tile_m=128 if waves == 4 else 256,
+                swizzle=3,
+                b_dtype=b_dtype,
+                waves=waves,
+                persistent_tiles=persistent,
+            ),
+        ),
+        128 if waves == 4 else 256,
         0,
         prequant=False,
         fuse_quant="fp8",
         skip_inter_quant=True,
     )
+    assert fm.stage2_uses_route_reduce(meta.stage2)
 
     def forward():
         return fm._fused_moe_impl(
@@ -161,7 +186,13 @@ def test_dynamic_routes_graph_and_packed_k384(tile, ep, b_dtype, limit):
     assert torch.equal(forward(), captured)
 
 
-def test_tuned_config_preserves_other_moe_paths(monkeypatch, tmp_path):
+@pytest.mark.parametrize(
+    "b_dtype,waves,persistent",
+    [("fp8", 8, 0), ("fp4", 8, 0), ("fp4", 4, 0), ("fp8", 8, 2), ("fp8", 8, 4)],
+)
+def test_tuned_config_preserves_other_moe_paths(
+    monkeypatch, tmp_path, b_dtype, waves, persistent
+):
     import csv
     from types import SimpleNamespace
 
@@ -173,9 +204,13 @@ def test_tuned_config_preserves_other_moe_paths(monkeypatch, tmp_path):
         "topk": 5,
         "dtype": aiter.dtypes.bf16,
         "q_dtype_a": aiter.dtypes.fp8,
-        "q_dtype_w": aiter.dtypes.fp8,
+        "q_dtype_w": aiter.dtypes.fp4x2 if b_dtype == "fp4" else aiter.dtypes.fp8,
         "q_type": aiter.QuantType.per_1x32,
-        "activation": aiter.ActivationType.Swiglu,
+        "activation": (
+            aiter.ActivationType.Silu
+            if b_dtype == "fp4"
+            else aiter.ActivationType.Swiglu
+        ),
         "use_g1u1": True,
         "doweight_stage1": False,
         "hidden_pad": 0,
@@ -184,13 +219,20 @@ def test_tuned_config_preserves_other_moe_paths(monkeypatch, tmp_path):
     }
     row = {k: str(int(v) if isinstance(v, bool) else v) for k, v in kwargs.items()}
     row["act_type"] = row.pop("activation")
+    block_m = 128 if waves == 4 else 256
     row.update(
         gfx="gfx950",
         cu_num=256,
-        block_m=256,
+        block_m=block_m,
         ksplit=0,
-        kernelName1=kernel_name(1),
-        kernelName2=kernel_name(2),
+        kernelName1=kernel_name(1, tile_m=block_m, b_dtype=b_dtype, waves=waves),
+        kernelName2=kernel_name(
+            2,
+            tile_m=block_m,
+            b_dtype=b_dtype,
+            waves=waves,
+            persistent_tiles=persistent,
+        ),
     )
     csv_path = tmp_path / "tuned.csv"
     with csv_path.open("w") as f:
@@ -205,8 +247,16 @@ def test_tuned_config_preserves_other_moe_paths(monkeypatch, tmp_path):
     try:
         selected = fm.get_2stage_cfgs(**kwargs)
         assert selected.stage1.func is stage1 and selected.stage2.func is stage2
+        assert selected.block_m == block_m
+        assert fm.stage2_uses_route_reduce(selected.stage2)
         for override in (
-            {"activation": aiter.ActivationType.Silu},
+            {
+                "activation": (
+                    aiter.ActivationType.Swiglu
+                    if b_dtype == "fp4"
+                    else aiter.ActivationType.Silu
+                )
+            },
             {"gate_mode": "separated"},
             {"input_dtype": aiter.dtypes.fp8},
             {"has_stage1_bias": True},
@@ -228,3 +278,161 @@ def test_tuned_config_preserves_other_moe_paths(monkeypatch, tmp_path):
                 assert a.func is b.func and a.keywords == b.keywords
     finally:
         fm.get_2stage_cfgs.cache_clear()
+
+
+def test_four_wave_stage1_exact_padding_and_dirty_graph(monkeypatch):
+    from aiter.ops.flydsl import mxfp8_moe_8wave as adapter
+
+    torch.manual_seed(813)
+    tokens, hidden, inter, experts, topk = 129, 256, 384, 3, 2
+    x = torch.randn(tokens, hidden, device="cuda", dtype=torch.bfloat16) * 0.1
+    w1, s1, _ = quant_weight(
+        torch.randn(experts, 2 * inter, hidden, device="cuda") * 0.1, "fp4"
+    )
+    w1 = shuffle_weight_a16w4(w1, 16, True)
+    s1 = shuffle_scale_a16w4(s1, experts, True)
+    w2 = torch.empty(experts, hidden, inter // 2, device="cuda", dtype=torch.int8)
+    ids = torch.rand(tokens, experts, device="cuda").topk(topk, -1).indices.int()
+    weights = torch.rand(tokens, topk, device="cuda").softmax(-1)
+    records = {}
+    run = adapter._run
+
+    def record(kind, args, **kw):
+        if kind == "gemm" and kw.get("num_waves") == 4:
+            records.update(args=args, kwargs=kw)
+        return run(kind, args, **kw)
+
+    monkeypatch.setattr(adapter, "_run", record)
+    results = {}
+    for waves, block_m in [(8, 256), (4, 128)]:
+        sorted_ids, _, expert_ids, valid, _ = fm.moe_sorting(
+            ids,
+            weights,
+            experts,
+            hidden,
+            torch.bfloat16,
+            block_size=block_m,
+            accumulate=False,
+        )
+        q, s = stage1(
+            x,
+            w1,
+            w2,
+            sorted_ids,
+            expert_ids,
+            valid,
+            None,
+            topk,
+            block_m=block_m,
+            kernelName=kernel_name(1, tile_m=block_m, b_dtype="fp4", waves=waves),
+            w1_scale=s1,
+        )
+        count = int(valid[0].item())
+        rid = sorted_ids[:count].long()
+        active = (rid & 0xFFFFFF) < tokens
+        pos = torch.arange(count, device="cuda")[active]
+        routes = (rid[active] & 0xFFFFFF) * topk + (rid[active] >> 24)
+        results[waves] = q, s, pos, routes, torch.arange(count, device="cuda")[~active]
+    oldq, olds, oldpos, oldroutes, _ = results[8]
+    q, s, pos, routes, pad = results[4]
+    inverse = torch.empty(tokens * topk, device="cuda", dtype=torch.int64)
+    inverse[oldroutes] = oldpos
+    refpos = inverse[routes]
+    kg = torch.arange(q.shape[1] // 32, device="cuda")[None, :]
+
+    def scale_index(rows):
+        rows = rows[:, None]
+        return (
+            ((rows // 32 * 2 + kg // 8) * 64 + kg % 4 * 16 + rows % 16) * 4
+            + kg // 4 % 2 * 2
+            + rows // 16 % 2
+        )
+
+    def check():
+        assert torch.equal(q[pos], oldq[refpos])
+        assert torch.equal(
+            s.flatten()[scale_index(pos)], olds.flatten()[scale_index(refpos)]
+        )
+        assert torch.count_nonzero(q[pad]).item() == 0
+        assert torch.all(s.flatten()[scale_index(pad)] == 19).item()
+        assert (
+            torch.count_nonzero(q[: int(pos.numel() + pad.numel()), inter:]).item() == 0
+        )
+
+    def launch():
+        args = records["args"]
+        run("gemm", (*args[:-1], torch.cuda.current_stream()), **records["kwargs"])
+
+    for value in (37, 83):
+        records["args"][2].fill_(value)
+        launch()
+        check()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        launch()
+    for value in (19, 101):
+        records["args"][2].fill_(value)
+        graph.replay()
+        check()
+
+
+@pytest.mark.parametrize("stage", [1, 2])
+def test_four_wave_aot(stage):
+    from aiter.aot.flydsl.moe import compile_one_config
+    from aiter.ops.flydsl.moe_kernels import get_flydsl_kernel_params
+
+    name = kernel_name(stage, tile_m=128, b_dtype="fp4", waves=4)
+    params = get_flydsl_kernel_params(name)
+    assert params["sort_block_m"] == 128 and params["num_waves"] == 4
+    result = compile_one_config(
+        name,
+        model_dim=512,
+        inter_dim=384,
+        experts=7,
+        topk=3,
+        cu_num=256,
+        token_num=257,
+        **params,
+    )
+    assert result["compile_time"] is not None
+    # AOT must also suppress dispatch when this launcher was warmed by runtime.
+    torch.cuda.synchronize()
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "flydsl_moe1_mxfp8_4w_t128x256_xcd1",
+        "flydsl_moe2_a8w4_4w_t256x256_xcd1",
+        "flydsl_moe1_a8w4_8w_t128x256_xcd1",
+        "flydsl_moe1_mxfp8_8w_t256x256_persistent2_xcd3",
+        "flydsl_moe2_a8w4_8w_t256x256_persistent2_xcd3",
+    ],
+)
+def test_prefill_rejects_incompatible_geometry(name):
+    from aiter.ops.flydsl.mxfp8_moe_8wave import kernel_params
+
+    with pytest.raises(ValueError):
+        kernel_params(name)
+
+
+@pytest.mark.parametrize("repeats", [2, 4])
+def test_persistent_stage2_aot(repeats):
+    from aiter.aot.flydsl.moe import compile_one_config
+    from aiter.ops.flydsl.moe_kernels import get_flydsl_kernel_params
+
+    name = kernel_name(2, persistent_tiles=repeats, swizzle=3)
+    params = get_flydsl_kernel_params(name)
+    assert params["persistent_tiles"] == repeats and params["sort_block_m"] == 256
+    result = compile_one_config(
+        name,
+        model_dim=512,
+        inter_dim=384,
+        experts=7,
+        topk=3,
+        cu_num=256,
+        token_num=257,
+        **params,
+    )
+    assert result["compile_time"] is not None
+    torch.cuda.synchronize()

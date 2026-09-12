@@ -43,6 +43,7 @@ from aiter.ops.flydsl.mxfp4_kname import (
     parse_flydsl_v2_gemm2_kernel,
     parse_g2_kname_any,
 )
+from aiter.ops.flydsl.mxfp8_moe_8wave import is_kernel_name as _is_mxfp8_prefill_kname
 from aiter.ops.moe_mxfp4_aux import _mxfp4_moe_sort_internal_is_supported
 from aiter.ops.opus import moe_stage2_a8w4 as _opus_a8w4
 from aiter.ops.opus.moe_stage1_a8w4 import (
@@ -2570,11 +2571,7 @@ def get_2stage_cfgs(
             if column in df_fallback.columns:
                 activation_specific = df_fallback[column].map(_is_mxfp4_kname).astype(
                     bool
-                ) | (
-                    df_fallback[column]
-                    .fillna("")
-                    .str.contains("_mxfp8_8w_", regex=False)
-                )
+                ) | df_fallback[column].map(_is_mxfp8_prefill_kname).astype(bool)
                 df_fallback = df_fallback.loc[~activation_specific]
         if "act_type" in df_fallback.columns:
             df_fallback["act_type"] = _ACT_TYPE_DISABLED_KEY
@@ -2727,14 +2724,26 @@ def get_2stage_cfgs(
                 f"[fused_moe] discarding Opus tuned config for unsupported "
                 f"activation {activation}; using default heuristics"
             )
-        elif "_mxfp8_8w_" in kn1 or "_mxfp8_8w_" in kn2:
+        elif _is_mxfp8_prefill_kname(kn1) or _is_mxfp8_prefill_kname(kn2):
+            from aiter.ops.flydsl.mxfp8_moe_8wave import kernel_params
+
+            p1, p2 = kernel_params(kn1), kernel_params(kn2)
+            a8w4 = p1 is not None and p1["b_dtype"] == "fp4"
             if not (
-                gfx == "gfx950"
+                p1
+                and p2
+                and p1["stage"] == 1
+                and p2["stage"] == 2
+                and p1["b_dtype"] == p2["b_dtype"]
+                and p1["sort_block_m"] == p2["sort_block_m"] == cfg["block_m"]
+                and gfx == "gfx950"
                 and dtype == dtypes.bf16
                 and input_dtype in (None, dtypes.bf16)
-                and q_dtype_a == q_dtype_w == dtypes.fp8
+                and q_dtype_a == dtypes.fp8
+                and q_dtype_w == (dtypes.fp4x2 if a8w4 else dtypes.fp8)
                 and q_type == QuantType.per_1x32
-                and activation == ActivationType.Swiglu
+                and activation
+                == (ActivationType.Silu if a8w4 else ActivationType.Swiglu)
                 and use_g1u1
                 and gate_mode == GateMode.INTERLEAVE
                 and not doweight_stage1
@@ -2743,9 +2752,9 @@ def get_2stage_cfgs(
                 and model_dim % 256 == 0
                 and inter_dim >= 256
                 and inter_dim % 128 == 0
+                and (not p2["persistent_tiles"] or inter_dim == 384)
                 and not hidden_pad
                 and not intermediate_pad
-                and cfg["block_m"] == 256
             ):
                 cfg = None
         elif _disable_inline_sort and _is_inline_sort_cfg(kn1, kn2):
@@ -2908,16 +2917,23 @@ def get_2stage_cfgs(
         else:
             return 16 if token < 2048 else 32 if token < 16384 else 64
 
-    if "_mxfp8_8w_" in str(kernelName1) or "_mxfp8_8w_" in str(kernelName2):
+    if _is_mxfp8_prefill_kname(kernelName1) or _is_mxfp8_prefill_kname(kernelName2):
         from aiter.ops.flydsl.mxfp8_moe_8wave import kernel_params, stage1, stage2
 
         p1, p2 = kernel_params(kernelName1), kernel_params(kernelName2)
-        if not (p1 and p1["stage"] == 1 and p2 and p2["stage"] == 2):
-            raise ValueError("Invalid eight-wave MXFP8 MoE kernel pair")
+        if not (
+            p1
+            and p1["stage"] == 1
+            and p2
+            and p2["stage"] == 2
+            and p1["b_dtype"] == p2["b_dtype"]
+            and p1["sort_block_m"] == p2["sort_block_m"] == block_m
+        ):
+            raise ValueError("Invalid MXFP8/A8W4 prefill MoE kernel pair")
         return MOEMetadata(
             functools.partial(stage1, kernelName=kernelName1),
             functools.partial(stage2, kernelName=kernelName2),
-            256,
+            p1["sort_block_m"],
             0,
             prequant=False,
             fuse_quant="fp8",
