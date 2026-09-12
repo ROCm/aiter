@@ -1415,7 +1415,12 @@ def _build_down_fp8_preshuffled_native(
     kh_per_warp: int,
     dot2_acc: int,
 ):
-    """N-major kpack-native FP8 down: one wave computes 16 output rows."""
+    """N-major kpack-native FP8 down: one wave computes 16 output rows of one expert.
+
+    Grid is ``B * TOPK * (HIDDEN/16)`` so occupancy matches gate/up native and
+    k-contiguous H2 at decode B. Experts that share an output row atomic-add
+    FP32 partials into a caller-zeroed accumulator.
+    """
     if inter % 64 != 0 or hidden % 16 != 0:
         raise ValueError("preshuffled FP8 down needs INTER % 64 and HIDDEN % 16")
     per_token_scale = const_expr(w_scale_mode == "pertoken")
@@ -1448,7 +1453,9 @@ def _build_down_fp8_preshuffled_native(
         klane = lane // fx.Int32(16)
 
         n0 = bid % (hidden // 16)
-        token_b = bid // (hidden // 16)
+        d = bid // (hidden // 16)
+        expert_k = d % top_k
+        token_b = d // top_k
         out_j = n0 * fx.Int32(16) + nlane
 
         inter_rsrc = _ptr_rsrc(inter_ptr)
@@ -1456,48 +1463,45 @@ def _build_down_fp8_preshuffled_native(
         rid_t = _i32_view(rid_ptr)
         rwt_t = _f32_view(rwt_ptr)
         one_f32 = fx.Float32(1.0).ir_value()
+
+        ridx = token_b * top_k + expert_k
+        e = fx.Int32(_i32_load(rid_t, ridx))
+        rw = fx.Float32(_f32_load(rwt_t, ridx))
+        w_row = e * hidden + out_j
+        wd_b = _preshuffled_expert_b_i32_tensor(wd_ptr, e, hidden, inter, 1)
+        inter_row = token_b * top_k + expert_k
+
         acc_l = fx.Float32(0.0)
+        for k0 in range_constexpr(num_kpack):
+            k_base = k0 * 64 + klane * fx.Int32(16)
+            a_word0 = (inter_row * inter + k_base) // 2
+            aw = load_i32_words(inter_rsrc, a_word0, 8)
+            dw = _native_kpack_words(wd_b, n0, k0, klane, nlane)
+            pairs = []
+            for ipair in range_constexpr(8):
+                w_word = ipair // 2
+                w_hi = (ipair % 2) == 1
+                d_i32 = bf16x2_to_i32(fp8x2_to_bf16x2(dw[w_word], one_f32, hi=w_hi))
+                pairs.append((aw[ipair], d_i32))
+            dot = fx.Float32(
+                drain_or_chain(pairs, dot2_acc=dot2_acc, serialize=serialize_dot2)
+            )
+            if const_expr(block2d):
+                row_blk = w_row // scale_bn
+                col_blk = k_base // scale_bk
+                ds = fx.Float32(_f32_load(wds_t, row_blk * scale_cols + col_blk))
+                acc_l = acc_l + dot * (rw * ds)
+            else:
+                acc_l = acc_l + dot
 
-        for k in range_constexpr(top_k):
-            ridx = token_b * top_k + k
-            e = fx.Int32(_i32_load(rid_t, ridx))
-            rw = fx.Float32(_f32_load(rwt_t, ridx))
-            w_row = e * hidden + out_j
-            wd_b = _preshuffled_expert_b_i32_tensor(wd_ptr, e, hidden, inter, 1)
-
-            expert_l = fx.Float32(0.0)
-            for k0 in range_constexpr(num_kpack):
-                k_base = k0 * 64 + klane * fx.Int32(16)
-                inter_row = token_b * top_k + k
-                a_word0 = (inter_row * inter + k_base) // 2
-                aw = load_i32_words(inter_rsrc, a_word0, 8)
-                dw = _native_kpack_words(wd_b, n0, k0, klane, nlane)
-                pairs = []
-                for ipair in range_constexpr(8):
-                    w_word = ipair // 2
-                    w_hi = (ipair % 2) == 1
-                    d_i32 = bf16x2_to_i32(fp8x2_to_bf16x2(dw[w_word], one_f32, hi=w_hi))
-                    pairs.append((aw[ipair], d_i32))
-                dot = fx.Float32(
-                    drain_or_chain(pairs, dot2_acc=dot2_acc, serialize=serialize_dot2)
-                )
-                if const_expr(block2d):
-                    row_blk = w_row // scale_bn
-                    col_blk = k_base // scale_bk
-                    ds = fx.Float32(_f32_load(wds_t, row_blk * scale_cols + col_blk))
-                    acc_l = acc_l + dot * (rw * ds)
-                else:
-                    expert_l = expert_l + dot
-
-            if const_expr(not block2d):
-                scale_off = _scale_elem_off(w_row, per_token_scale)
-                ds = fx.Float32(_f32_load(wds_t, scale_off))
-                acc_l = acc_l + expert_l * (rw * ds)
+        if const_expr(not block2d):
+            scale_off = _scale_elem_off(w_row, per_token_scale)
+            ds = fx.Float32(_f32_load(wds_t, scale_off))
+            acc_l = acc_l * (rw * ds)
 
         y_sum = _reduce_klane4_f32(acc_l.ir_value())
         if klane == 0:
-            y_t = _bf16_out_view(y_ptr)
-            y_t[token_b * hidden + out_j] = BFloat16(y_sum)
+            atomic_add_f32(y_ptr, token_b * hidden + out_j, y_sum)
 
     @flyc.jit
     def _launch(
@@ -1512,7 +1516,7 @@ def _build_down_fp8_preshuffled_native(
     ):
         _kernel(inter_ptr, wd_ptr, wds_ptr, rid_ptr, rwt_ptr, y_ptr).launch(
             grid=(
-                grid_x * fx.Int32(kh_per_warp) // fx.Int32(16),
+                grid_x * fx.Int32(kh_per_warp) // fx.Int32(16) * fx.Int32(top_k),
                 1,
                 1,
             ),

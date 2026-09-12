@@ -26,19 +26,18 @@ Track here as work lands (leave unchecked until that item is done). Per-subtask
 gates: op_test with `FLYDSL_RUNTIME_ENABLE_CACHE=0` on GPU 1; plus a G9/667
 spot-check when the hot loop or wait/reduce path changed.
 
-- [ ] 1. FP8 native down, `k_batch=1`, 16-row waves — PoC is correct but a
-      performance no-go; do not land as-is
+- [ ] 1. FP8 native down, `k_batch=1`, 16-row waves — serial-TOPK PoC was a
+      no-go; TOPK-parallel 16×4 is the current candidate (see subtask 1)
 - [ ] 2. FP4 native down
 - [ ] 3. BF16 native down
 - [ ] 4. Optional second N tile (32 rows) if 16 N is occupancy-bound
 - [ ] 5. Split-K last, only if extra waves over `k0` help
 
-**PoC stop:** subtasks 2–5 are paused. The first implementation reduced the
-grid by 8× versus k-contiguous H2 and serialized all TOPK experts in each wave.
-At B=1,2 that lost the parallelism needed to hide the long weight stream:
-geomean latency was 2.56× the existing gather path. Before porting FP4/BF16,
-revise the map to expose more waves (the leading candidate is splitting TOPK
-across waves with an accumulation epilogue), then repeat subtask 1.
+**Map revision:** serial-TOPK 16×4 (`grid = B*(HIDDEN/16)`, experts inside the
+wave) was 2.56× slower than gather at B=1,2. TOPK-parallel 16×4
+(`grid = B*TOPK*(HIDDEN/16)`, one expert per wave, `atomic_add_f32` into a
+zeroed FP32 `y`) recovers occupancy. Do not port FP4/BF16 until a land/no-land
+call on this FP8 form (Qwen B=1 is still slower than gather).
 
 ## Locked decisions
 
@@ -79,10 +78,11 @@ These locks apply to **this track** (subtasks 1–5).
 The G9 hole: preshuffled down FP8 is ~2× CK at B=1,2 because it still gathers.
 Mirror `_build_gate_up_fp8_preshuffled_native` onto down:
 
-- Grid `B * (HIDDEN/16)` waves of 64. `nlane = lane % 16`, `klane = lane // 16`.
-- Per expert in TOPK: load this klane’s INTER slice of `inter` (k-contiguous),
-  `_native_kpack_words` on `w_down`, `v_dot2`, fold `router_wt * ds` into the
-  per-lane partial, `_reduce_klane4_f32`, `klane==0` writes `y[b, n0*16+nlane]`.
+- Grid `B * TOPK * (HIDDEN/16)` waves of 64 (TOPK in the grid, like gate/up).
+  `nlane = lane % 16`, `klane = lane // 16`. One expert per wave.
+- Load this klane’s INTER slice of `inter` (k-contiguous), `_native_kpack_words`
+  on `w_down`, `v_dot2`, fold `router_wt * ds`, `_reduce_klane4_f32`,
+  `klane==0` `atomic_add_f32` into a caller-zeroed FP32 `y` (host finalizes bf16).
 - No `kh_per_warp` (16 N already shares one INTER chunk). No `k_batch`.
 - Scales: pertensor/pertoken first; add block2d if G9 FP8 down needs
   `block2d(128,128)` to pair CK.
@@ -98,22 +98,30 @@ Mirror `_build_gate_up_fp8_preshuffled_native` onto down:
       `_kpack_load_i32_words` gather; op_test + G9 B=1,2 down fp8 spot-check
       done, and the PoC is fast enough to justify landing.
 
-**PoC result (GPU 1, 100 iterations, 3 repeats, B=1,2):**
+**Serial-TOPK PoC (superseded):** `grid = B*(HIDDEN/16)` was correct (cos 1.0)
+but geomean **2.56× slower** than gather at B=1,2 (3–19% peak). Occupancy, not
+the 16×4 pack load, was the failure.
 
-| Shape | B | gather µs | native µs | native/gather | native/CK |
-|---|---:|---:|---:|---:|---:|
-| DeepSeek-V3 | 1 | 65.19 | 137.37 | 2.11 | 3.26 |
-| DeepSeek-V3 | 2 | 127.57 | 154.67 | 1.21 | 2.48 |
-| MiniMax | 1 | 23.57 | 96.90 | 4.11 | 4.00 |
-| MiniMax | 2 | 44.15 | 104.50 | 2.37 | 3.35 |
-| Qwen3-Next | 1 | 10.47 | 41.66 | 3.98 | 3.78 |
-| Qwen3-Next | 2 | 14.78 | 41.69 | 2.82 | 2.80 |
+**TOPK-parallel experiment (GPU 1, 100 iterations, 3 repeats, B=1,2):**
+`grid = B*TOPK*(HIDDEN/16)`, atomic FP32 epilogue. Artifact
+`/tmp/g9_native_down_topk_ck.{md,csv}` (did not overwrite of-record G9).
+Clocks mostly ~94 MHz (unlocked). Cosine 1.0. Some cells noisy (spread >5%).
 
-All six cells had cosine 1.0 and low FlyDSL spread (≤0.6%), so this is not
-measurement noise. Native reached only 3–19% of peak. The 16-row wave performs
-the right coalesced kpack loads, but there are only `B*HIDDEN/16` waves and each
-loops over all TOPK experts. This validates the map's numerics, not its
-performance. Do not port this form to FP4/BF16.
+| Shape | B | gather µs | serial µs | TOPK-par µs | par/gather | par/CK | %peak |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| DeepSeek-V3 | 1 | 65.19 | 137.37 | 36.85 | 0.57 | 0.87 | 39.8 |
+| DeepSeek-V3 | 2 | 127.57 | 154.67 | 58.73 | 0.46 | 0.94 | 50.0 |
+| MiniMax | 1 | 23.57 | 96.90 | 23.56 | 1.00 | 0.97 | 20.0 |
+| MiniMax | 2 | 44.15 | 104.50 | 27.08 | 0.61 | 0.87 | 34.9 |
+| Qwen3-Next | 1 | 10.47 | 41.66 | 15.35 | 1.47 | 1.39 | 8.5 |
+| Qwen3-Next | 2 | 14.78 | 41.69 | 15.87 | 1.07 | 1.06 | 16.5 |
+
+Geomean vs gather **0.79** (win); vs serial native **0.31**; vs CK **~1.00**.
+DeepSeek B=1,2 now **beats CK** (~0.87–0.94). Qwen B=1 is still slower than
+gather (short INTER=512; atomic + zeros/copy on a ~10 µs kernel). Land/no-land
+is not automatic: either ship TOPK-parallel native as the FP8 default and eat
+Qwen B=1, or keep gather below some INTER/grid cutoff. Do not port FP4/BF16
+until that call.
 
 ### 2. FP4 native down
 

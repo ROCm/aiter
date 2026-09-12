@@ -756,6 +756,13 @@ def flydsl_warp_decode_down_reduce(
     if out is None:
         out = torch.empty((B, HIDDEN), dtype=torch.bfloat16, device=intermediate.device)
 
+    native_fp8_down = (
+        _preshuffled_flag(weight_layout)
+        and split_k == 1
+        and INTER % 64 == 0
+        and HIDDEN % 16 == 0
+    )
+
     launcher = _get_down_reduce(
         INTER,
         HIDDEN,
@@ -771,11 +778,11 @@ def flydsl_warp_decode_down_reduce(
         dot2_acc,
         _preshuffled_flag(weight_layout),
     )
-    # Split-K writes FP32 partials via atomic-add into a caller-zeroed accumulator;
-    # the plain path stores bf16 directly to `out` (Locked decision, main plan ?1.2).
+    # Split-K and TOPK-parallel native down write FP32 partials via atomic-add
+    # into a caller-zeroed accumulator; the gather path stores bf16 to `out`.
     y_target = (
         torch.zeros((B, HIDDEN), dtype=torch.float32, device=intermediate.device)
-        if split_k > 1
+        if split_k > 1 or native_fp8_down
         else out
     )
     grid_x = B * (HIDDEN // kh_per_warp) * split_k
@@ -790,7 +797,7 @@ def flydsl_warp_decode_down_reduce(
         grid_x,
         torch.cuda.current_stream(),
     )
-    if split_k > 1:
+    if split_k > 1 or native_fp8_down:
         out.copy_(y_target)  # FP32 accumulator -> bf16 finalize (v1; fold later)
     return out
 
