@@ -269,6 +269,7 @@ def _should_use_vmm(is_gfx1250: bool) -> bool:
 
 _is_gfx1250 = _detect_gfx1250()
 _use_vmm = _should_use_vmm(_is_gfx1250)
+_use_symm_mem = env_flag("AITER_CUSTOM_AR_USE_SYMM_MEM")
 
 try:
     if _is_gfx1250:
@@ -709,6 +710,58 @@ class _GFX1250BufferProxy:
         return ptrs
 
 
+class _SymmMemBufferProxy:
+    """Proxy that exposes pool-like access for torch.symm_mem-backed buffers
+    so the rest of CustomAllreduce can use self._pool["meta"] etc."""
+
+    class _Entry:
+        def __init__(self, tensor):
+            self._tensor = tensor
+
+        @property
+        def data_ptr(self):
+            return self._tensor.data_ptr()
+
+        @property
+        def max_size(self):
+            return self._tensor.numel() * self._tensor.element_size()
+
+    def __init__(self, meta_tensor, input_tensor, ca):
+        self._meta = meta_tensor
+        self._input = input_tensor
+        self._ca = ca
+
+    def __getitem__(self, key):
+        if key == "meta":
+            return self._Entry(self._meta)
+        elif key == "input":
+            return self._Entry(self._input)
+        raise KeyError(key)
+
+    def flush_graph_buffers(self, ar_ptr):
+        count = self._ca._ops_get_graph_buffer_count(ar_ptr)
+        if count > 0:
+            logger.warning(
+                "symm_mem: CUDA graph buffer registration not yet "
+                "supported (%d buffers skipped)",
+                count,
+            )
+
+    def get_external_ipc_meta(self, tensor):
+        """Exchange a tensor's pointer across ranks using torch.symm_mem."""
+        import torch.distributed._symmetric_memory as symm_mem
+
+        ca = self._ca
+        size = tensor.numel() * tensor.element_size()
+        buf = symm_mem.empty(size, dtype=torch.uint8, device=ca.device)
+        buf.copy_(tensor.reshape(-1).view(torch.uint8)[:size])
+        hdl = symm_mem.rendezvous(buf, ca.group)
+        if not hasattr(ca, "_symm_ext_hdls"):
+            ca._symm_ext_hdls = []
+        ca._symm_ext_hdls.append((buf, hdl))
+        return list(hdl.buffer_ptrs)
+
+
 class CustomAllreduce:
     _SUPPORTED_WORLD_SIZES: ClassVar[list[Any]] = [2, 4, 6, 8]
 
@@ -738,7 +791,8 @@ class CustomAllreduce:
             self._ops_get_graph_buffer_ptrs = ops.get_graph_buffer_ptrs_gfx1250
             self._ops_register_graph_buffers = ops.register_graph_buffers_gfx1250
             # transport-coupled ops (init / register)
-            if self._use_vmm:
+            # symm_mem provides raw VA pointers (same as VMM), so use ptr-list ops.
+            if self._use_symm_mem or self._use_vmm:
                 self._ops_init_custom_ar = ops.init_custom_ar_gfx1250
                 self._ops_register_input_buffer = ops.register_input_buffer_gfx1250
                 self._ops_register_output_buffer = ops.register_output_buffer_gfx1250
@@ -783,6 +837,7 @@ class CustomAllreduce:
         self.disabled = True
         self._is_gfx1250 = _is_gfx1250  # kernel dimension (arch)
         self._use_vmm = _use_vmm  # transport dimension (arch + ROCm version)
+        self._use_symm_mem = _use_symm_mem  # torch.symm_mem transport (mori backend)
         self._select_ops()
 
         if not custom_ar:
@@ -796,13 +851,18 @@ class CustomAllreduce:
             dist.get_backend(group) != dist.Backend.NCCL
         ), "CustomAllreduce should be attached to a non-NCCL group."
 
-        if not all(in_the_same_node_as(group, source_rank=0)):
-            # No need to initialize custom allreduce for multi-node case.
+        self._same_node = all(in_the_same_node_as(group, source_rank=0))
+        if not self._same_node and not self._use_symm_mem:
             logger.warning(
                 "Custom allreduce is disabled because this process group"
                 " spans across nodes."
             )
             return
+        if not self._same_node and self._use_symm_mem:
+            logger.info(
+                "Custom allreduce: multi-node detected, relying on "
+                "symm_mem probe to verify cross-node P2P accessibility."
+            )
 
         rank = dist.get_rank(group=self.group)
         world_size = dist.get_world_size(group=self.group)
@@ -822,10 +882,10 @@ class CustomAllreduce:
 
         props = torch.cuda.get_device_properties(device)
         gcn_arch = getattr(props, "gcnArchName", "")
-        if "gfx1250" in gcn_arch and world_size > 4:
+        if "gfx1250" in gcn_arch and world_size > 8:
             raise RuntimeError(
                 f"gfx1250 (MI450) custom allreduce only supports "
-                f"world_size <= 4, got world_size={world_size}. "
+                f"world_size <= 8, got world_size={world_size}. "
                 f"RCCL fallback is also not available on this platform."
             )
 
@@ -889,7 +949,11 @@ class CustomAllreduce:
         # it would fail. Force the copy-in path, which stages into the plain
         # hipMalloc input pool (IPC-exportable). The VMM transport does its own
         # pointer exchange and is unaffected, so only guard the IPC path.
-        if not self._use_vmm and _expandable_segments_enabled():
+        if (
+            not self._use_vmm
+            and not self._use_symm_mem
+            and _expandable_segments_enabled()
+        ):
             if enable_register_for_capturing:
                 logger.warning(
                     "PyTorch expandable_segments is enabled; forcing custom "
@@ -921,10 +985,87 @@ class CustomAllreduce:
 
         self.fully_connected = fully_connected
 
-        if self._use_vmm:
+        if self._use_symm_mem:
+            if self._probe_symm_mem(rank, world_size):
+                self._init_symm_mem(rank, world_size, max_size)
+            else:
+                logger.warning(
+                    "symm_mem probe failed, falling back to %s transport",
+                    "VMM" if self._use_vmm else "IPC",
+                )
+                self._use_symm_mem = False
+                self._select_ops()
+                if self._use_vmm:
+                    self._init_gfx1250(rank, world_size, max_size)
+                else:
+                    self._init_ipc(rank, world_size, max_size)
+                return
+        elif self._use_vmm:
             self._init_gfx1250(rank, world_size, max_size)
         else:
             self._init_ipc(rank, world_size, max_size)
+
+    def _probe_symm_mem(self, rank: int, world_size: int) -> bool:
+        """Collective probe: verify that torch.symm_mem can allocate, exchange
+        handles, and map P2P buffers across all peers.  The mori backend's
+        rendezvous validates P2P internally (hipMemSetAccess with RW flags
+        throws if P2P is not possible).  Returns True/False consistently
+        across all ranks — every step is collective, so no rank hangs."""
+        if not self._is_gfx1250:
+            return False
+        try:
+            import mori.allocator  # noqa: F401
+            import torch.distributed._symmetric_memory as symm_mem
+
+            symm_mem.set_backend("MORI")
+
+            buf = symm_mem.empty(64, dtype=torch.uint8, device=self.device)
+            ptrs = symm_mem.rendezvous(buf, self.group).buffer_ptrs
+            all_peers_mapped = len(ptrs) == world_size and all(p != 0 for p in ptrs)
+            return all_peers_mapped
+        except Exception as e:  # noqa: BLE001
+            logger.debug("symm_mem probe failed: %s", e)
+            return False
+
+    def _init_symm_mem(self, rank: int, world_size: int, max_size: int):
+        """Init using torch.symm_mem (mori allocator backend).
+
+        Called only after _probe_symm_mem() succeeds, so imports and
+        backend availability are already verified.
+        """
+        import mori.allocator  # noqa: F401
+        import torch.distributed._symmetric_memory as symm_mem
+
+        symm_mem.set_backend("MORI")
+        logger.info("Custom allreduce: using torch.symm_mem transport (mori backend)")
+
+        self._symm_meta_tensor = symm_mem.empty(
+            self._ops_meta_size(), dtype=torch.uint8, device=self.device
+        )
+        self._symm_meta_tensor.zero_()
+        self._symm_meta_hdl = symm_mem.rendezvous(self._symm_meta_tensor, self.group)
+
+        self._symm_input_tensor = symm_mem.empty(
+            max_size, dtype=torch.uint8, device=self.device
+        )
+        self._symm_input_hdl = symm_mem.rendezvous(self._symm_input_tensor, self.group)
+
+        self._ptr = self._ops_init_custom_ar(
+            self._symm_meta_tensor.data_ptr(),
+            self.rank_data.data_ptr(),
+            self.rank_data.numel(),
+            list(self._symm_meta_hdl.buffer_ptrs),
+            rank,
+            self.fully_connected,
+        )
+        self._ops_register_input_buffer(
+            self._ptr,
+            self._symm_input_tensor.data_ptr(),
+            list(self._symm_input_hdl.buffer_ptrs),
+        )
+        self._pool = _SymmMemBufferProxy(
+            self._symm_meta_tensor, self._symm_input_tensor, self
+        )
 
     def _init_gfx1250(self, rank: int, world_size: int, max_size: int):
         """gfx1250 VMM init: used when hipIpc is unusable (ROCm < 7.15). Shares
@@ -1114,9 +1255,9 @@ class CustomAllreduce:
 
     def register_input_buffer(self, inp: torch.Tensor):
         """Register an external tensor as an IPC input buffer."""
-        # Branch on transport: VMM returns a raw peer-ptr list; IPC (both
-        # old-arch and gfx1250 kernels) returns handles + offsets.
-        if self._use_vmm:
+        # Branch on transport: VMM/symm_mem returns a raw peer-ptr list;
+        # IPC (old-arch and gfx1250 kernels) returns handles + offsets.
+        if self._use_symm_mem or self._use_vmm:
             all_ptrs = self._pool.get_external_ipc_meta(inp)
             self._ops_register_input_buffer(self._ptr, inp.data_ptr(), all_ptrs)
         else:
@@ -1127,7 +1268,7 @@ class CustomAllreduce:
 
     def register_output_buffer(self, out: torch.Tensor):
         """Register an external tensor as an IPC output buffer."""
-        if self._use_vmm:
+        if self._use_symm_mem or self._use_vmm:
             all_ptrs = self._pool.get_external_ipc_meta(out)
             self._ops_register_output_buffer(self._ptr, out.data_ptr(), all_ptrs)
         else:
