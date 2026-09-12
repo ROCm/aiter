@@ -43,6 +43,7 @@ from aiter.ops.flydsl.mxfp4_kname import (
     parse_flydsl_v2_gemm2_kernel,
     parse_g2_kname_any,
 )
+from aiter.ops.flydsl.mxfp8_moe_8wave import is_kernel_name as _is_mxfp8_prefill_kname
 from aiter.ops.moe_mxfp4_aux import _mxfp4_moe_sort_internal_is_supported
 from aiter.ops.opus import moe_stage2_a8w4 as _opus_a8w4
 from aiter.ops.opus.moe_stage1_a8w4 import (
@@ -1152,6 +1153,8 @@ def _fused_moe_impl(
             and getattr(w2, "is_shuffled", False),
             config_file=_metadata_config_file,
             _disable_inline_sort=disable_inline_sort,
+            input_dtype=hidden_states.dtype,
+            has_stage1_bias=bias1 is not None,
         )
         return (
             metadata if _metadata_transform is None else _metadata_transform(metadata)
@@ -2496,6 +2499,8 @@ def get_2stage_cfgs(
     opus_weights_shuffled=None,
     config_file=None,
     _disable_inline_sort=False,
+    input_dtype=None,
+    has_stage1_bias=False,
 ):
     gate_mode = GateMode(gate_mode)
     # Configs are keyed on (gfx, cu_num, ...) so archs that share a cu_num
@@ -2573,8 +2578,10 @@ def get_2stage_cfgs(
             df_fallback = df_fallback.loc[~is_ck2stages]
         for column in ("kernelName1", "kernelName2"):
             if column in df_fallback.columns:
-                is_mxfp4 = df_fallback[column].map(_is_mxfp4_kname)
-                df_fallback = df_fallback.loc[~is_mxfp4]
+                activation_specific = df_fallback[column].map(_is_mxfp4_kname).astype(
+                    bool
+                ) | df_fallback[column].map(_is_mxfp8_prefill_kname).astype(bool)
+                df_fallback = df_fallback.loc[~activation_specific]
         if "act_type" in df_fallback.columns:
             df_fallback["act_type"] = _ACT_TYPE_DISABLED_KEY
         dup_mask = df_fallback.duplicated(subset=_INDEX_COLS, keep="first")
@@ -2726,6 +2733,39 @@ def get_2stage_cfgs(
                 f"[fused_moe] discarding Opus tuned config for unsupported "
                 f"activation {activation}; using default heuristics"
             )
+        elif _is_mxfp8_prefill_kname(kn1) or _is_mxfp8_prefill_kname(kn2):
+            from aiter.ops.flydsl.mxfp8_moe_8wave import kernel_params
+
+            p1, p2 = kernel_params(kn1), kernel_params(kn2)
+            a8w4 = p1 is not None and p1["b_dtype"] == "fp4"
+            if not (
+                p1
+                and p2
+                and p1["stage"] == 1
+                and p2["stage"] == 2
+                and p1["b_dtype"] == p2["b_dtype"]
+                and p1["sort_block_m"] == p2["sort_block_m"] == cfg["block_m"]
+                and gfx == "gfx950"
+                and dtype == dtypes.bf16
+                and input_dtype in (None, dtypes.bf16)
+                and q_dtype_a == dtypes.fp8
+                and q_dtype_w == (dtypes.fp4x2 if a8w4 else dtypes.fp8)
+                and q_type == QuantType.per_1x32
+                and activation
+                == (ActivationType.Silu if a8w4 else ActivationType.Swiglu)
+                and use_g1u1
+                and gate_mode == GateMode.INTERLEAVE
+                and not doweight_stage1
+                and not has_stage1_bias
+                and not has_stage2_bias
+                and model_dim % 256 == 0
+                and inter_dim >= 256
+                and inter_dim % 128 == 0
+                and (not p2["persistent_tiles"] or inter_dim == 384)
+                and not hidden_pad
+                and not intermediate_pad
+            ):
+                cfg = None
         elif _disable_inline_sort and _is_inline_sort_cfg(kn1, kn2):
             cfg = None
             logger.warning("[fused_moe] discarding tuned inline-sort config")
@@ -2885,6 +2925,30 @@ def get_2stage_cfgs(
             return 32
         else:
             return 16 if token < 2048 else 32 if token < 16384 else 64
+
+    if _is_mxfp8_prefill_kname(kernelName1) or _is_mxfp8_prefill_kname(kernelName2):
+        from aiter.ops.flydsl.mxfp8_moe_8wave import kernel_params, stage1, stage2
+
+        p1, p2 = kernel_params(kernelName1), kernel_params(kernelName2)
+        if not (
+            p1
+            and p1["stage"] == 1
+            and p2
+            and p2["stage"] == 2
+            and p1["b_dtype"] == p2["b_dtype"]
+            and p1["sort_block_m"] == p2["sort_block_m"] == block_m
+        ):
+            raise ValueError("Invalid MXFP8/A8W4 prefill MoE kernel pair")
+        return MOEMetadata(
+            functools.partial(stage1, kernelName=kernelName1),
+            functools.partial(stage2, kernelName=kernelName2),
+            p1["sort_block_m"],
+            0,
+            prequant=False,
+            fuse_quant="fp8",
+            skip_inter_quant=True,
+            **route_bucket_metadata,
+        )
 
     if _is_mxfp4_kname(kernelName1) or _is_mxfp4_kname(kernelName2):
         # gate_mode is a runtime weight-layout property, not a tuning key: route
@@ -3457,6 +3521,8 @@ def fused_moe_2stages(
         opus_weights_shuffled=getattr(w1, "is_shuffled", False)
         and getattr(w2, "is_shuffled", False),
         config_file=_metadata_config_file,
+        input_dtype=hidden_states.dtype,
+        has_stage1_bias=bias1 is not None,
     )
     if _metadata_transform is not None:
         metadata = _metadata_transform(metadata)
@@ -3571,7 +3637,11 @@ def fused_moe_2stages(
         and q_dtype_a == dtypes.bf16
         and getattr(metadata.stage1, "func", metadata.stage1) is _flydsl_stage1_wrapper
     )
-    if _is_a16w4_port:
+    if _is_a16w4_port or getattr(
+        getattr(metadata.stage1, "func", metadata.stage1),
+        "_is_mxfp8_8wave_stage1",
+        False,
+    ):
         a2 = None
     elif quant_type == QuantType.per_1x128 and metadata.stage1.func is asm_stage1:
         ratio = a1_scale.element_size() // a1.element_size()
@@ -3599,6 +3669,10 @@ def fused_moe_2stages(
                 extra_stage1_args["topk_ids"] = topk_ids
         if metadata.stage2_has_bias:
             extra_stage2_args["bias2"] = _normalize_bias_for_kernel(bias2)
+    if getattr(stage1_func, "_is_mxfp8_8wave_stage1", False):
+        if bias1 is not None:
+            raise ValueError("Eight-wave MXFP8 stage 1 does not support expert bias")
+        extra_stage1_args["swiglu_limit"] = swiglu_limit
     if stage1_func in (_flydsl_stage1_wrapper, _opus_a8w4_stage1_wrapper):
         extra_stage1_args["swiglu_limit"] = swiglu_limit
     if stage1_func is _flydsl_stage1_wrapper:
