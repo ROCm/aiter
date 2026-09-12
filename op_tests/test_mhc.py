@@ -8,14 +8,12 @@ import torch
 
 import aiter
 from aiter import dtypes
+from aiter.benchmark_data_init import add_data_init_args, fill, make_generator
+from aiter.benchmark_reporting import print_json_table
 from aiter.jit.utils.chip_info import get_gfx_runtime
 from aiter.test_common import (
-    add_data_init_args,
     benchmark,
     checkAllclose,
-    fill,
-    make_generator,
-    print_json_table,
     run_perftest,
 )
 

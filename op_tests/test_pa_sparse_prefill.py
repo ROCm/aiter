@@ -39,19 +39,17 @@ import pytest
 import torch
 
 import aiter  # noqa: F401  (registers the top-level export)
+from aiter.benchmark_data_init import DATA_DISTS, fill, make_generator
+from aiter.benchmark_reporting import print_json_table
 from aiter.ops.mla_sparse_prefill import mla_sparse_prefill_fp8_asm
 from aiter.ops.pa_sparse_prefill_opus import (
     pa_sparse_prefill_fp8_opus,
     pa_sparse_prefill_opus,
 )
 from aiter.test_common import (
-    DATA_DISTS,
     benchmark,
     checkAllclose,
-    fill,
-    make_generator,
     perftest,
-    print_json_table,
 )
 
 try:

@@ -34,7 +34,8 @@ Env / CLI: --layers --logits_tol --acc_verify --dispatch_wire --combine
            --data-init --seed --warmup --iters --prof_replays
 
 ``--data-init`` / ``--scale-init`` / ``--seed`` are the shared ubench knobs from
-``aiter.test_common.add_data_init_args``. ``--scale-init`` is accepted for CLI
+``aiter.benchmark_data_init.add_data_init_args``. ``--scale-init`` is accepted
+for CLI
 compatibility but unused here: every scale is derived by quantizing the
 generated weights, never drawn independently.
 """
@@ -60,10 +61,11 @@ from aiter import (
     get_torch_quant,
     pertoken_quant,
 )
+from aiter.benchmark_data_init import add_data_init_args, fill, make_generator
+from aiter.benchmark_reporting import print_json_table
 from aiter.fused_moe import fused_moe
 from aiter.ops.flydsl.moe_common import GateMode
 from aiter.ops.shuffle import moe_shuffle_scale, shuffle_weight
-from aiter.test_common import add_data_init_args, fill, make_generator, print_json_table
 from aiter.utility import fp4_utils
 
 try:

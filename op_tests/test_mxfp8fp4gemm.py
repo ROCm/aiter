@@ -28,6 +28,12 @@ import torch
 
 import aiter
 from aiter import dtypes
+from aiter.benchmark_data_init import (
+    fill_fp4,
+    fill_fp8,
+    fill_scale_e8m0,
+    make_generator,
+)
 from aiter.jit.utils.chip_info import get_gfx_runtime as get_gfx
 from aiter.ops.shuffle import (
     shuffle_mxfp8fp4_a,
@@ -37,10 +43,6 @@ from aiter.ops.shuffle import (
 from aiter.test_common import (
     benchmark,
     checkAllclose,
-    fill_fp4,
-    fill_fp8,
-    fill_scale_e8m0,
-    make_generator,
     run_perftest,
 )
 from aiter.utility import fp4_utils

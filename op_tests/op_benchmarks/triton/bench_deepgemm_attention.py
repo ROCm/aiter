@@ -8,6 +8,8 @@ import random
 import torch
 import triton
 
+from aiter.benchmark_data_init import DATA_DISTS, fill, make_generator
+from aiter.benchmark_reporting import print_json_table
 from aiter.ops.shuffle import shuffle_weight
 from aiter.ops.triton.attention.pa_mqa_logits import (
     deepgemm_fp8_paged_mqa_logits,
@@ -15,13 +17,7 @@ from aiter.ops.triton.attention.pa_mqa_logits import (
 )
 from aiter.ops.triton.utils._triton import arch_info
 from aiter.ops.triton.utils.types import get_fp8_e4m3_dtype
-from aiter.test_common import (
-    DATA_DISTS,
-    fill,
-    make_generator,
-    print_json_table,
-    run_perftest,
-)
+from aiter.test_common import run_perftest
 
 
 def cdiv(x: int, y: int) -> int:

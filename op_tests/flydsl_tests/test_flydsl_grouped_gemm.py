@@ -34,7 +34,7 @@ import pytest
 import torch
 
 from aiter import ActivationType, QuantType, logger
-from aiter import test_common as bench_init
+from aiter import benchmark_data_init as bench_init
 from aiter.aot.flydsl.common import run_only_env
 from aiter.fused_moe import (
     fused_moe,

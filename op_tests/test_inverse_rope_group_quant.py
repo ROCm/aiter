@@ -20,6 +20,8 @@ import torch
 
 import aiter
 from aiter import dtypes
+from aiter.benchmark_data_init import DATA_DISTS, fill, make_generator
+from aiter.benchmark_reporting import print_json_table
 from aiter.jit.utils.chip_info import get_gfx
 from aiter.ops.inverse_rope_group_quant import (
     SCALE_LAYOUTS,
@@ -31,12 +33,8 @@ from aiter.ops.inverse_rope_group_quant import (
 from aiter.ops.quant import dynamic_per_group_scaled_quant
 from aiter.ops.triton.rope.rope import RotateStyle, _rope_cached_bwd
 from aiter.test_common import (
-    DATA_DISTS,
     benchmark,
     checkAllclose,
-    fill,
-    make_generator,
-    print_json_table,
     run_perftest,
 )
 

@@ -7,13 +7,12 @@ import pytest
 import torch
 import triton
 
+from aiter.benchmark_data_init import fill, make_generator
 from aiter.ops.triton.attention.pa_decode_sparse import pa_decode_sparse
 from aiter.ops.triton.utils._triton import arch_info
 from aiter.test_common import (
     benchmark,
     checkAllclose,
-    fill,
-    make_generator,
     run_perftest,
 )
 

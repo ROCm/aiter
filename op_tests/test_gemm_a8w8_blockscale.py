@@ -15,11 +15,12 @@ from einops import rearrange
 from einops import repeat as eirp
 
 import aiter
+from aiter import benchmark_data_init as bench_init
 from aiter import dtypes
-from aiter import test_common as bench_init
+from aiter.benchmark_reporting import print_json_table
 from aiter.ops.gemm_op_a8w8 import gemm_a8w8_blockscale_ck, gemm_a8w8_blockscale_cktile
 from aiter.ops.shuffle import shuffle_weight
-from aiter.test_common import benchmark, checkAllclose, perftest, print_json_table
+from aiter.test_common import benchmark, checkAllclose, perftest
 from aiter.utility import fp4_utils
 
 block_shape = (128, 128)

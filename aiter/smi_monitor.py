@@ -27,17 +27,133 @@ from __future__ import annotations
 import atexit
 import ctypes
 import importlib
+import inspect
 import json
 import os
 import sys
 import threading
 import time
 from contextlib import contextmanager
+from contextvars import ContextVar
+from enum import Enum
 from functools import cache
 from typing import Generator
 
+import numpy as np
+import torch
+
 SMI_RESULT_PREFIX = "AITER_SMI_RESULT "
 _ROCM_AMDSMI_PATH = "/opt/rocm/share/amd_smi"
+_SMI_LABEL_COUNTS = {}
+_SMI_CALL_LABEL = ContextVar("aiter_smi_call_label", default=None)
+
+
+def _smi_label_value(value):
+    """Return a compact, stable label value, or None for opaque arguments."""
+    if isinstance(value, torch.Tensor):
+        shape = "x".join(map(str, value.shape)) or "scalar"
+        return f"{shape}:{str(value.dtype).removeprefix('torch.')}"
+    if isinstance(value, torch.dtype):
+        return str(value).removeprefix("torch.")
+    if isinstance(value, Enum):
+        return str(value.value)
+    if value is None or isinstance(value, (str, bool, int, float, np.generic)):
+        return str(value)
+    if isinstance(value, (tuple, list)):
+        items = [_smi_label_value(item) for item in value]
+        if all(item is not None for item in items):
+            return ",".join(items)
+    return None
+
+
+def _smi_call_tag(func, callargs):
+    """Build a call-local SMI label from @benchmark's named arguments."""
+    source = os.path.splitext(os.path.basename(func.__code__.co_filename))[0]
+    parts = [f"{source}.{func.__name__}"]
+    aliases = {"m": "M", "n": "N", "k": "K", "t": "T", "h": "H", "d": "D"}
+    for name, value in callargs.items():
+        formatted = _smi_label_value(value)
+        if formatted is None:
+            continue
+        formatted = formatted.replace("/", "_").replace("\n", "")
+        parts.append(f"{aliases.get(name, name)}={formatted}")
+    return "/".join(parts)
+
+
+def _smi_perftest_tag(func, args, kwargs):
+    """Return scalar call details that distinguish one perftest invocation."""
+    try:
+        signature = inspect.signature(func)
+        callargs = signature.bind(*args, **kwargs)
+        callargs.apply_defaults()
+    except (TypeError, ValueError):
+        return None
+
+    parts = []
+    for name, parameter in signature.parameters.items():
+        if parameter.kind in (
+            inspect.Parameter.VAR_POSITIONAL,
+            inspect.Parameter.VAR_KEYWORD,
+        ):
+            continue
+        value = callargs.arguments.get(name)
+        if value is None or isinstance(value, torch.Tensor) or callable(value):
+            continue
+        formatted = _smi_label_value(value)
+        if formatted is None:
+            continue
+        formatted = formatted.replace("/", "_").replace("\n", "")
+        parts.append(f"{name}={formatted}")
+    return "/".join(parts) or None
+
+
+@contextmanager
+def benchmark_call_context(func, callargs):
+    """Expose one benchmark call's metadata to an inner SMI replay."""
+    token = _SMI_CALL_LABEL.set(_smi_call_tag(func, callargs))
+    try:
+        yield
+    finally:
+        _SMI_CALL_LABEL.reset(token)
+
+
+def replay_with_smi_metadata(
+    func,
+    args,
+    kwargs,
+    replay,
+    *,
+    synchronize,
+    estimated_us: float | None = None,
+):
+    """Replay one callable with stable benchmark metadata and skip filtering."""
+    if not smi_replay_enabled():
+        return None
+
+    fn_name = getattr(func, "__name__", "kernel")
+    skipped = {
+        name.strip()
+        for name in os.environ.get("AITER_SMI_SKIP_FUNCTIONS", "").split(",")
+        if name.strip()
+    }
+    if fn_name in skipped:
+        return None
+
+    case_label = _SMI_CALL_LABEL.get() or os.environ.get(
+        "AITER_SMI_LABEL", "benchmark_case"
+    )
+    perftest_tag = _smi_perftest_tag(func, args, kwargs)
+    if perftest_tag:
+        case_label = f"{case_label}/{perftest_tag}"
+    label_key = (case_label, fn_name)
+    occurrence = _SMI_LABEL_COUNTS.get(label_key, 0) + 1
+    _SMI_LABEL_COUNTS[label_key] = occurrence
+    return replay_with_smi(
+        replay,
+        label=f"{case_label}/{fn_name}#{occurrence}",
+        synchronize=synchronize,
+        estimated_us=estimated_us,
+    )
 
 
 def _import_amdsmi():

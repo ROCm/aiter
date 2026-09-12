@@ -26,13 +26,15 @@ if not _arch_ok:
     )
     sys.exit(0)
 
-from aiter.ops.opus import gemm_a16w16_opus
-from aiter.test_common import (
+from aiter.benchmark_data_init import (
     DATA_DISTS,
     add_data_init_args,
-    checkAllclose,
     fill,
     make_generator,
+)
+from aiter.ops.opus import gemm_a16w16_opus
+from aiter.test_common import (
+    checkAllclose,
     run_perftest,
 )
 
@@ -103,8 +105,8 @@ def _make_tensor(shape, dist="norm", gen=None, const_val=1.0):
     uniform  : U(-1, 1)
     norm     : N(0, 1)   [default; matches the original torch.randn path]
 
-    Delegates to ``test_common.fill`` so the operand init matches every other
-    op test; ``gen`` seeds the sampled dists (uniform/norm), zero/constant
+    Delegates to ``benchmark_data_init.fill`` so the operand init matches every
+    other op test; ``gen`` seeds the sampled dists (uniform/norm), zero/constant
     ignore it.
     """
     return fill(

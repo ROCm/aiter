@@ -38,13 +38,11 @@ import torch
 import aiter
 import aiter.mla  # main no longer auto-imports submodules; need explicit
 from aiter import dtypes
+from aiter.benchmark_data_init import DATA_DISTS, fill, make_generator
 from aiter.jit.utils.chip_info import get_gfx
 from aiter.test_common import (
-    DATA_DISTS,
     benchmark,
     checkAllclose,
-    fill,
-    make_generator,
     run_perftest,
 )
 
