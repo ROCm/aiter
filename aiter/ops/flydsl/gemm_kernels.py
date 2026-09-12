@@ -360,3 +360,46 @@ def flydsl_preshuffle_gemm_a8(
         Out.copy_(out_contig)
 
     return Out
+
+
+# ---------------------------------------------------------------------------
+# Expose flydsl_preshuffle_gemm_a8 to the PyTorch dispatcher
+# (torch.ops.aiter.flydsl_preshuffle_gemm_a8).
+# ---------------------------------------------------------------------------
+import functools as _ft
+import inspect as _insp
+
+from csrc.cpp_itfs.torch_utils import direct_register_custom_op
+
+_orig_flydsl_preshuffle_gemm_a8 = flydsl_preshuffle_gemm_a8
+_psg_sig = _insp.signature(_orig_flydsl_preshuffle_gemm_a8)
+
+
+@_ft.wraps(_orig_flydsl_preshuffle_gemm_a8)
+def _flydsl_preshuffle_gemm_a8_op(*args, **kwargs):
+    bound = _flydsl_preshuffle_gemm_a8_op.__signature__.bind(*args, **kwargs)
+    bound.apply_defaults()
+    _orig_flydsl_preshuffle_gemm_a8(**bound.arguments)  # writes Out; return discarded
+
+
+# Register annotation: mutating op returns None (schema `-> ()`).
+_flydsl_preshuffle_gemm_a8_op.__signature__ = _psg_sig.replace(return_annotation=None)
+_flydsl_preshuffle_gemm_a8_op.__annotations__ = {
+    **_orig_flydsl_preshuffle_gemm_a8.__annotations__,
+    "return": None,
+}
+
+if not hasattr(torch.ops.aiter, "flydsl_preshuffle_gemm_a8"):
+    direct_register_custom_op(
+        "flydsl_preshuffle_gemm_a8",
+        _flydsl_preshuffle_gemm_a8_op,
+        mutates_args=["Out"],
+        fake_impl=lambda *a_, **k_: None,
+    )
+
+
+def flydsl_preshuffle_gemm_a8(*args, **kwargs):
+    bound = _psg_sig.bind(*args, **kwargs)
+    bound.apply_defaults()
+    torch.ops.aiter.flydsl_preshuffle_gemm_a8(**bound.arguments)
+    return bound.arguments["Out"]
