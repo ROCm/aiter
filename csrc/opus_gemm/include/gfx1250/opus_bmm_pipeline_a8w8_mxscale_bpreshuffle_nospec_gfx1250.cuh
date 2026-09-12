@@ -736,13 +736,15 @@ void bmm_a8w8_mxscale_bpreshuffle_nospec_kernel_gfx1250(opus_bmm_a8w8_mxscale_ka
     //     This is the same hazard the specialized pipeline handles before its
     //     FREE signals.
     {
-        const int prime = opus_bmm_mx_min_i(k_steps, T::kNumSlots);
+        // kNumSlots-1 primed: step k issues for k + kNumSlots - 1, so the last
+        // slot is filled by the loop's own first pass.
+        const int prime = opus_bmm_mx_min_i(k_steps, T::kNumSlots - 1);
         for (int i = 0; i < prime; ++i) issue_slot(i, i > 0);
 
         for (int k = 0; k < k_steps; ++k) {
             const int s = k % T::kNumSlots;
             // Outstanding after this wait = the primed loads still ahead of k.
-            const int ahead = opus_bmm_mx_min_i(k_steps - 1 - k, T::kNumSlots - 1);
+            const int ahead = opus_bmm_mx_min_i(k_steps - 1 - k, T::kNumSlots - 2);
             switch (ahead) {
                 case 0:  opus::s_wait_tensorcnt<0>(); break;
                 case 1:  opus::s_wait_tensorcnt<1>(); break;
@@ -750,16 +752,27 @@ void bmm_a8w8_mxscale_bpreshuffle_nospec_kernel_gfx1250(opus_bmm_a8w8_mxscale_ka
             }
             __builtin_amdgcn_s_barrier();          // publish slot s to all waves
 
+            // ISSUE BEFORE COMPUTING, into the slot consumed LAST step.
+            //
+            // The TDM wait at the top of the next iteration is the kernel's
+            // single biggest stall, and what sets its length is how far the
+            // issue sits from it. Issuing at the END of the body, as this loop
+            // used to, leaves only the loop control in between and the transfer
+            // has had no time to progress: ATT measures 727 cycles a wait here
+            // against FlyDSL's 360, whose issue sits inside its compute. Moving
+            // ours ahead of consume_slot buys the whole K-step of WMMAs as cover.
+            //
+            // Refilling the slot read one step ago, not the one just read, is
+            // what makes that safe without a drain: consume_slot ends in its own
+            // s_wait_dscnt(0), and every wave passed the barrier above after
+            // finishing consume_slot(k-1), so slot (k-1) % kNumSlots is free.
+            // That also drops the second barrier this loop used to take.
+            const int kfill = k + T::kNumSlots - 1;
+            if (kfill < k_steps) issue_slot(kfill % T::kNumSlots, true);
+
             opus::static_for<T::kNumSlots>([&](auto sN) __attribute__((always_inline)) {
                 if ((int)decltype(sN)::value == s) consume_slot(sN, k);
             });
-
-            const int knext = k + T::kNumSlots;
-            if (knext < k_steps) {
-                opus::s_wait_dscnt(opus::number<0>{});
-                __builtin_amdgcn_s_barrier();      // WAR: slot s may be refilled
-                issue_slot(s, true);
-            }
         }
     }
 
