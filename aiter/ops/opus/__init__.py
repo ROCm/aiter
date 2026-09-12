@@ -46,6 +46,17 @@ if _arch_ok:
         opus_gemm_workspace_release_all,
     )
 
+    # gfx950-only, unlike the gemm entries above: _SUPPORTED is wider than this
+    # kernel, so the wrappers re-check at call time rather than at import.
+    from .pa_mqa_logits_opus import (
+        compute_prefill_windows,
+        pa_mqa_logits_mxfp4_decode,
+        pa_mqa_logits_mxfp4_fwd_decode,
+        pa_mqa_logits_mxfp4_fwd_prefill,
+        pa_mqa_logits_mxfp4_prefill,
+        pa_mqa_logits_mxfp4_prefill_windows,
+    )
+
     def opus_gemm_a8w8_blockscale_bpreshuffle_tune(*args, **kwargs):
         from .gemm_op_a8w8 import (
             opus_gemm_a8w8_blockscale_bpreshuffle_tune as _impl,
@@ -69,14 +80,36 @@ else:
     opus_gemm_workspace_release_all = _make_unsupported_arch_stub(
         "opus_gemm_workspace_release_all"
     )
+    compute_prefill_windows = _make_unsupported_arch_stub("compute_prefill_windows")
+    pa_mqa_logits_mxfp4_decode = _make_unsupported_arch_stub(
+        "pa_mqa_logits_mxfp4_decode"
+    )
+    pa_mqa_logits_mxfp4_fwd_decode = _make_unsupported_arch_stub(
+        "pa_mqa_logits_mxfp4_fwd_decode"
+    )
+    pa_mqa_logits_mxfp4_fwd_prefill = _make_unsupported_arch_stub(
+        "pa_mqa_logits_mxfp4_fwd_prefill"
+    )
+    pa_mqa_logits_mxfp4_prefill = _make_unsupported_arch_stub(
+        "pa_mqa_logits_mxfp4_prefill"
+    )
+    pa_mqa_logits_mxfp4_prefill_windows = _make_unsupported_arch_stub(
+        "pa_mqa_logits_mxfp4_prefill_windows"
+    )
 
 
 __all__ = [
     "bmm_a8w8_mxscale_opus",
+    "compute_prefill_windows",
     "gemm_a16w16_opus",
     "opus_gemm_a8w8_blockscale_bpreshuffle_tune",
     "opus_gemm_a16w16_tune",
     "opus_gemm_workspace_init",
     "opus_gemm_workspace_release",
     "opus_gemm_workspace_release_all",
+    "pa_mqa_logits_mxfp4_decode",
+    "pa_mqa_logits_mxfp4_fwd_decode",
+    "pa_mqa_logits_mxfp4_fwd_prefill",
+    "pa_mqa_logits_mxfp4_prefill",
+    "pa_mqa_logits_mxfp4_prefill_windows",
 ]
