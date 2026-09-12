@@ -24,7 +24,10 @@ import torch
 import aiter
 from aiter import dtypes
 from aiter.jit.utils.chip_info import get_gfx
-from aiter.ops.flydsl.gather_kv_b_proj import gather_kv_b_proj_flydsl
+from aiter.ops.flydsl.gather_kv_b_proj import (
+    gather_kv_b_proj_flydsl,
+    gather_kv_b_proj_flydsl_supported,
+)
 from aiter.ops.shuffle import shuffle_weight
 from aiter.ops.triton.gather_kv_b_proj import (
     gather_kv_b_proj as triton_gather_kv_b_proj,
@@ -309,6 +312,60 @@ def test_gather_kv_b_proj_flydsl_rejects_unsupported(kwargs, needle):
     case = _make_case(256, 12)
     with pytest.raises(ValueError, match=needle):
         _run_flydsl(case, **kwargs)
+
+
+def _supported(case, **kw):
+    return gather_kv_b_proj_flydsl_supported(
+        case["k_buffer"],
+        shuffle_weight(case["weight"], layout=(16, 16)),
+        case["weight_scale"],
+        case["k_prefix"],
+        case["v_prefix"],
+        **kw,
+    )
+
+
+@_SKIP
+def test_gather_kv_b_proj_flydsl_supported_agrees_with_the_op():
+    """The predicate and the op must never disagree about a configuration.
+
+    Both read one ``_unsupported_reason``; this pins that they keep doing so,
+    because the failure mode of a second copy is a caller routing a shape here
+    that the kernel then refuses mid-forward.
+    """
+    ok = _make_case(256, 12)
+    assert _supported(ok)
+    _run_flydsl(ok)  # and it really runs
+
+    for kw, needle in (
+        ({"shuffled_kv_cache": True}, "shuffled_kv_cache"),
+        ({"block_m": 192}, "BLOCK_M"),
+    ):
+        assert not _supported(ok, **kw)
+        with pytest.raises(ValueError, match=needle):
+            _run_flydsl(ok, **kw)
+
+
+@_SKIP
+@pytest.mark.parametrize("break_it", ["bf16_cache", "no_scale", "mxfp4_weight"])
+def test_gather_kv_b_proj_flydsl_declines_what_triton_covers(break_it):
+    """The three shapes ATOM hands this op that only the Triton one can serve.
+
+    Two of them took down a CI accuracy job apiece: the FlyDSL op raised, and
+    ATOM had gated on "did the import succeed" rather than on this predicate,
+    so the engine died instead of using the fallback sitting next to it.
+    """
+    case = _make_case(256, 12)
+    if break_it == "bf16_cache":
+        case["k_buffer"] = case["k_buffer"].to(torch.bfloat16)  # GLM-5.2
+    elif break_it == "no_scale":
+        case["weight_scale"] = None  # Kimi-K3 DSpark
+    else:
+        case["weight"] = case["weight"].view(torch.uint8)  # MXFP4 kv_b_proj
+
+    assert not _supported(case)
+    with pytest.raises(ValueError):
+        _run_flydsl(case)
 
 
 def _sparse_case(num_blocks, m, n_heads, lo):

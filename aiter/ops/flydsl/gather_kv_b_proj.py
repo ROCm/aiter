@@ -40,53 +40,176 @@ def lds_bytes(block_m: int, block_n: int) -> int:
     return _LDS_BYTES_PER_BLOCK_UNIT * (int(block_m) + int(block_n))
 
 
-def _validate(
+def _config_reason(
     *,
     n_heads: int,
     nope: int,
     v_dim: int,
     block_m: int,
     waves_per_eu: int,
-    num_blocks: int | None = None,
     m_rows: int | None = None,
-) -> None:
-    """Re-check every kernel precondition as ValueError."""
+) -> str | None:
+    """Why the kernel cannot serve this configuration, or None if it can.
+
+    Every precondition is written once here and reaches callers two ways: as an
+    exception via :func:`_validate`, as a bool via
+    :func:`gather_kv_b_proj_flydsl_supported`. A second copy for the predicate
+    would drift, and drift reads as "declines a shape it handles" or, worse,
+    "accepts one it does not".
+    """
     block_n = nope + v_dim  # BLOCK_N is one head
     if block_m < 128 or block_m % 128 != 0:
-        raise ValueError(
-            f"[FlyDSL gather_kv_b_proj] BLOCK_M must be >=128 and %128==0, got {block_m}"
-        )
+        return f"BLOCK_M must be >=128 and %128==0, got {block_m}"
     if nope != 128 or v_dim != 128:
-        raise ValueError(
-            f"[FlyDSL gather_kv_b_proj] this backend requires qk_nope_head_dim == "
-            f"v_head_dim == 128 (the k/v split is the MFMA accumulator-group "
-            f"boundary, not a runtime offset), got nope={nope} v_head_dim={v_dim}. "
-            f"Use the Triton op for other head dims."
+        return (
+            f"this backend requires qk_nope_head_dim == v_head_dim == 128 (the "
+            f"k/v split is the MFMA accumulator-group boundary, not a runtime "
+            f"offset), got nope={nope} v_head_dim={v_dim}"
         )
     if int(waves_per_eu) < 1:
-        raise ValueError(
-            f"[FlyDSL gather_kv_b_proj] waves_per_eu must be >=1 (the kernel always "
-            f"emits the rocdl.waves_per_eu attribute), got {waves_per_eu}"
+        return (
+            f"waves_per_eu must be >=1 (the kernel always emits the "
+            f"rocdl.waves_per_eu attribute), got {waves_per_eu}"
         )
     need = lds_bytes(block_m, block_n)
     have = get_lds_capacity_bytes(get_rocm_arch().split(":", 1)[0])
     if need > have:
-        raise ValueError(
-            f"[FlyDSL gather_kv_b_proj] BLOCK_M={block_m} needs {need} B of LDS, "
-            f"limit is {have} B"
-        )
+        return f"BLOCK_M={block_m} needs {need} B of LDS, limit is {have} B"
     # No num_blocks ceiling: past _BUFFER_SPAN_MAX the kernel addresses the
     # cache in 64 bits per lane instead (`wide_index`).
     if m_rows is not None:
         if m_rows < 0:
-            raise ValueError(
-                f"[FlyDSL gather_kv_b_proj] num_tokens must be >=0, got {m_rows}"
-            )
+            return f"num_tokens must be >=0, got {m_rows}"
         if m_rows * n_heads * (nope + KV_PE_DIM) >= _I32_MAX:
-            raise ValueError(
-                f"[FlyDSL gather_kv_b_proj] num_tokens={m_rows} x {n_heads} heads "
-                f"overflows 32-bit output indexing"
+            return (
+                f"num_tokens={m_rows} x {n_heads} heads overflows 32-bit output "
+                f"indexing"
             )
+    return None
+
+
+def _raise(reason: str) -> None:
+    raise ValueError(f"[FlyDSL gather_kv_b_proj] {reason}")
+
+
+def _validate(**kwargs) -> None:
+    """:func:`_config_reason` for the callers with nowhere to fall back."""
+    reason = _config_reason(**kwargs)
+    if reason is not None:
+        _raise(reason)
+
+
+def _is_per_row_scale(kv_proj_scale: Tensor) -> bool:
+    return kv_proj_scale.dim() == 1 or (
+        kv_proj_scale.dim() == 2 and kv_proj_scale.shape[1] == 1
+    )
+
+
+def _unsupported_reason(
+    k_buffer: Tensor,
+    kv_proj_weight: Tensor,
+    kv_proj_scale: Tensor | None,
+    k_prefix: Tensor,
+    v_prefix: Tensor,
+    *,
+    shuffled_kv_cache: bool = False,
+    block_m: int = 256,
+    waves_per_eu: int = 2,
+) -> str | None:
+    """Why this backend cannot serve these tensors, or None if it can.
+
+    Everything here is fixed once the weights are loaded and the cache is
+    allocated, so a caller that wants to route around this backend can ask once
+    and keep the answer. What is left inside the op is per-call.
+    """
+    if shuffled_kv_cache:
+        return (
+            "shuffled_kv_cache is not supported (the gather assumes each slot's "
+            f"{KV_ROW_ELEMS} latents are contiguous)"
+        )
+    if kv_proj_scale is None:
+        return (
+            "an unquantized weight (kv_proj_scale=None) is not supported; this "
+            "backend is fp8 x per-output-row scale only"
+        )
+    if k_buffer.dim() != 3 or k_buffer.shape[1] != 1:
+        return (
+            f"k_buffer must be [num_blocks, 1, {KV_ROW_ELEMS}] (page_size 1), got "
+            f"{tuple(k_buffer.shape)}"
+        )
+    if k_buffer.shape[2] != KV_ROW_ELEMS:
+        return f"k_buffer last dim must be {KV_ROW_ELEMS}, got {k_buffer.shape[2]}"
+
+    arch = _arch_of(k_buffer.device.index)
+    if arch != "gfx950":
+        return f"gfx950 only (OCP e4m3 + CDNA4 MFMA_Scale + 128 KB LDS), got {arch}"
+    for name, t in (("k_buffer", k_buffer), ("kv_proj_weight", kv_proj_weight)):
+        if t.dtype != torch.float8_e4m3fn:
+            return f"{name} must be torch.float8_e4m3fn (OCP e4m3), got {t.dtype}"
+    if k_prefix.dim() != 3 or v_prefix.dim() != 3:
+        return (
+            f"outputs must be 3-D, got {tuple(k_prefix.shape)}, "
+            f"{tuple(v_prefix.shape)}"
+        )
+    if k_prefix.dtype != torch.bfloat16 or v_prefix.dtype != torch.bfloat16:
+        return "outputs must be bf16"
+
+    total_kv, n_heads, kp_dim = k_prefix.shape
+    total_kv_v, n_heads_v, v_dim = v_prefix.shape
+    if (total_kv, n_heads) != (total_kv_v, n_heads_v):
+        return (
+            f"k_prefix / v_prefix disagree: {tuple(k_prefix.shape)} vs "
+            f"{tuple(v_prefix.shape)}"
+        )
+    nope = kp_dim - KV_PE_DIM
+    weight_n, weight_k = kv_proj_weight.shape
+    if weight_k != KV_C_DIM:
+        return f"weight K must be {KV_C_DIM}, got {weight_k}"
+    if weight_n != n_heads * (nope + v_dim):
+        return (
+            f"weight N={weight_n} != n_heads*(nope+v_dim)="
+            f"{n_heads}*({nope}+{v_dim})"
+        )
+
+    if _is_per_row_scale(kv_proj_scale):
+        if kv_proj_scale.numel() != weight_n:
+            return (
+                f"per-row kv_proj_scale must have {weight_n} elements, got "
+                f"{tuple(kv_proj_scale.shape)}"
+            )
+    elif kv_proj_scale.dim() != 2:
+        return (
+            f"kv_proj_scale must be 1-D (per-row) or 2-D (block), got "
+            f"{tuple(kv_proj_scale.shape)}"
+        )
+    elif (
+        kv_proj_scale.shape[0] * 128 != weight_n
+        or kv_proj_scale.shape[1] * 128 != KV_C_DIM
+    ):
+        return (
+            f"block kv_proj_scale must be [{weight_n // 128}, "
+            f"{KV_C_DIM // 128}] (128x128 granularity), got "
+            f"{tuple(kv_proj_scale.shape)}"
+        )
+
+    return _config_reason(
+        n_heads=n_heads,
+        nope=nope,
+        v_dim=v_dim,
+        block_m=block_m,
+        waves_per_eu=waves_per_eu,
+    )
+
+
+def gather_kv_b_proj_flydsl_supported(*args, **kwargs) -> bool:
+    """Would :func:`gather_kv_b_proj_flydsl` serve these tensors?
+
+    For callers holding a fallback -- the Triton op takes the same arguments and
+    covers bf16 caches, unquantized and MXFP4 weights, page_size > 1 and every
+    non-gfx950 arch. Ask once: the answer is fixed by the weights and the cache,
+    not by the call. Arguments are :func:`_unsupported_reason`'s.
+    """
+    return _unsupported_reason(*args, **kwargs) is None
 
 
 @functools.lru_cache(maxsize=64)
@@ -186,117 +309,52 @@ def gather_kv_b_proj_flydsl(
     distinct value.
     """
 
-    if shuffled_kv_cache:
-        raise ValueError(
-            "[FlyDSL gather_kv_b_proj] shuffled_kv_cache is not supported (the "
-            "gather assumes each slot's 576 latents are contiguous). "
-        )
-    if kv_proj_scale is None:
-        raise ValueError(
-            "[FlyDSL gather_kv_b_proj] an unquantized weight (kv_proj_scale=None) "
-            "is not supported; this backend is fp8 x per-output-row scale only. "
-        )
+    reason = _unsupported_reason(
+        k_buffer,
+        kv_proj_weight,
+        kv_proj_scale,
+        k_prefix,
+        v_prefix,
+        shuffled_kv_cache=shuffled_kv_cache,
+        block_m=block_m,
+        waves_per_eu=waves_per_eu,
+    )
+    if reason is not None:
+        _raise(reason)
 
-    if k_buffer.dim() != 3 or k_buffer.shape[1] != 1:
-        raise ValueError(
-            f"[FlyDSL gather_kv_b_proj] k_buffer must be [num_blocks, 1, {KV_ROW_ELEMS}] "
-            f"(page_size 1), got {tuple(k_buffer.shape)}. Use the Triton op for "
-            f"page_size > 1."
-        )
-    num_blocks, _, hidden = k_buffer.shape
-    if hidden != KV_ROW_ELEMS:
-        raise ValueError(
-            f"[FlyDSL gather_kv_b_proj] k_buffer last dim must be {KV_ROW_ELEMS}, got {hidden}"
-        )
-
-    arch = _arch_of(k_buffer.device.index)
-    if arch != "gfx950":
-        raise ValueError(
-            f"[FlyDSL gather_kv_b_proj] gfx950 only (OCP e4m3 + CDNA4 MFMA_Scale + "
-            f"128 KB LDS), got {arch}."
-        )
-    for name, t in (("k_buffer", k_buffer), ("kv_proj_weight", kv_proj_weight)):
-        if t.dtype != torch.float8_e4m3fn:
-            raise ValueError(
-                f"[FlyDSL gather_kv_b_proj] {name} must be torch.float8_e4m3fn "
-                f"(OCP e4m3), got {t.dtype}"
-            )
-    if k_prefix.dim() != 3 or v_prefix.dim() != 3:
-        raise ValueError(
-            f"[FlyDSL gather_kv_b_proj] outputs must be 3-D, got "
-            f"{tuple(k_prefix.shape)}, {tuple(v_prefix.shape)}"
-        )
-    if k_prefix.dtype != torch.bfloat16 or v_prefix.dtype != torch.bfloat16:
-        raise ValueError("[FlyDSL gather_kv_b_proj] outputs must be bf16")
-
+    num_blocks = k_buffer.shape[0]
     total_kv, n_heads, kp_dim = k_prefix.shape
-    total_kv_v, n_heads_v, v_dim = v_prefix.shape
-    if (total_kv, n_heads) != (total_kv_v, n_heads_v):
-        raise ValueError(
-            f"[FlyDSL gather_kv_b_proj] k_prefix / v_prefix disagree: "
-            f"{tuple(k_prefix.shape)} vs {tuple(v_prefix.shape)}"
-        )
     nope = kp_dim - KV_PE_DIM
-    weight_n, weight_k = kv_proj_weight.shape
-    if weight_k != KV_C_DIM:
-        raise ValueError(
-            f"[FlyDSL gather_kv_b_proj] weight K must be {KV_C_DIM}, got {weight_k}"
-        )
-    if weight_n != n_heads * (nope + v_dim):
-        raise ValueError(
-            f"[FlyDSL gather_kv_b_proj] weight N={weight_n} != n_heads*(nope+v_dim)="
-            f"{n_heads}*({nope}+{v_dim})"
-        )
+    v_dim = v_prefix.shape[2]
 
     m_rows = int(total_kv if num_tokens is None else num_tokens)
+    # Per-call, so not in `_unsupported_reason`: violating either is a caller
+    # bug, not a shape this backend declines, and raising is the right answer.
     if m_rows > total_kv:
-        raise ValueError(
-            f"[FlyDSL gather_kv_b_proj] num_tokens={m_rows} exceeds the allocated "
-            f"{total_kv} output rows"
-        )
+        _raise(f"num_tokens={m_rows} exceeds the allocated {total_kv} output rows")
     if m_rows == 0:
         return
     if kv_indices.numel() < m_rows:
-        raise ValueError(
-            f"[FlyDSL gather_kv_b_proj] kv_indices has {kv_indices.numel()} entries, "
-            f"need at least num_tokens={m_rows}"
+        _raise(
+            f"kv_indices has {kv_indices.numel()} entries, need at least "
+            f"num_tokens={m_rows}"
         )
 
-    per_row_scale = kv_proj_scale.dim() == 1 or (
-        kv_proj_scale.dim() == 2 and kv_proj_scale.shape[1] == 1
-    )
-    if per_row_scale:
-        if kv_proj_scale.numel() != weight_n:
-            raise ValueError(
-                f"[FlyDSL gather_kv_b_proj] per-row kv_proj_scale must have "
-                f"{weight_n} elements, got {tuple(kv_proj_scale.shape)}"
-            )
-    else:
-        if kv_proj_scale.dim() != 2:
-            raise ValueError(
-                f"[FlyDSL gather_kv_b_proj] kv_proj_scale must be 1-D (per-row) or "
-                f"2-D (block), got {tuple(kv_proj_scale.shape)}"
-            )
-        scale_n, scale_k = kv_proj_scale.shape
-        if scale_n * 128 != weight_n or scale_k * 128 != KV_C_DIM:
-            raise ValueError(
-                f"[FlyDSL gather_kv_b_proj] block kv_proj_scale must be "
-                f"[{weight_n // 128}, {KV_C_DIM // 128}] (128x128 granularity), "
-                f"got {tuple(kv_proj_scale.shape)}"
-            )
+    per_row_scale = _is_per_row_scale(kv_proj_scale)
     scale = kv_proj_scale.reshape(-1)
     if scale.dtype != torch.float32:
         scale = scale.to(torch.float32)
 
     xcd_swizzle = _default_xcd(m_rows) if xcd_swizzle is None else int(xcd_swizzle)
 
+    # The config half already ran in `_unsupported_reason`; this is here for
+    # `m_rows`, which only exists once `num_tokens` is resolved.
     _validate(
         n_heads=n_heads,
         nope=nope,
         v_dim=v_dim,
         block_m=block_m,
         waves_per_eu=waves_per_eu,
-        num_blocks=num_blocks,
         m_rows=m_rows,
     )
 
