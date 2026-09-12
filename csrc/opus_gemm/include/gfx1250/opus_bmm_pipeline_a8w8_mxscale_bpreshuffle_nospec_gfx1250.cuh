@@ -656,15 +656,35 @@ void bmm_a8w8_mxscale_bpreshuffle_nospec_kernel_gfx1250(opus_bmm_a8w8_mxscale_ka
                 fill_sb();
             }
 
+            // N OUTER, M inner -- so the inner run holds ONE B fragment and walks
+            // A, and M serpentines so consecutive columns share an A operand at
+            // the turn. Measured on kid35 (kExpM=8, kExpN=4) against the two
+            // alternatives, identical checksums, us at n=1024 k=4096:
+            //
+            //   b,m        M-outer+N-serp   N-outer (this)   M-outer+raster
+            //   8,1024          50.59           48.41            49.37
+            //   8,2048          57.39           57.11            56.54
+            //   16,2048        121.18          116.25           117.51
+            //   16,4096        235.42          232.19           233.68
+            //   4,2048          50.94           48.92            49.60
+            //
+            // 2.9% mean, and the M-outer serpentine this replaces was the WORST
+            // of the three -- its premise, that holding A and walking B shares
+            // the B operand, had the roles backwards. Order is moot where either
+            // extent is 1 (the decode tiles), so this only moves the prefill ones.
             auto mma_rows = [&](auto FirstN, auto CountN) __attribute__((always_inline)) {
-                opus::static_for<CountN.value>([&](auto jN) __attribute__((always_inline)) {
-                    constexpr int im = FirstN.value + decltype(jN)::value;
-                    if constexpr (!T::kSfAEarly) sa_v[im] = pack_sfa(im);
-                    // Serpentine in N: the last column of one row is the first of
-                    // the next, so consecutive WMMAs share a B operand.
-                    opus::static_for<T::kExpN>([&](auto jnN) __attribute__((always_inline)) {
-                        constexpr int raw = decltype(jnN)::value;
-                        constexpr int in  = (im % 2 == 1) ? (T::kExpN - 1 - raw) : raw;
+                if constexpr (!T::kSfAEarly) {
+                    opus::static_for<CountN.value>([&](auto jN) __attribute__((always_inline)) {
+                        constexpr int im = FirstN.value + decltype(jN)::value;
+                        sa_v[im] = pack_sfa(im);
+                    });
+                }
+                opus::static_for<T::kExpN>([&](auto inN) __attribute__((always_inline)) {
+                    constexpr int in = decltype(inN)::value;
+                    opus::static_for<CountN.value>([&](auto jN) __attribute__((always_inline)) {
+                        constexpr int j  = decltype(jN)::value;
+                        constexpr int im = FirstN.value + ((in % 2 == 1)
+                                              ? (CountN.value - 1 - j) : j);
                         acc[im][in] = mma(va[im], vb[in], acc[im][in], sa_v[im], sb_v[in],
                                           opus::number<0>{}, opus::number<0>{});
                     });
