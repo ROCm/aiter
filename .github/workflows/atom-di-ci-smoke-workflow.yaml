@@ -89,7 +89,7 @@ jobs:
   load-config:
     runs-on: ubuntu-latest
     outputs:
-      cell_id: ${{ steps.cell.outputs.cell_id }}
+      matrix: ${{ steps.cell.outputs.matrix }}
       node_pool: ${{ steps.cell.outputs.node_pool }}
     steps:
       - name: Apply ATOM DI smoke inputs
@@ -288,20 +288,105 @@ jobs:
           helper_path.write_text(text, encoding="utf-8")
           print(f"{helper_path}: patched Spur sacct exit-code query")
 
-          # ATOM streams every rank's container and role logs to stderr while
-          # also uploading the same files as artifacts. A single cell can exceed
-          # the GitHub Actions per-job log limit and block the runner's final
-          # Slurm status handling. Keep the lightweight Slurm monitor output;
-          # the complete server logs remain available in the result artifact.
+          # Each rank's container log already contains the server, router,
+          # benchmark, and eval output because pd_server_atom.sh tees its role
+          # logs to the container stdout. Stream bounded windows plus error
+          # context from those logs so failures are visible without exceeding
+          # the GitHub Actions live-log rendering limit. Complete files are
+          # still uploaded in the result artifact.
           text = submit_path.read_text(encoding="utf-8")
-          old_streamer = "  SLURM_EXTRA_LOG_STREAMER=stream_spur_shared_logs_once"
-          new_streamer = "  unset SLURM_EXTRA_LOG_STREAMER"
-          if new_streamer not in text:
-              if text.count(old_streamer) != 1:
-                  raise SystemExit("Failed to find unique Spur shared-log streamer")
-              text = text.replace(old_streamer, new_streamer, 1)
+          function_start = "stream_spur_shared_logs_once() {\n"
+          function_end = '\n}\n\nif [[ "${SLURM_SUBMIT_RUNNER}"'
+          if text.count(function_start) != 1 or text.count(function_end) != 1:
+              raise SystemExit("Failed to find unique Spur shared-log function")
+          start = text.index(function_start)
+          end = text.index(function_end, start)
+          old_function = text[start : end + 3]
+          new_function = r'''stream_spur_log_window() {
+            local file="$1"
+            local prefix="$2"
+            local current_line="$3"
+            local total_lines new_lines head_lines tail_lines head_end tail_start
+
+            if [[ ! -f "${file}" ]]; then
+              printf '%s\n' "${current_line}"
+              return 0
+            fi
+
+            total_lines="$(wc -l < "${file}" | tr -d ' ')"
+            if (( total_lines < current_line )); then
+              current_line=0
+            fi
+            new_lines=$((total_lines - current_line))
+            if (( new_lines <= 0 )); then
+              printf '%s\n' "${total_lines}"
+              return 0
+            fi
+
+            tail_lines="${SPUR_LIVE_LOG_TAIL_LINES:-80}"
+            head_lines=0
+            if (( current_line == 0 )); then
+              head_lines="${SPUR_LIVE_LOG_HEAD_LINES:-40}"
+            fi
+            if (( new_lines <= head_lines + tail_lines )); then
+              stream_file_lines "${file}" "${prefix}" "${current_line}"
+              return 0
+            fi
+
+            head_end=$((current_line + head_lines))
+            tail_start=$((total_lines - tail_lines + 1))
+            printf '%s\n' \
+              "${prefix}[live-log] sampling ${new_lines} new lines: head=${head_lines}, tail=${tail_lines}, plus error context" >&2
+            awk \
+              -v start="${current_line}" \
+              -v head_end="${head_end}" \
+              -v tail_start="${tail_start}" \
+              -v prefix="${prefix}" '
+                NR <= start { next }
+                NR <= head_end || NR >= tail_start {
+                  print prefix $0
+                  next
+                }
+                {
+                  lower = tolower($0)
+                  if (lower ~ /(traceback|error|exception|fatal|fail|timeout|timed out|out of memory|oom|killed|segmentation fault|assertion)/) {
+                    important = 12
+                  }
+                  if (important > 0) {
+                    print prefix "[important] " $0
+                    important--
+                  }
+                }
+              ' "${file}" >&2
+            printf '%s\n' "${total_lines}"
+          }
+
+          stream_spur_shared_logs_once() {
+            local job_id="$1"
+            local run_dir="${LOG_ROOT}/slurm_job-${job_id}"
+            local log_file rel_path current_line
+
+            [[ -d "${run_dir}" ]] || return 0
+
+            shopt -s nullglob
+            for log_file in "${run_dir}"/rank-*/container*.log; do
+              rel_path="${log_file#"${run_dir}/"}"
+              current_line="${SPUR_SHARED_LOG_LINES[${log_file}]:-0}"
+              SPUR_SHARED_LOG_LINES["${log_file}"]="$(
+                stream_spur_log_window \
+                  "${log_file}" \
+                  "[spur:${rel_path}] " \
+                  "${current_line}"
+              )"
+            done
+            shopt -u nullglob
+          }'''
+          text = text.replace(old_function, new_function + "\n", 1)
+          streamer = "  SLURM_EXTRA_LOG_STREAMER=stream_spur_shared_logs_once"
+          if text.count(streamer) != 1:
+              raise SystemExit("Failed to find enabled Spur shared-log streamer")
           submit_path.write_text(text, encoding="utf-8")
-          print(f"{submit_path}: disabled duplicate full-rank live-log streaming")
+          print(f"{submit_path}: enabled bounded per-rank live-log streaming")
 
           models_path = Path(".github/benchmark/models_atomesh.yaml")
           text = models_path.read_text(encoding="utf-8")
@@ -380,28 +465,32 @@ jobs:
           def parse_int_list(value: str):
               return [int(item) for item in value.replace(",", " ").split() if item]
 
-          def build_matrix(model: str, case: str, conc: str, eval_conc: str, output: Path):
-              subprocess.run(
-                  [
-                      "python3",
-                      ".github/scripts/atomesh/pd_matrix.py",
-                      "--suite",
-                      "nightly",
-                      "--model",
-                      model,
-                      "--case",
-                      case,
-                      "--image",
-                      os.environ["ATOMESH_IMAGE"],
-                      "--benchmark-concurrency",
-                      conc,
-                      "--eval-concurrency",
-                      eval_conc,
-                      "--output",
-                      str(output),
-                  ],
-                  check=True,
-              )
+          def build_matrix(
+              model: str,
+              case: str,
+              output: Path,
+              conc: str | None = None,
+              eval_conc: str | None = None,
+          ):
+              command = [
+                  "python3",
+                  ".github/scripts/atomesh/pd_matrix.py",
+                  "--suite",
+                  "nightly",
+                  "--model",
+                  model,
+                  "--case",
+                  case,
+                  "--image",
+                  os.environ["ATOMESH_IMAGE"],
+                  "--output",
+                  str(output),
+              ]
+              if conc is not None:
+                  command.extend(["--benchmark-concurrency", conc])
+              if eval_conc is not None:
+                  command.extend(["--eval-concurrency", eval_conc])
+              subprocess.run(command, check=True)
               return json.loads(output.read_text(encoding="utf-8"))
 
           requested = [
@@ -412,7 +501,7 @@ jobs:
                   "osl": os.environ["OSL"],
                   "conc": os.environ["CONC_LIST"],
                   "eval_conc": os.environ["EVAL_CONC_LIST"],
-                  "run_eval": True,
+                  "override_smoke_shape": True,
               }
           ]
           if os.environ.get("RUN_GLM_5_2_FP8", "false") == "true":
@@ -424,9 +513,25 @@ jobs:
                       "osl": os.environ["GLM_OSL"],
                       "conc": os.environ["GLM_CONC_LIST"],
                       "eval_conc": os.environ["GLM_EVAL_CONC_LIST"],
-                      "run_eval": True,
+                      "override_smoke_shape": True,
                   }
               )
+          requested.extend(
+              [
+                  {
+                      "model": "Kimi-K2.5-MXFP4",
+                      "case": "kimi-k25-1p1d-tp4",
+                      "topology": "1p1d",
+                      "override_smoke_shape": False,
+                  },
+                  {
+                      "model": "MiniMax-M3-MXFP4",
+                      "case": "minimax-m3-fp4-1p1d-tp4",
+                      "topology": "1p1d",
+                      "override_smoke_shape": False,
+                  },
+              ]
+          )
 
           node_pool = [
               node.strip()
@@ -441,25 +546,33 @@ jobs:
 
           for index, cfg in enumerate(requested):
               matrix_path = Path(f"../atomesh-matrix-{index}.json")
-              matrix = build_matrix(cfg["model"], cfg["case"], cfg["conc"], cfg["eval_conc"], matrix_path)
-              combined_matrix["include"].extend(matrix.get("include", []))
+              matrix = build_matrix(
+                  cfg["model"],
+                  cfg["case"],
+                  matrix_path,
+                  cfg.get("conc"),
+                  cfg.get("eval_conc"),
+              )
               matches = [
                   cell
                   for cell in matrix.get("include", [])
                   if cell.get("model") == cfg["model"]
-                  and cell.get("topology") == cfg["topology"]
+                  and cell.get("name") == cfg["case"]
               ]
               if not matches:
-                  raise SystemExit(f"No {cfg['model']} {cfg['topology']} cell was generated")
+                  raise SystemExit(f"No {cfg['model']} {cfg['case']} cell was generated")
 
               cell = matches[0]
-              conc = parse_int_list(cfg["conc"])
-              cell["isl"] = isl
-              cell["osl"] = int(cfg["osl"])
-              cell["concurrency"] = conc
-              cell["concurrency_x"] = "x".join(str(value) for value in conc)
-              cell["run_eval"] = bool(cfg["run_eval"])
-              cell["accuracy"]["concurrency"] = parse_int_list(cfg["eval_conc"])
+              if cfg["override_smoke_shape"]:
+                  conc = parse_int_list(cfg["conc"])
+                  cell["isl"] = isl
+                  cell["osl"] = int(cfg["osl"])
+                  cell["concurrency"] = conc
+                  cell["concurrency_x"] = "x".join(str(value) for value in conc)
+                  cell["run_eval"] = True
+                  cell["accuracy"]["concurrency"] = parse_int_list(
+                      cfg["eval_conc"]
+                  )
               cell["runner"]["slurm_submit_runner"] = "aiter-di-ci-spur-login"
               cell["runner"]["slurm_account"] = ""
               cell["runner"]["slurm_partition"] = ""
@@ -499,6 +612,7 @@ jobs:
               cell_path = cells_dir / f"{cell['id']}.json"
               cell_path.write_text(json.dumps(cell, indent=2), encoding="utf-8")
               all_cells.append(cell)
+              combined_matrix["include"].append(cell)
               print(json.dumps(cell, indent=2))
 
           Path("../atomesh-cell.json").write_text(
@@ -515,7 +629,21 @@ jobs:
           )
 
           with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as out:
-              out.write("cell_id=" + ",".join(cell["id"] for cell in all_cells) + "\n")
+              job_matrix = {
+                  "include": [
+                      {
+                          "cell_id": cell["id"],
+                          "model": cell["model"],
+                          "topology": cell["display_topology"],
+                      }
+                      for cell in all_cells
+                  ]
+              }
+              out.write(
+                  "matrix="
+                  + json.dumps(job_matrix, separators=(",", ":"))
+                  + "\n"
+              )
               out.write("node_pool=" + ",".join(node_pool) + "\n")
           PY
       - name: Package patched ATOM source
@@ -534,8 +662,12 @@ jobs:
 
   atom-di-ci-smoke:
     needs: [load-config]
+    name: ${{ matrix.cell_id }}
     runs-on: [self-hosted, aiter-di-ci-spur-login]
     timeout-minutes: 420
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.load-config.outputs.matrix) }}
     env:
       ATOMESH_SHARED_WORKSPACE_ROOT: /data/xinhuang/atomesh-ci
       SPUR_NODE_POOL: ${{ needs.load-config.outputs.node_pool }}
@@ -639,73 +771,54 @@ jobs:
           # ATOMesh Slurm script take its single-rank Spur path.
           unset SPUR_TASK_OFFSET SPUR_PEER_NODES SPUR_NODELIST
 
-          mapfile -t cell_files < <(find "${original_workspace}/atomesh-cells" -maxdepth 1 -name '*.json' | sort)
-          if [[ "${#cell_files[@]}" -eq 0 ]]; then
-            cell_files=("${original_workspace}/atomesh-cell.json")
-          fi
+          cell_id="${{ matrix.cell_id }}"
+          cell_json="${original_workspace}/atomesh-cells/${cell_id}.json"
+          test -f "${cell_json}"
+          shared_workspace="${ATOMESH_SHARED_WORKSPACE_ROOT%/}/${GITHUB_RUN_ID}/${GITHUB_RUN_ATTEMPT}/${cell_id}"
+          rm -rf "${shared_workspace}"
+          mkdir -p "${shared_workspace}"
 
-          for cell_json in "${cell_files[@]}"; do
-            cell_id="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["id"])' "${cell_json}")"
-            shared_workspace="${ATOMESH_SHARED_WORKSPACE_ROOT%/}/${GITHUB_RUN_ID}/${GITHUB_RUN_ATTEMPT}/${cell_id}"
-            rm -rf "${shared_workspace}"
-            mkdir -p "${shared_workspace}"
+          tar -C "${original_workspace}/ATOM" -cf - . | tar \
+            --no-same-owner \
+            --no-same-permissions \
+            -C "${shared_workspace}" \
+            -xf -
 
-            tar -C "${original_workspace}/ATOM" -cf - . | tar \
-              --no-same-owner \
-              --no-same-permissions \
-              -C "${shared_workspace}" \
-              -xf -
+          cd "${shared_workspace}"
+          chmod +x .github/scripts/atomesh/*.sh .github/scripts/atomesh/*.py
+          cancel_helper="${result_dir}/${cell_id}.slurm-cancel.sh"
+          rm -rf "${result_dir}/${cell_id}" \
+                 "${result_dir}/${cell_id}-summary.md" \
+                 "${result_dir}/${cell_id}-benchmark-action.json" \
+                 "${result_dir}/${cell_id}.slurm-job-id" \
+                 "${result_dir}/${cell_id}.slurm-cancel.sh"
 
-            cd "${shared_workspace}"
-            chmod +x .github/scripts/atomesh/*.sh .github/scripts/atomesh/*.py
-            cancel_helper="${result_dir}/${cell_id}.slurm-cancel.sh"
-            rm -rf "${result_dir}/${cell_id}" \
-                   "${result_dir}/${cell_id}-summary.md" \
-                   "${result_dir}/${cell_id}-benchmark-action.json" \
-                   "${result_dir}/${cell_id}.slurm-job-id" \
-                   "${result_dir}/${cell_id}.slurm-cancel.sh"
-
-            bash .github/scripts/atomesh/pd_submit.sh \
-              --cell-json "$(cat "${cell_json}")" \
-              --result-dir "${result_dir}"
-          done
+          bash .github/scripts/atomesh/pd_submit.sh \
+            --cell-json "$(cat "${cell_json}")" \
+            --result-dir "${result_dir}"
       - name: Summarize ATOMesh smoke result
         if: always()
         run: |
           set -euo pipefail
           cd ATOM
           mkdir -p ../atomesh-results
-          if [ -f ../atomesh-cells.json ]; then
-            mapfile -t cell_ids < <(python3 - <<'PY'
-          import json
-          for cell in json.load(open("../atomesh-cells.json")):
-              print(cell["id"])
-          PY
-            )
-          elif [ -f ../atomesh-cell.json ]; then
-            mapfile -t cell_ids < <(python3 -c 'import json; print(json.load(open("../atomesh-cell.json"))["id"])')
-          else
-            cell_ids=()
+          cell_id="${{ matrix.cell_id }}"
+          summary="../atomesh-results/${cell_id}-summary.md"
+          output="../atomesh-results/${cell_id}-benchmark-action.json"
+          python3 .github/scripts/atomesh/process_result.py \
+            "../atomesh-results/${cell_id}" \
+            --output "${output}" \
+            --summary "${summary}" \
+            --run-url "https://github.com/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" || true
+          if [ -f "${summary}" ]; then
+            cat "${summary}" >> "${GITHUB_STEP_SUMMARY}"
+            cat "${summary}"
           fi
-
-          for cell_id in "${cell_ids[@]}"; do
-            summary="../atomesh-results/${cell_id}-summary.md"
-            output="../atomesh-results/${cell_id}-benchmark-action.json"
-            python3 .github/scripts/atomesh/process_result.py \
-              "../atomesh-results/${cell_id}" \
-              --output "${output}" \
-              --summary "${summary}" \
-              --run-url "https://github.com/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" || true
-            if [ -f "${summary}" ]; then
-              cat "${summary}" >> "${GITHUB_STEP_SUMMARY}"
-              cat "${summary}"
-            fi
-          done
       - name: Upload ATOMesh smoke artifacts
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: atom-di-ci-smoke-${{ github.run_id }}-${{ github.run_attempt }}
+          name: atom-di-ci-smoke-${{ matrix.cell_id }}-${{ github.run_id }}-${{ github.run_attempt }}
           if-no-files-found: ignore
           retention-days: 7
           path: |
