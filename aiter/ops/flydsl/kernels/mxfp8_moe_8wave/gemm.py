@@ -98,7 +98,7 @@ class PackedFp4S2R(S2RLoader):
 
 
 class MxMfma:
-    """16x16x128 scaled-MFMA driver (bare atom: ``TiledMma`` has no ``set_value``).
+    """16x16x128 scaled MFMA with per-tile packed scales and byte selectors.
 
     One ``(opsel_a, opsel_b)`` atom per byte pair: in the ``shuffle_scale_w4``
     layout a single i32 carries the E8M0 of two 16-row tiles x two K-steps, and
