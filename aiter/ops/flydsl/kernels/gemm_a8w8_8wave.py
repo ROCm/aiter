@@ -107,10 +107,17 @@ class G2SLoader:
         return fx.make_view(lds_ptr, fx.make_layout(1, 1))
 
     def load(self, lds_dst, k_offset):
+        offsets = fx.make_rmem_tensor((self.n_load_steps,), fx.Int32)
         for step in range_constexpr(self.n_load_steps):
-            src = fx.slice(self.gl_src, (None, fx.Int32(self.gl_offsets[step])))
-            dst = self._lds_dst_at(lds_dst, step)
-            fx.copy(self.g2lds_atom, src, dst, soffset=fx.Int32(k_offset))
+            offsets[step] = fx.Int32(self.gl_offsets[step])
+        # Routed A rows need an indexed copy. The DMA applies the lane offset
+        # implicitly; this view describes only the wave bases for each step.
+        dst = fx.make_view(
+            fx.get_iter(self._lds_dst_at(lds_dst, 0)),
+            fx.make_layout((1, self.n_load_steps), (0, self.n_waves * 1024)),
+        )
+        atom = self.g2lds_atom.set_value("soffset", fx.Int32(k_offset))
+        fx.gather(atom, fx.get_iter(self.gl_src), offsets, dst)
 
     def load_one(self, lds_dst, k_offset, step):
         src = fx.slice(self.gl_src, (None, fx.Int32(self.gl_offsets[step])))
@@ -119,10 +126,22 @@ class G2SLoader:
 
 
 class S2RLoader:
-    def __init__(self, wave_idx, n_tiles):
+    """Load a wave's 16x128 MMA tiles through a 128-bit tiled copy."""
+
+    def __init__(self, wave_idx, n_tiles, *, packed_fp4=False):
         self.lane_id = fx.thread_idx.x % 64
         self.wave_idx = wave_idx
         self.n_tiles = n_tiles
+        self.packed_fp4 = packed_fp4
+        self.copy_atom = fx.make_copy_atom(fx.UniversalCopy(128), fx.Uint8)
+        # Sixteen lanes cover rows; four lane groups cover K. FP4 has half
+        # as many bytes per lane, while preserving the same logical MMA tile.
+        tiled_copy = fx.make_tiled_copy_tv(
+            self.copy_atom,
+            fx.make_layout((16, 4), (1, 16)),
+            fx.make_layout((1, 16 if packed_fp4 else 32), (0, 1)),
+        )
+        self.thr_copy = tiled_copy.get_slice(self.lane_id)
 
     def _vec_load_16xf8(self, lds_src, offset):
         off_tup = fx.make_int_tuple(offset)
@@ -132,21 +151,34 @@ class S2RLoader:
         return view.load()
 
     def load(self, lds_src, preshuffled=False):
-        frag = []
-        for i in range_constexpr(self.n_tiles):
-            halves = []
-            row = self.wave_idx * (self.n_tiles * 16) + i * 16 + self.lane_id % 16
-            for step in range_constexpr(2):
-                col = (self.lane_id // 16) * 16 + step * 64
-                if const_expr(preshuffled):
-                    offset = (row // 8) * 1024 + (row % 8) * 16 + (col // 16) * 128
-                else:
-                    row_swz, col_swz = swizzle_128(row, col)
-                    offset = row_swz * 128 + col_swz
-                v = self._vec_load_16xf8(lds_src, offset)
-                halves.append(v.bitcast(fx.Int32))
-            frag.append(pack_i32x4_i32x8(halves[0], halves[1]))
-        return frag
+        rows = self.n_tiles * 16
+        if const_expr(self.packed_fp4):
+            assert preshuffled, "packed FP4 requires preshuffled weights"
+            offset = self.wave_idx * rows * 64
+            layout = fx.make_layout(((16, rows // 16), (16, 4)), ((16, 1024), (1, 256)))
+        elif const_expr(preshuffled):
+            offset = self.wave_idx * rows * 128
+            layout = fx.make_layout(
+                ((8, rows // 8), (16, 2, 4)), ((16, 1024), (1, 512, 128))
+            )
+        else:
+            offset = self.wave_idx * rows * 128
+            layout = fx.make_composed_layout(
+                fx.static(fx.SwizzleType.get(3, 4, 4)),
+                fx.make_layout((rows, (16, 2, 4)), (128, (1, 64, 16))),
+            )
+        # The split K mode retains the existing two 16-byte halves per FP8
+        # lane. The wave base is a multiple of 2048 bytes, outside the XOR.
+        ptr = fx.recast_iter(
+            fx.Uint8, fx.add_offset(lds_src.ptr, fx.make_int_tuple(offset))
+        )
+        src = self.thr_copy.partition_S(fx.make_view(ptr, layout))
+        frag = fx.make_fragment_like(src)
+        fx.copy(self.copy_atom, src, frag)
+        return [
+            fx.slice(frag, (None, i, 0)).load().bitcast(fx.Int32)
+            for i in range_constexpr(self.n_tiles)
+        ]
 
     def load_one(self, lds_src, lds_offset):
         v = self._vec_load_16xf8(lds_src, lds_offset)

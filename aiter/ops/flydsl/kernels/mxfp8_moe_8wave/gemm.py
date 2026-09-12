@@ -85,18 +85,6 @@ class ScalePreshuffledS2R:
         return words
 
 
-class PackedFp4S2R(S2RLoader):
-    """Read a packed 16x128 FP4 tile from the standard AITER weight layout."""
-
-    def load(self, lds_src, preshuffled=True):
-        fragments = []
-        for i in range_constexpr(self.n_tiles):
-            row = self.wave_idx * (self.n_tiles * 16) + i * 16 + self.lane_id % 16
-            offset = row // 16 * 1024 + row % 16 * 16 + self.lane_id // 16 * 256
-            fragments.append(self._vec_load_16xf8(lds_src, offset).bitcast(fx.Int32))
-        return fragments
-
-
 class MxMfma:
     """16x16x128 scaled MFMA with per-tile packed scales and byte selectors.
 
@@ -368,7 +356,7 @@ def compile_mxfp8_gemm_8w(
             a1_g2s = G2SLoader(a_div, gl_off_a1, N_LDS_STEPS_A, F8_IR_t, wave_id)
             b_g2s = G2SLoader(b_div, gl_off_b, N_LDS_STEPS_B, F8_IR_t, wave_id)
             a_s2r = S2RLoader(wave_m, N_TILES_A)
-            b_s2r = (PackedFp4S2R if b_dtype == "fp4" else S2RLoader)(wave_n, N_TILES_B)
+            b_s2r = S2RLoader(wave_n, N_TILES_B, packed_fp4=b_dtype == "fp4")
             scratch = [
                 a_cur0.ptr,
                 a_cur1.ptr,

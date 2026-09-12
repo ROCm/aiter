@@ -110,7 +110,7 @@ def _store_factory(
                     .to(fx.Int32)
                 )
                 amax_bits = fx.max(amax_bits, bits)
-            amax_bits = fx.max(amax_bits, amax_bits.shuffle_xor(1, 64))
+            amax_bits = fx.max(amax_bits, fx.gpu.shuffle_xor(amax_bits, 1, 64))
             exponent = _mxfp8_exponent(amax_bits)
             scale = (exponent << 23).bitcast(fx.Float32)
             words = []
