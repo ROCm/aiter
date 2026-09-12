@@ -601,11 +601,11 @@ _GEMM_KEEP = [
 # gemm_a4w4 throughput square.
 _GEMM_A4W4_SHAPES = [(tokens, 16384, 16384) for tokens in _TOKENS]
 
+# The million-wide memory-bound case is defined at M=2 by the UT; expanding it
+# over _TOKENS would make the M=65536 fp32 reference alone require 256 GiB.
 _F8GEMM_PERF_SHAPES = {
-    "a8w8": [(tokens, 16384, 8192) for tokens in _TOKENS]
-    + [(tokens, 1048576, 16384) for tokens in _TOKENS],
-    "a8w4": [(tokens, 16384, 16384) for tokens in _TOKENS]
-    + [(tokens, 1048576, 16384) for tokens in _TOKENS],
+    "a8w8": [(tokens, 16384, 8192) for tokens in _TOKENS] + [(2, 1048576, 16384)],
+    "a8w4": [(tokens, 16384, 16384) for tokens in _TOKENS] + [(2, 1048576, 16384)],
 }
 # Curated (gqa_ratio, batch, kv_seq_lens, num_kv_splits) grid for MLA v4 nm
 # kernarg-preload perf (mirrors op_tests/test_mla_v4_kargpreld.py sweep subset).
