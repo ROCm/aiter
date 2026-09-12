@@ -156,10 +156,10 @@ def compile_mixed_moe_gemm1_common(
 
     sort_block_m = tile_m
     num_waves = min(4, tile_n // 32)
-    # accumulators are reduced in LDS before the epilogue. k_wave=1 keeps the
+    # K-wave groups reduce accumulators in LDS before the epilogue.
     num_n_waves = num_waves
     num_waves_total = num_n_waves * k_wave
-    # threads, so the cooperative-load striding is group-local.
+    # Cooperative-load strides stay within each N-wave group.
     a_load_threads = num_n_waves * 64
     total_threads = num_waves_total * 64
     pack_M = 1 if tile_m < 32 else 2

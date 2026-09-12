@@ -126,11 +126,7 @@ FX_ADDRESS_SPACE = {1: fx.AddressSpace.Global, 3: fx.AddressSpace.Shared}
 
 
 def create_llvm_ptr(value, address_space=1):
-    """Raw ``!llvm.ptr<n>`` at *value*, for ops that need one directly.
-
-    The atomicrmw builder and the plain llvm load/store take a raw pointer,
-    which no layout op produces, so the address is formed by hand here.
-    """
+    """Raw LLVM pointer for atomics and intrinsic APIs."""
     # Accept either the LLVM number (1 global / 3 LDS) or an fx.AddressSpace,
     # so a caller cannot silently pass the wrong one.
     space = FX_ADDRESS_SPACE.get(address_space, address_space)

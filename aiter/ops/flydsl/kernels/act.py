@@ -21,6 +21,7 @@ LOG2E = 1.4426950408889634
 
 
 def sigmoid_batch(xs, *, alpha=1.0):
+    """Emit all exponentials before their reciprocals to preserve batch scheduling."""
     e = [
         fx.Float32(rocdl.exp2(T.f32, _raw(x * fx.Float32(-alpha * LOG2E)))) for x in xs
     ]

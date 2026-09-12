@@ -623,16 +623,9 @@ def _build_kernel(
                     )
                     loop_final = yield new_state
 
-                # Tail iter at k=K-1. Gated by `window_len < K`: when wl==K
-                # Phase 2 is empty and the IfOp returns phase1_state.
-                #
-                # KEPT as a raw value-yielding scf.IfOp (measured floor). Both
-                # arms produce the m/kv/w accumulator; a per-lane select is
-                # INVALID here (the then-arm's softmax update reads speculative
-                # pre_* prefetch state that is garbage when wl==K). A local
-                # @flyc.jit returning the branch tuple was TESTED and drifts the
-                # gfx1250 ISA hard (1599 -> 870 lines, wholesale reschedule) --
-                # not byte-exact, so the raw IfOp stays.
+                # Skip the peeled tail when window_len == K: phase 2 is empty,
+                # so its speculative prefetch values are invalid. Preserve
+                # phase1_state without evaluating the tail update.
                 tail_state = list(phase1_state)
                 if fx.Int32(window_len) < fx.Int32(K):
                     m_lane_t = list(loop_final[0:VEC])

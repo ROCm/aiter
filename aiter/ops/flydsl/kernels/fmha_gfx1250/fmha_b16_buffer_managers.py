@@ -190,9 +190,8 @@ def _async_load_to_lds(gptrs, lds_ptrs, *, cluster, imm_offs=None):
 
     for gptr, lds_ptr, imm in zip(gptrs, lds_ptrs, imm_offs):
         if cluster:
-            # FlyDSL 0.3.x b128 op takes (gptr, lds_ptr, offset, mask); its
-            # expr.rocdl.cluster_load_async_to_lds wrapper still passes the old
-            # positional order, so call the dialect op directly with a 0 mask.
+            # The generic wrapper in FlyDSL 0.3.2 uses an older argument order.
+            # The public b128 overload preserves (gptr, lds_ptr, offset, mask).
             mask0 = _ir(fx.Int32(0))
             rocdl.cluster_load_async_to_lds_b128(gptr, lds_ptr, imm, mask0)
         else:

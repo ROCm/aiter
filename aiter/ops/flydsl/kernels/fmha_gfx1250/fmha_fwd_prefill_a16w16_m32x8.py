@@ -258,8 +258,7 @@ def _packed_tile_indices(gqa_ratio, warp_idx, lane_idx):
 
 def _wmma(a, b, c):
     """v_wmma_f32_16x16x32_{bf16,f16} (gfx1250, wave32): C[16x16 f32] = A[16x32] @
-    B[32x16] + C. No fdsl wrapper exists for this op (only mfma/fp8/f4), so we call
-    the raw ODS builder locally.
+    B[32x16] + C. Preserve the SSA-returning intrinsic and disable operand reuse.
 
     a/b: v16 16-bit fragments; c: v8 f32 accumulator; returns the v8 f32 result
     (raw MLIR value, feed straight back as ``c`` to accumulate)."""
