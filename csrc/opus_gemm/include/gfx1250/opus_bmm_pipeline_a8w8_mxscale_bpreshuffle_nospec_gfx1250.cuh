@@ -759,27 +759,49 @@ void bmm_a8w8_mxscale_bpreshuffle_nospec_kernel_gfx1250(opus_bmm_a8w8_mxscale_ka
         const int row_base = tile_row + wave_m * (T::kExpM * T::kWmmaM) + lane_id % T::kWmmaM;
         const int col_base = tile_col + wave_n * (T::kExpN * T::kWmmaN)
                            + (lane_id / T::kWmmaM) * kFragC;
-        opus::static_for<T::kExpM>([&](auto imN) __attribute__((always_inline)) {
-            constexpr int im = decltype(imN)::value;
-            const int row = row_base + im * T::kWmmaM;
-            if (row >= kargs.m) return;
-            DataC* row_ptr = ptr_c + (size_t)row * kargs.stride_c;
-            opus::static_for<T::kExpN>([&](auto inN) __attribute__((always_inline)) {
-                constexpr int in = decltype(inN)::value;
-                const int col = col_base + in * T::kWmmaN;
-                if (col >= kargs.n) return;
-                auto reg_c = opus::cast<DataC>(acc[im][in]);
-                opus::static_for<kFragC / kVec>([&](auto cN) __attribute__((always_inline)) {
-                    constexpr int c = decltype(cN)::value;
-                    CVec v;
-                    opus::static_for<kVec>([&](auto eN) __attribute__((always_inline)) {
-                        constexpr int e = decltype(eN)::value;
-                        v[e] = reg_c[c * kVec + e];
-                    });
-                    *reinterpret_cast<CVec*>(row_ptr + col + c * kVec) = v;
+
+        auto store_frag = [&](auto imN, auto inN) __attribute__((always_inline)) {
+            constexpr int im = decltype(imN)::value, in = decltype(inN)::value;
+            DataC* p = ptr_c + (size_t)(row_base + im * T::kWmmaM) * kargs.stride_c
+                     + col_base + in * T::kWmmaN;
+            auto reg_c = opus::cast<DataC>(acc[im][in]);
+            opus::static_for<kFragC / kVec>([&](auto cN) __attribute__((always_inline)) {
+                constexpr int c = decltype(cN)::value;
+                CVec v;
+                opus::static_for<kVec>([&](auto eN) __attribute__((always_inline)) {
+                    constexpr int e = decltype(eN)::value;
+                    v[e] = reg_c[c * kVec + e];
+                });
+                *reinterpret_cast<CVec*>(p + c * kVec) = v;
+            });
+        };
+
+        // The guards are hoisted into ONE WORKGROUP-UNIFORM test. Written per
+        // fragment instead -- `if (row >= m) return;` inside the static_for --
+        // they are lane-divergent, so each of the kExpM * kExpN fragments becomes
+        // its own exec save/restore region, and every region ends in an
+        // `s_wait_xcnt 0x0` that drains the store before exec is restored. ATT
+        // measured exactly kExpM*kExpN = 32 such sites on kid30 costing 9017
+        // cycles, 8.6% of the kernel, against FlyDSL's zero. A whole tile is in
+        // range for all but the last M and N block, so the uniform branch takes
+        // the fast path nearly always and costs one scalar compare.
+        if (tile_row + T::kBlockM <= kargs.m && tile_col + T::kBlockN <= kargs.n) {
+            opus::static_for<T::kExpM>([&](auto imN) __attribute__((always_inline)) {
+                opus::static_for<T::kExpN>([&](auto inN) __attribute__((always_inline)) {
+                    store_frag(imN, inN);
                 });
             });
-        });
+        } else {
+            opus::static_for<T::kExpM>([&](auto imN) __attribute__((always_inline)) {
+                constexpr int im = decltype(imN)::value;
+                if (row_base + im * T::kWmmaM >= kargs.m) return;
+                opus::static_for<T::kExpN>([&](auto inN) __attribute__((always_inline)) {
+                    constexpr int in = decltype(inN)::value;
+                    if (col_base + in * T::kWmmaN >= kargs.n) return;
+                    store_frag(imN, inN);
+                });
+            });
+        }
     }
 #else
     (void)kargs;   // non-gfx1250 device pass: empty stub (multi-arch wheel safety)
