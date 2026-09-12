@@ -220,7 +220,7 @@ speedup and stage-2 overlap rate):
 
     MORI_V2_KERNEL_BACKEND=hip MEGA_DISPATCH=mori \
     torchrun --standalone --nproc_per_node=4 \
-      op_tests/multigpu_tests/test_mega_moe.py \
+      op_tests/multigpu_tests/bench_mega_moe.py \
       -e 384 -k 6 -hd 7168 -id 3072 \
       --layers 61 -tpr 512 --combine both \
       --acc_verify 0 --profile_table 0
@@ -308,6 +308,13 @@ with _silence():
     import test_mla_v4_kargpreld as mla_v4_kargpreld_mod
     import test_mxfp8fp4gemm as f8gemm_mod
     import torch
+    from aiter.benchmark_data_init import (
+        DATA_DISTS,
+        E8M0_SCALE_DISTS,
+        fill,
+        make_generator,
+    )
+    from aiter.benchmark_reporting import print_json_table
     from aiter.smi_monitor import SMI_RESULT_PREFIX, GpuMonitor
     from flydsl_tests import test_flydsl_grouped_gemm as moe_mod
     from triton_tests.attention import test_mla_v4_triton as mla_v4_triton_mod
@@ -317,12 +324,7 @@ with _silence():
     from aiter import dtypes
     from aiter.jit.utils.chip_info import get_cu_num, get_gfx
     from aiter.test_common import (
-        DATA_DISTS,
-        E8M0_SCALE_DISTS,
         checkAllclose,
-        fill,
-        make_generator,
-        print_json_table,
         run_perftest,
     )
 
@@ -1526,7 +1528,7 @@ def run_mega_moe(args):
     # perRankSize=4294967296. Increase perRankVmmSize at ccoCommCreate". That
     # size is a ccoCommCreate argument with no environment variable behind it
     # (Communicator.DEFAULT_PER_RANK_VMM, 4 GiB), and
-    # test_mega_moe.py calls Communicator.init() without passing it.
+    # bench_mega_moe.py calls Communicator.init() without passing it.
     # MORI_SHMEM_HEAP_SIZE is read only in mori/src/shmem/init.cpp and feeds a
     # different allocator. The same error also prints "Hint: Increase via
     # MORI_SHMEM_HEAP_SIZE" -- that hint is what points the wrong way.
@@ -1535,7 +1537,7 @@ def run_mega_moe(args):
         "torchrun",
         "--standalone",
         "--nproc_per_node=4",
-        "op_tests/multigpu_tests/test_mega_moe.py",
+        "op_tests/multigpu_tests/bench_mega_moe.py",
         "-e",
         "384",
         "-k",
@@ -1634,16 +1636,15 @@ def run_qk_norm(args):
     data_inits = args.data_init or [None]
 
     def run_case(tokens, data_init):
-        qk_init = "normal" if data_init == "norm" else data_init
         _run_child(
             f"qk_norm/T={','.join(map(str, tokens))}/H=128/D=512/RD=64/"
-            f"qweight=both/swa=direct,paged/init={qk_init or 'native-default'}/"
+            f"qweight=both/swa=direct,paged/init={data_init or 'native-default'}/"
             f"seed={args.seed}",
             [
                 *base_cmd,
                 "-T",
                 *map(str, tokens),
-                *(["--init", qk_init] if qk_init else []),
+                *(["--data-init", data_init] if data_init else []),
                 "--seed",
                 str(args.seed),
             ],
