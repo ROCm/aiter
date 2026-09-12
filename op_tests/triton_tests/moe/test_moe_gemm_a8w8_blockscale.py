@@ -7,6 +7,7 @@ import pytest
 import torch
 
 # matmul utilities
+from aiter import logger
 from aiter.ops.triton.moe.moe_op_gemm_a8w8_blockscale import (
     moe_gemm_a8w8_blockscale,
     moe_gemm_torch,
@@ -150,23 +151,25 @@ def assert_close(ref, tri, maxtol=None, rmstol=None, description="--", verbose=T
     rms_err = torch.sqrt(torch.square(rel_err).mean()).item()
 
     if verbose:
-        print(
+        logger.info(
             f"{description} maximum relative error = {max_err} (threshold = {maxtol})"
         )
-        print(f"{description} RMS relative error = {rms_err} (threshold = {rmstol})")
+        logger.info(
+            f"{description} RMS relative error = {rms_err} (threshold = {rmstol})"
+        )
 
     if max_err > maxtol:
         bad_idxs = torch.nonzero(rel_err > maxtol)
         num_nonzero = bad_idxs.size(0)
         bad_idxs = bad_idxs[:1000]
-        print(
+        logger.info(
             f"{num_nonzero} / {rel_err.numel()} mismatched elements "
             f"(shape = {tuple(rel_err.shape)}) at coords {bad_idxs.tolist()}"
         )
 
         bad_idxs = bad_idxs.unbind(-1)
-        print("ref values: ", ref[tuple(bad_idxs)].cpu())
-        print("tri values: ", tri[tuple(bad_idxs)].cpu())
+        logger.info("ref values: %s", ref[tuple(bad_idxs)].cpu())
+        logger.info("tri values: %s", tri[tuple(bad_idxs)].cpu())
 
     assert max_err <= maxtol
     assert rms_err <= rmstol
