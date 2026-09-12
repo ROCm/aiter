@@ -32,7 +32,5 @@ def print_json_table(name, rows, keep=None):
                 if "err_msg" in column and column not in cols
             ]
             df = df[cols]
-    records = json.loads(
-        df.to_json(orient="records", default_handler=_json_default)
-    )
+    records = json.loads(df.to_json(orient="records", default_handler=_json_default))
     print(json.dumps({"name": name, "rows": records}), flush=True)
