@@ -1343,12 +1343,7 @@ def run_f8gemm(args):
 
 def run_a8w8_blockscale(args):
     """Run DSv4 FP8 blockscale linear projections across decode/prefill M."""
-    # AITER_LOG_MORE=1 is set at module scope for the FlyDSL MoE ops, and a
-    # child started with env=None inherits this process's whole environ. In this
-    # UT that turned a clean sweep into an intermittent HSA memory fault, so
-    # drop it for this child only -- every other op keeps it.
     env = os.environ.copy()
-    env.pop("AITER_LOG_MORE", None)
     nk_shapes = (
         (2048, 7168),
         (7168, 16384),
