@@ -5,8 +5,10 @@
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-from flydsl._mlir import ir as _ir
-from flydsl._mlir.dialects import llvm as _llvm_d
+
+# Raw dialect, and the only one here: `global_load_lds` has no fx wrapper (the
+# expr/rocdl surface stops at the buffer form). Pointers still go through
+# `fx.to_llvm_ptr`, so no address space is hardcoded.
 from flydsl._mlir.dialects import rocdl as _rocdl_d
 from flydsl.expr import T, const_expr, range_constexpr, rocdl
 from flydsl.expr.rocdl import cvt_pk_f32_fp8
@@ -33,17 +35,12 @@ N_WAVES = 8  # 512 threads
 BLOCK_K = 128  # fixed by MFMA_Scale(16, 16, 128)
 
 
-def _ir_ptr(space: int):
-    """``!llvm.ptr<space>`` -- the raw ROCDL ops take these, not ``!fly.ptr``."""
-    return _ir.Type.parse(f"!llvm.ptr<{space}>")
-
-
 def _raw(v):
     return v.ir_value() if hasattr(v, "ir_value") else v
 
 
 def _gather_a_offsets(
-    kvi_div, m_base, lane_id, wave_id, n_rounds, half_row_off, kv_base=None
+    kvi_div, m_base, lane_id, wave_id, n_rounds, half_row_off, wide=False
 ):
     """Per-lane A sources: gathered kv_cache row + the stock XOR-swizzled column.
 
@@ -58,10 +55,10 @@ def _gather_a_offsets(
     invariant across rounds and halves -- one VGPR for the whole tile rather
     than re-emitting ``swizzle_128``'s divide chain per step.
 
-    Element offsets by default; with ``kv_base``, the cache's address, absolute
-    64-bit byte addresses. Row and column widen together here because they are
-    added here: split across two functions the two widths could disagree, and
-    an i32 sum of a 64-bit address is not an error, just a wrong row.
+    Offsets are in fp8 elements; ``wide`` makes them 64-bit, for a cache the
+    32-bit form can no longer reach. Row and column widen together here because
+    they are added here: split across two functions the widths could disagree,
+    and an i32 sum against a 64-bit row is not an error, just a wrong row.
     """
     atom = fx.make_copy_atom(fx.rocdl.BufferCopy32b(), fx.Int32)
     regs = []
@@ -74,11 +71,9 @@ def _gather_a_offsets(
     mask = ((lane_id // 8 + (wave_id % 2) * 8) // 2) * 16
     col = ((lane_id % 8) * 16) ^ mask
     idxs = [Vec(fx.memref_load_vec(reg))[0] for reg in regs]
-    if kv_base is None:
+    if not wide:
         return [i * KV_ROW_ELEMS + col for i in idxs]
-    return [
-        kv_base + fx.Int64(i) * fx.Int64(KV_ROW_ELEMS) + fx.Int64(col) for i in idxs
-    ]
+    return [fx.Int64(i) * fx.Int64(KV_ROW_ELEMS) + fx.Int64(col) for i in idxs]
 
 
 class _WideG2SLoader:
@@ -96,10 +91,13 @@ class _WideG2SLoader:
     faults instead of returning zeros.
     """
 
-    LDS_BYTES_PER_WAVE_STEP = 1024  # 64 lanes x 16 B
+    # 64 lanes x 16 B. Both sides count fp8 elements, which are 1 B, so this is
+    # an element step too.
+    LDS_ELEMS_PER_WAVE_STEP = 1024
 
-    def __init__(self, gl_addrs, n_load_steps, wave_id, lane_id):
-        self.gl_addrs = gl_addrs
+    def __init__(self, kv_ptr, gl_offsets, n_load_steps, wave_id, lane_id):
+        self.kv_ptr = kv_ptr
+        self.gl_offsets = gl_offsets
         self.n_load_steps = n_load_steps
         self.wave_id = wave_id
         self.lane_id = lane_id
@@ -107,21 +105,13 @@ class _WideG2SLoader:
 
     def load(self, lds_dst, k_offset):
         for step in range_constexpr(self.n_load_steps):
-            step_off = self.wave_id * self.LDS_BYTES_PER_WAVE_STEP + step * (
-                self.n_waves * self.LDS_BYTES_PER_WAVE_STEP
+            step_off = self.wave_id * self.LDS_ELEMS_PER_WAVE_STEP + step * (
+                self.n_waves * self.LDS_ELEMS_PER_WAVE_STEP
             )
-            lds_off = (
-                fx.Int32(fx.ptrtoint(lds_dst.ptr))
-                + fx.Int32(step_off)
-                + self.lane_id * 16
-            )
+            src = fx.add_offset(self.kv_ptr, self.gl_offsets[step] + fx.Int64(k_offset))
+            dst = fx.add_offset(lds_dst.ptr, fx.Int32(step_off) + self.lane_id * 16)
             _rocdl_d.global_load_lds(
-                _llvm_d.inttoptr(
-                    _ir_ptr(1), _raw(self.gl_addrs[step] + fx.Int64(k_offset))
-                ),
-                _llvm_d.inttoptr(_ir_ptr(3), _raw(lds_off)),
-                16,
-                0,
+                _raw(fx.to_llvm_ptr(src)), _raw(fx.to_llvm_ptr(dst)), 16, 0
             )
 
 
@@ -359,17 +349,12 @@ class _RopeCopy:
         block_m,
         nope,
         n_heads,
-        kv_base=None,
+        kv_ptr=None,
     ):
-        # kv_base set: the cache outgrew a descriptor, so `a_div` is None and
-        # each rope row is reached by its own 64-bit address.
+        # kv_ptr set: the cache outgrew a descriptor, so `a_div` is None and each
+        # rope row is reached by a 64-bit offset off the cache pointer instead.
         self.a_div = a_div
-        self.kv_base = kv_base
-        self.f8_ptr_t = (
-            None
-            if kv_base is None
-            else fx.PointerType.get(fx.Float8E4M3FN.ir_type, fx.AddressSpace.Global, 16)
-        )
+        self.kv_ptr = kv_ptr
         self.kvi_div = kvi_div
         self.kp_div = kp_div
         self.m_base = m_base
@@ -381,7 +366,7 @@ class _RopeCopy:
         self.atom32 = fx.make_copy_atom(fx.rocdl.BufferCopy32b(), fx.Int32)
         # Wide form has no descriptor to load through, so a plain global load.
         self.ld = fx.make_copy_atom(
-            fx.rocdl.BufferCopy128b() if kv_base is None else fx.UniversalCopy128b(),
+            fx.rocdl.BufferCopy128b() if kv_ptr is None else fx.UniversalCopy128b(),
             fx.Float8E4M3FN,
         )
         self.st = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), fx.BFloat16)
@@ -408,9 +393,8 @@ class _RopeCopy:
             idx = Vec(fx.memref_load_vec(self.iregs[_p]))[0]
             rope_src = (
                 idx * KV_ROW_ELEMS + KV_C_DIM + self.half * 32
-                if self.kv_base is None
-                else self.kv_base
-                + fx.Int64(idx) * fx.Int64(KV_ROW_ELEMS)
+                if self.kv_ptr is None
+                else fx.Int64(idx) * fx.Int64(KV_ROW_ELEMS)
                 + fx.Int64(KV_C_DIM + self.half * 32)
             )
             self.bases.append(
@@ -434,10 +418,10 @@ class _RopeCopy:
             ):  # 2 x 16 fp8 = the 32 elements this lane owns
                 src = (
                     fx.slice(self.a_div, (None, self.bases[_p][0] + sub * 16))
-                    if self.kv_base is None
+                    if self.kv_ptr is None
                     else fx.make_view(
-                        fx.inttoptr(
-                            self.f8_ptr_t, self.bases[_p][0] + fx.Int64(sub * 16)
+                        fx.add_offset(
+                            self.kv_ptr, self.bases[_p][0] + fx.Int64(sub * 16)
                         ),
                         fx.make_layout(16, 1),
                     )
@@ -588,24 +572,20 @@ def compile_gather_kv_b_proj_8w(
         # shapes as i32, and this one passes 2**31 elements (2 GiB of fp8) while
         # the descriptor still reaches 4 GiB. The extent comes alongside, as
         # `kv_num_blocks`, and only ever widens in 64-bit.
+        # fp8 view of it, so every A offset below counts elements whichever form
+        # runs.
+        kv_f8 = fx.recast_iter(
+            fx.PointerType.get(F8_IR_t, KV_cache.address_space), KV_cache
+        )
         # Python-level branch: only one of the two forms is traced.
-        kv_base = fx.Int64(fx.ptrtoint(KV_cache)) if wide_index else None
         a_div = (
             None
-            if wide_index
+            if const_expr(wide_index)
             else rocdl.make_buffer_tensor(
                 # Flat-index carrier, as in causal_conv1d's `_view`: 16 is the
                 # widest unit A copies, and the unit strides let a flat element
                 # index reach anywhere. num_records, not the layout, bounds it.
-                fx.Tensor(
-                    fx.make_view(
-                        fx.recast_iter(
-                            fx.PointerType.get(F8_IR_t, KV_cache.address_space),
-                            KV_cache,
-                        ),
-                        fx.make_layout((16, 1), (1, 1)),
-                    )
-                ),
+                fx.Tensor(fx.make_view(kv_f8, fx.make_layout((16, 1), (1, 1)))),
                 max_size=False,
                 num_records_bytes=fx.Int64(kv_num_blocks) * fx.Int64(KV_ROW_ELEMS),
             )
@@ -620,10 +600,10 @@ def compile_gather_kv_b_proj_8w(
 
         # Index loads must precede the first G2S load -- see wait_barrier.
         gl_off_a0 = _gather_a_offsets(
-            kvi_div, m_base, lane_id, wave_id, N_LDS_ROUNDS, 0, kv_base
+            kvi_div, m_base, lane_id, wave_id, N_LDS_ROUNDS, 0, wide_index
         )
         gl_off_a1 = _gather_a_offsets(
-            kvi_div, m_base, lane_id, wave_id, N_LDS_ROUNDS, LDS_BLOCK_M, kv_base
+            kvi_div, m_base, lane_id, wave_id, N_LDS_ROUNDS, LDS_BLOCK_M, wide_index
         )
         gl_off_b = compute_global_swizzle(
             lane_id, wave_id, K, N_LDS_ROUNDS, preshuffled=weight_preshuffle
@@ -636,12 +616,12 @@ def compile_gather_kv_b_proj_8w(
         # Two A loaders: the stock kernel separates the halves via soffset, but
         # with a gather the half offset lives in the row index instead.
         a0_g2s = (
-            _WideG2SLoader(gl_off_a0, N_LDS_STEPS_A, wave_id, lane_id)
+            _WideG2SLoader(kv_f8, gl_off_a0, N_LDS_STEPS_A, wave_id, lane_id)
             if const_expr(wide_index)
             else G2SLoader(a_div, gl_off_a0, N_LDS_STEPS_A, F8_IR_t, wave_id)
         )
         a1_g2s = (
-            _WideG2SLoader(gl_off_a1, N_LDS_STEPS_A, wave_id, lane_id)
+            _WideG2SLoader(kv_f8, gl_off_a1, N_LDS_STEPS_A, wave_id, lane_id)
             if const_expr(wide_index)
             else G2SLoader(a_div, gl_off_a1, N_LDS_STEPS_A, F8_IR_t, wave_id)
         )
@@ -775,7 +755,7 @@ def compile_gather_kv_b_proj_8w(
             BLOCK_M,
             nope,
             n_heads,
-            kv_base,
+            kv_f8 if const_expr(wide_index) else None,
         )
         rope.load_idx()
         store.prefetch_scales(head, wave_n * (N_TILES_B * 16))
