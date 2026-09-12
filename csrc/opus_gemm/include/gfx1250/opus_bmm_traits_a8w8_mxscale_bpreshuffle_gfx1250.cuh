@@ -1822,6 +1822,38 @@ using opus_bmm_a8w8_mxscale_bpreshuffle_tile_ns256_gn128_sf_bk256_gfx1250 =
         /*SF_A_LDS*/true, /*SF_B_LDS*/true,
         /*SF_A_TDM_KG*/0, /*SF_A_TDM_PAD*/16, /*TILE_M*/2, /*NO_SPEC*/true>;
 
+// kid36: kid27 at B_K=256 / slots=2, the per-column twin of kid35.
+//
+// kid27 is the only tile the heuristics still dispatch with kExpK=1 -- every
+// other reachable kid (0, 6, 7, 8, 10, 31, 35) is already 2. Same reasoning as
+// kid35: at kExpK=1 a fragment's ds_read is issued in the only ik that consumes
+// it, so nothing hides its latency, and doubling B_K gives the scheduler a
+// second ik to overlap against. It cost kid35 nothing but ring depth and bought
+// 13%-27%.
+//
+// Cheaper on LDS than kid35 because the per-column family stages no scale
+// panels: 2 * (256*144 + 16*4096) = 200 KB flat.
+//
+// MEASURED, AND IT DOES NOT REPLICATE kid35: flat to 12.7% SLOWER than kid27
+// across b 2..16 x m 512..4096 (worst at b=16 m=4096), output bit-identical.
+// The trade is not the same one. kid35's family stages both scale panels in
+// LDS, so shortening the ring costs it nothing; this family has SF_A_LDS and
+// SF_B_LDS false and re-reads the e8m0 bytes from GLOBAL every K-step, with a
+// per-lane gather at GROUP_N=1 -- slots=3 is what was covering that latency,
+// and kExpK=2 does not pay for losing it.
+//
+// So the rule is: B_K=256 / slots=2 pays only where the scales already live in
+// LDS. NOT dispatched; kept as the control that says so.
+template <typename DataC>
+using opus_bmm_a8w8_mxscale_bpreshuffle_tile_ns256_bk256_gfx1250 =
+    opus_bmm_a8w8_mxscale_bpreshuffle_traits_gfx1250<
+        /*BLOCK_SIZE*/256, /*B_M*/256, /*B_N*/256, /*B_K*/256,
+        /*LAYOUT*/opus_gfx1250_bmm::kLayoutTileN,
+        /*D_A*/opus::fp8_t, /*D_B*/opus::fp8_t, /*D_C*/DataC, /*D_ACC*/float,
+        /*GROUP_K*/128, /*NUM_SLOTS*/2, /*WG_PER_CU*/1, /*GROUP_N*/1,
+        /*SF_A_LDS*/false, /*SF_B_LDS*/false,
+        /*SF_A_TDM_KG*/0, /*SF_A_TDM_PAD*/16, /*TILE_M*/2, /*NO_SPEC*/true>;
+
 // -- smem -> register read layouts -----------------------------------------
 // Device-only in effect, but compiled on the host pass too so vtype_c matches.
 #if defined(__gfx1250__) || !defined(__HIP_DEVICE_COMPILE__)
