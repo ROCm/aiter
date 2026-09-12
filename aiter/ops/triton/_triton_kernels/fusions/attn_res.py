@@ -36,6 +36,7 @@ _attnres_fwd_kernel_repr = make_kernel_repr(
         "WRITE_BLOCK_CAT",
         "HAS_W",
         "QUANT_FP8",
+        "SEPARATE",
     ],
 )
 
@@ -86,6 +87,7 @@ def attnres_fwd_kernel(
     HAS_W: tl.constexpr,
     QUANT_FP8: tl.constexpr,
     FP8_MAX: tl.constexpr,
+    SEPARATE: tl.constexpr = False,
 ):
     """AttnRes forward, ported from fla 0.5.2 ``attnres_fwd_kernel``.
 
@@ -128,10 +130,12 @@ def attnres_fwd_kernel(
     re-reading a BF16 ``o`` through a standalone quant kernel -- and when several
     GEMMs consume the same row (Kimi-K3's ``fused_qkv_a_proj`` + ``g_proj`` both
     read the attention input) that quant runs once here rather than once per
-    consumer. The scale derivation matches aiter's standalone per-token quant
-    (``_dynamic_per_token_quant_fp8_i8_kernel``). ``block_out`` is deliberately
-    left unquantized: those rows come back as scoring candidates on a later call,
-    where the per-candidate RMSNorm needs the full-precision values.
+    consumer. The scale derivation is bit-exact against the HIP per-token quant
+    (``get_hip_quant(QuantType.per_Token)``), which is what a consumer runs when
+    this fold is off -- including the zero scale on an all-zero row. ``block_out``
+    is deliberately left unquantized: those rows come back as scoring candidates
+    on a later call, where the per-candidate RMSNorm needs the full-precision
+    values.
 
     ``o_pre`` / ``rstd`` / ``logit`` / ``lse`` are the fla backward checkpoint; this
     is a forward-only port, so ``SAVE_OPRE`` / ``SAVE_STATS`` are off and those
@@ -177,103 +181,173 @@ def attnres_fwd_kernel(
     else:
         n_res = L
 
-    # online softmax over L; b_o accumulates in registers so each v tile is read once
-    b_m = tl.full([], float("-inf"), dtype=tl.float32)
-    b_acc = tl.zeros([], dtype=tl.float32)
-    b_o = tl.zeros([BD], dtype=tl.float32)
-    for i_l in range(tl.cdiv(L, BL)):
-        # [BL]
-        o_l = i_l * BL + tl.arange(0, BL)
-        m_l = o_l < L
-
-        # [BL, BD] candidate tile
-        if IS_PACKED:
-            if HAS_PREFIX:
-                m_res = o_l < n_res
-                l_safe = tl.minimum(o_l, tl.maximum(n_res - 1, 0))
-            else:
-                m_res = m_l
-                # Clamp padded lanes (o_l >= L when L is not a power of 2) to the
-                # last valid row so their address stays in-bounds; they are masked
-                # out anyway. Avoids the buffer-ops OOB sentinel (0x80000000) path
-                # that faults on gfx1250 when the drop is not honored.
-                l_safe = tl.minimum(o_l, L - 1)
-            b_v = tl.load(
-                res_packed
-                + i_n * stride_res_n
-                + l_safe[:, None] * stride_res_l
-                + o_d[None, :],
-                mask=m_res[:, None] & m_d[None, :],
-                other=0.0,
-            ).to(tl.float32)
-            if HAS_PREFIX:
+    # Online softmax over L; b_o accumulates in registers so each v tile is read
+    # once. Both branches leave the same (b_o, b_acc) for the shared epilogue
+    # below; SEPARATE is a constexpr, so only the taken branch is ever traced.
+    if SEPARATE:
+        b_ps_rstd = tl.rsqrt(tl.sum(ps * ps, axis=0) * (1.0 / D) + eps)
+        b_m = tl.sum(ps * b_qw, axis=0) * b_ps_rstd * scale
+        b_acc = tl.full([], 1.0, dtype=tl.float32)
+        b_o = ps
+        if BL == 1:
+            for i_l in range(n_res):
+                b_v = tl.load(
+                    res_packed + i_n * stride_res_n + i_l * stride_res_l + o_d,
+                    mask=m_d,
+                    other=0.0,
+                ).to(tl.float32)
                 if WRITE_BLOCK_CAT:
-                    # Copy-through: these are exactly the block_residual rows
-                    # this tile already paid to load, relocated into the wider
-                    # output at the same [n, l, :] slot. m_res confines the
-                    # store to real rows (l < n_res), safe even in the last,
-                    # partial tile; l_safe (already computed for the load above)
-                    # keeps the address in-bounds for masked-off lanes too, same
-                    # OOB-sentinel-fault concern as that load on gfx1250.
+                    tl.store(
+                        block_out + i_n * stride_bo_n + i_l * stride_bo_l + o_d,
+                        b_v.to(block_out.dtype.element_ty),
+                        mask=m_d,
+                    )
+                b_rstd = tl.rsqrt(tl.sum(b_v * b_v, axis=0) * (1.0 / D) + eps)
+                b_s = tl.sum(b_v * b_qw, axis=0) * b_rstd * scale
+                b_mp = b_m
+                b_m = tl.maximum(b_m, b_s)
+                b_r = tl.exp(b_mp - b_m)
+                b_p = tl.exp(b_s - b_m)
+                b_acc = b_acc * b_r + b_p
+                b_o = b_o * b_r + b_p * b_v
+        else:
+            for i_l in range(tl.cdiv(n_res, BL)):
+                o_l = i_l * BL + tl.arange(0, BL)
+                m_l = o_l < n_res
+                l_safe = tl.minimum(o_l, tl.maximum(n_res - 1, 0))
+                b_v = tl.load(
+                    res_packed
+                    + i_n * stride_res_n
+                    + l_safe[:, None] * stride_res_l
+                    + o_d[None, :],
+                    mask=m_l[:, None] & m_d[None, :],
+                    other=0.0,
+                ).to(tl.float32)
+                if WRITE_BLOCK_CAT:
                     tl.store(
                         block_out
                         + i_n * stride_bo_n
                         + l_safe[:, None] * stride_bo_l
                         + o_d[None, :],
                         b_v.to(block_out.dtype.element_ty),
-                        mask=m_res[:, None] & m_d[None, :],
+                        mask=m_l[:, None] & m_d[None, :],
                     )
-                # broadcast the prefix row into the last candidate while in-reg
-                b_v = tl.where((o_l == n_res)[:, None], ps[None, :], b_v)
-        else:
-            # AMD-safe gather: scan the padded slots, mask in the matching row.
-            b_v = tl.zeros([BL, BD], dtype=tl.float32)
-            for i in tl.static_range(0, L2):
-                b_v += tl.load(
-                    tl.multiple_of(res[i] + (i_n * D + o_d[None, :]), (1, 16)),
-                    mask=(o_l == i)[:, None] & m_l[:, None] & m_d[None, :],
+                b_rstd = tl.rsqrt(tl.sum(b_v * b_v, axis=1) * (1.0 / D) + eps)
+                b_s = tl.where(
+                    m_l,
+                    tl.sum(b_v * b_qw[None, :], axis=1) * b_rstd * scale,
+                    float("-inf"),
+                )
+                b_m, b_mp = tl.maximum(b_m, tl.max(b_s, axis=0)), b_m
+                b_r = tl.exp(b_mp - b_m)
+                b_p = tl.exp(b_s - b_m)
+                b_acc = b_acc * b_r + tl.sum(b_p, axis=0)
+                b_o = b_o * b_r + tl.sum(b_p[:, None] * b_v, axis=0)
+    else:
+        b_m = tl.full([], float("-inf"), dtype=tl.float32)
+        b_acc = tl.zeros([], dtype=tl.float32)
+        b_o = tl.zeros([BD], dtype=tl.float32)
+        for i_l in range(tl.cdiv(L, BL)):
+            # [BL]
+            o_l = i_l * BL + tl.arange(0, BL)
+            m_l = o_l < L
+
+            # [BL, BD] candidate tile
+            if IS_PACKED:
+                if HAS_PREFIX:
+                    m_res = o_l < n_res
+                    l_safe = tl.minimum(o_l, tl.maximum(n_res - 1, 0))
+                else:
+                    m_res = m_l
+                    # Clamp padded lanes (o_l >= L when L is not a power of 2) to the
+                    # last valid row so their address stays in-bounds; they are masked
+                    # out anyway. Avoids the buffer-ops OOB sentinel (0x80000000) path
+                    # that faults on gfx1250 when the drop is not honored.
+                    l_safe = tl.minimum(o_l, L - 1)
+                b_v = tl.load(
+                    res_packed
+                    + i_n * stride_res_n
+                    + l_safe[:, None] * stride_res_l
+                    + o_d[None, :],
+                    mask=m_res[:, None] & m_d[None, :],
                     other=0.0,
                 ).to(tl.float32)
+                if HAS_PREFIX:
+                    if WRITE_BLOCK_CAT:
+                        # Copy-through: these are exactly the block_residual rows
+                        # this tile already paid to load, relocated into the wider
+                        # output at the same [n, l, :] slot. m_res confines the
+                        # store to real rows (l < n_res), safe even in the last,
+                        # partial tile; l_safe (already computed for the load above)
+                        # keeps the address in-bounds for masked-off lanes too, same
+                        # OOB-sentinel-fault concern as that load on gfx1250.
+                        tl.store(
+                            block_out
+                            + i_n * stride_bo_n
+                            + l_safe[:, None] * stride_bo_l
+                            + o_d[None, :],
+                            b_v.to(block_out.dtype.element_ty),
+                            mask=m_res[:, None] & m_d[None, :],
+                        )
+                    # broadcast the prefix row into the last candidate while in-reg
+                    b_v = tl.where((o_l == n_res)[:, None], ps[None, :], b_v)
+            else:
+                # AMD-safe gather: scan the padded slots, mask in the matching row.
+                b_v = tl.zeros([BL, BD], dtype=tl.float32)
+                for i in tl.static_range(0, L2):
+                    b_v += tl.load(
+                        tl.multiple_of(res[i] + (i_n * D + o_d[None, :]), (1, 16)),
+                        mask=(o_l == i)[:, None] & m_l[:, None] & m_d[None, :],
+                        other=0.0,
+                    ).to(tl.float32)
 
-        # [BL] per-candidate RMSNorm + logit
-        b_rstd = tl.rsqrt(tl.sum(b_v * b_v, axis=1) / D + eps)
-        b_logit = tl.sum(b_v * b_qw[None, :], axis=1) * b_rstd
-        b_s = tl.where(m_l, b_logit * scale, float("-inf"))
+            # [BL] per-candidate RMSNorm + logit
+            b_rstd = tl.rsqrt(tl.sum(b_v * b_v, axis=1) * (1.0 / D) + eps)
+            b_logit = tl.sum(b_v * b_qw[None, :], axis=1) * b_rstd
+            b_s = tl.where(m_l, b_logit * scale, float("-inf"))
 
-        b_m, b_mp = tl.maximum(b_m, tl.max(b_s, axis=0)), b_m
-        b_r = tl.exp(b_mp - b_m)
-        # [BL]
-        b_p = tl.exp(b_s - b_m)
-        b_acc = b_acc * b_r + tl.sum(b_p, axis=0)
-        # [BD]
-        b_o = b_o * b_r + tl.sum(b_p[:, None] * b_v, axis=0)
+            b_m, b_mp = tl.maximum(b_m, tl.max(b_s, axis=0)), b_m
+            b_r = tl.exp(b_mp - b_m)
+            # [BL]
+            b_p = tl.exp(b_s - b_m)
+            b_acc = b_acc * b_r + tl.sum(b_p, axis=0)
+            # [BD]
+            b_o = b_o * b_r + tl.sum(b_p[:, None] * b_v, axis=0)
 
-        # rstd and logit are the fla bwd_dv checkpoint; off in this forward-only port
+            # rstd and logit are the fla bwd_dv checkpoint; off in this forward-only port
+            if SAVE_STATS:
+                p_rstd = rstd + i_n + o_l * N
+                p_logit = logit + i_n + o_l * N
+                tl.store(p_rstd, b_rstd.to(rstd.dtype.element_ty), mask=m_l)
+                tl.store(p_logit, b_logit.to(logit.dtype.element_ty), mask=m_l)
+
         if SAVE_STATS:
-            p_rstd = rstd + i_n + o_l * N
-            p_logit = logit + i_n + o_l * N
-            tl.store(p_rstd, b_rstd.to(rstd.dtype.element_ty), mask=m_l)
-            tl.store(p_logit, b_logit.to(logit.dtype.element_ty), mask=m_l)
-
-    if SAVE_STATS:
-        tl.store(lse + i_n, b_m + tl.log(b_acc))
+            tl.store(lse + i_n, b_m + tl.log(b_acc))
 
     # [BD] pre-norm mixed residual sum_l p_l * v_l
-    b_o = b_o / b_acc
+    b_o = b_o * (1.0 / b_acc)
     if SAVE_OPRE:
         tl.store(o_pre + i_n * D + o_d, b_o.to(o_pre.dtype.element_ty), mask=m_d)
     # fold the optional output RMSNorm into the returned output o
     if HAS_ONORM:
-        b_o_rstd = tl.rsqrt(tl.sum(tl.where(m_d, b_o * b_o, 0.0), axis=0) / D + out_eps)
+        b_o_rstd = tl.rsqrt(
+            tl.sum(tl.where(m_d, b_o * b_o, 0.0), axis=0) * (1.0 / D) + out_eps
+        )
         b_ow = tl.load(ow + o_d, mask=m_d, other=0.0).to(tl.float32)
         b_o = b_o * b_o_rstd * b_ow
     if QUANT_FP8:
         b_amax = tl.max(tl.abs(tl.where(m_d, b_o, 0.0)), axis=0)
-        # An all-zero row has no scale to derive; 1.0 keeps its quantized values
-        # at zero instead of dividing by zero.
-        b_oscale = tl.where(b_amax > 0.0, b_amax / FP8_MAX, 1.0)
+        # amax * (1/FP8_MAX), not amax / FP8_MAX. Triton lowers an fp32 divide on
+        # AMD to a reciprocal plus a refinement step, which lands 1 ulp off the
+        # HIP per-token quant (`absMax * inverted_DTYPE_MAX`, quant_kernels.cu)
+        # on roughly half of all rows. Consumers use the two interchangeably for
+        # the same activation, so the scales have to agree bit for bit.
+        b_oscale = b_amax * (1.0 / FP8_MAX)
         tl.store(o_scale + i_n, b_oscale.to(o_scale.dtype.element_ty))
-        b_o = b_o * (1.0 / b_oscale)
+        # An all-zero row therefore gets scale 0, matching the HIP path. Its
+        # reciprocal is forced to 0 rather than left as inf: the row dequantizes
+        # to zero under either convention, but inf would store NaN.
+        b_o = b_o * tl.where(b_oscale > 0.0, 1.0 / b_oscale, 0.0)
     tl.store(o + i_n * D + o_d, b_o.to(o.dtype.element_ty), mask=m_d)
 
 
