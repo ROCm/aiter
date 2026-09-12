@@ -59,6 +59,7 @@ REPRO_BPRESHUFFLE_CSV = os.path.join(
 TARGET_A = ("gfx942", 304)  # MI300X
 TARGET_B = ("gfx950", 256)  # MI350
 TARGET_C = ("gfx942", 80)  # MI308X — gfx942 with CU_NUM override
+TARGET_D = ("gfx90a", 104)  # MI210 / MI250 (per GCD); MI250X is 110 — CU_NUM override
 
 # ---------------------------------------------------------------------------
 # Minimal test harness (no external test framework required)
@@ -118,6 +119,24 @@ def test_get_build_targets():
         os.environ["GPU_ARCHS"] = TARGET_B[0]
         t = get_build_targets_env()
         _check(f"GPU_ARCHS={TARGET_B[0]} → [{TARGET_B}]", t == [TARGET_B], str(t))
+
+        # 1.3b CDNA2. gfx90a is listed in GFX_MAP but was absent from
+        # GFX_CU_NUM_MAP, so an explicit GPU_ARCHS=gfx90a build raised
+        # "Unknown gfx" before any kernel could be generated.
+        os.environ["GPU_ARCHS"] = TARGET_D[0]
+        t = get_build_targets_env()
+        _check(f"GPU_ARCHS={TARGET_D[0]} → [{TARGET_D}]", t == [TARGET_D], str(t))
+
+        # 1.3c CU_NUM override on gfx90a (MI250X is 110 CUs per GCD)
+        os.environ["GPU_ARCHS"] = TARGET_D[0]
+        os.environ["CU_NUM"] = "110"
+        t = get_build_targets_env()
+        _check(
+            f"GPU_ARCHS={TARGET_D[0]} + CU_NUM=110 → [('{TARGET_D[0]}', 110)]",
+            t == [(TARGET_D[0], 110)],
+            str(t),
+        )
+        del os.environ["CU_NUM"]
 
         # 1.4 Multi-arch (semicolon-separated)
         os.environ["GPU_ARCHS"] = f"{TARGET_A[0]};{TARGET_B[0]}"
