@@ -401,10 +401,7 @@ def get_trace_perf(prof, num_iters):
             df.at[avg_name, el] = df[el].sum() / actual_iters
     if int(os.environ.get("AITER_LOG_MORE", "0")):
         pd.set_option("display.expand_frame_repr", False)
-        # Keep complete profiler kernel symbols.  The gfx1250 combo benchmark
-        # consumes this table to attach the actual launched kernels to JSON
-        # result rows, so truncating here also truncates the structured output.
-        pd.set_option("display.max_colwidth", None)
+        pd.set_option("display.max_colwidth", 90)
         pd.set_option("display.float_format", "{:,.1f}".format)
         logger.info(f"{df}")
     return df.at[avg_name, "device_time_sum"]
