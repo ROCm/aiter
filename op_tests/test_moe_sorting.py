@@ -296,6 +296,50 @@ def test_moe_sorting(
     return ret
 
 
+def test_moe_sorting_output_aux(dtype, token, model_dim, E, topk):
+    topk_ids, topk_weights, _, _ = _build_moe_sorting_inputs(
+        token,
+        model_dim,
+        E,
+        topk,
+        dtype,
+        has_expert_mask=False,
+        padding_extra=0,
+    )
+    ref = run_torch_moe_sorting(topk_ids, topk_weights, E, BLOCK_SIZE_M)
+    out = moe_sorting(
+        topk_ids,
+        topk_weights,
+        E,
+        model_dim,
+        dtype,
+        BLOCK_SIZE_M,
+        accumulate=True,
+        output_aux=True,
+    )
+    errs = _compare_moe_sorting_outputs(ref, out, topk, token)
+    failures = {name: err for name, err in errs.items() if err}
+    if failures:
+        raise AssertionError(f"moe_sorting output_aux mismatch: {failures}")
+
+    sorted_ids, _, sorted_expert_ids, _, moe_buf, m_indices, reverse_sorted = out
+    routes = torch.arange(token * topk, dtype=torch.int32, device="cuda")
+    sorted_positions = reverse_sorted[routes]
+    token_ids = routes.div(topk, rounding_mode="floor")
+    slot_ids = routes.remainder(topk)
+
+    torch.testing.assert_close(
+        sorted_ids[sorted_positions],
+        (slot_ids << 24) | token_ids,
+    )
+    torch.testing.assert_close(m_indices[sorted_positions], token_ids)
+    torch.testing.assert_close(
+        sorted_expert_ids[sorted_positions.div(BLOCK_SIZE_M, rounding_mode="floor")],
+        topk_ids.flatten(),
+    )
+    torch.testing.assert_close(moe_buf, torch.zeros_like(moe_buf))
+
+
 def test_moe_sorting_flydsl_cuda_graph_capture(
     dtype,
     token,
@@ -626,6 +670,8 @@ def main():
         aiter.logger.info(
             "moe_sorting summary (markdown):\n%s", df.to_markdown(index=False)
         )
+
+        test_moe_sorting_output_aux(dtype, 4, 6144, 256, 8)
 
         for expert_mask, m in itertools.product(args.expert_mask, args.m):
             if m < 2:
