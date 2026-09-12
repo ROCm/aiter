@@ -2782,7 +2782,11 @@ def get_2stage_cfgs(
             f"activation {activation}; using default heuristics"
         )
 
-    use_non_temporal_load = False
+    # Non-temporal (streaming) loads are a cache-residency hint that only
+    # depends on how many routed rows each expert owns, see use_nt(). It is
+    # orthogonal to the tuned config, which selects block_m/ksplit/kernel
+    # names, so derive it here for both the tuned and the heuristic branch.
+    use_non_temporal_load = use_nt(token, topk, expert)
     if cfg is None or bypass_tuned_config:
         ksplit = 0
         kernelName1 = ""
@@ -2831,7 +2835,6 @@ def get_2stage_cfgs(
                 else ksplit
             )
         )
-        use_non_temporal_load = use_nt(token, topk, expert)
         aiter.logger.info(
             f"run_1stage = {run_1stage}, xbf16 = {run_1stage_xbf16}, ksplit = {ksplit} q_type = {q_type} block_m = {block_m} use_nt = {use_non_temporal_load}, estimated_m_per_expert = {token * topk // expert}"
         )
