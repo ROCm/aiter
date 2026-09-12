@@ -102,9 +102,22 @@ def batched_gemm_a16wfp4_(
 
     assert arch_info.is_fp4_avail(), "MXFP4 is not available on your device"
 
-    Bx, M, K = x.shape
+    # K_unpacked counts fp4 elements; w packs two of them per uint8, so w's K
+    # is half of x's. Everything below works in the packed K.
+    Bx, M, K_unpacked = x.shape
     Bw, N, K = w.shape
-    assert Bx == Bw
+    assert Bx == Bw, f"batch mismatch between x ({Bx}) and w ({Bw})"
+    assert K_unpacked == 2 * K, f"x K ({K_unpacked}) must be twice w's packed K ({K})"
+    assert (
+        K_unpacked % 32 == 0
+    ), f"unpacked K must be a multiple of 32 for mxfp4 scales, got {K_unpacked}"
+    # The kernel bounds its w_scales loads from K, not from w_scales itself, so
+    # an undersized scale tensor reads out of bounds rather than failing.
+    assert w_scales.shape == (
+        Bw,
+        N,
+        K_unpacked // 32,
+    ), f"w_scales must have shape {(Bw, N, K_unpacked // 32)}, got {tuple(w_scales.shape)}"
     B = Bx
 
     if config is None:
