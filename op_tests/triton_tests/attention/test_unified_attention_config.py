@@ -43,7 +43,7 @@ def _matched_key(params):
         _lookup,
     )
 
-    table, axes, _ = _load("attn_2d", "triton")
+    table, axes, _ = _load("attn_2d", "triton", None)
     values = _axis_values(
         params.head_size,
         params.max_seqlen_q,
