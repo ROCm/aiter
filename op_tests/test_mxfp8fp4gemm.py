@@ -434,7 +434,7 @@ def main():
     parser.add_argument(
         "--data-init",
         dest="data_init",
-        nargs="*",
+        nargs="+",
         choices=["zero", "constant", "uniform", "norm"],
         default=None,
         help="DATA init distribution(s) (sampled independently of scale).\n"
@@ -448,7 +448,7 @@ def main():
     parser.add_argument(
         "--scale-init",
         dest="scale_init",
-        nargs="*",
+        nargs="+",
         choices=["auto", "pow2_binomial", "zero", "constant", "uniform", "norm"],
         default=None,
         help="SCALE init distribution(s) (e8m0 for both operands)\n"

@@ -336,7 +336,7 @@ parser.add_argument(
 parser.add_argument(
     "--data-init",
     dest="data_init",
-    nargs="*",
+    nargs="+",
     choices=bench_init.DATA_DISTS,
     default=None,
     help="DATA initialization distribution(s), paired position-wise with "
@@ -345,7 +345,7 @@ parser.add_argument(
 parser.add_argument(
     "--scale-init",
     dest="scale_init",
-    nargs="*",
+    nargs="+",
     choices=bench_init.E8M0_SCALE_DISTS,
     default=None,
     help="E8M0 SCALE initialization distribution(s), paired position-wise "

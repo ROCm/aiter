@@ -536,11 +536,11 @@ if __name__ == "__main__":
 
     out_dtype = torch.bfloat16 if args.dtype == "bf16" else torch.float32
     gen = make_generator(args.seed)
-    # add_data_init_args makes --data-init a list (nargs="*"); a16w16 sweeps a
-    # single operand dist, so take the first entry.
-    data_init = (
-        args.data_init[0] if isinstance(args.data_init, list) else args.data_init
-    )
+    if len(args.data_init) != 1:
+        parser.error(
+            "--data-init accepts exactly one distribution for the a16w16 benchmark"
+        )
+    data_init = args.data_init[0]
     init_kwargs = {
         "dist": data_init,
         "gen": gen,

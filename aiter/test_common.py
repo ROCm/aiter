@@ -7,6 +7,7 @@ import multiprocessing as mp
 import os
 from contextvars import ContextVar
 from enum import Enum
+from functools import wraps
 
 import numpy as np
 import pandas as pd
@@ -366,6 +367,7 @@ def run_perftest(
         needTrace=needTrace,
         use_cuda_event=use_cuda_event,
     )
+    @wraps(func)
     def worker(*args, **kwargs):
         return func(*args, **kwargs)
 
@@ -777,7 +779,7 @@ def add_data_init_args(
     parser.add_argument(
         "--data-init",
         dest="data_init",
-        nargs="*",
+        nargs="+",
         choices=list(DATA_DISTS),
         default=[default_dist],
         help="DATA init: zero | constant | uniform | norm (N(0,1)). "
@@ -786,7 +788,7 @@ def add_data_init_args(
     parser.add_argument(
         "--scale-init",
         dest="scale_init",
-        nargs="*",
+        nargs="+",
         choices=list(SCALE_DISTS),
         default=[default_scale],
         help="SCALE init (non-negative float): zero | constant(=1) | "

@@ -586,11 +586,12 @@ def _gemm_work_metrics(
     weight_bytes = 0.5
     output_bytes = 2.0
     stage1_n = 2 * inter_dim
+    routed_rows = tokens * topk
 
-    gemm1_flops = tokens * topk * stage1_n * model_dim * 2
+    gemm1_flops = routed_rows * stage1_n * model_dim * 2
     gemm1_bytes = (
-        tokens * model_dim * input_bytes
-        + tokens * stage1_n * output_bytes
+        routed_rows * model_dim * input_bytes
+        + routed_rows * stage1_n * output_bytes
         + experts * model_dim * stage1_n * weight_bytes
     )
     gemm2_flops = tokens * topk * model_dim * inter_dim * 2
@@ -1233,7 +1234,7 @@ def main() -> None:
     parser.add_argument(
         "--data-init",
         dest="data_init",
-        nargs="*",
+        nargs="+",
         choices=bench_init.DATA_DISTS,
         default=None,
         help="DATA initialization distribution(s), paired position-wise with "
@@ -1277,7 +1278,7 @@ def main() -> None:
     parser.add_argument(
         "--scale-init",
         dest="scale_init",
-        nargs="*",
+        nargs="+",
         choices=bench_init.E8M0_SCALE_DISTS,
         default=None,
         help="E8M0 SCALE initialization distribution(s), paired position-wise "

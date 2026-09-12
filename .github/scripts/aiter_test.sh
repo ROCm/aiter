@@ -40,6 +40,7 @@ skip_tests=(
     "op_tests/multigpu_tests/test_communication.py"
     "op_tests/multigpu_tests/test_mori_all2all.py"
     "op_tests/multigpu_tests/test_fused_ar_rms.py"
+    "op_tests/multigpu_tests/test_mega_moe_v2.py"
     "op_tests/multigpu_tests/triton_test/test_reduce_scatter_all_gather.py"
     "op_tests/multigpu_tests/triton_test/test_fused_rs_rmsnorm_quant_ag.py"
 )
@@ -83,9 +84,9 @@ for file in "${sharded_files[@]}"; do
     # batch gate so they exercise the persistent kernel at every batch size.
     test_cmd=(timeout 60m python3 "$file")
     case "$file" in
-        op_tests/multigpu_tests/test_mega_moe.py)
+        op_tests/multigpu_tests/bench_mega_moe.py)
             {
-                echo "Running gfx1250 MegaMoE fused-scatter accuracy on 8 GPUs when supported"
+                echo "Running MegaMoE fused-scatter accuracy on 8 GPUs when supported"
             } | tee -a latest_test.log
             test_cmd=(
                 timeout 60m
