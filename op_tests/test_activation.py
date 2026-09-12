@@ -492,22 +492,32 @@ if df:
     aiter.logger.info("silu_and_mul_quant (fp8) summary (markdown):\n%s", df_md)
 
 # silu_and_mul_quant with fp4 (group_size=32)
-df = []
-for dtype in args.dtype:
-    for m in args.m:
-        for n in args.n:
-            d = n // 2
-            gs = 32
-            if d >= gs and d % gs == 0:
-                ret = test_silu_and_mul_quant(
-                    m, n, dtype, group_size=gs, output_dtype=dtypes.fp4x2
-                )
-                df.append(ret)
-if df:
-    df = pd.DataFrame(df)
-    df = df[quant_cols]
-    df_md = df.to_markdown(index=False)
-    aiter.logger.info("silu_and_mul_quant (fp4) summary (markdown):\n%s", df_md)
+# FP4 (e2m1) output uses CDNA4-only MFMA and is compiled in only for
+# gfx950/gfx1250. On other archs (e.g. gfx942/MI300A) the kernel is not
+# built, so skip instead of aborting inside the C++ dispatch.
+_fp4_gfx = aiter.get_gfx()
+if _fp4_gfx not in ("gfx950", "gfx1250"):
+    aiter.logger.info(
+        "skip silu_and_mul_quant (fp4): fp4 output requires gfx950/gfx1250, got %s",
+        _fp4_gfx,
+    )
+else:
+    df = []
+    for dtype in args.dtype:
+        for m in args.m:
+            for n in args.n:
+                d = n // 2
+                gs = 32
+                if d >= gs and d % gs == 0:
+                    ret = test_silu_and_mul_quant(
+                        m, n, dtype, group_size=gs, output_dtype=dtypes.fp4x2
+                    )
+                    df.append(ret)
+    if df:
+        df = pd.DataFrame(df)
+        df = df[quant_cols]
+        df_md = df.to_markdown(index=False)
+        aiter.logger.info("silu_and_mul_quant (fp4) summary (markdown):\n%s", df_md)
 
 # silu_and_mul_quant with fp8 + limit=10
 df = []
