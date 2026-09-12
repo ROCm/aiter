@@ -102,34 +102,24 @@ def _nmajor_kpack_i32_layout(n_out: int, packed_k: int, elem_bytes: int):
     return shape, stride
 
 
-def _logical_nk_to_kpack_i32(n, k_packed, *, elem_bytes: int):
-    """Map logical (N, packed-K) to (n0, k0, klane, nlane, ki) on the i32 view."""
-    n = fx.Int32(n)
-    k_packed = fx.Int32(k_packed)
-    n0 = n // fx.Int32(_KPACK_NLANE)
-    nlane = n % fx.Int32(_KPACK_NLANE)
-    if elem_bytes == 1:
-        k0 = k_packed // fx.Int32(64)
-        k_in = k_packed % fx.Int32(64)
-        klane = k_in // fx.Int32(16)
-        ki = (k_in % fx.Int32(16)) // fx.Int32(_KPACK_I32)
-    else:
-        k0 = k_packed // fx.Int32(32)
-        k_in = k_packed % fx.Int32(32)
-        klane = k_in // fx.Int32(8)
-        ki = (k_in % fx.Int32(8)) // fx.Int32(2)
-    return n0, k0, klane, nlane, ki
+def _nmajor_kpack_nk_layout(n_out: int, packed_k: int, elem_bytes: int):
+    """Logical ``(N, K_dword)`` view of N-major kpack (nested n0/nlane x k0/klane/ki)."""
+    (n0, k0, klane, nlane, ki), (sn0, sk0, sklane, snlane, ski) = (
+        _nmajor_kpack_i32_layout(n_out, packed_k, elem_bytes)
+    )
+    return ((n0, nlane), (k0, klane, ki)), ((sn0, snlane), (sk0, sklane, ski))
 
 
 def _preshuffled_expert_b_i32_tensor(ptr, expert, n_out, packed_k, elem_bytes):
     """In-expert kpack ``make_buffer_tensor``; expert base is an i64 byte fold.
 
-    Does not invent an unpacked e4m3/e2m1 grid. In-expert dword offsets stay
-    i32-safe because the descriptor starts at this expert.
+    Logical coords are ``(n, k_dword)``. Does not invent an unpacked e4m3/e2m1
+    grid. In-expert dword offsets stay i32-safe because the descriptor starts
+    at this expert.
     """
     bytes_per_expert = n_out * packed_k * elem_bytes
     base = fx.Int64(fx.ptrtoint(ptr)) + fx.Int64(expert) * fx.Int64(bytes_per_expert)
-    shape, stride = _nmajor_kpack_i32_layout(n_out, packed_k, elem_bytes)
+    shape, stride = _nmajor_kpack_nk_layout(n_out, packed_k, elem_bytes)
     pt = fx.PointerType.get(
         fx.Int32.ir_type, address_space=fx.AddressSpace.Global, alignment=4
     )
@@ -159,8 +149,14 @@ def _kpack_copy_ki(tile, ki, width: int):
 
 
 def _kpack_load_i32_words(t, n, k_packed0, n_words, *, elem_bytes: int):
-    """Consecutive logical dwords along inner ``ki`` (vec4/vec2 when they fit)."""
-    k_per_dword = 4 // elem_bytes
+    """Consecutive logical dwords along K (vec4/vec2 when they fit in one kpack)."""
+    n = fx.Int32(n)
+    n0 = n // fx.Int32(_KPACK_NLANE)
+    nlane = n % fx.Int32(_KPACK_NLANE)
+    k_per_dword = fx.Int32(4 // elem_bytes)
+    c_ki = fx.Int32(_KPACK_I32)
+    c_klane = fx.Int32(_KPACK_KLANE)
+    kd0 = fx.Int32(k_packed0) // k_per_dword
     out = []
     w = 0
     while w < n_words:
@@ -171,11 +167,12 @@ def _kpack_load_i32_words(t, n, k_packed0, n_words, *, elem_bytes: int):
             width = 2
         else:
             width = 1
-        k_packed = k_packed0 + w * k_per_dword
-        n0, k0, klane, nlane, ki = _logical_nk_to_kpack_i32(
-            n, k_packed, elem_bytes=elem_bytes
-        )
-        tile = fx.slice(t, (n0, k0, klane, nlane, None))
+        kd = kd0 + fx.Int32(w)
+        pack = kd // c_ki
+        ki = kd % c_ki
+        k0 = pack // c_klane
+        klane = pack % c_klane
+        tile = fx.slice(t, ((n0, nlane), (k0, klane, None)))
         out.extend(_kpack_copy_ki(tile, ki, width))
         w += width
     return out
@@ -698,7 +695,7 @@ def pick_kvector(hidden: int) -> int:
 
 def _native_kpack_words(t, n0, k0, klane, nlane):
     """One contiguous 16-byte B kpack owned by lane ``(klane, nlane)``."""
-    tile = fx.slice(t, (n0, k0, klane, nlane, None))
+    tile = fx.slice(t, ((n0, nlane), (k0, klane, None)))
     return _kpack_copy_ki(tile, fx.Int32(0), _KPACK_I32)
 
 
