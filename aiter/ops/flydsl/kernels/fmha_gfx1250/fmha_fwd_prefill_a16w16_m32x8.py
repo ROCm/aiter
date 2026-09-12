@@ -39,8 +39,6 @@ import flydsl.expr as fx
 import torch
 from flydsl._mlir import ir
 from flydsl._mlir.dialects import llvm as llvm_dialect
-from flydsl._mlir.dialects import rocdl as rocdl_dialect
-from flydsl._mlir.dialects import scf
 from flydsl.compiler.ast_rewriter import ReplaceIfWithDispatch
 from flydsl.expr import arith, gpu, rocdl
 from flydsl.expr import math as fmath
@@ -62,6 +60,8 @@ scf_if_dispatch = ReplaceIfWithDispatch.scf_if_dispatch
 # self-contained: this kernel maintains its own arch constants below and passes the
 # config each manager needs through its constructor.
 from flydsl.expr.rocdl import tdm_ops
+
+from ..act import LOG2E
 
 # Single source of truth for gfx1250 Expert Scheduling Mode 2 (DEP_MODE=2). Lives
 # in fmha_b16_buffer_managers. Under mode 2 the LLVM setreg (via the
@@ -128,7 +128,6 @@ N_KV_PP = 2
 MIN_KV_BLK_BYTES = 64 * 1024
 
 # log2(e): exp(x) = exp2(x * LOG2E). Softmax uses the native ISA exp2 intrinsic.
-LOG2E = 1.4426950408889634
 
 # Deferred oaccu rescale (FAv4 innovation, hk_mla spec §9.1.1). Rescaling the
 # running O accumulator by corr = exp(m_prev - m_new) is a full-width VALU pass
@@ -189,7 +188,7 @@ def _named_barrier_pair(warp_idx):
 def _lane_id():
     """Lane index within the wave (wave32), matching opus ``lane_id()``."""
     return fx.Int32(
-        rocdl_dialect.mbcnt_lo(T.i32, fx.Int32(-1).ir_value(), fx.Int32(0).ir_value())
+        rocdl.mbcnt_lo(T.i32, fx.Int32(-1).ir_value(), fx.Int32(0).ir_value())
     )
 
 
@@ -266,9 +265,9 @@ def _wmma(a, b, c):
     (raw MLIR value, feed straight back as ``c`` to accumulate)."""
     v8f32 = fx.Vector.make_type(8, fx.Float32)
     wmma = (
-        rocdl_dialect.wmma_f32_16x16x32_f16
+        rocdl.wmma_f32_16x16x32_f16
         if a.dtype is fx.Float16
-        else rocdl_dialect.wmma_f32_16x16x32_bf16
+        else rocdl.wmma_f32_16x16x32_bf16
     )
     # modC defaults to WMMACModifier::none (== the old modC=0); omit it.
     return wmma(v8f32, _ir(a), _ir(b), _ir(c), reuseA=False, reuseB=False).result
@@ -432,7 +431,7 @@ def _softmax(
 
     def peer(v):  # cross-lane reduce partner: lane l <-> l^16 (the other kv half)
         return fx.Float32(
-            rocdl_dialect.permlanex16(
+            rocdl.permlanex16(
                 f32,
                 _raw(v),
                 _raw(v),
@@ -1206,22 +1205,19 @@ def _core_attention(
         clean_lo = start_tile
     clean_lo = fx.min(fx.max(clean_lo, start_tile), clean_hi)
 
+    @flyc.jit
     def _run_tiles(state, lo_i32, hi_i32, *, mask_left, mask_right, kv_len):
-        _lo = arith.index_cast(T.index, arith.unwrap(lo_i32))
-        _hi = arith.index_cast(T.index, arith.unwrap(hi_i32))
-        _step = arith.index(1)
-        for _iv, _iargs, _res in scf.for_(_lo, _hi, _step, iter_args=state):
-            t0 = fx.Int32(arith.index_cast(T.i32, _iv))
-            scf.yield_(
-                main_loop(
-                    t0,
-                    list(_iargs),
-                    mask_left=mask_left,
-                    mask_right=mask_right,
-                    kv_len=kv_len,
-                )
+        final_state = state
+        for tile, carried in range(fx.Index(lo_i32), fx.Index(hi_i32), 1, init=state):
+            next_state = main_loop(
+                fx.Int32(tile),
+                list(carried),
+                mask_left=mask_left,
+                mask_right=mask_right,
+                kv_len=kv_len,
             )
-        return _res
+            final_state = yield next_state
+        return final_state
 
     state = _init
     if mask_left:

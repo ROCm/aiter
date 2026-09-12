@@ -50,32 +50,20 @@ from flydsl.expr import arith, const_expr, fastmath, gpu, range_constexpr
 from flydsl.expr import math as fmath
 from flydsl.expr.typing import Int32, Stream, T
 
+from .act import LOG2E as _LOG2E
 from .fused_compress_attn_common import (
+    _NEG_INF,
+    _fexp_f32,
+    _ptr_at_byte_off,
+    _wave_reduce_add,
     block_base_bytes_i64,
     emit_group_fp8_nm_asm_scatter,
     state_slot_byte_offset,
 )
-from .tensor_shim import _run_compiled, _to_raw, ptr_buf_tensor
+from .tensor_shim import _run_compiled, ptr_buf_tensor
 
 BLOCK_THREADS = 64  # 1 wave64
 SLICE = 64  # head_dim elements per block (grid-Y split)
-_NEG_INF = float("-inf")
-_LOG2E = math.log2(math.e)
-
-
-def _ptr_at_byte_off(tensor, base_i64):
-    """Global byte pointer at ``tensor``'s base + ``base_i64`` (64-bit byte offset).
-
-    Used to fold a slot/block rebase into the pointer handed to
-    ``ptr_buf_tensor``, which re-derives the descriptor's element type -- so the
-    i8 carrier type here only carries the address and the ptrtoint/inttoptr
-    roundtrip folds away pre-ISA, keeping the emitted V# identical to the old
-    ``buf_tensor(base_i64=...)`` descriptor.
-    """
-    pt = fx.PointerType.get(T.i8, address_space=fx.AddressSpace.Global, alignment=1)
-    return fx.inttoptr(
-        pt, fx.Int64(fx.ptrtoint(fx.get_iter(tensor))) + fx.Int64(base_i64)
-    )
 
 
 # ============================================================================
@@ -193,10 +181,6 @@ def _build_compress_forward_kernel(
         c_neg_inf = arith.constant(_NEG_INF, type=f32)
         c_zero_f32 = arith.constant(0.0, type=f32)
         c_log2e = fx.Float32(_LOG2E)
-
-        def fexp_f32(x):
-            # x is fx.Float32; exp2 needs a raw operand -> wrap once here.
-            return fx.rocdl.exp2(f32, _to_raw(x * c_log2e))
 
         # Per-thread wave / lane (block-local).
         wid = fx.Int32(tid) // 64  # -> [0, NW)
@@ -372,9 +356,9 @@ def _build_compress_forward_kernel(
                     m_new = m_old.maximumf(score_k)
                     with fastmath(None):
                         is_first = m_old == neg_inf
-                    scale_active = fx.Float32(fexp_f32(m_old - m_new))
+                    scale_active = fx.Float32(_fexp_f32(m_old - m_new, c_log2e))
                     scale_v = is_first.select(zero, scale_active)
-                    wk_active = fx.Float32(fexp_f32(score_k - m_new))
+                    wk_active = fx.Float32(_fexp_f32(score_k - m_new, c_log2e))
                     with fastmath(None):
                         is_pad_score = score_k == neg_inf
                     w_k = is_pad_score.select(zero, wk_active)
@@ -490,7 +474,7 @@ def _build_compress_forward_kernel(
                         kv_w = fx.ptr_load(lds_kv_ptr + idx_w)
                         w_w = fx.ptr_load(lds_w_ptr + idx_w)
                         m_w = m_arr[w]
-                        scale_w = fx.Float32(fexp_f32(m_w - m_g))
+                        scale_w = fx.Float32(_fexp_f32(m_w - m_g, c_log2e))
                         kv_sum = kv_sum + kv_w * scale_w
                         w_sum = w_sum + w_w * scale_w
                     rcp_w = fx.Float32(fx.rocdl.rcp(f32, w_sum.ir_value()))
@@ -661,13 +645,6 @@ def _build_norm_rope_scatter_kernel(
         c_eps = fx.Float32(rms_eps)
         c_inv_D = fx.Float32(1.0 / D)
 
-        def wave_reduce_add(x):
-            w = fx.Float32(x)
-            for sh_exp in range_constexpr(log2_wave):
-                off = WAVE // (2 << sh_exp)
-                w = w + w.shuffle_xor(off, WAVE)
-            return w
-
         # -- Load plan row --
         plan_buf = ptr_buf_tensor(fx.get_iter(plan), fx.Int32)
         plan_vec = fx.Vector(
@@ -711,7 +688,7 @@ def _build_norm_rope_scatter_kernel(
             sq_local = fx.Float32(0.0)
             for i in range_constexpr(VEC):
                 sq_local = sq_local + comp_lane[i] * comp_lane[i]
-            sq_full = wave_reduce_add(sq_local)
+            sq_full = _wave_reduce_add(sq_local, log2_wave, WAVE)
             var = sq_full * c_inv_D
             rrms = fmath.rsqrt((var + c_eps).ir_value(), fastmath=fm_fast)
 

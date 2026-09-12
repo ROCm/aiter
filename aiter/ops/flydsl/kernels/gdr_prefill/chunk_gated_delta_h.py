@@ -13,40 +13,13 @@ v_new = u - w @ h, then
 h = h * exp(g_last) + k^T @ (v_new * exp(g_last - g_cumsum)).
 """
 
-import math
-
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import T
 
-_LOG2E = math.log2(math.e)
-
-
-def _gview(tensor, base, shape, stride):
-    """Buffer-resource view of ``tensor`` rooted at ELEMENT offset ``base``
-    (None = origin), replacing the slot's own memref layout. The innermost mode
-    is one vector access: slicing it off with ``None`` gives the copy tile."""
-    it = fx.get_iter(fx.rocdl.make_buffer_tensor(tensor, max_size=True))
-    if base is not None:
-        it = fx.add_offset(it, base)
-    return fx.Tensor(fx.make_view(it, fx.make_layout(shape, stride)))
-
-
-def _load_vec(atom, tile, width, numeric):
-    """Load ``width`` elements from ``tile``; ``atom`` picks buffer_load (global)
-    or ds_read (LDS). fly-promote-regmem-to-vectorssa folds the fragment away."""
-    frag = fx.make_rmem_tensor(width, numeric)
-    fx.copy(atom, tile, frag)
-    vec = frag.load()
-    return vec[0] if width == 1 else vec
-
-
-def _store_vec(atom, tile, value, width, numeric):
-    """Inverse of ``_load_vec``: store ``value`` into the coordinate ``tile``."""
-    frag = fx.make_rmem_tensor(width, numeric)
-    frag.store(fx.Vector.from_elements([value], dtype=numeric) if width == 1 else value)
-    fx.copy(atom, frag, tile)
+from ..act import LOG2E as _LOG2E
+from ..gdr_common import _gview, _load_vec, _store_vec
 
 
 def _make_fast_exp(g_is_log2_scaled: bool):

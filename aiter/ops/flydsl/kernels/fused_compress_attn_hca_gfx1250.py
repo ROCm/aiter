@@ -20,7 +20,6 @@ from functools import lru_cache
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 import torch
-from flydsl._mlir.dialects import llvm
 from flydsl.expr import arith, const_expr, gpu, range_constexpr
 from flydsl.expr import math as fmath
 from flydsl.expr.arith import CmpFPredicate, CmpIPredicate
@@ -28,7 +27,10 @@ from flydsl.expr.typing import Int32, Stream, T
 
 from aiter.ops.flydsl.kernels import buffer_ops
 
+from .act import LOG2E as _LOG2E
 from .fused_compress_attn_common import (
+    _NEG_INF,
+    _fexp_f32,
     block_base_bytes_i64,
     emit_group_fp8_nm_asm_scatter,
     state_slot_byte_offset,
@@ -37,8 +39,6 @@ from .tensor_shim import _run_compiled
 
 BLOCK_THREADS = 32  # 1 wave32 (RDNA4 / gfx1250)
 SLICE = 32  # head_dim elements per block (grid-Y split)
-_NEG_INF = float("-inf")
-_LOG2E = math.log2(math.e)
 
 
 # ============================================================================
@@ -154,11 +154,6 @@ def _build_compress_forward_kernel(
         c_neg_inf = arith.constant(_NEG_INF, type=f32)
         c_zero_f32 = arith.constant(0.0, type=f32)
         c_log2e = arith.constant(_LOG2E, type=f32)
-
-        def fexp_f32(x):
-            return llvm.call_intrinsic(
-                f32, "llvm.amdgcn.exp2.f32", [x * c_log2e], [], []
-            )
 
         # Per-thread wave / lane (block-local); tid >= 0 -> unsigned div/rem
         # (divui/remui). Wrap back to Int32 for the signed i32 consumers.
@@ -331,9 +326,9 @@ def _build_compress_forward_kernel(
                     kv_k = kv_k_list[i]
                     m_new = fx.max(fx.Float32(m_old), fx.Float32(score_k)).ir_value()
                     is_first = arith.cmpf(CmpFPredicate.OEQ, m_old, c_neg_inf)
-                    scale_active = fexp_f32(arith.subf(m_old, m_new))
+                    scale_active = _fexp_f32(arith.subf(m_old, m_new), c_log2e)
                     scale_v = arith.select(is_first, c_zero_f32, scale_active)
-                    wk_active = fexp_f32(arith.subf(score_k, m_new))
+                    wk_active = _fexp_f32(arith.subf(score_k, m_new), c_log2e)
                     is_pad_score = arith.cmpf(CmpFPredicate.OEQ, score_k, c_neg_inf)
                     w_k = arith.select(is_pad_score, c_zero_f32, wk_active)
                     # Explicit fastmath float layer: fx `+`/`*` drop fastmath<fast>
@@ -461,14 +456,10 @@ def _build_compress_forward_kernel(
                         kv_w = fx.ptr_load(lds_kv_ptr + idx_w)
                         w_w = fx.ptr_load(lds_w_ptr + idx_w)
                         m_w = m_arr[w]
-                        scale_w = fx.Float32(fexp_f32((m_w - m_g).ir_value()))
+                        scale_w = fx.Float32(_fexp_f32((m_w - m_g).ir_value(), c_log2e))
                         kv_sum = kv_sum + kv_w * scale_w
                         w_sum = w_sum + w_w * scale_w
-                    rcp_w = fx.Float32(
-                        llvm.call_intrinsic(
-                            f32, "llvm.amdgcn.rcp.f32", [w_sum.ir_value()], [], []
-                        )
-                    )
+                    rcp_w = fx.Float32(fx.rocdl.rcp(f32, w_sum.ir_value()))
                     comp_list.append(kv_sum * rcp_w)
 
                 # -- Vectorized write of VEC f32 comp values --

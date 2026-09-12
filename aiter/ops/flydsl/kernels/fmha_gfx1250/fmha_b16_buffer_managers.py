@@ -32,7 +32,6 @@ Target: gfx1250 (MI400 / mi450), wave32, 8 waves per threadgroup (256 threads).
 
 import flydsl.expr as fx
 from flydsl._mlir.dialects import llvm as llvm_dialect
-from flydsl._mlir.dialects import rocdl as rocdl_dialect
 from flydsl.compiler.ast_rewriter import ReplaceIfWithDispatch
 from flydsl.expr import arith, rocdl
 from flydsl.expr.rocdl import tdm_ops
@@ -195,9 +194,9 @@ def _async_load_to_lds(gptrs, lds_ptrs, *, cluster, imm_offs=None):
             # expr.rocdl.cluster_load_async_to_lds wrapper still passes the old
             # positional order, so call the dialect op directly with a 0 mask.
             mask0 = _ir(fx.Int32(0))
-            rocdl_dialect.cluster_load_async_to_lds_b128(gptr, lds_ptr, imm, mask0)
+            rocdl.cluster_load_async_to_lds_b128(gptr, lds_ptr, imm, mask0)
         else:
-            rocdl_dialect.global_load_async_to_lds_b128(gptr, lds_ptr, imm)
+            rocdl.global_load_async_to_lds_b128(gptr, lds_ptr, imm)
 
 
 # ============================================================================
@@ -1853,7 +1852,7 @@ class OManager16bV3:
 
         def _burst(*_a):
             for gdst, lsrc in addrs:
-                rocdl_dialect.global_store_async_from_lds_b128(_ir(gdst), _ir(lsrc), 0)
+                rocdl.global_store_async_from_lds_b128(_ir(gdst), _ir(lsrc), 0)
 
         _scf_if_dispatch(valid_rows > fx.Int32(0), _burst)  # skip a fully-OOB warp
         # No s_wait_asynccnt: HW drains the async stores' LDS reads at workgroup retire.

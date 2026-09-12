@@ -5,26 +5,12 @@ import functools
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-from flydsl._mlir.dialects import (
-    gpu as mlir_gpu,
-)
 from flydsl.expr import const_expr, range_constexpr, rocdl
 from flydsl.expr.typing import T
 
-from .tensor_shim import (
-    _to_raw,
-    get_dtype_bytes,
-    get_dtype_in_kernel,
-)
-
-_LOG2E = 1.4426950408889634
-
-
-def _gview(tensor, base, shape, stride):
-    it = fx.get_iter(fx.rocdl.make_buffer_tensor(tensor, max_size=True))
-    if base is not None:
-        it = fx.add_offset(it, base)
-    return fx.Tensor(fx.make_view(it, fx.make_layout(shape, stride)))
+from .act import LOG2E as _LOG2E
+from .gdr_common import _gview, _load_vec, _store_vec
+from .tensor_shim import _to_raw
 
 
 def _gview64(tensor, base, shape, stride):
@@ -38,19 +24,6 @@ def _gview64(tensor, base, shape, stride):
     return fx.Tensor(
         fx.make_view(fx.rocdl.make_buffer_ptr(it), fx.make_layout(shape, stride))
     )
-
-
-def _load_vec(atom, tile, width, numeric):
-    frag = fx.make_rmem_tensor(width, numeric)
-    fx.copy(atom, tile, frag)
-    vec = frag.load()
-    return vec[0] if width == 1 else vec
-
-
-def _store_vec(atom, tile, value, width, numeric):
-    frag = fx.make_rmem_tensor(width, numeric)
-    frag.store(fx.Vector.from_elements([value], dtype=numeric) if width == 1 else value)
-    fx.copy(atom, frag, tile)
 
 
 def _fast_exp(x):
@@ -409,18 +382,16 @@ def create_vk_gdr_decode_kernel(
                         sum_k_partial = sum_k_partial + sum_k_partial.shuffle_xor(
                             offset, WARP_SIZE
                         )
-                    local_sum_q = mlir_gpu.ShuffleOp(
-                        _to_raw(sum_q_partial),
-                        _to_raw(fx.Int32(w_tid // WARP_THREADS_K * WARP_THREADS_K)),
+                    local_sum_q = fx.gpu.shuffle_idx(
+                        sum_q_partial,
+                        fx.Int32(w_tid // WARP_THREADS_K * WARP_THREADS_K),
                         width_i32,
-                        mode="idx",
-                    ).shuffleResult
-                    local_sum_k = mlir_gpu.ShuffleOp(
-                        _to_raw(sum_k_partial),
-                        _to_raw(fx.Int32(w_tid // WARP_THREADS_K * WARP_THREADS_K)),
+                    )
+                    local_sum_k = fx.gpu.shuffle_idx(
+                        sum_k_partial,
+                        fx.Int32(w_tid // WARP_THREADS_K * WARP_THREADS_K),
                         width_i32,
-                        mode="idx",
-                    ).shuffleResult
+                    )
                     inv_norm_q = fx.math.rsqrt(local_sum_q + 1e-6)
                     inv_norm_k = fx.math.rsqrt(local_sum_k + 1e-6)
                     inv_norm_q_vec = fx.Vector.filled(
@@ -479,12 +450,11 @@ def create_vk_gdr_decode_kernel(
                         )
 
                     v_new = (r_v - sum_hk) * r_beta
-                    v_new = mlir_gpu.ShuffleOp(
-                        _to_raw(v_new),
-                        _to_raw(fx.Int32(w_tid // WARP_THREADS_K * WARP_THREADS_K)),
+                    v_new = fx.gpu.shuffle_idx(
+                        v_new,
+                        fx.Int32(w_tid // WARP_THREADS_K * WARP_THREADS_K),
                         width_i32,
-                        mode="idx",
-                    ).shuffleResult
+                    )
                     sum_hq = sum_hq_old + v_new * dot_kq
                     v_new_bcast = fx.Vector.filled(
                         VALUES_PER_THREAD_K, fx.Float32(v_new), fx.Float32
@@ -703,7 +673,7 @@ def create_vk_gdr_mtp_kernel(
         offsets_ /= 2
     WARP_THREADS_K_SHFL_OFFSETS = WARP_THREADS_K_SHFL_OFFSETS[::-1]
 
-    INTER_BYTES = get_dtype_bytes(inter_dtype) if SAVE_INTER else 0
+    INTER_BYTES = inter_num.width // 8 if SAVE_INTER else 0
 
     assert not SAVE_INTER or VALUES_PER_THREAD_K * INTER_BYTES <= 16, (
         f"a {state_dtype} state splits K {VALUES_PER_THREAD_K} ways, so a "
@@ -747,7 +717,7 @@ def create_vk_gdr_mtp_kernel(
 
         f32_0 = fx.Float32(0.0)
         f32_1 = fx.Float32(1.0)
-        state_vec_t = T.vec(VALUES_PER_THREAD_K, get_dtype_in_kernel(state_dtype))
+        state_vec_t = T.vec(VALUES_PER_THREAD_K, state_num.ir_type)
         acc_vec_t = T.vec(VALUES_PER_THREAD_K, T.f32)
 
         tidx = fx.thread_idx.x
@@ -991,9 +961,7 @@ def create_vk_gdr_mtp_kernel(
                 # token's parent is only known at runtime.
                 held = reload_parents and sq_i == 1
                 if const_expr(held and not LOSSLESS_SNAPSHOT):
-                    snap_vec_t = T.vec(
-                        VALUES_PER_THREAD_K, get_dtype_in_kernel(inter_dtype)
-                    )
+                    snap_vec_t = T.vec(VALUES_PER_THREAD_K, inter_num.ir_type)
                     for si in range_constexpr(WARP_TILE_V_ITERS * WARP_TILE_K_ITERS):
                         state_vecs[si] = (
                             state_vecs[si].truncf(snap_vec_t).extf(acc_vec_t)
@@ -1248,9 +1216,7 @@ def create_vk_gdr_mtp_kernel(
                     # descends from the last.
                     keeps_reading = reload_parents and sq_i != seq_length - 1
                     snap_atom = cp_inter_vec if keeps_reading else cp_inter_vec_nt
-                    inter_vec_t = T.vec(
-                        VALUES_PER_THREAD_K, get_dtype_in_kernel(inter_dtype)
-                    )
+                    inter_vec_t = T.vec(VALUES_PER_THREAD_K, inter_num.ir_type)
 
                     def _snapshot(_step=sq_i, _vec_t=inter_vec_t, _atom=snap_atom):
                         for vi in range_constexpr(WARP_TILE_V_ITERS):

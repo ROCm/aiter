@@ -3,7 +3,6 @@
 
 import flydsl.expr as fx
 from flydsl._mlir import ir
-from flydsl._mlir.dialects import memref as memref_dialect
 from flydsl.expr import math as fmath
 from flydsl.expr.typing import T
 
@@ -25,14 +24,13 @@ def _udiv(x, d):
     return fx.Int32(fx.Uint32(x) // fx.Uint32(d))
 
 
+def _umod(x, d):
+    return fx.Int32(fx.Uint32(x) % fx.Uint32(d))
+
+
 def _lds_ptr3(base_i32, byte_off_i32):
     ptr_ty = fx.PointerType.get(T.i8, fx.AddressSpace.Shared)
     return fx.to_llvm_ptr(fx.inttoptr(ptr_ty, fx.Int64(base_i32 + byte_off_i32)))
-
-
-def _lds_base_ptr3(lds_view):
-    base_i32 = fx.Int32(memref_dialect.extract_aligned_pointer_as_index(lds_view))
-    return _lds_ptr3(base_i32, fx.Int32(0))
 
 
 def _gep3(base_ptr, byte_off_i32):
@@ -82,22 +80,30 @@ def lds_dma_dst(base_i32, byte_off_i32, elem_ty=None, align=16):
     return fx.make_view(lds_ptr, fx.make_layout(1, 1))
 
 
-def global_typed_ptr(arg, elem_ty, align=4):
+def global_typed_ptr(arg, elem_ty, align=4, *, byte_offset=None):
     """Typed global fx.Pointer over a raw i64 device address; index in ELEMENTS (ptr[i]), not bytes."""
     ptr_ty = fx.PointerType.get(elem_ty, fx.AddressSpace.Global, align)
+    if byte_offset is not None:
+        byte_ptr_ty = fx.PointerType.get(T.i8, fx.AddressSpace.Global, align)
+        base = fx.inttoptr(byte_ptr_ty, fx.Int64(arg))
+        return fx.recast_iter(ptr_ty, fx.add_offset(base, byte_offset))
     return fx.inttoptr(ptr_ty, fx.Int64(arg))
 
 
-def lds_typed_ptr(base_i32, elem_ty, align=4):
+def lds_typed_ptr(base_i32, elem_ty, align=4, *, byte_offset=None):
     """Typed LDS (Shared) fx.Pointer over an i32 LDS base; index in ELEMENTS (ptr[i]), not bytes."""
     ptr_ty = fx.PointerType.get(elem_ty, fx.AddressSpace.Shared, align)
+    if byte_offset is not None:
+        byte_ptr_ty = fx.PointerType.get(T.i8, fx.AddressSpace.Shared, align)
+        base = fx.inttoptr(byte_ptr_ty, fx.Int32(base_i32))
+        return fx.recast_iter(ptr_ty, fx.add_offset(base, byte_offset))
     return fx.inttoptr(ptr_ty, fx.Int32(base_i32))
 
 
 def lds_vec_load(base_i32, byte_off_i32, result_type, elem_ty, align=4):
     """Typed LDS ds-read at a BYTE offset from the i32 LDS base; mirrors raw llvm.load (vector or scalar)."""
     elem_ir_ty = elem_ty.ir_type if hasattr(elem_ty, "ir_type") else elem_ty
-    ptr = lds_typed_ptr(fx.Int32(base_i32) + byte_off_i32, elem_ir_ty, align=align)
+    ptr = lds_typed_ptr(base_i32, elem_ir_ty, align=align, byte_offset=byte_off_i32)
     return fx.ptr_load(ptr, result_type=result_type)
 
 

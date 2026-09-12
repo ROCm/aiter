@@ -31,14 +31,14 @@ Two launch modes (mirrors the HIP kernel):
 
 import enum
 import functools
-import math
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl.expr import math as fly_math
 from flydsl.expr.typing import T
 
-_LOG2E = math.log2(math.e)
+from .act import LOG2E as _LOG2E
+
 fm_fast = "fast"
 
 # Matches MlaReduceKernelV1Traits (reduce.cu:13)

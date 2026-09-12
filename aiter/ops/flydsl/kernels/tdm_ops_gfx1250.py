@@ -9,12 +9,9 @@ import contextlib
 
 import flydsl.expr as fx
 from flydsl._mlir import ir
-from flydsl._mlir.dialects import arith as std_arith
 from flydsl._mlir.dialects import fly as fly_dialect
 from flydsl._mlir.dialects import llvm as llvm_dialect
 from flydsl._mlir.dialects import memref as memref_dialect
-from flydsl._mlir.dialects import vector
-from flydsl.expr.arith import _to_raw as _raw
 from flydsl.expr.meta import dsl_loc_tracing
 from flydsl.expr.rocdl import tdm_ops as _tdm_ops
 from flydsl.expr.typing import Vector as Vec
@@ -44,7 +41,7 @@ def _fly_lds_base_index(raw: ir.Value) -> ir.Value:
     ptr = fly_dialect.extract_aligned_pointer_as_index(ptr_type, raw)
     i64 = ir.IntegerType.get_signless(64)
     ptr_i64 = llvm_dialect.ptrtoint(i64, ptr)
-    return std_arith.IndexCastOp(ir.IndexType.get(), ptr_i64).result
+    return fx.Index(ptr_i64).ir_value()
 
 
 class _FlyAwareMemrefDialect:
@@ -83,19 +80,14 @@ def _clamp_inner_extent(desc: TDMDescriptor2D, bound) -> TDMDescriptor2D:
     g1 = Vec(desc.dgroup1)
     b = fx.Int32(bound)
     dim0 = (b > 0).select(b, fx.Int32(0))
-    packed = (
-        (
-            _DIM0_LO_SGPR,
-            (fx.Int32(g1[_DIM0_LO_SGPR]) & 0xFFFF) | ((dim0 & 0xFFFF) << 16),
-        ),
-        (_DIM0_HI_SGPR, ((fx.Int32(g1[_DIM0_HI_SGPR]) >> 16) << 16) | (dim0 >> 16)),
+    dim0 = fx.Uint32(dim0)
+    lanes = [fx.Uint32(g1[i]) for i in range(8)]
+    lanes[_DIM0_LO_SGPR] = (lanes[_DIM0_LO_SGPR] & 0xFFFF) | ((dim0 & 0xFFFF) << 16)
+    lanes[_DIM0_HI_SGPR] = (lanes[_DIM0_HI_SGPR] & fx.Uint32(0xFFFF0000)) | (dim0 >> 16)
+    return TDMDescriptor2D(
+        dgroup0=desc.dgroup0,
+        dgroup1=Vec.from_elements(lanes, fx.Uint32).ir_value(),
     )
-    raw = _raw(desc.dgroup1)
-    for position, value in packed:
-        raw = vector.InsertOp(
-            _raw(value), raw, static_position=[position], dynamic_position=[]
-        ).result
-    return TDMDescriptor2D(dgroup0=desc.dgroup0, dgroup1=raw)
 
 
 def make_tensor_descriptor_2d(*args, oob_inner_bound=None, **kwargs) -> TDMDescriptor2D:
@@ -119,12 +111,10 @@ def update_tensor_descriptor_2d_lds_addr(
     new_lds_addr,
 ) -> TDMDescriptor2D:
     """Return a 2-D descriptor with its LDS address replaced."""
+    g0 = Vec(desc.dgroup0)
     return TDMDescriptor2D(
-        dgroup0=vector.InsertOp(
-            _raw(new_lds_addr),
-            _raw(desc.dgroup0),
-            static_position=[1],
-            dynamic_position=[],
-        ).result,
+        dgroup0=Vec.from_elements(
+            [g0[0], fx.Int32(new_lds_addr), g0[2], g0[3]], fx.Int32
+        ).ir_value(),
         dgroup1=desc.dgroup1,
     )

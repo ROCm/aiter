@@ -40,14 +40,6 @@ from aiter.utility.mx_types import (
 from .tensor_shim import GTensor, _run_compiled, ptr_buf_tensor
 
 
-def _imin(a, b):
-    return (a < b).select(a, b)
-
-
-def _imax(a, b):
-    return (a > b).select(a, b)
-
-
 def _idiv(a, b):
     """Truncating integer divide. Signed ``//`` maps to arith.floordivsi, a
     longer expansion; every dividend here is provably non-negative, so an
@@ -973,7 +965,7 @@ def _build_kernel_w32(
         tid = fx.thread_idx.x
         tid_y = fx.thread_idx.y  # wave within workgroup -> token selector
 
-        tok = _imin(bid_t * ROWS_PER_WG + tid_y, num_tokens - 1)
+        tok = fx.min(bid_t * ROWS_PER_WG + tid_y, num_tokens - 1)
         bid_t = tok  # all downstream token offsets use the clamped token
         bid_t_idx = fx.Int64(tok)
 
@@ -1023,7 +1015,7 @@ def _build_kernel_w32(
             held by this block. ``x_f32_vec`` and (optional) ``w_f32_vec`` are
             VEC-wide fp32 vectors already loaded by the caller."""
             is_rope_t = tid >= fx.Int32(ROPE_THREAD_LO)
-            rope_rel = _imax(tid - fx.Int32(ROPE_THREAD_LO), fx.Int32(0))
+            rope_rel = fx.max(tid - fx.Int32(ROPE_THREAD_LO), fx.Int32(0))
             cos_rmem = fx.make_rmem_tensor(rope_lay, elem_dtype)
             sin_rmem = fx.make_rmem_tensor(rope_lay, elem_dtype)
             fx.copy(rope_atom, fx.slice(cos_div, (None, rope_rel)), cos_rmem)
@@ -1259,7 +1251,7 @@ def _build_kernel_w32(
                     # gate is `bid < 0 || pos < 0`; match it, in both modes.
                     pos_ok = pos_i32 >= 0
                     do_swa = (bid_i32 >= 0) & pos_ok
-                    bid_safe = _imax(bid_i32, fx.Int32(0))
+                    bid_safe = fx.max(bid_i32, fx.Int32(0))
                     pos_safe = pos_ok.select(pos_i32, fx.Int32(0))
                     if const_expr(paged):
                         blk = _idiv(pos_safe, swa_cache_size)
@@ -1895,7 +1887,7 @@ def _build_kernel_w32_tdm(
         cos_rsrc = buffer_ops.create_buffer_resource(cos_cache, max_size=True)
         sin_rsrc = buffer_ops.create_buffer_resource(sin_cache, max_size=True)
         is_rope = tid >= ROPE_LO
-        rope_rel = _imax(tid - ROPE_LO, fx.Int32(0))
+        rope_rel = fx.max(tid - ROPE_LO, fx.Int32(0))
 
         def _ptr_res(ptr):
             return buffer_ops.create_buffer_resource_from_addr(
@@ -2085,7 +2077,7 @@ def _build_kernel_w32_tdm(
             )
 
             def row_of(tile_idx):
-                return _imin(tile_idx * RT + wave, nr_m1)
+                return fx.min(tile_idx * RT + wave, nr_m1)
 
             def issue(buf, tile_idx):
                 dst = fx.Tensor(
@@ -2144,9 +2136,7 @@ def _build_kernel_w32_tdm(
             cs_cache = [None, None]
             if const_expr(do_hoist):
                 pending_pos = [issue_pos(tok_of(tile_base + 0))]
-                cs_cache[0], cs_cache[1] = _cs_from_pos(
-                    fx.Int32(pending_pos[0].trunci(i32))
-                )
+                cs_cache[0], cs_cache[1] = _cs_from_pos(fx.Int32(pending_pos[0]))
             for i in range_constexpr(CT):
                 # Tile i consumes TDM load #i (issued in tile order: K in the
                 # prologue, then one per iteration while i + K < CT). In steady
@@ -2168,13 +2158,11 @@ def _build_kernel_w32_tdm(
                     issue(bufs[i % K], tile_base + i + K)  # reuse after read
                 if const_expr(do_hoist and (i + 1) % GROUP == 0 and i + 1 < CT):
                     pending_pos[0] = issue_pos(tok_of(tile_base + i + 1))
-                    cs_cache[0], cs_cache[1] = _cs_from_pos(
-                        fx.Int32(pending_pos[0].trunci(i32))
-                    )
+                    cs_cache[0], cs_cache[1] = _cs_from_pos(fx.Int32(pending_pos[0]))
 
         def emit_kv():
             gk = g - gx_q
-            tok = _imin(gk * RT + wave, num_tokens - 1)
+            tok = fx.min(gk * RT + wave, num_tokens - 1)
             kv_rsrc = _ptr_res(kv_in)
             xv = _concat(
                 [
@@ -2205,7 +2193,7 @@ def _build_kernel_w32_tdm(
                 )
                 pos_ok = pos_i32 >= 0
                 do_swa = (bid_i32 >= 0) & pos_ok
-                bid_safe = _imax(bid_i32, fx.Int32(0))
+                bid_safe = fx.max(bid_i32, fx.Int32(0))
                 pos_safe = pos_ok.select(pos_i32, fx.Int32(0))
                 if const_expr(paged):
                     blk = _idiv(pos_safe, swa_cache_size)

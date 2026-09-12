@@ -33,7 +33,7 @@ from flydsl.expr import rocdl
 
 from aiter.ops.flydsl.kernels import buffer_ops
 
-_LOG2E = 1.4426950408889634
+from .act import LOG2E as _LOG2E
 
 
 def build_causal_conv1d_update_module(

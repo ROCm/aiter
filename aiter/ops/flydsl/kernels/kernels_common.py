@@ -18,6 +18,11 @@ from flydsl.expr.typing import T
 from flydsl.runtime.device import get_rocm_arch, is_rdna_arch
 
 
+def ceildiv(numer, denom):
+    """Ceiling division preserving Python-int or DSL-scalar operand types."""
+    return (numer + denom - 1) // denom
+
+
 def format_kernel_name(name: str) -> str:
     """Sanitize a kernel symbol name for the amdhsa assembler.
 

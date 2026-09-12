@@ -25,13 +25,19 @@ import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl._mlir import ir
 from flydsl._mlir.dialects import llvm
-from flydsl._mlir.dialects.arith import CmpIPredicate
 from flydsl.compiler.kernel_function import CompilationContext
 from flydsl.expr import arith, const_expr, gpu, range_constexpr, rocdl
+from flydsl.expr.arith import CmpIPredicate
 from flydsl.expr.typing import T
 from flydsl.runtime.device import get_rocm_arch as get_hip_arch
 
 from aiter.ops.flydsl.kernels import buffer_ops
+from aiter.ops.flydsl.kernels.act import (
+    SituParams,
+    clamp_gate_up,
+    gate_up_act,
+    silu_mul_batch,
+)
 from aiter.ops.flydsl.kernels.kernels_common import default_f8_type
 from aiter.ops.flydsl.moe_common import GateMode
 
@@ -468,7 +474,6 @@ def compile_mixed_moe_gemm1_common(
 
             c_n_total = arith.constant(experts * (2 * inter_dim), index=True)
             b_layout = make_preshuffle_b_layout(
-                arith,
                 c_n=c_n_total,
                 c_k=k_in // b_byte_div,
                 kpack_bytes=kpack_bytes,
@@ -477,7 +482,6 @@ def compile_mixed_moe_gemm1_common(
             layout_b = b_layout.layout_b
             shared_c_n_total = arith.constant(2 * inter_dim, index=True)
             shared_b_layout = make_preshuffle_b_layout(
-                arith,
                 c_n=shared_c_n_total,
                 c_k=k_in,
                 kpack_bytes=kpack_bytes,
@@ -487,10 +491,10 @@ def compile_mixed_moe_gemm1_common(
 
             sorted_m = size_expert_ids_in * arith.constant(sort_block_m, index=True)
             layout_a_scale = make_preshuffle_scale_layout(
-                arith, c_mn=sorted_m, c_k=arith.constant(model_dim, index=True)
+                c_mn=sorted_m, c_k=arith.constant(model_dim, index=True)
             )
             layout_b_scale = make_preshuffle_scale_layout(
-                arith, c_mn=c_n_total, c_k=arith.constant(model_dim, index=True)
+                c_mn=c_n_total, c_k=arith.constant(model_dim, index=True)
             )
 
             eff_lds_stride = lds_stride
@@ -756,7 +760,6 @@ def compile_mixed_moe_gemm1_common(
 
                 def x_tile_chunk_coord_i32(i: int):
                     return tile_chunk_coord_i32(
-                        arith,
                         tx_i32_base=tx_i32_base,
                         i=i,
                         total_threads=a_load_threads,
@@ -1944,132 +1947,32 @@ def compile_mixed_moe_gemm1_common(
                 if const_expr(epilogue_pf is not None):
                     _, _, bias_pf = epilogue_pf
 
-                def sigmoid_elem(g):
-                    neg_log2e = arith.constant(-1.4426950408889634, type=f32)
-                    t = g * neg_log2e
-                    t_raw = t.ir_value() if hasattr(t, "ir_value") else t
-                    emu = llvm.call_intrinsic(
-                        f32, "llvm.amdgcn.exp2.f32", [t_raw], [], []
-                    )
-                    one = arith.constant(1.0, type=f32)
-                    den = one + emu
-                    return llvm.call_intrinsic(
-                        f32, "llvm.amdgcn.rcp.f32", [den], [], []
-                    )
+                activation_params = SituParams(
+                    f32_situ_beta,
+                    f32_situ_beta_rcp,
+                    f32_situ_linear_beta,
+                    f32_situ_linear_beta_rcp,
+                    swiglu_neg_limit,
+                )
 
-                def silu_elem(g):
-                    """silu(x) = x * sigmoid(x); HW fast path: exp2, rcp"""
-                    return g * sigmoid_elem(g)
-
-                def tanh_elem(x):
-                    """tanh(x), expanded via exp2 like preshuffle_gemm's GeLU path."""
-                    zero = arith.constant(0.0, type=f32)
-                    one = arith.constant(1.0, type=f32)
-                    neg_two_log2e = arith.constant(-2.8853900817779268, type=f32)
-                    abs_x = x.maximumf(-x)
-                    exp_arg = abs_x * neg_two_log2e
-                    exp_arg_raw = (
-                        exp_arg.ir_value() if hasattr(exp_arg, "ir_value") else exp_arg
-                    )
-                    e = llvm.call_intrinsic(
-                        f32, "llvm.amdgcn.exp2.f32", [exp_arg_raw], [], []
-                    )
-                    den = one + e
-                    recip = llvm.call_intrinsic(
-                        f32, "llvm.amdgcn.rcp.f32", [den], [], []
-                    )
-                    tanh_abs = (one - e) * recip
-                    is_pos = x > zero
-                    return is_pos.select(tanh_abs, -tanh_abs)
-
-                def situ_elem(g):
-                    """situ(x) = beta * tanh(x / beta) * sigmoid(x)"""
-                    return (
-                        f32_situ_beta
-                        * tanh_elem(g * f32_situ_beta_rcp)
-                        * sigmoid_elem(g)
-                    )
-
-                def situ_up_elem(u):
-                    """linear_beta * tanh(up / linear_beta)."""
-                    return f32_situ_linear_beta * tanh_elem(
-                        u * f32_situ_linear_beta_rcp
-                    )
-
-                def _clamp_gate(x):
-                    # min(x, lim) == -max(-x, -lim); upper bound only.
-                    return -((-x).maximumf(swiglu_neg_limit))
-
-                def _clamp_lin(x):
-                    # clamp to [-lim, lim].
-                    return (-((-x).maximumf(swiglu_neg_limit))).maximumf(
-                        swiglu_neg_limit
-                    )
-
-                def silu_mul_vec4(gate_v4, up_v4):
-                    """Element-wise silu(gate) * up on vec4_f32.
-                    Clamp gate <= limit and -limit <= up <= limit (runtime limit;
-                    +inf disables the clamp) before applying silu(gate) * up.
-                    """
-                    result_elems = []
-                    for ei in range_constexpr(4):
-                        g = fx.Vector(gate_v4)[ei]
-                        u = fx.Vector(up_v4)[ei]
-                        g = _clamp_gate(g)
-                        u = _clamp_lin(u)
-                        result_elems.append(silu_elem(g) * u)
-                    return fx.Vector.from_elements(result_elems, f32_t)
-
-                def swiglu_mul_vec4(gate_v4, up_v4):
-                    """Element-wise swiglu(gate, up) on vec4_f32.
-                    swiglu(g, u) = g * sigmoid(alpha * g) * (u + 1)
-                    Clamp gate <= limit and -limit <= up <= limit (runtime limit,
-                    7.0 default) before the activation.
-                    """
-                    result_elems = []
-                    alpha = arith.constant(1.702, type=f32)
-                    one = arith.constant(1.0, type=f32)
-                    neg_log2e = arith.constant(-1.4426950408889634, type=f32)
-
-                    for ei in range_constexpr(4):
-                        g = fx.Vector(gate_v4)[ei]
-                        u = fx.Vector(up_v4)[ei]
-                        g = _clamp_gate(g)
-                        u = _clamp_lin(u)
-                        t = g * alpha * neg_log2e
-                        t_raw = t.ir_value() if hasattr(t, "ir_value") else t
-                        emu = llvm.call_intrinsic(
-                            f32, "llvm.amdgcn.exp2.f32", [t_raw], [], []
-                        )
-                        den = one + emu
-                        sig = llvm.call_intrinsic(
-                            f32, "llvm.amdgcn.rcp.f32", [den], [], []
-                        )
-                        result_elems.append(g * sig * (u + one))
-                    return fx.Vector.from_elements(result_elems, f32_t)
-
-                def situ_mul_vec4(gate_v4, up_v4):
-                    """Element-wise situv2(gate, up) on vec4_f32."""
-                    result_elems = []
-                    for ei in range_constexpr(4):
-                        g = fx.Vector(gate_v4)[ei]
-                        u = fx.Vector(up_v4)[ei]
-                        g = _clamp_gate(g)
-                        u = _clamp_lin(u)
-                        result_elems.append(situ_elem(g) * situ_up_elem(u))
-                    return fx.Vector.from_elements(result_elems, f32_t)
+                def activate_pair(g, u):
+                    if const_expr(act == "silu"):
+                        g, u = clamp_gate_up(g, u, swiglu_neg_limit)
+                        return silu_mul_batch([g], [u])[0]
+                    return gate_up_act(act, [g], [u], activation_params)[0]
 
                 def act_vec4(gate_v4, up_v4):
                     """Dispatch activation based on `act` parameter."""
                     if const_expr(shared_b and need_fp8):
                         gate_v4 = gate_v4.to(fx.BFloat16).to(fx.Float32)
                         up_v4 = up_v4.to(fx.BFloat16).to(fx.Float32)
-                    if const_expr(act == "swiglu"):
-                        result = swiglu_mul_vec4(gate_v4, up_v4)
-                    elif const_expr(act == "situv2"):
-                        result = situ_mul_vec4(gate_v4, up_v4)
-                    else:
-                        result = silu_mul_vec4(gate_v4, up_v4)
+                    result = fx.Vector.from_elements(
+                        [
+                            activate_pair(fx.Vector(gate_v4)[i], fx.Vector(up_v4)[i])
+                            for i in range_constexpr(4)
+                        ],
+                        f32_t,
+                    )
                     if const_expr(shared_b and need_fp8):
                         result = result.to(fx.BFloat16).to(fx.Float32)
                     return result
@@ -2081,30 +1984,7 @@ def compile_mixed_moe_gemm1_common(
                     if const_expr(shared_b and need_fp8):
                         g = g.to(fx.BFloat16).to(fx.Float32)
                         u = u.to(fx.BFloat16).to(fx.Float32)
-                    if const_expr(act == "swiglu"):
-                        alpha = arith.constant(1.702, type=f32)
-                        one = arith.constant(1.0, type=f32)
-                        neg_log2e = arith.constant(-1.4426950408889634, type=f32)
-                        g = _clamp_gate(g)
-                        u = _clamp_lin(u)
-                        t = g * alpha * neg_log2e
-                        t_raw = t.ir_value() if hasattr(t, "ir_value") else t
-                        emu = llvm.call_intrinsic(
-                            f32, "llvm.amdgcn.exp2.f32", [t_raw], [], []
-                        )
-                        den = one + emu
-                        sig = llvm.call_intrinsic(
-                            f32, "llvm.amdgcn.rcp.f32", [den], [], []
-                        )
-                        result = g * sig * (u + one)
-                    elif const_expr(act == "situv2"):
-                        g = _clamp_gate(g)
-                        u = _clamp_lin(u)
-                        result = situ_elem(g) * situ_up_elem(u)
-                    else:
-                        g = _clamp_gate(g)
-                        u = _clamp_lin(u)
-                        result = silu_elem(g) * u
+                    result = activate_pair(g, u)
                     if const_expr(shared_b and need_fp8):
                         result = result.to(fx.BFloat16).to(fx.Float32)
                     return result
@@ -3547,12 +3427,8 @@ def compile_mixed_moe_gemm2_common(
 
             # A&B's scale preshuffle layout.  #3476: host e8m0_shuffle pads the
             c_k_orig = arith.constant(scale_k_padded, index=True)
-            layout_a_scale = make_preshuffle_scale_layout(
-                arith, c_mn=m_in, c_k=c_k_orig
-            )
-            layout_b_scale = make_preshuffle_scale_layout(
-                arith, c_mn=c_n_total, c_k=c_k_orig
-            )
+            layout_a_scale = make_preshuffle_scale_layout(c_mn=m_in, c_k=c_k_orig)
+            layout_b_scale = make_preshuffle_scale_layout(c_mn=c_n_total, c_k=c_k_orig)
 
             if const_expr(use_async_copy and a_elem_vec_pack > 1):
                 eff_lds_stride = lds_stride // a_elem_vec_pack
@@ -3841,7 +3717,6 @@ def compile_mixed_moe_gemm2_common(
 
                 def x_tile_chunk_coord_i32(i: int):
                     return tile_chunk_coord_i32(
-                        arith,
                         tx_i32_base=tx_i32_base,
                         i=i,
                         total_threads=total_threads,
@@ -4984,16 +4859,7 @@ def compile_mixed_moe_gemm2_common(
                             frag_vals.append(frag_vec[i].to(fx.Float32))
                         local_max = c0_f32_q
                         for i in range_constexpr(e_vec):
-                            abs_v = fx.Float32(
-                                llvm.call_intrinsic(
-                                    f32,
-                                    "llvm.fabs.f32",
-                                    [frag_vals[i].ir_value()],
-                                    [],
-                                    [],
-                                )
-                            )
-                            local_max = local_max.maximumf(abs_v)
+                            local_max = fx.max(local_max, abs(frag_vals[i]))
                         # opus: E = bf16/f32 biased exp(amax) - 7, clamp E>=1,
                         # E=0 when amax==0. scale byte = E; dequant = fp8*2^(E-127).
                         amax_bits = local_max.bitcast(fx.Int32)

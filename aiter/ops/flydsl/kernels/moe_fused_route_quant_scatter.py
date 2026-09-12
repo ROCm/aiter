@@ -86,6 +86,7 @@ from aiter.ops.flydsl.kernels.tensor_shim import (
     buf_scalar_load,
     ptr_buf_tensor,
 )
+from aiter.ops.flydsl.kernels.tensor_shim import _to_raw as _raw
 from aiter.utility.mx_types import (
     MX_DEFAULT_ROUND_MODE as _ROUND_MODE,
 )
@@ -165,20 +166,12 @@ def _cvt_scalef32_pk8_fp8_bf16(src_v8bf16, scale_f32, *, v2i32_ty):
     )
 
 
-def _raw(value):
-    """Unwrap a DSL Numeric to a raw ir.Value (rocdl ops need raw operands)."""
-    return value.ir_value() if hasattr(value, "ir_value") else value
-
-
 def _emit_pk8_lane_amax(bf16x8, c):
     """max(|x|) over the 8 bf16 this lane owns, as f32."""
-    f32 = c.f32
-    f32x8 = bf16x8.extf(T.vec(8, f32))
-    acc = c.c0_f32
+    f32x8 = bf16x8.to(fx.Float32)
+    acc = fx.Float32(c.c0_f32)
     for j in range_constexpr(8):
-        xj = fx.Vector(f32x8)[j]
-        absj = llvm.call_intrinsic(f32, "llvm.fabs.f32", [xj.ir_value()], [], [])
-        acc = arith.maximumf(acc, absj)
+        acc = fx.max(acc, abs(f32x8[j]))
     return acc
 
 
@@ -438,7 +431,7 @@ def _emit_quant_block_loop(c: SimpleNamespace) -> None:
                 peer_amax = block_amax.shuffle_xor(
                     arith.constant(dist, type=i32), c.c_wave
                 )
-                block_amax = arith.maximumf(block_amax, peer_amax)
+                block_amax = fx.max(block_amax, peer_amax)
 
             e8m0_scale = emit_mx_e8m0_scale(
                 block_amax, mode=_ROUND_MODE, dtype=c.mx_dtype
@@ -475,14 +468,12 @@ def _emit_quant_block_loop(c: SimpleNamespace) -> None:
 
             # per-block amax: max over this lane's 2 elems, then a butterfly
             # shuffle_xor across the block's 16 lanes.
-            abs0 = llvm.call_intrinsic(f32, "llvm.fabs.f32", [x0.ir_value()], [], [])
-            abs1 = llvm.call_intrinsic(f32, "llvm.fabs.f32", [x1.ir_value()], [], [])
-            block_amax = arith.maximumf(c.c0_f32, arith.maximumf(abs0, abs1))
+            block_amax = fx.max(fx.Float32(c.c0_f32), fx.max(abs(x0), abs(x1)))
             for dist in c.amax_shuffle_dists:
                 peer_amax = block_amax.shuffle_xor(
                     arith.constant(dist, type=i32), c.c_wave
                 )
-                block_amax = arith.maximumf(block_amax, peer_amax)
+                block_amax = fx.max(block_amax, peer_amax)
 
             e8m0_scale = emit_mx_e8m0_scale(
                 block_amax, mode=_ROUND_MODE, dtype=c.mx_dtype

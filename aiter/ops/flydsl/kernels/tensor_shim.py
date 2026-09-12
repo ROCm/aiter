@@ -303,29 +303,6 @@ def get_dtype_str(dtype):
         return "bf16"
 
 
-def get_dtype_in_kernel(dtype: str):
-    if dtype == "f32":
-        return T.f32
-    elif dtype == "f16":
-        return T.f16
-    elif dtype == "bf16":
-        return T.bf16
-
-
-def get_dtype_vec_size(dtype: str):
-    if dtype == "f32":
-        return 4
-    elif dtype == "f16" or dtype == "bf16":
-        return 8
-
-
-def get_dtype_bytes(dtype: str):
-    if dtype == "f32":
-        return 4
-    elif dtype == "f16" or dtype == "bf16":
-        return 2
-
-
 class TensorView:
     def __init__(self, dtype, shape, stride, base_offset, load_impl, store_impl):
         self.dtype = dtype
@@ -497,7 +474,7 @@ class GTensor(TensorBase):
         static_bytes_offset_i64=None,
     ):
         super().__init__(dtype, shape, stride, base_offset)
-        base = self.base_addr_i64(memref)
+        base = buf_base_i64(memref)
         if static_bytes_offset_i64 is not None:
             base = base + fx.Int64(static_bytes_offset_i64)
         self.base_i64 = base
@@ -544,16 +521,3 @@ class GTensor(TensorBase):
         return fx.rocdl.get_buffer_rsrc(
             fx.get_iter(self._view(_fx_elem(self.dtype), 1))
         )
-
-    @staticmethod
-    def base_addr_i64(ptr, ptr_type="!llvm.ptr<1>"):
-        """i64 base address of an fx pointer or a fly/memref value."""
-        return buf_base_i64(ptr)
-
-    def get_llvm_ptr(self, ptr, bytes_offset_i64, ptr_type="!llvm.ptr<1>"):
-        # fx.Int64 coerces index / i32 / i64 byte offsets to i64.
-        return llvm.AddOp(
-            _to_raw(self.base_addr_i64(ptr, ptr_type)),
-            _to_raw(fx.Int64(bytes_offset_i64)),
-            llvm.IntegerOverflowFlags(0),
-        ).result

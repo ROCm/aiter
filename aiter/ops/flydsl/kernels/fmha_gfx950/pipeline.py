@@ -4,13 +4,12 @@
 
 """Per-block forward pass: shared primitives, traits, and the kernel context."""
 
-import math as host_math
 from dataclasses import dataclass
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl._mlir import ir
-from flydsl._mlir.dialects import fly, llvm, vector
+from flydsl._mlir.dialects import fly, llvm
 from flydsl.expr import arith, const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import T
 from flydsl.expr.typing import Vector as Vec
@@ -18,7 +17,8 @@ from flydsl.expr.utils.arith import _to_raw as as_mlir_value
 
 from aiter.ops.flydsl.kernels import buffer_ops
 
-_LOG2E = host_math.log2(host_math.e)
+from ..act import LOG2E as _LOG2E
+
 _LN2 = 1.0 / _LOG2E
 
 # log2 of e4m3's largest finite value, 448.
@@ -58,7 +58,11 @@ def _ds_read_tr8_b64_imm(result_type, addr_i32, imm_offset=0):
         "=v,v,~{memory}",
         has_side_effects=True,
     )
-    return vector.BitCastOp(result_type, raw).result
+    return (
+        Vec(raw)
+        .bitcast(fx.Numeric.from_ir_type(ir.VectorType(result_type).element_type))
+        .ir_value()
+    )
 
 
 def _bitcast_i32(value):
