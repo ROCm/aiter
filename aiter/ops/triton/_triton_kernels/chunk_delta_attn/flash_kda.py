@@ -56,7 +56,6 @@ import triton.language as tl
 from aiter.ops.triton._triton_kernels.chunk_delta_attn.chunk_delta_attn_utils import (
     CHUNK_DELTA_ATTN_TRITON_AUTOTUNE,
     autotune_cache_kwargs,
-    chunk_delta_attn_autotune_configs,
     exp,
     exp2,
     input_guard,
@@ -65,6 +64,7 @@ from aiter.ops.triton._triton_kernels.chunk_delta_attn.chunk_delta_attn_utils im
 from aiter.ops.triton._triton_kernels.chunk_delta_attn.utils.index import (
     prepare_chunk_indices,
 )
+from aiter.ops.triton.utils.tuned_config_utils import autotune_configs
 
 # On by default. `flash_kda_supported` decides per call and anything outside the
 # restrictions above keeps the default pipeline, so this switch only exists to
@@ -98,7 +98,8 @@ FLASH_KDA_INV_BLOCK: int = 16
     }
 )
 @triton.autotune(
-    configs=chunk_delta_attn_autotune_configs(
+    configs=autotune_configs(
+        "CHUNK_DELTA_ATTN",
         [
             triton.Config({}, num_warps=nw, num_stages=ns)
             for nw in [2, 4]

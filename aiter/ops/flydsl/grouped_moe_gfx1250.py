@@ -633,6 +633,16 @@ def _grouped_a8w4_tdm_moe(
             f"row at model_dim {model_dim}, got {_src_width}"
         )
 
+    # The 16-row-interleaved a1 scale makes the quant pass write 4 B per cache
+    # line; the row-major form moves that interleave into gemm1's LDS read,
+    # which is free (~12 us off quant at 16k tokens, gemm1 unchanged). Only the
+    # topk=6 multidest quant path implements it.
+    _row_major_ascale = (
+        not _prequantized
+        and int(topk) == 6
+        and os.environ.get("AITER_FLYDSL_ROWMAJOR_ASCALE", "1") in ("1", "true", "True")
+    )
+
     a1_payload, a1_scale = flydsl_moe_fused_quant_preshuffle(
         hidden_states.reshape(1, token_num, _src_width),
         1,
@@ -644,6 +654,7 @@ def _grouped_a8w4_tdm_moe(
         source_topk=topk,
         num_valid_routes=_ep_nvr,
         prequantized_scale=src_a1_scale if _prequantized else None,
+        row_major_scale=_row_major_ascale,
     )
 
     # Fuse gemm1 activation + MX quantization + scale preshuffle into the
@@ -697,6 +708,7 @@ def _grouped_a8w4_tdm_moe(
             cluster_n=cluster_n,
             waves_per_tensor_tdm=waves_per_tensor_tdm,
             next_stage_prefetch=next_stage_prefetch,
+            row_major_ascale=int(_row_major_ascale),
             **_situ_kw,
         )
     else:
@@ -727,6 +739,7 @@ def _grouped_a8w4_tdm_moe(
             cluster_n=cluster_n,
             waves_per_tensor_tdm=waves_per_tensor_tdm,
             next_stage_prefetch=next_stage_prefetch,
+            row_major_ascale=int(_row_major_ascale),
             **_situ_kw,
         )
         a2_payload, a2_scale = flydsl_moe_fused_quant_preshuffle(
@@ -1421,6 +1434,12 @@ def contiguous_psum_remap(
             stream=torch.cuda.current_stream(),
         )
         return starts, psum, contiguous_m_t
+    from aiter.ops.flydsl.kernels.moe_contiguous_psum import MAX_REMAP_EXPERTS
+
+    assert experts <= MAX_REMAP_EXPERTS, (
+        f"contiguous_psum_remap holds one start per expert in LDS: "
+        f"experts={experts} exceeds MAX_REMAP_EXPERTS={MAX_REMAP_EXPERTS}"
+    )
     launch = _get_compiled_contiguous_psum_remap()
     launch(
         ptr_arg(masked_m_i32),
