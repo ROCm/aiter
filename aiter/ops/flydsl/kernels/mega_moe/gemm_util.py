@@ -220,10 +220,12 @@ class ATileLoader:
                 else fx.Boolean(True)
             )
 
+            # issue_copy is invoked below in this same iteration and never
+            # escapes it, so the late-binding B023 warns about cannot happen.
             @flyc.jit
             def issue_copy(active):
                 if active:
-                    physical = fx.Int32(round_base) + fx.Int32(self._tx)
+                    physical = fx.Int32(round_base) + fx.Int32(self._tx)  # noqa: B023
                     row = physical // fx.Int32(chunks_per_row)
                     physical_chunk = physical % fx.Int32(chunks_per_row)
                     if const_expr(self._swizzle):
@@ -236,7 +238,7 @@ class ATileLoader:
                         logical_chunk = physical_chunk
                     source_row = row
                     if const_expr(self._indexed_input):
-                        source_index = round_base // self._total_threads
+                        source_index = round_base // self._total_threads  # noqa: B023
                         source_byte = self._chunks[source_index][1]
                         source_row = source_byte // fx.Int32(self._row_bytes)
                     src_byte = (
@@ -249,7 +251,7 @@ class ATileLoader:
                         (None, src_byte),
                     )
                     wave_base = base_bytes + fx.Int32(
-                        (round_base + self._wave * 64) * 16
+                        (round_base + self._wave * 64) * 16  # noqa: B023
                     )
                     dst = fx.make_view(
                         fx.add_offset(lds_elem, wave_base),
