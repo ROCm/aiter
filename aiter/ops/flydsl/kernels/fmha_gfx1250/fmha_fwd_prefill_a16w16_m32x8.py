@@ -41,9 +41,6 @@ from flydsl._mlir.dialects import llvm as llvm_dialect
 from flydsl.expr import arith, gpu, rocdl
 from flydsl.expr import math as fmath
 
-# Runtime `if` helper the AST rewriter lowers dynamic conditions to. Called
-# explicitly here since _core_attention is a module-level helper (outside the
-# rewriter's @flyc.kernel scope), keeping side-effect guards free of raw scf.IfOp.
 # Q/K/V staging managers (own their LDS swizzles + async copy schedules). They are
 # self-contained: this kernel maintains its own arch constants below and passes the
 # config each manager needs through its constructor.
@@ -1139,9 +1136,7 @@ def _core_attention(
             if do_rescale_list[qt] is None:
                 o_resc = [ov * corr_vec for ov in o_vecs]
             else:
-                # Gate the wide multiply behind a wave-uniform scf.if (via the file's
-                # scf_if_dispatch idiom): the then-branch rescales, the omitted
-                # else-branch auto-passes o_acc through unchanged.
+                # Only rescale when the wave-uniform condition requires it.
                 o_resc = list(_maybe_rescale(o_vecs, corr_vec, do_rescale_list[qt]))
             o_resc_list.append(o_resc)
 

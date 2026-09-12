@@ -704,7 +704,7 @@ def _build_kernel(
             is_rope_t = (fx.Int32(tid) >= ROPE_THREAD_LO).ir_value()
             # rope_rel may be negative for NOPE threads; clamp to 0 so the
             # cos/sin load address is in-bounds (the loaded value is unused
-            # because is_rope_t = false). raw maxsi: no fx signed-int-max form.
+            # because is_rope_t = false).
             rope_rel_raw = fx.Int32(tid) - ROPE_THREAD_LO
             rope_rel = fx.max(rope_rel_raw, fx.Int32(0))
             cs_lo = fx.Int32(rope_rel) * PAIRS_PER_THREAD
@@ -1554,7 +1554,6 @@ def _build_kernel_ksplit(
                 cos_row_base = fx.Int32(comp_pos_i32) * (RD // 2)
 
                 is_rope_t = (fx.Int32(lid) >= ROPE_THREAD_LO).ir_value()
-                # raw maxsi: no fx signed-int-max form.
                 rope_rel_raw = fx.Int32(lid) - ROPE_THREAD_LO
                 rope_rel = fx.max(rope_rel_raw, fx.Int32(0))
                 cs_lo = fx.Int32(rope_rel) * PAIRS_PER_THREAD

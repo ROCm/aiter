@@ -1729,8 +1729,8 @@ class OManager16bV3:
     Accumulator (d-tile k, lane l = ``O[q=l%16, d=16k+(l//16)*8+{0..7}]``) -> row-major PADDED LDS
     ``[16, v_hdim]`` (row stride v_hdim+_O_PAD_ELEMS). Then the 16 x (v_hdim/8) b128 chunks are stored
     LDS->global over ``n_rounds`` waves of 32 lanes: round r lane l -> chunk c=r*32+l, row=c//cpr,
-    d_chunk=c%cpr (cpr = v_hdim/8) -> coalesced (consecutive lanes = consecutive global). Rows with
-    seq>=q_len are EXEC-masked off (async store has no bounds; ``scf_if_dispatch`` per lane).
+    d_chunk=c%cpr (cpr = v_hdim/8) -> coalesced (consecutive lanes = consecutive global).
+    Rows at seq>=q_len are masked off because async stores have no bounds check.
     """
 
     def __init__(
