@@ -1567,6 +1567,10 @@ def build_down_reduce_fp8_module(
       * router_ids   [B, TOPK]           int32
       * router_wts   [B, TOPK]           float32    (normalized to sum 1 per token)
       * y            [B, HIDDEN]         bf16
+
+    Preshuffled legal tiles (``k_batch==1``, INTER % 64, HIDDEN % 16) use
+    ``_build_down_fp8_preshuffled_native`` (16x4 pack loads, TOPK in the grid).
+    Gather is only the illegal-tile / split-K fallback.
     """
     if preshuffled and k_batch == 1 and inter % 64 == 0 and hidden % 16 == 0:
         return _build_down_fp8_preshuffled_native(

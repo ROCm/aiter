@@ -711,7 +711,9 @@ def flydsl_warp_decode_down_reduce(
             serialized ``s_nop 2`` baseline). Correctness-invariant.
         weight_layout: ``k_contiguous`` (default) or ``preshuffled`` (fused-MoE B
             from ``shuffle_weight`` / ``shuffle_weight_a16w4``). Never inferred
-            from strides.
+            from strides. Preshuffled FP8 uses the 16x4 native down kernel when
+            ``split_k==1``, INTER % 64, and HIDDEN % 16 (Qwen B=1 vs gather is
+            accepted; no small-INTER cutoff).
         out:          optional [B, HIDDEN] bfloat16 output buffer.
 
     Returns:
@@ -761,7 +763,7 @@ def flydsl_warp_decode_down_reduce(
         and split_k == 1
         and INTER % 64 == 0
         and HIDDEN % 16 == 0
-    )
+    )  # default; matches build_down_reduce_fp8_module native early-return
 
     launcher = _get_down_reduce(
         INTER,
@@ -778,8 +780,8 @@ def flydsl_warp_decode_down_reduce(
         dot2_acc,
         _preshuffled_flag(weight_layout),
     )
-    # Split-K and TOPK-parallel native down write FP32 partials via atomic-add
-    # into a caller-zeroed accumulator; the gather path stores bf16 to `out`.
+    # Split-K and default native down write FP32 partials via atomic-add into a
+    # caller-zeroed accumulator; k-contiguous / illegal-tile gather stores bf16.
     y_target = (
         torch.zeros((B, HIDDEN), dtype=torch.float32, device=intermediate.device)
         if split_k > 1 or native_fp8_down
