@@ -16,7 +16,7 @@ from aiter.ops.triton._triton_kernels.flash_attn_triton_amd.utils import (
 
 PREPROCESS_AUTOTUNE_KEYS = [
     "max_seqlen_q",
-    "ACTUAL_HEAD_DIM",
+    "ACTUAL_HEAD_DIM_V",
     "IS_VARLEN",
 ]
 
@@ -24,7 +24,8 @@ CAUSAL_AUTOTUNE_KEYS = [
     "dropout_p",
     "max_seqlen_q",
     "max_seqlen_k",
-    "ACTUAL_HEAD_DIM",
+    "ACTUAL_HEAD_DIM_QK",
+    "ACTUAL_HEAD_DIM_V",
     "IS_VARLEN",
     "HQ",
     "HK",
@@ -34,7 +35,8 @@ NONCAUSAL_AUTOTUNE_KEYS = [
     "dropout_p",
     "max_seqlen_q",
     "max_seqlen_k",
-    "ACTUAL_HEAD_DIM",
+    "ACTUAL_HEAD_DIM_QK",
+    "ACTUAL_HEAD_DIM_V",
     "IS_VARLEN",
     "HQ",
     "HK",
