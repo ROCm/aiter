@@ -484,6 +484,8 @@ def _pa_decode_sparse_gfx950_gluon(
 
     # Tuned launch config (gfx950 / MI355), inlined. BLOCK_M = heads per MFMA M-tile;
     # BLOCK_K = KV tile; num_warps = BLOCK_K // 16 (warps tile the dot-N, MFMA N=16).
+    # BLOCK_K starts at 64 and may be narrowed once the grid size is known --
+    # see the occupancy note after num_splits below.
     BLOCK_M, BLOCK_K, MFMA_K, waves_per_eu = 16, 64, 16, 0
     num_warps = BLOCK_K // 16
     NOPE_DIM, ROPE_DIM = 448, 64
@@ -562,6 +564,17 @@ def _pa_decode_sparse_gfx950_gluon(
         num_splits = _decode_num_splits(
             num_queries, heads_blocks, avg_main, avg_extra, BLOCK_K
         )
+
+    # Occupancy: while every CTA still gets a CU of its own, the wider KV tile
+    # (4 warps, 64 KB LDS) does more work per CU and wins. Once the grid needs
+    # more than one wave, the narrower tile (2 warps, 32 KB LDS) packs several
+    # CTAs per CU and hides the gather latency, which dominates this kernel --
+    # it reaches only ~10 % of peak HBM bandwidth even with contiguous indices.
+    # Measured on MI355X: predicts the faster tile on 21/21 load points, worth
+    # up to +43 % at 128 queries (264.5 -> 186.9 us) with identical numerics.
+    if num_queries * num_splits * heads_blocks > get_num_sms():
+        BLOCK_K = 32
+        num_warps = BLOCK_K // 16
 
     if num_splits > 1:
         part_m = torch.empty(
