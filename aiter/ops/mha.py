@@ -414,6 +414,7 @@ def gen_fmha_fwd_bf16_opus_fwd_fake(
     seqstart_k_pad: Tensor | None = None,
     max_seqlen_q: int = 0,
     max_seqlen_k: int = 0,
+    sink: Tensor | None = None,
 ) -> None:
     return None
 
@@ -456,15 +457,20 @@ def fmha_fwd_bf16_opus_fwd(
     lse: Tensor | None = None,
     sink: Tensor | None = None,
 ) -> Tensor | tuple[Tensor, Tensor]:
-    """Public wrapper for the OPUS gfx950 bf16 dense (batch) forward (D=128 and
-    D_QK=192/D_V=128). q/k/v are dense bshd [B, S, H, D]; allocates `out`
-    ([B, S, H_q, D_v]) if needed and forwards. The kernel applies `softmax_scale`
-    to Q·K^T internally and handles GQA fan-out.
+    """Public wrapper for the OPUS gfx950 bf16 dense (batch) forward: symmetric
+    D_QK == D_V in {64, 128}, plus D_QK=192/D_V=128. q/k/v are dense bshd
+    [B, S, H, D]; allocates `out` ([B, S, H_q, D_v]) if needed and forwards.
+    The kernel applies `softmax_scale` to Q·K^T internally and handles GQA fan-out.
+
+    `sink` is an optional attention sink: one fp32 logit per query head ([H_q]),
+    acting as a valueless extra key in the softmax denominator. It attenuates O
+    and raises lse, and is supported only by the symmetric kernel.
 
     `lse` is an output buffer for the log-sum-exp of the scaled scores ([B, H_q, S]
-    float32, natural log; rows that see no keys get -inf), filled when supplied and
-    allocated here when `return_lse` is set. Like `out` it does not change the return
-    type on its own: only `return_lse` does, and then the return is `(out, lse)`.
+    float32, natural log; rows that see no keys get -inf, or the sink logit when a
+    sink is set), filled when supplied and allocated here when `return_lse` is set.
+    Like `out` it does not change the return type on its own: only `return_lse`
+    does, and then the return is `(out, lse)`.
 
     Varlen / packed inputs go through `fmha_fwd_bf16_opus_varlen_fwd` instead.
     """
@@ -517,8 +523,9 @@ def fmha_fwd_bf16_opus_varlen_fwd(
     `lse` is an output buffer for the log-sum-exp of the scaled scores ([H_q, total_q]
     float32, natural log), filled when supplied and allocated here when `return_lse` is
     set. Like `out` it does not change the return type on its own: only `return_lse`
-    does, and then the return is `(out, lse)`. Rows that see no keys get -inf; rows in
-    the padding gaps of a KV-padded layout are left untouched.
+    does, and then the return is `(out, lse)`. Rows that see no keys get -inf, or the
+    sink logit when a sink is set; rows in the padding gaps of a KV-padded layout are
+    left untouched.
 
     seqstart_q / seqstart_k          : cumulative REAL sequence lengths (int32, len
                                        num_groups+1; drive masks / tile counts).
@@ -1815,6 +1822,23 @@ def fmha_v3_varlen_bwd(
 ) -> tuple[Tensor, Tensor, Tensor, Tensor]: ...
 
 
+def _reject_sink_autograd(entry, bwd_entry, grad_enabled, sink_ptr, *tensors):
+    """The forward applies the sink but every backward hard-codes sink=None, so a
+    gradient-tracked sink call would get dQ/dK/dV from a different softmax (and no
+    d_sink). Reject it instead. `grad_enabled` is passed in because grad mode is already
+    off inside autograd.Function.forward, where torch.is_grad_enabled() reads False.
+    """
+    if (
+        sink_ptr is not None
+        and grad_enabled
+        and any(t.requires_grad for t in (*tensors, sink_ptr))
+    ):
+        raise NotImplementedError(
+            f"attention sink is not differentiable through {entry}; call under "
+            f"torch.no_grad() for inference, or use {bwd_entry} with d_sink"
+        )
+
+
 def maybe_contiguous(x):
     return x.contiguous() if x is not None and x.stride(-1) != 1 else x
 
@@ -1894,7 +1918,7 @@ def _flash_attn_forward(
     _, seqlen_k, nhead_k, hdim_v = v.shape
     if sink_ptr is not None:
         assert sink_ptr.device == q.device, "sink_ptr must be on the same device as q"
-        assert sink_ptr.shape[0] == nhead_q, "sink_ptr has incorrect shape"
+        assert sink_ptr.shape == (nhead_q,), "sink_ptr must have shape [nhead_q]"
         if sink_ptr.dtype != torch.float32:
             sink_ptr = sink_ptr.to(torch.float32)
     # mask
@@ -2093,7 +2117,7 @@ def _flash_attn_forward(
             or (
                 hdim_q == hdim_v
                 and sink_ptr.dtype == dtypes.fp32
-                and sink_ptr.numel() == nhead_q
+                and sink_ptr.shape == (nhead_q,)
                 # our launcher reads the sink at unit stride; don't hand it a
                 # non-contiguous one -- fall back instead of failing its check.
                 and sink_ptr.is_contiguous()
@@ -2187,9 +2211,9 @@ def _flash_attn_forward(
         S_dmask = torch.empty((0,), dtype=torch.float32, device=q.device)
         rng_state = torch.empty((2,), dtype=torch.int64, device=q.device)
     elif can_impl_fmha_fwd_bf16_opus():
-        # OPUS gfx950 dense forward (shared entry point; dispatches D=128 vs
-        # D_QK=192/D_V=128 in C++ by head dim). The S_dmask/rng slots stay unused
-        # placeholders (the gate guarantees no dropout mask).
+        # OPUS gfx950 dense forward (shared entry point; dispatches symmetric D=64/128
+        # vs D_QK=192/D_V=128 in C++). The S_dmask/rng slots stay unused placeholders
+        # (the gate guarantees no dropout mask).
         softmax_lse = torch.empty(
             (batch_size, nhead_q, seqlen_q) if return_lse else (0,),
             dtype=torch.float32,
@@ -2647,6 +2671,9 @@ class FlashAttnFunc(torch.autograd.Function):
         out: torch.Tensor | None = None,
     ):
         is_grad = is_grad_enabled and any(x.requires_grad for x in [q, k, v])
+        _reject_sink_autograd(
+            "flash_attn_func", "mha_bwd", is_grad_enabled, sink_ptr, q, k, v
+        )
         if softmax_scale is None:
             softmax_scale = q.shape[-1] ** (-0.5)
         head_size_q_og = q.size(3)
@@ -2770,7 +2797,8 @@ class FlashAttnFunc(torch.autograd.Function):
         #              bwd sink gradient d_sink is computed inside mha_bwd kernel,
         #              not returned here as a positional gradient.)
         # 19 num_splits
-        # Need to return exactly 19 gradient entries.
+        # 20 out
+        # Need to return exactly 20 gradient entries.
         return (
             dq,  # q
             dk,  # k
@@ -2791,6 +2819,7 @@ class FlashAttnFunc(torch.autograd.Function):
             None,  # cu_seqlens_kv
             None,  # sink_ptr (not differentiable; bwd uses sink/d_sink args separately)
             None,  # num_splits
+            None,  # out
         )
 
 
@@ -2856,6 +2885,8 @@ def flash_attn_func(
            (they might not have the right scaling).
         cu_seqlens_q: (batch_size + 1,). The cumulative sequence lengths of the query sequences.
         cu_seqlens_kv: (batch_size + 1,). The cumulative sequence lengths of the key/value sequences.
+        sink_ptr: (nheads,), fp32. Optional valueless attention-sink logit per query
+            head. Sink-enabled calls are forward-only and must run without autograd.
         num_splits: int. Number of key/value splits for the native split-K forward path.
             0 (default) lets aiter decide via a heuristic; 1 disables split-K (uses the
             standard CK/ASM dispatch); >=2 forces the native split-K kernel with that many
@@ -2871,6 +2902,10 @@ def flash_attn_func(
             The output of softmax (possibly with different scaling). It also encodes the dropout
             pattern (negative means that location was dropped, nonnegative means it was kept).
     """
+    _reject_sink_autograd(
+        "flash_attn_func", "mha_bwd", torch.is_grad_enabled(), sink_ptr, q, k, v
+    )
+
     # FlyDSL path returns result if supported, None otherwise. window_size[2] (sink
     # size) is unsupported: the FlyDSL gate rejects it, and this screen keeps it off
     # the path so a sink-token request is never silently dropped.
@@ -2896,6 +2931,7 @@ def flash_attn_func(
             deterministic=deterministic,
             return_attn_probs=return_attn_probs,
             sink=sink_ptr,
+            out=out,
         )
         if _flydsl_result is not None:
             return _flydsl_result
@@ -2985,7 +3021,7 @@ def _flash_attn_varlen_forward(
     hdim_v = v.shape[-1]
     if sink_ptr is not None:
         assert sink_ptr.device == q.device, "sink_ptr must be on the same device as q"
-        assert sink_ptr.shape[0] == nhead_q, "sink_ptr has incorrect shape"
+        assert sink_ptr.shape == (nhead_q,), "sink_ptr must have shape [nhead_q]"
         if sink_ptr.dtype != torch.float32:
             sink_ptr = sink_ptr.to(torch.float32)
     # mask
@@ -3113,8 +3149,13 @@ def _flash_attn_varlen_forward(
         if int(os.environ.get("AITER_ENABLE_FMHA_OPUS", "0")) == 0:
             return False
         ret = get_gfx() == "gfx950"
+        # One owner per shape: batch-1 goes through the router above, which reshapes to the
+        # dense entry and can slice an oversized K/V workspace. Group mode takes the rest.
+        ret = ret and (batch_size > 1)
         ret = ret and (q.dtype == dtypes.bf16)
         ret = ret and (hdim_q == hdim_v and hdim_q in (64, 128))
+        ret = ret and (k.shape[-1] == hdim_q and k.shape[-2] == nhead_k)
+        ret = ret and (k.shape[0] == v.shape[0])
         ret = ret and (nhead_q % nhead_k == 0)
         ret = ret and (not swa)
         ret = ret and (dropout_p == 0.0)
@@ -3133,7 +3174,7 @@ def _flash_attn_varlen_forward(
             sink_ptr is None
             or (
                 sink_ptr.dtype == dtypes.fp32
-                and sink_ptr.numel() == nhead_q
+                and sink_ptr.shape == (nhead_q,)
                 and sink_ptr.is_contiguous()
             )
         )
@@ -3604,6 +3645,15 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
         v_descale=None,
     ):
         is_grad = is_grad_enabled and any(x.requires_grad for x in [q, k, v])
+        _reject_sink_autograd(
+            "flash_attn_varlen_func",
+            "mha_varlen_bwd",
+            is_grad_enabled,
+            sink_ptr,
+            q,
+            k,
+            v,
+        )
         if softmax_scale is None:
             softmax_scale = q.shape[-1] ** (-0.5)
         head_size_q_og = q.size(-1)
@@ -3810,6 +3860,15 @@ def flash_attn_varlen_func(
     k_descale: torch.Tensor | None = None,
     v_descale: torch.Tensor | None = None,
 ):
+    _reject_sink_autograd(
+        "flash_attn_varlen_func",
+        "mha_varlen_bwd",
+        torch.is_grad_enabled(),
+        sink_ptr,
+        q,
+        k,
+        v,
+    )
     if block_table is not None and (
         cu_seqlens_q_padded is not None or cu_seqlens_k_padded is not None
     ):
@@ -3864,6 +3923,10 @@ def flash_attn_varlen_func(
         return_attn_probs: bool. Whether to return the attention probabilities. This option is for
            testing only. The returned probabilities are not guaranteed to be correct
            (they might not have the right scaling).
+        out: (total_q, nheads, headdim_v). Optional caller-owned output buffer,
+            written in place and returned.
+        sink_ptr: (nheads,), fp32. Optional valueless attention-sink logit per query
+            head. Sink-enabled calls are forward-only and must run without autograd.
     Return:
         out: (total, nheads, headdim_v).
         softmax_lse [optional, if return_attn_probs=True]: (nheads, total_q_seqlen). The
@@ -3958,9 +4021,8 @@ def flash_attn_varlen_func(
         )
 
     # A varlen batch holding exactly ONE sequence is the same problem as a dense
-    # batch-1 call, so route it to the dense entry -- which is where the OPUS
-    # symmetric-head-dim kernels live (they are batch-mode only). This is what lets a
-    # single-request prefill reach OPUS instead of falling back to CK.
+    # batch-1 call, so route it to the dense specialization. Besides avoiding group-mode
+    # overhead, this is what permits the oversized K/V workspace slicing below.
     #
     # Detection is deliberately sync-free: cu_seqlens has batch+1 entries so
     # numel() == 2 means one sequence (metadata only, no D2H), and max_seqlen_* are

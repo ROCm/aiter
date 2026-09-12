@@ -185,8 +185,8 @@ void launch_d128(at::Tensor& q,
         }
     }
 
-    // Attention sinks: one fp32 logit per QUERY head, [H], unit stride. Only the
-    // denominator is affected, so no extra output buffer is needed.
+    // Attention sink: one fp32 valueless logit per QUERY head, [H], unit stride. It
+    // changes the softmax denominator without requiring an extra value/output buffer.
     if (sink.has_value()) {
         const at::Tensor& s = *sink;
         TORCH_CHECK(s.device() == q.device(), "sink must be on the same device as q");

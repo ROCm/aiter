@@ -1,4 +1,4 @@
-// GQA flash attention kernel template for D=128 on gfx950
+// GQA flash attention kernel template for symmetric D in {64, 128} on gfx950.
 // Include this header from per-variant .cc files that instantiate specific traits.
 #pragma once
 
@@ -728,27 +728,24 @@ __device__ __attribute__((always_inline)) void gqa_d128_impl(opus_gqa_kargs karg
     // runs no prologue, so neither wave group owes the other one.
     auto store_result = [&]() {
         // ── attention sink ────────────────────────────────────────────────────────────
-        // A learned per-head logit acting as one extra key that contributes to the
-        // softmax denominator but carries no value. Since
-        //   out = (sum_j exp(s_j - m) v_j) / (sum_j exp(s_j - m) + exp(sink - m))
-        // it enters ONLY the denominator: v_o needs no rescale, and folding it into l_row
-        // here fixes both the O normalization and the LSE below in one place.
-        //
-        // m_row/l_row are base-2 (exp2, with log2(e) folded into temperature_scale) while
-        // the sink arrives as a natural-log logit, hence the LOG2_E conversion.
-        //
-        // l_row == 0 means no key contributed (no keys at all, or all masked). m_row is
-        // then still lowest(), so referencing the exponent to it would overflow; reference
-        // the sink to itself instead, giving l_row = 1, O = 0 and lse = sink -- the
-        // correct "attends entirely to the sink" answer.
+        // A per-head logit acting as one valueless extra key in the softmax denominator.
+        // Rebase onto M = max(m_row, sink) before folding it in so a dominant sink cannot
+        // overflow exp2. The numerator and denominator rescale by
+        // alpha = exp2(m_row - M); LOG2_E converts the natural-log sink to the kernel's
+        // base-2 exponent. alpha folds into l_inv below, so v_o is scaled once. With no
+        // keys, m_row=lowest and l_row=0, so alpha=0, l_row=1, O=0, and lse=sink.
+        D_ACC alpha = D_ACC(1.0f);
         if (kargs.ptr_sink != nullptr) {
             const D_ACC sink_b2 =
                 reinterpret_cast<const D_ACC*>(kargs.ptr_sink)[h] * D_ACC(LOG2_E);
-            const bool have_keys = (l_row > D_ACC(0.0f));
-            const D_ACC m_ref = have_keys ? m_row : sink_b2;
-            l_row = (have_keys ? l_row : D_ACC(0.0f)) +
-                    __builtin_amdgcn_exp2f(sink_b2 - m_ref);
-            m_row = m_ref;
+            const D_ACC m_new = (m_row > sink_b2) ? m_row : sink_b2;
+            alpha = __builtin_amdgcn_exp2f(m_row - m_new);
+            // Avoid exp2(+inf - +inf): when the sink is M its contribution is exactly 1.
+            const D_ACC sink_term =
+                (sink_b2 >= m_new) ? D_ACC(1.0f)
+                                   : __builtin_amdgcn_exp2f(sink_b2 - m_new);
+            l_row = l_row * alpha + sink_term;
+            m_row = m_new;
         }
 
         if (kargs.ptr_lse != nullptr && lane_id < T::W_M) {
@@ -764,7 +761,7 @@ __device__ __attribute__((always_inline)) void gqa_d128_impl(opus_gqa_kargs karg
             g_lse.store(lse, warp_id * T::Q_TILE_SIZE + lane_id);
         }
 
-        D_ACC l_inv = (l_row > D_ACC(0.0f)) ? (D_ACC(1.0f) / l_row) : D_ACC(0.0f);
+        D_ACC l_inv = (l_row > D_ACC(0.0f)) ? (alpha / l_row) : D_ACC(0.0f);
         static_for<o_len>([&](auto i) { v_o[i.value] *= l_inv; });
 
         // Widened store: each dwordx4 (VEC_O_X4) group is packed and stored one group at a
