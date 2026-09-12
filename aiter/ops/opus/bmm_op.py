@@ -298,6 +298,7 @@ _BPRESHUF_TILE_BN = {
     27: (256, 256),                      # per-column prefill, wide
     28: (256, 256), 29: (128, 128),      # 128x128 blocked prefill
     30: (256, 256), 31: (128, 128),      # ... and their scale-in-LDS siblings
+    35: (256, 256),                      # kid30's tile at B_K=256 / slots=2
 }
 # Largest m the decode tiles were swept at. Past it, kid0.
 _BPRESHUF_DECODE_M_MAX = 256
@@ -370,18 +371,20 @@ def _heuristic_bpreshuffle_kid(
         # against kid31's 21. kid8 (16x64) takes m <= 16, kid10 (16x192) the rest
         # of the band.
         #
-        # Above it, kid30 (256x256) vs kid31 (128x128) splits on kid30's own
+        # Above it, kid35 (256x256) vs kid31 (128x128) splits on kid35's own
         # workgroup count reaching HALF the CU count -- 13 of 13 cells, no batch
         # term needed (unlike the kid28/29 rule this replaces, whose batch term
-        # was fitted to two cells and never understood).
+        # was fitted to two cells and never understood). kid35 took this slot
+        # from kid30 -- same tile, B_K doubled to give kExpK=2 -- and beats it by
+        # 13%-27% everywhere, so kid30 no longer wins a single swept cell.
         #
         # Names the measured winner in 48 of 55 cells; every miss is a near-tie
         # it declines to chase (worst 6.7%, at b<=2 m=32 where kid8 edges kid10).
         if m <= 128 and m * batch <= 256:
             return 8 if m <= 16 else 10
-        bm30, bn30 = _BPRESHUF_TILE_BN[30]
-        wg30 = -(-m // bm30) * -(-n // bn30) * batch
-        return 30 if wg30 * 2 >= cus else 31
+        bm35, bn35 = _BPRESHUF_TILE_BN[35]
+        wg35 = -(-m // bm35) * -(-n // bn35) * batch
+        return 35 if wg35 * 2 >= cus else 31
     if m > _BPRESHUF_DECODE_M_MAX:
         # Prefill. Two tiles, split on kid27's own workgroup count.
         #

@@ -1797,6 +1797,31 @@ using opus_bmm_a8w8_mxscale_bpreshuffle_tile_ns128x512_gn128_sf_gfx1250 =
         /*SF_A_LDS*/true, /*SF_B_LDS*/true,
         /*SF_A_TDM_KG*/0, /*SF_A_TDM_PAD*/16, /*TILE_M*/1, /*NO_SPEC*/true>;
 
+// kid35: kid30 with B_K doubled and the ring shortened, so kExpK goes 1 -> 2.
+//
+// ATT on kid30 put 26,232 cycles -- 25% of its latency -- in s_wait_dscnt, at 44
+// cycles per wait against FlyDSL's 7.6 for the same number of waits. The waits
+// are not more numerous, each one is longer: the fragment ds_reads are issued in
+// the same ik that consumes them, so there is nothing to hide them behind.
+// FlyDSL loads ik+1's fragments during ik's WMMAs, which needs kExpK > 1 -- and
+// kid30 has kExpK = kBlockK/kWmmaK = 128/128 = 1, so it has no second ik to
+// pipeline against and the existing front/back split is all the overlap it can
+// get.
+//
+// B_K=256 gives kExpK=2. It does NOT fit at slots=3 (396 KB against the 320 KB
+// budget, which is why kid27 took B_K=128 in the first place), but at slots=2 it
+// does: 2 * (256*144 + 16*4096) = 200 KB plus the scale panels. Shorter ring for
+// deeper per-slot reuse is the trade, and kid35-vs-kid30 prices it.
+template <typename DataC>
+using opus_bmm_a8w8_mxscale_bpreshuffle_tile_ns256_gn128_sf_bk256_gfx1250 =
+    opus_bmm_a8w8_mxscale_bpreshuffle_traits_gfx1250<
+        /*BLOCK_SIZE*/256, /*B_M*/256, /*B_N*/256, /*B_K*/256,
+        /*LAYOUT*/opus_gfx1250_bmm::kLayoutTileN,
+        /*D_A*/opus::fp8_t, /*D_B*/opus::fp8_t, /*D_C*/DataC, /*D_ACC*/float,
+        /*GROUP_K*/128, /*NUM_SLOTS*/2, /*WG_PER_CU*/1, /*GROUP_N*/128,
+        /*SF_A_LDS*/true, /*SF_B_LDS*/true,
+        /*SF_A_TDM_KG*/0, /*SF_A_TDM_PAD*/16, /*TILE_M*/2, /*NO_SPEC*/true>;
+
 // -- smem -> register read layouts -----------------------------------------
 // Device-only in effect, but compiled on the host pass too so vtype_c matches.
 #if defined(__gfx1250__) || !defined(__HIP_DEVICE_COMPILE__)
