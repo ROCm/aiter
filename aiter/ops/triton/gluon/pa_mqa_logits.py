@@ -309,9 +309,16 @@ def _gluon_deepgemm_fp8_paged_mqa_logits(
                 context_idx
                 + gl.arange(0, ChunkK, layout=gl.SliceLayout(0, mfma_layout))
             ),
-            mask=context_idx
-            + gl.arange(0, ChunkK, layout=gl.SliceLayout(0, mfma_layout))
-            >= 0,
+            mask=(
+                context_idx
+                + gl.arange(0, ChunkK, layout=gl.SliceLayout(0, mfma_layout))
+                >= 0
+            )
+            & (
+                context_idx
+                + gl.arange(0, ChunkK, layout=gl.SliceLayout(0, mfma_layout))
+                < max_model_len
+            ),
         )
 
     context_idx = split_context_start + split_context_length - ChunkK
@@ -342,8 +349,14 @@ def _gluon_deepgemm_fp8_paged_mqa_logits(
         offsets=(
             context_idx + gl.arange(0, ChunkK, layout=gl.SliceLayout(0, mfma_layout))
         ),
-        mask=context_idx + gl.arange(0, ChunkK, layout=gl.SliceLayout(0, mfma_layout))
-        >= 0,
+        mask=(
+            context_idx + gl.arange(0, ChunkK, layout=gl.SliceLayout(0, mfma_layout))
+            >= 0
+        )
+        & (
+            context_idx + gl.arange(0, ChunkK, layout=gl.SliceLayout(0, mfma_layout))
+            < max_model_len
+        ),
     )
 
 
@@ -812,9 +825,16 @@ def _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle(
                 context_idx
                 + gl.arange(0, ChunkKPerStage, layout=gl.SliceLayout(0, mfma_layout))
             ),
-            mask=context_idx
-            + gl.arange(0, ChunkKPerStage, layout=gl.SliceLayout(0, mfma_layout))
-            >= split_context_start,
+            mask=(
+                context_idx
+                + gl.arange(0, ChunkKPerStage, layout=gl.SliceLayout(0, mfma_layout))
+                >= split_context_start
+            )
+            & (
+                context_idx
+                + gl.arange(0, ChunkKPerStage, layout=gl.SliceLayout(0, mfma_layout))
+                < max_model_len
+            ),
         )
 
         for context_idx in range(
@@ -881,10 +901,22 @@ def _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle(
                         0, ChunkKPerStage, layout=gl.SliceLayout(0, mfma_layout)
                     )
                 ),
-                mask=context_idx
-                + ChunkKPerStage
-                + gl.arange(0, ChunkKPerStage, layout=gl.SliceLayout(0, mfma_layout))
-                >= split_context_start,
+                mask=(
+                    context_idx
+                    + ChunkKPerStage
+                    + gl.arange(
+                        0, ChunkKPerStage, layout=gl.SliceLayout(0, mfma_layout)
+                    )
+                    >= split_context_start
+                )
+                & (
+                    context_idx
+                    + ChunkKPerStage
+                    + gl.arange(
+                        0, ChunkKPerStage, layout=gl.SliceLayout(0, mfma_layout)
+                    )
+                    < max_model_len
+                ),
             )
 
             # =======================================================================================
@@ -996,10 +1028,18 @@ def _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle(
                 + ChunkKPerStage
                 + gl.arange(0, ChunkKPerStage, layout=gl.SliceLayout(0, mfma_layout))
             ),
-            mask=context_idx
-            + ChunkKPerStage
-            + gl.arange(0, ChunkKPerStage, layout=gl.SliceLayout(0, mfma_layout))
-            >= split_context_start,
+            mask=(
+                context_idx
+                + ChunkKPerStage
+                + gl.arange(0, ChunkKPerStage, layout=gl.SliceLayout(0, mfma_layout))
+                >= split_context_start
+            )
+            & (
+                context_idx
+                + ChunkKPerStage
+                + gl.arange(0, ChunkKPerStage, layout=gl.SliceLayout(0, mfma_layout))
+                < max_model_len
+            ),
         )
     else:
         context_idx = split_context_start
@@ -1663,9 +1703,16 @@ def _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle_varctx(
                 context_idx
                 + gl.arange(0, ChunkKPerStage, layout=gl.SliceLayout(0, mfma_layout))
             ),
-            mask=context_idx
-            + gl.arange(0, ChunkKPerStage, layout=gl.SliceLayout(0, mfma_layout))
-            >= split_context_start,
+            mask=(
+                context_idx
+                + gl.arange(0, ChunkKPerStage, layout=gl.SliceLayout(0, mfma_layout))
+                >= split_context_start
+            )
+            & (
+                context_idx
+                + gl.arange(0, ChunkKPerStage, layout=gl.SliceLayout(0, mfma_layout))
+                < max_model_len
+            ),
         )
 
         for context_idx in range(
@@ -1731,10 +1778,22 @@ def _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle_varctx(
                         0, ChunkKPerStage, layout=gl.SliceLayout(0, mfma_layout)
                     )
                 ),
-                mask=context_idx
-                + ChunkKPerStage
-                + gl.arange(0, ChunkKPerStage, layout=gl.SliceLayout(0, mfma_layout))
-                >= split_context_start,
+                mask=(
+                    context_idx
+                    + ChunkKPerStage
+                    + gl.arange(
+                        0, ChunkKPerStage, layout=gl.SliceLayout(0, mfma_layout)
+                    )
+                    >= split_context_start
+                )
+                & (
+                    context_idx
+                    + ChunkKPerStage
+                    + gl.arange(
+                        0, ChunkKPerStage, layout=gl.SliceLayout(0, mfma_layout)
+                    )
+                    < max_model_len
+                ),
             )
 
             # =======================================================================================
@@ -1845,10 +1904,18 @@ def _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle_varctx(
                 + ChunkKPerStage
                 + gl.arange(0, ChunkKPerStage, layout=gl.SliceLayout(0, mfma_layout))
             ),
-            mask=context_idx
-            + ChunkKPerStage
-            + gl.arange(0, ChunkKPerStage, layout=gl.SliceLayout(0, mfma_layout))
-            >= split_context_start,
+            mask=(
+                context_idx
+                + ChunkKPerStage
+                + gl.arange(0, ChunkKPerStage, layout=gl.SliceLayout(0, mfma_layout))
+                >= split_context_start
+            )
+            & (
+                context_idx
+                + ChunkKPerStage
+                + gl.arange(0, ChunkKPerStage, layout=gl.SliceLayout(0, mfma_layout))
+                < max_model_len
+            ),
         )
     else:
         context_idx = split_context_start
