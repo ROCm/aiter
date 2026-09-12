@@ -187,7 +187,15 @@ void bmm_a8w8_mxscale_bpreshuffle_nospec_kernel_gfx1250(opus_bmm_a8w8_mxscale_ka
             opus::s_wait_tensorcnt<0>();
         }
     }
-    if constexpr (T::kSfACoop || T::kSfBLds) {
+    // Defined here, CALLED after the ring prime. Only the definition can sit
+    // this early: the body is `ds_store(load(global))`, so the store waits on a
+    // cold global round-trip, and anything after it waits too. 1c12016a moved
+    // the panels' publish barrier past the prime but left the fill itself in
+    // front, which is why the ISA still showed four `s_wait_loadcnt 0x0` ->
+    // `ds_store` pairs before the first TDM went out -- two serialised round
+    // trips with the copy engine idle. The fill needs nothing the windows
+    // produce, so it can simply follow them.
+    auto fill_scale_panels = [&]() __attribute__((always_inline)) {
         const int tid = (int)opus::thread_id_x();
         // Flat index over the SOURCE row length; the destination re-applies
         // sf_pitch. VEC divides sf_kg on the wide rung, so kt is a multiple of
@@ -236,14 +244,7 @@ void bmm_a8w8_mxscale_bpreshuffle_nospec_kernel_gfx1250(opus_bmm_a8w8_mxscale_ka
                        kargs.stride_sfb, smem_sfb, T::kSfBPanelRows,
                        (unsigned)((nb_max - sfb_nb_base) * kargs.stride_sfb + sf_kg));
         }
-        // The waits and the barrier that publish these panels are NOT here --
-        // they sit after the ring prime, below. Waiting for the scale fetch
-        // before the first TDM has even been issued leaves the copy engine idle
-        // for the whole fill: ATT measured one 2629-cycle barrier in the
-        // prologue, 83% of this kernel's barrier time. Issuing the prime first
-        // overlaps the two, and the counters do not collide -- the panels are
-        // loadcnt/dscnt, the ring is tensorcnt.
-    }
+    };
 
     // ---------------------------------------------------------------------
     // Per-wave loads. Waves [0, kLoadWavesA) own A row-slices, the rest own B
@@ -743,10 +744,13 @@ void bmm_a8w8_mxscale_bpreshuffle_nospec_kernel_gfx1250(opus_bmm_a8w8_mxscale_ka
         const int prime = opus_bmm_mx_min_i(k_steps, T::kNumSlots - 1);
         for (int i = 0; i < prime; ++i) issue_slot(i, i > 0);
 
-        // Now publish the scale panels filled above. s_barrier retires neither
-        // counter on its own: loadcnt for the global reads feeding them, dscnt
-        // for the ds_writes. Both had the prime's TDM issue to hide behind.
+        // Fill and then publish the scale panels. Both halves sit here so the
+        // panels' global reads and their ds_writes hide behind the prime's TDM
+        // rather than delaying it; the counters do not collide (panels are
+        // loadcnt/dscnt, the ring is tensorcnt), and s_barrier retires neither
+        // on its own, hence the explicit waits.
         if constexpr (T::kSfACoop || T::kSfBLds) {
+            fill_scale_panels();
             opus::s_wait_loadcnt<0>();
             opus::s_wait_dscnt<0>();
         }
