@@ -15,10 +15,6 @@ ordering is caught without launching a kernel.
 import pytest
 import torch
 
-from aiter.ops.triton.utils.unified_attention_utils import get_unified_attention_config
-
-GFX = torch.cuda.get_device_capability()  # unused; arch resolved by get_gfx()
-
 
 class _Params:
     """Minimal stand-in for the wrapper's _UAParams (only lookup axes used)."""
@@ -38,8 +34,8 @@ class _Params:
 
 def _matched_key(params):
     from aiter.ops.triton.utils.unified_attention_utils import (
-        _load,
         _axis_values,
+        _load,
         _lookup,
     )
 
