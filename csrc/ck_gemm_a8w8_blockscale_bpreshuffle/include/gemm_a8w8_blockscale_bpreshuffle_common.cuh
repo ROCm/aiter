@@ -119,8 +119,11 @@ __forceinline__ torch::Tensor gemm_a8w8_blockscale_bpreshuffle_impl(torch::Tenso
                                                                     torch::Tensor& WQ,
                                                                     torch::Tensor& x_scale,
                                                                     torch::Tensor& w_scale,
-                                                                    torch::Tensor& Y)
+                                                                    torch::Tensor& Y,
+                                                                    int KBatch = 1)
 {
+    TORCH_CHECK(KBatch >= 1, "KBatch must be >= 1, got ", KBatch);
+
     int M = XQ.size(0);
     int N = WQ.size(0);
     int K = XQ.size(1);
@@ -155,7 +158,8 @@ __forceinline__ torch::Tensor gemm_a8w8_blockscale_bpreshuffle_impl(torch::Tenso
         reinterpret_cast<DDataType*>(w_scale.data_ptr()),
         a_element_op,
         b_element_op,
-        cde_element_op);
+        cde_element_op,
+        KBatch);
 
     TORCH_CHECK(device_gemm.IsSupportedArgument(argument), "This GEMM is not supported!");
 
