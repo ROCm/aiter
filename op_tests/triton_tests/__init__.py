@@ -5,7 +5,10 @@ import sys
 
 # Under pytest, silence aiter's INFO chatter (e.g. checkAllclose "passed~") unless the caller
 # set AITER_LOG_LEVEL; aiter/__init__.py reads it once, on the first import triggered below.
-if "pytest" in sys.modules and "AITER_LOG_LEVEL" not in os.environ:
-    os.environ["AITER_LOG_LEVEL"] = "WARNING"
+if "pytest" in sys.modules:
+    if "AITER_LOG_LEVEL" not in os.environ:
+        os.environ["AITER_LOG_LEVEL"] = "WARNING"
+    # Unit tests run the Dao-AI flash-attention port on its fixed default configs, not autotuning.
+    os.environ.setdefault("FLASH_ATTENTION_TRITON_AMD_AUTOTUNE", "0")
 
 from op_tests.triton_tests.utils import *
