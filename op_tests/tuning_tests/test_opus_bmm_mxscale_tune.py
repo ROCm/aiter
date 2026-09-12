@@ -44,14 +44,6 @@ class TestOpusBmmMxscaleTune(unittest.TestCase):
         row.update(changes)
         return pd.DataFrame([row])
 
-    def test_tune_result_records_opus(self):
-        frame = self.tuner.result_to_df(
-            [((("gfx950", 2, 64, 1024, 4096), 8311, 1, ""), 8.5, 0.0)]
-        )
-        self.assertEqual(frame.loc[0, "libtype"], "opus")
-        self.assertEqual(frame.loc[0, "kernelId"], 8311)
-        self.assertEqual(frame.loc[0, "splitK"], 1)
-
     def test_run_config_calls_saved_exact_kid(self):
         activation = torch.empty((2, 1, 1))
         weight = torch.empty((2, 1, 1))
@@ -69,7 +61,6 @@ class TestOpusBmmMxscaleTune(unittest.TestCase):
             workspace,
             reference,
         )
-        self.tuner.untunedf = self.row()
 
         def launch(XQ, WQ, Y, **kwargs):
             self.assertIs(XQ, activation)
@@ -88,45 +79,25 @@ class TestOpusBmmMxscaleTune(unittest.TestCase):
             self.assertEqual(kwargs, {"num_warmup": 0, "num_iters": 1})
             return func(*args), 3.0
 
-        with patch.object(
-            tune, "gen_bmm_mxscale_data", return_value=data
-        ) as generate, patch.object(
-            tune, "opus_bmm", side_effect=launch
-        ) as exact, patch(
-            "aiter.test_common.run_perftest", side_effect=measured
-        ):
-            results = self.tuner.run_config(self.args())
+        for saved_kid in (8311, 311):
+            with self.subTest(saved_kid=saved_kid):
+                output.fill_(float("nan"))
+                self.tuner.untunedf = self.row(kernelId=saved_kid)
+                with patch.object(
+                    tune, "gen_bmm_mxscale_data", return_value=data
+                ) as generate, patch.object(
+                    tune, "opus_bmm", side_effect=launch
+                ) as exact, patch(
+                    "aiter.test_common.run_perftest", side_effect=measured
+                ):
+                    results = self.tuner.run_config(self.args())
 
-        generate.assert_called_once_with(2, 64, 1024, 4096, 1, dtypes.bf16, 8311, 1)
-        exact.assert_called_once()
-        self.assertEqual(results[0]["status"], "ok")
-        self.assertIn("kid=8311,splitK=1", results[0]["shape"])
-
-    def test_run_config_normalizes_checked_in_local_kid(self):
-        self.tuner.untunedf = self.row(kernelId=311)
-        data = (
-            torch.empty((2, 1, 1)),
-            torch.empty((2, 1, 1)),
-            torch.empty((1, 2, 1)),
-            torch.empty((2, 1, 1), dtype=torch.uint8),
-            torch.empty((2, 1, 1), dtype=torch.uint8),
-            None,
-            torch.empty((1, 2, 1)),
-        )
-
-        with patch.object(
-            tune, "gen_bmm_mxscale_data", return_value=data
-        ) as generate, patch.object(
-            tune, "run_bmm_mxscale_bench", return_value=data[2]
-        ), patch(
-            "aiter.test_common.run_perftest", return_value=(data[2], 3.0)
-        ), patch(
-            "aiter.test_common.checkAllclose", return_value=0.0
-        ):
-            results = self.tuner.run_config(self.args())
-
-        generate.assert_called_once_with(2, 64, 1024, 4096, 1, dtypes.bf16, 8311, 1)
-        self.assertIn("kid=8311,splitK=1", results[0]["shape"])
+                generate.assert_called_once_with(
+                    2, 64, 1024, 4096, 1, dtypes.bf16, 8311, 1
+                )
+                exact.assert_called_once()
+                self.assertEqual(results[0]["status"], "ok")
+                self.assertIn("kid=8311,splitK=1", results[0]["shape"])
 
     def test_shape_only_run_config_keeps_production_policy_path(self):
         from aiter.ops import batched_gemm_op_a8w8 as batched

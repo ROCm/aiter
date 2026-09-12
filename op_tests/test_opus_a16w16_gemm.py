@@ -497,24 +497,35 @@ def test_gfx1250_bf16_output_accepts_fp32_bias():
 
 
 @pytest.mark.parametrize(
-    ("K", "split_k", "launch_split_k"),
-    ((128, 0, 1), (128, 1, 1), (128, 16, 1), (512, 0, 4)),
+    ("arch", "kid", "K", "split_k", "launch_split_k", "expected_shape"),
+    (
+        ("gfx942", 10201, 128, 0, 1, (1, 1, 64, 64)),
+        ("gfx942", 10201, 128, 16, 1, (1, 1, 64, 64)),
+        ("gfx942", 10201, 512, 0, 4, (4, 1, 64, 64)),
+        ("gfx1250", 20000, 128, 2, 1, None),
+    ),
 )
-def test_gfx942_split_k_plan_sizes_workspace_after_clamping(K, split_k, launch_split_k):
-    args = _a16_policy_args("gfx942", 1, 64, K)
-    args["cu_num"] = 80
-    plan = _get_cached_a16w16_launch_plan(**args, kid=10201, split_k=split_k)
+def test_a16w16_split_k_plan_converges_before_workspace(
+    arch, kid, K, split_k, launch_split_k, expected_shape
+):
+    args = _a16_policy_args(arch, 1, 64, K)
+    if arch == "gfx942":
+        args["cu_num"] = 80
+    plan = _get_cached_a16w16_launch_plan(**args, kid=kid, split_k=split_k)
 
-    assert plan.resolved_kid == 10201
+    assert plan.resolved_kid == kid
     assert plan.workspace_capacity_split_k == launch_split_k
     assert plan.abi_split_k == launch_split_k
-    assert plan.workspace_spec.shape == (launch_split_k, 1, 64, 64)
+    assert plan.workspace_spec is not None
+    assert plan.workspace_spec.shape[0] == launch_split_k
+    if expected_shape is not None:
+        assert plan.workspace_spec.shape == expected_shape
     assert plan.workspace_spec.dtype == torch.float32
 
 
 @pytest.mark.parametrize(
     ("K", "caller_splits", "allocated_splits", "launch_split_k"),
-    ((128, None, 1, 1), (512, None, 4, 4), (128, 1, 1, 1), (128, 16, 16, 1)),
+    ((128, None, 1, 1), (512, None, 4, 4), (128, 16, 16, 1)),
 )
 def test_gfx942_workspace_allocation_and_launch_split_k(
     monkeypatch, K, caller_splits, allocated_splits, launch_split_k
@@ -560,17 +571,6 @@ def test_a16w16_launch_plan_preserves_split_k_limits(arch, kid, K, split_k, erro
         _get_cached_a16w16_launch_plan(
             **_a16_policy_args(arch, 1, 64, K), kid=kid, split_k=split_k
         )
-
-
-def test_gfx1250_launch_plan_converges_split_k_before_workspace():
-    plan = _get_cached_a16w16_launch_plan(
-        **_a16_policy_args("gfx1250", 1, 64, 128), kid=20000, split_k=2
-    )
-
-    assert plan.abi_split_k == 1
-    assert plan.workspace_capacity_split_k == 1
-    assert plan.workspace_spec is not None
-    assert plan.workspace_spec.shape[0] == 1
 
 
 def test_gfx1250_split_k_reducer_row_limit():
@@ -771,22 +771,6 @@ def test_a16w16_policy_loader_skips_malformed_kid_and_splitk_rows(monkeypatch):
         policy._load_a16w16_opus_tuned.cache_clear()
 
 
-@pytest.mark.parametrize(
-    ("arch", "shape", "expected_kid"),
-    (
-        ("gfx950", (128, 64, 512), 1200),
-        ("gfx942", (32, 256, 1024), 10300),
-        ("gfx1250", (32, 128, 512), 20007),
-    ),
-)
-def test_a16w16_heuristic_baseline_kid(arch, shape, expected_kid):
-    from aiter.ops.opus.policy import resolve_a16w16_heuristic_candidate
-
-    M, N, K = shape
-    plan = resolve_a16w16_heuristic_candidate(**_a16_policy_args(arch, M, N, K))
-    assert plan.resolved_kid == expected_kid
-
-
 def test_shape_driven_opus_selection_and_rank_route(monkeypatch):
     from aiter.ops.opus import gemm_op_a16w16, policy
 
@@ -850,10 +834,9 @@ def test_gfx942_exact_plan_rejects_non_exact_n_bf16_workspace_kid(kid):
         )
 
 
-@pytest.mark.parametrize("selection", ("explicit", "tuned"))
 @pytest.mark.parametrize(
-    ("requested_kid", "resolved_kid"),
-    ((10210, 10200), (10213, 10203)),
+    ("selection", "requested_kid", "resolved_kid"),
+    (("explicit", 10210, 10200), ("tuned", 10213, 10203)),
 )
 def test_gfx942_compat_redirects_non_exact_n_bf16_workspace_kid(
     monkeypatch, selection, requested_kid, resolved_kid

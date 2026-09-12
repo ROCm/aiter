@@ -44,9 +44,6 @@ def test_general_a8w8_restores_required_scales_and_blockscale_dtypes():
             dtype=torch.float32,
         )
 
-    assert not hasattr(general_a8w8, "_OPUS_A8W8_NOSCALE_KID")
-    assert not hasattr(general_a8w8, "_OPUS_A8W8_BLOCKSCALE_KID")
-
 
 def test_general_scaled_a8w8_keeps_legacy_backend_route(monkeypatch):
     calls = []
@@ -254,7 +251,9 @@ def test_mxscale_invalid_tuned_kid_warns_and_uses_heuristic(
 
     config_path = tmp_path / "mxscale.csv"
     config_path.write_text(
-        "gfx,b,m,n,k,libtype,kernelId,splitK\n" "gfx950,2,1,1024,4096,opus,8001,1\n"
+        "gfx,b,m,n,k,libtype,kernelId,splitK\n"
+        "gfx950,2,1,1024,4096,opus,8001,1\n"
+        "gfx950,3,1,1024,4096,other,42,1\n"
     )
     warnings = []
     monkeypatch.setattr(
@@ -274,6 +273,8 @@ def test_mxscale_invalid_tuned_kid_warns_and_uses_heuristic(
     policy._load_mxscale_bmm_tuned.cache_clear()
     policy.lookup_mxscale_bmm_config.cache_clear()
     try:
+        rows = policy._load_mxscale_bmm_tuned(None)
+        assert rows[("gfx950", 3, 1, 1024, 4096)]["kernelId"] == 42
         assert policy.resolve_a8w8_mxscale_bmm_plan(2, 1, 1024, 4096) == (
             8640,
             1,

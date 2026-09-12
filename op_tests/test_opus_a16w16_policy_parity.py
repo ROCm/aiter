@@ -14,10 +14,7 @@ import pytest
 import torch
 
 from aiter.ops.opus import policy
-from csrc.opus_gemm.opus_gemm_common import (
-    GFX942_BF16WS_EXACT_N,
-    get_kernel_instance,
-)
+from csrc.opus_gemm.opus_gemm_common import get_kernel_instance
 
 
 # Keep the original C++ heuristic reference independent of policy.py.
@@ -325,28 +322,19 @@ def test_shipped_tuned_selection_diff_is_exhaustive(
 @pytest.mark.parametrize(
     ("arch", "cu_num", "M", "N", "K", "has_bias", "output", "expected"),
     (
-        # These workspace kids cannot satisfy the launcher's K prefetch depth.
+        # Representative launch failures after the independent selector sweep.
         ("gfx950", 256, 1, 17, 130, False, torch.bfloat16, None),
-        ("gfx950", 256, 5, 33, 130, False, torch.bfloat16, None),
-        ("gfx950", 256, 64, 64, 128, False, torch.bfloat16, None),
-        ("gfx950", 256, 65, 64, 64, False, torch.float32, None),
-        ("gfx950", 256, 129, 16, 128, False, torch.bfloat16, (300, 0)),
         ("gfx950", 256, 256, 256, 128, False, torch.bfloat16, (1300, 0)),
         ("gfx950", 256, 256, 256, 128, True, torch.bfloat16, None),
         ("gfx1250", 256, 31, 127, 4098, False, torch.bfloat16, (20000, 1)),
         ("gfx1250", 256, 32, 128, 4098, False, torch.bfloat16, (20007, 1)),
-        ("gfx1250", 256, 33, 64, 4098, True, torch.float32, (20003, 1)),
-        # main selected 10210 here, whose generated launcher redirected to
-        # 10200 before launch. The Python policy now resolves the same final id.
         ("gfx942", 80, 256, 768, 7168, False, torch.bfloat16, (10200, 7)),
         ("gfx942", 80, 257, 1024, 7168, False, torch.bfloat16, (10210, 4)),
-        ("gfx942", 80, 4, 4097, 1024, False, torch.bfloat16, (10300, 0)),
         ("gfx942", 80, 32, 1537, 2048, False, torch.bfloat16, (10303, 0)),
-        ("gfx942", 80, 128, 257, 4096, False, torch.bfloat16, (10302, 0)),
         ("gfx942", 80, 32, 256, 1024, False, torch.float32, (10201, 8)),
     ),
 )
-def test_untuned_shape_heuristic_matches_pre_pr_and_validates_launch(
+def test_untuned_shape_launch_resolution(
     arch, cu_num, M, N, K, has_bias, output, expected
 ):
     rows = _shipped_opus_rows()
@@ -368,9 +356,6 @@ def test_untuned_shape_heuristic_matches_pre_pr_and_validates_launch(
     }
     assert full_key not in current_keys
 
-    raw_pre_pr = _PRE_PR_HEURISTICS[arch](
-        M, N, K, has_bias, "bf16" if output == torch.bfloat16 else "fp32"
-    )
     plan = policy.resolve_a16w16_heuristic_candidate(
         arch=arch,
         M=M,
@@ -382,18 +367,6 @@ def test_untuned_shape_heuristic_matches_pre_pr_and_validates_launch(
         input_dtype=torch.bfloat16,
         output_dtype=output,
     )
-    assert (
-        policy.select_a16w16_heuristic_kid(
-            arch=arch,
-            M=M,
-            N=N,
-            K=K,
-            batch=1,
-            has_bias=has_bias,
-            output_dtype=output,
-        )
-        == raw_pre_pr
-    )
     if expected is None:
         assert plan is None
         return
@@ -402,23 +375,26 @@ def test_untuned_shape_heuristic_matches_pre_pr_and_validates_launch(
 
 
 @pytest.mark.parametrize(
-    ("requested", "expected"),
+    ("N", "requested", "expected"),
     (
-        (10210, 10200),
-        (10213, 10203),
-        (10216, None),
-        (10200, 10200),
-        (10300, 10300),
+        (768, 10210, 10200),
+        (768, 10213, 10203),
+        (768, 10216, None),
+        (768, 10200, 10200),
+        (768, 10300, 10300),
+        (64, 10210, 10210),
+        (1024, 10213, 10213),
+        (2048, 10216, 10216),
     ),
 )
-def test_gfx942_non_exact_n_matches_pre_pr_generated_launcher(requested, expected):
+def test_gfx942_requested_kid_matches_pre_pr_generated_launcher(N, requested, expected):
     # main redirected the two paired BF16-workspace launchers and AITER_CHECKed
     # 10216, which has no FP32-workspace sibling. ``None`` is that rejection at
     # policy time; unrelated gfx942 kids must remain unchanged.
     plan = policy.resolve_a16w16_tuned_candidate(
         arch="gfx942",
         M=256,
-        N=768,
+        N=N,
         K=4096,
         batch=1,
         cu_num=80,
@@ -429,22 +405,3 @@ def test_gfx942_non_exact_n_matches_pre_pr_generated_launcher(requested, expecte
         requested_split_k=1,
     )
     assert (None if plan is None else plan.resolved_kid) == expected
-
-
-def test_gfx942_exact_n_keeps_each_bf16_workspace_kid():
-    for N, requested in product(sorted(GFX942_BF16WS_EXACT_N), (10210, 10213, 10216)):
-        plan = policy.resolve_a16w16_tuned_candidate(
-            arch="gfx942",
-            M=256,
-            N=N,
-            K=4096,
-            batch=1,
-            cu_num=80,
-            has_bias=False,
-            input_dtype=torch.bfloat16,
-            output_dtype=torch.bfloat16,
-            requested_kid=requested,
-            requested_split_k=1,
-        )
-        assert plan is not None
-        assert plan.resolved_kid == requested

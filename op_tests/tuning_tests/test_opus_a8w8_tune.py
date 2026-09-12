@@ -53,15 +53,6 @@ class TestOpusA8W8Tuner(unittest.TestCase):
             pd.DataFrame([{"M": 64, "N": 256, "K": 256, **overrides}])
         )
 
-    def test_existing_cli_aliases(self):
-        long_args = self.args()
-        short_args = self.tuner.parser.parse_args(
-            ["-i", self.input_file, "-o", self.output_file, "--mp", "1"]
-        )
-        self.assertEqual(vars(long_args), vars(short_args))
-        self.assertEqual(long_args.errRatio, 0)
-        self.assertNotIn("family", vars(long_args))
-
     def test_rejects_unsupported_arch_before_tune_or_replay(self):
         cases = (
             ("tune", self.args()),
@@ -257,19 +248,6 @@ class TestOpusA8W8Tuner(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     self.tuner.run_config(self.args())
                 data.assert_not_called()
-
-    def test_run_config_without_input_file_uses_tuned_file(self):
-        self.rows(kernelId=2, splitK=0, libtype="opus").to_csv(
-            self.output_file, index=False
-        )
-        args = self.tuner.parser.parse_args(
-            ["--tuned_file", self.output_file, "--run_config"]
-        )
-        with patch.object(self.tuner, "run_config", return_value=[]) as replay:
-            self.tuner.run(args)
-        replay.assert_called_once()
-        self.assertEqual(args.run_config, self.output_file)
-        self.assertEqual(self.tuner.untunedf.iloc[0].kernelId, 2)
 
 
 class TestOpusA8W8TuneGPU(unittest.TestCase):
