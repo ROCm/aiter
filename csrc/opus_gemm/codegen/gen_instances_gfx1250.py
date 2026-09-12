@@ -36,6 +36,8 @@ PIPELINE_HEADER_MAP = {
     # the co emit below never uses it at all.
     "a16w16_4wave_co": "gfx1250/opus_gemm_traits_a16w16_gfx1250.cuh",
     "a16w16_4wave_wl_co": "gfx1250/opus_gemm_traits_a16w16_gfx1250.cuh",
+    # wlr (ring/pin) reuses the wl traits; only its device pipeline differs.
+    "a16w16_4wave_wlr_co": "gfx1250/opus_gemm_traits_a16w16_gfx1250.cuh",
 }
 
 TRAITS_HEADER_MAP = {
@@ -44,6 +46,7 @@ TRAITS_HEADER_MAP = {
     "a16w16_clusterlaunch_tdm_splitk_fuse": "gfx1250/opus_gemm_traits_a16w16_gfx1250.cuh",
     "a16w16_4wave_co": "gfx1250/opus_gemm_traits_a16w16_gfx1250.cuh",
     "a16w16_4wave_wl_co": "gfx1250/opus_gemm_traits_a16w16_gfx1250.cuh",
+    "a16w16_4wave_wlr_co": "gfx1250/opus_gemm_traits_a16w16_gfx1250.cuh",
 }
 
 KERNEL_FUNC_MAP = {
@@ -55,6 +58,7 @@ KERNEL_FUNC_MAP = {
     # build_co.py reads it to spell the stub TU's call.
     "a16w16_4wave_co": "gemm_a16w16_4wave_compute_body_gfx1250",
     "a16w16_4wave_wl_co": "gemm_a16w16_4wave_wl_body_gfx1250",
+    "a16w16_4wave_wlr_co": "gemm_a16w16_4wave_wlr_body_gfx1250",
 }
 
 TRAITS_NAME_MAP = {
@@ -63,6 +67,7 @@ TRAITS_NAME_MAP = {
     "a16w16_clusterlaunch_tdm_splitk_fuse": "opus_cluster_tdm_splitk_ws_traits_gfx1250",
     "a16w16_4wave_co": "opus_a16w16_4wave_compute_traits_gfx1250",
     "a16w16_4wave_wl_co": "opus_a16w16_4wave_wl_traits_gfx1250",
+    "a16w16_4wave_wlr_co": "opus_a16w16_4wave_wl_traits_gfx1250",
 }
 
 KARGS_NAME_MAP = {
@@ -71,6 +76,7 @@ KARGS_NAME_MAP = {
     "a16w16_clusterlaunch_tdm_splitk_fuse": "opus_gemm_splitk_fuse_kargs_gfx1250",
     "a16w16_4wave_co": "opus_gemm_4wave_compute_kargs_gfx1250",
     "a16w16_4wave_wl_co": "opus_gemm_4wave_compute_kargs_gfx1250",
+    "a16w16_4wave_wlr_co": "opus_gemm_4wave_compute_kargs_gfx1250",
 }
 
 
@@ -86,7 +92,7 @@ def co_traits_args(k):
         # The wave-layout family takes two more: how the 4 waves tile the block.
         + (
             f", {k.co_wave_layout[0]}, {k.co_wave_layout[1]}"
-            if k.kernel_tag == "a16w16_4wave_wl_co"
+            if k.kernel_tag in ("a16w16_4wave_wl_co", "a16w16_4wave_wlr_co")
             else ""
         )
     )
@@ -849,6 +855,7 @@ void
 # ---------- Self-register at import time ----------
 register_emit("gfx1250", "a16w16_4wave_co", gen_4wave_co_instance)
 register_emit("gfx1250", "a16w16_4wave_wl_co", gen_4wave_co_instance)
+register_emit("gfx1250", "a16w16_4wave_wlr_co", gen_4wave_co_instance)
 register_emit(
     "gfx1250", "a16w16_cluster_tdm_splitk_ws", gen_cluster_tdm_splitk_ws_instance
 )
