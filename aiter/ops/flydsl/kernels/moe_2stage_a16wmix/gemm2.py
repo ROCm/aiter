@@ -19,6 +19,7 @@ from aiter.ops.flydsl.kernels.mxfp4_gemm_common import (
 )
 
 from .utils import (
+    _check_weight_addressing_limits,
     _global_i32_at,
     _mma_bf16,
     _raw,
@@ -489,6 +490,10 @@ def compile_gemm2_a16w4_port(
         raise ValueError(f"reduce epilog requires topk>=1, got {_topk}")
     _use_k16 = use_k16
     _K = D_INTER
+    if w_dtype != "int4":
+        _check_weight_addressing_limits(
+            stage="A16W4 stage2", w_dtype=w_dtype, n_out=N_OUT, k=_K, experts=NE
+        )
     assert _K % TILE_K == 0, f"D_INTER (K) must be a multiple of {TILE_K}, got {_K}"
     assert (
         N_OUT % TILE_N == 0

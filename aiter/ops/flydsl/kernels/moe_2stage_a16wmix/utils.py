@@ -29,6 +29,34 @@ from aiter.ops.flydsl.kernels.tensor_shim import _to_raw as _raw
 # a16wi4 (int4 W) groupwise scale: group_size = 32 == one MFMA K32 step (one ku per
 # K-group). Scale packed bf16 pairs (E, G//2, N, 2); even/odd ku selects lo/hi half.
 A16WI4_GROUP_SIZE = 32
+_MAX_SIGNED_BUFFER_BYTES = 1 << 31
+
+
+def _check_weight_addressing_limits(
+    *, stage: str, w_dtype: str, n_out: int, k: int, experts: int
+) -> None:
+    if w_dtype == "int4":
+        return
+
+    per_expert_w_bytes = n_out * (k * 2 if w_dtype == "bf16" else k // 2)
+    if per_expert_w_bytes >= _MAX_SIGNED_BUFFER_BYTES:
+        raise ValueError(
+            f"{stage} {w_dtype} raw weight per expert is {per_expert_w_bytes} bytes; "
+            f"it must be smaller than {_MAX_SIGNED_BUFFER_BYTES} bytes for signed "
+            "32-bit buffer coordinates"
+        )
+
+    if w_dtype == "bf16":
+        return
+    scale_k_padded = ((k + 255) // 256) * 256
+    scale_w_bytes = experts * n_out * (scale_k_padded // 32)
+
+    if scale_w_bytes >= _MAX_SIGNED_BUFFER_BYTES:
+        raise ValueError(
+            f"{stage} {w_dtype} global weight scale resource is "
+            f"{scale_w_bytes} bytes; it must be smaller than "
+            f"{_MAX_SIGNED_BUFFER_BYTES} bytes for signed 32-bit buffer coordinates"
+        )
 
 
 def _udiv(a, c):
@@ -392,7 +420,7 @@ class _BCol(NamedTuple):
     Only the scale fields of the active ``w_dtype`` are filled; the others stay None.
     """
 
-    n_blk: object  # 16-row weight block index (expert-indexed for mxfp4/int4)
+    n_blk: object  # 16-row weight block index, global or expert-relative by W path
     n_intra: object  # row within that block
     sc_blk: object = None  # mxfp4: 32-col e8m0 scale block index
     sc_pack: object = None  # mxfp4: N_Pack half selector (0/1) within that block
@@ -507,17 +535,20 @@ def make_b_loader(
     _g_half = (K // A16WI4_GROUP_SIZE) // 2
 
     # ---- buffer resources -----------------------------------------------------
-    # bf16 W [E, N_OUT, K] whole-tensor extent overflows the 32-bit num_records/i32
-    # byte-offset at large E (E896: 6.6GB): fold the per-expert base into the i64
-    # resource addr and index within the expert. mxfp4/int4 keep the whole-tensor path.
-    if const_expr(_is_bf16):
-        _w_per_expert_bytes = N_OUT * (K * 2)
+    _w_per_expert_bytes = N_OUT * (K * 2 if _is_bf16 else K_HALF)
+    _w_bytes = NE * _w_per_expert_bytes
+    # FP4 uses one global resource while all byte offsets fit in signed i32 and
+    # expert-local resources above that limit. BF16 is always expert-relative;
+    # INT4 uses the whole-tensor path.
+    _rebase_w = _is_bf16 or (not _is_int4 and _w_bytes >= (1 << 31))
+    if const_expr(_is_int4):
+        w_tiles = _global_i32_buffer_tiles(arg_bq, min(_w_bytes, 0xFFFFFFFF), 4)
+    elif const_expr(_rebase_w):
         w_base_i64 = fx.Int64(arg_bq) + fx.Int64(e) * fx.Int64(_w_per_expert_bytes)
         w_tiles = _global_i32_buffer_tiles(
             w_base_i64, min(_w_per_expert_bytes, 0xFFFFFFFF), 4
         )
     else:
-        _w_bytes = NE * N_OUT * K_HALF
         w_tiles = _global_i32_buffer_tiles(arg_bq, min(_w_bytes, 0xFFFFFFFF), 4)
     # W dwordx4 load via BufferCopy128b atom (cache modifier in the aux field).
     w_copy_atom = fx.make_copy_atom(fx.rocdl.BufferCopy128b(b_cache_mod), fx.Int32)
@@ -581,8 +612,7 @@ def make_b_loader(
     def col(*n_terms):
         """Address one 16-wide N block; this lane owns row ``sum(n_terms) + lane``."""
         col_g = _sum(n_terms[0], n_terms[1:]) + lane_mod_16
-        # bf16 W folds the expert into the resource base (above); mxfp4/int4 index it.
-        _row_expert_off = fx.Int32(0) if const_expr(_is_bf16) else expert_off
+        _row_expert_off = fx.Int32(0) if const_expr(_rebase_w) else expert_off
         row = _row_expert_off + col_g
         n_blk = row // fx.Int32(16)
         n_intra = row % fx.Int32(16)
@@ -592,7 +622,7 @@ def make_b_loader(
     def col_pair(*n_terms, shift):
         """Address a gate|up pair: one block, and the one ``shift`` further along N."""
         col_g = _sum(n_terms[0], n_terms[1:]) + lane_mod_16
-        _row_expert_off = fx.Int32(0) if const_expr(_is_bf16) else expert_off
+        _row_expert_off = fx.Int32(0) if const_expr(_rebase_w) else expert_off
         row_g = _row_expert_off + col_g
         row_u = row_g + shift
         blk_g, intra_g = row_g // fx.Int32(16), row_g % fx.Int32(16)

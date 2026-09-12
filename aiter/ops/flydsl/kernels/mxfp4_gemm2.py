@@ -24,6 +24,7 @@ from .mxfp4_gemm_common import (
     _raw,
     bq_bytes_for,
     bscale_bytes_for,
+    check_weight_addressing_limits,
     k_half_for,
     k_tiles_total_for,
     kas_per_chunk_dw_for,
@@ -109,6 +110,11 @@ def compile_gemm2_a4w4_port(
         _K_REAL % 128 == 0 and 0 < _K_REAL <= _K
     ), f"D_INTER_REAL={_K_REAL} must be a multiple of 128 and in (0, {_K}]"
     _K_HALF = k_half_for(_K)
+    check_weight_addressing_limits(
+        stage="MXFP4 stage2",
+        per_expert_w_bytes=bq_bytes_for(NE, N_OUT, _K) // NE,
+        scale_w_bytes=bscale_bytes_for(NE, N_OUT, _K),
+    )
     _K_TILES_TOTAL = k_tiles_total_for(_K, BK)
     _persistent = epilog in ("nonatomic", "nonatomic_mxfp4")
     _slot_bytes = saq_slot_bytes(BM, KH_TILE)
@@ -370,6 +376,7 @@ def _gemm2_body(
     _num_n_blocks = num_n_blocks_for(N_OUT, BN)
     _n_load_waves, _rows_per_wave, _kSubBlocks = tiling(BM)
     b_aux = 2 if use_nt else 0
+    _bq_use_global_resource = _bq_bytes < (1 << 31)
 
     m_block_idx = _udiv(bx_i32, _num_n_blocks)
     n_block_idx = bx_i32 - m_block_idx * fx.Int32(_num_n_blocks)
@@ -379,7 +386,14 @@ def _gemm2_body(
 
     _asc_num = arith.index_cast(T.index, _raw(i32_max_m_blocks)) * fx.Index(_asc_per_mb)
     ascale_rsrc = _buffer_rsrc(arg_ascale, _asc_num)
-    bq_rsrc = _buffer_rsrc(arg_bq, fx.Index(_bq_bytes))
+    _bq_per_expert = _bq_bytes // NE
+    if const_expr(_bq_use_global_resource):
+        bq_rsrc = _buffer_rsrc(arg_bq, fx.Index(_bq_bytes))
+    else:
+        # Larger allocations keep the expert displacement in the 64-bit base
+        # address so the buffer offset and bound remain expert-relative.
+        _bq_expert_base = arg_bq + fx.Int64(e) * fx.Int64(_bq_per_expert)
+        bq_rsrc = _buffer_rsrc(_bq_expert_base, fx.Index(_bq_per_expert))
     bscale_rsrc = _buffer_rsrc(arg_bscale, fx.Index(_bscale_bytes))
 
     # Sequential LDS layout: saq bytes at offset 0, f32 accumulator after them.
@@ -391,12 +405,17 @@ def _gemm2_body(
 
     b_load_s_base = []
     for j in range_constexpr(4):
-        v = (
-            e * fx.Int32(N_OUT)
-            + n_block_idx * fx.Int32(BN)
-            + wave * fx.Int32(BN // 4)
-            + fx.Int32(j * 16)
-        ) * fx.Int32(_K_HALF)
+        if const_expr(_bq_use_global_resource):
+            v = (
+                e * fx.Int32(N_OUT)
+                + n_block_idx * fx.Int32(BN)
+                + wave * fx.Int32(BN // 4)
+                + fx.Int32(j * 16)
+            ) * fx.Int32(_K_HALF)
+        else:
+            v = (
+                n_block_idx * fx.Int32(BN) + wave * fx.Int32(BN // 4) + fx.Int32(j * 16)
+            ) * fx.Int32(_K_HALF)
         b_load_s_base.append(rocdl.readfirstlane(T.i32, v))
 
     mni_base = n_block_idx * fx.Int32(BN // 16 // 2) + wave * fx.Int32(BN // 64 // 2)
