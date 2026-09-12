@@ -118,6 +118,31 @@ class GemmA8W8Tuner(GemmCommonTuner):
         "config_env_name": "AITER_CONFIG_GEMM_A8W8",
     }
 
+    def get_untuned_gemm_list(self, untuned_gemm_file):
+        """Resolve the fp8 flavor in q_dtype_w to the one this arch runs.
+
+        a8w8_untuned_gemm.csv hardcodes torch.float8_e4m3fn, but only one e4m3
+        encoding exists per chip (gfx942 e4m3fnuz, gfx950 e4m3fn), so on gfx942
+        every fp8 row aborts with "Unsupported dtype" and only the int8 rows are
+        tunable. q_dtype_w is part of this tuner's key, so normalizing on ingest
+        also keeps the emitted rows and the tuned/untuned bookkeeping agreeing
+        on one dtype.
+        """
+        untunedf = super().get_untuned_gemm_list(untuned_gemm_file)
+        if "q_dtype_w" in untunedf.columns:
+            untunedf["q_dtype_w"] = untunedf["q_dtype_w"].map(
+                lambda s: (
+                    str(
+                        dtypes.normalize_fp8_dtype(
+                            getattr(torch, s.strip().removeprefix("torch."))
+                        )
+                    )
+                    if isinstance(s, str) and s.strip().startswith("torch.float8_e4m3")
+                    else s
+                )
+            )
+        return untunedf
+
     def getKernelName(self, kernelId):
         if kernelId >= len(kernels_list) or kernelId < 0:
             return None

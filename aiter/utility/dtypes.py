@@ -27,6 +27,38 @@ def get_dtype_fp8():
     return defaultDtypes.get(get_gfx_runtime(), {"fp8": _8bit_fallback})["fp8"]
 
 
+# The two e4m3 encodings are mutually exclusive in hardware: gfx942 implements
+# e4m3fnuz (max 240, exponent bias 8) and gfx950 implements OCP e4m3fn (max 448,
+# bias 7). See defaultDtypes above.
+_E4M3_FLAVORS = tuple(
+    d
+    for d in (
+        getattr(torch, "float8_e4m3fn", None),
+        getattr(torch, "float8_e4m3fnuz", None),
+    )
+    if d is not None
+)
+
+
+def normalize_fp8_dtype(dtype):
+    """Map either e4m3 encoding onto the one the running GPU implements.
+
+    Which e4m3 flavor exists is a property of the chip, not of the model, so a
+    tuning shape list naming the other flavor describes an unrunnable
+    configuration rather than a distinct problem. Left alone it fails deep in
+    ``_aiter_dtype_id`` as "Unsupported dtype: torch.float8_e4m3fn", because
+    ``_torch_to_aiter_dtype`` is built from the arch-native ``fp8`` alias and so
+    only ever contains one of the two.
+
+    Non-fp8 dtypes and e5m2 are returned unchanged. If the arch is unknown,
+    ``fp8`` falls back to uint8, in which case we also pass through rather than
+    silently reinterpreting fp8 data as integers.
+    """
+    if dtype in _E4M3_FLAVORS and fp8 in _E4M3_FLAVORS and dtype is not fp8:
+        return fp8
+    return dtype
+
+
 i4x2 = getattr(torch, "int4", _8bit_fallback)
 fp4x2 = getattr(torch, "float4_e2m1fn_x2", _8bit_fallback)
 fp8 = get_dtype_fp8()
