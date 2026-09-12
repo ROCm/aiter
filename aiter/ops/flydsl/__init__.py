@@ -8,6 +8,8 @@ from importlib import import_module
 import flydsl as _flydsl
 from packaging.version import Version
 
+from aiter.fused_moe_registry import register_fused_moe_impl
+
 from .moe_common import GateMode
 
 _MIN_FLYDSL_VERSION = Version("0.2.4")
@@ -100,6 +102,9 @@ __all__ = [
     "flydsl_qk_norm_rope_quant",
     "gather_kv_b_proj_flydsl",
 ]
+
+_fused_moe_impl_path = "aiter.ops.flydsl.fused_moe_gfx942:run_flydsl_moe_gfx942_impl"
+register_fused_moe_impl("flydsl_gfx942", _fused_moe_impl_path)
 
 
 def __getattr__(name: str):
