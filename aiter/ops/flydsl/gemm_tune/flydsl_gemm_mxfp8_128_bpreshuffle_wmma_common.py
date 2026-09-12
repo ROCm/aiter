@@ -52,6 +52,7 @@ _COMPUTE_PROFILES = (
 )
 _COMPUTE_CLUSTERS = ((2, 2), (4, 2), (2, 4), (4, 4), (1, 4))
 _COMPUTE_MIN_K_PER_SPLIT = 512
+_PERSISTENT_N_TILES = (2, 4, 8)
 
 _CLUSTER_MIN_DIM = 8192
 _CLUSTER_MIN_TILES = 32
@@ -71,14 +72,21 @@ class WmmaKernelInstance:
     m_warp: int = 2
     n_warp: int = 2
     name_prefix: str = NAME_PREFIX
+    a_preshuffle: bool = False
+    persistent_n_tiles: int = 1
 
-    @property
-    def name(self) -> str:
+    def name_for(self, a_preshuffle: bool = False) -> str:
         return (
             f"{self.name_prefix}_t{self.tile_m}x{self.tile_n}x{self.tile_k}_"
             f"mw{self.m_warp}_nw{self.n_warp}_nb{self.num_buffers}_sk{self.split_k}_"
             f"cm{self.cluster_m}_cn{self.cluster_n}"
+            + ("_apre" if (a_preshuffle or self.a_preshuffle) else "")
+            + (f"_ps{self.persistent_n_tiles}" if self.persistent_n_tiles > 1 else "")
         )
+
+    @property
+    def name(self) -> str:
+        return self.name_for()
 
 
 def _align_up(value: int, align: int) -> int:
@@ -87,14 +95,6 @@ def _align_up(value: int, align: int) -> int:
 
 def _ceil_div(a: int, b: int) -> int:
     return (a + b - 1) // b
-
-
-def cluster_m_grid_ok_for_tuning(M: int, tile_m: int, cluster_m: int) -> bool:
-    if not cluster_m_grid_ok(M, tile_m, cluster_m):
-        return False
-    if cluster_m == 1:
-        return True
-    return _ceil_div(M // 2 + 1, tile_m) == _ceil_div(M, tile_m)
 
 
 def _tile_valid(tm: int, tn: int, tk: int, mw: int, nw: int) -> bool:
@@ -140,7 +140,8 @@ def kernel_instance_estimated_lds_bytes(ki: WmmaKernelInstance) -> int:
 
     a_scale_bytes, b_scale_bytes = _mxfp8_128_stage_scale_bytes(ki)
 
-    lds_a_data = ki.tile_m * (ki.tile_k + _LDS_PAD_A_BYTES)
+    a_pair = 2 if ki.a_preshuffle else 1
+    lds_a_data = (ki.tile_m // a_pair) * (a_pair * ki.tile_k + _LDS_PAD_A_BYTES)
     lds_b_data = ki.tile_n * ki.tile_k
     stage_bytes = (
         _align_up(lds_a_data, 16)
@@ -182,19 +183,21 @@ def _build_kernels_list() -> dict[int, WmmaKernelInstance]:
     for sk in _SPLIT_K:
         for tm, tn, tk, mw, nw, nb in _COMPUTE_PROFILES:
             for cm, cn in _COMPUTE_CLUSTERS:
-                kl[idx] = WmmaKernelInstance(
-                    tile_m=tm,
-                    tile_n=tn,
-                    tile_k=tk,
-                    num_buffers=nb,
-                    split_k=sk,
-                    cluster_m=cm,
-                    cluster_n=cn,
-                    m_warp=mw,
-                    n_warp=nw,
-                    name_prefix=COMPUTE_NAME_PREFIX,
-                )
-                idx += 1
+                for ps in (1, *_PERSISTENT_N_TILES) if sk == 1 else (1,):
+                    kl[idx] = WmmaKernelInstance(
+                        tile_m=tm,
+                        tile_n=tn,
+                        tile_k=tk,
+                        num_buffers=nb,
+                        split_k=sk,
+                        cluster_m=cm,
+                        cluster_n=cn,
+                        m_warp=mw,
+                        n_warp=nw,
+                        name_prefix=COMPUTE_NAME_PREFIX,
+                        persistent_n_tiles=ps,
+                    )
+                    idx += 1
     return kl
 
 
@@ -203,6 +206,10 @@ kernels_list: dict[int, WmmaKernelInstance] = _build_kernels_list()
 
 def kernel_fits_shape(ki: WmmaKernelInstance, M: int, N: int, K: int) -> bool:
     """Return True iff ``ki`` can be launched for runtime shape ``(M, N, K)``."""
+
+    # Row pairs need both rows, so an odd M has no valid pairing.
+    if ki.a_preshuffle and M % 2 != 0:
+        return False
 
     if is_compute_kernel(ki):
         profile = (
@@ -219,10 +226,22 @@ def kernel_fits_shape(ki: WmmaKernelInstance, M: int, N: int, K: int) -> bool:
             return False
         if (ki.cluster_m, ki.cluster_n) not in _COMPUTE_CLUSTERS:
             return False
+        # Compute-bound kernels allocate a full tile_m tile; unlike sync WMMA they
+        # must not launch when M < tile_m (cluster barrier hang on decode M).
+        if M < ki.tile_m:
+            return False
         if N % (ki.tile_n * ki.cluster_n) != 0:
             return False
-        if not cluster_m_grid_ok_for_tuning(M, ki.tile_m, ki.cluster_m):
+        if not cluster_m_grid_ok(M, ki.tile_m, ki.cluster_m):
             return False
+        if ki.persistent_n_tiles > 1:
+            if ki.split_k != 1:
+                return False
+            n_tiles = N // ki.tile_n
+            if n_tiles % ki.persistent_n_tiles:
+                return False
+            if (n_tiles // ki.persistent_n_tiles) % ki.cluster_n:
+                return False
         if K % ki.split_k != 0:
             return False
         k_per_split = K // ki.split_k
@@ -232,6 +251,8 @@ def kernel_fits_shape(ki: WmmaKernelInstance, M: int, N: int, K: int) -> bool:
             and k_per_split % (ki.tile_k * k_pair) == 0
         )
 
+    if ki.persistent_n_tiles > 1:
+        return False
     if N % _BLOCK_N != 0 or K % _BLOCK_K != 0:
         return False
     if not _tile_valid(ki.tile_m, ki.tile_n, ki.tile_k, ki.m_warp, ki.n_warp):
@@ -254,7 +275,7 @@ def kernel_fits_shape(ki: WmmaKernelInstance, M: int, N: int, K: int) -> bool:
     if ki.cluster_m > 1:
         if M < _CLUSTER_MIN_DIM or m_blocks < _CLUSTER_MIN_TILES:
             return False
-        if not cluster_m_grid_ok_for_tuning(M, ki.tile_m, ki.cluster_m):
+        if not cluster_m_grid_ok(M, ki.tile_m, ki.cluster_m):
             return False
     if ki.cluster_n > 1:
         if N < _CLUSTER_MIN_DIM or n_blocks < _CLUSTER_MIN_TILES:
@@ -262,6 +283,12 @@ def kernel_fits_shape(ki: WmmaKernelInstance, M: int, N: int, K: int) -> bool:
         if n_blocks % ki.cluster_n != 0:
             return False
     return True
+
+
+def compute_grid_ctas(ki: WmmaKernelInstance, M: int, N: int) -> int:
+    gx = _ceil_div(M, ki.tile_m)
+    gy = N // ki.tile_n
+    return gx * (gy // ki.persistent_n_tiles) * ki.split_k
 
 
 def is_compute_kernel(kernel: WmmaKernelInstance) -> bool:

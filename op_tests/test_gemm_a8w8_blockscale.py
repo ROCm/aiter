@@ -17,7 +17,7 @@ from einops import repeat as eirp
 import aiter
 from aiter import dtypes
 from aiter.ops.gemm_op_a8w8 import gemm_a8w8_blockscale_ck, gemm_a8w8_blockscale_cktile
-from aiter.ops.shuffle import shuffle_weight
+from aiter.ops.shuffle import shuffle_mxfp8fp4_a, shuffle_weight
 from aiter.test_common import benchmark, checkAllclose, perftest
 from aiter.utility import fp4_utils
 
@@ -67,6 +67,15 @@ def run_gemm_bpreshuffle(x, weightshuffle, x_scale, w_scale, dtype=dtypes.bf16):
 
 
 @perftest(num_iters=TEST_NUM_ITERS)
+def run_gemm_abpreshuffle(
+    x_shuffled, weightshuffle, x_scale, w_scale, dtype=dtypes.bf16
+):
+    return aiter.gemm_a8w8_blockscale_abpreshuffle(
+        x_shuffled, weightshuffle, x_scale, w_scale, dtype
+    )
+
+
+@perftest(num_iters=TEST_NUM_ITERS)
 def run_triton(x, weightshuffle, x_scale, w_scale, dtype=dtypes.bf16, backend=None):
     # Direct call into the triton preshuffle kernel, mirroring the dispatch in
     # gemm_a8w8_blockscale_bpreshuffle: reshape the (n, k) preshuffled weight to
@@ -87,7 +96,7 @@ def run_triton(x, weightshuffle, x_scale, w_scale, dtype=dtypes.bf16, backend=No
 
 
 @benchmark()
-def test_gemm(dtype, m, n, k, ck_preshuffle=True, use_flydsl=False):
+def test_gemm(dtype, m, n, k, ck_preshuffle=True, use_flydsl=False, apre=False):
     ret = {}
     block_shape_n, block_shape_k = block_shape
     scale_m = m
@@ -131,6 +140,23 @@ def test_gemm(dtype, m, n, k, ck_preshuffle=True, use_flydsl=False):
     ret["ck TFLOPS"] = m * n * k * 2 / avg_b / 1e6
     ret["ck TB/s"] = (x.nbytes + weight.nbytes) / avg_b / 1e6
     ret["ck err"] = err_ck
+
+    if apre and use_flydsl_fp8_scale:
+        # A-preshuffle packs adjacent A row pairs, so an odd M needs A -- and only
+        # A -- padded to M+1 rows; x_scale and the result keep the true M.
+        if m % 2:
+            x_apre = torch.zeros((m + 1, k), dtype=x.dtype, device=x.device)
+            x_apre[:m] = x
+        else:
+            x_apre = x
+        e, avg_e = run_gemm_abpreshuffle(
+            shuffle_mxfp8fp4_a(x_apre), gemm_weight, gemm_x_scale, w_scale, dtype
+        )
+        ret["apre us"] = avg_e
+        ret["apre TFLOPS"] = m * n * k * 2 / avg_e / 1e6
+        ret["apre TB/s"] = (x_apre.nbytes + weight.nbytes) / avg_e / 1e6
+        ret["apre err"] = checkAllclose(a, e, msg="apre", catastrophic_check=True)
+        ret["apre/ck"] = avg_e / avg_b
 
     if not use_flydsl_fp8_scale:
         tag = "asm"
@@ -320,6 +346,17 @@ parser.add_argument(
     help="use flydsl fp8 e8m0 scale path (requires --ck_preshuffle True)",
 )
 parser.add_argument(
+    "--apre",
+    type=dtypes.str2bool,
+    nargs="*",
+    default=[False],
+    help="""also measure the FlyDSL A-preshuffle candidate (requires --flydsl
+    --ck_preshuffle True). Odd M is padded to M+1 rows for A only.
+    Sweeps like --ck_preshuffle.
+    e.g.: --apre True
+        or --apre True False""",
+)
+parser.add_argument(
     "--csv",
     type=str,
     default=None,
@@ -347,6 +384,7 @@ args = parser.parse_args()
 l_preshuffle = (
     args.ck_preshuffle if isinstance(args.ck_preshuffle, list) else [args.ck_preshuffle]
 )
+l_apre = args.apre if isinstance(args.apre, list) else [args.apre]
 
 df = []
 if args.csv is not None:
@@ -356,25 +394,34 @@ if args.csv is not None:
     print(f"Loaded {len(shapes_df)} shapes from {args.csv}", flush=True)
     for dtype in args.dtype:
         for preshuffle in l_preshuffle:
-            for _, row in shapes_df.iterrows():
-                ret = test_gemm(
-                    dtype,
-                    int(row["M"]),
-                    int(row["N"]),
-                    int(row["K"]),
-                    ck_preshuffle=preshuffle,
-                    use_flydsl=args.flydsl,
-                )
-                df.append(ret)
+            for apre in l_apre:
+                for _, row in shapes_df.iterrows():
+                    ret = test_gemm(
+                        dtype,
+                        int(row["M"]),
+                        int(row["N"]),
+                        int(row["K"]),
+                        ck_preshuffle=preshuffle,
+                        use_flydsl=args.flydsl,
+                        apre=apre,
+                    )
+                    df.append(ret)
 else:
     for dtype in args.dtype:
         for m in args.m:
             for n, k in args.nk:
                 for ck_p in l_preshuffle:
-                    ret = test_gemm(
-                        dtype, m, n, k, ck_preshuffle=ck_p, use_flydsl=args.flydsl
-                    )
-                    df.append(ret)
+                    for apre in l_apre:
+                        ret = test_gemm(
+                            dtype,
+                            m,
+                            n,
+                            k,
+                            ck_preshuffle=ck_p,
+                            use_flydsl=args.flydsl,
+                            apre=apre,
+                        )
+                        df.append(ret)
 
 df = pd.DataFrame(df)
 
