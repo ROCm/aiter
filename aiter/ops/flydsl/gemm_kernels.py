@@ -210,13 +210,33 @@ PRESHUFFLE_SPLIT_K_WORKSPACE_ELEMS = (
 )
 
 
-@functools.lru_cache(maxsize=128)
-def _get_preshuffle_split_buffers(
-    device: torch.device,
-    stream: torch.cuda.Stream,
-) -> tuple[Tensor, Tensor]:
-    # Safe to reuse: launches on a stream are ordered and the reduction hands
-    # the semaphore back zeroed.
+@functools.lru_cache(maxsize=16)
+def _get_preshuffle_split_buffers(device: torch.device) -> tuple[Tensor, Tensor]:
+    # Keyed on device alone, and never allocated while a CUDA graph is
+    # capturing.
+    #
+    # Keying on the current stream as well made a capture -- which always runs
+    # on a fresh stream -- a guaranteed miss, so the buffers were allocated
+    # *inside* the capture region. An allocation made there comes from that
+    # graph's private mempool, and the caching allocator may hand the same
+    # block out again during a later capture into the same pool (vLLM captures
+    # every graph into one shared pool). The cached buffers then alias another
+    # graph's tensors, every replay of that graph overwrites the semaphore, the
+    # reduction's arrival count goes wrong, and it reduces workspace slots this
+    # launch never wrote -- surfacing as ~1e30..inf garbage in the output.
+    #
+    # Dropping the stream from the key is what makes preallocation possible at
+    # all: a capture stream does not exist before the capture starts, so a
+    # stream-keyed cache can never be warmed ahead of one.
+    if torch.cuda.is_current_stream_capturing():
+        raise RuntimeError(
+            f"FlyDSL split-K preshuffle buffers for {device} would be allocated "
+            "during a CUDA graph capture, which places them in that graph's "
+            "private mempool and lets a later capture into the same pool alias "
+            "them. Call aiter.ops.flydsl.gemm_kernels."
+            "preallocate_preshuffle_split_buffers(device) during warmup, before "
+            "any graph capture."
+        )
     workspace = torch.empty(
         PRESHUFFLE_SPLIT_K_WORKSPACE_ELEMS, dtype=torch.float32, device=device
     )
@@ -224,6 +244,17 @@ def _get_preshuffle_split_buffers(
         PRESHUFFLE_SPLIT_K_MAX_TILES, dtype=torch.int32, device=device
     )
     return workspace, semaphore
+
+
+def preallocate_preshuffle_split_buffers(device: torch.device) -> None:
+    """Warm the split-K buffer cache outside any CUDA graph capture region.
+
+    Integrators that capture CUDA graphs should call this once per device
+    during warmup. The split-K path warms the cache implicitly on first use,
+    but only a call made outside a capture region gets its memory from the
+    regular caching allocator rather than from a graph private pool.
+    """
+    _get_preshuffle_split_buffers(torch.device(device))
 
 
 def _check_preshuffle_split_capacity(
@@ -332,9 +363,7 @@ def flydsl_preshuffle_gemm_a8(
     dummy_bias = torch.empty(0, dtype=Out.dtype, device=Out.device)
     if split_k > 1:
         _check_preshuffle_split_capacity(m, n, tile_m, tile_n, split_k)
-        workspace, semaphore = _get_preshuffle_split_buffers(
-            Out.device, torch.cuda.current_stream(device=Out.device)
-        )
+        workspace, semaphore = _get_preshuffle_split_buffers(Out.device)
     else:
         workspace = out_contig
         # dtype is part of the executable's cache signature, so this must match
