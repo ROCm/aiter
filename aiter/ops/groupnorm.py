@@ -56,15 +56,13 @@ def _groupnorm_workspace(ws_slots: int, device: torch.device) -> Tensor:
     return ws
 
 
-def groupnorm_run(
+def _groupnorm_run_impl(
     input: Tensor,
     num_groups: int,
     weight: Tensor,
     bias: Tensor,
     eps: float,
 ) -> Tensor:
-    """Group Normalization. Allocates output and reuses a cached scratch
-    workspace, then calls the HIP kernel. Returns the normalized output."""
     input = input.contiguous()
     weight = weight.contiguous()
     bias = bias.contiguous()
@@ -76,6 +74,26 @@ def groupnorm_run(
 
     _groupnorm_run(y, workspace, input, num_groups, weight, bias, eps)
     return y
+
+
+def groupnorm_run(
+    input: Tensor,
+    num_groups: int,
+    weight: Tensor,
+    bias: Tensor,
+    eps: float,
+) -> Tensor:
+    """Group Normalization. Allocates output and reuses a cached scratch
+    workspace, then calls the HIP kernel. CUDA autocast follows PyTorch's FP32
+    policy for GroupNorm. Returns the normalized output."""
+    device_type = input.device.type
+    if torch.is_autocast_enabled(device_type):
+        with torch.amp.autocast(device_type, enabled=False):
+            return _groupnorm_run_impl(
+                input.float(), num_groups, weight.float(), bias.float(), eps
+            )
+
+    return _groupnorm_run_impl(input, num_groups, weight, bias, eps)
 
 
 class GroupNorm(torch.nn.Module):
