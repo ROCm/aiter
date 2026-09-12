@@ -50,6 +50,7 @@ from flydsl.expr.utils.arith import _to_raw as _raw
 from aiter.jit.utils.chip_info import get_lds_capacity_bytes
 from aiter.ops.flydsl.kernels import buffer_ops
 
+from ..kernels_common import create_llvm_ptr
 from ..tensor_shim import _run_compiled
 
 # Runtime `if` helper the AST rewriter lowers dynamic conditions to. Called
@@ -218,7 +219,7 @@ def _load_sink_logit(ptr_sink, q_head_idx, num_heads_q):
     sink_base_i64 = fx.Int64(fx.ptrtoint(fx.get_iter(ptr_sink)))
     byte_off = fx.Int64(q_head_idx) * fx.Int64(4)
     addr = sink_base_i64 + byte_off
-    gptr = buffer_ops.create_llvm_ptr(addr, address_space=1)
+    gptr = create_llvm_ptr(addr, address_space=1)
     return fx.Float32(llvm_dialect.load(ir.F32Type.get(), gptr))
 
 

@@ -843,6 +843,7 @@ def _precompile_a16w4_to_cache(
     b_nt: int = 2,
     xcd_swizzle: int = 0,
     k_wave: int = 1,
+    waves_per_eu: int | None = None,
     b_dtype: str = "fp4",
     **kwargs,
 ):
@@ -852,7 +853,7 @@ def _precompile_a16w4_to_cache(
     gemm (``_s1_args_fp4``), so it can't reuse ``_precompile_to_cache``'s arg
     builders.  Instead drive the SAME runtime launchers (``flydsl_a16w4_gemm{1,2}``)
     the fused-MoE op uses, under ``COMPILE_ONLY=1`` — the cache key then matches
-    runtime by construction (``waves_per_eu=None``, ``persist=False``,
+    runtime by construction (``waves_per_eu`` follows runtime, ``persist=False``,
     ``w_layout="standard"``, g2 tile downgrade are all applied inside the
     launcher).  The compiled artifact is keyed only on the kernel's constexpr
     params (shapes/tiles/topk/act), never on the launch pointers, grid, or
@@ -878,7 +879,6 @@ def _precompile_a16w4_to_cache(
         "tile_m": tile_m,
         "b_nt": b_nt,
         "xcd_swizzle": xcd_swizzle,
-        "waves_per_eu": None,
         "stream": 0,
     }
     with compile_only_env():
@@ -893,6 +893,7 @@ def _precompile_a16w4_to_cache(
                 tile_n=tile_n,
                 tile_k=tile_k,
                 k_wave=k_wave,
+                waves_per_eu=None if waves_per_eu == 1 else waves_per_eu,
                 act=("situv2" if act in ("situv2", "situ") else act),
                 w_dtype=b_dtype,
                 w_layout="standard",

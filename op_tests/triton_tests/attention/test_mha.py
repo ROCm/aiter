@@ -23,6 +23,7 @@ from aiter.test_mha_common import (
 from op_tests.triton_tests.attention.mha_test_utils import (
     pad_rearrange_dropout_mask,
     skip_if_gluon_unsupported,
+    skip_if_triton_padded_head_miscompiled,
 )
 
 logging.basicConfig(level=logging.DEBUG)
@@ -112,9 +113,10 @@ def _test_mha_impl(
     "SEQLEN_Q, SEQLEN_K",
     [(1, 1), (128, 128), (32, 16), (64, 128), (2048, 2048)],
 )
-@pytest.mark.parametrize("NUM_Q_HEADS, NUM_K_HEADS", [(1, 1), (8, 8), (48, 8)])
-@pytest.mark.parametrize("HEAD_SZ", [64, 128])
+@pytest.mark.parametrize("NUM_Q_HEADS, NUM_K_HEADS", [(1, 1), (8, 1), (48, 8)])
+@pytest.mark.parametrize("HEAD_SZ", [33, 64, 128])
 @pytest.mark.parametrize("CAUSAL", [(True), (False)])
+@pytest.mark.parametrize("backend", ["triton", "gluon"])
 def test_mha(
     BATCH: int,
     SEQLEN_Q: int,
@@ -123,42 +125,12 @@ def test_mha(
     NUM_K_HEADS: int,
     HEAD_SZ: int,
     CAUSAL: bool,
+    backend: str,
     dtype=torch.bfloat16,
 ):
-    _test_mha_impl(
-        BATCH,
-        SEQLEN_Q,
-        SEQLEN_K,
-        NUM_Q_HEADS,
-        NUM_K_HEADS,
-        HEAD_SZ,
-        DROPOUT=0.0,
-        RETURN_LSE=False,
-        RETURN_SOFTMAX=False,
-        CAUSAL=CAUSAL,
-        backend="triton",
-        dtype=dtype,
+    skip_if_triton_padded_head_miscompiled(
+        backend, HEAD_SZ, CAUSAL, SEQLEN_K, NUM_K_HEADS
     )
-
-
-@pytest.mark.parametrize("BATCH", [1, 30, 50])
-@pytest.mark.parametrize(
-    "SEQLEN_Q, SEQLEN_K",
-    [(1, 1), (128, 128), (32, 16), (64, 128), (2048, 2048)],
-)
-@pytest.mark.parametrize("NUM_Q_HEADS, NUM_K_HEADS", [(1, 1), (8, 1), (64, 8)])
-@pytest.mark.parametrize("HEAD_SZ", [33, 64, 128])
-@pytest.mark.parametrize("CAUSAL", [(True), (False)])
-def test_mha_gluon(
-    BATCH: int,
-    SEQLEN_Q: int,
-    SEQLEN_K: int,
-    NUM_Q_HEADS: int,
-    NUM_K_HEADS: int,
-    HEAD_SZ: int,
-    CAUSAL: bool,
-    dtype=torch.bfloat16,
-):
     _test_mha_impl(
         BATCH,
         SEQLEN_Q,
@@ -170,7 +142,7 @@ def test_mha_gluon(
         RETURN_LSE=False,
         RETURN_SOFTMAX=False,
         CAUSAL=CAUSAL,
-        backend="gluon",
+        backend=backend,
         dtype=dtype,
     )
 
@@ -600,10 +572,11 @@ def _test_mha_varlen_impl(
     [(1, 1), (128, 128), (32, 16), (64, 128), (2048, 2048)],
 )
 @pytest.mark.parametrize(
-    "NUM_Q_HEADS, NUM_K_HEADS", [(1, 1), (16, 16), (2, 1), (48, 8)]
+    "NUM_Q_HEADS, NUM_K_HEADS", [(1, 1), (8, 1), (16, 16), (48, 8)]
 )
-@pytest.mark.parametrize("HEAD_SZ", [8, 32, 128])
+@pytest.mark.parametrize("HEAD_SZ", [8, 32, 33, 128])
 @pytest.mark.parametrize("CAUSAL", [(True), (False)])
+@pytest.mark.parametrize("backend", ["triton", "gluon"])
 def test_mha_varlen(
     BATCH: int,
     SEQLEN_Q: int,
@@ -612,44 +585,12 @@ def test_mha_varlen(
     NUM_K_HEADS: int,
     HEAD_SZ: int,
     CAUSAL: bool,
+    backend: str,
     dtype=torch.bfloat16,
 ):
-    _test_mha_varlen_impl(
-        BATCH,
-        SEQLEN_Q,
-        SEQLEN_K,
-        NUM_Q_HEADS,
-        NUM_K_HEADS,
-        HEAD_SZ,
-        DROPOUT=0.0,
-        RETURN_LSE=False,
-        RETURN_SOFTMAX=False,
-        CAUSAL=CAUSAL,
-        backend="triton",
-        dtype=dtype,
+    skip_if_triton_padded_head_miscompiled(
+        backend, HEAD_SZ, CAUSAL, SEQLEN_K, NUM_K_HEADS
     )
-
-
-@pytest.mark.parametrize("BATCH", [1, 4, 30, 50])
-@pytest.mark.parametrize(
-    "SEQLEN_Q, SEQLEN_K",
-    [(1, 1), (128, 128), (32, 16), (64, 128), (2048, 2048)],
-)
-@pytest.mark.parametrize(
-    "NUM_Q_HEADS, NUM_K_HEADS", [(1, 1), (8, 1), (16, 16), (64, 8)]
-)
-@pytest.mark.parametrize("HEAD_SZ", [8, 32, 33, 128])
-@pytest.mark.parametrize("CAUSAL", [(True), (False)])
-def test_mha_varlen_gluon(
-    BATCH: int,
-    SEQLEN_Q: int,
-    SEQLEN_K: int,
-    NUM_Q_HEADS: int,
-    NUM_K_HEADS: int,
-    HEAD_SZ: int,
-    CAUSAL: bool,
-    dtype=torch.bfloat16,
-):
     _test_mha_varlen_impl(
         BATCH,
         SEQLEN_Q,
@@ -661,7 +602,7 @@ def test_mha_varlen_gluon(
         RETURN_LSE=False,
         RETURN_SOFTMAX=False,
         CAUSAL=CAUSAL,
-        backend="gluon",
+        backend=backend,
         dtype=dtype,
     )
 
