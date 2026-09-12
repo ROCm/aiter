@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
-"""Compare online-faithful Mori EP and MegaMoEV2 on a v4_pro A8W4 workload."""
+"""Compare Mori EP and MegaMoE with the same v4_pro CUDA Graph workload."""
 
 from __future__ import annotations
 
@@ -9,7 +9,8 @@ import os
 from dataclasses import replace
 from pathlib import Path
 
-os.environ.setdefault("MORI_SHMEM_HEAP_SIZE", "17179869184")
+os.environ.setdefault("MORI_EP_LAUNCH_CONFIG_MODE", "AUTO")
+os.environ.setdefault("MORI_SHMEM_HEAP_SIZE", "40G")
 
 import mori
 import mori.shmem as ms
@@ -19,9 +20,7 @@ from torch.profiler import ProfilerActivity, profile
 
 import aiter
 from aiter import dtypes
-from aiter.fused_moe import fused_moe, get_padded_M
-from aiter.jit.core import AITER_CONFIGS
-from aiter.jit.utils.chip_info import get_cu_num
+from aiter.fused_moe import fused_moe
 from aiter.ops.flydsl.kernels.mega_moe import MegaMoEV2
 from aiter.ops.flydsl.moe_common import GateMode
 from aiter.ops.shuffle import shuffle_scale_a16w4, shuffle_weight_a16w4
@@ -33,37 +32,11 @@ TOPK = 6
 SWIGLU_LIMIT = 10.0
 
 PERF_GUARD_MIN_SPEEDUP = {
-    ("decode", 512, "uniform"): 140.0,
-    ("decode", 512, "rank-mixed-skew"): 110.0,
-    ("prefill", 8192, "uniform"): 50.0,
-    ("prefill", 8192, "rank-mixed-skew"): 40.0,
+    (512, "uniform"): 140.0,
+    (512, "rank-mixed-skew"): 110.0,
+    (8192, "uniform"): 50.0,
+    (8192, "rank-mixed-skew"): 40.0,
 }
-
-
-def online_mori_launch_config(phase: str) -> tuple[int, int]:
-    """Mirror ATOM MoriPrepareAndFinalize._get_dispatch_config()."""
-    cu_num = get_cu_num()
-    if phase == "prefill":
-        return min(128, cu_num), 16
-    return min(64, cu_num), 4
-
-
-def trim_mori_dispatch_output(
-    dispatched,
-    recv_weights,
-    recv_scales,
-    recv_ids,
-    trim_rows: int | None,
-):
-    """Mirror ATOM's uniform-decode static CUDA Graph buffer trim."""
-    if trim_rows is None or trim_rows >= dispatched.shape[0]:
-        return dispatched, recv_weights, recv_scales, recv_ids
-    dispatched = dispatched[:trim_rows]
-    recv_weights = recv_weights[:trim_rows]
-    recv_ids = recv_ids[:trim_rows]
-    if recv_scales is not None:
-        recv_scales = recv_scales[:trim_rows]
-    return dispatched, recv_weights, recv_scales, recv_ids
 
 
 def setup_dist():
@@ -85,18 +58,46 @@ def barrier():
     ms.shmem_barrier_all()
 
 
-def make_inputs(tokens, rank, world, model_dim, experts, topk, route, hot_bias, device):
+def make_inputs(
+    tokens,
+    rank,
+    world,
+    model_dim,
+    experts,
+    topk,
+    route,
+    hot_bias,
+    zipf_alpha,
+    device,
+):
     local_experts = experts // world
     generator = torch.Generator(device=device).manual_seed(1234 + rank)
     x = torch.randn(
         (tokens, model_dim), dtype=torch.bfloat16, device=device, generator=generator
     )
-    scores = torch.randn(
-        (tokens, experts), dtype=torch.float32, device=device, generator=generator
-    )
+    if route == "zipf":
+        order_generator = torch.Generator(device=device).manual_seed(1234 + 19001)
+        permutation = torch.randperm(experts, device=device, generator=order_generator)
+        ranked = torch.arange(1, experts + 1, dtype=torch.float32, device=device).pow(
+            -float(zipf_alpha)
+        )
+        probabilities = torch.empty_like(ranked)
+        probabilities[permutation] = ranked
+        uniform = torch.rand(
+            (tokens, experts), dtype=torch.float32, device=device, generator=generator
+        )
+        scores = torch.log(probabilities)[None, :] - torch.log(
+            -torch.log(uniform.clamp_(1e-7, 1.0 - 1e-7))
+        )
+    else:
+        scores = torch.randn(
+            (tokens, experts), dtype=torch.float32, device=device, generator=generator
+        )
     if route == "hot-rank0":
         scores[:, :local_experts] += hot_bias
     values, ids = torch.topk(scores, topk, dim=-1)
+    if route == "zipf":
+        values = torch.zeros_like(values)
     if route in ("rank-balanced-hot", "rank-balanced-last", "rank-mixed-skew"):
         destination_scores = torch.rand(
             (tokens, world), device=device, generator=generator
@@ -208,33 +209,18 @@ def main():
     parser.add_argument("--rank-tokens", default="")
     parser.add_argument("--config-tokens", type=int, default=0)
     parser.add_argument("--mtpr", type=int, default=8192)
-    parser.add_argument(
-        "--phase",
-        choices=("decode", "prefill"),
-        default=None,
-        help=(
-            "Online MORI phase. Required unless --mega-only; controls the exact "
-            "dispatch/combine launch geometry and decode buffer trimming."
-        ),
-    )
-    parser.add_argument(
-        "--graph-bs",
-        type=int,
-        default=0,
-        help=(
-            "Online CUDA Graph batch bucket used by decode trimming. Zero infers "
-            "the maximum --rank-tokens value (or --tokens for a uniform batch)."
-        ),
-    )
     parser.add_argument("--model-dim", type=int, default=MODEL_DIM)
     parser.add_argument("--inter-dim", type=int, default=INTER_DIM)
     parser.add_argument("--experts", type=int, default=EXPERTS)
     parser.add_argument("--topk", type=int, default=TOPK)
+    parser.add_argument("--quant", choices=("a4w4", "a8w4"), default="a4w4")
+    parser.add_argument("--swiglu-limit", type=float, default=SWIGLU_LIMIT)
     parser.add_argument("--iters", type=int, default=10)
     parser.add_argument(
         "--route",
         choices=(
             "uniform",
+            "zipf",
             "hot-rank0",
             "rank-balanced-hot",
             "rank-balanced-last",
@@ -243,11 +229,15 @@ def main():
         default="uniform",
     )
     parser.add_argument("--hot-bias", type=float, default=0.6)
+    parser.add_argument("--zipf-alpha", type=float, default=1.2)
     parser.add_argument("--stage2-strided", action="store_true")
     parser.add_argument("--stage2-persist-cu", type=int, default=0)
     parser.add_argument("--stage2-skew-cu", type=int, default=0)
     parser.add_argument("--disable-stage2-skew", action="store_true")
     parser.add_argument("--stage1-payload-chunk-rows", type=int, default=0)
+    parser.add_argument("--stage1-tile-ready", action="store_true")
+    parser.add_argument("--disable-stage1-tile-ready", action="store_true")
+    parser.add_argument("--stage1-internal-grouping", action="store_true")
     parser.add_argument("--stage1-work-shards", type=int, default=0)
     parser.add_argument("--stage1-dispatch-cu", type=int, default=0)
     parser.add_argument("--stage1-grid-mult", type=int, default=0)
@@ -259,20 +249,6 @@ def main():
     parser.add_argument("--perf-guard", action="store_true")
     args = parser.parse_args()
 
-    if not args.mega_only and args.phase is None:
-        parser.error("--phase {decode,prefill} is required for a Mori comparison")
-    if args.graph_bs < 0:
-        parser.error("--graph-bs must be non-negative")
-
-    # ATOM leaves MORI in MANUAL mode and passes the phase-specific geometry to
-    # every dispatch/combine call. Force the same behavior even if the parent
-    # shell happens to export AUTO; otherwise MORI's JSON rules can silently
-    # override the online launch parameters and invalidate the comparison.
-    os.environ["MORI_EP_LAUNCH_CONFIG_MODE"] = "MANUAL"
-    # The validated online DSV4-Pro stack always takes the MXFP8-activation
-    # A8W4 fused-MoE path, including small decode CUDA Graph buckets.
-    os.environ["AITER_BF16_FP8_MOE_BOUND"] = "0"
-
     rank, world, device = setup_dist()
     if world != 8:
         raise ValueError("This comparison requires eight ranks")
@@ -282,28 +258,6 @@ def main():
     if rank_tokens and len(rank_tokens) != world:
         raise ValueError(f"--rank-tokens requires {world} comma-separated values")
     tokens = rank_tokens[rank] if rank_tokens else args.tokens
-    max_rank_tokens = max(rank_tokens) if rank_tokens else args.tokens
-    if max_rank_tokens > args.mtpr:
-        raise ValueError(
-            f"maximum input tokens ({max_rank_tokens}) exceed mtpr={args.mtpr}"
-        )
-    phase = args.phase or "decode"  # unused by --mega-only, but keeps setup valid
-    graph_bs = args.graph_bs or max_rank_tokens
-    if phase == "decode" and graph_bs < max_rank_tokens:
-        raise ValueError(
-            f"decode graph_bs={graph_bs} is smaller than the largest rank batch "
-            f"({max_rank_tokens})"
-        )
-    if phase == "decode" and graph_bs > args.mtpr:
-        raise ValueError(f"decode graph_bs={graph_bs} exceeds mtpr={args.mtpr}")
-    mori_block_num, mori_warp_per_block = online_mori_launch_config(phase)
-    # ATOM trims only uniform all-ranks decode. MORI sends one copy of a token
-    # per destination rank even when several of its top-k experts live there,
-    # so the static receive bound is graph_bs * DP without a top-k factor.
-    uniform_rank_tokens = not rank_tokens or len(set(rank_tokens)) == 1
-    mori_trim_rows = (
-        graph_bs * world if phase == "decode" and uniform_rank_tokens else None
-    )
     local_experts = args.experts // world
     x, route_weights, ids = make_inputs(
         tokens,
@@ -314,6 +268,7 @@ def main():
         args.topk,
         args.route,
         args.hot_bias,
+        args.zipf_alpha,
         device,
     )
     route_counts = torch.zeros(world, dtype=torch.int64, device=device)
@@ -338,13 +293,13 @@ def main():
         inter_dim=args.inter_dim,
         experts=args.experts,
         topk=args.topk,
-        quant="a8w4",
+        quant=args.quant,
         w1=w1,
         w1_scale=w1_scale,
         w2=w2,
         w2_scale=w2_scale,
         max_tok_per_rank=args.mtpr,
-        swiglu_limit=SWIGLU_LIMIT,
+        swiglu_limit=args.swiglu_limit,
     )
     default_select_config = mega._select_config
     variant_select_config = None
@@ -354,6 +309,9 @@ def main():
         or args.stage2_skew_cu
         or args.disable_stage2_skew
         or args.stage1_payload_chunk_rows
+        or args.stage1_tile_ready
+        or args.disable_stage1_tile_ready
+        or args.stage1_internal_grouping
         or args.stage1_work_shards
         or args.stage1_dispatch_cu
         or args.stage1_grid_mult
@@ -366,21 +324,28 @@ def main():
             config = default_select_config(args.config_tokens or tokens)
             stage1 = config.stage1
             stage2 = config.stage2
-            stage1_updates = {}
             if args.stage1_payload_chunk_rows:
-                stage1_updates["payload_chunk_rows"] = args.stage1_payload_chunk_rows
+                stage1 = replace(
+                    stage1, payload_chunk_rows=args.stage1_payload_chunk_rows
+                )
+            if args.stage1_tile_ready:
+                stage1 = replace(stage1, payload_tile_ready=True)
+            if args.disable_stage1_tile_ready:
+                stage1 = replace(stage1, payload_tile_ready=False)
+            if args.stage1_internal_grouping:
+                stage1 = replace(
+                    stage1, external_grouping=False, external_counting=False
+                )
             if args.stage1_work_shards:
-                stage1_updates["work_shards"] = args.stage1_work_shards
+                stage1 = replace(stage1, work_shards=args.stage1_work_shards)
             if args.stage1_dispatch_cu:
-                stage1_updates["num_dispatch_cu"] = args.stage1_dispatch_cu
+                stage1 = replace(stage1, num_dispatch_cu=args.stage1_dispatch_cu)
             if args.stage1_grid_mult:
-                stage1_updates["grid_mult"] = args.stage1_grid_mult
+                stage1 = replace(stage1, grid_mult=args.stage1_grid_mult)
             if args.stage1_b_nt >= 0:
-                stage1_updates["b_nt"] = args.stage1_b_nt
+                stage1 = replace(stage1, b_nt=args.stage1_b_nt)
             if args.stage1_tile_resource:
-                stage1_updates["use_tile_resource"] = True
-            if stage1_updates:
-                stage1 = replace(stage1, **stage1_updates)
+                stage1 = replace(stage1, use_tile_resource=True)
             if (
                 args.stage2_strided
                 or args.stage2_persist_cu
@@ -414,39 +379,23 @@ def main():
         world_size=world,
         hidden_dim=args.model_dim,
         scale_dim=0,
-        scale_type_size=torch.float32.itemsize,
+        scale_type_size=0,
         max_token_type_size=torch.bfloat16.itemsize,
         max_num_inp_token_per_rank=args.mtpr,
         num_experts_per_rank=local_experts,
         num_experts_per_token=args.topk,
         warp_num_per_block=16,
-        block_num=80,
-        rdma_block_num=0,
-        kernel_type=mori.ops.EpDispatchCombineKernelType.IntraNode,
+        block_num=128,
         gpu_per_node=world,
     )
     mori_op = mori.ops.EpDispatchCombineOp(mori_cfg)
-    # Match ATOM's no-shared-expert EP layout. The final zero is the sentinel
-    # entry appended to expert_map for AITER's non-local-token convention.
-    expert_mask = torch.zeros(args.experts + 1, dtype=torch.int32, device=device)
+    expert_mask = torch.zeros(args.experts, dtype=torch.int32, device=device)
     expert_mask[rank * local_experts : (rank + 1) * local_experts] = 1
     holders = {}
 
     def mori_body():
-        dispatched, recv_weights, recv_scales, recv_ids, recv_tokens = mori_op.dispatch(
-            x,
-            route_weights,
-            None,
-            ids,
-            block_num=mori_block_num,
-            warp_per_block=mori_warp_per_block,
-        )
-        dispatched, recv_weights, recv_scales, recv_ids = trim_mori_dispatch_output(
-            dispatched,
-            recv_weights,
-            recv_scales,
-            recv_ids,
-            mori_trim_rows,
+        dispatched, recv_weights, _, recv_ids, recv_tokens = mori_op.dispatch(
+            x, route_weights, None, ids
         )
         local_out = fused_moe(
             dispatched,
@@ -464,45 +413,22 @@ def main():
             swiglu_limit=SWIGLU_LIMIT,
             gate_mode=GateMode.INTERLEAVE.value,
         )
-        holders["mori"] = mori_op.combine(
-            local_out,
-            None,
-            ids,
-            block_num=mori_block_num,
-            warp_per_block=mori_warp_per_block,
-        )[0][:tokens]
+        holders["mori"] = mori_op.combine(local_out, None, ids)[0]
 
     def mega_body():
         holders["mega"] = mega(x, route_weights, ids)
 
     mori_graph = None if args.mega_only else capture(mori_body)
     print(f"[STEP] rank={rank} mori-capture-done", flush=True)
-    if rank == 0 and mori_graph is not None:
-        full_recv_rows = mori_op.max_num_tokens_to_recv()
-        fused_moe_rows = min(full_recv_rows, mori_trim_rows or full_recv_rows)
-        tune_topk = args.topk - 1  # fused_moe's expert-parallel lookup convention
-        print(
-            "[MORI_CONFIG] "
-            f"mode=MANUAL phase={phase} graph_bs={graph_bs} dp_size={world} "
-            f"launch=({mori_block_num}_blocks,{mori_warp_per_block}_warps) "
-            f"full_recv_M={full_recv_rows} fused_moe_M={fused_moe_rows} "
-            f"padded_M={get_padded_M(fused_moe_rows)} runtime_topk={args.topk} "
-            f"tune_topk={tune_topk} "
-            f"a8w4_activation=fp8 fmoe_csv={AITER_CONFIGS.AITER_CONFIG_FMOE_FILE} "
-            f"dispatch_launch={getattr(mori_op, '_cached_dispatch_launch', None)} "
-            f"combine_launch={getattr(mori_op, '_cached_combine_launch', None)}",
-            flush=True,
-        )
     mega_graph = capture(mega_body)
     print(f"[STEP] rank={rank} mega-capture-done", flush=True)
-    if rank == 0:
-        print(f"[MEGA_CONFIG] {mega._active_config}", flush=True)
     mori_ms = (
         (float("nan"), float("nan"))
         if mori_graph is None
         else time_graph(mori_graph, args.iters, device)
     )
     mega_ms = time_graph(mega_graph, args.iters, device)
+
     x_q, x_scale = mega.quantize(x)
 
     def mega_stage1():
@@ -545,15 +471,9 @@ def main():
     speedup = (mori_ms[1] / mega_ms[1] - 1.0) * 100.0
     guard_floor = None
     if args.perf_guard:
-        if (
-            args.mega_only
-            or rank_tokens
-            or args.mtpr != 8192
-            or graph_bs != args.tokens
-        ):
+        if args.mega_only or rank_tokens or args.mtpr != 8192:
             raise ValueError(
-                "--perf-guard requires Mori, equal rank tokens, graph_bs=tokens, "
-                "and mtpr=8192"
+                "--perf-guard requires Mori, equal rank tokens, and mtpr=8192"
             )
         if (args.model_dim, args.inter_dim, args.experts, args.topk) != (
             MODEL_DIM,
@@ -562,11 +482,10 @@ def main():
             TOPK,
         ):
             raise ValueError("--perf-guard requires the v4_pro shape")
-        guard_floor = PERF_GUARD_MIN_SPEEDUP.get((phase, args.tokens, args.route))
+        guard_floor = PERF_GUARD_MIN_SPEEDUP.get((args.tokens, args.route))
         if guard_floor is None:
             raise ValueError(
-                f"no performance guard for phase={phase}, tokens={args.tokens}, "
-                f"route={args.route}"
+                f"no performance guard for tokens={args.tokens}, route={args.route}"
             )
     guard_pass = guard_floor is None or speedup >= guard_floor
     if rank == 0:
@@ -581,8 +500,8 @@ def main():
                 f"[ACCURACY] variant_vs_default_rel_l2={rel_l2.item():.6e}", flush=True
             )
         print(
-            f"[RESULT] phase={phase} graph_bs={graph_bs} route={args.route} "
-            f"hot_bias={args.hot_bias} tokens={tokens} "
+            f"[RESULT] route={args.route} hot_bias={args.hot_bias} tokens={tokens} "
+            f"quant={args.quant} "
             f"rank_tokens={rank_tokens or 'same'} mtpr={args.mtpr} "
             f"shape={args.model_dim}x{args.inter_dim} epr={local_experts} topk={args.topk} "
             f"mori_e2e={mori_ms[0]:.4f}/{mori_ms[1]:.4f}ms "

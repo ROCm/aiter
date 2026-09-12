@@ -40,7 +40,6 @@ skip_tests=(
     "op_tests/multigpu_tests/test_communication.py"
     "op_tests/multigpu_tests/test_mori_all2all.py"
     "op_tests/multigpu_tests/test_fused_ar_rms.py"
-    "op_tests/multigpu_tests/test_mega_moe_v2.py"
     "op_tests/multigpu_tests/triton_test/test_reduce_scatter_all_gather.py"
     "op_tests/multigpu_tests/triton_test/test_fused_rs_rmsnorm_quant_ag.py"
 )
@@ -104,6 +103,40 @@ for file in "${sharded_files[@]}"; do
                         --combine fused --layers 2 --acc_verify 1
                 '
                 _ "$file"
+            )
+            ;;
+        op_tests/multigpu_tests/test_mega_moe_v2.py)
+            {
+                echo "Running MegaMoEV2 A8W4 and A4W4 coverage on 8 GPUs"
+            } | tee -a latest_test.log
+            test_cmd=(
+                env MORI_SHMEM_HEAP_SIZE=40G MORI_SOCKET_IFNAME=lo
+                timeout 60m
+                bash -lc
+                'set -uo pipefail
+                exit_code=0
+                torchrun --standalone --nproc_per_node=8 "$1" \
+                    --network v4_pro --quant a8w4 --bs-list 128,512 \
+                    --iters 10 --accuracy-max-bs 512 --rtol 0.10 || exit_code=$?
+                torchrun --standalone --nproc_per_node=8 "$1" \
+                    --network v4_pro --quant a4w4 --bs-list 2,4,16,128,512 \
+                    --iters 10 --accuracy-max-bs 512 --rtol 0.25 || exit_code=$?
+                torchrun --standalone --nproc_per_node=8 "$1" \
+                    --network r1_v3 --quant a8w4 --bs-list 128,512 \
+                    --max-tok-per-rank 8192 --iters 10 \
+                    --accuracy-max-bs 512 --rtol 0.10 || exit_code=$?
+                torchrun --standalone --nproc_per_node=8 "$1" \
+                    --network r1_v3 --quant a4w4 --routing-mode uniform \
+                    --bs-list 2,8,64,128,512 --max-tok-per-rank 8192 \
+                    --iters 10 --accuracy-max-bs 512 --rtol 0.25 || exit_code=$?
+                torchrun --standalone --nproc_per_node=8 "$1" \
+                    --network r1_v3 --quant a4w4 --routing-mode zipf \
+                    --zipf-alpha 1.2 --bs-list 2,8,64,128,512 \
+                    --max-tok-per-rank 8192 --iters 10 \
+                    --accuracy-max-bs 512 --rtol 0.25 || exit_code=$?
+                exit $exit_code'
+                _
+                "$file"
             )
             ;;
         op_tests/multigpu_tests/test_comm_fused_moe.py)
