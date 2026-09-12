@@ -12,7 +12,10 @@ import os
 import torch
 import triton
 
-from aiter.ops.triton.utils.tuned_config_utils import get_tuned_kernel_config
+from aiter.ops.triton.utils.tuned_config_utils import (
+    autotune_enabled,
+    get_tuned_kernel_config,
+)
 
 SUPPORTS_AUTOTUNE_CACHE = (
     "cache_results" in inspect.signature(triton.autotune).parameters
@@ -22,19 +25,7 @@ autotune_cache_kwargs: dict = (
     {"cache_results": _FLA_CACHE_RESULTS} if SUPPORTS_AUTOTUNE_CACHE else {}
 )
 
-CHUNK_DELTA_ATTN_TRITON_AUTOTUNE: bool = os.getenv(
-    "CHUNK_DELTA_ATTN_TRITON_AUTOTUNE", "0"
-).lower() in ("1", "true", "yes", "on")
-
-
-def chunk_delta_attn_autotune_configs(
-    configs: list,
-    default_config=None,
-) -> list:
-    """Return configs for @triton.autotune."""
-    if CHUNK_DELTA_ATTN_TRITON_AUTOTUNE:
-        return configs
-    return [default_config if default_config is not None else configs[0]]
+CHUNK_DELTA_ATTN_TRITON_AUTOTUNE: bool = autotune_enabled("CHUNK_DELTA_ATTN")
 
 
 def chunk_delta_attn_tuned_config(

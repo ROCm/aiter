@@ -71,6 +71,8 @@ from flydsl.expr.typing import Int32, T
 from flydsl.runtime.device import get_rocm_arch
 
 from aiter.ops.flydsl.kernels import buffer_ops
+from aiter.ops.flydsl.kernels import tdm_ops_gfx1250 as tdm_ops
+from aiter.ops.flydsl.kernels.gemm_common_gfx1250 import make_lds_copy_ops
 from aiter.ops.flydsl.kernels.kernels_common import (
     create_llvm_ptr,
     format_kernel_name,
@@ -92,6 +94,18 @@ from aiter.utility.mx_types import (
 )
 
 BLOCK_THREADS = 256
+# Nominal extent of a live destination descriptor; a dead one gets 0 instead.
+# It only has to exceed any real buffer, and stays under 2 GiB because the
+# descriptor builder sign-extends the size to 64 bits.
+_SCALE_RSRC_MAX_BYTES = 0x7FFFFFFF
+# TDM staging depth. One chunk is degenerate -- the prologue waits on the whole
+# row with nothing to overlap -- and past four the per-chunk tensor_wait and two
+# CTA barriers outweigh the smaller transfer. Four also divides every shipped
+# model_dim's iteration count, so one depth serves them all.
+_TOKEN_MULTIDEST_TDM_CHUNKS = 4
+# The K-split aims for this many blocks per CU; past that it stops paying.
+_TOKEN_MULTIDEST_BLOCKS_PER_CU = 4
+_TOKEN_MULTIDEST_MAX_KSPLIT = 14
 ELEMS_PER_LANE = 2  # bf16 columns each lane quantizes -> 1 fp4 byte / 2 fp8 bytes
 LANES_PER_MX_BLOCK = 32 // ELEMS_PER_LANE  # 16 lanes cover one 32-element MX block
 
@@ -154,6 +168,18 @@ def _cvt_scalef32_pk8_fp8_bf16(src_v8bf16, scale_f32, *, v2i32_ty):
 def _raw(value):
     """Unwrap a DSL Numeric to a raw ir.Value (rocdl ops need raw operands)."""
     return value.ir_value() if hasattr(value, "ir_value") else value
+
+
+def _emit_pk8_lane_amax(bf16x8, c):
+    """max(|x|) over the 8 bf16 this lane owns, as f32."""
+    f32 = c.f32
+    f32x8 = bf16x8.extf(T.vec(8, f32))
+    acc = c.c0_f32
+    for j in range_constexpr(8):
+        xj = fx.Vector(f32x8)[j]
+        absj = llvm.call_intrinsic(f32, "llvm.fabs.f32", [xj.ir_value()], [], [])
+        acc = arith.maximumf(acc, absj)
+    return acc
 
 
 def _arch_has_native_scaled_cvt(arch: str) -> bool:
@@ -284,14 +310,18 @@ def _emit_quant_block_loop(c: SimpleNamespace) -> None:
     # i64 row base: at >64k tokens a grouped row index times model_dim exceeds the
     # 32-bit buffer voffset (contiguous_m * feat_dim > 2**32), corrupting the store.
     payload_bytes_per_row = c.payload_bytes_per_row
+    payload_dests = getattr(c, "payload_dests", c.dests)
+    # A zero-length descriptor is how a dead destination is switched off, so
+    # the quant pass stays one basic block.
+    payload_records = getattr(c, "payload_num_records", payload_bytes_per_row)
     dst_payload = []
-    for dst in c.dests:
+    for dst in payload_dests:
         row_addr = (
             c.payload_base + fx.Uint64(dst.payload_row_i32) * payload_bytes_per_row
         )
         dst_payload.append(
             buffer_ops.create_buffer_resource_from_addr(
-                row_addr, num_records_bytes=payload_bytes_per_row
+                row_addr, num_records_bytes=payload_records
             )
         )
 
@@ -323,12 +353,49 @@ def _emit_quant_block_loop(c: SimpleNamespace) -> None:
             num_records_bytes=c.src_scale_bytes_per_row,
         )
 
-    quant_results = []
-    for it in range_constexpr(c.block_iters):
-        # MX block (along K) this lane works on this iteration.
-        mx_block = (mx_group_base + arith.constant(it, type=i32)) * arith.constant(
+    def _mx_block_of(it):
+        return (mx_group_base + arith.constant(it, type=i32)) * arith.constant(
             c.mx_blocks_per_wave_iter, type=i32
         ) + c.block_in_wave
+
+    # Optional TDM staging of the hidden row: ``chunk_prefetch`` issues chunk
+    # n+1's DMA before chunk n is converted, so the transfer runs under the
+    # convert pipeline. The store pass still sees every block at once.
+    n_chunks = getattr(c, "hidden_chunks", 1)
+    assert c.block_iters % n_chunks == 0
+    iters_per_chunk = c.block_iters // n_chunks
+    chunk_prefetch = getattr(c, "chunk_prefetch", None)
+    hidden_lds_load = getattr(c, "hidden_lds_load", None)
+
+    def _emit_hidden_load(it):
+        """This iteration's 8 bf16 (one aligned dwordx4)."""
+        col_base = (
+            _mx_block_of(it) * arith.constant(32, type=i32)
+            + c.lane_in_block * c.c_elems_per_lane
+        )
+        if const_expr(hidden_lds_load is not None):
+            chunk = it // iters_per_chunk
+            chunk_elems = c.mx_blocks_per_wave_iter * iters_per_chunk * 32
+            return hidden_lds_load(
+                c.hidden_lds_idx,
+                c.hidden_lds_row_off
+                + arith.constant((chunk % 2) * c.hidden_slot_bytes, type=i32)
+                + (col_base - arith.constant(chunk * chunk_elems, type=i32))
+                * arith.constant(2, type=i32),
+            )
+        return buffer_ops.buffer_load(
+            hidden_rsrc,
+            (feat_elem_base + col_base) >> c.c1_i32,
+            vec_width=4,
+            dtype=i32,
+        )
+
+    quant_results = []
+    for it in range_constexpr(c.block_iters):
+        if const_expr(chunk_prefetch is not None and it % iters_per_chunk == 0):
+            chunk_prefetch(it // iters_per_chunk)
+        # MX block (along K) this lane works on this iteration.
+        mx_block = _mx_block_of(it)
         if const_expr(prequantized):
             # This lane's payload bytes sit at exactly the offset the store pass
             # writes them to, so both sides share the expression and cannot drift.
@@ -361,23 +428,12 @@ def _emit_quant_block_loop(c: SimpleNamespace) -> None:
                 + c.lane_in_block * c.c_elems_per_lane
             )
             # 2 bf16/dword -> 4 dwords; one aligned dwordx4 = 8 bf16.
-            hidden_dword = (feat_elem_base + col_base) >> c.c1_i32
-            dwords4 = buffer_ops.buffer_load(
-                hidden_rsrc, hidden_dword, vec_width=4, dtype=i32
-            )
-            vec8_f32_ty = T.vec(8, f32)
+            dwords4 = _emit_hidden_load(it)
             bf16x8 = fx.Vector(dwords4).bitcast(fx.Numeric.from_ir_type(T.bf16))
-            f32x8 = bf16x8.extf(vec8_f32_ty)
 
             # per-block amax over this lane's 8 elems, then a butterfly
             # shuffle_xor across the block's 4 lanes.
-            block_amax = c.c0_f32
-            for j in range_constexpr(8):
-                xj = fx.Vector(f32x8)[j]
-                absj = llvm.call_intrinsic(
-                    f32, "llvm.fabs.f32", [xj.ir_value()], [], []
-                )
-                block_amax = arith.maximumf(block_amax, absj)
+            block_amax = _emit_pk8_lane_amax(bf16x8, c)
             for dist in c.amax_shuffle_dists:
                 peer_amax = block_amax.shuffle_xor(
                     arith.constant(dist, type=i32), c.c_wave
@@ -474,53 +530,181 @@ def _emit_quant_block_loop(c: SimpleNamespace) -> None:
 
         quant_results.append((mx_block, payload_val, e8m0_scale))
 
+    if const_expr(getattr(c, "scale_vec4", False)):
+        # Payload per block as usual, but the row's e8m0 goes out 16 B at a
+        # time: the store pass has every block's result live, so two adjacent
+        # blocks' dwords pair into one dwordx4.
+        for mx_block, payload_val, _e8m0 in quant_results:
+            _emit_payload_stores(c, dst_payload, payload_val, mx_block)
+        for i in range_constexpr(0, len(quant_results), 2):
+            _emit_row_major_scale_vec4(
+                c, quant_results[i][0], quant_results[i][2], quant_results[i + 1][2]
+            )
+        return
+
     # Stores are a separate pass so the quant pass above stays one basic block and
     # its loads can cluster. That only works while the quant pass is branch-free:
-    # a value defined inside an scf.if does not dominate this loop, so putting a
-    # per-iteration guard back above would produce invalid IR.
+    # a value defined inside a guarded region does not dominate this loop, so
+    # putting a per-iteration guard back above would produce invalid IR.
     # One quant result (payload_val + e8m0_scale) is written to every destination
-    # row in ``c.dests``; current kernels pass one.
+    # row in ``c.dests``.
     for mx_block, payload_val, e8m0_scale in quant_results:
-        # The block-scale's dword/byte position depends only on ``mx_block``.
-        scale_dword = fx.Uint32(mx_block) // fx.Uint32(c.c4_i32)
-        byte_in_dword = mx_block - scale_dword * c.c4_i32
-        e8m0_byte = arith.trunci(T.i8, e8m0_scale)
-        for di, dst in enumerate(c.dests):
-            # The MX payload row stays on the width-agnostic buffer_ops V#
-            # (per-access byte offset). A lane-unit ptr_buf_tensor store is
-            # correct and cheaper on most rows but perturbs VGPR alloc by +1..+4
-            # on the fp4/fp8 pk8 modules.
-            payload_rsrc = dst_payload[di]
-            payload_byte_off = (
-                mx_block * c.c_payload_bytes_per_block
-                + c.lane_in_block * c.c_payload_bytes_per_lane
-            )
-            buffer_ops.buffer_store(
-                payload_val, payload_rsrc, payload_byte_off, offset_is_bytes=True
-            )
+        _emit_quant_result_stores(c, dst_payload, mx_block, payload_val, e8m0_scale)
 
-            # one e8m0 byte per block, written by the block's lead lane. This
-            # plain helper is not AST-rewritten, so the runtime guard goes through
-            # a local @flyc.jit dispatch (a bare Python ``if`` would eval the
-            # dynamic Boolean as a host bool).
-            def _store_lead_scale(
-                dst=dst,
-                scale_dword=scale_dword,
-                byte_in_dword=byte_in_dword,
-                e8m0_byte=e8m0_byte,
-            ):
+
+def _emit_quant_result_stores(c, dst_payload, mx_block, payload_val, e8m0_scale):
+    """Write one MX-block result to every destination in ``c.dests``.
+
+    Payload stores are unpredicated. The scale stores share one lead-lane guard
+    covering all destinations, so a 6-dest kernel emits one dispatch per MX
+    block instead of six.
+    """
+    # The block-scale's dword/byte position depends only on ``mx_block``.
+    scale_dword = fx.Uint32(mx_block) // fx.Uint32(c.c4_i32)
+    byte_in_dword = mx_block - scale_dword * c.c4_i32
+    e8m0_byte = arith.trunci(T.i8, e8m0_scale)
+    _emit_payload_stores(c, dst_payload, payload_val, mx_block)
+
+    row_major_scale = getattr(c, "row_major_scale", False)
+    if const_expr(row_major_scale and getattr(c, "scale_pack_dwords", False)):
+        _emit_row_major_scale_dwords(c, mx_block, scale_dword, e8m0_scale)
+        return
+
+    # one e8m0 byte per block, written by the block's lead lane. This plain
+    # helper is not AST-rewritten, so the runtime guard goes through a local
+    # @flyc.jit dispatch (a bare Python ``if`` would eval the dynamic Boolean
+    # as a host bool).
+    def _store_lead_scale():
+        for dst in c.dests:
+            if const_expr(row_major_scale):
+                # (row, feat_dim//32) bytes: each row's scales contiguous, so a
+                # warp's six destination writes stay within six rows instead of
+                # touching a fresh cache line per MX block.
+                dst_scale_byte = (
+                    dst.payload_row_i32 * c.c_scale_bytes_per_row + mx_block
+                )
+            else:
                 dst_scale_dword = (
                     dst.scale_row_dword_base + scale_dword * c.c_wmma_rep * 16
                 )
                 dst_scale_byte = dst_scale_dword * c.c4_i32 + byte_in_dword
-                c.scale_t[dst_scale_byte] = e8m0_byte
+            c.scale_t[dst_scale_byte] = e8m0_byte
 
-            @flyc.jit
-            def _dispatch_lead_scale():
-                if c.is_block_lead:
-                    _store_lead_scale()
+    @flyc.jit
+    def _dispatch_lead_scale():
+        if c.is_block_lead:
+            _store_lead_scale()
 
-            _dispatch_lead_scale()
+    _dispatch_lead_scale()
+
+
+def _emit_payload_stores(c, dst_payload, payload_val, mx_block):
+    """One MX block's payload bytes to every payload destination.
+
+    The MX payload row stays on the width-agnostic buffer_ops V# (per-access
+    byte offset). A lane-unit ptr_buf_tensor store is correct and cheaper on
+    most rows but perturbs VGPR alloc by +1..+4 on the fp4/fp8 pk8 modules.
+    """
+    payload_byte_off = (
+        mx_block * c.c_payload_bytes_per_block
+        + c.lane_in_block * c.c_payload_bytes_per_lane
+    )
+    payload_cache = getattr(c, "payload_cache_modifier", 0)
+    for rsrc in dst_payload:
+        buffer_ops.buffer_store(
+            payload_val,
+            rsrc,
+            payload_byte_off,
+            cache_modifier=payload_cache,
+            offset_is_bytes=True,
+        )
+
+
+def _pack_block_group_dword(c, e8m0_scale):
+    """The dword of e8m0 bytes for the 4 MX blocks around this lane's block.
+
+    Only the lane holding block 4k ends up with them in the right order; the
+    caller predicates on that.
+    """
+    i32 = c.i32
+    v = ArithValue(arith.andi(e8m0_scale, arith.constant(0xFF, type=i32)))
+    p1 = ArithValue(v.shuffle_xor(c.c4_i32, c.c_wave))
+    half = v | (p1 << arith.constant(8, type=i32))
+    p2 = ArithValue(half.shuffle_xor(arith.constant(8, type=i32), c.c_wave))
+    return half | (p2 << arith.constant(16, type=i32))
+
+
+def _emit_row_major_scale_vec4(c, mx_block_lo, e8m0_lo, e8m0_hi):
+    """Two blocks' worth of row-major e8m0 (16 B) in one dwordx4 store.
+
+    ``mx_block_lo`` is the low iteration's block for this lane. Lane 4k*4 holds
+    the low dword of each pair and picks up its partner's upper dword with one
+    more xor-shuffle, so a single lane writes all 16 bytes.
+
+    Like the payload, the packed scale stays on the width-agnostic buffer_ops V#:
+    ``c.scale_t`` is a byte view, and this store is a dword-indexed dwordx4.
+    """
+    i32 = c.i32
+    lo = _pack_block_group_dword(c, e8m0_lo)
+    hi = _pack_block_group_dword(c, e8m0_hi)
+    lo_peer = ArithValue(lo).shuffle_xor(arith.constant(16, type=i32), c.c_wave)
+    hi_peer = ArithValue(hi).shuffle_xor(arith.constant(16, type=i32), c.c_wave)
+    quad = fx.Vector.from_elements(
+        [lo, lo_peer, hi, hi_peer], fx.Numeric.from_ir_type(i32)
+    )
+    scale_dword = fx.Uint32(mx_block_lo) // fx.Uint32(c.c4_i32)
+
+    def _store_quad():
+        for dst in c.dests:
+            buffer_ops.buffer_store(
+                quad,
+                c.scale_rsrc,
+                dst.payload_row_i32 * c.c_scale_dwords_per_row + scale_dword,
+            )
+
+    # Only lane 0 of the wave stores: it holds blocks 4k..4k+3 of both halves.
+    is_wave_lead = arith.andi(
+        fx.Int32(c.block_in_wave) == c.c0_i32,
+        c.is_block_lead,
+    )
+
+    @flyc.jit
+    def _dispatch_quad():
+        if is_wave_lead:
+            _store_quad()
+
+    _dispatch_quad()
+
+
+def _emit_row_major_scale_dwords(c, mx_block, scale_dword, e8m0_scale):
+    """Row-major e8m0 as one dword per 4 MX blocks instead of 4 byte stores.
+
+    Only the lane holding block 4k ends up with the bytes in the right order,
+    hence the ``block_in_wave % 4 == 0`` predicate.
+    """
+    i32 = c.i32
+    packed = _pack_block_group_dword(c, e8m0_scale)
+
+    def _store_packed():
+        for dst in c.dests:
+            # buffer_store scales the offset by the stored type, so index dwords.
+            buffer_ops.buffer_store(
+                packed,
+                c.scale_rsrc,
+                dst.payload_row_i32 * c.c_scale_dwords_per_row + scale_dword,
+            )
+
+    group_lead = arith.andi(
+        arith.andi(fx.Int32(c.block_in_wave), arith.constant(3, type=i32)) == c.c0_i32,
+        c.is_block_lead,
+    )
+
+    @flyc.jit
+    def _dispatch_packed():
+        if group_lead:
+            _store_packed()
+
+    _dispatch_packed()
 
 
 def _emit_quant_one_k_group(c: SimpleNamespace, mx_group) -> None:
@@ -1623,6 +1807,367 @@ def build_moe_fused_quant_preshuffle_route_ksplit_module(
     }
 
     return launch_fused
+
+
+def _token_multidest_scale_base(
+    row, c_rows_per_tile, c_dst_scale_dwords_per_row, c16_i32
+):
+    """Return the preshuffled e8m0 dword base for one grouped row."""
+    scale_tile = fx.Uint32(row) // fx.Uint32(c_rows_per_tile)
+    row_in_tile = fx.Uint32(row) - scale_tile * c_rows_per_tile
+    wmma_row = row_in_tile // fx.Uint32(c16_i32)
+    row_lane16 = row_in_tile - wmma_row * c16_i32
+    return (
+        scale_tile * c_dst_scale_dwords_per_row * c16_i32
+        + wmma_row * c16_i32
+        + row_lane16
+    )
+
+
+def token_multidest_ksplit(
+    feat_dim: int, wmma_rep: int, quant_mode: str, token_num: int
+) -> int:
+    """How many ways to split the row's K groups over ``grid.y``.
+
+    One warp per token gives only ``token_num / warps_per_block`` blocks, so a
+    decode-sized batch leaves most of the GPU idle; splitting K widens the grid
+    without duplicating any work. Splitting further than that only multiplies
+    the per-block route setup, and it costs the staging pipeline, so it stops
+    once the grid is wide enough.
+    """
+    from aiter.jit.utils.chip_info import get_cu_num
+
+    L = _quant_layout(feat_dim, quant_mode, wmma_rep)
+    grid = -(-token_num // L.warps_per_block)
+    target = (get_cu_num() or 256) * _TOKEN_MULTIDEST_BLOCKS_PER_CU
+    want = -(-target // max(grid, 1))
+    best = 1
+    for n in range(1, min(want, _TOKEN_MULTIDEST_MAX_KSPLIT) + 1):
+        if L.block_iters % n == 0:
+            best = n
+    return best
+
+
+def token_multidest_tdm_chunks(
+    feat_dim: int, wmma_rep: int, quant_mode: str, ksplit: int = 1
+) -> int:
+    """TDM staging depth: the deepest the row's geometry allows, up to the tuned one.
+
+    A chunk has to cover a whole number of wave iterations and stay 16 B
+    aligned, so the depth has to come from the row's divisors rather than a
+    constant. A K-split block has too few iterations left to pay for a pipeline
+    and the builder drops staging for it, so report that here too.
+    """
+    if ksplit > 1:
+        return 0
+    L = _quant_layout(feat_dim, quant_mode, wmma_rep)
+    for n in range(min(_TOKEN_MULTIDEST_TDM_CHUNKS, L.block_iters), 0, -1):
+        if L.block_iters % n == 0 and (feat_dim * 2) % (n * 16) == 0:
+            return n
+    return 0
+
+
+def build_moe_token_multidest_quant_module(
+    feat_dim: int,
+    wmma_rep: int,
+    topk: int,
+    quant_mode: str = "fp4",
+    row_major_scale: bool = False,
+    tdm_hidden_chunks: int = _TOKEN_MULTIDEST_TDM_CHUNKS,
+    ksplit: int = 1,
+):
+    """Quantize each token once and scatter the result to its ``topk`` routed rows.
+
+    The route-indexed kernel quantizes the same hidden row once per route; this
+    one uses a warp per token, computes the MX payload/e8m0 row once, then emits
+    every destination. What it saves therefore grows with ``topk``, while what
+    it costs -- one buffer descriptor per destination held live across the store
+    pass -- grows with it too.
+    """
+    L = _quant_layout(feat_dim, quant_mode, wmma_rep)
+    if not L.use_pk8:
+        raise NotImplementedError("token multidest quant requires gfx1250 pk8")
+    is_fp8 = L.is_fp8
+    use_native = L.use_native
+    use_pk8 = L.use_pk8
+    elems_per_lane = L.elems_per_lane
+    lanes_per_mx_block = L.lanes_per_mx_block
+    mx_dtype = L.mx_dtype
+    payload_bytes_per_row = L.payload_bytes_per_row
+    payload_bytes_per_block = L.payload_bytes_per_block
+    payload_bytes_per_lane = L.payload_bytes_per_lane
+    wave_size = L.wave_size
+    warps_per_block = L.warps_per_block
+    mx_blocks_per_wave_iter = L.mx_blocks_per_wave_iter
+    mx_blocks_per_row = L.mx_blocks_per_row
+    rows_per_tile = L.rows_per_tile
+    dst_scale_dwords_per_row = L.dst_scale_dwords_per_row
+    row_iters = L.block_iters
+    amax_shuffle_dists = L.amax_shuffle_dists
+    # Splitting the row's K groups over grid.y is safe because an MX block scale
+    # covers 32 contiguous elements: the slices need no cross-block reduction.
+    if row_iters % ksplit:
+        raise ValueError(
+            f"ksplit={ksplit} must divide the row's {row_iters} wave iterations"
+        )
+    block_iters = row_iters // ksplit
+    # The staged chunks are a pipeline over the *block's* iterations, and a
+    # split block has too few left to pay for one.
+    if ksplit > 1:
+        tdm_hidden_chunks = 0
+    if tdm_hidden_chunks and (
+        block_iters % tdm_hidden_chunks or (feat_dim * 2) % (tdm_hidden_chunks * 16)
+    ):
+        raise ValueError(
+            f"tdm_hidden_chunks={tdm_hidden_chunks} must divide block_iters="
+            f"{block_iters} and leave a 16 B-aligned chunk of {feat_dim * 2} B"
+        )
+    hidden_chunk_bytes = feat_dim * 2 // tdm_hidden_chunks if tdm_hidden_chunks else 0
+    # Row-major e8m0 goes out packed: a dword per 4 MX blocks, widened to a
+    # dwordx4 per 8 when the block count pairs up. Both need the pk8 geometry
+    # (4 lanes per MX block) to assemble the bytes with xor-shuffles.
+    scale_pack_dwords = row_major_scale and lanes_per_mx_block == 4
+    scale_vec4 = scale_pack_dwords and block_iters % 2 == 0
+    module_name = (
+        f"moe_token_multidest_quant_k{topk}_fd{feat_dim}_r{wmma_rep}"
+        f"_{quant_mode}_{L.native_tag}"
+        f"{'_rmscale' if row_major_scale else ''}"
+        f"{'_scpk' if scale_pack_dwords else ''}"
+        f"{'_scv4' if scale_vec4 else ''}"
+        f"{f'_hidtdm{tdm_hidden_chunks}' if tdm_hidden_chunks else ''}"
+        f"{f'_ks{ksplit}' if ksplit > 1 else ''}"
+    )
+
+    @flyc.kernel(name=module_name, known_block_size=[BLOCK_THREADS, 1, 1])
+    def token_multidest_kernel(
+        hidden: fx.Pointer,
+        grouped_payload: fx.Pointer,
+        grouped_scale: fx.Pointer,
+        topids_to_rows: fx.Pointer,
+        token_num: Int32,
+    ):
+        i32 = T.i32
+        f32 = T.f32
+
+        c0_i32 = arith.constant(0, type=i32)
+        c1_i32 = arith.constant(1, type=i32)
+        c4_i32 = arith.constant(4, type=i32)
+        c16_i32 = arith.constant(16, type=i32)
+        c23_i32 = arith.constant(23, type=i32)
+        c254_i32 = arith.constant(254, type=i32)
+        c0_f32 = arith.constant(0.0, type=f32)
+
+        c_wave = arith.constant(wave_size, type=i32)
+        c_payload_bytes_per_block = arith.constant(payload_bytes_per_block, type=i32)
+        c_payload_bytes_per_lane = arith.constant(payload_bytes_per_lane, type=i32)
+        c_dst_scale_dwords_per_row = arith.constant(dst_scale_dwords_per_row, type=i32)
+        c_wmma_rep = arith.constant(wmma_rep, type=i32)
+        c_rows_per_tile = arith.constant(rows_per_tile, type=i32)
+        c_lanes_per_block = arith.constant(lanes_per_mx_block, type=i32)
+        c_elems_per_lane = arith.constant(elems_per_lane, type=i32)
+        c_scale_bytes_per_row = arith.constant(mx_blocks_per_row, type=i32)
+        c_scale_dwords_per_row = arith.constant(mx_blocks_per_row // 4, type=i32)
+
+        tid = fx.Uint32(fx.thread_idx.x)
+        bid = fx.Uint32(fx.block_idx.x)
+        warp_in_block = fx.Uint32(rocdl.readfirstlane(i32, fx.Uint32(tid // c_wave)))
+        lane = tid - warp_in_block * c_wave
+        token0 = bid * arith.constant(warps_per_block, type=i32)
+        token = token0 + warp_in_block
+
+        # Double-buffered hidden staging: [chunk slot 0 | chunk slot 1].
+        hslot = warps_per_block * hidden_chunk_bytes if tdm_hidden_chunks else 0
+        hidden_lds_load = None
+        hidden_lds_idx = None
+        hidden_lds_row_off = c0_i32
+        chunk_prefetch = None
+        if const_expr(tdm_hidden_chunks):
+            h_lds = fx.SharedAllocator().allocate(2 * hslot)._ptr
+            hidden_lds_idx = fx.index_cast(T.index, ptrtoint(h_lds))
+            hidden_lds_load, _ = make_lds_copy_ops(128)
+            hidden_lds_row_off = warp_in_block * arith.constant(
+                hidden_chunk_bytes, type=i32
+            )
+            valid_rows = fx.Int32(token_num) - fx.Int32(token0)
+            hg_base = fx.recast_iter(fx.Int8, hidden) + fx.Int64(token0) * (
+                feat_dim * 2
+            )
+
+            def _issue_hidden(chunk):
+                shape = (warps_per_block, hidden_chunk_bytes)
+                tdm_ops.tensor_load_2d(
+                    tdm_ops.make_tensor_descriptor_2d(
+                        global_ptr=fx.Tensor(
+                            fx.make_view(
+                                hg_base + fx.Int64(chunk * hidden_chunk_bytes),
+                                fx.make_layout(shape, (feat_dim * 2, 1)),
+                            )
+                        ),
+                        lds_memref=fx.Tensor(
+                            fx.make_view(
+                                fx.add_offset(h_lds, (chunk % 2) * hslot),
+                                fx.make_layout(shape, (hidden_chunk_bytes, 1)),
+                            )
+                        ),
+                        global_offset=(0, 0),
+                        tensor_shape=shape,
+                        strides=(feat_dim * 2, 1),
+                        tile_shape=shape,
+                        elem_bytes=1,
+                        num_warps=1,
+                        oob_outer_bound=valid_rows,
+                    )
+                )
+
+            is_loader = warp_in_block == fx.Uint32(c0_i32)
+
+            def chunk_prefetch(chunk):
+                # Prologue lands chunk 0 outright; every chunk then stages the
+                # next one and leaves exactly it in flight, so the DMA runs
+                # under this chunk's converts. Two slots mean chunk n+1 reuses
+                # chunk n-1's, hence the WAR barrier before the issue; the RAW
+                # barrier publishes chunk n, which only wave 0 waited on.
+                if const_expr(chunk == 0) and is_loader:
+                    _issue_hidden(0)
+                    tdm_ops.tensor_wait(0)
+                gpu.barrier()
+                if is_loader and const_expr(chunk + 1 < tdm_hidden_chunks):
+                    _issue_hidden(chunk + 1)
+                if const_expr(chunk > 0):
+                    if is_loader:
+                        tdm_ops.tensor_wait(1 if chunk + 1 < tdm_hidden_chunks else 0)
+                    gpu.barrier()
+
+        # CTA-uniform guard (every launched block owns at least one token), so
+        # the TDM staging barriers below are reached by all waves. A warp whose
+        # token is past the end reads token 0 instead and has its destination
+        # descriptors zero-sized, so its stores are dropped by the hardware
+        # bounds check rather than by a branch.
+        valid = token < fx.Uint32(token_num)
+        token_eff = valid.select(token, fx.Uint32(c0_i32))
+        pay_records = valid.select(
+            arith.constant(payload_bytes_per_row, type=i32), c0_i32
+        )
+        # Sign-extended to i64 by the descriptor builder, so stay under 2 GiB.
+        scale_records = valid.select(
+            arith.constant(_SCALE_RSRC_MAX_BYTES, type=i32), c0_i32
+        )
+        if token0 < fx.Uint32(token_num):
+            rows_t = ptr_buf_tensor(topids_to_rows)
+            route0 = token_eff * arith.constant(topk, type=i32)
+            # Scalar loads: the route is wave-uniform, and landing each row in
+            # an SGPR is what keeps its destination descriptor uniform too.
+            rows = [
+                fx.Uint32(buf_scalar_load(rows_t, route0 + arith.constant(k, type=i32)))
+                for k in range_constexpr(topk)
+            ]
+            scales = [
+                _token_multidest_scale_base(
+                    row, c_rows_per_tile, c_dst_scale_dwords_per_row, c16_i32
+                )
+                for row in rows
+            ]
+
+            block_in_wave = lane // fx.Uint32(c_lanes_per_block)
+            lane_in_block = lane - block_in_wave * c_lanes_per_block
+            qc = SimpleNamespace(
+                i32=i32,
+                f32=f32,
+                block_iters=block_iters,
+                payload_base=fx.Int64(ptrtoint(grouped_payload)),
+                payload_bytes_per_row=payload_bytes_per_row,
+                hidden_base=fx.Int64(ptrtoint(hidden)),
+                feat_bytes_per_row=feat_dim * 2,
+                feat_row_i32=token_eff,
+                payload_num_records=pay_records,
+                prequantized=False,
+                payload_dwords_per_lane=payload_bytes_per_lane // 4,
+                src_scale_base=fx.Int64(0),
+                src_scale_bytes_per_row=0,
+                mx_blocks_per_wave_iter=mx_blocks_per_wave_iter,
+                mx_blocks_per_row=mx_blocks_per_row,
+                amax_shuffle_dists=amax_shuffle_dists,
+                is_fp8=is_fp8,
+                use_native=use_native,
+                use_pk8=use_pk8,
+                mx_dtype=mx_dtype,
+                c0_i32=c0_i32,
+                c1_i32=c1_i32,
+                c4_i32=c4_i32,
+                c23_i32=c23_i32,
+                c254_i32=c254_i32,
+                c0_f32=c0_f32,
+                c_wave=c_wave,
+                c_elems_per_lane=c_elems_per_lane,
+                c_payload_bytes_per_block=c_payload_bytes_per_block,
+                c_payload_bytes_per_lane=c_payload_bytes_per_lane,
+                c_wmma_rep=c_wmma_rep,
+                block_in_wave=block_in_wave,
+                lane_in_block=lane_in_block,
+                is_block_lead=lane_in_block == c0_i32,
+                payload_dests=[SimpleNamespace(payload_row_i32=row) for row in rows],
+                dests=[
+                    SimpleNamespace(payload_row_i32=row, scale_row_dword_base=sc)
+                    for row, sc in zip(rows, scales)
+                ],
+                # Byte view for the unpacked e8m0 store; the packed dword /
+                # dwordx4 row-major stores need a width-agnostic V# instead.
+                # Both carry the same zero-on-invalid bound.
+                scale_t=ptr_buf_tensor(
+                    grouped_scale, fx.Int8, num_records_bytes=scale_records
+                ),
+                scale_rsrc=buffer_ops.create_buffer_resource_from_addr(
+                    fx.Int64(ptrtoint(grouped_scale)),
+                    num_records_bytes=scale_records,
+                ),
+                row_major_scale=row_major_scale,
+                c_scale_bytes_per_row=c_scale_bytes_per_row,
+                c_scale_dwords_per_row=c_scale_dwords_per_row,
+                hidden_chunks=max(1, tdm_hidden_chunks),
+                chunk_prefetch=chunk_prefetch,
+                hidden_lds_load=hidden_lds_load,
+                hidden_lds_idx=hidden_lds_idx,
+                hidden_lds_row_off=hidden_lds_row_off,
+                hidden_slot_bytes=hslot,
+                scale_pack_dwords=scale_pack_dwords,
+                scale_vec4=scale_vec4,
+                mx_group_base=(
+                    fx.Uint32(fx.block_idx.y) * arith.constant(block_iters, type=i32)
+                    if const_expr(ksplit > 1)
+                    else None
+                ),
+            )
+            _emit_quant_block_loop(qc)
+
+    @flyc.jit
+    def launch_token_multidest(
+        hidden: fx.Pointer,
+        grouped_payload: fx.Pointer,
+        grouped_scale: fx.Pointer,
+        topids_to_rows: fx.Pointer,
+        token_num: fx.Int32,
+        grid_blocks: fx.Int32,
+        stream: fx.Stream = fx.Stream(None),  # noqa: B008
+    ):
+        token_multidest_kernel(
+            hidden, grouped_payload, grouped_scale, topids_to_rows, token_num
+        ).launch(
+            grid=(
+                arith.index_cast(T.index, grid_blocks),
+                arith.index_cast(T.index, arith.constant(ksplit, type=T.i32)),
+                1,
+            ),
+            block=(BLOCK_THREADS, 1, 1),
+            stream=stream,
+        )
+
+    launch_token_multidest.compile_hints = {
+        "llvm_options": {
+            "amdgpu-kernarg-preload": AITER_FLYDSL_KERNARG_PRELOAD,
+            "amdgpu-kernarg-preload-count": AITER_FLYDSL_KERNARG_PRELOAD_COUNT,
+        },
+    }
+    return launch_token_multidest
 
 
 def build_moe_fused_route_psum_quant_scatter_module(
