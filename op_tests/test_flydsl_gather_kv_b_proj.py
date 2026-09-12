@@ -5,7 +5,7 @@
 
 Covers the one configuration the FlyDSL backend implements: page_size 1, fp8 KV
 cache, fp8 ``shuffle_weight((16,16))`` weight, per-output-row weight scale,
-per-tensor activation scale, bf16 outputs, gfx950.
+per-tensor activation scale, bf16 or scaled fp8 outputs, gfx950.
 
 Checked against two independent references:
   * a float32 torch reference (ground truth), and
@@ -14,6 +14,7 @@ Checked against two independent references:
 Usage:
     pytest op_tests/test_flydsl_gather_kv_b_proj.py -q
     python op_tests/test_flydsl_gather_kv_b_proj.py      # + perf
+    python op_tests/test_flydsl_gather_kv_b_proj.py --fp8-output
 """
 
 import argparse
@@ -441,6 +442,223 @@ def _bench(num_tokens, n_heads):
     return us_tri, us_fly, tflops, out_gb
 
 
+@_SKIP
+@pytest.mark.parametrize("scale_mode", ["row", "block"])
+@pytest.mark.parametrize("weight_preshuffle", [False, True])
+@pytest.mark.parametrize("n_heads", [12, 16])
+@pytest.mark.parametrize("num_tokens,block_m", [(1, 128), (257, 256), (8192, 256)])
+def test_fp8_output(scale_mode, weight_preshuffle, n_heads, num_tokens, block_m):
+    case = _make_case(
+        num_tokens,
+        n_heads,
+        alloc=num_tokens + 31,
+        duplicate_indices=True,
+        k_scale_value=0.43,
+        scale_mode=scale_mode,
+    )
+    for key in ("k_prefix", "v_prefix"):
+        case[key] = torch.full_like(case[key], 7).to(torch.float8_e4m3fn)
+    ks = torch.tensor([0.37], device="cuda", dtype=torch.float32)
+    vs = torch.tensor([0.53], device="cuda", dtype=torch.float32)
+    _run_flydsl(
+        case,
+        weight_preshuffle=weight_preshuffle,
+        block_m=block_m,
+        k_out_scale=ks,
+        v_out_scale=vs,
+    )
+    refs = _torch_ref(case)
+    for key, ref, scale in zip(("k_prefix", "v_prefix"), refs, (ks, vs)):
+        actual = case[key][:num_tokens].float() * scale
+        # E4M3 has at most 1/16 relative rounding error; the absolute term
+        # covers subnormals and fp32 GEMM cancellation near zero.
+        torch.testing.assert_close(actual, ref, rtol=0.065, atol=0.001)
+        assert (case[key][num_tokens:].float() == 7).all()
+    # RoPE must use K's descale too, despite bypassing the GEMM epilogue.
+    # The RoPE path precombines the activation scale and reciprocal descale.
+    rope = case["k_buffer"][case["kv_indices"][:num_tokens].long(), 0, 512:].float()
+    expected_rope = (
+        (rope * (case["k_scale"] * ks.reciprocal()))
+        .clamp(-448, 448)
+        .to(torch.float8_e4m3fn)
+        .unsqueeze(1)
+        .expand(-1, n_heads, -1)
+    )
+    assert torch.equal(
+        case["k_prefix"][:num_tokens, :, 128:].view(torch.int8),
+        expected_rope.view(torch.int8),
+    )
+
+
+@_SKIP
+@pytest.mark.parametrize(
+    "descale,projection",
+    [(0.37, 7.029999732971191), (0.73, 78.83999633789062)],
+)
+def test_fp8_reciprocal_rounding(descale, projection):
+    # An exact one-term dot product isolates output conversion from GEMM
+    # accumulation error. These values land on E4M3 ties after reciprocal
+    # multiplication, but just below the ties after direct fp32 division.
+    case = _make_case(257, 12, k_scale_value=projection)
+    case["k_buffer"].zero_()
+    case["k_buffer"][:, 0, 0] = 1
+    case["k_buffer"][:, 0, 512:] = 1
+    case["weight"].zero_()
+    case["weight"][:, 0] = 1
+    case["weight_scale"].fill_(1)
+    for key in ("k_prefix", "v_prefix"):
+        case[key] = case[key].to(torch.float8_e4m3fn)
+    scale = torch.tensor([descale], device="cuda", dtype=torch.float32)
+    # Compute the boundary reference on CPU so the device compiler cannot
+    # transform the reference division into reciprocal multiplication too.
+    value = torch.tensor([projection], dtype=torch.float32)
+    scale_cpu = torch.tensor([descale], dtype=torch.float32)
+    expected = (value * scale_cpu.reciprocal()).to(torch.float8_e4m3fn)
+    divided = (value / scale_cpu).to(torch.float8_e4m3fn)
+    assert not torch.equal(expected.view(torch.int8), divided.view(torch.int8))
+    expected = expected.to(device="cuda")
+    _run_flydsl(case, k_out_scale=scale, v_out_scale=scale)
+    for key in ("k_prefix", "v_prefix"):
+        assert torch.equal(
+            case[key].view(torch.int8),
+            expected.view(torch.int8).expand_as(case[key]),
+        )
+
+
+@_SKIP
+@pytest.mark.parametrize("zero", [False, True])
+def test_fp8_saturation_and_zero(zero):
+    case = _make_case(259, 2, k_scale_value=2.0)
+    case["k_buffer"].fill_(0 if zero else 1)
+    case["weight"].fill_(1)
+    case["weight"][128:256].fill_(-1)
+    case["weight_scale"].fill_(1)
+    for key in ("k_prefix", "v_prefix"):
+        case[key] = case[key].to(torch.float8_e4m3fn)
+    scale = torch.tensor([0.001], device="cuda")
+    _run_flydsl(case, k_out_scale=scale, v_out_scale=scale)
+    for key, ref in zip(("k_prefix", "v_prefix"), _torch_ref(case)):
+        actual = case[key].float()
+        expected = (
+            (ref * scale.reciprocal()).clamp(-448, 448).to(torch.float8_e4m3fn).float()
+        )
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+        assert actual.isfinite().all()
+        if not zero:
+            assert (actual.abs() == 448).any()
+
+
+@_SKIP
+@pytest.mark.parametrize(
+    "invalid",
+    ["missing", "shape", "dtype", "device", "mixed_outputs", "bf16_scales", "strided"],
+)
+def test_fp8_output_validation(invalid):
+    case = _make_case(256, 2)
+    if invalid != "bf16_scales":
+        for key in ("k_prefix", "v_prefix"):
+            case[key] = case[key].to(torch.float8_e4m3fn)
+    ks = vs = torch.ones(1, device="cuda")
+    if invalid == "missing":
+        ks = None
+    elif invalid == "shape":
+        ks = torch.ones(2, device="cuda")
+    elif invalid == "dtype":
+        ks = ks.to(torch.bfloat16)
+    elif invalid == "device":
+        ks = ks.cpu()
+    elif invalid == "mixed_outputs":
+        case["v_prefix"] = case["v_prefix"].to(torch.bfloat16)
+    elif invalid == "strided":
+        case["k_prefix"] = case["k_prefix"].transpose(0, 1).contiguous().transpose(0, 1)
+    with pytest.raises(ValueError):
+        _run_flydsl(case, k_out_scale=ks, v_out_scale=vs)
+
+
+@_SKIP
+def test_fp8_graph_replay_uses_current_scales():
+    case = _make_case(257, 2)
+    for key in ("k_prefix", "v_prefix"):
+        case[key] = case[key].to(torch.float8_e4m3fn)
+    scale = torch.ones(1, device="cuda")
+    weight = shuffle_weight(case["weight"], layout=(16, 16))
+
+    def run():
+        gather_kv_b_proj_flydsl(
+            case["k_buffer"],
+            case["k_scale"],
+            case["kv_indptr"],
+            case["kv_indices"],
+            case["cu_seqlens_k"],
+            weight,
+            case["weight_scale"],
+            case["k_prefix"],
+            case["v_prefix"],
+            k_out_scale=scale,
+            v_out_scale=scale,
+        )
+
+    run()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        run()
+    scale.fill_(0.5)
+    graph.replay()
+    for key, ref in zip(("k_prefix", "v_prefix"), _torch_ref(case)):
+        torch.testing.assert_close(
+            case[key].float() * scale, ref, rtol=0.065, atol=0.001
+        )
+
+
+def _bench_fp8(num_tokens, n_heads):
+    from aiter.ops.quant import per_tensor_quant_hip
+
+    case = _make_case(num_tokens, n_heads)
+    args = (
+        case["k_buffer"],
+        case["k_scale"],
+        case["kv_indptr"],
+        case["kv_indices"],
+        case["cu_seqlens_k"],
+        shuffle_weight(case["weight"], layout=(16, 16)),
+        case["weight_scale"],
+    )
+    k, v = case["k_prefix"], case["v_prefix"]
+
+    def dynamic_quant():
+        gather_kv_b_proj_flydsl(*args, k, v)
+        # These benchmark shapes admit 256 rows of complete 16-element vectors.
+        # Per-tensor quantization is shape-independent; a compact row count
+        # avoids inflating the HIP amax kernel's atomic-reduction overhead.
+        return tuple(
+            per_tensor_quant_hip(x.view(256, -1), quant_dtype=torch.float8_e4m3fn)
+            for x in (k, v)
+        )
+
+    (_, ks), (_, vs) = dynamic_quant()
+    k8, v8 = (torch.empty_like(x, dtype=torch.float8_e4m3fn) for x in (k, v))
+
+    def supplied_scale_quant():
+        gather_kv_b_proj_flydsl(*args, k, v)
+        return tuple(
+            per_tensor_quant_hip(
+                x.view(256, -1), scale=scale, quant_dtype=torch.float8_e4m3fn
+            )
+            for x, scale in ((k, ks), (v, vs))
+        )
+
+    def fused():
+        gather_kv_b_proj_flydsl(*args, k8, v8, k_out_scale=ks, v_out_scale=vs)
+
+    fused()
+    for actual, ref, scale in zip((k8, v8), _torch_ref(case), (ks, vs)):
+        torch.testing.assert_close(actual.float() * scale, ref, rtol=0.065, atol=0.01)
+    _, dynamic_us = run_perftest(dynamic_quant)
+    _, supplied_scale_us = run_perftest(supplied_scale_quant)
+    _, fused_us = run_perftest(fused)
+    return dynamic_us, supplied_scale_us, fused_us
+
+
 def main():
     if get_gfx() not in SUPPORTED_GFX:
         aiter.logger.warning(
@@ -450,7 +668,29 @@ def main():
 
     parser = argparse.ArgumentParser()
     parser.add_argument("-heads", type=int, default=12, help="tp_k_head_num")
+    parser.add_argument(
+        "--fp8-output",
+        action="store_true",
+        help="compare BF16 gather + HIP K/V quantization against direct FP8 output",
+    )
     args = parser.parse_args()
+
+    if args.fp8_output:
+        print(f"\n## FP8 gather output, {args.heads} heads, K=512\n")
+        print("The supplied-scale and fused paths reuse scales prepared before timing.")
+        print("The HIP per-tensor baseline uses a 256-row view of each output.")
+        print(
+            "| M | BF16 gather + dynamic quant us | BF16 gather + supplied-scale quant us "
+            "| FP8 gather us | speedup vs dynamic | speedup vs supplied-scale |"
+        )
+        print("|---|---|---|---|---|---|")
+        for m in (2048, 8192, 16384):
+            dynamic_us, supplied_scale_us, fused_us = _bench_fp8(m, args.heads)
+            print(
+                f"| {m} | {dynamic_us:.2f} | {supplied_scale_us:.2f} | {fused_us:.2f} | "
+                f"{dynamic_us / fused_us:.2f}x | {supplied_scale_us / fused_us:.2f}x |"
+            )
+        return
 
     rows = []
     for m in (2048, 8192, 16384):

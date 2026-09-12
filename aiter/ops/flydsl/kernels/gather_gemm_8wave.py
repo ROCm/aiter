@@ -119,6 +119,18 @@ class BlockScale:
         return out
 
 
+def _pack_fp8(v):
+    """Saturating round-to-nearest e4m3, four fp32 values packed in one i32."""
+    clipped = [
+        (v[i] > 448.0).select(
+            fx.Float32(448.0), (v[i] < -448.0).select(fx.Float32(-448.0), v[i])
+        )
+        for i in range_constexpr(4)
+    ]
+    lo = rocdl.cvt_pk_fp8_f32(T.i32, clipped[0], clipped[1], fx.Int32(0), False)
+    return rocdl.cvt_pk_fp8_f32(T.i32, clipped[2], clipped[3], lo, True)
+
+
 class StoreKV:
     """Split k_prefix / v_prefix epilogue for BLOCK_N == one head."""
 
@@ -136,7 +148,12 @@ class StoreKV:
         n_tiles_b,
         idx_fn,
         per_row_scale=True,
+        output_fp8=False,
+        K_out_scale=None,
+        V_out_scale=None,
     ):
+        self.output_fp8 = output_fp8
+        out_bytes = 1 if output_fp8 else 2
         self.lane_id = fx.thread_idx.x % 64
         self.idx_fn = idx_fn
         self.per_row_scale = bool(per_row_scale)
@@ -155,12 +172,12 @@ class StoreKV:
         gKP = fx.rocdl.make_buffer_tensor(
             K_prefix,
             max_size=False,
-            num_records_bytes=fx.Int64(m_rows) * fx.Int64(self.kp_stride * 2),
+            num_records_bytes=fx.Int64(m_rows) * fx.Int64(self.kp_stride * out_bytes),
         )
         gVP = fx.rocdl.make_buffer_tensor(
             V_prefix,
             max_size=False,
-            num_records_bytes=fx.Int64(m_rows) * fx.Int64(self.vp_stride * 2),
+            num_records_bytes=fx.Int64(m_rows) * fx.Int64(self.vp_stride * out_bytes),
         )
         gSB = fx.rocdl.make_buffer_tensor(
             W_scale, max_size=False, num_records_bytes=n_heads * self.n_per_head * 4
@@ -171,10 +188,14 @@ class StoreKV:
         self.sb_div = fx.logical_divide(gSB, fx.make_layout(1, 1))
 
         self.scale_atom = fx.make_copy_atom(fx.rocdl.BufferCopy32b(), fx.Float32)
-        self.out_atom = fx.make_copy_atom(fx.rocdl.BufferCopy16b(), fx.BFloat16)
+        self.out_dtype = fx.Int8 if output_fp8 else fx.BFloat16
+        self.out_atom = fx.make_copy_atom(
+            fx.rocdl.BufferCopy8b() if output_fp8 else fx.rocdl.BufferCopy16b(),
+            self.out_dtype,
+        )
         self._scale_cache = {}
         self._scale_regs = {}
-        self.reg_bf16 = fx.make_rmem_tensor(fx.make_layout(1, 1), fx.BFloat16)
+        self.reg_out = fx.make_rmem_tensor(fx.make_layout(1, 1), self.out_dtype)
 
         # k_scale is per-tensor (and 1.0 in the current deployment) but the
         # reference applies it to both the GEMM and the rope, so read it rather
@@ -183,6 +204,22 @@ class StoreKV:
         r1 = fx.make_rmem_tensor(fx.make_layout(1, 1), fx.Float32)
         fx.copy(self.scale_atom, fx.slice(ks_div, (None, 0)), r1)
         self.k_scale = Vec(fx.memref_load_vec(r1))[0]
+        self.inv_k_out_scale = fx.Float32(1.0)
+        self.inv_v_out_scale = fx.Float32(1.0)
+        if output_fp8:
+            inv_scales = []
+            for tensor in (K_out_scale, V_out_scale):
+                buf = fx.rocdl.make_buffer_tensor(
+                    tensor, max_size=False, num_records_bytes=4
+                )
+                reg = fx.make_rmem_tensor(fx.make_layout(1, 1), fx.Float32)
+                fx.copy(
+                    self.scale_atom,
+                    fx.slice(fx.logical_divide(buf, fx.make_layout(1, 1)), (None, 0)),
+                    reg,
+                )
+                inv_scales.append(fx.Float32(1.0) / Vec(fx.memref_load_vec(reg))[0])
+            self.inv_k_out_scale, self.inv_v_out_scale = inv_scales
 
     def _scale_issue(self, tag, scale_base, col_base):
         """Issue the two scale loads for one half without consuming them."""
@@ -220,9 +257,9 @@ class StoreKV:
         self._scale_cache[tag] = out
         return out
 
-    def _store_bf16(self, value, div, index):
-        fx.memref_store_vec(Vec.filled(1, value, fx.BFloat16), self.reg_bf16)
-        fx.copy(self.out_atom, self.reg_bf16, fx.slice(div, (None, index)))
+    def _store(self, value, div, index):
+        fx.memref_store_vec(Vec.filled(1, value, self.out_dtype), self.reg_out)
+        fx.copy(self.out_atom, self.reg_out, fx.slice(div, (None, index)))
 
     def _emit(
         self,
@@ -245,9 +282,17 @@ class StoreKV:
             for tj in range_constexpr(self.n_tiles_b):
                 col = col_base + tj * 16 + self.lane_id % 16
                 vec_f32 = Vec(c_frag[self.idx_fn(ti, tj)])
+                scaled = vec_f32 * Vec.filled(4, b_scales[tj], fx.Float32)
+                if self.output_fp8:
+                    inv_scale = (
+                        self.inv_k_out_scale if tag == "k" else self.inv_v_out_scale
+                    )
+                    packed = _pack_fp8(scaled * Vec.filled(4, inv_scale, fx.Float32))
+                    vals = Vec.filled(1, fx.Int32(packed), fx.Int32).bitcast(fx.Int8)
+                else:
+                    vals = scaled.to(fx.BFloat16)
                 for i in range_constexpr(4):
-                    val = (vec_f32[i] * b_scales[tj]).to(fx.BFloat16)
-                    self._store_bf16(val, div, (row + i) * row_stride + head_off + col)
+                    self._store(vals[i], div, (row + i) * row_stride + head_off + col)
 
     def store_k(self, c_frag, base_row, head, col_base):
         """c00 / c10 -> k_prefix[row, head, 0:nope]."""
@@ -286,8 +331,21 @@ class _RopeCopy:
     ROWS_PER_PASS = 256  # 512 threads / 2 threads-per-row
 
     def __init__(
-        self, a_div, kvi_div, kp_div, m_base, head, tid, k_scale, block_m, nope, n_heads
+        self,
+        a_div,
+        kvi_div,
+        kp_div,
+        m_base,
+        head,
+        tid,
+        k_scale,
+        block_m,
+        nope,
+        n_heads,
+        output_fp8=False,
+        inv_k_out_scale=None,
     ):
+        self.output_fp8 = output_fp8
         self.a_div = a_div
         self.kvi_div = kvi_div
         self.kp_div = kp_div
@@ -299,9 +357,16 @@ class _RopeCopy:
         self.col_base = head * (nope + KV_PE_DIM) + nope
         self.atom32 = fx.make_copy_atom(fx.rocdl.BufferCopy32b(), fx.Int32)
         self.ld = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), fx.Float8E4M3FN)
-        self.st = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), fx.BFloat16)
-        self.dst_reg = fx.make_rmem_tensor(fx.make_layout(8, 1), fx.BFloat16)
-        self.ks4 = Vec.filled(4, k_scale, fx.Float32)
+        self.st = fx.make_copy_atom(
+            fx.rocdl.BufferCopy128b(), fx.Int8 if output_fp8 else fx.BFloat16
+        )
+        self.dst_reg = fx.make_rmem_tensor(
+            fx.make_layout(16 if output_fp8 else 8, 1),
+            fx.Int8 if output_fp8 else fx.BFloat16,
+        )
+        self.ks4 = Vec.filled(
+            4, k_scale * inv_k_out_scale if output_fp8 else k_scale, fx.Float32
+        )
 
     def load_idx(self):
         self.iregs = [
@@ -357,21 +422,34 @@ class _RopeCopy:
                 for w in range_constexpr(4):  # each i32 packs 4 fp8
                     lo = cvt_pk_f32_fp8(res=v2f32, src=words[w], word_sel=False)
                     hi = cvt_pk_f32_fp8(res=v2f32, src=words[w], word_sel=True)
+                    scaled = Vec(lo.shuffle(hi, [0, 1, 2, 3])) * self.ks4
                     outs.append(
-                        (Vec(lo.shuffle(hi, [0, 1, 2, 3])) * self.ks4).to(fx.BFloat16)
+                        _pack_fp8(scaled) if self.output_fp8 else scaled.to(fx.BFloat16)
                     )
-                for p in range_constexpr(2):  # 2 x 8 bf16 = 2 x 16 B stores
-                    fx.memref_store_vec(
-                        outs[2 * p].shuffle(outs[2 * p + 1], list(range(8))),
-                        self.dst_reg,
-                    )
+                if self.output_fp8:
+                    packed = fx.Vector.from_elements(
+                        [fx.Int32(x) for x in outs], dtype=fx.Int32
+                    ).bitcast(fx.Int8)
+                    fx.memref_store_vec(packed, self.dst_reg)
                     fx.copy(
                         self.st,
                         self.dst_reg,
-                        fx.slice(
-                            self.kp_div, (None, self.bases[_p][1] + sub * 16 + p * 8)
-                        ),
+                        fx.slice(self.kp_div, (None, self.bases[_p][1] + sub * 16)),
                     )
+                else:
+                    self._commit_bf16(outs, _p, sub)
+
+    def _commit_bf16(self, outs, _p, sub):
+        for p in range_constexpr(2):  # 2 x 8 bf16 = 2 x 16 B stores
+            fx.memref_store_vec(
+                outs[2 * p].shuffle(outs[2 * p + 1], list(range(8))),
+                self.dst_reg,
+            )
+            fx.copy(
+                self.st,
+                self.dst_reg,
+                fx.slice(self.kp_div, (None, self.bases[_p][1] + sub * 16 + p * 8)),
+            )
 
 
 def compile_gather_kv_b_proj_8w(
@@ -384,6 +462,7 @@ def compile_gather_kv_b_proj_8w(
     xcd_swizzle: int = 1,
     weight_preshuffle: bool = True,
     per_row_scale: bool = True,
+    output_fp8: bool = False,
 ):
     """Build the fused gather + kv_b_proj kernel for one fixed MLA configuration."""
     K = KV_C_DIM
@@ -416,6 +495,7 @@ def compile_gather_kv_b_proj_8w(
         f"h{n_heads}_{waves_per_eu}x{xcd_swizzle}"
         f"{'_ps' if weight_preshuffle else '_rm'}"
         f"{'_row' if per_row_scale else '_blk'}"
+        f"{'_fp8' if output_fp8 else '_bf16'}"
     )
 
     @fx.struct
@@ -429,6 +509,10 @@ def compile_gather_kv_b_proj_8w(
         B_lds_next_0: fx.Array[fx.Float8E4M3FN, b_lds_size, 16]
         B_lds_next_1: fx.Array[fx.Float8E4M3FN, b_lds_size, 16]
 
+    # BF16 has no output-scale device arguments. Compile-time unity sentinels
+    # cannot accidentally alias the activation scale in a later epilogue edit.
+    OutputScaleArg = fx.Tensor if output_fp8 else fx.Constexpr[float]
+
     @flyc.kernel(name=_kname, known_block_size=[512, 1, 1])
     def kernel_gather(
         KV_cache: fx.Tensor,
@@ -438,6 +522,8 @@ def compile_gather_kv_b_proj_8w(
         K_scale: fx.Tensor,
         K_prefix: fx.Tensor,
         V_prefix: fx.Tensor,
+        K_out_scale: OutputScaleArg,
+        V_out_scale: OutputScaleArg,
         m_rows: fx.Int32,
     ):
         F8_IR_t = fx.Float8E4M3FN.ir_type
@@ -525,6 +611,9 @@ def compile_gather_kv_b_proj_8w(
             N_TILES_B,
             mfma.idx,
             per_row_scale=per_row_scale,
+            output_fp8=output_fp8,
+            K_out_scale=K_out_scale,
+            V_out_scale=V_out_scale,
         )
         if const_expr(not per_row_scale):
             store.block_scale_k = blk.fk * store.k_scale
@@ -639,6 +728,8 @@ def compile_gather_kv_b_proj_8w(
             BLOCK_M,
             nope,
             n_heads,
+            output_fp8=output_fp8,
+            inv_k_out_scale=store.inv_k_out_scale,
         )
         rope.load_idx()
         store.prefetch_scales(head, wave_n * (N_TILES_B * 16))
@@ -689,6 +780,8 @@ def compile_gather_kv_b_proj_8w(
         K_scale: fx.Tensor,
         K_prefix: fx.Tensor,
         V_prefix: fx.Tensor,
+        K_out_scale: OutputScaleArg,
+        V_out_scale: OutputScaleArg,
         m_rows: fx.Int32,
         stream: fx.Stream,
     ):
@@ -701,6 +794,8 @@ def compile_gather_kv_b_proj_8w(
             K_scale,
             K_prefix,
             V_prefix,
+            K_out_scale,
+            V_out_scale,
             m_rows,
             value_attrs={
                 "rocdl.waves_per_eu": waves_per_eu,
