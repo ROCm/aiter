@@ -26,11 +26,19 @@ Track here as work lands (leave unchecked until that item is done). Per-subtask
 gates: op_test with `FLYDSL_RUNTIME_ENABLE_CACHE=0` on GPU 1; plus a G9/667
 spot-check when the hot loop or wait/reduce path changed.
 
-- [ ] 1. FP8 native down, `k_batch=1`, 16-row waves
+- [ ] 1. FP8 native down, `k_batch=1`, 16-row waves — PoC is correct but a
+      performance no-go; do not land as-is
 - [ ] 2. FP4 native down
 - [ ] 3. BF16 native down
 - [ ] 4. Optional second N tile (32 rows) if 16 N is occupancy-bound
 - [ ] 5. Split-K last, only if extra waves over `k0` help
+
+**PoC stop:** subtasks 2–5 are paused. The first implementation reduced the
+grid by 8× versus k-contiguous H2 and serialized all TOPK experts in each wave.
+At B=1,2 that lost the parallelism needed to hide the long weight stream:
+geomean latency was 2.56× the existing gather path. Before porting FP4/BF16,
+revise the map to expose more waves (the leading candidate is splitting TOPK
+across waves with an accumulation epilogue), then repeat subtask 1.
 
 ## Locked decisions
 
@@ -81,14 +89,31 @@ Mirror `_build_gate_up_fp8_preshuffled_native` onto down:
 - Early-return from `build_down_reduce_fp8_module` when `preshuffled` and the
   native tile constraints hold; else keep gather.
 
-- [ ] `_build_down_fp8_preshuffled_native` (or equivalent) + dispatch.
-- [ ] `test_preshuffled_fp8_down_matches_k_contiguous` (and combined) still
+- [x] `_build_down_fp8_preshuffled_native` (or equivalent) + dispatch.
+- [x] `test_preshuffled_fp8_down_matches_k_contiguous` (and combined) still
       cos ≥ 0.999.
-- [ ] G9 B=1,2 down fp8 vs CK: FlyDSL should move off the gather ~20% peak
+- [x] G9 B=1,2 down fp8 vs CK: FlyDSL should move off the gather ~20% peak
       plateau; record the new ratios in this section when the run lands.
 - [ ] **Done when:** preshuffled FP8 down uses 16×4 pack loads, not
       `_kpack_load_i32_words` gather; op_test + G9 B=1,2 down fp8 spot-check
-      done.
+      done, and the PoC is fast enough to justify landing.
+
+**PoC result (GPU 1, 100 iterations, 3 repeats, B=1,2):**
+
+| Shape | B | gather µs | native µs | native/gather | native/CK |
+|---|---:|---:|---:|---:|---:|
+| DeepSeek-V3 | 1 | 65.19 | 137.37 | 2.11 | 3.26 |
+| DeepSeek-V3 | 2 | 127.57 | 154.67 | 1.21 | 2.48 |
+| MiniMax | 1 | 23.57 | 96.90 | 4.11 | 4.00 |
+| MiniMax | 2 | 44.15 | 104.50 | 2.37 | 3.35 |
+| Qwen3-Next | 1 | 10.47 | 41.66 | 3.98 | 3.78 |
+| Qwen3-Next | 2 | 14.78 | 41.69 | 2.82 | 2.80 |
+
+All six cells had cosine 1.0 and low FlyDSL spread (≤0.6%), so this is not
+measurement noise. Native reached only 3–19% of peak. The 16-row wave performs
+the right coalesced kpack loads, but there are only `B*HIDDEN/16` waves and each
+loops over all TOPK experts. This validates the map's numerics, not its
+performance. Do not port this form to FP4/BF16.
 
 ### 2. FP4 native down
 

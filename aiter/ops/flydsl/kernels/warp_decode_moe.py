@@ -1403,6 +1403,126 @@ def build_gate_up_fp8_act_module(
 # -------------------------------------------------------------------------
 # Phase 3 -- down_reduce FP8 fast path (BF16 intermediate, FP8 e4m3 weights)
 # -------------------------------------------------------------------------
+def _build_down_fp8_preshuffled_native(
+    inter: int,
+    hidden: int,
+    top_k: int,
+    *,
+    w_scale_mode: str,
+    serialize_dot2: bool,
+    scale_bn: int | None,
+    scale_bk: int | None,
+    kh_per_warp: int,
+    dot2_acc: int,
+):
+    """N-major kpack-native FP8 down: one wave computes 16 output rows."""
+    if inter % 64 != 0 or hidden % 16 != 0:
+        raise ValueError("preshuffled FP8 down needs INTER % 64 and HIDDEN % 16")
+    per_token_scale = const_expr(w_scale_mode == "pertoken")
+    block2d = const_expr(w_scale_mode == "block2d")
+    if w_scale_mode == "block2d":
+        if scale_bn is None or scale_bk is None:
+            raise ValueError("block2d scales require scale_bn and scale_bk")
+        if inter % scale_bk != 0 or scale_bk % 16 != 0:
+            raise ValueError(
+                "native preshuffled FP8 down needs scale_bk to divide INTER "
+                "and be a multiple of 16"
+            )
+    elif w_scale_mode not in ("pertensor", "pertoken"):
+        raise ValueError(f"unsupported w_scale_mode: {w_scale_mode!r}")
+    scale_cols = inter // scale_bk if w_scale_mode == "block2d" else 0
+    num_kpack = inter // 64
+
+    @flyc.kernel
+    def _kernel(
+        inter_ptr: fx.Pointer,
+        wd_ptr: fx.Pointer,
+        wds_ptr: fx.Pointer,
+        rid_ptr: fx.Pointer,
+        rwt_ptr: fx.Pointer,
+        y_ptr: fx.Pointer,
+    ):
+        bid = fx.Int32(gpu.block_id("x"))
+        lane = fx.Int32(gpu.thread_id("x"))
+        nlane = lane % fx.Int32(16)
+        klane = lane // fx.Int32(16)
+
+        n0 = bid % (hidden // 16)
+        token_b = bid // (hidden // 16)
+        out_j = n0 * fx.Int32(16) + nlane
+
+        inter_rsrc = _ptr_rsrc(inter_ptr)
+        wds_t = _f32_view(wds_ptr)
+        rid_t = _i32_view(rid_ptr)
+        rwt_t = _f32_view(rwt_ptr)
+        one_f32 = fx.Float32(1.0).ir_value()
+        acc_l = fx.Float32(0.0)
+
+        for k in range_constexpr(top_k):
+            ridx = token_b * top_k + k
+            e = fx.Int32(_i32_load(rid_t, ridx))
+            rw = fx.Float32(_f32_load(rwt_t, ridx))
+            w_row = e * hidden + out_j
+            wd_b = _preshuffled_expert_b_i32_tensor(wd_ptr, e, hidden, inter, 1)
+
+            expert_l = fx.Float32(0.0)
+            for k0 in range_constexpr(num_kpack):
+                k_base = k0 * 64 + klane * fx.Int32(16)
+                inter_row = token_b * top_k + k
+                a_word0 = (inter_row * inter + k_base) // 2
+                aw = load_i32_words(inter_rsrc, a_word0, 8)
+                dw = _native_kpack_words(wd_b, n0, k0, klane, nlane)
+                pairs = []
+                for ipair in range_constexpr(8):
+                    w_word = ipair // 2
+                    w_hi = (ipair % 2) == 1
+                    d_i32 = bf16x2_to_i32(fp8x2_to_bf16x2(dw[w_word], one_f32, hi=w_hi))
+                    pairs.append((aw[ipair], d_i32))
+                dot = fx.Float32(
+                    drain_or_chain(pairs, dot2_acc=dot2_acc, serialize=serialize_dot2)
+                )
+                if const_expr(block2d):
+                    row_blk = w_row // scale_bn
+                    col_blk = k_base // scale_bk
+                    ds = fx.Float32(_f32_load(wds_t, row_blk * scale_cols + col_blk))
+                    acc_l = acc_l + dot * (rw * ds)
+                else:
+                    expert_l = expert_l + dot
+
+            if const_expr(not block2d):
+                scale_off = _scale_elem_off(w_row, per_token_scale)
+                ds = fx.Float32(_f32_load(wds_t, scale_off))
+                acc_l = acc_l + expert_l * (rw * ds)
+
+        y_sum = _reduce_klane4_f32(acc_l.ir_value())
+        if klane == 0:
+            y_t = _bf16_out_view(y_ptr)
+            y_t[token_b * hidden + out_j] = BFloat16(y_sum)
+
+    @flyc.jit
+    def _launch(
+        inter_ptr: fx.Pointer,
+        wd_ptr: fx.Pointer,
+        wds_ptr: fx.Pointer,
+        rid_ptr: fx.Pointer,
+        rwt_ptr: fx.Pointer,
+        y_ptr: fx.Pointer,
+        grid_x: fx.Int32,
+        stream: fx.Stream,
+    ):
+        _kernel(inter_ptr, wd_ptr, wds_ptr, rid_ptr, rwt_ptr, y_ptr).launch(
+            grid=(
+                grid_x * fx.Int32(kh_per_warp) // fx.Int32(16),
+                1,
+                1,
+            ),
+            block=(WARP_SIZE, 1, 1),
+            stream=stream,
+        )
+
+    return _launch
+
+
 def build_down_reduce_fp8_module(
     inter: int,
     hidden: int,
@@ -1444,6 +1564,18 @@ def build_down_reduce_fp8_module(
       * router_wts   [B, TOPK]           float32    (normalized to sum 1 per token)
       * y            [B, HIDDEN]         bf16
     """
+    if preshuffled and k_batch == 1 and inter % 64 == 0 and hidden % 16 == 0:
+        return _build_down_fp8_preshuffled_native(
+            inter,
+            hidden,
+            top_k,
+            w_scale_mode=w_scale_mode,
+            serialize_dot2=serialize_dot2,
+            scale_bn=scale_bn,
+            scale_bk=scale_bk,
+            kh_per_warp=kh_per_warp,
+            dot2_acc=dot2_acc,
+        )
     if kvector is None:
         kvector = pick_kvector(inter)
     if kvector % 2 != 0:
