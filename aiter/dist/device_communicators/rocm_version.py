@@ -23,7 +23,6 @@ Returns a ``(major, minor, patch)`` tuple that compares naturally against a
 threshold like ``(7, 15)``, or ``None`` if every source failed.
 """
 
-import ctypes
 import functools
 import glob
 import os
@@ -104,24 +103,11 @@ def _from_hip_runtime():
     *runtime* version; it aligns with the ROCm release from ROCm 6.0 onward,
     which is the range that matters for the IPC gate.
     """
-    hip = None
-    for name in ("libamdhip64.so", "libamdhip64.so.7", "libamdhip64.so.6"):
-        try:
-            hip = ctypes.CDLL(name)
-            break
-        except OSError:
-            continue
-    if hip is None:
-        return None
-    try:
-        raw = ctypes.c_int()
-        if hip.hipRuntimeGetVersion(ctypes.byref(raw)) != 0:
-            return None
-        val = raw.value
-    except Exception:  # noqa: BLE001
-        return None
-    v = (val // 10_000_000, (val // 100_000) % 100, val % 100_000)
-    logger.info("ROCm version %s from hipRuntimeGetVersion=%d", v, val)
+    from aiter.jit.utils.hip_runtime import get_hip_runtime_version
+
+    v = get_hip_runtime_version()
+    if v:
+        logger.info("ROCm version %s from hipRuntimeGetVersion", v)
     return v
 
 
