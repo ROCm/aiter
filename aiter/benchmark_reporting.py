@@ -7,6 +7,11 @@ import json
 import pandas as pd
 
 
+def _json_default(value):
+    """Render non-native JSON scalars without expanding their attributes."""
+    return str(value).removeprefix("torch.")
+
+
 def print_json_table(name, rows, keep=None):
     """Print benchmark rows as one record-oriented JSON object.
 
@@ -27,5 +32,7 @@ def print_json_table(name, rows, keep=None):
                 if "err_msg" in column and column not in cols
             ]
             df = df[cols]
-    records = json.loads(df.to_json(orient="records"))
+    records = json.loads(
+        df.to_json(orient="records", default_handler=_json_default)
+    )
     print(json.dumps({"name": name, "rows": records}), flush=True)
