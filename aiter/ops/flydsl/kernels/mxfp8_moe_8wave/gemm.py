@@ -16,7 +16,7 @@ from ..gemm_a8w8_8wave import (
     ceildiv,
     compute_global_swizzle,
     make_fp8_buffer_tensor,
-    wait_barrier,
+    run_8wave_pipeline,
 )
 from ..kernels_common import get_warp_size
 from ..mfma_preshuffle_pipeline import split_row_major_2d
@@ -163,6 +163,46 @@ class MxMfma:
         ]
 
 
+def make_mx_pipeline_mma(mfma, a_sc, b_sc, a_base16, b_base16, k_iters):
+    """MX scale prefetch and byte selection for the shared eight-wave schedule."""
+
+    # Keep scale emission in this callable so FlyDSL tracks its source dependency.
+    class MxPipelineMma:
+        def __init__(self):
+            self.mfma = mfma
+            self.zero_value = mfma.zero_value
+            self.n_tiles_a, self.n_tiles_b = mfma.n_tiles_a, mfma.n_tiles_b
+            self.a_sc, self.b_sc = a_sc, b_sc
+            self.a_base16, self.b_base16 = a_base16, b_base16
+            self.k_iters = k_iters
+            self.prefetched = {}
+
+        def prefetch(self, k):
+            if const_expr(k >= self.k_iters or k // 2 in self.prefetched):
+                return
+            words = {
+                w: (self.a_sc if w[0] == "a" else self.b_sc).read(
+                    (self.a_base16 if w[0] == "a" else self.b_base16)[int(w[1])], k
+                )
+                for w in ("a0", "a1", "b0", "b1")
+            }
+            self.prefetched = {**self.prefetched, k // 2: words}
+
+        def call(self, a, b, c, *, k, a_half, b_half, set_prio=True):
+            scales = self.prefetched[k // 2]
+            return self.mfma.call(
+                a,
+                b,
+                c,
+                scales[f"a{a_half}"],
+                scales[f"b{b_half}"],
+                k_pack=k % 2,
+                set_prio=set_prio,
+            )
+
+    return MxPipelineMma()
+
+
 def compile_mxfp8_gemm_8w(
     *,
     K: int,
@@ -220,12 +260,13 @@ def compile_mxfp8_gemm_8w(
     b_pack = 2 if b_dtype == "fp4" else 1
     assert b_k % (64 * b_pack) == 0
     K_ITERS = logical_k // BLOCK_K
+    # FlyDSL 0.3.2 tracks cross-directory helpers captured by the kernel closure.
+    pipeline = run_8wave_pipeline
     # Scale words are addressed by K-pair, so K must contain a whole number of
     # them (K % 256 above already guarantees it).
 
     N_TILES_A = BLOCK_M // 64
     N_TILES_B = BLOCK_N // 128
-    N_ACCUMS = N_TILES_A * N_TILES_B
 
     LDS_BLOCK_M = BLOCK_M // 2
     LDS_BLOCK_N = BLOCK_N // 2
@@ -391,156 +432,36 @@ def compile_mxfp8_gemm_8w(
                 "wait_barrier counts below were validated against; re-check them against the ISA"
             )
 
-            def scale_prefetch(sc, k0):
-                if const_expr(k0 >= K_ITERS or k0 // 2 in sc):
-                    return sc
-                words = {
-                    w: (a_sc if w[0] == "a" else b_sc).read(
-                        (a_base16 if w[0] == "a" else b_base16)[int(w[1])], k0
-                    )
-                    for w in ("a0", "a1", "b0", "b1")
-                }
-                return {**sc, k0 // 2: words}
-
-            def scale_read(sc, k, which):
-                """The prefetched E8M0 operands for K-step ``k``."""
-                return sc[k // 2][which]
-
-            c00_frag = [mfma.zero_value] * N_ACCUMS
-            c01_frag = [mfma.zero_value] * N_ACCUMS
-            c10_frag = [mfma.zero_value] * N_ACCUMS
-            c11_frag = [mfma.zero_value] * N_ACCUMS
-
-            sc_pf = scale_prefetch({}, 0)
-
-            b_g2s.load(b_cur0, B0_gl_offset + 0 * B_K_STEP)
-            a_g2s.load(a_cur0, A0_gl_offset + 0 * BLOCK_K)
-            b_g2s.load(b_cur1, B1_gl_offset + 0 * B_K_STEP)
-            a1_g2s.load(a_cur1, A1_gl_offset + 0 * BLOCK_K)
-
+            pipeline_mma = make_mx_pipeline_mma(
+                mfma, a_sc, b_sc, a_base16, b_base16, K_ITERS
+            )
+            pipeline_mma.prefetch(0)
+            b_g2s.load(b_cur0, B0_gl_offset)
+            a_g2s.load(a_cur0, A0_gl_offset)
+            b_g2s.load(b_cur1, B1_gl_offset)
+            a1_g2s.load(a_cur1, A1_gl_offset)
             if wave_m == 1:
                 rocdl.s_barrier()
 
-            wait_barrier(N_LDS_STEPS_A + N_LDS_STEPS_B)
-
-            b_g2s.load(b_next0, B0_gl_offset + 1 * B_K_STEP)
-            a_g2s.load(a_next0, A0_gl_offset + 1 * BLOCK_K)
-            b_g2s.load(b_next1, B1_gl_offset + 1 * B_K_STEP)
-
-            wait_barrier(N_LDS_STEPS_A + 2 * N_LDS_STEPS_B)
-
-            for k in range_constexpr(K_ITERS - 2):
-                if const_expr(k % 2 == 1):
-                    sc_pf = scale_prefetch(sc_pf, k + 1)
-                sa0 = scale_read(sc_pf, k, "a0")
-                sb0 = scale_read(sc_pf, k, "b0")
-                b0_frag = b_s2r.load(b_cur0, preshuffled=b_preshuffled)
-                a0_frag = a_s2r.load(a_cur0)
-                a1_g2s.load(a_next1, A1_gl_offset + (k + 1) * BLOCK_K)
-                rocdl.s_barrier()
-
-                c00_frag = mfma.call(a0_frag, b0_frag, c00_frag, sa0, sb0, k_pack=k % 2)
-
-                sb1 = scale_read(sc_pf, k, "b1")
-                b1_frag = b_s2r.load(b_cur1, preshuffled=b_preshuffled)
-                b_g2s.load(b_cur0, B0_gl_offset + (k + 2) * B_K_STEP)
-                rocdl.s_barrier()
-
-                c01_frag = mfma.call(a0_frag, b1_frag, c01_frag, sa0, sb1, k_pack=k % 2)
-
-                sa1 = scale_read(sc_pf, k, "a1")
-                a1_frag = a_s2r.load(a_cur1)
-                a_g2s.load(a_cur0, A0_gl_offset + (k + 2) * BLOCK_K)
-                rocdl.s_barrier()
-
-                c10_frag = mfma.call(a1_frag, b0_frag, c10_frag, sa1, sb0, k_pack=k % 2)
-
-                b_g2s.load(b_cur1, B1_gl_offset + (k + 2) * B_K_STEP)
-                # Complete the A prefetches before rotating grouped/gathered LDS
-                # buffers, leaving only the final B half (two loads) outstanding.
-                # The dense vmcnt(6) allowance races on expert/padding boundaries.
-                wait_barrier(
+            c00_frag, c01_frag, c10_frag, c11_frag = pipeline(
+                lds,
+                (a_g2s, a1_g2s),
+                b_g2s,
+                a_s2r,
+                b_s2r,
+                (A0_gl_offset, A1_gl_offset),
+                (B0_gl_offset, B1_gl_offset),
+                pipeline_mma,
+                k_iters=K_ITERS,
+                b_k_step=B_K_STEP,
+                b_preshuffled=b_preshuffled,
+                # Grouped/gathered A must complete before LDS buffer rotation.
+                loop_wait_count=(
                     N_LDS_STEPS_B if grouped else 2 * N_LDS_STEPS_A + N_LDS_STEPS_B
-                )
-
-                c11_frag = mfma.call(a1_frag, b1_frag, c11_frag, sa1, sb1, k_pack=k % 2)
-
-                # Swap cur and next
-                a_cur0, a_next0 = a_next0, a_cur0
-                a_cur1, a_next1 = a_next1, a_cur1
-                b_cur0, b_next0 = b_next0, b_cur0
-                b_cur1, b_next1 = b_next1, b_cur1
-
-            # Step k = K_ITERS - 2
-            # Odd logical K (e.g. 384 with physical stride 512) needs the final
-            # scale pair even though the main loop never reaches its odd prefetch.
-            sc_pf = scale_prefetch(sc_pf, K_ITERS - 1)
-            k = K_ITERS - 2
-            sa0 = scale_read(sc_pf, k, "a0")
-            sb0 = scale_read(sc_pf, k, "b0")
-            b0_frag = b_s2r.load(b_cur0, preshuffled=b_preshuffled)
-            a0_frag = a_s2r.load(a_cur0)
-            rocdl.s_barrier()
-
-            c00_frag = mfma.call(a0_frag, b0_frag, c00_frag, sa0, sb0, k_pack=k % 2)
-
-            sb1 = scale_read(sc_pf, k, "b1")
-            b1_frag = b_s2r.load(b_cur1, preshuffled=b_preshuffled)
-            rocdl.s_barrier()
-
-            c01_frag = mfma.call(a0_frag, b1_frag, c01_frag, sa0, sb1, k_pack=k % 2)
-
-            sa1 = scale_read(sc_pf, k, "a1")
-            a1_frag = a_s2r.load(a_cur1)
-            # Main loop prefetches a_next1 one step behind; issue the final
-            # K_ITERS - 1 tile here, otherwise c10 / c11 read stale A1 data.
-            a1_g2s.load(a_next1, A1_gl_offset + (K_ITERS - 1) * BLOCK_K)
-            if const_expr(grouped and K_ITERS == 2):
-                # With no main-loop iteration, the final B prefetch has not
-                # passed its VMEM fence before the staggered S2R read.
-                rocdl.s_waitcnt(vmcnt=0)
-            rocdl.s_barrier()
-
-            c10_frag = mfma.call(a1_frag, b0_frag, c10_frag, sa1, sb0, k_pack=k % 2)
-
-            b0_frag = b_s2r.load(b_next0, preshuffled=b_preshuffled)
-            rocdl.s_barrier()
-
-            c11_frag = mfma.call(a1_frag, b1_frag, c11_frag, sa1, sb1, k_pack=k % 2)
-            # Swap cur and next
-            a_cur0, a_next0 = a_next0, a_cur0
-            a_cur1, a_next1 = a_next1, a_cur1
-            b_cur0, b_next0 = b_next0, b_cur0
-            b_cur1, b_next1 = b_next1, b_cur1
-
-            # Step k = K_ITERS - 1
-            k = K_ITERS - 1
-            sa0 = scale_read(sc_pf, k, "a0")
-            sb0 = scale_read(sc_pf, k, "b0")
-            a0_frag = a_s2r.load(a_cur0)
-            wait_barrier(0)
-
-            c00_frag = mfma.call(a0_frag, b0_frag, c00_frag, sa0, sb0, k_pack=k % 2)
-
-            sb1 = scale_read(sc_pf, k, "b1")
-            b1_frag = b_s2r.load(b_cur1, preshuffled=b_preshuffled)
-            rocdl.s_barrier()
-
-            c01_frag = mfma.call(a0_frag, b1_frag, c01_frag, sa0, sb1, k_pack=k % 2)
-
-            sa1 = scale_read(sc_pf, k, "a1")
-            a1_frag = a_s2r.load(a_cur1)
-            rocdl.s_barrier()
-
-            rocdl.s_setprio(1)
-            c10_frag = mfma.call(
-                a1_frag, b0_frag, c10_frag, sa1, sb0, k_pack=k % 2, set_prio=False
+                ),
+                # With no main loop, the final B prefetch needs its VMEM fence.
+                tail_a1_fence=grouped and K_ITERS == 2,
             )
-            c11_frag = mfma.call(
-                a1_frag, b1_frag, c11_frag, sa1, sb1, k_pack=k % 2, set_prio=False
-            )
-            rocdl.s_setprio(0)
-            rocdl.s_barrier()
 
             # Rejoin the staggered M wave groups before reusing LDS for the epilogue.
             if wave_m == 0:

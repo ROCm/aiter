@@ -296,7 +296,10 @@ class Mfma16x16x128:
         fx.gemm(self.atom, c_frag, a_frag, b_frag, c_frag)
         return c_frag.load().ir_value()
 
-    def call(self, a, b, c, *, set_prio=True):
+    def prefetch(self, k):
+        """Dense row scales are applied in the epilogue; no K-block scale loads."""
+
+    def call(self, a, b, c, *, set_prio=True, k=0, a_half=0, b_half=0):
         assert len(a) == self.n_tiles_a
         assert len(b) == self.n_tiles_b
         assert len(c) == self.n_tiles_a * self.n_tiles_b
@@ -355,6 +358,151 @@ def _xcd_swizzle_any(num_pid_m, num_pid_n, wgm):
     return first_pid_m + intra_group_m, pid_n
 
 
+def run_8wave_pipeline(
+    lds,
+    a_loaders,
+    b_g2s,
+    a_s2r,
+    b_s2r,
+    a_offsets,
+    b_offsets,
+    mma,
+    *,
+    k_iters,
+    b_k_step,
+    b_preshuffled,
+    loop_wait_count,
+    tail_a1_fence=False,
+):
+    """Emit the common 8-wave K-loop and two peeled iterations (K-step 128).
+
+    ``mma`` supplies zero_value, tile counts, prefetch(k), and call(..., k,
+    a_half, b_half, set_prio). Dense MMA prefetch is a no-op; MX owns its scale
+    state. A may use a different routed loader for each M half. Offsets and B's
+    K step are bytes, including packed FP4. The caller chooses the loop wait
+    count and optional tail fence. The initial four DMAs and dynamic M-wave
+    stagger barrier stay in the kernel caller, as does epilogue synchronization.
+    """
+    block_k = 128
+    a_g2s, a1_g2s = a_loaders
+    A0_gl_offset, A1_gl_offset = a_offsets
+    B0_gl_offset, B1_gl_offset = b_offsets
+    n_accums = mma.n_tiles_a * mma.n_tiles_b
+    a_cur0, a_cur1 = lds.A_lds_cur_0, lds.A_lds_cur_1
+    a_next0, a_next1 = lds.A_lds_next_0, lds.A_lds_next_1
+    b_cur0, b_cur1 = lds.B_lds_cur_0, lds.B_lds_cur_1
+    b_next0, b_next1 = lds.B_lds_next_0, lds.B_lds_next_1
+
+    # Four accumulators cover the two M and two N LDS halves.
+    c00_frag = [mma.zero_value] * n_accums
+    c01_frag = [mma.zero_value] * n_accums
+    c10_frag = [mma.zero_value] * n_accums
+    c11_frag = [mma.zero_value] * n_accums
+
+    wait_barrier(a_g2s.n_load_steps + b_g2s.n_load_steps)
+
+    b_g2s.load(b_next0, B0_gl_offset + 1 * b_k_step)
+    a_g2s.load(a_next0, A0_gl_offset + 1 * block_k)
+    b_g2s.load(b_next1, B1_gl_offset + 1 * b_k_step)
+
+    wait_barrier(a_g2s.n_load_steps + 2 * b_g2s.n_load_steps)
+
+    for k in range_constexpr(k_iters - 2):
+        if const_expr(k % 2 == 1):
+            mma.prefetch(k + 1)
+        b0_frag = b_s2r.load(b_cur0, preshuffled=b_preshuffled)
+        a0_frag = a_s2r.load(a_cur0)
+        a1_g2s.load(a_next1, A1_gl_offset + (k + 1) * block_k)
+        rocdl.s_barrier()
+
+        c00_frag = mma.call(a0_frag, b0_frag, c00_frag, k=k, a_half=0, b_half=0)
+
+        b1_frag = b_s2r.load(b_cur1, preshuffled=b_preshuffled)
+        b_g2s.load(b_cur0, B0_gl_offset + (k + 2) * b_k_step)
+        rocdl.s_barrier()
+
+        c01_frag = mma.call(a0_frag, b1_frag, c01_frag, k=k, a_half=0, b_half=1)
+
+        a1_frag = a_s2r.load(a_cur1)
+        a_g2s.load(a_cur0, A0_gl_offset + (k + 2) * block_k)
+        rocdl.s_barrier()
+
+        c10_frag = mma.call(a1_frag, b0_frag, c10_frag, k=k, a_half=1, b_half=0)
+
+        b_g2s.load(b_cur1, B1_gl_offset + (k + 2) * b_k_step)
+        wait_barrier(loop_wait_count)
+
+        c11_frag = mma.call(a1_frag, b1_frag, c11_frag, k=k, a_half=1, b_half=1)
+
+        # Swap cur and next
+        a_cur0, a_next0 = a_next0, a_cur0
+        a_cur1, a_next1 = a_next1, a_cur1
+        b_cur0, b_next0 = b_next0, b_cur0
+        b_cur1, b_next1 = b_next1, b_cur1
+
+    # The peeled tail may need a new scale pair for odd logical K.
+    mma.prefetch(k_iters - 1)
+    # Step k = k_iters - 2
+    k = k_iters - 2
+    b0_frag = b_s2r.load(b_cur0, preshuffled=b_preshuffled)
+    a0_frag = a_s2r.load(a_cur0)
+    rocdl.s_barrier()
+
+    c00_frag = mma.call(a0_frag, b0_frag, c00_frag, k=k, a_half=0, b_half=0)
+
+    b1_frag = b_s2r.load(b_cur1, preshuffled=b_preshuffled)
+    rocdl.s_barrier()
+
+    c01_frag = mma.call(a0_frag, b1_frag, c01_frag, k=k, a_half=0, b_half=1)
+
+    a1_frag = a_s2r.load(a_cur1)
+    # Main loop prefetches a_next1 one step behind; issue the final
+    # k_iters - 1 tile here, otherwise c10 / c11 read stale A1 data.
+    a1_g2s.load(a_next1, A1_gl_offset + (k_iters - 1) * block_k)
+    if const_expr(tail_a1_fence):
+        rocdl.s_waitcnt(vmcnt=0)
+    rocdl.s_barrier()
+
+    c10_frag = mma.call(a1_frag, b0_frag, c10_frag, k=k, a_half=1, b_half=0)
+
+    b0_frag = b_s2r.load(b_next0, preshuffled=b_preshuffled)
+    rocdl.s_barrier()
+
+    c11_frag = mma.call(a1_frag, b1_frag, c11_frag, k=k, a_half=1, b_half=1)
+    # Swap cur and next
+    a_cur0, a_next0 = a_next0, a_cur0
+    a_cur1, a_next1 = a_next1, a_cur1
+    b_cur0, b_next0 = b_next0, b_cur0
+    b_cur1, b_next1 = b_next1, b_cur1
+
+    # Step k = k_iters - 1
+    k = k_iters - 1
+    a0_frag = a_s2r.load(a_cur0)
+    wait_barrier(0)
+
+    c00_frag = mma.call(a0_frag, b0_frag, c00_frag, k=k, a_half=0, b_half=0)
+
+    b1_frag = b_s2r.load(b_cur1, preshuffled=b_preshuffled)
+    rocdl.s_barrier()
+
+    c01_frag = mma.call(a0_frag, b1_frag, c01_frag, k=k, a_half=0, b_half=1)
+
+    a1_frag = a_s2r.load(a_cur1)
+    rocdl.s_barrier()
+
+    rocdl.s_setprio(1)
+    c10_frag = mma.call(
+        a1_frag, b0_frag, c10_frag, k=k, a_half=1, b_half=0, set_prio=False
+    )
+    c11_frag = mma.call(
+        a1_frag, b1_frag, c11_frag, k=k, a_half=1, b_half=1, set_prio=False
+    )
+    rocdl.s_setprio(0)
+    rocdl.s_barrier()
+
+    return c00_frag, c01_frag, c10_frag, c11_frag
+
+
 def compile_fp8_gemm_8w(
     *,
     K: int,
@@ -375,8 +523,6 @@ def compile_fp8_gemm_8w(
 
     N_TILES_A = BLOCK_M // 64
     N_TILES_B = BLOCK_N // 128
-    N_ACCUMS = N_TILES_A * N_TILES_B
-    assert N_ACCUMS > 0
 
     LDS_BLOCK_M = BLOCK_M // 2
     LDS_BLOCK_N = BLOCK_N // 2
@@ -421,14 +567,6 @@ def compile_fp8_gemm_8w(
         n_blocks = ceildiv(c_n, BLOCK_N)
 
         lds = fx.SharedAllocator().allocate(SharedStorage).peek()
-        a_cur0 = lds.A_lds_cur_0
-        a_cur1 = lds.A_lds_cur_1
-        a_next0 = lds.A_lds_next_0
-        a_next1 = lds.A_lds_next_1
-        b_cur0 = lds.B_lds_cur_0
-        b_cur1 = lds.B_lds_cur_1
-        b_next0 = lds.B_lds_next_0
-        b_next1 = lds.B_lds_next_1
 
         lane_id = fx.thread_idx.x % 64
         wave_id = fx.thread_idx.x // 64
@@ -467,110 +605,27 @@ def compile_fp8_gemm_8w(
         b_s2r = S2RLoader(wave_n, N_TILES_B)
         store_c = StoreC(A_scale, B_scale, C, c_m, c_n, mfma.idx, N_TILES_A, N_TILES_B)
 
-        # 2x2 config of 4x2 (instead of 4x4 in 4wave) 16x16 sub-tiles
-        c00_frag = [mfma.zero_value] * N_ACCUMS
-        c01_frag = [mfma.zero_value] * N_ACCUMS
-        c10_frag = [mfma.zero_value] * N_ACCUMS
-        c11_frag = [mfma.zero_value] * N_ACCUMS
-
-        b_g2s.load(b_cur0, B0_gl_offset + 0 * B_K_STEP)
-        a_g2s.load(a_cur0, A0_gl_offset + 0 * BLOCK_K)
-        b_g2s.load(b_cur1, B1_gl_offset + 0 * B_K_STEP)
-        a_g2s.load(a_cur1, A1_gl_offset + 0 * BLOCK_K)
-
+        b_g2s.load(lds.B_lds_cur_0, B0_gl_offset)
+        a_g2s.load(lds.A_lds_cur_0, A0_gl_offset)
+        b_g2s.load(lds.B_lds_cur_1, B1_gl_offset)
+        a_g2s.load(lds.A_lds_cur_1, A1_gl_offset)
         if wave_m == 1:
             rocdl.s_barrier()
 
-        wait_barrier(N_LDS_STEPS_A + N_LDS_STEPS_B)
-
-        b_g2s.load(b_next0, B0_gl_offset + 1 * B_K_STEP)
-        a_g2s.load(a_next0, A0_gl_offset + 1 * BLOCK_K)
-        b_g2s.load(b_next1, B1_gl_offset + 1 * B_K_STEP)
-
-        wait_barrier(N_LDS_STEPS_A + 2 * N_LDS_STEPS_B)
-
-        for k in range_constexpr(K_ITERS - 2):
-            b0_frag = b_s2r.load(b_cur0, preshuffled=b_preshuffled)
-            a0_frag = a_s2r.load(a_cur0)
-            a_g2s.load(a_next1, A1_gl_offset + (k + 1) * BLOCK_K)
-            rocdl.s_barrier()
-
-            c00_frag = mfma.call(a0_frag, b0_frag, c00_frag)
-
-            b1_frag = b_s2r.load(b_cur1, preshuffled=b_preshuffled)
-            b_g2s.load(b_cur0, B0_gl_offset + (k + 2) * B_K_STEP)
-            rocdl.s_barrier()
-
-            c01_frag = mfma.call(a0_frag, b1_frag, c01_frag)
-
-            a1_frag = a_s2r.load(a_cur1)
-            a_g2s.load(a_cur0, A0_gl_offset + (k + 2) * BLOCK_K)
-            rocdl.s_barrier()
-
-            c10_frag = mfma.call(a1_frag, b0_frag, c10_frag)
-
-            b_g2s.load(b_cur1, B1_gl_offset + (k + 2) * B_K_STEP)
-            wait_barrier(2 * N_LDS_STEPS_A + N_LDS_STEPS_B)
-
-            c11_frag = mfma.call(a1_frag, b1_frag, c11_frag)
-
-            # Swap cur and next
-            a_cur0, a_next0 = a_next0, a_cur0
-            a_cur1, a_next1 = a_next1, a_cur1
-            b_cur0, b_next0 = b_next0, b_cur0
-            b_cur1, b_next1 = b_next1, b_cur1
-
-        # Step k = K_ITERS - 2
-        k = K_ITERS - 2
-        b0_frag = b_s2r.load(b_cur0, preshuffled=b_preshuffled)
-        a0_frag = a_s2r.load(a_cur0)
-        rocdl.s_barrier()
-
-        c00_frag = mfma.call(a0_frag, b0_frag, c00_frag)
-
-        b1_frag = b_s2r.load(b_cur1, preshuffled=b_preshuffled)
-        rocdl.s_barrier()
-
-        c01_frag = mfma.call(a0_frag, b1_frag, c01_frag)
-
-        a1_frag = a_s2r.load(a_cur1)
-        # Main loop prefetches a_next1 one step behind; issue the final
-        # K_ITERS - 1 tile here, otherwise c10 / c11 read stale A1 data.
-        a_g2s.load(a_next1, A1_gl_offset + (K_ITERS - 1) * BLOCK_K)
-        rocdl.s_barrier()
-
-        c10_frag = mfma.call(a1_frag, b0_frag, c10_frag)
-
-        b0_frag = b_s2r.load(b_next0, preshuffled=b_preshuffled)
-        rocdl.s_barrier()
-
-        c11_frag = mfma.call(a1_frag, b1_frag, c11_frag)
-        # Swap cur and next
-        a_cur0, a_next0 = a_next0, a_cur0
-        a_cur1, a_next1 = a_next1, a_cur1
-        b_cur0, b_next0 = b_next0, b_cur0
-        b_cur1, b_next1 = b_next1, b_cur1
-
-        # Step k = K_ITERS - 1
-        k = K_ITERS - 1
-        a0_frag = a_s2r.load(a_cur0)
-        wait_barrier(0)
-
-        c00_frag = mfma.call(a0_frag, b0_frag, c00_frag)
-
-        b1_frag = b_s2r.load(b_cur1, preshuffled=b_preshuffled)
-        rocdl.s_barrier()
-
-        c01_frag = mfma.call(a0_frag, b1_frag, c01_frag)
-
-        a1_frag = a_s2r.load(a_cur1)
-        rocdl.s_barrier()
-
-        rocdl.s_setprio(1)
-        c10_frag = mfma.call(a1_frag, b0_frag, c10_frag, set_prio=False)
-        c11_frag = mfma.call(a1_frag, b1_frag, c11_frag, set_prio=False)
-        rocdl.s_setprio(0)
-        rocdl.s_barrier()
+        c00_frag, c01_frag, c10_frag, c11_frag = run_8wave_pipeline(
+            lds,
+            (a_g2s, a_g2s),
+            b_g2s,
+            a_s2r,
+            b_s2r,
+            (A0_gl_offset, A1_gl_offset),
+            (B0_gl_offset, B1_gl_offset),
+            mfma,
+            k_iters=K_ITERS,
+            b_k_step=B_K_STEP,
+            b_preshuffled=b_preshuffled,
+            loop_wait_count=2 * N_LDS_STEPS_A + N_LDS_STEPS_B,
+        )
 
         # Scale and store back to gmem
         wave_n_offset = wave_n * (N_TILES_B * 16)
