@@ -658,20 +658,25 @@ void bmm_a8w8_mxscale_bpreshuffle_nospec_kernel_gfx1250(opus_bmm_a8w8_mxscale_ka
 
             // N OUTER, M inner -- so the inner run holds ONE B fragment and walks
             // A, and M serpentines so consecutive columns share an A operand at
-            // the turn. Measured on kid35 (kExpM=8, kExpN=4) against the two
-            // alternatives, identical checksums, us at n=1024 k=4096:
+            // the turn. The M-outer serpentine this replaces had the roles
+            // backwards: it held A and walked B, which shares the A operand.
             //
-            //   b,m        M-outer+N-serp   N-outer (this)   M-outer+raster
-            //   8,1024          50.59           48.41            49.37
-            //   8,2048          57.39           57.11            56.54
-            //   16,2048        121.18          116.25           117.51
-            //   16,4096        235.42          232.19           233.68
-            //   4,2048          50.94           48.92            49.60
+            // Worth ~1.3%, winning 4 of 5 cells. Re-measured A/B/A because the
+            // first number (2.9%, from three sequential rebuilds) was inflated by
+            // this box's cross-run clock drift -- the SAME binary can read 48.6 us
+            // in one session and 31.1 in another. Bracketed, rebuilding back to
+            // the old order on both sides, us at n=1024 k=4096:
             //
-            // 2.9% mean, and the M-outer serpentine this replaces was the WORST
-            // of the three -- its premise, that holding A and walking B shares
-            // the B operand, had the roles backwards. Order is moot where either
-            // extent is 1 (the decode tiles), so this only moves the prefill ones.
+            //   b,m       M-outer A1   N-outer (this)   M-outer A2
+            //   8,1024        32.69         31.57          32.55
+            //   8,2048        49.91         48.97          49.21
+            //   16,2048       97.93         97.18          98.07
+            //   16,4096      181.18        182.33         181.46   <- the one loss
+            //   4,2048        32.56         32.27          33.23
+            //
+            // Order is moot where either extent is 1 (the decode tiles), so this
+            // only moves the prefill ones. Do not re-measure it across a rebuild
+            // without bracketing; the effect is smaller than the drift.
             auto mma_rows = [&](auto FirstN, auto CountN) __attribute__((always_inline)) {
                 if constexpr (!T::kSfAEarly) {
                     opus::static_for<CountN.value>([&](auto jN) __attribute__((always_inline)) {
