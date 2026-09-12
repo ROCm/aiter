@@ -2866,6 +2866,16 @@ def get_2stage_cfgs(
         _opus_a8w4.parse_stage2_config(cfg, block_m) if is_opus_cfg else None
     )
 
+    if (
+        os.environ.get("AITER_SITUV2_A4W4_FP8_INTER", "0") == "1"
+        and q_dtype_a == dtypes.fp4x2
+        and isinstance(kernelName2, str)
+        and kernelName2.startswith("flydsl_moe2_layout_afp4_")
+        and isinstance(kernelName1, str)
+        and kernelName1.startswith("flydsl_moe1_")
+    ):
+        kernelName2 = kernelName2.replace("_afp4_", "_afp8_", 1)
+
     tag = f"({kernelName1=}, {kernelName2=})"
     logger.info(
         f"[fused_moe] using {'1stage' if run_1stage else '2stage'}{' xbf16' if run_1stage_xbf16 else ''} {'default' if cfg is None else tag} for {keys} "
