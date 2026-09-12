@@ -244,6 +244,7 @@ void opus_bmm_a8w8_mxscale_bpreshuffle(
     {34, OPUS_BMM_BPRESHUF_NS_ENTRY(opus_bmm_a8w8_mxscale_bpreshuffle_tile_ns128x512_gn128_sf_gfx1250)},
     {35, OPUS_BMM_BPRESHUF_NS_ENTRY(opus_bmm_a8w8_mxscale_bpreshuffle_tile_ns256_gn128_sf_bk256_gfx1250)},
     {36, OPUS_BMM_BPRESHUF_NS_ENTRY(opus_bmm_a8w8_mxscale_bpreshuffle_tile_ns256_bk256_gfx1250)},
+    {38, OPUS_BMM_BPRESHUF_NS_ENTRY(opus_bmm_a8w8_mxscale_bpreshuffle_tile_ns_dec_n64_gn128_sf_gfx1250)},
   };
 #undef OPUS_BMM_BPRESHUF_ENTRY
 #undef OPUS_BMM_BPRESHUF_NS_ENTRY
@@ -251,7 +252,7 @@ void opus_bmm_a8w8_mxscale_bpreshuffle(
   auto it = kBpreshuf.find(kernelId);
   AITER_CHECK(it != kBpreshuf.end(),
               "opus_bmm_a8w8_mxscale_bpreshuffle: unknown kernelId ", kernelId,
-              "; valid ids: 0..10, 13, 14, 17..36");
+              "; valid ids: 0..10, 13, 14, 17..36, 38");
   it->second(O, wo_a, Y, x_scale, w_scale, splitK);
 #endif  // OPUS_BUILD_HAS_GFX1250
 }

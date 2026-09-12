@@ -1854,6 +1854,34 @@ using opus_bmm_a8w8_mxscale_bpreshuffle_tile_ns256_bk256_gfx1250 =
         /*SF_A_LDS*/false, /*SF_B_LDS*/false,
         /*SF_A_TDM_KG*/0, /*SF_A_TDM_PAD*/16, /*TILE_M*/2, /*NO_SPEC*/true>;
 
+// kid38: kid8's tile on the NON-SPECIALIZED pipeline, deeper K, 4 slots.
+//
+// ATT at b=16 m=16 n=1024 k=4096 (256 workgroups, full CU coverage) puts 43.7%
+// of kid8's latency in s_barrier_wait -- 18 waits at 270 cycles -- against
+// FlyDSL's 0.7% (10 waits at 6.9). FlyDSL's time is in s_wait_tensorcnt, 51%,
+// which is the RIGHT place for a bandwidth-bound decode to wait: on the global
+// fetch. kid8 spends its time on synchronisation instead. Both issue the same
+// 32 WMMAs at the same 288 cycles.
+//
+// The barriers are the specialized pipeline's DATA/FREE handshake, one pair per
+// slot per K-step, and at B_K=256 a k=4096 decode runs 16 K-steps. FlyDSL's
+// decode dispatch is t16x64x512_mw1_nw4_nb4: the SAME 16x64 tile, but every wave
+// loads and computes, so there is no handshake to pay for -- which is exactly
+// what NO_SPEC gives.
+//
+// 4 waves on a 1x4 grid (kTileM*kTileN == kNumWaves), B_K=512 for kExpK=4 (the
+// largest kSf*WideRead still covers), slots=4 to match nb4. LDS is
+// 4 * (16*528 + 4*8192) = 161 KB.
+template <typename DataC>
+using opus_bmm_a8w8_mxscale_bpreshuffle_tile_ns_dec_n64_gn128_sf_gfx1250 =
+    opus_bmm_a8w8_mxscale_bpreshuffle_traits_gfx1250<
+        /*BLOCK_SIZE*/128, /*B_M*/16, /*B_N*/64, /*B_K*/512,
+        /*LAYOUT*/opus_gfx1250_bmm::kLayoutTileN,
+        /*D_A*/opus::fp8_t, /*D_B*/opus::fp8_t, /*D_C*/DataC, /*D_ACC*/float,
+        /*GROUP_K*/128, /*NUM_SLOTS*/4, /*WG_PER_CU*/1, /*GROUP_N*/128,
+        /*SF_A_LDS*/true, /*SF_B_LDS*/true,
+        /*SF_A_TDM_KG*/0, /*SF_A_TDM_PAD*/16, /*TILE_M*/1, /*NO_SPEC*/true>;
+
 // -- smem -> register read layouts -----------------------------------------
 // Device-only in effect, but compiled on the host pass too so vtype_c matches.
 #if defined(__gfx1250__) || !defined(__HIP_DEVICE_COMPILE__)

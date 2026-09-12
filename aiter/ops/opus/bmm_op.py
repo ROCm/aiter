@@ -299,6 +299,7 @@ _BPRESHUF_TILE_BN = {
     28: (256, 256), 29: (128, 128),      # 128x128 blocked prefill
     30: (256, 256), 31: (128, 128),      # ... and their scale-in-LDS siblings
     35: (256, 256),                      # kid30's tile at B_K=256 / slots=2
+    38: (16, 64),                        # kid8's tile, nospec, B_K=512/slots=4
 }
 # Largest m the decode tiles were swept at. Past it, kid0.
 _BPRESHUF_DECODE_M_MAX = 256
@@ -381,7 +382,20 @@ def _heuristic_bpreshuffle_kid(
         # Names the measured winner in 48 of 55 cells; every miss is a near-tie
         # it declines to chase (worst 6.7%, at b<=2 m=32 where kid8 edges kid10).
         if m <= 128 and m * batch <= 256:
-            return 8 if m <= 16 else 10
+            # kid38 is kid8's 16x64 tile moved onto the NON-SPECIALIZED pipeline
+            # at B_K=512 / slots=4. ATT at b=16 m=16 put 43.7% of kid8's latency
+            # in s_barrier_wait -- the specialized DATA/FREE handshake, one pair
+            # per slot per K-step -- against FlyDSL's 0.7%; with every wave both
+            # loading and computing there is no handshake left to pay for. Worth
+            # 4%-17% and it wins every swept decode cell but one.
+            #
+            # That one is where kid38's own grid has outgrown the machine: at
+            # b=32 n=1024 it is 512 workgroups on 256 CUs, and the wider kid10
+            # (16x192, so a third of the grid and a third of the A re-reads)
+            # takes it by 1.3x. Below saturation the narrow tile's parallelism
+            # is worth more than its duplicated A traffic; above it, the reverse.
+            bm38, bn38 = _BPRESHUF_TILE_BN[38]
+            return 10 if -(-n // bn38) * batch > cus else 38
         bm35, bn35 = _BPRESHUF_TILE_BN[35]
         wg35 = -(-m // bm35) * -(-n // bn35) * batch
         return 35 if wg35 * 2 >= cus else 31
