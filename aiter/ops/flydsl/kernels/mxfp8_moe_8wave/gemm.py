@@ -274,24 +274,25 @@ def compile_mxfp8_gemm_8w(
         wave_id = fx.thread_idx.x // 64
         wave_m = wave_id // 4
         wave_n = wave_id % 4
-        if const_expr(xcd_swizzle > 0):
-            m_blocks = ceildiv(c_m, BLOCK_M)
-            block_m, block_n = _xcd_swizzle_any(m_blocks, n_blocks, xcd_swizzle)
-            simple_m, simple_n = split_row_major_2d(fx.block_idx.x, n_blocks)
-            use_simple = m_blocks * n_blocks < 1024
-            if const_expr(not grouped):
-                use_simple = use_simple | (m_blocks * n_blocks % 8 != 0)
-            block_m = use_simple.select(simple_m, block_m)
-            block_n = use_simple.select(simple_n, block_n)
-        else:
-            block_m, block_n = split_row_major_2d(fx.block_idx.x, n_blocks)
-
+        # Partition actual work across XCDs, excluding the routing allocation tail.
+        live_rows = c_m
+        if const_expr(dynamic_rows):
+            live_rows = fx.Int32(rocdl.readfirstlane(fx.Int32.ir_type, valid_rows[0]))
+        m_blocks = ceildiv(live_rows, BLOCK_M)
         active = fx.Int32(1)
         if const_expr(dynamic_rows):
-            active = block_m * BLOCK_M < rocdl.readfirstlane(
-                fx.Int32.ir_type, valid_rows[0]
-            )
+            active = fx.block_idx.x < m_blocks * n_blocks
         if active:
+            if const_expr(xcd_swizzle > 0):
+                block_m, block_n = _xcd_swizzle_any(m_blocks, n_blocks, xcd_swizzle)
+                simple_m, simple_n = split_row_major_2d(fx.block_idx.x, n_blocks)
+                use_simple = m_blocks * n_blocks < 1024
+                if const_expr(not grouped):
+                    use_simple = use_simple | (m_blocks * n_blocks % 8 != 0)
+                block_m = use_simple.select(simple_m, block_m)
+                block_n = use_simple.select(simple_n, block_n)
+            else:
+                block_m, block_n = split_row_major_2d(fx.block_idx.x, n_blocks)
             b_row = block_n * BLOCK_N
             if const_expr(grouped):
                 expert = rocdl.readfirstlane(
@@ -475,6 +476,10 @@ def compile_mxfp8_gemm_8w(
             # Main loop prefetches a_next1 one step behind; issue the final
             # K_ITERS - 1 tile here, otherwise c10 / c11 read stale A1 data.
             a1_g2s.load(a_next1, A1_gl_offset + (K_ITERS - 1) * BLOCK_K)
+            if const_expr(grouped and K_ITERS == 2):
+                # With no main-loop iteration, the final B prefetch has not
+                # passed its VMEM fence before the staggered S2R read.
+                rocdl.s_waitcnt(vmcnt=0)
             rocdl.s_barrier()
 
             c10_frag = mfma.call(a1_frag, b0_frag, c10_frag, sa1, sb0, k_pack=k % 2)
