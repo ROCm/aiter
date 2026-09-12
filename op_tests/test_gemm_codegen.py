@@ -59,6 +59,7 @@ REPRO_BPRESHUFFLE_CSV = os.path.join(
 TARGET_A = ("gfx942", 304)  # MI300X
 TARGET_B = ("gfx950", 256)  # MI350
 TARGET_C = ("gfx942", 80)  # MI308X — gfx942 with CU_NUM override
+TARGET_D = ("gfx1100", 96)  # Radeon PRO W7900
 
 # ---------------------------------------------------------------------------
 # Minimal test harness (no external test framework required)
@@ -152,7 +153,12 @@ def test_get_build_targets():
             "gfx942" in GFX_CU_NUM_MAP and "gfx950" in GFX_CU_NUM_MAP,
         )
 
-        # 1.8 Live GPU fallback — requires torch and a GPU; skipped otherwise
+        # 1.8 Radeon PRO W7900 (gfx1100) headless build target
+        os.environ["GPU_ARCHS"] = TARGET_D[0]
+        t = get_build_targets_env()
+        _check(f"GPU_ARCHS={TARGET_D[0]} → [{TARGET_D}]", t == [TARGET_D], str(t))
+
+        # 1.9 Live GPU fallback — requires torch and a GPU; skipped otherwise
         del os.environ["GPU_ARCHS"]
         try:
             from aiter.jit.utils.chip_info import get_build_targets
