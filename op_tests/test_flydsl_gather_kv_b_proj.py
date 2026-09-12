@@ -311,6 +311,93 @@ def test_gather_kv_b_proj_flydsl_rejects_unsupported(kwargs, needle):
         _run_flydsl(case, **kwargs)
 
 
+def _sparse_case(num_blocks, m, n_heads, lo):
+    """A case whose cache is zero except the ``m`` rows it gathers, all at or
+    above row ``lo``.
+
+    ``_make_case`` tiles its content every 4096 rows, so a misaddressed load
+    there can return data that still looks plausible. Zero everywhere else means
+    a wrong address can only come back as zeros, which the reference never is.
+    """
+    torch.manual_seed(0)
+    row = KV_C_DIM + KV_PE_DIM
+    k_buffer = torch.zeros((num_blocks, 1, row), device="cuda", dtype=torch.uint8)
+    kv_indices = (torch.randperm(num_blocks - lo, device="cuda")[:m] + lo).to(
+        torch.int32
+    )
+    # 0x01..0x76 is positive-finite e4m3 -- no NaN to poison the reference.
+    k_buffer[kv_indices.long()] = torch.randint(
+        1, 0x77, (m, 1, row), device="cuda", dtype=torch.uint8
+    )
+    case = _make_case(m, n_heads, num_blocks=4096)
+    case["k_buffer"] = k_buffer.view(dtypes.fp8)
+    case["kv_indices"] = kv_indices
+    return case
+
+
+def _check_sparse_case(case):
+    """Assert on cosine, not on checkAllclose, which only warns.
+
+    These cases feed the full positive-finite e4m3 range through a 512-deep dot
+    product, so the bf16 result carries a real absolute error at the top of the
+    range; cosine is the scale-free statement, and a gather that reads the wrong
+    row lands nowhere near 1 because everything off the gathered rows is zero.
+    """
+    k_ref, v_ref = _torch_ref(case)
+    _run_flydsl(case)
+    checkAllclose(k_ref, case["k_prefix"].float(), rtol=2e-2, atol=2e-2, msg="k_prefix")
+    checkAllclose(v_ref, case["v_prefix"].float(), rtol=2e-2, atol=2e-2, msg="v_prefix")
+    for name, got, ref in (
+        ("k_prefix", case["k_prefix"], k_ref),
+        ("v_prefix", case["v_prefix"], v_ref),
+    ):
+        cos = torch.nn.functional.cosine_similarity(
+            got.float().flatten(), ref.flatten(), dim=0
+        )
+        assert cos > 0.999, f"{name} cosine {cos:.6f} -- gathered the wrong rows"
+    assert (case["k_prefix"] != 0).any(), "every gathered row read back as zero"
+    torch.cuda.empty_cache()
+
+
+@_SKIP
+def test_gather_kv_b_proj_flydsl_spans_past_2gib():
+    """A cache past 2**31 bytes, gathered only above that boundary.
+
+    The DeepSeek-R1-0528 tp4 shape, and two distinct 32-bit edges: FlyDSL packs
+    memref shapes as i32, so the cache goes in as a pointer plus ``num_blocks``
+    rather than a flattened memref; and the descriptor form's ``idx * 576`` is
+    an i32 whose wrap is harmless only because voffset is read unsigned.
+    """
+    row = KV_C_DIM + KV_PE_DIM
+    num_blocks = 4_458_592
+    assert 2**31 < num_blocks * row < 2**32, "must land in the descriptor's range"
+    _check_sparse_case(_sparse_case(num_blocks, 256, 12, 2**31 // row + 1))
+
+
+@_SKIP
+@pytest.mark.parametrize(
+    "num_blocks, wide",
+    [
+        # Brackets the switch: the widest cache one descriptor still spans, then
+        # the narrowest it does not. Both gather only from the top of the cache.
+        ((2**32 - 1) // (KV_C_DIM + KV_PE_DIM), False),
+        (2**32 // (KV_C_DIM + KV_PE_DIM) + 1, True),
+        (9_000_000, True),  # 4.83 GiB -- well past, not just over
+    ],
+)
+def test_gather_kv_b_proj_flydsl_brackets_the_descriptor_span(num_blocks, wide):
+    """Either side of 4 GiB must agree with the reference.
+
+    Past it the kernel drops the buffer descriptor for ``global_load_lds`` over
+    64-bit per-lane addresses: a gather's row is per-lane, so it can never be
+    folded into an SRsrc base the way a tile scan's can.
+    """
+    row = KV_C_DIM + KV_PE_DIM
+    assert (num_blocks * row >= 2**32) == wide
+    lo = 2**31 // row + 1
+    _check_sparse_case(_sparse_case(num_blocks, 256, 12, lo))
+
+
 @_SKIP
 @pytest.mark.parametrize("num_tokens, block_m", [(16384, 256), (8192, 128)])
 def test_gather_kv_b_proj_flydsl_determinism_large_m(num_tokens, block_m):

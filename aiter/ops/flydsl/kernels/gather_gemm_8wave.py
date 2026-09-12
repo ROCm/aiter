@@ -5,6 +5,9 @@
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
+from flydsl._mlir import ir as _ir
+from flydsl._mlir.dialects import llvm as _llvm_d
+from flydsl._mlir.dialects import rocdl as _rocdl_d
 from flydsl.expr import T, const_expr, range_constexpr, rocdl
 from flydsl.expr.rocdl import cvt_pk_f32_fp8
 from flydsl.expr.typing import Vector as Vec
@@ -30,15 +33,35 @@ N_WAVES = 8  # 512 threads
 BLOCK_K = 128  # fixed by MFMA_Scale(16, 16, 128)
 
 
-def _load_row_bases(kvi_div, m_base, lane_id, wave_id, n_rounds, half_row_off):
-    """Gathered kv_cache row bases (in fp8 elements) for the rows this lane DMAs.
+def _ir_ptr(space: int):
+    """``!llvm.ptr<space>`` -- the raw ROCDL ops take these, not ``!fly.ptr``."""
+    return _ir.Type.parse(f"!llvm.ptr<{space}>")
+
+
+def _raw(v):
+    return v.ir_value() if hasattr(v, "ir_value") else v
+
+
+def _gather_a_offsets(
+    kvi_div, m_base, lane_id, wave_id, n_rounds, half_row_off, kv_base=None
+):
+    """Per-lane A sources: gathered kv_cache row + the stock XOR-swizzled column.
 
     The row map is exactly ``compute_global_swizzle``'s non-preshuffled A map:
-    ``row = lane//8 + wave*8 + round*(N_WAVES*8) (+ LDS_BLOCK_M)``.
+    ``row = lane//8 + wave*8 + round*(N_WAVES*8) (+ LDS_BLOCK_M)``. Every index
+    load is issued before any is consumed so they coalesce into one
+    ``s_waitcnt`` instead of ``n_rounds`` serialized round trips; eight lanes
+    share a row, so their requests fold into one L1 access.
 
-    All loads are issued before any result is consumed so they coalesce into one
-    ``s_waitcnt`` instead of ``n_rounds`` serialized round trips.  Eight lanes
-    share each row, so the eight requests fold into one L1 access.
+    ``mask`` depends only on ``row % 16``, and both the round step (64) and the
+    half step (LDS_BLOCK_M, a multiple of 128) are multiples of 16, so it is
+    invariant across rounds and halves -- one VGPR for the whole tile rather
+    than re-emitting ``swizzle_128``'s divide chain per step.
+
+    Element offsets by default; with ``kv_base``, the cache's address, absolute
+    64-bit byte addresses. Row and column widen together here because they are
+    added here: split across two functions the two widths could disagree, and
+    an i32 sum of a 64-bit address is not an error, just a wrong row.
     """
     atom = fx.make_copy_atom(fx.rocdl.BufferCopy32b(), fx.Int32)
     regs = []
@@ -47,20 +70,59 @@ def _load_row_bases(kvi_div, m_base, lane_id, wave_id, n_rounds, half_row_off):
         reg = fx.make_rmem_tensor(fx.make_layout(1, 1), fx.Int32)
         fx.copy(atom, fx.slice(kvi_div, (None, m_base + row)), reg)
         regs.append(reg)
-    return [Vec(fx.memref_load_vec(reg))[0] * KV_ROW_ELEMS for reg in regs]
 
-
-def _gather_a_offsets(lane_id, wave_id, n_rounds, row_bases):
-    """Per-lane A offsets: gathered row base + the stock XOR-swizzled column.
-
-    ``mask`` depends only on ``row % 16``, and both the round step (64) and the
-    half step (LDS_BLOCK_M, a multiple of 128) are multiples of 16, so it is
-    invariant across rounds and halves -- one VGPR for the whole tile rather
-    than re-emitting ``swizzle_128``'s divide chain per step.
-    """
     mask = ((lane_id // 8 + (wave_id % 2) * 8) // 2) * 16
-    col_swz = ((lane_id % 8) * 16) ^ mask
-    return [row_bases[r] + col_swz for r in range_constexpr(n_rounds)]
+    col = ((lane_id % 8) * 16) ^ mask
+    idxs = [Vec(fx.memref_load_vec(reg))[0] for reg in regs]
+    if kv_base is None:
+        return [i * KV_ROW_ELEMS + col for i in idxs]
+    return [
+        kv_base + fx.Int64(i) * fx.Int64(KV_ROW_ELEMS) + fx.Int64(col) for i in idxs
+    ]
+
+
+class _WideG2SLoader:
+    """``G2SLoader``'s A path without the buffer descriptor.
+
+    ``buffer_load ... lds`` stops at 4 GiB: its SRsrc base must stay uniform
+    across the wave, so a gather's per-lane row can never ride in it -- the
+    per-tile rebase of ROCm/aiter#4473 works only for a scan. ``global_load_lds``
+    is the same DMA on a per-lane 64-bit pointer.
+
+    Two things the copy atom did implicitly and this does by hand: lane ``i``
+    lands at ``lds_base + i*16``, and the K offset rides in the address, there
+    being no ``soffset`` -- safe only because nothing range-checks an origin
+    here. Nothing bounds the read either: a kv_indices entry outside the cache
+    faults instead of returning zeros.
+    """
+
+    LDS_BYTES_PER_WAVE_STEP = 1024  # 64 lanes x 16 B
+
+    def __init__(self, gl_addrs, n_load_steps, wave_id, lane_id):
+        self.gl_addrs = gl_addrs
+        self.n_load_steps = n_load_steps
+        self.wave_id = wave_id
+        self.lane_id = lane_id
+        self.n_waves = fx.block_dim.x // 64
+
+    def load(self, lds_dst, k_offset):
+        for step in range_constexpr(self.n_load_steps):
+            step_off = self.wave_id * self.LDS_BYTES_PER_WAVE_STEP + step * (
+                self.n_waves * self.LDS_BYTES_PER_WAVE_STEP
+            )
+            lds_off = (
+                fx.Int32(fx.ptrtoint(lds_dst.ptr))
+                + fx.Int32(step_off)
+                + self.lane_id * 16
+            )
+            _rocdl_d.global_load_lds(
+                _llvm_d.inttoptr(
+                    _ir_ptr(1), _raw(self.gl_addrs[step] + fx.Int64(k_offset))
+                ),
+                _llvm_d.inttoptr(_ir_ptr(3), _raw(lds_off)),
+                16,
+                0,
+            )
 
 
 class BlockScale:
@@ -286,9 +348,28 @@ class _RopeCopy:
     ROWS_PER_PASS = 256  # 512 threads / 2 threads-per-row
 
     def __init__(
-        self, a_div, kvi_div, kp_div, m_base, head, tid, k_scale, block_m, nope, n_heads
+        self,
+        a_div,
+        kvi_div,
+        kp_div,
+        m_base,
+        head,
+        tid,
+        k_scale,
+        block_m,
+        nope,
+        n_heads,
+        kv_base=None,
     ):
+        # kv_base set: the cache outgrew a descriptor, so `a_div` is None and
+        # each rope row is reached by its own 64-bit address.
         self.a_div = a_div
+        self.kv_base = kv_base
+        self.f8_ptr_t = (
+            None
+            if kv_base is None
+            else fx.PointerType.get(fx.Float8E4M3FN.ir_type, fx.AddressSpace.Global, 16)
+        )
         self.kvi_div = kvi_div
         self.kp_div = kp_div
         self.m_base = m_base
@@ -298,7 +379,11 @@ class _RopeCopy:
         self.kp_row = n_heads * (nope + KV_PE_DIM)
         self.col_base = head * (nope + KV_PE_DIM) + nope
         self.atom32 = fx.make_copy_atom(fx.rocdl.BufferCopy32b(), fx.Int32)
-        self.ld = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), fx.Float8E4M3FN)
+        # Wide form has no descriptor to load through, so a plain global load.
+        self.ld = fx.make_copy_atom(
+            fx.rocdl.BufferCopy128b() if kv_base is None else fx.UniversalCopy128b(),
+            fx.Float8E4M3FN,
+        )
         self.st = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), fx.BFloat16)
         self.dst_reg = fx.make_rmem_tensor(fx.make_layout(8, 1), fx.BFloat16)
         self.ks4 = Vec.filled(4, k_scale, fx.Float32)
@@ -321,9 +406,16 @@ class _RopeCopy:
         for _p in range_constexpr(self.n_passes):
             row_local = self.tid // 2 + _p * self.ROWS_PER_PASS
             idx = Vec(fx.memref_load_vec(self.iregs[_p]))[0]
+            rope_src = (
+                idx * KV_ROW_ELEMS + KV_C_DIM + self.half * 32
+                if self.kv_base is None
+                else self.kv_base
+                + fx.Int64(idx) * fx.Int64(KV_ROW_ELEMS)
+                + fx.Int64(KV_C_DIM + self.half * 32)
+            )
             self.bases.append(
                 (
-                    idx * KV_ROW_ELEMS + KV_C_DIM + self.half * 32,
+                    rope_src,
                     (self.m_base + row_local) * self.kp_row
                     + self.col_base
                     + self.half * 32,
@@ -340,11 +432,17 @@ class _RopeCopy:
             for sub in range_constexpr(
                 2
             ):  # 2 x 16 fp8 = the 32 elements this lane owns
-                fx.copy(
-                    self.ld,
-                    fx.slice(self.a_div, (None, self.bases[_p][0] + sub * 16)),
-                    self.src_regs[_p][sub],
+                src = (
+                    fx.slice(self.a_div, (None, self.bases[_p][0] + sub * 16))
+                    if self.kv_base is None
+                    else fx.make_view(
+                        fx.inttoptr(
+                            self.f8_ptr_t, self.bases[_p][0] + fx.Int64(sub * 16)
+                        ),
+                        fx.make_layout(16, 1),
+                    )
                 )
+                fx.copy(self.ld, src, self.src_regs[_p][sub])
 
     def commit(self):
         v2f32 = T.vec(2, T.f32)
@@ -384,8 +482,14 @@ def compile_gather_kv_b_proj_8w(
     xcd_swizzle: int = 1,
     weight_preshuffle: bool = True,
     per_row_scale: bool = True,
+    wide_index: bool = False,
 ):
-    """Build the fused gather + kv_b_proj kernel for one fixed MLA configuration."""
+    """Build the fused gather + kv_b_proj kernel for one fixed MLA configuration.
+
+    ``wide_index`` swaps the KV cache's descriptor-addressed DMA for
+    ``global_load_lds`` over 64-bit per-lane addresses, which is what a cache
+    spanning more than 4 GiB needs. The host sets it from the cache extent.
+    """
     K = KV_C_DIM
     BLOCK_N = nope + v_dim
 
@@ -416,6 +520,7 @@ def compile_gather_kv_b_proj_8w(
         f"h{n_heads}_{waves_per_eu}x{xcd_swizzle}"
         f"{'_ps' if weight_preshuffle else '_rm'}"
         f"{'_row' if per_row_scale else '_blk'}"
+        f"{'_wide' if wide_index else ''}"
     )
 
     @fx.struct
@@ -431,7 +536,8 @@ def compile_gather_kv_b_proj_8w(
 
     @flyc.kernel(name=_kname, known_block_size=[512, 1, 1])
     def kernel_gather(
-        KV_cache: fx.Tensor,
+        KV_cache: fx.Pointer,
+        kv_num_blocks: fx.Int32,
         KV_indices: fx.Tensor,
         W: fx.Tensor,
         W_scale: fx.Tensor,
@@ -478,9 +584,33 @@ def compile_gather_kv_b_proj_8w(
         B0_gl_offset = (block_n * BLOCK_N) * K
         B1_gl_offset = (block_n * BLOCK_N + LDS_BLOCK_N) * K
 
-        gA = make_fp8_buffer_tensor(KV_cache, F8_IR_t)
+        # The cache arrives as a pointer, not a memref: FlyDSL packs memref
+        # shapes as i32, and this one passes 2**31 elements (2 GiB of fp8) while
+        # the descriptor still reaches 4 GiB. The extent comes alongside, as
+        # `kv_num_blocks`, and only ever widens in 64-bit.
+        # Python-level branch: only one of the two forms is traced.
+        kv_base = fx.Int64(fx.ptrtoint(KV_cache)) if wide_index else None
+        a_div = (
+            None
+            if wide_index
+            else rocdl.make_buffer_tensor(
+                # Flat-index carrier, as in causal_conv1d's `_view`: 16 is the
+                # widest unit A copies, and the unit strides let a flat element
+                # index reach anywhere. num_records, not the layout, bounds it.
+                fx.Tensor(
+                    fx.make_view(
+                        fx.recast_iter(
+                            fx.PointerType.get(F8_IR_t, KV_cache.address_space),
+                            KV_cache,
+                        ),
+                        fx.make_layout((16, 1), (1, 1)),
+                    )
+                ),
+                max_size=False,
+                num_records_bytes=fx.Int64(kv_num_blocks) * fx.Int64(KV_ROW_ELEMS),
+            )
+        )
         gB = make_fp8_buffer_tensor(W, F8_IR_t)
-        a_div = fx.logical_divide(gA, fx.make_layout(1, 1))
         b_div = fx.logical_divide(gB, fx.make_layout(1, 1))
 
         gKVI = fx.rocdl.make_buffer_tensor(
@@ -489,14 +619,12 @@ def compile_gather_kv_b_proj_8w(
         kvi_div = fx.logical_divide(gKVI, fx.make_layout(1, 1))
 
         # Index loads must precede the first G2S load -- see wait_barrier.
-        row_bases_0 = _load_row_bases(
-            kvi_div, m_base, lane_id, wave_id, N_LDS_ROUNDS, 0
+        gl_off_a0 = _gather_a_offsets(
+            kvi_div, m_base, lane_id, wave_id, N_LDS_ROUNDS, 0, kv_base
         )
-        row_bases_1 = _load_row_bases(
-            kvi_div, m_base, lane_id, wave_id, N_LDS_ROUNDS, LDS_BLOCK_M
+        gl_off_a1 = _gather_a_offsets(
+            kvi_div, m_base, lane_id, wave_id, N_LDS_ROUNDS, LDS_BLOCK_M, kv_base
         )
-        gl_off_a0 = _gather_a_offsets(lane_id, wave_id, N_LDS_ROUNDS, row_bases_0)
-        gl_off_a1 = _gather_a_offsets(lane_id, wave_id, N_LDS_ROUNDS, row_bases_1)
         gl_off_b = compute_global_swizzle(
             lane_id, wave_id, K, N_LDS_ROUNDS, preshuffled=weight_preshuffle
         )
@@ -507,8 +635,16 @@ def compile_gather_kv_b_proj_8w(
 
         # Two A loaders: the stock kernel separates the halves via soffset, but
         # with a gather the half offset lives in the row index instead.
-        a0_g2s = G2SLoader(a_div, gl_off_a0, N_LDS_STEPS_A, F8_IR_t, wave_id)
-        a1_g2s = G2SLoader(a_div, gl_off_a1, N_LDS_STEPS_A, F8_IR_t, wave_id)
+        a0_g2s = (
+            _WideG2SLoader(gl_off_a0, N_LDS_STEPS_A, wave_id, lane_id)
+            if const_expr(wide_index)
+            else G2SLoader(a_div, gl_off_a0, N_LDS_STEPS_A, F8_IR_t, wave_id)
+        )
+        a1_g2s = (
+            _WideG2SLoader(gl_off_a1, N_LDS_STEPS_A, wave_id, lane_id)
+            if const_expr(wide_index)
+            else G2SLoader(a_div, gl_off_a1, N_LDS_STEPS_A, F8_IR_t, wave_id)
+        )
         b_g2s = G2SLoader(b_div, gl_off_b, N_LDS_STEPS_B, F8_IR_t, wave_id)
         a_s2r = S2RLoader(wave_m, N_TILES_A)
         b_s2r = S2RLoader(wave_n, N_TILES_B)
@@ -639,6 +775,7 @@ def compile_gather_kv_b_proj_8w(
             BLOCK_M,
             nope,
             n_heads,
+            kv_base,
         )
         rope.load_idx()
         store.prefetch_scales(head, wave_n * (N_TILES_B * 16))
@@ -682,7 +819,8 @@ def compile_gather_kv_b_proj_8w(
 
     @flyc.jit
     def launch_gather_kv_b_proj(
-        KV_cache: fx.Tensor,
+        KV_cache: fx.Pointer,
+        kv_num_blocks: fx.Int32,
         KV_indices: fx.Tensor,
         W: fx.Tensor,
         W_scale: fx.Tensor,
@@ -695,6 +833,7 @@ def compile_gather_kv_b_proj_8w(
         grid_x = ceildiv(m_rows, BLOCK_M) * n_heads
         kernel_gather(
             KV_cache,
+            kv_num_blocks,
             KV_indices,
             W,
             W_scale,

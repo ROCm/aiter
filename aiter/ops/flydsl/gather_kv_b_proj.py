@@ -6,6 +6,10 @@
 Supported: fp8 KV cache (OCP e4m3), fp8 weight in either row-major or
 ``shuffle_weight((16,16))`` layout, per-output-row *or* 128x128 block weight
 scale, per-tensor activation scale, page_size 1, bf16 outputs, gfx950.
+
+The cache has no size limit: up to 4 GiB it is reached through one buffer
+descriptor, beyond that through 64-bit per-lane addresses. Output width is
+bounded, though -- see ``m_rows`` in :func:`_validate`.
 """
 
 import functools
@@ -18,7 +22,7 @@ from torch import Tensor
 from aiter.jit.utils.chip_info import get_lds_capacity_bytes
 
 from .kernels.gather_gemm_8wave import compile_gather_kv_b_proj_8w
-from .kernels.tensor_shim import _run_compiled
+from .kernels.tensor_shim import _run_compiled, ptr_arg
 
 # The MLA latent layout, fixed by the model.
 KV_C_DIM = 512
@@ -28,6 +32,8 @@ KV_ROW_ELEMS = KV_C_DIM + KV_PE_DIM
 # LDS = 4 A buffers of (BM/2)x128 plus 4 B buffers of (BN/2)x128, 1 byte/elem.
 _LDS_BYTES_PER_BLOCK_UNIT = 256
 _I32_MAX = 2**31
+# num_records is a 32-bit BYTE count, so one descriptor spans at most this.
+_BUFFER_SPAN_MAX = 2**32
 
 
 def lds_bytes(block_m: int, block_n: int) -> int:
@@ -69,12 +75,8 @@ def _validate(
             f"[FlyDSL gather_kv_b_proj] BLOCK_M={block_m} needs {need} B of LDS, "
             f"limit is {have} B"
         )
-    # Every gathered address and every output index is computed in 32-bit.
-    if num_blocks is not None and num_blocks * KV_ROW_ELEMS >= _I32_MAX:
-        raise ValueError(
-            f"[FlyDSL gather_kv_b_proj] num_blocks={num_blocks} x {KV_ROW_ELEMS} "
-            f"overflows 32-bit buffer indexing"
-        )
+    # No num_blocks ceiling: past _BUFFER_SPAN_MAX the kernel addresses the
+    # cache in 64 bits per lane instead (`wide_index`).
     if m_rows is not None:
         if m_rows < 0:
             raise ValueError(
@@ -98,6 +100,7 @@ def compile_gather_kv_b_proj(
     xcd_swizzle: int,
     weight_preshuffle: bool,
     per_row_scale: bool,
+    wide_index: bool,
 ):
     """Compile (and memoize) a gather+proj launcher."""
     _validate(
@@ -116,6 +119,7 @@ def compile_gather_kv_b_proj(
         xcd_swizzle=int(xcd_swizzle),
         weight_preshuffle=bool(weight_preshuffle),
         per_row_scale=bool(per_row_scale),
+        wide_index=bool(wide_index),
     )
 
 
@@ -305,11 +309,19 @@ def gather_kv_b_proj_flydsl(
         xcd_swizzle=int(xcd_swizzle),
         weight_preshuffle=bool(weight_preshuffle),
         per_row_scale=bool(per_row_scale),
+        # This cache's own extent, as its own compile-time variant. The two
+        # measure the same, so the split is not for speed: the descriptor form
+        # keeps the hardware bounds check, which the wide form gives up.
+        wide_index=(num_blocks * KV_ROW_ELEMS >= _BUFFER_SPAN_MAX),
     )
 
+    # Local: `ptr_arg` keeps only the address, so a `.contiguous()` temporary
+    # has to outlive the launch.
+    kv_cache = k_buffer.contiguous()
     _run_compiled(
         exe,
-        _as_i8(k_buffer.contiguous()).view(-1),
+        ptr_arg(kv_cache),
+        num_blocks,
         kv_indices.contiguous().view(-1),
         _as_i8(kv_proj_weight.contiguous()).view(-1),
         scale.contiguous(),
