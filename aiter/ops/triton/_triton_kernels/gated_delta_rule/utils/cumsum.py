@@ -21,6 +21,7 @@ from aiter.ops.triton._triton_kernels.gated_delta_rule.gated_delta_rule_utils im
 from aiter.ops.triton._triton_kernels.gated_delta_rule.utils.index import (
     prepare_chunk_indices,
 )
+from aiter.ops.triton.utils.tuned_config_utils import autotune_configs
 
 BS_LIST = [32, 64] if check_shared_mem() else [16, 32]
 
@@ -32,7 +33,10 @@ BS_LIST = [32, 64] if check_shared_mem() else [16, 32]
     }
 )
 @triton.autotune(
-    configs=[triton.Config({}, num_warps=num_warps) for num_warps in [1, 2, 4, 8]],
+    configs=autotune_configs(
+        "GATED_DELTA_RULE",
+        [triton.Config({}, num_warps=num_warps) for num_warps in [1, 2, 4, 8]],
+    ),
     key=["B", "H", "BT", "IS_VARLEN", "REVERSE"],
     **autotune_cache_kwargs,
 )
@@ -95,11 +99,14 @@ def chunk_local_cumsum_scalar_kernel(
     }
 )
 @triton.autotune(
-    configs=[
-        triton.Config({"BS": BS}, num_warps=num_warps)
-        for BS in BS_LIST
-        for num_warps in [2, 4, 8]
-    ],
+    configs=autotune_configs(
+        "GATED_DELTA_RULE",
+        [
+            triton.Config({"BS": BS}, num_warps=num_warps)
+            for BS in BS_LIST
+            for num_warps in [2, 4, 8]
+        ],
+    ),
     key=["B", "H", "S", "BT", "IS_VARLEN", "REVERSE"],
     **autotune_cache_kwargs,
 )

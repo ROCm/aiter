@@ -17,7 +17,6 @@ import triton.language as tl
 
 from aiter.ops.triton._triton_kernels.chunk_delta_attn.chunk_delta_attn_utils import (
     autotune_cache_kwargs,
-    chunk_delta_attn_autotune_configs,
     chunk_delta_attn_tuned_config,
     exp,
     exp2,
@@ -26,6 +25,7 @@ from aiter.ops.triton._triton_kernels.chunk_delta_attn.chunk_delta_attn_utils im
 from aiter.ops.triton._triton_kernels.chunk_delta_attn.utils.index import (
     prepare_chunk_indices,
 )
+from aiter.ops.triton.utils.tuned_config_utils import autotune_configs
 
 # The BV=128 / num_stages=3 tile this kernel came with wants up to 123KB of LDS,
 # which a 64KB device (gfx942, gfx90a) cannot launch at all. Unpipelined, this one
@@ -41,7 +41,8 @@ _FALLBACK_O_CONFIG = triton.Config({"BK": 64, "BV": 64}, num_warps=4, num_stages
     }
 )
 @triton.autotune(
-    configs=chunk_delta_attn_autotune_configs(
+    configs=autotune_configs(
+        "CHUNK_DELTA_ATTN",
         [
             triton.Config({"BK": BK, "BV": BV}, num_warps=nw, num_stages=ns)
             for BK in [32, 64]
