@@ -89,100 +89,90 @@ def wait_barrier(count):
     )
 
 
-class G2SLoader:
-    def __init__(self, gl_src, gl_offsets, n_load_steps, lds_dtype, wave_id):
-        self.g2lds_atom = fx.make_copy_atom(fx.rocdl.BufferCopyLDS128b(), 128)
-        self.LdsPtr_t = fx.PointerType.get(lds_dtype, 2, 512)
-        self.gl_src = gl_src
-        self.gl_offsets = gl_offsets
-        self.n_load_steps = n_load_steps
-        self.wave_id = wave_id
-        self.n_waves = fx.block_dim.x // 64
+def make_g2s_loader(gl_src, gl_offsets, n_load_steps, lds_dtype, wave_id):
+    """Create the original per-step DMA loader with cache-visible emission code."""
 
-    def _lds_dst_at(self, lds_dst, step):
-        step_off = self.wave_id * 1024 + step * (self.n_waves * 1024)
-        base_i32 = fx.Int32(fx.ptrtoint(lds_dst.ptr))
-        sum_i32 = base_i32 + fx.Int32(step_off)
-        lds_ptr = fx.inttoptr(self.LdsPtr_t, sum_i32)
-        return fx.make_view(lds_ptr, fx.make_layout(1, 1))
+    class G2SLoader:
+        def __init__(self):
+            self.g2lds_atom = fx.make_copy_atom(fx.rocdl.BufferCopyLDS128b(), 128)
+            self.LdsPtr_t = fx.PointerType.get(lds_dtype, 2, 512)
+            self.gl_src = gl_src
+            self.gl_offsets = gl_offsets
+            self.n_load_steps = n_load_steps
+            self.wave_id = wave_id
+            self.n_waves = fx.block_dim.x // 64
 
-    def load(self, lds_dst, k_offset):
-        offsets = fx.make_rmem_tensor((self.n_load_steps,), fx.Int32)
-        for step in range_constexpr(self.n_load_steps):
-            offsets[step] = fx.Int32(self.gl_offsets[step])
-        # Routed A rows need an indexed copy. The DMA applies the lane offset
-        # implicitly; this view describes only the wave bases for each step.
-        dst = fx.make_view(
-            fx.get_iter(self._lds_dst_at(lds_dst, 0)),
-            fx.make_layout((1, self.n_load_steps), (0, self.n_waves * 1024)),
-        )
-        atom = self.g2lds_atom.set_value("soffset", fx.Int32(k_offset))
-        fx.gather(atom, fx.get_iter(self.gl_src), offsets, dst)
+        def _lds_dst_at(self, lds_dst, step):
+            step_off = self.wave_id * 1024 + step * (self.n_waves * 1024)
+            base_i32 = fx.Int32(fx.ptrtoint(lds_dst.ptr))
+            sum_i32 = base_i32 + fx.Int32(step_off)
+            lds_ptr = fx.inttoptr(self.LdsPtr_t, sum_i32)
+            return fx.make_view(lds_ptr, fx.make_layout(1, 1))
 
-    def load_one(self, lds_dst, k_offset, step):
-        src = fx.slice(self.gl_src, (None, fx.Int32(self.gl_offsets[step])))
-        dst = self._lds_dst_at(lds_dst, step)
-        fx.copy(self.g2lds_atom, src, dst, soffset=fx.Int32(k_offset))
+        def load(self, lds_dst, k_offset):
+            for step in range_constexpr(self.n_load_steps):
+                src = fx.slice(self.gl_src, (None, fx.Int32(self.gl_offsets[step])))
+                dst = self._lds_dst_at(lds_dst, step)
+                fx.copy(self.g2lds_atom, src, dst, soffset=fx.Int32(k_offset))
+
+        def load_one(self, lds_dst, k_offset, step):
+            src = fx.slice(self.gl_src, (None, fx.Int32(self.gl_offsets[step])))
+            dst = self._lds_dst_at(lds_dst, step)
+            fx.copy(self.g2lds_atom, src, dst, soffset=fx.Int32(k_offset))
+
+    return G2SLoader()
 
 
-class S2RLoader:
-    """Load a wave's 16x128 MMA tiles through a 128-bit tiled copy."""
+def make_s2r_loader(wave_idx, n_tiles, *, packed_fp4=False):
+    """Preserve FP8 register loads and use the same addressing helpers for FP4."""
 
-    def __init__(self, wave_idx, n_tiles, *, packed_fp4=False):
-        self.lane_id = fx.thread_idx.x % 64
-        self.wave_idx = wave_idx
-        self.n_tiles = n_tiles
-        self.packed_fp4 = packed_fp4
-        self.copy_atom = fx.make_copy_atom(fx.UniversalCopy(128), fx.Uint8)
-        # Sixteen lanes cover rows; four lane groups cover K. FP4 has half
-        # as many bytes per lane, while preserving the same logical MMA tile.
-        tiled_copy = fx.make_tiled_copy_tv(
-            self.copy_atom,
-            fx.make_layout((16, 4), (1, 16)),
-            fx.make_layout((1, 16 if packed_fp4 else 32), (0, 1)),
-        )
-        self.thr_copy = tiled_copy.get_slice(self.lane_id)
+    class S2RLoader:
+        def __init__(self):
+            self.lane_id = fx.thread_idx.x % 64
+            self.wave_idx = wave_idx
+            self.n_tiles = n_tiles
 
-    def _vec_load_16xf8(self, lds_src, offset):
-        off_tup = fx.make_int_tuple(offset)
-        ptr_off = fx.add_offset(lds_src.ptr, off_tup)
-        i8_iter = fx.recast_iter(fx.Uint8, ptr_off)
-        view = fx.make_view(i8_iter, fx.make_layout(16, 1))
-        return view.load()
+        def _vec_load_16xf8(self, lds_src, offset):
+            off_tup = fx.make_int_tuple(offset)
+            ptr_off = fx.add_offset(lds_src.ptr, off_tup)
+            i8_iter = fx.recast_iter(fx.Uint8, ptr_off)
+            view = fx.make_view(i8_iter, fx.make_layout(16, 1))
+            return view.load()
 
-    def load(self, lds_src, preshuffled=False):
-        rows = self.n_tiles * 16
-        if const_expr(self.packed_fp4):
-            assert preshuffled, "packed FP4 requires preshuffled weights"
-            offset = self.wave_idx * rows * 64
-            layout = fx.make_layout(((16, rows // 16), (16, 4)), ((16, 1024), (1, 256)))
-        elif const_expr(preshuffled):
-            offset = self.wave_idx * rows * 128
-            layout = fx.make_layout(
-                ((8, rows // 8), (16, 2, 4)), ((16, 1024), (1, 512, 128))
-            )
-        else:
-            offset = self.wave_idx * rows * 128
-            layout = fx.make_composed_layout(
-                fx.static(fx.SwizzleType.get(3, 4, 4)),
-                fx.make_layout((rows, (16, 2, 4)), (128, (1, 64, 16))),
-            )
-        # The split K mode retains the existing two 16-byte halves per FP8
-        # lane. The wave base is a multiple of 2048 bytes, outside the XOR.
-        ptr = fx.recast_iter(
-            fx.Uint8, fx.add_offset(lds_src.ptr, fx.make_int_tuple(offset))
-        )
-        src = self.thr_copy.partition_S(fx.make_view(ptr, layout))
-        frag = fx.make_fragment_like(src)
-        fx.copy(self.copy_atom, src, frag)
-        return [
-            fx.slice(frag, (None, i, 0)).load().bitcast(fx.Int32)
-            for i in range_constexpr(self.n_tiles)
-        ]
+        def load(self, lds_src, preshuffled=False):
+            if const_expr(packed_fp4):
+                assert preshuffled, "packed FP4 requires preshuffled weights"
+                fragments = []
+                for i in range_constexpr(self.n_tiles):
+                    row = (
+                        self.wave_idx * (self.n_tiles * 16) + i * 16 + self.lane_id % 16
+                    )
+                    offset = row // 16 * 1024 + row % 16 * 16 + self.lane_id // 16 * 256
+                    fragments.append(
+                        self._vec_load_16xf8(lds_src, offset).bitcast(fx.Int32)
+                    )
+                return fragments
+            frag = []
+            for i in range_constexpr(self.n_tiles):
+                halves = []
+                row = self.wave_idx * (self.n_tiles * 16) + i * 16 + self.lane_id % 16
+                for step in range_constexpr(2):
+                    col = (self.lane_id // 16) * 16 + step * 64
+                    if const_expr(preshuffled):
+                        offset = (row // 8) * 1024 + (row % 8) * 16 + (col // 16) * 128
+                    else:
+                        row_swz, col_swz = swizzle_128(row, col)
+                        offset = row_swz * 128 + col_swz
+                    v = self._vec_load_16xf8(lds_src, offset)
+                    halves.append(v.bitcast(fx.Int32))
+                frag.append(pack_i32x4_i32x8(halves[0], halves[1]))
+            return frag
 
-    def load_one(self, lds_src, lds_offset):
-        v = self._vec_load_16xf8(lds_src, lds_offset)
-        return v.bitcast(fx.Int32)
+        def load_one(self, lds_src, lds_offset):
+            v = self._vec_load_16xf8(lds_src, lds_offset)
+            return v.bitcast(fx.Int32)
+
+    return S2RLoader()
 
 
 class StoreC:
@@ -599,10 +589,10 @@ def compile_fp8_gemm_8w(
 
         mfma = Mfma16x16x128(N_TILES_A, N_TILES_B)
 
-        a_g2s = G2SLoader(a_div, gl_off_a, N_LDS_STEPS_A, F8_IR_t, wave_id)
-        b_g2s = G2SLoader(b_div, gl_off_b, N_LDS_STEPS_B, F8_IR_t, wave_id)
-        a_s2r = S2RLoader(wave_m, N_TILES_A)
-        b_s2r = S2RLoader(wave_n, N_TILES_B)
+        a_g2s = make_g2s_loader(a_div, gl_off_a, N_LDS_STEPS_A, F8_IR_t, wave_id)
+        b_g2s = make_g2s_loader(b_div, gl_off_b, N_LDS_STEPS_B, F8_IR_t, wave_id)
+        a_s2r = make_s2r_loader(wave_m, N_TILES_A)
+        b_s2r = make_s2r_loader(wave_n, N_TILES_B)
         store_c = StoreC(A_scale, B_scale, C, c_m, c_n, mfma.idx, N_TILES_A, N_TILES_B)
 
         b_g2s.load(lds.B_lds_cur_0, B0_gl_offset)

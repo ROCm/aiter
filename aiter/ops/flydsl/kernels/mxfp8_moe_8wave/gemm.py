@@ -10,12 +10,12 @@ from flydsl.expr.typing import Vector as Vec
 from flydsl.runtime.device import get_rocm_arch
 
 from ..gemm_a8w8_8wave import (
-    G2SLoader,
-    S2RLoader,
     _xcd_swizzle_any,
     ceildiv,
     compute_global_swizzle,
     make_fp8_buffer_tensor,
+    make_g2s_loader,
+    make_s2r_loader,
     run_8wave_pipeline,
 )
 from ..kernels_common import get_warp_size
@@ -262,6 +262,7 @@ def compile_mxfp8_gemm_8w(
     K_ITERS = logical_k // BLOCK_K
     # FlyDSL 0.3.2 tracks cross-directory helpers captured by the kernel closure.
     pipeline = run_8wave_pipeline
+    make_g2s, make_s2r = make_g2s_loader, make_s2r_loader
     # Scale words are addressed by K-pair, so K must contain a whole number of
     # them (K % 256 above already guarantees it).
 
@@ -393,11 +394,11 @@ def compile_mxfp8_gemm_8w(
 
             mfma = MxMfma(N_TILES_A, N_TILES_B, b_dtype)
 
-            a_g2s = G2SLoader(a_div, gl_off_a, N_LDS_STEPS_A, F8_IR_t, wave_id)
-            a1_g2s = G2SLoader(a_div, gl_off_a1, N_LDS_STEPS_A, F8_IR_t, wave_id)
-            b_g2s = G2SLoader(b_div, gl_off_b, N_LDS_STEPS_B, F8_IR_t, wave_id)
-            a_s2r = S2RLoader(wave_m, N_TILES_A)
-            b_s2r = S2RLoader(wave_n, N_TILES_B, packed_fp4=b_dtype == "fp4")
+            a_g2s = make_g2s(a_div, gl_off_a, N_LDS_STEPS_A, F8_IR_t, wave_id)
+            a1_g2s = make_g2s(a_div, gl_off_a1, N_LDS_STEPS_A, F8_IR_t, wave_id)
+            b_g2s = make_g2s(b_div, gl_off_b, N_LDS_STEPS_B, F8_IR_t, wave_id)
+            a_s2r = make_s2r(wave_m, N_TILES_A)
+            b_s2r = make_s2r(wave_n, N_TILES_B, packed_fp4=b_dtype == "fp4")
             scratch = [
                 a_cur0.ptr,
                 a_cur1.ptr,
