@@ -457,9 +457,7 @@ def _apply_a4_tuning(
                 stage1_patch["grid_mult"] = 2
             config = _replace_config(config, stage1=stage1_patch)
         elif bucket == 16384:
-            config = _replace_config(
-                config, stage1={"payload_chunk_rows": 1536}
-            )
+            config = _replace_config(config, stage1={"payload_chunk_rows": 1536})
         elif bucket == 32768:
             config = _replace_config(
                 config,
@@ -619,11 +617,7 @@ def select_mega_moe_config(
             config,
             stage2={"aligned_pair": False, "pair_cu": 0},
         )
-    if (
-        a_dtype == ACTIVATION_FP4
-        and bucket <= 128
-        and config.stage1.async_a_copy
-    ):
+    if a_dtype == ACTIVATION_FP4 and bucket <= 128 and config.stage1.async_a_copy:
         # FP4 halves each A K-step. SBM64 keeps at least one 16-byte async
         # copy per thread in the eight-wave Stage1 configuration.
         config = replace(
@@ -632,9 +626,7 @@ def select_mega_moe_config(
         )
     if p2p_quant == P2P_QUANT_AUTO:
         desired_p2p = (
-            P2P_QUANT_FP8_BLOCKWISE
-            if mtpr >= P2P_FP8_MIN_MTPR
-            else config.p2p_quant
+            P2P_QUANT_FP8_BLOCKWISE if mtpr >= P2P_FP8_MIN_MTPR else config.p2p_quant
         )
     else:
         desired_p2p = p2p_quant

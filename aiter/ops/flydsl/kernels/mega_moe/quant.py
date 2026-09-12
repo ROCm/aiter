@@ -84,9 +84,9 @@ def emit_per_1x32_mx_fp4_group(in_buf, out_buf, scale_buf, group_id):
         for elem in range_constexpr(8):
             act.append(values[elem])
 
-    working = (
-        local_max * fx.Int32(_FP4_INV_MAX_POS_BITS).bitcast(fx.Float32)
-    ).bitcast(fx.Int32)
+    working = (local_max * fx.Int32(_FP4_INV_MAX_POS_BITS).bitcast(fx.Float32)).bitcast(
+        fx.Int32
+    )
     mantissa = working & fx.Int32(0x7FFFFF)
     biased_exp = (working >> fx.Int32(23)) & fx.Int32(0xFF)
     e8m0 = (mantissa != fx.Int32(0)).select(biased_exp + fx.Int32(1), biased_exp)
@@ -130,9 +130,7 @@ def build_per_1x32_mx_quant_module(n: int, quant_mode: str):
         group_id = fx.block_idx.x * fx.Int32(BLOCK) + fx.thread_idx.x
         if group_id < m * fx.Int32(scale_n):
             if const_expr(need_fp4):
-                emit_per_1x32_mx_fp4_group(
-                    in_buf, out_buf, scale_buf, group_id
-                )
+                emit_per_1x32_mx_fp4_group(in_buf, out_buf, scale_buf, group_id)
             else:
                 emit_per_1x32_mx_fp8_group(in_buf, out_buf, scale_buf, group_id)
 

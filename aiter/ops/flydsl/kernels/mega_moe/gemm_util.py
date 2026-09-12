@@ -95,10 +95,7 @@ class ATileLoader:
             assert total_threads % 64 == 0
             total_chunks = sort_block_m * (k_step_bytes // 16)
             assert total_chunks % 64 == 0
-            assert (
-                total_chunks < total_threads
-                or total_chunks % total_threads == 0
-            )
+            assert total_chunks < total_threads or total_chunks % total_threads == 0
             assert row_bytes % 16 == 0 and k_step_bytes % 16 == 0
             self._dma_atom = fx.make_copy_atom(
                 fx.rocdl.BufferCopyLDS128b(),
@@ -222,6 +219,7 @@ class ATileLoader:
                 if const_expr(total_chunks < self._total_threads)
                 else fx.Boolean(True)
             )
+
             @flyc.jit
             def issue_copy(active):
                 if active:

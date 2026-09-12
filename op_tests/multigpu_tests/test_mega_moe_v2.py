@@ -132,12 +132,10 @@ def _make_inputs(
     )
     if routing_mode == "zipf":
         order_generator = torch.Generator(device=device).manual_seed(seed + 19001)
-        permutation = torch.randperm(
-            experts, device=device, generator=order_generator
+        permutation = torch.randperm(experts, device=device, generator=order_generator)
+        ranked = torch.arange(1, experts + 1, dtype=torch.float32, device=device).pow(
+            -float(zipf_alpha)
         )
-        ranked = torch.arange(
-            1, experts + 1, dtype=torch.float32, device=device
-        ).pow(-float(zipf_alpha))
         probabilities = torch.empty_like(ranked)
         probabilities[permutation] = ranked
         uniform = torch.rand(
