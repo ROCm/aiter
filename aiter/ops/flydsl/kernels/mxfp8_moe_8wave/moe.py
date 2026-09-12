@@ -22,6 +22,27 @@ from flydsl.expr.typing import Vector as Vec
 from .gemm import compile_mxfp8_gemm_8w
 
 
+def _mxfp8_exponent(amax_bits):
+    # BF16 mantissa 96 is 1.75; ceil(log2(amax / 448)), clamped at 1e-30.
+    return fx.max((amax_bits >> 7) - 8 + ((amax_bits & 127) > 96).to(fx.Int32), 19)
+
+
+def _pack_fp8x8(values, scale):
+    words = []
+    for word in range_constexpr(2):
+        packed = Vec.filled(2, 0, fx.Int16)
+        for half in range_constexpr(2):
+            base = word * 4 + half * 2
+            pair = Vec.from_elements([values[base], values[base + 1]], fx.BFloat16)
+            packed = Vec(
+                rocdl.cvt_scalef32_pk_fp8_bf16(
+                    T.i16x2, packed.ir_value(), pair.ir_value(), scale.ir_value(), half
+                )
+            )
+        words.append(packed.bitcast(fx.Int32)[0])
+    return Vec.from_elements(words, fx.Int32)
+
+
 def _store_factory(
     *,
     activation=False,
@@ -29,6 +50,7 @@ def _store_factory(
     mask_n=False,
     swiglu_limit=7.0,
     activation_type="swiglu",
+    fuse_quant=False,
 ):
     def factory(C, rows, cols, idx, n_tiles_a, n_tiles_b, scratch):
         cols = cols // 2 if activation else cols
@@ -38,18 +60,80 @@ def _store_factory(
         wave = fx.thread_idx.x // 64
         # SharedAllocator fields are independent LDS globals, not one contiguous array.
         base = fx.Int32(fx.ptrtoint(scratch[0]))
+        # Each N wave produces 16 activation columns; adjacent waves share a
+        # 32-column quantization group and one LDS field.
+        owner = wave & -2 if fuse_quant else wave
         for i in range_constexpr(1, 8):
-            base = (wave == i).select(fx.Int32(fx.ptrtoint(scratch[i])), base)
+            base = (owner == i).select(fx.Int32(fx.ptrtoint(scratch[i])), base)
         ptr = fx.recast_iter(fx.BFloat16, fx.inttoptr(scratch[0].type, base))
-        out = fx.rocdl.make_buffer_tensor(
-            C, max_size=False, num_records_bytes=fx.Int64(rows) * cols * 2
+        kp = (cols + 255) // 256 * 256
+        records = (
+            fx.Int64(rows) * (kp + kp // 32)
+            if fuse_quant
+            else fx.Int64(rows) * cols * 2
         )
-        out = fx.logical_divide(out, fx.make_layout(8, 1))
-        atom = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), fx.BFloat16)
+        out = fx.rocdl.make_buffer_tensor(C, max_size=False, num_records_bytes=records)
+        scales = out
+        out = fx.logical_divide(out, fx.make_layout(16 if fuse_quant else 8, 1))
+        atom = fx.make_copy_atom(
+            fx.rocdl.BufferCopy128b(), fx.Int8 if fuse_quant else fx.BFloat16
+        )
+        scratch_n = tile_n * 2 if fuse_quant else tile_n
 
         def scratch_at(row, col, width):
-            offset = row * tile_n + (col ^ ((row % (tile_n // 8)) * 8))
+            offset = row * scratch_n + (col ^ ((row % (scratch_n // 8)) * 8))
             return fx.make_view(ptr + offset, fx.make_layout(width, 1))
+
+        def store_scale(row, kg, exponent, valid):
+            scale_index = (
+                (row // 32 * (kp // 256) + kg // 8) * 64 + kg % 4 * 16 + row % 16
+            ) * 4
+            scale_index += kg // 4 % 2 * 2 + row // 16 % 2
+            scales[valid.select(rows * kp + scale_index, fx.Int32(-1))] = exponent.to(
+                fx.Int8
+            )
+
+        def quant_store(base_row, base_col):
+            # Two lanes own one group, each loading and storing 16 values.
+            row = lane // 2 + wave % 2 * 32
+            col = lane % 2 * 16
+            group_col = base_col - wave % 2 * 16
+            values = [
+                scratch_at(row, col + chunk * 8, 8).load()
+                for chunk in range_constexpr(2)
+            ]
+            amax_bits = fx.Int32(0)
+            for chunk in range_constexpr(2):
+                bits = (
+                    (values[chunk].bitcast(fx.Int16) & 0x7FFF)
+                    .reduce(ReductionOp.MAX)
+                    .to(fx.Int32)
+                )
+                amax_bits = fx.max(amax_bits, bits)
+            amax_bits = fx.max(amax_bits, amax_bits.shuffle_xor(1, 64))
+            exponent = _mxfp8_exponent(amax_bits)
+            scale = (exponent << 23).bitcast(fx.Float32)
+            words = []
+            for chunk in range_constexpr(2):
+                packed = _pack_fp8x8(values[chunk], scale)
+                words.extend([packed[0], packed[1]])
+            reg = fx.make_rmem_tensor(16, fx.Int8)
+            reg.store(Vec.from_elements(words, fx.Int32).bitcast(fx.Int8))
+            offset = (base_row + row) * kp + group_col + col
+            fx.copy(atom, reg, fx.slice(out, (None, offset >> 4)))
+            store_scale(base_row + row, group_col // 32, exponent, lane % 2 == 0)
+            # The final 128-column output tile also clears the K256 padding.
+            pad = (kp != cols) & (group_col >= cols - 128)
+            reg.store(Vec.filled(16, 0, fx.Int8))
+            pad_offset = pad.select(offset + 128, fx.Int32(-16))
+            fx.copy(atom, reg, fx.slice(out, (None, pad_offset >> 4)))
+            store_scale(
+                base_row + row,
+                (group_col + 128) // 32,
+                fx.Int32(19),
+                pad & (lane % 2 == 0),
+            )
+            rocdl.s_barrier()
 
         def store(c_frag, base_row, base_col):
             for ti in range_constexpr(n_tiles_a):
@@ -84,13 +168,17 @@ def _store_factory(
                                     )
                                 else:
                                     v = gate / (1.0 + fmath.exp(-gate)) * linear
-                            scratch_at(row + i, col, 1).store(
+                            scratch_col = col + wave % 2 * tile_n if fuse_quant else col
+                            scratch_at(row + i, scratch_col, 1).store(
                                 Vec.filled(1, v.to(fx.BFloat16), fx.BFloat16)
                             )
             rocdl.s_waitcnt(lgkmcnt=0)
             if const_expr(activation):
                 base_col = base_col // 2
-            if const_expr(transpose):
+            if const_expr(fuse_quant):
+                rocdl.s_barrier()
+                quant_store(base_row, base_col)
+            elif const_expr(transpose):
                 for step in range_constexpr(tile_m * tile_n // (64 * 32)):
                     linear = lane * 32 + step * 64 * 32
                     row, col = linear // (tile_n * 4) * 4, linear // 4 % tile_n
@@ -139,17 +227,22 @@ def compile_mxfp8_moe_gemm_8w(
     activation=True,
     activation_type="swiglu",
     b_dtype="fp8",
+    fuse_quant=False,
 ):
     """Return a grouped launcher with FP8 activations and FP8 or packed FP4 weights.
 
     Stage 1 fuses clamped SwiGLU or standard SiLU, selected by activation_type.
     A None swiglu_limit uses 7 for SwiGLU and disables clamping for SiLU.
+    With fuse_quant, stage 1 writes FP8 data followed by E8M0 scales in one
+    byte buffer; both use K padded to 256. BF16 activation rounding is retained.
 
-    Arguments: A, packed B, BF16 C, shuffled A/B scales, expert_ids, row_map,
+    Arguments: A, packed B, C, shuffled A/B scales, expert_ids, row_map,
     padded_rows, projection_N, stream. Both padded_rows and projection_N must
     be multiples of 256. Row maps use -1 for padding; initialize padded A scale
-    rows to 127 before quantizing with ``scatter_scale_topk``.
+    rows to 127 before quantizing with ``scatter_scale_topk``. C is BF16 unless
+    fuse_quant selects the combined FP8/E8M0 byte buffer described above.
     """
+    assert not fuse_quant or (stage == 1 and activation and tile_m == tile_n == 256)
     if stage not in (1, 2):
         raise ValueError(f"stage must be 1 or 2, got {stage}")
     if activation_type not in ("swiglu", "silu"):
@@ -175,6 +268,7 @@ def compile_mxfp8_moe_gemm_8w(
             mask_n=tile_n == 512,
             swiglu_limit=swiglu_limit,
             activation_type=activation_type,
+            fuse_quant=fuse_quant,
         ),
     )
 

@@ -4,8 +4,9 @@
 
 Uses the existing G1U1 16x64 weight packing and E8M0 scale layout. Workspace
 bounds come from tensor shapes; the valid sorted row count stays on the GPU.
-Stage 1 returns sorted FP8 activations and scales; stage 2 reduces sorted BF16
-partials in FP32. A8W4 names select packed E2M1 weights and standard SiLU.
+Stage 1 returns sorted FP8 activations and scales; the A8W4 256x256 path fuses
+its output quantization. Stage 2 reduces sorted BF16 partials in FP32.
+A8W4 names select packed E2M1 weights and standard SiLU.
 Neither weight repacking nor host row-count readback is needed. A8W4 remains
 opt-in: the existing DSV4 tuned kernels remain the default.
 """
@@ -135,27 +136,66 @@ def stage1(
     inter = w2.shape[-1] * (2 if params["b_dtype"] == "fp4" else 1)
     rows, row_map, inverse = _routes(sorted_ids, num_valid_ids, tokens, topk)
     device = hidden_states.device
-    aq = torch.empty((tokens, hidden), dtype=torch.int8, device=device)
-    sa = torch.full((rows, hidden // 32), 127, dtype=torch.uint8, device=device)
-    act = torch.empty((rows, inter), dtype=torch.bfloat16, device=device)
+    fuse_quant = params["b_dtype"] == "fp4" and params["tile_m"] == 256
     kp = (inter + 255) // 256 * 256
-    aq2 = torch.empty((rows, kp), dtype=torch.int8, device=device)
-    sa2 = torch.empty((rows, kp // 32), dtype=torch.uint8, device=device)
+    if params["b_dtype"] == "fp4" and os.environ.get("COMPILE_ONLY") != "1":
+        from aiter.ops.quant import mxfp4_moe_sort_hip, per_1x32_mx_quant_hip
+
+        aq, scale_per_token = per_1x32_mx_quant_hip(
+            hidden_states,
+            quant_dtype=torch.float8_e4m3fn,
+            scale_type=torch.float8_e8m0fnu,
+            shuffle=False,
+        )
+        # The scale sort writes only routed tokens. Padded expert rows still
+        # participate in GEMM, so their zero activations need finite scales.
+        sa = torch.full((rows, hidden // 32), 127, dtype=torch.uint8, device=device)
+        mxfp4_moe_sort_hip(
+            sa.view(torch.float8_e8m0fnu),
+            scale_per_token,
+            sorted_ids,
+            num_valid_ids,
+            tokens,
+            hidden,
+        )
+    else:
+        aq = torch.empty((tokens, hidden), dtype=torch.int8, device=device)
+        sa = torch.full((rows, hidden // 32), 127, dtype=torch.uint8, device=device)
+        if params["b_dtype"] == "fp8":
+            _run(
+                "quant",
+                (
+                    hidden_states.view(-1),
+                    aq.view(-1),
+                    sa.view(-1),
+                    inverse,
+                    tokens,
+                    _stream(),
+                ),
+                K=hidden,
+                gather=False,
+                scatter_scale_topk=topk,
+            )
+    if fuse_quant:
+        packed_output = torch.empty(
+            rows * (kp + kp // 32), dtype=torch.int8, device=device
+        )
+        aq2 = packed_output[: rows * kp].view(rows, kp)
+        sa2 = packed_output[rows * kp :].view(rows, kp // 32).view(torch.uint8)
+        gemm_output = packed_output
+    else:
+        act = torch.empty((rows, inter), dtype=torch.bfloat16, device=device)
+        aq2 = torch.empty((rows, kp), dtype=torch.int8, device=device)
+        sa2 = torch.empty((rows, kp // 32), dtype=torch.uint8, device=device)
+        gemm_output = act.view(-1)
     stream = _stream()
-    _run(
-        "quant",
-        (hidden_states.view(-1), aq.view(-1), sa.view(-1), inverse, tokens, stream),
-        K=hidden,
-        gather=False,
-        scatter_scale_topk=topk,
-    )
     _run(
         "gemm",
         (
-            aq.view(-1),
+            _bytes(aq),
             _bytes(w1),
-            act.view(-1),
-            sa.view(-1),
+            gemm_output,
+            _bytes(sa),
             _bytes(w1_scale),
             sorted_expert_ids,
             row_map,
@@ -175,22 +215,24 @@ def stage1(
         activation_type=params["activation_type"],
         b_dtype=params["b_dtype"],
         expert_block_m=block_m,
+        fuse_quant=fuse_quant,
     )
-    _run(
-        "quant",
-        (
-            act.view(-1),
-            aq2.view(-1),
-            sa2.view(-1),
-            row_map,
-            rows,
-            num_valid_ids,
-            stream,
-        ),
-        K=inter,
-        gather=False,
-        dynamic_rows=True,
-    )
+    if not fuse_quant:
+        _run(
+            "quant",
+            (
+                act.view(-1),
+                aq2.view(-1),
+                sa2.view(-1),
+                row_map,
+                rows,
+                num_valid_ids,
+                stream,
+            ),
+            K=inter,
+            gather=False,
+            dynamic_rows=True,
+        )
     return aq2, sa2
 
 
