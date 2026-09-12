@@ -273,6 +273,79 @@ def compile_mxfp8_moe_gemm_8w(
     )
 
 
+def compile_mxfp8_moe_sort_input_scale(*, K: int, topk: int):
+    """Sort per-token E8M0 bytes and unpack routes in one pass.
+
+    Source scales use unshuffled [tokens, K // 32] bytes. Output uses the
+    GEMM shuffled layout, viewed as int32 for coalesced stores. Padding scales
+    are 127 and padding row-map entries are -1. Rows and the GPU valid count
+    must be padded to 32; rows beyond the valid count remain untouched.
+    """
+    groups = K // 32
+    assert K > 0 and K % 256 == 0 and topk > 0
+
+    @flyc.kernel(name=f"mxfp8_moe_sort_input_scale_k{K}", known_block_size=[256, 1, 1])
+    def kernel(
+        source: fx.Tensor,
+        output: fx.Tensor,
+        ids: fx.Tensor,
+        row_map: fx.Tensor,
+        valid_rows: fx.Tensor,
+        tokens: fx.Int32,
+    ):
+        lane = fx.thread_idx.x % 64
+        wave = fx.thread_idx.x // 64
+        row = fx.block_idx.x * 32 + lane % 32
+        kg_base = wave * 8
+        if row < valid_rows[0]:
+            src = fx.logical_divide(
+                fx.rocdl.make_buffer_tensor(source, max_size=False),
+                fx.make_layout(4, 1),
+            )
+            load = fx.make_copy_atom(rocdl.BufferCopy32b(), fx.Uint8)
+            a = ids[row]
+            ta = a & 0xFFFFFF
+            valid = (ta < tokens) & (((a >> 24) & 0xFF) < topk)
+            for step in range_constexpr((groups + 31) // 32):
+                kg = kg_base + step * 32
+                if kg < groups:
+                    index = valid.select(
+                        (ta * groups + kg + lane // 32 * 4) // 4, fx.Int32(-1)
+                    )
+                    reg = fx.make_rmem_tensor(4, fx.Uint8)
+                    fx.copy(load, fx.slice(src, (None, index)), reg)
+                    # Each lane loads four adjacent scales for one row.
+                    # The wave then transposes them into the four-byte shuffled
+                    # word: [row, row+16] x [group, group+4].
+                    value = valid.select(reg.load().bitcast(fx.Int32)[0], 0x7F7F7F7F)
+                    shift = lane // 16 * 8
+                    s0 = (fx.gpu.shuffle_idx(value, lane % 16, 64) >> shift) & 255
+                    s1 = (fx.gpu.shuffle_idx(value, lane % 16 + 16, 64) >> shift) & 255
+                    s2 = (fx.gpu.shuffle_idx(value, lane % 16 + 32, 64) >> shift) & 255
+                    s3 = (fx.gpu.shuffle_idx(value, lane % 16 + 48, 64) >> shift) & 255
+                    word = fx.block_idx.x * groups * 8 + fx.thread_idx.x + step * 256
+                    output[word] = s0 | (s1 << 8) | (s2 << 16) | (s3 << 24)
+            if fx.thread_idx.x < 32:
+                row_map[row] = valid.select(ta, fx.Int32(-1))
+
+    @flyc.jit
+    def launch(
+        source: fx.Tensor,
+        output: fx.Tensor,
+        ids: fx.Tensor,
+        row_map: fx.Tensor,
+        valid_rows: fx.Tensor,
+        tokens: fx.Int32,
+        rows: fx.Int32,
+        stream: fx.Stream,
+    ):
+        kernel(source, output, ids, row_map, valid_rows, tokens).launch(
+            grid=((rows + 31) // 32, 1, 1), block=(256, 1, 1), stream=stream
+        )
+
+    return launch
+
+
 def compile_mxfp8_moe_quant(
     *, K: int, gather: bool, scatter_scale_topk: int = 0, dynamic_rows=False
 ):

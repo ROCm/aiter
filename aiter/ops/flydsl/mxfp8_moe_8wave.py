@@ -57,6 +57,7 @@ def _builder(kind, **kwargs):
         compile_mxfp8_moe_gemm_8w,
         compile_mxfp8_moe_quant,
         compile_mxfp8_moe_reduce,
+        compile_mxfp8_moe_sort_input_scale,
         compile_mxfp8_moe_unpack_routes,
     )
 
@@ -64,6 +65,7 @@ def _builder(kind, **kwargs):
         "gemm": compile_mxfp8_moe_gemm_8w,
         "quant": compile_mxfp8_moe_quant,
         "reduce": compile_mxfp8_moe_reduce,
+        "sort_scale": compile_mxfp8_moe_sort_input_scale,
         "routes": compile_mxfp8_moe_unpack_routes,
     }[kind](**kwargs)
 
@@ -134,48 +136,60 @@ def stage1(
         )
     tokens, hidden = hidden_states.shape
     inter = w2.shape[-1] * (2 if params["b_dtype"] == "fp4" else 1)
-    rows, row_map, inverse = _routes(sorted_ids, num_valid_ids, tokens, topk)
     device = hidden_states.device
     fuse_quant = params["b_dtype"] == "fp4" and params["tile_m"] == 256
     kp = (inter + 255) // 256 * 256
-    if params["b_dtype"] == "fp4" and os.environ.get("COMPILE_ONLY") != "1":
-        from aiter.ops.quant import mxfp4_moe_sort_hip, per_1x32_mx_quant_hip
+    if params["b_dtype"] == "fp4":
+        rows = (sorted_ids.numel() + 255) // 256 * 256
+        row_map = torch.empty(rows, dtype=torch.int32, device=device)
+        sa = torch.empty((rows, hidden // 32), dtype=torch.uint8, device=device)
+        if os.environ.get("COMPILE_ONLY") == "1":
+            aq = torch.empty((tokens, hidden), dtype=torch.int8, device=device)
+            scale_per_token = torch.empty(
+                (tokens, hidden // 32), dtype=torch.uint8, device=device
+            )
+        else:
+            from aiter.ops.quant import per_1x32_mx_quant_hip
 
-        aq, scale_per_token = per_1x32_mx_quant_hip(
-            hidden_states,
-            quant_dtype=torch.float8_e4m3fn,
-            scale_type=torch.float8_e8m0fnu,
-            shuffle=False,
-        )
-        # The scale sort writes only routed tokens. Padded expert rows still
-        # participate in GEMM, so their zero activations need finite scales.
-        sa = torch.full((rows, hidden // 32), 127, dtype=torch.uint8, device=device)
-        mxfp4_moe_sort_hip(
-            sa.view(torch.float8_e8m0fnu),
-            scale_per_token,
-            sorted_ids,
-            num_valid_ids,
-            tokens,
-            hidden,
+            aq, scale_per_token = per_1x32_mx_quant_hip(
+                hidden_states,
+                quant_dtype=torch.float8_e4m3fn,
+                scale_type=torch.float8_e8m0fnu,
+                shuffle=False,
+            )
+        _run(
+            "sort_scale",
+            (
+                scale_per_token.view(torch.uint8).view(-1),
+                sa.view(torch.int32).view(-1),
+                sorted_ids,
+                row_map,
+                num_valid_ids,
+                tokens,
+                rows,
+                _stream(),
+            ),
+            K=hidden,
+            topk=topk,
         )
     else:
+        rows, row_map, inverse = _routes(sorted_ids, num_valid_ids, tokens, topk)
         aq = torch.empty((tokens, hidden), dtype=torch.int8, device=device)
         sa = torch.full((rows, hidden // 32), 127, dtype=torch.uint8, device=device)
-        if params["b_dtype"] == "fp8":
-            _run(
-                "quant",
-                (
-                    hidden_states.view(-1),
-                    aq.view(-1),
-                    sa.view(-1),
-                    inverse,
-                    tokens,
-                    _stream(),
-                ),
-                K=hidden,
-                gather=False,
-                scatter_scale_topk=topk,
-            )
+        _run(
+            "quant",
+            (
+                hidden_states.view(-1),
+                aq.view(-1),
+                sa.view(-1),
+                inverse,
+                tokens,
+                _stream(),
+            ),
+            K=hidden,
+            gather=False,
+            scatter_scale_topk=topk,
+        )
     if fuse_quant:
         packed_output = torch.empty(
             rows * (kp + kp // 32), dtype=torch.int8, device=device
