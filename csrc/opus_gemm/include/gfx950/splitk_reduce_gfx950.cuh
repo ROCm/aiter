@@ -62,14 +62,13 @@
 #pragma once
 
 #include "../opus_gemm_utils.cuh"
-#include "opus_gemm_traits_a16w16_gfx950.cuh"  // opus_splitk_ws_handle
 #include <cstdint>   // uint16_t / uint32_t used by the bias-fold and bf16 store paths
 
 template<int VEC_ = 16, int BLOCK_ = 64, typename D_OUT = __bf16,
          bool HAS_BIAS_ = false, typename D_BIAS_ = D_OUT,
          bool HAS_OOB_ = true>
 __global__ void splitk_reduce_kernel(
-    const opus_splitk_ws_handle* __restrict__ ws_handle,
+    const void* __restrict__ ws_ptr,
     D_OUT*       __restrict__ c_out,
     int split_k, int M, int N, int batch,
     int padded_M, int padded_N,
@@ -81,9 +80,9 @@ __global__ void splitk_reduce_kernel(
     // gfx950-only kernel body. See opus_gemm_pipeline_a16w16_gfx950.cuh for the
     // multi-arch wheel rationale.
     //
-    // Deref the handle slot at entry; survives a post-capture grow.
-    const float* __restrict__ workspace =
-        reinterpret_cast<const float*>(ws_handle->ptr);
+    using D_WS = float;
+    const D_WS* __restrict__ workspace =
+        reinterpret_cast<const D_WS*>(ws_ptr);
     constexpr int VEC   = VEC_;
     constexpr int BLOCK = BLOCK_;
     constexpr bool HAS_BIAS = HAS_BIAS_;
@@ -137,7 +136,7 @@ __global__ void splitk_reduce_kernel(
     const long split_stride = (long)batch * padded_M * padded_N;
 
     auto g_ws = opus::make_gmem(workspace,
-                                (unsigned int)(split_stride * split_k * sizeof(float)));
+                                (unsigned int)(split_stride * split_k * sizeof(D_WS)));
 
     opus::vector_t<float, VEC> acc;
     #pragma unroll
@@ -270,7 +269,7 @@ __global__ void splitk_reduce_kernel(
 // splitk_reduce_extra hook).
 template <typename D_OUT, int VEC = 16, int BLOCK = 64>
 __global__ void opus_bmm_splitk_reduce_kernel(
-    const opus_splitk_ws_handle* __restrict__ ws_handle,
+    const void* __restrict__ workspace_ptr,
     D_OUT* __restrict__ out,
     int split_k, int M, int N, int batch,
     int padded_M, int padded_N,
@@ -289,7 +288,7 @@ __global__ void opus_bmm_splitk_reduce_kernel(
   const int m = bm_id - b * M;
 
   const float* __restrict__ workspace =
-      reinterpret_cast<const float*>(ws_handle->ptr);
+      reinterpret_cast<const float*>(workspace_ptr);
   const long split_stride = (long)batch * padded_M * padded_N;
   const int base = b * padded_M * padded_N + m * padded_N + n_base;
   auto g_ws = make_gmem(workspace, (unsigned int)(split_stride * split_k * sizeof(float)));

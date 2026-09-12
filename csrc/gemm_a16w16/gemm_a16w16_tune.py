@@ -67,13 +67,11 @@ try:
         kid_rejects_shape as _opus_kid_rejects_shape,
     )
 
-    from aiter.ops.opus.gemm_op_a16w16 import (
-        opus_gemm_a16w16_tune as _opus_gemm_a16w16_tune,
-    )
+    from aiter.ops.opus import opus_gemm as _opus_gemm
 
     _opus_all_kernels = dict(_opus_kernels_list)
 except Exception as _opus_exc:  # noqa: BLE001
-    _opus_gemm_a16w16_tune = None
+    _opus_gemm = None
     _opus_all_kernels = None
     _opus_splitk_kids = frozenset()
     _opus_candidate_kids_for_shape = None
@@ -203,16 +201,14 @@ _opus_max_delta_checked = set()
 
 
 def run_opus_gemm_bf16(inp, weight, out, bias=None, kid=0, splitK=0):
-    inp3 = inp.unsqueeze(0)
-    weight3 = weight.unsqueeze(0)
-    out3 = out.unsqueeze(0)
-    _opus_gemm_a16w16_tune(
-        inp3,
-        weight3,
-        out3,
+    """Launch one OPUS kid and run the existing maximum-error check."""
+    _opus_gemm(
+        inp,
+        weight,
+        out,
         bias=bias,
-        kernelId=kid,
-        splitK=splitK,
+        kid=kid,
+        split_k=splitK,
     )
     if torch.cuda.is_current_stream_capturing():
         return out
@@ -227,13 +223,13 @@ def run_opus_gemm_bf16(inp, weight, out, bias=None, kid=0, splitK=0):
     )
     if cache_key in _opus_max_delta_checked:
         return out
-    ref_fp32 = torch.bmm(inp3.float(), weight3.float().transpose(-1, -2))
+    # ``opus_gemm`` is the strict logical-2D public entry point.  Keep this
+    # catastrophic-error guard in the same shape domain instead of referring
+    # to the pre-split adapter's removed 3D views.
+    ref_fp32 = F.linear(inp.float(), weight.float())
     if bias is not None:
-        if bias.dim() == 1:
-            ref_fp32 = ref_fp32 + bias.float().view(1, 1, -1)
-        else:
-            ref_fp32 = ref_fp32 + bias.float().unsqueeze(1)
-    max_delta = (out3.float() - ref_fp32).abs().max().item()
+        ref_fp32 = ref_fp32 + bias.float()
+    max_delta = (out.float() - ref_fp32).abs().max().item()
     max_ref = ref_fp32.abs().max().item()
     bound = max(max_ref * 0.1, 1.0)
     if max_delta > bound:
@@ -683,7 +679,7 @@ class GemmA16W16Tuner(GemmCommonTuner):
     def _get_opus_tasks(
         self, info_keys, has_bias, indtype, outdtype, scaleAB, is_shuffle, run_kwargs
     ):
-        if _opus_gemm_a16w16_tune is None:
+        if _opus_gemm is None:
             logger.warning(f"opus not available, skip. reason: {OPUS_TUNE_ERROR}")
             return []
         if scaleAB or indtype != dtypes.bf16:

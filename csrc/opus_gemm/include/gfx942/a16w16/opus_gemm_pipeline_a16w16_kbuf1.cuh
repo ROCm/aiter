@@ -31,6 +31,7 @@ void gemm_a16w16_kbuf1_kernel(Kargs kargs) {
     using D_A = typename T::D_A;
     using D_B = typename T::D_B;
     using D_C = typename T::D_C;
+    using D_WS = typename T::D_WS;
     using D_ACC = typename T::D_ACC;
 
     int wgid;
@@ -70,7 +71,7 @@ void gemm_a16w16_kbuf1_kernel(Kargs kargs) {
 
     auto g_c = [&]() {
         if constexpr (IS_SPLITK) {
-            return make_gmem(opus_splitk_ws_ptr<D_C>(kargs.ws_handle)
+            return make_gmem(opus_gfx942_uniform_ws_ptr<D_WS>(kargs.ptr_ws)
                              + (size_t)split_id  * kargs.batch * kargs.stride_ws_batch
                              + (size_t)batch_id  * kargs.stride_ws_batch
                              + (size_t)row       * kargs.stride_ws

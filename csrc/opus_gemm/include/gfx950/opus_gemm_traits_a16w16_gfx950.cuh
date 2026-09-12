@@ -265,24 +265,7 @@ struct opus_gemm_a16w16_flatmm_traits_gfx950 {
     // only defined on the device pass; host pass would see 65536 and cause
     // pfk<3 and break static_asserts.
     //
-    // All aiter a16w16 kernels are gfx950-only today. Three-layer enforcement:
-    //   1. Python: aiter/ops/opus/__init__.py calls _arch._detect_arch({"gfx950"})
-    //      at import time. On non-gfx950 the import still succeeds (so it
-    //      cannot break the surrounding `from aiter.ops.opus import *` in
-    //      aiter/__init__.py) but gemm_a16w16_opus / opus_gemm_a16w16_tune
-    //      are replaced with stubs that raise RuntimeError on call, plus a
-    //      one-shot RuntimeWarning at import. Helper is reusable for future
-    //      opus submodules with different supported sets.
-    //   2. Host:   opus_dispatch_a16w16<T> / opus_a16w16_tune_dispatch<T> in
-    //      opus_gemm.cu are arch routers built on opus_get_gfx_arch(). Only
-    //      the gfx950 branch is wired up today (delegates to
-    //      opus_dispatch_a16w16_gfx950<T>); other archs return TORCH_CHECK
-    //      fail with a 'pipeline TBD' message. Future archs are added by
-    //      extending OpusGfxArch + adding a per-arch dispatch function.
-    //   3. Device: each __global__ kernel body wraps real code in
-    //      #if defined(__gfx950__) so non-gfx950 device passes (in multi-arch
-    //      wheels like GPU_ARCHS='gfx942;gfx950') compile to an empty stub.
-    //      Combined with layer 1/2 the empty stub is unreachable at runtime.
+    // Python selects the kid; the host router then enters the gfx950 table.
     static constexpr int WG_PER_CU = WG_PER_CU_;
     static constexpr int LDS_SIZE_TOTAL = 163840;
     static constexpr int max_lds_size_per_wg = LDS_SIZE_TOTAL / WG_PER_CU_;
@@ -339,13 +322,13 @@ struct opus_gemm_flatmm_kargs_gfx950 {
 // ============================================================================
 //
 // 7 template parameters match opus_gemm_a16w16_flatmm_traits_gfx950, with
-// additional static_assert D_C=float (splitk main kernel writes fp32
+// additional static_assert D_WS=float (splitk main kernel writes fp32
 // partial sums to workspace). Ported from
 // gcnasm/opus_fmm/flatmm_a16w16_4wave_wasp_splitk.cc lines 34-143.
 
 template<int BLOCK_SIZE_,   // workgroup size (locked to 256)
         typename BLOCK_,    // opus::seq<B_M, B_N, B_K>
-        typename DTYPE_,    // opus::tuple<D_A, D_B, D_C, D_ACC, D_BIAS>, D_C MUST be float
+        typename DTYPE_,    // opus::tuple<D_A, D_B, D_WS, D_ACC, D_BIAS>, D_WS MUST be float
         typename VEC_,      // opus::seq<VEC_A, VEC_B, VEC_C>
         typename MFMA_,     // opus::seq<W_M, W_N, W_K>
         int WG_PER_CU_,
@@ -364,13 +347,13 @@ struct opus_flatmm_splitk_traits_gfx950 {
 
     using D_A    = opus::tuple_element_t<0, DTYPE>;
     using D_B    = opus::tuple_element_t<1, DTYPE>;
-    using D_C    = opus::tuple_element_t<2, DTYPE>;
+    using D_WS   = opus::tuple_element_t<2, DTYPE>;
     using D_ACC  = opus::tuple_element_t<3, DTYPE>;
     using D_BIAS = opus::tuple_element_t<4, DTYPE>;
 
     // Split-K writes fp32 partial sums; reduce kernel later casts to bf16.
-    static_assert(std::is_same_v<D_C, float>,
-                  "splitk kernel requires D_C = float for fp32 workspace");
+    static_assert(std::is_same_v<D_WS, float>,
+                  "splitk kernel requires D_WS = float for fp32 workspace");
 
     // Warp-specialized 4-wave layout: 2 producer + 2 consumer. T_K=1 locked.
     static constexpr int T_M = 2;
@@ -585,22 +568,11 @@ struct opus_gemm_persistent_kargs_gfx950 {
 };
 #endif
 
-#ifndef OPUS_GEMM_SPLITK_WS_HANDLE_DEFINED
-#define OPUS_GEMM_SPLITK_WS_HANDLE_DEFINED
-// Indirection slot for the split-K fp32 workspace pointer. Captured HIP
-// graphs hold the slot address (stable), not the workspace ptr, so a
-// post-capture grow + hipFree of the old buffer doesn't dangle the graph.
-struct opus_splitk_ws_handle {
-    void*         ptr;    // current backing workspace; null until first grow
-    unsigned long bytes;  // current capacity in bytes
-};
-#endif
-
 #ifndef OPUS_GEMM_FLATMM_SPLITK_KARGS_DEFINED
 #define OPUS_GEMM_FLATMM_SPLITK_KARGS_DEFINED
 // Kernel arguments for the a16w16 flatmm split-K pipeline.
 //
-// Main kernel writes fp32 partial results to *ws_handle->ptr, laid out as
+// Main kernel writes fp32 partial results to ptr_ws, laid out as
 // [split_k, B, padded_M, padded_N] (tile-aligned, no per-thread pred on
 // store). Reduce kernel consumes it and writes C[B, M, N].
 //
@@ -608,7 +580,7 @@ struct opus_splitk_ws_handle {
 struct opus_gemm_flatmm_splitk_kargs_gfx950 {
     const void* __restrict__ ptr_a;         // bf16 [B, M, K]
     const void* __restrict__ ptr_b;         // bf16 [B, N, K] (pre-transposed)
-    const opus_splitk_ws_handle* __restrict__ ws_handle; // deref at kernel entry
+    void*       __restrict__ ptr_ws;        // D_WS [split_k, B, padded_M, padded_N]
     void*       __restrict__ ptr_c;         // bf16 [B, M, N] (filled by reduce kernel)
     // bias is consumed only by the reduce kernel (main kernel ignores it).
     // ptr_bias = nullptr when HAS_BIAS=false; dtype matches D_BIAS (== D_C
@@ -643,7 +615,8 @@ struct opus_gemm_flatmm_splitk_kargs_gfx950 {
 // Locked geometry, derived in the kernel itself:
 //   * T_M = 2, T_N = 4, T_K = 1  -> 8 waves / WG -> BLOCK_SIZE = 8 * 64 = 512.
 //   * W_M = 16, W_N = 16, W_K = 32 (MFMA 16x16x32 BF16).
-//   * VEC_A = VEC_B = VEC_C = 8.
+//   * VEC_A = VEC_B = VEC_C = 8 logical elements.  The pipeline splits an
+//     FP32 logical C vector into 4-element physical stores.
 //
 // Constraints (mirror the kernel-internal static_asserts in
 // gemm_a16w16_mono_tile_kernel_template.hpp; static_asserts here surface
