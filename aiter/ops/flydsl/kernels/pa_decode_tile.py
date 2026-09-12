@@ -65,6 +65,7 @@ def compile_pa_decode_tile(
     query_length: int = 1,
     trans_v: bool = True,
     wide_kv_addressing: bool = False,
+    prefetch_v: bool = False,
 ):
     """Build the tile-programming PA-decode kernel + launch wrapper.
 
@@ -117,6 +118,17 @@ def compile_pa_decode_tile(
     TOTAL_ROWS = query_length * query_group_size
     M_TILES = cdiv(TOTAL_ROWS, MFMA_MNK)
     ROWS_PADDED = M_TILES * MFMA_MNK
+    # The page-128 gfx950 scalar-scale path benefits from earlier V loads
+    # for decode and alternating P/reduction buffers for three M-tiles.
+    tune_page128 = (
+        is_gfx950
+        and head_dim == 128
+        and block_size == 128
+        and trans_v
+        and not per_token_kv
+    )
+    EARLY_V = prefetch_v and tune_page128 and M_TILES == 1
+    P_BUFFERS = 2 if tune_page128 and M_TILES == 3 else 1
     # PV layout: V=A, P=B -> output [head-dim (row), query-row (col=lane16)],
     # generalized over head_dim via the VHE_CHUNKS loop.
     NWARP = 4  # 4 waves / CTA
@@ -171,7 +183,7 @@ def compile_pa_decode_tile(
     # +16B row padding breaks a 32-bank LDS conflict on the P-pack writes while
     # keeping the row 16B-aligned for PV's ds_read_b128.
     SP_ROW_BYTES = TILE_TOK + 16
-    sP_bytes = MFMA_MNK * SP_ROW_BYTES  # fp8, padded rows
+    sP_bytes = P_BUFFERS * MFMA_MNK * SP_ROW_BYTES  # fp8, padded rows
     sQscale_off = sP_off + sP_bytes
     NWARP_PAD = (
         NWARP + 1
@@ -180,7 +192,7 @@ def compile_pa_decode_tile(
     sLmax_off = sQscale_off + ROWS_PADDED * f32
     sLsum_off = sLmax_off + M_TILES * MFMA_MNK * NWARP_PAD * f32
     # V page-index broadcast (V's page depends on `rgroup`, shared across warps).
-    sVPage_off = sLsum_off + MFMA_MNK * NWARP_PAD * f32
+    sVPage_off = sLsum_off + P_BUFFERS * MFMA_MNK * NWARP_PAD * f32
     sVPage_bytes = NWARP * PAGES_PER_CHUNK * 4  # i32
     # Per-token KV-scale staging (per_token only), double-buffered so the tt+1
     # prefetch (into the other buffer) doesn't clobber the current tile's scales.
@@ -823,10 +835,10 @@ def compile_pa_decode_tile(
                 def _mask_v_scale(vec, a, thr=ctx_thr, zero=zero4_scale):
                     return (_ct[a] < thr).select(vec, zero)
 
-            # V data doesn't depend on `m`; hoist once for the phase-split
-            # instead of reloading per M-tile.
+            # V is independent of QK/softmax. Load it early for the tuned
+            # decode path and reuse it across M-tiles in the phase-split path.
             v_vh_shared = None
-            if const_expr(M_TILES > 1):
+            if const_expr(M_TILES > 1 or EARLY_V):
                 v_vh_shared = [
                     _v_ops(v_page_cur, vh) for vh in range_constexpr(VHE_CHUNKS)
                 ]
@@ -964,6 +976,8 @@ def compile_pa_decode_tile(
                     ]
 
                 for m in range_constexpr(M_TILES):
+                    p_base = sP_off + (m % P_BUFFERS) * MFMA_MNK * SP_ROW_BYTES
+                    lsum_base = sLsum_off + (m % P_BUFFERS) * MFMA_MNK * NWARP_PAD * f32
                     o_acc = [
                         ostate[_o_slot(m, vh)] for vh in range_constexpr(VHE_CHUNKS)
                     ]
@@ -1019,7 +1033,7 @@ def compile_pa_decode_tile(
                         words.append(_f32_to_fp8_words(p_scaled)[0])
 
                     p_off0 = (
-                        sP_off + lane16 * SP_ROW_BYTES + warp * TOK_CHUNK + rgroup * 4
+                        p_base + lane16 * SP_ROW_BYTES + warp * TOK_CHUNK + rgroup * 4
                     )
                     # The NCHUNK P words scatter across the row at stride c16//4
                     # i32 (the token->fp8-lane interleave the PV ds_read_b128
@@ -1037,13 +1051,13 @@ def compile_pa_decode_tile(
                     safe_prev = (m_prev > NEG_INF).select(m_prev, ZERO_F)
                     corr_reg = fx.Float32(exp2_amdgcn_scalar(safe_prev - safe_max))
                     if rgroup == 0:
-                        _st_lw(sLsum_off, lane16, warp, ls)
+                        _st_lw(lsum_base, lane16, warp, ls)
                     gpu.barrier()
-                    gsum = _ld_lw_row(sLsum_off, lane16).reduce(ReductionOp.ADD)
+                    gsum = _ld_lw_row(lsum_base, lane16).reduce(ReductionOp.ADD)
                     l_new = l_prev * corr_reg + gsum
 
                     p_ops = _lds_load(
-                        sP_off + lane16 * SP_ROW_BYTES + rgroup * 64, fx.Int64, NVOPS
+                        p_base + lane16 * SP_ROW_BYTES + rgroup * 64, fx.Int64, NVOPS
                     )
 
                     corr_b = fx.Vector.from_elements(
@@ -1065,11 +1079,15 @@ def compile_pa_decode_tile(
                             ).broadcast_to(OP_ELEMS)
                         o_acc[vh] = o_acc[vh] * corr_b + op
                     next_state.extend([*o_acc, m_new, l_new])
-                    # sP and sLsum are reused by the next M-tile. Synchronize
-                    # all waves after their LDS reads before any wave overwrites
-                    # those regions, then retire this tile's dependency chain.
+                    # A shared P/Lsum slot needs all reads to finish before
+                    # the next M-tile overwrites it. With alternating slots,
+                    # the next tile's write barrier retires those reads before
+                    # that slot is reused. The Phase A barrier protects reuse
+                    # across loop iterations. Keep the scheduler fence to
+                    # bound register liveness across M-tiles.
                     if const_expr(m < M_TILES - 1):
-                        gpu.barrier()
+                        if const_expr(P_BUFFERS == 1):
+                            gpu.barrier()
                         fx.rocdl.sched_barrier(0)
             else:
                 # M_TILES==1 single tile (m==0 for the _o_slot/_m_slot/_l_slot helpers).
@@ -1217,11 +1235,14 @@ def compile_pa_decode_tile(
                 corr_b = fx.Vector.from_elements(
                     [corr_reg], dtype=fx.Float32
                 ).broadcast_to(OP_ELEMS)
-                # Single tile: batch both vh's V loads upfront (no sibling chain
-                # to hide the latency behind).
-                v_vh_batch = [
-                    _v_ops(v_page_cur, vh) for vh in range_constexpr(VHE_CHUNKS)
-                ]
+                # Use the early V loads where enabled; other shapes retain
+                # the existing batched loads before PV.
+                if const_expr(EARLY_V):
+                    v_vh_batch = v_vh_shared
+                else:
+                    v_vh_batch = [
+                        _v_ops(v_page_cur, vh) for vh in range_constexpr(VHE_CHUNKS)
+                    ]
                 for vh in range_constexpr(VHE_CHUNKS):
                     v_vh = v_vh_batch[vh]
                     acc = fx.Vector.filled(MFMA_ACC_ELEMS, 0.0, fx.Float32)

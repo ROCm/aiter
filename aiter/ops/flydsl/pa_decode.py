@@ -378,6 +378,22 @@ def pa_decode(
     # if either does.
     wide_kv_addressing = max(key_cache.numel(), value_cache.numel()) >= 2**31
 
+    # Early V loads help the measured one-to-two-workgroup-per-CU regime.
+    # Keep other grids on the existing schedule: early loads regress
+    # short-context decode at larger grid sizes.
+    prefetch_v = False
+    if (
+        arch == "gfx950"
+        and head_dim == 128
+        and block_size == 128
+        and trans_v
+        and not per_token_kv
+        and query_length * query_group_size <= 16
+    ):
+        num_cus = torch.cuda.get_device_properties(dev).multi_processor_count
+        workgroups = num_seqs * num_kv_heads * num_partitions
+        prefetch_v = num_cus < workgroups <= 2 * num_cus
+
     with torch.cuda.device(dev):
         compiled = compile_pa_decode_tile(
             head_dim=head_dim,
@@ -390,6 +406,7 @@ def pa_decode(
             query_length=query_length,
             trans_v=trans_v,
             wide_kv_addressing=wide_kv_addressing,
+            prefetch_v=prefetch_v,
         )
 
     if num_partitions == 1:

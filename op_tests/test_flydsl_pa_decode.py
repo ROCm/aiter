@@ -667,6 +667,7 @@ def _constant_page_decode_case(
     block_table_width,
     poison_padding=False,
     per_token=False,
+    trans_v=False,
 ):
     """Each sequence's V pages are constant, so its attention output is known."""
     _require_gpu()
@@ -690,6 +691,12 @@ def _constant_page_decode_case(
         .contiguous()
         .to(quant_dtype)
     )
+    if trans_v:
+        value_cache = (
+            value_cache.view(num_pages, 1, head_dim, block_size // 16, 16)
+            .permute(0, 1, 3, 2, 4)
+            .contiguous()
+        )
     block_tables = torch.full(
         (batch_size, block_table_width),
         num_pages + 1024 if poison_padding else 0,
@@ -722,11 +729,14 @@ def _constant_page_decode_case(
         scale,
         scale,
     )
+    # The reference uses the values actually representable in the FP8 cache.
     expected = (
         torch.tensor(
             [float(seq + 1) if length else 0.0 for seq, length in enumerate(lengths)],
             dtype=dtypes.fp32,
         )
+        .to(quant_dtype)
+        .to(dtypes.fp32)
         .reshape(batch_size, 1, 1)
         .expand_as(output)
     )
@@ -936,6 +946,41 @@ def test_prepared_sparse_page_tables(block_size, per_token, packed):
         sliding_window=-1,
     )
     _assert_matches(output.float(), reference)
+
+
+@pytest.mark.parametrize("context_length", [3, 257, 2051])
+@pytest.mark.parametrize("num_partitions", [1, 4])
+@pytest.mark.parametrize("trans_v", [False, True])
+@pytest.mark.parametrize("zero_query", [False, True])
+def test_mtp3_page128_partition_boundaries(
+    context_length, num_partitions, trans_v, zero_query
+):
+    """MTP rows retain independent softmax state across partial/empty partitions."""
+    output, reference = _adversarial_case(
+        head_dim=128,
+        context_length=context_length,
+        block_size=128,
+        query_group_size=16,
+        query_length=3,
+        num_partitions=num_partitions,
+        trans_v=trans_v,
+        zero_query=zero_query,
+    )
+    _assert_matches(output, reference)
+
+
+@pytest.mark.parametrize("all_empty", [False, True])
+def test_page128_decode_prefetch_mixed_contexts(all_empty):
+    """A two-CTA-per-CU decode grid handles empty partitions and poisoned padding."""
+    lengths = [0] * 64 if all_empty else [0, 1, 63, 127, 128, 129, 257, 2051] * 8
+    _constant_page_decode_case(
+        lengths,
+        block_size=128,
+        num_partitions=8,
+        block_table_width=0 if all_empty else 17,
+        poison_padding=True,
+        trans_v=True,
+    )
 
 
 def main():
