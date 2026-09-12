@@ -61,6 +61,7 @@ __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_QKV_mfma16_kernel(
     const int* __restrict__ context_lens,   // [num_seqs]
     const int* __restrict__ query_start_loc_ptr,   // [num_seqs]
     const int max_num_blocks_per_seq,
+    const int num_kv_blocks,
     const float* __restrict__ alibi_slopes, // [num_heads]
     const int q_stride,
     const int kv_block_stride,
@@ -82,7 +83,6 @@ __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_QKV_mfma16_kernel(
     const int rowid                  = laneid / 16;
 
     const auto seq_idx   = blockIdx.x;
-    const int num_blocks = max_num_blocks_per_seq * gridDim.x;
     // NOTE queries with sequence len > 1 are prefills and taken care by another
     // kernel.
     if(query_start_loc_ptr != nullptr &&
@@ -484,11 +484,10 @@ __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_QKV_mfma16_kernel(
                     }
                     else if constexpr(QUANT_METHOD == vllm::Fp8QuantMethod::kPerHead)
                     {
-                        const int klocal_token_idx =
-                            TOKENS_PER_WARP * warpid + token_depth * 16 + lane16id;
-                        const int kglobal_token_idx = partition_start_token_idx + klocal_token_idx;
                         const int k_scale_idx =
-                            wg_start_kv_head_idx * num_blocks * BLOCK_SIZE + kglobal_token_idx;
+                            wg_start_kv_head_idx * num_kv_blocks * BLOCK_SIZE +
+                            kphysical_block_number[token_depth] * BLOCK_SIZE +
+                            kphysical_block_offset[token_depth];
                         d_out[gqa_ratio_loop][mtp][token_depth] *=
                             k_scale_ptr ? *(k_scale_ptr + k_scale_idx) : float(1.0);
                     }
@@ -768,15 +767,10 @@ __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_QKV_mfma16_kernel(
                         }
                         else if constexpr(QUANT_METHOD == vllm::Fp8QuantMethod::kPerHead)
                         {
-                            const int vlocal_token_idx =
-                                vtoken_depth * VTOKENS_PER_LANE * ROWS_PER_WARP +
-                                rowid * VTOKENS_PER_LANE;
-                            // Safe to use an int32_t here assuming we are working with < 2 billion
-                            // tokens
-                            const int vglobal_token_idx =
-                                partition_start_token_idx + vlocal_token_idx;
                             const int v_scale_idx =
-                                wg_start_kv_head_idx * num_blocks * BLOCK_SIZE + vglobal_token_idx;
+                                wg_start_kv_head_idx * num_kv_blocks * BLOCK_SIZE +
+                                vphysical_block_number[vtoken_depth] * BLOCK_SIZE +
+                                vphysical_block_offset[vtoken_depth];
                             v_scale = v_scale_ptr ? *(v_scale_ptr + v_scale_idx) : float(1.0);
                         }
 
@@ -955,6 +949,7 @@ __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_QKV_mfma16_kernel(
     const int* __restrict__ context_lens,    // [num_seqs]
     const int* __restrict__ query_start_loc_ptr,  // [num_seqs]
     const int max_num_blocks_per_seq,
+    const int num_kv_blocks,
     const float* __restrict__ alibi_slopes,  // [num_heads]
     const int q_stride,
     const int kv_block_stride,
@@ -964,6 +959,7 @@ __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_QKV_mfma16_kernel(
     output_t* __restrict__ out,               // [num_seqs, num_heads, max_num_partitions, head_size]
     const float* q_scale_ptr,
     const float* k_scale_ptr, const float* v_scale_ptr) {
+  (void)num_kv_blocks;
   UNREACHABLE_CODE
 }
 
