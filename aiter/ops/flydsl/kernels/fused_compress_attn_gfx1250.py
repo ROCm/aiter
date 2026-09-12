@@ -2099,18 +2099,70 @@ _DEFAULT_COMPILE_HINTS = {
 }
 
 
-def hca_per_n_config_gfx1250(plan_capacity: int) -> tuple[int, int]:
+def hca_per_n_config_gfx1250(
+    plan_capacity: int, num_input_tokens: int | None = None
+) -> tuple[int, int]:
     """Return ``(slice_size, k_split_num_waves)`` for gfx1250 HCA.
 
-    Initial values -- need hardware tuning.
+    Capacity alone does not determine the best config, because prefill and
+    decode want opposite things at the same capacity and both occur there.
+    Prefill leaves ``window_len == 0`` on all but each sequence's first
+    boundary, so nearly the whole K range is the statically unrolled Phase 2,
+    and few long-running waves beat many short ones: halving the waves doubles
+    the unrolled trip count, which lifts the loads the scheduler keeps in
+    flight from 22 to 27 and shrinks the cross-wave LDS reduce. Decode sources
+    most of K from the state cache through the runtime-bounded Phase 1 loop,
+    which does not unroll, so it wants waves instead. At capacity 144 the
+    prefill optimum (64,4) costs decode 47% (16.6 -> 24.4us) and the decode
+    optimum (128,16) costs prefill 6%.
+
+    ``num_input_tokens`` (``kv_in.shape[0]``) separates them: a prefill
+    boundary streams ~``ratio`` tokens out of ``kv_in`` while a decode boundary
+    streams ~1, so tokens-per-boundary measures ~86-114 for prefill and ~1.1-2.8
+    for decode over the whole tuned range, and 16 sits in the empty middle.
+    Small capacities are the one place the two get close (~16 vs ~8), which is
+    why the ``<= 32`` tier is decided before the mode test -- both modes want
+    the same config there, so the signal is only consulted where it is
+    unambiguous. Both arguments are host-side shapes, so dispatch stays
+    CUDAGraph-stable (the plan contents that would name the mode directly live
+    on the device). Callers that omit it keep decode-safe behaviour.
+
+    Tuned on hardware (median of 3 perftest runs per point, D=512 ratio=128):
+
+        prefill  capacity   18     24     48     80    144
+          32,8              6.68   6.86   7.10   7.89  11.25
+          32,16             6.56   6.70   7.27   8.52  12.48
+          64,4              8.30   8.43   8.77   8.72  10.04
+          64,8              7.30   7.43   7.88   8.31  10.48
+          128,16            7.60   7.79   8.14   9.35  10.59
+
+        decode   capacity   20     80    144    216    256   1040
+          32,16            10.21  13.50  19.86  27.61  30.27 100.01
+          64,4             22.74  23.64  24.39  26.21  27.15  70.92
+          64,8             14.53  15.57  16.64  25.92  27.28  73.92
+          128,8            15.99  16.32  17.19  18.79  19.70  64.93
+          128,16           11.70  12.62  13.22  20.64  21.68  72.43
+
+    ``slice_size`` 256 was 2-3x off the best at every capacity measured and
+    512 does not build at all (VEC=16 exceeds what the Phase 1 f32 loader
+    handles), so neither is selectable here.
+
+    Folding several boundaries into one block to share their ape loads was
+    tried and dropped: ape is boundary-independent so P=2 does cut the compress
+    kernel's loads 12%, but it also halves the grid, and at 576 blocks over 256
+    CUs the load imbalance costs more than the traffic saves (compress kernel
+    7.28 -> 7.90us at capacity 144, and P=2 lost at every capacity measured).
     """
-    if plan_capacity <= 64:
-        return 32, 8
-    if plan_capacity <= 256:
-        return 64, 8
-    if plan_capacity <= 1024:
-        return 256, 4
-    return 512, 1
+    if plan_capacity <= 32:
+        return 32, 16
+    is_prefill = num_input_tokens is not None and num_input_tokens >= 16 * plan_capacity
+    if is_prefill:
+        if plan_capacity <= 96:
+            return 32, 8
+        return 64, 4
+    if plan_capacity <= 160:
+        return 128, 16
+    return 128, 8
 
 
 @lru_cache(maxsize=32)
