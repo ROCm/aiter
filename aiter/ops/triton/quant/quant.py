@@ -343,11 +343,7 @@ def dynamic_mxfp8_quant(
         if M <= 32:
             NUM_ITER = 1
             BLOCK_SIZE_M = triton.next_power_of_2(M)
-            # Capped at 512: BLOCK_SIZE_N=4096 (M=1) / 2048 (M=2) overflow the
-            # TDM descriptor's 8-bit log2 pad-interval field at LLVM lowering
-            # (TDMUtility.cpp createTDMDescriptor assert). 512 is verified safe
-            # and correct for M in {1,2,4,...,32}; NUM_ITER/grid still cover
-            # any K via cdiv.
+            # Capped at 512: larger overflows the TDM descriptor's pad-interval field (see repo notes).
             BLOCK_SIZE_N = min(4096 // BLOCK_SIZE_M, 512)
             NUM_WARPS = 4
             NUM_STAGES = 1

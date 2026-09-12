@@ -9,6 +9,7 @@ import triton
 
 from aiter.ops.triton.quant import dynamic_mxfp4_quant as triton_dynamic_mxfp4_quant
 from aiter.ops.triton.quant import dynamic_mxfp8_quant as triton_dynamic_mxfp8_quant
+from aiter.test_common import run_perftest
 from aiter.utility.fp4_utils import dynamic_mxfp4_quant as fp4_utils_dynamic_mxfp4_quant
 from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
     get_available_models,
@@ -114,10 +115,9 @@ def run_benchmark(args):
         x = torch.randn((M, N), dtype=dtype, device="cuda")
         quant_fn = get_provider(fmt, provider)
 
-        def fn():
-            quant_fn(x)
-
-        ms = triton.testing.do_bench_cudagraph(fn, rep=100)
+        # Rotates deep-copied inputs past L2 cache size, unlike do_bench_cudagraph's buffer reuse.
+        _, us = run_perftest(quant_fn, x)
+        ms = us / 1000
 
         # Read x and write quantized output + block scales.
         x_bytes = x.numel() * x.element_size()

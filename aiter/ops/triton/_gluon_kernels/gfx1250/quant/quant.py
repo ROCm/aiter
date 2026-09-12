@@ -159,7 +159,9 @@ def gluon_dynamic_mxfp4_quant_kernel_gfx1250(
             # ring-buffer garbage, not zero -- exclude them from the amax
             # reduction (and downstream scaled_downcast input) or the e8m0
             # scale for the whole quant-block gets corrupted.
-            col_valid = (pid_n * BLOCK_SIZE_N + gl.arange(0, BLOCK_SIZE_N, layout=gLayoutN)) < N
+            col_valid = (
+                pid_n * BLOCK_SIZE_N + gl.arange(0, BLOCK_SIZE_N, layout=gLayoutN)
+            ) < N
             x_reg = gl.where(col_valid[None, :], x_reg, 0.0)
             out_fp4, bs_e8m0 = _mxfp4_quant_op(
                 x_reg, BLOCK_SIZE_N, BLOCK_SIZE_M, MXFP4_QUANT_BLOCK_SIZE
@@ -207,7 +209,9 @@ def gluon_dynamic_mxfp4_quant_kernel_gfx1250(
                 x_reg, BLOCK_SIZE_N, BLOCK_SIZE_M, MXFP4_QUANT_BLOCK_SIZE
             )
         else:
-            col_valid = (pid_n * BLOCK_SIZE_N + gl.arange(0, BLOCK_SIZE_N, layout=gLayoutN)) < N
+            col_valid = (
+                pid_n * BLOCK_SIZE_N + gl.arange(0, BLOCK_SIZE_N, layout=gLayoutN)
+            ) < N
             x_reg = gl.where(col_valid[None, :], x_reg, 0.0)
             out_fp4, bs_e8m0 = _mxfp4_quant_op(
                 x_reg, BLOCK_SIZE_N, BLOCK_SIZE_M, MXFP4_QUANT_BLOCK_SIZE
@@ -298,6 +302,11 @@ def gluon_dynamic_mxfp8_quant_kernel_gfx1250(
 ):
     # NUM_BUFFERS=1: synchronous, no prefetch
     gl.static_assert(NUM_BUFFERS >= 1, "LDS kernel requires NUM_BUFFERS >= 1")
+    # Cap unverified beyond repro testing (see repo notes on async_store corruption).
+    gl.static_assert(
+        BLOCK_SIZE_N <= 1024,
+        "BLOCK_SIZE_N > 1024 not yet verified safe for fp8 TDM async_store",
+    )
 
     pid_m = gl.program_id(0)
     start_n = gl.program_id(1) * NUM_ITER
@@ -322,11 +331,12 @@ def gluon_dynamic_mxfp8_quant_kernel_gfx1250(
         shape=[NUM_BUFFERS, BLOCK_SIZE_M, BLOCK_SIZE_N],
         layout=SHARED_LAYOUT_X,
     )
-    # Also ring-buffered (see STORE_WAIT below)
+    # Unpadded: padding here triggers fp8 async_store corruption at BLOCK_SIZE_N >= 256 (see repo notes).
+    SHARED_LAYOUT_OUT: gl.constexpr = gl.SwizzledSharedLayout(1, 1, 1, [1, 0])
     out_smem = gl.allocate_shared_memory(
         x_fp8_ptr.type.element_ty,
         shape=[NUM_BUFFERS, BLOCK_SIZE_M, BLOCK_SIZE_N],
-        layout=SHARED_LAYOUT_X,
+        layout=SHARED_LAYOUT_OUT,
     )
     SHARED_LAYOUT_BS: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
         [[NUM_QUANT_BLOCKS, 8]], [BLOCK_SIZE_M, NUM_QUANT_BLOCKS], [1, 0]
@@ -356,7 +366,7 @@ def gluon_dynamic_mxfp8_quant_kernel_gfx1250(
         shape=(M, N),
         strides=(stride_x_fp8_m_in, stride_x_fp8_n_in),
         block_shape=(BLOCK_SIZE_M, BLOCK_SIZE_N),
-        layout=SHARED_LAYOUT_X,
+        layout=SHARED_LAYOUT_OUT,
     )
     bs_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
         base=bs_ptr,
