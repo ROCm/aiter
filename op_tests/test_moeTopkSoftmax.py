@@ -554,6 +554,196 @@ def test_topk_softmax_shared_experts(
     return ret
 
 
+def _assert_topk_contract(
+    logits: torch.Tensor,
+    ids: torch.Tensor,
+    weights: torch.Tensor,
+    *,
+    topk: int,
+    renorm: bool,
+    scale: float,
+    bias: torch.Tensor | None,
+    scoring: str = "sigmoid",
+) -> None:
+    """Op contract, order-insensitive. Passes on stock and on radix.
+
+    The selected set must be a valid top-k of the biased score (ties allowed
+    at the boundary). Each weight belongs to the id sitting beside it.
+    """
+    assert bool((ids >= 0).all()) and bool(
+        (ids < logits.shape[-1]).all()
+    ), "unfilled or out-of-range topk id"
+    ids64 = ids.to(torch.int64)
+    for row in range(min(ids.shape[0], 64)):
+        uniq = torch.unique(ids64[row])
+        assert (
+            uniq.numel() == topk
+        ), f"duplicate ids on row {row}: {ids64[row].tolist()}"
+
+    logits_f = logits.float()
+    if scoring == "softmax":
+        pre = torch.softmax(logits_f, dim=-1)
+    else:
+        pre = torch.sigmoid(logits_f)
+    choice = pre if bias is None else pre + bias.float().unsqueeze(0)
+    kth = torch.topk(choice, topk, dim=-1, sorted=True).values[:, -1]
+    selected = choice.gather(-1, ids64)
+    slack = 2e-3 if logits.dtype != torch.float32 else 2e-6
+    assert bool(
+        (selected + slack >= kth.unsqueeze(-1)).all()
+    ), "selected expert is not a valid top-k by biased score"
+
+    raw = pre.gather(-1, ids64)
+    if renorm:
+        raw = raw / raw.sum(dim=-1, keepdim=True).clamp_min(1e-12)
+    expected = raw * scale
+    werr = (weights.float() - expected).abs().max().item()
+    wtol = 3e-3 if logits.dtype != torch.float32 else 2e-5
+    assert werr < wtol, f"weight/id pairing drifted: max|dw|={werr}"
+
+
+def test_grouped_topk_radix_envelope() -> tuple[int, int]:
+    """Walk both sides of every vector-width expert ceiling.
+
+    vec4: 896 / 1024 / 1028; vec2: 510 / 514 / 898; vec1: 255 / 257 / 897.
+    Crossed with topk 8/16/32, fp32 and bf16, 1/3/64/1024 tokens, renorm on
+    and off, three scaling factors, and both entry points. Describes the op,
+    not this kernel — the same checks pass on stock aiter.
+    """
+    experts = (896, 1024, 1028, 510, 514, 898, 255, 257, 897)
+    topks = (8, 16, 32)
+    dtypes_ = (torch.float32, torch.bfloat16)
+    tokens = (1, 3, 64, 1024)
+    scales = (1.0, 2.5, 2.827)
+    n_ok = n_fail = 0
+    for ne in experts:
+        for topk in topks:
+            if topk > ne:
+                continue
+            for dtype in dtypes_:
+                for m in tokens:
+                    for renorm in (True, False):
+                        for scale in scales:
+                            for biased in (True, False):
+                                torch.manual_seed(
+                                    (ne * 1009 + topk * 17 + m + int(scale * 10))
+                                    % (2**31 - 1)
+                                )
+                                logits = torch.randn((m, ne), dtype=dtype)
+                                bias = (
+                                    torch.randn((ne,), dtype=dtype) if biased else None
+                                )
+                                w = torch.empty((m, topk), dtype=torch.float32)
+                                ids = torch.full((m, topk), -1, dtype=torch.int32)
+                                try:
+                                    if biased:
+                                        aiter.biased_grouped_topk(
+                                            logits, bias, w, ids, 1, 1, renorm, scale
+                                        )
+                                    else:
+                                        aiter.grouped_topk(
+                                            logits,
+                                            w,
+                                            ids,
+                                            1,
+                                            1,
+                                            renorm,
+                                            False,
+                                            scale,
+                                        )
+                                    torch.cuda.synchronize()
+                                    _assert_topk_contract(
+                                        logits,
+                                        ids,
+                                        w,
+                                        topk=topk,
+                                        renorm=renorm,
+                                        scale=scale,
+                                        bias=bias,
+                                    )
+                                    n_ok += 1
+                                except Exception as exc:  # noqa: BLE001
+                                    n_fail += 1
+                                    aiter.logger.info(
+                                        "radix envelope FAIL ne=%s topk=%s "
+                                        "dtype=%s M=%s renorm=%s scale=%s "
+                                        "biased=%s: %s",
+                                        ne,
+                                        topk,
+                                        dtype,
+                                        m,
+                                        renorm,
+                                        scale,
+                                        biased,
+                                        exc,
+                                    )
+    aiter.logger.info(
+        "test_grouped_topk_radix_envelope: %s passed, %s failed", n_ok, n_fail
+    )
+    return n_ok, n_fail
+
+
+def test_grouped_topk_ties() -> tuple[int, int]:
+    """Drive the non-exact radix path with 2 / 3 / 5 distinct logit values."""
+    n_ok = n_fail = 0
+    for n_distinct in (2, 3, 5):
+        for ne, topk in ((896, 16), (510, 8), (255, 16)):
+            for m in (1, 64):
+                for dtype in (torch.float32, torch.bfloat16):
+                    for biased in (True, False):
+                        g = torch.Generator(device="cuda").manual_seed(
+                            1000 + n_distinct * 17 + ne
+                        )
+                        levels = torch.linspace(-3.0, 3.0, n_distinct, device="cuda")
+                        idx = torch.randint(
+                            0, n_distinct, (m, ne), device="cuda", generator=g
+                        )
+                        logits = levels[idx].to(dtype)
+                        bias = (
+                            torch.zeros((ne,), dtype=dtype, device="cuda")
+                            if biased
+                            else None
+                        )
+                        w = torch.empty((m, topk), dtype=torch.float32, device="cuda")
+                        ids = torch.full(
+                            (m, topk), -1, dtype=torch.int32, device="cuda"
+                        )
+                        try:
+                            if biased:
+                                aiter.biased_grouped_topk(
+                                    logits, bias, w, ids, 1, 1, True, 1.0
+                                )
+                            else:
+                                aiter.grouped_topk(
+                                    logits, w, ids, 1, 1, True, False, 1.0
+                                )
+                            torch.cuda.synchronize()
+                            _assert_topk_contract(
+                                logits,
+                                ids,
+                                w,
+                                topk=topk,
+                                renorm=True,
+                                scale=1.0,
+                                bias=bias,
+                            )
+                            n_ok += 1
+                        except Exception as exc:  # noqa: BLE001
+                            n_fail += 1
+                            aiter.logger.info(
+                                "radix ties FAIL n_distinct=%s ne=%s topk=%s "
+                                "M=%s biased=%s: %s",
+                                n_distinct,
+                                ne,
+                                topk,
+                                m,
+                                biased,
+                                exc,
+                            )
+    aiter.logger.info("test_grouped_topk_ties: %s passed, %s failed", n_ok, n_fail)
+    return n_ok, n_fail
+
+
 parser = argparse.ArgumentParser(
     formatter_class=argparse.RawTextHelpFormatter,
     description="config input of test",
@@ -631,8 +821,29 @@ parser.add_argument(
     Raise this to stabilize GPU clocks for latency-bound (small-token) shapes.
     e.g.: -w 50""",
 )
+parser.add_argument(
+    "--radix-tests-only",
+    action="store_true",
+    help="Run the radix contract tests and exit before the benchmark tables.",
+)
 
 args = parser.parse_args()
+
+# Assertion tests first so a contract failure is loud, not buried in a table.
+_envelope_ok, _envelope_fail = test_grouped_topk_radix_envelope()
+_ties_ok, _ties_fail = test_grouped_topk_ties()
+if _envelope_fail or _ties_fail:
+    raise SystemExit(
+        f"grouped_topk radix contract tests failed: "
+        f"envelope {_envelope_fail}, ties {_ties_fail}"
+    )
+if args.radix_tests_only:
+    aiter.logger.info(
+        "radix contract tests passed (%s envelope + %s ties). exiting.",
+        _envelope_ok,
+        _ties_ok,
+    )
+    raise SystemExit(0)
 
 df = []
 for dtype in args.dtype:
