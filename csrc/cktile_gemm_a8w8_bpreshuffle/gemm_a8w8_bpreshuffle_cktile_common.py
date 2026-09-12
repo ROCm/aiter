@@ -17,6 +17,15 @@ sys.path.insert(0, AITER_CORE_DIR)
 
 from chip_info import get_gfx
 
+DEFAULT_PIPELINE = "flatmm_v1"
+
+# Python pipeline name -> the `sPipeline` template argument of CustomConfig in
+# include/gemm_a8w8_bpreshuffle_cktile_common.cuh. Keep the two in sync.
+PIPELINE_IDS = {
+    "flatmm_v1": 0,
+    "rowcol_wp_v2": 1,
+}
+
 
 @dataclass
 class kernelInstance:
@@ -40,33 +49,63 @@ class kernelInstance:
     NWTile: int
     KWTile: int
     sScheduler: str
+    # Which device kernel/pipeline composition the instance runs on. The tile
+    # geometry above is shared; this selects what consumes it:
+    #
+    #  "flatmm_v1"    - ck_tile::FlatmmKernel + FlatmmPipelineAGmemBGmemCRegV1
+    #                   with the ScaleM/ScaleN epilogue. The historical (and
+    #                   default) cktile a8w8-bpreshuffle path.
+    #  "rowcol_wp_v2" - ck_tile::QuantGemmKernel in QuantType::RowColQuant mode
+    #                   driving WeightPreshufflePipelineAGmemBGmemCRegV2. Same
+    #                   host-side inputs as flatmm_v1 (B preshuffled with
+    #                   shuffle_weight(16, 16), per-token A scale (M,) and
+    #                   per-channel B scale (N,) applied natively by the
+    #                   kernel's RowCol scale windows -- no replication).
+    #                   Requires M/N/K divisible by the tile: the quant route
+    #                   is instantiated with the pads clamped false.
+    #
+    # The value is part of `name`, so a tuned-CSV row that selects a non-default
+    # pipeline stays self-describing and round-trips through
+    # chip_info.build_tune_dict()'s kernelName lookup.
+    sPipeline: str = DEFAULT_PIPELINE
+
+    @property
+    def supports_m_padding(self) -> bool:
+        return self.sPipeline == DEFAULT_PIPELINE
+
+    @property
+    def supports_k_padding(self) -> bool:
+        return self.sPipeline == DEFAULT_PIPELINE
 
     @property
     def name(self) -> str:
-        return ("_").join(
-            [
-                "a8w8_bpreshuffle_cktile",
-                ("x").join(
-                    str(x)
-                    for x in [
-                        self.sTransposeC,
-                        self.sUseStructuredSparsity,
-                        self.sTileParitionerGroupNum,
-                        self.sTileParitionerM01,
-                        self.sNumWaveGroups,
-                        self.sDoubleSmemBuffer,
-                        self.PadM,
-                        self.PadN,
-                        self.PadK,
-                        self.BlockPerCu,
-                    ]
-                ),
-                ("x").join(str(x) for x in [self.MTile, self.NTile, self.KTile]),
-                ("x").join(str(x) for x in [self.MWarp, self.NWarp, self.KWarp]),
-                ("x").join(str(x) for x in [self.MWTile, self.NWTile, self.KWTile]),
-                self.sScheduler.lower(),
-            ]
-        )
+        parts = [
+            "a8w8_bpreshuffle_cktile",
+            ("x").join(
+                str(x)
+                for x in [
+                    self.sTransposeC,
+                    self.sUseStructuredSparsity,
+                    self.sTileParitionerGroupNum,
+                    self.sTileParitionerM01,
+                    self.sNumWaveGroups,
+                    self.sDoubleSmemBuffer,
+                    self.PadM,
+                    self.PadN,
+                    self.PadK,
+                    self.BlockPerCu,
+                ]
+            ),
+            ("x").join(str(x) for x in [self.MTile, self.NTile, self.KTile]),
+            ("x").join(str(x) for x in [self.MWarp, self.NWarp, self.KWarp]),
+            ("x").join(str(x) for x in [self.MWTile, self.NWTile, self.KWTile]),
+            self.sScheduler.lower(),
+        ]
+        # Only non-default pipelines extend the name, so every already-tuned
+        # flatmm_v1 CSV row keeps matching byte-for-byte.
+        if self.sPipeline != DEFAULT_PIPELINE:
+            parts.append(self.sPipeline)
+        return ("_").join(parts)
 
 
 BLOCK_PER_CU_MAX = 4
@@ -390,6 +429,37 @@ kernels_list_950 = {
 
 }
 
+# QuantGemmKernel(RowColQuant) x WeightPreshufflePipelineAGmemBGmemCRegV2.
+# Same host-side inputs as the flatmm_v1 table above (B preshuffled with
+# shuffle_weight(16, 16), native per-token/per-channel scales); only the
+# device-side composition differs.
+#
+# Kept in a SEPARATE table, appended after the flatmm table has been
+# BlockPerCu-expanded, so that adding a rowcol tile can never renumber an
+# existing flatmm kernelId. Ids here are local to this table.
+#
+# The quant route runs unpadded, so a tile is only a candidate where it divides
+# M, N and K. These are chosen to be divisible for the live GLM-5.2 N/K pairs
+# (N in {2688, 6144}, K in {6144, 12288}) -- note 2688 % 192 == 0 but
+# 2688 % 256 != 0, and no MTile divides M == 1.
+# fmt: off
+kernels_list_950_rowcol_wp_v2 = {
+    #   N_Tile == 128 family:
+    0: kernelInstance( 0, 0, 8, 4, 1, 0, 0, 0, 0, 1,   16,   128,   256,  1,  4,  1,   16,    16,    128, "Intrawave", "rowcol_wp_v2"),
+    1: kernelInstance( 0, 0, 8, 4, 1, 0, 0, 0, 0, 1,   32,   128,   256,  1,  4,  1,   16,    16,    128, "Intrawave", "rowcol_wp_v2"),
+    2: kernelInstance( 0, 0, 8, 4, 1, 0, 0, 0, 0, 1,   64,   128,   256,  1,  4,  1,   16,    16,    128, "Intrawave", "rowcol_wp_v2"),
+    3: kernelInstance( 0, 0, 8, 4, 1, 0, 0, 0, 0, 1,  128,   128,   128,  1,  4,  1,   16,    16,    128, "Intrawave", "rowcol_wp_v2"),
+    4: kernelInstance( 0, 0, 8, 4, 1, 0, 0, 0, 0, 1,  128,   128,   256,  1,  4,  1,   16,    16,    128, "Intrawave", "rowcol_wp_v2"),
+    5: kernelInstance( 0, 0, 8, 4, 1, 0, 0, 0, 0, 1,  128,   128,   256,  1,  4,  1,   16,    16,    128, "Default",   "rowcol_wp_v2"),
+    #   narrow-N / small-M, where 32-64 x 64 tiles lead at M <= 1024:
+    6: kernelInstance( 0, 0, 8, 4, 1, 0, 0, 0, 0, 1,   16,    64,   512,  1,  4,  1,   16,    16,    128, "Intrawave", "rowcol_wp_v2"),
+    7: kernelInstance( 0, 0, 8, 4, 1, 0, 0, 0, 0, 1,   32,    64,   512,  1,  4,  1,   16,    16,    128, "Intrawave", "rowcol_wp_v2"),
+    8: kernelInstance( 0, 0, 8, 4, 1, 0, 0, 0, 0, 1,   64,    64,   256,  1,  4,  1,   16,    16,    128, "Intrawave", "rowcol_wp_v2"),
+    #   wide-N / large-M, where 192-wide tiles lead at M >= 2048:
+    9: kernelInstance( 0, 0, 8, 4, 1, 0, 0, 0, 0, 1,  128,   192,   128,  1,  4,  1,   16,    16,    128, "Intrawave", "rowcol_wp_v2"),
+   10: kernelInstance( 0, 0, 8, 4, 1, 0, 0, 0, 0, 1,  256,   192,   128,  1,  4,  1,   16,    16,    128, "Intrawave", "rowcol_wp_v2"),
+}
+
 default_kernels_dict_950 = {
     (-1): kernelInstance( 0, 0, 8, 4, 1, 0, 0, 0, 0,1, 128,   256,   256,  1,  4,  1,   16,    16,    128, "Default"),
     (-2): kernelInstance( 0, 0, 8, 4, 1, 0, 0, 0, 0,1, 16,    64,    512,  1,  4,  1,   16,    16,    128, "Default"),
@@ -399,12 +469,32 @@ default_kernels_dict_950 = {
 
 # fmt: on
 
+
+def append_expanded(base_expanded, extra):
+    """Append BlockPerCu-expanded `extra` after `base_expanded`, renumbering
+    only the appended entries.
+
+    Kernel ids are positional, so inserting into a table shifts every id after
+    the insertion point -- including the ids `expand_blockpercu` hands out.
+    Growing a secondary table (e.g. the rowcol_wp_v2 candidates) must not
+    renumber the primary one, so it is expanded on its own and appended.
+    """
+    out = dict(base_expanded)
+    next_id = max(out.keys()) + 1
+    for inst in expand_blockpercu(extra).values():
+        out[next_id] = inst
+        next_id += 1
+    return out
+
+
 arch = get_gfx()
 if arch == "gfx942":
     kernels_list = expand_blockpercu(kernels_list_942)
     default_kernels_dict = default_kernels_dict_942
 else:
-    kernels_list = expand_blockpercu(kernels_list_950)
+    kernels_list = append_expanded(
+        expand_blockpercu(kernels_list_950), kernels_list_950_rowcol_wp_v2
+    )
     default_kernels_dict = default_kernels_dict_950
 
 # Name-based reverse lookup for get_tune_dict() — built once at import time

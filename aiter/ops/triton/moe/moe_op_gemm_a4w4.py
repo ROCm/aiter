@@ -17,10 +17,42 @@ from aiter.ops.triton._triton_kernels.moe.moe_op_gemm_a4w4 import (
     _mxfp4_quant_kernel,
 )
 from aiter.ops.triton.moe.moe_routing.routing import RoutingData
-from aiter.ops.triton.moe.reduce import reduce_grouped
+from aiter.ops.triton.moe.reduce import (
+    EpCombineScatter,
+    reduce_grouped,
+    scatter_grouped,
+    validate_reduce_out,
+)
+from aiter.ops.triton.utils._triton import arch_info
 from aiter.ops.triton.utils._triton.arch_info import get_arch
 from aiter.ops.triton.utils.gemm_config_utils import pick_gemm_num_stages
 from aiter.ops.triton.utils.moe_config_utils import get_moe_dispatch
+
+
+def _prefill_lds_bytes(config, x_scales_preload, xs_slab_cols):
+    # Check for prefill kernel's LDS budget, this determines if we can afford x_scales_preload without losing occupancy
+    # please keep in sync with whatever the layout the prefill kernel is using
+    bm, bn, bk = config["block_m"], config["block_n"], config["block_k"]
+    nb = config["num_buffers"]
+    mx_scale_block_k = bk // MXFP4_QUANT_BLOCK_SIZE
+    # x: [bm, bk//2] with 16 pad elements between each of the bm intervals
+    x_buf = nb * (bm * (bk // 2) + (bm - 1) * 16)
+    # w / w-scales: identity swizzle, so exactly their (preshuffled) extents
+    w_buf = nb * bn * (bk // 2)
+    w_scales_buf = nb * bn * mx_scale_block_k
+    if x_scales_preload:
+        x_scales_buf = bm * xs_slab_cols
+    else:
+        x_scales_buf = nb * bm * mx_scale_block_k
+    # +32 is inter-allocation alignment, measured at 16-32B. Rounded up so
+    # this never overstates how many workgroups fit.
+    return x_buf + w_buf + w_scales_buf + x_scales_buf + 32
+
+
+def _workgroups_per_wgp(lds_bytes):
+    cap = arch_info._LDS_CAP_BYTES[get_arch()]
+    return max(1, cap // max(1, lds_bytes))
+
 
 # -----------------------------------------------------------------------------
 #                    Matrix Multiplication + Outer Gather/Scatter
@@ -51,6 +83,10 @@ def allocate_output(
     block_m,
     split_k,
     preshuffle_weights,
+    y_out=None,
+    skip_final=False,
+    skip_matmul=False,
+    out_mx_quant=False,
 ):
     # ---- output ------
     N = w.shape[-1]
@@ -68,12 +104,40 @@ def allocate_output(
         y_rows = (
             scatter_indx.shape[0] // routing_data.n_expts_act
         )  # compressed number of rows
-    matmul_shape = (split_k, M, N // reduction_n_matmul)
-    final_shape = (y_rows, N // reduction_n_matmul // reduction_n_reduction)
-    matmul_output = torch.empty(matmul_shape, device=x.device, dtype=out_dtype)
-    if scatter_indx is not None or split_k > 1:
-        final_output = torch.empty(final_shape, device=x.device, dtype=out_dtype)
+    if out_mx_quant:
+        # MXFP4 emit: the epilogue writes packed e2m1, two values per byte, so
+        # the row is half as wide and uint8 rather than out_dtype.
+        matmul_shape = (split_k, M, N // reduction_n_matmul // 2)
+        matmul_dtype = torch.uint8
     else:
+        matmul_shape = (split_k, M, N // reduction_n_matmul)
+        matmul_dtype = out_dtype
+    final_shape = (y_rows, N // reduction_n_matmul // reduction_n_reduction)
+    if skip_matmul:
+        # The epilogue scatters straight into a caller-owned window, so nothing
+        # ever reads this buffer -- and at (M x hidden) bf16 it is tens of MB
+        # per layer, allocated and dirtied for nothing.
+        matmul_output = None
+    else:
+        matmul_output = torch.empty(matmul_shape, device=x.device, dtype=matmul_dtype)
+    if skip_final:
+        # The rows are delivered elsewhere (expert-parallel scatter), so a
+        # reduced output would only be allocated to be thrown away -- at
+        # (tokens x hidden) bf16 that is tens of MB per layer. Mirrors a8w4.
+        #
+        assert y_out is None, "y_out names a reduced output; skip_final has none"
+        final_output = None
+    elif scatter_indx is not None or split_k > 1:
+        final_output = validate_reduce_out(y_out, final_shape, out_dtype, x.device)
+    else:
+        # No reduction runs: reduce_grouped early-returns the matmul buffer
+        # itself (indx is None and split_k == 1), so a caller-provided buffer
+        # would be silently dropped. Say so instead of writing nowhere.
+        assert y_out is None, (
+            "y_out was provided but this call has no grouped reduction "
+            "(scatter_indx is None and split_k == 1), so nothing would write "
+            "into it -- the result comes straight out of the matmul buffer."
+        )
         final_output = None
     return matmul_output, final_output
 
@@ -103,7 +167,7 @@ def get_kernel_config_triton(m, n, k, routing_data):
         # for scale preshuffling
         block_n = 512
         block_k = 256
-        num_warps = 8
+        num_warps = 4
     num_stages = pick_gemm_num_stages(
         arch, block_m, block_n, block_k, 4, 4, use_async_padding=True
     )
@@ -144,11 +208,11 @@ def get_kernel_config_gluon(m, n, k, routing_data):
     num_xcds = 1
 
     arch = get_arch()
+    bucket = m2bucket(m)
     tuned = get_moe_dispatch("A4W4", arch, "gluon")
-    key = f"bm{block_m}_n{n}_k{k}_{m2bucket(m)}"
+    key = f"bm{block_m}_n{n}_k{k}_{bucket}"
     if key not in tuned:
         key = f"bm{block_m}_any"
-    assert key in tuned, f"no a4w4 gluon config for {arch}: {key}"
     cfg = tuned[key]
     block_n, block_k, num_buffers, num_warps = (
         cfg["block_n"],
@@ -200,7 +264,6 @@ def mxfp4_quant(
     assert N % MXFP4_QUANT_BLOCK_SIZE == 0
     assert block_size_n % MXFP4_QUANT_BLOCK_SIZE == 0
 
-    x_fp32 = x.to(torch.float32)
     x_fp4 = torch.empty((M, N // 2), dtype=torch.uint8, device=x.device)
     x_scale = torch.empty(
         (M, N // MXFP4_QUANT_BLOCK_SIZE), dtype=torch.uint8, device=x.device
@@ -212,11 +275,11 @@ def mxfp4_quant(
     )
 
     _mxfp4_quant_kernel[grid](
-        x_fp32,
+        x,
         x_fp4,
         x_scale,
-        x_fp32.stride(0),
-        x_fp32.stride(1),
+        x.stride(0),
+        x.stride(1),
         x_fp4.stride(0),
         x_fp4.stride(1),
         x_scale.stride(0),
@@ -252,6 +315,31 @@ def moe_gemm_a4w4(
     unpadded_N=None,
     unpadded_K=None,
     backend=None,
+    # Per-gate validity, same layout as scatter_indx. Default None == every gate
+    # slot is live, which holds whenever routing() produced the indices. Pass a
+    # mask when only some of a token's n_expts_act slots are computed here --
+    # expert parallelism, where the other slots belong to another rank and are
+    # never written, so the reduce must not sum them. Mirrors moe_gemm_a8w4.
+    gate_valid=None,
+    # Destination for the grouped reduction's result, instead of a freshly
+    # allocated buffer. May be a slice of a taller tensor -- the reduce writes
+    # through `out`'s strides -- which lets a caller whose consumer wants more
+    # rows than this GEMM produces skip a full-width copy. Requires a grouped
+    # reduction to actually run, i.e. scatter_indx is not None or split_k > 1.
+    # Mirrors moe_gemm_a8w4.
+    y_out=None,
+    # Deliver GEMM2's un-reduced rows into an EP combine staging window instead
+    # of reducing them locally. Same contract as moe_gemm_a8w4's `ep_scatter`.
+    # Folded into the gluon epilogue when `ep_scatter.fused`; otherwise (and
+    # always on the triton backend) it falls through to the standalone
+    # `scatter_grouped` pass, which writes the same bytes.
+    ep_scatter: EpCombineScatter | None = None,
+    # Emit MXFP4 from the epilogue instead of bf16: returns
+    # (packed e2m1 [M, N_out//2] uint8, e8m0 scales [M, N_out//32] uint8), the
+    # exact pair `mxfp4_quant` would have produced, so GEMM2 consumes it
+    # directly and that separate launch over the intermediate disappears.
+    # GEMM1-style only -- requires split_k == 1 and no scatter_indx.
+    out_mx_quant: bool = False,
 ):
     """
     Y[:, :] = 0.
@@ -280,6 +368,25 @@ def moe_gemm_a4w4(
     K, N = x.shape[-1] * 2, w.shape[-1]
     if preshuffle_weights:
         N = N * 16
+
+    if out_mx_quant:
+        assert use_gluon, (
+            "out_mx_quant is implemented in the gfx1250 gluon epilogue only; the "
+            "triton fallback would silently write bf16"
+        )
+        assert scatter_indx is None, (
+            "out_mx_quant is GEMM1-style (no scatter): scatter+combine would need "
+            "an mxfp4-aware reduce_grouped"
+        )
+    if ep_scatter is not None:
+        assert scatter_indx is not None, (
+            "ep_scatter needs the scatter indices' row order: dst_row is indexed "
+            "by sorted row, which only exists once the gates are sorted"
+        )
+        assert not out_mx_quant, "ep_scatter delivers bf16 rows, not MXFP4"
+        assert (
+            not apply_swiglu
+        ), "ep_scatter is a GEMM2-side delivery; the activation belongs to GEMM1"
 
     block_m = routing_data.block_m
     if unpadded_N and block_m == 16:
@@ -321,6 +428,22 @@ def moe_gemm_a4w4(
         apply_swiglu_reduction = False
         reduction_n_reduction = 1
 
+    if out_mx_quant:
+        assert split_k == 1, "out_mx_quant requires split_k == 1"
+
+    # Fold the EP scatter into the GEMM epilogue when the kernel we are about to
+    # launch has one. Both gluon kernels do; the triton fallback has no gfx1250
+    # epilogue and drops through to the standalone `scatter_grouped`, which
+    # writes the same bytes.
+    fused_ep_scatter = (
+        ep_scatter is not None
+        and ep_scatter.fused
+        and use_gluon
+        # split-k partials must be summed before a row can be delivered, and the
+        # epilogue sees only its own partial.
+        and split_k == 1
+    )
+
     # allocate output memory
     y, y_final = allocate_output(
         x,
@@ -334,7 +457,41 @@ def moe_gemm_a4w4(
         config["block_m"],
         split_k,
         preshuffle_weights,
+        y_out=y_out,
+        skip_final=ep_scatter is not None,
+        # The epilogue writes straight into the staging window, so the
+        # (M x hidden) matmul buffer is never read. Skip allocating it.
+        skip_matmul=fused_ep_scatter,
+        out_mx_quant=out_mx_quant,
     )
+    if fused_ep_scatter:
+        # `Y` and its strides now name the staging window; the kernel indexes it
+        # by dst_row instead of by sorted row, so no `start_m` bias applies.
+        y_ptr = ep_scatter.out
+        stride_y_m = ep_scatter.out.stride(0)
+        stride_y_n = ep_scatter.out.stride(1)
+        dst_row = ep_scatter.dst_row
+    else:
+        y_ptr = y
+        stride_y_m = y.stride(1)
+        stride_y_n = y.stride(2)
+        dst_row = None
+
+    # Companion e8m0 scale buffer for the MXFP4 emit path. Plain row-major, the
+    # layout the consuming GEMM reads activation scales in (SWIZZLE_MX_SCALE
+    # applies to w_scales only), and the same shape `mxfp4_quant` returns.
+    if out_mx_quant:
+        n_out = N // reduction_n_matmul  # post-swiglu width, pre-pack
+        assert n_out % 32 == 0, "out_mx_quant requires N_out % 32 == 0"
+        y_scale = torch.empty(
+            (y.shape[-2], n_out // 32), dtype=torch.uint8, device=x.device
+        )
+        stride_y_mx_m = y_scale.stride(0)
+        stride_y_mx_n = y_scale.stride(1)
+    else:
+        y_scale = None
+        stride_y_mx_m = 0
+        stride_y_mx_n = 0
 
     stride_bias = None if bias is None else bias.stride(0)
 
@@ -365,9 +522,9 @@ def moe_gemm_a4w4(
         )
         # launch gluon kernel
         _moe_gemm_a4w4_decode[(grid,)](
-            y,
-            y.stride(1),
-            y.stride(2),
+            y_ptr,
+            stride_y_m,
+            stride_y_n,
             x,
             x.stride(0),
             x.stride(1),
@@ -408,10 +565,17 @@ def moe_gemm_a4w4(
             SWIZZLE_MX_SCALE=swizzle_mx_scale,
             PRESHUFFLE_WEIGHTS=preshuffle_weights,
             NUM_BUFFERS=config["num_buffers"],
-            UPCAST_INDICES=should_upcast_indices(x, w, y),
+            UPCAST_INDICES=should_upcast_indices(x, w, y_ptr),
             X_SCALES_TDM=x_scales_tdm,
             CLAMP_BOUNDS=K % config["block_k"] != 0,
             **layouts,
+            YMxScale=y_scale,
+            stride_y_mx_m=stride_y_mx_m,
+            stride_y_mx_n=stride_y_mx_n,
+            HAS_MX_OUT=out_mx_quant,
+            DstRow=dst_row,
+            EP_SCATTER=fused_ep_scatter,
+            Y_ROWS=(ep_scatter.out.shape[0] if fused_ep_scatter else 0),
             num_warps=config["num_warps"],
         )
     elif use_gluon:
@@ -431,11 +595,47 @@ def moe_gemm_a4w4(
         clamp_bounds = (K % config["block_k"] != 0) or (
             triton.cdiv(K, config["block_k"]) < config["num_buffers"]
         )
+        XS_SLAB_MAX_BYTES = 32 * 1024
+        xs_slab_cols = triton.next_power_of_2(triton.cdiv(K, MXFP4_QUANT_BLOCK_SIZE))
+        x_scales_preload = (
+            not clamp_bounds
+            and config["block_m"] <= 32
+            and K > 1024
+            and config["block_m"] * (config["block_k"] // MXFP4_QUANT_BLOCK_SIZE) <= 256
+            and config["block_m"] * xs_slab_cols <= XS_SLAB_MAX_BYTES
+            and config["num_ctas"] == 1
+            and preshuffle_weights
+            and swizzle_mx_scale == "GFX1250_SCALE"
+        )
+        if x_scales_preload:
+            wgs_with = _workgroups_per_wgp(
+                _prefill_lds_bytes(config, True, xs_slab_cols)
+            )
+            wgs_without = _workgroups_per_wgp(
+                _prefill_lds_bytes(config, False, xs_slab_cols)
+            )
+            if wgs_with < wgs_without:
+                x_scales_preload = False
+        if not x_scales_preload:
+            xs_slab_cols = 0
+
+        # L2 prefetch distance, in K-tiles. The ramp is a fixed burst of
+        # prefetches before the K loop, so it only pays off once the loop is
+        # long enough to absorb it -- hence the 4x rule.
+        num_k_iter = triton.cdiv(K, config["block_k"])
+        l2_prefetch_distance = (
+            4 if preshuffle_weights and swizzle_mx_scale == "GFX1250_SCALE" else 0
+        )
+        if l2_prefetch_distance and (
+            num_k_iter < 4 * l2_prefetch_distance
+            or config["num_buffers"] + l2_prefetch_distance - 1 >= num_k_iter
+        ):
+            l2_prefetch_distance = 0
         # launch gluon kernel
         _moe_gemm_a4w4_prefill[(grid,)](
-            y,
-            y.stride(1),
-            y.stride(2),
+            y_ptr,
+            stride_y_m,
+            stride_y_n,
             x,
             x.stride(0),
             x.stride(1),
@@ -476,10 +676,20 @@ def moe_gemm_a4w4(
             SWIZZLE_MX_SCALE=swizzle_mx_scale,
             PRESHUFFLE_WEIGHTS=preshuffle_weights,
             NUM_BUFFERS=config["num_buffers"],
-            UPCAST_INDICES=should_upcast_indices(x, w, y),
+            UPCAST_INDICES=should_upcast_indices(x, w, y_ptr),
             X_SCALES_TDM=x_scales_tdm,
             CLAMP_BOUNDS=clamp_bounds,
+            PRELOAD_X_SCALES=x_scales_preload,
+            XS_SLAB_COLS=xs_slab_cols,
+            L2_PREFETCH_DISTANCE=l2_prefetch_distance,
             **layouts,
+            YMxScale=y_scale,
+            stride_y_mx_m=stride_y_mx_m,
+            stride_y_mx_n=stride_y_mx_n,
+            HAS_MX_OUT=out_mx_quant,
+            DstRow=dst_row,
+            EP_SCATTER=fused_ep_scatter,
+            Y_ROWS=(ep_scatter.out.shape[0] if fused_ep_scatter else 0),
             num_ctas=config["num_ctas"],
             num_warps=config["num_warps"],
         )
@@ -546,6 +756,24 @@ def moe_gemm_a4w4(
         if scatter_indx is None
         else scatter_indx.view(-1, routing_data.n_expts_act)
     )
+    group_valid = (
+        None
+        if (gate_valid is None or scatter_indx is None)
+        else gate_valid.view(-1, routing_data.n_expts_act)
+    )
+    # Expert-parallel combine: hand the rows to the staging window instead of
+    # reducing them. Returns the window view, which is NOT a per-token output --
+    # the caller's combine produces that once every rank has delivered.
+    # MXFP4 emit path: scatter_indx is None and split_k == 1, so we bypass
+    # reduce_grouped and return (packed e2m1, e8m0 scales) directly -- the same
+    # pair, in the same layout, that `mxfp4_quant` returns.
+    if out_mx_quant:
+        return y.squeeze(0), y_scale
+    if ep_scatter is not None:
+        if fused_ep_scatter:
+            # The epilogue already placed every row in the window.
+            return ep_scatter.out
+        return scatter_grouped(y, ep_scatter.dst_row, ep_scatter.out)
     y_final = reduce_grouped(
         y,
         group_indx,
@@ -556,6 +784,7 @@ def moe_gemm_a4w4(
         reduction_n_reduction,
         out_dtype=out_dtype,
         swiglu_add_residual=swiglu_add_residual,
+        indx_valid=group_valid,
     )
 
     return y_final

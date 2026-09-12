@@ -30,12 +30,8 @@ def _warn_tile_override(axis: str, inter_dim: int, requested: int, resolved: int
     Deduped by (axis, inter_dim, requested, resolved) so it fires once per shape
     during tuning/serving instead of every launch.
     """
-    try:
-        from aiter import logger
-    except ImportError:  # pragma: no cover - logging must never break the kernel
-        import logging
+    from aiter import logger
 
-        logger = logging.getLogger("aiter")
     logger.warning(
         "FlyDSL MoE: %s=%d does not divide inter_dim=%d (not 256-aligned); "
         "forcing %s=%d. tile=%d is NOT usable/tunable for this shape — any tuned "
@@ -194,12 +190,17 @@ def get_flydsl_stage1_kernels(
     is_fp4_b = b_dtype == "fp4"
     # a16w4 (bf16 A x MXFP4 W) gemm1 is fully CSV/registry-driven: register the
     # extra tile_k=128 and xcd_swizzle=1 variants its tuned kernelNames name
-    # (t32x{64,128}x128 / _xcd1), which the other dtypes don't use.
+    # (t32x{64,128,192,256}x128 / _xcd1), which the other dtypes don't use.
     is_a16w4 = a_dtype == "bf16" and is_fp4_b
 
     tile_ns = [32, 64, 128] if is_fp4_b else [128]
     tile_ks = [128, 256] if is_a16w4 else [256]
-    tile_ms = [16, 32, 64, 128] if a_dtype == "fp8" and is_fp4_b else [32, 64, 128]
+    # tile_m=16 halves the M quantum: 1.18-1.35x at E=896 inter=384, token<=512 only.
+    tile_ms = (
+        [16, 32, 64, 128]
+        if (is_fp4_b and (a_dtype == "fp8" or is_a16w4))
+        else [32, 64, 128]
+    )
 
     waves_per_eus = [1, 2, 3, 4]
     k_batches = [1, 2, 4, 7, 14]
@@ -207,8 +208,10 @@ def get_flydsl_stage1_kernels(
     xcd_swizzles = [0, 1, 4] if is_a16w4 else [0, 4]
 
     for tm in tile_ms:
-        if tm == 32:
-            tile_ns = [32, 64, 128]
+        # tile_m=16 shares tile_m=32's N-tile set: m_repeat<=2 either way.
+        if tm == 32 or (tm == 16 and is_a16w4):
+            # 192|384, 256|512 exactly; a16w4-only (that port takes tile_n as given).
+            tile_ns = [32, 64, 128, 192, 256] if is_a16w4 else [32, 64, 128]
         else:
             tile_ns = [64, 128] if is_fp4_a else [128, 256]
         for tn in tile_ns:
@@ -237,12 +240,13 @@ def get_flydsl_stage1_kernels(
                                     if xcd > 0:
                                         base += f"_xcd{xcd}"
                                     # k_wave (intra-block K-slice): only for the
-                                    # small-M tile (tile_m==32), no split-K/mock,
+                                    # small-M tiles (tile_m==32, plus 16 on a16w4 only),
                                     # and capped to <=8 total waves (<=512 threads).
                                     num_n_waves = min(4, tn // 32)
+                                    _small_m = tm == 32 or (tm == 16 and is_a16w4)
                                     k_waves = (
                                         [1, 2, 4]
-                                        if (tm == 32 and kb == 1 and not go)
+                                        if (_small_m and kb == 1 and not go)
                                         else [1]
                                     )
                                     for kw in k_waves:
@@ -524,13 +528,13 @@ def get_flydsl_stage1_kernels_int4_bf16(out_dtype: str) -> dict[str, dict]:
             for tk in tile_ks:
                 # The kernel splits the 4 waves into (4/kw) N-waves x kw K-waves, so
                 # each N-wave covers tn/(4/kw) cols and needs >= 16 for the 16x16 MMA
-                # (kw=1 therefore requires tn >= 64); kw > 1 additionally needs
+                # (kw=1 therefore requires tn % 64 == 0); kw > 1 additionally needs
                 # 4*tn <= tk so the K-slice fits the tile. b_nt=0 (L2-cached W loads)
                 # is registered alongside the default nt/streaming b_nt=2: large-M
                 # weight reuse wants cached, decode wants streamed.
                 for kw in (1, 2, 4):
                     num_n_waves = 4 // kw
-                    if tn % num_n_waves or tn // num_n_waves < 16:
+                    if tn % num_n_waves or (tn // num_n_waves) % 16:
                         continue
                     if kw > 1 and 4 * tn > tk:
                         continue
@@ -558,8 +562,7 @@ def get_flydsl_stage2_kernels_int4_bf16(out_dtype: str) -> dict[str, dict]:
     tile_ks = [128, 256]
     tile_ms = [16, 32, 64, 128]
     tile_ns = [128]
-    # modes = ["atomic", "reduce"]
-    modes = ["atomic"]
+    modes = ["atomic", "reduce"]
 
     for tm in tile_ms:
         for tn in tile_ns:
@@ -720,6 +723,7 @@ def compile_flydsl_moe_stage2(
     inter_dim_pad: int = 0,
     xcd_swizzle: int = 0,
     enable_bias: bool = False,
+    mode: str = "atomic",
 ):
     """Compile stage2 kernel (cached via underlying lru_cache)."""
     # a16w-mix (bf16 A x {fp4 mxfp4, int4} W) down-proj: build the ported gemm2
@@ -743,6 +747,8 @@ def compile_flydsl_moe_stage2(
             w_dtype=b_dtype,
             # gfx942 lacks K=32 bf16 MFMA + v_cvt_pk_bf16_f32 -> K=16 fallback.
             use_k16="gfx95" not in str(get_rocm_arch()),
+            epilog=("reduce" if b_dtype == "int4" and mode == "reduce" else "atomic"),
+            topk=topk,
         )
     if b_dtype in ("fp4", "fp8"):
         from .kernels.mixed_moe_gemm_2stage import compile_mixed_moe_gemm2
@@ -1513,11 +1519,14 @@ def _flydsl_moe_stage1_impl(
 
     dev = a.device
     # a16w-mix ported gemm1: bf16 A x {mxfp4 (a16w4), int4 (a16wi4)} W -> bf16 sorted
-    # intermediate, threaded to stage2 unchanged. Tiles from the CSV kernelName;
-    # waves_per_eu=None (a no-_w name parses to wpe=1, a different kernel). Both
+    # intermediate, threaded to stage2 unchanged. Tiles from the CSV kernelName. Both
     # w_dtypes consume the standard (GGUU) N-major preshuffle; a16wi4 W1 is the
     # OLD-kernel int4 prep (pack_int8_to_packed_int4(shuffle_weight(w,(16,16)))) +
     # (E,G//2,N,2) bf16 scale.
+    # wpe=1 (a no-_w name) must map to None: waves_per_eu=1 is a real occupancy cap.
+    _g1_waves_per_eu = (
+        waves_per_eu if (waves_per_eu is not None and int(waves_per_eu) > 1) else None
+    )
     _is_a16w_port = a_dtype == "bf16" and b_dtype in ("fp4", "int4")
     if _is_a16w_port:
         from aiter.ops.flydsl.kernels.moe_2stage_a16wmix import flydsl_a16w4_gemm1
@@ -1553,7 +1562,7 @@ def _flydsl_moe_stage1_impl(
             k_batch=k_batch,
             b_nt=b_nt,
             xcd_swizzle=xcd_swizzle,
-            waves_per_eu=None,
+            waves_per_eu=_g1_waves_per_eu,
             act=_act,
             situ_beta=situ_beta,
             situ_linear_beta=situ_linear_beta,
@@ -2016,8 +2025,9 @@ def _flydsl_moe_stage2_impl(
     """Run stage2 with injectable compiler and launch-argument builders."""
 
     if a_dtype == "bf16" and b_dtype in ("fp4", "int4"):
-        # a16w-mix down-proj (a16w4 mxfp4 / a16wi4 int4): ported gemm2 atomic-scatters
-        # into the caller's moe_sorting-zeroed `out`. Tiles from the kernelName (like
+        # a16w-mix down-proj (a16w4 mxfp4 / a16wi4 int4). Default atomic-scatters
+        # into the caller's moe_sorting-zeroed `out`. a16wi4 mode=reduce writes
+        # unique [M*topk,H] rows then moe_reduce. Tiles from the kernelName (like
         # a4w4/a8w4). a16wi4 W2 uses the OLD-kernel int4 layout
         # (pack_int8_to_packed_int4(shuffle_weight(w,(16,16)))) + (E,G//2,N,2) bf16 scale.
         from aiter.ops.flydsl.kernels.moe_2stage_a16wmix import flydsl_a16w4_gemm2
@@ -2045,6 +2055,17 @@ def _flydsl_moe_stage2_impl(
                 device=inter_states.device,
             )
         )
+        _epilog = "atomic"
+        gemm2_out = out
+        if b_dtype == "int4" and mode == "reduce":
+            _epilog = "reduce"
+            gemm2_out = torch.empty(
+                (M_logical * int(topk), model_dim),
+                dtype=out.dtype,
+                device=out.device,
+            )
+            if expert_mask is not None:
+                gemm2_out.zero_()
         flydsl_a16w4_gemm2(
             inter_sorted_bf16=inter_states,
             w2_u8=w2.view(torch.uint8).contiguous(),
@@ -2057,7 +2078,7 @@ def _flydsl_moe_stage2_impl(
             cumsum_tensor=num_valid_ids.to(torch.int32).contiguous(),
             sorted_token_ids=sorted_token_ids,
             sorted_weights=_sw,
-            flat_out=out.view(-1),
+            flat_out=gemm2_out.view(-1),
             M_logical=M_logical,
             max_sorted=max_sorted,
             NE=E,
@@ -2071,7 +2092,18 @@ def _flydsl_moe_stage2_impl(
             waves_per_eu=waves_per_eu,
             xcd_swizzle=xcd_swizzle,
             w_dtype=b_dtype,
+            epilog=_epilog,
         )
+        if _epilog == "reduce":
+            _run_moe_reduction(
+                gemm2_out,
+                out,
+                M_logical,
+                int(topk),
+                model_dim,
+                expert_mask,
+                topk_ids,
+            )
         return out
 
     token_num = inter_states.shape[0]
@@ -2714,6 +2746,8 @@ def flydsl_moe_fused_route_quant_scatter(
             source_topk=topk,
             ksplit=use_ksplit_s1,
         )
+        _null_i32 = torch.empty(0, dtype=torch.int32, device=device)
+        assert _null_i32.data_ptr() == 0, "expected a null data_ptr"
         launch_routeks(
             ptr_arg(hidden_flat),
             ptr_arg(grouped_a1.view(-1)),
@@ -2722,6 +2756,12 @@ def flydsl_moe_fused_route_quant_scatter(
             ptr_arg(counter),  # dummy row_starts; unused because remap_rows=False
             1,
             numel,
+            # Pre-existing omission, not fallout of the prequantized change: this
+            # branch never passed num_valid_routes. A 0-element tensor has a null
+            # data_ptr, which the kernel tests for before dereferencing.
+            ptr_arg(_null_i32),
+            # src_scale: read only by the prequantized build, which this is not.
+            ptr_arg(grouped_a1_scale.view(-1)),
             grid_blocks,
             stream=torch.cuda.current_stream(),
         )
@@ -2948,6 +2988,38 @@ def _get_compiled_fused_quant_preshuffle(
 
 
 _ROUTEKS_KSPLIT_GRID_THRESHOLD = 512
+# Below this the route-ksplit kernel wins: both split along K, but one warp per
+# token cannot fill a grid out of a handful of tokens whatever the split, while
+# one warp per route starts with topk times as many.
+_TOKEN_MULTIDEST_MIN_TOKENS = 64
+# Every destination costs a buffer descriptor held live across the store pass,
+# so the saving stops being free once they crowd the register budget.
+_TOKEN_MULTIDEST_MAX_TOPK = 8
+
+
+@functools.cache
+def _get_compiled_token_multidest_quant(
+    feat_dim: int,
+    wmma_rep: int,
+    topk: int,
+    quant_mode: str,
+    row_major_scale: bool = False,
+    tdm_hidden_chunks: int = 4,
+    ksplit: int = 1,
+):
+    from aiter.ops.flydsl.kernels.moe_fused_route_quant_scatter import (
+        build_moe_token_multidest_quant_module,
+    )
+
+    return build_moe_token_multidest_quant_module(
+        feat_dim=feat_dim,
+        wmma_rep=wmma_rep,
+        topk=topk,
+        quant_mode=quant_mode,
+        row_major_scale=row_major_scale,
+        tdm_hidden_chunks=tdm_hidden_chunks,
+        ksplit=ksplit,
+    )
 
 
 @functools.cache
@@ -2958,6 +3030,8 @@ def _get_compiled_fused_quant_preshuffle_route_ksplit(
     source_topk: int = 0,
     remap_rows: bool = False,
     ksplit: bool = True,
+    prequantized: bool = False,
+    src_scale_bytes_per_row: int = 0,
 ):
     from aiter.ops.flydsl.kernels.moe_fused_route_quant_scatter import (
         build_moe_fused_quant_preshuffle_route_ksplit_module,
@@ -2970,6 +3044,8 @@ def _get_compiled_fused_quant_preshuffle_route_ksplit(
         source_topk=source_topk,
         remap_rows=remap_rows,
         ksplit=ksplit,
+        prequantized=prequantized,
+        src_scale_bytes_per_row=src_scale_bytes_per_row,
     )
 
 
@@ -2987,9 +3063,16 @@ def flydsl_moe_fused_quant_preshuffle(
     route_max_m: int = 0,
     out_payload: torch.Tensor | None = None,  # (E, max_m, Pb) uint8
     out_scale: torch.Tensor | None = None,  # (E, max_m//wmma_rep, Ws*wmma_rep)
-    num_valid_routes: (
-        torch.Tensor | None
-    ) = None,  # (1,) int32; route-branch only: skip routes >= this (EP dead-tail)
+    # (1,) int32; route-branch only: skip routes >= this (EP dead-tail)
+    num_valid_routes: torch.Tensor | None = None,
+    # (tokens, Ws) uint8 e8m0. When given, grouped_in IS the MX payload for
+    # ``quant_mode``: the sender already quantized, so the kernel only scatters
+    # + preshuffles.
+    prequantized_scale: torch.Tensor | None = None,
+    # When True, write the e8m0 scale as (row, feat_dim//32) instead of the
+    # 16-row-interleaved WMMA form. The consuming GEMM must be built with
+    # row_major_ascale so it does the interleave on its LDS->register read.
+    row_major_scale: bool = False,
 ):
     """Fused grouped quant + e8m0 scale-preshuffle in one kernel pass.
 
@@ -3000,11 +3083,44 @@ def flydsl_moe_fused_quant_preshuffle(
             f"flydsl_moe_fused_quant_preshuffle: quant_mode={quant_mode!r} "
             "unsupported (expected 'fp4' or 'fp8')."
         )
-    assert (
-        grouped_in.dtype == torch.bfloat16
-    ), f"fused grouped quant+preshuffle requires bf16 input (got {grouped_in.dtype})"
+    # A quantizing EP dispatch (fp8 or fp4) already put the payload and its e8m0
+    # row on the wire: nothing left to convert, only scatter + preshuffle.
+    prequantized = prequantized_scale is not None
+    if prequantized:
+        # torch dtypes, not aiter.dtypes: this module deliberately imports only
+        # torch and the tensor shim.
+        _packed = tuple(
+            d
+            for d in (
+                torch.float8_e4m3fn,
+                torch.float8_e4m3fnuz,
+                torch.uint8,
+                getattr(torch, "float4_e2m1fn_x2", None),
+            )
+            if d is not None
+        )
+        assert grouped_in.dtype in _packed, (
+            "prequantized payload must be packed MX bytes " f"(got {grouped_in.dtype})"
+        )
+        assert (
+            topids_to_rows is not None
+        ), "prequantized mode exists only on the route-indexed branch"
+        assert (
+            prequantized_scale.dtype == torch.uint8
+            and prequantized_scale.is_contiguous()
+        ), "prequantized scale must be a contiguous uint8 (tokens, Ws) tensor"
+    else:
+        assert grouped_in.dtype == torch.bfloat16, (
+            "fused grouped quant+preshuffle requires bf16 input "
+            f"(got {grouped_in.dtype})"
+        )
     device = grouped_in.device
+    # feat_dim is the FEATURE count, and a prequantized fp4 row carries two
+    # features per byte -- taking shape[-1] there would halve every derived
+    # geometry (Pb, Ws, the module name) without tripping a single assert.
     feat_dim = grouped_in.shape[-1]
+    if prequantized and quant_mode == "fp4":
+        feat_dim *= 2
     rows_per_tile = wmma_rep * 16
     assert (
         max_m % rows_per_tile == 0
@@ -3049,6 +3165,52 @@ def flydsl_moe_fused_quant_preshuffle(
         else:
             row_starts_i32 = masked_m
             route_max_m_arg = 1
+        token_num = numel // int(source_topk) if source_topk > 0 else 0
+        use_token_multidest = (
+            not prequantized
+            and not remap_rows
+            and num_valid_routes is None
+            and 1 < int(source_topk) <= _TOKEN_MULTIDEST_MAX_TOPK
+            and token_num >= _TOKEN_MULTIDEST_MIN_TOKENS
+            and os.environ.get("AITER_FLYDSL_TOKEN_MULTIDEST_QUANT", "1")
+            in ("1", "true", "True")
+        )
+        if row_major_scale and not use_token_multidest:
+            raise ValueError(
+                "row_major_scale is only implemented on the token-multidest "
+                "quant path"
+            )
+        if use_token_multidest:
+            from aiter.ops.flydsl.kernels.moe_fused_route_quant_scatter import (
+                token_multidest_ksplit,
+                token_multidest_tdm_chunks,
+            )
+
+            md_ksplit = token_multidest_ksplit(
+                feat_dim, wmma_rep, quant_mode, token_num
+            )
+            launch = _get_compiled_token_multidest_quant(
+                feat_dim=feat_dim,
+                wmma_rep=wmma_rep,
+                topk=int(source_topk),
+                quant_mode=quant_mode,
+                row_major_scale=bool(row_major_scale),
+                tdm_hidden_chunks=token_multidest_tdm_chunks(
+                    feat_dim, wmma_rep, quant_mode, md_ksplit
+                ),
+                ksplit=md_ksplit,
+            )
+            token_grid = (token_num + warps_per_block - 1) // warps_per_block
+            launch(
+                ptr_arg(grouped_in.contiguous().view(-1)),
+                ptr_arg(out_payload.view(-1)),
+                ptr_arg(out_scale.view(-1)),
+                ptr_arg(topids_to_rows_i32),
+                token_num,
+                token_grid,
+                stream=torch.cuda.current_stream(),
+            )
+            return out_payload, out_scale
         use_ksplit = grid_blocks < _ROUTEKS_KSPLIT_GRID_THRESHOLD
         launch = _get_compiled_fused_quant_preshuffle_route_ksplit(
             feat_dim=feat_dim,
@@ -3057,6 +3219,10 @@ def flydsl_moe_fused_quant_preshuffle(
             source_topk=source_topk,
             remap_rows=remap_rows,
             ksplit=use_ksplit,
+            prequantized=prequantized,
+            src_scale_bytes_per_row=(
+                int(prequantized_scale.shape[-1]) if prequantized else 0
+            ),
         )
         # Dead-tail skip (EP dynamic token count): routes >= num_valid_routes are
         # padding rows of the dispatch buffer and are not gathered/quantized. When
@@ -3077,6 +3243,11 @@ def flydsl_moe_fused_quant_preshuffle(
             route_max_m_arg,
             numel,
             ptr_arg(num_valid_routes_i32),
+            # Read only when prequantized; the quant path must still pass a valid
+            # pointer, so hand it the output scale, which the kernel never loads.
+            ptr_arg(
+                prequantized_scale.view(-1) if prequantized else out_scale.view(-1)
+            ),
             grid_blocks,
             stream=torch.cuda.current_stream(),
         )

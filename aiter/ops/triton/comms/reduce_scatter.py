@@ -17,7 +17,7 @@ import triton.language as tl
 from torch import Tensor
 
 if TYPE_CHECKING:
-    from .iris import IrisCommContext
+    from aiter.ops.triton.comms.iris import IrisCommContext
 
 
 # If we got here, iris is available

@@ -30,6 +30,7 @@ def _get_compiled_mxfp4_gemm1_port(
     BK,
     interleave=False,
     xcd_swizzle=0,
+    act="silu",
 ):
     from .kernels.mxfp4_gemm1 import compile_gemm1_a4w4_port
 
@@ -45,6 +46,7 @@ def _get_compiled_mxfp4_gemm1_port(
         BK=BK,
         interleave=interleave,
         xcd_swizzle=xcd_swizzle,
+        act=act,
     )
 
 
@@ -91,6 +93,9 @@ def flydsl_mxfp4_gemm1(
     BK=256,
     interleave=False,
     xcd_swizzle=0,
+    act="silu",
+    situ_beta=1.0,
+    situ_linear_beta=1.0,
     stream=None,
 ):
     _assert_supported(
@@ -104,6 +109,12 @@ def flydsl_mxfp4_gemm1(
         BN=BN,
         BK=BK,
     )
+    if act == "situv2" and (float(situ_beta) <= 0.0 or float(situ_linear_beta) <= 0.0):
+        # The epilogue takes their reciprocals; non-positive betas give inf/NaN.
+        raise ValueError(
+            "situ_beta/situ_linear_beta must be > 0, got "
+            f"{situ_beta!r}/{situ_linear_beta!r}"
+        )
     from .kernels.mxfp4_gemm1 import gemm1_grid
 
     launch = _get_compiled_mxfp4_gemm1_port(
@@ -118,6 +129,7 @@ def flydsl_mxfp4_gemm1(
         BK,
         interleave,
         xcd_swizzle,
+        act,
     )
     grid = gemm1_grid(n_tokens, BM, NE=NE, TOPK=topk, INTER=D_INTER, BN=BN)
     _moe_kernels._run_compiled(
@@ -135,6 +147,8 @@ def flydsl_mxfp4_gemm1(
             inter_sorted_quant.data_ptr(),
             inter_sorted_shuffled_scale.data_ptr(),
             hidden_states.data_ptr(),
+            float(situ_beta),
+            float(situ_linear_beta),
             torch.cuda.current_stream() if stream is None else stream,
         ),
     )
