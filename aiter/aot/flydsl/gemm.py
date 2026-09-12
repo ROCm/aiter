@@ -12,6 +12,7 @@ way as runtime JIT config lookup.
 
 Supported kernel families:
   - ``flydsl_hgemm_*``                        gfx950 A16W16 GEMM kernels
+  - ``flydsl_hgemm_*_gfx1250``                gfx1250 A16W16 GEMM kernels
   - ``flydsl_bpreshuflle_*``                  a8w8 preshuffle GEMM kernels
   - ``flydsl_bpreshuffle_8w_*``               gfx950 8-wave a8w8 ptpc GEMM kernels
   - ``flydsl_bpreshuffle_wmma_*``             gfx1250 a8w8 ptpc GEMM kernels
@@ -71,8 +72,12 @@ from aiter.ops.flydsl.kernels.gemm_a16w16_gfx950 import (
     gemm_a16w16_gfx950,
     make_gemm_a16w16_param_and_validate,
 )
+from aiter.ops.flydsl.kernels.gemm_a16w16_kernel_gfx1250 import (
+    compile_gemm_a16w16 as compile_gemm_a16w16_gfx1250,
+)
 from aiter.ops.flydsl.kernels.kernels_common import run_cached
 from aiter.ops.flydsl.kernels.preshuffle_gemm import compile_preshuffle_gemm
+from aiter.ops.flydsl.kernels.tensor_shim import ptr_arg
 from aiter.ops.flydsl.mxfp8_128_bpreshuffle_gemm_gfx1250 import (
     BLOCK_K as SCALE_BLOCK_SIZE,
 )
@@ -209,7 +214,11 @@ def parse_csv(csv_path: str):
                 params = get_flydsl_hgemm_kernel_params(kernel_name)
                 if params is not None:
                     params = dict(params)
-                    params["kind"] = "hgemm"
+                    params["kind"] = (
+                        "a16w16_gfx1250"
+                        if params["target_gfx"] == "gfx1250"
+                        else "hgemm"
+                    )
             else:
                 params = None
 
@@ -374,6 +383,104 @@ def _compile_hgemm_to_cache(
             compiler=flyc.compile,
             dispatch_args=dispatch_args,
         )
+
+
+def _compile_a16w16_gfx1250_to_cache(
+    *,
+    m: int,
+    n: int,
+    k: int,
+    dtype: str,
+    out_dtype: str,
+    block_m: int,
+    block_n: int,
+    block_k: int,
+    stages: int,
+    split_k: int,
+    m_waves: int,
+    n_waves: int,
+    k_waves: int,
+    group_m: int,
+    use_half_tile_interleaved: bool,
+    has_bias: bool,
+    target_gfx: str,
+    **kwargs,
+):
+    del kwargs, group_m
+
+    import torch
+
+    if target_gfx != "gfx1250":
+        raise ValueError(
+            f"The FlyDSL gfx1250 A16W16 kernel only supports gfx1250, got {target_gfx}"
+        )
+    if k_waves != 1:
+        raise ValueError(
+            f"The FlyDSL gfx1250 A16W16 kernel only supports k_waves=1, got {k_waves}"
+        )
+
+    torch_dtype = _torch_dtype_for_kernel(dtype)
+    torch_out_dtype = _torch_dtype_for_kernel(out_dtype)
+    if torch_out_dtype not in (torch_dtype, torch.float32):
+        raise ValueError(
+            f"Unsupported output dtype {out_dtype!r} for input dtype {dtype!r}"
+        )
+    in_dtype_str = "fp16" if torch_dtype == torch.float16 else "bf16"
+    out_dtype_str = {torch.float16: "f16", torch.bfloat16: "bf16"}.get(
+        torch_out_dtype, "f32"
+    )
+    fx_dtype = {
+        torch.bfloat16: fx.BFloat16,
+        torch.float16: fx.Float16,
+        torch.float32: fx.Float32,
+        torch.int32: fx.Int32,
+    }
+    launch = compile_gemm_a16w16_gfx1250(
+        N=n,
+        K=k,
+        tile_m=block_m,
+        tile_n=block_n,
+        tile_k=block_k,
+        m_warp=m_waves,
+        n_warp=n_waves,
+        in_dtype=in_dtype_str,
+        out_dtype=out_dtype_str,
+        num_buffers=stages,
+        add_bias=has_bias,
+        split_k=split_k,
+        main_loop_unroll=use_half_tile_interleaved,
+    )
+
+    with compile_only_env():
+        dev = torch.device("cpu")
+        representative_extent = 8
+        a = torch.empty((1, representative_extent), device=dev, dtype=torch_dtype)
+        b = torch.empty((1, representative_extent), device=dev, dtype=torch_dtype)
+        out = torch.empty((1, representative_extent), device=dev, dtype=torch_out_dtype)
+        bias = torch.empty(
+            (representative_extent if has_bias else 0,),
+            device=dev,
+            dtype=torch_dtype if has_bias else torch_out_dtype,
+        )
+        workspace = torch.empty(
+            (representative_extent,), device=dev, dtype=torch.float32
+        )
+        semaphore = torch.zeros((representative_extent,), device=dev, dtype=torch.int32)
+        stream = fx.Stream(0)
+        dispatch_args = (
+            ptr_arg(out, fx_dtype[out.dtype]),
+            ptr_arg(a, fx_dtype[a.dtype]),
+            ptr_arg(b, fx_dtype[b.dtype]),
+            ptr_arg(bias, fx_dtype[bias.dtype]),
+            ptr_arg(workspace, fx_dtype[workspace.dtype]),
+            ptr_arg(semaphore, fx_dtype[semaphore.dtype]),
+            m,
+            n,
+            k,
+            k,
+            stream,
+        )
+        _compile_executable_to_cache(launch, *dispatch_args)
 
 
 def _compile_preshuffle_to_cache(
@@ -679,7 +786,9 @@ def compile_one_config(
 
     t0 = time.time()
     try:
-        tensor_context = nullcontext() if kind == "hgemm" else FakeTensorMode()
+        tensor_context = (
+            nullcontext() if kind in ("hgemm", "a16w16_gfx1250") else FakeTensorMode()
+        )
         with (
             override_env("FLYDSL_GPU_ARCH", aot_arch),
             tensor_context,
@@ -688,6 +797,10 @@ def compile_one_config(
                 hgemm_kwargs = dict(kwargs)
                 hgemm_kwargs["target_gfx"] = aot_arch
                 _compile_hgemm_to_cache(m=m, n=n, k=k, **hgemm_kwargs)
+            elif kind == "a16w16_gfx1250":
+                a16w16_kwargs = dict(kwargs)
+                a16w16_kwargs["target_gfx"] = aot_arch
+                _compile_a16w16_gfx1250_to_cache(m=m, n=n, k=k, **a16w16_kwargs)
             elif kind == "preshuffle":
                 _compile_preshuffle_to_cache(m=m, n=n, k=k, **kwargs)
             elif kind == "8wave":

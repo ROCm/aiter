@@ -15,6 +15,7 @@ from torch import Tensor
 from aiter import logger
 from aiter.jit.utils.chip_info import get_gfx
 
+from .gemm_a16w16_gfx1250 import gemm_a16w16 as gemm_a16w16_gfx1250
 from .kernels.gemm_a16w16_gfx950 import (
     SPLIT_K_SEMAPHORE_MAX_LEN,
     gemm_a16w16,
@@ -138,10 +139,8 @@ def flydsl_hgemm(
     out_dtype: torch.dtype | None = None,
     stream: torch.cuda.Stream | None = None,
 ) -> torch.Tensor:
-    """Run the gfx950 A16W16 kernel with AITER's ``B[N, K]`` convention."""
+    """Run the A16W16 kernel for this arch with AITER's ``B[N, K]`` convention."""
 
-    if get_gfx() != "gfx950":
-        raise RuntimeError("The FlyDSL A16W16 kernel currently supports gfx950 only")
     if policy not in ("ft", "ht", "hti"):
         raise ValueError(f"Unsupported FlyDSL HGEMM policy: {policy!r}")
     launch_stream = (
@@ -149,6 +148,31 @@ def flydsl_hgemm(
     )
     if launch_stream.device != a.device:
         raise ValueError(f"`stream` must be on {a.device}, got {launch_stream.device}")
+
+    gfx = get_gfx()
+    if gfx == "gfx1250":
+        if k_waves != 1:
+            raise ValueError("The gfx1250 FlyDSL A16W16 kernel supports k_waves=1 only")
+        with torch.cuda.stream(launch_stream):
+            return gemm_a16w16_gfx1250(
+                a,
+                b,
+                bias=bias,
+                dtype=out_dtype or a.dtype,
+                y=out,
+                tile_m=block_m,
+                tile_n=block_n,
+                tile_k=block_k,
+                m_warp=m_waves,
+                n_warp=n_waves,
+                num_buffers=stages,
+                split_k=split_k,
+                main_loop_unroll=policy in ("ht", "hti"),
+            )
+    if gfx != "gfx950":
+        raise RuntimeError(
+            "The FlyDSL A16W16 kernel currently supports gfx950 and gfx1250 only"
+        )
 
     if not a.is_contiguous():
         a = a.contiguous()
