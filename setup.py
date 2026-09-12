@@ -21,8 +21,10 @@ PREBUILD_KERNELS = int(os.environ.get("PREBUILD_KERNELS", "0"))
 PRETUNE_MODULES = os.environ.get("PRETUNE_MODULES", "")
 ENABLE_CK = int(os.environ.get("ENABLE_CK", "1"))
 IS_WINDOWS = sys.platform == "win32"
-# Single skip-C++/HIP-build gate; Windows enables it automatically.
-AITER_TRITON_ONLY = os.environ.get("AITER_TRITON_ONLY", "0") == "1" or IS_WINDOWS
+# flydsl publishes Linux-only wheels.
+FLYDSL_REQUIRES = [] if IS_WINDOWS else [FLYDSL_VERSION]
+# Single skip-C++/HIP-build gate.
+AITER_TRITON_ONLY = os.environ.get("AITER_TRITON_ONLY", "0") == "1"
 if AITER_TRITON_ONLY:
     ENABLE_CK = False
     PREBUILD_KERNELS = False
@@ -54,7 +56,7 @@ def is_develop_mode():
     return False
 
 
-if not AITER_TRITON_ONLY and is_develop_mode():
+if not AITER_TRITON_ONLY and not IS_WINDOWS and is_develop_mode():
     try:
         from importlib.metadata import version as pkg_version
 
@@ -209,7 +211,7 @@ if not _is_metadata_only() and not AITER_TRITON_ONLY:
     import json
     from concurrent.futures import ThreadPoolExecutor
 
-    sys.path.insert(0, f"{this_dir}/aiter/")
+    sys.path.insert(0, os.path.join(this_dir, "aiter"))
     from jit import core
     from jit.utils.cpp_extension import IS_HIP_EXTENSION
 
@@ -224,7 +226,9 @@ if not _is_metadata_only() and not AITER_TRITON_ONLY:
     if not IS_ROCM:
         raise NotImplementedError("Only ROCM is supported")
 
-    ck_dir = os.environ.get("CK_DIR", f"{this_dir}/3rdparty/composable_kernel")
+    ck_dir = os.environ.get(
+        "CK_DIR", os.path.join(this_dir, "3rdparty", "composable_kernel")
+    )
     if ENABLE_CK:
         assert os.path.exists(ck_dir), (
             "CK is needed by aiter, please make sure clone by "
@@ -394,18 +398,21 @@ if PREBUILD_KERNELS != 0:
         os.environ["PREBUILD_THREAD_NUM"] = str(prebuid_thread_num)
 
         # --- FlyDSL AOT pre-compilation (MOE + GEMM, before CK) ---
-        _prev_aot_import = os.environ.get("AITER_AOT_IMPORT")
-        os.environ["AITER_AOT_IMPORT"] = "1"
-        try:
-            from aiter.aot.flydsl.common import run_aot
+        if not IS_WINDOWS:
+            _prev_aot_import = os.environ.get("AITER_AOT_IMPORT")
+            os.environ["AITER_AOT_IMPORT"] = "1"
+            try:
+                from aiter.aot.flydsl.common import run_aot
 
-            flydsl_cache_dir = os.path.join(this_dir, "aiter", "jit", "flydsl_cache")
-            run_aot(flydsl_cache_dir)
-        finally:
-            if _prev_aot_import is None:
-                os.environ.pop("AITER_AOT_IMPORT", None)
-            else:
-                os.environ["AITER_AOT_IMPORT"] = _prev_aot_import
+                flydsl_cache_dir = os.path.join(
+                    this_dir, "aiter", "jit", "flydsl_cache"
+                )
+                run_aot(flydsl_cache_dir)
+            finally:
+                if _prev_aot_import is None:
+                    os.environ.pop("AITER_AOT_IMPORT", None)
+                else:
+                    os.environ["AITER_AOT_IMPORT"] = _prev_aot_import
 
         # --- CK kernel builds ---
         with ThreadPoolExecutor(max_workers=prebuid_thread_num) as executor:
@@ -475,7 +482,7 @@ else:
         "einops",
         "psutil",
         "packaging",
-        FLYDSL_VERSION,
+        *FLYDSL_REQUIRES,
     ]
 
 setup(
@@ -490,6 +497,7 @@ setup(
         "Programming Language :: Python :: 3",
         "License :: OSI Approved :: BSD License",
         "Operating System :: Unix",
+        "Operating System :: Microsoft :: Windows",
     ],
     cmdclass={"build_ext": NinjaBuildExtension},
     # 3.8/3.9 have not actually worked for a long time: 81 modules already use

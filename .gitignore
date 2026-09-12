@@ -25,6 +25,7 @@ aiter/install_mode
 *.so.*
 *.dylib
 *.dll
+*.pyd
 build
 blob
 
