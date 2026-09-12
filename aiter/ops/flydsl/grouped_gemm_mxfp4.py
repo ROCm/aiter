@@ -26,6 +26,26 @@ def _select_next_stage_prefetch(csv_next_stage_prefetch: int) -> int:
     return int(value)
 
 
+def _select_as_in_prologue(csv_as_in_prologue: int) -> int:
+    """Selects the environment override or the CSV setting."""
+    value = os.environ.get("AITER_GROUPED_GEMM_AS_PROLOGUE")
+    if value is None:
+        return int(bool(csv_as_in_prologue))
+    value = value.strip()
+    if value not in ("0", "1"):
+        raise ValueError("AITER_GROUPED_GEMM_AS_PROLOGUE must be 0 or 1")
+    return int(value)
+
+
+def _select_tdm_b_th(csv_tdm_b_th: int) -> int:
+    """Selects the B-only TDM temporal hint."""
+    value = os.environ.get("AITER_TDM_B_TH")
+    temporal_hint = int(csv_tdm_b_th) if value is None else int(value.strip())
+    if not 0 <= temporal_hint <= 6:
+        raise ValueError("AITER_TDM_B_TH must be between 0 and 6")
+    return temporal_hint
+
+
 def _select_cluster_n(n_tiles: int, csv_cluster_n: int) -> int:
     """Selects the environment override or CSV cluster degree."""
     env_cluster_n = os.environ.get("AITER_FLYDSL_MXFP4_CLUSTER_N")
@@ -91,6 +111,8 @@ def flydsl_grouped_gemm_a8w4_masked(
     cluster_n=-1,
     waves_per_tensor_tdm=-1,
     next_stage_prefetch=0,
+    tdm_as_in_prologue=0,
+    tdm_b_th=0,
     stage2_scatter: Stage2ScatterContext | None = None,
     ep_destination_stride=0,
     ep_row_map=None,
@@ -152,6 +174,8 @@ def flydsl_grouped_gemm_a8w4_masked(
         cluster_n,
         _select_next_stage_prefetch(next_stage_prefetch),
         waves_per_tensor_tdm,
+        _select_as_in_prologue(tdm_as_in_prologue),
+        _select_tdm_b_th(tdm_b_th),
         enable_ep_scatter=int(enable_ep_scatter),
         ep_arena_handle=(int(stage2_scatter.arena_handle) if enable_ep_scatter else 0),
         ep_combine_input_offset=(
