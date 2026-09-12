@@ -185,9 +185,10 @@ def compile_pa_decode_tile(
     SP_ROW_BYTES = TILE_TOK + 16
     sP_bytes = P_BUFFERS * MFMA_MNK * SP_ROW_BYTES  # fp8, padded rows
     sQscale_off = sP_off + sP_bytes
-    NWARP_PAD = (
-        NWARP + 1
-    )  # coprime with 32 banks -> no LDS bank conflict on the cross-warp scratch
+    # Keep reduction rows 16-byte aligned on the tuned gfx950 page-128 path
+    # so each cross-wave row can be read as one vector. Other paths retain
+    # the padding used to avoid LDS bank conflicts.
+    NWARP_PAD = NWARP if tune_page128 else NWARP + 1
     # Phase-split slices sLmax per M-tile so all pass-1 writes share one barrier.
     sLmax_off = sQscale_off + ROWS_PADDED * f32
     sLsum_off = sLmax_off + M_TILES * MFMA_MNK * NWARP_PAD * f32

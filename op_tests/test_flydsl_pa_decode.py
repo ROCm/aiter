@@ -983,6 +983,26 @@ def test_page128_decode_prefetch_mixed_contexts(all_empty):
     )
 
 
+@pytest.mark.parametrize(
+    "query_group_size,query_length", [(8, 3), (16, 2), (16, 4), (16, 5)]
+)
+@pytest.mark.parametrize("context_length", [129, 1027])
+def test_page128_reduction_rows_across_m_tiles(
+    query_group_size, query_length, context_length
+):
+    """Aligned scratch rows stay independent across padded M-tiles and partitions."""
+    output, reference = _adversarial_case(
+        head_dim=128,
+        context_length=context_length,
+        block_size=128,
+        query_group_size=query_group_size,
+        query_length=query_length,
+        num_partitions=4,
+        trans_v=True,
+    )
+    _assert_matches(output, reference)
+
+
 def main():
     torch.set_default_device("cuda")
     if not torch.cuda.is_available():
