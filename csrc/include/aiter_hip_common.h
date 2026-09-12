@@ -380,44 +380,113 @@ class AiterAsmKernel : private AiterAsmKernelFast
         }
     }
 
+    // Largest .co we are willing to map. The shipped objects are a few hundred KB;
+    // this only exists so a corrupt or bogus tellg() cannot turn into a huge new[].
+    static constexpr std::streamoff kMaxHsacoBytes = 64ll << 20;
+
+    // hsaco_path is a build-generated relative name (e.g. "fmha_v3_bwd/foo.co"). It is
+    // joined onto a configured directory, so it must not be able to walk out of it.
+    static void validate_relative_hsaco_path(const char* hsaco_path)
+    {
+        std::string_view rel(hsaco_path);
+        AITER_CHECK(!rel.empty(), "empty hsaco path");
+        AITER_CHECK(rel.front() != '/', "hsaco path must be relative, got ", hsaco_path);
+        size_t pos = 0;
+        while(true)
+        {
+            size_t next = rel.find('/', pos);
+            size_t len  = (next == std::string_view::npos ? rel.size() : next) - pos;
+            AITER_CHECK(
+                rel.substr(pos, len) != "..", "hsaco path must not contain '..', got ", hsaco_path);
+            if(next == std::string_view::npos)
+                break;
+            pos = next + 1;
+        }
+    }
+
+    const void* load_hsaco_from_dir(const char* kernel_name,
+                                    const char* asm_dir,
+                                    const std::string& arch_name,
+                                    const char* hsaco_path)
+    {
+        validate_relative_hsaco_path(hsaco_path);
+
+        std::string full_path = std::string(asm_dir) + "/" + arch_name + "/" + hsaco_path;
+        AITER_LOG_INFO("LoadKernel: " << kernel_name << " hsaco: " << full_path);
+
+        std::ifstream file(full_path, std::ios::binary | std::ios::ate);
+
+        AITER_CHECK(file.is_open(), "failed to open ", full_path.c_str());
+
+        // tellg() returns -1 on failure; assigning that straight into a size_t used to
+        // produce a SIZE_MAX allocation.
+        std::streamoff size_off = file.tellg();
+        AITER_CHECK(size_off > 0, "empty or unseekable hsaco ", full_path.c_str());
+        AITER_CHECK(size_off <= kMaxHsacoBytes,
+                    "hsaco ",
+                    full_path.c_str(),
+                    " is ",
+                    static_cast<long long>(size_off),
+                    " bytes, above the ",
+                    static_cast<long long>(kMaxHsacoBytes),
+                    " byte limit");
+
+        size_t file_size = static_cast<size_t>(size_off);
+        hsaco_data.reset(new char[file_size]);
+
+        file.seekg(0, std::ios::beg);
+        AITER_CHECK(file.read(hsaco_data.get(), file_size), "failed to read ", full_path.c_str());
+
+        // Reject anything that is not an ELF up front, so a truncated or wrong-format
+        // file fails here instead of somewhere inside the HIP loader.
+        const unsigned char* magic = reinterpret_cast<const unsigned char*>(hsaco_data.get());
+        AITER_CHECK(file_size >= 4 && magic[0] == 0x7f && magic[1] == 'E' && magic[2] == 'L' &&
+                        magic[3] == 'F',
+                    full_path.c_str(),
+                    " is not an ELF code object");
+
+        validate_hsaco_lds(kernel_name, full_path, hsaco_data.get(), file_size);
+
+        return hsaco_data.get();
+    }
+
     const void* load_hsaco_file(const char* kernel_name, const char* hsaco_path)
     {
         const char* AITER_ASM_DIR = std::getenv("AITER_ASM_DIR");
         std::string arch_name     = get_gpu_arch();
+
+#if defined(AITER_EMBEDDED_HSA_HEADER) && defined(AITER_EMBEDDED_HSA_MAP)
+        // This build embedded its code objects at compile time, so they -- not the
+        // environment -- are the trusted source. Redirecting the loader to an arbitrary
+        // directory is a debug facility and has to be opted into by the builder
+        // (-DAITER_ALLOW_ASM_DIR_OVERRIDE), otherwise AITER_ASM_DIR is ignored.
         if(AITER_ASM_DIR != nullptr)
         {
-            std::string full_path = std::string(AITER_ASM_DIR) + "/" + arch_name + "/" + hsaco_path;
-            AITER_LOG_INFO("LoadKernel: " << kernel_name << " hsaco: " << full_path);
-
-            std::ifstream file(full_path, std::ios::binary | std::ios::ate);
-
-            AITER_CHECK(file.is_open(), "failed to open ", full_path.c_str());
-
-            size_t file_size = file.tellg();
-            hsaco_data.reset(new char[file_size]);
-
-            file.seekg(0, std::ios::beg);
-            AITER_CHECK(
-                file.read(hsaco_data.get(), file_size), "failed to read ", full_path.c_str());
-
-            validate_hsaco_lds(kernel_name, full_path, hsaco_data.get(), file_size);
-
-            return hsaco_data.get();
-        }
-        else
-        {
-#if defined(AITER_EMBEDDED_HSA_HEADER) && defined(AITER_EMBEDDED_HSA_MAP)
-            std::string fname = "hsa/" + arch_name + "/" + hsaco_path;
-            auto hasco_obj    = AITER_EMBEDDED_HSA_MAP.find(fname);
-            AITER_CHECK(hasco_obj != AITER_EMBEDDED_HSA_MAP.end(), "hasco_obj not found");
-            AITER_CHECK(hasco_obj->second.data() != nullptr, "hasco_obj is nullptr");
-            AITER_LOG_INFO("LoadKernel: " << kernel_name << " hsaco: [embedded] " << fname);
-            return hasco_obj->second.data();
+#if defined(AITER_ALLOW_ASM_DIR_OVERRIDE)
+            AITER_LOG_WARNING("AITER_ASM_DIR=" << AITER_ASM_DIR
+                                               << " overrides the embedded code objects for '"
+                                               << kernel_name << "'; loading unverified GPU code");
+            return load_hsaco_from_dir(kernel_name, AITER_ASM_DIR, arch_name, hsaco_path);
 #else
-            AITER_CHECK(AITER_ASM_DIR != nullptr, "AITER_ASM_DIR not set");
-            return nullptr;
+            AITER_LOG_WARNING("ignoring AITER_ASM_DIR="
+                              << AITER_ASM_DIR
+                              << "; this build uses embedded code objects. Rebuild with "
+                                 "AITER_ALLOW_ASM_DIR_OVERRIDE to allow the override.");
 #endif
         }
+
+        std::string fname = "hsa/" + arch_name + "/" + hsaco_path;
+        auto hasco_obj    = AITER_EMBEDDED_HSA_MAP.find(fname);
+        AITER_CHECK(hasco_obj != AITER_EMBEDDED_HSA_MAP.end(), "hasco_obj not found");
+        AITER_CHECK(hasco_obj->second.data() != nullptr, "hasco_obj is nullptr");
+        AITER_LOG_INFO("LoadKernel: " << kernel_name << " hsaco: [embedded] " << fname);
+        return hasco_obj->second.data();
+#else
+        // No embedded objects in this build, so loading from disk is the only mechanism.
+        // aiter.jit sets AITER_ASM_DIR to the packaged hsa/ directory on import.
+        AITER_CHECK(AITER_ASM_DIR != nullptr, "AITER_ASM_DIR not set");
+        return load_hsaco_from_dir(kernel_name, AITER_ASM_DIR, arch_name, hsaco_path);
+#endif
     }
 
     public:
