@@ -37,7 +37,7 @@ KV_COMPUTE_BLOCK = 256
 # Pairwise coverage of the normal-accuracy axes in FlyDSL's PA regression test:
 # batches {3, 81, 128}, Q/KV heads {(4,1), (8,1), (16,1)}, head dims
 # {128, 256}, and contexts {1027, 8192}. Keep the original 257-token boundary
-# case as well. Both supported block sizes are crossed with every case in main().
+# case as well. All supported block sizes are crossed with every case in main().
 DEFAULT_BATCH_SIZES = [3, 81, 128]
 DEFAULT_SHAPES = [
     (8, 1, 128, 257),
@@ -430,7 +430,7 @@ def run_pa_decode_tile_case(
     return ret
 
 
-@pytest.mark.parametrize("block_size", [16, 64])
+@pytest.mark.parametrize("block_size", [16, 64, 128])
 def test_pa_decode_tile(block_size):
     if not torch.cuda.is_available():
         pytest.skip("ROCm is not available")
@@ -472,6 +472,8 @@ def _adversarial_case(
     poison_padding_blocks=False,
     tail_value_scale=None,
     seed=0,
+    trans_v=False,
+    num_partitions=1,
 ):
     """Build one case plus its torch reference over the same dequantised fp8 KV.
 
@@ -533,7 +535,14 @@ def _adversarial_case(
         .permute(0, 1, 3, 2, 4)
         .contiguous()
     )
-    value_cache = value.permute(0, 1, 3, 2).contiguous()
+    if trans_v:
+        value_cache = (
+            value.view(blocks, 1, block_size // 16, 16, head_dim)
+            .permute(0, 1, 2, 4, 3)
+            .contiguous()
+        )
+    else:
+        value_cache = value.permute(0, 1, 3, 2).contiguous()
     block_tables = torch.arange(blocks, dtype=dtypes.i32).reshape(1, blocks)
     context_lengths = torch.full((1,), context_length, dtype=dtypes.i32)
 
@@ -561,7 +570,7 @@ def _adversarial_case(
         block_tables,
         head_dim**-0.5,
         query_length,
-        1,
+        num_partitions,
         256,
         quant_dtype,
         None,
@@ -592,7 +601,7 @@ def test_zero_query_stays_finite(query_length, per_token):
     _assert_matches(output, reference)
 
 
-@pytest.mark.parametrize("block_size", [16, 64])
+@pytest.mark.parametrize("block_size", [16, 64, 128])
 @pytest.mark.parametrize("context_length", [1, 257, 1027])
 def test_block_table_padding_is_not_dereferenced(block_size, context_length):
     """Entries past the sequence's extent must resolve to block 0.
@@ -651,6 +660,284 @@ def test_unsupported_head_dim_is_rejected(head_dim):
         _adversarial_case(head_dim=head_dim, context_length=64)
 
 
+def _constant_page_decode_case(
+    lengths,
+    block_size,
+    num_partitions,
+    block_table_width,
+    poison_padding=False,
+    per_token=False,
+):
+    """Each sequence's V pages are constant, so its attention output is known."""
+    _require_gpu()
+    batch_size, query_heads, head_dim = len(lengths), 8, 128
+    pages_per_sequence = [(length + block_size - 1) // block_size for length in lengths]
+    page_values = [
+        float(seq + 1)
+        for seq, pages in enumerate(pages_per_sequence)
+        for _ in range(pages)
+    ]
+    num_pages = len(page_values)
+    quant_dtype = _quant_dtype()
+    query = torch.ones(batch_size, query_heads, head_dim, dtype=dtypes.bf16)
+    key_cache = torch.zeros(
+        num_pages, 1, head_dim // 16, block_size, 16, dtype=quant_dtype
+    )
+    value_cache = (
+        torch.tensor(page_values, dtype=dtypes.fp32)
+        .reshape(num_pages, 1, 1, 1)
+        .expand(num_pages, 1, head_dim, block_size)
+        .contiguous()
+        .to(quant_dtype)
+    )
+    block_tables = torch.full(
+        (batch_size, block_table_width),
+        num_pages + 1024 if poison_padding else 0,
+        dtype=dtypes.i32,
+    )
+    next_page = 0
+    for seq, pages in enumerate(pages_per_sequence):
+        block_tables[seq, :pages] = torch.arange(
+            next_page, next_page + pages, dtype=dtypes.i32
+        )
+        next_page += pages
+    context_lengths = torch.tensor(lengths, dtype=dtypes.i32)
+    scale = torch.ones(
+        (num_pages, 1, block_size, 1) if per_token else (1,), dtype=dtypes.fp32
+    )
+    output = torch.full_like(query, float("nan"))
+    torch.ops.aiter.pa_decode_flydsl(
+        output,
+        query,
+        key_cache,
+        value_cache,
+        context_lengths,
+        block_tables,
+        head_dim**-0.5,
+        1,
+        num_partitions,
+        256,
+        quant_dtype,
+        None,
+        scale,
+        scale,
+    )
+    expected = (
+        torch.tensor(
+            [float(seq + 1) if length else 0.0 for seq, length in enumerate(lengths)],
+            dtype=dtypes.fp32,
+        )
+        .reshape(batch_size, 1, 1)
+        .expand_as(output)
+    )
+    _assert_matches(output.float(), expected, tolerance=0.02)
+
+
+@pytest.mark.parametrize("num_partitions", [1, 4])
+@pytest.mark.parametrize("block_table_width", [1, 2, 3, 4, 5])
+def test_block_table_row_alignment(block_table_width, num_partitions):
+    """A contiguous block table need not have four-entry-aligned row starts."""
+    _constant_page_decode_case([16, 16, 16], 16, num_partitions, block_table_width)
+
+
+@pytest.mark.parametrize("num_partitions", [1, 4])
+@pytest.mark.parametrize("block_size", [16, 64, 128])
+@pytest.mark.parametrize(
+    "lengths,per_token",
+    [
+        pytest.param([64, 0], False, id="mixed"),
+        pytest.param([64, 0], True, id="mixed-per-token"),
+        pytest.param([0, 0], False, id="all-empty"),
+    ],
+)
+def test_empty_contexts_do_not_read_kv(lengths, per_token, block_size, num_partitions):
+    """Empty rows must not follow padding or read an empty KV allocation."""
+    width = 2 * KV_COMPUTE_BLOCK // block_size if any(lengths) else 0
+    _constant_page_decode_case(
+        lengths,
+        block_size,
+        num_partitions,
+        width,
+        poison_padding=True,
+        per_token=per_token,
+    )
+
+
+@pytest.mark.parametrize("context_length", [63, 64, 65, 127, 128, 129, 257])
+@pytest.mark.parametrize("trans_v", [False, True])
+@pytest.mark.parametrize("per_token", [False, True])
+def test_page128_chunk_boundaries(context_length, trans_v, per_token):
+    """Two waves share a page-128, but must load different K/V/scales halves."""
+    _require_gpu()
+    output, reference = _adversarial_case(
+        block_size=128,
+        context_length=context_length,
+        query_group_size=16,
+        trans_v=trans_v,
+        per_token=per_token,
+        num_partitions=4,
+    )
+    _assert_matches(output, reference)
+
+
+@pytest.mark.parametrize("context_length", [2048, 100000, 200000])
+@pytest.mark.parametrize("query_length", [1, 3])
+@pytest.mark.parametrize("per_token", [False, True])
+def test_tp4_page128_contexts(context_length, query_length, per_token):
+    """64 Q / 4 KV heads under TP4: Hq16, Hkv1, D128, including dense MTP."""
+    _require_gpu()
+    output, reference = _adversarial_case(
+        block_size=128,
+        query_group_size=16,
+        context_length=context_length,
+        query_length=query_length,
+        trans_v=True,
+        per_token=per_token,
+        num_partitions=8,
+    )
+    _assert_matches(output, reference)
+
+
+@pytest.mark.parametrize("trans_v", [False, True])
+def test_page128_cache_above_2gib(trans_v):
+    """Large batches at 200k context cross the signed-i32 cache offset limit."""
+    _require_gpu()
+    block_size, head_dim = 128, 128
+    boundary_page = 2**31 // (block_size * head_dim)
+    pages = boundary_page + 2
+    quant_dtype = _quant_dtype()
+    key_cache = torch.empty(pages, 1, 8, block_size, 16, dtype=quant_dtype)
+    value_shape = (
+        (pages, 1, 8, head_dim, 16) if trans_v else (pages, 1, head_dim, block_size)
+    )
+    value_cache = torch.empty(value_shape, dtype=quant_dtype)
+    key_cache[0].zero_()
+    value_cache[0].zero_()
+    page_ids = [boundary_page - 1, boundary_page, boundary_page + 1]
+    for index, page in enumerate(page_ids):
+        key_cache[page].zero_()
+        value_cache[page].fill_(index + 1)
+    query = torch.ones(1, 16, head_dim, dtype=dtypes.bf16)
+    output = torch.empty_like(query)
+    scale = torch.ones(1, dtype=dtypes.fp32)
+    torch.ops.aiter.pa_decode_flydsl(
+        output,
+        query,
+        key_cache,
+        value_cache,
+        torch.tensor([257], dtype=dtypes.i32),
+        torch.tensor([page_ids], dtype=dtypes.i32),
+        head_dim**-0.5,
+        1,
+        8,
+        256,
+        quant_dtype,
+        None,
+        scale,
+        scale,
+    )
+    expected = torch.full_like(output, (128 + 2 * 128 + 3) / 257, dtype=dtypes.fp32)
+    _assert_matches(output.float(), expected, tolerance=0.02)
+
+
+@pytest.mark.parametrize(
+    "block_size,per_token,packed",
+    [
+        (16, False, False),
+        (16, True, False),
+        (16, False, True),
+        (128, False, False),
+        (128, True, False),
+    ],
+)
+def test_prepared_sparse_page_tables(block_size, per_token, packed):
+    """PA consumes selected pages; each MTP query already has its own table.
+
+    Select 2048 tokens from a 200k-token cache. In the page-16 adapter each
+    selected logical page-128 expands to eight physical pages. Packed K/V
+    sides share a block and V has a different base pointer and cache extent.
+    """
+    _require_gpu()
+    torch.manual_seed(7)
+    rows, query_heads, head_dim = 6, 16, 128  # two requests with three MTP queries
+    logical_blocks = (200000 + 127) // 128
+    pages_per_logical = 128 // block_size
+    page_stride = pages_per_logical * (2 if packed else 1)
+    num_pages = logical_blocks * page_stride
+    quant_dtype = _quant_dtype()
+    key = (torch.rand(num_pages, 1, block_size, head_dim) - 0.5).to(quant_dtype)
+    value = (torch.rand_like(key, dtype=dtypes.fp32) - 0.5).to(quant_dtype)
+    key_cache = (
+        key.view(num_pages, 1, block_size, head_dim // 16, 16)
+        .permute(0, 1, 3, 2, 4)
+        .contiguous()
+    )
+    value_cache = (
+        value.view(num_pages, 1, block_size // 16, 16, head_dim)
+        .permute(0, 1, 2, 4, 3)
+        .contiguous()
+    )
+    if packed:
+        # Mirror the adapter's contiguous, overlapping views into interleaved
+        # K/V storage. Only K-side page ids are put into the block table.
+        value_cache = key_cache.flatten()[
+            pages_per_logical * block_size * head_dim :
+        ].view(num_pages - pages_per_logical, 1, block_size // 16, head_dim, 16)
+        value = value_cache.permute(0, 1, 2, 4, 3).reshape(
+            num_pages - pages_per_logical, 1, block_size, head_dim
+        )
+
+    query = (torch.rand(rows, query_heads, head_dim) - 0.5).to(dtypes.bf16)
+    lengths = [2046, 2047, 2048] * 2
+    # Spare entry deliberately leaves page-16 rows non-vector-aligned.
+    block_tables = torch.full(
+        (rows, 16 * pages_per_logical + 1), num_pages + 1024, dtype=dtypes.i32
+    )
+    if per_token:
+        key_scale = 0.5 + torch.rand(num_pages, 1, block_size, 1)
+        value_scale = 0.5 + torch.rand_like(key_scale)
+    else:
+        key_scale = torch.ones(1, dtype=dtypes.fp32)
+        value_scale = torch.ones(1, dtype=dtypes.fp32)
+    reference = torch.empty_like(query, dtype=dtypes.fp32)
+    for row, length in enumerate(lengths):
+        selected = torch.randperm(logical_blocks - 1)[:15]
+        # Partial current block comes last; earlier selections differ per query.
+        selected = torch.cat((selected, selected.new_tensor([logical_blocks - 1])))
+        pages = (
+            selected[:, None] * page_stride + torch.arange(pages_per_logical)[None, :]
+        ).flatten()
+        block_tables[row, : pages.numel()] = pages.to(dtypes.i32)
+        keys = key[pages].float()
+        values = value[pages].float()
+        if per_token:
+            keys = keys * key_scale[pages]
+            values = values * value_scale[pages]
+        keys = keys.reshape(-1, head_dim)[:length]
+        values = values.reshape(-1, head_dim)[:length]
+        scores = query[row].float() @ keys.T * head_dim**-0.5
+        reference[row] = torch.softmax(scores, dim=-1) @ values
+    output = torch.empty_like(query)
+    torch.ops.aiter.pa_decode_flydsl(
+        output,
+        query,
+        key_cache,
+        value_cache,
+        torch.tensor(lengths, dtype=dtypes.i32),
+        block_tables,
+        head_dim**-0.5,
+        1,
+        8,
+        256,
+        quant_dtype,
+        None,
+        key_scale,
+        value_scale,
+        sliding_window=-1,
+    )
+    _assert_matches(output.float(), reference)
+
+
 def main():
     torch.set_default_device("cuda")
     if not torch.cuda.is_available():
@@ -698,8 +985,8 @@ def main():
         "--block-size",
         type=int,
         nargs="*",
-        choices=[16, 64],
-        default=[16, 64],
+        choices=[16, 64, 128],
+        default=[16, 64, 128],
         help="""KV-cache block sizes.""",
     )
     args = parser.parse_args()

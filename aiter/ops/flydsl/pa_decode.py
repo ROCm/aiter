@@ -10,7 +10,7 @@ score, value scale + 1/FP8_MAX into the epilogue); softmax max/sum stay f32.
 ``key_scale``/``value_scale`` are either a ``[1]`` per-tensor scalar or a
 ``[num_blocks, num_kv_heads, block_size, 1]`` per-token tensor.
 
-``block_size`` (16/64) and ``head_dim`` (multiple of 64) are compile-time
+``block_size`` (16/64/128) and ``head_dim`` (multiple of 64) are compile-time
 constants. Layouts are logical, not production's preshuffle.
 
 * ``query``        [num_seqs, num_q_heads, head_dim]  f16/bf16 (head_dim contiguous)
@@ -166,7 +166,10 @@ def pa_decode(
 
     The call signature and intermediate-buffer layouts follow the shared
     aiter paged-attention decode API. This kernel currently supports FP8 K/V caches,
-    BF16/FP16 queries, a 256-token context partition, and block sizes 16/64.
+    BF16/FP16 queries, a 256-token compute tile, and block sizes 16/64/128.
+    Sparse attention uses caller-prepared block tables and selected context
+    lengths. Each independently selected MTP query must have its own table row
+    and use query_length=1; query_length>1 applies dense causal masking.
     ALiBi, attention sinks, sliding-window attention, and externally quantized
     FP8 queries are not supported.
     """
@@ -183,7 +186,7 @@ def pa_decode(
         raise NotImplementedError("pa_decode does not support ALiBi")
     if sinks is not None:
         raise NotImplementedError("pa_decode does not support attention sinks")
-    if sliding_window != 0:
+    if sliding_window not in (0, -1):
         raise NotImplementedError("pa_decode does not support sliding-window attention")
     if query_length < 1:
         raise ValueError(f"query_length must be positive, got {query_length}")
@@ -237,7 +240,8 @@ def pa_decode(
     assert block_size in (
         16,
         64,
-    ), f"pa_decode only supports block_size in (16, 64), got {block_size}"
+        128,
+    ), f"pa_decode only supports block_size in (16, 64, 128), got {block_size}"
 
     trans_v = value_cache.dim() == 5
     if trans_v:
@@ -295,10 +299,9 @@ def pa_decode(
         ("block_tables", block_tables),
         ("context_lengths", context_lengths),
     ):
-        assert tensor.device == dev, (
-            f"{name} must be on the same device as query ({dev}), "
-            f"got {tensor.device}"
-        )
+        assert (
+            tensor.device == dev
+        ), f"{name} must be on the same device as query ({dev}), got {tensor.device}"
     for name, tensor in (
         ("key_cache", key_cache),
         ("value_cache", value_cache),

@@ -10,7 +10,7 @@ score, value scale + 1/FP8_MAX into the epilogue); softmax max/sum stay f32.
 ``key_scale``/``value_scale`` are either a ``[1]`` per-tensor scalar or a
 ``[num_blocks, num_kv_heads, block_size]`` per-token tensor (chosen by rank).
 
-``block_size`` (16/64) and ``head_dim`` (multiple of 64) are compile-time
+``block_size`` (16/64/128) and ``head_dim`` (multiple of 64) are compile-time
 constants. Layouts are logical, not production's preshuffle.
 
 * ``query``        [num_seqs, num_q_heads, head_dim]  f16/bf16 (head_dim contiguous)
@@ -101,7 +101,8 @@ def compile_pa_decode_tile(
     assert block_size in (
         16,
         64,
-    ), f"pa_decode_tile only supports block_size in (16, 64), got {block_size}"
+        128,
+    ), f"pa_decode_tile only supports block_size in (16, 64, 128), got {block_size}"
     assert query_dtype in (
         "f16",
         "bf16",
@@ -121,9 +122,8 @@ def compile_pa_decode_tile(
     NWARP = 4  # 4 waves / CTA
     TOK_PER_WARP = 64  # tokens each warp owns per compute block (matches production KV_COMPUTE_BLOCK)
     TILE_TOK = NWARP * TOK_PER_WARP  # 256 tokens / compute block
-    PAGES_PER_CHUNK = (
-        TOK_PER_WARP // block_size
-    )  # pages spanned by one 64-token warp-chunk: 1 (bs=64) or 4 (bs=16)
+    # A warp owns 64 tokens: four page-16s, one page-64, or half a page-128.
+    PAGES_PER_CHUNK = cdiv(TOK_PER_WARP, block_size)
     assert (
         head_dim % (NWARP * MFMA_MNK) == 0
     ), "head_dim must split across the 4 warps for PV"
@@ -306,10 +306,12 @@ def compile_pa_decode_tile(
         bt_num_records_bytes = (
             fx.Index(gpu.grid_dim.x) * fx.Index(max_blocks_per_seq) * 4
         )  # int32 entries
+        # Wide loads must preserve row starts that are only int32-aligned.
         bt_buf = ptr_buf_tensor(
             block_tables_ptr,
             fx.Int32,
             unit_elems=PAGES_PER_CHUNK,
+            unit_stride=1,
             num_records_bytes=bt_num_records_bytes,
         )
         # Per-tensor: a single global scale, read once. Per-token: read
@@ -358,10 +360,10 @@ def compile_pa_decode_tile(
         NCHUNK = TILE_TOK // TOK_CHUNK  # 4
 
         if const_expr(per_token_kv):
-            scale_load_width = NCHUNK if block_size == 64 else 1
+            scale_load_width = NCHUNK if block_size >= 64 else 1
             scale_copy_op = (
                 fx.rocdl.BufferCopy128b()
-                if block_size == 64
+                if block_size >= 64
                 else fx.rocdl.BufferCopy32b()
             )
             scale_copy_atom = fx.make_copy_atom(scale_copy_op, fx.Float32)
@@ -405,7 +407,7 @@ def compile_pa_decode_tile(
             frag = fx.make_fragment_like(fx.slice(bt_buf, (0, None)))
             fx.copy(
                 bt_copy_atom,
-                fx.slice(bt_buf, (element_offset // fx.Int32(vec_width), None)),
+                fx.slice(bt_buf, (element_offset, None)),
                 frag,
             )
             loaded = fx.Vector(fx.memref_load_vec(frag))
@@ -422,7 +424,7 @@ def compile_pa_decode_tile(
             # its rgroup row and broadcasts via LDS (read back by _v_page_read_row).
             base_page = tt_i32 * TILE_TOK // block_size  # tile start is page-aligned
             fetched = _load_phys_scalar(
-                base_page + warp * PAGES_PER_CHUNK, PAGES_PER_CHUNK
+                base_page + (warp * TOK_PER_WARP) // block_size, PAGES_PER_CHUNK
             )
             if lane == 0:
                 fetched_vec = (
@@ -445,13 +447,14 @@ def compile_pa_decode_tile(
             return 0
 
         def _stage_kv_scale_to_lds(phys_vec, buf_off=0):
-            if const_expr(block_size == 64):
+            if const_expr(block_size >= 64):
                 phys = fx.Int32(phys_vec[0])
-                base_tok = lane16 * NCHUNK
-                scale_idx = phys * stride_ks_block + kv_h * stride_ks_head + base_tok
+                chunk_tok = lane16 * NCHUNK
+                page_tok = (warp * TOK_PER_WARP) % block_size + chunk_tok
+                scale_idx = phys * stride_ks_block + kv_h * stride_ks_head + page_tok
                 k_scale_vec = _k_scale_load(scale_idx)
                 v_scale_vec = _v_scale_load(scale_idx)
-                slot = (warp * TOK_PER_WARP + base_tok) * f32
+                slot = (warp * TOK_PER_WARP + chunk_tok) * f32
                 _lds_store(sKScale_off + buf_off + slot, fx.Float32, k_scale_vec)
                 _lds_store(sVScale_off + buf_off + slot, fx.Float32, v_scale_vec)
             else:
@@ -488,7 +491,7 @@ def compile_pa_decode_tile(
         # token = warp*TOK_CHUNK + a*c16 + lane16 (the softmax mask and P-pack
         # write position below must encode this same formula).
         def _k_ops(phys, a):
-            within_page_tok = (a * c16 + lane16) % block_size
+            within_page_tok = (warp * TOK_PER_WARP + a * c16 + lane16) % block_size
             ops = []
             for qkhe in range_constexpr(QKHE_LOOP):
                 he_idx = qkhe * RGROUP_QUARTERS + rgroup
@@ -508,7 +511,7 @@ def compile_pa_decode_tile(
         def _k_ops_flat(tt_i32):
             base_page = tt_i32 * TILE_TOK // block_size  # tile start is page-aligned
             fetched = _load_phys_scalar(
-                base_page + warp * PAGES_PER_CHUNK, PAGES_PER_CHUNK
+                base_page + (warp * TOK_PER_WARP) // block_size, PAGES_PER_CHUNK
             )
             phys_vec = (
                 fx.Vector.from_elements([fx.Int32(fetched)], dtype=fx.Int32)
@@ -524,15 +527,22 @@ def compile_pa_decode_tile(
 
             return fx.Vector.from_elements(flat, dtype=fx.Int64), phys_vec
 
-        # -- prologue: prefetch the first tile's K --
-        num_tiles_m1 = num_tiles - 1
-        start_safe = (part_start < num_tiles).select(part_start, num_tiles_m1)
-        k_pf0, phys_vec0 = _k_ops_flat(start_safe)
-        # V page-index prefetch, issued here too for the same overlap; the
-        # LDS write is visible after the barrier below.
-        _v_page_fetch_and_stage(start_safe)
-        if const_expr(per_token_kv):
-            _stage_kv_scale_to_lds(phys_vec0, _kv_buf_off(fx.Int32(start_safe)))
+        # Empty partitions retain neutral state and must not read K/V or the
+        # block table. In particular, an empty context has no valid first tile.
+        k_pf0 = fx.Vector.filled(NCHUNK * N_SUBCHUNKS, 0, fx.Int64)
+        if part_start < part_end:
+            k_pf0, phys_vec0 = _k_ops_flat(part_start)
+            # Issue the V page-index prefetch alongside K; the LDS write is
+            # visible after the barrier below.
+            _v_page_fetch_and_stage(part_start)
+            if const_expr(per_token_kv):
+                _stage_kv_scale_to_lds(phys_vec0, _kv_buf_off(fx.Int32(part_start)))
+        elif lane == 0:
+            _lds_store(
+                sVPage_off + warp * (PAGES_PER_CHUNK * 4),
+                fx.Int32,
+                fx.Vector.filled(PAGES_PER_CHUNK, 0, fx.Int32),
+            )
 
         # per_token_kv has no single global key_scale/value_scale: scale_qk
         # drops the key_scale factor (folded in per-token, see masked_chunks
@@ -700,25 +710,32 @@ def compile_pa_decode_tile(
         # changes the offset formula. `sub`/`step` walk pages/16-token sub-blocks.
         NVOPS = TILE_TOK // MFMA_K  # 8 PV k_steps (256 tokens / K=32)
         STEPS_PER_PAGE = block_size // 16
+        STEPS_PER_CHUNK = min(block_size, TOK_PER_WARP) // 16
 
         def _v_ops(phys_row, vh):
             head_group = ((vh * VHE_SIZE) // 16) + warp
             head_element = head_group * 16 + lane16
             ops = []
             for sub in range_constexpr(PAGES_PER_CHUNK):
-                for step in range_constexpr(STEPS_PER_PAGE):
+                for step in range_constexpr(STEPS_PER_CHUNK):
+                    # PV's token chunk is owned by rgroup after the LDS transpose.
+                    page_step = ((rgroup * TOK_PER_WARP) % block_size) // 16 + step
                     if const_expr(trans_v):
                         base = _kv_addr(
                             phys_row[sub],
                             n_kv * (STEPS_PER_PAGE * head_dim * 16),
-                            ((kv_h * STEPS_PER_PAGE + step) * head_dim + head_element)
+                            (
+                                (kv_h * STEPS_PER_PAGE + page_step) * head_dim
+                                + head_element
+                            )
                             * 16,
                         )
                     else:
                         base = _kv_addr(
                             phys_row[sub],
                             n_kv * (head_dim * block_size),
-                            (kv_h * head_dim + head_element) * block_size + step * 16,
+                            (kv_h * head_dim + head_element) * block_size
+                            + page_step * 16,
                         )
                     w = _v_load16(base)
                     if const_expr(block_size == 16):
