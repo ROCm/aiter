@@ -4,15 +4,16 @@
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl._mlir import ir
-from flydsl._mlir.dialects import fly, llvm
+from flydsl._mlir.dialects import llvm
 from flydsl.expr import (
-    arith,
     const_expr,
     gpu,
     range_constexpr,
     rocdl,
 )
 from flydsl.expr.typing import T
+
+from .tensor_shim import buf_base_i64
 
 GFX950_DMA_BYTES = 16
 GFX950_WAVE_SIZE = 64
@@ -25,13 +26,9 @@ def wait_vmcnt_and_barrier(vmcnt=0):
 
 
 def get_llvm_ptr(ptr, offset, dtype_bytes, ptr_type):
-    base_ptr = fly.extract_aligned_pointer_as_index(ptr_type, ptr)
-    base_ptr = llvm.PtrToIntOp(T.i64, base_ptr).result
-    byte_offset = arith.index_cast(T.i64, fx.Index(offset) * fx.Index(dtype_bytes))
-    llvm_ptr = llvm.AddOp(base_ptr, byte_offset, llvm.IntegerOverflowFlags(0)).result
-    llvm_ptr = llvm.IntToPtrOp(ptr_type, llvm_ptr).result
-    ptr_v = llvm_ptr._value if const_expr(hasattr(llvm_ptr, "_value")) else llvm_ptr
-    return ptr_v
+    byte_offset = fx.Int64(fx.Index(offset) * fx.Index(dtype_bytes))
+    address = buf_base_i64(ptr) + byte_offset
+    return llvm.IntToPtrOp(ptr_type, address.ir_value()).result
 
 
 def store_global_f32_vec(c_ptr, global_offset, vec, vec_size):
@@ -205,7 +202,7 @@ class SplitKProtocol:
                     ir.Type.parse("!llvm.ptr<1>"),
                 )
                 llvm.StoreOp(
-                    arith.constant(1, type=T.i32),
+                    fx.Int32(1).ir_value(),
                     signal_ptr,
                     alignment=4,
                     ordering=llvm.AtomicOrdering.monotonic,
@@ -251,7 +248,7 @@ class SplitKProtocol:
             4,
             ir.Type.parse("!llvm.ptr<1>"),
         )
-        zero = arith.constant(0, type=T.i32)
+        zero = fx.Int32(0).ir_value()
         llvm.StoreOp(
             zero,
             semaphore_ptr,
@@ -280,7 +277,7 @@ class SplitKProtocol:
             arrive_idx = llvm.AtomicRMWOp(
                 llvm.AtomicBinOp.add,
                 semaphore_ptr,
-                arith.constant(1, type=T.i32),
+                fx.Int32(1).ir_value(),
                 llvm.AtomicOrdering.monotonic,
                 syncscope="agent",
                 alignment=4,

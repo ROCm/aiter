@@ -3,22 +3,27 @@
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-from flydsl._mlir.dialects import llvm
 from flydsl.expr import arith, const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import T
 
 from . import dpp_utils
+from .act import sigmoid_batch, tanh_batch
 from .layout_utils import crd2idx
 from .mxfp4_gemm_common import (
     _e8m0_from_amax,
     _e8m0_roundup,
     _fabs_f32,
+    _global_i32_buffer_tiles,
+    _global_i32_buffer_view,
     _inline_dpp_quad_amax,
     _lds_swizzle_mask,
     _raw,
+    _udiv,
     _umax_i32,
+    _umod,
     bq_bytes_for,
     bscale_bytes_for,
+    global_typed_ptr,
     k_half_for,
     k_tiles_total_for,
     kas_per_chunk_dw_for,
@@ -33,25 +38,10 @@ from .mxfp4_gemm_common import (
 )
 
 
-def _udiv(a, c):
-    return fx.Int32(fx.Uint32(a) // fx.Uint32(c))
-
-
-def _umod(a, c):
-    return fx.Int32(fx.Uint32(a) % fx.Uint32(c))
-
-
-def _global_i32_ptr(addr_i64):
-    ptr_ty = fx.PointerType.get(
-        T.i32, address_space=fx.AddressSpace.Global, alignment=4
-    )
-    return fx.inttoptr(ptr_ty, fx.Int64(addr_i64))
-
-
 def _global_i32_at(addr_i64, idx):
     # fx.ptr_load/add_offset for a plain scalar read -- no tiling needed, so
     # skip the Tensor/tile/register-fragment machinery fx.copy requires.
-    return _global_i32_ptr(addr_i64)[idx]
+    return global_typed_ptr(addr_i64, T.i32)[idx]
 
 
 def _global_i32_load(tiles, idx):
@@ -93,36 +83,13 @@ def n_out_for(inter):
     return 2 * inter
 
 
-LOG2E = 1.4426950408889634
-
-
-def _sigmoid_batch(xs):
-    e = [fx.Float32(rocdl.exp2(T.f32, _raw(x * fx.Float32(-LOG2E)))) for x in xs]
-    return [fx.Float32(rocdl.rcp(T.f32, _raw(fx.Float32(1.0) + ei))) for ei in e]
-
-
-def _tanh_batch(xs):
-    neg_two_log2e = fx.Float32(-2.8853900817779268)
-    es = []
-    for x in xs:
-        abs_x = x.maximumf(-x)
-        es.append(fx.Float32(rocdl.exp2(T.f32, _raw(abs_x * neg_two_log2e))))
-    recips = [fx.Float32(rocdl.rcp(T.f32, _raw(fx.Float32(1.0) + e))) for e in es]
-    zero = fx.Float32(0.0)
-    out = []
-    for i, x in enumerate(xs):
-        tanh_abs = (fx.Float32(1.0) - es[i]) * recips[i]
-        out.append((x > zero).select(tanh_abs, -tanh_abs))
-    return out
-
-
 def _activation_mul_batch(gs, us, act, situ_beta, situ_linear_beta):
-    sig = _sigmoid_batch(gs)
+    sig = sigmoid_batch(gs)
     if const_expr(act == "situv2"):
         beta_rcp = fx.Float32(rocdl.rcp(T.f32, _raw(situ_beta)))
         linear_beta_rcp = fx.Float32(rocdl.rcp(T.f32, _raw(situ_linear_beta)))
-        gt = _tanh_batch([g * beta_rcp for g in gs])
-        ut = _tanh_batch([u * linear_beta_rcp for u in us])
+        gt = tanh_batch([g * beta_rcp for g in gs])
+        ut = tanh_batch([u * linear_beta_rcp for u in us])
         return [
             situ_beta * gt[i] * sig[i] * situ_linear_beta * ut[i]
             for i in range(len(gs))
@@ -131,12 +98,9 @@ def _activation_mul_batch(gs, us, act, situ_beta, situ_linear_beta):
 
 
 def _pkmax_u16(a_i32, b_i32):
-    _v2i16 = T.vec(2, T.i16)
-    va = llvm.BitcastOp(_v2i16, _raw(a_i32)).result
-    vb = llvm.BitcastOp(_v2i16, _raw(b_i32)).result
-    vm = arith.MaxUIOp(va, vb).result
-    out = llvm.BitcastOp(T.i32, vm).result
-    return fx.Int32(out)
+    va = fx.Vector.from_elements([a_i32], fx.Int32).bitcast(fx.Uint16)
+    vb = fx.Vector.from_elements([b_i32], fx.Int32).bitcast(fx.Uint16)
+    return fx.max(va, vb).bitcast(fx.Int32)[0]
 
 
 def _inline_e8m0(amax_u16_i32):
@@ -221,27 +185,6 @@ def _gemm1_body(
     aq_num_records = fx.Int64(i32_ntok * fx.Int32(K_HALF))
     _asc_per_mb = max(BM // 32, 1) * kAS_per_chunk_dw * 4
     ascale_num = fx.Int64(i32_total_m_blocks) * fx.Int64(_asc_per_mb)
-
-    # fx.copy's BufferCopy/BufferCopyLDS atoms take soffset as an element count,
-    # not the bytes buffer_ops.buffer_load's soffset_bytes expects.
-    def _global_i32_buffer_view(addr_i64, num_bytes):
-        # make_layout's dynamic-shape leaf must be i32/i64, not fx.Index.
-        num_bytes_i64 = fx.Int64(num_bytes)
-        ptr_ty = fx.PointerType.get(
-            T.i32, address_space=fx.AddressSpace.Global, alignment=4
-        )
-        ptr = fx.inttoptr(ptr_ty, fx.Int64(addr_i64))
-        view = fx.Tensor(
-            fx.make_view(ptr, fx.make_layout(num_bytes_i64 // fx.Int64(4), 1))
-        )
-        return fx.rocdl.make_buffer_tensor(
-            view, max_size=False, num_records_bytes=num_bytes_i64
-        )
-
-    def _global_i32_buffer_tiles(addr_i64, num_bytes, tile_elems):
-        return fx.logical_divide(
-            _global_i32_buffer_view(addr_i64, num_bytes), fx.make_layout(tile_elems, 1)
-        )
 
     bq_tiles = _global_i32_buffer_tiles(arg_bq, BQ_BYTES, 4)
     bq_copy_atom = fx.make_copy_atom(fx.rocdl.BufferCopy128b(b_aux), fx.Int32)

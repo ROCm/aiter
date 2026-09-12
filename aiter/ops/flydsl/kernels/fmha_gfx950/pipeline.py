@@ -4,21 +4,21 @@
 
 """Per-block forward pass: shared primitives, traits, and the kernel context."""
 
-import math as host_math
 from dataclasses import dataclass
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl._mlir import ir
-from flydsl._mlir.dialects import fly, llvm, vector
-from flydsl.expr import arith, const_expr, gpu, range_constexpr, rocdl
+from flydsl._mlir.dialects import fly, llvm
+from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import T
 from flydsl.expr.typing import Vector as Vec
 from flydsl.expr.utils.arith import _to_raw as as_mlir_value
 
 from aiter.ops.flydsl.kernels import buffer_ops
 
-_LOG2E = host_math.log2(host_math.e)
+from ..act import LOG2E as _LOG2E
+
 _LN2 = 1.0 / _LOG2E
 
 # log2 of e4m3's largest finite value, 448.
@@ -50,7 +50,7 @@ def _read_exec_i64():
 
 def _ds_read_tr8_b64_imm(result_type, addr_i32, imm_offset=0):
     imm = int(imm_offset)
-    raw_type = ir.VectorType.get([2], ir.IntegerType.get_signless(32))
+    raw_type = T.vec(2, T.i32)
     raw = llvm.inline_asm(
         raw_type,
         [as_mlir_value(addr_i32)],
@@ -58,7 +58,11 @@ def _ds_read_tr8_b64_imm(result_type, addr_i32, imm_offset=0):
         "=v,v,~{memory}",
         has_side_effects=True,
     )
-    return vector.BitCastOp(result_type, raw).result
+    return (
+        Vec(raw)
+        .bitcast(fx.Numeric.from_ir_type(ir.VectorType(result_type).element_type))
+        .ir_value()
+    )
 
 
 def _bitcast_i32(value):
@@ -646,9 +650,9 @@ def _init_dualwave_thread_mapping(ctx):
         (_tid_i32 // fx.Int32(traits.WARP_SIZE)).ir_value(),
     )
     # Two stagger groups, whatever the wave count.
-    ctx.stagger_i32 = arith.divsi(
-        _wave_id_uni_i32, as_mlir_value(fx.Int32(traits.NUM_WAVES // 2))
-    )
+    ctx.stagger_i32 = (
+        fx.Int32(_wave_id_uni_i32) // fx.Int32(traits.NUM_WAVES // 2)
+    ).ir_value()
     ctx.wave_id_uni = fx.Index(_wave_id_uni_i32)
 
     ctx.wave_q_offset = ctx.wave_id * traits.ROWS_PER_WAVE

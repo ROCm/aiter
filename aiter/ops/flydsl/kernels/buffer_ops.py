@@ -33,8 +33,8 @@ from __future__ import annotations
 
 import inspect
 
+import flydsl.expr as fx
 from flydsl._mlir import ir
-from flydsl._mlir.dialects import arith as std_arith
 from flydsl._mlir.dialects import llvm, rocdl
 from flydsl._mlir.extras import types as T
 from flydsl.expr.meta import dsl_loc_tracing
@@ -119,52 +119,6 @@ def _unwrap_value(value):
 
 
 @dsl_loc_tracing
-def _create_i32_constant(value: int) -> ir.Value:
-    """Create i32 constant using standard MLIR arith dialect."""
-    i32_type = T.i32()
-    if value > 0x7FFFFFFF:
-        value = int(value - 2**32)
-    attr = ir.IntegerAttr.get(i32_type, value)
-    op = std_arith.ConstantOp(i32_type, attr)
-    return _unwrap_value(op.result)
-
-
-def _to_i32_offset(offset: ir.Value) -> ir.Value:
-    """Normalize an already-unwrapped offset value to i32.
-
-    Accepts index (index_cast), i32 (as-is), wider ints e.g. i64 (trunc), and
-    narrower ints (sign-extend). Lets callers pass fx.Int64 offsets (element or
-    byte) without hitting the ``index_cast i64<->i32`` incompatibility.
-    """
-    ot = offset.type
-    if isinstance(ot, ir.IntegerType):
-        if ot.width == 32:
-            return offset
-        if ot.width > 32:
-            return _unwrap_value(std_arith.TruncIOp(T.i32(), offset).result)
-        return _unwrap_value(std_arith.ExtSIOp(T.i32(), offset).result)
-    return _unwrap_value(std_arith.IndexCastOp(T.i32(), offset).result)
-
-
-@dsl_loc_tracing
-def _create_i16_constant(value: int) -> ir.Value:
-    """Create i16 constant using standard MLIR arith dialect."""
-    i16_type = T.i16()
-    attr = ir.IntegerAttr.get(i16_type, value)
-    op = std_arith.ConstantOp(i16_type, attr)
-    return _unwrap_value(op.result)
-
-
-@dsl_loc_tracing
-def _create_i64_constant(value: int) -> ir.Value:
-    """Create i64 constant using standard MLIR arith dialect."""
-    i64_type = T.i64()
-    attr = ir.IntegerAttr.get(i64_type, value)
-    op = std_arith.ConstantOp(i64_type, attr)
-    return _unwrap_value(op.result)
-
-
-@dsl_loc_tracing
 def _ptr8_to_v4i32(ptr8_val) -> ir.Value:
     """Reinterpret a buffer resource (!llvm.ptr<8>) as a <4 x i32> vector.
 
@@ -207,10 +161,7 @@ def get_element_ptr(
     else:
         offset_val = _unwrap_value(byte_offset)
         if isinstance(offset_val.type, ir.IndexType):
-            i64_type = T.i64()
-            offset_val = _unwrap_value(
-                std_arith.IndexCastOp(i64_type, offset_val).result
-            )
+            offset_val = fx.Int64(offset_val).ir_value()
         elif not isinstance(offset_val.type, ir.IntegerType):
             raise TypeError(
                 "byte_offset must be int, index, or integer-typed MLIR value; "
@@ -218,6 +169,10 @@ def get_element_ptr(
             )
 
         if static_byte_offset != 0:
+            # GEP accepts arbitrary IR integer widths, including widths without
+            # a corresponding fx scalar type.
+            from flydsl._mlir.dialects import arith as std_arith
+
             static_type = offset_val.type
             static_attr = ir.IntegerAttr.get(static_type, int(static_byte_offset))
             static_const = _unwrap_value(
@@ -294,8 +249,8 @@ class BufferResourceDescriptor:
 
         # Create buffer resource descriptor
         flags_val = _get_buffer_flags()
-        flags = _create_i32_constant(flags_val)
-        stride_val = _create_i16_constant(stride)
+        flags = fx.Int32(flags_val).ir_value()
+        stride_val = fx.Int16(stride).ir_value()
 
         def _num_records_from_memref_type() -> int | None:
             """Best-effort: derive logical buffer size (in bytes) from static memref type."""
@@ -327,30 +282,22 @@ class BufferResourceDescriptor:
                 nbytes = max(0, nbytes)
                 # Descriptor uses i32 bytes; clamp to the max representable.
                 nbytes = min(nbytes, 0xFFFFFFFF)
-                num_records = _create_i64_constant(nbytes)
+                num_records = fx.Int64(nbytes).ir_value()
             else:
-                v = _unwrap_value(num_records_bytes)
-                i64_type = T.i64()
-                if not isinstance(v.type, ir.IntegerType) or v.type.width != 64:
-                    if isinstance(v.type, ir.IndexType):
-                        op = std_arith.IndexCastOp(i64_type, v)
-                    else:
-                        op = std_arith.ExtSIOp(i64_type, v)
-                    v = _unwrap_value(op.result)
-                num_records = v
+                num_records = fx.Int64(_unwrap_value(num_records_bytes)).ir_value()
         elif max_size:
             # Use max for flexibility (hardware will check actual bounds)
             # Note: FlyDSL's rocdl.make.buffer.rsrc requires i32, not i64
-            num_records = _create_i64_constant(0xFFFFFFFF)  # FALLBACK_MAX_SIZE
+            num_records = fx.Int64(0xFFFFFFFF).ir_value()  # FALLBACK_MAX_SIZE
         else:
             # Use the logical memref size (in bytes) for hardware OOB checking.
             nbytes = _num_records_from_memref_type()
             if nbytes is None:
                 # Fall back to max-size if we can't infer statically.
-                num_records = _create_i64_constant(0xFFFFFFFF)
+                num_records = fx.Int64(0xFFFFFFFF).ir_value()
             else:
                 nbytes = min(nbytes, 0xFFFFFFFF)
-                num_records = _create_i64_constant(int(nbytes))
+                num_records = fx.Int64(int(nbytes)).ir_value()
 
         # Create resource descriptor (returns !llvm.ptr<8>)
         rsrc_type = ir.Type.parse("!llvm.ptr<8>")
@@ -388,28 +335,15 @@ def create_buffer_resource_from_addr(
     addr_i64 = _unwrap_value(addr_i64)
     ptr_type = ir.Type.parse("!llvm.ptr")
     base_ptr = llvm.IntToPtrOp(ptr_type, addr_i64).result
-    flags = _create_i32_constant(_get_buffer_flags())
-    stride = _create_i16_constant(0)
+    flags = fx.Int32(_get_buffer_flags()).ir_value()
+    stride = fx.Int16(0).ir_value()
     if num_records_bytes is None:
-        num_records = _create_i64_constant(0xFFFFFFFF)
+        num_records = fx.Int64(0xFFFFFFFF).ir_value()
     elif isinstance(num_records_bytes, int):
         nbytes = max(0, min(int(num_records_bytes), 0xFFFFFFFF))
-        num_records = _create_i64_constant(nbytes)
+        num_records = fx.Int64(nbytes).ir_value()
     else:
-        num_records = _unwrap_value(num_records_bytes)
-        i64_type = T.i64()
-        if (
-            not isinstance(num_records.type, ir.IntegerType)
-            or num_records.type.width != 64
-        ):
-            if isinstance(num_records.type, ir.IndexType):
-                num_records = _unwrap_value(
-                    std_arith.IndexCastOp(i64_type, num_records).result
-                )
-            else:
-                num_records = _unwrap_value(
-                    std_arith.ExtSIOp(i64_type, num_records).result
-                )
+        num_records = fx.Int64(_unwrap_value(num_records_bytes)).ir_value()
     rsrc_type = ir.Type.parse("!llvm.ptr<8>")
     return rocdl.MakeBufferRsrcOp(
         rsrc_type, base_ptr, stride, num_records, flags
@@ -515,29 +449,17 @@ def buffer_load(
     elif hasattr(dtype, "ir_type"):
         dtype = dtype.ir_type
 
-    # Unwrap offset first (accept Python ints and DSL Numeric values).
-    if isinstance(offset, int):
-        offset = _create_i32_constant(offset)
-    elif hasattr(offset, "ir_value"):
-        offset = offset.ir_value()
-    offset = _unwrap_value(offset)
-
-    # Convert offset to i32 if needed (accepts index/i64/i32)
-    offset = _to_i32_offset(offset)
+    # Buffer offsets truncate wider integers and sign-extend narrower ones.
+    offset = fx.Int32(_unwrap_value(offset))
 
     # IMPORTANT: Buffer load offset is in BYTES, not elements!
     # For vec4xf32, each element is 4 bytes, so multiply offset by 4
     element_bytes = dtype.width // 8
-    bytes_const = _create_i32_constant(element_bytes)
-    op = std_arith.MulIOp(offset, bytes_const)
-    offset = _unwrap_value(op.result)
+    offset = offset * element_bytes
 
     # Apply mask by setting invalid offsets to max
     if mask is not None:
-        mask = _unwrap_value(mask)
-        max_offset = _create_i32_constant(0x7FFFFFFF)
-        op = std_arith.SelectOp(mask, offset, max_offset)
-        offset = _unwrap_value(op.result)
+        offset = fx.Boolean(_unwrap_value(mask)).select(offset, 0x7FFFFFFF)
 
     # Create vector type
     if vec_width == 1:
@@ -549,35 +471,31 @@ def buffer_load(
     # byte offset computed above. Returns i32 (vec_width 1) or v4i32 (vec_width 4).
     if is_scalar:
         rsrc_v4 = _ptr8_to_v4i32(rsrc)
-        cache_policy = _create_i32_constant(cache_modifier)
+        cache_policy = fx.Int32(cache_modifier).ir_value()
         suffix = "i32" if vec_width == 1 else "v4i32"
         return llvm.call_intrinsic(
             result_type,
             f"llvm.amdgcn.s.buffer.load.{suffix}",
-            [rsrc_v4, offset, cache_policy],
+            [rsrc_v4, offset.ir_value(), cache_policy],
             [],
             [],
         )
 
     # Create instruction offset and aux flags
-    if soffset_bytes is None:
-        soffset = _create_i32_constant(0)
-    else:
-        if isinstance(soffset_bytes, int):
-            soffset = _create_i32_constant(soffset_bytes)
-        else:
-            soffset = _to_i32_offset(_unwrap_value(soffset_bytes))
+    soffset = fx.Int32(
+        0 if soffset_bytes is None else _unwrap_value(soffset_bytes)
+    ).ir_value()
     aux = (
         ir.IntegerAttr.get(ir.IntegerType.get_signless(32), cache_modifier)
         if _RAW_PTR_BUFFER_AUX_IS_ATTRIBUTE
-        else _create_i32_constant(cache_modifier)
+        else fx.Int32(cache_modifier).ir_value()
     )
 
     # Emit buffer load
     load_op = rocdl.RawPtrBufferLoadOp(
         result_type,
         rsrc,
-        offset,
+        offset.ir_value(),
         soffset,
         aux=aux,
     )
@@ -613,19 +531,9 @@ def buffer_store(
         >>> # Store with mask
         >>> buffer_store(data, rsrc, offset, mask=valid)
     """
-    # Unwrap all inputs (accept DSL Numeric values via ir_value())
-    if hasattr(data, "ir_value"):
-        data = data.ir_value()
-    if isinstance(offset, int):
-        offset = _create_i32_constant(offset)
-    elif hasattr(offset, "ir_value"):
-        offset = offset.ir_value()
     data = _unwrap_value(data)
     rsrc = _unwrap_value(rsrc)
-    offset = _unwrap_value(offset)
-
-    # Convert offset to i32 if needed (accepts index/i64/i32)
-    offset = _to_i32_offset(offset)
+    offset = fx.Int32(_unwrap_value(offset))
 
     # IMPORTANT: RawPtrBufferStoreOp offset is in BYTES.
     # For backward compat, `buffer_store()` accepts element offsets by default
@@ -638,36 +546,27 @@ def buffer_store(
         else:  # Scalar type
             element_type = data_type
         element_bytes = element_type.width // 8
-        bytes_const = _create_i32_constant(element_bytes)
-        op = std_arith.MulIOp(offset, bytes_const)
-        offset = _unwrap_value(op.result)
+        offset = offset * element_bytes
 
     # Apply mask by setting invalid offsets to max
     if mask is not None:
-        mask = _unwrap_value(mask)
-        max_offset = _create_i32_constant(0x7FFFFFFF)
-        op = std_arith.SelectOp(mask, offset, max_offset)
-        offset = _unwrap_value(op.result)
+        offset = fx.Boolean(_unwrap_value(mask)).select(offset, 0x7FFFFFFF)
 
     # Create instruction offset (soffset) and aux flags
-    if soffset_bytes is None:
-        soffset = _create_i32_constant(0)
-    else:
-        if isinstance(soffset_bytes, int):
-            soffset = _create_i32_constant(int(soffset_bytes))
-        else:
-            soffset = _to_i32_offset(_unwrap_value(soffset_bytes))
+    soffset = fx.Int32(
+        0 if soffset_bytes is None else _unwrap_value(soffset_bytes)
+    ).ir_value()
     aux = (
         ir.IntegerAttr.get(ir.IntegerType.get_signless(32), cache_modifier)
         if _RAW_PTR_BUFFER_AUX_IS_ATTRIBUTE
-        else _create_i32_constant(cache_modifier)
+        else fx.Int32(cache_modifier).ir_value()
     )
 
     # Emit buffer store
     rocdl.RawPtrBufferStoreOp(
         data,
         rsrc,
-        offset,
+        offset.ir_value(),
         soffset,
         aux=aux,
     )

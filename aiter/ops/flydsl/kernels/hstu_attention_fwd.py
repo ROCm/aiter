@@ -42,7 +42,7 @@ from flydsl.runtime.device import get_rocm_arch
 
 from aiter.jit.utils.chip_info import get_lds_capacity_bytes
 
-_LOG2E = host_math.log2(host_math.e)
+from .act import LOG2E as _LOG2E
 
 
 def _dtype_to_elem_type(dtype_str: str):

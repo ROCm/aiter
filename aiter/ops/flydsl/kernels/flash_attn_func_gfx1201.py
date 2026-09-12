@@ -13,16 +13,15 @@ import os
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl._mlir import ir
-from flydsl._mlir.dialects.fly_rocdl import TargetAddressSpace
 from flydsl.compiler.kernel_function import CompilationContext
 from flydsl.expr import const_expr, gpu, range_constexpr
 from flydsl.expr.typing import T
 from flydsl.expr.typing import Vector as Vec
 
+from .act import LOG2E as _LOG2E
 from .tensor_shim import _run_compiled
 
 KERNEL_NAME = "flash_attn_func_gfx1201_kernel"
-_LOG2E = host_math.log2(host_math.e)
 
 
 def build_flash_attn_func_module_primary(
@@ -172,7 +171,7 @@ def build_flash_attn_func_module_primary(
             flags = (7 << 12) | (4 << 15) | (1 << 24) | (3 << 28)
             buf_ptr_ty = fx.PointerType.get(
                 elem_ty=ptr.element_type.ir_type,
-                address_space=TargetAddressSpace.BufferDesc,
+                address_space=fx.rocdl.TargetAddressSpace.BufferDesc,
                 alignment=ptr.alignment,
             )
             return fx.make_ptr(

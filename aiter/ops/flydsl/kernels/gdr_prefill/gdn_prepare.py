@@ -24,6 +24,8 @@ from flydsl.expr import (
     range_constexpr,
 )
 
+from ..act import LOG2E
+
 
 def _exp2_f32(x):
     """Evaluate exp2 directly; decay exponents are always non-positive."""
@@ -226,7 +228,6 @@ def compile_gdn_prepare(
     remain in the natural-log domain.
     """
     assert BT == 64 and K == 128 and V == 128, "gdn_prepare targets the BT=64 main path"
-    LOG2E = 1.4426950408889634
 
     KS = K + 4
     VTS = BT + 4

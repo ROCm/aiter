@@ -30,12 +30,6 @@ __all__ = [
 ]
 
 
-def _get_dtypes():
-    from aiter.utility import dtypes
-
-    return dtypes
-
-
 _HGEMM_KERNEL_RE = re.compile(
     r"^flydsl_hgemm_"
     r"a(?P<dtype>bf16|fp16|f16)_w(?P=dtype)"
@@ -261,7 +255,7 @@ def flydsl_preshuffle_gemm_a8(
 ) -> Tensor:
     """Compile and run FlyDSL preshuffle GEMM, optionally with fp32 split-K."""
     compile_fn = _get_compile_fn()
-    dtypes = _get_dtypes()
+    from aiter.utility import dtypes
 
     m, k = XQ.shape[0], XQ.shape[-1]
     n = WQ.shape[0]

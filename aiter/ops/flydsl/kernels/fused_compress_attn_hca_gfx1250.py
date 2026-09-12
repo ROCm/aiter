@@ -20,15 +20,17 @@ from functools import lru_cache
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 import torch
-from flydsl._mlir.dialects import llvm
 from flydsl.expr import arith, const_expr, gpu, range_constexpr
 from flydsl.expr import math as fmath
-from flydsl.expr.arith import CmpFPredicate, CmpIPredicate
+from flydsl.expr.arith import CmpFPredicate
 from flydsl.expr.typing import Int32, Stream, T
 
 from aiter.ops.flydsl.kernels import buffer_ops
 
+from .act import LOG2E as _LOG2E
 from .fused_compress_attn_common import (
+    _NEG_INF,
+    _fexp_f32,
     block_base_bytes_i64,
     emit_group_fp8_nm_asm_scatter,
     state_slot_byte_offset,
@@ -37,8 +39,6 @@ from .tensor_shim import _run_compiled
 
 BLOCK_THREADS = 32  # 1 wave32 (RDNA4 / gfx1250)
 SLICE = 32  # head_dim elements per block (grid-Y split)
-_NEG_INF = float("-inf")
-_LOG2E = math.log2(math.e)
 
 
 # ============================================================================
@@ -150,15 +150,9 @@ def _build_compress_forward_kernel(
         sid = fx.block_idx.y
         tid = fx.thread_idx.x  # 0..BLOCK_TH-1
 
-        c_zero_i32 = arith.constant(0, type=i32)
         c_neg_inf = arith.constant(_NEG_INF, type=f32)
         c_zero_f32 = arith.constant(0.0, type=f32)
         c_log2e = arith.constant(_LOG2E, type=f32)
-
-        def fexp_f32(x):
-            return llvm.call_intrinsic(
-                f32, "llvm.amdgcn.exp2.f32", [x * c_log2e], [], []
-            )
 
         # Per-thread wave / lane (block-local); tid >= 0 -> unsigned div/rem
         # (divui/remui). Wrap back to Int32 for the signed i32 consumers.
@@ -221,11 +215,11 @@ def _build_compress_forward_kernel(
                     # logical shift for the hi-word extract too.
                     hi = fx.Int32((fx.Uint32(raw_s) >> 16).ir_value())
                     lo_or_hi = arith.select(
-                        arith.cmpi(CmpIPredicate.eq, lane_in_dw.ir_value(), c_zero_i32),
+                        (lane_in_dw == 0).ir_value(),
                         raw_s,
                         hi.ir_value(),
                     )
-                    lo16 = arith.andi(lo_or_hi, arith.constant(0xFFFF, type=i32))
+                    lo16 = fx.Int32(lo_or_hi) & 0xFFFF
                     lo16_v = fx.Vector.from_elements([lo16], dtype=fx.Int32)
                     bf16_pair = lo16_v.bitcast(fx.BFloat16)
                     # raw f32 for the explicit-fastmath float layer downstream.
@@ -300,9 +294,10 @@ def _build_compress_forward_kernel(
             def _issue_phase1_loads(k_i32):
                 """Phase 1 (state cache) loads. Returns (kv_list, sc_padded_list)
                 each of length VEC. Score is -inf when s < 0."""
-                s = (fx.Int32(position) - fx.Int32(K - 1) + fx.Int32(k_i32)).ir_value()
-                is_pad = arith.cmpi(CmpIPredicate.slt, s, c_zero_i32)
-                s_safe = fx.Int32(arith.select(is_pad, c_zero_i32, s))
+                s = fx.Int32(position) - fx.Int32(K - 1) + fx.Int32(k_i32)
+                is_pad_b = s < 0
+                is_pad = is_pad_b.ir_value()
+                s_safe = is_pad_b.select(fx.Int32(0), s)
                 ring = fx.Int32((fx.Uint32(s_safe.ir_value()) % state_size).ir_value())
                 # Slot term already folded into the descriptor base.
                 base_kv_off = ring * fx.Int32(kv_state_pos_stride) + col_off_base
@@ -331,9 +326,9 @@ def _build_compress_forward_kernel(
                     kv_k = kv_k_list[i]
                     m_new = fx.max(fx.Float32(m_old), fx.Float32(score_k)).ir_value()
                     is_first = arith.cmpf(CmpFPredicate.OEQ, m_old, c_neg_inf)
-                    scale_active = fexp_f32(arith.subf(m_old, m_new))
+                    scale_active = _fexp_f32(arith.subf(m_old, m_new), c_log2e)
                     scale_v = arith.select(is_first, c_zero_f32, scale_active)
-                    wk_active = fexp_f32(arith.subf(score_k, m_new))
+                    wk_active = _fexp_f32(arith.subf(score_k, m_new), c_log2e)
                     is_pad_score = arith.cmpf(CmpFPredicate.OEQ, score_k, c_neg_inf)
                     w_k = arith.select(is_pad_score, c_zero_f32, wk_active)
                     # Explicit fastmath float layer: fx `+`/`*` drop fastmath<fast>
@@ -461,14 +456,10 @@ def _build_compress_forward_kernel(
                         kv_w = fx.ptr_load(lds_kv_ptr + idx_w)
                         w_w = fx.ptr_load(lds_w_ptr + idx_w)
                         m_w = m_arr[w]
-                        scale_w = fx.Float32(fexp_f32((m_w - m_g).ir_value()))
+                        scale_w = fx.Float32(_fexp_f32((m_w - m_g).ir_value(), c_log2e))
                         kv_sum = kv_sum + kv_w * scale_w
                         w_sum = w_sum + w_w * scale_w
-                    rcp_w = fx.Float32(
-                        llvm.call_intrinsic(
-                            f32, "llvm.amdgcn.rcp.f32", [w_sum.ir_value()], [], []
-                        )
-                    )
+                    rcp_w = fx.Float32(fx.rocdl.rcp(f32, w_sum.ir_value()))
                     comp_list.append(kv_sum * rcp_w)
 
                 # -- Vectorized write of VEC f32 comp values --
@@ -770,11 +761,7 @@ def _build_norm_rope_scatter_kernel(
             sin_rsrc = buffer_ops.create_buffer_resource(sin_cache, max_size=True)
             cos_row_base = comp_pos_i32 * (RD // 2)
 
-            is_rope_t = arith.cmpi(
-                CmpIPredicate.sge,
-                tid.ir_value(),
-                arith.constant(ROPE_THREAD_LO, type=i32),
-            )
+            is_rope_t = (tid >= ROPE_THREAD_LO).ir_value()
             rope_rel_raw = fx.Int32(tid) - ROPE_THREAD_LO
             rope_rel = fx.max(rope_rel_raw, fx.Int32(0))
             cs_lo = rope_rel * PAIRS_PER_THREAD

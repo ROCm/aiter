@@ -1,27 +1,27 @@
 ---
 name: flydsl-kernel-code-cleanup
 description: >
-  Modernize FlyDSL kernels: replace raw MLIR dialects (arith, scf, vector, llvm,
-  memref, math), ArithValue, redundant fx.* wrapping, fx.Index, buffer_ops,
-  SmemPtr/SmemAllocator, copy_atom_call/mma_atom_call (loop or single atom), and raw rocdl.mfma_* with the
-  current fx.* surface (fx types, Python control flow, make_buffer_tensor,
-  SharedAllocator, fx.copy/fx.gemm, make_layout_tv/make_tiled_copy TV layouts,
-  to_llvm_ptr, arch-dispatched fx.rocdl.s_waitcnt, local @flyc.jit if/else). Also
-  trims comments
-  and dead code and applies the _run_compiled fast launch path. Use when
-  reviewing, cleaning, or migrating existing kernels.
+  Clean up aiter FlyDSL kernels and shared helpers while preserving numerical
+  behavior and performance. Use for raw-IR migrations, helper deduplication,
+  dead-code removal, and reviews of those changes against the pinned FlyDSL API.
 allowed-tools: Read Edit Bash Grep Glob Agent
 ---
 
 # FlyDSL Kernel Code Cleanup
 
-Maps legacy/deprecated kernel constructs to the current `fx.*` surface. Companion
-to `flydsl-kernel-authoring` (API reference) and `flydsl-tile-programming`
-(authoring wizard).
+Maps legacy kernel constructs to the `fx.*` surface available in aiter's pinned
+FlyDSL version. See the in-tree `flydsl-kernel-authoring` skill for API guidance.
 
 **Golden rule:** in `@flyc.kernel` / `@flyc.jit` bodies, use `fx.*` and Python
 operators first. Drop to a raw dialect only at a hard boundary with no wrapper,
 and localize it.
+
+Before applying the recipes, check `requirements.txt` and the imported FlyDSL
+version and module path. A sibling FlyDSL checkout can expose newer APIs than
+aiter supports. Kernel cleanup does not require a dependency bump or edits to
+FlyDSL itself; honor the task's explicit version, architecture and single-/multi-
+GPU scope. For helper extraction or low-level API substitutions, read
+[semantic preservation and validation](references/semantic-preservation.md).
 
 ## Aiter layout
 
@@ -33,9 +33,15 @@ and localize it.
 | `op_tests/flydsl_tests/` | Additional FlyDSL kernel tests |
 
 Prefer `from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled, ptr_arg`.
-Do **not** add a second `_run_compiled` copy — reuse `tensor_shim.py`. Some older
-wrappers such as `moe_kernels.py` still carry a local `_run_compiled(exe, args)`
-with a list argument; new code should import from `tensor_shim`.
+Reuse `tensor_shim.py` for compilation, cached dispatch and failure recovery.
+`moe_kernels._run_compiled(exe, args)` is a tuple-argument adapter for existing
+MoE/AOT callers; preserve that contract when consolidating launch code.
+
+Reuse existing owners before adding helpers: `act.py` for activations and
+`LOG2E`; `tensor_shim.py` for pointer/base/dtype extraction;
+`kernels_common.py` for host or wrapping integer `ceildiv`; family common modules
+for reductions and specialized memory operations. Prefer typed `fx.min`/`fx.max`
+and `fx.ceildiv` where their signedness, NaN and overflow semantics match.
 
 ## Cautions
 
@@ -44,10 +50,12 @@ with a list argument; new code should import from `tensor_shim`.
 - **Don't mass-rewrite heavily-legacy kernels** unless asked (e.g.
   `flash_attn_gfx950.py` uses `_scf.IfOp`/`_raw` pervasively). Clean what the task
   touches.
-- **Verify.** Offset/type/SSA changes can shift results — run the kernel test
-  before/after; clear cache with `FLYDSL_RUNTIME_ENABLE_CACHE=0` if unsure.
-- **`expr/` stays target-neutral:** no `rocdl`/`llvm`/buffer imports in
-  `python/flydsl/expr/` top-level (guarded by `test_expr_optional_rocdl.py`).
+- **Verify.** Offset/type/SSA changes can shift results. Compare before/after
+  numerics and generated code with `FLYDSL_RUNTIME_ENABLE_CACHE=0`; use a fresh
+  dump directory per specialization so one shape cannot overwrite another.
+- **Raw boundaries are semantic.** Retain exact scope/ordering, volatile and
+  alias metadata, raw SSA contracts, or integer widths unsupported by the pinned
+  API. Record the specific reason; do not merely hide a dialect in a new facade.
 
 ---
 
@@ -57,11 +65,14 @@ with a list argument; new code should import from `tensor_shim`.
 |---|---|
 | `ArithValue(x)` (wrap for operators) | `fx.Int32/Int64/Float32/Vector` — already overload `+ - * / % << >> == < >` |
 | `arith.unwrap(v)` / `arith._to_raw(v)` | `v.ir_value()`, only where a raw `ir.Value` is needed |
-| `arith.index(n)` / `arith.index_cast(T.index, v)` / `fx.Index(n)` | `fx.Int64(...)` (or `fx.Int32(...)`) |
+| index-typed arithmetic counters | `fx.Int64(...)` or `fx.Int32(...)` when the consumer permits a fixed-width integer |
+| `arith.index_cast(T.index, v)` at an index-typed boundary | `fx.Index(v)` |
 
-`fx.Index` maps to MLIR `index` — platform-defined width, ambiguous, and forces
-implicit casts. Prefer explicit-width `fx.Int64`/`fx.Int32`; pick the width on
-purpose (don't widen counters that must stay `i32`).
+`fx.Index` maps to MLIR `index`. Prefer explicit-width `fx.Int64`/`fx.Int32` for
+arithmetic, choosing width and signedness deliberately. Keep `fx.Index` where a
+launch, layout, loop or other API requires the index type; replacing it merely
+to remove the name can change the IR contract. Do not widen `i32` counters or
+narrow an index without checking the consumer and supported bounds.
 
 ```python
 # Before
@@ -73,7 +84,7 @@ off  = arith.index_cast(T.index, x)
 acc  = val + peer                    # val already fx.Float32 / fx.Vector
 lane = tid % fx.Int64(64)
 cond = (idx >= limit).ir_value()     # only if a raw scf.IfOp needs it
-off  = fx.Int64(x)
+off  = fx.Index(x)                 # preserve this consumer's index contract
 ```
 
 If an operand is a raw `ir.Value`, wrap it once at the source (`fx.Float32(v)`),
@@ -162,8 +173,17 @@ needed.
 | `scf.ForOp` | `range_constexpr(N)` (unrolled) or `range(lo, hi, step, init=[...])` (runtime, loop-carried) |
 | `scf.IfOp(_raw(cond))` | Python `if cond:` (runtime) / `if const_expr(flag):` (compile-time) |
 
-Runtime bounds must be typed (`fx.Int64`) or the rewriter unrolls and drops
-`init=`. See §5 for branches the rewriter can't express.
+Check the rewriter's loop contract in the pinned version. In FlyDSL 0.3.2:
+
+- `range_constexpr` requests Python unrolling.
+- `range(..., init=[...])` emits an `scf.for` with explicit carried state and
+  converts its bounds to index, including Python integer bounds. It does not
+  discard `init` merely because the bounds are static.
+- Ordinary `range` without `init` uses automatic carried-state dispatch and
+  expects `i32` bounds; index bounds are converted to `i32`, and `i64` is rejected.
+
+Preserve the selected loop form, supported bounds and state types. See §5 for
+runtime branches inside helper functions.
 
 ### `vector`
 | Raw | Preferred |
@@ -176,8 +196,9 @@ Runtime bounds must be typed (`fx.Int64`) or the rewriter unrolls and drops
 
 ### `llvm` / `memref` / `math`
 - `llvm.*` ptr math / load/store / const → layout views (`fx.make_view`,
-  `fx.get_iter`), `fx.Array` + `SharedAllocator`, `fx` constants. Real intrinsics
-  go in `expr/rocdl/inline_asm.py` or `rocdl` wrappers.
+  `fx.get_iter`), `fx.Array` + `SharedAllocator`, `fx` constants. Use existing
+  intrinsic wrappers where equivalent; keep unsupported boundaries local to
+  aiter rather than extending FlyDSL as part of a cleanup.
 - `memref.*` → layout tensors/views + copy atoms.
 - `math.*` → `fx` math helpers (`expr/math.py`); keep `math_dialect.fma` etc. only
   where no wrapper exists.
@@ -203,6 +224,9 @@ p = fx.to_llvm_ptr(ptr)   # equivalent free function; backend resolves the AS
 - `mem_ops.get_llvm_ptr` / `element_ptr` also fold in `+ offset*dtype_bytes`
   arithmetic; keep the offset math (layout views / `get_element_ptr`) and only swap
   the final ptr cast for `.llvm_ptr`.
+- Preserve byte versus element GEPs and alignment provenance. An equal numeric
+  address alone does not guarantee equal memory instructions; see the semantic
+  preservation reference before replacing an epilog pointer path.
 
 ### 3c. Manual `s_waitcnt` bitfields → `fx.rocdl.s_waitcnt(vmcnt=/lgkmcnt=/expcnt=)`
 
@@ -219,7 +243,7 @@ rocdl.s_waitcnt(0)                             # raw "wait for everything"
 _s_waitcnt(0xC07F)                             # magic LGKMCNT_0_ONLY bitfield
 # After
 fx.rocdl.s_waitcnt(lgkmcnt=0)                  # wait for LDS/SMEM only
-fx.rocdl.s_waitcnt(vmcnt=0, lgkmcnt=0)         # wait for all
+fx.rocdl.s_waitcnt(vmcnt=0, lgkmcnt=0, expcnt=0)  # matches raw s_waitcnt(0)
 fx.rocdl.s_waitcnt(lgkmcnt=0)
 ```
 
@@ -227,10 +251,10 @@ fx.rocdl.s_waitcnt(lgkmcnt=0)
   you need.
 - Delete the now-unused per-kernel `_encode_waitcnt` / `_s_waitcnt` shims and magic
   `*CNT_*` constants once your changes make them dead.
-- `sched_barrier` / `sched_group_barrier` have no keyword fx wrapper — keep raw
-  `rocdl.sched_barrier(...)`. The legacy raw form stays available as positional
-  `fx.rocdl.s_waitcnt(bitfield)` for a boundary the keyword form can't express;
-  localize it.
+- Use the public `fx.rocdl.sched_barrier` / `fx.rocdl.sched_group_barrier`
+  wrappers when exposed by the pinned version. The legacy wait form remains
+  available as positional `fx.rocdl.s_waitcnt(bitfield)` for a boundary the
+  keyword form cannot express; localize it.
 - **Scheduler-sensitive.** `s_waitcnt` placement drives hot-loop pipelining in
   tuned attention/GEMM kernels — an op-identical swap can still shift the
   schedule. Verify perf (median-based), not just correctness, and don't mass-migrate
@@ -271,12 +295,16 @@ lds_b = lds.b.view(fx.make_layout((BLOCK_K, BLOCK_N), (BLOCK_N, 1)))
 
 ---
 
-## 5. Runtime `if/else` with side effects → local `@flyc.jit`
+## 5. Runtime branches inside helper functions
 
-A plain `if runtime_cond:` works for simple guarded stores but breaks when a
-branch defines values used later, carries loop state, or has `return`/`yield`. The
-legacy fix is `scf.IfOp(_raw(cond))`; the current idiom is branch helpers wrapped
-in a local `@flyc.jit`.
+Inside a rewritten `@flyc.kernel` or `@flyc.jit` function, ordinary Python `if`
+supports side effects and carried scalar/list/tuple state. Initialize carried
+values before the branch with matching types; `None` cannot become an SSA
+result. A branch producing values does not by itself require raw SCF.
+
+A plain helper executing outside the rewriter's scope needs a local
+`@flyc.jit` boundary for its runtime `if`. Use that public decorator instead of
+calling `ReplaceIfWithDispatch.scf_if_dispatch` directly.
 
 ```python
 # Before
@@ -299,7 +327,9 @@ dispatch()
 - A bare `if cond:` is fine for a simple guarded side effect — no helper needed.
 - `const_expr(flag)` for compile-time branches; never wrap runtime SSA
   (`gpu.thread_id`, `lane`) in `const_expr`.
-- Keep manual `scf.IfOp` only where the rewriter can't express it; localize it.
+- For branches returning or updating values, check that the rewriter preserves
+  their structure and types. Keep manual `scf.IfOp` only for a demonstrated
+  unsupported control-flow contract; localize it.
 
 ---
 
@@ -325,8 +355,9 @@ fx.mma_atom_call(mma, frag_C, frag_A, frag_B, frag_C)           # single tile �
 - Build fragments with `fx.make_fragment_like` / `make_fragment_{A,B,C}`, not raw
   `T.vec(...)`.
 - Order is **d, a, b, c** (accumulator first).
-- Structural — convert the whole MMA loop and diff numerics. Keep a raw call only
-  for an instruction the builders don't expose.
+- Structural — convert a complete supported MMA path and diff numerics. Retain
+  raw calls for instructions or operand forms the builders cannot express, or
+  when the alternative changes required semantics or scheduling.
 
 ---
 
@@ -338,7 +369,7 @@ A tiled copy is a copy atom laid over a **thread-value (TV) layout** plus a tile
 Build the TV layout from separate thread/value layouts with `fx.make_layout_tv`
 (returns `(tile_mn, tv_layout)`), pass both to `fx.make_tiled_copy`, slice
 per-thread with `.get_slice(tid)`, then partition the tensor. See
-`examples/02-tiledCopy.py`.
+`examples/02-tiledCopy.py` in a FlyDSL source checkout.
 
 ```python
 # thread + value layouts -> (tile_mn, tv_layout) -> tiled copy
@@ -359,7 +390,7 @@ frag       = fx.make_fragment_like(part_src)
 - For copies matched to an MMA operand layout, do **not** hand-build a TV layout —
   use `fx.make_tiled_copy_A/B/C(copy_atom, tiled_mma)` (they read the atom's
   `tv_layout_{A,B,C}_tiled`), then `.get_slice(tid)` + `partition_S` /
-  `.retile(frag)`. See `examples/03-tiledMma.py`.
+  `.retile(frag)`. See `examples/03-tiledMma.py` in a FlyDSL source checkout.
 - Build the MMA with `fx.make_tiled_mma(mma_atom, atom_layout)`; slice with
   `.thr_slice(tid)` / `.get_slice(tid)` and make fragments via
   `make_fragment_{A,B,C}`.
@@ -371,9 +402,9 @@ frag       = fx.make_fragment_like(part_src)
 `fx.copy` / `fx.gemm` iterate the atom over a tiled/partitioned layout and take
 atom state as kwargs — no hand-written loop or `atom_set_value`. Prefer them over
 `copy_atom_call` / `mma_atom_call` **not just for loops but for single-atom sites
-too**: `fx.copy(atom, src, dst)` issues the same one atom over the single-tile
-partition — behavior-preserving and **perf-neutral** (identical ISA; the compiler
-lowers it to the same single copy/MMA). Migrate the whole family, not only loops.
+too**, when supported by the pinned API: `fx.copy(atom, src, dst)` can issue the
+same atom over a single-tile partition. Verify the generated code; API-level
+equivalence alone does not prove identical ISA or performance.
 
 ```python
 # Before — loop
@@ -393,22 +424,22 @@ fx.gemm(mma, frag_C, frag_A, frag_B, frag_C, scale_a=sa, scale_b=sb)   # atom st
 
 - `fx.copy` for partitioned tensors (`partition_S`/`partition_D` / tiled divide);
   `fx.gemm` for the MMA loop (accumulator-first order).
-- Single-atom swap is a **textual one-for-one** (`fx.copy_atom_call(a, s, d)` →
-  `fx.copy(a, s, d)`); no TV layout needed. Don't manufacture a bogus TV layout for
+- A supported single-atom swap can be one-for-one (`fx.copy_atom_call(a, s, d)` →
+  `fx.copy(a, s, d)`); no new TV layout is needed. Don't manufacture a TV layout for
   a degenerate single-tile load whose thread→data mapping is a mandatory swizzle —
   just pass the existing single-tile slice to `fx.copy`.
 - **Keep** `copy_atom_call_ssa` / `mma_atom_call_ssa` (the SSA-*returning* variants
   are a different primitive) and any raw atom call whose operands have no tensor/
-  partition form to pass. Everything else → `fx.copy` / `fx.gemm`.
-- Perf-neutral by construction, but for scheduler-tuned hot loops still diff
-  numerics cold and spot-check perf (median-of-7).
+  partition form to pass. Prefer `fx.copy` / `fx.gemm` for supported tensor forms.
+- Diff numerics and ISA; for scheduler-sensitive hot loops compare repeated,
+  paired graph timings. Unchanged resources alone do not prove unchanged time.
 
 ---
 
 ## 8. Trim comments and dead code
 
-Cut low-value comments and dead code; a net LOC drop with unchanged behavior is
-the signal a cleanup landed (the migrations above already collapse verbose code).
+Cut low-value comments and dead code within the requested scope. A line-count
+reduction is useful context, not evidence of correctness or complete cleanup.
 
 **Remove:** comments that restate code; commented-out / dead blocks; per-line step
 narration; ASCII banners (keep one concise header per section); stale comments that
@@ -418,9 +449,14 @@ blank lines.
 **Keep:** the *why* — non-obvious layout/stride math, swizzle rationale, ABI
 quirks, offset-unit gotchas, invariants, spec/ISA references.
 
-- Comment cleanup must not touch code — do it in a separate commit.
-- When unsure about a *why* comment, keep it. Leave pre-existing dead code (mention
-  it); only remove dead code you introduced.
+- Keep a broad comment-only cleanup separate from executable changes. Compare
+  ASTs (ignoring docstrings when appropriate) to verify that claim.
+- Confirm callers, re-exports, generated/JIT lookup and import side effects before
+  deleting a helper or argument. Remove pre-existing dead code when it is within
+  the requested cleanup scope; retain comments explaining a real invariant.
+- Similar formulas are not necessarily interchangeable: preserve activation
+  rounding and batch scheduling, signed/unsigned extrema and packed bit widths.
+  Extract the common operation and keep meaningful variants explicit.
 
 ---
 
@@ -438,15 +474,11 @@ compiled = compile_my_kernel(...)          # {"launch": <exe>, ...}
 _run_compiled(compiled["launch"],
               ptr_arg(out), ptr_arg(a), ptr_arg(b),
               a.stride(0), M, N, K, stream)
-
-def _run_compiled(exe, *args):             # in tensor_shim.py — do not duplicate
-    cf = getattr(exe, "_cf", None)
-    if cf is None:
-        cf = flyc.compile(exe, *args); exe._cf = cf
-    else:
-        cf(*args)
 ```
 
+- On the pinned runtime, `flyc.compile` can execute the launcher on the first
+  call. Use the existing preload helper for no-dispatch materialization; never
+  pass placeholder pointers to a compiling launch path without that guard.
 - Pass flat scalars/pointers (`ptr_arg(t)`, `data_ptr()`, `stride(i)`, sizes,
   `stream`) — bypasses DLPack. See `mla_reduce_kernels.py`,
   `linear_attention_prefill_kernels.py`, `splitk_hgemm.py`.
@@ -460,29 +492,38 @@ def _run_compiled(exe, *args):             # in tensor_shim.py — do not duplic
 
 1. **Find** legacy usage (under `aiter/ops/flydsl/`):
    ```bash
-   grep -nE "ArithValue|_to_raw|arith\.(unwrap|index|index_cast)|fx\.Index\(" <file>
-   grep -nE "buffer_ops\.(create_buffer_resource|buffer_load|buffer_store)" <file>
-   grep -nE "_mlir\.dialects import.*(arith|scf|vector|llvm|memref|math)" <file>
-   grep -nE "\b(scf\.(For|If)Op|vector\.(extract|bitcast|splat)|llvm\.(load|store|mlir))" <file>
-   grep -nE "SmemPtr|SmemAllocator|\.finalize\(\)" <file>
-   grep -nE "fx\.(Int32|Int64|Float32)\(fx\.(Int32|Int64|Float32)\(" <file>
-   grep -nE "rocdl\.mfma_|\bmfma_(f32|i32)_|copy_atom_call|mma_atom_call" <file>
-   grep -nE "create_llvm_ptr|_create_llvm_ptr|get_llvm_ptr|IntToPtrOp" <file>
-   grep -nE "s_waitcnt\(|_encode_waitcnt|_s_waitcnt|CNT_[0-9A-Z_]*=|0x[Cc]07[Ff]" <file>
+   rg -n 'ArithValue|_to_raw|arith\.(unwrap|index|index_cast)|fx\.Index\(' <file>
+   rg -n 'buffer_ops\.(create_buffer_resource|buffer_load|buffer_store)' <file>
+   rg -n '_mlir\.dialects|from flydsl\.expr import' <file>
+   rg -n '\b(scf\.(For|If)Op|vector\.(extract|bitcast|splat)|llvm\.(load|store|mlir))' <file>
+   rg -n 'SmemPtr|SmemAllocator|\.finalize\(\)' <file>
+   rg -n 'fx\.(Int32|Int64|Float32)\(fx\.(Int32|Int64|Float32)\(' <file>
+   rg -n 'rocdl\.mfma_|\bmfma_(f32|i32)_|copy_atom_call|mma_atom_call' <file>
+   rg -n 'create_llvm_ptr|_create_llvm_ptr|get_llvm_ptr|IntToPtrOp' <file>
+   rg -n 's_waitcnt\(|_encode_waitcnt|_s_waitcnt|CNT_[0-9A-Z_]*=|0x[Cc]07[Ff]' <file>
+   rg -n 'LOG2E|log2e|def .*sigmoid|def .*tanh|def .*ceildiv|def .*ptr' <file>
    ```
+   Resolve import aliases and inspect nested definitions/callers; text hits are
+   candidates, not proof of duplication or dead code.
 2. **Triage:** do mechanical swaps (operators, casts, `vector.extract/bitcast`)
    first; structural ones (control flow, `buffer_ops` offsets, MMA loops) next.
 3. **Migrate in small commits**, one family at a time, matching local style.
 4. **Verify:**
    ```bash
-   black <changed-files> && ruff check <changed-files>
+   black --check <changed-files> && ruff check <changed-files>
    FLYDSL_RUNTIME_ENABLE_CACHE=0 python3 -m pytest op_tests/test_flydsl_<kernel>.py -v
    # or: op_tests/flydsl_tests/test_flydsl_<kernel>.py
    ```
-   Diff numerics for offset-sensitive buffer changes.
-5. **Check `git diff --stat`** shows a net line reduction; growth is a red flag.
-6. **Report** anything left legacy on purpose (pervasive `_scf.IfOp`, a
-   scalar-base load with no layout form).
+   Use the existing test's actual CLI when it is a script rather than pytest.
+   Check asserted comparisons and dispatch logs as well as the exit code. See
+   the reference for bit-level probes, ISA and performance evidence.
+5. **Review the actual merge-base diff and all remaining candidates.** Check
+   callers of shared helpers, excluded paths importing them, and the final tree
+   after any upstream merge. Inspect `git diff --stat` and `git diff --check`.
+6. **Report coverage and residuals.** Separate native correctness/performance,
+   compile/ISA-only cases, skips and baseline failures. Record each retained
+   low-level boundary's reason and the tested commit; inspect CI failures before
+   declaring completion. Rerun checks affected by subsequent code changes.
 
 ---
 
@@ -492,9 +533,9 @@ def _run_compiled(exe, *args):             # in tensor_shim.py — do not duplic
 |---|---|
 | `ArithValue(x) + y` | `x + y` (typed `fx`) |
 | `arith.unwrap(v)` / `_to_raw(v)` | `v.ir_value()` (boundary only) |
-| `fx.Index(n)` / `arith.index` / `arith.index_cast` | explicit `fx.Int64/Int32(...)` |
+| index-typed arithmetic | explicit `fx.Int64/Int32(...)` where supported; retain `fx.Index` at index-typed boundaries |
 | `arith.mulf/addf/trunc_f/select` | `*`, `+`, `.to(ty)`, `.select(...)` |
-| raw integer min/max or ceil-div | `fx.max` / `fx.min` / `fx.ceildiv` |
+| raw integer min/max or ceil-div | `fx.max` / `fx.min` / `fx.ceildiv` when signedness and overflow behavior match |
 | `vector.extract/bitcast/splat` | `fx.Vector(v)[i]` / `.bitcast(ty)` / `.filled(...)` |
 | `scf.ForOp` / `scf.IfOp` | `range_constexpr` / `range(..., init=)` / Python `if` / `const_expr` |
 | `buffer_ops.*` + offsets | `fx.rocdl.make_buffer_tensor` + layout + `fx.copy` |
@@ -502,10 +543,10 @@ def _run_compiled(exe, *args):             # in tensor_shim.py — do not duplic
 | `create_llvm_ptr(v, address_space=N)` / manual `IntToPtrOp` | `ptr.llvm_ptr` / `fx.to_llvm_ptr(ptr)` (backend-resolved AS) |
 | `rocdl.s_waitcnt(_encode_waitcnt(...))` / magic bitfield | `fx.rocdl.s_waitcnt(vmcnt=/lgkmcnt=/expcnt=)` (arch-dispatched) |
 | `SmemAllocator`/`SmemPtr` + `finalize()` | `@fx.struct` + `fx.SharedAllocator().allocate(...).peek().view(...)` |
-| `scf.IfOp(_raw(cond))` branch w/ outputs | branch helpers + local `@flyc.jit` |
+| raw SCF or AST-rewriter calls in a plain helper | local `@flyc.jit` with Python `if` and typed carried state |
 | `fx.Int32(fx.Int32(x))` / wrapping const ints | plain Python int; wrap once |
-| `rocdl.mfma_*` raw intrinsic | `fx.make_mma_atom(fx.rocdl.MFMA(...))` + `fx.gemm` |
+| `rocdl.mfma_*` raw intrinsic | `fx.make_mma_atom(fx.rocdl.MFMA(...))` + `fx.gemm` for supported operands and semantics |
 | hand-built TV layout in `make_tiled_copy` | `fx.make_layout_tv` + `fx.make_tiled_copy` / `make_tiled_copy_tv`; `_A/_B/_C` for MMA operands |
-| `*_atom_call` (loop *or* single atom) | `fx.copy` / `fx.gemm` (state as kwargs); keep only `*_atom_call_ssa` |
-| restated/dead/stale comments, blank runs | delete; keep *why*; aim for net LOC drop |
+| `*_atom_call` (loop *or* single atom) | `fx.copy` / `fx.gemm` where equivalent; retain raw SSA and unsupported operand contracts |
+| restated/dead/stale comments, blank runs | delete within scope; retain invariant and rationale comments |
 | per-call `@flyc.jit` on a hot path | `_run_compiled(exe, *args)` fast dispatch |

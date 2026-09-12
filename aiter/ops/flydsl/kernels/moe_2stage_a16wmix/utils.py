@@ -24,6 +24,11 @@ from flydsl.expr.typing import T
 
 from aiter.ops.flydsl.kernels import buffer_ops
 from aiter.ops.flydsl.kernels.layout_utils import crd2idx
+from aiter.ops.flydsl.kernels.mxfp4_gemm_common import (
+    _global_i32_buffer_tiles,
+    _global_i32_buffer_view,
+    global_typed_ptr,
+)
 from aiter.ops.flydsl.kernels.tensor_shim import _to_raw as _raw
 
 # a16wi4 (int4 W) groupwise scale: group_size = 32 == one MFMA K32 step (one ku per
@@ -41,35 +46,8 @@ def _umod(a, c):
     return fx.Int32(arith.remui(_raw(a), _raw(cc)))
 
 
-def _global_i32_ptr(addr_i64):
-    ptr_ty = fx.PointerType.get(
-        T.i32, address_space=fx.AddressSpace.Global, alignment=4
-    )
-    return fx.inttoptr(ptr_ty, fx.Int64(addr_i64))
-
-
 def _global_i32_at(addr_i64, idx):
-    return _global_i32_ptr(addr_i64)[idx]
-
-
-def _global_i32_buffer_view(addr_i64, num_bytes):
-    # fx.copy BufferCopy atoms take soffset as an element count (not bytes); the
-    # make_layout dynamic-shape leaf must be i32/i64, not fx.Index.
-    num_bytes_i64 = fx.Int64(num_bytes)
-    view = fx.Tensor(
-        fx.make_view(
-            _global_i32_ptr(addr_i64), fx.make_layout(num_bytes_i64 // fx.Int64(4), 1)
-        )
-    )
-    return fx.rocdl.make_buffer_tensor(
-        view, max_size=False, num_records_bytes=num_bytes_i64
-    )
-
-
-def _global_i32_buffer_tiles(addr_i64, num_bytes, tile_elems):
-    return fx.logical_divide(
-        _global_i32_buffer_view(addr_i64, num_bytes), fx.make_layout(tile_elems, 1)
-    )
+    return global_typed_ptr(addr_i64, T.i32)[idx]
 
 
 def _buffer_i32_scalar_read(tiles1, idx, atom):
