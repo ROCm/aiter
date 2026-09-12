@@ -2440,6 +2440,9 @@ class FmoeTuner(TunerCommon):
         activation=ActivationType.Silu,
         quant_type=QuantType.No,
         doweight_stage1=False,
+        w1_bias=None,
+        w2_bias=None,
+        swiglu_limit=None,
     ):
         ref1 = torch_moe_stage1(
             hidden_states,
@@ -2452,7 +2455,9 @@ class FmoeTuner(TunerCommon):
             quant_type=quant_type,
             a1_scale=a1_scale,
             w1_scale=w1_scale,
+            w1_bias=w1_bias,
             doweight=doweight_stage1,
+            swiglu_limit=swiglu_limit,
             situ_beta=DEFAULT_SITUV2_BETA,
             situ_linear_beta=DEFAULT_SITUV2_LINEAR_BETA,
         )
@@ -2492,6 +2497,7 @@ class FmoeTuner(TunerCommon):
             quant_type=quant_type,
             a2_scale=a2_scale,
             w2_scale=w2_scale,
+            w2_bias=w2_bias,
             doweight=not doweight_stage1,
         )
         return ref2
@@ -4046,7 +4052,7 @@ class FmoeTuner(TunerCommon):
         )
 
         # fp8-activation stage2 ref (shape-level, shared by all opus kids): torch
-        # stage2 on the bf16 stage1 output, sliced by opus_eff to match runtime effective-K.
+        # stage2 on the bf16 stage1 output, sliced by opus_eff to match the family.
         s2_ref_args = (
             [
                 "ref1_bf16",
@@ -4510,7 +4516,12 @@ class FmoeTuner(TunerCommon):
         return tasks_flydsl
 
     def run_config(self, args):
-        from aiter.fused_moe import fused_moe, fused_topk
+        from aiter.fused_moe import (
+            fmoe_runtime_env,
+            fmoe_runtime_policy,
+            fused_moe,
+            fused_topk,
+        )
         from aiter.test_common import checkAllclose, run_perftest
 
         untunedf = self.untunedf
@@ -4530,19 +4541,11 @@ class FmoeTuner(TunerCommon):
             q_type = QuantType.per_1x128 if q_type == QuantType.per_128x128 else q_type
             use_g1u1 = bool(row["use_g1u1"])
             doweight_stage1 = bool(row["doweight_stage1"])
-            # fused_moe overrides the activation quant dtype at runtime for
-            # per_1x32 fp4-weight MoE (gate_mode defaults to SEPARATED, which
-            # run_config does not override): Silu -> fp4, Swiglu -> bf16/fp4 by M.
-            # The config's nominal q_dtype_a (e.g. a8w4=fp8) is ignored, so the
-            # kernel actually runs a4w4. Mirror that here so the reference and the
-            # kernel weight layout match (else outputs are uncorrelated).
-            # Source of truth: aiter/fused_moe.py q_dtype_a selection.
-            eff_q_dtype_a = q_dtype_a
-            if q_type == QuantType.per_1x32 and q_dtype_w == dtypes.fp4x2:
-                if act_type == ActivationType.Swiglu:
-                    eff_q_dtype_a = dtypes.bf16 if token < 256 else dtypes.fp4x2
-                else:
-                    eff_q_dtype_a = dtypes.fp4x2
+            # Every knob that decides which tuned config fused_moe dispatches to
+            # lives in fmoe_runtime_policy, so this benchmark and
+            # op_tests/test_moe_2stage.py cannot drift apart on it.
+            policy = fmoe_runtime_policy(q_type, q_dtype_a, q_dtype_w, act_type)
+            gate_mode = policy.gate_mode
             shape_str = (
                 f"({token}, {model_dim}, {inter_dim}, E={expert}, topk={topk}, "
                 f"{row['act_type']}, {row['dtype']}, {row['q_dtype_a']}, "
@@ -4582,6 +4585,39 @@ class FmoeTuner(TunerCommon):
                 w2 = torch.randn(
                     (expert, model_dim, inter_dim), dtype=dtype, device="cuda"
                 )
+                # Swiglu MXFP4 (a16w4 / a8w4) runs the gpt-oss Swiglu path, which
+                # folds an extra +1 into the linear/up branch via the kernel's
+                # bias support (see fused_moe.swiglu / _needs_swiglu_bias_support).
+                # The torch reference's swiglu() always applies that +1, so the
+                # kernel must run its bias path too -- which only happens when a
+                # bias is supplied. Build a random expert bias and feed it to BOTH
+                # the kernel and the reference so the +1 (and bias) match. Mirrors
+                # op_tests/test_moe_2stage.py. Silu (no +1) and mxfp8/a4w4/a16wi4
+                # run without bias (their tuned kernels take the no-bias path, so
+                # adding a reference-only bias would create a spurious mismatch).
+                use_bias = (
+                    q_type == QuantType.per_1x32
+                    and act_type == ActivationType.Swiglu
+                    and q_dtype_a in [dtypes.bf16, dtypes.fp16, dtypes.fp8]
+                    and q_dtype_w == dtypes.fp4x2
+                )
+                if use_bias:
+                    n1 = inter_dim * 2 if use_g1u1 else inter_dim
+                    exp_bias1 = torch.clamp(
+                        torch.randn((expert, n1), dtype=dtype, device="cuda"),
+                        -1.0,
+                        1.0,
+                    )
+                    exp_bias2 = torch.clamp(
+                        torch.randn((expert, model_dim), dtype=dtype, device="cuda"),
+                        -1.0,
+                        1.0,
+                    )
+                    bias1_aiter = exp_bias1.to(dtypes.fp32)
+                    bias2_aiter = exp_bias2.to(dtypes.fp32)
+                else:
+                    exp_bias1 = exp_bias2 = None
+                    bias1_aiter = bias2_aiter = None
                 w1_qt, w1_scale = self.weight_quant(w1, q_type, quant_dtype=q_dtype_w)
                 w2_qt, w2_scale = self.weight_quant(w2, q_type, quant_dtype=q_dtype_w)
                 if q_dtype_w is not dtypes.fp4x2:
@@ -4651,8 +4687,13 @@ class FmoeTuner(TunerCommon):
                     # a16w4 / a8w4 (16-bit or fp8 activation, fp4 weight): the
                     # weight layout follows the *config* activation dtype, not the
                     # runtime-effective one (mirror op_tests/test_moe_2stage.py).
-                    w1_qt_fmoe = shuffle_weight_a16w4(w1_qt_fmoe, 16, True)
-                    w1_scale_fmoe = shuffle_scale_a16w4(w1_scale, expert, True)
+                    # a8w4 interleaves w1 gate/up (GUGU, paired with
+                    # gate_mode=INTERLEAVE); a16w4 keeps standard GGUU, the same
+                    # layout generate_data_2stages tuned it with.
+                    w1_qt_fmoe = shuffle_weight_a16w4(w1_qt_fmoe, 16, policy.w1_gate_up)
+                    w1_scale_fmoe = shuffle_scale_a16w4(
+                        w1_scale, expert, policy.w1_gate_up
+                    )
                     w2_qt_fmoe = shuffle_weight_a16w4(w2_qt_fmoe, 16, False)
                     w2_scale_fmoe = shuffle_scale_a16w4(w2_scale, expert, False)
                 elif (
@@ -4674,8 +4715,10 @@ class FmoeTuner(TunerCommon):
                     # mxfp8 (a8w8): gate-up interleaved fp8 weight; w1 scale uses the
                     # a16w4 interleave, w2 scale uses plain e8m0 (mirror
                     # op_tests/test_moe_2stage.py is_mxfp8).
-                    w1_qt_fmoe = shuffle_weight_a16w4(w1_qt_fmoe, 16, True)
-                    w1_scale_fmoe = shuffle_scale_a16w4(w1_scale, expert, True)
+                    w1_qt_fmoe = shuffle_weight_a16w4(w1_qt_fmoe, 16, policy.w1_gate_up)
+                    w1_scale_fmoe = shuffle_scale_a16w4(
+                        w1_scale, expert, policy.w1_gate_up
+                    )
                     w2_qt_fmoe = shuffle_weight_a16w4(w2_qt_fmoe, 16, False)
                     w2_scale_fmoe = fp4_utils.e8m0_shuffle(w2_scale)
                 elif q_dtype_w != dtypes.fp4x2:
@@ -4717,47 +4760,55 @@ class FmoeTuner(TunerCommon):
                 elif q_type == QuantType.per_1x32 and q_dtype_w == dtypes.i4x2:
                     a1_qt = hidden.to(dtypes.bf16)
                     a1_scale = None
-                elif (
-                    q_type == QuantType.per_1x32
-                    and eff_q_dtype_a in [dtypes.bf16, dtypes.fp16]
-                    and q_dtype_w == dtypes.fp4x2
+                elif q_type == QuantType.per_1x32 and (
+                    (
+                        q_dtype_a in [dtypes.bf16, dtypes.fp16, dtypes.fp8]
+                        and q_dtype_w == dtypes.fp4x2
+                    )
+                    or (q_dtype_a == dtypes.fp8 and q_dtype_w == dtypes.fp8)
                 ):
-                    # a16w4 (bf16 activation): reference runs activation in bf16.
-                    a1_qt = hidden.to(dtype)
-                    a1_scale = None
-                elif (
-                    q_type == QuantType.per_1x32
-                    and q_dtype_a == dtypes.fp8
-                    and q_dtype_w == dtypes.fp8
-                ):
-                    # mxfp8 (a8w8): kernel quantizes the activation internally; the
-                    # reference runs activation in bf16 (mirror test_moe_2stage).
+                    # a16w4 / a8w4 / mxfp8: the kernel quantizes the activation
+                    # internally; the torch reference keeps the activation in bf16
+                    # (higher precision) and lets logits_diff absorb the kernel's
+                    # quant error. Mirrors op_tests/test_moe_2stage.py.
                     a1_qt = hidden.to(dtype)
                     a1_scale = None
                 else:
-                    # Use the *effective* activation dtype (what fused_moe runs),
-                    # not the config's nominal q_dtype_a. For Silu+SEPARATED fp4
-                    # weights this is fp4x2 (a4w4), so the reference quantizes the
-                    # activation to fp4 to match the kernel.
+                    # a4w4 (and other per_128x128/per_Token paths): quantize the
+                    # reference activation with the config's nominal q_dtype_a,
+                    # matching op_tests/test_moe_2stage.py.
                     torch_quant = aiter.get_torch_quant(q_type)
-                    a1_qt, a1_scale = torch_quant(hidden, quant_dtype=eff_q_dtype_a)
+                    a1_qt, a1_scale = torch_quant(hidden, quant_dtype=q_dtype_a)
 
-                out, us = run_perftest(
-                    fused_moe,
-                    hidden,
-                    w1_qt_fmoe,
-                    w2_qt_fmoe,
-                    topk_weights,
-                    topk_ids,
-                    activation=act_type,
-                    quant_type=q_type,
-                    doweight_stage1=doweight_stage1,
-                    w1_scale=w1_scale_fmoe,
-                    w2_scale=w2_scale_fmoe,
-                    dtype=dtype,
-                    num_warmup=args.warmup,
-                    num_iters=args.iters,
+                # SiTUv2 beta/linear_beta are runtime scalars whose kernel default
+                # depends on the stage1 wrapper that wins dispatch, so pin them to
+                # the same constants torch_moe_2stages references.
+                situ_kwargs = (
+                    {"beta": policy.situ_beta, "linear_beta": policy.situ_linear_beta}
+                    if policy.situ_beta is not None
+                    else {}
                 )
+                with fmoe_runtime_env(policy):
+                    out, us = run_perftest(
+                        fused_moe,
+                        hidden,
+                        w1_qt_fmoe,
+                        w2_qt_fmoe,
+                        topk_weights,
+                        topk_ids,
+                        activation=act_type,
+                        quant_type=q_type,
+                        doweight_stage1=doweight_stage1,
+                        w1_scale=w1_scale_fmoe,
+                        w2_scale=w2_scale_fmoe,
+                        dtype=dtype,
+                        gate_mode=gate_mode,
+                        bias1=bias1_aiter,
+                        bias2=bias2_aiter,
+                        **situ_kwargs,
+                        num_warmup=args.warmup,
+                        num_iters=args.iters,
+                    )
                 # a16wi4: per_1x32_i4_quant stores int4 in an int8 container.
                 # The torch reference detects int4 weights by the i4x2 dtype, so
                 # pass an i4x2-reinterpreted view to the reference only (the kernel
@@ -4779,6 +4830,8 @@ class FmoeTuner(TunerCommon):
                     activation=act_type,
                     quant_type=q_type,
                     doweight_stage1=doweight_stage1,
+                    w1_bias=exp_bias1,
+                    w2_bias=exp_bias2,
                 )
                 if out.count_nonzero() == 0 and ref.count_nonzero() > 0:
                     diag = tensor_compare_diagnostics(ref, out)
@@ -4811,7 +4864,7 @@ class FmoeTuner(TunerCommon):
                         status = (
                             f"mismatch:err_ratio={err_ratio:.6g}"
                             f"(>{allowed_err_ratio_desc}),"
-                            f"logits_diff={logits_diff:.6g}(>{diag})"
+                            f"logits_diff={logits_diff:.6g}(>{cos_tol}); {diag}"
                         )
                 results.append(
                     {

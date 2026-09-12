@@ -15,6 +15,7 @@ import aiter
 from aiter import dtypes
 from aiter.aot.flydsl.common import override_env, run_only_env
 from aiter.fused_moe import (
+    fmoe_runtime_policy,
     fused_moe,
     fused_topk,
     get_2stage_cfgs,
@@ -110,6 +111,9 @@ def test_fmoe(
         and AQDType == dtypes.fp8
         and WQDType == dtypes.fp8
     )
+    # Same source the callers used for gateMode: w1's gate_up shuffle flag and
+    # the gate mode have to agree or the kernel misreads gate/up channels.
+    policy = fmoe_runtime_policy(qType, AQDType, WQDType, actType)
     input = torch.randn((token, model_dim), dtype=dtype)
     if use_g1u1:
         w1 = torch.randn((E, inter_dim * 2, model_dim), dtype=dtype)
@@ -334,14 +338,13 @@ def test_fmoe(
     ):  # a16w4 / a8w4
         # a16w4 (bf16/fp16 act) uses standard GGUU (gate_up=False), matching main;
         # a8w4 (fp8 act) keeps the gate/up-interleaved GUGU (gate_up=True).
-        _w1_gu = AQDType == dtypes.fp8
-        w1_qt_aiter = shuffle_weight_a16w4(w1_qt_aiter, 16, _w1_gu)
-        w1_scale_aiter = shuffle_scale_a16w4(w1_scale, E, _w1_gu)
+        w1_qt_aiter = shuffle_weight_a16w4(w1_qt_aiter, 16, policy.w1_gate_up)
+        w1_scale_aiter = shuffle_scale_a16w4(w1_scale, E, policy.w1_gate_up)
         w2_qt_aiter = shuffle_weight_a16w4(w2_qt_aiter, 16, False)
         w2_scale_aiter = shuffle_scale_a16w4(w2_scale, E, False)
     elif is_mxfp8:  # mxfp8 (a8w8): gate-up interleaved fp8 weight + e8m0 scale
-        w1_qt_aiter = shuffle_weight_a16w4(w1_qt_aiter, 16, True)
-        w1_scale_aiter = shuffle_scale_a16w4(w1_scale, E, True)
+        w1_qt_aiter = shuffle_weight_a16w4(w1_qt_aiter, 16, policy.w1_gate_up)
+        w1_scale_aiter = shuffle_scale_a16w4(w1_scale, E, policy.w1_gate_up)
         w2_qt_aiter = shuffle_weight_a16w4(w2_qt_aiter, 16, False)
         w2_scale_aiter = fp4_utils.e8m0_shuffle(w2_scale)
     elif WQDType != dtypes.fp4x2 or preshuffle:
@@ -743,14 +746,15 @@ parser.add_argument(
     "--beta",
     type=float,
     default=None,
-    help="SiTUv2 gate scale param (beta). Default None -> 1.0. Only affects SiTUv2.",
+    help="SiTUv2 gate scale param (beta). Default None -> the tuned-config "
+    "policy value. Only affects SiTUv2.",
 )
 parser.add_argument(
     "--linear-beta",
     type=float,
     default=None,
-    help="SiTUv2 up (linear) scale param (linear_beta). Default None -> 1.0. "
-    "Only affects SiTUv2.",
+    help="SiTUv2 up (linear) scale param (linear_beta). Default None -> the "
+    "tuned-config policy value. Only affects SiTUv2.",
 )
 parser.add_argument(
     "--kernel",
@@ -814,7 +818,7 @@ def _row_to_kwargs(row):
     inter_dim = int(row["inter_dim"])
     # Tuned CSV rows do not carry gate mode explicitly. Infer the runtime mode
     # from the selected activation/weight dtype layout used by fused_moe.
-    gate_mode = _effective_gate_mode(aq_dtype, wq_dtype)
+    gate_mode = fmoe_runtime_policy(q_type, aq_dtype, wq_dtype, act_type).gate_mode
     return {
         "dtype": _str2dtype(row["dtype"]),
         "token": int(row["token"]),
@@ -884,9 +888,8 @@ def _iter_csv_cases():
                 kwargs["qType"], kwargs["WQDType"]
             )
             runtime_mode = "SiTUv2 MXFP4"
-            # SiTUv2 a16w4 never ran before this ordering fix and every row
-            # fails: _effective_gate_mode asks for INTERLEAVE while stage1 binds
-            # gate_mode="separated" for non-fp8 activations.
+            # SiTUv2 a16w4 rows never ran before the dispatch-ordering fix and
+            # have not been re-validated since; keep skipping them until they are.
             if kwargs["AQDType"] == dtypes.bf16 and kwargs["WQDType"] == dtypes.fp4x2:
                 continue
         else:
@@ -935,29 +938,26 @@ _PER1X32_BF16_I4 = (aiter.QuantType.per_1x32, dtypes.bf16, dtypes.i4x2)
 _SITUV2_SUPPORTED_TRIPLES = (_PER1X32_FP8_FP4, _PER1X32_FP4_FP4)
 
 
-def _situv2_beta_kwargs(act_type):
+def _situv2_beta_kwargs(quant_type, aq_dtype, wq_dtype, act_type):
     """beta/linear_beta are only meaningful for SiTUv2; leave them unset (None)
-    for every other activation so silu/swiglu/gelu behavior is unchanged."""
-    if act_type == aiter.ActivationType.Situv2:
-        return {"beta": args.beta, "linear_beta": args.linear_beta}
-    return {}
+    for every other activation so silu/swiglu/gelu behavior is unchanged.
 
-
-def _effective_gate_mode(aq_dtype, wq_dtype):
-    # a16w4 (bf16 A x mxfp4 W) SiTUv2 is served by the ported FlyDSL kernel via
-    # fused_moe_'s SEPARATED dispatch; keep it in SEPARATED (bf16 activation) so
-    # the abf16_wfp4 rows exercise that kernel instead of downgrading to a8w4/fp8.
-    if aq_dtype == dtypes.bf16 and wq_dtype == dtypes.fp4x2:
-        return GateMode.SEPARATED.value
-    # a8w4 mxfp4 weights run the gate/up-interleaved (guinterleave) layout,
-    # matching serving's ATOM_MOE_GU_ITLV=1. gate_mode is a runtime weight-layout
-    # property (not a tuned-config key); request INTERLEAVE here for them.
-    if aq_dtype == dtypes.fp8 and wq_dtype == dtypes.fp4x2:
-        return GateMode.INTERLEAVE.value
-    # mxfp8 (a8w8) uses the gate-up interleave stage1 path as well.
-    if aq_dtype == dtypes.fp8 and wq_dtype == dtypes.fp8:
-        return GateMode.INTERLEAVE.value
-    return GateMode.SEPARATED.value
+    They are runtime scalars rather than tuned-config keys, so an unset beta
+    inherits whichever stage1 wrapper wins the dispatch (1.0 for FlyDSL). Take
+    the policy's pinned pair instead, so a row is validated at the same beta
+    the tuner measured it with; --beta / --linear-beta still override.
+    """
+    if act_type != aiter.ActivationType.Situv2:
+        return {}
+    policy = fmoe_runtime_policy(quant_type, aq_dtype, wq_dtype, act_type)
+    return {
+        "beta": args.beta if args.beta is not None else policy.situ_beta,
+        "linear_beta": (
+            args.linear_beta
+            if args.linear_beta is not None
+            else policy.situ_linear_beta
+        ),
+    }
 
 
 def _effective_swiglu_limit(quant_type, aq_dtype, wq_dtype, swiglu_limit):
@@ -1093,7 +1093,9 @@ def _iter_legacy_cases():
             E=args.expert,
             topk=args.topk,
             actType=act_type,
-            gateMode=_effective_gate_mode(aq_dtype, wq_dtype),
+            gateMode=fmoe_runtime_policy(
+                quant_type, aq_dtype, wq_dtype, act_type
+            ).gate_mode,
             qType=quant_type,
             AQDType=aq_dtype,
             WQDType=wq_dtype,
@@ -1147,7 +1149,9 @@ def _iter_legacy_cases():
                             act_type,
                             hidden_pad=hidden_pad,
                             intermediate_pad=intermediate_pad,
-                            **_situv2_beta_kwargs(act_type),
+                            **_situv2_beta_kwargs(
+                                quant_type, aq_dtype, wq_dtype, act_type
+                            ),
                         ), extras
         elif triple == _PER1X32_FP4_FP4:
             for preshuffle in args.preshuffle:
@@ -1166,7 +1170,9 @@ def _iter_legacy_cases():
                             preshuffle=preshuffle,
                             hidden_pad=0,
                             intermediate_pad=0,
-                            **_situv2_beta_kwargs(act_type),
+                            **_situv2_beta_kwargs(
+                                quant_type, aq_dtype, wq_dtype, act_type
+                            ),
                         ), extras
         elif triple == _PER1X32_BF16_I4:
             for m in args.tokenNum:
@@ -1201,7 +1207,7 @@ def _iter_legacy_cases():
                         wq_dtype,
                         doweight_stage1,
                         act_type,
-                        **_situv2_beta_kwargs(act_type),
+                        **_situv2_beta_kwargs(quant_type, aq_dtype, wq_dtype, act_type),
                     ), extras
 
 

@@ -1,11 +1,12 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
+import contextlib
 import functools
 import os
 import re
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import torch
 
@@ -74,6 +75,105 @@ _MOE_SORT_BACKEND = os.environ.get("AITER_MOE_SORT_BACKEND", "auto").lower()
 _ACT_TYPE_DISABLED_KEY = "__ignore__"
 _SWIGLU_MXFP4_BF16_BOUND = int(os.environ.get("GPTOSS_SWIGLU_MXFP4_BF16_BOUND", "256"))
 _MOE_A8W4_BYPASS_QUANT = os.environ.get("AITER_MOE_A8W4_BYPASS_QUANT", "0") == "1"
+
+
+@dataclass(frozen=True)
+class FmoeRuntimePolicy:
+    """Runtime knobs that make fused_moe dispatch to a given tuned config.
+
+    fused_moe derives the effective activation dtype -- and with it the tuned
+    config it looks up -- from the quant type, weight dtype, activation and gate
+    mode, plus a few env overrides. Callers that hand-build weights instead of
+    going through a serving stack (the tuner's --run_config benchmark,
+    op_tests/test_moe_2stage.py) have to reproduce that derivation exactly. Get
+    it wrong and the lookup misses, fused_moe falls back to its default kernel,
+    and the run reports a healthy number for a kernel nobody tuned.
+
+    gate_mode and w1_gate_up are one decision, not two: w1_gate_up is the
+    gate_up flag for shuffle_weight_a16w4 / shuffle_scale_a16w4, and the kernel
+    only reads that layout correctly under the matching gate_mode.
+    """
+
+    gate_mode: str
+    w1_gate_up: bool
+    # env overrides the caller must apply for the dispatch above to be reached.
+    env: dict = field(default_factory=dict)
+    # SiTUv2 gate/linear scales. None for every other activation.
+    situ_beta: float | None = None
+    situ_linear_beta: float | None = None
+
+
+def fmoe_runtime_policy(
+    quant_type,
+    q_dtype_a,
+    q_dtype_w,
+    activation=ActivationType.Silu,
+) -> FmoeRuntimePolicy:
+    """Return the runtime knobs for the (quant_type, dtypes, activation) config."""
+    activation = ActivationType(activation)
+    gate_mode = GateMode.SEPARATED.value
+    w1_gate_up = False
+    env: dict = {}
+    situ_beta = situ_linear_beta = None
+
+    if quant_type == QuantType.per_1x32:
+        if q_dtype_w == dtypes.fp8:
+            # mxfp8 (a8w8): gate-up interleaved fp8 weight.
+            gate_mode = GateMode.INTERLEAVE.value
+            w1_gate_up = True
+        elif q_dtype_w == dtypes.fp4x2:
+            if q_dtype_a == dtypes.fp8:
+                # a8w4 runs the GUGU layout, matching serving's ATOM_MOE_GU_ITLV=1.
+                gate_mode = GateMode.INTERLEAVE.value
+                w1_gate_up = True
+            # a16w4 (16-bit activation) and a4w4 keep the standard GGUU layout.
+
+            if activation == ActivationType.Situv2:
+                # SiTUv2 is tested ahead of the gate-mode branches and defaults to
+                # a bf16 activation; the fp8 / fp4 variants are opt-in.
+                if q_dtype_a == dtypes.fp8:
+                    env["AITER_SITUV2_A8W4"] = "1"
+                elif q_dtype_a == dtypes.fp4x2:
+                    env["AITER_SITUV2_A4W4"] = "1"
+                # beta / linear_beta are runtime scalars rather than compile keys,
+                # so the kernel default depends on which stage1 wrapper wins (1.0
+                # for FlyDSL, 4.0/25.0 for Opus). Pin them instead of inheriting
+                # whichever default the dispatch happens to land on.
+                situ_beta = DEFAULT_SITUV2_BETA
+                situ_linear_beta = DEFAULT_SITUV2_LINEAR_BETA
+            elif q_dtype_a == dtypes.fp8:
+                # Under INTERLEAVE the picker only selects the fp8 activation once
+                # token >= AITER_BF16_FP8_MOE_BOUND (256 by default), so small-token
+                # rows would otherwise never reach the tuned a8w4 kernel.
+                env["AITER_BF16_FP8_MOE_BOUND"] = "0"
+
+    return FmoeRuntimePolicy(
+        gate_mode=gate_mode,
+        w1_gate_up=w1_gate_up,
+        env=env,
+        situ_beta=situ_beta,
+        situ_linear_beta=situ_linear_beta,
+    )
+
+
+@contextlib.contextmanager
+def fmoe_runtime_env(policy: FmoeRuntimePolicy):
+    """Apply policy.env for the duration of the block, then restore it.
+
+    Restoring matters when a process walks many configs in a row: a leaked
+    override silently changes which kernel later configs dispatch to.
+    """
+    saved = {key: os.environ.get(key) for key in policy.env}
+    os.environ.update(policy.env)
+    try:
+        yield
+    finally:
+        for key, value in saved.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+
 
 # Opt-in kernel-bench hook: a caller sets a list here to collect (name, callable)
 # per-kernel launches in fused_moe_2stages ("stage1"/"stage2"); None in production
