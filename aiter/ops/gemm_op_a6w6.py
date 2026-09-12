@@ -18,9 +18,22 @@ from ..utility import dtypes
 
 # The mxfp6 (E2M3, per-1x32 blockscale) asm gemm shares the a4w4 kernarg ABI.
 # Its packed operand/scale layouts are produced by the helpers below and must
-# match exactly what the `f6gemm_dmabig_kernel_func` kernel consumes.
-_KERNEL_NAME = "f6gemm_dmabig_kernel_func"
-_SAFE_FALLBACK_KERNEL_NAME = "f6gemm_dmabig_swz0_kernel_func"
+# match exactly what the asm kernels consume.
+_DEFAULT_KERNEL_NAME = "aiter_a6w6_m256n256_tile_stage"
+_LEGACY_KERNEL_NAMES = {
+    "f6gemm_tstage_kernel_func": "aiter_a6w6_m256n256_tile_stage",
+    "f6gemm_astage_g32_kernel_func": "aiter_a6w6_m256n256_row_stage_gm32_k6k",
+    "f6gemm_astage_g64_kernel_func": "aiter_a6w6_m256n256_row_stage_gm64_k6k",
+    "f6gemm_astage_allk_kernel_func": "aiter_a6w6_m256n256_row_stage_gm32_k16k",
+    "f6gemm_persist_n1_kernel_func": "aiter_a6w6_m256n256_persistent",
+    "f6gemm_pipeline_q10_kernel_func": "aiter_a6w6_m256n256_persistent_prefetch10",
+    "f6gemm_persist_n2_kernel_func": "aiter_a6w6_m256n512_persistent",
+    "f6gemm_n2_stage_kernel_func": "aiter_a6w6_m256n512_persistent_row_stage",
+    "f6gemm_rect128_kernel_func": "aiter_a6w6_m128n256_stream",
+    "f6gemm_small_tstage_kernel_func": "aiter_a6w6_m64n128_tile_stage",
+    "f6gemm_small_full_kernel_func": "aiter_a6w6_m64n128_full_stage",
+    "f6gemm_square128_kernel_func": "aiter_a6w6_m128n128_full_stage",
+}
 _TILE = 256
 _K_TILE = 128
 _SCALE_GROUP_SIZE = 32
@@ -28,9 +41,6 @@ _PADK = 2  # K-padding steps (of 128) baked into the packed A/B layout
 _PACKED_TILE_BYTES = 24576
 _SCALE_TILE_BYTES = 1024
 _PACK_LAYOUT = "mxfp6_c0c1_256_padk2"
-_SHORT_K_SWIZZLE_LIMIT = 48 * _K_TILE
-_GROUPED_SWIZZLE_MAX_M = 16 * 32 * _TILE
-_GROUPED_SWIZZLE_MAX_N = 64 * _TILE
 _BATCHED_PACK_MIN_ELEMENTS = 32 * 1024 * 1024
 _BATCHED_PACK_BLOCK_M = 64
 _BATCHED_PACK_K_BLOCKS = _K_TILE // _SCALE_GROUP_SIZE
@@ -571,8 +581,27 @@ def _load_gemm_a6w6_configs(
         return {}
 
     configs = configs.copy()
+    separator_columns = [
+        column for column in configs.columns if str(column).startswith("Unnamed:")
+    ]
+    if separator_columns:
+        configs = configs.drop(columns=separator_columns)
     for column in _TUNED_CONFIG_NUMERIC_COLUMNS:
         configs[column] = pd.to_numeric(configs[column], errors="raise").astype(int)
+    if "logicalShape" in configs:
+        configs["logicalShape"] = (
+            pd.to_numeric(configs["logicalShape"], errors="raise")
+            .fillna(0)
+            .astype(int)
+        )
+        if not configs["logicalShape"].isin((0, 1)).all():
+            raise ValueError("A6W6 logicalShape must be 0 or 1")
+    if "splitM64" in configs:
+        configs["splitM64"] = (
+            pd.to_numeric(configs["splitM64"], errors="raise").fillna(0).astype(int)
+        )
+        if not configs["splitM64"].isin((0, 1)).all():
+            raise ValueError("A6W6 splitM64 must be 0 or 1")
     configs["gfx"] = configs["gfx"].astype(str).str.strip()
     configs["kernelName"] = configs["kernelName"].astype(str).str.strip()
 
@@ -598,21 +627,8 @@ def clear_gemm_a6w6_config_cache() -> None:
 
 
 def _default_gemm_a6w6_kernel(M: int, N: int, K: int) -> str:
-    """Choose a safe untuned fallback for the physical launch shape.
-
-    The optimized grouped-M kernel has compile-time swizzle bounds for short-K
-    launches. Natural ordering has no such grid bound and is used outside them.
-    """
-    padM, padN, padK = _ceil(M, _TILE), _ceil(N, _TILE), _ceil(K, _K_TILE)
-    short_k = padK <= _SHORT_K_SWIZZLE_LIMIT
-    grouped_grid_in_bounds = (
-        padM <= _GROUPED_SWIZZLE_MAX_M and padN <= _GROUPED_SWIZZLE_MAX_N
-    )
-    return (
-        _KERNEL_NAME
-        if not short_k or grouped_grid_in_bounds
-        else _SAFE_FALLBACK_KERNEL_NAME
-    )
+    """Choose the unbounded T-stage kernel for an untuned launch shape."""
+    return _DEFAULT_KERNEL_NAME
 
 
 @functools.lru_cache(maxsize=1024)
@@ -664,11 +680,25 @@ def get_GEMM_A6W6_config(
 
 def _select_gemm_a6w6_kernel(M: int, N: int, K: int, kernelName: str | None) -> str:
     if kernelName:
-        return kernelName
+        return _LEGACY_KERNEL_NAMES.get(kernelName, kernelName)
     config = get_GEMM_A6W6_config(M, N, K)
     if config is not None:
         return str(config["kernelName"])
     return _default_gemm_a6w6_kernel(M, N, K)
+
+
+def _config_uses_logical_shape(config: dict[str, object] | None) -> bool:
+    if config is None:
+        return False
+    value = config.get("logicalShape")
+    return bool(int(value)) if value is not None and pd.notna(value) else False
+
+
+def _config_uses_split_m64(config: dict[str, object] | None) -> bool:
+    if config is None:
+        return False
+    value = config.get("splitM64")
+    return bool(int(value)) if value is not None and pd.notna(value) else False
 
 
 def mxfp6_gemm_pack_size(rows: int, K: int) -> tuple[int, int]:
@@ -827,6 +857,8 @@ def _gemm_a6w6_asm(
     A_scale: Tensor,  # packed e8m0 blob
     B_scale: Tensor,  # packed e8m0 blob
     out: Tensor,  # Out:[M, N] bf16
+    M: int,  # logical output rows
+    N: int,  # logical output columns
     K: int,  # logical contraction dim
     kernelName: str | None = None,
     alpha: float = 1.0,
@@ -842,19 +874,32 @@ def gemm_a6w6_asm(
     K: int,
     kernelName: str | None = None,
     alpha: float = 1.0,
+    M: int | None = None,
+    N: int | None = None,
 ) -> Tensor:
     if float(alpha) != 1.0:
         raise ValueError("gemm_a6w6 currently supports only alpha=1.0.")
+    if out.ndim != 2:
+        raise ValueError("gemm_a6w6_asm expects a 2D [M, N] output tensor.")
+    logical_M = out.shape[0] if M is None else int(M)
+    logical_N = out.shape[1] if N is None else int(N)
     if not kernelName:
-        if out.ndim != 2:
-            raise ValueError("gemm_a6w6_asm expects a 2D [M, N] output tensor.")
-        kernelName = _default_gemm_a6w6_kernel(*out.shape, K)
+        kernelName = _select_gemm_a6w6_kernel(logical_M, logical_N, K, None)
+    else:
+        kernelName = _LEGACY_KERNEL_NAMES.get(kernelName, kernelName)
+    if not 0 < logical_M <= out.shape[0] or not 0 < logical_N <= out.shape[1]:
+        raise ValueError(
+            f"logical output shape {(logical_M, logical_N)} must fit in "
+            f"storage shape {tuple(out.shape)}"
+        )
     _gemm_a6w6_asm(
         A,
         B,
         A_scale,
         B_scale,
         out,
+        logical_M,
+        logical_N,
         int(K),
         kernelName,
         float(alpha),
@@ -862,11 +907,12 @@ def gemm_a6w6_asm(
     return out
 
 
-def gemm_a6w6(
+def gemm_a6w6_out(
     A: Tensor,  # packed mxfp6 A (from quant_mxfp6_gemm)
     B: Tensor,  # packed mxfp6 B (from quant_mxfp6_gemm)
     A_scale: Tensor,  # packed A scales
     B_scale: Tensor,  # packed B scales
+    out: Tensor,
     M: int,
     N: int,
     K: int,
@@ -887,10 +933,95 @@ def gemm_a6w6(
         )
     if float(alpha) != 1.0:
         raise ValueError("gemm_a6w6 currently supports only alpha=1.0.")
-    selected_kernel = _select_gemm_a6w6_kernel(M, N, K, kernelName)
     padM, padN, padK = _ceil(M, _TILE), _ceil(N, _TILE), _ceil(K, _K_TILE)
-    out = torch.empty((padM, padN), dtype=dtype, device=A.device)
-    gemm_a6w6_asm(A, B, A_scale, B_scale, out, padK, selected_kernel, alpha)
-    if padM != M or padN != N:
-        return out[:M, :N]
+    if tuple(out.shape) != (padM, padN):
+        raise ValueError(
+            f"gemm_a6w6_out expects padded output shape {(padM, padN)}, "
+            f"got {tuple(out.shape)}"
+        )
+    config = get_GEMM_A6W6_config(M, N, K) if kernelName is None else None
+    selected_kernel = (
+        str(config["kernelName"])
+        if config is not None
+        else _select_gemm_a6w6_kernel(M, N, K, kernelName)
+    )
+    use_logical_shape = _config_uses_logical_shape(config)
+    if _config_uses_split_m64(config):
+        main_M = M - 64
+        if main_M <= 0 or main_M % _TILE:
+            raise ValueError("splitM64 requires M - 64 to be a positive multiple of 256")
+        nk_pad = padK // _K_TILE + _PADK
+        packed_parent_size = nk_pad * _PACKED_TILE_BYTES
+        scale_parent_size = nk_pad * _SCALE_TILE_BYTES
+        parent_count = main_M // _TILE
+        packed_offset = parent_count * packed_parent_size
+        scale_offset = parent_count * scale_parent_size
+        gemm_a6w6_asm(
+            A[:packed_offset],
+            B,
+            A_scale[:scale_offset],
+            B_scale,
+            out[:main_M],
+            padK,
+            selected_kernel,
+            alpha,
+            main_M,
+            N,
+        )
+        gemm_a6w6_asm(
+            A[packed_offset : packed_offset + packed_parent_size],
+            B,
+            A_scale[scale_offset : scale_offset + scale_parent_size],
+            B_scale,
+            out[main_M : main_M + _TILE],
+            padK,
+            "aiter_a6w6_m64n128_full_stage",
+            alpha,
+            64,
+            N,
+        )
+        return out
+    gemm_a6w6_asm(
+        A,
+        B,
+        A_scale,
+        B_scale,
+        out,
+        padK,
+        selected_kernel,
+        alpha,
+        M if use_logical_shape else None,
+        N if use_logical_shape else None,
+    )
     return out
+
+
+def gemm_a6w6(
+    A: Tensor,
+    B: Tensor,
+    A_scale: Tensor,
+    B_scale: Tensor,
+    M: int,
+    N: int,
+    K: int,
+    dtype: torch.dtype = dtypes.bf16,
+    alpha: float = 1.0,
+    kernelName: str | None = None,
+) -> Tensor:
+    """A6W6 GEMM returning a logical [M, N] view of padded output storage."""
+    padM, padN = _ceil(M, _TILE), _ceil(N, _TILE)
+    out = torch.empty((padM, padN), dtype=dtype, device=A.device)
+    gemm_a6w6_out(
+        A,
+        B,
+        A_scale,
+        B_scale,
+        out,
+        M,
+        N,
+        K,
+        dtype,
+        alpha,
+        kernelName,
+    )
+    return out[:M, :N]

@@ -17,12 +17,11 @@ constexpr int kKPaddingTiles        = 2;
 constexpr size_t kPackedTileBytes   = 24576;
 constexpr size_t kScaleTileBytes    = 1024;
 constexpr char kPackLayout[]        = "mxfp6_c0c1_256_padk2";
-constexpr char kDefaultKernelName[] = "f6gemm_dmabig_kernel_func";
+constexpr char kDefaultKernelName[] = "aiter_a6w6_m256n256_tile_stage";
 
-// KernelArgs layout is identical to the a4w4 asm gemm ABI; the mxfp6 dmabig
-// kernel was assembled against the same kernarg struct (0x180 bytes). Fields
-// the fp6 kernel does not consume (ptr_C, beta, A/B strides, k-split) are left
-// zeroed and ignored by the kernel.
+// KernelArgs layout is identical to the a4w4 asm gemm ABI. The mxfp6 kernels
+// use the same kernarg struct (0x180 bytes). Fields they do not consume
+// (ptr_C, beta, A/B strides, k-split) are left zeroed and ignored.
 struct __attribute__((packed)) KernelArgs
 {
     void* ptr_D;
@@ -106,11 +105,13 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
      aiter_tensor_t* A_scale, // A_scale: packed e8m0 blob (pack_scale layout)
      aiter_tensor_t* B_scale, // B_scale: packed e8m0 blob (pack_scale layout)
      aiter_tensor_t* out,     // Out:[M, N] bf16
+     int M,                   // logical output rows
+     int N,                   // logical output columns
      int K,                   // padded contraction dim consumed by the packed layout
      const char* kernelName,
      float alpha,
      hipStream_t stream),
-    (A, B, A_scale, B_scale, out, K, kernelName, alpha, stream))
+    (A, B, A_scale, B_scale, out, M, N, K, kernelName, alpha, stream))
 {
     AITER_CHECK(out->dtype() == AITER_DTYPE_bf16, __func__, " only support BFloat16 output now!");
     AITER_CHECK(out->dim() == 2 && out->is_contiguous(),
@@ -124,13 +125,25 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
                     A->device_id == B_scale->device_id && A->device_id == out->device_id,
                 __func__,
                 " all tensors must be on the same GPU");
-    int Mdim = out->size(0);
-    int Ndim = out->size(1);
+    int Mstorage = out->size(0);
+    int Nstorage = out->size(1);
+    int Mdim = M;
+    int Ndim = N;
     int Kdim = K;
+    AITER_CHECK(Mdim > 0 && Mdim <= Mstorage,
+                __func__,
+                " logical M must fit output storage");
+    AITER_CHECK(Ndim > 0 && Ndim <= Nstorage,
+                __func__,
+                " logical N must fit output storage");
     AITER_CHECK(
-        Mdim > 0 && (Mdim % kTileSize) == 0, __func__, " M must be a positive multiple of 256!");
+        Mstorage > 0 && (Mstorage % kTileSize) == 0,
+        __func__,
+        " output storage M must be a positive multiple of 256!");
     AITER_CHECK(
-        Ndim > 0 && (Ndim % kTileSize) == 0, __func__, " N must be a positive multiple of 256!");
+        Nstorage > 0 && (Nstorage % kTileSize) == 0,
+        __func__,
+        " output storage N must be a positive multiple of 256!");
     AITER_CHECK(
         Kdim > 0 && (Kdim % kKTileSize) == 0, __func__, " K must be a positive multiple of 128!");
     AITER_CHECK(A->dtype() == AITER_DTYPE_u8 && B->dtype() == AITER_DTYPE_u8 &&
@@ -139,10 +152,10 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
                 " packed operands and scales must use uint8");
 
     const size_t nk_pad     = static_cast<size_t>(Kdim / kKTileSize + kKPaddingTiles);
-    const size_t expected_A = static_cast<size_t>(Mdim / kTileSize) * nk_pad * kPackedTileBytes;
-    const size_t expected_B = static_cast<size_t>(Ndim / kTileSize) * nk_pad * kPackedTileBytes;
-    const size_t expected_scaleA = static_cast<size_t>(Mdim / kTileSize) * nk_pad * kScaleTileBytes;
-    const size_t expected_scaleB = static_cast<size_t>(Ndim / kTileSize) * nk_pad * kScaleTileBytes;
+    const size_t expected_A = static_cast<size_t>(Mstorage / kTileSize) * nk_pad * kPackedTileBytes;
+    const size_t expected_B = static_cast<size_t>(Nstorage / kTileSize) * nk_pad * kPackedTileBytes;
+    const size_t expected_scaleA = static_cast<size_t>(Mstorage / kTileSize) * nk_pad * kScaleTileBytes;
+    const size_t expected_scaleB = static_cast<size_t>(Nstorage / kTileSize) * nk_pad * kScaleTileBytes;
     AITER_CHECK(A->numel() == expected_A && B->numel() == expected_B,
                 __func__,
                 " packed operand buffer sizes must exactly match the launch dimensions");
