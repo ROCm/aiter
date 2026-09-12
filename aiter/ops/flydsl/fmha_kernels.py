@@ -28,7 +28,6 @@ The kernel implements self-attention only (Lq == Lk). Cross-attention
 
 from __future__ import annotations
 
-import math
 from functools import lru_cache
 
 import torch
@@ -261,6 +260,7 @@ def _fp8_gfx950_supported(
         return False
 
     from ...jit.utils.chip_info import get_gfx
+    from .kernels.flash_attn_func_fp8_gfx950 import _is_valid_softmax_scale
 
     if get_gfx() != "gfx950":
         return False
@@ -280,9 +280,7 @@ def _fp8_gfx950_supported(
     ):
         return False
     qk_hdim = q.shape[-1]
-    if softmax_scale is not None and (
-        not math.isfinite(softmax_scale) or softmax_scale <= 0
-    ):
+    if not _is_valid_softmax_scale(softmax_scale):
         return False
     if not _fp8_gfx950_buildable(qk_hdim, v.shape[-1]):
         return False

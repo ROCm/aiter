@@ -5,6 +5,8 @@
 
 from __future__ import annotations
 
+from contextlib import nullcontext
+
 import pytest
 import torch
 import torch.nn.functional as F
@@ -1688,6 +1690,107 @@ def test_fp8_softmax_scale_rejects_invalid(scale):
     q, k, v, descales = _fp8_dispatch_inputs(B=1, S=70, H=12, D=192)
     with pytest.raises(ValueError, match="softmax_scale must be positive and finite"):
         flydsl_flash_attn_fp8_func(q, k, v, softmax_scale=scale, **descales)
+
+
+@pytest.mark.parametrize("varlen", [False, True])
+@pytest.mark.parametrize(
+    "scale,valid",
+    [
+        (None, True),
+        (192**-0.5, True),
+        (0.137, True),
+        (0.0, False),
+        (-0.5, False),
+        (float("nan"), False),
+        (float("inf"), False),
+        (float("-inf"), False),
+    ],
+)
+def test_fp8_softmax_scale_cpu_dispatch_contract(monkeypatch, varlen, scale, valid):
+    """Exercise both public APIs with fake tensors; no GPU or compilation."""
+    from torch._subclasses.fake_tensor import FakeTensor, FakeTensorMode
+
+    from aiter.jit.utils import chip_info
+    from aiter.ops.flydsl import fmha_kernels as dispatch
+    from aiter.ops.flydsl.kernels import flash_attn_func_fp8_gfx950 as fa
+
+    launches = []
+    monkeypatch.setattr(chip_info, "get_gfx", lambda: "gfx950")
+    monkeypatch.setattr(fa, "_gpu_arch", lambda device: "gfx950")
+    monkeypatch.setattr(fa, "_num_cu", lambda device: 256)
+    monkeypatch.setattr(torch.cuda, "device", lambda device: nullcontext())
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda device: None)
+    monkeypatch.setattr(
+        fa, "_build_fp8", lambda **kw: lambda *args, **kw: launches.append(kw)
+    )
+    with FakeTensorMode() as mode:
+
+        def fake(shape, dtype=torch.float8_e4m3fn):
+            return FakeTensor(
+                mode,
+                torch.empty(shape, dtype=dtype, device="meta"),
+                torch.device("cuda:0"),
+            )
+
+        shape = (70, 12, 192) if varlen else (1, 70, 12, 192)
+        q, k, v = fake(shape), fake(shape), fake((*shape[:-1], 128))
+        descale = fake((1,), torch.float32)
+        kw = {
+            "softmax_scale": scale,
+            "q_descale": descale,
+            "k_descale": descale,
+            "v_descale": descale,
+        }
+        direct_kw = {}
+        if varlen:
+            cu = fake((2,), torch.int32)
+            direct_kw = {
+                "cu_seqlens_q": cu,
+                "cu_seqlens_kv": cu,
+                "max_seqlen_q": 70,
+                "max_seqlen_kv": 70,
+                "cross_seqlen": False,
+            }
+            out = dispatch.flydsl_flash_attn_varlen_func(q, k, v, cu, cu, 70, 70, **kw)
+        else:
+            out = dispatch.flydsl_flash_attn_batch_func(q, k, v, **kw)
+        if not valid:
+            assert out is None
+            with pytest.raises(
+                ValueError, match="softmax_scale must be positive and finite"
+            ):
+                fa.flydsl_flash_attn_fp8_func(q, k, v, **direct_kw, **kw)
+            assert not launches
+        else:
+            direct = fa.flydsl_flash_attn_fp8_func(q, k, v, **direct_kw, **kw)
+            assert out.shape == direct.shape == (*shape[:-1], 128)
+            assert out.dtype == direct.dtype == torch.bfloat16
+            assert len(launches) == 2
+            assert all(
+                z["softmax_scale"] == (192**-0.5 if scale is None else scale)
+                for z in launches
+            )
+
+
+@pytest.mark.parametrize("head_dim", [128, 192])
+@pytest.mark.parametrize("scale", [None, 0.137])
+@pytest.mark.parametrize("compile_only", [False, True])
+def test_fp8_softmax_scale_cpu_launch_arguments(
+    monkeypatch, head_dim, scale, compile_only
+):
+    """Run and compile use the built head dimension for the default scale."""
+    from aiter.ops.flydsl.kernels.fmha_gfx950 import flash_attn_fp8_gfx950 as kernel
+
+    monkeypatch.setattr(kernel, "get_hip_arch", lambda: "gfx950")
+    monkeypatch.setattr(kernel.fx, "Stream", lambda stream: stream)
+    monkeypatch.setattr(kernel, "_run_compiled", lambda fn, *args: args)
+    monkeypatch.setattr(kernel.flyc, "compile", lambda fn, *args: args)
+    launch = kernel.build_flash_attn_dualwave_swp_fp8_module(
+        12, head_dim, head_dim_v=128
+    )
+    call = launch.compile if compile_only else launch
+    args = call(object(), object(), object(), object(), 1, 70, softmax_scale=scale)
+    assert args[-3] == (head_dim**-0.5 if scale is None else scale)
 
 
 @_gfx950_only

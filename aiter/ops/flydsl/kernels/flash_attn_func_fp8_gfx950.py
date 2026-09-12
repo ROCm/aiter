@@ -49,6 +49,11 @@ _FP8_NARROW_MAX_KV_TILES = 48
 _FP8_BATCH_INTERLEAVE_GROUP = 2
 
 
+def _is_valid_softmax_scale(softmax_scale: float | None) -> bool:
+    """Accept the default scale or a positive, finite custom scale."""
+    return softmax_scale is None or (math.isfinite(softmax_scale) and softmax_scale > 0)
+
+
 def _fp8_rescale_threshold(seqlen_kv: int) -> float:
     return 6.0 if seqlen_kv <= _FP8_LONG_SEQ else 4.0
 
@@ -416,7 +421,7 @@ def flydsl_flash_attn_fp8_func(
 
     if softmax_scale is None:
         softmax_scale = D**-0.5
-    if not math.isfinite(softmax_scale) or softmax_scale <= 0:
+    if not _is_valid_softmax_scale(softmax_scale):
         raise ValueError(
             "flydsl_flash_attn_fp8_func: softmax_scale must be positive and finite"
         )

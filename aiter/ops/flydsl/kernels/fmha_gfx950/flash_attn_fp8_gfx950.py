@@ -503,7 +503,6 @@ def build_flash_attn_dualwave_swp_fp8_module(
         seq_len,
         stride_kv_n=None,
         stride_q_n=None,
-        head_dim_runtime=None,
         *,
         softmax_scale=None,
         seq_len_kv=None,
@@ -522,10 +521,8 @@ def build_flash_attn_dualwave_swp_fp8_module(
             stride_kv_n = DEFAULT_STRIDE_KV_N
         if stride_q_n is None:
             stride_q_n = DEFAULT_STRIDE_Q_N
-        if head_dim_runtime is None:
-            head_dim_runtime = HEAD_DIM
         if softmax_scale is None:
-            softmax_scale = head_dim_runtime**-0.5
+            softmax_scale = HEAD_DIM**-0.5
         # seq_len_kv defaults to seq_len (self-attention / equal Q,KV lengths).
         if seq_len_kv is None:
             seq_len_kv = seq_len
