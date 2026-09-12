@@ -771,6 +771,7 @@ with open(os.path.join(args.output_dir, "generated.cpp"), "w") as output:
             "parse": version,
             "Version": version,
             "get_gfx": lambda: "gfx942",
+            "get_gfx_list": lambda: ["gfx942"],
             "check_LLVM_MAIN_REVISION": lambda: 0,
             "validate_and_update_archs": lambda: ["gfx942"],
             "hip_flag_checker": lambda _flag: True,

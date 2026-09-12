@@ -22,6 +22,12 @@ from packaging.version import Version, parse
 
 this_dir = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, f"{this_dir}/utils/")
+from build_targets import (
+    KNOWN_GFX,
+    _parse_gpu_archs_env,
+    get_build_archs_env,
+    gpu_archs_env_names,
+)
 from chip_info import get_gfx, get_gfx_list, get_gfx_runtime
 from cpp_extension import _jit_compile, executable_path, get_hip_version
 from file_baton import FileBaton
@@ -588,29 +594,21 @@ if multiprocessing.current_process().name == "MainProcess":
 
 
 def validate_and_update_archs():
-    archs = os.getenv("GPU_ARCHS", "native").split(";")
-    archs = [arch.strip() for arch in archs]
-    # List of allowed architectures
-    allowed_archs = [
-        "native",
-        "gfx90a",
-        "gfx940",
-        "gfx941",
-        "gfx942",
-        "gfx1100",
-        "gfx1101",
-        "gfx1102",
-        "gfx1103",
-        "gfx1150",
-        "gfx1151",
-        "gfx1152",
-        "gfx1153",
-        "gfx1200",
-        "gfx1201",
-        "gfx1250",
-        "gfx950",
-        "gfx1250",
-    ]
+    # AITER_GPU_TARGETS is authoritative for the arch set; a conflicting
+    # GPU_ARCHS warns and loses.
+    named = get_build_archs_env()
+    if named is not None:
+        archs = list(named)
+        explicit = set(gpu_archs_env_names())
+        if explicit and explicit != set(archs):
+            logger.warning(
+                f"GPU_ARCHS={sorted(explicit)} disagrees with "
+                f"AITER_GPU_TARGETS={archs}; compiling for {archs}."
+            )
+    else:
+        archs = _parse_gpu_archs_env(os.getenv("GPU_ARCHS", "native"))
+
+    allowed_archs = {"native", *KNOWN_GFX}
 
     # Validate if each element in archs is in allowed_archs
     assert all(
@@ -1119,13 +1117,11 @@ def build_module(
         # Cluster launch is a HOST-side API question (hipDrvLaunchKernelEx +
         # HIP_LAUNCH_CONFIG appear in ROCm 7.0), not a question about which GPU
         # this machine has -- so the arch test must accept a cross-compile for
-        # gfx1250 the way the gfx1250 flags in optCompilerConfig.json already do.
-        # get_gfx() alone reads the LAST entry of a multi-arch GPU_ARCHS, which
-        # left "gfx1250;gfx942" building gfx1250 kernels whose cluster launch
+        # gfx1250, and must test membership rather than a single resolved arch:
+        # "gfx1250;gfx942" otherwise builds gfx1250 kernels whose cluster launch
         # path was compiled out (AiterAsmKernelFast then rejects them at launch).
-        if (
-            get_gfx() == "gfx1250" or "gfx1250" in os.environ.get("GPU_ARCHS", "")
-        ) and hip_version >= Version("7.0.0"):
+        # Same test as the gfx1250 flags in optCompilerConfig.json.
+        if "gfx1250" in get_gfx_list() and hip_version >= Version("7.0.0"):
             flags_hip += ["-DAITER_ENABLE_CLUSTER_LAUNCH"]
 
         if not torch_exclude:
