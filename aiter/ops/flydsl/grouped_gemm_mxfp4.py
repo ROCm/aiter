@@ -121,6 +121,18 @@ def flydsl_grouped_gemm_a8w4_masked(
             f"(N={N}, tile_n={tile_n}) to be an exact multiple"
         )
     enable_ep_scatter = stage2_scatter is not None
+    if enable_ep_scatter and stage2_scatter.combine_quant_bits:
+        # N is the payload plane's length and so the scale plane's base, which
+        # has to land on a cache line; fp4 packs two elements to the byte and
+        # needs twice the element alignment fp8 does. Checked here because N is
+        # traced inside @flyc.jit, same as the cluster_n constraint above.
+        n_align = 128 * (8 // stage2_scatter.combine_quant_bits)
+        if N % n_align:
+            raise ValueError(
+                f"[grouped-moe tdm] combine_quant_bits="
+                f"{stage2_scatter.combine_quant_bits} needs N % {n_align} == 0 to "
+                f"keep the scale plane cache-line aligned, got N={N}"
+            )
     ep_row_map_tensor = ep_row_map if ep_row_map is not None else out
     launch_gemm_a8w4_tdm(
         out,
@@ -162,6 +174,9 @@ def flydsl_grouped_gemm_a8w4_masked(
         ),
         ep_destination_stride=int(ep_destination_stride),
         ep_world_size=int(stage2_scatter.world_size) if enable_ep_scatter else 0,
+        ep_quant_bits=(
+            int(stage2_scatter.combine_quant_bits) if enable_ep_scatter else 0
+        ),
         arg_ep_row_map=ep_row_map_tensor,
         f32_situ_beta=float(situ_beta),
         f32_situ_linear_beta=float(situ_linear_beta),

@@ -122,6 +122,7 @@ def _find_grouped_config(
     q_dtype_a,
     q_dtype_w,
     quant_type,
+    ep_fused: bool = False,
 ):
     from aiter.jit.utils.chip_info import get_cu_num
 
@@ -138,6 +139,9 @@ def _find_grouped_config(
         "q_dtype_a": str(q_dtype_a),
         "q_dtype_w": str(q_dtype_w),
         "q_type": _enum_name(quant_type),
+        # gemm2 also does the EP scatter, which shifts the stage2 tile optimum
+        # away from the plain-GEMM one. Rows leaving this blank serve both paths.
+        "ep_fused": "1" if ep_fused else "0",
     }
     rows = _load_grouped_config_rows()
 
@@ -145,17 +149,32 @@ def _find_grouped_config(
     # constraint, while cu_num can be relaxed as a fallback. Columns missing from
     # the CSV (e.g. older configs without a 'gfx' column) are skipped, so this
     # stays backward compatible with pre-gfx tuned files.
+    # The tuner rewrites its frame through ``astype(str)``, so a blank cell can
+    # come back as the literal "nan"; read those as unset (wildcard) instead of
+    # as a value that matches nothing.
+    def _cell(row, k):
+        value = str(row.get(k) or "").strip()
+        return "" if value.lower() in ("nan", "none") else value
+
     def _matches(row, *, require_cu_num: bool):
         for k, v in keys.items():
             if k == "cu_num" and not require_cu_num:
                 continue
-            if row.get(k) and str(row.get(k)).strip() != v:
+            cell = _cell(row, k)
+            if cell and cell != v:
                 return False
         return True
 
     matches = [row for row in rows if _matches(row, require_cu_num=True)]
     if not matches:
         matches = [row for row in rows if _matches(row, require_cu_num=False)]
+    # A row that names ep_fused explicitly was tuned for that path, so it wins
+    # over an otherwise equal row that serves both. These are hand-picked, not
+    # tuned: measuring the fused path needs a live multi-rank arena for gemm2's
+    # scatter epilogue, which the single-GPU bench cannot stand up.
+    ep_specific = [row for row in matches if _cell(row, "ep_fused")]
+    if ep_specific:
+        matches = ep_specific
     if not matches:
         if os.environ.get("AITER_GROUPED_DEBUG", "0") not in (
             "",
@@ -169,7 +188,17 @@ def _find_grouped_config(
                 flush=True,
             )
         return None
-    matches.sort(key=lambda r: float(r.get("us") or 0.0))
+
+    # Unmeasured rows sort last: a hand-written row's blank or 0 `us` reads as
+    # infinitely fast and would beat every real measurement for the same shape.
+    def _by_measured_us(row):
+        try:
+            us = float(_cell(row, "us") or 0.0)
+        except ValueError:
+            us = 0.0
+        return (us <= 0.0, us)
+
+    matches.sort(key=_by_measured_us)
     return matches[0]
 
 
@@ -476,6 +505,15 @@ def _grouped_a8w4_tdm_moe(
     wmma_rep = get_wmma_m_rep(tile_m, tile_n, m_warp, n_warp, "gemm1")
     wmma_rep2 = get_wmma_m_rep(tile_m2, tile_n2, m_warp2, n_warp2, "gemm2")
     _align_m = max(tile_m, tile_m2)
+    # Both GEMMs walk the same contiguous layout, each with its own tile height,
+    # so every expert must start on a row that is a multiple of both. Aligning to
+    # the larger tile only achieves that when it is a multiple of the smaller one.
+    if _align_m % tile_m or _align_m % tile_m2:
+        raise ValueError(
+            f"[grouped-moe] tile_m={tile_m} and tile_m2={tile_m2} must both "
+            f"divide their max ({_align_m}); otherwise a GEMM tile straddles "
+            "two experts and silently computes against the wrong weights"
+        )
     contiguous_m = max(
         _align_m, _tdm_align_up(token_num * topk + E * _align_m - topk, _align_m)
     )
@@ -549,12 +587,15 @@ def _grouped_a8w4_tdm_moe(
             "max_tok": int(stage2_scatter.max_tokens_per_rank),
             "slot_stride": int(stage2_scatter.max_tokens_per_rank) * int(topk),
         }
+    # _align_m, not tile_m: gemm2 may tile M more coarsely than gemm1, and a
+    # start aligned only to tile_m would let a gemm2 tile cross an expert
+    # boundary (see the divisibility check above).
     _starts, psum, _ = contiguous_psum_remap(
         _masked_m,
         topids_to_rows,
         E,
         max_m,
-        tile_m,
+        _align_m,
         num_valid_routes=_ep_nvr,
         ep_scatter_params=ep_scatter_params,
     )
@@ -1079,6 +1120,7 @@ def grouped_gemm_gfx1250_a8w4(
         q_dtype_a=q_dtype_a,
         q_dtype_w=q_dtype_w_key,
         quant_type=quant_type,
+        ep_fused=stage2_scatter is not None,
     )
     if cfg_row is not None:
         tile_m = _as_int(cfg_row.get("tile_m"), tile_m)

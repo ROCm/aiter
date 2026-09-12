@@ -14,9 +14,18 @@ from aiter.fused_moe import fused_moe
 from aiter.jit.utils.chip_info import get_gfx
 from aiter.ops.flydsl.moe_common import GateMode
 
-from .combine import _make_combine_fused_reduce, _make_combine_fused_sync
+from .combine import (
+    CHUNK_ELEMS as _COMBINE_CHUNK_ELEMS,
+)
+from .combine import (
+    COMBINE_LDS_BUDGET,
+    _make_combine_fused_reduce,
+    _make_combine_fused_sync,
+    combine_reduce_lds_bytes,
+)
 from .config import _WAVE_SIZE, _select_dispatch_config
 from .dispatch import _make_dispatch
+from .types import COMBINE_SCALE_BLOCK as _COMBINE_SCALE_BLOCK
 from .types import Stage2ScatterContext, _from_gpu_ptr
 
 __all__ = ["MegaMoEGfx1250"]
@@ -24,6 +33,64 @@ __all__ = ["MegaMoEGfx1250"]
 _DISPATCH_BACKENDS = ("flydsl", "mori")
 _MAX_WORLD_SIZE = 72
 _MAX_EXPERTS_PER_RANK = 512
+
+# "mxfp8" is what the mega_moe v2 path calls "fp8_blockwise_1x32" (kernels/
+# flydsl_dispatch_combine_intranode_op.py); that path has no fp4.
+_COMBINE_QUANT_MODES = ("none", "mxfp8", "mxfp4")
+# Preferred lane tile for the TDM combine: T tokens x C chunks per block
+# iteration, which the reduce turns into T*C*256/16 lanes -- so the quantized
+# path runs a wider block than the bf16 one. A ceiling, not the answer:
+# `_combine_tile` walks these down until the tile fits a given topk.
+_COMBINE_TOKENS_PER_BLOCK = 16
+_COMBINE_CHUNKS_PER_ITER = 1
+# The MXFP8 wire wants a larger C: its scale plane puts only C*8 bytes in a TDM
+# row, so a small C makes that load pull a whole cache line per row for a
+# handful of bytes.
+_COMBINE_QUANT_TOKENS_PER_BLOCK = 8
+_COMBINE_QUANT_CHUNKS_PER_ITER = 4
+
+
+def _combine_tile(*, topk, hidden_dim, quant_bits):
+    """(tokens_per_block, chunks_per_iter) for the reduce, widest that fits.
+
+    C has to divide the hidden chunk count, since the reduce has no tail path
+    along hidden, and 2*topk, so the tile's T*topk rows spread evenly over the
+    block's T*C/2 warps.
+
+    T then takes the tile as high as the LDS budget allows, since trips per block
+    is what keeps the prefetch pipeline fed. LDS grows as T*topk, so a large topk
+    trades height away: topk=8 on the mxfp8 wire needs 164KB at the preferred
+    T=8 and lands on T=7.
+    """
+    n_chunks = hidden_dim // _COMBINE_CHUNK_ELEMS
+    max_chunks, max_toks = (
+        (_COMBINE_QUANT_CHUNKS_PER_ITER, _COMBINE_QUANT_TOKENS_PER_BLOCK)
+        if quant_bits
+        else (_COMBINE_CHUNKS_PER_ITER, _COMBINE_TOKENS_PER_BLOCK)
+    )
+    for chunks in range(max_chunks, 0, -1):
+        if n_chunks % chunks or (2 * topk) % chunks:
+            continue
+        for toks in range(max_toks, 0, -1):
+            lanes = toks * chunks * _COMBINE_CHUNK_ELEMS // 16
+            if lanes % _WAVE_SIZE:
+                continue
+            if (
+                combine_reduce_lds_bytes(
+                    experts_per_token=topk,
+                    quant_bits=quant_bits,
+                    tokens_per_block=toks,
+                    chunks_per_iter=chunks,
+                )
+                <= COMBINE_LDS_BUDGET
+            ):
+                return toks, chunks
+    raise ValueError(
+        f"no combine reduce tile fits the {COMBINE_LDS_BUDGET // 1024}KB LDS "
+        f"budget for topk={topk}, hidden_dim={hidden_dim}, "
+        f"combine_quant_bits={quant_bits}"
+    )
+
 
 # mori's C++ EpArgs offset stems -> this package's arena region names. All eight
 # are bound when a plan is built even though mori's dispatch dereferences only the
@@ -44,21 +111,8 @@ _MORI_REGION_NAMES = {
 
 
 def read_dispatch_wire_env() -> str:
-    """$MEGA_DISPATCH_WIRE, and a loud death for the name it replaced.
-
-    Not a fallback: an env var that is silently ignored sends a run that asked
-    for fp4 down the bf16 path and reports nothing, which is the one failure
-    mode a wire benchmark cannot survive.
-    """
-    stale, current = os.environ.get("MEGA_WIRE"), os.environ.get("MEGA_DISPATCH_WIRE")
-    if stale is not None and current != stale:
-        raise RuntimeError(
-            "MEGA_WIRE was renamed to MEGA_DISPATCH_WIRE (combine gets its own "
-            f"wire); found MEGA_WIRE={stale!r} with MEGA_DISPATCH_WIRE="
-            f"{current!r}. Update the launch script rather than relying on the "
-            "old name -- it is no longer read."
-        )
-    return current or "bf16"
+    """$MEGA_DISPATCH_WIRE, defaulting to bf16."""
+    return os.environ.get("MEGA_DISPATCH_WIRE") or "bf16"
 
 
 @dataclass(frozen=True)
@@ -186,6 +240,9 @@ class MegaMoEConfig:
     # fp8, a4w4 -> fp4). It is not a free choice: the receiver hands the payload
     # to the grouped GEMM as-is, so a mismatch is a width error, not a slow path.
     dispatch_wire: str = "bf16"
+    # What the combine reduce puts on the wire. Independent of dispatch_wire:
+    # combine moves post-expert tokens, so it picks its own payload format.
+    combine_quant: str = "none"
 
     def __post_init__(self):
         if self.dispatch_wire not in _DISPATCH_WIRES:
@@ -204,6 +261,19 @@ class MegaMoEConfig:
             raise ValueError(
                 "one e8m0 scale covers 32 features, so a quantizing dispatch "
                 f"wire needs hidden_dim % 32 == 0, got {self.hidden_dim}"
+            )
+        if self.combine_quant not in _COMBINE_QUANT_MODES:
+            raise ValueError(
+                f"combine_quant must be one of {_COMBINE_QUANT_MODES}, "
+                f"got {self.combine_quant!r}"
+            )
+        # Every wire, not just the quantized ones: the reduce tiles hidden in
+        # whole chunks and has no tail path.
+        if self.hidden_dim % _COMBINE_CHUNK_ELEMS:
+            raise ValueError(
+                f"the combine reduce tiles hidden in {_COMBINE_CHUNK_ELEMS}-"
+                f"element chunks with no tail path, so it needs hidden_dim % "
+                f"{_COMBINE_CHUNK_ELEMS} == 0, got {self.hidden_dim}"
             )
         if self.dispatch_backend not in _DISPATCH_BACKENDS:
             raise ValueError(
@@ -276,8 +346,19 @@ class MegaMoEConfig:
         )
 
     @property
-    def combine_token_nbytes(self) -> int:
-        """Combine moves bf16 post-expert tokens, whatever the wire carried."""
+    def combine_quant_bits(self) -> int:
+        """Payload width on the combine wire; 0 keeps it bf16."""
+        return {"none": 0, "mxfp8": 8, "mxfp4": 4}[self.combine_quant]
+
+    @property
+    def combine_wire_nbytes(self) -> int:
+        """What combine moves per token: an MX payload, or bf16 when off."""
+        if self.combine_quant_bits:
+            # A payload plane of MX bytes, then its e8m0 scale plane.
+            return (
+                self.hidden_dim * self.combine_quant_bits // 8
+                + self.hidden_dim // _COMBINE_SCALE_BLOCK
+            )
         return self.hidden_dim * 2
 
     @property
@@ -317,7 +398,7 @@ class MegaMoEConfig:
     @property
     def combine_slot_stride_bytes(self) -> int:
         stride = 1
-        while stride < self.combine_token_nbytes:
+        while stride < self.combine_wire_nbytes:
             stride <<= 1
         return stride
 
@@ -359,6 +440,7 @@ class MegaMoEGfx1250:
         situ_linear_beta: torch.Tensor | None = None,
         dispatch_backend: str | None = None,
         dispatch_wire: str | None = None,
+        combine_quant: str | None = None,
     ):
         """Everything here is fixed for the whole model; forward() takes the rest.
 
@@ -454,6 +536,11 @@ class MegaMoEGfx1250:
                     dispatch_wire
                     if dispatch_wire is not None
                     else read_dispatch_wire_env()
+                ),
+                combine_quant=(
+                    combine_quant
+                    if combine_quant is not None
+                    else os.environ.get("MEGA_COMBINE_QUANT", "none")
                 ),
             ),
             communicator,
@@ -701,8 +788,15 @@ class MegaMoEGfx1250:
             }
 
         # Keep the cross-device barrier in its own 1-block kernel so the reduce
-        # grid is unconstrained. 512x16 measured best-or-tied at every token count.
-        combine_specs = [(512, 16)]
+        # grid is unconstrained. Both wires stage through LDS, so the block is
+        # sized to the lane tile (T*C*256/16 lanes).
+        _comb_toks, _comb_chunks = _combine_tile(
+            topk=config.topk,
+            hidden_dim=config.hidden_dim,
+            quant_bits=config.combine_quant_bits,
+        )
+        _lanes = _comb_toks * _comb_chunks * _COMBINE_CHUNK_ELEMS // 16
+        combine_specs = [(512, _lanes // _WAVE_SIZE)]
         self._combine_specs = combine_specs
         self._combine_variants = {
             spec: _make_combine_fused_reduce(
@@ -711,6 +805,9 @@ class MegaMoEGfx1250:
                 block_num=spec[0],
                 warp_num_per_block=spec[1],
                 slot_stride_nbytes=config.combine_slot_stride_bytes,
+                quant_bits=config.combine_quant_bits,
+                tokens_per_block=_comb_toks,
+                chunks_per_iter=_comb_chunks,
             )
             for spec in combine_specs
         }
@@ -936,6 +1033,7 @@ class MegaMoEGfx1250:
             max_tokens_per_rank=self._config.max_tokens_per_rank,
             world_size=self._config.world_size,
             source_token_map=routing.source_token_map,
+            combine_quant_bits=self._config.combine_quant_bits,
         )
 
     def _combine(self, routing: Routing) -> torch.Tensor:
