@@ -7,6 +7,8 @@ from dataclasses import dataclass, fields
 import pytest
 import torch
 
+import aiter.ops.triton.moe.moe_op_gemm_a16w4 as moe_gemm_a16w4_module
+
 # matmul utilities
 from aiter.ops.triton.moe.moe_op_gemm_a16w4 import (
     moe_gemm_a16w4,
@@ -155,6 +157,41 @@ def assert_close(ref, tri, maxtol=None, rmstol=None, description="--", verbose=T
 # ---------------
 # unit tests
 # ---------------
+
+
+@pytest.mark.parametrize(
+    "backend, gluon_available, expected, expected_warnings",
+    [
+        (None, False, "triton", []),
+        (None, True, "gluon", []),
+        ("triton", False, "triton", []),
+        ("gluon", True, "gluon", []),
+        (
+            "gluon",
+            False,
+            "triton",
+            [
+                (
+                    "Gluon backend was explicitly requested but is not available; "
+                    "using Triton."
+                )
+            ],
+        ),
+    ],
+)
+def test_resolve_backend(
+    monkeypatch, backend, gluon_available, expected, expected_warnings
+):
+    warnings = []
+    monkeypatch.setattr(
+        moe_gemm_a16w4_module,
+        "_is_gluon_available",
+        lambda: gluon_available,
+    )
+    monkeypatch.setattr(moe_gemm_a16w4_module._LOGGER, "warning", warnings.append)
+
+    assert moe_gemm_a16w4_module._resolve_backend(backend) == expected
+    assert warnings == expected_warnings
 
 
 @dataclass

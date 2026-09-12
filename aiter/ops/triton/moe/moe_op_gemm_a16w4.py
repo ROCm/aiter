@@ -30,6 +30,27 @@ def _is_gluon_available():
         return False
 
 
+def _resolve_backend(backend: str | None) -> str:
+    """Resolve automatic selection without warning on the expected fallback."""
+    if backend is None:
+        return "gluon" if _is_gluon_available() else "triton"
+
+    backend = backend.lower()
+    assert backend in (
+        "triton",
+        "gluon",
+    ), f"Unknown backend '{backend}', must be 'triton' or 'gluon'"
+
+    if backend == "gluon" and not _is_gluon_available():
+        _LOGGER.warning(
+            "Gluon backend was explicitly requested but is not available; "
+            "using Triton."
+        )
+        return "triton"
+
+    return backend
+
+
 def can_overflow_int32(tensor: torch.Tensor):
     max_int32 = (1 << 31) - 1
     offset = 0
@@ -248,18 +269,7 @@ def moe_gemm_a16w4(
         torch.Tensor: Output with shape as x(num_tokens, K/hidden_dim/emb_dim)
     """
 
-    if backend in (None, "gluon"):
-        if _is_gluon_available():
-            backend = "gluon"
-        else:
-            _LOGGER.warning("GLUON backend not available. Using TRITON backend!!!")
-            backend = "triton"
-
-    backend = backend.lower()
-    assert backend in (
-        "triton",
-        "gluon",
-    ), f"Unknown backend '{backend}', must be 'triton' or 'gluon'"
+    backend = _resolve_backend(backend)
 
     _LOGGER.info(
         f"MOE_GEMM_A16W4: x={x.shape} w={w.shape} w_scales={w_scales.shape} swizzle_mx_scale={swizzle_mx_scale} backend={backend}"
