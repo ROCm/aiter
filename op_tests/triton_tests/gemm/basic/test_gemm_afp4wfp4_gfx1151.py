@@ -1,13 +1,12 @@
 # SPDX-License-Identifier: MIT
 import copy
-import importlib
 
 import pytest
 import torch
 
-from aiter.ops.triton._triton_kernels.gemm.basic.gemm_afp4wfp4 import _get_config
 from aiter.ops.triton.gemm.basic.gemm_afp4wfp4 import gemm_afp4wfp4
 from aiter.ops.triton.utils._triton import arch_info
+from aiter.ops.triton.utils.gemm_config_utils import get_gemm_config
 
 pytestmark = pytest.mark.skipif(
     arch_info.get_arch() != "gfx1151", reason="gfx1151 FP4 GEMM regression tests"
@@ -68,44 +67,34 @@ def test_gfx1151_fp4_gemm(m, n, k, dtype, strided):
     torch.testing.assert_close(actual.float(), expected, atol=0.002, rtol=rtol)
 
 
+@pytest.mark.parametrize("m", [17, 32])
 @pytest.mark.parametrize("skip_reduce", [False, True])
-def test_gfx1151_fp4_splitk(skip_reduce):
-    args = _inputs(17, 129, 1024)
-    config, _ = _get_config(17, 129, 512)
-    config["NUM_KSPLIT"] = 4
-    actual = gemm_afp4wfp4(
-        *args, dtype=torch.float32, config=config, skip_reduce=skip_reduce
-    )
+def test_gfx1151_fp4_splitk(m, skip_reduce):
+    args = _inputs(m, 129, 1024)
+    config, is_tuned = get_gemm_config("GEMM-AFP4WFP4", m, 129, 1024)
+    assert is_tuned
+    assert config["NUM_KSPLIT"] > 1
+    # Exercise the wrapper's normal resolution of the checked-in config.
+    actual = gemm_afp4wfp4(*args, dtype=torch.float32, skip_reduce=skip_reduce)
     if skip_reduce:
-        assert actual.ndim == 3
+        assert actual.shape == (config["NUM_KSPLIT"], m, 129)
         actual = actual.sum(0)
     torch.testing.assert_close(actual, _reference(*args), atol=0.002, rtol=1e-4)
 
 
 @pytest.mark.parametrize("m", [1, 16, 17, 128, 129, 512])
-def test_gfx1151_fp4_compiled_shared_memory(m, monkeypatch):
-    module = importlib.import_module("aiter.ops.triton.gemm.basic.gemm_afp4wfp4")
-    kernel = module._triton_gemm_afp4wfp4_kernel
-    run = kernel.run
-    metadata = []
-
-    def record(*args, **kwargs):
-        compiled = run(*args, **kwargs)
-        if compiled is not None:
-            metadata.append(compiled.metadata)
-        return compiled
-
-    monkeypatch.setattr(kernel, "run", record)
+def test_gfx1151_fp4_launch_resource_limits(m):
+    # A real launch makes Triton check compiled resource requirements against
+    # device limits (including shared memory), without inspecting private kernels.
     args = _inputs(m, 256, 1024)
-    gemm_afp4wfp4(*args)
+    actual = gemm_afp4wfp4(*args, dtype=torch.float32)
     torch.cuda.synchronize()
-    assert metadata, "The test must observe an actual compiled/loaded GPU kernel."
-    assert all(meta.shared <= 65536 for meta in metadata)
+    torch.testing.assert_close(actual, _reference(*args), atol=0.002, rtol=1e-4)
 
 
 def test_gfx1151_fp4_graph_and_config_reuse():
     args = _inputs(16, 128, 512)
-    config, _ = _get_config(16, 128, 256)
+    config, _ = get_gemm_config("GEMM-AFP4WFP4", 16, 128, 512)
     before = copy.deepcopy(config)
     for _ in range(3):
         expected = gemm_afp4wfp4(*args, config=config)
