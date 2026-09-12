@@ -1531,9 +1531,11 @@ def _attn_fwd(
 
 
 def _get_config(is_fp8: bool, has_pe: bool = False):
-    """Return the already-tuned gfx942 MHA tile.
+    """Return the gfx942 MHA tile.
 
     has_pe is part of the caller signature. gfx942 does not switch tiles on PE.
+    The FP8 tile keeps K/V in registers and uses 4 warps. That was faster than
+    the previous 8-warp, 2-buffer tile on the 4K query / 65K context chunks.
     """
     _ = has_pe
     if is_fp8:
@@ -1541,9 +1543,10 @@ def _get_config(is_fp8: bool, has_pe: bool = False):
             "BLOCK_M": 256,
             "BLOCK_N": 64,
             "NUM_KV_SPLITS": 3,
-            "DIRECT_REGISTERS": False,
+            "DIRECT_REGISTERS": True,
+            "KV_BUFFERS": 1,
             "waves_per_eu": 1,
-            "num_warps": 8,
+            "num_warps": 4,
         }
     return {
         "BLOCK_M": 128,
