@@ -122,6 +122,7 @@ else:
     from .ops.communication import *
     from .ops.rope import *
     from .ops.topk import *
+    from .ops.topk import TOPK_GATING_SUPPORTS_SOFTMAX_RENORM  # noqa: F401
     from .ops.topk_plain import topk_plain  # noqa: F401
     from .ops.mha import *
     from .ops.vsa_sparse_attention import vsa_sparse_attention  # noqa: F401
