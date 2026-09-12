@@ -2,8 +2,11 @@
 # Copyright (C) 2025-2026, Advanced Micro Devices, Inc. All rights reserved.
 """A16W16 exact launch, Torch workspace, and shape-driven compatibility."""
 
+from functools import lru_cache
+
 import torch
 
+from aiter import logger
 from csrc.opus_gemm.opus_gemm_common import OpusGemmInstance
 
 from ...jit.core import compile_ops
@@ -380,6 +383,11 @@ def _prepare_shape_driven_a16w16(
     return XQ, WQ, Y, is_gemm
 
 
+@lru_cache(maxsize=256)
+def _warn_invalid_a16w16_tuned_row(message: str) -> None:
+    logger.warning(message)
+
+
 def gemm_a16w16_opus(
     A: torch.Tensor,
     B: torch.Tensor,
@@ -392,34 +400,50 @@ def gemm_a16w16_opus(
 ) -> torch.Tensor:
     """Shape-driven A16W16 compatibility API over the exact-kid launchers.
 
-    Explicit ``kernelId`` bypasses policy. Otherwise a present OPUS tuned row
-    is attempted as-is, while a tuned miss uses the migrated architecture
-    heuristic.
+    An explicit ``kernelId`` wins over tuned lookup. Explicit and tuned ids
+    still pass through legacy requested-to-actual compatibility resolution;
+    a missing or invalid tuned row uses the migrated architecture heuristic.
     """
     XQ, WQ, Y, is_gemm = _prepare_shape_driven_a16w16(A, B, bias, dtype, out)
-    if kernelId is None:
-        from .policy import (
-            lookup_a16w16_opus_config,
-            resolve_a16w16_heuristic_candidate,
-        )
+    from .policy import (
+        lookup_a16w16_opus_config,
+        resolve_a16w16_heuristic_candidate,
+        resolve_a16w16_tuned_candidate,
+    )
 
-        arch, cu_num = _device_arch_and_cu(A.device)
-        batch, M, K = map(int, XQ.shape)
-        N = int(WQ.shape[1])
-        lookup_args = {
-            "arch": arch,
-            "cu_num": cu_num,
-            "M": M,
-            "N": N,
-            "K": K,
-            "has_bias": bias is not None,
-            "input_dtype": A.dtype,
-            "output_dtype": Y.dtype,
-        }
+    arch, cu_num = _device_arch_and_cu(A.device)
+    batch, M, K = map(int, XQ.shape)
+    N = int(WQ.shape[1])
+    lookup_args = {
+        "arch": arch,
+        "cu_num": cu_num,
+        "M": M,
+        "N": N,
+        "K": K,
+        "has_bias": bias is not None,
+        "input_dtype": A.dtype,
+        "output_dtype": Y.dtype,
+    }
+    if kernelId is None:
         config = lookup_a16w16_opus_config(**lookup_args)
+        plan = None
         if config is not None:
-            kid, split_k = int(config["solidx"]), int(config["splitK"])
-        else:
+            plan = resolve_a16w16_tuned_candidate(
+                batch=batch,
+                requested_kid=config.get("solidx"),
+                requested_split_k=config.get("splitK"),
+                **lookup_args,
+            )
+            if plan is None:
+                _warn_invalid_a16w16_tuned_row(
+                    "Ignoring invalid OPUS A16W16 tuned row for "
+                    f"gfx={arch}, cu_num={cu_num}, "
+                    f"shape=({batch},{M},{N},{K}), "
+                    f"kid={config.get('solidx')!r}, "
+                    f"splitK={config.get('splitK')!r}; "
+                    "using OPUS heuristic fallback"
+                )
+        if plan is None:
             plan = resolve_a16w16_heuristic_candidate(batch=batch, **lookup_args)
             if plan is None:
                 raise RuntimeError(
@@ -427,9 +451,20 @@ def gemm_a16w16_opus(
                     f"arch={arch}, shape=({batch},{M},{N},{K})"
                 )
             kid, split_k = plan.resolved_kid, 0
+        else:
+            kid = plan.resolved_kid
+            split_k = int(config["splitK"])
     else:
         kid = int(kernelId)
         split_k = int(splitK or 0)
+        plan = resolve_a16w16_tuned_candidate(
+            batch=batch,
+            requested_kid=kid,
+            requested_split_k=split_k,
+            **lookup_args,
+        )
+        if plan is not None:
+            kid = plan.resolved_kid
 
     if is_gemm:
         return _launch_a16w16_gemm(

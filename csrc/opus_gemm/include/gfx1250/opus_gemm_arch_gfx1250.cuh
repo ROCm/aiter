@@ -76,6 +76,29 @@ inline const OpusA16W16WorkspaceKidEntry* workspace_entry(int kid)
         kWorkspace = {{GENERATE_A16W16_WORKSPACE_KID_DISPATCH_GFX1250}};
     return find_kid(kWorkspace, kid);
 }
+
+template <typename CDataType>
+inline const OpusA16W16KidEntry* non_workspace_entry(int kid);
+
+template <>
+inline const OpusA16W16KidEntry* non_workspace_entry<bf16_t>(int kid)
+{
+    static constexpr std::array<
+        OpusA16W16KidEntry,
+        GENERATE_A16W16_NONWORKSPACE_KID_DISPATCH_GFX1250_BF16_SIZE>
+        kKids = {{GENERATE_A16W16_NONWORKSPACE_KID_DISPATCH_GFX1250_BF16(bf16_t)}};
+    return find_kid(kKids, kid);
+}
+
+template <>
+inline const OpusA16W16KidEntry* non_workspace_entry<fp32_t>(int kid)
+{
+    static constexpr std::array<
+        OpusA16W16KidEntry,
+        GENERATE_A16W16_NONWORKSPACE_KID_DISPATCH_GFX1250_FP32_SIZE>
+        kKids = {{GENERATE_A16W16_NONWORKSPACE_KID_DISPATCH_GFX1250_FP32(fp32_t)}};
+    return find_kid(kKids, kid);
+}
 } // namespace opus_gfx1250_detail
 
 template <typename CDataType>
@@ -129,12 +152,7 @@ inline OpusA16W16Kernel opus_a16w16_kid_dispatch_gfx1250(int kid);
 template <>
 inline OpusA16W16Kernel opus_a16w16_kid_dispatch_gfx1250<bf16_t>(int kid)
 {
-    using namespace opus_gfx1250_detail;
-    static constexpr std::array<
-        OpusA16W16KidEntry,
-        GENERATE_A16W16_NONWORKSPACE_KID_DISPATCH_GFX1250_BF16_SIZE>
-        kKids = {{GENERATE_A16W16_NONWORKSPACE_KID_DISPATCH_GFX1250_BF16(bf16_t)}};
-    const auto* entry = find_kid(kKids, kid);
+    const auto* entry = opus_gfx1250_detail::non_workspace_entry<bf16_t>(kid);
     AITER_CHECK(entry != nullptr,
                 "unknown kid ", kid,
                 " for OPUS a16w16 on gfx1250 with bf16 Y in the "
@@ -145,17 +163,18 @@ inline OpusA16W16Kernel opus_a16w16_kid_dispatch_gfx1250<bf16_t>(int kid)
 template <>
 inline OpusA16W16Kernel opus_a16w16_kid_dispatch_gfx1250<fp32_t>(int kid)
 {
-    using namespace opus_gfx1250_detail;
-    static constexpr std::array<
-        OpusA16W16KidEntry,
-        GENERATE_A16W16_NONWORKSPACE_KID_DISPATCH_GFX1250_FP32_SIZE>
-        kKids = {{GENERATE_A16W16_NONWORKSPACE_KID_DISPATCH_GFX1250_FP32(fp32_t)}};
-    const auto* entry = find_kid(kKids, kid);
+    const auto* entry = opus_gfx1250_detail::non_workspace_entry<fp32_t>(kid);
     AITER_CHECK(entry != nullptr,
                 "unknown kid ", kid,
                 " for OPUS a16w16 on gfx1250 with fp32 Y in the "
                 "non-workspace launch table");
     return entry->func;
+}
+
+inline bool opus_a16w16_has_non_workspace_kernel_gfx1250(int id)
+{
+    return opus_gfx1250_detail::non_workspace_entry<bf16_t>(id) != nullptr
+           || opus_gfx1250_detail::non_workspace_entry<fp32_t>(id) != nullptr;
 }
 
 inline bool opus_a16w16_has_workspace_kernel_gfx1250(int id)

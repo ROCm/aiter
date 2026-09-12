@@ -13,6 +13,7 @@ launcher.
 
 from __future__ import annotations
 
+import math
 from functools import cache, lru_cache
 
 import pandas as pd
@@ -31,6 +32,7 @@ from ..gemm_op_common import get_padded_m
 from ._arch import GFX942, GFX950, GFX1250
 from .launch_plan import (
     A16W16LaunchPlan,
+    _get_cached_a8w8_mxscale_bmm_plan,
     _get_cached_a16w16_launch_plan,
 )
 
@@ -576,6 +578,25 @@ def resolve_a16w16_caller_candidate(
 _MXSCALE_BMM_KID_OFFSET = 8000
 _MXSCALE_BMM_LOCAL_KID_MAX = 653
 _TUNED_PERF_COLUMNS = ("us", "tflops", "bw", "errRatio")
+_C_INT_MAX = (1 << 31) - 1
+
+
+def _parse_mxscale_bmm_tuned_split_k(value: object) -> int:
+    """Require one saved split-K value that can cross the C++ int ABI."""
+    if isinstance(value, bool):
+        raise TypeError(f"splitK must be a positive integer, got {value!r}")
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError(f"splitK must be a positive integer, got {value!r}") from exc
+    if (
+        not math.isfinite(numeric)
+        or not numeric.is_integer()
+        or numeric < 1
+        or numeric > _C_INT_MAX
+    ):
+        raise ValueError(f"splitK must be a positive integer, got {value!r}")
+    return int(numeric)
 
 
 @cache
@@ -601,29 +622,46 @@ def _load_mxscale_bmm_tuned(libtype: str | None = None) -> dict:
         else pd.Series(True, index=df.index, dtype=bool)
     )
 
-    # Checked-in rows predate the unified dispatcher and use local ids. Convert
-    # those ids in memory, then require an exact registry entry; a numeric band
-    # reserves identities but does not prove that a kernel is registered.
+    # Normalize legacy local ids, then validate each complete saved launch.
     opus_kids = pd.to_numeric(df.loc[opus_rows, "kernelId"], errors="coerce")
     legacy_rows = opus_kids.between(0, _MXSCALE_BMM_LOCAL_KID_MAX)
     opus_kids.loc[legacy_rows] += _MXSCALE_BMM_KID_OFFSET
     integer_kids = (
         opus_kids.notna() & opus_kids.lt(float("inf")) & opus_kids.eq(opus_kids.round())
     )
-    registered_kids = pd.Series(False, index=opus_kids.index, dtype=bool)
+    valid_opus_rows = pd.Series(False, index=opus_kids.index, dtype=bool)
     for index in opus_kids.index[integer_kids]:
         kid = int(opus_kids.at[index])
         arch = str(df.at[index, "gfx"]).lower().split(":", 1)[0]
-        if get_kernel_instance(arch, "a8w8_mxscale_bmm", kid) is not None:
+        try:
+            split_k = _parse_mxscale_bmm_tuned_split_k(df.at[index, "splitK"])
+            batch, m, n, k = (
+                int(df.at[index, column]) for column in ("b", "m", "n", "k")
+            )
+            _get_cached_a8w8_mxscale_bmm_plan(
+                arch,
+                kid,
+                "bf16",
+                m,
+                batch,
+                n,
+                k,
+                split_k,
+            )
+        except (TypeError, ValueError, OverflowError):
+            continue
+        else:
             df.at[index, "kernelId"] = kid
-            registered_kids.at[index] = True
+            df.at[index, "splitK"] = split_k
+            valid_opus_rows.at[index] = True
 
     invalid_opus_rows = opus_rows.copy()
-    invalid_opus_rows.loc[opus_rows] = ~registered_kids
+    invalid_opus_rows.loc[opus_rows] = ~valid_opus_rows
     if invalid_opus_rows.any():
         logger.warning(
             "Skipping %d invalid OPUS row(s) in MXFP8 BMM tuned CSV %r: "
-            "kernelId must resolve to a registered MXFP8 BMM kernel",
+            "kernelId, splitK and shape must form a compatible registered "
+            "MXFP8 BMM launch",
             int(invalid_opus_rows.sum()),
             path,
         )
@@ -681,22 +719,6 @@ def lookup_mxscale_bmm_config(
     return row
 
 
-@cache
-def _mxscale_bmm_kid_m_align() -> dict[int, int]:
-    from csrc.opus_gemm.opus_gemm_common import a8w8_mxscale_bmm_kernel_lists
-
-    return {
-        int(kid): int(instance.m_align)
-        for family in a8w8_mxscale_bmm_kernel_lists
-        for kid, instance in family.items()
-    }
-
-
-def _mxscale_bmm_kid_runs_m(kid: int, m: int) -> bool:
-    align = _mxscale_bmm_kid_m_align().get(int(kid))
-    return align is not None and m % align == 0
-
-
 def _heuristic_mxscale_bmm_kid(g: int, m: int, n: int, k: int) -> int:
     """Choose a final global kid only when the tuned table has no usable row."""
 
@@ -732,12 +754,38 @@ def resolve_a8w8_mxscale_bmm_plan(
             f"MXFP8 BMM tuned row requests unsupported backend {libtype!r}"
         )
 
-    kid = int(config["kernelId"]) if config is not None else None
-    split_k = int(config["splitK"]) if config is not None else 1
-    if kid is None or not _mxscale_bmm_kid_runs_m(kid, m):
-        kid = _heuristic_mxscale_bmm_kid(g, m, n, k)
-        split_k = 1
-    return kid, split_k
+    if config is not None:
+        try:
+            kid = int(config["kernelId"])
+            split_k = _parse_mxscale_bmm_tuned_split_k(config["splitK"])
+            plan = _get_cached_a8w8_mxscale_bmm_plan(
+                get_gfx(),
+                kid,
+                "bf16",
+                m,
+                g,
+                n,
+                k,
+                split_k,
+            )
+        except (TypeError, ValueError, OverflowError) as exc:
+            logger.warning(
+                "Ignoring invalid OPUS MXFP8 BMM tuned row for "
+                "B:%s M:%s N:%s K:%s (kernelId=%r, splitK=%r): %s; "
+                "using heuristic fallback",
+                g,
+                m,
+                n,
+                k,
+                config.get("kernelId"),
+                config.get("splitK"),
+                exc,
+            )
+        else:
+            return plan.resolved_kid, plan.abi_split_k
+
+    kid = _heuristic_mxscale_bmm_kid(g, m, n, k)
+    return kid, 1
 
 
 __all__ = [

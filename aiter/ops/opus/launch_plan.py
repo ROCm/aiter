@@ -17,10 +17,12 @@ from csrc.opus_gemm.opus_gemm_common import (
     GFX942_MIN_ITERS_PER_SPLIT,
     SPLITK_KIDS,
     OpusGemmInstance,
+    a8w8_mxscale_flatmm_prefetch_k_iter,
+    a16w16_flatmm_prefetch_k_iter,
     get_kernel_instance,
 )
 
-from ._arch import GFX942, GFX1250
+from ._arch import GFX942, GFX950, GFX1250
 
 _WORKSPACE_DTYPES = {
     "bf16_t": torch.bfloat16,
@@ -133,6 +135,47 @@ def _plan_gfx942_split_k(
                 f"K={K}, split_k={abi_split_k}, "
                 f"loops=({iters_full},{last_loops})"
             )
+    return abi_split_k
+
+
+def _plan_gfx950_split_k(
+    instance: OpusGemmInstance,
+    *,
+    K: int,
+    requested: int,
+) -> int:
+    """Return the converged ABI split-K matching the gfx950 launcher."""
+    total_iters = (K + instance.B_K - 1) // instance.B_K
+    prefetch_k_iter = a16w16_flatmm_prefetch_k_iter(instance)
+    if total_iters < prefetch_k_iter:
+        raise ValueError(
+            f"K={K} is too small for gfx950 kid B_K={instance.B_K}; "
+            f"need at least {instance.B_K * prefetch_k_iter}"
+        )
+    abi_split_k = min(max(1, requested), total_iters // prefetch_k_iter)
+    while abi_split_k > 1:
+        iters_full = (total_iters + abi_split_k - 1) // abi_split_k
+        last_loops = total_iters - (abi_split_k - 1) * iters_full
+        if iters_full >= prefetch_k_iter and last_loops >= prefetch_k_iter:
+            break
+        abi_split_k -= 1
+    return abi_split_k
+
+
+def _plan_gfx1250_split_k(
+    instance: OpusGemmInstance,
+    *,
+    K: int,
+    requested: int,
+) -> int:
+    """Return the converged ABI split-K matching the gfx1250 launcher."""
+    total_iters = (K + instance.B_K - 1) // instance.B_K
+    abi_split_k = min(max(1, requested), total_iters)
+    while abi_split_k > 1:
+        iters_full = (total_iters + abi_split_k - 1) // abi_split_k
+        if (abi_split_k - 1) * iters_full < total_iters:
+            break
+        abi_split_k -= 1
     return abi_split_k
 
 
@@ -317,10 +360,8 @@ def _build_a16w16_launch_plan(
     workspace_capacity_split_k = 1
     abi_split_k = requested_split_k
     if needs_workspace:
-        workspace_capacity_split_k = max(1, requested_split_k)
         if instance.kernel_tag == _GFX1250_FUSED_SPLITK_TAG:
-            workspace_capacity_split_k = int(instance.fuse_split_k)
-            abi_split_k = workspace_capacity_split_k
+            abi_split_k = int(instance.fuse_split_k)
         elif registry_arch == GFX942:
             abi_split_k = _plan_gfx942_split_k(
                 instance,
@@ -331,7 +372,19 @@ def _build_a16w16_launch_plan(
                 cu_num=cu_num,
                 requested=requested_split_k,
             )
-            workspace_capacity_split_k = abi_split_k
+        elif registry_arch == GFX950:
+            abi_split_k = _plan_gfx950_split_k(
+                instance,
+                K=K,
+                requested=requested_split_k,
+            )
+        elif registry_arch == GFX1250:
+            abi_split_k = _plan_gfx1250_split_k(
+                instance,
+                K=K,
+                requested=requested_split_k,
+            )
+        workspace_capacity_split_k = max(1, abi_split_k)
 
         # Validate the launch split-K independently of workspace sizing.
         launch_split_k = max(1, abi_split_k)
@@ -415,6 +468,13 @@ _A8W8_MXSCALE_BMM_WORKSPACE_TAGS = frozenset(
     {
         "a8w8_mxscale_bmm_flatmm_splitk",
         "a8w8_mxscale_bmm_fused",
+    }
+)
+_A8W8_MXSCALE_BMM_PREFETCH_TAGS = _A8W8_MXSCALE_BMM_WORKSPACE_TAGS | frozenset(
+    {
+        "a8w8_mxscale_bmm_minterleave",
+        "a8w8_mxscale_bmm_mouter",
+        "a8w8_mxscale_bmm_mouter_tunable",
     }
 )
 _A8W8_FAMILY_BY_TAG = {
@@ -590,14 +650,59 @@ def _build_a8w8_mxscale_bmm_plan(
     if tag not in _A8W8_MXSCALE_BMM_TAGS:
         raise ValueError(f"OPUS kid {resolved_kid} is not an MXFP8 BMM kernel")
 
+    if requested_split_k < 0 or requested_split_k > (1 << 31) - 1:
+        raise ValueError(
+            f"OPUS BMM kid {resolved_kid} requires 0 <= split_k <= 2147483647; "
+            f"got {requested_split_k}"
+        )
     abi_split_k = max(1, requested_split_k)
+    if min(M, batch, N, K) <= 0:
+        raise ValueError(
+            "OPUS BMM requires positive M, batch, N and K; "
+            f"got M={M}, batch={batch}, N={N}, K={K}"
+        )
     m_align = max(1, int(instance.m_align))
     if M % m_align:
         raise ValueError(
-            f"OPUS BMM kid {resolved_kid} requires M % {m_align} == 0; " f"got M={M}"
+            f"OPUS BMM kid {resolved_kid} requires M % {m_align} == 0; got M={M}"
         )
+    n_align = int(instance.B_N) * (2 if tag == "a8w8_mxscale_bmm_wave8n2" else 1)
+    if N % n_align:
+        raise ValueError(
+            f"OPUS BMM kid {resolved_kid} requires N % {n_align} == 0; got N={N}"
+        )
+    k_align = int(instance.B_K)
+    if K % k_align:
+        raise ValueError(
+            f"OPUS BMM kid {resolved_kid} requires K % {k_align} == 0; got K={K}"
+        )
+    if (instance.k1024_only or instance.k1024_lb1) and K != 1024:
+        raise ValueError(f"OPUS BMM kid {resolved_kid} requires K == 1024; got K={K}")
     if instance.direct_only and abi_split_k != 1:
         raise ValueError(f"OPUS BMM kid {resolved_kid} requires split_k <= 1")
+
+    if tag in _A8W8_MXSCALE_BMM_PREFETCH_TAGS:
+        total_iters = K // k_align
+        prefetch_k_iter = a8w8_mxscale_flatmm_prefetch_k_iter(instance)
+        if tag in _A8W8_MXSCALE_BMM_WORKSPACE_TAGS:
+            if abi_split_k > total_iters:
+                raise ValueError(
+                    f"OPUS BMM kid {resolved_kid} split_k={abi_split_k} exceeds "
+                    f"the K-tile count {total_iters} for K={K}"
+                )
+            iters_full = (total_iters + abi_split_k - 1) // abi_split_k
+            last_loops = total_iters - (abi_split_k - 1) * iters_full
+            if last_loops < prefetch_k_iter:
+                raise ValueError(
+                    f"OPUS BMM kid {resolved_kid} requires every split to have "
+                    f"at least {prefetch_k_iter} K-tiles; K={K}, "
+                    f"split_k={abi_split_k}, last split has {last_loops}"
+                )
+        elif total_iters < prefetch_k_iter:
+            raise ValueError(
+                f"OPUS BMM kid {resolved_kid} requires at least "
+                f"{prefetch_k_iter} K-tiles; K={K} gives {total_iters}"
+            )
 
     workspace_numel = 0
     if tag in _A8W8_MXSCALE_BMM_WORKSPACE_TAGS:

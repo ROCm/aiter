@@ -31,12 +31,11 @@ The Python layer retains two distinct A16 shape-driven flows. The generic
 on a miss or invalid OPUS row, keeps its original skinny, gfx1250 Triton, or
 PyTorch fallback. It does not run an OPUS heuristic. The OPUS-only
 `gemm_a16w16_opus` compatibility entry instead uses an explicit id when
-provided, otherwise attempts a present OPUS tuned row as-is and runs the
-migrated per-architecture OPUS heuristic only when no tuned row exists. Every
-successful OPUS selection is reduced to one final integer kid before the local
-A16 exact launcher and this C++ layer are entered. The compatibility entry does
-not re-enter the package-level `opus_gemm`/`opus_bmm` family router. Reusable
-candidate/heuristic policy helpers live in `aiter/ops/opus/policy.py`.
+provided, otherwise tries a tuned row and falls back to its heuristic for a
+missing or invalid row. All selections pass through legacy compatibility
+resolution before the local exact launcher; the strict `opus_gemm`/`opus_bmm`
+APIs never redirect. Reusable policy helpers live in
+`aiter/ops/opus/policy.py`.
 
 ## Family entries
 

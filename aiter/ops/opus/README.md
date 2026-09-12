@@ -89,24 +89,18 @@ aiter.gemm_a16w16
                   -> otherwise PyTorch
 
 gemm_a16w16_opus
-  -> explicit kernelId -> local exact A16 GEMM/BMM launcher
-  -> otherwise OPUS-only tuned row -> attempt that exact kid as-is
-  -> missing OPUS row -> per-arch OPUS heuristic
-                       -> validate -> local exact A16 GEMM/BMM launcher
+  -> explicit kernelId -> legacy requested-to-actual resolution
+  -> otherwise OPUS-only tuned row -> the same compatibility resolution
+  -> missing/invalid OPUS row -> per-arch OPUS heuristic
+                               -> validate -> local exact A16 GEMM/BMM launcher
 ```
 
 The shared OPUS candidate helpers are isolated in `policy.py`.
-`tuned_gemm.py` uses only the tuned-candidate validator; a missing or invalid
-OPUS row continues through its normal framework fallback and never invokes an
-OPUS heuristic. `gemm_op_a16w16.py` owns the compatibility wrapper and applies
-the migrated gfx942/gfx950/gfx1250 heuristic only after an OPUS-only tuned
-miss. A present but invalid OPUS row is not replaced by a heuristic kid: the
-exact launcher reports the invalid row. If the heuristic-selected kid is
-invalid, the OPUS-only wrapper raises instead of trying secondary kids or
-silently switching backend. Legacy gfx942 requested-to-actual resolution
-happens before heuristic launch, so only a final integer id reaches
-the local exact A16 family launcher. The compatibility entry calls that
-launcher directly rather than re-entering the package-level family router.
+`tuned_gemm.py` validates tuned candidates and keeps its normal framework
+fallback. The OPUS-only compatibility entry warns once and uses its heuristic
+for a stale tuned row, but rejects an invalid explicit id. It applies legacy
+gfx942 requested-to-actual resolution before calling the local exact launcher;
+the strict `opus_gemm`/`opus_bmm` APIs never redirect.
 
 There is currently no high-level A16W16 BF16 BMM wrapper. In particular,
 `aiter/ops/batched_gemm_op_bf16.py` contains the existing CK entry points but
@@ -355,8 +349,10 @@ therefore never request a workspace.
 
 gfx942 BF16-workspace kids `10210`, `10213`, and `10216` are exact ids. Their
 registered exact-N contract is `{64,128,256,384,512,1024,2048}`. A different N
-or an FP32 `Y` is rejected; the call is never redirected to an FP32-workspace
-kid.
+or an FP32 `Y` is rejected by the strict `opus_gemm`/`opus_bmm` exact APIs; they
+never redirect. To preserve the former shape-driven API, `gemm_a16w16_opus`
+maps `10210` to `10200` and `10213` to `10203` for a non-exact N. Kid `10216`
+has no FP32-workspace sibling and remains rejected.
 
 ## MXFP8 BMM Torch workspace
 

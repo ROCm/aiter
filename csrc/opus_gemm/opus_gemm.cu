@@ -191,6 +191,36 @@ opus_a16w16_kid_dispatch(int kid)
   }
 }
 
+// Query the direct table separately so an unavailable workspace kid is not
+// misclassified as direct.
+static bool opus_a16w16_has_non_workspace_kernel(int kid)
+{
+  switch (opus_get_gfx_arch())
+  {
+#ifdef OPUS_BUILD_HAS_GFX950
+    case OpusGfxArch::Gfx950:
+      return opus_a16w16_has_non_workspace_kernel_gfx950(kid);
+#endif
+#ifdef OPUS_BUILD_HAS_GFX942
+    case OpusGfxArch::Gfx942:
+      return opus_a16w16_has_non_workspace_kernel_gfx942(kid);
+#endif
+#ifdef OPUS_BUILD_HAS_GFX1250
+    case OpusGfxArch::Gfx1250:
+      return opus_a16w16_has_non_workspace_kernel_gfx1250(kid);
+#endif
+    default:
+    {
+      const auto &info = opus_get_arch_info();
+      AITER_CHECK(false,
+                  "opus_gemm_a16w16_launch: no non-workspace dispatch table for "
+                  "current device ", info.dev,
+                  " with gcnArchName='", info.name, "'");
+      return false;
+    }
+  }
+}
+
 // Query the current architecture's generated workspace table.
 static bool opus_a16w16_has_workspace_kernel(int kid)
 {
@@ -287,6 +317,18 @@ static void opus_gemm_a16w16_launch_impl(
   if (XQ.dtype() == AITER_DTYPE_bf16)
   {
     const bool uses_workspace = opus_a16w16_has_workspace_kernel(kid);
+    const bool has_non_workspace = opus_a16w16_has_non_workspace_kernel(kid);
+    AITER_CHECK(!(uses_workspace && has_non_workspace),
+                "opus_gemm_a16w16_launch: kid ", kid,
+                " appears in both workspace and non-workspace launch tables");
+    if (!uses_workspace && !has_non_workspace)
+    {
+      const auto &info = opus_get_arch_info();
+      AITER_CHECK(false,
+                  "opus_gemm_a16w16_launch: kid ", kid,
+                  " is not compiled in the current OPUS module for device ",
+                  info.dev, " with gcnArchName='", info.name, "'");
+    }
     if (uses_workspace)
     {
       AITER_CHECK(workspace.has_value(),

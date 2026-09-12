@@ -279,11 +279,11 @@ def _gfx1250_cluster_waste(gx: int, gy: int, cwm: int, cwn: int) -> float:
     return (launched - gx * gy) / launched
 
 
-def _gfx1250_co_cluster_dims(gx, gy, available, top_clusters, cu_num):
-    """Rank cluster dimensions for a CO tile without requiring exact fill."""
+def _gfx1250_cluster_dims_for_grid(gx, gy, available, top_clusters, cu_num=0):
+    """Rank cluster dims by round-up waste; ``cu_num`` enables CO's CU-fit rule."""
 
     def _roundup_is_free(cwm, cwn):
-        return _round_up(gx, cwm) * _round_up(gy, cwn) <= cu_num
+        return cu_num > 0 and _round_up(gx, cwm) * _round_up(gy, cwn) <= cu_num
 
     feasible = [
         (_gfx1250_cluster_waste(gx, gy, cwm, cwn), cwm, cwn)
@@ -346,7 +346,9 @@ def _gfx1250_co_candidates(
         bm, bn, _bk = tile
         gx, gy = _ceil_div(M, bm), _ceil_div(N, bn)
         available = _GFX1250_CO_BY_TILE[tile]
-        for dims in _gfx1250_co_cluster_dims(gx, gy, available, top_clusters, cu_num):
+        for dims in _gfx1250_cluster_dims_for_grid(
+            gx, gy, available, top_clusters, cu_num
+        ):
             selected.update(available[dims])
     return selected
 
@@ -361,18 +363,7 @@ def _gfx1250_select_candidates(
     *,
     include_fused=True,
 ):
-    """gfx1250 candidate kid set for shape (M,N,K): top-N tiles x {plain + top-N
-    square cluster dims}.
-
-    1. Tile (top-8): score each plain tile by its best grid-occupancy fit over
-       splitK in [1, min(16, k_steps)] (occ cost + tiny splitK bias). Smallest
-       score wins; take top GFX1250_TOP_TILES.
-    2. For each selected tile, always include its plain (P=3) kid.
-    3. Cluster (top-3): among cluster dims that satisfy cluster-fill for this
-       shape (ceil(M/B_M)%cwm==0 && ceil(N/B_N)%cwn==0), rank by
-       (|cwm*cwn - nearest(8,16)|, |cwm-cwn|) -- prefer products near 8/16 and
-       SQUARE clusters -- take top GFX1250_TOP_CLUSTERS clusterlaunch kids.
-    """
+    """Select top tiles and launcher-supported rounded cluster grids."""
 
     def _tile_score(bm, bn, bk):
         gx = _ceil_div(M, bm)
@@ -384,10 +375,6 @@ def _gfx1250_select_candidates(
             best = c if best is None else min(best, c)
         return best if best is not None else float("inf")
 
-    # A winner tuned at M is reused down to M // 2, so an M-cluster must stay
-    # full across that whole runtime reuse bucket.
-    prev_m = max(1, M // 2)
-
     tiles = sorted(GFX1250_PLAIN_KID_OF.keys(), key=lambda t: _tile_score(*t))
     sel = set()
     for t in tiles[:top_tiles]:
@@ -395,28 +382,15 @@ def _gfx1250_select_candidates(
         bm, bn, _bk = t
         gx = _ceil_div(M, bm)
         gy = _ceil_div(N, bn)
-        # Keep the branch's conservative admission policy: 2D clusters are
-        # excluded because they can hang on gfx1250, and M-direction clusters
-        # must stay fully occupied throughout the runtime reuse bucket.
-        feas = [
-            (cwm, cwn, kid)
+        available = {
+            (cwm, cwn): kid
             for (tbm, tbn, tbk, cwm, cwn), kid in GFX1250_CLUSTERLAUNCH_KID_OF.items()
             if (tbm, tbn, tbk) == t
-            and gx % cwm == 0
-            and gy % cwn == 0
-            and cwm <= 2
-            and (cwm == 1 or M <= 128)
-            and (cwm == 1 or _ceil_div(prev_m + 1, bm) == gx)
-            and (cwm == 1 or cwn == 1)
-        ]
-        feas.sort(
-            key=lambda x: (
-                min(abs(x[0] * x[1] - 8), abs(x[0] * x[1] - 16)),  # near 8/16
-                abs(x[0] - x[1]),  # prefer square
-            )
-        )
-        for cwm, cwn, kid in feas[:top_clusters]:
-            sel.add(kid)
+            and cwm <= GFX1250_MAX_CLUSTER_SIDE
+            and cwn <= GFX1250_MAX_CLUSTER_SIDE
+        }
+        for dims in _gfx1250_cluster_dims_for_grid(gx, gy, available, top_clusters):
+            sel.add(available[dims])
 
     # Fused exact kids: bounded by tile, occupancy-fit compile-time SplitK,
     # baseline/max feasible N-cluster, and both workspace dtypes.
@@ -695,23 +669,8 @@ def kid_rejects_shape(k_inst, M, N, K):
         padded_M = _ceil_div(M, k_inst.B_M) * k_inst.B_M
         padded_N = _ceil_div(N, k_inst.B_N) * k_inst.B_N
         UINT32_MAX_BYTES = (1 << 32) - 1
-        workspace_bytes = 2 if _kid_uses_bf16_workspace(k_inst) else 4
-        if padded_M * padded_N * workspace_bytes > UINT32_MAX_BYTES:
-            return True
-        # Cluster-launch multicast names EVERY WG of the (cwm x cwn) cluster, so
-        # ceil(M/B_M) and ceil(N/B_N) MUST be exact multiples -- an OOB tail WG
-        # would still be named in its peers' multicast mask and stall/fault the
-        # cluster barrier. The candidate filter enforces this, but guard here too
-        # (kid may be forced via explicit id).
-        if (
-            _ceil_div(M, k_inst.B_M) % k_inst.cluster_wg_m != 0
-            or _ceil_div(N, k_inst.B_N) % k_inst.cluster_wg_n != 0
-        ):
-            return True
-        # 2D-cluster lockout (see candidate_kids_for_shape): 2D clusters (cwm>1 &&
-        # cwn>1) GPU-hang at runtime and no barrier-sync variant fixes it. Reject
-        # here too so an explicit-id / heuristic path can never launch a hanging kid.
-        # Override with OPUS_ALLOW_2D=1 for isolated root-cause probing only.
+        # Rounded OOB workgroups exit after the cluster barrier, so ragged and
+        # 2D cluster grids do not require exact fill.
         # NOTE: large output tiles (B_M*B_N >= 16384, e.g. 128x128 / 64x256) used
         # to fault at runtime, but the root cause was a clang<=22 (HIP<=7.2)
         # codegen bug in the bounded-buffer C-store address lowering (it sank the
@@ -720,7 +679,7 @@ def kid_rejects_shape(k_inst, M, N, K):
         # voffset barrier, auto-gated to __clang_major__<=22), so large clusterlaunch
         # tiles are safe to tune again. No tile-area cap here.
         # batch=1 in tune path
-        return 1 * padded_M * padded_N * 4 > UINT32_MAX_BYTES
+        return padded_M * padded_N * 4 > UINT32_MAX_BYTES
 
     # kbuf2v_sk and quad_mfma32 splitK families require loops_per_split
     # (both full and last) even AND >=2.
@@ -856,8 +815,8 @@ def candidate_kids_for_shape(M, N, K, bias, cu_num):
     cu_num = int(cu_num)
 
     # gfx1250: dedicated candidate filter (top-N tiles by grid-occupancy fit x
-    # {plain + top-N square cluster dims}). Bias-bearing tuning retains the
-    # two-stage kids but omits fused round-1 kids because their bf16 [N]-only
+    # {plain + top-N round-up-capable cluster dims}). Bias-bearing tuning retains
+    # the two-stage kids but omits fused round-1 kids because their bf16 [N]-only
     # bias contract cannot be encoded by the tuned CSV's boolean bias key.
     try:
         from aiter.jit.utils.chip_info import get_gfx_runtime

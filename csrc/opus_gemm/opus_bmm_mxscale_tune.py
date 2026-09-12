@@ -532,7 +532,6 @@ class OpusBmmMxscaleTuner(GemmCommonTuner):
 
         policy._load_mxscale_bmm_tuned.cache_clear()
         policy.lookup_mxscale_bmm_config.cache_clear()
-        policy._mxscale_bmm_kid_m_align.cache_clear()
         batched_gemm_op_a8w8._get_mxscale_bmm_launch_plan.cache_clear()
 
     def run_config(self, args):

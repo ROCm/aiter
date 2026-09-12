@@ -325,16 +325,17 @@ def test_shipped_tuned_selection_diff_is_exhaustive(
 @pytest.mark.parametrize(
     ("arch", "cu_num", "M", "N", "K", "has_bias", "output", "expected"),
     (
-        ("gfx950", 256, 1, 17, 130, False, torch.bfloat16, (208, 0)),
-        ("gfx950", 256, 5, 33, 130, False, torch.bfloat16, (206, 0)),
-        ("gfx950", 256, 64, 64, 128, False, torch.bfloat16, (1206, 0)),
-        ("gfx950", 256, 65, 64, 64, False, torch.float32, (200, 0)),
+        # These workspace kids cannot satisfy the launcher's K prefetch depth.
+        ("gfx950", 256, 1, 17, 130, False, torch.bfloat16, None),
+        ("gfx950", 256, 5, 33, 130, False, torch.bfloat16, None),
+        ("gfx950", 256, 64, 64, 128, False, torch.bfloat16, None),
+        ("gfx950", 256, 65, 64, 64, False, torch.float32, None),
         ("gfx950", 256, 129, 16, 128, False, torch.bfloat16, (300, 0)),
         ("gfx950", 256, 256, 256, 128, False, torch.bfloat16, (1300, 0)),
-        ("gfx950", 256, 256, 256, 128, True, torch.bfloat16, (1200, 0)),
-        ("gfx1250", 256, 31, 127, 4098, False, torch.bfloat16, (20000, 0)),
-        ("gfx1250", 256, 32, 128, 4098, False, torch.bfloat16, (20007, 0)),
-        ("gfx1250", 256, 33, 64, 4098, True, torch.float32, (20003, 0)),
+        ("gfx950", 256, 256, 256, 128, True, torch.bfloat16, None),
+        ("gfx1250", 256, 31, 127, 4098, False, torch.bfloat16, (20000, 1)),
+        ("gfx1250", 256, 32, 128, 4098, False, torch.bfloat16, (20007, 1)),
+        ("gfx1250", 256, 33, 64, 4098, True, torch.float32, (20003, 1)),
         # main selected 10210 here, whose generated launcher redirected to
         # 10200 before launch. The Python policy now resolves the same final id.
         ("gfx942", 80, 256, 768, 7168, False, torch.bfloat16, (10200, 7)),
@@ -345,7 +346,7 @@ def test_shipped_tuned_selection_diff_is_exhaustive(
         ("gfx942", 80, 32, 256, 1024, False, torch.float32, (10201, 8)),
     ),
 )
-def test_untuned_shape_final_selection_matches_pre_pr(
+def test_untuned_shape_heuristic_matches_pre_pr_and_validates_launch(
     arch, cu_num, M, N, K, has_bias, output, expected
 ):
     rows = _shipped_opus_rows()
@@ -381,7 +382,6 @@ def test_untuned_shape_final_selection_matches_pre_pr(
         input_dtype=torch.bfloat16,
         output_dtype=output,
     )
-    assert plan is not None
     assert (
         policy.select_a16w16_heuristic_kid(
             arch=arch,
@@ -394,6 +394,10 @@ def test_untuned_shape_final_selection_matches_pre_pr(
         )
         == raw_pre_pr
     )
+    if expected is None:
+        assert plan is None
+        return
+    assert plan is not None
     assert (plan.resolved_kid, plan.abi_split_k) == expected
 
 

@@ -552,8 +552,7 @@ def test_gfx942_workspace_allocation_and_launch_split_k(
     (
         ("gfx942", 10201, 64, 0, "too small for gfx942"),
         ("gfx942", 10201, 192, 0, "needs even loops per split"),
-        ("gfx950", 200, 128, 3, "K-tile limit 2"),
-        ("gfx1250", 20000, 128, 2, "K-tile limit 1"),
+        ("gfx950", 200, 128, 3, "too small for gfx950"),
     ),
 )
 def test_a16w16_launch_plan_preserves_split_k_limits(arch, kid, K, split_k, error):
@@ -561,6 +560,17 @@ def test_a16w16_launch_plan_preserves_split_k_limits(arch, kid, K, split_k, erro
         _get_cached_a16w16_launch_plan(
             **_a16_policy_args(arch, 1, 64, K), kid=kid, split_k=split_k
         )
+
+
+def test_gfx1250_launch_plan_converges_split_k_before_workspace():
+    plan = _get_cached_a16w16_launch_plan(
+        **_a16_policy_args("gfx1250", 1, 64, 128), kid=20000, split_k=2
+    )
+
+    assert plan.abi_split_k == 1
+    assert plan.workspace_capacity_split_k == 1
+    assert plan.workspace_spec is not None
+    assert plan.workspace_spec.shape[0] == 1
 
 
 def test_gfx1250_split_k_reducer_row_limit():
@@ -805,20 +815,82 @@ def test_shape_driven_opus_selection_and_rank_route(monkeypatch):
         ("bmm", 1200, 0),
     ]
     tuned[0] = {"solidx": -1, "splitK": 0}
-    monkeypatch.setattr(
-        policy,
-        "resolve_a16w16_heuristic_candidate",
-        lambda **_kwargs: pytest.fail("a present tuned row must not use heuristic"),
+    warnings = []
+    gemm_op_a16w16._warn_invalid_a16w16_tuned_row.cache_clear()
+    monkeypatch.setattr(gemm_op_a16w16.logger, "warning", warnings.append)
+    try:
+        opus.gemm_a16w16_opus(A, B)
+        opus.gemm_a16w16_opus(A, B)
+    finally:
+        gemm_op_a16w16._warn_invalid_a16w16_tuned_row.cache_clear()
+
+    assert [(op, args["kid"], args["split_k"]) for op, *_, args in calls[-2:]] == [
+        ("gemm", 1200, 0),
+        ("gemm", 1200, 0),
+    ]
+    assert len(warnings) == 1
+    assert "kid=-1, splitK=0" in warnings[0]
+
+
+@pytest.mark.parametrize("kid", (10210, 10213, 10216))
+def test_gfx942_exact_plan_rejects_non_exact_n_bf16_workspace_kid(kid):
+    with pytest.raises(ValueError, match=rf"gfx942 exact kid {kid} requires N"):
+        _get_cached_a16w16_launch_plan(
+            "gfx942",
+            256,
+            1000,
+            4096,
+            1,
+            304,
+            False,
+            torch.bfloat16,
+            torch.bfloat16,
+            kid,
+            2,
+        )
+
+
+@pytest.mark.parametrize("selection", ("explicit", "tuned"))
+@pytest.mark.parametrize(
+    ("requested_kid", "resolved_kid"),
+    ((10210, 10200), (10213, 10203)),
+)
+def test_gfx942_compat_redirects_non_exact_n_bf16_workspace_kid(
+    monkeypatch, selection, requested_kid, resolved_kid
+):
+    tuned_config = (
+        {"solidx": requested_kid, "splitK": 2} if selection == "tuned" else None
     )
+    opus, calls = _capture_shape_driven_opus_launch(
+        monkeypatch, arch="gfx942", tuned_config=tuned_config
+    )
+    A = torch.empty((256, 4096), device="meta", dtype=torch.bfloat16)
+    B = torch.empty((1000, 4096), device="meta", dtype=torch.bfloat16)
+    kwargs = {"kernelId": requested_kid, "splitK": 2} if selection == "explicit" else {}
+
+    opus.gemm_a16w16_opus(A, B, **kwargs)
+
+    assert [(op, args["kid"], args["split_k"]) for op, *_, args in calls] == [
+        ("gemm", resolved_kid, 2)
+    ]
+
+
+def test_gfx942_compat_rejects_non_exact_n_bf16_workspace_kid_without_sibling(
+    monkeypatch,
+):
+    from aiter.ops.opus import gemm_op_a16w16, policy
+
     monkeypatch.setattr(
         gemm_op_a16w16,
-        "_launch_a16w16_gemm",
-        lambda _XQ, _WQ, _Y, **kwargs: (_ for _ in ()).throw(
-            ValueError(f"unknown OPUS kid {kwargs['kid']}")
-        ),
+        "_device_arch_and_cu",
+        lambda _device: ("gfx942", 304),
     )
-    with pytest.raises(ValueError, match="unknown OPUS kid -1"):
-        opus.gemm_a16w16_opus(A, B)
+    monkeypatch.setattr(policy, "lookup_a16w16_opus_config", lambda **_kwargs: None)
+    A = torch.empty((256, 4096), device="meta", dtype=torch.bfloat16)
+    B = torch.empty((1000, 4096), device="meta", dtype=torch.bfloat16)
+
+    with pytest.raises(ValueError, match="gfx942 exact kid 10216 requires N"):
+        gemm_op_a16w16.gemm_a16w16_opus(A, B, kernelId=10216, splitK=2)
 
 
 def test_legacy_a16w16_tune_routes_to_family_executor(monkeypatch):
