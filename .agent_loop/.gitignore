@@ -1,0 +1,7 @@
+﻿# installation-specific and never committed
+config/loop.json
+*.key
+id_*
+*.pem
+__pycache__/
+*.pyc
