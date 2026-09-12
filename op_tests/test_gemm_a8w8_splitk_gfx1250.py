@@ -60,10 +60,22 @@ def _inputs(m, n, k, a_preshuffle=False, strided_scale=False):
     return a, shuffle_weight(b, layout=(16, 16)), sa, sb
 
 
-def _run(inputs, out, name):
-    return backend.run_gemm_a8w8_mxfp8_128_bpreshuffle_gfx1250(
-        *inputs, out, name, a_is_preshuffled="_apre" in name
-    )
+def _run(inputs, out, name, cluster_reduce=False):
+    def run():
+        return backend.run_gemm_a8w8_mxfp8_128_bpreshuffle_gfx1250(
+            *inputs, out, name, a_is_preshuffled="_apre" in name
+        )
+
+    if not cluster_reduce:
+        return run()
+    backend._lazy_import()
+    launch = backend._launch_gemm_a8w8_compute_bound
+    with mock.patch.object(
+        backend,
+        "_launch_gemm_a8w8_compute_bound",
+        side_effect=lambda *args: launch(*args, cluster_splitk=True),
+    ):
+        return run()
 
 
 def _reference(inputs, out, name):
@@ -96,14 +108,22 @@ def test_tuned_splitk(m, n, k, name):
 @pytest.mark.parametrize("split_k", [2, 4, 8])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("a_preshuffle", [False, True])
-def test_splitk_tail_and_graph(split_k, dtype, a_preshuffle):
+@pytest.mark.parametrize(
+    "tile_m,m_warp,num_buffers,cluster_reduce",
+    [(128, 2, 4, False), (256, 4, 2, False), (128, 2, 4, True), (256, 2, 2, True)],
+)
+def test_splitk_tail_and_graph(
+    split_k, dtype, a_preshuffle, tile_m, m_warp, num_buffers, cluster_reduce
+):
     """Check partial M tiles, padded output, strided scales, and graph replay."""
     pytest.importorskip("flydsl")
     torch.manual_seed(43)
-    m, n, k = 129, 512, 4096
+    m, n, k = tile_m + 1, 512, 4096
+    tile_n = 128 if tile_m == 128 else 256
     name = (
-        "flydsl_mxfp8_128_bpreshuffle_compute_wmma_t128x128x128_"
-        f"mw2_nw2_nb4_sk{split_k}_cm1_cn2" + ("_apre" if a_preshuffle else "")
+        f"flydsl_mxfp8_128_bpreshuffle_compute_wmma_t{tile_m}x{tile_n}x128_"
+        f"mw{m_warp}_nw2_nb{num_buffers}_sk{split_k}_cm1_cn2"
+        + ("_apre" if a_preshuffle else "")
     )
     inputs = _inputs(m, n, k, a_preshuffle, strided_scale=True)
     expected = torch.empty((m, n), dtype=dtype, device="cuda")
@@ -115,11 +135,11 @@ def test_splitk_tail_and_graph(split_k, dtype, a_preshuffle):
         with torch.cuda.stream(stream):
             storage = torch.full((m, n + 8), 17.0, dtype=dtype, device="cuda")
             out = storage[:, :n]
-            _run(inputs, out, name)
+            _run(inputs, out, name, cluster_reduce)
             graph = torch.cuda.CUDAGraph()
             with torch.cuda.graph(graph, stream=stream):
-                _run(inputs, out, name)
-                _run(inputs, out, name)
+                _run(inputs, out, name, cluster_reduce)
+                _run(inputs, out, name, cluster_reduce)
             outputs.append(storage)
             graphs.append(graph)
     for _ in range(5):
@@ -136,3 +156,69 @@ def test_splitk_tail_and_graph(split_k, dtype, a_preshuffle):
         assert torch.all(storage[:, n:] == 17.0).item()
         flags = backend.get_split_k_flags(stream.cuda_stream, inputs[0].device)
         assert flags.count_nonzero().item() == 0
+
+
+@pytest.mark.parametrize("num_buffers", [2, 4])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("a_preshuffle", [False, True])
+def test_m512_eightwave_matches_fourwave(num_buffers, dtype, a_preshuffle):
+    """Check the new wave mapping against the original split-K=4 GEMM."""
+    pytest.importorskip("flydsl")
+    torch.manual_seed(44)
+    m, n, k = 512, 7168, 16384
+    inputs = _inputs(m, n, k, a_preshuffle)
+    name = (
+        "flydsl_mxfp8_128_bpreshuffle_compute_wmma_t256x256x128_"
+        f"mw2_nw2_nb{num_buffers}_sk4_cm2_cn4" + ("_apre" if a_preshuffle else "")
+    )
+    expected = torch.empty((m, n), dtype=dtype, device="cuda")
+    actual = torch.full_like(expected, float("nan"))
+    _reference(inputs, expected, name)
+    with mock.patch.object(
+        backend, "_compile_splitk_reduce", side_effect=AssertionError("extra kernel")
+    ):
+        _run(inputs, actual, name.replace("_mw2_", "_mw4_"))
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("num_buffers", [2, 4])
+@pytest.mark.parametrize("a_preshuffle", [False, True])
+def test_m512_cluster_matches_original(num_buffers, a_preshuffle):
+    """Compare clustered K splits with the original M/N cluster layout."""
+    pytest.importorskip("flydsl")
+    torch.manual_seed(45)
+    m, n, k = 512, 7168, 16384
+    inputs = _inputs(m, n, k, a_preshuffle)
+    name = (
+        "flydsl_mxfp8_128_bpreshuffle_compute_wmma_t256x256x128_"
+        f"mw2_nw2_nb{num_buffers}_sk4_cm2_cn4" + ("_apre" if a_preshuffle else "")
+    )
+    expected = torch.empty((m, n), dtype=torch.bfloat16, device="cuda")
+    actual = torch.full_like(expected, float("nan"))
+    _reference(inputs, expected, name)
+    with mock.patch.object(
+        backend, "_compile_splitk_reduce", side_effect=AssertionError("extra kernel")
+    ):
+        _run(inputs, actual, name.replace("_cn4", "_cn2"), cluster_reduce=True)
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("a_preshuffle", [False, True])
+def test_cluster_splitk_large_m_grid(a_preshuffle):
+    """Keep K splits in the same cluster when M spans more than 32 tiles."""
+    pytest.importorskip("flydsl")
+    torch.manual_seed(46)
+    m, n, k = 63 * 256 + 1, 512, 2048
+    inputs = _inputs(m, n, k, a_preshuffle)
+    name = (
+        "flydsl_mxfp8_128_bpreshuffle_compute_wmma_t256x256x128_"
+        "mw2_nw2_nb2_sk4_cm1_cn2" + ("_apre" if a_preshuffle else "")
+    )
+    expected = torch.empty((m, n), dtype=torch.bfloat16, device="cuda")
+    actual = torch.full_like(expected, float("nan"))
+    _reference(inputs, expected, name)
+    with mock.patch.object(
+        backend, "_compile_splitk_reduce", side_effect=AssertionError("extra kernel")
+    ):
+        _run(inputs, actual, name, cluster_reduce=True)
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)

@@ -24,6 +24,7 @@ from .gemm_common_gfx1250 import (
 )
 from .gfx1250_cluster import compute_mcast_masks
 from .kernels_common import format_kernel_name
+from .splitk_cluster_epilogue_gfx1250 import emit_cluster_splitk_reduce_epilogue
 from .splitk_epilogue_gfx1250 import CPOL_STORE_DEVICE, emit_splitk_reduce_epilogue
 from .tensor_shim import (
     AITER_FLYDSL_KERNARG_PRELOAD,
@@ -63,6 +64,7 @@ def launch_gemm_a8w8_256x256(
     persistent_n_tiles: Constexpr[int] = 1,
     fused_splitk: Constexpr[bool] = False,
     bounded_m: Constexpr[bool] = True,
+    cluster_splitk: Constexpr[bool] = False,
 ):
     """N must be a multiple of ``tile_n * cluster_n``; M is unrestricted (a
     multiple of 2 when ``a_preshuffle``); K must be divisible by 128 and at
@@ -74,7 +76,9 @@ def launch_gemm_a8w8_256x256(
         (128, 128, 128, 2, 2, 4),
         (128, 256, 128, 2, 2, 4),
         (128, 256, 128, 2, 2, 3),
-    ), "only the tuned 2x2-wave profiles are supported"
+        (256, 256, 128, 4, 2, 4),
+        (256, 256, 128, 4, 2, 2),
+    ), "unsupported compute WMMA profile"
     assert (
         cluster_m >= 1 and cluster_n >= 1 and 1 < cluster_m * cluster_n <= 16
     ), f"cluster_m*cluster_n must be 2..16, got {cluster_m}x{cluster_n}"
@@ -85,6 +89,13 @@ def launch_gemm_a8w8_256x256(
     assert (
         persistent_n_tiles == 1 or split_k == 1
     ), "persistent_n_tiles>1 requires split_k=1"
+    assert not cluster_splitk or (
+        fused_splitk and split_k > 1 and block_size == 128
+    ), "cluster reduction requires fused split-K block128"
+    cluster_k = split_k if cluster_splitk else 1
+    assert (
+        cluster_m * cluster_n * cluster_k <= 16
+    ), "all K splits must fit in one cluster with at most 16 workgroups"
     cluster_sync_revs = 8
     m_run_max, m_run_min = 32, 8
     WMMA_M = WMMA_N = 16
@@ -106,6 +117,10 @@ def launch_gemm_a8w8_256x256(
     n_acc = wmma_m_rep * wmma_n_rep
     num_waves = m_warp * n_warp
     block = num_waves * WAVE
+    if num_waves == 8:
+        assert (
+            block_size == 128 and split_k > 1
+        ), "eight-wave profiles are split-K block128 tuning candidates"
     KPAIR = 1 if num_buffers == 4 and tile_n == 256 else 2
     UNROLL = KPAIR * num_buffers
     SUPER_K = tile_k * KPAIR
@@ -147,7 +162,11 @@ def launch_gemm_a8w8_256x256(
         f"_cm{cluster_m}_cn{cluster_n}"
         + ("_apre" if a_preshuffle else "")
         + (f"_ps{persistent_n_tiles}" if persistent_n_tiles > 1 else "")
-        + ("_rsk" if fused_splitk and split_k > 1 else "")
+        + (
+            "_csk"
+            if cluster_splitk
+            else ("_rsk" if fused_splitk and split_k > 1 else "")
+        )
         + ("b" if fused_splitk and split_k > 1 and bounded_m else "")
     )
 
@@ -194,6 +213,15 @@ def launch_gemm_a8w8_256x256(
         wave_n = wave % n_warp
         local_x, local_y = cluster.compute_cluster_position()
         a_mask, b_mask = compute_mcast_masks(local_x, local_y, cluster_m, cluster_n)
+        cluster_plane = fx.Int32(0)
+        if const_expr(cluster_splitk):
+            # Multicast inputs only within the matching K split. The hardware
+            # numbers workgroups X first, then Y, then Z inside the cluster.
+            cluster_plane = fx.Int32(rocdl.cluster_workgroup_id_z()) * (
+                cluster_m * cluster_n
+            )
+            a_mask = fx.Int32(a_mask) << cluster_plane
+            b_mask = fx.Int32(b_mask) << cluster_plane
         blk_m = (m_chunk * fx.Int32(fx.grid_dim.x) + bid_x) * tile_m
         blk_n = bid_y * tile_n
         blk_m64 = fx.Int64(blk_m)
@@ -323,7 +351,11 @@ def launch_gemm_a8w8_256x256(
                     True,
                 )
                 if const_expr(not mx32):
-                    flat_wg = fx.Int32(local_x) + fx.Int32(local_y) * cluster_m
+                    flat_wg = (
+                        fx.Int32(local_x)
+                        + fx.Int32(local_y) * cluster_m
+                        + cluster_plane
+                    )
                     mask = fx.Int32(1) << fx.Int32(rocdl.readfirstlane(T.i32, flat_wg))
             inner_bound = mn_oob if const_expr(owner == 2 and not mx32) else None
             desc = tdm_ops.make_tensor_descriptor_2d(
@@ -698,8 +730,8 @@ def launch_gemm_a8w8_256x256(
             nxt = {}
 
             def _mk(kind, half, key):
-                """One thunk per WMMA slot. Only the 256-row tile has enough slots for
-                block128 to split per ds_load rather than per fragment."""
+                """Split producers per DS load only when each wave has enough
+                WMMA slots; the smaller wave tiles load whole fragments."""
                 n = half_m if kind == "a" else half_n
                 addr, row, span = _frag_geom(kind, stage)
                 nxt[key] = [None] * n
@@ -717,7 +749,9 @@ def launch_gemm_a8w8_256x256(
                     if const_expr(j == DS_PER_FRAG - 1):
                         nxt[key][i] = _rmem(16, _join(parts[i]))
 
-                per = const_expr(DS_PER_FRAG if mx32 or tile_m != 256 else 1)
+                per = const_expr(
+                    DS_PER_FRAG if mx32 or min(wmma_m_rep, wmma_n_rep) < 8 else 1
+                )
                 return [
                     (
                         lambda i=i, base=base: [
@@ -746,7 +780,10 @@ def launch_gemm_a8w8_256x256(
                 if const_expr(boundary and has_next):
                     pipeline_fence_wait(use_cluster=False)
                     if const_expr(refill):
-                        tdm_ops.tensor_load_2d(prepared)
+                        if const_expr(num_waves == 4):
+                            tdm_ops.tensor_load_2d(prepared)
+                        elif wave < 4:
+                            tdm_ops.tensor_load_2d(prepared)
                 rocdl.sched_barrier(0)
 
             n_slots = half_m * half_n
@@ -862,7 +899,12 @@ def launch_gemm_a8w8_256x256(
         for i in range_constexpr(num_buffers):
             seed_delta = fx.Int32(i) * tdm_global_step
             seed_delta = (seed_delta < last_delta).select(seed_delta, last_delta)
-            tdm_ops.tensor_load_2d(_prepare_tdm(i, seed_delta))
+            # A, B and their scales retain one producer wave each. Additional
+            # compute waves participate in every barrier but issue no TDM load.
+            if const_expr(num_waves == 4):
+                tdm_ops.tensor_load_2d(_prepare_tdm(i, seed_delta))
+            elif wave < 4:
+                tdm_ops.tensor_load_2d(_prepare_tdm(i, seed_delta))
         pipeline_fence(outstanding=num_buffers - 1, use_cluster=False)
         for group in _seed_thunks(0):
             for thunk in group:
@@ -906,19 +948,24 @@ def launch_gemm_a8w8_256x256(
                 if do_sync:
                     cluster.cluster_barrier()
 
-        wave_parity = fx.Int32(
-            llvm_dialect.inline_asm(
-                T.i32,
-                [as_ir_value(rocdl.wave_id())],
-                "s_and_b32 $0, $1, 1",
-                "=s,s,~{scc}",
-                has_side_effects=True,
-            )
-        )
-        if wave_parity == 0:
+        if const_expr(num_waves == 8):
+            # Eight waves have a 512-VGPR budget per wave. Duplicating the
+            # steady schedules extends live ranges enough to cause spills.
             _run_steady(0)
         else:
-            _run_steady(1)
+            wave_parity = fx.Int32(
+                llvm_dialect.inline_asm(
+                    T.i32,
+                    [as_ir_value(rocdl.wave_id())],
+                    "s_and_b32 $0, $1, 1",
+                    "=s,s,~{scc}",
+                    has_side_effects=True,
+                )
+            )
+            if wave_parity == 0:
+                _run_steady(0)
+            else:
+                _run_steady(1)
 
         # Retire the last steady producer before the shared drain.
         rocdl.s_wait_dscnt(0)
@@ -986,24 +1033,43 @@ def launch_gemm_a8w8_256x256(
         if const_expr(persistent_n_tiles == 1):
             tdm_ops.tensor_wait(0)
         if const_expr(_reduce_c):
-            workgroup_barrier(use_cluster=False)
-            emit_splitk_reduce_epilogue(
-                elem=oc,
-                tid=tid,
-                block=block,
-                tile_m=tile_m,
-                tile_n=tile_n,
-                lds_base_ptr=base_ptr,
-                partials=arg_c,
-                out=arg_out,
-                c_off=blk_m64 * ldc64 + blk_n64,
-                ldc64=ldc64,
-                c_lds_row=C_LDS_ROW,
-                split_k=split_k,
-                mn_oob=mn_oob,
-                flat_tile=_flat_tile,
-                arg_flag=arg_flag,
-            )
+            if const_expr(cluster_splitk):
+                emit_cluster_splitk_reduce_epilogue(
+                    elem=oc,
+                    tid=tid,
+                    block=block,
+                    tile_m=tile_m,
+                    tile_n=tile_n,
+                    lds_base_ptr=base_ptr,
+                    partials=arg_c,
+                    out=arg_out,
+                    c_off=blk_m64 * ldc64 + blk_n64,
+                    ldc64=ldc64,
+                    c_lds_row=C_LDS_ROW,
+                    split_k=split_k,
+                    split_idx=split_idx,
+                    mn_oob=mn_oob,
+                    flat_tile=_flat_tile,
+                )
+            else:
+                workgroup_barrier(use_cluster=False)
+                emit_splitk_reduce_epilogue(
+                    elem=oc,
+                    tid=tid,
+                    block=block,
+                    tile_m=tile_m,
+                    tile_n=tile_n,
+                    lds_base_ptr=base_ptr,
+                    partials=arg_c,
+                    out=arg_out,
+                    c_off=blk_m64 * ldc64 + blk_n64,
+                    ldc64=ldc64,
+                    c_lds_row=C_LDS_ROW,
+                    split_k=split_k,
+                    mn_oob=mn_oob,
+                    flat_tile=_flat_tile,
+                    arg_flag=arg_flag,
+                )
 
     @flyc.kernel(name=kernel_name, known_block_size=[block, 1, 1])
     def kernel_gemm_a8w8_256x256(
@@ -1053,12 +1119,19 @@ def launch_gemm_a8w8_256x256(
     capped = (pow2 < m_run_max).select(pow2, fx.Int32(m_run_max))
     # A cluster spans consecutive bid_x, so the x extent must stay a whole number of cluster rows.
     fits_cluster = (capped % fx.Int32(cluster_m)) == 0
-    m_run = ((gx > m_run_max) & (pow2 >= m_run_min) & fits_cluster).select(capped, gx)
+    if const_expr(cluster_splitk):
+        # Keep grid.z exclusively for K so every tile's splits belong to the
+        # same hardware cluster, including grids with more than 32 M tiles.
+        m_run = gx
+    else:
+        m_run = ((gx > m_run_max) & (pow2 >= m_run_min) & fits_cluster).select(
+            capped, gx
+        )
     m_chunks = gx // m_run
     gy_launch = gy // persistent_n_tiles if const_expr(persistent_n_tiles > 1) else gy
     grid_arg = (m_run, gy_launch, m_chunks * split_k)
     # Runtime N/K shape checks belong to the caller.
-    cluster_arg = (cluster_m, cluster_n, 1)
+    cluster_arg = (cluster_m, cluster_n, cluster_k)
     kernel_gemm_a8w8_256x256(
         arg_c,
         arg_a,
@@ -1073,7 +1146,7 @@ def launch_gemm_a8w8_256x256(
         i32_ldc,
         arg_flag,
         arg_out,
-        value_attrs={"rocdl.cluster_dims": f"{cluster_m},{cluster_n},1"},
+        value_attrs={"rocdl.cluster_dims": f"{cluster_m},{cluster_n},{cluster_k}"},
     ).launch(
         grid=grid_arg,
         block=(block, 1, 1),

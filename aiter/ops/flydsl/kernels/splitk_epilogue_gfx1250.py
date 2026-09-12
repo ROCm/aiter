@@ -72,7 +72,10 @@ def emit_splitk_reduce_epilogue(
     if arrival == fx.Int32(split_k - 1):
         lanes_per_row = tile_n // VEC
         rows_per_iter = block // lanes_per_row
-        unroll = min(UNROLL, MAX_PARTIAL_VECTORS // split_k, tile_m // rows_per_iter)
+        # More waves share the same register file. Scale the load batch down
+        # so the eight-wave profiles leave room for FP32 unpacking and sums.
+        partial_vectors = MAX_PARTIAL_VECTORS // (block // 128)
+        unroll = min(UNROLL, partial_vectors // split_k, tile_m // rows_per_iter)
         row0 = tid // lanes_per_row
         col = (tid % lanes_per_row) * VEC
         plane = fx.Int64(tile_m * tile_n)
