@@ -916,7 +916,8 @@ def flydsl_warp_decode_down_reduce_bf16(
                       the fallback math against the dot2 path.
         weight_layout: ``k_contiguous`` (default) or ``preshuffled`` (fused-MoE B
             from ``shuffle_weight`` / ``shuffle_weight_a16w4``). Never inferred
-            from strides.
+            from strides. Preshuffled uses the 16x4 native down kernel when
+            INTER % 32 and HIDDEN % 16.
         out:          optional [B, HIDDEN] bfloat16 output buffer.
 
     Returns:
@@ -949,6 +950,10 @@ def flydsl_warp_decode_down_reduce_bf16(
     if out is None:
         out = torch.empty((B, HIDDEN), dtype=torch.bfloat16, device=intermediate.device)
 
+    native_bf16_down = (
+        _preshuffled_flag(weight_layout) and INTER % 32 == 0 and HIDDEN % 16 == 0
+    )
+
     launcher = _get_down_reduce_bf16(
         INTER,
         HIDDEN,
@@ -959,6 +964,11 @@ def flydsl_warp_decode_down_reduce_bf16(
         use_dot2,
         _preshuffled_flag(weight_layout),
     )
+    y_target = (
+        torch.zeros((B, HIDDEN), dtype=torch.float32, device=intermediate.device)
+        if native_bf16_down
+        else out
+    )
     grid_x = B * (HIDDEN // kh_per_warp)
     _run_compiled(
         launcher,
@@ -966,10 +976,12 @@ def flydsl_warp_decode_down_reduce_bf16(
         ptr_arg(w_down),
         ptr_arg(router_ids),
         ptr_arg(router_wts),
-        ptr_arg(out),
+        ptr_arg(y_target),
         grid_x,
         torch.cuda.current_stream(),
     )
+    if native_bf16_down:
+        out.copy_(y_target)
     return out
 
 

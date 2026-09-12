@@ -29,15 +29,14 @@ spot-check when the hot loop or wait/reduce path changed.
 - [x] 1. FP8 native down, `k_batch=1`, 16-row TOPK-parallel waves — landed as
       the preshuffled FP8 default; Qwen B=1 vs gather accepted
 - [x] 2. FP4 native down — TOPK-parallel 16×4, same grid/epilogue as FP8
-- [ ] 3. BF16 native down
+- [x] 3. BF16 native down — TOPK-parallel 16×4 oracle; G9 has no BF16 down cell
 - [ ] 4. Optional second N tile (32 rows) if 16 N is occupancy-bound
 - [ ] 5. Split-K last, only if extra waves over `k0` help
 
 **Landed:** TOPK-parallel 16×4 (`grid = B*TOPK*(HIDDEN/16)`, one expert per
-wave, `atomic_add_f32` into a zeroed FP32 `y`) is the preshuffled FP8 **and
-FP4** down default on legal tiles. Serial-TOPK is abandoned. No INTER/grid
+wave, `atomic_add_f32` into a zeroed FP32 `y`) is the preshuffled FP8, FP4,
+and BF16 down default on legal tiles. Serial-TOPK is abandoned. No INTER/grid
 cutoff. Qwen B=1 vs gather is accepted for FP8; FP4 Qwen B=1 **beats** gather.
-BF16 native is still later.
 
 ## Locked decisions
 
@@ -54,8 +53,8 @@ These locks apply to **this track** (subtasks 1–5).
   drain, `cvt_scalef32_pk_bf16_{fp8,fp4}`, and E8M0 `shl 23` stay.
 - **Gather remains the fallback** when HIDDEN % 16 or INTER is not a native
   kpack tile (FP8: INTER % 64; FP4: INTER % 128; BF16: INTER % 32), matching
-  gate/up. Legal-tile preshuffled FP8/FP4 down does **not** keep a gather cutoff
-  for small INTER or Qwen B=1.
+  gate/up. Legal-tile preshuffled FP8/FP4/BF16 down does **not** keep a gather
+  cutoff for small INTER or Qwen B=1.
 - **Do not fold native down into the k-contiguous builder body.** Early-return
   a dedicated `_build_down_*_preshuffled_native` (same pattern as gate/up).
 - **Compile cache.** After kernel-source edits, run with
@@ -159,13 +158,18 @@ DeepSeek B=2 is the only CK loss (1.29×). Land as the FP4 default; no cutoff.
 ### 3. BF16 native down
 
 Unquantized oracle: 16B kpack is 8 bf16 along K (`INTER % 32`), no weight
-scale, only `router_wt`. Thinner than 1–2; still a separate builder so the
-fp8/fp4 hot paths stay readable.
+scale, only `router_wt`. Same TOPK-parallel 16×4 map as FP8/FP4. `use_dot2`
+stays wired (`dot2_or_scalar`) so the gfx942 scalar fallback still works.
 
-- [ ] `_build_down_bf16_preshuffled_native` + dispatch from
+- [x] `_build_down_bf16_preshuffled_native` + dispatch from
       `build_down_reduce_bf16_module`.
-- [ ] BF16 preshuffled vs k-contiguous down still matches.
-- [ ] **Done when:** BF16 preshuffled down is kpack-native.
+- [x] BF16 preshuffled vs k-contiguous down still matches.
+- [x] **Done when:** BF16 preshuffled down is kpack-native.
+
+G9 has no BF16-down vs CK cell (`FLYDSL_CELLS` is FP8/FP4 only). Gate is
+op_test: 35 preshuffled passed, including `test_preshuffled_bf16_matches_k_contiguous`
+and `test_down_reduce_bf16` / combined. Native when INTER % 32 and HIDDEN % 16;
+gather only on illegal tiles.
 
 ### 4. Optional second N tile (32 rows)
 
