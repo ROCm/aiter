@@ -790,3 +790,94 @@ def test_pa_decode_sparse_two_loop(T, H, D, main_len, extra_len, dtype, strided_
 
     tol = 1e-2 if dtype == "fp8" else 5e-3
     torch.testing.assert_close(out, ref, atol=tol, rtol=tol)
+
+
+# ---------------------------------------------------------------------------
+# EXPERIMENTAL uniform-MX layout: the whole head (RoPE included) quantized to
+# e4m3 in 64-element groups, with the E8M0 scales in their own plane. Not the
+# asm kernel's format -- this exists to measure what the packing would cost if
+# it were designed for the MX WMMA path from the start.
+# ---------------------------------------------------------------------------
+
+
+def v4_pack_mx(x_bf16):
+    """``[..., 512]`` bf16 -> ``(e4m3 [..., 512], E8M0 scales [..., 16] uint8)``.
+
+    8 quant groups of 64 over the full head. Each group's scale byte is stored
+    twice so the 16 bytes are the MX scale operand as-is (MX blocks are 32).
+    """
+    lead = x_bf16.shape[:-1]
+    d = x_bf16.shape[-1]
+    ngroups = d // _V4_TILE
+    tiled = x_bf16.float().reshape(*lead, ngroups, _V4_TILE)
+    fp8_max = float(torch.finfo(_V4_FP8).max)
+    scale = torch.pow(
+        2.0, torch.clamp_min(tiled.abs().amax(dim=-1) / fp8_max, 1e-4).log2().ceil()
+    )
+    vals = (tiled / scale.unsqueeze(-1)).to(_V4_FP8).reshape(*lead, d)
+    e8m0 = (scale.log2().round().to(torch.int32) + 127).clamp(0, 254).to(torch.uint8)
+    return vals, e8m0.repeat_interleave(2, dim=-1)
+
+
+def v4_unpack_mx(vals, scales16):
+    """Inverse of ``v4_pack_mx`` -> ``[..., 512]`` bf16."""
+    lead = vals.shape[:-1]
+    d = vals.shape[-1]
+    ngroups = d // _V4_TILE
+    exps = scales16[..., ::2].to(torch.int32)
+    scale = torch.pow(2.0, (exps - 127).float())
+    deq = vals.float().reshape(*lead, ngroups, _V4_TILE) * scale.unsqueeze(-1)
+    return deq.reshape(*lead, d).to(torch.bfloat16)
+
+
+@pytest.mark.parametrize("T", [1, 32, 512])
+@pytest.mark.parametrize("H", [16, 128])
+@pytest.mark.parametrize("kv_len", [136, 384])
+@pytest.mark.parametrize("var_len", [True, False])
+def test_pa_decode_sparse_mx_vs_reference(T, H, kv_len, var_len):
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA required")
+    if arch_info.get_arch() != "gfx1250":
+        pytest.skip("the uniform-MX path is gfx1250-only")
+
+    D = _V4_DIM_QK
+    pages = T * kv_len
+    q_bf16, ukv_bf16, indices, indptr, sink, scale = _make_inputs(
+        T, H, D, kv_len, pages, variable_len=var_len
+    )
+    q_mx, q_s = v4_pack_mx(q_bf16)
+    kv_mx, kv_s = v4_pack_mx(ukv_bf16)
+
+    # Reference dequantizes exactly the bytes the kernel reads.
+    ref = pa_decode_sparse_reference(
+        v4_unpack_mx(q_mx, q_s),
+        v4_unpack_mx(kv_mx, kv_s),
+        indices,
+        indptr,
+        sink,
+        scale,
+    )
+    out = pa_decode_sparse(
+        q_mx,
+        kv_mx,
+        indices,
+        indptr,
+        sink,
+        scale,
+        has_invalid=False,
+        kv_mx_scales=kv_s,
+        q_mx_scales=q_s,
+    )
+
+    tol_err_ratio = 0.01
+    assert (
+        checkAllclose(
+            out.to(torch.bfloat16),
+            ref.to(torch.bfloat16),
+            atol=1e-2,
+            rtol=1e-2,
+            tol_err_ratio=tol_err_ratio,
+            msg="pa_decode_sparse uniform-MX output",
+        )
+        <= tol_err_ratio
+    )
