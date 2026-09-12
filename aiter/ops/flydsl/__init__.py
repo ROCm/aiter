@@ -46,6 +46,14 @@ _LAZY_IMPORTS = {
         ".kernels.mqa_logits.fp8_mqa_logits",
         "flydsl_fp8_mqa_logits",
     ),
+    "flydsl_fp8_paged_mqa_logits": (
+        ".kernels.mqa_logits.fp8_paged_mqa_logits_gfx950",
+        "flydsl_fp8_paged_mqa_logits",
+    ),
+    "flydsl_fp8_paged_mqa_logits_gfx950": (
+        ".kernels.mqa_logits.fp8_paged_mqa_logits_gfx950",
+        "flydsl_fp8_paged_mqa_logits_gfx950",
+    ),
     "flydsl_hgemm": (".gemm_kernels", "flydsl_hgemm"),
     "flydsl_hstu_attention_fwd": (
         ".hstu_attention_kernels",
@@ -88,6 +96,8 @@ __all__ = [
     "flydsl_flash_attn_fp8_func",
     "flydsl_flash_attn_func",
     "flydsl_fp8_mqa_logits",
+    "flydsl_fp8_paged_mqa_logits",
+    "flydsl_fp8_paged_mqa_logits_gfx950",
     "flydsl_hgemm",
     "flydsl_hstu_attention_fwd",
     "flydsl_mla_reduce_v1",
