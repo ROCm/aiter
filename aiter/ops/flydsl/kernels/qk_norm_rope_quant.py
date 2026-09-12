@@ -1588,6 +1588,18 @@ def flydsl_qk_norm_rope_quant(
         ssm_arg = q.new_empty(1, dtype=torch.int32)
         bid_arg = q.new_empty(1, dtype=torch.int32)
 
+    has_direct = False
+
+    def _ptr_arg(t):
+        return (
+            int(t.data_ptr())
+            if has_direct
+            else flyc.from_c_void_p(fx.Uint8, t.data_ptr())
+        )
+
+    def _stream_arg():
+        return stream if has_direct else Stream(stream)
+
     if is_gfx1250:
         tdm_quant = quant
         use_tdm = (
@@ -1625,32 +1637,25 @@ def flydsl_qk_norm_rope_quant(
                 stream = torch.cuda.current_stream()
             has_direct = getattr(launcher, "_direct_call_state", None) is not None
 
-            def _t_ptr(t):
-                return (
-                    int(t.data_ptr())
-                    if has_direct
-                    else flyc.from_c_void_p(fx.Uint8, t.data_ptr())
-                )
-
             q_2d = q_view.reshape(num_rows, D)
             per_wg = rows_per_tile * tiles_per_wg
             args = (
                 # q is a per-call activation: uncached, else the adaptor cache
                 # pins its allocation (see _cached_from_dlpack).
                 flyc.from_dlpack(q_2d),
-                _t_ptr(kv),
+                _ptr_arg(kv),
                 _cached_from_dlpack(cos_2d),
                 _cached_from_dlpack(sin_2d),
-                _t_ptr(positions),
-                _t_ptr(q_out.view(num_rows, D)),
-                _t_ptr(kv_out),
-                _t_ptr(q_scale_arg.view(-1)),
-                _t_ptr(kv_scale_arg.view(-1)),
+                _ptr_arg(positions),
+                _ptr_arg(q_out.view(num_rows, D)),
+                _ptr_arg(kv_out),
+                _ptr_arg(q_scale_arg.view(-1)),
+                _ptr_arg(kv_scale_arg.view(-1)),
                 _cached_from_dlpack(q_weight_arg.reshape(-1)),
                 _cached_from_dlpack(kv_weight.reshape(-1)),
-                _t_ptr(swa_kv_arg),
-                _t_ptr(ssm_arg),
-                _t_ptr(bid_arg),
+                _ptr_arg(swa_kv_arg),
+                _ptr_arg(ssm_arg),
+                _ptr_arg(bid_arg),
                 num_rows,
                 T_tok,
                 (num_rows + per_wg - 1) // per_wg,
@@ -1659,7 +1664,7 @@ def flydsl_qk_norm_rope_quant(
                 swa_pos_stride,
                 swa_num_rows,
                 swa_cache_size,
-                stream if has_direct else Stream(stream),
+                _stream_arg(),
             )
             _run_compiled(launcher, *args)
             return (
@@ -1705,25 +1710,8 @@ def flydsl_qk_norm_rope_quant(
         sin_static = _cached_from_dlpack(sin_2d)
         has_direct = getattr(launcher, "_direct_call_state", None) is not None
 
-        def _ptr_arg(t):
-            return (
-                int(t.data_ptr())
-                if has_direct
-                else flyc.from_c_void_p(fx.Uint8, t.data_ptr())
-            )
-
-        def _stream_arg():
-            return stream if has_direct else Stream(stream)
-
         wt_args = (q_weight_static, kv_weight_static, cos_static, sin_static)
     else:
-
-        def _ptr_arg(t):
-            return flyc.from_c_void_p(fx.Uint8, t.data_ptr())
-
-        def _stream_arg():
-            return Stream(stream)
-
         wt_args = (q_weight_arg, kv_weight, cos_2d, sin_2d)
 
     # HW grid Y is a 16-bit field on AMD HIP -> cap 65535 blocks/launch and

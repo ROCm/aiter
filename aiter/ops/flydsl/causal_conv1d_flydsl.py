@@ -9,12 +9,12 @@ import flydsl.expr as fx
 import torch
 from flydsl.expr.typing import Int32
 
+from aiter.ops.flydsl.kernels.act import LOG2E as _LOG2E
 from aiter.ops.flydsl.kernels.tensor_shim import ptr_buf_tensor
 
 from ..prefill_batch_metadata import CausalConvPrefillMetadata
 
 PAD_SLOT_ID = -1
-_LOG2E = 1.4426950408889634
 
 
 def build_causal_conv1d_flydsl_module(

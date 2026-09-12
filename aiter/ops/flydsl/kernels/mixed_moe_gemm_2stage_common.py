@@ -54,6 +54,7 @@ from .mfma_preshuffle_pipeline import (
     swizzle_xor16,
     tile_chunk_coord_i32,
 )
+from .tensor_shim import ptr_rsrc
 
 _VALID_A_DTYPES = frozenset(("fp8", "fp16", "bf16", "int8", "fp4"))
 _VALID_B_DTYPES = frozenset(("fp8", "fp16", "int8", "int4", "fp4", "mxfp4"))
@@ -99,6 +100,14 @@ def _barrier(vmcnt=63, lgkmcnt=63):
 
 # HEAD generic path uses `barrier`; a16w4 uses `_barrier`.
 barrier = _barrier
+
+
+def _idx_to_llvm_ptr(idx_val, addr_space=1):
+    """Convert a byte address to an LLVM pointer without adding alignment claims."""
+    idx_v = idx_val._value if hasattr(idx_val, "_value") else idx_val
+    i64_raw = fx.Int64(idx_v).ir_value()
+    ptr_ty = ir.Type.parse(f"!llvm.ptr<{addr_space}>")
+    return llvm.inttoptr(ptr_ty, i64_raw)
 
 
 def compile_mixed_moe_gemm1_common(
@@ -463,13 +472,6 @@ def compile_mixed_moe_gemm1_common(
             vec4_f32 = T.vec(4, f32)
             vec16_elems = 16 if a_elem_bytes == 1 else 8
 
-            def ptr_buffer_resource(ptr, num_records_bytes):
-                addr = fx.ptrtoint(ptr)
-                addr_i64 = fx.Int64(addr)
-                return buffer_ops.create_buffer_resource_from_addr(
-                    addr_i64, num_records_bytes=num_records_bytes
-                )
-
             acc_init = arith.constant_vector(0.0, vec4_f32)
 
             c_n_total = arith.constant(experts * (2 * inter_dim), index=True)
@@ -597,13 +599,11 @@ def compile_mixed_moe_gemm1_common(
 
             x_nbytes_idx = (tokens_in * k_in * c_elem_bytes) // c_a_pack
             x_nbytes_i32 = fx.Int32(x_nbytes_idx)
-            x_rsrc = ptr_buffer_resource(arg_x, x_nbytes_i32)
+            x_rsrc = ptr_rsrc(arg_x, x_nbytes_i32)
 
-            shared_w_rsrc = ptr_buffer_resource(arg_shared_w, shared_w_nbytes)
+            shared_w_rsrc = ptr_rsrc(arg_shared_w, shared_w_nbytes)
 
-            numids_rsrc = ptr_buffer_resource(
-                arg_num_valid_ids, arith.constant(4, type=T.i32)
-            )
+            numids_rsrc = ptr_rsrc(arg_num_valid_ids, arith.constant(4, type=T.i32))
             num_valid_i32 = buffer_ops.buffer_load(
                 numids_rsrc, arith.constant(0, index=True), vec_width=1, dtype=T.i32
             )
@@ -620,14 +620,14 @@ def compile_mixed_moe_gemm1_common(
                 )
                 sx_nbytes_idx = scale_rows * kblk
                 sx_nbytes_i32 = fx.Int32(sx_nbytes_idx)
-                sx_rsrc = ptr_buffer_resource(arg_scale_x, sx_nbytes_i32)
+                sx_rsrc = ptr_rsrc(arg_scale_x, sx_nbytes_i32)
 
             c32 = arith.constant(32, index=True)
             kblk_w = k_in // c32
             mn_w = arith.constant(experts * (2 * inter_dim), index=True)
             sw_nbytes_idx = mn_w * kblk_w
             sw_nbytes_i32 = fx.Int32(sw_nbytes_idx)
-            sw_rsrc = ptr_buffer_resource(arg_scale_w, sw_nbytes_i32)
+            sw_rsrc = ptr_rsrc(arg_scale_w, sw_nbytes_i32)
             shared_scale_rows = arith.constant(
                 ((2 * inter_dim + 255) // 256) * 256, index=True
             )
@@ -635,23 +635,19 @@ def compile_mixed_moe_gemm1_common(
                 ((model_dim // 32 + 7) // 8) * 8, index=True
             )
             shared_sw_nbytes_i32 = fx.Int32(shared_scale_rows * shared_scale_cols)
-            shared_sw_rsrc = ptr_buffer_resource(
-                arg_shared_scale_w, shared_sw_nbytes_i32
-            )
+            shared_sw_rsrc = ptr_rsrc(arg_shared_scale_w, shared_sw_nbytes_i32)
 
             sorted_nbytes_idx = size_expert_ids_in * arith.constant(
                 sort_block_m * 4, index=True
             )
             sorted_nbytes_i32 = fx.Int32(sorted_nbytes_idx)
-            sorted_rsrc = ptr_buffer_resource(arg_sorted_token_ids, sorted_nbytes_i32)
-            sorted_w_rsrc = ptr_buffer_resource(arg_sorted_weights, sorted_nbytes_i32)
+            sorted_rsrc = ptr_rsrc(arg_sorted_token_ids, sorted_nbytes_i32)
+            sorted_w_rsrc = ptr_rsrc(arg_sorted_weights, sorted_nbytes_i32)
 
             eid_nbytes_idx = size_expert_ids_in * arith.constant(4, index=True)
             eid_nbytes_i32 = fx.Int32(eid_nbytes_idx)
-            expert_rsrc = ptr_buffer_resource(arg_expert_ids, eid_nbytes_i32)
-            bias_rsrc = (
-                ptr_buffer_resource(arg_bias, bias_nbytes) if enable_bias else None
-            )
+            expert_rsrc = ptr_rsrc(arg_expert_ids, eid_nbytes_i32)
+            bias_rsrc = ptr_rsrc(arg_bias, bias_nbytes) if enable_bias else None
 
             # #3476: pad group-N (= inter_dim/32) up to a multiple of 8 so it
             sorted_scale_cols = ((inter_dim // 32) + 7) // 8 * 8
@@ -670,9 +666,7 @@ def compile_mixed_moe_gemm1_common(
                     ((sorted_scale_cols + 7) // 8) * 8, index=True
                 )
                 sort_scale_nbytes = fx.Int32(sort_padded_rows * sort_padded_cols)
-                sorted_scale_rsrc = ptr_buffer_resource(
-                    arg_out_scale_sorted, sort_scale_nbytes
-                )
+                sorted_scale_rsrc = ptr_rsrc(arg_out_scale_sorted, sort_scale_nbytes)
 
             PERSIST_M = persist_m
             c_pm = arith.constant(PERSIST_M, index=True)
@@ -2215,12 +2209,6 @@ def compile_mixed_moe_gemm1_common(
                     )
                     return ((fused2, row_byte_base), row_valid)
 
-                def idx_to_llvm_ptr(idx_val, addr_space=1):
-                    idx_v = idx_val._value if hasattr(idx_val, "_value") else idx_val
-                    i64_raw = fx.Int64(idx_v).ir_value()
-                    ptr_ty = ir.Type.parse(f"!llvm.ptr<{addr_space}>")
-                    return llvm.inttoptr(ptr_ty, i64_raw)
-
                 e_vec = e_vec_s1
                 e_vec_sk = 2
                 cshuffle_nlane = min(32, tile_n // e_vec)
@@ -2341,7 +2329,7 @@ def compile_mixed_moe_gemm1_common(
                             ptr_addr_idx = row_byte_base + col_g0 // arith.constant(
                                 2, index=True
                             )
-                            out_ptr_v = idx_to_llvm_ptr(ptr_addr_idx)
+                            out_ptr_v = _idx_to_llvm_ptr(ptr_addr_idx)
                             pack_bytes = e_vec // 2
                             if const_expr(pack_bytes == 1):
                                 store_val = arith.TruncIOp(T.i8, packed_i32)
@@ -2389,7 +2377,7 @@ def compile_mixed_moe_gemm1_common(
                                         packed_i32,
                                         w,
                                     )
-                                out_ptr_v = idx_to_llvm_ptr(ptr_addr_idx)
+                                out_ptr_v = _idx_to_llvm_ptr(ptr_addr_idx)
                                 if const_expr(e_vec == 2):
                                     store_val = arith.TruncIOp(T.i16, packed_i32)
                                     store_raw = (
@@ -2436,7 +2424,7 @@ def compile_mixed_moe_gemm1_common(
                                     word_ptr = ptr_addr_idx + arith.constant(
                                         wg * 4, index=True
                                     )
-                                    out_ptr_v = idx_to_llvm_ptr(word_ptr)
+                                    out_ptr_v = _idx_to_llvm_ptr(word_ptr)
                                     packed_raw = (
                                         packed_w._value
                                         if hasattr(packed_w, "_value")
@@ -2490,7 +2478,7 @@ def compile_mixed_moe_gemm1_common(
                             out_elem_bytes, index=True
                         )
                         ptr_addr_idx = row_byte_base + byte_off_col
-                        out_ptr_v = idx_to_llvm_ptr(ptr_addr_idx)
+                        out_ptr_v = _idx_to_llvm_ptr(ptr_addr_idx)
                         frag_v = frag._value if hasattr(frag, "_value") else frag
                         llvm.AtomicRMWOp(
                             llvm.AtomicBinOp.fadd,
@@ -2506,7 +2494,7 @@ def compile_mixed_moe_gemm1_common(
                             out_elem_bytes, index=True
                         )
                         ptr_addr_idx = row_byte_base + byte_off_col
-                        out_ptr_v = idx_to_llvm_ptr(ptr_addr_idx)
+                        out_ptr_v = _idx_to_llvm_ptr(ptr_addr_idx)
                         frag_v = frag._value if hasattr(frag, "_value") else frag
                         llvm.StoreOp(
                             frag_v,
@@ -3403,13 +3391,6 @@ def compile_mixed_moe_gemm2_common(
             vec4_f32 = T.vec(4, f32)
             vec16_elems = 16 if a_elem_bytes == 1 else 8
 
-            def ptr_buffer_resource(ptr, num_records_bytes):
-                addr = fx.ptrtoint(ptr)
-                addr_i64 = fx.Int64(addr)
-                return buffer_ops.create_buffer_resource_from_addr(
-                    addr_i64, num_records_bytes=num_records_bytes
-                )
-
             acc_init = arith.constant_vector(0.0, vec4_f32)
 
             topk_idx = arith.constant(topk, index=True)
@@ -3519,10 +3500,10 @@ def compile_mixed_moe_gemm2_common(
                 (tokens_in * c_topk) * k_in * c_elem_bytes, int(a_elem_vec_pack)
             )
             x_nbytes_i32 = fx.Int32(x_nbytes_idx)
-            x_rsrc = ptr_buffer_resource(arg_x, x_nbytes_i32)
+            x_rsrc = ptr_rsrc(arg_x, x_nbytes_i32)
 
-            w_rsrc = ptr_buffer_resource(arg_w, w_nbytes)
-            shared_w_rsrc = ptr_buffer_resource(arg_shared_w, shared_w_nbytes)
+            w_rsrc = ptr_rsrc(arg_w, w_nbytes)
+            shared_w_rsrc = ptr_rsrc(arg_shared_w, shared_w_nbytes)
 
             out_elem_bytes = 1 if need_fp8_out else (4 if out_is_f32 else 2)
             # fp8 route-out row = [N fp8 value bytes | N/8 e8m0 scale bytes].
@@ -3547,11 +3528,9 @@ def compile_mixed_moe_gemm2_common(
                     * arith.constant(out_row_bytes_const, index=True)
                 )
             out_nbytes_i32 = fx.Int32(out_nbytes_idx)
-            out_rsrc = ptr_buffer_resource(arg_out, out_nbytes_i32)
+            out_rsrc = ptr_rsrc(arg_out, out_nbytes_i32)
 
-            numids_rsrc = ptr_buffer_resource(
-                arg_num_valid_ids, arith.constant(4, type=T.i32)
-            )
+            numids_rsrc = ptr_rsrc(arg_num_valid_ids, arith.constant(4, type=T.i32))
             num_valid_i32 = buffer_ops.buffer_load(
                 numids_rsrc, arith.constant(0, index=True), vec_width=1, dtype=T.i32
             )
@@ -3568,17 +3547,17 @@ def compile_mixed_moe_gemm2_common(
                 )
                 sx_nbytes_idx = scale_rows * kblk
                 sx_nbytes_i32 = fx.Int32(sx_nbytes_idx)
-                sx_rsrc = ptr_buffer_resource(arg_scale_x, sx_nbytes_i32)
+                sx_rsrc = ptr_rsrc(arg_scale_x, sx_nbytes_i32)
             else:
                 sx_nbytes_idx = (tokens_in * c_topk) * arith.constant(4, index=True)
                 sx_nbytes_i32 = fx.Int32(sx_nbytes_idx)
-                sx_rsrc = ptr_buffer_resource(arg_scale_x, sx_nbytes_i32)
+                sx_rsrc = ptr_rsrc(arg_scale_x, sx_nbytes_i32)
 
             kblk_w = arith.constant(scale_kblk_padded, index=True)
             mn_w = arith.constant(experts * model_dim, index=True)
             sw_nbytes_idx = mn_w * kblk_w
             sw_nbytes_i32 = fx.Int32(sw_nbytes_idx)
-            sw_rsrc = ptr_buffer_resource(arg_scale_w, sw_nbytes_i32)
+            sw_rsrc = ptr_rsrc(arg_scale_w, sw_nbytes_i32)
             shared_scale_rows = arith.constant(
                 ((model_dim + 255) // 256) * 256, index=True
             )
@@ -3586,9 +3565,7 @@ def compile_mixed_moe_gemm2_common(
                 ((scale_kblk_padded + 7) // 8) * 8, index=True
             )
             shared_sw_nbytes_i32 = fx.Int32(shared_scale_rows * shared_scale_cols)
-            shared_sw_rsrc = ptr_buffer_resource(
-                arg_shared_scale_w, shared_sw_nbytes_i32
-            )
+            shared_sw_rsrc = ptr_rsrc(arg_shared_scale_w, shared_sw_nbytes_i32)
 
             sorted_nbytes_idx = (
                 size_expert_ids_in
@@ -3596,8 +3573,8 @@ def compile_mixed_moe_gemm2_common(
                 * arith.constant(4, index=True)
             )
             sorted_nbytes_i32 = fx.Int32(sorted_nbytes_idx)
-            sorted_rsrc = ptr_buffer_resource(arg_sorted_token_ids, sorted_nbytes_i32)
-            sorted_w_rsrc = ptr_buffer_resource(arg_sorted_weights, sorted_nbytes_i32)
+            sorted_rsrc = ptr_rsrc(arg_sorted_token_ids, sorted_nbytes_i32)
+            sorted_w_rsrc = ptr_rsrc(arg_sorted_weights, sorted_nbytes_i32)
 
             c_sbm = arith.constant(_sort_block_m, index=True)
             c_tm = arith.constant(tile_m, index=True)
@@ -3607,10 +3584,8 @@ def compile_mixed_moe_gemm2_common(
             )
             eid_nbytes_idx = sort_blocks_ub * arith.constant(4, index=True)
             eid_nbytes_i32 = fx.Int32(eid_nbytes_idx)
-            expert_rsrc = ptr_buffer_resource(arg_expert_ids, eid_nbytes_i32)
-            bias_rsrc = (
-                ptr_buffer_resource(arg_bias, bias_nbytes) if enable_bias else None
-            )
+            expert_rsrc = ptr_rsrc(arg_expert_ids, eid_nbytes_i32)
+            bias_rsrc = ptr_rsrc(arg_bias, bias_nbytes) if enable_bias else None
 
             c0_p = arith.constant(0, index=True)
             c1_p = arith.constant(1, index=True)
@@ -4834,13 +4809,6 @@ def compile_mixed_moe_gemm2_common(
                     row_byte_off_i32 = None
                     return ((fused2, row_byte_base, row_byte_off_i32), row_valid)
 
-                def idx_to_llvm_ptr(idx_val, addr_space=1):
-                    """Convert an index-typed byte address to !llvm.ptr<addr_space>."""
-                    idx_v = idx_val._value if hasattr(idx_val, "_value") else idx_val
-                    i64_raw = fx.Int64(idx_v).ir_value()
-                    ptr_ty = ir.Type.parse(f"!llvm.ptr<{addr_space}>")
-                    return llvm.inttoptr(ptr_ty, i64_raw)
-
                 def store_pair(*, row_local, row, row_ctx, col_pair0, col_g0, frag):
                     _fused, row_byte_base, row_byte_off_i32 = row_ctx
                     if const_expr(need_fp8_out):
@@ -4888,7 +4856,7 @@ def compile_mixed_moe_gemm2_common(
                                 1,
                             )
                             word_ptr = ptr_addr_idx + arith.constant(wg * 4, index=True)
-                            out_ptr_v = idx_to_llvm_ptr(word_ptr)
+                            out_ptr_v = _idx_to_llvm_ptr(word_ptr)
                             packed_raw = (
                                 packed_w._value
                                 if hasattr(packed_w, "_value")
@@ -4903,7 +4871,7 @@ def compile_mixed_moe_gemm2_common(
                             + arith.constant(model_dim, index=True)
                             + (col_g0 // arith.constant(8, index=True))
                         )
-                        scale_ptr_v = idx_to_llvm_ptr(scale_byte_idx)
+                        scale_ptr_v = _idx_to_llvm_ptr(scale_byte_idx)
                         e8m0_raw = fx.Int8(E).ir_value()
                         llvm.StoreOp(
                             e8m0_raw, scale_ptr_v, alignment=1, nontemporal=True
@@ -4914,7 +4882,7 @@ def compile_mixed_moe_gemm2_common(
                             out_elem_bytes, index=True
                         )
                         ptr_addr_idx = row_byte_base + byte_off_col
-                        out_ptr_v = idx_to_llvm_ptr(ptr_addr_idx)
+                        out_ptr_v = _idx_to_llvm_ptr(ptr_addr_idx)
                         frag_v = frag._value if hasattr(frag, "_value") else frag
                         llvm.StoreOp(
                             frag_v,
@@ -4939,7 +4907,7 @@ def compile_mixed_moe_gemm2_common(
                             out_elem_bytes, index=True
                         )
                         ptr_addr_idx = row_byte_base + byte_off_col
-                        out_ptr_v = idx_to_llvm_ptr(ptr_addr_idx)
+                        out_ptr_v = _idx_to_llvm_ptr(ptr_addr_idx)
                         frag_v = frag._value if hasattr(frag, "_value") else frag
                         llvm.AtomicRMWOp(
                             llvm.AtomicBinOp.fadd,

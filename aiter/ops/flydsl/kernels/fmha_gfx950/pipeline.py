@@ -10,7 +10,7 @@ import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl._mlir import ir
 from flydsl._mlir.dialects import fly, llvm
-from flydsl.expr import arith, const_expr, gpu, range_constexpr, rocdl
+from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import T
 from flydsl.expr.typing import Vector as Vec
 from flydsl.expr.utils.arith import _to_raw as as_mlir_value
@@ -50,7 +50,7 @@ def _read_exec_i64():
 
 def _ds_read_tr8_b64_imm(result_type, addr_i32, imm_offset=0):
     imm = int(imm_offset)
-    raw_type = ir.VectorType.get([2], ir.IntegerType.get_signless(32))
+    raw_type = T.vec(2, T.i32)
     raw = llvm.inline_asm(
         raw_type,
         [as_mlir_value(addr_i32)],
@@ -650,9 +650,9 @@ def _init_dualwave_thread_mapping(ctx):
         (_tid_i32 // fx.Int32(traits.WARP_SIZE)).ir_value(),
     )
     # Two stagger groups, whatever the wave count.
-    ctx.stagger_i32 = arith.divsi(
-        _wave_id_uni_i32, as_mlir_value(fx.Int32(traits.NUM_WAVES // 2))
-    )
+    ctx.stagger_i32 = (
+        fx.Int32(_wave_id_uni_i32) // fx.Int32(traits.NUM_WAVES // 2)
+    ).ir_value()
     ctx.wave_id_uni = fx.Index(_wave_id_uni_i32)
 
     ctx.wave_q_offset = ctx.wave_id * traits.ROWS_PER_WAVE

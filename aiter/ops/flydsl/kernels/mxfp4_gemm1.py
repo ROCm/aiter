@@ -13,6 +13,8 @@ from .mxfp4_gemm_common import (
     _e8m0_from_amax,
     _e8m0_roundup,
     _fabs_f32,
+    _global_i32_buffer_tiles,
+    _global_i32_buffer_view,
     _inline_dpp_quad_amax,
     _lds_swizzle_mask,
     _raw,
@@ -183,27 +185,6 @@ def _gemm1_body(
     aq_num_records = fx.Int64(i32_ntok * fx.Int32(K_HALF))
     _asc_per_mb = max(BM // 32, 1) * kAS_per_chunk_dw * 4
     ascale_num = fx.Int64(i32_total_m_blocks) * fx.Int64(_asc_per_mb)
-
-    # fx.copy's BufferCopy/BufferCopyLDS atoms take soffset as an element count,
-    # not the bytes buffer_ops.buffer_load's soffset_bytes expects.
-    def _global_i32_buffer_view(addr_i64, num_bytes):
-        # make_layout's dynamic-shape leaf must be i32/i64, not fx.Index.
-        num_bytes_i64 = fx.Int64(num_bytes)
-        ptr_ty = fx.PointerType.get(
-            T.i32, address_space=fx.AddressSpace.Global, alignment=4
-        )
-        ptr = fx.inttoptr(ptr_ty, fx.Int64(addr_i64))
-        view = fx.Tensor(
-            fx.make_view(ptr, fx.make_layout(num_bytes_i64 // fx.Int64(4), 1))
-        )
-        return fx.rocdl.make_buffer_tensor(
-            view, max_size=False, num_records_bytes=num_bytes_i64
-        )
-
-    def _global_i32_buffer_tiles(addr_i64, num_bytes, tile_elems):
-        return fx.logical_divide(
-            _global_i32_buffer_view(addr_i64, num_bytes), fx.make_layout(tile_elems, 1)
-        )
 
     bq_tiles = _global_i32_buffer_tiles(arg_bq, BQ_BYTES, 4)
     bq_copy_atom = fx.make_copy_atom(fx.rocdl.BufferCopy128b(b_aux), fx.Int32)

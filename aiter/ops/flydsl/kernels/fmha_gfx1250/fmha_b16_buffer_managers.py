@@ -30,18 +30,16 @@ Contents:
 Target: gfx1250 (MI400 / mi450), wave32, 8 waves per threadgroup (256 threads).
 """
 
+import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl._mlir.dialects import llvm as llvm_dialect
-from flydsl.compiler.ast_rewriter import ReplaceIfWithDispatch
-from flydsl.expr import arith, rocdl
+from flydsl.expr import rocdl
 from flydsl.expr.rocdl import tdm_ops
 
 from aiter.ops.flydsl.kernels import buffer_ops
 
 from ..kernels_common import create_llvm_ptr
-
-_scf_if_dispatch = ReplaceIfWithDispatch.scf_if_dispatch
-
+from ..tensor_shim import _to_raw as _ir
 
 # ============================================================================
 # Manager-intrinsic tiling constants (private — not the caller's config).
@@ -151,11 +149,6 @@ ENABLE_SCHED_MODE2 = True
 # against the opaque async global->LDS store and mis-orders it under DEP_MODE=2
 # (the historical 55% NaN @16384 causal bug). See memory fmha-flydsl-0-3-x-migration.
 # ===========================================================================
-
-
-def _ir(x):
-    """Unwrap an fx value to its raw MLIR ir.Value (pass-through if already raw)."""
-    return x.ir_value() if hasattr(x, "ir_value") else x
 
 
 def _async_load_to_lds(gptrs, lds_ptrs, *, cluster, imm_offs=None):
@@ -1465,7 +1458,7 @@ class OManager16bV1:
             fx.Int64(q_start + q_len) * fx.Int64(stride_o_seq) * fx.Int64(_BF16_BYTES)
         )
         o_rsrc = buffer_ops.create_buffer_resource(
-            ptr_O, num_records_bytes=arith.unwrap(o_num_records_bytes)
+            ptr_O, num_records_bytes=_ir(o_num_records_bytes)
         )
         lds_warp = ptr_lds + warp_idx * self._warp_stride
         q_st = lane_idx % _WMMA_M
@@ -1849,11 +1842,13 @@ class OManager16bV3:
             0
         )  # all ds_stores landed (every async row reads a full padded row)
 
-        def _burst(*_a):
-            for gdst, lsrc in addrs:
-                rocdl.global_store_async_from_lds_b128(_ir(gdst), _ir(lsrc), 0)
+        @flyc.jit
+        def _burst():
+            if valid_rows > fx.Int32(0):
+                for gdst, lsrc in addrs:
+                    rocdl.global_store_async_from_lds_b128(_ir(gdst), _ir(lsrc), 0)
 
-        _scf_if_dispatch(valid_rows > fx.Int32(0), _burst)  # skip a fully-OOB warp
+        _burst()
         # No s_wait_asynccnt: HW drains the async stores' LDS reads at workgroup retire.
         self._pending = []
 

@@ -35,6 +35,91 @@ from aiter.ops.flydsl.kernels import buffer_ops
 
 from .act import LOG2E as _LOG2E
 
+ELEM_BYTES = 2  # Both supported element types, bf16 and fp16, occupy two bytes.
+
+
+def _vec_chunks(total):
+    """Cover [0, total) with aligned vector widths (4, 2) + scalar."""
+    chunks, i = [], 0
+    for wd in (4, 2):
+        while total - i >= wd:
+            chunks.append((i, wd))
+            i += wd
+    while i < total:
+        chunks.append((i, 1))
+        i += 1
+    return chunks
+
+
+def _rsrc(ptr):
+    # Index loads that reach descriptor bases must remain uniform.
+    return buffer_ops.create_buffer_resource_from_addr(ptr)
+
+
+def _addr_at(ptr, index, stride):
+    # The base uses bytes; buffer offsets use elements. Widen both factors
+    # before multiplication, since batch/cache-sized products can exceed i32.
+    return ptr + index.to(fx.Int64) * stride.to(fx.Int64) * fx.Int64(ELEM_BYTES)
+
+
+def _make_buffer_io(elem_dtype):
+    """Bind the shared conv1d vector IO to its bf16/fp16 element type."""
+
+    def _view(addr, vec_width):
+        """Buffer tensor over a raw pointer, indexed in elements.
+
+        The fast axis holds the ``vec_width`` elements one copy moves and
+        the other carries a unit stride, so a flat element index reaches
+        any element of the allocation. Repeats off one address fold back
+        together, the descriptor being the same value.
+        """
+        align = max(1, elem_dtype.width * vec_width // 8)
+        ptr_ty = fx.PointerType.get(elem_dtype.ir_type, fx.AddressSpace.Global, align)
+        base = fx.inttoptr(ptr_ty, fx.Int64(addr))
+        return rocdl.make_buffer_tensor(
+            fx.Tensor(fx.make_view(base, fx.make_layout((vec_width, 1), (1, 1))))
+        )
+
+    def _atom(vec_width):
+        return fx.make_copy_atom(
+            rocdl.BufferCopy(elem_dtype.width * vec_width), elem_dtype
+        )
+
+    def _load(addr, off, vec_width=1):
+        frag = fx.make_rmem_tensor(vec_width, elem_dtype)
+        fx.copy(_atom(vec_width), fx.slice(_view(addr, vec_width), (None, off)), frag)
+        vec = fx.Vector(frag.load())
+        return vec[0] if fx.const_expr(vec_width == 1) else vec
+
+    def _store(addr, off, value, vec_width=1):
+        frag = fx.make_rmem_tensor(vec_width, elem_dtype)
+        frag.store(
+            fx.Vector.from_elements([value], elem_dtype)
+            if fx.const_expr(vec_width == 1)
+            else value
+        )
+        fx.copy(_atom(vec_width), frag, fx.slice(_view(addr, vec_width), (None, off)))
+
+    def _store_run(vals, addr, base, stride, total, vectorize):
+        # Callers only set ``vectorize`` when the axis stride is 1, so the
+        # slot offset is a constant here; spelling it as one keeps the byte
+        # address out of the runtime path.
+        if fx.const_expr(vectorize):
+            for start, wd in _vec_chunks(total):
+                off = base if fx.const_expr(start == 0) else base + fx.Int32(start)
+                if fx.const_expr(wd == 1):
+                    _store(addr, off, vals[start])
+                else:
+                    chunk = fx.Vector.from_elements(
+                        [vals[start + j] for j in range(wd)], elem_dtype
+                    )
+                    _store(addr, off, chunk, wd)
+        else:
+            for t in fx.range_constexpr(total):
+                _store(addr, base + fx.Int32(t) * stride, vals[t])
+
+    return _load, _store, _store_run
+
 
 def build_causal_conv1d_update_module(
     width: int,
@@ -86,7 +171,6 @@ def build_causal_conv1d_update_module(
     HAS_NULL_BLOCK = bool(has_null_block)
     IS_APC = bool(is_apc_enabled)
     IS_VARLEN = bool(is_varlen)
-    ELEM_BYTES = 2  # bf16 / fp16 are the only element types this kernel takes
 
     # Effective conv_state window length (matches vLLM wrapper):
     #   spec  -> width - 1 + (seqlen - 1)   (history + K candidate slots)
@@ -109,18 +193,6 @@ def build_causal_conv1d_update_module(
     # Only valid when the token axis is contiguous; the wrapper decides.
     CS_VEC = bool(cs_vec)
     O_VEC = bool(o_vec)
-
-    def _vec_chunks(total):
-        """Cover [0, total) with aligned vector widths (4, 2) + scalar."""
-        chunks, i = [], 0
-        for wd in (4, 2):
-            while total - i >= wd:
-                chunks.append((i, wd))
-                i += wd
-        while i < total:
-            chunks.append((i, 1))
-            i += 1
-        return chunks
 
     @flyc.kernel
     def update_kernel(
@@ -151,60 +223,7 @@ def build_causal_conv1d_update_module(
         so_tok: fx.Int32,
     ):
         elem_dtype = fx.BFloat16 if dtype_str == "bf16" else fx.Float16
-
-        def _rsrc(ptr):
-            # Index tensors keep the raw descriptor. Most of their loads are
-            # scalar, which a copy atom has no spelling for, since the values
-            # reach descriptor bases and those have to stay uniform; the rest
-            # are i32 and would each need an atom of their own to no gain.
-            return buffer_ops.create_buffer_resource_from_addr(ptr)
-
-        # A term scaling with the batch or the cache size goes in the 64-bit base;
-        # the buffer offset is 32 bits. Both factors widen separately, their
-        # product being what overflows.
-        def _addr_at(ptr, index, stride):
-            return ptr + index.to(fx.Int64) * stride.to(fx.Int64) * fx.Int64(ELEM_BYTES)
-
-        def _view(addr, vec_width):
-            """Buffer tensor over a raw pointer, indexed in elements.
-
-            The fast axis holds the ``vec_width`` elements one copy moves and
-            the other carries a unit stride, so a flat element index reaches
-            any element of the allocation. Repeats off one address fold back
-            together, the descriptor being the same value.
-            """
-            align = max(1, elem_dtype.width * vec_width // 8)
-            ptr_ty = fx.PointerType.get(
-                elem_dtype.ir_type, fx.AddressSpace.Global, align
-            )
-            base = fx.inttoptr(ptr_ty, fx.Int64(addr))
-            return rocdl.make_buffer_tensor(
-                fx.Tensor(fx.make_view(base, fx.make_layout((vec_width, 1), (1, 1))))
-            )
-
-        def _atom(vec_width):
-            return fx.make_copy_atom(
-                rocdl.BufferCopy(elem_dtype.width * vec_width), elem_dtype
-            )
-
-        def _load(addr, off, vec_width=1):
-            frag = fx.make_rmem_tensor(vec_width, elem_dtype)
-            fx.copy(
-                _atom(vec_width), fx.slice(_view(addr, vec_width), (None, off)), frag
-            )
-            vec = fx.Vector(frag.load())
-            return vec[0] if fx.const_expr(vec_width == 1) else vec
-
-        def _store(addr, off, value, vec_width=1):
-            frag = fx.make_rmem_tensor(vec_width, elem_dtype)
-            frag.store(
-                fx.Vector.from_elements([value], elem_dtype)
-                if fx.const_expr(vec_width == 1)
-                else value
-            )
-            fx.copy(
-                _atom(vec_width), frag, fx.slice(_view(addr, vec_width), (None, off))
-            )
+        _load, _store, _store_run = _make_buffer_io(elem_dtype)
 
         # Only the descriptors actually used: the rest are dummy (x) pointers, and
         # skipping them keeps their kernargs out of the prologue.
@@ -309,24 +328,6 @@ def build_causal_conv1d_update_module(
                 offset_dyn = (s_len > fx.Int32(0)).select(offset_dyn, fx.Int32(0))
         else:
             offset_dyn = fx.Int32(0)
-
-        def _store_run(vals, addr, base, stride, total, vectorize):
-            # Callers only set ``vectorize`` when the axis stride is 1, so the
-            # slot offset is a constant here; spelling it as one keeps the byte
-            # address out of the runtime path.
-            if fx.const_expr(vectorize):
-                for start, wd in _vec_chunks(total):
-                    off = base if fx.const_expr(start == 0) else base + fx.Int32(start)
-                    if fx.const_expr(wd == 1):
-                        _store(addr, off, vals[start])
-                    else:
-                        chunk = fx.Vector.from_elements(
-                            [vals[start + j] for j in range(wd)], elem_dtype
-                        )
-                        _store(addr, off, chunk, wd)
-            else:
-                for t in fx.range_constexpr(total):
-                    _store(addr, base + fx.Int32(t) * stride, vals[t])
 
         # ================= per-channel work ==================================
         def _channel(gfeat):
@@ -598,7 +599,6 @@ def build_causal_conv1d_update_sglang_module(
     W = width
     S = seqlen
     BN = block_n
-    ELEM_BYTES = 2  # bf16 / fp16 are the only element types this kernel takes
     CPT = int(channels_per_thread)
     HAS_BIAS = bool(has_bias)
     SILU = bool(silu)
@@ -630,18 +630,6 @@ def build_causal_conv1d_update_sglang_module(
     CS_VEC = bool(cs_vec)
     O_VEC = bool(o_vec)
     I_VEC = bool(i_vec)
-
-    def _vec_chunks(total):
-        """Cover [0, total) with aligned vector widths (4, 2) + scalar."""
-        chunks, i = [], 0
-        for wd in (4, 2):
-            while total - i >= wd:
-                chunks.append((i, wd))
-                i += wd
-        while i < total:
-            chunks.append((i, 1))
-            i += 1
-        return chunks
 
     @flyc.kernel
     def update_kernel(
@@ -685,56 +673,13 @@ def build_causal_conv1d_update_sglang_module(
         srpt_tok: fx.Int32,
     ):
         elem_dtype = fx.BFloat16 if dtype_str == "bf16" else fx.Float16
-
-        def _rsrc(ptr):
-            # Index tensors keep the raw descriptor: their loads reach
-            # descriptor bases, which have to stay uniform.
-            return buffer_ops.create_buffer_resource_from_addr(ptr)
-
-        # A term scaling with the batch or the cache size goes in the 64-bit
-        # base; the buffer offset is 32 bits.
-        def _addr_at(ptr, index, stride):
-            return ptr + index.to(fx.Int64) * stride.to(fx.Int64) * fx.Int64(ELEM_BYTES)
+        _load, _store, _store_run = _make_buffer_io(elem_dtype)
 
         def _load_i32(rsrc, off, is_scalar=False):
             return fx.Int32(
                 buffer_ops.buffer_load(
                     rsrc, off, vec_width=1, dtype=fx.Int32, is_scalar=is_scalar
                 )
-            )
-
-        def _view(addr, vec_width):
-            align = max(1, elem_dtype.width * vec_width // 8)
-            ptr_ty = fx.PointerType.get(
-                elem_dtype.ir_type, fx.AddressSpace.Global, align
-            )
-            base = fx.inttoptr(ptr_ty, fx.Int64(addr))
-            return rocdl.make_buffer_tensor(
-                fx.Tensor(fx.make_view(base, fx.make_layout((vec_width, 1), (1, 1))))
-            )
-
-        def _atom(vec_width):
-            return fx.make_copy_atom(
-                rocdl.BufferCopy(elem_dtype.width * vec_width), elem_dtype
-            )
-
-        def _load(addr, off, vec_width=1):
-            frag = fx.make_rmem_tensor(vec_width, elem_dtype)
-            fx.copy(
-                _atom(vec_width), fx.slice(_view(addr, vec_width), (None, off)), frag
-            )
-            vec = fx.Vector(frag.load())
-            return vec[0] if fx.const_expr(vec_width == 1) else vec
-
-        def _store(addr, off, value, vec_width=1):
-            frag = fx.make_rmem_tensor(vec_width, elem_dtype)
-            frag.store(
-                fx.Vector.from_elements([value], elem_dtype)
-                if fx.const_expr(vec_width == 1)
-                else value
-            )
-            fx.copy(
-                _atom(vec_width), frag, fx.slice(_view(addr, vec_width), (None, off))
             )
 
         # Only the descriptors actually used; the rest are dummy pointers. The
@@ -971,27 +916,6 @@ def build_causal_conv1d_update_sglang_module(
                 col_raw[SHIFT + t] if fx.const_expr((t + S) < ST) else x_raw[t - VAL]
                 for t in fx.range_constexpr(ST)
             ]
-
-            def _store_run(vals, addr, base, stride, total, vectorize):
-                # ``vectorize`` implies an axis stride of 1, so the slot offset
-                # is a constant.
-                if fx.const_expr(vectorize):
-                    for start, wd in _vec_chunks(total):
-                        off = (
-                            base
-                            if fx.const_expr(start == 0)
-                            else base + fx.Int32(start)
-                        )
-                        if fx.const_expr(wd == 1):
-                            _store(addr, off, vals[start])
-                        else:
-                            chunk = fx.Vector.from_elements(
-                                [vals[start + j] for j in range(wd)], elem_dtype
-                            )
-                            _store(addr, off, chunk, wd)
-                else:
-                    for t in fx.range_constexpr(total):
-                        _store(addr, base + fx.Int32(t) * stride, vals[t])
 
             if active:
                 _store_run(cs_vals, cs_a, cs_base, scs_tok, ST, CS_VEC)

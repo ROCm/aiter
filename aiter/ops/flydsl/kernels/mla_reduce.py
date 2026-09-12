@@ -175,6 +175,10 @@ def _store_final_out(buf, row, head_idx, tid, elems_f32, vec, out_numeric_t):
     )
 
 
+def _store_lse(lse, row, head_idx, value):
+    lse[row, head_idx] = value
+
+
 def _exp(x):
     """exp(x) via the hardware v_exp_f32 (exp2(x*log2e))."""
     return fx.rocdl.exp2(T.f32, (x * _LOG2E).ir_value())
@@ -414,9 +418,6 @@ def compile_mla_reduce(
         def store_lse_scale(split_idx, value):
             lds_scale[split_idx] = value
 
-        def store_lse_value(lse, row, head_idx, value):
-            lse[row, head_idx] = value
-
         def process_work_item(head, block_idx, tile, ntg):
             """Reduce one (head, q-pos-group, tile) work item into final_output.
 
@@ -520,7 +521,7 @@ def compile_mla_reduce(
                     inf = fx.Float32(float("inf"))
                     final_lse_val = bad.select(inf, lse_val)
                     if tid == fx.Int32(0):
-                        store_lse_value(g_flse, seq, head, final_lse_val)
+                        _store_lse(g_flse, seq, head, final_lse_val)
 
             # Runtime range without carried state lets scheduling overlap the
             # split-loop VMEM loads with compute.
@@ -614,7 +615,7 @@ def compile_mla_reduce(
                         sc = _exp(local_lses[j] - global_lse)
                         store_lse_scale(split_idx, in_rng.select(sc, zero_f))
                     if fx.const_expr(output_lse) and lane == fx.Int32(0):
-                        store_lse_value(g_flse, seq_i32, head, global_lse)
+                        _store_lse(g_flse, seq_i32, head, global_lse)
 
                 # Keep GRP output loads in flight while computing the prior group.
                 # Tail gathers use slot zero and the scale select zeros invalid
@@ -1247,9 +1248,6 @@ def compile_mla_reduce_splitk(
             (H, 1),
         )
 
-        def store_combined_lse(lse, row, head_idx, value):
-            lse[row, head_idx] = value
-
         c_H = fx.Int32(H)
         c_K = fx.Int32(K)
         slot = fx.block_idx.x
@@ -1301,7 +1299,7 @@ def compile_mla_reduce_splitk(
                     inf = fx.Float32(float("inf"))
                     lse_val = bad.select(inf, fly_math.log(den, fastmath=fm_fast) + M)
                     if tid == fx.Int32(0):
-                        store_combined_lse(g_flse, q_start, head, lse_val)
+                        _store_lse(g_flse, q_start, head, lse_val)
 
     @flyc.jit
     def launch_partial(

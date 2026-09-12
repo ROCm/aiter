@@ -90,6 +90,27 @@ def global_typed_ptr(arg, elem_ty, align=4, *, byte_offset=None):
     return fx.inttoptr(ptr_ty, fx.Int64(arg))
 
 
+def _global_i32_buffer_view(addr_i64, num_bytes):
+    # BufferCopy soffset is in elements; make_layout's dynamic shape must be
+    # i32/i64 rather than Index. Keep the hardware OOB bound in bytes.
+    num_bytes_i64 = fx.Int64(num_bytes)
+    view = fx.Tensor(
+        fx.make_view(
+            global_typed_ptr(addr_i64, T.i32),
+            fx.make_layout(num_bytes_i64 // fx.Int64(4), 1),
+        )
+    )
+    return fx.rocdl.make_buffer_tensor(
+        view, max_size=False, num_records_bytes=num_bytes_i64
+    )
+
+
+def _global_i32_buffer_tiles(addr_i64, num_bytes, tile_elems):
+    return fx.logical_divide(
+        _global_i32_buffer_view(addr_i64, num_bytes), fx.make_layout(tile_elems, 1)
+    )
+
+
 def lds_typed_ptr(base_i32, elem_ty, align=4, *, byte_offset=None):
     """Typed LDS (Shared) fx.Pointer over an i32 LDS base; index in ELEMENTS (ptr[i]), not bytes."""
     ptr_ty = fx.PointerType.get(elem_ty, fx.AddressSpace.Shared, align)

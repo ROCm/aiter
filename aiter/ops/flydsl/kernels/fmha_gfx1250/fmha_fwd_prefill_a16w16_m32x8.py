@@ -37,31 +37,26 @@ from enum import IntEnum
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 import torch
-from flydsl._mlir import ir
 from flydsl._mlir.dialects import llvm as llvm_dialect
-from flydsl.compiler.ast_rewriter import ReplaceIfWithDispatch
 from flydsl.expr import arith, gpu, rocdl
 from flydsl.expr import math as fmath
+
+# Runtime `if` helper the AST rewriter lowers dynamic conditions to. Called
+# explicitly here since _core_attention is a module-level helper (outside the
+# rewriter's @flyc.kernel scope), keeping side-effect guards free of raw scf.IfOp.
+# Q/K/V staging managers (own their LDS swizzles + async copy schedules). They are
+# self-contained: this kernel maintains its own arch constants below and passes the
+# config each manager needs through its constructor.
+from flydsl.expr.rocdl import tdm_ops
 from flydsl.expr.typing import T
 from flydsl.expr.utils.arith import _to_raw as _raw
 
 from aiter.jit.utils.chip_info import get_lds_capacity_bytes
 from aiter.ops.flydsl.kernels import buffer_ops
 
+from ..act import LOG2E
 from ..kernels_common import create_llvm_ptr
 from ..tensor_shim import _run_compiled
-
-# Runtime `if` helper the AST rewriter lowers dynamic conditions to. Called
-# explicitly here since _core_attention is a module-level helper (outside the
-# rewriter's @flyc.kernel scope), keeping side-effect guards free of raw scf.IfOp.
-scf_if_dispatch = ReplaceIfWithDispatch.scf_if_dispatch
-
-# Q/K/V staging managers (own their LDS swizzles + async copy schedules). They are
-# self-contained: this kernel maintains its own arch constants below and passes the
-# config each manager needs through its constructor.
-from flydsl.expr.rocdl import tdm_ops
-
-from ..act import LOG2E
 
 # Single source of truth for gfx1250 Expert Scheduling Mode 2 (DEP_MODE=2). Lives
 # in fmha_b16_buffer_managers. Under mode 2 the LLVM setreg (via the
@@ -219,7 +214,7 @@ def _load_sink_logit(ptr_sink, q_head_idx, num_heads_q):
     byte_off = fx.Int64(q_head_idx) * fx.Int64(4)
     addr = sink_base_i64 + byte_off
     gptr = create_llvm_ptr(addr, address_space=1)
-    return fx.Float32(llvm_dialect.load(ir.F32Type.get(), gptr))
+    return fx.Float32(llvm_dialect.load(T.f32, gptr))
 
 
 def _packed_tile_indices(gqa_ratio, warp_idx, lane_idx):
@@ -396,7 +391,7 @@ def _softmax(
     when deferral is compiled out).
     """
     NKV = n_block // WMMA_N
-    f32 = ir.F32Type.get()
+    f32 = T.f32
     fast = arith.FastMathFlags.fast
     neg_inf = fx.Float32(float("-inf"))
     zero = fx.Float32(0.0)
@@ -1040,19 +1035,21 @@ def _core_attention(
         def _prefetch(addr):
             # Skip t+1 prefetch on the last tile: a dead copy into the O-epilogue slot
             # races the epilogue O write across waves.
+            @flyc.jit
             def _issue():
-                if USE_TDM_LOADER:
-                    k_views, v_views = addr
-                    for _v in k_views:
-                        fx.copy_atom_call(*_v)
-                    for _v in v_views:
-                        fx.copy_atom_call(*_v)
-                else:
-                    k_g, k_l, k_i, v_g, v_l, v_i = addr
-                    _async_load_to_lds(k_g, k_l, cluster=True, imm_offs=k_i)
-                    _async_load_to_lds(v_g, v_l, cluster=True, imm_offs=v_i)
+                if nxt < fx.Int32(n_tiles):
+                    if USE_TDM_LOADER:
+                        k_views, v_views = addr
+                        for _v in k_views:
+                            fx.copy_atom_call(*_v)
+                        for _v in v_views:
+                            fx.copy_atom_call(*_v)
+                    else:
+                        k_g, k_l, k_i, v_g, v_l, v_i = addr
+                        _async_load_to_lds(k_g, k_l, cluster=True, imm_offs=k_i)
+                        _async_load_to_lds(v_g, v_l, cluster=True, imm_offs=v_i)
 
-            scf_if_dispatch(nxt < fx.Int32(n_tiles), _issue)
+            _issue()
 
         # Address VALU up front (no barrier dependency) so it overlaps the drain; only
         # the async issue in _prefetch must stay after the barrier.
@@ -1126,6 +1123,13 @@ def _core_attention(
         # corr == 1 so the else-branch passes o_acc through untouched. do_rescale is
         # None -> deferral compiled out, keep the unconditional multiply. Each q-tile
         # decides its own deferred-rescale. ----
+        @flyc.jit
+        def _maybe_rescale(o_vecs, corr_vec, do_rescale):
+            result = o_vecs
+            if do_rescale:
+                result = [ov * corr_vec for ov in o_vecs]
+            return result
+
         o_resc_list = []
         for qt in range(R):
             corr_vec = fx.Vector.from_elements(
@@ -1138,14 +1142,7 @@ def _core_attention(
                 # Gate the wide multiply behind a wave-uniform scf.if (via the file's
                 # scf_if_dispatch idiom): the then-branch rescales, the omitted
                 # else-branch auto-passes o_acc through unchanged.
-                o_resc = list(
-                    scf_if_dispatch(
-                        do_rescale_list[qt],
-                        lambda *_a, _ov=o_vecs, _cv=corr_vec: [ov * _cv for ov in _ov],
-                        result_names=tuple(f"o{qt}_{dt}" for dt in range(d_tiles)),
-                        result_values=o_vecs,
-                    )
-                )
+                o_resc = list(_maybe_rescale(o_vecs, corr_vec, do_rescale_list[qt]))
             o_resc_list.append(o_resc)
 
         o_new_list = _pv_gemm(
@@ -1761,15 +1758,11 @@ def _ensure_thd_kernel(
     ):
         # 3D grid: x = tiles over (seq, q_head_in_group) per kv-head,
         #          y = kv_head, z = batch. block = 256 (8 waves x wave32).
-        grid_x = arith.index_cast(
-            T.index,
-            arith.ceildivui(
-                arith.unwrap(max_seqlen_q * gqa_ratio),
-                arith.constant(BLOCK_M, type=T.i32),
-            ),
+        grid_x = fx.Index(
+            fx.ceildiv(fx.Uint32(max_seqlen_q * gqa_ratio), fx.Uint32(BLOCK_M))
         )
-        grid_y = arith.index_cast(T.index, num_heads_kv)
-        grid_z = arith.index_cast(T.index, batch_size)
+        grid_y = fx.Index(num_heads_kv)
+        grid_z = fx.Index(batch_size)
 
         launcher = kernel(
             ptr_O,
@@ -1872,15 +1865,11 @@ def _ensure_bshd_kernel(
     ):
         # 3D grid: x = tiles over (seq, q_head_in_group) per kv-head,
         #          y = kv_head, z = batch. block = 256 (8 waves x wave32).
-        grid_x = arith.index_cast(
-            T.index,
-            arith.ceildivui(
-                arith.unwrap(seq_len_q * gqa_ratio),
-                arith.constant(BLOCK_M, type=T.i32),
-            ),
+        grid_x = fx.Index(
+            fx.ceildiv(fx.Uint32(seq_len_q * gqa_ratio), fx.Uint32(BLOCK_M))
         )
-        grid_y = arith.index_cast(T.index, num_heads_kv)
-        grid_z = arith.index_cast(T.index, batch_size)
+        grid_y = fx.Index(num_heads_kv)
+        grid_z = fx.Index(batch_size)
 
         launcher = kernel(
             ptr_O,
