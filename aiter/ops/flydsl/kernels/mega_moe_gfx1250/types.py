@@ -63,6 +63,11 @@ class Stage2ScatterContext:
     max_tokens_per_rank: int
     world_size: int
     source_token_map: torch.Tensor
+    compact_layout: bool = False
+    compact_masked_m: torch.Tensor | None = None
+    compact_psum: torch.Tensor | None = None
+    compact_ep_rowmap: torch.Tensor | None = None
+    compact_wire_row_stride: int = 0
 
     def __post_init__(self):
         if self.arena_handle < 0:

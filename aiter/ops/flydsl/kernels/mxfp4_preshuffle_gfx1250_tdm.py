@@ -83,6 +83,8 @@ def launch_gemm_a8w4_tdm(
     f32_situ_beta: fx.Float32 = 1.0,
     f32_situ_linear_beta: fx.Float32 = 1.0,
     row_major_ascale: Constexpr[int] = 0,
+    a_row_stride_bytes: Constexpr[int] = 0,
+    a_scale_row_stride_bytes: Constexpr[int] = 0,
 ):
     """Launch the grouped contiguous-M a8w4 MoE GEMM for gfx1250.
 
@@ -147,6 +149,8 @@ def launch_gemm_a8w4_tdm(
         ep_destination_stride,
         ep_world_size,
         row_major_ascale,
+        a_row_stride_bytes,
+        a_scale_row_stride_bytes,
     )
     _ = cache_tag
     if enable_ep_scatter:
@@ -162,6 +166,9 @@ def launch_gemm_a8w4_tdm(
     output_n_rep = warp_tile_n // 16
     num_waves = m_warp * n_warp
     block = num_waves * WAVE
+    if (4 * num_waves_per_tensor_tdm) % num_waves:
+        raise ValueError("A/B/SA/SB ownership must cover every workgroup wave")
+    TDM_PER = 4 * num_waves_per_tensor_tdm // num_waves
 
     A_PACK = 2 if a_is_fp4 else 1
     A_ROW_B = tile_k // A_PACK
@@ -196,10 +203,11 @@ def launch_gemm_a8w4_tdm(
         else ((AS_SUPERS * AS_INNER * 4 + 15) // 16) * 16
     )
     STAGE_SB = ((SB_SUPERS * SC_INNER * 4 + 15) // 16) * 16
+    B_OFF = STAGE_A
     SA_OFF = STAGE_A + STAGE_B
     SB_OFF = STAGE_A + STAGE_B + STAGE_SA
-    # 512-align so per-buffer ptr offset preserves LDS alignment for TDM/ds_b128
-    PITCH = ((STAGE_A + STAGE_B + STAGE_SA + STAGE_SB + 511) // 512) * 512
+    _STAGE_BYTES = STAGE_A + STAGE_B + STAGE_SA + STAGE_SB
+    PITCH = ((_STAGE_BYTES + 511) // 512) * 512
 
     out_elem = T.f16 if out_is_f16 else T.bf16
     # +16 cols: the bf16 passthrough epilogue stages C with a padded row pitch
@@ -324,7 +332,12 @@ def launch_gemm_a8w4_tdm(
         B_BATCH_ROWS = n64 // 16
         N_SUPERS = (n64 + 31) // 32
         AS_ROW = (K // 128) * wmma_m_rep * 16
-        SA_GROW = K // 128  # row-major: scale dwords per M row
+        A_GROW = a_row_stride_bytes if a_row_stride_bytes else A_KROW
+        SA_GROW = (
+            a_scale_row_stride_bytes // 4
+            if a_scale_row_stride_bytes
+            else K // 128
+        )
 
         c_outer_off, c_inner_off, c_stride = blk_m64, blk_n64, i32_n
         SB_OUTER_STRIDE = K4
@@ -374,7 +387,7 @@ def launch_gemm_a8w4_tdm(
         gB_base = fx.recast_iter(fx.Int8, arg_b)
         gSA_base, gSB_base = fx.get_iter(arg_scale_a), fx.get_iter(arg_scale_b)
         b_outer_row = eb64 * B_BATCH_ROWS + blk_n64 // 16
-        a_off0 = blk_m64 * A_KROW
+        a_off0 = blk_m64 * A_GROW
         b_off0 = b_outer_row * Kp16
         sb_off0 = (blk_n64 // 32) * SB_OUTER_STRIDE + sb_batch_off
         assert num_waves_per_tensor_tdm in (
@@ -385,11 +398,6 @@ def launch_gemm_a8w4_tdm(
         assert (
             num_waves_per_tensor_tdm <= num_waves
         ), "waves per tensor cannot exceed workgroup waves"
-        assert (
-            4 * num_waves_per_tensor_tdm
-        ) % num_waves == 0, "A/B/SA/SB ownership must cover every workgroup wave"
-        # TDMs one wave issues per k-tile: its share of the four A/B/SA/SB jobs.
-        # Both the tensorcnt arithmetic and the WMMA interleave count in these.
         TDM_PER = 4 * num_waves_per_tensor_tdm // num_waves
         shared = fx.AddressSpace.Shared
         p8_shared = fx.PointerType.get(
@@ -429,6 +437,7 @@ def launch_gemm_a8w4_tdm(
             pad=None,
             wg_mask=0,
             split_inner=False,
+            job_list=None,
         ):
             split_i = split_inner and len(wv) > 1
             if const_expr(len(wv) > 1):
@@ -462,7 +471,8 @@ def launch_gemm_a8w4_tdm(
                 # Non-zero mask switches the TDM from GLOBAL_LOAD_ASYNC to
                 # CLUSTER_LOAD_ASYNC, fanning one load out to every peer's LDS.
                 atom = fx.atom_set_value(atom, "workgroup_mask", fx.Int32(wg_mask))
-            jobs.append(
+            target_jobs = jobs if job_list is None else job_list
+            target_jobs.append(
                 Job(
                     atom,
                     gt,
@@ -479,7 +489,7 @@ def launch_gemm_a8w4_tdm(
         add_tdm_loads(
             gA_base,
             a_off0,
-            A_KROW,
+            A_GROW,
             mn_oob,
             A_ROW_B,
             tile_m,
@@ -499,7 +509,7 @@ def launch_gemm_a8w4_tdm(
             PACK_TK * 16,
             tile_n // 16,
             on_i32=False,
-            lds_off=STAGE_A,
+            lds_off=B_OFF,
             lds_row=B_LDS_ROW,
             k_adv=PACK_TK * 16,
             wv=waves[1],
@@ -560,7 +570,7 @@ def launch_gemm_a8w4_tdm(
 
         def issue(s, kt, my_jobs=None):
             pa = fx.recast_iter(p8_shared, buf_ptr(s))
-            so4 = s * (PITCH // 4)
+            so4 = (s * PITCH) // 4
 
             def emit(j):
                 base = base_i32 if j.on_i32 else pa
@@ -582,10 +592,8 @@ def launch_gemm_a8w4_tdm(
                                 emit(j)
 
         def dispatch_wave_job(fn):
-            """Run ``fn`` with the current wave's jobs."""
-            for g in range_constexpr(len(job_waves)):
-                if owns(job_waves[g]):
-                    fn([j for j in jobs if j.waves == job_waves[g]])
+            """Run ``fn`` once. ``issue`` still filters jobs by wave owner."""
+            fn(None)
 
         wmb = wave_m * warp_tile_m
         wnb = wave_n * warp_tile_n
@@ -593,7 +601,7 @@ def launch_gemm_a8w4_tdm(
         # Split each region's offset into a lane-varying base, which keepalive
         # can pin, and a compile-time part that folds into ds_load's offset:.
         lds_a_lane_off = (wmb + lane16) * A_LDS_ROW + kgrp * 16
-        lds_b_lane_off = STAGE_A + (wnb // 16) * B_LDS_ROW + kgrp * 256 + lane16 * 16
+        lds_b_lane_off = B_OFF + (wnb // 16) * B_LDS_ROW + kgrp * 256 + lane16 * 16
         assert wmma_m_rep == 1 or wmma_m_rep % 2 == 0
         sa_lane = lane16 if wmma_m_rep == 1 else lane
         SA_ROWS_PER_LOAD = 16 if wmma_m_rep == 1 else 32
@@ -628,7 +636,7 @@ def launch_gemm_a8w4_tdm(
                 lds_sb_base(buf),
             )
 
-        def load_a(buf, wm, ksl):
+        def load_a(buf, wm, ksl, a_kt):
             base = lds_a_base(buf)
             off = wm * 16 * A_LDS_ROW + ksl * A_KSTEP
             if const_expr(a_is_fp4):
@@ -658,7 +666,7 @@ def launch_gemm_a8w4_tdm(
                 return load_half(wn * 2).shuffle(load_half(wn * 2 + 1), list(range(16)))
             return load_half(wn)
 
-        def load_sa(buf, sm, ksl):
+        def load_sa(buf, sm, ksl, a_kt):
             off = (
                 (sm * SA_ROWS_PER_LOAD * SA_KDW + ksl) * 4
                 if row_major_ascale
@@ -776,16 +784,18 @@ def launch_gemm_a8w4_tdm(
         # cannot carry a Python value, and a prefetch needs a slot no WMMA reads.
         rmem_slots = [make_rmem_slot() for _ in range_constexpr(2)]
 
-        def load_state(slot, buf, ksl):
+        def load_state(slot, buf, ksl, a_kt):
             """Load one k128 of ``buf``'s A/B/scales into ``slot``."""
             sb_v = [load_sb(buf, sn, ksl) for sn in range_constexpr(sb_pairs)]
-            sa_v = [load_sa(buf, sm, ksl) for sm in range_constexpr(sa_pairs)]
+            sa_v = [
+                load_sa(buf, sm, ksl, a_kt) for sm in range_constexpr(sa_pairs)
+            ]
             slot.sb.store(Vec.from_elements(sb_v + sb_v[: SB_WIDTH - sb_pairs]))
             slot.sa.store(Vec.from_elements(sa_v + sa_v[: SA_WIDTH - sa_pairs]))
             for wn in range_constexpr(wmma_n_rep):
                 slot.b[wn].store(load_b(buf, wn, ksl))
             for wm in range_constexpr(wmma_m_rep):
-                slot.a[wm].store(load_a(buf, wm, ksl))
+                slot.a[wm].store(load_a(buf, wm, ksl, a_kt))
 
         def k_step(
             cur_rmem,
@@ -811,6 +821,7 @@ def launch_gemm_a8w4_tdm(
 
         def compute_ktile(
             buf,
+            current_kt,
             prefetch_kt,
             rmem_preloaded=False,
             next_stage_buf=None,
@@ -875,7 +886,7 @@ def launch_gemm_a8w4_tdm(
                     rocdl.sched_mfma(tail_mfma)
 
             if const_expr(not rmem_preloaded):
-                load_state(rmem_slots[0], buf, 0)
+                load_state(rmem_slots[0], buf, 0, current_kt)
             for ksl in range_constexpr(KWS):
                 is_last = ksl + 1 == KWS
                 carries = is_last and next_stage_buf is not None
@@ -883,10 +894,14 @@ def launch_gemm_a8w4_tdm(
                 # or -- on the last one -- the next tile's subtile 0, into slot 0.
                 if const_expr(not is_last):
                     next_rmem = rmem_slots[(ksl + 1) % 2]
-                    load_nxt_fn = lambda n=next_rmem, k=ksl + 1: load_state(n, buf, k)
+                    load_nxt_fn = lambda n=next_rmem, k=ksl + 1: load_state(
+                        n, buf, k, current_kt
+                    )
                 elif const_expr(carries):
                     next_rmem = rmem_slots[0]
-                    load_nxt_fn = lambda n=next_rmem: load_state(n, next_stage_buf, 0)
+                    load_nxt_fn = lambda n=next_rmem: load_state(
+                        n, next_stage_buf, 0, current_kt + 1
+                    )
                 else:
                     next_rmem, load_nxt_fn = None, None
                 k_step(
@@ -948,7 +963,7 @@ def launch_gemm_a8w4_tdm(
                     # outside ``dispatch_wave_job``, since every wave runs this once.
                     tdm_ops.tensor_wait(TDM_PER * (num_buffers - 1))
                     workgroup_barrier()
-                    load_state(rmem_slots[0], ptr_to_idx(buf_ptr(0)), 0)
+                    load_state(rmem_slots[0], ptr_to_idx(buf_ptr(0)), 0, 0)
 
                 def steady_post(my_jobs):
                     for kt in range(n_steady):
@@ -963,6 +978,7 @@ def launch_gemm_a8w4_tdm(
                         )
                         compute_ktile(
                             buf,
+                            kt,
                             None,
                             next_stage_on,
                             next_stage_buf,
@@ -994,7 +1010,7 @@ def launch_gemm_a8w4_tdm(
                         if const_expr(has_next)
                         else None
                     )
-                    compute_ktile(buf, None, next_stage_on, next_stage_buf)
+                    compute_ktile(buf, kt, None, next_stage_on, next_stage_buf)
             else:
                 # Mid-compute prefetch: better for prefill. PRE is both the tiles
                 # resident before the loop and the issue lead; the carry adds one.
@@ -1004,7 +1020,7 @@ def launch_gemm_a8w4_tdm(
                 n_steady = K_TILES - PRE
                 if const_expr(next_stage_on):
                     pipeline_fence(outstanding=TDM_PER * (PRE - 1))
-                    load_state(rmem_slots[0], ptr_to_idx(buf_ptr(0)), 0)
+                    load_state(rmem_slots[0], ptr_to_idx(buf_ptr(0)), 0, 0)
 
                 # With the carry, a tile's only fence is at its last k128 (see
                 # k_step); buffer 0 and the first drain tile use the prologue's.
@@ -1028,6 +1044,7 @@ def launch_gemm_a8w4_tdm(
                         )
                         compute_ktile(
                             buf,
+                            kt,
                             kt + PRE if const_expr(next_stage_on) else None,
                             next_stage_on,
                             next_stage_buf,
@@ -1063,6 +1080,7 @@ def launch_gemm_a8w4_tdm(
                     )
                     compute_ktile(
                         buf,
+                        kt,
                         None,
                         next_stage_on,
                         next_stage_buf,
