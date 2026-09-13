@@ -61,12 +61,14 @@ def _store_factory(
         tile_m = n_tiles_a * 16
         lane = fx.thread_idx.x % 64
         wave = fx.thread_idx.x // 64
+        num_waves = fx.known_block_size()[0] // fx.num_warp_threads()
+        quant_waves = 32 // tile_n if fuse_quant else 1
         # SharedAllocator fields are independent LDS globals, not one contiguous array.
         base = fx.Int32(fx.ptrtoint(scratch[0]))
-        # Each N wave produces 16 activation columns; adjacent waves share a
-        # 32-column quantization group and one LDS field.
-        owner = wave & -2 if fuse_quant else wave
-        for i in range_constexpr(1, 8):
+        # Four-wave tiles produce 32 columns per wave; eight-wave tiles share
+        # each quantization group across two adjacent N waves.
+        owner = wave & -quant_waves
+        for i in range_constexpr(1, num_waves):
             base = (owner == i).select(fx.Int32(fx.ptrtoint(scratch[i])), base)
         ptr = fx.recast_iter(fx.BFloat16, fx.inttoptr(scratch[0].type, base))
         kp = (cols + 255) // 256 * 256
@@ -81,7 +83,7 @@ def _store_factory(
         atom = fx.make_copy_atom(
             fx.rocdl.BufferCopy128b(), fx.Int8 if fuse_quant else fx.BFloat16
         )
-        scratch_n = tile_n * 2 if fuse_quant else tile_n
+        scratch_n = tile_n * quant_waves
 
         def scratch_at(row, col, width):
             offset = row * scratch_n + (col ^ ((row % (scratch_n // 8)) * 8))
@@ -98,9 +100,9 @@ def _store_factory(
 
         def quant_store(base_row, base_col):
             # Two lanes own one group, each loading and storing 16 values.
-            row = lane // 2 + wave % 2 * 32
+            row = lane // 2 + wave % quant_waves * 32
             col = lane % 2 * 16
-            group_col = base_col - wave % 2 * 16
+            group_col = base_col - wave % quant_waves * tile_n
             values = [
                 scratch_at(row, col + chunk * 8, 8).load()
                 for chunk in range_constexpr(2)
@@ -171,7 +173,7 @@ def _store_factory(
                                     )
                                 else:
                                     v = gate / (1.0 + fmath.exp(-gate)) * linear
-                            scratch_col = col + wave % 2 * tile_n if fuse_quant else col
+                            scratch_col = col + wave % quant_waves * tile_n
                             scratch_at(row + i, scratch_col, 1).store(
                                 Vec.filled(1, v.to(fx.BFloat16), fx.BFloat16)
                             )

@@ -74,7 +74,7 @@ def reference(x, w1, w2, ids, weights, limit, b_dtype="fp8"):
         for tile in [(256, 256), (128, 512)]
         for b_dtype, limit in [("fp8", 5.0), ("fp8", 0.0), ("fp4", None)]
     ]
-    + [((128, 256), 4, "fp4", None, False)]
+    + [((128, 256), 4, "fp4", limit, False) for limit in (None, 0.0, 0.125)]
     + [
         ((256, 256), 8, "fp8", limit, repeats)
         for repeats in (2, 4)

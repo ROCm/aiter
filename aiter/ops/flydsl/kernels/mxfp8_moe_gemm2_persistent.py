@@ -209,7 +209,7 @@ def compile_mxfp8_moe_gemm_persistent(
             def process_m_tile(m_repeat, previous_expert):
                 bm = block_m * m_tiles + m_repeat
                 expert = fx.Int32(rocdl.readfirstlane(fx.Int32.ir_type, expert_ids[bm]))
-                b_row = block_n * BLOCK_N + fx.Int32(expert) * c_n
+                b_row = block_n * BLOCK_N + expert * c_n
                 load_resident_b(
                     expert != previous_expert, b_g2s, b_tiles0, b_tiles1, b_row, b_k
                 )

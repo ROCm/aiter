@@ -7,8 +7,7 @@
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl._mlir.dialects import llvm as _llvm
-from flydsl._mlir.dialects.fly_rocdl import TargetAddressSpace
-from flydsl.expr import arith, const_expr, range_constexpr, rocdl
+from flydsl.expr import const_expr, range_constexpr, rocdl
 from flydsl.expr.typing import Vector as Vec
 
 from aiter.ops.flydsl.kernels.mfma_preshuffle_pipeline import split_row_major_2d
@@ -26,7 +25,7 @@ def ceildiv(numer, denom):
 
 
 def _min(a, b):
-    return arith.select(a < b, a, b)
+    return (a < b).select(a, b)
 
 
 def make_fp8_buffer_tensor(arg_i8, fp8_ir_t):
@@ -36,13 +35,8 @@ def make_fp8_buffer_tensor(arg_i8, fp8_ir_t):
     # extent and no longer bakes the first-call's shape into IR.
     t_i8 = fx.rocdl.make_buffer_tensor(arg_i8, max_size=False)
     iter_i8 = fx.get_iter(t_i8)
-    f8_buf_ptr_ty = fx.PointerType.get(
-        elem_ty=fp8_ir_t,
-        address_space=TargetAddressSpace.BufferDesc,
-        alignment=fx.PointerType(iter_i8.type).alignment,
-    )
-    iter_f8 = fx.recast_iter(f8_buf_ptr_ty, iter_i8)
-    return fx.Tensor(fx.make_view(iter_f8, fx.get_layout(t_i8)))
+    iter_f8 = fx.recast_iter(fx.Numeric.from_ir_type(fp8_ir_t), iter_i8)
+    return fx.make_view(iter_f8, fx.get_layout(t_i8))
 
 
 def swizzle_128(row, col):
@@ -256,7 +250,7 @@ class StoreC:
                         fx.BFloat16
                     )
                     c_index = (row + i) * self.c_cols + col
-                    self._store_bf16(scaled, arith.select(col_valid, c_index, oob))
+                    self._store_bf16(scaled, col_valid.select(c_index, oob))
 
 
 class Mfma16x16x128:
