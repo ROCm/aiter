@@ -130,6 +130,8 @@ while [ "$#" -gt 0 ]; do
   esac
 done
 
+PERF_CONTROL_COLUMN=$(python3 -c 'import sys; print(sys.argv[1].strip())' "$PERF_CONTROL_COLUMN")
+
 if [ -z "$REPO_WT" ]; then
   echo "--repo is required" >&2
   exit 2
@@ -525,6 +527,26 @@ else
 fi
 
 # ---------- stage 3: repo-aware runtime compatibility ----------
+# Runtime probes import the candidate too. Construct the same allowlisted environment used
+# by correctness/perf BEFORE the first import, including the build-identity subprocesses.
+TARGET_BASE_ENV=()
+mapfile -d '' -t TARGET_BASE_ENV < <(python3 "$TARGET_TOOL" env)
+jset_json "isolation.target_environment" \
+  "$(python3 "$TARGET_TOOL" env-summary "${TARGET_BASE_ENV[@]}")"
+mkdir -p "$WORK/head/home" "$WORK/head/xdg-cache" "$WORK/head/flydsl-cache" \
+  "$WORK/head/triton-cache" "$WORK/head/torch-extensions" "$WORK/head/aiter-jit"
+RUNTIME_ENV=(
+  "PYTHONDONTWRITEBYTECODE=1"
+  "HOME=$WORK/head/home"
+  "XDG_CACHE_HOME=$WORK/head/xdg-cache"
+  "FLYDSL_CACHE_DIR=$WORK/head/flydsl-cache"
+  "FLYDSL_RUNTIME_CACHE_DIR=$WORK/head/flydsl-cache"
+  "TRITON_CACHE_DIR=$WORK/head/triton-cache"
+  "TORCH_EXTENSIONS_DIR=$WORK/head/torch-extensions"
+  "AITER_TRITON_ONLY=1"
+  "AITER_JIT_DIR=$WORK/head/aiter-jit"
+)
+[ -n "$PICK" ] && RUNTIME_ENV+=("HIP_VISIBLE_DEVICES=$PICK")
 RUNTIME_OK=0
 RUNTIME_SOURCE_CHANGED=0
 RC_OUT=""
@@ -560,8 +582,7 @@ case "$REPO_KIND" in
     PROBE_PATH="$REPO_WT${PYLIB:+:$PYLIB}"
     RC_OUT=$(
       cd "$REPO_WT" \
-        && AITER_TRITON_ONLY=1 AITER_JIT_DIR="$WORK/head/aiter-jit" \
-          PYTHONDONTWRITEBYTECODE=1 \
+        && env -i "${TARGET_BASE_ENV[@]}" "${RUNTIME_ENV[@]}" \
           PYTHONPATH="$PROBE_PATH" timeout 300 \
           "$TARGET_PYTHON" - "$REPO_WT" 2>&1 <<'PY'
 import importlib
@@ -595,7 +616,8 @@ PY
     if [ "$RC_OUT" = "" ]; then
       RC_OUT=$(
         cd "$REPO_WT" \
-          && PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$PROBE_PATH" timeout 300 \
+          && env -i "${TARGET_BASE_ENV[@]}" "${RUNTIME_ENV[@]}" \
+            PYTHONPATH="$PROBE_PATH" timeout 300 \
             "$TARGET_PYTHON" - "$REPO_WT/python/flydsl/__init__.py" \
               "$EXPECTED_FLYDSL_ROOT" 2>&1 <<'PY'
 import importlib
@@ -644,8 +666,7 @@ if [ "$RC" -eq 0 ]; then
     [ -n "$PYLIB" ] && DEPENDENCY_ARGS=(--dependency-root "$PYLIB")
     (
       cd "$REPO_WT" \
-        && AITER_TRITON_ONLY=1 AITER_JIT_DIR="$WORK/head/aiter-jit" \
-          PYTHONDONTWRITEBYTECODE=1 \
+        && env -i "${TARGET_BASE_ENV[@]}" "${RUNTIME_ENV[@]}" \
           PYTHONPATH="$PROBE_PATH" timeout 300 \
           "$TARGET_PYTHON" "$SCRIPT_DIR/validate_evidence.py" runtime aiter "$REPO_WT" \
           "${DEPENDENCY_ARGS[@]}" --output "$IDENTITY_FILE"
@@ -654,7 +675,7 @@ if [ "$RC" -eq 0 ]; then
   else
     (
       cd "$REPO_WT" \
-        && PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$PROBE_PATH" \
+        && env -i "${TARGET_BASE_ENV[@]}" "${RUNTIME_ENV[@]}" PYTHONPATH="$PROBE_PATH" \
           timeout 300 "$TARGET_PYTHON" "$SCRIPT_DIR/validate_evidence.py" runtime flydsl \
           "$EXPECTED_FLYDSL_ROOT" --output "$IDENTITY_FILE"
     ) >"$WORK/runtime-identity.log" 2>&1
@@ -706,6 +727,16 @@ base_result = subprocess.run(
 base = base_result.stdout if base_result.returncode == 0 else ""
 changed = subprocess.run(
     ["git", "-C", worktree, "diff", "--name-only", "HEAD"],
+    check=True,
+    capture_output=True,
+    text=True,
+).stdout.splitlines()
+# `git apply` introduces added files as UNTRACKED, and `git diff HEAD` never lists
+# those. Without this a PR whose whole point is a new kernel reads as touching no
+# kernel code, and a tolerance widened alongside it is reported under the weaker
+# finding. --exclude-standard keeps .gitignore'd build output out.
+changed += subprocess.run(
+    ["git", "-C", worktree, "ls-files", "--others", "--exclude-standard"],
     check=True,
     capture_output=True,
     text=True,
@@ -1196,17 +1227,6 @@ target_stats() {
 head_receipt() {
   printf '%s\n' "$WORK/head/execution-receipt-head-repo.json"
 }
-
-# ---------- credential-free execution isolation ----------
-#
-# The allowlist, the secret-shaped denylist, and the reasons for both live in target_run.py.
-# What stays here is only the handoff: the pairs are read once, and every launch below runs
-# under `env -i` with exactly this set and nothing inherited.
-TARGET_BASE_ENV=()
-mapfile -d '' -t TARGET_BASE_ENV < <(python3 "$TARGET_TOOL" env)
-jset_json "isolation.target_environment" \
-  "$(python3 "$TARGET_TOOL" env-summary "${TARGET_BASE_ENV[@]}")"
-
 
 # ---------- does this target actually need a GPU? ----------
 # Asked of the target, not inferred from the diff. A diff heuristic cannot settle this:

@@ -332,7 +332,7 @@
         },
         "shape_vars": {
           "type": "string",
-          "description": "Comma-separated local variable names captured from each observed route call."
+          "description": "Optional comma-separated local variable names captured from each observed route call. Empty means route-only evidence."
         },
         "runner": {
           "type": "string",
@@ -864,9 +864,6 @@
               "expected_route": {
                 "minLength": 1
               },
-              "shape_vars": {
-                "minLength": 1
-              },
               "runner": {
                 "enum": [
                   "pytest",
@@ -951,7 +948,6 @@
                   },
                   "executed_shapes": {
                     "type": "array",
-                    "minItems": 1,
                     "items": {
                       "type": "string",
                       "minLength": 1

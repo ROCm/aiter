@@ -20,6 +20,22 @@ VALIDATOR = SKILL_DIR / "validate_pr.sh"
 SCANNER = SKILL_DIR / "scan_index_width.py"
 SHIPPED_PICKER = SKILL_DIR / "pick-idle-gpu.py"
 REPORT_SCHEMA = json.loads((SKILL_DIR / "report_schema.json").read_text())
+REVIEW_DIR = SKILL_DIR.parent / "review-pr"
+
+
+def review_skill_text():
+    """The review-pr skill's text: SKILL.md AND fetch.sh.
+
+    Step 1 moved out of the document into a program, so a contract test that reads only
+    SKILL.md now sees the prose and none of the implementation it is asserting about. The
+    seam between the two skills is the code, wherever it lives."""
+    return (
+        (REVIEW_DIR / "SKILL.md").read_text()
+        + "\n"
+        + (REVIEW_DIR / "fetch.sh").read_text()
+    )
+
+
 REQUIRED_STAGES = {
     "merge_sim",
     "gpu_claim",
@@ -235,6 +251,7 @@ class ValidatorFixture:
         # The file to TIME, when it is not the file to run. Defaults to None so every existing
         # test keeps exercising the fallback, which is still the common case.
         perf_target=None,
+        extra_env=None,
     ):
         report = self.root / f"{patch.stem}-report.json"
         # `cwd` exists for one reason: the validator has to accept RELATIVE --patch/--out from
@@ -285,6 +302,7 @@ class ValidatorFixture:
             environment["PYLIB"] = str(pylib)
         if path_prefix:
             environment["PATH"] = f"{path_prefix}:{environment['PATH']}"
+        environment.update(extra_env or {})
         result = run(command, env=environment, cwd=cwd, check=False)
         if not report.exists():
             raise AssertionError(
@@ -403,6 +421,55 @@ class ValidatorFixture:
         return mutate
 
 
+class ConcurrentRunGuard(unittest.TestCase):
+    """Two of these suites at once make a third of the run look broken.
+
+    The validator claims a GPU with `flock -n` on /tmp/gpu-N.lock. A second validator finds
+    every candidate locked, degrades to NO_GPU, skips the runtime stages, and returns
+    INCONCLUSIVE -- correctly, and it says so in the report: "GPU claim raced with another
+    process". The tests that assert PASS then fail with `'PASS' != 'INCONCLUSIVE'`, which
+    names the symptom and not the cause, and the cause is off-screen unless the whole
+    report is read.
+
+    That cost five sessions of calling this suite flaky and nearly cost it a round of
+    "isolate the timing-sensitive tests", which would have deleted a true signal. Runs
+    alone: 89 passed, six times over. Two runs overlapping: 5 and 6 failures. So the suite
+    says up front when the machine is not its own.
+    """
+
+    def test_no_other_validator_holds_a_gpu_lock(self):
+        """Checks the contended resource, not a process name.
+
+        Written first as `pgrep -af validate_pr.sh`, which matched the shell command
+        running the grep -- the string is in its own argv. The lock is the thing that
+        actually decides the outcome, so ask the lock.
+        """
+        import fcntl
+        import glob
+
+        held = []
+        for path in sorted(glob.glob("/tmp/gpu-*.lock")):
+            try:
+                fd = os.open(path, os.O_RDWR)
+            except OSError:
+                continue
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                fcntl.flock(fd, fcntl.LOCK_UN)
+            except OSError:
+                held.append(path)
+            finally:
+                os.close(fd)
+        self.assertEqual(
+            [],
+            held,
+            "another validator holds %s. It will keep holding the GPU while this suite "
+            "runs, so the runtime stages degrade to NO_GPU and every test expecting PASS "
+            "reports INCONCLUSIVE. These are not regressions -- wait for the other run."
+            % ", ".join(held),
+        )
+
+
 class ValidateKernelPrTests(unittest.TestCase):
     def setUp(self):
         self.fixture = ValidatorFixture()
@@ -454,6 +521,8 @@ class ValidateKernelPrTests(unittest.TestCase):
             ),
             report["findings"],
         )
+        accepted = self.run_review_gate(report, patch)
+        self.assertEqual(0, accepted.returncode, accepted.stdout + accepted.stderr)
 
     def test_the_no_test_blocker_still_names_the_head_it_is_about(self):
         # A report review-pr cannot bind to the PR head is not evidence about that PR, so the
@@ -1098,19 +1167,29 @@ class ValidateKernelPrTests(unittest.TestCase):
         self.assertNotEqual("NEEDS_WORK", report["verdict"])
         self.assertNotEqual(1, result.returncode)
 
-    def run_review_gate(self, report, patch):
+    def run_review_gate(self, report, patch, head_override=None):
         """Feed a report through review-pr's real identity gate.
 
         The gate is the seam between the two skills, and it is the only place that can
         catch a report whose perf fields do not hang together. Extracting the block from
         SKILL.md rather than restating it means the two cannot drift apart silently.
         """
-        skill = (SKILL_DIR.parent / "review-pr" / "SKILL.md").read_text()
-        blocks = re.findall(r"<<'PY'\n(.*?)\nPY\n", skill, re.DOTALL)
+        skill = review_skill_text()
+        blocks = [
+            b
+            for b in re.findall(r"<<'PY'\n(.*?)\nPY\n", skill, re.DOTALL)
+            if "expected_verdict" in b
+        ]
+        # Selected by what the block IS, not by its position. Indexing into the heredocs
+        # made this test depend on how many unrelated Python blocks happened to precede
+        # the gate, which is not a property anyone maintains.
+        self.assertEqual(1, len(blocks), "expected exactly one identity-gate PY block")
         gate = self.fixture.root / "gate.py"
-        gate.write_text(blocks[1])
+        gate.write_text(blocks[0])
         meta = self.fixture.root / "gate-meta.json"
-        meta.write_text(json.dumps({"headRefOid": report["repo"]["head"]}))
+        meta.write_text(
+            json.dumps({"headRefOid": head_override or report["repo"]["head"]})
+        )
         base = self.fixture.root / "gate-base.txt"
         base.write_text(report["repo"]["base"] + "\n")
         target = self.fixture.root / "gate-report.json"
@@ -1128,6 +1207,30 @@ class ValidateKernelPrTests(unittest.TestCase):
             ],
             check=False,
         )
+
+    def test_review_gate_rejects_a_report_for_another_head(self):
+        """The gate's stated purpose: "reports that do not name this exact head are
+        rejected". Every existing test fed it `headRefOid` copied from the report under
+        test, so the comparison was never exercised -- replacing it with `if False` left
+        the suite green. A stale report from the previous push is the exact artifact this
+        is supposed to stop, and it is worse than no report at all.
+        """
+        patch = self.fixture.make_patch(
+            self.fixture.rewrite_bench(self.bench_body("1.25")), "stale-head.patch"
+        )
+        _, report = self.fixture.validate(
+            patch,
+            tests=self.fixture.BENCH_TARGET,
+            expected_route="test_bench:run_kernel",
+        )
+        other_head = "0" * 40
+        self.assertNotEqual(other_head, report["repo"]["head"])
+        result = self.run_review_gate(report, patch, head_override=other_head)
+        self.assertNotEqual(
+            0, result.returncode, "gate accepted a report naming a different head"
+        )
+        combined = (result.stdout or "") + (result.stderr or "")
+        self.assertIn("stale or for another checkout", combined)
 
     def test_perf_report_survives_the_review_identity_gate(self):
         patch = self.fixture.make_patch(
@@ -1854,6 +1957,48 @@ class ValidateKernelPrTests(unittest.TestCase):
         self.assertEqual(self.fixture.REPO_BENCH, perf["target"])
         self.assertEqual(0, result.returncode)
 
+    def test_a_correctness_bench_is_timed_alongside_the_other_discovery_path(self):
+        self.fixture.add_repo_bench()
+        for target in (self.fixture.REPO_BENCH, self.NEW_BENCH_TARGET):
+            with self.subTest(target=target):
+                patch = self._both_paths_patch("correctness-bench.patch", scale="2.0")
+                result, report = self.fixture.validate(
+                    patch,
+                    tests=target,
+                    runner="script",
+                    expected_route="__main__:main",
+                    shape_vars="dim",
+                    perf_control_column="reference us",
+                )
+                perf = report["stages"]["perf"]
+                self.assertEqual(
+                    [self.fixture.REPO_BENCH, self.NEW_BENCH_TARGET],
+                    [item["target"] for item in perf["measurements"]],
+                )
+                measured = next(
+                    item for item in perf["measurements"] if item["target"] == target
+                )
+                self.assertEqual("same-as-correctness-target", measured["target_basis"])
+                self.assertEqual(
+                    "pass", report["stages"]["correctness_repo_tests"]["status"]
+                )
+                self.assertEqual(
+                    "pass", report["stages"]["execution_receipt"]["status"]
+                )
+                self.assertEqual("fail", perf["status"])
+                self.assertEqual(0.5, perf["median_ratio"])
+                self.assertEqual("NEEDS_WORK", report["verdict"])
+                self.assertEqual(1, result.returncode)
+
+    def test_a_blank_control_does_not_authorize_a_transplanted_baseline(self):
+        self.fixture.add_repo_bench()
+        patch = self._both_paths_patch("blank-control.patch", scale="1.0")
+        _, report = self.fixture.validate(patch, perf_control_column=" \t ")
+        shipped = report["stages"]["perf"]["measurements"][1]
+        self.assertEqual("skip", shipped["status"])
+        self.assertIn("--perf-control-column is required", shipped["note"])
+        self.assertNotIn("median_ratio", shipped)
+
     def perf_findings(self, report, severity):
         return [
             item["detail"]
@@ -2167,6 +2312,55 @@ class ValidateKernelPrTests(unittest.TestCase):
             "a killed run left a previous run's report at --out: "
             + (report_path.read_text() if report_path.exists() else ""),
         )
+
+    def test_runtime_import_and_identity_share_the_isolated_environment(self):
+        for kind in ("aiter", "flydsl"):
+            with self.subTest(kind=kind):
+                if kind == "flydsl":
+                    self.fixture.convert_to_flydsl()
+                observations = self.fixture.root / f"{kind}-imports.jsonl"
+                module = (
+                    "aiter/__init__.py"
+                    if kind == "aiter"
+                    else "python/flydsl/__init__.py"
+                )
+
+                def mutate(repo):
+                    path = repo / module
+                    path.write_text(
+                        path.read_text()
+                        + "import json, os, sys\n"
+                        + f"with open({str(observations)!r}, 'a') as observed:\n"
+                        + "    observed.write(json.dumps({'program': sys.argv[0], "
+                        + "'token_visible': 'GITHUB_TOKEN' in os.environ, "
+                        + "'home': os.environ.get('HOME', ''), "
+                        + "'jit': os.environ.get('AITER_JIT_DIR', '')}) + '\\n')\n"
+                    )
+
+                patch = self.fixture.make_patch(mutate, f"{kind}-import-env.patch")
+                _, report = self.fixture.validate(
+                    patch,
+                    perf=False,
+                    extra_env={"GITHUB_TOKEN": "synthetic-test-canary"},
+                )
+                self.assertEqual("pass", report["stages"]["runtime_compat"]["status"])
+                records = [
+                    json.loads(line) for line in observations.read_text().splitlines()
+                ]
+                self.assertTrue(
+                    any(item["program"] == "-" for item in records), records
+                )
+                self.assertTrue(
+                    any(
+                        item["program"].endswith("validate_evidence.py")
+                        for item in records
+                    ),
+                    records,
+                )
+                for item in records:
+                    self.assertFalse(item["token_visible"], item)
+                    self.assertTrue(item["home"].endswith("/head/home"), item)
+                    self.assertTrue(item["jit"].endswith("/head/aiter-jit"), item)
 
     def test_the_target_cannot_read_the_reviewers_credentials(self):
         # `env VAR=... cmd` ADDS to the inherited environment. The target is arbitrary code
@@ -3036,9 +3230,171 @@ class SkillProseContractTests(unittest.TestCase):
                 self.assertIn(flag, accepted)
 
 
+class ReviewFetchIntegrationTests(unittest.TestCase):
+    """Exercise the real caller, validator and consumer with local Git/GitHub fixtures."""
+
+    def setUp(self):
+        self.fixture = ValidatorFixture()
+        self.addCleanup(self.fixture.close)
+
+    def fetch(self, runner, declared=True, route=True):
+        fixture = self.fixture
+        target = "op_tests/test_review.py"
+        (fixture.repo / "op_tests").mkdir()
+        if runner == "pytest":
+            source = (fixture.repo / "tests/test_sample.py").read_text()
+            expected_route = "test_review:run_kernel"
+        else:
+            # A script can be named test_*.py. Its caller must read it, not infer pytest.
+            source = (
+                "def run_kernel(dim):\n    assert dim > 0\n"
+                "if __name__ == '__main__':\n"
+                "    run_kernel(7)\n    print('case passed')\n"
+            )
+            expected_route = "__main__:run_kernel"
+        (fixture.repo / target).write_text(source)
+        run(["git", "config", "user.name", "Validator Test"], cwd=fixture.repo)
+        run(["git", "config", "user.email", "validator@example.com"], cwd=fixture.repo)
+        run(["git", "add", "."], cwd=fixture.repo)
+        run(["git", "commit", "-qm", "review target"], cwd=fixture.repo)
+        base = run(["git", "rev-parse", "HEAD"], cwd=fixture.repo).stdout.strip()
+
+        def mutate(repo):
+            ValidateKernelPrTests.harmless_change(repo)
+            (repo / target).write_text(source + "# candidate test comment\n")
+
+        patch = fixture.make_patch(mutate, "fetch.patch")
+        run(["git", "apply", str(patch)], cwd=fixture.repo)
+        run(["git", "add", "."], cwd=fixture.repo)
+        run(["git", "commit", "-qm", "candidate"], cwd=fixture.repo)
+        head = run(["git", "rev-parse", "HEAD"], cwd=fixture.repo).stdout.strip()
+        run(["git", "update-ref", "refs/pull/5308/head", head], cwd=fixture.repo)
+        run(["git", "reset", "--hard", "-q", base], cwd=fixture.repo)
+        # Every fetch stays inside this fixture; no GitHub network or credentials are used.
+        run(
+            [
+                "git",
+                "config",
+                f"url.{fixture.repo}.insteadOf",
+                "https://github.com/fixture/aiter",
+            ],
+            cwd=fixture.repo,
+        )
+        meta = fixture.root / "pr.json"
+        meta.write_text(
+            json.dumps(
+                {
+                    "number": 5308,
+                    "title": "validation handoff fixture",
+                    "body": "",
+                    "labels": [],
+                    "author": {"login": "fixture"},
+                    "comments": [],
+                    "reviews": [],
+                    "baseRefName": "main",
+                    "baseRefOid": base,
+                    "headRefOid": head,
+                    "files": [{"path": "aiter/kernel.py"}, {"path": target}],
+                }
+            )
+        )
+        write_executable(
+            fixture.tools / "gh",
+            (
+                f"#!{sys.executable}\nimport pathlib, sys\nargs = sys.argv[1:]\n"
+                f"if args[:2] == ['pr', 'view']: print(pathlib.Path({str(meta)!r}).read_text())\n"
+                f"elif args[:2] == ['pr', 'diff']: sys.stdout.write(pathlib.Path({str(patch)!r}).read_text())\n"
+                f"elif args[0] == 'api' and '/branches/' in args[1]: print({base!r})\n"
+                "elif args[0] == 'api' and args[1].endswith('/comments'): print('[]')\n"
+                "else: raise SystemExit('unexpected gh call: ' + repr(args))\n"
+            ),
+        )
+        (fixture.repo / ".claude").mkdir()
+        (fixture.repo / ".claude/skills").symlink_to(
+            SKILL_DIR.parent, target_is_directory=True
+        )
+        environment = {
+            key: value
+            for key, value in os.environ.items()
+            if not key.startswith("REVIEW_")
+        }
+        environment.update(
+            {
+                "PATH": f"{fixture.tools}:{environment['PATH']}",
+                "PICKER": str(fixture.picker),
+                "PYTHONPATH": str(fixture.fake_modules),
+                "TIMEOUT": "30",
+                "REVIEW_SHAPE_VARS": "",
+                # Obsolete caller settings must not leak removed flags into the invocation.
+                "REVIEW_GRID": "7,257,f32",
+                "REVIEW_SHAPE_ENV": "OLD_GRID",
+                "REVIEW_SHAPE_ARG": "--old-grid",
+                "REVIEW_SHAPE_ARGNAMES": "M,N,dtype_str",
+            }
+        )
+        if declared:
+            environment.update(
+                REVIEW_RUNNER=runner, REVIEW_RUNNER_REASON="read fixture target"
+            )
+        if route:
+            environment["REVIEW_EXPECTED_ROUTE"] = expected_route
+        result = run(
+            [str(REVIEW_DIR / "fetch.sh"), "5308", "fixture/aiter"],
+            cwd=fixture.repo,
+            env=environment,
+            check=False,
+        )
+        self.assertEqual(0, result.returncode, result.stdout + result.stderr)
+        match = re.search(r"^WORK=(.+)$", result.stdout, re.M)
+        self.assertIsNotNone(match, result.stdout)
+        work = Path(match.group(1))
+        self.assertEqual(Path("/tmp"), work.parent)
+        self.assertTrue(work.name.startswith("review-pr-"))
+        self.addCleanup(shutil.rmtree, work, ignore_errors=True)
+        self.assertEqual(
+            base, run(["git", "rev-parse", "HEAD"], cwd=fixture.repo).stdout.strip()
+        )
+        self.assertEqual("", run(["git", "diff"], cwd=fixture.repo).stdout)
+        return result, work
+
+    def assert_report(self, result, work, runner, verdict):
+        report = json.loads((work / "validation_report.json").read_text())
+        self.assertEqual(verdict, report["verdict"])
+        self.assertEqual(runner, report["test_selection"]["runner"])
+        self.assertEqual("declared-by-caller", report["test_selection"]["runner_basis"])
+        self.assertEqual(
+            "read fixture target", report["test_selection"]["runner_reason"]
+        )
+        self.assertEqual("", report["test_selection"]["shape_vars"])
+        self.assertNotIn("correctness_s1_grid", report["stages"])
+        self.assertIn("validation report accepted for head", result.stdout)
+        return report
+
+    def test_fetch_validates_and_consumes_a_declared_pytest_target(self):
+        result, work = self.fetch("pytest")
+        self.assert_report(result, work, "pytest", "PASS")
+
+    def test_fetch_validates_and_consumes_a_script_named_test(self):
+        result, work = self.fetch("script")
+        self.assert_report(result, work, "script", "PASS")
+
+    def test_fetch_explains_an_undeclared_runner_before_launching_the_validator(self):
+        result, work = self.fetch("script", declared=False)
+        self.assertFalse((work / "auto_validation_report.json").exists())
+        self.assertIn(
+            "runner not declared", (work / "auto_validation_outcome.txt").read_text()
+        )
+        self.assertIn("validation REQUIRED but not run", result.stdout)
+
+    def test_fetch_consumes_inconclusive_evidence_without_a_route(self):
+        result, work = self.fetch("script", route=False)
+        report = self.assert_report(result, work, "script", "INCONCLUSIVE")
+        self.assertEqual("skip", report["stages"]["execution_receipt"]["status"])
+
+
 class ReviewSkillContractTests(unittest.TestCase):
     def test_review_skill_is_advisory_and_has_no_dead_scanner_paths(self):
-        review_skill = (SKILL_DIR.parent / "review-pr" / "SKILL.md").read_text()
+        review_skill = review_skill_text()
 
         self.assertTrue((SKILL_DIR / "validate_evidence.py").is_file())
         self.assertTrue((SKILL_DIR / "validation_probe.py").is_file())
@@ -3054,21 +3410,36 @@ class ReviewSkillContractTests(unittest.TestCase):
         self.assertNotIn("review-flydsl-kernel/scan_", review_skill)
 
     def test_review_fetch_snippet_parses_as_bash(self):
-        review_skill = (SKILL_DIR.parent / "review-pr" / "SKILL.md").read_text()
-        match = re.search(
-            r"## Step 1 — Fetch.*?```bash\n(.*?)\n```",
-            review_skill,
-            re.DOTALL,
-        )
-        self.assertIsNotNone(match)
+        """Step 1 is fetch.sh now. Parsing the three-line call site proves nothing, so
+        parse the program, and check the document still reaches it."""
+        fetch = REVIEW_DIR / "fetch.sh"
+        self.assertTrue(fetch.is_file(), "review-pr/fetch.sh is missing")
         result = subprocess.run(
+            ["bash", "-n", str(fetch)], capture_output=True, text=True, check=False
+        )
+        self.assertEqual(0, result.returncode, result.stderr)
+
+        review_skill = (REVIEW_DIR / "SKILL.md").read_text()
+        match = re.search(
+            r"## Step 1 — Fetch.*?```bash\n(.*?)\n```", review_skill, re.DOTALL
+        )
+        self.assertIsNotNone(match, "Step 1 no longer carries a bash block")
+        # A comment mentioning fetch.sh satisfied `assertIn` on the whole block, so
+        # breaking the call site left this test green. Require an executable line.
+        invocations = [
+            ln
+            for ln in match.group(1).split("\n")
+            if "fetch.sh" in ln and not ln.lstrip().startswith("#")
+        ]
+        self.assertTrue(invocations, "Step 1 mentions fetch.sh but never calls it")
+        called = subprocess.run(
             ["bash", "-n"],
             input=match.group(1),
             capture_output=True,
             text=True,
             check=False,
         )
-        self.assertEqual(0, result.returncode, result.stderr)
+        self.assertEqual(0, called.returncode, called.stderr)
 
     def test_perf_harness_detection_agrees_across_both_skills(self):
         """review-pr and the validator must classify a target identically.
@@ -3078,7 +3449,7 @@ class ReviewSkillContractTests(unittest.TestCase):
         harness the validator declined to use -- or, worse, prints "no benchmark entry
         point" for a target the validator happily timed.
         """
-        review_skill = (SKILL_DIR.parent / "review-pr" / "SKILL.md").read_text()
+        review_skill = review_skill_text()
         validator = (SKILL_DIR / "scrape_perf.py").read_text()
 
         review_body = re.search(
@@ -4206,6 +4577,17 @@ class PerfDecisionTests(unittest.TestCase):
         decision = self.choose("A  op_tests/bench_new.py\n", "op_tests/bench_new.py")
         self.assertEqual("same-as-correctness-target", decision["basis"])
 
+    def test_overlapping_discoveries_time_each_file_once(self):
+        for correctness in ("op_tests/test_old.py", "op_tests/bench_new.py"):
+            with self.subTest(correctness=correctness):
+                decisions = self.choose_all(
+                    "M  op_tests/bench_new.py\n",
+                    correctness,
+                    repo_benches=["op_tests/bench_new.py"],
+                )["targets"]
+                self.assertEqual(1, len(decisions))
+                self.assertEqual("op_tests/bench_new.py", decisions[0]["target"])
+
     def test_several_shipped_benches_are_named_rather_than_chosen_between(self):
         # The safety argument for discovery, in one test. A target declined costs a
         # measurement; a target chosen WRONG spends a should-fix on an author whose code may
@@ -4353,6 +4735,50 @@ class PerfDecisionTests(unittest.TestCase):
         self.assertIn("reproduced within", stage["control_note"])
         self.assertEqual(["should-fix"], [f["severity"] for f in findings])
         self.assertIn("128: 1 -> 2", findings[0]["detail"])
+
+    def test_blank_or_ambiguous_controls_cannot_attribute_a_comparison(self):
+        for control in ("", " ", "\t\n", "us"):
+            with self.subTest(control=control):
+                result = {
+                    "status": "regression",
+                    "median_ratio": 0.5,
+                    "columns": {
+                        "kernel us": {"median_ratio": 1.0},
+                        "reference us": {"median_ratio": 0.5},
+                    },
+                }
+                stage, _ = self.perf.perf_stage(
+                    result,
+                    self.context(
+                        baseline_method="target-transplant", control_column=control
+                    ),
+                )
+                self.assertEqual("skip", stage["status"])
+                self.assertNotIn("median_ratio", stage)
+
+    def test_control_matching_prefers_an_exact_name_then_a_unique_substring(self):
+        for control in (" Reference Us ", "reference us", "REFERENCE"):
+            with self.subTest(control=control):
+                columns = {
+                    "kernel us": {"median_ratio": 0.8},
+                    "reference us": {"median_ratio": 1.0},
+                }
+                if control != "REFERENCE":
+                    columns["other reference us"] = {"median_ratio": 0.5}
+                result = {
+                    "status": "regression",
+                    "reason": "kernel regressed",
+                    "median_ratio": 0.8,
+                    "columns": columns,
+                }
+                stage, _ = self.perf.perf_stage(
+                    result,
+                    self.context(
+                        baseline_method="target-transplant", control_column=control
+                    ),
+                )
+                self.assertEqual("fail", stage["status"])
+                self.assertEqual(1.0, stage["control_ratio"])
 
     def test_only_a_measured_regression_can_fail_the_stage(self):
         # A timeout, a crash, a missing harness and a one-row table must all land on skip:

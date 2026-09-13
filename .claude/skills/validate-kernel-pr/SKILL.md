@@ -126,7 +126,7 @@ variable (next section).
 | `--tol-table` | tolerances recorded alongside the comparison |
 | `--perf-args` \| `--no-perf` | force the timing entry point, or skip timing entirely |
 | `--perf-target` | the file to **time**, when that is not the file to run. Defaults to `--target`'s file |
-| `--perf-control-column` | a column the patch does not touch; **required** before a transplanted baseline is believed |
+| `--perf-control-column` | a nonblank, unambiguous column the patch does not touch; **required** before a transplanted baseline is believed. Exact names win over unique substrings |
 | `--label` `--out` | run name and report path (default `./validation_report.json`) |
 
 Take the base from the **branch tip**, not from `baseRefOid`. `baseRefOid` is where the branch
@@ -460,9 +460,10 @@ long as perf had no target of its own, and `--perf-target` is how you say otherw
 kernel's unit test and its bench are routinely two different files. `perf.target` names what was
 timed on every status including `skip`, and `perf.target_basis` says whose choice it was:
 `declared-by-caller` when someone who read the diff named it, `discovered-pr-shipped` when the
-patch brought a bench along and the validator took it, `same-as-correctness-target` when it fell
-back. The fallback is an inference, not a reading of the change, and the report does not let the
-two look alike.
+patch brought a bench along and the validator took it, `same-as-correctness-target` when it uses
+the correctness target. That target still needs base/head timing if the other discovery path
+also resolves: a correctness run does not measure a regression. Each file is timed once, even
+when both discovery paths select it.
 
 **Two places a perf target comes from, and neither of them is a filename.** When no
 `--perf-target` is given, both are searched:
@@ -632,7 +633,8 @@ These are fields, not prose, so a report cannot overclaim by omission:
   an actual architecture-specific compile.
 - **`isolation`** — the real level. Where no container runtime is available it is
   `git-worktree + private caches`, and the report says `container: false`.
-- **`isolation.target_environment`** — the target is unmerged third-party code, so it runs in
+- **`isolation.target_environment`** — runtime imports (compatibility and build identity),
+  correctness and timing all execute candidate code, so they share
   a **constructed** environment (`env -i` plus a name/prefix allowlist, minus a
   secret-shaped denylist), not the reviewer's. `env VAR=… cmd` *adds* to the inherited
   environment; before this, every token in the calling shell was readable from `os.environ`

@@ -699,8 +699,8 @@ BENCH_HOME = "op_tests/op_benchmarks/"
 def _resolve(candidates, correctness_target, kind, advice):
     """One path's candidate list reduced to a target, or to the reason there is none.
 
-    Every outcome that is not "exactly one, and it is new information" resolves to None. That
-    asymmetry is the whole safety argument for discovery: a target declined costs a
+    Resolve the caller's own target, a unique candidate, or the repository tie-break. That
+    asymmetry is the safety argument for discovery: a target declined costs a
     measurement, while a target picked WRONG spends a should-fix finding on a PR author whose
     code may be innocent -- and nothing downstream can tell the two apart, because run_perf
     injects no probe and no evidence exists that the bench executed the changed line.
@@ -711,7 +711,10 @@ def _resolve(candidates, correctness_target, kind, advice):
     if not candidates:
         return None, f"nothing is {kind}"
     if correctness_target in candidates:
-        return None, f"the correctness target is itself {advice}"
+        return correctness_target, (
+            f"the correctness target is itself {advice}; its correctness run does not "
+            "replace a base/head timing comparison"
+        )
     if len(candidates) > 1:
         # One tie-break before declining, and only among candidates the import edge already
         # proved: if exactly one of them lives where the project keeps its benchmarks, that is
@@ -764,21 +767,29 @@ def choose_perf_targets(shipped, repo_benches, correctness_target):
     if repo_target is not None:
         targets.append(
             {
-                "basis": BASIS_REPO,
+                "basis": (
+                    BASIS_FALLBACK if repo_target == correctness_target else BASIS_REPO
+                ),
                 "target": repo_target,
-                "reason": (
-                    "the repository already owns exactly one benchmark importing what this "
+                "reason": repo_reason
+                or (
+                    "the repository benchmark imports what this "
                     "patch changed, and it is on both sides of the patch so the baseline "
                     "needs no transplant"
                 ),
             }
         )
-    if ship_target is not None:
+    if ship_target is not None and ship_target != repo_target:
         targets.append(
             {
-                "basis": BASIS_SHIPPED,
+                "basis": (
+                    BASIS_FALLBACK
+                    if ship_target == correctness_target
+                    else BASIS_SHIPPED
+                ),
                 "target": ship_target,
-                "reason": (
+                "reason": ship_reason
+                or (
                     "the patch ships exactly one file carrying a benchmark harness"
                     + (
                         ""
@@ -871,17 +882,23 @@ def attribute(result, baseline_method, control_column, control_tol):
     if baseline_method != "target-transplant":
         return "", None
     columns = result.get("columns") or {}
-    match = next(
-        (name for name in columns if control_column.lower() in name.lower()), None
-    )
-    if match is None:
-        note = (
-            f"the named control column {control_column!r} is not present in both logs, so "
-            "this cross-tree comparison cannot be attributed"
-        )
+    requested = control_column.strip().casefold()
+    exact = [name for name in columns if name.strip().casefold() == requested]
+    matches = exact or [name for name in columns if requested in name.casefold()]
+    if not requested or len(matches) != 1:
+        if not requested:
+            problem = "the control column name is blank"
+        elif not matches:
+            problem = f"the named control column {control_column!r} is not present in both logs"
+        else:
+            problem = (
+                f"the named control column {control_column!r} is ambiguous: {matches}"
+            )
+        note = f"{problem}, so this cross-tree comparison cannot be attributed"
         result["status"] = "insufficient"
         result["reason"] = note
         return note, None
+    match = matches[0]
     ratio = columns[match].get("median_ratio")
     tolerance = float(control_tol)
     if ratio is None or abs(ratio - 1.0) > tolerance:
