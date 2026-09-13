@@ -1049,8 +1049,9 @@ def compile_pa_decode_tile(
                         ls = ls + ls.shuffle_xor(sh, WAVE)
                     # PV output is [head-dim, query-row=lane16] after the operand
                     # swap, so correction/denominator are per-lane scalars (no sCorr).
-                    safe_prev = (m_prev > NEG_INF).select(m_prev, ZERO_F)
-                    corr_reg = fx.Float32(exp2_amdgcn_scalar(safe_prev - safe_max))
+                    # Empty history must contribute zero: exp2(-inf - safe_max).
+                    # Replacing m_prev with 0 can overflow for negative logits.
+                    corr_reg = fx.Float32(exp2_amdgcn_scalar(m_prev - safe_max))
                     if rgroup == 0:
                         _st_lw(lsum_base, lane16, warp, ls)
                     gpu.barrier()

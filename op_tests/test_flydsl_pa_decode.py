@@ -601,6 +601,82 @@ def test_zero_query_stays_finite(query_length, per_token):
     _assert_matches(output, reference)
 
 
+@pytest.mark.parametrize("query_dtype", [dtypes.bf16, dtypes.fp16])
+@pytest.mark.parametrize("per_token", [False, True])
+@pytest.mark.parametrize(
+    "query_group_size,query_length,block_size,context_length,num_partitions,trans_v,split_values",
+    [
+        pytest.param(32, 1, 64, 128, 1, False, False, id="decode"),
+        pytest.param(16, 3, 128, 257, 4, True, False, id="mtp-partitions"),
+        pytest.param(8, 3, 128, 257, 1, True, False, id="padded-m-tile"),
+        pytest.param(32, 1, 64, 512, 1, False, True, id="history"),
+    ],
+)
+def test_large_negative_logits_preserve_online_softmax(
+    query_group_size,
+    query_length,
+    block_size,
+    context_length,
+    num_partitions,
+    trans_v,
+    split_values,
+    per_token,
+    query_dtype,
+):
+    """Large negative logits must preserve both initial and accumulated state."""
+    _require_gpu()
+    head_dim = 128
+    blocks = (context_length + block_size - 1) // block_size
+    quant_dtype = _quant_dtype()
+    query = torch.full(
+        (query_length, query_group_size, head_dim), -3.0, dtype=query_dtype
+    )
+    key = torch.full((blocks, 1, block_size, head_dim), 3.0).to(quant_dtype)
+    value = torch.ones(blocks, 1, block_size, head_dim)
+    if split_values:
+        # With equal logits, both KV tiles contribute equally. Resetting the
+        # correction to zero on every tile would incorrectly return 1, not 0.5.
+        value[: KV_COMPUTE_BLOCK // block_size] = 0
+    value = value.to(quant_dtype)
+    key_cache = (
+        key.view(blocks, 1, block_size, head_dim // 16, 16)
+        .permute(0, 1, 3, 2, 4)
+        .contiguous()
+    )
+    if trans_v:
+        value_cache = (
+            value.view(blocks, 1, block_size // 16, 16, head_dim)
+            .permute(0, 1, 2, 4, 3)
+            .contiguous()
+        )
+    else:
+        value_cache = value.permute(0, 1, 3, 2).contiguous()
+    block_tables = torch.arange(blocks, dtype=dtypes.i32).reshape(1, blocks)
+    context_lengths = torch.full((1,), context_length, dtype=dtypes.i32)
+    scale = torch.ones(
+        (blocks, 1, block_size, 1) if per_token else (1,), dtype=dtypes.fp32
+    )
+    output = torch.full_like(query, float("nan"))
+    torch.ops.aiter.pa_decode_flydsl(
+        output,
+        query,
+        key_cache,
+        value_cache,
+        context_lengths,
+        block_tables,
+        head_dim**-0.5,
+        query_length,
+        num_partitions,
+        KV_COMPUTE_BLOCK,
+        quant_dtype,
+        None,
+        scale,
+        scale,
+    )
+    reference = torch.full_like(output, 0.5 if split_values else 1.0, dtype=dtypes.fp32)
+    _assert_matches(output.float(), reference, tolerance=0.02)
+
+
 @pytest.mark.parametrize("block_size", [16, 64, 128])
 @pytest.mark.parametrize("context_length", [1, 257, 1027])
 def test_block_table_padding_is_not_dereferenced(block_size, context_length):
