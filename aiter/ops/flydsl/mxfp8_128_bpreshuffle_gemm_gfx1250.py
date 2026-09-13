@@ -16,6 +16,8 @@ import re
 import torch
 from torch import Tensor
 
+from .kernels.splitk_epilogue_gfx1250 import FLAG_STRIDE_I32
+
 _launch_gemm_a8w8 = None
 _launch_gemm_a8w8_compute_bound = None
 _compile_splitk_reduce = None
@@ -34,23 +36,35 @@ SPLIT_K_FLAG_MAX_LEN = 65536  # i32 slots; each flag takes a whole 128 B line
 
 
 @functools.lru_cache(maxsize=128)
-def get_split_k_flags(stream, device):
-    """Per-(stream, device) split-K flag slots."""
+def _cached_split_k_flags(stream, device):
     return torch.zeros(SPLIT_K_FLAG_MAX_LEN, dtype=torch.int32, device=device)
 
 
+_CAPTURED_SPLIT_K_FLAGS = []
+
+
+def get_split_k_flags(stream, device, slots=SPLIT_K_FLAG_MAX_LEN):
+    """Split-K flag slots: one set per stream, or one per launch while capturing."""
+    if torch.cuda.is_current_stream_capturing():
+        flags = torch.zeros(slots, dtype=torch.int32, device=device)
+        _CAPTURED_SPLIT_K_FLAGS.append(flags)
+        return flags
+    return _cached_split_k_flags(stream, device)
+
+
 def splitk_epilogue_flags(
-    M, N, tile_m, tile_n, cluster_m, split_k, cu_num, compute_bound
+    M, N, tile_m, tile_n, cluster_m, split_k, cu_num, compute_bound, fuse_splitk=True
 ):
     """Return ``(fused_splitk, bounded_m)`` for one launch."""
     wgs = _splitk_grid_wgs(M, N, tile_m, tile_n, cluster_m, split_k)
     pow2 = split_k & (split_k - 1) == 0
     fused = (
-        compute_bound
+        fuse_splitk
+        and compute_bound
         and split_k > 1
         and pow2
         and tile_m % split_k == 0
-        and wgs * 32 <= SPLIT_K_FLAG_MAX_LEN
+        and wgs * FLAG_STRIDE_I32 <= SPLIT_K_FLAG_MAX_LEN
         and wgs <= cu_num
     )
     return fused, bool(M % tile_m)
@@ -157,6 +171,7 @@ def _run_mxfp8_128_preshuffle_gemm_a8_gfx1250(
     x_scale_transposed: bool = True,
     a_preshuffle: bool = False,
     persistent_n_tiles: int = 1,
+    fuse_splitk: bool = True,
 ) -> Tensor:
     """Run the gfx1250 WMMA mxfp8_128 bpreshuffle GEMM.
 
@@ -309,9 +324,15 @@ def _run_mxfp8_128_preshuffle_gemm_a8_gfx1250(
         split_k,
         torch.cuda.get_device_properties(XQ.device).multi_processor_count,
         compute_bound,
+        fuse_splitk,
     )
     flag = (
-        get_split_k_flags(torch_stream.cuda_stream, XQ.device)
+        get_split_k_flags(
+            torch_stream.cuda_stream,
+            XQ.device,
+            _splitk_grid_wgs(M, N, tile_m, tile_n, cluster_m, split_k)
+            * FLAG_STRIDE_I32,
+        )
         if _atomic_splitk
         else Out
     )
@@ -383,7 +404,8 @@ BASE_NAME_SUFFIX_RE = (
     r"cm(?P<cluster_m>\d+)_cn(?P<cluster_n>\d+)"
 )
 NAME_SUFFIX_RE = (
-    BASE_NAME_SUFFIX_RE + r"(?P<a_preshuffle>_apre)?"
+    BASE_NAME_SUFFIX_RE + r"(?P<no_fsk>_nofsk)?"
+    r"(?P<a_preshuffle>_apre)?"
     r"(?:_ps(?P<persistent_n_tiles>\d+))?$"
 )
 _KERNEL_NAME_RE = re.compile(rf"^{re.escape(WMMA_NAME_PREFIX)}_{NAME_SUFFIX_RE}")
@@ -399,9 +421,11 @@ def parse_wmma_kernel_name(name: str):
         return None
     groups = match.groupdict()
     a_preshuffle = groups.pop("a_preshuffle", None) is not None
+    no_fsk = groups.pop("no_fsk", None) is not None
     persistent_n_tiles = groups.pop("persistent_n_tiles", None)
     cfg = {key: int(value) for key, value in groups.items()}
     cfg["a_preshuffle"] = a_preshuffle
+    cfg["fuse_splitk"] = not no_fsk
     cfg["persistent_n_tiles"] = int(persistent_n_tiles) if persistent_n_tiles else 1
     return cfg
 
@@ -506,5 +530,6 @@ def run_gemm_a8w8_mxfp8_128_bpreshuffle_gfx1250(
         n_warp=cfg["n_warp"],
         x_scale_transposed=True,
         a_preshuffle=cfg["a_preshuffle"],
+        fuse_splitk=cfg["fuse_splitk"],
         persistent_n_tiles=cfg["persistent_n_tiles"],
     )

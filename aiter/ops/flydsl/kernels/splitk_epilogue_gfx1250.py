@@ -11,13 +11,12 @@ from flydsl._mlir.dialects import llvm as llvm_dialect
 from flydsl.expr import const_expr, range_constexpr, rocdl
 from flydsl.expr.typing import T, as_ir_value
 
-from .gemm_common_gfx1250 import workgroup_barrier
-
 # rows of C pushed per unrolled batch of LDS reads
 EPI_UNROLL = 16
 # pk_add_bf16 is 32-bit: 2 elems/thread puts lane L at base + L*4, so one
 # instruction covers exactly one fully-written 128 B line.
 EPI_VEC = 2
+SPIN_CLAIM = 4096  # polls before taking over a slot whose owner never arrived
 FLAG_STRIDE_I32 = 32
 
 
@@ -151,12 +150,12 @@ def emit_atomic_splitk_epilogue(
                     _emit_row(binop, gptr, vecs[u])
 
     @flyc.jit
-    def _publish():
+    def _publish(cc):
         if tid == fx.Int32(0):
             # monotonic suffices: GL2 already orders the device-scope atomics.
             llvm_dialect.StoreOp(
                 as_ir_value(fx.Int32(split_k - 1)),
-                _flag_ptr(split_idx),
+                _flag_ptr(cc),
                 alignment=4,
                 ordering=llvm_dialect.AtomicOrdering.monotonic,
                 syncscope="agent",
@@ -175,32 +174,104 @@ def emit_atomic_splitk_epilogue(
                 alignment=4,
             )
 
+    def _load_flag(cc):
+        return fx.Int32(
+            llvm_dialect.LoadOp(
+                T.i32,
+                _flag_ptr(cc),
+                alignment=4,
+                ordering=llvm_dialect.AtomicOrdering.monotonic,
+                syncscope="agent",
+            ).result
+        )
+
+    my_token = fx.Int32(0) - split_idx - fx.Int32(1)
+
     @flyc.jit
-    def _spin(cc):
-        def _load():
-            return fx.Int32(
-                llvm_dialect.LoadOp(
-                    T.i32,
-                    _flag_ptr(cc),
-                    alignment=4,
-                    ordering=llvm_dialect.AtomicOrdering.monotonic,
-                    syncscope="agent",
-                ).result
+    def _claim(cc):
+        if tid == fx.Int32(0):
+            llvm_dialect.AtomicCmpXchgOp(
+                _flag_ptr(cc),
+                as_ir_value(fx.Int32(0)),
+                as_ir_value(my_token),
+                llvm_dialect.AtomicOrdering.monotonic,
+                llvm_dialect.AtomicOrdering.monotonic,
+                syncscope="agent",
+                alignment=4,
             )
 
-        cur = _load()
-        while cur == fx.Int32(0):
-            cur = _load()
+    @flyc.jit
+    def _await(cc):
+        cur = _load_flag(cc)
+        n = fx.Int32(0)
+        while (cur < fx.Int32(1)) & (cur != my_token):
+            if n == fx.Int32(SPIN_CLAIM):
+                _claim(cc)
+            n = n + fx.Int32(1)
+            cur = _load_flag(cc)
+        return cur
 
-    _emit_rows(llvm_dialect.AtomicBinOp.xchg, split_idx * ch_rows, bounded_m)
-    workgroup_barrier(use_cluster=False)
-    _publish()
+    @functools.lru_cache(maxsize=4)
+    def _rolled_emitter(binop, bounded):
+        n_iter = ch_rows // rows_per_iter
+
+        @flyc.jit
+        def _f(row_base):
+            for i in range(fx.Int32(0), fx.Int32(n_iter), fx.Int32(1)):
+                row = row_base + r0 + i * fx.Int32(rows_per_iter)
+                vec = fx.Vector(
+                    fx.ptr_load(
+                        fx.add_offset(lds_c, row * c_lds_row + cx),
+                        result_type=T.vec(EPI_VEC, elem.ir_type),
+                    )
+                )
+                gptr = fx.add_offset(
+                    gc_base, c_off_rt + fx.Int64(row) * ldc64 + fx.Int64(cx)
+                )
+                if const_expr(bounded):
+                    if row < mn_oob:
+                        _emit_row(binop, gptr, vec)
+                else:
+                    _emit_row(binop, gptr, vec)
+
+        return _f
+
+    @functools.lru_cache(maxsize=2)
+    def _contrib_emitter(bounded, hot_xchg):
+        hot = (
+            llvm_dialect.AtomicBinOp.xchg if hot_xchg else llvm_dialect.AtomicBinOp.fadd
+        )
+        cold = (
+            llvm_dialect.AtomicBinOp.fadd if hot_xchg else llvm_dialect.AtomicBinOp.xchg
+        )
+
+        @flyc.jit
+        def _f(cur, row_base, cc):
+            if cur == my_token:
+                if const_expr(hot_xchg):
+                    _emit_rows(hot, row_base, bounded)
+                else:
+                    _rolled_emitter(cold, bounded)(row_base)
+                rocdl.s_wait_storecnt(0)
+                rocdl.s_barrier_signal(-1)
+                rocdl.s_barrier_wait(-1)
+                _publish(cc)
+            else:
+                if const_expr(hot_xchg):
+                    _rolled_emitter(cold, bounded)(row_base)
+                else:
+                    _emit_rows(hot, row_base, bounded)
+
+        return _f
+
+    def _contribute(cc, row_base, hot_xchg):
+        _contrib_emitter(bounded_m, hot_xchg)(_await(cc), row_base, cc)
+
+    _claim(split_idx)
+    _contribute(split_idx, split_idx * ch_rows, True)
     for c in range_constexpr(1, split_k):
         cc = (split_idx + fx.Int32(c)) & fx.Int32(split_k - 1)
-        # every thread polls its own copy: a broadcast read of one line, cheaper
-        # than tid0 polling behind a workgroup barrier.
-        _spin(cc)
-        _emit_rows(llvm_dialect.AtomicBinOp.fadd, cc * ch_rows, bounded_m)
+        _contribute(cc, cc * ch_rows, False)
     rocdl.s_barrier_signal(-1)
     rocdl.s_barrier_wait(-1)
     for c in range_constexpr(1, split_k):
