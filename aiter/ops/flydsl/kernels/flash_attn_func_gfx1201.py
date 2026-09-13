@@ -336,11 +336,7 @@ def build_flash_attn_func_module_primary(
             if const_expr(KV_NEEDS_GUARD):
                 row_cap = fx.Int64(BLOCK_N - 1)
                 load_row_v = fx.Int64(
-                    fx.Uint64(
-                        fx.arith.select(
-                            load_row_in_batch < row_cap, load_row_in_batch, row_cap
-                        )
-                    )
+                    (load_row_in_batch < row_cap).select(load_row_in_batch, row_cap)
                 )
             vecs = []
             for batch in range_constexpr(NUM_BATCHES_KV):
@@ -374,9 +370,7 @@ def build_flash_attn_func_module_primary(
         q_row_i32 = fx.Int32(q_row)
 
         q_in_bounds = q_row < seq_len_v
-        q_row_safe = fx.Int64(
-            fx.Uint64(fx.arith.select(q_in_bounds, q_row, fx.Uint64(fx.Int64(0))))
-        )
+        q_row_safe = fx.Int64(q_in_bounds.select(q_row, fx.Int64(0)))
 
         # First KV column fully masked for this wave.
         wave_kv_limit_i32 = fx.Int32(q_start + wave_q_offset + fx.Int64(ROWS_PER_WAVE))
@@ -386,13 +380,7 @@ def build_flash_attn_func_module_primary(
             q_col = fx.Int64(ks * K_STEP_QK) + klane * WMMA_LANE_K
             g_idx = global_idx(q_row_safe, q_col)
             raw = load_global_v8f16(q_elem_ptr, g_idx)
-            q_b_packs.append(
-                fx.Vector(
-                    fx.arith.select(q_in_bounds, raw, c_zero_v8f16),
-                    shape=(8,),
-                    dtype=elem_dtype,
-                )
-            )
+            q_b_packs.append(q_in_bounds.select(raw, c_zero_v8f16))
 
         c_neg_inf = fx.Float32(float("-inf"))
         c_zero_f = fx.Float32(0.0)
@@ -407,9 +395,7 @@ def build_flash_attn_func_module_primary(
 
         _q_end = q_start + BLOCK_M
         if const_expr(CAUSAL):
-            kv_upper = fx.Int64(
-                fx.Uint64(fx.arith.select(_q_end < seq_len_v, _q_end, seq_len_v))
-            )
+            kv_upper = fx.Int64((_q_end < seq_len_v).select(_q_end, seq_len_v))
         else:
             kv_upper = seq_len_v
 
@@ -511,49 +497,37 @@ def build_flash_attn_func_module_primary(
                 if tile_needs_mask:
                     klane_off_i32 = klane_i32 * fx.Int32(8)
                     _b0 = kv_start_i32 + fx.Int32(0) + klane_off_i32
-                    s_v0 = fx.Float32(fx.arith.select(_b0 > q_row_i32, c_neg_inf, s_v0))
+                    s_v0 = (_b0 > q_row_i32).select(c_neg_inf, s_v0)
                     _b1 = kv_start_i32 + fx.Int32(1) + klane_off_i32
-                    s_v1 = fx.Float32(fx.arith.select(_b1 > q_row_i32, c_neg_inf, s_v1))
+                    s_v1 = (_b1 > q_row_i32).select(c_neg_inf, s_v1)
                     _b2 = kv_start_i32 + fx.Int32(2) + klane_off_i32
-                    s_v2 = fx.Float32(fx.arith.select(_b2 > q_row_i32, c_neg_inf, s_v2))
+                    s_v2 = (_b2 > q_row_i32).select(c_neg_inf, s_v2)
                     _b3 = kv_start_i32 + fx.Int32(3) + klane_off_i32
-                    s_v3 = fx.Float32(fx.arith.select(_b3 > q_row_i32, c_neg_inf, s_v3))
+                    s_v3 = (_b3 > q_row_i32).select(c_neg_inf, s_v3)
                     _b4 = kv_start_i32 + fx.Int32(4) + klane_off_i32
-                    s_v4 = fx.Float32(fx.arith.select(_b4 > q_row_i32, c_neg_inf, s_v4))
+                    s_v4 = (_b4 > q_row_i32).select(c_neg_inf, s_v4)
                     _b5 = kv_start_i32 + fx.Int32(5) + klane_off_i32
-                    s_v5 = fx.Float32(fx.arith.select(_b5 > q_row_i32, c_neg_inf, s_v5))
+                    s_v5 = (_b5 > q_row_i32).select(c_neg_inf, s_v5)
                     _b6 = kv_start_i32 + fx.Int32(6) + klane_off_i32
-                    s_v6 = fx.Float32(fx.arith.select(_b6 > q_row_i32, c_neg_inf, s_v6))
+                    s_v6 = (_b6 > q_row_i32).select(c_neg_inf, s_v6)
                     _b7 = kv_start_i32 + fx.Int32(7) + klane_off_i32
-                    s_v7 = fx.Float32(fx.arith.select(_b7 > q_row_i32, c_neg_inf, s_v7))
+                    s_v7 = (_b7 > q_row_i32).select(c_neg_inf, s_v7)
                     _b8 = kv_start_i32 + fx.Int32(16) + klane_off_i32
-                    s_v8 = fx.Float32(fx.arith.select(_b8 > q_row_i32, c_neg_inf, s_v8))
+                    s_v8 = (_b8 > q_row_i32).select(c_neg_inf, s_v8)
                     _b9 = kv_start_i32 + fx.Int32(17) + klane_off_i32
-                    s_v9 = fx.Float32(fx.arith.select(_b9 > q_row_i32, c_neg_inf, s_v9))
+                    s_v9 = (_b9 > q_row_i32).select(c_neg_inf, s_v9)
                     _b10 = kv_start_i32 + fx.Int32(18) + klane_off_i32
-                    s_v10 = fx.Float32(
-                        fx.arith.select(_b10 > q_row_i32, c_neg_inf, s_v10)
-                    )
+                    s_v10 = (_b10 > q_row_i32).select(c_neg_inf, s_v10)
                     _b11 = kv_start_i32 + fx.Int32(19) + klane_off_i32
-                    s_v11 = fx.Float32(
-                        fx.arith.select(_b11 > q_row_i32, c_neg_inf, s_v11)
-                    )
+                    s_v11 = (_b11 > q_row_i32).select(c_neg_inf, s_v11)
                     _b12 = kv_start_i32 + fx.Int32(20) + klane_off_i32
-                    s_v12 = fx.Float32(
-                        fx.arith.select(_b12 > q_row_i32, c_neg_inf, s_v12)
-                    )
+                    s_v12 = (_b12 > q_row_i32).select(c_neg_inf, s_v12)
                     _b13 = kv_start_i32 + fx.Int32(21) + klane_off_i32
-                    s_v13 = fx.Float32(
-                        fx.arith.select(_b13 > q_row_i32, c_neg_inf, s_v13)
-                    )
+                    s_v13 = (_b13 > q_row_i32).select(c_neg_inf, s_v13)
                     _b14 = kv_start_i32 + fx.Int32(22) + klane_off_i32
-                    s_v14 = fx.Float32(
-                        fx.arith.select(_b14 > q_row_i32, c_neg_inf, s_v14)
-                    )
+                    s_v14 = (_b14 > q_row_i32).select(c_neg_inf, s_v14)
                     _b15 = kv_start_i32 + fx.Int32(23) + klane_off_i32
-                    s_v15 = fx.Float32(
-                        fx.arith.select(_b15 > q_row_i32, c_neg_inf, s_v15)
-                    )
+                    s_v15 = (_b15 > q_row_i32).select(c_neg_inf, s_v15)
                 s_raw = [
                     s_v0,
                     s_v1,

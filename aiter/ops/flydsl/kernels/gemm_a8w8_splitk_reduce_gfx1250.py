@@ -48,12 +48,8 @@ def compile_gemm_a8w8_splitk_reduce(
         off = fx.Int64(tile) * fx.Int64(span)
         rest = i64_run - off
         is_tail = (rest >> fx.Int64(span.bit_length() - 1)) == fx.Int64(0)
-        nbytes = fx.Int32(
-            fx.arith.select(
-                is_tail,
-                fx.Int32(rest) * fx.Int32(ELEM_BYTES),
-                fx.Int32(span * ELEM_BYTES),
-            )
+        nbytes = is_tail.select(
+            fx.Int32(rest) * fx.Int32(ELEM_BYTES), fx.Int32(span * ELEM_BYTES)
         )
         row = fx.Int64(run) * fx.Int64(i32_ld) + off
 

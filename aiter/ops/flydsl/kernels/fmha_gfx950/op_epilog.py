@@ -36,7 +36,7 @@ class DualwaveFp8StoreHelper(DualwaveFp8KernelContext):
         )
         lo_res = llvm.extractvalue(T.i32, swapped, [0])
         hi_res = llvm.extractvalue(T.i32, swapped, [1])
-        return fx.Int32(fx.arith.select(self.lane_div_32 != 0, lo_res, hi_res))
+        return (self.lane_div_32 != 0).select(lo_res, hi_res)
 
     def _packed_o_128_dwords(self, v_o, dc, g):
         is_hi_half = self.lane_div_32 != 0
@@ -44,10 +44,10 @@ class DualwaveFp8StoreHelper(DualwaveFp8KernelContext):
         d0_b, d1_b = self._o_pack_2dw(v_o, dc, 2 * g + 1)
         y0_a, y1_a = self._swap_half_partner(d0_a), self._swap_half_partner(d1_a)
         y0_b, y1_b = self._swap_half_partner(d0_b), self._swap_half_partner(d1_b)
-        w0 = fx.Int32(fx.arith.select(is_hi_half, y0_b, as_mlir_value(d0_a)))
-        w1 = fx.Int32(fx.arith.select(is_hi_half, y1_b, as_mlir_value(d1_a)))
-        w2 = fx.Int32(fx.arith.select(is_hi_half, as_mlir_value(d0_b), y0_a))
-        w3 = fx.Int32(fx.arith.select(is_hi_half, as_mlir_value(d1_b), y1_a))
+        w0 = is_hi_half.select(y0_b, as_mlir_value(d0_a))
+        w1 = is_hi_half.select(y1_b, as_mlir_value(d1_a))
+        w2 = is_hi_half.select(as_mlir_value(d0_b), y0_a)
+        w3 = is_hi_half.select(as_mlir_value(d1_b), y1_a)
         return w0, w1, w2, w3
 
     def _packed_o_128_vec(self, v_o, dc, g):

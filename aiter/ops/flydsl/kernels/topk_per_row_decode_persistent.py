@@ -118,11 +118,9 @@ def build_topk_per_row_decode_one_workgroup_module(
 
             if wave == 0:
                 active = lane < num_waves
-                safe_lane = fx.Int32(fx.arith.select(active, lane, zero))
-                first_wave = fx.Int32(fx.arith.select(active, scan[safe_lane], zero))
-                second_wave = fx.Int32(
-                    fx.arith.select(active, scan[safe_lane + num_waves], zero)
-                )
+                safe_lane = active.select(lane, zero)
+                first_wave = active.select(scan[safe_lane], zero)
+                second_wave = active.select(scan[safe_lane + num_waves], zero)
                 first_wave_inclusive = _warp_inclusive_prefix_i32(
                     first_wave, lane, wave_size
                 )
@@ -164,8 +162,8 @@ def build_topk_per_row_decode_one_workgroup_module(
 
             if wave == 0:
                 active = lane < num_waves
-                safe_lane = fx.Int32(fx.arith.select(active, lane, zero))
-                wave_total = fx.Int32(fx.arith.select(active, scan[safe_lane], zero))
+                safe_lane = active.select(lane, zero)
+                wave_total = active.select(scan[safe_lane], zero)
                 wave_prefix = (
                     _warp_inclusive_prefix_i32(wave_total, lane, wave_size) - wave_total
                 )
@@ -293,7 +291,7 @@ def build_topk_per_row_decode_one_workgroup_module(
             for step in range(zero, num_steps, one):
                 vector_idx = step * block_threads + tid
                 active_vector = vector_idx < row_vectors
-                safe_vector_idx = fx.arith.select(active_vector, vector_idx, zero)
+                safe_vector_idx = active_vector.select(vector_idx, zero)
                 col_base = safe_vector_idx * vec_width
                 rvals = _load_f32x4(input_resource, safe_vector_idx)
                 classes = fx.make_rmem_tensor(_VEC, fx.Int32)
@@ -308,8 +306,8 @@ def build_topk_per_row_decode_one_workgroup_module(
                         third_threshold,
                     )
                     active = active_vector & (col < row_len)
-                    above_i32 = fx.arith.select(active & above, one, zero)
-                    equal_i32 = fx.arith.select(active & equal, one, zero)
+                    above_i32 = (active & above).select(one, zero)
+                    equal_i32 = (active & equal).select(one, zero)
                     classes[lane_idx] = above_i32 * two + equal_i32
                     local_above = local_above + above_i32
                     local_equal = local_equal + equal_i32
@@ -325,8 +323,8 @@ def build_topk_per_row_decode_one_workgroup_module(
                 for lane_idx in range_constexpr(_VEC):
                     cls = classes[lane_idx]
                     col = col_base + lane_idx
-                    accepted_equal = fx.Int32(
-                        fx.arith.select(my_equal < num_needed, my_equal, num_needed)
+                    accepted_equal = (my_equal < num_needed).select(
+                        my_equal, num_needed
                     )
                     out_pos = my_above + accepted_equal
                     if cls == two:
@@ -350,16 +348,11 @@ def build_topk_per_row_decode_one_workgroup_module(
                 out_pos = output_step * _BLOCK_THREADS + tid
                 if out_pos < k:
                     valid = out_pos < row_len
-                    row_indices[out_pos] = fx.Int32(
-                        fx.arith.select(valid, out_pos, fx.Int32(-1))
-                    )
+                    row_indices[out_pos] = valid.select(out_pos, fx.Int32(-1))
                     if const_expr(write_values):
-                        row_values[out_pos] = fx.Float32(
-                            fx.arith.select(
-                                valid,
-                                fx.Float32(input[row, out_pos]),
-                                fx.Float32(float("-inf")),
-                            )
+                        row_values[out_pos] = valid.select(
+                            input[row, out_pos],
+                            fx.Float32(float("-inf")),
                         )
 
         if row_len > top_k:

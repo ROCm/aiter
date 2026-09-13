@@ -43,13 +43,9 @@ def _fp8_scale_for_leader(is_leader, local_max):
         )
         mantissa = working_bits & fx.Int32(0x7FFFFF)
         biased_exp = (working_bits >> fx.Int32(23)) & fx.Int32(0xFF)
-        e8m0 = fx.Int32(
-            fx.arith.select(
-                mantissa != fx.Int32(0), biased_exp + fx.Int32(1), biased_exp
-            )
-        )
-        e8m0 = fx.Int32(fx.arith.select(e8m0 > fx.Int32(0xFF), fx.Int32(0xFF), e8m0))
-        e8m0 = fx.Int32(fx.arith.select(max_bits == fx.Int32(0), fx.Int32(0), e8m0))
+        e8m0 = (mantissa != fx.Int32(0)).select(biased_exp + fx.Int32(1), biased_exp)
+        e8m0 = (e8m0 > fx.Int32(0xFF)).select(fx.Int32(0xFF), e8m0)
+        e8m0 = (max_bits == fx.Int32(0)).select(fx.Int32(0), e8m0)
     return e8m0
 
 
@@ -127,7 +123,7 @@ def p2p_scatter_epilog(lds_acc_base, accm, n_block_idx, wave, lane, *, N_OUT, BM
         dest_pe = t >> fx.Int32(log2_max_tok)
         dest_lid = t & fx.Int32(mask_max_tok)
         valid = (t < fx.Int32(recv_cap)) & (s < fx.Int32(topk)) & (dest_pe < fx.Int32(npes))
-        dest_pe_safe = fx.Int32(fx.arith.select(valid, dest_pe, fx.Int32(0)))
+        dest_pe_safe = valid.select(dest_pe, fx.Int32(0))
         peer_base = fx.ptr_load(
             lds_typed_ptr(
                 fx.Int32(lds_peer_off) + dest_pe_safe * fx.Int32(8),
@@ -142,7 +138,7 @@ def p2p_scatter_epilog(lds_acc_base, accm, n_block_idx, wave, lane, *, N_OUT, BM
 
         # Inactive lanes read safe LDS and issue a bounded OOB store.
         active = lane < fx.Int32(BN // scatter_vec)
-        col = fx.Int32(fx.arith.select(active, lane * fx.Int32(scatter_vec), fx.Int32(0)))
+        col = active.select(lane * fx.Int32(scatter_vec), fx.Int32(0))
         idx0 = row * fx.Int32(BN) + col
         if const_expr(g2_bf16_lds):
             pk = fx.Vector(
@@ -224,7 +220,10 @@ def p2p_scatter_epilog(lds_acc_base, accm, n_block_idx, wave, lane, *, N_OUT, BM
                 fx.Int32,
             )
             scale_leader = active & is_scale_leader
-            payload_off = fx.Int32(fx.arith.select(valid & active, row_off + col, fx.Int32(comb_inp_nbytes)))
+            payload_off = (valid & active).select(
+                row_off + col,
+                fx.Int32(comb_inp_nbytes),
+            )
             # Adjacent active lanes issue contiguous 8-byte stores without ds_bpermute gathers.
             payload_words = scatter_vec // 4
             payload_buf = ptr_buf_tensor(
@@ -245,10 +244,13 @@ def p2p_scatter_epilog(lds_acc_base, accm, n_block_idx, wave, lane, *, N_OUT, BM
             @flyc.jit
             def store_scale_if_leader():
                 if scale_leader:
-                    scale_off = fx.Int32(fx.arith.select(valid, row_base
+                    scale_off = valid.select(
+                        row_base
                         + fx.Int32(N_OUT)
                         + n_block_idx * fx.Int32(BN // 32)
-                        + lane // fx.Int32(scale_group_lanes), fx.Int32(comb_inp_nbytes)))
+                        + lane // fx.Int32(scale_group_lanes),
+                        fx.Int32(comb_inp_nbytes),
+                    )
                     scale_buf = ptr_buf_tensor(
                         peer_base,
                         fx.Int8,
@@ -264,7 +266,10 @@ def p2p_scatter_epilog(lds_acc_base, accm, n_block_idx, wave, lane, *, N_OUT, BM
 
             store_scale_if_leader()
         else:
-            off = fx.Int32(fx.arith.select(valid & active, row_off + col * fx.Int32(out_elem_bytes), fx.Int32(comb_inp_nbytes)))
+            off = (valid & active).select(
+                row_off + col * fx.Int32(out_elem_bytes),
+                fx.Int32(comb_inp_nbytes),
+            )
             output_buf = ptr_buf_tensor(
                 peer_base,
                 fx.BFloat16,
@@ -413,12 +418,20 @@ def compile_mega_moe_stage2(*, model_dim: int, inter_dim: int, experts: int, top
             skip_base_b_lane = fx.Int32(0)
             skip_rows_lane = fx.Int32(0)
             if lane == fx.Int32(0):
-                safe_prev_a = fx.Int32(fx.arith.select(skip_a > fx.Int32(0), skip_a - fx.Int32(1), fx.Int32(0)))
-                safe_prev_b = fx.Int32(fx.arith.select(skip_b > fx.Int32(0), skip_b - fx.Int32(1), fx.Int32(0)))
+                safe_prev_a = (skip_a > fx.Int32(0)).select(
+                    skip_a - fx.Int32(1), fx.Int32(0)
+                )
+                safe_prev_b = (skip_b > fx.Int32(0)).select(
+                    skip_b - fx.Int32(1), fx.Int32(0)
+                )
                 prev_a = expert_tile_end[safe_prev_a] * fx.Int32(SBM)
                 prev_b = expert_tile_end[safe_prev_b] * fx.Int32(SBM)
-                skip_base_a_lane = fx.Int32(fx.arith.select(skip_a > fx.Int32(0), prev_a, fx.Int32(0)))
-                skip_base_b_lane = fx.Int32(fx.arith.select(skip_b > fx.Int32(0), prev_b, fx.Int32(0)))
+                skip_base_a_lane = (skip_a > fx.Int32(0)).select(
+                    prev_a, fx.Int32(0)
+                )
+                skip_base_b_lane = (skip_b > fx.Int32(0)).select(
+                    prev_b, fx.Int32(0)
+                )
                 group_count = fx.Int32(0)
                 group_column = fx.Int32(_total_experts + rank)
                 for source in range_constexpr(npes):
@@ -512,7 +525,7 @@ def compile_mega_moe_stage2(*, model_dim: int, inter_dim: int, experts: int, top
                     & (m_row >= skip_base_b)
                     & (m_row < skip_base_b + skip_rows)
                 )
-                skip = fx.Int32(fx.arith.select(in_a | in_b, fx.Int32(1), fx.Int32(0)))
+                skip = (in_a | in_b).select(fx.Int32(1), fx.Int32(0))
             if skip == fx.Int32(0):
                 issue_all_a_loads(m_block_idx * fx.Int32(BM))
                 rocdl.sched_barrier(0)
@@ -541,25 +554,29 @@ def compile_mega_moe_stage2(*, model_dim: int, inter_dim: int, experts: int, top
             skew_m_slot = bx_i32 - skew_n_block * fx.Int32(cu_num)
             normal_m_slot = bx_i32 // fx.Int32(num_n_blocks)
             normal_n_block = bx_i32 - normal_m_slot * fx.Int32(num_n_blocks)
-            n_block = fx.Int32(fx.arith.select(skewed, skew_n_block, normal_n_block))
-            m_slot = fx.Int32(fx.arith.select(skewed, skew_m_slot, normal_m_slot))
-            active_cu = fx.Int32(fx.arith.select(skewed, fx.Int32(skew_cu), fx.Int32(cu_num)))
+            n_block = skewed.select(skew_n_block, normal_n_block)
+            m_slot = skewed.select(skew_m_slot, normal_m_slot)
+            active_cu = skewed.select(fx.Int32(skew_cu), fx.Int32(cu_num))
             strided_diff = total_m_blocks - m_slot
-            strided_rem = fx.Int32(fx.arith.select(strided_diff > fx.Int32(0), strided_diff, fx.Int32(0)))
+            strided_rem = (strided_diff > fx.Int32(0)).select(strided_diff, fx.Int32(0))
             strided_iters = (strided_rem + active_cu - fx.Int32(1)) // active_cu
             tiles_per_slot = (
                 total_m_blocks + active_cu - fx.Int32(1)
             ) // active_cu
             m_tile0 = m_slot * tiles_per_slot
             contiguous_diff = total_m_blocks - m_tile0
-            contiguous_rem = fx.Int32(fx.arith.select(contiguous_diff > fx.Int32(0), contiguous_diff, fx.Int32(0)))
-            contiguous_iters = fx.Int32(fx.arith.select(contiguous_rem < tiles_per_slot, contiguous_rem, tiles_per_slot))
-            n_iters = fx.Int32(fx.arith.select(skewed, strided_iters, contiguous_iters))
+            contiguous_rem = (contiguous_diff > fx.Int32(0)).select(
+                contiguous_diff, fx.Int32(0)
+            )
+            contiguous_iters = (contiguous_rem < tiles_per_slot).select(
+                contiguous_rem, tiles_per_slot
+            )
+            n_iters = skewed.select(strided_iters, contiguous_iters)
             active = m_slot < active_cu
             for _it in range(fx.Int32(0), n_iters, fx.Int32(1)):
                 strided_m = m_slot + fx.Int32(_it) * active_cu
                 contiguous_m = m_tile0 + fx.Int32(_it)
-                m_block = fx.Int32(fx.arith.select(skewed, strided_m, contiguous_m))
+                m_block = skewed.select(strided_m, contiguous_m)
                 if active:
                     unit_bx = m_block * fx.Int32(num_n_blocks) + n_block
                     fx.barrier()
@@ -570,7 +587,7 @@ def compile_mega_moe_stage2(*, model_dim: int, inter_dim: int, experts: int, top
             n_block = bx_i32 - m_slot * fx.Int32(num_n_blocks)
             if const_expr(persist_strided):
                 diff = total_m_blocks - m_slot
-                rem = fx.Int32(fx.arith.select(diff > fx.Int32(0), diff, fx.Int32(0)))
+                rem = (diff > fx.Int32(0)).select(diff, fx.Int32(0))
                 n_iters = (rem + fx.Int32(cu_num - 1)) // fx.Int32(cu_num)
             else:
                 tiles_per_slot = (
@@ -578,8 +595,8 @@ def compile_mega_moe_stage2(*, model_dim: int, inter_dim: int, experts: int, top
                 ) // fx.Int32(cu_num)
                 m_tile0 = m_slot * tiles_per_slot
                 diff = total_m_blocks - m_tile0
-                rem = fx.Int32(fx.arith.select(diff > fx.Int32(0), diff, fx.Int32(0)))
-                n_iters = fx.Int32(fx.arith.select(rem < tiles_per_slot, rem, tiles_per_slot))
+                rem = (diff > fx.Int32(0)).select(diff, fx.Int32(0))
+                n_iters = (rem < tiles_per_slot).select(rem, tiles_per_slot)
             for _it in range(fx.Int32(0), n_iters, fx.Int32(1)):
                 if const_expr(persist_strided):
                     m_block = m_slot + fx.Int32(_it) * fx.Int32(cu_num)

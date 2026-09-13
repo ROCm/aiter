@@ -204,7 +204,7 @@ def c_shuffle_epilog(
         gpu.barrier()
 
         # -- read phase (each group reads from its own LDS buffer) --
-        tx_local = tx - fx.Index(fx.arith.select(_is_group_b, _half_thr_idx, _zero_idx))
+        tx_local = tx - _is_group_b.select(_half_thr_idx, _zero_idx)
         c_nlane_s = fx.Index(CShuffleNLane_s).ir_value()
         m_lane_s = tx_local // c_nlane_s
         n_lane_s = tx_local % c_nlane_s

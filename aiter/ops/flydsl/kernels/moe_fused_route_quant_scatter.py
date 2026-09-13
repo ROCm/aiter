@@ -861,16 +861,14 @@ def build_moe_fused_route_quant_scatter_module(
             if const_expr(use_g2l):
                 le = ptr_buf_tensor(g2l_lut)[expert]
                 is_drop = le == fx.Uint32(n_buckets)
-                expert = fx.Uint32(fx.Int32(fx.arith.select(is_drop, c0_i32, le)))
+                expert = fx.Uint32(is_drop.select(c0_i32, le))
                 # Fused weight cast+mask (warp-uniform: every lane writes the same
                 # value to gather_w[route], redundant but race-free). Reads f32
                 # weight_in and writes weight_dtype (kept -> cast, dropped -> 0),
                 # folding the host topk_weight.to(bf16) copy + masked_fill.
                 w_f32 = ptr_buf_tensor(weight_in, fx.Float32)[route]
                 w_cast = arith.trunc_f(wdt, w_f32)
-                w_out = w_fx(
-                    fx.arith.select(is_drop, arith.constant(0.0, type=wdt), w_cast)
-                )
+                w_out = is_drop.select(arith.constant(0.0, type=wdt), w_cast)
                 ptr_buf_tensor(gather_w, w_fx)[route] = w_out
 
             # Lane 0 claims the within-expert slot via atomicAdd, then broadcasts
@@ -879,7 +877,7 @@ def build_moe_fused_route_quant_scatter_module(
             # branch here.
             if const_expr(use_g2l):
                 # Dropped routes add 0, so they take no row in the grouped layout.
-                slot_incr = fx.Int32(fx.arith.select(is_drop, c0_i32, c1_i32))
+                slot_incr = is_drop.select(c0_i32, c1_i32)
             else:
                 slot_incr = c1_i32
             slot_on_lane0 = arith.constant(0, type=i32)
@@ -2037,17 +2035,13 @@ def build_moe_token_multidest_quant_module(
         # descriptors zero-sized, so its stores are dropped by the hardware
         # bounds check rather than by a branch.
         valid = token < fx.Uint32(token_num)
-        token_eff = fx.Uint32(fx.arith.select(valid, token, fx.Uint32(c0_i32)))
-        pay_records = fx.Int32(
-            fx.arith.select(
-                valid, arith.constant(payload_bytes_per_row, type=i32), c0_i32
-            )
+        token_eff = valid.select(token, fx.Uint32(c0_i32))
+        pay_records = valid.select(
+            arith.constant(payload_bytes_per_row, type=i32), c0_i32
         )
         # Sign-extended to i64 by the descriptor builder, so stay under 2 GiB.
-        scale_records = fx.Int32(
-            fx.arith.select(
-                valid, arith.constant(_SCALE_RSRC_MAX_BYTES, type=i32), c0_i32
-            )
+        scale_records = valid.select(
+            arith.constant(_SCALE_RSRC_MAX_BYTES, type=i32), c0_i32
         )
         if token0 < fx.Uint32(token_num):
             rows_t = ptr_buf_tensor(topids_to_rows)

@@ -217,9 +217,7 @@ class StoreC:
                         fx.BFloat16
                     )
                     c_index = (row + i) * self.c_cols + col
-                    self._store_bf16(
-                        scaled, fx.Int32(fx.arith.select(col_valid, c_index, oob))
-                    )
+                    self._store_bf16(scaled, col_valid.select(c_index, oob))
 
 
 class Mfma16x16x128:

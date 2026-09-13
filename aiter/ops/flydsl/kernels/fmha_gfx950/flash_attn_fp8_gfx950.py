@@ -278,7 +278,7 @@ def build_flash_attn_dualwave_swp_fp8_module(
         NPF_I = const_expr(fx.Index(NPF))
 
         def _ring_wrap(x):
-            return fx.arith.select(x >= NPF_I, x - NPF_I, x)
+            return (x >= NPF_I).select(x - NPF_I, x)
 
         init_args = [m_row, l_row] + v_o + [t0 % fx.Index(NPF)]
         loop_results = init_args
@@ -333,11 +333,7 @@ def build_flash_attn_dualwave_swp_fp8_module(
 
         inv_l_rcp = rocdl.rcp(T.f32, _raw(l_row))
         inv_l = fx.Float32(
-            fx.Float32(
-                fx.arith.select(
-                    fx.Float32(l_row) > ctx.c_zero_f, inv_l_rcp, ctx.c_zero_f
-                )
-            )
+            (fx.Float32(l_row) > ctx.c_zero_f).select(inv_l_rcp, ctx.c_zero_f)
         )
         inv_l = inv_l * ctx.vd_fp8
         softmax_helper.scale_o(v_o, inv_l)

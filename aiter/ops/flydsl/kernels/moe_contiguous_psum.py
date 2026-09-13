@@ -196,7 +196,7 @@ def build_moe_contiguous_psum_module():
         if is_lane0:
             total = carry[0]
             gt = total > fx.Int32(tile_v)
-            c_p[0] = fx.Uint32(fx.arith.select(gt, total, tile_v))
+            c_p[0] = gt.select(total, tile_v)
 
     @flyc.jit
     def launch_psum(
@@ -326,7 +326,7 @@ def build_moe_contiguous_psum_remap_module():
         if is_blk0 & is_lane0:
             total = carry[0]
             gt = total > fx.Int32(tile_v)
-            c_p[0] = fx.Uint32(fx.arith.select(gt, total, tile_v))
+            c_p[0] = gt.select(total, tile_v)
 
         gpu.barrier()
 
@@ -491,7 +491,7 @@ def build_moe_contiguous_psum_remap_ep_module():
                 if is_last:
                     total = src[tid]
                     gt = total > fx.Int32(tile_v)
-                    c_p[0] = fx.Uint32(fx.arith.select(gt, total, tile_v))
+                    c_p[0] = gt.select(total, tile_v)
 
         gpu.barrier()
 

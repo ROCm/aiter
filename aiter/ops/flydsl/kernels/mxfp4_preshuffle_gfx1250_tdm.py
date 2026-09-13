@@ -291,9 +291,7 @@ def launch_gemm_a8w4_tdm(
         group_first_tile = group * TILES_PER_GROUP
         in_group = swz_id - group * blocks_per_group
         rem_tiles = total_m_tiles - group_first_tile
-        group_tiles = fx.Int32(
-            fx.arith.select(rem_tiles < TILES_PER_GROUP, rem_tiles, TILES_PER_GROUP)
-        )
+        group_tiles = (rem_tiles < TILES_PER_GROUP).select(rem_tiles, TILES_PER_GROUP)
         m_tile = group_first_tile + (in_group - (in_group // group_tiles) * group_tiles)
         blk_m = m_tile * tile_m
         n_unit = in_group // group_tiles
@@ -317,12 +315,10 @@ def launch_gemm_a8w4_tdm(
         lo, hi = blk_m * 0, blk_m * 0 + n_experts
         for _ in range_constexpr(max(1, math.ceil(math.log2(max(2, n_experts))) + 1)):
             mid = (lo + hi) >> 1
-            mid_clamped = fx.Int32(
-                fx.arith.select(mid < n_experts - 1, mid, n_experts - 1)
-            )
+            mid_clamped = (mid < n_experts - 1).select(mid, n_experts - 1)
             go_right = tile_map[mid_clamped] <= blk_m
-            lo = fx.Int32(fx.arith.select(go_right, mid + 1, lo))
-            hi = fx.Int32(fx.arith.select(go_right, hi, mid))
+            lo = go_right.select(mid + 1, lo)
+            hi = go_right.select(hi, mid)
         expert = lo
         eb64 = fx.Int64(expert)
         B_BATCH_ROWS = n64 // 16
@@ -334,12 +330,7 @@ def launch_gemm_a8w4_tdm(
         SB_OUTER_STRIDE = K4
         sb_batch_off = eb64 * (N_SUPERS * K4)
         # Per-expert A-data OOB: bound to the owning expert's valid-row
-        mn_oob = (
-            tile_map[
-                fx.Int32(fx.arith.select(expert < n_experts, expert, n_experts - 1))
-            ]
-            - blk_m
-        )
+        mn_oob = tile_map[(expert < n_experts).select(expert, n_experts - 1)] - blk_m
 
         # static=False (one dyn-shared base) only where a second region is
         # needed, so the non-scatter path keeps its per-leaf static allocation.
@@ -1396,9 +1387,7 @@ def launch_gemm_a8w4_tdm(
                                 slot = dstp % fx.Int32(ep_destination_stride)
                                 idxv = pe * _K + slot
                                 keep = (fx.Int32(r) < mn_oob) & (dstp >= fx.Int32(0))
-                                row_indices.append(
-                                    fx.Int32(fx.arith.select(keep, idxv, _oob))
-                                )
+                                row_indices.append(keep.select(idxv, _oob))
                             else:
                                 row_indices.append(_oob)
                         # Geometry is passed explicitly rather than derived from

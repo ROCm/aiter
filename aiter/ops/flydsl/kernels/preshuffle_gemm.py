@@ -760,9 +760,7 @@ def compile_preshuffle_gemm(
                     abs_y = fx.Float32(y).maximumf(zero_f32 - y)
                     e_neg2abs = math.exp(fx.Float32(-2.0) * abs_y)
                     denom = one_f32 + e_neg2abs
-                    numerator = fx.Float32(
-                        fx.arith.select(y > zero_f32, two_f32, two_f32 * e_neg2abs)
-                    )
+                    numerator = (y > zero_f32).select(two_f32, two_f32 * e_neg2abs)
                     return half_f32 * val_s * (numerator * (one_f32 / denom))
                 return val_s
 

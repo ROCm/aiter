@@ -297,7 +297,7 @@ def _build_compress_forward_kernel(
                 s = fx.Int32(position) - fx.Int32(K - 1) + fx.Int32(k_i32)
                 is_pad_b = s < 0
                 is_pad = is_pad_b.ir_value()
-                s_safe = fx.Int32(fx.arith.select(is_pad_b, fx.Int32(0), s))
+                s_safe = is_pad_b.select(fx.Int32(0), s)
                 ring = fx.Int32((fx.Uint32(s_safe.ir_value()) % state_size).ir_value())
                 # Slot term already folded into the descriptor base.
                 base_kv_off = ring * fx.Int32(kv_state_pos_stride) + col_off_base

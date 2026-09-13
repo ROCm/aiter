@@ -289,7 +289,7 @@ if lane == c_zero:
     ...
 
 in_range = lane < c_limit
-val = fx.arith.select(in_range, good_val, zero_val)
+val = in_range.select(good_val, zero_val)
 
 # Avoid for simple integer comparisons
 in_range = arith.cmpi(arith.CmpIPredicate.slt, lane, c_limit)
@@ -429,15 +429,10 @@ mask = fx.Int32(0xFF)                            # i32 constant (preferred)
 # Prefer operators / Numeric methods
 result = a + b
 result = a * scale
-result = fx.arith.select(cond, true_val, false_val)
+result = cond.select(true_val, false_val)
 
 # Keep direct arith.*FOp only when explicit fastmath flags are required.
 ```
-
-`fx.arith.select` requires matching branch types. Scalar results are
-`ArithValue`; inferred vector wrappers may lose unsigned element metadata.
-Preserve promotion, static folding, broadcasting and the exact result dtype and
-shape when migrating a method call.
 
 ### Internal Types: Vector and Numeric (PREFERRED)
 
@@ -488,8 +483,8 @@ Use `Vec.filled(...)` for splats and `Vec.from_elements(...)` for vectors from s
 | Negate | `-a` | Yes | |
 | Max | `a.maximumf(b)` | Yes | Good for ReLU |
 | Compare | `a < b`, `a == b`, `a > b` | Yes | Boolean result (i1 / vec<i1>) |
-| Select | `fx.arith.select(cond, t, f)` | Yes | Match branch types; wrap the result in its DSL type |
-| Abs | no direct helper | Use `-v`, comparison, and `fx.arith.select(...)` |
+| Select | `cond.select(t, f)` | Yes | |
+| Abs | no direct helper | Use `-v`, comparison, and `cond.select(...)` |
 | FMA | `a * b + c` | Yes | Use direct FOp only when explicit fastmath is needed |
 | Splat const | `Vec.filled(width, val, dtype)` | Creates vector | For scalar broadcast |
 
@@ -787,11 +782,11 @@ zero_vec = Vec.filled(vec_width, 0.0, fx.Float32)
 vC = vA.maximumf(zero_vec)
 
 # --- Abs: C = |A| (arith.absf does NOT exist) ---
-vA = Vec(fx.memref_load_vec(rA))
+vA = fx.memref_load_vec(rA)
 zero_vec = Vec.filled(vec_width, 0.0, fx.Float32)
 neg_vA = -vA
 is_neg = vA < zero_vec
-vC = Vec(fx.arith.select(is_neg, neg_vA, vA))
+vC = is_neg.select(neg_vA, vA)
 ```
 
 ### Naive GEMM Template (for understanding, not performance)
@@ -937,7 +932,7 @@ Pass raw `torch.Tensor` objects instead.
 
 10. **INT4 (W4A8)**: A matrix is int8, B matrix is packed int4 (2 values/byte), unpacked to int8 in-kernel.
 
-11. **`arith.absf` does not exist**: Prefer `fx.Vector` / typed `fx` operators (not the deprecated `ArithValue`): `neg = -v`, `is_neg = v < zero`, `out = fx.Vector(fx.arith.select(is_neg, neg, v))`.
+11. **`arith.absf` does not exist**: Prefer `fx.Vector` / typed `fx` operators (not the deprecated `ArithValue`): `neg = -v`, `is_neg = v < zero`, `out = is_neg.select(neg, v)`.
 
 12. **Scalar broadcast to vector**: Use `Vec.filled(width, value, fx.Float32)` to create a splat constant vector. Do NOT use raw vector ops for ordinary arithmetic.
 

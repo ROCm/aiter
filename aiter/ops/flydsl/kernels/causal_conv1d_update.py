@@ -299,10 +299,8 @@ def build_causal_conv1d_update_module(
             # them at the start of the tensor: its own qs can sit one past the
             # last token when it trails the batch.
             nonempty = s_len > fx.Int32(0)
-            qs_eff = fx.Int32(fx.arith.select(nonempty, qs, fx.Int32(0)))
-            tok_hi = fx.Int32(
-                fx.arith.select(nonempty, s_len - fx.Int32(1), fx.Int32(0))
-            )
+            qs_eff = nonempty.select(qs, fx.Int32(0))
+            tok_hi = nonempty.select(s_len - fx.Int32(1), fx.Int32(0))
             x_seq_idx, x_seq_stride = qs_eff, sx_tok
             o_seq_idx, o_seq_stride = qs_eff, so_tok
         else:
@@ -327,9 +325,7 @@ def build_causal_conv1d_update_module(
                 # returns before reading it. Loads here are unconditional and
                 # only the stores are guarded, so pin the offset rather than
                 # address conv_state with whatever the padding holds.
-                offset_dyn = fx.Int32(
-                    fx.arith.select(s_len > fx.Int32(0), offset_dyn, fx.Int32(0))
-                )
+                offset_dyn = (s_len > fx.Int32(0)).select(offset_dyn, fx.Int32(0))
         else:
             offset_dyn = fx.Int32(0)
 
@@ -362,9 +358,7 @@ def build_causal_conv1d_update_module(
                     # consumers are store-guarded) but the address must stay
                     # inside the packed tensor, so clamp rather than mask. Token 0
                     # needs no clamp, tok_hi being 0 when the slot is empty.
-                    tok_idx = fx.Int32(
-                        fx.arith.select(fx.Int32(tok) < s_len, fx.Int32(tok), tok_hi)
-                    )
+                    tok_idx = (fx.Int32(tok) < s_len).select(fx.Int32(tok), tok_hi)
                 else:
                     tok_idx = fx.Int32(tok)
                 off = x_base + tok_idx * sx_tok
@@ -754,7 +748,7 @@ def build_causal_conv1d_update_sglang_module(
                 got = par[0]
                 for k in fx.range_constexpr(S):
                     if fx.const_expr(k > 0):
-                        got = fx.Int32(fx.arith.select(idx == fx.Int32(k), par[k], got))
+                        got = (idx == fx.Int32(k)).select(par[k], got)
                 return got
 
             # chain[t] entry j says how tap j+1 is reached from tap j: the parent
@@ -764,14 +758,10 @@ def build_causal_conv1d_update_sglang_module(
                 # A child's parent is the current token, a sibling inherits it.
                 # -1 never matches a slot index, so the guard folds into the test.
                 for k in fx.range_constexpr(S):
-                    par[k] = fx.Int32(
-                        fx.arith.select(rnt_v[t] == fx.Int32(k), fx.Int32(t), par[k])
-                    )
+                    par[k] = (rnt_v[t] == fx.Int32(k)).select(fx.Int32(t), par[k])
                 p_cur = par[t]
                 for k in fx.range_constexpr(S):
-                    par[k] = fx.Int32(
-                        fx.arith.select(rns_v[t] == fx.Int32(k), p_cur, par[k])
-                    )
+                    par[k] = (rns_v[t] == fx.Int32(k)).select(p_cur, par[k])
 
                 steps = []
                 cur = fx.Int32(t)
@@ -791,7 +781,7 @@ def build_causal_conv1d_update_sglang_module(
                         cond = cur > fx.Int32(0)
                         pidx = _par_gather(cur)
                         steps.append((cond, pidx, cur))
-                        cur = fx.Int32(fx.arith.select(cond, pidx, cur - fx.Int32(1)))
+                        cur = cond.select(pidx, cur - fx.Int32(1))
                 chain.append(steps)
 
         # ================= per-channel work ==================================
@@ -872,9 +862,7 @@ def build_causal_conv1d_update_sglang_module(
                     return cols[max(W - 2 + cur_const, 0)]
                 got = cols[0]
                 for cval in fx.range_constexpr(-(W - 3), 1):
-                    got = fx.Float32(
-                        fx.arith.select(cur == fx.Int32(cval), cols[W - 2 + cval], got)
-                    )
+                    got = (cur == fx.Int32(cval)).select(cols[W - 2 + cval], got)
                 return got
 
             inter_vals = []  # per token: the W-1 window slots to snapshot
@@ -898,12 +886,9 @@ def build_causal_conv1d_update_sglang_module(
                             elif fx.const_expr(cond is False):
                                 tap = _hist(None, hist_cur)
                             else:
-                                tap = fx.Float32(
-                                    fx.arith.select(
-                                        cond,
-                                        tree_x[t][j].to(fx.Float32),
-                                        _hist(hist_cur, None),
-                                    )
+                                tap = cond.select(
+                                    tree_x[t][j].to(fx.Float32),
+                                    _hist(hist_cur, None),
                                 )
                     if fx.const_expr(SILU):
                         acc = _silu(acc)

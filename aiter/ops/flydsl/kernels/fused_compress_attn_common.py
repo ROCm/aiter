@@ -235,7 +235,7 @@ def emit_group_fp8_nm_asm_scatter(
                 sv = normed[i] * inv_scale
                 # e4m3fnuz -0->+0 clamp: small negatives -> +0 (cvt returns NaN otherwise)
                 is_tn = (sv < c0f) & (sv > c_neg_uf)
-                safe.append(fx.Float32(fx.arith.select(is_tn, c0f, sv)))
+                safe.append(is_tn.select(c0f, sv))
             # pack VEC fp8 -> VEC/4 dwords (2 cvt_pk_fp8 per dword)
             dwords = []
             for d in range_constexpr(VEC // 4):

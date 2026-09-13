@@ -72,9 +72,7 @@ class DualwaveSplitKCombineContext:
         rows_per_batch = self.seq_len_v * traits.NUM_HEADS_Q
         row_raw = self.blk * combine_rows_per_block + self.tid // combine_lanes_per_row
         threads_in_use = combine_rows_per_block * combine_lanes_per_row
-        self.row = fx.Index(
-            fx.arith.select(self.tid < threads_in_use, row_raw, rows_per_batch)
-        )
+        self.row = (self.tid < threads_in_use).select(row_raw, rows_per_batch)
         self.row_valid = self.row < rows_per_batch
         self.q_head_idx = self.row // self.seq_len_v
         self.seq_idx = self.row % self.seq_len_v
@@ -213,9 +211,7 @@ class DualwaveSplitKCombineHelper(DualwaveSplitKCombineContext):
 
     def pack_output(self, acc, den):
         inv_rcp = rocdl.rcp(T.f32, den)
-        inv = fx.Float32(
-            fx.arith.select(fx.Float32(den) > self.c_zero_f, inv_rcp, self.c_zero_f)
-        )
+        inv = (fx.Float32(den) > self.c_zero_f).select(inv_rcp, self.c_zero_f)
         inv4 = Vec.from_elements([fx.Float32(inv)], fx.Float32).broadcast_to(4)
         out4 = Vec(acc * inv4, (4,), fx.Float32)
         lo = rocdl.cvt_pk_bf16_f32(out4[0], out4[1])
@@ -236,9 +232,7 @@ class DualwaveSplitKCombineHelper(DualwaveSplitKCombineContext):
             + self.col
         )
         # Out-of-range rows aim past num_records, which the buffer drops.
-        o_off = fx.Index(
-            fx.arith.select(self.row_valid, o_global * 2, self.o_nrec_bytes)
-        )
+        o_off = self.row_valid.select(o_global * 2, self.o_nrec_bytes)
         buffer_ops.buffer_store(
             o_pack.ir_value(),
             self.o_rsrc,

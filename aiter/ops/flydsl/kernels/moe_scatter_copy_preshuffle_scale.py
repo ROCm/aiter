@@ -83,11 +83,9 @@ def _emit_preshuffle_dword(gather, map_p, src_p, grow, sd, src_dwords):
         # -1 marks a padding row, so the test is signed.
         valid = fx.Int32(srow) >= fx.Int32(0)
         # Clamp offset in-bounds when padding, then zero the result.
-        src_off = fx.Uint32(
-            fx.arith.select(valid, fx.Uint32(srow) * src_dwords + sd, fx.Uint32(0))
-        )
+        src_off = valid.select(fx.Uint32(srow) * src_dwords + sd, fx.Uint32(0))
         v_raw = src_p[src_off]
-        return fx.Uint32(fx.arith.select(valid, fx.Uint32(v_raw), fx.Uint32(0)))
+        return valid.select(fx.Uint32(v_raw), fx.Uint32(0))
     return src_p[grow * src_dwords + sd]
 
 

@@ -62,7 +62,7 @@ def tanh_batch(xs):
     out = []
     for i, x in enumerate(xs):
         tanh_abs = (fx.Float32(1.0) - es[i]) * recips[i]
-        out.append(fx.Float32(fx.arith.select(x > zero, tanh_abs, -tanh_abs)))
+        out.append((x > zero).select(tanh_abs, -tanh_abs))
     return out
 
 

@@ -401,7 +401,7 @@ def gemm2_compute_v2(
                         kt_rt * fx.Int32(kHalves) + fx.Int32(half) < halves_real
                     )
                 safe_bq_off_dw = (
-                    fx.Int32(fx.arith.select(load_mask, bq_off_dw, fx.Int32(0)))
+                    load_mask.select(bq_off_dw, fx.Int32(0))
                     if load_mask is not None
                     else bq_off_dw
                 )
@@ -415,9 +415,7 @@ def gemm2_compute_v2(
                 bq_vec = (
                     fx.Vector.from_elements(
                         [
-                            fx.Int32(
-                                fx.arith.select(load_mask, loaded_bq[i], fx.Int32(0))
-                            )
+                            load_mask.select(loaded_bq[i], fx.Int32(0))
                             for i in range_constexpr(4)
                         ],
                         fx.Int32,
@@ -700,7 +698,7 @@ def _spart_output_tile_index(block_1d_id, M0, N0, group_num, m01):
     # remap = group_id_x < big_group_num ? gx*gs + gy : gx*gs + big - gx + gy
     remap_a = group_id_x * group_size + group_id_y
     remap_b = group_id_x * group_size + big_group_num - group_id_x + group_id_y
-    remap = fx.Int32(fx.arith.select(group_id_x < big_group_num, remap_a, remap_b))
+    remap = (group_id_x < big_group_num).select(remap_a, remap_b)
 
     idx_M0 = remap // n0
     idx_N0 = remap - idx_M0 * n0
@@ -708,7 +706,7 @@ def _spart_output_tile_index(block_1d_id, M0, N0, group_num, m01):
     # M0_tmp = M0 / M01 ; M0_mod_M01 = M0 - M0_tmp*M01 ; M01_adapt = (idx_M0 < M0 - M0_mod) ? M01 : M0_mod
     M0_tmp = M0 // m01c
     M0_mod = M0 - M0_tmp * m01c
-    M01_adapt = fx.Int32(fx.arith.select(idx_M0 < (M0 - M0_mod), m01c, M0_mod))
+    M01_adapt = (idx_M0 < (M0 - M0_mod)).select(m01c, M0_mod)
 
     idx_M00 = idx_M0 // m01c
     idx_M01 = idx_M0 - idx_M00 * m01c

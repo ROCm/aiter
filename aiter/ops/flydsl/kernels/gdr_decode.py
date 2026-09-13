@@ -299,13 +299,9 @@ def create_vk_gdr_decode_kernel(
                 softplus_big = (f32_1 / softplus_beta_) * fx.math.log1p(
                     _fast_exp(beta_x)
                 )
-                softplus_x = fx.Float32(
-                    fx.arith.select(
-                        fx.Float32(beta_x) <= fx.Float32(softplus_threshold_),
-                        softplus_big,
-                        x,
-                    )
-                )
+                softplus_x = (
+                    fx.Float32(beta_x) <= fx.Float32(softplus_threshold_)
+                ).select(softplus_big, x)
 
                 r_g_value = -_fast_exp(r_A_log) * softplus_x
                 r_beta = f32_1 / (f32_1 + _fast_exp(-r_b))
@@ -1014,9 +1010,7 @@ def create_vk_gdr_mtp_kernel(
 
                 # For beta_x > threshold, softplus(x) == x; both arms run and one is dropped.
                 softplus_big = inv_softplus_beta_ * fx.math.log1p(_fast_exp(beta_x))
-                softplus_x = fx.Float32(
-                    fx.arith.select(beta_x <= softplus_threshold_, softplus_big, x)
-                )
+                softplus_x = (beta_x <= softplus_threshold_).select(softplus_big, x)
 
                 r_g_value = -_fast_exp(r_A_log) * softplus_x
                 r_beta = f32_1 / (f32_1 + _fast_exp(-r_b))

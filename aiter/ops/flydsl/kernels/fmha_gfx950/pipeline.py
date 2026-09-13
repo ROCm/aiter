@@ -77,12 +77,8 @@ def _attn_mask_vec2_imm(rel_i32, neg_inf_i32, thr_x, thr_y, x_ref_i32, y_ref_i32
     """Causal pair mask: ``rel < thr ? -inf : score``, on the f32 bit patterns."""
     rel = fx.Int32(rel_i32)
     neg_inf = fx.Int32(neg_inf_i32)
-    out_x = fx.Int32(
-        fx.arith.select(rel < fx.Int32(thr_x), neg_inf, fx.Int32(x_ref_i32))
-    )
-    out_y = fx.Int32(
-        fx.arith.select(rel < fx.Int32(thr_y), neg_inf, fx.Int32(y_ref_i32))
-    )
+    out_x = (rel < fx.Int32(thr_x)).select(neg_inf, fx.Int32(x_ref_i32))
+    out_y = (rel < fx.Int32(thr_y)).select(neg_inf, fx.Int32(y_ref_i32))
     return out_x.ir_value(), out_y.ir_value()
 
 
@@ -311,13 +307,7 @@ def _store_lse(ctx, row, m_scaled, l_row, in_range, is_writer):
         + fx.log(fx.Float32(l_row), fastmath=ctx.fm_fast)
         + fx.Float32(-_p_headroom_log2(traits) * _LN2)
     )
-    off = fx.Index(
-        fx.arith.select(
-            is_writer,
-            fx.Index(fx.arith.select(in_range, local, slice_elems)),
-            slice_elems,
-        )
-    )
+    off = is_writer.select(in_range.select(local, slice_elems), slice_elems)
     buffer_ops.buffer_store(lse.ir_value(), lse_rsrc, fx.Int32(off).ir_value())
 
 
@@ -915,32 +905,22 @@ class DualwaveFp8KernelContext:
                 fx.Int32(self.q_start + traits.BLOCK_M) + self.delta_i32
             )
             causal_end_i32 = fx.Int32(
-                fx.Int32(
-                    fx.arith.select(
-                        causal_end_raw_i32 > fx.Int32(0),
-                        causal_end_raw_i32,
-                        fx.Int32(0),
-                    )
+                (causal_end_raw_i32 > fx.Int32(0)).select(
+                    causal_end_raw_i32, fx.Int32(0)
                 )
             )
             causal_num_tiles = (
                 fx.Index(causal_end_i32) + kv_tile_size - 1
             ) // kv_tile_size
             max_num_tiles = fx.Index(
-                fx.Index(
-                    fx.arith.select(
-                        causal_num_tiles < num_kv_tiles, causal_num_tiles, num_kv_tiles
-                    )
-                )
+                (causal_num_tiles < num_kv_tiles).select(causal_num_tiles, num_kv_tiles)
             )
         else:
             causal_end_raw_i32 = None
             max_num_tiles = num_kv_tiles
         # Pipeline needs an EVEN tile count >= 4; extra tiles read 0 (num_records) and are masked.
         max_num_tiles = ((max_num_tiles + 1) // 2) * 2
-        max_num_tiles = fx.Index(
-            fx.Index(fx.arith.select(max_num_tiles < 4, fx.Index(4), max_num_tiles))
-        )
+        max_num_tiles = fx.Index((max_num_tiles < 4).select(4, max_num_tiles))
         self.max_num_tiles = max_num_tiles
         if const_expr(traits.SPLITK):
             chunk = (
@@ -951,22 +931,14 @@ class DualwaveFp8KernelContext:
                 // 2
                 * 2
             )
-            chunk = fx.Index(fx.Index(fx.arith.select(chunk < 6, fx.Index(6), chunk)))
+            chunk = fx.Index((chunk < 6).select(6, chunk))
             split_t0 = self.split_idx * chunk
             split_t_end = split_t0 + chunk
             split_t_end = fx.Index(
-                fx.Index(
-                    fx.arith.select(
-                        split_t_end < max_num_tiles, split_t_end, max_num_tiles
-                    )
-                )
+                (split_t_end < max_num_tiles).select(split_t_end, max_num_tiles)
             )
             split_t_end = fx.Index(
-                fx.Index(
-                    fx.arith.select(
-                        max_num_tiles - split_t_end < 4, max_num_tiles, split_t_end
-                    )
-                )
+                (max_num_tiles - split_t_end < 4).select(max_num_tiles, split_t_end)
             )
             self.split_nonempty = split_t0 + 4 <= max_num_tiles
         else:
@@ -981,9 +953,7 @@ class DualwaveFp8KernelContext:
             if const_expr(traits.CAUSAL and traits.CROSS_SEQLEN):
                 in_mask = causal_end_raw_i32 > fx.Int32(0)
                 active = in_mask if active is None else (active & in_mask)
-            split_t_end = fx.Index(
-                fx.Index(fx.arith.select(active, split_t_end, split_t0))
-            )
+            split_t_end = fx.Index(active.select(split_t_end, split_t0))
 
         self.split_t0 = split_t0
         self.split_t_end = split_t_end

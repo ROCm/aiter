@@ -77,7 +77,7 @@ def build_moe_g2l_lut_module():
         # Load 0/1 into LDS.
         if in_range:
             m = mask_p[tid]
-            mr0[tid] = fx.Int32(fx.arith.select(m != c0, c1, c0))
+            mr0[tid] = (m != c0).select(c1, c0)
 
         gpu.barrier()
 
@@ -89,10 +89,8 @@ def build_moe_g2l_lut_module():
             if in_range:
                 val = src[tid]
                 has_prev = tid >= fx.Int32(offset)
-                rd_idx = fx.Int32(
-                    fx.arith.select(has_prev, tid - fx.Int32(offset), tid)
-                )
-                prev = fx.Int32(fx.arith.select(has_prev, src[rd_idx], c0))
+                rd_idx = has_prev.select(tid - fx.Int32(offset), tid)
+                prev = has_prev.select(src[rd_idx], c0)
                 dst[tid] = val + prev
             gpu.barrier()
             src, dst = dst, src
@@ -102,7 +100,7 @@ def build_moe_g2l_lut_module():
             incl = src[tid]
             m2 = mask_p[tid]
             local = incl - c1
-            lut_p[tid] = fx.Int32(fx.arith.select(m2 != c0, local, E))
+            lut_p[tid] = (m2 != c0).select(local, E)
 
     @flyc.jit
     def launch_g2l(

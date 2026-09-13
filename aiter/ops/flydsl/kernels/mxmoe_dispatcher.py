@@ -66,7 +66,7 @@ def _spart_output_tile_index(block_1d_id, M0, N0, group_num, m01, nmajor=False):
     # remap = group_id_x <= big_group_num ? gx*gs + gy : gx*gs + big - gx + gy
     remap_a = group_id_x * group_size + group_id_y
     remap_b = group_id_x * group_size + big_group_num - group_id_x + group_id_y
-    remap = fx.Int32(fx.arith.select(group_id_x <= big_group_num, remap_a, remap_b))
+    remap = (group_id_x <= big_group_num).select(remap_a, remap_b)
 
     if nmajor:
         if m01 != 1:
@@ -80,7 +80,7 @@ def _spart_output_tile_index(block_1d_id, M0, N0, group_num, m01, nmajor=False):
     # M0_tmp = M0 / M01 ; M0_mod_M01 = M0 - M0_tmp*M01 ; M01_adapt = (idx_M0 < M0 - M0_mod) ? M01 : M0_mod
     M0_tmp = _udiv(M0, m01c)
     M0_mod = M0 - M0_tmp * m01c
-    M01_adapt = fx.Int32(fx.arith.select(idx_M0 < (M0 - M0_mod), m01c, M0_mod))
+    M01_adapt = (idx_M0 < (M0 - M0_mod)).select(m01c, M0_mod)
 
     idx_M00 = _udiv(idx_M0, m01c)
     idx_M01 = idx_M0 - idx_M00 * m01c
@@ -442,7 +442,7 @@ def compile_gemm2_a4w4_port(
             total_m_blocks = _udiv(cumsum0, BM)
             # ceil((total_m_blocks - m_tile0) / cu_num), clamped to 0 when m_tile0 >= total_m_blocks.
             diff = total_m_blocks - m_tile0
-            rem = fx.Int32(fx.arith.select(diff > fx.Int32(0), diff, fx.Int32(0)))
+            rem = (diff > fx.Int32(0)).select(diff, fx.Int32(0))
             n_iters = _udiv(rem + c_stride - fx.Int32(1), c_stride)
             for _it in range(
                 fx.Int32(0),

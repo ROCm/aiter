@@ -459,17 +459,11 @@ def _softmax(
                             if kv_len is None
                             else fx.min(q_max, kv_len - fx.Int32(1))
                         )
-                        sval = fx.Float32(
-                            fx.arith.select(kv_pos > ubound, neg_inf, sval)
-                        )
+                        sval = (kv_pos > ubound).select(neg_inf, sval)
                     if q_min is not None:
-                        sval = fx.Float32(
-                            fx.arith.select(kv_pos < q_min, neg_inf, sval)
-                        )
+                        sval = (kv_pos < q_min).select(neg_inf, sval)
                     if kv_len is not None and q_max is None:
-                        sval = fx.Float32(
-                            fx.arith.select(kv_pos >= kv_len, neg_inf, sval)
-                        )
+                        sval = (kv_pos >= kv_len).select(neg_inf, sval)
                 s_masked.append(sval)
         s_masked_list.append(s_masked)
 
@@ -497,7 +491,7 @@ def _softmax(
             need = fsub(row_max, m_prev) > fx.Float32(RESCALE_THRESHOLD)
             mask = rocdl.ballot(fx.Int32.ir_type, need)
             do_rescale = fx.Int32(mask) != fx.Int32(0)
-            m_new = fx.Float32(fx.arith.select(do_rescale, m_full, m_prev))
+            m_new = do_rescale.select(m_full, m_prev)
         else:
             do_rescale = None
             m_new = m_full
@@ -1284,10 +1278,8 @@ def _core_attention(
         d_final = fx.Float32(final[qt * _QS + 1])
         o_final = [fx.Vector(final[qt * _QS + 2 + dt]) for dt in range(d_tiles)]
         # Fully-masked row (d_final==0): 1/0=inf, o_final=0, 0*inf=NaN -> guard to O=0.
-        inv = fx.Float32(
-            fx.arith.select(
-                d_final > fx.Float32(0.0), fx.Float32(1.0) / d_final, fx.Float32(0.0)
-            )
+        inv = (d_final > fx.Float32(0.0)).select(
+            fx.Float32(1.0) / d_final, fx.Float32(0.0)
         )
         inv_vec = fx.Vector.from_elements([inv], fx.Float32).broadcast_to(8)
         # NOTE (mode-2): tying o_final through va_vdst here (to cover the final PV-wmma
@@ -1339,10 +1331,8 @@ def _core_attention(
             )
             # Pre-mask the offset (OOB rows -> 0x7fffffff) and pass mask=None so the
             # store maps 1:1 to a single buffer_store with masking already SSA-visible.
-            lse_off_masked = fx.Int32(
-                fx.arith.select(
-                    lse_mask, lse_off_el * fx.Int32(4), fx.Int32(0x7FFFFFFF)
-                )
+            lse_off_masked = lse_mask.select(
+                lse_off_el * fx.Int32(4), fx.Int32(0x7FFFFFFF)
             )
             buffer_ops.buffer_store(
                 lse_val, lse_rsrc, lse_off_masked, mask=None, offset_is_bytes=True
@@ -1394,9 +1384,7 @@ def _zero_fill_attention(
         seq = prow // g
         head = kv_head * g + prow % g
         off = (q_start + seq) * stride_o_seq + head * stride_o_head + d
-        off_masked = fx.Int32(
-            fx.arith.select(seq < q_len, off * fx.Int32(2), fx.Int32(0x7FFFFFFF))
-        )
+        off_masked = (seq < q_len).select(off * fx.Int32(2), fx.Int32(0x7FFFFFFF))
         buffer_ops.buffer_store(
             zero_o, o_rsrc, off_masked, mask=None, offset_is_bytes=True
         )
@@ -1414,9 +1402,7 @@ def _zero_fill_attention(
         else:
             lse_val = fx.Float32(float("-inf"))
         off = (q_start + seq) * stride_lse_seq + head * stride_lse_head
-        off_masked = fx.Int32(
-            fx.arith.select(seq < q_len, off * fx.Int32(4), fx.Int32(0x7FFFFFFF))
-        )
+        off_masked = (seq < q_len).select(off * fx.Int32(4), fx.Int32(0x7FFFFFFF))
         buffer_ops.buffer_store(
             lse_val, lse_rsrc, off_masked, mask=None, offset_is_bytes=True
         )

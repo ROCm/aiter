@@ -224,7 +224,10 @@ def do_tile(m_tile, n_tile_base, expert, sched, a_gather, a_s2r, b_loader, b_sca
             acc = [Vec(a) for a in state]
             cur_off = (sp & fx.Int32(1)) * fx.Int32(a_lds_i32)
             nxt_off = ((sp + fx.Int32(1)) & fx.Int32(1)) * fx.Int32(a_lds_i32)
-            spn = fx.Int32(fx.arith.select(sp + fx.Int32(1) < last, sp + fx.Int32(1), last))
+            spn = (sp + fx.Int32(1) < last).select(
+                sp + fx.Int32(1),
+                last,
+            )
 
             def a_load(mi, ks, _base=cur_off):
                 return a_s2r.load_operand(a_buf, mi, ks, _base)

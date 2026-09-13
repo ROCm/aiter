@@ -49,10 +49,8 @@ def emit_per_1x32_mx_fp8_group(in_buf, out_buf, scale_buf, group_id):
     ).bitcast(fx.Int32)
     mantissa = working & fx.Int32(0x7FFFFF)
     biased_exp = (working >> fx.Int32(23)) & fx.Int32(0xFF)
-    e8m0 = fx.Int32(
-        fx.arith.select(mantissa != fx.Int32(0), biased_exp + fx.Int32(1), biased_exp)
-    )
-    e8m0 = fx.Int32(fx.arith.select(e8m0 > fx.Int32(255), fx.Int32(255), e8m0))
+    e8m0 = (mantissa != fx.Int32(0)).select(biased_exp + fx.Int32(1), biased_exp)
+    e8m0 = (e8m0 > fx.Int32(255)).select(fx.Int32(255), e8m0)
     scale_buf[group_id] = e8m0.to(fx.Uint8)
 
     quant_scale = ((fx.Int32(254) - e8m0) << fx.Int32(23)).bitcast(fx.Float32)
@@ -111,14 +109,10 @@ def build_per_1x32_mx_quant_module(n: int, quant_mode: str):
                 ).bitcast(fx.Int32)
                 mantissa = working & fx.Int32(0x7FFFFF)
                 biased_exp = (working >> fx.Int32(23)) & fx.Int32(0xFF)
-                e8m0 = fx.Int32(
-                    fx.arith.select(
-                        mantissa != fx.Int32(0), biased_exp + fx.Int32(1), biased_exp
-                    )
+                e8m0 = (mantissa != fx.Int32(0)).select(
+                    biased_exp + fx.Int32(1), biased_exp
                 )
-                e8m0 = fx.Int32(
-                    fx.arith.select(e8m0 > fx.Int32(255), fx.Int32(255), e8m0)
-                )
+                e8m0 = (e8m0 > fx.Int32(255)).select(fx.Int32(255), e8m0)
                 scale_buf[group_id] = e8m0.to(fx.Uint8)
 
                 dequant_scale = (e8m0 << fx.Int32(23)).bitcast(fx.Float32)
@@ -234,9 +228,7 @@ def build_mxfp4_moe_scale_sort_module(cols: int):
         def token_scale_base(row):
             fused = sid_buf[row]
             token = fused & fx.Int32(0xFFFFFF)
-            return fx.Int32(
-                fx.arith.select(token < token_max, token, token_max)
-            ) * fx.Int32(scale_cols)
+            return (token < token_max).select(token, token_max) * fx.Int32(scale_cols)
 
         def load_byte(offset):
             return scale_buf[offset].to(fx.Int32)

@@ -398,7 +398,7 @@ def xcd_remap_bx_by(
     _r = _num_wgs % _c_xcds
     _xcd = _linear_id % _c_xcds
     _in_xcd = _linear_id // _c_xcds
-    _clip = fx.Index(fx.arith.select(_xcd < _r, _xcd, _r))
+    _clip = (_xcd < _r).select(_xcd, _r)
     _wgid = _xcd * _q + _clip + _in_xcd
 
     _c_wgm = fx.Index(xcd_swizzle)
@@ -406,9 +406,7 @@ def xcd_remap_bx_by(
     _group_id = _wgid // _num_wgid_in_group
     _first_pid_m = _group_id * _c_wgm
     _remaining_m = _gy - _first_pid_m
-    _group_size_m = fx.Index(
-        fx.arith.select(_remaining_m < _c_wgm, _remaining_m, _c_wgm)
-    )
+    _group_size_m = (_remaining_m < _c_wgm).select(_remaining_m, _c_wgm)
 
     _wgid_in_group = _wgid % _num_wgid_in_group
     new_bx = _first_pid_m + (_wgid_in_group % _group_size_m)

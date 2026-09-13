@@ -104,14 +104,9 @@ def build_dcp_topk_merge_module(n_cand, k_loc, topk_tokens, page_size, world_siz
         for step in range_constexpr(steps):
             c = step * _BLOCK_THREADS + tid
             in_cand = c < fx.Int32(n_cand)
-            ords_reg[step] = fx.Int32(
-                fx.arith.select(
-                    in_cand,
-                    _f32_to_ord(
-                        row_sc[fx.Int32(fx.arith.select(in_cand, c, fx.Int32(0)))]
-                    ),
-                    fx.Int32(_INT32_MIN),
-                )
+            ords_reg[step] = in_cand.select(
+                _f32_to_ord(row_sc[in_cand.select(c, fx.Int32(0))]),
+                fx.Int32(_INT32_MIN),
             )
 
         storage = fx.SharedAllocator().allocate(_make_storage())
@@ -140,22 +135,14 @@ def build_dcp_topk_merge_module(n_cand, k_loc, topk_tokens, page_size, world_siz
                     _DPP_BANK_MASK,
                     True,
                 )
-                val = fx.Int32(
-                    fx.arith.select(
-                        lane >= fx.Int32(threshold), val + fx.Int32(remote), val
-                    )
-                )
+                val = (lane >= fx.Int32(threshold)).select(val + fx.Int32(remote), val)
                 val_raw = unwrap_val(val)
             src16 = (lane & fx.Int32(0x30)) - 1
             r16 = fly_rocdl.ds_bpermute(T.i32, src16 * fx.Int32(4), val)
-            val = fx.Int32(
-                fx.arith.select(lane >= fx.Int32(16), val + fx.Int32(r16), val)
-            )
+            val = (lane >= fx.Int32(16)).select(val + fx.Int32(r16), val)
             src32 = (lane & fx.Int32(0x30)) - fx.Int32(17)
             r32 = fly_rocdl.ds_bpermute(T.i32, src32 * fx.Int32(4), val)
-            return fx.Int32(
-                fx.arith.select(lane >= fx.Int32(32), val + fx.Int32(r32), val)
-            )
+            return (lane >= fx.Int32(32)).select(val + fx.Int32(r32), val)
 
         def block_exclusive_prefix_i32(val, scan):
             lane = tid % fx.Int32(_WAVE_SIZE)
@@ -218,10 +205,8 @@ def build_dcp_topk_merge_module(n_cand, k_loc, topk_tokens, page_size, world_siz
                     if const_expr(byte_pos == 0):
                         pass
                     else:
-                        keep = fx.Int32(
-                            fx.arith.select(
-                                (ords & dmask) == prefix, fx.Int32(1), fx.Int32(0)
-                            )
+                        keep = ((ords & dmask) == prefix).select(
+                            fx.Int32(1), fx.Int32(0)
                         )
                     if keep != 0:
                         bv = (
@@ -273,22 +258,12 @@ def build_dcp_topk_merge_module(n_cand, k_loc, topk_tokens, page_size, world_siz
         for step in range_constexpr(steps):
             c = step * _BLOCK_THREADS + tid
             in_cand = c < fx.Int32(n_cand)
-            before_base = fx.Int32(
-                fx.arith.select(
-                    in_cand,
-                    fx.Int32(fx.arith.select(c < base, fx.Int32(1), fx.Int32(0))),
-                    fx.Int32(0),
-                )
+            before_base = in_cand.select(
+                (c < base).select(fx.Int32(1), fx.Int32(0)), fx.Int32(0)
             )
             ords_all = ords_reg[step]
-            prior_eq_local = prior_eq_local + fx.Int32(
-                fx.arith.select(
-                    before_base != 0,
-                    fx.Int32(
-                        fx.arith.select(ords_all == threshold, fx.Int32(1), fx.Int32(0))
-                    ),
-                    fx.Int32(0),
-                )
+            prior_eq_local = prior_eq_local + (before_base != 0).select(
+                (ords_all == threshold).select(fx.Int32(1), fx.Int32(0)), fx.Int32(0)
             )
         _, prior_eq_total = block_exclusive_prefix_i32(prior_eq_local, s_scan)
         if tid == 0:
@@ -303,33 +278,17 @@ def build_dcp_topk_merge_module(n_cand, k_loc, topk_tokens, page_size, world_siz
         for step in range_constexpr(own_steps):
             t = step * _BLOCK_THREADS + tid
             in_range = t < fx.Int32(k_loc)
-            safe_t = fx.Int32(fx.arith.select(in_range, t, fx.Int32(0)))
+            safe_t = in_range.select(t, fx.Int32(0))
             ords = _f32_to_ord(row_sc[base + safe_t])
             j = row_local[safe_t]
-            live = fx.Int32(
-                fx.arith.select(
-                    in_range,
-                    fx.Int32(fx.arith.select(j >= 0, fx.Int32(1), fx.Int32(0))),
-                    fx.Int32(0),
-                )
+            live = in_range.select(
+                (j >= 0).select(fx.Int32(1), fx.Int32(0)), fx.Int32(0)
             )
-            above = fx.Int32(
-                fx.arith.select(
-                    live != 0,
-                    fx.Int32(
-                        fx.arith.select(ords > threshold, fx.Int32(1), fx.Int32(0))
-                    ),
-                    fx.Int32(0),
-                )
+            above = (live != 0).select(
+                (ords > threshold).select(fx.Int32(1), fx.Int32(0)), fx.Int32(0)
             )
-            equal = fx.Int32(
-                fx.arith.select(
-                    live != 0,
-                    fx.Int32(
-                        fx.arith.select(ords == threshold, fx.Int32(1), fx.Int32(0))
-                    ),
-                    fx.Int32(0),
-                )
+            equal = (live != 0).select(
+                (ords == threshold).select(fx.Int32(1), fx.Int32(0)), fx.Int32(0)
             )
             # ONE packed scan instead of two sequential ones. The naive form
             # scans `equal`, derives `keep` from its prefix, then scans `keep` --
@@ -351,22 +310,16 @@ def build_dcp_topk_merge_module(n_cand, k_loc, topk_tokens, page_size, world_siz
             eq_run = s_acc[4]
             # Room left for equal-valued candidates, globally.
             room = remaining_k - eq_run
-            room = fx.Int32(fx.arith.select(room < 0, fx.Int32(0), room))
-            admit_eq = fx.Int32(
-                fx.arith.select(
-                    equal != 0,
-                    fx.Int32(
-                        fx.arith.select(eq_before < room, fx.Int32(1), fx.Int32(0))
-                    ),
-                    fx.Int32(0),
-                )
+            room = (room < 0).select(fx.Int32(0), room)
+            admit_eq = (equal != 0).select(
+                (eq_before < room).select(fx.Int32(1), fx.Int32(0)), fx.Int32(0)
             )
             keep = above + admit_eq
             # Equals admitted strictly before this thread this step.
-            eq_adm_before = fx.Int32(fx.arith.select(eq_before < room, eq_before, room))
+            eq_adm_before = (eq_before < room).select(eq_before, room)
             dst_off = ab_before + eq_adm_before
             # Total admitted this step = all aboves + the equals that fit.
-            eq_adm_total = fx.Int32(fx.arith.select(eq_total < room, eq_total, room))
+            eq_adm_total = (eq_total < room).select(eq_total, room)
             keep_total = ab_total + eq_adm_total
             if keep != 0:
                 slot = row_bt[j // fx.Int32(page_size)] * fx.Int32(page_size) + (
@@ -438,22 +391,14 @@ def build_dcp_topk_merge_module(n_cand, k_loc, topk_tokens, page_size, world_siz
                     _DPP_BANK_MASK,
                     True,
                 )
-                val = fx.Int32(
-                    fx.arith.select(
-                        lane >= fx.Int32(threshold), val + fx.Int32(remote), val
-                    )
-                )
+                val = (lane >= fx.Int32(threshold)).select(val + fx.Int32(remote), val)
                 val_raw = unwrap_val(val)
             src16 = (lane & fx.Int32(0x30)) - 1
             r16 = fly_rocdl.ds_bpermute(T.i32, src16 * fx.Int32(4), val)
-            val = fx.Int32(
-                fx.arith.select(lane >= fx.Int32(16), val + fx.Int32(r16), val)
-            )
+            val = (lane >= fx.Int32(16)).select(val + fx.Int32(r16), val)
             src32 = (lane & fx.Int32(0x30)) - fx.Int32(17)
             r32 = fly_rocdl.ds_bpermute(T.i32, src32 * fx.Int32(4), val)
-            return fx.Int32(
-                fx.arith.select(lane >= fx.Int32(32), val + fx.Int32(r32), val)
-            )
+            return (lane >= fx.Int32(32)).select(val + fx.Int32(r32), val)
 
         def block_exclusive_prefix_i32(val, scan):
             lane = tid % fx.Int32(_WAVE_SIZE)
@@ -489,12 +434,8 @@ def build_dcp_topk_merge_module(n_cand, k_loc, topk_tokens, page_size, world_siz
         step_blk = fx.Int32(_BLOCK_THREADS)
         for _ in range(fx.Int32(0), (rows_n + step_blk - 1) // step_blk, fx.Int32(1)):
             r = base + tid
-            cnt = fx.Int32(
-                fx.arith.select(
-                    r < rows_n,
-                    owned_counts[fx.Int32(fx.arith.select(r < rows_n, r, fx.Int32(0)))],
-                    fx.Int32(0),
-                )
+            cnt = (r < rows_n).select(
+                owned_counts[(r < rows_n).select(r, fx.Int32(0))], fx.Int32(0)
             )
             excl, chunk_total = block_exclusive_prefix_i32(cnt, s_scan)
             # Exactly one thread holds this block's row, and `excl` is a private

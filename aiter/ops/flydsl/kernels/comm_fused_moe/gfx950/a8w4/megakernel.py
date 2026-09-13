@@ -1263,12 +1263,10 @@ def compile_megakernel(
                     config.compute_groups
                 )
                 has_extra = compute_group < remainder
-                iteration_count = base_iterations + fx.Int32(
-                    fx.arith.select(has_extra, fx.Int32(1), fx.Int32(0))
+                iteration_count = base_iterations + has_extra.select(
+                    fx.Int32(1), fx.Int32(0)
                 )
-                start_tail = fx.Int32(
-                    fx.arith.select(has_extra, compute_group, remainder)
-                )
+                start_tail = has_extra.select(compute_group, remainder)
                 start_m_block = compute_group * base_iterations + start_tail
                 for iteration in range(fx.Int32(0), iteration_count, fx.Int32(1)):
                     gpu.barrier()
@@ -1299,12 +1297,9 @@ def compile_megakernel(
                 )
                 service_begin = fx.Int32(config.compute_groups - config.service_groups)
                 fx.ptr_store(
-                    fx.Int32(
-                        fx.arith.select(
-                            ticket >= service_begin,
-                            ticket - service_begin + fx.Int32(1),
-                            fx.Int32(0),
-                        )
+                    (ticket >= service_begin).select(
+                        ticket - service_begin + fx.Int32(1),
+                        fx.Int32(0),
                     ),
                     service_marker_ptr,
                 )

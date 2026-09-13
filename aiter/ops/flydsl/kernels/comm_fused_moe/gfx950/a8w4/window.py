@@ -334,16 +334,11 @@ def _compose_cycle(
                 is_compute = (linear >= fx.Int32(service_grid * 3)) | (
                     paired & (slot != fx.Int32(0))
                 )
-                raw_compute = fx.Int32(
-                    fx.arith.select(
-                        paired,
-                        (linear // fx.Int32(3)) * fx.Int32(2) + slot - fx.Int32(1),
-                        linear - fx.Int32(service_grid),
-                    )
+                raw_compute = paired.select(
+                    (linear // fx.Int32(3)) * fx.Int32(2) + slot - fx.Int32(1),
+                    linear - fx.Int32(service_grid),
                 )
-                compute_worker = fx.Int32(
-                    fx.arith.select(is_compute, raw_compute, fx.Int32(0))
-                )
+                compute_worker = is_compute.select(raw_compute, fx.Int32(0))
                 service_worker = linear // fx.Int32(3)
             else:
                 compute_worker = linear
