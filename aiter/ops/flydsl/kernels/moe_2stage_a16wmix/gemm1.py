@@ -57,6 +57,9 @@ def _gemm1_body_a16w4(
     w_layout="standard",
     k_wave=1,
     use_k16=False,
+    out_stride=None,
+    token_slot_output=False,
+    fixed_expert=None,
 ):
     """a16w4/a16wi4/a16w16 (bf16 A x mxfp4/int4/bf16 W) fused stage1 gemm1 body.
 
@@ -65,6 +68,7 @@ def _gemm1_body_a16w4(
     -> bf16 intermediate ``[sorted_size, inter_dim]`` stored by SORTED POSITION.
     """
     N_OUT = 2 * INTER
+    OUT_STRIDE = INTER if out_stride is None else out_stride
     elem_bytes = 2  # bf16
     a_elem_bytes = 2
     KH_TILE_BYTES = TILE_K * a_elem_bytes  # A-LDS bytes per row per K-tile
@@ -105,7 +109,11 @@ def _gemm1_body_a16w4(
     # ---- grid decode: m-block (expert block) x n-block (inter tile) -----------
     n_block_idx = bx_i32 % fx.Int32(NUM_N_BLOCKS)
     m_block_idx = bx_i32 // fx.Int32(NUM_N_BLOCKS)
-    e = rocdl.readfirstlane(T.i32, _raw(_global_i32_at(arg_eids, m_block_idx)))
+    e = (
+        fx.Int32(fixed_expert)
+        if const_expr(fixed_expert is not None)
+        else rocdl.readfirstlane(T.i32, _raw(_global_i32_at(arg_eids, m_block_idx)))
+    )
     bx_m = m_block_idx * fx.Int32(BM)  # first sorted row of this m-block
     by_n = n_block_idx * fx.Int32(TILE_N)
     inter_i32 = fx.Int32(INTER)
@@ -134,7 +142,7 @@ def _gemm1_body_a16w4(
     _cumsum0 = _global_i32_at(arg_cumsum, fx.Int32(0))
     out_rsrc = buffer_ops.create_buffer_resource_from_addr(
         _raw(fx.Int64(arg_out)),
-        num_records_bytes=_raw(fx.Int64(_cumsum0) * fx.Int64(INTER * 2)),
+        num_records_bytes=_raw(fx.Int64(_cumsum0) * fx.Int64(OUT_STRIDE * 2)),
     )
 
     # ---- A path (shared with gemm2, see utils.make_a_loader) -------------------
@@ -353,6 +361,7 @@ def _gemm1_body_a16w4(
             sorted_row = bx_m + row_in_tile
             fused = fx.Int32(_global_i32_at(arg_mind, sorted_row))
             token = fused & fx.Int32(0x00FFFFFF)
+            slot = fused >> fx.Int32(24)
             valid = token < i32_ntok
             if const_expr(k_wave > 1):
                 valid = valid & _is_primary
@@ -361,7 +370,12 @@ def _gemm1_body_a16w4(
                 u = fx.Float32(fx.Vector(fx.memref_load_vec(acc_up[mi][ni]))[ii])
                 y = gate_up_act(act, [g], [u], situ)[0]
                 yb = y.to(fx.BFloat16)
-                out_idx = sorted_row * inter_i32 + col_g_list[ni]
+                out_row = (
+                    token * fx.Int32(TOPK) + slot
+                    if const_expr(token_slot_output)
+                    else sorted_row
+                )
+                out_idx = out_row * fx.Int32(OUT_STRIDE) + col_g_list[ni]
                 buffer_ops.buffer_store(yb, _raw(out_rsrc), _raw(out_idx), mask=valid)
 
 

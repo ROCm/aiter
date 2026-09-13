@@ -30,11 +30,14 @@ from flydsl.expr.typing import T
 from flydsl.runtime.device import get_rocm_arch as get_hip_arch
 
 from aiter.ops.flydsl.kernels import buffer_ops
+from aiter.ops.flydsl.kernels.act import situ_params
 from aiter.ops.flydsl.kernels.kernels_common import default_f8_type
 from aiter.ops.flydsl.moe_common import GateMode
 
 from .layout_utils import crd2idx, idx2crd
 from .mfma_epilogues import c_shuffle_epilog, default_epilog
+from .moe_2stage_a16wmix.gemm1 import _gemm1_body_a16w4
+from .moe_2stage_a16wmix.gemm2 import _gemm2_body_a16w4
 from .mfma_preshuffle_pipeline import (
     _buffer_load_vec,
     buffer_copy_gmem16_dwordx4,
@@ -147,10 +150,12 @@ def compile_mixed_moe_gemm1_common(
             )
         if (shared_a_dtype, shared_b_dtype) != ("bf16", "bf16"):
             raise ValueError("K3 latent FHMoE shared stage1 must use BF16 x BF16")
-        raise NotImplementedError(
-            "Latent FHMoE stage1 needs a BF16 shared-A/shared-W MFMA loader in "
-            "the common persistent kernel"
-        )
+        if act != "situv2":
+            raise ValueError("K3 latent FHMoE stage1 requires SiTUv2")
+        if k_batch != 1 or k_wave != 1:
+            raise ValueError("K3 latent FHMoE stage1 does not support split-K")
+        if shared_model_dim % tile_k or shared_inter_dim % tile_n:
+            raise ValueError("Shared K and intermediate dimensions must tile exactly")
     if heterogeneous_b and shared_expert_id != experts - 1:
         raise ValueError(
             "FHMoE stage1 requires shared_expert_id == experts - 1; "
@@ -281,6 +286,10 @@ def compile_mixed_moe_gemm1_common(
     # therefore must not be part of the on-disk symbol/cache identity.
     act_tag = "" if act == "silu" else f"_{act}"
     heterogeneous_tag = f"_shared_fp8_e{shared_expert_id}" if heterogeneous_b else ""
+    if latent_heterogeneous:
+        heterogeneous_tag = (
+            f"_latent_bf16_e{shared_expert_id}_h{shared_model_dim}_i{shared_inter_dim}"
+        )
     # ABI v33 adds four runtime SiTUv2 beta scalars; heterogeneous ABI tracks one
     # version ahead of the ordinary kernel.
     kernel_version = 34 if heterogeneous_b else 33
@@ -320,6 +329,11 @@ def compile_mixed_moe_gemm1_common(
     else:
         pong_buffer_bytes = max(x_region_bytes, lds_out_bytes)
         ping_buffer_bytes = x_region_bytes
+    if latent_heterogeneous:
+        # The BF16 body stages two BM x TILE_K A tiles in one LDS allocation.
+        pong_buffer_bytes = max(
+            pong_buffer_bytes, 2 * int(tile_m) * int(tile_k) * 2
+        )
 
     def x_lds_elem():
         return default_f8_type()
@@ -347,7 +361,11 @@ def compile_mixed_moe_gemm1_common(
     w_elem_bytes = 1
     w_elem_pack = 2 if is_f4_b else 1
     w_nbytes = (experts * (2 * inter_dim) * model_dim * w_elem_bytes) // w_elem_pack
-    shared_w_nbytes = (2 * inter_dim) * model_dim
+    shared_w_nbytes = (
+        (2 * int(shared_inter_dim)) * int(shared_model_dim) * 2
+        if latent_heterogeneous
+        else (2 * inter_dim) * model_dim
+    )
     bias_nbytes = experts * (2 * inter_dim) * 4
 
     e_vec_s1 = min(tile_n // 32, 8)
@@ -439,6 +457,7 @@ def compile_mixed_moe_gemm1_common(
         def _emit_moe_gemm1(
             arg_out: fx.Pointer,
             arg_x: fx.Pointer,
+            arg_shared_x: fx.Pointer,
             arg_w: fx.Pointer,
             arg_scale_x: fx.Pointer,
             arg_scale_w: fx.Pointer,
@@ -2337,6 +2356,8 @@ def compile_mixed_moe_gemm1_common(
                         else (inter_dim if need_fp8 else inter_dim * out_elem_bytes)
                     )
                 )
+                if const_expr(latent_heterogeneous):
+                    out_row_stride = shared_inter_dim * out_elem_bytes
 
                 def precompute_row(*, row_local, row):
                     fused2 = fx.ptr_load(lds_tid + fx.Int32(row_local)).ir_value()
@@ -2894,7 +2915,67 @@ def compile_mixed_moe_gemm1_common(
             @flyc.jit
             def _gemm1_dispatch():
                 if blk_valid and exp_valid:
-                    if const_expr(heterogeneous_b):
+                    if const_expr(latent_heterogeneous):
+                        if is_shared_expert:
+                            if by < arith.constant(
+                                shared_inter_dim // tile_n, index=True
+                            ):
+                                shared_tile = (
+                                    bx
+                                    * arith.constant(
+                                        shared_inter_dim // tile_n, index=True
+                                    )
+                                    + by
+                                )
+                                shared_situ = situ_params(
+                                    f32_situ_beta,
+                                    f32_situ_beta_rcp,
+                                    f32_situ_linear_beta,
+                                    f32_situ_linear_beta_rcp,
+                                    f32_swiglu_limit,
+                                )
+                                shared_lds_ptr = fx.inttoptr(
+                                    fx.PointerType.get(
+                                        T.i8, fx.AddressSpace.Shared, 16
+                                    ),
+                                    arith.index_cast(T.i64, fx.ptrtoint(base_ptr_pong)),
+                                )
+                                _gemm1_body_a16w4(
+                                    shared_lds_ptr,
+                                    arith.index_cast(T.i64, fx.ptrtoint(arg_shared_x)),
+                                    arith.index_cast(T.i64, fx.ptrtoint(arg_shared_w)),
+                                    arith.index_cast(
+                                        T.i64, fx.ptrtoint(arg_shared_scale_w)
+                                    ),
+                                    arith.index_cast(T.i64, fx.ptrtoint(arg_expert_ids)),
+                                    arith.index_cast(
+                                        T.i64, fx.ptrtoint(arg_sorted_token_ids)
+                                    ),
+                                    arith.index_cast(
+                                        T.i64, fx.ptrtoint(arg_num_valid_ids)
+                                    ),
+                                    arith.index_cast(T.i64, fx.ptrtoint(arg_out)),
+                                    arith.index_cast(T.i32, shared_tile),
+                                    arith.index_cast(T.i32, tx % arith.index(64)),
+                                    arith.index_cast(T.i32, tx // arith.index(64)),
+                                    i32_tokens_in,
+                                    shared_situ,
+                                    BM=tile_m,
+                                    TILE_N=tile_n,
+                                    TILE_K=tile_k,
+                                    K=shared_model_dim,
+                                    INTER=shared_inter_dim,
+                                    NE=1,
+                                    TOPK=topk,
+                                    act="situv2",
+                                    w_dtype="bf16",
+                                    out_stride=shared_inter_dim,
+                                    token_slot_output=True,
+                                    fixed_expert=0,
+                                )
+                        elif by < arith.constant(inter_dim // tile_n, index=True):
+                            moe_gemm1_body(shared_b=False)
+                    elif const_expr(heterogeneous_b):
                         if is_shared_expert:
                             moe_gemm1_body(shared_b=True)
                         else:
@@ -2934,7 +3015,61 @@ def compile_mixed_moe_gemm1_common(
 
             _run_persist()
 
-    if heterogeneous_b:
+    if latent_heterogeneous:
+
+        @flyc.kernel(name=module_name, known_block_size=[total_threads, 1, 1])
+        def moe_gemm1(
+            arg_out: fx.Pointer,
+            arg_x: fx.Pointer,
+            arg_shared_x: fx.Pointer,
+            arg_w: fx.Pointer,
+            arg_scale_x: fx.Pointer,
+            arg_scale_w: fx.Pointer,
+            arg_shared_w: fx.Pointer,
+            arg_shared_scale_w: fx.Pointer,
+            arg_sorted_token_ids: fx.Pointer,
+            arg_expert_ids: fx.Pointer,
+            arg_sorted_weights: fx.Pointer,
+            arg_num_valid_ids: fx.Pointer,
+            arg_bias: fx.Pointer,
+            arg_out_scale_sorted: fx.Pointer,
+            i32_tokens_in: fx.Int32,
+            i32_n_in: fx.Int32,
+            i32_k_in: fx.Int32,
+            i32_size_expert_ids_in: fx.Int32,
+            f32_situ_beta: fx.Float32,
+            f32_situ_beta_rcp: fx.Float32,
+            f32_situ_linear_beta: fx.Float32,
+            f32_situ_linear_beta_rcp: fx.Float32,
+            f32_swiglu_limit: fx.Float32,
+        ):
+            _emit_moe_gemm1(
+                arg_out,
+                arg_x,
+                arg_shared_x,
+                arg_w,
+                arg_scale_x,
+                arg_scale_w,
+                arg_shared_w,
+                arg_shared_scale_w,
+                arg_sorted_token_ids,
+                arg_expert_ids,
+                arg_sorted_weights,
+                arg_num_valid_ids,
+                arg_bias,
+                arg_out_scale_sorted,
+                i32_tokens_in,
+                i32_n_in,
+                i32_k_in,
+                i32_size_expert_ids_in,
+                f32_situ_beta,
+                f32_situ_beta_rcp,
+                f32_situ_linear_beta,
+                f32_situ_linear_beta_rcp,
+                f32_swiglu_limit,
+            )
+
+    elif heterogeneous_b:
 
         @flyc.kernel(name=module_name, known_block_size=[total_threads, 1, 1])
         def moe_gemm1(
@@ -2963,6 +3098,7 @@ def compile_mixed_moe_gemm1_common(
         ):
             _emit_moe_gemm1(
                 arg_out,
+                arg_x,
                 arg_x,
                 arg_w,
                 arg_scale_x,
@@ -3013,6 +3149,7 @@ def compile_mixed_moe_gemm1_common(
         ):
             _emit_moe_gemm1(
                 arg_out,
+                arg_x,
                 arg_x,
                 arg_w,
                 arg_scale_x,
@@ -3065,6 +3202,7 @@ def compile_mixed_moe_gemm1_common(
     def _launch_mixed_moe_gemm1(
         arg_out: fx.Pointer,
         arg_x: fx.Pointer,
+        arg_shared_x: fx.Pointer,
         arg_w: fx.Pointer,
         arg_scale_x: fx.Pointer,
         arg_scale_w: fx.Pointer,
@@ -3112,13 +3250,41 @@ def compile_mixed_moe_gemm1_common(
                 // tile_n_index
                 // arith.constant(2, index=True)
             )
+        if const_expr(latent_heterogeneous):
+            gx = arith.constant(shared_inter_dim // tile_n, index=True)
 
         c_pm_l = arith.constant(persist_m, index=True)
         gy = (
             fx.Index(i32_size_expert_ids_in) + c_pm_l - arith.constant(1, index=True)
         ) // c_pm_l
 
-        if const_expr(heterogeneous_b):
+        if const_expr(latent_heterogeneous):
+            launcher = moe_gemm1(
+                arg_out,
+                arg_x,
+                arg_shared_x,
+                arg_w,
+                arg_scale_x,
+                arg_scale_w,
+                arg_shared_w,
+                arg_shared_scale_w,
+                arg_sorted_token_ids,
+                arg_expert_ids,
+                arg_sorted_weights,
+                arg_max_token_ids,
+                arg_bias,
+                arg_out_scale_sorted,
+                i32_tokens_in,
+                i32_inter_in,
+                i32_k_in,
+                i32_size_expert_ids_in,
+                f32_situ_beta,
+                f32_situ_beta_rcp,
+                f32_situ_linear_beta,
+                f32_situ_linear_beta_rcp,
+                f32_swiglu_limit,
+            )
+        elif const_expr(heterogeneous_b):
             launcher = moe_gemm1(
                 arg_out,
                 arg_x,
@@ -3175,7 +3341,63 @@ def compile_mixed_moe_gemm1_common(
             grid=(gx, gy, k_batch), block=(total_threads, 1, 1), stream=stream
         )
 
-    if heterogeneous_b:
+    if latent_heterogeneous:
+
+        @flyc.jit
+        def launch_mixed_moe_gemm1(
+            arg_out: fx.Pointer,
+            arg_x: fx.Pointer,
+            arg_shared_x: fx.Pointer,
+            arg_w: fx.Pointer,
+            arg_scale_x: fx.Pointer,
+            arg_scale_w: fx.Pointer,
+            arg_shared_w: fx.Pointer,
+            arg_shared_scale_w: fx.Pointer,
+            arg_sorted_token_ids: fx.Pointer,
+            arg_expert_ids: fx.Pointer,
+            arg_sorted_weights: fx.Pointer,
+            arg_max_token_ids: fx.Pointer,
+            arg_bias: fx.Pointer,
+            arg_out_scale_sorted: fx.Pointer,
+            i32_tokens_in: fx.Int32,
+            i32_inter_in: fx.Int32,
+            i32_k_in: fx.Int32,
+            i32_size_expert_ids_in: fx.Int32,
+            f32_situ_beta: fx.Float32,
+            f32_situ_beta_rcp: fx.Float32,
+            f32_situ_linear_beta: fx.Float32,
+            f32_situ_linear_beta_rcp: fx.Float32,
+            f32_swiglu_limit: fx.Float32,
+            stream: fx.Stream,
+        ):
+            _launch_mixed_moe_gemm1(
+                arg_out,
+                arg_x,
+                arg_shared_x,
+                arg_w,
+                arg_scale_x,
+                arg_scale_w,
+                arg_shared_w,
+                arg_shared_scale_w,
+                arg_sorted_token_ids,
+                arg_expert_ids,
+                arg_sorted_weights,
+                arg_max_token_ids,
+                arg_bias,
+                arg_out_scale_sorted,
+                i32_tokens_in,
+                i32_inter_in,
+                i32_k_in,
+                i32_size_expert_ids_in,
+                f32_situ_beta,
+                f32_situ_beta_rcp,
+                f32_situ_linear_beta,
+                f32_situ_linear_beta_rcp,
+                f32_swiglu_limit,
+                stream,
+            )
+
+    elif heterogeneous_b:
 
         @flyc.jit
         def launch_mixed_moe_gemm1(
@@ -3205,6 +3427,7 @@ def compile_mixed_moe_gemm1_common(
         ):
             _launch_mixed_moe_gemm1(
                 arg_out,
+                arg_x,
                 arg_x,
                 arg_w,
                 arg_scale_x,
@@ -3257,6 +3480,7 @@ def compile_mixed_moe_gemm1_common(
         ):
             _launch_mixed_moe_gemm1(
                 arg_out,
+                arg_x,
                 arg_x,
                 arg_w,
                 arg_scale_x,
@@ -3335,10 +3559,10 @@ def compile_mixed_moe_gemm2_common(
             )
         if (shared_a_dtype, shared_b_dtype) != ("bf16", "bf16"):
             raise ValueError("K3 latent FHMoE shared stage2 must use BF16 x BF16")
-        raise NotImplementedError(
-            "Latent FHMoE stage2 needs max-intermediate addressing and a "
-            "separate shared-output epilogue in the common persistent kernel"
-        )
+        if shared_inter_dim % tile_k or shared_model_dim % tile_n:
+            raise ValueError("Shared K and output dimensions must tile exactly")
+        if persist_m <= 0:
+            raise ValueError("K3 latent FHMoE stage2 currently requires persist_m > 0")
     if heterogeneous_b and shared_expert_id != experts - 1:
         raise ValueError(
             "FHMoE stage2 requires shared_expert_id == experts - 1; "
@@ -3445,7 +3669,11 @@ def compile_mixed_moe_gemm2_common(
     w_elem_bytes = 1
     w_elem_pack = 2 if is_f4_b else 1
     w_nbytes = (experts * model_dim * inter_dim * w_elem_bytes) // w_elem_pack
-    shared_w_nbytes = model_dim * inter_dim
+    shared_w_nbytes = (
+        int(shared_model_dim) * int(shared_inter_dim) * 2
+        if latent_heterogeneous
+        else model_dim * inter_dim
+    )
     # #3476: host e8m0_shuffle pads scale group-N up to a multiple of 8, i.e.
     # 128- but not 256-aligned (e.g. 384) read OOB scales -> garbage e8m0 -> NaN.
     scale_k_padded = (inter_dim + 255) // 256 * 256
@@ -3512,6 +3740,10 @@ def compile_mixed_moe_gemm2_common(
     acc_tag = "" if accumulate else "_acc0"
     xcd_tag = f"_xcd{xcd_swizzle}" if xcd_swizzle > 0 else ""
     heterogeneous_tag = f"_shared_fp8_e{shared_expert_id}" if heterogeneous_b else ""
+    if latent_heterogeneous:
+        heterogeneous_tag = (
+            f"_latent_bf16_e{shared_expert_id}_h{shared_model_dim}_i{shared_inter_dim}"
+        )
     serial_n_tag = "_serialn128" if serial_shared_n else ""
     if heterogeneous_b:
         variant_tags = (
@@ -3532,6 +3764,12 @@ def compile_mixed_moe_gemm2_common(
     lds_tid_bytes = int(tile_m) * 4
     lds_tw_bytes = (int(tile_m) * 4) if bool(doweight_stage2) else 0
     lds_total_bytes = max(lds_x_bytes, lds_out_bytes) + lds_tid_bytes + lds_tw_bytes
+    if latent_heterogeneous:
+        # BF16 shared body needs one A tile plus a full f32 CShuffle tile.
+        lds_total_bytes = max(
+            lds_total_bytes,
+            int(tile_m) * int(tile_k) * 2 + int(tile_m) * int(tile_n) * 4,
+        )
     lds_total_elems = lds_total_bytes if a_elem_bytes == 1 else (lds_total_bytes // 2)
 
     def x_lds_elem():
@@ -3543,6 +3781,7 @@ def compile_mixed_moe_gemm2_common(
 
         def _emit_moe_gemm2(
             arg_out: fx.Pointer,
+            arg_shared_out: fx.Pointer,
             arg_x: fx.Pointer,
             arg_w: fx.Pointer,
             arg_scale_x: fx.Pointer,
@@ -3692,6 +3931,10 @@ def compile_mixed_moe_gemm2_common(
             c_elem_bytes = arith.constant(int(a_elem_bytes), index=True)
             c_a_pack = arith.constant(int(a_elem_vec_pack), index=True)
             x_nbytes_idx = _div_pow2(x_rows * k_in * c_elem_bytes, int(a_elem_vec_pack))
+            if const_expr(latent_heterogeneous):
+                x_nbytes_idx = (tokens_in * c_topk) * arith.constant(
+                    shared_inter_dim * 2, index=True
+                )
             x_nbytes_i32 = fx.Int32(x_nbytes_idx)
             x_rsrc = ptr_buffer_resource(arg_x, x_nbytes_i32)
 
@@ -3876,6 +4119,10 @@ def compile_mixed_moe_gemm2_common(
                     * arith.constant(int(a_elem_bytes), index=True),
                     4,
                 )
+                if const_expr(latent_heterogeneous):
+                    c_k_div4 = arith.constant(
+                        shared_inter_dim * 2 // 4, index=True
+                    )
                 tile_k_dwords = (int(tile_k) * int(a_elem_bytes)) // (
                     4 * int(a_elem_vec_pack)
                 )
@@ -5159,7 +5406,62 @@ def compile_mixed_moe_gemm2_common(
                 rocdl.s_setprio(0)
 
             def emit_moe_gemm2_body():
-                if const_expr(heterogeneous_b):
+                if const_expr(latent_heterogeneous):
+
+                    def _latent_shared():
+                        if by < arith.constant(shared_model_dim // tile_n, index=True):
+                            shared_tile = (
+                                bx
+                                * arith.constant(
+                                    shared_model_dim // tile_n, index=True
+                                )
+                                + by
+                            )
+                            shared_lds_ptr = fx.inttoptr(
+                                fx.PointerType.get(T.i8, fx.AddressSpace.Shared, 16),
+                                arith.index_cast(T.i64, fx.ptrtoint(base_ptr)),
+                            )
+                            _gemm2_body_a16w4(
+                                shared_lds_ptr,
+                                arith.index_cast(T.i64, fx.ptrtoint(arg_x)),
+                                arith.index_cast(T.i64, fx.ptrtoint(arg_shared_w)),
+                                arith.index_cast(
+                                    T.i64, fx.ptrtoint(arg_shared_scale_w)
+                                ),
+                                arith.index_cast(T.i64, fx.ptrtoint(arg_expert_ids)),
+                                arith.index_cast(
+                                    T.i64, fx.ptrtoint(arg_sorted_token_ids)
+                                ),
+                                arith.index_cast(
+                                    T.i64, fx.ptrtoint(arg_sorted_weights)
+                                ),
+                                arith.index_cast(T.i64, fx.ptrtoint(arg_shared_out)),
+                                arith.index_cast(T.i32, shared_tile),
+                                arith.index_cast(T.i32, tx % arith.index(64)),
+                                arith.index_cast(T.i32, tx // arith.index(64)),
+                                i32_tokens_in,
+                                BM=tile_m,
+                                TILE_N=tile_n,
+                                TILE_K=tile_k,
+                                N_OUT=shared_model_dim,
+                                INTER=shared_inter_dim,
+                                NE=1,
+                                w_dtype="bf16",
+                                a_stride=shared_inter_dim,
+                                topk=topk,
+                                token_slot_input=True,
+                                fixed_expert=0,
+                            )
+
+                    @flyc.jit
+                    def _fmt_dispatch():
+                        if fx.Boolean(is_shared_expert):
+                            _latent_shared()
+                        elif by < arith.constant(model_dim // tile_n, index=True):
+                            moe_gemm2_then_body(shared_b=False)
+
+                    _fmt_dispatch()
+                elif const_expr(heterogeneous_b):
 
                     def _fmt_then():
                         if const_expr(serial_shared_n):
@@ -5263,7 +5565,49 @@ def compile_mixed_moe_gemm2_common(
 
             _run_persist()
 
-    if heterogeneous_b:
+    if latent_heterogeneous:
+
+        @flyc.kernel(name=module_name)
+        def moe_gemm2(
+            arg_out: fx.Pointer,
+            arg_shared_out: fx.Pointer,
+            arg_x: fx.Pointer,
+            arg_w: fx.Pointer,
+            arg_scale_x: fx.Pointer,
+            arg_scale_w: fx.Pointer,
+            arg_shared_w: fx.Pointer,
+            arg_shared_scale_w: fx.Pointer,
+            arg_sorted_token_ids: fx.Pointer,
+            arg_expert_ids: fx.Pointer,
+            arg_sorted_weights: fx.Pointer,
+            arg_num_valid_ids: fx.Pointer,
+            arg_bias: fx.Pointer,
+            i32_tokens_in: fx.Int32,
+            i32_n_in: fx.Int32,
+            i32_k_in: fx.Int32,
+            i32_size_expert_ids_in: fx.Int32,
+        ):
+            _emit_moe_gemm2(
+                arg_out,
+                arg_shared_out,
+                arg_x,
+                arg_w,
+                arg_scale_x,
+                arg_scale_w,
+                arg_shared_w,
+                arg_shared_scale_w,
+                arg_sorted_token_ids,
+                arg_expert_ids,
+                arg_sorted_weights,
+                arg_num_valid_ids,
+                arg_bias,
+                i32_tokens_in,
+                i32_n_in,
+                i32_k_in,
+                i32_size_expert_ids_in,
+            )
+
+    elif heterogeneous_b:
 
         @flyc.kernel(name=module_name)
         def moe_gemm2(
@@ -5286,6 +5630,7 @@ def compile_mixed_moe_gemm2_common(
             i32_size_expert_ids_in: fx.Int32,
         ):
             _emit_moe_gemm2(
+                arg_out,
                 arg_out,
                 arg_x,
                 arg_w,
@@ -5326,6 +5671,7 @@ def compile_mixed_moe_gemm2_common(
             i32_size_expert_ids_in: fx.Int32,
         ):
             _emit_moe_gemm2(
+                arg_out,
                 arg_out,
                 arg_x,
                 arg_w,
@@ -5371,6 +5717,7 @@ def compile_mixed_moe_gemm2_common(
 
     def _launch_mixed_moe_gemm2(
         arg_out: fx.Pointer,
+        arg_shared_out: fx.Pointer,
         arg_x: fx.Pointer,
         arg_w: fx.Pointer,
         arg_scale_x: fx.Pointer,
@@ -5400,6 +5747,8 @@ def compile_mixed_moe_gemm2_common(
         gx = (
             n_in - model_dim_pad_idx + tile_n_idx - arith.constant(1, index=True)
         ) // tile_n_idx
+        if const_expr(latent_heterogeneous):
+            gx = arith.constant(shared_model_dim // tile_n, index=True)
         if const_expr(persistent):
             gy = arith.constant(cu_num, index=True)
         else:
@@ -5410,7 +5759,27 @@ def compile_mixed_moe_gemm2_common(
                 - arith.constant(1, index=True)
             ) // c_pm_l
 
-        if const_expr(heterogeneous_b):
+        if const_expr(latent_heterogeneous):
+            launcher = moe_gemm2(
+                arg_out,
+                arg_shared_out,
+                arg_x,
+                arg_w,
+                arg_scale_x,
+                arg_scale_w,
+                arg_shared_w,
+                arg_shared_scale_w,
+                arg_sorted_token_ids,
+                arg_expert_ids,
+                arg_sorted_weights,
+                arg_num_valid_ids,
+                arg_bias,
+                i32_tokens_in,
+                i32_n_in,
+                i32_k_in,
+                i32_size_expert_ids_in,
+            )
+        elif const_expr(heterogeneous_b):
             launcher = moe_gemm2(
                 arg_out,
                 arg_x,
@@ -5459,7 +5828,51 @@ def compile_mixed_moe_gemm2_common(
             stream=stream,
         )
 
-    if heterogeneous_b:
+    if latent_heterogeneous:
+
+        @flyc.jit
+        def launch_mixed_moe_gemm2(
+            arg_out: fx.Pointer,
+            arg_shared_out: fx.Pointer,
+            arg_x: fx.Pointer,
+            arg_w: fx.Pointer,
+            arg_scale_x: fx.Pointer,
+            arg_scale_w: fx.Pointer,
+            arg_shared_w: fx.Pointer,
+            arg_shared_scale_w: fx.Pointer,
+            arg_sorted_token_ids: fx.Pointer,
+            arg_expert_ids: fx.Pointer,
+            arg_sorted_weights: fx.Pointer,
+            arg_num_valid_ids: fx.Pointer,
+            arg_bias: fx.Pointer,
+            i32_tokens_in: fx.Int32,
+            i32_n_in: fx.Int32,
+            i32_k_in: fx.Int32,
+            i32_size_expert_ids_in: fx.Int32,
+            stream: fx.Stream,
+        ):
+            _launch_mixed_moe_gemm2(
+                arg_out,
+                arg_shared_out,
+                arg_x,
+                arg_w,
+                arg_scale_x,
+                arg_scale_w,
+                arg_shared_w,
+                arg_shared_scale_w,
+                arg_sorted_token_ids,
+                arg_expert_ids,
+                arg_sorted_weights,
+                arg_num_valid_ids,
+                arg_bias,
+                i32_tokens_in,
+                i32_n_in,
+                i32_k_in,
+                i32_size_expert_ids_in,
+                stream,
+            )
+
+    elif heterogeneous_b:
 
         @flyc.jit
         def launch_mixed_moe_gemm2(
@@ -5483,6 +5896,7 @@ def compile_mixed_moe_gemm2_common(
             stream: fx.Stream,
         ):
             _launch_mixed_moe_gemm2(
+                arg_out,
                 arg_out,
                 arg_x,
                 arg_w,
@@ -5525,6 +5939,7 @@ def compile_mixed_moe_gemm2_common(
             stream: fx.Stream,
         ):
             _launch_mixed_moe_gemm2(
+                arg_out,
                 arg_out,
                 arg_x,
                 arg_w,
