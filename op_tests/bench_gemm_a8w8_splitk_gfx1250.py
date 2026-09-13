@@ -15,6 +15,7 @@ or another KFD process exists. It never clears processes or changes GPU clocks.
 
 import argparse
 import json
+import math
 import os
 from pathlib import Path
 import statistics
@@ -94,9 +95,47 @@ def _positive_int(value):
     return value
 
 
+def _nonnegative_float(value):
+    value = float(value)
+    if not math.isfinite(value) or value < 0:
+        raise argparse.ArgumentTypeError("must be finite and nonnegative")
+    return value
+
+
+def _parity_result(samples, reference, candidate, max_regression_pct):
+    """Compare the selected kernel with the original configuration's median."""
+    for mode in (reference, candidate):
+        if not samples[mode] or any(
+            not math.isfinite(value) or value <= 0 for value in samples[mode]
+        ):
+            raise RuntimeError(f"Invalid timing samples for {mode}")
+    baseline_us = statistics.median(samples[reference])
+    candidate_us = statistics.median(samples[candidate])
+    ratio = candidate_us / baseline_us
+    return {
+        "reference": reference,
+        "candidate": candidate,
+        "reference_us": baseline_us,
+        "candidate_us": candidate_us,
+        "regression_pct": (ratio - 1) * 100,
+        "max_regression_pct": max_regression_pct,
+        "pass": ratio <= 1 + max_regression_pct / 100,
+    }
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--kernel", required=True)
+    parser.add_argument(
+        "--reference-kernel",
+        help="original CSV winner to run with separate reduction (default: --kernel)",
+    )
+    parser.add_argument(
+        "--max-regression-pct",
+        type=_nonnegative_float,
+        help="fail if the selected kernel exceeds this regression versus the reference",
+    )
+    parser.add_argument("--json-output", type=Path)
     parser.add_argument("-m", type=_positive_int, default=512)
     parser.add_argument("-n", type=_positive_int, default=7168)
     parser.add_argument("-k", type=_positive_int, default=16384)
@@ -133,30 +172,36 @@ def main():
     registration = torch.empty(1, device="cuda")
     monitor = _GpuMonitor()
     try:
+        reference_name = args.reference_kernel or args.kernel
         cfg = backend.parse_wmma_kernel_name(args.kernel)
-        if cfg is None or not backend.is_compute_wmma_kernel_name(args.kernel):
-            raise ValueError("--kernel must name a compute WMMA profile")
-        if cfg["split_k"] == 1 or cfg["persistent_n_tiles"] != 1:
-            raise ValueError("The comparison requires split-K > 1 and one N tile")
+        reference_cfg = backend.parse_wmma_kernel_name(reference_name)
+        for name, case in ((args.kernel, cfg), (reference_name, reference_cfg)):
+            if case is None or not backend.is_compute_wmma_kernel_name(name):
+                raise ValueError(f"Expected a compute WMMA profile: {name}")
+            if case["persistent_n_tiles"] != 1:
+                raise ValueError("The comparison requires one N tile per block")
         m, n, k = args.m, args.n, args.k
         apre = args.apre or cfg["a_preshuffle"]
         cfg["a_preshuffle"] = apre
+        if (args.apre or reference_cfg["a_preshuffle"]) != apre:
+            raise ValueError(
+                "Reference and selected kernel must use the same preshuffle"
+            )
+        reference_cfg["a_preshuffle"] = apre
         tm, tn, sk = cfg["tile_m"], cfg["tile_n"], cfg["split_k"]
-        if n % (tn * cfg["cluster_n"]) or not backend.cluster_m_grid_ok(
-            m, tm, cfg["cluster_m"]
-        ):
-            raise ValueError("Shape must fill the M/N cluster without padding")
-        if k % (
-            sk * cfg["tile_k"] * backend.compute_kernel_k_pair(cfg["num_buffers"], tn)
-        ):
-            raise ValueError("K must contain whole pipeline stages in each split")
-        if k // sk < 512 or (m % 2 and apre):
-            raise ValueError("Each split needs K >= 512; A-preshuffle needs even M")
-        tile_count = ((m + tm - 1) // tm) * (n // tn)
-        if tile_count * 32 > backend.SPLIT_K_FLAG_MAX_LEN:
-            raise ValueError("Output tiles exceed the last-arrival counter capacity")
 
-        cases = [("separate", dict(cfg)), ("last_arrival", dict(cfg))]
+        reference_mode = "separate" if reference_cfg["split_k"] > 1 else "reference"
+        selected_mode = "last_arrival" if sk > 1 else "direct"
+        cases = [(reference_mode, dict(reference_cfg)), (selected_mode, dict(cfg))]
+        separate_modes = {reference_mode}
+        # Changing split-K changes the rounding of the partials. Keep a matching
+        # separate reference for bitwise correctness, while gating performance
+        # against the original CSV winner.
+        if sk != reference_cfg["split_k"]:
+            cases.insert(1, ("selected_separate", dict(cfg)))
+            separate_modes.add("selected_separate")
+        if sk == 1 and (args.include_eightwave or args.include_cluster):
+            raise ValueError("Reduction candidates require split-K > 1")
         if args.include_eightwave:
             if (tm, tn, cfg["num_buffers"]) not in ((256, 256, 2), (256, 256, 4)):
                 raise ValueError("Eight-wave candidates require 256x256, nb2 or nb4")
@@ -170,9 +215,35 @@ def main():
                 raise ValueError("K splits cannot fit in a supported 16-block cluster")
             cases.append(("cluster", dict(cfg, cluster_n=cn)))
 
+        scratch_bytes = 0
+        for _, case in cases:
+            tm, tn, sk = case["tile_m"], case["tile_n"], case["split_k"]
+            if n % (tn * case["cluster_n"]) or not backend.cluster_m_grid_ok(
+                m, tm, case["cluster_m"]
+            ):
+                raise ValueError("Shape must fill the M/N cluster without padding")
+            if k % (
+                sk
+                * case["tile_k"]
+                * backend.compute_kernel_k_pair(case["num_buffers"], tn)
+            ):
+                raise ValueError("K must contain whole pipeline stages in each split")
+            if k // sk < 512 or (m % 2 and apre):
+                raise ValueError("Each split needs K >= 512; A-preshuffle needs even M")
+            tile_count = ((m + tm - 1) // tm) * (n // tn)
+            if sk > 1 and tile_count * 32 > backend.SPLIT_K_FLAG_MAX_LEN:
+                raise ValueError(
+                    "Output tiles exceed the last-arrival counter capacity"
+                )
+            if sk > 1:
+                scratch_bytes += sk * tile_count * tm * tn * 2
+
         free_bytes, _ = torch.cuda.mem_get_info()
-        scratch_bytes = sk * tile_count * tm * tn * 2
-        estimate = 6 * (m * k + n * k) + len(cases) * (scratch_bytes + m * n * 2)
+        estimate = (
+            6 * (m * k + n * k)
+            + scratch_bytes
+            + len(cases) * (m * n * 2 + backend.SPLIT_K_FLAG_MAX_LEN * 4)
+        )
         if estimate > free_bytes * 0.75:
             raise RuntimeError(f"Insufficient free VRAM: need about {estimate} bytes")
         torch.manual_seed(42)
@@ -194,10 +265,16 @@ def main():
         with torch.cuda.stream(stream):
             for mode, case in cases:
                 monitor.check()
-                fused = mode != "separate"
+                tm, tn, sk = case["tile_m"], case["tile_n"], case["split_k"]
+                tile_count = ((m + tm - 1) // tm) * (n // tn)
+                fused = mode not in separate_modes and sk > 1
                 partial_shape = (tile_count, sk, tm, tn) if fused else (sk, m, n)
-                partial = torch.empty(partial_shape, dtype=dtype, device="cuda")
                 out = torch.empty((m, n), dtype=dtype, device="cuda")
+                partial = (
+                    torch.empty(partial_shape, dtype=dtype, device="cuda")
+                    if sk > 1
+                    else out
+                )
                 flag = torch.zeros(
                     backend.SPLIT_K_FLAG_MAX_LEN, dtype=torch.int32, device="cuda"
                 )
@@ -237,7 +314,7 @@ def main():
                 )
                 gemm = flyc.compile(launch_gemm_a8w8_256x256, *launch_args)
                 reduce_args, reduce_fn = (), None
-                if not fused:
+                if sk > 1 and not fused:
                     reduce_args = (
                         ptr_arg(partial),
                         ptr_arg(out),
@@ -269,13 +346,21 @@ def main():
                         run()
                 keepalive.extend((gemm, reduce_fn))
                 graphs[mode], outputs[mode], flags[mode] = graph, out, flag
+            expected_mode = {
+                mode: (
+                    reference_mode
+                    if case["split_k"] == reference_cfg["split_k"]
+                    else "selected_separate"
+                )
+                for mode, case in cases
+            }
             for mode, graph in graphs.items():
                 for _ in range(args.warmup_replays):
                     monitor.check()
                     graph.replay()
                 stream.synchronize()
                 torch.testing.assert_close(
-                    outputs[mode], outputs["separate"], rtol=0, atol=0
+                    outputs[mode], outputs[expected_mode[mode]], rtol=0, atol=0
                 )
             samples = {mode: [] for mode in graphs}
             modes = list(graphs)
@@ -304,31 +389,38 @@ def main():
             stream.synchronize()
             for mode in modes:
                 torch.testing.assert_close(
-                    outputs[mode], outputs["separate"], rtol=0, atol=0
+                    outputs[mode], outputs[expected_mode[mode]], rtol=0, atol=0
                 )
                 assert flags[mode].count_nonzero().item() == 0
         monitor.check()
-        print(
-            json.dumps(
-                {
-                    "shape": [m, n, k],
-                    "kernel": args.kernel,
-                    "apre": apre,
-                    "fp16": args.fp16,
-                    "graph_iters": args.graph_iters,
-                    "replays": args.replays,
-                    "repeats": args.repeats,
-                    "calls_per_mode": args.graph_iters * args.replays * args.repeats,
-                    "cases": dict(cases),
-                    "median_us": {
-                        mode: statistics.median(v) for mode, v in samples.items()
-                    },
-                    "samples_us": samples,
-                    "correctness": "bitwise, including changed-input replay",
-                },
-                indent=2,
+        report = {
+            "shape": [m, n, k],
+            "kernel": args.kernel,
+            "reference_kernel": reference_name,
+            "apre": apre,
+            "fp16": args.fp16,
+            "graph_iters": args.graph_iters,
+            "replays": args.replays,
+            "repeats": args.repeats,
+            "calls_per_mode": args.graph_iters * args.replays * args.repeats,
+            "cases": dict(cases),
+            "median_us": {mode: statistics.median(v) for mode, v in samples.items()},
+            "samples_us": samples,
+            "correctness": "bitwise against matching split-K, including changed-input replay",
+            "correctness_reference": expected_mode,
+        }
+        if args.max_regression_pct is not None:
+            report["parity"] = _parity_result(
+                samples, reference_mode, selected_mode, args.max_regression_pct
             )
-        )
+        encoded = json.dumps(report, indent=2)
+        if args.json_output is not None:
+            args.json_output.write_text(encoded + "\n")
+        print(encoded)
+        if args.max_regression_pct is not None and not report["parity"]["pass"]:
+            raise SystemExit(
+                "Selected kernel does not meet the performance parity limit"
+            )
     finally:
         monitor.close()
 
