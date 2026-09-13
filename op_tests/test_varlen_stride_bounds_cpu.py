@@ -60,6 +60,7 @@ def test_h3_geometry_and_lse():
         TensorMetadata((1, 16, 128), (2048, -128, 1)),
         TensorMetadata((0, 16, 128), (2048, 128, 1)),
         TensorMetadata((1, 1, 16, 128), (2048, 2048, 128, 1)),
+        TensorMetadata((2**31, 16, 128), (0, 128, 1)),
     ],
 )
 def test_unsafe_or_unsupported_layout(tensor):

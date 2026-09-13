@@ -386,6 +386,8 @@ def _varlen_int32_addressable(
     for tensor in tensors:
         if tensor.ndim not in (2, 3) or tensor.numel() == 0:
             return False
+        if any(int(n) <= 0 or int(n) > limit for n in tensor.shape):
+            return False
         strides = tuple(int(s) for s in tensor.stride())
         if any(s < 0 or s > limit for s in strides):
             return False
