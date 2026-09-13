@@ -97,6 +97,25 @@ def _align_up(value: int, alignment: int) -> int:
     return (value + alignment - 1) // alignment * alignment
 
 
+def _compact_gemm_align_m() -> int:
+    """Tile alignment for compact dest rows; must match GEMM ``max(tile_m, tile_m2)``.
+
+    Arena size is fixed at MegaMoE init, before CSV lookup. Default 64 matches
+    the grouped GEMM CSV default; honour ``AITER_TDM_TILE_M{,2}``. Aligning
+    finer than the GEMM tile lets a GEMM tile span two experts.
+    """
+
+    def _env(name: str, default: int | None = None) -> int | None:
+        v = os.environ.get(name)
+        if v is None or v == "":
+            return default
+        return int(v)
+
+    tile_m = _env("AITER_TDM_TILE_M", 64)
+    tile_m2 = _env("AITER_TDM_TILE_M2", tile_m)
+    return max(int(tile_m), int(tile_m2), 64)
+
+
 def _mori_dispatch_schedule(config) -> tuple:
     """mori's own tuned buckets, as this package's (bound, block, warp) triples.
 
@@ -250,6 +269,27 @@ class MegaMoEConfig:
     @property
     def max_recv(self) -> int:
         return self.world_size * self.max_tokens_per_rank
+
+    @property
+    def compact_plan(self) -> bool:
+        """Send-side compact dest rows; TDM default, disable with env=0."""
+        if self.dispatch_backend != "tdm" or not self.is_quant_dispatch_wire:
+            return False
+        return os.environ.get("AITER_TDM_COMPACT_PLAN", "1") in (
+            "1",
+            "true",
+            "True",
+        )
+
+    def compact_row_cap(self, tile_m: int = 64) -> int:
+        from .compact_plan import compact_row_capacity
+
+        return compact_row_capacity(
+            max_recv=self.max_recv,
+            topk=self.topk,
+            experts_per_rank=self.experts_per_rank,
+            tile_m=tile_m,
+        )
 
     @property
     def is_quant_dispatch_wire(self) -> bool:
@@ -555,7 +595,7 @@ class MegaMoEGfx1250:
         recv_x, recv_weights, recv_ids, total_recv, routing = self._dispatch(
             hidden_states, topk_weights, topk_ids
         )
-        if recv_token_bound is not None:
+        if recv_token_bound is not None and not self._compact_plan:
             bound = int(recv_token_bound)
             if bound <= 0 or bound > recv_x.shape[0]:
                 raise ValueError(
@@ -571,36 +611,45 @@ class MegaMoEGfx1250:
                 "caller-supplied one would be silently discarded"
             )
             a1_scale = self._recv_dispatch_scales()
-            if recv_token_bound is not None:
+            if recv_token_bound is not None and not self._compact_plan:
                 a1_scale = a1_scale[: int(recv_token_bound)]
         extra = {}
         if self.activation == ActivationType.Situv2:
             extra["beta"] = self.situ_beta
             extra["linear_beta"] = self.situ_linear_beta
-        fused_moe(
-            recv_x,
-            w1,
-            w2,
-            recv_weights,
-            recv_ids,
-            expert_mask=self.expert_mask,
-            activation=self.activation,
-            gate_mode=self.gate_mode,
-            quant_type=self.quant_type,
-            w1_scale=w1_scale,
-            w2_scale=w2_scale,
-            a1_scale=a1_scale,
-            a2_scale=a2_scale,
-            bias1=bias1,
-            bias2=bias2,
-            hidden_pad=self.hidden_pad,
-            intermediate_pad=self.intermediate_pad,
-            dtype=dtypes.bf16,
-            num_local_tokens=total_recv,
-            swiglu_limit=self.swiglu_limit,
-            stage2_scatter=self._scatter_context(routing),
-            **extra,
-        )
+        scatter = self._scatter_context(routing)
+        from aiter.ops.flydsl.grouped_moe_gfx1250 import set_tdm_compact_plan
+
+        set_tdm_compact_plan(scatter if self._compact_plan else None)
+        moe_ids = self._compact_dummy_ids if self._compact_plan else recv_ids
+        moe_wts = self._compact_dummy_wts if self._compact_plan else recv_weights
+        try:
+            fused_moe(
+                recv_x,
+                w1,
+                w2,
+                moe_wts,
+                moe_ids,
+                expert_mask=self.expert_mask,
+                activation=self.activation,
+                gate_mode=self.gate_mode,
+                quant_type=self.quant_type,
+                w1_scale=w1_scale,
+                w2_scale=w2_scale,
+                a1_scale=a1_scale,
+                a2_scale=a2_scale,
+                bias1=bias1,
+                bias2=bias2,
+                hidden_pad=self.hidden_pad,
+                intermediate_pad=self.intermediate_pad,
+                dtype=dtypes.bf16,
+                num_local_tokens=None if self._compact_plan else total_recv,
+                swiglu_limit=self.swiglu_limit,
+                stage2_scatter=scatter,
+                **extra,
+            )
+        finally:
+            set_tdm_compact_plan(None)
         return self._combine(routing)
 
     __call__ = forward
@@ -616,33 +665,65 @@ class MegaMoEGfx1250:
         self._closed = False
         device = torch.device("cuda", torch.cuda.current_device())
         max_recv = config.max_recv
-
-        self._arena = SymmetricArena(
-            communicator,
-            [
-                ("tok_off", 4),
-                ("recv_num", config.world_size * 4),
-                ("recv_to_src_token", max_recv * 4),
-                ("out_idx", max_recv * config.topk * 4),
-                ("out_wts", max_recv * config.topk * 4),
-                ("disp_out", max_recv * config.dispatch_token_nbytes),
-                ("cross_device_barrier", config.world_size * 8),
-                *(
-                    # Arrival stride, not the packed row: undersizing overruns
-                    # the last slots.
-                    [("disp_out_scales", max_recv * config.dispatch_scale_dst_nbytes)]
-                    if config.dispatch_scale_dst_nbytes
-                    else []
-                ),
-                (
-                    "comb_inp",
-                    config.max_tokens_per_rank
-                    * config.topk
-                    * config.combine_slot_stride_bytes,
-                ),
-            ],
+        self._compact_plan = config.compact_plan
+        self._compact_tile_m = _compact_gemm_align_m()
+        self._compact_cap = (
+            config.compact_row_cap(self._compact_tile_m)
+            if self._compact_plan
+            else max_recv
+        )
+        recv_rows = self._compact_cap if self._compact_plan else max_recv
+        self._compact_wire_row = (
+            _align_up(
+                config.dispatch_token_nbytes + config.dispatch_scale_nbytes,
+                128,
+            )
+            if self._compact_plan
+            else config.dispatch_token_nbytes
+        )
+        segs = config.world_size * config.experts_per_rank
+        hist_stride = config.world_size * segs
+        arena_regions = [
+            ("tok_off", 4),
+            ("recv_num", config.world_size * 4),
+            ("recv_to_src_token", max_recv * 4),
+            ("out_idx", max_recv * config.topk * 4),
+            ("out_wts", max_recv * config.topk * 4),
+            ("disp_out", recv_rows * self._compact_wire_row),
+            ("cross_device_barrier", config.world_size * 8),
+        ]
+        if config.dispatch_scale_dst_nbytes and not self._compact_plan:
+            arena_regions.append(
+                ("disp_out_scales", recv_rows * config.dispatch_scale_dst_nbytes)
+            )
+        if self._compact_plan:
+            arena_regions.extend(
+                [
+                    ("ep_rowmap", (recv_rows + 1) * 8),
+                    ("compact_hist", 2 * hist_stride * 4),
+                    ("compact_done", 2 * config.world_size * 4),
+                ]
+            )
+        arena_regions.append(
+            (
+                "comb_inp",
+                config.max_tokens_per_rank
+                * config.topk
+                * config.combine_slot_stride_bytes,
+            )
+        )
+        self._arena = SymmetricArena(communicator, arena_regions)
+        self._compact_scale_row = (
+            config.dispatch_scale_nbytes
+            if self._compact_plan
+            else config.dispatch_scale_dst_nbytes
         )
         self._arena.zero()
+        # Shared with grouped_moe_gfx1250. TDM dispatch clears this at its tail,
+        # before the following route kernel starts issuing slot atomics.
+        from aiter.ops.flydsl.grouped_moe_gfx1250 import route_counter_buffer
+
+        self._route_counter = route_counter_buffer(config.experts_per_rank, device)
 
         self._token_destination_map = torch.full(
             (config.max_tokens_per_rank * config.topk,),
@@ -650,6 +731,40 @@ class MegaMoEGfx1250:
             dtype=torch.int32,
             device=device,
         )
+        self._compact_masked_m = None
+        self._compact_psum = None
+        self._compact_plan_launch = None
+        if self._compact_plan:
+            from .compact_plan import PLAN_BLOCKS, compile_tdm_compact_plan
+
+            self._compact_masked_m = torch.zeros(
+                config.experts_per_rank, dtype=torch.int32, device=device
+            )
+            self._compact_psum = torch.zeros(
+                config.experts_per_rank, dtype=torch.int32, device=device
+            )
+            self._compact_block_hist = torch.empty(
+                PLAN_BLOCKS * segs, dtype=torch.int32, device=device
+            )
+            self._compact_send_base = torch.empty(segs, dtype=torch.int32, device=device)
+            self._compact_barrier = torch.zeros(4, dtype=torch.int32, device=device)
+            self._compact_dummy_ids = torch.zeros(
+                (1, config.topk), dtype=torch.int32, device=device
+            )
+            self._compact_dummy_wts = torch.zeros(
+                (1, config.topk), dtype=torch.float32, device=device
+            )
+            self._compact_plan_launch = compile_tdm_compact_plan(
+                rank=config.rank,
+                npes=config.world_size,
+                experts_per_rank=config.experts_per_rank,
+                topk=config.topk,
+                tile_m=self._compact_tile_m,
+                compact_cap=self._compact_cap,
+                off_hist=self._arena.offset("compact_hist"),
+                off_done=self._arena.offset("compact_done"),
+                hist_stride=hist_stride,
+            )
         self._destination_peer_counter = torch.zeros(
             config.world_size, dtype=torch.int32, device=device
         )
@@ -669,6 +784,13 @@ class MegaMoEGfx1250:
             # mori's geometry is a compile-time Cfg field, so it brings its own
             # tuned buckets.
             config.schedule = _mori_dispatch_schedule(config)
+        elif self._compact_plan:
+            # Compact dispatch has one warp load a token and fan it out to all
+            # final expert rows. Its optimum is unrelated to token-major
+            # COUNT/RESERVE/FINALIZE, so keep a separate sweepable geometry.
+            compact_blocks = int(os.environ.get("AITER_TDM_COMPACT_BLOCKS", "64"))
+            compact_warps = int(os.environ.get("AITER_TDM_COMPACT_WARPS", "8"))
+            config.schedule = ((None, compact_blocks, compact_warps),)
 
         if config.schedule:
             dispatch_specs = sorted(
@@ -813,6 +935,7 @@ class MegaMoEGfx1250:
                     stg_src.data_ptr(),
                     stg_scale.data_ptr() if stg_scale is not None else 0,
                     self._dispatch_sent_scales_ptr,
+                    self._route_counter.data_ptr(),
                     my_lsa_rank,
                     inp_cur_tok,
                     stream,
@@ -834,7 +957,13 @@ class MegaMoEGfx1250:
                     hidden_elem_size=elem_size,
                     slab_bytes=slab_bytes,
                     max_tok_per_rank=config.max_tokens_per_rank,
-                    max_recv=config.max_recv,
+                    max_recv=(
+                        self._compact_cap if self._compact_plan else config.max_recv
+                    ),
+                    compact_row_stride=(
+                        self._compact_wire_row if self._compact_plan else 0
+                    ),
+                    enable_signal=True,
                     off_tok_off=self._arena.offset("tok_off"),
                     off_recv_num=self._arena.offset("recv_num"),
                     off_tis=self._arena.offset("recv_to_src_token"),
@@ -842,7 +971,12 @@ class MegaMoEGfx1250:
                     off_out_wts=self._arena.offset("out_wts"),
                     off_out_tok=self._arena.offset("disp_out"),
                     off_out_scales=(
-                        self._arena.offset("disp_out_scales")
+                        (
+                            self._arena.offset("disp_out")
+                            + config.dispatch_token_nbytes
+                        )
+                        if self._compact_plan
+                        else self._arena.offset("disp_out_scales")
                         if config.dispatch_scale_dst_nbytes
                         else 0
                     ),
@@ -850,6 +984,16 @@ class MegaMoEGfx1250:
                     scale_stride=config.dispatch_scale_dst_nbytes,
                     block_num=geom[0],
                     warp_num_per_block=geom[1],
+                    clear_route_counter=os.environ.get(
+                        "AITER_TDM_DIRECT_EP_MASK", "1"
+                    )
+                    in ("1", "true", "True")
+                    and not self._compact_plan,
+                    compact_plan=self._compact_plan,
+                    off_ep_rowmap=(
+                        self._arena.offset("ep_rowmap") if self._compact_plan else 0
+                    ),
+                    max_tok_slot_stride=config.max_tokens_per_rank * config.topk,
                 )
             variants[spec] = make_variant(built[geom])
         self._tdm_stage_capacity = stg_cap
@@ -974,9 +1118,21 @@ class MegaMoEGfx1250:
             config.dispatch_token_nbytes
             // config.dispatch_wire_spec.recv_dtype.itemsize
         )
+        rows = self._compact_cap if self._compact_plan else config.max_recv
+        if self._compact_plan:
+            storage = _from_gpu_ptr(
+                self._arena.local_ptr("disp_out"),
+                (rows * self._compact_wire_row,),
+                config.dispatch_wire_spec.recv_dtype,
+            )
+            return torch.as_strided(
+                storage,
+                (rows, width),
+                (self._compact_wire_row, 1),
+            )
         return _from_gpu_ptr(
             self._arena.local_ptr("disp_out"),
-            (config.max_recv, width),
+            (rows, width),
             config.dispatch_wire_spec.recv_dtype,
         )
 
@@ -984,12 +1140,23 @@ class MegaMoEGfx1250:
         """The forwarded e8m0 rows, or None on the bf16 wire."""
         if not self._config.is_quant_dispatch_wire:
             return None
-        # Full padded rows, not a trimmed view: this goes to the gather kernel as a
-        # base pointer plus a build-constant pitch, and that pitch is the arrival
-        # stride. The kernel reads only the meaningful bytes of each row.
+        rows = self._compact_cap if self._compact_plan else self._config.max_recv
+        if self._compact_plan:
+            span = (rows - 1) * self._compact_wire_row + self._compact_scale_row
+            storage = _from_gpu_ptr(
+                self._arena.local_ptr("disp_out")
+                + self._config.dispatch_token_nbytes,
+                (span,),
+                torch.uint8,
+            )
+            return torch.as_strided(
+                storage,
+                (rows, self._compact_scale_row),
+                (self._compact_wire_row, 1),
+            )
         return _from_gpu_ptr(
             self._arena.local_ptr("disp_out_scales"),
-            (self._config.max_recv, self._config.dispatch_scale_dst_nbytes),
+            (rows, self._compact_scale_row),
             torch.uint8,
         )
 
@@ -1033,6 +1200,20 @@ class MegaMoEGfx1250:
             # Straight onto the wire; mori restrides these packed rows while it
             # stages them, so there is no repack here.
             self._dispatch_sent_scales_ptr = scale_rows.data_ptr()
+        if self._compact_plan:
+            self._compact_plan_launch(
+                self._arena.handle,
+                topk_ids.data_ptr(),
+                self._token_destination_map.data_ptr(),
+                self._compact_block_hist.data_ptr(),
+                self._compact_send_base.data_ptr(),
+                self._compact_masked_m.data_ptr(),
+                self._compact_psum.data_ptr(),
+                self._compact_barrier.data_ptr(),
+                self._config.rank,
+                token_count,
+                stream,
+            )
         self._dispatch_variants[spec](
             self._arena.handle,
             payload.data_ptr(),
@@ -1071,6 +1252,21 @@ class MegaMoEGfx1250:
             max_tokens_per_rank=self._config.max_tokens_per_rank,
             world_size=self._config.world_size,
             source_token_map=routing.source_token_map,
+            compact_layout=self._compact_plan,
+            compact_masked_m=self._compact_masked_m,
+            compact_psum=self._compact_psum,
+            compact_ep_rowmap=(
+                _from_gpu_ptr(
+                    self._arena.local_ptr("ep_rowmap"),
+                    (self._compact_cap + 1, 2),
+                    torch.int32,
+                )
+                if self._compact_plan
+                else None
+            ),
+            compact_wire_row_stride=(
+                self._compact_wire_row if self._compact_plan else 0
+            ),
         )
 
     def _combine(self, routing: Routing) -> torch.Tensor:
