@@ -745,7 +745,30 @@ void bmm_a8w8_mxscale_bpreshuffle_nospec_kernel_gfx1250(opus_bmm_a8w8_mxscale_ka
             // forced 18 extra ds_reads, which is why measuring it there gave a
             // 1% regression that says nothing about the schedule itself. Only
             // worth asking on a tile with register room.
-            if constexpr (T::kAllReadsFirst) {
+            if constexpr (T::kDsLookahead >= 0) {
+                // Spread the ds_reads across the WMMAs instead of clumping them,
+                // keeping kDsLookahead A-fragments in flight ahead of the row
+                // that consumes them. The prologue group covers every B fragment
+                // (every row needs all of them) plus the first kDsLookahead A
+                // fragments; each row then issues ONE more A fragment before its
+                // own kExpN WMMAs, so a read is always kDsLookahead rows ahead
+                // of its use -- kDsLookahead * kExpN * 8 cycles of distance.
+                //
+                // Counts add up to the same totals the other two chains request:
+                //   reads kDsPerFrag*(kExpN + LA) + kDsPerFrag*(kExpM - LA)
+                //       = kDsPerFrag*(kExpN + kExpM)
+                //   mfma  kExpM * kExpN
+                constexpr int kLA = T::kDsLookahead;
+                __builtin_amdgcn_sched_group_barrier(
+                    kDsRead, kDsPerFrag * (T::kExpN + kLA), 0);
+                opus::static_for<T::kExpM>([&](auto imN) __attribute__((always_inline)) {
+                    constexpr int im = decltype(imN)::value;
+                    if constexpr (im + kLA < T::kExpM) {
+                        __builtin_amdgcn_sched_group_barrier(kDsRead, kDsPerFrag, 0);
+                    }
+                    __builtin_amdgcn_sched_group_barrier(kMfma, T::kExpN, 0);
+                });
+            } else if constexpr (T::kAllReadsFirst) {
                 __builtin_amdgcn_sched_group_barrier(
                     kDsRead, kDsPerFrag * (T::kExpN + T::kExpM), 0);
                 opus::static_for<T::kExpM>([&](auto) __attribute__((always_inline)) {

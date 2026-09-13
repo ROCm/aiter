@@ -181,7 +181,16 @@ template<int BLOCK_SIZE_,
          // K=16384; at K=4096 that is a 4x over-allocation, and on a slots=3
          // tile it is the difference between fitting in 320 KB and not.
          int SF_A_PANEL_KG_ = 128,
-         bool ALL_READS_FIRST_ = false>
+         bool ALL_READS_FIRST_ = false,
+         // Distance, in A-fragments, between a fragment's ds_read and the WMMA
+         // row that consumes it. -1 keeps the front/back split. 0 issues each
+         // row's read immediately before its own WMMAs (maximally spread);
+         // kExpM is equivalent to ALL_READS_FIRST. This is one axis, not a
+         // switch: PMC shows clumping and spreading trade against each other --
+         // ALL_READS_FIRST took INST_ISSUE_LDS_STALL 3.6% -> 5.6% while cutting
+         // the LDS wait 11.6% -> 9.5%. FlyDSL sits off that curve entirely
+         // (0.1% stall AND 6.1% wait), spreading its reads across the step.
+         int DS_LOOKAHEAD_ = -1>
 struct opus_bmm_a8w8_mxscale_bpreshuffle_traits_gfx1250 {
     static constexpr int BLOCK_SIZE = BLOCK_SIZE_;
     static constexpr int B_M = B_M_;
@@ -870,6 +879,12 @@ struct opus_bmm_a8w8_mxscale_bpreshuffle_traits_gfx1250 {
     // split. Needs room to hold kExpM+kExpN fragments at once, so it is opt-in
     // per tile rather than global. See the pipeline's kAllReadsFirst block.
     static constexpr bool kAllReadsFirst = ALL_READS_FIRST_;
+    static constexpr int  kDsLookahead   = DS_LOOKAHEAD_;
+    static_assert(!(ALL_READS_FIRST_ && DS_LOOKAHEAD_ >= 0),
+                  "ALL_READS_FIRST and DS_LOOKAHEAD are two settings of the same "
+                  "axis; pick one (ALL_READS_FIRST == DS_LOOKAHEAD of kExpM)");
+    static_assert(DS_LOOKAHEAD_ < 0 || DS_LOOKAHEAD_ <= kExpM,
+                  "DS_LOOKAHEAD cannot exceed kExpM");
     // How many scale-panel loads are issued before the first wait. The fill is
     // load->wait->store; at 1 every trip pays a cold round trip in series, and
     // ATT priced that at 13,234 cycles (10.7% of a kid35 prefill wave) against
@@ -1993,6 +2008,45 @@ using opus_bmm_a8w8_mxscale_bpreshuffle_tile_ns128_arf_gfx1250 =
         /*SF_A_LDS*/true, /*SF_B_LDS*/true,
         /*SF_A_TDM_KG*/0, /*SF_A_TDM_PAD*/16, /*TILE_M*/2, /*NO_SPEC*/true,
         /*SF_A_PANEL_KG*/128, /*ALL_READS_FIRST*/true>;
+
+// kid51 / kid52: kid46 with the ds_reads SPREAD across the step.
+//
+// PMC put our LDS wait at 8,343 cycles a wave against FlyDSL's 3,254 on an
+// identical read count, and showed the two of us on opposite ends of one trade:
+//
+//   kid46 (front/back)      issue stall 3.6%   LDS wait 11.6%
+//   kid50 (all reads first) issue stall 5.6%   LDS wait  9.5%
+//   FlyDSL                  issue stall 0.1%   LDS wait  6.1%
+//
+// FlyDSL is off the curve, and its ATT body says why: it spreads the reads
+// (`wait, 3-4 WMMA, wait, 3-4 WMMA`) rather than clumping them. Bank layout is
+// ruled out -- its generator uses `tile_m * (tile_k + 16)` with B unpadded,
+// byte-identical to kSmemPitchA/kSmemPitchB.
+//
+// DS_LOOKAHEAD is that axis. At kExpN=8 each row of WMMAs is ~64 cycles, so
+// lookahead 2 keeps a read ~128 cycles ahead of its use and lookahead 4 ~256 --
+// bracketing a plausible LDS latency from both sides.
+template <typename DataC>
+using opus_bmm_a8w8_mxscale_bpreshuffle_tile_ns128_la2_gfx1250 =
+    opus_bmm_a8w8_mxscale_bpreshuffle_traits_gfx1250<
+        /*BLOCK_SIZE*/128, /*B_M*/256, /*B_N*/256, /*B_K*/256,
+        /*LAYOUT*/opus_gfx1250_bmm::kLayoutTileN,
+        /*D_A*/opus::fp8_t, /*D_B*/opus::fp8_t, /*D_C*/DataC, /*D_ACC*/float,
+        /*GROUP_K*/128, /*NUM_SLOTS*/2, /*WG_PER_CU*/1, /*GROUP_N*/128,
+        /*SF_A_LDS*/true, /*SF_B_LDS*/true,
+        /*SF_A_TDM_KG*/0, /*SF_A_TDM_PAD*/16, /*TILE_M*/2, /*NO_SPEC*/true,
+        /*SF_A_PANEL_KG*/128, /*ALL_READS_FIRST*/false, /*DS_LOOKAHEAD*/2>;
+
+template <typename DataC>
+using opus_bmm_a8w8_mxscale_bpreshuffle_tile_ns128_la4_gfx1250 =
+    opus_bmm_a8w8_mxscale_bpreshuffle_traits_gfx1250<
+        /*BLOCK_SIZE*/128, /*B_M*/256, /*B_N*/256, /*B_K*/256,
+        /*LAYOUT*/opus_gfx1250_bmm::kLayoutTileN,
+        /*D_A*/opus::fp8_t, /*D_B*/opus::fp8_t, /*D_C*/DataC, /*D_ACC*/float,
+        /*GROUP_K*/128, /*NUM_SLOTS*/2, /*WG_PER_CU*/1, /*GROUP_N*/128,
+        /*SF_A_LDS*/true, /*SF_B_LDS*/true,
+        /*SF_A_TDM_KG*/0, /*SF_A_TDM_PAD*/16, /*TILE_M*/2, /*NO_SPEC*/true,
+        /*SF_A_PANEL_KG*/128, /*ALL_READS_FIRST*/false, /*DS_LOOKAHEAD*/4>;
 
 // -- smem -> register read layouts -----------------------------------------
 // Device-only in effect, but compiled on the host pass too so vtype_c matches.
