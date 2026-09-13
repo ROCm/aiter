@@ -163,6 +163,11 @@ def _make_dispatch_tdm(
     slab_bytes=0,
     enable_signal=True,
     meta_tdm=True,
+    clear_route_counter=False,
+    compact_plan=False,
+    compact_row_stride=0,
+    off_ep_rowmap=0,
+    max_tok_slot_stride=0,
 ):
     """Build the TDM dispatch kernel. Returns a ``@flyc.jit`` launcher.
 
@@ -178,6 +183,10 @@ def _make_dispatch_tdm(
     payload does not shrink the tile exactly when the metadata grew by a scale
     row. All three are 0 on a bf16 wire and the scale path disappears.
     """
+    compact_plan = bool(compact_plan)
+    compact_row_stride = int(compact_row_stride)
+    off_ep_rowmap = int(off_ep_rowmap)
+    max_tok_slot_stride = int(max_tok_slot_stride)
     if WAVE != 32:
         raise ValueError(
             f"TDM dispatch is gfx1250-only (wave32); wave size resolved to {WAVE}"
@@ -190,6 +199,14 @@ def _make_dispatch_tdm(
         )
     if nbytes % 128:
         raise ValueError(f"TDM payload rows must be 128-byte aligned, got {nbytes}B")
+    if compact_plan:
+        if compact_row_stride < nbytes + scale_bytes or compact_row_stride % 128:
+            raise ValueError(
+                "compact_row_stride must contain payload and scale and be "
+                f"128-byte aligned, got {compact_row_stride}B"
+            )
+    elif compact_row_stride:
+        raise ValueError("compact_row_stride requires compact_plan")
     if scale_bytes:
         if scale_bytes % 4:
             raise ValueError(f"scale rows must be dword-sized, got {scale_bytes}B")
@@ -215,8 +232,15 @@ def _make_dispatch_tdm(
     stg_cap, _stage_slots = tdm_stage_capacity(npes=npes, max_recv=max_recv)
     # sentinel: tok_map dropped-slot marker whose dest_pe (value // max_recv) == npes.
     sentinel_val = npes * max_recv
+    compact_peer_bits = max(1, (npes - 1).bit_length())
+    compact_peer_mask = (1 << compact_peer_bits) - 1
 
     tile_bytes = _tile_bytes(nbytes, slab_bytes)
+    if compact_plan and compact_row_stride > tile_bytes:
+        raise ValueError(
+            "compact wire row does not fit the warp LDS tile: "
+            f"row={compact_row_stride}B tile={tile_bytes}B"
+        )
     ctl_bytes = _align(3 * npes * 4, 128)
     lds_bytes = warp_num_per_block * tile_bytes + ctl_bytes
     if lds_bytes > _LDS_BUDGET:
@@ -269,6 +293,7 @@ def _make_dispatch_tdm(
         addr_stg_src: Int64,
         addr_stg_scale: Int64,
         addr_inp_scale: Int64,
+        addr_route_counter: Int64,
         my_lsa_rank: Int32,
         inp_cur_tok: Int32,
     ):
@@ -287,6 +312,7 @@ def _make_dispatch_tdm(
         rsrc_stg_idx = create_buffer_resource_from_addr(addr_stg_idx)
         rsrc_stg_wt = create_buffer_resource_from_addr(addr_stg_wt)
         rsrc_stg_src = create_buffer_resource_from_addr(addr_stg_src)
+        rsrc_route_counter = create_buffer_resource_from_addr(addr_route_counter)
         if const_expr(scale_bytes > 0):
             rsrc_inp_scale = create_buffer_resource_from_addr(addr_inp_scale)
             rsrc_stg_scale = create_buffer_resource_from_addr(addr_stg_scale)
@@ -348,10 +374,11 @@ def _make_dispatch_tdm(
             e_lane = lane
         lane_act = (s_lane < etpi) & (e_lane < topk)
 
-        if tid < npes:
-            comm_ops.store_i32_lds(s_n(tid), arith.constant(0))
-            comm_ops.store_i32_lds(s_run(tid), arith.constant(0))
-        fx.barrier()
+        if const_expr(not compact_plan):
+            if tid < npes:
+                comm_ops.store_i32_lds(s_n(tid), arith.constant(0))
+                comm_ops.store_i32_lds(s_run(tid), arith.constant(0))
+            fx.barrier()
 
         # Route resolution, shared by COUNT and FINALIZE. No dynamic `if`: it
         # runs under both phases' loops and selects rather than branches, so
@@ -390,291 +417,294 @@ def _make_dispatch_tdm(
             return tok, act, expert, slot_off, dest_pe, keep
 
         # ── COUNT: block-local histogram of routes per destination peer ──
-        for tok_base in range(global_warp_id * etpi, inp_cur_tok, warps_total * etpi):
-            _tok, _act, _expert, _off, dest_pe, keep = resolve(tok_base)
-            if keep:
-                comm_ops.atomic_add_lds(s_n(dest_pe), arith.constant(1))
-        fx.barrier()
+        if const_expr(not compact_plan):
+            for tok_base in range(
+                global_warp_id * etpi, inp_cur_tok, warps_total * etpi
+            ):
+                _tok, _act, _expert, _off, dest_pe, keep = resolve(tok_base)
+                if keep:
+                    comm_ops.atomic_add_lds(s_n(dest_pe), arith.constant(1))
+            fx.barrier()
 
-        # ── RESERVE: one remote atomic per (block, peer), not per route ──
-        if tid < npes:
-            n = comm_ops.load_i32_lds(s_n(tid))
-            base = arith.constant(0)
-            if n > 0:
-                base = comm_ops.atomic_add_system(
-                    fx.Int64(window.lsa_ptr(tid, off_tok_off)), n
-                )
-                comm_ops.atomic_add_system(
-                    fx.Int64(addr_dest_pe_ctr) + fx.Int64(tid) * fx.Int64(4), n
-                )
-            comm_ops.store_i32_lds(s_base(tid), base)
-        fx.barrier()
+            # ── RESERVE: one remote atomic per (block, peer), not per route ──
+            if tid < npes:
+                n = comm_ops.load_i32_lds(s_n(tid))
+                base = arith.constant(0)
+                if n > 0:
+                    base = comm_ops.atomic_add_system(
+                        fx.Int64(window.lsa_ptr(tid, off_tok_off)), n
+                    )
+                    comm_ops.atomic_add_system(
+                        fx.Int64(addr_dest_pe_ctr) + fx.Int64(tid) * fx.Int64(4), n
+                    )
+                comm_ops.store_i32_lds(s_base(tid), base)
+            fx.barrier()
 
-        # ── FINALIZE: hand out the reserved slots and gather the metadata ──
-        # destTokId = s_base + block-local j; staging is peer-major destTokId
-        # SoA, so a block's reserved run is already a contiguous TDM source.
-        for tok_base in range(global_warp_id * etpi, inp_cur_tok, warps_total * etpi):
-            tok, act, expert, slot_off, dest_pe, keep = resolve(tok_base)
-            wt = buffer_load(rsrc_inp_wts, slot_off, vec_width=1, dtype=T.f32)
-            j = arith.constant(0)
-            if keep:
-                j = comm_ops.atomic_add_lds(s_run(dest_pe), arith.constant(1))
-            base = arith.constant(0)
-            if keep:
-                base = comm_ops.load_i32_lds(s_base(dest_pe))
-            dest_tok = base + j
-            pub = keep & (dest_tok < stg_cap) & (dest_tok < max_recv)
-            if act:
-                buffer_store(
-                    arith.select(pub, dest_pe * max_recv + dest_tok, sentinel_val),
-                    rsrc_tok_map,
-                    tok * topk + e_lane,
-                )
-            slot = dest_pe * stg_cap + dest_tok
-            src_encoded = rank * max_tok_per_rank + tok
-            pub_i = arith.select(pub, fx.Int32(1), fx.Int32(0))
-            for e in range_constexpr(topk):
-                probe = (s_lane * topk + e) * 4
-                pub_e = ds_bpermute(T.i32, probe, pub_i)
-                slot_e = ds_bpermute(T.i32, probe, slot)
-                if lane_act & (pub_e != 0):
-                    buffer_store(expert, rsrc_stg_idx, slot_e * topk + e_lane)
+            # ── FINALIZE: hand out the reserved slots and gather the metadata ──
+            # destTokId = s_base + block-local j; staging is peer-major destTokId
+            # SoA, so a block's reserved run is already a contiguous TDM source.
+            for tok_base in range(global_warp_id * etpi, inp_cur_tok, warps_total * etpi):
+                tok, act, expert, slot_off, dest_pe, keep = resolve(tok_base)
+                wt = buffer_load(rsrc_inp_wts, slot_off, vec_width=1, dtype=T.f32)
+                j = arith.constant(0)
+                if keep:
+                    j = comm_ops.atomic_add_lds(s_run(dest_pe), arith.constant(1))
+                base = arith.constant(0)
+                if keep:
+                    base = comm_ops.load_i32_lds(s_base(dest_pe))
+                dest_tok = base + j
+                pub = keep & (dest_tok < stg_cap) & (dest_tok < max_recv)
+                if act:
                     buffer_store(
-                        arith.bitcast(T.i32, wt), rsrc_stg_wt, slot_e * topk + e_lane
+                        arith.select(pub, dest_pe * max_recv + dest_tok, sentinel_val),
+                        rsrc_tok_map,
+                        tok * topk + e_lane,
                     )
-                    if e_lane == 0:
-                        buffer_store(src_encoded, rsrc_stg_src, slot_e)
-                    if const_expr(scale_bytes > 0):
-                        # The caller's row is packed, the staged one is padded to
-                        # `scale_stride` so a run of them starts on a TDM row. The
-                        # token's route lanes split both halves between them.
-                        for si in range(e_lane, scale_src_dw, topk):
-                            buffer_store(
-                                buffer_load(
-                                    rsrc_inp_scale,
-                                    tok * scale_src_dw + si,
-                                    vec_width=1,
-                                    dtype=T.i32,
-                                ),
-                                rsrc_stg_scale,
-                                slot_e * scale_dst_dw + si,
-                            )
-                        # Zeroed rather than left over: the pad crosses into a
-                        # peer's memory on the next TDM run.
-                        for si in range(scale_src_dw + e_lane, scale_dst_dw, topk):
-                            buffer_store(
-                                arith.constant(0),
-                                rsrc_stg_scale,
-                                slot_e * scale_dst_dw + si,
-                            )
-
-        # tok_map is written here and re-read by the payload phase, and the
-        # staging arrays are written here and read by the metadata phase; both
-        # go through global memory, so the stores have to land before either.
-        comm_ops.waitcnt_stores()
-        fx.barrier()
-
-        # ── META: the staged runs leave as bulk cross-GPU writes ──
-        def _copy_edge(src_rsrc, dst_rsrc, src_off, dst_off, head, body, total):
-            """Scalar-copy the leading and trailing elements the body misses."""
-            for i in range(lane, head, WAVE):
-                buffer_store(
-                    buffer_load(src_rsrc, src_off + i, vec_width=1, dtype=T.i32),
-                    dst_rsrc,
-                    dst_off + i,
-                )
-            for i in range(head + body + lane, total, WAVE):
-                buffer_store(
-                    buffer_load(src_rsrc, src_off + i, vec_width=1, dtype=T.i32),
-                    dst_rsrc,
-                    dst_off + i,
-                )
-
-        def _ship_meta(peer_id, n_tok, src_tok, dst_tok, p_idx, p_wts, p_tis, p_scales):
-            """Move one batch of staged metadata for ``n_tok`` tokens to a peer.
-
-            Every field is planned on its own: they start at unrelated phases
-            within a 128B row, so one can earn a TDM body where the next goes
-            entirely scalar. The tile regions are packed at each body's real
-            size, which is a whole number of rows and so keeps every region as
-            128B-aligned as the tile base.
-            """
-            row = TDM.TDM_ROW_ELEMS_4B
-            n_kv = n_tok * topk
-            kv_bytes = fx.Int64(src_tok) * fx.Int64(topk * 4)
-            kv_dbytes = fx.Int64(dst_tok) * fx.Int64(topk * 4)
-            s_idx = fx.Int64(addr_stg_idx) + kv_bytes
-            d_idx = fx.Int64(window.lsa_ptr(peer_id, off_out_idx)) + kv_dbytes
-            s_wt = fx.Int64(addr_stg_wt) + kv_bytes
-            d_wt = fx.Int64(window.lsa_ptr(peer_id, off_out_wts)) + kv_dbytes
-            s_src = fx.Int64(addr_stg_src) + fx.Int64(src_tok) * fx.Int64(4)
-            d_src = fx.Int64(window.lsa_ptr(peer_id, off_tis)) + fx.Int64(
-                dst_tok
-            ) * fx.Int64(4)
-            h_idx, r_idx = TDM.tdm_plan_xfer_4b(s_idx, d_idx, n_kv)
-            h_wt, r_wt = TDM.tdm_plan_xfer_4b(s_wt, d_wt, n_kv)
-            h_src, r_src = TDM.tdm_plan_xfer_4b(s_src, d_src, n_tok)
-            b_idx = r_idx * row
-            b_wt = r_wt * row
-            b_src = r_src * row
-            l_idx = my_tile
-            l_wt = l_idx + b_idx * 4
-            l_src = l_wt + b_wt * 4
-            if r_idx > 0:
-                TDM.tdm_load(
-                    TDM.tdm_group0(l_idx, s_idx + fx.Int64(h_idx) * fx.Int64(4)),
-                    TDM.tdm_group1_rows_4b(r_idx),
-                )
-            if r_wt > 0:
-                TDM.tdm_load(
-                    TDM.tdm_group0(l_wt, s_wt + fx.Int64(h_wt) * fx.Int64(4)),
-                    TDM.tdm_group1_rows_4b(r_wt),
-                )
-            if r_src > 0:
-                TDM.tdm_load(
-                    TDM.tdm_group0(l_src, s_src + fx.Int64(h_src) * fx.Int64(4)),
-                    TDM.tdm_group1_rows_4b(r_src),
-                )
-            if const_expr(scale_bytes > 0):
-                n_sc = n_tok * scale_dst_dw
-                s_sc = fx.Int64(addr_stg_scale) + fx.Int64(src_tok) * fx.Int64(
-                    scale_stride
-                )
-                d_sc = fx.Int64(window.lsa_ptr(peer_id, off_out_scales)) + fx.Int64(
-                    dst_tok
-                ) * fx.Int64(scale_stride)
-                h_sc, r_sc = TDM.tdm_plan_xfer_4b(s_sc, d_sc, n_sc)
-                b_sc = r_sc * row
-                l_sc = l_src + b_src * 4
-                if r_sc > 0:
-                    TDM.tdm_load(
-                        TDM.tdm_group0(l_sc, s_sc + fx.Int64(h_sc) * fx.Int64(4)),
-                        TDM.tdm_group1_rows_4b(r_sc),
-                    )
-            # The edges are global-to-global and owe the tile nothing, so they
-            # run while the loads above are still in flight.
-            _copy_edge(
-                rsrc_stg_idx, p_idx, src_tok * topk, dst_tok * topk, h_idx, b_idx, n_kv
-            )
-            _copy_edge(
-                rsrc_stg_wt, p_wts, src_tok * topk, dst_tok * topk, h_wt, b_wt, n_kv
-            )
-            _copy_edge(rsrc_stg_src, p_tis, src_tok, dst_tok, h_src, b_src, n_tok)
-            if const_expr(scale_bytes > 0):
-                _copy_edge(
-                    rsrc_stg_scale,
-                    p_scales,
-                    src_tok * scale_dst_dw,
-                    dst_tok * scale_dst_dw,
-                    h_sc,
-                    b_sc,
-                    n_sc,
-                )
-            TDM.tdm_wait(0)
-            if r_idx > 0:
-                TDM.tdm_store(
-                    TDM.tdm_group0(l_idx, d_idx + fx.Int64(h_idx) * fx.Int64(4)),
-                    TDM.tdm_group1_rows_4b(r_idx),
-                )
-            if r_wt > 0:
-                TDM.tdm_store(
-                    TDM.tdm_group0(l_wt, d_wt + fx.Int64(h_wt) * fx.Int64(4)),
-                    TDM.tdm_group1_rows_4b(r_wt),
-                )
-            if r_src > 0:
-                TDM.tdm_store(
-                    TDM.tdm_group0(l_src, d_src + fx.Int64(h_src) * fx.Int64(4)),
-                    TDM.tdm_group1_rows_4b(r_src),
-                )
-            if const_expr(scale_bytes > 0):
-                if r_sc > 0:
-                    TDM.tdm_store(
-                        TDM.tdm_group0(l_sc, d_sc + fx.Int64(h_sc) * fx.Int64(4)),
-                        TDM.tdm_group1_rows_4b(r_sc),
-                    )
-            TDM.tdm_wait(0)
-
-        for run_id in range(warp, meta_runs, warp_num_per_block):
-            peer = run_id // peer_split
-            part = run_id - peer * peer_split
-            cnt_all = comm_ops.load_i32_lds(s_n(peer))
-            base_all = comm_ops.load_i32_lds(s_base(peer))
-            # Split the peer's run across `peer_split` warps, remainder to the
-            # low parts so the sub-runs differ by at most one token.
-            q = cnt_all // peer_split
-            rem = cnt_all - q * peer_split
-            my_beg = part * q + arith.select(part < rem, part, rem)
-            my_cnt = q + arith.select(part < rem, fx.Int32(1), fx.Int32(0))
-            # RESERVE counted every route, FINALIZE published only those that
-            # fit; without this the surplus names slots the peer never
-            # allocated and the metadata run walks off its recv buffer.
-            room = arith.constant(min(max_recv, stg_cap)) - (base_all + my_beg)
-            my_cnt = arith.select(my_cnt < room, my_cnt, room)
-            my_cnt = arith.select(my_cnt < 0, fx.Int32(0), my_cnt)
-            peer_idx = create_buffer_resource_from_addr(
-                fx.Int64(window.lsa_ptr(peer, off_out_idx))
-            )
-            peer_wts = create_buffer_resource_from_addr(
-                fx.Int64(window.lsa_ptr(peer, off_out_wts))
-            )
-            peer_tis = create_buffer_resource_from_addr(
-                fx.Int64(window.lsa_ptr(peer, off_tis))
-            )
-            if const_expr(scale_bytes > 0):
-                peer_scales = create_buffer_resource_from_addr(
-                    fx.Int64(window.lsa_ptr(peer, off_out_scales))
-                )
-            stg_beg = peer * stg_cap + base_all + my_beg
-            step = meta_cap if use_meta_tdm else 1
-            for cs in range(0, my_cnt, step):
-                dst = base_all + my_beg + cs
-                src = stg_beg + cs
-                if const_expr(use_meta_tdm):
-                    left = my_cnt - cs
-                    n_tok = arith.select(left < step, left, fx.Int32(step))
-                    _ship_meta(
-                        peer,
-                        n_tok,
-                        src,
-                        dst,
-                        peer_idx,
-                        peer_wts,
-                        peer_tis,
-                        peer_scales if scale_bytes else None,
-                    )
-                else:
-                    for i in range(lane, topk, WAVE):
+                slot = dest_pe * stg_cap + dest_tok
+                src_encoded = rank * max_tok_per_rank + tok
+                pub_i = arith.select(pub, fx.Int32(1), fx.Int32(0))
+                for e in range_constexpr(topk):
+                    probe = (s_lane * topk + e) * 4
+                    pub_e = ds_bpermute(T.i32, probe, pub_i)
+                    slot_e = ds_bpermute(T.i32, probe, slot)
+                    if lane_act & (pub_e != 0):
+                        buffer_store(expert, rsrc_stg_idx, slot_e * topk + e_lane)
                         buffer_store(
-                            buffer_load(
-                                rsrc_stg_idx, src * topk + i, vec_width=1, dtype=T.i32
-                            ),
-                            peer_idx,
-                            dst * topk + i,
+                            arith.bitcast(T.i32, wt), rsrc_stg_wt, slot_e * topk + e_lane
                         )
-                        buffer_store(
-                            buffer_load(
-                                rsrc_stg_wt, src * topk + i, vec_width=1, dtype=T.i32
-                            ),
-                            peer_wts,
-                            dst * topk + i,
-                        )
-                    if lane == 0:
-                        buffer_store(
-                            buffer_load(rsrc_stg_src, src, vec_width=1, dtype=T.i32),
-                            peer_tis,
-                            dst,
-                        )
-                    if const_expr(scale_bytes > 0):
-                        for i in range(lane, scale_dst_dw, WAVE):
-                            buffer_store(
-                                buffer_load(
+                        if e_lane == 0:
+                            buffer_store(src_encoded, rsrc_stg_src, slot_e)
+                        if const_expr(scale_bytes > 0):
+                            # The caller's row is packed, the staged one is padded to
+                            # `scale_stride` so a run of them starts on a TDM row. The
+                            # token's route lanes split both halves between them.
+                            for si in range(e_lane, scale_src_dw, topk):
+                                buffer_store(
+                                    buffer_load(
+                                        rsrc_inp_scale,
+                                        tok * scale_src_dw + si,
+                                        vec_width=1,
+                                        dtype=T.i32,
+                                    ),
                                     rsrc_stg_scale,
-                                    src * scale_dst_dw + i,
-                                    vec_width=1,
-                                    dtype=T.i32,
+                                    slot_e * scale_dst_dw + si,
+                                )
+                            # Zeroed rather than left over: the pad crosses into a
+                            # peer's memory on the next TDM run.
+                            for si in range(scale_src_dw + e_lane, scale_dst_dw, topk):
+                                buffer_store(
+                                    arith.constant(0),
+                                    rsrc_stg_scale,
+                                    slot_e * scale_dst_dw + si,
+                                )
+
+            # tok_map is written here and re-read by the payload phase, and the
+            # staging arrays are written here and read by the metadata phase; both
+            # go through global memory, so the stores have to land before either.
+            comm_ops.waitcnt_stores()
+            fx.barrier()
+
+            # ── META: the staged runs leave as bulk cross-GPU writes ──
+            def _copy_edge(src_rsrc, dst_rsrc, src_off, dst_off, head, body, total):
+                """Scalar-copy the leading and trailing elements the body misses."""
+                for i in range(lane, head, WAVE):
+                    buffer_store(
+                        buffer_load(src_rsrc, src_off + i, vec_width=1, dtype=T.i32),
+                        dst_rsrc,
+                        dst_off + i,
+                    )
+                for i in range(head + body + lane, total, WAVE):
+                    buffer_store(
+                        buffer_load(src_rsrc, src_off + i, vec_width=1, dtype=T.i32),
+                        dst_rsrc,
+                        dst_off + i,
+                    )
+
+            def _ship_meta(peer_id, n_tok, src_tok, dst_tok, p_idx, p_wts, p_tis, p_scales):
+                """Move one batch of staged metadata for ``n_tok`` tokens to a peer.
+
+                Every field is planned on its own: they start at unrelated phases
+                within a 128B row, so one can earn a TDM body where the next goes
+                entirely scalar. The tile regions are packed at each body's real
+                size, which is a whole number of rows and so keeps every region as
+                128B-aligned as the tile base.
+                """
+                row = TDM.TDM_ROW_ELEMS_4B
+                n_kv = n_tok * topk
+                kv_bytes = fx.Int64(src_tok) * fx.Int64(topk * 4)
+                kv_dbytes = fx.Int64(dst_tok) * fx.Int64(topk * 4)
+                s_idx = fx.Int64(addr_stg_idx) + kv_bytes
+                d_idx = fx.Int64(window.lsa_ptr(peer_id, off_out_idx)) + kv_dbytes
+                s_wt = fx.Int64(addr_stg_wt) + kv_bytes
+                d_wt = fx.Int64(window.lsa_ptr(peer_id, off_out_wts)) + kv_dbytes
+                s_src = fx.Int64(addr_stg_src) + fx.Int64(src_tok) * fx.Int64(4)
+                d_src = fx.Int64(window.lsa_ptr(peer_id, off_tis)) + fx.Int64(
+                    dst_tok
+                ) * fx.Int64(4)
+                h_idx, r_idx = TDM.tdm_plan_xfer_4b(s_idx, d_idx, n_kv)
+                h_wt, r_wt = TDM.tdm_plan_xfer_4b(s_wt, d_wt, n_kv)
+                h_src, r_src = TDM.tdm_plan_xfer_4b(s_src, d_src, n_tok)
+                b_idx = r_idx * row
+                b_wt = r_wt * row
+                b_src = r_src * row
+                l_idx = my_tile
+                l_wt = l_idx + b_idx * 4
+                l_src = l_wt + b_wt * 4
+                if r_idx > 0:
+                    TDM.tdm_load(
+                        TDM.tdm_group0(l_idx, s_idx + fx.Int64(h_idx) * fx.Int64(4)),
+                        TDM.tdm_group1_rows_4b(r_idx),
+                    )
+                if r_wt > 0:
+                    TDM.tdm_load(
+                        TDM.tdm_group0(l_wt, s_wt + fx.Int64(h_wt) * fx.Int64(4)),
+                        TDM.tdm_group1_rows_4b(r_wt),
+                    )
+                if r_src > 0:
+                    TDM.tdm_load(
+                        TDM.tdm_group0(l_src, s_src + fx.Int64(h_src) * fx.Int64(4)),
+                        TDM.tdm_group1_rows_4b(r_src),
+                    )
+                if const_expr(scale_bytes > 0):
+                    n_sc = n_tok * scale_dst_dw
+                    s_sc = fx.Int64(addr_stg_scale) + fx.Int64(src_tok) * fx.Int64(
+                        scale_stride
+                    )
+                    d_sc = fx.Int64(window.lsa_ptr(peer_id, off_out_scales)) + fx.Int64(
+                        dst_tok
+                    ) * fx.Int64(scale_stride)
+                    h_sc, r_sc = TDM.tdm_plan_xfer_4b(s_sc, d_sc, n_sc)
+                    b_sc = r_sc * row
+                    l_sc = l_src + b_src * 4
+                    if r_sc > 0:
+                        TDM.tdm_load(
+                            TDM.tdm_group0(l_sc, s_sc + fx.Int64(h_sc) * fx.Int64(4)),
+                            TDM.tdm_group1_rows_4b(r_sc),
+                        )
+                # The edges are global-to-global and owe the tile nothing, so they
+                # run while the loads above are still in flight.
+                _copy_edge(
+                    rsrc_stg_idx, p_idx, src_tok * topk, dst_tok * topk, h_idx, b_idx, n_kv
+                )
+                _copy_edge(
+                    rsrc_stg_wt, p_wts, src_tok * topk, dst_tok * topk, h_wt, b_wt, n_kv
+                )
+                _copy_edge(rsrc_stg_src, p_tis, src_tok, dst_tok, h_src, b_src, n_tok)
+                if const_expr(scale_bytes > 0):
+                    _copy_edge(
+                        rsrc_stg_scale,
+                        p_scales,
+                        src_tok * scale_dst_dw,
+                        dst_tok * scale_dst_dw,
+                        h_sc,
+                        b_sc,
+                        n_sc,
+                    )
+                TDM.tdm_wait(0)
+                if r_idx > 0:
+                    TDM.tdm_store(
+                        TDM.tdm_group0(l_idx, d_idx + fx.Int64(h_idx) * fx.Int64(4)),
+                        TDM.tdm_group1_rows_4b(r_idx),
+                    )
+                if r_wt > 0:
+                    TDM.tdm_store(
+                        TDM.tdm_group0(l_wt, d_wt + fx.Int64(h_wt) * fx.Int64(4)),
+                        TDM.tdm_group1_rows_4b(r_wt),
+                    )
+                if r_src > 0:
+                    TDM.tdm_store(
+                        TDM.tdm_group0(l_src, d_src + fx.Int64(h_src) * fx.Int64(4)),
+                        TDM.tdm_group1_rows_4b(r_src),
+                    )
+                if const_expr(scale_bytes > 0):
+                    if r_sc > 0:
+                        TDM.tdm_store(
+                            TDM.tdm_group0(l_sc, d_sc + fx.Int64(h_sc) * fx.Int64(4)),
+                            TDM.tdm_group1_rows_4b(r_sc),
+                        )
+                TDM.tdm_wait(0)
+
+            for run_id in range(warp, meta_runs, warp_num_per_block):
+                peer = run_id // peer_split
+                part = run_id - peer * peer_split
+                cnt_all = comm_ops.load_i32_lds(s_n(peer))
+                base_all = comm_ops.load_i32_lds(s_base(peer))
+                # Split the peer's run across `peer_split` warps, remainder to the
+                # low parts so the sub-runs differ by at most one token.
+                q = cnt_all // peer_split
+                rem = cnt_all - q * peer_split
+                my_beg = part * q + arith.select(part < rem, part, rem)
+                my_cnt = q + arith.select(part < rem, fx.Int32(1), fx.Int32(0))
+                # RESERVE counted every route, FINALIZE published only those that
+                # fit; without this the surplus names slots the peer never
+                # allocated and the metadata run walks off its recv buffer.
+                room = arith.constant(min(max_recv, stg_cap)) - (base_all + my_beg)
+                my_cnt = arith.select(my_cnt < room, my_cnt, room)
+                my_cnt = arith.select(my_cnt < 0, fx.Int32(0), my_cnt)
+                peer_idx = create_buffer_resource_from_addr(
+                    fx.Int64(window.lsa_ptr(peer, off_out_idx))
+                )
+                peer_wts = create_buffer_resource_from_addr(
+                    fx.Int64(window.lsa_ptr(peer, off_out_wts))
+                )
+                peer_tis = create_buffer_resource_from_addr(
+                    fx.Int64(window.lsa_ptr(peer, off_tis))
+                )
+                if const_expr(scale_bytes > 0):
+                    peer_scales = create_buffer_resource_from_addr(
+                        fx.Int64(window.lsa_ptr(peer, off_out_scales))
+                    )
+                stg_beg = peer * stg_cap + base_all + my_beg
+                step = meta_cap if use_meta_tdm else 1
+                for cs in range(0, my_cnt, step):
+                    dst = base_all + my_beg + cs
+                    src = stg_beg + cs
+                    if const_expr(use_meta_tdm):
+                        left = my_cnt - cs
+                        n_tok = arith.select(left < step, left, fx.Int32(step))
+                        _ship_meta(
+                            peer,
+                            n_tok,
+                            src,
+                            dst,
+                            peer_idx,
+                            peer_wts,
+                            peer_tis,
+                            peer_scales if scale_bytes else None,
+                        )
+                    else:
+                        for i in range(lane, topk, WAVE):
+                            buffer_store(
+                                buffer_load(
+                                    rsrc_stg_idx, src * topk + i, vec_width=1, dtype=T.i32
                                 ),
-                                peer_scales,
-                                dst * scale_dst_dw + i,
+                                peer_idx,
+                                dst * topk + i,
+                            )
+                            buffer_store(
+                                buffer_load(
+                                    rsrc_stg_wt, src * topk + i, vec_width=1, dtype=T.i32
+                                ),
+                                peer_wts,
+                                dst * topk + i,
+                            )
+                        if lane == 0:
+                            buffer_store(
+                                buffer_load(rsrc_stg_src, src, vec_width=1, dtype=T.i32),
+                                peer_tis,
+                                dst,
+                            )
+                        if const_expr(scale_bytes > 0):
+                            for i in range(lane, scale_dst_dw, WAVE):
+                                buffer_store(
+                                    buffer_load(
+                                        rsrc_stg_scale,
+                                        src * scale_dst_dw + i,
+                                        vec_width=1,
+                                        dtype=T.i32,
+                                    ),
+                                    peer_scales,
+                                    dst * scale_dst_dw + i,
                             )
 
         # ── PAYLOAD: one TDM load per token, one TDM store per surviving route ──
@@ -697,10 +727,21 @@ def _make_dispatch_tdm(
         # `sub` is a runtime loop and not `range_constexpr` on purpose: the route
         # loop below already unrolls `topk` descriptor sites, and unrolling this
         # one too would multiply them by `tpi`.
-        g_payload = TDM.tdm_group1(hidden_dim, 1, hidden_elem_size)
+        g_payload_load = TDM.tdm_group1(hidden_dim, 1, hidden_elem_size)
+        g_payload_store = TDM.tdm_group1(
+            compact_row_stride if compact_plan else hidden_dim,
+            1,
+            1 if compact_plan else hidden_elem_size,
+        )
         probe_off = arith.select(lane < topk, lane, 0)
-        for tok_base in range(global_warp_id * etpi, inp_cur_tok, warps_total * etpi):
-            for sub in range(etpi):
+        row_stride = compact_row_stride if compact_plan else nbytes
+        # Compact plan fills tok_map in a prior low-LDS kernel, so every warp
+        # may read it. Token-major dispatch still only trusts entries it wrote.
+        tok_step = warps_total if compact_plan else (warps_total * etpi)
+        tok_begin = global_warp_id if compact_plan else (global_warp_id * etpi)
+        for tok_base in range(tok_begin, inp_cur_tok, tok_step):
+            sub_limit = fx.Int32(1) if compact_plan else etpi
+            for sub in range(sub_limit):
                 tok = tok_base + sub
                 if tok < inp_cur_tok:
                     flat = buffer_load(
@@ -709,8 +750,28 @@ def _make_dispatch_tdm(
                     # `flat >= 0` rejects the host's -1 fill as well as the
                     # sentinel, so a slot FINALIZE never published can never name
                     # a route.
-                    live = (lane < topk) & (flat >= 0) & (flat < sentinel_val)
+                    live = (lane < topk) & (flat >= 0)
+                    if const_expr(not compact_plan):
+                        live = live & (flat < sentinel_val)
                     live_mask = ballot(T.i32, live)
+                    wt_bits = arith.constant(0)
+                    packed_meta = arith.constant(0)
+                    if const_expr(compact_plan):
+                        if live:
+                            wt_bits = arith.bitcast(
+                                T.i32,
+                                buffer_load(
+                                    rsrc_inp_wts,
+                                    tok * topk + lane,
+                                    vec_width=1,
+                                    dtype=T.f32,
+                                ),
+                            )
+                            packed_meta = (
+                                fx.Int32(rank) * fx.Int32(max_tok_slot_stride)
+                                + tok * fx.Int32(topk)
+                                + lane
+                            )
                     if live_mask != 0:
                         TDM.tdm_load(
                             TDM.tdm_group0(
@@ -718,32 +779,134 @@ def _make_dispatch_tdm(
                                 fx.Int64(addr_inp_tok)
                                 + fx.Int64(tok) * fx.Int64(nbytes),
                             ),
-                            g_payload,
+                            g_payload_load,
                         )
+                        # All compact rows of this token carry the same scale.
+                        # Read it once into the unused tail of this warp's LDS
+                        # tile instead of re-reading the global row per route.
+                        scale_lds = fx.Int64(my_tile) + fx.Int64(nbytes)
+                        if const_expr(compact_plan and scale_bytes > 0):
+                            scale_vec = 2 if scale_src_dw % 2 == 0 else 1
+                            for si in range(
+                                lane * scale_vec,
+                                scale_src_dw,
+                                WAVE * scale_vec,
+                            ):
+                                val = buffer_load(
+                                    rsrc_inp_scale,
+                                    tok * scale_src_dw + si,
+                                    vec_width=scale_vec,
+                                    dtype=T.i32,
+                                )
+                                if const_expr(scale_vec == 2):
+                                    comm_ops.store_i32_lds(
+                                        scale_lds + fx.Int64(si) * fx.Int64(4),
+                                        val[0],
+                                    )
+                                    comm_ops.store_i32_lds(
+                                        scale_lds + fx.Int64(si + 1) * fx.Int64(4),
+                                        val[1],
+                                    )
+                                else:
+                                    comm_ops.store_i32_lds(
+                                        scale_lds + fx.Int64(si) * fx.Int64(4),
+                                        val,
+                                    )
+                            fx.rocdl.s_wait_dscnt(0)
                         TDM.tdm_wait(0)
-                        # Walk the live lanes off the ballot rather than all
-                        # `topk` slots: a token with one destination costs one
-                        # iteration instead of `topk` probe-and-skip rounds,
-                        # and the destinations still come out in lane order.
-                        rest = live_mask
-                        for _ in range(fx.ctpop(live_mask)):
-                            src_lane = fx.cttz(rest)
-                            rest = rest & (rest - 1)
-                            flat_l = readlane(T.i32, flat, src_lane)
-                            dest_pe = flat_l // max_recv
-                            dest_tok = flat_l - dest_pe * max_recv
-                            TDM.tdm_store(
-                                TDM.tdm_group0(
-                                    my_tile,
-                                    fx.Int64(window.lsa_ptr(dest_pe, off_out_tok))
-                                    + fx.Int64(dest_tok) * fx.Int64(nbytes),
-                                ),
-                                g_payload,
-                            )
-                        # The next token reloads into this same tile.
+                        if const_expr(compact_plan):
+                            # Unroll the live routes so each TDM descriptor is a
+                            # distinct issue site. The ctpop walk serializes too
+                            # many SGPR descriptor rebuilds through one loop.
+                            for k in range_constexpr(topk):
+                                bit = arith.constant(1 << k)
+                                if (live_mask & bit) != 0:
+                                    flat_l = readlane(T.i32, flat, k)
+                                    dest_pe = flat_l & compact_peer_mask
+                                    dest_tok = flat_l >> compact_peer_bits
+                                    TDM.tdm_store(
+                                        TDM.tdm_group0(
+                                            my_tile,
+                                            fx.Int64(
+                                                window.lsa_ptr(dest_pe, off_out_tok)
+                                            )
+                                            + fx.Int64(dest_tok)
+                                            * fx.Int64(row_stride),
+                                        ),
+                                        g_payload_store,
+                                    )
+                                    if lane == k:
+                                        buffer_store(
+                                            fx.Vector.from_elements(
+                                                [packed_meta, wt_bits],
+                                                dtype=fx.Int32,
+                                            ),
+                                            create_buffer_resource_from_addr(
+                                                fx.Int64(
+                                                    window.lsa_ptr(
+                                                        dest_pe, off_ep_rowmap
+                                                    )
+                                                )
+                                            ),
+                                            dest_tok * 2,
+                                        )
+                        else:
+                            rest = live_mask
+                            for _ in range(fx.ctpop(live_mask)):
+                                src_lane = fx.cttz(rest)
+                                rest = rest & (rest - 1)
+                                flat_l = readlane(T.i32, flat, src_lane)
+                                dest_pe = flat_l // max_recv
+                                dest_tok = flat_l - dest_pe * max_recv
+                                TDM.tdm_store(
+                                    TDM.tdm_group0(
+                                        my_tile,
+                                        fx.Int64(window.lsa_ptr(dest_pe, off_out_tok))
+                                        + fx.Int64(dest_tok) * fx.Int64(row_stride),
+                                    ),
+                                    g_payload_store,
+                                )
                         TDM.tdm_wait(0)
 
-        if const_expr(enable_signal):
+        if const_expr(enable_signal and compact_plan):
+            TDM.tdm_wait(0)
+            comm_ops.waitcnt_stores()
+            fx.barrier()
+
+            arrive_ticket = arith.constant(-1)
+            if tid == 0:
+                arrive_ticket = comm_ops.atomic_add_system(
+                    fx.Int64(addr_disp_bar), arith.constant(1)
+                )
+            if warp == 0:
+                arrive_ticket = readlane(T.i32, arrive_ticket, 0)
+            is_last = (warp == 0) & (arrive_ticket == block_num - 1)
+            if is_last:
+                if lane == 0:
+                    buffer_store(arith.constant(0), rsrc_disp_bar, 0)
+                comm_ops.fence_system_release()
+                for dest_pe in range(lane, npes, WAVE):
+                    recv_num_remote_addr = fx.Int64(
+                        window.lsa_ptr(dest_pe, off_recv_num)
+                    ) + fx.Int64(rank) * fx.Int64(4)
+                    comm_ops.store_i32_system(
+                        recv_num_remote_addr, arith.constant(0), arith.constant(1)
+                    )
+                comm_ops.waitcnt_stores()
+
+                local_recv_num = fx.Int64(
+                    window.lsa_ptr(my_lsa_rank, off_recv_num)
+                )
+                for src_pe in range(lane, npes, WAVE):
+                    recv_num_src_addr = (
+                        local_recv_num + fx.Int64(src_pe) * fx.Int64(4)
+                    )
+                    comm_ops.spin_until_gt_i32(recv_num_src_addr, 0)
+                    comm_ops.store_i32_system(
+                        recv_num_src_addr, arith.constant(0), arith.constant(0)
+                    )
+
+        if const_expr(enable_signal and not compact_plan):
             # TDM stores retire on the tensor counter, which storecnt does not
             # track, so the grid barrier needs both drains to cover the payload
             # and the plain stores.
@@ -800,6 +963,12 @@ def _make_dispatch_tdm(
                 # waiting on a barrier it had already consumed would hang.
                 if lane == 0:
                     buffer_store(arith.constant(0), rsrc_disp_bar, 0)
+                # The following route kernel uses this local array for slot
+                # atomics. This tail already has a unique owner, so folding the
+                # reset here needs neither another launch nor a grid barrier.
+                if const_expr(clear_route_counter):
+                    for expert in range(lane, experts_per_rank, WAVE):
+                        buffer_store(arith.constant(0), rsrc_route_counter, expert)
                 for dest_pe in range(lane, npes, WAVE):
                     recv_num_remote_addr = fx.Int64(
                         window.lsa_ptr(dest_pe, off_recv_num)
@@ -861,6 +1030,7 @@ def _make_dispatch_tdm(
         addr_stg_src: Int64,
         addr_stg_scale: Int64,
         addr_inp_scale: Int64,
+        addr_route_counter: Int64,
         my_lsa_rank: Int32,
         inp_cur_tok: Int32,
         stream=fx.Stream(None),  # noqa: B008
@@ -879,6 +1049,7 @@ def _make_dispatch_tdm(
             addr_stg_src,
             addr_stg_scale,
             addr_inp_scale,
+            addr_route_counter,
             my_lsa_rank,
             inp_cur_tok,
         ).launch(

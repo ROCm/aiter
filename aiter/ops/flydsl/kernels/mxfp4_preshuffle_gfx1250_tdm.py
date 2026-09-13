@@ -86,6 +86,8 @@ def launch_gemm_a8w4_tdm(
     f32_situ_beta: fx.Float32 = 1.0,
     f32_situ_linear_beta: fx.Float32 = 1.0,
     row_major_ascale: Constexpr[int] = 0,
+    a_row_stride_bytes: Constexpr[int] = 0,
+    a_scale_row_stride_bytes: Constexpr[int] = 0,
 ):
     """Launch the grouped contiguous-M a8w4 MoE GEMM for gfx1250.
 
@@ -152,6 +154,8 @@ def launch_gemm_a8w4_tdm(
         ep_destination_stride,
         ep_world_size,
         row_major_ascale,
+        a_row_stride_bytes,
+        a_scale_row_stride_bytes,
     )
     _ = cache_tag
     if enable_ep_scatter:
@@ -174,6 +178,8 @@ def launch_gemm_a8w4_tdm(
     scatter_dst_vectors = (
         scatter_passes + SCATTER_PASSES_PER_VECTOR - 1
     ) // SCATTER_PASSES_PER_VECTOR
+    if (4 * num_waves_per_tensor_tdm) % num_waves:
+        raise ValueError("A/B/SA/SB ownership must cover every workgroup wave")
 
     A_PACK = 2 if a_is_fp4 else 1
     A_ROW_B = tile_k // A_PACK
@@ -209,10 +215,11 @@ def launch_gemm_a8w4_tdm(
         else ((AS_SUPERS * AS_INNER * 4 + 15) // 16) * 16
     )
     STAGE_SB = ((SB_SUPERS * SC_INNER * 4 + 15) // 16) * 16
+    B_OFF = STAGE_A
     SA_OFF = STAGE_A + STAGE_B
     SB_OFF = STAGE_A + STAGE_B + STAGE_SA
-    # 512-align so per-buffer ptr offset preserves LDS alignment for TDM/ds_b128
-    PITCH = ((STAGE_A + STAGE_B + STAGE_SA + STAGE_SB + 511) // 512) * 512
+    _STAGE_BYTES = STAGE_A + STAGE_B + STAGE_SA + STAGE_SB
+    PITCH = ((_STAGE_BYTES + 511) // 512) * 512
 
     out_elem = T.f16 if out_is_f16 else T.bf16
     # The bf16 passthrough epilogue stages C with a padded row pitch to break the
@@ -354,7 +361,12 @@ def launch_gemm_a8w4_tdm(
         B_BATCH_ROWS = n64 // 16
         N_SUPERS = (n64 + 31) // 32
         AS_ROW = (K // 128) * wmma_m_rep * 16
-        SA_GROW = K // 128  # row-major: scale dwords per M row
+        A_GROW = a_row_stride_bytes if a_row_stride_bytes else A_KROW
+        SA_GROW = (
+            a_scale_row_stride_bytes // 4
+            if a_scale_row_stride_bytes
+            else K // 128
+        )
 
         c_outer_off, c_inner_off, c_stride = blk_m64, blk_n64, i32_n
         SB_OUTER_STRIDE = K4
@@ -420,7 +432,7 @@ def launch_gemm_a8w4_tdm(
             _ep_lsa0 = fx.Int64(ep_win.lsa_ptr(fx.Int32(0), 0))
             _ep_lsa1 = fx.Int64(ep_win.lsa_ptr(fx.Int32(1), 0))
         b_outer_row = eb64 * B_BATCH_ROWS + blk_n64 // 16
-        a_off0 = blk_m64 * A_KROW
+        a_off0 = blk_m64 * A_GROW
         b_off0 = b_outer_row * Kp16
         sb_off0 = (blk_n64 // 32) * SB_OUTER_STRIDE + sb_batch_off
         assert num_waves_per_tensor_tdm in (
@@ -535,7 +547,7 @@ def launch_gemm_a8w4_tdm(
         add_tdm_loads(
             gA_base,
             a_off0,
-            A_KROW,
+            A_GROW,
             mn_oob,
             A_ROW_B,
             tile_m,
@@ -555,7 +567,7 @@ def launch_gemm_a8w4_tdm(
             PACK_TK * 16,
             tile_n // 16,
             on_i32=False,
-            lds_off=STAGE_A,
+            lds_off=B_OFF,
             lds_row=B_LDS_ROW,
             k_adv=PACK_TK * 16,
             wv=waves[1],
@@ -633,7 +645,7 @@ def launch_gemm_a8w4_tdm(
 
         def issue(s, kt, my_jobs=None):
             pa = fx.recast_iter(p8_shared, buf_ptr(s))
-            so4 = s * (PITCH // 4)
+            so4 = (s * PITCH) // 4
 
             def emit(j):
                 base = base_i32 if j.on_i32 else pa
@@ -655,10 +667,8 @@ def launch_gemm_a8w4_tdm(
                                 emit(j)
 
         def dispatch_wave_job(fn):
-            """Run ``fn`` with the current wave's jobs."""
-            for g in range_constexpr(len(job_waves)):
-                if owns(job_waves[g]):
-                    fn([j for j in jobs if j.waves == job_waves[g]])
+            """Run ``fn`` once. ``issue`` still filters jobs by wave owner."""
+            fn(None)
 
         def issue_as_prologue():
             """Loads the full A-scale K range into its resident LDS buffer."""
@@ -677,7 +687,7 @@ def launch_gemm_a8w4_tdm(
         # Split each region's offset into a lane-varying base, which keepalive
         # can pin, and a compile-time part that folds into ds_load's offset:.
         lds_a_lane_off = (wmb + lane16) * A_LDS_ROW + kgrp * 16
-        lds_b_lane_off = STAGE_A + (wnb // 16) * B_LDS_ROW + kgrp * 256 + lane16 * 16
+        lds_b_lane_off = B_OFF + (wnb // 16) * B_LDS_ROW + kgrp * 256 + lane16 * 16
         assert wmma_m_rep == 1 or wmma_m_rep % 2 == 0
         sa_lane = lane16 if wmma_m_rep == 1 else lane
         SA_ROWS_PER_LOAD = 16 if wmma_m_rep == 1 else 32
@@ -712,7 +722,7 @@ def launch_gemm_a8w4_tdm(
                 lds_sb_base(buf),
             )
 
-        def load_a(buf, wm, ksl):
+        def load_a(buf, wm, ksl, a_kt):
             base = lds_a_base(buf)
             off = wm * 16 * A_LDS_ROW + ksl * A_KSTEP
             if const_expr(a_is_fp4):
@@ -871,7 +881,7 @@ def launch_gemm_a8w4_tdm(
             for wn in range_constexpr(wmma_n_rep):
                 slot.b[wn].store(load_b(buf, wn, ksl))
             for wm in range_constexpr(wmma_m_rep):
-                slot.a[wm].store(load_a(buf, wm, ksl))
+                slot.a[wm].store(load_a(buf, wm, ksl, kt))
 
         def k_step(
             cur_rmem,
