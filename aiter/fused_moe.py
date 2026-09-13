@@ -43,7 +43,7 @@ from aiter.ops.flydsl.mxfp4_kname import (
     parse_flydsl_v2_gemm2_kernel,
     parse_g2_kname_any,
 )
-from aiter.ops.flydsl.mxfp8_moe_8wave import is_kernel_name as _is_mxfp8_prefill_kname
+from aiter.ops.flydsl.mxfp8_moe import is_kernel_name as _is_mxfp8_prefill_kname
 from aiter.ops.moe_mxfp4_aux import _mxfp4_moe_sort_internal_is_supported
 from aiter.ops.opus import moe_stage2_a8w4 as _opus_a8w4
 from aiter.ops.opus.moe_stage1_a8w4 import (
@@ -2725,7 +2725,7 @@ def get_2stage_cfgs(
                 f"activation {activation}; using default heuristics"
             )
         elif _is_mxfp8_prefill_kname(kn1) or _is_mxfp8_prefill_kname(kn2):
-            from aiter.ops.flydsl.mxfp8_moe_8wave import kernel_params
+            from aiter.ops.flydsl.mxfp8_moe import kernel_params
 
             p1, p2 = kernel_params(kn1), kernel_params(kn2)
             a8w4 = p1 is not None and p1["b_dtype"] == "fp4"
@@ -2918,7 +2918,7 @@ def get_2stage_cfgs(
             return 16 if token < 2048 else 32 if token < 16384 else 64
 
     if _is_mxfp8_prefill_kname(kernelName1) or _is_mxfp8_prefill_kname(kernelName2):
-        from aiter.ops.flydsl.mxfp8_moe_8wave import kernel_params, stage1, stage2
+        from aiter.ops.flydsl.mxfp8_moe import kernel_params, stage1, stage2
 
         p1, p2 = kernel_params(kernelName1), kernel_params(kernelName2)
         if not (
@@ -3630,7 +3630,7 @@ def fused_moe_2stages(
     )
     if _is_a16w4_port or getattr(
         getattr(metadata.stage1, "func", metadata.stage1),
-        "_is_mxfp8_8wave_stage1",
+        "_is_mxfp8_prefill_stage1",
         False,
     ):
         a2 = None
@@ -3660,9 +3660,9 @@ def fused_moe_2stages(
                 extra_stage1_args["topk_ids"] = topk_ids
         if metadata.stage2_has_bias:
             extra_stage2_args["bias2"] = _normalize_bias_for_kernel(bias2)
-    if getattr(stage1_func, "_is_mxfp8_8wave_stage1", False):
+    if getattr(stage1_func, "_is_mxfp8_prefill_stage1", False):
         if bias1 is not None:
-            raise ValueError("Eight-wave MXFP8 stage 1 does not support expert bias")
+            raise ValueError("MXFP8/A8W4 prefill stage 1 does not support expert bias")
         extra_stage1_args["swiglu_limit"] = swiglu_limit
     if stage1_func in (_flydsl_stage1_wrapper, _opus_a8w4_stage1_wrapper):
         extra_stage1_args["swiglu_limit"] = swiglu_limit

@@ -10,7 +10,7 @@ import torch
 
 import aiter
 from aiter.jit.utils.chip_info import get_gfx
-from aiter.ops.flydsl.mxfp8_moe_8wave import kernel_name, stage1, stage2
+from aiter.ops.flydsl.mxfp8_moe import kernel_name, stage1, stage2
 from aiter.ops.shuffle import shuffle_scale_a16w4, shuffle_weight_a16w4
 from aiter.utility import fp4_utils
 
@@ -71,8 +71,8 @@ def reference(x, w1, w2, ids, weights, limit, b_dtype="fp8"):
     "tile,waves,b_dtype,limit,persistent",
     [
         (tile, 8, b_dtype, limit, False)
-        for tile in [(256, 256), (128, 512)]
-        for b_dtype, limit in [("fp8", 5.0), ("fp8", 0.0), ("fp4", None)]
+        for tile in [(256, 256)]
+        for b_dtype, limit in [("fp8", 5.0), ("fp8", 0.0)]
     ]
     + [((128, 256), 4, "fp4", limit, False) for limit in (None, 0.0, 0.125)]
     + [
@@ -188,7 +188,7 @@ def test_dynamic_routes_graph_and_packed_k384(
 
 @pytest.mark.parametrize(
     "b_dtype,waves,persistent",
-    [("fp8", 8, 0), ("fp4", 8, 0), ("fp4", 4, 0), ("fp8", 8, 2), ("fp8", 8, 4)],
+    [("fp8", 8, 0), ("fp4", 4, 0), ("fp8", 8, 2), ("fp8", 8, 4)],
 )
 def test_tuned_config_preserves_other_moe_paths(
     monkeypatch, tmp_path, b_dtype, waves, persistent
@@ -281,7 +281,7 @@ def test_tuned_config_preserves_other_moe_paths(
 
 
 def test_four_wave_stage1_exact_padding_and_dirty_graph(monkeypatch):
-    from aiter.ops.flydsl import mxfp8_moe_8wave as adapter
+    from aiter.ops.flydsl import mxfp8_moe as adapter
 
     torch.manual_seed(813)
     tokens, hidden, inter, experts, topk = 129, 256, 384, 3, 2
@@ -298,46 +298,37 @@ def test_four_wave_stage1_exact_padding_and_dirty_graph(monkeypatch):
     run = adapter._run
 
     def record(kind, args, **kw):
-        if kind == "gemm" and kw.get("num_waves") == 4:
+        if kind == "gemm" and kw["stage"] == 1:
             records.update(args=args, kwargs=kw)
         return run(kind, args, **kw)
 
     monkeypatch.setattr(adapter, "_run", record)
-    results = {}
-    for waves, block_m in [(8, 256), (4, 128)]:
-        sorted_ids, _, expert_ids, valid, _ = fm.moe_sorting(
-            ids,
-            weights,
-            experts,
-            hidden,
-            torch.bfloat16,
-            block_size=block_m,
-            accumulate=False,
-        )
-        q, s = stage1(
-            x,
-            w1,
-            w2,
-            sorted_ids,
-            expert_ids,
-            valid,
-            None,
-            topk,
-            block_m=block_m,
-            kernelName=kernel_name(1, tile_m=block_m, b_dtype="fp4", waves=waves),
-            w1_scale=s1,
-        )
-        count = int(valid[0].item())
-        rid = sorted_ids[:count].long()
-        active = (rid & 0xFFFFFF) < tokens
-        pos = torch.arange(count, device="cuda")[active]
-        routes = (rid[active] & 0xFFFFFF) * topk + (rid[active] >> 24)
-        results[waves] = q, s, pos, routes, torch.arange(count, device="cuda")[~active]
-    oldq, olds, oldpos, oldroutes, _ = results[8]
-    q, s, pos, routes, pad = results[4]
-    inverse = torch.empty(tokens * topk, device="cuda", dtype=torch.int64)
-    inverse[oldroutes] = oldpos
-    refpos = inverse[routes]
+    sorted_ids, _, expert_ids, valid, _ = fm.moe_sorting(
+        ids,
+        weights,
+        experts,
+        hidden,
+        torch.bfloat16,
+        block_size=128,
+        accumulate=False,
+    )
+    q, s = stage1(
+        x,
+        w1,
+        w2,
+        sorted_ids,
+        expert_ids,
+        valid,
+        None,
+        topk,
+        block_m=128,
+        kernelName=kernel_name(1, b_dtype="fp4"),
+        w1_scale=s1,
+    )
+    count = int(valid[0].item())
+    live = torch.arange(count, device="cuda")
+    pad = live[(sorted_ids[:count].long() & 0xFFFFFF) >= tokens]
+    reference_q, reference_s = q.clone(), s.clone()
     kg = torch.arange(q.shape[1] // 32, device="cuda")[None, :]
 
     def scale_index(rows):
@@ -349,15 +340,13 @@ def test_four_wave_stage1_exact_padding_and_dirty_graph(monkeypatch):
         )
 
     def check():
-        assert torch.equal(q[pos], oldq[refpos])
+        assert torch.equal(q[:count], reference_q[:count])
         assert torch.equal(
-            s.flatten()[scale_index(pos)], olds.flatten()[scale_index(refpos)]
+            s.flatten()[scale_index(live)], reference_s.flatten()[scale_index(live)]
         )
         assert torch.count_nonzero(q[pad]).item() == 0
         assert torch.all(s.flatten()[scale_index(pad)] == 19).item()
-        assert (
-            torch.count_nonzero(q[: int(pos.numel() + pad.numel()), inter:]).item() == 0
-        )
+        assert torch.count_nonzero(q[:count, inter:]).item() == 0
 
     def launch():
         args = records["args"]
@@ -405,12 +394,14 @@ def test_four_wave_aot(stage):
         "flydsl_moe1_mxfp8_4w_t128x256_xcd1",
         "flydsl_moe2_a8w4_4w_t256x256_xcd1",
         "flydsl_moe1_a8w4_8w_t128x256_xcd1",
+        "flydsl_moe1_a8w4_8w_t256x256_xcd1",
+        "flydsl_moe1_mxfp8_8w_t128x512_xcd1",
         "flydsl_moe1_mxfp8_8w_t256x256_persistent2_xcd3",
         "flydsl_moe2_a8w4_8w_t256x256_persistent2_xcd3",
     ],
 )
 def test_prefill_rejects_incompatible_geometry(name):
-    from aiter.ops.flydsl.mxfp8_moe_8wave import kernel_params
+    from aiter.ops.flydsl.mxfp8_moe import kernel_params
 
     with pytest.raises(ValueError):
         kernel_params(name)
