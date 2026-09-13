@@ -122,7 +122,10 @@ def _routed_aiter_reference(
 
 
 @pytest.mark.parametrize(
-    "m", [1, 8] if os.environ.get("AITER_K3_LATENT_M8", "0") == "1" else [1]
+    # FlyDSL specializes runtime integer arguments in its process-local cache.
+    # Run M=8 in a fresh pytest process instead of mixing specializations.
+    "m",
+    [8] if os.environ.get("AITER_K3_LATENT_M8", "0") == "1" else [1],
 )
 def test_k3_latent_fhmoe_exact_dimensions(
     monkeypatch: pytest.MonkeyPatch, m: int, capsys: pytest.CaptureFixture[str]
