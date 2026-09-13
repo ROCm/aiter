@@ -1805,6 +1805,7 @@ def _flydsl_stage2_wrapper(
     a2_scale=None,
     sorted_weights=None,
     bias2=None,
+    block_m=None,
     inter_dim_pad: int = 0,
     model_dim_pad: int = 0,
     expert_mask=None,
@@ -1828,6 +1829,14 @@ def _flydsl_stage2_wrapper(
     parsed = moe_kernels.get_flydsl_kernel_params(kernelName)
     if parsed is None:
         raise ValueError(f"Invalid FlyDSL kernel name: {kernelName}")
+    effective_sort_block_m = parsed.get("sort_block_m", 0) or parsed["tile_m"]
+    if block_m is not None and int(block_m) != effective_sort_block_m:
+        raise ValueError(
+            "FlyDSL stage2 sorting layout mismatch: "
+            f"moe_sorting uses block_m={int(block_m)}, but {kernelName} expects "
+            f"sort_block_m={effective_sort_block_m}. Select a kernel with "
+            f"_sbm{int(block_m)}."
+        )
     return moe_kernels.flydsl_moe_stage2(
         inter_states=inter_states,
         w2=w2,
