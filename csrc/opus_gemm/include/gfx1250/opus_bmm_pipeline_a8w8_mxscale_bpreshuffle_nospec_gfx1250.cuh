@@ -738,12 +738,27 @@ void bmm_a8w8_mxscale_bpreshuffle_nospec_kernel_gfx1250(opus_bmm_a8w8_mxscale_ka
             // The order the solver must produce. Counts are what the code above
             // issues: B frags and A-front before the front WMMAs, A-back before
             // the back ones.
+            // kAllReadsFirst: every ds_read of the ik, then the WMMAs in
+            // kExpN-sized groups -- the shape ATT shows FlyDSL running. Gated
+            // because it costs registers: holding all kExpM+kExpN fragments at
+            // once took kid35 (8 waves, 512 VGPR budget) from 458 to 496 and
+            // forced 18 extra ds_reads, which is why measuring it there gave a
+            // 1% regression that says nothing about the schedule itself. Only
+            // worth asking on a tile with register room.
+            if constexpr (T::kAllReadsFirst) {
+                __builtin_amdgcn_sched_group_barrier(
+                    kDsRead, kDsPerFrag * (T::kExpN + T::kExpM), 0);
+                opus::static_for<T::kExpM>([&](auto) __attribute__((always_inline)) {
+                    __builtin_amdgcn_sched_group_barrier(kMfma, T::kExpN, 0);
+                });
+            } else {
             __builtin_amdgcn_sched_group_barrier(
                 kDsRead, kDsPerFrag * (T::kExpN + kFront), 0);
             __builtin_amdgcn_sched_group_barrier(kMfma, kFront * T::kExpN, 0);
             if constexpr (kBack > 0) {
                 __builtin_amdgcn_sched_group_barrier(kDsRead, kDsPerFrag * kBack, 0);
                 __builtin_amdgcn_sched_group_barrier(kMfma, kBack * T::kExpN, 0);
+            }
             }
             __builtin_amdgcn_sched_barrier(0);
         });

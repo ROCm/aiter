@@ -180,7 +180,8 @@ template<int BLOCK_SIZE_,
          // which it already checks (kg_cap). The default 128 reserves for
          // K=16384; at K=4096 that is a 4x over-allocation, and on a slots=3
          // tile it is the difference between fitting in 320 KB and not.
-         int SF_A_PANEL_KG_ = 128>
+         int SF_A_PANEL_KG_ = 128,
+         bool ALL_READS_FIRST_ = false>
 struct opus_bmm_a8w8_mxscale_bpreshuffle_traits_gfx1250 {
     static constexpr int BLOCK_SIZE = BLOCK_SIZE_;
     static constexpr int B_M = B_M_;
@@ -865,6 +866,10 @@ struct opus_bmm_a8w8_mxscale_bpreshuffle_traits_gfx1250 {
     static constexpr int kSfPanelPad   = (kSfALds || kSfBLds) ? 16 : 0;
     static constexpr int kSfFillVecMax = 16;
     static constexpr int kFillUnroll   = 4;
+    // Schedule every ik's ds_reads before its WMMAs, instead of the front/back
+    // split. Needs room to hold kExpM+kExpN fragments at once, so it is opt-in
+    // per tile rather than global. See the pipeline's kAllReadsFirst block.
+    static constexpr bool kAllReadsFirst = ALL_READS_FIRST_;
     // How many scale-panel loads are issued before the first wait. The fill is
     // load->wait->store; at 1 every trip pays a cold round trip in series, and
     // ATT priced that at 13,234 cycles (10.7% of a kid35 prefill wave) against
@@ -1965,6 +1970,29 @@ using opus_bmm_a8w8_mxscale_bpreshuffle_tile_ns128_n128_s3_gfx1250 =
         /*SF_A_LDS*/true, /*SF_B_LDS*/true,
         /*SF_A_TDM_KG*/0, /*SF_A_TDM_PAD*/16, /*TILE_M*/2, /*NO_SPEC*/true,
         /*SF_A_PANEL_KG*/32>;
+
+// kid50: kid46 with the FlyDSL-shaped ik schedule.
+//
+// ATT's per-K-step comparison: our body waits 35 times at 529 cycles each,
+// FlyDSL's waits 58 times at 78. It issues every ds_read of the step up front
+// and then drains them with a staircase of short waits; we alternate read-block
+// / WMMA-block, so each block is waited on soon after it is issued.
+//
+// Asking for FlyDSL's order on kid35 measured 1% SLOWER, but that test was
+// confounded: kid35 has 8 waves and a 512-VGPR budget, holding all 12 fragments
+// pushed it 458 -> 496 and the compiler inserted 18 extra ds_reads. kid46 has 4
+// waves, a 1024 budget and reuse already at 1.00, so the schedule can be asked
+// there without paying for it in re-reads.
+template <typename DataC>
+using opus_bmm_a8w8_mxscale_bpreshuffle_tile_ns128_arf_gfx1250 =
+    opus_bmm_a8w8_mxscale_bpreshuffle_traits_gfx1250<
+        /*BLOCK_SIZE*/128, /*B_M*/256, /*B_N*/256, /*B_K*/256,
+        /*LAYOUT*/opus_gfx1250_bmm::kLayoutTileN,
+        /*D_A*/opus::fp8_t, /*D_B*/opus::fp8_t, /*D_C*/DataC, /*D_ACC*/float,
+        /*GROUP_K*/128, /*NUM_SLOTS*/2, /*WG_PER_CU*/1, /*GROUP_N*/128,
+        /*SF_A_LDS*/true, /*SF_B_LDS*/true,
+        /*SF_A_TDM_KG*/0, /*SF_A_TDM_PAD*/16, /*TILE_M*/2, /*NO_SPEC*/true,
+        /*SF_A_PANEL_KG*/128, /*ALL_READS_FIRST*/true>;
 
 // -- smem -> register read layouts -----------------------------------------
 // Device-only in effect, but compiled on the host pass too so vtype_c matches.
