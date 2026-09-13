@@ -136,9 +136,14 @@ def build_inputs(T, H, D, kv_len, var_len=False, seed=0, device="cuda"):
     indptr = torch.zeros(T + 1, device=device, dtype=torch.int64)
     indptr[1:] = lens.cumsum(0)
     total_indices = int(indptr[-1].item())
-    indices = torch.randint(
-        0, pages, (total_indices,), device=device, dtype=torch.int32
-    )
+    # Every gathered row is DISTINCT across the whole batch: one permutation of
+    # the pool, sliced per token. randint-with-replacement let rows repeat both
+    # inside a token's context and across tokens, so much of the pool stayed
+    # L2-resident and the kernel looked faster than it is in production -- the
+    # isolated numbers came out ~28% under the same asm kernel's time in a real
+    # DSv4 trace. With a permutation the working set is the entire pool
+    # (T * kv_len rows), which is what a real KV cache looks like.
+    indices = torch.randperm(pages, device=device)[:total_indices].to(torch.int32)
 
     kv_packed, kv_rope = v4_pack_2buff(kv)
     q_packed, q_rope = v4_pack_2buff(q)

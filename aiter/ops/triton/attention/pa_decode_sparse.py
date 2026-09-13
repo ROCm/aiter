@@ -101,7 +101,7 @@ def pa_decode_sparse(
     use_mx: bool | None = None,
     num_warps: int | None = None,
     ctas_h: int = 1,
-    q_tdm: bool = False,
+    q_tdm: bool = True,
 ) -> torch.Tensor:
     """Sparse paged-decode attention with split-K + widened BLOCK_H.
 
@@ -135,13 +135,11 @@ def pa_decode_sparse(
             (448 fp8 NoPE | 14 duplicated E8M0 group scales | 50 pad), so the
             same pool can be handed to either kernel with no repacking.
             ``kv_scales`` must be None (the scales are inline).
-        q_tdm: Load Q by TDM descriptor into LDS instead of masked
-            buffer_loads. Measured 92.3 -> 72.2us (kv_len 384) and
-            59.9 -> 44.2us (kv_len 136), and it takes VGPR spills 171 -> 0 on
+        q_tdm: DEFAULT ON. Load Q by TDM descriptor into LDS instead of masked
+            buffer_loads. Worth 90.4 -> 71.7us (kv_len 384) and
+            58.9 -> 43.5us (kv_len 136), and it takes VGPR spills 146 -> 0 on
             its own, because Q stops materialising [BLOCK_H, D] register tiles
-            and lands in LDS already in dot_q_layout. Verified correct over 24
-            shape combos. Default off only because it postdates the last full
-            suite run; it is the recommended next default.
+            and lands in LDS already in dot_q_layout. Set False to A/B it.
         ctas_h: EXPERIMENTAL, default 1 (off). Launch ``ctas_h`` CTAs as one
             workgroup cluster, splitting ``block_h`` across them. All CTAs of a
             cluster serve the same token and want the same KV rows, so the KV
@@ -795,7 +793,7 @@ def _pa_decode_sparse_v4_2buff(
     use_mx: bool | None = None,
     num_warps: int | None = None,
     ctas_h: int = 1,
-    q_tdm: bool = False,
+    q_tdm: bool = True,
     block_h: int | None = None,
     kv_splits: int | None = None,
     has_invalid: bool = True,
@@ -914,8 +912,15 @@ def _pa_decode_sparse_v4_2buff(
         max_num_wg = 1024
     if ctas_h > 1:
         # block_h is the CLUSTER tile: each CTA owns block_h // ctas_h heads,
-        # and warps follow the per-CTA tile (16 heads -> 1 warp).
+        # and warps follow the per-CTA tile (16 heads -> 1 warp). The per-CTA
+        # tile may not fall below the 16-row WMMA instruction tile -- without
+        # this the compiler dies with a bare "PassManager::run failed".
         assert not (block_h % ctas_h), f"block_h {block_h} % ctas_h {ctas_h}"
+        assert block_h // ctas_h >= 16, (
+            f"ctas_h={ctas_h} would give {block_h // ctas_h} heads per CTA for "
+            f"block_h={block_h}; the WMMA tile is 16 rows, so ctas_h must be "
+            f"<= block_h // 16 ({block_h // 16})"
+        )
         attn_num_warps = max(1, (block_h // ctas_h) // 16)
     if num_warps is not None:
         attn_num_warps = num_warps
@@ -1164,7 +1169,14 @@ def _pa_decode_sparse_v4_mx(
     block_k = 32 if block_h == 128 else 16
     attn_num_warps = 8 if block_h == 128 else max(1, block_h // 16)
     if ctas_h > 1:
+        # See the 2buff driver: the per-CTA head tile cannot go below the
+        # 16-row WMMA instruction tile.
         assert not (block_h % ctas_h), f"block_h {block_h} % ctas_h {ctas_h}"
+        assert block_h // ctas_h >= 16, (
+            f"ctas_h={ctas_h} would give {block_h // ctas_h} heads per CTA for "
+            f"block_h={block_h}; the WMMA tile is 16 rows, so ctas_h must be "
+            f"<= block_h // 16 ({block_h // 16})"
+        )
         attn_num_warps = max(1, (block_h // ctas_h) // 16)
     max_num_wg = 256
     if kv_splits is None:

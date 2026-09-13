@@ -1298,7 +1298,13 @@ def _pa_decode_sparse_v4_2buff(
     acc = gl.zeros([BLOCK_H, BLOCK_D], dtype=gl.float32, layout=PV_WMMA_LAYOUT)
 
     # ---- 2-stage pipeline (slots one tile ahead of the KV/RoPE gathers) ----
-    NUM_BUFFERS: gl.constexpr = 2
+    # 3-deep so a tile can be gathered two iterations ahead of its use, plus a
+    # 2-deep bf16 staging ring so tile i+1's dequant writes one buffer while
+    # tile i's dots read the other. With the old 2-deep/1-deep pair the dequant
+    # ran immediately before the dots that consumed it, which ATT showed as
+    # ~60% of stall on s_wait_dscnt.
+    NUM_BUFFERS: gl.constexpr = 3
+    NUM_STAGE: gl.constexpr = 2
     kv_bufs = gl.allocate_shared_memory(
         gl.uint8,
         [NUM_BUFFERS, BLOCK_K, BLOCK_D],
@@ -1311,8 +1317,10 @@ def _pa_decode_sparse_v4_2buff(
     )
     # Single staging tile: dequantized NoPE + gathered RoPE, the operand both
     # wmma's read. Written once per iteration, immediately before the math.
-    kv_bf16 = gl.allocate_shared_memory(gl.bfloat16, [BLOCK_K, BLOCK_D], kv_bf16_shared)
-    NUM_SLOT_BUFFERS: gl.constexpr = 2
+    kv_bf16 = gl.allocate_shared_memory(
+        gl.bfloat16, [NUM_STAGE, BLOCK_K, BLOCK_D], kv_bf16_shared
+    )
+    NUM_SLOT_BUFFERS: gl.constexpr = 4
     slot_bufs = gl.allocate_shared_memory(
         kv_indices_ptr.dtype.element_ty,
         [NUM_SLOT_BUFFERS, 1, BLOCK_K],
@@ -1343,75 +1351,100 @@ def _pa_decode_sparse_v4_2buff(
 
     k_offs_mma = gl.arange(0, BLOCK_K, layout=valid_col_mma)
 
-    # ---- Prologue ----
+    # ---- Prologue: prime the 3-deep pipeline ----
+    # Invariant at the top of iteration i -- exactly 3 TDM ops outstanding:
+    #   slot(i+2) in flight, KV/RoPE(i+1) in flight, and staging[i % 2] already
+    #   holding the dequantized tile i.
     gl.amd.gfx1250.tdm.async_load(
         slot_desc, [0, tile_start * BLOCK_K], slot_bufs.index(0)
     )
     gl.amd.gfx1250.tdm.async_load(
         slot_desc, [0, (tile_start + 1) * BLOCK_K], slot_bufs.index(1)
     )
-    gl.amd.gfx1250.tdm.async_wait(1)  # slot[tile_start] ready (slot[+1] in flight)
+    gl.amd.gfx1250.tdm.async_wait(1)  # slot(0) ready
     slot_reg = slot_bufs.index(0).reshape([BLOCK_K]).load(layout=slot_reg_layout)
-
     if HAS_INVALID:
         valid_wide = slot_reg >= 0
-        safe_slot_cur = gl.where(valid_wide, slot_reg, 0)
+        safe_slot = gl.where(valid_wide, slot_reg, 0)
         cur_valid = gl.convert_layout(valid_wide, valid_col_mma)
     else:
-        safe_slot_cur = slot_reg
-    gl.amd.gfx1250.tdm.async_gather(kv_desc, safe_slot_cur, kv_bufs.index(0))
-    gl.amd.gfx1250.tdm.async_gather(rope_desc, safe_slot_cur, rope_bufs.index(0))
+        safe_slot = slot_reg
+    gl.amd.gfx1250.tdm.async_gather(kv_desc, safe_slot, kv_bufs.index(0))
+    gl.amd.gfx1250.tdm.async_gather(rope_desc, safe_slot, rope_bufs.index(0))
+    gl.amd.gfx1250.tdm.async_load(
+        slot_desc, [0, (tile_start + 2) * BLOCK_K], slot_bufs.index(2)
+    )
+    gl.amd.gfx1250.tdm.async_wait(3)  # slot(1) ready
+    slot_reg = slot_bufs.index(1).reshape([BLOCK_K]).load(layout=slot_reg_layout)
+    if HAS_INVALID:
+        valid_wide = slot_reg >= 0
+        safe_slot = gl.where(valid_wide, slot_reg, 0)
+        next_valid = gl.convert_layout(valid_wide, valid_col_mma)
+    else:
+        safe_slot = slot_reg
+    gl.amd.gfx1250.tdm.async_gather(kv_desc, safe_slot, kv_bufs.index(1))
+    gl.amd.gfx1250.tdm.async_gather(rope_desc, safe_slot, rope_bufs.index(1))
+    gl.amd.gfx1250.tdm.async_wait(3)  # KV/RoPE(0) ready
+    _v4_dequant_tile(
+        kv_bufs.index(0),
+        kv_bf16.index(0),
+        rope_bufs.index(0),
+        BLOCK_K,
+        SCALE_COL_LAYOUT,
+        GROUP_BLOCKED_LAYOUT,
+        ROPE_BLOCKED_LAYOUT,
+        NOPE_DIM,
+        ROPE_DIM,
+        GROUP_SIZE,
+    )
 
-    buf_idx: gl.int32 = 0
-
-    # ---- Main loop: tile_start .. tile_end-1 (final tile in epilogue) ----
+    # ---- Main loop: math on tiles tile_start .. tile_end-2 ----
     gl.assume(num_iters >= 1)
     for i in tl.range(0, num_iters - 1):
-        async_idx = (buf_idx + 1) % NUM_BUFFERS
-
-        gl.amd.gfx1250.tdm.async_load(
-            slot_desc,
-            [0, (tile_start + i + 2) * BLOCK_K],
-            slot_bufs.index(i % NUM_SLOT_BUFFERS),
-        )
-        # In flight before the wait: slot[i+1], KV[i], RoPE[i], slot[i+2].
-        # Retire the oldest (slot[i+1]) and keep the other three.
-        if CTAS_H > 1:
-            gl.amd.gfx1250.cluster.arrive()
-        gl.amd.gfx1250.tdm.async_wait(3)
-        if CTAS_H > 1:
-            gl.amd.gfx1250.cluster.wait()
+        # 1. retire slot(i+2), read it, gather tile i+2 two iterations ahead
+        gl.amd.gfx1250.tdm.async_wait(2)
         slot_reg = (
-            slot_bufs.index((i + 1) % NUM_SLOT_BUFFERS)
+            slot_bufs.index((i + 2) % NUM_SLOT_BUFFERS)
             .reshape([BLOCK_K])
             .load(layout=slot_reg_layout)
         )
-
         if HAS_INVALID:
             valid_wide = slot_reg >= 0
-            safe_next_slot = gl.where(valid_wide, slot_reg, 0)
-            next_valid = gl.convert_layout(valid_wide, valid_col_mma)
+            safe_slot = gl.where(valid_wide, slot_reg, 0)
+            next2_valid = gl.convert_layout(valid_wide, valid_col_mma)
         else:
-            safe_next_slot = slot_reg
-        gl.amd.gfx1250.tdm.async_gather(
-            kv_desc, safe_next_slot, kv_bufs.index(async_idx)
+            safe_slot = slot_reg
+        gl.amd.gfx1250.tdm.async_load(
+            slot_desc,
+            [0, (tile_start + i + 3) * BLOCK_K],
+            slot_bufs.index((i + 3) % NUM_SLOT_BUFFERS),
         )
         gl.amd.gfx1250.tdm.async_gather(
-            rope_desc, safe_next_slot, rope_bufs.index(async_idx)
+            kv_desc, safe_slot, kv_bufs.index((i + 2) % NUM_BUFFERS)
+        )
+        gl.amd.gfx1250.tdm.async_gather(
+            rope_desc, safe_slot, rope_bufs.index((i + 2) % NUM_BUFFERS)
         )
 
-        # Retire KV[i] + RoPE[i]; slot[i+2], KV[i+1], RoPE[i+1] stay in flight.
+        # 2. issue tile i's dot-operand reads BEFORE the dequant below. The
+        #    LDS pipe is serial: the dequant's ds_load + ds_store for tile i+1
+        #    would otherwise sit in front of these in the queue and the wmma
+        #    could not start until they drained. Issued first, the operands
+        #    land early and the dequant's LDS traffic overlaps the dots.
+        kv_t = kv_bf16.index(i % NUM_STAGE).permute([1, 0]).load(dot_k_layout)
+        kv_for_acc = kv_bf16.index(i % NUM_STAGE).load(dot_v_layout)
+
+        # 3. retire KV/RoPE(i+1) and dequantize it into the staging buffer the
+        #    dots are NOT reading this iteration
         if CTAS_H > 1:
             gl.amd.gfx1250.cluster.arrive()
         gl.amd.gfx1250.tdm.async_wait(3)
         if CTAS_H > 1:
             gl.amd.gfx1250.cluster.wait()
-
-        # ---- Dequantize tile (tile_start + i) into the bf16 staging tile ----
         _v4_dequant_tile(
-            kv_bufs.index(buf_idx),
-            kv_bf16,
-            rope_bufs.index(buf_idx),
+            kv_bufs.index((i + 1) % NUM_BUFFERS),
+            kv_bf16.index((i + 1) % NUM_STAGE),
+            rope_bufs.index((i + 1) % NUM_BUFFERS),
             BLOCK_K,
             SCALE_COL_LAYOUT,
             GROUP_BLOCKED_LAYOUT,
@@ -1421,8 +1454,7 @@ def _pa_decode_sparse_v4_2buff(
             GROUP_SIZE,
         )
 
-        # ---- Math for tile (tile_start + i) ----
-        kv_t = kv_bf16.permute([1, 0]).load(dot_k_layout)
+        # 4. math on tile i, whose operands are already in registers
         scores = gl.amd.gfx1250.wmma(
             mfma_q,
             kv_t,
@@ -1443,7 +1475,6 @@ def _pa_decode_sparse_v4_2buff(
             p = gl.exp(scores - m_new[:, None])
         l_new = l_i * alpha + gl.sum(p, axis=1)
 
-        kv_for_acc = kv_bf16.load(dot_v_layout)
         p_dot = gl.convert_layout(p.to(gl.bfloat16), dot_p_layout)
         acc = acc * gl.convert_layout(alpha[:, None], layout=PV_WMMA_LAYOUT)
         acc = gl.amd.gfx1250.wmma(p_dot, kv_for_acc, acc)
@@ -1453,7 +1484,7 @@ def _pa_decode_sparse_v4_2buff(
 
         if HAS_INVALID:
             cur_valid = next_valid
-        buf_idx = async_idx
+            next_valid = next2_valid
 
     # ---- Epilogue: process final tile (tile_end - 1) ----
     if CTAS_H > 1:
@@ -1469,20 +1500,9 @@ def _pa_decode_sparse_v4_2buff(
     else:
         valid_col = final_in_range
 
-    _v4_dequant_tile(
-        kv_bufs.index(buf_idx),
-        kv_bf16,
-        rope_bufs.index(buf_idx),
-        BLOCK_K,
-        SCALE_COL_LAYOUT,
-        GROUP_BLOCKED_LAYOUT,
-        ROPE_BLOCKED_LAYOUT,
-        NOPE_DIM,
-        ROPE_DIM,
-        GROUP_SIZE,
-    )
-
-    kv_t = kv_bf16.permute([1, 0]).load(dot_k_layout)
+    # No dequant here: the last loop iteration already staged this tile (and
+    # for num_iters == 1 the prologue did).
+    kv_t = kv_bf16.index((num_iters - 1) % NUM_STAGE).permute([1, 0]).load(dot_k_layout)
     scores = gl.amd.gfx1250.wmma(
         mfma_q,
         kv_t,
@@ -1503,7 +1523,7 @@ def _pa_decode_sparse_v4_2buff(
         p = gl.exp(scores - m_new[:, None])
     l_new = l_i * alpha + gl.sum(p, axis=1)
 
-    kv_for_acc = kv_bf16.load(dot_v_layout)
+    kv_for_acc = kv_bf16.index((num_iters - 1) % NUM_STAGE).load(dot_v_layout)
     p_dot = gl.convert_layout(p.to(gl.bfloat16), dot_p_layout)
     acc = acc * gl.convert_layout(alpha[:, None], layout=PV_WMMA_LAYOUT)
     acc = gl.amd.gfx1250.wmma(p_dot, kv_for_acc, acc)
