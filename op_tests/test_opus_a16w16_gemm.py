@@ -107,22 +107,10 @@ def _run_exact_a16w16(
     kid: int,
     split_k: int,
     use_graph: bool,
-    iters: int = 101,
-    warmup: int = 2,
-    rotate: int = 0,
 ):
     kwargs = {"kid": kid, "split_k": split_k}
     if not use_graph:
-        return run_perftest(
-            opus_bmm,
-            A,
-            B,
-            Y,
-            num_iters=iters,
-            num_warmup=warmup,
-            num_rotate_args=rotate,
-            **kwargs,
-        )
+        return run_perftest(opus_bmm, A, B, Y, **kwargs)
 
     arch, cu_num = _device_arch_and_cu(A.device)
     plan = _get_cached_a16w16_launch_plan(
@@ -161,13 +149,7 @@ def _run_exact_a16w16(
     with torch.cuda.graph(graph, stream=side):
         opus_bmm(A, B, Y, **kwargs)
     current.wait_stream(side)
-    _, us = run_perftest(
-        graph.replay,
-        num_iters=iters,
-        num_warmup=warmup,
-        num_rotate_args=1,
-        use_cuda_event=True,
-    )
+    _, us = run_perftest(graph.replay, use_cuda_event=True)
     return Y, us
 
 
@@ -181,15 +163,9 @@ def run_a16w16_case(
     split_k: int = 0,
     out_dtype=torch.bfloat16,
     use_graph: bool = False,
-    dist: str = "norm",
-    gen=None,
-    const_val: float = 1.0,
-    iters: int = 101,
-    warmup: int = 2,
-    rotate: int = 0,
 ):
-    A = _make_a(batch, M, K, dist, gen, const_val)
-    B = _make_b(batch, N, K, dist, gen, const_val)
+    A = torch.randn(batch, M, K, device="cuda", dtype=torch.bfloat16)
+    B = _make_b(batch, N, K)
     Y = torch.empty((batch, M, N), device="cuda", dtype=out_dtype)
 
     ref = _torch_ref(A, B, out_dtype)
@@ -201,9 +177,6 @@ def run_a16w16_case(
         kid=kid,
         split_k=split_k,
         use_graph=use_graph,
-        iters=iters,
-        warmup=warmup,
-        rotate=rotate,
     )
 
     err = checkAllclose(
@@ -213,11 +186,11 @@ def run_a16w16_case(
         rtol=0.1,
         atol=0.5,
     )
-    tflops = _tflops(batch, M, N, K, us)
-    tbs = _tbs(batch, M, N, K, us, out_bytes=Y.element_size())
+    flops = 2.0 * batch * M * N * K
+    tflops = flops / us / 1e6
     print(
         f"[a16w16] batch={batch} M={M} N={N} K={K} dtype={out_dtype} "
-        f"| {us:.1f}us | {tflops:.2f} TFLOPs | {tbs:.3f} TB/s | err={err}"
+        f"| {us:.1f}us | {tflops:.2f} TFLOPs | err={err}"
     )
     return err
 
@@ -260,7 +233,6 @@ def run_a16w16_csv_sweep(
     split_k: int = 0,
     out_dtype=torch.bfloat16,
     use_graph: bool = False,
-    **run_kwargs,
 ):
     shapes = load_shapes_from_csv(csv_path, default_kid=kid, default_split_k=split_k)
     return _run_a16w16_sweep(
@@ -269,7 +241,6 @@ def run_a16w16_csv_sweep(
         batch=batch,
         out_dtype=out_dtype,
         use_graph=use_graph,
-        **run_kwargs,
     )
 
 
@@ -280,12 +251,6 @@ def _run_a16w16_sweep(
     batch: int,
     out_dtype: torch.dtype,
     use_graph: bool,
-    dist: str = "norm",
-    gen=None,
-    const_val: float = 1.0,
-    iters: int = 101,
-    warmup: int = 2,
-    rotate: int = 0,
 ):
     print(f"\n{'=' * 80}")
     mode = "graph" if use_graph else "eager"
@@ -301,8 +266,8 @@ def _run_a16w16_sweep(
             f"kid={row_kid} split_k={row_split_k}"
         )
         try:
-            A = _make_a(batch, M, K, dist, gen, const_val)
-            B = _make_b(batch, N, K, dist, gen, const_val)
+            A = torch.randn(batch, M, K, device="cuda", dtype=torch.bfloat16)
+            B = _make_b(batch, N, K)
             Y = torch.empty((batch, M, N), device="cuda", dtype=out_dtype)
             ref = _torch_ref(A, B, out_dtype)
             Y, us = _run_exact_a16w16(
@@ -312,17 +277,10 @@ def _run_a16w16_sweep(
                 kid=row_kid,
                 split_k=row_split_k,
                 use_graph=use_graph,
-                iters=iters,
-                warmup=warmup,
-                rotate=rotate,
             )
             err = checkAllclose(Y, ref, msg=tag, rtol=0.1, atol=0.5)
-            tflops = _tflops(batch, M, N, K, us)
-            tbs = _tbs(batch, M, N, K, us, out_bytes=Y.element_size())
-            print(
-                f"[PASS] {tag} | {us:.1f}us | {tflops:.2f} TFLOPs | "
-                f"{tbs:.3f} TB/s | err={err}"
-            )
+            tflops = 2.0 * batch * M * N * K / us / 1e6
+            print(f"[PASS] {tag} | {us:.1f}us | {tflops:.2f} TFLOPs | err={err}")
             passed += 1
         except Exception as e:  # noqa: BLE001
             print(f"[FAIL] {tag} | {type(e).__name__}: {e}")
@@ -405,7 +363,6 @@ def run_a16w16_opus_sweep(
     N: int,
     K: int,
     out_dtype: torch.dtype,
-    **run_kwargs,
 ):
     shapes = load_opus_sweep_shapes(csv_path, N=N, K=K, out_dtype=out_dtype)
     return _run_a16w16_sweep(
@@ -414,106 +371,7 @@ def run_a16w16_opus_sweep(
         batch=1,
         out_dtype=out_dtype,
         use_graph=True,
-        **run_kwargs,
     )
-
-
-def run_shape_driven_a16w16_case(
-    batch: int,
-    M: int,
-    N: int,
-    K: int,
-    *,
-    out_dtype=torch.bfloat16,
-    use_graph: bool = False,
-    dist: str = "norm",
-    gen=None,
-    const_val: float = 1.0,
-    iters: int = 101,
-    warmup: int = 2,
-    rotate: int = 0,
-):
-    """Exercise the production tuned/heuristic policy, never an exact kid."""
-    A = _make_a(batch, M, K, dist, gen, const_val)
-    B = _make_b(
-        batch,
-        N,
-        K,
-        dist,
-        gen,
-        const_val,
-        batch_first=False,
-    )
-    ref = _torch_ref(A, B, out_dtype)
-    Y, us = run_perftest(
-        gemm_a16w16_opus,
-        A,
-        B,
-        None,
-        out_dtype,
-        testGraph=use_graph,
-        num_iters=iters,
-        num_warmup=warmup,
-        num_rotate_args=rotate,
-    )
-    err = checkAllclose(
-        Y,
-        ref,
-        msg=f"a16w16-policy b={batch} m={M} n={N} k={K}",
-        rtol=0.1,
-        atol=0.5,
-    )
-    tflops = _tflops(batch, M, N, K, us)
-    tbs = _tbs(batch, M, N, K, us, out_bytes=Y.element_size())
-    print(
-        f"[a16w16-policy] batch={batch} M={M} N={N} K={K} "
-        f"dtype={out_dtype} | {us:.1f}us | {tflops:.2f} TFLOPs | "
-        f"{tbs:.3f} TB/s | err={err}"
-    )
-    return err
-
-
-def run_shape_driven_csv_sweep(
-    csv_path: str,
-    *,
-    batch: int,
-    out_dtype: torch.dtype,
-    use_graph: bool,
-    **run_kwargs,
-):
-    import pandas as pd
-
-    frame = pd.read_csv(csv_path)
-    shapes = list(
-        dict.fromkeys(
-            zip(
-                frame["M"].astype(int),
-                frame["N"].astype(int),
-                frame["K"].astype(int),
-            )
-        )
-    )
-    passed = failed = 0
-    for M, N, K in shapes:
-        try:
-            run_shape_driven_a16w16_case(
-                batch,
-                M,
-                N,
-                K,
-                out_dtype=out_dtype,
-                use_graph=use_graph,
-                **run_kwargs,
-            )
-            passed += 1
-        except Exception as exc:  # noqa: BLE001
-            print(
-                f"[FAIL] a16w16-policy b={batch} M={M} N={N} K={K} | "
-                f"{type(exc).__name__}: {exc}"
-            )
-            failed += 1
-    print(f"\nSummary: {passed} passed, {failed} failed out of {len(shapes)}")
-    return failed == 0
 
 
 def run_shape_driven_opus_sweep(
@@ -523,7 +381,12 @@ def run_shape_driven_opus_sweep(
     K: int,
     batch: int,
     out_dtype: torch.dtype,
-    **run_kwargs,
+    dist: str = "norm",
+    gen=None,
+    const_val: float = 1.0,
+    iters: int = 101,
+    warmup: int = 2,
+    rotate: int = 0,
 ):
     rows = load_opus_sweep_rows(csv_path, N=N, K=K, out_dtype=out_dtype)
     print(f"\n{'=' * 100}")
@@ -541,17 +404,17 @@ def run_shape_driven_opus_sweep(
                 batch,
                 M,
                 K,
-                run_kwargs.get("dist", "norm"),
-                run_kwargs.get("gen"),
-                run_kwargs.get("const_val", 1.0),
+                dist,
+                gen,
+                const_val,
             )
             B = _make_b(
                 batch,
                 N,
                 K,
-                run_kwargs.get("dist", "norm"),
-                run_kwargs.get("gen"),
-                run_kwargs.get("const_val", 1.0),
+                dist,
+                gen,
+                const_val,
                 batch_first=False,
             )
             ref = _torch_ref(A, B, out_dtype)
@@ -562,9 +425,9 @@ def run_shape_driven_opus_sweep(
                 None,
                 out_dtype,
                 testGraph=True,
-                num_iters=run_kwargs.get("iters", 101),
-                num_warmup=run_kwargs.get("warmup", 2),
-                num_rotate_args=run_kwargs.get("rotate", 0),
+                num_iters=iters,
+                num_warmup=warmup,
+                num_rotate_args=rotate,
             )
             err = checkAllclose(
                 Y,
@@ -602,15 +465,6 @@ def run_shape_driven_opus_sweep(
             )
     print(f"\nSummary: {passed} passed, {failed} failed out of {len(rows)}")
     return failed == 0
-
-
-def _csv_has_exact_kid(csv_path: str) -> bool:
-    import pandas as pd
-
-    return any(
-        name in pd.read_csv(csv_path, nrows=0).columns
-        for name in ("kernelId", "solidx", "kid")
-    )
 
 
 def _runtime_arch() -> str | None:
@@ -1370,22 +1224,20 @@ if __name__ == "__main__":
         "rotate": args.rotate,
     }
 
-    selected_modes = sum(
-        (
-            args.opus_sweep,
-            args.exact_opus_sweep,
-            args.csv_file is not None,
-            args.m is not None or args.kid is not None,
-        )
-    )
-    if selected_modes > 1:
-        parser.error(
-            "choose only one of --opus_sweep, --exact_opus_sweep, "
-            "--csv_file, or a single shape"
-        )
-    if args.tuned_csv is not None and not (
-        args.opus_sweep or args.exact_opus_sweep or selected_modes == 0
+    if args.opus_sweep and args.exact_opus_sweep:
+        parser.error("--opus_sweep and --exact_opus_sweep are mutually exclusive")
+    if args.csv_file is not None and (
+        args.opus_sweep or args.exact_opus_sweep or args.m is not None
     ):
+        parser.error("--csv_file cannot be combined with a sweep or -m")
+
+    production_sweep = args.opus_sweep or (
+        not args.exact_opus_sweep
+        and args.csv_file is None
+        and args.kid is None
+        and args.m is None
+    )
+    if args.tuned_csv is not None and not (production_sweep or args.exact_opus_sweep):
         parser.error("--tuned_csv is only valid for an OPUS tuned-row sweep")
 
     tuned_csv = args.tuned_csv or str(_DEFAULT_TUNED_CSV)
@@ -1395,10 +1247,9 @@ if __name__ == "__main__":
             N=args.n if args.n is not None else 2048,
             K=args.k if args.k is not None else 7168,
             out_dtype=out_dtype,
-            **run_kwargs,
         )
         sys.exit(0 if ok else 1)
-    elif args.opus_sweep or selected_modes == 0:
+    elif production_sweep:
         ok = run_shape_driven_opus_sweep(
             tuned_csv,
             N=args.n if args.n is not None else 2048,
@@ -1409,49 +1260,29 @@ if __name__ == "__main__":
         )
         sys.exit(0 if ok else 1)
     elif args.csv_file is not None:
-        if args.kid is not None or _csv_has_exact_kid(args.csv_file):
-            ok = run_a16w16_csv_sweep(
-                args.csv_file,
-                batch=args.batch or 8,
-                kid=args.kid,
-                split_k=args.split_k,
-                out_dtype=out_dtype,
-                use_graph=args.graph,
-                **run_kwargs,
-            )
-        else:
-            ok = run_shape_driven_csv_sweep(
-                args.csv_file,
-                batch=args.batch or 8,
-                out_dtype=out_dtype,
-                use_graph=args.graph,
-                **run_kwargs,
-            )
+        ok = run_a16w16_csv_sweep(
+            args.csv_file,
+            batch=args.batch or 8,
+            kid=args.kid,
+            split_k=args.split_k,
+            out_dtype=out_dtype,
+            use_graph=args.graph,
+        )
         sys.exit(0 if ok else 1)
     else:
+        if args.kid is None:
+            parser.error("--kid is required for a single-shape exact run")
         M = args.m if args.m is not None else 256
         N = args.n if args.n is not None else 512
         K = max(args.k if args.k is not None else 256, 128)
         batch = args.batch or 8
-        if args.kid is not None:
-            run_a16w16_case(
-                batch,
-                M,
-                N,
-                K,
-                kid=args.kid,
-                split_k=args.split_k,
-                out_dtype=out_dtype,
-                use_graph=args.graph,
-                **run_kwargs,
-            )
-        else:
-            run_shape_driven_a16w16_case(
-                batch,
-                M,
-                N,
-                K,
-                out_dtype=out_dtype,
-                use_graph=args.graph,
-                **run_kwargs,
-            )
+        run_a16w16_case(
+            batch,
+            M,
+            N,
+            K,
+            kid=args.kid,
+            split_k=args.split_k,
+            out_dtype=out_dtype,
+            use_graph=args.graph,
+        )
