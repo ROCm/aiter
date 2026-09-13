@@ -186,7 +186,6 @@ def compile_pa_decode_ps_reduce(
             acc = acc + part_logits * weight
 
         query_idx = eqgs_idx // c_qgs
-        group_idx = eqgs_idx % c_qgs
         output_offset = (
             batch_idx * stride_output_bs
             + query_idx * stride_output_len
