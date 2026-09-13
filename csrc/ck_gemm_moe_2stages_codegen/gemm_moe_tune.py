@@ -1,12 +1,14 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
+import argparse
 import functools
 import math
 import os
 import re
 import sys
 import tempfile
+from argparse import ArgumentTypeError
 from pathlib import Path
 from typing import Any, ClassVar
 
@@ -78,6 +80,7 @@ from aiter.ops.shuffle import (
 )
 from aiter.utility import fp4_utils
 from aiter.utility.base_tuner import TunerCommon
+from aiter.utility.dtypes import str2ActivationType, str2Dtype
 from aiter.utility.fp4_utils import moe_mxfp4_sort
 from aiter.utility.mp_tuner import mp_tuner
 from csrc.ck_gemm_moe_2stages_codegen.mxfp4_v2_tune_utils import (
@@ -110,6 +113,30 @@ TUNE_MOE_EXPERT_BALANCE = (
 )
 
 COS_DIFF_THRESHOLD = 1e-1
+
+
+def _parse_tuning_type(value):
+    if isinstance(value, (torch.dtype, ActivationType, QuantType)):
+        return value
+    if not isinstance(value, str):
+        raise ValueError(f"unsupported tuning type: {value!r}")  # noqa: TRY004
+
+    namespace, separator, name = value.strip().rpartition(".")
+    try:
+        if namespace == "torch" and separator:
+            parsed = getattr(torch, name)
+        elif namespace == "ActivationType" and separator:
+            parsed = str2ActivationType(name)
+        elif (namespace == "QuantType" and separator) or not separator:
+            parsed = str2Dtype(name)
+        else:
+            raise ValueError
+    except (ArgumentTypeError, AttributeError, TypeError, ValueError):
+        raise ValueError(f"unsupported tuning type: {value!r}") from None
+
+    if not isinstance(parsed, (torch.dtype, ActivationType, QuantType)):
+        raise ValueError(f"unsupported tuning type: {value!r}")  # noqa: TRY004
+    return parsed
 
 
 def _a16w_sorted_cos(ref, res, msg="", printLog=True):
@@ -459,6 +486,26 @@ class FmoeTuner(TunerCommon):
             required=False,
             help="Tune the FlyDSL mxfp4 a4w4 port as a coupled (g1, g2) unit instead of the normal fmoe tuner.",
         )
+        self.parser.add_argument(
+            "--mxfp4-search-mode",
+            choices=("prune", "full"),
+            help="GEMM1 search mode: prune by M_est (default) or search all legal "
+            "variants (full); requires --mxfp4-flydsl.",
+        )
+
+    def parse_args(self) -> argparse.Namespace:
+        args = super().parse_args()
+        # None distinguishes an omitted mode from an explicit prune request.
+        if args.mxfp4_search_mode is not None and (
+            not args.mxfp4_flydsl
+            or args.grouped_gemm
+            or not isinstance(self, Mxfp4FlydslTuner)
+        ):
+            self.parser.error(
+                "--mxfp4-search-mode requires --mxfp4-flydsl without --grouped-gemm"
+            )
+        args.mxfp4_search_mode = args.mxfp4_search_mode or "prune"
+        return args
 
     @staticmethod
     def weight_quant(
@@ -6063,6 +6110,12 @@ class GroupedFmoeTuner(FmoeTuner):
 class Mxfp4FlydslTuner(FmoeTuner):
     """Tune the FlyDSL mxfp4 a4w4 *port* (flydsl_mxmoe_g{1,2}_a4w4_*) as one coupled
     unit.
+
+    By default, prune GEMM1 using M_est = ceil(token * topk / expert). This
+    reduces candidate evaluation work and is expected to shorten tuning wall
+    time; the actual speedup has not been measured. Kernel performance and
+    winner retention on unseen shapes require separate validation. Use
+    --mxfp4-search-mode full to enumerate all statically supported GEMM1 variants.
     """
 
     ARG_DEFAULTS: ClassVar[dict[str, Any]] = {
@@ -6071,6 +6124,11 @@ class Mxfp4FlydslTuner(FmoeTuner):
         "tune_file": f"{AITER_ROOT_DIR}/aiter/configs/model_configs/kimik2_fp4_tuned_fmoe.csv",
         "config_env_name": "AITER_CONFIG_FMOE",
     }
+
+    #: Key columns holding a torch dtype rather than a plain scalar.
+    DTYPE_KEYS: ClassVar[frozenset[str]] = frozenset(
+        {"dtype", "q_dtype_a", "q_dtype_w"}
+    )
 
     @staticmethod
     def _g1_kname(
@@ -6110,7 +6168,7 @@ class Mxfp4FlydslTuner(FmoeTuner):
         return name
 
     # GEMM1 axes swept on top of (BM, use_nt, inline_quant). Their constraints
-    # interact (BN64 implies BM32 non-inline separated; num_waves==2 implies
+    # interact (BN64 implies BM32 non-inline; num_waves==2 implies
     # BN64; k_wave>1 implies BM32 non-inline and num_waves*k_wave<=8), so
     # _g1_variants enumerates the cross-product and lets the kernel's own
     # _assert_supported reject the rest instead of duplicating that logic.
@@ -6151,8 +6209,30 @@ class Mxfp4FlydslTuner(FmoeTuner):
             raise ValueError(f"{name}={raw!r} selects nothing out of {values!r}")
         return kept
 
-    def _g1_variants(self, row):
-        """Valid _g1_kname kwargs for one shape, most-default first."""
+    @staticmethod
+    def _g1_matches_m_est(g1: dict[str, Any], m_est: int) -> bool:
+        """Apply M_est allowlists; require an explicit rule for each BM family."""
+        bm = g1["bm"]
+        if bm == 16:
+            return m_est < 16
+        if bm == 32:
+            return 4 <= m_est <= 128 and (
+                m_est <= 32
+                or (g1["num_waves"] == 4 and g1["k_wave"] == 1 and not g1["use_nt"])
+            )
+        if bm == 64:
+            return m_est >= 16 and (m_est <= 64 or not g1["use_nt"])
+        if bm == 128:
+            return m_est >= 64
+        raise ValueError(
+            f"Missing GEMM1 pruning rule for BM{bm}; add an M_est pruning rule "
+            "for this BM in Mxfp4FlydslTuner._g1_matches_m_est before using prune mode."
+        )
+
+    def _g1_variants(
+        self, row: dict[str, Any], full_search: bool = False
+    ) -> list[dict[str, Any]]:
+        """Supported _g1_kname kwargs, pruned by M_est unless full_search is set."""
         from aiter.ops.flydsl.mxfp4_gemm1_kernels import _assert_supported
         from aiter.ops.flydsl.mxfp4_kname import MXFP4_G1_VARIANTS
 
@@ -6212,7 +6292,21 @@ class Mxfp4FlydslTuner(FmoeTuner):
                                         "num_waves": num_waves,
                                     }
                                 )
-        return out
+        if full_search:
+            return out
+        m_est = (int(row["token"]) * topk + ne - 1) // ne
+        kept = [g1 for g1 in out if self._g1_matches_m_est(g1, m_est)]
+        if len(kept) < len(out):
+            # Name the shape in full: under --mp the workers' stdout interleaves,
+            # and M_est alone does not identify a row (different shapes share it).
+            print(
+                f"[mxfp4-port] pruned G1: pid={os.getpid()} "
+                f"token={int(row['token'])} model_dim={h} inter_dim={e} "
+                f"expert={ne} topk={topk} act={act} "
+                f"M_est={m_est} valid={len(out)} kept={len(kept)}",
+                flush=True,
+            )
+        return kept
 
     @staticmethod
     def _row_act(row):
@@ -6268,12 +6362,14 @@ class Mxfp4FlydslTuner(FmoeTuner):
         )
         return cand
 
-    def _candidate_rows(self, row):
+    def _candidate_rows(
+        self, row: dict[str, Any], full_search: bool = False
+    ) -> list[dict[str, Any]]:
         cands = []
         sparts = self._env_filter("MXFP4_TUNE_G2_SPART", self._G2_SPART)
         g2_tns = self._env_filter("MXFP4_TUNE_G2_TN", (128, 256))
         g2_tks = self._env_filter("MXFP4_TUNE_G2_TK", (128, 256))
-        for g1 in self._g1_variants(row):
+        for g1 in self._g1_variants(row, full_search=full_search):
             bm = g1["bm"]
             kn1 = self._g1_kname(**g1)
             # a4w4 pairs flydsl_mxmoe_g1_* with flydsl_moe2_layout_* only. The
@@ -6375,6 +6471,7 @@ class Mxfp4FlydslTuner(FmoeTuner):
                 topk=topk,
                 block_size=BM,
                 sorted_weights=sw,
+                num_experts_upper_bound=ne,
             )
         inter_q, inter_s = _mxfp4_a4w4_stage1_fw(
             stage1_input,
@@ -6477,12 +6574,22 @@ class Mxfp4FlydslTuner(FmoeTuner):
             num_iters=int(args.iters),
         )
         us = round(float(us), 4)
+        # The pair is timed as one unit, so the fused-MoE estimate in calculate()
+        # is the right roofline for it. Untuned rows keep dtypes as strings, while
+        # calculate() looks bpe up by torch dtype.
+        key = tuple(
+            _parse_tuning_type(row[col]) if col in self.DTYPE_KEYS else row[col]
+            for col in self.keys
+        )
+        tflops, bw = self.calculate((key, "", kn1, candidate["block_m"], us, err))
         candidate.update(
             {
                 "us1": us,
                 "us": us,
-                "err1": round(float(err), 6),
-                "err2": round(float(err), 6),
+                "err1": f"{float(err):.1%}",
+                "err2": f"{float(err):.1%}",
+                "tflops": tflops,
+                "bw": bw,
             }
         )
         return us
@@ -6512,8 +6619,11 @@ class Mxfp4FlydslTuner(FmoeTuner):
             except ValueError:
                 timeout = 0  # not on the main thread; cannot arm SIGALRM
 
+        candidates = self._candidate_rows(
+            row, full_search=getattr(args, "mxfp4_search_mode", "prune") == "full"
+        )
         best, failures = None, []
-        for candidate in self._candidate_rows(row):
+        for candidate in candidates:
             if timeout > 0:
                 signal.alarm(timeout)
             try:
@@ -6534,7 +6644,7 @@ class Mxfp4FlydslTuner(FmoeTuner):
                 if timeout > 0:
                     signal.alarm(0)
         if best is None:
-            best = self._candidate_rows(row)[0]
+            best = candidates[0]
             best["us"] = self.INVALID_TIME
             best["kernelName1"] = ("FAILED: " + "; ".join(failures))[:240]
             print(
@@ -6632,9 +6742,8 @@ def _mxfp4_failed_row(keys, row, reason):
     """A tuned-CSV row standing in for a shape that produced no timing."""
     tuner = Mxfp4FlydslTuner.__new__(Mxfp4FlydslTuner)
     tuner.keys = keys
-    cand = tuner._candidate_rows(row)[0]
+    cand = tuner._candidate_row(row, 0, reason[:240], "")
     cand["us"] = Mxfp4FlydslTuner.INVALID_TIME
-    cand["kernelName1"] = reason[:240]
     return cand
 
 

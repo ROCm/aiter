@@ -33,6 +33,7 @@ MXFP4_MOE_SUPPORTED_SHAPES = frozenset(
         (257, 6144, 256, 9),
         (896, 3584, 512, 16),
         (48, 7168, 2048, 8),
+        (56, 3584, 3072, 16),
         (64, 7168, 2048, 8),
         (128, 3072, 512, 4),
         (128, 3072, 1536, 4),
@@ -61,6 +62,17 @@ def is_mxfp4_moe_shape_supported(
     return (int(expert), int(model_dim), padded_inter, int(topk)) in (
         MXFP4_MOE_SUPPORTED_SHAPES
     )
+
+
+@compile_ops("module_moe_mxfp4_aux", develop=True)
+def _mxfp4_moe_sort_internal_is_supported(
+    NE: int,
+    TOPK: int,
+    D_HIDDEN: int,
+    MB: int,
+    zero_init: bool,
+) -> bool:
+    """Private dispatch probe; not exported through ``aiter.ops`` or ``aiter``."""
 
 
 @compile_ops("module_moe_mxfp4_aux", develop=True)

@@ -8,6 +8,7 @@ from typing import Any, ClassVar
 
 # (NE, D_HIDDEN, D_INTER, TOPK)
 SHAPES = [
+    (896, 3584, 384, 16),  # Kimi-K3 A4W4 TP=8
     (385, 7168, 512, 9),  # Kimi-K2.5 TP=4
     (385, 7168, 1024, 9),  # Kimi-K2.5 TP=2 (kimik2_c)
     (257, 7168, 512, 9),  # DSR (dsv3_b)
@@ -33,6 +34,7 @@ SHAPES = [
     (257, 6144, 256, 9),  # GLM-5.2 TP=8
     (896, 3584, 512, 16),  # Kimi-K3 TP=1/2 (INTER 384 pads to 512)
     (48, 7168, 2048, 8),  # DSV3 E48
+    (56, 3584, 3072, 16),  # Kimi-K3 E56
     (64, 7168, 2048, 8),  # DSV3 E64
     (128, 3072, 512, 4),  # GPT-OSS TP=6
     (128, 3072, 1536, 4),  # GPT-OSS TP=2

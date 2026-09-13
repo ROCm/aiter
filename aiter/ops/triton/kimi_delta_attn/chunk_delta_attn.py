@@ -96,11 +96,13 @@ def chunk_kimi_delta_attn(
             Scale factor for the attention scores. Default: `1 / sqrt(K)`.
         initial_state (torch.Tensor, optional):
             Initial state of shape `[N, HV, K, V]` (`[N, HV, V, K]` when
-            `state_v_first=True`) and dtype fp32, for `N` input sequences. For
+            `state_v_first=True`), for `N` input sequences. Any float dtype; the
+            recurrence accumulates in fp32 whatever the state is stored as. For
             equal-length inputs `N` equals the batch size `B`. Default: `None`.
         output_final_state (bool):
-            Whether to return the final state, same shape and dtype as
-            `initial_state`. Default: `False`.
+            Whether to return the final state, same shape as `initial_state`.
+            Its dtype is `initial_state`'s on the FlashKDA path and fp32 on the
+            default pipeline. Default: `False`.
         use_qk_l2norm_in_kernel (bool):
             Whether to L2-normalize `q` and `k` before the recurrence.
         use_gate_in_kernel (bool):
@@ -196,12 +198,10 @@ def chunk_kimi_delta_attn(
                 f"of input sequences, i.e., {len(cu_seqlens) - 1} rather than "
                 f"{initial_state.shape[0]}."
             )
-    if initial_state is not None and initial_state.dtype != torch.float32:
+    if initial_state is not None and not initial_state.is_floating_point():
         raise ValueError(
-            f"`initial_state` must be fp32, got {initial_state.dtype}. The recurrence "
-            "accumulates in fp32 and the state is read back verbatim."
+            f"`initial_state` must be a float tensor, got {initial_state.dtype}."
         )
-
     if use_gate_in_kernel and A_log is None:
         raise ValueError("`A_log` must be provided when `use_gate_in_kernel=True`.")
     if safe_gate and use_gate_in_kernel:

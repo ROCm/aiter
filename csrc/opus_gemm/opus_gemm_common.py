@@ -1821,21 +1821,6 @@ default_kernels_dict = {
 # fmt: on
 
 
-# The gfx1250 _ws families are the ones that opt in to a bf16 split-K partial;
-# see splitk_workspace_dtype for what that buys and costs. Applied here rather
-# than in each constructor so the set is one list, and scoped by tag so it
-# cannot reach the gfx942/gfx950 split-K pipelines, several of which
-# static_assert an fp32 workspace.
-_GFX1250_WS_BF16_PARTIAL_TAGS = (
-    "a16w16_cluster_tdm_splitk_ws",
-    "a16w16_clusterlaunch_tdm_splitk_ws",
-)
-for _inst in kernels_list.values():
-    if _inst.kernel_tag in _GFX1250_WS_BF16_PARTIAL_TAGS:
-        _inst.splitk_workspace_dtype = "bf16_t"
-del _inst
-
-
 # Subset-compile kid taxonomy (consumed by gen_instances.py for the `HEURISTIC_DEFAULT_KIDS ?
 
 # Splitk kids: a16w16_flatmm_splitk pipeline (kid 200..223 + nooob mirror).
@@ -1997,10 +1982,13 @@ def _opus_sidecar_path():
     Lives in ``{bd_dir}/`` (one level above the per-module build dir) so
     it survives ``aiter.jit.core.clear_build("module_deepgemm_opus")`` --
     which ``build_module()`` calls when ``AITER_REBUILD == 1`` -- and is
-    therefore the canonical "what kids should be in the next .so" source
-    that ``gen_instances.py`` consumes. The tuner expands this sidecar
-    BEFORE triggering the rebuild; if it lived inside the build dir,
-    clear_build would wipe it out before gen_instances could read it.
+    therefore seeds the last successfully compiled set into the next codegen.
+    The tuner passes new candidates through ``--extra_kids``; it does not
+    advance this file before compiling. JIT atomically copies the generated
+    sidecar back here after installing the .so, independently of source-cache
+    publication. Its adjacent ``.receipt`` binds the contents to that binary;
+    the tuner requires both to match before skipping a rebuild. A plain runtime
+    dispatch uses the CSV/C++ lookup, not this file.
     """
     # Import lazily to avoid circular import at module load (aiter imports
     # opus_gemm_common, opus_gemm_common imports aiter.jit.core).

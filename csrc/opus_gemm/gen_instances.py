@@ -1432,12 +1432,18 @@ if __name__ == "__main__":
             "Path to the subset-compile sidecar (JSON list of int kids). "
             "Defaults to {working_path}/compiled_kids.json. The sidecar "
             "captures the union of CSV opus rows + previous sidecar "
-            "contents + HEURISTIC_DEFAULT_KIDS so subsequent rebuilds "
-            "are idempotent (no rebuild if every required kid is already "
-            "in the .so). gradlib's GemmTuner and opus_gemm_tune.py "
-            "expand this sidecar in tuner-startup to add new kids before "
-            "triggering an AITER_REBUILD."
+            "contents + extra kids + HEURISTIC_DEFAULT_KIDS. JIT supplies a "
+            "staged copy and publishes it after successful compilation. "
+            "Tuners pass new candidates with --extra_kids."
         ),
+    )
+
+    parser.add_argument(
+        "--extra_kids",
+        nargs="*",
+        type=int,
+        default=[],
+        help="Additional tuner candidates for this build; persisted only after success.",
     )
 
     # Legacy --tune_file alias kept for backward compat with any existing
@@ -1512,12 +1518,14 @@ if __name__ == "__main__":
         try:
             with open(sidecar_path) as f:
                 sidecar_kids = {int(x) for x in json.load(f)}
-        except (OSError, ValueError):
+        except (OSError, ValueError, TypeError):
             sidecar_kids = set()
 
     # The compile set: union, intersected with valid kernels_list entries.
     valid_kids = set(kernels_list.keys())
-    S = (csv_kids | sidecar_kids | set(HEURISTIC_DEFAULT_KIDS)) & valid_kids
+    S = (
+        csv_kids | sidecar_kids | set(args.extra_kids) | set(HEURISTIC_DEFAULT_KIDS)
+    ) & valid_kids
 
     # Per-arch filter: drop kids whose arch_prefix is not in the target build set.
     _kid_arch = _kid_arch_common
@@ -1579,7 +1587,7 @@ if __name__ == "__main__":
         tag_keys = set(TAG_TO_LIST.get(args.kernel_tag, {}).keys())
         if tag_keys:
             # Restrict to the requested family + heuristic defaults.
-            S = (S & tag_keys) | set(HEURISTIC_DEFAULT_KIDS)
+            S = (S & tag_keys) | set(heuristic_kids_for_arch(target_arches))
             if target_arches is None or "gfx950" in target_arches:
                 S |= set(a8w8_scale_kernels_list.keys())
                 S |= set(a8w8_kernels_list.keys())
@@ -1594,6 +1602,15 @@ if __name__ == "__main__":
         f"kid. Add them to the compile set or update HEURISTIC_DEFAULT_KIDS "
         f"in csrc/opus_gemm/opus_gemm_common.py."
     )
+
+    missing_requested = set(args.extra_kids) - S
+    if missing_requested:
+        parser.error(
+            "cannot compile requested --extra_kids "
+            f"{sorted(missing_requested)}: unknown kernel, outside target arches "
+            f"{sorted(target_arches) if target_arches is not None else 'all'}, "
+            "or excluded by --kernel_tag"
+        )
 
     # Build the per-kid dict that drives codegen.
     kdict = {kid: kernels_list[kid] for kid in sorted(S)}
@@ -1694,7 +1711,8 @@ if __name__ == "__main__":
             f"existing files; using empty lookup"
         )
 
-    # Persist the expanded compile set so subsequent rebuilds reuse it.
+    # Write the generated set inside staging. JIT publishes it to bd_dir only
+    # after the binary is installed, so a failed compile cannot advance it.
     try:
         os.makedirs(os.path.dirname(sidecar_path) or ".", exist_ok=True)
     except OSError:

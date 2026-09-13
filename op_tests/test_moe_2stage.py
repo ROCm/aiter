@@ -29,7 +29,11 @@ from aiter.int4_utils import (
 from aiter.jit.core import AITER_CONFIGS
 from aiter.jit.utils.chip_info import get_cu_num, get_gfx
 from aiter.ops.flydsl.kernels.mega_moe_gfx1250.types import Stage2ScatterContext
-from aiter.ops.flydsl.moe_common import GateMode
+from aiter.ops.flydsl.moe_common import (
+    DEFAULT_SITUV2_BETA,
+    DEFAULT_SITUV2_LINEAR_BETA,
+    GateMode,
+)
 from aiter.ops.quant import per_1x32_f8_scale_f8_quant, per_1x32_i4_quant
 from aiter.test_common import benchmark, checkAllclose, run_perftest
 from aiter.utility import fp4_utils
@@ -103,6 +107,11 @@ def test_fmoe(
 ):
     if get_gfx() not in ["gfx950"] and qType in [aiter.QuantType.per_1x32]:
         return
+    if actType == aiter.ActivationType.Situv2:
+        beta = DEFAULT_SITUV2_BETA if beta is None else float(beta)
+        linear_beta = (
+            DEFAULT_SITUV2_LINEAR_BETA if linear_beta is None else float(linear_beta)
+        )
     torch_quant = aiter.get_torch_quant(qType)
     # mxfp8 (a8w8): per-1x32 e8m0 microscale on both fp8 activation and fp8 weight.
     is_mxfp8 = (
@@ -409,9 +418,7 @@ def test_fmoe(
         w1_bias=exp_bias1,
         doweight=doweight_stage1,
         swiglu_limit=swiglu_limit,
-        # pr1 torch_moe_stage1 exposes situ_beta/situ_linear_beta (no None
-        # handling); mirror the kernel's None -> 1.0 mapping so the reference
-        # matches fused_moe for SiTUv2 (harmless for other activations).
+        # SiTUv2 defaults were resolved above; other activations ignore these values.
         situ_beta=1.0 if beta is None else float(beta),
         situ_linear_beta=1.0 if linear_beta is None else float(linear_beta),
     )
@@ -475,7 +482,6 @@ def test_fmoe(
         "beta": beta,
         "linear_beta": linear_beta,
         "gate_mode": gateMode,
-        "output_aux": args.output_aux,
     }
 
     if kernel_bench:
@@ -744,14 +750,14 @@ parser.add_argument(
     "--beta",
     type=float,
     default=None,
-    help="SiTUv2 gate scale param (beta). Default None -> 1.0. Only affects SiTUv2.",
+    help="SiTUv2 gate scale param (beta). Default None uses the kernel default (4.0).",
 )
 parser.add_argument(
     "--linear-beta",
     type=float,
     default=None,
-    help="SiTUv2 up (linear) scale param (linear_beta). Default None -> 1.0. "
-    "Only affects SiTUv2.",
+    help="SiTUv2 up (linear) scale param (linear_beta). "
+    "Default None uses the kernel default (25.0).",
 )
 parser.add_argument(
     "--kernel",
@@ -769,19 +775,6 @@ parser.add_argument(
     "in fp32 so the a2 mxfp4 amax is taken over fp32 (mirrors the fused asm "
     "kernel, which computes amax on the in-register fp32 silu result, instead "
     "of the bf16 round-trip the 2-stage flydsl/torch path does). Default: bf16.",
-)
-
-parser.add_argument(
-    "--output-aux",
-    choices=["threestage", "opus"],
-    default="",
-    help="For configs whose sort emits the a4w4 aux arrays, pick which prologue "
-    "does it: 'opus' (the default those configs already select) runs the Opus "
-    "multi-phase sorter, one CTA per expert; 'threestage' forces the port's own "
-    "3-stage sort instead. Same sorted output either way, and block_m=16 keeps "
-    "its fused sort regardless. Passed straight through to "
-    "fused_moe(output_aux=...); configs that do not use the aux sort are "
-    "unaffected.",
 )
 
 args = parser.parse_args()
