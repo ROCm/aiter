@@ -1,21 +1,16 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-import os
 
 import triton
 import triton.language as tl
 
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
+from aiter.ops.triton.utils.tuned_config_utils import autotune_enabled
 
 # Dev-time tuning escape hatch (off by default). See the block below the kernel
 # for what this actually does and why it's not the production path.
-ATTN_RES_TRITON_AUTOTUNE: bool = os.getenv("ATTN_RES_TRITON_AUTOTUNE", "0").lower() in (
-    "1",
-    "true",
-    "yes",
-    "on",
-)
+ATTN_RES_TRITON_AUTOTUNE: bool = autotune_enabled("ATTN_RES")
 
 
 _attnres_fwd_kernel_repr = make_kernel_repr(
