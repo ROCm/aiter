@@ -130,6 +130,10 @@ def parse_csv(csv_path: str):
         seen.add(key)
         jobs.append(job)
 
+    def _add_g1(job):
+        _add(job)
+        _add(dict(job, n_tokens=job["BM"]))
+
     with open(csv_path, newline="") as f:
         for row in csv.DictReader(f):
             token = int(row["token"])
@@ -160,7 +164,7 @@ def parse_csv(csv_path: str):
                     # gate_mode selects the layout at runtime; CSV kernel names
                     # represent both layouts, with separate compiled cache keys.
                     for interleave in (False, True):
-                        _add(
+                        _add_g1(
                             {
                                 "stage": 1,
                                 "kernel_name": kn1,
@@ -393,7 +397,7 @@ def _compile_v2_stage2(job):
         sorted_token_ids=d,
         sorted_weights=d,
         out=target,
-        M_logical=job["BM"],
+        M_logical=job.get("n_tokens", job["BM"]),
         max_sorted=max_sorted,
         NE=job["NE"],
         D_HIDDEN=job["N_OUT"],

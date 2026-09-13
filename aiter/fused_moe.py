@@ -3331,6 +3331,65 @@ def get_2stage_cfgs(
         and use_g1u1
         and not doweight_stage1
     )
+    # Untuned a4w4 SiTUv2 shapes covered by the Opus aux kernels: pick a
+    # heuristic MXMOE pair rather than dropping to the old flydsl_moe1/moe2 port.
+    _mxmoe_fallback_ok = (
+        dtype in [dtypes.bf16, dtypes.fp16]
+        and q_type == QuantType.per_1x32
+        and activation == ActivationType.Situv2
+        and q_dtype_a == dtypes.fp4x2
+        and q_dtype_w == dtypes.fp4x2
+        and is_shuffled
+        and use_g1u1
+        and not doweight_stage1
+        and gate_mode != GateMode.INTERLEAVE
+        and not (has_stage1_bias or has_stage2_bias)
+        and situ_beta == situ_linear_beta == 1.0
+        and hidden_pad == 0
+        and intermediate_pad == 0
+        and model_dim % 256 == 0
+        and aiter.is_mxfp4_moe_shape_supported(expert, model_dim, inter_dim, topk)
+        and os.environ.get("AITER_MXMOE_FALLBACK", "1") == "1"
+    )
+    if _mxmoe_fallback_ok:
+        # A wide sort block only amortizes once there are enough tokens to fill it.
+        _bm = 64 if token < 512 else 128
+        _g2_tk = 128 if inter_dim % 128 == 0 else 256
+        # xcd_swizzle groups m-blocks against one B tile, and B is indexed by
+        # (expert, n_block), so the m-blocks an expert spans caps a useful group;
+        # too wide a group also starves the grid tail, hence the clamp at 6.
+        _rows_per_expert = -(-token * topk // expert)
+        _g1_swz = min(6, max(1, -(-_rows_per_expert // _bm)))
+        _g1_sfx = f"_xcd{_g1_swz}" if _g1_swz > 1 else ""
+        # Persist needs enough tiles to amortize its loop setup and hide its tail;
+        # the spatial partition pays off one tier earlier.
+        _g2_persist = "_persist" if _bm == 128 and token >= 4096 else ""
+        _g2_sfx = "_sp402" if _bm == 128 and token >= 2048 else ""
+        _kn1 = f"flydsl_mxmoe_g1_a4w4_{_bm}x256x256_situv2{_g1_sfx}"
+        _kn2 = (
+            f"flydsl_moe2_layout_afp4_wfp4_bf16_t{_bm}x256x{_g2_tk}"
+            f"_reduce{_g2_persist}_sbm{_bm}{_g2_sfx}"
+        )
+        logger.warning(
+            f"[fused_moe] no tuned FlyDSL config for {keys}, "
+            f"using heuristic MXMOE fallback (kn1={_kn1!r}, kn2={_kn2!r})"
+        )
+        return MOEMetadata(
+            stage1=functools.partial(
+                _mxfp4_a4w4_stage1_fw,
+                kernelName1=_kn1,
+                interleave=False,
+            ),
+            stage2=functools.partial(
+                _mxfp4_a4w4_stage2_fw,
+                kernelName2=_kn2,
+            ),
+            block_m=_bm,
+            ksplit=0,
+            fuse_quant="fp4",
+            output_aux=AUX_SORT_OPUS,
+            prequant=False,
+        )
     if use_mxfp4_flydsl:
         from aiter.ops.flydsl.moe_kernels import (
             flydsl_kernel_name,
