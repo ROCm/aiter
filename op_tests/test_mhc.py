@@ -869,10 +869,10 @@ def test_mhc_post_pre(
         hip_kwargs["norm_weight"] = norm_weight
 
     from aiter.ops.mhc import (
-        mhc_shuffle_fn,
         mhc_res_shuffle,
         mhc_res_shuffle_enabled,
         mhc_res_unshuffle,
+        mhc_shuffle_fn,
     )
 
     packed = w_preshuffle_bf16
