@@ -6173,31 +6173,9 @@ class Mxfp4FlydslTuner(FmoeTuner):
     # _g1_variants enumerates the cross-product and lets the kernel's own
     # _assert_supported reject the rest instead of duplicating that logic.
     _G1_BN = (64, 128, 256)
-    # Useful swizzles scale with the m-blocks an expert spans, and the peak is
-    # sharp, so odd values have to be in the sweep too.
-    _G1_XCD_SWIZZLE = (0, 1, 2, 3, 4, 5, 6, 7, 8, 12)
+    _G1_XCD_SWIZZLE = (0, 2, 4)
     _G1_K_WAVE = (1, 2, 4)
     _G1_NUM_WAVES = (4, 2)
-    # Spatial-partitioner encodings (GroupNum*100 + M01); None = dispatcher default.
-    _G2_SPART = (None, 402, 801, 1601, 2401, 3201)
-
-    # Narrow one sweep axis at a time, e.g. MXFP4_TUNE_G1_BM=64,128,160.
-    # Comma-separated ints; MXFP4_TUNE_G2_SPART also accepts "none".
-    @staticmethod
-    def _env_filter(name, values):
-        raw = os.environ.get(name)
-        if not raw:
-            return tuple(values)
-        want = set()
-        for tok in raw.split(","):
-            tok = tok.strip().lower()
-            if not tok:
-                continue
-            want.add(None if tok in ("none", "default") else int(tok))
-        kept = tuple(v for v in values if v in want)
-        if not kept:
-            raise ValueError(f"{name}={raw!r} selects nothing out of {values!r}")
-        return kept
 
     @staticmethod
     def _g1_matches_m_est(g1: dict[str, Any], m_est: int) -> bool:
@@ -6229,24 +6207,15 @@ class Mxfp4FlydslTuner(FmoeTuner):
         ne, h, e = int(row["expert"]), int(row["model_dim"]), int(row["inter_dim"])
         topk = int(row["topk"])
         act = self._row_act(row)
-        bm_keep = self._env_filter(
-            "MXFP4_TUNE_G1_BM", sorted({b for b, _, _ in MXFP4_G1_VARIANTS["fp4"]})
-        )
-        bns = self._env_filter("MXFP4_TUNE_G1_BN", self._G1_BN)
-        nws = self._env_filter("MXFP4_TUNE_G1_NW", self._G1_NUM_WAVES)
-        kws = self._env_filter("MXFP4_TUNE_G1_KW", self._G1_K_WAVE)
-        xcds = self._env_filter("MXFP4_TUNE_G1_XCD", self._G1_XCD_SWIZZLE)
         out = []
         for bm, use_nt, inline_quant in sorted(MXFP4_G1_VARIANTS["fp4"]):
-            if bm not in bm_keep:
-                continue
-            for bn in bns:
-                for num_waves in nws:
-                    for k_wave in kws:
+            for bn in self._G1_BN:
+                for num_waves in self._G1_NUM_WAVES:
+                    for k_wave in self._G1_K_WAVE:
                         # Hidden prefetch hoists the next K-tile's hidden_states
                         # load, which only the inline-quant path performs.
                         for hpf in (False, True) if inline_quant else (False,):
-                            for xcd in xcds:
+                            for xcd in self._G1_XCD_SWIZZLE:
                                 try:
                                     _assert_supported(
                                         NE=ne,
@@ -6356,9 +6325,6 @@ class Mxfp4FlydslTuner(FmoeTuner):
         self, row: dict[str, Any], full_search: bool = False
     ) -> list[dict[str, Any]]:
         cands = []
-        sparts = self._env_filter("MXFP4_TUNE_G2_SPART", self._G2_SPART)
-        g2_tns = self._env_filter("MXFP4_TUNE_G2_TN", (128, 256))
-        g2_tks = self._env_filter("MXFP4_TUNE_G2_TK", (128, 256))
         for g1 in self._g1_variants(row, full_search=full_search):
             bm = g1["bm"]
             kn1 = self._g1_kname(**g1)
@@ -6376,11 +6342,8 @@ class Mxfp4FlydslTuner(FmoeTuner):
                 bm,
                 model_dim=int(row["model_dim"]),
                 inter_dim=int(row["inter_dim"]),
-                sparts=sparts,
             ).items():
                 if kp["tile_m"] != bm:
-                    continue
-                if kp["tile_n"] not in g2_tns or kp["tile_k"] not in g2_tks:
                     continue
                 cands.append(self._candidate_row(row, bm, kn1, kn2v))
         return cands
@@ -6499,9 +6462,6 @@ class Mxfp4FlydslTuner(FmoeTuner):
             a2_scale=inter_s,
             block_m=BM,
             sorted_weights=sw,
-            # The fp8 route-out is gated on topk_weights; without it the tuner
-            # would rank every reduce candidate against the slower bf16 path.
-            topk_weights=data["topk_weights"],
             kernelName2=kn2,
             reverse_sorted=reverse_sorted,
         )
