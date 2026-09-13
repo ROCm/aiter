@@ -4,9 +4,9 @@
 """gfx950 MXFP8 gather-GEMM kernels for MoE prefill.
 
 The kernel uses 256x256 eight-wave tiles. Weights retain the G1U1 16x64
-preshuffle and E8M0 scale layout. The standard MoE pipeline owns sorting,
-MXFP8 quantization and top-k reduction; this file only gathers route-order
-activations, runs the tuned GEMM and scatters BF16 output.
+preshuffle and E8M0 scale layout. Stage 1 gathers token-order input and writes
+sorted contiguous output; stage 2 consumes that output directly. The standard
+MoE pipeline owns sorting, MXFP8 quantization and top-k reduction.
 """
 
 import flydsl.compiler as flyc
@@ -42,13 +42,15 @@ def compile_mxfp8_moe_gemm(
     xcd_swizzle=1,
     swiglu_limit=None,
     persistent_tiles=0,
+    route_output=False,
 ):
-    """Compile a tuned gather tile; K is the route-order activation stride.
+    """Compile a tuned gather tile; K is the activation row stride.
 
-    Both stages gather route-order A through the standard sorter's packed IDs.
-    Stage 1 scatters activated BF16 rows; stage 2 additionally applies sorted
-    routing weights before scattering. Persistent2/4 retain B across adjacent
-    M256 tiles for FP8 K384 only.
+    Stage 1 gathers token-order A through the standard sorter's packed IDs and
+    stores sorted rows. Stage 2 reads those rows contiguously. Non-EP dispatches
+    also store sorted rows and let the existing auxiliary reducer apply routing
+    weights; EP can request route-order weighted output for its masked reducer.
+    Persistent2/4 retain B across adjacent M256 tiles for FP8 K384 only.
     """
     assert str(get_rocm_arch()).startswith("gfx950") and get_warp_size() == 64
     assert stage in (1, 2)
@@ -58,9 +60,12 @@ def compile_mxfp8_moe_gemm(
     scale_k = (K + 255) // 256 * 256
     assert persistent_tiles in (0, 2, 4)
     if persistent_tiles:
-        assert stage == 2 and K == b_k == 384
+        assert stage == 2 and K == 512 and b_k == 384
         return _compile_persistent_gemm(
-            topk=topk, xcd_swizzle=xcd_swizzle, m_tiles=persistent_tiles
+            topk=topk,
+            xcd_swizzle=xcd_swizzle,
+            m_tiles=persistent_tiles,
+            route_output=route_output,
         )
 
     num_waves = 8
@@ -83,7 +88,8 @@ def compile_mxfp8_moe_gemm(
         transpose=stage == 2,
         swiglu_limit=swiglu_limit,
         topk=topk,
-        apply_weight=stage == 2,
+        apply_weight=stage == 2 and route_output,
+        scatter_route=stage == 2 and route_output,
     )
 
     @fx.struct
@@ -163,19 +169,19 @@ def compile_mxfp8_moe_gemm(
                 lane_id, wave_id, b_k, N_LDS_STEPS_B, preshuffled=True
             )
 
-            offsets = []
-            for half in range_constexpr(2):
-                part = []
-                for offset in gl_off_a:
-                    row = block_m * BLOCK_M + half * LDS_BLOCK_M + offset // K
-                    route = sorted_ids[row]
-                    source_row = route & 0xFFFFFF
-                    if const_expr(stage == 2):
-                        source_row = source_row * topk + ((route >> 24) & 0xFF)
-                    part.append(source_row * K + offset % K)
-                offsets.append(part)
-            gl_off_a, gl_off_a1 = offsets
-            A0_gl_offset = A1_gl_offset = fx.Int32(0)
+            gl_off_a1 = gl_off_a
+            if const_expr(stage == 1):
+                offsets = []
+                for half in range_constexpr(2):
+                    part = []
+                    for offset in gl_off_a:
+                        row = block_m * BLOCK_M + half * LDS_BLOCK_M + offset // K
+                        route = sorted_ids[row]
+                        source_row = route & 0xFFFFFF
+                        part.append(source_row * K + offset % K)
+                    offsets.append(part)
+                gl_off_a, gl_off_a1 = offsets
+                A0_gl_offset = A1_gl_offset = fx.Int32(0)
 
             mfma = make_mx_mfma(N_TILES_A, N_TILES_B)
 
@@ -312,7 +318,7 @@ def _run_resident_b_pipeline(
     a_cur1,
     a_next0,
     a_next1,
-    a_g2s_pair,
+    a_g2s,
     a_s2r,
     b_s2r,
     a_offsets,
@@ -321,7 +327,6 @@ def _run_resident_b_pipeline(
     base_row,
     base_col,
 ):
-    a0_g2s, a1_g2s = a_g2s_pair
     count = mma.n_tiles_a * mma.n_tiles_b
     c00, c01, c10, c11 = ([mma.zero_value] * count for _ in range(4))
     # Emit the final group stores as soon as their accumulators retire.
@@ -330,8 +335,8 @@ def _run_resident_b_pipeline(
         rocdl.s_barrier()
         if const_expr(k < 2):
             mma.prefetch(k + 1)
-            a0_g2s.load(a_next0, a_offsets[0] + (k + 1) * 128)
-            a1_g2s.load(a_next1, a_offsets[1] + (k + 1) * 128)
+            a_g2s.load(a_next0, a_offsets[0] + (k + 1) * 128)
+            a_g2s.load(a_next1, a_offsets[1] + (k + 1) * 128)
         a0 = a_s2r.load(a_cur0)
         b0 = b_s2r.load(b_tiles0[k], preshuffled=True)
         rocdl.s_setprio(1)
@@ -371,17 +376,22 @@ def _load_b_if_needed(condition, b_g2s, bs0, bs1, b_row, b_k):
     dispatch()
 
 
-def _compile_persistent_gemm(*, topk, xcd_swizzle, m_tiles):
+def _compile_persistent_gemm(*, topk, xcd_swizzle, m_tiles, route_output):
     """K384 down projection with resident B and per-tile expert/row guards."""
-    K, scale_k = 384, 512
-    b_k = K
+    K, b_k = 512, 384
+    scale_k = K
     BLOCK_M = BLOCK_N = 256
     LDS_BLOCK_M = LDS_BLOCK_N = 128
     N_TILES_A, N_TILES_B = 4, 2
     N_LDS_STEPS_A = N_LDS_STEPS_B = 2
     A_GRP_ROWS, B_GRP_ROWS = 64, 32
     a_lds_size = b_lds_size = 16384
-    store_factory = _store_factory(transpose=True, topk=topk, apply_weight=True)
+    store_factory = _store_factory(
+        transpose=True,
+        topk=topk,
+        apply_weight=route_output,
+        scatter_route=route_output,
+    )
     resident_pipeline = _run_resident_b_pipeline
     load_resident_b = _load_b_if_needed
     make_pipeline_mma = make_mx_pipeline_mma
@@ -454,15 +464,11 @@ def _compile_persistent_gemm(*, topk, xcd_swizzle, m_tiles):
             gl_off_a = compute_global_swizzle(
                 lane_id, wave_id, K, N_LDS_STEPS_A, preshuffled=False
             )
-            gathered_a_offsets = []
-            for half in range_constexpr(2):
-                part = []
-                for offset in gl_off_a:
-                    row_in_tile = half * LDS_BLOCK_M + offset // K
-                    part.append((row_in_tile, offset % K))
-                gathered_a_offsets.append(part)
             gl_off_b = compute_global_swizzle(
                 lane_id, wave_id, b_k, N_LDS_STEPS_B, preshuffled=True
+            )
+            a_g2s = make_g2s_loader(
+                a_div, gl_off_a, N_LDS_STEPS_A, F8_IR_t, wave_id
             )
             b_g2s = make_g2s_loader(b_div, gl_off_b, N_LDS_STEPS_B, F8_IR_t, wave_id)
             a_s2r = make_s2r_loader(wave_m, N_TILES_A)
@@ -481,23 +487,12 @@ def _compile_persistent_gemm(*, topk, xcd_swizzle, m_tiles):
                 load_resident_b(
                     expert != previous_expert, b_g2s, b_tiles0, b_tiles1, b_row, b_k
                 )
-                a_offsets = []
-                for half in range_constexpr(2):
-                    offsets = []
-                    for row_in_tile, col in gathered_a_offsets[half]:
-                        sorted_row = bm * BLOCK_M + row_in_tile
-                        route = sorted_ids[sorted_row]
-                        source_row = (route & 0xFFFFFF) * topk + ((route >> 24) & 0xFF)
-                        offsets.append(source_row * K + col)
-                    a_offsets.append(offsets)
-                gathered_a = [
-                    make_g2s_loader(
-                        a_div, a_offsets[half], N_LDS_STEPS_A, F8_IR_t, wave_id
-                    )
-                    for half in range_constexpr(2)
+                a_offsets = [
+                    bm * BLOCK_M * K,
+                    (bm * BLOCK_M + LDS_BLOCK_M) * K,
                 ]
-                gathered_a[0].load(a_cur0, fx.Int32(0))
-                gathered_a[1].load(a_cur1, fx.Int32(0))
+                a_g2s.load(a_cur0, a_offsets[0])
+                a_g2s.load(a_cur1, a_offsets[1])
                 a_base16 = [
                     (bm * BLOCK_M + h * LDS_BLOCK_M + wave_m * A_GRP_ROWS) // 16
                     for h in range_constexpr(2)
@@ -534,10 +529,10 @@ def _compile_persistent_gemm(*, topk, xcd_swizzle, m_tiles):
                     a_cur1,
                     a_next0,
                     a_next1,
-                    gathered_a,
+                    a_g2s,
                     a_s2r,
                     b_s2r,
-                    (fx.Int32(0), fx.Int32(0)),
+                    a_offsets,
                     pipeline_mma,
                     store_c,
                     base_row,

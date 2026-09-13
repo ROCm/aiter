@@ -203,9 +203,11 @@ def _store_factory(
     swiglu_limit=7.0,
     topk=1,
     apply_weight=False,
+    scatter_route=False,
 ):
     def factory(C, route_ids, route_weights, cols, idx, n_tiles_a, n_tiles_b, scratch):
         cols = cols // 2 if activation else cols
+        row_stride = ((cols + 255) // 256) * 256 if activation else cols
         tile_n = n_tiles_b * (8 if activation else 16)
         tile_m = n_tiles_a * 16
         lane = fx.thread_idx.x % 64
@@ -230,6 +232,8 @@ def _store_factory(
             return fx.make_view(ptr + offset, fx.make_layout(width, 1))
 
         def output_row(sorted_row):
+            if const_expr(not scatter_route):
+                return sorted_row
             route = route_ids[sorted_row]
             return (route & 0xFFFFFF) * topk + ((route >> 24) & 0xFF)
 
@@ -291,7 +295,7 @@ def _store_factory(
                     sorted_row = base_row + row
                     reg = fx.make_rmem_tensor(8, fx.BFloat16)
                     reg.store(maybe_weight(scratch_at(row, col, 8).load(), sorted_row))
-                    offset = output_row(sorted_row) * cols + base_col + col
+                    offset = output_row(sorted_row) * row_stride + base_col + col
                     fx.copy(atom, reg, fx.slice(out, (None, offset >> 3)))
 
         return store

@@ -2483,19 +2483,21 @@ def flydsl_mxfp_moe_stage1(
         raise ValueError(
             f"Invalid prefill stage-1 configuration: {kernelName}, block_m={block_m}"
         )
-    if hidden_states.element_size() != 1 or a1_scale is None or out is None:
+    if hidden_states.element_size() != 1 or a1_scale is None:
         raise ValueError(
             "MXFP8 prefill stage 1 requires prequantized MXFP8 input "
-            "and a BF16 route-output buffer"
+            "and preshuffled scales"
         )
     rows = sorted_ids.numel()
     inter = w2.shape[-1]
+    kp = (inter + 255) // 256 * 256
+    act = torch.empty((rows, kp), dtype=torch.bfloat16, device=hidden_states.device)
     route_weights = sorted_ids if sorted_weights is None else sorted_weights
     _run_mxfp_moe_gemm(
         (
             _mxfp_moe_bytes(hidden_states),
             _mxfp_moe_bytes(w1),
-            out.view(-1),
+            act.view(-1),
             _mxfp_moe_bytes(a1_scale),
             _mxfp_moe_bytes(w1_scale),
             sorted_expert_ids,
@@ -2512,7 +2514,25 @@ def flydsl_mxfp_moe_stage1(
         xcd_swizzle=params["xcd_swizzle"],
         swiglu_limit=None if swiglu_limit is None else float(swiglu_limit),
     )
-    return out
+    dtypes = _get_dtypes()
+    if os.environ.get("COMPILE_ONLY") == "1":
+        aq2 = torch.empty((rows, kp), dtype=torch.int8, device=hidden_states.device)
+        sa2 = torch.empty(
+            ((rows + 255) // 256 * 256, kp // 32),
+            dtype=torch.uint8,
+            device=hidden_states.device,
+        )
+    else:
+        from aiter.ops.quant import per_1x32_mx_quant_hip
+
+        aq2, sa2 = per_1x32_mx_quant_hip(
+            act,
+            quant_dtype=dtypes.fp8,
+            scale_type=dtypes.fp8_e8m0,
+            shuffle=True,
+            num_rows=num_valid_ids,
+        )
+    return aq2, sa2
 
 
 def flydsl_mxfp_moe_stage2(
@@ -2532,6 +2552,7 @@ def flydsl_mxfp_moe_stage2(
     sorted_weights=None,
     expert_mask=None,
     topk_ids=None,
+    reverse_sorted=None,
 ):
     params = get_mxfp_prefill_kernel_params(kernelName)
     if params is None or params["stage"] != 2 or block_m != params["sort_block_m"]:
@@ -2540,15 +2561,15 @@ def flydsl_mxfp_moe_stage2(
         )
     if hidden_states.element_size() != 1 or a2_scale is None or sorted_weights is None:
         raise ValueError(
-            "MXFP8 prefill stage 2 requires quantized route-order input, "
+            "MXFP8 prefill stage 2 requires quantized sorted input, "
             "sorted scales and routing weights"
         )
     tokens, hidden = out.shape
     inter = w2.shape[-1]
     rows = sorted_ids.numel()
-    partial = torch.empty(
-        (tokens, topk, hidden), dtype=torch.bfloat16, device=out.device
-    )
+    route_output = reverse_sorted is None
+    partial_shape = (tokens, topk, hidden) if route_output else (rows, hidden)
+    partial = torch.empty(partial_shape, dtype=torch.bfloat16, device=out.device)
     stream = _mxfp_moe_stream()
     _run_mxfp_moe_gemm(
         (
@@ -2565,24 +2586,39 @@ def flydsl_mxfp_moe_stage2(
             hidden,
             stream,
         ),
-        K=inter,
+        K=hidden_states.shape[-1],
         b_k=inter,
         stage=2,
         topk=topk,
         xcd_swizzle=params["xcd_swizzle"],
         persistent_tiles=params["persistent_tiles"],
+        route_output=route_output,
     )
     if os.environ.get("COMPILE_ONLY") != "1":
-        _run_moe_reduction(
-            partial,
-            out,
-            tokens,
-            topk,
-            hidden,
-            expert_mask=expert_mask,
-            topk_ids=topk_ids,
-            stream=stream,
-        )
+        if route_output:
+            _run_moe_reduction(
+                partial,
+                out,
+                tokens,
+                topk,
+                hidden,
+                expert_mask=expert_mask,
+                topk_ids=topk_ids,
+                stream=stream,
+            )
+        else:
+            import aiter
+
+            aiter.mxfp4_moe_scatter_reduce(
+                flat_out=partial,
+                reverse_sorted=reverse_sorted,
+                sorted_weights=sorted_weights,
+                out=out,
+                NE=w2.shape[0],
+                TOPK=topk,
+                D_HIDDEN=hidden,
+                MB=block_m,
+            )
     return out
 
 
@@ -2612,7 +2648,6 @@ def precompile_mxfp_moe(kernelName, token_num, model_dim, inter_dim, experts, to
         wscale = torch.empty(
             experts * 2 * inter * (hidden // 32), dtype=torch.int8, **kwargs
         )
-        route_out = torch.empty((tokens, topk, inter), dtype=torch.bfloat16, **kwargs)
         flydsl_mxfp_moe_stage1(
             x,
             w1,
@@ -2620,7 +2655,7 @@ def precompile_mxfp_moe(kernelName, token_num, model_dim, inter_dim, experts, to
             ids,
             eids,
             valid,
-            route_out,
+            None,
             topk,
             block_m=block_m,
             kernelName=kernelName,
@@ -2629,7 +2664,7 @@ def precompile_mxfp_moe(kernelName, token_num, model_dim, inter_dim, experts, to
         )
     else:
         kp = (inter + 255) // 256 * 256
-        x = torch.empty((tokens, topk, inter), dtype=torch.int8, **kwargs)
+        x = torch.empty((count, kp), dtype=torch.int8, **kwargs)
         scale = torch.empty(experts * hidden * (kp // 32), dtype=torch.int8, **kwargs)
         ascale = torch.empty((scale_rows, kp // 32), dtype=torch.uint8, **kwargs)
         out = torch.empty((tokens, hidden), dtype=torch.bfloat16, **kwargs)

@@ -1274,7 +1274,11 @@ def _fused_moe_impl(
             )
         _stage2_kwargs = metadata.stage2.keywords
         _kn2 = _stage2_kwargs.get("kernelName2") or _stage2_kwargs.get("kernelName", "")
-        _atomic = parse_g2_kname_any(_kn2)["atomic"]
+        _atomic = (
+            False
+            if getattr(stage1_func, "_is_mxfp8_prefill_stage1", False)
+            else parse_g2_kname_any(_kn2)["atomic"]
+        )
         # BM16's adaptive sort already emits routes and zeroes the output without
         # quantizing. Keep the Opus crossover for the configured aux pipeline.
         sorting_ret = moe_sorting(
@@ -3159,7 +3163,8 @@ def get_2stage_cfgs(
             0,
             prequant=True,
             fuse_quant=False,
-            skip_inter_quant=False,
+            skip_inter_quant=True,
+            output_aux=AUX_SORT_OPUS if not is_ep else False,
             **route_bucket_metadata,
         )
 
@@ -3872,7 +3877,11 @@ def fused_moe_2stages(
         and q_dtype_a == dtypes.bf16
         and getattr(metadata.stage1, "func", metadata.stage1) is _flydsl_stage1_wrapper
     )
-    if _is_a16w4_port:
+    if _is_a16w4_port or getattr(
+        getattr(metadata.stage1, "func", metadata.stage1),
+        "_is_mxfp8_prefill_stage1",
+        False,
+    ):
         a2 = None
     elif quant_type == QuantType.per_1x128 and metadata.stage1.func is asm_stage1:
         ratio = a1_scale.element_size() // a1.element_size()
@@ -3956,8 +3965,9 @@ def fused_moe_2stages(
         if uses_flydsl_v2_stage2:
             extra_stage2_args["topk_weights"] = topk_weights
     if m_indices is not None:
-        extra_stage1_args["m_indices"] = m_indices
-        extra_stage1_args["moe_buf"] = _sort_moe_buf
+        if not getattr(stage1_func, "_is_mxfp8_prefill_stage1", False):
+            extra_stage1_args["m_indices"] = m_indices
+            extra_stage1_args["moe_buf"] = _sort_moe_buf
         extra_stage2_args["reverse_sorted"] = reverse_sorted
     _stage1_call = functools.partial(
         metadata.stage1,
