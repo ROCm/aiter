@@ -78,28 +78,6 @@ _MXFP_PREFILL_NAME = re.compile(
 )
 
 
-def mxfp_prefill_kernel_name(
-    stage,
-    tile_m=None,
-    tile_n=256,
-    swizzle=1,
-    b_dtype="fp8",
-    waves=None,
-    persistent_tiles=0,
-):
-    if b_dtype not in ("fp8", "fp4"):
-        raise ValueError(f"Unsupported weight dtype: {b_dtype}")
-    if persistent_tiles not in (0, 2, 4):
-        raise ValueError(f"Unsupported persistent tile count: {persistent_tiles}")
-    waves = (4 if b_dtype == "fp4" else 8) if waves is None else waves
-    tile_m = (128 if waves == 4 else 256) if tile_m is None else tile_m
-    family = "a8w4" if b_dtype == "fp4" else "mxfp8"
-    suffix = f"_persistent{persistent_tiles}" if persistent_tiles else ""
-    return (
-        f"flydsl_moe{stage}_{family}_{waves}w_t{tile_m}x{tile_n}{suffix}_xcd{swizzle}"
-    )
-
-
 def get_mxfp_prefill_kernel_params(name):
     match = _MXFP_PREFILL_NAME.fullmatch(name or "")
     if match is None:
