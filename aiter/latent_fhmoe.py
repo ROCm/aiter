@@ -83,7 +83,11 @@ def _validate_latent_fhmoe_contract(
     _expect_shape(
         "routed_w2_scale",
         routed_w2_scale,
-        (experts, K3_ROUTED_MODEL_DIM, K3_ROUTED_INTER_DIM // 32),
+        (
+            experts,
+            K3_ROUTED_MODEL_DIM,
+            ((K3_ROUTED_INTER_DIM + 255) // 256) * 256 // 32,
+        ),
     )
     if routed_w1_scale.dtype not in (dtypes.fp8_e8m0, torch.uint8):
         raise ValueError("K3 routed_w1_scale must use E8M0 storage")
@@ -106,9 +110,9 @@ def _validate_latent_fhmoe_contract(
     if topk_weight.dtype != torch.float32:
         raise ValueError("topk_weight must be float32")
 
-    if activation is not ActivationType.Situv2:
+    if activation != ActivationType.Situv2:
         raise ValueError("K3 latent FHMoE requires SiTUv2")
-    if quant_type is not QuantType.per_1x32:
+    if quant_type != QuantType.per_1x32:
         raise ValueError("K3 latent FHMoE requires per_1x32 routed quantization")
     if (beta, linear_beta) != (K3_SITUV2_BETA, K3_SITUV2_LINEAR_BETA):
         raise ValueError("K3 latent FHMoE requires beta=4 and linear_beta=25")

@@ -36,7 +36,7 @@ def _meta_contract(topk: int = 2, experts: int = 2) -> dict:
             (experts, 768, 112), dtype=torch.uint8, device=device
         ),
         "routed_w2_scale": torch.empty(
-            (experts, 3584, 12), dtype=torch.uint8, device=device
+            (experts, 3584, 16), dtype=torch.uint8, device=device
         ),
         "topk_weight": torch.empty((m, topk), dtype=torch.float32, device=device),
         "topk_ids": torch.empty((m, topk), dtype=torch.int32, device=device),
@@ -114,13 +114,11 @@ def test_latent_api_is_separate_and_returns_two_outputs():
     assert callable(latent_fhmoe_)
 
 
-def test_common_kernel_reports_precise_bf16_dual_mfma_blocker():
+def test_common_kernel_builds_bf16_dual_mfma_launchers():
     from aiter.ops.flydsl.kernels.fhmoe import (
         compile_mixed_latent_fhmoe_gemm1,
         compile_mixed_latent_fhmoe_gemm2,
     )
 
-    with pytest.raises(NotImplementedError, match="BF16 shared-A/shared-W MFMA"):
-        compile_mixed_latent_fhmoe_gemm1(experts=2, topk=2)
-    with pytest.raises(NotImplementedError, match="separate shared-output epilogue"):
-        compile_mixed_latent_fhmoe_gemm2(experts=2, topk=2)
+    assert callable(compile_mixed_latent_fhmoe_gemm1(experts=2, topk=2))
+    assert callable(compile_mixed_latent_fhmoe_gemm2(experts=2, topk=2))
