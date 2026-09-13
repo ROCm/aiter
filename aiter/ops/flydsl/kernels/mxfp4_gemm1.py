@@ -116,10 +116,8 @@ def _gemm1_body(
     num_waves=4,
     k_wave=1,
     epi_splits=1,
-    k_stages=None,
+    k_stages=kStages,
 ):
-    _KS = kStages if k_stages is None else k_stages
-
     # A-code tile bytes/row: fp4 packs 2 codes/byte (BK/2); fp8 is 1 B/elem (BK).
     KH_TILE = BK if a_dtype == "fp8" else BK // 2
     K_HALF = k_half_for(K)
@@ -138,9 +136,9 @@ def _gemm1_body(
     OUT_AS_PER_CHUNK_DW = out_as_per_chunk_dw_for(inter)
     OUT_ROW_BYTES = inter if out_dtype == "fp8" else k_g2_half_for(inter)
     kAStages, kSubBlocks, kMChunks, _ = _bm_constants(
-        BM, BN, KH_TILE, K_TILES_TOTAL, k_wave, epi_splits, _KS
+        BM, BN, KH_TILE, K_TILES_TOTAL, k_wave, epi_splits, k_stages
     )
-    kUnroll = K_TILES_PER_WAVE - _KS
+    kUnroll = K_TILES_PER_WAVE - k_stages
 
     k_split = (
         a_dtype == "fp4"
@@ -301,8 +299,8 @@ def _gemm1_body(
         for i in range_constexpr(kMChunks):
             for J in range_constexpr(N_REPS):
                 accm[i][J].store(fx.Vector.filled(4, 0.0, fx.Float32))
-    b = [[[None, None] for _ in range(N_REPS)] for _ in range(_KS)]
-    b_scale_v = [[None, None] for _ in range(_KS)]
+    b = [[[None, None] for _ in range(N_REPS)] for _ in range(k_stages)]
+    b_scale_v = [[None, None] for _ in range(k_stages)]
 
     # s_aq as flat i32, divided into 4-element (128-bit) and 1-element tiles.
     s_aq_i32_flat = fx.make_view(
@@ -430,7 +428,7 @@ def _gemm1_body(
                 + (lds_row + lane_div_8) * fx.Int32(KH_TILE)
                 + lane_mod_8 * fx.Int32(16)
             )
-            fx.copy_atom_call(
+            fx.copy(
                 i32x4_copy_atom,
                 regs[sub],
                 fx.slice(s_aq_i32x4_tiles, (None, dst // fx.Int32(16))),
@@ -977,22 +975,22 @@ def _gemm1_body(
         bh = [[None] * N_REPS for _ in range(2)]
         a_regs = [None] * a_reg_depth
         issue_a_scale_load()
-        for S in range_constexpr(_KS):
+        for S in range_constexpr(k_stages):
             issue_a_load_lds(S, global_k_tile(S))
         rocdl.sched_barrier(0)
-        for S in range_constexpr(_KS):
+        for S in range_constexpr(k_stages):
             issue_b_scale_load(b_scale_v[S], global_k_tile(S))
         for h in range_constexpr(2):
             for j in range_constexpr(N_REPS):
                 issue_b_load_half(bh[h], global_k_tile(0), j, h)
         for d in range_constexpr(a_reg_depth):
-            if const_expr(_KS + d < K_TILES_PER_WAVE):
-                a_regs[d] = issue_a_load_reg(global_k_tile(_KS + d))
+            if const_expr(k_stages + d < K_TILES_PER_WAVE):
+                a_regs[d] = issue_a_load_reg(global_k_tile(k_stages + d))
 
         for KT in range_constexpr(K_TILES_PER_WAVE):
             read_slot = KT % kAStages
-            slot_b = KT % _KS
-            wt = KT + _KS
+            slot_b = KT % k_stages
+            wt = KT + k_stages
             gpu.barrier()
             asc_cur = issue_a_scale_ds_read(global_k_tile(KT))
             if const_expr(wt < K_TILES_PER_WAVE):
@@ -1030,7 +1028,7 @@ def _gemm1_body(
                 inline_quant_load_kt(0, global_k_tile(0), cached_row_inline),
                 inline_quant_load_kt(1, global_k_tile(0), cached_row_inline),
             )
-        for K_C_LOCAL in range_constexpr(_KS):
+        for K_C_LOCAL in range_constexpr(k_stages):
             K_C = global_k_tile(K_C_LOCAL)
             if const_expr(inline_quant):
                 scale_accum = fx.Int32(0)
@@ -1073,18 +1071,18 @@ def _gemm1_body(
                 issue_b_scale_load(b_scale_v[K_C_LOCAL], K_C)
         if const_expr(_relax_prologue):
             rocdl.sched_barrier(0)
-            for K_C_LOCAL in range_constexpr(_KS):
+            for K_C_LOCAL in range_constexpr(k_stages):
                 K_C = global_k_tile(K_C_LOCAL)
                 for j in range_constexpr(N_REPS):
                     issue_b_load_j(b[K_C_LOCAL], K_C, j)
                 issue_b_scale_load(b_scale_v[K_C_LOCAL], K_C)
 
         for OFFSET in range_constexpr(kUnroll):
-            K_C_LOCAL = _KS + OFFSET
+            K_C_LOCAL = k_stages + OFFSET
             K_C = global_k_tile(K_C_LOCAL)
             read_slot = OFFSET % kAStages
             write_slot = K_C_LOCAL % kAStages
-            slot_b = OFFSET % _KS
+            slot_b = OFFSET % k_stages
             if const_expr(inline_quant and prefetch_hidden):
                 h_v0, h_v1 = hidden_prefetch
                 if const_expr(OFFSET + 1 < kUnroll):
@@ -1094,11 +1092,11 @@ def _gemm1_body(
                     )
             gpu.barrier()
             if const_expr(BM == 128):
-                asc_cur = issue_a_scale_ds_read(K_C - _KS)
+                asc_cur = issue_a_scale_ds_read(K_C - k_stages)
                 a_cur = issue_a_ds_read(read_slot)
             else:
                 a_cur = issue_a_ds_read(read_slot)
-                asc_cur = issue_a_scale_ds_read(K_C - _KS)
+                asc_cur = issue_a_scale_ds_read(K_C - k_stages)
             if const_expr(not inline_quant):
                 issue_a_load_lds(write_slot, K_C)
             if const_expr(inline_quant and not prefetch_hidden):
@@ -1122,8 +1120,8 @@ def _gemm1_body(
                 )
                 inline_quant_pack_write(K_C, scale_accum)
 
-        for S in range_constexpr(_KS):
-            kt_local = K_TILES_PER_WAVE - _KS + S
+        for S in range_constexpr(k_stages):
+            kt_local = K_TILES_PER_WAVE - k_stages + S
             kt = global_k_tile(kt_local)
             gpu.barrier()
             if const_expr(BM == 128):
@@ -1134,10 +1132,10 @@ def _gemm1_body(
                 asc_cur = issue_a_scale_ds_read(kt)
             for J in range_constexpr(N_REPS):
                 mfma_cluster(
-                    b[kt_local % _KS],
+                    b[kt_local % k_stages],
                     a_cur,
                     asc_cur,
-                    b_scale_v[kt_local % _KS],
+                    b_scale_v[kt_local % k_stages],
                     J,
                 )
 
@@ -1199,10 +1197,8 @@ def _gemm1_body(
 
     def acc_load4(idx):
         r = fx.make_rmem_tensor(mem_4x1, fx.Float32)
-        fx.copy_atom_call(
-            acc_x4_copy_atom,
-            fx.slice(acc_flat_tiles4, (None, idx // fx.Int32(4))),
-            r,
+        fx.copy(
+            acc_x4_copy_atom, fx.slice(acc_flat_tiles4, (None, idx // fx.Int32(4))), r
         )
         return r.load()
 
@@ -1554,9 +1550,9 @@ def _gemm1_body(
 
 
 def _bm_constants(
-    BM, BN, KH_TILE, K_TILES_TOTAL, k_wave=1, epi_splits=1, k_stages=None
+    BM, BN, KH_TILE, K_TILES_TOTAL, k_wave=1, epi_splits=1, k_stages=kStages
 ):
-    kAStages = (kStages if k_stages is None else k_stages) + 1
+    kAStages = k_stages + 1
     kSubBlocks = 1 if BM < 32 else BM // 32
     kMChunks = kmchunks_for(BM)
     s_aq_bytes = k_wave * kAStages * BM * KH_TILE
