@@ -35,7 +35,8 @@ def bound():
         if isinstance(n, ast.FunctionDef) and n.name == "_varlen_int32_addressable"
     )
     ns = {}
-    exec(compile(ast.Module(body=[node], type_ignores=[]), str(SOURCE), "exec"), ns)
+    # Execute only the checked-in metadata helper, avoiding GPU initialization.
+    exec(compile(ast.Module(body=[node], type_ignores=[]), str(SOURCE), "exec"), ns)  # noqa: S102
     return ns[node.name]
 
 

@@ -1,9 +1,11 @@
+# SPDX-License-Identifier: MIT
 """Current AITER per-call varlen correctness, graph replay and warm timing."""
 
 import json
 import statistics
 
 import torch
+
 from aiter.ops.triton.attention import mha
 
 
@@ -58,7 +60,7 @@ def main():
             ]
             cu = torch.tensor([0, length], device="cuda", dtype=torch.int32)
 
-            def invoke(prefer):
+            def invoke(prefer, tensors=tensors, cu=cu, length=length):
                 return mha.flash_attn_varlen_func(
                     *tensors, cu, cu, length, length, prefer_int32_strides=prefer
                 )
