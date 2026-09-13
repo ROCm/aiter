@@ -930,11 +930,19 @@ def _gemm1_body(
                     i1 = sub * 2 + 1
                     sa = a_scale[sub]
                     if const_expr(khalf is None or khalf == 0):
-                        accm[i0][J] = _mma(accm[i0][J], 0, 0 + in_b, a[i0][0], bJ0, sa, sb)
-                        accm[i1][J] = _mma(accm[i1][J], 1, 0 + in_b, a[i1][0], bJ0, sa, sb)
+                        accm[i0][J] = _mma(
+                            accm[i0][J], 0, 0 + in_b, a[i0][0], bJ0, sa, sb
+                        )
+                        accm[i1][J] = _mma(
+                            accm[i1][J], 1, 0 + in_b, a[i1][0], bJ0, sa, sb
+                        )
                     if const_expr(khalf is None or khalf == 1):
-                        accm[i0][J] = _mma(accm[i0][J], 2, 2 + in_b, a[i0][1], bJ1, sa, sb)
-                        accm[i1][J] = _mma(accm[i1][J], 3, 2 + in_b, a[i1][1], bJ1, sa, sb)
+                        accm[i0][J] = _mma(
+                            accm[i0][J], 2, 2 + in_b, a[i0][1], bJ1, sa, sb
+                        )
+                        accm[i1][J] = _mma(
+                            accm[i1][J], 3, 2 + in_b, a[i1][1], bJ1, sa, sb
+                        )
 
         if const_expr(interleave and N_REPS == 1):
             # Adjacent waves consume the low/high N half of one scale word.
@@ -1545,7 +1553,9 @@ def _gemm1_body(
                 store_scales()
 
 
-def _bm_constants(BM, BN, KH_TILE, K_TILES_TOTAL, k_wave=1, epi_splits=1, k_stages=None):
+def _bm_constants(
+    BM, BN, KH_TILE, K_TILES_TOTAL, k_wave=1, epi_splits=1, k_stages=None
+):
     kAStages = (kStages if k_stages is None else k_stages) + 1
     kSubBlocks = 1 if BM < 32 else BM // 32
     kMChunks = kmchunks_for(BM)
@@ -1582,9 +1592,8 @@ def default_k_stages(BM, BN, KH_TILE, K_TILES_TOTAL, N_OUT, k_wave=1, epi_splits
 
 
 def default_epi_splits(BM, BN, k_wave=1, num_waves=4):
-    if BN == 256 and num_waves == 4 and k_wave == 1:
-        if BM in (128, 160):
-            return 2
+    if BN == 256 and num_waves == 4 and k_wave == 1 and BM in (128, 160):
+        return 2
     return 1
 
 
@@ -1695,9 +1704,9 @@ def compile_gemm1_a4w4_port(
         k_stages = default_k_stages(
             BM, BN, KH_TILE, K_TILES_TOTAL, N_OUT, k_wave, epi_splits
         )
-    assert 1 <= k_stages <= K_TILES_TOTAL // k_wave, (
-        f"k_stages must be in [1, {K_TILES_TOTAL // k_wave}], got {k_stages}"
-    )
+    assert (
+        1 <= k_stages <= K_TILES_TOTAL // k_wave
+    ), f"k_stages must be in [1, {K_TILES_TOTAL // k_wave}], got {k_stages}"
 
     _, _, _, lds_bytes = _bm_constants(
         BM, BN, KH_TILE, K_TILES_TOTAL, k_wave, epi_splits, k_stages

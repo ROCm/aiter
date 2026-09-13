@@ -150,11 +150,10 @@ def compile_gemm2_a4w4_port(
         )
     if SBM < BM:
         raise AssertionError(f"SBM ({SBM}) must be >= BM ({BM})")
-    if SBM % BM:
-        if SBM % 32 or BM % 32:
-            raise AssertionError(
-                f"sub-tiled gemm2 needs SBM ({SBM}) and BM ({BM}) 32-row aligned"
-            )
+    if SBM % BM and (SBM % 32 or BM % 32):
+        raise AssertionError(
+            f"sub-tiled gemm2 needs SBM ({SBM}) and BM ({BM}) 32-row aligned"
+        )
     if (_composition is None) != (_input_row_resolver is None):
         raise ValueError("a composed GEMM2 requires an input row resolver")
     if _reduce_store_cache_modifier is not None and _composition is None:

@@ -2,8 +2,6 @@
 # Copyright (C) 2025-2026 FlyDSL Project Contributors
 """Layout-API MXFP4 MoE GEMM device body (BM32): gemm2 down."""
 
-import os
-
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl.expr import arith as _arith
@@ -310,9 +308,7 @@ def gemm2_body_v2(
             rocdl.readfirstlane(T.i32, _raw(_udiv(m_block_idx, fx.Int32(SUBS))))
         )
         m_sub = fx.Int32(
-            rocdl.readfirstlane(
-                T.i32, _raw(m_block_idx - sort_block * fx.Int32(SUBS))
-            )
+            rocdl.readfirstlane(T.i32, _raw(m_block_idx - sort_block * fx.Int32(SUBS)))
         )
         m_row = fx.Int32(
             rocdl.readfirstlane(T.i32, _raw(sort_block * SBM + m_sub * BM))
