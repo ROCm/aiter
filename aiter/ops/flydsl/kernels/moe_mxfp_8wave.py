@@ -467,9 +467,7 @@ def _compile_persistent_gemm(*, topk, xcd_swizzle, m_tiles, route_output):
             gl_off_b = compute_global_swizzle(
                 lane_id, wave_id, b_k, N_LDS_STEPS_B, preshuffled=True
             )
-            a_g2s = make_g2s_loader(
-                a_div, gl_off_a, N_LDS_STEPS_A, F8_IR_t, wave_id
-            )
+            a_g2s = make_g2s_loader(a_div, gl_off_a, N_LDS_STEPS_A, F8_IR_t, wave_id)
             b_g2s = make_g2s_loader(b_div, gl_off_b, N_LDS_STEPS_B, F8_IR_t, wave_id)
             a_s2r = make_s2r_loader(wave_m, N_TILES_A)
             b_s2r = make_s2r_loader(wave_n, N_TILES_B)
