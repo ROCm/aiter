@@ -396,9 +396,29 @@ def _heuristic_bpreshuffle_kid(
             # is worth more than its duplicated A traffic; above it, the reverse.
             bm38, bn38 = _BPRESHUF_TILE_BN[38]
             return 10 if -(-n // bn38) * batch > cus else 38
+        # kid47 (256x128) splits this band in two places. It shares kid35's
+        # B_M=256 and kid31's B_N=128, so against kid35 it doubles the grid, and
+        # against kid31 it HALVES the B re-reads (half as many M tiles) at
+        # identical A re-reads. Swept twice over batch 1..16 x m 512..4096; the
+        # rule below names the measured winner in 26 of 28 cells (both misses are
+        # kid46 edging kid35 by 1.6%, a near-tie this heuristic declines to
+        # chase) and is worth 6.1%-6.3% on average, up to 42.7%.
         bm35, bn35 = _BPRESHUF_TILE_BN[35]
         wg35 = -(-m // bm35) * -(-n // bn35) * batch
-        return 35 if wg35 * 2 >= cus else 31
+        mt35 = -(-m // bm35)
+        if wg35 * 2 >= cus:
+            # kid35's grid is at least half the machine. kid47's is exactly
+            # twice it, so kid47 fills the machine precisely where kid35 runs
+            # half empty -- and overflows into a second, mostly idle round as
+            # soon as kid35 is more than three quarters full. Measured: at
+            # wg35=128 kid47 wins 0.6%-7.7%; at wg35=192 it LOSES 35%.
+            return 47 if wg35 * 4 < cus * 3 else 35
+        # Below half a machine the incumbent is kid31, which already exists to
+        # buy parallelism from a narrow tile. kid47 beats it once there are
+        # enough M tiles for the halved B traffic to outweigh kid31's finer
+        # grid -- eight of them, or four when the batch is replicating B anyway.
+        # Under that, kid31 still wins and this leaves it alone.
+        return 47 if (mt35 >= 8 or (mt35 >= 4 and batch >= 4)) else 31
     if m > _BPRESHUF_DECODE_M_MAX:
         # Prefill. Two tiles, split on kid27's own workgroup count.
         #
