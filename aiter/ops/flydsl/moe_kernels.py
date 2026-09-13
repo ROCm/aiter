@@ -2590,9 +2590,7 @@ def flydsl_moe_topids_to_rows(
             topids_to_rows_kernel = _get_compiled_route_g2l_lds(
                 wdt, direct_mask=contiguous_expert_mask
             )
-            if contiguous_expert_mask:
-                assert num_local_tokens is not None
-            topids_to_rows_kernel(
+            route_args = [
                 ptr_arg(topk_ids.to(torch.int32).reshape(-1)),
                 ptr_arg(g2l_lut),
                 ptr_arg(counter),
@@ -2600,16 +2598,17 @@ def flydsl_moe_topids_to_rows(
                 ptr_arg(weight_in.to(torch.float32).reshape(-1)),
                 ptr_arg(gather_w.reshape(-1)),
                 ptr_arg(num_valid_routes),
-                ptr_arg(
-                    num_local_tokens.reshape(-1)[:1]
-                    if num_local_tokens is not None
-                    else torch.empty(0, dtype=torch.int32, device=device)
-                ),
-                numel,
-                int(max_m),
-                int(E),
-                int(topk),
-                route_grid,
+            ]
+            if contiguous_expert_mask:
+                assert num_local_tokens is not None
+                route_args.append(ptr_arg(num_local_tokens.reshape(-1)[:1]))
+                route_args.extend(
+                    [numel, int(max_m), int(E), int(topk), route_grid]
+                )
+            else:
+                route_args.extend([numel, int(max_m), int(E), route_grid])
+            topids_to_rows_kernel(
+                *route_args,
                 stream=torch.cuda.current_stream(),
             )
         else:
