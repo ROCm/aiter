@@ -517,12 +517,24 @@ __global__ void __launch_bounds__(512, 1) cross_device_reduce_2stage(RankData* _
     auto tmp_out = tmps[0];
     start_sync<ngpus>(sg, self_sg, rank);
     // stage 1: reduce scatter
-    for(int idx = start + tid; idx < end; idx += stride)
+    // The __syncthreads() below must be reached by every thread in the block the
+    // same number of times, so the loop count has to be block-uniform. A plain
+    // grid-stride `for(idx = start + tid; idx < end; ...)` diverges when
+    // (end - start) is not a multiple of stride (lanes past `end` exit early),
+    // which makes the barriers ill-formed and corrupts the smem reduction. Mirror
+    // the 1-stage kernel: iterate a uniform `iters` and predicate the work.
+    const int block_first = start + blockIdx.x * tnum_gpu; // lane 0's first idx
+    const int rem         = end - block_first;
+    const int iters       = rem > 0 ? (rem + stride - 1) / stride : 0;
+    for(int it = 0; it < iters; ++it)
     {
-        *(reinterpret_cast<P*>(&tmp_smem[0]) + threadIdx.x) = ptrs[warp_id][idx];
+        const int idx     = start + tid + it * stride;
+        const bool active = idx < end;
+        if(active)
+            *(reinterpret_cast<P*>(&tmp_smem[0]) + threadIdx.x) = ptrs[warp_id][idx];
         __syncthreads();
         // cal add in first 64 threads
-        if(warp_id == 0)
+        if(warp_id == 0 && active)
         {
             A add_reg;
 #pragma unroll
@@ -618,13 +630,22 @@ __global__ void __launch_bounds__(512, 1)
     end_sync<ngpus>(sg, self_sg, rank);
 
     // stage 2: reduce scatter & write result to remote rank
-    end = rank != ngpus - 1 ? part : size - part * (ngpus - 1);
-    for(int idx = tid; idx < end; idx += stride)
+    // Block-uniform loop count so the two __syncthreads() below are reached by
+    // every thread the same number of times; a plain grid-stride loop diverges
+    // when `end` is not a multiple of stride and corrupts the smem reduction.
+    end                 = rank != ngpus - 1 ? part : size - part * (ngpus - 1);
+    const int s2_first  = blockIdx.x * tnum_gpu; // lane 0's first idx (loop starts at tid)
+    const int s2_rem    = end - s2_first;
+    const int s2_iters  = s2_rem > 0 ? (s2_rem + stride - 1) / stride : 0;
+    for(int it = 0; it < s2_iters; ++it)
     {
-        *(reinterpret_cast<P*>(&tmp_smem[0]) + threadIdx.x) = tmp_out[warp_id * part + idx];
+        const int idx     = tid + it * stride;
+        const bool active = idx < end;
+        if(active)
+            *(reinterpret_cast<P*>(&tmp_smem[0]) + threadIdx.x) = tmp_out[warp_id * part + idx];
         __syncthreads();
         // cal add in first 64 threads
-        if(warp_id == 0)
+        if(warp_id == 0 && active)
         {
             A add_reg;
 #pragma unroll
@@ -652,6 +673,8 @@ __global__ void __launch_bounds__(512, 1)
             *(reinterpret_cast<P*>(&res_smem[0]) + lane_id) = write_reg;
         }
         __syncthreads();
+        if(!active)
+            continue;
         // send data to remote rank
         if(is_broadcast_reg_outptr)
         {
