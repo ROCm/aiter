@@ -4,11 +4,14 @@
 import flydsl.expr as fx
 from flydsl._mlir import ir
 from flydsl.expr import math as fmath
-from flydsl.expr.typing import T
+from flydsl.expr.typing import Float4E2M1FN, Float8E4M3FN, T
 
 from aiter.ops.flydsl.kernels import buffer_ops
 
 from . import dpp_utils
+from .act import sigmoid_batch, sigmoid_f32, tanh_f32
+from .act import silu_mul_batch as _silu_mul_batch
+from .layout_utils import crd2idx
 
 kStages = 2
 kBS_stride_k0_dw = 64
@@ -26,6 +29,29 @@ def _udiv(x, d):
 
 def _umod(x, d):
     return fx.Int32(fx.Uint32(x) % fx.Uint32(d))
+
+
+_A_ELEM = {"fp4": Float4E2M1FN, "fp8": Float8E4M3FN}
+
+
+def _scale_mma_atoms(a_dtype):
+    """Build scaled 16x16x128 MFMA atoms for every scale-byte selection."""
+    elem_a = _A_ELEM[a_dtype]
+    return {
+        (opsel_a, opsel_b): fx.make_mma_atom(
+            fx.rocdl.cdna4.MFMA_Scale(
+                16,
+                16,
+                128,
+                elem_a,
+                Float4E2M1FN,
+                opsel_a=opsel_a,
+                opsel_b=opsel_b,
+            )
+        )
+        for opsel_a in range(4)
+        for opsel_b in range(4)
+    }
 
 
 def _lds_ptr3(base_i32, byte_off_i32):
@@ -52,6 +78,38 @@ def _gep1(base_ptr, byte_off_i32):
 
 def _global_ptr1(arg, byte_off_i32):
     return _gep1(_global_base_ptr1(arg), byte_off_i32)
+
+
+def _global_i32_at(addr_i64, idx):
+    return global_typed_ptr(addr_i64, T.i32)[idx]
+
+
+def _global_f32_at(addr_i64, idx):
+    return global_typed_ptr(addr_i64, T.f32)[idx]
+
+
+def _global_i32_load(tiles, idx):
+    atom = fx.make_copy_atom(fx.UniversalCopy32b(), fx.Int32)
+    r = fx.make_rmem_tensor(fx.make_layout(1, 1), fx.Int32)
+    fx.copy(atom, fx.slice(tiles, (None, idx)), r)
+    return r.load()[0]
+
+
+def _global_scalar_tiles(addr_i64, numeric_cls, num_elems):
+    ptr = global_typed_ptr(addr_i64, numeric_cls.ir_type, numeric_cls.width // 8)
+    flat = fx.make_view(ptr, fx.make_layout(num_elems, 1))
+    return fx.logical_divide(flat, fx.make_layout(1, 1))
+
+
+def _scalar_store(tiles, idx, value, numeric_cls):
+    atom = fx.make_copy_atom(fx.UniversalCopy(numeric_cls.width), numeric_cls)
+    r = fx.make_rmem_tensor(fx.make_layout(1, 1), numeric_cls)
+    r.store(fx.Vector.from_elements([numeric_cls(value)], numeric_cls))
+    fx.copy(atom, r, fx.slice(tiles, (None, idx)))
+
+
+def _layout_idx(layout, *coords):
+    return fx.Int32(crd2idx([fx.Int64(coord) for coord in coords], layout))
 
 
 def _buffer_rsrc(addr_i64, num_records_bytes):
@@ -157,17 +215,76 @@ def _fabs_f32(x):
     return fmath.absf(x)
 
 
-def _e8m0_roundup(amax_f32):
-    wi = (amax_f32 * fx.Float32(1.0 / 6.0)).bitcast(fx.Int32)
+def _e8m0_roundup(amax_f32, max_norm=6.0):
+    wi = (amax_f32 * fx.Float32(1.0 / float(max_norm))).bitcast(fx.Int32)
     bexp = (wi + fx.Int32(0x7FFFFF)).shrui(fx.Int32(23)) & fx.Int32(0xFF)
     lt = fx.Uint32(bexp) < fx.Uint32(254)
     return lt.select(bexp, fx.Int32(254))
 
 
-def _e8m0_from_amax(amax_f32):
-    e8m0 = _e8m0_roundup(amax_f32)
+def _e8m0_from_amax(amax_f32, max_norm=6.0):
+    e8m0 = _e8m0_roundup(amax_f32, max_norm=max_norm)
     qscale = (e8m0 << fx.Int32(23)).bitcast(fx.Float32)
     return e8m0, qscale
+
+
+def _inline_e8m0(amax_u16_i32, max_norm=6.0):
+    bits = (fx.Int32(amax_u16_i32) & 0xFFFF) << 16
+    return _e8m0_roundup(bits.bitcast(fx.Float32), max_norm=max_norm)
+
+
+def _pkmax_u16(a_i32, b_i32):
+    va = fx.Vector.from_elements([a_i32], fx.Int32).bitcast(fx.Uint16)
+    vb = fx.Vector.from_elements([b_i32], fx.Int32).bitcast(fx.Uint16)
+    return fx.max(va, vb).bitcast(fx.Int32)[0]
+
+
+def _swiglu_mul_batch(gate_values, up_values, limit=7.0):
+    limit_f32 = fx.Float32(float(limit))
+    neg_limit_f32 = fx.Float32(-float(limit))
+    gates = [fx.min(gate, limit_f32) for gate in gate_values]
+    ups = [fx.max(fx.min(up, limit_f32), neg_limit_f32) for up in up_values]
+    # Fold alpha into the exp2 constant to retain this kernel's rounding.
+    sigmoids = sigmoid_batch(gates, alpha=1.702)
+    return [
+        gate * sigmoid * (up + 1.0) for gate, sigmoid, up in zip(gates, sigmoids, ups)
+    ]
+
+
+def _situ_mul_batch(gate_values, up_values, beta=1.0, linear_beta=1.0):
+    # This variant is unclamped, with host-computed reciprocals and left-associated products.
+    beta_f32 = fx.Float32(float(beta))
+    beta_rcp = fx.Float32(1.0 / float(beta))
+    linear_beta_f32 = fx.Float32(float(linear_beta))
+    linear_beta_rcp = fx.Float32(1.0 / float(linear_beta))
+    return [
+        beta_f32
+        * tanh_f32(gate * beta_rcp)
+        * sigmoid_f32(gate)
+        * linear_beta_f32
+        * tanh_f32(up * linear_beta_rcp)
+        for gate, up in zip(gate_values, up_values)
+    ]
+
+
+def _activation_mul_batch(
+    gate_values,
+    up_values,
+    act="silu",
+    situ_beta=1.0,
+    situ_linear_beta=1.0,
+    swiglu_limit=7.0,
+):
+    if act == "swiglu":
+        return _swiglu_mul_batch(gate_values, up_values, limit=swiglu_limit)
+    if act == "situv2":
+        return _situ_mul_batch(
+            gate_values,
+            up_values,
+            beta=situ_beta,
+            linear_beta=situ_linear_beta,
+        )
+    return _silu_mul_batch(gate_values, up_values)
 
 
 def _umax_i32(a, b):
