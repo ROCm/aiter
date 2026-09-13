@@ -1,9 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (C) 2025-2026 FlyDSL Project Contributors
 
-"""Shared MXFP4/FP8 MoE and heterogeneous MoE kernel builders."""
-
-"""MoE GEMM stage1/stage2 kernel implementations (FlyDSL MFMA FP8/FP16/FP4).
+"""Shared MXFP4/FP8 MoE GEMM stage1/stage2 kernel builders.
 
 This module contains the **kernel builder code** for:
 - `moe_gemm1` (stage1, with silu/swiglu activation)
@@ -124,9 +122,35 @@ def compile_mixed_moe_gemm1_common(
     k_wave: int = 1,
     shared_expert_id: int | None = None,
     v2_output_layout: bool = False,
+    shared_model_dim: int | None = None,
+    shared_inter_dim: int | None = None,
+    shared_a_dtype: str | None = None,
+    shared_b_dtype: str | None = None,
+    separate_shared_output: bool = False,
 ):
     """Compile stage1 kernel: act(X @ W_gate.T, X @ W_up.T) -> [tokens*topk, inter_dim]."""
     heterogeneous_b = shared_expert_id is not None
+    latent_args = (
+        shared_model_dim,
+        shared_inter_dim,
+        shared_a_dtype,
+        shared_b_dtype,
+    )
+    latent_heterogeneous = any(value is not None for value in latent_args) or bool(
+        separate_shared_output
+    )
+    if latent_heterogeneous:
+        if any(value is None for value in latent_args) or not separate_shared_output:
+            raise ValueError(
+                "Latent FHMoE requires shared model/inter dimensions, shared "
+                "A/B dtypes, and separate_shared_output=True"
+            )
+        if (shared_a_dtype, shared_b_dtype) != ("bf16", "bf16"):
+            raise ValueError("K3 latent FHMoE shared stage1 must use BF16 x BF16")
+        raise NotImplementedError(
+            "Latent FHMoE stage1 needs a BF16 shared-A/shared-W MFMA loader in "
+            "the common persistent kernel"
+        )
     if heterogeneous_b and shared_expert_id != experts - 1:
         raise ValueError(
             "FHMoE stage1 requires shared_expert_id == experts - 1; "
@@ -3286,9 +3310,35 @@ def compile_mixed_moe_gemm2_common(
     b_nt: int = 0,
     xcd_swizzle: int = 0,
     shared_expert_id: int | None = None,
+    shared_model_dim: int | None = None,
+    shared_inter_dim: int | None = None,
+    shared_a_dtype: str | None = None,
+    shared_b_dtype: str | None = None,
+    separate_shared_output: bool = False,
 ):
     """Compile stage2 kernel (moe_gemm2): A2 @ W2.T -> [tokens, model_dim], atomic-add."""
     heterogeneous_b = shared_expert_id is not None
+    latent_args = (
+        shared_model_dim,
+        shared_inter_dim,
+        shared_a_dtype,
+        shared_b_dtype,
+    )
+    latent_heterogeneous = any(value is not None for value in latent_args) or bool(
+        separate_shared_output
+    )
+    if latent_heterogeneous:
+        if any(value is None for value in latent_args) or not separate_shared_output:
+            raise ValueError(
+                "Latent FHMoE requires shared model/inter dimensions, shared "
+                "A/B dtypes, and separate_shared_output=True"
+            )
+        if (shared_a_dtype, shared_b_dtype) != ("bf16", "bf16"):
+            raise ValueError("K3 latent FHMoE shared stage2 must use BF16 x BF16")
+        raise NotImplementedError(
+            "Latent FHMoE stage2 needs max-intermediate addressing and a "
+            "separate shared-output epilogue in the common persistent kernel"
+        )
     if heterogeneous_b and shared_expert_id != experts - 1:
         raise ValueError(
             "FHMoE stage2 requires shared_expert_id == experts - 1; "

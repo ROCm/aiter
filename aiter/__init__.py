@@ -143,6 +143,7 @@ else:
     from .ops.fused_split_gdr_update import *
     from .ops.gdr_decode_packed_bf16 import *
     from . import mla  # noqa: F401
+    from .latent_fhmoe import latent_fhmoe as kimi_k3_latent_fhmoe  # noqa: F401
 
     # isort: on
 
