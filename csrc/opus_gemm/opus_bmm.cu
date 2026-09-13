@@ -245,6 +245,7 @@ void opus_bmm_a8w8_mxscale_bpreshuffle(
     {35, OPUS_BMM_BPRESHUF_NS_ENTRY(opus_bmm_a8w8_mxscale_bpreshuffle_tile_ns256_gn128_sf_bk256_gfx1250)},
     {36, OPUS_BMM_BPRESHUF_NS_ENTRY(opus_bmm_a8w8_mxscale_bpreshuffle_tile_ns256_bk256_gfx1250)},
     {38, OPUS_BMM_BPRESHUF_NS_ENTRY(opus_bmm_a8w8_mxscale_bpreshuffle_tile_ns_dec_n64_gn128_sf_gfx1250)},
+    {46, OPUS_BMM_BPRESHUF_NS_ENTRY(opus_bmm_a8w8_mxscale_bpreshuffle_tile_ns128_gn128_sf_bk256_gfx1250)},
   };
 #undef OPUS_BMM_BPRESHUF_ENTRY
 #undef OPUS_BMM_BPRESHUF_NS_ENTRY

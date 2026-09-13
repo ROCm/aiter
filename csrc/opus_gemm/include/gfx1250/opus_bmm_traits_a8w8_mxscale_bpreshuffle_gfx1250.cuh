@@ -1891,6 +1891,34 @@ using opus_bmm_a8w8_mxscale_bpreshuffle_tile_ns_dec_n64_gn128_sf_gfx1250 =
         /*SF_A_LDS*/true, /*SF_B_LDS*/true,
         /*SF_A_TDM_KG*/0, /*SF_A_TDM_PAD*/16, /*TILE_M*/1, /*NO_SPEC*/true>;
 
+// kid46: kid35's tile on FOUR waves instead of eight, for LDS-read reuse.
+//
+// ATT on kid35 prefill counted 3072 ds_load_b128 against FlyDSL's 2048 for the
+// SAME 2048 WMMAs -- 50% more LDS traffic -- and its s_wait_dscnt is 29.9
+// cycles a hit against FlyDSL's 7.2. Arithmetic explains it exactly. A wave
+// loads kExpM A-fragments and kExpN B-fragments and issues kExpM*kExpN WMMAs,
+// so reads per WMMA are 4*(kExpM+kExpN)/(kExpM*kExpN). At 8 waves on a 2x4
+// consumer grid kid35 gets kExpM=8, kExpN=4 -> 1.50, which is the measured
+// number. Four waves on 2x2 gives kExpM=kExpN=8 -> exactly 1.00.
+//
+// The trade is register pressure: kExpM*kExpN*kFragC = 8*8*8 = 512 VGPRs of
+// accumulator, against 256 today. The budget at 4 waves is 1024 (1024 /
+// ceil(kNumWaves/4)), so it fits on paper and the ISA has to confirm no
+// scratch. LDS is unchanged -- slots * tile bytes does not depend on wave
+// count -- so this stays inside kid35's 200 KB.
+//
+// Against it: half the waves per workgroup to hide latency with. That is the
+// whole question, and it is why this is measured rather than assumed.
+template <typename DataC>
+using opus_bmm_a8w8_mxscale_bpreshuffle_tile_ns128_gn128_sf_bk256_gfx1250 =
+    opus_bmm_a8w8_mxscale_bpreshuffle_traits_gfx1250<
+        /*BLOCK_SIZE*/128, /*B_M*/256, /*B_N*/256, /*B_K*/256,
+        /*LAYOUT*/opus_gfx1250_bmm::kLayoutTileN,
+        /*D_A*/opus::fp8_t, /*D_B*/opus::fp8_t, /*D_C*/DataC, /*D_ACC*/float,
+        /*GROUP_K*/128, /*NUM_SLOTS*/2, /*WG_PER_CU*/1, /*GROUP_N*/128,
+        /*SF_A_LDS*/true, /*SF_B_LDS*/true,
+        /*SF_A_TDM_KG*/0, /*SF_A_TDM_PAD*/16, /*TILE_M*/2, /*NO_SPEC*/true>;
+
 // -- smem -> register read layouts -----------------------------------------
 // Device-only in effect, but compiled on the host pass too so vtype_c matches.
 #if defined(__gfx1250__) || !defined(__HIP_DEVICE_COMPILE__)
