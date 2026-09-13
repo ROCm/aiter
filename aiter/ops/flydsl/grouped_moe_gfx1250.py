@@ -567,6 +567,7 @@ def _grouped_a8w4_tdm_moe(
     _ep_nvr = None
     _ep_nvt = None
     _fuse_ep_route_quant = False
+    ep_rowmap = None
     if _compact:
         _masked_m = stage2_scatter.compact_masked_m
         topids_to_rows = None
@@ -628,6 +629,14 @@ def _grouped_a8w4_tdm_moe(
             # Route kernel writes every entry (kept -> weight_dtype cast,
             # dropped -> 0), so the buffer is fully kernel-written.
             _gather_w_buf = torch.empty((token_num, topk), dtype=dtype, device=device)
+            # Pre-allocate ep_rowmap so the route kernel can fuse its sentinel fill
+            # (fire-and-forget stores interleaved with route work, no extra barrier).
+            _ep_rowmap_for_route = None
+            if enable_ep_scatter:
+                ep_rowmap = torch.empty(
+                    (int(contiguous_m) + 1, 2), dtype=torch.int32, device=device
+                )
+                _ep_rowmap_for_route = ep_rowmap
             _masked_m, topids_to_rows = flydsl_moe_topids_to_rows(
                 topk_ids,
                 E,
@@ -639,22 +648,23 @@ def _grouped_a8w4_tdm_moe(
                 num_local_tokens=num_local_tokens,
                 num_valid_routes=_ep_nvr,
                 contiguous_expert_mask=_direct_ep_mask,
+                ep_rowmap=_ep_rowmap_for_route,
             )
     else:
         _fuse_ep_route_quant = False
         _masked_m, topids_to_rows = flydsl_moe_topids_to_rows(topk_ids, E, max_m)
-    # EP gemm2-fused scatter: build the ep_rowmap inside the remap pass, which
-    # already knows each route's final contiguous row, so the gemm2 TDM epilogue
-    # can P2P each weighted row into peers' comb_inp.
+    # EP gemm2-fused scatter: ep_rowmap is allocated (and sentinel-filled by the
+    # route kernel) above when the route path runs; compact / fused-route-quant
+    # still allocate here. Remap then scatters kept rows into the same buffer.
     ep_scatter_params = None
-    ep_rowmap = None
     if enable_ep_scatter:
         if _compact:
             ep_rowmap = stage2_scatter.compact_ep_rowmap
-        else:
+        elif ep_rowmap is None:
             ep_rowmap = torch.empty(
                 (int(contiguous_m) + 1, 2), dtype=torch.int32, device=device
             )
+        if not _compact:
             ep_scatter_params = {
                 "gather_w": _gather_w_buf,
                 "tis": stage2_scatter.source_token_map,
@@ -1628,9 +1638,8 @@ def contiguous_psum_remap(
         )
     if ep_scatter_params is not None:
         launch = _get_compiled_contiguous_psum_remap_ep()
-        # Init ep_rowmap to (-1, 0) with one int64 fill (low i32 = -1, high = 0);
-        # stream-ordered before the launch, whose scatter overwrites the kept rows.
-        ep_scatter_params["ep_rowmap"].view(torch.int64).fill_(0xFFFFFFFF)
+        # ep_rowmap sentinel fill was done by the route kernel (g2l_lds),
+        # interleaved with route work for free.  No host .fill_() needed.
         launch(
             ptr_arg(masked_m_i32),
             ptr_arg(topids_flat),
