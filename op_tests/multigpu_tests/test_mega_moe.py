@@ -999,15 +999,29 @@ elif _GFX == "gfx1250":
         return w1, w2, sw1, sw2
 
 
-    def make_routings(n_layers, ct, E, topk, dev, seed):
-        """Per-layer random routing, RETAINED so device + reference replay the same.
-        topk_ids are distinct experts per token (top-k over a random score); weights
-        are random and renormalized. Returns list[(ids[ct,topk] i32, wts[ct,topk] f32)]."""
+    def make_routings(n_layers, ct, E, topk, dev, seed, expert_balance=False):
+        """Build retained per-layer routing for device and reference replay.
+
+        ``expert_balance`` mirrors ``AITER_MOE_EXPERT_BALANCE`` in
+        ``test_moe_2stage.py``: route slots walk the experts round-robin. Otherwise,
+        top-k is selected from random scores. Weights stay random and normalized in
+        both modes.
+        """
         routings = []
+        balanced_ids = None
+        if expert_balance:
+            balanced_ids = (
+                torch.arange(ct * topk, device=dev, dtype=torch.int64) % E
+            ).reshape(ct, topk)
         for layer_idx in range(n_layers):
             gen = torch.Generator(device=dev).manual_seed(seed + layer_idx)
-            score = torch.rand(ct, E, generator=gen, device=dev, dtype=torch.float32)
-            _, ids = score.topk(topk, dim=-1)  # distinct experts per token
+            if expert_balance:
+                ids = balanced_ids
+            else:
+                score = torch.rand(
+                    ct, E, generator=gen, device=dev, dtype=torch.float32
+                )
+                _, ids = score.topk(topk, dim=-1)  # distinct experts per token
             wts = torch.rand(ct, topk, generator=gen, device=dev, dtype=torch.float32)
             wts = wts / wts.sum(dim=-1, keepdim=True).clamp_min(1e-9)
             routings.append((ids.to(dtypes.i32), wts))
@@ -1700,6 +1714,9 @@ elif _GFX == "gfx1250":
 
         E, hdim, idim, topk = args.expert, args.hidden, args.inter, args.topk
         ct, n_layers = args.token_per_rank, args.layers
+        expert_balance = (
+            os.environ.get("AITER_MOE_EXPERT_BALANCE", "False").lower() == "true"
+        )
         assert (
             E % dist_ctx.world == 0
         ), f"E={E} must be divisible by world_size={dist_ctx.world}"
@@ -1713,7 +1730,8 @@ elif _GFX == "gfx1250":
                 f"combine={args.combine} dispatch_wire={spec['dispatch_wire']} "
                 f"force_a8w4={os.environ['AITER_FORCE_A8W4']} "
                 f"gate={spec['gate_mode'].name} shared_E={args.shared_experts} "
-                f"data_init={data_dist} seed={args.seed} gfx={get_gfx()}",
+                f"expert_balance={expert_balance} data_init={data_dist} "
+                f"seed={args.seed} gfx={get_gfx()}",
                 flush=True,
             )
             if list(args.scale_init) != [_DEFAULT_SCALE_INIT]:
@@ -1747,7 +1765,13 @@ elif _GFX == "gfx1250":
             device=dev,
         )
         routings = make_routings(
-            n_layers, ct, E, topk, dev, seed=4242 + 100 * dist_ctx.rank + args.seed
+            n_layers,
+            ct,
+            E,
+            topk,
+            dev,
+            seed=4242 + 100 * dist_ctx.rank + args.seed,
+            expert_balance=expert_balance,
         )
 
         # ---- device path (isolated): setup -> capture 61 layers in one graph -> bench,
