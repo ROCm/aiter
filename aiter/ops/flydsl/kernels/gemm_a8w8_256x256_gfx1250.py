@@ -65,6 +65,7 @@ def launch_gemm_a8w8_256x256(
     fused_splitk: Constexpr[bool] = False,
     bounded_m: Constexpr[bool] = True,
     cluster_splitk: Constexpr[bool] = False,
+    reuse_splitk_lds: Constexpr[bool] = False,
 ):
     """N must be a multiple of ``tile_n * cluster_n``; M is unrestricted (a
     multiple of 2 when ``a_preshuffle``); K must be divisible by 128 and at
@@ -92,6 +93,9 @@ def launch_gemm_a8w8_256x256(
     assert not cluster_splitk or (
         fused_splitk and split_k > 1 and block_size == 128
     ), "cluster reduction requires fused split-K block128"
+    assert (
+        not reuse_splitk_lds or cluster_splitk
+    ), "LDS reuse requires clustered split-K"
     cluster_k = split_k if cluster_splitk else 1
     assert (
         cluster_m * cluster_n * cluster_k <= 16
@@ -168,6 +172,7 @@ def launch_gemm_a8w8_256x256(
             else ("_rsk" if fused_splitk and split_k > 1 else "")
         )
         + ("b" if fused_splitk and split_k > 1 and bounded_m else "")
+        + ("_lds" if reuse_splitk_lds else "")
     )
 
     def _run_tile(
@@ -989,6 +994,12 @@ def launch_gemm_a8w8_256x256(
         pipeline_fence(outstanding=0, use_cluster=True)
         for wm in range_constexpr(wmma_m_rep):
             row_rel = wmb + wm * 16 + lane16
+            if const_expr(reuse_splitk_lds):
+                # Put the locally reduced stripe last. All peer rows then
+                # form one contiguous TDM store, with no packing copy in LDS.
+                row_rel = (row_rel + tile_m - (split_idx + 1) * (tile_m // split_k)) & (
+                    tile_m - 1
+                )
             for wn in range_constexpr(wmma_n_rep):
                 col_rel = wnb + wn * 16 + kgrp * 8
                 h = accs[wm * wmma_n_rep + wn].to(oc)
@@ -1004,34 +1015,35 @@ def launch_gemm_a8w8_256x256(
             )
         elif const_expr(split_k > 1):
             c_off_rt = c_off_rt + fx.Int64(split_idx) * fx.Int64(i32_m) * ldc64
-        gC_base = fx.recast_iter(
-            fx.PointerType.get(oc.ir_type, arg_c.address_space),
-            arg_c,
-        )
-        gtC = _gv(
-            gC_base,
-            c_off_rt,
-            (tile_m, C_LDS_ROW),
-            (C_LDS_ROW, 1),
-        )
-        atomC = fx.rocdl.make_tdm_atom(
-            gtC,
-            [mn_oob, tile_n],
-            strides=[fx.Int64(tile_n) if _reduce_c else ldc64, None],
-            num_warps=num_waves,
-            cache_modifier=CPOL_STORE_DEVICE if _reduce_c else 0,
-        )
-        fx.copy(
-            atomC,
-            _view(
-                fx.recast_iter(oc, base_ptr),
+        if const_expr(not reuse_splitk_lds):
+            gC_base = fx.recast_iter(
+                fx.PointerType.get(oc.ir_type, arg_c.address_space),
+                arg_c,
+            )
+            gtC = _gv(
+                gC_base,
+                c_off_rt,
                 (tile_m, C_LDS_ROW),
                 (C_LDS_ROW, 1),
-            ),
-            gtC,
-        )
-        if const_expr(persistent_n_tiles == 1):
-            tdm_ops.tensor_wait(0)
+            )
+            atomC = fx.rocdl.make_tdm_atom(
+                gtC,
+                [mn_oob, tile_n],
+                strides=[fx.Int64(tile_n) if _reduce_c else ldc64, None],
+                num_warps=num_waves,
+                cache_modifier=CPOL_STORE_DEVICE if _reduce_c else 0,
+            )
+            fx.copy(
+                atomC,
+                _view(
+                    fx.recast_iter(oc, base_ptr),
+                    (tile_m, C_LDS_ROW),
+                    (C_LDS_ROW, 1),
+                ),
+                gtC,
+            )
+            if const_expr(persistent_n_tiles == 1):
+                tdm_ops.tensor_wait(0)
         if const_expr(_reduce_c):
             if const_expr(cluster_splitk):
                 emit_cluster_splitk_reduce_epilogue(
@@ -1050,6 +1062,7 @@ def launch_gemm_a8w8_256x256(
                     split_idx=split_idx,
                     mn_oob=mn_oob,
                     flat_tile=_flat_tile,
+                    reuse_lds=reuse_splitk_lds,
                 )
             else:
                 workgroup_barrier(use_cluster=False)

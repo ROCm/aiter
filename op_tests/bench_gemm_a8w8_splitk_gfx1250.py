@@ -6,8 +6,9 @@
 Example:
     ENABLE_CK=0 python3 op_tests/bench_gemm_a8w8_splitk_gfx1250.py \
         --kernel flydsl_mxfp8_128_bpreshuffle_compute_wmma_t256x256x128_mw2_nw2_nb2_sk4_cm2_cn4 \
-        --include-eightwave --include-cluster --graph-iters 1000 \
-        --replays 10 --repeats 10
+        --include-eightwave --include-cluster --include-cluster-lds \
+        --parity-mode cluster_lds --max-regression-pct 0 \
+        --graph-iters 1000 --replays 10 --repeats 10
 
 The benchmark fails before importing the GPU runtime if a driver query is stuck
 or another KFD process exists. It never clears processes or changes GPU clocks.
@@ -145,6 +146,19 @@ def main():
     parser.add_argument("--warmup-replays", type=_positive_int, default=10)
     parser.add_argument("--include-eightwave", action="store_true")
     parser.add_argument("--include-cluster", action="store_true")
+    parser.add_argument("--include-cluster-lds", action="store_true")
+    parser.add_argument(
+        "--parity-mode",
+        choices=(
+            "last_arrival",
+            "direct",
+            "eightwave",
+            "cluster",
+            "cluster_lds",
+            "cluster_lds_eightwave",
+        ),
+        help="candidate to gate against the original reference (default: selected CSV mode)",
+    )
     parser.add_argument("--apre", action="store_true")
     parser.add_argument("--fp16", action="store_true")
     args = parser.parse_args()
@@ -200,20 +214,40 @@ def main():
         if sk != reference_cfg["split_k"]:
             cases.insert(1, ("selected_separate", dict(cfg)))
             separate_modes.add("selected_separate")
-        if sk == 1 and (args.include_eightwave or args.include_cluster):
+        if sk == 1 and (
+            args.include_eightwave or args.include_cluster or args.include_cluster_lds
+        ):
             raise ValueError("Reduction candidates require split-K > 1")
         if args.include_eightwave:
             if (tm, tn, cfg["num_buffers"]) not in ((256, 256, 2), (256, 256, 4)):
                 raise ValueError("Eight-wave candidates require 256x256, nb2 or nb4")
             cases.append(("eightwave", dict(cfg, m_warp=4, n_warp=2)))
-        if args.include_cluster:
+        cluster_modes, lds_modes = set(), set()
+        if args.include_cluster or args.include_cluster_lds:
             cm = cfg["cluster_m"]
             cn = min(cfg["cluster_n"], 16 // (cm * sk))
             while cn > 0 and n % (tn * cn):
                 cn -= 1
             if cn < 1 or cm * cn < 2:
                 raise ValueError("K splits cannot fit in a supported 16-block cluster")
-            cases.append(("cluster", dict(cfg, cluster_n=cn)))
+            if args.include_cluster:
+                cases.append(("cluster", dict(cfg, cluster_n=cn)))
+                cluster_modes.add("cluster")
+            if args.include_cluster_lds:
+                cases.append(("cluster_lds", dict(cfg, cluster_n=cn)))
+                lds_modes.add("cluster_lds")
+                if args.include_eightwave:
+                    cases.append(
+                        (
+                            "cluster_lds_eightwave",
+                            dict(cfg, cluster_n=cn, m_warp=4, n_warp=2),
+                        )
+                    )
+                    lds_modes.add("cluster_lds_eightwave")
+                cluster_modes.update(lds_modes)
+        parity_mode = args.parity_mode or selected_mode
+        if parity_mode not in dict(cases):
+            raise ValueError(f"Parity mode {parity_mode} is not enabled")
 
         scratch_bytes = 0
         for _, case in cases:
@@ -310,7 +344,8 @@ def main():
                     1,
                     fused,
                     bool(m % tm),
-                    mode == "cluster",
+                    mode in cluster_modes,
+                    mode in lds_modes,
                 )
                 gemm = flyc.compile(launch_gemm_a8w8_256x256, *launch_args)
                 reduce_args, reduce_fn = (), None
@@ -404,6 +439,8 @@ def main():
             "repeats": args.repeats,
             "calls_per_mode": args.graph_iters * args.replays * args.repeats,
             "cases": dict(cases),
+            "cluster_modes": sorted(cluster_modes),
+            "lds_reuse_modes": sorted(lds_modes),
             "median_us": {mode: statistics.median(v) for mode, v in samples.items()},
             "samples_us": samples,
             "correctness": "bitwise against matching split-K, including changed-input replay",
@@ -411,7 +448,7 @@ def main():
         }
         if args.max_regression_pct is not None:
             report["parity"] = _parity_result(
-                samples, reference_mode, selected_mode, args.max_regression_pct
+                samples, reference_mode, parity_mode, args.max_regression_pct
             )
         encoded = json.dumps(report, indent=2)
         if args.json_output is not None:

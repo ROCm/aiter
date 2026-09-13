@@ -60,7 +60,9 @@ def _inputs(m, n, k, a_preshuffle=False, strided_scale=False):
     return a, shuffle_weight(b, layout=(16, 16)), sa, sb
 
 
-def _run(inputs, out, name, cluster_reduce=False):
+def _run(inputs, out, name, cluster_reduce=False, reuse_lds=False):
+    assert not reuse_lds or cluster_reduce
+
     def run():
         return backend.run_gemm_a8w8_mxfp8_128_bpreshuffle_gfx1250(
             *inputs, out, name, a_is_preshuffled="_apre" in name
@@ -73,7 +75,9 @@ def _run(inputs, out, name, cluster_reduce=False):
     with mock.patch.object(
         backend,
         "_launch_gemm_a8w8_compute_bound",
-        side_effect=lambda *args: launch(*args, cluster_splitk=True),
+        side_effect=lambda *args: launch(
+            *args, cluster_splitk=True, reuse_splitk_lds=reuse_lds
+        ),
     ):
         return run()
 
@@ -109,17 +113,34 @@ def test_tuned_splitk(m, n, k, name):
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("a_preshuffle", [False, True])
 @pytest.mark.parametrize(
-    "tile_m,m_warp,num_buffers,cluster_reduce",
-    [(128, 2, 4, False), (256, 4, 2, False), (128, 2, 4, True), (256, 2, 2, True)],
+    "tile_m,tile_n,m_warp,num_buffers,cluster_reduce,reuse_lds",
+    [
+        (128, 128, 2, 4, False, False),
+        (256, 256, 4, 2, False, False),
+        (128, 128, 2, 4, True, False),
+        (256, 256, 2, 2, True, False),
+        (128, 128, 2, 4, True, True),
+        (128, 256, 2, 3, True, True),
+        (128, 256, 2, 4, True, True),
+        (256, 256, 2, 2, True, True),
+        (256, 256, 4, 2, True, True),
+    ],
 )
 def test_splitk_tail_and_graph(
-    split_k, dtype, a_preshuffle, tile_m, m_warp, num_buffers, cluster_reduce
+    split_k,
+    dtype,
+    a_preshuffle,
+    tile_m,
+    tile_n,
+    m_warp,
+    num_buffers,
+    cluster_reduce,
+    reuse_lds,
 ):
     """Check partial M tiles, padded output, strided scales, and graph replay."""
     pytest.importorskip("flydsl")
     torch.manual_seed(43)
     m, n, k = tile_m + 1, 512, 4096
-    tile_n = 128 if tile_m == 128 else 256
     name = (
         f"flydsl_mxfp8_128_bpreshuffle_compute_wmma_t{tile_m}x{tile_n}x128_"
         f"mw{m_warp}_nw2_nb{num_buffers}_sk{split_k}_cm1_cn2"
@@ -135,11 +156,11 @@ def test_splitk_tail_and_graph(
         with torch.cuda.stream(stream):
             storage = torch.full((m, n + 8), 17.0, dtype=dtype, device="cuda")
             out = storage[:, :n]
-            _run(inputs, out, name, cluster_reduce)
+            _run(inputs, out, name, cluster_reduce, reuse_lds)
             graph = torch.cuda.CUDAGraph()
             with torch.cuda.graph(graph, stream=stream):
-                _run(inputs, out, name, cluster_reduce)
-                _run(inputs, out, name, cluster_reduce)
+                _run(inputs, out, name, cluster_reduce, reuse_lds)
+                _run(inputs, out, name, cluster_reduce, reuse_lds)
             outputs.append(storage)
             graphs.append(graph)
     for _ in range(5):
@@ -183,7 +204,11 @@ def test_m512_eightwave_matches_fourwave(num_buffers, dtype, a_preshuffle):
 
 @pytest.mark.parametrize("num_buffers", [2, 4])
 @pytest.mark.parametrize("a_preshuffle", [False, True])
-def test_m512_cluster_matches_original(num_buffers, a_preshuffle):
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("m_warp,reuse_lds", [(2, False), (2, True), (4, True)])
+def test_m512_cluster_matches_original(
+    num_buffers, a_preshuffle, dtype, m_warp, reuse_lds
+):
     """Compare clustered K splits with the original M/N cluster layout."""
     pytest.importorskip("flydsl")
     torch.manual_seed(45)
@@ -193,18 +218,25 @@ def test_m512_cluster_matches_original(num_buffers, a_preshuffle):
         "flydsl_mxfp8_128_bpreshuffle_compute_wmma_t256x256x128_"
         f"mw2_nw2_nb{num_buffers}_sk4_cm2_cn4" + ("_apre" if a_preshuffle else "")
     )
-    expected = torch.empty((m, n), dtype=torch.bfloat16, device="cuda")
+    expected = torch.empty((m, n), dtype=dtype, device="cuda")
     actual = torch.full_like(expected, float("nan"))
     _reference(inputs, expected, name)
     with mock.patch.object(
         backend, "_compile_splitk_reduce", side_effect=AssertionError("extra kernel")
     ):
-        _run(inputs, actual, name.replace("_cn4", "_cn2"), cluster_reduce=True)
+        _run(
+            inputs,
+            actual,
+            name.replace("_cn4", "_cn2").replace("_mw2_", f"_mw{m_warp}_"),
+            cluster_reduce=True,
+            reuse_lds=reuse_lds,
+        )
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
 
 @pytest.mark.parametrize("a_preshuffle", [False, True])
-def test_cluster_splitk_large_m_grid(a_preshuffle):
+@pytest.mark.parametrize("reuse_lds", [False, True])
+def test_cluster_splitk_large_m_grid(a_preshuffle, reuse_lds):
     """Keep K splits in the same cluster when M spans more than 32 tiles."""
     pytest.importorskip("flydsl")
     torch.manual_seed(46)
@@ -220,5 +252,5 @@ def test_cluster_splitk_large_m_grid(a_preshuffle):
     with mock.patch.object(
         backend, "_compile_splitk_reduce", side_effect=AssertionError("extra kernel")
     ):
-        _run(inputs, actual, name, cluster_reduce=True)
+        _run(inputs, actual, name, cluster_reduce=True, reuse_lds=reuse_lds)
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
