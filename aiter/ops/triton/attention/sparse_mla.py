@@ -57,7 +57,7 @@ def _check_out(out, q, kv_lora_rank):
 
 
 def _infer_cache_format(kv, d_qk, kv_lora_rank, qk_rope_head_dim, kv_scale):
-    """-> (fmt, cache, alt_ptr, scl_ptr, block_size, fp8_fnuz). Pointer roles
+    """-> (fmt, cache, alt_ptr, scl_ptr, block_size). Pointer roles
     follow the kernel's Seg contract (see its docstring)."""
     if kv.ndim == 4:  # [slots, 1, 1, R], the asm mla_decode_fwd view
         assert kv.shape[1] == 1 and kv.shape[2] == 1
@@ -71,15 +71,18 @@ def _infer_cache_format(kv, d_qk, kv_lora_rank, qk_rope_head_dim, kv_scale):
     fp8_dtypes = (torch.uint8, torch.float8_e4m3fn, torch.float8_e4m3fnuz)
     if kv.ndim == 2 and kv.shape[1] == d_qk:
         if kv.dtype == torch.bfloat16:
-            return "bf16", kv, kv, None, 1, False
+            return "bf16", kv, kv, None, 1
         assert kv.dtype in fp8_dtypes, f"unsupported flat cache dtype {kv.dtype}"
         assert (
             kv_scale is not None
         ), "flat fp8 cache needs the per-tensor kv_scale (layer._k_scale)"
         assert kv_scale.dtype == torch.float32
         u8 = kv.view(torch.uint8)
-        fnuz = kv.dtype == torch.float8_e4m3fnuz
-        return "fp8_scalar", u8, u8, kv_scale.reshape(1), 1, fnuz
+        # gfx950 reads OCP e4m3 natively; fnuz is the gfx942 encoding.
+        assert (
+            kv.dtype != torch.float8_e4m3fnuz
+        ), "gfx950 reads OCP e4m3; float8_e4m3fnuz is the gfx942 encoding"
+        return "fp8_scalar", u8, u8, kv_scale.reshape(1), 1
     if (
         kv.ndim == 3
         and kv.element_size() == 1
@@ -99,7 +102,6 @@ def _infer_cache_format(kv, d_qk, kv_lora_rank, qk_rope_head_dim, kv_scale):
             u8.view(torch.bfloat16),
             u8.view(torch.float32),
             u8.shape[1],
-            False,
         )
     raise ValueError(f"unrecognized sparse-MLA kv cache: {tuple(kv.shape)} {kv.dtype}")
 
@@ -158,7 +160,7 @@ def _async_launch_config(
 _E4M3_MAX = 448.0
 
 
-def _resolve_dot_precision(dot_precision: str, fmt: str, fp8_fnuz: bool) -> bool:
+def _resolve_dot_precision(dot_precision: str, fmt: str) -> bool:
     if dot_precision not in ("bf16", "fp8"):
         raise ValueError(
             f"dot_precision must be 'bf16' or 'fp8', got {dot_precision!r}"
@@ -172,8 +174,6 @@ def _resolve_dot_precision(dot_precision: str, fmt: str, fp8_fnuz: bool) -> bool
         )
     if fmt == "bf16":
         raise ValueError("dot_precision='fp8' needs an fp8 cache.")
-    if fp8_fnuz:
-        raise ValueError("dot_precision='fp8' is OCP e4m3 only.")
     return True
 
 
@@ -272,10 +272,10 @@ def sparse_mla_fwd(
         f"nnz={kv_indices.shape[0]}"
     )
 
-    fmt, cache, alt, scl, block_size, fp8_fnuz = _infer_cache_format(
+    fmt, cache, alt, scl, block_size = _infer_cache_format(
         kv_buffer, d_qk, kv_lora_rank, qk_rope_head_dim, kv_scale
     )
-    fp8_dots = _resolve_dot_precision(dot_precision, fmt, fp8_fnuz)
+    fp8_dots = _resolve_dot_precision(dot_precision, fmt)
     if fp8_dots and not q_is_fp8:
         # Quantize the way production does, one scaled_fp8_quant over
         # [C, H*d_qk]. A caller-supplied q_scale is the layer's calibrated
@@ -440,12 +440,11 @@ def sparse_mla_fwd(
         Q_CACHE=q_cache,
         MAIN_SPLITS=num_splits,
         ADAPTIVE_SPLITS=num_splits > 1,
-        ASM_DEQ=False,
+        DEQ="none",
         MAIN_USE_BUFFER_LOAD=use_buffer_load,
         EXTRA_USE_BUFFER_LOAD=use_buffer_load,
         IDX_BUFFER_LOAD=idx_use_buffer_load,
         HAS_INVALID=has_invalid,
-        FP8_FNUZ=fp8_fnuz,
         FP8_MFMA=fp8_dots,
         ASYNC_LDS=async_lds_on,
         ROPE_VEC=_ASYNC_ROPE_VEC,

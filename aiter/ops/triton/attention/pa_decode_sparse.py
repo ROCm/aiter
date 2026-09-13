@@ -13,6 +13,9 @@ import torch
 import triton
 
 from aiter.ops.triton._gluon_kernels.gfx950.attention.pa_decode_sparse import (
+    _HAS_SCALED_UPCAST,
+)
+from aiter.ops.triton._gluon_kernels.gfx950.attention.pa_decode_sparse import (
     _pa_decode_sparse as _pa_decode_sparse_gfx950,
 )
 from aiter.ops.triton._gluon_kernels.gfx950.attention.pa_decode_sparse import (
@@ -34,6 +37,7 @@ from aiter.ops.triton.utils._triton import arch_info
 from aiter.ops.triton.utils.common_utils import max_addressable_bytes
 from aiter.ops.triton.utils.device_info import get_num_sms
 from aiter.ops.triton.utils.logger import AiterTritonLogger
+from aiter.ops.triton.utils.types import get_fp8_e4m3_dtype
 
 DEVICE_ARCH = arch_info.get_arch()
 
@@ -41,7 +45,7 @@ _LOGGER = AiterTritonLogger()
 
 
 _FP8_GROUP_SIZE = 64
-_FP8_DTYPE = torch.float8_e4m3fnuz
+_FP8_DTYPE = get_fp8_e4m3_dtype()
 
 
 def _check_out(out, q, dtype):
@@ -133,21 +137,15 @@ def pa_decode_sparse(
     # kv_splits and skip_reduce are honored here; block_h and fp16 q fall through to
     # the triton path below (the gluon kernel is bf16-only: bf16 LDS + bf16 MFMA).
     if DEVICE_ARCH == "gfx950" and block_h is None and q.dtype == torch.bfloat16:
+        # gfx950 (CDNA4) reads OCP e4m3 natively. fnuz is the gfx942 encoding,
+        # so it never appears here and falls through to the triton path below.
         if unified_kv.ndim == 3:
-            _ok = kv_scales is None and (
-                unified_kv.dtype == torch.uint8 or unified_kv.dtype == q.dtype
-            )
+            # packed / bf16 block cache: it carries its own scales, if any
+            _ok = kv_scales is None and unified_kv.dtype in (torch.uint8, q.dtype)
+        elif kv_scales is not None:
+            _ok = unified_kv.dtype in (torch.float8_e4m3fn, torch.uint8)
         else:
-            _fp8 = unified_kv.dtype in (
-                torch.float8_e4m3fn,
-                torch.float8_e4m3fnuz,
-                torch.uint8,
-            )
-            _ok = (kv_scales is not None and _fp8) or (
-                kv_scales is None and unified_kv.dtype == q.dtype
-            )
-        # fnuz vs OCP e4m3 (2D fp8 only) selects the in-kernel dequant bias.
-        fp8_fnuz = unified_kv.ndim == 2 and unified_kv.dtype == torch.float8_e4m3fnuz
+            _ok = unified_kv.dtype == q.dtype
         if _ok:
             cache = (
                 unified_kv.view(torch.uint8)
@@ -168,7 +166,6 @@ def pa_decode_sparse(
                 kv_splits=kv_splits,
                 skip_reduce=skip_reduce,
                 has_invalid=bool(has_invalid),
-                fp8_fnuz=fp8_fnuz,
                 out=out,
             )
 
@@ -465,7 +462,6 @@ def _pa_decode_sparse_gfx950_gluon(
     skip_reduce=False,
     out=None,
     has_invalid=False,
-    fp8_fnuz=False,
 ):
     """Merged gfx950 gluon DSv4 sparse-MLA decode driver. Format from cache.ndim:
     3D [nb, block, 584] -> packed fp8_dsv4_mla (uint8: 448 NoPE fp8 e4m3 OCP +
@@ -651,8 +647,14 @@ def _pa_decode_sparse_gfx950_gluon(
     # than one split to give back.
     adaptive_splits = num_splits > 1
 
-    # Fuse the fp8 x E8M0 dequant into v_cvt_scalef32_pk_bf16_fp8 via inline asm
-    asm_deq = one_wg_per_cu and not FLAT_POOL and not fp8_fnuz and main_is_fp8
+    # Fuse the dsv4 dequant into v_cvt_scalef32_pk_bf16_fp8. The asm fallback
+    # gathers an extra int16 tile, so it only pays off at one workgroup per CU.
+    if _HAS_SCALED_UPCAST:
+        deq = "upcast"
+    elif one_wg_per_cu:
+        deq = "asm"
+    else:
+        deq = "none"
 
     # Grid dim 0 varies fastest and XCD assignment is round-robin over the linear
     # workgroup id, so the axis order decides what shares an XCD's L2.
@@ -720,12 +722,11 @@ def _pa_decode_sparse_gfx950_gluon(
         UNI_TILE=True,
         MAIN_SPLITS=main_splits,
         ADAPTIVE_SPLITS=adaptive_splits,
-        ASM_DEQ=asm_deq,
+        DEQ=deq,
         MAIN_USE_BUFFER_LOAD=main_use_buffer_load,
         EXTRA_USE_BUFFER_LOAD=extra_use_buffer_load,
         IDX_BUFFER_LOAD=idx_use_buffer_load,
         HAS_INVALID=has_invalid,
-        FP8_FNUZ=fp8_fnuz,
         num_warps=num_warps,
         waves_per_eu=waves_per_eu,
     )
