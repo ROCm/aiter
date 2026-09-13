@@ -173,7 +173,14 @@ template<int BLOCK_SIZE_,
          // at b=8 m=2048 that shape uses 6.7% of peak bandwidth, so a wave that
          // issues no WMMA is one wave's worth of matrix pipe standing idle.
          // Read by the _nospec pipeline; the specialized pipeline ignores it.
-         bool NO_SPEC_ = false>
+         bool NO_SPEC_ = false,
+         // K-group capacity the A scale panel is ALLOCATED for. Purely an
+         // allocation bound -- the layout uses the runtime K/GROUP_K -- so the
+         // only cost of a smaller value is that the launcher rejects a larger K,
+         // which it already checks (kg_cap). The default 128 reserves for
+         // K=16384; at K=4096 that is a 4x over-allocation, and on a slots=3
+         // tile it is the difference between fitting in 320 KB and not.
+         int SF_A_PANEL_KG_ = 128>
 struct opus_bmm_a8w8_mxscale_bpreshuffle_traits_gfx1250 {
     static constexpr int BLOCK_SIZE = BLOCK_SIZE_;
     static constexpr int B_M = B_M_;
@@ -742,7 +749,7 @@ struct opus_bmm_a8w8_mxscale_bpreshuffle_traits_gfx1250 {
     // kSfAPanelKG * GROUP_K = 16384 at GROUP_K=128, enforced in the launcher.
     // Unlike the TDM version this is ONLY an allocation bound -- the layout uses
     // the runtime K/GROUP_K -- so a smaller K now wastes LDS and nothing else.
-    static constexpr int kSfAPanelKG = 128;
+    static constexpr int kSfAPanelKG = SF_A_PANEL_KG_;
 
     // TDM FILL FOR THE A PANEL, as a measurable alternative to the cooperative
     // one rather than a replacement. 0 is the cooperative fill; a positive value
@@ -1918,6 +1925,46 @@ using opus_bmm_a8w8_mxscale_bpreshuffle_tile_ns128_gn128_sf_bk256_gfx1250 =
         /*GROUP_K*/128, /*NUM_SLOTS*/2, /*WG_PER_CU*/1, /*GROUP_N*/128,
         /*SF_A_LDS*/true, /*SF_B_LDS*/true,
         /*SF_A_TDM_KG*/0, /*SF_A_TDM_PAD*/16, /*TILE_M*/2, /*NO_SPEC*/true>;
+
+// kid47: depth instead of width. Four waves, slots=THREE.
+//
+// ATT settled what the ring wait actually is. kid35 waits 490 cycles a
+// s_wait_tensorcnt; kid46 moves TWICE the bytes per wave (4 waves over the same
+// tile) and waits 527 -- essentially flat. Doubling the transfer does not
+// lengthen the wait, so it is LATENCY, not bandwidth, and the lever is pipeline
+// depth: at slots=2 a wave has exactly one consume_slot of cover for a full
+// memory round trip.
+//
+// slots=3 does not fit at 256x256 (408 KB against the 320 KB budget), so
+// something has to shrink. B_N=192 was the tempting choice -- it keeps both
+// dims large and improves reuse to 1.33 -- but it is dead on a compile-time
+// constant: a 2x2 grid at B_N=192 gives kExpN=6, a 96-column wave span, and
+// 128 % 96 != 0, so kSfBUniformOverN goes false and kSfBLoadsPerK jumps 1 -> 6.
+// Six times the B-scale LDS reads, to save LDS reads. No.
+//
+// B_N=128 keeps the span at 64 columns and uniformity with it. Reuse stays at
+// kid35's 1.50 (kExpM=8, kExpN=4) and accumulators stay at 256 VGPRs -- half
+// kid46's 512 -- so this buys depth without kid46's register pressure. The cost
+// is a half-width tile, which doubles how often A is re-read across N tiles;
+// that is the trade this kid prices.
+//
+// LDS is what made this hard, and the fix was not the tile. At the default
+// SF_A_PANEL_KG=128 the A scale panel reserves 256*144 = 36 KB for a K of
+// 16384; at K=4096 it needs 12 KB. That 24 KB of over-allocation is exactly
+// what pushed 256x128/slots=3 over the 320 KB budget (336 KB). SF_A_PANEL_KG=32
+// caps this kid at K<=4096 -- enforced by the launcher's existing kg_cap check,
+// a hard error with a clear message -- and brings it to 312 KB.
+//   3 * (256*272 + 8*4096) + 256*48 = 312 KB.
+template <typename DataC>
+using opus_bmm_a8w8_mxscale_bpreshuffle_tile_ns128_n128_s3_gfx1250 =
+    opus_bmm_a8w8_mxscale_bpreshuffle_traits_gfx1250<
+        /*BLOCK_SIZE*/128, /*B_M*/256, /*B_N*/128, /*B_K*/256,
+        /*LAYOUT*/opus_gfx1250_bmm::kLayoutTileN,
+        /*D_A*/opus::fp8_t, /*D_B*/opus::fp8_t, /*D_C*/DataC, /*D_ACC*/float,
+        /*GROUP_K*/128, /*NUM_SLOTS*/3, /*WG_PER_CU*/1, /*GROUP_N*/128,
+        /*SF_A_LDS*/true, /*SF_B_LDS*/true,
+        /*SF_A_TDM_KG*/0, /*SF_A_TDM_PAD*/16, /*TILE_M*/2, /*NO_SPEC*/true,
+        /*SF_A_PANEL_KG*/32>;
 
 // -- smem -> register read layouts -----------------------------------------
 // Device-only in effect, but compiled on the host pass too so vtype_c matches.
