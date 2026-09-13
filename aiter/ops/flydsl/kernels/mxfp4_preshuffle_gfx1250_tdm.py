@@ -82,6 +82,7 @@ def launch_gemm_a8w4_tdm(
     arg_ep_row_map: fx.Tensor = None,
     f32_situ_beta: fx.Float32 = 1.0,
     f32_situ_linear_beta: fx.Float32 = 1.0,
+    row_major_ascale: Constexpr[int] = 0,
 ):
     """Launch the grouped contiguous-M a8w4 MoE GEMM for gfx1250.
 
@@ -145,6 +146,7 @@ def launch_gemm_a8w4_tdm(
         ep_slot_stride_bytes,
         ep_destination_stride,
         ep_world_size,
+        row_major_ascale,
     )
     _ = cache_tag
     if enable_ep_scatter:
@@ -178,9 +180,21 @@ def launch_gemm_a8w4_tdm(
     AS_KSTEPS = tile_k // 128
     AS_INNER = AS_KSTEPS * wmma_m_rep * 16
     AS_SUPERS = m_warp
-    # One outer row is one wave's M tile. Its inner (k128, wm, lane16)
-    # layout gives each WMMA scale operand a contiguous 16-dword block.
-    STAGE_SA = ((AS_SUPERS * AS_INNER * 4 + 15) // 16) * 16
+    # A-scale LDS: one outer row is one wave's M tile, and its inner
+    # (k128, wm, lane16) layout gives each WMMA scale operand a contiguous
+    # 16-dword block -- which is why the global buffer has to arrive already
+    # interleaved across 16 M rows.
+    #
+    # row_major_ascale instead takes a plain (row, k128) global buffer, so a
+    # producer writes each row's scales contiguously, and moves the 16-row
+    # interleave into the per-lane ds_read below (lane == M row, stride
+    # SA_KDW dwords -> a 2-way bank conflict on one b32 read per operand).
+    SA_KDW = AS_KSTEPS  # scale dwords per row per k-tile (tile_k // 128)
+    STAGE_SA = (
+        ((tile_m * SA_KDW * 4 + 15) // 16) * 16
+        if row_major_ascale
+        else ((AS_SUPERS * AS_INNER * 4 + 15) // 16) * 16
+    )
     STAGE_SB = ((SB_SUPERS * SC_INNER * 4 + 15) // 16) * 16
     SA_OFF = STAGE_A + STAGE_B
     SB_OFF = STAGE_A + STAGE_B + STAGE_SA
@@ -310,6 +324,7 @@ def launch_gemm_a8w4_tdm(
         B_BATCH_ROWS = n64 // 16
         N_SUPERS = (n64 + 31) // 32
         AS_ROW = (K // 128) * wmma_m_rep * 16
+        SA_GROW = K // 128  # row-major: scale dwords per M row
 
         c_outer_off, c_inner_off, c_stride = blk_m64, blk_n64, i32_n
         SB_OUTER_STRIDE = K4
@@ -489,20 +504,35 @@ def launch_gemm_a8w4_tdm(
             k_adv=PACK_TK * 16,
             wv=waves[1],
         )
-        add_tdm_loads(
-            gSA_base,
-            (blk_m64 // (wmma_m_rep * 16)) * AS_ROW,
-            AS_ROW,
-            None,
-            AS_INNER,
-            AS_SUPERS,
-            on_i32=True,
-            lds_off=SA_OFF // 4,
-            lds_row=AS_INNER,
-            k_adv=AS_INNER * 4,
-            wv=waves[2],
-            split_inner=AS_SUPERS < len(waves[2]),
-        )
+        if const_expr(row_major_ascale):
+            add_tdm_loads(
+                gSA_base,
+                blk_m64 * SA_GROW,
+                SA_GROW,
+                None,
+                SA_KDW,
+                tile_m,
+                on_i32=True,
+                lds_off=SA_OFF // 4,
+                lds_row=SA_KDW,
+                k_adv=SA_KDW * 4,
+                wv=waves[2],
+            )
+        else:
+            add_tdm_loads(
+                gSA_base,
+                (blk_m64 // (wmma_m_rep * 16)) * AS_ROW,
+                AS_ROW,
+                None,
+                AS_INNER,
+                AS_SUPERS,
+                on_i32=True,
+                lds_off=SA_OFF // 4,
+                lds_row=AS_INNER,
+                k_adv=AS_INNER * 4,
+                wv=waves[2],
+                split_inner=AS_SUPERS < len(waves[2]),
+            )
         add_tdm_loads(
             gSB_base,
             sb_off0,
@@ -566,7 +596,12 @@ def launch_gemm_a8w4_tdm(
         lds_b_lane_off = STAGE_A + (wnb // 16) * B_LDS_ROW + kgrp * 256 + lane16 * 16
         assert wmma_m_rep == 1 or wmma_m_rep % 2 == 0
         sa_lane = lane16 if wmma_m_rep == 1 else lane
-        lds_sa_lane_off = SA_OFF + wave_m * (AS_INNER * 4) + sa_lane * 4
+        SA_ROWS_PER_LOAD = 16 if wmma_m_rep == 1 else 32
+        lds_sa_lane_off = (
+            SA_OFF + (wave_m * warp_tile_m + sa_lane) * SA_KDW * 4
+            if row_major_ascale
+            else SA_OFF + wave_m * (AS_INNER * 4) + sa_lane * 4
+        )
         # One full-wave load covers both 16-column halves of an N32 scale
         # super-row. WMMA opsel_a selects lane 0:15 or 16:31 for each wn.
         assert warp_tile_n % 32 == 0, "load_sb split requires a 32-aligned wnb"
@@ -624,7 +659,11 @@ def launch_gemm_a8w4_tdm(
             return load_half(wn)
 
         def load_sa(buf, sm, ksl):
-            off = (ksl * wmma_m_rep + sm * 2) * 16 * 4
+            off = (
+                (sm * SA_ROWS_PER_LOAD * SA_KDW + ksl) * 4
+                if row_major_ascale
+                else (ksl * wmma_m_rep + sm * 2) * 16 * 4
+            )
             return lds_load_b32(lds_sa_base(buf), fx.Int32(off))[0]
 
         def load_sb(buf, sn, ksl):
