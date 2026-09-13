@@ -101,8 +101,8 @@ def _load_fanout_pair(
     pair_a = packed & fx.Int32(0xFF)
     pair_b = (packed >> fx.Int32(8)) & fx.Int32(0xFF)
     pair_mask = (fx.Int64(1) << fx.Int64(pair_a)) | (fx.Int64(1) << fx.Int64(pair_b))
-    selected_mask = enabled.select(pair_mask, fx.Int64(0))
-    canonical = enabled.select(pair_a, fx.Int32(0))
+    selected_mask = fx.Int64(fx.arith.select(enabled, pair_mask, fx.Int64(0)))
+    canonical = fx.Int32(fx.arith.select(enabled, pair_a, fx.Int32(0)))
     return selected_mask, pair_a, pair_b, enabled, canonical
 
 
@@ -112,14 +112,20 @@ def _wave_inclusive_scan_i32(value, lane):
     zero_raw = fx.Int32(0).ir_value()
     for shift, dpp in ((1, 0x111), (2, 0x112), (4, 0x114), (8, 0x118)):
         remote = fx.rocdl.update_dpp(T.i32, zero_raw, value_raw, dpp, 0xF, 0xF, True)
-        value = (lane >= fx.Int32(shift)).select(value + fx.Int32(remote), value)
+        value = fx.Int32(
+            fx.arith.select(lane >= fx.Int32(shift), value + fx.Int32(remote), value)
+        )
         value_raw = value.ir_value()
     source16 = (lane & fx.Int32(0x30)) - fx.Int32(1)
     remote16 = fx.rocdl.ds_bpermute(T.i32, source16 * fx.Int32(4), value)
-    value = (lane >= fx.Int32(16)).select(value + fx.Int32(remote16), value)
+    value = fx.Int32(
+        fx.arith.select(lane >= fx.Int32(16), value + fx.Int32(remote16), value)
+    )
     source32 = (lane & fx.Int32(0x30)) - fx.Int32(17)
     remote32 = fx.rocdl.ds_bpermute(T.i32, source32 * fx.Int32(4), value)
-    return (lane >= fx.Int32(32)).select(value + fx.Int32(remote32), value)
+    return fx.Int32(
+        fx.arith.select(lane >= fx.Int32(32), value + fx.Int32(remote32), value)
+    )
 
 
 @flyc.jit
@@ -130,7 +136,7 @@ def _wave_reduce_max_i32(value, lane):
                 T.i32, (lane ^ fx.Int32(distance)) * fx.Int32(4), value
             )
         )
-        value = (peer > value).select(peer, value)
+        value = fx.Int32(fx.arith.select(peer > value, peer, value))
     return value
 
 
@@ -185,17 +191,23 @@ def _classify_fanout_wave_route(
             )
             same_destination = peer_expert // fx.Int32(fz_epr) == destination
             peer_local = peer_expert - destination * fx.Int32(fz_epr)
-            safe_local = (valid & same_destination).select(peer_local, fx.Int32(0))
+            safe_local = fx.Int32(
+                fx.arith.select(valid & same_destination, peer_local, fx.Int32(0))
+            )
             peer_bit = fx.Int64(1) << fx.Int64(safe_local)
-            token_mask = (valid & same_destination).select(
-                token_mask | peer_bit, token_mask
+            token_mask = fx.Int64(
+                fx.arith.select(
+                    valid & same_destination, token_mask | peer_bit, token_mask
+                )
             )
             selected_member = valid & same_destination
             selected_member = selected_member & (
                 ((selected_mask >> fx.Int64(safe_local)) & fx.Int64(1)) != fx.Int64(0)
             )
-            member_slots = selected_member.select(
-                member_slots | fx.Int32(1 << slot), member_slots
+            member_slots = fx.Int32(
+                fx.arith.select(
+                    selected_member, member_slots | fx.Int32(1 << slot), member_slots
+                )
             )
         selected = selected_mask != fx.Int64(0)
         matched = selected & ((token_mask & selected_mask) == selected_mask)
@@ -218,18 +230,24 @@ def _classify_fanout_wave_route(
             )
             same_destination = peer_expert // fx.Int32(fz_epr) == destination
             peer_local = peer_expert - destination * fx.Int32(fz_epr)
-            safe_local = (valid & same_destination).select(peer_local, fx.Int32(0))
+            safe_local = fx.Int32(
+                fx.arith.select(valid & same_destination, peer_local, fx.Int32(0))
+            )
             member_a = valid & same_destination & pair_enabled & (safe_local == pair_a)
             member_b = valid & same_destination & pair_enabled & (safe_local == pair_b)
             has_a = has_a | member_a
             has_b = has_b | member_b
             if const_expr(fz_k <= 8):
                 selected_member = member_a | member_b
-                member_slots = selected_member.select(
-                    member_slots | fx.Int32(1 << slot), member_slots
+                member_slots = fx.Int32(
+                    fx.arith.select(
+                        selected_member,
+                        member_slots | fx.Int32(1 << slot),
+                        member_slots,
+                    )
                 )
-            slot_a = member_a.select(fx.Int32(slot), slot_a)
-            slot_b = member_b.select(fx.Int32(slot), slot_b)
+            slot_a = fx.Int32(fx.arith.select(member_a, fx.Int32(slot), slot_a))
+            slot_b = fx.Int32(fx.arith.select(member_b, fx.Int32(slot), slot_b))
         matched = pair_enabled & has_a & has_b
         shared_member = matched & ((local_expert == pair_a) | (local_expert == pair_b))
         if const_expr(fz_k > 8):
@@ -237,7 +255,7 @@ def _classify_fanout_wave_route(
             member_slots = slot_a | (slot_b << fx.Int32(4))
     emit = (~shared_member) | (local_expert == canonical)
     shared_segment = fx.Int32(fz_total_experts) + destination
-    segment = shared_member.select(shared_segment, expert)
+    segment = fx.Int32(fx.arith.select(shared_member, shared_segment, expert))
     return segment, emit, member_slots
 
 
@@ -263,22 +281,28 @@ def _configure_payload_geometry(
         for local_expert in range(lane, fz_epr, 64):
             ge = fx.Int32(destination * fz_epr) + local_expert
             source_count = local_hist[ge]
-            max_source_count = (source_count > max_source_count).select(
-                source_count, max_source_count
+            max_source_count = fx.Int32(
+                fx.arith.select(
+                    source_count > max_source_count, source_count, max_source_count
+                )
             )
         max_source_count = _wave_reduce_max_i32(max_source_count, lane)
         group_count = fx.Int32(0)
         if lane == fx.Int32(0):
             group_count = local_hist[fx.Int32(fz_total_experts + destination)]
         group_count = fx.Int32(fx.rocdl.readfirstlane(T.i32, group_count))
-        max_source_count = (group_count > max_source_count).select(
-            group_count, max_source_count
+        max_source_count = fx.Int32(
+            fx.arith.select(
+                group_count > max_source_count, group_count, max_source_count
+            )
         )
         if lane == fx.Int32(0):
             chunks = (max_source_count + fx.Int32(payload_chunk_rows - 1)) // fx.Int32(
                 payload_chunk_rows
             )
-            chunks = (chunks > fx.Int32(0)).select(chunks, fx.Int32(1))
+            chunks = fx.Int32(
+                fx.arith.select(chunks > fx.Int32(0), chunks, fx.Int32(1))
+            )
             chunk_counts[fx.Int32(destination)] = chunks
             # Tasks are flattened as chunk x expert. Even one chunk contains
             # enough independent expert tasks to keep every producer useful.
@@ -496,7 +520,7 @@ def emit_direct_fixed_slot_payload(
             global_expert_lane = idx_buffer[wk]
         global_expert = fx.Int32(fx.rocdl.readfirstlane(T.i32, global_expert_lane))
         valid_expert = (global_expert >= fx.Int32(0)) & (global_expert < fx.Int32(fz_total_experts))
-        safe_expert = valid_expert.select(global_expert, fx.Int32(0))
+        safe_expert = fx.Int32(fx.arith.select(valid_expert, global_expert, fx.Int32(0)))
         destination = safe_expert // fx.Int32(fz_epr)
         local_expert = safe_expert - destination * fx.Int32(fz_epr)
         offset_lane = fx.Int32(0)
@@ -613,14 +637,14 @@ def emit_direct_fixed_slot_finalize(
         comm_ops.fence_system_acquire()
 
         valid_expert = lane < fx.Int32(fz_epr)
-        safe_expert = valid_expert.select(lane, fx.Int32(0))
+        safe_expert = fx.Int32(fx.arith.select(valid_expert, lane, fx.Int32(0)))
         count = running[safe_expert]
-        count = valid_expert.select(count, fx.Int32(0))
-        overflow_flag = (count > fx.Int32(fz_cap)).select(fx.Int32(1), fx.Int32(0))
+        count = fx.Int32(fx.arith.select(valid_expert, count, fx.Int32(0)))
+        overflow_flag = fx.Int32(fx.arith.select(count > fx.Int32(fz_cap), fx.Int32(1), fx.Int32(0)))
         overflow_prefix = _wave_inclusive_scan_i32(overflow_flag, lane)
         overflow_count = fx.Int32(fx.rocdl.readlane(T.i32, overflow_prefix, fz_epr - 1))
         no_overflow = overflow_count == fx.Int32(0)
-        safe_count = (count <= fx.Int32(fz_cap)).select(count, fx.Int32(0))
+        safe_count = fx.Int32(fx.arith.select(count <= fx.Int32(fz_cap), count, fx.Int32(0)))
         num_expert_tiles = (safe_count + fx.Int32(fz_tile_m - 1)) // fx.Int32(fz_tile_m)
         max_expert_tiles = _wave_reduce_max_i32(num_expert_tiles, lane)
         inclusive_tiles = _wave_inclusive_scan_i32(num_expert_tiles, lane)
@@ -651,8 +675,8 @@ def emit_direct_fixed_slot_finalize(
             running[safe_expert] = fx.Int32(0)
 
         if lane == fx.Int32(0):
-            num_valid = no_overflow.select(total_tiles * fx.Int32(fz_tile_m), fx.Int32(0))
-            ready_work = no_overflow.select(total_tiles * fx.Int32(n_tiles), fx.Int32(0))
+            num_valid = fx.Int32(fx.arith.select(no_overflow, total_tiles * fx.Int32(fz_tile_m), fx.Int32(0)))
+            ready_work = fx.Int32(fx.arith.select(no_overflow, total_tiles * fx.Int32(n_tiles), fx.Int32(0)))
             num_valid_buffer[fx.Int32(0)] = num_valid
             # num_valid[1] is a device-visible overflow status.
             num_valid_buffer[fx.Int32(1)] = overflow_count
@@ -746,7 +770,7 @@ def _derive_allgather_offsets(
         for expert_chunk in range_constexpr((epr + 63) // 64):
             local_expert = fx.Int32(expert_chunk * 64) + lane
             valid_expert = local_expert < fx.Int32(epr)
-            safe_expert = valid_expert.select(local_expert, fx.Int32(0))
+            safe_expert = fx.Int32(fx.arith.select(valid_expert, local_expert, fx.Int32(0)))
             ge = destination * fx.Int32(epr) + safe_expert
             if const_expr(epr <= 64):
                 group_member = valid_expert & (
@@ -770,15 +794,11 @@ def _derive_allgather_offsets(
             fx.rocdl.s_waitcnt(0)
             normal_count = fx.Int32(0)
             normal_source_prefix = fx.Int32(0)
-            group_count = group_member.select(
-                destination_group_count, fx.Int32(0)
-            )
-            group_source_prefix = group_member.select(
-                destination_group_source_prefix, fx.Int32(0)
-            )
+            group_count = fx.Int32(fx.arith.select(group_member, destination_group_count, fx.Int32(0)))
+            group_source_prefix = fx.Int32(fx.arith.select(group_member, destination_group_source_prefix, fx.Int32(0)))
             for source in range_constexpr(npes):
                 source_count = normal_source_counts[source]
-                source_count = valid_expert.select(source_count, fx.Int32(0))
+                source_count = fx.Int32(fx.arith.select(valid_expert, source_count, fx.Int32(0)))
                 if const_expr(source < rank):
                     normal_source_prefix = normal_source_prefix + source_count
                 normal_count = normal_count + source_count
@@ -840,7 +860,7 @@ def _derive_next_fanout_pairs(
         )
         if const_expr(epr <= 64):
             valid_expert = lane < fx.Int32(epr)
-            safe_expert = valid_expert.select(lane, fx.Int32(0))
+            safe_expert = fx.Int32(fx.arith.select(valid_expert, lane, fx.Int32(0)))
             ge = fx.Int32(destination * epr) + safe_expert
             normal_count = fx.Int32(0)
             for source in range_constexpr(npes):
@@ -850,9 +870,7 @@ def _derive_next_fanout_pairs(
                     fx.Int32,
                     cache_modifier=2,
                 )
-                normal_count = normal_count + valid_expert.select(
-                    source_count, fx.Int32(0)
-                )
+                normal_count = normal_count + fx.Int32(fx.arith.select(valid_expert, source_count, fx.Int32(0)))
             group_count_lane = fx.Int32(0)
             if lane == fx.Int32(0):
                 for source in range_constexpr(npes):
@@ -870,18 +888,11 @@ def _derive_next_fanout_pairs(
             current_member = (
                 (current_mask >> fx.Int64(safe_expert)) & fx.Int64(1)
             ) != fx.Int64(0)
-            total_count = normal_count + (valid_expert & current_member).select(
-                group_count, fx.Int32(0)
-            )
-            score = valid_expert.select(
-                total_count * score_stride + fx.Int32(epr) - safe_expert,
-                fx.Int32(-1),
-            )
+            total_count = normal_count + fx.Int32(fx.arith.select(valid_expert & current_member, group_count, fx.Int32(0)))
+            score = fx.Int32(fx.arith.select(valid_expert, total_count * score_stride + fx.Int32(epr) - safe_expert, fx.Int32(-1)))
             best_score = _wave_reduce_max_i32(score, lane)
             best_expert = fx.Int32(epr) - (best_score % score_stride)
-            second_score = (safe_expert != best_expert).select(
-                score, fx.Int32(-1)
-            )
+            second_score = fx.Int32(fx.arith.select(safe_expert != best_expert, score, fx.Int32(-1)))
             second_score = _wave_reduce_max_i32(second_score, lane)
         else:
             group_count_lane = fx.Int32(0)
@@ -903,7 +914,7 @@ def _derive_next_fanout_pairs(
             for expert_chunk in range_constexpr((epr + 63) // 64):
                 local_expert = fx.Int32(expert_chunk * 64) + lane
                 valid_expert = local_expert < fx.Int32(epr)
-                safe_expert = valid_expert.select(local_expert, fx.Int32(0))
+                safe_expert = fx.Int32(fx.arith.select(valid_expert, local_expert, fx.Int32(0)))
                 ge = fx.Int32(destination * epr) + safe_expert
                 normal_count = fx.Int32(0)
                 for source in range_constexpr(npes):
@@ -913,46 +924,32 @@ def _derive_next_fanout_pairs(
                         fx.Int32,
                         cache_modifier=2,
                     )
-                    normal_count = normal_count + valid_expert.select(
-                        source_count, fx.Int32(0)
-                    )
+                    normal_count = normal_count + fx.Int32(fx.arith.select(valid_expert, source_count, fx.Int32(0)))
                 current_member = current_pair_enabled & (
                     (safe_expert == current_pair_a)
                     | (safe_expert == current_pair_b)
                 )
-                total_count = normal_count + (valid_expert & current_member).select(
-                    group_count, fx.Int32(0)
-                )
-                score = valid_expert.select(
-                    total_count * score_stride + fx.Int32(epr) - safe_expert,
-                    fx.Int32(-1),
-                )
+                total_count = normal_count + fx.Int32(fx.arith.select(valid_expert & current_member, group_count, fx.Int32(0)))
+                score = fx.Int32(fx.arith.select(valid_expert, total_count * score_stride + fx.Int32(epr) - safe_expert, fx.Int32(-1)))
                 new_best = score > lane_best_score
-                lane_second_score = new_best.select(
-                    lane_best_score,
-                    (score > lane_second_score).select(score, lane_second_score),
-                )
-                lane_best_score = new_best.select(score, lane_best_score)
+                lane_second_score = fx.Int32(fx.arith.select(new_best, lane_best_score, fx.Int32(fx.arith.select(score > lane_second_score, score, lane_second_score))))
+                lane_best_score = fx.Int32(fx.arith.select(new_best, score, lane_best_score))
 
             best_score = _wave_reduce_max_i32(lane_best_score, lane)
             best_expert = fx.Int32(epr) - (best_score % score_stride)
-            lane_second_candidate = (lane_best_score == best_score).select(
-                lane_second_score, lane_best_score
-            )
+            lane_second_candidate = fx.Int32(fx.arith.select(lane_best_score == best_score, lane_second_score, lane_best_score))
             second_score = _wave_reduce_max_i32(lane_second_candidate, lane)
         second_expert = fx.Int32(epr) - (second_score % score_stride)
         second_count = second_score // score_stride
-        pair_a = (best_expert < second_expert).select(best_expert, second_expert)
-        pair_b = (best_expert < second_expert).select(second_expert, best_expert)
+        pair_a = fx.Int32(fx.arith.select(best_expert < second_expert, best_expert, second_expert))
+        pair_b = fx.Int32(fx.arith.select(best_expert < second_expert, second_expert, best_expert))
         enabled = (
             (second_count > fx.Int32(0))
             & (pair_a >= fx.Int32(0))
             & (pair_b < fx.Int32(epr))
             & (pair_a != pair_b)
         )
-        packed = pair_a | (pair_b << fx.Int32(8)) | enabled.select(
-            fx.Int32(1 << 16), fx.Int32(0)
-        )
+        packed = pair_a | (pair_b << fx.Int32(8)) | fx.Int32(fx.arith.select(enabled, fx.Int32(1 << 16), fx.Int32(0)))
         if lane == fx.Int32(0):
             comm_ops.store_i32_system(
                 addr_pair_config,
@@ -1124,7 +1121,7 @@ def emit_dispatch_plan(
         for expert_chunk in range_constexpr((fz_epr + 63) // 64):
             local_expert = fx.Int32(expert_chunk * 64) + lane
             valid_expert = local_expert < fx.Int32(fz_epr)
-            safe_expert = valid_expert.select(local_expert, fx.Int32(0))
+            safe_expert = fx.Int32(fx.arith.select(valid_expert, local_expert, fx.Int32(0)))
             ge = fx.Int32(fz_rank * fz_epr + local_expert)
             safe_ge = fx.Int32(fz_rank * fz_epr) + safe_expert
             normal_source_counts = []
@@ -1150,7 +1147,7 @@ def emit_dispatch_plan(
                     fx.Int32,
                     cache_modifier=2,
                 )
-                source_count = valid_expert.select(source_count, fx.Int32(0))
+                source_count = fx.Int32(fx.arith.select(valid_expert, source_count, fx.Int32(0)))
                 normal_source_counts.append(source_count)
                 normal_count = normal_count + source_count
                 source_group_count = buf_copy_load(
@@ -1159,9 +1156,7 @@ def emit_dispatch_plan(
                     fx.Int32,
                     cache_modifier=2,
                 )
-                source_group_count = group_member.select(
-                    source_group_count, fx.Int32(0)
-                )
+                source_group_count = fx.Int32(fx.arith.select(group_member, source_group_count, fx.Int32(0)))
                 group_source_counts.append(source_group_count)
                 group_count = group_count + source_group_count
 
@@ -1173,9 +1168,7 @@ def emit_dispatch_plan(
             ) // fx.Int32(fz_tile_m)
             num_tiles = group_num_tiles + normal_num_tiles
             chunk_max = _wave_reduce_max_i32(num_tiles, lane)
-            max_expert_tiles = (chunk_max > max_expert_tiles).select(
-                chunk_max, max_expert_tiles
-            )
+            max_expert_tiles = fx.Int32(fx.arith.select(chunk_max > max_expert_tiles, chunk_max, max_expert_tiles))
             group_padded_rows = group_num_tiles * fx.Int32(fz_tile_m)
             normal_padded_rows = normal_num_tiles * fx.Int32(fz_tile_m)
             padded_rows = group_padded_rows + normal_padded_rows
@@ -1189,24 +1182,16 @@ def emit_dispatch_plan(
                 )
             else:
                 group_input_base = fx.Int32(0)
-                pair_a_base_lane = (valid_expert & (local_expert == pair_a)).select(
-                    group_row_base, fx.Int32(0)
-                )
-                pair_b_base_lane = (valid_expert & (local_expert == pair_b)).select(
-                    group_row_base, fx.Int32(0)
-                )
+                pair_a_base_lane = fx.Int32(fx.arith.select(valid_expert & (local_expert == pair_a), group_row_base, fx.Int32(0)))
+                pair_b_base_lane = fx.Int32(fx.arith.select(valid_expert & (local_expert == pair_b), group_row_base, fx.Int32(0)))
                 pair_a_in_chunk = (pair_a >= fx.Int32(expert_chunk * 64)) & (
                     pair_a < fx.Int32(min(fz_epr, (expert_chunk + 1) * 64))
                 )
                 pair_b_in_chunk = (pair_b >= fx.Int32(expert_chunk * 64)) & (
                     pair_b < fx.Int32(min(fz_epr, (expert_chunk + 1) * 64))
                 )
-                pair_a_group_base = pair_a_in_chunk.select(
-                    _wave_reduce_max_i32(pair_a_base_lane, lane), pair_a_group_base
-                )
-                pair_b_group_base = pair_b_in_chunk.select(
-                    _wave_reduce_max_i32(pair_b_base_lane, lane), pair_b_group_base
-                )
+                pair_a_group_base = fx.Int32(fx.arith.select(pair_a_in_chunk, _wave_reduce_max_i32(pair_a_base_lane, lane), pair_a_group_base))
+                pair_b_group_base = fx.Int32(fx.arith.select(pair_b_in_chunk, _wave_reduce_max_i32(pair_b_base_lane, lane), pair_b_group_base))
 
             if valid_expert:
                 if group_member:
@@ -1339,9 +1324,9 @@ def emit_dispatch_plan(
         for item in range_constexpr(pairs_per_lane):
             ge = lane_base + fx.Int32(item)
             valid_ge = ge < fx.Int32(total_segments)
-            safe_ge = valid_ge.select(ge, fx.Int32(0))
+            safe_ge = fx.Int32(fx.arith.select(valid_ge, ge, fx.Int32(0)))
             source_count = local_hist[safe_ge]
-            source_count = valid_ge.select(source_count, fx.Int32(0))
+            source_count = fx.Int32(fx.arith.select(valid_ge, source_count, fx.Int32(0)))
             lane_counts.append(source_count)
             lane_total = lane_total + source_count
         lane_prefix = _wave_inclusive_scan_i32(lane_total, lane) - lane_total
@@ -1457,13 +1442,13 @@ def emit_dispatch_group(
     for token_batch in range(token_batch0, i32_cur_tok, token_stride):
         token = token_batch + (lane >> fx.Int32(route_group_shift))
         active_route = active_slot & (token < i32_cur_tok)
-        safe_token = (token < i32_cur_tok).select(token, fx.Int32(0))
-        safe_slot = active_slot.select(topk_slot, fx.Int32(0))
+        safe_token = fx.Int32(fx.arith.select(token < i32_cur_tok, token, fx.Int32(0)))
+        safe_slot = fx.Int32(fx.arith.select(active_slot, topk_slot, fx.Int32(0)))
         route = safe_token * fx.Int32(fz_k) + safe_slot
         expert = idx_buffer[route]
         valid = active_route & (expert >= fx.Int32(0))
         valid = valid & (expert < fx.Int32(fz_total_experts))
-        safe_expert = valid.select(expert, fx.Int32(0))
+        safe_expert = fx.Int32(fx.arith.select(valid, expert, fx.Int32(0)))
         segment, emit, member_slots = _classify_fanout_wave_route(
             safe_expert,
             expert,
@@ -1521,8 +1506,8 @@ def emit_dispatch_group(
     ):
         token = token_batch + (lane >> fx.Int32(route_group_shift))
         active_route = active_slot & (token < i32_cur_tok)
-        safe_token = (token < i32_cur_tok).select(token, fx.Int32(0))
-        safe_slot = active_slot.select(topk_slot, fx.Int32(0))
+        safe_token = fx.Int32(fx.arith.select(token < i32_cur_tok, token, fx.Int32(0)))
+        safe_slot = fx.Int32(fx.arith.select(active_slot, topk_slot, fx.Int32(0)))
         route = safe_token * fx.Int32(fz_k) + safe_slot
         packed_segment = route_segment[route]
         if const_expr(packed_topk6_metadata):
@@ -1540,7 +1525,7 @@ def emit_dispatch_group(
             position = block_base + intra_rank
             shared_group = segment >= fx.Int32(fz_total_experts)
             group_entry = token | (member_slots << fx.Int32(24))
-            pair_entry = shared_group.select(group_entry, route)
+            pair_entry = fx.Int32(fx.arith.select(shared_group, group_entry, route))
             pair_order[position] = pair_entry
 
     fx.rocdl.s_waitcnt(0)
@@ -1668,11 +1653,9 @@ def emit_dispatch_payload(
             npes=num_destinations,
         )
         group_task = local_segment == fx.Int32(fz_epr)
-        local_expert = group_task.select(canonical_expert, local_segment)
+        local_expert = fx.Int32(fx.arith.select(group_task, canonical_expert, local_segment))
         ge = destination * fx.Int32(fz_epr) + local_expert
-        segment = group_task.select(
-            fx.Int32(fz_total_experts) + destination, ge
-        )
+        segment = fx.Int32(fx.arith.select(group_task, fx.Int32(fz_total_experts) + destination, ge))
         source_count_lane = fx.Int32(0)
         source_base_lane = fx.Int32(0)
         destination_base_lane = fx.Int32(0)
@@ -1680,23 +1663,20 @@ def emit_dispatch_payload(
             source_count_lane = local_hist[segment]
             source_base_lane = pair_base[segment]
             destination_base_lane = task_base[ge]
-            destination_base_lane = group_task.select(
-                group_base[ge],
-                destination_base_lane,
-            )
+            destination_base_lane = fx.Int32(fx.arith.select(group_task, group_base[ge], destination_base_lane))
         source_count = fx.Int32(fx.rocdl.readfirstlane(T.i32, source_count_lane))
         source_base = fx.Int32(fx.rocdl.readfirstlane(T.i32, source_base_lane))
         destination_base = fx.Int32(fx.rocdl.readfirstlane(T.i32, destination_base_lane))
         num_chunks = (source_count + fx.Int32(payload_chunk_rows - 1)) // fx.Int32(
             payload_chunk_rows
         )
-        num_chunks = (num_chunks > fx.Int32(0)).select(num_chunks, fx.Int32(1))
+        num_chunks = fx.Int32(fx.arith.select(num_chunks > fx.Int32(0), num_chunks, fx.Int32(1)))
         chunk_active = chunk_id < num_chunks
         chunk_begin = chunk_id * fx.Int32(payload_chunk_rows)
         chunk_limit = chunk_begin + fx.Int32(payload_chunk_rows)
-        chunk_end = (source_count < chunk_limit).select(source_count, chunk_limit)
-        row_begin = chunk_active.select(chunk_begin, fx.Int32(0))
-        row_end = chunk_active.select(chunk_end, fx.Int32(0))
+        chunk_end = fx.Int32(fx.arith.select(source_count < chunk_limit, source_count, chunk_limit))
+        row_begin = fx.Int32(fx.arith.select(chunk_active, chunk_begin, fx.Int32(0)))
+        row_end = fx.Int32(fx.arith.select(chunk_active, chunk_end, fx.Int32(0)))
         if const_expr(hoist_remote_resources):
             remote_weight_buffer = ptr_buf_tensor(
                 weight_table[destination], fx.Int32
@@ -1720,10 +1700,8 @@ def emit_dispatch_payload(
             source_token = wk // fx.Int32(fz_k)
             topk_slot = wk % fx.Int32(fz_k)
             group_member_slots = (wk >> fx.Int32(24)) & fx.Int32(0xFF)
-            source_token = group_task.select(
-                wk & fx.Int32(0xFFFFFF), source_token
-            )
-            topk_slot = group_task.select(fx.Int32(0), topk_slot)
+            source_token = fx.Int32(fx.arith.select(group_task, wk & fx.Int32(0xFFFFFF), source_token))
+            topk_slot = fx.Int32(fx.arith.select(group_task, fx.Int32(0), topk_slot))
             destination_row = destination_base + row
             source_key = fx.Int32(fz_rank * fz_mtpr) + source_token
 

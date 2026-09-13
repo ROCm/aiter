@@ -191,7 +191,7 @@ def _build_kernel_mfma_r_w(
                     shift = byte_idx * 8
                     byte_val = fx.Int32(fx.Uint32(src) >> shift) & 0xFF
                     is_0x80 = byte_val == 0x80
-                    cleaned = is_0x80.select(fx.Int32(0), byte_val)
+                    cleaned = fx.Int32(fx.arith.select(is_0x80, fx.Int32(0), byte_val))
                     result = result | (cleaned << shift)
                 return result
 

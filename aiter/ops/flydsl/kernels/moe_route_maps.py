@@ -259,20 +259,20 @@ def build_moe_topids_to_rows_g2l_module(weight_dtype="bf16"):
             is_drop = le == fx.Uint32(n_buckets)
             # Dropped routes address bucket 0 to keep the atomic in bounds, but
             # add 0 to it (incr below) and keep the sentinel instead of the row.
-            eff_e = is_drop.select(fx.Uint32(0), le)
+            eff_e = fx.Uint32(fx.arith.select(is_drop, fx.Uint32(0), le))
 
             # Fused weight cast+mask: read f32 route weight, write weight_dtype
             # (kept -> cast, dropped -> 0). Folds the host topk_weight.to(bf16)
             # copy and the dropped-weight masked_fill into this route pass.
             w_f32 = wi_p[route]
             w_cast = w_f32.to(w_fx)
-            w_out = is_drop.select(w_fx(0.0), w_cast)
+            w_out = w_fx(fx.arith.select(is_drop, w_fx(0.0), w_cast))
             w_p[route] = w_out
 
             # A dropped route that claimed a slot would still cost a grouped GEMM
             # row, and its computed row would alias the bucket-0 route holding
             # that slot -- hence incr 0 plus the sentinel.
-            incr = is_drop.select(c0, c1).ir_value()
+            incr = fx.Int32(fx.arith.select(is_drop, c0, c1)).ir_value()
             slot = llvm.AtomicRMWOp(
                 llvm.AtomicBinOp.add,
                 _slot_ptr(fx.Int64(ptrtoint(atomic_buffer)), eff_e),
@@ -282,7 +282,7 @@ def build_moe_topids_to_rows_g2l_module(weight_dtype="bf16"):
                 alignment=4,
             ).result
             row = fx.Uint32(slot) + eff_e * fx.Uint32(max_m)
-            row_out = is_drop.select(dropped_row, row)
+            row_out = fx.Uint32(fx.arith.select(is_drop, dropped_row, row))
             out_p[route] = row_out
 
     @flyc.jit
@@ -416,14 +416,14 @@ def build_moe_route_g2l_lds_module(weight_dtype="bf16"):
         le = fx.Uint32(g2l_p[ge])
         is_drop = (le == n_buckets_i32) | oob
         is_kept = ~is_drop
-        eff_e = is_drop.select(fx.Uint32(0), le)
+        eff_e = fx.Uint32(fx.arith.select(is_drop, fx.Uint32(0), le))
 
         # Fused weight cast+mask (kept -> cast(f32->weight_dtype), dropped -> 0).
         w_f32 = fx.Float32(0.0)
         if in_range:
             w_f32 = wi_p[route]
         w_cast = w_f32.to(w_fx)
-        w_out = is_drop.select(w_fx(0.0), w_cast)
+        w_out = w_fx(fx.arith.select(is_drop, w_fx(0.0), w_cast))
 
         if in_range:
             w_p[route] = w_out
@@ -471,7 +471,7 @@ def build_moe_route_g2l_lds_module(weight_dtype="bf16"):
         if in_range:
             base = fx.Uint32(lds_cnt[eff_e])
             row = base + my_rank + eff_e * fx.Uint32(max_m)
-            row_out = is_drop.select(dropped_row, row)
+            row_out = fx.Uint32(fx.arith.select(is_drop, dropped_row, row))
             out_p[route] = row_out
 
     @flyc.jit
@@ -577,7 +577,7 @@ def build_moe_route_g2l_fused_module(weight_dtype="bf16"):
         if in_range:
             m = m_p[tid]
             nz = m != c0
-            lds0[tid] = fx.Int32(nz.select(c1, c0))
+            lds0[tid] = fx.Int32(fx.Int32(fx.arith.select(nz, c1, c0)))
 
         gpu.barrier()
 
@@ -602,7 +602,7 @@ def build_moe_route_g2l_fused_module(weight_dtype="bf16"):
             incl = src[tid]
             m2 = m_p[tid]
             nz2 = m2 != c0
-            lds_lut[tid] = nz2.select(fx.Uint32(incl) - 1, e_count)
+            lds_lut[tid] = fx.Uint32(fx.arith.select(nz2, fx.Uint32(incl) - 1, e_count))
 
         gpu.barrier()
 
@@ -634,21 +634,21 @@ def build_moe_route_g2l_fused_module(weight_dtype="bf16"):
             # dispatch rows (route >= num_valid_routes) may carry -1 / stale garbage
             # expert ids, which would otherwise OOB-read lds_lut. oob is forced to
             # the drop path below regardless of the clamped lookup result.
-            ge = is_oob.select(fx.Uint32(0), ge_raw)
+            ge = fx.Uint32(fx.arith.select(is_oob, fx.Uint32(0), ge_raw))
             le = fx.Uint32(lds_lut[ge])
             is_drop = (le == e_count) | is_oob
-            eff_e = is_drop.select(fx.Uint32(0), le)
+            eff_e = fx.Uint32(fx.arith.select(is_drop, fx.Uint32(0), le))
 
             # Fused weight cast+mask: kept -> cast(f32->weight_dtype), dropped -> 0.
             w_f32 = wi_p[route]
             w_cast = w_f32.to(w_fx)
-            w_out = is_drop.select(w_fx(0.0), w_cast)
+            w_out = w_fx(fx.arith.select(is_drop, w_fx(0.0), w_cast))
             w_p[route] = w_out
 
             # Counting a dropped route inflates masked_m, which grows psum and
             # makes the grouped GEMM compute rows that only fold away via
             # gather_w=0; the sentinel keeps that row unclaimed and unambiguous.
-            incr = is_drop.select(c0, c1).ir_value()
+            incr = fx.Int32(fx.arith.select(is_drop, c0, c1)).ir_value()
             slot = llvm.AtomicRMWOp(
                 llvm.AtomicBinOp.add,
                 _slot_ptr(fx.Int64(ptrtoint(counter)), eff_e),
@@ -658,7 +658,7 @@ def build_moe_route_g2l_fused_module(weight_dtype="bf16"):
                 alignment=4,
             ).result
             row = fx.Uint32(slot) + eff_e * fx.Uint32(max_m)
-            row_out = is_drop.select(dropped_row, row)
+            row_out = fx.Uint32(fx.arith.select(is_drop, dropped_row, row))
             out_p[route] = row_out
 
     @flyc.jit

@@ -1088,7 +1088,9 @@ def atomic_bf16_epilog(
                             )
                             acc = p if h == 0 else Vec(_arith.maxui(_raw(acc), _raw(p)))
                         a0, a1 = fx.Int32(acc[0]), fx.Int32(acc[1])
-                        amax_bits = (a0 > a1).select(a0, a1) << fx.Int32(16)
+                        amax_bits = fx.Int32(
+                            fx.arith.select(a0 > a1, a0, a1)
+                        ) << fx.Int32(16)
                     else:
                         local_max = fabs_f32(vals[0])
                         for q in range_constexpr(1, route_vec):
@@ -1102,11 +1104,18 @@ def atomic_bf16_epilog(
                         amax_bits = _inline_dpp_quad_amax(amax_bits)
                     ax_e = (amax_bits >> fx.Int32(23)) & fx.Int32(0xFF)
                     e8m0 = ax_e - fx.Int32(_FP8_E8M0_SHIFT)
-                    e8m0 = (e8m0 < fx.Int32(1)).select(fx.Int32(1), e8m0)
-                    e8m0 = (amax_bits == fx.Int32(0)).select(fx.Int32(0), e8m0)
-                    block_scale = (amax_bits == fx.Int32(0)).select(
-                        fx.Float32(1.0),
-                        fx.Float32(_raw(e8m0 << fx.Int32(23)).bitcast(T.f32)),
+                    e8m0 = fx.Int32(
+                        fx.arith.select(e8m0 < fx.Int32(1), fx.Int32(1), e8m0)
+                    )
+                    e8m0 = fx.Int32(
+                        fx.arith.select(amax_bits == fx.Int32(0), fx.Int32(0), e8m0)
+                    )
+                    block_scale = fx.Float32(
+                        fx.arith.select(
+                            amax_bits == fx.Int32(0),
+                            fx.Float32(1.0),
+                            fx.Float32(_raw(e8m0 << fx.Int32(23)).bitcast(T.f32)),
+                        )
                     )
                     bs_raw = _raw(block_scale)
                     pk_ty = T.vec(2, T.i16)

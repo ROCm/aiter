@@ -792,7 +792,7 @@ def compile_mixed_moe_gemm1_common(
                     t_valid = t_i32 < fx.Uint32(tokens_i32)
                     s_valid = s_i32 < fx.Uint32(topk_i32)
                     ts_valid = t_valid & s_valid
-                    t_safe = ts_valid.select(t_i32, fx.Uint32(0))
+                    t_safe = fx.Uint32(fx.arith.select(ts_valid, t_i32, fx.Uint32(0)))
 
                     t_idx = fx.Index(t_safe)
                     x_row_base_div4.append(t_idx * c_k_div4)
@@ -3599,9 +3599,11 @@ def compile_mixed_moe_gemm2_common(
                 tiles_per_block_base = total_m_tiles // c_cu
                 tiles_remainder = total_m_tiles - (tiles_per_block_base * c_cu)
                 has_extra_tile = fx.Index(bx_persist) < fx.Index(tiles_remainder)
-                extra_tile = has_extra_tile.select(c1_p, c0_p)
+                extra_tile = fx.Index(fx.arith.select(has_extra_tile, c1_p, c0_p))
                 tiles_per_block = tiles_per_block_base + extra_tile
-                start_tail = has_extra_tile.select(bx_persist, tiles_remainder)
+                start_tail = fx.Index(
+                    fx.arith.select(has_extra_tile, bx_persist, tiles_remainder)
+                )
                 persist_start_tile = bx_persist * tiles_per_block_base + start_tail
                 i1 = ir.IntegerType.get_signless(1)
                 init_active = arith.constant(1, type=i1)
@@ -3760,8 +3762,12 @@ def compile_mixed_moe_gemm2_common(
                         t_valid = t_i32 < fx.Uint32(tokens_i32)
                         s_valid = s_i32 < fx.Uint32(topk_i32)
                         ts_valid = t_valid & s_valid
-                        t_safe = ts_valid.select(t_i32, fx.Uint32(0))
-                        s_safe = ts_valid.select(s_i32, fx.Uint32(0))
+                        t_safe = fx.Uint32(
+                            fx.arith.select(ts_valid, t_i32, fx.Uint32(0))
+                        )
+                        s_safe = fx.Uint32(
+                            fx.arith.select(ts_valid, s_i32, fx.Uint32(0))
+                        )
                         row_ts_i32 = t_safe * fx.Uint32(topk_i32) + s_safe
                         row_ts_idx = fx.Index(row_ts_i32)
 
@@ -4444,8 +4450,10 @@ def compile_mixed_moe_gemm2_common(
                                 & (fx.Uint32(t_pre) < fx.Uint32(tokens_i32_guard))
                                 & (s_pre < fx.Uint32(topk))
                             )
-                            stored_val = valid.select(
-                                fx.Int32(row_byte_off), fx.Int32(0x7FFF0000)
+                            stored_val = fx.Int32(
+                                fx.arith.select(
+                                    valid, fx.Int32(row_byte_off), fx.Int32(0x7FFF0000)
+                                )
                             )
                         else:
                             stored_val = tid_val
@@ -4833,8 +4841,10 @@ def compile_mixed_moe_gemm2_common(
                         amax_bits = local_max.bitcast(fx.Int32)
                         ax_e = (amax_bits >> c23_i32_q) & c255_i32_q
                         E = ax_e - c7_i32_q
-                        E = (E > c1_i32_q).select(E, c1_i32_q)
-                        E = (amax_bits == c0_i32_q).select(c0_i32_q, E)
+                        E = fx.Int32(fx.arith.select(E > c1_i32_q, E, c1_i32_q))
+                        E = fx.Int32(
+                            fx.arith.select(amax_bits == c0_i32_q, c0_i32_q, E)
+                        )
                         quant_scale = ((c254_i32_q - E) << c23_i32_q).bitcast(
                             fx.Float32
                         )

@@ -37,7 +37,7 @@ import flydsl.expr as fx
 from flydsl.expr import math as fly_math
 from flydsl.expr.typing import T
 
-from .act import LOG2E as _LOG2E
+from .kernels_common import LOG2E as _LOG2E
 
 fm_fast = "fast"
 
@@ -444,7 +444,7 @@ def compile_mla_reduce(
             # A single-split tile still needs reducing when it carries a real partial slot
             # (need_lse); -1 is the only "nothing to reduce" case. Mirrors reduce.cu.
             tile_live = t0 != last
-            slot0 = g_pmap[tile_live.select(t0, fx.Int32(0))]
+            slot0 = g_pmap[fx.Int32(fx.arith.select(tile_live, t0, fx.Int32(0)))]
             single_split_has_partial = (n_splits == fx.Int32(1)) & (
                 slot0 != fx.Int32(-1)
             )
@@ -465,10 +465,10 @@ def compile_mla_reduce(
                 q_valid = (q_start >= fx.Int32(0)) & (q_start < num_final_rows)
                 has_work = has_work & q_valid
                 q_end_oob = q_end > num_final_rows
-                q_end = q_end_oob.select(num_final_rows, q_end)
+                q_end = fx.Int32(fx.arith.select(q_end_oob, num_final_rows, q_end))
 
             seq0 = q_start + block_idx
-            ub_seq = has_work.select(q_end, seq0)
+            ub_seq = fx.Int32(fx.arith.select(has_work, q_end, seq0))
 
             def row_from_pmap(pmap_i32, local_seq):
                 """Bounds-guarded row index from an already-loaded pmap value.
@@ -480,7 +480,9 @@ def compile_mla_reduce(
                 row_i32 = pmap_i32 + local_seq
                 if fx.const_expr(not disable_guards):
                     in_bounds = (row_i32 >= fx.Int32(0)) & (row_i32 < num_partial_rows)
-                    safe_row_i32 = in_bounds.select(row_i32, fx.Int32(0))
+                    safe_row_i32 = fx.Int32(
+                        fx.arith.select(in_bounds, row_i32, fx.Int32(0))
+                    )
                 else:
                     in_bounds = fx.Int32(0) == fx.Int32(0)
                     safe_row_i32 = row_i32
@@ -491,7 +493,9 @@ def compile_mla_reduce(
                     # Clamp the absolute pmap load address for masked tail slots.
                     # The contribution is later zeroed by the split-valid guard.
                     in_split = split_i32 < n_splits
-                    safe_split = in_split.select(split_i32, fx.Int32(0))
+                    safe_split = fx.Int32(
+                        fx.arith.select(in_split, split_i32, fx.Int32(0))
+                    )
                     return g_pmap[t0 + safe_split]
                 return lds_pmap[split_i32]
 
@@ -503,13 +507,13 @@ def compile_mla_reduce(
                 row_idx, in_bounds = gather_row(split_i32, local_seq, direct_pmap)
                 loaded = load_o_elems(row_idx, head)
                 zero = fx.Float32(0.0)
-                return [in_bounds.select(v, zero) for v in loaded]
+                return [fx.Float32(fx.arith.select(in_bounds, v, zero)) for v in loaded]
 
             def load_split_lse(split_i32, local_seq, direct_pmap: bool = False):
                 row_idx, in_bounds = gather_row(split_i32, local_seq, direct_pmap)
                 lse = g_pl[row_idx, head]
                 neg_inf = fx.Float32(float("-inf"))
-                return in_bounds.select(lse, neg_inf)
+                return fx.Float32(fx.arith.select(in_bounds, lse, neg_inf))
 
             def store_result(seq, out_elems):
                 store_o_elems(seq, head, out_elems)
@@ -519,7 +523,7 @@ def compile_mla_reduce(
                     bad = _is_zero_or_nan(sum_e)
                     lse_val = fly_math.log(sum_e, fastmath=fm_fast) + max_lse
                     inf = fx.Float32(float("inf"))
-                    final_lse_val = bad.select(inf, lse_val)
+                    final_lse_val = fx.Float32(fx.arith.select(bad, inf, lse_val))
                     if tid == fx.Int32(0):
                         _store_lse(g_flse, seq, head, final_lse_val)
 
@@ -586,9 +590,9 @@ def compile_mla_reduce(
                     for j in fx.range_constexpr(nlse):
                         split_idx = lane + fx.Int32(j * WARP)
                         in_rng = split_idx < n_splits
-                        safe = in_rng.select(split_idx, fx.Int32(0))
+                        safe = fx.Int32(fx.arith.select(in_rng, split_idx, fx.Int32(0)))
                         lse_j = load_split_lse(safe, local_seq, direct_pmap)
-                        lse_j = in_rng.select(lse_j, neg_inf)
+                        lse_j = fx.Float32(fx.arith.select(in_rng, lse_j, neg_inf))
                         local_lses.append(lse_j)
                         max_lse = fx.Float32(max_lse).maximumf(lse_j)
                     for off in [32, 16, 8, 4, 2, 1]:
@@ -606,14 +610,18 @@ def compile_mla_reduce(
                         sum_e = sum_e + peer
                     bad = _is_zero_or_nan(sum_e)
                     inf = fx.Float32(float("inf"))
-                    global_lse = bad.select(
-                        inf, fly_math.log(sum_e, fastmath=fm_fast) + max_lse
+                    global_lse = fx.Float32(
+                        fx.arith.select(
+                            bad, inf, fly_math.log(sum_e, fastmath=fm_fast) + max_lse
+                        )
                     )
                     for j in fx.range_constexpr(nlse):
                         split_idx = lane + fx.Int32(j * WARP)
                         in_rng = split_idx < n_splits
                         sc = _exp(local_lses[j] - global_lse)
-                        store_lse_scale(split_idx, in_rng.select(sc, zero_f))
+                        store_lse_scale(
+                            split_idx, fx.Float32(fx.arith.select(in_rng, sc, zero_f))
+                        )
                     if fx.const_expr(output_lse) and lane == fx.Int32(0):
                         _store_lse(g_flse, seq_i32, head, global_lse)
 
@@ -657,11 +665,13 @@ def compile_mla_reduce(
                         split_j = base_i32 + j
                         in_split = split_j < n_splits
                         if fx.const_expr(direct_pmap):
-                            safe_split = in_split.select(split_j, fx.Int32(0))
+                            safe_split = fx.Int32(
+                                fx.arith.select(in_split, split_j, fx.Int32(0))
+                            )
                             pmap_raw = g_pmap[t0 + safe_split]
                         else:
                             pmap_raw = pmap_elements[j]
-                        pmap_j = in_split.select(pmap_raw, pmap0)
+                        pmap_j = fx.Int32(fx.arith.select(in_split, pmap_raw, pmap0))
                         row_idx, in_bounds = row_from_pmap(pmap_j, local_seq)
                         os_raw = load_o_elems(row_idx, head)
                         valid = in_split & in_bounds
@@ -685,7 +695,11 @@ def compile_mla_reduce(
                     scs = []
                     scale_elements = _vector_elements(scale_v, fx.Float32, GRP)
                     for j in fx.range_constexpr(GRP):
-                        scs.append(valids[j].select(scale_elements[j], zero_f))
+                        scs.append(
+                            fx.Float32(
+                                fx.arith.select(valids[j], scale_elements[j], zero_f)
+                            )
+                        )
                     return scs
 
                 def load_group(base_i32):
@@ -835,7 +849,9 @@ def compile_mla_reduce(
                     # Fence before reusing LDS for the next work item.
                     fx.gpu.barrier()
 
-                work_idx = is_past_end.select(tot_work, work_idx + grid_stride)
+                work_idx = fx.Int32(
+                    fx.arith.select(is_past_end, tot_work, work_idx + grid_stride)
+                )
         else:
             head = fx.block_idx.x
             block_idx = fx.block_idx.y  # q-pos group (NTG)
@@ -1157,7 +1173,7 @@ def compile_mla_reduce_splitk(
         lo = j * chunk
         hi_full = lo + chunk
         over = hi_full > n_splits
-        hi = over.select(n_splits, hi_full)
+        hi = fx.Int32(fx.arith.select(over, n_splits, hi_full))
 
         neg_inf = fx.Float32(float("-inf"))
         zero_f = fx.Float32(0.0)
@@ -1174,10 +1190,10 @@ def compile_mla_reduce_splitk(
             split_i32 = t0 + s_i32
             pmap_v = g_pmap[split_i32]
             in_b = (pmap_v >= fx.Int32(0)) & (pmap_v < num_partial_rows)
-            safe_row = in_b.select(pmap_v, fx.Int32(0))
+            safe_row = fx.Int32(fx.arith.select(in_b, pmap_v, fx.Int32(0)))
             os = _load_partial_out(partial_output_buf, safe_row, head, tid, VEC)
             lse = g_pl[safe_row, head]
-            lse = in_b.select(lse, neg_inf)
+            lse = fx.Float32(fx.arith.select(in_b, lse, neg_inf))
             new_m = fx.Float32(m).maximumf(lse)
             c_old = _exp(fx.Float32(m) - new_m)
             c_new = _exp(lse - new_m)
@@ -1287,7 +1303,7 @@ def compile_mla_reduce_splitk(
                 den = den + lj * wj
 
             den_ok = den > zero_f
-            inv = den_ok.select(fx.rocdl.rcp(T.f32, den), zero_f)
+            inv = fx.Float32(fx.arith.select(den_ok, fx.rocdl.rcp(T.f32, den), zero_f))
             out_elems = [regs[i] * inv for i in fx.range_constexpr(VEC)]
 
             if q_valid:
@@ -1297,7 +1313,11 @@ def compile_mla_reduce_splitk(
                 if fx.const_expr(output_lse):
                     bad = _is_zero_or_nan(den)
                     inf = fx.Float32(float("inf"))
-                    lse_val = bad.select(inf, fly_math.log(den, fastmath=fm_fast) + M)
+                    lse_val = fx.Float32(
+                        fx.arith.select(
+                            bad, inf, fly_math.log(den, fastmath=fm_fast) + M
+                        )
+                    )
                     if tid == fx.Int32(0):
                         _store_lse(g_flse, q_start, head, lse_val)
 

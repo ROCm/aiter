@@ -118,8 +118,8 @@ class DualwaveFp8KvGmemToLdsLoader(DualwaveFp8KernelContext):
             c_sub = (w16 >= fx.Int32(8)) & (w16 < fx.Int32(12))
             n = (
                 dest_n
-                + c_add.select(fx.Int32(4), fx.Int32(0))
-                - c_sub.select(fx.Int32(4), fx.Int32(0))
+                + fx.Int32(fx.arith.select(c_add, fx.Int32(4), fx.Int32(0)))
+                - fx.Int32(fx.arith.select(c_sub, fx.Int32(4), fx.Int32(0)))
             )
             d_block = rem // 8
             src_elem = (

@@ -67,13 +67,9 @@ def _pair_routewise_half_scatter(lds_a, lds_b, n_block_idx, wave, lane, *,
     token_nbytes = N_OUT + N_OUT // 32
     second_half = lane >= fx.Int32(32)
     half_lane = lane & fx.Int32(31)
-    selected_lds = second_half.select(lds_b, lds_a)
-    packed_off = second_half.select(
-        fx.Int32(lds_packed_b_off), fx.Int32(lds_packed_a_off)
-    )
-    weight_off = second_half.select(
-        fx.Int32(lds_weight_b_off), fx.Int32(lds_weight_a_off)
-    )
+    selected_lds = fx.Int32(fx.arith.select(second_half, lds_b, lds_a))
+    packed_off = fx.Int32(fx.arith.select(second_half, fx.Int32(lds_packed_b_off), fx.Int32(lds_packed_a_off)))
+    weight_off = fx.Int32(fx.arith.select(second_half, fx.Int32(lds_weight_b_off), fx.Int32(lds_weight_a_off)))
 
     for row_iter in range_constexpr(BM // 4):
         row = wave + fx.Int32(row_iter * 4)
@@ -97,7 +93,7 @@ def _pair_routewise_half_scatter(lds_a, lds_b, n_block_idx, wave, lane, *,
             & (slot < fx.Int32(topk))
             & (dest_pe < fx.Int32(npes))
         )
-        safe_peer = valid.select(dest_pe, fx.Int32(0))
+        safe_peer = fx.Int32(fx.arith.select(valid, dest_pe, fx.Int32(0)))
         peer_base = fx.Int64(
             fx.ptr_load(
                 lds_typed_ptr(
@@ -117,7 +113,7 @@ def _pair_routewise_half_scatter(lds_a, lds_b, n_block_idx, wave, lane, *,
             token_nbytes
         )
         active = half_lane < fx.Int32(BN // ALIGNED_PAIR_SCATTER_VEC)
-        col = active.select(half_lane * fx.Int32(ALIGNED_PAIR_SCATTER_VEC), fx.Int32(0))
+        col = fx.Int32(fx.arith.select(active, half_lane * fx.Int32(ALIGNED_PAIR_SCATTER_VEC), fx.Int32(0)))
         idx0 = row * fx.Int32(BN) + col
         values_raw = fx.Vector(
             lds_vec_load(
@@ -177,10 +173,7 @@ def _pair_routewise_half_scatter(lds_a, lds_b, n_block_idx, wave, lane, *,
                 )
             packed_words.append(fx.Vector(packed_word).bitcast(fx.Int32)[0])
         payload = fx.Vector.from_elements(packed_words, fx.Int32)
-        payload_off = (valid & active).select(
-            row_base + n_block_idx * fx.Int32(BN) + col,
-            fx.Int32(comb_inp_nbytes),
-        )
+        payload_off = fx.Int32(fx.arith.select(valid & active, row_base + n_block_idx * fx.Int32(BN) + col, fx.Int32(comb_inp_nbytes)))
         buf_copy_store(
             payload_buf,
             payload_off // fx.Int32(ALIGNED_PAIR_SCATTER_VEC),
@@ -193,13 +186,10 @@ def _pair_routewise_half_scatter(lds_a, lds_b, n_block_idx, wave, lane, *,
         @flyc.jit
         def store_scale_if_leader():
             if scale_leader:
-                scale_off = valid.select(
-                    row_base
+                scale_off = fx.Int32(fx.arith.select(valid, row_base
                     + fx.Int32(N_OUT)
                     + n_block_idx * fx.Int32(BN // 32)
-                    + half_lane // fx.Int32(scale_group_lanes),
-                    fx.Int32(comb_inp_nbytes),
-                )
+                    + half_lane // fx.Int32(scale_group_lanes), fx.Int32(comb_inp_nbytes)))
                 scale_buf = ptr_buf_tensor(
                     peer_base,
                     fx.Int8,
@@ -316,9 +306,7 @@ def compile_mega_moe_stage2_aligned_pair(*, model_dim: int, inter_dim: int,
         # after divergent control flow can select the wrong experts.
         pair_a_lane = packed_pair & fx.Int32(0xFF)
         pair_b_lane = packed_pair.shrui(fx.Int32(8)) & fx.Int32(0xFF)
-        pair_enabled_lane = (
-            (packed_pair & fx.Int32(1 << 16)) != fx.Int32(0)
-        ).select(fx.Int32(1), fx.Int32(0))
+        pair_enabled_lane = fx.Int32(fx.arith.select((packed_pair & fx.Int32(1 << 16)) != fx.Int32(0), fx.Int32(1), fx.Int32(0)))
         pair_a_rt = fx.Int32(rocdl.readfirstlane(T.i32, pair_a_lane))
         pair_b_rt = fx.Int32(rocdl.readfirstlane(T.i32, pair_b_lane))
         pair_enabled = fx.Int32(
@@ -330,29 +318,21 @@ def compile_mega_moe_stage2_aligned_pair(*, model_dim: int, inter_dim: int,
         group_b_lane = fx.Int32(0)
         group_rows_lane = fx.Int32(0)
         if lane == fx.Int32(0):
-            safe_prev_a = (pair_a_rt > fx.Int32(0)).select(
-                pair_a_rt - fx.Int32(1), fx.Int32(0)
-            )
-            safe_prev_b = (pair_b_rt > fx.Int32(0)).select(
-                pair_b_rt - fx.Int32(1), fx.Int32(0)
-            )
+            safe_prev_a = fx.Int32(fx.arith.select(pair_a_rt > fx.Int32(0), pair_a_rt - fx.Int32(1), fx.Int32(0)))
+            safe_prev_b = fx.Int32(fx.arith.select(pair_b_rt > fx.Int32(0), pair_b_rt - fx.Int32(1), fx.Int32(0)))
             prev_a = expert_tile_end[safe_prev_a] * fx.Int32(SBM)
             prev_b = expert_tile_end[safe_prev_b] * fx.Int32(SBM)
-            group_a_lane = (pair_a_rt > fx.Int32(0)).select(
-                prev_a, fx.Int32(0)
-            )
-            group_b_lane = (pair_b_rt > fx.Int32(0)).select(
-                prev_b, fx.Int32(0)
-            )
+            group_a_lane = fx.Int32(fx.arith.select(pair_a_rt > fx.Int32(0), prev_a, fx.Int32(0)))
+            group_b_lane = fx.Int32(fx.arith.select(pair_b_rt > fx.Int32(0), prev_b, fx.Int32(0)))
             group_count = fx.Int32(0)
             group_column = fx.Int32(total_experts + rank)
             for source in range_constexpr(npes):
                 group_count = group_count + count_matrix[
                     fx.Int32(source * total_segments) + group_column
                 ]
-            group_rows_lane = pair_enabled.select((
+            group_rows_lane = fx.Int32(fx.arith.select(pair_enabled, (
                 (group_count + fx.Int32(SBM - 1)) // fx.Int32(SBM)
-            ) * fx.Int32(SBM), fx.Int32(0))
+            ) * fx.Int32(SBM), fx.Int32(0)))
         group_a = fx.Int32(rocdl.readfirstlane(T.i32, group_a_lane))
         group_b = fx.Int32(rocdl.readfirstlane(T.i32, group_b_lane))
         group_rows = fx.Int32(rocdl.readfirstlane(T.i32, group_rows_lane))
@@ -373,7 +353,7 @@ def compile_mega_moe_stage2_aligned_pair(*, model_dim: int, inter_dim: int,
         n_block = bx // fx.Int32(cu_num)
         m_slot = bx - n_block * fx.Int32(cu_num)
         diff = total_m_blocks - m_slot
-        remaining = (diff > fx.Int32(0)).select(diff, fx.Int32(0))
+        remaining = fx.Int32(fx.arith.select(diff > fx.Int32(0), diff, fx.Int32(0)))
         iterations = (
             remaining + fx.Int32(cu_num - 1)
         ) // fx.Int32(cu_num)
@@ -488,21 +468,7 @@ def compile_mega_moe_stage2_aligned_pair(*, model_dim: int, inter_dim: int,
             # coprime to M. Pick a small prime which does not divide the
             # runtime group size; this spreads initially resident CTAs across
             # all source-rank row bands without changing coverage.
-            factor = (total_m_blocks % fx.Int32(17) != fx.Int32(0)).select(
-                fx.Int32(17),
-                (total_m_blocks % fx.Int32(13) != fx.Int32(0)).select(
-                    fx.Int32(13),
-                    (total_m_blocks % fx.Int32(11) != fx.Int32(0)).select(
-                        fx.Int32(11),
-                        (total_m_blocks % fx.Int32(7) != fx.Int32(0)).select(
-                            fx.Int32(7),
-                            (total_m_blocks % fx.Int32(5) != fx.Int32(0)).select(
-                                fx.Int32(5), fx.Int32(1)
-                            ),
-                        ),
-                    ),
-                ),
-            )
+            factor = fx.Int32(fx.arith.select(total_m_blocks % fx.Int32(17) != fx.Int32(0), fx.Int32(17), fx.Int32(fx.arith.select(total_m_blocks % fx.Int32(13) != fx.Int32(0), fx.Int32(13), fx.Int32(fx.arith.select(total_m_blocks % fx.Int32(11) != fx.Int32(0), fx.Int32(11), fx.Int32(fx.arith.select(total_m_blocks % fx.Int32(7) != fx.Int32(0), fx.Int32(7), fx.Int32(fx.arith.select(total_m_blocks % fx.Int32(5) != fx.Int32(0), fx.Int32(5), fx.Int32(1)))))))))))
             return (m_block * factor) % total_m_blocks
 
         for iteration in range(fx.Int32(0), iterations, fx.Int32(1)):

@@ -306,7 +306,9 @@ class QManager16bV1:
                 pr = warp_row0 + row
                 q_head = kv_head * self.gqa_ratio + pr % self.gqa_ratio
                 seq = pr // self.gqa_ratio
-                safe_seq = (seq < q_len).select(seq, fx.Int32(0))  # clamp OOB
+                safe_seq = fx.Int32(
+                    fx.arith.select(seq < q_len, seq, fx.Int32(0))
+                )  # clamp OOB
                 token = q_start + safe_seq
                 # stride_q_seq/head arrive in ELEMENTS (host convention); convert the
                 # whole offset to bytes here (V2 TDM uses the element strides directly).
@@ -599,7 +601,9 @@ class KManager16bV1:
             row_in_tile = (row_idx % _WMMA_M) + wr_row  # row within that tile [0,16)
             kv_row = row_idx + wr_row
             if check_oob:
-                kv_row = (kv_row < kv_valid).select(kv_row, fx.Int32(0))  # clamp OOB
+                kv_row = fx.Int32(
+                    fx.arith.select(kv_row < kv_valid, kv_row, fx.Int32(0))
+                )  # clamp OOB
             token = kv_row0 + kv_row
             # Row base at hdim column 0 (col term lives in the immediate); computed once.
             # stride_k_seq/head are ELEMENT strides -> ×_BF16_BYTES to a byte offset.
@@ -630,7 +634,9 @@ class KManager16bV1:
             tile_col = col_idx // _WMMA_K
             kv_row = row_idx + wr_row
             if check_oob:
-                kv_row = (kv_row < kv_valid).select(kv_row, fx.Int32(0))  # clamp OOB
+                kv_row = fx.Int32(
+                    fx.arith.select(kv_row < kv_valid, kv_row, fx.Int32(0))
+                )  # clamp OOB
             token = kv_row0 + kv_row
             g_off = (
                 token * stride_k_seq
@@ -813,7 +819,9 @@ class VManager16bV1:
             kv_row = row_idx + wr_row  # UNCLAMPED (LDS position); once/warp
             safe_kv = kv_row
             if check_oob:
-                safe_kv = (kv_row < kv_valid).select(kv_row, fx.Int32(0))  # clamp OOB
+                safe_kv = fx.Int32(
+                    fx.arith.select(kv_row < kv_valid, kv_row, fx.Int32(0))
+                )  # clamp OOB
             token = kv_row0 + safe_kv
             # Row base at d column 0 (col term lives in the immediate); computed once.
             # stride_v_seq/head are ELEMENT strides -> ×_BF16_BYTES to a byte offset.
@@ -843,7 +851,9 @@ class VManager16bV1:
             d_col = fx.Int32(col_idx) + chunk * _CHUNK_ELEMS
             safe_kv = kv_row
             if check_oob:
-                safe_kv = (kv_row < kv_valid).select(kv_row, fx.Int32(0))  # clamp OOB
+                safe_kv = fx.Int32(
+                    fx.arith.select(kv_row < kv_valid, kv_row, fx.Int32(0))
+                )  # clamp OOB
             token = kv_row0 + safe_kv
             g_off = (
                 token * stride_v_seq + kv_head * stride_v_head + d_col
@@ -1540,7 +1550,9 @@ class OManager16bV1:
                     + d_local
                 )
                 off_bytes = off_elems * fx.Int32(_BF16_BYTES)
-                off_masked = valid.select(off_bytes, fx.Int32(0x7FFFFFFF))
+                off_masked = fx.Int32(
+                    fx.arith.select(valid, off_bytes, fx.Int32(0x7FFFFFFF))
+                )
                 buffer_ops.buffer_store(
                     data, o_rsrc, off_masked, mask=None, offset_is_bytes=True
                 )

@@ -518,8 +518,10 @@ def build_pa_mqa_logits_fp4_prefill_module(
             max_size=False,
             num_records_bytes=win_len * fx.Int32(4),
         )
-        out_lane_off = lane_mod_16 + (lane_div_16 > fx.Int32(0)).select(
-            fx.Int32(_NON_WRITER_LANE_OFF), fx.Int32(0)
+        out_lane_off = lane_mod_16 + fx.Int32(
+            fx.arith.select(
+                lane_div_16 > fx.Int32(0), fx.Int32(_NON_WRITER_LANE_OFF), fx.Int32(0)
+            )
         )
         out_atom = fx.make_copy_atom(fx.rocdl.BufferCopy32b(), 1)
         out_reg_ty = fx.MemRefType.get(

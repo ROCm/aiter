@@ -50,7 +50,6 @@ from flydsl.expr import arith, const_expr, fastmath, gpu, range_constexpr
 from flydsl.expr import math as fmath
 from flydsl.expr.typing import Int32, Stream, T
 
-from .act import LOG2E as _LOG2E
 from .fused_compress_attn_common import (
     _NEG_INF,
     _fexp_f32,
@@ -60,6 +59,7 @@ from .fused_compress_attn_common import (
     emit_group_fp8_nm_asm_scatter,
     state_slot_byte_offset,
 )
+from .kernels_common import LOG2E as _LOG2E
 from .tensor_shim import _run_compiled, ptr_buf_tensor
 
 BLOCK_THREADS = 64  # 1 wave64
@@ -240,7 +240,9 @@ def _build_compress_forward_kernel(
                     # logical (unsigned) shift for the hi-word extract: fx Int32 >>
                     # is arithmetic -> use Uint32 to keep v_lshrrev_b32.
                     hi = fx.Int32((fx.Uint32(raw_s) >> 16).ir_value())
-                    lo_or_hi = (lane_in_dw == fx.Int32(0)).select(raw_s, hi)
+                    lo_or_hi = fx.Int32(
+                        fx.arith.select(lane_in_dw == fx.Int32(0), raw_s, hi)
+                    )
                     lo16 = lo_or_hi & 0xFFFF
                     lo16_v = fx.Vector.from_elements([lo16], dtype=fx.Int32)
                     bf16_pair = lo16_v.bitcast(fx.BFloat16)
@@ -305,7 +307,9 @@ def _build_compress_forward_kernel(
                 k = fx.Int32(k_i32)
                 ape_row = k % ratio
                 in_row_raw = fx.Int32(ragged_id) - (fx.Int32(K - 1) - k)
-                in_row = (in_row_raw > fx.Int32(0)).select(in_row_raw, fx.Int32(0))
+                in_row = fx.Int32(
+                    fx.arith.select(in_row_raw > fx.Int32(0), in_row_raw, fx.Int32(0))
+                )
                 base_in_off = in_row * fx.Int32(kv_in_row_stride) + col_off_base
                 base_sc_off = in_row * fx.Int32(score_in_row_stride) + col_off_base
                 base_ape_off = ape_row * DIM_FULL + col_off_base
@@ -319,7 +323,7 @@ def _build_compress_forward_kernel(
                 each of length VEC. Score is -inf when s < 0."""
                 s = fx.Int32(position) - fx.Int32(K - 1) + fx.Int32(k_i32)
                 is_pad = s < fx.Int32(0)
-                s_safe = is_pad.select(fx.Int32(0), s)
+                s_safe = fx.Int32(fx.arith.select(is_pad, fx.Int32(0), s))
                 ring = s_safe % state_size
                 # Slot term already folded into the descriptor base.
                 base_kv_off = ring * fx.Int32(kv_state_pos_stride) + col_off_base
@@ -327,7 +331,10 @@ def _build_compress_forward_kernel(
                 kv_list = _load_f32_vec(kv_state_buf, base_kv_off)
                 sc_list = _load_f32_vec(score_state_buf, base_sc_off)
                 neg_inf = fx.Float32(c_neg_inf)
-                sc_padded = [is_pad.select(neg_inf, sc_list[i]) for i in range(VEC)]
+                sc_padded = [
+                    fx.Float32(fx.arith.select(is_pad, neg_inf, sc_list[i]))
+                    for i in range(VEC)
+                ]
                 return kv_list, sc_padded
 
             def _softmax_step_padded(
@@ -357,11 +364,11 @@ def _build_compress_forward_kernel(
                     with fastmath(None):
                         is_first = m_old == neg_inf
                     scale_active = fx.Float32(_fexp_f32(m_old - m_new, c_log2e))
-                    scale_v = is_first.select(zero, scale_active)
+                    scale_v = fx.Float32(fx.arith.select(is_first, zero, scale_active))
                     wk_active = fx.Float32(_fexp_f32(score_k - m_new, c_log2e))
                     with fastmath(None):
                         is_pad_score = score_k == neg_inf
-                    w_k = is_pad_score.select(zero, wk_active)
+                    w_k = fx.Float32(fx.arith.select(is_pad_score, zero, wk_active))
                     new_kv.append((kv_old * scale_v + w_k * kv_k).ir_value())
                     new_w.append((w_old * scale_v + w_k).ir_value())
                     new_m.append(m_new.ir_value())
@@ -381,8 +388,10 @@ def _build_compress_forward_kernel(
             # both sub-loops are empty when their bound collapses, so any
             # of the three cases naturally falls out.
             wl = fx.Int32(window_len)
-            split_lo = (wl > k_start_i32).select(wl, k_start_i32)
-            split_i32 = (split_lo < k_end_i32).select(split_lo, k_end_i32)
+            split_lo = fx.Int32(fx.arith.select(wl > k_start_i32, wl, k_start_i32))
+            split_i32 = fx.Int32(
+                fx.arith.select(split_lo < k_end_i32, split_lo, k_end_i32)
+            )
 
             # State is 3*VEC scalars: m_lane[VEC] + kv_lane[VEC] + w_lane[VEC].
             init_m = [c_neg_inf for _ in range(VEC)]
@@ -746,7 +755,9 @@ def _build_norm_rope_scatter_kernel(
 
             is_rope_t = lane >= fx.Int32(ROPE_THREAD_LO)
             rope_rel_raw = lane - ROPE_THREAD_LO
-            rope_rel = (rope_rel_raw > fx.Int32(0)).select(rope_rel_raw, fx.Int32(0))
+            rope_rel = fx.Int32(
+                fx.arith.select(rope_rel_raw > fx.Int32(0), rope_rel_raw, fx.Int32(0))
+            )
             cs_lo = rope_rel * PAIRS_PER_THREAD
 
             if const_expr(PAIRS_PER_THREAD == 1):
@@ -835,7 +846,9 @@ def _build_norm_rope_scatter_kernel(
                     fx.Int32,
                 )
                 out_lane = [
-                    is_rope_t.select(rotated_lane[i], normed_lane[i])
+                    fx.Float32(
+                        fx.arith.select(is_rope_t, rotated_lane[i], normed_lane[i])
+                    )
                     for i in range_constexpr(VEC)
                 ]
                 cache_off = cache_base + tid_x_vec

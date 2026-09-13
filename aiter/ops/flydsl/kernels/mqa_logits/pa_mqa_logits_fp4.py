@@ -287,7 +287,9 @@ def build_pa_mqa_logits_fp4_module(
         # matters: a negative length wraps to a huge unsigned bound.
         _mask_off = fx.Int32(next_n - 1) - pid_next_n
         _win_raw = context_len - _mask_off
-        win_len = (_win_raw < fx.Int32(0)).select(fx.Int32(0), _win_raw)
+        win_len = fx.Int32(
+            fx.arith.select(_win_raw < fx.Int32(0), fx.Int32(0), _win_raw)
+        )
         out_win = fx.rocdl.make_buffer_tensor(
             fx.make_view(
                 fx.recast_iter(
@@ -298,8 +300,10 @@ def build_pa_mqa_logits_fp4_module(
             max_size=False,
             num_records_bytes=win_len * fx.Int32(4),
         )
-        out_lane_off = lane_mod_16 + (lane_div_16 > fx.Int32(0)).select(
-            fx.Int32(_NON_WRITER_LANE_OFF), fx.Int32(0)
+        out_lane_off = lane_mod_16 + fx.Int32(
+            fx.arith.select(
+                lane_div_16 > fx.Int32(0), fx.Int32(_NON_WRITER_LANE_OFF), fx.Int32(0)
+            )
         )
         out_atom = fx.make_copy_atom(fx.rocdl.BufferCopy32b(), 1)
         out_reg_ty = fx.MemRefType.get(

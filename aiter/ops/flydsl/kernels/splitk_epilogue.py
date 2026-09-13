@@ -96,7 +96,9 @@ def splitk_reduce_epilogue(
                 _semaphore_addr(semaphore, bid_x, bid_y, tiles_n), fx.Int32(1)
             )
         )
-        is_last = (arrival == fx.Int32(split_k - 1)).select(fx.Int32(1), fx.Int32(0))
+        is_last = fx.Int32(
+            fx.arith.select(arrival == fx.Int32(split_k - 1), fx.Int32(1), fx.Int32(0))
+        )
         fx.ptr_store(Vec.from_elements([is_last], Int32), flag_ptr)
     gpu.barrier()
 

@@ -42,7 +42,7 @@ from flydsl.runtime.device import get_rocm_arch
 
 from aiter.jit.utils.chip_info import get_lds_capacity_bytes
 
-from .act import LOG2E as _LOG2E
+from .kernels_common import LOG2E as _LOG2E
 
 
 def _dtype_to_elem_type(dtype_str: str):
@@ -345,14 +345,14 @@ def build_hstu_attention_fwd(
         # hz_per_group is a ceil -> the last group is padded past batch*num_heads. Padding blocks
         # clamp hz_idx=0 (in-bounds seq_offsets read) and set seq_len=0 below -> no stores, n_tiles=0.
         block_valid = hz_idx < hz_total
-        hz_idx = block_valid.select(hz_idx, fx.Int32(0))
+        hz_idx = fx.Int32(fx.arith.select(block_valid, hz_idx, fx.Int32(0)))
         batch_idx = hz_idx // fx.Int32(num_heads)
         head_idx = hz_idx % fx.Int32(num_heads)
 
         # ---- Sequence bounds + id clamps (target tail) ----
         seq_start = fx.Int32(seq_offsets[batch_idx])
         seq_len = fx.Int32(seq_offsets[batch_idx + fx.Int32(1)]) - seq_start
-        seq_len = block_valid.select(seq_len, fx.Int32(0))
+        seq_len = fx.Int32(fx.arith.select(block_valid, seq_len, fx.Int32(0)))
 
         num_target = fx.Int32(0)
         if has_targets:
@@ -363,7 +363,9 @@ def build_hstu_attention_fwd(
         if has_contextual:
             max_id = seq_len - fx.Int32(contextual_seq_len) + fx.Int32(1)
         if has_targets:
-            max_id = (num_target > fx.Int32(0)).select(max_id - num_target, max_id)
+            max_id = fx.Int32(
+                fx.arith.select(num_target > fx.Int32(0), max_id - num_target, max_id)
+            )
 
         # ---- Global tensor views: g-wide coordinate slices for coalesced vector loads ----
         # (row, head) is indexed through the tensor's own i64-strided layout first (row*row_stride can
@@ -433,11 +435,19 @@ def build_hstu_attention_fwd(
             q_col = fx.Int32(ks * MFMA_K) + lane_div_16 * fx.Int32(MFMA_LANE_K)
             per_qg = []
             for qg in range_constexpr(Q_SUBTILES):
-                safe = q_in_bounds[qg].select(seq_start + q_rows[qg], seq_start)
+                safe = fx.Int32(
+                    fx.arith.select(q_in_bounds[qg], seq_start + q_rows[qg], seq_start)
+                )
                 raw = q_load(
                     fx.Int64(safe), head_idx, q_col // fx.Int32(MFMA_LANE_K)
                 ).ir_value()
-                per_qg.append(q_in_bounds[qg].select(raw, c_zero_mfma_pack))
+                per_qg.append(
+                    fx.Vector(
+                        fx.arith.select(q_in_bounds[qg], raw, c_zero_mfma_pack),
+                        shape=(MFMA_LANE_K,),
+                        dtype=elem_dtype,
+                    )
+                )
             q_packs.append(per_qg)
 
         # ---- Score-gate helpers ----
@@ -471,9 +481,9 @@ def build_hstu_attention_fwd(
             xid = x
             if has_contextual:
                 xid = xid - fx.Int32(contextual_seq_len - 1)
-                xid = (xid < fx.Int32(0)).select(fx.Int32(0), xid)
+                xid = fx.Int32(fx.arith.select(xid < fx.Int32(0), fx.Int32(0), xid))
             if has_targets:
-                xid = (xid > max_id).select(max_id, xid)
+                xid = fx.Int32(fx.arith.select(xid > max_id, max_id, xid))
             return xid
 
         def pack_p(vals):
@@ -501,31 +511,35 @@ def build_hstu_attention_fwd(
         q_end = q_start + fx.Int32(BLOCK_M)
         base_upper = seq_len
         if causal:
-            clamped = (q_end < seq_len).select(q_end, seq_len)
+            clamped = fx.Int32(fx.arith.select(q_end < seq_len, q_end, seq_len))
             if has_contextual:
                 # The prefix block holds logical row id 0, which attends the whole contextual
                 # prefix (col_id < max_id) above its diagonal, so its KV range opens to seq_len.
                 # Other blocks are pure causal and their high tiles are fully masked.
                 ctx_block = q_start < fx.Int32(contextual_seq_len)
-                base_upper = ctx_block.select(seq_len, clamped)
+                base_upper = fx.Int32(fx.arith.select(ctx_block, seq_len, clamped))
             else:
                 base_upper = clamped
         active = q_start < seq_len
-        kv_upper = active.select(base_upper, fx.Int32(0))
+        kv_upper = fx.Int32(fx.arith.select(active, base_upper, fx.Int32(0)))
         n_tiles = (kv_upper + fx.Int32(BLOCK_N - 1)) // fx.Int32(BLOCK_N)
 
         # ---- Sliding-window lower bound: skip fully-masked low KV tiles ----
         kv_tile_start = fx.Int32(0)
         if has_window:
-            eff_q_low = (q_start < max_id).select(q_start, max_id)
+            eff_q_low = fx.Int32(fx.arith.select(q_start < max_id, q_start, max_id))
             kv_lower = eff_q_low - fx.Int32(max_attn_len)
-            kv_lower = (kv_lower > fx.Int32(0)).select(kv_lower, fx.Int32(0))
+            kv_lower = fx.Int32(
+                fx.arith.select(kv_lower > fx.Int32(0), kv_lower, fx.Int32(0))
+            )
             win_tile_start = kv_lower // fx.Int32(BLOCK_N)
             if has_contextual:
                 # The prefix block must walk KV from 0 to see the prefix; the window lower bound
                 # would otherwise skip the low tiles the prefix opener needs.
                 ctx_prefix_block = q_start < fx.Int32(contextual_seq_len)
-                kv_tile_start = ctx_prefix_block.select(fx.Int32(0), win_tile_start)
+                kv_tile_start = fx.Int32(
+                    fx.arith.select(ctx_prefix_block, fx.Int32(0), win_tile_start)
+                )
             else:
                 kv_tile_start = win_tile_start
 
@@ -570,12 +584,20 @@ def build_hstu_attention_fwd(
                     ).ir_value()
                     vecs.append(raw)
                 else:
-                    safe = guard.select(seq_start + tok, seq_start)
+                    safe = fx.Int32(fx.arith.select(guard, seq_start + tok, seq_start))
                     raw = k_load(
                         fx.Int64(safe), head_idx, k_load_col // fx.Int32(VEC_K)
                     ).ir_value()
                     vecs.append(
-                        guard.select(raw, Vec.filled(VEC_K, 0.0, elem_dtype).ir_value())
+                        fx.Vector(
+                            fx.arith.select(
+                                guard,
+                                raw,
+                                Vec.filled(VEC_K, 0.0, elem_dtype).ir_value(),
+                            ),
+                            shape=(VEC_K,),
+                            dtype=elem_dtype,
+                        )
                     )
             return vecs
 
@@ -627,12 +649,22 @@ def build_hstu_attention_fwd(
                     ).ir_value()
                     vecs.append(raw)
                 else:
-                    safe_tok = guard.select(seq_start + tok, seq_start)
+                    safe_tok = fx.Int32(
+                        fx.arith.select(guard, seq_start + tok, seq_start)
+                    )
                     raw = v_load(
                         fx.Int64(safe_tok), head_idx, v_load_col // fx.Int32(VEC_V)
                     ).ir_value()
                     vecs.append(
-                        guard.select(raw, Vec.filled(VEC_V, 0.0, elem_dtype).ir_value())
+                        fx.Vector(
+                            fx.arith.select(
+                                guard,
+                                raw,
+                                Vec.filled(VEC_V, 0.0, elem_dtype).ir_value(),
+                            ),
+                            shape=(VEC_V,),
+                            dtype=elem_dtype,
+                        )
                     )
             return vecs
 
@@ -717,7 +749,9 @@ def build_hstu_attention_fwd(
                                 # Non-causal: symmetric id distance |q - col|. With the diagonal
                                 # term this admits all in-seq columns (full attention); a window
                                 # then becomes symmetric (|q - col| <= max_attn_len).
-                                dist = (dist > fx.Int32(0)).select(dist, -dist)
+                                dist = fx.Int32(
+                                    fx.arith.select(dist > fx.Int32(0), dist, -dist)
+                                )
                             # Diagonal compared in RAW positions (q_rows_i32 == col_raw): a query
                             # always attends its own token, even where to_id's shift+clamp collapses
                             # distinct ids. The window/causal distance uses to_id ids, so the id
@@ -737,7 +771,9 @@ def build_hstu_attention_fwd(
                             return keep
 
                         s_vals = [
-                            keep_col(i).select(s_vals[i], c_zero_f)
+                            fx.Float32(
+                                fx.arith.select(keep_col(i), s_vals[i], c_zero_f)
+                            )
                             for i in range_constexpr(MFMA_ELEMS_PER_LANE)
                         ]
                     p_packs[ng][qg] = pack_p(silu_scale_batch(s_vals))
@@ -810,12 +846,18 @@ def build_hstu_attention_fwd(
             if const_expr(CAUSAL_SPLIT):
                 split_pos = q_start
                 if has_targets:
-                    split_pos = (q_start < max_id).select(q_start, max_id)
+                    split_pos = fx.Int32(
+                        fx.arith.select(q_start < max_id, q_start, max_id)
+                    )
                 unmasked_end = split_pos // fx.Int32(BLOCK_N)
-                unmasked_end = (unmasked_end > kv_tile_start).select(
-                    unmasked_end, kv_tile_start
+                unmasked_end = fx.Int32(
+                    fx.arith.select(
+                        unmasked_end > kv_tile_start, unmasked_end, kv_tile_start
+                    )
                 )
-                unmasked_end = (unmasked_end < n_tiles).select(unmasked_end, n_tiles)
+                unmasked_end = fx.Int32(
+                    fx.arith.select(unmasked_end < n_tiles, unmasked_end, n_tiles)
+                )
             else:
                 unmasked_end = kv_tile_start
 

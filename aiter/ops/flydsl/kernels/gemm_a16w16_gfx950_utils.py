@@ -77,13 +77,15 @@ class BlockSwizzle:
         intra_group = wgid % wgid_per_group
         first_pid_m = group_id * group_m
         remaining_m = num_pid_m - first_pid_m
-        group_size_m = (remaining_m < group_m).select(remaining_m, group_m)
+        group_size_m = fx.Int32(
+            fx.arith.select(remaining_m < group_m, remaining_m, group_m)
+        )
         swizzled_n = intra_group // group_size_m
         swizzled_m = first_pid_m + (intra_group % group_size_m)
         use_simple = (num_wg < swizzle_threshold) | ((num_wg % num_xcds) != 0)
         return (
-            use_simple.select(simple_m, swizzled_m),
-            use_simple.select(simple_n, swizzled_n),
+            fx.Int32(fx.arith.select(use_simple, simple_m, swizzled_m)),
+            fx.Int32(fx.arith.select(use_simple, simple_n, swizzled_n)),
         )
 
 
@@ -153,7 +155,9 @@ class SplitKProtocol:
                 n_local_idx = global_tid % self.STG_C_X_THREADS * self.STG_VEC_SIZE
                 global_m_idx = self.block_m_offset + m_local_idx
                 global_n_idx = self.block_n_offset + n_local_idx
-                safe_global_n_idx = (global_n_idx < self.n).select(global_n_idx, 0)
+                safe_global_n_idx = fx.Int32(
+                    fx.arith.select(global_n_idx < self.n, global_n_idx, 0)
+                )
                 if const_expr(self.HAS_BIAS):
                     init_vec = self.bias_vecs[
                         None, safe_global_n_idx // self.STG_VEC_SIZE

@@ -175,8 +175,14 @@ def moe_reduction_kernel(
                     [vk[i] * wk for i in range_constexpr(V)], fx.Float32
                 )
             if const_expr(use_mask):
-                vk = (em_ptr[tk_ptr[k]] != fx.Int32(0)).select(
-                    vk, fx.Vector.filled(V, 0.0, fx.Float32)
+                vk = fx.Vector(
+                    fx.arith.select(
+                        em_ptr[tk_ptr[k]] != fx.Int32(0),
+                        vk,
+                        fx.Vector.filled(V, 0.0, fx.Float32),
+                    ),
+                    shape=(V,),
+                    dtype=fx.Float32,
                 )
             acc = acc + vk
         ofrag = fx.make_fragment_like(p_dst)

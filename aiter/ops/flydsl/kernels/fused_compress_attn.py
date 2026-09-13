@@ -86,9 +86,6 @@ from aiter.utility.mx_types import (
     MxScaleRoundModeInt as _MxRoundInt,
 )
 
-# Shared FP8 group_fp8 (V4 nm-asm) scatter emitter (single source of truth across
-# the CSA single-kernel + HCA 2-kernel paths). See fused_compress_attn_common.
-from .act import LOG2E as _LOG2E
 from .fused_compress_attn_common import (
     _NEG_INF,
     _PRESHUFFLE_TILE,
@@ -102,6 +99,10 @@ from .fused_compress_attn_common import (
     emit_group_fp8_nm_asm_scatter,
     state_slot_byte_offset,
 )
+
+# Shared FP8 group_fp8 (V4 nm-asm) scatter emitter (single source of truth across
+# the CSA single-kernel + HCA 2-kernel paths). See fused_compress_attn_common.
+from .kernels_common import LOG2E as _LOG2E
 from .quant_utils import emit_f32_to_e2m1, emit_mx_e8m0_scale
 from .tensor_shim import _run_compiled, _to_raw, ptr_buf_tensor
 
@@ -424,12 +425,16 @@ def _build_kernel(
                     with fastmath(None):
                         is_first = m_old_f == neg_inf_f
                     scale_active = _fexp_f32(m_old_f - m_new, c_log2e)
-                    scale_v = is_first.select(c_zero_f32, scale_active)
+                    scale_v = fx.Float32(
+                        fx.arith.select(is_first, c_zero_f32, scale_active)
+                    )
                     wk_active = _fexp_f32(score_f - m_new, c_log2e)
                     if const_expr(score_can_be_neg_inf):
                         with fastmath(None):
                             is_pad_score = score_f == neg_inf_f
-                        w_k = is_pad_score.select(c_zero_f32, wk_active)
+                        w_k = fx.Float32(
+                            fx.arith.select(is_pad_score, c_zero_f32, wk_active)
+                        )
                     else:
                         w_k = wk_active
                     new_m.append(m_new)
@@ -482,7 +487,7 @@ def _build_kernel(
                     return fx.Int32(D if k_static_val >= ratio else 0)
                 # Dynamic: (k >= RATIO) ? D : 0  via select
                 is_b = fx.Int32(k_static_val) >= fx.Int32(ratio)
-                return is_b.select(fx.Int32(D), fx.Int32(0))
+                return fx.Int32(fx.arith.select(is_b, fx.Int32(D), fx.Int32(0)))
 
             # ---- Step 6: Phase 1 -- state cache loop (dynamic bound = window_len) ----
             # window_len ? [0, K]. When 0, the loop is a no-op.
@@ -492,7 +497,7 @@ def _build_kernel(
                 k_i32 = fx.Int32(k_static)
                 s = fx.Int32(position) - (K - 1) + k_i32
                 is_pad = s < fx.Int32(0)
-                s_safe = is_pad.select(fx.Int32(0), s)
+                s_safe = fx.Int32(fx.arith.select(is_pad, fx.Int32(0), s))
                 ring = fx.Uint32(s_safe) % fx.Uint32(state_size)
                 col_off = _col_off_for_k(k_i32)
 
@@ -508,7 +513,9 @@ def _build_kernel(
                 sc_pad_lane = []
                 for i in range_constexpr(VEC):
                     sc_pad_lane.append(
-                        is_pad.select(c_neg_inf, fx.Float32(sc_v_lane[i]))
+                        fx.Float32(
+                            fx.arith.select(is_pad, c_neg_inf, fx.Float32(sc_v_lane[i]))
+                        )
                     )
 
                 new_m, new_kv, new_w = _online_softmax_update(
@@ -667,11 +674,15 @@ def _build_kernel(
                 kv_p1 = list(phase1_state[VEC : 2 * VEC])
                 w_p1 = list(phase1_state[2 * VEC : 3 * VEC])
                 kv_final = [
-                    is_phase2_nonempty.select(new_kv_t[i], kv_p1[i]).ir_value()
+                    fx.Float32(
+                        fx.arith.select(is_phase2_nonempty, new_kv_t[i], kv_p1[i])
+                    ).ir_value()
                     for i in range(VEC)
                 ]
                 w_final = [
-                    is_phase2_nonempty.select(new_w_t[i], w_p1[i]).ir_value()
+                    fx.Float32(
+                        fx.arith.select(is_phase2_nonempty, new_w_t[i], w_p1[i])
+                    ).ir_value()
                     for i in range(VEC)
                 ]
 
@@ -773,7 +784,11 @@ def _build_kernel(
                 rotated_lane[2 * k + 1] = e * s + o * c
 
             out_lane = [
-                _to_raw(is_rope_t.select(rotated_lane[i], normed_lane[i]))
+                _to_raw(
+                    fx.Float32(
+                        fx.arith.select(is_rope_t, rotated_lane[i], normed_lane[i])
+                    )
+                )
                 for i in range_constexpr(VEC)
             ]
 
@@ -924,7 +939,7 @@ def _build_kernel(
                         v = fx.min(fx.max(v, c_neg_fp8_max), c_fp8_max)
                         # NaN guard
                         is_tn = (v < c_zero) & (v > c_neg_uf)
-                        v_safe = _to_raw(is_tn.select(c_zero, v))
+                        v_safe = _to_raw(fx.Float32(fx.arith.select(is_tn, c_zero, v)))
                         fp8_inputs.append(v_safe)
 
                     # (e) pack VEC fp32 -> VEC fp8 bytes inside i32 seed
@@ -1480,7 +1495,9 @@ def _build_kernel_ksplit(
             def _col_off_for_k(k_i32):
                 if const_expr(not overlap):
                     return fx.Int32(0)
-                return (fx.Int32(k_i32) >= ratio).select(fx.Int32(D), fx.Int32(0))
+                return fx.Int32(
+                    fx.arith.select(fx.Int32(k_i32) >= ratio, fx.Int32(D), fx.Int32(0))
+                )
 
             def _softmax_step(m_lane, kv_lane, w_lane, score_lane, kv_v_lane):
                 """Padding-aware per-lane online-softmax update. Phase 2 scores
@@ -1503,11 +1520,13 @@ def _build_kernel_ksplit(
                     with fastmath(None):
                         is_first = m_old_f == neg_inf_f
                     scale_active = _fexp_f32(m_old_f - m_new, c_log2e)
-                    scale_v = is_first.select(c_zero_f32, scale_active)
+                    scale_v = fx.Float32(
+                        fx.arith.select(is_first, c_zero_f32, scale_active)
+                    )
                     wk_active = _fexp_f32(score_f - m_new, c_log2e)
                     with fastmath(None):
                         is_pad = score_f == neg_inf_f
-                    w_k = is_pad.select(c_zero_f32, wk_active)
+                    w_k = fx.Float32(fx.arith.select(is_pad, c_zero_f32, wk_active))
                     new_m.append(m_new)
                     new_kv.append(
                         _to_raw(
@@ -1526,7 +1545,7 @@ def _build_kernel_ksplit(
             def _phase1_loads(k_i32):
                 s = fx.Int32(position) - (K - 1) + fx.Int32(k_i32)
                 is_pad = s < fx.Int32(0)
-                s_safe = is_pad.select(fx.Int32(0), s)
+                s_safe = fx.Int32(fx.arith.select(is_pad, fx.Int32(0), s))
                 ring = fx.Int32(s_safe) % state_size
                 col_off = _col_off_for_k(k_i32)
                 # Slot term already folded into the descriptor base.
@@ -1535,7 +1554,8 @@ def _build_kernel_ksplit(
                 kv_v = _load_f32_vec(kv_state_buf, base_kv, VEC)
                 sc_v = _load_f32_vec(score_state_buf, base_sc, VEC)
                 sc_pad = [
-                    is_pad.select(c_neg_inf, fx.Float32(sc_v[i])) for i in range(VEC)
+                    fx.Float32(fx.arith.select(is_pad, c_neg_inf, fx.Float32(sc_v[i])))
+                    for i in range(VEC)
                 ]
                 return kv_v, sc_pad
 
@@ -1544,7 +1564,9 @@ def _build_kernel_ksplit(
                 k = fx.Int32(k_i32)
                 ape_row = k % ratio
                 in_row_raw = fx.Int32(ragged_id) - ((K - 1) - k)
-                in_row = (in_row_raw > 0).select(in_row_raw, fx.Int32(0))
+                in_row = fx.Int32(
+                    fx.arith.select(in_row_raw > 0, in_row_raw, fx.Int32(0))
+                )
                 base_in = in_row * kv_in_row_stride + col_off + lid_x_vec
                 base_sc = in_row * score_in_row_stride + col_off + lid_x_vec
                 base_ape = ape_row * DIM_FULL + col_off + lid_x_vec
@@ -1558,8 +1580,8 @@ def _build_kernel_ksplit(
             k_start = wid * K_PER_WAVE
             k_end = k_start + K_PER_WAVE
             wl = fx.Int32(window_len)
-            split_lo = (wl > k_start).select(wl, k_start)
-            split = (split_lo < k_end).select(split_lo, k_end)
+            split_lo = fx.Int32(fx.arith.select(wl > k_start, wl, k_start))
+            split = fx.Int32(fx.arith.select(split_lo < k_end, split_lo, k_end))
 
             init_m = [c_neg_inf for _ in range(VEC)]
             init_kv = [c_zero_f32 for _ in range(VEC)]
@@ -1703,7 +1725,11 @@ def _build_kernel_ksplit(
                     rotated_lane[2 * kk + 1] = e * ss + o * cc
 
                 out_lane = [
-                    _to_raw(is_rope_t.select(rotated_lane[i], normed_lane[i]))
+                    _to_raw(
+                        fx.Float32(
+                            fx.arith.select(is_rope_t, rotated_lane[i], normed_lane[i])
+                        )
+                    )
                     for i in range_constexpr(VEC)
                 ]
 
@@ -1819,7 +1845,7 @@ def _build_kernel_ksplit(
                         v = fx.Float32(out_lane[i]) * fx.Float32(inv_scale)
                         v = fx.min(fx.max(v, c_neg_fp8_max), c_fp8_max)
                         is_tn = (v < c_zero) & (v > c_neg_uf)
-                        v_safe = _to_raw(is_tn.select(c_zero, v))
+                        v_safe = _to_raw(fx.Float32(fx.arith.select(is_tn, c_zero, v)))
                         fp8_inputs.append(v_safe)
 
                     # (e) pack VEC fp32 -> VEC fp8 bytes

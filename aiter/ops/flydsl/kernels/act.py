@@ -6,7 +6,6 @@
 Elementwise f32-register helpers (exp2/rcp-based sigmoid, sign-restored tanh, and the
 gate*up batch forms) usable by any FlyDSL gemm1 fused gate+up epilog, plus
 :func:`gate_up_act`, which picks between them so kernels carry no ``act`` branch.
-Leaf module: depends only on flydsl and ``tensor_shim._to_raw``.
 """
 
 from typing import NamedTuple
@@ -15,9 +14,8 @@ import flydsl.expr as fx
 from flydsl.expr import const_expr, rocdl
 from flydsl.expr.typing import T
 
+from aiter.ops.flydsl.kernels.kernels_common import LOG2E
 from aiter.ops.flydsl.kernels.tensor_shim import _to_raw as _raw
-
-LOG2E = 1.4426950408889634
 
 
 def sigmoid_batch(xs, *, alpha=1.0):
@@ -64,7 +62,7 @@ def tanh_batch(xs):
     out = []
     for i, x in enumerate(xs):
         tanh_abs = (fx.Float32(1.0) - es[i]) * recips[i]
-        out.append((x > zero).select(tanh_abs, -tanh_abs))
+        out.append(fx.Float32(fx.arith.select(x > zero, tanh_abs, -tanh_abs)))
     return out
 
 

@@ -161,7 +161,7 @@ def _e8m0_roundup(amax_f32):
     wi = (amax_f32 * fx.Float32(1.0 / 6.0)).bitcast(fx.Int32)
     bexp = (wi + fx.Int32(0x7FFFFF)).shrui(fx.Int32(23)) & fx.Int32(0xFF)
     lt = fx.Uint32(bexp) < fx.Uint32(254)
-    return lt.select(bexp, fx.Int32(254))
+    return fx.Int32(fx.arith.select(lt, bexp, fx.Int32(254)))
 
 
 def _e8m0_from_amax(amax_f32):
@@ -172,7 +172,7 @@ def _e8m0_from_amax(amax_f32):
 
 def _umax_i32(a, b):
     is_gt = fx.Uint32(a) > fx.Uint32(b)
-    return is_gt.select(a, b)
+    return fx.Int32(fx.arith.select(is_gt, a, b))
 
 
 def _dpp_umax_step(a32, dpp_ctrl):

@@ -37,7 +37,6 @@ from flydsl.expr.typing import Int32, Stream, T
 
 from aiter.ops.flydsl.kernels import buffer_ops
 
-from .act import LOG2E as _LOG2E
 from .fused_compress_attn_common import (
     _NEG_INF,
     _PRESHUFFLE_TILE,
@@ -48,6 +47,7 @@ from .fused_compress_attn_common import (
     emit_group_fp8_nm_asm_scatter,
     state_slot_byte_offset,
 )
+from .kernels_common import LOG2E as _LOG2E
 from .tensor_shim import _run_compiled, _to_raw
 
 # --- shape constants --------------------------------------------------------
@@ -433,7 +433,7 @@ def _build_kernel(
                     return arith.constant(D if k_static_val >= ratio else 0, type=i32)
                 # Dynamic: (k >= RATIO) ? D : 0  via select
                 is_b = fx.Int32(k_static_val) >= ratio
-                return is_b.select(fx.Int32(D), fx.Int32(0))
+                return fx.Int32(fx.arith.select(is_b, fx.Int32(D), fx.Int32(0)))
 
             # ---- Step 6: Phase 1 -- state cache loop (dynamic bound = window_len) ----
             # window_len ? [0, K]. When 0, the loop is a no-op.
@@ -445,7 +445,7 @@ def _build_kernel(
                 s_fx = fx.Int32(position) - (K - 1) + fx.Int32(k_i32)
                 is_pad_b = s_fx < 0
                 is_pad = is_pad_b.ir_value()
-                s_safe = is_pad_b.select(fx.Int32(0), s_fx)
+                s_safe = fx.Int32(fx.arith.select(is_pad_b, fx.Int32(0), s_fx))
                 ring = fx.Uint32(s_safe) % state_size
                 # Slot term already folded into the descriptor base.
                 col_off_fx = fx.Int32(_col_off_for_k(k_i32))
@@ -1354,7 +1354,7 @@ def _build_kernel_ksplit(
                 if const_expr(not overlap):
                     return c_zero_i32
                 is_b = fx.Int32(k_i32) >= ratio
-                return is_b.select(fx.Int32(D), fx.Int32(0))
+                return fx.Int32(fx.arith.select(is_b, fx.Int32(D), fx.Int32(0)))
 
             def _softmax_step(m_lane, kv_lane, w_lane, score_lane, kv_v_lane):
                 """Padding-aware per-lane online-softmax update. Phase 2 scores
@@ -1392,7 +1392,7 @@ def _build_kernel_ksplit(
                 s_fx = fx.Int32(position) - (K - 1) + fx.Int32(k_i32)
                 is_pad_b = s_fx < 0
                 is_pad = is_pad_b.ir_value()
-                s_safe = is_pad_b.select(fx.Int32(0), s_fx)
+                s_safe = fx.Int32(fx.arith.select(is_pad_b, fx.Int32(0), s_fx))
                 ring = fx.Uint32(s_safe) % state_size
                 col_off_fx = fx.Int32(_col_off_for_k(k_i32))
                 # Slot term already folded into the descriptor base.

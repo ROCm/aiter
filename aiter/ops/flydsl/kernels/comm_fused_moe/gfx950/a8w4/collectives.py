@@ -150,8 +150,10 @@ def e8m0_scale(local_max):
     working = (local_max * fx.Int32(0x3B124925).bitcast(fx.Float32)).bitcast(fx.Int32)
     mantissa = working & fx.Int32(0x7FFFFF)
     exponent = (working >> fx.Int32(23)) & fx.Int32(0xFF)
-    e8m0 = (mantissa != fx.Int32(0)).select(exponent + fx.Int32(1), exponent)
-    e8m0 = (e8m0 > fx.Int32(0xFF)).select(fx.Int32(0xFF), e8m0)
+    e8m0 = fx.Int32(
+        fx.arith.select(mantissa != fx.Int32(0), exponent + fx.Int32(1), exponent)
+    )
+    e8m0 = fx.Int32(fx.arith.select(e8m0 > fx.Int32(0xFF), fx.Int32(0xFF), e8m0))
     scale = ((fx.Int32(254) - e8m0) << fx.Int32(23)).bitcast(fx.Float32)
     return e8m0, scale
 

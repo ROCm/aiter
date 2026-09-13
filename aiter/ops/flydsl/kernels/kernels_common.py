@@ -17,6 +17,8 @@ from flydsl.expr import as_ir_value
 from flydsl.expr.typing import T
 from flydsl.runtime.device import get_rocm_arch, is_rdna_arch
 
+LOG2E = 1.4426950408889634
+
 
 def ceildiv(numer, denom):
     """Ceiling division preserving Python-int or DSL-scalar operand types."""

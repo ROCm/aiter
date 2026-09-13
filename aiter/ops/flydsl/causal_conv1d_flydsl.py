@@ -9,7 +9,7 @@ import flydsl.expr as fx
 import torch
 from flydsl.expr.typing import Int32
 
-from aiter.ops.flydsl.kernels.act import LOG2E as _LOG2E
+from aiter.ops.flydsl.kernels.kernels_common import LOG2E as _LOG2E
 from aiter.ops.flydsl.kernels.tensor_shim import ptr_buf_tensor
 
 from ..prefill_batch_metadata import CausalConvPrefillMetadata
@@ -160,7 +160,9 @@ def build_causal_conv1d_flydsl_module(
                 if fx.const_expr(j + 1 < ELEMS):
                     cur = cur + fstep
             do_halo = hc < (KW - 1)
-            prefix_off = do_halo.select((feat_start + hf) * sx0 + (tok_gbase + hc), 0)
+            prefix_off = fx.Int32(
+                fx.arith.select(do_halo, (feat_start + hf) * sx0 + (tok_gbase + hc), 0)
+            )
             prefix_v = fx_elem_dtype(x_r[prefix_off])
             lds_idx = f_base * LDS_PAD + (t_const + (KW - 1))
             for j in fx.range_constexpr(ELEMS):
@@ -173,14 +175,14 @@ def build_causal_conv1d_flydsl_module(
             zero_e = fx_elem_dtype(0.0)
             body_wp = tok_start + t_const
             body_ok = body_wp < seqlen
-            sl_m1 = (seqlen > 0).select(seqlen - 1, 0)
-            body_gt = seq_start + body_ok.select(body_wp, sl_m1)
+            sl_m1 = fx.Int32(fx.arith.select(seqlen > 0, seqlen - 1, 0))
+            body_gt = seq_start + fx.Int32(fx.arith.select(body_ok, body_wp, sl_m1))
             for j in fx.range_constexpr(ELEMS):
                 gf = (feat_start + f_base) + (j * FG)
                 gf_ok = gf < dim
-                safe_gf = gf_ok.select(gf, 0)
+                safe_gf = fx.Int32(fx.arith.select(gf_ok, gf, 0))
                 raw = fx_elem_dtype(x_r[safe_gf * sx0 + body_gt])
-                val = (body_ok & gf_ok).select(raw, zero_e)
+                val = fx_elem_dtype(fx.arith.select(body_ok & gf_ok, raw, zero_e))
                 lds_st(
                     val,
                     (f_base + (j * FG)) * LDS_PAD + (t_const + (KW - 1)),
@@ -193,10 +195,11 @@ def build_causal_conv1d_flydsl_module(
                 wp = (tok_start + hc) - (KW - 1)
                 wp_in = (wp >= 0) & (wp < seqlen)
                 both = wp_in & gf_ok
-                safe_xoff = both.select(gf * sx0 + (seq_start + wp), 0)
-                xv = both.select(
-                    fx_elem_dtype(x_r[safe_xoff]),
-                    zero_e,
+                safe_xoff = fx.Int32(
+                    fx.arith.select(both, gf * sx0 + (seq_start + wp), 0)
+                )
+                xv = fx_elem_dtype(
+                    fx.arith.select(both, fx_elem_dtype(x_r[safe_xoff]), zero_e)
                 )
                 # pre-seq source: conv_state at chunk0
                 hi8 = fx.Int8(hi_r[seq_idx])
@@ -204,9 +207,13 @@ def build_causal_conv1d_flydsl_module(
                 need_cs = ((wp < 0) & is_chunk0) & (hi_nz & gf_ok)
                 in_coord = fx.Int32(ci_r[seq_idx * sci])
                 slot = (KW - 1) + wp
-                cs_off = need_cs.select((in_coord * scs0 + gf * scs1) + slot * scs2, 0)
+                cs_off = fx.Int32(
+                    fx.arith.select(
+                        need_cs, (in_coord * scs0 + gf * scs1) + slot * scs2, 0
+                    )
+                )
                 csv = fx_elem_dtype(cs_r[cs_off])
-                hv = need_cs.select(csv, xv)
+                hv = fx_elem_dtype(fx.arith.select(need_cs, csv, xv))
                 lds_st(hv, hf * LDS_PAD + hc)
 
         fx.gpu.barrier()
@@ -290,17 +297,27 @@ def build_causal_conv1d_flydsl_module(
                 in_coord = fx.Int32(ci_r[seq_idx * sci])
                 pos_x = (seqlen - (KW - 1)) + slot
                 x_in = pos_x >= 0
-                safe_x = x_in.select(gfeat * sx0 + (seq_start + pos_x), 0)
+                safe_x = fx.Int32(
+                    fx.arith.select(x_in, gfeat * sx0 + (seq_start + pos_x), 0)
+                )
                 val_x = fx_elem_dtype(x_r[safe_x])
                 hi8 = fx.Int8(hi_r[seq_idx])
                 hi_nz = hi8 != 0
                 need_pr = (pos_x < 0) & hi_nz
                 src = slot + seqlen
-                safe_pr = need_pr.select(
-                    (in_coord * scs0 + gfeat * scs1) + src * scs2, 0
+                safe_pr = fx.Int32(
+                    fx.arith.select(
+                        need_pr, (in_coord * scs0 + gfeat * scs1) + src * scs2, 0
+                    )
                 )
                 val_pr = fx_elem_dtype(cs_r[safe_pr])
-                wb_val = x_in.select(val_x, need_pr.select(val_pr, zero_e))
+                wb_val = fx_elem_dtype(
+                    fx.arith.select(
+                        x_in,
+                        val_x,
+                        fx_elem_dtype(fx.arith.select(need_pr, val_pr, zero_e)),
+                    )
+                )
                 cs_wr = (in_coord * scs0 + gfeat * scs1) + slot * scs2
                 cs_r[cs_wr] = wb_val
 

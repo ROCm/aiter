@@ -526,9 +526,7 @@ def compile_mega_moe_stage1(
         def _run_work_batch(first_work, scheduled_first):
             for batch_offset in range_constexpr(work_batch):
                 if const_expr(compact_dispatch):
-                    work = use_ready_order.select(
-                        scheduled_first, first_work
-                    ) + fx.Int32(batch_offset)
+                    work = fx.Int32(fx.arith.select(use_ready_order, scheduled_first, first_work)) + fx.Int32(batch_offset)
                 else:
                     work = first_work + fx.Int32(batch_offset * WORK_SHARDS)
                 if work < total_work:

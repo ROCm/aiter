@@ -103,8 +103,12 @@ class DualwaveFp8SoftmaxHelper(DualwaveFp8KernelContext):
             thr = (r // 4) * 8 + (r % 4)
             col_lo = col_base + fx.Int32(thr)
             col_hi = col_lo + fx.Int32(32)
-            s_lo[r] = (col_lo < self.seqlen_kv_i32).select(s_lo[r], self.c_neg_inf)
-            s_hi[r] = (col_hi < self.seqlen_kv_i32).select(s_hi[r], self.c_neg_inf)
+            s_lo[r] = fx.Float32(
+                fx.arith.select(col_lo < self.seqlen_kv_i32, s_lo[r], self.c_neg_inf)
+            )
+            s_hi[r] = fx.Float32(
+                fx.arith.select(col_hi < self.seqlen_kv_i32, s_hi[r], self.c_neg_inf)
+            )
 
     def seq_pad_mask_if_needed(self, v_s, tile_idx=None):
         if tile_idx is None:

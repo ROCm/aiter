@@ -694,7 +694,7 @@ def make_b_loader(
             byte_odd = byte_even + fx.Int32(1)
             se = _e8m0_byte_to_f32(packed, byte_even)
             so = _e8m0_byte_to_f32(packed, byte_odd)
-            scales.append((n_pack == fx.Int32(0)).select(se, so))
+            scales.append(fx.arith.select(n_pack == fx.Int32(0), se, so))
         return scales
 
     def load_b_scale_int4(base_k, n_full):
@@ -711,7 +711,9 @@ def make_b_loader(
             # even adj_ku -> low bf16, odd -> high.
             lo = (packed << fx.Int32(16)).bitcast(fx.Float32)
             hi = (packed & fx.Int32(0xFFFF0000)).bitcast(fx.Float32)
-            scales.append((adj_ku % fx.Int32(2) == fx.Int32(0)).select(lo, hi))
+            scales.append(
+                fx.Float32(fx.arith.select(adj_ku % fx.Int32(2) == fx.Int32(0), lo, hi))
+            )
         return scales
 
     vec2_bf16 = T.vec(2, T.bf16)

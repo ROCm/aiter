@@ -238,7 +238,7 @@ def _store_fp8_packed_w64(
         for v in vals_list:
             vv = v if hasattr(v, "ir_value") else fx.Float32(v)
             is_tn = (vv < c0) & (vv > c_neg_uf)
-            safe.append(is_tn.select(c0, vv).ir_value())
+            safe.append(fx.Float32(fx.arith.select(is_tn, c0, vv)).ir_value())
 
     assert vec == 8, "fp8 store helper hardcoded for VEC=8"
     p0 = fx.Int32(0).ir_value()
@@ -268,7 +268,7 @@ def _store_fp8_packed_w32(
         for v in vals_list:
             vv = v if hasattr(v, "ir_value") else fx.Float32(v)
             is_tn = (vv < c0) & (vv > c_neg_uf)
-            safe.append(is_tn.select(c0, vv).ir_value())
+            safe.append(fx.Float32(fx.arith.select(is_tn, c0, vv)).ir_value())
 
     n_dwords = vec // 4
     assert n_dwords in (2, 4), f"VEC={vec} -> n_dwords={n_dwords} unsupported"
@@ -674,8 +674,10 @@ def _build_kernel_w64(
                     # is `bid < 0 || pos < 0`; match it, in both modes.
                     pos_ok = pos_i32 >= fx.Int32(0)
                     do_swa = (bid_i32 >= fx.Int32(0)) & pos_ok
-                    bid_safe = (bid_i32 >= fx.Int32(0)).select(bid_i32, fx.Int32(0))
-                    pos_safe = pos_ok.select(pos_i32, fx.Int32(0))
+                    bid_safe = fx.Int32(
+                        fx.arith.select(bid_i32 >= fx.Int32(0), bid_i32, fx.Int32(0))
+                    )
+                    pos_safe = fx.Int32(fx.arith.select(pos_ok, pos_i32, fx.Int32(0)))
                     if const_expr(paged):
                         blk = pos_safe // swa_cache_size
                         # The other two gates the C++ sibling applies (see
@@ -687,8 +689,8 @@ def _build_kernel_w64(
                         # both the table width and the distance between two
                         # requests' rows.
                         blk_ok = blk < swa_slot_stride
-                        bt_off = bid_safe * swa_slot_stride + blk_ok.select(
-                            blk, fx.Int32(0)
+                        bt_off = bid_safe * swa_slot_stride + fx.Int32(
+                            fx.arith.select(blk_ok, blk, fx.Int32(0))
                         )
                         phys = fx.Int32(
                             _scalar_load(
@@ -709,7 +711,7 @@ def _build_kernel_w64(
                         do_swa = do_swa & row_ok
                         # Clamp too: a negative row would move the descriptor
                         # base backwards, out of this tensor entirely.
-                        row = row_ok.select(row_raw, fx.Int32(0))
+                        row = fx.Int32(fx.arith.select(row_ok, row_raw, fx.Int32(0)))
                     else:
                         dest = fx.Int32(
                             _scalar_load(
@@ -721,7 +723,7 @@ def _build_kernel_w64(
                         )
                         dest_ok = (dest >= fx.Int32(0)) & (dest < swa_num_rows)
                         do_swa = do_swa & dest_ok
-                        row = dest_ok.select(dest, fx.Int32(0))
+                        row = fx.Int32(fx.arith.select(dest_ok, dest, fx.Int32(0)))
                     # Fold the row's byte offset into the base ptr; the per-token
                     # row is then a plain (1, D) tiled-copy store like kv_out.
                     # Widen BEFORE the element product: a unified V4 pool runs to
@@ -1108,7 +1110,8 @@ def _build_kernel_w32(
                 rotated[2 * k + 1] = e * s + o * c
 
             final_list = [
-                is_rope_t.select(rotated[i], scaled[i]) for i in range_constexpr(VEC)
+                fx.Float32(fx.arith.select(is_rope_t, rotated[i], scaled[i]))
+                for i in range_constexpr(VEC)
             ]
 
             if const_expr(quant):
@@ -1252,7 +1255,7 @@ def _build_kernel_w32(
                     pos_ok = pos_i32 >= 0
                     do_swa = (bid_i32 >= 0) & pos_ok
                     bid_safe = fx.max(bid_i32, fx.Int32(0))
-                    pos_safe = pos_ok.select(pos_i32, fx.Int32(0))
+                    pos_safe = fx.Int32(fx.arith.select(pos_ok, pos_i32, fx.Int32(0)))
                     if const_expr(paged):
                         blk = _idiv(pos_safe, swa_cache_size)
                         # The other two gates the C++ sibling applies (see
@@ -1263,7 +1266,7 @@ def _build_kernel_w32(
                         # stride(0) == max_blocks, so the row stride is both the
                         # table width and the distance between two requests' rows.
                         blk_ok = blk < swa_slot_stride
-                        blk_safe = blk_ok.select(blk, fx.Int32(0))
+                        blk_safe = fx.Int32(fx.arith.select(blk_ok, blk, fx.Int32(0)))
                         bt_off = bid_safe * swa_slot_stride + blk_safe
                         bt_rsrc = _ptr_buffer_resource(swa_index)
                         phys = fx.Int32(
@@ -1280,7 +1283,7 @@ def _build_kernel_w32(
                         do_swa = do_swa & row_ok
                         # Clamp too: a negative row would move the descriptor
                         # base backwards, out of this tensor entirely.
-                        row_safe = row_ok.select(row, fx.Int32(0))
+                        row_safe = fx.Int32(fx.arith.select(row_ok, row, fx.Int32(0)))
                     else:
                         row_rsrc = _ptr_buffer_resource(swa_index)
                         row = fx.Int32(
@@ -1290,7 +1293,7 @@ def _build_kernel_w32(
                         )
                         dest_ok = (row >= 0) & (row < swa_num_rows)
                         do_swa = do_swa & dest_ok
-                        row_safe = dest_ok.select(row, fx.Int32(0))
+                        row_safe = fx.Int32(fx.arith.select(dest_ok, row, fx.Int32(0)))
                     # The row index fits 32 bits; `row * D * 2` does not. A
                     # unified V4 pool runs to ~150M rows, so a 32-bit byte
                     # offset wraps 3% of the way in, and the sliding windows
@@ -2182,11 +2185,11 @@ def _build_kernel_w32_tdm(
                 pos_ok = pos_i32 >= 0
                 do_swa = (bid_i32 >= 0) & pos_ok
                 bid_safe = fx.max(bid_i32, fx.Int32(0))
-                pos_safe = pos_ok.select(pos_i32, fx.Int32(0))
+                pos_safe = fx.Int32(fx.arith.select(pos_ok, pos_i32, fx.Int32(0)))
                 if const_expr(paged):
                     blk = _idiv(pos_safe, swa_cache_size)
                     blk_ok = blk < swa_slot_stride
-                    blk_safe = blk_ok.select(blk, fx.Int32(0))
+                    blk_safe = fx.Int32(fx.arith.select(blk_ok, blk, fx.Int32(0)))
                     phys = fx.Int32(
                         buffer_ops.buffer_load(
                             _ptr_res(swa_index),
@@ -2198,7 +2201,7 @@ def _build_kernel_w32_tdm(
                     row = phys * swa_cache_size + (pos_safe % swa_cache_size)
                     row_ok = blk_ok & (phys >= 0) & (row < swa_num_rows)
                     do_swa = do_swa & row_ok
-                    row_safe = row_ok.select(row, fx.Int32(0))
+                    row_safe = fx.Int32(fx.arith.select(row_ok, row, fx.Int32(0)))
                 else:
                     row = fx.Int32(
                         buffer_ops.buffer_load(
@@ -2207,7 +2210,7 @@ def _build_kernel_w32_tdm(
                     )
                     dest_ok = (row >= 0) & (row < swa_num_rows)
                     do_swa = do_swa & dest_ok
-                    row_safe = dest_ok.select(row, fx.Int32(0))
+                    row_safe = fx.Int32(fx.arith.select(dest_ok, row, fx.Int32(0)))
                 # row fits 32 bits, row*D*2 does not: widen before the multiply.
                 swa_rsrc = GTensor(
                     swa_kv,

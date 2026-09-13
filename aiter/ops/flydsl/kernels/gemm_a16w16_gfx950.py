@@ -402,8 +402,8 @@ def async_load_to_lds(
                 )
             )
         global_outer_idx = tile.global_outer_offset + outer_local_idx
-        safe_global_outer_idx = (global_outer_idx < tile.outer_bound).select(
-            global_outer_idx, 0
+        safe_global_outer_idx = fx.Int32(
+            fx.arith.select(global_outer_idx < tile.outer_bound, global_outer_idx, 0)
         )
         if const_expr(is_k_major):
             global_offset = global_k_idx * tile.leading_stride + safe_global_outer_idx
@@ -538,7 +538,7 @@ def gemm_a16w16_gfx950_kernel(
     ks_idx = fx.block_idx.y
     ks_begin = ks_idx * working_k
     ks_end = ks_begin + working_k
-    ks_end = (ks_end < k).select(ks_end, k)
+    ks_end = fx.Int32(fx.arith.select(ks_end < k, ks_end, k))
     k_tiles = (ks_end - ks_begin) // block_k
     block_m_offset = bid_m * block_m
     block_n_offset = bid_n * block_n
@@ -638,11 +638,15 @@ def gemm_a16w16_gfx950_kernel(
         for i in range_constexpr(fx.size(frag_C.shape).unpack()):
             col_idx = fx.get_scalar(thr_mma_cCol[i])
             global_n_idx = block_n_offset + col_idx
-            safe_global_n_idx = (global_n_idx < n).select(global_n_idx, 0)
+            safe_global_n_idx = fx.Int32(
+                fx.arith.select(global_n_idx < n, global_n_idx, 0)
+            )
             bias_val = bias_buf[safe_global_n_idx].to(fx.Float32)
             if const_expr(is_slice_k):
                 is_first_k_slice = k_wave_idx == 0
-                bias_val = is_first_k_slice.select(bias_val, fx.Float32(0.0))
+                bias_val = fx.Float32(
+                    fx.arith.select(is_first_k_slice, bias_val, fx.Float32(0.0))
+                )
             frag_C[i] = bias_val
     else:
         frag_C.fill(0.0)
@@ -857,7 +861,7 @@ def gemm_a16w16_hti_gfx950_kernel(
     ks_idx = fx.block_idx.y
     ks_begin = ks_idx * working_k
     ks_end = ks_begin + working_k
-    ks_end = (ks_end < k).select(ks_end, k)
+    ks_end = fx.Int32(fx.arith.select(ks_end < k, ks_end, k))
     k_tiles = (ks_end - ks_begin) // block_k
     block_m_offset = bid_m * block_m
     block_n_offset = bid_n * block_n
@@ -1080,8 +1084,12 @@ def gemm_a16w16_hti_gfx950_kernel(
             col_idx = fx.get_scalar(thr_mma_cCol[i])
             global_n0_idx = block_n_offset + col_idx
             global_n1_idx = global_n0_idx + half_block_n
-            safe_global_n0_idx = (global_n0_idx < n).select(global_n0_idx, 0)
-            safe_global_n1_idx = (global_n1_idx < n).select(global_n1_idx, 0)
+            safe_global_n0_idx = fx.Int32(
+                fx.arith.select(global_n0_idx < n, global_n0_idx, 0)
+            )
+            safe_global_n1_idx = fx.Int32(
+                fx.arith.select(global_n1_idx < n, global_n1_idx, 0)
+            )
             bias0 = bias_buf[safe_global_n0_idx].to(fx.Float32)
             bias1 = bias_buf[safe_global_n1_idx].to(fx.Float32)
             c00[i] = bias0

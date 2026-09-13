@@ -27,7 +27,6 @@ from flydsl.expr.typing import Int32, Stream, T
 
 from aiter.ops.flydsl.kernels import buffer_ops
 
-from .act import LOG2E as _LOG2E
 from .fused_compress_attn_common import (
     _NEG_INF,
     _fexp_f32,
@@ -35,6 +34,7 @@ from .fused_compress_attn_common import (
     emit_group_fp8_nm_asm_scatter,
     state_slot_byte_offset,
 )
+from .kernels_common import LOG2E as _LOG2E
 from .tensor_shim import _run_compiled
 
 BLOCK_THREADS = 32  # 1 wave32 (RDNA4 / gfx1250)
@@ -297,7 +297,7 @@ def _build_compress_forward_kernel(
                 s = fx.Int32(position) - fx.Int32(K - 1) + fx.Int32(k_i32)
                 is_pad_b = s < 0
                 is_pad = is_pad_b.ir_value()
-                s_safe = is_pad_b.select(fx.Int32(0), s)
+                s_safe = fx.Int32(fx.arith.select(is_pad_b, fx.Int32(0), s))
                 ring = fx.Int32((fx.Uint32(s_safe.ir_value()) % state_size).ir_value())
                 # Slot term already folded into the descriptor base.
                 base_kv_off = ring * fx.Int32(kv_state_pos_stride) + col_off_base

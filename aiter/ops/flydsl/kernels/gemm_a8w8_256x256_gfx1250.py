@@ -223,7 +223,9 @@ def launch_gemm_a8w8_256x256(
                 STAGE_SB // N_BLOCKS,
             )
             sa_gstride, sb_gstride = i32_stride_ascale_k, i32_k // 128
-            sa_bound = (mn_oob > 0).select(fx.Int32(SC_K), fx.Int32(0))
+            sa_bound = fx.Int32(
+                fx.arith.select(mn_oob > 0, fx.Int32(SC_K), fx.Int32(0))
+            )
             sa_step, sb_step = i32_stride_ascale_k * SC_K, SC_K
         gSA = _gv(arg_scale_a, sa_off0, SA_SHAPE, (SA_SHAPE[1], 1))
         gSB = _gv(arg_scale_b, sb_off0, SB_SHAPE, (SB_SHAPE[1], 1))
@@ -821,7 +823,9 @@ def launch_gemm_a8w8_256x256(
         last_delta = (SUPERS - 1) * tdm_global_step
         for i in range_constexpr(num_buffers):
             seed_delta = fx.Int32(i) * tdm_global_step
-            seed_delta = (seed_delta < last_delta).select(seed_delta, last_delta)
+            seed_delta = fx.Int32(
+                fx.arith.select(seed_delta < last_delta, seed_delta, last_delta)
+            )
             tdm_ops.tensor_load_2d(_prepare_tdm(i, seed_delta))
         pipeline_fence(outstanding=num_buffers - 1, use_cluster=False)
         for group in _seed_thunks(0):
@@ -838,7 +842,7 @@ def launch_gemm_a8w8_256x256(
         def _stage_args(g, rev_delta, fence_outstanding):
             slot = g // KPAIR
             delta = rev_delta + slot_delta[slot]
-            delta = (delta < last_delta).select(delta, last_delta)
+            delta = fx.arith.select(delta < last_delta, delta, last_delta)
             return (
                 g,
                 (g + 1) % UNROLL,
@@ -942,13 +946,20 @@ def launch_gemm_a8w8_256x256(
 
     gx = (i32_m + (tile_m - 1)) // tile_m
     gy = (N + (tile_n - 1)) // tile_n
-    gx = (((gx > 0).select(gx, fx.Int32(1)) + (cluster_m - 1)) // cluster_m) * cluster_m
+    gx = (
+        (fx.Int32(fx.arith.select(gx > 0, gx, fx.Int32(1))) + (cluster_m - 1))
+        // cluster_m
+    ) * cluster_m
     # Split gx exactly, so no workgroup is left over to recompute a duplicate tile.
     pow2 = gx & -gx
-    capped = (pow2 < m_run_max).select(pow2, fx.Int32(m_run_max))
+    capped = fx.Int32(fx.arith.select(pow2 < m_run_max, pow2, fx.Int32(m_run_max)))
     # A cluster spans consecutive bid_x, so the x extent must stay a whole number of cluster rows.
     fits_cluster = (capped % fx.Int32(cluster_m)) == 0
-    m_run = ((gx > m_run_max) & (pow2 >= m_run_min) & fits_cluster).select(capped, gx)
+    m_run = fx.Int32(
+        fx.arith.select(
+            (gx > m_run_max) & (pow2 >= m_run_min) & fits_cluster, capped, gx
+        )
+    )
     m_chunks = gx // m_run
     grid_arg = (m_run, gy, m_chunks * split_k)
     # Runtime N/K shape checks belong to the caller.

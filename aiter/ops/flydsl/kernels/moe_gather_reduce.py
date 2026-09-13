@@ -184,7 +184,7 @@ def build_moe_gather_reduce_module(
                 map_off = map_base + tid_u32
                 raw_row = fx.Int32(rows_t[map_off])
                 is_mapped = raw_row >= fx.Int32(0)
-                row_i32 = is_mapped.select(raw_row, oob_row_i32)
+                row_i32 = fx.Int32(fx.arith.select(is_mapped, raw_row, oob_row_i32))
                 _lds_si32(rows_lds, row_i32, tid)
                 # .to(Float32) is a no-op when the route weights are already f32.
                 w_f32 = w_dt_fx(w_t[map_off]).to(fx.Float32)

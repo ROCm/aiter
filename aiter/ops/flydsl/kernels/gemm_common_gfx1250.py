@@ -9,7 +9,8 @@ from flydsl.expr import as_ir_value, gpu, rocdl
 from flydsl.expr.rocdl import cluster, tdm_ops
 from flydsl.expr.typing import T
 
-from .act import LOG2E, sigmoid_f32
+from .act import sigmoid_f32
+from .kernels_common import LOG2E
 
 
 def make_lds_copy_ops(bits):

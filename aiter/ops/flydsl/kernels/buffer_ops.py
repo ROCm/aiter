@@ -459,7 +459,9 @@ def buffer_load(
 
     # Apply mask by setting invalid offsets to max
     if mask is not None:
-        offset = fx.Boolean(_unwrap_value(mask)).select(offset, 0x7FFFFFFF)
+        offset = fx.Int32(
+            fx.arith.select(fx.Boolean(_unwrap_value(mask)), offset, 0x7FFFFFFF)
+        )
 
     # Create vector type
     if vec_width == 1:
@@ -550,7 +552,9 @@ def buffer_store(
 
     # Apply mask by setting invalid offsets to max
     if mask is not None:
-        offset = fx.Boolean(_unwrap_value(mask)).select(offset, 0x7FFFFFFF)
+        offset = fx.Int32(
+            fx.arith.select(fx.Boolean(_unwrap_value(mask)), offset, 0x7FFFFFFF)
+        )
 
     # Create instruction offset (soffset) and aux flags
     soffset = fx.Int32(

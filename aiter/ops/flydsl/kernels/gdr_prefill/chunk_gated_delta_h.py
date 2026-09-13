@@ -18,8 +18,8 @@ import flydsl.expr as fx
 from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import T
 
-from ..act import LOG2E as _LOG2E
 from ..gdr_common import _gview, _load_vec, _store_vec
+from ..kernels_common import LOG2E as _LOG2E
 
 
 def _make_fast_exp(g_is_log2_scaled: bool):
@@ -355,7 +355,7 @@ def compile_chunk_gated_delta_h(
         # Rows past the sequence end clamp to 0 rather than being masked -- with
         # max_size descriptors that is what keeps w / k / u in range.
         def _clamp_row(row):
-            return (row < T_local).select(row, 0)
+            return fx.Int32(fx.arith.select(row < T_local, row, 0))
 
         # -- Global tensor views -- bases stay i64 (snapshot tensors can exceed
         # 2^31 elements); the per-chunk coordinates fit in i32.
@@ -631,9 +631,12 @@ def compile_chunk_gated_delta_h(
             gpu.barrier()
 
             next_chunk_end = (i_t_i32 + 1) * BT
-            last_idx_raw = (next_chunk_end < T_local).select(
-                next_chunk_end, T_local
-            ) - 1
+            last_idx_raw = (
+                fx.Int32(
+                    fx.arith.select(next_chunk_end < T_local, next_chunk_end, T_local)
+                )
+                - 1
+            )
 
             # Issue every u / g load before GEMM1 so the 64-MFMA chain hides the
             # latency; left alone LLVM sinks them into the middle of GEMM1.
@@ -659,7 +662,7 @@ def compile_chunk_gated_delta_h(
                 for elem_i in range_constexpr(4):
                     abs_row = _bt_abs_row(elem_i)
                     in_bounds = abs_row < T_local
-                    safe_row = in_bounds.select(abs_row, 0)
+                    safe_row = fx.Int32(fx.arith.select(in_bounds, abs_row, 0))
                     g_row_pf.append(
                         (
                             _load_vec(
@@ -729,7 +732,9 @@ def compile_chunk_gated_delta_h(
                 for elem_i in range_constexpr(4):
                     g_row_val, in_bounds = g_row_pf[elem_i]
                     gate = _fast_exp(g_last - g_row_val)
-                    gate_elems.append(in_bounds.select(gate, fx.Float32(0.0)))
+                    gate_elems.append(
+                        fx.Float32(fx.arith.select(in_bounds, gate, fx.Float32(0.0)))
+                    )
                 gate_vec = fx.Vector.from_elements(gate_elems, dtype=fx.Float32)
             else:
                 # Padding rows must be masked or their v_new reaches GEMM2 and
@@ -738,7 +743,9 @@ def compile_chunk_gated_delta_h(
                 for elem_i in range_constexpr(4):
                     in_bounds = _bt_abs_row(elem_i) < T_local
                     mask_elems.append(
-                        in_bounds.select(fx.Float32(1.0), fx.Float32(0.0))
+                        fx.Float32(
+                            fx.arith.select(in_bounds, fx.Float32(1.0), fx.Float32(0.0))
+                        )
                     )
                 gate_vec = fx.Vector.from_elements(mask_elems, dtype=fx.Float32)
 

@@ -741,7 +741,7 @@ class SiluQuantEpilogue:
                     m = m.maximumf(m.shuffle_xor(fx.Int32(off), c64))
                 max_rounded = (m.bitcast(fx.Int32) + fx.Int32(0x400000)) & fx.Int32(0xFF800000)
                 _e = (max_rounded >> fx.Int32(23)) - fx.Int32(8)
-                e8m0_v = (_e > fx.Int32(0)).select(_e, fx.Int32(0))
+                e8m0_v = fx.Int32(fx.arith.select(_e > fx.Int32(0), _e, fx.Int32(0)))
                 quant_scale = ((fx.Int32(254) - e8m0_v) << fx.Int32(23)).bitcast(fx.Float32)
                 gcol = out_tile_base + col0
 
@@ -750,7 +750,7 @@ class SiluQuantEpilogue:
                 packed = rocdl.cvt_pk_fp8_f32(T.i32, scaled0, scaled1, fx.Int32(0), 0)
                 short_raw = fx.Int32(packed).to(fx.Int16)
                 out_byte = out_row_base + gcol
-                out_byte = valid.select(out_byte, fx.Int32(0x40000000))
+                out_byte = fx.Int32(fx.arith.select(valid, out_byte, fx.Int32(0x40000000)))
                 out_rsrc[out_byte // fx.Int32(2)] = short_raw
 
                 col_s = gcol >> fx.Int32(5)
@@ -762,7 +762,7 @@ class SiluQuantEpilogue:
                 d4 = (col_s >> fx.Int32(2)) & fx.Int32(1)
                 d5 = col_s & fx.Int32(3)
                 byte_off = d0 * n32 + d3 * fx.Int32(256) + d5 * fx.Int32(64) + d2 * fx.Int32(4) + d4 * fx.Int32(2) + d1
-                byte_off = is_writer.select(byte_off, fx.Int32(0x40000000))
+                byte_off = fx.Int32(fx.arith.select(is_writer, byte_off, fx.Int32(0x40000000)))
                 e8m0_i8 = e8m0_v.to(fx.Int8)
                 self._out_scale_rsrc[byte_off] = e8m0_i8
         wait_lds_barrier()

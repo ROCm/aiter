@@ -16,9 +16,8 @@ def resolve_route_input_row(packed, tokens, topk):
     token = packed & fx.Int32(0x00FFFFFF)
     route_slot = packed >> fx.Int32(24)
     valid = (token < tokens) & (route_slot < fx.Int32(topk))
-    return valid.select(
-        token * fx.Int32(topk) + route_slot,
-        fx.Int32(0),
+    return fx.Int32(
+        fx.arith.select(valid, token * fx.Int32(topk) + route_slot, fx.Int32(0))
     )
 
 

@@ -79,7 +79,7 @@ def _clamp_inner_extent(desc: TDMDescriptor2D, bound) -> TDMDescriptor2D:
     """Rewrite a built descriptor's ``tensor_dim0`` to ``max(0, bound)``."""
     g1 = Vec(desc.dgroup1)
     b = fx.Int32(bound)
-    dim0 = (b > 0).select(b, fx.Int32(0))
+    dim0 = fx.Int32(fx.arith.select(b > 0, b, fx.Int32(0)))
     dim0 = fx.Uint32(dim0)
     lanes = [fx.Uint32(g1[i]) for i in range(8)]
     lanes[_DIM0_LO_SGPR] = (lanes[_DIM0_LO_SGPR] & 0xFFFF) | ((dim0 & 0xFFFF) << 16)

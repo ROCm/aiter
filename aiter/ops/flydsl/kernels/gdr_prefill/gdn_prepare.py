@@ -24,7 +24,7 @@ from flydsl.expr import (
     range_constexpr,
 )
 
-from ..act import LOG2E
+from ..kernels_common import LOG2E
 
 
 def _exp2_f32(x):
@@ -170,7 +170,7 @@ def _identity_frag(lane):
     """Return the identity fragment for one diagonal block."""
     n = lane % 16
     mb4 = (lane // 16) * 4
-    elems = [((mb4 + p) == n).select(1.0, 0.0) for p in range(4)]
+    elems = [fx.Float32(fx.arith.select((mb4 + p) == n, 1.0, 0.0)) for p in range(4)]
     return fx.Float32x4(elems)
 
 
@@ -208,7 +208,7 @@ def _wave_inclusive_scan(val, tid, width, zero):
     s = 1
     while s < width:
         prev = gpu.shuffle(csum, s, width, mode="up")
-        csum = csum + (tid >= s).select(prev, zero)
+        csum = csum + fx.Float32(fx.arith.select(tid >= s, prev, zero))
         s <<= 1
     return csum
 
@@ -449,7 +449,9 @@ def compile_gdn_prepare(
                     gc_s = gc[s]
                     gc_r = gc[r]
                     decay = _exp2_f32((gc_s - gc_r) * LOG2E)
-                    aval = (s > r).select(cval * beta_s * decay, zero_f)
+                    aval = fx.Float32(
+                        fx.arith.select(s > r, cval * beta_s * decay, zero_f)
+                    )
                     kkt[(p, 0), 0, en] = aval
             fx.copy(
                 lds_copy32,
