@@ -13,9 +13,6 @@ void mhc_pre_gemm_sqrsum(aiter_tensor_t& out,    // (split_k, m, hc_mult3) / (m,
                          aiter_tensor_t& fn,     // (hc_mult3, hc_hidden_size) fp32; packed int32 when w_preshuffle_bf16
                          int tile_k = 128,
                          int w_preshuffle_bf16 = 0);
-// Pre-convert fn (fp32) into packed int32 BF16 hi/lo weights for the gemm paths.
-void mhc_pre_convert_fn(aiter_tensor_t& fn_packed, // (hc_mult3, hc_hidden_size) int32 out
-                        aiter_tensor_t& fn);       // (hc_mult3, hc_hidden_size) fp32 in
 void mhc_pre_big_fuse(aiter_tensor_t& post_mix,        // (m, hc_mult)
                       aiter_tensor_t& comb_mix,        // (m, hc_mult * hc_mult)
                       aiter_tensor_t& layer_input,     // (m, hidden_size)

@@ -5,9 +5,12 @@ import functools
 import math
 
 import torch
+import triton
+import triton.language as tl
 from torch import Tensor
 
 from aiter import dtypes
+from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
 
 from ..jit.core import compile_ops
 from ..jit.utils.chip_info import get_cu_num, get_gfx_runtime
@@ -21,14 +24,7 @@ def mhc_pre_gemm_sqrsum(
     x: Tensor,
     fn: Tensor,
     tile_k: int = 128,  # 64 or 128
-    w_preshuffle_bf16: int = 0,  # 1: fn is pre-packed BF16 hi/lo from mhc_pre_convert_fn
-) -> None: ...
-
-
-@compile_ops("module_mhc", develop=True)
-def mhc_pre_convert_fn(
-    fn_packed: Tensor,  # (hc_mult3, hc_hidden_size) int32 out
-    fn: Tensor,  # (hc_mult3, hc_hidden_size) fp32 in
+    w_preshuffle_bf16: int = 0,  # 1: fn is pre-packed BF16 hi/lo from mhc_shuffle_fn
 ) -> None: ...
 
 
@@ -80,10 +76,6 @@ def mhc_shuffle_fn(fn: torch.Tensor, arch: str | None = None) -> torch.Tensor:
     return out16.view(torch.int32)
 
 
-# Back-compat name; the HIP kernel and this must produce identical bytes.
-mhc_pre_convert_fn_ref = mhc_shuffle_fn
-
-
 @compile_ops("module_mhc", develop=True)
 def mhc_pre_big_fuse(
     post_mix: Tensor,
@@ -132,6 +124,243 @@ def mhc_pre_big_fuse_rmsnorm(
 # its next_residual write use this layout, so it stays internal to a stack of layers:
 # only the first residual in and the last one out need converting.
 MHC_RES_KS = 32
+
+_MHC_RES_LAYOUT_REPR = make_kernel_repr(
+    "_mhc_res_layout_kernel",
+    ["HC_MULT", "KS", "BLOCK_M", "BLOCK_KB"],
+)
+_MHC_RES_REPEAT_TRITON_CONFIG = {
+    "BLOCK_M": 32,
+    "BLOCK_KB": 16,
+    "num_warps": 16,
+    "waves_per_eu": 1,
+}
+_MHC_RES_SHUFFLE_TRITON_CONFIG = {
+    "BLOCK_M": 32,
+    "BLOCK_KB": 16,
+    "num_warps": 8,
+    "waves_per_eu": 1,
+}
+_MHC_RES_UNSHUFFLE_TRITON_CONFIG = {
+    "BLOCK_M": 32,
+    "BLOCK_KB": 16,
+    "num_warps": 8,
+    "waves_per_eu": 1,
+}
+
+
+@triton.jit(repr=_MHC_RES_LAYOUT_REPR)
+def _mhc_res_repeat_triton_kernel(
+    hidden_states,
+    out,
+    M,
+    hidden_size,
+    HC_MULT: tl.constexpr,
+    KS: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_KB: tl.constexpr,
+):
+    """Repeat [M, hidden] directly into resS[kb, head, row, kk]."""
+    pid_m = tl.program_id(0)
+    pid_kb = tl.program_id(1)
+
+    rows = (pid_m * BLOCK_M + tl.arange(0, BLOCK_M)).to(tl.int64)
+    kbs = (pid_kb * BLOCK_KB + tl.arange(0, BLOCK_KB)).to(tl.int64)
+    kk = tl.arange(0, KS)
+    num_kb = hidden_size // KS
+
+    input_offsets = (
+        rows[:, None, None] * hidden_size + kbs[None, :, None] * KS + kk[None, None, :]
+    )
+    mask = (rows[:, None, None] < M) & (kbs[None, :, None] < num_kb)
+    values = tl.load(hidden_states + input_offsets, mask=mask, other=0.0)
+    values_t = tl.trans(values, (1, 0, 2))
+    output_mask = (kbs[:, None, None] < num_kb) & (rows[None, :, None] < M)
+
+    for head in range(HC_MULT):
+        output_offsets = (
+            (kbs[:, None, None] * HC_MULT + head) * M + rows[None, :, None]
+        ) * KS + kk[None, None, :]
+        tl.store(out + output_offsets, values_t, mask=output_mask)
+
+
+@triton.jit(repr=_MHC_RES_LAYOUT_REPR)
+def _mhc_res_shuffle_triton_kernel(
+    residual,
+    out,
+    M,
+    hidden_size,
+    HC_MULT: tl.constexpr,
+    KS: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_KB: tl.constexpr,
+):
+    """Convert residual[row, head, k] to resS[kb, head, row, kk]."""
+    pid_m = tl.program_id(0)
+    pid_kb = tl.program_id(1)
+    head = tl.program_id(2)
+
+    rows = (pid_m * BLOCK_M + tl.arange(0, BLOCK_M)).to(tl.int64)
+    kbs = (pid_kb * BLOCK_KB + tl.arange(0, BLOCK_KB)).to(tl.int64)
+    kk = tl.arange(0, KS)
+    num_kb = hidden_size // KS
+
+    input_offsets = (
+        ((rows[:, None, None] * HC_MULT + head) * hidden_size)
+        + kbs[None, :, None] * KS
+        + kk[None, None, :]
+    )
+    input_mask = (rows[:, None, None] < M) & (kbs[None, :, None] < num_kb)
+    values = tl.load(residual + input_offsets, mask=input_mask, other=0.0)
+    values_t = tl.trans(values, (1, 0, 2))
+    output_offsets = (
+        (kbs[:, None, None] * HC_MULT + head) * M + rows[None, :, None]
+    ) * KS + kk[None, None, :]
+    output_mask = (kbs[:, None, None] < num_kb) & (rows[None, :, None] < M)
+    tl.store(out + output_offsets, values_t, mask=output_mask)
+
+
+@triton.jit(repr=_MHC_RES_LAYOUT_REPR)
+def _mhc_res_unshuffle_triton_kernel(
+    shuffled,
+    out,
+    M,
+    hidden_size,
+    HC_MULT: tl.constexpr,
+    KS: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_KB: tl.constexpr,
+):
+    """Convert resS[kb, head, row, kk] to residual[row, head, k]."""
+    pid_m = tl.program_id(0)
+    pid_kb = tl.program_id(1)
+    head = tl.program_id(2)
+
+    rows = (pid_m * BLOCK_M + tl.arange(0, BLOCK_M)).to(tl.int64)
+    kbs = (pid_kb * BLOCK_KB + tl.arange(0, BLOCK_KB)).to(tl.int64)
+    kk = tl.arange(0, KS)
+    num_kb = hidden_size // KS
+
+    input_offsets = (
+        (kbs[:, None, None] * HC_MULT + head) * M + rows[None, :, None]
+    ) * KS + kk[None, None, :]
+    input_mask = (kbs[:, None, None] < num_kb) & (rows[None, :, None] < M)
+    values = tl.load(shuffled + input_offsets, mask=input_mask, other=0.0)
+    values_t = tl.trans(values, (1, 0, 2))
+    output_offsets = (
+        ((rows[:, None, None] * HC_MULT + head) * hidden_size)
+        + kbs[None, :, None] * KS
+        + kk[None, None, :]
+    )
+    output_mask = (rows[:, None, None] < M) & (kbs[None, :, None] < num_kb)
+    tl.store(out + output_offsets, values_t, mask=output_mask)
+
+
+def _validate_mhc_res_triton_config(config: dict | None, default: dict) -> dict:
+    cfg = dict(default if config is None else config)
+    block_m = cfg["BLOCK_M"]
+    block_kb = cfg["BLOCK_KB"]
+    assert block_m > 0 and (block_m & (block_m - 1)) == 0
+    assert block_kb > 0 and (block_kb & (block_kb - 1)) == 0
+    return cfg
+
+
+def _validate_mhc_res_triton_input(x: torch.Tensor) -> tuple[int, int, int]:
+    assert x.dim() == 3, f"expected a 3D residual, got {x.dim()}D"
+    assert x.is_cuda, "residual must be on GPU"
+    assert x.is_contiguous(), "residual must be contiguous"
+    assert x.dtype in (torch.bfloat16, torch.float16)
+    m, hc_mult, hidden_size = x.shape
+    assert m > 0 and hc_mult > 0
+    assert hidden_size % MHC_RES_KS == 0
+    return m, hc_mult, hidden_size
+
+
+def mhc_res_repeat_triton(
+    hidden_states: torch.Tensor,
+    hc_mult: int,
+    config: dict | None = None,
+) -> torch.Tensor:
+    assert hidden_states.dim() == 2
+    assert hidden_states.is_cuda
+    assert hidden_states.is_contiguous()
+    assert hidden_states.dtype in (torch.bfloat16, torch.float16)
+    m, hidden_size = hidden_states.shape
+    assert m > 0 and hc_mult > 0
+    assert hidden_size % MHC_RES_KS == 0
+    cfg = _validate_mhc_res_triton_config(config, _MHC_RES_REPEAT_TRITON_CONFIG)
+
+    out = torch.empty(
+        m,
+        hc_mult,
+        hidden_size,
+        dtype=hidden_states.dtype,
+        device=hidden_states.device,
+    )
+    grid = (
+        triton.cdiv(m, cfg["BLOCK_M"]),
+        triton.cdiv(hidden_size // MHC_RES_KS, cfg["BLOCK_KB"]),
+    )
+    _mhc_res_repeat_triton_kernel[grid](
+        hidden_states,
+        out,
+        m,
+        hidden_size,
+        HC_MULT=hc_mult,
+        KS=MHC_RES_KS,
+        **cfg,
+    )
+    return out
+
+
+def mhc_res_shuffle_triton(
+    residual: torch.Tensor,
+    config: dict | None = None,
+) -> torch.Tensor:
+    m, hc_mult, hidden_size = _validate_mhc_res_triton_input(residual)
+    cfg = _validate_mhc_res_triton_config(config, _MHC_RES_SHUFFLE_TRITON_CONFIG)
+    out = torch.empty_like(residual)
+    grid = (
+        triton.cdiv(m, cfg["BLOCK_M"]),
+        triton.cdiv(hidden_size // MHC_RES_KS, cfg["BLOCK_KB"]),
+        hc_mult,
+    )
+    _mhc_res_shuffle_triton_kernel[grid](
+        residual,
+        out,
+        m,
+        hidden_size,
+        HC_MULT=hc_mult,
+        KS=MHC_RES_KS,
+        **cfg,
+    )
+    return out
+
+
+def mhc_res_unshuffle_triton(
+    shuffled: torch.Tensor,
+    config: dict | None = None,
+) -> torch.Tensor:
+    m, hc_mult, hidden_size = _validate_mhc_res_triton_input(shuffled)
+    cfg = _validate_mhc_res_triton_config(config, _MHC_RES_UNSHUFFLE_TRITON_CONFIG)
+    out = torch.empty_like(shuffled)
+    grid = (
+        triton.cdiv(m, cfg["BLOCK_M"]),
+        triton.cdiv(hidden_size // MHC_RES_KS, cfg["BLOCK_KB"]),
+        hc_mult,
+    )
+    _mhc_res_unshuffle_triton_kernel[grid](
+        shuffled,
+        out,
+        m,
+        hidden_size,
+        HC_MULT=hc_mult,
+        KS=MHC_RES_KS,
+        **cfg,
+    )
+    return out
+
+
 MHC_FUSED_POST_PRE_M_UPPER_BOUND = {
     "gfx950": 1024,
     "gfx942": 128,
@@ -167,14 +396,7 @@ def mhc_res_layout_fake(residual: torch.Tensor) -> torch.Tensor:
 @torch_compile_guard(mutates_args=[], gen_fake=mhc_res_layout_fake)
 def mhc_res_shuffle(residual: torch.Tensor) -> torch.Tensor:
     """res[row][head][k] -> resS[k//KS][head][row][k%KS], same shape."""
-    m, hc_mult, hidden_size = residual.shape
-    assert hidden_size % MHC_RES_KS == 0
-    return (
-        residual.view(m, hc_mult, hidden_size // MHC_RES_KS, MHC_RES_KS)
-        .permute(2, 1, 0, 3)
-        .contiguous()
-        .view(m, hc_mult, hidden_size)
-    )
+    return mhc_res_shuffle_triton(residual)
 
 
 def mhc_res_repeat_fake(
@@ -203,38 +425,21 @@ def mhc_res_repeat(
     intermediate ``[m, hc_mult, hidden]`` repeat followed by another full
     shuffle copy.
     """
-    assert hidden_states.ndim == 2, (
-        f"hidden_states must be 2D, got {tuple(hidden_states.shape)}"
-    )
+    assert (
+        hidden_states.ndim == 2
+    ), f"hidden_states must be 2D, got {tuple(hidden_states.shape)}"
     assert hc_mult > 0, f"hc_mult must be positive, got {hc_mult}"
-    m, hidden_size = hidden_states.shape
+    m = hidden_states.size(0)
     if not res_preshuffle or not mhc_res_shuffle_enabled(m):
         return hidden_states.unsqueeze(-2).repeat(1, hc_mult, 1)
 
-    assert hidden_size % MHC_RES_KS == 0, (
-        f"hidden_size {hidden_size} must be divisible by MHC_RES_KS {MHC_RES_KS}"
-    )
-    return (
-        hidden_states.reshape(m, hidden_size // MHC_RES_KS, MHC_RES_KS)
-        .permute(1, 0, 2)
-        .unsqueeze(1)
-        .expand(-1, hc_mult, -1, -1)
-        .contiguous()
-        .view(m, hc_mult, hidden_size)
-    )
+    return mhc_res_repeat_triton(hidden_states, hc_mult)
 
 
 @torch_compile_guard(mutates_args=[], gen_fake=mhc_res_layout_fake)
 def mhc_res_unshuffle(shuffled: torch.Tensor) -> torch.Tensor:
     """Inverse of :func:`mhc_res_shuffle`."""
-    m, hc_mult, hidden_size = shuffled.shape
-    assert hidden_size % MHC_RES_KS == 0
-    return (
-        shuffled.view(hidden_size // MHC_RES_KS, hc_mult, m, MHC_RES_KS)
-        .permute(2, 1, 0, 3)
-        .contiguous()
-        .view(m, hc_mult, hidden_size)
-    )
+    return mhc_res_unshuffle_triton(shuffled)
 
 
 @functools.lru_cache(maxsize=1024)
@@ -570,7 +775,7 @@ def mhc_pre(
     norm_weight: torch.Tensor | None = None,
     norm_eps: float = 1e-6,
     large_m_splitk: bool = False,
-    w_preshuffle_bf16: int = 0,  # 1: fn is pre-packed BF16 hi/lo from mhc_pre_convert_fn
+    w_preshuffle_bf16: int = 0,  # 1: fn is pre-packed BF16 hi/lo from mhc_shuffle_fn
     res_preshuffle: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     if res_preshuffle and mhc_res_shuffle_enabled(residual.size(0)):
@@ -841,7 +1046,7 @@ def mhc_fused_post_pre(
     A ``res_preshuffle`` request uses that same fuse/unfuse boundary.
 
     ``w_preshuffle_bf16=True`` selects BF16 hi/lo compute and requires ``fn`` from
-    ``mhc_pre_convert_fn``. ``res_preshuffle=True`` requests automatic shuffled
+    ``mhc_shuffle_fn``. ``res_preshuffle=True`` requests automatic shuffled
     layout on gfx1250 only when runtime M selects the fused path; ``next_residual``
     uses the same layout. For BF16 with plain residuals, pass
     ``w_preshuffle_bf16=True, res_preshuffle=False``.

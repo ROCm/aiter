@@ -146,56 +146,6 @@ namespace aiter {
         return val;
     }
 
-    // Pre-convert fn (fp32) into a packed dword: hi = bf16(fn) in [31:16], lo = bf16(fn -
-    // fp32(hi)) in [15:0]. Same 4-byte width as fp32 so the gemm's load / LDS / swizzle are
-    // unchanged; the bf16 gemm then reads the pre-packed hi/lo instead of
-    // recomputing the fp32->bf16 split per (m_block, k) -- the split was redundant work
-    // repeated m_blocks times. fn are model weights (constant across forward passes), so
-    // this runs once and the packed int32 tensor is reused every forward.
-    template <typename DTYPE_I>
-    __global__ void mhc_pre_convert_fn_kernel(uint32_t* fn_packed, const float* fn, int64_t numel,
-                                             [[maybe_unused]] int hc_hidden_size)
-    {
-        int64_t i = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
-        if (i >= numel) return;
-        float f = fn[i];
-        DTYPE_I hi = static_cast<DTYPE_I>(f);
-        DTYPE_I lo = static_cast<DTYPE_I>(f - static_cast<float>(hi));
-        uint32_t hi_bits = __builtin_bit_cast(uint16_t, hi);
-        uint32_t lo_bits = __builtin_bit_cast(uint16_t, lo);
-        // Same tensor (int32, (hc_mult3, hc_hidden)) viewed as uint16; hi and lo of one
-        // 16-element k block land as [16 hi][16 lo], i.e. 32 B apart. Total size and row
-        // stride in bytes are unchanged.
-        uint16_t* out16 = reinterpret_cast<uint16_t*>(fn_packed);
-        const int64_t n_row = i / hc_hidden_size;
-        const int64_t k = i % hc_hidden_size;
-        const int64_t base = n_row * (2 * (int64_t)hc_hidden_size)
-                           + (k / mhc_fn_kb) * (2 * mhc_fn_kb) + (k % mhc_fn_kb);
-        out16[base]              = (uint16_t)hi_bits;
-        out16[base + mhc_fn_kb]  = (uint16_t)lo_bits;
-    }
-
-    // The packed hi/lo are encoded as bf16 -- the activation/MFMA element type the gemm
-    // uses -- so the gemm's bit-extract round-trips.
-    void mhc_pre_convert_fn(
-        aiter_tensor_t& fn_packed, // (hc_mult3, hc_hidden_size) int32 out
-        aiter_tensor_t& fn         // (hc_mult3, hc_hidden_size) fp32 in
-    )
-    {
-        AITER_CHECK(fn.dtype() == AITER_DTYPE_fp32, "fn must be fp32");
-        AITER_CHECK(fn_packed.numel() == fn.numel(), "fn_packed and fn must have same numel");
-        int64_t numel = static_cast<int64_t>(fn.numel());
-        const int block_size = 256;
-        int64_t grid = (numel + block_size - 1) / block_size;
-        const HipDeviceGuard device_guard(fn.device_id);
-        const hipStream_t stream = aiter::getCurrentHIPStream();
-        using DTYPE_I = typename hip2opus<hip_bfloat16>::type;
-        mhc_pre_convert_fn_kernel<DTYPE_I><<<grid, block_size, 0, stream>>>(
-            reinterpret_cast<uint32_t*>(fn_packed.data_ptr()),
-            reinterpret_cast<const float*>(fn.data_ptr()),
-            numel, (int)fn.size(1));
-    }
-
 // Branch must match mma_pack_size (= warp_size == 64 ? 1 : 2): the MFMA path
 // consumes scalar lanes ((a)[0]/(b)[0], pack size 1, wave64), while gfx1250
 // uses native wave32 WMMA and other wave32 targets use the FMA fallback.
