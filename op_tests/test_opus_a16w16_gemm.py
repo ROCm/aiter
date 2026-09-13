@@ -1,26 +1,19 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2025-2026, Advanced Micro Devices, Inc. All rights reserved.
-"""A16W16 OPUS exact-kid regressions and shape-driven benchmark coverage.
+"""A16W16 OPUS exact-kid regressions and benchmark coverage.
 
 Usage:
     python3 op_tests/test_opus_a16w16_gemm.py --kid KID [-m M -n N -k K -b B]
     python3 op_tests/test_opus_a16w16_gemm.py --csv_file <shape_csv>
-
-    # Production-policy sweep in CUDA-graph mode, golden-checked:
-    python3 op_tests/test_opus_a16w16_gemm.py --opus_sweep -n 2048 -k 7168
-
-    # Replay the exact kid/splitK saved in the tuned CSV:
-    python3 op_tests/test_opus_a16w16_gemm.py --exact_opus_sweep
 """
 
 import argparse
 import sys
-from pathlib import Path
 
 import pytest
 import torch
 
-from aiter.benchmark_data_init import add_data_init_args, fill, make_generator
+from aiter.benchmark_data_init import fill
 
 # Skip on unsupported arch via the same probe opus uses at import time.
 from aiter.ops.opus._arch import _detect_arch, _device_arch_and_cu
@@ -28,13 +21,8 @@ from aiter.ops.opus.launch_plan import _get_cached_a16w16_launch_plan
 
 _arch_ok, _detected_gfx = _detect_arch({"gfx950", "gfx942", "gfx1250"})
 
-from aiter.ops.opus import gemm_a16w16_opus, opus_bmm, opus_gemm
+from aiter.ops.opus import opus_bmm, opus_gemm
 from aiter.test_common import checkAllclose, run_perftest
-
-_DEFAULT_TUNED_CSV = (
-    Path(__file__).resolve().parents[1]
-    / "aiter/configs/model_configs/dsv4_bf16_tuned_gemm.csv"
-)
 
 
 def _torch_ref(A: torch.Tensor, B: torch.Tensor, out_dtype):
@@ -58,17 +46,6 @@ def _make_tensor(shape, dist="norm", gen=None, const_val=1.0):
     )
 
 
-def _make_a(
-    batch: int,
-    M: int,
-    K: int,
-    dist: str = "norm",
-    gen=None,
-    const_val: float = 1.0,
-) -> torch.Tensor:
-    return _make_tensor((batch, M, K), dist, gen, const_val)
-
-
 def _make_b(
     batch: int,
     N: int,
@@ -76,27 +53,10 @@ def _make_b(
     dist: str = "norm",
     gen=None,
     const_val: float = 1.0,
-    *,
-    batch_first: bool = True,
 ) -> torch.Tensor:
-    """Build either exact-BMM or shape-driven GEMM/BMM physical weights."""
+    """Build batch-first physical weights for the exact BMM path."""
     B2D = _make_tensor((N, K), dist, gen, const_val)
-    if batch == 1 and not batch_first:
-        return B2D
     return B2D.unsqueeze(0).expand(batch, -1, -1).contiguous()
-
-
-def _tflops(batch, M, N, K, us):
-    return (2.0 * batch * M * N * K / us / 1e6) if us else None
-
-
-def _tbs(batch, M, N, K, us, out_bytes=2):
-    if not us:
-        return None
-    a_bytes = batch * M * K * 2
-    b_bytes = (batch * N * K if batch > 1 else N * K) * 2
-    out_bytes_total = batch * M * N * out_bytes
-    return (a_bytes + b_bytes + out_bytes_total) / us / 1e6
 
 
 def _run_exact_a16w16(
@@ -286,184 +246,6 @@ def _run_a16w16_sweep(
             print(f"[FAIL] {tag} | {type(e).__name__}: {e}")
             failed += 1
     print(f"\nSummary: {passed} passed, {failed} failed out of {len(shapes)}")
-    return failed == 0
-
-
-def load_opus_sweep_rows(csv_path: str, *, N: int, K: int, out_dtype):
-    import pandas as pd
-
-    df = pd.read_csv(csv_path)
-    required = {
-        "gfx",
-        "cu_num",
-        "M",
-        "N",
-        "K",
-        "bias",
-        "dtype",
-        "outdtype",
-        "scaleAB",
-        "bpreshuffle",
-        "libtype",
-        "solidx",
-        "splitK",
-    }
-    missing = sorted(required.difference(df.columns))
-    if missing:
-        raise ValueError(f"OPUS sweep CSV is missing columns {missing}")
-
-    arch, cu_num = _device_arch_and_cu(torch.device("cuda"))
-
-    def is_false(column):
-        return df[column].astype(str).str.strip().str.lower().isin(("false", "0"))
-
-    rows = df[
-        df["gfx"].astype(str).str.lower().eq(arch)
-        & df["cu_num"].eq(cu_num)
-        & df["N"].eq(N)
-        & df["K"].eq(K)
-        & df["libtype"].astype(str).str.lower().eq("opus")
-        & df["dtype"].astype(str).eq(str(torch.bfloat16))
-        & df["outdtype"].astype(str).eq(str(out_dtype))
-        & is_false("bias")
-        & is_false("scaleAB")
-        & is_false("bpreshuffle")
-    ]
-    result = []
-    for row in rows.itertuples(index=False):
-        result.append(
-            {
-                "M": int(row.M),
-                "N": int(row.N),
-                "K": int(row.K),
-                "kid": int(row.solidx),
-                "split_k": int(row.splitK),
-                "csv_us": float(getattr(row, "us", 0.0) or 0.0),
-                "kernel_name": str(getattr(row, "kernelName", "") or ""),
-            }
-        )
-    if not result:
-        raise ValueError(
-            f"no OPUS tuned rows for gfx={arch}, cu_num={cu_num}, N={N}, K={K}, "
-            f"outdtype={out_dtype} in {csv_path}"
-        )
-    return list({tuple(row.values()): row for row in result}.values())
-
-
-def load_opus_sweep_shapes(csv_path: str, *, N: int, K: int, out_dtype):
-    return [
-        (row["M"], row["N"], row["K"], row["kid"], row["split_k"])
-        for row in load_opus_sweep_rows(csv_path, N=N, K=K, out_dtype=out_dtype)
-    ]
-
-
-def run_a16w16_opus_sweep(
-    csv_path: str,
-    *,
-    N: int,
-    K: int,
-    out_dtype: torch.dtype,
-):
-    shapes = load_opus_sweep_shapes(csv_path, N=N, K=K, out_dtype=out_dtype)
-    return _run_a16w16_sweep(
-        shapes,
-        source=csv_path,
-        batch=1,
-        out_dtype=out_dtype,
-        use_graph=True,
-    )
-
-
-def run_shape_driven_opus_sweep(
-    csv_path: str,
-    *,
-    N: int,
-    K: int,
-    batch: int,
-    out_dtype: torch.dtype,
-    dist: str = "norm",
-    gen=None,
-    const_val: float = 1.0,
-    iters: int = 101,
-    warmup: int = 2,
-    rotate: int = 0,
-):
-    rows = load_opus_sweep_rows(csv_path, N=N, K=K, out_dtype=out_dtype)
-    print(f"\n{'=' * 100}")
-    print(
-        f"production OPUS graph sweep [{_detected_gfx}] N={N} K={K} "
-        f"batch={batch}: {len(rows)} shapes"
-    )
-    print("=" * 100)
-    passed = failed = 0
-    perf_rows = []
-    for row in rows:
-        M = row["M"]
-        try:
-            A = _make_a(
-                batch,
-                M,
-                K,
-                dist,
-                gen,
-                const_val,
-            )
-            B = _make_b(
-                batch,
-                N,
-                K,
-                dist,
-                gen,
-                const_val,
-                batch_first=False,
-            )
-            ref = _torch_ref(A, B, out_dtype)
-            Y, us = run_perftest(
-                gemm_a16w16_opus,
-                A,
-                B,
-                None,
-                out_dtype,
-                testGraph=True,
-                num_iters=iters,
-                num_warmup=warmup,
-                num_rotate_args=rotate,
-            )
-            err = checkAllclose(
-                Y,
-                ref,
-                msg=f"a16w16-policy b={batch} M={M} N={N} K={K}",
-                rtol=0.1,
-                atol=0.5,
-            )
-            tflops = _tflops(batch, M, N, K, us)
-            tbs = _tbs(batch, M, N, K, us, out_bytes=Y.element_size())
-            ratio = us / row["csv_us"] if row["csv_us"] else float("nan")
-            print(
-                f"[PASS] M={M} | {us:.1f}us (csv {row['csv_us']:.1f}us, "
-                f"{ratio:.2f}x) | {tflops:.2f} TFLOPs | {tbs:.3f} TB/s | "
-                f"err={err} | splitK={row['split_k']} | "
-                f"kid={row['kernel_name'] or row['kid']}"
-            )
-            perf_rows.append((M, us, ratio, tflops, tbs, row))
-            passed += 1
-        except Exception as exc:  # noqa: BLE001
-            print(f"[FAIL] M={M} | {type(exc).__name__}: {exc}")
-            failed += 1
-
-    if perf_rows:
-        print(f"\n{'-' * 100}")
-        print(
-            f"{'M':>6} | {'graph us':>10} | {'csv us':>10} | {'ratio':>7} | "
-            f"{'TFLOPs':>9} | {'TB/s':>7} | {'splitK':>6} | kernel(kid)"
-        )
-        for M, us, ratio, tflops, tbs, row in perf_rows:
-            print(
-                f"{M:>6} | {us:>10.2f} | {row['csv_us']:>10.2f} | "
-                f"{ratio:>6.2f}x | {tflops:>9.2f} | {tbs:>7.3f} | "
-                f"{row['split_k']:>6} | {row['kernel_name'] or row['kid']}"
-            )
-    print(f"\nSummary: {passed} passed, {failed} failed out of {len(rows)}")
     return failed == 0
 
 
@@ -1115,17 +897,11 @@ if __name__ == "__main__":
         )
         sys.exit(0)
 
-    # The standard Aiter runner executes each file directly. Keep the branch's
-    # exact-launch regression coverage, then continue into main's default
-    # production-policy benchmark so a bare invocation preserves both roles.
+    # The standard Aiter runner executes each file directly.
     if len(sys.argv) == 1:
-        pytest_status = pytest.main([__file__])
-        if pytest_status:
-            sys.exit(pytest_status)
+        sys.exit(pytest.main([__file__]))
 
-    parser = argparse.ArgumentParser(
-        description="A16W16 OPUS exact-kid tests and shape-driven benchmark"
-    )
+    parser = argparse.ArgumentParser(description="A16W16 OPUS exact-kid benchmark")
     parser.add_argument("-m", type=int, default=None)
     parser.add_argument("-n", type=int, default=None)
     parser.add_argument("-k", type=int, default=None)
@@ -1151,115 +927,17 @@ if __name__ == "__main__":
         ),
     )
     parser.add_argument(
-        "--opus_sweep",
-        action="store_true",
-        help=(
-            "Run the CUDA-graph-mode production-policy sweep over "
-            "the M values whose tuned winner is opus for the given N/K in the "
-            "tuned CSV (default action when no shape/CSV is given)."
-        ),
-    )
-    parser.add_argument(
-        "--exact_opus_sweep",
-        action="store_true",
-        help=(
-            "Replay each tuned CSV row through the strict exact-kid API with "
-            "its saved solidx/splitK."
-        ),
-    )
-    parser.add_argument(
-        "--tuned_csv",
-        type=str,
-        default=None,
-        metavar="CSV",
-        help=(
-            "Tuned GEMM CSV used by --opus_sweep to pick opus shapes. "
-            "Defaults to the shipped dsv4_bf16_tuned_gemm.csv."
-        ),
-    )
-    parser.add_argument(
         "--graph",
         action="store_true",
         help="Use CUDA-graph mode for the single-shape / --csv_file paths too.",
     )
-    parser.add_argument(
-        "--iters",
-        type=int,
-        default=101,
-        help="Timed iterations passed to run_perftest (default: 101).",
-    )
-    parser.add_argument(
-        "--warmup",
-        type=int,
-        default=2,
-        help="Warmup iterations passed to run_perftest (default: 2).",
-    )
-    parser.add_argument(
-        "--rotate",
-        type=int,
-        default=0,
-        help=(
-            "Number of rotated input copies. 0 lets run_perftest size the "
-            "rotation from L2; 1 disables rotation."
-        ),
-    )
-    add_data_init_args(parser, default_dist="norm", include_scale=False)
-    parser.add_argument(
-        "--const-val",
-        type=float,
-        default=1.0,
-        help="Fill value used by --data-init constant (default: 1.0).",
-    )
     args = parser.parse_args()
 
     out_dtype = torch.bfloat16 if args.dtype == "bf16" else torch.float32
-    if len(args.data_init) != 1:
-        parser.error("--data-init accepts exactly one distribution")
-    run_kwargs = {
-        "dist": args.data_init[0],
-        "gen": make_generator(args.seed),
-        "const_val": args.const_val,
-        "iters": args.iters,
-        "warmup": args.warmup,
-        "rotate": args.rotate,
-    }
+    if args.csv_file is not None and args.m is not None:
+        parser.error("--csv_file cannot be combined with -m")
 
-    if args.opus_sweep and args.exact_opus_sweep:
-        parser.error("--opus_sweep and --exact_opus_sweep are mutually exclusive")
-    if args.csv_file is not None and (
-        args.opus_sweep or args.exact_opus_sweep or args.m is not None
-    ):
-        parser.error("--csv_file cannot be combined with a sweep or -m")
-
-    production_sweep = args.opus_sweep or (
-        not args.exact_opus_sweep
-        and args.csv_file is None
-        and args.kid is None
-        and args.m is None
-    )
-    if args.tuned_csv is not None and not (production_sweep or args.exact_opus_sweep):
-        parser.error("--tuned_csv is only valid for an OPUS tuned-row sweep")
-
-    tuned_csv = args.tuned_csv or str(_DEFAULT_TUNED_CSV)
-    if args.exact_opus_sweep:
-        ok = run_a16w16_opus_sweep(
-            tuned_csv,
-            N=args.n if args.n is not None else 2048,
-            K=args.k if args.k is not None else 7168,
-            out_dtype=out_dtype,
-        )
-        sys.exit(0 if ok else 1)
-    elif production_sweep:
-        ok = run_shape_driven_opus_sweep(
-            tuned_csv,
-            N=args.n if args.n is not None else 2048,
-            K=args.k if args.k is not None else 7168,
-            batch=args.batch if args.batch is not None else 1,
-            out_dtype=out_dtype,
-            **run_kwargs,
-        )
-        sys.exit(0 if ok else 1)
-    elif args.csv_file is not None:
+    if args.csv_file is not None:
         ok = run_a16w16_csv_sweep(
             args.csv_file,
             batch=args.batch or 8,
