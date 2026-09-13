@@ -7,11 +7,6 @@ A low-LDS persistent-enough grid counts every local route into
 ``(dest_rank, local_expert)`` buckets, allgathers the histogram, then writes
 the destination compact row into ``tok_map``. Dispatch copies payload straight
 onto that row, so the receiver never runs ``moe_route_g2l_lds``.
-
-This is the gfx1250 counterpart of ``mega_moe_prepare`` + ``emit_dispatch_group``:
-the plan is a separate launch whose LDS is a few kilobytes of counters, not the
-320 KiB TDM payload tile, so a software grid barrier here does not stall
-max-LDS dispatch CTAs.
 """
 
 from __future__ import annotations
@@ -40,6 +35,38 @@ from . import tdm_prims as TDM
 PLAN_BLOCKS = 1
 PLAN_WAVES = 32
 PLAN_THREADS = PLAN_WAVES * WAVE
+_LDS_ROUTE_CAP = 8192
+
+
+def _align32(n: int) -> int:
+    return (int(n) + 31) // 32 * 32
+
+
+def compact_hist_layout(*, npes: int, experts_per_rank: int, max_routes: int):
+    """Per-parity histogram row layout for the symmetric arena.
+
+    Returns ``(row_dwords, sparse_cap, use_sparse)``. Dense rows are ``npes*epr``
+    dwords. Sparse rows pack ``nnz`` plus ``(seg, cnt)`` pairs when local routes
+    cannot fill the dense table (decode).
+    """
+    segs = int(npes) * int(experts_per_rank)
+    max_routes = max(1, int(max_routes))
+    sparse_cap = min(segs, _align32(max_routes))
+    use_sparse = sparse_cap < segs
+    row_dwords = _align32(1 + sparse_cap) if use_sparse else segs
+    return row_dwords, sparse_cap, use_sparse
+
+
+def compact_hist_stride(*, npes: int, experts_per_rank: int, max_routes: int) -> int:
+    row_dwords, _, _ = compact_hist_layout(
+        npes=npes, experts_per_rank=experts_per_rank, max_routes=max_routes
+    )
+    return int(npes) * int(row_dwords)
+
+
+def compact_done_nbytes() -> int:
+    """Two parity arrival counters (one i32 each)."""
+    return 8
 
 
 @flyc.jit
@@ -90,8 +117,9 @@ def compile_tdm_compact_plan(
     off_hist: int,
     off_done: int,
     hist_stride: int,
+    max_routes: int,
 ):
-    """Compile the compact-plan kernel. ``hist_stride`` is ``npes * segs`` (one parity)."""
+    """Compile the compact-plan kernel. ``hist_stride`` is ``npes * row_dwords``."""
     if WAVE != 32:
         raise ValueError("compact plan requires gfx1250 wave32")
     epr = int(experts_per_rank)
@@ -100,6 +128,7 @@ def compile_tdm_compact_plan(
         raise ValueError(f"compact plan LDS hist supports at most 1024 segments, got {segs}")
     tile_m = int(tile_m)
     compact_cap = int(compact_cap)
+    max_routes = max(1, int(max_routes))
     peer_bits = max(1, (int(npes) - 1).bit_length())
     peer_mask = (1 << peer_bits) - 1
     if compact_cap >= (1 << (31 - peer_bits)):
@@ -108,6 +137,20 @@ def compile_tdm_compact_plan(
             f"cap={compact_cap} peers={npes}"
         )
     hist_stride = int(hist_stride)
+    row_dwords, sparse_cap, use_sparse = compact_hist_layout(
+        npes=npes, experts_per_rank=epr, max_routes=max_routes
+    )
+    if hist_stride != npes * row_dwords:
+        raise ValueError(
+            f"hist_stride={hist_stride} != npes*row_dwords={npes * row_dwords}"
+        )
+    merge_routes = max_routes <= _LDS_ROUTE_CAP
+    if max_routes % 4 == 0:
+        route_vec = 4
+    elif max_routes % 2 == 0:
+        route_vec = 2
+    else:
+        route_vec = 1
     dropped = -1
 
     @flyc.kernel(name="tdm_compact_plan", known_block_size=[PLAN_THREADS, 1, 1])
@@ -146,14 +189,22 @@ def compile_tdm_compact_plan(
         lds_total = fx.Int64(fx.ptrtoint(total_ptr))
         lds_pref = fx.Int64(fx.ptrtoint(pref_ptr))
         lds_matrix = fx.Int64(fx.ptrtoint(matrix_ptr))
+        if const_expr(merge_routes):
+            routes_ptr = smem.allocate(max_routes * 4, 16)._ptr
+            lds_routes = fx.Int64(fx.ptrtoint(routes_ptr))
+        if const_expr(use_sparse):
+            pack_ptr = smem.allocate(row_dwords * 4, 128)._ptr
+            recv_ptr = smem.allocate(npes * row_dwords * 4, 128)._ptr
+            lds_pack = fx.Int64(fx.ptrtoint(pack_ptr))
+            lds_recv = fx.Int64(fx.ptrtoint(recv_ptr))
 
         for s in range(tid, segs, PLAN_THREADS):
             comm_ops.store_i32_lds(lds_hist + fx.Int64(s) * fx.Int64(4), arith.constant(0))
         fx.barrier()
 
         n_routes = inp_cur_tok * fx.Int32(topk)
-        for route in range(bid * PLAN_THREADS + tid, n_routes, PLAN_BLOCKS * PLAN_THREADS):
-            expert = buffer_load(rsrc_idx, route, vec_width=1, dtype=T.i32)
+
+        def _tally_one(route, expert):
             dest_pe = expert // epr
             valid = (expert >= 0) & (dest_pe >= 0) & (dest_pe < npes)
             local_e = expert - dest_pe * fx.Int32(epr)
@@ -163,14 +214,33 @@ def compile_tdm_compact_plan(
                 intra = comm_ops.atomic_add_lds(
                     lds_hist + fx.Int64(segment) * fx.Int64(4), arith.constant(1)
                 )
-            # Pack (segment, intra) into tok_map for the fill pass. Dropped
-            # routes keep the sentinel so dispatch never names them.
             packed = arith.select(
                 valid,
                 segment | (intra << arith.constant(16)),
                 arith.constant(dropped),
             )
-            buffer_store(packed, rsrc_map, route)
+            if const_expr(merge_routes):
+                comm_ops.store_i32_lds(
+                    lds_routes + fx.Int64(route) * fx.Int64(4), packed
+                )
+            else:
+                buffer_store(packed, rsrc_map, route)
+
+        vec_n = n_routes - (n_routes & fx.Int32(route_vec - 1))
+        stride = PLAN_BLOCKS * PLAN_THREADS * route_vec
+        for route in range(bid * PLAN_THREADS * route_vec + tid * route_vec, vec_n, stride):
+            if const_expr(route_vec == 1):
+                expert = buffer_load(rsrc_idx, route, vec_width=1, dtype=T.i32)
+                _tally_one(route, expert)
+            else:
+                raw = fx.Vector(
+                    buffer_load(rsrc_idx, route, vec_width=route_vec, dtype=T.i32)
+                )
+                for k in range_constexpr(route_vec):
+                    _tally_one(route + k, raw[k])
+        for route in range(vec_n + bid * PLAN_THREADS + tid, n_routes, PLAN_BLOCKS * PLAN_THREADS):
+            expert = buffer_load(rsrc_idx, route, vec_width=1, dtype=T.i32)
+            _tally_one(route, expert)
 
         fx.barrier()
         if const_expr(PLAN_BLOCKS > 1):
@@ -217,10 +287,37 @@ def compile_tdm_compact_plan(
             gen = buffer_load(rsrc_bar, 2, vec_width=1, dtype=T.i32)
             parity = gen & arith.constant(1)
             hist_off = off_hist + parity * hist_stride * 4
-            done_off = off_done + parity * npes * 4
-            # One wave publishes the dense source histogram to each peer.
-            # Typical EP4 is 384 dwords = 12 whole TDM rows.
-            if const_expr(PLAN_BLOCKS == 1 and segs % 32 == 0):
+            done_off = off_done
+
+            if const_expr(use_sparse):
+                for s in range(tid, row_dwords, PLAN_THREADS):
+                    comm_ops.store_i32_lds(
+                        lds_pack + fx.Int64(s) * fx.Int64(4), arith.constant(0)
+                    )
+                fx.barrier()
+                for s in range(tid, segs, PLAN_THREADS):
+                    cnt = comm_ops.load_i32_lds(lds_hist + fx.Int64(s) * fx.Int64(4))
+                    if cnt != 0:
+                        slot = comm_ops.atomic_add_lds(lds_pack, arith.constant(1))
+                        packed = fx.Int32(s) | (cnt << arith.constant(16))
+                        comm_ops.store_i32_lds(
+                            lds_pack + fx.Int64(slot + 1) * fx.Int64(4), packed
+                        )
+                fx.barrier()
+                tdm_rows = row_dwords // 32
+                if warp < npes:
+                    peer_hist = fx.Int64(window.lsa_ptr(warp, hist_off)) + fx.Int64(
+                        rank * row_dwords * 4
+                    )
+                    TDM.tdm_store(
+                        TDM.tdm_group0(
+                            arith.trunci(T.i32, arith.unwrap(lds_pack)), peer_hist
+                        ),
+                        TDM.tdm_group1(32, tdm_rows, 4),
+                    )
+                fx.barrier()
+                TDM.tdm_wait(0)
+            elif const_expr(PLAN_BLOCKS == 1 and segs % 32 == 0):
                 if warp < npes:
                     peer_hist = fx.Int64(
                         window.lsa_ptr(warp, hist_off)
@@ -262,43 +359,75 @@ def compile_tdm_compact_plan(
                 comm_ops.fence_system_release()
             fx.barrier()
             if tid < npes:
-                comm_ops.store_i32_system(
+                comm_ops.atomic_add_system(
                     fx.Int64(window.lsa_ptr(tid, done_off)),
-                    fx.Int32(rank),
-                    gen,
+                    arith.constant(1),
                 )
             comm_ops.waitcnt_stores()
             fx.barrier()
-            if tid < npes:
-                comm_ops.wait_i32_until_equals(
-                    fx.Int64(window.lsa_ptr(rank, done_off))
-                    + fx.Int64(tid) * fx.Int64(4),
-                    gen,
-                )
             if tid == 0:
+                comm_ops.wait_i32_until_equals(
+                    fx.Int64(window.lsa_ptr(rank, done_off)),
+                    gen * fx.Int32(npes),
+                )
                 comm_ops.fence_system_acquire()
             fx.barrier()
 
-            matrix_n = npes * segs
-            if const_expr(matrix_n % 32 == 0):
+            if const_expr(use_sparse):
+                tdm_rows = (npes * row_dwords) // 32
                 TDM.tdm_load(
                     TDM.tdm_group0(
-                        arith.trunci(T.i32, arith.unwrap(lds_matrix)),
+                        arith.trunci(T.i32, arith.unwrap(lds_recv)),
                         fx.Int64(window.lsa_ptr(my_lsa_rank, hist_off)),
                     ),
-                    TDM.tdm_group1(32, matrix_n // 32, 4),
+                    TDM.tdm_group1(32, tdm_rows, 4),
                 )
                 TDM.tdm_wait(0)
-            else:
-                local_hist_rsrc = create_buffer_resource_from_addr(
-                    fx.Int64(window.lsa_ptr(my_lsa_rank, hist_off))
-                )
-                for s in range(tid, matrix_n, PLAN_THREADS):
+                for s in range(tid, npes * segs, PLAN_THREADS):
                     comm_ops.store_i32_lds(
-                        lds_matrix + fx.Int64(s) * fx.Int64(4),
-                        buffer_load(local_hist_rsrc, s, vec_width=1, dtype=T.i32),
+                        lds_matrix + fx.Int64(s) * fx.Int64(4), arith.constant(0)
                     )
-            fx.barrier()
+                fx.barrier()
+                for src in range_constexpr(npes):
+                    src_base = fx.Int32(src * row_dwords)
+                    nnz = comm_ops.load_i32_lds(
+                        lds_recv + fx.Int64(src * row_dwords) * fx.Int64(4)
+                    )
+                    for i in range(tid, nnz, PLAN_THREADS):
+                        packed = comm_ops.load_i32_lds(
+                            lds_recv
+                            + fx.Int64(src_base + i + 1) * fx.Int64(4)
+                        )
+                        seg = packed & arith.constant(0xFFFF)
+                        cnt = packed >> arith.constant(16)
+                        comm_ops.store_i32_lds(
+                            lds_matrix
+                            + fx.Int64(src * segs) * fx.Int64(4)
+                            + fx.Int64(seg) * fx.Int64(4),
+                            cnt,
+                        )
+                fx.barrier()
+            else:
+                matrix_n = npes * segs
+                if const_expr(matrix_n % 32 == 0):
+                    TDM.tdm_load(
+                        TDM.tdm_group0(
+                            arith.trunci(T.i32, arith.unwrap(lds_matrix)),
+                            fx.Int64(window.lsa_ptr(my_lsa_rank, hist_off)),
+                        ),
+                        TDM.tdm_group1(32, matrix_n // 32, 4),
+                    )
+                    TDM.tdm_wait(0)
+                else:
+                    local_hist_rsrc = create_buffer_resource_from_addr(
+                        fx.Int64(window.lsa_ptr(my_lsa_rank, hist_off))
+                    )
+                    for s in range(tid, matrix_n, PLAN_THREADS):
+                        comm_ops.store_i32_lds(
+                            lds_matrix + fx.Int64(s) * fx.Int64(4),
+                            buffer_load(local_hist_rsrc, s, vec_width=1, dtype=T.i32),
+                        )
+                fx.barrier()
             for idx in range(tid, segs, PLAN_THREADS):
                 dest = idx // fx.Int32(epr)
                 e = idx - dest * fx.Int32(epr)
@@ -367,10 +496,13 @@ def compile_tdm_compact_plan(
                     buffer_store(next_gen, rsrc_bar, 1)
             fx.barrier()
 
-        # Fill dest_row = send_base[segment] + intra. PLAN_BLOCKS is one, so
-        # intra is already the full source-local exclusive offset.
         for route in range(bid * PLAN_THREADS + tid, n_routes, PLAN_THREADS):
-            packed = buffer_load(rsrc_map, route, vec_width=1, dtype=T.i32)
+            if const_expr(merge_routes):
+                packed = comm_ops.load_i32_lds(
+                    lds_routes + fx.Int64(route) * fx.Int64(4)
+                )
+            else:
+                packed = buffer_load(rsrc_map, route, vec_width=1, dtype=T.i32)
             valid = packed >= 0
             segment = packed & arith.constant(0xFFFF)
             intra = packed >> arith.constant(16)
@@ -380,10 +512,6 @@ def compile_tdm_compact_plan(
             )
             dest_row = send_base + intra
             in_cap = dest_row < compact_cap
-            # Dispatch consumes this directly: low bits select the peer and
-            # the remaining bits are the final expert row. Keeping it positive
-            # preserves -1 as the dropped-route sentinel and removes the
-            # per-route division by compact_cap in dispatch.
             flat = (dest_row << fx.Int32(peer_bits)) | (
                 dest_pe & fx.Int32(peer_mask)
             )

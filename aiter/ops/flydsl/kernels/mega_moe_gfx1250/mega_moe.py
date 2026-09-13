@@ -728,8 +728,20 @@ class MegaMoEGfx1250:
             if self._compact_plan
             else config.dispatch_token_nbytes
         )
+        from .compact_plan import (
+            PLAN_BLOCKS,
+            compact_done_nbytes,
+            compact_hist_stride,
+            compile_tdm_compact_plan,
+        )
+
         segs = config.world_size * config.experts_per_rank
-        hist_stride = config.world_size * segs
+        max_routes = config.max_tokens_per_rank * config.topk
+        hist_stride = compact_hist_stride(
+            npes=config.world_size,
+            experts_per_rank=config.experts_per_rank,
+            max_routes=max_routes,
+        )
         arena_regions = [
             ("tok_off", 4),
             ("recv_num", config.world_size * 4),
@@ -748,7 +760,7 @@ class MegaMoEGfx1250:
                 [
                     ("ep_rowmap", (recv_rows + 1) * 8),
                     ("compact_hist", 2 * hist_stride * 4),
-                    ("compact_done", 2 * config.world_size * 4),
+                    ("compact_done", compact_done_nbytes()),
                 ]
             )
         arena_regions.append(
@@ -782,8 +794,6 @@ class MegaMoEGfx1250:
         self._compact_psum = None
         self._compact_plan_launch = None
         if self._compact_plan:
-            from .compact_plan import PLAN_BLOCKS, compile_tdm_compact_plan
-
             self._compact_masked_m = torch.zeros(
                 config.experts_per_rank, dtype=torch.int32, device=device
             )
@@ -811,6 +821,7 @@ class MegaMoEGfx1250:
                 off_hist=self._arena.offset("compact_hist"),
                 off_done=self._arena.offset("compact_done"),
                 hist_stride=hist_stride,
+                max_routes=max_routes,
             )
         self._destination_peer_counter = torch.zeros(
             config.world_size, dtype=torch.int32, device=device
