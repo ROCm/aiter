@@ -603,6 +603,14 @@ def run_flydsl_moe_gfx942_impl(
     request: FusedMoeRequest,
     config_string: str,
 ) -> torch.Tensor:
+    config = Config.from_string(config_string)
+    if not (
+        getattr(request.w1, "is_shuffled", False)
+        and getattr(request.w2, "is_shuffled", False)
+    ):
+        raise NotImplementedError(
+            "gfx942 FlyDSL whole-graph backend requires preshuffled weights"
+        )
     if request.bias1 is not None or request.bias2 is not None:
         raise NotImplementedError(
             "gfx942 FlyDSL whole-graph backend does not support per-expert bias"
@@ -610,6 +618,38 @@ def run_flydsl_moe_gfx942_impl(
     if request.doweight_stage1:
         raise NotImplementedError(
             "gfx942 FlyDSL whole-graph backend does not support doweight_stage1=True"
+        )
+    if request.a1_scale is not None or request.a2_scale is not None:
+        raise NotImplementedError(
+            "gfx942 FlyDSL whole-graph backend does not support prequantized activations"
+        )
+    if request.hidden_pad or request.intermediate_pad:
+        raise NotImplementedError(
+            "gfx942 FlyDSL whole-graph backend does not support hidden/intermediate padding"
+        )
+    if request.gate_mode not in (None, "separated"):
+        raise NotImplementedError(
+            "gfx942 FlyDSL whole-graph backend only supports separated gate weights"
+        )
+    if request.dtype not in (None, request.hidden_states.dtype):
+        raise NotImplementedError(
+            "gfx942 FlyDSL whole-graph backend does not support output dtype conversion"
+        )
+    if request.block_size_m not in (None, config.BLOCK_M):
+        raise NotImplementedError(
+            "gfx942 FlyDSL whole-graph backend does not support overriding block_size_m"
+        )
+    if request.ksplit != 0:
+        raise NotImplementedError(
+            "gfx942 FlyDSL whole-graph backend does not support split-K"
+        )
+    if request.q_dtype_a not in (None, torch.float8_e4m3fnuz):
+        raise NotImplementedError(
+            "gfx942 FlyDSL whole-graph backend requires FP8 E4M3FNUZ activations"
+        )
+    if request.q_dtype_w not in (None, torch.float8_e4m3fnuz):
+        raise NotImplementedError(
+            "gfx942 FlyDSL whole-graph backend requires FP8 E4M3FNUZ weights"
         )
     return run_flydsl_moe_gfx942(
         request.hidden_states,
@@ -624,6 +664,6 @@ def run_flydsl_moe_gfx942_impl(
         request.expert_mask,
         request.num_local_tokens,
         request.moe_sorting_dispatch_policy,
-        config_string,
+        config.to_string(),
         request.swiglu_limit,
     )
