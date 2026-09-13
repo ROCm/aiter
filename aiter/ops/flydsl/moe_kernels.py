@@ -74,7 +74,7 @@ def flydsl_kernel_name(
 
 
 _MXFP_PREFILL_NAME = re.compile(
-    r"flydsl_moe([12])_(mxfp8|a8w4)_([48])w_t(256x256|128x512|128x256)(?:_persistent([24]))?_xcd([0-9]+)"
+    r"flydsl_moe([12])_mxfp8_8w_t256x256(?:_persistent([24]))?_xcd([0-9]+)"
 )
 
 
@@ -82,34 +82,23 @@ def get_mxfp_prefill_kernel_params(name):
     match = _MXFP_PREFILL_NAME.fullmatch(name or "")
     if match is None:
         return None
-    stage, family, waves, tile, persistent, swizzle = match.groups()
-    waves = int(waves)
-    tile_m, tile_n = map(int, tile.split("x"))
+    stage, persistent, swizzle = match.groups()
     if int(swizzle) not in (0, 1, 2, 3, 4, 8):
         raise ValueError(f"Unsupported prefill swizzle: {swizzle}")
-    if persistent and (int(stage), family, waves, tile_m, tile_n) != (
-        2,
-        "mxfp8",
-        8,
-        256,
-        256,
-    ):
+    if persistent and int(stage) != 2:
         raise ValueError("Persistent prefill requires MXFP8 stage2 tile256x256")
-    expected = (4, 128, 256) if family == "a8w4" else (8, 256, 256)
-    if (waves, tile_m, tile_n) != expected:
-        raise ValueError(f"Unsupported prefill geometry: {name}")
     return {
         "stage": int(stage),
-        "num_waves": waves,
+        "num_waves": 8,
         "persistent_tiles": int(persistent) if persistent else 0,
-        "tile_m": tile_m,
-        "tile_n": tile_n,
+        "tile_m": 256,
+        "tile_n": 256,
         "xcd_swizzle": int(swizzle),
         "mode": "reduce",
-        "sort_block_m": 128 if waves == 4 else 256,
+        "sort_block_m": 256,
         "a_dtype": "fp8",
-        "b_dtype": "fp4" if family == "a8w4" else "fp8",
-        "activation_type": "silu" if family == "a8w4" else "swiglu",
+        "b_dtype": "fp8",
+        "activation_type": "swiglu",
         "out_dtype": "fp8" if int(stage) == 1 else "bf16",
     }
 
@@ -2448,28 +2437,16 @@ def flydsl_moe_stage2(
 
 
 @functools.lru_cache(maxsize=256)
-def _get_compiled_mxfp_moe(kind, **kwargs):
-    from .kernels.moe_mxfp_8wave import (
-        compile_mxfp8_moe_gemm,
-        compile_mxfp8_moe_quant,
-        compile_mxfp8_moe_reduce,
-        compile_mxfp8_moe_sort_input_scale,
-        compile_mxfp8_moe_unpack_routes,
-    )
+def _get_compiled_mxfp_moe_gemm(**kwargs):
+    from .kernels.moe_mxfp_8wave import compile_mxfp8_moe_gemm
 
-    return {
-        "gemm": compile_mxfp8_moe_gemm,
-        "quant": compile_mxfp8_moe_quant,
-        "reduce": compile_mxfp8_moe_reduce,
-        "sort_scale": compile_mxfp8_moe_sort_input_scale,
-        "routes": compile_mxfp8_moe_unpack_routes,
-    }[kind](**kwargs)
+    return compile_mxfp8_moe_gemm(**kwargs)
 
 
-def _run_mxfp_moe(kind, args, **kwargs):
+def _run_mxfp_moe_gemm(args, **kwargs):
     from .kernels.tensor_shim import _preload_compiled, _run_compiled
 
-    launch = _get_compiled_mxfp_moe(kind, **kwargs)
+    launch = _get_compiled_mxfp_moe_gemm(**kwargs)
     if os.environ.get("COMPILE_ONLY") == "1":
         _preload_compiled(launch, *args)
     else:
@@ -2482,30 +2459,6 @@ def _mxfp_moe_stream():
 
 def _mxfp_moe_bytes(t):
     return t.view(torch.int8).view(-1)
-
-
-def _mxfp_moe_routes(sorted_ids, valid, tokens, topk):
-    rows = (sorted_ids.numel() + 255) // 256 * 256
-    row_map = torch.empty(rows, dtype=torch.int32, device=sorted_ids.device)
-    # Masked/remote routes are zero in the final reduction, including empty EP.
-    inverse = torch.full(
-        (tokens * topk,), -1, dtype=torch.int32, device=sorted_ids.device
-    )
-    _run_mxfp_moe(
-        "routes",
-        (
-            sorted_ids,
-            row_map,
-            inverse,
-            rows,
-            tokens,
-            valid,
-            _mxfp_moe_stream(),
-        ),
-        topk=topk,
-        dynamic_rows=True,
-    )
-    return rows, row_map, inverse
 
 
 def flydsl_mxfp_moe_stage1(
@@ -2530,119 +2483,36 @@ def flydsl_mxfp_moe_stage1(
         raise ValueError(
             f"Invalid prefill stage-1 configuration: {kernelName}, block_m={block_m}"
         )
-    if hidden_states.dtype != torch.bfloat16 or sorted_weights is not None:
+    if hidden_states.element_size() != 1 or a1_scale is None or out is None:
         raise ValueError(
-            "MXFP8/A8W4 prefill requires BF16 input and stage-2 routing weights"
+            "MXFP8 prefill stage 1 requires prequantized MXFP8 input "
+            "and a BF16 route-output buffer"
         )
-    tokens, hidden = hidden_states.shape
-    inter = w2.shape[-1] * (2 if params["b_dtype"] == "fp4" else 1)
-    device = hidden_states.device
-    fuse_quant = params["b_dtype"] == "fp4"
-    kp = (inter + 255) // 256 * 256
-    if params["b_dtype"] == "fp4":
-        rows = (sorted_ids.numel() + 255) // 256 * 256
-        row_map = torch.empty(rows, dtype=torch.int32, device=device)
-        sa = torch.empty((rows, hidden // 32), dtype=torch.uint8, device=device)
-        if os.environ.get("COMPILE_ONLY") == "1":
-            aq = torch.empty((tokens, hidden), dtype=torch.int8, device=device)
-            scale_per_token = torch.empty(
-                (tokens, hidden // 32), dtype=torch.uint8, device=device
-            )
-        else:
-            from aiter.ops.quant import per_1x32_mx_quant_hip
-
-            aq, scale_per_token = per_1x32_mx_quant_hip(
-                hidden_states,
-                quant_dtype=torch.float8_e4m3fn,
-                scale_type=torch.float8_e8m0fnu,
-                shuffle=False,
-            )
-        _run_mxfp_moe(
-            "sort_scale",
-            (
-                scale_per_token.view(torch.uint8).view(-1),
-                sa.view(torch.int32).view(-1),
-                sorted_ids,
-                row_map,
-                num_valid_ids,
-                tokens,
-                rows,
-                _mxfp_moe_stream(),
-            ),
-            K=hidden,
-            topk=topk,
-        )
-    else:
-        rows, row_map, inverse = _mxfp_moe_routes(
-            sorted_ids, num_valid_ids, tokens, topk
-        )
-        aq = torch.empty((tokens, hidden), dtype=torch.int8, device=device)
-        sa = torch.full((rows, hidden // 32), 127, dtype=torch.uint8, device=device)
-        _run_mxfp_moe(
-            "quant",
-            (
-                hidden_states.view(-1),
-                aq.view(-1),
-                sa.view(-1),
-                inverse,
-                tokens,
-                _mxfp_moe_stream(),
-            ),
-            K=hidden,
-            gather=False,
-            scatter_scale_topk=topk,
-        )
-    if fuse_quant:
-        packed_output = torch.empty(
-            rows * (kp + kp // 32), dtype=torch.int8, device=device
-        )
-        aq2 = packed_output[: rows * kp].view(rows, kp)
-        sa2 = packed_output[rows * kp :].view(rows, kp // 32).view(torch.uint8)
-        gemm_output = packed_output
-    else:
-        act = torch.empty((rows, inter), dtype=torch.bfloat16, device=device)
-        aq2 = torch.empty((rows, kp), dtype=torch.int8, device=device)
-        sa2 = torch.empty((rows, kp // 32), dtype=torch.uint8, device=device)
-        gemm_output = act.view(-1)
-    stream = _mxfp_moe_stream()
-    _run_mxfp_moe(
-        "gemm",
+    rows = sorted_ids.numel()
+    inter = w2.shape[-1]
+    route_weights = sorted_ids if sorted_weights is None else sorted_weights
+    _run_mxfp_moe_gemm(
         (
-            _mxfp_moe_bytes(aq),
+            _mxfp_moe_bytes(hidden_states),
             _mxfp_moe_bytes(w1),
-            gemm_output,
-            _mxfp_moe_bytes(sa),
+            out.view(-1),
+            _mxfp_moe_bytes(a1_scale),
             _mxfp_moe_bytes(w1_scale),
             sorted_expert_ids,
-            row_map,
+            sorted_ids,
+            route_weights,
             num_valid_ids,
             rows,
             2 * inter,
-            stream,
+            _mxfp_moe_stream(),
         ),
-        K=hidden,
+        K=hidden_states.shape[-1],
         stage=1,
+        topk=topk,
         xcd_swizzle=params["xcd_swizzle"],
         swiglu_limit=None if swiglu_limit is None else float(swiglu_limit),
-        b_dtype=params["b_dtype"],
     )
-    if not fuse_quant:
-        _run_mxfp_moe(
-            "quant",
-            (
-                act.view(-1),
-                aq2.view(-1),
-                sa2.view(-1),
-                row_map,
-                rows,
-                num_valid_ids,
-                stream,
-            ),
-            K=inter,
-            gather=False,
-            dynamic_rows=True,
-        )
-    return aq2, sa2
+    return out
 
 
 def flydsl_mxfp_moe_stage2(
@@ -2660,46 +2530,59 @@ def flydsl_mxfp_moe_stage2(
     a2_scale=None,
     w2_scale=None,
     sorted_weights=None,
+    expert_mask=None,
+    topk_ids=None,
 ):
     params = get_mxfp_prefill_kernel_params(kernelName)
     if params is None or params["stage"] != 2 or block_m != params["sort_block_m"]:
         raise ValueError(
             f"Invalid prefill stage-2 configuration: {kernelName}, block_m={block_m}"
         )
+    if hidden_states.element_size() != 1 or a2_scale is None or sorted_weights is None:
+        raise ValueError(
+            "MXFP8 prefill stage 2 requires quantized route-order input, "
+            "sorted scales and routing weights"
+        )
     tokens, hidden = out.shape
-    inter = w2.shape[-1] * (2 if params["b_dtype"] == "fp4" else 1)
-    rows, row_map, inverse = _mxfp_moe_routes(sorted_ids, num_valid_ids, tokens, topk)
-    partial = torch.empty((rows, hidden), dtype=torch.bfloat16, device=out.device)
+    inter = w2.shape[-1]
+    rows = sorted_ids.numel()
+    partial = torch.empty(
+        (tokens, topk, hidden), dtype=torch.bfloat16, device=out.device
+    )
     stream = _mxfp_moe_stream()
-    _run_mxfp_moe(
-        "gemm",
+    _run_mxfp_moe_gemm(
         (
-            hidden_states.view(-1),
+            _mxfp_moe_bytes(hidden_states),
             _mxfp_moe_bytes(w2),
             partial.view(-1),
-            a2_scale.view(-1),
+            _mxfp_moe_bytes(a2_scale),
             _mxfp_moe_bytes(w2_scale),
             sorted_expert_ids,
-            row_map,
+            sorted_ids,
+            sorted_weights,
             num_valid_ids,
             rows,
             hidden,
             stream,
         ),
-        K=hidden_states.shape[-1],
+        K=inter,
         b_k=inter,
         stage=2,
+        topk=topk,
         xcd_swizzle=params["xcd_swizzle"],
-        b_dtype=params["b_dtype"],
         persistent_tiles=params["persistent_tiles"],
     )
-    _run_mxfp_moe(
-        "reduce",
-        (partial.view(-1), out.view(-1), inverse, sorted_weights, tokens, stream),
-        N=hidden,
-        topk=topk,
-        sorted_weights=True,
-    )
+    if os.environ.get("COMPILE_ONLY") != "1":
+        _run_moe_reduction(
+            partial,
+            out,
+            tokens,
+            topk,
+            hidden,
+            expert_mask=expert_mask,
+            topk_ids=topk_ids,
+            stream=stream,
+        )
     return out
 
 
@@ -2708,26 +2591,28 @@ flydsl_mxfp_moe_stage2._is_flydsl_stage2 = True
 
 
 def precompile_mxfp_moe(kernelName, token_num, model_dim, inter_dim, experts, topk):
-    """Compile through the runtime adapter using FakeTensorMode and COMPILE_ONLY."""
+    """Compile the gather GEMM through the runtime adapter with fake tensors."""
     params = get_mxfp_prefill_kernel_params(kernelName)
     if params is None:
         raise ValueError(f"Invalid prefill kernel name: {kernelName}")
     tokens, hidden, inter = token_num, model_dim, inter_dim
-    pack = 2 if params["b_dtype"] == "fp4" else 1
     block_m = params["sort_block_m"]
     count = tokens * topk + experts * block_m - topk
-    rows = (count + 255) // 256 * 256
+    scale_rows = (count + 31) // 32 * 32
     kwargs = {"device": "cpu"}
-    w1 = torch.empty((experts, 2 * inter, hidden // pack), dtype=torch.int8, **kwargs)
-    w2 = torch.empty((experts, hidden, inter // pack), dtype=torch.int8, **kwargs)
+    w1 = torch.empty((experts, 2 * inter, hidden), dtype=torch.int8, **kwargs)
+    w2 = torch.empty((experts, hidden, inter), dtype=torch.int8, **kwargs)
     ids = torch.empty(count, dtype=torch.int32, **kwargs)
     eids = torch.empty((count + block_m - 1) // block_m, dtype=torch.int32, **kwargs)
     valid = torch.empty(2, dtype=torch.int32, **kwargs)
+    weights = torch.empty(count, dtype=torch.float32, **kwargs)
     if params["stage"] == 1:
-        x = torch.empty((tokens, hidden), dtype=torch.bfloat16, **kwargs)
-        scale = torch.empty(
+        x = torch.empty((tokens, hidden), dtype=torch.int8, **kwargs)
+        scale = torch.empty((scale_rows, hidden // 32), dtype=torch.uint8, **kwargs)
+        wscale = torch.empty(
             experts * 2 * inter * (hidden // 32), dtype=torch.int8, **kwargs
         )
+        route_out = torch.empty((tokens, topk, inter), dtype=torch.bfloat16, **kwargs)
         flydsl_mxfp_moe_stage1(
             x,
             w1,
@@ -2735,18 +2620,18 @@ def precompile_mxfp_moe(kernelName, token_num, model_dim, inter_dim, experts, to
             ids,
             eids,
             valid,
-            None,
+            route_out,
             topk,
             block_m=block_m,
             kernelName=kernelName,
-            w1_scale=scale,
+            a1_scale=scale,
+            w1_scale=wscale,
         )
     else:
         kp = (inter + 255) // 256 * 256
-        x = torch.empty((rows, kp), dtype=torch.int8, **kwargs)
+        x = torch.empty((tokens, topk, inter), dtype=torch.int8, **kwargs)
         scale = torch.empty(experts * hidden * (kp // 32), dtype=torch.int8, **kwargs)
-        ascale = torch.empty((rows, kp // 32), dtype=torch.uint8, **kwargs)
-        weights = torch.empty(count, dtype=torch.float32, **kwargs)
+        ascale = torch.empty((scale_rows, kp // 32), dtype=torch.uint8, **kwargs)
         out = torch.empty((tokens, hidden), dtype=torch.bfloat16, **kwargs)
         flydsl_mxfp_moe_stage2(
             x,

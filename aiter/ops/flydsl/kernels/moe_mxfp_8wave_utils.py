@@ -1,13 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (c) 2026 FlyDSL Project Contributors
 
-"""Scaled MFMA, scale loading and epilogues for MXFP8/A8W4 MoE."""
+"""Scaled MFMA, scale loading and epilogues for MXFP8 MoE."""
 
 import flydsl.expr as fx
 from flydsl.expr import const_expr, range_constexpr, rocdl
-from flydsl.expr import math as fmath
-from flydsl.expr.typing import ReductionOp, T
 from flydsl.expr.typing import Vector as Vec
+
+from .mxfp4_gemm_common import _swiglu_mul_batch
 
 
 def make_scale_preshuffled_s2r(scale_arg, rows, K, n_tiles):
@@ -71,7 +71,7 @@ def make_scale_preshuffled_s2r(scale_arg, rows, K, n_tiles):
     return ScalePreshuffledS2R()
 
 
-def make_mx_mfma(n_tiles_a, n_tiles_b, b_dtype="fp8"):
+def make_mx_mfma(n_tiles_a, n_tiles_b):
     class MxMfma:
         """16x16x128 scaled MFMA with per-tile packed scales and byte selectors.
 
@@ -90,7 +90,7 @@ def make_mx_mfma(n_tiles_a, n_tiles_b, b_dtype="fp8"):
                         16,
                         128,
                         fx.Float8E4M3FN,
-                        fx.Float4E2M1FN if b_dtype == "fp4" else fx.Float8E4M3FN,
+                        fx.Float8E4M3FN,
                         opsel_a=kp * 2 + ia,
                         opsel_b=kp * 2 + jb,
                     )
@@ -102,7 +102,6 @@ def make_mx_mfma(n_tiles_a, n_tiles_b, b_dtype="fp8"):
             self.zero_value = Vec.filled(4, 0.0, fx.Float32)
             self.n_tiles_a = n_tiles_a
             self.n_tiles_b = n_tiles_b
-            self.b_words = 4 if b_dtype == "fp4" else 8
 
         def idx(self, i, j):
             return i * self.n_tiles_b + j
@@ -126,10 +125,7 @@ def make_mx_mfma(n_tiles_a, n_tiles_b, b_dtype="fp8"):
             assert len(c) == self.n_tiles_a * self.n_tiles_b
 
             a_frags = [self._operand(a[i]) for i in range_constexpr(self.n_tiles_a)]
-            b_frags = [
-                self._operand(b[j], self.b_words)
-                for j in range_constexpr(self.n_tiles_b)
-            ]
+            b_frags = [self._operand(b[j]) for j in range_constexpr(self.n_tiles_b)]
             c_frags = [
                 self._accum(c[i])
                 for i in range_constexpr(self.n_tiles_a * self.n_tiles_b)
@@ -200,39 +196,15 @@ def make_mx_pipeline_mma(mfma, a_sc, b_sc, a_base16, b_base16, k_iters):
     return MxPipelineMma()
 
 
-def _mxfp8_exponent(amax_bits):
-    # BF16 mantissa 96 is 1.75; ceil(log2(amax / 448)), clamped at 1e-30.
-    return fx.max((amax_bits >> 7) - 8 + ((amax_bits & 127) > 96).to(fx.Int32), 19)
-
-
-def _pack_fp8x8(values, scale):
-    words = []
-    for word in range_constexpr(2):
-        packed = Vec.filled(2, 0, fx.Int16)
-        for half in range_constexpr(2):
-            base = word * 4 + half * 2
-            pair = Vec.from_elements([values[base], values[base + 1]], fx.BFloat16)
-            packed = Vec(
-                rocdl.cvt_scalef32_pk_fp8_bf16(
-                    T.i16x2, packed.ir_value(), pair.ir_value(), scale.ir_value(), half
-                )
-            )
-        words.append(packed.bitcast(fx.Int32)[0])
-    return Vec.from_elements(words, fx.Int32)
-
-
 def _store_factory(
     *,
     activation=False,
     transpose=False,
     swiglu_limit=7.0,
-    activation_type="swiglu",
-    fuse_quant=False,
+    topk=1,
+    apply_weight=False,
 ):
-    exponent_for_amax = _mxfp8_exponent
-    pack_fp8x8 = _pack_fp8x8
-
-    def factory(C, rows, cols, idx, n_tiles_a, n_tiles_b, scratch):
+    def factory(C, route_ids, route_weights, cols, idx, n_tiles_a, n_tiles_b, scratch):
         cols = cols // 2 if activation else cols
         tile_n = n_tiles_b * (8 if activation else 16)
         tile_m = n_tiles_a * 16
@@ -244,73 +216,27 @@ def _store_factory(
         for i in range_constexpr(1, num_waves):
             base = (wave == i).select(fx.Int32(fx.ptrtoint(scratch[i])), base)
         ptr = fx.recast_iter(fx.BFloat16, fx.inttoptr(scratch[0].type, base))
-        kp = (cols + 255) // 256 * 256
-        records = (
-            fx.Int64(rows) * (kp + kp // 32)
-            if fuse_quant
-            else fx.Int64(rows) * cols * 2
+        out = fx.rocdl.make_buffer_tensor(
+            C,
+            max_size=False,
+            num_records_bytes=fx.Int64(fx.size(C.shape).unpack()) * 2,
         )
-        out = fx.rocdl.make_buffer_tensor(C, max_size=False, num_records_bytes=records)
-        scales = out
-        out = fx.logical_divide(out, fx.make_layout(16 if fuse_quant else 8, 1))
-        atom = fx.make_copy_atom(
-            fx.rocdl.BufferCopy128b(), fx.Int8 if fuse_quant else fx.BFloat16
-        )
+        out = fx.logical_divide(out, fx.make_layout(8, 1))
+        atom = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), fx.BFloat16)
+        weights = fx.rocdl.make_buffer_tensor(route_weights, max_size=False)
 
         def scratch_at(row, col, width):
             offset = row * tile_n + (col ^ ((row % (tile_n // 8)) * 8))
             return fx.make_view(ptr + offset, fx.make_layout(width, 1))
 
-        def store_scale(row, kg, exponent, valid):
-            scale_index = (
-                (row // 32 * (kp // 256) + kg // 8) * 64 + kg % 4 * 16 + row % 16
-            ) * 4
-            scale_index += kg // 4 % 2 * 2 + row // 16 % 2
-            scales[valid.select(rows * kp + scale_index, fx.Int32(-1))] = exponent.to(
-                fx.Int8
-            )
+        def output_row(sorted_row):
+            route = route_ids[sorted_row]
+            return (route & 0xFFFFFF) * topk + ((route >> 24) & 0xFF)
 
-        def quant_store(base_row, base_col):
-            # Two lanes own one group, each loading and storing 16 values.
-            row = lane // 2
-            col = lane % 2 * 16
-            group_col = base_col
-            values = [
-                scratch_at(row, col + chunk * 8, 8).load()
-                for chunk in range_constexpr(2)
-            ]
-            amax_bits = fx.Int32(0)
-            for chunk in range_constexpr(2):
-                bits = (
-                    (values[chunk].bitcast(fx.Int16) & 0x7FFF)
-                    .reduce(ReductionOp.MAX)
-                    .to(fx.Int32)
-                )
-                amax_bits = fx.max(amax_bits, bits)
-            amax_bits = fx.max(amax_bits, fx.gpu.shuffle_xor(amax_bits, 1, 64))
-            exponent = exponent_for_amax(amax_bits)
-            scale = (exponent << 23).bitcast(fx.Float32)
-            words = []
-            for chunk in range_constexpr(2):
-                packed = pack_fp8x8(values[chunk], scale)
-                words.extend([packed[0], packed[1]])
-            reg = fx.make_rmem_tensor(16, fx.Int8)
-            reg.store(Vec.from_elements(words, fx.Int32).bitcast(fx.Int8))
-            offset = (base_row + row) * kp + group_col + col
-            fx.copy(atom, reg, fx.slice(out, (None, offset >> 4)))
-            store_scale(base_row + row, group_col // 32, exponent, lane % 2 == 0)
-            # The final 128-column output tile also clears the K256 padding.
-            pad = (kp != cols) & (group_col >= cols - 128)
-            reg.store(Vec.filled(16, 0, fx.Int8))
-            pad_offset = pad.select(offset + 128, fx.Int32(-16))
-            fx.copy(atom, reg, fx.slice(out, (None, pad_offset >> 4)))
-            store_scale(
-                base_row + row,
-                (group_col + 128) // 32,
-                fx.Int32(19),
-                pad & (lane % 2 == 0),
-            )
-            rocdl.s_barrier()
+        def maybe_weight(values, sorted_row):
+            if const_expr(apply_weight):
+                return (values.to(fx.Float32) * weights[sorted_row]).to(fx.BFloat16)
+            return values
 
         def store(c_frag, base_row, base_col):
             for ti in range_constexpr(n_tiles_a):
@@ -326,56 +252,46 @@ def _store_factory(
                     else:
                         if const_expr(activation):
                             up = Vec(c_frag[idx(ti, tj * 2 + 1)])
+                            activated = _swiglu_mul_batch(
+                                [value[i] for i in range_constexpr(4)],
+                                [up[i] for i in range_constexpr(4)],
+                                limit=swiglu_limit,
+                            )
                         for i in range_constexpr(4):
-                            v = value[i]
-                            if const_expr(activation):
-                                gate, linear = v, up[i]
-                                if const_expr(
-                                    activation_type == "swiglu" or swiglu_limit
-                                ):
-                                    gate = fx.min(gate, swiglu_limit)
-                                    linear = fx.max(
-                                        fx.min(linear, swiglu_limit), -swiglu_limit
-                                    )
-                                if const_expr(activation_type == "swiglu"):
-                                    v = (
-                                        gate
-                                        / (1.0 + fmath.exp(-1.702 * gate))
-                                        * (linear + 1.0)
-                                    )
-                                else:
-                                    v = gate / (1.0 + fmath.exp(-gate)) * linear
+                            v = activated[i] if activation else value[i]
                             scratch_at(row + i, col, 1).store(
                                 Vec.filled(1, v.to(fx.BFloat16), fx.BFloat16)
                             )
             rocdl.s_waitcnt(lgkmcnt=0)
             if const_expr(activation):
                 base_col = base_col // 2
-            if const_expr(fuse_quant):
-                rocdl.s_barrier()
-                quant_store(base_row, base_col)
-            elif const_expr(transpose):
+            if const_expr(transpose):
                 for step in range_constexpr(tile_m * tile_n // (64 * 32)):
                     linear = lane * 32 + step * 64 * 32
                     row, col = linear // (tile_n * 4) * 4, linear // 4 % tile_n
                     values = fx.make_view(ptr + linear, fx.make_layout(32, 1)).load()
                     for i in range_constexpr(4):
+                        sorted_row = base_row + row + i
                         reg = fx.make_rmem_tensor(8, fx.BFloat16)
                         reg.store(
-                            Vec.from_elements(
-                                [values[i + j * 4] for j in range_constexpr(8)],
-                                fx.BFloat16,
+                            maybe_weight(
+                                Vec.from_elements(
+                                    [values[i + j * 4] for j in range_constexpr(8)],
+                                    fx.BFloat16,
+                                ),
+                                sorted_row,
                             )
                         )
-                        offset = (base_row + row + i) * cols + base_col + col
+                        offset = output_row(sorted_row) * cols + base_col + col
                         fx.copy(atom, reg, fx.slice(out, (None, offset >> 3)))
             else:
                 for step in range_constexpr(tile_m * tile_n // (64 * 8)):
                     linear = lane * 8 + step * 64 * 8
                     row, col = linear // tile_n, linear % tile_n
+                    sorted_row = base_row + row
                     reg = fx.make_rmem_tensor(8, fx.BFloat16)
-                    reg.store(scratch_at(row, col, 8).load())
-                    offset = (base_row + row) * cols + base_col + col
+                    reg.store(maybe_weight(scratch_at(row, col, 8).load(), sorted_row))
+                    offset = output_row(sorted_row) * cols + base_col + col
                     fx.copy(atom, reg, fx.slice(out, (None, offset >> 3)))
 
         return store

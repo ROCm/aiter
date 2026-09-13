@@ -2903,7 +2903,6 @@ def get_2stage_cfgs(
 
             p1 = get_mxfp_prefill_kernel_params(kn1)
             p2 = get_mxfp_prefill_kernel_params(kn2)
-            a8w4 = p1 is not None and p1["b_dtype"] == "fp4"
             if not (
                 p1
                 and p2
@@ -2915,10 +2914,9 @@ def get_2stage_cfgs(
                 and dtype == dtypes.bf16
                 and input_dtype in (None, dtypes.bf16)
                 and q_dtype_a == dtypes.fp8
-                and q_dtype_w == (dtypes.fp4x2 if a8w4 else dtypes.fp8)
+                and q_dtype_w == dtypes.fp8
                 and q_type == QuantType.per_1x32
-                and activation
-                == (ActivationType.Silu if a8w4 else ActivationType.Swiglu)
+                and activation == ActivationType.Swiglu
                 and use_g1u1
                 and gate_mode == GateMode.INTERLEAVE
                 and not doweight_stage1
@@ -3153,15 +3151,15 @@ def get_2stage_cfgs(
             and p1["b_dtype"] == p2["b_dtype"]
             and p1["sort_block_m"] == p2["sort_block_m"] == block_m
         ):
-            raise ValueError("Invalid MXFP8/A8W4 prefill MoE kernel pair")
+            raise ValueError("Invalid MXFP8 prefill MoE kernel pair")
         return MOEMetadata(
             functools.partial(flydsl_mxfp_moe_stage1, kernelName=kernelName1),
             functools.partial(flydsl_mxfp_moe_stage2, kernelName=kernelName2),
             p1["sort_block_m"],
             0,
-            prequant=False,
-            fuse_quant="fp8",
-            skip_inter_quant=True,
+            prequant=True,
+            fuse_quant=False,
+            skip_inter_quant=False,
             **route_bucket_metadata,
         )
 
@@ -3874,11 +3872,7 @@ def fused_moe_2stages(
         and q_dtype_a == dtypes.bf16
         and getattr(metadata.stage1, "func", metadata.stage1) is _flydsl_stage1_wrapper
     )
-    if _is_a16w4_port or getattr(
-        getattr(metadata.stage1, "func", metadata.stage1),
-        "_is_mxfp8_prefill_stage1",
-        False,
-    ):
+    if _is_a16w4_port:
         a2 = None
     elif quant_type == QuantType.per_1x128 and metadata.stage1.func is asm_stage1:
         ratio = a1_scale.element_size() // a1.element_size()
@@ -3908,7 +3902,7 @@ def fused_moe_2stages(
             extra_stage2_args["bias2"] = _normalize_bias_for_kernel(bias2)
     if getattr(stage1_func, "_is_mxfp8_prefill_stage1", False):
         if bias1 is not None:
-            raise ValueError("MXFP8/A8W4 prefill stage 1 does not support expert bias")
+            raise ValueError("MXFP8 prefill stage 1 does not support expert bias")
         extra_stage1_args["swiglu_limit"] = swiglu_limit
     if stage1_func in (_flydsl_stage1_wrapper, _opus_a8w4_stage1_wrapper):
         # Hand these two the caller's limit unchanged. They clamp silu whenever a
@@ -3945,13 +3939,9 @@ def fused_moe_2stages(
     # EP: forward expert_mask + topk_ids to the flydsl stage2 wrapper so it can
     # switch to reduce mode and fuse the validity gather in compile_moe_reduction.
     if (
-        stage2_func
-        in (
-            _flydsl_stage2_wrapper,
-            _flydsl_v2_stage2_wrapper,
-        )
-        and expert_mask is not None
-    ):
+        stage2_func in (_flydsl_stage2_wrapper, _flydsl_v2_stage2_wrapper)
+        or getattr(stage2_func, "_is_flydsl_stage2", False)
+    ) and expert_mask is not None:
         extra_stage2_args["expert_mask"] = expert_mask
         extra_stage2_args["topk_ids"] = topk_ids
     if not doweight_stage1 and _flydsl_stage2_fp8_enabled():

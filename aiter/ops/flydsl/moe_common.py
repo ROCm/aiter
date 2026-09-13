@@ -79,6 +79,4 @@ def apply_gate_up(
 
 def is_mxfp_prefill_kernel(name):
     """Recognize this adapter's namespace before validating a complete name."""
-    return any(
-        marker in str(name) for marker in ("_mxfp8_8w_", "_a8w4_8w_", "_a8w4_4w_")
-    )
+    return "_mxfp8_8w_" in str(name)
