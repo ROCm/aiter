@@ -194,11 +194,11 @@ def _moe_reduction_body(
 
 
 def _pick_reduce_block(model_dim: int, V: int) -> int:
-    need = -(-model_dim // V)
-    block = BLOCK
-    while block < need and block < 1024:
-        block *= 2
-    return block
+    # FlyDSL kernels without a declared known_block_size are capped at the
+    # AMDGPU default of 256 threads. Cover wider model dimensions with the
+    # existing y-grid instead of emitting an invalid 512/1024-thread launch.
+    del model_dim, V
+    return BLOCK
 
 
 @functools.lru_cache(maxsize=1024)

@@ -288,7 +288,7 @@ def compile_mixed_moe_gemm1_common(
     heterogeneous_tag = f"_shared_fp8_e{shared_expert_id}" if heterogeneous_b else ""
     if latent_heterogeneous:
         heterogeneous_tag = (
-            f"_latent_bf16_e{shared_expert_id}_h{shared_model_dim}_i{shared_inter_dim}"
+            f"_latent_bf16_rbounds_e{shared_expert_id}_h{shared_model_dim}_i{shared_inter_dim}"
         )
     # ABI v33 adds four runtime SiTUv2 beta scalars; heterogeneous ABI tracks one
     # version ahead of the ordinary kernel.
@@ -360,13 +360,16 @@ def compile_mixed_moe_gemm1_common(
     out_elem_bytes = 4 if out_is_f32 else 2
     w_elem_bytes = 1
     w_elem_pack = 2 if is_f4_b else 1
-    w_nbytes = (experts * (2 * inter_dim) * model_dim * w_elem_bytes) // w_elem_pack
+    weight_experts = experts - 1 if latent_heterogeneous else experts
+    w_nbytes = (
+        weight_experts * (2 * inter_dim) * model_dim * w_elem_bytes
+    ) // w_elem_pack
     shared_w_nbytes = (
         (2 * int(shared_inter_dim)) * int(shared_model_dim) * 2
         if latent_heterogeneous
         else (2 * inter_dim) * model_dim
     )
-    bias_nbytes = experts * (2 * inter_dim) * 4
+    bias_nbytes = weight_experts * (2 * inter_dim) * 4
 
     e_vec_s1 = min(tile_n // 32, 8)
     if need_quant:
@@ -509,7 +512,7 @@ def compile_mixed_moe_gemm1_common(
 
             acc_init = arith.constant_vector(0.0, vec4_f32)
 
-            c_n_total = arith.constant(experts * (2 * inter_dim), index=True)
+            c_n_total = arith.constant(weight_experts * (2 * inter_dim), index=True)
             b_layout = make_preshuffle_b_layout(
                 arith,
                 c_n=c_n_total,
@@ -663,7 +666,7 @@ def compile_mixed_moe_gemm1_common(
 
             c32 = arith.constant(32, index=True)
             kblk_w = k_in // c32
-            mn_w = arith.constant(experts * (2 * inter_dim), index=True)
+            mn_w = arith.constant(weight_experts * (2 * inter_dim), index=True)
             sw_nbytes_idx = mn_w * kblk_w
             sw_nbytes_i32 = fx.Int32(sw_nbytes_idx)
             sw_rsrc = ptr_buffer_resource(arg_scale_w, sw_nbytes_i32)
@@ -763,7 +766,7 @@ def compile_mixed_moe_gemm1_common(
                     )
 
                 # per-expert 64-bit re-base: 32-bit buffer voffset overflows when w1 > 4GB
-                per_expert_w_bytes = w_nbytes // experts
+                per_expert_w_bytes = w_nbytes // weight_experts
                 w_addr_i64 = fx.Int64(fx.ptrtoint(arg_w))
                 expert_byte_off = fx.Int64(
                     expert_idx * arith.constant(per_expert_w_bytes, index=True)
@@ -887,7 +890,7 @@ def compile_mixed_moe_gemm1_common(
                 up_n_intra_list = []
                 up_n_blk_list = []
                 col_g_list = []
-                c_n0_static = experts * (2 * inter_dim) // 16
+                c_n0_static = weight_experts * (2 * inter_dim) // 16
                 layout_n_blk_intra = fx.make_layout((c_n0_static, 16), stride=(16, 1))
                 inter_idx = arith.constant(inter_dim, index=True)
 
@@ -3668,7 +3671,10 @@ def compile_mixed_moe_gemm2_common(
         )
     w_elem_bytes = 1
     w_elem_pack = 2 if is_f4_b else 1
-    w_nbytes = (experts * model_dim * inter_dim * w_elem_bytes) // w_elem_pack
+    weight_experts = experts - 1 if latent_heterogeneous else experts
+    w_nbytes = (
+        weight_experts * model_dim * inter_dim * w_elem_bytes
+    ) // w_elem_pack
     shared_w_nbytes = (
         int(shared_model_dim) * int(shared_inter_dim) * 2
         if latent_heterogeneous
@@ -3678,7 +3684,7 @@ def compile_mixed_moe_gemm2_common(
     # 128- but not 256-aligned (e.g. 384) read OOB scales -> garbage e8m0 -> NaN.
     scale_k_padded = (inter_dim + 255) // 256 * 256
     scale_kblk_padded = scale_k_padded // 32
-    bias_nbytes = experts * model_dim * 4
+    bias_nbytes = weight_experts * model_dim * 4
 
     def x_elem_type():
         if const_expr(is_f4_b):
@@ -3742,7 +3748,7 @@ def compile_mixed_moe_gemm2_common(
     heterogeneous_tag = f"_shared_fp8_e{shared_expert_id}" if heterogeneous_b else ""
     if latent_heterogeneous:
         heterogeneous_tag = (
-            f"_latent_bf16_e{shared_expert_id}_h{shared_model_dim}_i{shared_inter_dim}"
+            f"_latent_bf16_rbounds_e{shared_expert_id}_h{shared_model_dim}_i{shared_inter_dim}"
         )
     serial_n_tag = "_serialn128" if serial_shared_n else ""
     if heterogeneous_b:
@@ -3826,7 +3832,7 @@ def compile_mixed_moe_gemm2_common(
             topk_idx = arith.constant(topk, index=True)
             m_in = tokens_in * topk_idx
 
-            c_n_total = arith.constant(experts * model_dim, index=True)
+            c_n_total = arith.constant(weight_experts * model_dim, index=True)
             kpack_bytes = 16
             from .layout_utils import _div_pow2, _mod_pow2
 
@@ -3992,7 +3998,7 @@ def compile_mixed_moe_gemm2_common(
                 sx_rsrc = ptr_buffer_resource(arg_scale_x, sx_nbytes_i32)
 
             kblk_w = arith.constant(scale_kblk_padded, index=True)
-            mn_w = arith.constant(experts * model_dim, index=True)
+            mn_w = arith.constant(weight_experts * model_dim, index=True)
             sw_nbytes_idx = mn_w * kblk_w
             sw_nbytes_i32 = fx.Int32(sw_nbytes_idx)
             sw_rsrc = ptr_buffer_resource(arg_scale_w, sw_nbytes_i32)

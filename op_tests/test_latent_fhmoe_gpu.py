@@ -133,8 +133,9 @@ def test_k3_latent_fhmoe_exact_dimensions(
     monkeypatch.setenv("AITER_SITUV2_A8W4", "1")
     torch.manual_seed(7 + m)
     device = torch.device("cuda")
-    experts = 1
-    topk = 1
+    graph_mode = os.environ.get("AITER_K3_LATENT_GRAPH", "0") == "1"
+    experts = 896 if graph_mode else 1
+    topk = 16 if graph_mode else 1
 
     routed_input = torch.randn((m, 3584), device=device, dtype=torch.bfloat16) * 0.02
     shared_input = torch.randn((m, 7168), device=device, dtype=torch.bfloat16) * 0.02
@@ -163,10 +164,14 @@ def test_k3_latent_fhmoe_exact_dimensions(
     )
     shared_w1 = shuffle_weight(raw_shared_w1, layout=(16, 16))
     shared_w2 = shuffle_weight(raw_shared_w2, layout=(16, 16))
-    topk_ids = torch.zeros((m, topk), dtype=torch.int32, device=device)
-    topk_weight = torch.ones((m, topk), dtype=torch.float32, device=device)
+    topk_ids = torch.randperm(experts, dtype=torch.int32, device=device)[
+        : m * topk
+    ].reshape(m, topk)
+    topk_weight = torch.full(
+        (m, topk), 1.0 / topk, dtype=torch.float32, device=device
+    )
 
-    routed_actual, shared_actual = latent_fhmoe(
+    args = (
         routed_input,
         routed_w1,
         routed_w2,
@@ -178,6 +183,15 @@ def test_k3_latent_fhmoe_exact_dimensions(
         shared_w1,
         shared_w2,
     )
+    if graph_mode:
+        latent_fhmoe(*args)
+        torch.cuda.synchronize()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            routed_actual, shared_actual = latent_fhmoe(*args)
+        graph.replay()
+    else:
+        routed_actual, shared_actual = latent_fhmoe(*args)
     torch.cuda.synchronize()
 
     routed_ref = _routed_aiter_reference(
@@ -189,10 +203,15 @@ def test_k3_latent_fhmoe_exact_dimensions(
         topk_weight,
         topk_ids,
     )
-    routed_gate, routed_up = F.linear(routed_input, raw_routed_w1[0]).chunk(2, dim=-1)
-    routed_torch_ref = F.linear(
-        _situv2(routed_gate, routed_up).to(torch.bfloat16), raw_routed_w2[0]
-    )
+    if experts == 1:
+        routed_gate, routed_up = F.linear(routed_input, raw_routed_w1[0]).chunk(
+            2, dim=-1
+        )
+        routed_torch_ref = F.linear(
+            _situv2(routed_gate, routed_up).to(torch.bfloat16), raw_routed_w2[0]
+        )
+    else:
+        routed_torch_ref = routed_ref
     gate, up = F.linear(shared_input, raw_shared_w1[0]).chunk(2, dim=-1)
     shared_inter = _situv2(gate, up).to(torch.bfloat16)
     shared_ref = F.linear(shared_inter, raw_shared_w2[0])
@@ -211,7 +230,10 @@ def test_k3_latent_fhmoe_exact_dimensions(
         )
     assert torch.isfinite(routed_actual).all()
     assert torch.isfinite(shared_actual).all()
-    assert routed_error <= 1e-3, f"routed AITER rel-L2: {routed_error:.3e}"
+    routed_tolerance = 1e-2 if graph_mode else 1e-3
+    assert routed_error <= routed_tolerance, (
+        f"routed AITER rel-L2: {routed_error:.3e}"
+    )
     assert shared_error <= 3e-2, f"shared rel-L2: {shared_error:.3e}"
 
     for _ in range(2):
@@ -250,3 +272,68 @@ def test_k3_latent_fhmoe_exact_dimensions(
             f"K3 latent FHMoE M={m}: {start.elapsed_time(end) / 10:.3f} ms, "
             f"routed rel-L2={routed_error:.3e}, shared rel-L2={shared_error:.3e}"
         )
+
+
+@pytest.mark.skipif(
+    os.environ.get("AITER_K3_LATENT_LIVE_SHAPE", "0") != "1",
+    reason="large 896-expert K3 shape is opt-in",
+)
+def test_k3_latent_fhmoe_live_tp8_shape():
+    """Smoke the exact TP8/EP1 IX decode domain without allocating BF16 experts."""
+    torch.manual_seed(23)
+    device = torch.device("cuda")
+    m, experts, topk = 8, 896, 16
+
+    routed_input = torch.randn((m, 3584), device=device, dtype=torch.bfloat16) * 0.02
+    shared_input = torch.randn((m, 7168), device=device, dtype=torch.bfloat16) * 0.02
+    routed_w1 = torch.zeros(
+        (experts, 768, 1792), device=device, dtype=torch.uint8
+    ).view(aiter.dtypes.fp4x2)
+    routed_w2 = torch.zeros(
+        (experts, 3584, 192), device=device, dtype=torch.uint8
+    ).view(aiter.dtypes.fp4x2)
+    routed_s1 = torch.full(
+        (experts, 768, 112), 0x7F, device=device, dtype=torch.uint8
+    )
+    routed_s2 = torch.full(
+        (experts, 3584, 16), 0x7F, device=device, dtype=torch.uint8
+    )
+    raw_shared_w1 = (
+        torch.randn((1, 1536, 7168), device=device, dtype=torch.bfloat16) * 0.01
+    )
+    raw_shared_w2 = (
+        torch.randn((1, 7168, 768), device=device, dtype=torch.bfloat16) * 0.01
+    )
+    shared_w1 = shuffle_weight(raw_shared_w1, layout=(16, 16))
+    shared_w2 = shuffle_weight(raw_shared_w2, layout=(16, 16))
+    topk_ids = torch.arange(topk, dtype=torch.int32, device=device).repeat(m, 1)
+    topk_weight = torch.full(
+        (m, topk), 1.0 / topk, dtype=torch.float32, device=device
+    )
+
+    routed_actual, shared_actual = latent_fhmoe(
+        routed_input,
+        routed_w1,
+        routed_w2,
+        routed_s1,
+        routed_s2,
+        topk_weight,
+        topk_ids,
+        shared_input,
+        shared_w1,
+        shared_w2,
+    )
+    torch.cuda.synchronize()
+    gate, up = F.linear(shared_input, raw_shared_w1[0]).chunk(2, dim=-1)
+    shared_ref = F.linear(
+        _situv2(gate, up).to(torch.bfloat16), raw_shared_w2[0]
+    )
+    shared_error = _rel_l2(shared_actual, shared_ref)
+    print(
+        "K3 live TP8 shape: "
+        f"routed norm={routed_actual.float().norm().item():.3e}, "
+        f"shared rel-L2={shared_error:.3e}"
+    )
+    assert torch.count_nonzero(routed_actual) == 0
+    assert torch.isfinite(shared_actual).all()
+    assert shared_error <= 3e-2

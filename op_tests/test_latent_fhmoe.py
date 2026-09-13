@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import importlib
 import inspect
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -122,3 +123,53 @@ def test_common_kernel_builds_bf16_dual_mfma_launchers():
 
     assert callable(compile_mixed_latent_fhmoe_gemm1(experts=2, topk=2))
     assert callable(compile_mixed_latent_fhmoe_gemm2(experts=2, topk=2))
+
+
+def test_vllm_adapter_is_strictly_m8_and_opt_in(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    from aiter.latent_fhmoe_vllm import maybe_run_vllm_k3_latent_fhmoe
+
+    runner = SimpleNamespace(
+        moe_config=SimpleNamespace(tp_size=8, ep_size=1, is_sequence_parallel=False),
+        expert_map=None,
+    )
+    routed = torch.empty((8, 3584), dtype=torch.bfloat16, device="meta")
+    shared = torch.empty((8, 7168), dtype=torch.bfloat16, device="meta")
+    logits = torch.empty((8, 896), dtype=torch.float32, device="meta")
+
+    monkeypatch.delenv("VLLM_ROCM_USE_K3_LATENT_FHMOE", raising=False)
+    assert (
+        maybe_run_vllm_k3_latent_fhmoe(runner, routed, logits, shared) is None
+    )
+    monkeypatch.setenv("VLLM_ROCM_USE_K3_LATENT_FHMOE", "1")
+    assert (
+        maybe_run_vllm_k3_latent_fhmoe(
+            runner, routed[:1], logits[:1], shared[:1]
+        )
+        is None
+    )
+    runner.moe_config.tp_size = 4
+    assert (
+        maybe_run_vllm_k3_latent_fhmoe(runner, routed, logits, shared) is None
+    )
+
+
+def test_vllm_adapter_unwraps_live_weight_containers():
+    from aiter.latent_fhmoe_vllm import _precision_scale, _raw_tensor, _weight_scale
+
+    tensor = torch.empty((2, 3), device="meta")
+    wrapped = SimpleNamespace(storage=SimpleNamespace(data=tensor))
+    precision = SimpleNamespace(weight_scale=wrapped)
+    assert _raw_tensor(wrapped) is tensor
+    assert _precision_scale(precision) is tensor
+    assert _weight_scale(SimpleNamespace(_w1=SimpleNamespace(scale=tensor)), 1) is tensor
+
+    class AssertingQuant:
+        _w1 = SimpleNamespace(scale=tensor)
+
+        @property
+        def w1_precision(self):
+            raise AssertionError
+
+    assert _weight_scale(AssertingQuant(), 1) is tensor
