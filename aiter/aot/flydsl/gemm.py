@@ -518,6 +518,7 @@ def _compile_mxfp8_128_wmma_to_cache(
     cluster_n: int,
     a_preshuffle: bool = False,
     persistent_n_tiles: int = 1,
+    splitk_mode: str = "atomic",
     cu_num: int = 0,
     **kwargs,
 ):
@@ -580,10 +581,21 @@ def _compile_mxfp8_128_wmma_to_cache(
             variant_args = launch_args[:-3] + (variant_cm, cluster_n, True)
             if compute_bound:
                 fused_splitk, row_bounded = splitk_epilogue_flags(
-                    m, n, tile_m, tile_n, variant_cm, split_k, cu_num, True
+                    m,
+                    n,
+                    tile_m,
+                    tile_n,
+                    variant_cm,
+                    cluster_n,
+                    split_k,
+                    cu_num,
+                    True,
+                    splitk_mode=splitk_mode,
                 )
                 cb_args = (
-                    variant_args[:12] + (_ptr_view_safe(flag),) + variant_args[12:]
+                    variant_args[:12]
+                    + (_ptr_view_safe(flag), _ptr_view_safe(out))
+                    + variant_args[12:]
                 )
                 for bounded_m in ((False, True) if fused_splitk else (row_bounded,)):
                     launch(
@@ -594,6 +606,7 @@ def _compile_mxfp8_128_wmma_to_cache(
                         persistent_n_tiles,
                         fused_splitk,
                         bounded_m,
+                        splitk_mode,
                     )
             else:
                 launch(
