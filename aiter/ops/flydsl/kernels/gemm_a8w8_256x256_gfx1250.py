@@ -66,6 +66,7 @@ def launch_gemm_a8w8_256x256(
     bounded_m: Constexpr[bool] = True,
     cluster_splitk: Constexpr[bool] = False,
     reuse_splitk_lds: Constexpr[bool] = False,
+    reuse_splitk_lds_k: Constexpr[int] = 0,
 ):
     """N must be a multiple of ``tile_n * cluster_n``; M is unrestricted (a
     multiple of 2 when ``a_preshuffle``); K must be divisible by 128 and at
@@ -96,6 +97,10 @@ def launch_gemm_a8w8_256x256(
     assert (
         not reuse_splitk_lds or cluster_splitk
     ), "LDS reuse requires clustered split-K"
+    # This schedule cannot safely reuse one FlyDSL artifact across K values.
+    assert (
+        not reuse_splitk_lds or reuse_splitk_lds_k > 0
+    ), "LDS-reuse split-K must specialize the K loop bound"
     cluster_k = split_k if cluster_splitk else 1
     assert (
         cluster_m * cluster_n * cluster_k <= 16
@@ -173,6 +178,7 @@ def launch_gemm_a8w8_256x256(
         )
         + ("b" if fused_splitk and split_k > 1 and bounded_m else "")
         + ("_lds" if reuse_splitk_lds else "")
+        + (f"_k{reuse_splitk_lds_k}" if reuse_splitk_lds else "")
     )
 
     def _run_tile(
@@ -1062,6 +1068,7 @@ def launch_gemm_a8w8_256x256(
                     split_idx=split_idx,
                     mn_oob=mn_oob,
                     flat_tile=_flat_tile,
+                    bounded_m=bounded_m,
                     reuse_lds=reuse_splitk_lds,
                 )
             else:

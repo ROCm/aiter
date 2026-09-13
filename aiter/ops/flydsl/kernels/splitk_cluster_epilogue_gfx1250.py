@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (c) 2026 FlyDSL Project Contributors
 
-"""Experimental reduction shared by the K-split workgroups in one cluster."""
+"""Reduction shared by the K-split workgroups in one cluster."""
 
 import flydsl.expr as fx
 from flydsl.expr import const_expr, range_constexpr
@@ -17,7 +17,7 @@ from .splitk_epilogue_gfx1250 import (
     UNROLL,
     VEC,
 )
-from .tensor_shim import buf_copy_load, ptr_buf_tensor
+from .tensor_shim import buf_copy_load, buf_copy_store, ptr_buf_tensor
 
 
 @traced
@@ -38,6 +38,7 @@ def emit_cluster_splitk_reduce_epilogue(
     split_idx,
     mn_oob,
     flat_tile,
+    bounded_m=False,
     reuse_lds=False,
 ):
     """Reduce disjoint row ranges using all of a tile's split-K workgroups.
@@ -46,7 +47,8 @@ def emit_cluster_splitk_reduce_epilogue(
     either published the full partial or retained it in LDS for ``reuse_lds``.
     In that mode the caller cyclically rotates the LDS rows so the local row
     stripe is last. Peer rows are published by one contiguous TDM store, and
-    the local rounded partial stays in LDS. Both modes sum in split order.
+    the local rounded partial stays in LDS. The reduced stripe is written
+    directly to global memory. Both modes preserve the split-order FP32 sum.
     """
     reduce_m = tile_m // split_k
     reduce_row = split_idx * reduce_m
@@ -56,7 +58,8 @@ def emit_cluster_splitk_reduce_epilogue(
     unroll = min(UNROLL, partial_vectors // split_k, reduce_m // rows_per_iter)
     row0 = tid // lanes_per_row
     col = (tid % lanes_per_row) * VEC
-    plane = fx.Int64(tile_m * tile_n)
+    peer_m = tile_m - reduce_m
+    plane = fx.Int64((peer_m if reuse_lds else tile_m) * tile_n)
     partial_base = (
         fx.recast_iter(
             fx.PointerType.get(elem.ir_type, partials.address_space), partials
@@ -65,10 +68,8 @@ def emit_cluster_splitk_reduce_epilogue(
     )
     lds_out = fx.recast_iter(elem, lds_base_ptr)
     if const_expr(reuse_lds):
-        # The rotated peer rows occupy the prefix of each padded scratch plane.
-        # Even on an M tail, the whole prefix fits the allocated tile. Invalid
-        # logical rows are discarded by the final output store's M bound.
-        peer_m = tile_m - reduce_m
+        # Each scratch plane stores just the rotated peer rows, including on an
+        # M tail. The final output descriptor discards invalid logical rows.
         partial_out = partial_base + fx.Int64(split_idx) * plane
         layout = fx.make_layout((peer_m, c_lds_row), (c_lds_row, 1))
         dst = fx.Tensor(fx.make_view(partial_out, layout))
@@ -87,6 +88,15 @@ def emit_cluster_splitk_reduce_epilogue(
         + c_off
         + fx.Int64(reduce_row) * ldc64
     )
+    remaining = mn_oob - reduce_row
+    valid_rows = (remaining > 0).select(remaining, fx.Int32(0))
+    if const_expr(reuse_lds and bounded_m):
+        output_buffer = ptr_buf_tensor(
+            output_base,
+            elem,
+            unit_elems=VEC,
+            num_records_bytes=fx.Int64(valid_rows) * ldc64 * 2,
+        )
     # Select the cyclic peer stripe in each uniform buffer base. Keeping that
     # offset out of the per-vector indices avoids repeated vector arithmetic.
     buffers = [
@@ -109,6 +119,13 @@ def emit_cluster_splitk_reduce_epilogue(
         )
         for s in range_constexpr(split_k)
     ]
+    if const_expr(reuse_lds and split_k == 2):
+        peer_buffer = ptr_buf_tensor(
+            partial_base + fx.Int64(1 - split_idx) * plane,
+            elem,
+            unit_elems=VEC,
+            num_records_bytes=fx.Int64(reduce_m * tile_n * 2),
+        )
     for batch in range(reduce_m // (rows_per_iter * unroll)):
         partial_indices = [
             tid
@@ -116,7 +133,27 @@ def emit_cluster_splitk_reduce_epilogue(
             + (0 if const_expr(reuse_lds) else reduce_row * lanes_per_row)
             for u in range_constexpr(unroll)
         ]
-        if const_expr(reuse_lds):
+        if const_expr(reuse_lds and split_k == 2):
+            # With two splits, both peer stripes begin at offset zero. The
+            # two-term FP32 sum is commutative, so no split-index branch is needed.
+            peer_parts = [
+                buf_copy_load(peer_buffer, idx, elem, VEC, cache_modifier=CPOL_DEVICE)
+                for idx in partial_indices
+            ]
+            local_parts = [
+                fx.Vector(
+                    fx.ptr_load(
+                        lds_out
+                        + (peer_m + row0 + (batch * unroll + u) * rows_per_iter)
+                        * c_lds_row
+                        + col,
+                        result_type=T.vec(VEC, elem.ir_type),
+                    )
+                )
+                for u in range_constexpr(unroll)
+            ]
+            values = [[local_parts[u], peer_parts[u]] for u in range_constexpr(unroll)]
+        elif const_expr(reuse_lds):
             local_parts = [
                 fx.Vector(
                     fx.ptr_load(
@@ -175,18 +212,29 @@ def emit_cluster_splitk_reduce_epilogue(
             for s in range_constexpr(1, split_k):
                 acc = acc + values[u][s].extf(T.vec(VEC, T.f32))
             row = row0 + (batch * unroll + u) * rows_per_iter
-            fx.ptr_store(acc.to(elem), lds_out + row * c_lds_row + col)
+            if const_expr(reuse_lds):
+                if const_expr(bounded_m):
+                    buf_copy_store(
+                        output_buffer,
+                        row * fx.Int32(ldc64 // VEC) + col // VEC,
+                        acc.to(elem),
+                        elem,
+                        VEC,
+                    )
+                else:
+                    fx.ptr_store(acc.to(elem), output_base + row * ldc64 + col)
+            else:
+                fx.ptr_store(acc.to(elem), lds_out + row * c_lds_row + col)
 
-    workgroup_barrier(use_cluster=False)
-    remaining = mn_oob - reduce_row
-    valid_rows = (remaining > 0).select(remaining, fx.Int32(0))
-    layout = fx.make_layout((reduce_m, c_lds_row), (c_lds_row, 1))
-    tile_out = fx.Tensor(fx.make_view(output_base, layout))
-    store_atom = fx.rocdl.make_tdm_atom(
-        tile_out,
-        [valid_rows, tile_n],
-        strides=[ldc64, None],
-        num_warps=block // 32,
-    )
-    fx.copy(store_atom, fx.Tensor(fx.make_view(lds_out, layout)), tile_out)
-    fx.rocdl.tdm_ops.tensor_wait(0)
+    if const_expr(not reuse_lds):
+        workgroup_barrier(use_cluster=False)
+        layout = fx.make_layout((reduce_m, c_lds_row), (c_lds_row, 1))
+        tile_out = fx.Tensor(fx.make_view(output_base, layout))
+        store_atom = fx.rocdl.make_tdm_atom(
+            tile_out,
+            [valid_rows, tile_n],
+            strides=[ldc64, None],
+            num_warps=block // 32,
+        )
+        fx.copy(store_atom, fx.Tensor(fx.make_view(lds_out, layout)), tile_out)
+        fx.rocdl.tdm_ops.tensor_wait(0)

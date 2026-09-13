@@ -5,7 +5,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from aiter.jit.utils.chip_info import get_gfx, get_lds_capacity_bytes
 from aiter.ops.flydsl.mxfp8_128_bpreshuffle_gemm_gfx1250 import (
@@ -74,12 +74,14 @@ class WmmaKernelInstance:
     name_prefix: str = NAME_PREFIX
     a_preshuffle: bool = False
     persistent_n_tiles: int = 1
+    cluster_splitk_lds: bool = False
 
     def name_for(self, a_preshuffle: bool = False) -> str:
         return (
             f"{self.name_prefix}_t{self.tile_m}x{self.tile_n}x{self.tile_k}_"
             f"mw{self.m_warp}_nw{self.n_warp}_nb{self.num_buffers}_sk{self.split_k}_"
             f"cm{self.cluster_m}_cn{self.cluster_n}"
+            + ("_csk_lds" if self.cluster_splitk_lds else "")
             + ("_apre" if (a_preshuffle or self.a_preshuffle) else "")
             + (f"_ps{self.persistent_n_tiles}" if self.persistent_n_tiles > 1 else "")
         )
@@ -198,6 +200,15 @@ def _build_kernels_list() -> dict[int, WmmaKernelInstance]:
                         persistent_n_tiles=ps,
                     )
                     idx += 1
+    # Append variants so existing tuned kernel IDs keep their meaning.
+    for ki in list(kl.values()):
+        if (
+            ki.name_prefix == COMPUTE_NAME_PREFIX
+            and ki.split_k > 1
+            and ki.cluster_m * ki.cluster_n * ki.split_k <= 16
+        ):
+            kl[idx] = replace(ki, cluster_splitk_lds=True)
+            idx += 1
     return kl
 
 
@@ -212,6 +223,10 @@ def kernel_fits_shape(ki: WmmaKernelInstance, M: int, N: int, K: int) -> bool:
         return False
 
     if is_compute_kernel(ki):
+        if ki.cluster_splitk_lds and (
+            ki.split_k not in (2, 4, 8) or ki.cluster_m * ki.cluster_n * ki.split_k > 16
+        ):
+            return False
         profile = (
             ki.tile_m,
             ki.tile_n,
@@ -251,7 +266,7 @@ def kernel_fits_shape(ki: WmmaKernelInstance, M: int, N: int, K: int) -> bool:
             and k_per_split % (ki.tile_k * k_pair) == 0
         )
 
-    if ki.persistent_n_tiles > 1:
+    if ki.persistent_n_tiles > 1 or ki.cluster_splitk_lds:
         return False
     if N % _BLOCK_N != 0 or K % _BLOCK_K != 0:
         return False

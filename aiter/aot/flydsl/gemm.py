@@ -81,6 +81,7 @@ from aiter.ops.flydsl.mxfp8_128_bpreshuffle_gemm_gfx1250 import (
 )
 from aiter.ops.flydsl.mxfp8_128_bpreshuffle_gemm_gfx1250 import (
     SPLIT_K_FLAG_MAX_LEN,
+    check_cluster_splitk_lds,
     check_persistent_n_tiles,
     cluster_m_fallback_values,
     is_compute_wmma_kernel_name,
@@ -518,6 +519,7 @@ def _compile_mxfp8_128_wmma_to_cache(
     cluster_n: int,
     a_preshuffle: bool = False,
     persistent_n_tiles: int = 1,
+    cluster_splitk_lds: bool = False,
     cu_num: int = 0,
     **kwargs,
 ):
@@ -570,6 +572,8 @@ def _compile_mxfp8_128_wmma_to_cache(
             True,
         )
         compute_bound = is_compute_wmma_kernel_name(kernel_name)
+        if cluster_splitk_lds:
+            check_cluster_splitk_lds(split_k, cluster_m, cluster_n, compute_bound)
         launch = launch_gemm_a8w8_256x256 if compute_bound else launch_gemm_a8w8
         check_persistent_n_tiles(
             persistent_n_tiles, n, tile_n, cluster_n, split_k, compute_bound
@@ -582,6 +586,7 @@ def _compile_mxfp8_128_wmma_to_cache(
                 fused_splitk, row_bounded = splitk_epilogue_flags(
                     m, n, tile_m, tile_n, variant_cm, split_k, cu_num, True
                 )
+                fused_splitk = fused_splitk or cluster_splitk_lds
                 cb_args = (
                     variant_args[:12]
                     + (_ptr_view_safe(flag), _ptr_view_safe(out))
@@ -596,6 +601,9 @@ def _compile_mxfp8_128_wmma_to_cache(
                         persistent_n_tiles,
                         fused_splitk,
                         bounded_m,
+                        cluster_splitk_lds,
+                        cluster_splitk_lds,
+                        k if cluster_splitk_lds else 0,
                     )
             else:
                 launch(

@@ -68,7 +68,7 @@ def _run(inputs, out, name, cluster_reduce=False, reuse_lds=False):
             *inputs, out, name, a_is_preshuffled="_apre" in name
         )
 
-    if not cluster_reduce:
+    if not cluster_reduce or "_csk_lds" in name:
         return run()
     backend._lazy_import()
     launch = backend._launch_gemm_a8w8_compute_bound
@@ -76,7 +76,10 @@ def _run(inputs, out, name, cluster_reduce=False, reuse_lds=False):
         backend,
         "_launch_gemm_a8w8_compute_bound",
         side_effect=lambda *args: launch(
-            *args, cluster_splitk=True, reuse_splitk_lds=reuse_lds
+            *args[:30],
+            cluster_splitk=True,
+            reuse_splitk_lds=reuse_lds,
+            reuse_splitk_lds_k=args[8] if reuse_lds else 0,
         ),
     ):
         return run()
@@ -86,7 +89,7 @@ def _reference(inputs, out, name):
     with mock.patch.object(
         backend, "splitk_epilogue_flags", return_value=(False, True)
     ):
-        return _run(inputs, out, name)
+        return _run(inputs, out, name.replace("_csk_lds", ""))
 
 
 @pytest.mark.parametrize("m,n,k,name", _splitk_configs())
@@ -107,6 +110,28 @@ def test_tuned_splitk(m, n, k, name):
         torch.cuda.current_stream().cuda_stream, inputs[0].device
     )
     assert flags.count_nonzero().item() == 0
+
+
+def test_cluster_splitk_lds_specializes_k():
+    """Reuse the same tuned profile safely across different K loop bounds."""
+    pytest.importorskip("flydsl")
+    torch.manual_seed(47)
+    name = (
+        "flydsl_mxfp8_128_bpreshuffle_compute_wmma_t128x256x128_"
+        "mw2_nw2_nb3_sk2_cm4_cn2_csk_lds"
+    )
+    for m, n, k in ((512, 6144, 7168), (512, 7168, 16384)):
+        inputs = _inputs(m, n, k)
+        expected = torch.empty((m, n), dtype=torch.bfloat16, device="cuda")
+        actual = torch.full_like(expected, float("nan"))
+        _reference(inputs, expected, name)
+        with mock.patch.object(
+            backend,
+            "_compile_splitk_reduce",
+            side_effect=AssertionError("extra kernel"),
+        ):
+            _run(inputs, actual, name)
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
 
 @pytest.mark.parametrize("split_k", [2, 4, 8])
@@ -144,6 +169,7 @@ def test_splitk_tail_and_graph(
     name = (
         f"flydsl_mxfp8_128_bpreshuffle_compute_wmma_t{tile_m}x{tile_n}x128_"
         f"mw{m_warp}_nw2_nb{num_buffers}_sk{split_k}_cm1_cn2"
+        + ("_csk_lds" if reuse_lds else "")
         + ("_apre" if a_preshuffle else "")
     )
     inputs = _inputs(m, n, k, a_preshuffle, strided_scale=True)

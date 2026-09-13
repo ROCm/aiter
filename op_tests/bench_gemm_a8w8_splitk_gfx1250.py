@@ -1,14 +1,14 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Compare split-K epilogues with fixed workspaces and long CUDA-graph runs.
+"""Compare split-K epilogues with fixed workspaces and CUDA-graph timing.
 
 Example:
     ENABLE_CK=0 python3 op_tests/bench_gemm_a8w8_splitk_gfx1250.py \
         --kernel flydsl_mxfp8_128_bpreshuffle_compute_wmma_t256x256x128_mw2_nw2_nb2_sk4_cm2_cn4 \
         --include-eightwave --include-cluster --include-cluster-lds \
         --parity-mode cluster_lds --max-regression-pct 0 \
-        --graph-iters 1000 --replays 10 --repeats 10
+        --graph-iters 100 --replays 1 --repeats 10
 
 The benchmark fails before importing the GPU runtime if a driver query is stuck
 or another KFD process exists. It never clears processes or changes GPU clocks.
@@ -140,8 +140,8 @@ def main():
     parser.add_argument("-m", type=_positive_int, default=512)
     parser.add_argument("-n", type=_positive_int, default=7168)
     parser.add_argument("-k", type=_positive_int, default=16384)
-    parser.add_argument("--graph-iters", type=_positive_int, default=1000)
-    parser.add_argument("--replays", type=_positive_int, default=10)
+    parser.add_argument("--graph-iters", type=_positive_int, default=100)
+    parser.add_argument("--replays", type=_positive_int, default=1)
     parser.add_argument("--repeats", type=_positive_int, default=10)
     parser.add_argument("--warmup-replays", type=_positive_int, default=10)
     parser.add_argument("--include-eightwave", action="store_true")
@@ -205,7 +205,11 @@ def main():
         tm, tn, sk = cfg["tile_m"], cfg["tile_n"], cfg["split_k"]
 
         reference_mode = "separate" if reference_cfg["split_k"] > 1 else "reference"
-        selected_mode = "last_arrival" if sk > 1 else "direct"
+        selected_mode = (
+            "cluster_lds"
+            if cfg["cluster_splitk_lds"]
+            else ("last_arrival" if sk > 1 else "direct")
+        )
         cases = [(reference_mode, dict(reference_cfg)), (selected_mode, dict(cfg))]
         separate_modes = {reference_mode}
         # Changing split-K changes the rounding of the partials. Keep a matching
@@ -223,6 +227,12 @@ def main():
                 raise ValueError("Eight-wave candidates require 256x256, nb2 or nb4")
             cases.append(("eightwave", dict(cfg, m_warp=4, n_warp=2)))
         cluster_modes, lds_modes = set(), set()
+        if cfg["cluster_splitk_lds"]:
+            backend.check_cluster_splitk_lds(
+                sk, cfg["cluster_m"], cfg["cluster_n"], True
+            )
+            cluster_modes.add(selected_mode)
+            lds_modes.add(selected_mode)
         if args.include_cluster or args.include_cluster_lds:
             cm = cfg["cluster_m"]
             cn = min(cfg["cluster_n"], 16 // (cm * sk))
@@ -234,7 +244,8 @@ def main():
                 cases.append(("cluster", dict(cfg, cluster_n=cn)))
                 cluster_modes.add("cluster")
             if args.include_cluster_lds:
-                cases.append(("cluster_lds", dict(cfg, cluster_n=cn)))
+                if selected_mode != "cluster_lds":
+                    cases.append(("cluster_lds", dict(cfg, cluster_n=cn)))
                 lds_modes.add("cluster_lds")
                 if args.include_eightwave:
                     cases.append(
@@ -302,7 +313,8 @@ def main():
                 tm, tn, sk = case["tile_m"], case["tile_n"], case["split_k"]
                 tile_count = ((m + tm - 1) // tm) * (n // tn)
                 fused = mode not in separate_modes and sk > 1
-                partial_shape = (tile_count, sk, tm, tn) if fused else (sk, m, n)
+                partial_m = tm - tm // sk if mode in lds_modes else tm
+                partial_shape = (tile_count, sk, partial_m, tn) if fused else (sk, m, n)
                 out = torch.empty((m, n), dtype=dtype, device="cuda")
                 partial = (
                     torch.empty(partial_shape, dtype=dtype, device="cuda")
@@ -346,6 +358,7 @@ def main():
                     bool(m % tm),
                     mode in cluster_modes,
                     mode in lds_modes,
+                    k if mode in lds_modes else 0,
                 )
                 gemm = flyc.compile(launch_gemm_a8w8_256x256, *launch_args)
                 reduce_args, reduce_fn = (), None
@@ -408,7 +421,6 @@ def main():
                     )
                     start.record()
                     for _ in range(args.replays):
-                        monitor.check()
                         graphs[mode].replay()
                     end.record()
                     end.synchronize()
@@ -438,6 +450,11 @@ def main():
             "replays": args.replays,
             "repeats": args.repeats,
             "calls_per_mode": args.graph_iters * args.replays * args.repeats,
+            "calls_per_sample": args.graph_iters * args.replays,
+            "median_total_ms": {
+                mode: statistics.median(values) * args.graph_iters * args.replays / 1000
+                for mode, values in samples.items()
+            },
             "cases": dict(cases),
             "cluster_modes": sorted(cluster_modes),
             "lds_reuse_modes": sorted(lds_modes),

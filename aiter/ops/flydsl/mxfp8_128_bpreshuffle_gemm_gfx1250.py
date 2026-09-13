@@ -58,6 +58,14 @@ def _splitk_grid_wgs(M, N, tile_m, tile_n, cluster_m, split_k) -> int:
     return gx * ((N + tile_n - 1) // tile_n) * split_k
 
 
+def check_cluster_splitk_lds(split_k, cluster_m, cluster_n, compute_bound):
+    """Require all K splits of a compute tile to fit in one hardware cluster."""
+    if not compute_bound or split_k not in (2, 4, 8):
+        raise ValueError("clustered LDS reduction requires compute WMMA split-K 2/4/8")
+    if not 2 <= cluster_m * cluster_n <= 16 // split_k:
+        raise ValueError("clustered LDS reduction needs 2..16 workgroups including K")
+
+
 def _lazy_import():
     global _launch_gemm_a8w8, _launch_gemm_a8w8_compute_bound
     global _compile_splitk_reduce, _run_compiled, _ptr_arg, _fx
@@ -152,6 +160,7 @@ def _run_mxfp8_128_preshuffle_gemm_a8_gfx1250(
     x_scale_transposed: bool = True,
     a_preshuffle: bool = False,
     persistent_n_tiles: int = 1,
+    cluster_splitk_lds: bool = False,
 ) -> Tensor:
     """Run the gfx1250 WMMA mxfp8_128 bpreshuffle GEMM.
 
@@ -182,6 +191,8 @@ def _run_mxfp8_128_preshuffle_gemm_a8_gfx1250(
     split_k = max(1, int(split_k))
     cluster_m = max(1, int(cluster_m))
     cluster_n = max(1, int(cluster_n))
+    if cluster_splitk_lds:
+        check_cluster_splitk_lds(split_k, cluster_m, cluster_n, compute_bound)
 
     if N % _BLOCK_N != 0 or K % BLOCK_K != 0:
         raise RuntimeError(
@@ -305,13 +316,18 @@ def _run_mxfp8_128_preshuffle_gemm_a8_gfx1250(
         torch.cuda.get_device_properties(XQ.device).multi_processor_count,
         compute_bound,
     )
+    # Clustered reduction has no arrival counters or counter-capacity limit.
+    fused_splitk = fused_splitk or cluster_splitk_lds
     flag = (
-        get_split_k_flags(torch_stream.cuda_stream, XQ.device) if fused_splitk else Out
+        get_split_k_flags(torch_stream.cuda_stream, XQ.device)
+        if fused_splitk and not cluster_splitk_lds
+        else Out
     )
     # Pack each tile's splits together so the reducer reads nearby cache lines.
-    # Round M up for the last tile; TDM bounds mask its unused rows.
+    # LDS reuse publishes only peer rows; the local stripe needs no scratch.
+    partial_m = tile_m - tile_m // split_k if cluster_splitk_lds else tile_m
     partial_shape = (
-        (((M + tile_m - 1) // tile_m) * (N // tile_n), split_k, tile_m, tile_n)
+        (((M + tile_m - 1) // tile_m) * (N // tile_n), split_k, partial_m, tile_n)
         if fused_splitk
         else (split_k, M, ldc)
     )
@@ -358,6 +374,9 @@ def _run_mxfp8_128_preshuffle_gemm_a8_gfx1250(
             persistent_n_tiles,
             fused_splitk,
             bounded_m,
+            cluster_splitk_lds,
+            cluster_splitk_lds,
+            K if cluster_splitk_lds else 0,
         )
     else:
         launch(*launch_args, BLOCK_K, split_k, False, 0, 1, a_preshuffle)
@@ -383,7 +402,8 @@ BASE_NAME_SUFFIX_RE = (
     r"cm(?P<cluster_m>\d+)_cn(?P<cluster_n>\d+)"
 )
 NAME_SUFFIX_RE = (
-    BASE_NAME_SUFFIX_RE + r"(?P<a_preshuffle>_apre)?"
+    BASE_NAME_SUFFIX_RE + r"(?P<cluster_splitk_lds>_csk_lds)?"
+    r"(?P<a_preshuffle>_apre)?"
     r"(?:_ps(?P<persistent_n_tiles>\d+))?$"
 )
 _KERNEL_NAME_RE = re.compile(rf"^{re.escape(WMMA_NAME_PREFIX)}_{NAME_SUFFIX_RE}")
@@ -398,11 +418,13 @@ def parse_wmma_kernel_name(name: str):
     if match is None:
         return None
     groups = match.groupdict()
+    cluster_splitk_lds = groups.pop("cluster_splitk_lds", None) is not None
     a_preshuffle = groups.pop("a_preshuffle", None) is not None
     persistent_n_tiles = groups.pop("persistent_n_tiles", None)
     cfg = {key: int(value) for key, value in groups.items()}
     cfg["a_preshuffle"] = a_preshuffle
     cfg["persistent_n_tiles"] = int(persistent_n_tiles) if persistent_n_tiles else 1
+    cfg["cluster_splitk_lds"] = cluster_splitk_lds
     return cfg
 
 
@@ -507,4 +529,5 @@ def run_gemm_a8w8_mxfp8_128_bpreshuffle_gfx1250(
         x_scale_transposed=True,
         a_preshuffle=cfg["a_preshuffle"],
         persistent_n_tiles=cfg["persistent_n_tiles"],
+        cluster_splitk_lds=cfg["cluster_splitk_lds"],
     )
