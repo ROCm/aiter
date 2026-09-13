@@ -97,23 +97,65 @@ def _align_up(value: int, alignment: int) -> int:
     return (value + alignment - 1) // alignment * alignment
 
 
-def _compact_gemm_align_m() -> int:
+def _compact_gemm_align_m(
+    config: "MegaMoEConfig",
+    *,
+    activation: ActivationType,
+    quant_type: QuantType,
+    inter_dim: int,
+) -> int:
     """Tile alignment for compact dest rows; must match GEMM ``max(tile_m, tile_m2)``.
 
-    Arena size is fixed at MegaMoE init, before CSV lookup. Default 64 matches
-    the grouped GEMM CSV default; honour ``AITER_TDM_TILE_M{,2}``. Aligning
-    finer than the GEMM tile lets a GEMM tile span two experts.
+    Arena size is fixed at MegaMoE init. Honour ``AITER_TDM_TILE_M{,2}``, otherwise
+    use the same grouped-GEMM CSV row fused_moe will pick for this recv-token
+    bucket. Flooring at 64 used to pad compact_cap to EPR*64 even when the CSV
+    tile is 16/32, which launched a 3–4× GEMM grid at small tpr.
     """
 
-    def _env(name: str, default: int | None = None) -> int | None:
+    def _env(name: str) -> int | None:
         v = os.environ.get(name)
         if v is None or v == "":
-            return default
+            return None
         return int(v)
 
-    tile_m = _env("AITER_TDM_TILE_M", 64)
-    tile_m2 = _env("AITER_TDM_TILE_M2", tile_m)
-    return max(int(tile_m), int(tile_m2), 64)
+    ov_m = _env("AITER_TDM_TILE_M")
+    ov_m2 = _env("AITER_TDM_TILE_M2")
+    if ov_m is not None or ov_m2 is not None:
+        tile_m = 64 if ov_m is None else ov_m
+        tile_m2 = tile_m if ov_m2 is None else ov_m2
+        return max(int(tile_m), int(tile_m2))
+
+    from aiter.ops.flydsl.grouped_moe_gfx1250 import (
+        _as_int,
+        _find_grouped_config,
+        _get_padded_m,
+    )
+
+    if config.dispatch_wire == "fp4":
+        q_dtype_a = dtypes.fp4x2
+    elif config.dispatch_wire == "fp8":
+        q_dtype_a = dtypes.fp8
+    else:
+        return 64
+
+    row = _find_grouped_config(
+        token_num=_get_padded_m(config.max_recv),
+        model_dim=config.hidden_dim,
+        inter_dim=int(inter_dim),
+        experts=config.experts_per_rank,
+        topk=-1,
+        activation=activation,
+        dtype=dtypes.bf16,
+        q_dtype_a=q_dtype_a,
+        q_dtype_w=dtypes.fp4x2,
+        quant_type=quant_type,
+    )
+    tile_m = 64
+    tile_m2 = 64
+    if row is not None:
+        tile_m = _as_int(row.get("tile_m"), tile_m) or tile_m
+        tile_m2 = _as_int(row.get("tile_m2"), tile_m) or tile_m
+    return max(int(tile_m), int(tile_m2))
 
 
 def _mori_dispatch_schedule(config) -> tuple:
@@ -666,7 +708,12 @@ class MegaMoEGfx1250:
         device = torch.device("cuda", torch.cuda.current_device())
         max_recv = config.max_recv
         self._compact_plan = config.compact_plan
-        self._compact_tile_m = _compact_gemm_align_m()
+        self._compact_tile_m = _compact_gemm_align_m(
+            config,
+            activation=self.activation,
+            quant_type=self.quant_type,
+            inter_dim=self.inter_dim,
+        )
         self._compact_cap = (
             config.compact_row_cap(self._compact_tile_m)
             if self._compact_plan
