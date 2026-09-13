@@ -45,7 +45,7 @@
   "attn_3d": {
     "BLOCK_M": 16,
     "num_warps": 2,
-    "num_stages": 2,
+    "num_stages": 1,
     "waves_per_eu": 2
   },
   "reduce": {
