@@ -28,7 +28,7 @@ from .gemm_a8w8_8wave import (
 )
 from .kernels_common import get_warp_size
 from .mfma_preshuffle_pipeline import split_row_major_2d
-from .mxfp8_moe_utils import (
+from .moe_mxfp_8wave_utils import (
     _store_factory,
     make_mx_mfma,
     make_mx_pipeline_mma,

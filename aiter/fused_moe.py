@@ -36,6 +36,7 @@ from aiter.ops.flydsl.moe_common import (
     DEFAULT_SITUV2_LINEAR_BETA,
     GateMode,
     get_flydsl_activation_name,
+    is_mxfp_prefill_kernel,
 )
 from aiter.ops.flydsl.mxfp4_kname import (
     _is_mxfp4_kname,
@@ -45,7 +46,6 @@ from aiter.ops.flydsl.mxfp4_kname import (
     parse_flydsl_v2_gemm2_kernel,
     parse_g2_kname_any,
 )
-from aiter.ops.flydsl.mxfp8_moe import is_kernel_name as _is_mxfp8_prefill_kname
 from aiter.ops.moe_mxfp4_aux import _mxfp4_moe_sort_internal_is_supported
 from aiter.ops.opus import moe_stage2_a8w4 as _opus_a8w4
 from aiter.ops.opus.moe_stage1_a8w4 import (
@@ -2745,7 +2745,7 @@ def get_2stage_cfgs(
             if column in df_fallback.columns:
                 activation_specific = df_fallback[column].map(_is_mxfp4_kname).astype(
                     bool
-                ) | df_fallback[column].map(_is_mxfp8_prefill_kname).astype(bool)
+                ) | df_fallback[column].map(is_mxfp_prefill_kernel).astype(bool)
                 df_fallback = df_fallback.loc[~activation_specific]
         if "act_type" in df_fallback.columns:
             df_fallback["act_type"] = _ACT_TYPE_DISABLED_KEY
@@ -2898,10 +2898,11 @@ def get_2stage_cfgs(
                 f"[fused_moe] discarding Opus tuned config for unsupported "
                 f"activation {activation}; using default heuristics"
             )
-        elif _is_mxfp8_prefill_kname(kn1) or _is_mxfp8_prefill_kname(kn2):
-            from aiter.ops.flydsl.mxfp8_moe import kernel_params
+        elif is_mxfp_prefill_kernel(kn1) or is_mxfp_prefill_kernel(kn2):
+            from aiter.ops.flydsl.moe_kernels import get_mxfp_prefill_kernel_params
 
-            p1, p2 = kernel_params(kn1), kernel_params(kn2)
+            p1 = get_mxfp_prefill_kernel_params(kn1)
+            p2 = get_mxfp_prefill_kernel_params(kn2)
             a8w4 = p1 is not None and p1["b_dtype"] == "fp4"
             if not (
                 p1
@@ -3135,10 +3136,15 @@ def get_2stage_cfgs(
         else:
             return 16 if token < 2048 else 32 if token < 16384 else 64
 
-    if _is_mxfp8_prefill_kname(kernelName1) or _is_mxfp8_prefill_kname(kernelName2):
-        from aiter.ops.flydsl.mxfp8_moe import kernel_params, stage1, stage2
+    if is_mxfp_prefill_kernel(kernelName1) or is_mxfp_prefill_kernel(kernelName2):
+        from aiter.ops.flydsl.moe_kernels import (
+            flydsl_mxfp_moe_stage1,
+            flydsl_mxfp_moe_stage2,
+            get_mxfp_prefill_kernel_params,
+        )
 
-        p1, p2 = kernel_params(kernelName1), kernel_params(kernelName2)
+        p1 = get_mxfp_prefill_kernel_params(kernelName1)
+        p2 = get_mxfp_prefill_kernel_params(kernelName2)
         if not (
             p1
             and p1["stage"] == 1
@@ -3149,8 +3155,8 @@ def get_2stage_cfgs(
         ):
             raise ValueError("Invalid MXFP8/A8W4 prefill MoE kernel pair")
         return MOEMetadata(
-            functools.partial(stage1, kernelName=kernelName1),
-            functools.partial(stage2, kernelName=kernelName2),
+            functools.partial(flydsl_mxfp_moe_stage1, kernelName=kernelName1),
+            functools.partial(flydsl_mxfp_moe_stage2, kernelName=kernelName2),
             p1["sort_block_m"],
             0,
             prequant=False,

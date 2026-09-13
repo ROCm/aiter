@@ -75,3 +75,10 @@ def apply_gate_up(
         gate = gate.clamp(max=lim)
         up = up.clamp(min=-lim, max=lim)
     return torch.nn.functional.silu(gate) * up
+
+
+def is_mxfp_prefill_kernel(name):
+    """Recognize this adapter's namespace before validating a complete name."""
+    return any(
+        marker in str(name) for marker in ("_mxfp8_8w_", "_a8w4_8w_", "_a8w4_4w_")
+    )

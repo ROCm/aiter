@@ -10,7 +10,15 @@ import torch
 
 import aiter
 from aiter.jit.utils.chip_info import get_gfx
-from aiter.ops.flydsl.mxfp8_moe import kernel_name, stage1, stage2
+from aiter.ops.flydsl.moe_kernels import (
+    flydsl_mxfp_moe_stage1 as stage1,
+)
+from aiter.ops.flydsl.moe_kernels import (
+    flydsl_mxfp_moe_stage2 as stage2,
+)
+from aiter.ops.flydsl.moe_kernels import (
+    mxfp_prefill_kernel_name as kernel_name,
+)
 from aiter.ops.shuffle import shuffle_scale_a16w4, shuffle_weight_a16w4
 from aiter.utility import fp4_utils
 
@@ -281,7 +289,7 @@ def test_tuned_config_preserves_other_moe_paths(
 
 
 def test_four_wave_stage1_exact_padding_and_dirty_graph(monkeypatch):
-    from aiter.ops.flydsl import mxfp8_moe as adapter
+    from aiter.ops.flydsl import moe_kernels as adapter
 
     torch.manual_seed(813)
     tokens, hidden, inter, experts, topk = 129, 256, 384, 3, 2
@@ -295,14 +303,14 @@ def test_four_wave_stage1_exact_padding_and_dirty_graph(monkeypatch):
     ids = torch.rand(tokens, experts, device="cuda").topk(topk, -1).indices.int()
     weights = torch.rand(tokens, topk, device="cuda").softmax(-1)
     records = {}
-    run = adapter._run
+    run = adapter._run_mxfp_moe
 
     def record(kind, args, **kw):
         if kind == "gemm" and kw["stage"] == 1:
             records.update(args=args, kwargs=kw)
         return run(kind, args, **kw)
 
-    monkeypatch.setattr(adapter, "_run", record)
+    monkeypatch.setattr(adapter, "_run_mxfp_moe", record)
     sorted_ids, _, expert_ids, valid, _ = fm.moe_sorting(
         ids,
         weights,
@@ -401,10 +409,10 @@ def test_four_wave_aot(stage):
     ],
 )
 def test_prefill_rejects_incompatible_geometry(name):
-    from aiter.ops.flydsl.mxfp8_moe import kernel_params
+    from aiter.ops.flydsl.moe_kernels import get_mxfp_prefill_kernel_params
 
     with pytest.raises(ValueError):
-        kernel_params(name)
+        get_mxfp_prefill_kernel_params(name)
 
 
 @pytest.mark.parametrize("repeats", [2, 4])
