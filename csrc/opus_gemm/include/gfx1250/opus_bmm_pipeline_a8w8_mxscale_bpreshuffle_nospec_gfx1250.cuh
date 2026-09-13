@@ -208,13 +208,40 @@ void bmm_a8w8_mxscale_bpreshuffle_nospec_kernel_gfx1250(opus_bmm_a8w8_mxscale_ka
             auto g = opus::make_gmem(src, bound);
             auto s = opus::make_smem(dst);
             const int total = rows * sf_kg;
+            // Loads for a whole group FIRST, then the stores. Written as one
+            // `store(load(...))` the two fuse into load / s_wait_loadcnt 0x0 /
+            // ds_store per iteration, so every trip pays a full cold global
+            // round trip back to back. ATT on kid35 (b=8 m=2048) measured that
+            // as **13,234 cycles over 4 hits** -- 10.7% of the wave, against
+            // FlyDSL's ZERO loadcnt stall. Issuing kFillUnroll loads before the
+            // first wait leaves one round trip exposed instead of four.
+            //
+            // 64ec7227 moved this whole function after the ring prime, which
+            // fixed WHERE it sits; this fixes what it does internally. Same
+            // defect as the other three wins -- waiting on something before
+            // anything else has been started that could hide it.
             auto run = [&](auto VecN) __attribute__((always_inline)) {
-                constexpr int VEC = decltype(VecN)::value;
-                for (int idx = tid * VEC; idx < total; idx += T::BLOCK_SIZE * VEC) {
-                    const int r  = idx / sf_kg;
-                    const int kt = idx - r * sf_kg;
-                    opus::store<VEC>(s, opus::load<VEC>(g, r * src_pitch + kt),
-                                     r * sf_pitch + kt);
+                constexpr int VEC  = decltype(VecN)::value;
+                constexpr int kStr = T::BLOCK_SIZE * VEC;
+                using VecT = decltype(opus::load<VEC>(g, 0));
+                for (int base = tid * VEC; base < total; base += kStr * T::kFillUnroll) {
+                    VecT v[T::kFillUnroll];
+                    opus::static_for<T::kFillUnroll>([&](auto uN) __attribute__((always_inline)) {
+                        constexpr int u = decltype(uN)::value;
+                        const int idx = base + u * kStr;
+                        if (idx < total) {
+                            const int r = idx / sf_kg;
+                            v[u] = opus::load<VEC>(g, r * src_pitch + (idx - r * sf_kg));
+                        }
+                    });
+                    opus::static_for<T::kFillUnroll>([&](auto uN) __attribute__((always_inline)) {
+                        constexpr int u = decltype(uN)::value;
+                        const int idx = base + u * kStr;
+                        if (idx < total) {
+                            const int r = idx / sf_kg;
+                            opus::store<VEC>(s, v[u], r * sf_pitch + (idx - r * sf_kg));
+                        }
+                    });
                 }
             };
             // A chunk must not span two source rows nor land unaligned, so the

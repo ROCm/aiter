@@ -857,6 +857,15 @@ struct opus_bmm_a8w8_mxscale_bpreshuffle_traits_gfx1250 {
     // drops from 16-way to 4-way AND the fill keeps its 16-byte store.
     static constexpr int kSfPanelPad   = (kSfALds || kSfBLds) ? 16 : 0;
     static constexpr int kSfFillVecMax = 16;
+    static constexpr int kFillUnroll   = 4;
+    // How many scale-panel loads are issued before the first wait. The fill is
+    // load->wait->store; at 1 every trip pays a cold round trip in series, and
+    // ATT priced that at 13,234 cycles (10.7% of a kid35 prefill wave) against
+    // FlyDSL's zero. 4 covers the deepest fill any shipped tile runs: the
+    // longest is kBlockM=256 rows x sf_kg=32 at BLOCK_SIZE=256 / VEC=16, i.e.
+    // 8192 / 4096 = 2 trips, so 4 always drains the loop in ONE group and the
+    // guarded tail iterations fold away. Costs kFillUnroll * VEC bytes of VGPR
+    // in the prologue only, where nothing else is live.
     // The widest row pitch either panel can ask for, given the K cap.
     static constexpr int kSfPanelPitchMax = kSfAPanelKG + kSfPanelPad;
     // A COMPILE-TIME pitch for the TDM fill, because there the pitch is the D#'s
