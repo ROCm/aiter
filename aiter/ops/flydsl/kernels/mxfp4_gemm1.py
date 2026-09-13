@@ -4,7 +4,6 @@
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-from flydsl._mlir.dialects import llvm as _llvm
 from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import T, as_ir_value
 
@@ -43,16 +42,6 @@ from .mxfp4_gemm_common import (
 )
 
 ACC_LDS_PAD_DW = 4
-
-
-def _agpr_accum_for(BM, BN, num_waves, a_dtype, interleave):
-    return (
-        BM > 128
-        and BN == 256
-        and num_waves == 4
-        and a_dtype == "fp4"
-        and not interleave
-    )
 
 
 def k_g2_half_for(inter):
@@ -285,20 +274,13 @@ def _gemm1_body(
         b_scale_s_base_hi.append(base + fx.Int32(16 * kBS_stride_k0_dw * 4))
 
     scale_atoms = _scale_mma_atoms(a_dtype)
-    use_agpr = const_expr(_agpr_accum_for(BM, BN, num_waves, a_dtype, interleave))
-    if const_expr(use_agpr):
-        accm = [
-            [as_ir_value(fx.Vector.filled(4, 0.0, fx.Float32)) for _ in range(N_REPS)]
-            for _ in range(kMChunks)
-        ]
-    else:
-        accm = [
-            [fx.make_rmem_tensor(mem_4x1, fx.Float32) for _ in range(N_REPS)]
-            for _ in range(kMChunks)
-        ]
-        for i in range_constexpr(kMChunks):
-            for J in range_constexpr(N_REPS):
-                accm[i][J].store(fx.Vector.filled(4, 0.0, fx.Float32))
+    accm = [
+        [fx.make_rmem_tensor(mem_4x1, fx.Float32) for _ in range(N_REPS)]
+        for _ in range(kMChunks)
+    ]
+    for i in range_constexpr(kMChunks):
+        for J in range_constexpr(N_REPS):
+            accm[i][J].store(fx.Vector.filled(4, 0.0, fx.Float32))
     b = [[[None, None] for _ in range(N_REPS)] for _ in range(k_stages)]
     b_scale_v = [[None, None] for _ in range(k_stages)]
 
@@ -867,42 +849,19 @@ def _gemm1_body(
             )
             bs_slot[mw] = r.load()[0]
 
-    if const_expr(use_agpr):
-        _F32X4 = fx.Vector.make_type(4, fx.Float32)
-
-        def _mma(ci, opsel_a, opsel_b, a_frag, b_frag, sa, sb):
-            asm = (
-                "v_mfma_scale_f32_16x16x128_f8f6f4 $0, $1, $2, $0, $3, $4 "
-                f"op_sel:[{opsel_a & 1},{opsel_b & 1},0] "
-                f"op_sel_hi:[{opsel_a >> 1},{opsel_b >> 1},0] cbsz:4 blgp:4"
-            )
-            return _llvm.inline_asm(
-                _F32X4,
-                [
-                    as_ir_value(fx.Vector(fx.memref_load_vec(a_frag))),
-                    as_ir_value(fx.Vector(fx.memref_load_vec(b_frag))),
-                    as_ir_value(sa),
-                    as_ir_value(sb),
-                    ci,
-                ],
-                asm,
-                "=a,v,v,v,v,0",
-                has_side_effects=False,
-            )
-
-    else:
-
-        def _mma(ci, opsel_a, opsel_b, a_frag, b_frag, sa, sb):
-            fx.gemm(
-                scale_atoms[(opsel_a, opsel_b)],
-                ci,
-                a_frag,
-                b_frag,
-                ci,
-                scale_a=sa,
-                scale_b=sb,
-            )
-            return ci
+    def _mma(ci, opsel_a, opsel_b, a_frag, b_frag, sa, sb):
+        # opsel_a/opsel_b select the e8m0 scale byte in the shared 256-K word and are
+        # baked into the atom.
+        fx.gemm(
+            scale_atoms[(opsel_a, opsel_b)],
+            ci,
+            a_frag,
+            b_frag,
+            ci,
+            scale_a=sa,
+            scale_b=sb,
+        )
+        return ci
 
     def mfma_cluster(b_slot, a, a_scale, bs_slot, J, khalf=None):
         if const_expr(interleave):
@@ -1192,24 +1151,6 @@ def _gemm1_body(
             value = value + acc_load(acc_idx(fx.Int32(group), row, col))
         return value
 
-    acc_x4_copy_atom = fx.make_copy_atom(fx.UniversalCopy128b(), fx.Float32)
-    acc_flat_tiles4 = fx.logical_divide(acc_flat_view, mem_4x1)
-
-    def acc_load4(idx):
-        r = fx.make_rmem_tensor(mem_4x1, fx.Float32)
-        fx.copy(
-            acc_x4_copy_atom, fx.slice(acc_flat_tiles4, (None, idx // fx.Int32(4))), r
-        )
-        return r.load()
-
-    def acc_load_sum4(row, col):
-        v = acc_load4(acc_idx(fx.Int32(0), row, col))
-        out = [v[i] for i in range_constexpr(4)]
-        for group in range_constexpr(1, k_wave):
-            w = acc_load4(acc_idx(fx.Int32(group), row, col))
-            out = [out[i] + w[i] for i in range_constexpr(4)]
-        return out
-
     tx_i32 = wave_n * fx.Int32(64) + lane
     if const_expr(num_waves == 2):
         m_lane = tx_i32 // fx.Int32(4)
@@ -1257,11 +1198,7 @@ def _gemm1_body(
                         + lane_mod_16
                     )
                     lds_col = fx.Int32(BN_INT) + col_local if is_up else col_local
-                vec = (
-                    fx.Vector(accm[i][J])
-                    if const_expr(use_agpr)
-                    else fx.Vector(fx.memref_load_vec(accm[i][J]))
-                )
+                vec = fx.Vector(fx.memref_load_vec(accm[i][J]))
                 for v in range_constexpr(4):
                     idx = acc_idx(wave_k, row_base + fx.Int32(v), lds_col)
                     acc_store(idx, vec[v])
@@ -1329,16 +1266,13 @@ def _gemm1_body(
 
             gate_vs = [None] * 8
             up_vs = [None] * 8
-            gate_col0 = wave_grp * fx.Int32(32) + fx.Int32(8) * kk
-            up_col0 = fx.Int32(BN_INT) + gate_col0
-            for h in range_constexpr(2):
-                gq = acc_load_sum4(row_lds, gate_col0 + fx.Int32(4 * h))
-                uq = acc_load_sum4(row_lds, up_col0 + fx.Int32(4 * h))
-                for i in range_constexpr(4):
-                    gate_vs[4 * h + i] = gq[i]
-                    up_vs[4 * h + i] = uq[i]
-            if const_expr(enable_bias):
-                for ee in range_constexpr(8):
+            for ee in range_constexpr(8):
+                col_in_grp = fx.Int32(8) * kk + fx.Int32(ee)
+                gate_col = wave_grp * fx.Int32(32) + col_in_grp
+                up_col = fx.Int32(BN_INT) + gate_col
+                gate_vs[ee] = acc_load_sum(row_lds, gate_col)
+                up_vs[ee] = acc_load_sum(row_lds, up_col)
+                if const_expr(enable_bias):
                     gate_vs[ee] = gate_vs[ee] + bias_gate[ee]
                     up_vs[ee] = up_vs[ee] + bias_up[ee]
             result = _activation_mul_batch(
@@ -1882,6 +1816,4 @@ def compile_gemm1_a4w4_port(
     launch_gemm1.compile_hints = {
         "llvm_options": {"amdgpu-sched-strategy": "iterative-minreg"},
     }
-    if _agpr_accum_for(BM, BN, num_waves, a_dtype, interleave):
-        launch_gemm1.compile_hints["waves_per_eu"] = 1
     return launch_gemm1
