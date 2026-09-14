@@ -7,6 +7,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from aiter.jit.utils.chip_info import get_gfx, get_lds_capacity_bytes
 from aiter.ops.flydsl.mxfp8_128_bpreshuffle_gemm_gfx1250 import (
     COMPUTE_WMMA_NAME_PREFIX as COMPUTE_NAME_PREFIX,
 )
@@ -17,10 +18,9 @@ from aiter.ops.flydsl.mxfp8_128_bpreshuffle_gemm_gfx1250 import (
     cluster_m_grid_ok,
     compute_kernel_k_pair,
 )
-from aiter.ops.flydsl.utils import get_shared_memory_per_block
 
 WMMA = 16  # WMMA M/N tile granularity
-LDS_BYTES = get_shared_memory_per_block(fallback_gfx="gfx1250")
+LDS_BYTES = get_lds_capacity_bytes(get_gfx())
 _MAX_WARP_TILE = 256
 _MAX_TUNE_WARPS = 4
 _MAX_ACC_FRAGMENTS = 64

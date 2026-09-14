@@ -316,10 +316,11 @@ static void mla_decode_gfx1250_dispatch(
     const int num_heads    = Q->size(1);
     const int gqa_ratio    = num_heads / nhead_kv;
     const int kv_split     = splitData->size(1);
-    // TODO: Keep the ABI decision in this host dispatch layer: it owns kernel
-    // selection and the exact kernarg layout. qh128 remains on the legacy ABI
-    // for e2e stability; the other gfx1250 gfx1250 kernels use packed preload.
-    const bool use_packed_gfx1250_args = !(gqa_ratio == 128 && max_seqlen_q == 1);
+    // Keep the ABI decision in this host dispatch layer: it owns kernel selection
+    // and the exact kernarg layout. Every gfx1250 MLA kernel -- qh128 included --
+    // is now built from the poc_kl sp3 with DIRECT_PARAM=1, i.e. the 120B packed
+    // preload ABI, so there is no longer a legacy exception.
+    const bool use_packed_gfx1250_args = true;
     constexpr int bdx      = 128;
     constexpr int bdy      = 1;
     constexpr int bdz      = 1;
@@ -407,9 +408,9 @@ static void mla_decode_gfx1250_dispatch(
         AITER_CHECK(false, __func__, " not find kernel ", kernelName);
     }
 
-    // gfx1250 gfx1250 dispatch. qh128 is temporarily left on the legacy 288B ABI
-    // because it is used by e2e. Other gfx1250 private kernels use the new
-    // 120B packed-preload ABI from poc_kl/gfx1250/mla/mla_execute_v3_hip.inl.
+    // gfx1250 dispatch. All gfx1250 private kernels use the 120B packed-preload
+    // ABI from poc_kl/gfx1250/mla/mla_execute_v3_hip.inl; the legacy 288B branch
+    // below is kept only for kernels that have not been rebuilt from sp3 yet.
     const int q_elem_size = Q->element_size();
     const int qk_head_dim = Q->size(2);
     const int q_seq_lens_kernel = max_seqlen_q * gqa_ratio;
@@ -473,9 +474,13 @@ static void mla_decode_gfx1250_dispatch(
         arg_size = sizeof(packed_args);
     }
 
-    const int gdx = (max_seqlen_q * gqa_ratio + sub_Q - 1) / sub_Q;
+    // The kernel body covers 64 Q rows per workgroup, so gqa=128 is split across
+    // two workgroups along X: the kernel copies the X id into _s_tg_idx (guarded by
+    // _s_MQA > 64) and shifts Q by Q_GROUP_PAD_SIZE * tg_idx. Z is the plain KV
+    // split id in every case -- it must not carry the head half as well.
+    const int gdx = (gqa_ratio == 128) ? 2 : (max_seqlen_q * gqa_ratio + sub_Q - 1) / sub_Q;
     const int gdy = batch;
-    const int gdz = (gqa_ratio == 128) ? kv_split * 2 : kv_split;
+    const int gdz = kv_split;
 
 #ifdef ASM_DEBUG
     std::printf("[aiter][gfx1250][debug] kernelName=%s\n", kernelName.c_str());
@@ -983,7 +988,8 @@ void mla_decode_stage1_asm_fwd(
     } else if (arch_id == "gfx950" && q_type == "fp8" && kv_type == "fp8" && persistent
                && ((gqa_ratio == 32 && max_seqlen_q >= 4)
                    || (gqa_ratio == 64 && max_seqlen_q >= 2)
-                   || (gqa_ratio == 128))){
+                   || (gqa_ratio == 128)
+                   || (gqa_ratio == 96 && max_seqlen_q <= 6))){
         config_max_seqlen_q = 4;
         config_gqa_ratio = 32;
         args.s_MQA = gqa_ratio;

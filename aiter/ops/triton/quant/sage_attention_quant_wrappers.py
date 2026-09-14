@@ -373,55 +373,6 @@ def sage_quant_v_mxfp4(value):
     return view, scale
 
 
-def sage_quant_f4f4(
-    q,
-    k,
-    v,
-    FP8_TYPE,
-    FP8_MAX,
-    BLKQ,
-    BLKK,
-    sm_scale=None,
-    q_smoothing=False,
-    layout="bshd",
-    USE_RNE=False,
-    R=None,
-    BLOCK_R=32,
-):
-    """Quantize rotated MXFP4 Q/K plus true-MXFP4 V for the F4F4 ASM kernel."""
-    del FP8_TYPE, FP8_MAX, BLKK, USE_RNE
-    if layout != "bshd":
-        raise ValueError(f"f4f4 requires bshd layout, got {layout}")
-    _, _, _, head_dim = q.shape
-    _, kv_len, _, _ = v.shape
-
-    tile = 128
-    assert head_dim == 128, f"f4f4 requires head_dim=128, got {head_dim}"
-    assert (
-        kv_len % tile == 0
-    ), f"f4f4 col-major V pack requires kv_len % {tile} == 0, got {kv_len}"
-
-    if sm_scale is None:
-        sm_scale = head_dim**-0.5
-
-    # Q/K: identical to sage_quant_mxfp4 (hadamard rotation + smoothing -> mxfp4).
-    q, k, delta_s = rotation_smooth_qk(
-        q,
-        k,
-        BLKQ,
-        R=R,
-        BLOCK_R=BLOCK_R,
-        q_smoothing=q_smoothing,
-        layout=layout,
-        sm_scale=(sm_scale * 1.4426950408889634),
-    )
-    q_fp4, q_scale = downcast_to_mxfp(q, torch.uint8, axis=-1)
-    k_fp4, k_scale = downcast_to_mxfp(k, torch.uint8, axis=-1)
-
-    v_fp4_view, v_descale = sage_quant_v_mxfp4(v)
-    return q_fp4, q_scale, k_fp4, k_scale, v_fp4_view, v_descale, delta_s
-
-
 def sage_quant_mxfp6(
     q,
     k,

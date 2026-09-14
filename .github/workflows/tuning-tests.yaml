@@ -93,7 +93,7 @@ jobs:
             -e PYTHONUNBUFFERED=1 \
             -w /workspace \
             tuning_tests_level01 \
-            bash -lc "set -euo pipefail; python3 -m unittest op_tests.tuning_tests.test_csv_validation op_tests.tuning_tests.test_tuner_infra op_tests.tuning_tests.test_mp_tuner_logic -v 2>&1 | tee /workspace/${LOG_DIR}/level01.log"
+            bash -lc "set -euo pipefail; python3 -m unittest op_tests.tuning_tests.test_csv_validation op_tests.tuning_tests.test_tuner_infra op_tests.tuning_tests.test_mp_tuner_logic op_tests.tuning_tests.test_a6w6_tuning -v 2>&1 | tee /workspace/${LOG_DIR}/level01.log"
 
       - name: Upload level 0+1 artifacts
         if: always()

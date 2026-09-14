@@ -1,8 +1,19 @@
 import triton
 import triton.language as tl
 
+from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
 
-@triton.jit
+_fp8_mqa_logits_kernel_repr = make_kernel_repr(
+    "_fp8_mqa_logits_kernel",
+    [
+        "NUM_HEADS",
+        "HEAD_SIZE",
+        "BLOCK_KV",
+    ],
+)
+
+
+@triton.jit(repr=_fp8_mqa_logits_kernel_repr)
 def _fp8_mqa_logits_kernel(
     Q_ptr,  # fp8e4m3 [seq_len, H, D]
     KV_ptr,  # fp8e4m3 [seq_len_kv, D]

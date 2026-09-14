@@ -4,28 +4,17 @@
 
 import functools
 
+import flydsl.compiler as flyc
+import flydsl.expr as fx
 import torch
+from flydsl.expr.typing import Int32
+
+from aiter.ops.flydsl.kernels.tensor_shim import ptr_buf_tensor
 
 from ..prefill_batch_metadata import CausalConvPrefillMetadata
 
-try:
-    import flydsl.compiler as flyc
-    import flydsl.expr as fx
-    from flydsl.expr.typing import Int32, T
-
-    from aiter.ops.flydsl.kernels import buffer_ops
-
-    _FLYDSL_AVAILABLE = True
-except Exception:  # pragma: no cover - flydsl optional  # noqa: BLE001
-    _FLYDSL_AVAILABLE = False
-
-
 PAD_SLOT_ID = -1
 _LOG2E = 1.4426950408889634
-
-
-def is_flydsl_available() -> bool:
-    return _FLYDSL_AVAILABLE
 
 
 def build_causal_conv1d_flydsl_module(
@@ -38,7 +27,6 @@ def build_causal_conv1d_flydsl_module(
     dtype_str: str = "bf16",
 ):
     """Build the FlyDSL causal conv1d kernel for the given config."""
-    assert _FLYDSL_AVAILABLE, "flydsl is not installed"
     assert width in (2, 3, 4)
     assert (
         tm == 64 and tn == 64 and block_threads == 256
@@ -96,25 +84,20 @@ def build_causal_conv1d_flydsl_module(
         vs0: Int32,
         vs1: Int32,
     ):
-        # dtype args for buffer_ops loads (MLIR types, not values)
-        i32 = T.i32
-        elem_dtype = T.bf16 if dtype_str == "bf16" else T.f16
-
-        def _rsrc(ptr):
-            return buffer_ops.create_buffer_resource(ptr, max_size=True)
-
-        x_r = _rsrc(x_ptr)
-        w_r = _rsrc(w_ptr)
-        b_r = _rsrc(bias_ptr)
-        cs_r = _rsrc(cs_ptr)
-        ci_r = _rsrc(cache_idx_ptr)
-        hi_r = _rsrc(has_init_ptr)
-        qsl_r = _rsrc(qsl_ptr)
-        batch_r = _rsrc(batch_ptr)
-        choff_r = _rsrc(chunk_off_ptr)
-        q_r = _rsrc(q_ptr)
-        k_r = _rsrc(k_ptr)
-        v_r = _rsrc(v_ptr)
+        # Every access here is one element wide, so each buffer gets a single
+        # view typed by its own element -- `t[i]` is the whole access.
+        x_r = ptr_buf_tensor(x_ptr, fx_elem_dtype)
+        w_r = ptr_buf_tensor(w_ptr, fx_elem_dtype)
+        b_r = ptr_buf_tensor(bias_ptr, fx_elem_dtype)
+        cs_r = ptr_buf_tensor(cs_ptr, fx_elem_dtype)
+        ci_r = ptr_buf_tensor(cache_idx_ptr, fx.Int32)
+        hi_r = ptr_buf_tensor(has_init_ptr, fx.Int8)
+        qsl_r = ptr_buf_tensor(qsl_ptr, fx.Int32)
+        batch_r = ptr_buf_tensor(batch_ptr, fx.Int32)
+        choff_r = ptr_buf_tensor(chunk_off_ptr, fx.Int32)
+        q_r = ptr_buf_tensor(q_ptr, fx_elem_dtype)
+        k_r = ptr_buf_tensor(k_ptr, fx_elem_dtype)
+        v_r = ptr_buf_tensor(v_ptr, fx_elem_dtype)
 
         lds_base = fx.SharedAllocator().allocate(SharedStorage).peek().lds.ptr
 
@@ -128,18 +111,10 @@ def build_causal_conv1d_flydsl_module(
         pid_x = fx.block_idx.x
         pid_y = fx.block_idx.y
 
-        seq_idx = fx.Int32(
-            buffer_ops.buffer_load(batch_r, pid_x, vec_width=1, dtype=i32)
-        )
-        chunk_idx = fx.Int32(
-            buffer_ops.buffer_load(choff_r, pid_x, vec_width=1, dtype=i32)
-        )
-        seq_start = fx.Int32(
-            buffer_ops.buffer_load(qsl_r, seq_idx, vec_width=1, dtype=i32)
-        )
-        seq_end = fx.Int32(
-            buffer_ops.buffer_load(qsl_r, seq_idx + 1, vec_width=1, dtype=i32)
-        )
+        seq_idx = fx.Int32(batch_r[pid_x])
+        chunk_idx = fx.Int32(choff_r[pid_x])
+        seq_start = fx.Int32(qsl_r[seq_idx])
+        seq_end = fx.Int32(qsl_r[seq_idx + 1])
         seqlen = seq_end - seq_start
 
         feat_start = pid_y * TN
@@ -156,20 +131,9 @@ def build_causal_conv1d_flydsl_module(
         w_base = gfeat * sw0
         w_taps = []
         for j in fx.range_constexpr(W):
-            w_taps.append(
-                fx.Float32(
-                    buffer_ops.buffer_load(
-                        w_r,
-                        w_base + j * sw1,
-                        vec_width=1,
-                        dtype=elem_dtype,
-                    )
-                )
-            )
+            w_taps.append(fx.Float32(w_r[w_base + j * sw1]))
         if fx.const_expr(HAS_BIAS):
-            bias_f = fx.Float32(
-                buffer_ops.buffer_load(b_r, gfeat, vec_width=1, dtype=elem_dtype)
-            )
+            bias_f = fx.Float32(b_r[gfeat])
         else:
             bias_f = fx.Float32(0.0)
 
@@ -192,18 +156,12 @@ def build_causal_conv1d_flydsl_module(
             fstep = FG * sx0
             raws = []
             for j in fx.range_constexpr(ELEMS):
-                raws.append(
-                    fx_elem_dtype(
-                        buffer_ops.buffer_load(x_r, cur, vec_width=1, dtype=elem_dtype)
-                    )
-                )
+                raws.append(fx_elem_dtype(x_r[cur]))
                 if fx.const_expr(j + 1 < ELEMS):
                     cur = cur + fstep
             do_halo = hc < (KW - 1)
             prefix_off = do_halo.select((feat_start + hf) * sx0 + (tok_gbase + hc), 0)
-            prefix_v = fx_elem_dtype(
-                buffer_ops.buffer_load(x_r, prefix_off, vec_width=1, dtype=elem_dtype)
-            )
+            prefix_v = fx_elem_dtype(x_r[prefix_off])
             lds_idx = f_base * LDS_PAD + (t_const + (KW - 1))
             for j in fx.range_constexpr(ELEMS):
                 cur_idx = lds_idx if j == 0 else lds_idx + (j * FG * LDS_PAD)
@@ -221,11 +179,7 @@ def build_causal_conv1d_flydsl_module(
                 gf = (feat_start + f_base) + (j * FG)
                 gf_ok = gf < dim
                 safe_gf = gf_ok.select(gf, 0)
-                raw = fx_elem_dtype(
-                    buffer_ops.buffer_load(
-                        x_r, safe_gf * sx0 + body_gt, vec_width=1, dtype=elem_dtype
-                    )
-                )
+                raw = fx_elem_dtype(x_r[safe_gf * sx0 + body_gt])
                 val = (body_ok & gf_ok).select(raw, zero_e)
                 lds_st(
                     val,
@@ -241,27 +195,17 @@ def build_causal_conv1d_flydsl_module(
                 both = wp_in & gf_ok
                 safe_xoff = both.select(gf * sx0 + (seq_start + wp), 0)
                 xv = both.select(
-                    fx_elem_dtype(
-                        buffer_ops.buffer_load(
-                            x_r, safe_xoff, vec_width=1, dtype=elem_dtype
-                        )
-                    ),
+                    fx_elem_dtype(x_r[safe_xoff]),
                     zero_e,
                 )
                 # pre-seq source: conv_state at chunk0
-                hi8 = fx.Int8(
-                    buffer_ops.buffer_load(hi_r, seq_idx, vec_width=1, dtype=T.i8)
-                )
+                hi8 = fx.Int8(hi_r[seq_idx])
                 hi_nz = hi8 != 0
                 need_cs = ((wp < 0) & is_chunk0) & (hi_nz & gf_ok)
-                in_coord = fx.Int32(
-                    buffer_ops.buffer_load(ci_r, seq_idx * sci, vec_width=1, dtype=i32)
-                )
+                in_coord = fx.Int32(ci_r[seq_idx * sci])
                 slot = (KW - 1) + wp
                 cs_off = need_cs.select((in_coord * scs0 + gf * scs1) + slot * scs2, 0)
-                csv = fx_elem_dtype(
-                    buffer_ops.buffer_load(cs_r, cs_off, vec_width=1, dtype=elem_dtype)
-                )
+                csv = fx_elem_dtype(cs_r[cs_off])
                 hv = need_cs.select(csv, xv)
                 lds_st(hv, hf * LDS_PAD + hc)
 
@@ -312,7 +256,7 @@ def build_causal_conv1d_flydsl_module(
                     cur = base_off
                     for e in fx.range_constexpr(EPT):
                         val = lds_ld((tg_ept + e) * STORE_PAD + sf)
-                        buffer_ops.buffer_store(val, res, cur)
+                        res[cur] = val
                         if fx.const_expr(e + 1 < EPT):
                             cur = cur + ts
 
@@ -329,7 +273,7 @@ def build_causal_conv1d_flydsl_module(
                     for e in fx.range_constexpr(EPT):
                         tok_ok = ((tok_start + tok_base) + e) < seqlen
                         if tok_ok:
-                            buffer_ops.buffer_store(acc[e].to(fx_elem_dtype), res, cur)
+                            res[cur] = acc[e].to(fx_elem_dtype)
                         if fx.const_expr(e + 1 < EPT):
                             cur = cur + ts
 
@@ -343,30 +287,22 @@ def build_causal_conv1d_flydsl_module(
             slot = tok_group
             should = (slot < (KW - 1)) & (gfeat < dim)
             if should:
-                in_coord = fx.Int32(
-                    buffer_ops.buffer_load(ci_r, seq_idx * sci, vec_width=1, dtype=i32)
-                )
+                in_coord = fx.Int32(ci_r[seq_idx * sci])
                 pos_x = (seqlen - (KW - 1)) + slot
                 x_in = pos_x >= 0
                 safe_x = x_in.select(gfeat * sx0 + (seq_start + pos_x), 0)
-                val_x = fx_elem_dtype(
-                    buffer_ops.buffer_load(x_r, safe_x, vec_width=1, dtype=elem_dtype)
-                )
-                hi8 = fx.Int8(
-                    buffer_ops.buffer_load(hi_r, seq_idx, vec_width=1, dtype=T.i8)
-                )
+                val_x = fx_elem_dtype(x_r[safe_x])
+                hi8 = fx.Int8(hi_r[seq_idx])
                 hi_nz = hi8 != 0
                 need_pr = (pos_x < 0) & hi_nz
                 src = slot + seqlen
                 safe_pr = need_pr.select(
                     (in_coord * scs0 + gfeat * scs1) + src * scs2, 0
                 )
-                val_pr = fx_elem_dtype(
-                    buffer_ops.buffer_load(cs_r, safe_pr, vec_width=1, dtype=elem_dtype)
-                )
+                val_pr = fx_elem_dtype(cs_r[safe_pr])
                 wb_val = x_in.select(val_x, need_pr.select(val_pr, zero_e))
                 cs_wr = (in_coord * scs0 + gfeat * scs1) + slot * scs2
-                buffer_ops.buffer_store(wb_val, cs_r, cs_wr)
+                cs_r[cs_wr] = wb_val
 
     @flyc.jit
     def launch(

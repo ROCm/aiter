@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 from functools import lru_cache
+from typing import NamedTuple
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
@@ -16,6 +17,7 @@ from flydsl.expr.primitive import range_constexpr
 from flydsl.expr.typing import Float4E2M1FN, Int32, T
 
 from .pa_mqa_logits_fp4_common import (
+    _NON_WRITER_LANE_OFF,
     _i32_buffer,
     _load_vec4_i32,
 )
@@ -46,6 +48,15 @@ def compute_prefill_schedule(
     Pass `cta_info_out` (a fixed [parallel_unit_num, CTA_INFO_WIDTH] int32 buffer)
     to write the schedule into a stable address (CUDAGraph decode: the captured
     kernel replays from this pointer while `build()` refreshes its contents).
+
+    Returns `(safe, cta_info, parallel_unit_num)`, `safe` being the [1] int32
+    split factor the schedule was built with.
+
+    The row plan is every-lane work over one [T] vector, so up to
+    `_ROW_PLAN_MAX_ROWS` rows it is one block instead of the ~25 torch ops
+    `_row_plan_torch` spells it as. What that buys is HOST latency, not device
+    time -- the torch form hides its own kernels behind its own dispatch, and a
+    decode step calls this once per forward, in the host gap between two.
     """
     device = local_ends.device
     P = parallel_unit_num
@@ -57,15 +68,135 @@ def compute_prefill_schedule(
         f"pre-fill -> wrong top-k). Pass parallel_unit_num >= number of rows."
     )
 
-    rb = row_to_batch.to(torch.int32)
-    ls = local_starts.to(torch.int32)
-    le = local_ends.to(torch.int32)
+    # Asserted, not coerced. Every caller already holds int32, so the three
+    # `.to()` calls this replaces were no-ops -- but on a host-bound path a
+    # no-op still costs its dispatch, and a caller that stopped honouring this
+    # would silently change what the kernels below compile to.
+    assert (
+        row_to_batch.dtype == local_starts.dtype == local_ends.dtype == torch.int32
+    ), (
+        f"compute_prefill_schedule: row_to_batch/local_starts/local_ends must be "
+        f"int32, got {row_to_batch.dtype}/{local_starts.dtype}/{local_ends.dtype}."
+    )
 
+    s_max = max(1, (max_seq_len + block_k - 1) // block_k)
+    plan = _row_plan(local_ends, block_k, P, s_max)
+
+    # ── map each fixed slot → (row, split) + emit cta_info in ONE kernel ──
+    if cta_info_out is None:
+        cta_info = torch.empty(P, CTA_INFO_WIDTH, dtype=torch.int32, device=device)
+    else:
+        cta_info = cta_info_out
+    BLOCK_P = 256
+    grid = (triton.cdiv(P, BLOCK_P),)
+    _prefill_cta_info_kernel[grid](
+        plan.incl,
+        plan.excl,
+        plan.chunks,
+        row_to_batch,
+        local_starts,
+        local_ends,
+        plan.safe,
+        plan.total_splits,
+        cta_info,
+        T,
+        P,
+        BLOCK_P=BLOCK_P,
+    )
+    return plan.safe, cta_info, P
+
+
+class _RowPlan(NamedTuple):
+    """Everything the emit kernel needs about the rows, from either producer.
+
+    One carrier, so a field can only be added where both have to answer for it.
+    """
+
+    incl: torch.Tensor  # [T] inclusive prefix sum of per-row CTA counts
+    excl: torch.Tensor  # [T] exclusive prefix sum
+    chunks: torch.Tensor  # [T] ceil(local_end / block_k), 0 for an empty row
+    safe: torch.Tensor  # [1] chunk-splits merged into one CTA
+    total_splits: torch.Tensor  # [1] number of valid (row, split) slots
+
+
+# Rows the fused arm plans, and the only two widths it plans them in. A block
+# costs its WIDTH, not the rows that fill it -- 40.8us at 16384 lanes whether 300
+# rows or 16384 arrive -- so the choice is which shapes share a width, and every
+# distinct width is a kernel to compile:
+#
+#     block    device    cold compile   what reaches it
+#      4096    13.3us          0.84s    every decode forward
+#     16384    40.8us          1.86s    every prefill forward
+#
+# The FLOOR is what keeps decode off the wide block: `max_num_seqs * (1 + spec
+# steps)` = 512 x 8 fits in one width, so decode compiles once and pays 13.3us.
+# Sizing per shape below it saves 0.3us for nine more variants.
+#
+# NOTHING between them, though an 8192 rung measured 21.1us: on a 100k/10 conc-50
+# trace 534 of 541 prefill forwards ran 8193-16384 rows and four ran 4097-8192,
+# so that rung would cost a third of the ladder and a 1.13s compile to save 20us
+# on 0.7% of forwards -- and a variant nothing exercises is one discovered
+# mid-run.
+#
+# The CAP is where widening stops paying: 32768 is bit-exact and still beats the
+# torch arm on both axes (87.1us device against 338.8us), but takes 4.98s to
+# compile, and 65536 does not finish compiling at all.
+_ROW_PLAN_BLOCK_FLOOR = 4096
+_ROW_PLAN_MAX_ROWS = 16384
+
+# int32s per 16 bytes -- the granularity Triton's pointer-alignment
+# specialization works at.
+_I32_PER_16B = 4
+
+
+def _row_plan(le, block_k, P, s_max) -> _RowPlan:
+    T = le.shape[0]
+    if T > _ROW_PLAN_MAX_ROWS:
+        return _row_plan_torch(le, block_k, P, s_max)
+    # One allocation, sliced: five `torch.empty` calls would put four more
+    # dispatches back on the path this exists to shorten.
+    #
+    # Every region starts on a 16-byte boundary, which is not cosmetic: Triton
+    # specializes a kernel on whether each pointer is 16-byte aligned, so a
+    # stride of exactly T forks a variant per `T % 4` and the JIT never stops
+    # finding new ones mid-run. Rounding the stride up pins all six pointers to
+    # one alignment signature.
+    stride = (T + _I32_PER_16B - 1) // _I32_PER_16B * _I32_PER_16B
+    tail = 3 * stride
+    work = torch.empty(tail + 2 * _I32_PER_16B, dtype=torch.int32, device=le.device)
+    plan = _RowPlan(
+        incl=work[:T],
+        excl=work[stride : stride + T],
+        chunks=work[2 * stride : 2 * stride + T],
+        safe=work[tail : tail + 1],
+        total_splits=work[tail + _I32_PER_16B : tail + _I32_PER_16B + 1],
+    )
+    # Named, not `*plan`: field ORDER should not become load-bearing.
+    _prefill_row_plan_kernel[(1,)](
+        le,
+        plan.incl,
+        plan.excl,
+        plan.chunks,
+        plan.safe,
+        plan.total_splits,
+        T,
+        P,
+        block_k,
+        s_max,
+        BLOCK_T=(
+            _ROW_PLAN_BLOCK_FLOOR if T <= _ROW_PLAN_BLOCK_FLOOR else _ROW_PLAN_MAX_ROWS
+        ),
+        SEARCH_STEPS=max(1, (s_max - 1).bit_length() + 1),
+    )
+    return plan
+
+
+def _row_plan_torch(le, block_k, P, s_max) -> _RowPlan:
+    """The row plan as ~25 torch ops. Reference for `_prefill_row_plan_kernel`."""
     # chunk count per row = ceil(le / block_k); le<=0 → 0 chunks.
     chunks_per_row = torch.clamp((le + (block_k - 1)) // block_k, min=0)  # [T]
 
-    s_max = max(1, (max_seq_len + block_k - 1) // block_k)
-    s_cand = torch.arange(1, s_max + 1, device=device, dtype=torch.int32)  # [s_max]
+    s_cand = torch.arange(1, s_max + 1, device=le.device, dtype=torch.int32)  # [s_max]
     ctas_per_r_s = (chunks_per_row[None, :] + (s_cand[:, None] - 1)) // s_cand[
         :, None
     ]  # [s_max, T]
@@ -79,37 +210,90 @@ def compute_prefill_schedule(
     # ── per-row number of CTAs (chunk-splits); 0 for empty rows ──
     ctas_r = (chunks_per_row + (safe - 1)) // safe  # [T]
     incl = torch.cumsum(ctas_r, dim=0, dtype=torch.int32)  # [T] inclusive prefix sum
-    excl = incl - ctas_r  # exclusive prefix sum
-    total_splits = incl[-1]  # 0-dim; total valid (row, split) slots
-
-    # ── map each fixed slot → (row, split) + emit cta_info in ONE kernel ──
-    # (the ~25 per-slot torch ops below were the bulk of the ~50-launch cost).
-    if cta_info_out is None:
-        cta_info = torch.empty(P, CTA_INFO_WIDTH, dtype=torch.int32, device=device)
-    else:
-        cta_info = cta_info_out
-    safe_i32 = safe.reshape(1).to(torch.int32)
-    total_splits_i32 = total_splits.reshape(1).to(torch.int32)
-    BLOCK_P = 256
-    grid = (triton.cdiv(P, BLOCK_P),)
-    _prefill_cta_info_kernel[grid](
-        incl,
-        excl,
-        chunks_per_row.to(torch.int32),
-        rb,
-        ls,
-        le,
-        safe_i32,
-        total_splits_i32,
-        cta_info,
-        T,
-        P,
-        BLOCK_P=BLOCK_P,
+    return _RowPlan(
+        incl=incl,
+        excl=incl - ctas_r,  # exclusive prefix sum
+        chunks=chunks_per_row.to(torch.int32),
+        safe=safe.reshape(1).to(torch.int32),
+        total_splits=incl[-1].reshape(1).to(torch.int32),
     )
-    return safe, cta_info, P
 
 
-@triton.jit
+# `T` and `P` are batch shape, and a decode step's row count changes every
+# forward, so specializing on whether they divide 16 keeps finding new variants
+# to compile in the middle of a run. Both kernels here: over 17 shapes it takes
+# this pair from 9 and 6 variants down to 3 and 1, and what is left of the 3 is
+# exactly the BLOCK_T ladder -- a set small enough to be compiled through.
+#
+# `T` alone is the whole of that halving AND the whole of its cost: dropping it
+# gives up the divisibility hint the wide blocks vectorize on, 41.1us -> 52.0us
+# at 16384 lanes. That lands on prefill, one call per ~500ms forward; the widths
+# decode runs stay hidden behind the call's own dispatch either way.
+@triton.jit(do_not_specialize=["T", "P"])
+def _prefill_row_plan_kernel(
+    le_ptr,  # [T] int32 local_ends
+    incl_ptr,  # [T] int32 out
+    excl_ptr,  # [T] int32 out
+    chunks_ptr,  # [T] int32 out
+    safe_ptr,  # [1] int32 out
+    total_splits_ptr,  # [1] int32 out
+    T,
+    P,
+    block_k,
+    s_max,
+    BLOCK_T: tl.constexpr,
+    SEARCH_STEPS: tl.constexpr,
+):
+    """Single-block row plan: chunk counts, split factor, and its prefix sums.
+
+    `total_ctas(s) = sum ceil(chunks/s)` is non-increasing in s, so feasibility is
+    monotone and the smallest feasible s is a binary search. `_row_plan_torch`
+    instead materializes the whole [s_max, T] feasibility matrix and counts its
+    False entries -- same answer, and the matrix is why that path's cost also
+    tracks the model's context length.
+
+    Masked-out lanes carry `chunks = 0`, which contributes 0 CTAs at every s, so
+    no reduction below needs a second mask.
+
+    `SEARCH_STEPS` is derived from `s_max`, not a generous constant: the range
+    halves each step, so `(s_max - 1).bit_length()` converges it and the caller
+    passes one more. Every surplus step is another reduction over all BLOCK_T
+    lanes -- 0.74us each at 4096 rows -- and a fixed 32 was this kernel's ENTIRE
+    growth with block width, 28.7us against 12.8us. The one spare step is not
+    that: it is hidden behind the call's own dispatch, and coming up short
+    returns a schedule that is merely wrong, with nothing downstream to fault.
+    """
+    t = tl.arange(0, BLOCK_T)
+    mask = t < T
+    le = tl.load(le_ptr + t, mask=mask, other=0)
+    # The clamp puts `le <= 0` at 0 under either rounding, so this agrees with the
+    # torch path's floor division without asking which one Triton does.
+    chunks = tl.where(mask, tl.maximum((le + block_k - 1) // block_k, 0), 0)
+    max_chunks = tl.maximum(tl.max(chunks, axis=0), 1)
+
+    lo = 1
+    hi = s_max
+    for _ in tl.static_range(SEARCH_STEPS):
+        mid = (lo + hi) // 2
+        feasible = tl.sum((chunks + mid - 1) // mid, axis=0) <= P
+        active = lo < hi
+        hi = tl.where(active & feasible, mid, hi)
+        lo = tl.where(active & (feasible == 0), mid + 1, lo)
+    # No s in [1, s_max] fits: fall back to one CTA per row, as torch's
+    # `feasible.any()` arm does.
+    total_smax = tl.sum((chunks + s_max - 1) // s_max, axis=0)
+    safe = tl.where(total_smax <= P, lo, max_chunks)
+
+    ctas = tl.where(mask, (chunks + safe - 1) // safe, 0)
+    incl = tl.cumsum(ctas, axis=0)
+    tl.store(incl_ptr + t, incl, mask=mask)
+    tl.store(excl_ptr + t, incl - ctas, mask=mask)
+    tl.store(chunks_ptr + t, chunks, mask=mask)
+    tl.store(safe_ptr, safe)
+    tl.store(total_splits_ptr, tl.sum(ctas, axis=0))
+
+
+@triton.jit(do_not_specialize=["T", "P"])
 def _prefill_cta_info_kernel(
     incl_ptr,  # [T] int32 inclusive prefix sum of per-row CTA counts
     excl_ptr,  # [T] int32 exclusive prefix sum
@@ -289,8 +473,15 @@ def build_pa_mqa_logits_fp4_prefill_module(
             fx.make_view(cta_it, fx.make_layout((1 << 28, 4), (4, 1)))
         )
         cta_info_vec = fx.Vector(_load_vec4_i32(cta_info_bt, fx.Int32(0)))
-        local_start = cta_info_bt[(fx.Int32(1), fx.Int32(0))]
-        local_end = cta_info_bt[(fx.Int32(1), fx.Int32(1))]
+
+        # Wave-uniform by construction, but they arrive in VGPRs via the buffer
+        # load; the V# below needs num_records in an SGPR or the store is wrapped
+        # in a waterfall loop.
+        def _uniform(v):
+            return fx.Int32(fx.rocdl.readfirstlane(T.i32, v.ir_value()))
+
+        local_start = _uniform(cta_info_bt[(fx.Int32(1), fx.Int32(0))])
+        local_end = _uniform(cta_info_bt[(fx.Int32(1), fx.Int32(1))])
 
         kv_bt = _i32_buffer(kv_cache_ptr, width=4)
         kvs_bt = _i32_buffer(kv_scale_ptr, width=1)
@@ -304,10 +495,37 @@ def build_pa_mqa_logits_fp4_prefill_module(
         chunk_start = cta_info_vec[2]
         chunk_count = cta_info_vec[3]
 
-        # out row base folded into an f32 global pointer (sizeof(f32)=4); the
-        # per-token store offset below stays small (no i32 overflow).
-        _row_elems = fx.Int64(row_id) * fx.Int64(stride_out_row)
-        out_base = fx.add_offset(fx.get_iter(out_logits_ptr), _row_elems)
+        # A V# spanning exactly [local_start, local_end) of this row: num_records
+        # then IS the window test, in hardware. A token below the window
+        # underflows to a huge unsigned offset and is dropped by the same bound,
+        # so one check covers both ends. Lanes 16..63 hold redundant copies of
+        # the butterfly result and must not write; a large constant added to
+        # their offset puts them past num_records. It must be a CONSTANT, not a
+        # multiple of win_len: `token_base - local_start` is negative for a
+        # token below a non-zero window start, and adding win_len to that lands
+        # back INSIDE the window, racing the lane that owns the column. Both
+        # terms are chunk-invariant, so both live here.
+        win_len = local_end - local_start
+        _row_elems = fx.Int64(row_id) * fx.Int64(stride_out_row) + fx.Int64(local_start)
+        out_win = fx.rocdl.make_buffer_tensor(
+            fx.make_view(
+                fx.recast_iter(
+                    fx.PointerType.get(T.f32, out_logits_ptr.memspace, 4),
+                    fx.add_offset(fx.get_iter(out_logits_ptr), _row_elems),
+                ),
+                fx.make_layout((win_len, 1), (1, 1)),
+            ),
+            max_size=False,
+            num_records_bytes=win_len * fx.Int32(4),
+        )
+        out_lane_off = lane_mod_16 + (lane_div_16 > fx.Int32(0)).select(
+            fx.Int32(_NON_WRITER_LANE_OFF), fx.Int32(0)
+        )
+        out_atom = fx.make_copy_atom(fx.rocdl.BufferCopy32b(), 1)
+        out_reg_ty = fx.MemRefType.get(
+            T.f32, fx.LayoutType.get(1, 1), fx.AddressSpace.Register
+        )
+        out_reg_lay = fx.make_layout(1, 1)
 
         # Q load (hoisted): per (k_tile, mi_idx) a thread loads its 16-byte FP4
         # chunk for head row mi_idx*16+lane_mod_16. Q: [total_tokens, H, D/2] uint8.
@@ -491,15 +709,17 @@ def build_pa_mqa_logits_fp4_prefill_module(
             thread_sum = _bperm_xor_add(thread_sum, 32)
             # `weight_scale` already folded into `w_per_lane` (hoisted, once/wave).
 
-            # Only [local_start, local_end) is written (one writer lane per token);
-            # the rest stays at the caller's -inf pre-fill. Sparse 1-writer
-            # scatter: guard the plain store instead of a V# OOB sentinel. Row base
-            # is folded into out_base, so the store offset is the token index.
-            is_writer = lane_div_16 < fx.Int32(1)
-            out_token = token_base + lane_mod_16
-            in_window = (out_token >= local_start) & (out_token < local_end)
-            if is_writer & in_window:
-                fx.ptr_store(thread_sum, fx.add_offset(out_base, out_token))
+            # Window and writer-lane guards are both in the V#; nothing is
+            # tested here. Cells outside stay at the caller's -inf pre-fill.
+            r_out = fx.memref_alloca(out_reg_ty, out_reg_lay)
+            fx.memref_store_vec(
+                fx.Vector.from_elements([thread_sum], dtype=fx.Float32), r_out
+            )
+            fx.copy(
+                out_atom,
+                r_out,
+                fx.slice(out_win, (token_base - local_start + out_lane_off, None)),
+            )
 
         def _compute_chunk(kv_list_in, kvs_packed_list_in, c_i32_arg, nt0_accs_in=None):
             assert (

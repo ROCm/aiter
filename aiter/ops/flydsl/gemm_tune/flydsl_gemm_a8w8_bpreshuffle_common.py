@@ -19,32 +19,12 @@ The gfx1250 WMMA pipeline has its own file and is not part of PIPELINES yet.
 """
 
 import math
-import os
 from collections.abc import Callable
 from dataclasses import dataclass
 from functools import cache
 from typing import Any
 
-from aiter.ops.flydsl.utils import (
-    addressable_lds_bytes_for_gfx as _addressable_lds_bytes_for_gfx,
-)
-from aiter.ops.flydsl.utils import (
-    get_shared_memory_per_block,
-)
-
-
-def get_gfx():
-    """Detect GPU arch: honour GPU_ARCHS env, fall back to chip_info, default gfx942."""
-    env = os.environ.get("GPU_ARCHS", "")
-    if env and env != "native":
-        return env.split(";")[-1].strip()
-    try:
-        from aiter.jit.utils.chip_info import get_gfx as _get_gfx
-
-        return _get_gfx()
-    except Exception:  # noqa: BLE001
-        return "gfx942"
-
+from aiter.jit.utils.chip_info import get_gfx, get_lds_capacity_bytes
 
 _DTYPE_SHORT = {
     "fp8": "F8",
@@ -67,6 +47,7 @@ class kernelInstance:
     xcd_swizzle: int  # 0=off, >0=group size for XCD remap
     lds_stage: int = 2  # 2=double-buffer ping-pong, 1=single A-LDS buffer (half LDS)
     sScheduler: str = "Default"  # scheduler hints on; "Off" = compiler default
+    k_split: int = 1  # >1 splits the K loop over gridDim.z (fp32 workspace + reduce)
 
     @property
     def enable_scheduler(self) -> bool:
@@ -99,6 +80,7 @@ class kernelInstance:
                 ),
                 self.sScheduler.lower(),
             ]
+            + ([f"ks{self.k_split}"] if self.k_split > 1 else [])
         )
 
 
@@ -114,6 +96,7 @@ def _ki(
     q_dtype_w="fp8",
     dtype="bf16",
     scheduler="Default",
+    k_split=1,
 ):
     return kernelInstance(
         tile_m,
@@ -127,6 +110,7 @@ def _ki(
         xcd_swizzle,
         lds_stage,
         scheduler,
+        k_split,
     )
 
 
@@ -181,20 +165,15 @@ def kernel_instance_estimated_lds_bytes(ki: kernelInstance) -> int:
     )
 
 
-def addressable_lds_bytes_for_gfx(gfx: str) -> int:
-    return _addressable_lds_bytes_for_gfx(gfx)
-
-
 @cache
 def max_lds_bytes_for_tune() -> int:
     """Addressable LDS limit for current target.
 
     Cached because ``kernel_fits_shape`` calls it per candidate (thousands of
-    times per shape) and the uncached path does a ``torch.cuda.current_device()``
-    round trip each time. The arch is already resolved once at import below, so
-    a process-lifetime cache changes nothing.
+    times per shape). The arch is resolved once at import below, so a
+    process-lifetime cache changes nothing.
     """
-    return get_shared_memory_per_block(fallback_gfx=get_gfx())
+    return get_lds_capacity_bytes(get_gfx())
 
 
 def _padded_m(M: int) -> int:
@@ -226,6 +205,8 @@ def kernel_fits_shape(ki: kernelInstance, M: int, N: int, K: int) -> bool:
     if kernel_instance_estimated_lds_bytes(ki) > max_lds_bytes_for_tune():
         return False
     if N % ki.tile_n != 0 or K % ki.tile_k != 0:
+        return False
+    if ki.k_split > 1 and (K // ki.tile_k) % ki.k_split != 0:
         return False
     if _padded_m(M) % ki.tile_m != 0:
         return False
@@ -329,6 +310,32 @@ def _estimate_max_wpe(tile_m: int, tile_n: int, total_vgpr: int = 512) -> int:
     return int(total_vgpr / max(est_per_wave, 1))
 
 
+# Legal values are the divisors of K//tile_k, which is shape-dependent, so they
+# are enumerated rather than hardcoded.
+K_SPLIT_MIN_TILES_PER_SLICE = 2  # keep the ping-pong loop fed
+K_SPLIT_MAX_CTA_OVERSUBSCRIBE = 4  # no point going far past one CU each
+
+
+def k_split_candidates(ki, M: int, N: int, K: int, cu_num: int = 256) -> list[int]:
+    """Split-K values worth benchmarking; 1 is excluded, the caller has it.
+
+    Empty once the tile grid already fills the GPU -- splitting would only add
+    the reduce pass. That bound also caps the fp32 workspace, since for a given
+    tile grid it caps M.
+    """
+    if ki.k_split != 1 or K % ki.tile_k:
+        return []
+    base_ctas = ((M + ki.tile_m - 1) // ki.tile_m) * (N // ki.tile_n)
+    if base_ctas >= cu_num:
+        return []
+    n_tiles = K // ki.tile_k
+    max_split = min(
+        n_tiles // K_SPLIT_MIN_TILES_PER_SLICE,
+        max(2, cu_num * K_SPLIT_MAX_CTA_OVERSUBSCRIBE // base_ctas),
+    )
+    return [d for d in range(2, max_split + 1) if n_tiles % d == 0]
+
+
 def _build_kernels_list(tiles, total_vgpr=512):
     kl = {}
     idx = 0
@@ -383,19 +390,15 @@ else:
 # Pipeline 2: 8wave (CDNA4 MFMA_Scale), gfx950 only
 # ===========================================================================
 
-try:
-    from aiter.ops.flydsl.gemm_a8w8_bpreshuffle_8wave import (
-        BLOCK_K as BLOCK_K_8WAVE,
-    )
-    from aiter.ops.flydsl.gemm_a8w8_bpreshuffle_8wave import (
-        MIN_K as MIN_K_8WAVE,
-    )
-    from aiter.ops.flydsl.gemm_a8w8_bpreshuffle_8wave import (
-        lds_bytes as _lds_bytes_8wave,
-    )
-except Exception as _exc:  # noqa: BLE001
-    print(f"[FlyDSL] 8wave op module unavailable ({_exc}); 8wave candidates disabled")
-    BLOCK_K_8WAVE, MIN_K_8WAVE, _lds_bytes_8wave = 128, 256, None
+from aiter.ops.flydsl.gemm_a8w8_bpreshuffle_8wave import (
+    BLOCK_K as BLOCK_K_8WAVE,
+)
+from aiter.ops.flydsl.gemm_a8w8_bpreshuffle_8wave import (
+    MIN_K as MIN_K_8WAVE,
+)
+from aiter.ops.flydsl.gemm_a8w8_bpreshuffle_8wave import (
+    lds_bytes as _lds_bytes_8wave,
+)
 
 NAME_PREFIX_8WAVE = "flydsl_bpreshuffle_8w"
 
@@ -405,7 +408,7 @@ NAME_PREFIX_8WAVE = "flydsl_bpreshuffle_8w"
 # keeps CSV rows unambiguous to a human.
 KERNEL_ID_BASE_8WAVE = 1_000_000
 
-LDS_BYTES_8WAVE = get_shared_memory_per_block(fallback_gfx="gfx950")
+LDS_BYTES_8WAVE = get_lds_capacity_bytes(get_gfx())
 _I32_MAX = 2**31
 
 _TILES_8WAVE = ((128, 256), (128, 512), (256, 256))
@@ -447,8 +450,6 @@ def kernel_fits_shape_8wave(
     the 8-wave kernel handles ragged M and N through its buffer descriptors and
     an explicit column guard, and the best tile for e.g. M=11256 is ragged.
     """
-    if _lds_bytes_8wave is None:
-        return False
     if M <= 0 or N <= 0 or K <= 0:
         return False
     if K % BLOCK_K_8WAVE != 0 or K < MIN_K_8WAVE:
@@ -471,7 +472,7 @@ def is_8wave_enabled() -> bool:
     ``gemm_a8w8_bpreshuffle_flydsl`` dispatches on the kernelName prefix alone.
     To exclude the pipeline, drop its rows from the tuned CSV.
     """
-    return _lds_bytes_8wave is not None and get_gfx().startswith("gfx950")
+    return get_gfx().startswith("gfx950")
 
 
 def _build_kernels_list_8wave() -> dict[int, EightWaveKernelInstance]:

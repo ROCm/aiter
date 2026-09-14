@@ -50,7 +50,8 @@ opus_a16w16_tune_dispatch_gfx1250<fp32_t>(int id)
     };
     constexpr size_t kSize = sizeof(kTune) / sizeof(kTune[0]);
     OpusA16W16TuneEntry needle{id, nullptr};
-    auto it = std::lower_bound(kTune, kTune + kSize, needle, tune_entry_less);
+    auto it = std::lower_bound(kTune, kTune + kSize, needle,
+                               kid_entry_less<OpusA16W16TuneEntry>);
     AITER_CHECK(it != kTune + kSize && it->kid == id,
                 "Kernel id ", id,
                 " not found in a16w16 fp32 tune lookup table (gfx1250)");
@@ -68,6 +69,52 @@ opus_a16w16_tune_dispatch_gfx1250<bf16_t>(int id)
                 "opus_gemm gfx1250: a16w16 <bf16_t> tune dispatch is not used "
                 "(split-K kids are fp32-workspace; bf16 Y is produced by the "
                 "reduce kernel). kid=", id);
+    return nullptr;
+}
+
+// ── a16w16 pre-compiled .co dispatch ────────────────────────────────────────
+// Two tables, mirroring the split-K pair above: id-based for the explicit
+// kernelId / tuner path, (M, N, K) for the tuned-CSV production path. Both hold
+// OpusA16W16CoKernel (no workspace argument -- see the type's comment), and both
+// are bf16-out only: the kernel writes bf16 C directly, with no reduce kernel in
+// the way to cast anything else.
+inline opus_gfx1250_detail::OpusA16W16CoKernel
+opus_a16w16_co_tune_dispatch_gfx1250(int id)
+{
+    using namespace opus_gfx1250_detail;
+    static constexpr OpusA16W16CoTuneEntry kTune[] = {
+        GENERATE_A16W16_CO_TUNE_LOOKUP_GFX1250()
+    };
+    constexpr size_t kSize = sizeof(kTune) / sizeof(kTune[0]);
+    OpusA16W16CoTuneEntry needle{id, nullptr};
+    auto it = std::lower_bound(kTune, kTune + kSize, needle,
+                               kid_entry_less<OpusA16W16CoTuneEntry>);
+    AITER_CHECK(it != kTune + kSize && it->kid == id,
+                "Kernel id ", id,
+                " not found in the a16w16 pre-compiled (.co) tune lookup table "
+                "(gfx1250). Either it is not in this build's compile set, or "
+                "the build saw no gen_co/co_kernels.json / no matching "
+                "gen_co/<arch>/*.co and the whole family is empty (the loader "
+                "drops kids whose image is missing).");
+    return it->func;
+}
+
+// (M, N, K) -> pre-compiled kernel, nullptr on miss. No heuristic fallback: the
+// shape heuristic never returns a .co kid, so a miss just means "this shape has
+// no tuned .co winner" and the caller carries on with the split-K path.
+inline opus_gfx1250_detail::OpusA16W16CoKernel
+opus_a16w16_co_dispatch_gfx1250(int M, int N, int K)
+{
+    using namespace opus_gfx1250_detail;
+    static constexpr OpusA16W16CoRuntimeEntry kLookup[] = {
+        GENERATE_OPUS_LOOKUP_TABLE_CO_GFX1250()
+    };
+    constexpr size_t kSize = sizeof(kLookup) / sizeof(kLookup[0]);
+    OpusA16W16CoRuntimeEntry needle{{M, N, K}, nullptr};
+    auto it = std::lower_bound(kLookup, kLookup + kSize, needle,
+                               shape_entry_less<OpusA16W16CoRuntimeEntry>);
+    if (it != kLookup + kSize && shape_entry_eq(*it, needle))
+        return it->func;
     return nullptr;
 }
 
@@ -90,6 +137,20 @@ inline void check_shape_4g(int M, int N, int K, size_t c_elem_bytes)
                 "opus_gemm gfx1250: a16w16 heuristic refuses >4 GiB shape (M=",
                 M, " N=", N, " K=", K, "): launcher gmem descriptors are 32-bit.");
 }
+
+inline void check_shape_reduce_grid(int M)
+{
+    // Every kid this heuristic can return is split-K, and their reduce carries
+    // one row per grid.y block against a 65535 cap. Past it the reduce writes
+    // garbage rather than failing -- NaN at M=65536, measured. A .co kid has no
+    // reduce and handles these shapes, but the heuristic never returns one, so
+    // the only way through is a tuned row.
+    AITER_CHECK(M <= 65535,
+                "opus_gemm gfx1250: a16w16 heuristic refuses M=", M,
+                " (> 65535): every heuristic kid is split-K and its reduce is "
+                "capped at 65535 rows. Tune this shape -- the winner will be a "
+                ".co kid, which has no reduce.");
+}
 }  // namespace opus_gfx1250_detail
 
 template <typename CDataType>
@@ -106,11 +167,13 @@ opus_dispatch_a16w16_gfx1250<bf16_t>(int M, int N, int K, int batch, bool has_bi
     };
     constexpr size_t kSize = sizeof(kLookup) / sizeof(kLookup[0]);
     OpusA16W16RuntimeEntry needle{{M, N, K}, nullptr};
-    auto it = std::lower_bound(kLookup, kLookup + kSize, needle, entry_less);
-    if (it != kLookup + kSize && entry_eq(*it, needle))
+    auto it = std::lower_bound(kLookup, kLookup + kSize, needle,
+                               shape_entry_less<OpusA16W16RuntimeEntry>);
+    if (it != kLookup + kSize && shape_entry_eq(*it, needle))
         return it->func;
     (void)batch;
     opus_gfx1250_detail::check_shape_4g(M, N, K, sizeof(bf16_t));
+    opus_gfx1250_detail::check_shape_reduce_grid(M);
     const int kid = opus_a16w16_heuristic_kid_gfx1250(M, N, K, has_bias);
     return opus_a16w16_tune_dispatch_gfx1250<fp32_t>(kid);
 }
@@ -125,11 +188,13 @@ opus_dispatch_a16w16_gfx1250<fp32_t>(int M, int N, int K, int batch, bool has_bi
     };
     constexpr size_t kSize = sizeof(kLookup) / sizeof(kLookup[0]);
     OpusA16W16RuntimeEntry needle{{M, N, K}, nullptr};
-    auto it = std::lower_bound(kLookup, kLookup + kSize, needle, entry_less);
-    if (it != kLookup + kSize && entry_eq(*it, needle))
+    auto it = std::lower_bound(kLookup, kLookup + kSize, needle,
+                               shape_entry_less<OpusA16W16RuntimeEntry>);
+    if (it != kLookup + kSize && shape_entry_eq(*it, needle))
         return it->func;
     (void)batch;
     opus_gfx1250_detail::check_shape_4g(M, N, K, sizeof(fp32_t));
+    opus_gfx1250_detail::check_shape_reduce_grid(M);
     const int kid = opus_a16w16_heuristic_kid_gfx1250(M, N, K, has_bias);
     return opus_a16w16_tune_dispatch_gfx1250<fp32_t>(kid);
 }
