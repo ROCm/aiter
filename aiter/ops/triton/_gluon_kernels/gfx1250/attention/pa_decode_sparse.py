@@ -1551,23 +1551,23 @@ def _pa_decode_sparse_v4_2buff(
         one_over_L = gl.convert_layout(one_over_L, layout=PV_WMMA_LAYOUT)
         out_val = acc * one_over_L
 
-        h_offs_out = gl.arange(0, BLOCK_H, layout=gl.SliceLayout(1, Q_BLOCKED_LAYOUT))
-        d_offs_out = gl.arange(0, BLOCK_D, layout=gl.SliceLayout(0, Q_BLOCKED_LAYOUT))
-        h_offs_out_eff = h_off_base + h_offs_out
-        h_mask_out = h_offs_out_eff < H
-
-        out_blocked = gl.convert_layout(
-            out_val.to(out_ptr.dtype.element_ty), Q_BLOCKED_LAYOUT
+        # Out by descriptor, mirroring the TDM-Q load: the descriptor's row
+        # extent is H, so out-of-range heads clip and the head mask disappears,
+        # and the write leaves through the TDM engine instead of 64 masked
+        # buffer_store_b128 (4.4% of this kernel's stall in ATT).
+        out_smem = gl.allocate_shared_memory(
+            out_ptr.dtype.element_ty, [BLOCK_H, BLOCK_D], q_bf16_shared
         )
-        gl.amd.cdna4.buffer_store(
-            out_blocked,
-            ptr=out_ptr + t * out_stride_t,
-            offsets=(
-                h_offs_out_eff[:, None] * out_stride_h
-                + d_offs_out[None, :] * out_stride_d
-            ).to(gl.int32),
-            mask=h_mask_out[:, None],
+        out_smem.store(out_val.to(out_ptr.dtype.element_ty))
+        out_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
+            base=out_ptr + t * out_stride_t,
+            shape=[H, BLOCK_D],
+            strides=[out_stride_h, out_stride_d],
+            block_shape=[BLOCK_H, BLOCK_D],
+            layout=q_bf16_shared,
         )
+        gl.amd.gfx1250.tdm.async_store(out_desc, [h_off_base, 0], out_smem)
+        gl.amd.gfx1250.tdm.async_wait(0)
     else:
         h_offs_ml = gl.arange(0, BLOCK_H, layout=gl.SliceLayout(1, Q_BLOCKED_LAYOUT))
         h_offs_ml_eff = h_off_base + h_offs_ml
@@ -2047,6 +2047,9 @@ def _pa_decode_sparse_v4_a8w8(
     q_shared: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
         [[BLOCK_D, 16]], [BLOCK_H, BLOCK_D], [1, 0], CGA_H
     )
+    out_shared: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
+        [[BLOCK_D, 8]], [BLOCK_H, BLOCK_D], [1, 0], CGA_H
+    )
     qs_shared: gl.constexpr = gl.SwizzledSharedLayout(
         vec=1, per_phase=1, max_phase=1, order=[1, 0], cga_layout=CGA_H
     )
@@ -2519,52 +2522,24 @@ def _pa_decode_sparse_v4_a8w8(
 
     if KV_SPLITS == 1:
         inv = gl.convert_layout(1.0 / l_i[:, None], layout=BF16_WMMA_LAYOUT)
-        ob = out_ptr + t * out_stride_t
         oty: gl.constexpr = out_ptr.dtype.element_ty
-        _v4_store_acc(
-            (a0 * inv).to(oty),
-            0,
-            PV0,
-            ob,
-            h_offs_o_eff,
-            h_mask_o,
-            out_stride_h,
-            out_stride_d,
-            OUT_BLOCKED_LAYOUT,
+        # Out by descriptor: the four accumulators are reassembled in LDS and
+        # leave as one block. The descriptor's row extent is H, so out-of-range
+        # heads clip and the head mask goes away.
+        out_smem = gl.allocate_shared_memory(oty, [BLOCK_H, BLOCK_D], out_shared)
+        out_smem.slice(0, PV0, dim=1).store((a0 * inv).to(oty))
+        out_smem.slice(PV0, PV1, dim=1).store((a1 * inv).to(oty))
+        out_smem.slice(PV0 + PV1, PV2, dim=1).store((a2 * inv).to(oty))
+        out_smem.slice(NOPE_DIM, ROPE_DIM, dim=1).store((ar * inv).to(oty))
+        out_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
+            base=out_ptr + t * out_stride_t,
+            shape=[H, BLOCK_D],
+            strides=[out_stride_h, out_stride_d],
+            block_shape=[BLOCK_H, BLOCK_D],
+            layout=out_shared,
         )
-        _v4_store_acc(
-            (a1 * inv).to(oty),
-            PV0,
-            PV1,
-            ob,
-            h_offs_o_eff,
-            h_mask_o,
-            out_stride_h,
-            out_stride_d,
-            OUT_BLOCKED_LAYOUT,
-        )
-        _v4_store_acc(
-            (a2 * inv).to(oty),
-            PV0 + PV1,
-            PV2,
-            ob,
-            h_offs_o_eff,
-            h_mask_o,
-            out_stride_h,
-            out_stride_d,
-            OUT_BLOCKED_LAYOUT,
-        )
-        _v4_store_acc(
-            (ar * inv).to(oty),
-            NOPE_DIM,
-            ROPE_DIM,
-            ob,
-            h_offs_o_eff,
-            h_mask_o,
-            out_stride_h,
-            out_stride_d,
-            OUT_BLOCKED_LAYOUT,
-        )
+        gl.amd.gfx1250.tdm.async_store(out_desc, [h_off_base, 0], out_smem)
+        gl.amd.gfx1250.tdm.async_wait(0)
     else:
         h_offs_ml = gl.arange(0, BLOCK_H, layout=gl.SliceLayout(1, MXS_BLOCKED_LAYOUT))
         h_offs_ml_eff = h_off_base + h_offs_ml
@@ -2858,6 +2833,9 @@ def _pa_decode_sparse_v4_mx(
     )
     q_shared: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
         [[BLOCK_D, 16]], [BLOCK_H, BLOCK_D], [1, 0], CGA_H
+    )
+    out_shared: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
+        [[BLOCK_D, 8]], [BLOCK_H, BLOCK_D], [1, 0], CGA_H
     )
     qs_shared: gl.constexpr = gl.SwizzledSharedLayout(
         vec=1, per_phase=1, max_phase=1, order=[1, 0], cga_layout=CGA_H
@@ -3232,20 +3210,25 @@ def _pa_decode_sparse_v4_mx(
 
     if KV_SPLITS == 1:
         inv = gl.convert_layout(1.0 / l_i[:, None], layout=PV_WMMA_LAYOUT)
+        oty: gl.constexpr = out_ptr.dtype.element_ty
+        # Out by descriptor: the eight group accumulators are reassembled in
+        # LDS and leave as one block, with the head mask folded into the
+        # descriptor's row extent.
+        out_smem = gl.allocate_shared_memory(oty, [BLOCK_H, BLOCK_D], out_shared)
         accs = [a0, a1, a2, a3, a4, a5, a6, a7]
         for g in tl.static_range(8):
-            o = gl.convert_layout(
-                (accs[g] * inv).to(out_ptr.dtype.element_ty), OUT_BLOCKED_LAYOUT
+            out_smem.slice(g * GROUP_SIZE, GROUP_SIZE, dim=1).store(
+                (accs[g] * inv).to(oty)
             )
-            gl.amd.cdna4.buffer_store(
-                o,
-                ptr=out_ptr + t * out_stride_t + g * GROUP_SIZE * out_stride_d,
-                offsets=(
-                    h_offs_o_eff[:, None] * out_stride_h
-                    + d_offs_o[None, :] * out_stride_d
-                ).to(gl.int32),
-                mask=h_mask_o[:, None],
-            )
+        out_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
+            base=out_ptr + t * out_stride_t,
+            shape=[H, BLOCK_D],
+            strides=[out_stride_h, out_stride_d],
+            block_shape=[BLOCK_H, BLOCK_D],
+            layout=out_shared,
+        )
+        gl.amd.gfx1250.tdm.async_store(out_desc, [h_off_base, 0], out_smem)
+        gl.amd.gfx1250.tdm.async_wait(0)
     else:
         h_offs_ml = gl.arange(0, BLOCK_H, layout=gl.SliceLayout(1, MXS_BLOCKED_LAYOUT))
         h_offs_ml_eff = h_off_base + h_offs_ml
