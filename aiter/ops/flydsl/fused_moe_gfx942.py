@@ -70,11 +70,10 @@ class Config:
                 f"inter_dim={problem.inter_dim} is not divisible by the "
                 "down BLOCK_K=64"
             )
-        down_tiles = (problem.model_dim + 127) // 128
-        if self.use_prefill and down_tiles % 2 != 0:
+        if self.use_prefill and problem.model_dim % 128 != 0:
             return (
-                f"model_dim={problem.model_dim} produces {down_tiles} down tiles; "
-                "the prefill down kernel requires an even number of 128-wide tiles"
+                f"model_dim={problem.model_dim} is not divisible by 128; "
+                "the prefill down kernel processes paired 64-wide tiles"
             )
         return None
 

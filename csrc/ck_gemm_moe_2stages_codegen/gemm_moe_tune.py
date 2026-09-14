@@ -5987,7 +5987,7 @@ class FmoeTuner(TunerCommon):
                     or (
                         int(row["inter_dim"]) * 2 % config.BLOCK_N == 0
                         and int(row["inter_dim"]) % 64 == 0
-                        and ((int(row["model_dim"]) + 127) // 128) % 2 == 0
+                        and int(row["model_dim"]) % 128 == 0
                     )
                 )
             ]

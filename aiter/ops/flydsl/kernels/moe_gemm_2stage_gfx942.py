@@ -79,17 +79,18 @@ def compile_gemm(
         )
     if stage == "down" and alg == "prefill_1x4":
         assert K % 64 == 0, f"down prefill requires K to be divisible by 64, got K={K}"
-        num_n_tiles = (N + BLOCK_TILE_SIZE_N - 1) // BLOCK_TILE_SIZE_N
-        assert num_n_tiles % 2 == 0, (
-            f"down prefill requires an even number of N tiles, got "
-            f"ceil({N}/{BLOCK_TILE_SIZE_N})={num_n_tiles}"
+        assert N % 128 == 0, (
+            f"down prefill requires N to be divisible by 128 for paired "
+            f"64-wide tiles, got N={N}"
         )
 
     if stage == "gateup" and alg == "splitk":
         assert (
             BLOCK_TILE_SIZE_N % 64 == 0
         ), "For split-k, BLOCK_TILE_SIZE_N needs to be multiple of 64 due to reduce layout."
-        assert K % (32 * 4) == 0, "K must be a multiple of 128 for split-k algorithm."
+        assert (
+            K % (TILE_K * 4) == 0
+        ), f"gateup split-K requires K to be divisible by {TILE_K * 4}, got K={K}"
         c_reduce_lds_size = (
             16 * 64 * 4
         )  # save LDS size instead of BLOCK_TILE_SIZE_M * BLOCK_TILE_SIZE_N * 4
@@ -100,6 +101,9 @@ def compile_gemm(
             c_reduce_lds: fx.Array[fx.Float32, c_reduce_lds_size, 16]
 
     elif stage == "down" and alg == "splitk":
+        assert (
+            K % TILE_K == 0
+        ), f"down split-K requires K to be divisible by {TILE_K}, got K={K}"
 
         @fx.struct
         class SharedStorage:
@@ -703,6 +707,10 @@ def compile_gemm(
         tid = gpu.thread_idx.x
 
         tile_k_per_wg = TILE_K * splitk_waves
+        assert K % tile_k_per_wg == 0, (
+            f"split-K requires K to be divisible by TILE_K * splitk_waves, "
+            f"got K={K}, TILE_K={TILE_K}, splitk_waves={splitk_waves}"
+        )
 
         a_tensor = fx.rocdl.make_buffer_tensor(arg_p_input, max_size=False)
         a_cp_atom_r = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), arg_p_input.dtype)
