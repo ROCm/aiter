@@ -83,11 +83,11 @@ def _get_workspace(
             all_weights=torch.empty(
                 (m, total_topk), dtype=torch.float32, device=device
             ),
-            sorted_ids=torch.empty(max_sorted, dtype=torch.int32, device=device),
-            sorted_weights=torch.empty(
+            sorted_ids=torch.zeros(max_sorted, dtype=torch.int32, device=device),
+            sorted_weights=torch.zeros(
                 max_sorted, dtype=torch.float32, device=device
             ),
-            sorted_expert_ids=torch.empty(
+            sorted_expert_ids=torch.zeros(
                 max_blocks, dtype=torch.int32, device=device
             ),
             num_valid_ids=torch.empty(2, dtype=torch.int32, device=device),
@@ -113,6 +113,8 @@ def _get_workspace(
             empty_u8=torch.empty(0, dtype=torch.uint8, device=device),
             empty_f32=torch.empty(0, dtype=torch.float32, device=device),
         )
+        workspace.all_ids[:, routed_topk].fill_(routed_experts)
+        workspace.all_weights[:, routed_topk].fill_(1.0)
         _WORKSPACES[key] = workspace
     return workspace
 
@@ -176,20 +178,16 @@ def run_latent_fhmoe(
     all_ids = workspace.all_ids
     all_weights = workspace.all_weights
     all_ids[:, :routed_topk].copy_(topk_ids)
-    all_ids[:, routed_topk].fill_(routed_experts)
     all_weights[:, :routed_topk].copy_(topk_weight)
-    all_weights[:, routed_topk].fill_(1.0)
 
     num_experts = routed_experts + 1
-    # Stage kernels may speculatively read metadata for grid-tail blocks before
-    # applying num_valid_ids. Keep those entries mapped to expert/token zero.
+    # Tail entries are initialized to valid expert/token zero once. Sort may
+    # leave values from a prior replay there, but all remain in bounds and
+    # num_valid_ids prevents them from contributing to the result.
     sorted_ids = workspace.sorted_ids
     sorted_weights = workspace.sorted_weights
     sorted_expert_ids = workspace.sorted_expert_ids
     num_valid_ids = workspace.num_valid_ids
-    sorted_ids.zero_()
-    sorted_weights.zero_()
-    sorted_expert_ids.zero_()
     flydsl_moe_sorting_fwd(
         all_ids,
         all_weights,
