@@ -34,7 +34,10 @@ import torch
 
 from aiter.jit.utils.chip_info import get_gfx_runtime
 
-from .kernels.pa_decode_reduce import compile_pa_decode_ps_reduce
+from .kernels.pa_decode_reduce import (
+    MAX_CONTEXT_PARTITIONS,
+    compile_pa_decode_ps_reduce,
+)
 from .kernels.pa_decode_tile import KV_COMPUTE_BLOCK, compile_pa_decode_tile
 from .kernels.tensor_shim import _run_compiled, ptr_arg
 from .kernels.utils import cdiv
@@ -110,8 +113,11 @@ def launch_pa_decode_ps_reduce(
     context_partition_num: int,
     stream: torch.cuda.Stream,
 ) -> None:
-    if context_partition_num > 64:
-        raise ImportError("FlyDSL pa_decode reduce supports at most 64 partitions")
+    if context_partition_num > MAX_CONTEXT_PARTITIONS:
+        raise ImportError(
+            "FlyDSL pa_decode reduce supports at most "
+            f"{MAX_CONTEXT_PARTITIONS} partitions"
+        )
     use_sinks = sink_token is not None
     compiled = compile_pa_decode_ps_reduce(
         max_context_partition_num=context_partition_num,
@@ -205,9 +211,9 @@ def pa_decode(
         raise NotImplementedError("pa_decode does not support sliding-window attention")
     if query_length < 1:
         raise ValueError(f"query_length must be positive, got {query_length}")
-    if not 1 <= max_context_partition_num <= 64:
+    if not 1 <= max_context_partition_num <= MAX_CONTEXT_PARTITIONS:
         raise ValueError(
-            "max_context_partition_num must be in [1, 64], "
+            f"max_context_partition_num must be in [1, {MAX_CONTEXT_PARTITIONS}], "
             f"got {max_context_partition_num}"
         )
 
