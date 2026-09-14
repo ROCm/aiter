@@ -719,29 +719,6 @@ def get_g2(
     return launch
 
 
-def _g2_prefetch_ids_eligible(
-    M_logical,
-    NE,
-    topk,
-    D_HIDDEN,
-    D_INTER,
-    BM,
-    BN,
-    BK,
-    a_dtype,
-    b_dtype,
-    epilog,
-    out_dtype,
-):
-    del M_logical, NE, topk, D_HIDDEN, D_INTER
-    return (
-        (BM, BN, BK) == (128, 256, 128)
-        and a_dtype == b_dtype == "fp4"
-        and epilog == "reduce"
-        and str(out_dtype).strip().lower() == "fp8"
-    )
-
-
 def mxfp4_moe_gemm2(
     *,
     inter_sorted_quant,
@@ -829,20 +806,10 @@ def mxfp4_moe_gemm2(
         if not bias.is_contiguous():
             bias = bias.contiguous()
     g2_prefetch_ids = (
-        _g2_prefetch_ids_eligible(
-            M_logical,
-            NE,
-            topk,
-            D_HIDDEN,
-            D_INTER,
-            BM,
-            BN,
-            BK,
-            a_dtype,
-            b_dtype,
-            epilog,
-            out_dtype,
-        )
+        (BM, BN, BK) == (128, 256, 128)
+        and a_dtype == b_dtype == "fp4"
+        and epilog == "reduce"
+        and str(out_dtype).strip().lower() == "fp8"
         and _kstatic
         and not (persist or is_ep)
         and bias is None
