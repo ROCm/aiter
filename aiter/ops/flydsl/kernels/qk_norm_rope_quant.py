@@ -2144,9 +2144,7 @@ def _build_kernel_w32_tdm(
             cs_cache = [None, None]
             if const_expr(do_hoist):
                 pending_pos = [issue_pos(tok_of(tile_base + 0))]
-                cs_cache[0], cs_cache[1] = _cs_from_pos(
-                    fx.Int32(pending_pos[0].trunci(i32))
-                )
+                cs_cache[0], cs_cache[1] = _cs_from_pos(pending_pos[0].to(fx.Int32))
             for i in range_constexpr(CT):
                 # Tile i consumes TDM load #i (issued in tile order: K in the
                 # prologue, then one per iteration while i + K < CT). In steady
@@ -2168,9 +2166,7 @@ def _build_kernel_w32_tdm(
                     issue(bufs[i % K], tile_base + i + K)  # reuse after read
                 if const_expr(do_hoist and (i + 1) % GROUP == 0 and i + 1 < CT):
                     pending_pos[0] = issue_pos(tok_of(tile_base + i + 1))
-                    cs_cache[0], cs_cache[1] = _cs_from_pos(
-                        fx.Int32(pending_pos[0].trunci(i32))
-                    )
+                    cs_cache[0], cs_cache[1] = _cs_from_pos(pending_pos[0].to(fx.Int32))
 
         def emit_kv():
             gk = g - gx_q
