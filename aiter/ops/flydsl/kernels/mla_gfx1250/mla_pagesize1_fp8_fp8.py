@@ -141,6 +141,7 @@ def launch_mla_pagesize1_fp8_fp8(
     q_row_stride = num_q_heads * Q_HEAD_STRIDE
     output_lds_bytes = max_seqlen_q * num_q_heads * V_HEAD_DIM * 4
     lds_total_bytes = max(KV_RING_BYTES, output_lds_bytes)
+    
     assert (
         lds_total_bytes <= lds_size
     ), f"Kernel requires {lds_total_bytes} bytes LDS but CU budget is {lds_size}"
