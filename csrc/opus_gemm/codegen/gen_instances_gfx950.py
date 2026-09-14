@@ -669,7 +669,7 @@ using {k.name}_Traits = {traits_name}<{k.BLOCK_SIZE},
 """
 
     grid_setup = f"""
-    constexpr int NUM_CU = 256;
+    const int NUM_CU = get_device_cu_num();
     constexpr int NUM_XCD = 8;
     const int num_tiles_m = (M + {k.B_M} - 1) / {k.B_M};
     const int num_tiles_n = (N + {k.B_N} - 1) / {k.B_N};
@@ -701,7 +701,9 @@ using {k.name}_Traits = {traits_name}<{k.BLOCK_SIZE},
     dim3 block({k.BLOCK_SIZE});
 """
 
-    preamble = instance_impl_preamble("\n#include <algorithm>")
+    preamble = instance_impl_preamble(
+        '\n#include <algorithm>\n#include "gemm_dispatch_utils.h"'
+    )
     host_tu_split = instance_impl_host_tu_split(
         traits_header,
         pipeline_header,
