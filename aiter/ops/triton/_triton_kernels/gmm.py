@@ -52,8 +52,8 @@ def _remap_xcd_tile_grid(
     tile_in_mm,
     num_row_tiles,
     num_col_tiles,
+    NUM_XCDS: tl.constexpr,
     GROUP_SIZE: tl.constexpr = 1,
-    NUM_XCDS: tl.constexpr = 8,
 ):
     return pid_grid(
         remap_xcd(tile_in_mm, num_row_tiles * num_col_tiles, NUM_XCDS=NUM_XCDS),
@@ -142,9 +142,10 @@ def _process_gmm_tile(
     K_DIVISIBLE_BY_BLOCK_SIZE_K: tl.constexpr,
     GROUP_SIZE: tl.constexpr,
     USE_BIAS: tl.constexpr,
+    NUM_XCDS: tl.constexpr,
 ):
     tile_m, tile_n = _remap_xcd_tile_grid(
-        tile_in_mm, num_m_tiles, num_n_tiles, GROUP_SIZE=GROUP_SIZE
+        tile_in_mm, num_m_tiles, num_n_tiles, GROUP_SIZE=GROUP_SIZE, NUM_XCDS=NUM_XCDS
     )
 
     offs_lhs_m = (tile_m.to(tl.int64) * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)) % m
@@ -231,6 +232,7 @@ def _gmm(
     GRID_DIM: tl.constexpr,
     USE_BIAS: tl.constexpr,
     INT_TYPE: tl.constexpr,
+    NUM_XCDS: tl.constexpr,
 ):
     zero = tl.cast(0, INT_TYPE)
 
@@ -286,6 +288,7 @@ def _gmm(
                 K_DIVISIBLE_BY_BLOCK_SIZE_K=K_DIVISIBLE_BY_BLOCK_SIZE_K,
                 GROUP_SIZE=GROUP_SIZE,
                 USE_BIAS=USE_BIAS,
+                NUM_XCDS=NUM_XCDS,
             )
 
             # Go to the next tile by advancing number of programs.
@@ -328,6 +331,7 @@ def _work_stealing_gmm(
     GROUP_SIZE: tl.constexpr,
     USE_BIAS: tl.constexpr,
     INT_TYPE: tl.constexpr,
+    NUM_XCDS: tl.constexpr,
 ):
     total_tiles = _total_gmm_tiles(
         group_sizes_ptr,
@@ -375,6 +379,7 @@ def _work_stealing_gmm(
             K_DIVISIBLE_BY_BLOCK_SIZE_K=K_DIVISIBLE_BY_BLOCK_SIZE_K,
             GROUP_SIZE=GROUP_SIZE,
             USE_BIAS=USE_BIAS,
+            NUM_XCDS=NUM_XCDS,
         )
         tile = tl.atomic_add(tile_counter_ptr, 1, sem="relaxed").to(INT_TYPE)
 
@@ -411,6 +416,7 @@ def gmm_kernel(
     GRID_DIM: tl.constexpr,
     USE_BIAS: tl.constexpr,
     WORK_STEALING: tl.constexpr,
+    NUM_XCDS: tl.constexpr,
 ):
     tl.assume(M > 0)
     tl.assume(K > 0)
@@ -446,6 +452,7 @@ def gmm_kernel(
             GROUP_SIZE=GROUP_SIZE,
             USE_BIAS=USE_BIAS,
             INT_TYPE=INT_TYPE,
+            NUM_XCDS=NUM_XCDS,
         )
     else:
         _gmm(
@@ -471,6 +478,7 @@ def gmm_kernel(
             GRID_DIM=GRID_DIM,
             USE_BIAS=USE_BIAS,
             INT_TYPE=INT_TYPE,
+            NUM_XCDS=NUM_XCDS,
         )
 
 
@@ -500,6 +508,7 @@ def tgmm_persistent_kernel(
     GRID_DIM: tl.constexpr,
     COMPUTE_BIAS_GRAD: tl.constexpr,
     ACCUMULATE: tl.constexpr,
+    NUM_XCDS: tl.constexpr,
 ):
     tl.assume(M > 0)
     tl.assume(K > 0)
@@ -545,7 +554,11 @@ def tgmm_persistent_kernel(
             tl.device_assert(tile_in_mm >= 0, "tile_in_mm < 0")
 
             tile_k, tile_n = _remap_xcd_tile_grid(
-                tile_in_mm, num_k_tiles, num_n_tiles, GROUP_SIZE=GROUP_SIZE
+                tile_in_mm,
+                num_k_tiles,
+                num_n_tiles,
+                GROUP_SIZE=GROUP_SIZE,
+                NUM_XCDS=NUM_XCDS,
             )
 
             # Do regular MM:
@@ -690,6 +703,7 @@ def tgmm_non_persistent_kernel(
     GROUP_SIZE: tl.constexpr,
     COMPUTE_BIAS_GRAD: tl.constexpr,
     ACCUMULATE: tl.constexpr,
+    NUM_XCDS: tl.constexpr,
 ):
     tl.assume(M > 0)
     tl.assume(K > 0)
@@ -727,7 +741,7 @@ def tgmm_non_persistent_kernel(
     tl.device_assert(tile_in_mm >= 0, "tile_in_mm < 0")
 
     tile_k, tile_n = _remap_xcd_tile_grid(
-        tile_in_mm, num_k_tiles, num_n_tiles, GROUP_SIZE=GROUP_SIZE
+        tile_in_mm, num_k_tiles, num_n_tiles, GROUP_SIZE=GROUP_SIZE, NUM_XCDS=NUM_XCDS
     )
 
     tl.device_assert(tile_k * BLOCK_SIZE_K >= 0, "tile_k * BLOCK_SIZE_K < 0")

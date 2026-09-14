@@ -22,6 +22,7 @@ from aiter.ops.triton._triton_kernels.gmm import (
     tgmm_non_persistent_kernel,
     tgmm_persistent_kernel,
 )
+from aiter.ops.triton.utils.device_info import get_num_sms, get_num_xcds
 
 # AITER: GMM utility functions
 from aiter.ops.triton.utils.gmm_common import (
@@ -56,6 +57,24 @@ def _get_gmm_tile_counter(device: torch.device, grid_dim: int) -> Tensor:
         _GMM_TILE_COUNTER_CACHE[(device, stream)] = tile_counter
     tile_counter.fill_(grid_dim)
     return tile_counter
+
+
+def _cap_grid_dim_to_device(config: dict) -> dict:
+    """Clamp a tuned GRID_DIM to the CU count of the running device.
+
+    GRID_DIM is a persistent grid, and each arch's config carries that arch's
+    largest SKU. A smaller SKU of the same arch would launch CTAs it has no
+    cores for and start the work-stealing counter above its own parallelism.
+
+    Only applied to a config the caller did not override, so an explicit
+    grid_dim= stays exactly what was asked for.
+    """
+    num_cus = get_num_sms()
+    if num_cus <= 0 or config["GRID_DIM"] <= num_cus:
+        return config
+    config = dict(config)
+    config["GRID_DIM"] = num_cus
+    return config
 
 
 def _gmm_grid(
@@ -245,6 +264,8 @@ def gmm(
         # the override into subsequent calls.
         config = dict(config)
         config["GRID_DIM"] = grid_dim
+    else:
+        config = _cap_grid_dim_to_device(config)
 
     grid = _gmm_grid(
         N,
@@ -269,6 +290,7 @@ def gmm(
         USE_BIAS=use_bias,
         WORK_STEALING=work_stealing,
         **config,
+        NUM_XCDS=get_num_xcds(),
     )
     # fmt: on
 
@@ -455,6 +477,8 @@ def ptgmm(
         # the override into subsequent calls.
         config = dict(config)
         config["GRID_DIM"] = grid_dim
+    else:
+        config = _cap_grid_dim_to_device(config)
 
     # Bias gradient handling.
     # -----------------------
@@ -487,6 +511,7 @@ def ptgmm(
         COMPUTE_BIAS_GRAD=compute_bias_grad,
         ACCUMULATE=accumulate,
         **config,
+        NUM_XCDS=get_num_xcds(),
     )
     # fmt: on
 
@@ -682,6 +707,7 @@ def nptgmm(
         COMPUTE_BIAS_GRAD=compute_bias_grad,
         ACCUMULATE=accumulate,
         **config,
+        NUM_XCDS=get_num_xcds(),
     )
     # fmt: on
 
