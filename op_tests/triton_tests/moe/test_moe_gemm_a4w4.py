@@ -226,6 +226,8 @@ class Case:
             Case(16, 1024, 1024, 128, 4, preshuffle_weights=True),
             Case(1024, 7168, 2048, 256, 8, hbm_swizzling=True, preshuffle_weights=True),
             Case(256, 1024, 1024, 8, 4, preshuffle_weights=True),
+            Case(16, 1536, 7168, 256, 8, hbm_swizzling=True, preshuffle_weights=True),
+            Case(16, 7168, 768, 256, 8, hbm_swizzling=True, preshuffle_weights=True),
         ]
     ],
 )
