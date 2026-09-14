@@ -265,6 +265,48 @@ float fmha_fwd_v3(mha_fwd_args a, const ck_tile::stream_config& s)
         bdx = 256;
     auto [gdx, gdy, gdz] = get_grid_dim(a, cfg.ts_qo, arch_id);
 
+    int tg_div_dbg = (a.mask_type != 0) ? 2 : 1;
+    if(arch_id == "gfx942" && a.is_group_mode && a.hdim_q == 192 && a.hdim_v == 128)
+        tg_div_dbg = 1;
+
+    printf("[DBG fmha_fwd_v3] arch=%s dtype=%s mask=%d cfg_mask=%d is_group=%d\n"
+           "  grid=(%d,%d,%d) bdx=%d ts_qo=%d tg_div=%d\n"
+           "  seqlen_q=%d seqlen_k=%d max_seqlen_q=%d batch=%d nhead_q=%d nhead_k=%d hdim_q=%d hdim_v=%d\n"
+           "  args.s_seq_len=%u args.s_kv_seq_len=%u args.s_opt=%u args.s_lse=%u args.s_gqa=%u\n"
+           "  args.s_Seqs=%u args.s_Ts=%u args.s_Hs=%u args.s_Bs=%u\n"
+           "  args.s_k_Seqs=%u args.s_k_Hs=%u args.s_k_Bs=%u\n"
+           "  args.s_v_Seqs=%u args.s_v_Hs=%u args.s_v_Bs=%u\n"
+           "  args.s_o_Seqs=%u args.s_o_Hs=%u args.s_o_Bs=%u\n"
+           "  args.s_lse_Hs=%u args.s_qk_head_dim=%u args.s_v_head_dim=%u args.s_q_head_num=%u\n"
+           "  ptr_q=%p ptr_k=%p ptr_v=%p ptr_o=%p ptr_lse=%p\n"
+           "  ptr_qseq=%p ptr_kseq=%p ptr_qseq_padding=%p ptr_kseq_padding=%p\n"
+           "  window_size_left=%d window_size_right=%d scale_s=%f\n"
+           "  a.stride_q=%d a.nhead_stride_q=%d a.batch_stride_q=%d\n"
+           "  a.stride_k=%d a.nhead_stride_k=%d a.batch_stride_k=%d\n"
+           "  a.stride_v=%d a.nhead_stride_v=%d a.batch_stride_v=%d\n"
+           "  a.stride_o=%d a.nhead_stride_o=%d a.batch_stride_o=%d\n"
+           "  a.nhead_stride_lse=%d\n"
+           "  co=%s knl=%s\n",
+           arch_id.c_str(), a.data_type.c_str(), a.mask_type, cfg_mask_type, a.is_group_mode ? 1 : 0,
+           gdx, gdy, gdz, bdx, cfg.ts_qo, tg_div_dbg,
+           a.seqlen_q, a.seqlen_k, a.max_seqlen_q, a.batch, a.nhead_q, a.nhead_k, a.hdim_q, a.hdim_v,
+           args.s_seq_len, args.s_kv_seq_len, args.s_opt, args.s_lse, args.s_gqa,
+           args.s_Seqs, args.s_Ts, args.s_Hs, args.s_Bs,
+           args.s_k_Seqs, args.s_k_Hs, args.s_k_Bs,
+           args.s_v_Seqs, args.s_v_Hs, args.s_v_Bs,
+           args.s_o_Seqs, args.s_o_Hs, args.s_o_Bs,
+           args.s_lse_Hs, args.s_qk_head_dim, args.s_v_head_dim, args.s_q_head_num,
+           args.ptr_q, args.ptr_k, args.ptr_v, args.ptr_o, args.ptr_lse,
+           args.ptr_qseq, args.ptr_kseq, args.ptr_qseq_padding, args.ptr_kseq_padding,
+           a.window_size_left, a.window_size_right, a.scale_s,
+           a.stride_q, a.nhead_stride_q, a.batch_stride_q,
+           a.stride_k, a.nhead_stride_k, a.batch_stride_k,
+           a.stride_v, a.nhead_stride_v, a.batch_stride_v,
+           a.stride_o, a.nhead_stride_o, a.batch_stride_o,
+           a.nhead_stride_lse,
+           co_name.c_str(), name);
+    fflush(stdout);
+
     return ck_tile::launch_kernel(s, [=](const ck_tile::stream_config& s_) mutable {
         // Explicit assignment forces evaluation order and prevents compiler from
         // reordering operations that could lead to accessing uninitialized args
