@@ -95,6 +95,7 @@ __all__ = [
     "compute_varqlen_windows",
     "flydsl_flash_attn_fp8_func",
     "flydsl_flash_attn_func",
+    "flydsl_flash_attn_paged_fp8_func",
     "flydsl_fp8_mqa_logits",
     "flydsl_hgemm",
     "flydsl_hstu_attention_fwd",

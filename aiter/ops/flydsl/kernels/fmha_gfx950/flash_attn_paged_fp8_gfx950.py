@@ -652,6 +652,15 @@ def build_flash_attn_paged_fp8_module(
             )
         if has_last_page_lens and kv_last_page_lens is None:
             raise ValueError("paged FP8 CSR launch requires kv_last_page_lens")
+        for metadata in (cu_seqlens_q, kv_metadata, block_table, kv_last_page_lens):
+            if (
+                metadata is not None
+                and metadata.numel() * metadata.element_size()
+                > PAGED_FP8_BUFFER_LIMIT_BYTES
+            ):
+                raise ValueError(
+                    "paged FP8 metadata exceeds the signed-int32 byte limit"
+                )
         # stride_kv_n is accepted for compatibility; native cache layouts fix it.
         if stride_q_n is None:
             stride_q_n = DEFAULT_STRIDE_Q_N
