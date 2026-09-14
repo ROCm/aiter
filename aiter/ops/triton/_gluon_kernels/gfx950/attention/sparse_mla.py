@@ -298,7 +298,6 @@ class Cfg:
         IDX_CACHE="",
         ASYNC_LDS=False,
         RELAXED_LOAD=True,
-        ROPE_VEC=16,
         PAD_INTERVAL=1024,
     ):
         self.BLOCK_M = gl.constexpr(BLOCK_M)
@@ -322,6 +321,7 @@ class Cfg:
         self.IDX_CACHE = gl.constexpr(IDX_CACHE)
         self.ASYNC_LDS = gl.constexpr(ASYNC_LDS)
         self.RELAXED_LOAD = gl.constexpr(RELAXED_LOAD)
+        ROPE_VEC = 16
         self.ROPE_VEC = gl.constexpr(ROPE_VEC)
         MFMA_K = 32 if FP8_MFMA else 16
         self.MFMA_K = gl.constexpr(MFMA_K)
@@ -1764,7 +1764,6 @@ def _sparse_mla(
     IDX_CACHE: gl.constexpr = _NO_CACHE,
     ASYNC_LDS: gl.constexpr = False,
     RELAXED_LOAD: gl.constexpr = True,
-    ROPE_VEC: gl.constexpr = 16,
     PAD_INTERVAL: gl.constexpr = 1024,
 ):
     """One program = (query, split, head-block). Two-loop: main (SWA) then
@@ -1852,7 +1851,6 @@ def _sparse_mla(
         IDX_CACHE,
         ASYNC_LDS,
         RELAXED_LOAD,
-        ROPE_VEC,
         PAD_INTERVAL,
     )
     main_fmt = Fmt(

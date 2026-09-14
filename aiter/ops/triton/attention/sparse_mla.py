@@ -656,7 +656,6 @@ def sparse_mla_fwd(
         HAS_INVALID=has_invalid,
         FP8_MFMA=fp8_dots,
         ASYNC_LDS=async_lds_on,
-        ROPE_VEC=16,  # bytes/lane in the rope copy
         GATHER_CACHE="",
         q_scl_ptr=q_scale,
         Q_FP8=q_is_fp8,
