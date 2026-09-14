@@ -1,0 +1,17 @@
+gfx,cu_num,M,N,K,libtype,kernelId,splitK,us,kernelName,tflops,bw,errRatio
+gfx950,128,1,2048,2048,asm,0,1,8.6331,_ZN5aiter42fp8gemm_bf16_blockscale_BpreShuffle_32x128E,0.97,486.55,0.0
+gfx950,128,4,2048,2048,asm,0,1,8.7098,_ZN5aiter42fp8gemm_bf16_blockscale_BpreShuffle_32x128E,3.85,484.38,0.0
+gfx950,128,32,2048,2048,asm,0,1,9.4974,_ZN5aiter42fp8gemm_bf16_blockscale_BpreShuffle_32x128E,28.26,462.33,0.0
+gfx950,128,128,2048,2048,asm,0,1,9.5945,_ZN5aiter42fp8gemm_bf16_blockscale_BpreShuffle_32x128E,111.91,519.12,0.0
+gfx950,128,4,3072,6144,asm,0,1,20.6972,_ZN5aiter42fp8gemm_bf16_blockscale_BpreShuffle_32x128E,7.3,914.3,0.0
+gfx950,128,128,3072,6144,asm,0,1,22.4126,_ZN5aiter42fp8gemm_bf16_blockscale_BpreShuffle_32x128E,215.59,912.31,0.0
+gfx950,128,1,4096,2048,asm,0,1,8.5,_ZN5aiter42fp8gemm_bf16_blockscale_BpreShuffle_32x128E,1.97,988.1,0.0
+gfx950,128,4,4096,2048,asm,0,1,8.5865,_ZN5aiter42fp8gemm_bf16_blockscale_BpreShuffle_32x128E,7.82,981.72,0.0
+gfx950,128,32,4096,2048,asm,0,1,9.329,_ZN5aiter42fp8gemm_bf16_blockscale_BpreShuffle_32x128E,57.55,934.32,0.0
+gfx950,128,128,4096,2048,asm,0,1,9.7925,_ZN5aiter42fp8gemm_bf16_blockscale_BpreShuffle_32x128E,219.3,990.49,0.0
+gfx950,128,1,6144,2048,asm,0,1,9.0271,_ZN5aiter42fp8gemm_bf16_blockscale_BpreShuffle_32x128E,2.79,1395.49,0.0
+gfx950,128,4,6144,1536,asm,0,1,7.5385,_ZN5aiter42fp8gemm_bf16_blockscale_BpreShuffle_32x128E,10.01,1259.2,0.0
+gfx950,128,4,6144,2048,asm,0,1,9.1911,_ZN5aiter42fp8gemm_bf16_blockscale_BpreShuffle_32x128E,10.95,1375.27,0.0
+gfx950,128,32,6144,2048,asm,0,1,10.0694,_ZN5aiter42fp8gemm_bf16_blockscale_BpreShuffle_32x128E,79.98,1295.18,0.0
+gfx950,128,128,6144,1536,asm,2,1,10.123,_ZN5aiter42fp8gemm_bf16_blockscale_BpreShuffle_64x128E,238.66,1107.05,0.0
+gfx950,128,128,6144,2048,asm,2,1,11.8489,_ZN5aiter42fp8gemm_bf16_blockscale_BpreShuffle_64x128E,271.86,1216.82,0.0
