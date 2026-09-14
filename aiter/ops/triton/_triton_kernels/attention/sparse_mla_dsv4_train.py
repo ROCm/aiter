@@ -12,39 +12,7 @@ import triton.language as tl
 
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
 
-# =====================================================================
-# Forward — autotune configs
-# =====================================================================
-
-
-def _fwd_configs():
-    configs = []
-    for BLOCK_H in [16, 32, 64]:
-        for BLOCK_K in [16, 32]:
-            for num_stages in [1, 2, 3, 4]:
-                configs.append(
-                    triton.Config(
-                        {"BLOCK_H": BLOCK_H, "BLOCK_K": BLOCK_K},
-                        num_warps=4,
-                        num_stages=num_stages,
-                    )
-                )
-    return configs
-
-
-def _fwd_prune(configs, named_args, **kwargs):
-    D = named_args["head_dim"]
-    BLOCK_D = kwargs.get("BLOCK_D", D)
-    BLOCK_D = max(BLOCK_D, D)
-    pruned = []
-    for c in configs:
-        bk = c.kwargs["BLOCK_K"]
-        ns = c.num_stages
-        lds = BLOCK_D * bk * 2 * ns
-        if lds <= 65536:
-            pruned.append(c)
-    return pruned
-
+_FWD_FALLBACK = triton.Config({"BLOCK_H": 32, "BLOCK_K": 32}, num_warps=4, num_stages=2)
 
 # =====================================================================
 # Forward kernel — sparse MLA with LSE output
@@ -57,11 +25,6 @@ _sparse_mla_fwd_kernel_repr = make_kernel_repr(
 )
 
 
-@triton.autotune(
-    configs=_fwd_configs(),
-    key=["num_heads", "topk", "head_dim"],
-    prune_configs_by={"early_config_prune": _fwd_prune},
-)
 @triton.jit(repr=_sparse_mla_fwd_kernel_repr)
 def _sparse_mla_fwd_kernel(
     q_ptr,
