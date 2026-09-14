@@ -766,10 +766,11 @@ def chunk_gated_delta_rule_fwd_h_flydsl_opt(
     else:
         _total_chunks, _max_seq_chunks = B * NT, NT
 
-    # Experimental context-parallel K5. Measurements cover 8k/16k/32k token
-    # budgets and packed N=1..16 batches. N<=2 benefits from 8k total tokens;
-    # N==3 crosses over only for a full 32k pack with a >=16k sequence.
-    use_segment_scan = os.getenv("AITER_GDN_K5_SEGMENT_SCAN", "0").lower() in (
+    # Context-parallel K5. On by default; shape gates keep FlyDSL for the
+    # packed batches that lost in measurement. N<=2 wins from ~8k tokens;
+    # N==3 only for a full 32k pack with a >=16k sequence. Disable with
+    # AITER_GDN_K5_SEGMENT_SCAN=0.
+    use_segment_scan = os.getenv("AITER_GDN_K5_SEGMENT_SCAN", "1").lower() in (
         "1",
         "true",
         "yes",

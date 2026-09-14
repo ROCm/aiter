@@ -132,7 +132,11 @@ def test_wrapper_dispatches_n1_and_skips_n4(monkeypatch):
     torch.testing.assert_close(first[0], second[0], atol=0.0, rtol=0.0)
     torch.testing.assert_close(first[1], second[1], atol=0.0, rtol=0.0)
 
-    monkeypatch.setenv("AITER_GDN_K5_SEGMENT_SCAN", "1")
+    monkeypatch.delenv("AITER_GDN_K5_SEGMENT_SCAN", raising=False)
+    gated = _stock(k, w, u, g, cu, metadata, pool, indices)
+    assert calls == []
+    torch.testing.assert_close(gated[0], first[0], atol=0.0, rtol=0.0)
+
     monkeypatch.setenv("AITER_GDN_K5_SEGMENT_MIN_TOTAL_CHUNKS", "8")
     monkeypatch.setenv("AITER_GDN_K5_SEGMENT_CHUNKS", "4")
     dispatched = _stock(k, w, u, g, cu, metadata, pool, indices)
