@@ -140,18 +140,16 @@ def _cpp_name_suffix(name: str) -> str:
 # gfx950 ships at 256 CUs with eight dies and at 128 with four. The stage-2
 # swizzle is baked per instance, so a build is only correct on the part it
 # targets.
-_GFX950_NUM_XCD_BY_CU = {256: 8, 128: 4}
-_DEFAULT_NUM_XCD = 8
-
-
 def build_num_xcd() -> int:
     """Die count of the part these instances are built for."""
     try:
-        from aiter.jit.utils.chip_info import get_cu_num
+        from aiter.jit.utils.build_targets import target_num_xcds
 
-        return _GFX950_NUM_XCD_BY_CU.get(int(get_cu_num()), _DEFAULT_NUM_XCD)
+        return target_num_xcds("gfx950")
     except Exception:  # noqa: BLE001
-        return _DEFAULT_NUM_XCD
+        from aiter.jit.utils.build_targets import DEFAULT_NUM_XCDS
+
+        return DEFAULT_NUM_XCDS
 
 
 def _stage2_a8w4_traits_alias(kid: int) -> str:
