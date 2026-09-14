@@ -101,7 +101,7 @@ def _bq_view(arg_bq_addr, row_elems, KH4, k_tiles, k_halves, pair):
 
 
 @flyc.jit
-def launch_gemm(
+def _launch_gemm_impl(
     arg_c: fx.Pointer,
     arg_a: fx.Pointer,
     arg_b: fx.Pointer,
@@ -245,8 +245,7 @@ def launch_gemm(
     if splitk_fused:
         _kname += "_fused_reduce"
 
-    @flyc.kernel(name=_kname)
-    def kernel_gemm(
+    def _kernel_body(
         arg_c: fx.Int64,
         arg_a: fx.Int64,
         arg_b: fx.Int64,
@@ -896,6 +895,60 @@ def launch_gemm(
                     )
                     fx.ptr_store(fx.Int32(0), sem_ptr)
 
+    # Keep the established kernel ABI for every non-fused configuration.  The
+    # fused M=1 specialization needs two extra pointers, but carrying those
+    # unused kernargs on all prefill/decode kernels can perturb kernarg preload
+    # and regress a few latency-sensitive existing configurations.
+    if const_expr(splitk_fused):
+
+        @flyc.kernel(name=_kname)
+        def kernel_gemm(
+            arg_c: fx.Int64,
+            arg_a: fx.Int64,
+            arg_b: fx.Int64,
+            arg_scale_a: fx.Int64,
+            arg_scale_b: fx.Int64,
+            arg_out: fx.Int64,
+            arg_semaphore: fx.Int64,
+            i32_m: fx.Int32,
+            i32_n: fx.Int32,
+        ):
+            _kernel_body(
+                arg_c,
+                arg_a,
+                arg_b,
+                arg_scale_a,
+                arg_scale_b,
+                arg_out,
+                arg_semaphore,
+                i32_m,
+                i32_n,
+            )
+
+    else:
+
+        @flyc.kernel(name=_kname)
+        def kernel_gemm(
+            arg_c: fx.Int64,
+            arg_a: fx.Int64,
+            arg_b: fx.Int64,
+            arg_scale_a: fx.Int64,
+            arg_scale_b: fx.Int64,
+            i32_m: fx.Int32,
+            i32_n: fx.Int32,
+        ):
+            _kernel_body(
+                arg_c,
+                arg_a,
+                arg_b,
+                arg_scale_a,
+                arg_scale_b,
+                arg_c,
+                arg_c,
+                i32_m,
+                i32_n,
+            )
+
     c_addr = fx.Int64(fx.ptrtoint(arg_c))
     a_addr = fx.Int64(fx.ptrtoint(arg_a))
     b_addr = fx.Int64(fx.ptrtoint(arg_b))
@@ -910,18 +963,160 @@ def launch_gemm(
     gx = (i32_m + (BM - 1)) // BM
     gy = i32_n // BN
     gz = batch * k_batch  # split-K: k_batch splits per (real) batch on grid.z
-    kernel_gemm(
-        c_addr,
-        a_addr,
-        b_addr,
-        sa_addr,
-        sb_addr,
-        out_addr,
-        semaphore_addr,
+    if const_expr(splitk_fused):
+        kernel_gemm(
+            c_addr,
+            a_addr,
+            b_addr,
+            sa_addr,
+            sb_addr,
+            out_addr,
+            semaphore_addr,
+            i32_m,
+            i32_n,
+            value_attrs={"rocdl.waves_per_eu": wpe},
+        ).launch(grid=(gx, gy, gz), block=(num_threads, 1, 1), stream=stream)
+    else:
+        kernel_gemm(
+            c_addr,
+            a_addr,
+            b_addr,
+            sa_addr,
+            sb_addr,
+            i32_m,
+            i32_n,
+            value_attrs={"rocdl.waves_per_eu": wpe},
+        ).launch(grid=(gx, gy, gz), block=(num_threads, 1, 1), stream=stream)
+
+
+@flyc.jit
+def launch_gemm(
+    arg_c: fx.Pointer,
+    arg_a: fx.Pointer,
+    arg_b: fx.Pointer,
+    arg_scale_a: fx.Pointer,
+    arg_scale_b: fx.Pointer,
+    i32_m: fx.Int32,
+    i32_n: fx.Int32,
+    stream: fx.Stream,
+    N: Constexpr[int],
+    K: Constexpr[int],
+    tile_m: Constexpr[int],
+    tile_n: Constexpr[int],
+    tile_k: Constexpr[int],
+    a_dtype: Constexpr[str],
+    out_dtype: Constexpr[str],
+    b_dtype: Constexpr[str],
+    batch: Constexpr[int],
+    a_row_stride: Constexpr[int],
+    a_batch_stride: Constexpr[int],
+    sca_row_stride: Constexpr[int],
+    sca_batch_stride: Constexpr[int],
+    c_row_stride: Constexpr[int],
+    c_batch_stride: Constexpr[int],
+    waves_per_eu: Constexpr[int],
+    xcd_swizzle: Constexpr[int],
+    k_batch: Constexpr[int] = 1,
+    blockscale: Constexpr[str] = "none",
+):
+    """Launch the established non-fused GEMM ABI used by existing configs."""
+    _launch_gemm_impl(
+        arg_c,
+        arg_a,
+        arg_b,
+        arg_scale_a,
+        arg_scale_b,
+        arg_c,
+        arg_c,
         i32_m,
         i32_n,
-        value_attrs={"rocdl.waves_per_eu": wpe},
-    ).launch(grid=(gx, gy, gz), block=(num_threads, 1, 1), stream=stream)
+        stream,
+        N,
+        K,
+        tile_m,
+        tile_n,
+        tile_k,
+        a_dtype,
+        out_dtype,
+        b_dtype,
+        batch,
+        a_row_stride,
+        a_batch_stride,
+        sca_row_stride,
+        sca_batch_stride,
+        c_row_stride,
+        c_batch_stride,
+        waves_per_eu,
+        xcd_swizzle,
+        k_batch,
+        blockscale,
+    )
+
+
+@flyc.jit
+def launch_gemm_fused(
+    arg_c: fx.Pointer,
+    arg_a: fx.Pointer,
+    arg_b: fx.Pointer,
+    arg_scale_a: fx.Pointer,
+    arg_scale_b: fx.Pointer,
+    arg_out: fx.Pointer,
+    arg_semaphore: fx.Pointer,
+    i32_m: fx.Int32,
+    i32_n: fx.Int32,
+    stream: fx.Stream,
+    N: Constexpr[int],
+    K: Constexpr[int],
+    tile_m: Constexpr[int],
+    tile_n: Constexpr[int],
+    tile_k: Constexpr[int],
+    a_dtype: Constexpr[str],
+    out_dtype: Constexpr[str],
+    b_dtype: Constexpr[str],
+    batch: Constexpr[int],
+    a_row_stride: Constexpr[int],
+    a_batch_stride: Constexpr[int],
+    sca_row_stride: Constexpr[int],
+    sca_batch_stride: Constexpr[int],
+    c_row_stride: Constexpr[int],
+    c_batch_stride: Constexpr[int],
+    waves_per_eu: Constexpr[int],
+    xcd_swizzle: Constexpr[int],
+    k_batch: Constexpr[int] = 1,
+    blockscale: Constexpr[str] = "none",
+):
+    """Launch the M=1 split-K GEMM with its fused reduction arguments."""
+    _launch_gemm_impl(
+        arg_c,
+        arg_a,
+        arg_b,
+        arg_scale_a,
+        arg_scale_b,
+        arg_out,
+        arg_semaphore,
+        i32_m,
+        i32_n,
+        stream,
+        N,
+        K,
+        tile_m,
+        tile_n,
+        tile_k,
+        a_dtype,
+        out_dtype,
+        b_dtype,
+        batch,
+        a_row_stride,
+        a_batch_stride,
+        sca_row_stride,
+        sca_batch_stride,
+        c_row_stride,
+        c_batch_stride,
+        waves_per_eu,
+        xcd_swizzle,
+        k_batch,
+        blockscale,
+    )
 
 
 # ── split-K reduce ────────────────────────────────────────────────────────────

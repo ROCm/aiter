@@ -36,12 +36,13 @@ _OUT_DTYPE_STR = {torch.bfloat16: "bf16", torch.float16: "fp16"}
 
 
 @functools.cache
-def _gemm_exe(_cfg):
+def _gemm_exe(_cfg, fused):
     import flydsl.compiler as flyc
 
-    from .kernels.gemm.mxscale_preshuffle import launch_gemm
+    from .kernels.gemm.mxscale_preshuffle import launch_gemm, launch_gemm_fused
 
-    return flyc.jit(launch_gemm.func)
+    launcher = launch_gemm_fused if fused else launch_gemm
+    return flyc.jit(launcher.func)
 
 
 @functools.cache
@@ -204,18 +205,24 @@ def flydsl_mxscale_preshuffle_gemm(
         split_k,  # k_batch
         bs_mode,  # blockscale
     )
-    gemm_exe = _gemm_exe(cfg)
+    gemm_exe = _gemm_exe(cfg, splitk_fused)
+    # Build each runtime pointer wrapper once per op.  The fused ABI carries two
+    # additional pointer slots; re-wrapping Out (or the split workspace) for
+    # those aliases measurably increases launch gaps on very short decode GEMMs.
+    a_ptr = ptr_arg(A)
+    b_ptr = ptr_arg(B)
+    a_scale_ptr = ptr_arg(a_scale)
+    b_scale_ptr = ptr_arg(b_scale)
+    out_ptr = ptr_arg(Out)
 
     if split_k == 1:
         _run_compiled(
             gemm_exe,
-            ptr_arg(Out),
-            ptr_arg(A),
-            ptr_arg(B),
-            ptr_arg(a_scale),
-            ptr_arg(b_scale),
-            ptr_arg(Out),  # unused fused-reduce output argument
-            ptr_arg(Out),  # unused fused-reduce semaphore argument
+            out_ptr,
+            a_ptr,
+            b_ptr,
+            a_scale_ptr,
+            b_scale_ptr,
             M,
             N,
             st,
@@ -243,11 +250,11 @@ def flydsl_mxscale_preshuffle_gemm(
         _run_compiled(
             gemm_exe,
             ptr_arg(workspace),
-            ptr_arg(A),
-            ptr_arg(B),
-            ptr_arg(a_scale),
-            ptr_arg(b_scale),
-            ptr_arg(Out),
+            a_ptr,
+            b_ptr,
+            a_scale_ptr,
+            b_scale_ptr,
+            out_ptr,
             ptr_arg(semaphore),
             M,
             N,
@@ -258,15 +265,14 @@ def flydsl_mxscale_preshuffle_gemm(
 
     # split-K: GEMM -> fp32 partial slabs tmp[split_k, M, N] -> fused fp32 reduce -> Out.
     tmp = torch.empty((split_k, M, N), dtype=torch.float32, device=A.device)
+    tmp_ptr = ptr_arg(tmp)
     _run_compiled(
         gemm_exe,
-        ptr_arg(tmp),
-        ptr_arg(A),
-        ptr_arg(B),
-        ptr_arg(a_scale),
-        ptr_arg(b_scale),
-        ptr_arg(Out),  # unused by the regular split-K GEMM
-        ptr_arg(tmp),  # unused semaphore argument
+        tmp_ptr,
+        a_ptr,
+        b_ptr,
+        a_scale_ptr,
+        b_scale_ptr,
         M,
         N,
         st,
@@ -274,8 +280,8 @@ def flydsl_mxscale_preshuffle_gemm(
     )
     _run_compiled(
         _reduce_exe((split_k, out_dtype)),
-        ptr_arg(tmp),
-        ptr_arg(Out),
+        tmp_ptr,
+        out_ptr,
         (M * N) // 2,  # n_out_dw (2 out elems per dword)
         M * N,  # slab_stride_dw (fp32: 1 dword/elem)
         st,
