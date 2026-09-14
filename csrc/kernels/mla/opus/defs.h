@@ -9,7 +9,6 @@ using fp16_t = opus::dtypes::fp16;
 using fp8_t  = _BitInt(8);
 using bf8_t  = unsigned _BitInt(8);
 
-static constexpr int DSA_V32_NUM_CU         = 256;
 static constexpr int DSA_V32_FIXED_OVERHEAD = 5;
 
 struct alignas(16) DsaSchedMeta

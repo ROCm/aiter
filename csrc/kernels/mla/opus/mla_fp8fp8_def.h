@@ -7,8 +7,6 @@ using fp16_t = __fp16;
 using fp8_t  = _BitInt(8);
 using bf8_t  = unsigned _BitInt(8);
 
-static constexpr int NUM_CU = 256;
-
 struct mla_kargs
 {
     const void* __restrict__ q_buffer_ptr;
