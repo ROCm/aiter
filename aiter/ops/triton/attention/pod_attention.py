@@ -111,8 +111,9 @@ def pod_attention(
     qk_scale = sm_scale * 1.44269504
 
     # We assume the kernel functions fused by pod attention are persistent kernel functions
-    # For gfx942, we launch total 608 WGs. Each CU will get 2 WG --- one WG will be doing decode and one prefill
-    # For different decode:prefill ratios, assign (decode+prefill)*304 number of WGs
+    # Each CU gets 2 WGs -- one doing decode and one prefill -- so the caller passes
+    # 2x the CU count, and this halves it back to the per-CU slot count the kernel
+    # folds program ids by.
     total_wgs = total_programs // 2
 
     (
@@ -280,6 +281,7 @@ def pod_attention(
         prefill_ratio=prefill_ratio,
         decode_ratio=decode_ratio,
         max_output_tile_cnt=max_output_tile_cnt,
+        num_cus=total_wgs,
     )
     # torch.cuda.synchronize()
     print(
