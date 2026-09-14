@@ -161,10 +161,13 @@ def assert_close(ref, tri, maxtol=None, rmstol=None, description="--", verbose=T
 
     if verbose:
         logger.info(
-            f"{description} maximum relative error = {max_err} (threshold = {maxtol})"
+            "%s maximum relative error = %s (threshold = %s)",
+            description,
+            max_err,
+            maxtol,
         )
         logger.info(
-            f"{description} RMS relative error = {rms_err} (threshold = {rmstol})"
+            "%s RMS relative error = %s (threshold = %s)", description, rms_err, rmstol
         )
 
     if max_err > maxtol:
@@ -172,8 +175,11 @@ def assert_close(ref, tri, maxtol=None, rmstol=None, description="--", verbose=T
         num_nonzero = bad_idxs.size(0)
         bad_idxs = bad_idxs[:1000]
         logger.info(
-            f"{num_nonzero} / {rel_err.numel()} mismatched elements "
-            f"(shape = {tuple(rel_err.shape)}) at coords {bad_idxs.tolist()}"
+            "%s / %s mismatched elements (shape = %s) at coords %s",
+            num_nonzero,
+            rel_err.numel(),
+            tuple(rel_err.shape),
+            bad_idxs.tolist(),
         )
 
         bad_idxs = bad_idxs.unbind(-1)

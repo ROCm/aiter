@@ -360,8 +360,15 @@ def test_gather_kv_b_proj(
 
         logger.info(">>> Performance gather_kv_b_proj:")
         logger.info(
-            f">>>   batch {batch_size}, block_size {block_size}, tp_k_head_num {tp_k_head_num}, kv_c_dim {kv_c_dim}, qk_nope_head_dim {qk_nope_head_dim}, kv_length {avg_kv_length}\n"
-            f">>>       elapsed={elapsed_us:.2f}us, TFLOPS={tflops:.2f}"
+            ">>>   batch %s, block_size %s, tp_k_head_num %s, kv_c_dim %s, qk_nope_head_dim %s, kv_length %s\n>>>       elapsed=%.2fus, TFLOPS=%.2f",
+            batch_size,
+            block_size,
+            tp_k_head_num,
+            kv_c_dim,
+            qk_nope_head_dim,
+            avg_kv_length,
+            elapsed_us,
+            tflops,
         )
 
 
@@ -504,8 +511,15 @@ def test_gather_kv_b_proj_per_row_scale(
 
         logger.info(">>> Performance gather_kv_b_proj_per_row_scale:")
         logger.info(
-            f">>>   batch {batch_size}, block_size {block_size}, tp_k_head_num {tp_k_head_num}, kv_c_dim {kv_c_dim}, qk_nope_head_dim {qk_nope_head_dim}, kv_length {avg_kv_length}\n"
-            f">>>       elapsed={elapsed_us:.2f}us, TFLOPS={tflops:.2f}"
+            ">>>   batch %s, block_size %s, tp_k_head_num %s, kv_c_dim %s, qk_nope_head_dim %s, kv_length %s\n>>>       elapsed=%.2fus, TFLOPS=%.2f",
+            batch_size,
+            block_size,
+            tp_k_head_num,
+            kv_c_dim,
+            qk_nope_head_dim,
+            avg_kv_length,
+            elapsed_us,
+            tflops,
         )
 
 
@@ -661,10 +675,16 @@ def test_gather_kv_b_proj_bf16_weight(
 
         logger.info(">>> Performance gather_kv_b_proj_bf16_weight:")
         logger.info(
-            f">>>   batch {batch_size}, block_size {block_size}, tp_k_head_num {tp_k_head_num}, "
-            f"kv_c_dim {kv_c_dim}, qk_nope_head_dim {qk_nope_head_dim}, kv_length {avg_kv_length}, "
-            f"scale_mode {scale_mode}\n"
-            f">>>       elapsed={elapsed_us:.2f}us, TFLOPS={tflops:.2f}"
+            ">>>   batch %s, block_size %s, tp_k_head_num %s, kv_c_dim %s, qk_nope_head_dim %s, kv_length %s, scale_mode %s\n>>>       elapsed=%.2fus, TFLOPS=%.2f",
+            batch_size,
+            block_size,
+            tp_k_head_num,
+            kv_c_dim,
+            qk_nope_head_dim,
+            avg_kv_length,
+            scale_mode,
+            elapsed_us,
+            tflops,
         )
 
 
@@ -1165,10 +1185,14 @@ def test_gather_kv_b_proj_shuffled_kv(
             shuffled_kv_cache=True,
         )
         logger.info(
-            f">>> Performance gather_kv_b_proj_shuffled_kv ({scale_mode}):\n"
-            f">>>   batch {batch_size}, block_size {block_size}, tp_k_head_num {tp_k_head_num}, "
-            f"kv_length {avg_kv_length}, ktype {k_buffer_type}\n"
-            f">>>       elapsed={elapsed_us:.2f}us"
+            ">>> Performance gather_kv_b_proj_shuffled_kv (%s):\n>>>   batch %s, block_size %s, tp_k_head_num %s, kv_length %s, ktype %s\n>>>       elapsed=%.2fus",
+            scale_mode,
+            batch_size,
+            block_size,
+            tp_k_head_num,
+            avg_kv_length,
+            k_buffer_type,
+            elapsed_us,
         )
 
 
