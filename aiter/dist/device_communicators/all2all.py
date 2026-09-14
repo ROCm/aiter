@@ -1,4 +1,5 @@
 import importlib.util
+import os
 from functools import cache
 
 import torch
@@ -58,23 +59,39 @@ class MoriAll2AllManager(All2AllManagerBase):
         num_experts_per_token: int,
         gpu_per_node: int,
         quant_type: str = "none",
+        low_latency: bool = False,
     ):
         import mori  # type: ignore[import-not-found]
 
-        if not self.internode:
-            # single node
-            kernel_type = mori.ops.EpDispatchCombineKernelType.IntraNode
-            warp_num_per_block = 16
-            block_num = 80
-            rdma_block_num = 0
-        else:
+        # `low_latency` is the caller's ask; `self.internode` is measured from
+        # the process group, never inferred from world size -- 2 nodes x 4 GPUs
+        # would read as intra-node and pick kernels that assume P2P.
+        num_qp_per_pe = None
+        if low_latency:
+            if self.internode:
+                kernel_type = mori.ops.EpDispatchCombineKernelType.InterNodeV1LL
+            else:
+                # AsyncLL has no RDMA path.
+                kernel_type = mori.ops.EpDispatchCombineKernelType.AsyncLL
+            # Wide-EP reference values; overridable, neither has been swept.
+            warp_num_per_block = int(os.environ.get("MORI_EP_WARP_PER_BLOCK", "8"))
+            block_num = int(os.environ.get("MORI_EP_BLOCK_NUM", "96"))
+            rdma_block_num = int(os.environ.get("MORI_EP_RDMA_BLOCK_NUM", "64"))
+            num_qp_per_pe = 2
+        elif self.internode:
             # multi node
             kernel_type = mori.ops.EpDispatchCombineKernelType.InterNodeV1
             warp_num_per_block = 16
             block_num = 32
             rdma_block_num = 16
+        else:
+            # single node
+            kernel_type = mori.ops.EpDispatchCombineKernelType.IntraNode
+            warp_num_per_block = 16
+            block_num = 80
+            rdma_block_num = 0
 
-        return {
+        kwargs = {
             "rank": rank,
             "world_size": num_ep_ranks,
             "data_type": quant_dtype,
@@ -94,6 +111,11 @@ class MoriAll2AllManager(All2AllManagerBase):
             # "fp8_blockwise" picks the EpCombineIntraNodeKernel_*_fp8bwq_* kernels.
             "quant_type": quant_type,
         }
+        if num_qp_per_pe is not None:
+            # Omitted otherwise, so the other kernels keep the handle_cache key
+            # and MoRI config they have always had.
+            kwargs["num_qp_per_pe"] = num_qp_per_pe
+        return kwargs
 
     def _make_handle(self, **kwargs):
         import mori  # type: ignore[import-not-found]
@@ -102,15 +124,26 @@ class MoriAll2AllManager(All2AllManagerBase):
         handle = mori.ops.EpDispatchCombineOp(mori_config)
         return handle
 
-    def get_handle(self, kwargs):
-        import mori  # type: ignore[import-not-found]
+    def get_handle(self, kwargs, index: int = 0):
+        """Cached op for one config and ``index``. Always a single handle.
+
+        ``index=0`` (default) is the shared singleton used by layers with the
+        same kwargs. Distinct indexes are distinct ops: an op holds routing
+        state from dispatch to combine, so callers with several in flight at
+        once -- ATOM's TBO ubatches -- pass ``index=ubatch_id``. Indexes are
+        part of the cache key so every MoE layer reuses the same arenas.
+        """
+        if index < 0:
+            raise ValueError(f"index must be >= 0, got {index}")
 
         mori_kwargs = self._make_all2all_kwargs(**kwargs)
-        logger.debug("MoRI all2all args %s", mori_kwargs)
-        handle: mori.ops.EpDispatchCombineOp = self.handle_cache.get_or_create(
-            mori_kwargs, self._make_handle
+        logger.debug("MoRI all2all index=%d args %s", index, mori_kwargs)
+        # Cache hashes the dict it is given, then calls factory(**that dict).
+        # Keep index in the key only; the MoRI config must not see it.
+        return self.handle_cache.get_or_create(
+            {**mori_kwargs, "_handle_index": index},
+            lambda **_: self._make_handle(**mori_kwargs),
         )
-        return handle
 
 
 class FlyDSLAll2AllManager(All2AllManagerBase):
