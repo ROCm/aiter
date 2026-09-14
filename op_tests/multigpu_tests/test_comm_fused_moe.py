@@ -25,7 +25,7 @@ import argparse
 import itertools
 import os
 from collections.abc import Callable
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field
 
 import pandas as pd
 import torch
@@ -58,14 +58,10 @@ from aiter.jit.utils.chip_info import get_cu_num, get_gfx_runtime
 from aiter.ops.comm_fused_moe_runtime import CommFusedMoeRuntime
 from aiter.ops.flydsl.comm_fused_moe_host import (
     ShapeKey,
-    _LazyRunners,
     config_name,
     create_flydsl_comm_fused_runners,
     is_flydsl_comm_fused_moe_available,
     winners_for,
-)
-from aiter.ops.flydsl.kernels.comm_fused_moe.gfx950.a8w4.config import (
-    MegakernelConfig,
 )
 from aiter.ops.quant import (
     mxfp4_moe_sort_fwd,
@@ -157,7 +153,7 @@ class TestSession:
     device: torch.device
     group: object
     gfx: str
-    runners: dict
+    runners: dict | None
     weights: Stage2Weights
     graph_replays: int
     rs_runners: dict | None = None
@@ -540,9 +536,7 @@ def _stage2_fixture(session: TestSession, tokens: int, route: str) -> Stage2Fixt
         getattr(stage2_func, "__name__", "") == "_flydsl_v2_stage2_wrapper",
     )
     shared = (
-        _shared_partial(tokens, session.rank, session.device)
-        if ADD_SHARED
-        else None
+        _shared_partial(tokens, session.rank, session.device) if ADD_SHARED else None
     )
     reference = _torch_stage2_allreduce(case, session.weights, shared, session.group)
     fixture = Stage2Fixture(
@@ -654,11 +648,7 @@ def _full_moe_fixture(session: TestSession) -> FullMoeFixture:
     if session.full_fixture is not None:
         return session.full_fixture
     case = _make_full_moe_case(session.rank, session.device)
-    shared = (
-        _shared_partial(3, session.rank, session.device)
-        if ADD_SHARED
-        else None
-    )
+    shared = _shared_partial(3, session.rank, session.device) if ADD_SHARED else None
     reference = _torch_full_moe_allreduce(case, session.weights, shared, session.group)
     session.full_fixture = FullMoeFixture(
         case=case,
@@ -865,8 +855,11 @@ def _record_candidates(
 def _run_stage2_case(
     session: TestSession, tokens: int, route: str, mode: str
 ) -> dict[str, float | str]:
+    if session.runners is None:
+        raise RuntimeError("all-reduce runners are not configured")
     fixture = _stage2_fixture(session, tokens, route)
     runner = session.runners[tokens]
+
     def run_ordinary():
         return _run_ordinary_stage2(fixture, session.weights)
 
@@ -915,6 +908,8 @@ def _run_stage2_case(
 def _run_full_runtime_case(
     session: TestSession, tokens: int, route: str, mode: str
 ) -> dict[str, float | str]:
+    if session.runners is None:
+        raise RuntimeError("all-reduce runners are not configured")
     if tokens != 3 or route != "skew":
         raise ValueError("the runtime-padding case is fixed to M=3, route=skew")
     fixture = _full_moe_fixture(session)
@@ -1178,13 +1173,18 @@ def main() -> None:
             get_cu_num(),
             add_shared=ADD_SHARED,
         )
-        configs = winners_for(shape)
-        missing = sorted(set(requested_tokens).difference(configs))
-        if missing:
-            raise AssertionError(
-                f"production comm-fused rows are missing: {missing}; "
-                f"available={sorted(configs)}"
-            )
+        try:
+            configs = winners_for(shape)
+        except KeyError:
+            configs = None
+
+        if configs is not None:
+            missing = sorted(set(requested_tokens).difference(configs))
+            if missing:
+                raise AssertionError(
+                    f"production comm-fused rows are missing: {missing}; "
+                    f"available={sorted(configs)}"
+                )
         is_default_dsv4_shape = (
             MODEL_DIM,
             INTER_DIM,
@@ -1193,28 +1193,20 @@ def main() -> None:
             TP_SIZE,
             ADD_SHARED,
         ) == (7168, 384, 384, 6, 8, True)
-        if is_default_dsv4_shape and 32 in configs:
+        if is_default_dsv4_shape and configs is not None and 32 in configs:
             raise AssertionError("M=32 fallback unexpectedly created a fused runner")
 
         rs_runners = None
         if args.dp_reducescatter:
-            rs_configs = {}
-            for bucket in requested_tokens:
-                winner = configs[bucket]
-                if (
-                    isinstance(winner, MegakernelConfig)
-                    and winner.collective == "direct"
-                    and bucket % TP_SIZE == 0
-                ):
-                    rs_configs[bucket] = replace(winner, collective="rs")
-                elif rank == 0:
-                    aiter.logger.warning(
-                        "M=%d winner is %s; reduce-scatter case will be skipped",
-                        bucket,
-                        config_name(winner),
-                    )
-            if rs_configs:
-                rs_runners = _LazyRunners(get_tp_group(), rs_configs)
+            rs_runners = create_flydsl_comm_fused_runners(
+                tp_group=get_tp_group(),
+                model_dim=MODEL_DIM,
+                inter_dim=INTER_DIM,
+                experts=EXPERTS,
+                topk=TOPK,
+                comm="rs",
+                add_shared=ADD_SHARED,
+            )
 
         session = TestSession(
             rank=rank,
@@ -1222,12 +1214,17 @@ def main() -> None:
             device=device,
             group=group,
             gfx=shape.gfx,
-            runners=create_flydsl_comm_fused_runners(
-                tp_group=get_tp_group(),
-                model_dim=MODEL_DIM,
-                inter_dim=INTER_DIM,
-                experts=EXPERTS,
-                topk=TOPK,
+            runners=(
+                create_flydsl_comm_fused_runners(
+                    tp_group=get_tp_group(),
+                    model_dim=MODEL_DIM,
+                    inter_dim=INTER_DIM,
+                    experts=EXPERTS,
+                    topk=TOPK,
+                    add_shared=ADD_SHARED,
+                )
+                if configs is not None
+                else None
             ),
             weights=_make_stage2_weights(rank, device),
             graph_replays=args.graph_replays,
@@ -1236,12 +1233,13 @@ def main() -> None:
         _ACTIVE_SESSION = session
 
         stage2_rows = []
-        for tokens, route, mode in itertools.product(
-            requested_tokens, requested_routes, MODES
-        ):
-            row = test_comm_fused_stage2(tokens, route, mode)
-            if rank == 0:
-                stage2_rows.append(row)
+        if session.runners is not None:
+            for tokens, route, mode in itertools.product(
+                requested_tokens, requested_routes, MODES
+            ):
+                row = test_comm_fused_stage2(tokens, route, mode)
+                if rank == 0:
+                    stage2_rows.append(row)
 
         stage2_rs_rows = []
         if rs_runners is not None:
@@ -1256,7 +1254,7 @@ def main() -> None:
         # Without a shared add, the caller still has to apply any model-specific
         # post-processing and combine its separate shared branch. The generic
         # full-MoE runtime fixture models the add-shared contract only.
-        if ADD_SHARED:
+        if ADD_SHARED and session.runners is not None:
             for mode in MODES:
                 row = test_comm_fused_runtime(3, "skew", mode)
                 if rank == 0:

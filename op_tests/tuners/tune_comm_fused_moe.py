@@ -3,6 +3,7 @@
 
 import argparse
 import csv
+import json
 import os
 import statistics
 from dataclasses import MISSING, dataclass, fields
@@ -265,7 +266,7 @@ def _resolve_ordinary_stage2(args):
     return metadata, not stage2_uses_route_reduce(metadata.stage2)
 
 
-def _run_ordinary_stage2_allreduce(
+def _run_ordinary_stage2_local(
     case, metadata, *, requires_output_zero, shared_partial=None
 ):
     if requires_output_zero:
@@ -286,7 +287,31 @@ def _run_ordinary_stage2_allreduce(
     )
     if shared_partial is not None:
         case.partial_out.add_(shared_partial)
-    return get_tp_group().all_reduce(case.partial_out, ca_fp8_quant=False)
+    return case.partial_out
+
+
+def _run_ordinary_stage2_allreduce(
+    case, metadata, *, requires_output_zero, shared_partial=None
+):
+    partial = _run_ordinary_stage2_local(
+        case,
+        metadata,
+        requires_output_zero=requires_output_zero,
+        shared_partial=shared_partial,
+    )
+    return get_tp_group().all_reduce(partial, ca_fp8_quant=False)
+
+
+def _run_ordinary_stage2_reducescatter(
+    case, metadata, *, requires_output_zero, shared_partial=None
+):
+    partial = _run_ordinary_stage2_local(
+        case,
+        metadata,
+        requires_output_zero=requires_output_zero,
+        shared_partial=shared_partial,
+    )
+    return get_tp_group().reduce_scatter_tensor(partial)
 
 
 _BASE_KEY_FIELDS = (
@@ -305,13 +330,14 @@ _BASE_KEY_FIELDS = (
     "use_g1u1",
     "doweight_stage1",
 )
-_WINNER_KEY_FIELDS = (*_BASE_KEY_FIELDS, "comm_tp", "comm_add_shared")
-_COMM_FIELDS = (
+_WINNER_KEY_FIELDS = (
+    *_BASE_KEY_FIELDS,
     "comm_tp",
     "comm_add_shared",
-    "comm_kernel_name",
-    "comm_stage2_tp_us",
+    "comm_mode",
 )
+_COMM_MODES = ("ar", "rs")
+_COMM_CONFIGS_FIELD = "comm_fused_configs"
 PROFILE_FIELDS = (
     *_WINNER_KEY_FIELDS,
     "block_m",
@@ -413,9 +439,7 @@ def benchmark(
 
     runner = create_runner(tp_group, config)
     runner.output.fill_(float("nan"))
-    candidate_shared = (
-        shared_partial.clone() if shared_partial is not None else None
-    )
+    candidate_shared = shared_partial.clone() if shared_partial is not None else None
     prepare_shared_partial = getattr(runner, "prepare_shared_partial", None)
 
     def run():
@@ -586,7 +610,57 @@ def _winner_key(shape: ShapeKey, token: int) -> dict:
         "doweight_stage1": shape.doweight_stage1,
         "comm_add_shared": int(shape.add_shared),
         "comm_tp": shape.tp,
+        "comm_mode": shape.comm,
     }
+
+
+def _row_key(row: dict, field_names: tuple[str, ...]) -> tuple[str, ...]:
+    return tuple(str(row.get(field, "")) for field in field_names)
+
+
+def _check_matching_block_m(row: dict, winner: dict, base_key) -> None:
+    existing = row.get("block_m")
+    if existing not in (None, "") and int(existing) != int(winner["block_m"]):
+        raise ValueError(
+            f"comm_fused block_m={winner['block_m']} does not match "
+            f"ordinary block_m={existing} for {base_key}"
+        )
+
+
+def _comm_config(mode, tp, add_shared, kernel_name, latency):
+    if mode not in _COMM_MODES:
+        raise ValueError(f"unsupported comm mode {mode!r}")
+    config = {
+        "tp": int(tp),
+        "add_shared": bool(int(add_shared)),
+        "kernel": str(kernel_name),
+    }
+    if latency not in (None, ""):
+        config["us"] = float(latency)
+    return config
+
+
+def _comm_configs(row: dict) -> dict:
+    raw = row.get(_COMM_CONFIGS_FIELD)
+    if not raw:
+        return {}
+    configs = json.loads(raw)
+    if not isinstance(configs, dict):
+        raise TypeError(f"{_COMM_CONFIGS_FIELD} must be a JSON object")
+    unknown = set(configs).difference(_COMM_MODES)
+    if unknown:
+        raise ValueError(f"unsupported comm_fused modes: {sorted(unknown)}")
+    return configs
+
+
+def _find_output_row(rows: list[dict], base_key) -> dict:
+    matches = [row for row in rows if _row_key(row, _BASE_KEY_FIELDS) == base_key]
+    if len(matches) != 1:
+        raise ValueError(
+            f"expected exactly one ordinary tuned_fmoe row for {base_key}, "
+            f"found {len(matches)}"
+        )
+    return matches[0]
 
 
 def winner_row(shape: ShapeKey, result: TuningResult) -> dict:
@@ -622,42 +696,24 @@ def write_winner(path, row: dict) -> None:
             fieldnames = reader.fieldnames
     if fieldnames is None or "kernelName1" not in fieldnames:
         raise ValueError("comm-fused winners must be written to a tuned_fmoe CSV")
-    for field in _COMM_FIELDS:
-        if field not in fieldnames:
-            fieldnames.append(field)
-    base_key = tuple(str(row[field]) for field in _BASE_KEY_FIELDS)
-    matches = [
-        old
-        for old in rows
-        if tuple(str(old.get(field, "")) for field in _BASE_KEY_FIELDS) == base_key
-    ]
-    if len(matches) > 1:
-        raise ValueError(f"duplicate ordinary rows for comm_fused winner {base_key}")
-    if matches:
-        output_row = matches[0]
-        for field in ("comm_tp", "comm_add_shared"):
-            existing = output_row.get(field)
-            if existing not in (None, "") and str(existing) != str(row[field]):
-                raise ValueError(
-                    f"one ordinary row cannot store multiple {field} values for "
-                    f"{base_key}"
-                )
-        existing_block_m = output_row.get("block_m")
-        if existing_block_m not in (None, "") and int(existing_block_m) != int(
-            row["block_m"]
-        ):
-            raise ValueError(
-                f"comm_fused block_m={row['block_m']} does not match "
-                f"ordinary block_m={existing_block_m} for {base_key}"
-            )
-    else:
-        output_row = {field: "" for field in fieldnames}
-        output_row.update({field: row.get(field, "") for field in _BASE_KEY_FIELDS})
-        output_row["block_m"] = row["block_m"]
-        shared_tag = "shared" if row["comm_add_shared"] else "no_shared"
-        output_row["_tag"] = f"comm_fused_tp{row['comm_tp']}_{shared_tag}"
-        rows.append(output_row)
-    output_row.update({field: row.get(field, "") for field in _COMM_FIELDS})
+    if _COMM_CONFIGS_FIELD not in fieldnames:
+        fieldnames.append(_COMM_CONFIGS_FIELD)
+    base_key = _row_key(row, _BASE_KEY_FIELDS)
+    output_row = _find_output_row(rows, base_key)
+    if output_row.get("block_m") not in (None, ""):
+        _check_matching_block_m(output_row, row, base_key)
+    mode = row["comm_mode"]
+    configs = _comm_configs(output_row)
+    configs[mode] = _comm_config(
+        mode,
+        row["comm_tp"],
+        row["comm_add_shared"],
+        row["comm_kernel_name"],
+        row["comm_stage2_tp_us"],
+    )
+    output_row[_COMM_CONFIGS_FIELD] = json.dumps(
+        configs, separators=(",", ":"), sort_keys=True
+    )
     with path.open("w", newline="") as file:
         writer = csv.DictWriter(file, fieldnames=fieldnames, lineterminator="\n")
         writer.writeheader()
@@ -674,26 +730,25 @@ def remove_winner(path, shape: ShapeKey, token: int) -> None:
         fieldnames = reader.fieldnames
     if fieldnames is None or "kernelName1" not in fieldnames:
         raise ValueError("comm-fused winners must be written to a tuned_fmoe CSV")
+    if _COMM_CONFIGS_FIELD not in fieldnames:
+        return
     winner_key = _winner_key(shape, token)
-    key = tuple(str(winner_key[field]) for field in _WINNER_KEY_FIELDS)
-    retained = []
-    changed = False
-    for row in rows:
-        row_key = tuple(str(row.get(field, "")) for field in _WINNER_KEY_FIELDS)
-        if row_key != key:
-            retained.append(row)
-            continue
-        changed = True
-        if (row.get("_tag") or "").startswith("comm_fused"):
-            continue
-        for field in _COMM_FIELDS:
-            row[field] = ""
-        retained.append(row)
-    if changed:
+    base_key = _row_key(winner_key, _BASE_KEY_FIELDS)
+    matching = [row for row in rows if _row_key(row, _BASE_KEY_FIELDS) == base_key]
+    if matching:
+        output_row = _find_output_row(rows, base_key)
+        configs = _comm_configs(output_row)
+        if configs.pop(shape.comm, None) is None:
+            return
+        output_row[_COMM_CONFIGS_FIELD] = (
+            json.dumps(configs, separators=(",", ":"), sort_keys=True)
+            if configs
+            else ""
+        )
         with path.open("w", newline="") as file:
             writer = csv.DictWriter(file, fieldnames=fieldnames, lineterminator="\n")
             writer.writeheader()
-            writer.writerows(retained)
+            writer.writerows(rows)
 
 
 def _parse_args():
@@ -706,6 +761,12 @@ def _parse_args():
     parser.add_argument("--experts", type=int, default=384)
     parser.add_argument("--topk", type=int, default=6)
     parser.add_argument("--tp", type=int, default=8)
+    parser.add_argument(
+        "--comm-mode",
+        choices=("ar", "rs"),
+        default="ar",
+        help="Tune Stage2 + AllReduce or DPA Stage2 + ReduceScatter.",
+    )
     parser.add_argument(
         "--add-shared",
         type=int,
@@ -741,7 +802,7 @@ def _parse_args():
     parser.add_argument(
         "--ordinary-only",
         action="store_true",
-        help="Measure the ordinary Stage2 + TP AllReduce baseline and exit.",
+        help="Measure the matching ordinary Stage2 + TP collective and exit.",
     )
     parser.add_argument("--profile-output", type=Path)
     parser.add_argument("--winner-output", type=Path)
@@ -777,7 +838,12 @@ def main():
                 .view(1, -1)
                 + float(rank + 1) / 16.0
             ).to(torch.bfloat16)
-        reference = _run_ordinary_stage2_allreduce(
+        run_ordinary_collective = (
+            _run_ordinary_stage2_allreduce
+            if args.comm_mode == "ar"
+            else _run_ordinary_stage2_reducescatter
+        )
+        reference = run_ordinary_collective(
             case,
             metadata,
             requires_output_zero=requires_zero,
@@ -785,7 +851,7 @@ def main():
         ).clone()
 
         def run_ordinary():
-            return _run_ordinary_stage2_allreduce(
+            return run_ordinary_collective(
                 case,
                 metadata,
                 requires_output_zero=requires_zero,
@@ -817,6 +883,7 @@ def main():
             args.tp,
             get_cu_num(),
             add_shared=bool(args.add_shared),
+            comm=args.comm_mode,
         )
         current = production_config(shape, args.token, args.family)
         candidates = candidate_configs(
@@ -829,6 +896,7 @@ def main():
         if rank == 0:
             print(
                 f"COMM_FUSED_TUNE_START M={args.token} route={args.route} "
+                f"comm={args.comm_mode} "
                 f"family={args.family} candidates={len(candidates)}",
                 flush=True,
             )

@@ -2,6 +2,7 @@
 """Production host runtime for communication-fused FlyDSL MoE."""
 
 import csv
+import json
 import math
 import re
 from dataclasses import MISSING, dataclass, fields, replace
@@ -78,6 +79,7 @@ class ShapeKey:
 
 
 _CONFIG_NAME_PREFIX = "flydsl_comm_moe2_afp8_wfp4_bf16_"
+_COMM_MODES = ("ar", "rs")
 _RUNNER_CACHE = {}
 
 
@@ -293,35 +295,68 @@ def _select_row(key, rows):
     return min(measured, key=lambda item: item[0])[1]
 
 
+def _comm_configs(row):
+    raw = row.get("comm_fused_configs")
+    if not raw:
+        return {}
+    configs = json.loads(raw)
+    if not isinstance(configs, dict):
+        raise TypeError("comm_fused_configs must be a JSON object")
+    unknown = set(configs).difference(_COMM_MODES)
+    if unknown:
+        raise ValueError(f"unsupported comm_fused modes: {sorted(unknown)}")
+    return configs
+
+
 @cache
 def _winner_table() -> dict[ShapeKey, dict[int, PipelineConfig]]:
     candidates = {}
     config_path = Path(AITER_CONFIGS.AITER_CONFIG_FMOE_FILE)
     with config_path.open(newline="") as file:
         for row in csv.DictReader(file):
-            name = (row.get("comm_kernel_name") or "").strip()
-            if not name:
-                continue
-            shape = ShapeKey(
-                row["gfx"],
-                _int_value(row["model_dim"], "model_dim"),
-                _int_value(row["inter_dim"], "inter_dim"),
-                _int_value(row["expert"], "expert"),
-                _int_value(row["topk"], "topk"),
-                _int_value(row["comm_tp"], "comm_tp"),
-                _int_value(row["cu_num"], "cu_num"),
-                row["act_type"],
-                row["dtype"],
-                row["q_dtype_a"],
-                row["q_dtype_w"],
-                row["q_type"],
-                _int_value(row["use_g1u1"], "use_g1u1"),
-                _int_value(row["doweight_stage1"], "doweight_stage1"),
-                _optional_bool(row, "comm_add_shared", _ADD_SHARED),
-                (row.get("comm_mode") or "ar").strip() or "ar",
-            )
-            key = (shape, _int_value(row["token"], "token"))
-            candidates.setdefault(key, []).append(row)
+            for mode, entry in _comm_configs(row).items():
+                if not isinstance(entry, dict):
+                    raise TypeError(
+                        f"comm_fused_configs[{mode!r}] must be a JSON object"
+                    )
+                name = entry.get("kernel")
+                if not isinstance(name, str):
+                    raise TypeError(
+                        f"comm_fused_configs[{mode!r}].kernel must be a string"
+                    )
+                if not name.startswith(_CONFIG_NAME_PREFIX):
+                    raise ValueError(
+                        f"invalid comm_fused_configs[{mode!r}].kernel: {name!r}"
+                    )
+                normalized = dict(row)
+                normalized["comm_kernel_name"] = name
+                normalized["comm_stage2_tp_us"] = entry.get("us")
+                tp = _int_value(entry["tp"], f"comm_fused_configs.{mode}.tp")
+                add_shared = entry.get("add_shared")
+                if not isinstance(add_shared, bool):
+                    raise TypeError(
+                        f"comm_fused_configs[{mode!r}].add_shared must be boolean"
+                    )
+                shape = ShapeKey(
+                    row["gfx"],
+                    _int_value(row["model_dim"], "model_dim"),
+                    _int_value(row["inter_dim"], "inter_dim"),
+                    _int_value(row["expert"], "expert"),
+                    _int_value(row["topk"], "topk"),
+                    tp,
+                    _int_value(row["cu_num"], "cu_num"),
+                    row["act_type"],
+                    row["dtype"],
+                    row["q_dtype_a"],
+                    row["q_dtype_w"],
+                    row["q_type"],
+                    _int_value(row["use_g1u1"], "use_g1u1"),
+                    _int_value(row["doweight_stage1"], "doweight_stage1"),
+                    add_shared,
+                    mode,
+                )
+                key = (shape, _int_value(row["token"], "token"))
+                candidates.setdefault(key, []).append(normalized)
     table = {}
     for (shape, m), rows in candidates.items():
         row = _select_row((shape, m), rows)
@@ -932,6 +967,7 @@ def create_flydsl_comm_fused_runners(
     topk,
     act_type: str = _DEFAULT_ACT_TYPE,
     comm: str = "ar",
+    add_shared: bool | None = None,
 ):
     if comm not in ("ar", "rs"):
         raise ValueError(f"comm must be 'ar' or 'rs', got {comm!r}")
@@ -943,7 +979,7 @@ def create_flydsl_comm_fused_runners(
         topk,
         int(tp_group.world_size),
         act_type=act_type,
-        add_shared=None,
+        add_shared=add_shared,
         comm=comm,
     )
     configs = winners_for(shape)

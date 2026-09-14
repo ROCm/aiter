@@ -82,7 +82,7 @@ attention 也改为 TP（放弃 DPA），代价过大。结论：DPA 应使用�
 
 `aiter/ops/flydsl/kernels/comm_fused_moe/gfx950/a8w4/config.py`
 - `collective` 允许 `"rs"`；校验：`rs` 要求 `service_groups==1`（grouped 后续支持）、
-  `producer_mode` 不限（routes 优先）；`m % tp == 0` 与 vector 均分校验经由
+  `producer_mode="routes"`；`m % tp == 0` 与 vector 均分校验经由
   `uses_rsag` 自动生效。
 - `uses_rsag` 属性纳入 `"rs"`（复用 slotted partial、入口节流、`gather_done`
   区域分配）。
@@ -103,7 +103,8 @@ attention 也改为 TP（放弃 DPA），代价过大。结论：DPA 应使用�
 `aiter/ops/flydsl/comm_fused_moe_host.py`
 - kernel 名 tag：`"rs"` ↔ `collective="rs"` 双向（注意与数值 tag `rs<cache_modifier>`
   的解析顺序：精确匹配优先，无冲突）。
-- `ShapeKey.comm` 增加 `"rs"`；CSV `comm_mode` 列允许 `rs`（缺省 `ar` 不变）。
+- `ShapeKey.comm` 增加 `"rs"`；CSV 的同一 ordinary shape 行通过一个
+  `comm_fused_configs` JSON 字段同时保存 `ar` 与 `rs` 配置。
 - `create_flydsl_comm_fused_runners(comm="rs")`；runner 输出视图 `[m//tp, H]`。
 
 `aiter/ops/comm_fused_moe_runtime.py`
@@ -114,19 +115,20 @@ attention 也改为 TP（放弃 DPA），代价过大。结论：DPA 应使用�
 - `test_comm_fused_stage2_reducescatter`：全 rank 相同 token 输入（模拟 AG 后的
   复制布局），reference = 未融合 stage2 全量输出 → `dist.reduce_scatter_tensor`
   等效切片，逐 rank 比较自有 shard。
-- runtime RS case（含 M 非 TP 整数倍时的 padding 行为：padding 行不比较）。
+- M=8/16 的 eager/graph RS case 均覆盖 uniform/skew，并对 graph workspace 做
+  poisoned replay；DPA 的 runtime 接线由 ATOM 定向单测和整网 smoke 覆盖。
 - 性能：graph 模式下对比 unfused（stage2 + NCCL reduce_scatter）、`rs`、
   以及 AR 变体 `rsag`（数据记录用）。
 
 ### M3 tuner / CSV
-- tuner 增加 `--comm-mode rs`，`write_winner` 按 comm_mode 合并 winner 行。
+- tuner 增加 `--comm-mode rs`；`write_winner` 根据 mode 更新同一 ordinary 行的
+  `comm_fused_configs` 项，不再复制 ordinary 前缀生成并列行。
 
 ### M4 ATOM 集成
-- ATOM DSV4 DPA 路径当前为 `dp_gather_hidden_and_router`（AG）→ MoE →
-  reduce_scatter。接入点：MoE 权重 TP 组内以 `comm="rs"` 创建 fused runner，
-  替换 stage2 之后的独立 RS；`create_comm_fused_moe_backend` 的 `dp_size==1`
-  限制需按「MoE TP 组内 token 已复制」的条件解禁（与 AG 输入侧的
-  `custom_all_gather` 搭配）。
+- ATOM DSV4 DPA 路径在 `dp_gather_hidden_and_router`（AG）之后，以 DP collective
+  group 创建 `comm="rs", add_shared=False` 的 fused runner；它只替换 routed
+  GEMM2 和尾部独立 RS。GEMM1、ordinary GEMM2 以及 rank-local shared expert
+  路径保持不变。
 
 ## 5. 验证计划
 
@@ -144,8 +146,8 @@ attention 也改为 TP（放弃 DPA），代价过大。结论：DPA 应使用�
 | --- | --- | --- |
 | M1 | config + megakernel `rs` 路径 | 已完成 |
 | M2 | host/runtime/测试 + GPU 正确性 | 已完成（MI350 TP8，M=8/16 全绿） |
-| M3 | 性能对比（含 rsag AR 变体评估）+ tuner | 部分（初测见下）；RS 专属调优待做 |
-| M4 | ATOM 侧使能（解禁 dp_size>1、RS 接线） | 待做 |
+| M3 | 性能对比 + RS tuner/独立 RS winner | 已完成（M8 cg32，M16 cg96） |
+| M4 | ATOM DSV4 DPA 接入与整网验证 | 已完成首轮接入与 C2 稳态验证 |
 
 ## 7. 初步实测（MI350 gfx950, TP8, DSV4 形状 H=7168/I=384/E=384/topk=6）
 
@@ -163,5 +165,49 @@ graph 模式（生产路径），RS 配置由 direct AR winner 派生（未专�
 - 融合 RS 约等于融合 AR（direct winner 同配置互换 collective）：这些 M 下
   kernel 以 GEMM 为主，RS 少做 (tp-1)/tp 的远端读取尚未体现优势；AR 变体
  （全量输出 + 本地切片）在 DPA 中性能与 RS 相当，可作为布局允许时的替代。
-- 后续 M3 调优方向：RS 的 service 侧归约量只有 AR 的 1/tp，可上调
-  compute_groups / 调整 tile，预期 M=16 uniform 等 GEMM 主导用例还有空间。
+- 后续专属调优确认 M=8 应从 cg48 降到 cg32；M=16 上调 compute groups 只有
+  约 0.3%–1% uniform 收益，却明显伤害 skew，因此保留 cg96。
+
+## 8. 当前验证状态（2026-09-14）
+
+RS 已写入 ordinary 行的 `comm_fused_configs["rs"]` 项，不再依赖运行时临时
+改写 AR winner，也不会给 ordinary selector 制造重复 shape：
+
+- M=8：`t32x256x128_cg32_v8_bnt2_rs`
+- M=16：`t32x256x128_v8_bnt2_rs`（默认 cg96）
+
+M=8 的长稳态同进程 A/B 中，cg32 相对原 cg48：
+
+| 路由 | cg48 | cg32 | cg32 收益 |
+| --- | ---: | ---: | ---: |
+| uniform | 23.7029 us | 22.2125 us | 6.3% |
+| skew | 15.3294 us | 14.5610 us | 5.0% |
+
+cg36 虽在一次 uniform 窄搜中达到 22.0423 us，但 skew 恶化到 19.0030 us；
+整网 C2 也只有 91.71 tok/s，低于 cg32 的两轮稳定中位 92.50 tok/s，因此未采用。
+
+最新 8 卡 graph correctness/performance 回归通过：
+
+```text
+COMM_FUSED_UT_OK stage2_cases=0 stage2_rs_cases=8 runtime_cases=0
+```
+
+| 用例 | ordinary + custom RS | fused RS | 加速比 |
+| --- | ---: | ---: | ---: |
+| M=8 uniform | 38.6404 us | 31.0805 us | 1.24x |
+| M=8 skew | 32.9044 us | 28.0363 us | 1.17x |
+| M=16 uniform | 48.7086 us | 42.7965 us | 1.14x |
+| M=16 skew | 34.1365 us | 26.6525 us | 1.28x |
+
+ATOM DSV4 DPA C2（固定输入 128、输出 64、80 请求）的 cg32 两轮稳定中位：
+
+| 指标 | ordinary | fused RS cg32 | 收益 |
+| --- | ---: | ---: | ---: |
+| output throughput | 88.9346 tok/s | 92.5046 tok/s | +4.01% |
+| mean TPOT | 19.7351 ms | 18.8991 ms | -4.24% |
+| median TPOT | 19.5917 ms | 18.8893 ms | -3.59% |
+| mean E2EL | 1438.9364 ms | 1383.2359 ms | -3.87% |
+
+该 C2 对比必须保持 `ATOM_PREFILL_DECODE_INTERVAL=10`。若遗漏，默认 prefill
+coalescer 会在低并发下把请求近似串行化，吞吐会降到约 59 tok/s；这是服务调度
+配置差异，不是 fused kernel 性能回退。
