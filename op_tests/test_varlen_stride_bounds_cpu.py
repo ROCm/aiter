@@ -36,7 +36,9 @@ def bound():
     )
     ns = {}
     # Execute only the checked-in metadata helper, avoiding GPU initialization.
-    exec(compile(ast.Module(body=[node], type_ignores=[]), str(SOURCE), "exec"), ns)  # noqa: S102
+    exec(  # noqa: S102
+        compile(ast.Module(body=[node], type_ignores=[]), str(SOURCE), "exec"), ns
+    )
     return ns[node.name]
 
 
@@ -83,6 +85,37 @@ def test_masked_coordinate_overflow_is_not_numel_check():
 def test_grid_id_overflow():
     tensor = TensorMetadata((1, 1, 128), (128, 128, 1))
     assert not fits([tensor], length=1, batch=2**30, heads=8)
+
+
+@pytest.mark.parametrize(
+    "qlen,klen,window",
+    [(1, 2**31 - 1, 0), (2**31 - 1, 1, 0), (10**9, 1, 1500000000)],
+)
+def test_sequence_coordinates_independent_of_strides(qlen, klen, window):
+    tensor = TensorMetadata((1, 1, 8), (0, 8, 1))
+    assert not bound()(
+        [tensor], qlen, klen, 1, 1, {"BLOCK_M": 128, "BLOCK_N": 64}, window
+    )
+
+
+def test_head_tile_minimum_16_includes_masked_lanes():
+    tensor = TensorMetadata((1, 2, 8), (0, 2**31 - 8, 1))
+    assert not fits([tensor], length=1, heads=2)
+
+
+def test_coordinate_guard_boundary():
+    tensor = TensorMetadata((1, 1, 8), (0, 8, 1))
+    kwargs = {
+        "tensors": [tensor],
+        "max_seqlen_q": 1,
+        "max_seqlen_k": 1,
+        "batch": 1,
+        "heads": 1,
+        "config": {"BLOCK_M": 128, "BLOCK_N": 64},
+    }
+    window = 2**31 - 1 - 2 - 256
+    assert bound()(**kwargs, sliding_window=window)
+    assert not bound()(**kwargs, sliding_window=window + 1)
 
 
 def test_bound_has_no_thread_shared_decision():
