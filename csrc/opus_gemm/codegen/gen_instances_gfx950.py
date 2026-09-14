@@ -17,6 +17,23 @@ from codegen.common import (
     register_emit,
 )
 
+# ---------------- gfx950 die count ----------------
+# gfx950 ships at 256 CUs with eight dies and at 128 with four. The swizzle is
+# baked per instance, so a wheel is only correct on the part it was built for.
+_GFX950_NUM_XCD_BY_CU = {256: 8, 128: 4}
+_DEFAULT_NUM_XCD = 8
+
+
+def build_num_xcd():
+    """Die count of the part these instances are built for."""
+    try:
+        from aiter.jit.utils.chip_info import get_cu_num
+
+        return _GFX950_NUM_XCD_BY_CU.get(int(get_cu_num()), _DEFAULT_NUM_XCD)
+    except Exception:  # noqa: BLE001
+        return _DEFAULT_NUM_XCD
+
+
 # ---------------- gfx950 arch-override maps ----------------
 
 PIPELINE_HEADER_MAP = {
@@ -652,7 +669,8 @@ using {k.name}_Traits = {traits_name}<{k.BLOCK_SIZE},
     opus::seq<{k.W_M}, {k.W_N}, {k.W_K}>,
     {has_oob_str},
     {k.cachectl_a},
-    {k.cachectl_b}>;
+    {k.cachectl_b},
+    {build_num_xcd()}>;
 """
 
     min_k = 2 * k.B_K
