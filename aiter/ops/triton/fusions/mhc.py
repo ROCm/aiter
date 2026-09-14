@@ -1159,6 +1159,8 @@ def mhc_post_dsv4(
     Shapes are ``layer_input=[M,C]``, ``residual=[M,n,C]``,
     ``post_mix=[M,n,1]`` (or ``[M,n]``), and ``comb_mix=[M,n,n]``.
     """
+    if residual.shape[0] == 0:
+        return torch.empty_like(residual)
     return _MHCPostDSV4.apply(layer_input, residual, post_mix, comb_mix, config)
 
 
