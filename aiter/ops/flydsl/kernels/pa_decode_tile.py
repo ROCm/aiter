@@ -67,6 +67,7 @@ def compile_pa_decode_tile(
     wide_kv_addressing: bool = False,
     prefetch_v: bool = False,
     prefetch_v_iglp: bool = False,
+    match_gluon_numerics: bool = False,
 ):
     """Build the tile-programming PA-decode kernel + launch wrapper.
 
@@ -110,6 +111,18 @@ def compile_pa_decode_tile(
         "bf16",
     ), f"pa_decode_tile only supports query_dtype in ('f16', 'bf16'), got {query_dtype}"
     Q_DTYPE = fx.BFloat16 if query_dtype == "bf16" else fx.Float16
+
+    if match_gluon_numerics:
+        assert (
+            is_gfx950
+            and head_dim == 128
+            and block_size == 16
+            and trans_v
+            and not per_token_kv
+            and query_dtype == "bf16"
+            and query_length == 1
+            and query_group_size in (8, 16)
+        ), "matched Gluon numerics is restricted to the MiniMax-M3 page-16 shapes"
 
     assert (
         head_dim % 64 == 0
@@ -185,7 +198,8 @@ def compile_pa_decode_tile(
 
     # -- LDS layout (shared across the 4 warps) --
     # sQ: fp8[ROWS_PADDED,head_dim] staged+quantized query. sP: fp8[16,TILE_TOK]
-    # quantized probs. sQscale: f32[ROWS_PADDED]. sLmax/sLsum: cross-warp scratch.
+    # quantized probs. sQscale: f32[ROWS_PADDED] except in the matched-Gluon
+    # ablation, where Q has no dynamic scale. sLmax/sLsum: cross-warp scratch.
     # sVPage: V page-index broadcast. sKScale/sVScale/sVScaleMax: per-token K/V
     # scale staging. No sO/sM/sL/sCorr: PV output is register-resident/loop-carried
     # and stored straight to global (V=A/P=B swap).
@@ -197,12 +211,13 @@ def compile_pa_decode_tile(
     SP_ROW_BYTES = TILE_TOK + 16
     sP_bytes = P_BUFFERS * MFMA_MNK * SP_ROW_BYTES  # fp8, padded rows
     sQscale_off = sP_off + sP_bytes
+    sQscale_bytes = 0 if match_gluon_numerics else ROWS_PADDED * f32
     # Keep reduction rows 16-byte aligned on the tuned gfx950 page-128 path
     # so each cross-wave row can be read as one vector. Other paths retain
     # the padding used to avoid LDS bank conflicts.
     NWARP_PAD = NWARP if tune_page128 else NWARP + 1
     # Phase-split slices sLmax per M-tile so all pass-1 writes share one barrier.
-    sLmax_off = sQscale_off + ROWS_PADDED * f32
+    sLmax_off = sQscale_off + sQscale_bytes
     sLsum_off = sLmax_off + M_TILES * MFMA_MNK * NWARP_PAD * f32
     # V page-index broadcast (V's page depends on `rgroup`, shared across warps).
     sVPage_off = sLsum_off + P_BUFFERS * MFMA_MNK * NWARP_PAD * f32
@@ -661,33 +676,55 @@ def compile_pa_decode_tile(
                 for u in range_constexpr(N_QLOADS)
             ]
 
-            absmax = fmath.absf(q_units[0]).reduce(ReductionOp.MAX).to(fx.Float32)
-            for u in range_constexpr(1, N_QLOADS):
-                absmax = fx.maxnumf(
-                    absmax,
-                    fmath.absf(q_units[u]).reduce(ReductionOp.MAX).to(fx.Float32),
+            if const_expr(match_gluon_numerics):
+                # Match Gluon's Hkv1 policy when QUERY_QUANT_MODE==-1: cast
+                # BF16 Q directly to the fp8 MFMA type, with no per-row absmax
+                # normalization and therefore no Q scale to fold into QK.
+                for u in range_constexpr(N_QLOADS):
+                    _st_words(
+                        q_row_off
+                        + qh_local * head_dim
+                        + lane16 * QCHUNK
+                        + u * QLOAD_UNIT,
+                        _f32_to_fp8_words(q_units[u].to(fx.Float32)),
+                    )
+            else:
+                absmax = (
+                    fmath.absf(q_units[0])
+                    .reduce(ReductionOp.MAX)
+                    .to(fx.Float32)
                 )
-            for sh in (8, 4, 2, 1):
-                absmax = fx.maxnumf(absmax, dpp_utils.dpp_xor_f32(absmax, sh))
+                for u in range_constexpr(1, N_QLOADS):
+                    absmax = fx.maxnumf(
+                        absmax,
+                        fmath.absf(q_units[u])
+                        .reduce(ReductionOp.MAX)
+                        .to(fx.Float32),
+                    )
+                for sh in (8, 4, 2, 1):
+                    absmax = fx.maxnumf(absmax, dpp_utils.dpp_xor_f32(absmax, sh))
 
-            q_scale = absmax * fx.Float32(1.0 / FP8_MAX)
-            inv = fx.Float32(rcp_f32(fx.maxnumf(q_scale, fx.Float32(1e-20))))
-            inv_b = fx.Vector.from_elements([inv], dtype=fx.Float32).broadcast_to(
-                QLOAD_UNIT
-            )
-
-            for u in range_constexpr(N_QLOADS):
-                q_scaled_unit = q_units[u].to(fx.Float32) * inv_b
-                _st_words(
-                    q_row_off + qh_local * head_dim + lane16 * QCHUNK + u * QLOAD_UNIT,
-                    _f32_to_fp8_words(q_scaled_unit),
+                q_scale = absmax * fx.Float32(1.0 / FP8_MAX)
+                inv = fx.Float32(rcp_f32(fx.maxnumf(q_scale, fx.Float32(1e-20))))
+                inv_b = fx.Vector.from_elements([inv], dtype=fx.Float32).broadcast_to(
+                    QLOAD_UNIT
                 )
-            if lane16 == 0:
-                # Transposed [qh][m] (not [m][qh]) so the whole M_TILES-wide
-                # row for a fixed qh is contiguous, letting the KV-loop read
-                # it back in one wide load instead of M_TILES separate
-                # narrow ones -- see the read site below.
-                _st1(sQscale_off, qh_local * M_TILES + m, q_scale)
+
+                for u in range_constexpr(N_QLOADS):
+                    q_scaled_unit = q_units[u].to(fx.Float32) * inv_b
+                    _st_words(
+                        q_row_off
+                        + qh_local * head_dim
+                        + lane16 * QCHUNK
+                        + u * QLOAD_UNIT,
+                        _f32_to_fp8_words(q_scaled_unit),
+                    )
+                if lane16 == 0:
+                    # Transposed [qh][m] (not [m][qh]) so the whole M_TILES-wide
+                    # row for a fixed qh is contiguous, letting the KV-loop read
+                    # it back in one wide load instead of M_TILES separate
+                    # narrow ones -- see the read site below.
+                    _st1(sQscale_off, qh_local * M_TILES + m, q_scale)
 
         for m in range_constexpr(M_TILES):
             flat_idx = m * MFMA_MNK + qh_local
@@ -707,7 +744,7 @@ def compile_pa_decode_tile(
                     q_row_off + qh_local * head_dim + lane16 * QCHUNK,
                     fx.Vector.filled(QCHUNK // 4, 0, fx.Int32),
                 )
-                if lane16 == 0:
+                if const_expr(not match_gluon_numerics) and lane16 == 0:
                     _st1(sQscale_off, qh_local * M_TILES + m, ZERO_F)
 
         gpu.barrier()
@@ -876,7 +913,7 @@ def compile_pa_decode_tile(
             # q_scale doesn't depend on `m`; read the whole M_TILES-wide row once
             # (contiguous via the transposed [qh][m] sQscale layout).
             q_scale_vec = None
-            if const_expr(M_TILES > 1):
+            if const_expr(M_TILES > 1 and not match_gluon_numerics):
                 q_scale_vec = _lds_load(
                     sQscale_off + lane16 * (M_TILES * f32), fx.Float32, M_TILES
                 )
@@ -932,7 +969,11 @@ def compile_pa_decode_tile(
                             )
                         frag_Ss.append(fx.Vector(acc))
 
-                    scale = scale_qk * fx.Float32(q_scale_vec[m])
+                    scale = (
+                        scale_qk
+                        if const_expr(match_gluon_numerics)
+                        else scale_qk * fx.Float32(q_scale_vec[m])
+                    )
                     n_valid_tile = (causal_bound[m] - tok0).to(fx.Float32)
                     base_tok_f = fx.Int32(warp * TOK_CHUNK + rgroup * 4).to(fx.Float32)
                     thr = fx.Vector.from_elements(
@@ -1058,6 +1099,10 @@ def compile_pa_decode_tile(
                                 else v_scale_shared[a]
                             )
                             p_scaled = Pa * v_sc * norm_factor_b
+                        elif const_expr(match_gluon_numerics):
+                            # Match Gluon Hkv1's scalar-scale path: P is cast
+                            # to fp8 in its native [0, 1] range.
+                            p_scaled = Pa
                         else:
                             p_scaled = Pa * fx.Vector.filled(4, FP8_MAX, fx.Float32)
                         words.append(_f32_to_fp8_words(p_scaled)[0])
@@ -1150,8 +1195,10 @@ def compile_pa_decode_tile(
                         if const_expr(per_token_kv):
                             _stage_kv_scale_to_lds(phys_vec1, _kv_buf_off(tt1))
                 # Softmax: each lane owns one qhead (lane%16); register reduce + shuffle_xor.
-                scale = scale_qk * _ld1(
-                    sQscale_off, lane16
+                scale = (
+                    scale_qk
+                    if const_expr(match_gluon_numerics)
+                    else scale_qk * _ld1(sQscale_off, lane16)
                 )  # per-qhead positive score scale
                 n_valid_tile = (causal_bound[0] - tok0).to(fx.Float32)
                 base_tok_f = fx.Int32(warp * TOK_CHUNK + rgroup * 4).to(fx.Float32)
@@ -1243,6 +1290,10 @@ def compile_pa_decode_tile(
                             else v_scale_vecs[a]
                         )
                         p_scaled = Pa * v_scale_this * norm_factor_b
+                    elif const_expr(match_gluon_numerics):
+                        # Gluon Hkv1 does not multiply scalar-scale P by 448
+                        # before its fp8 conversion.
+                        p_scaled = Pa
                     else:
                         p_scaled = Pa * fx.Vector.filled(4, FP8_MAX, fx.Float32)
                     words.append(_f32_to_fp8_words(p_scaled)[0])
@@ -1314,6 +1365,10 @@ def compile_pa_decode_tile(
             inv_l = fx.Float32(rcp_f32(safe_l))
             if const_expr(per_token_kv):
                 o_scale = inv_l
+            elif const_expr(match_gluon_numerics):
+                # The matching P path did not scale by FP8_MAX, so preserve
+                # value_scale but omit FlyDSL's compensating 1/FP8_MAX.
+                o_scale = inv_l * v_scale_f
             else:
                 o_scale = inv_l * (v_scale_f * inv_fp8)
             o_scale_b = fx.Vector.from_elements(

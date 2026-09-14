@@ -41,6 +41,7 @@ from .kernels.utils import cdiv
 
 _PAGE16_VPIPE_ENV = "AITER_FLYDSL_PA_PAGE16_VPIPE"
 _PAGE16_VPIPE_IGLP_ENV = "AITER_FLYDSL_PA_PAGE16_VPIPE_IGLP"
+_MATCH_GLUON_NUMERICS_ENV = "AITER_FLYDSL_PA_MATCH_GLUON_NUMERICS"
 
 
 def _env_enabled(name: str) -> bool:
@@ -410,6 +411,24 @@ def pa_decode(
     )
     page16_vpipe_iglp = page16_vpipe and page16_vpipe_iglp
 
+    # Numerical-policy ablation against Gluon's Hkv1 kernel.  Keep this
+    # independent from the page-16 scheduling switches so the two effects can
+    # be measured separately, and constrain it to the exact MiniMax-M3 shapes
+    # whose Gluon path directly casts both Q and P to fp8.  All other shapes,
+    # including per-token KV scales, retain FlyDSL's range-normalized policy.
+    match_gluon_numerics = (
+        _env_enabled(_MATCH_GLUON_NUMERICS_ENV)
+        and arch == "gfx950"
+        and head_dim == 128
+        and block_size == 16
+        and trans_v
+        and not per_token_kv
+        and query.dtype == torch.bfloat16
+        and num_kv_heads == 1
+        and query_length == 1
+        and query_group_size in (8, 16)
+    )
+
     # Early V loads help the measured one-to-two-workgroup-per-CU regime.
     # Keep other grids on the existing schedule: early loads regress
     # short-context decode at larger grid sizes.
@@ -440,6 +459,7 @@ def pa_decode(
             wide_kv_addressing=wide_kv_addressing,
             prefetch_v=prefetch_v,
             prefetch_v_iglp=page16_vpipe_iglp,
+            match_gluon_numerics=match_gluon_numerics,
         )
 
     if num_partitions == 1:
