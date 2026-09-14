@@ -861,7 +861,6 @@ def _gemm1_body(
             scale_a=sa,
             scale_b=sb,
         )
-        return ci
 
     def mfma_cluster(b_slot, a, a_scale, bs_slot, J, khalf=None):
         if const_expr(interleave):
@@ -878,28 +877,20 @@ def _gemm1_body(
             if const_expr(kMChunks == 1):
                 sa = a_scale[0]
                 if const_expr(khalf is None or khalf == 0):
-                    accm[0][J] = _mma(accm[0][J], 0, 0 + in_b, a[0][0], bJ0, sa, sb)
+                    _mma(accm[0][J], 0, 0 + in_b, a[0][0], bJ0, sa, sb)
                 if const_expr(khalf is None or khalf == 1):
-                    accm[0][J] = _mma(accm[0][J], 2, 2 + in_b, a[0][1], bJ1, sa, sb)
+                    _mma(accm[0][J], 2, 2 + in_b, a[0][1], bJ1, sa, sb)
             else:
                 for sub in range_constexpr(kSubBlocks):
                     i0 = sub * 2 + 0
                     i1 = sub * 2 + 1
                     sa = a_scale[sub]
                     if const_expr(khalf is None or khalf == 0):
-                        accm[i0][J] = _mma(
-                            accm[i0][J], 0, 0 + in_b, a[i0][0], bJ0, sa, sb
-                        )
-                        accm[i1][J] = _mma(
-                            accm[i1][J], 1, 0 + in_b, a[i1][0], bJ0, sa, sb
-                        )
+                        _mma(accm[i0][J], 0, 0 + in_b, a[i0][0], bJ0, sa, sb)
+                        _mma(accm[i1][J], 1, 0 + in_b, a[i1][0], bJ0, sa, sb)
                     if const_expr(khalf is None or khalf == 1):
-                        accm[i0][J] = _mma(
-                            accm[i0][J], 2, 2 + in_b, a[i0][1], bJ1, sa, sb
-                        )
-                        accm[i1][J] = _mma(
-                            accm[i1][J], 3, 2 + in_b, a[i1][1], bJ1, sa, sb
-                        )
+                        _mma(accm[i0][J], 2, 2 + in_b, a[i0][1], bJ1, sa, sb)
+                        _mma(accm[i1][J], 3, 2 + in_b, a[i1][1], bJ1, sa, sb)
 
         if const_expr(interleave and N_REPS == 1):
             # Adjacent waves consume the low/high N half of one scale word.
@@ -1543,8 +1534,6 @@ def compile_gemm1_a4w4_port(
     native_scale_layout=False,
     num_waves=4,
     k_wave=1,
-    epi_splits=None,
-    k_stages=None,
 ):
     """Compile GEMM1 with expert-sorted output."""
     if a_dtype not in ("fp4", "fp8"):
@@ -1610,8 +1599,7 @@ def compile_gemm1_a4w4_port(
     )
     NUM_N_BLOCKS = N_OUT // BN
 
-    if epi_splits is None:
-        epi_splits = default_epi_splits(BM, BN, k_wave, num_waves)
+    epi_splits = default_epi_splits(BM, BN, k_wave, num_waves)
     assert (
         epi_splits >= 1 and (epi_splits & (epi_splits - 1)) == 0
     ), f"epi_splits must be a power of two, got {epi_splits}"
@@ -1620,13 +1608,12 @@ def compile_gemm1_a4w4_port(
             BN == 256 and num_waves == 4 and k_wave == 1
         ), "epi_splits > 1 requires BN256 / 4 waves / k_wave 1"
         assert (
-            kmchunks_for(BM) % epi_splits == 0 and (BM // 16) % epi_splits == 0
+            kmchunks_for(BM) % epi_splits == 0
         ), f"epi_splits={epi_splits} does not divide BM={BM} evenly"
 
-    if k_stages is None:
-        k_stages = default_k_stages(
-            BM, BN, KH_TILE, K_TILES_TOTAL, N_OUT, k_wave, epi_splits
-        )
+    k_stages = default_k_stages(
+        BM, BN, KH_TILE, K_TILES_TOTAL, N_OUT, k_wave, epi_splits
+    )
     assert (
         1 <= k_stages <= K_TILES_TOTAL // k_wave
     ), f"k_stages must be in [1, {K_TILES_TOTAL // k_wave}], got {k_stages}"
@@ -1806,7 +1793,8 @@ def compile_gemm1_a4w4_port(
             stream=stream,
         )
 
-    launch_gemm1.compile_hints = {
-        "llvm_options": {"amdgpu-sched-strategy": "iterative-minreg"},
-    }
+    if k_stages == 1:
+        launch_gemm1.compile_hints = {
+            "llvm_options": {"amdgpu-sched-strategy": "iterative-minreg"},
+        }
     return launch_gemm1

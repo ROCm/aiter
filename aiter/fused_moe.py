@@ -2497,6 +2497,11 @@ def _flydsl_v2_stage2_wrapper(
     bn = cfg["tile_n"]
     bk = cfg["tile_k"]
     sbm = cfg["sort_block_m"] or (int(block_m) if block_m else bm)
+    if cfg["sort_block_m"] and block_m is not None and int(block_m) != sbm:
+        raise ValueError(
+            "FlyDSL v2 stage2 sorting layout mismatch: moe_sorting uses "
+            f"block_m={int(block_m)}, but the kernel expects sort_block_m={sbm}."
+        )
     epilog = cfg["epilog"]
     max_sorted = inter_states.shape[0]
 
@@ -3346,37 +3351,23 @@ def get_2stage_cfgs(
         and hidden_pad == 0
         and intermediate_pad == 0
         and model_dim % 256 == 0
+        and inter_dim % 128 == 0
         and aiter.is_mxfp4_moe_shape_supported(expert, model_dim, inter_dim, topk)
         and os.environ.get("AITER_MXMOE_FALLBACK", "1") == "1"
     )
     if _mxmoe_fallback_ok and cfg is None:
         _bm = 64 if token < 512 else 128
-        _g2_tk = 128 if inter_dim % 128 == 0 else 256
         _rows_per_expert = -(-token * topk // expert)
         _g1_swz = min(6, max(1, -(-_rows_per_expert // _bm)))
         _g1_sfx = f"_xcd{_g1_swz}" if _g1_swz > 1 else ""
         _kn1 = f"flydsl_mxmoe_g1_a4w4_{_bm}x256x256_situv2{_g1_sfx}"
-        _kn2 = f"flydsl_moe2_layout_afp4_wfp4_bf16_t{_bm}x256x{_g2_tk}_reduce_sbm{_bm}"
+        _kn2 = f"flydsl_moe2_layout_afp4_wfp4_bf16_t{_bm}x256x128_reduce_sbm{_bm}"
         logger.warning(
             f"[fused_moe] no tuned FlyDSL config for {keys}, "
             f"using heuristic MXMOE fallback (kn1={_kn1!r}, kn2={_kn2!r})"
         )
-        return MOEMetadata(
-            stage1=functools.partial(
-                _mxfp4_a4w4_stage1_fw,
-                kernelName1=_kn1,
-                interleave=False,
-            ),
-            stage2=functools.partial(
-                _mxfp4_a4w4_stage2_fw,
-                kernelName2=_kn2,
-            ),
-            block_m=_bm,
-            ksplit=0,
-            fuse_quant="fp4",
-            output_aux=AUX_SORT_OPUS,
-            prequant=False,
-        )
+        return _make_mxfp4_metadata(_kn1, _kn2, gate_mode, 0, block_m=_bm)
+
     if use_mxfp4_flydsl:
         from aiter.ops.flydsl.moe_kernels import (
             flydsl_kernel_name,

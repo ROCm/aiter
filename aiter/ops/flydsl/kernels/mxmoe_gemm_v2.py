@@ -307,22 +307,12 @@ def gemm2_body_v2(
         n_block_idx = bx_i32 - m_block_idx * num_n_blocks
     eids_ptr = global_typed_ptr(arg_eids, T.i32)
     if const_expr(sub_tiled):
-        sort_block = fx.Int32(
-            rocdl.readfirstlane(T.i32, _raw(_udiv(m_block_idx, fx.Int32(SUBS))))
-        )
-        m_sub = fx.Int32(
-            rocdl.readfirstlane(T.i32, _raw(m_block_idx - sort_block * fx.Int32(SUBS)))
-        )
-        m_row = fx.Int32(
-            rocdl.readfirstlane(T.i32, _raw(sort_block * SBM + m_sub * BM))
-        )
+        sort_block = _udiv(m_block_idx, fx.Int32(SUBS))
+        m_sub = m_block_idx - sort_block * fx.Int32(SUBS)
+        m_row = sort_block * SBM + m_sub * BM
         e = rocdl.readfirstlane(T.i32, _raw(eids_ptr[sort_block]))
         _left = fx.Int32(SBM) - m_sub * BM
-        m_rows_valid = fx.Int32(
-            rocdl.readfirstlane(
-                T.i32, _raw((_left < fx.Int32(BM)).select(_left, fx.Int32(BM)))
-            )
-        )
+        m_rows_valid = (_left < fx.Int32(BM)).select(_left, fx.Int32(BM))
     else:
         m_row = m_block_idx * BM
         m_rows_valid = None
@@ -671,7 +661,13 @@ def gemm2_body_v2(
         load_i32 = fx.make_copy_atom(fx.rocdl.BufferCopy32b(), Int32)
         packed = []
         for mr in range_constexpr(M_REPS):
-            sorted_pos = m_row + mr * EPI_ROWS + m_lane
+            if const_expr(m_rows_valid is None):
+                sorted_pos = m_row + mr * EPI_ROWS + m_lane
+            else:
+                row_in_block = fx.Int32(mr * EPI_ROWS) + m_lane
+                sorted_pos = m_row + (row_in_block < m_rows_valid).select(
+                    row_in_block, m_rows_valid - fx.Int32(1)
+                )
             frag = fx.make_rmem_tensor(1, Int32)
             fx.copy(load_i32, stids[None, sorted_pos], frag)
             packed.append(Vec(frag.load())[0])
