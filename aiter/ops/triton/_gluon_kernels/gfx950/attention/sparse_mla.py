@@ -348,9 +348,9 @@ class Cfg:
         self.p_layout = gl.constexpr(gl.DotOperandLayout(0, self.pv_layout, KW))
         self.v_layout = gl.constexpr(gl.DotOperandLayout(1, self.pv_layout, KW))
 
-        # 16 uint8 per thread = 128-bit gather loads
-        # GATHER_TW1 = threads spent on the head dim: 32 requests a whole
-        # 512 B token row per instruction, at the cost of a longer slot vector.
+        # 16 uint8 per thread = 128-bit gather loads. GATHER_TW1 lanes span a row,
+        # so one gather covers GATHER_TW1 * 16 = 512 B of it, at the cost of a
+        # longer slot vector.
         GSPT = 16
         self.gather_l = gl.constexpr(
             gl.BlockedLayout(

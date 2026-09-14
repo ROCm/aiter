@@ -574,8 +574,11 @@ def sparse_mla_fwd(
         part_m = part_l = part_acc = out  # unused placeholders (never dereferenced)
         pm_stride0 = pm_stride_s = pa_stride0 = pa_stride_s = pa_stride_h = 0
 
-    # Dequant chunking
-    col_reps = kv_lora_rank // 512  # the kernel gathers 512 B per row per instruction
+    # Dequant chunking. The gather layout puts 32 of a wave's 64 lanes along a row
+    # (16 B each, 512 B) and the other 32 on a second row; col_reps is how many
+    # such spans each lane holds, which is what makes a column split a free
+    # register rename.
+    col_reps = kv_lora_rank // 512
     chunk_axis = 1 if col_reps >= 4 else 0
     nope_chunk = max(1, block_k // 4) if chunk_axis == 0 else min(128, kv_lora_rank)
     async_lds_on, block_k, waves_per_eu = _async_launch_config(
