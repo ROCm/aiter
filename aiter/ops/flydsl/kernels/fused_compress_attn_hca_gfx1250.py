@@ -1349,7 +1349,7 @@ def _build_norm_rope_scatter_kernel(
 # epilogue's address resolution overlap other blocks' compress work. Opt-in
 # while it soaks; set HCA_FUSE=0 to fall back to the 2-kernel path.
 _FUSE_EPILOGUE = os.environ.get("HCA_FUSE", "1") == "1"
-_SYNC_COUNTERS: dict[tuple[int, str], torch.Tensor] = {}
+_SYNC_COUNTERS: dict[tuple[int, str, int], torch.Tensor] = {}
 
 
 def _sync_counter(n: int, device) -> torch.Tensor:
@@ -1359,8 +1359,17 @@ def _sync_counter(n: int, device) -> torch.Tensor:
     launches, and a per-call zeroing kernel would cost more than the fusion
     saves. The last arriver for each boundary subtracts its slot back to zero,
     so the buffer is self-cleaning and safe to reuse across CUDAGraph replays.
+
+    Keyed on the stream as well, which is what makes reuse safe: two launches
+    on one stream cannot overlap, so they cannot both be counting in a slot,
+    while two launches on *different* streams can and do. Sharing one buffer
+    across streams lets an arrival from grid B push a slot past the threshold
+    while grid A still has siblings storing, so the block that wins the
+    election reduces over a half-written row -- silent wrong results, and the
+    slot is left un-reset for every launch after it. Costs one small buffer
+    per (shape, stream) actually used.
     """
-    key = (int(n), str(device))
+    key = (int(n), str(device), torch.cuda.current_stream(device).cuda_stream)
     buf = _SYNC_COUNTERS.get(key)
     if buf is None:
         buf = torch.zeros(
