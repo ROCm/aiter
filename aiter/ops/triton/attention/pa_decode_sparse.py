@@ -589,6 +589,7 @@ def _pa_decode_sparse_gfx950_gluon(
         math.ceil(avg_main / BLOCK_K) if avg_main > 0 else 1,
         math.ceil(avg_extra / BLOCK_K) if avg_extra > 0 else 1,
     )
+    # Starved grid with small kv length, lower block m to 8
     if (
         num_heads % 8 == 0
         and tiles <= 2
