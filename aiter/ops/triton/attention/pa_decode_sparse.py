@@ -578,30 +578,12 @@ def _pa_decode_sparse_gfx950_gluon(
     heads_blocks = (num_heads + BLOCK_M - 1) // BLOCK_M
     out = _check_out(out, q, torch.bfloat16)
 
-    def _pick_splits(hb):
-        if kv_splits is not None:
-            return max(1, int(kv_splits))
-        return _decode_num_splits_occ(num_queries, hb, avg_main, avg_extra, BLOCK_K)
-
-    num_splits = _pick_splits(heads_blocks)
-
-    tiles = max(
-        math.ceil(avg_main / BLOCK_K) if avg_main > 0 else 1,
-        math.ceil(avg_extra / BLOCK_K) if avg_extra > 0 else 1,
-    )
-    # Starved grid with small kv length, lower block m to 8
-    if (
-        num_heads % 8 == 0
-        and tiles <= 2
-        and num_queries * heads_blocks * num_splits <= get_num_sms()
-    ):
-        hb8 = (num_heads + 7) // 8
-        ns8 = _pick_splits(hb8)
-        if ns8 >= num_splits and num_queries * hb8 * ns8 <= get_num_sms():
-            BLOCK_M = 8
-            HEAD_ALIGNED = num_heads % BLOCK_M == 0
-            heads_blocks = hb8
-            num_splits = ns8
+    if kv_splits is not None:
+        num_splits = max(1, int(kv_splits))
+    else:
+        num_splits = _decode_num_splits_occ(
+            num_queries, heads_blocks, avg_main, avg_extra, BLOCK_K
+        )
 
     # Q is read once per query without split-K, and re-read by every split
     q_cache = ".cg" if num_splits == 1 else ""
