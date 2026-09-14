@@ -42,10 +42,31 @@ from aiter.ops.flydsl.hstu_attention_kernels import (
 from aiter.ops.flydsl.kernels.hstu_attention_bwd import validate_hstu_attention_bwd
 from aiter.test_common import benchmark, checkAllclose, run_perftest
 
-# Reuse the forward test's self-contained input generator.
-from op_tests.test_flydsl_hstu_attention import (
-    generate_hstu_attn_inputs,
-)
+# Reuse the forward test's self-contained input generator and torch-reference
+# loader. Mirror the forward's sys.path fallback (#5394) so this file also works
+# when run directly as a script (`python op_tests/test_*.py`), where `op_tests`
+# is not importable unless the repo root is on sys.path.
+try:
+    from op_tests.test_flydsl_hstu_attention import (
+        _load_torch_hstu_reference,
+        generate_hstu_attn_inputs,
+    )
+except ModuleNotFoundError as exc:
+    missing = exc.name or ""
+    if not (missing == "op_tests" or missing.startswith(("op_tests.", "triton_tests"))):
+        raise
+
+    import sys
+    from pathlib import Path
+
+    repo_root = Path(__file__).resolve().parents[1]
+    if str(repo_root) not in sys.path:
+        sys.path.insert(0, str(repo_root))
+
+    from op_tests.test_flydsl_hstu_attention import (
+        _load_torch_hstu_reference,
+        generate_hstu_attn_inputs,
+    )
 
 requires_cuda = pytest.mark.skipif(
     not torch.cuda.is_available(), reason="requires CUDA device"
@@ -74,7 +95,7 @@ def hstu_bwd_reference(
 
     Computed in fp32 for a clean oracle; the FlyDSL kernel runs in {f16,bf16}.
     """
-    from op_tests.triton_tests.utils.hstu_attention_ref import torch_hstu_attention
+    torch_hstu_attention = _load_torch_hstu_reference()
 
     qf = q.detach().float().requires_grad_(True)
     kf = k.detach().float().requires_grad_(True)
