@@ -25,7 +25,7 @@ Launcher: torchrun (one process per rank / GPU), mirroring test_moe_layer_ep.py.
 
 Launch (4x gfx1250; every env knob below is already the script's default):
     cd <dir not under /app>   # avoid the /app/triton namespace shadow
-    torchrun --standalone --nproc_per_node=4 bench_mega_moe.py \
+    torchrun --standalone --nproc_per_node=4 bench_mega_moe_gfx1250.py \
       -q a4w4_mxfp4 -e 384 -k 6 -hd 7168 -id 3072 --layers 61 --combine both
     # Set MORI_CCO_BC to a prebuilt libmori_cco_device.bc to skip CCO JIT.
 
@@ -63,6 +63,7 @@ from aiter.benchmark_data_init import add_data_init_args, fill, make_generator
 from aiter.benchmark_reporting import print_json_table
 from aiter.fused_moe import fused_moe
 from aiter.ops.flydsl.moe_common import GateMode
+from aiter.ops.quant import per_1x32_mx_quant_hip
 from aiter.ops.shuffle import moe_shuffle_scale, shuffle_weight
 from aiter.utility import fp4_utils
 
@@ -134,18 +135,34 @@ def resolve_spec(quant_key):
     }
 
 
-# The MegaMoE (--combine fused) dispatch wire.
+# The dispatch wire, honoured by BOTH combine modes.
 _DISPATCH_WIRE_FOR_QUANT = {"a8w4_mxfp4": "fp8", "a4w4_mxfp4": "fp4"}
+# What each wire means to the `base` path's mori op: the dtype mori sizes a
+# transported token with, and the dtype the SENDER quantizes to. mori does no
+# quantizing of its own -- a quantized payload arrives already packed, and the
+# e8m0 rows beside it are forwarded verbatim -- so the second entry is what
+# _layer_step runs before handing the tokens over. None leaves them bf16.
+_MORI_DISPATCH_WIRE = {
+    "bf16": (torch.bfloat16, None),
+    "fp8": (dtypes.fp8, dtypes.fp8),
+    "fp4": (dtypes.fp4x2, dtypes.fp4x2),
+}
+# One e8m0 scale per 32 features, on both the MegaMoE wire and the mori one.
+_MX_SCALE_BLOCK = 32
 
 
 def resolve_dispatch_wire(wire, quant_key):
-    """What MegaMoE's dispatch puts on the wire: bf16 | fp8 | fp4.
+    """What dispatch puts on the wire: bf16 | fp8 | fp4.
 
     A quantizing wire is not a free choice -- the receiver hands the payload to
     the grouped GEMM as its A operand, so it has to be the width that GEMM wants
     (a8w4 -> fp8, a4w4 -> fp4), which is what ``auto`` resolves to. The other
     pairing is a width error, not a slow path, so it is rejected here rather
     than deep inside the gather.
+
+    One wire for both combine modes: base and fused differ in how the expert
+    output comes BACK, and leaving them on different dispatch wires would put
+    that difference on the send leg too.
     """
     if wire == "auto":
         return _DISPATCH_WIRE_FOR_QUANT[quant_key]
@@ -263,11 +280,17 @@ def moe_forward(
     expert_mask,
     spec,
     num_local_tokens=None,
+    a1_scale=None,
 ):
     """Single fused_moe call (device path). ``num_local_tokens`` (device int32
     scalar == total_recv) lets the caller feed the FULL, un-truncated dispatch
     buffer: routes past total_recv*topk are dropped in the grouped route kernel,
-    so no host .item()/slice/clone is needed and the call stays graph-capturable."""
+    so no host .item()/slice/clone is needed and the call stays graph-capturable.
+
+    ``a1_scale`` is the e8m0 row a quantizing dispatch wire delivered next to
+    the payload; passing it (with ``hidden`` in packed MX bytes) is what tells
+    fused_moe the activations are already quantized. None on a bf16 wire, where
+    fused_moe quantizes each received copy itself."""
     if num_local_tokens is None:
         num_local_tokens = torch.tensor(
             [hidden.shape[0]], dtype=dtypes.i32, device=hidden.device
@@ -284,6 +307,7 @@ def moe_forward(
         quant_type=spec["aiter_qtype"],
         w1_scale=w1_s,
         w2_scale=w2_s,
+        a1_scale=a1_scale,
         dtype=dtypes.bf16,
         num_local_tokens=num_local_tokens,
     )
@@ -401,8 +425,9 @@ _ACC_TOL_SAFETY = 1.5
 
 def default_logits_tol(quant_key, combine_quant, n_layers):
     # Per-quant tol for an n_layers chain; see _ACC_TOL for the calibration.
-    # --combine base puts nothing on the wire, and --combine_quant none puts bf16;
-    # both stay under the mxfp8 curve.
+    # Keyed on the COMBINE wire only: --combine base leaves it bf16 (its dispatch
+    # wire tracks --dispatch_wire, same as fused's), and --combine_quant none
+    # does too; both stay under the mxfp8 curve.
     slope, sat = _ACC_TOL[quant_key, "mxfp4" if combine_quant == "mxfp4" else "mxfp8"]
     return _ACC_TOL_SAFETY * slope * n_layers / (1.0 + sat * n_layers)
 
@@ -546,6 +571,10 @@ class DeviceMoEPipeline:
         self.comm = None
         self.op = None
         self.mega = None
+        # base path only: what the sender quantizes to (None on a bf16 wire),
+        # and the arrived e8m0 rows the grouped GEMM reads as its a1_scale.
+        self.dispatch_quant_dtype = None
+        self.recv_scale_rows = None
         self.graph = None
         self.x0_static = None
         self.out_static = None
@@ -600,6 +629,28 @@ class DeviceMoEPipeline:
             )
         else:
             EpDispatchCombineConfig, EpDispatchCombineOp = _import_mori_v2()
+            wire_dtype, self.dispatch_quant_dtype = _MORI_DISPATCH_WIRE[
+                self.spec["dispatch_wire"]
+            ]
+            # A quantizing wire makes this an asymmetric op: an MX payload goes
+            # out on dispatch, the post-expert tokens come back bf16. The two
+            # dtypes are all-or-none, and the scale row is the same hidden/32
+            # e8m0 bytes the fused wire sends -- mori forwards it to the
+            # receiver's out_scales without repacking it.
+            wire_kw = {}
+            if self.dispatch_quant_dtype is not None:
+                if self.hdim % _MX_SCALE_BLOCK:
+                    raise ValueError(
+                        f"one e8m0 scale covers {_MX_SCALE_BLOCK} features, so "
+                        f"--dispatch_wire={self.spec['dispatch_wire']} needs a "
+                        f"hidden dim that is a multiple of it, got {self.hdim}"
+                    )
+                wire_kw = dict(
+                    dispatch_data_type=wire_dtype,
+                    combine_data_type=self.transport_dtype,
+                    scale_dim=self.hdim // _MX_SCALE_BLOCK,
+                    scale_type_size=1,
+                )
             cfg = EpDispatchCombineConfig(
                 rank=r,
                 world_size=self.dist_ctx.world,
@@ -609,9 +660,28 @@ class DeviceMoEPipeline:
                 num_experts_per_token=self.topk,
                 data_type=self.transport_dtype,
                 combine_mode="gather",  # mori's name for the `base` combine
+                **wire_kw,
             )
             self.op = EpDispatchCombineOp(cfg, self.comm)
+            self.recv_scale_rows = self._recv_scale_rows()
         self.comm.barrier()
+
+    def _recv_scale_rows(self):
+        """The arrived e8m0 rows as fused_moe's a1_scale, None on a bf16 wire.
+
+        FULL padded rows, which is also what MegaMoE hands the grouped GEMM: the
+        kernel takes a base pointer and strides by the row width it is given,
+        while mori lays the rows down at its own 128 B-aligned pitch. recv_scales()
+        returns that region already trimmed to the meaningful dwords, so the
+        pitch has to come from the op rather than from that view's shape.
+        """
+        if self.dispatch_quant_dtype is None:
+            return None
+        trimmed = self.op.recv_scales()
+        cap = trimmed.shape[0]
+        stride_i32 = self.op.scale_stride_bytes() // 4
+        rows = torch.as_strided(trimmed, (cap, stride_i32), (stride_i32, 1))
+        return rows.view(torch.uint8)
 
     # ---- one graph-capturable layer + full chain (calls grouped together) ---- #
     def _layer_step(self, x, layer_idx):
@@ -631,11 +701,24 @@ class DeviceMoEPipeline:
                 y = y + _device_shared_ffn(xn, self.sw1, self.sw2)
             return x + y
 
+        payload, scales = xn, None
+        if self.dispatch_quant_dtype is not None:
+            # Quantize ONCE PER LOCAL TOKEN on the sender, as the fused wire
+            # does, rather than once per received copy on the far side. mori
+            # only transports: it forwards these bytes and the e8m0 row beside
+            # them, so the payload has to arrive already packed.
+            payload, scales = per_1x32_mx_quant_hip(
+                xn,
+                quant_dtype=self.dispatch_quant_dtype,
+                scale_type=dtypes.fp8_e8m0,
+                shuffle=False,
+            )
+            scales = scales.view(torch.uint8)
         # Recompute routing every layer (mode A: atomic routing inside dispatch)
         # instead of replaying a precomputed handle. return_routing=True hands
         # back this layer's forward dest-slot map, which combine then consumes.
         recv_x, recv_w, _rs, recv_idx, total_recv_t, handle = self.op.dispatch(
-            xn, wts, None, ids, return_routing=True
+            payload, wts, scales, ids, return_routing=True
         )
         out = moe_forward(
             recv_x,
@@ -648,6 +731,7 @@ class DeviceMoEPipeline:
             self.expert_mask,
             self.spec,
             num_local_tokens=total_recv_t,
+            a1_scale=self.recv_scale_rows,
         )
         combine_out, _ = self.op.combine(out.to(self.transport_dtype), routing=handle)
         y = combine_out[: self.ct].to(dtypes.bf16)
@@ -1348,7 +1432,7 @@ def _parse_args():
         type=str,
         choices=["auto", "bf16", "fp8", "fp4"],
         default=read_dispatch_wire_env(),
-        help="what dispatch puts on the wire (--combine fused only): bf16 sends "
+        help="what dispatch puts on the wire, on BOTH combine modes: bf16 sends "
         "activations and the receiver quantizes each copy; fp8/fp4 quantize once "
         "on the sender and forward the e8m0 row. 'auto' picks what the quant "
         "key's GEMM wants.",
