@@ -7,6 +7,22 @@ applyTo: "aiter/ops/triton/**,op_tests/triton_tests/**,op_tests/op_benchmarks/tr
 When a change violates one of these rules, flag it and point the author to the
 relevant rule — reviewers may not know these conventions yet.
 
+## PR scope — one concern per PR
+
+- **A new kernel goes in its own PR.** Flag any PR that adds a new kernel
+  together with unrelated work — a refactor, a cleanup, config retuning, or a
+  fix to a different kernel — and ask for the new kernel to be split into a
+  dedicated PR. A new kernel's own PR still carries its wrapper, unit test and
+  benchmark (see *Tests and benchmarks*); those belong to the kernel and are
+  not separate concerns.
+- Keep PRs small and easy to review: one concern each, as granular as the
+  change allows. Flag a PR that solves two or three independent problems at
+  once — a bug fix plus a refactor, a new op plus a cleanup, retuning plus an
+  API change — even when every individual change is correct.
+- When flagging scope, name the specific part that should move out and say it
+  belongs in a follow-up PR, so the author knows what to split rather than
+  only that the PR is too large.
+
 ## Reuse before adding
 
 Always prefer reusing existing code over adding new code. Before a PR adds a
@@ -50,6 +66,27 @@ and tuned JSON in `configs/`. Flag:
 - Relative imports (`from .foo import ...`, `from ..utils import ...`) —
   only absolute imports (`from aiter.ops.triton.<...> import ...`) are
   allowed.
+
+## Framework portability — torch stays out of `utils/_triton/`
+
+`utils/_triton/` and the config loaders are torch-free so the kernels and
+their tuned configs can be imported by a framework that is not PyTorch
+(JAX-Triton is the live case). Flag:
+
+- `import torch`, `from torch import ...` or any `torch.` use added to a
+  module under `utils/_triton/`. The torch-using half belongs in `utils/` —
+  split the helper rather than duplicating it (`moe_common.py` already lives
+  on both sides). `utils/_triton/tunning/` is exempt: standalone tuning
+  harnesses, not importable library code.
+- torch newly introduced into config resolution (`utils/config_utils.py` or a
+  `*_config_utils.py` family module) — loading a tuned config must not
+  require torch.
+- A new kernel module under `_triton_kernels/` or `_gluon_kernels/` that
+  imports torch, or a first torch import added to one that is currently
+  torch-free. A jit body cannot call torch; what drags it in is host-side
+  glue — `torch.Tensor` annotations, dtype constants, `torch.empty`
+  allocations — and that belongs in the public wrapper. Kernel modules that
+  already import torch are grandfathered.
 
 ## Tuned configs: JSON placement and naming
 
@@ -236,10 +273,32 @@ All weight/scale pre-shuffle helpers are unified in
   if int(DEVICE_ARCH.split("MI")[1]) >= 350: ...
   ```
 
+- Device handling: allocate on the input's device, never a hardcoded
+  `"cuda"`. `device="cuda"` resolves to the process's current default device,
+  so a wrapper whose inputs live on `cuda:3` allocates its output or
+  workspace on `cuda:0` — a cross-device error at best, the wrong GPU at
+  worst. Flag new `device="cuda"`, `torch.device("cuda")` and `.cuda()` in
+  wrappers and kernel launch code:
+
+  ```python
+  # Correct
+  y = torch.empty(shape, dtype=x.dtype, device=x.device)
+  # Wrong
+  y = torch.empty(shape, dtype=x.dtype, device="cuda")
+  ```
+
+  Docstring examples and tests that build their own inputs may keep
+  `device="cuda"`; the rule is about library code deriving the device from
+  the tensors it was handed.
 - Flag new public wrapper functions without a docstring covering: what the
   kernel computes, the arguments (including which config parameters apply),
   the return value, and special considerations (layout expectations,
   unsupported options).
+- Keep comments and docstrings concise. Flag padded or hard-to-follow prose:
+  multi-paragraph docstrings that restate the code, tutorial-style
+  explanations of Triton basics, narration of what the next line does, or
+  commented-out code left behind. A comment earns its place by explaining
+  *why* — a non-obvious constraint, a layout requirement, an arch quirk.
 
 ## Tests and benchmarks
 
@@ -257,6 +316,16 @@ All weight/scale pre-shuffle helpers are unified in
   config dicts (`BLOCK_SIZE_*`, `num_warps`, `waves_per_eu`, ...) or passes
   literal `config=` overrides to a wrapper. Tests exercise the wrapper's own
   config resolution — tuning values live only in `configs/` JSON.
+- Unit tests assert, they do not dump. Flag `print(...)` of tensors, shapes,
+  or timings and any ad-hoc `if __name__ == "__main__"` reporting block in a
+  test file: correctness is checked with asserts
+  (`torch.testing.assert_close` and friends) so a regression fails the test
+  instead of needing a human to read the log. Some older tests still print —
+  flag new dumps, not the ones already there.
+- No autotuning in unit tests: flag `@triton.autotune`, an autotune config
+  sweep, or a loop over tile sizes inside a test. Tests exercise the config
+  the wrapper resolves for the shape; tuning belongs in the tuning scripts
+  and benchmarks.
 - Benchmarks live in `op_tests/op_benchmarks/triton/` as `bench_<op>.py`,
   structured like the existing files. The config and shuffle rules above
   apply to them too: no hardcoded tuning dicts, shuffles imported from

@@ -4,8 +4,15 @@
 import triton
 import triton.language as tl
 
+from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
 
-@triton.jit
+_fused_qk_norm_rope_cached_repr = make_kernel_repr(
+    "_fused_qk_norm_rope_cached_kernel",
+    ["BLOCK_H", "BLOCK_D"],
+)
+
+
+@triton.jit(repr=_fused_qk_norm_rope_cached_repr)
 def _fused_qk_norm_rope_cached_kernel(
     q_ptr,
     k_ptr,
