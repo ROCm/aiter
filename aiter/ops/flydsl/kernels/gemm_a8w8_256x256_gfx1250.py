@@ -62,9 +62,8 @@ def launch_gemm_a8w8_256x256(
     split_k: Constexpr[int] = 1,
     a_preshuffle: Constexpr[bool] = False,
     persistent_n_tiles: Constexpr[int] = 1,
-    fused_splitk: Constexpr[bool] = False,
     bounded_m: Constexpr[bool] = True,
-    splitk_mode: Constexpr[str] = "atomic",
+    splitk_mode: Constexpr[str] = "none",
 ):
     """N must be a multiple of ``tile_n * cluster_n``; M is unrestricted (a
     multiple of 2 when ``a_preshuffle``); K must be divisible by 128 and at
@@ -87,15 +86,17 @@ def launch_gemm_a8w8_256x256(
     assert (
         persistent_n_tiles == 1 or split_k == 1
     ), "persistent_n_tiles>1 requires split_k=1"
-    assert splitk_mode in ("atomic", "fsk"), f"unknown splitk_mode {splitk_mode!r}"
-    _fused = fused_splitk and split_k > 1
-    atomic_splitk = _fused and splitk_mode == "atomic"
-    # "fsk": every K split of a tile shares one hardware cluster and reduces a
-    # disjoint row range behind a cluster barrier.
-    cluster_splitk = _fused and splitk_mode == "fsk"
-    assert (
-        not cluster_splitk or block_size == 128
-    ), "clustered split-K requires block128"
+    assert splitk_mode in (
+        "none",
+        "atomic",
+        "fsk",
+    ), f"unknown splitk_mode {splitk_mode!r}"
+    atomic_splitk = splitk_mode == "atomic"
+    cluster_splitk = splitk_mode == "fsk"
+    assert splitk_mode == "none" or (
+        split_k > 1 and tile_m % split_k == 0
+    ), "a fused split-K epilogue needs split_k > 1 dividing tile_m"
+    assert not cluster_splitk or block_size == 128, "fsk requires split-K block128"
     cluster_k = split_k if cluster_splitk else 1
     assert (
         cluster_m * cluster_n * cluster_k <= 16
@@ -1032,6 +1033,7 @@ def launch_gemm_a8w8_256x256(
                 split_idx=split_idx,
                 mn_oob=mn_oob,
                 flat_tile=_flat_tile,
+                bounded_m=bounded_m,
             )
         else:
             gtC = _gv(

@@ -52,36 +52,25 @@ def get_split_k_flags(stream, device, slots=SPLIT_K_FLAG_MAX_LEN):
     return _cached_split_k_flags(stream, device)
 
 
-SPLITK_MODES = ("atomic", "fsk")
+# Tuned-name suffixes map to these; "none" falls back to the separate reduce.
+SPLITK_MODES = ("none", "atomic", "fsk")
 
 
-def splitk_epilogue_flags(
-    M,
-    N,
-    tile_m,
-    tile_n,
-    cluster_m,
-    cluster_n,
-    split_k,
-    cu_num,
-    compute_bound,
-    fuse_splitk=True,
-    splitk_mode="atomic",
+def resolve_splitk_mode(
+    M, N, tile_m, tile_n, cluster_m, cluster_n, split_k, compute_bound, mode
 ):
-    """Return ``(fused_splitk, bounded_m)`` for one launch."""
-    assert splitk_mode in SPLITK_MODES, f"unknown splitk_mode {splitk_mode!r}"
+    """Narrow a requested split-K mode to what this launch can actually run."""
+    assert mode in SPLITK_MODES, f"unknown splitk_mode {mode!r}"
+    if mode == "none" or not compute_bound:
+        return "none"
+    if split_k < 2 or split_k & (split_k - 1) or tile_m % split_k:
+        return "none"
     wgs = _splitk_grid_wgs(M, N, tile_m, tile_n, cluster_m, split_k)
-    pow2 = split_k & (split_k - 1) == 0
-    fused = (
-        fuse_splitk and compute_bound and split_k > 1 and pow2 and tile_m % split_k == 0
-    )
-    if splitk_mode == "atomic":
-        fused = (
-            fused and wgs * FLAG_STRIDE_I32 <= SPLIT_K_FLAG_MAX_LEN and wgs <= cu_num
-        )
+    if mode == "atomic":
+        ok = wgs * FLAG_STRIDE_I32 <= SPLIT_K_FLAG_MAX_LEN
     else:
-        fused = fused and cluster_m * cluster_n * split_k <= 16
-    return fused, bool(M % tile_m)
+        ok = cluster_m * cluster_n * split_k <= 16
+    return mode if ok else "none"
 
 
 def _splitk_grid_wgs(M, N, tile_m, tile_n, cluster_m, split_k) -> int:
@@ -185,7 +174,6 @@ def _run_mxfp8_128_preshuffle_gemm_a8_gfx1250(
     x_scale_transposed: bool = True,
     a_preshuffle: bool = False,
     persistent_n_tiles: int = 1,
-    fuse_splitk: bool = True,
     splitk_mode: str = "atomic",
 ) -> Tensor:
     """Run the gfx1250 WMMA mxfp8_128 bpreshuffle GEMM.
@@ -330,7 +318,7 @@ def _run_mxfp8_128_preshuffle_gemm_a8_gfx1250(
     ldc = Out.stride(0)
     torch_stream = torch.cuda.current_stream(device=XQ.device)
     stream = _fx.Stream(torch_stream)
-    fused_splitk, bounded_m = splitk_epilogue_flags(
+    mode = resolve_splitk_mode(
         M,
         N,
         tile_m,
@@ -338,13 +326,10 @@ def _run_mxfp8_128_preshuffle_gemm_a8_gfx1250(
         cluster_m,
         cluster_n,
         split_k,
-        torch.cuda.get_device_properties(XQ.device).multi_processor_count,
         compute_bound,
-        fuse_splitk,
         splitk_mode,
     )
-    _atomic_splitk = fused_splitk and splitk_mode == "atomic"
-    _cluster_splitk = fused_splitk and not _atomic_splitk
+    bounded_m = bool(M % tile_m)
     flag = (
         get_split_k_flags(
             torch_stream.cuda_stream,
@@ -352,19 +337,20 @@ def _run_mxfp8_128_preshuffle_gemm_a8_gfx1250(
             _splitk_grid_wgs(M, N, tile_m, tile_n, cluster_m, split_k)
             * FLAG_STRIDE_I32,
         )
-        if _atomic_splitk
+        if mode == "atomic"
         else Out
     )
-    if _cluster_splitk:
-        # One contiguous plane per split of an output tile.  Round M up for
-        # the last tile; the output store's M bound masks its spare rows.
+    if mode == "fsk":
+        # One contiguous plane per split of an output tile, holding only the
+        # peer rows -- the local stripe never leaves LDS.  Round M up for the
+        # last tile; the output store's M bound masks its spare rows.
         partial_shape = (
             ((M + tile_m - 1) // tile_m) * (N // tile_n),
             split_k,
-            tile_m,
+            tile_m - tile_m // split_k if split_k == 2 else tile_m,
             tile_n,
         )
-    elif split_k > 1 and not _atomic_splitk:
+    elif split_k > 1 and mode == "none":
         partial_shape = (split_k, M, ldc)
     else:
         partial_shape = None
@@ -409,13 +395,12 @@ def _run_mxfp8_128_preshuffle_gemm_a8_gfx1250(
             split_k,
             a_preshuffle,
             persistent_n_tiles,
-            fused_splitk,
             bounded_m,
-            splitk_mode,
+            mode,
         )
     else:
         launch(*launch_args, BLOCK_K, split_k, False, 0, 1, a_preshuffle)
-    if partials is not None and not _cluster_splitk:
+    if partials is not None and mode == "none":
         dense = ldc == N
         _run_compiled(
             _compile_splitk_reduce(split_k=split_k, out_dtype_str=out_dtype),
@@ -437,12 +422,12 @@ BASE_NAME_SUFFIX_RE = (
     r"cm(?P<cluster_m>\d+)_cn(?P<cluster_n>\d+)"
 )
 NAME_SUFFIX_RE = (
-    BASE_NAME_SUFFIX_RE + r"(?P<no_fsk>_nofsk)?"
-    r"(?P<splitk_mode>_fsk)?"
+    BASE_NAME_SUFFIX_RE + r"(?P<splitk_mode>_nofsk|_fsk)?"
     r"(?P<a_preshuffle>_apre)?"
     r"(?:_ps(?P<persistent_n_tiles>\d+))?$"
 )
-_SPLITK_MODE_SUFFIX = {None: "atomic", "_fsk": "fsk"}
+# No suffix keeps the historical meaning: the atomic fused epilogue.
+_SPLITK_MODE_SUFFIX = {None: "atomic", "_nofsk": "none", "_fsk": "fsk"}
 _KERNEL_NAME_RE = re.compile(rf"^{re.escape(WMMA_NAME_PREFIX)}_{NAME_SUFFIX_RE}")
 _COMPUTE_KERNEL_NAME_RE = re.compile(
     rf"^{re.escape(COMPUTE_WMMA_NAME_PREFIX)}_{NAME_SUFFIX_RE}"
@@ -456,12 +441,10 @@ def parse_wmma_kernel_name(name: str):
         return None
     groups = match.groupdict()
     a_preshuffle = groups.pop("a_preshuffle", None) is not None
-    no_fsk = groups.pop("no_fsk", None) is not None
     splitk_mode = _SPLITK_MODE_SUFFIX[groups.pop("splitk_mode", None)]
     persistent_n_tiles = groups.pop("persistent_n_tiles", None)
     cfg = {key: int(value) for key, value in groups.items()}
     cfg["a_preshuffle"] = a_preshuffle
-    cfg["fuse_splitk"] = not no_fsk
     cfg["splitk_mode"] = splitk_mode
     cfg["persistent_n_tiles"] = int(persistent_n_tiles) if persistent_n_tiles else 1
     return cfg
@@ -567,7 +550,6 @@ def run_gemm_a8w8_mxfp8_128_bpreshuffle_gfx1250(
         n_warp=cfg["n_warp"],
         x_scale_transposed=True,
         a_preshuffle=cfg["a_preshuffle"],
-        fuse_splitk=cfg["fuse_splitk"],
         splitk_mode=cfg["splitk_mode"],
         persistent_n_tiles=cfg["persistent_n_tiles"],
     )

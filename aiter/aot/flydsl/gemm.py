@@ -84,7 +84,7 @@ from aiter.ops.flydsl.mxfp8_128_bpreshuffle_gemm_gfx1250 import (
     check_persistent_n_tiles,
     cluster_m_fallback_values,
     is_compute_wmma_kernel_name,
-    splitk_epilogue_flags,
+    resolve_splitk_mode,
 )
 from aiter.ops.flydsl.mxfp8_128_bpreshuffle_gemm_gfx1250 import (
     WMMA_NAME_PREFIX as MXFP8_128_WMMA_PREFIX,
@@ -580,7 +580,7 @@ def _compile_mxfp8_128_wmma_to_cache(
         ):
             variant_args = launch_args[:-3] + (variant_cm, cluster_n, True)
             if compute_bound:
-                fused_splitk, row_bounded = splitk_epilogue_flags(
+                mode = resolve_splitk_mode(
                     m,
                     n,
                     tile_m,
@@ -588,25 +588,25 @@ def _compile_mxfp8_128_wmma_to_cache(
                     variant_cm,
                     cluster_n,
                     split_k,
-                    cu_num,
                     True,
-                    splitk_mode=splitk_mode,
+                    splitk_mode,
                 )
+                row_bounded = bool(m % tile_m)
                 cb_args = (
                     variant_args[:12]
                     + (_ptr_view_safe(flag), _ptr_view_safe(out))
                     + variant_args[12:]
                 )
-                for bounded_m in ((False, True) if fused_splitk else (row_bounded,)):
+                bounds = (False, True) if mode != "none" else (row_bounded,)
+                for bounded_m in bounds:
                     launch(
                         *cb_args,
                         SCALE_BLOCK_SIZE,
                         split_k,
                         a_preshuffle,
                         persistent_n_tiles,
-                        fused_splitk,
                         bounded_m,
-                        splitk_mode,
+                        mode,
                     )
             else:
                 launch(
