@@ -196,7 +196,8 @@ def pa_decode(
     are not inspected here (which would synchronize the device). Callers must
     ensure ``0 <= context_lengths[i] <= block_tables.shape[1] * block_size`` and
     that every block-table entry used by a sequence is a physical block index in
-    ``[0, key_cache.shape[0])``.
+    ``[0, min(key_cache.shape[0], value_cache.shape[0]))`` -- a packed cache
+    reaches V through a shifted view that spans fewer blocks than K.
     """
     if context_partition_size != KV_COMPUTE_BLOCK:
         raise NotImplementedError(
@@ -326,9 +327,13 @@ def pa_decode(
                 f"got {tuple(value_cache.shape)} for block_size={block_size}, "
                 f"head_dim={head_dim}"
             )
-    if v_num_blocks != num_blocks:
+    # A packed cache interleaves K and V in one allocation, so the V view starts
+    # part-way into it and legitimately spans fewer blocks than K. Block ids live
+    # on the device, so V's usable extent is a caller contract either way; only
+    # the inverted-argument direction is worth rejecting here.
+    if v_num_blocks > num_blocks:
         raise ValueError(
-            f"key_cache and value_cache must have the same number of blocks, "
+            f"value_cache must not span more blocks than key_cache, "
             f"got {num_blocks} and {v_num_blocks}"
         )
     if v_num_kv_heads != num_kv_heads:
