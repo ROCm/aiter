@@ -51,7 +51,7 @@ def _build_inverted_topk(indices, num_kv):
     """
     N, topk = indices.shape
     flat = indices.reshape(-1).long()
-    valid = flat >= 0
+    valid = (flat >= 0) & (flat < num_kv)
 
     positions = torch.arange(N * topk, device=indices.device, dtype=torch.int64)
     valid_pos = positions[valid]
@@ -252,6 +252,8 @@ class SparseMLADSV4Function(torch.autograd.Function):
     @staticmethod
     def forward(ctx, q, kv, attn_sink, indices, scale):
         out, lse = sparse_mla_fwd(q, kv, attn_sink, indices, scale)
+        if attn_sink is None:
+            attn_sink = torch.empty(0, device=q.device, dtype=torch.float32)
         ctx.save_for_backward(q, kv, out, indices, lse, attn_sink)
         ctx.scale = scale
         return out
@@ -259,7 +261,7 @@ class SparseMLADSV4Function(torch.autograd.Function):
     @staticmethod
     def backward(ctx, do):
         q, kv, o, indices, lse, attn_sink = ctx.saved_tensors
-        has_sink = attn_sink is not None and attn_sink.numel() > 1
+        has_sink = attn_sink.numel() > 0
 
         dq, dkv, d_sink = sparse_mla_bwd(
             q,
