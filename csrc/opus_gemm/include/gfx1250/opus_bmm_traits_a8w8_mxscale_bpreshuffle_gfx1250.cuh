@@ -2002,6 +2002,26 @@ using opus_bmm_a8w8_mxscale_bpreshuffle_tile_ns128_gn128_sf_bk256_gfx1250 =
         /*SF_A_LDS*/true, /*SF_B_LDS*/true,
         /*SF_A_TDM_KG*/0, /*SF_A_TDM_PAD*/16, /*TILE_M*/2, /*NO_SPEC*/true>;
 
+// kid60: kid46's geometry with kid56's C write-out. kid46 is four waves on the
+// same 256x256 tile, so its wave grid is 2x2 and the per-wave tile is square:
+// kExpM = kExpN = 8, which is 4*(8+8)/(8*8) = 1.0 ds_reads per WMMA against
+// kid35's 1.5 at 8 waves (2x4, kExpN=4). Measured LDS load instructions track
+// that exactly -- kid35 issues 1.44x FlyDSL's, and FlyDSL's own warp layout
+// (mw1_nw4 on 128x512) is also 1.0. Stacking C_VIA_LDS on top combines the two
+// wins; kid46 alone was only worth ~4% back when s_wait_xcnt still took 25.5%
+// and the LDS path was not the binding cost.
+template <typename DataC>
+using opus_bmm_a8w8_mxscale_bpreshuffle_tile_ns128_ctdm_gfx1250 =
+    opus_bmm_a8w8_mxscale_bpreshuffle_traits_gfx1250<
+        /*BLOCK_SIZE*/128, /*B_M*/256, /*B_N*/256, /*B_K*/256,
+        /*LAYOUT*/opus_gfx1250_bmm::kLayoutTileN,
+        /*D_A*/opus::fp8_t, /*D_B*/opus::fp8_t, /*D_C*/DataC, /*D_ACC*/float,
+        /*GROUP_K*/128, /*NUM_SLOTS*/2, /*WG_PER_CU*/1, /*GROUP_N*/128,
+        /*SF_A_LDS*/true, /*SF_B_LDS*/true,
+        /*SF_A_TDM_KG*/0, /*SF_A_TDM_PAD*/16, /*TILE_M*/2, /*NO_SPEC*/true,
+        /*SF_A_PANEL_KG*/128, /*ALL_READS_FIRST*/false, /*DS_LOOKAHEAD*/-1,
+        /*TDM_SCOPE*/0, /*C_VIA_LDS*/true>;
+
 // kid47: depth instead of width. Four waves, slots=THREE.
 //
 // ATT settled what the ring wait actually is. kid35 waits 490 cycles a
