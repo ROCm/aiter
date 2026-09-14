@@ -118,8 +118,9 @@ DINLINE opus::fp32_t downcast_s<opus::fp32_t>(opus::fp32_t val)
 // shared Signal meta buffer (offset kLLScratchOffset), so no extra cross-rank
 // exchange is needed — peer scratch base = (char*)sg_.signals[i] + off.
 
-// gfx1250 AR supports world_size <= 4; size scratch for the max.
-constexpr int    kLLMaxRanks       = 4;
+// gfx1250 AR supports world_size <= 8 (cross-node via symm_mem/mori for 6/8);
+// size scratch for the max so the LL fast path never writes out of bounds.
+constexpr int    kLLMaxRanks       = 8;
 // Route to LL when bytes <= this (matches RCCL DDA_ALLREDUCE_LL_THRESHOLD).
 constexpr size_t kLLArMaxBytes     = 4194304;           // 4 MiB
 // Hard per-message payload cap (one slot). Comfortably above the routing

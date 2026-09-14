@@ -269,7 +269,7 @@ def _should_use_vmm(is_gfx1250: bool) -> bool:
 
 _is_gfx1250 = _detect_gfx1250()
 _use_vmm = _should_use_vmm(_is_gfx1250)
-_use_symm_mem = _env_flag("AITER_CUSTOM_AR_USE_SYMM_MEM")
+_use_symm_mem = env_flag("AITER_CUSTOM_AR_USE_SYMM_MEM")
 
 try:
     if _is_gfx1250:
