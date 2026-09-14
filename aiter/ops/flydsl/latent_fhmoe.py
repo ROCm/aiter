@@ -99,7 +99,7 @@ def _get_workspace(
                 (max_sorted, 112), dtype=dtypes.fp8_e8m0, device=device
             ),
             inter_storage=torch.empty(
-                (m, total_topk, 1536), dtype=torch.uint8, device=device
+                (max_sorted, 1536), dtype=torch.uint8, device=device
             ),
             routed_inter_scale=torch.empty(
                 scale_rows * 16, dtype=torch.uint8, device=device
