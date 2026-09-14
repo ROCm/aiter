@@ -277,31 +277,31 @@ def sparse_mla_fwd(
     dtype and kv_scale; each row gives what the caller has to pass. R is the
     QK width, kv_lora_rank + qk_rope_head_dim.
 
-        format          kv_buffer                       kv_scale          geometry args
-        bf16            [slots, R] / [nb, block, R] /   None              as the model
-                        [slots, 1, 1, R], bf16
-        fp8_scalar      same shapes, fp8 or uint8       [1] f32 k_scale   as the model
-                        (GLM-5.x; the only format that
-                        can run dot_precision="fp8")
-        fp8_g64         [slots, D] fp8 or uint8         [slots, D//64]    kv_lora_rank=D,
-                        (uniform pool, rope inside)     f32               qk_rope_head_dim=0
-        fp8_dsv32_mla   [nb, block, 656] uint8          None              512 / 64
-                        (DeepSeek-V3.2, Kimi-K3; vLLM
-                        fp8_ds_mla, 512 fp8 | 4 f32
-                        per-128 | 64 bf16 rope)
-        fp8_dsv4_mla    [nb, block, 584] uint8          None              ignored
-                        (DeepSeek-V4; vLLM fp8_ds_mla,
-                        448 fp8 | 64 bf16 rope + 8 B
-                        UE8M0 trailer per block)
+        format         kv_buffer                     kv_scale        geometry args
+        bf16           [slots, R], [nb, block, R],   None            as the model
+                       [slots, 1, 1, R]; bf16
+        fp8_scalar     same shapes, fp8 or uint8     [1] f32         as the model
+                       (GLM-5.x; the only format
+                       that runs dot_precision="fp8")
+        fp8_g64        [slots, D] fp8 or uint8       [slots, D//64]  kv_lora_rank=D,
+                       (uniform pool, rope inside)   f32             qk_rope_head_dim=0
+        fp8_dsv32_mla  [nb, block, 656] uint8        None            512 / 64
+                       (DeepSeek-V3.2, Kimi-K3; vLLM
+                       fp8_ds_mla: 512 fp8 | 4 f32
+                       per-128 | 64 bf16 rope)
+        fp8_dsv4_mla   [nb, block, 584] uint8        None            ignored
+                       (DeepSeek-V4; vLLM fp8_ds_mla:
+                       448 fp8 | 64 bf16 rope + 8 B
+                       UE8M0 trailer per block)
 
     Geometry, set by qk_rope_head_dim: separated rope (DeepSeek-V3.2,
     GLM-5.1/5.2), where the query is the latent plus an appended rope and V is
     the latent; rope-free (GLM-5.3-Flash), qk_rope_head_dim=0, where the query
     is the latent alone. DeepSeek-V4 keeps its rope inside the 512-wide row
     (448 nope + 64 rope) with V the whole row; that layout is fixed by the cache
-    format, so the geometry args are not read for it.
-    A bf16 pool carries no rope information, so a rope-inside or rope-free
-    model on a bf16 cache must pass qk_rope_head_dim=0.
+    format, so the geometry args (kv_lora_rank and qk_rope_head_dim) are not
+    read for it. A bf16 pool carries no rope information, so a rope-inside or
+    rope-free model on a bf16 cache must pass qk_rope_head_dim=0.
 
     Args:
         q: [C, H, kv_lora_rank + qk_rope_head_dim] queries, one row per
@@ -373,7 +373,7 @@ def sparse_mla_fwd(
             extra_indptr,
             extra_indices,
         )
-    assert arch_info.get_arch() == "gfx950", "sparse_mla_fwd is gfx950-only"
+    assert arch_info.get_arch() == "gfx950", "Howgfx950-only"
     q_is_fp8 = q.dtype == torch.float8_e4m3fn
     if q.dtype not in (torch.bfloat16, torch.float8_e4m3fn):
         raise ValueError(
