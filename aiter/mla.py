@@ -1214,7 +1214,12 @@ def mla_prefill_ps_fwd(
     q_scale: torch.Tensor | None = None,
     k_scale: torch.Tensor | None = None,
     v_scale: torch.Tensor | None = None,
-) -> None:
+    return_lse: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor | None]:
+    """Returns `(output, final_lse)`, where `final_lse` is `None` unless `return_lse`.
+
+    `return_lse` should match the `need_lse` used to build the metadata.
+    """
     device = Q.device
     total_s, nhead, v_head_dim = output.shape
     if softmax_scale is None:
@@ -1229,7 +1234,11 @@ def mla_prefill_ps_fwd(
     attn_lse = torch.empty(
         (reduce_partial_map.size(0) * tile_q, nhead), dtype=dtypes.fp32, device=device
     )
-    final_lse = torch.empty((total_s, nhead), dtype=dtypes.fp32, device=device)
+    final_lse = (
+        torch.empty((total_s, nhead), dtype=dtypes.fp32, device=device)
+        if return_lse
+        else None
+    )
 
     aiter.mla_prefill_ps_asm_fwd(
         Q,
@@ -1263,7 +1272,7 @@ def mla_prefill_ps_fwd(
         final_lse,
     )
 
-    return output.view(total_s, nhead, v_head_dim), attn_lse
+    return output.view(total_s, nhead, v_head_dim), final_lse
 
 
 @triton.jit
