@@ -200,13 +200,13 @@ def _build_kernel_mfma_r_w(
             # Map FN byte 0x80 (neg-zero, = FNUZ NaN) -> 0x00 in 8 packed fp8 bytes.
             raw = fx.Int64(raw_i64)
             lo_i32 = fx.Int32(raw)
-            hi_i32 = fx.Int32(raw.shrui(32))
+            hi_i32 = fx.Int32(raw.shrui(fx.Int64(32)))
 
             def _fix_i32(src):
                 result = fx.Int32(0)
                 for byte_idx in range_constexpr(4):
                     shift = byte_idx * 8
-                    byte_val = src.shrui(shift) & 0xFF
+                    byte_val = src.shrui(fx.Int32(shift)) & 0xFF
                     is_0x80 = byte_val == 0x80
                     cleaned = is_0x80.select(fx.Int32(0), byte_val)
                     result = result | (cleaned << shift)
