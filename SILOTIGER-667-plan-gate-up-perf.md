@@ -299,23 +299,42 @@ Native gate/up at Qwen B=1 is **1.25 waves/CU**. Extra `k0` shards multiply
 the grid and shorten the per-wave INTER-side K loop — the opposite of native
 down, where the grid already filled CUs.
 
-Policy (mirrors down’s CU-aware split, but for **gate/up native**): only
-when `base_grid * k_batch <= CuCount` and `num_kpack % k_batch == 0`.
-DeepSeek B=1 (4 waves/CU) may take a small `k_batch` if VGPR allows; Qwen
-B=1 is the must-win. Epilogue: `klane==0` `atomic_add_f32` into a zeroed
-workspace, then one silu×up store (or fused last-shard silu if that stays
-bit-identical enough for cos ≥ 0.999 — prefer a clear two-step if fusion
-fights the atomic).
+Do **not** copy down’s `base_grid * k_batch <= CuCount` gate. That rule
+never enables Qwen B=1 (`320 > 256` already at `k_batch=1`), which is why
+native-down split-K is WontFix and would make this subtask a no-op.
+
+**Auto policy (occupancy, not CU-fill):** `waves = B × TOPK × (INTER/16)`,
+`occ = waves / CuCount`. Default `k_batch=1`. Else pick the largest
+`k ∈ {4, 2}` such that all of:
+
+- `occ < 2` (under-occupied; Qwen B=1 is 1.25, Qwen B=2 is 2.5, DeepSeek
+  B=1 is 4)
+- `num_kpack % k == 0`
+- `occ * k <= 5` (do not drive past ~5 waves/CU)
+
+That turns on **only Qwen B=1** in the of-record G9 matrix (`k=2` → 2.5
+waves/CU, `k=4` → 5). Qwen B=2 and all DeepSeek batches stay `k_batch=1`
+unless a dedicated A/B beats of-record **both** B=1 and B=2 (locked
+decision). After-prefetch VGPRs are 48; extra waves may not resident —
+that is an A/B, not a reason to skip the Qwen B=1 must-win. Depth-1
+prefetch still has enough `k0` at `k=2` (16) or `k=4` (8) on Qwen FP8
+(`num_kpack=32`).
+
+Qwen B=1 is the must-win. Epilogue: `klane==0` `atomic_add_f32` into a
+zeroed workspace, then one silu×up store (or fused last-shard silu if that
+stays bit-identical enough for cos ≥ 0.999 — prefer a clear two-step if
+fusion fights the atomic).
 
 Do **not** turn this on for large-B DeepSeek if `%peak` is already high
-(B=32 gate_up FP8 ~74%): extra atomics would cost bandwidth.
+(B=32 gate_up FP8 ~74%): extra atomics would cost bandwidth. The occupancy
+gate above already keeps those grids at `k_batch=1`.
 
 - [ ] Native gate/up `k_batch` (or equivalent `k0` shard) + dispatch.
-- [ ] Auto policy vs CU count; Qwen B=1 uses `k_batch>1`; saturated grids
-      stay `k_batch=1`.
+- [ ] Auto occupancy policy as above; Qwen B=1 uses `k_batch>1`; Qwen B=2
+      and DeepSeek stay `k_batch=1` unless an A/B wins both batches.
 - [ ] **Done when:** op_test covers split and non-split; G9 Qwen B=1 gate_up
-      FP8 vs CK improves vs the baseline in this file; DeepSeek B=32 does
-      not regress outside noise.
+      FP8 vs CK improves vs the baseline in this file; G9 gate_up B=1 and
+      B=2 do not regress vs of-record (lock).
 
 ## Non-goals (do not pull into this plan)
 
