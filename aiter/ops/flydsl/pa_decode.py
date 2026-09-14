@@ -407,7 +407,6 @@ def pa_decode(
         and num_kv_heads == 1
         and query_length == 1
         and query_group_size in (8, 16)
-        and num_partitions == 8
     )
     page16_vpipe_iglp = page16_vpipe and page16_vpipe_iglp
 
