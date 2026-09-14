@@ -288,9 +288,7 @@ class Cfg:
         KV_DIM,
         ROPE_DIM,
         ROPE_SEPARATE,
-        MFMA_K,
         NUM_WARPS,
-        GATHER_TW1,
         UNI_TILE,
         HAS_INVALID,
         HEAD_ALIGNED,
@@ -310,6 +308,8 @@ class Cfg:
         self.ROPE_SEPARATE = gl.constexpr(ROPE_SEPARATE)
         self.QK_DIM = gl.constexpr(KV_DIM + (ROPE_DIM if ROPE_SEPARATE else 0))
         self.NUM_WARPS = gl.constexpr(NUM_WARPS)
+        # Threads the row gather spends on the head dim
+        GATHER_TW1 = 32
         self.GATHER_TW1 = gl.constexpr(GATHER_TW1)
         LDS_PAD = 16 if FP8_MFMA else 8
         self.LDS_PAD = gl.constexpr(LDS_PAD)
@@ -323,11 +323,7 @@ class Cfg:
         self.ASYNC_LDS = gl.constexpr(ASYNC_LDS)
         self.RELAXED_LOAD = gl.constexpr(RELAXED_LOAD)
         self.ROPE_VEC = gl.constexpr(ROPE_VEC)
-        # K=32 is the only shape the backend offers for plain fp8 operands, and
-        # it divides KV_DIM, ROPE_DIM and BLOCK_K alike, so one layout still
-        # covers both dots.
-        if FP8_MFMA:
-            MFMA_K = 32
+        MFMA_K = 32 if FP8_MFMA else 16
         self.MFMA_K = gl.constexpr(MFMA_K)
 
         self.qk_layout = gl.constexpr(
@@ -1733,8 +1729,6 @@ def _sparse_mla(
     BLOCK_K: gl.constexpr,
     NUM_SPLITS: gl.constexpr,
     HEAD_ALIGNED: gl.constexpr,
-    MFMA_K: gl.constexpr,
-    GATHER_TW1: gl.constexpr,
     # NOPE_CHUNK: extent of one dequant piece along CHUNK_AXIS (0 = rows,
     # 1 = columns); >= the tile's extent means one shot.
     NOPE_CHUNK: gl.constexpr,
@@ -1848,9 +1842,7 @@ def _sparse_mla(
         HEAD_SIZE,
         ROPE_DIM,
         ROPE_SEPARATE,
-        MFMA_K,
         NUM_WARPS,
-        GATHER_TW1,
         UNI_TILE,
         HAS_INVALID,
         HEAD_ALIGNED,

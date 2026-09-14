@@ -22,14 +22,6 @@ from aiter.ops.triton.utils.logger import AiterTritonLogger
 _LOGGER = AiterTritonLogger()
 
 
-# Tuned launch config (gfx950 / MI355). num_warps = BLOCK_K // 16 (warps tile
-# the dot-N, MFMA N=16); GATHER_TW1=32 requests a whole 512 B token row per
-# gather instruction.
-_BLOCK_K = 64
-_MFMA_K = 16
-_GATHER_TW1 = 32
-
-
 def _check_out(out, q, kv_lora_rank):
     """Caller-supplied output buffer, or a fresh one. A buffer wider than
     kv_lora_rank is accepted and written in its leading columns."""
@@ -67,7 +59,9 @@ def _cache_pointers(fmt, kv, d_qk, kv_scale):
     return u8, u8.view(torch.bfloat16), u8.view(torch.float32), u8.shape[1]
 
 
-def _mla_num_splits(num_queries: int, heads_blocks: int, avg_topk: float) -> int:
+def _mla_num_splits(
+    num_queries: int, heads_blocks: int, avg_topk: float, block_k: int = 64
+) -> int:
     """Split-K count for the sparse-MLA decode.
 
     Below one workgroup per CU, split to fill the machine but never past 8.
@@ -75,7 +69,7 @@ def _mla_num_splits(num_queries: int, heads_blocks: int, avg_topk: float) -> int
     num_sms = get_num_sms()
     base_wg = max(1, num_queries * heads_blocks)
     cta_cap = max(1, (2 * num_sms) // base_wg)
-    tiles = max(1, math.ceil(avg_topk / _BLOCK_K))
+    tiles = max(1, math.ceil(avg_topk / block_k))
     if base_wg >= num_sms:
         return max(1, min(cta_cap, tiles // 16))
     return max(1, min(cta_cap, tiles, 8))
@@ -97,6 +91,7 @@ def _async_launch_config(
     use_buffer_load: bool,
     uni_tile: bool = True,
     has_extra: bool = False,
+    block_k: int = 64,
 ) -> tuple[bool, int, int]:
     """-> (ASYNC_LDS, BLOCK_K, waves_per_eu) for this launch.
 
@@ -115,7 +110,7 @@ def _async_launch_config(
     waves_per_eu = 2
     if use_buffer_load and workgroups <= num_sms:
         waves_per_eu = 1
-    return enabled, (128 if enabled else _BLOCK_K), waves_per_eu
+    return enabled, (128 if enabled else block_k), waves_per_eu
 
 
 def _resolve_dot_precision(dot_precision: str, fmt: str) -> bool:
@@ -520,9 +515,11 @@ def sparse_mla_fwd(
         # The kernel still wants a live pointer for the compile-time-elided slot.
         attn_sink = torch.empty(1, device=q.device, dtype=torch.float32)
 
-    # H < 16 runs natively at BLOCK_M = next_pow2(H) instead of padding heads.
+    # Tuned launch config (gfx950 / MI355). H < 16 runs natively at
+    # BLOCK_M = next_pow2(H) instead of padding heads
     block_m = 16 if num_heads >= 16 else max(8, 1 << (num_heads - 1).bit_length())
-    num_warps = _BLOCK_K // 16
+    block_k = 64
+    num_warps = block_k // 16
 
     num_rows = cache.shape[0] * block_size if cache.ndim >= 2 else cache.shape[0]
     avg_topk = kv_indices.numel() / max(1, num_queries)
@@ -553,7 +550,7 @@ def sparse_mla_fwd(
     if kv_splits is not None:
         num_splits = max(1, int(kv_splits))
     else:
-        num_splits = _mla_num_splits(num_queries, heads_blocks, avg_topk)
+        num_splits = _mla_num_splits(num_queries, heads_blocks, avg_topk, block_k)
 
     if num_splits > 1:
         part_m = torch.empty(
@@ -578,9 +575,9 @@ def sparse_mla_fwd(
         pm_stride0 = pm_stride_s = pa_stride0 = pa_stride_s = pa_stride_h = 0
 
     # Dequant chunking
-    col_reps = kv_lora_rank // (_GATHER_TW1 * 16)
+    col_reps = kv_lora_rank // 512  # the kernel gathers 512 B per row per instruction
     chunk_axis = 1 if col_reps >= 4 else 0
-    nope_chunk = max(1, _BLOCK_K // 4) if chunk_axis == 0 else min(128, kv_lora_rank)
+    nope_chunk = max(1, block_k // 4) if chunk_axis == 0 else min(128, kv_lora_rank)
     async_lds_on, block_k, waves_per_eu = _async_launch_config(
         fp8_dots,
         has_invalid,
@@ -591,9 +588,8 @@ def sparse_mla_fwd(
         use_buffer_load,
         uni_tile=True,
         has_extra=False,
+        block_k=block_k,
     )
-    # num_warps stays 4: warps tile the dot's N (MFMA N=16), so a larger BLOCK_K just
-    # gives each warp two N tiles.
 
     # Q is read once per query without split-K, and re-read by every split
     q_cache = ".cg" if num_splits == 1 else ""
@@ -645,8 +641,6 @@ def sparse_mla_fwd(
         BLOCK_K=block_k,
         NUM_SPLITS=num_splits,
         HEAD_ALIGNED=head_aligned,
-        MFMA_K=_MFMA_K,
-        GATHER_TW1=_GATHER_TW1,
         NOPE_CHUNK=nope_chunk,
         CHUNK_AXIS=chunk_axis,
         PART_STORE_CACHE="",

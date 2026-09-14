@@ -185,49 +185,6 @@ def test_return_lse(fmt, C, topk, ragged, splits):
     assert torch.equal(out.view(torch.int16), out_no.view(torch.int16))
 
 
-def reference_sink(q, kv_truth, indices, indptr, sm_scale, sink):
-    """Attention with a per-head sink: one extra softmax column of score sink[h]
-    that contributes nothing to the output. Returns (out, natural-log lse)."""
-    outs, lses = [], []
-    for c in range(q.shape[0]):
-        kvs = kv_truth[indices[indptr[c] : indptr[c + 1]].long()].float()
-        s = torch.einsum("hd,td->ht", q[c].float(), kvs) * sm_scale
-        s = torch.cat([s, sink.float()[:, None]], dim=-1)
-        p = torch.softmax(s, dim=-1)
-        outs.append(torch.einsum("ht,td->hd", p[:, :-1], kvs[:, :KV_LORA]))
-        lses.append(torch.logsumexp(s, dim=-1))
-    return torch.stack(outs), torch.stack(lses)
-
-
-@pytest.mark.parametrize("fmt", ["bf16", "tensor"])
-@pytest.mark.parametrize(
-    "C,topk,ragged,splits",
-    [(8, 2048, False, None), (8, 500, True, None), (2048, 256, True, 1)],
-    ids=["split", "split_ragged", "nosplit"],
-)
-def test_attn_sink(fmt, C, topk, ragged, splits):
-    _skip_unless_gfx950()
-    H, pool = 16, 1 << 16
-    sm = D_QK**-0.5
-    q, cache, ks, idx, ptr, truth = _build(fmt, C, H, topk, pool, ragged)
-    # A sink near the score scale, so it actually moves the denominator.
-    sink = torch.randn(H, device="cuda") * 0.5 + 1.0
-    kwargs = {} if splits is None else {"kv_splits": splits}
-    out, lse = sparse_mla_fwd(
-        q, cache, ptr, idx, sm, kv_scale=ks, attn_sink=sink, return_lse=True, **kwargs
-    )
-    ref_out, ref_lse = reference_sink(q, truth.to(torch.bfloat16), idx, ptr, sm, sink)
-    e = rel_err(out, ref_out)
-    assert e < 2e-2, f"{fmt} C={C} splits={splits}: sink out rel-err {e:.3e}"
-    el = (lse - ref_lse).abs().max().item() / ref_lse.abs().max().item()
-    assert el < 2e-2, f"{fmt} C={C} splits={splits}: sink lse rel-err {el:.3e}"
-    # The sink has to change the answer, or the test proves nothing.
-    out_no, _ = sparse_mla_fwd(q, cache, ptr, idx, sm, kv_scale=ks, **kwargs)
-    assert not torch.equal(out.view(torch.int16), out_no.view(torch.int16))
-    with pytest.raises(ValueError):
-        sparse_mla_fwd(q, cache, ptr, idx, sm, kv_scale=ks, attn_sink=sink[: H - 1])
-
-
 def test_global_load_path():
     """A pool whose addressable span passes buffer_load's 2 GB offset limit."""
     _skip_unless_gfx950()

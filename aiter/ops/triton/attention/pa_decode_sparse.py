@@ -482,12 +482,8 @@ def _pa_decode_sparse_gfx950_gluon(
     # Tuned launch config (gfx950 / MI355). BLOCK_M = heads per MFMA M-tile, and 16
     # is both the MFMA M and the DSv4 head count; BLOCK_K = KV tile; num_warps =
     # BLOCK_K // 16, because warps tile the dot-N and MFMA N = 16.
-    BLOCK_M, BLOCK_K, MFMA_K = 16, 64, 16
+    BLOCK_M, BLOCK_K = 16, 64
     num_warps = max(1, BLOCK_K // 16)
-    # Threads the NoPE gather spends on the head dim, 16 B each: 32 requests a whole
-    # 512 B token row per instruction instead of four 128 B quarters, which is what
-    # a scattered top-k gather wants. The cost is a longer per-lane slot vector.
-    gather_tw1 = 32
     NOPE_DIM, ROPE_DIM = 448, 64
     MAX_BYTES = 2**31 - 1
 
@@ -632,7 +628,7 @@ def _pa_decode_sparse_gfx950_gluon(
         pm_stride0 = pm_stride_s = pa_stride0 = pa_stride_s = pa_stride_h = 0
 
     # Dequant chunking
-    col_reps = head_dim // (gather_tw1 * 16)
+    col_reps = head_dim // 512  # the kernel gathers 512 B per row per instruction
     chunk_axis = 1 if col_reps >= 4 else 0
     nope_chunk = max(1, BLOCK_K // 4) if chunk_axis == 0 else min(128, head_dim)
 
@@ -712,8 +708,6 @@ def _pa_decode_sparse_gfx950_gluon(
         BLOCK_K=BLOCK_K,
         NUM_SPLITS=num_splits,
         HEAD_ALIGNED=HEAD_ALIGNED,
-        MFMA_K=MFMA_K,
-        GATHER_TW1=gather_tw1,
         NOPE_CHUNK=nope_chunk,
         CHUNK_AXIS=chunk_axis,
         PART_STORE_CACHE="",
