@@ -1048,6 +1048,33 @@ def _tdm_load_views(
     return views
 
 
+def _dense_warp_view_args(*, bases, n_block, row_bytes, kv_row0, kv_valid, producer_warp,
+                          num_producer_warps):
+    """Per-wave dense sub-tile placement for a 2-way-split K|V TDM load.
+
+    Wave ``producer_warp`` (0..num_producer_warps-1, runtime) owns kv rows
+    ``[w*rows, (w+1)*rows)`` of the tile and copies them alone (``num_warps=1``), so it issues
+    one ``tensor_load`` per pow2 hdim segment instead of a share of every split's copy. The
+    waves of a split are contiguous, so the LDS destination stays dense inside its chunk.
+    Returns ``(lds_base, row0, valid, num_rows)`` for ``_tdm_load_views``."""
+    num_splits = len(bases)
+    _assert_multiple("n_block", n_block, num_producer_warps)
+    if num_producer_warps % num_splits:
+        raise ValueError(
+            f"{num_producer_warps} producer waves do not divide over {num_splits} LDS splits"
+        )
+    num_rows = n_block // num_producer_warps
+    warps_per_split = num_producer_warps // num_splits
+    base = bases[-1]
+    for s in range(num_splits - 2, -1, -1):
+        base = (producer_warp < fx.Int32((s + 1) * warps_per_split)).select(bases[s], base)
+    r0 = producer_warp * fx.Int32(num_rows)
+    lds_base = base + (producer_warp % fx.Int32(warps_per_split)) * fx.Int32(
+        num_rows * row_bytes
+    )
+    return lds_base, kv_row0 + r0, fx.max(kv_valid - r0, fx.Int32(0)), num_rows
+
+
 class QManager16bV2:
     """Q loader (per-warp TDM + row-major padded LDS). No ring buffer: each wave TDM-copies
     ALL of its Q rows — a ``(WMMA_M * q_tiles_per_wave) x qk_hdim`` tile — into its own private
@@ -1248,38 +1275,37 @@ class KManager16bV2:
         kv_head,
         kv_row0,
         kv_valid,
-        num_warps=None,
+        num_warps,
+        producer_warp,
     ):
-        """Return a LIST of ``(atom, g_view, lds_view)`` TDM copies for this block's K tile into the
-        padded LDS at ``ptr_lds`` — one per pow2 hdim segment (1 for 128/256, 2 for 192) per LDS
-        split. ``ptr_lds`` is one fx.Int32 byte base, or a list of CALLER-PLACED sub-buffer bases;
-        split ``s`` of ``S = len(ptr_lds)`` holds kv rows ``[s*n_block/S, (s+1)*n_block/S)``.
-        Pure (hoistable); issue each with ``fx.copy_atom_call(*view)``, drain with
-        ``tdm_ops.tensor_wait(0)``."""
-        bases = _as_bases(ptr_lds)
-        rows_per_split = self._rows_per_split(len(bases))
-        views = []
-        for s, base in enumerate(bases):
-            r0 = s * rows_per_split
-            views += _tdm_load_views(
-                ptr_x=ptr_K,
-                stride_seq=stride_k_seq,
-                stride_head=stride_k_head,
-                head=kv_head,
-                row0=kv_row0 if r0 == 0 else kv_row0 + fx.Int32(r0),
-                valid=(
-                    kv_valid
-                    if r0 == 0
-                    else fx.max(kv_valid - fx.Int32(r0), fx.Int32(0))
-                ),
-                num_rows=rows_per_split,
-                hdim=self.qk_hdim,
-                pad_elems=_K_PAD_ELEMS,
-                lds_base=base,
-                elem_dtype=self.elem_dtype,
-                num_warps=self.num_waves if num_warps is None else num_warps,
-            )
-        return views
+        """Return a LIST of ``(atom, g_view, lds_view)`` TDM copies for THIS wave's dense band
+        of the block's K tile — one per pow2 hdim segment (1 for 128/256, 2 for 192).
+        ``ptr_lds`` is the list of CALLER-PLACED sub-buffer bases; see
+        ``_dense_warp_view_args`` for the wave -> (split, rows) mapping. Pure (hoistable);
+        issue each with ``fx.copy_atom_call(*view)``, drain with ``tdm_ops.tensor_wait(0)``."""
+        lds_base, row0, valid, num_rows = _dense_warp_view_args(
+            bases=_as_bases(ptr_lds),
+            n_block=self.n_block,
+            row_bytes=self.row_bytes,
+            kv_row0=kv_row0,
+            kv_valid=kv_valid,
+            producer_warp=producer_warp,
+            num_producer_warps=num_warps,
+        )
+        return _tdm_load_views(
+            ptr_x=ptr_K,
+            stride_seq=stride_k_seq,
+            stride_head=stride_k_head,
+            head=kv_head,
+            row0=row0,
+            valid=valid,
+            num_rows=num_rows,
+            hdim=self.qk_hdim,
+            pad_elems=_K_PAD_ELEMS,
+            lds_base=lds_base,
+            elem_dtype=self.elem_dtype,
+            num_warps=1,
+        )
 
     def ds_load_ptrs(self, *, ptr_lds, lane_idx):
         """One per-lane ds_load base pointer per LDS split (a list, matching V1's API) that
@@ -1383,37 +1409,37 @@ class VManager16bV2:
         kv_head,
         kv_row0,
         kv_valid,
-        num_warps=None,
+        num_warps,
+        producer_warp,
     ):
-        """Return a LIST of ``(atom, g_view, lds_view)`` TDM copies for this block's V tile (v_hdim=128
-        is pow2 -> one copy per LDS split). ``ptr_lds`` is one fx.Int32 byte base, or a list of
-        CALLER-PLACED sub-buffer bases; split ``s`` of ``S = len(ptr_lds)`` holds kv rows
-        ``[s*n_block/S, (s+1)*n_block/S)``. Pure; issue each with ``fx.copy_atom_call(*view)``,
-        drain with ``tdm_ops.tensor_wait(0)``."""
-        bases = _as_bases(ptr_lds)
-        rows_per_split = self._rows_per_split(len(bases))
-        views = []
-        for s, base in enumerate(bases):
-            r0 = s * rows_per_split
-            views += _tdm_load_views(
-                ptr_x=ptr_V,
-                stride_seq=stride_v_seq,
-                stride_head=stride_v_head,
-                head=kv_head,
-                row0=kv_row0 if r0 == 0 else kv_row0 + fx.Int32(r0),
-                valid=(
-                    kv_valid
-                    if r0 == 0
-                    else fx.max(kv_valid - fx.Int32(r0), fx.Int32(0))
-                ),
-                num_rows=rows_per_split,
-                hdim=self.v_hdim,
-                pad_elems=_V_PAD_ELEMS,
-                lds_base=base,
-                elem_dtype=self.elem_dtype,
-                num_warps=self.num_waves if num_warps is None else num_warps,
-            )
-        return views
+        """Return a LIST of ``(atom, g_view, lds_view)`` TDM copies for THIS wave's dense band
+        of the block's V tile (v_hdim=128 is pow2 -> one copy). ``ptr_lds`` is the list of
+        CALLER-PLACED sub-buffer bases; see ``_dense_warp_view_args`` for the wave ->
+        (split, rows) mapping. Pure; issue each with ``fx.copy_atom_call(*view)``, drain with
+        ``tdm_ops.tensor_wait(0)``."""
+        lds_base, row0, valid, num_rows = _dense_warp_view_args(
+            bases=_as_bases(ptr_lds),
+            n_block=self.n_block,
+            row_bytes=self.row_bytes,
+            kv_row0=kv_row0,
+            kv_valid=kv_valid,
+            producer_warp=producer_warp,
+            num_producer_warps=num_warps,
+        )
+        return _tdm_load_views(
+            ptr_x=ptr_V,
+            stride_seq=stride_v_seq,
+            stride_head=stride_v_head,
+            head=kv_head,
+            row0=row0,
+            valid=valid,
+            num_rows=num_rows,
+            hdim=self.v_hdim,
+            pad_elems=_V_PAD_ELEMS,
+            lds_base=lds_base,
+            elem_dtype=self.elem_dtype,
+            num_warps=1,
+        )
 
     def ds_load_ptrs(self, *, ptr_lds, lane_idx):
         """One per-lane transpose-load base pointer per LDS split (a list, matching V1's API).

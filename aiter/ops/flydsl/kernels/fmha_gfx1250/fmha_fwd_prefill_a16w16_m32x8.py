@@ -110,10 +110,24 @@ SUPPORTED_QK_HDIM = (128, 192, 256)
 
 # KV sequence block (columns of one QK GEMM tile). Configurable; 64 for now.
 N_BLOCK_CHOICES = (32, 64, 128, 256)
-# Fixed K|V slot stride: one 64 KB LDS segment per slot, independent of hdim/n_block.
-# The slot being read must not share a segment with the slots being written by
-# in-flight copies -- see gfx1250 LDS segment notes.
-LDS_SLOT_BYTES = 64 * 1024
+# ---- LDS chunk layout: 12 x 26 KB = 312 KB of the 320 KB budget. ----
+# Chunk i sits at LDS_CHUNK_BYTES * i, and every K|V tile is MANDATORILY split 2-way
+# along n_block, the two halves landing in chunks 6 apart so they fall in different
+# 64 KB LDS segments (segment = base // 64 KB):
+#
+#   K[0][0]   0..26  seg 0      K[0][1] 156..182  seg 2
+#   V[0][0]  26..52  seg 0      V[0][1] 182..208  seg 2,3
+#   K[1][0]  52..78  seg 0,1    K[1][1] 208..234  seg 3
+#   V[1][0]  78..104 seg 1      V[1][1] 234..260  seg 3,4
+#   K[2][0] 104..130 seg 1,2    K[2][1] 260..286  seg 4
+#   V[2][0] 130..156 seg 2      V[2][1] 286..312  seg 4
+#
+# Q and O own no LDS of their own -- they time-share KV chunks (see _q_wave_base /
+# _o_wave_base). Slot pp owns [52*pp, +52) low and [156 + 52*pp, +52) high.
+LDS_CHUNK_BYTES = 26 * 1024
+KV_LDS_SPLITS = 2  # halves one K (or V) tile is split into along n_block
+# Per-wave Q / O region inside a chunk pair. 17 KB covers 32 rows x 256 hdim + pad.
+LDS_QO_BYTES = 17 * 1024
 
 DEFAULT_N_BLOCK = 64
 
@@ -121,17 +135,10 @@ DEFAULT_N_BLOCK = 64
 # software-pipelined body: it reads V(u-1) from slot 0 and K(u) from slot 1 while the
 # copy for tile u+1 is written into slot 2.
 N_KV_PP = 3
-# Steady-state KV fence depth. True leaves tile t+1's copies in flight across the body
-# (the point of distance-2 prefetch); False drains every body, so only one tile is ever
-# outstanding. MEASURED case 10 @ init=fixed=0.25, 4-5 runs each (the box is ~2% noisy
-# now that the clocks are not pinned): partial min/med 1301/1317 us, full 1281/1293 --
-# partial loses ~1.5%. With 3 slots it has two of them under TDM writes while a third is
-# read, and that write traffic costs more than the extra latency cover buys. Revisit at
-# stage 4, where K/V producer specialization cuts the descriptor count.
-#
-# MUST stay False while the body is software-pipelined: body u reads tile u as K, and a
-# partial fence would leave that tile's copies in flight. N_KV_PP = 4 is what would buy
-# the slack back (it fits: 4*64KB + 69632 O <= 327680).
+# Steady-state KV fence depth. Stage A keeps the full drain: prefetch distance is still
+# 1, so exactly one tile is outstanding at a fence and "wait to 0" is the only correct
+# setting. Stage C moves K one tile ahead of V, which is what makes a partial wait mean
+# something.
 KV_PARTIAL_FENCE = False
 assert not KV_PARTIAL_FENCE, "software-pipelined body needs tile u resident at its top"
 
@@ -162,13 +169,12 @@ BIG_NEG = -1.0e30
 # fewer address VGPRs). Gates all three loaders (Q, K and V); O is selected separately by O_VARIANT.
 USE_TDM_LOADER = True
 
-# K/V producer specialization: the LO half issues every K copy, the HI half every V copy,
-# each as a num_warps = NUM_WAVES//2 TDM copy (the lowering takes a wave's row share from
-# wave_id % num_warps, so waves 4..7 cover the same tile waves 0..3 would). Halves the
-# copies each wave issues and each half's tensorcnt now tracks one operand; the drain
-# barrier still publishes both halves. Requires the TDM loader.
-KV_PRODUCER_SPLIT = True and USE_TDM_LOADER
-KV_PRODUCER_WARPS = NUM_WAVES // 2 if KV_PRODUCER_SPLIT else NUM_WAVES
+# K/V producer specialization (always on; V1's cooperative loaders do not support it).
+# The LO half issues every K copy, the HI half every V copy, and each of a half's
+# KV_PRODUCER_WARPS waves copies one dense n_block/KV_PRODUCER_WARPS row band by itself
+# (num_warps=1), so a wave issues one tensor_load per pow2 hdim segment and each half's
+# tensorcnt tracks one operand. The drain barrier still publishes both halves.
+KV_PRODUCER_WARPS = NUM_WAVES // 2
 
 # LO/HI anti-phase (FA3 ping-pong). Both halves run the same tile stream and the same
 # number of bodies and barriers; the HI half runs its two phases in the opposite order,
@@ -212,12 +218,6 @@ PVQK_LAG = 2
 # NP; 0 restores the un-carried head. Costs 4 VGPR per carried load.
 PVQK_HEAD_CARRY = 20
 
-# Independent LDS sub-buffers one K (or V) tile is split across. The CALLER places them
-# (_k_bufs_at/_v_bufs_at) and the managers read the count off the list length, so this
-# constant never reaches a manager. 1 == today's single contiguous block (IR-identical);
-# >1 lets the halves of a tile be loaded and waited on separately (V2/TDM only).
-KV_LDS_SPLITS = 1
-
 # NOTE: the remaining tiling constants (chunk sizes, K/V write-tile + V swizzle
 # granularity) live inside fmha_b16_buffer_managers.py — they are intrinsic to the
 # managers' LDS layouts, so the kernel no longer declares them here.
@@ -258,6 +258,16 @@ def _kv_drain_depths(num_tensorcnt, num_asynccnt):
     return (0 if num_tensorcnt >= 0 else -1, 0 if num_asynccnt >= 0 else -1)
 
 
+def _bare_barrier():
+    """Workgroup rendezvous with NO memory fence, unlike ``gpu.barrier()``.
+
+    ``gpu.barrier()`` lowers to ``s_wait_storecnt_dscnt 0x0`` + signal/wait, so it would
+    retire a ring head issued just above it. Use this where the barrier is a scheduling
+    or counting rendezvous, or where the caller has already named its own dscnt depth."""
+    rocdl_dialect.s_barrier_signal(-1)
+    rocdl_dialect.s_barrier_wait(-1)
+
+
 def _kv_fence(num_tensorcnt=-1, num_asynccnt=-1, num_dscnt=None):
     """``_kv_wait``, then publish the retired copies workgroup-wide.
 
@@ -275,8 +285,7 @@ def _kv_fence(num_tensorcnt=-1, num_asynccnt=-1, num_dscnt=None):
         gpu.barrier()
     else:
         rocdl.s_wait_dscnt(num_dscnt)
-        rocdl_dialect.s_barrier_signal(-1)
-        rocdl_dialect.s_barrier_wait(-1)
+        _bare_barrier()
     rocdl.sched_barrier(0)
 
 
@@ -960,9 +969,9 @@ def _core_attention(
     lane_idx = _lane_id()
     kv_head, q_head_idx, seq_idx = _packed_tile_indices(gqa_ratio, warp_idx, lane_idx)
 
-    # K/V staging: N_KV_PP slots of LDS_SLOT_BYTES each, slot i at lds_base + i*stride,
-    # laid out [K.i | V.i]. Q time-shares slots 1.. and O stages past all the slots; both
-    # are dead whenever a tile occupies the same bytes.
+    # K/V staging: N_KV_PP slots of 2 LDS_CHUNK_BYTES chunks each, every tile split 2-way
+    # along n_block into chunks 6 apart (different 64 KB segments). Q time-shares slot 1's
+    # chunks, O the two slots the loop has finished with -- see the 12-chunk map up top.
     if USE_TDM_LOADER:
         q_mgr = QManager16bV2(
             qk_hdim=qk_hdim,
@@ -999,59 +1008,56 @@ def _core_attention(
         )
     k_blk_bytes = k_mgr.get_lds_size_in_byte()
     v_blk_bytes = v_mgr.get_lds_size_in_byte()
-    slot_bytes = LDS_SLOT_BYTES
-    assert k_blk_bytes + v_blk_bytes <= slot_bytes, (
-        f"K|V stage {k_blk_bytes + v_blk_bytes}B exceeds the fixed slot {slot_bytes}B "
-        f"(qk_hdim={qk_hdim}, v_hdim={v_hdim}, n_block={n_block})"
-    )
-    assert N_KV_PP * slot_bytes <= get_lds_capacity_bytes("gfx1250")
     assert k_blk_bytes % KV_LDS_SPLITS == 0 and v_blk_bytes % KV_LDS_SPLITS == 0
-    k_split_stride = k_blk_bytes // KV_LDS_SPLITS
-    v_split_stride = v_blk_bytes // KV_LDS_SPLITS
+    # Chunk stride between a tile's two n_block halves (K[pp][0] -> K[pp][1]) and between
+    # consecutive slots. Slot pp occupies chunks 2pp, 2pp+1 low and 2pp+6, 2pp+7 high.
+    _SPLIT_STRIDE = 6 * LDS_CHUNK_BYTES  # 156 KB
+    slot_bytes = 2 * LDS_CHUNK_BYTES  # 52 KB: one slot's K|V pair in one half
+    for _who, _b in (("K", k_blk_bytes), ("V", v_blk_bytes)):
+        assert _b // KV_LDS_SPLITS <= LDS_CHUNK_BYTES, (
+            f"{_who} split {_b // KV_LDS_SPLITS}B exceeds the {LDS_CHUNK_BYTES}B chunk "
+            f"(qk_hdim={qk_hdim}, v_hdim={v_hdim}, n_block={n_block})"
+        )
+    assert (
+        2 * N_KV_PP * slot_bytes <= get_lds_capacity_bytes("gfx1250")
+    ), "12-chunk K|V layout over LDS capacity"
 
     def _k_lds_buf(
         pp,
-    ):  # K base of ping-pong slot ``pp`` (int or fx.Int32; folds when const)
+    ):  # slot ``pp``'s low-half base == K[pp][0] (int or fx.Int32; folds when const)
         if isinstance(pp, int):
             pp = fx.Int32(pp)
         return lds_base + pp * fx.Int32(slot_bytes)
 
-    def _v_lds_buf(pp):  # V base of ping-pong slot ``pp`` (== K base + k_blk_bytes)
-        if isinstance(pp, int):
-            pp = fx.Int32(pp)
-        return lds_base + pp * fx.Int32(slot_bytes) + fx.Int32(k_blk_bytes)
+    def _v_lds_buf(pp):  # V[pp][0] == the slot base one chunk in
+        return _k_lds_buf(pp) + fx.Int32(LDS_CHUNK_BYTES)
 
-    def _split_list(base, stride):  # the KV_LDS_SPLITS sub-buffer bases of one block
-        return [
-            base if s == 0 else base + fx.Int32(s * stride)
-            for s in range(KV_LDS_SPLITS)
-        ]
-
-    def _k_bufs_at(slot):  # K sub-buffer bases of the slot starting at byte ``slot``
-        return _split_list(slot, k_split_stride)
+    def _k_bufs_at(slot):  # K[.][0], K[.][1] of the slot whose low-half base is ``slot``
+        return [slot, slot + fx.Int32(_SPLIT_STRIDE)]
 
     def _v_bufs_at(slot):
-        return _split_list(slot + fx.Int32(k_blk_bytes), v_split_stride)
+        v0 = slot + fx.Int32(LDS_CHUNK_BYTES)
+        return [v0, v0 + fx.Int32(_SPLIT_STRIDE)]
 
     def _k_lds_bufs(pp):
         return _k_bufs_at(_k_lds_buf(pp))
 
     def _v_lds_bufs(pp):
-        return _split_list(_v_lds_buf(pp), v_split_stride)
+        return _v_bufs_at(_k_lds_buf(pp))
 
-    def _assert_lds_fits(who, base_slot, nbytes):
-        total = base_slot * slot_bytes + nbytes
-        assert total <= get_lds_capacity_bytes("gfx1250"), (
-            f"{who} at slot {base_slot} needs {total}B, over LDS capacity"
-        )
-
-    # ---- Q time-shares slots 1.. : it is drained into VGPR and dead before the
-    # prologue issues any tile into them (s_wait_dscnt + barrier below). ----
-    _assert_lds_fits("Q", 1, q_mgr.get_lds_size_in_byte())
-    q_lds_base = lds_base + fx.Int32(slot_bytes)
-    # ---- O stages past the K|V slots. ----
-    o_lds_base = lds_base + fx.Int32(N_KV_PP * slot_bytes)
-    q_lds_warp = q_lds_base + warp_idx * fx.Int32(q_mgr.warp_lds_size_in_byte())
+    # ---- Q and O own no LDS: both time-share KV chunks in LDS_QO_BYTES per-wave slices.
+    # Q sits in the K[1][0] / K[1][1] chunk pairs (52 KB and 208 KB, 4 waves x 17 KB each);
+    # it is drained into VGPR and dead before the prologue issues a tile into slot 1 or 2
+    # (s_wait_dscnt + barrier below). Wave w -> chunk B iff (w&1) ^ ((w>>2)&1), so the two
+    # waves sharing a SIMD (w and w+4) always land in different chunks. ----
+    for _who, _b in (("Q", q_mgr.warp_lds_size_in_byte()),):
+        assert _b <= LDS_QO_BYTES, f"{_who} per-wave {_b}B over the {LDS_QO_BYTES}B slice"
+    _q_chunk_b = (warp_idx & fx.Int32(1)) ^ ((warp_idx >> fx.Int32(2)) & fx.Int32(1))
+    q_lds_warp = (
+        _k_lds_buf(1)
+        + _q_chunk_b * fx.Int32(_SPLIT_STRIDE)
+        + (warp_idx >> fx.Int32(1)) * fx.Int32(LDS_QO_BYTES)
+    )
 
     q_mgr.load_q_to_vgpr_part1(
         ptr_Q=ptr_Q,
@@ -1126,14 +1132,17 @@ def _core_attention(
     # only FINITE data in slot 0's V region -- its PV is the dead leading one, p == 0, and
     # 0 * NaN would poison O. Loading start_tile's V there is the cheapest such filler.
     start_row0 = start_tile * fx.Int32(n_block)
-    _mine_k = not KV_PRODUCER_SPLIT or warp_type == WarpType.LO_WARP
-    _mine_v = not KV_PRODUCER_SPLIT or warp_type == WarpType.HI_WARP
+    # This wave's slot among its half's KV_PRODUCER_WARPS producers: it owns a dense
+    # n_block/KV_PRODUCER_WARPS row band and copies it alone (one tensor_load per pow2
+    # hdim segment).
+    _producer_warp = warp_idx % fx.Int32(KV_PRODUCER_WARPS)
     if USE_TDM_LOADER:
         # V2: build the TDM copy views (pure), run Q part2, fence Q's LDS dead, then
         # issue the copies and drain before the loop.
         def _kv_views(slot, row0):
-            return (
-                k_mgr.load_views(
+            # This half's operand only: LO issues every K copy, HI every V copy.
+            if warp_type == WarpType.LO_WARP:
+                return k_mgr.load_views(
                     ptr_lds=_k_bufs_at(slot),
                     ptr_K=ptr_K,
                     stride_k_seq=stride_k_seq,
@@ -1142,32 +1151,29 @@ def _core_attention(
                     kv_row0=kv_start + row0,
                     kv_valid=_kv_valid(row0),
                     num_warps=KV_PRODUCER_WARPS,
-                ),
-                v_mgr.load_views(
-                    ptr_lds=_v_bufs_at(slot),
-                    ptr_V=ptr_V,
-                    stride_v_seq=stride_v_seq,
-                    stride_v_head=stride_v_head,
-                    kv_head=kv_head,
-                    kv_row0=kv_start + row0,
-                    kv_valid=_kv_valid(row0),
-                    num_warps=KV_PRODUCER_WARPS,
-                ),
+                    producer_warp=_producer_warp,
+                )
+            return v_mgr.load_views(
+                ptr_lds=_v_bufs_at(slot),
+                ptr_V=ptr_V,
+                stride_v_seq=stride_v_seq,
+                stride_v_head=stride_v_head,
+                kv_head=kv_head,
+                kv_row0=kv_start + row0,
+                kv_valid=_kv_valid(row0),
+                num_warps=KV_PRODUCER_WARPS,
+                producer_warp=_producer_warp,
             )
 
-        def _issue_views(kv):
-            if _mine_k:
-                for _v in kv[0]:
-                    fx.copy_atom_call(*_v)
-            if _mine_v:
-                for _v in kv[1]:
-                    fx.copy_atom_call(*_v)
+        def _issue_views(views):
+            for _v in views:
+                fx.copy_atom_call(*_v)
 
         kv0 = _kv_views(_k_lds_buf(1), start_row0)
+        # Built here, issued below: the views are pure, so the address VALU stays in the
+        # Q global-load shadow.
         kv_fill = _kv_views(_k_lds_buf(0), start_row0)
-        num_tdm_copies = (len(kv0[0]) if _mine_k else 0) + (
-            len(kv0[1]) if _mine_v else 0
-        )
+        num_tdm_copies = len(kv0)
         num_async_copies = -1  # nothing increments asynccnt under TDM
         _kv_drain = _kv_drain_depths(num_tdm_copies, num_async_copies)
         q_frags = q_mgr.load_q_to_vgpr_part2(scale=softmax_scale)
@@ -1178,9 +1184,8 @@ def _core_attention(
         rocdl.s_wait_dscnt(0)
         gpu.barrier()
         _issue_views(kv0)
-        if _mine_v:
-            for _v in kv_fill[1]:
-                fx.copy_atom_call(*_v)
+        if warp_type == WarpType.HI_WARP:
+            _issue_views(kv_fill)
         _kv_fence(*_kv_drain)
     else:
 
@@ -1418,17 +1423,19 @@ def _core_attention(
             # Pure (no memory op) -> hoistable: V2 the TDM copy views, V1 the per-lane
             # global/LDS pointer lists, for tile ``pf``'s K/V into the oldest slot.
             if USE_TDM_LOADER:
-                k_views = k_mgr.load_views(
-                    ptr_lds=_k_bufs_at(wr_slot),
-                    ptr_K=ptr_K,
-                    stride_k_seq=stride_k_seq,
-                    stride_k_head=stride_k_head,
-                    kv_head=kv_head,
-                    kv_row0=kv_start + pf_row0,
-                    kv_valid=pf_valid,
-                    num_warps=KV_PRODUCER_WARPS,
-                )
-                v_views = v_mgr.load_views(
+                if warp_type == WarpType.LO_WARP:
+                    return k_mgr.load_views(
+                        ptr_lds=_k_bufs_at(wr_slot),
+                        ptr_K=ptr_K,
+                        stride_k_seq=stride_k_seq,
+                        stride_k_head=stride_k_head,
+                        kv_head=kv_head,
+                        kv_row0=kv_start + pf_row0,
+                        kv_valid=pf_valid,
+                        num_warps=KV_PRODUCER_WARPS,
+                        producer_warp=_producer_warp,
+                    )
+                return v_mgr.load_views(
                     ptr_lds=_v_bufs_at(wr_slot),
                     ptr_V=ptr_V,
                     stride_v_seq=stride_v_seq,
@@ -1437,8 +1444,8 @@ def _core_attention(
                     kv_row0=kv_start + pf_row0,
                     kv_valid=pf_valid,
                     num_warps=KV_PRODUCER_WARPS,
+                    producer_warp=_producer_warp,
                 )
-                return (k_views, v_views)
             k_g, k_l, k_i = k_mgr.global_load_ptrs(
                 ptr_lds=wr_slot,
                 ptr_K=ptr_K,
@@ -1479,13 +1486,8 @@ def _core_attention(
 
         def _prefetch(addr):
             if USE_TDM_LOADER:
-                k_views, v_views = addr
-                if _mine_k:
-                    for _v in k_views:
-                        fx.copy_atom_call(*_v)
-                if _mine_v:
-                    for _v in v_views:
-                        fx.copy_atom_call(*_v)
+                for _v in addr:
+                    fx.copy_atom_call(*_v)
             else:
                 k_g, k_l, k_i, v_g, v_l, v_i = addr
                 _async_load_to_lds(k_g, k_l, cluster=True, imm_offs=k_i)
@@ -1594,16 +1596,12 @@ def _core_attention(
             # enters it. Body count and barrier count are identical on both halves, so
             # the two never disagree on how many s_barriers this loop executes.
             #
-            # Bare signal/wait, NOT gpu.barrier(): this is a scheduling rendezvous, not a
-            # memory publication. gpu.barrier() carries workgroup acquire/release fences
-            # that lower to s_wait_storecnt_dscnt 0x0, which would retire the ring head
-            # issued just above it -- the whole point of the head is to still be in flight
-            # when the ring's own s_wait_dscnt 0x12 picks it up fragment by fragment. LDS
-            # publication is already covered by _kv_fence's tensorcnt wait + gpu.barrier.
+            # _bare_barrier, not gpu.barrier: the head issued just above must stay in
+            # flight for the ring's own per-fragment s_wait_dscnt. LDS publication is
+            # already covered by _kv_fence's tensorcnt wait + gpu.barrier.
             if ANTI_PHASE:
                 rocdl.sched_barrier(0)
-                rocdl_dialect.s_barrier_signal(-1)
-                rocdl_dialect.s_barrier_wait(-1)
+                _bare_barrier()
                 rocdl.sched_barrier(0)
 
         # GEMM2(u-1) then GEMM1(u) on one ring: O += P^T(u-1) @ V(u-1), then
@@ -1762,10 +1760,13 @@ def _core_attention(
     )
     final = state
     if LAG_DRAIN_AFTER_GEMM and not _lag_sm:
-        # Partner for the lagging half's trailing drain -- see the prologue filler.
-        rocdl_dialect.s_barrier_signal(-1)
-        rocdl_dialect.s_barrier_wait(-1)
-    rocdl.s_wait_dscnt(0)  # retire the trailing body's dead carried head
+        # Partner for the lagging half's prologue filler -- without it the two halves
+        # disagree on the barrier count. It also orders this half's O stores against its
+        # OWN last K reads: the lagging half's trailing drain retires those before its
+        # last barrier, but this half's last in-loop barrier is the PHASE one, which sits
+        # BEFORE the gemm, so wave 1 could otherwise store O into final[0]'s K chunk while
+        # wave 0 is still reading K out of it.
+        _bare_barrier()
 
     # ========================================================================
     # Epilogue: normalize O by the running denom d, then reshape+store to VRAM.
@@ -1773,8 +1774,6 @@ def _core_attention(
     # (unnormalized); divide by the per-query denom d (peer-consistent across the
     # lane pair) to finish softmax. OManager16b masks rows with seq >= q_len.
     # ========================================================================
-    # O stages in its own region past the K|V slots, so no wave ever writes it in the
-    # loop -- no cross-wave barrier needed here.
     # The R q-tiles serialize through the same O ring (s_wait_dscnt(0) between them).
     _OMgr = {"v1": OManager16bV1, "v2": OManager16bV2, "v3": OManager16bV3}[O_VARIANT]
     o_mgr = _OMgr(
@@ -1784,14 +1783,33 @@ def _core_attention(
         q_tiles_per_wave=R,
         elem_dtype=elem_dtype,
     )
-    _assert_lds_fits("O", N_KV_PP, o_mgr.get_lds_size_in_byte())
-    # The loop exits with the last two bodies' (clamped, dead) tile copies still in
-    # flight. They target slots O never touches, but they must not outlive the kernel.
-    _kv_wait(*_kv_drain)
+    # Two waves share a chunk at 0 and LDS_QO_BYTES, and the upper one must stop short of
+    # the next chunk -- that clearance is what keeps O off the V rows the dead carried
+    # head is still reading (8704 + 17408 = 26112 of 26624 at v_hdim 128).
+    assert LDS_QO_BYTES + o_mgr.warp_lds_size_in_byte() <= LDS_CHUNK_BYTES, (
+        f"O per-wave {o_mgr.warp_lds_size_in_byte()}B does not fit above the "
+        f"{LDS_QO_BYTES}B slice inside a {LDS_CHUNK_BYTES}B chunk"
+    )
     # O strides are in ELEMENTS (OManager multiplies by _BF16_BYTES itself). Both V1/V2
     # take ptr_O and build their own store descriptor internally (V1 a bounded buffer
     # resource for the masked buffer_store; V2 the TDM store atom with HW OOB drop).
-    o_lds_warp = o_lds_base + warp_idx * fx.Int32(o_mgr.warp_lds_size_in_byte())
+    # O reuses the two KV slots the loop is done with: body u writes slot_of[2], so after
+    # the yield's left-rotation the last-written slot is final[1] and the free pair is
+    # (final[2], final[0]) == ((k+1)%3, (k+2)%3). Wave w -> even/odd picks the slot, bit 1
+    # the 17 KB half-slice, bit 2 the low/high 156 KB chunk group.
+    assert LAG_DRAIN_AFTER_GEMM, "O's KV-chunk reuse needs the trailing rendezvous"
+    _o_free = [
+        fx.Int32(final[_SLOT_BASE + 2]),
+        fx.Int32(final[_SLOT_BASE + 0]),
+    ]
+    o_lds_warp = (
+        ((warp_idx & fx.Int32(1)) > fx.Int32(0)).select(_o_free[1], _o_free[0])
+        + ((warp_idx >> fx.Int32(1)) & fx.Int32(1)) * fx.Int32(LDS_QO_BYTES)
+        + (warp_idx >> fx.Int32(2)) * fx.Int32(_SPLIT_STRIDE)
+    )
+    # The trailing body's dead clamped tile copy is still in flight; it targets final[1],
+    # the one slot O never touches, but it must not outlive the workgroup.
+    _kv_wait(*_kv_drain)
     for qt in range(R):
         # Normalize this q-tile's O by its running denom d, then reshape+store to VRAM.
         # o_final[dt] lane l elem si = sum_kv P[q,kv] V[kv, dt*16+(l//16)*8+si]
