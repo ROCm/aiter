@@ -232,10 +232,18 @@ def flydsl_fp8_pertensor_quant(
         raise ValueError("flydsl_fp8_pertensor_quant requires a non-empty tensor")
 
     D = x.shape[-1]
+    original_x = x
+    producer_stream = torch.cuda.current_stream(x.device)
     if stream is None:
-        stream = torch.cuda.current_stream(x.device)
+        stream = producer_stream
     if stream.device != x.device:
         raise ValueError(f"stream must be on {x.device}, got {stream.device}")
+
+    if stream != producer_stream:
+        # Respect work that produced the caller's input before reading it from
+        # the explicitly supplied launch stream. This must precede contiguous(),
+        # which may itself enqueue a copy on the launch stream.
+        stream.wait_stream(producer_stream)
 
     expected_shape = tuple(x.shape)
     if out is not None and (
@@ -268,4 +276,13 @@ def flydsl_fp8_pertensor_quant(
         # Pass 2 scales, clamps, and casts using the global descale.
         scale_k = _compile(head_dim=D, rotate=rotate, mode="scale")
         _run_compiled(scale_k, _ptr(x), _ptr(out), _ptr(scale), M, fx_stream)
+
+        # The caching allocator otherwise associates these outputs with the
+        # current stream. Keep their storage alive until an explicitly supplied
+        # non-current launch stream has completed its writes.
+        if stream != producer_stream:
+            original_x.record_stream(stream)
+            x.record_stream(stream)
+            out.record_stream(stream)
+            scale.record_stream(stream)
     return out, scale

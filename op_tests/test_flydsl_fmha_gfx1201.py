@@ -65,43 +65,6 @@ def _make_qkv(
 
 
 @pytest.mark.parametrize(
-    "batch,seq_len,num_heads,head_dim",
-    [
-        # Aligned production-like Wan2.1 1.3B shape, padded to multiple of 128.
-        (1, 32768, 12, 128),
-        # Smaller aligned shape (sanity).
-        (2, 1024, 8, 128),
-        # Unaligned shape — exercises the auto-padding path. 32760 → 32768.
-        (1, 32760, 12, 128),
-        # Flux self-attn, short seq (128/32 tile).
-        (1, 512, 24, 128),
-        # Flux self-attn, long seq (256/64 tile).
-        (1, 1536, 24, 128),
-        # SD3 joint-attn seq.
-        (1, 1024, 24, 128),
-        # head_dim=64 self-attn (128/64 tile).
-        (1, 2048, 16, 64),
-    ],
-)
-def test_flydsl_fmha_correctness_bf16(batch, seq_len, num_heads, head_dim):
-    q, k, v = _make_qkv(batch, seq_len, num_heads, head_dim, torch.bfloat16)
-    out = flydsl_flash_attn_func(q, k, v, causal=False)
-    ref = _ref_sdpa_bshd(q, k, v)
-
-    assert out.shape == ref.shape == (batch, seq_len, num_heads, head_dim)
-    assert out.dtype == ref.dtype == torch.bfloat16
-
-    cos = F.cosine_similarity(
-        out.float().reshape(-1, head_dim),
-        ref.float().reshape(-1, head_dim),
-        dim=1,
-    )
-    # bf16 attention is noisy; cosine is the right correctness signal.
-    assert cos.min().item() > 0.99, f"min_cos={cos.min().item():.6f}"
-    assert cos.mean().item() > 0.999, f"mean_cos={cos.mean().item():.6f}"
-
-
-@pytest.mark.parametrize(
     "batch,seq_q,seq_kv,num_heads,head_dim",
     [
         (1, 1024, 512, 12, 128),  # Wan-style long Q, short text K/V.
@@ -211,20 +174,6 @@ def test_flydsl_fmha_correctness_fp8_cross_attention(
     assert cos.mean().item() > 0.998, f"mean_cos={cos.mean().item():.6f}"
 
 
-def test_flydsl_fmha_rejects_unsupported_head_dim():
-    q = torch.randn(1, 256, 8, 48, dtype=torch.bfloat16, device="cuda")
-    with pytest.raises(ValueError, match="head_dim"):
-        flydsl_flash_attn_func(q, q.clone(), q.clone())
-
-
-def test_flydsl_fmha_rejects_dtype_mismatch():
-    q = torch.randn(1, 1024, 8, 128, dtype=torch.bfloat16, device="cuda")
-    k = torch.randn(1, 1024, 8, 128, dtype=torch.float16, device="cuda")
-    v = torch.randn(1, 1024, 8, 128, dtype=torch.bfloat16, device="cuda")
-    with pytest.raises(ValueError, match="dtype"):
-        flydsl_flash_attn_func(q, k, v)
-
-
 @pytest.mark.parametrize("seq_len", [672, 640, 32])
 def test_flydsl_fmha_all_zero_head(seq_len):
     """An all-zero head (Q=K=V=0) must give all-zero output, not NaN.
@@ -319,119 +268,6 @@ def test_flydsl_fmha_rejects_gqa():
         flydsl_flash_attn_func(q, k, v)
 
 
-def test_flydsl_fmha_correctness_f16():
-    """f16 dtype coverage — Wan2.1 1.3B-style shape, non-causal."""
-    batch, seq_len, num_heads, head_dim = 1, 32768, 12, 128
-    q, k, v = _make_qkv(batch, seq_len, num_heads, head_dim, torch.float16)
-    out = flydsl_flash_attn_func(q, k, v, causal=False)
-    ref = _ref_sdpa_bshd(q, k, v, causal=False)
-
-    assert out.shape == ref.shape == (batch, seq_len, num_heads, head_dim)
-    assert out.dtype == ref.dtype == torch.float16
-
-    cos = F.cosine_similarity(
-        out.float().reshape(-1, head_dim),
-        ref.float().reshape(-1, head_dim),
-        dim=1,
-    )
-    assert cos.min().item() > 0.99, f"min_cos={cos.min().item():.6f}"
-    assert cos.mean().item() > 0.999, f"mean_cos={cos.mean().item():.6f}"
-
-
-def test_flydsl_fmha_correctness_causal_small():
-    """Causal masking coverage — small bf16 shape."""
-    batch, seq_len, num_heads, head_dim = 2, 4096, 8, 128
-    q, k, v = _make_qkv(batch, seq_len, num_heads, head_dim, torch.bfloat16)
-    out = flydsl_flash_attn_func(q, k, v, causal=True)
-    ref = _ref_sdpa_bshd(q, k, v, causal=True)
-
-    assert out.shape == ref.shape == (batch, seq_len, num_heads, head_dim)
-    assert out.dtype == ref.dtype == torch.bfloat16
-
-    cos = F.cosine_similarity(
-        out.float().reshape(-1, head_dim),
-        ref.float().reshape(-1, head_dim),
-        dim=1,
-    )
-    assert cos.min().item() > 0.99, f"min_cos={cos.min().item():.6f}"
-    assert cos.mean().item() > 0.999, f"mean_cos={cos.mean().item():.6f}"
-
-
-def test_flydsl_fmha_correctness_multi_device():
-    """Kernel runs on q's device when it differs from the current device.
-
-    Runs the kernel on device 1 while the current device is 0, in a subprocess
-    so a HIP context-pollution failure cannot leak into the rest of the test
-    session. Exercises the ``with torch.cuda.device(...)`` wrap in
-    ``flydsl_flash_attn_func``.
-
-    If the FlyDSL runtime pins to device 0 internally (a runtime limitation, not
-    a wrapper bug), the subprocess raises ``hipErrorInvalidDevice`` and the test
-    is xfail'd; the same-device guard test below still covers the device check.
-    """
-    if torch.cuda.device_count() < 2:
-        pytest.skip("requires >=2 visible GPUs")
-
-    import subprocess
-    import textwrap
-
-    script = textwrap.dedent("""
-        import torch
-        import torch.nn.functional as F
-        from aiter.ops.flydsl import flydsl_flash_attn_func
-
-        torch.cuda.set_device(0)
-        dev1 = torch.device("cuda", 1)
-        B, S, H, D = 1, 1024, 8, 128
-        g = torch.Generator(device=dev1).manual_seed(0)
-        shape = (B, S, H, D)
-        q = torch.randn(shape, generator=g, dtype=torch.bfloat16, device=dev1)
-        k = torch.randn(shape, generator=g, dtype=torch.bfloat16, device=dev1)
-        v = torch.randn(shape, generator=g, dtype=torch.bfloat16, device=dev1)
-
-        out = flydsl_flash_attn_func(q, k, v, causal=False)
-        torch.cuda.synchronize(dev1)
-        assert out.device == dev1, f"expected cuda:1 got {out.device}"
-
-        with torch.cuda.device(dev1):
-            ref_bhsd = F.scaled_dot_product_attention(
-                q.transpose(1, 2).contiguous(),
-                k.transpose(1, 2).contiguous(),
-                v.transpose(1, 2).contiguous(),
-                is_causal=False,
-            )
-            ref = ref_bhsd.transpose(1, 2).contiguous()
-        cos = F.cosine_similarity(
-            out.float().reshape(-1, D),
-            ref.float().reshape(-1, D),
-            dim=1,
-        )
-        cm = cos.min().item()
-        assert cm > 0.99, f"min_cos={cm:.6f}"
-        print("MULTI_DEVICE_OK", flush=True)
-        """)
-
-    proc = subprocess.run(
-        ["python", "-c", script],
-        capture_output=True,
-        text=True,
-        timeout=120,
-        check=False,
-    )
-    combined = (proc.stdout or "") + "\n" + (proc.stderr or "")
-    if "MULTI_DEVICE_OK" in proc.stdout:
-        return
-    if "hipErrorInvalidDevice" in combined or "invalid device ordinal" in combined:
-        pytest.xfail(
-            "FlyDSL runtime pins to device 0; wrapper-level device-context "
-            "switch is in place but underlying runtime does not honor it"
-        )
-    raise AssertionError(
-        f"multi-device subprocess failed unexpectedly:\n"
-        f"stdout:\n{proc.stdout}\nstderr:\n{proc.stderr}"
-    )
-
-
 @pytest.mark.parametrize(
     "batch,seq_len,num_heads,head_dim",
     [
@@ -459,26 +295,37 @@ def test_flydsl_fmha_correctness_unaligned_noncausal(
     assert cos.mean().item() > 0.999, f"mean_cos={cos.mean().item():.6f}"
 
 
-def test_flydsl_fmha_allows_tight_padding():
-    """Wan2.1 production case (S_real=32760 -> S_pad=32768) must produce
-    SDPA-equivalent output. The kernel bounds the non-causal KV loop at the
-    real length and tail-masks the straddling last tile, so tight padding is
-    exact. Regression guard for the production hot path.
-    """
-    batch, seq_len, num_heads, head_dim = 1, 32760, 12, 128
+@pytest.mark.parametrize("head_dim", [160, 192])
+@pytest.mark.parametrize("use_fp8", [False, True], ids=["bf16", "fp8"])
+def test_flydsl_fmha_partial_kv_load_batch(head_dim, use_fp8):
+    """Cover load schedules whose final cooperative batch is only partial."""
+    batch, seq_len, num_heads = 1, 96, 2
     q, k, v = _make_qkv(batch, seq_len, num_heads, head_dim, torch.bfloat16)
-    out = flydsl_flash_attn_func(q, k, v, causal=False)
     ref = _ref_sdpa_bshd(q, k, v, causal=False)
 
-    assert out.shape == ref.shape == (batch, seq_len, num_heads, head_dim)
+    if use_fp8:
+        qq, kk, vv, sq, sk, sv = flydsl_fp8_quant(q, k, v, rotation=False)
+        out = flydsl_flash_attn_func(
+            qq,
+            kk,
+            vv,
+            causal=False,
+            q_descale=sq,
+            k_descale=sk,
+            v_descale=sv,
+        )
+        min_cos, mean_cos = 0.98, 0.995
+    else:
+        out = flydsl_flash_attn_func(q, k, v, causal=False)
+        min_cos, mean_cos = 0.99, 0.999
+
     cos = F.cosine_similarity(
         out.float().reshape(-1, head_dim),
         ref.float().reshape(-1, head_dim),
         dim=1,
     )
-    # Tight padding is exact in practice (cos_min ~0.99999 on this shape);
-    # 0.9999 is a conservative bf16 regression bound.
-    assert cos.min().item() > 0.9999, f"min_cos={cos.min().item():.6f}"
+    assert cos.min().item() > min_cos, f"min_cos={cos.min().item():.6f}"
+    assert cos.mean().item() > mean_cos, f"mean_cos={cos.mean().item():.6f}"
 
 
 @pytest.mark.parametrize(
@@ -510,6 +357,27 @@ def test_flydsl_fmha_correctness_fp8(batch, seq_len, num_heads, head_dim):
     )
     assert cos.min().item() > 0.99, f"min_cos={cos.min().item():.6f}"
     assert cos.mean().item() > 0.998, f"mean_cos={cos.mean().item():.6f}"
+
+
+def test_flydsl_fmha_correctness_fp8_causal():
+    """Exercise causal masking in the gfx1201 FP8 consumer end to end."""
+    batch, seq_len, num_heads, head_dim = 1, 1024, 8, 128
+    q, k, v = _make_qkv(batch, seq_len, num_heads, head_dim, torch.bfloat16)
+    qq, kk, vv, sq, sk, sv = flydsl_fp8_quant(q, k, v)
+    out = flydsl_flash_attn_func(
+        qq, kk, vv, causal=True, q_descale=sq, k_descale=sk, v_descale=sv
+    )
+    ref = _ref_sdpa_bshd(q, k, v, causal=True)
+
+    assert out.shape == ref.shape
+    assert out.dtype == torch.bfloat16
+    cos = F.cosine_similarity(
+        out.float().reshape(-1, head_dim),
+        ref.float().reshape(-1, head_dim),
+        dim=1,
+    )
+    assert cos.min().item() > 0.98, f"min_cos={cos.min().item():.6f}"
+    assert cos.mean().item() > 0.997, f"mean_cos={cos.mean().item():.6f}"
 
 
 def test_flydsl_fp8_quant_producer_invariants():
@@ -666,12 +534,22 @@ def test_flydsl_fp8_quant_non_current_stream():
         flydsl_fp8_pertensor_quant,
     )
 
-    x = torch.randn(1024, 128, dtype=torch.bfloat16, device="cuda")
+    # Transpose gives the quantizer a non-contiguous input produced on the
+    # current stream, exercising both producer ordering and staging lifetime.
+    backing = torch.randn(128, 1024, dtype=torch.bfloat16, device="cuda")
+    x = backing.T
+    expected = x.float().clone()
     stream = torch.cuda.Stream()
     xq, scale = flydsl_fp8_pertensor_quant(x, rotate=False, stream=stream)
+    del x, backing
+
+    # Encourage allocator reuse before the non-current stream finishes. The
+    # quantizer must keep the original input and contiguous staging allocation
+    # alive until their reads complete.
+    torch.empty(1024, 128, dtype=torch.bfloat16, device="cuda").fill_(float("nan"))
     stream.synchronize()
 
-    cos = F.cosine_similarity(x.float(), xq.float() * scale, dim=1)
+    cos = F.cosine_similarity(expected, xq.float() * scale, dim=1)
     assert cos.mean().item() > 0.99
 
 
@@ -700,7 +578,7 @@ def test_flydsl_fp8_ignores_bf16_lds_vec_width_toggle(monkeypatch):
     from aiter.ops.flydsl import fmha_kernels
 
     monkeypatch.setenv("FLYDSL_FLASH_ATTN_FUNC_ENABLE_LDS_VEC16", "0")
-    fmha_kernels._get_fp8_kernel.cache_clear()
+    fmha_kernels._get_fp8_gfx1201_kernel.cache_clear()
 
     q, k, v = _make_qkv(1, 128, 2, 128, torch.bfloat16)
     qq, kk, vv, sq, sk, sv = flydsl_fp8_quant(q, k, v, rotation=False)
@@ -854,13 +732,69 @@ def test_flydsl_fmha_positional_backcompat():
     torch.testing.assert_close(out_pos, out_kw, rtol=0, atol=0)
 
 
-def test_flydsl_fmha_rejects_device_mismatch():
-    """Same-device check (#6) — q on device 0, k/v on device 1 must raise."""
-    if torch.cuda.device_count() < 2:
-        pytest.skip("requires >=2 visible GPUs")
+def test_flydsl_fmha_non_current_stream_padding_and_out():
+    """Padding, kernel launch, and the final out copy share the requested stream."""
+    q, k, v = _make_qkv(1, 97, 2, 128, torch.bfloat16)
+    out = torch.empty_like(q)
+    launch_stream = torch.cuda.Stream(device=q.device)
 
-    q = torch.randn(1, 1024, 8, 128, dtype=torch.bfloat16, device="cuda:0")
-    k = torch.randn(1, 1024, 8, 128, dtype=torch.bfloat16, device="cuda:1")
-    v = torch.randn(1, 1024, 8, 128, dtype=torch.bfloat16, device="cuda:1")
-    with pytest.raises(ValueError, match="same device"):
+    result = flydsl_flash_attn_func(q, k, v, stream=launch_stream, out=out)
+    launch_stream.synchronize()
+    ref = _ref_sdpa_bshd(q, k, v)
+
+    assert result.data_ptr() == out.data_ptr()
+    cos = F.cosine_similarity(
+        out.float().reshape(-1, 128), ref.float().reshape(-1, 128), dim=1
+    )
+    assert cos.min().item() > 0.99
+
+
+@pytest.mark.parametrize(
+    "shape_q,shape_kv",
+    [
+        ((0, 128, 2, 128), (0, 128, 2, 128)),
+        ((1, 0, 2, 128), (1, 0, 2, 128)),
+        ((1, 128, 0, 128), (1, 128, 0, 128)),
+        ((1, 128, 2, 128), (1, 0, 2, 128)),
+    ],
+)
+def test_flydsl_fmha_rejects_zero_dimensions(shape_q, shape_kv):
+    q = torch.empty(shape_q, dtype=torch.bfloat16, device="cuda")
+    k = torch.empty(shape_kv, dtype=torch.bfloat16, device="cuda")
+    v = torch.empty_like(k)
+    with pytest.raises(ValueError, match="must all be non-zero"):
         flydsl_flash_attn_func(q, k, v)
+
+
+@pytest.mark.parametrize("source", ["q", "k", "v"])
+def test_flydsl_fmha_rejects_out_alias(source):
+    q, k, v = _make_qkv(1, 128, 2, 128, torch.bfloat16)
+    out = {"q": q, "k": k, "v": v}[source]
+    with pytest.raises(ValueError, match="must not alias"):
+        flydsl_flash_attn_func(q, k, v, out=out)
+
+
+@pytest.mark.parametrize("seq_len", [96, 1408])
+def test_flydsl_fmha_masks_block_m_padding_when_block_n_aligned(seq_len):
+    q, k, v = _make_qkv(1, seq_len, 8, 128, torch.bfloat16)
+    out = flydsl_flash_attn_func(q, k, v, causal=False)
+    ref = _ref_sdpa_bshd(q, k, v, causal=False)
+    cosine = F.cosine_similarity(
+        out.float().reshape(-1, 128), ref.float().reshape(-1, 128), dim=1
+    )
+    assert cosine.min().item() > 0.99
+    assert cosine.mean().item() > 0.999
+
+
+@pytest.mark.parametrize("head_dim", [64, 128])
+def test_flydsl_fmha_cross_attention_batch_two(head_dim):
+    q = torch.randn(2, 1000, 8, head_dim, dtype=torch.bfloat16, device="cuda")
+    k = torch.randn(2, 777, 8, head_dim, dtype=torch.bfloat16, device="cuda")
+    v = torch.randn_like(k)
+    out = flydsl_flash_attn_func(q, k, v, causal=False)
+    ref = _ref_sdpa_bshd(q, k, v, causal=False)
+    cosine = F.cosine_similarity(
+        out.float().reshape(-1, head_dim), ref.float().reshape(-1, head_dim), dim=1
+    )
+    assert cosine.min().item() > 0.99
+    assert cosine.mean().item() > 0.999

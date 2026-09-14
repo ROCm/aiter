@@ -20,7 +20,7 @@ Candidates per shape:
                             the pure attention-kernel ceiling; shows fp8's headroom
 
 Correctness (functional coverage) lives in the pytest suite
-``op_tests/flydsl_tests/test_flydsl_fmha.py``; this file is the perf sweep.
+``op_tests/test_flydsl_fmha_gfx1201.py``; this file is the perf sweep.
 """
 
 import argparse
@@ -173,6 +173,9 @@ def test_flydsl_fmha(model, batch, seq_len, num_heads, head_dim, dtype, causal):
         ret[f"{name}_peak_mb"] = peak_mb
         ret[f"{name}_transient_mb"] = peak_mb - base_mb
         ret[f"{name}_err"] = err
+        # Do not retain the preceding candidate's output in the resting
+        # allocation baseline used for the next candidate's memory metrics.
+        del out_bshd, out
     return ret
 
 

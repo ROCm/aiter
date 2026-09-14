@@ -55,10 +55,10 @@ def wave32_peer(value):
 def kv_load_schedule(block_size, head_dim, block_n, vec_width):
     """Return cooperative-load geometry derived only from static tile sizes."""
     threads_per_row = head_dim // vec_width
-    rows_per_batch = block_size // threads_per_row
-    if rows_per_batch >= block_n:
-        return threads_per_row, rows_per_batch, 1, rows_per_batch > block_n
-    return threads_per_row, rows_per_batch, block_n // rows_per_batch, False
+    total_chunks = block_n * threads_per_row
+    num_batches = (total_chunks + block_size - 1) // block_size
+    needs_guard = num_batches * block_size != total_chunks
+    return threads_per_row, num_batches, needs_guard
 
 
 def flatten_and_mask_scores(

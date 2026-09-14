@@ -188,10 +188,10 @@ def build_flash_attn_func_module(
     VEC_WIDTH = 16
     (
         THREADS_PER_ROW_LOAD,
-        ROWS_PER_BATCH_LOAD,
         NUM_BATCHES_KV,
         KV_NEEDS_GUARD,
     ) = kv_load_schedule(BLOCK_SIZE, HEAD_DIM, BLOCK_N, VEC_WIDTH)
+    NUM_KV_CHUNKS = BLOCK_N * THREADS_PER_ROW_LOAD
 
     LDS_K_TILE_SIZE = BLOCK_N * K_STRIDE
     LDS_K_TOTAL_SIZE = NUM_PREFETCH_K * LDS_K_TILE_SIZE
@@ -233,7 +233,7 @@ def build_flash_attn_func_module(
         V: fx.Pointer,
         O: fx.Pointer,
         seq_len: fx.Int32,
-        seq_len_real: fx.Int32,
+        seq_len_kv_real: fx.Int32,
         seq_len_kv: fx.Int32,
         q_scale_ptr: fx.Pointer,
         k_scale_ptr: fx.Pointer,
@@ -270,7 +270,7 @@ def build_flash_attn_func_module(
             ).result
 
         seq_len_v = fx.Index(seq_len)
-        seq_len_real_v = fx.Index(seq_len_real)
+        seq_len_kv_real_v = fx.Index(seq_len_kv_real)
         if const_expr(CROSS_ATTN):
             seq_len_kv_v = fx.Index(seq_len_kv)
         else:
@@ -322,10 +322,6 @@ def build_flash_attn_func_module(
         batch_idx = batch_q_tile_id // num_q_tiles
         q_start = q_tile_idx * BLOCK_M
 
-        load_row_in_batch = tid // THREADS_PER_ROW_LOAD
-        load_lane_in_row = tid % THREADS_PER_ROW_LOAD
-        load_col_base = load_lane_in_row * VEC_WIDTH
-
         def global_idx(token_idx, col):
             # Q + O addressing (Q sequence length).
             token = batch_idx * seq_len_v + token_idx
@@ -356,15 +352,17 @@ def build_flash_attn_func_module(
             # Per-row: lds_row * K_STRIDE_I32 + load_col_base // 4
             # VEC_WIDTH=16 fp8 per thread = 4 i32 → stored at consecutive i32 slots.
             k_base_i32 = fx.Index(0)
-            load_col_i32 = load_col_base // fx.Index(4)
             for batch in range_constexpr(NUM_BATCHES_KV):
-                row_offset = batch * ROWS_PER_BATCH_LOAD
-                row_idx = tile_start + load_row_in_batch + row_offset
+                linear_chunk = tid + fx.Index(batch * BLOCK_SIZE)
+                lds_row = linear_chunk // fx.Index(THREADS_PER_ROW_LOAD)
+                load_lane = linear_chunk % fx.Index(THREADS_PER_ROW_LOAD)
+                load_col_base = load_lane * fx.Index(VEC_WIDTH)
+                load_col_i32 = load_col_base // fx.Index(4)
+                row_idx = tile_start + lds_row
                 if const_expr(KV_NEEDS_GUARD):
-                    row_valid = load_row_in_batch < fx.Index(BLOCK_N)
-                    if row_valid:
+                    chunk_valid = linear_chunk < fx.Index(NUM_KV_CHUNKS)
+                    if chunk_valid:
                         g_idx = kv_global_idx(row_idx, load_col_base)
-                        lds_row = load_row_in_batch + row_offset
                         lds_i32_idx = (
                             k_base_i32 + lds_row * fx.Index(K_STRIDE_I32) + load_col_i32
                         )
@@ -378,7 +376,6 @@ def build_flash_attn_func_module(
                             )
                 else:
                     g_idx = kv_global_idx(row_idx, load_col_base)
-                    lds_row = load_row_in_batch + row_offset
                     lds_i32_idx = (
                         k_base_i32 + lds_row * fx.Index(K_STRIDE_I32) + load_col_i32
                     )
@@ -391,7 +388,7 @@ def build_flash_attn_func_module(
                             [_raw(lds_i32_idx + fx.Index(wi))],
                         )
 
-        def _v_store_row_major_fp8(lds_row, v_bytes):
+        def _v_store_row_major_fp8(lds_row, load_col_base, v_bytes):
             # fp8-input: V already fp8 bytes (v16i8) — no convert, just scatter-store
             # TRANSPOSED (V_T[d][kv_row]). 16 d-values of this lane land in 16 d-rows
             # at the same kv column (stride KV_STRIDE_FP8). Makes GEMM2 load contiguous.
@@ -405,31 +402,35 @@ def build_flash_attn_func_module(
         def coop_load_v_global(tile_start):
             vecs = []
             for batch in range_constexpr(NUM_BATCHES_KV):
-                row_offset = batch * ROWS_PER_BATCH_LOAD
+                linear_chunk = tid + fx.Index(batch * BLOCK_SIZE)
+                lds_row = linear_chunk // fx.Index(THREADS_PER_ROW_LOAD)
+                load_lane = linear_chunk % fx.Index(THREADS_PER_ROW_LOAD)
+                load_col_base = load_lane * fx.Index(VEC_WIDTH)
                 if const_expr(KV_NEEDS_GUARD):
                     # Guard OOB global read: with BLOCK_SIZE>256 the extra load
-                    # threads would read past the tile and fault at the last KV
-                    # tile (no allocation slack). Wrap into the valid in-tile row
-                    # range; the value is discarded by the guarded LDS store.
-                    safe_row = load_row_in_batch % fx.Index(BLOCK_N)
-                    row_idx = tile_start + safe_row + row_offset
+                    # rows, including a partial final load batch, would read
+                    # past the tile. Wrap into its valid row range; the value is
+                    # discarded by the guarded LDS store.
+                    safe_row = lds_row % fx.Index(BLOCK_N)
+                    row_idx = tile_start + safe_row
                 else:
-                    row_idx = tile_start + load_row_in_batch + row_offset
+                    row_idx = tile_start + lds_row
                 g_idx = kv_global_idx(row_idx, load_col_base)
                 vecs.append(_load_global_fp8(v_ptr, g_idx, v16i8_type))
             return vecs
 
         def coop_store_v_lds(vecs):
             for batch in range_constexpr(NUM_BATCHES_KV):
-                row_offset = batch * ROWS_PER_BATCH_LOAD
+                linear_chunk = tid + fx.Index(batch * BLOCK_SIZE)
+                lds_row = linear_chunk // fx.Index(THREADS_PER_ROW_LOAD)
+                load_lane = linear_chunk % fx.Index(THREADS_PER_ROW_LOAD)
+                load_col_base = load_lane * fx.Index(VEC_WIDTH)
                 if const_expr(KV_NEEDS_GUARD):
-                    row_valid = load_row_in_batch < fx.Index(BLOCK_N)
-                    if row_valid:
-                        lds_row = load_row_in_batch + row_offset
-                        _v_store_row_major_fp8(lds_row, vecs[batch])
+                    chunk_valid = linear_chunk < fx.Index(NUM_KV_CHUNKS)
+                    if chunk_valid:
+                        _v_store_row_major_fp8(lds_row, load_col_base, vecs[batch])
                 else:
-                    lds_row = load_row_in_batch + row_offset
-                    _v_store_row_major_fp8(lds_row, vecs[batch])
+                    _v_store_row_major_fp8(lds_row, load_col_base, vecs[batch])
 
         # ---- Q preload ----
         q_row = q_start + wave_q_offset + lane16
@@ -464,7 +465,7 @@ def build_flash_attn_func_module(
         if const_expr(CAUSAL):
             kv_upper = fx.Index((_q_end < seq_len_v).select(_q_end, seq_len_v))
         else:
-            kv_upper = seq_len_real_v
+            kv_upper = seq_len_kv_real_v
 
         # ---- Pre-issue first V global load before the loop ----
         _v_vecs_init = coop_load_v_global(fx.Index(0))
@@ -537,7 +538,7 @@ def build_flash_attn_func_module(
                 kv_block_start,
                 klane,
                 q_row_i32,
-                seq_len_real,
+                seq_len_kv_real,
                 c_neg_inf,
                 num_s_accs=NUM_S_ACCS,
                 causal=CAUSAL,
@@ -663,7 +664,7 @@ def build_flash_attn_func_module(
         O: fx.Pointer,
         batch_size: fx.Int32,
         seq_len: fx.Int32,
-        seq_len_real: fx.Int32,
+        seq_len_kv_real: fx.Int32,
         seq_len_kv: fx.Int32,
         q_scale_ptr: fx.Pointer,
         k_scale_ptr: fx.Pointer,
@@ -687,7 +688,7 @@ def build_flash_attn_func_module(
             V,
             O,
             seq_len,
-            seq_len_real,
+            seq_len_kv_real,
             seq_len_kv,
             q_scale_ptr,
             k_scale_ptr,
@@ -723,7 +724,7 @@ def build_flash_attn_func_module(
         O,
         batch_size,
         seq_len,
-        seq_len_real,
+        seq_len_kv_real,
         seq_len_kv,
         q_scale=None,
         k_scale=None,
@@ -739,7 +740,7 @@ def build_flash_attn_func_module(
             pointer_arg(O),
             batch_size,
             seq_len,
-            seq_len_real,
+            seq_len_kv_real,
             seq_len_kv,
             pointer_arg(q_scale),
             pointer_arg(k_scale),
