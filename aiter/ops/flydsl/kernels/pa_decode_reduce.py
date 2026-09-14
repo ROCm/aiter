@@ -24,11 +24,10 @@ def compile_pa_decode_ps_reduce(
 ):
     """Build the partitioned-softmax reduction used by ``pa_decode``.
 
-    Each wave reduces the partition statistics independently, then reuses the
-    per-partition weights to combine one output element per thread.  Counts up
-    to one wave retain the original one-partition-per-lane path.  For larger
-    counts, each lane owns up to four partitions separated by a wave, keeping
-    all weights in registers and avoiding an LDS round trip.
+    Counts up to one wave use one partition per lane and one output element per
+    thread.  For D=128 and larger counts, a 2-D workgroup materializes weights
+    once in LDS and splits each output element's partition chain over several
+    waves.  Other head sizes retain the register-only lane-striped fallback.
     """
     if not 1 <= max_context_partition_num <= MAX_CONTEXT_PARTITIONS:
         raise ValueError(
@@ -63,7 +62,39 @@ def compile_pa_decode_ps_reduce(
         offset for offset in (32, 16, 8, 4, 2, 1) if offset < reduce_width
     ]
 
-    @flyc.kernel(known_block_size=[head_size, 1, 1])
+    # The original mapping gives each output element to one thread, so every
+    # thread walks every partition.  That is a good fit for <=1 wave of
+    # partitions, but it leaves NP=160..256 as a long dependent load/FMA
+    # chain.  For the decode shape used by PA (D=128), split that chain over
+    # two or four independent wave pairs.  A pair covers the two 64-element
+    # halves of the output vector, while its y-coordinate selects a disjoint
+    # contiguous range of partitions.
+    use_parallel_lds = head_size == 128 and max_context_partition_num > warp_size
+    parallel_groups = 1
+    if use_parallel_lds:
+        # Four groups win from NP=128 onward on gfx950; two avoid excessive
+        # synchronization/thread overhead for the small >64 tail.
+        parallel_groups = 2 if max_context_partition_num <= 96 else 4
+    head_waves = head_size // warp_size
+    worker_waves = head_waves * parallel_groups
+    block_shape = (
+        [warp_size, worker_waves, 1] if use_parallel_lds else [head_size, 1, 1]
+    )
+    parts_per_group = (
+        max_context_partition_num + parallel_groups - 1
+    ) // parallel_groups
+
+    # Keep the legacy specializations effectively LDS-free.  The fields are
+    # only allocated from the compile-time parallel branch below.
+    shared_weight_elems = max_context_partition_num if use_parallel_lds else 1
+    shared_partial_elems = (parallel_groups - 1) * head_size if use_parallel_lds else 1
+
+    @fx.struct
+    class SharedStorage:
+        weights: fx.Array[fx.Float32, shared_weight_elems, 16]
+        partials: fx.Array[fx.Float32, shared_partial_elems, 16]
+
+    @flyc.kernel(known_block_size=block_shape)
     def pa_decode_ps_reduce_kernel(
         output_ptr: fx.Pointer,
         exp_sums_ptr: fx.Pointer,
@@ -84,6 +115,7 @@ def compile_pa_decode_ps_reduce(
         query_group_size: fx.Int32,
     ):
         tid = fx.thread_idx.x
+        worker = fx.thread_idx.y
         batch_idx = fx.block_idx.x
         kv_head_idx = fx.block_idx.y
         eqgs_idx = fx.block_idx.z
@@ -128,7 +160,134 @@ def compile_pa_decode_ps_reduce(
                 )
             return reduced
 
-        if fx.const_expr(max_context_partition_num <= warp_size):
+        if fx.const_expr(use_parallel_lds):
+            # One wave materializes the normalized partition weights once.
+            # All output waves then reuse those weights from LDS and split the
+            # long partition loop.  This avoids both duplicated exp2 work and
+            # a ds_bpermute for every output FMA.
+            lds = fx.SharedAllocator().allocate(SharedStorage).peek()
+            lds_weights = lds.weights
+            lds_partials = lds.partials
+
+            if worker == zero_i:
+                partitions_per_lane = (
+                    max_context_partition_num + warp_size - 1
+                ) // warp_size
+                part_sums = []
+                part_maxes = []
+                lane_max = neg_inf
+                for chunk_idx in fx.range_constexpr(partitions_per_lane):
+                    chunk_base = chunk_idx * warp_size
+                    chunk_size = min(warp_size, max_context_partition_num - chunk_base)
+                    part_idx = lane + fx.Int32(chunk_base)
+                    if fx.const_expr(chunk_size == warp_size):
+                        stats_offset = (
+                            batch_idx * stride_exp_sums_seq
+                            + kv_head_idx * stride_exp_sums_head
+                            + part_idx * stride_exp_sums_part
+                            + eqgs_idx
+                        )
+                        part_sum = fx.Float32(exp_sums[stats_offset])
+                        part_max = fx.Float32(max_logits[stats_offset])
+                    else:
+                        lane_in_range = lane < fx.Int32(chunk_size)
+                        stats_offset = (
+                            batch_idx * stride_exp_sums_seq
+                            + kv_head_idx * stride_exp_sums_head
+                            + part_idx * stride_exp_sums_part
+                            + eqgs_idx
+                        )
+                        part_sum = zero_f
+                        part_max = neg_inf
+                        if lane_in_range:
+                            part_sum = fx.Float32(exp_sums[stats_offset])
+                            part_max = fx.Float32(max_logits[stats_offset])
+                    part_sums.append(part_sum)
+                    part_maxes.append(part_max)
+                    lane_max = lane_max.maximumf(part_max)
+
+                global_max = _wave_reduce_max(lane_max)
+                safe_global_max = (global_max > neg_inf).select(global_max, zero_f)
+                scaled_sums = []
+                lane_exp_sum = zero_f
+                for chunk_idx in fx.range_constexpr(partitions_per_lane):
+                    part_max = part_maxes[chunk_idx]
+                    part_scale = (part_max > neg_inf).select(
+                        fx.exp2(
+                            (part_max - safe_global_max) * c_log2e,
+                            fastmath="fast",
+                        ),
+                        zero_f,
+                    )
+                    scaled_sum = part_sums[chunk_idx] * part_scale
+                    scaled_sums.append(scaled_sum)
+                    lane_exp_sum = lane_exp_sum + scaled_sum
+
+                global_exp_sum = _wave_reduce_sum(lane_exp_sum)
+                if fx.const_expr(use_sinks):
+                    sink_value = fx.Float32(sink_token[kv_head_idx * c_qgs + group_idx])
+                    sink_scale = (global_max > neg_inf).select(
+                        fx.exp2(
+                            (sink_value - safe_global_max) * c_log2e,
+                            fastmath="fast",
+                        ),
+                        zero_f,
+                    )
+                    global_exp_sum = global_exp_sum + sink_scale
+                safe_global_exp_sum = (global_exp_sum > zero_f).select(
+                    global_exp_sum, one_f
+                )
+
+                for chunk_idx in fx.range_constexpr(partitions_per_lane):
+                    chunk_base = chunk_idx * warp_size
+                    chunk_size = min(warp_size, max_context_partition_num - chunk_base)
+                    part_idx = lane + fx.Int32(chunk_base)
+                    weight = scaled_sums[chunk_idx] / safe_global_exp_sum
+                    if fx.const_expr(chunk_size == warp_size):
+                        lds_weights[part_idx] = weight
+                    else:
+                        lane_in_range = lane < fx.Int32(chunk_size)
+                        if lane_in_range:
+                            lds_weights[part_idx] = weight
+
+            fx.gpu.barrier()
+
+            head_wave = worker % fx.Int32(head_waves)
+            partition_group = worker // fx.Int32(head_waves)
+            output_element = head_wave * c_warp_size + lane
+            group_part_begin = partition_group * fx.Int32(parts_per_group)
+            acc = zero_f
+            for local_part in fx.range_constexpr(parts_per_group):
+                part_idx = group_part_begin + fx.Int32(local_part)
+                part_in_range = part_idx < c_part_num
+                if part_in_range:
+                    weight = fx.Float32(lds_weights[part_idx])
+                    logits_offset = (
+                        batch_idx * stride_logits_seq
+                        + kv_head_idx * stride_logits_head
+                        + part_idx * stride_logits_part
+                        + eqgs_idx * stride_logits_group
+                        + output_element
+                    )
+                    part_logits = fx.Float32(logits[logits_offset])
+                    acc = acc + part_logits * weight
+
+            if partition_group > zero_i:
+                partial_offset = (partition_group - fx.Int32(1)) * fx.Int32(
+                    head_size
+                ) + output_element
+                lds_partials[partial_offset] = acc
+
+            fx.gpu.barrier()
+
+            if partition_group == zero_i:
+                for other_group in fx.range_constexpr(1, parallel_groups):
+                    partial_offset = (
+                        fx.Int32((other_group - 1) * head_size) + output_element
+                    )
+                    acc = acc + fx.Float32(lds_partials[partial_offset])
+
+        elif fx.const_expr(max_context_partition_num <= warp_size):
             # Exact powers of two have no inactive lanes inside their reduction
             # subgroup. Keep that original path unchanged; only partial
             # subgroups need an EXEC-masked load to avoid carrying a predicate
@@ -311,14 +470,25 @@ def compile_pa_decode_ps_reduce(
                     acc = acc + part_logits * weight
 
         query_idx = eqgs_idx // c_qgs
-        output_offset = (
-            batch_idx * stride_output_bs
-            + query_idx * stride_output_len
-            + kv_head_idx * stride_output_kv_head
-            + group_idx * stride_output_group_size
-            + tid
-        )
-        output[output_offset] = acc.to(output_dtype)
+        if fx.const_expr(use_parallel_lds):
+            if partition_group == zero_i:
+                output_offset = (
+                    batch_idx * stride_output_bs
+                    + query_idx * stride_output_len
+                    + kv_head_idx * stride_output_kv_head
+                    + group_idx * stride_output_group_size
+                    + output_element
+                )
+                output[output_offset] = acc.to(output_dtype)
+        else:
+            output_offset = (
+                batch_idx * stride_output_bs
+                + query_idx * stride_output_len
+                + kv_head_idx * stride_output_kv_head
+                + group_idx * stride_output_group_size
+                + tid
+            )
+            output[output_offset] = acc.to(output_dtype)
 
     @flyc.jit
     def launch_pa_decode_ps_reduce_kernel(
@@ -364,7 +534,7 @@ def compile_pa_decode_ps_reduce(
             query_group_size,
         ).launch(
             grid=(batch_size, num_kv_heads, query_seq_len * query_group_size),
-            block=(head_size, 1, 1),
+            block=tuple(block_shape),
             stream=stream,
         )
 
