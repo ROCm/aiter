@@ -38,20 +38,12 @@ SUPPORTED_GFX = ["gfx942"]
 HEAD_DIM_QK = 192
 HEAD_DIM_V = 128
 
-# Accuracy gate.  bf16 gradients over multi-thousand-token causal sequences span
-# a wide dynamic range with many near-zero elements, so a few elements always
-# miss an elementwise 2e-2 isclose -- TOL_ERR_RATIO bounds that fraction.
-# mean_abs_diff / mean_abs_ref is the aggregate metric the kernel was tuned on
-# and the one that actually moves when the maths is wrong; both are asserted.
+# Accuracy gate.
 RTOL = ATOL = 2e-2
 TOL_ERR_RATIO = 0.05
 TOL_MEAN_REL = 2e-2
 
-# Ragged sequence-length patterns, each summing to its total token count. `main`
-# is the target workload shape (13 ragged sequences over 32K tokens), `uniform`
-# an equal-split variant of the same size, `small` a case whose whole grid is
-# co-resident on 304 CUs -- that last one is what the kernel's split-K path
-# exists for, so it must stay in the sweep.
+# Ragged sequence-length patterns, each summing to its total token count.
 SEQLEN_CASES = {
     "main": [
         4096,
@@ -74,7 +66,7 @@ SEQLEN_CASES = {
 
 
 class VarlenInputs(NamedTuple):
-    """One varlen THD batch plus the forward's `out` / `lse`."""
+    """One varlen THD batch plus the forward's out / lse."""
 
     q: torch.Tensor
     k: torch.Tensor
@@ -277,10 +269,7 @@ def run_fmha_varlen_bwd(case, nheads, dtype):
     return ret
 
 
-# The (case, nheads) pairs pytest collects.  nheads selects the dispatch regime as much as the
-# sequence pattern does: at 2 heads `small` is co-resident on 304 CUs and takes the split-K
-# path, while at 16 -- the 128-head MLA shape this kernel targets, at TP=8 -- the same tokens
-# produce ~2.2k workgroups and take the untouched nsp == 1 path.  Both must stay covered.
+# The (case, nheads) pairs pytest collects.
 _PYTEST_CASES = [(c, 2) for c in SEQLEN_CASES] + [("small", 16)]
 
 

@@ -102,11 +102,6 @@ BASELINE = {"192/128": "ck", "128/128": "ck_128"}
 BACKENDS = tuple(BACKEND_GROUP)
 
 # dS -> bf16 rounding mode for the ASM v3 backward: 0 = rtne, 1 = rtna, 2 = rtz.
-# Each mode is a separately compiled kernel, and hsa/gfx942/fmha_v3_bwd/
-# fmha_bwd_dqdkdv.csv carries all three for every bf16 config -- the 192/128
-# shape resolves to bwd_hd192_bf16_causal_a32_rtz_psskddv_group.co.  Pinned to
-# rtz (truncation, the cheapest of the three) rather than left on the router's
-# rtna default, so the baseline is timed on its fastest conversion.
 V3_BF16_CVT_RTZ = 2
 
 # Sweep defaults.  `num_seqs` x `seqlen` spans both of the kernel's dispatch
