@@ -29,6 +29,7 @@ _GROUPED_WEIGHT_CACHE = {}
 # (name, callable) per-kernel launches; None in production.
 kernel_bench_callable = None
 
+
 def _grouped_weight_uint8(w: torch.Tensor) -> torch.Tensor:
     """Contiguous uint8 view of a static MoE weight, cached by data_ptr."""
     key = (w.data_ptr(), tuple(w.shape), tuple(w.stride()), str(w.dtype))
@@ -41,15 +42,18 @@ def _grouped_weight_uint8(w: torch.Tensor) -> torch.Tensor:
     _GROUPED_WEIGHT_CACHE[key] = out
     return out
 
+
 def _as_bool(value, default: bool) -> bool:
     if value is None or str(value).strip() == "":
         return default
     return str(value).strip() in _TRUTHY_ENV
 
+
 def _as_int(value, default: int | None) -> int | None:
     if value is None or str(value).strip() == "":
         return default
     return int(value)
+
 
 def _dtype_name(dtype) -> str:
     if dtype is torch.bfloat16 or dtype == dtypes.bf16:
@@ -58,10 +62,12 @@ def _dtype_name(dtype) -> str:
         return "torch.float16"
     return str(dtype)
 
+
 def _enum_name(value) -> str:
     if hasattr(value, "name"):
         return f"{type(value).__name__}.{value.name}"
     return str(value)
+
 
 def _load_grouped_config_rows():
     cfg_path = os.environ.get("AITER_CONFIG_GROUPED_FMOE")
@@ -84,12 +90,15 @@ def _load_grouped_config_rows():
     _GROUPED_CONFIG_CACHE[cfg_path] = rows
     return rows
 
+
 def _next_pow2(n):
     if n <= 1:
         return 1
     return 1 << (n - 1).bit_length()
 
+
 _PADDED_M_TIERS = [32768, 131072]
+
 
 def _get_padded_m(m):
     if m < _PADDED_M_TIERS[0]:
@@ -98,6 +107,7 @@ def _get_padded_m(m):
         if m >= tier:
             return tier
     return _PADDED_M_TIERS[0]
+
 
 @functools.lru_cache(maxsize=1024)
 def _find_grouped_config(
@@ -162,15 +172,18 @@ def _find_grouped_config(
     matches.sort(key=lambda r: float(r.get("us") or 0.0))
     return matches[0]
 
+
 def _use_grouped_gemm_enabled() -> bool:
     env_enabled = os.environ.get("AITER_USE_GROUPED_GEMM", "0") in _TRUTHY_ENV
     is_gfx1250 = get_gfx() == "gfx1250"
     return env_enabled or is_gfx1250
 
+
 def _align_up(value: int, alignment: int) -> int:
     if alignment <= 0:
         raise ValueError(f"alignment must be > 0, got {alignment}")
     return ((int(value) + int(alignment) - 1) // int(alignment)) * int(alignment)
+
 
 def _make_contiguous_psum_layout(
     *,
@@ -208,6 +221,7 @@ def _make_contiguous_psum_layout(
 
     return remapped_topids, remapped_rows, psum_t, int(contiguous_m)
 
+
 def _grouped_a8w4_preshuffle_e8m0_scale(
     scale: torch.Tensor,
     warp_tile: int,
@@ -224,6 +238,7 @@ def _grouped_a8w4_preshuffle_e8m0_scale(
     # fills two adjacent M16 scale operands, selected by SCL_OPSEL_B.
     g = g.permute(0, 1, 4, 5, 2, 3, 6).contiguous()
     return g.reshape(E, -1, k_groups * k_wmma_steps * wmma_rep * 4)
+
 
 def _grouped_a8w4_prepare_scale_batch(
     scale: torch.Tensor,
@@ -254,6 +269,7 @@ def _grouped_a8w4_prepare_scale_batch(
         scale_u8, warp_tile=warp_tile, scale_k_per_tile=scale_k_per_tile
     ).to(device=device)
 
+
 def _use_fused_quant_preshuffle(
     model_dim: int, wmma_rep: int, quant_mode: str, token_num: int, topk: int
 ) -> bool:
@@ -268,9 +284,10 @@ def _use_fused_quant_preshuffle(
     )
     from aiter.ops.flydsl.moe_kernels import token_multidest_eligible
 
-    return token_multidest_eligible(token_num, topk) and fused_quant_preshuffle_supported(
-        model_dim, wmma_rep, quant_mode
-    )
+    return token_multidest_eligible(
+        token_num, topk
+    ) and fused_quant_preshuffle_supported(model_dim, wmma_rep, quant_mode)
+
 
 @functools.cache
 def _fused_preshuffle_workers() -> int:
@@ -284,6 +301,7 @@ def _fused_preshuffle_workers() -> int:
 
     return int(get_cu_num()) * 2
 
+
 @functools.cache
 def _get_compiled_g2l_lut():
     """Compile and cache the single-block FlyDSL g2l-LUT builder."""
@@ -291,9 +309,11 @@ def _get_compiled_g2l_lut():
 
     return build_moe_g2l_lut_module()
 
+
 # Single-workgroup scan ceiling (matches moe_g2l_lut.MAX_G2L_EXPERTS); larger
 # masks fall back to the torch chain.
 _G2L_MAX_N = 512
+
 
 def _build_g2l_lut(
     expert_mask: torch.Tensor,
@@ -379,8 +399,10 @@ def _build_g2l_lut(
     )
     return lut, None, None
 
+
 def _tdm_align_up(x: int, a: int) -> int:
     return ((int(x) + a - 1) // a) * a
+
 
 def get_wmma_m_rep(
     tile_m: int, tile_n: int, m_warp: int, n_warp: int, label: str
@@ -415,6 +437,7 @@ def get_wmma_m_rep(
             f"{m_warp * n_warp * wave_size} threads > {max_block}"
         )
     return tile_m // m_warp // wmma_m
+
 
 def _grouped_a8w4_tdm_moe(
     hidden_states,
@@ -1004,6 +1027,7 @@ def _grouped_a8w4_tdm_moe(
     )
     return moe_out
 
+
 def grouped_gemm_gfx1250_a8w4(
     hidden_states: torch.Tensor,
     w1: torch.Tensor,
@@ -1318,6 +1342,7 @@ def grouped_gemm_gfx1250_a8w4(
     # until that is added back.
     return None
 
+
 # --- Functions moved from moe_kernels.py for grouped gemm ---
 @functools.cache
 def _get_compiled_gather_reduce(
@@ -1337,11 +1362,13 @@ def _get_compiled_gather_reduce(
         model_dim, topk, out_dtype, split_k, vec_dwords, w_dtype
     )
 
+
 def _choose_gather_reduce_vec(token_num: int, model_dim: int) -> int:
     """Prefer CTA parallelism first; use wider vec only once CTA count is ample."""
     out_dwords = int(model_dim) // 2
     n_iters_v4 = (out_dwords + 256 * 4 - 1) // (256 * 4)
     return 4 if int(token_num) * n_iters_v4 >= 256 else 2
+
 
 @functools.cache
 def _get_compiled_route_maps():
@@ -1349,6 +1376,7 @@ def _get_compiled_route_maps():
     from aiter.ops.flydsl.kernels.moe_route_maps import build_moe_route_maps_module
 
     return build_moe_route_maps_module()
+
 
 @functools.cache
 def _get_compiled_contiguous_psum():
@@ -1359,6 +1387,7 @@ def _get_compiled_contiguous_psum():
 
     return build_moe_contiguous_psum_module()
 
+
 @functools.cache
 def _get_compiled_contiguous_psum_remap():
     """Compile and cache the contiguous prefix-sum + row-remap kernel."""
@@ -1367,6 +1396,7 @@ def _get_compiled_contiguous_psum_remap():
     )
 
     return build_moe_contiguous_psum_remap_module()
+
 
 @functools.cache
 def _get_compiled_route_psum_fused():
@@ -1377,12 +1407,14 @@ def _get_compiled_route_psum_fused():
 
     return build_moe_route_psum_fused_module()
 
+
 # One workgroup handles every route. NUMEL is advisory -- the route sweep is
 # grid-stride, so a larger count is correct but stops being worth fusing.
 # EXPERTS is a hard limit, enforced below: the scan and the LDS route counter
 # are both one slot per lane.
 _FUSED_ROUTE_PSUM_MAX_NUMEL = 4096
 _FUSED_ROUTE_PSUM_MAX_EXPERTS = 512
+
 
 def fused_route_psum_remap(
     topk_ids: torch.Tensor,
@@ -1429,6 +1461,7 @@ def fused_route_psum_remap(
     )
     return masked_m, topids_to_rows.view(token_num, topk), psum
 
+
 def contiguous_psum(masked_m: torch.Tensor, experts: int, tile_m: int):
     """Tile-aligned exclusive prefix sum over per-expert counts."""
     device = masked_m.device
@@ -1449,6 +1482,7 @@ def contiguous_psum(masked_m: torch.Tensor, experts: int, tile_m: int):
     )
     return starts, psum, contiguous_m_t
 
+
 @functools.cache
 def _get_compiled_contiguous_psum_remap_ep():
     """psum + remap fused with the gemm2 EP ep_rowmap build."""
@@ -1457,6 +1491,7 @@ def _get_compiled_contiguous_psum_remap_ep():
     )
 
     return build_moe_contiguous_psum_remap_ep_module()
+
 
 def contiguous_psum_remap(
     masked_m: torch.Tensor,
@@ -1538,6 +1573,7 @@ def contiguous_psum_remap(
     )
     return starts, psum, contiguous_m_t
 
+
 def build_route_maps(topk_ids: torch.Tensor, E: int, max_m: int):
     """Atomic-scatter route maps. Returns (topids_to_rows, rows_to_tokens, masked_m)."""
     device = topk_ids.device
@@ -1562,6 +1598,7 @@ def build_route_maps(topk_ids: torch.Tensor, E: int, max_m: int):
     )
     masked_m = atomic_buffer
     return topids_to_rows.view(token_num, topk), rows_to_tokens, masked_m
+
 
 def flydsl_moe_gather_reduce(
     grouped_out: torch.Tensor,  # (E,max_m,D) or (split_k,E,max_m,D) bf16/f16
@@ -1638,7 +1675,9 @@ def flydsl_moe_gather_reduce(
     )
     return out
 
+
 # MoE route-gather (scatter-copy) input layout helpers
+
 
 @functools.cache
 def _get_compiled_scatter_copy(row_bytes: int):
@@ -1648,6 +1687,7 @@ def _get_compiled_scatter_copy(row_bytes: int):
     )
 
     return build_moe_scatter_copy_token_module(row_bytes)
+
 
 def flydsl_moe_scatter_copy_token(
     a1_payload: torch.Tensor,  # (token_num, payload_w) uint8
@@ -1695,6 +1735,7 @@ def flydsl_moe_scatter_copy_token(
 
     return grouped_a1, a1_scale_raw
 
+
 @functools.cache
 def _get_compiled_scatter_preshuffle_scale(
     row_bytes: int, wmma_rep: int, scale_k_per_tile: int, gather: bool = True
@@ -1707,6 +1748,7 @@ def _get_compiled_scatter_preshuffle_scale(
     return build_moe_scatter_copy_preshuffle_scale_module(
         row_bytes, wmma_rep, scale_k_per_tile, gather=gather
     )
+
 
 def flydsl_moe_scatter_preshuffle_scale(
     a1_scale_token_u8: torch.Tensor,  # (token_num, scale_w) uint8
@@ -1750,6 +1792,7 @@ def flydsl_moe_scatter_preshuffle_scale(
         stream=torch.cuda.current_stream(),
     )
     return grouped_a1_scale
+
 
 def flydsl_moe_preshuffle_scale(
     scale_grouped_u8: torch.Tensor,  # (E, max_m, scale_w) or (E*max_m, scale_w) uint8

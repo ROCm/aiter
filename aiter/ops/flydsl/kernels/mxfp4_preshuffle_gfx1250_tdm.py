@@ -41,6 +41,7 @@ from .tensor_shim import (
 
 TDM_DESCRIPTOR_VERSION = 1
 
+
 @flyc.jit
 def launch_gemm_a8w4_tdm(
     arg_c: fx.Tensor,
@@ -1519,6 +1520,7 @@ def launch_gemm_a8w4_tdm(
         )
     else:
         kernel(*kargs).launch(grid=grid, block=(block, 1, 1), stream=stream)
+
 
 launch_gemm_a8w4_tdm.compile_hints["llvm_options"] = {
     "amdgpu-expert-scheduling-mode": AITER_FLYDSL_MOE_EXPERT_SCHEDULING_MODE,

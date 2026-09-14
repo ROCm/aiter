@@ -60,8 +60,6 @@ Block : (BLOCK_THREADS, 1, 1)
 
 from types import SimpleNamespace
 
-import os
-
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl._mlir import ir
@@ -573,9 +571,7 @@ def _emit_quant_result_stores(c, dst_payload, mx_block, payload_val, e8m0_scale)
     # as a host bool).
     def _store_lead_scale():
         for dst in c.dests:
-            dst_scale_dword = (
-                dst.scale_row_dword_base + scale_dword * c.c_wmma_rep * 16
-            )
+            dst_scale_dword = dst.scale_row_dword_base + scale_dword * c.c_wmma_rep * 16
             dst_scale_byte = dst_scale_dword * c.c4_i32 + byte_in_dword
             c.scale_t[dst_scale_byte] = e8m0_byte
 
@@ -2045,7 +2041,6 @@ def build_moe_token_multidest_quant_module(
                 for row in rows
             ]
 
-
             block_in_wave = lane // fx.Uint32(c_lanes_per_block)
             lane_in_block = lane - block_in_wave * c_lanes_per_block
             qc = SimpleNamespace(
@@ -2146,7 +2141,6 @@ def build_moe_token_multidest_quant_module(
     return launch_token_multidest
 
 
-
 def fused_quant_preshuffle_supported(
     feat_dim: int, wmma_rep: int, quant_mode: str
 ) -> bool:
@@ -2220,7 +2214,6 @@ def build_moe_token_multidest_quant_fused_module(
     mx_blocks_per_wave_iter = L.mx_blocks_per_wave_iter
     mx_blocks_per_row = L.mx_blocks_per_row
     rows_per_tile = L.rows_per_tile
-    dst_scale_dwords_per_row = L.dst_scale_dwords_per_row
     block_iters = L.block_iters
     amax_shuffle_dists = L.amax_shuffle_dists
     _is_gfx12 = str(L.arch).startswith("gfx12")
@@ -2280,7 +2273,6 @@ def build_moe_token_multidest_quant_fused_module(
         c0_i32 = arith.constant(0, type=i32)
         c1_i32 = arith.constant(1, type=i32)
         c4_i32 = arith.constant(4, type=i32)
-        c16_i32 = arith.constant(16, type=i32)
         c23_i32 = arith.constant(23, type=i32)
         c254_i32 = arith.constant(254, type=i32)
         c0_f32 = arith.constant(0.0, type=f32)
@@ -2288,7 +2280,6 @@ def build_moe_token_multidest_quant_fused_module(
         c_wave = arith.constant(wave_size, type=i32)
         c_payload_bytes_per_block = arith.constant(payload_bytes_per_block, type=i32)
         c_payload_bytes_per_lane = arith.constant(payload_bytes_per_lane, type=i32)
-        c_dst_scale_dwords_per_row = arith.constant(dst_scale_dwords_per_row, type=i32)
         c_wmma_rep = arith.constant(wmma_rep, type=i32)
         c_rows_per_tile = arith.constant(rows_per_tile, type=i32)
         c_lanes_per_block = arith.constant(lanes_per_mx_block, type=i32)
@@ -2344,8 +2335,8 @@ def build_moe_token_multidest_quant_fused_module(
             )
 
         # ===================== Phase 1: quant + scatter =====================
-        step = fx.Uint32(num_workers) * c_wpb
-        for token0 in range(bid * c_wpb, fx.Uint32(token_num), step):
+        def _quant_token_group(token0):
+            """Quantize one block's worth of tokens and emit every copy."""
             token = token0 + warp_in_block
             chunk_prefetch = None
             if const_expr(tdm_hidden_chunks):
@@ -2406,9 +2397,7 @@ def build_moe_token_multidest_quant_fused_module(
             rows_t = ptr_buf_tensor(topids_to_rows)
             route0 = token_eff * arith.constant(topk, type=i32)
             rows = [
-                fx.Uint32(
-                    buf_scalar_load(rows_t, route0 + arith.constant(k, type=i32))
-                )
+                fx.Uint32(buf_scalar_load(rows_t, route0 + arith.constant(k, type=i32)))
                 for k in range_constexpr(topk)
             ]
 
@@ -2478,9 +2467,7 @@ def build_moe_token_multidest_quant_fused_module(
                 ),
                 scale_pack_dwords=True,
                 compact_scale=True,
-                c_scale_dwords_per_row=arith.constant(
-                    mx_blocks_per_row // 4, type=i32
-                ),
+                c_scale_dwords_per_row=arith.constant(mx_blocks_per_row // 4, type=i32),
                 hidden_chunks=max(1, tdm_hidden_chunks),
                 chunk_prefetch=chunk_prefetch,
                 hidden_lds_load=hidden_lds_load,
@@ -2490,6 +2477,10 @@ def build_moe_token_multidest_quant_fused_module(
                 mx_group_base=None,
             )
             _emit_quant_block_loop(qc)
+
+        step = fx.Uint32(num_workers) * c_wpb
+        for token0 in range(bid * c_wpb, fx.Uint32(token_num), step):
+            _quant_token_group(token0)
 
         # ============================= Barrier ==============================
         gpu.barrier()
@@ -2531,9 +2522,7 @@ def build_moe_token_multidest_quant_fused_module(
                     sd = unit - row * k_chunk
                     srow = map_p[row_base + row]
                     ok = fx.Int32(srow) >= fx.Int32(0)
-                    src_off = ok.select(
-                        fx.Uint32(srow) * src_dwords + sd, fx.Uint32(0)
-                    )
+                    src_off = ok.select(fx.Uint32(srow) * src_dwords + sd, fx.Uint32(0))
                     for j in range_constexpr(VEC):
                         v = fx.Int32(src_p[src_off + j])
                         tile_lds[row * lds_pitch + sd + j] = ok.select(v, fx.Int32(0))
