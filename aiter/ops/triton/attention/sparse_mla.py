@@ -1,14 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Sparse MLA attention (gfx950 gluon): kv_lora_rank latent + appended
-decoupled rope, token-granular top-k gather.
-
-Prefill and decode are the same MQA operator on this path, one program per query
-token over that token's own gathered KV, so this serves both phases; the launcher
-picks the tile from what the grid supplies.
-"""
-
 import math
 
 import torch
@@ -286,10 +278,8 @@ def sparse_mla_fwd(
     GLM-5.1/5.2), where the query is the latent plus an appended rope, or
     rope-free (GLM-5.3-Flash), where the query is the latent alone.
 
-    This is the common entry point. A DeepSeek-V4 cache, or a call carrying the
-    second index stream, routes to pa_decode_sparse; the two drivers still build
-    their own launches, so a few knobs (fp8 dots, LSE) are MLA-only for now and
-    raise on the paged route.
+    DeepSeek-V4 is the third case, rope inside the 512-wide row (448 nope + 64 rope)
+    with V the whole row.
 
     Args:
         q: [C, H, kv_lora_rank + qk_rope_head_dim] queries, one row per
@@ -343,7 +333,7 @@ def sparse_mla_fwd(
             reports -inf.
 
     Returns:
-        (out, lse), following aiter.mla.mla_decode_fwd: out is
+        (out, lse), out is
         [C, H, kv_lora_rank] bf16 (the latent V), lse is None unless return_lse.
     """
     assert q.ndim == 3, f"expected q=[b,h,d], got {q.shape}"
