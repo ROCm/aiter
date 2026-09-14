@@ -296,6 +296,7 @@ def run_pa_decode_tile_case(
     context_length,
     block_size,
     dtype,
+    trans_v=False,
 ):
     if pa_decode is None or get_recommended_splits is None:
         raise RuntimeError("FlyDSL is not available")
@@ -343,7 +344,20 @@ def run_pa_decode_tile_case(
         .permute(0, 1, 3, 2, 4)
         .contiguous()
     )
-    value_cache = value_quant.contiguous()
+    if trans_v:
+        value_cache = (
+            value_quant.view(
+                num_blocks,
+                num_kv_heads,
+                head_dim,
+                block_size // 16,
+                16,
+            )
+            .permute(0, 1, 3, 2, 4)
+            .contiguous()
+        )
+    else:
+        value_cache = value_quant.contiguous()
     block_tables = torch.arange(num_blocks, dtype=torch.int32).reshape(
         batch_size, blocks_per_sequence
     )
@@ -412,7 +426,11 @@ def run_pa_decode_tile_case(
         + value_scale.numel() * value_scale.element_size()
     )
 
-    ret = {"gfx": get_gfx_runtime(), "partitions": num_partitions}
+    ret = {
+        "gfx": get_gfx_runtime(),
+        "partitions": num_partitions,
+        "trans_v": trans_v,
+    }
     for name, fn in candidates.items():
         out, us = run_perftest(fn)
         err = checkAllclose(
@@ -1130,11 +1148,19 @@ def main():
         default=[16, 64, 128],
         help="""KV-cache block sizes.""",
     )
+    parser.add_argument(
+        "--trans-v",
+        type=int,
+        nargs="*",
+        choices=[0, 1],
+        default=[0],
+        help="""Value-cache layout: 0 for rank-4, 1 for rank-5 transposed V.""",
+    )
     args = parser.parse_args()
 
     rows = []
-    for dtype, batch_size, shape, block_size in itertools.product(
-        args.dtype, args.batch, args.shapes, args.block_size
+    for dtype, batch_size, shape, block_size, trans_v in itertools.product(
+        args.dtype, args.batch, args.shapes, args.block_size, args.trans_v
     ):
         num_query_heads, num_kv_heads, head_dim, context_length = shape
         rows.append(
@@ -1146,6 +1172,7 @@ def main():
                 context_length,
                 block_size,
                 dtype,
+                bool(trans_v),
             )
         )
 
