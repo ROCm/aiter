@@ -25,7 +25,7 @@ import argparse
 import itertools
 import os
 from collections.abc import Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 import pandas as pd
 import torch
@@ -58,10 +58,14 @@ from aiter.jit.utils.chip_info import get_cu_num, get_gfx_runtime
 from aiter.ops.comm_fused_moe_runtime import CommFusedMoeRuntime
 from aiter.ops.flydsl.comm_fused_moe_host import (
     ShapeKey,
+    _LazyRunners,
     config_name,
     create_flydsl_comm_fused_runners,
     is_flydsl_comm_fused_moe_available,
     winners_for,
+)
+from aiter.ops.flydsl.kernels.comm_fused_moe.gfx950.a8w4.config import (
+    MegakernelConfig,
 )
 from aiter.ops.quant import (
     mxfp4_moe_sort_fwd,
@@ -156,6 +160,7 @@ class TestSession:
     runners: dict
     weights: Stage2Weights
     graph_replays: int
+    rs_runners: dict | None = None
     stage2_fixtures: dict[tuple[int, str], Stage2Fixture] = field(default_factory=dict)
     full_fixture: FullMoeFixture | None = None
 
@@ -463,7 +468,7 @@ def _torch_stage2_allreduce(
     return output
 
 
-def _run_ordinary_stage2(
+def _run_ordinary_stage2_local(
     fixture: Stage2Fixture, weights: Stage2Weights
 ) -> torch.Tensor:
     case = fixture.case
@@ -485,7 +490,37 @@ def _run_ordinary_stage2(
     )
     if fixture.shared_partial is not None:
         case.partial_out.add_(fixture.shared_partial)
-    return get_tp_group().all_reduce(case.partial_out, ca_fp8_quant=False)
+    return case.partial_out
+
+
+def _run_ordinary_stage2(
+    fixture: Stage2Fixture, weights: Stage2Weights
+) -> torch.Tensor:
+    return get_tp_group().all_reduce(
+        _run_ordinary_stage2_local(fixture, weights), ca_fp8_quant=False
+    )
+
+
+def _run_ordinary_stage2_reducescatter(
+    fixture: Stage2Fixture, session: TestSession
+) -> torch.Tensor:
+    partial = _run_ordinary_stage2_local(fixture, session.weights)
+    # The production DSV4 DPA path scatters with the custom CA IPC kernel
+    # (GroupCoordinator.reduce_scatter_tensor, use_custom=True).
+    return get_tp_group().reduce_scatter_tensor(partial)
+
+
+def _run_ordinary_stage2_reducescatter_nccl(
+    fixture: Stage2Fixture, session: TestSession
+) -> torch.Tensor:
+    partial = _run_ordinary_stage2_local(fixture, session.weights)
+    shard = torch.empty(
+        (partial.shape[0] // session.world, *partial.shape[1:]),
+        dtype=partial.dtype,
+        device=partial.device,
+    )
+    dist.reduce_scatter_tensor(shard, partial, group=session.group)
+    return shard
 
 
 def _stage2_fixture(session: TestSession, tokens: int, route: str) -> Stage2Fixture:
@@ -951,6 +986,80 @@ def test_comm_fused_stage2(tokens: int, route: str, mode: str):
     return _run_stage2_case(_session(), tokens, route, mode)
 
 
+def _run_stage2_rs_case(
+    session: TestSession, tokens: int, route: str, mode: str
+) -> dict[str, float | str]:
+    if session.rs_runners is None or tokens not in session.rs_runners:
+        if session.rank == 0:
+            aiter.logger.warning(
+                "no reduce-scatter runner for M=%d (bucket not divisible by TP "
+                "or winner is not a direct megakernel); skipping",
+                tokens,
+            )
+        return {"gfx": session.gfx, "comm_fused_rs kernel": "skipped"}
+    fixture = _stage2_fixture(session, tokens, route)
+    runner = session.rs_runners[tokens]
+    shard_tokens = tokens // session.world
+    shard_start = session.rank * shard_tokens
+    reference = fixture.reference[shard_start : shard_start + shard_tokens]
+
+    def run_comm_fused():
+        case = fixture.case
+        prepared = fixture.shared_partial
+        if prepared is not None:
+            prepared = runner.prepare_shared_partial(prepared)
+        return runner(
+            stage2_args=(
+                case.inter_states,
+                None,
+                session.weights.kernel,
+                case.sorted_token_ids,
+                case.sorted_expert_ids,
+                case.num_valid_ids,
+                case.partial_out,
+                TOPK,
+            ),
+            stage2_kwargs={
+                "w2_scale": session.weights.kernel_scale.view(dtypes.fp8_e8m0),
+                "a2_scale": case.a2_scale,
+                "block_m": case.block_m,
+                "sorted_weights": case.sorted_weights,
+            },
+            shared_partial=prepared,
+            ordinary_stage2=fixture.metadata.stage2,
+        )
+
+    candidates = {
+        "ordinary_rs": lambda: _run_ordinary_stage2_reducescatter(fixture, session),
+        "ordinary_rs_nccl": lambda: _run_ordinary_stage2_reducescatter_nccl(
+            fixture, session
+        ),
+        "comm_fused_rs": run_comm_fused,
+    }
+
+    flops, nbytes = _stage2_work(fixture.case, session.world)
+    result = _record_candidates(
+        candidates=candidates,
+        mode=mode,
+        reference=reference,
+        flops=flops,
+        nbytes=nbytes,
+        session=session,
+    )
+    return {
+        "ordinary kernel": fixture.ordinary_kernel,
+        "comm_fused_rs kernel": config_name(runner.config),
+        **result,
+    }
+
+
+@benchmark()
+def test_comm_fused_stage2_reducescatter(tokens: int, route: str, mode: str):
+    """Benchmark DPA Stage2 + reduce-scatter candidates vs a torch reference."""
+
+    return _run_stage2_rs_case(_session(), tokens, route, mode)
+
+
 @benchmark()
 def test_comm_fused_runtime(tokens: int, route: str, mode: str):
     """Benchmark the model-facing M=3 -> M=4 runtime-padding path."""
@@ -973,6 +1082,14 @@ def _parse_args():
         type=int,
         choices=(0, 1),
         default=int(ADD_SHARED),
+    )
+    parser.add_argument(
+        "--dp-reducescatter",
+        type=int,
+        choices=(0, 1),
+        default=1,
+        help="Also test DPA Stage2 + reduce-scatter runners derived from the "
+        "direct megakernel winners (default: 1).",
     )
     parser.add_argument(
         "-m",
@@ -1079,6 +1196,26 @@ def main() -> None:
         if is_default_dsv4_shape and 32 in configs:
             raise AssertionError("M=32 fallback unexpectedly created a fused runner")
 
+        rs_runners = None
+        if args.dp_reducescatter:
+            rs_configs = {}
+            for bucket in requested_tokens:
+                winner = configs[bucket]
+                if (
+                    isinstance(winner, MegakernelConfig)
+                    and winner.collective == "direct"
+                    and bucket % TP_SIZE == 0
+                ):
+                    rs_configs[bucket] = replace(winner, collective="rs")
+                elif rank == 0:
+                    aiter.logger.warning(
+                        "M=%d winner is %s; reduce-scatter case will be skipped",
+                        bucket,
+                        config_name(winner),
+                    )
+            if rs_configs:
+                rs_runners = _LazyRunners(get_tp_group(), rs_configs)
+
         session = TestSession(
             rank=rank,
             world=world,
@@ -1094,6 +1231,7 @@ def main() -> None:
             ),
             weights=_make_stage2_weights(rank, device),
             graph_replays=args.graph_replays,
+            rs_runners=rs_runners,
         )
         _ACTIVE_SESSION = session
 
@@ -1104,6 +1242,15 @@ def main() -> None:
             row = test_comm_fused_stage2(tokens, route, mode)
             if rank == 0:
                 stage2_rows.append(row)
+
+        stage2_rs_rows = []
+        if rs_runners is not None:
+            for tokens, route, mode in itertools.product(
+                requested_tokens, requested_routes, MODES
+            ):
+                row = test_comm_fused_stage2_reducescatter(tokens, route, mode)
+                if rank == 0:
+                    stage2_rs_rows.append(row)
 
         runtime_rows = []
         # Without a shared add, the caller still has to apply any model-specific
@@ -1117,9 +1264,11 @@ def main() -> None:
 
         if rank == 0:
             _log_summary("comm-fused MoE Stage2", stage2_rows)
+            _log_summary("comm-fused MoE Stage2 reduce-scatter", stage2_rs_rows)
             _log_summary("comm-fused MoE runtime padding", runtime_rows)
             print(
                 f"COMM_FUSED_UT_OK stage2_cases={len(stage2_rows)} "
+                f"stage2_rs_cases={len(stage2_rs_rows)} "
                 f"runtime_cases={len(runtime_rows)}",
                 flush=True,
             )

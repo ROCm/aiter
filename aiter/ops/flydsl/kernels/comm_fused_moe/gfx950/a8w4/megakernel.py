@@ -165,12 +165,18 @@ def emit_service_tile(
     payload_bytes = config.payload_bytes
     partial_payload_bytes = config.partial_payload_bytes
     partial_bytes = config.partial_bytes
-    partial_scale_sideband = not config.shared_bf16_partials and (
+    partial_scale_sideband = not (
+        config.shared_bf16_partials or config.rs_bf16_partials
+    ) and (
         config.vector_width == 8 or config.wide_partial_scales
     )
     reduce_items = config.m * config.tile_n // config.vector_width
     optimized_m8_direct = config.collective == "direct" and config.m == 8
-    partial_store_cache_modifier = CPOL_COHERENT if optimized_m8_direct else 0
+    optimized_m8_rs = config.collective == "rs" and config.m == 8
+    optimized_rs_single_pass = config.collective == "rs" and config.m <= 64
+    optimized_single_pass = optimized_m8_direct or optimized_rs_single_pass
+    single_pass_service = config.single_pass_direct or optimized_rs_single_pass
+    partial_store_cache_modifier = CPOL_COHERENT if optimized_single_pass else 0
     local_workspace_base = fx.Int64(ptrtoint(workspace))
     state_n_tile = (n_tile // fx.Int32(config.service_tile_group)) * fx.Int32(
         config.service_tile_group
@@ -185,7 +191,7 @@ def emit_service_tile(
     output_resource = buffer_tensor_from_addr(
         local_workspace_base + fx.Int64(config.output_offset),
         fx.BFloat16,
-        payload_bytes,
+        config.output_region_bytes,
     )
     shared_resource = buffer_tensor_from_addr(
         fx.Int64(ptrtoint(shared_partial)),
@@ -221,6 +227,13 @@ def emit_service_tile(
         fx.Int32,
         (partial_payload_bytes if partial_scale_sideband else partial_bytes),
     )
+    partial_bf16_resource = None
+    if const_expr(config.rs_bf16_partials):
+        partial_bf16_resource = buffer_tensor_from_addr(
+            local_workspace_base + slot * fx.Int64(partial_bytes),
+            fx.BFloat16,
+            partial_payload_bytes,
+        )
     partial_scale_resource = None
     if const_expr(partial_scale_sideband):
         partial_scale_resource = buffer_tensor_from_addr(
@@ -278,7 +291,6 @@ def emit_service_tile(
                 expected_i32 - fx.Int32(SLOTS),
             )
         gpu.barrier()
-
     def emit_local_reduce_item(item):
         token = item // fx.Int32(config.tile_n // config.vector_width)
         tile_item = item - token * fx.Int32(config.tile_n // config.vector_width)
@@ -336,7 +348,15 @@ def emit_service_tile(
                     else:
                         local_even = local_even + load_bf16_route(route_slot)
                 reduced_f32 = local_even + local_odd
-
+        if const_expr(config.rs_bf16_partials):
+            store_bf16(
+                partial_bf16_resource,
+                output_offset,
+                reduced_f32.to(fx.BFloat16),
+                config.vector_width,
+                cache_modifier=partial_store_cache_modifier,
+            )
+            return None
         if const_expr(config.shared_bf16_partials):
             if const_expr(config.producer_mode == "atomic_shared"):
                 store_bf16(
@@ -394,7 +414,13 @@ def emit_service_tile(
     retained_local_partials = []
 
     def emit_local_reduce_items():
-        if const_expr(retain_underfilled_local_partial):
+        if const_expr(
+            optimized_m8_rs
+            and config.vector_width == 8
+            and reduce_items == service_stride
+        ):
+            emit_local_reduce_item(service_start)
+        elif const_expr(retain_underfilled_local_partial):
             initial = [fx.Int32(0) for _ in range_constexpr(config.vector_width // 4)]
             initial.append(fx.Int32(0))
             for item, _ in range(
@@ -431,6 +457,23 @@ def emit_service_tile(
         load_vector_width = vector_width or config.vector_width
 
         def load_peer(peer, cache_modifier=None, use_retained=False):
+            if const_expr(config.rs_bf16_partials):
+                peer_resource = buffer_tensor_from_addr(
+                    peer_base(workspace_flat_base, peer)
+                    + slot * fx.Int64(partial_bytes),
+                    fx.BFloat16,
+                    partial_payload_bytes,
+                )
+                return load_bf16(
+                    peer_resource,
+                    offset,
+                    load_vector_width,
+                    (
+                        config.remote_load_cache_modifier
+                        if const_expr(peer != specialized_rank)
+                        else config.local_load_cache_modifier
+                    ),
+                ).to(fx.Float32)
             if const_expr(config.shared_bf16_partials):
                 if const_expr(config.producer_mode == "atomic_shared"):
                     peer_resource = buffer_tensor_from_addr(
@@ -704,6 +747,11 @@ def emit_service_tile(
                 if const_expr(config.collective == "rs_broadcast"):
                     emit_gather_ack()
                     wait_for_gather_acks()
+                elif const_expr(optimized_rs_single_pass):
+                    # The RS loads are already drained and all threads have
+                    # rendezvoused.  This ack only protects partial-buffer
+                    # reuse; it does not publish data consumed by a peer.
+                    emit_gather_ack()
                 else:
                     if tid == fx.Int32(0):
                         comm_ops.fence_system_release()
@@ -741,17 +789,8 @@ def emit_service_tile(
         def emit_reduce_scatter_items():
             vectors_per_token = config.tile_n // collective_vector_width
             shard_tokens = config.m // tp_size
-            service_item = tid + service_group * fx.Int32(config.block_threads)
-            first_shard_token = service_item // fx.Int32(vectors_per_token)
-            vector_lane = service_item - first_shard_token * fx.Int32(vectors_per_token)
 
-            for shard_token in range(
-                first_shard_token,
-                fx.Int32(shard_tokens),
-                fx.Int32(
-                    config.block_threads * config.service_groups // vectors_per_token,
-                ),
-            ):
+            def emit_reduce_scatter_item(shard_token, vector_lane):
                 token = rank * fx.Int32(shard_tokens) + shard_token
                 offset = (
                     token * fx.Int32(hidden_dim)
@@ -779,12 +818,21 @@ def emit_service_tile(
                         collective_vector_width,
                         config.remote_store_cache_modifier,
                     )
-                reduced_offset = (
-                    n_tile * fx.Int32(config.m * config.tile_n // tp_size)
-                    + shard_token * fx.Int32(config.tile_n)
-                    + vector_lane * fx.Int32(collective_vector_width)
-                )
-                if const_expr(config.collective == "rs_broadcast"):
+                if const_expr(config.collective == "rs"):
+                    # DPA reduce-scatter: keep only this rank's token shard in a
+                    # compact [m // tp, hidden] output; no AG exchange follows.
+                    shard_offset = (
+                        shard_token * fx.Int32(hidden_dim)
+                        + n_tile * fx.Int32(config.tile_n)
+                        + vector_lane * fx.Int32(collective_vector_width)
+                    )
+                    store_bf16(
+                        output_resource,
+                        shard_offset,
+                        reduced_bf16,
+                        collective_vector_width,
+                    )
+                elif const_expr(config.collective == "rs_broadcast"):
                     for peer_step in range_constexpr(tp_size):
                         peer = (specialized_rank + peer_step + 1) % tp_size
                         if const_expr(peer == specialized_rank):
@@ -803,7 +851,12 @@ def emit_service_tile(
                             collective_vector_width,
                             config.remote_store_cache_modifier,
                         )
-                else:
+                elif const_expr(config.collective == "rsag"):
+                    reduced_offset = (
+                        n_tile * fx.Int32(config.m * config.tile_n // tp_size)
+                        + shard_token * fx.Int32(config.tile_n)
+                        + vector_lane * fx.Int32(collective_vector_width)
+                    )
                     reduced_e8m0, reduced_quant_scale = _mxfp8_scale(
                         reduced,
                         tid & fx.Int32(63),
@@ -827,10 +880,37 @@ def emit_service_tile(
                         collective_vector_width,
                         reduced_e8m0,
                     )
+
+            if const_expr(optimized_m8_rs):
+                if tid < fx.Int32(vectors_per_token):
+                    emit_reduce_scatter_item(fx.Int32(0), tid)
+            else:
+                service_item = tid + service_group * fx.Int32(config.block_threads)
+                first_shard_token = service_item // fx.Int32(vectors_per_token)
+                vector_lane = (
+                    service_item
+                    - first_shard_token * fx.Int32(vectors_per_token)
+                )
+                for shard_token in range(
+                    first_shard_token,
+                    fx.Int32(shard_tokens),
+                    fx.Int32(
+                        config.block_threads
+                        * config.service_groups
+                        // vectors_per_token,
+                    ),
+                ):
+                    emit_reduce_scatter_item(shard_token, vector_lane)
             fx.rocdl.s_waitcnt(vmcnt=0, lgkmcnt=0)
             gpu.barrier()
 
         emit_reduce_scatter_items()
+
+        if const_expr(config.collective == "rs"):
+            # All peers' partials have been consumed; publish the read
+            # completion ack that gates partial reuse two epochs later.
+            publish_gather_completion()
+            return
 
         if const_expr(config.collective == "rs_broadcast"):
             publish_gather_completion()
@@ -1022,7 +1102,7 @@ def emit_service_tile(
     if const_expr(config.service_groups == 1):
         if tid == fx.Int32(0):
             comm_ops.fence_system_release()
-        if const_expr(config.single_pass_direct):
+        if const_expr(single_pass_service):
             gpu.barrier()
 
         if tid < fx.Int32(tp_size):
@@ -1039,11 +1119,11 @@ def emit_service_tile(
                 + fx.Int64(config.rank_ready_offset)
                 + fx.Int64(local_slot) * fx.Int64(4)
             )
-            if const_expr(config.single_pass_direct):
+            if const_expr(single_pass_service):
                 comm_ops.spin_until_ge_i32_system(
                     ready_address,
                     expected_i32,
-                    acquire=not optimized_m8_direct,
+                    acquire=not optimized_single_pass,
                     sleep=False,
                 )
             else:
@@ -1051,7 +1131,7 @@ def emit_service_tile(
                     ready_address,
                     expected_i32,
                 )
-        if const_expr(not config.single_pass_direct):  # noqa: SIM102
+        if const_expr(not single_pass_service):  # noqa: SIM102
             if tid == fx.Int32(0):
                 comm_ops.fence_system_acquire()
         gpu.barrier()
@@ -1271,9 +1351,21 @@ def compile_megakernel(
                 )
                 start_tail = has_extra.select(compute_group, remainder)
                 start_m_block = compute_group * base_iterations + start_tail
-                for iteration in range(fx.Int32(0), iteration_count, fx.Int32(1)):
-                    gpu.barrier()
-                    emit_gemm(start_m_block + fx.Int32(iteration))
+                if const_expr(config.collective == "rs" and config.m == 8):
+                    max_iterations = (
+                        config.producer_rows + config.compute_groups - 1
+                    ) // config.compute_groups
+                    for iteration in range_constexpr(max_iterations):
+                        if iteration_count > fx.Int32(iteration):
+                            if const_expr(iteration > 0):
+                                gpu.barrier()
+                            emit_gemm(start_m_block + fx.Int32(iteration))
+                else:
+                    for iteration in range(
+                        fx.Int32(0), iteration_count, fx.Int32(1)
+                    ):
+                        gpu.barrier()
+                        emit_gemm(start_m_block + fx.Int32(iteration))
             else:
                 for iteration in range_constexpr(rows_per_group):
                     if iteration:

@@ -5,23 +5,52 @@
 from __future__ import annotations
 
 from collections.abc import Callable
-from typing import Any
+from typing import Any, Protocol
 
 import torch
 
 
+class _RuntimeRunner(Protocol):
+    output: torch.Tensor
+
+    def output_rows_for(self, input_rows: int) -> int: ...
+
+    def prepare_padded_shared_partial(
+        self, shared_partial: torch.Tensor, input_rows: int
+    ) -> torch.Tensor: ...
+
+    def prepare_shared_partial(
+        self, shared_partial: torch.Tensor
+    ) -> torch.Tensor: ...
+
+    def __call__(self, **kwargs: Any) -> torch.Tensor: ...
+
+
+class _RunnerSet(Protocol):
+    add_shared: bool
+
+    def __contains__(self, tokens: int) -> bool: ...
+
+    def __getitem__(self, tokens: int) -> _RuntimeRunner: ...
+
+
 class CommFusedMoeRuntime:
-    """Reuse ordinary MoE through Stage1, then run fused Stage2 + TP AR.
+    """Reuse ordinary MoE through Stage1, then run fused Stage2 + TP collective.
 
     Each prepared runner owns one exact token bucket. Runners with
     ``add_shared=True`` add a shared partial before TP reduction; the others
-    return only the replicated routed result.
+    return only the routed result in their declared output layout.
+
+    Each runner owns its input-to-output row layout. Replicated collectives map
+    one input row to one output row, while sharded collectives may return only
+    a proportional subset. The runtime only consumes that layout contract and
+    does not need to identify the runner's collective implementation.
     """
 
     def __init__(
         self,
         *,
-        runners: dict[int, Callable],
+        runners: _RunnerSet,
     ) -> None:
         self.runners = runners
         self.add_shared = runners.add_shared
@@ -49,6 +78,7 @@ class CommFusedMoeRuntime:
         if bucket < raw_tokens:
             raise KeyError(f"no comm_fused bucket for {raw_tokens} tokens")
         runner = self.runners[bucket]
+        output_rows = runner.output_rows_for(raw_tokens)
 
         if bucket != raw_tokens:
             topk_weight = moe_args["topk_weight"]
@@ -68,17 +98,15 @@ class CommFusedMoeRuntime:
                 current_shared = shared_partial
                 if before_stage2 is not None:
                     current_shared = before_stage2()
-                add_shared = runner.config.shape.add_shared
+                add_shared = self.add_shared
                 if add_shared and current_shared is None:
                     raise RuntimeError("comm-fused Stage2 requires shared_partial")
                 if add_shared and bucket != raw_tokens:
-                    padded_shared = runner.output
-                    padded_shared[:raw_tokens].copy_(current_shared)
-                    padded_shared[raw_tokens:].zero_()
-                    current_shared = padded_shared
-                prepare_shared_partial = getattr(runner, "prepare_shared_partial", None)
-                if add_shared and prepare_shared_partial is not None:
-                    current_shared = prepare_shared_partial(current_shared)
+                    current_shared = runner.prepare_padded_shared_partial(
+                        current_shared, raw_tokens
+                    )
+                if add_shared:
+                    current_shared = runner.prepare_shared_partial(current_shared)
                 return runner(shared_partial=current_shared, **kwargs)
 
             if stage2_stream is None:
@@ -96,7 +124,7 @@ class CommFusedMoeRuntime:
             **moe_args,
             _stage2_override=stage2_override,
         )
-        return output if raw_tokens == bucket else output[:raw_tokens]
+        return output if output_rows == output.shape[0] else output[:output_rows]
 
 
 __all__ = ["CommFusedMoeRuntime"]

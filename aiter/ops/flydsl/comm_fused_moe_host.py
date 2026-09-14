@@ -62,6 +62,7 @@ class ShapeKey:
     use_g1u1: int = 1
     doweight_stage1: int = 0
     add_shared: bool | None = _ADD_SHARED
+    comm: str = "ar"
 
     def kernel_shape(self) -> Shape:
         if self.add_shared is None:
@@ -164,6 +165,7 @@ def config_name(config: PipelineConfig) -> str:
             {
                 "rs_broadcast": "rsbcast",
                 "rsag": "rsag",
+                "rs": "rs",
             }[config.collective]
         )
     if config.service_groups != defaults["service_groups"]:
@@ -208,13 +210,14 @@ def _parse_megakernel_name(name: str, shape: Shape, m: int):
     }
     collective = values["collective"]
     for part in parts:
-        if part in ("direct", "rsbcast", "rsag"):
+        if part in ("direct", "rsbcast", "rsag", "rs"):
             if collective != values["collective"]:
                 raise ValueError(f"duplicate collective in {name!r}")
             collective = {
                 "direct": "direct",
                 "rsbcast": "rs_broadcast",
                 "rsag": "rsag",
+                "rs": "rs",
             }[part]
         elif part == "patomic":
             values["producer_mode"] = "atomic_shared"
@@ -315,6 +318,7 @@ def _winner_table() -> dict[ShapeKey, dict[int, PipelineConfig]]:
                 _int_value(row["use_g1u1"], "use_g1u1"),
                 _int_value(row["doweight_stage1"], "doweight_stage1"),
                 _optional_bool(row, "comm_add_shared", _ADD_SHARED),
+                (row.get("comm_mode") or "ar").strip() or "ar",
             )
             key = (shape, _int_value(row["token"], "token"))
             candidates.setdefault(key, []).append(row)
@@ -345,6 +349,7 @@ def winners_for(shape: ShapeKey) -> dict[int, PipelineConfig]:
             shape.use_g1u1,
             shape.doweight_stage1,
             shape.add_shared,
+            shape.comm,
         )
     table = _winner_table()
     if shape.add_shared is None:
@@ -446,7 +451,47 @@ def _stage2_args(args, kwargs, config):
     )
 
 
-class _AtomicRunner:
+class _RuntimeLayoutRunner:
+    """Common model-runtime contract independent of collective type."""
+
+    def _init_runtime_layout(self) -> None:
+        self._runtime_shared_stage = None
+
+    def output_rows_for(self, input_rows: int) -> int:
+        output_rows, remainder = divmod(
+            input_rows * int(self.output.shape[0]), self.config.m
+        )
+        if remainder:
+            raise ValueError(
+                f"runner layout maps bucket M={self.config.m} to "
+                f"{self.output.shape[0]} output rows and cannot represent "
+                f"input M={input_rows}"
+            )
+        return output_rows
+
+    def prepare_padded_shared_partial(
+        self, shared_partial: torch.Tensor, input_rows: int
+    ) -> torch.Tensor:
+        """Pad a full-layout shared contribution for this runner's bucket."""
+
+        if self.output.shape[0] == self.config.m:
+            padded = self.output
+        else:
+            padded = self._runtime_shared_stage
+            if padded is None:
+                padded = shared_partial.new_empty(
+                    (self.config.m, *shared_partial.shape[1:])
+                )
+                self._runtime_shared_stage = padded
+        padded[:input_rows].copy_(shared_partial)
+        padded[input_rows:].zero_()
+        return padded
+
+    def prepare_shared_partial(self, shared_partial: torch.Tensor) -> torch.Tensor:
+        return shared_partial
+
+
+class _AtomicRunner(_RuntimeLayoutRunner):
     def __init__(
         self,
         tp_group,
@@ -472,6 +517,7 @@ class _AtomicRunner:
             dtype=torch.bfloat16,
             device=self.device,
         )
+        self._init_runtime_layout()
         self.comm, self.windows, (workspace_base,) = _register(
             tp_group, self.rank, shape.tp_size, (self.workspace,)
         )
@@ -548,7 +594,7 @@ class _AtomicRunner:
         return self.output
 
 
-class _MegakernelRunner:
+class _MegakernelRunner(_RuntimeLayoutRunner):
     """Single-launch GEMM2 with per-N-tile TP collective services."""
 
     def __init__(
@@ -562,11 +608,16 @@ class _MegakernelRunner:
         self.device = torch.device(tp_group.device)
         self.workspace = _symmetric(self.device, config.workspace_bytes)
         self.workspace.zero_()
+        if config.collective == "rs":
+            output_rows = config.m // shape.tp_size
+        else:
+            output_rows = config.m
         self.output = (
-            self.workspace.narrow(0, config.output_offset, config.payload_bytes)
+            self.workspace.narrow(0, config.output_offset, config.output_region_bytes)
             .view(torch.bfloat16)
-            .view(config.m, shape.model_dim)
+            .view(output_rows, shape.model_dim)
         )
+        self._init_runtime_layout()
         self.comm, self.windows, bases = _register(
             tp_group,
             self.rank,
@@ -657,7 +708,7 @@ class _MegakernelRunner:
         return self.output
 
 
-class _WindowRunner:
+class _WindowRunner(_RuntimeLayoutRunner):
     def __init__(
         self,
         tp_group,
@@ -699,6 +750,7 @@ class _WindowRunner:
             dtype=torch.bfloat16,
             device=self.device,
         )
+        self._init_runtime_layout()
         self.comm, self.windows, (workspace_base,) = _register(
             tp_group, self.rank, shape.tp_size, (self.workspace,)
         )
@@ -879,7 +931,10 @@ def create_flydsl_comm_fused_runners(
     experts,
     topk,
     act_type: str = _DEFAULT_ACT_TYPE,
+    comm: str = "ar",
 ):
+    if comm not in ("ar", "rs"):
+        raise ValueError(f"comm must be 'ar' or 'rs', got {comm!r}")
     shape = ShapeKey(
         get_gfx_runtime(),
         model_dim,
@@ -889,6 +944,7 @@ def create_flydsl_comm_fused_runners(
         int(tp_group.world_size),
         act_type=act_type,
         add_shared=None,
+        comm=comm,
     )
     configs = winners_for(shape)
     if not configs:

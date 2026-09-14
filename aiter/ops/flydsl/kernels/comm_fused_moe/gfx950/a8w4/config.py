@@ -180,9 +180,10 @@ class MegakernelConfig:
             "direct",
             "rsag",
             "rs_broadcast",
+            "rs",
         ):
             raise ValueError(
-                "collective must be 'direct', 'rsag', or 'rs_broadcast', got "
+                "collective must be 'direct', 'rsag', 'rs_broadcast', or 'rs', got "
                 f"{self.collective!r}"
             )
         if not 1 <= self.service_groups <= self.compute_groups:
@@ -193,7 +194,7 @@ class MegakernelConfig:
             )
         if self.collective != "rsag" and self.service_groups != 1:
             raise ValueError(
-                "direct and rs_broadcast collectives require service_groups=1"
+                "direct, rs_broadcast, and rs collectives require service_groups=1"
             )
         if self.collective == "rsag" and (
             self.service_groups not in (1, 2, 4, 8)
@@ -256,11 +257,15 @@ class MegakernelConfig:
 
     @property
     def uses_rsag(self) -> bool:
-        return self.collective in ("rsag", "rs_broadcast")
+        return self.collective in ("rsag", "rs_broadcast", "rs")
 
     @property
     def shared_bf16_partials(self) -> bool:
         return self.collective == "rs_broadcast"
+
+    @property
+    def rs_bf16_partials(self) -> bool:
+        return self.collective == "rs" and self.m in (8, 16)
 
     @property
     def wide_partial_scales(self) -> bool:
@@ -298,15 +303,24 @@ class MegakernelConfig:
         return self.m * self.shape.model_dim * 2
 
     @property
+    def output_region_bytes(self) -> int:
+        if self.collective == "rs":
+            return self.payload_bytes // self.shape.tp_size
+        return self.payload_bytes
+
+    @property
     def partial_bytes(self) -> int:
         return _align_up(self.partial_payload_bytes + self.partial_scale_bytes, 16)
 
     @property
     def partial_payload_bytes(self) -> int:
-        return self.m * self.shape.model_dim
+        element_bytes = 2 if self.rs_bf16_partials else 1
+        return self.m * self.shape.model_dim * element_bytes
 
     @property
     def partial_scale_bytes(self) -> int:
+        if self.rs_bf16_partials:
+            return 0
         if self.shared_bf16_partials:
             return 0
         if self.wide_partial_scales:
@@ -315,7 +329,7 @@ class MegakernelConfig:
 
     @property
     def reduced_payload_bytes(self) -> int:
-        if not self.uses_rsag:
+        if not self.uses_rsag or self.collective == "rs":
             return 0
         element_bytes = 2 if self.shared_bf16_partials else 1
         return self.m * self.shape.model_dim * element_bytes // self.shape.tp_size
@@ -350,7 +364,7 @@ class MegakernelConfig:
 
     @property
     def producer_done_offset(self) -> int:
-        return self.output_offset + self.payload_bytes
+        return self.output_offset + self.output_region_bytes
 
     @property
     def producer_counter_slots(self) -> int:
