@@ -11,31 +11,86 @@ Algorithm:
 - Q is loaded once into registers and held for all KT x KH inner iterations.
 - Each iteration loads one (t_kv, h_kv) row of K and V at the shared W window.
 - Running online softmax in log2 space (exp2, log2(e) folded into scale).
-- Autotuned over BLOCK_Q (16, 32), num_stages (2, 3, 4), num_warps (4, 8).
+- Optionally autotuned (NA3D_FLASH_TRITON_AUTOTUNE=1) over BLOCK_Q (16, 32),
+  num_stages (2, 3, 4), num_warps (4, 8).
 """
+
+import os
 
 import triton
 import triton.language as tl
 
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
+from aiter.ops.triton.utils.tuned_config_utils import get_tuned_kernel_config
 
-# Autotune configs.
-# BLOCK_KV = next_pow2(BLOCK_Q + KW - 1) covers the union of all BLOCK_Q
-# queries' W windows in one chunk:
-#   BLOCK_Q=16  ->  BLOCK_KV=32
-#   BLOCK_Q=32  ->  BLOCK_KV=64
-# The W >= BLOCK_Q constraint is enforced by the pruner below.
-_NA3D_AUTOTUNE_CONFIGS = [
-    triton.Config({"BLOCK_Q": 16, "BLOCK_KV": 32}, num_warps=4, num_stages=2),
-    triton.Config({"BLOCK_Q": 16, "BLOCK_KV": 32}, num_warps=8, num_stages=2),
-    triton.Config({"BLOCK_Q": 16, "BLOCK_KV": 32}, num_warps=4, num_stages=3),
-    triton.Config({"BLOCK_Q": 16, "BLOCK_KV": 32}, num_warps=8, num_stages=3),
-    triton.Config({"BLOCK_Q": 16, "BLOCK_KV": 32}, num_warps=4, num_stages=4),
-    triton.Config({"BLOCK_Q": 16, "BLOCK_KV": 32}, num_warps=8, num_stages=4),
-    # BLOCK_Q=32 halves program count but doubles BLOCK_KV (more masked compute).
-    triton.Config({"BLOCK_Q": 32, "BLOCK_KV": 64}, num_warps=4, num_stages=2),
-    triton.Config({"BLOCK_Q": 32, "BLOCK_KV": 64}, num_warps=8, num_stages=2),
-]
+
+def _na3d_autotune_configs():
+    """Full autotune search space (opt-in via NA3D_FLASH_TRITON_AUTOTUNE=1).
+
+    BLOCK_KV = next_pow2(BLOCK_Q + KW - 1) covers the union of all BLOCK_Q queries'
+    W windows in one chunk (BLOCK_Q=16 -> 32, BLOCK_Q=32 -> 64). The BLOCK_Q=32
+    family halves program count but doubles BLOCK_KV (more masked compute), so it
+    is only swept at num_stages=2. W >= BLOCK_Q is enforced by the pruner below.
+    """
+    configs = []
+    for block_q, block_kv, stages in ((16, 32, (2, 3, 4)), (32, 64, (2,))):
+        for ns in stages:
+            for nw in (4, 8):
+                configs.append(
+                    triton.Config(
+                        {"BLOCK_Q": block_q, "BLOCK_KV": block_kv},
+                        num_warps=nw,
+                        num_stages=ns,
+                    )
+                )
+    return configs
+
+
+_NA3D_AUTOTUNE_CONFIGS = _na3d_autotune_configs()
+
+# Live-search opt-in.  Default (unset) uses the per-arch tiles published in
+# configs/<arch>/triton/attention/na3d_flash/DEFAULT.json; set to 1 to re-tune
+# over the full _na3d_autotune_configs() search space.
+_NA3D_FLASH_TRITON_AUTOTUNE = os.getenv("NA3D_FLASH_TRITON_AUTOTUNE", "0").lower() in (
+    "1",
+    "true",
+    "yes",
+    "on",
+)
+
+# Always-launchable fallbacks used when an arch has no published DEFAULT.json entry.
+# One per KW-family: the pruner keeps BLOCK_Q=16 for KW <= 17 and BLOCK_Q=32 for
+# KW > 17 (BLOCK_KV must cover BLOCK_Q + KW - 1).
+_FALLBACK_SMALL_KW = triton.Config(
+    {"BLOCK_Q": 16, "BLOCK_KV": 32}, num_warps=4, num_stages=2
+)
+_FALLBACK_LARGE_KW = triton.Config(
+    {"BLOCK_Q": 32, "BLOCK_KV": 64}, num_warps=4, num_stages=2
+)
+
+
+def _na3d_default_configs():
+    """Per-arch default tiles from JSON, one per KW-family.
+
+    Both are returned; the pruner keeps only the family valid for the runtime KW
+    (BLOCK_Q=16 for KW <= 17, BLOCK_Q=32 for KW > 17), so this is at most a 2-way
+    select for KW <= 17 and a single config for KW > 17 -- not a full search.
+    A single pinned tile cannot serve both branches (a KW > 17 shape with only the
+    BLOCK_Q=16 tile would leave the pruner with an empty config set).
+    """
+    return [
+        get_tuned_kernel_config(
+            "attention", "NA3D_FLASH", "na3d_flash_small_kw", _FALLBACK_SMALL_KW
+        ),
+        get_tuned_kernel_config(
+            "attention", "NA3D_FLASH", "na3d_flash_large_kw", _FALLBACK_LARGE_KW
+        ),
+    ]
+
+
+_NA3D_ACTIVE_CONFIGS = (
+    _NA3D_AUTOTUNE_CONFIGS if _NA3D_FLASH_TRITON_AUTOTUNE else _na3d_default_configs()
+)
 
 
 def _prune_configs(configs, named_args, **kwargs):
@@ -62,7 +117,7 @@ _na3d_flash_fwd_repr = make_kernel_repr(
 
 
 @triton.autotune(
-    configs=_NA3D_AUTOTUNE_CONFIGS,
+    configs=_NA3D_ACTIVE_CONFIGS,
     key=["KT", "KH", "KW", "HD", "W"],
     prune_configs_by={"early_config_prune": _prune_configs},
 )
