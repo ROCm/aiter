@@ -24,7 +24,6 @@ from .gemm_common_gfx1250 import (
 )
 from .gfx1250_cluster import compute_mcast_masks
 from .kernels_common import format_kernel_name
-from .splitk_atomic_epilogue_gfx1250 import emit_atomic_splitk_epilogue
 from .splitk_fused_epilogue_gfx1250 import emit_fused_splitk_epilogue
 from .tensor_shim import (
     AITER_FLYDSL_KERNARG_PRELOAD,
@@ -46,7 +45,6 @@ def launch_gemm_a8w8_256x256(
     stride_ascale_k: fx.Int32,
     i32_lda: fx.Int32,
     i32_ldc: fx.Int32,
-    arg_flag: fx.Pointer,
     arg_out: fx.Pointer,
     tile_m: Constexpr[int],
     tile_n: Constexpr[int],
@@ -62,8 +60,8 @@ def launch_gemm_a8w8_256x256(
     split_k: Constexpr[int] = 1,
     a_preshuffle: Constexpr[bool] = False,
     persistent_n_tiles: Constexpr[int] = 1,
+    fused_splitk: Constexpr[bool] = False,
     bounded_m: Constexpr[bool] = True,
-    splitk_mode: Constexpr[str] = "none",
 ):
     """N must be a multiple of ``tile_n * cluster_n``; M is unrestricted (a
     multiple of 2 when ``a_preshuffle``); K must be divisible by 128 and at
@@ -86,14 +84,8 @@ def launch_gemm_a8w8_256x256(
     assert (
         persistent_n_tiles == 1 or split_k == 1
     ), "persistent_n_tiles>1 requires split_k=1"
-    assert splitk_mode in (
-        "none",
-        "atomic",
-        "fsk",
-    ), f"unknown splitk_mode {splitk_mode!r}"
-    atomic_splitk = splitk_mode == "atomic"
-    cluster_splitk = splitk_mode == "fsk"
-    assert splitk_mode == "none" or (
+    cluster_splitk = fused_splitk and split_k > 1
+    assert not fused_splitk or (
         split_k > 1 and tile_m % split_k == 0
     ), "a fused split-K epilogue needs split_k > 1 dividing tile_m"
     assert not cluster_splitk or block_size == 128, "fsk requires split-K block128"
@@ -163,8 +155,7 @@ def launch_gemm_a8w8_256x256(
         f"_cm{cluster_m}_cn{cluster_n}"
         + ("_apre" if a_preshuffle else "")
         + (f"_ps{persistent_n_tiles}" if persistent_n_tiles > 1 else "")
-        + ("_atm" if atomic_splitk else ("_fsk" if cluster_splitk else ""))
-        + ("b" if atomic_splitk and bounded_m else "")
+        + ("_fsk" if cluster_splitk else "")
     )
 
     def _run_tile(
@@ -179,7 +170,6 @@ def launch_gemm_a8w8_256x256(
         i32_stride_ascale_k: fx.Int32,
         i32_lda: fx.Int32,
         i32_ldc: fx.Int32,
-        arg_flag: fx.Pointer,
         arg_out: fx.Pointer,
         tile_idx=0,
     ):
@@ -242,7 +232,7 @@ def launch_gemm_a8w8_256x256(
             return _view(fx.add_offset(base, off), shape, stride)
 
         oc = fx.Float16 if out_is_f16 else fx.BFloat16
-        if const_expr(atomic_splitk or cluster_splitk):
+        if const_expr(cluster_splitk):
             _flat_tile = bid_y * fx.Int32(fx.grid_dim.x) * fx.Int32(
                 fx.grid_dim.z
             ) // split_k + (m_chunk * fx.Int32(fx.grid_dim.x) + bid_x)
@@ -991,32 +981,13 @@ def launch_gemm_a8w8_256x256(
             c_off_rt = (fx.Int64(_flat_tile) * split_k + fx.Int64(split_idx)) * (
                 tile_m * tile_n
             )
-        elif const_expr(split_k > 1 and not atomic_splitk):
+        elif const_expr(split_k > 1):
             c_off_rt = c_off_rt + fx.Int64(split_idx) * fx.Int64(i32_m) * ldc64
         gC_base = fx.recast_iter(
             fx.PointerType.get(oc.ir_type, arg_c.address_space),
             arg_c,
         )
-        if const_expr(atomic_splitk):
-            emit_atomic_splitk_epilogue(
-                elem=oc,
-                tid=tid,
-                block=block,
-                tile_m=tile_m,
-                tile_n=tile_n,
-                c_lds_row=C_LDS_ROW,
-                lds_base_ptr=base_ptr,
-                gc_base=gC_base,
-                c_off_rt=c_off_rt,
-                ldc64=ldc64,
-                split_k=split_k,
-                split_idx=split_idx,
-                mn_oob=mn_oob,
-                bounded_m=bounded_m,
-                flat_tile=_flat_tile,
-                arg_flag=arg_flag,
-            )
-        elif const_expr(cluster_splitk):
+        if const_expr(cluster_splitk):
             emit_fused_splitk_epilogue(
                 elem=oc,
                 tid=tid,
@@ -1073,7 +1044,6 @@ def launch_gemm_a8w8_256x256(
         i32_stride_ascale_k: fx.Int32,
         i32_lda: fx.Int32,
         i32_ldc: fx.Int32,
-        arg_flag: fx.Pointer,
         arg_out: fx.Pointer,
     ):
         tile_args = (
@@ -1088,7 +1058,6 @@ def launch_gemm_a8w8_256x256(
             i32_stride_ascale_k,
             i32_lda,
             i32_ldc,
-            arg_flag,
             arg_out,
         )
         if const_expr(persistent_n_tiles == 1):
@@ -1133,7 +1102,6 @@ def launch_gemm_a8w8_256x256(
         stride_ascale_k,
         i32_lda,
         i32_ldc,
-        arg_flag,
         arg_out,
         value_attrs={"rocdl.cluster_dims": f"{cluster_m},{cluster_n},{cluster_k}"},
     ).launch(

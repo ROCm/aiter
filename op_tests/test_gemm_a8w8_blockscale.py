@@ -389,7 +389,7 @@ parser.add_argument(
     "--ck_preshuffle",
     type=dtypes.str2bool,
     nargs="*",
-    default=[True, False],
+    default=None,
     help="""weight ck_preshuffle or not.
     e.g.: --ck_preshuffle True
         or --ck_preshuffle False
@@ -417,6 +417,12 @@ parser.add_argument(
     default=None,
     help="""CSV file containing M, N, K columns (one shape per row).
     e.g.: --csv shapes.csv""",
+)
+parser.add_argument(
+    "--table",
+    action="store_true",
+    help="""Also print the summary as a human-readable table.
+    The default output is the single-line JSON record.""",
 )
 parser.add_argument(
     "-o",
@@ -449,6 +455,8 @@ if len(data_init_list) != len(scale_init_list):
     )
 init_pairs = list(zip(data_init_list, scale_init_list))
 
+if args.ck_preshuffle is None:
+    args.ck_preshuffle = [True] if args.flydsl else [True, False]
 l_preshuffle = (
     args.ck_preshuffle if isinstance(args.ck_preshuffle, list) else [args.ck_preshuffle]
 )
@@ -499,7 +507,14 @@ else:
                             )
                             df.append(ret)
 
+df = pd.DataFrame([row for row in df if row is not None])
 print_json_table("gemm_a8w8_blockscale summary", df)
+if args.table and not df.empty:
+    print("\n" + "=" * 150)
+    print("COMPLETE PERFORMANCE SUMMARY (All Columns)")
+    print("=" * 150)
+    print(df.to_string(index=False))
+    print("=" * 150)
 
 # Correctness check: verify split-K produces matching results
 print("\nRunning split-K correctness checks ...")
