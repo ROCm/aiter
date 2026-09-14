@@ -44,54 +44,27 @@ def _check_out(out, q, kv_lora_rank):
     return out
 
 
-def _infer_cache_format(kv, d_qk, kv_lora_rank, qk_rope_head_dim, kv_scale):
-    """-> (fmt, cache, alt_ptr, scl_ptr, block_size). Pointer roles
-    follow the kernel's Seg contract (see its docstring)."""
+def _cache_pointers(fmt, kv, d_qk, kv_scale):
+    """-> (cache, alt_ptr, scl_ptr, block_size) for an MLA-route format. Pointer
+    roles follow the kernel's Seg contract (see its docstring)."""
     if kv.ndim == 4:  # [slots, 1, 1, R], the asm mla_decode_fwd view
-        assert kv.shape[1] == 1 and kv.shape[2] == 1
         kv = kv.reshape(kv.shape[0], kv.shape[3])
     elif kv.ndim == 3 and kv.shape[2] == d_qk:
         # vLLM paged cache [nb, block_size, R]: indices are global slot ids and
         # rows are contiguous, so the flat view is stride-identical.
-        assert kv.stride(2) == 1 and kv.stride(1) == kv.shape[2] * kv.stride(2)
+        if not (kv.stride(2) == 1 and kv.stride(1) == kv.shape[2]):
+            raise ValueError("a [nb, block, R] pool must have contiguous rows")
         kv = kv.reshape(-1, d_qk)
-
-    fp8_dtypes = (torch.uint8, torch.float8_e4m3fn, torch.float8_e4m3fnuz)
-    if kv.ndim == 2 and kv.shape[1] == d_qk:
-        if kv.dtype == torch.bfloat16:
-            return "bf16", kv, kv, None, 1
-        assert kv.dtype in fp8_dtypes, f"unsupported flat cache dtype {kv.dtype}"
-        assert (
-            kv_scale is not None
-        ), "flat fp8 cache needs the per-tensor kv_scale (layer._k_scale)"
-        assert kv_scale.dtype == torch.float32
+    if fmt == "bf16":
+        return kv, kv, None, 1
+    if fmt == "fp8_scalar":
         u8 = kv.view(torch.uint8)
-        # gfx950 reads OCP e4m3 natively; fnuz is the gfx942 encoding.
-        assert (
-            kv.dtype != torch.float8_e4m3fnuz
-        ), "gfx950 reads OCP e4m3; float8_e4m3fnuz is the gfx942 encoding"
-        return "fp8_scalar", u8, u8, kv_scale.reshape(1), 1
-    if (
-        kv.ndim == 3
-        and kv.element_size() == 1
-        and kv.shape[2]
-        == kv_lora_rank + 4 * (kv_lora_rank // 128) + 2 * qk_rope_head_dim
-    ):
-        # fp8_dsv32_mla: 512 fp8 | 4 f32 per-128 scales | 64 bf16 rope = 656 B.
-        # This is vLLM's fp8_ds_mla on V3.2 / Kimi-K3; the same vLLM name also
-        # covers V4's 584 B layout (fp8_dsv4_mla), hence the explicit generation.
-        u8 = kv if kv.dtype == torch.uint8 else kv.view(torch.uint8)
-        assert (
-            u8.stride(2) == 1 and u8.stride(1) == u8.shape[2]
-        ), "fp8_dsv32_mla rows must be contiguous 656-byte records"
-        return (
-            "fp8_dsv32_mla",
-            u8,
-            u8.view(torch.bfloat16),
-            u8.view(torch.float32),
-            u8.shape[1],
-        )
-    raise ValueError(f"unrecognized sparse-MLA kv cache: {tuple(kv.shape)} {kv.dtype}")
+        return u8, u8, kv_scale.reshape(1), 1
+    # fp8_dsv32_mla: 512 fp8 | 4 f32 per-128 scales | 64 bf16 rope = 656 B.
+    u8 = kv if kv.dtype == torch.uint8 else kv.view(torch.uint8)
+    if not (u8.stride(2) == 1 and u8.stride(1) == u8.shape[2]):
+        raise ValueError("fp8_dsv32_mla rows must be contiguous records")
+    return u8, u8.view(torch.bfloat16), u8.view(torch.float32), u8.shape[1]
 
 
 def _mla_num_splits(num_queries: int, heads_blocks: int, avg_topk: float) -> int:
@@ -162,33 +135,142 @@ def _resolve_dot_precision(dot_precision: str, fmt: str) -> bool:
     return True
 
 
-def _is_packed_mla_record(q, kv, kv_lora_rank):
-    """True for the dsv3.2 / Kimi-K3 record: rank fp8 | f32 per-128 | bf16 rope.
+_DSV4_ROW = 448 + 2 * 64 + 8  # 584 B: fp8 nope | bf16 rope | 8 B UE8M0 trailer
 
-    The rope width is d_qk - kv_lora_rank (what the MLA geometry assert
-    enforces). dsv4's 584 B record does not satisfy the formula for any rope
-    width, so the two packed layouts are told apart by size alone. Any one-byte
-    dtype counts, matching _infer_cache_format.
+
+def _dsv32_row(kv_lora_rank, qk_rope_head_dim):
+    return kv_lora_rank + 4 * (kv_lora_rank // 128) + 2 * qk_rope_head_dim
+
+
+def _classify_flat(kv, width, slots, kv_scale, what):
+    """Flat pool rows are one QK row per slot; dtype and kv_scale pick the tag."""
+    if kv.dtype == torch.bfloat16:
+        return "bf16"  # kv_scale, if any, is ignored
+    if kv.dtype == torch.float8_e4m3fnuz:
+        raise ValueError(
+            f"{what}: float8_e4m3fnuz is the gfx942 encoding; gfx950 reads OCP e4m3"
+        )
+    if kv.element_size() != 1:
+        raise ValueError(f"{what}: unsupported cache dtype {kv.dtype}")
+    if kv_scale is None:
+        raise ValueError(
+            f"{what}: a flat fp8 cache needs kv_scale, [1] f32 (fp8_scalar) or "
+            f"[slots, D // 64] f32 (fp8_g64)"
+        )
+    if kv_scale.dtype != torch.float32:
+        raise ValueError(f"{what}: kv_scale must be f32, got {kv_scale.dtype}")
+    if kv_scale.numel() == 1:
+        return "fp8_scalar"
+    if width % 64 or tuple(kv_scale.shape) != (slots, width // 64):
+        raise ValueError(
+            f"{what}: kv_scale {tuple(kv_scale.shape)} is neither [1] (fp8_scalar) "
+            f"nor [slots, D // 64] = [{slots}, {width // 64}] (fp8_g64)"
+        )
+    return "fp8_g64"
+
+
+def _classify_cache(q, kv, kv_lora_rank, qk_rope_head_dim, kv_scale, what="kv_buffer"):
+    """kv -> one of the kernel's format tags, or raise.
+
+    Record width, dtype and the kv_scale shape are the only things that tell the
+    formats apart, so whatever they do not pin down is rejected here instead of
+    being decoded as the wrong layout. Host metadata only: safe under graph
+    capture.
     """
-    if kv.ndim != 3 or kv.element_size() != 1:
-        return False
-    rope = q.shape[-1] - kv_lora_rank
-    return (
-        rope > 0 and kv.shape[2] == kv_lora_rank + 4 * (kv_lora_rank // 128) + 2 * rope
-    )
+    d_qk = q.shape[-1]
+    if kv.device != q.device:
+        raise ValueError(f"{what} is on {kv.device}, q is on {q.device}")
+    if kv.ndim == 4:
+        if kv.shape[1] != 1 or kv.shape[2] != 1:
+            raise ValueError(
+                f"{what}: a 4-D cache must be [slots, 1, 1, R], got {tuple(kv.shape)}"
+            )
+    if kv.ndim in (2, 4):
+        width = kv.shape[-1]
+        if width != d_qk:
+            raise ValueError(
+                f"{what}: flat cache rows are {width} wide but q is {d_qk}; a flat "
+                f"pool stores one QK row (kv_lora_rank + qk_rope_head_dim) per slot"
+            )
+        return _classify_flat(kv, width, kv.shape[0], kv_scale, what)
+    if kv.ndim == 3:
+        nb, block, width = kv.shape
+        if width == d_qk:
+            # [nb, block, R]: a flat pool stored in blocks. Same rules, except the
+            # per-64 scale vector is only defined for the 2-D pool.
+            fmt = _classify_flat(kv, width, nb * block, kv_scale, what)
+            if fmt == "fp8_g64":
+                raise ValueError(f"{what}: fp8_g64 needs a 2-D [slots, D] pool")
+            return fmt
+        if kv_scale is not None:
+            raise ValueError(
+                f"{what}: packed caches carry their own scales; kv_scale must be None"
+            )
+        one_byte = kv.element_size() == 1
+        if one_byte and width == _DSV4_ROW:
+            return "fp8_dsv4_mla"
+        dsv32 = _dsv32_row(kv_lora_rank, qk_rope_head_dim)
+        if one_byte and qk_rope_head_dim > 0 and width == dsv32:
+            return "fp8_dsv32_mla"
+        raise ValueError(
+            f"{what}: unrecognized 3-D cache, {width}-wide {kv.dtype} records for q "
+            f"width {d_qk}. Expected {d_qk} (bf16 or fp8_scalar block pool), "
+            f"{_DSV4_ROW} uint8 (fp8_dsv4_mla) or {dsv32} uint8 (fp8_dsv32_mla with "
+            f"kv_lora_rank={kv_lora_rank}, qk_rope_head_dim={qk_rope_head_dim})"
+        )
+    raise ValueError(f"{what} must be 2-D, 3-D or 4-D, got {kv.ndim}-D")
 
 
-def _is_paged_cache(q, kv, kv_lora_rank, kv_scale=None):
-    """True for a cache only the paged driver reads: dsv4's 584 B record, a bf16
-    block pool, or the uniform fp8 pool (fp8_g64: a 2-D pool with a per-64
-    [pages, D // 64] scale vector). [nb, block, d_qk] is the flat MLA
-    pool and a 2-D pool with a scalar kv_scale is fp8_scalar; neither is
-    this."""
-    if kv.ndim == 2:
-        return kv_scale is not None and kv_scale.numel() != 1
-    if kv.ndim != 3 or kv.shape[2] == q.shape[-1]:
-        return False
-    return not _is_packed_mla_record(q, kv, kv_lora_rank)
+def _check_geometry(fmt, d_qk, kv_lora_rank, qk_rope_head_dim):
+    if kv_lora_rank <= 0 or qk_rope_head_dim < 0:
+        raise ValueError(
+            f"kv_lora_rank must be > 0 and qk_rope_head_dim >= 0, got "
+            f"{kv_lora_rank} / {qk_rope_head_dim}"
+        )
+    if fmt == "fp8_dsv4_mla":
+        if d_qk != 512:
+            raise ValueError(
+                f"fp8_dsv4_mla needs q width 512 (448 nope + 64 rope), got {d_qk}"
+            )
+        return
+    if fmt == "fp8_g64":
+        return  # the whole row is the head; geometry args are not read
+    if d_qk != kv_lora_rank + qk_rope_head_dim:
+        hint = (
+            " A bf16 or fp8_scalar cache carries no rope information: pass "
+            "qk_rope_head_dim=0 for rope-inside-the-row or rope-free models."
+            if fmt in ("bf16", "fp8_scalar")
+            else ""
+        )
+        raise ValueError(
+            f"q width {d_qk} != kv_lora_rank {kv_lora_rank} + qk_rope_head_dim "
+            f"{qk_rope_head_dim}.{hint}"
+        )
+    if fmt == "fp8_dsv32_mla" and kv_lora_rank % 128:
+        raise ValueError(
+            f"fp8_dsv32_mla stores one scale per 128 latent columns; kv_lora_rank "
+            f"{kv_lora_rank} is not a multiple of 128"
+        )
+
+
+def _check_index_stream(indptr, indices, num_queries, device, what=""):
+    """Both are flat integer tensors, so only the length of indptr can catch a
+    swapped pair. No device reads."""
+    for name, t in ((f"{what}kv_indptr", indptr), (f"{what}kv_indices", indices)):
+        if not torch.is_tensor(t):
+            raise ValueError(f"{name} must be a tensor, got {type(t).__name__}")
+        if t.dtype not in (torch.int32, torch.int64):
+            raise ValueError(f"{name} must be int32 (int64 accepted), got {t.dtype}")
+        if t.ndim != 1:
+            raise ValueError(f"{name} must be 1-D, got {tuple(t.shape)}")
+        if t.device != device:
+            raise ValueError(f"{name} is on {t.device}, q is on {device}")
+    if indptr.numel() != num_queries + 1:
+        raise ValueError(
+            f"{what}kv_indptr must have C + 1 = {num_queries + 1} entries, got "
+            f"{indptr.numel()}. kv_indptr and kv_indices are both flat int32; "
+            "check their order."
+        )
 
 
 def _forward_paged(
@@ -217,7 +299,6 @@ def _forward_paged(
         name
         for name, asked in (
             ("dot_precision='fp8'", dot_precision != "bf16"),
-            ("q_scale", q_scale is not None),
             ("return_lse", return_lse),
         )
         if asked
@@ -318,9 +399,7 @@ def sparse_mla_fwd(
         skip_reduce: with split-K active, return (part_acc, part_m, part_l)
             instead of launching the combine.
         has_invalid: index stream carries -1 sentinels (masked out). Default
-            False: on the fp8-dots path True disables the direct-to-LDS pipeline
-            (see the ASYNC_LDS static assert), so only set it when the stream
-            really carries -1.
+            False.
         attn_sink: optional [H] f32 per-head sink: exp(sink) joins the softmax
             denominator (and the LSE) as a virtual key. None means no sink,
             which is not the same as a zero sink.
@@ -332,14 +411,15 @@ def sparse_mla_fwd(
                 into LDS and both dots are bf16. Works with every cache format.
             "fp8": the cache's own code points go to the fp8 matrix core with no
                 dequant, and the per-tensor scale folds outside the tile loop.
+                tensor scale fp8 kv cache only.
 
             q is adapted to the choice. bf16 q is quantized in the kernel
             prologue, one scale per (query, head-block) tile; fp8 q is passed
-            straight through, and fp8 q under "bf16" dots is widened in-kernel,
-            which is exact.
+            straight through, and fp8 q under "bf16" dots is widened in-kernel.
+
         q_scale: scalar f32, required when q arrives already fp8 (the scale it
-            was quantized with; the aiter asm convention). It describes q's
-            encoding, so bf16 q must not carry one.
+            was quantized with; the aiter asm convention). Ignored for bf16 q,
+            which the kernel quantizes itself when dot_precision="fp8".
         out: optional [C, H, >= kv_lora_rank] bf16 destination.
         return_lse: also return the natural-log log-sum-exp, [C, H] f32, for
             merging partials across context-parallel ranks. A fully masked row
@@ -349,11 +429,41 @@ def sparse_mla_fwd(
         (out, lse), out is
         [C, H, kv_lora_rank] bf16 (the latent V), lse is None unless return_lse.
     """
-    assert q.ndim == 3, f"expected q=[b,h,d], got {q.shape}"
-    paged_args = (extra_kv, extra_indptr, extra_indices)
-    if any(a is not None for a in paged_args) or _is_paged_cache(
-        q, kv_buffer, kv_lora_rank, kv_scale
-    ):
+    if q.ndim != 3:
+        raise ValueError(f"expected q=[C, H, d_qk], got {tuple(q.shape)}")
+    num_queries, num_heads, d_qk = q.shape
+    fmt = _classify_cache(q, kv_buffer, kv_lora_rank, qk_rope_head_dim, kv_scale)
+    _check_geometry(fmt, d_qk, kv_lora_rank, qk_rope_head_dim)
+    _check_index_stream(kv_indptr, kv_indices, num_queries, q.device)
+    if attn_sink is not None and attn_sink.numel() != num_heads:
+        raise ValueError(
+            f"attn_sink must have one entry per head ({num_heads}), got "
+            f"{tuple(attn_sink.shape)}"
+        )
+    extra = (extra_kv, extra_indptr, extra_indices)
+    has_extra = all(a is not None for a in extra)
+    if any(a is not None for a in extra) and not has_extra:
+        raise ValueError("extra_kv, extra_indptr and extra_indices go together")
+    if has_extra:
+        # The SWA-window + top-k two-loop: both segments are block caches the
+        # dsv4 decoder reads. A flat main pool would silently drop the extra one.
+        if kv_buffer.ndim != 3 or fmt not in ("fp8_dsv4_mla", "bf16"):
+            raise ValueError(
+                "the two-loop needs a 3-D block cache (fp8_dsv4_mla or bf16) as "
+                f"kv_buffer, got {fmt}"
+            )
+        extra_fmt = _classify_cache(
+            q, extra_kv, kv_lora_rank, qk_rope_head_dim, None, what="extra_kv"
+        )
+        if extra_kv.ndim != 3 or extra_fmt not in ("fp8_dsv4_mla", "bf16"):
+            raise ValueError(
+                f"extra_kv must be a 3-D fp8_dsv4_mla or bf16 block cache, got "
+                f"{extra_fmt}"
+            )
+        _check_index_stream(
+            extra_indptr, extra_indices, num_queries, q.device, what="extra_"
+        )
+    if fmt in ("fp8_dsv4_mla", "fp8_g64") or has_extra:
         return _forward_paged(
             q,
             kv_buffer,
@@ -373,7 +483,7 @@ def sparse_mla_fwd(
             extra_indptr,
             extra_indices,
         )
-    assert arch_info.get_arch() == "gfx950", "Howgfx950-only"
+    assert arch_info.get_arch() == "gfx950", "sparse_mla_fwd is gfx950-only"
     q_is_fp8 = q.dtype == torch.float8_e4m3fn
     if q.dtype not in (torch.bfloat16, torch.float8_e4m3fn):
         raise ValueError(
@@ -389,36 +499,22 @@ def sparse_mla_fwd(
         if q_scale is None:
             raise ValueError("fp8 q needs q_scale (the scale it was quantized with)")
         q_scale = q_scale.reshape(1).to(torch.float32).contiguous()
-    num_queries, num_heads, d_qk = q.shape
-    assert (
-        d_qk == kv_lora_rank + qk_rope_head_dim
-    ), f"q last dim {d_qk} != {kv_lora_rank} + {qk_rope_head_dim}"
-    assert qk_rope_head_dim >= 0, "qk_rope_head_dim cannot be negative"
     _LOGGER.info(
         f"SPARSE_MLA C={num_queries} H={num_heads} d_qk={d_qk} "
         f"nnz={kv_indices.shape[0]}"
     )
 
-    fmt, cache, alt, scl, block_size = _infer_cache_format(
-        kv_buffer, d_qk, kv_lora_rank, qk_rope_head_dim, kv_scale
-    )
+    cache, alt, scl, block_size = _cache_pointers(fmt, kv_buffer, d_qk, kv_scale)
     fp8_dots = _resolve_dot_precision(dot_precision, fmt)
-    if q_scale is not None and not q_is_fp8:
-        raise ValueError(
-            "q_scale describes an fp8 q. With bf16 q the kernel quantizes per "
-            "(query, head-block) tile, so drop q_scale, or pass q already "
-            "quantized."
-        )
+    if not q_is_fp8:
+        # q_scale describes an fp8 q's encoding. With bf16 q the kernel quantizes
+        # per (query, head-block) tile when the dots are fp8, so a caller-supplied
+        # scale has nothing to apply to; callers pass layer._q_scale regardless.
+        q_scale = None
     kv_indices = _as_int32_contiguous_1d(kv_indices)
     kv_indptr = _as_int32_contiguous_1d(kv_indptr)
-    assert kv_indptr.numel() == num_queries + 1
     has_sink = attn_sink is not None
     if has_sink:
-        if attn_sink.numel() != num_heads:
-            raise ValueError(
-                f"attn_sink must have one entry per head ({num_heads}), got "
-                f"{tuple(attn_sink.shape)}"
-            )
         attn_sink = attn_sink.reshape(-1).to(torch.float32).contiguous()
     else:
         # The kernel still wants a live pointer for the compile-time-elided slot.
