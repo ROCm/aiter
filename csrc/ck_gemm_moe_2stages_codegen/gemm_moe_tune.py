@@ -5946,7 +5946,10 @@ class FmoeTuner(TunerCommon):
             dtype=None,
             config_string="",
             swiglu_limit=None,
+            beta=None,
+            linear_beta=None,
         ):
+            del beta, linear_beta
             if doweight_stage1:
                 raise NotImplementedError(
                     "gfx942 FlyDSL whole-graph tuning does not support "
@@ -5976,8 +5979,8 @@ class FmoeTuner(TunerCommon):
         for config_string in get_tune_space():
             config = Config.from_string(config_string)
             eligible_indices = [
-                i
-                for i, row in self.untunedf.iterrows()
+                position
+                for position, (_, row) in enumerate(self.untunedf.iterrows())
                 if not bool(row["doweight_stage1"])
                 and (
                     not config.use_prefill

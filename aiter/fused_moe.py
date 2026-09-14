@@ -2708,7 +2708,6 @@ def get_2stage_cfgs(
     opus_weights_shuffled=None,
     config_file=None,
     _disable_inline_sort=False,
-    has_bias=False,
     input_dtype=None,
     has_stage2_scatter=False,
 ):
@@ -3048,7 +3047,7 @@ def get_2stage_cfgs(
         unsupported = None
         if not weights_shuffled:
             unsupported = "both w1 and w2 must be marked is_shuffled=True"
-        elif has_bias or has_stage2_bias:
+        elif has_stage1_bias or has_stage2_bias:
             unsupported = "per-expert bias"
         elif doweight_stage1:
             unsupported = "doweight_stage1=True"
