@@ -37,7 +37,6 @@ class _LatentFHMoEWorkspace:
     sorted_weights: torch.Tensor
     sorted_expert_ids: torch.Tensor
     num_valid_ids: torch.Tensor
-    sort_zero: torch.Tensor
     routed_a: torch.Tensor
     routed_a_scale: torch.Tensor
     inter_storage: torch.Tensor
@@ -95,9 +94,6 @@ def _get_workspace(
                 max_blocks, dtype=torch.int32, device=device
             ),
             num_valid_ids=torch.empty(2, dtype=torch.int32, device=device),
-            sort_zero=torch.empty(
-                (m, 3584), dtype=torch.bfloat16, device=device
-            ),
             routed_a=torch.empty((m, 3584), dtype=dtypes.fp8, device=device),
             routed_a_scale=torch.empty(
                 (max_sorted, 112), dtype=dtypes.fp8_e8m0, device=device
@@ -191,6 +187,7 @@ def run_latent_fhmoe(
     sorted_weights = workspace.sorted_weights
     sorted_expert_ids = workspace.sorted_expert_ids
     num_valid_ids = workspace.num_valid_ids
+    routed_output = workspace.routed_output
     flydsl_moe_sorting_fwd(
         all_ids,
         all_weights,
@@ -198,7 +195,7 @@ def run_latent_fhmoe(
         sorted_weights,
         sorted_expert_ids,
         num_valid_ids,
-        workspace.sort_zero,
+        routed_output,
         num_experts,
         block_m,
         None,
@@ -259,9 +256,7 @@ def run_latent_fhmoe(
         torch.cuda.synchronize()
         print("latent stage1 complete", flush=True)
 
-    routed_output = workspace.routed_output
     shared_output = workspace.shared_output
-    routed_output.zero_()
     shared_output.zero_()
     stage2 = compile_mixed_latent_fhmoe_gemm2(experts=routed_experts, topk=routed_topk)
     _run_compiled(

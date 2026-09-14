@@ -212,25 +212,14 @@ def maybe_run_vllm_k3_latent_fhmoe(
 
     routed_w1, routed_w2, routed_s1, routed_s2 = weights
     shared_w1, shared_w2 = shared_weights
-    route_weight = getattr(runner, "_k3_latent_topk_weight", None)
-    route_ids = getattr(runner, "_k3_latent_topk_ids", None)
-    if route_weight is None:
-        if capturing:
-            raise RuntimeError("K3 latent routing buffers were not prewarmed")
-        route_weight = torch.empty_like(topk_weight, dtype=torch.float32)
-        route_ids = torch.empty_like(topk_ids, dtype=torch.int32)
-        runner._k3_latent_topk_weight = route_weight
-        runner._k3_latent_topk_ids = route_ids
-    route_weight.copy_(topk_weight)
-    route_ids.copy_(topk_ids)
     routed_output, shared_output = latent_fhmoe(
         routed_input,
         routed_w1,
         routed_w2,
         routed_s1,
         routed_s2,
-        route_weight,
-        route_ids,
+        topk_weight,
+        topk_ids,
         shared_input,
         shared_w1,
         shared_w2,
