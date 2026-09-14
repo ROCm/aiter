@@ -16,6 +16,9 @@ from aiter.ops.flydsl.linear_attention_prefill_kernels import (
 from aiter.ops.prefill_batch_metadata import (
     build_gated_delta_rule_prefill_metadata,
 )
+from aiter.ops.triton._triton_kernels.gated_delta_rule.prefill import (
+    gdn_segment_scan as segment_scan_mod,
+)
 from aiter.ops.triton._triton_kernels.gated_delta_rule.prefill.gdn_segment_scan import (
     gdn_segment_scan_fwd,
 )
@@ -35,8 +38,8 @@ def _prepare(lengths: tuple[int, ...]):
     g_raw = torch.full((1, tokens, H), -0.05, device="cuda")
     beta = torch.full((1, tokens, H), 0.7, device="cuda")
     w, u, g = gdn_prepare_fwd_flydsl(k=k, v=v, g=g_raw, beta=beta, use_exp2=True)
-    cu = torch.tensor((0, *tuple(sum(lengths[: i + 1]) for i in range(len(lengths)))),
-                      dtype=torch.int32, device="cuda")
+    offsets = (0, *tuple(sum(lengths[: i + 1]) for i in range(len(lengths))))
+    cu = torch.tensor(offsets, dtype=torch.int32, device="cuda")
     metadata = build_gated_delta_rule_prefill_metadata(
         lengths, cu_seqlens=cu, chunk_size=64
     )
@@ -51,7 +54,7 @@ def _stock(k, w, u, g, cu, metadata, pool, indices):
         w=w,
         u=u,
         g=g,
-        initial_state=pool,
+        initial_state=pool.clone(),
         output_final_state=True,
         use_exp2=True,
         g_head_major=True,
@@ -63,12 +66,13 @@ def _stock(k, w, u, g, cu, metadata, pool, indices):
 
 def test_gdn_segment_scan_matches_flydsl():
     k, w, u, g, _cu, _metadata, pool, _indices = _prepare((1024,))
+    h0 = pool[:1].clone()
     expected = chunk_gated_delta_rule_fwd_h_flydsl_opt(
         k=k,
         w=w,
         u=u,
         g=g,
-        initial_state=pool[:1],
+        initial_state=h0,
         output_final_state=True,
         use_exp2=True,
         g_head_major=True,
@@ -78,9 +82,11 @@ def test_gdn_segment_scan_matches_flydsl():
         w=w,
         u=u,
         g=g,
-        initial_state=pool[:1],
+        initial_state=h0,
         output_final_state=True,
         seq_lens=(1024,),
+        snapshot_dtype=torch.bfloat16,
+        state_dtype=torch.bfloat16,
         chunks_per_segment=4,
     )
     torch.testing.assert_close(actual[0], expected[0], atol=0.032, rtol=0.05)
@@ -96,7 +102,7 @@ def test_gdn_segment_scan_packed_n2_matches_flydsl():
         w=w,
         u=u,
         g=g,
-        initial_state=pool,
+        initial_state=pool.clone(),
         output_final_state=True,
         seq_lens=(768, 512),
         state_indices=indices,
@@ -110,21 +116,35 @@ def test_gdn_segment_scan_packed_n2_matches_flydsl():
 
 
 def test_wrapper_dispatches_n1_and_skips_n4(monkeypatch):
+    calls: list[tuple[int, ...]] = []
+    original = segment_scan_mod.gdn_segment_scan_fwd
+
+    def _counting_fwd(**kwargs):
+        calls.append(tuple(kwargs["seq_lens"]))
+        return original(**kwargs)
+
+    monkeypatch.setattr(segment_scan_mod, "gdn_segment_scan_fwd", _counting_fwd)
+    monkeypatch.setenv("AITER_GDN_K5_SEGMENT_SCAN", "0")
+    k, w, u, g, cu, metadata, pool, indices = _prepare((1024,))
+    first = _stock(k, w, u, g, cu, metadata, pool, indices)
+    second = _stock(k, w, u, g, cu, metadata, pool, indices)
+    assert calls == []
+    torch.testing.assert_close(first[0], second[0], atol=0.0, rtol=0.0)
+    torch.testing.assert_close(first[1], second[1], atol=0.0, rtol=0.0)
+
     monkeypatch.setenv("AITER_GDN_K5_SEGMENT_SCAN", "1")
     monkeypatch.setenv("AITER_GDN_K5_SEGMENT_MIN_TOTAL_CHUNKS", "8")
     monkeypatch.setenv("AITER_GDN_K5_SEGMENT_CHUNKS", "4")
-
-    k, w, u, g, cu, metadata, pool, indices = _prepare((1024,))
     dispatched = _stock(k, w, u, g, cu, metadata, pool, indices)
-    monkeypatch.setenv("AITER_GDN_K5_SEGMENT_SCAN", "0")
-    baseline = _stock(k, w, u, g, cu, metadata, pool, indices)
-    torch.testing.assert_close(dispatched[0], baseline[0], atol=0.04, rtol=0.05)
-    torch.testing.assert_close(dispatched[1], baseline[1], atol=0.04, rtol=0.05)
+    assert calls == [(1024,)]
+    torch.testing.assert_close(dispatched[0], first[0], atol=0.04, rtol=0.05)
+    torch.testing.assert_close(dispatched[1], first[1], atol=0.04, rtol=0.05)
 
-    monkeypatch.setenv("AITER_GDN_K5_SEGMENT_SCAN", "1")
+    calls.clear()
     packed = _prepare((256, 256, 256, 256))
     skipped = _stock(*packed)
     monkeypatch.setenv("AITER_GDN_K5_SEGMENT_SCAN", "0")
     stock = _stock(*packed)
+    assert calls == []
     torch.testing.assert_close(skipped[0], stock[0], atol=0.0, rtol=0.0)
     torch.testing.assert_close(skipped[1], stock[1], atol=0.0, rtol=0.0)
