@@ -412,7 +412,18 @@ def _heuristic_bpreshuffle_kid(
             # half empty -- and overflows into a second, mostly idle round as
             # soon as kid35 is more than three quarters full. Measured: at
             # wg35=128 kid47 wins 0.6%-7.7%; at wg35=192 it LOSES 35%.
-            return 47 if wg35 * 4 < cus * 3 else 35
+            #
+            # kid56 is kid35 writing C through LDS and one TDM store instead of
+            # a guarded global_store per fragment, which drops s_wait_xcnt from
+            # 25.5% of the kernel to 1.8%. Its gain tracks the workgroup count,
+            # because that is what amortises the staging: measured over 16 cells
+            # at m 512..16384, every one at wg35 >= cus won (-0.8% to -18.9%,
+            # best at m=16384 where the write-out is largest) and every
+            # regression (+0.5% to +2.6%) sat at wg35 <= 128. One CU each is
+            # the cut.
+            if wg35 * 4 >= cus * 3:
+                return 56 if wg35 >= cus else 35
+            return 47
         # Below half a machine the incumbent is kid31, which already exists to
         # buy parallelism from a narrow tile. kid47 beats it once there are
         # enough M tiles for the halved B traffic to outweigh kid31's finer
