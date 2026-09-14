@@ -39,7 +39,7 @@ _OUT_DTYPE_STR = {torch.bfloat16: "bf16", torch.float16: "fp16"}
 def _gemm_exe(_cfg):
     import flydsl.compiler as flyc
 
-    from .kernels.mxscale_preshuffle import launch_gemm
+    from .kernels.gemm.mxscale_preshuffle import launch_gemm
 
     return flyc.jit(launch_gemm.func)
 
@@ -48,7 +48,7 @@ def _gemm_exe(_cfg):
 def _reduce_exe(_cfg):
     import flydsl.compiler as flyc
 
-    from .kernels.mxscale_preshuffle import launch_splitk_reduce
+    from .kernels.gemm.mxscale_preshuffle import launch_splitk_reduce
 
     return flyc.jit(launch_splitk_reduce.func)
 
@@ -75,9 +75,9 @@ def flydsl_mxscale_preshuffle_gemm(
 
     A is [M, K]; N is taken from Out ([M, N]); K from A. Returns Out.
 
-    split_k>1 splits the K reduction across grid.z: each split writes an fp32
-    partial slab to a scratch tmp[split_k, M, N], then a reduce kernel sums the
-    slabs into Out (bf16/fp16). Helps small-M / large-K (low-occupancy) shapes.
+    split_k>1 splits the K reduction across grid.z. The tuned M=1 blockscale
+    specialization accumulates directly into BF16 with packed gfx950 atomics;
+    other shapes write fp32 partial slabs and reduce them into Out.
 
     blockscale selects the scale format and **defaults to True** -- the coarse
     blockscale path is the one this op is tuned for. It is a8w8-only and needs
@@ -139,6 +139,15 @@ def flydsl_mxscale_preshuffle_gemm(
     # a_scale/b_scale are already compact-shuffled by the caller
     # (shuffle_scale_blockscale_a/_b). No per-call repack here.
     bs_mode = "ab" if blockscale else "none"
+    # gfx950 has native BF16 atomics. For the latency-sensitive M=1 path, direct
+    # accumulation avoids the separate fp32 scratch reduction launch.
+    splitk_atomic = (
+        blockscale
+        and split_k > 1
+        and M == 1
+        and int(tile_m) == 16
+        and out_dtype == "bf16"
+    )
 
     st = stream if stream is not None else torch.cuda.current_stream()
 
@@ -175,10 +184,32 @@ def flydsl_mxscale_preshuffle_gemm(
         int(xcd_swizzle),
         split_k,  # k_batch
         bs_mode,  # blockscale
+        splitk_atomic,
     )
     gemm_exe = _gemm_exe(cfg)
 
     if split_k == 1:
+        _run_compiled(
+            gemm_exe,
+            ptr_arg(Out),
+            ptr_arg(A),
+            ptr_arg(B),
+            ptr_arg(a_scale),
+            ptr_arg(b_scale),
+            M,
+            N,
+            st,
+            *cfg,
+        )
+        return Out
+
+    if splitk_atomic:
+        if isinstance(st, torch.cuda.Stream):
+            with torch.cuda.stream(st):
+                Out.zero_()
+        else:
+            # Compile-only/AOT uses an fx.Stream placeholder and FakeTensor.
+            Out.zero_()
         _run_compiled(
             gemm_exe,
             ptr_arg(Out),

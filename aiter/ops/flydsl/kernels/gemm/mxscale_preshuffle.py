@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# Copyright (c) 2025 FlyDSL Project Contributors
+# Copyright (c) 2025-2026 FlyDSL Project Contributors
 
 """MXFP4/MXFP6/MXFP8 A x MXFP4/MXFP8 B preshuffle GEMM (gfx950): per-32 E8M0 scales folded
 into a scaled 16x16x128 fx.gemm; A streams global->LDS via double-buffered async DMA. Layout
@@ -27,6 +27,10 @@ from flydsl.expr.typing import Vector as Vec
 from aiter.ops.flydsl.gemm_tune.flydsl_gemm_mxscale_preshuffle_common import (
     _DTYPE_SHORT,
     make_kernel_name,
+)
+from aiter.ops.flydsl.kernels.gemm.preshuffle_layout import (
+    make_preshuffle_dma_layouts,
+    preshuffle_dma_lane_coord,
 )
 
 _A_ELEM = {"fp4": Float4E2M1FN, "fp6": Float6E2M3FN, "fp8": Float8E4M3FN}
@@ -96,6 +100,7 @@ def launch_gemm(
     xcd_swizzle: Constexpr[int],
     k_batch: Constexpr[int] = 1,
     blockscale: Constexpr[str] = "none",
+    splitk_atomic: Constexpr[bool] = False,
 ):
     """Direct @flyc.jit launcher. Operands are fx.Pointer (pass ptr_arg(t): raw data_ptr, no
     per-launch DLPack). Compile once with flyc.compile, then cf(*runtime). a_dtype fp4/fp6/fp8
@@ -135,8 +140,8 @@ def launch_gemm(
     KH4 = b_row_bytes // 4  # i32 per N-row in preshuffled B (== (K//2)//4 for fp4)
     K_TILES = K // BK
     # split-K (k_batch>1): each grid.z split reduces k_tiles_local = K_TILES//k_batch
-    # K-tiles and writes an fp32 partial slab to arg_c (viewed as [batch*k_batch, M, N]);
-    # a follow-up reduce kernel sums the k_batch slabs -> bf16 out. K/k_batch is 256-K
+    # K-tiles. The M=1 BF16 specialization atomically accumulates into arg_c; other
+    # variants write fp32 partial slabs followed by a reduce kernel. K/k_batch is 256-K
     # aligned (see fits_shape), so a split boundary lands on whole tiles + scale chunks.
     assert K_TILES % k_batch == 0, "K_TILES must be divisible by k_batch"
     k_tiles_local = K_TILES // k_batch
@@ -159,7 +164,12 @@ def launch_gemm(
     _scale_chunk_dw_a = ((K + 255) // 256) * _sc_k0_a
     _scale_chunk_dw_b = ((K + 255) // 256) * _sc_k0_b
     _b_sc_rows = (N // 128) if _bs_b else (N // 32)  # B scale super-rows
-    n_coop = A_LDS_B // num_threads // 16  # 16B cooperative loads per thread
+    a_copy_granularity = num_threads * 16
+    assert A_LDS_B % a_copy_granularity == 0, (
+        f"A_LDS_B ({A_LDS_B}B) must be divisible by num_threads*16 "
+        f"({a_copy_granularity}B)"
+    )
+    n_coop = A_LDS_B // a_copy_granularity  # 16B cooperative loads per thread
     n_pairs = max(1, num_acc_n // 2)
     m_pairs = max(1, m_chunks // 2)
 
@@ -192,6 +202,8 @@ def launch_gemm(
         k_batch,
         blockscale,
     )
+    if splitk_atomic:
+        _kname += "_atomic"
 
     @flyc.kernel(name=_kname)
     def kernel_gemm(
@@ -222,7 +234,7 @@ def launch_gemm(
         lane_mod_16 = lane % 16
         # XCD swizzle: remap (bid_x, bid_y) for L2-cache reuse (no-op when xcd_swizzle<=0).
         if const_expr(xcd_swizzle > 0):
-            from .mfma_preshuffle_pipeline import xcd_remap_bx_by
+            from ..mfma_preshuffle_pipeline import xcd_remap_bx_by
 
             _bx, _by = xcd_remap_bx_by(
                 fx.Index(bid_x),
@@ -288,7 +300,6 @@ def launch_gemm(
             max_size=False,
             num_records_bytes=a_nrec,
         )
-        a_flat_div = fx.logical_divide(a_flat, fx.make_layout(1, 1))
         lds = fx.SharedAllocator().allocate(SharedA).peek()
         # A-LDS modeled as i32 (16B = 4 i32): fx.copy is dtype-agnostic, only the MMA cares.
         sA0_i32 = fx.recast_iter(Int32, lds.a0.ptr)
@@ -304,60 +315,59 @@ def launch_gemm(
         def _iter_of(parity):  # parity in {0,1} (runtime) -> i32 LDS iterator
             return fx.add_offset(sA0_i32, parity * lds_db_i32)
 
-        def _lds_view(base_iter, off_i32):
-            return fx.make_view(fx.add_offset(base_iter, off_i32), fx.make_layout(4, 1))
+        dma_src_layout, dma_dst_layout = make_preshuffle_dma_layouts(
+            BM, A_ROW_B, a_rstride, num_threads, swizzle=swz_lds
+        )
+        dma_lane = preshuffle_dma_lane_coord(lane, A_ROW_B)
+        dma_a_base = fx.add_offset(fx.get_iter(a_flat), bx_m * a_rstride)
+
+        # (dword, row lane, K lane, M tile, K half, register half).
+        a_read_layout = fx.make_layout(
+            (4, 16, 4, m_chunks, k_halves, 1 if a_dtype == "fp4" else 2),
+            (1, A_ROW_I32, A_GK_I32, 16 * A_ROW_I32, A_KH_I32, A_HI_OFF),
+        )
+        if const_expr(swz_lds):
+            swz_bits = k_blk16.bit_length() - 1
+            a_read_layout = fx.make_composed_layout(
+                fx.static(fx.SwizzleType.get(swz_bits, 2, swz_bits)),
+                a_read_layout,
+            )
 
         # Async A: gmem->LDS DMA (buffer_load_lds); issued after B/scale loads to overlap the MFMAs.
         def dma_a_to_lds(kt, parity):
-            base_off = rocdl.readfirstlane(T.i32, parity * lds_db + wave * (64 * 16))
-            lds_ptr = fx.add_offset(sA0_i8, base_off)
-            base_k_byte = kt * A_ROW_B
+            src = fx.Tensor(
+                fx.make_view(fx.add_offset(dma_a_base, kt * A_ROW_B), dma_src_layout)
+            )
+            base_off = rocdl.readfirstlane(T.i32, parity * lds_db)
+            dst = fx.Tensor(
+                fx.make_view(fx.add_offset(sA0_i8, base_off), dma_dst_layout)
+            )
             for i in range_constexpr(n_coop):
-                if const_expr(i > 0):
-                    lds_ptr = fx.add_offset(lds_ptr, fx.Int32(num_threads * 16))
-                lin = (i * num_threads + tid) * 16
-                row = lin // A_ROW_B
-                col = lin % A_ROW_B
-                if const_expr(swz_lds):
-                    col = col ^ ((row % k_blk16) * 16)
-                gmem_byte = (bx_m + row) * a_rstride + base_k_byte + col
-                dst = fx.make_view(lds_ptr, fx.make_layout(1, 1))
-                src = fx.slice(a_flat_div, (None, gmem_byte))
-                fx.copy(dma_atom, src, dst)
+                fx.copy(
+                    dma_atom,
+                    src[None, dma_lane, wave, i],
+                    dst[None, wave, i],
+                )
 
-        def _read16(base_iter, off_i32):
+        def _read16(src):
             # ds_read_b128 straight into an i32[4] register fragment.
             t = fx.make_rmem_tensor(4, Int32)
-            fx.copy(lds_copy, _lds_view(base_iter, off_i32), t)
+            fx.copy(lds_copy, src, t)
             return t
 
         def read_a(parity):
-            base_iter = _iter_of(parity)
+            src = fx.Tensor(fx.make_view(_iter_of(parity), a_read_layout))
             av = []
             for mi in range_constexpr(m_chunks):
                 for kh in range_constexpr(k_halves):
-                    row = mi * 16 + lane_mod_16
-                    row_base = row * A_ROW_I32
-                    lo_blk = kh * (A_KH_I32 // 4) + lane_div_16 * (A_GK_I32 // 4)
-                    if const_expr(swz_lds):
-                        off = row_base + (lo_blk ^ (row % k_blk16)) * 4
-                    else:
-                        off = row_base + kh * A_KH_I32 + lane_div_16 * A_GK_I32
+                    lo = _read16(src[None, lane_mod_16, lane_div_16, mi, kh, 0])
                     if const_expr(a_dtype == "fp4"):
-                        av.append(_read16(base_iter, off))
+                        av.append(lo)
                     else:
                         # fp6/fp8: pack two halves (64 K apart, f8f6f4 ABI) into i32[A_NDW].
-                        if const_expr(swz_lds):
-                            hi_off = (
-                                row_base
-                                + ((lo_blk + A_HI_OFF // 4) ^ (row % k_blk16)) * 4
-                            )
-                        else:
-                            hi_off = off + A_HI_OFF
-                        lo = Vec(fx.memref_load_vec(_read16(base_iter, off)))
-                        hi = Vec(fx.memref_load_vec(_read16(base_iter, hi_off)))
+                        hi = _read16(src[None, lane_mod_16, lane_div_16, mi, kh, 1])
                         t = fx.make_rmem_tensor(A_NDW, Int32)
-                        t.store(lo.shuffle(hi, list(range(A_NDW))))
+                        t.store(lo.load().shuffle(hi.load(), list(range(A_NDW))))
                         av.append(t)
             return av
 
@@ -574,13 +584,16 @@ def launch_gemm(
             rocdl.s_waitcnt(0)  # drain the A DMA before the barrier
             gpu.barrier()
             results = yield accs
-        accs = results
+        # A single loop-carried accumulator is returned directly rather than as
+        # a one-element tuple by the SCF builder.
+        accs = [results] if n_acc == 1 else results
 
-        # Epilogue via fx.copy: a lane owns 4 rows per (mi,ni) accm (row m*16+(l//16)*4+ii, col
-        # base+l%16), c_stride apart.
+        # Epilogue via fx.copy: a lane owns 4 rows per (mi,ni) accm (row
+        # m*16+(l//16)*4+ii, col base+l%16), c_stride apart. The M=1 split-K
+        # specialization packs adjacent lanes for native BF16 atomic adds.
         c_stride = N if c_row_stride < 0 else c_row_stride
         # split-K writes an fp32 partial slab (no cast); no-split writes bf16/fp16 out.
-        if const_expr(k_batch > 1):
+        if const_expr(k_batch > 1 and not splitk_atomic):
             store_elem = Float32
             _ebytes = 4
             # arg_c is tmp[batch*k_batch, M, N] fp32; this WG's slab index == bid_z.
@@ -608,7 +621,9 @@ def launch_gemm(
         _rows_wg = (_rows_rem < fx.Index(BM)).select(_rows_rem, fx.Index(BM))
         c_nrec = fx.Int64(_rows_wg) * fx.Int64(c_stride) * fx.Int64(_ebytes)
         c_ptr_ty = fx.PointerType.get(
-            store_elem.ir_type, address_space=fx.AddressSpace.Global, alignment=_ebytes
+            store_elem.ir_type,
+            address_space=fx.AddressSpace.Global,
+            alignment=4 if splitk_atomic else _ebytes,
         )
         c_flat = fx.logical_divide(
             fx.rocdl.make_buffer_tensor(
@@ -622,7 +637,11 @@ def launch_gemm(
             ),
             fx.make_layout(1, 1),
         )
-        if const_expr(k_batch > 1):
+        if const_expr(splitk_atomic):
+            c_copy = fx.make_copy_atom(
+                fx.rocdl.BufferAtomicPkAdd(store_elem), store_elem
+            )
+        elif const_expr(k_batch > 1):
             c_copy = fx.make_copy_atom(fx.rocdl.BufferCopy32b(), store_elem)
         else:
             c_copy = fx.make_copy_atom(fx.rocdl.BufferCopy16b(), store_elem)
@@ -634,12 +653,33 @@ def launch_gemm(
             )  # relative to this WG (base folded into c_tile_addr)
             for ni in range_constexpr(num_acc_n):
                 col = col_w + ni * 16
-                acc = Vec(accs[mi * num_acc_n + ni]).to(store_elem)
+                acc_f32 = Vec(accs[mi * num_acc_n + ni])
+                if const_expr(not splitk_atomic):
+                    acc = acc_f32.to(store_elem)
                 for ii in range_constexpr(4):
-                    cf = fx.make_rmem_tensor(1, store_elem)
-                    cf.store(Vec.from_elements([acc[ii]], store_elem))
                     off = (row_local + ii) * c_rstride + col
-                    fx.copy(c_copy, cf, c_flat[None, off])
+                    if const_expr(splitk_atomic):
+                        # Adjacent lanes own adjacent N columns. Exchange the
+                        # neighbour's value, then let even lanes issue one native
+                        # packed BF16 atomic add for the pair.
+                        peer_bits = rocdl.ds_bpermute(
+                            T.i32,
+                            (lane ^ fx.Int32(1)) * fx.Int32(4),
+                            acc_f32[ii].bitcast(fx.Int32),
+                        )
+                        peer = fx.Int32(peer_bits).bitcast(Float32)
+                        if lane_mod_16 % fx.Int32(2) == fx.Int32(0):
+                            cf = fx.make_rmem_tensor(2, store_elem)
+                            cf.store(
+                                Vec.from_elements([acc_f32[ii], peer], Float32).to(
+                                    store_elem
+                                )
+                            )
+                            fx.copy(c_copy, cf, c_flat[None, off])
+                    else:
+                        cf = fx.make_rmem_tensor(1, store_elem)
+                        cf.store(Vec.from_elements([acc[ii]], store_elem))
+                        fx.copy(c_copy, cf, c_flat[None, off])
 
     c_addr = fx.Int64(fx.ptrtoint(arg_c))
     a_addr = fx.Int64(fx.ptrtoint(arg_a))
