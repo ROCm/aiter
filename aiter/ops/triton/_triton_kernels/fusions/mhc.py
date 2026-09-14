@@ -49,7 +49,13 @@ def _mhc_apply_pre_mix_tile(
     )
 
 
-@triton.jit
+_mhc_asymmetric_sinkhorn_kernel_repr = make_kernel_repr(
+    "_mhc_asymmetric_sinkhorn_kernel",
+    ["n", "N_POW2_RES", "NUM_SINKHORN_ITERS"],
+)
+
+
+@triton.jit(repr=_mhc_asymmetric_sinkhorn_kernel_repr)
 def _mhc_asymmetric_sinkhorn_kernel(
     logits_ptr,
     out_ptr,
@@ -92,7 +98,13 @@ def _mhc_asymmetric_sinkhorn_kernel(
     )
 
 
-@triton.jit
+_mhc_head_kernel_repr = make_kernel_repr(
+    "_mhc_head_kernel",
+    ["BLOCK_M", "BLOCK_K", "BLOCK_C", "N_TILE"],
+)
+
+
+@triton.jit(repr=_mhc_head_kernel_repr)
 def _mhc_head_kernel(
     x_ptr,
     fn_ptr,
@@ -167,9 +179,6 @@ def _mhc_head_kernel(
             stride_om,
             stride_oc,
         )
-
-
-@triton.jit
 
 
 _mhc_fused_kernel_repr = make_kernel_repr(
