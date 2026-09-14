@@ -297,26 +297,50 @@ def drain_or_chain(pairs, *, dot2_acc: int, serialize: bool = True):
 
 
 def drain_or_chain_gate_up(
-    gate_pairs, up_pairs, *, dot2_acc: int, serialize: bool = True
+    gate_pairs,
+    up_pairs,
+    *,
+    dot2_acc: int,
+    serialize: bool = True,
+    interleave: bool = True,
 ):
     """Interleave gate/up ``v_dot2`` so consecutive dots write different accs.
 
     Default ``dot2_acc=1`` emits ``g0, u0, g1, u1, ...``. Consecutive dots write
     different accumulators, so gate dots omit ``s_nop 2``; each up dot keeps the
     nop so the next gate reuse of the gate acc (and the following f32 add) stay
-    covered. Net nops drop by half vs two serialized drains. ``dot2_acc>1`` keeps
-    per-stream G7. Down stays on :func:`drain_or_chain`.
+    covered. Net nops drop by half vs two serialized drains. ``dot2_acc>1`` with
+    ``interleave`` round-robins independent accs per stream in the same g/u
+    pairing; ``interleave=False`` is two sequential :func:`drain_or_chain` calls
+    (the G7 gather-grid form). Down stays on :func:`drain_or_chain`.
     """
     if len(gate_pairs) != len(up_pairs):
         raise ValueError("gate/up pair lists must be the same length")
-    if const_expr(dot2_acc > 1):
+    if const_expr(not interleave):
         return (
             drain_or_chain(gate_pairs, dot2_acc=dot2_acc, serialize=serialize),
             drain_or_chain(up_pairs, dot2_acc=dot2_acc, serialize=serialize),
         )
+    n = len(gate_pairs)
+    if const_expr(dot2_acc > 1):
+        k = min(dot2_acc, n)
+        g_accs = [fx.Float32(0.0).ir_value() for _ in range(k)]
+        u_accs = [fx.Float32(0.0).ir_value() for _ in range(k)]
+        last_for = {idx % k: idx for idx in range(n)}
+        for idx in range(n):
+            ga, gb = gate_pairs[idx]
+            ua, ub = up_pairs[idx]
+            j = idx % k
+            g_accs[j] = dot2_f32_bf16(ga, gb, g_accs[j], serialize=False)
+            u_accs[j] = dot2_f32_bf16(ua, ub, u_accs[j], serialize=(last_for[j] == idx))
+        g_tot = fx.Float32(g_accs[0])
+        u_tot = fx.Float32(u_accs[0])
+        for j in range(1, k):
+            g_tot = g_tot + fx.Float32(g_accs[j])
+            u_tot = u_tot + fx.Float32(u_accs[j])
+        return g_tot.ir_value(), u_tot.ir_value()
     g_acc = fx.Float32(0.0).ir_value()
     u_acc = fx.Float32(0.0).ir_value()
-    n = len(gate_pairs)
     for idx in range_constexpr(n):
         ga, gb = gate_pairs[idx]
         ua, ub = up_pairs[idx]
@@ -749,6 +773,7 @@ def _build_gate_up_fp8_preshuffled_native(
     scale_bn: int | None,
     scale_bk: int | None,
     dot2_acc: int,
+    interleave_gate_up: bool = True,
 ):
     """N-major kpack-native FP8 gate/up: one wave computes 16 output rows."""
     if hidden % 64 != 0 or inter % 16 != 0:
@@ -817,7 +842,11 @@ def _build_gate_up_fp8_preshuffled_native(
                 gate_pairs.append((xw[ipair], g_i32))
                 up_pairs.append((xw[ipair], u_i32))
             gd, ud = drain_or_chain_gate_up(
-                gate_pairs, up_pairs, dot2_acc=dot2_acc, serialize=serialize_dot2
+                gate_pairs,
+                up_pairs,
+                dot2_acc=dot2_acc,
+                serialize=serialize_dot2,
+                interleave=interleave_gate_up,
             )
             if const_expr(block2d):
                 row_blk = w_row // scale_bn
@@ -876,6 +905,7 @@ def build_gate_up_fp8_module(
     num_experts: int | None = None,
     dot2_acc: int = 1,
     preshuffled: bool = False,
+    interleave_gate_up: bool = True,
 ):
     """Build the gate_up FP8 launcher (BF16 activation, FP8 e4m3 weights).
 
@@ -903,6 +933,7 @@ def build_gate_up_fp8_module(
             scale_bn=scale_bn,
             scale_bk=scale_bk,
             dot2_acc=dot2_acc,
+            interleave_gate_up=interleave_gate_up,
         )
     if kvector is None:
         kvector = pick_kvector(hidden)
@@ -1844,6 +1875,7 @@ def _build_gate_up_fp4_preshuffled_native(
     scale_bn: int,
     scale_bk: int,
     dot2_acc: int,
+    interleave_gate_up: bool = True,
 ):
     """N-major kpack-native MXFP4 gate/up; one wave computes 16 rows."""
     if hidden % 128 != 0 or inter % 16 != 0:
@@ -1908,7 +1940,11 @@ def _build_gate_up_fp4_preshuffled_native(
                 gate_pairs.append((xw[ipair], g_i32))
                 up_pairs.append((xw[ipair], u_i32))
             gd, ud = drain_or_chain_gate_up(
-                gate_pairs, up_pairs, dot2_acc=dot2_acc, serialize=serialize_dot2
+                gate_pairs,
+                up_pairs,
+                dot2_acc=dot2_acc,
+                serialize=serialize_dot2,
+                interleave=interleave_gate_up,
             )
             gate_l = gate_l + fx.Float32(gd)
             up_l = up_l + fx.Float32(ud)
@@ -1952,6 +1988,7 @@ def build_gate_up_fp4_module(
     scale_bk: int = 32,
     dot2_acc: int = 1,
     preshuffled: bool = False,
+    interleave_gate_up: bool = True,
 ):
     """Build the gate_up MXFP4 launcher (BF16 activation, FP4 e2m1 weights).
 
@@ -1996,6 +2033,7 @@ def build_gate_up_fp4_module(
             scale_bn=scale_bn,
             scale_bk=scale_bk,
             dot2_acc=dot2_acc,
+            interleave_gate_up=interleave_gate_up,
         )
     if kvector is None:
         # FP4 fast path: 1 i32 = 8 FP4 = one weight dword per lane per iter.

@@ -135,7 +135,7 @@ def _default_use_dot2() -> bool:
         return True
 
 
-@functools.lru_cache(maxsize=64)
+@functools.lru_cache(maxsize=128)
 def _get_gate_up(
     hidden,
     inter,
@@ -148,6 +148,7 @@ def _get_gate_up(
     num_experts,
     dot2_acc,
     preshuffled,
+    interleave_gate_up,
 ):
     return build_gate_up_fp8_module(
         hidden,
@@ -161,6 +162,7 @@ def _get_gate_up(
         num_experts=num_experts,
         dot2_acc=dot2_acc,
         preshuffled=preshuffled,
+        interleave_gate_up=interleave_gate_up,
     )
 
 
@@ -253,7 +255,7 @@ def _get_down_reduce_bf16(
     )
 
 
-@functools.lru_cache(maxsize=64)
+@functools.lru_cache(maxsize=128)
 def _get_gate_up_fp4(
     hidden,
     inter,
@@ -264,6 +266,7 @@ def _get_gate_up_fp4(
     scale_bk,
     dot2_acc,
     preshuffled,
+    interleave_gate_up,
 ):
     return build_gate_up_fp4_module(
         hidden,
@@ -275,6 +278,7 @@ def _get_gate_up_fp4(
         scale_bk=scale_bk,
         dot2_acc=dot2_acc,
         preshuffled=preshuffled,
+        interleave_gate_up=interleave_gate_up,
     )
 
 
@@ -370,6 +374,7 @@ def flydsl_warp_decode_gate_up(
     scale_block: tuple[int, int] | None = None,
     serialize_dot2: bool = True,
     dot2_acc: int = 1,
+    interleave_gate_up: bool = True,
     weight_layout: str | WeightLayout = WeightLayout.K_CONTIGUOUS,
     out: torch.Tensor | None = None,
 ) -> torch.Tensor:
@@ -394,8 +399,11 @@ def flydsl_warp_decode_gate_up(
         w_scale_mode: "pertensor", "pertoken" or "block2d".
         scale_block:  (BN, BK) block dims, required when ``w_scale_mode='block2d'``.
         dot2_acc:     G7 dot2 ILP -- number of independent f32 accumulators for the
-                      s_nop-free multi-accumulator dot2 (>1 enables the drain form;
+                      s_nop-free multi-accumulator drain form (>1 enables the drain form;
                       1 = serialized ``s_nop 2`` baseline). Correctness-invariant.
+        interleave_gate_up: Pair gate/up ``v_dot2`` in the native 16x4 kernel
+            (default True). ``False`` drains gate then up (G7 gather-grid form).
+            Ignored on k-contiguous gather. A/B knob; default stays True.
         weight_layout: ``k_contiguous`` (default) or ``preshuffled`` (fused-MoE B
             from ``shuffle_weight`` / ``shuffle_weight_a16w4``). Never inferred
             from strides.
@@ -446,6 +454,7 @@ def flydsl_warp_decode_gate_up(
         E,
         dot2_acc,
         _preshuffled_flag(weight_layout),
+        interleave_gate_up,
     )
     grid_x = B * TOPK * INTER
     _run_compiled(
@@ -571,6 +580,7 @@ def flydsl_warp_decode_gate_up_fp4(
     scale_block: tuple[int, int] = (1, 32),
     serialize_dot2: bool = True,
     dot2_acc: int = 1,
+    interleave_gate_up: bool = True,
     kvector: int | None = None,
     weight_layout: str | WeightLayout = WeightLayout.K_CONTIGUOUS,
     out: torch.Tensor | None = None,
@@ -591,10 +601,11 @@ def flydsl_warp_decode_gate_up_fp4(
             [(E*INTER)//BN, HIDDEN//BK] row-major over (weight-row-block, K-block),
             (BN, BK) = ``scale_block``.
         scale_block:  (BN, BK); MXFP4 default (1, 32).
-        dot2_acc:     G7 independent dot2 accumulators per stream. **Default 1
-            (serialized)**: G7 measured ~4% slower for gate_up on gfx950 (the two
-            gate/up streams already cover the hazard and the B=1 grid is
-            occupancy-bound); ``>1`` enables the s_nop-free ILP path (see builder).
+        dot2_acc:     G7 independent dot2 accumulators per stream. **Default 1**:
+            native-grid A/B (subtask 2) keeps 1 because Qwen B=1 gate_up FP8 does
+            not improve with ``acc>1``; ``>1`` stays wired for FP4 ILP experiments.
+        interleave_gate_up: Pair gate/up ``v_dot2`` in the native 16x4 kernel
+            (default True). ``False`` drains gate then up.
         kvector:      elements/lane/iter; ``None`` auto-picks the largest that tiles
             HIDDEN (32/16/8, see :func:`pick_kvector_fp4`). Override for A/B.
         weight_layout: ``k_contiguous`` (default) or ``preshuffled`` (fused-MoE B
@@ -644,6 +655,7 @@ def flydsl_warp_decode_gate_up_fp4(
         scale_bk,
         dot2_acc,
         _preshuffled_flag(weight_layout),
+        interleave_gate_up,
     )
     grid_x = B * TOPK * INTER
     _run_compiled(

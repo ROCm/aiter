@@ -59,7 +59,7 @@ gates: op_test with `FLYDSL_RUNTIME_ENABLE_CACHE=0` on GPU 6; plus a G9/667
 preshuffled gate/up spot-check when the hot loop, wait/reduce, or grid changed.
 
 - [x] 1. Interleave gate/up `v_dot2` (drop half the `s_nop`s)
-- [ ] 2. Re-A/B G7 `dot2_acc` on the **native** 16×4 grid
+- [x] 2. Re-A/B G7 `dot2_acc` on the **native** 16×4 grid
 - [ ] 3. Dedup `x` loads within `nlane` (broadcast per `klane`)
 - [ ] 4. Software-pipeline `k0` (prefetch next kpack)
 - [ ] 5. Split-K over `k0` for small-`INTER` occupancy (Qwen B=1 first)
@@ -160,18 +160,64 @@ CK win vs the of-record table still needs 1000 iters.
 
 ### 2. Re-A/B G7 `dot2_acc` on the native 16×4 grid
 
-Default `dot2_acc=1` for gate/up was locked from a gather-grid A/B (~4%
-slower ILP). Re-run on **preshuffled native** at Qwen B=1 and DeepSeek B=1
-(FP8 and FP4). Sweep `dot2_acc ∈ {1,2,4,8}` with and without subtask 1’s
-interleave (interleave may already cover the hazard).
+**Done (2026-09-14).** Native-grid sweep on GPU 6, `timing=device`, 100 iters,
+20 warmup, 3 repeats, cache-off, preshuffled. Cos 1.0 on every cell. Spread
+≤2.9% (most ≤1%). `vs` is relative to that shape/dtype’s **interleave +
+acc=1**.
 
-Keep the knob. Change the **default** only if Qwen B=1 gate_up FP8 improves
-outside noise and DeepSeek B=1 does not regress.
+| shape | dtype | interleave | acc | us | spr% | vs i1/acc1 |
+|---|---|---|---|---|---|---|
+| qwen3next | fp8 | True | 1 | 20.48 | 0.7 | 1.000 |
+| qwen3next | fp8 | True | 2 | 20.68 | 0.3 | 1.010 |
+| qwen3next | fp8 | True | 4 | 20.86 | 0.7 | 1.019 |
+| qwen3next | fp8 | True | 8 | 21.28 | 0.4 | 1.039 |
+| qwen3next | fp8 | False | 1 | 22.00 | 0.3 | 1.074 |
+| qwen3next | fp8 | False | 2 | 20.82 | 0.2 | 1.017 |
+| qwen3next | fp8 | False | 4 | 21.21 | 0.3 | 1.036 |
+| qwen3next | fp8 | False | 8 | 23.12 | 2.2 | 1.129 |
+| qwen3next | fp4 | True | 1 | 16.55 | 1.0 | 1.000 |
+| qwen3next | fp4 | True | 2 | 14.65 | 0.3 | **0.885** |
+| qwen3next | fp4 | True | 4 | 14.90 | 0.2 | 0.900 |
+| qwen3next | fp4 | True | 8 | 15.57 | 0.6 | 0.941 |
+| qwen3next | fp4 | False | 1 | 18.17 | 0.6 | 1.098 |
+| qwen3next | fp4 | False | 2 | 14.76 | 0.8 | 0.892 |
+| qwen3next | fp4 | False | 4 | 15.31 | 0.7 | 0.925 |
+| qwen3next | fp4 | False | 8 | 17.58 | 0.4 | 1.062 |
+| deepseek-v3 | fp8 | True | 1 | 76.19 | 2.9 | 1.000 |
+| deepseek-v3 | fp8 | True | 2 | 75.76 | 0.2 | 0.994 |
+| deepseek-v3 | fp8 | True | 4 | 73.74 | 0.3 | 0.968 |
+| deepseek-v3 | fp8 | True | 8 | 77.83 | 0.3 | 1.021 |
+| deepseek-v3 | fp8 | False | 1 | 77.47 | 0.5 | 1.017 |
+| deepseek-v3 | fp8 | False | 2 | 76.28 | 0.3 | 1.001 |
+| deepseek-v3 | fp8 | False | 4 | 77.19 | 0.6 | 1.013 |
+| deepseek-v3 | fp8 | False | 8 | 78.80 | 0.3 | 1.034 |
+| deepseek-v3 | fp4 | True | 1 | 48.90 | 0.8 | 1.000 |
+| deepseek-v3 | fp4 | True | 2 | 45.73 | 1.0 | **0.935** |
+| deepseek-v3 | fp4 | True | 4 | 45.90 | 0.8 | 0.939 |
+| deepseek-v3 | fp4 | True | 8 | 48.34 | 1.1 | 0.989 |
+| deepseek-v3 | fp4 | False | 1 | 53.07 | 0.9 | 1.085 |
+| deepseek-v3 | fp4 | False | 2 | 46.37 | 1.4 | 0.948 |
+| deepseek-v3 | fp4 | False | 4 | 46.88 | 0.7 | 0.959 |
+| deepseek-v3 | fp4 | False | 8 | 65.35 | 0.7 | 1.336 |
 
-- [ ] Native-grid A/B table (Qwen/DeepSeek B=1, FP8+FP4) recorded here.
-- [ ] Default update or an explicit “keep 1” with the new numbers.
-- [ ] **Done when:** decision is written in this file; op_test still passes
-      for `dot2_acc=1` and the chosen default.
+**Keep `dot2_acc=1`.** Qwen B=1 gate_up FP8 (the change gate) is best at
+interleave+acc=1; acc>1 is 1–4% slower. DeepSeek B=1 FP8 acc=4 is ~3%
+faster but that cell’s acc=1 spread was 2.9%, and changing the default
+would move Qwen the wrong way. Interleave already covers the RAW; extra
+G7 accs add VGPR without filling Qwen’s 1.25 waves/CU.
+
+Native **FP4 acc=2** is a real leftover: Qwen **−11.5%**, DeepSeek **−6.5%**,
+both outside spread. Do not fold that into the shared default (it would
+also hit k-contiguous gather). A later dtype-split (`fp4=2`, `fp8=1`) is
+allowed; this subtask does not.
+
+`interleave_gate_up` stays a compile-time knob (default True). `dot2_acc>1`
+with interleave now pairs G7 accs across gate/up instead of two sequential
+drains.
+
+- [x] Native-grid A/B table (Qwen/DeepSeek B=1, FP8+FP4) recorded here.
+- [x] Default: **keep 1** (Qwen B=1 FP8 does not improve).
+- [x] op_test cache-off GPU 6: **100 passed** (`dot2_acc=1` default).
 
 ### 3. Dedup `x` loads within `nlane`
 
