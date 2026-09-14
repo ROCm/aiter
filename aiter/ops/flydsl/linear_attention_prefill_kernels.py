@@ -765,6 +765,56 @@ def chunk_gated_delta_rule_fwd_h_flydsl_opt(
         )
     else:
         _total_chunks, _max_seq_chunks = B * NT, NT
+
+    # Experimental context-parallel K5.  Keep this opt-in until its three-pass
+    # crossover has been tuned across serving batches; short sequences stay on
+    # the single-pass FlyDSL kernel regardless of the switch.
+    use_segment_scan = os.getenv("AITER_GDN_K5_SEGMENT_SCAN", "0").lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
+    segment_min_chunks = int(os.getenv("AITER_GDN_K5_SEGMENT_MIN_CHUNKS", "256"))
+    if (
+        use_segment_scan
+        and _max_seq_chunks >= segment_min_chunks
+        and B == 1
+        and K == V == 128
+        and use_g
+        and not use_gk
+        and g_head_major
+        and g_log2_scaled
+        and save_new_value
+        and N == 1
+    ):
+        from ..triton._triton_kernels.gated_delta_rule.prefill.gdn_segment_scan import (
+            gdn_segment_scan_fwd,
+        )
+
+        if is_varlen:
+            if prefill_metadata is None:
+                raise ValueError(
+                    "AITER_GDN_K5_SEGMENT_SCAN requires prefill_metadata in "
+                    "varlen mode."
+                )
+            seq_lens = prefill_metadata.layout.seq_lens_cpu[num_decodes:]
+        else:
+            seq_lens = (T,)
+        return gdn_segment_scan_fwd(
+            k=k,
+            w=w,
+            u=u,
+            g=g,
+            initial_state=initial_state,
+            output_final_state=output_final_state,
+            seq_lens=seq_lens,
+            state_indices=si_i32,
+            inplace_final_state=bool(inplace),
+            snapshot_dtype=resolved_snapshot_dtype,
+            state_dtype=resolved_state_dtype,
+        )
+
     BV = _tuned_bv(
         H=H,
         Hg=Hg,
