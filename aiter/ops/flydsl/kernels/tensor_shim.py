@@ -4,6 +4,7 @@
 import os
 import threading
 from abc import ABC, abstractmethod
+from functools import lru_cache
 from itertools import product
 
 import flydsl.compiler as flyc
@@ -16,6 +17,8 @@ from flydsl.compiler.protocol import extract_to_ir_values
 from flydsl.expr import ptrtoint, range_constexpr
 from flydsl.expr.typing import T
 from flydsl.expr.typing import Vector as Vec
+
+from aiter.ops.flydsl.kernels.kernels_common import get_warp_size
 
 # Global toggle for the amdgpu-kernarg-preload compile hint used by the flydsl
 # kernels. Enabled by default; set AITER_FLYDSL_KERNARG_PRELOAD=0 to disable it
@@ -226,6 +229,18 @@ def buf_copy_store(buffer, index, value, elem=fx.Int32, unit_elems=1, cache_modi
         fragment,
         _buf_copy_slice(buffer, index, unit_elems),
     )
+
+
+@lru_cache(maxsize=8)
+def wave_size_of(device_index: int | None = None) -> int:
+    """Wave width of the GPU a kernel will dispatch on.
+
+    Not ``get_warp_size(get_gfx())``: ``get_gfx()`` honours ``GPU_ARCHS``, so a
+    build cross-targeting another arch answers for that arch while the kernel
+    still dispatches here. A caller that picks a backend by one and builds it by
+    the other picks for a machine it is not running on.
+    """
+    return get_warp_size(torch.cuda.get_device_properties(device_index).gcnArchName)
 
 
 def ptr_arg(t: torch.Tensor, dtype=None):

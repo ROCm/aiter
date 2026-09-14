@@ -32,10 +32,10 @@ from functools import lru_cache
 import torch
 
 from aiter.jit.utils.chip_info import get_gfx
-from aiter.ops.flydsl.kernels.kernels_common import get_warp_size
-from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled
+from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled, wave_size_of
 from aiter.ops.flydsl.kernels.topk_per_row_radix_stream import (
     build_topk_per_row_radix_stream_module,
+    topk_per_row_radix_stream_serves,
 )
 from aiter.ops.flydsl.topk_per_row import flydsl_top_k_per_row_decode
 from aiter.ops.flydsl.topk_per_row_small_k import (
@@ -115,8 +115,11 @@ _PLAIN_FEW_ROWS_BAND = (16384, 131072)
 
 
 @lru_cache(maxsize=1)
-def _wave_size() -> int:
-    return get_warp_size(get_gfx())
+def _unsupported_arch() -> str | None:
+    """The arch, if this is one the selectors are not built for. Not evaluated
+    at import: aiter is imported for codegen on hosts with no GPU."""
+    gfx = get_gfx()
+    return None if gfx in _SUPPORTED_GFX else gfx
 
 
 @lru_cache(maxsize=8)
@@ -162,15 +165,43 @@ def _available(width: int, k: int, wave_size: int, ragged: bool) -> frozenset:
     # decode was refused at 4 GiB when it built descriptors over the whole
     # tensor; it slices the row first now, so there is nothing left to ask.
     out.add("decode")
-    try:
-        build_topk_per_row_radix_stream_module(k, wave_size)
+    if topk_per_row_radix_stream_serves(k, wave_size) is None:
         out.add("stream")
-    except ValueError:
-        pass
     return frozenset(out)
 
 
-def topk_select_backend(rows: int, width: int, k: int, available: set[str]) -> str:
+@lru_cache(maxsize=1024)
+def _choose(
+    rows: int,
+    width: int,
+    k: int,
+    wave_size: int,
+    ragged: bool,
+    tie: str | None,
+    deterministic: bool,
+) -> str:
+    """The backend for one call shape, resolved once.
+
+    Every input is a scalar the caller varies rarely, and the whole decision --
+    which backends can serve, which the promises leave, which the shape rules
+    name -- is a pure function of them. Memoized as one step so the serving path
+    is a dict lookup rather than a set build, an intersection and a rule chain.
+    """
+    allowed = frozenset(_BACKENDS_BY_TIE[tie])
+    if deterministic:
+        allowed -= _NONDETERMINISTIC
+    available = _available(width, k, wave_size, ragged) & allowed
+    if not available:
+        raise RuntimeError(
+            f"no backend serves rows={rows} width={width} topk={k} "
+            f"tie={tie!r} deterministic={deterministic}"
+        )
+    return topk_select_backend(rows, width, k, available)
+
+
+def topk_select_backend(
+    rows: int, width: int, k: int, available: frozenset[str]
+) -> str:
     """Name the backend to use for this shape among those that can serve it.
 
     Not simply the fastest: where two are within 1.4x, this prefers the one
@@ -214,6 +245,7 @@ def topk_select_backend(rows: int, width: int, k: int, available: set[str]) -> s
 
 
 def _reject_unsupported(
+    *,
     input,
     indices_type,
     idx_oob_fill_value,
@@ -340,18 +372,19 @@ def topk_select(
         ``(values, indices)``; ``values`` is None when ``return_value`` is False.
     """
     _reject_unsupported(
-        input,
-        indices_type,
-        idx_oob_fill_value,
-        abort_when_nan_found,
-        begin,
-        hint,
-        tie,
-        sorted,
-        sorted_index,
+        input=input,
+        indices_type=indices_type,
+        idx_oob_fill_value=idx_oob_fill_value,
+        abort_when_nan_found=abort_when_nan_found,
+        begin=begin,
+        hint=hint,
+        tie=tie,
+        sorted=sorted,
+        sorted_index=sorted_index,
     )
-    if get_gfx() not in _SUPPORTED_GFX:
-        raise RuntimeError(f"topk_select is not supported on {get_gfx()}")
+    unsupported = _unsupported_arch()
+    if unsupported is not None:
+        raise RuntimeError(f"topk_select is not supported on {unsupported}")
     rows, width = input.shape
     if not 1 <= topk <= width:
         raise ValueError(f"topk must be in [1, {width}], got {topk}")
@@ -369,17 +402,16 @@ def topk_select(
             f"output_idx must be int32 [{rows}, {topk}], got {tuple(idx.shape)}"
         )
 
-    allowed = set(_BACKENDS_BY_TIE[tie])
-    if deterministic:
-        allowed -= _NONDETERMINISTIC
-    available = _available(width, topk, _wave_size(), end is not None) & allowed
-    if not available:
-        raise RuntimeError(
-            f"no backend serves rows={rows} width={width} topk={topk} "
-            f"tie={tie!r} deterministic={deterministic}"
-        )
-    backend = topk_select_backend(rows, width, topk, available)
-    _dispatch(backend, input, row_lens, idx, topk, rows, width, end is not None)
+    backend = _choose(
+        rows,
+        width,
+        topk,
+        wave_size_of(input.device.index),
+        end is not None,
+        tie,
+        deterministic,
+    )
+    _dispatch(backend, input, row_lens, idx, topk, rows, end is not None)
 
     values = None
     if return_value or sorted:
@@ -391,11 +423,8 @@ def topk_select(
         # that order even when the caller does not want them back. Gathering
         # them and dropping them is the cost of asking for the order; returning
         # indices in an arbitrary order from `sorted=True` is not an option.
-        gathered = torch.where(
-            idx >= 0,
-            input.gather(1, idx.clamp_min(0).long()),
-            torch.tensor(value_oob_fill_value, dtype=input.dtype, device=input.device),
-        )
+        gathered = input.gather(1, idx.long().clamp_min_(0))
+        gathered.masked_fill_(idx < 0, value_oob_fill_value)
         if sorted:
             gathered, order = torch.sort(gathered, dim=1, descending=True)
             idx = idx.gather(1, order)
@@ -421,7 +450,7 @@ def topk_select(
     return values, idx
 
 
-def _dispatch(backend, input, row_lens, idx, topk, rows, width, ragged):
+def _dispatch(backend, input, row_lens, idx, topk, rows, ragged):
     if backend == "small_k":
         topk_per_row_small_k(input, row_lens, idx, topk)
     elif backend == "plain":
@@ -445,7 +474,9 @@ def _dispatch(backend, input, row_lens, idx, topk, rows, width, ragged):
         )
     elif backend == "stream":
         _run_compiled(
-            build_topk_per_row_radix_stream_module(topk, _wave_size()),
+            build_topk_per_row_radix_stream_module(
+                topk, wave_size_of(input.device.index)
+            ),
             input,
             row_lens,
             idx,

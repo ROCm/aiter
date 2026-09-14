@@ -52,7 +52,7 @@ an ordinary fp32 selection; it re-reads each winner from the row to get that
 value, which is k gathered loads against a slice of N/G.
 """
 
-from functools import cache
+from functools import cache, lru_cache
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
@@ -190,6 +190,75 @@ def _wave_inclusive_prefix_i32(val, lane, wave_size):
     return val
 
 
+@lru_cache(maxsize=64)
+def _resolve_lds(k: int, block_threads: int, lds_budget: int, vec: int):
+    """The (unroll, soft_trigger) the LDS budget allows, or None if none does.
+
+    Tiles are loaded in groups, all loads issued before any of the filtering, so
+    a thread has `unroll` 128-bit reads in flight instead of one; with one tile
+    per group a barrier follows every load and its latency is fully exposed. The
+    arrivals region has to absorb a whole group, since the count is only checked
+    between groups, so the group size is what LDS can pay for -- and it competes
+    with the second resident workgroup for the same LDS.
+
+    The budget is a preference, not a requirement: a large enough k cannot be
+    held twice over on one CU at all, and one resident workgroup that runs beats
+    a build that does not exist. Callers who pass a budget get it if it can be
+    met and the hardware ceiling if it cannot.
+    """
+    tile = block_threads * vec
+
+    def fits(unroll, soft, budget):
+        cap = k + soft + unroll * tile
+        return (cap + k) * 8 + _NUM_BUCKETS * 4 + 4096 <= budget
+
+    for budget in dict.fromkeys((lds_budget, _LDS_MAX)):
+        for unroll in (_prefetch_tiles(k), 4, 2, 1):
+            # Start at the floor, not at k: the arrivals region may hold more
+            # than k candidates, and capping the trigger at k made every k below
+            # `_SOFT_TRIGGER_MIN` unsatisfiable by construction -- reported, for
+            # years, as an LDS shortage it never was.
+            soft = min(max(k, _SOFT_TRIGGER_MIN), _SOFT_TRIGGER_MAX)
+            while soft >= _SOFT_TRIGGER_MIN and not fits(unroll, soft, budget):
+                soft //= 2
+            if soft >= _SOFT_TRIGGER_MIN:
+                return unroll, soft
+    return None
+
+
+@lru_cache(maxsize=64)
+def topk_per_row_radix_stream_serves(
+    k: int,
+    wave_size: int,
+    block_threads: int = _BLOCK_THREADS,
+    lds_budget: int = _LDS_BUDGET,
+    vec: int = _VEC,
+) -> str | None:
+    """Why this geometry cannot be built, or None if it can.
+
+    What the build itself would hit, asked without building: a caller choosing
+    between selectors needs the answer, not the module. The build shares this
+    rather than restating the limits, so the two cannot drift.
+    """
+    if wave_size not in (32, 64):
+        return f"wave size must be 32 or 64, got {wave_size}"
+    if k < 1:
+        return f"k must be positive, got {k}"
+    if block_threads % wave_size:
+        return "block must be a whole number of waves"
+    if _NUM_BUCKETS % block_threads:
+        return (
+            f"the bucket scan splits {_NUM_BUCKETS} buckets across the block, "
+            f"so the block must divide it; got {block_threads}"
+        )
+    if _resolve_lds(k, block_threads, lds_budget, vec) is None:
+        return (
+            f"k={k} with a {block_threads}-thread block needs more than "
+            f"{_LDS_MAX} bytes of LDS for its candidate buffer"
+        )
+    return None
+
+
 @cache
 def build_topk_per_row_radix_stream_module(
     k: int,
@@ -211,64 +280,16 @@ def build_topk_per_row_radix_stream_module(
     inside one workgroup; spending half buys a second resident workgroup whose
     loads cover this one's barriers. Which wins is a measurement, not a rule.
     """
-    if wave_size not in (32, 64):
-        raise ValueError(f"wave size must be 32 or 64, got {wave_size}")
-    if k < 1:
-        raise ValueError(f"k must be positive, got {k}")
-    if block_threads % wave_size:
-        raise ValueError("block must be a whole number of waves")
-    if _NUM_BUCKETS % block_threads:
-        raise ValueError(
-            f"the bucket scan splits {_NUM_BUCKETS} buckets across the block, "
-            f"so the block must divide it; got {block_threads}"
-        )
+    reason = topk_per_row_radix_stream_serves(
+        k, wave_size, block_threads, lds_budget, vec
+    )
+    if reason is not None:
+        raise ValueError(f"[FlyDSL topk_per_row_radix_stream] {reason}")
 
     num_waves = block_threads // wave_size
     buckets_per_thread = _NUM_BUCKETS // block_threads
     tile = block_threads * vec
-    soft_trigger = min(k, _SOFT_TRIGGER_MAX)
-
-    # Tiles are loaded in groups, all loads issued before any of the filtering,
-    # so a thread has `unroll` 128-bit reads in flight instead of one; with one
-    # tile per group a barrier follows every load and its latency is fully
-    # exposed. The arrivals region has to absorb a whole group, since the count
-    # is only checked between groups, so the group size is what LDS can pay for
-    # -- and it competes with the second resident workgroup for the same LDS.
-    def _fits(unroll, soft, budget):
-        cap = k + soft + unroll * tile
-        return (cap + k) * 8 + _NUM_BUCKETS * 4 + 4096 <= budget
-
-    # The largest re-select trigger the budget allows. Trading it down is cheap
-    # while it stays well above k's own arrival rate.
-    #
-    # The budget is a preference, not a requirement: a large enough k cannot be
-    # held twice over on one CU at all, and one resident workgroup that runs
-    # beats a build that does not exist. Callers who pass a budget get it if it
-    # can be met and the hardware ceiling if it cannot.
-    #
-    # The prefetch depth is not part of this search any more. Draining arrivals
-    # between tiles took it out of the LDS budget, so it is set by how many
-    # loads are worth holding in registers, not by what the buffer can absorb.
-    unroll = None
-    for budget in dict.fromkeys((lds_budget, _LDS_MAX)):
-        for candidate in (_prefetch_tiles(k), 4, 2, 1):
-            # Start at the floor, not at k: the arrivals region may hold more
-            # than k candidates, and capping the trigger at k made every k below
-            # `_SOFT_TRIGGER_MIN` unsatisfiable by construction -- reported, for
-            # years, as an LDS shortage it never was.
-            soft = min(max(k, _SOFT_TRIGGER_MIN), _SOFT_TRIGGER_MAX)
-            while soft >= _SOFT_TRIGGER_MIN and not _fits(candidate, soft, budget):
-                soft //= 2
-            if soft >= _SOFT_TRIGGER_MIN:
-                unroll, soft_trigger = candidate, soft
-                break
-        if unroll is not None:
-            break
-    if unroll is None:
-        raise ValueError(
-            f"k={k} with a {block_threads}-thread block needs more than "
-            f"{_LDS_MAX} bytes of LDS for its candidate buffer"
-        )
+    unroll, soft_trigger = _resolve_lds(k, block_threads, lds_budget, vec)
     arrivals_cap = soft_trigger + unroll * tile
     capacity = k + arrivals_cap
 

@@ -3,12 +3,11 @@
 
 """FlyDSL per-row TopK for a small k (block-sparse indexer selection)."""
 
-from functools import cache, lru_cache
+from functools import lru_cache
 
 import torch
 
-from .kernels.kernels_common import get_warp_size
-from .kernels.tensor_shim import _run_compiled
+from .kernels.tensor_shim import _run_compiled, wave_size_of
 from .kernels.topk_per_row_small_k import (
     _LDS_LIMIT,
     build_topk_per_row_small_k_module,
@@ -25,11 +24,6 @@ def _row_bucket(width: int) -> int:
     while bucket < width:
         bucket *= 2
     return bucket
-
-
-@cache
-def _wave_size(device_index: int | None) -> int:
-    return get_warp_size(torch.cuda.get_device_properties(device_index).gcnArchName)
 
 
 @lru_cache(maxsize=64)
@@ -82,7 +76,7 @@ def _unsupported_reason(
         return "indices must have inner stride 1"
     if not (scores.is_cuda and row_lens.is_cuda and indices.is_cuda):
         return "every tensor must be on the GPU"
-    return topk_per_row_small_k_serves(k, width, _wave_size(scores.device.index))
+    return topk_per_row_small_k_serves(k, width, wave_size_of(scores.device.index))
 
 
 def topk_per_row_small_k_supported(
@@ -144,7 +138,7 @@ def topk_per_row_small_k(
     """
     rows, width = scores.shape
     launcher = _plan(
-        k, width, _wave_size(scores.device.index), bool(init_blocks or local_blocks)
+        k, width, wave_size_of(scores.device.index), bool(init_blocks or local_blocks)
     )
     _run_compiled(
         launcher,

@@ -25,9 +25,9 @@ import torch
 import aiter
 from aiter import dtypes
 from aiter.jit.utils.chip_info import get_gfx
+from aiter.ops.flydsl.kernels.tensor_shim import wave_size_of
 from aiter.ops.topk_select import (
     _available,
-    _wave_size,
     topk_select,
     topk_select_backend,
 )
@@ -64,7 +64,7 @@ def test_topk_select(m, n, k, tie, deterministic):
     x = torch.randn(m, n, dtype=dtypes.fp32)
     row_lens = torch.full((m,), n, dtype=dtypes.i32)
     ref = run_torch(x, row_lens, k)
-    serving = _available(n, k, _wave_size(), False)
+    serving = _available(n, k, wave_size_of(x.device.index), False)
 
     candidates = {
         "topk_select": lambda: topk_select(x, k, tie=tie, deterministic=deterministic)[
@@ -104,15 +104,21 @@ def _run_single_backend(x, row_lens, k, backend):
     narrowed = dict(keep)
     narrowed[None] = (backend,)
     ts._BACKENDS_BY_TIE = narrowed
+    # The dispatch is memoized on the call shape, which reads these tables. They
+    # are constants everywhere but here, so withholding a backend means dropping
+    # the answers taken while it was visible -- both on the way in and out.
+    ts._choose.cache_clear()
     try:
         rows, width = x.shape
-        served = ts._available(width, k, ts._wave_size(), False) & {backend}
+        wave = wave_size_of(x.device.index)
+        served = ts._available(width, k, wave, False) & {backend}
         picked = ts.topk_select_backend(rows, width, k, served)
         if picked != backend:
             raise AssertionError(f"asked for {backend}, the dispatch chose {picked}")
         return topk_select(x, k)[1]
     finally:
         ts._BACKENDS_BY_TIE = keep
+        ts._choose.cache_clear()
 
 
 def test_invariants(m, n, k):
