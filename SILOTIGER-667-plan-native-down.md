@@ -30,13 +30,14 @@ spot-check when the hot loop or wait/reduce path changed.
       the preshuffled FP8 default; Qwen B=1 vs gather accepted
 - [x] 2. FP4 native down — TOPK-parallel 16×4, same grid/epilogue as FP8
 - [x] 3. BF16 native down — TOPK-parallel 16×4 oracle; G9 has no BF16 down cell
-- [ ] 4. Optional second N tile (32 rows) if 16 N is occupancy-bound
+- [x] 4. Optional second N tile (32 rows) — **WontFix** (cuts waves; 16 N is not occupancy-bound)
 - [ ] 5. Split-K last, only if extra waves over `k0` help
 
 **Landed:** TOPK-parallel 16×4 (`grid = B*TOPK*(HIDDEN/16)`, one expert per
 wave, `atomic_add_f32` into a zeroed FP32 `y`) is the preshuffled FP8, FP4,
 and BF16 down default on legal tiles. Serial-TOPK is abandoned. No INTER/grid
 cutoff. Qwen B=1 vs gather is accepted for FP8; FP4 Qwen B=1 **beats** gather.
+Subtask 4 (32-row / two `n0`) is **WontFix**.
 
 ## Locked decisions
 
@@ -178,14 +179,31 @@ latency- or occupancy-limited, not bandwidth). This is **two `n0` tiles per
 wave** (or equivalent), not k-contiguous `kh_per_warp=2`. Skip entirely if
 subtask 1 already saturates the interesting decode batches.
 
-Subtask 1 did: DeepSeek B=32 is 72% peak. 32-row would *cut* waves, which is
-the wrong direction for the accepted Qwen B=1 cell. Lean WontFix unless a
-later FP4/BF16 native map is occupancy-starved at large B.
+**No-go.** 32-row is two `n0` per wave, so `grid = B*TOPK*(HIDDEN/32)` — half
+the waves of 16×4. That is the wrong direction wherever B=1,2 is still
+occupancy- or latency-limited (Qwen), and it is unnecessary where 16 N already
+streams.
 
-- [x] Measure G9 B=1,2 down after subtask 1; decide go/no-go here.
-- [ ] If go: 32-row variant, cosine vs 16-row and vs k-contiguous.
-- [ ] **Done when:** either explicitly WontFix in Progress, or 32-row path
-      gated and G9 B=1,2 down re-checked.
+Of-record G9 (`tickets/667/g9_compare_ck.md`, GPU 1, native 16×4 default):
+
+| Shape | B | down FP8 %peak | down FP4 %peak |
+|---|---:|---:|---:|
+| DeepSeek-V3 | 1 | 64.8 | 34.1 |
+| DeepSeek-V3 | 32 | 74.5 | 52.3 |
+| MiniMax | 1 | 32.2 | 25.8 |
+| MiniMax | 32 | 67.5 | 54.8 |
+| Qwen3-Next | 1 | 20.6 | 13.5 |
+| Qwen3-Next | 32 | 63.9 | 54.7 |
+
+FP8 DeepSeek B=32 is bandwidth-saturated (~75% peak). FP4 B=32 tops out ~52–55%
+peak because packed B is half the bytes plus convert, not because 16 N starves
+the CU; cutting waves would not add bytes in flight at B=32 and would worsen
+Qwen B=1. G9 has no BF16-down cell; the same 16×4 grid applies.
+
+- [x] Measure G9 B=1,2 (and B=32) down after subtasks 1–3; **no-go**.
+- [x] **WontFix:** no 32-row kernel, no extra dispatch gate.
+
+**Done when:** explicit WontFix in Progress (this section).
 
 ### 5. Split-K last
 
