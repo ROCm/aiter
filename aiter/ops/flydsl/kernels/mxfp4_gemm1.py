@@ -1496,24 +1496,13 @@ def _bm_constants(
     return kAStages, kSubBlocks, kMChunks, lds_bytes
 
 
-# gfx950 2-workgroup/CU LDS residency cliff. Not the naive 160KB/2=80KB: measured
-# on GLM5 (I=2048, token=16384, BM128/BN256) the cliff sits between 66560 and
-# 73728 bytes -- a 65KB threshold picks k_stages=1 (s1 2074.6us) while an 80KB
-# threshold picks k_stages=2 (s1 2297.0us, 10.7% slower). 65KB is just under the
-# 66560 that BM128/BN256/epi_splits=2 needs, so that tile stays resident.
 LDS_2WG_LIMIT = 65 * 1024
 
 MIN_N_BLOCKS_FOR_SHALLOW_K = 4
 
 
 def default_k_stages(BM, BN, KH_TILE, K_TILES_TOTAL, N_OUT, k_wave=1, epi_splits=1):
-    """Pick the deepest K pipeline that still fits two workgroups per CU.
-
-    The A-scale buffer grows with K, so large-K shapes cannot reach the 2-WG
-    residency limit at full depth; trading a stage for the second workgroup wins
-    there. It only pays when the A tile is reused over enough N blocks to hide
-    the shallower pipeline, so narrow-N shapes keep the full depth.
-    """
+    """Pick the deepest K pipeline that still fits two workgroups per CU."""
     if N_OUT // BN < MIN_N_BLOCKS_FOR_SHALLOW_K:
         return kStages
     *_, lds = _bm_constants(BM, BN, KH_TILE, K_TILES_TOTAL, k_wave, epi_splits, kStages)
@@ -1522,7 +1511,6 @@ def default_k_stages(BM, BN, KH_TILE, K_TILES_TOTAL, N_OUT, k_wave=1, epi_splits
     *_, lds_shallow = _bm_constants(
         BM, BN, KH_TILE, K_TILES_TOTAL, k_wave, epi_splits, 1
     )
-    # Neither depth fits: keep the deeper pipeline rather than pay for both.
     return 1 if lds_shallow <= LDS_2WG_LIMIT else kStages
 
 
@@ -1818,12 +1806,6 @@ def compile_gemm1_a4w4_port(
             stream=stream,
         )
 
-    # Measured on a4w4 fp4: -4.7% (BM64/2048), -6.5% (BM64/8192), -3.9% (BM64/16384),
-    # neutral on BM16/32/128. Applied to every gemm1 variant, but only the a4w4 fp4
-    # BMs above have tuned rows -- a8w4/fp8, BN64, k_wave>1 and inline_quant are
-    # unverified. NOTE: flydsl's llvm_options mutates a process-global LLVM cl::opt
-    # and only restores it on contextmanager exit; safe today because AOT compiles
-    # in forked processes, but it would leak across kernels under a thread pool.
     launch_gemm1.compile_hints = {
         "llvm_options": {"amdgpu-sched-strategy": "iterative-minreg"},
     }

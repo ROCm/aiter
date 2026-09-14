@@ -3331,8 +3331,6 @@ def get_2stage_cfgs(
         and use_g1u1
         and not doweight_stage1
     )
-    # Untuned a4w4 SiTUv2 shapes covered by the Opus aux kernels: pick a
-    # heuristic MXMOE pair rather than dropping to the old flydsl_moe1/moe2 port.
     _mxmoe_fallback_ok = (
         dtype in [dtypes.bf16, dtypes.fp16]
         and q_type == QuantType.per_1x32
@@ -3351,23 +3349,13 @@ def get_2stage_cfgs(
         and os.environ.get("AITER_MXMOE_FALLBACK", "1") == "1"
     )
     if _mxmoe_fallback_ok and cfg is None:
-        # A wide sort block only amortizes once there are enough tokens to fill it.
         _bm = 64 if token < 512 else 128
         _g2_tk = 128 if inter_dim % 128 == 0 else 256
-        # xcd_swizzle groups m-blocks against one B tile, and B is indexed by
-        # (expert, n_block), so the m-blocks an expert spans caps a useful group;
-        # too wide a group also starves the grid tail, hence the clamp at 6.
         _rows_per_expert = -(-token * topk // expert)
         _g1_swz = min(6, max(1, -(-_rows_per_expert // _bm)))
         _g1_sfx = f"_xcd{_g1_swz}" if _g1_swz > 1 else ""
-        # Persist needs enough tiles to amortize its loop setup and hide its tail.
-        _g2_persist = "_persist" if _bm == 128 and token >= 4096 else ""
-        _g2_sfx = ""
         _kn1 = f"flydsl_mxmoe_g1_a4w4_{_bm}x256x256_situv2{_g1_sfx}"
-        _kn2 = (
-            f"flydsl_moe2_layout_afp4_wfp4_bf16_t{_bm}x256x{_g2_tk}"
-            f"_reduce{_g2_persist}_sbm{_bm}{_g2_sfx}"
-        )
+        _kn2 = f"flydsl_moe2_layout_afp4_wfp4_bf16_t{_bm}x256x{_g2_tk}_reduce_sbm{_bm}"
         logger.warning(
             f"[fused_moe] no tuned FlyDSL config for {keys}, "
             f"using heuristic MXMOE fallback (kn1={_kn1!r}, kn2={_kn2!r})"

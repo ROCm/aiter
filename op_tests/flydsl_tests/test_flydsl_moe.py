@@ -336,23 +336,12 @@ def test_flydsl_v2_stage2_a8w4_full_tile(block_m, inter_dim, tile_k):
 @pytest.mark.parametrize("epilog", ["atomic", "reduce"])
 @_SKIP_GFX950_FLYDSL
 def test_flydsl_v2_stage2_sub_tiled(sbm, block_m, epilog):
-    """GEMM2 where the sort block (SBM) is not a multiple of the compute tile (BM).
-
-    (160, 64) is the sub-tiled case the BM160 GEMM1 row needs: 3 tiles of 64 cover
-    160 rows, so the third tile has only 32 live rows and must be masked on the
-    store side and clamped on the stids/sweights read side.
-
-    persist is not covered here because the dispatcher rejects persist with an
-    fp8 A operand; that branch is exercised end-to-end instead by pointing a
-    tuned CSV row at ``..._reduce_persist_sbm160``.
-    """
+    """GEMM2 where the sort block (SBM) is not a multiple of the compute tile (BM)."""
     from aiter.ops.flydsl.kernels.mxmoe_dispatcher import mxfp4_moe_gemm2
 
     torch.manual_seed(123)
     torch.cuda.manual_seed(123)
     inter_dim, tile_k = 384, 128
-    # E=1/topk=1 keeps the sort mapping an identity, so inter_sorted_quant can be
-    # fed in token order (same trick as test_flydsl_v2_stage2_a8w4_full_tile).
     token, model_dim, E, topk = 2 * sbm, 128, 1, 1
     a2 = torch.randn((token, topk, inter_dim), dtype=torch.bfloat16, device="cuda") / 4
     w1 = torch.zeros((E, inter_dim * 2, model_dim), dtype=torch.bfloat16, device="cuda")

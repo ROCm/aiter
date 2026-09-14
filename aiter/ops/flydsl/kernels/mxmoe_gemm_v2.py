@@ -974,15 +974,10 @@ def atomic_bf16_epilog(
     defer_w = bool(g2_defer_weight)
 
     # Prefetch sorted_token_ids / sorted_weights (invariant); latency overlaps stores+barriers.
-    # A sub-tiled block (SBM % BM != 0) spans SUBS*BM rows but only m_rows_valid of
-    # them exist, and stids/sweights are unbounded buffer views (max_size=True), so
-    # the tail lanes would read past the real allocation. Their results are dropped
-    # by the m_rows_valid store mask below, so clamp the index to the last valid row.
     packed = []
     weight = []
     for mr in range_constexpr(M_REPS):
         if const_expr(m_rows_valid is None):
-            # Keep the original expression shape so non-sub-tiled codegen is unchanged.
             sorted_pos = m_row + mr * EPI_ROWS + m_lane
         else:
             row_in_block = fx.Int32(mr * EPI_ROWS) + m_lane
@@ -1288,9 +1283,6 @@ def atomic_bf16_epilog(
                 else:
                     fx.copy(atomic_bf16x2, out_frag, out_bf16[None, out_off])
 
-    # Scheduling hint, not a correctness fix: drain every outstanding load so the
-    # route-out store burst below issues uninterrupted. Measured 1-3.5% off stage2
-    # across the tuned a4w4 rows; applies to all v2 gemm2 epilogs.
     rocdl.s_waitcnt(vmcnt=0)
 
     for mr in range_constexpr(M_REPS):
