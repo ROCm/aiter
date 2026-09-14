@@ -132,7 +132,19 @@ for file in "${sharded_files[@]}"; do
                     set -euo pipefail
                     test_file=$1
                     python3 -m pytest -q \
-                        "${test_file}::test_large_negative_logits_preserve_online_softmax"
+                        "${test_file}::test_pa_decode_api_matches_gluon" \
+                        "${test_file}::test_pa_decode_maps_gluon_buffers_and_scale_layout" \
+                        "${test_file}::test_gluon_unsupported_flydsl_reducer_falls_back" \
+                        "${test_file}::test_gluon_supported_flydsl_reducer_does_not_mask_errors" \
+                        "${test_file}::test_v_prefetch_workgroup_interval" \
+                        "${test_file}::test_pa_decode_fixed_length_accuracy" \
+                        "${test_file}::test_pa_decode_variable_length_accuracy" \
+                        "${test_file}::test_large_negative_logits_preserve_online_softmax" \
+                        "${test_file}::test_additional_supported_head_dims_are_accurate" \
+                        "${test_file}::test_supported_head_dim_boundaries_are_accepted" \
+                        "${test_file}::test_unsupported_head_dim_is_rejected" \
+                        "${test_file}::test_ps_false_is_rejected" \
+                        "${test_file}::test_invalid_tensor_structure_is_rejected"
                     python3 "$test_file"
                 '
                 _ "$file"
