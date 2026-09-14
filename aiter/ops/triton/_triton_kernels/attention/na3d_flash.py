@@ -58,14 +58,18 @@ _NA3D_FLASH_TRITON_AUTOTUNE = os.getenv("NA3D_FLASH_TRITON_AUTOTUNE", "0").lower
     "on",
 )
 
-# Always-launchable fallbacks used when an arch has no published DEFAULT.json entry.
-# One per KW-family: the pruner keeps BLOCK_Q=16 for KW <= 17 and BLOCK_Q=32 for
-# KW > 17 (BLOCK_KV must cover BLOCK_Q + KW - 1).
-_FALLBACK_SMALL_KW = triton.Config(
-    {"BLOCK_Q": 16, "BLOCK_KV": 32}, num_warps=4, num_stages=2
+# Always-launchable per-KW-family fallbacks, used only when an arch has no published
+# DEFAULT.json entry (no accelerator at import, unpublished arch, or unreadable file).
+# get_tuned_kernel_config() requires a Python triton.Config fallback by design: this is
+# the mandated not-JSON path -- a conservative correctness floor, not a copy of the tuned
+# defaults. Derived from the single search-space source so there are no parallel literals
+# to drift: the minimal tile (fewest num_stages) of each BLOCK_Q family. The pruner then
+# keeps BLOCK_Q=16 for KW <= 17 and BLOCK_Q=32 for KW > 17.
+_FALLBACK_SMALL_KW = next(
+    c for c in _NA3D_AUTOTUNE_CONFIGS if c.kwargs["BLOCK_Q"] == 16
 )
-_FALLBACK_LARGE_KW = triton.Config(
-    {"BLOCK_Q": 32, "BLOCK_KV": 64}, num_warps=4, num_stages=2
+_FALLBACK_LARGE_KW = next(
+    c for c in _NA3D_AUTOTUNE_CONFIGS if c.kwargs["BLOCK_Q"] == 32
 )
 
 
@@ -100,8 +104,11 @@ def _prune_configs(configs, named_args, **kwargs):
     wasting compute. Correctness also requires BLOCK_KV >= (BLOCK_Q + KW - 1)
     so the KV tile covers the union of all BLOCK_Q query windows.
     """
-    W = named_args["W"]
-    KW = kwargs.get("KW")  # constexpr in kwargs
+    # Triton routes positional launch args into named_args and keyword launch args
+    # into kwargs.  This launcher passes W positionally and KW as a keyword, but read
+    # from both so the size check stays active regardless of how either is passed.
+    W = named_args.get("W", kwargs.get("W"))
+    KW = named_args.get("KW", kwargs.get("KW"))
     return [
         c
         for c in configs
