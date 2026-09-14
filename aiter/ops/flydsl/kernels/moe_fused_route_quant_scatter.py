@@ -108,14 +108,8 @@ _TOKEN_MULTIDEST_BLOCKS_PER_CU = 4
 _TOKEN_MULTIDEST_MAX_KSPLIT = 14
 ELEMS_PER_LANE = 2  # bf16 columns each lane quantizes -> 1 fp4 byte / 2 fp8 bytes
 
-# Non-temporal (SLC / streaming) cache hint for the prequantized copy path. The
-# payload/scale SOURCES (the EP dispatch buffers) and the e8m0 SOURCE are each read
-# exactly once by this kernel, so a streaming load avoids polluting L2 with data
-# that has no reuse (matches ``b_aux = 2 if use_nt`` in the mxfp4 gemms /
-# ``_SLC_CACHE = 2`` in the dispatch/combine kernel). The payload DEST is re-read
-# by the downstream grouped GEMM, so its store keeps the default (temporal) policy
-# to stay resident in L2; flip ``_PREQUANT_NT_STORE`` only if the working set is
-# proven to exceed L2 (then the eviction is free and NT cuts write pollution).
+# SLC streaming hints for prequantized copy: sources are read once (no L2 reuse),
+# payload dest is re-read by the grouped GEMM so it stays temporal.
 _PREQUANT_NT_LOAD = 2
 _PREQUANT_NT_STORE = 0
 LANES_PER_MX_BLOCK = 32 // ELEMS_PER_LANE  # 16 lanes cover one 32-element MX block
@@ -732,44 +726,22 @@ def _emit_quant_one_k_group(c: SimpleNamespace, mx_group) -> None:
 
 
 def _emit_prequant_copy_preshuffle(c: SimpleNamespace) -> None:
-    """Optimized noKS *prequantized* full-row path: wide contiguous payload copy
-    plus a dword-combined e8m0 scale scatter.
+    """Prequantized full-row path: dwordx4 payload copy + dword-combined e8m0 scatter.
 
-    In prequantized mode the row is a pure gather-scatter memcpy -- the payload is
-    already an MX payload and the e8m0 scale is loaded (not computed) -- so the
-    per-MX-block dwordx1 structure of ``_emit_quant_block_loop`` (built for the
-    quant path, where 8 bf16/lane feed the pk8 convert and a 4-lane amax butterfly
-    ties the layout together) is pure overhead here. This replaces it for the
-    full-row (``ksplit=False``) prequantized case:
+    Replaces ``_emit_quant_block_loop`` for the noKS prequantized case — the row
+    is already an MX payload so the per-block quant structure is pure overhead.
+    Payload goes out as dwordx4 (16 B/lane); e8m0 as whole dwords (4 src bytes
+    already in destination byte order → one i32 copy per 4 MX blocks).
 
-      * payload -- a straight ``payload_bytes_per_row`` contiguous copy issued as
-        dwordx4 (16 B/lane) instead of ``block_iters`` x dwordx1 (4 B/lane): ~4x
-        fewer memory instructions for the same coalesced 512 B/wave/iter. The two
-        passes (cluster all loads, then all stores) are kept so the loads stay in
-        flight (memory-level parallelism) rather than each store serializing
-        behind its load -- but at dwordx4 only ``ceil(rows/32/16)`` chunks are
-        live (7 v4i32 = 28 VGPR for fd7168), *below* the quant path's per-lane
-        footprint, so occupancy does not regress. Overshoot lanes are dropped by
-        the buffer resource's ``num_records`` bound, so no per-iter guard.
-      * e8m0 scale -- by construction 4 consecutive MX blocks share one
-        destination dword (``scale_dword = mx_block//4``, ``byte_in_dword =
-        mx_block%4``) and the byte-in-dword order matches the source row's byte
-        order, so the 4 source e8m0 bytes at ``src_scale[g*4 .. g*4+3]`` ARE the
-        destination dword. The ``mx_blocks_per_row`` sub-dword byte-stores (224 for
-        fd7168) collapse to ``mx_blocks_per_row//4`` dword copies
-        ``dst_i32[scale_row_dword_base + g*wmma_rep*16] = src_scale_i32[g]``.
-
-    Requires (added to ``c`` by the routeks builder for this path): ``lane`` (raw
-    0..wave-1), ``wmma_rep`` (int), ``scale_t_i32`` (i32 view of grouped_scale),
-    plus the payload/src bases and strides already carried for the quant path.
+    Loads are clustered before stores to overlap payload and scale latencies.
+    Overshoot lanes are OOB-checked by the buffer resource ``num_records``.
     """
     i32 = c.i32
-    c4 = arith.constant(4, type=i32)
-    c16 = arith.constant(16, type=i32)
+    c4 = fx.Int32(4)
+    c16 = fx.Int32(16)
     lane = c.lane
     dst = c.dests[0]
 
-    # ---- payload row copy: dwordx4 contiguous, bounds-checked ----
     payload_bytes_per_row = c.payload_bytes_per_row
     dst_addr = c.payload_base + fx.Uint64(dst.payload_row_i32) * payload_bytes_per_row
     src_addr = c.hidden_base + fx.Uint64(c.feat_row_i32) * c.feat_bytes_per_row
@@ -779,58 +751,55 @@ def _emit_prequant_copy_preshuffle(c: SimpleNamespace) -> None:
     src_rsrc = buffer_ops.create_buffer_resource_from_addr(
         src_addr, num_records_bytes=c.feat_bytes_per_row
     )
-    total_chunks = payload_bytes_per_row // 16  # 16 B (dwordx4) per lane per chunk
-    n_iter = (total_chunks + 31) // 32
+    n_iter = (payload_bytes_per_row // 16 + 31) // 32
 
-    # ---- e8m0 scale source resource (loaded together with the payload below) ----
     src_scale_rsrc = buffer_ops.create_buffer_resource_from_addr(
         c.src_scale_base + fx.Uint64(c.feat_row_i32) * c.src_scale_bytes_per_row,
         num_records_bytes=c.src_scale_bytes_per_row,
     )
     n_scale_dwords = c.mx_blocks_per_row // 4
-    c_stride = arith.constant(c.wmma_rep * 16, type=i32)
-    c_n_scale_dwords = arith.constant(n_scale_dwords, type=i32)
+    c_stride = fx.Int32(c.wmma_rep * 16)
+    c_n_scale_dwords = fx.Int32(n_scale_dwords)
     scale_row_dword_base = dst.scale_row_dword_base
     scale_t_i32 = c.scale_t_i32
     n_sc_iter = (n_scale_dwords + 31) // 32
 
-    # Overlap the two independent streams. The payload copy and the e8m0 scale
-    # scatter share no data, so issuing *all* their loads first (payload dwordx4 +
-    # scale dword, streaming/NT since each source is read once) keeps the scale
-    # load latency hidden under the payload loads instead of starting only after
-    # the payload stores retire. Stores follow once the loads return. Live set:
-    # n_iter v4i32 + n_sc_iter i32 (7*4 + 2 = 30 VGPR for fd7168) -- still below
-    # the quant path's footprint, so occupancy holds.
+    # Cluster all loads before stores for memory-level parallelism.
     payload_chunks = []
     for it in range_constexpr(n_iter):
-        chunk_idx = arith.constant(it * 32, type=i32) + lane
-        # load offset is in i32 elements (4 dwords / 16 B chunk); store is in bytes.
+        chunk_idx = fx.Int32(it * 32) + lane
         v = buffer_ops.buffer_load(
-            src_rsrc, chunk_idx * c4, vec_width=4, dtype=i32,
+            src_rsrc,
+            chunk_idx * c4,
+            vec_width=4,
+            dtype=i32,
             cache_modifier=_PREQUANT_NT_LOAD,
         )
         payload_chunks.append((chunk_idx, v))
     scale_chunks = []
     for it in range_constexpr(n_sc_iter):
-        g = arith.constant(it * 32, type=i32) + lane
-        # element offset g -> byte g*4: the 4 contiguous src e8m0 bytes for this
-        # scale dword, in the destination's byte order (see docstring).
+        g = fx.Int32(it * 32) + lane
         src_dword = buffer_ops.buffer_load(
-            src_scale_rsrc, g, vec_width=1, dtype=i32,
+            src_scale_rsrc,
+            g,
+            vec_width=1,
+            dtype=i32,
             cache_modifier=_PREQUANT_NT_LOAD,
         )
         scale_chunks.append((g, src_dword))
 
     for chunk_idx, v in payload_chunks:
         buffer_ops.buffer_store(
-            v, dst_rsrc, chunk_idx * c16, offset_is_bytes=True,
+            v,
+            dst_rsrc,
+            chunk_idx * c16,
+            offset_is_bytes=True,
             cache_modifier=_PREQUANT_NT_STORE,
         )
     for g, src_dword in scale_chunks:
         dst_dword_idx = scale_row_dword_base + g * c_stride
 
-        # Divergent guard: n_scale_dwords is not a multiple of the wave, so the
-        # tail lanes of the last iteration must not write a valid-but-wrong dword.
+        # Tail-lane guard: n_scale_dwords may not be a wave multiple.
         def _store_scale_dword(dst_dword_idx=dst_dword_idx, src_dword=src_dword):
             scale_t_i32[dst_dword_idx] = fx.Int32(src_dword)
 
@@ -1832,7 +1801,6 @@ def build_moe_fused_quant_preshuffle_route_ksplit_module(
                 feat_row_i32 = row
 
             scale_t = ptr_buf_tensor(grouped_scale, fx.Int8)
-            # i32 view for the optimized prequant path's dword-combined scale store.
             scale_t_i32 = ptr_buf_tensor(grouped_scale, fx.Int32)
             payload_base = fx.Int64(ptrtoint(grouped_payload))
             hidden_base = fx.Int64(ptrtoint(grouped_in))
@@ -1890,9 +1858,6 @@ def build_moe_fused_quant_preshuffle_route_ksplit_module(
                 k_group_val = fx.Uint32(fx.block_idx.y)
                 _emit_quant_one_k_group(qc, k_group_val)
             elif const_expr(prequantized):
-                # Full-row prequantized copy: a wide, low-register-pressure
-                # memcpy + dword-combined scale scatter (see the function
-                # docstring). The quant path and the ksplit path are unchanged.
                 _emit_prequant_copy_preshuffle(qc)
             else:
                 _emit_quant_block_loop(qc)

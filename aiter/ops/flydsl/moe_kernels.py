@@ -2600,7 +2600,8 @@ def flydsl_moe_topids_to_rows(
         # standalone .fill_() launch between g2l_lds and psum_remap_ep.  When
         # ep_rowmap is None the kernel receives a null pointer and skips the fill.
         _ep_rowmap_ptr = (
-            ep_rowmap.reshape(-1) if ep_rowmap is not None
+            ep_rowmap.reshape(-1)
+            if ep_rowmap is not None
             else torch.empty(0, dtype=torch.int32, device=device)
         )
         _ep_rowmap_cap = ep_rowmap.shape[0] if ep_rowmap is not None else 0

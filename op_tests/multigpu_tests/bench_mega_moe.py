@@ -404,9 +404,7 @@ def make_routings(n_layers, ct, E, topk, dev, seed, expert_balance=False):
         if expert_balance:
             ids = balanced_ids
         else:
-            score = torch.rand(
-                ct, E, generator=gen, device=dev, dtype=torch.float32
-            )
+            score = torch.rand(ct, E, generator=gen, device=dev, dtype=torch.float32)
             _, ids = score.topk(topk, dim=-1)  # distinct experts per token
         wts = torch.rand(ct, topk, generator=gen, device=dev, dtype=torch.float32)
         wts = wts / wts.sum(dim=-1, keepdim=True).clamp_min(1e-9)
