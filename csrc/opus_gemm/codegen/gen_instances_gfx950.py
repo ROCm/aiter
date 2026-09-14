@@ -17,20 +17,24 @@ from codegen.common import (
     register_emit,
 )
 
-
 # ---------------- gfx950 die count ----------------
 # gfx950 ships at 256 CUs with eight dies and at 128 with four. The swizzle is
 # baked per instance, so a wheel is only correct on the part it was built for.
+_FALLBACK_NUM_XCD = 8
+
+
 def build_num_xcd():
-    """Die count of the part these instances are built for."""
+    """Die count of the part these instances are built for.
+
+    Falls back to the literal below when aiter is not importable, which is the
+    case for a standalone codegen run.
+    """
     try:
         from aiter.jit.utils.build_targets import target_num_xcds
 
         return target_num_xcds("gfx950")
     except Exception:  # noqa: BLE001
-        from aiter.jit.utils.build_targets import DEFAULT_NUM_XCDS
-
-        return DEFAULT_NUM_XCDS
+        return _FALLBACK_NUM_XCD
 
 
 # ---------------- gfx950 arch-override maps ----------------
