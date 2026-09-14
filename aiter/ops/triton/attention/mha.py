@@ -623,6 +623,7 @@ def _flash_attn_forward(
             supported = (
                 is_varlen
                 and not IS_FP8
+                and q.dtype == k.dtype == v.dtype == torch.bfloat16
                 and not enable_dropout
                 and not return_softmax
                 and alibi_slopes is None
@@ -1327,7 +1328,7 @@ def flash_attn_varlen_func(
             and no backward pass). For FP8, pass pre-quantized fp8 q/k/v with
             q_descale/k_descale/v_descale.
         prefer_int32_strides: opt in to metadata-guarded int32 addressing for
-            the default Triton varlen inference implementation. Unsupported
+            the default Triton BF16 varlen inference implementation. Unsupported
             Q/K/V layouts and training retain int64. Cumulative lengths must
             be contiguous one-dimensional tensors; invalid metadata is
             rejected because the kernel does not consume metadata strides.

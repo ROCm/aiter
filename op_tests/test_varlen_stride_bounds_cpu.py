@@ -2,6 +2,7 @@
 """No GPU import: test exact production metadata bound and per-call wiring."""
 
 import ast
+import json
 import math
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -42,13 +43,30 @@ def bound():
     return ns[node.name]
 
 
-def fits(tensors, length=65536, batch=1, heads=16):
-    return bound()(
-        tensors, length, length, batch, heads, {"BLOCK_M": 128, "BLOCK_N": 64}
-    )
+def production_tiles():
+    root = SOURCE.parent.parent / "configs"
+    cases = []
+    for path in sorted(root.glob("*/triton/attention/mha/*.json")):
+        for variant, config in json.loads(path.read_text())["fwd"].items():
+            cases.append(pytest.param(config, id=f"{path.relative_to(root)}:{variant}"))
+    assert cases, "Production MHA configurations were not found"
+    return cases
 
 
-def test_h3_geometry_and_lse():
+@pytest.fixture(params=production_tiles())
+def production_config(request):
+    return request.param
+
+
+@pytest.fixture
+def fits(production_config):
+    def check(tensors, length=65536, batch=1, heads=16):
+        return bound()(tensors, length, length, batch, heads, production_config)
+
+    return check
+
+
+def test_h3_geometry_and_lse(fits):
     qkv = TensorMetadata((65536, 16, 128), (2048, 128, 1))
     lse = TensorMetadata((65536, 16), (16, 1))
     assert fits([qkv, qkv, qkv, qkv, lse])
@@ -66,23 +84,25 @@ def test_h3_geometry_and_lse():
         TensorMetadata((2**31, 16, 128), (0, 128, 1)),
     ],
 )
-def test_unsafe_or_unsupported_layout(tensor):
+def test_unsafe_or_unsupported_layout(tensor, fits):
     assert not fits([tensor])
 
 
-def test_output_and_lse_participate_in_bound():
+def test_output_and_lse_participate_in_bound(fits):
     safe = TensorMetadata((65536, 16, 128), (2048, 128, 1))
     unsafe = TensorMetadata((65536, 16), (2**30, 1))
     assert not fits([safe, safe, safe, safe, unsafe])
 
 
-def test_masked_coordinate_overflow_is_not_numel_check():
-    tensor = TensorMetadata((524200, 16, 128), (2048, 128, 1))
+def test_masked_coordinate_overflow_is_not_numel_check(fits, production_config):
+    tile = max(production_config["BLOCK_M"], production_config["BLOCK_N"])
+    length = (2**31 // 2048) // 2 - tile + 1
+    tensor = TensorMetadata((length, 16, 128), (2048, 128, 1))
     assert tensor.numel() < 2**31
-    assert not fits([tensor], length=524200)
+    assert not fits([tensor], length=length)
 
 
-def test_grid_id_overflow():
+def test_grid_id_overflow(fits):
     tensor = TensorMetadata((1, 1, 128), (128, 128, 1))
     assert not fits([tensor], length=1, batch=2**30, heads=8)
 
@@ -91,19 +111,19 @@ def test_grid_id_overflow():
     "qlen,klen,window",
     [(1, 2**31 - 1, 0), (2**31 - 1, 1, 0), (10**9, 1, 1500000000)],
 )
-def test_sequence_coordinates_independent_of_strides(qlen, klen, window):
+def test_sequence_coordinates_independent_of_strides(
+    qlen, klen, window, production_config
+):
     tensor = TensorMetadata((1, 1, 8), (0, 8, 1))
-    assert not bound()(
-        [tensor], qlen, klen, 1, 1, {"BLOCK_M": 128, "BLOCK_N": 64}, window
-    )
+    assert not bound()([tensor], qlen, klen, 1, 1, production_config, window)
 
 
-def test_head_tile_minimum_16_includes_masked_lanes():
+def test_head_tile_minimum_16_includes_masked_lanes(fits):
     tensor = TensorMetadata((1, 2, 8), (0, 2**31 - 8, 1))
     assert not fits([tensor], length=1, heads=2)
 
 
-def test_coordinate_guard_boundary():
+def test_coordinate_guard_boundary(production_config):
     tensor = TensorMetadata((1, 1, 8), (0, 8, 1))
     kwargs = {
         "tensors": [tensor],
@@ -111,14 +131,15 @@ def test_coordinate_guard_boundary():
         "max_seqlen_k": 1,
         "batch": 1,
         "heads": 1,
-        "config": {"BLOCK_M": 128, "BLOCK_N": 64},
+        "config": production_config,
     }
-    window = 2**31 - 1 - 2 - 256
+    tile = max(production_config["BLOCK_M"], production_config["BLOCK_N"])
+    window = 2**31 - 1 - 2 - 2 * tile
     assert bound()(**kwargs, sliding_window=window)
     assert not bound()(**kwargs, sliding_window=window + 1)
 
 
-def test_bound_has_no_thread_shared_decision():
+def test_bound_has_no_thread_shared_decision(fits):
     good = TensorMetadata((65536, 16, 128), (2048, 128, 1))
     bad = TensorMetadata((65536, 16, 128), (32768, 128, 1))
     with ThreadPoolExecutor(4) as pool:

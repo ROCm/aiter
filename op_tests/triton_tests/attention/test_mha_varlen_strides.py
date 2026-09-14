@@ -174,3 +174,17 @@ def test_unsupported_implementation_rejected(backend, impl, monkeypatch):
             backend=backend,
             prefer_int32_strides=True,
         )
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.float32])
+def test_other_dtypes_preserve_int64(dtype, stride_widths):
+    torch.manual_seed(49)
+    tensors = [torch.randn(17, 4, 128, device="cuda", dtype=dtype) for _ in range(3)]
+    cu = torch.tensor([0, 17], device="cuda", dtype=torch.int32)
+    with torch.inference_mode():
+        control = mha.flash_attn_varlen_func(*tensors, cu, cu, 17, 17, return_lse=True)
+        candidate = mha.flash_attn_varlen_func(
+            *tensors, cu, cu, 17, 17, return_lse=True, prefer_int32_strides=True
+        )
+    assert stride_widths == [True, True]
+    torch.testing.assert_close(candidate, control, rtol=0, atol=0)
