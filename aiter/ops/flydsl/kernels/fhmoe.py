@@ -167,7 +167,7 @@ def compile_mixed_latent_fhmoe_gemm1(
         out_dtype="fp8",
         act="situv2",
         persist_m=4,
-        gate_mode=GateMode.SEPARATED,
+        gate_mode=GateMode.INTERLEAVE,
         shared_expert_id=experts,
         shared_model_dim=7168,
         shared_inter_dim=768,

@@ -13,7 +13,6 @@ import argparse
 from pathlib import Path
 
 MARKER = "maybe_run_vllm_k3_latent_fhmoe"
-LAYOUT_ENV = "VLLM_ROCM_K3_LATENT_SEPARATED_LAYOUT"
 OLD = """        result = self._forward_entry(
             hidden_states,
             router_logits,
@@ -47,44 +46,6 @@ NEW = """        from aiter.latent_fhmoe_vllm import maybe_run_vllm_k3_latent_fh
             )
 """
 
-ORACLE_IMPORT_OLD = """from enum import Enum
-from typing import TYPE_CHECKING, Literal, Union
-"""
-ORACLE_IMPORT_NEW = """from enum import Enum
-import os
-from typing import TYPE_CHECKING, Literal, Union
-"""
-ORACLE_LAYOUT_OLD = (
-    "            guinterleave = "
-    "rocm_aiter_ops.is_fused_moe_situv2_a8w4_enabled()\n"
-)
-ORACLE_LAYOUT_NEW = """            guinterleave = (
-                rocm_aiter_ops.is_fused_moe_situv2_a8w4_enabled()
-                and os.environ.get("VLLM_ROCM_K3_LATENT_SEPARATED_LAYOUT", "0")
-                != "1"
-            )
-"""
-
-EXPERT_IMPORT_OLD = """from functools import lru_cache
-from typing import TYPE_CHECKING
-"""
-EXPERT_IMPORT_NEW = """from functools import lru_cache
-import os
-from typing import TYPE_CHECKING
-"""
-EXPERT_GATE_OLD = (
-    "                if "
-    "rocm_aiter_ops.is_fused_moe_situv2_a8w4_enabled()\n"
-)
-EXPERT_GATE_NEW = """                if (
-                    rocm_aiter_ops.is_fused_moe_situv2_a8w4_enabled()
-                    and os.environ.get(
-                        "VLLM_ROCM_K3_LATENT_SEPARATED_LAYOUT", "0"
-                    )
-                    != "1"
-                )
-"""
-
 
 def _replace_once(target: Path, old: str, new: str, marker: str) -> bool:
     text = target.read_text()
@@ -99,19 +60,7 @@ def _replace_once(target: Path, old: str, new: str, marker: str) -> bool:
 
 def install(vllm_root: Path) -> bool:
     target = vllm_root / "models/kimi_k3/amd/latent_moe_runner.py"
-    changed = _replace_once(target, OLD, NEW, MARKER)
-
-    oracle = vllm_root / "model_executor/layers/fused_moe/oracle/mxfp4.py"
-    changed |= _replace_once(oracle, ORACLE_IMPORT_OLD, ORACLE_IMPORT_NEW, "import os")
-    changed |= _replace_once(oracle, ORACLE_LAYOUT_OLD, ORACLE_LAYOUT_NEW, LAYOUT_ENV)
-
-    expert = (
-        vllm_root
-        / "model_executor/layers/fused_moe/experts/rocm_aiter_moe.py"
-    )
-    changed |= _replace_once(expert, EXPERT_IMPORT_OLD, EXPERT_IMPORT_NEW, "import os")
-    changed |= _replace_once(expert, EXPERT_GATE_OLD, EXPERT_GATE_NEW, LAYOUT_ENV)
-    return changed
+    return _replace_once(target, OLD, NEW, MARKER)
 
 
 def main() -> None:

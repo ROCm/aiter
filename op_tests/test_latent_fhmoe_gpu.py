@@ -17,7 +17,11 @@ from aiter.latent_fhmoe import latent_fhmoe
 from aiter.ops.flydsl.moe_kernels import flydsl_moe_stage1, flydsl_moe_stage2
 from aiter.ops.flydsl.moe_sorting import flydsl_moe_sorting_fwd
 from aiter.ops.quant import per_1x32_f4_quant
-from aiter.ops.shuffle import shuffle_scale, shuffle_weight
+from aiter.ops.shuffle import (
+    shuffle_scale_a16w4,
+    shuffle_weight,
+    shuffle_weight_a16w4,
+)
 
 pytestmark = pytest.mark.skipif(get_gfx() != "gfx950", reason="requires gfx950")
 
@@ -98,7 +102,7 @@ def _routed_aiter_reference(
         w1_scale=routed_s1,
         a1_scale=a1_scale,
         persist_m=1,
-        gate_mode="separated",
+        gate_mode="interleave",
     )
     return flydsl_moe_stage2(
         a2,
@@ -147,12 +151,16 @@ def test_k3_latent_fhmoe_exact_dimensions(
     )
     routed_w1, routed_s1 = per_1x32_f4_quant(raw_routed_w1)
     routed_w2, routed_s2 = per_1x32_f4_quant(raw_routed_w2)
-    routed_w1 = shuffle_weight(routed_w1, layout=(16, 16))
-    routed_w2 = shuffle_weight(routed_w2, layout=(16, 16))
-    routed_s1 = shuffle_scale(routed_s1.view(-1, routed_s1.shape[-1])).reshape(
+    routed_w1 = shuffle_weight_a16w4(routed_w1, 16, True)
+    routed_w2 = shuffle_weight_a16w4(routed_w2, 16, False)
+    routed_s1 = shuffle_scale_a16w4(
+        routed_s1.view(-1, routed_s1.shape[-1]), experts, True
+    ).reshape(
         experts, 768, 112
     )
-    routed_s2 = shuffle_scale(routed_s2.view(-1, routed_s2.shape[-1])).reshape(
+    routed_s2 = shuffle_scale_a16w4(
+        routed_s2.view(-1, routed_s2.shape[-1]), experts, False
+    ).reshape(
         experts, 3584, 16
     )
 

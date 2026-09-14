@@ -15,8 +15,10 @@ Mixed-precision support (a_dtype x b_dtype):
 - fp8 x fp8, fp8 x fp4 (A8W4 on gfx950), fp4 x fp4,
   fp16 x fp16, int8 x int4, ...
 
-A8W4 path is selected by `a_dtype='fp8', b_dtype='fp4'` plus
-`gate_mode=GateMode.INTERLEAVE` + `a_scale_one=True` in stage1.
+A8W4 uses `a_dtype='fp8', b_dtype='fp4'` and typically
+`gate_mode=GateMode.INTERLEAVE`. `a_scale_one=True` is available for callers
+whose activations are already normalized; dynamic MXFP8 callers can instead
+provide their E8M0 activation scales.
 """
 
 import flydsl.compiler as flyc
@@ -2970,7 +2972,12 @@ def compile_mixed_moe_gemm1_common(
                                     token_slot_output=True,
                                     fixed_expert=0,
                                 )
-                        elif by < arith.constant(inter_dim // tile_n, index=True):
+                        elif by < arith.constant(
+                            (2 * inter_dim // tile_n)
+                            if gate_up_interleave
+                            else (inter_dim // tile_n),
+                            index=True,
+                        ):
                             moe_gemm1_body(shared_b=False)
                     elif const_expr(heterogeneous_b):
                         if is_shared_expert:

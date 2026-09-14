@@ -135,6 +135,12 @@ def maybe_run_vllm_k3_latent_fhmoe(
     """
     if os.environ.get("VLLM_ROCM_USE_K3_LATENT_FHMOE", "0") != "1":
         return None
+    if os.environ.get("VLLM_ROCM_K3_LATENT_SEPARATED_LAYOUT", "0") == "1":
+        if os.environ.get("VLLM_ROCM_K3_LATENT_STRICT", "0") == "1":
+            raise RuntimeError(
+                "K3 latent FHMoE requires production interleaved A8W4 W1 layout"
+            )
+        return None
     config = getattr(runner, "moe_config", None)
     if (
         shared_input is None
@@ -199,7 +205,10 @@ def maybe_run_vllm_k3_latent_fhmoe(
     global _LOGGED_LIVE_PATH
     if not _LOGGED_LIVE_PATH:
         _LOGGED_LIVE_PATH = True
-        print("K3 latent FHMoE: enabled TP8/EP1/M=8 integrated path", flush=True)
+        print(
+            "K3 latent FHMoE: enabled TP8/EP1/M=8 interleaved A8W4 path",
+            flush=True,
+        )
 
     routed_w1, routed_w2, routed_s1, routed_s2 = weights
     shared_w1, shared_w2 = shared_weights

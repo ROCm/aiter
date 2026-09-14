@@ -143,6 +143,13 @@ def test_vllm_adapter_is_strictly_m8_and_opt_in(
         maybe_run_vllm_k3_latent_fhmoe(runner, routed, logits, shared) is None
     )
     monkeypatch.setenv("VLLM_ROCM_USE_K3_LATENT_FHMOE", "1")
+    monkeypatch.setenv("VLLM_ROCM_K3_LATENT_SEPARATED_LAYOUT", "1")
+    assert maybe_run_vllm_k3_latent_fhmoe(runner, routed, logits, shared) is None
+    monkeypatch.setenv("VLLM_ROCM_K3_LATENT_STRICT", "1")
+    with pytest.raises(RuntimeError, match="interleaved A8W4"):
+        maybe_run_vllm_k3_latent_fhmoe(runner, routed, logits, shared)
+    monkeypatch.delenv("VLLM_ROCM_K3_LATENT_SEPARATED_LAYOUT")
+    monkeypatch.delenv("VLLM_ROCM_K3_LATENT_STRICT")
     assert (
         maybe_run_vllm_k3_latent_fhmoe(
             runner, routed[:1], logits[:1], shared[:1]
