@@ -19,8 +19,10 @@ from aiter.ops.flydsl.kernels.mega_moe.tp_incremental_schedule import (
     min_expert_ids,
     pack_rows_by_sorted_ids,
     partition_counts_by_min_expert,
+    publish_order_from_topk,
     simulate_incremental_publish,
     tokens_needed_by_expert,
+    tp_dest_row,
 )
 
 V4_PRO = {"tp": 8, "m_local": 64, "num_experts": 384, "topk": 6}
@@ -162,6 +164,23 @@ def test_dense_row_index_rank_major():
     assert dense_row_index(rank=3, local_row=7, m_local=64) == 3 * 64 + 7
 
 
+def test_tp_dest_row_layouts():
+    assert tp_dest_row(rank=3, local_row=7, m_local=64, npes=8) == 3 * 64 + 7
+    assert tp_dest_row(rank=3, local_row=7, m_local=64, npes=8, row_major=True) == (
+        7 * 8 + 3
+    )
+    # m_local=1: both layouts land on the same slot.
+    assert tp_dest_row(rank=3, local_row=0, m_local=1, npes=8) == 3
+    assert tp_dest_row(rank=3, local_row=0, m_local=1, npes=8, row_major=True) == 3
+
+
+def test_publish_order_is_stable_min_expert_argsort():
+    ids = torch.tensor([[4, 1], [0, 5], [1, 3]], dtype=torch.int32)
+    torch.testing.assert_close(
+        publish_order_from_topk(ids), torch.tensor([1, 0, 2], dtype=torch.int64)
+    )
+
+
 def test_pack_rows_uses_padding_row_for_sentinel():
     dense = torch.tensor([[1.0, 2.0], [3.0, 4.0], [0.0, 0.0]])
     # token 0, token 1, sentinel token_id=2 (n_tokens)
@@ -207,6 +226,8 @@ def main():
         test_v4_pro_shape_uniform_and_skew,
         test_duplicate_topk_ids_count_once,
         test_dense_row_index_rank_major,
+        test_tp_dest_row_layouts,
+        test_publish_order_is_stable_min_expert_argsort,
         test_pack_rows_uses_padding_row_for_sentinel,
         test_make_tile_row_base_stride,
     ]

@@ -19,6 +19,24 @@ def dense_row_index(rank: int, local_row: int, m_local: int) -> int:
     return int(rank) * int(m_local) + int(local_row)
 
 
+def tp_dest_row(
+    rank: int, local_row: int, m_local: int, npes: int, row_major: bool = False
+) -> int:
+    """Push destination in the dense TP slab.
+
+    Rank-major (default) is ``rank * m_local + local_row``. Row-major
+    ``local_row * npes + rank`` is the Step 3 negative control.
+    """
+    if row_major:
+        return int(local_row) * int(npes) + int(rank)
+    return dense_row_index(rank, local_row, m_local)
+
+
+def publish_order_from_topk(topk_ids: torch.Tensor) -> torch.Tensor:
+    """Stable argsort of ``min(topk)`` — each token published once."""
+    return min_expert_ids(topk_ids).argsort(stable=True)
+
+
 def min_expert_ids(topk_ids: torch.Tensor) -> torch.Tensor:
     """Per-token first-publish expert: ``min(topk)`` along the last dim."""
     if topk_ids.ndim != 2:
