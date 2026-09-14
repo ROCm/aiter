@@ -209,7 +209,6 @@ def _forward_paged(
     extra_kv,
     extra_indptr,
     extra_indices,
-    block_h,
 ):
     """dsv4 and the SWA+top-k two-loop, until the two launchers merge."""
     from aiter.ops.triton.attention.pa_decode_sparse import pa_decode_sparse
@@ -225,8 +224,8 @@ def _forward_paged(
     ]
     if unsupported:
         raise ValueError(
-            f"{', '.join(unsupported)} is not wired on the paged route yet "
-            "(dsv4 / two-loop caches)."
+            f"{', '.join(unsupported)} is not supported for dsv4 / two-loop "
+            "caches yet."
         )
     res = pa_decode_sparse(
         q,
@@ -236,7 +235,6 @@ def _forward_paged(
         attn_sink,
         softmax_scale,
         kv_scales=kv_scale,
-        block_h=block_h,
         kv_splits=kv_splits,
         has_invalid=has_invalid,
         skip_reduce=skip_reduce,
@@ -254,6 +252,7 @@ def sparse_mla_fwd(
     kv_indptr: torch.Tensor,
     kv_indices: torch.Tensor,
     softmax_scale: float,
+    *,
     kv_scale: torch.Tensor | None = None,
     kv_lora_rank: int = 512,
     qk_rope_head_dim: int = 64,
@@ -264,54 +263,69 @@ def sparse_mla_fwd(
     q_scale: torch.Tensor | None = None,
     out: torch.Tensor | None = None,
     return_lse: bool = False,
-    *,
     attn_sink: torch.Tensor | None = None,
     extra_kv: torch.Tensor | None = None,
     extra_indptr: torch.Tensor | None = None,
     extra_indices: torch.Tensor | None = None,
-    block_h: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     """Sparse (top-k gathered) MLA attention.
 
-    qk_rope_head_dim selects the geometry: separated rope (DeepSeek-V3.2,
-    GLM-5.1/5.2), where the query is the latent plus an appended rope, or
-    rope-free (GLM-5.3-Flash), where the query is the latent alone.
+    Everything after softmax_scale is keyword-only: kv_indptr and kv_indices are
+    both flat int32, so a positional mix-up would type-check and return garbage.
 
-    DeepSeek-V4 is the third case, rope inside the 512-wide row (448 nope + 64 rope)
-    with V the whole row.
+    Supported KV cache formats. The format is inferred from kv_buffer's shape,
+    dtype and kv_scale; each row gives what the caller has to pass. R is the
+    QK width, kv_lora_rank + qk_rope_head_dim.
+
+        format          kv_buffer                       kv_scale          geometry args
+        bf16            [slots, R] / [nb, block, R] /   None              as the model
+                        [slots, 1, 1, R], bf16
+        fp8_scalar      same shapes, fp8 or uint8       [1] f32 k_scale   as the model
+                        (GLM-5.x; the only format that
+                        can run dot_precision="fp8")
+        fp8_g64         [slots, D] fp8 or uint8         [slots, D//64]    kv_lora_rank=D,
+                        (uniform pool, rope inside)     f32               qk_rope_head_dim=0
+        fp8_dsv32_mla   [nb, block, 656] uint8          None              512 / 64
+                        (DeepSeek-V3.2, Kimi-K3; vLLM
+                        fp8_ds_mla, 512 fp8 | 4 f32
+                        per-128 | 64 bf16 rope)
+        fp8_dsv4_mla    [nb, block, 584] uint8          None              ignored
+                        (DeepSeek-V4; vLLM fp8_ds_mla,
+                        448 fp8 | 64 bf16 rope + 8 B
+                        UE8M0 trailer per block)
+
+    Geometry, set by qk_rope_head_dim: separated rope (DeepSeek-V3.2,
+    GLM-5.1/5.2), where the query is the latent plus an appended rope and V is
+    the latent; rope-free (GLM-5.3-Flash), qk_rope_head_dim=0, where the query
+    is the latent alone. DeepSeek-V4 keeps its rope inside the 512-wide row
+    (448 nope + 64 rope) with V the whole row; that layout is fixed by the cache
+    format, so the geometry args are not read for it.
+    A bf16 pool carries no rope information, so a rope-inside or rope-free
+    model on a bf16 cache must pass qk_rope_head_dim=0.
 
     Args:
         q: [C, H, kv_lora_rank + qk_rope_head_dim] queries, one row per
             query token (prefill and decode alike).
         qk_rope_head_dim: width of the appended rope. 0 means rope-free, and
             the QK contraction becomes a single dot over kv_lora_rank.
-        kv_buffer: the KV pool [nb, block, R] / [slots, 1, 1, R] /
-            [slots, R] in bf16, the same shapes in fp8 (+ scalar
-            kv_scale), [nb, block, 656] uint8 (fp8_dsv32_mla, which is
-            vLLM's fp8_ds_mla on DeepSeek-V3.2 / Kimi-K3), [nb, block, 584]
-            uint8 (fp8_dsv4_mla), or a 2-D fp8 pool with a per-64
-            kv_scale vector (fp8_g64); the last two route paged.
+        kv_buffer: the KV pool, one of the formats in the table above.
         kv_indptr: [C + 1] int32 prefix sum of per-query index counts.
         kv_indices: flat int32 GLOBAL slot ids into the pool.
         softmax_scale: the layer's softmax scale.
-        kv_scale: f32 cache scale. [1] per-tensor for the flat fp8 format
-            (fp8_scalar, required); [pages, D // 64] per-64 for the
-            uniform fp8 pool (fp8_g64), which routes paged. The packed
-            formats carry their own scales and take None.
+        kv_scale: f32 cache scale, shape per the table; the packed formats
+            carry their own scales and take None.
         kv_splits: split-K override; default follows the occupancy policy.
         skip_reduce: with split-K active, return (part_acc, part_m, part_l)
             instead of launching the combine.
         has_invalid: index stream carries -1 sentinels (masked out). Default
             False: on the fp8-dots path True disables the direct-to-LDS pipeline
             (see the ASYNC_LDS static assert), so only set it when the stream
-            really carries -1. The paged route's own default is True; this
-            entry passes the flag through as given.
+            really carries -1.
         attn_sink: optional [H] f32 per-head sink: exp(sink) joins the softmax
             denominator (and the LSE) as a virtual key. None means no sink,
             which is not the same as a zero sink.
         extra_kv, extra_indptr, extra_indices: a second segment attended in the
             same pass, for the SWA-window + top-k two-loop. All three together.
-        block_h: BLOCK_H override; only the non-gfx950 fallback honors it.
         dot_precision: what the QK and PV matrix-core ops run in.
 
             "bf16" (default): the KV tile is dequantized to bf16 on its way
@@ -336,7 +350,7 @@ def sparse_mla_fwd(
         [C, H, kv_lora_rank] bf16 (the latent V), lse is None unless return_lse.
     """
     assert q.ndim == 3, f"expected q=[b,h,d], got {q.shape}"
-    paged_args = (extra_kv, extra_indptr, extra_indices, block_h)
+    paged_args = (extra_kv, extra_indptr, extra_indices)
     if any(a is not None for a in paged_args) or _is_paged_cache(
         q, kv_buffer, kv_lora_rank, kv_scale
     ):
@@ -358,7 +372,6 @@ def sparse_mla_fwd(
             extra_kv,
             extra_indptr,
             extra_indices,
-            block_h,
         )
     assert arch_info.get_arch() == "gfx950", "sparse_mla_fwd is gfx950-only"
     q_is_fp8 = q.dtype == torch.float8_e4m3fn
