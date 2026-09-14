@@ -189,6 +189,9 @@ KV_PRODUCER_WARPS = NUM_WAVES // 2 if KV_PRODUCER_SPLIT else NUM_WAVES
 # leading softmax(start-1) is neutralized by seeding s_acc to -inf, which is exactly the
 # fully-masked path (m_new = m_prev, corr = 1, P = 0, d unchanged).
 ANTI_PHASE = True
+# Lagging half only: put the KV drain barrier AFTER the gemm instead of at the top of the
+# body, so the loop's back-edge bookkeeping and _addr_phase VALU/SALU land BEHIND it.
+LAG_DRAIN_AFTER_GEMM = True and ANTI_PHASE
 # O writer variant (decoupled from USE_TDM_LOADER): "v1" swizzled LDS + buffer_store (fastest so
 # far), "v2" TDM store (padding ignored -> contiguous LDS -> bank conflict, slow), "v3" padded LDS +
 # global_store_async_from_lds_b128.
@@ -1264,6 +1267,12 @@ def _core_attention(
     # HI half runs softmax(u-1) before gemm(u), so its per-q-tile carry slot holds the
     # f32 s_acc the next body's softmax consumes instead of the bf16 P. Same slot count.
     _lag_sm = ANTI_PHASE and warp_type == WarpType.HI_WARP
+    if LAG_DRAIN_AFTER_GEMM and _lag_sm:
+        # Rotating the drain to the body tail shifts this half's barrier stream by one:
+        # it now opens with the phase barrier and closes with the drain. One filler here
+        # (and its partner after the loop on the leading half) re-pairs the two streams
+        # so phase barrier still meets phase barrier.
+        _kv_fence(*_kv_drain)
     if has_sink:
         num_heads_q = gpu.grid_dim.y * fx.Int32(gqa_ratio)
         m_init = [
@@ -1611,7 +1620,8 @@ def _core_attention(
         # S^T = K(u) @ Q^T. sched_barrier fences the ring head out of the WMMA stream
         # (no wmma<-ds_load bubble); the ring itself issues the per-fragment s_wait_dscnt.
         if _lag_sm:
-            _drain_barrier()
+            if not LAG_DRAIN_AFTER_GEMM:
+                _drain_barrier()
             _prefetch(addr)
             p_list, m_new_list, d_new_list, o_resc = _softmax_phase(carry_prev, o_acc)
             # Anchor the f32->bf16 P conversion in THIS block. Its only real use is the
@@ -1632,6 +1642,8 @@ def _core_attention(
                 o_acc_list=o_resc,
                 head=pvqk_head,
             )
+            if LAG_DRAIN_AFTER_GEMM:
+                _drain_barrier()
             head_next = []
         else:
             _drain_barrier()
@@ -1762,6 +1774,10 @@ def _core_attention(
         kv_len=kv_len,
     )
     final = state
+    if LAG_DRAIN_AFTER_GEMM and not _lag_sm:
+        # Partner for the lagging half's trailing drain -- see the prologue filler.
+        rocdl_dialect.s_barrier_signal(-1)
+        rocdl_dialect.s_barrier_wait(-1)
     rocdl.s_wait_dscnt(0)  # retire the trailing body's dead carried head
 
     # ========================================================================
