@@ -60,6 +60,7 @@ def _gemm1_body_a16w4(
     out_stride=None,
     token_slot_output=False,
     fixed_expert=None,
+    num_waves=4,
 ):
     """a16w4/a16wi4/a16w16 (bf16 A x mxfp4/int4/bf16 W) fused stage1 gemm1 body.
 
@@ -75,10 +76,11 @@ def _gemm1_body_a16w4(
     LDS_STRIDE = TILE_K  # bf16 elems per LDS row (pad_k=0, LDS128)
     m_repeat = BM // 16
     k_unroll = KH_TILE_BYTES // 64  # bf16 8-per-lane K micro-steps per K-tile
-    # Wave partition num_n_waves x k_wave. k_wave=1: 4 waves split TILE_N (TILE_N/4 each).
+    # Wave partition num_n_waves x k_wave. The standalone kernels use four
+    # waves; heterogeneous launchers may use fewer waves for narrower N tiles.
     # k_wave>1 (aiter intra-block slice-K): each wave does a K-slice (klen=K/k_wave) of a
     # wider N-slice; partials LDS-reduced across k-group peers before epilogue.
-    _NUM_WAVES = 4
+    _NUM_WAVES = num_waves
     num_n_waves = _NUM_WAVES // k_wave
     if const_expr(k_wave > 1):
         wave_n_id = wave % fx.Int32(num_n_waves)

@@ -50,13 +50,15 @@ class _LatentFHMoEWorkspace:
 
 # CUDA graphs replay raw addresses. Keep every kernel-visible temporary alive
 # for the lifetime of the layer weight that owns this workspace.
-_WORKSPACES: dict[tuple[int, int, int, int], _LatentFHMoEWorkspace] = {}
+_WORKSPACES: dict[tuple[int, int, int, int, int], _LatentFHMoEWorkspace] = {}
+_LATENT_BLOCK_M = 32
 
 
 def _get_workspace(
     routed_input: torch.Tensor,
     routed_w1: torch.Tensor,
     routed_topk: int,
+    block_m: int,
 ) -> _LatentFHMoEWorkspace:
     from aiter import dtypes
 
@@ -66,13 +68,15 @@ def _get_workspace(
     num_tasks = m * total_topk
     max_active_experts = min(routed_experts + 1, num_tasks)
     max_sorted = (
-        num_tasks + max_active_experts * 31 + 31
-    ) // 32 * 32
-    max_blocks = max_sorted // 32
+        num_tasks
+        + max_active_experts * (block_m - 1)
+        + (block_m - 1)
+    ) // block_m * block_m
+    max_blocks = max_sorted // block_m
     scale_rows = (max_sorted + 255) // 256 * 256
     device_index = routed_input.device.index
     assert device_index is not None
-    key = (device_index, routed_w1.data_ptr(), m, routed_topk)
+    key = (device_index, routed_w1.data_ptr(), m, routed_topk, block_m)
     workspace = _WORKSPACES.get(key)
     if workspace is None:
         device = routed_input.device
@@ -172,9 +176,8 @@ def run_latent_fhmoe(
     m = routed_input.shape[0]
     routed_experts = routed_w1.shape[0]
     routed_topk = topk_ids.shape[1]
-    total_topk = routed_topk + 1
-    block_m = 32
-    workspace = _get_workspace(routed_input, routed_w1, routed_topk)
+    block_m = _LATENT_BLOCK_M
+    workspace = _get_workspace(routed_input, routed_w1, routed_topk, block_m)
     all_ids = workspace.all_ids
     all_weights = workspace.all_weights
     all_ids[:, :routed_topk].copy_(topk_ids)

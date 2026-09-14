@@ -125,6 +125,68 @@ def _routed_aiter_reference(
     )
 
 
+def _install_latent_tuning_config(
+    monkeypatch: pytest.MonkeyPatch, *, force: bool = False
+) -> tuple[tuple[int, ...], tuple[int, ...]] | None:
+    stage1_value = os.environ.get("AITER_K3_LATENT_STAGE1_CONFIG")
+    stage2_value = os.environ.get("AITER_K3_LATENT_STAGE2_CONFIG")
+    if not force and stage1_value is None and stage2_value is None:
+        return
+
+    import importlib
+
+    latent_impl = importlib.import_module("aiter.ops.flydsl.latent_fhmoe")
+    from aiter.ops.flydsl.kernels import fhmoe as fhmoe_kernels
+
+    stage1_config = tuple(
+        int(value)
+        for value in (
+            stage1_value or "32,64,256,4,4,0"
+        ).split(",")
+    )
+    stage2_config = tuple(
+        int(value)
+        for value in (
+            stage2_value or "32,256,128,4,32,0,0"
+        ).split(",")
+    )
+    assert len(stage1_config) == 6
+    assert len(stage2_config) == 7
+    monkeypatch.setattr(latent_impl, "_LATENT_BLOCK_M", stage1_config[0])
+    original_stage1 = fhmoe_kernels.compile_mixed_latent_fhmoe_gemm1
+    original_stage2 = fhmoe_kernels.compile_mixed_latent_fhmoe_gemm2
+    monkeypatch.setattr(
+        fhmoe_kernels,
+        "compile_mixed_latent_fhmoe_gemm1",
+        lambda *, experts, topk: original_stage1(
+            experts=experts,
+            topk=topk,
+            tile_m=stage1_config[0],
+            tile_n=stage1_config[1],
+            tile_k=stage1_config[2],
+            persist_m=stage1_config[3],
+            waves_per_eu=stage1_config[4] or None,
+            xcd_swizzle=stage1_config[5],
+        ),
+    )
+    monkeypatch.setattr(
+        fhmoe_kernels,
+        "compile_mixed_latent_fhmoe_gemm2",
+        lambda *, experts, topk: original_stage2(
+            experts=experts,
+            topk=topk,
+            tile_m=stage2_config[0],
+            tile_n=stage2_config[1],
+            tile_k=stage2_config[2],
+            persist_m=stage2_config[3],
+            sort_block_m=stage2_config[4] or stage1_config[0],
+            waves_per_eu=stage2_config[5] or None,
+            xcd_swizzle=stage2_config[6],
+        ),
+    )
+    return stage1_config, stage2_config
+
+
 @pytest.mark.parametrize(
     # FlyDSL specializes runtime integer arguments in its process-local cache.
     # Run M=8 in a fresh pytest process instead of mixing specializations.
@@ -135,6 +197,7 @@ def test_k3_latent_fhmoe_exact_dimensions(
     monkeypatch: pytest.MonkeyPatch, m: int, capsys: pytest.CaptureFixture[str]
 ):
     monkeypatch.setenv("AITER_SITUV2_A8W4", "1")
+    _install_latent_tuning_config(monkeypatch)
     torch.manual_seed(7 + m)
     device = torch.device("cuda")
     graph_mode = os.environ.get("AITER_K3_LATENT_GRAPH", "0") == "1"
@@ -172,9 +235,14 @@ def test_k3_latent_fhmoe_exact_dimensions(
     )
     shared_w1 = shuffle_weight(raw_shared_w1, layout=(16, 16))
     shared_w2 = shuffle_weight(raw_shared_w2, layout=(16, 16))
-    topk_ids = torch.randperm(experts, dtype=torch.int32, device=device)[
-        : m * topk
-    ].reshape(m, topk)
+    if experts >= m * topk:
+        topk_ids = torch.randperm(experts, dtype=torch.int32, device=device)[
+            : m * topk
+        ].reshape(m, topk)
+    else:
+        topk_ids = torch.randint(
+            experts, (m, topk), dtype=torch.int32, device=device
+        )
     topk_weight = torch.full(
         (m, topk), 1.0 / topk, dtype=torch.float32, device=device
     )
@@ -213,6 +281,13 @@ def test_k3_latent_fhmoe_exact_dimensions(
         routed_actual, shared_actual = latent_fhmoe(*args)
     torch.cuda.synchronize()
 
+    if experts == 1:
+        routed_gate, routed_up = F.linear(routed_input, raw_routed_w1[0]).chunk(
+            2, dim=-1
+        )
+        routed_torch_ref = F.linear(
+            _situv2(routed_gate, routed_up).to(torch.bfloat16), raw_routed_w2[0]
+        )
     routed_ref = _routed_aiter_reference(
         routed_input,
         routed_w1,
@@ -222,14 +297,7 @@ def test_k3_latent_fhmoe_exact_dimensions(
         topk_weight,
         topk_ids,
     )
-    if experts == 1:
-        routed_gate, routed_up = F.linear(routed_input, raw_routed_w1[0]).chunk(
-            2, dim=-1
-        )
-        routed_torch_ref = F.linear(
-            _situv2(routed_gate, routed_up).to(torch.bfloat16), raw_routed_w2[0]
-        )
-    else:
+    if experts != 1:
         routed_torch_ref = routed_ref
     gate, up = F.linear(shared_input, raw_shared_w1[0]).chunk(2, dim=-1)
     shared_inter = _situv2(gate, up).to(torch.bfloat16)
@@ -297,8 +365,11 @@ def test_k3_latent_fhmoe_exact_dimensions(
     os.environ.get("AITER_K3_LATENT_LIVE_SHAPE", "0") != "1",
     reason="large 896-expert K3 shape is opt-in",
 )
-def test_k3_latent_fhmoe_live_tp8_shape():
+def test_k3_latent_fhmoe_live_tp8_shape(monkeypatch: pytest.MonkeyPatch):
     """Smoke the exact TP8/EP1 IX decode domain without allocating BF16 experts."""
+    tuning_config = _install_latent_tuning_config(monkeypatch, force=True)
+    assert tuning_config is not None
+    stage1_config, stage2_config = tuning_config
     torch.manual_seed(23)
     device = torch.device("cuda")
     m, experts, topk = 8, 896, 16
@@ -356,3 +427,31 @@ def test_k3_latent_fhmoe_live_tp8_shape():
     assert torch.count_nonzero(routed_actual) == 0
     assert torch.isfinite(shared_actual).all()
     assert shared_error <= 3e-2
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        latent_fhmoe(
+            routed_input,
+            routed_w1,
+            routed_w2,
+            routed_s1,
+            routed_s2,
+            topk_weight,
+            topk_ids,
+            shared_input,
+            shared_w1,
+            shared_w2,
+        )
+    for _ in range(10):
+        graph.replay()
+    start = torch.cuda.Event(enable_timing=True)
+    end = torch.cuda.Event(enable_timing=True)
+    start.record()
+    for _ in range(100):
+        graph.replay()
+    end.record()
+    end.synchronize()
+    print(
+        f"K3 live TP8 graph: {start.elapsed_time(end) / 100:.3f} ms, "
+        f"stage1={stage1_config}, stage2={stage2_config}"
+    )

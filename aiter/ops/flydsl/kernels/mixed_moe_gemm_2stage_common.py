@@ -2971,6 +2971,7 @@ def compile_mixed_moe_gemm1_common(
                                     out_stride=shared_inter_dim,
                                     token_slot_output=True,
                                     fixed_expert=0,
+                                    num_waves=num_waves,
                                 )
                         elif by < arith.constant(
                             (2 * inter_dim // tile_n)
