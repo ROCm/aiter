@@ -103,10 +103,24 @@ class WarpType(IntEnum):
     """Warp-specialization role (compile-time). gfx1250 pairs wave i with wave i+4 on
     one SIMD; the low half (waves 0..3) and high half (waves 4..7) run different
     main-loop preamble orderings so one wave drives memory while its SIMD-mate computes.
+
+    Split again on SIMD parity (wave w -> SIMD w%4) so ``KV_SPLIT_PARITY_ORDER`` picks its
+    KV split order at trace time: the read bases and the softmax mask constants both fold.
+    With the flag off only the ``*_EVEN`` roles are traced, so the body stays 2-way.
     """
 
-    LO_WARP = 0  # waves 0..NUM_WAVES/2-1
-    HI_WARP = 1  # waves NUM_WAVES/2..NUM_WAVES-1
+    LO_EVEN = 0
+    LO_ODD = 1
+    HI_EVEN = 2
+    HI_ODD = 3
+
+    @property
+    def is_lo(self):
+        return self in (WarpType.LO_EVEN, WarpType.LO_ODD)
+
+    @property
+    def odd_simd(self):
+        return self in (WarpType.LO_ODD, WarpType.HI_ODD)
 
 
 DEFAULT_QK_HDIM = 128
@@ -184,6 +198,15 @@ USE_TDM_LOADER = True
 # (num_warps=1), so a wave issues one tensor_load per pow2 hdim segment and each half's
 # tensorcnt tracks one operand. The drain barrier still publishes both halves.
 KV_PRODUCER_WARPS = NUM_WAVES // 2
+# Read a tile's two n_block halves in opposite order on odd SIMDs, so the two SIMD
+# parities never sit in the same 64 KB LDS segment set at the same point of a gemm. Swaps
+# the READ bases only (the producer still writes split s to chunk s); that permutes the
+# kv-tile slots by ^(NKV/2) and the contraction slots by ^(nkt/2) TOGETHER, so S, P and
+# the PV consumption stay mutually consistent and only the softmax mask sees the absolute
+# index. Splits warp_type on SIMD parity, so ON costs a 4-way trace (~2x the body).
+# Measured on case 10 at fix-init: 4-way trace -3.6%, the swap itself neutral -- the K/V
+# ds_load addresses carry no warp_idx, so all four waves of a half read the same bytes.
+KV_SPLIT_PARITY_ORDER = True
 
 # LO/HI anti-phase (FA3 ping-pong). Both halves run the same tile stream and the same
 # number of bodies and barriers; the HI half runs its two phases in the opposite order,
@@ -567,6 +590,7 @@ def _softmax(
     lane_idx,
     n_block,
     kv_pos_base=None,
+    kv_slots_swapped=False,
     q_max_list=None,
     q_min_list=None,
     kv_len=None,
@@ -586,6 +610,10 @@ def _softmax(
     rows ``kvt*16 + (l//16)*8 + [0..8)`` (its half). The peer lane ``l^16`` holds the other
     8-row half of the same q, so the row max/sum reduce locally over (kvt, i) then across
     the ``shuffle_xor(16)`` partner.
+
+    ``kv_slots_swapped`` is ``KV_SPLIT_PARITY_ORDER``'s correction: when the wave reads the
+    tile's two halves in swapped order, slot ``kvt`` holds physical kv-tile ``kvt ^ (NKV/2)``.
+    It only renames the mask's per-slot compile-time constant -- no runtime cost.
 
     Masking (per element, per row r, sequence-relative ``kv_pos = kv_pos_base + (l//16)*8 +
     kvt*16 + i``; all bounds fx.Int32): ``q_max_list[r]`` masks ``kv_pos > q_max`` (band
@@ -652,6 +680,12 @@ def _softmax(
 
     khalf = lane_idx // fx.Int32(WMMA_M)  # 0/1: which 8-row kv half this lane owns
 
+    # Slot -> absolute kv offset. Swapped reads make slot kvt hold physical tile
+    # kvt ^ (NKV//2); the mask is the only consumer of the absolute index.
+    _kv_off = [
+        (kvt ^ (NKV // 2) if kv_slots_swapped else kvt) * WMMA_N for kvt in range(NKV)
+    ]
+
     R = len(s_list)
     q_max_list = q_max_list if q_max_list is not None else [None] * R
     q_min_list = q_min_list if q_min_list is not None else [None] * R
@@ -669,7 +703,7 @@ def _softmax(
                 sval = fx.Float32(svec[i])
                 if q_max is not None or q_min is not None or kv_len is not None:
                     kv_pos = (
-                        kv_pos_base + khalf * fx.Int32(8) + fx.Int32(kvt * WMMA_N + i)
+                        kv_pos_base + khalf * fx.Int32(8) + fx.Int32(_kv_off[kvt] + i)
                     )
                     if q_max is not None:
                         ubound = (
@@ -962,7 +996,7 @@ def _core_attention(
     window_left,
     window_right,
     warp_idx,  # runtime fx.Int32 wave index
-    warp_type,  # compile-time WarpType (LO_WARP / HI_WARP)
+    warp_type,  # compile-time WarpType (LO/HI x SIMD parity)
     lds_base,  # LDS base (fx.Int32), allocated once by the caller (_alloc_lds)
     elem_dtype,  # compile-time fx.BFloat16 / fx.Float16 for Q/K/V/P/O fragments
 ):
@@ -1049,11 +1083,21 @@ def _core_attention(
         v0 = slot + fx.Int32(LDS_CHUNK_BYTES)
         return [v0, v0 + fx.Int32(_SPLIT_STRIDE)]
 
+    # READ side only -- the producer keeps writing split s to chunk s. Odd SIMDs take the
+    # two bases in the other order, so the parities are never in the same 64 KB segment set
+    # at the same point of a gemm. Compile-time, so this costs no register and no add.
+    _kv_swap = KV_SPLIT_PARITY_ORDER and warp_type.odd_simd
+    assert not (KV_SPLIT_PARITY_ORDER and KV_LDS_SPLITS != 2), "parity order needs a 2-way split"
+    _rd = [_SPLIT_STRIDE, 0] if _kv_swap else [0, _SPLIT_STRIDE]
+
+    def _split_bufs(b):
+        return [b + fx.Int32(o) if o else b for o in _rd]
+
     def _k_lds_bufs(pp):
-        return _k_bufs_at(_k_lds_buf(pp))
+        return _split_bufs(_k_lds_buf(pp))
 
     def _v_lds_bufs(pp):
-        return _v_bufs_at(_k_lds_buf(pp))
+        return _split_bufs(_v_lds_buf(pp))
 
     # ---- Q and O own no LDS: both time-share KV chunks in LDS_QO_BYTES per-wave slices.
     # Q sits in the K[1][0] / K[1][1] chunk pairs (52 KB and 208 KB, 4 waves x 17 KB each);
@@ -1151,7 +1195,7 @@ def _core_attention(
         # issue the copies and drain before the loop.
         def _kv_views(slot, row0):
             # This half's operand only: LO issues every K copy, HI every V copy.
-            if warp_type == WarpType.LO_WARP:
+            if warp_type.is_lo:
                 return k_mgr.load_views(
                     ptr_lds=_k_bufs_at(slot),
                     ptr_K=ptr_K,
@@ -1194,7 +1238,7 @@ def _core_attention(
         rocdl.s_wait_dscnt(0)
         gpu.barrier()
         _issue_views(kv0)
-        if warp_type == WarpType.HI_WARP:
+        if not warp_type.is_lo:
             _issue_views(kv_fill)
         _kv_fence(*_kv_drain)
     else:
@@ -1271,7 +1315,7 @@ def _core_attention(
     _QS = 2 + d_tiles + NKV
     # HI half runs softmax(u-1) before gemm(u), so its per-q-tile carry slot holds the
     # f32 s_acc the next body's softmax consumes instead of the bf16 P. Same slot count.
-    _lag_sm = ANTI_PHASE and warp_type == WarpType.HI_WARP
+    _lag_sm = ANTI_PHASE and not warp_type.is_lo
     if LAG_DRAIN_AFTER_GEMM and _lag_sm:
         # Rotating the drain to the body tail shifts this half's barrier stream by one:
         # it now opens with the phase barrier and closes with the drain. One filler here
@@ -1433,7 +1477,7 @@ def _core_attention(
             # Pure (no memory op) -> hoistable: V2 the TDM copy views, V1 the per-lane
             # global/LDS pointer lists, for tile ``pf``'s K/V into the oldest slot.
             if USE_TDM_LOADER:
-                if warp_type == WarpType.LO_WARP:
+                if warp_type.is_lo:
                     return k_mgr.load_views(
                         ptr_lds=_k_bufs_at(wr_slot),
                         ptr_K=ptr_K,
@@ -1561,6 +1605,7 @@ def _core_attention(
                 lane_idx=lane_idx,
                 n_block=n_block,
                 kv_pos_base=kv_tile_start,
+                kv_slots_swapped=_kv_swap,
                 q_max_list=q_max_list,
                 q_min_list=q_min_list,
                 kv_len=kv_len,
@@ -2097,23 +2142,30 @@ def build_fmha_fwd_prefill_a16w16_m32x8(
                     "window_right": window_right,
                     "elem_dtype": ELEM_DTYPE,
                 }
-                # Warp specialization: LO warp (waves 0..N/2-1) vs HI warp (N/2..N-1).
+                # Warp specialization: LO (waves 0..N/2-1) vs HI (N/2..N-1), x SIMD parity.
                 lds_base = _alloc_lds()
                 warp_idx = _warp_id()
+                def _run(wt):
+                    _core_attention(
+                        warp_idx=warp_idx, warp_type=wt, lds_base=lds_base, **_ca_kw
+                    )
+
                 if warp_idx // fx.Int32(NUM_WAVES // 2) == fx.Int32(0):
-                    _core_attention(
-                        warp_idx=warp_idx,
-                        warp_type=WarpType.LO_WARP,
-                        lds_base=lds_base,
-                        **_ca_kw,
-                    )
+                    if fx.const_expr(KV_SPLIT_PARITY_ORDER):
+                        if warp_idx % fx.Int32(2) == fx.Int32(0):
+                            _run(WarpType.LO_EVEN)
+                        else:
+                            _run(WarpType.LO_ODD)
+                    else:
+                        _run(WarpType.LO_EVEN)
                 else:
-                    _core_attention(
-                        warp_idx=warp_idx,
-                        warp_type=WarpType.HI_WARP,
-                        lds_base=lds_base,
-                        **_ca_kw,
-                    )
+                    if fx.const_expr(KV_SPLIT_PARITY_ORDER):
+                        if warp_idx % fx.Int32(2) == fx.Int32(0):
+                            _run(WarpType.HI_EVEN)
+                        else:
+                            _run(WarpType.HI_ODD)
+                    else:
+                        _run(WarpType.HI_EVEN)
             elif q_len > fx.Int32(0):
                 # Cross-attention tail: q_len>0 but kv_len==0 -> O=0, LSE=-inf (or sink).
                 _zero_fill_attention(
@@ -2212,23 +2264,30 @@ def build_fmha_fwd_prefill_a16w16_m32x8(
             "window_right": window_right,
             "elem_dtype": ELEM_DTYPE,
         }
-        # Warp specialization: LO warp (waves 0..N/2-1) vs HI warp (N/2..N-1).
+        # Warp specialization: LO (waves 0..N/2-1) vs HI (N/2..N-1), x SIMD parity.
         lds_base = _alloc_lds()
         warp_idx = _warp_id()
+        def _run(wt):
+            _core_attention(
+                warp_idx=warp_idx, warp_type=wt, lds_base=lds_base, **_ca_kw
+            )
+
         if warp_idx // fx.Int32(NUM_WAVES // 2) == fx.Int32(0):
-            _core_attention(
-                warp_idx=warp_idx,
-                warp_type=WarpType.LO_WARP,
-                lds_base=lds_base,
-                **_ca_kw,
-            )
+            if fx.const_expr(KV_SPLIT_PARITY_ORDER):
+                if warp_idx % fx.Int32(2) == fx.Int32(0):
+                    _run(WarpType.LO_EVEN)
+                else:
+                    _run(WarpType.LO_ODD)
+            else:
+                _run(WarpType.LO_EVEN)
         else:
-            _core_attention(
-                warp_idx=warp_idx,
-                warp_type=WarpType.HI_WARP,
-                lds_base=lds_base,
-                **_ca_kw,
-            )
+            if fx.const_expr(KV_SPLIT_PARITY_ORDER):
+                if warp_idx % fx.Int32(2) == fx.Int32(0):
+                    _run(WarpType.HI_EVEN)
+                else:
+                    _run(WarpType.HI_ODD)
+            else:
+                _run(WarpType.HI_EVEN)
 
     return kn_fmha_fwd_prefill_a16w16_m32x8_bshd
 
