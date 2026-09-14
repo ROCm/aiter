@@ -9,7 +9,7 @@ import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl.expr import const_expr, gpu, range_constexpr
 
-from .kernels_common import atomic_add_i32
+from .kernels_common import atomic_add_i32, kernel_signature
 from .topk_per_row_decode import (
     _f32_to_ord,
     _load_f32x4,
@@ -52,7 +52,8 @@ def build_topk_per_row_decode_one_workgroup_module(
         metadata: fx.Array[fx.Int32, 8, 16]
 
     @flyc.kernel(
-        name=f"topk_per_row_decode_1wg_k{k}",
+        name="topk_per_row_decode_1wg_"
+        + kernel_signature(k=k, wave=wave_size, wv=write_values),
         known_block_size=[_BLOCK_THREADS, 1, 1],
     )
     def topk_per_row_decode_one_workgroup_kernel(
@@ -83,9 +84,17 @@ def build_topk_per_row_decode_one_workgroup_module(
         scan = storage.scan.peek().view(fx.make_layout(num_waves * 2, 1))
         metadata = storage.metadata.peek().view(fx.make_layout(8, 1))
 
-        input_buffer = fx.rocdl.make_buffer_tensor(input, max_size=False)
+        # Slice the row first, then build the descriptor over it. Built over
+        # the whole tensor and sliced afterwards, the row offset has to fit the
+        # descriptor's 32-bit byte count and its 32-bit voffset, so anything at
+        # or past 4 GiB is unaddressable -- measured on the small-k selector,
+        # which had the same shape: at exactly 4 GiB every row came back wrong
+        # with nothing raised. A row is 4 MiB at the widest width here.
         input_resource = fx.logical_divide(
-            fx.slice(input_buffer, (row, None)), fx.make_layout(_VEC, 1)
+            fx.rocdl.make_buffer_tensor(
+                fx.slice(input, (row, None)), max_size=False
+            ),
+            fx.make_layout(_VEC, 1),
         )
         row_len = _row_length(row, row_ends, width, next_n)
         row_indices = fx.slice(indices, (row, None))

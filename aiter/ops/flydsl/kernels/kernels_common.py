@@ -29,17 +29,35 @@ def format_kernel_name(name: str) -> str:
     return name.replace("-", "_")
 
 
+def kernel_signature(**params: object) -> str:
+    """Render build parameters into a kernel-name suffix.
+
+    Every build parameter that changes a kernel's body belongs here. Two builds
+    of one module that differ only in an omitted parameter otherwise emit the
+    same symbol, and are then indistinguishable in a profile, in a disassembly
+    dump, and to anything keyed on the name.
+
+    Booleans render as 0/1 so the suffix stays short, and the whole string goes
+    through ``format_kernel_name`` because a negative config value is legal here
+    and a hyphen is not legal in a symbol.
+    """
+    parts = [
+        f"{name}{int(value) if isinstance(value, bool) else value}"
+        for name, value in params.items()
+    ]
+    return format_kernel_name("_".join(parts))
+
+
 def uint32_to_int32(x: int) -> int:
     """Return the signed int32 value with the same low 32-bit pattern."""
     return x - (1 << 32) if x >= (1 << 31) else x
 
 
-def atomic_add_i32(memref, val, offset, syncscope):
-    """Atomically add an int32 value and return the previous value."""
+def _atomic_rmw_i32(binop, memref, val, offset, syncscope):
     ptr = fx.to_llvm_ptr(fx.get_iter(memref) + offset)
     val = fx.Int32(val) if isinstance(val, int) else val
     old = _llvm.AtomicRMWOp(
-        _llvm.AtomicBinOp.add,
+        binop,
         ptr,
         as_ir_value(val),
         _llvm.AtomicOrdering.monotonic,
@@ -47,6 +65,20 @@ def atomic_add_i32(memref, val, offset, syncscope):
         alignment=4,
     ).result
     return fx.Int32(old)
+
+
+def atomic_add_i32(memref, val, offset, syncscope):
+    """Atomically add an int32 value and return the previous value."""
+    return _atomic_rmw_i32(_llvm.AtomicBinOp.add, memref, val, offset, syncscope)
+
+
+def atomic_max_i32(memref, val, offset, syncscope):
+    """Atomically take the signed max and return the previous value.
+
+    Unlike a fetch-and-add, the result does not depend on the order the lanes
+    are served, so a reduction built on this is reproducible.
+    """
+    return _atomic_rmw_i32(_llvm.AtomicBinOp.max, memref, val, offset, syncscope)
 
 
 def get_warp_size(arch=None):
