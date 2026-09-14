@@ -23,11 +23,7 @@ jobs:
     if: >-
       github.event.pull_request.head.repo.fork == false &&
       github.event.pull_request.head.repo.full_name == github.repository &&
-      (
-        contains(github.event.pull_request.title, 'gfx1250') ||
-        contains(github.event.pull_request.title, 'GFX1250') ||
-        contains(github.event.pull_request.labels.*.name, 'ci:extended-test')
-      ) &&
+      contains(github.event.pull_request.labels.*.name, 'ci:extended-test') &&
       (github.event.action != 'labeled' || github.event.label.name == 'ci:extended-test')
     runs-on: linux-aiter-build-mi250
 

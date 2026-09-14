@@ -7,7 +7,13 @@ from typing import Any
 import torch
 from torch import Generator, Tensor
 
-from ..jit.core import AITER_META_DIR, CK_DIR, ENABLE_CK, compile_ops
+from ..jit.core import (
+    AITER_META_DIR,
+    CK_DIR,
+    ENABLE_CK,
+    compile_ops,
+    is_experimental_enabled,
+)
 from ..jit.utils.chip_info import get_cu_num, get_gfx
 from ..jit.utils.mha_recipes import (
     compose_mha_fwd_variant_suffix_and_filter,
@@ -2824,6 +2830,35 @@ def flash_attn_func(
             The output of softmax (possibly with different scaling). It also encodes the dropout
             pattern (negative means that location was dropped, nonnegative means it was kept).
     """
+    # FlyDSL path returns result if supported, None otherwise. window_size[2] (sink
+    # size) is unsupported: the FlyDSL gate rejects it, and this screen keeps it off
+    # the path so a sink-token request is never silently dropped.
+    if (
+        cu_seqlens_q is None
+        and cu_seqlens_kv is None
+        and num_splits <= 1
+        and (len(window_size) < 3 or window_size[2] == 0)
+    ):
+        from .flydsl.fmha_kernels import flydsl_flash_attn_batch_func
+
+        _flydsl_result = flydsl_flash_attn_batch_func(
+            q,
+            k,
+            v,
+            softmax_scale=softmax_scale,
+            causal=causal,
+            return_lse=return_lse,
+            dropout_p=dropout_p,
+            window_size=window_size,
+            bias=bias,
+            alibi_slopes=alibi_slopes,
+            deterministic=deterministic,
+            return_attn_probs=return_attn_probs,
+            sink=sink_ptr,
+        )
+        if _flydsl_result is not None:
+            return _flydsl_result
+
     if not ENABLE_CK:
         from .triton.attention.mha import flash_attn_func as flash_attn_func_triton
 
@@ -3265,11 +3300,63 @@ def _flash_attn_varlen_backward(
 
         return ret
 
+    def can_impl_fmha_bwd_flydsl():
+        # d_qk=192 / d_v=128 causal varlen self-attention -- the shape family both
+        # `can_impl_fmha_v3_bwd*` gates exclude by requiring hdim_q == hdim_v.
+        # `deterministic` is absent on purpose: the kernel uses no atomics and
+        # writes each of dq/dk/dv exactly once, so it is deterministic either way.
+        ret = get_gfx() == "gfx942"
+        ret &= alibi_slopes is None
+        ret &= dropout_p == 0.0
+        ret &= hdim_q == 192 and hdim_v == 128
+        ret &= nhead_q == nhead_k
+        ret &= not swa
+        ret &= causal
+        ret &= sink is None and d_sink is None
+        ret &= cu_seqlens_q_padded is None and cu_seqlens_k_padded is None
+        # Self-attention: one cu_seqlens drives both bounds. Comparing values
+        # would need a device sync, so distinct-but-equal tensors are rejected
+        # rather than synced on.
+        ret &= cu_seqlens_q.data_ptr() == cu_seqlens_k.data_ptr()
+        ret &= max_seqlen_q == max_seqlen_k
+        ret &= all(x.dtype == dtypes.bf16 for x in (q, k, v, out, dout))
+        ret &= all(x.is_contiguous() for x in (q, k, v, out, dout))
+        # dq/dk/dv are optional here; the launcher allocates contiguous ones when
+        # they are None.
+        ret &= all(x is None or x.is_contiguous() for x in (dq, dk, dv))
+
+        return ret
+
     can_impl_fmha_v3_bwd_ = can_impl_fmha_v3_bwd() or can_impl_fmha_v3_bwd_gfx950()
     # dq, dk, dv are allocated by us so they should already be contiguous
     dout, q, k, v, out = [maybe_contiguous(x) for x in (dout, q, k, v, out)]
+    # Evaluated after maybe_contiguous: the gate checks contiguity.
+    can_impl_fmha_bwd_flydsl_ = can_impl_fmha_bwd_flydsl()
 
-    if can_impl_fmha_v3_bwd_:
+    if can_impl_fmha_bwd_flydsl_:
+        from .flydsl.fmha_kernels import flydsl_flash_attn_varlen_bwd
+
+        (
+            dq,
+            dk,
+            dv,
+            softmax_d,
+        ) = flydsl_flash_attn_varlen_bwd(
+            dout,
+            q,
+            k,
+            v,
+            out,
+            softmax_lse,
+            dq,
+            dk,
+            dv,
+            cu_seqlens_q,
+            max_seqlen_q,
+            max_seqlen_k,
+            softmax_scale,
+        )
+    elif can_impl_fmha_v3_bwd_:
         (
             dq,
             dk,
@@ -3651,6 +3738,10 @@ def flash_attn_varlen_func(
         nhead_k = k.shape[-2]
         if hdim_q not in (64, 128) or hdim_v != hdim_q:
             return False
+        # Experimental FlyDSL m32x8 kernel owns the 128/128 path when enabled;
+        # yield so it reaches flydsl_flash_attn_varlen_func below.
+        if hdim_q == 128 and is_experimental_enabled():
+            return False
         if nhead_q % nhead_k != 0:
             return False
         if not causal or dropout_p != 0.0 or logits_soft_cap != 0.0:
@@ -3698,32 +3789,35 @@ def flash_attn_varlen_func(
             sink_ptr,
         )
 
-    # FlyDSL path returns result if supported, None otherwise.
-    from .flydsl.fmha_kernels import flydsl_flash_attn_varlen_func
+    # FlyDSL path returns result if supported, None otherwise. window_size[2] (sink
+    # size) is unsupported: the FlyDSL gate rejects it, and this screen keeps it off
+    # the path so a sink-token request is never silently dropped.
+    if len(window_size) < 3 or window_size[2] == 0:
+        from .flydsl.fmha_kernels import flydsl_flash_attn_varlen_func
 
-    _flydsl_result = flydsl_flash_attn_varlen_func(
-        q,
-        k,
-        v,
-        cu_seqlens_q,
-        cu_seqlens_k,
-        max_seqlen_q,
-        max_seqlen_k,
-        softmax_scale=softmax_scale,
-        causal=causal,
-        return_lse=return_lse,
-        dropout_p=dropout_p,
-        window_size=window_size,
-        bias=bias,
-        alibi_slopes=alibi_slopes,
-        deterministic=deterministic,
-        return_attn_probs=return_attn_probs,
-        block_table=block_table,
-        out=out,
-        sink=sink_ptr,
-    )
-    if _flydsl_result is not None:
-        return _flydsl_result
+        _flydsl_result = flydsl_flash_attn_varlen_func(
+            q,
+            k,
+            v,
+            cu_seqlens_q,
+            cu_seqlens_k,
+            max_seqlen_q,
+            max_seqlen_k,
+            softmax_scale=softmax_scale,
+            causal=causal,
+            return_lse=return_lse,
+            dropout_p=dropout_p,
+            window_size=window_size,
+            bias=bias,
+            alibi_slopes=alibi_slopes,
+            deterministic=deterministic,
+            return_attn_probs=return_attn_probs,
+            block_table=block_table,
+            out=out,
+            sink=sink_ptr,
+        )
+        if _flydsl_result is not None:
+            return _flydsl_result
 
     if not ENABLE_CK:
         from .triton.attention.mha import (
