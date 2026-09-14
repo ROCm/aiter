@@ -5887,22 +5887,6 @@ class FmoeTuner(TunerCommon):
             config_file=self.get_out_file(args.tune_file),
         )
         better_kernels = {}
-        # --all removes the target rows from self.tunedf during preprocessing.
-        # Re-read the output file so exact baselines remain distinguishable from
-        # activation fallbacks returned by the runtime config lookup.
-        existing_tunedf = self.get_tuned_gemm_list(args.tune_file)
-        if (
-            "gfx" in self.keys
-            and "gfx" not in existing_tunedf.columns
-            and "cu_num" in existing_tunedf.columns
-        ):
-            existing_tunedf["gfx"] = existing_tunedf["cu_num"].map(gfx_from_cu_num)
-        tuned_keys = (
-            set(existing_tunedf[self.keys].apply(tuple, axis=1))
-            if not existing_tunedf.empty
-            and all(col in existing_tunedf.columns for col in self.keys)
-            else set()
-        )
 
         for i in range(len(self.untunedf)):
             e2e_us = results_base[i]["e2e_us"]
@@ -5911,18 +5895,12 @@ class FmoeTuner(TunerCommon):
             row = self.untunedf.iloc[i]
             row_key = tuple(row[col] for col in self.keys)
             keyname = " ".join(map(str, row_key))
-            has_exact_tuned = row_key in tuned_keys
             baseline_valid = status == "ok" and e2e_us > 0
             better_kernels[i] = {
                 "name": keyname,
                 "row": row,
                 "kernel_name": None,
-                # An activation fallback is useful at runtime, but it is not a
-                # tuned result for this exact key. Force the first valid gfx942
-                # candidate to establish an explicit baseline for new shapes.
-                "e2e_us": (
-                    e2e_us if has_exact_tuned and baseline_valid else float("inf")
-                ),
+                "e2e_us": e2e_us if baseline_valid else float("inf"),
                 "err_ratio": err_ratio,
                 "e2e_us_base": e2e_us,
                 "err_ratio_base": err_ratio,
