@@ -15,7 +15,7 @@ import flydsl.expr as fx
 # so the existing barrier keeps covering it. Pointers still go through
 # `fx.to_llvm_ptr`, so no address space is hardcoded.
 from flydsl._mlir.dialects import rocdl as _rocdl_d
-from flydsl.expr import T, const_expr, range_constexpr, rocdl
+from flydsl.expr import T, arith, const_expr, range_constexpr, rocdl
 from flydsl.expr.rocdl import cvt_pk_f32_fp8
 from flydsl.expr.typing import Vector as Vec
 
@@ -42,6 +42,16 @@ BLOCK_K = 128  # fixed by MFMA_Scale(16, 16, 128)
 
 def _raw(v):
     return v.ir_value() if hasattr(v, "ir_value") else v
+
+
+def lds_block_n(nope: int, v_dim: int) -> int:
+    """Width of one k/v part in the padded per-head output ``[k|pad|v|pad]``.
+
+    The epilogue routes a whole B LDS half to one output, so the k/v split has to
+    land on a half boundary and both parts pad to the same width; the narrower
+    one's dead columns are dropped by StoreKV.
+    """
+    return ceildiv(max(nope, v_dim), 64) * 64
 
 
 def _gather_a_offsets(
@@ -177,7 +187,7 @@ class BlockScale:
 
 
 class StoreKV:
-    """Split k_prefix / v_prefix epilogue for BLOCK_N == one head."""
+    """Split k_prefix / v_prefix epilogue: B LDS half 0 -> k, half 1 -> v."""
 
     def __init__(
         self,
@@ -189,6 +199,8 @@ class StoreKV:
         n_heads,
         nope,
         v_dim,
+        lds_half,
+        tile_col,
         n_tiles_a,
         n_tiles_b,
         idx_fn,
@@ -197,6 +209,10 @@ class StoreKV:
         self.lane_id = fx.thread_idx.x % 64
         self.idx_fn = idx_fn
         self.per_row_scale = bool(per_row_scale)
+        self.m_rows = m_rows
+        self.lds_half = lds_half
+        # Column origin of this head tile in each output; None for a whole head.
+        self.tile_col = tile_col
         # Set by the kernel in block-scale mode: the single trailing K-tile scale
         # for each half, already multiplied by k_scale.
         self.block_scale_k = None
@@ -241,6 +257,10 @@ class StoreKV:
         fx.copy(self.scale_atom, fx.slice(ks_div, (None, 0)), r1)
         self.k_scale = Vec(fx.memref_load_vec(r1))[0]
 
+    def out_col(self, col):
+        """``col`` -- a column of this workgroup's tile -- in whole-output terms."""
+        return col if self.tile_col is None else self.tile_col + col
+
     def _scale_issue(self, tag, scale_base, col_base):
         """Issue the two scale loads for one half without consuming them."""
         if tag in self._scale_regs:
@@ -254,7 +274,12 @@ class StoreKV:
                 self.scale_atom,
                 fx.slice(
                     self.sb_div,
-                    (None, scale_base + col_base + tj * 16 + self.lane_id % 16),
+                    (
+                        None,
+                        scale_base
+                        + self.out_col(col_base + tj * 16)
+                        + self.lane_id % 16,
+                    ),
                 ),
                 regs[tj],
             )
@@ -291,6 +316,7 @@ class StoreKV:
         scale_base,
         col_base,
         tag,
+        n_valid,
         block_scale=None,
     ):
         if self.per_row_scale:
@@ -300,11 +326,18 @@ class StoreKV:
         for ti in range_constexpr(self.n_tiles_a):
             row = base_row + ti * 16 + (self.lane_id // 16) * 4
             for tj in range_constexpr(self.n_tiles_b):
-                col = col_base + tj * 16 + self.lane_id % 16
+                col = self.out_col(col_base + tj * 16) + self.lane_id % 16
                 vec_f32 = Vec(c_frag[self.idx_fn(ti, tj)])
                 for i in range_constexpr(4):
                     val = (vec_f32[i] * b_scales[tj]).to(fx.BFloat16)
-                    self._store_bf16(val, div, (row + i) * row_stride + head_off + col)
+                    index = (row + i) * row_stride + head_off + col
+                    if const_expr(n_valid < self.lds_half):
+                        # Dead columns of the widened part: an index past the
+                        # descriptor's last record discards the store.
+                        index = arith.select(
+                            col < n_valid, index, self.m_rows * row_stride
+                        )
+                    self._store_bf16(val, div, index)
 
     def store_k(self, c_frag, base_row, head, col_base):
         """c00 / c10 -> k_prefix[row, head, 0:nope]."""
@@ -317,6 +350,7 @@ class StoreKV:
             head * self.n_per_head,
             col_base,
             "k",
+            self.nope,
             block_scale=self.block_scale_k,
         )
 
@@ -331,6 +365,7 @@ class StoreKV:
             head * self.n_per_head + self.nope,
             col_base,
             "v",
+            self.v_dim,
             block_scale=self.block_scale_v,
         )
 
@@ -355,11 +390,14 @@ class _RopeCopy:
         nope,
         n_heads,
         kv_ptr=None,
+        dead_off=None,
     ):
         # kv_ptr set: the cache outgrew a descriptor, so `a_div` is None and each
         # rope row is reached by a 64-bit offset off the cache pointer instead.
         self.a_div = a_div
         self.kv_ptr = kv_ptr
+        # Steers a duplicate head tile's copy off the output; see the caller.
+        self.dead_off = dead_off
         self.kvi_div = kvi_div
         self.kp_div = kp_div
         self.m_base = m_base
@@ -402,14 +440,12 @@ class _RopeCopy:
                 else fx.Int64(idx) * fx.Int64(KV_ROW_ELEMS)
                 + fx.Int64(KV_C_DIM + self.half * 32)
             )
-            self.bases.append(
-                (
-                    rope_src,
-                    (self.m_base + row_local) * self.kp_row
-                    + self.col_base
-                    + self.half * 32,
-                )
+            dst = (
+                (self.m_base + row_local) * self.kp_row + self.col_base + self.half * 32
             )
+            if self.dead_off is not None:
+                dst = dst + self.dead_off
+            self.bases.append((rope_src, dst))
         self.src_regs = [
             [
                 fx.make_rmem_tensor(fx.make_layout(16, 1), fx.Float8E4M3FN)
@@ -467,6 +503,7 @@ def compile_gather_kv_b_proj_8w(
     nope: int = 128,
     v_dim: int = 128,
     BLOCK_M: int = 256,
+    head_tiles: int = 1,
     waves_per_eu: int = 2,
     xcd_swizzle: int = 1,
     weight_preshuffle: bool = True,
@@ -478,12 +515,23 @@ def compile_gather_kv_b_proj_8w(
     ``wide_index`` swaps the KV cache's descriptor-addressed DMA for
     ``global_load_lds`` over 64-bit per-lane addresses, which is what a cache
     spanning more than 4 GiB needs. The host sets it from the cache extent.
+
+    ``head_tiles`` is how many workgroups split one head's output columns, which
+    is how a head too wide for a 256-row M tile still gets one.
     """
     K = KV_C_DIM
-    BLOCK_N = nope + v_dim
+    HEAD_N = nope + v_dim
+    LDS_HALF = lds_block_n(nope, v_dim)
+    BLOCK_N = 2 * LDS_HALF // head_tiles  # per-workgroup slice of the padded output
 
     assert BLOCK_M >= 128 and BLOCK_M % 128 == 0
-    assert BLOCK_N == 256, "BLOCK_N is one head; the k/v split assumes 128+128"
+    assert (
+        nope % 16 == 0 and v_dim % 16 == 0
+    ), "the k/v split is the MFMA accumulator-group boundary, not a runtime offset"
+    assert head_tiles in (1, 2) and BLOCK_N >= 128, (
+        f"head_tiles={head_tiles} leaves a {BLOCK_N}-wide tile; a workgroup needs "
+        "two B LDS halves of at least the 64-column step each"
+    )
     assert K % BLOCK_K == 0
 
     K_ITERS = K // BLOCK_K  # 4 -- satisfies the pipeline's K_ITERS >= 2
@@ -505,8 +553,8 @@ def compile_gather_kv_b_proj_8w(
     b_lds_size = LDS_BLOCK_N * BLOCK_K
 
     _kname = (
-        f"flydsl_gather_kv_b_proj_8w_{BLOCK_M}x{BLOCK_N}x{BLOCK_K}_"
-        f"h{n_heads}_{waves_per_eu}x{xcd_swizzle}"
+        f"flydsl_gather_kv_b_proj_8w_{BLOCK_M}x{nope}v{v_dim}x{BLOCK_K}_"
+        f"h{n_heads}t{head_tiles}_{waves_per_eu}x{xcd_swizzle}"
         f"{'_ps' if weight_preshuffle else '_rm'}"
         f"{'_row' if per_row_scale else '_blk'}"
         f"{'_wide' if wide_index else ''}"
@@ -553,25 +601,39 @@ def compile_gather_kv_b_proj_8w(
         wave_m = wave_id // 4
         wave_n = wave_id % 4
 
-        # One N-tile per head, so num_pid_n is just n_heads. The XCD remap is the
-        # single biggest lever here: without it the n_heads tiles of one M-tile
-        # scatter across 8 XCDs and each re-reads the same gathered A tile from
-        # HBM; with it they share one XCD's L2.
+        # head_tiles N-tiles per head. The XCD remap is the single biggest lever
+        # here: without it the tiles of one M-tile scatter across 8 XCDs and each
+        # re-reads the same gathered A tile from HBM; with it they share one
+        # XCD's L2.
         if const_expr(xcd_swizzle > 0):
             block_m, block_n = _xcd_swizzle_any(
-                ceildiv(m_rows, BLOCK_M), n_heads, wgm=xcd_swizzle
+                ceildiv(m_rows, BLOCK_M), n_heads * head_tiles, wgm=xcd_swizzle
             )
         else:
-            block_m, block_n = split_row_major_2d(fx.block_idx.x, n_heads)
+            block_m, block_n = split_row_major_2d(fx.block_idx.x, n_heads * head_tiles)
 
-        head = block_n
+        # A head tile keeps the half 0 -> k, half 1 -> v routing and takes
+        # LDS_BLOCK_N columns of each, starting at tile_col.
+        if const_expr(head_tiles == 1):
+            head, tile_col, rope_dead = block_n, None, None
+        else:
+            head = block_n // head_tiles
+            tile = block_n % head_tiles
+            tile_col = tile * LDS_BLOCK_N
+            # Every tile of a head writes the same rope columns; all but the
+            # first are pushed past k_prefix's last record so one survives.
+            rope_dead = tile * (m_rows * (n_heads * (nope + KV_PE_DIM)))
+
         m_base = block_m * BLOCK_M
 
         # Preshuffled B advances 2 KB per K-tile (the 16-row x 64-K group), a
         # row-major one advances BLOCK_K elements.
         B_K_STEP = (2 * 1024) if weight_preshuffle else BLOCK_K
-        B0_gl_offset = (block_n * BLOCK_N) * K
-        B1_gl_offset = (block_n * BLOCK_N + LDS_BLOCK_N) * K
+        b_row_k, b_row_v = head * HEAD_N, head * HEAD_N + nope
+        if const_expr(head_tiles > 1):
+            b_row_k, b_row_v = b_row_k + tile_col, b_row_v + tile_col
+        B0_gl_offset = b_row_k * K
+        B1_gl_offset = b_row_v * K
 
         # The cache arrives as a pointer, not a memref: FlyDSL packs memref
         # shapes as i32, and this one passes 2**31 elements (2 GiB of fp8) while
@@ -642,6 +704,8 @@ def compile_gather_kv_b_proj_8w(
             n_heads,
             nope,
             v_dim,
+            LDS_HALF,
+            tile_col,
             N_TILES_A,
             N_TILES_B,
             mfma.idx,
@@ -761,6 +825,7 @@ def compile_gather_kv_b_proj_8w(
             nope,
             n_heads,
             kv_f8 if const_expr(wide_index) else None,
+            rope_dead,
         )
         rope.load_idx()
         store.prefetch_scales(head, wave_n * (N_TILES_B * 16))
@@ -815,7 +880,7 @@ def compile_gather_kv_b_proj_8w(
         m_rows: fx.Int32,
         stream: fx.Stream,
     ):
-        grid_x = ceildiv(m_rows, BLOCK_M) * n_heads
+        grid_x = ceildiv(m_rows, BLOCK_M) * n_heads * head_tiles
         kernel_gather(
             KV_cache,
             kv_num_blocks,
