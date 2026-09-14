@@ -389,6 +389,7 @@ def _flydsl_top_k_per_row(
             is_decode=is_decode,
             wave_size=wave_size,
             lds_budget_bytes=_ONE_BLOCK_LDS_BUDGET_BYTES.get(arch, 0),
+            arch=arch,
         )
         _run_compiled(
             launcher,
