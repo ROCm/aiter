@@ -270,6 +270,38 @@ def _grouped_a8w4_prepare_scale_batch(
     ).to(device=device)
 
 
+def _use_fused_quant_preshuffle(
+    model_dim: int, wmma_rep: int, quant_mode: str, token_num: int, topk: int
+) -> bool:
+    """Can this call take the single-launch quant + preshuffle kernel?
+
+    Two gates: the routing has to reach the token-multidest quant at all, and
+    the kernel's phase 2 has to fit a whole scale row-tile in LDS. Both matter
+    to the caller, which sizes token-indexed buffers on the answer.
+    """
+    from aiter.ops.flydsl.kernels.moe_fused_route_quant_scatter import (
+        fused_quant_preshuffle_supported,
+    )
+    from aiter.ops.flydsl.moe_kernels import token_multidest_eligible
+
+    return token_multidest_eligible(
+        token_num, topk
+    ) and fused_quant_preshuffle_supported(model_dim, wmma_rep, quant_mode)
+
+
+@functools.cache
+def _fused_preshuffle_workers() -> int:
+    """Resident workgroup count for the grid-barrier quant kernel.
+
+    The barrier deadlocks unless every worker is co-resident, and the kernel's
+    LDS leaves room for two blocks per CU. One block per CU also works but gives
+    up the cross-block latency hiding, which measured 93 us against 75.
+    """
+    from aiter.jit.utils.chip_info import get_cu_num
+
+    return int(get_cu_num()) * 2
+
+
 @functools.cache
 def _get_compiled_g2l_lut():
     """Compile and cache the single-block FlyDSL g2l-LUT builder."""
@@ -635,16 +667,42 @@ def _grouped_a8w4_tdm_moe(
             f"row at model_dim {model_dim}, got {_src_width}"
         )
 
-    # The 16-row-interleaved a1 scale makes the quant pass write 4 B per cache
-    # line; the row-major form moves that interleave into gemm1's LDS read,
-    # which is free (~12 us off quant at 16k tokens, gemm1 unchanged). Only the
-    # topk=6 multidest quant path implements it.
-    _row_major_ascale = (
+    # The scattered e8m0 write is what makes the quant pass bandwidth-bound: the
+    # WMMA layout spaces a row's consecutive blocks wmma_rep*16 dwords apart, so
+    # every store lands 4 useful bytes in a 64 B line, and topk routes repeat it.
+    # The kernel writes one compact row per token instead and rebuilds the layout
+    # after a grid-wide barrier, both sides coalesced, in the same launch. gemm1
+    # still reads the WMMA scale it always did.
+    _compact = (
         not _prequantized
-        and int(topk) == 6
-        and not tdm_as_in_prologue
-        and os.environ.get("AITER_FLYDSL_ROWMAJOR_ASCALE", "1") in ("1", "true", "True")
+        and _ep_nvr is None
+        and _use_fused_quant_preshuffle(
+            model_dim, wmma_rep, _quant_mode, token_num, topk
+        )
     )
+    _compact_scale_buf = None
+    _row_to_token = None
+    _fused_out = None
+    _fused_barrier = None
+    _fused_workers = 0
+    if _compact:
+        scale_w = model_dim // 32
+        _compact_scale_buf = torch.empty(
+            (token_num, scale_w), dtype=torch.uint8, device=device
+        )
+        # -1 marks tile padding: no route points at those rows, so phase 1 never
+        # writes them and phase 2 zero-fills them.
+        _row_to_token = torch.full(
+            (int(contiguous_m),), -1, dtype=torch.int32, device=device
+        )
+        _fused_out = torch.empty(
+            (1, contiguous_m // wmma_rep, scale_w * wmma_rep),
+            dtype=torch.uint8,
+            device=device,
+        )
+        # Arrival and release counters; both must start at zero.
+        _fused_barrier = torch.zeros(2, dtype=torch.int32, device=device)
+        _fused_workers = _fused_preshuffle_workers()
 
     a1_payload, a1_scale = flydsl_moe_fused_quant_preshuffle(
         hidden_states.reshape(1, token_num, _src_width),
@@ -657,7 +715,11 @@ def _grouped_a8w4_tdm_moe(
         source_topk=topk,
         num_valid_routes=_ep_nvr,
         prequantized_scale=src_a1_scale if _prequantized else None,
-        row_major_scale=_row_major_ascale,
+        out_scale=_compact_scale_buf,
+        row_to_token=_row_to_token,
+        fused_preshuffle_out=_fused_out,
+        fused_barrier=_fused_barrier,
+        fused_num_workers=_fused_workers,
     )
 
     # Fuse gemm1 activation + MX quantization + scale preshuffle into the
@@ -713,7 +775,6 @@ def _grouped_a8w4_tdm_moe(
             next_stage_prefetch=next_stage_prefetch,
             tdm_as_in_prologue=tdm_as_in_prologue,
             tdm_b_th=tdm_b_th,
-            row_major_ascale=int(_row_major_ascale),
             **_situ_kw,
         )
     else:
@@ -746,7 +807,6 @@ def _grouped_a8w4_tdm_moe(
             next_stage_prefetch=next_stage_prefetch,
             tdm_as_in_prologue=tdm_as_in_prologue,
             tdm_b_th=tdm_b_th,
-            row_major_ascale=int(_row_major_ascale),
             **_situ_kw,
         )
         a2_payload, a2_scale = flydsl_moe_fused_quant_preshuffle(
@@ -792,6 +852,44 @@ def _grouped_a8w4_tdm_moe(
     )
 
     if kernel_bench_callable is not None:
+        kernel_bench_callable.append(
+            (
+                "quant_a1",
+                functools.partial(
+                    flydsl_moe_fused_quant_preshuffle,
+                    hidden_states.reshape(1, token_num, _src_width),
+                    1,
+                    contiguous_m,
+                    wmma_rep=wmma_rep,
+                    quant_mode=_quant_mode,
+                    masked_m=None,
+                    topids_to_rows=topids_to_rows,
+                    source_topk=topk,
+                    num_valid_routes=_ep_nvr,
+                    prequantized_scale=src_a1_scale if _prequantized else None,
+                    out_payload=a1_payload,
+                    out_scale=a1_scale,
+                ),
+            )
+        )
+        if not _fuse_quant:
+            kernel_bench_callable.append(
+                (
+                    "quant_a2",
+                    functools.partial(
+                        flydsl_moe_fused_quant_preshuffle,
+                        y,
+                        1,
+                        contiguous_m,
+                        wmma_rep=wmma_rep2,
+                        quant_mode=_quant_mode,
+                        masked_m=None,
+                        topids_to_rows=None,
+                        out_payload=a2_payload,
+                        out_scale=a2_scale,
+                    ),
+                )
+            )
         if _fuse_quant:
             kernel_bench_callable.append(
                 (
