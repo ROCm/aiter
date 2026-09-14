@@ -7,8 +7,15 @@
 import triton
 import triton.language as tl
 
+from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
 
-@triton.jit
+_indexer_fwd_kernel_repr = make_kernel_repr(
+    "_indexer_fwd_kernel",
+    ["H", "HD", "COMPRESS_RATIO", "BLOCK_S", "BLOCK_P"],
+)
+
+
+@triton.jit(repr=_indexer_fwd_kernel_repr)
 def _indexer_fwd_kernel(
     q_ptr,
     k_ptr,
@@ -72,7 +79,13 @@ def _indexer_fwd_kernel(
     )
 
 
-@triton.jit
+_indexer_bwd_dq_dw_kernel_repr = make_kernel_repr(
+    "_indexer_bwd_dq_dw_kernel",
+    ["H", "HD", "COMPRESS_RATIO", "BLOCK_S", "BLOCK_P"],
+)
+
+
+@triton.jit(repr=_indexer_bwd_dq_dw_kernel_repr)
 def _indexer_bwd_dq_dw_kernel(
     q_ptr,
     k_ptr,
@@ -160,7 +173,13 @@ def _indexer_bwd_dq_dw_kernel(
         )
 
 
-@triton.jit
+_indexer_bwd_dk_kernel_repr = make_kernel_repr(
+    "_indexer_bwd_dk_kernel",
+    ["H", "HD", "COMPRESS_RATIO", "BLOCK_S", "BLOCK_P"],
+)
+
+
+@triton.jit(repr=_indexer_bwd_dk_kernel_repr)
 def _indexer_bwd_dk_kernel(
     q_ptr,
     k_ptr,
