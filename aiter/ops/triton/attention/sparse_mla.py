@@ -428,6 +428,10 @@ def sparse_mla_fwd(
         raise ValueError(f"expected q=[C, H, d_qk], got {tuple(q.shape)}")
     num_queries, num_heads, d_qk = q.shape
     fmt = _classify_cache(q, kv_buffer, kv_lora_rank, qk_rope_head_dim, kv_scale)
+    _LOGGER.info(
+        f"SPARSE_MLA_FWD: q={tuple(q.shape)} kv_buffer={tuple(kv_buffer.shape)} "
+        f"{kv_buffer.dtype} kv_indices={tuple(kv_indices.shape)} fmt={fmt}"
+    )
     _check_geometry(fmt, d_qk, kv_lora_rank, qk_rope_head_dim)
     _check_index_stream(kv_indptr, kv_indices, num_queries, q.device)
     if attn_sink is not None and attn_sink.numel() != num_heads:
@@ -490,15 +494,15 @@ def sparse_mla_fwd(
             )
         )
     if q_is_fp8:
-        # Caller-quantized q, one scaled_fp8_quant over [C, H*d_qk]
+        # Caller-quantized q, tensor scale
         if q_scale is None:
             raise ValueError("fp8 q needs q_scale (the scale it was quantized with)")
+        if q_scale.numel() != 1:
+            raise ValueError(
+                f"q_scale must be a single per-tensor value, got "
+                f"{tuple(q_scale.shape)}; per-head q scales are not supported"
+            )
         q_scale = q_scale.reshape(1).to(torch.float32).contiguous()
-    _LOGGER.info(
-        f"SPARSE_MLA C={num_queries} H={num_heads} d_qk={d_qk} "
-        f"nnz={kv_indices.shape[0]}"
-    )
-
     cache, alt, scl, block_size = _cache_pointers(fmt, kv_buffer, d_qk, kv_scale)
     fp8_dots = _resolve_dot_precision(dot_precision, fmt)
     if not q_is_fp8:

@@ -135,6 +135,10 @@ def pa_decode_sparse(
         raise RuntimeError("pa_decode_sparse requires CUDA/HIP tensors")
     if q.dtype not in (torch.bfloat16, torch.float16):
         raise RuntimeError(f"pa_decode_sparse expects fp16/bf16 q, got {q.dtype}")
+    _LOGGER.info(
+        f"PA_DECODE_SPARSE: q={tuple(q.shape)} unified_kv={tuple(unified_kv.shape)} "
+        f"{unified_kv.dtype} kv_indices={tuple(kv_indices.shape)}"
+    )
 
     # gfx950: route to the merged DSv4 sparse-MLA gluon driver. Format is inferred
     # from the cache: 3D -> packed fp8_dsv4_mla / bf16 block cache (optional SWA+top-k
@@ -204,9 +208,6 @@ def pa_decode_sparse(
             )
 
     T, H, D = q.shape
-    _LOGGER.info(
-        f"PA_DECODE_SPARSE T={T} H={H} D={D} " f"total_indices={kv_indices.shape[0]}"
-    )
 
     out = _check_out(out, q, q.dtype)
     assert kv_indices.dtype == torch.int32 and kv_indices.is_contiguous()
