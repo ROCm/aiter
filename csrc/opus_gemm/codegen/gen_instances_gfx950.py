@@ -1806,7 +1806,8 @@ using {k.name}_Traits = {traits_name}<{k.BLOCK_SIZE},
     opus::tuple<{da}, {db}, fp32_t, fp32_t, unsigned char>,
     opus::seq<{k.VEC_A}, {k.VEC_B}, {k.VEC_C}>,
     opus::seq<{k.GROUP_M}, {k.GROUP_N}, {k.GROUP_K}>,
-    {k.WG_PER_CU}>;
+    {k.WG_PER_CU},
+    {build_num_xcd()}>;
 """
 
     preamble = instance_impl_preamble('\n#include "opus_gemm_common.cuh"')
@@ -2018,7 +2019,8 @@ using {k.name}_Traits = {traits_name}<{k.BLOCK_SIZE},
     opus::tuple<{da}, {db}, fp32_t, fp32_t, unsigned char>,
     opus::seq<{k.VEC_A}, {k.VEC_B}, {k.VEC_C}>,
     opus::seq<{k.GROUP_M}, {k.GROUP_N}, {k.GROUP_K}>,
-    {k.WG_PER_CU}>;
+    {k.WG_PER_CU},
+    {build_num_xcd()}>;
 """
 
     preamble = instance_impl_preamble()
@@ -2085,7 +2087,8 @@ using {k.name}_Traits = {traits_name}<{k.BLOCK_SIZE},
     opus::tuple<{da}, {db}, fp32_t, fp32_t, unsigned char>,
     opus::seq<{k.VEC_A}, {k.VEC_B}, {k.VEC_C}>,
     opus::seq<{k.GROUP_M}, {k.GROUP_N}, {k.GROUP_K}>,
-    {k.WG_PER_CU}>;
+    {k.WG_PER_CU},
+    {build_num_xcd()}>;
 """
 
 
