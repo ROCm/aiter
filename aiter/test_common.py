@@ -588,6 +588,18 @@ def checkAllclose(
         return percent
 
 
+def assertAllclose(a, b, rtol=1e-2, atol=1e-2, max_err_ratio=1e-3, msg="", **kwargs):
+    """checkAllclose only logs and returns the mismatch ratio; this variant fails
+    the test when more than max_err_ratio of the elements mismatch."""
+    # Own the separator so no caller has to pad msg; checkAllclose interpolates it too.
+    prefix = f"{msg.strip()} " if msg.strip() else ""
+    ratio = checkAllclose(a, b, rtol=rtol, atol=atol, msg=prefix, **kwargs)
+    assert (
+        ratio <= max_err_ratio
+    ), f"{prefix}{ratio:.3%} of elements exceed atol={atol} rtol={rtol}"
+    return ratio
+
+
 def tensor_dump(x: torch.Tensor, name: str, dir="./"):
     x_cpu = x.cpu().view(torch.uint8)
     filename = f"{dir}/{name}.bin"

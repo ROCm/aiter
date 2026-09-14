@@ -5,7 +5,7 @@ import triton
 from aiter.ops.triton.kv_cache import cat_and_cache_mla
 from aiter.ops.triton.utils._triton import arch_info
 from aiter.ops.triton.utils.types import e4m3_dtype
-from aiter.test_common import checkAllclose
+from aiter.test_common import assertAllclose
 from op_tests.triton_tests.attention.test_mla import (
     dynamic_nvfp4_quant_kv_buffer,
     shuffle_kv_buffer,
@@ -149,20 +149,22 @@ def check_kv_buffer(
         # reference can flip a small number of elements to an adjacent FP4 code.
         # Tolerate a tiny fraction of such mismatches instead of requiring an
         # exact match.
-        checkAllclose(
+        assertAllclose(
             gather_written_slots(ref_kv_buffer_lora_dquant),
             gather_written_slots(kv_buffer_lora_dquant),
             atol=1e-1,
             rtol=1e-1,
             tol_err_ratio=0.05,
+            max_err_ratio=0.05,
             msg="NVFP4 kv_buffer lora dequant",
         )
-        checkAllclose(
+        assertAllclose(
             gather_written_slots(ref_kv_buffer_rope_dquant),
             gather_written_slots(kv_buffer_rope_dquant),
             atol=1e-1,
             rtol=1e-1,
             tol_err_ratio=0.05,
+            max_err_ratio=0.05,
             msg="NVFP4 kv_buffer rope dequant",
         )
     elif shuffled_kv_cache:
