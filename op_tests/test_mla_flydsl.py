@@ -46,9 +46,6 @@ QK_HEAD_DIM = QK_NOPE_HEAD_DIM + QK_ROPE_HEAD_DIM
 V_HEAD_DIM = QK_NOPE_HEAD_DIM
 Q_HEAD_STRIDE = 768
 
-# The page-size-1 kernel consumes all 128 Q heads in one work item. Passing 16
-# to the generic metadata planner prevents its host-side 128-to-16-head folding.
-METADATA_NUM_Q_HEADS = 16
 KV_GRANULARITY = 16
 MAX_SPLIT_PER_BATCH = 16
 
@@ -57,11 +54,11 @@ _PERF_NUM_ITERS = 101
 _PERF_NUM_WARMUP = 5
 
 
-def _allocate_metadata(batch, q_seq_len):
+def _allocate_metadata(batch, q_seq_len, num_q_heads):
     metadata_info = aiter.get_mla_metadata_info_v1(
         batch,
         q_seq_len,
-        METADATA_NUM_Q_HEADS,
+        num_q_heads,
         dtypes.fp8,
         dtypes.fp8,
         is_sparse=False,
@@ -126,12 +123,12 @@ def _build_case_ps1(batch, ctx_len, num_q_heads, q_seq_len):
         reduce_indptr,
         reduce_final_map,
         reduce_partial_map,
-    ) = _allocate_metadata(batch, q_seq_len)
+    ) = _allocate_metadata(batch, q_seq_len, num_q_heads)
     aiter.get_mla_metadata_v1(
         qo_indptr,
         kv_indptr,
         kv_last_page_lens,
-        METADATA_NUM_Q_HEADS,
+        num_q_heads,
         1,
         True,
         work_meta_data,

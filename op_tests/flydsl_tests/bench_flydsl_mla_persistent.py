@@ -25,12 +25,12 @@ Two batch shapes:
                   so short sequences leave their blocks idle.
 
 Examples:
-  python3 op_tests/test_mla_ps1_persistent_vs_asm_ps64.py
-  python3 op_tests/test_mla_ps1_persistent_vs_asm_ps64.py -q 1 2 4 -b 4 -c 2048 4096
-  python3 op_tests/test_mla_ps1_persistent_vs_asm_ps64.py -n 128 -q 1 -b 4 -c 2048 4096
-  python3 op_tests/test_mla_ps1_persistent_vs_asm_ps64.py -n 32 64 -q 1 --scales poc
-  python3 op_tests/test_mla_ps1_persistent_vs_asm_ps64.py -b 32 -c 8192 --varlen
-  python3 op_tests/test_mla_ps1_persistent_vs_asm_ps64.py --varlen --varlen-min-ratio 0.1
+  python3 op_tests/flydsl_tests/bench_flydsl_mla_persistent.py
+  python3 op_tests/flydsl_tests/bench_flydsl_mla_persistent.py -q 1 2 4 -b 4 -c 2048 4096
+  python3 op_tests/flydsl_tests/bench_flydsl_mla_persistent.py -n 128 -q 1 -b 4 -c 2048 4096
+  python3 op_tests/flydsl_tests/bench_flydsl_mla_persistent.py -n 32 64 -q 1 --scales poc
+  python3 op_tests/flydsl_tests/bench_flydsl_mla_persistent.py -b 32 -c 8192 --varlen
+  python3 op_tests/flydsl_tests/bench_flydsl_mla_persistent.py --varlen --varlen-min-ratio 0.1
 """
 
 import argparse
@@ -71,10 +71,9 @@ PS64_PAGE_SIZE = 64
 # buffers.
 PS64_Q_HEAD_STRIDE = 768
 
-# Planner head count is always 16: the page-size-1 kernel eats the full
-# nhead (16 or 128) inside one work item, and passing 128 would trigger the
-# host-side 128-to-16-head fold that this kernel does not consume.
-METADATA_NUM_Q_HEADS = 16
+# Planner uses the real Q head count. gfx1250 + AITER_MLA_DECODE_PS1_FLYDSL=1
+# treats 32/64/128 (q=1) as native so it does not fold them into 16-head
+# pseudo-batches the FlyDSL kernel cannot consume.
 KV_GRANULARITY = 16
 MAX_SPLIT_PER_BATCH = 16
 
@@ -271,11 +270,11 @@ def _prefix_sum(values, device):
     return out
 
 
-def _allocate_ps1_metadata(batch, q_seq_len):
+def _allocate_ps1_metadata(batch, q_seq_len, nhead):
     metadata_info = aiter.get_mla_metadata_info_v1(
         batch,
         q_seq_len,
-        METADATA_NUM_Q_HEADS,
+        nhead,
         dtypes.fp8,
         dtypes.fp8,
         is_sparse=False,
@@ -288,7 +287,7 @@ def _allocate_ps1_metadata(batch, q_seq_len):
     ]
 
 
-def _build_ps1_metadata(seq_lens, q_seq_len):
+def _build_ps1_metadata(seq_lens, q_seq_len, nhead):
     """Plan the persistent work queue.
 
     At page_size=1 the planner's kv_indptr is token-level, so the ragged
@@ -308,13 +307,13 @@ def _build_ps1_metadata(seq_lens, q_seq_len):
         reduce_indptr,
         reduce_final_map,
         reduce_partial_map,
-    ) = _allocate_ps1_metadata(batch, q_seq_len)
+    ) = _allocate_ps1_metadata(batch, q_seq_len, nhead)
 
     aiter.get_mla_metadata_v1(
         qo_indptr,
         kv_indptr,
         kv_last_page_lens,
-        METADATA_NUM_Q_HEADS,
+        nhead,
         1,
         True,
         work_meta_data,
@@ -336,31 +335,21 @@ def _build_ps1_metadata(seq_lens, q_seq_len):
 
     num_works = int(work_indptr[-1].item())
     work_info = work_info_set[:num_works]
-    partial_locations = work_info[:, 1]
     if bool((work_info[:, 3] - work_info[:, 2] != q_seq_len).any()):
         raise RuntimeError(
             "page-size-1 comparison requires one full query tile per work item"
         )
 
-    # True max_t(n_splits). The FlyDSL reduce compiles its unroll to this, so an
-    # over-estimate would cost masked gathers on every tile.
-    tile_widths = reduce_indptr[1:] - reduce_indptr[:-1]
-
     return {
         "work_meta_data": work_meta_data,
         "work_indptr": work_indptr,
         "work_info_set": work_info_set,
-        "work_info": work_info,
         "kv_indptr_ps1": kv_indptr,
         "kv_last_page_lens_ps1": kv_last_page_lens,
         "reduce_indptr": reduce_indptr,
         "reduce_final_map": reduce_final_map,
         "reduce_partial_map": reduce_partial_map,
         "num_works": num_works,
-        # Work items the planner left whole carry partial_qo_loc == -1 and write
-        # straight to the final output, so clamp before sizing the partials.
-        "num_partials": max(int(partial_locations.max().item()), 0) + q_seq_len,
-        "max_splits": int(tile_widths.max().item()),
     }
 
 
@@ -421,7 +410,7 @@ def _build_case(seq_lens, num_splits, q_seq_len, nhead, scale_mode="unit"):
     case["q_scale"] = q_scale
     case["kv_scale"] = kv_scale
     case["scale_mode"] = scale_mode
-    case.update(_build_ps1_metadata(seq_lens, q_seq_len))
+    case.update(_build_ps1_metadata(seq_lens, q_seq_len, nhead))
     return case
 
 
@@ -568,32 +557,6 @@ def test_ps1_persistent_vs_asm_ps64(
         "asm_ps64": (run_asm, asm_output),
     }
 
-    total_kv = case["total_kv"]
-    flops = 2 * total_kv * q_seq_len * nhead * (QK_HEAD_DIM + V_HEAD_DIM)
-    # Unique KV bytes plus the Q read; the partial traffic differs per backend so
-    # it is reported through the measured time rather than folded in here.
-    stage1_bytes = total_kv * QK_HEAD_DIM + batch * q_seq_len * nhead * QK_HEAD_DIM
-
-    # Partial traffic the merge has to stream: the fp32 [H, Dv] tile each split
-    # wrote, read back once, plus the bf16 result. This is where the persistent
-    # path and the ASM path differ most -- the planner emits far more, smaller
-    # splits than the ASM grid does.
-    partial_element_size = 4
-    ps1_reduce_bytes = (
-        case["num_partials"] * nhead * (V_HEAD_DIM * partial_element_size + 4)
-        + batch * nhead * V_HEAD_DIM * 2 * q_seq_len
-    )
-    asm_reduce_bytes = (
-        0
-        if num_splits == 1
-        else batch
-        * num_splits
-        * q_seq_len
-        * nhead
-        * (V_HEAD_DIM * partial_element_size + 4)
-        + batch * q_seq_len * nhead * V_HEAD_DIM * 2
-    )
-
     ret = {
         "scales": scales,
         "nhead": nhead,
@@ -601,20 +564,14 @@ def test_ps1_persistent_vs_asm_ps64(
         "varlen": varlen,
         "min_ctx": min(seq_lens),
         "max_ctx": max(seq_lens),
-        "total_kv": total_kv,
+        "total_kv": case["total_kv"],
         "ps1_num_works": case["num_works"],
-        "ps1_num_partials": case["num_partials"],
-        "ps1_max_splits": case["max_splits"],
     }
 
     for name, (run_decode, output) in backends.items():
-        is_asm = name == "asm_ps64"
         _, total_us = run_perftest(
             run_decode, num_iters=num_iters, num_warmup=num_warmup
         )
-        # mla_decode_fwd fuses stage-1 and reduce; keep column names for tables.
-        stage1_us = total_us
-        reduce_us = 0.0
 
         assert torch.isfinite(output).all(), f"{name}: non-finite output"
         err = checkAllclose(
@@ -627,15 +584,7 @@ def test_ps1_persistent_vs_asm_ps64(
         )
         assert err <= 0.05, f"{name}: mismatch ratio {err:.2%} exceeds 5%"
 
-        reduce_bytes = asm_reduce_bytes if is_asm else ps1_reduce_bytes
-        ret[f"{name} stage1 us"] = stage1_us
-        ret[f"{name} reduce us"] = reduce_us
         ret[f"{name} total us"] = total_us
-        ret[f"{name} TFLOPS"] = flops / total_us / 1e6
-        ret[f"{name} stage1 TB/s"] = stage1_bytes / stage1_us / 1e6
-        ret[f"{name} reduce TB/s"] = (
-            reduce_bytes / reduce_us / 1e6 if reduce_us else 0.0
-        )
         ret[f"{name} err"] = err
 
     ret["speedup ps1/asm"] = (

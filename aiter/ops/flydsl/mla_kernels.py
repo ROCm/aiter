@@ -180,6 +180,7 @@ def flydsl_mla_pagesize1_fp8_fp8(
         ptr_arg(kv_scale, fx.Float32),
         softmax_scale,
         kv_buffer.size(0),
+        kv_page_indices.numel(),
         num_q_heads,
         max_seqlen_q,
         causal,

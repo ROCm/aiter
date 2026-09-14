@@ -106,6 +106,7 @@ def launch_mla_pagesize1_fp8_fp8(
     kv_scale: fx.Pointer,
     softmax_scale: fx.Float32,
     num_pages: fx.Int32,
+    num_page_indices: fx.Int32,
     num_q_heads: fx.Constexpr[int],
     max_seqlen_q: fx.Constexpr[int],
     causal: fx.Constexpr[int],
@@ -161,6 +162,7 @@ def launch_mla_pagesize1_fp8_fp8(
         kv_scale: fx.Pointer,
         softmax_scale: fx.Float32,
         num_pages: fx.Int32,
+        num_page_indices: fx.Int32,
     ):
         """Persistent stage-1 MLA kernel for one-token KV pages."""
         fm_no_inf = (
@@ -218,7 +220,7 @@ def launch_mla_pagesize1_fp8_fp8(
 
         kv_pages = fx.Tensor(fx.make_view(ptr_kv, fx.make_layout(QK_HEAD_DIM, 1)))
         page_indices_rsrc = ptr_rsrc(
-            kv_page_indices, num_records_bytes=fx.Int64(num_pages) * 4
+            kv_page_indices, num_records_bytes=fx.Int64(num_page_indices) * 4
         )
 
         tid = fx.thread_idx.x
@@ -916,6 +918,7 @@ def launch_mla_pagesize1_fp8_fp8(
         kv_scale,
         softmax_scale,
         num_pages,
+        num_page_indices,
     ).launch(
         grid=(num_cus, 1, 1),
         block=(BLOCK_THREADS, 1, 1),
