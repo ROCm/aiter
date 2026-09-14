@@ -16,6 +16,7 @@ from aiter.ops.triton._triton_kernels.gemm.basic.gemm_afp8wfp8 import (
     _get_config,
 )
 from aiter.ops.triton.utils._triton.arch_info import get_arch
+from aiter.ops.triton.utils.device_info import get_num_xcds
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 
 _LOGGER = AiterTritonLogger()
@@ -168,6 +169,7 @@ def gemm_afp8wfp8(
         w_scales.stride(1),
         A_SCALE_K_GROUP=x_scale_group_size,
         **config,
+        NUM_XCDS=get_num_xcds(),
     )
 
     if config["NUM_KSPLIT"] > 1:
@@ -438,6 +440,7 @@ def gemm_afp8wfp8_preshuffle(
             w_scales.stride(1),
             A_SCALE_K_GROUP=x_scale_group_size,
             **config,
+            NUM_XCDS=get_num_xcds(),
         )
 
     if config["NUM_KSPLIT"] > 1:

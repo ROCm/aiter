@@ -67,6 +67,7 @@ def _gemm_afp8wfp8_kernel(
     waves_per_eu: tl.constexpr,
     matrix_instr_nonkdim: tl.constexpr,
     cache_modifier: tl.constexpr,
+    NUM_XCDS: tl.constexpr,
 ):
     """
     Kernel for computing the matmul C = A x B.
@@ -105,7 +106,7 @@ def _gemm_afp8wfp8_kernel(
     num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
 
     if NUM_KSPLIT == 1:
-        pid = remap_xcd(pid, GRID_MN, NUM_XCDS=8)
+        pid = remap_xcd(pid, GRID_MN, NUM_XCDS=NUM_XCDS)
         pid_m, pid_n = pid_grid(pid, num_pid_m, num_pid_n, GROUP_SIZE_M=GROUP_SIZE_M)
     else:
         pid_m = pid // num_pid_n
@@ -291,6 +292,7 @@ def _gemm_afp8wfp8_preshuffle_kernel(
     waves_per_eu: tl.constexpr,
     matrix_instr_nonkdim: tl.constexpr,
     cache_modifier: tl.constexpr,
+    NUM_XCDS: tl.constexpr,
 ):
     """
     Preshuffle variant of _gemm_afp8wfp8_kernel. Weight tensor has been shuffled
@@ -323,7 +325,7 @@ def _gemm_afp8wfp8_preshuffle_kernel(
     num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
 
     if NUM_KSPLIT == 1:
-        pid = remap_xcd(pid, GRID_MN, NUM_XCDS=8)
+        pid = remap_xcd(pid, GRID_MN, NUM_XCDS=NUM_XCDS)
         pid_m, pid_n = pid_grid(pid, num_pid_m, num_pid_n, GROUP_SIZE_M=GROUP_SIZE_M)
     else:
         pid_m = pid // num_pid_n

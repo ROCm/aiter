@@ -90,12 +90,15 @@ def _fwd_grouped_kernel_stage1_rope(
     logit_cap: tl.constexpr,
     USE_ROPE: tl.constexpr,
     IS_NEOX_STYLE: tl.constexpr,
+    NUM_XCDS: tl.constexpr,
 ):
     pid = tl.program_id(0)
     num_q_head_blk = tl.cdiv(q_head_num, BLOCK_H)
 
     pid_head_kv_split = pid % (num_q_head_blk * NUM_KV_SPLITS)
-    pid_head_kv_split = remap_xcd(pid_head_kv_split, (num_q_head_blk * NUM_KV_SPLITS))
+    pid_head_kv_split = remap_xcd(
+        pid_head_kv_split, (num_q_head_blk * NUM_KV_SPLITS), NUM_XCDS=NUM_XCDS
+    )
 
     cur_head_id = pid_head_kv_split % num_q_head_blk
     split_kv_id = (pid_head_kv_split // num_q_head_blk) % NUM_KV_SPLITS
@@ -352,10 +355,11 @@ def _fwd_kernel_stage2(
     Lv: tl.constexpr,
     batch: tl.constexpr,
     head_num: tl.constexpr,
+    NUM_XCDS: tl.constexpr,
 ):
     pid = tl.program_id(0)
 
-    pid = remap_xcd(pid, batch * head_num)
+    pid = remap_xcd(pid, batch * head_num, NUM_XCDS=NUM_XCDS)
     cur_batch = pid % batch
     cur_head = (pid // batch) % head_num
 

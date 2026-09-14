@@ -167,6 +167,7 @@ def gemm_a8w8(
         y.stride(1) if config["NUM_KSPLIT"] == 1 else y_pp.stride(2),
         (bias is not None) and (config["NUM_KSPLIT"] == 1),
         **config,
+        NUM_XCDS=get_num_xcds(),
     )
 
     if config["NUM_KSPLIT"] > 1:
