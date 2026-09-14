@@ -461,6 +461,7 @@ def compile_mixed_moe_gemm1_common(
 
         def _emit_moe_gemm1(
             arg_out: fx.Pointer,
+            arg_shared_out: fx.Pointer,
             arg_x: fx.Pointer,
             arg_shared_x: fx.Pointer,
             arg_w: fx.Pointer,
@@ -569,6 +570,8 @@ def compile_mixed_moe_gemm1_common(
                         // tile_n_idx
                         // two
                     )
+                if const_expr(latent_heterogeneous):
+                    grid_x = arith.constant(shared_inter_dim // tile_n, index=True)
                 persist_m_idx = arith.constant(persist_m, index=True)
                 grid_y = (size_expert_ids_in + persist_m_idx - one) // persist_m_idx
                 linear_id = bx_persist * grid_x + by
@@ -2953,7 +2956,9 @@ def compile_mixed_moe_gemm1_common(
                                     arith.index_cast(
                                         T.i64, fx.ptrtoint(arg_num_valid_ids)
                                     ),
-                                    arith.index_cast(T.i64, fx.ptrtoint(arg_out)),
+                                    arith.index_cast(
+                                        T.i64, fx.ptrtoint(arg_shared_out)
+                                    ),
                                     arith.index_cast(T.i32, shared_tile),
                                     arith.index_cast(T.i32, tx % arith.index(64)),
                                     arith.index_cast(T.i32, tx // arith.index(64)),
@@ -3025,6 +3030,7 @@ def compile_mixed_moe_gemm1_common(
         @flyc.kernel(name=module_name, known_block_size=[total_threads, 1, 1])
         def moe_gemm1(
             arg_out: fx.Pointer,
+            arg_shared_out: fx.Pointer,
             arg_x: fx.Pointer,
             arg_shared_x: fx.Pointer,
             arg_w: fx.Pointer,
@@ -3050,6 +3056,7 @@ def compile_mixed_moe_gemm1_common(
         ):
             _emit_moe_gemm1(
                 arg_out,
+                arg_shared_out,
                 arg_x,
                 arg_shared_x,
                 arg_w,
@@ -3103,6 +3110,7 @@ def compile_mixed_moe_gemm1_common(
         ):
             _emit_moe_gemm1(
                 arg_out,
+                arg_out,
                 arg_x,
                 arg_x,
                 arg_w,
@@ -3153,6 +3161,7 @@ def compile_mixed_moe_gemm1_common(
             f32_swiglu_limit: fx.Float32,
         ):
             _emit_moe_gemm1(
+                arg_out,
                 arg_out,
                 arg_x,
                 arg_x,
@@ -3206,6 +3215,7 @@ def compile_mixed_moe_gemm1_common(
 
     def _launch_mixed_moe_gemm1(
         arg_out: fx.Pointer,
+        arg_shared_out: fx.Pointer,
         arg_x: fx.Pointer,
         arg_shared_x: fx.Pointer,
         arg_w: fx.Pointer,
@@ -3266,6 +3276,7 @@ def compile_mixed_moe_gemm1_common(
         if const_expr(latent_heterogeneous):
             launcher = moe_gemm1(
                 arg_out,
+                arg_shared_out,
                 arg_x,
                 arg_shared_x,
                 arg_w,
@@ -3351,6 +3362,7 @@ def compile_mixed_moe_gemm1_common(
         @flyc.jit
         def launch_mixed_moe_gemm1(
             arg_out: fx.Pointer,
+            arg_shared_out: fx.Pointer,
             arg_x: fx.Pointer,
             arg_shared_x: fx.Pointer,
             arg_w: fx.Pointer,
@@ -3377,6 +3389,7 @@ def compile_mixed_moe_gemm1_common(
         ):
             _launch_mixed_moe_gemm1(
                 arg_out,
+                arg_shared_out,
                 arg_x,
                 arg_shared_x,
                 arg_w,
@@ -3432,6 +3445,7 @@ def compile_mixed_moe_gemm1_common(
         ):
             _launch_mixed_moe_gemm1(
                 arg_out,
+                arg_out,
                 arg_x,
                 arg_x,
                 arg_w,
@@ -3484,6 +3498,7 @@ def compile_mixed_moe_gemm1_common(
             stream: fx.Stream,
         ):
             _launch_mixed_moe_gemm1(
+                arg_out,
                 arg_out,
                 arg_x,
                 arg_x,
@@ -3791,6 +3806,7 @@ def compile_mixed_moe_gemm2_common(
             arg_out: fx.Pointer,
             arg_shared_out: fx.Pointer,
             arg_x: fx.Pointer,
+            arg_shared_x: fx.Pointer,
             arg_w: fx.Pointer,
             arg_scale_x: fx.Pointer,
             arg_scale_w: fx.Pointer,
@@ -3874,6 +3890,8 @@ def compile_mixed_moe_gemm2_common(
                 tile_n_idx = arith.constant(tile_n, index=True)
                 model_pad_idx = arith.constant(model_dim_pad, index=True)
                 grid_x = (n_in - model_pad_idx + tile_n_idx - one) // tile_n_idx
+                if const_expr(latent_heterogeneous):
+                    grid_x = arith.constant(shared_model_dim // tile_n, index=True)
                 if const_expr(persistent):
                     grid_y = arith.constant(cu_num, index=True)
                 else:
@@ -5427,7 +5445,7 @@ def compile_mixed_moe_gemm2_common(
                             )
                             _gemm2_body_a16w4(
                                 lds_x,
-                                arith.index_cast(T.i64, fx.ptrtoint(arg_x)),
+                                arith.index_cast(T.i64, fx.ptrtoint(arg_shared_x)),
                                 arith.index_cast(T.i64, fx.ptrtoint(arg_shared_w)),
                                 arith.index_cast(
                                     T.i64, fx.ptrtoint(arg_shared_scale_w)
@@ -5509,7 +5527,7 @@ def compile_mixed_moe_gemm2_common(
                     is_shared_expert = (
                         fx.Int32(expert_i32) == fx.Int32(shared_expert_id)
                     ).ir_value()
-                if const_expr(persistent):
+                if const_expr(persistent or latent_heterogeneous):
                     expert_b_base = expert_idx * arith.constant(
                         expert_b_stride, index=True
                     )
@@ -5576,6 +5594,7 @@ def compile_mixed_moe_gemm2_common(
             arg_out: fx.Pointer,
             arg_shared_out: fx.Pointer,
             arg_x: fx.Pointer,
+            arg_shared_x: fx.Pointer,
             arg_w: fx.Pointer,
             arg_scale_x: fx.Pointer,
             arg_scale_w: fx.Pointer,
@@ -5595,6 +5614,7 @@ def compile_mixed_moe_gemm2_common(
                 arg_out,
                 arg_shared_out,
                 arg_x,
+                arg_shared_x,
                 arg_w,
                 arg_scale_x,
                 arg_scale_w,
@@ -5638,6 +5658,7 @@ def compile_mixed_moe_gemm2_common(
                 arg_out,
                 arg_out,
                 arg_x,
+                arg_x,
                 arg_w,
                 arg_scale_x,
                 arg_scale_w,
@@ -5678,6 +5699,7 @@ def compile_mixed_moe_gemm2_common(
             _emit_moe_gemm2(
                 arg_out,
                 arg_out,
+                arg_x,
                 arg_x,
                 arg_w,
                 arg_scale_x,
@@ -5724,6 +5746,7 @@ def compile_mixed_moe_gemm2_common(
         arg_out: fx.Pointer,
         arg_shared_out: fx.Pointer,
         arg_x: fx.Pointer,
+        arg_shared_x: fx.Pointer,
         arg_w: fx.Pointer,
         arg_scale_x: fx.Pointer,
         arg_scale_w: fx.Pointer,
@@ -5769,6 +5792,7 @@ def compile_mixed_moe_gemm2_common(
                 arg_out,
                 arg_shared_out,
                 arg_x,
+                arg_shared_x,
                 arg_w,
                 arg_scale_x,
                 arg_scale_w,
@@ -5840,6 +5864,7 @@ def compile_mixed_moe_gemm2_common(
             arg_out: fx.Pointer,
             arg_shared_out: fx.Pointer,
             arg_x: fx.Pointer,
+            arg_shared_x: fx.Pointer,
             arg_w: fx.Pointer,
             arg_scale_x: fx.Pointer,
             arg_scale_w: fx.Pointer,
@@ -5860,6 +5885,7 @@ def compile_mixed_moe_gemm2_common(
                 arg_out,
                 arg_shared_out,
                 arg_x,
+                arg_shared_x,
                 arg_w,
                 arg_scale_x,
                 arg_scale_w,
@@ -5905,6 +5931,7 @@ def compile_mixed_moe_gemm2_common(
                 arg_out,
                 arg_out,
                 arg_x,
+                arg_x,
                 arg_w,
                 arg_scale_x,
                 arg_scale_w,
@@ -5947,6 +5974,7 @@ def compile_mixed_moe_gemm2_common(
             _launch_mixed_moe_gemm2(
                 arg_out,
                 arg_out,
+                arg_x,
                 arg_x,
                 arg_w,
                 arg_scale_x,

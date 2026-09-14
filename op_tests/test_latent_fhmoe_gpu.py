@@ -271,7 +271,10 @@ def test_k3_latent_fhmoe_exact_dimensions(
         with torch.cuda.graph(graph):
             routed_actual, shared_actual = latent_fhmoe(*args)
         topk_ids.copy_(
-            torch.arange(m * topk, dtype=torch.int32, device=device).reshape(m, topk)
+            (
+                torch.arange(m * topk, dtype=torch.int32, device=device)
+                * (experts // (m * topk))
+            ).reshape(m, topk)
         )
         scratch = torch.empty(128 * 1024 * 1024, dtype=torch.uint8, device=device)
         scratch.fill_(0xA5)

@@ -40,6 +40,7 @@ class _LatentFHMoEWorkspace:
     routed_a: torch.Tensor
     routed_a_scale: torch.Tensor
     inter_storage: torch.Tensor
+    shared_inter: torch.Tensor
     routed_inter_scale: torch.Tensor
     routed_output: torch.Tensor
     shared_output: torch.Tensor
@@ -100,6 +101,9 @@ def _get_workspace(
             ),
             inter_storage=torch.empty(
                 (max_sorted, 1536), dtype=torch.uint8, device=device
+            ),
+            shared_inter=torch.empty(
+                (m * total_topk, 768), dtype=torch.bfloat16, device=device
             ),
             routed_inter_scale=torch.empty(
                 scale_rows * 16, dtype=torch.uint8, device=device
@@ -200,6 +204,7 @@ def run_latent_fhmoe(
         block_m,
         None,
         None,
+        last_expert_after=routed_experts // 4,
     )
 
     routed_a = workspace.routed_a
@@ -217,6 +222,7 @@ def run_latent_fhmoe(
     )
 
     inter_storage = workspace.inter_storage
+    shared_inter = workspace.shared_inter
     routed_inter_scale = workspace.routed_inter_scale
     empty_u8 = workspace.empty_u8
     empty_f32 = workspace.empty_f32
@@ -227,6 +233,7 @@ def run_latent_fhmoe(
         stage1,
         (
             ptr_arg(inter_storage),
+            ptr_arg(shared_inter),
             ptr_arg(routed_a),
             ptr_arg(shared_input),
             ptr_arg(routed_w1),
@@ -265,6 +272,7 @@ def run_latent_fhmoe(
             ptr_arg(routed_output),
             ptr_arg(shared_output),
             ptr_arg(inter_storage),
+            ptr_arg(shared_inter),
             ptr_arg(routed_w2),
             ptr_arg(routed_inter_scale.view(dtypes.fp8_e8m0)),
             ptr_arg(routed_w2_scale),

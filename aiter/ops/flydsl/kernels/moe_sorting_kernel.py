@@ -229,6 +229,7 @@ def _compile_moe_sorting_oneshot(
     unit_size: int = UNIT_SIZE,
     has_mask: bool = False,
     has_local_tokens: bool = False,
+    last_expert_after: int | None = None,
 ):
     """Compile the oneshot MoE sorting kernel (single kernel, all phases in LDS).
 
@@ -400,8 +401,6 @@ def _compile_moe_sorting_oneshot(
             lane_group_id = tid // c_lane_group_sz
             lane_group_os = tid % c_lane_group_sz
             width8_i32 = fx.Int32(8)
-
-            is_t0 = tid == c_zero_i32
 
             # Initialize cumsum[0] = 0.  All threads write 0 so there's no
             # read-modify-write race across waves.
@@ -588,6 +587,15 @@ def _compile_moe_sorting_oneshot(
 
             # Write sorted_expert_ids — predicated stores to buffer (safe: buffer_store ignores OOB)
             # EP: use cumdup[eid] as local expert index instead of global eid
+            last_expert_count = c_zero_i32
+            last_expert_insert = c_zero_i32
+            if last_expert_after is not None:
+                last_expert_count = _lds_load_raw(
+                    cumsum_mr, c_E
+                ) - _lds_load_raw(cumsum_mr, c_E - c_one_i32)
+                last_expert_insert = _lds_load_raw(
+                    cumsum_mr, fx.Int32(last_expert_after)
+                )
             for i_eid in range_constexpr(0, E, ONESHOT_BLOCK):
                 eid_wr = fx.Int32(i_eid) + tid
                 eid_wr_valid = eid_wr < c_E
@@ -597,6 +605,23 @@ def _compile_moe_sorting_oneshot(
                 e_end = eid_wr_valid.select(
                     _lds_load_raw(cumsum_mr, safe_eid_wr + c_one_i32), e_start
                 )
+                if last_expert_after is not None:
+                    is_last_expert = eid_wr_valid & (
+                        eid_wr == c_E - c_one_i32
+                    )
+                    is_after_insert = eid_wr_valid & (
+                        eid_wr >= fx.Int32(last_expert_after)
+                    ) & (eid_wr != c_E - c_one_i32)
+                    e_start = is_last_expert.select(
+                        last_expert_insert,
+                        is_after_insert.select(
+                            e_start + last_expert_count, e_start
+                        ),
+                    )
+                    e_end = is_last_expert.select(
+                        last_expert_insert + last_expert_count,
+                        is_after_insert.select(e_end + last_expert_count, e_end),
+                    )
                 local_eid = _lds_load_raw(cumdup_mr, safe_eid_wr)
 
                 # Store cumdup: reuse cumdup for scatter phase position tracking.
@@ -643,7 +668,10 @@ def _compile_moe_sorting_oneshot(
                     sc_mask_val = _gld(mask_it, eid_sc_valid.select(eid_sc, c_zero_i32))
                     sc_expert_enabled = eid_sc_valid & (sc_mask_val != c_zero_i32)
 
-                position = _lds_load_raw(cumsum_mr, safe_eid_sc)
+                position = _lds_load_raw(
+                    cumdup_mr if last_expert_after is not None else cumsum_mr,
+                    safe_eid_sc,
+                )
 
                 for i_sub2 in range_constexpr(0, sub_tokens, 8):
                     # This lane handles sub_token (i_sub2 + lane_group_os).
@@ -1817,12 +1845,20 @@ def compile_moe_sorting(
     has_mask=False,
     has_local_tokens=False,
     k4_block=256,
+    last_expert_after=None,
 ):
     """Compile MoE sorting kernels for all paths (oneshot + multiphase).
 
     Returns (launch_oneshot, launch_p0v2_p23, launch_4k_fused) covering all T ranges.
     Oneshot compilation depends on max_tokens (LDS sizing); multiphase is independent.
     """
+    if last_expert_after is not None and not (
+        0 <= last_expert_after < num_experts - 1
+    ):
+        raise ValueError(
+            "last_expert_after must identify a routed-expert boundary in "
+            f"[0, {num_experts - 1}), got {last_expert_after}"
+        )
     launch_oneshot = _compile_moe_sorting_oneshot(
         num_experts=num_experts,
         topk=topk,
@@ -1830,6 +1866,7 @@ def compile_moe_sorting(
         unit_size=unit_size,
         has_mask=has_mask,
         has_local_tokens=has_local_tokens,
+        last_expert_after=last_expert_after,
     )
     _, _, _, _, _, launch_p0v2_p23, launch_4k_fused = _compile_moe_sorting_multiphase(
         num_experts=num_experts,
@@ -1855,6 +1892,7 @@ def moe_sorting_flydsl(
     expert_mask=None,
     num_local_tokens=None,
     workspace=None,
+    last_expert_after=None,
 ):
     """MoE sorting using FlyDSL kernel (oneshot + multiphase paths).
 
@@ -1954,6 +1992,7 @@ def moe_sorting_flydsl(
             unit_size=unit_size,
             has_mask=has_mask,
             has_local_tokens=has_local_tokens,
+            last_expert_after=last_expert_after,
         )
         oneshot_args = (
             topk_ids,
@@ -1975,6 +2014,11 @@ def moe_sorting_flydsl(
             fx.Stream(torch.cuda.current_stream(device)),
         )
     else:
+        if last_expert_after is not None:
+            raise ValueError(
+                "last_expert_after is currently supported only by the "
+                f"oneshot sorter (got M={M}, limit={min(sub_tokens, ONESHOT_MAX_T)})"
+            )
         mesh_stride = ((M + unit_size - 1) // unit_size) * unit_size
         ws_mesh_bytes = num_experts * mesh_stride
         ws_mesh_i32 = (ws_mesh_bytes + 3) // 4

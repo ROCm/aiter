@@ -28,6 +28,8 @@ def flydsl_moe_sorting_fwd(
     unit_size,
     expert_mask=None,
     num_local_tokens=None,
+    *,
+    last_expert_after=None,
 ):
     from .kernels.moe_sorting_kernel import (
         moe_sorting_flydsl,
@@ -61,4 +63,5 @@ def flydsl_moe_sorting_fwd(
         expert_mask,
         num_local_tokens,
         workspace,
+        last_expert_after,
     )
