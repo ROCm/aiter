@@ -1,16 +1,20 @@
 # Copyright (C) 2023-2026, Songlin Yang, Yu Zhang
 
+import argparse
 import importlib
+import itertools
 import os
 
 os.environ.setdefault("AITER_TRITON_ONLY", "1")
 os.environ.setdefault("AITER_USE_SYSTEM_TRITON", "1")
 
+import pandas as pd
 import pytest
 import torch
 import torch.nn.functional as F
 from einops import rearrange, repeat
 
+import aiter
 from aiter.ops.chunk_gated_delta_rule_fwd_h import (
     chunk_gated_delta_rule_fwd_h_hip_fn,
 )
@@ -40,6 +44,30 @@ from aiter.ops.triton.gated_delta_net import (
     chunk_gated_delta_rule_opt_vk,
     fused_recurrent_gated_delta_rule,
 )
+from aiter.test_common import benchmark, checkAllclose, run_perftest
+
+SUPPORTED_GFX = ("gfx942", "gfx950", "gfx1200", "gfx1201", "gfx1250")
+
+
+def _get_gfx() -> str:
+    if not torch.cuda.is_available():
+        return "unavailable"
+    props = torch.cuda.get_device_properties(torch.cuda.current_device())
+    return getattr(props, "gcnArchName", "").split(":")[0]
+
+
+def _str2dtype(value: str) -> torch.dtype:
+    try:
+        return {"fp16": torch.float16, "bf16": torch.bfloat16}[value.lower()]
+    except KeyError as exc:
+        raise argparse.ArgumentTypeError(f"unsupported dtype {value!r}") from exc
+
+
+def _str2tuple(value: str) -> tuple[int, ...]:
+    try:
+        return tuple(int(part) for part in value.strip("()").split(",") if part)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(f"invalid shape {value!r}") from exc
 
 
 def _is_gfx12_runtime() -> bool:
@@ -1915,5 +1943,160 @@ def test_chunk_opt_vk_unsupported_gfx12_downgrades_to_triton(monkeypatch):
     assert triton_called
 
 
+@benchmark()
+def test_fused_recurrent_benchmark(
+    batch: int = 1,
+    seqlen: int = 1,
+    q_heads: int = 1,
+    v_heads: int = 1,
+    head_dim: int = 64,
+    dtype: torch.dtype = torch.bfloat16,
+):
+    """Benchmark the public recurrent/decode path against its Torch recurrence."""
+    if v_heads % q_heads:
+        raise ValueError("v_heads must be divisible by q_heads")
+
+    torch.manual_seed(42)
+    q = torch.randn(
+        batch, seqlen, q_heads, head_dim, dtype=torch.float32, device=device
+    )
+    k = torch.randn(
+        batch, seqlen, q_heads, head_dim, dtype=torch.float32, device=device
+    )
+    v = torch.randn(batch, seqlen, v_heads, head_dim, dtype=dtype, device=device)
+    beta = torch.rand(batch, seqlen, v_heads, dtype=dtype, device=device).sigmoid()
+    g = F.logsigmoid(
+        torch.rand(batch, seqlen, v_heads, dtype=torch.float32, device=device)
+    )
+    initial_state = torch.randn(
+        batch, v_heads, head_dim, head_dim, dtype=torch.float32, device=device
+    )
+    scale = head_dim**-0.5
+
+    q_ref = F.normalize(
+        repeat(q, "b t h d -> b t (h g) d", g=v_heads // q_heads), p=2, dim=-1
+    ).to(dtype)
+    k_ref = F.normalize(
+        repeat(k, "b t h d -> b t (h g) d", g=v_heads // q_heads), p=2, dim=-1
+    ).to(dtype)
+    ref, ref_state = recurrent_gated_delta_rule_ref(
+        q=q_ref,
+        k=k_ref,
+        v=v,
+        beta=beta,
+        g=g,
+        scale=scale,
+        initial_state=initial_state.clone(),
+        output_final_state=True,
+    )
+
+    candidates = {
+        "triton_recurrent": lambda: fused_recurrent_gated_delta_rule(
+            q=q,
+            k=k,
+            v=v,
+            g=g,
+            beta=beta,
+            scale=scale,
+            initial_state=initial_state,
+            output_final_state=True,
+            use_qk_l2norm_in_kernel=True,
+        )
+    }
+    # Per value head/token: state decay (K*V), state@key (2*K*V),
+    # rank-one update (2*K*V), query@state (2*K*V), and residual/gating
+    # vector work (2*V). Q/K normalization adds about 6*K per Q/K head.
+    flops = (
+        batch
+        * seqlen
+        * (v_heads * (7 * head_dim * head_dim + 2 * head_dim) + q_heads * 6 * head_dim)
+    )
+    nbytes = (
+        q.nbytes
+        + k.nbytes
+        + v.nbytes
+        + beta.nbytes
+        + g.nbytes
+        + ref.nbytes
+        + 2 * initial_state.nbytes
+    )
+
+    ret = {"gfx": _get_gfx()}
+    for name, fn in candidates.items():
+        (out, final_state), us = run_perftest(fn)
+        out_err = checkAllclose(
+            ref.to(torch.float32),
+            out.to(torch.float32),
+            rtol=5e-3,
+            atol=5e-3,
+            msg=f"{name}: recurrent output",
+        )
+        state_err = checkAllclose(
+            ref_state.to(torch.float32),
+            final_state.to(torch.float32),
+            rtol=5e-3,
+            atol=5e-3,
+            msg=f"{name}: recurrent final state",
+        )
+        ret[f"{name} us"] = us
+        ret[f"{name} TFLOPS"] = flops / us / 1e6
+        ret[f"{name} TB/s"] = nbytes / us / 1e6
+        ret[f"{name} err"] = max(out_err, state_err)
+    return ret
+
+
+# The benchmark is driven by main(); pytest continues to collect the full
+# correctness/regression suite above without running the perf driver twice.
+test_fused_recurrent_benchmark.__test__ = False
+
+
+def main():
+    gfx = _get_gfx()
+    if gfx not in SUPPORTED_GFX:
+        aiter.logger.warning(
+            "fused recurrent gated delta rule unsupported on %s; skipping", gfx
+        )
+        return
+
+    parser = argparse.ArgumentParser(
+        formatter_class=argparse.RawTextHelpFormatter,
+        description="Benchmark the public fused recurrent gated delta rule",
+    )
+    parser.add_argument(
+        "-d",
+        "--dtype",
+        type=_str2dtype,
+        nargs="*",
+        default=[torch.bfloat16],
+        choices=[torch.float16, torch.bfloat16],
+    )
+    parser.add_argument("-b", "--batch", type=int, nargs="*", default=[1, 4])
+    parser.add_argument(
+        "-s",
+        "--mnk",
+        type=_str2tuple,
+        nargs="*",
+        default=[(1, 4, 8, 128), (4, 4, 8, 128)],
+        help="seqlen,q_heads,v_heads,head_dim",
+    )
+    args = parser.parse_args()
+
+    rows = []
+    for dtype, batch, shape in itertools.product(args.dtype, args.batch, args.mnk):
+        seqlen, q_heads, v_heads, head_dim = shape
+        rows.append(
+            test_fused_recurrent_benchmark(
+                batch, seqlen, q_heads, v_heads, head_dim, dtype
+            )
+        )
+    aiter.logger.info(
+        "fused recurrent gated delta rule summary (markdown):\n%s",
+        pd.DataFrame(rows).to_markdown(index=False),
+    )
+    pytest_status = pytest.main([__file__, "-v"])
+    if pytest_status != pytest.ExitCode.OK:
+        raise SystemExit(pytest_status)
+
+
 if __name__ == "__main__":
-    pytest.main([__file__, "-v"])
+    main()

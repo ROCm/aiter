@@ -374,7 +374,7 @@ def _per_1x32_mxfp4_quant(w):
 def _randn_or_const(shape, *, const_init, scale=1.0, dtype=dtypes.bf16, device="cuda"):
     """randn (scaled) by default; a constant VALUE tensor when const_init is set.
 
-    Mirrors test_flydsl_grouped_gemm_gfx1250.py's --const-init: the const path
+    Mirrors flydsl_tests/test_flydsl_grouped_gemm.py's --const-init: the const path
     fills with VALUE exactly (the ``scale`` only applies to the random path)."""
     if const_init is not None:
         return torch.full(shape, float(const_init), dtype=dtype, device=device)
@@ -439,7 +439,7 @@ def test_fmoe_ep_mxfp4(
     expert (routed or active shared), deduplicated to one buffer row per token.
     MORI returns that count as the device scalar `total_recv_t`, which ATOM
     forwards to fused_moe as `num_local_tokens` (mirrors
-    test_mega_moe_gfx1250.py's DeviceMoEPipeline._layer_step, where total_recv_t
+    bench_mega_moe.py's DeviceMoEPipeline._layer_step, where total_recv_t
     comes straight from op.dispatch and feeds moe_forward's num_local_tokens).
 
     The dispatch buffer has `trim_M` rows with the full `topk` routing dimension.
@@ -623,7 +623,7 @@ def test_fmoe_ep_mxfp4(
         # total_recv_t: device scalar matching MORI's dispatch return; fused_moe
         # gets it as num_local_tokens and processes only the first total_recv rows,
         # skipping the padded tail (mirrors DeviceMoEPipeline._layer_step in
-        # test_mega_moe_gfx1250.py, where total_recv_t from op.dispatch feeds
+        # bench_mega_moe.py, where total_recv_t from op.dispatch feeds
         # moe_forward's num_local_tokens).
         total_recv_t = torch.tensor([total_recv], dtype=dtypes.i32, device="cuda")
         num_local_tokens = total_recv_t
@@ -679,7 +679,7 @@ def test_fmoe_ep_mxfp4(
         # gugu (INTERLEAVE) stage1 layout so the EP path is routed through the
         # TDM batched GEMM (_grouped_a8w4_tdm_moe, gugu-only). gate/up are
         # row-interleaved ([g0,u0,g1,u1,...]) inside moe_shuffle_weight/scale,
-        # matching test_flydsl_grouped_gemm_gfx1250.py.
+        # matching flydsl_tests/test_flydsl_grouped_gemm.py.
         w1_a = moe_shuffle_weight(
             w1_u8, experts_cnt=total_local, is_guinterleave=True, gate_up=True
         )
@@ -809,7 +809,7 @@ def test_fmoe_ep_mxfp4(
         # The grouped a8w4 path quantizes activations to fp8, so the reference
         # (bf16 activations) differs elementwise by more than atol/rtol=5e-2
         # even without EP. Use the grouped tests' cosine criterion instead
-        # (test_flydsl_grouped_gemm_gfx1250.py: logits_diff < 0.01).
+        # (flydsl_tests/test_flydsl_grouped_gemm.py: logits_diff < 0.01).
         _logits_diff_tol = 0.01
         err = logits_diff
         _verdict = "PASSED" if logits_diff < _logits_diff_tol else "FAILED"
@@ -971,7 +971,7 @@ parser.add_argument(
     help="""initialize activations (input) and weights (w1/w2) to the constant
     VALUE instead of random values (mxfp4 EP tests only). Bare --const-init uses
     0.0 (zero-init). Routing scores stay random so expert selection is unchanged.
-    Mirrors test_flydsl_grouped_gemm_gfx1250.py --const-init.""",
+    Mirrors flydsl_tests/test_flydsl_grouped_gemm.py --const-init.""",
 )
 
 args = parser.parse_args()
