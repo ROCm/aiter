@@ -22,7 +22,7 @@ from ..jit.core import compile_ops, is_experimental_enabled
 from ..jit.utils.chip_info import get_cu_num, get_gfx
 
 try:
-    from aiter.ops.flydsl import pa_decode as _pa_decode_flydsl
+    from aiter.ops.flydsl.pa_decode import pa_decode as _pa_decode_flydsl
 except (ImportError, AttributeError, RuntimeError, OSError):
     _pa_decode_flydsl = None
 
