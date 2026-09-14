@@ -247,7 +247,11 @@ static float fmha_batch_prefill_v3(const mha_batch_prefill_args& a,
     base.ptr_k_descale    = a.k_descale_ptr;
     base.ptr_v_descale    = a.v_descale_ptr;
 
-    const int tg_div = causal ? 2 : 1;
+    // Static kernels may process one Q tile or a causal pair per workgroup.
+    // This must match the compiled kernel, independently of its mask mode.
+    const int tg_div = cfg->qtiles_per_workgroup;
+    AITER_CHECK(tg_div == 1 || (causal && tg_div == 2),
+                __func__, ": invalid qtiles_per_workgroup ", tg_div);
     const int qtiles =
         ((a.max_seqlen_q + ts_qo - 1) / ts_qo + tg_div - 1) / tg_div;
     int gdx;

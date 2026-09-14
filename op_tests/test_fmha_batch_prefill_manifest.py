@@ -49,6 +49,9 @@ def test_batch_prefill_manifest_declares_static_page_size():
         assert row["qscale"] in {"no", "pertensor"}
         assert row["abi"] in {"paged_varlen_v3_ext", "paged_varlen_v3_reuse"}
         assert row["grid_layout"] in {"qtiles_heads_batch", "heads_batch_qtiles"}
+        qtiles_per_workgroup = int(row["qtiles_per_workgroup"])
+        assert qtiles_per_workgroup in {1, 2}
+        assert qtiles_per_workgroup == 1 or int(row["mask"]) == 2
         if row["dtype"] == "fp8bf16":
             assert row["qscale"] == "pertensor"
         else:
@@ -135,6 +138,27 @@ def test_optional_page_size_column_is_codegen_compatible(tmp_path):
     assert "int page_size;" in generated
     assert "int min_seqlen_q;" in generated
     assert "int max_seqlen_q;" in generated
+    assert "int qtiles_per_workgroup;" in generated
     assert "std::string kv_layout;" in generated
     assert "static CFG cfg_fmha_fwd" in generated
     assert "static CFG cfg_fmha_batch_prefill" in generated
+
+
+@pytest.mark.parametrize(
+    "q_len,tile,pairing",
+    [(1023, 64, 1), (1024, 64, 1), (1025, 64, 2), (4096, 64, 2), (4097, 256, 2)],
+)
+def test_causal_fp8_schedule_boundaries(q_len, tile, pairing):
+    _, rows = _read_manifest(MANIFEST)
+    matches = [
+        row
+        for row in rows
+        if row["dtype"] == "fp8bf16"
+        and int(row["mask"]) == 2
+        and int(row["page_size"]) == 64
+        and int(row["min_seqlen_q"]) <= q_len
+        and (int(row["max_seqlen_q"]) == 0 or q_len <= int(row["max_seqlen_q"]))
+    ]
+    assert len(matches) == 1
+    assert int(matches[0]["ts_qo"]) == tile
+    assert int(matches[0]["qtiles_per_workgroup"]) == pairing
