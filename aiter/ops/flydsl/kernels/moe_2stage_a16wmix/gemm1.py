@@ -466,8 +466,9 @@ def compile_gemm1_a16w4_port(
 
     assert act in (
         "silu",
+        "swiglu",
         "situv2",
-    ), f"a16w4 gemm1 act must be 'silu' or 'situv2', got {act!r}"
+    ), f"a16w4 gemm1 act must be 'silu', 'swiglu', or 'situv2', got {act!r}"
     # Arch-gate K=16 (gfx942) vs K=32 (gfx950); resolved by the caller and passed in
     # (not in name_suffix -- ARCH is already in the JIT cache key).
     _use_k16 = use_k16
@@ -539,8 +540,8 @@ def compile_gemm1_a16w4_port(
                 _tile = _xcd(bx_i32)
             else:
                 _tile = bx_i32
-            # SiTUv2 runtime scalars; silu ignores them (and emits none of this).
-            if const_expr(act == "situv2"):
+            # Runtime activation scalars; plain silu ignores them.
+            if const_expr(act in ("swiglu", "situv2")):
                 _situ = situ_params(
                     fx.Float32(f32_situ_beta),
                     fx.Float32(f32_situ_beta_rcp),
