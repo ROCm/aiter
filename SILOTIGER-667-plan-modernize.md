@@ -28,7 +28,7 @@ spot-check when the hot loop or wait/reduce path changed.
 - [x] 2. Reuse `tensor_shim._run_compiled`
 - [x] 3. `atomic_add_f32` without hardcoded LLVM address space
 - [x] 4. Single definition path for `const_expr` if/else
-- [ ] 5. Buffer views + layouts for *unpacked* tensors only
+- [x] 5. Buffer views + layouts, including i64-base packed dword views
 - [x] Follow-on: preshuffled pack, still `v_dot2` (landed; not this track)
 
 ## Locked decisions
@@ -44,8 +44,9 @@ These locks apply to **this track** (subtasks 1–5).
 - **Keep ISA-level helpers.** `v_dot2_f32_bf16` inline asm, `s_nop 2` / G7
   drain, `cvt_scalef32_pk_bf16_{fp8,fp4}`, and E8M0 `shl 23` stay; there is no
   `fx.gemm` atom for `v_dot2`.
-- **Packed weight dwords stay on `buffer_ops` until subtask 5.** Offsets remain
-  in **elements** of the load dtype (`i32` / `f32` / `i8`).
+- **Packed dwords use explicit buffer views.** K-loop activation/intermediate
+  and k-contiguous weight loads keep i32 dword offsets and vec4/vec2 width.
+  Large expert pools fold the expert byte base in i64 before descriptor creation.
 - **Compile cache.** After kernel-source edits, run with
   `FLYDSL_RUNTIME_ENABLE_CACHE=0` (or clear `~/.flydsl/cache`) so a stale HSACO
   cannot mask a bad rewrite.
@@ -129,21 +130,27 @@ Only after 1–4. Move **unpacked** tensors onto `fx.rocdl.make_buffer_tensor` +
 `fx.make_view` + `fx.copy` (or a documented `buffer_ops` exception with a
 comment):
 
-- [ ] BF16 activations / intermediate / outputs
+- [x] BF16 activations / intermediate / outputs
   - [x] unpacked BF16 **outputs** (`out` / `y` stores via `ptr_buf_tensor`)
-  - [ ] K-loop activations / intermediate stay on `load_i32_words` (packed dword exception)
+  - [x] K-loop activations / intermediate use i64-base i32 views through
+        `load_i32_words` (packed dword representation preserved)
 - [x] f32 scales (pertensor / pertoken / block2d; FP8-act `x_scale`)
 - [x] MXFP4 E8M0 (`i8` / `BufferCopy8b`)
 - [x] `router_ids` (i32), `router_wts` (f32)
 
-**Keep** packed i32 weight/activation word loads (`load_i32_words`, FP8/FP4
-dwords) and `_ptr_rsrc_off` (K3 i64 expert base) on `buffer_ops` until there
-is an i64-base `make_buffer_tensor` equivalent. Do not invent a fake TV layout
-for a mandatory packed-dword swizzle.
+Packed i32 weight/activation loads now use `ptr_buf_tensor` from an i64 byte
+base. `load_i32_words` builds only the required overlapping 1/2/4-dword view
+(`unit_stride=1`) and uses `BufferCopy32b/64b/128b`; K3 large-E weights narrow
+the descriptor to one expert before the i32 voffset. Preshuffled B keeps its
+nested kpack view. No fake unpacked dtype or TV layout is introduced.
 
-- [ ] **Done when:** unpacked loads/stores go through buffer-resource views; packed
-      dword path is explicitly commented as the leftover legacy exception; op_test +
-      one FP8 and one MXFP4 bench spot-check are unchanged within noise.
+- [x] **Done when:** all production warp-decode loads/stores use buffer-resource
+      views; packed dwords preserve wide transactions and i64 expert-base safety.
+      GPU 1 cache-off gate: 100 tests passed. ISA check on FP8 gate/up preserved
+      four `buffer_load_dwordx4` instructions (no scalarization), with SGPRs
+      reduced from 32 to 24. G9 FP8/MXFP4 B=1,2 spot-check remained in the
+      established low-clock range (run sampled 94 MHz; not comparable to the
+      2.4 GHz of-record artifact).
 
 ## Non-goals (do not pull into this plan)
 
