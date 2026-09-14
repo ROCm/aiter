@@ -116,7 +116,7 @@ def _lane_striped_partition_reduce(exp_sums, max_logits, partials):
 def _parallel_lds_partition_reduce(exp_sums, max_logits, partials, sink=None):
     """Model the D=128 large-NP workgroup and its cross-wave LDS merge."""
     num_partitions = len(exp_sums)
-    parallel_groups = 2 if num_partitions <= 96 else 4
+    parallel_groups = 2 if num_partitions <= 96 else 8
     parts_per_group = (num_partitions + parallel_groups - 1) // parallel_groups
     global_max = max(max_logits)
     scaled_sums = [

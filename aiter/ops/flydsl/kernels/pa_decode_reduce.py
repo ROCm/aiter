@@ -66,15 +66,15 @@ def compile_pa_decode_ps_reduce(
     # thread walks every partition.  That is a good fit for <=1 wave of
     # partitions, but it leaves NP=160..256 as a long dependent load/FMA
     # chain.  For the decode shape used by PA (D=128), split that chain over
-    # two or four independent wave pairs.  A pair covers the two 64-element
+    # two or eight independent wave pairs.  A pair covers the two 64-element
     # halves of the output vector, while its y-coordinate selects a disjoint
     # contiguous range of partitions.
     use_parallel_lds = head_size == 128 and max_context_partition_num > warp_size
     parallel_groups = 1
     if use_parallel_lds:
-        # Four groups win from NP=128 onward on gfx950; two avoid excessive
+        # Eight groups win from NP=128 onward on gfx950; two avoid excessive
         # synchronization/thread overhead for the small >64 tail.
-        parallel_groups = 2 if max_context_partition_num <= 96 else 4
+        parallel_groups = 2 if max_context_partition_num <= 96 else 8
     head_waves = head_size // warp_size
     worker_waves = head_waves * parallel_groups
     block_shape = (
