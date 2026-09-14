@@ -29,8 +29,7 @@
         "BLOCK_K": 256,
         "NUM_BUFFERS": 3,
         "num_warps": 4,
-        "GROUP_SIZE_M": 1,
-        "kernel_type": "bandwidth_bound_large"
+        "GROUP_SIZE_M": 1
     },
     "any": {
         "BLOCK_M": 16,

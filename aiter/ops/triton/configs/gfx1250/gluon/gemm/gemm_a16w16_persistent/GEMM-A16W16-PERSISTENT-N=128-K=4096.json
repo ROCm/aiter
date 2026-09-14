@@ -31,7 +31,6 @@
         "num_warps": 4,
         "GROUP_SIZE_M": 4,
         "num_stages": 2,
-        "waves_per_eu": 2,
-        "kernel_type": "bandwidth_bound_large"
+        "waves_per_eu": 2
     }
 }
