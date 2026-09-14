@@ -153,6 +153,10 @@ def compile_pa_decode_tile(
     EARLY_V = prefetch_v and (tune_page128 or tune_page16_vpipe) and M_TILES == 1
     PAGE16_VPIPE = prefetch_v and tune_page16_vpipe and M_TILES == 1
     PAGE16_VPIPE_IGLP = PAGE16_VPIPE and prefetch_v_iglp
+    # Keep the single-M-tile softmax rewrite confined to the two opt-in
+    # MiniMax-M3 experiments.  In particular, every default/non-target kernel
+    # continues to instantiate the original instruction stream.
+    M1_SCALE_BEFORE_MASK = PAGE16_VPIPE or match_gluon_numerics
     P_BUFFERS = 2 if tune_page128 and M_TILES == 3 else 1
     # PV layout: V=A, P=B -> output [head-dim (row), query-row (col=lane16)],
     # generalized over head_dim via the VHE_CHUNKS loop.
@@ -1205,31 +1209,73 @@ def compile_pa_decode_tile(
                 thr = fx.Vector.from_elements(
                     [n_valid_tile - base_tok_f], dtype=fx.Float32
                 ).broadcast_to(4)
-                neg4 = fx.Vector.filled(4, -1e30, fx.Float32)
-                # per_token_kv: K-scale varies per token, so fold it in BEFORE the max-reduce.
+                neg4 = fx.Vector.filled(
+                    4,
+                    float("-inf") if M1_SCALE_BEFORE_MASK else -1e30,
+                    fx.Float32,
+                )
+                # The tuned path follows the M_TILES>1 numerical ordering:
+                # fold every positive score scale into finite logits before
+                # selecting -inf for invalid tokens.  This makes the reduced
+                # max directly usable by pass 2 and avoids `-inf * 0` for an
+                # all-zero Q row.  The per-token branch is retained here so
+                # this ordering stays correct if the gate is widened later.
+                scale_b = None
+                if const_expr(M1_SCALE_BEFORE_MASK):
+                    scale_b = fx.Vector.from_elements(
+                        [scale], dtype=fx.Float32
+                    ).broadcast_to(4)
                 v_scale_vecs = None
                 if const_expr(per_token_kv):
                     v_scale_vecs = []
                     scaled_frags = []
+                    masked_chunks = []
                     for a in range_constexpr(NCHUNK):
                         k_scale_vec, v_scale_vec = _load_kv_scale_vecs(a, cur_kv_buf)
                         v_scale_vecs.append(v_scale_vec)
-                        scaled_frags.append(frag_Ss[a] * k_scale_vec)
+                        scaled_frag = frag_Ss[a] * k_scale_vec
+                        if const_expr(M1_SCALE_BEFORE_MASK):
+                            scaled_frag = scaled_frag * scale_b
+                            masked_chunks.append(
+                                (_ct[a] < thr).select(scaled_frag, neg4)
+                            )
+                        else:
+                            scaled_frags.append(scaled_frag)
                 else:
-                    scaled_frags = frag_Ss
+                    if const_expr(M1_SCALE_BEFORE_MASK):
+                        masked_chunks = [
+                            (_ct[a] < thr).select(frag_Ss[a] * scale_b, neg4)
+                            for a in range_constexpr(NCHUNK)
+                        ]
+                    else:
+                        scaled_frags = frag_Ss
                 # Reused in pass 2 below, halving the mask instruction count.
-                masked_chunks = [
-                    (_ct[a] < thr).select(scaled_frags[a], neg4)
-                    for a in range_constexpr(NCHUNK)
-                ]
+                if const_expr(not M1_SCALE_BEFORE_MASK):
+                    masked_chunks = [
+                        (_ct[a] < thr).select(scaled_frags[a], neg4)
+                        for a in range_constexpr(NCHUNK)
+                    ]
                 # pass 1: per-warp max for this qhead
                 pm = fx.Float32(float("-inf"))
                 for a in range_constexpr(NCHUNK):
-                    pm = fx.maxnumf(pm, masked_chunks[a].reduce(ReductionOp.MAX))
+                    if const_expr(M1_SCALE_BEFORE_MASK):
+                        pm = fx.maxnumf(
+                            pm,
+                            masked_chunks[a].reduce(ReductionOp.MAX, fastmath=fm_nnan),
+                            fastmath=fm_nnan,
+                        )
+                    else:
+                        pm = fx.maxnumf(pm, masked_chunks[a].reduce(ReductionOp.MAX))
                 for sh in (16, 32):
-                    pm = fx.maxnumf(pm, pm.shuffle_xor(sh, WAVE))
+                    if const_expr(M1_SCALE_BEFORE_MASK):
+                        pm = fx.maxnumf(pm, pm.shuffle_xor(sh, WAVE), fastmath=fm_nnan)
+                    else:
+                        pm = fx.maxnumf(pm, pm.shuffle_xor(sh, WAVE))
                 _st_lw(
-                    sLmax_off, lane16, warp, pm * scale
+                    sLmax_off,
+                    lane16,
+                    warp,
+                    pm if const_expr(M1_SCALE_BEFORE_MASK) else pm * scale,
                 )  # redundant across the 4 lanes sharing this qhead
                 # per_token_kv: max V-scale for the per-tile fp8 normalization.
                 # Slots at/after context_len are uninitialised, so an arbitrarily
@@ -1266,22 +1312,49 @@ def compile_pa_decode_tile(
                         [norm_factor], dtype=fx.Float32
                     ).broadcast_to(4)
                 # pass 2: global max over warps -> exp -> fp8 P pack (-> sP) -> sum
-                m_new = fx.maxnumf(
-                    m_prev, _ld_lw_row(sLmax_off, lane16).reduce(ReductionOp.MAX)
-                )
+                if const_expr(M1_SCALE_BEFORE_MASK):
+                    m_new = fx.maxnumf(
+                        m_prev,
+                        _ld_lw_row(sLmax_off, lane16).reduce(
+                            ReductionOp.MAX, fastmath=fm_nnan
+                        ),
+                        fastmath=fm_nnan,
+                    )
+                else:
+                    m_new = fx.maxnumf(
+                        m_prev,
+                        _ld_lw_row(sLmax_off, lane16).reduce(ReductionOp.MAX),
+                    )
+                # Keep -inf in the loop-carried/persisted max for an empty
+                # partition, but use zero as the exponent reference so
+                # -inf-(-inf) cannot manufacture NaNs in P or the correction.
+                softmax_max = m_new
+                if const_expr(M1_SCALE_BEFORE_MASK):
+                    softmax_max = (m_new > NEG_INF).select(m_new, ZERO_F)
                 m_new_b = fx.Vector.from_elements(
-                    [m_new], dtype=fx.Float32
+                    [softmax_max], dtype=fx.Float32
                 ).broadcast_to(4)
                 ls = fx.Float32(0.0)
                 words = []
-                zero4_p = fx.Vector.filled(4, 0.0, fx.Float32)
+                if const_expr(not M1_SCALE_BEFORE_MASK):
+                    zero4_p = fx.Vector.filled(4, 0.0, fx.Float32)
                 for a in range_constexpr(NCHUNK):
-                    # re-mask Pa so a fully-masked chunk contributes exactly 0
-                    valid_a = masked_chunks[a] > fx.Vector.filled(4, -1e29, fx.Float32)
-                    Pa = valid_a.select(
-                        fx.Vector(exp2_f32_fast(masked_chunks[a] * scale - m_new_b)),
-                        zero4_p,
-                    )
+                    if const_expr(M1_SCALE_BEFORE_MASK):
+                        # Invalid lanes are -inf, hence exp2(-inf-safe_max)=0
+                        # without a second validity compare/select.
+                        Pa = fx.Vector(exp2_f32_fast(masked_chunks[a] - m_new_b))
+                    else:
+                        # Legacy path: re-mask Pa so a fully-masked chunk
+                        # contributes exactly 0.
+                        valid_a = masked_chunks[a] > fx.Vector.filled(
+                            4, -1e29, fx.Float32
+                        )
+                        Pa = valid_a.select(
+                            fx.Vector(
+                                exp2_f32_fast(masked_chunks[a] * scale - m_new_b)
+                            ),
+                            zero4_p,
+                        )
                     ls = ls + Pa.reduce(ReductionOp.ADD)
                     if const_expr(per_token_kv):
                         v_scale_this = (
@@ -1311,7 +1384,7 @@ def compile_pa_decode_tile(
                     ls = ls + ls.shuffle_xor(sh, WAVE)
                 # PV (V=A, P=B) -> output [head-dim, query-row=lane16]; same as
                 # the phase-split path.
-                corr_reg = fx.Float32(exp2_amdgcn_scalar(m_prev - m_new))
+                corr_reg = fx.Float32(exp2_amdgcn_scalar(m_prev - softmax_max))
                 if rgroup == 0:
                     _st_lw(sLsum_off, lane16, warp, ls)
                 gpu.barrier()
