@@ -70,6 +70,30 @@ def hipb_findallsols(
 def getHipblasltKernelName() -> None: ...
 
 
+@compile_ops("module_hipbsolgemm")
+def hipb_mm_out(
+    mat1: torch.Tensor,
+    mat2: torch.Tensor,
+    result: torch.Tensor,           # caller pre-allocates; written in-place
+    solution_index: int,
+    bias: torch.Tensor | None = None,
+    scaleA: torch.Tensor | None = None,
+    scaleB: torch.Tensor | None = None,
+    scaleOut: torch.Tensor | None = None,
+    bpreshuffle: bool | None = None,
+    use_gelu: bool | None = None,
+) -> None:
+    """In-place hipBLASLt GEMM — no output allocation.
+
+    Identical to hipb_mm except the caller provides a pre-allocated ``result``
+    tensor and the function returns None.  Use this in rotating-buffer harnesses
+    so the allocation cost is outside the timed window.
+
+    uint8 inputs are interpreted as packed MXFP4 (two E2M1 elements per byte,
+    HIP_R_4F_E2M1), matching the layout produced by aiter's gemm_a4w4_asm.
+    """ ...
+
+
 @compile_ops("module_rocsolgemm")
 def rocb_create_extension() -> None: ...
 

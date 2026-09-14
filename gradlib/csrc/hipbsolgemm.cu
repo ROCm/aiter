@@ -103,7 +103,12 @@ std::map<at::ScalarType, hipDataType> dtype_map{{at::kHalf, HIP_R_16F},
                                                 {at::kFloat, HIP_R_32F},
                                                 {at::kChar, HIP_R_8I},
                                                 {at::kShort, HIP_R_16I},
-                                                {at::kInt, HIP_R_32I}
+                                                {at::kInt, HIP_R_32I},
+                                                // uint8 is used as a packed-FP4 proxy: two
+                                                // MXFP4 E2M1 elements per byte. HIP_R_4F_E2M1
+                                                // tells hipBLASLt the true element type so it
+                                                // applies the correct tile layout and scale math.
+                                                {at::kByte, static_cast<hipDataType>(HIP_R_4F_E2M1)}
 #ifdef ENABLE_TORCH_FP8
                                                 ,
                                                 {at::kFloat8_e4m3fnuz, HIP_R_8F_E4M3_FNUZ},
@@ -1241,6 +1246,135 @@ torch::Tensor hipb_mm(const torch::Tensor& mat1,
     return result;
 }
 
+// In-place variant: caller pre-allocates `result` and we write into it directly.
+// This lets the benchmarking harness keep `result` in a rotating pool so the
+// allocation cost is outside the timed window — identical to how gemm_a4w4_asm
+// takes a caller-provided `out` tensor.  All stride/transpose/scale logic is
+// identical to hipb_mm; the only difference is no torch::empty call.
+void hipb_mm_out(const torch::Tensor&              mat1,
+                 const torch::Tensor&              mat2,
+                 torch::Tensor&                    result,
+                 const int                         solution_index,
+                 std::optional<torch::Tensor>      bias,
+                 std::optional<torch::Tensor>      scaleA,
+                 std::optional<torch::Tensor>      scaleB,
+                 std::optional<torch::Tensor>      scaleOut,
+                 std::optional<bool>               bpreshuffle,
+                 std::optional<bool>               use_gelu)
+{
+    bool bpreshuffle_flag = bpreshuffle.value_or(false);
+    bool use_gelu_flag    = use_gelu.value_or(false);
+
+    TORCH_CHECK(!use_gelu_flag || bias.has_value(),
+                "hipb_mm_out(use_gelu=True) requires bias");
+
+    auto mat1_strides{mat1.strides()};
+    auto mat2_strides{mat2.strides()};
+    auto mat1_sizes{mat1.sizes()};
+    auto mat2_sizes{mat2.sizes()};
+
+    TORCH_CHECK(mat1.dim() == 2 && mat2.dim() == 2, "tensors must be 2-D");
+    TORCH_CHECK(mat1_sizes[1] == mat2_sizes[0], "mat1 dim 1 must match mat2 dim 0");
+
+    auto inDtype{mat1.options().dtype().toScalarType()};
+    auto outDtype{result.options().dtype().toScalarType()};
+
+    TORCH_CHECK(result.dim() == 2
+                && result.sizes()[0] == mat1_sizes[0]
+                && result.sizes()[1] == mat2_sizes[1],
+                "result shape must be [", mat1_sizes[0], ", ", mat2_sizes[1], "]");
+
+    bool transpose_result = true;
+    bool transpose_mat1;
+    bool transpose_mat2;
+    if((mat2_strides[0] == 1) && (mat2_strides[1] >= std::max<int64_t>(1, mat2_sizes[0])))
+        transpose_mat2 = false;
+    else if((mat2_strides[1] == 1) && (mat2_strides[0] >= std::max<int64_t>(1, mat2_sizes[1])))
+        transpose_mat2 = true;
+    else
+        TORCH_CHECK(false, "unusual mat2 strides");
+
+    if((mat1_strides[0] == 1) && (mat1_strides[1] >= std::max<int64_t>(1, mat1_sizes[0])))
+        transpose_mat1 = false;
+    else if((mat1_strides[1] == 1) && (mat1_strides[0] >= std::max<int64_t>(1, mat1_sizes[1])))
+        transpose_mat1 = true;
+    else
+        TORCH_CHECK(false, "unusual mat1 strides");
+
+    if(transpose_result)
+    {
+        bool tmp       = transpose_mat1;
+        transpose_mat1 = !transpose_mat2;
+        transpose_mat2 = !tmp;
+        mat1_strides   = mat2.strides();
+        mat2_strides   = mat1.strides();
+        mat1_sizes     = mat2.sizes();
+        mat2_sizes     = mat1.sizes();
+    }
+
+    float one{1.0f};
+    float zero{0.0f};
+    int64_t m         = mat1_sizes[transpose_result ? 1 : 0];
+    int64_t k         = mat1_sizes[transpose_result ? 0 : 1];
+    int64_t n         = mat2_sizes[transpose_result ? 0 : 1];
+    int64_t mat1_ld   = mat1_strides[(transpose_mat1 == transpose_result) ? 1 : 0];
+    int64_t mat2_ld   = mat2_strides[(transpose_mat2 == transpose_result) ? 1 : 0];
+    int64_t result_ld = result.stride(transpose_result ? 0 : 1);
+
+    void *d_scaleA = nullptr, *d_scaleB = nullptr, *d_scaleOut = nullptr;
+    bool use_rowwise = false;
+
+    if(scaleA.has_value() && scaleB.has_value())
+    {
+        int64_t m_orig = mat1.sizes()[0];
+        int64_t n_orig = mat2.sizes()[1];
+        ScalingType scaling_type = get_scaling_type(scaleA.value(), scaleB.value(), m_orig, n_orig);
+        if(scaling_type == ScalingType::RowWise)
+            use_rowwise = true;
+        d_scaleA = static_cast<void*>(scaleA.value().data_ptr());
+        d_scaleB = static_cast<void*>(scaleB.value().data_ptr());
+    }
+    else
+    {
+        if(scaleA.has_value()) d_scaleA = static_cast<void*>(scaleA.value().data_ptr());
+        if(scaleB.has_value()) d_scaleB = static_cast<void*>(scaleB.value().data_ptr());
+    }
+    if(scaleOut.has_value())
+        d_scaleOut = static_cast<void*>(scaleOut.value().data_ptr());
+
+    if(transpose_result)
+        std::swap(d_scaleA, d_scaleB);
+
+    auto hipblasInType  = dtype_map.at(inDtype);
+    auto hipblasOutType = dtype_map.at(outDtype);
+
+    void* ptrA{static_cast<void*>((transpose_result ? mat2 : mat1).data_ptr())};
+    void* ptrB{static_cast<void*>((transpose_result ? mat1 : mat2).data_ptr())};
+    void* ptrC{static_cast<void*>(result.data_ptr())};
+
+    const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(mat1));
+    const hipStream_t current_stream = at::hip::getCurrentHIPStream();
+    void* bias_ptr = bias.has_value() ? static_cast<void*>(bias.value().data_ptr()) : nullptr;
+
+    CHECK_HIPBLAS_ERROR(hipblasLtMatmul_sol_wrapper(hipblaslt_handle,
+                                                    transpose_mat1 ? HIPBLAS_OP_T : HIPBLAS_OP_N,
+                                                    transpose_mat2 ? HIPBLAS_OP_T : HIPBLAS_OP_N,
+                                                    m, n, k,
+                                                    &one,
+                                                    ptrA, mat1_ld, d_scaleA,
+                                                    ptrB, mat2_ld, d_scaleB,
+                                                    &zero,
+                                                    ptrC, result_ld, d_scaleOut,
+                                                    bias_ptr,
+                                                    hipblasInType,
+                                                    hipblasOutType,
+                                                    current_stream,
+                                                    solution_index,
+                                                    bpreshuffle_flag,
+                                                    use_rowwise,
+                                                    use_gelu_flag));
+}
+
 // find all hipblas solutions and return them to python land
 std::vector<int> hipb_findallsols(const torch::Tensor& mat1,
                                   const torch::Tensor& mat2,
@@ -1450,6 +1584,21 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
           py::arg("bpreshuffle") = false,
           py::arg("use_gelu")    = false);
     m.def("getHipblasltKernelName", &getHipblasltKernelName);
+    m.def("hipb_mm_out",
+          &hipb_mm_out,
+          "hipb_mm_out — in-place GEMM: writes into caller-provided result tensor, "
+          "no allocation. Use for rotating-buffer harnesses where output is pre-allocated "
+          "per slot. uint8 inputs are interpreted as packed MXFP4 (HIP_R_4F_E2M1).",
+          py::arg("mat1"),
+          py::arg("mat2"),
+          py::arg("result"),
+          py::arg("solution_index"),
+          py::arg("bias")        = std::nullopt,
+          py::arg("scaleA")      = std::nullopt,
+          py::arg("scaleB")      = std::nullopt,
+          py::arg("scaleOut")    = std::nullopt,
+          py::arg("bpreshuffle") = std::nullopt,
+          py::arg("use_gelu")    = std::nullopt);
 }
 
 
