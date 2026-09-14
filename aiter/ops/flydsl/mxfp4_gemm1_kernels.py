@@ -6,6 +6,7 @@ import functools
 
 import torch
 
+from aiter.jit.utils.chip_info import get_num_xcds
 from aiter.ops.flydsl import moe_kernels as _moe_kernels
 from aiter.ops.flydsl.mxfp4_kname import MXFP4_G1_VARIANTS
 
@@ -33,6 +34,7 @@ def _get_compiled_mxfp4_gemm1_port(
     native_scale_layout=False,
     num_waves=4,
     k_wave=1,
+    num_xcds=8,
 ):
     from .kernels.mxfp4_gemm1 import compile_gemm1_a4w4_port
 
@@ -58,6 +60,7 @@ def _get_compiled_mxfp4_gemm1_port(
         native_scale_layout=native_scale_layout,
         num_waves=num_waves,
         k_wave=k_wave,
+        num_xcds=num_xcds,
     )
 
 
@@ -220,6 +223,7 @@ def flydsl_mxfp4_gemm1(
     situ_linear_beta=1.0,
     swiglu_limit=7.0,
     bias=None,
+    num_xcds=None,
     stream=None,
     num_waves=4,
     k_wave=1,
@@ -271,6 +275,7 @@ def flydsl_mxfp4_gemm1(
         native_scale_layout,
         num_waves,
         k_wave,
+        get_num_xcds() if num_xcds is None else num_xcds,
     )
     grid = gemm1_grid(n_tokens, BM, NE=NE, TOPK=topk, INTER=D_INTER, BN=BN)
     _moe_kernels._run_compiled(

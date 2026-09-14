@@ -39,6 +39,7 @@ def compile_flydsl_fhmoe_stage1(
     enable_bias: bool = False,
     a_scale_one: bool = False,
     xcd_swizzle: int = 0,
+    num_xcds: int = 8,
     k_wave: int = 1,
     v2_output_layout: bool = False,
     shared_expert_id: int = -1,
@@ -73,6 +74,7 @@ def compile_flydsl_fhmoe_stage1(
         enable_bias=enable_bias,
         a_scale_one=a_scale_one,
         xcd_swizzle=xcd_swizzle,
+        num_xcds=num_xcds,
         k_wave=k_wave,
         v2_output_layout=v2_output_layout,
         shared_expert_id=shared_expert_id,
@@ -102,6 +104,7 @@ def compile_flydsl_fhmoe_stage2(
     inter_dim_pad: int = 0,
     enable_bias: bool = False,
     xcd_swizzle: int = 0,
+    num_xcds: int = 8,
     shared_expert_id: int = -1,
 ):
     """Compile the heterogeneous stage2 kernel."""
@@ -132,6 +135,7 @@ def compile_flydsl_fhmoe_stage2(
         inter_dim_pad=inter_dim_pad,
         enable_bias=enable_bias,
         xcd_swizzle=xcd_swizzle,
+        num_xcds=num_xcds,
         shared_expert_id=shared_expert_id,
     )
 
