@@ -191,23 +191,14 @@ def resolve_data_init(data_init):
     return dists[0]
 
 
-def resolve_combine_modes(combine, spec, dist_ctx):
+def resolve_combine_modes(combine):
     """The combine modes one invocation benchmarks, in the order they run.
 
     ``both`` is the default so a plain run always produces the base-vs-fused
-    comparison. The fused combine is mxfp4-only, so for the other quant keys
-    ``both`` degrades to base alone instead of failing -- an explicit
-    ``--combine fused`` still raises in setup(), where the constraint belongs."""
+    comparison. The fused combine is mxfp4-only and every key in ``QUANT_KEYS``
+    is mxfp4-weight, so ``both`` never has to degrade to base alone here."""
     if combine != "both":
         return [combine]
-    if not spec["is_mxfp4"]:
-        if dist_ctx.rank == 0:
-            print(
-                "# note: --combine both runs base only for this quant key -- the "
-                "fused combine is mxfp4-only",
-                flush=True,
-            )
-        return ["base"]
     return ["base", "fused"]
 
 
@@ -1196,7 +1187,7 @@ def main():
     # ---- device path (isolated): setup -> capture 61 layers in one graph -> bench,
     # once per combine mode. Every rank walks `modes` in the same order, so the
     # collectives inside the loop stay in step.
-    modes = resolve_combine_modes(args.combine, spec, dist_ctx)
+    modes = resolve_combine_modes(args.combine)
     summary_rows = []
     outputs = {}
     kernel_rows = {}  # per mode, kept for the stage-2 overlap rate below
