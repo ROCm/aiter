@@ -629,6 +629,102 @@ def test_auto_split_k_gate_logic():
     assert _auto_split_k_down(1, 8, 2, 2048, 16, 0) in (1, 2)
 
 
+def test_auto_split_k_gate_up_logic():
+    """Occupancy pick would split Qwen B=1; auto is WontFix and stays 1."""
+    from aiter.ops.flydsl.warp_decode_moe import (
+        _auto_split_k_gate_up,
+        _cu_count,
+        _occupancy_split_k_gate_up,
+    )
+
+    cu = _cu_count(0)
+    qwen_b1 = _occupancy_split_k_gate_up(1, 512, 10, 32, 0)
+    if 320 / cu < 2:
+        assert qwen_b1 in (2, 4), qwen_b1
+        assert 320 / cu * qwen_b1 <= 5
+    else:
+        assert qwen_b1 == 1
+    assert _occupancy_split_k_gate_up(2, 512, 10, 32, 0) == 1
+    assert _occupancy_split_k_gate_up(1, 2048, 8, 112, 0) == 1
+    assert _auto_split_k_gate_up(1, 512, 10, 32, 0) == 1
+    assert _auto_split_k_gate_up(2, 512, 10, 32, 0) == 1
+
+
+GATE_UP_SPLITK_CASES = [
+    ("splitk_gu_h512_i64_e4_tk2_sk2", 1, 512, 64, 4, 2, 2),
+    ("splitk_gu_h512_i64_e4_tk2_sk4", 1, 512, 64, 4, 2, 4),
+]
+
+
+@pytest.mark.skipif(not _HAS_FP8, reason="torch build lacks float8_e4m3fn")
+@pytest.mark.parametrize(
+    "case", [pytest.param(c, id=c[0]) for c in GATE_UP_SPLITK_CASES]
+)
+def test_gate_up_split_k(case):
+    name, B, HIDDEN, INTER, E, TOPK, split_k = case
+    x, w_gate, w_up, router_ids, wgs, wus = _gen_gate_up(
+        B, HIDDEN, INTER, E, TOPK, "pertensor"
+    )
+    wg, wu = _layout_weights(WeightLayout.PRESHUFFLED, w_gate, w_up)
+    base = flydsl_warp_decode_gate_up(
+        x,
+        wg,
+        wu,
+        router_ids,
+        wgs,
+        wus,
+        w_scale_mode="pertensor",
+        weight_layout=WeightLayout.PRESHUFFLED,
+        split_k=1,
+    )
+    got = flydsl_warp_decode_gate_up(
+        x,
+        wg,
+        wu,
+        router_ids,
+        wgs,
+        wus,
+        w_scale_mode="pertensor",
+        weight_layout=WeightLayout.PRESHUFFLED,
+        split_k=split_k,
+    )
+    torch.cuda.synchronize()
+    ref = _ref_gate_up(x, w_gate, w_up, router_ids, wgs, wus, "pertensor")
+    cos_ref = _cosine(ref, got)
+    cos_base = _cosine(base, got)
+    print(
+        f"[gate_up splitk {name}] cos_vs_ref={cos_ref:.6f} cos_vs_base={cos_base:.6f}"
+    )
+    assert cos_ref >= 0.999, f"split_k {name}: cos_vs_ref={cos_ref:.6f}"
+    assert cos_base >= 0.999, f"split_k {name}: cos_vs_base={cos_base:.6f}"
+
+
+@pytest.mark.skipif(not _HAS_FP8, reason="torch build lacks float8_e4m3fn")
+def test_gate_up_split_k_auto():
+    """split_k='auto' matches split_k=1 on a Qwen-like under-occupied grid."""
+    from aiter.ops.flydsl.warp_decode_moe import _auto_split_k_gate_up
+
+    B, HIDDEN, INTER, E, TOPK = 1, 512, 64, 4, 2
+    x, w_gate, w_up, router_ids, wgs, wus = _gen_gate_up(
+        B, HIDDEN, INTER, E, TOPK, "pertensor"
+    )
+    wg, wu = _layout_weights(WeightLayout.PRESHUFFLED, w_gate, w_up)
+    kw = dict(
+        w_scale_mode="pertensor",
+        weight_layout=WeightLayout.PRESHUFFLED,
+    )
+    base = flydsl_warp_decode_gate_up(x, wg, wu, router_ids, wgs, wus, split_k=1, **kw)
+    got = flydsl_warp_decode_gate_up(
+        x, wg, wu, router_ids, wgs, wus, split_k="auto", **kw
+    )
+    torch.cuda.synchronize()
+    picked = _auto_split_k_gate_up(B, INTER, TOPK, HIDDEN // 64, 0)
+    cos_base = _cosine(base, got)
+    print(f"[gate_up splitk auto] picked_k={picked} cos_vs_base={cos_base:.6f}")
+    assert picked == 1
+    assert cos_base >= 0.999, f"split_k auto: cos_vs_base={cos_base:.6f}"
+
+
 # -------------------------------------------------------------------------
 # Phase B -- down_reduce MXFP4 (BF16 intermediate, FP4 e2m1 + E8M0 block scale)
 # -------------------------------------------------------------------------

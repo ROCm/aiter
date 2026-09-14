@@ -149,6 +149,7 @@ def _get_gate_up(
     dot2_acc,
     preshuffled,
     interleave_gate_up,
+    k_batch,
 ):
     return build_gate_up_fp8_module(
         hidden,
@@ -163,6 +164,7 @@ def _get_gate_up(
         dot2_acc=dot2_acc,
         preshuffled=preshuffled,
         interleave_gate_up=interleave_gate_up,
+        k_batch=k_batch,
     )
 
 
@@ -210,6 +212,7 @@ def _get_gate_up_fp8_act(
     scale_bk,
     num_experts,
     preshuffled,
+    k_batch,
 ):
     return build_gate_up_fp8_act_module(
         hidden,
@@ -221,12 +224,13 @@ def _get_gate_up_fp8_act(
         scale_bk=scale_bk,
         num_experts=num_experts,
         preshuffled=preshuffled,
+        k_batch=k_batch,
     )
 
 
 @functools.lru_cache(maxsize=64)
 def _get_gate_up_bf16(
-    hidden, inter, top_k, kvector, serialize_dot2, use_dot2, preshuffled
+    hidden, inter, top_k, kvector, serialize_dot2, use_dot2, preshuffled, k_batch
 ):
     return build_gate_up_bf16_module(
         hidden,
@@ -236,6 +240,7 @@ def _get_gate_up_bf16(
         serialize_dot2=serialize_dot2,
         use_dot2=use_dot2,
         preshuffled=preshuffled,
+        k_batch=k_batch,
     )
 
 
@@ -267,6 +272,7 @@ def _get_gate_up_fp4(
     dot2_acc,
     preshuffled,
     interleave_gate_up,
+    k_batch,
 ):
     return build_gate_up_fp4_module(
         hidden,
@@ -279,6 +285,7 @@ def _get_gate_up_fp4(
         dot2_acc=dot2_acc,
         preshuffled=preshuffled,
         interleave_gate_up=interleave_gate_up,
+        k_batch=k_batch,
     )
 
 
@@ -343,6 +350,63 @@ def _cu_count(device_index: int) -> int:
     return torch.cuda.get_device_properties(device_index).multi_processor_count
 
 
+def _occupancy_split_k_gate_up(
+    B, INTER, TOPK, num_kpack, device_index, candidates=(4, 2)
+):
+    """Would-be occupancy pick for native gate/up split-K (not used by auto).
+
+    Extra ``k0`` shards only when the 16x4 grid is under-occupied
+    (``waves/CU < 2``) and the split stays at most ~5 waves/CU. That would fire
+    on Qwen B=1 in the of-record G9 matrix, not Qwen B=2 or DeepSeek. A/B of
+    ``k=2`` and ``k=4`` lost to ``k=1`` (atomics + host silu), so auto stays 1.
+    """
+    cu = _cu_count(device_index)
+    waves = B * TOPK * (INTER // 16)
+    occ = waves / cu
+    if occ >= 2:
+        return 1
+    for k in candidates:
+        if num_kpack % k == 0 and occ * k <= 5:
+            return k
+    return 1
+
+
+def _auto_split_k_gate_up(B, INTER, TOPK, num_kpack, device_index, candidates=(4, 2)):
+    """Default native gate/up split-K: always 1 (occupancy split is WontFix)."""
+    return 1
+
+
+def _resolve_gate_up_k_batch(
+    split_k, *, B, INTER, TOPK, num_kpack, preshuffled, device
+):
+    if split_k == "auto":
+        if not preshuffled:
+            return 1
+        idx = 0 if device.index is None else device.index
+        return _auto_split_k_gate_up(B, INTER, TOPK, num_kpack, idx)
+    k = int(split_k)
+    if k < 1:
+        raise ValueError(f"split_k must be >= 1 or 'auto', got {split_k!r}")
+    if k > 1:
+        if not preshuffled:
+            raise ValueError("gate_up split_k>1 requires preshuffled native 16x4")
+        if num_kpack % k != 0:
+            raise ValueError(f"num_kpack={num_kpack} not divisible by split_k={k}")
+    return k
+
+
+def _run_native_gate_up(launcher, ptrs, out, B, TOPK, INTER, k_batch):
+    stream = torch.cuda.current_stream()
+    grid_x = B * TOPK * INTER * k_batch
+    if k_batch == 1:
+        _run_compiled(launcher, *ptrs, ptr_arg(out), grid_x, stream)
+        return out
+    acc = torch.zeros((B, TOPK, INTER, 2), dtype=torch.float32, device=out.device)
+    _run_compiled(launcher, *ptrs, ptr_arg(acc), grid_x, stream)
+    out.copy_((torch.nn.functional.silu(acc[..., 0]) * acc[..., 1]).to(torch.bfloat16))
+    return out
+
+
 def _auto_split_k_down(
     B, HIDDEN, kh_per_warp, INTER, kvector, device_index, candidates=(8, 4, 2)
 ):
@@ -376,6 +440,7 @@ def flydsl_warp_decode_gate_up(
     dot2_acc: int = 1,
     interleave_gate_up: bool = True,
     weight_layout: str | WeightLayout = WeightLayout.K_CONTIGUOUS,
+    split_k: int | str = "auto",
     out: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """gate_up stage of warp-decode MoE (BF16 activation, FP8 e4m3 weights).
@@ -407,6 +472,9 @@ def flydsl_warp_decode_gate_up(
         weight_layout: ``k_contiguous`` (default) or ``preshuffled`` (fused-MoE B
             from ``shuffle_weight`` / ``shuffle_weight_a16w4``). Never inferred
             from strides.
+        split_k: Native ``k0`` occupancy split. ``"auto"`` (default) is ``1``
+            (Qwen B=1 ``k=2/4`` lost the G9 A/B). ``1`` is the direct silu
+            store. ``>1`` atomic-adds gate/up partials (preshuffled only).
         out:          optional [B, TOPK, INTER] bfloat16 output buffer.
 
     Returns:
@@ -442,6 +510,16 @@ def flydsl_warp_decode_gate_up(
     if out is None:
         out = torch.empty((B, TOPK, INTER), dtype=torch.bfloat16, device=x.device)
 
+    preshuffled = _preshuffled_flag(weight_layout)
+    k_batch = _resolve_gate_up_k_batch(
+        split_k,
+        B=B,
+        INTER=INTER,
+        TOPK=TOPK,
+        num_kpack=HIDDEN // 64,
+        preshuffled=preshuffled,
+        device=x.device,
+    )
     launcher = _get_gate_up(
         HIDDEN,
         INTER,
@@ -453,23 +531,26 @@ def flydsl_warp_decode_gate_up(
         scale_bk,
         E,
         dot2_acc,
-        _preshuffled_flag(weight_layout),
+        preshuffled,
         interleave_gate_up,
+        k_batch,
     )
-    grid_x = B * TOPK * INTER
-    _run_compiled(
+    return _run_native_gate_up(
         launcher,
-        ptr_arg(x),
-        ptr_arg(w_gate),
-        ptr_arg(w_up),
-        ptr_arg(w_gate_scale),
-        ptr_arg(w_up_scale),
-        ptr_arg(router_ids),
-        ptr_arg(out),
-        grid_x,
-        torch.cuda.current_stream(),
+        (
+            ptr_arg(x),
+            ptr_arg(w_gate),
+            ptr_arg(w_up),
+            ptr_arg(w_gate_scale),
+            ptr_arg(w_up_scale),
+            ptr_arg(router_ids),
+        ),
+        out,
+        B,
+        TOPK,
+        INTER,
+        k_batch,
     )
-    return out
 
 
 def flydsl_warp_decode_gate_up_fp8act(
@@ -485,6 +566,7 @@ def flydsl_warp_decode_gate_up_fp8act(
     x_scale_bk: int = 128,
     serialize_dot2: bool = True,
     weight_layout: str | WeightLayout = WeightLayout.K_CONTIGUOUS,
+    split_k: int | str = "auto",
     out: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """gate_up stage with **FP8 activation** x FP8 weights (CK ``gate_fp8_d2`` peer).
@@ -541,6 +623,16 @@ def flydsl_warp_decode_gate_up_fp8act(
     if out is None:
         out = torch.empty((B, TOPK, INTER), dtype=torch.bfloat16, device=x.device)
 
+    preshuffled = _preshuffled_flag(weight_layout)
+    k_batch = _resolve_gate_up_k_batch(
+        split_k,
+        B=B,
+        INTER=INTER,
+        TOPK=TOPK,
+        num_kpack=HIDDEN // 64,
+        preshuffled=preshuffled,
+        device=x.device,
+    )
     launcher = _get_gate_up_fp8_act(
         HIDDEN,
         INTER,
@@ -550,23 +642,26 @@ def flydsl_warp_decode_gate_up_fp8act(
         scale_bn,
         scale_bk,
         E,
-        _preshuffled_flag(weight_layout),
+        preshuffled,
+        k_batch,
     )
-    grid_x = B * TOPK * INTER
-    _run_compiled(
+    return _run_native_gate_up(
         launcher,
-        ptr_arg(x),
-        ptr_arg(x_scale),
-        ptr_arg(w_gate),
-        ptr_arg(w_up),
-        ptr_arg(w_gate_scale),
-        ptr_arg(w_up_scale),
-        ptr_arg(router_ids),
-        ptr_arg(out),
-        grid_x,
-        torch.cuda.current_stream(),
+        (
+            ptr_arg(x),
+            ptr_arg(x_scale),
+            ptr_arg(w_gate),
+            ptr_arg(w_up),
+            ptr_arg(w_gate_scale),
+            ptr_arg(w_up_scale),
+            ptr_arg(router_ids),
+        ),
+        out,
+        B,
+        TOPK,
+        INTER,
+        k_batch,
     )
-    return out
 
 
 def flydsl_warp_decode_gate_up_fp4(
@@ -583,6 +678,7 @@ def flydsl_warp_decode_gate_up_fp4(
     interleave_gate_up: bool = True,
     kvector: int | None = None,
     weight_layout: str | WeightLayout = WeightLayout.K_CONTIGUOUS,
+    split_k: int | str = "auto",
     out: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """gate_up stage with **MXFP4** weights (BF16 activation, FP4 e2m1 + E8M0).
@@ -645,6 +741,16 @@ def flydsl_warp_decode_gate_up_fp4(
     if out is None:
         out = torch.empty((B, TOPK, INTER), dtype=torch.bfloat16, device=x.device)
 
+    preshuffled = _preshuffled_flag(weight_layout)
+    k_batch = _resolve_gate_up_k_batch(
+        split_k,
+        B=B,
+        INTER=INTER,
+        TOPK=TOPK,
+        num_kpack=HIDDEN // 128,
+        preshuffled=preshuffled,
+        device=x.device,
+    )
     launcher = _get_gate_up_fp4(
         HIDDEN,
         INTER,
@@ -654,23 +760,26 @@ def flydsl_warp_decode_gate_up_fp4(
         scale_bn,
         scale_bk,
         dot2_acc,
-        _preshuffled_flag(weight_layout),
+        preshuffled,
         interleave_gate_up,
+        k_batch,
     )
-    grid_x = B * TOPK * INTER
-    _run_compiled(
+    return _run_native_gate_up(
         launcher,
-        ptr_arg(x),
-        ptr_arg(w_gate),
-        ptr_arg(w_up),
-        ptr_arg(w_gate_scale),
-        ptr_arg(w_up_scale),
-        ptr_arg(router_ids),
-        ptr_arg(out),
-        grid_x,
-        torch.cuda.current_stream(),
+        (
+            ptr_arg(x),
+            ptr_arg(w_gate),
+            ptr_arg(w_up),
+            ptr_arg(w_gate_scale),
+            ptr_arg(w_up_scale),
+            ptr_arg(router_ids),
+        ),
+        out,
+        B,
+        TOPK,
+        INTER,
+        k_batch,
     )
-    return out
 
 
 def flydsl_warp_decode_down_reduce(
@@ -825,6 +934,7 @@ def flydsl_warp_decode_gate_up_bf16(
     serialize_dot2: bool = True,
     use_dot2: bool | None = None,
     weight_layout: str | WeightLayout = WeightLayout.K_CONTIGUOUS,
+    split_k: int | str = "auto",
     out: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """gate_up stage with **BF16 weights** (unquantized oracle; no scales).
@@ -875,6 +985,16 @@ def flydsl_warp_decode_gate_up_bf16(
     if out is None:
         out = torch.empty((B, TOPK, INTER), dtype=torch.bfloat16, device=x.device)
 
+    preshuffled = _preshuffled_flag(weight_layout)
+    k_batch = _resolve_gate_up_k_batch(
+        split_k,
+        B=B,
+        INTER=INTER,
+        TOPK=TOPK,
+        num_kpack=HIDDEN // 32,
+        preshuffled=preshuffled,
+        device=x.device,
+    )
     launcher = _get_gate_up_bf16(
         HIDDEN,
         INTER,
@@ -882,20 +1002,18 @@ def flydsl_warp_decode_gate_up_bf16(
         kvector,
         serialize_dot2,
         use_dot2,
-        _preshuffled_flag(weight_layout),
+        preshuffled,
+        k_batch,
     )
-    grid_x = B * TOPK * INTER
-    _run_compiled(
+    return _run_native_gate_up(
         launcher,
-        ptr_arg(x),
-        ptr_arg(w_gate),
-        ptr_arg(w_up),
-        ptr_arg(router_ids),
-        ptr_arg(out),
-        grid_x,
-        torch.cuda.current_stream(),
+        (ptr_arg(x), ptr_arg(w_gate), ptr_arg(w_up), ptr_arg(router_ids)),
+        out,
+        B,
+        TOPK,
+        INTER,
+        k_batch,
     )
-    return out
 
 
 def flydsl_warp_decode_down_reduce_bf16(

@@ -62,7 +62,7 @@ preshuffled gate/up spot-check when the hot loop, wait/reduce, or grid changed.
 - [x] 2. Re-A/B G7 `dot2_acc` on the **native** 16×4 grid
 - [x] 3. Dedup `x` loads within `nlane` — **WontFix** (broadcast regresses)
 - [x] 4. Software-pipeline `k0` (prefetch next kpack; FP4 WontFix)
-- [ ] 5. Split-K over `k0` for small-`INTER` occupancy (Qwen B=1 first)
+- [x] 5. Split-K over `k0` for small-`INTER` occupancy — **WontFix** (auto stays 1)
 
 ## Locked decisions
 
@@ -329,12 +329,41 @@ Do **not** turn this on for large-B DeepSeek if `%peak` is already high
 (B=32 gate_up FP8 ~74%): extra atomics would cost bandwidth. The occupancy
 gate above already keeps those grids at `k_batch=1`.
 
-- [ ] Native gate/up `k_batch` (or equivalent `k0` shard) + dispatch.
-- [ ] Auto occupancy policy as above; Qwen B=1 uses `k_batch>1`; Qwen B=2
-      and DeepSeek stay `k_batch=1` unless an A/B wins both batches.
-- [ ] **Done when:** op_test covers split and non-split; G9 Qwen B=1 gate_up
-      FP8 vs CK improves vs the baseline in this file; G9 gate_up B=1 and
-      B=2 do not regress vs of-record (lock).
+**Done (2026-09-14), WontFix on auto.** Native builders take `k_batch`.
+`fx.slice` cannot take a runtime shard `k0`, so split rebases the
+preshuffled B view by `k0_lo` and loops a local `k0`. `k_batch==1` keeps
+the subtask-4 pipeline and unsharded B view. Split epilogue is two-step:
+`atomic_add_f32` of `(gate, up)` into a zeroed `[B,TOPK,INTER,2]` f32
+workspace, then host `silu(gate)*up`. Explicit `split_k=2/4` matches
+`split_k=1` at cos ≥ 0.999.
+
+The occupancy pick (`_occupancy_split_k_gate_up`) would select **k=4** on
+Qwen B=1 and 1 elsewhere. That pick loses. GPU 6 G9 (`/tmp/g9_s5_ck.md`),
+1000 iters, 3 repeats, loaded SCLK median **2387 MHz**; A/B vs subtask 4
+`/tmp/g9_s4_clean_1_ck.csv` (same protocol):
+
+| shape | B | dtype | act | k=1 (s4) us | auto k=4 us | delta |
+|---|---|---|---|---|---|---|
+| qwen3next | 1 | fp8 | bf16 | 17.48 | **19.89** | **+14%** |
+| qwen3next | 1 | fp8 | fp8 | 18.49 | **19.83** | **+7%** |
+| qwen3next | 1 | fp4 | bf16 | 16.02 | **18.50** | **+15%** |
+| qwen3next | 2 | fp8 | bf16 | 18.65 | 18.58 | −0.4% (k=1 path) |
+
+Focused same-clock A/B (Qwen B=1 FP8, 400 iters): k=1 **9.2 µs**, k=2
+**21.6 µs**, k=4 **20.5 µs**. Extra waves do not pay the atomic + host silu
+(and 48-VGPR waves are not resident at 5 waves/CU). Default `split_k="auto"`
+therefore stays **1**. Explicit `split_k>1` remains for tests.
+
+Lock G9 after WontFix (`/tmp/g9_s5_wontfix_ck.md`), SCLK median **2375 MHz**.
+Qwen B=1 gate_up FP8 is **18.11 µs / 2.30× CK** vs of-record **22.07 µs /
+2.84×**. vs s4 (17.48 µs) is **+3.6%**, inside the few-percent noise band
+on the unchanged k=1 path. B=2 gate_up FP8 19.04 vs s4 18.65 (+2%).
+
+- [x] Native gate/up `k_batch` + dispatch + two-step atomic epilogue.
+- [x] Occupancy policy coded but **not** used by auto (WontFix with numbers).
+- [x] op_test: split and non-split; cache-off GPU 6 **104 passed**.
+- [x] G9 B=1/B=2 lock vs of-record holds; Qwen B=1 FP8 vs CK still better
+      than of-record from subtasks 1–4, not from split-K.
 
 ## Non-goals (do not pull into this plan)
 

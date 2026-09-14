@@ -102,16 +102,29 @@ def _nmajor_kpack_nk_layout(n_out: int, packed_k: int, elem_bytes: int):
     return ((n0, nlane), (k0, klane, ki)), ((sn0, snlane), (sk0, sklane, ski))
 
 
-def _preshuffled_expert_b_i32_tensor(ptr, expert, n_out, packed_k, elem_bytes):
+def _preshuffled_expert_b_i32_tensor(
+    ptr, expert, n_out, packed_k, elem_bytes, k0_lo=0, k0_count=None
+):
     """In-expert kpack ``make_buffer_tensor``; expert base is an i64 byte fold.
 
     Logical coords are ``(n, k_dword)``. Does not invent an unpacked e4m3/e2m1
     grid. In-expert dword offsets stay i32-safe because the descriptor starts
     at this expert.
+
+    ``k0_lo`` / ``k0_count`` rebase the view onto one split-K shard so ``fx.slice``
+    k0 coords stay in ``range(k0_count)``. Physical n0/k0 strides stay full-expert.
     """
     bytes_per_expert = n_out * packed_k * elem_bytes
-    base = fx.Int64(fx.ptrtoint(ptr)) + fx.Int64(expert) * fx.Int64(bytes_per_expert)
     shape, stride = _nmajor_kpack_nk_layout(n_out, packed_k, elem_bytes)
+    n_shape, k_shape = shape
+    k0_full, klane, ki = k_shape
+    if k0_count is None:
+        k0_count = k0_full
+    stride_k0 = stride[1][0]
+    base = fx.Int64(fx.ptrtoint(ptr)) + fx.Int64(expert) * fx.Int64(bytes_per_expert)
+    base = base + fx.Int64(k0_lo) * fx.Int64(stride_k0 * 4)
+    if k0_count != k0_full:
+        shape = (n_shape, (k0_count, klane, ki))
     pt = fx.PointerType.get(
         fx.Int32.ir_type, address_space=fx.AddressSpace.Global, alignment=4
     )
@@ -462,6 +475,31 @@ def wave_reduce_add_f32(val_f32):
     return val.ir_value()
 
 
+def _native_kpack_shard(num_kpack: int, k_batch: int):
+    """Compile-time k0 shard for native gate/up split-K."""
+    if k_batch < 1:
+        raise ValueError(f"k_batch must be >= 1, got {k_batch}")
+    if num_kpack % k_batch != 0:
+        raise ValueError(f"num_kpack={num_kpack} not divisible by k_batch={k_batch}")
+    return num_kpack // k_batch, const_expr(k_batch > 1)
+
+
+def _decode_native_gate_up_bid(bid, inter, top_k, k_batch, kpacks_per_kb):
+    """Map wave bid -> (n0, expert_k, token_b, k0_lo). ``k_batch==1`` is identity."""
+    kb = bid % k_batch
+    rest = bid // k_batch
+    n0 = rest % (inter // 16)
+    d = rest // (inter // 16)
+    expert_k = d % top_k
+    token_b = d // top_k
+    k0_lo = kb * kpacks_per_kb
+    return n0, expert_k, token_b, k0_lo
+
+
+def _native_gate_up_out_off(token_b, top_k, expert_k, inter, neuron_j):
+    return (token_b * top_k + expert_k) * inter + neuron_j
+
+
 def atomic_add_f32(ptr, elem_off, val_f32):
     """Atomic ``fadd`` of one f32 into global ``ptr[elem_off]`` (split-K accumulate).
 
@@ -774,6 +812,7 @@ def _build_gate_up_fp8_preshuffled_native(
     scale_bk: int | None,
     dot2_acc: int,
     interleave_gate_up: bool = True,
+    k_batch: int = 1,
 ):
     """N-major kpack-native FP8 gate/up: one wave computes 16 output rows."""
     if hidden % 64 != 0 or inter % 16 != 0:
@@ -792,6 +831,7 @@ def _build_gate_up_fp8_preshuffled_native(
         raise ValueError(f"unsupported w_scale_mode: {w_scale_mode!r}")
     scale_cols = hidden // scale_bk if w_scale_mode == "block2d" else 0
     num_kpack = hidden // 64
+    kpacks_per_kb, split_k = _native_kpack_shard(num_kpack, k_batch)
 
     @flyc.kernel
     def _kernel(
@@ -808,24 +848,34 @@ def _build_gate_up_fp8_preshuffled_native(
         nlane = lane % fx.Int32(16)
         klane = lane // fx.Int32(16)
 
-        n0 = bid % (inter // 16)
-        d = bid // (inter // 16)
-        expert_k = d % top_k
-        token_b = d // top_k
+        n0, expert_k, token_b, k0_lo = _decode_native_gate_up_bid(
+            bid, inter, top_k, k_batch, kpacks_per_kb
+        )
         neuron_j = n0 * fx.Int32(16) + nlane
 
         rid_t = _i32_view(rid_ptr)
         e = fx.Int32(_i32_load(rid_t, token_b * top_k + expert_k))
         w_row = e * inter + neuron_j
-        wg_b = _preshuffled_expert_b_i32_tensor(wg_ptr, e, inter, hidden, 1)
-        wu_b = _preshuffled_expert_b_i32_tensor(wu_ptr, e, inter, hidden, 1)
+        if const_expr(split_k):
+            wg_b = _preshuffled_expert_b_i32_tensor(
+                wg_ptr, e, inter, hidden, 1, k0_lo, kpacks_per_kb
+            )
+            wu_b = _preshuffled_expert_b_i32_tensor(
+                wu_ptr, e, inter, hidden, 1, k0_lo, kpacks_per_kb
+            )
+        else:
+            wg_b = _preshuffled_expert_b_i32_tensor(wg_ptr, e, inter, hidden, 1)
+            wu_b = _preshuffled_expert_b_i32_tensor(wu_ptr, e, inter, hidden, 1)
         x_rsrc = _i32_word_base(x_ptr)
         wgs_t = _f32_view(wgs_ptr)
         wus_t = _f32_view(wus_ptr)
         one_f32 = fx.Float32(1.0).ir_value()
 
         def _issue(k0):
-            k_base = k0 * 64 + klane * fx.Int32(16)
+            if const_expr(split_k):
+                k_base = (k0_lo + k0) * 64 + klane * fx.Int32(16)
+            else:
+                k_base = k0 * 64 + klane * fx.Int32(16)
             x_word0 = (token_b * hidden + k_base) // 2
             xw = load_i32_words(x_rsrc, x_word0, 8)
             gw = _native_kpack_words(wg_b, n0, k0, klane, nlane)
@@ -833,7 +883,10 @@ def _build_gate_up_fp8_preshuffled_native(
             return xw, gw, uw
 
         def _consume(k0, gate_l, up_l, xw, gw, uw):
-            k_base = fx.Int32(k0) * fx.Int32(64) + klane * fx.Int32(16)
+            if const_expr(split_k):
+                k_base = (k0_lo + fx.Int32(k0)) * fx.Int32(64) + klane * fx.Int32(16)
+            else:
+                k_base = fx.Int32(k0) * fx.Int32(64) + klane * fx.Int32(16)
             gate_pairs = []
             up_pairs = []
             for ipair in range_constexpr(8):
@@ -870,7 +923,7 @@ def _build_gate_up_fp8_preshuffled_native(
             + list(uw0)
         )
         final_state = init_state
-        for k0, state in range(0, num_kpack - 1, 1, init=init_state):
+        for k0, state in range(0, kpacks_per_kb - 1, 1, init=init_state):
             gate_l = fx.Float32(state[0])
             up_l = fx.Float32(state[1])
             xw = list(state[2:10])
@@ -890,7 +943,7 @@ def _build_gate_up_fp8_preshuffled_native(
         xw = list(final_state[2:10])
         gw = list(final_state[10:14])
         uw = list(final_state[14:18])
-        gate_l, up_l = _consume(fx.Int32(num_kpack - 1), gate_l, up_l, xw, gw, uw)
+        gate_l, up_l = _consume(fx.Int32(kpacks_per_kb - 1), gate_l, up_l, xw, gw, uw)
         gate_acc = _reduce_klane4_f32(gate_l.ir_value())
         up_acc = _reduce_klane4_f32(up_l.ir_value())
         if const_expr(not block2d):
@@ -898,10 +951,15 @@ def _build_gate_up_fp8_preshuffled_native(
             gate_acc = gate_acc * fx.Float32(_f32_load(wgs_t, scale_off))
             up_acc = up_acc * fx.Float32(_f32_load(wus_t, scale_off))
 
-        if klane == 0:
-            out_t = _bf16_out_view(out_ptr)
-            out_off = (token_b * top_k + expert_k) * inter + neuron_j
-            out_t[out_off] = BFloat16(_silu_mul(gate_acc, up_acc))
+        out_off = _native_gate_up_out_off(token_b, top_k, expert_k, inter, neuron_j)
+        if const_expr(split_k):
+            if klane == 0:
+                atomic_add_f32(out_ptr, out_off * 2, gate_acc)
+                atomic_add_f32(out_ptr, out_off * 2 + 1, up_acc)
+        else:
+            if klane == 0:
+                out_t = _bf16_out_view(out_ptr)
+                out_t[out_off] = BFloat16(_silu_mul(gate_acc, up_acc))
 
     @flyc.jit
     def _launch(
@@ -938,6 +996,7 @@ def build_gate_up_fp8_module(
     dot2_acc: int = 1,
     preshuffled: bool = False,
     interleave_gate_up: bool = True,
+    k_batch: int = 1,
 ):
     """Build the gate_up FP8 launcher (BF16 activation, FP8 e4m3 weights).
 
@@ -966,6 +1025,7 @@ def build_gate_up_fp8_module(
             scale_bk=scale_bk,
             dot2_acc=dot2_acc,
             interleave_gate_up=interleave_gate_up,
+            k_batch=k_batch,
         )
     if kvector is None:
         kvector = pick_kvector(hidden)
@@ -1195,6 +1255,7 @@ def _build_gate_up_fp8_act_preshuffled_native(
     scale_bn: int,
     scale_bk: int,
     scale_bxk: int,
+    k_batch: int = 1,
 ):
     """N-major kpack-native FP8-activation gate/up; 16 output rows per wave."""
     if hidden % 64 != 0 or inter % 16 != 0:
@@ -1210,6 +1271,7 @@ def _build_gate_up_fp8_act_preshuffled_native(
             "scale K blocks to divide HIDDEN and be multiples of 16"
         )
     num_kpack = hidden // 64
+    kpacks_per_kb, split_k = _native_kpack_shard(num_kpack, k_batch)
     scale_cols_g = hidden // scale_bk
     scale_cols_x = hidden // scale_bxk
 
@@ -1228,17 +1290,24 @@ def _build_gate_up_fp8_act_preshuffled_native(
         lane = fx.Int32(gpu.thread_id("x"))
         nlane = lane % fx.Int32(16)
         klane = lane // fx.Int32(16)
-        n0 = bid % (inter // 16)
-        d = bid // (inter // 16)
-        expert_k = d % top_k
-        token_b = d // top_k
+        n0, expert_k, token_b, k0_lo = _decode_native_gate_up_bid(
+            bid, inter, top_k, k_batch, kpacks_per_kb
+        )
         neuron_j = n0 * fx.Int32(16) + nlane
 
         rid_t = _i32_view(rid_ptr)
         e = fx.Int32(_i32_load(rid_t, token_b * top_k + expert_k))
         w_row = e * inter + neuron_j
-        wg_b = _preshuffled_expert_b_i32_tensor(wg_ptr, e, inter, hidden, 1)
-        wu_b = _preshuffled_expert_b_i32_tensor(wu_ptr, e, inter, hidden, 1)
+        if const_expr(split_k):
+            wg_b = _preshuffled_expert_b_i32_tensor(
+                wg_ptr, e, inter, hidden, 1, k0_lo, kpacks_per_kb
+            )
+            wu_b = _preshuffled_expert_b_i32_tensor(
+                wu_ptr, e, inter, hidden, 1, k0_lo, kpacks_per_kb
+            )
+        else:
+            wg_b = _preshuffled_expert_b_i32_tensor(wg_ptr, e, inter, hidden, 1)
+            wu_b = _preshuffled_expert_b_i32_tensor(wu_ptr, e, inter, hidden, 1)
         x_rsrc = _i32_word_base(x_ptr)
         xs_t = _f32_view(xs_ptr)
         wgs_t = _f32_view(wgs_ptr)
@@ -1247,7 +1316,10 @@ def _build_gate_up_fp8_act_preshuffled_native(
         row_blk = w_row // scale_bn
 
         def _issue(k0):
-            k_base = k0 * 64 + klane * fx.Int32(16)
+            if const_expr(split_k):
+                k_base = (k0_lo + k0) * 64 + klane * fx.Int32(16)
+            else:
+                k_base = k0 * 64 + klane * fx.Int32(16)
             x_word0 = (token_b * hidden + k_base) // 4
             xw = load_i32_words(x_rsrc, x_word0, 4)
             gw = _native_kpack_words(wg_b, n0, k0, klane, nlane)
@@ -1255,7 +1327,10 @@ def _build_gate_up_fp8_act_preshuffled_native(
             return xw, gw, uw
 
         def _consume(k0, gate_l, up_l, xw, gw, uw):
-            k_base = fx.Int32(k0) * fx.Int32(64) + klane * fx.Int32(16)
+            if const_expr(split_k):
+                k_base = (k0_lo + fx.Int32(k0)) * fx.Int32(64) + klane * fx.Int32(16)
+            else:
+                k_base = fx.Int32(k0) * fx.Int32(64) + klane * fx.Int32(16)
             gate_pairs = []
             up_pairs = []
             for ipair in range_constexpr(8):
@@ -1286,7 +1361,7 @@ def _build_gate_up_fp8_act_preshuffled_native(
             + list(uw0)
         )
         final_state = init_state
-        for k0, state in range(0, num_kpack - 1, 1, init=init_state):
+        for k0, state in range(0, kpacks_per_kb - 1, 1, init=init_state):
             gate_l = fx.Float32(state[0])
             up_l = fx.Float32(state[1])
             xw = list(state[2:6])
@@ -1306,13 +1381,18 @@ def _build_gate_up_fp8_act_preshuffled_native(
         xw = list(final_state[2:6])
         gw = list(final_state[6:10])
         uw = list(final_state[10:14])
-        gate_l, up_l = _consume(fx.Int32(num_kpack - 1), gate_l, up_l, xw, gw, uw)
+        gate_l, up_l = _consume(fx.Int32(kpacks_per_kb - 1), gate_l, up_l, xw, gw, uw)
         gate_acc = _reduce_klane4_f32(gate_l.ir_value())
         up_acc = _reduce_klane4_f32(up_l.ir_value())
-        if klane == 0:
-            out_t = _bf16_out_view(out_ptr)
-            out_off = (token_b * top_k + expert_k) * inter + neuron_j
-            out_t[out_off] = BFloat16(_silu_mul(gate_acc, up_acc))
+        out_off = _native_gate_up_out_off(token_b, top_k, expert_k, inter, neuron_j)
+        if const_expr(split_k):
+            if klane == 0:
+                atomic_add_f32(out_ptr, out_off * 2, gate_acc)
+                atomic_add_f32(out_ptr, out_off * 2 + 1, up_acc)
+        else:
+            if klane == 0:
+                out_t = _bf16_out_view(out_ptr)
+                out_t[out_off] = BFloat16(_silu_mul(gate_acc, up_acc))
 
     @flyc.jit
     def _launch(
@@ -1350,6 +1430,7 @@ def build_gate_up_fp8_act_module(
     scale_bxk: int | None = None,
     num_experts: int | None = None,
     preshuffled: bool = False,
+    k_batch: int = 1,
 ):
     """Build the gate_up launcher with **FP8 activation** (CK ``gate_fp8_d2`` peer).
 
@@ -1372,6 +1453,7 @@ def build_gate_up_fp8_act_module(
             scale_bn=scale_bn,
             scale_bk=scale_bk,
             scale_bxk=scale_bxk,
+            k_batch=k_batch,
         )
     if kvector is None:
         kvector = pick_kvector(hidden)
@@ -1940,6 +2022,7 @@ def _build_gate_up_fp4_preshuffled_native(
     scale_bk: int,
     dot2_acc: int,
     interleave_gate_up: bool = True,
+    k_batch: int = 1,
 ):
     """N-major kpack-native MXFP4 gate/up; one wave computes 16 rows."""
     if hidden % 128 != 0 or inter % 16 != 0:
@@ -1950,6 +2033,7 @@ def _build_gate_up_fp4_preshuffled_native(
             "and be a multiple of 32"
         )
     num_kpack = hidden // 128
+    kpacks_per_kb, split_k = _native_kpack_shard(num_kpack, k_batch)
     scale_cols = hidden // scale_bk
 
     @flyc.kernel
@@ -1966,26 +2050,37 @@ def _build_gate_up_fp4_preshuffled_native(
         lane = fx.Int32(gpu.thread_id("x"))
         nlane = lane % fx.Int32(16)
         klane = lane // fx.Int32(16)
-        n0 = bid % (inter // 16)
-        d = bid // (inter // 16)
-        expert_k = d % top_k
-        token_b = d // top_k
+        n0, expert_k, token_b, k0_lo = _decode_native_gate_up_bid(
+            bid, inter, top_k, k_batch, kpacks_per_kb
+        )
         neuron_j = n0 * fx.Int32(16) + nlane
 
         rid_t = _i32_view(rid_ptr)
         e = fx.Int32(_i32_load(rid_t, token_b * top_k + expert_k))
         w_row = e * inter + neuron_j
         row_blk = w_row // scale_bn
-        wg_b = _preshuffled_expert_b_i32_tensor(wg_ptr, e, inter, hidden // 2, 1)
-        wu_b = _preshuffled_expert_b_i32_tensor(wu_ptr, e, inter, hidden // 2, 1)
+        if const_expr(split_k):
+            wg_b = _preshuffled_expert_b_i32_tensor(
+                wg_ptr, e, inter, hidden // 2, 1, k0_lo, kpacks_per_kb
+            )
+            wu_b = _preshuffled_expert_b_i32_tensor(
+                wu_ptr, e, inter, hidden // 2, 1, k0_lo, kpacks_per_kb
+            )
+        else:
+            wg_b = _preshuffled_expert_b_i32_tensor(wg_ptr, e, inter, hidden // 2, 1)
+            wu_b = _preshuffled_expert_b_i32_tensor(wu_ptr, e, inter, hidden // 2, 1)
         x_rsrc = _i32_word_base(x_ptr)
         wgs_t = _i8_view(wgs_ptr)
         wus_t = _i8_view(wus_ptr)
         gate_l = fx.Float32(0.0)
         up_l = fx.Float32(0.0)
 
-        for k0 in range(num_kpack):
-            k_base = k0 * 128 + klane * fx.Int32(32)
+        for k0 in range(kpacks_per_kb):
+            if const_expr(split_k):
+                k0_abs = k0_lo + k0
+            else:
+                k0_abs = k0
+            k_base = k0_abs * 128 + klane * fx.Int32(32)
             x_word0 = (token_b * hidden + k_base) // 2
             xw = load_i32_words(x_rsrc, x_word0, 16)
             gw = _native_kpack_words(wg_b, n0, k0, klane, nlane)
@@ -2015,10 +2110,15 @@ def _build_gate_up_fp4_preshuffled_native(
 
         gate_acc = _reduce_klane4_f32(gate_l.ir_value())
         up_acc = _reduce_klane4_f32(up_l.ir_value())
-        if klane == 0:
-            out_t = _bf16_out_view(out_ptr)
-            out_off = (token_b * top_k + expert_k) * inter + neuron_j
-            out_t[out_off] = BFloat16(_silu_mul(gate_acc, up_acc))
+        out_off = _native_gate_up_out_off(token_b, top_k, expert_k, inter, neuron_j)
+        if const_expr(split_k):
+            if klane == 0:
+                atomic_add_f32(out_ptr, out_off * 2, gate_acc)
+                atomic_add_f32(out_ptr, out_off * 2 + 1, up_acc)
+        else:
+            if klane == 0:
+                out_t = _bf16_out_view(out_ptr)
+                out_t[out_off] = BFloat16(_silu_mul(gate_acc, up_acc))
 
     @flyc.jit
     def _launch(
@@ -2053,6 +2153,7 @@ def build_gate_up_fp4_module(
     dot2_acc: int = 1,
     preshuffled: bool = False,
     interleave_gate_up: bool = True,
+    k_batch: int = 1,
 ):
     """Build the gate_up MXFP4 launcher (BF16 activation, FP4 e2m1 weights).
 
@@ -2098,6 +2199,7 @@ def build_gate_up_fp4_module(
             scale_bk=scale_bk,
             dot2_acc=dot2_acc,
             interleave_gate_up=interleave_gate_up,
+            k_batch=k_batch,
         )
     if kvector is None:
         # FP4 fast path: 1 i32 = 8 FP4 = one weight dword per lane per iter.
@@ -2606,11 +2708,13 @@ def _build_gate_up_bf16_preshuffled_native(
     *,
     serialize_dot2: bool,
     use_dot2: bool,
+    k_batch: int = 1,
 ):
     """N-major kpack-native BF16 gate/up; one wave computes 16 output rows."""
     if hidden % 32 != 0 or inter % 16 != 0:
         raise ValueError("preshuffled BF16 gate_up needs HIDDEN % 32 and INTER % 16")
     num_kpack = hidden // 32
+    kpacks_per_kb, split_k = _native_kpack_shard(num_kpack, k_batch)
 
     @flyc.kernel
     def _kernel(
@@ -2624,20 +2728,30 @@ def _build_gate_up_bf16_preshuffled_native(
         lane = fx.Int32(gpu.thread_id("x"))
         nlane = lane % fx.Int32(16)
         klane = lane // fx.Int32(16)
-        n0 = bid % (inter // 16)
-        d = bid // (inter // 16)
-        expert_k = d % top_k
-        token_b = d // top_k
+        n0, expert_k, token_b, k0_lo = _decode_native_gate_up_bid(
+            bid, inter, top_k, k_batch, kpacks_per_kb
+        )
         neuron_j = n0 * fx.Int32(16) + nlane
 
         rid_t = _i32_view(rid_ptr)
         e = fx.Int32(_i32_load(rid_t, token_b * top_k + expert_k))
-        wg_b = _preshuffled_expert_b_i32_tensor(wg_ptr, e, inter, hidden, 2)
-        wu_b = _preshuffled_expert_b_i32_tensor(wu_ptr, e, inter, hidden, 2)
+        if const_expr(split_k):
+            wg_b = _preshuffled_expert_b_i32_tensor(
+                wg_ptr, e, inter, hidden, 2, k0_lo, kpacks_per_kb
+            )
+            wu_b = _preshuffled_expert_b_i32_tensor(
+                wu_ptr, e, inter, hidden, 2, k0_lo, kpacks_per_kb
+            )
+        else:
+            wg_b = _preshuffled_expert_b_i32_tensor(wg_ptr, e, inter, hidden, 2)
+            wu_b = _preshuffled_expert_b_i32_tensor(wu_ptr, e, inter, hidden, 2)
         x_rsrc = _i32_word_base(x_ptr)
 
         def _issue(k0):
-            k_base = k0 * 32 + klane * fx.Int32(8)
+            if const_expr(split_k):
+                k_base = (k0_lo + k0) * 32 + klane * fx.Int32(8)
+            else:
+                k_base = k0 * 32 + klane * fx.Int32(8)
             x_word0 = (token_b * hidden + k_base) // 2
             xw = load_i32_words(x_rsrc, x_word0, 4)
             gw = _native_kpack_words(wg_b, n0, k0, klane, nlane)
@@ -2679,7 +2793,7 @@ def _build_gate_up_bf16_preshuffled_native(
             + list(uw0)
         )
         final_state = init_state
-        for k0, state in range(0, num_kpack - 1, 1, init=init_state):
+        for k0, state in range(0, kpacks_per_kb - 1, 1, init=init_state):
             gate_l = state[0]
             up_l = state[1]
             xw = list(state[2:6])
@@ -2699,10 +2813,15 @@ def _build_gate_up_bf16_preshuffled_native(
         gate_l, up_l = _consume(gate_l, up_l, xw, gw, uw)
         gate_acc = _reduce_klane4_f32(gate_l)
         up_acc = _reduce_klane4_f32(up_l)
-        if klane == 0:
-            out_t = _bf16_out_view(out_ptr)
-            out_off = (token_b * top_k + expert_k) * inter + neuron_j
-            out_t[out_off] = BFloat16(_silu_mul(gate_acc, up_acc))
+        out_off = _native_gate_up_out_off(token_b, top_k, expert_k, inter, neuron_j)
+        if const_expr(split_k):
+            if klane == 0:
+                atomic_add_f32(out_ptr, out_off * 2, gate_acc)
+                atomic_add_f32(out_ptr, out_off * 2 + 1, up_acc)
+        else:
+            if klane == 0:
+                out_t = _bf16_out_view(out_ptr)
+                out_t[out_off] = BFloat16(_silu_mul(gate_acc, up_acc))
 
     @flyc.jit
     def _launch(
@@ -2732,6 +2851,7 @@ def build_gate_up_bf16_module(
     serialize_dot2: bool = True,
     use_dot2: bool = True,
     preshuffled: bool = False,
+    k_batch: int = 1,
 ):
     """Build the gate_up launcher with **BF16 weights** (BF16 activation too).
 
@@ -2755,6 +2875,7 @@ def build_gate_up_bf16_module(
             top_k,
             serialize_dot2=serialize_dot2,
             use_dot2=use_dot2,
+            k_batch=k_batch,
         )
     if kvector is None:
         kvector = pick_kvector(hidden)
