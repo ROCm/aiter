@@ -903,7 +903,43 @@ void bmm_a8w8_mxscale_bpreshuffle_nospec_kernel_gfx1250(opus_bmm_a8w8_mxscale_ka
         // cycles, 8.6% of the kernel, against FlyDSL's zero. A whole tile is in
         // range for all but the last M and N block, so the uniform branch takes
         // the fast path nearly always and costs one scalar compare.
-        if (tile_row + T::kBlockM <= kargs.m && tile_col + T::kBlockN <= kargs.n) {
+        if constexpr (T::kCViaLds) {
+            // Stage the tile in LDS and hand the whole thing to ONE TDM store.
+            // The per-fragment guards -- and with them the 33 divergent EXEC
+            // regions whose drains cost 25.5% of the kernel -- disappear: the
+            // window's own extents clamp the partial tile instead.
+            DataC* smem_c = reinterpret_cast<DataC*>(lds_buf);
+            opus::static_for<T::kExpM>([&](auto imN) __attribute__((always_inline)) {
+                constexpr int im = decltype(imN)::value;
+                opus::static_for<T::kExpN>([&](auto inN) __attribute__((always_inline)) {
+                    constexpr int in = decltype(inN)::value;
+                    auto reg_c = opus::cast<DataC>(acc[im][in]);
+                    const int r = wave_m * (T::kExpM * T::kWmmaM) + im * T::kWmmaM
+                                + lane_id % T::kWmmaM;
+                    const int c = wave_n * (T::kExpN * T::kWmmaN) + in * T::kWmmaN
+                                + (lane_id / T::kWmmaM) * kFragC;
+                    DataC* q = smem_c + (size_t)r * T::kSmemPitchC + c;
+                    opus::static_for<kFragC / kVec>([&](auto cN) __attribute__((always_inline)) {
+                        constexpr int cc = decltype(cN)::value;
+                        CVec v;
+                        opus::static_for<kVec>([&](auto eN) __attribute__((always_inline)) {
+                            v[decltype(eN)::value] = reg_c[cc * kVec + decltype(eN)::value];
+                        });
+                        *reinterpret_cast<CVec*>(q + cc * kVec) = v;
+                    });
+                });
+            });
+            opus::s_wait_dscnt<0>();
+            __builtin_amdgcn_s_barrier();
+            if (wave_id == 0) {
+                auto win_c = opus::make_tdm<typename T::WindowC>(
+                    (u32_t)reinterpret_cast<u64_t>(smem_c), ptr_c,
+                    (u32_t)kargs.n, (u32_t)kargs.m, (u64_t)kargs.stride_c,
+                    (u32_t)tile_col, (u32_t)tile_row);
+                win_c.async_store();
+                opus::s_wait_tensorcnt<0>();
+            }
+        } else if (tile_row + T::kBlockM <= kargs.m && tile_col + T::kBlockN <= kargs.n) {
             opus::static_for<T::kExpM>([&](auto imN) __attribute__((always_inline)) {
                 opus::static_for<T::kExpN>([&](auto inN) __attribute__((always_inline)) {
                     store_frag(imN, inN);

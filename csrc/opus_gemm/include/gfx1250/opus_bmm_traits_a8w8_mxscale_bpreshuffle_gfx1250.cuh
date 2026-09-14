@@ -209,7 +209,15 @@ template<int BLOCK_SIZE_,
          // control. NOTE this window pair carries A and B only -- the split-K
          // workspace in the cluster path is a separate descriptor, so widening
          // scope here does not touch the one place with cross-workgroup writes.
-         int TDM_SCOPE_ = 0>
+         int TDM_SCOPE_ = 0,
+         // Write C out through LDS and ONE TDM store, instead of one guarded
+         // global_store_b128 per fragment. ATT at b=16 M=4096 put 25.5% of the
+         // kernel in s_wait_xcnt (96 hits x 1230 cycles); the epilogue's 33
+         // divergent EXEC regions are what pays it, because in-flight stores
+         // pin EXEC and every region boundary has to drain them first. FlyDSL
+         // writes the same C with 64 ds_store + 1 tensor_store_from_lds, zero
+         // saveexec, and spends 126 cycles there -- 0.1%.
+         bool C_VIA_LDS_ = false>
 struct opus_bmm_a8w8_mxscale_bpreshuffle_traits_gfx1250 {
     static constexpr int BLOCK_SIZE = BLOCK_SIZE_;
     static constexpr int B_M = B_M_;
@@ -900,6 +908,7 @@ struct opus_bmm_a8w8_mxscale_bpreshuffle_traits_gfx1250 {
     static constexpr bool kAllReadsFirst = ALL_READS_FIRST_;
     static constexpr int  kDsLookahead   = DS_LOOKAHEAD_;
     static constexpr int  kTdmScope      = TDM_SCOPE_;
+    static constexpr bool kCViaLds       = C_VIA_LDS_;
     static constexpr int  kTdmCachePol   = opus::tdm_traits::make_cache_policy(
         opus::tdm_traits::load_temporal_hint::regular,
         (opus::tdm_traits::scope)TDM_SCOPE_);
@@ -951,8 +960,15 @@ struct opus_bmm_a8w8_mxscale_bpreshuffle_traits_gfx1250 {
     // 1-WG/CU enforcement by LDS padding (same portable trick as the a16w16
     // traits: a WG over 160 KB leaves no room for a second on the 320 KB budget).
     static constexpr int kHalfLds = 160 * 1024;
-    static constexpr int kLdsTotalBytes =
+    // C staging reuses the ring's LDS: it is written only after the last
+    // K-step, by which point every slot is dead, so the peak is a max not a sum.
+    static constexpr int kSmemPitchC   = kBlockN;
+    static constexpr int kSegBytesC    = kCViaLds
+        ? kBlockM * kSmemPitchC * (int)sizeof(DataC) : 0;
+    static constexpr int kLdsRingBytes =
         (kWgPerCu == 1 && kSegBytesAB <= kHalfLds) ? (kHalfLds + 1024) : kSegBytesAB;
+    static constexpr int kLdsTotalBytes =
+        kLdsRingBytes > kSegBytesC ? kLdsRingBytes : kSegBytesC;
     static_assert(kLdsTotalBytes <= 320 * 1024, "LDS exceeds gfx1250's 320KB");
     // A WG_PER_CU_ = 2 request is a claim about occupancy, and LDS is what
     // actually decides it: two workgroups only co-reside if each fits in half
@@ -980,6 +996,8 @@ struct opus_bmm_a8w8_mxscale_bpreshuffle_traits_gfx1250 {
     using PaddingA = opus::tdm_traits::padding_auto<DataA, kBlockK, kPadReadVecBytes>;
     using PaddingB = opus::tdm_traits::padding<>;      // no pad -- see kSmemPitchB
     using TdmCache = opus::tdm_traits::cache<kTdmCachePol>;
+    using PaddingC = opus::tdm_traits::padding<>;       // tile is contiguous rows
+    using WindowC  = opus::tdm<DataC, opus::seq<kBlockN, kBlockM>, PaddingC, TdmCache>;
     using WindowA  = opus::tdm<DataA, opus::seq<kBlockK, kARows>, PaddingA, TdmCache>;
     using WindowB  = opus::tdm<DataB, opus::seq<kBShufBlockElems, kBRows>, PaddingB, TdmCache>;
     // A-scale panel window, used only when kSfATdm; the cooperative fill needs
@@ -1881,6 +1899,20 @@ using opus_bmm_a8w8_mxscale_bpreshuffle_tile_ns256_gn128_sf_bk256_gfx1250 =
         /*GROUP_K*/128, /*NUM_SLOTS*/2, /*WG_PER_CU*/1, /*GROUP_N*/128,
         /*SF_A_LDS*/true, /*SF_B_LDS*/true,
         /*SF_A_TDM_KG*/0, /*SF_A_TDM_PAD*/16, /*TILE_M*/2, /*NO_SPEC*/true>;
+
+// kid56: kid35 with the C write-out staged through LDS and issued as one TDM
+// store. Single variable against kid35 -- see C_VIA_LDS_ for the ATT evidence.
+template <typename DataC>
+using opus_bmm_a8w8_mxscale_bpreshuffle_tile_ns256_ctdm_gfx1250 =
+    opus_bmm_a8w8_mxscale_bpreshuffle_traits_gfx1250<
+        /*BLOCK_SIZE*/256, /*B_M*/256, /*B_N*/256, /*B_K*/256,
+        /*LAYOUT*/opus_gfx1250_bmm::kLayoutTileN,
+        /*D_A*/opus::fp8_t, /*D_B*/opus::fp8_t, /*D_C*/DataC, /*D_ACC*/float,
+        /*GROUP_K*/128, /*NUM_SLOTS*/2, /*WG_PER_CU*/1, /*GROUP_N*/128,
+        /*SF_A_LDS*/true, /*SF_B_LDS*/true,
+        /*SF_A_TDM_KG*/0, /*SF_A_TDM_PAD*/16, /*TILE_M*/2, /*NO_SPEC*/true,
+        /*SF_A_PANEL_KG*/128, /*ALL_READS_FIRST*/false, /*DS_LOOKAHEAD*/-1,
+        /*TDM_SCOPE*/0, /*C_VIA_LDS*/true>;
 
 // kid36: kid27 at B_K=256 / slots=2, the per-column twin of kid35.
 //
