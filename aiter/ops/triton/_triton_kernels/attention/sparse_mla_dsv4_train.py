@@ -87,7 +87,7 @@ def _sparse_mla_fwd_kernel(
     BLOCK_H: tl.constexpr,
     BLOCK_K: tl.constexpr,
 ):
-    query_idx = tl.program_id(0)
+    query_idx = tl.program_id(0).to(tl.int64)
     pid_h = tl.program_id(1)
 
     head_offsets = pid_h * BLOCK_H + tl.arange(0, BLOCK_H)
@@ -115,7 +115,7 @@ def _sparse_mla_fwd_kernel(
         in_range = k_pos < topk
         slot = tl.load(
             indices_ptr + query_idx * idx_stride_t + k_pos, mask=in_range, other=-1
-        )
+        ).to(tl.int64)
         valid = in_range & (slot >= 0) & (slot < num_kv)
 
         kv = tl.load(
