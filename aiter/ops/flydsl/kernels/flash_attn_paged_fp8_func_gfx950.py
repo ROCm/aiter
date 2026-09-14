@@ -87,6 +87,8 @@ def _build(
     group,
     buffered,
     lazy,
+    metadata_mode,
+    has_last_page_lens,
 ):
     from aiter.ops.flydsl.kernels.fmha_gfx950.flash_attn_paged_fp8_gfx950 import (
         build_flash_attn_paged_fp8_module,
@@ -108,6 +110,8 @@ def _build(
         batch_interleave_group=group,
         cache_buffered=buffered,
         dualwave_swp_lazy_rescale=lazy,
+        metadata_mode=metadata_mode,
+        has_last_page_lens=has_last_page_lens,
     )
 
 
@@ -119,8 +123,11 @@ def flydsl_flash_attn_paged_fp8_func(
     max_seqlen_q,
     max_seqlen_k,
     *,
-    block_table,
-    seqlen_k,
+    block_table=None,
+    seqlen_k=None,
+    kv_indptr=None,
+    kv_page_indices=None,
+    kv_last_page_lens=None,
     q_descale,
     k_descale,
     v_descale,
@@ -135,7 +142,10 @@ def flydsl_flash_attn_paged_fp8_func(
     Q is packed ``[total_q,Hq,Dqk]``. Page-1 K/V are linear rank 3/4;
     page-16/64/1024 K/V use the native vectorized rank-5 cache layouts.
     ``block_table`` contains physical page IDs and ``seqlen_k`` contains
-    actual KV token lengths. Both maxima are nonnegative launch bounds.
+    actual KV token lengths. Alternatively, ``kv_indptr[B+1]`` indexes the
+    flat ``kv_page_indices`` array; pages larger than one then require
+    ``kv_last_page_lens[B]``. A supplied block table takes precedence.
+    Both maxima are nonnegative launch bounds.
     Metadata must be int32 on Q's device. Active IDs and lengths are the
     caller's valid cache metadata; unused table entries are never consumed.
 
@@ -168,9 +178,12 @@ def flydsl_flash_attn_paged_fp8_func(
     ):
         raise ValueError("cu_seqlens_q must be int32 [B+1] with at least one boundary")
     batch = cu_seqlens_q.numel() - 1
+    csr = block_table is None
+    metadata = kv_indptr if csr else seqlen_k
+    metadata_name = "kv_indptr" if csr else "seqlen_k"
     for name, tensor, shape in (
         ("cu_seqlens_q", cu_seqlens_q, (batch + 1,)),
-        ("seqlen_k", seqlen_k, (batch,)),
+        (metadata_name, metadata, (batch + 1,) if csr else (batch,)),
     ):
         if (
             not torch.is_tensor(tensor)
@@ -183,8 +196,10 @@ def flydsl_flash_attn_paged_fp8_func(
         raise TypeError("paged FP8 sequence maxima must be integers")
     if max_seqlen_q < 0 or max_seqlen_k < 0:
         raise ValueError("paged FP8 sequence maxima must be nonnegative")
+    if max(max_seqlen_q, max_seqlen_k) >= _MAX_FLAT_ELEMS:
+        raise NotImplementedError("paged FP8 sequence maxima must fit signed int32")
     max_pages = (max_seqlen_k + page_size - 1) // page_size
-    if (
+    if not csr and (
         not torch.is_tensor(block_table)
         or block_table.ndim != 2
         or block_table.shape[0] != batch
@@ -195,6 +210,25 @@ def flydsl_flash_attn_paged_fp8_func(
         raise ValueError(
             "block_table must be int32 [B,capacity] on Q's device and cover max_seqlen_k"
         )
+    if csr:
+        if (
+            not torch.is_tensor(kv_page_indices)
+            or kv_page_indices.ndim != 1
+            or kv_page_indices.dtype != torch.int32
+            or kv_page_indices.device != q.device
+        ):
+            raise ValueError("kv_page_indices must be int32 [capacity] on Q's device")
+        if page_size > 1 and kv_last_page_lens is None:
+            raise ValueError("CSR pages larger than one require kv_last_page_lens")
+        if kv_last_page_lens is not None and (
+            not torch.is_tensor(kv_last_page_lens)
+            or kv_last_page_lens.shape != (batch,)
+            or kv_last_page_lens.dtype != torch.int32
+            or kv_last_page_lens.device != q.device
+        ):
+            raise ValueError("kv_last_page_lens must be int32 [B] on Q's device")
+    page_indices = kv_page_indices if csr else block_table
+    has_last = csr and kv_last_page_lens is not None
     for name, tensor in (
         ("q_descale", q_descale),
         ("k_descale", k_descale),
@@ -231,7 +265,12 @@ def flydsl_flash_attn_paged_fp8_func(
         with torch.cuda.stream(launch_stream) if stream is not None else nullcontext():
             if out is None:
                 out = torch.empty(output_shape, dtype=torch.bfloat16, device=q.device)
-            if q.numel() == 0 or pages == 0 or max_seqlen_k == 0:
+            if (
+                q.numel() == 0
+                or pages == 0
+                or max_seqlen_k == 0
+                or page_indices.numel() == 0
+            ):
                 out.zero_()
                 if stream is not None:
                     out.record_stream(launch_stream)
@@ -257,11 +296,14 @@ def flydsl_flash_attn_paged_fp8_func(
                 group=group,
                 buffered=buffered,
                 lazy=dualwave_swp_lazy_rescale,
+                metadata_mode="csr" if csr else "block_table",
+                has_last_page_lens=has_last,
             )
             query = q.contiguous().view(-1)
             key, value = k.contiguous(), v.contiguous()
-            table = block_table.contiguous().view(-1)
-            cuq, lengths = cu_seqlens_q.contiguous(), seqlen_k.contiguous()
+            table = page_indices.contiguous().view(-1)
+            cuq, lengths = cu_seqlens_q.contiguous(), metadata.contiguous()
+            last = kv_last_page_lens.contiguous() if has_last else cuq
             scales = [
                 s if s.stride() == (1,) else s.as_strided((1,), (1,))
                 for s in (q_descale, k_descale, v_descale)
@@ -275,9 +317,10 @@ def flydsl_flash_attn_paged_fp8_func(
                 int(max_seqlen_q),
                 seq_len_kv=int(max_seqlen_k),
                 cu_seqlens_q=cuq,
-                seqlen_k=lengths,
+                kv_metadata=lengths,
+                kv_last_page_lens=last,
                 block_table=table,
-                block_table_stride=block_table.shape[1],
+                block_table_stride=0 if csr else block_table.shape[1],
                 q_descale=scales[0],
                 k_descale=scales[1],
                 v_descale=scales[2],
@@ -285,6 +328,16 @@ def flydsl_flash_attn_paged_fp8_func(
                 stream=launch_stream,
             )
             if stream is not None:
-                for tensor in (query, key, value, table, cuq, lengths, *scales, out):
+                for tensor in (
+                    query,
+                    key,
+                    value,
+                    table,
+                    cuq,
+                    lengths,
+                    last,
+                    *scales,
+                    out,
+                ):
                     tensor.record_stream(launch_stream)
     return out

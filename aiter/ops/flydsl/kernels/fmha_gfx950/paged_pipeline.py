@@ -567,6 +567,8 @@ class PagedDualwaveSwpFp8Traits:
     PAGE_SIZE: int = 64
     KV_CACHE_LAYOUT: str = "vectorized"
     CACHE_BUFFERED: bool = False
+    CSR_PAGE_TABLE: bool = False
+    HAS_LAST_PAGE_LENS: bool = False
     DMA_BYTES: int = 16
     ELEM_BYTES: int = 1
     OUT_ELEM_BYTES: int = 2
@@ -599,6 +601,8 @@ class PagedDualwaveSwpFp8Traits:
             self.PAGE_SIZE,
             self.KV_CACHE_LAYOUT,
             self.CACHE_BUFFERED,
+            self.CSR_PAGE_TABLE,
+            self.HAS_LAST_PAGE_LENS,
         )
 
     @property
@@ -645,6 +649,8 @@ def _make_paged_dualwave_swp_fp8_traits(
     page_size=64,
     kv_cache_layout="vectorized",
     cache_buffered=False,
+    metadata_mode="block_table",
+    has_last_page_lens=False,
 ):
     """Build layouts after the dedicated builder validates the paged contract."""
     block_n = 64
@@ -680,6 +686,8 @@ def _make_paged_dualwave_swp_fp8_traits(
         PAGE_SIZE=page_size,
         KV_CACHE_LAYOUT=kv_cache_layout,
         CACHE_BUFFERED=bool(cache_buffered),
+        CSR_PAGE_TABLE=metadata_mode == "csr",
+        HAS_LAST_PAGE_LENS=bool(has_last_page_lens),
         DEFAULT_STRIDE_Q_N=num_heads * head_dim,
         DEFAULT_STRIDE_KV_N=num_kv_heads * head_dim,
         SMEM_D_RPT=smem_d_rpt,
@@ -710,7 +718,8 @@ class DualwaveFp8KernelContext:
         O=None,
         DebugCounts=None,
         CuSeqQ=None,
-        SeqLensKv=None,
+        KvMetadata=None,
+        LastPageLens=None,
         QDescale=None,
         KDescale=None,
         VDescale=None,
@@ -735,7 +744,8 @@ class DualwaveFp8KernelContext:
         self.O = O
         self.DebugCounts = DebugCounts
         self.CuSeqQ = CuSeqQ
-        self.SeqLensKv = SeqLensKv
+        self.KvMetadata = KvMetadata
+        self.LastPageLens = LastPageLens
         self.QDescale = QDescale
         self.KDescale = KDescale
         self.VDescale = VDescale
@@ -846,14 +856,48 @@ class DualwaveFp8KernelContext:
                 fx.rocdl.make_buffer_tensor(self.CuSeqQ), fx.make_layout(1, 1)
             )
             _cuk_div = fx.logical_divide(
-                fx.rocdl.make_buffer_tensor(self.SeqLensKv), fx.make_layout(1, 1)
+                fx.rocdl.make_buffer_tensor(self.KvMetadata), fx.make_layout(1, 1)
             )
             _cu_atom = fx.make_copy_atom(fx.rocdl.BufferCopy32b(), fx.Int32)
             _cu_v1i32 = Vec.make_type(1, fx.Int32)
             self.q_tok_base = _cu_load(_cuq_div, self.batch_idx, _cu_atom, _cu_v1i32)
             self.q_tok_end = _cu_load(_cuq_div, self.batch_idx + 1, _cu_atom, _cu_v1i32)
             self.kv_tok_base = fx.Index(0)
-            self.kv_tok_end = _cu_load(_cuk_div, self.batch_idx, _cu_atom, _cu_v1i32)
+            if const_expr(traits.CSR_PAGE_TABLE):
+                self.page_base = fx.Int64(
+                    _cu_load(_cuk_div, self.batch_idx, _cu_atom, _cu_v1i32)
+                )
+                page_end = fx.Int64(
+                    _cu_load(_cuk_div, self.batch_idx + 1, _cu_atom, _cu_v1i32)
+                )
+                # CSR prefixes and per-request token lengths obey the int32
+                # metadata ABI. Keep their proven width before widening any
+                # physical address; otherwise LLVM carries 64-bit loop bounds.
+                self.request_page_count = fx.Int64(
+                    fx.Int32(page_end) - fx.Int32(self.page_base)
+                )
+                if const_expr(traits.HAS_LAST_PAGE_LENS):
+                    last_div = fx.logical_divide(
+                        fx.rocdl.make_buffer_tensor(self.LastPageLens),
+                        fx.make_layout(1, 1),
+                    )
+                    last = fx.Int64(
+                        _cu_load(last_div, self.batch_idx, _cu_atom, _cu_v1i32)
+                    )
+                    length = (self.request_page_count - 1) * traits.PAGE_SIZE + last
+                    self.kv_tok_end = fx.Index(
+                        fx.Int32(
+                            (self.request_page_count > 0).select(length, fx.Int64(0))
+                        )
+                    )
+                else:
+                    self.kv_tok_end = fx.Index(
+                        fx.Int32(self.request_page_count * traits.PAGE_SIZE)
+                    )
+            else:
+                self.kv_tok_end = _cu_load(
+                    _cuk_div, self.batch_idx, _cu_atom, _cu_v1i32
+                )
             self.seqlen_q_v = self.q_tok_end - self.q_tok_base
             self.seqlen_kv_v = self.kv_tok_end - self.kv_tok_base
             self.seqlen_kv_i32 = fx.Int32(self.seqlen_kv_v)
@@ -1168,22 +1212,42 @@ class DualwaveFp8KernelContext:
         )
 
     def init_page_table(self):
-        self.page_indices_div = fx.logical_divide(
-            fx.rocdl.make_buffer_tensor(self.BlockTable), fx.make_layout(1, 1)
-        )
         self.page_i32_atom = fx.make_copy_atom(fx.rocdl.BufferCopy32b(), fx.Int32)
         self.page_v1i32 = Vec.make_type(1, fx.Int32)
         self.page_i32x2_atom = fx.make_copy_atom(fx.rocdl.BufferCopy64b(), fx.Int32)
         self.page_v2i32 = Vec.make_type(2, fx.Int32)
-        self.page_base = fx.Int64(self.batch_idx) * fx.Int64(self.block_table_stride)
-        if const_expr(self.traits.PAIRED_PAGE_IDS):
+        if const_expr(self.traits.CSR_PAGE_TABLE):
+            # A request-local resource both enforces the CSR boundary and
+            # removes the row-base add from each lane's hot-loop lookup.
             request = fx.make_view(
                 fx.add_offset(fx.get_iter(self.BlockTable), self.page_base),
-                fx.make_layout(fx.Int64(self.block_table_stride), 1),
+                fx.make_layout(self.request_page_count, 1),
             )
+            resource = fx.rocdl.make_buffer_tensor(
+                request, num_records_bytes=(self.request_page_count * 4).ir_value()
+            )
+            self.page_indices_div = fx.logical_divide(resource, fx.make_layout(1, 1))
+            self.page_base = fx.Int64(0)
+        else:
+            self.page_indices_div = fx.logical_divide(
+                fx.rocdl.make_buffer_tensor(self.BlockTable), fx.make_layout(1, 1)
+            )
+            self.page_base = fx.Int64(self.batch_idx) * fx.Int64(
+                self.block_table_stride
+            )
+        if const_expr(self.traits.PAIRED_PAGE_IDS):
+            if const_expr(not self.traits.CSR_PAGE_TABLE):
+                request = fx.make_view(
+                    fx.add_offset(fx.get_iter(self.BlockTable), self.page_base),
+                    fx.make_layout(fx.Int64(self.block_table_stride), 1),
+                )
             num_pages = (
                 self.seqlen_kv_v + self.traits.PAGE_SIZE - 1
             ) // self.traits.PAGE_SIZE
+            if const_expr(self.traits.CSR_PAGE_TABLE):
+                num_pages = fx.min(
+                    fx.Int64(num_pages), fx.Int64(self.request_page_count)
+                )
             bounded = fx.rocdl.make_buffer_tensor(
                 request, num_records_bytes=(num_pages * 4).ir_value()
             )

@@ -60,6 +60,8 @@ def build_flash_attn_paged_fp8_module(
     batch_interleave_group=1,
     page_size=64,
     cache_buffered=False,
+    metadata_mode="block_table",
+    has_last_page_lens=False,
 ):
     """Build the gfx950 packed-varlen paged FP8 attention launcher.
 
@@ -108,6 +110,10 @@ def build_flash_attn_paged_fp8_module(
         raise ValueError(
             "whole-cache buffer descriptors are reserved for page sizes 1/16"
         )
+    if metadata_mode not in ("block_table", "csr"):
+        raise ValueError("paged FP8 metadata mode must be block_table or csr")
+    if metadata_mode == "csr" and page_size > 1 and not has_last_page_lens:
+        raise ValueError("CSR pages larger than one require last-page lengths")
     batch_interleave_group = int(batch_interleave_group)
     if batch_interleave_group < 1:
         raise ValueError(
@@ -127,6 +133,8 @@ def build_flash_attn_paged_fp8_module(
         page_size=page_size,
         kv_cache_layout=kv_cache_layout,
         cache_buffered=cache_buffered,
+        metadata_mode=metadata_mode,
+        has_last_page_lens=has_last_page_lens,
     )
     BLOCK_M = traits.BLOCK_M
     BLOCK_SIZE = traits.BLOCK_SIZE
@@ -152,7 +160,8 @@ def build_flash_attn_paged_fp8_module(
         V: fx.Tensor,
         O: fx.Tensor,
         CuSeqQ: fx.Tensor,
-        SeqLensKv: fx.Tensor,
+        KvMetadata: fx.Tensor,
+        LastPageLens: fx.Tensor,
         BlockTable: fx.Tensor,
         block_table_stride: fx.Int32,
         QDescale: fx.Tensor,
@@ -171,7 +180,8 @@ def build_flash_attn_paged_fp8_module(
             V,
             O,
             CuSeqQ=CuSeqQ,
-            SeqLensKv=SeqLensKv,
+            KvMetadata=KvMetadata,
+            LastPageLens=LastPageLens,
             QDescale=QDescale,
             KDescale=KDescale,
             VDescale=VDescale,
@@ -496,7 +506,8 @@ def build_flash_attn_paged_fp8_module(
         V: fx.Tensor,
         O: fx.Tensor,
         CuSeqQ: fx.Tensor,
-        SeqLensKv: fx.Tensor,
+        KvMetadata: fx.Tensor,
+        LastPageLens: fx.Tensor,
         BlockTable: fx.Tensor,
         block_table_stride: fx.Int32,
         QDescale: fx.Tensor,
@@ -537,7 +548,8 @@ def build_flash_attn_paged_fp8_module(
             V,
             O,
             CuSeqQ,
-            SeqLensKv,
+            KvMetadata,
+            LastPageLens,
             BlockTable,
             block_table_stride,
             QDescale,
@@ -581,7 +593,7 @@ def build_flash_attn_paged_fp8_module(
                 f"of KV pages; got seq_len_kv={seq_len_kv}, "
                 f"page_size={traits.PAGE_SIZE}"
             )
-        if block_table_stride < num_kv_pages:
+        if metadata_mode == "block_table" and block_table_stride < num_kv_pages:
             raise ValueError(
                 f"paged BN128 block table has too few entries: need {num_kv_pages}, got stride {block_table_stride}"
             )
@@ -607,7 +619,8 @@ def build_flash_attn_paged_fp8_module(
         *,
         seq_len_kv=None,
         cu_seqlens_q=None,
-        seqlen_k=None,
+        kv_metadata=None,
+        kv_last_page_lens=None,
         block_table=None,
         block_table_stride=None,
         q_descale=None,
@@ -626,7 +639,7 @@ def build_flash_attn_paged_fp8_module(
             )
         if (
             cu_seqlens_q is None
-            or seqlen_k is None
+            or kv_metadata is None
             or block_table is None
             or block_table_stride is None
             or q_descale is None
@@ -634,9 +647,11 @@ def build_flash_attn_paged_fp8_module(
             or v_descale is None
         ):
             raise ValueError(
-                "paged FP8 flash_attn requires cu_seqlens_q, seqlen_k, block_table, "
+                "paged FP8 flash_attn requires cu_seqlens_q, kv_metadata, block_table, "
                 "block_table_stride, q_descale, k_descale, and v_descale"
             )
+        if has_last_page_lens and kv_last_page_lens is None:
+            raise ValueError("paged FP8 CSR launch requires kv_last_page_lens")
         # stride_kv_n is accepted for compatibility; native cache layouts fix it.
         if stride_q_n is None:
             stride_q_n = DEFAULT_STRIDE_Q_N
@@ -656,7 +671,8 @@ def build_flash_attn_paged_fp8_module(
             V,
             O,
             cu_seqlens_q,
-            seqlen_k,
+            kv_metadata,
+            kv_last_page_lens if kv_last_page_lens is not None else cu_seqlens_q,
             block_table,
             block_table_stride,
             q_descale,
