@@ -66,6 +66,7 @@ def compile_pa_decode_tile(
     trans_v: bool = True,
     wide_kv_addressing: bool = False,
     prefetch_v: bool = False,
+    prefetch_v_iglp: bool = False,
 ):
     """Build the tile-programming PA-decode kernel + launch wrapper.
 
@@ -138,6 +139,7 @@ def compile_pa_decode_tile(
     )
     EARLY_V = prefetch_v and (tune_page128 or tune_page16_vpipe) and M_TILES == 1
     PAGE16_VPIPE = prefetch_v and tune_page16_vpipe and M_TILES == 1
+    PAGE16_VPIPE_IGLP = PAGE16_VPIPE and prefetch_v_iglp
     P_BUFFERS = 2 if tune_page128 and M_TILES == 3 else 1
     # PV layout: V=A, P=B -> output [head-dim (row), query-row (col=lane16)],
     # generalized over head_dim via the VHE_CHUNKS loop.
@@ -826,7 +828,9 @@ def compile_pa_decode_tile(
             tok0 = tt * TILE_TOK
             # per_tensor phase-split: let IGLP interleave MFMA with softmax
             # VALU/LDS to hide the MFMA-hazard s_nop (per_token is VGPR-cliffed).
-            if const_expr(not per_token_kv and M_TILES > 1):
+            if const_expr(
+                (not per_token_kv and M_TILES > 1) or PAGE16_VPIPE_IGLP
+            ):
                 fx.rocdl.iglp_opt(0)
 
             tt1 = tt + 1
@@ -1131,7 +1135,8 @@ def compile_pa_decode_tile(
                             [k_cur[a * N_SUBCHUNKS + s], q_ops_all[s], acc, 0, 0, 0],
                         )
                     frag_Ss.append(fx.Vector(acc))
-                # tt+1 K/V/scale prefetch, issued here to reuse the pass-1 barrier.
+                # Prepare tt+1 before the pass-1 barrier. The page-16 deep
+                # pipeline publishes page ids only; other paths also load K.
                 k_next = k_cur
                 if tt1 < part_end:
                     if const_expr(PAGE16_VPIPE):

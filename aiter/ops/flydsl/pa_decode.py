@@ -40,10 +40,11 @@ from .kernels.tensor_shim import _run_compiled, ptr_arg
 from .kernels.utils import cdiv
 
 _PAGE16_VPIPE_ENV = "AITER_FLYDSL_PA_PAGE16_VPIPE"
+_PAGE16_VPIPE_IGLP_ENV = "AITER_FLYDSL_PA_PAGE16_VPIPE_IGLP"
 
 
-def _page16_vpipe_enabled() -> bool:
-    return os.getenv(_PAGE16_VPIPE_ENV, "0").strip().lower() in {
+def _env_enabled(name: str) -> bool:
+    return os.getenv(name, "0").strip().lower() in {
         "1",
         "true",
         "yes",
@@ -394,8 +395,9 @@ def pa_decode(
     # The page-16 long-context pipeline is opt-in until it can be benchmarked
     # on gfx950.  It loads current V before QK and delays next K until the
     # current PV, while every unsupported shape keeps the existing schedule.
+    page16_vpipe_iglp = _env_enabled(_PAGE16_VPIPE_IGLP_ENV)
     page16_vpipe = (
-        _page16_vpipe_enabled()
+        (_env_enabled(_PAGE16_VPIPE_ENV) or page16_vpipe_iglp)
         and arch == "gfx950"
         and head_dim == 128
         and block_size == 16
@@ -407,6 +409,7 @@ def pa_decode(
         and query_group_size in (8, 16)
         and num_partitions == 8
     )
+    page16_vpipe_iglp = page16_vpipe and page16_vpipe_iglp
 
     # Early V loads help the measured one-to-two-workgroup-per-CU regime.
     # Keep other grids on the existing schedule: early loads regress
@@ -437,6 +440,7 @@ def pa_decode(
             trans_v=trans_v,
             wide_kv_addressing=wide_kv_addressing,
             prefetch_v=prefetch_v,
+            prefetch_v_iglp=page16_vpipe_iglp,
         )
 
     if num_partitions == 1:
