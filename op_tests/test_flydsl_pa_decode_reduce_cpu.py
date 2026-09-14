@@ -62,13 +62,15 @@ def test_reduce_kernel_rejects_unsupported_partition_counts(num_partitions):
         )
 
 
-def _flat_partition_reduce(exp_sums, max_logits, partials):
+def _flat_partition_reduce(exp_sums, max_logits, partials, sink=None):
     global_max = max(max_logits)
     scaled_sums = [
         part_sum * math.exp(part_max - global_max) if part_max != -math.inf else 0.0
         for part_sum, part_max in zip(exp_sums, max_logits)
     ]
     denominator = sum(scaled_sums)
+    if sink is not None and global_max != -math.inf:
+        denominator += math.exp(sink - global_max)
     if denominator == 0.0:
         return [0.0] * len(partials[0])
     return [
@@ -111,6 +113,42 @@ def _lane_striped_partition_reduce(exp_sums, max_logits, partials):
     return accumulators
 
 
+def _parallel_lds_partition_reduce(exp_sums, max_logits, partials, sink=None):
+    """Model the D=128 large-NP workgroup and its cross-wave LDS merge."""
+    num_partitions = len(exp_sums)
+    parallel_groups = 2 if num_partitions <= 96 else 4
+    parts_per_group = (num_partitions + parallel_groups - 1) // parallel_groups
+    global_max = max(max_logits)
+    scaled_sums = [
+        part_sum * math.exp(part_max - global_max) if part_max != -math.inf else 0.0
+        for part_sum, part_max in zip(exp_sums, max_logits)
+    ]
+    denominator = sum(scaled_sums)
+    if sink is not None and global_max != -math.inf:
+        denominator += math.exp(sink - global_max)
+    if denominator == 0.0:
+        return [0.0] * len(partials[0])
+    weights = [value / denominator for value in scaled_sums]
+
+    group_accumulators = []
+    for group in range(parallel_groups):
+        begin = group * parts_per_group
+        end = min(begin + parts_per_group, num_partitions)
+        group_accumulators.append(
+            [
+                sum(
+                    partials[part][element] * weights[part]
+                    for part in range(begin, end)
+                )
+                for element in range(len(partials[0]))
+            ]
+        )
+    return [
+        sum(group[element] for group in group_accumulators)
+        for element in range(len(partials[0]))
+    ]
+
+
 @pytest.mark.parametrize(
     "num_partitions",
     [26, 30, 32, 34, 36, 40, 64, 65, 96, 127, 128, 129, 160, 192, 255, 256],
@@ -140,3 +178,34 @@ def test_lane_striped_reduce_all_empty_is_zero(num_partitions):
     # The tile kernel writes finite neutral scratch for empty partitions.
     partials = [[0.0] * 7 for _ in range(num_partitions)]
     assert _lane_striped_partition_reduce(exp_sums, max_logits, partials) == [0.0] * 7
+
+
+@pytest.mark.parametrize("num_partitions", [65, 96, 97, 128, 160, 192, 255, 256])
+@pytest.mark.parametrize("use_sink", [False, True])
+def test_parallel_lds_reduce_matches_flat_reference(num_partitions, use_sink):
+    rng = random.Random(10_000 + num_partitions)
+    max_logits = [rng.uniform(-20.0, 5.0) for _ in range(num_partitions)]
+    exp_sums = [rng.uniform(0.01, 10.0) for _ in range(num_partitions)]
+    partials = [
+        [rng.uniform(-2.0, 2.0) for _ in range(128)] for _ in range(num_partitions)
+    ]
+    for part in range(7, num_partitions, 37):
+        max_logits[part] = -math.inf
+        exp_sums[part] = 0.0
+    sink = rng.uniform(-10.0, 4.0) if use_sink else None
+
+    expected = _flat_partition_reduce(exp_sums, max_logits, partials, sink)
+    actual = _parallel_lds_partition_reduce(exp_sums, max_logits, partials, sink)
+    assert actual == pytest.approx(expected, rel=2e-15, abs=2e-15)
+
+
+@pytest.mark.parametrize("num_partitions", [65, 96, 128, 160, 192, 256])
+@pytest.mark.parametrize("sink", [None, -2.0])
+def test_parallel_lds_reduce_all_empty_is_zero(num_partitions, sink):
+    exp_sums = [0.0] * num_partitions
+    max_logits = [-math.inf] * num_partitions
+    partials = [[0.0] * 128 for _ in range(num_partitions)]
+    assert (
+        _parallel_lds_partition_reduce(exp_sums, max_logits, partials, sink)
+        == [0.0] * 128
+    )
