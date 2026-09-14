@@ -2987,7 +2987,6 @@ def _flash_attn_varlen_forward(
                 and hdim_v == 256
                 and q.dtype == dtypes.bf16
                 and get_gfx() == "gfx950"
-                and not causal
             )
         )
         ret = ret and (nhead_q % nhead_k == 0)
