@@ -405,3 +405,7 @@ def test_gfx942_requested_kid_matches_pre_pr_generated_launcher(N, requested, ex
         requested_split_k=1,
     )
     assert (None if plan is None else plan.resolved_kid) == expected
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__]))

@@ -284,3 +284,7 @@ def test_mxscale_invalid_tuned_kid_warns_and_uses_heuristic(
     finally:
         policy.lookup_mxscale_bmm_config.cache_clear()
         policy._load_mxscale_bmm_tuned.cache_clear()
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__]))

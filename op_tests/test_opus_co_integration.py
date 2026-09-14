@@ -372,3 +372,7 @@ def test_gfx1250_tuner_selects_co_without_split_k(monkeypatch):
     instance = gfx1250_4wave_co_kernels_list[min(GFX1250_4WAVE_CO_KIDS)]
     assert candidate_splitK(64, 128, 4096, 1, 256, instance) == [0]
     assert not kid_rejects_shape(instance, 65, 129, 4097)
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__]))
