@@ -30,6 +30,7 @@ def stride_widths(monkeypatch):
     return widths
 
 
+@pytest.mark.parametrize("return_lse", [False, True])
 @pytest.mark.parametrize(
     "nq,nk,dim,causal,left",
     [
@@ -39,7 +40,9 @@ def stride_widths(monkeypatch):
         (17, 17, 8, False, -1),
     ],
 )
-def test_varlen_stride_dispatch_parity(nq, nk, dim, causal, left, stride_widths):
+def test_varlen_stride_dispatch_parity(
+    nq, nk, dim, causal, left, return_lse, stride_widths
+):
     torch.manual_seed(47)
     # Offset, noncontiguous input views also exercise masked head padding.
     q, k, v = [
@@ -61,6 +64,7 @@ def test_varlen_stride_dispatch_parity(nq, nk, dim, causal, left, stride_widths)
         nk,
         causal=causal,
         window_size=(left, -1),
+        return_lse=return_lse,
     )
     with torch.inference_mode():
         control = invoke()
@@ -78,8 +82,17 @@ def test_varlen_stride_dispatch_parity(nq, nk, dim, causal, left, stride_widths)
             mask &= ki <= qi
         if left >= 0:
             mask &= ki >= qi - left
-        ref = (scores.masked_fill(~mask, -torch.inf).softmax(-1) @ vv).transpose(0, 1)
-        torch.testing.assert_close(candidate.float(), ref, atol=0.02, rtol=0.03)
+        scores = scores.masked_fill(~mask, -torch.inf)
+        ref = (scores.softmax(-1) @ vv).transpose(0, 1)
+        output = candidate[0] if return_lse else candidate
+        torch.testing.assert_close(output.float(), ref, atol=0.02, rtol=0.03)
+        if return_lse:
+            lse = candidate[1]
+            assert lse.shape == (nq, 8)
+            assert lse.dtype == torch.float32
+            torch.testing.assert_close(
+                lse, scores.logsumexp(-1).transpose(0, 1), atol=0.002, rtol=0.002
+            )
 
         stream = torch.cuda.Stream()
         stream.wait_stream(torch.cuda.current_stream())
