@@ -342,6 +342,40 @@ def test_v_prefetch_workgroup_interval(batch_size, expected):
     )
 
 
+@pytest.mark.parametrize(
+    "batch_size,max_partitions,expected",
+    [(1, 8, 8), (1, 256, 256), (16, 256, 32), (64, 256, 8)],
+)
+def test_recommended_splits_has_configurable_upper_clamp(
+    monkeypatch, batch_size, max_partitions, expected
+):
+    """The default stays at eight while long-context callers may opt into 256."""
+    if get_recommended_splits is None:
+        pytest.skip("FlyDSL is not available")
+    monkeypatch.setattr(
+        torch.cuda,
+        "get_device_properties",
+        lambda *_args, **_kwargs: type("Props", (), {"multi_processor_count": 256})(),
+    )
+    assert (
+        get_recommended_splits(
+            batch_size,
+            num_kv_heads=1,
+            split_kv_blocks=2,
+            max_partitions=max_partitions,
+        )
+        == expected
+    )
+
+
+@pytest.mark.parametrize("max_partitions", [0, 3, 257])
+def test_recommended_splits_rejects_invalid_upper_clamp(max_partitions):
+    if get_recommended_splits is None:
+        pytest.skip("FlyDSL is not available")
+    with pytest.raises(ValueError, match="max_partitions"):
+        get_recommended_splits(1, 1, max_partitions=max_partitions)
+
+
 def run_torch(
     query: torch.Tensor,
     key_cache: torch.Tensor,
@@ -430,6 +464,7 @@ def run_pa_decode_tile_case(
     block_size,
     dtype,
     trans_v,
+    max_partitions=8,
 ):
     if pa_decode is None or get_recommended_splits is None:
         raise RuntimeError("FlyDSL is not available")
@@ -508,6 +543,7 @@ def run_pa_decode_tile_case(
         batch_size,
         num_kv_heads,
         split_kv_blocks=KV_COMPUTE_BLOCK // block_size,
+        max_partitions=max_partitions,
     )
     partial_shape = (
         batch_size,
@@ -1547,6 +1583,12 @@ def main():
         help="""V-cache layouts: 0 is the plain 4-D cache, 1 the transposed 5-D
         cache production serves.""",
     )
+    parser.add_argument(
+        "--max-partitions",
+        type=int,
+        default=8,
+        help="""Upper clamp passed to get_recommended_splits (4..256).""",
+    )
     args = parser.parse_args()
 
     rows = []
@@ -1564,6 +1606,7 @@ def main():
                 block_size,
                 dtype,
                 bool(trans_v),
+                args.max_partitions,
             )
         )
 

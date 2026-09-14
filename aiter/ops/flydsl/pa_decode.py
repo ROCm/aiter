@@ -62,12 +62,24 @@ def get_recommended_splits(
     num_sequences: int,
     num_kv_heads: int,
     split_kv_blocks: int = 1,
+    max_partitions: int = 8,
 ) -> int:
+    """Choose a split count, with a caller-configurable upper clamp.
+
+    The default of eight preserves the existing policy. Long-context callers
+    can opt into the FlyDSL reducer's larger domain with, for example,
+    ``max_partitions=256``.
+    """
+    if not 4 <= max_partitions <= MAX_CONTEXT_PARTITIONS:
+        raise ValueError(
+            f"max_partitions must be in [4, {MAX_CONTEXT_PARTITIONS}], "
+            f"got {max_partitions}"
+        )
     props = torch.cuda.get_device_properties(torch.device("cuda"))
     num_sm = props.multi_processor_count * 2
     denom = max(1, num_sequences * num_kv_heads * split_kv_blocks)
     n = cdiv(num_sm, denom) * split_kv_blocks
-    return max(4, min(n, 8))
+    return max(4, min(n, max_partitions))
 
 
 def _workgroup_count_enables_v_prefetch(
