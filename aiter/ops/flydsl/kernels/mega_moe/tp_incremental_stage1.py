@@ -377,7 +377,7 @@ def run_tp_incremental_fused(
     use_tile_resource: bool = True, waves_per_eu_hint: int = 2, num_cu: int = 256,
     b_cache_modifier: int = 0, swiglu_limit: float = 0.0, row_major: bool = False,
     num_producers: int | None = None, skew_rank: int = -1, skew_split: int = 0,
-    skew_sleeps: int = 0,
+    skew_sleeps: int = 0, publish_order: torch.Tensor | None = None,
 ):
     # fmt: on
     """Fused min-expert push + per-expert GEMM1. Overlap is the Step 4 contract."""
@@ -396,7 +396,11 @@ def run_tp_incremental_fused(
     n_tiles = (2 * int(inter_dim)) // int(tile_n)
     total_work = (num_valid // int(sort_block_m)) * n_tiles
     grid_x = max(producers, min(total_work, int(num_cu) * int(grid_mult)))
-    order = publish_order_from_topk(local_ids).to(torch.int32).contiguous()
+    order = (
+        publish_order
+        if publish_order is not None
+        else publish_order_from_topk(local_ids).to(torch.int32).contiguous()
+    )
     launch = compile_tp_incremental_fused(
         model_dim=model_dim, inter_dim=inter_dim, npes=workspace.npes,
         topk=int(local_ids.shape[1]), num_producers=producers, row_major=bool(row_major),

@@ -304,9 +304,10 @@ def main():
         "--tp",
         action="store_true",
         help=(
-            "Also run a dp-input/tp-weight variant (all-gather + fused_moe with "
-            "inter_dim-sharded, all-experts-resident weights + all-reduce) and "
-            "check its accuracy against the mori (dp+ep) output, sliced per rank."
+            "Also run a dp-input/tp-weight variant: local MXFP8 quant, NCCL AG "
+            "of ids/weights, fused incremental GEMM1 (min-expert P2P push + "
+            "per-expert overlap), then the existing GEMM2+RS path. Accuracy is "
+            "checked against the mori (dp+ep) output, sliced per rank."
         ),
     )
     args = parser.parse_args()
@@ -527,6 +528,7 @@ def main():
 
     tp_rel_l2 = None
     tp_ms = (float("nan"), float("nan"))
+    tp_stage1_ms = (float("nan"), float("nan"))
     tp_comm_fused = os.environ.get("AITER_TP_COMM_FUSED", "0") == "1"
     if args.tp:
         if rank_tokens:
@@ -536,10 +538,40 @@ def main():
             )
         if mori_graph is None:
             raise ValueError("--tp accuracy check requires Mori (no --mega-only)")
+        from functools import partial
+
+        import flydsl.expr as fx
+
+        from aiter.fused_moe import (
+            _flydsl_v2_stage2_wrapper,
+            _fused_moe_impl,
+            get_padded_M,
+            moe_sorting,
+        )
+        from aiter.ops.flydsl.kernels.mega_moe.quant import per_1x32_mx_quant
+        from aiter.ops.flydsl.kernels.mega_moe.tp_incremental_push import (
+            TpIncrementalWorkspace,
+        )
+        from aiter.ops.flydsl.kernels.mega_moe.tp_incremental_schedule import (
+            expected_token_counts,
+            make_tile_row_base,
+            publish_order_from_topk,
+        )
+        from aiter.ops.flydsl.kernels.mega_moe.tp_incremental_stage1 import (
+            compile_tp_incremental_fused,
+            run_tp_incremental_fused,
+        )
+        from aiter.ops.flydsl.moe_kernels import (
+            build_flydslv2_gemm2_name,
+            pick_flydsl_stage2_tile_k,
+        )
+
         w1_tp, w1_scale_tp, w2_tp, w2_scale_tp = make_weights_tp(
             args.experts, args.model_dim, args.inter_dim, world, rank, device
         )
         world_tokens = world * tokens
+        inter_shard = args.inter_dim // world
+        sort_block_m = 32
         x_g = torch.empty(
             (world_tokens, args.model_dim), dtype=torch.bfloat16, device=device
         )
@@ -551,14 +583,135 @@ def main():
             (tokens, args.model_dim), dtype=torch.bfloat16, device=device
         )
 
-        # AITER_TP_COMM_FUSED=1 replaces the `fused_moe` + NCCL reduce_scatter
-        # pair with the comm-fused Stage2: the ordinary Stage2 GEMM still runs,
-        # but its BF16 result is MXFP8-quantized and reduce-scattered by FlyDSL
-        # kernels over MORI symmetric memory. Only the ReduceScatter half runs -
-        # DP consumes just this rank's shard, so the AllGather is skipped.
+        workspace = TpIncrementalWorkspace(
+            rank=rank,
+            npes=world,
+            max_m_local=tokens,
+            model_dim=args.model_dim,
+            num_experts=args.experts,
+            device=device,
+        )
+        dist.all_gather_into_tensor(route_weights_g, route_weights.contiguous())
+        dist.all_gather_into_tensor(ids_g, ids.contiguous())
+        expected = expected_token_counts(ids_g, args.experts).to(
+            dtype=torch.int32, device=device
+        )
+        sorted_ids0, _, sorted_expert_ids0, num_valid_ids0, _ = moe_sorting(
+            ids_g,
+            route_weights_g,
+            args.experts,
+            args.model_dim,
+            torch.bfloat16,
+            sort_block_m,
+        )
+        num_valid = int(num_valid_ids0[0].item())
+        tile_row_base = make_tile_row_base(num_valid, sort_block_m, device=device)
+        publish_order = publish_order_from_topk(ids).to(torch.int32).contiguous()
+        n_m = num_valid // sort_block_m
+        sorted_rows = max(
+            sorted_ids0.shape[0], sorted_expert_ids0.shape[0] * sort_block_m
+        )
+        scale_cols = (inter_shard // 32 + 7) // 8 * 8
+        padded_rows = (sorted_rows + 255) // 256 * 256
+        gemm1_out = torch.zeros(
+            (sorted_rows, inter_shard), dtype=torch.float8_e4m3fn, device=device
+        )
+        gemm1_scale = torch.zeros(
+            (padded_rows, scale_cols), dtype=torch.uint8, device=device
+        )
+        gemm1_scale_e8m0 = gemm1_scale.view(dtypes.fp8_e8m0)
+        x_fp8 = torch.empty(
+            (tokens, args.model_dim), dtype=torch.float8_e4m3fn, device=device
+        )
+        x_scale = torch.empty(
+            (tokens, args.model_dim // 32), dtype=torch.uint8, device=device
+        )
+        fused_kwargs = dict(
+            model_dim=args.model_dim,
+            inter_dim=inter_shard,
+            expert_offset=0,
+            sort_block_m=sort_block_m,
+            tile_n=256,
+            tile_k=256,
+            num_cu=torch.cuda.get_device_properties(device).multi_processor_count,
+            swiglu_limit=SWIGLU_LIMIT,
+        )
+        compile_tp_incremental_fused(
+            model_dim=args.model_dim,
+            inter_dim=inter_shard,
+            npes=world,
+            topk=args.topk,
+            num_producers=8,
+            swiglu_limit=SWIGLU_LIMIT,
+        )
+        stage2_kn = build_flydslv2_gemm2_name(
+            "fp8",
+            "fp4",
+            "bf16",
+            tm=sort_block_m,
+            tn=256,
+            tk=pick_flydsl_stage2_tile_k(inter_shard),
+            epilog="atomic",
+            persist=False,
+            use_nt=True,
+            sbm=sort_block_m,
+        )
+
+        def tp_metadata_transform(metadata):
+            return replace(
+                metadata,
+                skip_inter_quant=True,
+                fuse_quant="fp8",
+                block_m=sort_block_m,
+                stage2=partial(
+                    _flydsl_v2_stage2_wrapper,
+                    kernelName=stage2_kn,
+                    model_dim=args.model_dim,
+                    inter_dim=inter_shard,
+                    num_experts=args.experts,
+                ),
+            )
+
+        def _quant_local_x():
+            return per_1x32_mx_quant(x, quant_mode="fp8", out=x_fp8, scale=x_scale)
+
+        def _run_fused_stage1(sorted_ids, sorted_expert_ids):
+            stream = fx.Stream(torch.cuda.current_stream().cuda_stream)
+            return run_tp_incremental_fused(
+                workspace,
+                x_fp8,
+                x_scale,
+                ids,
+                gemm1_out,
+                w1_tp,
+                w1_scale_tp,
+                tile_row_base,
+                sorted_expert_ids[:n_m].contiguous(),
+                sorted_ids,
+                gemm1_scale,
+                expected,
+                num_valid,
+                world_tokens,
+                tokens,
+                stream,
+                publish_order=publish_order,
+                **fused_kwargs,
+            )
+
+        def tp_stage1_override(
+            *,
+            sorted_ids,
+            sorted_expert_ids,
+            **_kwargs,
+        ):
+            _quant_local_x()
+            _run_fused_stage1(sorted_ids, sorted_expert_ids)
+            return gemm1_out, gemm1_scale_e8m0
+
+        # AITER_TP_COMM_FUSED=1 replaces NCCL reduce_scatter with the comm-fused
+        # Stage2 RS over a separate MORI communicator (arena merge is Step 6).
         fused_runner = None
         if tp_comm_fused:
-            from aiter.fused_moe import _fused_moe_impl, get_padded_M
             from aiter.ops.flydsl.comm_fused_moe_host import (
                 create_flydsl_comm_fused_runners,
             )
@@ -572,22 +725,16 @@ def main():
             runners = create_flydsl_comm_fused_runners(
                 tp_group=TpGroupShim(rank, world, device),
                 model_dim=args.model_dim,
-                inter_dim=args.inter_dim // world,
+                inter_dim=inter_shard,
                 experts=args.experts,
                 topk=args.topk,
             )
             if bucket not in runners:
                 raise ValueError(f"no comm-fused config for M={bucket}")
-            # Instantiate here: the symmetric-memory allocation and MORI window
-            # registration must happen outside CUDA Graph capture.
             fused_runner = runners[bucket]
             print(f"[STEP] rank={rank} tp-comm-fused-runner m={bucket}", flush=True)
 
         def tp_stage2_override(*, ordinary_stage2, stage2_args, stage2_kwargs):
-            # stage2_args[6] is the framework's moe_out, already zeroed by
-            # moe_sorting for the accumulating Stage2. There is no shared expert
-            # here, so it doubles as the runner's `shared_partial` and no extra
-            # buffer or per-replay zeroing is needed.
             return fused_runner(
                 stage2_args=stage2_args,
                 stage2_kwargs=stage2_kwargs,
@@ -596,49 +743,51 @@ def main():
                 all_gather=False,
             )
 
-        def tp_body():
-            dist.all_gather_into_tensor(x_g, x.contiguous())
-            dist.all_gather_into_tensor(route_weights_g, route_weights.contiguous())
-            dist.all_gather_into_tensor(ids_g, ids.contiguous())
-            if fused_runner is not None:
-                holders["tp"] = _fused_moe_impl(
-                    x_g,
-                    w1_tp,
-                    w2_tp,
-                    route_weights_g,
-                    ids_g,
-                    quant_type=aiter.QuantType.per_1x32.value,
-                    w1_scale=w1_scale_tp,
-                    w2_scale=w2_scale_tp,
-                    a1_scale=None,
-                    dtype=torch.bfloat16,
-                    swiglu_limit=SWIGLU_LIMIT,
-                    gate_mode=GateMode.INTERLEAVE.value,
-                    _stage2_override=tp_stage2_override,
-                )
-                return
-            tp_out = fused_moe(
+        def _tp_fused_moe():
+            return _fused_moe_impl(
                 x_g,
                 w1_tp,
                 w2_tp,
                 route_weights_g,
                 ids_g,
-                quant_type=aiter.QuantType.per_1x32,
+                quant_type=aiter.QuantType.per_1x32.value,
                 w1_scale=w1_scale_tp,
                 w2_scale=w2_scale_tp,
                 a1_scale=None,
                 dtype=torch.bfloat16,
                 swiglu_limit=SWIGLU_LIMIT,
                 gate_mode=GateMode.INTERLEAVE.value,
+                _metadata_transform=tp_metadata_transform,
+                _stage1_override=tp_stage1_override,
+                _stage2_override=(
+                    tp_stage2_override if fused_runner is not None else None
+                ),
             )
-            # Only this rank's [rank*tokens:(rank+1)*tokens) slice of the fully-reduced
-            # output is ever used, so replace all_reduce (= reduce_scatter + all_gather)
-            # with just reduce_scatter to skip the unneeded all_gather half.
+
+        def tp_stage1_body():
+            workspace.zero_handshake()
+            dist.all_gather_into_tensor(route_weights_g, route_weights.contiguous())
+            dist.all_gather_into_tensor(ids_g, ids.contiguous())
+            _quant_local_x()
+            _run_fused_stage1(sorted_ids0, sorted_expert_ids0)
+
+        def tp_body():
+            workspace.zero_handshake()
+            dist.all_gather_into_tensor(route_weights_g, route_weights.contiguous())
+            dist.all_gather_into_tensor(ids_g, ids.contiguous())
+            tp_out = _tp_fused_moe()
+            if fused_runner is not None:
+                holders["tp"] = tp_out
+                return
             dist.reduce_scatter_tensor(tp_local_out, tp_out, op=dist.ReduceOp.SUM)
             holders["tp"] = tp_local_out
 
+        print(f"[STEP] rank={rank} tp-incremental-compile", flush=True)
+        tp_stage1_graph = capture(tp_stage1_body)
+        print(f"[STEP] rank={rank} tp-stage1-capture-done", flush=True)
         tp_graph = capture(tp_body)
         print(f"[STEP] rank={rank} tp-capture-done", flush=True)
+        tp_stage1_ms = time_graph(tp_stage1_graph, args.iters, device)
         tp_ms = time_graph(tp_graph, args.iters, device)
 
         tp_local = holders["tp"]
@@ -697,6 +846,7 @@ def main():
             f"stage1={stage1_ms[0]:.4f}/{stage1_ms[1]:.4f}ms "
             f"stage2_combine={stage2_ms[0]:.4f}/{stage2_ms[1]:.4f}ms "
             f"tp_e2e={tp_ms[0]:.4f}/{tp_ms[1]:.4f}ms "
+            f"tp_stage1={tp_stage1_ms[0]:.4f}/{tp_stage1_ms[1]:.4f}ms "
             f"tp_path={'comm_fused_rs' if tp_comm_fused else 'nccl_rs'} rank-mean/max",
             flush=True,
         )

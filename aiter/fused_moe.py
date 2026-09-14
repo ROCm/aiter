@@ -825,6 +825,7 @@ def _fused_moe_impl(
     _metadata_config_file: str | None = None,
     _stage1_extra_args: dict | None = None,
     _stage2_extra_args: dict | None = None,
+    _stage1_override: Callable | None = None,
     _stage2_override: Callable | None = None,
 ) -> torch.Tensor:
     # We do such convert since custom_op schema restriction on block_size_M, and Enum type
@@ -1103,6 +1104,8 @@ def _fused_moe_impl(
     _opus_a8w4.check_route_bucket_metadata(metadata, sorted_expert_ids, logger)
 
     if metadata.run_1stage:
+        if _stage1_override is not None:
+            raise RuntimeError("_stage1_override requires a two-stage MoE config")
         if _stage2_override is not None:
             raise RuntimeError("_stage2_override requires a two-stage MoE config")
         _stage1_call = functools.partial(
@@ -1174,6 +1177,7 @@ def _fused_moe_impl(
             _metadata_config_file=_metadata_config_file,
             _stage1_extra_args=_stage1_extra_args,
             _stage2_extra_args=_stage2_extra_args,
+            _stage1_override=_stage1_override,
             _stage2_override=_stage2_override,
             output=output,
         )
@@ -3160,6 +3164,7 @@ def fused_moe_2stages(
     _metadata_config_file: str | None = None,
     _stage1_extra_args: dict | None = None,
     _stage2_extra_args: dict | None = None,
+    _stage1_override: Callable | None = None,
     _stage2_override: Callable | None = None,
     output=None,
 ):
@@ -3204,6 +3209,59 @@ def fused_moe_2stages(
     )
     if _metadata_transform is not None:
         metadata = _metadata_transform(metadata)
+    extra_stage2_args = dict(_stage2_extra_args or {})
+    if _stage1_override is not None:
+        a2, a2_scale = _stage1_override(
+            sorted_ids=sorted_ids,
+            sorted_weights=sorted_weights,
+            sorted_expert_ids=sorted_expert_ids,
+            num_valid_ids=num_valid_ids,
+            token_num=token_num,
+            inter_dim=inter_dim,
+            block_size_M=block_size_M,
+            metadata=metadata,
+        )
+        stage2_sorted_weights = sorted_weights if not doweight_stage1 else None
+        stage2_args = (
+            a2,
+            w1,
+            w2,
+            sorted_ids,
+            sorted_expert_ids,
+            num_valid_ids,
+            moe_out,
+            topk,
+        )
+        stage2_kwargs = dict(
+            w2_scale=(
+                w2_scale.view(dtypes.fp8_e8m0)
+                if w2.dtype in (dtypes.fp4x2, dtypes.fp8)
+                and w2_scale is not None
+                and w2_scale.element_size() == 1
+                else w2_scale
+            ),
+            a2_scale=a2_scale,
+            block_m=block_size_M,
+            sorted_weights=stage2_sorted_weights,
+            **extra_stage2_args,
+        )
+        if _stage2_override is None:
+            _stage2_call = functools.partial(
+                metadata.stage2,
+                *stage2_args,
+                **stage2_kwargs,
+            )
+        else:
+            _stage2_call = functools.partial(
+                _stage2_override,
+                ordinary_stage2=metadata.stage2,
+                stage2_args=stage2_args,
+                stage2_kwargs=stage2_kwargs,
+            )
+        if kernel_bench_callable is not None:
+            kernel_bench_callable.append(("stage2", _stage2_call))
+        stage2_output = _stage2_call()
+        return moe_out if _stage2_override is None else stage2_output
     if not metadata.prequant:
         a1 = hidden_states
         a1_scale = None

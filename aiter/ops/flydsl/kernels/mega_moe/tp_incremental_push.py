@@ -55,6 +55,15 @@ class TpIncrementalWorkspace:
         self.p2p_received = _p2p_table(self.received, self.rank, self.npes, device)
         self.p2p_ranks_done = _p2p_table(self.ranks_done, self.rank, self.npes, device)
 
+    def zero_handshake(self):
+        """Clear per-replay flags. Caller must cross-rank sync before producers."""
+        self.received.zero_()
+        self.ranks_done.zero_()
+        self.local_prod_done.zero_()
+        self.work_cursor.zero_()
+        self.expert0_done.zero_()
+        self.overlap.zero_()
+
     @property
     def rx(self):
         return self.rx_u8.view(torch.float8_e4m3fn)
