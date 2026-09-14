@@ -51,7 +51,7 @@ NSPLIT = 3
 def _num_cu() -> int:
     try:
         return int(get_cu_num())
-    except Exception:
+    except (RuntimeError, AssertionError, ValueError):
         return int(
             torch.cuda.get_device_properties(
                 torch.cuda.current_device()

@@ -41,9 +41,7 @@ DV = 128
 LOG2E = 1.4426950408889634
 
 ROWS_DELTA = 32  # rows reduced per delta workgroup (2 unrolled 16-row passes)
-NUM_THREADS = (
-    512
-)
+NUM_THREADS = 512
 
 KEYS_PER_WG = 128  # dK/dV job: keys owned by a workgroup (16 per wave)
 QUERY_TILE = 32  # dK/dV job: queries streamed per iteration
@@ -141,10 +139,12 @@ def _pack4_trunc(vals):
     )
     return packed.bitcast(fx.BFloat16)
 
+
 def _to_bf16(v):
     """fp32 -> bf16 in TWO VALU ops (add + shift), for the epilogue's scalar stores."""
     bits = v.bitcast(fx.Uint32) + fx.Uint32(0x00008000)
     return (bits >> fx.Uint32(16)).to(fx.Uint16).bitcast(fx.BFloat16)
+
 
 def _buffer_view(tensor, nbytes, fx_dt, vec=1):
     """Flat ``(ntile, vec)`` buffer-tensor view with an EXACT num_records.
@@ -156,6 +156,7 @@ def _buffer_view(tensor, nbytes, fx_dt, vec=1):
     return fx.Tensor(
         fx.make_view(fx.get_iter(buf), fx.make_layout((ntile, vec), (vec, 1)))
     )
+
 
 def _atom(fx_dt, vec):
     """Widest single buffer copy atom covering a ``vec``-wide ``fx_dt`` fragment."""
