@@ -429,6 +429,7 @@ def run_pa_decode_tile_case(
     context_length,
     block_size,
     dtype,
+    trans_v,
 ):
     if pa_decode is None or get_recommended_splits is None:
         raise RuntimeError("FlyDSL is not available")
@@ -476,7 +477,16 @@ def run_pa_decode_tile_case(
         .permute(0, 1, 3, 2, 4)
         .contiguous()
     )
-    value_cache = value_quant.contiguous()
+    if trans_v:
+        value_cache = (
+            value_quant.permute(0, 1, 3, 2)
+            .contiguous()
+            .view(num_blocks, num_kv_heads, block_size // 16, 16, head_dim)
+            .permute(0, 1, 2, 4, 3)
+            .contiguous()
+        )
+    else:
+        value_cache = value_quant.contiguous()
     block_tables = torch.arange(num_blocks, dtype=torch.int32).reshape(
         batch_size, blocks_per_sequence
     )
@@ -510,27 +520,12 @@ def run_pa_decode_tile_case(
     pout = torch.empty(*partial_shape, head_dim, dtype=dtype)
     softmax_scale = head_dim**-0.5
 
-    candidates = {
-        "flydsl": lambda: _run_flydsl(
-            output,
-            query,
-            key_cache,
-            value_cache,
-            block_tables,
-            context_lengths,
-            key_scale,
-            value_scale,
-            num_partitions,
-            softmax_scale,
-            pmax,
-            psum,
-            pout,
-        )
-    }
+    candidates = {"flydsl": _run_flydsl}
 
     # QK and PV each perform one multiply-add per query-head/context pair.
     flops = 4 * batch_size * num_query_heads * context_length * head_dim
-    # Logical tensor traffic: Q + O + the referenced K/V tokens and metadata.
+    # Effective bandwidth counts Q + O + referenced K/V tokens and metadata once.
+    # It excludes padded tokens, repeated loads, and partition scratch traffic.
     nbytes = (
         2 * query.numel() * query.element_size()
         + 2
@@ -547,7 +542,23 @@ def run_pa_decode_tile_case(
 
     ret = {"gfx": get_gfx_runtime(), "partitions": num_partitions}
     for name, fn in candidates.items():
-        out, us = run_perftest(fn)
+        # Pass tensors explicitly so perftest can rotate their allocations.
+        out, us = run_perftest(
+            fn,
+            output,
+            query,
+            key_cache,
+            value_cache,
+            block_tables,
+            context_lengths,
+            key_scale,
+            value_scale,
+            num_partitions,
+            softmax_scale,
+            pmax,
+            psum,
+            pout,
+        )
         err = checkAllclose(
             reference.to(dtypes.fp32),
             out.to(dtypes.fp32),
@@ -573,6 +584,7 @@ def _run_accuracy_case(
     query_dtype,
     num_partitions,
     tolerance,
+    trans_v=False,
 ):
     """Run PA against a dequantized-FP8 torch reference without benchmarking."""
     _require_gpu()
@@ -605,7 +617,16 @@ def _run_accuracy_case(
         .permute(0, 1, 3, 2, 4)
         .contiguous()
     )
-    value_cache = value_quant.contiguous()
+    if trans_v:
+        value_cache = (
+            value_quant.permute(0, 1, 3, 2)
+            .contiguous()
+            .view(num_blocks, num_kv_heads, block_size // 16, 16, head_dim)
+            .permute(0, 1, 2, 4, 3)
+            .contiguous()
+        )
+    else:
+        value_cache = value_quant.contiguous()
 
     block_tables = torch.zeros(
         batch_size, max_pages, dtype=dtypes.i32, device=query.device
@@ -1214,14 +1235,20 @@ def test_page128_chunk_boundaries(context_length, trans_v, per_token):
     _assert_matches(output, reference)
 
 
+@pytest.mark.parametrize("block_size", [16, 128])
 @pytest.mark.parametrize("context_length", [2048, 100000, 200000])
 @pytest.mark.parametrize("query_length", [1, 3])
 @pytest.mark.parametrize("per_token", [False, True])
-def test_tp4_page128_contexts(context_length, query_length, per_token):
-    """64 Q / 4 KV heads under TP4: Hq16, Hkv1, D128, including dense MTP."""
+def test_tp4_contexts(block_size, context_length, query_length, per_token):
+    """64 Q / 4 KV heads under TP4: Hq16, Hkv1, D128, including dense MTP.
+
+    Page size decides how many block-table entries a 256-token tile walks --
+    two at page-128, sixteen at page-16 -- so both served page sizes are run
+    against every context.
+    """
     _require_gpu()
     output, reference = _adversarial_case(
-        block_size=128,
+        block_size=block_size,
         query_group_size=16,
         context_length=context_length,
         query_length=query_length,
@@ -1230,6 +1257,32 @@ def test_tp4_page128_contexts(context_length, query_length, per_token):
         num_partitions=8,
     )
     _assert_matches(output, reference)
+
+
+@pytest.mark.parametrize("batch_size", [1, 2, 4, 8, 16, 32, 64])
+@pytest.mark.parametrize("block_size", [16, 128])
+@pytest.mark.parametrize("context_length", [2048, 100000, 200000])
+def test_tp4_decode_batches(batch_size, block_size, context_length):
+    """Served TP4 decode grid: Hq16, Hkv1, D128, transposed V.
+
+    Batch is the only axis that moves the CTA count, and at NP=8 the sweep
+    straddles the tuned V-prefetch window (256 < batch * 8 <= 512 on a 256-CU
+    part), so page-128 batch 64 compiles the prefetch specialization while the
+    smaller batches compile the default schedule. Page 16 never enters that
+    window -- the gate also requires block_size == 128 -- so it covers the
+    sixteen-pages-per-tile block-table walk over the same grids instead.
+    """
+    _run_accuracy_case(
+        [context_length] * batch_size,
+        num_query_heads=16,
+        num_kv_heads=1,
+        head_dim=128,
+        block_size=block_size,
+        query_dtype=dtypes.bf16,
+        num_partitions=8,
+        tolerance=FIXED_LENGTH_ACCURACY_TOLERANCE,
+        trans_v=True,
+    )
 
 
 @pytest.mark.parametrize("trans_v", [False, True])
@@ -1481,11 +1534,20 @@ def main():
         default=[16, 64, 128],
         help="""KV-cache block sizes.""",
     )
+    parser.add_argument(
+        "--trans-v",
+        type=int,
+        nargs="*",
+        choices=[0, 1],
+        default=[0, 1],
+        help="""V-cache layouts: 0 is the plain 4-D cache, 1 the transposed 5-D
+        cache production serves.""",
+    )
     args = parser.parse_args()
 
     rows = []
-    for dtype, batch_size, shape, block_size in itertools.product(
-        args.dtype, args.batch, args.shapes, args.block_size
+    for dtype, batch_size, shape, block_size, trans_v in itertools.product(
+        args.dtype, args.batch, args.shapes, args.block_size, args.trans_v
     ):
         num_query_heads, num_kv_heads, head_dim, context_length = shape
         rows.append(
@@ -1497,6 +1559,7 @@ def main():
                 context_length,
                 block_size,
                 dtype,
+                bool(trans_v),
             )
         )
 
