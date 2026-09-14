@@ -687,6 +687,11 @@ void mla_decode_stage1_asm_fwd(
 
     const HipDeviceGuard device_guard(Q->device_id);
 
+    AITER_CHECK(output->dtype() == AITER_DTYPE_bf16 || output->dtype() == AITER_DTYPE_fp16,
+                __func__,
+                ": output must use a 16-bit floating dtype (BF16 or FP16), got ",
+                AiterDtype_to_str(output->dtype()));
+
     std::string arch_id = get_gpu_arch();
     if(arch_id == "gfx1250")
     {
