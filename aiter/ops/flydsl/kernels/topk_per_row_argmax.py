@@ -36,6 +36,14 @@ from aiter.ops.flydsl.kernels.kernels_common import kernel_signature, ord_signed
 from aiter.ops.flydsl.kernels.tensor_shim import buf_copy_atom
 
 _VEC = 4
+# Swept jointly with the split rule below -- 64/128/256/512 against every split
+# count, on the same 34 cells -- because the two are coupled: a narrower block
+# absorbs less of a slice, which is what the split rule decides. 256 is the best
+# single width (mean 1.043x off a per-cell (block, split) oracle, against 1.046
+# for 128, 1.064 for 512 and 1.080 for 64), and no block rule tried beat holding
+# it flat. The whole configuration sits 1.056x off that oracle, so ~1.3% is left
+# in the split rule and the rest needs a per-cell block choice nobody has found a
+# form for. `argmax_joint_fit.py` re-runs the sweep.
 _BLOCK_THREADS = 256
 _INT32_MIN = -2147483648
 
