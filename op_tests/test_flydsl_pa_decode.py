@@ -5,7 +5,6 @@
 
 import argparse
 import importlib
-import inspect
 import itertools
 
 import pandas as pd
@@ -16,7 +15,6 @@ import aiter
 from aiter import dtypes, per_tensor_quant
 from aiter.jit.utils.chip_info import get_gfx_runtime
 from aiter.ops.attention import pa_decode_flydsl as public_pa_decode
-from aiter.ops.triton.gluon.pa_decode_gluon import pa_decode_gluon
 from aiter.test_common import benchmark, checkAllclose, run_perftest
 
 
@@ -33,9 +31,8 @@ def _default_cuda_device():
 
 SUPPORTED_GFX = ["gfx942", "gfx950"]
 KV_COMPUTE_BLOCK = 256
-# Match the corresponding FP8 Gluon accuracy contracts: fixed-length outputs
-# use the tighter bound, while independently selected variable-length rows use
-# the established varlen bound.
+# Fixed-length outputs use the tighter bound, while independently selected
+# variable-length rows use the established varlen bound.
 FIXED_LENGTH_ACCURACY_TOLERANCE = 5e-3
 VARIABLE_LENGTH_ACCURACY_TOLERANCE = 5e-2
 
@@ -77,36 +74,12 @@ def _require_gpu():
         pytest.skip(f"pa_decode is unsupported on {get_gfx_runtime()}")
 
 
-def test_pa_decode_api_matches_gluon():
-    if pa_decode is None:
-        pytest.skip("FlyDSL is not available")
-
-    flydsl_parameters = inspect.signature(pa_decode).parameters
-    gluon_parameters = inspect.signature(pa_decode_gluon).parameters
-    public_parameters = inspect.signature(public_pa_decode).parameters
-
-    assert tuple(flydsl_parameters) == tuple(gluon_parameters)
-    assert tuple(public_parameters) == tuple(gluon_parameters)
-    for name, parameter in flydsl_parameters.items():
-        gluon_parameter = gluon_parameters[name]
-        assert parameter.kind == gluon_parameter.kind
-        assert parameter.default == gluon_parameter.default
-        assert public_parameters[name].kind == gluon_parameter.kind
-        assert public_parameters[name].default == gluon_parameter.default
-
-
-def test_pa_decode_maps_gluon_buffers_and_scale_layout(monkeypatch):
+def test_pa_decode_maps_buffers_and_scale_layout(monkeypatch):
     _require_gpu()
 
     pa_decode_module = importlib.import_module("aiter.ops.flydsl.pa_decode")
-    gluon_module = importlib.import_module("aiter.ops.triton.gluon.pa_decode_gluon")
     attention_module = importlib.import_module("aiter.ops.attention")
     captured = {}
-
-    assert (
-        gluon_module.launch_pa_decode_ps_reduce_flydsl
-        is pa_decode_module.launch_pa_decode_ps_reduce
-    )
 
     monkeypatch.setattr(
         pa_decode_module,
@@ -218,108 +191,6 @@ def test_pa_decode_maps_gluon_buffers_and_scale_layout(monkeypatch):
         temporary_output=temporary_output,
     )
     assert dispatches == ["flydsl"]
-
-
-def _call_gluon_reduce_wrapper(gluon_module, head_size):
-    output = torch.empty(1, 1, 1, 1, head_size, dtype=dtypes.bf16, device="cpu")
-    exp_sums = torch.empty(1, 1, 4, 1, dtype=dtypes.fp32, device="cpu")
-    max_logits = torch.empty_like(exp_sums)
-    logits = torch.empty(1, 1, 4, 1, head_size, dtype=dtypes.bf16, device="cpu")
-    context_lengths = torch.tensor([256], dtype=dtypes.i32, device="cpu")
-
-    gluon_module._paged_attention_decode_v2_reduce_kernel_wrapper(
-        (1, 1, 1),
-        output,
-        exp_sums,
-        max_logits,
-        logits,
-        context_lengths,
-        None,
-        output.stride(0),
-        output.stride(1),
-        output.stride(2),
-        output.stride(3),
-        exp_sums.stride(0),
-        exp_sums.stride(1),
-        exp_sums.stride(2),
-        logits.stride(0),
-        logits.stride(1),
-        logits.stride(2),
-        logits.stride(3),
-        1,
-        1,
-        head_size,
-        256,
-        PS=True,
-        context_partition_num=4,
-    )
-
-
-def test_gluon_unsupported_flydsl_reducer_falls_back(monkeypatch):
-    """An unsupported optional reducer must fall back instead of failing dispatch."""
-    _require_gpu()
-    gluon_module = importlib.import_module("aiter.ops.triton.gluon.pa_decode_gluon")
-    triton_launches = []
-    flydsl_launches = []
-
-    class TritonReduceStub:
-        def __getitem__(self, grid):
-            def launch(*args, **kwargs):
-                triton_launches.append((grid, args, kwargs))
-
-            return launch
-
-    monkeypatch.setattr(gluon_module, "CXX_PS_REDUCE_AVAILABLE", False)
-    monkeypatch.setattr(gluon_module, "FLYDSL_PS_REDUCE_AVAILABLE", True)
-    monkeypatch.setattr(
-        gluon_module,
-        "launch_pa_decode_ps_reduce_flydsl",
-        lambda *args, **kwargs: flydsl_launches.append((args, kwargs)),
-    )
-    monkeypatch.setattr(
-        gluon_module,
-        "paged_attention_decode_ps_reduce_kernel",
-        TritonReduceStub(),
-    )
-
-    _call_gluon_reduce_wrapper(gluon_module, head_size=96)
-
-    assert not flydsl_launches
-    assert len(triton_launches) == 1
-    assert triton_launches[0][0] == (1, 1, 1)
-
-
-def test_gluon_supported_flydsl_reducer_does_not_mask_errors(monkeypatch):
-    """Errors from a selected FlyDSL reducer are not mistaken for unsupported."""
-    _require_gpu()
-    gluon_module = importlib.import_module("aiter.ops.triton.gluon.pa_decode_gluon")
-    triton_launches = []
-
-    class TritonReduceStub:
-        def __getitem__(self, grid):
-            def launch(*args, **kwargs):
-                triton_launches.append((grid, args, kwargs))
-
-            return launch
-
-    def fail_flydsl(*args, **kwargs):
-        raise ImportError("FlyDSL reducer failed internally")
-
-    monkeypatch.setattr(gluon_module, "CXX_PS_REDUCE_AVAILABLE", False)
-    monkeypatch.setattr(gluon_module, "FLYDSL_PS_REDUCE_AVAILABLE", True)
-    monkeypatch.setattr(gluon_module, "launch_pa_decode_ps_reduce_flydsl", fail_flydsl)
-    monkeypatch.setattr(
-        gluon_module,
-        "paged_attention_decode_ps_reduce_kernel",
-        TritonReduceStub(),
-    )
-    monkeypatch.setattr(
-        gluon_module.torch.cuda, "current_stream", lambda device: object()
-    )
-
-    with pytest.raises(ImportError, match="failed internally"):
-        _call_gluon_reduce_wrapper(gluon_module, head_size=128)
-    assert not triton_launches
 
 
 @pytest.mark.parametrize(
