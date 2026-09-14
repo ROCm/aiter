@@ -282,7 +282,10 @@ def _gemm2_body_a16w4(
     w_dtype="fp4",
     use_k16=False,
     use_reduce=False,
+    a_stride=None,
     topk=1,
+    token_slot_input=False,
+    fixed_expert=None,
 ):
     """a16w4/a16wi4/a16w16 stage2 body. K=inter_dim (contraction), N=model_dim (N_OUT).
 
@@ -293,6 +296,7 @@ def _gemm2_body_a16w4(
     KH_TILE_BYTES = TILE_K * elem_bytes
     LDS_STRIDE = TILE_K
     K = INTER
+    A_STRIDE = K if a_stride is None else a_stride
     K_TILES_TOTAL = K // TILE_K
     m_repeat = BM // 16
     k_unroll = KH_TILE_BYTES // 64
@@ -307,7 +311,11 @@ def _gemm2_body_a16w4(
 
     m_block_idx = bx_i32 // fx.Int32(_num_n_blocks)
     n_block_idx = bx_i32 % fx.Int32(_num_n_blocks)
-    e = rocdl.readfirstlane(T.i32, _raw(_global_i32_at(arg_eids, m_block_idx)))
+    e = (
+        fx.Int32(fixed_expert)
+        if const_expr(fixed_expert is not None)
+        else rocdl.readfirstlane(T.i32, _raw(_global_i32_at(arg_eids, m_block_idx)))
+    )
     m_row = m_block_idx * fx.Int32(BM)  # first sorted row of this m-block
     by_n = n_block_idx * fx.Int32(TILE_N)
 
@@ -333,7 +341,16 @@ def _gemm2_body_a16w4(
     # A row = SORTED position m_row + row_local; the whole block (256 threads) stages one
     # BM x TILE_K tile. stage2 has a single unslotted A region and XOR-swizzles it to
     # kill LDS bank conflicts.
-    c_k_div4 = (K * elem_bytes) // 4
+    c_k_div4 = (A_STRIDE * elem_bytes) // 4
+
+    def _a_row_base_dwords(row_local):
+        if const_expr(token_slot_input):
+            fused = fx.Int32(_global_i32_at(arg_stids, m_row + row_local))
+            token = fused & fx.Int32(0x00FFFFFF)
+            slot = fused >> fx.Int32(24)
+            return (token * fx.Int32(topk) + slot) * fx.Int32(c_k_div4)
+        return (m_row + row_local) * fx.Int32(c_k_div4)
+
     a_loader = make_a_loader(
         lds_raw_ptr,
         num_i32=BM * LDS_STRIDE // 2,
@@ -347,7 +364,7 @@ def _gemm2_body_a16w4(
         a_ptr=arg_a,
         a_num_bytes=fx.Int64(0xFFFFFFFF),
         a_load_threads=256,
-        row_base_dwords=lambda row_local: (m_row + row_local) * fx.Int32(c_k_div4),
+        row_base_dwords=_a_row_base_dwords,
         dma_cache_mod=b_cache_mod,
         dma_via_vgpr=use_k16,
     )
