@@ -20,7 +20,7 @@ from flydsl.expr.arith import ArithValue
 from flydsl.expr.typing import T
 
 from aiter.jit.utils.chip_info import get_lds_capacity_bytes
-from aiter.ops.flydsl.kernels import buffer_ops, vector
+from aiter.ops.flydsl.kernels import buffer_ops
 
 from .tensor_shim import _to_raw as raw
 
@@ -685,7 +685,7 @@ def prepare_pair(packed, contraction: ContractionMode):
         return raw(packed)
     expanded = unpack_bf16x2_f32(packed)
     if contraction == ContractionMode.PACKED_F32:
-        return vector.from_elements(T.vec(2, T.f32), list(expanded))
+        return raw(fx.Vector.from_elements(list(expanded), fx.Float32))
     return expanded
 
 
@@ -761,16 +761,8 @@ def reduce_wave_accumulator(accumulator, lane, contraction, reduction):
             if use_dpp
             else bpermute_reduce_sum_f32(accumulator, lane)
         )
-    lo = vector.extract(
-        accumulator,
-        static_position=[0],
-        dynamic_position=[],
-    )
-    hi = vector.extract(
-        accumulator,
-        static_position=[1],
-        dynamic_position=[],
-    )
+    lo = raw(fx.Vector(accumulator)[0])
+    hi = raw(fx.Vector(accumulator)[1])
     if use_dpp:
         lo = wavefront_reduce_sum_f32(lo)
         hi = wavefront_reduce_sum_f32(hi)
@@ -815,8 +807,8 @@ def store_bf16(
 
 def mfma_4x4x4_bf16(a_fragment, b_fragment, accumulator):
     """Use the shared native atom; FlyDSL has no matching high-level MMA atom."""
-    a_i16 = vector.bitcast(T.vec(4, T.i16), a_fragment)
-    b_i16 = vector.bitcast(T.vec(4, T.i16), b_fragment)
+    a_i16 = fx.Vector(a_fragment).bitcast(fx.Int16)
+    b_i16 = fx.Vector(b_fragment).bitcast(fx.Int16)
     return fx.rocdl.mfma_f32_4x4x4bf16_1k_(
         T.vec(4, T.f32),
         raw(a_i16),
@@ -829,13 +821,11 @@ def mfma_4x4x4_bf16(a_fragment, b_fragment, accumulator):
 
 
 def bf16x4_slice(fragment, fragment_index: int):
-    return vector.extract_strided_slice(
-        T.vec(MFMA_K, T.bf16),
-        raw(fragment),
-        [fragment_index * MFMA_K],
-        [MFMA_K],
-        [1],
-    )
+    # fx has no extract_strided_slice; a shuffle with a contiguous mask is the
+    # same lane selection and is what main's migrated kernels use.
+    vec = fx.Vector(fragment)
+    base = fragment_index * MFMA_K
+    return raw(vec.shuffle(vec, list(range(base, base + MFMA_K))))
 
 
 def dpp_move_f32(value, control: int):
@@ -852,7 +842,7 @@ def dpp_move_f32(value, control: int):
 
 def reduce_mfma_scalar(accumulator):
     components = [
-        vector.extract(accumulator, static_position=[i], dynamic_position=[])
+        raw(fx.Vector(accumulator)[i])
         for i in range_constexpr(4)
     ]
     result = fx.Float32(components[0])
@@ -889,4 +879,4 @@ def masked_bf16_vector(
             cache_modifier,
         )
         values.append(ArithValue(raw(valid)).select(loaded, zero))
-    return vector.from_elements(T.vec(width, T.bf16), values)
+    return raw(fx.Vector.from_elements(values, fx.BFloat16))

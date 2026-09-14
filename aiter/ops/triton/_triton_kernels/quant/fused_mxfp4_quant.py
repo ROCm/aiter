@@ -1,9 +1,8 @@
 import triton
 import triton.language as tl
 
+from aiter.ops.triton._triton_kernels.quant.quant import _mxfp4_quant_op
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
-
-from .quant import _mxfp4_quant_op
 
 
 @triton.jit

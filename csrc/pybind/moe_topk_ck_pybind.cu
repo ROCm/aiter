@@ -12,7 +12,7 @@ void topk_sigmoid(torch::Tensor topk_weights,   // [tokens, topk]
                   torch::Tensor gating_output); // [tokens, experts]
 } // namespace aiter
 
-PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
+PYBIND11_MODULE(AITER_EXTENSION_NAME, m)
 {
     MOE_TOPK_CK_PYBIND;
 }
