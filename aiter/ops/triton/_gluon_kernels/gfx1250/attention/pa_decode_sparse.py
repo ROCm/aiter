@@ -834,16 +834,24 @@ def _v4_dequant_tile(
     range, so those bytes can never reach a dot.
     """
     for g in tl.static_range(NOPE_DIM // GROUP_SIZE):
-        sc = _v4_group_scale(
-            kv_u8_smem, NOPE_DIM + 2 * g, BLOCK_K, col_layout, group_layout
+        # scaled_upcast folds (e4m3 -> bf16) and the E8M0 multiply into one
+        # v_cvt_scale_pk8_bf16_fp8. It needs the scale EXPANDED to the payload's
+        # shape and layout, so the [BLOCK_K] group byte is broadcast over the
+        # GROUP_SIZE columns it applies to rather than turned into a bf16
+        # multiplier. Exact, same as the multiply it replaces.
+        exps = gl.reshape(
+            kv_u8_smem.slice(NOPE_DIM + 2 * g, 1, dim=1).load(col_layout), [BLOCK_K]
         )
+        exps = gl.convert_layout(exps, gl.SliceLayout(1, group_layout))
         raw = (
             kv_u8_smem.slice(g * GROUP_SIZE, GROUP_SIZE, dim=1)
             .load(group_layout)
             .to(gl.float8e4nv, bitcast=True)
-            .to(gl.bfloat16)
         )
-        kv_bf16_smem.slice(g * GROUP_SIZE, GROUP_SIZE, dim=1).store(raw * sc[:, None])
+        sc, raw = gl.broadcast(exps[:, None], raw)
+        kv_bf16_smem.slice(g * GROUP_SIZE, GROUP_SIZE, dim=1).store(
+            gl.amd.gfx1250.scaled_upcast(raw, sc, gl.bfloat16)
+        )
     kv_bf16_smem.slice(NOPE_DIM, ROPE_DIM, dim=1).store(rope_smem.load(rope_layout))
 
 
@@ -887,6 +895,12 @@ def _cga_shard0(ctas):
 def _cga_bcast(cga):
     """Same CTA-bit count, every dim replicated: one multicast fill per cluster."""
     return [[0 for _ in b] for b in cga]
+
+
+@gluon.constexpr_function
+def _cga_bcast_3d(cga):
+    """Rank-3 all-broadcast CGA with the same CTA-bit count."""
+    return [[0, 0, 0] for _ in cga]
 
 
 @gluon.constexpr_function
@@ -1722,6 +1736,126 @@ def _v4_pv_groups(
     return a0, a1, a2, a3, a4, a5, a6, ar
 
 
+@gluon.jit
+def _v4_dequant_lora_mx(
+    kv_smem,
+    mxs_smem,
+    bf16_smem,
+    BLOCK_K: gl.constexpr,
+    chunk2: gl.constexpr,
+    chunk3: gl.constexpr,
+    SC_SPAN: gl.constexpr,
+    DQ0: gl.constexpr,
+    DQ1: gl.constexpr,
+    DQ2: gl.constexpr,
+):
+    """e4m3 lora half + out-of-line E8M0 scales -> bf16 staging tile.
+
+    Three wide chunks (448 = DQ0 + DQ1 + DQ2) rather than seven quant groups:
+    the ISA showed the per-group version as seven serial store/load pairs, each
+    gated on a full `s_wait_dscnt 0`, with no overlap between them.
+    """
+    _v4_dequant_chunk_mx(
+        kv_smem, mxs_smem, bf16_smem, 0, DQ0, BLOCK_K, chunk2, chunk3, SC_SPAN
+    )
+    _v4_dequant_chunk_mx(
+        kv_smem, mxs_smem, bf16_smem, DQ0, DQ1, BLOCK_K, chunk2, chunk3, SC_SPAN
+    )
+    _v4_dequant_chunk_mx(
+        kv_smem, mxs_smem, bf16_smem, DQ0 + DQ1, DQ2, BLOCK_K, chunk2, chunk3, SC_SPAN
+    )
+
+
+@gluon.jit
+def _v4_dequant_chunk_mx(
+    kv_smem,
+    mxs_smem,
+    bf16_smem,
+    COL: gl.constexpr,
+    WIDTH: gl.constexpr,
+    BLOCK_K: gl.constexpr,
+    chunk2: gl.constexpr,
+    chunk3: gl.constexpr,
+    SC_SPAN: gl.constexpr,
+):
+    """One wide e4m3 -> bf16 chunk, scales expanded to the payload's shape.
+
+    ``scaled_upcast`` wants a per-element scale for fp8, so the chunk's
+    ``WIDTH / SC_SPAN`` E8M0 bytes are broadcast over the SC_SPAN columns each
+    covers. The scale is read through ``SliceLayout(2, chunk3)`` so that the
+    expand_dims to ``[BLOCK_K, NS, 1]`` is legal (expand_dims requires a
+    SliceLayout input), and the broadcast then costs no data movement.
+    """
+    NS: gl.constexpr = WIDTH // SC_SPAN
+    e = mxs_smem.slice(COL // SC_SPAN, NS, dim=1).load(gl.SliceLayout(2, chunk3))
+    # reshape yields a LinearLayout; pin it to chunk3 so the broadcast against
+    # the scale type-checks. The two are the same distribution, so this is free.
+    r3 = gl.convert_layout(
+        gl.reshape(
+            kv_smem.slice(COL, WIDTH, dim=1).load(chunk2), [BLOCK_K, NS, SC_SPAN]
+        ),
+        chunk3,
+    )
+    sc3, r3 = gl.broadcast(e[:, :, None], r3)
+    bf16_smem.slice(COL, WIDTH, dim=1).store(
+        gl.reshape(gl.amd.gfx1250.scaled_upcast(r3, sc3, gl.bfloat16), [BLOCK_K, WIDTH])
+    )
+
+
+@gluon.jit
+def _v4_pv_bf16(
+    p_dot,
+    bf16_smem,
+    rope_smem,
+    a0,
+    a1,
+    a2,
+    ar,
+    dot_v_layout: gl.constexpr,
+    PV0: gl.constexpr,
+    PV1: gl.constexpr,
+    PV2: gl.constexpr,
+):
+    """P @ V over the dequantized tile: 448 = PV0 + PV1 + PV2, plus RoPE.
+
+    Wider dots than one-per-quant-group, and four accumulator live ranges
+    instead of eight. Unrolled because ``memdesc_slice`` needs a literal int.
+    """
+    a0 = gl.amd.gfx1250.wmma(
+        p_dot, bf16_smem.slice(0, PV0, dim=1).load(dot_v_layout), a0
+    )
+    a1 = gl.amd.gfx1250.wmma(
+        p_dot, bf16_smem.slice(PV0, PV1, dim=1).load(dot_v_layout), a1
+    )
+    a2 = gl.amd.gfx1250.wmma(
+        p_dot, bf16_smem.slice(PV0 + PV1, PV2, dim=1).load(dot_v_layout), a2
+    )
+    ar = gl.amd.gfx1250.wmma(p_dot, rope_smem.load(dot_v_layout), ar)
+    return a0, a1, a2, ar
+
+
+@gluon.jit
+def _v4_store_acc(
+    acc,
+    col,
+    WIDTH: gl.constexpr,
+    base_ptr,
+    h_offs,
+    h_mask,
+    stride_h,
+    stride_d,
+    blocked: gl.constexpr,
+):
+    """Store one accumulator at its column offset in the head dim."""
+    d = gl.arange(0, WIDTH, layout=gl.SliceLayout(0, blocked))
+    gl.amd.cdna4.buffer_store(
+        gl.convert_layout(acc, blocked),
+        ptr=base_ptr + col * stride_d,
+        offsets=(h_offs[:, None] * stride_h + d[None, :] * stride_d).to(gl.int32),
+        mask=h_mask[:, None],
+    )
+
+
 _pa_decode_sparse_v4_a8w8_repr = make_kernel_repr(
     "_pa_decode_sparse_v4_a8w8",
     [
@@ -1844,7 +1978,6 @@ def _pa_decode_sparse_v4_a8w8(
     dot_v_layout: gl.constexpr = gl.DotOperandLayout(
         operand_index=1, parent=BF16_WMMA_LAYOUT, k_width=8
     )
-    p_slice_layout: gl.constexpr = gl.SliceLayout(0, dot_p_layout)
     valid_col_mma: gl.constexpr = gl.SliceLayout(0, QK_WMMA_LAYOUT)
 
     QDQ_D_THREADS: gl.constexpr = BLOCK_D // GROUP_SIZE
@@ -1871,12 +2004,25 @@ def _pa_decode_sparse_v4_a8w8(
         order=[1, 0],
         cga_layout=CGA_H,
     )
-    SCALE_COL_LAYOUT: gl.constexpr = gl.BlockedLayout(
-        size_per_thread=[1, 1],
-        threads_per_warp=[WARP_SIZE, 1],
+    # One E8M0 byte per SC_SPAN columns in the gathered scale tile. The dequant
+    # chunk layouts are tiled in units of SC_SPAN so the [BLOCK_K, WIDTH] <->
+    # [BLOCK_K, NS, SC_SPAN] reshape costs nothing.
+    SC_SPAN: gl.constexpr = 32
+    SPAN_THREADS: gl.constexpr = SC_SPAN // 8
+    CGA_B3: gl.constexpr = _cga_bcast_3d(CGA_H)
+    CHUNK2_LAYOUT: gl.constexpr = gl.BlockedLayout(
+        size_per_thread=[1, 8],
+        threads_per_warp=[WARP_SIZE // SPAN_THREADS, SPAN_THREADS],
         warps_per_cta=[num_warps, 1],
         order=[1, 0],
         cga_layout=CGA_B,
+    )
+    CHUNK3_LAYOUT: gl.constexpr = gl.BlockedLayout(
+        size_per_thread=[1, 1, 8],
+        threads_per_warp=[WARP_SIZE // SPAN_THREADS, 1, SPAN_THREADS],
+        warps_per_cta=[num_warps, 1, 1],
+        order=[2, 1, 0],
+        cga_layout=CGA_B3,
     )
     SLOT_BLOCKED_LAYOUT: gl.constexpr = gl.BlockedLayout(
         size_per_thread=[BLOCK_K],
@@ -1891,6 +2037,12 @@ def _pa_decode_sparse_v4_a8w8(
     )
     rope_shared: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
         [[ROPE_DIM, 8]], [BLOCK_K, ROPE_DIM], [1, 0], CGA_B
+    )
+    # Staging tile for the dequantized lora half. Declared BLOCK_D wide because
+    # NOPE_DIM (448) is not a power of two and the padded-layout helper requires
+    # one; only the first NOPE_DIM columns are ever written or read.
+    kv_bf16_shared: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
+        [[BLOCK_D, 8]], [BLOCK_K, BLOCK_D], [1, 0], CGA_B
     )
     q_shared: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
         [[BLOCK_D, 16]], [BLOCK_H, BLOCK_D], [1, 0], CGA_H
@@ -2050,18 +2202,21 @@ def _pa_decode_sparse_v4_a8w8(
             [BLOCK_H], 1.0, dtype=gl.float32, layout=gl.SliceLayout(1, QK_WMMA_LAYOUT)
         )
 
-    # One accumulator per quant group plus one for RoPE: together they tile the
-    # same [BLOCK_H, D] output as the bf16 kernel's single accumulator.
-    a0 = gl.zeros([BLOCK_H, GROUP_SIZE], gl.float32, layout=BF16_WMMA_LAYOUT)
-    a1 = gl.zeros([BLOCK_H, GROUP_SIZE], gl.float32, layout=BF16_WMMA_LAYOUT)
-    a2 = gl.zeros([BLOCK_H, GROUP_SIZE], gl.float32, layout=BF16_WMMA_LAYOUT)
-    a3 = gl.zeros([BLOCK_H, GROUP_SIZE], gl.float32, layout=BF16_WMMA_LAYOUT)
-    a4 = gl.zeros([BLOCK_H, GROUP_SIZE], gl.float32, layout=BF16_WMMA_LAYOUT)
-    a5 = gl.zeros([BLOCK_H, GROUP_SIZE], gl.float32, layout=BF16_WMMA_LAYOUT)
-    a6 = gl.zeros([BLOCK_H, GROUP_SIZE], gl.float32, layout=BF16_WMMA_LAYOUT)
+    # 448 = 256 + 128 + 64, the power-of-two decomposition of the lora half,
+    # plus RoPE: four accumulators tiling the same [BLOCK_H, D] output.
+    PV0: gl.constexpr = 256
+    PV1: gl.constexpr = 128
+    PV2: gl.constexpr = NOPE_DIM - PV0 - PV1
+    a0 = gl.zeros([BLOCK_H, PV0], gl.float32, layout=BF16_WMMA_LAYOUT)
+    a1 = gl.zeros([BLOCK_H, PV1], gl.float32, layout=BF16_WMMA_LAYOUT)
+    a2 = gl.zeros([BLOCK_H, PV2], gl.float32, layout=BF16_WMMA_LAYOUT)
     ar = gl.zeros([BLOCK_H, ROPE_DIM], gl.float32, layout=BF16_WMMA_LAYOUT)
 
-    NUM_BUFFERS: gl.constexpr = 2
+    # 3-deep gather ring plus a 2-deep bf16 staging ring, as in the bf16
+    # kernel: a tile is gathered two iterations ahead of its use, and tile
+    # i+1's dequant writes one staging buffer while tile i's PV reads the other.
+    NUM_BUFFERS: gl.constexpr = 3
+    NUM_STAGE: gl.constexpr = 2
     kv_bufs = gl.allocate_shared_memory(
         unified_kv_ptr.dtype.element_ty,
         [NUM_BUFFERS, BLOCK_K, BLOCK_D],
@@ -2075,7 +2230,10 @@ def _pa_decode_sparse_v4_a8w8(
     scale_bufs = gl.allocate_shared_memory(
         gl.uint8, [NUM_BUFFERS, BLOCK_K, NUM_MX_BLOCKS], mxs_shared
     )
-    NUM_SLOT_BUFFERS: gl.constexpr = 2
+    kv_bf16 = gl.allocate_shared_memory(
+        gl.bfloat16, [NUM_STAGE, BLOCK_K, BLOCK_D], kv_bf16_shared
+    )
+    NUM_SLOT_BUFFERS: gl.constexpr = 4
     slot_bufs = gl.allocate_shared_memory(
         kv_indices_ptr.dtype.element_ty,
         [NUM_SLOT_BUFFERS, 1, BLOCK_K],
@@ -2134,53 +2292,74 @@ def _pa_decode_sparse_v4_a8w8(
     gl.amd.gfx1250.tdm.async_gather(kv_desc, safe_slot_cur, kv_bufs.index(0))
     gl.amd.gfx1250.tdm.async_gather(rope_desc, safe_slot_cur, rope_bufs.index(0))
     gl.amd.gfx1250.tdm.async_gather(mxs_desc, safe_slot_cur, scale_bufs.index(0))
-
-    buf_idx: gl.int32 = 0
+    gl.amd.gfx1250.tdm.async_load(
+        slot_desc, [0, (tile_start + 2) * BLOCK_K], slot_bufs.index(2)
+    )
+    # Four TDM ops per tile here (slot + kv + rope + mxs) against the bf16
+    # kernel's three, so the waits are one deeper. Invariant at the top of
+    # iteration i: exactly 4 outstanding -- slot(i+2) in flight, KV/RoPE/MXS(i+1)
+    # in flight, and staging[i % NUM_STAGE] already holding dequantized tile i.
+    gl.amd.gfx1250.tdm.async_wait(4)  # slot(1) ready
+    slot_reg = slot_bufs.index(1).reshape([BLOCK_K]).load(layout=SLOT_BLOCKED_LAYOUT)
+    if HAS_INVALID:
+        valid_wide = slot_reg >= 0
+        safe_slot_nxt = gl.where(valid_wide, slot_reg, 0)
+        next_valid = gl.convert_layout(valid_wide, valid_col_mma)
+    else:
+        safe_slot_nxt = slot_reg
+    gl.amd.gfx1250.tdm.async_gather(kv_desc, safe_slot_nxt, kv_bufs.index(1))
+    gl.amd.gfx1250.tdm.async_gather(rope_desc, safe_slot_nxt, rope_bufs.index(1))
+    gl.amd.gfx1250.tdm.async_gather(mxs_desc, safe_slot_nxt, scale_bufs.index(1))
+    gl.amd.gfx1250.tdm.async_wait(4)  # KV/RoPE/MXS(0) ready
+    _v4_dequant_lora_mx(
+        kv_bufs.index(0),
+        scale_bufs.index(0),
+        kv_bf16.index(0),
+        BLOCK_K,
+        CHUNK2_LAYOUT,
+        CHUNK3_LAYOUT,
+        SC_SPAN,
+        PV0,
+        PV1,
+        PV2,
+    )
 
     gl.assume(num_iters >= 1)
     for i in tl.range(0, num_iters - 1):
-        async_idx = (buf_idx + 1) % NUM_BUFFERS
-        gl.amd.gfx1250.tdm.async_load(
-            slot_desc,
-            [0, (tile_start + i + 2) * BLOCK_K],
-            slot_bufs.index(i % NUM_SLOT_BUFFERS),
-        )
-        # In flight: slot[i+1], KV[i], RoPE[i], MXS[i], slot[i+2] -- retire the
-        # oldest and keep four.
-        if CTAS_H > 1:
-            gl.amd.gfx1250.cluster.arrive()
-        gl.amd.gfx1250.tdm.async_wait(4)
-        if CTAS_H > 1:
-            gl.amd.gfx1250.cluster.wait()
+        # 1. retire slot(i+2), read it, gather tile i+2 two iterations ahead
+        gl.amd.gfx1250.tdm.async_wait(3)
         slot_reg = (
-            slot_bufs.index((i + 1) % NUM_SLOT_BUFFERS)
+            slot_bufs.index((i + 2) % NUM_SLOT_BUFFERS)
             .reshape([BLOCK_K])
             .load(layout=SLOT_BLOCKED_LAYOUT)
         )
         if HAS_INVALID:
             valid_wide = slot_reg >= 0
             safe_next_slot = gl.where(valid_wide, slot_reg, 0)
-            next_valid = gl.convert_layout(valid_wide, valid_col_mma)
+            next2_valid = gl.convert_layout(valid_wide, valid_col_mma)
         else:
             safe_next_slot = slot_reg
-        gl.amd.gfx1250.tdm.async_gather(
-            kv_desc, safe_next_slot, kv_bufs.index(async_idx)
+        gl.amd.gfx1250.tdm.async_load(
+            slot_desc,
+            [0, (tile_start + i + 3) * BLOCK_K],
+            slot_bufs.index((i + 3) % NUM_SLOT_BUFFERS),
         )
         gl.amd.gfx1250.tdm.async_gather(
-            rope_desc, safe_next_slot, rope_bufs.index(async_idx)
+            kv_desc, safe_next_slot, kv_bufs.index((i + 2) % NUM_BUFFERS)
         )
         gl.amd.gfx1250.tdm.async_gather(
-            mxs_desc, safe_next_slot, scale_bufs.index(async_idx)
+            rope_desc, safe_next_slot, rope_bufs.index((i + 2) % NUM_BUFFERS)
         )
-        if CTAS_H > 1:
-            gl.amd.gfx1250.cluster.arrive()
-        gl.amd.gfx1250.tdm.async_wait(4)
-        if CTAS_H > 1:
-            gl.amd.gfx1250.cluster.wait()
+        gl.amd.gfx1250.tdm.async_gather(
+            mxs_desc, safe_next_slot, scale_bufs.index((i + 2) % NUM_BUFFERS)
+        )
 
         # ---- QK ----
-        k_e4m3 = kv_bufs.index(buf_idx).permute([1, 0]).load(dot_k_layout)
-        k_scale = scale_bufs.index(buf_idx).load(k_scale_layout)
+        # 2. tile i's dot operands BEFORE the dequant below: the LDS pipe is
+        #    serial, so the dequant's traffic for tile i+1 would otherwise sit
+        #    in front of these and the dots could not start until it drained.
+        k_e4m3 = kv_bufs.index(i % NUM_BUFFERS).permute([1, 0]).load(dot_k_layout)
+        k_scale = scale_bufs.index(i % NUM_BUFFERS).load(k_scale_layout)
         scores = gl.amd.gfx1250.wmma_scaled(
             mfma_q,
             q_scale,
@@ -2190,7 +2369,27 @@ def _pa_decode_sparse_v4_a8w8(
             "e4m3",
             gl.zeros([BLOCK_H, BLOCK_K], dtype=gl.float32, layout=QK_WMMA_LAYOUT),
         )
-        kr_t = rope_bufs.index(buf_idx).permute([1, 0]).load(dot_kr_layout)
+        kr_t = rope_bufs.index(i % NUM_BUFFERS).permute([1, 0]).load(dot_kr_layout)
+
+        # 3. retire KV/RoPE/MXS(i+1) and dequantize it into the staging buffer
+        #    tile i's PV is NOT reading this iteration
+        if CTAS_H > 1:
+            gl.amd.gfx1250.cluster.arrive()
+        gl.amd.gfx1250.tdm.async_wait(4)
+        if CTAS_H > 1:
+            gl.amd.gfx1250.cluster.wait()
+        _v4_dequant_lora_mx(
+            kv_bufs.index((i + 1) % NUM_BUFFERS),
+            scale_bufs.index((i + 1) % NUM_BUFFERS),
+            kv_bf16.index((i + 1) % NUM_STAGE),
+            BLOCK_K,
+            CHUNK2_LAYOUT,
+            CHUNK3_LAYOUT,
+            SC_SPAN,
+            PV0,
+            PV1,
+            PV2,
+        )
         scores_r = gl.amd.gfx1250.wmma(
             mfma_qr,
             kr_t,
@@ -2215,38 +2414,27 @@ def _pa_decode_sparse_v4_a8w8(
         a0 = a0 * alpha_pv
         a1 = a1 * alpha_pv
         a2 = a2 * alpha_pv
-        a3 = a3 * alpha_pv
-        a4 = a4 * alpha_pv
-        a5 = a5 * alpha_pv
-        a6 = a6 * alpha_pv
         ar = ar * alpha_pv
         p_dot = gl.convert_layout(p.to(gl.bfloat16), dot_p_layout)
-        a0, a1, a2, a3, a4, a5, a6, ar = _v4_pv_groups(
+        a0, a1, a2, ar = _v4_pv_bf16(
             p_dot,
-            kv_bufs.index(buf_idx),
-            scale_bufs.index(buf_idx),
-            rope_bufs.index(buf_idx),
+            kv_bf16.index(i % NUM_STAGE),
+            rope_bufs.index(i % NUM_BUFFERS),
             a0,
             a1,
             a2,
-            a3,
-            a4,
-            a5,
-            a6,
             ar,
-            BLOCK_K,
-            SCALE_COL_LAYOUT,
-            p_slice_layout,
             dot_v_layout,
-            NOPE_DIM,
-            GROUP_SIZE,
+            PV0,
+            PV1,
+            PV2,
         )
 
         m_i = m_new
         l_i = l_new
         if HAS_INVALID:
             cur_valid = next_valid
-        buf_idx = async_idx
+            next_valid = next2_valid
 
     # ---- Epilogue: final (possibly partial) tile ----
     if CTAS_H > 1:
@@ -2261,8 +2449,9 @@ def _pa_decode_sparse_v4_a8w8(
     else:
         valid_col = final_in_range
 
-    k_e4m3 = kv_bufs.index(buf_idx).permute([1, 0]).load(dot_k_layout)
-    k_scale = scale_bufs.index(buf_idx).load(k_scale_layout)
+    final_idx = (num_iters - 1) % NUM_BUFFERS
+    k_e4m3 = kv_bufs.index(final_idx).permute([1, 0]).load(dot_k_layout)
+    k_scale = scale_bufs.index(final_idx).load(k_scale_layout)
     scores = gl.amd.gfx1250.wmma_scaled(
         mfma_q,
         q_scale,
@@ -2272,7 +2461,7 @@ def _pa_decode_sparse_v4_a8w8(
         "e4m3",
         gl.zeros([BLOCK_H, BLOCK_K], dtype=gl.float32, layout=QK_WMMA_LAYOUT),
     )
-    kr_t = rope_bufs.index(buf_idx).permute([1, 0]).load(dot_kr_layout)
+    kr_t = rope_bufs.index(final_idx).permute([1, 0]).load(dot_kr_layout)
     scores_r = gl.amd.gfx1250.wmma(
         mfma_qr,
         kr_t,
@@ -2296,31 +2485,22 @@ def _pa_decode_sparse_v4_a8w8(
     a0 = a0 * alpha_pv
     a1 = a1 * alpha_pv
     a2 = a2 * alpha_pv
-    a3 = a3 * alpha_pv
-    a4 = a4 * alpha_pv
-    a5 = a5 * alpha_pv
-    a6 = a6 * alpha_pv
     ar = ar * alpha_pv
     p_dot = gl.convert_layout(p.to(gl.bfloat16), dot_p_layout)
-    a0, a1, a2, a3, a4, a5, a6, ar = _v4_pv_groups(
+    # No dequant here: the last loop iteration already staged this tile (and
+    # for num_iters == 1 the prologue did).
+    a0, a1, a2, ar = _v4_pv_bf16(
         p_dot,
-        kv_bufs.index(buf_idx),
-        scale_bufs.index(buf_idx),
-        rope_bufs.index(buf_idx),
+        kv_bf16.index((num_iters - 1) % NUM_STAGE),
+        rope_bufs.index(final_idx),
         a0,
         a1,
         a2,
-        a3,
-        a4,
-        a5,
-        a6,
         ar,
-        BLOCK_K,
-        SCALE_COL_LAYOUT,
-        p_slice_layout,
         dot_v_layout,
-        NOPE_DIM,
-        GROUP_SIZE,
+        PV0,
+        PV1,
+        PV2,
     )
     m_i = m_new
     l_i = l_new
@@ -2334,26 +2514,57 @@ def _pa_decode_sparse_v4_a8w8(
         cga_layout=CGA_H,
     )
     h_offs_o = gl.arange(0, BLOCK_H, layout=gl.SliceLayout(1, OUT_BLOCKED_LAYOUT))
-    d_offs_o = gl.arange(0, GROUP_SIZE, layout=gl.SliceLayout(0, OUT_BLOCKED_LAYOUT))
     h_offs_o_eff = h_off_base + h_offs_o
     h_mask_o = h_offs_o_eff < H
 
     if KV_SPLITS == 1:
         inv = gl.convert_layout(1.0 / l_i[:, None], layout=BF16_WMMA_LAYOUT)
-        accs = [a0, a1, a2, a3, a4, a5, a6, ar]
-        for g in tl.static_range(8):
-            o = gl.convert_layout(
-                (accs[g] * inv).to(out_ptr.dtype.element_ty), OUT_BLOCKED_LAYOUT
-            )
-            gl.amd.cdna4.buffer_store(
-                o,
-                ptr=out_ptr + t * out_stride_t + g * GROUP_SIZE * out_stride_d,
-                offsets=(
-                    h_offs_o_eff[:, None] * out_stride_h
-                    + d_offs_o[None, :] * out_stride_d
-                ).to(gl.int32),
-                mask=h_mask_o[:, None],
-            )
+        ob = out_ptr + t * out_stride_t
+        oty: gl.constexpr = out_ptr.dtype.element_ty
+        _v4_store_acc(
+            (a0 * inv).to(oty),
+            0,
+            PV0,
+            ob,
+            h_offs_o_eff,
+            h_mask_o,
+            out_stride_h,
+            out_stride_d,
+            OUT_BLOCKED_LAYOUT,
+        )
+        _v4_store_acc(
+            (a1 * inv).to(oty),
+            PV0,
+            PV1,
+            ob,
+            h_offs_o_eff,
+            h_mask_o,
+            out_stride_h,
+            out_stride_d,
+            OUT_BLOCKED_LAYOUT,
+        )
+        _v4_store_acc(
+            (a2 * inv).to(oty),
+            PV0 + PV1,
+            PV2,
+            ob,
+            h_offs_o_eff,
+            h_mask_o,
+            out_stride_h,
+            out_stride_d,
+            OUT_BLOCKED_LAYOUT,
+        )
+        _v4_store_acc(
+            (ar * inv).to(oty),
+            NOPE_DIM,
+            ROPE_DIM,
+            ob,
+            h_offs_o_eff,
+            h_mask_o,
+            out_stride_h,
+            out_stride_d,
+            OUT_BLOCKED_LAYOUT,
+        )
     else:
         h_offs_ml = gl.arange(0, BLOCK_H, layout=gl.SliceLayout(1, MXS_BLOCKED_LAYOUT))
         h_offs_ml_eff = h_off_base + h_offs_ml
@@ -2372,19 +2583,51 @@ def _pa_decode_sparse_v4_a8w8(
             offsets=(h_offs_ml_eff * lp_stride_h).to(gl.int32),
             mask=h_mask_ml,
         )
-        a_base = t * ap_stride_t + pid_k * ap_stride_k
-        accs = [a0, a1, a2, a3, a4, a5, a6, ar]
-        for g in tl.static_range(8):
-            o = gl.convert_layout(accs[g], OUT_BLOCKED_LAYOUT)
-            gl.amd.cdna4.buffer_store(
-                o,
-                ptr=acc_partial_ptr + a_base + g * GROUP_SIZE * ap_stride_d,
-                offsets=(
-                    h_offs_o_eff[:, None] * ap_stride_h
-                    + d_offs_o[None, :] * ap_stride_d
-                ).to(gl.int32),
-                mask=h_mask_o[:, None],
-            )
+        ab = acc_partial_ptr + t * ap_stride_t + pid_k * ap_stride_k
+        _v4_store_acc(
+            a0,
+            0,
+            PV0,
+            ab,
+            h_offs_o_eff,
+            h_mask_o,
+            ap_stride_h,
+            ap_stride_d,
+            OUT_BLOCKED_LAYOUT,
+        )
+        _v4_store_acc(
+            a1,
+            PV0,
+            PV1,
+            ab,
+            h_offs_o_eff,
+            h_mask_o,
+            ap_stride_h,
+            ap_stride_d,
+            OUT_BLOCKED_LAYOUT,
+        )
+        _v4_store_acc(
+            a2,
+            PV0 + PV1,
+            PV2,
+            ab,
+            h_offs_o_eff,
+            h_mask_o,
+            ap_stride_h,
+            ap_stride_d,
+            OUT_BLOCKED_LAYOUT,
+        )
+        _v4_store_acc(
+            ar,
+            NOPE_DIM,
+            ROPE_DIM,
+            ab,
+            h_offs_o_eff,
+            h_mask_o,
+            ap_stride_h,
+            ap_stride_d,
+            OUT_BLOCKED_LAYOUT,
+        )
 
 
 # ---------------------------------------------------------------------------
