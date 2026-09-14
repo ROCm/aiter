@@ -12,7 +12,7 @@ import pytest
 import torch
 
 import aiter
-from aiter import dtypes, per_tensor_quant
+from aiter import dtypes, per_tensor_quant, pertoken_quant
 from aiter.jit.utils.chip_info import get_gfx_runtime
 from aiter.ops.attention import pa_decode_flydsl as public_pa_decode
 from aiter.test_common import benchmark, checkAllclose, run_perftest
@@ -270,13 +270,16 @@ def run_torch(
         token_offsets = token_ids % block_size
         physical_pages = block_tables[seq_idx, logical_pages].long()
 
-        keys = (
-            key_cache[physical_pages, :, token_offsets, :].float() * key_scale.float()
-        )
-        values = (
-            value_cache[physical_pages, :, :, token_offsets].float()
-            * value_scale.float()
-        )
+        keys = key_cache[physical_pages, :, token_offsets, :].float()
+        values = value_cache[physical_pages, :, :, token_offsets].float()
+        if key_scale.numel() == 1:
+            keys = keys * key_scale.float()
+            values = values * value_scale.float()
+        else:
+            token_key_scale = key_scale[physical_pages, :, token_offsets, 0].float()
+            token_value_scale = value_scale[physical_pages, :, token_offsets, 0].float()
+            keys = keys * token_key_scale.unsqueeze(-1)
+            values = values * token_value_scale.unsqueeze(-1)
         keys = keys.repeat_interleave(query_group_size, dim=1)
         values = values.repeat_interleave(query_group_size, dim=1)
         scores = (
@@ -336,6 +339,7 @@ def run_pa_decode_tile_case(
     dtype,
     trans_v,
     max_partitions=8,
+    per_token=False,
 ):
     if pa_decode is None or get_recommended_splits is None:
         raise RuntimeError("FlyDSL is not available")
@@ -370,8 +374,16 @@ def run_pa_decode_tile_case(
     ).uniform_(-0.5, 0.5)
 
     quant_dtype = _quant_dtype()
-    key_quant, key_scale = per_tensor_quant(key, quant_dtype=quant_dtype)
-    value_quant, value_scale = per_tensor_quant(value, quant_dtype=quant_dtype)
+    if per_token:
+        key_quant, key_scale = pertoken_quant(key, quant_dtype=quant_dtype)
+        value_token_major = value.permute(0, 1, 3, 2).contiguous()
+        value_token_quant, value_scale = pertoken_quant(
+            value_token_major, quant_dtype=quant_dtype
+        )
+        value_quant = value_token_quant.permute(0, 1, 3, 2).contiguous()
+    else:
+        key_quant, key_scale = per_tensor_quant(key, quant_dtype=quant_dtype)
+        value_quant, value_scale = per_tensor_quant(value, quant_dtype=quant_dtype)
     key_cache = (
         key_quant.view(
             num_blocks,
@@ -451,6 +463,7 @@ def run_pa_decode_tile_case(
         "gfx": get_gfx_runtime(),
         "partitions": num_partitions,
         "trans_v": trans_v,
+        "per_token": per_token,
     }
     for name, fn in candidates.items():
         # Pass tensors explicitly so perftest can rotate their allocations.
@@ -1460,11 +1473,24 @@ def main():
         default=8,
         help="""Upper clamp passed to get_recommended_splits (4..256).""",
     )
+    parser.add_argument(
+        "--per-token",
+        type=int,
+        nargs="*",
+        choices=[0, 1],
+        default=[0],
+        help="""KV scale layout: 0 for per-tensor, 1 for per-token.""",
+    )
     args = parser.parse_args()
 
     rows = []
-    for dtype, batch_size, shape, block_size, trans_v in itertools.product(
-        args.dtype, args.batch, args.shapes, args.block_size, args.trans_v
+    for dtype, batch_size, shape, block_size, trans_v, per_token in itertools.product(
+        args.dtype,
+        args.batch,
+        args.shapes,
+        args.block_size,
+        args.trans_v,
+        args.per_token,
     ):
         num_query_heads, num_kv_heads, head_dim, context_length = shape
         rows.append(
@@ -1478,6 +1504,7 @@ def main():
                 dtype,
                 bool(trans_v),
                 args.max_partitions,
+                bool(per_token),
             )
         )
 
