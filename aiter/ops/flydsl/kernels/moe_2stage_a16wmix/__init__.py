@@ -22,6 +22,7 @@ Launch args are raw device pointers (``fx.Int64``); tensors passed as
 import torch
 from flydsl.runtime.device import get_rocm_arch
 
+from aiter.jit.utils.chip_info import get_num_xcds
 from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled
 
 from .gemm1 import compile_gemm1_a16w4_port, gemm1_a16w4_grid
@@ -65,6 +66,7 @@ def flydsl_a16w4_gemm1(
     k_wave=1,
     b_nt=None,
     xcd_swizzle=0,
+    num_xcds=None,
     gate_mode="separated",
     act="silu",
     situ_beta=1.0,
@@ -135,6 +137,7 @@ def flydsl_a16w4_gemm1(
         act=act,
         b_cache_mod=b_cache_mod,
         xcd_swizzle=xcd_swizzle,
+        num_xcds=get_num_xcds() if num_xcds is None else num_xcds,
         waves_per_eu=waves_per_eu,
         w_dtype=w_dtype,
         w_layout=w_layout,
@@ -196,6 +199,7 @@ def flydsl_a16w4_gemm2(
     k_batch=1,
     b_nt=None,
     xcd_swizzle=1,
+    num_xcds=None,
     w_dtype="fp4",
     persist=None,
     epilog="atomic",
@@ -243,6 +247,7 @@ def flydsl_a16w4_gemm2(
         TILE_K=TILE_K,
         b_cache_mod=_b_cache_mod,
         xcd_swizzle=xcd_swizzle,
+        num_xcds=get_num_xcds() if num_xcds is None else num_xcds,
         waves_per_eu=waves_per_eu,
         w_dtype=w_dtype,
         persist=_persist,
