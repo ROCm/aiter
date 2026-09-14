@@ -105,12 +105,6 @@ _HIGH_SHIFT = 21
 _SOFT_TRIGGER_MAX = 2048
 # Below this the re-selects come often enough to cost more than the LDS they free.
 _SOFT_TRIGGER_MIN = 256
-# k=1 and k=2 return wrong rows, and not a few: at 64 rows of 32768 gaussian
-# columns, 55 and 63 of them. Only once the row is wide enough to re-select --
-# one tile group is right at every k -- and k>=4 is clean at every width tried.
-# Declined rather than shipped while the cause is open; the dispatcher has three
-# other selectors for a k this small, and `topk_per_row_argmax` owns k=1.
-_MIN_SERVED_K = 3
 
 
 # Loads a thread keeps in flight per group. Registers only, since arrivals are
@@ -248,8 +242,8 @@ def topk_per_row_radix_stream_serves(
     """
     if wave_size not in (32, 64):
         return f"wave size must be 32 or 64, got {wave_size}"
-    if k < _MIN_SERVED_K:
-        return f"k must be at least {_MIN_SERVED_K}, got {k}"
+    if k < 1:
+        return f"k must be positive, got {k}"
     if block_threads % wave_size:
         return "block must be a whole number of waves"
     if _NUM_BUCKETS % block_threads:
@@ -298,6 +292,15 @@ def build_topk_per_row_radix_stream_module(
     unroll, soft_trigger = _resolve_lds(k, block_threads, lds_budget, vec)
     arrivals_cap = soft_trigger + unroll * tile
     capacity = k + arrivals_cap
+    # Where the streaming loop starts, and it must be a whole number of vectors.
+    # `absorb` takes the column of an element from its own base but the address
+    # from `base // vec`, so an unaligned start reads one column and labels it
+    # another -- the key and the column of every element after the window
+    # disagree by `base % vec`. `arrivals_cap` is a multiple of `vec`, so this
+    # was exactly the k whose `capacity` was not: k=1, 2, 3, 5, 6, 7 returned 56
+    # to 64 wrong rows in 64 at 32768 columns, and k=4, 8, 12, 16 were clean.
+    # Rounding down rather than up keeps it inside the buffer.
+    window_cap = (capacity // vec) * vec
 
     @fx.struct
     class SharedStorage:
@@ -634,7 +637,7 @@ def build_topk_per_row_radix_stream_module(
             # The window that seeds the threshold: as much of the row as the
             # buffer holds, so a row that fits is selected once and never
             # streamed at all.
-            window = fx.min(row_len, Int32(capacity))
+            window = fx.min(row_len, Int32(window_cap))
             window_vecs = fx.ceildiv(window, Int32(vec))
             for v_iv in range(tid, window_vecs, Int32(block_threads)):
                 v = Int32(v_iv)
@@ -720,6 +723,7 @@ def build_topk_per_row_radix_stream_module(
         "unroll": unroll,
         "soft_trigger": soft_trigger,
         "capacity": capacity,
+        "window_cap": window_cap,
         "arrivals_cap": arrivals_cap,
         "lds_bytes": (capacity + k) * 8 + _NUM_BUCKETS * 4,
     }
