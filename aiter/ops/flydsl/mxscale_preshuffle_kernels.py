@@ -53,6 +53,22 @@ def _reduce_exe(_cfg):
     return flyc.jit(launch_splitk_reduce.func)
 
 
+@functools.lru_cache(maxsize=1024)
+def _fused_splitk_buffers(
+    device: torch.device,
+    stream_id: int,
+    split_k: int,
+    M: int,
+    N: int,
+    num_tiles: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Stream-private BF16 partials and per-output-tile arrival counters."""
+    del stream_id
+    workspace = torch.empty((split_k, M, N), dtype=torch.bfloat16, device=device)
+    semaphore = torch.zeros((num_tiles,), dtype=torch.int32, device=device)
+    return workspace, semaphore
+
+
 def flydsl_mxscale_preshuffle_gemm(
     A: torch.Tensor,
     B: torch.Tensor,
@@ -76,8 +92,9 @@ def flydsl_mxscale_preshuffle_gemm(
     A is [M, K]; N is taken from Out ([M, N]); K from A. Returns Out.
 
     split_k>1 splits the K reduction across grid.z. The tuned M=1 blockscale
-    specialization accumulates directly into BF16 with packed gfx950 atomics;
-    other shapes write fp32 partial slabs and reduce them into Out.
+    specialization writes BF16 partials to a small workspace, then the last
+    arriving block for each output tile reduces them in FP32 and writes Out.
+    Other shapes write fp32 partial slabs and launch a separate reduce kernel.
 
     blockscale selects the scale format and **defaults to True** -- the coarse
     blockscale path is the one this op is tuned for. It is a8w8-only and needs
@@ -139,19 +156,21 @@ def flydsl_mxscale_preshuffle_gemm(
     # a_scale/b_scale are already compact-shuffled by the caller
     # (shuffle_scale_blockscale_a/_b). No per-call repack here.
     bs_mode = "ab" if blockscale else "none"
-    # gfx950 has native BF16 atomics. For the latency-sensitive M=1 path, direct
-    # accumulation avoids the separate fp32 scratch reduction launch.
-    splitk_atomic = (
+    split_k = int(split_k)
+    # For the latency-sensitive M=1 path, keep the split partials in BF16 and
+    # let the last arriving GEMM block reduce them. This avoids a second launch
+    # without introducing output atomics or a grid-wide spin wait.
+    splitk_fused = (
         blockscale
         and split_k > 1
         and M == 1
         and int(tile_m) == 16
         and out_dtype == "bf16"
+        and int(tile_n) <= 128
     )
 
     st = stream if stream is not None else torch.cuda.current_stream()
 
-    split_k = int(split_k)
     if split_k > 1:
         # split-K legality (same constraints the tuner enforces in fits_shape):
         # per-split K must be a whole number of tile_k tiles AND 256-K scale chunks.
@@ -184,7 +203,6 @@ def flydsl_mxscale_preshuffle_gemm(
         int(xcd_swizzle),
         split_k,  # k_batch
         bs_mode,  # blockscale
-        splitk_atomic,
     )
     gemm_exe = _gemm_exe(cfg)
 
@@ -196,6 +214,8 @@ def flydsl_mxscale_preshuffle_gemm(
             ptr_arg(B),
             ptr_arg(a_scale),
             ptr_arg(b_scale),
+            ptr_arg(Out),  # unused fused-reduce output argument
+            ptr_arg(Out),  # unused fused-reduce semaphore argument
             M,
             N,
             st,
@@ -203,20 +223,32 @@ def flydsl_mxscale_preshuffle_gemm(
         )
         return Out
 
-    if splitk_atomic:
+    if splitk_fused:
+        num_tiles = ((M + int(tile_m) - 1) // int(tile_m)) * (N // int(tile_n))
         if isinstance(st, torch.cuda.Stream):
             with torch.cuda.stream(st):
-                Out.zero_()
+                workspace, semaphore = _fused_splitk_buffers(
+                    A.device,
+                    int(st.cuda_stream),
+                    split_k,
+                    M,
+                    N,
+                    num_tiles,
+                )
         else:
-            # Compile-only/AOT uses an fx.Stream placeholder and FakeTensor.
-            Out.zero_()
+            # Compile-only/AOT uses an fx.Stream placeholder and CPU/Fake tensors.
+            workspace, semaphore = _fused_splitk_buffers(
+                A.device, 0, split_k, M, N, num_tiles
+            )
         _run_compiled(
             gemm_exe,
-            ptr_arg(Out),
+            ptr_arg(workspace),
             ptr_arg(A),
             ptr_arg(B),
             ptr_arg(a_scale),
             ptr_arg(b_scale),
+            ptr_arg(Out),
+            ptr_arg(semaphore),
             M,
             N,
             st,
@@ -233,6 +265,8 @@ def flydsl_mxscale_preshuffle_gemm(
         ptr_arg(B),
         ptr_arg(a_scale),
         ptr_arg(b_scale),
+        ptr_arg(Out),  # unused by the regular split-K GEMM
+        ptr_arg(tmp),  # unused semaphore argument
         M,
         N,
         st,
