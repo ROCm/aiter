@@ -48,9 +48,9 @@ G7’s “`dot2_acc>1` is ~4% slower; B=1 is occupancy-bound” A/B was on the
 over `k0` was WontFix for **down** because down already fills CUs; gate/up
 is the opposite.
 
-The hot loop **now** interleaves gate/up `v_dot2` (subtask 1). `x` loads still
-ignore `nlane`: all 16 nlanes issue the same activation dwordx4s every `k0`
-(subtask 3).
+The hot loop **now** interleaves gate/up `v_dot2` (subtask 1). Native `x` loads
+already use 4 unique `klane` addresses per wave; explicit nlane-0 broadcast
+was tried and reverted (subtask 3).
 
 ## Progress
 
@@ -60,7 +60,7 @@ preshuffled gate/up spot-check when the hot loop, wait/reduce, or grid changed.
 
 - [x] 1. Interleave gate/up `v_dot2` (drop half the `s_nop`s)
 - [x] 2. Re-A/B G7 `dot2_acc` on the **native** 16×4 grid
-- [ ] 3. Dedup `x` loads within `nlane` (broadcast per `klane`)
+- [x] 3. Dedup `x` loads within `nlane` — **WontFix** (broadcast regresses)
 - [ ] 4. Software-pipeline `k0` (prefetch next kpack)
 - [ ] 5. Split-K over `k0` for small-`INTER` occupancy (Qwen B=1 first)
 
@@ -84,8 +84,9 @@ both sides of the A/B.
   `w_gate`/`w_up` `[E, INTER, HIDDEN]`. Do not invent gather `kVector` as a
   substitute, and do not add 32-row / two `n0` for decode B=1 (that halves an
   already thin grid and would make Qwen worse).
-- **Activation stays k-contiguous.** Only B is kpack-native. `x` is still
-  packed dwords; subtask 3 may broadcast those loads, not change layout.
+- **Activation stays k-contiguous.** Only B is kpack-native. `x` is packed
+  dwords; subtask 3 showed nlane-0 + broadcast does not beat coalesced
+  same-address loads.
 - **Keep ISA-level helpers.** `v_dot2_f32_bf16` inline asm, `s_nop 2` / G7
   drain, `cvt_scalef32_pk_bf16_{fp8,fp4}`, and E8M0 `shl 23` stay; there is no
   `fx.gemm` atom for `v_dot2`.
@@ -221,20 +222,33 @@ drains.
 
 ### 3. Dedup `x` loads within `nlane`
 
-`x_word0 = (token_b * hidden + k_base) // 2` depends on `klane`, not
-`nlane`. All 16 nlanes issue the same 32 B activation load every `k0`. B
-kpacks are unique per `(klane, nlane)`; A is not.
+**WontFix (2026-09-14).** Wave ISA already has **2** activation
+`buffer_load_dwordx4` + **2** B kpack `dwordx4` per `k0` (`h1024` loop body).
+That is one SIMT instruction for all 64 lanes, not 16 separate A loads. The
+four `klane` groups already use four unique `x` addresses; hardware coalesces
+the 16 nlanes of a klane onto that address.
 
-Load `x` once per `klane` and broadcast (`readlane` / DPP). Do not move `x`
-into LDS unless broadcast VGPR pressure forces it (that is a last resort,
-not the first design).
+Explicit “nlane 0 loads, others broadcast” **compiles and is correct** (ternary
+`scf.if` + zeros on non-lead; do not put `if nlane==0` in a Python helper —
+that is not AST-rewritten). It does not win:
 
-- [ ] One A transaction per `klane` per `k0`, 16 nlanes share it.
-- [ ] ISA check: activation `buffer_load_dwordx4` count per `k0` drops ~16×
-      (or coalesces to the 4 unique `klane` addresses); B kpack loads stay
-      16 B / lane.
-- [ ] **Done when:** op_test + G9 canary; Qwen B=1 gate_up FP8 `%peak` or `us`
-      improves or is explained if it does not (VGPR/occupancy trade).
+| variant | Qwen B=1 fp8 | Qwen B=1 fp4 | DS B=1 fp8 | DS B=1 fp4 |
+|---|---|---|---|---|
+| subtask 1 G9 (all-lane `x`) | 19.99 | 16.21 | 74.59 | 48.59 |
+| nlane0 + xor-add tree (G9 `/tmp/g9_gu_xdedup_ck.md`, SCLK med 2380) | 22.19 | 23.36 | 84.14 | **84.17** |
+| nlane0 + `ds_bpermute` (local 100-iter device) | 21.82 | 17.72 | 77.77 | **63.27** |
+
+Xor-add: `v_add` 2→34 in the `k0` body. `ds_bpermute` is 8 (FP8) / 16 (FP4)
+permutes per `k0` and still loses, worst on DeepSeek FP4 (~+30%). Qwen B=1
+FP8 `us`/`%peak` do not improve (occupancy 1.25). Keep all-lane coalesced
+`x` loads. Do not put `x` in LDS.
+
+- [x] ISA: not a 16× drop in wave `dwordx4` count (already 2 A + 2 B); A
+      addresses already unique per klane; B kpack loads stay.
+- [x] Explained: broadcast ALU/LDS-permute cost > coalesced duplicate-address
+      A traffic. Kernel left on the subtask 1 load path.
+- [x] op_test: 100 passed on the xor-add path (reverted). Default kernel
+      unchanged vs subtask 2.
 
 ### 4. Software-pipeline `k0`
 
