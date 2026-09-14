@@ -101,14 +101,24 @@ def benchmark_paged(
         )
     if "ck" in backends:
         known_rocm72_fault = (torch.version.hip or "").startswith("7.2") and (
-            (page_size == 16 and (head_dim, value_dim) == (192, 128))
+            # Native D192/V128 returns non-finite output on page1/page16
+            # under repeated launches/reference allocation; page1024 is
+            # unqualified. D192/V192's batch sweep faulted at B4/page16.
+            ((head_dim, value_dim) == (192, 128))
             or (head_dim == 192 and batch >= 4)
+            # The independent long-context sweep also rejected this exact
+            # B1/page1/V192 record for non-finite output before timing.
+            or (
+                (head_dim, value_dim) == (192, 192)
+                and (batch, page_size, query_length, kv_length) == (1, 1, 16384, 32768)
+            )
         )
         if page_size == 64:
             aiter.logger.warning("CK page 64 has no matching D128/D192 kernel")
         elif known_rocm72_fault:
             aiter.logger.warning(
-                "CK case excluded: recorded ROCm 7.2/gfx950 D192 fault or unqualified batch"
+                "CK case excluded: recorded ROCm 7.2/gfx950 D192 numerical failure "
+                "or unqualified batch after a B4/page16 GPU fault"
             )
         else:
             ck_output = torch.empty_like(case.out)
