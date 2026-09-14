@@ -45,6 +45,7 @@ _SHORT_HIGH_BUCKETS = 1 << _SHORT_RADIX_BITS[0]
 _MAX_ROW_ELEMENTS = ((1 << 32) - 1) // 4
 _COMPACT_CAPACITY = 4096
 _STABLE_INDEX_SORT_MIN_ROW_LEN = 1 << 15
+_STABLE_COMPACT_SORT_MIN_ROW_LEN = 48 * 1024
 
 _FIRST_ABOVE = 0
 _FIRST_THRESHOLD = 1
@@ -118,9 +119,13 @@ def build_radix_topk_one_block_module(
     stable_sort_enabled = (
         stable and not short_rows and block_threads == 1024 and k <= 2048
     )
-    # At k=2048, scanning 32K elements costs less than sorting their selected
-    # indices. The larger sort becomes profitable at 64K elements.
+    # Keep the crossover for a full-row gather followed by index sorting.
     stable_sort_min_row_len = _STABLE_INDEX_SORT_MIN_ROW_LEN * (2 if k > 1024 else 1)
+    # Cached output uses a fixed 48K crossover on every architecture. Preserve
+    # existing configurations whose crossover is already lower.
+    stable_compact_sort_min_row_len = min(
+        stable_sort_min_row_len, _STABLE_COMPACT_SORT_MIN_ROW_LEN
+    )
     stable_sort_capacity = 1 << (k - 1).bit_length() if stable_sort_enabled else 1
     stable_stage_capacity = k if stable_sort_enabled else 1
     stable_data_columns = 1 + int(write_values)
@@ -330,7 +335,11 @@ def build_radix_topk_one_block_module(
         def radix_bucket(key, shift, mask):
             return (key >> fx.Int32(shift)) & fx.Int32(mask)
 
-        def classify_prefix(key, radix_shifts, prefix_threshold, levels):
+        def classify_prefix(key, radix_shifts, prefix_threshold, levels, key_mask=None):
+            if key_mask is not None:
+                # Only classification is coarsened; emitters retain the original
+                # key for values, including when a whole prefix is selected.
+                key = key & key_mask
             prefix_shift = radix_shifts[levels - 1]
             prefix_mask = (
                 -1 if prefix_shift == 0 else (1 << (_KEY_BITS - prefix_shift)) - 1
@@ -681,6 +690,7 @@ def build_radix_topk_one_block_module(
             staged_value_bits,
             staged_local_indices,
             candidate_count=None,
+            key_mask=None,
         ):
             # These aliases hold raw value bits and local indices during index sorting.
             selected_value_bits = candidate_ordered_keys
@@ -696,7 +706,7 @@ def build_radix_topk_one_block_module(
                 output_local_indices,
             ):
                 above, equal = classify_prefix(
-                    key, long_shifts, prefix_threshold, levels
+                    key, long_shifts, prefix_threshold, levels, key_mask
                 )
                 if source == "global_row":
                     if above:
@@ -761,7 +771,7 @@ def build_radix_topk_one_block_module(
             )
 
         def scatter_stable_ordered_keys(
-            source, radix_shifts, prefix_threshold, num_needed, levels
+            source, radix_shifts, prefix_threshold, num_needed, levels, key_mask=None
         ):
             """Scan uniform block tiles: every thread must enter each scatter_step."""
 
@@ -775,7 +785,7 @@ def build_radix_topk_one_block_module(
                     classes[item] = 0
                     if valid:
                         above, equal = classify_prefix(
-                            key, radix_shifts, prefix_threshold, levels
+                            key, radix_shifts, prefix_threshold, levels, key_mask
                         )
                         if above:
                             classes[item] = 2
@@ -876,18 +886,21 @@ def build_radix_topk_one_block_module(
             candidate_local_indices,
             staged_value_bits,
             staged_local_indices,
+            key_mask,
         ):
             def scatter_ordered():
                 scatter_stable_ordered_keys(
-                    "global_row", long_shifts, prefix_threshold, num_needed, 3
+                    "global_row", long_shifts, prefix_threshold, num_needed, 3, key_mask
                 )
 
             if const_expr(stable_sort_enabled):
                 can_use_index_sort = (row_len >= fx.Int32(stable_sort_min_row_len)) & (
                     metadata[_SELECTED_BUCKET_COUNT] == num_needed
                 )
-                can_sort_compacted_indices = can_use_index_sort & (
-                    candidate_count <= fx.Int32(candidate_capacity)
+                can_sort_compacted_indices = (
+                    (row_len >= fx.Int32(stable_compact_sort_min_row_len))
+                    & (metadata[_SELECTED_BUCKET_COUNT] == num_needed)
+                    & (candidate_count <= fx.Int32(candidate_capacity))
                 )
                 if can_sort_compacted_indices:
                     scatter_stable_sorted_keys(
@@ -900,6 +913,7 @@ def build_radix_topk_one_block_module(
                         staged_value_bits,
                         staged_local_indices,
                         candidate_count=candidate_count,
+                        key_mask=key_mask,
                     )
                 else:
                     if can_use_index_sort:
@@ -912,6 +926,7 @@ def build_radix_topk_one_block_module(
                             candidate_local_indices,
                             staged_value_bits,
                             staged_local_indices,
+                            key_mask=key_mask,
                         )
                     else:
                         scatter_ordered()
@@ -1064,8 +1079,9 @@ def build_radix_topk_one_block_module(
                 prefix = preceding_prefix(key, shift, mask)
                 collect_above = fx.Int32(int(not stable)) == one
                 if const_expr(stable_sort_enabled):
+                    # Retain first-level winners for the cached output path.
                     collect_above = collect_above | (
-                        (row_len >= fx.Int32(stable_sort_min_row_len))
+                        (row_len >= fx.Int32(stable_compact_sort_min_row_len))
                         & compact_candidates
                     )
                 # Ordered streaming emission does not consume this counter or
@@ -1184,24 +1200,33 @@ def build_radix_topk_one_block_module(
                 prefix_threshold = (
                     prefix_threshold << fx.Int32(long_radix_bits[1])
                 ) | metadata[_SECOND_THRESHOLD]
-                can_finish = (
-                    unstable_mode
-                    & (metadata[_SELECTED_BUCKET_COUNT] == remaining_k)
-                    & (candidate_count <= fx.Int32(candidate_capacity))
-                )
-                if can_finish:
-                    # Fast exit after the second radix pass.
-                    scatter_unstable_keys(
-                        "compacted_candidates",
-                        long_shifts,
-                        prefix_threshold,
-                        remaining_k,
-                        2,
-                        reset_above=False,
-                        candidate_count=candidate_count,
-                        candidate_ordered_keys=candidate_ordered_keys,
-                        candidate_local_indices=candidate_local_indices,
+                final_key_mask = fx.Int32(-1)
+                can_finish = metadata[_SELECTED_BUCKET_COUNT] == remaining_k
+                if const_expr(not stable):
+                    can_finish = can_finish & (
+                        candidate_count <= fx.Int32(candidate_capacity)
                     )
+                if can_finish:
+                    if const_expr(stable):
+                        # Compare the selected prefix in the common final emitter.
+                        # Keeping one emitter avoids duplicating its scans/sort and
+                        # extending scalar live ranges across separate exit paths.
+                        prefix_threshold = prefix_threshold << fx.Int32(
+                            long_radix_bits[2]
+                        )
+                        final_key_mask = fx.Int32(-1 << long_radix_bits[2])
+                    else:
+                        scatter_unstable_keys(
+                            "compacted_candidates",
+                            long_shifts,
+                            prefix_threshold,
+                            remaining_k,
+                            2,
+                            reset_above=False,
+                            candidate_count=candidate_count,
+                            candidate_ordered_keys=candidate_ordered_keys,
+                            candidate_local_indices=candidate_local_indices,
+                        )
                 else:
                     # Level 3: select the low bucket and emit the final result.
                     clear_histograms((histogram,), later_bins_per_thread)
@@ -1243,17 +1268,7 @@ def build_radix_topk_one_block_module(
                     prefix_threshold = (
                         prefix_threshold << fx.Int32(long_radix_bits[2])
                     ) | metadata[_THIRD_THRESHOLD]
-                    if const_expr(stable):
-                        scatter_streaming_stable(
-                            candidate_count,
-                            prefix_threshold,
-                            remaining_k,
-                            candidate_ordered_keys,
-                            candidate_local_indices,
-                            staged_value_bits,
-                            staged_local_indices,
-                        )
-                    else:
+                    if const_expr(not stable):
                         if candidate_count <= fx.Int32(candidate_capacity):
                             scatter_unstable_keys(
                                 "compacted_candidates",
@@ -1274,6 +1289,18 @@ def build_radix_topk_one_block_module(
                                 remaining_k,
                                 3,
                             )
+
+                if const_expr(stable):
+                    scatter_streaming_stable(
+                        candidate_count,
+                        prefix_threshold,
+                        remaining_k,
+                        candidate_ordered_keys,
+                        candidate_local_indices,
+                        staged_value_bits,
+                        staged_local_indices,
+                        final_key_mask,
+                    )
 
         def write_direct_scalar(row_indices, row_values):
             for step in range_constexpr((k + block_threads - 1) // block_threads):
