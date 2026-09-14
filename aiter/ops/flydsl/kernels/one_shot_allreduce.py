@@ -16,12 +16,23 @@ No LDS is needed: thread ``t``'s 16 B lands at the same offset in every destinat
 so it can be pushed straight from registers.
 """
 
+import math
+
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl._mlir import ir
 from flydsl._mlir.dialects import llvm
 from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
-from flydsl.expr.typing import Int32, Int64, Stream, T, as_ir_value
+from flydsl.expr import math as fmath
+from flydsl.expr.typing import (
+    Float32,
+    Int32,
+    Int64,
+    ReductionOp,
+    Stream,
+    T,
+    as_ir_value,
+)
 
 from . import buffer_ops
 
@@ -146,6 +157,71 @@ def oneshot_ladder(world_size: int):
     )
 
 
+# Fused epilogues this factory can append to the reduce. 
+FUSIONS = ("none", "rmsnorm")
+
+# In the plain schedule ``atoms`` sets the *tile width*: tile = BLOCK*atoms*16 B,
+# so a bigger atom count means fewer, fatter tiles and fewer flags. TP2 and TP8
+# pick atoms=4 for exactly that reason.
+#
+# In the fused schedule the tile is pinned to one token row, because RMSNorm
+# reduces over the row and every element has to be reachable from one workgroup.
+# ``atoms`` therefore sets the *block width* instead -- BLOCK = hidden/(8*atoms)
+# -- and the tile, the flag count and the block count are all independent of it.
+FUSED_ONESHOT_LADDER = {
+    2: ((0, 1, 128, "peer"),),
+    4: ((0, 1, 32, "peer"),),
+    8: ((0, 1, 64, "peer"),),
+}
+
+
+def fused_oneshot_ladder(world_size: int):
+    """Rungs for *world_size* under ``fusion="rmsnorm"``. See FUSED_ONESHOT_LADDER."""
+    return FUSED_ONESHOT_LADDER.get(
+        int(world_size), ((0, 1, DEFAULT_GRID_CAP, "peer"),)
+    )
+
+
+# Wave width on gfx942/gfx950. The sum-of-squares butterfly is a full-wave shuffle_xor.
+WAVE = 64
+
+
+def fused_block(hidden: int, atoms: int) -> int:
+    """Threads per block for a fused build, or raise saying why *hidden* is out.
+
+    One block covers one whole token row -- ``BLOCK * atoms * 8 == hidden`` --
+    because the RMSNorm reduction spans the row and a row split across two
+    blocks could only be joined with a grid-wide barrier.
+    """
+    hidden = int(hidden)
+    per_thread = 8 * int(atoms)  # 8 bf16 per 16 B atom
+    if hidden <= 0 or hidden % per_thread != 0:
+        raise ValueError(
+            f"fused hidden must be a multiple of {per_thread} (8*atoms), got {hidden}"
+        )
+    block = hidden // per_thread
+    if block % WAVE != 0:
+        raise ValueError(
+            f"fused hidden={hidden} with atoms={atoms} gives BLOCK={block}, "
+            f"not a multiple of the {WAVE}-lane wave; needs hidden % {WAVE * per_thread} == 0"
+        )
+    if block > 1024:
+        raise ValueError(
+            f"fused hidden={hidden} with atoms={atoms} needs BLOCK={block} threads, "
+            f"over the 1024 limit; raise atoms or split the row"
+        )
+    return block
+
+
+def fused_hidden_supported(hidden: int, atoms: int = 1) -> bool:
+    """Whether a fused build exists for this (hidden, atoms). For host-side gates."""
+    try:
+        fused_block(hidden, atoms)
+    except ValueError:
+        return False
+    return True
+
+
 # Inbox slots are indexed by ``colour & 1``. Two buffers is exactly enough to
 # let one rank run a whole call ahead of another without overwriting a slot the
 # straggler has not read.
@@ -219,7 +295,15 @@ def make_one_shot_allreduce_kernel(
     fanout: str = DEFAULT_FANOUT,
     probe: str = "full",
     spin_sleep: int = DEFAULT_SPIN_SLEEP,
+    fusion: str = "none",
+    hidden: int | None = None,
 ):
+    if fusion not in FUSIONS:
+        raise ValueError(f"fusion must be one of {FUSIONS}, got {fusion!r}")
+    if fusion != "none" and hidden is None:
+        raise ValueError(f"fusion={fusion!r} requires hidden")
+    if fusion == "none" and hidden is not None:
+        raise ValueError("hidden is only meaningful for a fused build")
     if world_size not in SUPPORTED_WORLDS:
         raise ValueError(
             f"world_size must be one of {SUPPORTED_WORLDS}, got {world_size}"
@@ -244,7 +328,17 @@ def make_one_shot_allreduce_kernel(
     flag_policy = policy["flag"]
     release_writeback = policy["writeback"]
 
-    tile_bytes = BLOCK * atoms * ATOM_BYTES
+    fused = fusion == "rmsnorm"
+    # The plain schedule keeps the shipped 256-thread block, so its emitted code
+    # is untouched by this factory growing a fused mode. A fused build sizes the
+    # block to the row instead; see ``fused_block``.
+    block = fused_block(hidden, atoms) if fused else BLOCK
+    # Per-wave partials for the block-wide sum of squares. The plain build has
+    # no LDS at all.
+    n_waves = block // WAVE
+    lds_bytes = n_waves * 4 if fused else 0
+
+    tile_bytes = block * atoms * ATOM_BYTES
     tile_i32 = tile_bytes // 4
     # Payload then the 64 B handshake sector.
     wire_tile_i32 = tile_i32 + FLAG_I32
@@ -257,7 +351,19 @@ def make_one_shot_allreduce_kernel(
     else:
         fanout_pairs = [(p, a) for a in range(atoms) for p in range(world_size)]
 
-    @flyc.kernel(known_block_size=[BLOCK, 1, 1])
+    # LDS for the fused sum-of-squares. Carries the per-wave partial sums
+    # only: the 1/hidden, the +eps and the rsqrt all happen afterwards in
+    # registers, per thread, so no scale is ever broadcast through LDS.
+    if fused:
+        @fx.struct
+        class _RmsShared:
+            wave_sq: fx.Array[fx.Float32, max(1, n_waves), 16]
+
+    # One signature for both modes. The fused-only arguments are present (and
+    # passed as zeros) in a plain build rather than being appended to a second
+    # kernel. The fused-only code is still elided by ``const_expr(fused)``,
+    # only four unused kernargs remain in a plain build.
+    @flyc.kernel(known_block_size=[block, 1, 1])
     def one_shot_allreduce(
         rank: Int32,
         nbytes: Int64,
@@ -267,20 +373,24 @@ def make_one_shot_allreduce_kernel(
         peer_ptrs: Int64,
         colors_ptr: Int64,
         n_blocks: Int32,
+        res_in_ptr: Int64,
+        res_out_ptr: Int64,
+        w_ptr: Int64,
+        eps: Float32,
     ):
         tid = fx.Int32(gpu.thread_id("x"))
         bid = fx.Int32(gpu.block_id("x"))
         lane_in_quad = tid % fx.Int32(4)
 
         hbm_layout = fx.make_layout(
-            (num_tiles, atoms, BLOCK * ATOM_I32),
-            (tile_i32, BLOCK * ATOM_I32, 1),
+            (num_tiles, atoms, block * ATOM_I32),
+            (tile_i32, block * ATOM_I32, 1),
         )
-        hbm_row_layout = fx.make_layout((1, BLOCK * ATOM_I32), (BLOCK * ATOM_I32, 1))
+        hbm_row_layout = fx.make_layout((1, block * ATOM_I32), (block * ATOM_I32, 1))
         hbm_copy_atom = fx.make_copy_atom(rocdl.BufferCopy128b(), fx.Int32)
         hbm_copy = fx.make_tiled_copy_tv(
             hbm_copy_atom,
-            fx.make_layout((1, BLOCK), (1, 1)),
+            fx.make_layout((1, block), (1, 1)),
             fx.make_layout((1, ATOM_I32), (1, 1)),
         ).get_slice(tid)
         color_layout = fx.make_layout((grid,), (1,))
@@ -299,17 +409,29 @@ def make_one_shot_allreduce_kernel(
             T.i32, address_space=fx.AddressSpace.Global, alignment=16
         )
 
-        def _payload_tensor(ptr):
+        def _payload_tensor(ptr, records=None):
             # num_records_bytes is the live payload, so a partial last tile
             # reads 0 and stores are dropped rather than faulting.
             view = fx.make_view(fx.inttoptr(hbm_i32_ptr, ptr), hbm_layout)
             return rocdl.make_buffer_tensor(
-                view, max_size=False, num_records_bytes=nbytes
+                view,
+                max_size=False,
+                num_records_bytes=nbytes if records is None else records,
             )
 
         in_buf = _payload_tensor(inp_ptr)
         out_buf = _payload_tensor(out_ptr)
         color_rsrc = buffer_ops.create_buffer_resource_from_addr(colors_ptr)
+
+        if const_expr(fused):
+            # residual in/out are (M, hidden) bf16 exactly like the payload, so
+            # they ride the payload layout and the same tiled copy.
+            res_in_buf = _payload_tensor(res_in_ptr)
+            res_out_buf = _payload_tensor(res_out_ptr)
+            # The gain is a single (hidden,) row shared by every token: same
+            # shape as one tile, so it reuses the layout with tile index 0 and
+            # its own (one-tile) record bound.
+            w_buf = _payload_tensor(w_ptr, records=fx.Int64(tile_bytes))
 
         def _slot_i32(parity, src):
             """i32 offset of the wire slot ``[parity][bid][src]``.
@@ -340,22 +462,28 @@ def make_one_shot_allreduce_kernel(
             off = fx.get_scalar(fx.crd2idx((bid,), color_layout))
             buffer_ops.buffer_store(color, color_rsrc, off)
 
-        def _load_tile(tile):
-            """This thread's 16 B of each atom of *tile*, as raw i32x4."""
+        def _load_rows(buf, tile):
+            """This thread's 16 B of each atom of *tile* of *buf*, as raw i32x4."""
             out = []
             for atom in range_constexpr(atoms):
-                src = hbm_copy.partition_S(_hbm_atom_row(in_buf, tile, atom))
+                src = hbm_copy.partition_S(_hbm_atom_row(buf, tile, atom))
                 frag = fx.make_fragment_like(src)
                 fx.copy(hbm_copy_atom, src, frag)
                 out.append(fx.Vector(frag.load()))
             return out
 
-        def _store_tile(tile, vals):
+        def _load_tile(tile):
+            return _load_rows(in_buf, tile)
+
+        def _store_rows(buf, tile, vals):
             for atom in range_constexpr(atoms):
-                dst = hbm_copy.partition_D(_hbm_atom_row(out_buf, tile, atom))
+                dst = hbm_copy.partition_D(_hbm_atom_row(buf, tile, atom))
                 frag = fx.make_fragment_like(dst)
                 frag.store(vals[atom])
                 fx.copy(hbm_copy_atom, frag, dst)
+
+        def _store_tile(tile, vals):
+            _store_rows(out_buf, tile, vals)
 
         def _fanout(parity, my_atoms):
             """Push this thread's atoms into every peer's slot for this rank.
@@ -376,7 +504,7 @@ def make_one_shot_allreduce_kernel(
                         peer_vec[peer]
                         + _i32_to_bytes(
                             _slot_i32(parity, rank)
-                            + fx.Int32(atom * BLOCK * ATOM_I32)
+                            + fx.Int32(atom * block * ATOM_I32)
                             + tid * fx.Int32(ATOM_I32)
                         ),
                         my_atoms[atom],
@@ -461,12 +589,15 @@ def make_one_shot_allreduce_kernel(
                 rocdl.s_waitcnt(vmcnt=0)
             _acquire_inbox()
 
-        def _reduce(parity):
+        def _reduce_f32(parity):
             """Sum this thread's atom across all N inbox copies, in rank order.
 
             Rank order, not a rotated order: every rank must accumulate in the
             same sequence or the results differ in the last bit across ranks.
             ``cross_device_reduce`` makes the same promise for the same reason.
+
+            Returns fp32 vectors; the plain path rounds them once in
+            ``_reduce``, the fused path needs them unrounded for the norm.
             """
             outs = []
             for atom in range_constexpr(atoms):
@@ -474,13 +605,81 @@ def make_one_shot_allreduce_kernel(
                 for src in range_constexpr(world_size):
                     elem = (
                         _slot_i32(parity, fx.Int32(src))
-                        + fx.Int32(atom * BLOCK * ATOM_I32)
+                        + fx.Int32(atom * block * ATOM_I32)
                         + tid * fx.Int32(ATOM_I32)
                     )
                     v = _atom_bf16_to_f32(_load_v4i32_at(self_rsrc, elem, _RECV_POLICY))
                     acc = v if acc is None else acc + v
-                outs.append(_atom_f32_to_bf16(acc))
+                outs.append(acc)
             return outs
+
+        def _reduce(parity):
+            return [_atom_f32_to_bf16(a) for a in _reduce_f32(parity)]
+
+        def _block_sum_sq(accs):
+            """Block-wide ``sum(acc^2)`` over the whole row, one value per thread.
+
+            Three levels: per-thread over its ``8*atoms`` channels, a full-wave
+            ``shuffle_xor`` butterfly, then the cross-wave combine through LDS.
+
+            What lands in LDS is a partial sum -- every thread
+            reads the ``n_waves`` partials back and adds them itself, and
+            computes its own ``rsqrt`` afterwards. That redundancy is bought
+            deliberately: it removes the broadcast, so this costs only one barrier.
+            """
+            local = None
+            for atom in range_constexpr(atoms):
+                sq = accs[atom] * accs[atom]
+                part = fx.Float32(sq.reduce(ReductionOp.ADD))
+                local = part if local is None else local + part
+
+            for sh in range_constexpr(int(math.log2(WAVE))):
+                local = local + local.shuffle_xor(WAVE // (2 << sh), WAVE)
+
+            if const_expr(n_waves == 1):
+                # One wave covers the row: the butterfly already finished it and
+                # LDS would only add a barrier.
+                return local
+
+            sq_lds = fx.SharedAllocator().allocate(_RmsShared).peek().wave_sq.ptr
+            wid = tid // fx.Int32(WAVE)
+            if tid % fx.Int32(WAVE) == fx.Int32(0):
+                sq_lds[wid] = local
+            gpu.barrier()
+            total = None
+            for w in range_constexpr(n_waves):
+                v = fx.Float32(sq_lds[fx.Int32(w)])
+                total = v if total is None else total + v
+            return total
+
+        def _epilogue(tile, x_atoms, w_atoms, parity):
+            """bf16 round-trip, residual add, RMSNorm.
+            """
+            accs = _reduce_f32(parity)
+            res_out = []
+            for atom in range_constexpr(atoms):
+                # Round the all-reduce result to bf16 and back before adding the
+                # residual. 
+                # TODO: Keeping the extra f32 mantissa bits would be more accurate,
+                # diverging 1 ULP per layer from the kernel this replaces.
+                a = accs[atom].to(fx.BFloat16).to(fx.Float32)
+                a = a + fx.Vector(x_atoms[atom]).bitcast(fx.BFloat16).to(fx.Float32)
+                accs[atom] = a
+                res_out.append(_atom_f32_to_bf16(a))
+            _store_rows(res_out_buf, tile, res_out)
+
+            # rsqrt on the fp32 accumulator, not on the bf16 just stored.
+            rstd = fmath.rsqrt(_block_sum_sq(accs) * (1.0 / hidden) + eps)
+            outs = []
+            for atom in range_constexpr(atoms):
+                w = fx.Vector(w_atoms[atom]).bitcast(fx.BFloat16).to(fx.Float32)
+                outs.append(_atom_f32_to_bf16(accs[atom] * rstd * w))
+            _store_tile(tile, outs)
+
+        # The gain is one row shared by every token, so it is read once here
+        # rather than once per token.
+        if const_expr(fused):
+            w_atoms = _load_rows(w_buf, fx.Int32(0))
 
         # Stride by the *launched* grid, not the compile-time cap: the host may
         # launch fewer blocks than ``grid``, and striding by the cap would leave
@@ -497,11 +696,19 @@ def make_one_shot_allreduce_kernel(
             # data movement can go below it. Output is garbage.
             if const_expr(probe == "full"):
                 my_atoms = _load_tile(tile)
+                # Issued before the handshake on purpose: the residual is plain
+                # HBM with no dependence on any peer, so this load retires
+                # during the flag spin instead of after it.
+                if const_expr(fused):
+                    x_atoms = _load_rows(res_in_buf, tile)
                 _fanout(parity, my_atoms)
             _publish(parity, color)
             _wait(parity, color)
             if const_expr(probe == "full"):
-                _store_tile(tile, _reduce(parity))
+                if const_expr(fused):
+                    _epilogue(tile, x_atoms, w_atoms, parity)
+                else:
+                    _store_tile(tile, _reduce(parity))
             color = color + fx.Int32(1)
             if color == fx.Int32(0):  # 0 is the unset sentinel
                 color = fx.Int32(1)
@@ -509,7 +716,7 @@ def make_one_shot_allreduce_kernel(
             _store_color(color)
         gpu.barrier()
 
-    flat_wg = f"{BLOCK},{BLOCK}"
+    flat_wg = f"{block},{block}"
 
     @flyc.jit
     def launch_one_shot_allreduce(
@@ -521,6 +728,10 @@ def make_one_shot_allreduce_kernel(
         peer_ptrs: Int64,
         colors_ptr: Int64,
         grid_x: Int32,
+        res_in_ptr: Int64,
+        res_out_ptr: Int64,
+        w_ptr: Int64,
+        eps: Float32,
         stream: Stream = Stream(None),  # noqa: B008
     ):
         one_shot_allreduce(
@@ -532,12 +743,20 @@ def make_one_shot_allreduce_kernel(
             peer_ptrs,
             colors_ptr,
             grid_x,
+            res_in_ptr,
+            res_out_ptr,
+            w_ptr,
+            eps,
             value_attrs={"rocdl.flat_work_group_size": flat_wg},
-        ).launch(grid=(grid_x, 1, 1), block=(BLOCK, 1, 1), stream=stream)
+        ).launch(grid=(grid_x, 1, 1), block=(block, 1, 1), stream=stream)
 
     # Every compile-time knob that changes the emitted code has to be in the
     # symbol name, or two variants collide in the JIT cache.
     tag = f"ws{world_size}_a{atoms}_{inbox_memory}_{fanout}"
+    if fused:
+        # hidden sets BLOCK and the tile, so it belongs in the key just as much
+        # as atoms does.
+        tag += f"_rms_h{hidden}"
     if probe != "full":
         tag += f"_{probe}"
     if spin_sleep:
@@ -551,7 +770,7 @@ def make_one_shot_allreduce_kernel(
         "launch": launch_one_shot_allreduce,
         "flags_bytes": 0,
         "data_bytes": data_bytes,
-        "lds_bytes": 0,
+        "lds_bytes": lds_bytes,
         "tile_bytes": tile_bytes,
         "wire_tile_bytes": wire_tile_bytes,
         # Shims for ``quick_allreduce_int4._StEngine``, which is reused verbatim for the IPC
@@ -568,5 +787,7 @@ def make_one_shot_allreduce_kernel(
         "probe": probe,
         "spin_sleep": spin_sleep,
         "grid": grid,
-        "block": BLOCK,
+        "block": block,
+        "fusion": fusion,
+        "hidden": hidden,
     }
