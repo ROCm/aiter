@@ -20,13 +20,13 @@ from flydsl.expr.rocdl import cvt_pk_f32_fp8
 from flydsl.expr.typing import Vector as Vec
 
 from aiter.ops.flydsl.kernels.gemm_a8w8_8wave import (
-    G2SLoader,
     Mfma16x16x128,
-    S2RLoader,
     _xcd_swizzle_any,
     ceildiv,
     compute_global_swizzle,
     make_fp8_buffer_tensor,
+    make_g2s_loader,
+    make_s2r_loader,
     wait_barrier,
 )
 from aiter.ops.flydsl.kernels.mfma_preshuffle_pipeline import split_row_major_2d
@@ -623,16 +623,16 @@ def compile_gather_kv_b_proj_8w(
         a0_g2s = (
             _WideG2SLoader(kv_f8, gl_off_a0, N_LDS_STEPS_A, wave_id, lane_id)
             if const_expr(wide_index)
-            else G2SLoader(a_div, gl_off_a0, N_LDS_STEPS_A, F8_IR_t, wave_id)
+            else make_g2s_loader(a_div, gl_off_a0, N_LDS_STEPS_A, F8_IR_t, wave_id)
         )
         a1_g2s = (
             _WideG2SLoader(kv_f8, gl_off_a1, N_LDS_STEPS_A, wave_id, lane_id)
             if const_expr(wide_index)
-            else G2SLoader(a_div, gl_off_a1, N_LDS_STEPS_A, F8_IR_t, wave_id)
+            else make_g2s_loader(a_div, gl_off_a1, N_LDS_STEPS_A, F8_IR_t, wave_id)
         )
-        b_g2s = G2SLoader(b_div, gl_off_b, N_LDS_STEPS_B, F8_IR_t, wave_id)
-        a_s2r = S2RLoader(wave_m, N_TILES_A)
-        b_s2r = S2RLoader(wave_n, N_TILES_B)
+        b_g2s = make_g2s_loader(b_div, gl_off_b, N_LDS_STEPS_B, F8_IR_t, wave_id)
+        a_s2r = make_s2r_loader(wave_m, N_TILES_A)
+        b_s2r = make_s2r_loader(wave_n, N_TILES_B)
         store = StoreKV(
             W_scale,
             K_scale,

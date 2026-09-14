@@ -38,6 +38,7 @@ from aiter.aot.flydsl.common import (
 )
 from aiter.jit.core import AITER_CONFIGS
 from aiter.ops.flydsl.kernels.tensor_shim import ptr_arg as _ptr_view_safe
+from aiter.ops.flydsl.moe_common import is_mxfp_prefill_kernel
 from aiter.ops.flydsl.moe_kernels import (
     _get_compiled_silu_fused,
     _run_compiled,
@@ -1065,7 +1066,19 @@ def compile_one_config(
                 override_env("FLYDSL_GPU_ARCH", aot_arch),
                 FakeTensorMode(),
             ):
-                if is_epilogue:
+                if is_mxfp_prefill_kernel(kernel_name):
+                    from aiter.ops.flydsl.moe_kernels import precompile_mxfp_moe
+
+                    with compile_only_env():
+                        precompile_mxfp_moe(
+                            kernel_name,
+                            kwargs["token_num"],
+                            model_dim,
+                            inter_dim,
+                            experts,
+                            topk,
+                        )
+                elif is_epilogue:
                     _precompile_epilogue_to_cache(
                         act=kwargs.get("act", "silu"),
                         inter_dim=inter_dim,
