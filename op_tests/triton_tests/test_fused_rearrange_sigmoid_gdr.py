@@ -177,7 +177,7 @@ def test_fused_rearrange_sigmoid_gdr_sweep(
         use_qk_l2norm_in_kernel,
     )
 
-    core = torch.empty(1 * 1 * T * HV * V, device=device, dtype=dtype)
+    core = torch.empty(T, HV, V, device=device, dtype=dtype)
     o_tr, h_tr = fused_rearrange_sigmoid_gated_delta_rule(
         A_log,
         a,
