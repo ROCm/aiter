@@ -80,6 +80,8 @@ OUT_FOLDER/
 # Large benchmark results - archive to Wiki or external storage
 op_tests/moe_benchmarking_profiling/results/*.csv
 scripts/results/*.csv
+# Written into the repo root by op_tests/triton_tests/test_pa_decode_gluon.py.
+run_pa_gluon_test*.csv
 
 # Opus tuned/untuned CSVs (moved to aiter/configs/bf16_tuned_gemm.csv with libtype='opus' filter;
 # autolog feature removed). Reject any re-introduction under aiter/ops/opus/configs/.
