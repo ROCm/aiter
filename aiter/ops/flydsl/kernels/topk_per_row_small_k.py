@@ -55,6 +55,7 @@ from flydsl.expr.typing import T
 from aiter.ops.flydsl.kernels.kernels_common import (
     atomic_add_i32,
     kernel_signature,
+    ord_signed_f32,
     uint32_to_int32,
 )
 from aiter.ops.flydsl.kernels.tensor_shim import buf_copy_atom
@@ -107,32 +108,6 @@ def _ugt(a, b):
 _INIT_PIN = 1e30
 _LOCAL_PIN = 1e29
 _INT32_MIN = -2147483648
-# Exponent-all-ones with a zero mantissa; anything above it is a NaN.
-_INF_BITS = 0x7F800000
-# The top of the signed key space, one above +inf's key. Every NaN lands here,
-# so NaN wins a selection it enters -- see `_ord_signed`.
-_NAN_KEY = 2147483647
-
-
-def _ord_signed(value):
-    """Map fp32 to an int32 that compares the same way under `<`, NaN highest.
-
-    fp32 is sign-magnitude, so flipping the magnitude bits of negatives yields a
-    signed-integer total order. -0.0 and 0.0 are one score with two bit patterns
-    and must not become two keys.
-
-    NaN sorts above +inf, matching `torch.topk` and the other two selectors: the
-    dispatcher picks between them by shape, so a row holding a NaN must not
-    answer differently depending on a choice the caller did not make. Every NaN
-    payload collapses onto `_NAN_KEY`, so NaNs tie and the column rule orders
-    them. Testing the bits rather than `x != x` keeps this in the integer domain
-    and leaves the infinities exactly where they belong.
-    """
-    bits = value.bitcast(Int32)
-    bits = (bits == Int32(_INT32_MIN)).select(Int32(0), bits)
-    ordered = bits ^ ((bits >> Int32(31)) & Int32(0x7FFFFFFF))
-    is_nan = (bits & Int32(0x7FFFFFFF)) > Int32(_INF_BITS)
-    return is_nan.select(Int32(_NAN_KEY), ordered)
 
 
 # gfx9 gives a workgroup 160 KiB of LDS.
@@ -334,7 +309,7 @@ def build_topk_per_row_small_k_module(
                     # A padding slot must lose to every real element, so it
                     # takes the bottom of the key space. A real NaN now takes the
                     # top, so the two no longer collide.
-                    ords[slot] = live.select(_ord_signed(value), neg_inf)
+                    ords[slot] = live.select(ord_signed_f32(value), neg_inf)
                     lane_max[j % n_acc] = fx.max(lane_max[j % n_acc], ords[slot])
         my_max = reduce(fx.max, lane_max)
 

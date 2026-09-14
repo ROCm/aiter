@@ -48,6 +48,32 @@ def kernel_signature(**params: object) -> str:
     return format_kernel_name("_".join(parts))
 
 
+# Exponent-all-ones with a zero mantissa; anything above it is a NaN.
+F32_INF_BITS = 0x7F800000
+F32_NAN_KEY = 2147483647
+_F32_INT32_MIN = -2147483648
+
+
+def ord_signed_f32(value):
+    """Map fp32 to an int32 that compares the same way under `<`, NaN highest.
+
+    fp32 is sign-magnitude, so flipping the magnitude bits of negatives yields a
+    signed-integer total order. -0.0 and 0.0 are one score with two bit patterns
+    and must not become two keys.
+
+    NaN sorts above +inf, matching `torch.topk`. The per-row selectors are
+    dispatched by shape, so a row holding a NaN must not answer differently
+    depending on a choice the caller did not make -- which is why this lives
+    here rather than once per selector. Testing the bits rather than `x != x`
+    keeps it in the integer domain and leaves the infinities where they belong.
+    """
+    bits = value.bitcast(fx.Int32)
+    bits = (bits == fx.Int32(_F32_INT32_MIN)).select(fx.Int32(0), bits)
+    ordered = bits ^ ((bits >> fx.Int32(31)) & fx.Int32(0x7FFFFFFF))
+    is_nan = (bits & fx.Int32(0x7FFFFFFF)) > fx.Int32(F32_INF_BITS)
+    return is_nan.select(fx.Int32(F32_NAN_KEY), ordered)
+
+
 def uint32_to_int32(x: int) -> int:
     """Return the signed int32 value with the same low 32-bit pattern."""
     return x - (1 << 32) if x >= (1 << 31) else x

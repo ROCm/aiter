@@ -311,9 +311,7 @@ def flydsl_top_k_per_row_decode(
     # one row, 16 chunks leaves all but a handful of CUs idle, and at many rows
     # it makes the single-block reduce walk counters nobody needed.
     chunks = topk_per_row_decode_chunks(rows, width, wave_size)
-    hist_shape, state_shape = topk_per_row_decode_workspace_shapes(
-        rows, stable, chunks
-    )
+    hist_shape, state_shape = topk_per_row_decode_workspace_shapes(rows, stable, chunks)
     partial_hist, state = _get_topk_workspace(
         logits.device,
         stream.cuda_stream,

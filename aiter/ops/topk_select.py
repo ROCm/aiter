@@ -6,6 +6,8 @@
 aiter carries four per-row selectors, each fastest in a different corner and
 none able to cover the whole domain:
 
+    argmax   k=1 only, and a reduction rather than a selection: the row split
+             across as many workgroups as it takes to fill the part. Owns k=1.
     small_k  one chunk per lane, so k <= wave_size, and a survivor buffer that
              grows with the row bound. Unbeatable on short rows and tiny k.
     plain    the C++/ASM radix selector. Bounded at k=2048. Scales with rows
@@ -38,6 +40,10 @@ from aiter.ops.flydsl.kernels.topk_per_row_radix_stream import (
     topk_per_row_radix_stream_serves,
 )
 from aiter.ops.flydsl.topk_per_row import flydsl_top_k_per_row_decode
+from aiter.ops.flydsl.topk_per_row_argmax import (
+    topk_per_row_argmax,
+    topk_per_row_argmax_serves,
+)
 from aiter.ops.flydsl.topk_per_row_small_k import (
     topk_per_row_small_k,
     topk_per_row_small_k_serves,
@@ -59,8 +65,8 @@ _PLAIN_MAX_K = 2048
 # ...] against a canonical [128, 132, 136, ...]. Serving "low" needs the chunk
 # tie-break made column-aware first.
 _BACKENDS_BY_TIE = {
-    None: ("small_k", "plain", "decode", "stream"),
-    "low": ("decode", "stream"),
+    None: ("argmax", "small_k", "plain", "decode", "stream"),
+    "low": ("argmax", "decode", "stream"),
     "high": ("small_k",),
 }
 # `plain` selects a different set of tied columns from one call to the next:
@@ -71,7 +77,7 @@ _NONDETERMINISTIC = frozenset({"plain"})
 # Order to fall back in when the shape rules name nothing that is available.
 # Streaming first because it takes a row length natively and scales with rows;
 # `plain` last for the reasons below.
-_PREFERENCE = ("stream", "decode", "small_k", "plain")
+_PREFERENCE = ("argmax", "stream", "decode", "small_k", "plain")
 # Fitted to a 232-cell sweep -- M 1..16384, N 2048..1M, k 16..4096, to 64 GiB --
 # by topk_fit_policy.py over topk_full_sweep.csv. Re-run both rather than nudging
 # a number: the function is piecewise constant. Every backend was checked against
@@ -153,6 +159,8 @@ def _available(width: int, k: int, wave_size: int, ragged: bool) -> frozenset:
     already enforced by `_reject_unsupported`, so what is left is geometry.
     """
     out = set()
+    if topk_per_row_argmax_serves(k) is None:
+        out.add("argmax")
     if topk_per_row_small_k_serves(k, width, wave_size) is None:
         out.add("small_k")
     if k <= _PLAIN_MAX_K and not (
@@ -218,6 +226,10 @@ def topk_select_backend(
     """
     if not available:
         raise ValueError("topk_select_backend needs at least one backend")
+    # k=1 first and unconditionally: the others answer it by building machinery
+    # the answer does not need, and lose 1.3x to 12x doing so.
+    if "argmax" in available:
+        return "argmax"
     lo, hi = _PLAIN_MANY_ROWS_BAND
     if "plain" in available and rows >= _PLAIN_MANY_ROWS and lo <= width <= hi:
         return "plain"
@@ -451,7 +463,9 @@ def topk_select(
 
 
 def _dispatch(backend, input, row_lens, idx, topk, rows, ragged):
-    if backend == "small_k":
+    if backend == "argmax":
+        topk_per_row_argmax(input, row_lens, idx)
+    elif backend == "small_k":
         topk_per_row_small_k(input, row_lens, idx, topk)
     elif backend == "plain":
         # plain takes a [start, end) pair, not a length, and an empty

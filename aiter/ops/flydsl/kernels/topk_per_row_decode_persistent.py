@@ -91,9 +91,7 @@ def build_topk_per_row_decode_one_workgroup_module(
         # which had the same shape: at exactly 4 GiB every row came back wrong
         # with nothing raised. A row is 4 MiB at the widest width here.
         input_resource = fx.logical_divide(
-            fx.rocdl.make_buffer_tensor(
-                fx.slice(input, (row, None)), max_size=False
-            ),
+            fx.rocdl.make_buffer_tensor(fx.slice(input, (row, None)), max_size=False),
             fx.make_layout(_VEC, 1),
         )
         row_len = _row_length(row, row_ends, width, next_n)
