@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# Copyright (c) 2025 FlyDSL Project Contributors
+# Copyright (C) 2025-2026 FlyDSL Project Contributors
 
 """Shared MXFP4/FP8 MoE and heterogeneous MoE kernel builders."""
 
@@ -3505,12 +3505,14 @@ def compile_mixed_moe_gemm2_common(
             arg_num_valid_ids: fx.Pointer,
             arg_bias: fx.Pointer,
             i32_tokens_in: fx.Int32,
+            i32_x_rows: fx.Int32,
             i32_n_in: fx.Int32,
             i32_k_in: fx.Int32,
             i32_size_expert_ids_in: fx.Int32,
         ):
 
             tokens_in = fx.Index(i32_tokens_in)
+            x_rows = fx.Index(i32_x_rows)
             n_in = fx.Index(i32_n_in)
             k_in = fx.Index(i32_k_in)
             size_expert_ids_in = fx.Index(i32_size_expert_ids_in)
@@ -3639,9 +3641,7 @@ def compile_mixed_moe_gemm2_common(
 
             c_elem_bytes = arith.constant(int(a_elem_bytes), index=True)
             c_a_pack = arith.constant(int(a_elem_vec_pack), index=True)
-            x_nbytes_idx = _div_pow2(
-                (tokens_in * c_topk) * k_in * c_elem_bytes, int(a_elem_vec_pack)
-            )
+            x_nbytes_idx = _div_pow2(x_rows * k_in * c_elem_bytes, int(a_elem_vec_pack))
             x_nbytes_i32 = fx.Int32(x_nbytes_idx)
             x_rsrc = ptr_buffer_resource(arg_x, x_nbytes_i32)
 
@@ -5230,6 +5230,7 @@ def compile_mixed_moe_gemm2_common(
             arg_num_valid_ids: fx.Pointer,
             arg_bias: fx.Pointer,
             i32_tokens_in: fx.Int32,
+            i32_x_rows: fx.Int32,
             i32_n_in: fx.Int32,
             i32_k_in: fx.Int32,
             i32_size_expert_ids_in: fx.Int32,
@@ -5248,6 +5249,7 @@ def compile_mixed_moe_gemm2_common(
                 arg_num_valid_ids,
                 arg_bias,
                 i32_tokens_in,
+                i32_x_rows,
                 i32_n_in,
                 i32_k_in,
                 i32_size_expert_ids_in,
@@ -5268,6 +5270,7 @@ def compile_mixed_moe_gemm2_common(
             arg_num_valid_ids: fx.Pointer,
             arg_bias: fx.Pointer,
             i32_tokens_in: fx.Int32,
+            i32_x_rows: fx.Int32,
             i32_n_in: fx.Int32,
             i32_k_in: fx.Int32,
             i32_size_expert_ids_in: fx.Int32,
@@ -5286,6 +5289,7 @@ def compile_mixed_moe_gemm2_common(
                 arg_num_valid_ids,
                 arg_bias,
                 i32_tokens_in,
+                i32_x_rows,
                 i32_n_in,
                 i32_k_in,
                 i32_size_expert_ids_in,
@@ -5329,6 +5333,7 @@ def compile_mixed_moe_gemm2_common(
         arg_num_valid_ids: fx.Pointer,
         arg_bias: fx.Pointer,
         i32_tokens_in: fx.Int32,
+        i32_x_rows: fx.Int32,
         i32_n_in: fx.Int32,
         i32_k_in: fx.Int32,
         i32_size_expert_ids_in: fx.Int32,
@@ -5370,6 +5375,7 @@ def compile_mixed_moe_gemm2_common(
                 arg_num_valid_ids,
                 arg_bias,
                 i32_tokens_in,
+                i32_x_rows,
                 i32_n_in,
                 i32_k_in,
                 i32_size_expert_ids_in,
@@ -5387,6 +5393,7 @@ def compile_mixed_moe_gemm2_common(
                 arg_num_valid_ids,
                 arg_bias,
                 i32_tokens_in,
+                i32_x_rows,
                 i32_n_in,
                 i32_k_in,
                 i32_size_expert_ids_in,
@@ -5419,6 +5426,7 @@ def compile_mixed_moe_gemm2_common(
             arg_num_valid_ids: fx.Pointer,
             arg_bias: fx.Pointer,
             i32_tokens_in: fx.Int32,
+            i32_x_rows: fx.Int32,
             i32_n_in: fx.Int32,
             i32_k_in: fx.Int32,
             i32_size_expert_ids_in: fx.Int32,
@@ -5438,6 +5446,7 @@ def compile_mixed_moe_gemm2_common(
                 arg_num_valid_ids,
                 arg_bias,
                 i32_tokens_in,
+                i32_x_rows,
                 i32_n_in,
                 i32_k_in,
                 i32_size_expert_ids_in,
@@ -5459,6 +5468,7 @@ def compile_mixed_moe_gemm2_common(
             arg_num_valid_ids: fx.Pointer,
             arg_bias: fx.Pointer,
             i32_tokens_in: fx.Int32,
+            i32_x_rows: fx.Int32,
             i32_n_in: fx.Int32,
             i32_k_in: fx.Int32,
             i32_size_expert_ids_in: fx.Int32,
@@ -5478,6 +5488,7 @@ def compile_mixed_moe_gemm2_common(
                 arg_num_valid_ids,
                 arg_bias,
                 i32_tokens_in,
+                i32_x_rows,
                 i32_n_in,
                 i32_k_in,
                 i32_size_expert_ids_in,
