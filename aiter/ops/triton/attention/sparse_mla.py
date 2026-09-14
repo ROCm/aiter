@@ -75,12 +75,6 @@ def _mla_num_splits(
     return max(1, min(cta_cap, tiles, 8))
 
 
-# Direct-to-LDS tile pipeline; wins wherever the launch gives a CU more than one
-# workgroup to hide the copy behind.
-_ASYNC_LDS_DEFAULT = True
-_ASYNC_ROPE_VEC = 16  # bytes/lane in the rope copy
-
-
 def _async_launch_config(
     fp8_dots: bool,
     has_invalid: bool,
@@ -101,8 +95,14 @@ def _async_launch_config(
     workgroups/CU) the large tile wins instead, by halving the cross-warp softmax
     exchange rate per token.
     """
-    enabled = _ASYNC_LDS_DEFAULT
-    enabled = enabled and fp8_dots and uni_tile and not has_invalid and not has_extra
+    ASYNC_LDS_DEFAULT = True
+    enabled = (
+        ASYNC_LDS_DEFAULT
+        and fp8_dots
+        and uni_tile
+        and not has_invalid
+        and not has_extra
+    )
     workgroups = num_queries * heads_blocks * max(1, num_splits)
     num_sms = get_num_sms()
     if enabled and workgroups >= 4 * num_sms:
@@ -656,7 +656,7 @@ def sparse_mla_fwd(
         HAS_INVALID=has_invalid,
         FP8_MFMA=fp8_dots,
         ASYNC_LDS=async_lds_on,
-        ROPE_VEC=_ASYNC_ROPE_VEC,
+        ROPE_VEC=16,  # bytes/lane in the rope copy
         GATHER_CACHE="",
         q_scl_ptr=q_scale,
         Q_FP8=q_is_fp8,
