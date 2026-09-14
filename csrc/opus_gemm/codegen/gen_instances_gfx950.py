@@ -688,7 +688,7 @@ using {k.name}_Traits = {traits_name}<{k.BLOCK_SIZE},
 
     grid_setup = f"""
     const int NUM_CU = get_device_cu_num();
-    constexpr int NUM_XCD = 8;
+    constexpr int NUM_XCD = {build_num_xcd()};
     const int num_tiles_m = (M + {k.B_M} - 1) / {k.B_M};
     const int num_tiles_n = (N + {k.B_N} - 1) / {k.B_N};
     int split_m = std::max(1, (NUM_CU + num_tiles_n - 1) / num_tiles_n);
@@ -1962,7 +1962,7 @@ void
   kargs.stride_c_batch = (int)Y.stride(1);
 
   const int split_m = num_tiles_m / MI;          // M-tile groups (WGs along M)
-  constexpr int NUM_XCD = 8;
+  constexpr int NUM_XCD = @@NUM_XCD@@;
   const int m_grp_per_xcd = (split_m + NUM_XCD - 1) / NUM_XCD;
   kargs.stride_ws = split_m;
   kargs.stride_ws_batch = m_grp_per_xcd;
@@ -2031,6 +2031,7 @@ using {k.name}_Traits = {traits_name}<{k.BLOCK_SIZE},
 
     launcher = (
         _BMM_MXSCALE_MINTERLEAVE_LAUNCHER_BODY.replace("@@NAME@@", k.name)
+        .replace("@@NUM_XCD@@", str(build_num_xcd()))
         .replace("@@KERNEL@@", kernel_func)
         .replace("@@SKIP@@", "true" if k.skip_scale_wait else "false")
     )
@@ -2399,7 +2400,7 @@ _BMM_MOUTER_TAIL = r"""  kargs.split_k = m_per_wg;
   kargs.stride_c_batch = (int)Y.stride(1);
 
   const int split_m = (num_tiles_m + m_per_wg - 1) / m_per_wg;
-  constexpr int NUM_XCD = 8;
+  constexpr int NUM_XCD = @@NUM_XCD@@;
   const int m_grp_per_xcd = (split_m + NUM_XCD - 1) / NUM_XCD;
   kargs.stride_ws = split_m;
   kargs.stride_ws_batch = m_grp_per_xcd;
@@ -2455,6 +2456,7 @@ def gen_bmm_mxscale_mouter_instance(
     _, tpl, fn = kargs_template_vars(k.kernel_tag, kargs_name)
     launcher = (
         _BMM_MOUTER_LAUNCHER_BODY.replace("@@NAME@@", k.name)
+        .replace("@@NUM_XCD@@", str(build_num_xcd()))
         .replace("@@KERNEL@@", kernel_func)
         .replace("@@SSW@@", _cppbool(k.skip_scale_wait))
     )
@@ -2494,6 +2496,7 @@ def gen_bmm_mxscale_mouter_tunable_instance(
     _, tpl, fn = kargs_template_vars(k.kernel_tag, kargs_name)
     launcher = (
         _BMM_MOUTER_TUNABLE_LAUNCHER_BODY.replace("@@NAME@@", k.name)
+        .replace("@@NUM_XCD@@", str(build_num_xcd()))
         .replace("@@KERNEL@@", kernel_func)
         .replace("@@SSW@@", _cppbool(k.skip_scale_wait))
     )
