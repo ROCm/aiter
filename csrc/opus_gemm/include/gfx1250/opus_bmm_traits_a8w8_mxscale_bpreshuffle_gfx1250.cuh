@@ -190,7 +190,16 @@ template<int BLOCK_SIZE_,
          // ALL_READS_FIRST took INST_ISSUE_LDS_STALL 3.6% -> 5.6% while cutting
          // the LDS wait 11.6% -> 9.5%. FlyDSL sits off that curve entirely
          // (0.1% stall AND 6.1% wait), spreading its reads across the step.
-         int DS_LOOKAHEAD_ = -1>
+         int DS_LOOKAHEAD_ = -1,
+         // TDM load coherence scope (opus::tdm_traits::scope). 2 = dev is the
+         // opus default and the current behaviour; 0 = cu is what FlyDSL's atom
+         // uses (its cache_modifier defaults to 0, documented "0=cached").
+         // A and B are read-only inputs with no cross-workgroup writes, so
+         // device-scope coherence is a cost with nothing to buy. PMC: we issue
+         // 4x FlyDSL's HBM read requests for a bit-identical result on the same
+         // tile, same grid, same TDM -- scope is the only descriptor field that
+         // still differs after a field-by-field comparison.
+         int TDM_SCOPE_ = 2>
 struct opus_bmm_a8w8_mxscale_bpreshuffle_traits_gfx1250 {
     static constexpr int BLOCK_SIZE = BLOCK_SIZE_;
     static constexpr int B_M = B_M_;
@@ -880,6 +889,10 @@ struct opus_bmm_a8w8_mxscale_bpreshuffle_traits_gfx1250 {
     // per tile rather than global. See the pipeline's kAllReadsFirst block.
     static constexpr bool kAllReadsFirst = ALL_READS_FIRST_;
     static constexpr int  kDsLookahead   = DS_LOOKAHEAD_;
+    static constexpr int  kTdmScope      = TDM_SCOPE_;
+    static constexpr int  kTdmCachePol   = opus::tdm_traits::make_cache_policy(
+        opus::tdm_traits::load_temporal_hint::regular,
+        (opus::tdm_traits::scope)TDM_SCOPE_);
     static_assert(!(ALL_READS_FIRST_ && DS_LOOKAHEAD_ >= 0),
                   "ALL_READS_FIRST and DS_LOOKAHEAD are two settings of the same "
                   "axis; pick one (ALL_READS_FIRST == DS_LOOKAHEAD of kExpM)");
@@ -956,8 +969,9 @@ struct opus_bmm_a8w8_mxscale_bpreshuffle_traits_gfx1250 {
     //   B: [B_K*16 x B_N/16]        over the SHUFFLED buffer, unpadded
     using PaddingA = opus::tdm_traits::padding_auto<DataA, kBlockK, kPadReadVecBytes>;
     using PaddingB = opus::tdm_traits::padding<>;      // no pad -- see kSmemPitchB
-    using WindowA  = opus::tdm<DataA, opus::seq<kBlockK, kARows>, PaddingA>;
-    using WindowB  = opus::tdm<DataB, opus::seq<kBShufBlockElems, kBRows>, PaddingB>;
+    using TdmCache = opus::tdm_traits::cache<kTdmCachePol>;
+    using WindowA  = opus::tdm<DataA, opus::seq<kBlockK, kARows>, PaddingA, TdmCache>;
+    using WindowB  = opus::tdm<DataB, opus::seq<kBShufBlockElems, kBRows>, PaddingB, TdmCache>;
     // A-scale panel window, used only when kSfATdm; the cooperative fill needs
     // no descriptor. Both template arguments have to stay well-formed when the
     // tile does NOT ask for TDM, because naming the alias instantiates it: pad
@@ -2047,6 +2061,31 @@ using opus_bmm_a8w8_mxscale_bpreshuffle_tile_ns128_la4_gfx1250 =
         /*SF_A_LDS*/true, /*SF_B_LDS*/true,
         /*SF_A_TDM_KG*/0, /*SF_A_TDM_PAD*/16, /*TILE_M*/2, /*NO_SPEC*/true,
         /*SF_A_PANEL_KG*/128, /*ALL_READS_FIRST*/false, /*DS_LOOKAHEAD*/4>;
+
+// kid55: kid35 with the TDM loads at CU scope instead of device scope.
+//
+// Field-by-field against FlyDSL's `make_tdm_atom` for the same shape, every
+// descriptor field matches (extents, strides, pad_interval, pad_amount,
+// atomic_barrier, workgroup_mask=0) EXCEPT the cache modifier: FlyDSL passes 0,
+// documented in its own signature as "0=cached", which decodes as
+// temporal=regular + scope=CU. opus's make_cache_policy() defaults to
+// scope::dev, i.e. 16. Both sides "use the default" and the defaults are
+// opposite ends of the same hardware CPOL field.
+//
+// A and B are read-only inputs and nothing in this kernel writes them, so
+// device-scope coherence buys nothing. PMC: 4,024,208 HBM read requests against
+// FlyDSL's 1,009,492 for a bit-identical result on the same tile and grid.
+template <typename DataC>
+using opus_bmm_a8w8_mxscale_bpreshuffle_tile_ns256_cuscope_gfx1250 =
+    opus_bmm_a8w8_mxscale_bpreshuffle_traits_gfx1250<
+        /*BLOCK_SIZE*/256, /*B_M*/256, /*B_N*/256, /*B_K*/256,
+        /*LAYOUT*/opus_gfx1250_bmm::kLayoutTileN,
+        /*D_A*/opus::fp8_t, /*D_B*/opus::fp8_t, /*D_C*/DataC, /*D_ACC*/float,
+        /*GROUP_K*/128, /*NUM_SLOTS*/2, /*WG_PER_CU*/1, /*GROUP_N*/128,
+        /*SF_A_LDS*/true, /*SF_B_LDS*/true,
+        /*SF_A_TDM_KG*/0, /*SF_A_TDM_PAD*/16, /*TILE_M*/2, /*NO_SPEC*/true,
+        /*SF_A_PANEL_KG*/128, /*ALL_READS_FIRST*/false, /*DS_LOOKAHEAD*/-1,
+        /*TDM_SCOPE*/0>;   // 0 = scope::cu
 
 // -- smem -> register read layouts -----------------------------------------
 // Device-only in effect, but compiled on the host pass too so vtype_c matches.
