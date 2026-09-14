@@ -14,9 +14,9 @@ One kernel serves two geometries, selected by the ROPE_SEPARATE constexpr:
         K-only rope and the QK contraction chains a second MFMA into the first.
         The KV buffer is the entire V in both geometries.
 
-Cache formats (Fmt.KIND), per segment. The two packed kinds are both vLLM's
-``--kv-cache-dtype fp8_ds_mla``, which is one name for two byte layouts
-distinguished by model generation, so they carry the generation instead:
+Cache formats (Fmt.KIND), per segment. vLLM calls both packed kinds
+--kv-cache-dtype fp8_ds_mla, one name for two byte layouts told apart by model
+generation, so the tags here carry the generation instead:
 
     "bf16"            full-row bf16
     "fp8_scalar"      whole-row fp8 + a single per-tensor f32 scale (k_scale).
@@ -39,15 +39,6 @@ from triton.language.core import _aggregate as aggregate
 
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
 from aiter.ops.triton.utils.common_utils import strip_annotate
-
-# Upstream fused fp8 x E8M0 -> bf16 upcast. Falls back to _deq_asm.
-try:
-    from triton.experimental.gluon.language.amd import cdna4 as _cdna4
-
-    _HAS_SCALED_UPCAST = hasattr(_cdna4, "scaled_upcast")
-except ImportError:
-    _cdna4 = None
-    _HAS_SCALED_UPCAST = False
 
 # Triton's default max ignores NaN, which on AMD costs a canonicalize per
 # operand. Nothing here produces NaN (masked lanes are -inf and the all-masked
@@ -321,6 +312,10 @@ class Cfg:
         self.QK_DIM = gl.constexpr(KV_DIM + (ROPE_DIM if ROPE_SEPARATE else 0))
         self.NUM_WARPS = gl.constexpr(NUM_WARPS)
         self.GATHER_TW1 = gl.constexpr(GATHER_TW1)
+        # LDS_PAD is in bf16 elements. fp8 tiles store 1 B elements, so double the
+        # count to keep the same row pitch in bytes.
+        if FP8_MFMA:
+            LDS_PAD = LDS_PAD * 2
         self.LDS_PAD = gl.constexpr(LDS_PAD)
         self.UNI_TILE = gl.constexpr(UNI_TILE)
         self.HAS_INVALID = gl.constexpr(HAS_INVALID)
@@ -609,8 +604,10 @@ def _deq_store(x_u8, sc, kv_smem, off, cfg, fmt, AXIS: gl.constexpr):
             kv_smem.slice(off, x_u8.shape[0], dim=0).store(val)
     else:
         if fmt.DEQ == "upcast":
+            # Upstream fused fp8 x E8M0 -> bf16 upcast; the driver only asks for
+            # it when cdna4.scaled_upcast exists, else DEQ="asm" (_deq_asm).
             # sc is the raw E8M0 byte, already in x_u8's shape and layout.
-            val = _cdna4.scaled_upcast(
+            val = gl.amd.cdna4.scaled_upcast(
                 x_u8.to(gl.float8e4nv, bitcast=True), sc, gl.bfloat16
             )
         elif fmt.KIND == "fp8_scalar":
@@ -830,7 +827,7 @@ def _async_segment(
     """Direct-to-LDS tile walk, one LDS buffer.
 
     vmcnt is one in-order FIFO, so the wait goes before any plain load in the body: a
-    plain load outstanding past the newest copy group would drag `wait_group` into
+    plain load outstanding past the newest copy group would drag wait_group into
     waiting for that copy too. The body has no masked variant: the slot read is
     clamped and the partial tail falls out of the score mask (UNI_TILE).
     """
@@ -1674,14 +1671,14 @@ def _process_segment(
     return m_i, l_i, acc
 
 
-_pa_decode_sparse_repr = make_kernel_repr(
-    "_pa_decode_sparse",
+_sparse_mla_repr = make_kernel_repr(
+    "_sparse_mla",
     ["BLOCK_M", "BLOCK_K", "HEAD_SIZE", "NUM_SPLITS", "MAIN_FMT", "ROPE_SEPARATE"],
 )
 
 
-@gluon.jit(repr=_pa_decode_sparse_repr)
-def _pa_decode_sparse(
+@gluon.jit(repr=_sparse_mla_repr)
+def _sparse_mla(
     # Shapes below: C = queries, H = num_heads, S = HEAD_SIZE (the V width),
     # R = ROPE_DIM, nnz = total gathered tokens in a segment's index list.
     q_ptr,  # [C, H, S (+R when ROPE_SEPARATE)] bf16
@@ -1829,6 +1826,7 @@ def _pa_decode_sparse(
     )
     # The direct-to-LDS path stages raw code points, needs the clamped (branch-free)
     # tail, and carries no per-tile validity vector.
+    # TODO(has_invalid): the sentinel restriction is conservative, not fundamental.
     gl.static_assert(
         (not ASYNC_LDS)
         or (FP8_MFMA and UNI_TILE and not HAS_INVALID and not HAS_EXTRA),
@@ -2213,14 +2211,14 @@ def _pa_decode_sparse(
         )
 
 
-_pa_decode_sparse_reduce_repr = make_kernel_repr(
-    "_pa_decode_sparse_reduce",
+_sparse_mla_reduce_repr = make_kernel_repr(
+    "_sparse_mla_reduce",
     ["BLOCK_M", "HEAD_SIZE", "NUM_SPLITS"],
 )
 
 
-@gluon.jit(repr=_pa_decode_sparse_reduce_repr)
-def _pa_decode_sparse_reduce(
+@gluon.jit(repr=_sparse_mla_reduce_repr)
+def _sparse_mla_reduce(
     part_m_ptr,
     part_l_ptr,
     part_acc_ptr,

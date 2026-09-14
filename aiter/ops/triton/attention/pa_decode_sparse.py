@@ -12,14 +12,11 @@ import math
 import torch
 import triton
 
-from aiter.ops.triton._gluon_kernels.gfx950.attention.pa_decode_sparse import (
-    _HAS_SCALED_UPCAST,
+from aiter.ops.triton._gluon_kernels.gfx950.attention.sparse_mla import (
+    _sparse_mla as _sparse_mla_gfx950,
 )
-from aiter.ops.triton._gluon_kernels.gfx950.attention.pa_decode_sparse import (
-    _pa_decode_sparse as _pa_decode_sparse_gfx950,
-)
-from aiter.ops.triton._gluon_kernels.gfx950.attention.pa_decode_sparse import (
-    _pa_decode_sparse_reduce as _pa_decode_sparse_reduce_gfx950,
+from aiter.ops.triton._gluon_kernels.gfx950.attention.sparse_mla import (
+    _sparse_mla_reduce as _sparse_mla_reduce_gfx950,
 )
 from aiter.ops.triton._gluon_kernels.gfx1250.attention.pa_decode_sparse import (
     _pa_decode_sparse as gluon_pa_decode_sparse,
@@ -40,6 +37,14 @@ from aiter.ops.triton.utils.logger import AiterTritonLogger
 from aiter.ops.triton.utils.types import get_fp8_e4m3_dtype
 
 DEVICE_ARCH = arch_info.get_arch()
+
+# Fused fp8 x E8M0 -> bf16 upcast check (gluon cdna4.scaled_upcast)
+try:
+    from triton.experimental.gluon.language.amd import cdna4 as _cdna4
+
+    _HAS_SCALED_UPCAST = hasattr(_cdna4, "scaled_upcast")
+except ImportError:
+    _HAS_SCALED_UPCAST = False
 
 _LOGGER = AiterTritonLogger()
 
@@ -659,7 +664,7 @@ def _pa_decode_sparse_gfx950_gluon(
     # Grid dim 0 varies fastest and XCD assignment is round-robin over the linear
     # workgroup id, so the axis order decides what shares an XCD's L2.
     grid = (num_queries, num_splits, heads_blocks)
-    _pa_decode_sparse_gfx950[grid](
+    _sparse_mla_gfx950[grid](
         q,
         cache,
         main_bf16,
@@ -738,7 +743,7 @@ def _pa_decode_sparse_gfx950_gluon(
 
     # One head per reduce workgroup
     rgrid = (num_queries, num_heads)
-    _pa_decode_sparse_reduce_gfx950[rgrid](
+    _sparse_mla_reduce_gfx950[rgrid](
         part_m,
         part_l,
         part_acc,

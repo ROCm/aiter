@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Sparse MLA attention (gfx950 gluon): ``kv_lora_rank`` latent + appended
+"""Sparse MLA attention (gfx950 gluon): kv_lora_rank latent + appended
 decoupled rope, token-granular top-k gather.
 
 Prefill and decode are the same MQA operator on this path, one program per query
@@ -13,11 +13,11 @@ import math
 
 import torch
 
-from aiter.ops.triton._gluon_kernels.gfx950.attention.pa_decode_sparse import (
-    _pa_decode_sparse as _pa_decode_sparse_gfx950,
+from aiter.ops.triton._gluon_kernels.gfx950.attention.sparse_mla import (
+    _sparse_mla as _sparse_mla_gfx950,
 )
-from aiter.ops.triton._gluon_kernels.gfx950.attention.pa_decode_sparse import (
-    _pa_decode_sparse_reduce as _pa_decode_sparse_reduce_gfx950,
+from aiter.ops.triton._gluon_kernels.gfx950.attention.sparse_mla import (
+    _sparse_mla_reduce as _sparse_mla_reduce_gfx950,
 )
 from aiter.ops.triton.attention.pa_decode_sparse import (
     _as_int32_contiguous_1d,
@@ -29,9 +29,6 @@ from aiter.ops.triton.utils.logger import AiterTritonLogger
 
 _LOGGER = AiterTritonLogger()
 
-# buffer_load carries a signed 32-bit offset; caches past this span gather
-# through 64-bit addresses
-MAX_BYTES = 2**31 - 1
 
 # Tuned launch config (gfx950 / MI355). num_warps = BLOCK_K // 16 (warps tile
 # the dot-N, MFMA N=16); GATHER_TW1=32 requests a whole 512 B token row per
@@ -157,9 +154,6 @@ def _async_launch_config(
     return enabled, (128 if enabled else _BLOCK_K), waves_per_eu
 
 
-_E4M3_MAX = 448.0
-
-
 def _resolve_dot_precision(dot_precision: str, fmt: str) -> bool:
     if dot_precision not in ("bf16", "fp8"):
         raise ValueError(
@@ -175,6 +169,92 @@ def _resolve_dot_precision(dot_precision: str, fmt: str) -> bool:
     if fmt == "bf16":
         raise ValueError("dot_precision='fp8' needs an fp8 cache.")
     return True
+
+
+def _is_packed_mla_record(q, kv, kv_lora_rank):
+    """True for the dsv3.2 / Kimi-K3 record: rank fp8 | f32 per-128 | bf16 rope.
+
+    The rope width is d_qk - kv_lora_rank (what the MLA geometry assert
+    enforces). dsv4's 584 B record does not satisfy the formula for any rope
+    width, so the two packed layouts are told apart by size alone. Any one-byte
+    dtype counts, matching _infer_cache_format.
+    """
+    if kv.ndim != 3 or kv.element_size() != 1:
+        return False
+    rope = q.shape[-1] - kv_lora_rank
+    return (
+        rope > 0 and kv.shape[2] == kv_lora_rank + 4 * (kv_lora_rank // 128) + 2 * rope
+    )
+
+
+def _is_paged_cache(q, kv, kv_lora_rank, kv_scale=None):
+    """True for a cache only the paged driver reads: dsv4's 584 B record, a bf16
+    block pool, or the uniform fp8 pool (fp8_g64: a 2-D pool with a per-64
+    [pages, D // 64] scale vector). [nb, block, d_qk] is the flat MLA
+    pool and a 2-D pool with a scalar kv_scale is fp8_scalar; neither is
+    this."""
+    if kv.ndim == 2:
+        return kv_scale is not None and kv_scale.numel() != 1
+    if kv.ndim != 3 or kv.shape[2] == q.shape[-1]:
+        return False
+    return not _is_packed_mla_record(q, kv, kv_lora_rank)
+
+
+def _forward_paged(
+    q,
+    kv,
+    kv_indptr,
+    kv_indices,
+    softmax_scale,
+    kv_scale,
+    kv_splits,
+    skip_reduce,
+    has_invalid,
+    dot_precision,
+    q_scale,
+    out,
+    return_lse,
+    attn_sink,
+    extra_kv,
+    extra_indptr,
+    extra_indices,
+    block_h,
+):
+    """dsv4 and the SWA+top-k two-loop, until the two launchers merge."""
+    from aiter.ops.triton.attention.pa_decode_sparse import pa_decode_sparse
+
+    unsupported = [
+        name
+        for name, asked in (
+            ("dot_precision='fp8'", dot_precision != "bf16"),
+            ("q_scale", q_scale is not None),
+            ("return_lse", return_lse),
+        )
+        if asked
+    ]
+    if unsupported:
+        raise ValueError(
+            f"{', '.join(unsupported)} is not wired on the paged route yet "
+            "(dsv4 / two-loop caches)."
+        )
+    res = pa_decode_sparse(
+        q,
+        kv,
+        kv_indices,
+        kv_indptr,
+        attn_sink,
+        softmax_scale,
+        kv_scales=kv_scale,
+        block_h=block_h,
+        kv_splits=kv_splits,
+        has_invalid=has_invalid,
+        skip_reduce=skip_reduce,
+        extra_cache=extra_kv,
+        extra_indices=extra_indices,
+        extra_indptr=extra_indptr,
+        out=out,
+    )
+    return res if isinstance(res, tuple) else (res, None)
 
 
 def sparse_mla_fwd(
@@ -193,12 +273,23 @@ def sparse_mla_fwd(
     q_scale: torch.Tensor | None = None,
     out: torch.Tensor | None = None,
     return_lse: bool = False,
+    *,
+    attn_sink: torch.Tensor | None = None,
+    extra_kv: torch.Tensor | None = None,
+    extra_indptr: torch.Tensor | None = None,
+    extra_indices: torch.Tensor | None = None,
+    block_h: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     """Sparse (top-k gathered) MLA attention.
 
-    ``qk_rope_head_dim`` selects the geometry: separated rope (DeepSeek-V3.2,
+    qk_rope_head_dim selects the geometry: separated rope (DeepSeek-V3.2,
     GLM-5.1/5.2), where the query is the latent plus an appended rope, or
     rope-free (GLM-5.3-Flash), where the query is the latent alone.
+
+    This is the common entry point. A DeepSeek-V4 cache, or a call carrying the
+    second index stream, routes to pa_decode_sparse; the two drivers still build
+    their own launches, so a few knobs (fp8 dots, LSE) are MLA-only for now and
+    raise on the paged route.
 
     Args:
         q: [C, H, kv_lora_rank + qk_rope_head_dim] queries, one row per
@@ -207,18 +298,31 @@ def sparse_mla_fwd(
             the QK contraction becomes a single dot over kv_lora_rank.
         kv_buffer: the KV pool [nb, block, R] / [slots, 1, 1, R] /
             [slots, R] in bf16, the same shapes in fp8 (+ scalar
-            kv_scale), or [nb, block, 656] uint8 (``fp8_dsv32_mla``, which is
-            vLLM's ``fp8_ds_mla`` on DeepSeek-V3.2 / Kimi-K3).
-        kv_indptr: ``[C + 1]`` int32 prefix sum of per-query index counts.
+            kv_scale), [nb, block, 656] uint8 (fp8_dsv32_mla, which is
+            vLLM's fp8_ds_mla on DeepSeek-V3.2 / Kimi-K3), [nb, block, 584]
+            uint8 (fp8_dsv4_mla), or a 2-D fp8 pool with a per-64
+            kv_scale vector (fp8_g64); the last two route paged.
+        kv_indptr: [C + 1] int32 prefix sum of per-query index counts.
         kv_indices: flat int32 GLOBAL slot ids into the pool.
         softmax_scale: the layer's softmax scale.
-        kv_scale: ``[1]`` f32 per-tensor cache scale;
-            required for the flat fp8 format.
+        kv_scale: f32 cache scale. [1] per-tensor for the flat fp8 format
+            (fp8_scalar, required); [pages, D // 64] per-64 for the
+            uniform fp8 pool (fp8_g64), which routes paged. The packed
+            formats carry their own scales and take None.
         kv_splits: split-K override; default follows the occupancy policy.
-        skip_reduce: with split-K active, return ``(part_acc, part_m, part_l)``
+        skip_reduce: with split-K active, return (part_acc, part_m, part_l)
             instead of launching the combine.
         has_invalid: index stream carries -1 sentinels (masked out). Default
-            False.
+            False: on the fp8-dots path True disables the direct-to-LDS pipeline
+            (see the ASYNC_LDS static assert), so only set it when the stream
+            really carries -1. The paged route's own default is True; this
+            entry passes the flag through as given.
+        attn_sink: optional [H] f32 per-head sink: exp(sink) joins the softmax
+            denominator (and the LSE) as a virtual key. None means no sink,
+            which is not the same as a zero sink.
+        extra_kv, extra_indptr, extra_indices: a second segment attended in the
+            same pass, for the SWA-window + top-k two-loop. All three together.
+        block_h: BLOCK_H override; only the non-gfx950 fallback honors it.
         dot_precision: what the QK and PV matrix-core ops run in.
 
             "bf16" (default): the KV tile is dequantized to bf16 on its way
@@ -226,13 +330,14 @@ def sparse_mla_fwd(
             "fp8": the cache's own code points go to the fp8 matrix core with no
                 dequant, and the per-tensor scale folds outside the tile loop.
 
-            q is adapted to the choice. bf16 q is quantized here when "fp8" is
-            asked for, fp8 q is passed straight through, and fp8 q under "bf16"
-            dots is widened in-kernel, which is exact.
-        q_scale: scalar f32. Required when q arrives already fp8 (the scale it
-            was quantized with; the aiter asm convention. Optional when q is bf16 and
-            dot_precision="fp8".
-        out: optional ``[C, H, >= kv_lora_rank]`` bf16 destination.
+            q is adapted to the choice. bf16 q is quantized in the kernel
+            prologue, one scale per (query, head-block) tile; fp8 q is passed
+            straight through, and fp8 q under "bf16" dots is widened in-kernel,
+            which is exact.
+        q_scale: scalar f32, required when q arrives already fp8 (the scale it
+            was quantized with; the aiter asm convention). It describes q's
+            encoding, so bf16 q must not carry one.
+        out: optional [C, H, >= kv_lora_rank] bf16 destination.
         return_lse: also return the natural-log log-sum-exp, [C, H] f32, for
             merging partials across context-parallel ranks. A fully masked row
             reports -inf.
@@ -242,6 +347,30 @@ def sparse_mla_fwd(
         [C, H, kv_lora_rank] bf16 (the latent V), lse is None unless return_lse.
     """
     assert q.ndim == 3, f"expected q=[b,h,d], got {q.shape}"
+    paged_args = (extra_kv, extra_indptr, extra_indices, block_h)
+    if any(a is not None for a in paged_args) or _is_paged_cache(
+        q, kv_buffer, kv_lora_rank, kv_scale
+    ):
+        return _forward_paged(
+            q,
+            kv_buffer,
+            kv_indptr,
+            kv_indices,
+            softmax_scale,
+            kv_scale,
+            kv_splits,
+            skip_reduce,
+            has_invalid,
+            dot_precision,
+            q_scale,
+            out,
+            return_lse,
+            attn_sink,
+            extra_kv,
+            extra_indptr,
+            extra_indices,
+            block_h,
+        )
     assert arch_info.get_arch() == "gfx950", "sparse_mla_fwd is gfx950-only"
     q_is_fp8 = q.dtype == torch.float8_e4m3fn
     if q.dtype not in (torch.bfloat16, torch.float8_e4m3fn):
@@ -254,13 +383,9 @@ def sparse_mla_fwd(
             )
         )
     if q_is_fp8:
-        # Caller-quantized q, the asm calling convention: one scaled_fp8_quant
-        # over [C, H*d_qk] with the layer's scale. The kernel folds the scale
-        # into qk_scale, so nothing per-tile changes.
+        # Caller-quantized q, one scaled_fp8_quant over [C, H*d_qk]
         if q_scale is None:
             raise ValueError("fp8 q needs q_scale (the scale it was quantized with)")
-        if q_scale.numel() != 1:
-            raise ValueError(f"q_scale must be a scalar, got {tuple(q_scale.shape)}")
         q_scale = q_scale.reshape(1).to(torch.float32).contiguous()
     num_queries, num_heads, d_qk = q.shape
     assert (
@@ -276,34 +401,26 @@ def sparse_mla_fwd(
         kv_buffer, d_qk, kv_lora_rank, qk_rope_head_dim, kv_scale
     )
     fp8_dots = _resolve_dot_precision(dot_precision, fmt)
-    if fp8_dots and not q_is_fp8:
-        # Quantize the way production does, one scaled_fp8_quant over
-        # [C, H*d_qk]. A caller-supplied q_scale is the layer's calibrated
-        # static scale; without one, take a per-tensor amax.
-        if q_scale is None:
-            q_scale = (
-                (q.detach().float().abs().amax() / _E4M3_MAX)
-                .clamp_min(torch.finfo(torch.float32).tiny)
-                .reshape(1)
-            )
-        q = (
-            (q.float() / q_scale)
-            .clamp(-_E4M3_MAX, _E4M3_MAX)
-            .to(torch.float8_e4m3fn)
-            .contiguous()
-        )
-        q_is_fp8 = True
-    elif q_scale is not None and not q_is_fp8:
+    if q_scale is not None and not q_is_fp8:
         raise ValueError(
-            "q_scale was given but q is bf16 and dot_precision='bf16', so "
-            "nothing would use it"
+            "q_scale describes an fp8 q. With bf16 q the kernel quantizes per "
+            "(query, head-block) tile, so drop q_scale, or pass q already "
+            "quantized."
         )
     kv_indices = _as_int32_contiguous_1d(kv_indices)
     kv_indptr = _as_int32_contiguous_1d(kv_indptr)
     assert kv_indptr.numel() == num_queries + 1
-    # No attention sink in MLA models; the kernel still wants a live pointer
-    # for the compile-time-elided argument slot.
-    attn_sink = torch.empty(1, device=q.device, dtype=torch.float32)
+    has_sink = attn_sink is not None
+    if has_sink:
+        if attn_sink.numel() != num_heads:
+            raise ValueError(
+                f"attn_sink must have one entry per head ({num_heads}), got "
+                f"{tuple(attn_sink.shape)}"
+            )
+        attn_sink = attn_sink.reshape(-1).to(torch.float32).contiguous()
+    else:
+        # The kernel still wants a live pointer for the compile-time-elided slot.
+        attn_sink = torch.empty(1, device=q.device, dtype=torch.float32)
 
     # H < 16 runs natively at BLOCK_M = next_pow2(H) instead of padding heads.
     block_m = 16 if num_heads >= 16 else max(8, 1 << (num_heads - 1).bit_length())
@@ -318,7 +435,8 @@ def sparse_mla_fwd(
         if int(cache.stride(0)) % a == 0:
             cs0_align = a
             break
-
+    # buffer_load carries a signed 32-bit offset
+    MAX_BYTES = 2**31 - 1
     use_buffer_load = max_addressable_bytes(cache) < MAX_BYTES
     idx_use_buffer_load = max_addressable_bytes(kv_indices) < MAX_BYTES
 
@@ -382,7 +500,7 @@ def sparse_mla_fwd(
     # Q is read once per query without split-K, and re-read by every split
     q_cache = ".cg" if num_splits == 1 else ""
     grid = (num_queries, num_splits, heads_blocks)
-    _pa_decode_sparse_gfx950[grid](
+    _sparse_mla_gfx950[grid](
         q,
         cache,
         alt,
@@ -415,7 +533,7 @@ def sparse_mla_fwd(
         pa_stride_h,
         num_heads,
         HAS_EXTRA=False,
-        HAS_SINK=False,
+        HAS_SINK=has_sink,
         MAIN_FMT=fmt,
         EXTRA_FMT=fmt,
         MAIN_BLOCK_SIZE=block_size,
@@ -431,7 +549,7 @@ def sparse_mla_fwd(
         HEAD_ALIGNED=head_aligned,
         MFMA_K=_MFMA_K,
         GATHER_TW1=_GATHER_TW1,
-        LDS_PAD=(_LDS_PAD * 2 if fp8_dots else _LDS_PAD),
+        LDS_PAD=_LDS_PAD,
         NOPE_CHUNK=nope_chunk,
         CHUNK_AXIS=chunk_axis,
         PART_STORE_CACHE="",
@@ -448,9 +566,6 @@ def sparse_mla_fwd(
         FP8_MFMA=fp8_dots,
         ASYNC_LDS=async_lds_on,
         ROPE_VEC=_ASYNC_ROPE_VEC,
-        # A 576 B row is not 128 B aligned: it spans five lines and shares its end
-        # line with its own rope read. ".cg" (sc0 nt) marks that evict-first and
-        # throws the sharing away, so this gather wants a plain cached load.
         GATHER_CACHE="",
         q_scl_ptr=q_scale,
         Q_FP8=q_is_fp8,
@@ -467,7 +582,7 @@ def sparse_mla_fwd(
 
     # One head per reduce workgroup
     rgrid = (num_queries, num_heads)
-    _pa_decode_sparse_reduce_gfx950[rgrid](
+    _sparse_mla_reduce_gfx950[rgrid](
         part_m,
         part_l,
         part_acc,
@@ -481,7 +596,7 @@ def sparse_mla_fwd(
         pa_stride_s,
         pa_stride_h,
         num_heads,
-        HAS_SINK=False,
+        HAS_SINK=has_sink,
         HEAD_SIZE=kv_lora_rank,
         BLOCK_M=1,
         NUM_SPLITS=num_splits,
