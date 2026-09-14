@@ -68,7 +68,6 @@ def compile_pa_decode_tile(
     prefetch_v: bool = False,
     prefetch_v_iglp: bool = False,
     match_gluon_numerics: bool = False,
-    early_v_only: bool = False,
 ):
     """Build the tile-programming PA-decode kernel + launch wrapper.
 
@@ -133,26 +132,30 @@ def compile_pa_decode_tile(
     TOTAL_ROWS = query_length * query_group_size
     M_TILES = cdiv(TOTAL_ROWS, MFMA_MNK)
     ROWS_PADDED = M_TILES * MFMA_MNK
-    tune_scalar_v = is_gfx950 and head_dim == 128 and trans_v and not per_token_kv
-    tune_page128 = tune_scalar_v and block_size == 128
-    tune_page16_vpipe = tune_scalar_v and block_size == 16
-    # Native page-16 decode overlaps V with QK/softmax and relaxes the K/V
-    # scheduling fences. The opt-in V/K pipeline also moves next K and changes
-    # the softmax instruction sequence, so keep its selection independent.
-    PAGE16_EARLY_V = (
-        early_v_only
-        and not prefetch_v
-        and tune_page16_vpipe
-        and query_length == 1
-        and M_TILES == 1
+    # The gfx950 scalar-scale decode paths can opt into earlier V loads.  The
+    # page-16 single-M-tile variant additionally delays the next K load until
+    # immediately before the current PV, shortening its live range across the
+    # softmax while leaving the existing schedule as the default.
+    tune_page128 = (
+        is_gfx950
+        and head_dim == 128
+        and block_size == 128
+        and trans_v
+        and not per_token_kv
     )
-    EARLY_V = (
-        prefetch_v and (tune_page128 or tune_page16_vpipe) and M_TILES == 1
-    ) or PAGE16_EARLY_V
+    tune_page16_vpipe = (
+        is_gfx950
+        and head_dim == 128
+        and block_size == 16
+        and trans_v
+        and not per_token_kv
+    )
+    EARLY_V = prefetch_v and (tune_page128 or tune_page16_vpipe) and M_TILES == 1
     PAGE16_VPIPE = prefetch_v and tune_page16_vpipe and M_TILES == 1
     PAGE16_VPIPE_IGLP = PAGE16_VPIPE and prefetch_v_iglp
-    # Keep the softmax rewrite confined to the opt-in experiments. Native
-    # early-V scheduling retains the original numerical policy.
+    # Keep the single-M-tile softmax rewrite confined to the two opt-in
+    # MiniMax-M3 experiments.  In particular, every default/non-target kernel
+    # continues to instantiate the original instruction stream.
     M1_SCALE_BEFORE_MASK = PAGE16_VPIPE or match_gluon_numerics
     P_BUFFERS = 2 if tune_page128 and M_TILES == 3 else 1
     # PV layout: V=A, P=B -> output [head-dim (row), query-row (col=lane16)],
@@ -550,9 +553,8 @@ def compile_pa_decode_tile(
                     * QK_CHUNK_ELEMS,
                 )
                 w = _k_load16(base)  # head[he_idx*16 : +16] -> k_step 2*qkhe, 2*qkhe+1
-                if const_expr(block_size == 16 and not PAGE16_EARLY_V):
-                    # Native early V needs K/V loads to interleave with MFMA
-                    # and softmax; retain the fences for the other schedules.
+                if const_expr(block_size == 16):
+                    # help the scheduler overlap the PAGES_PER_CHUNK gathered loads
                     fx.rocdl.sched_barrier(fx.rocdl.mask_vmem_rd)
                 ops.extend([w[0], w[1]])
             return ops  # N_SUBCHUNKS i64 operands
@@ -811,8 +813,8 @@ def compile_pa_decode_tile(
                             + page_step * 16,
                         )
                     w = _v_load16(base)
-                    if const_expr(block_size == 16 and not PAGE16_EARLY_V):
-                        # Match the K-load scheduling policy in _k_ops.
+                    if const_expr(block_size == 16):
+                        # help the scheduler overlap the per-page gathered loads (see _k_ops)
                         fx.rocdl.sched_barrier(fx.rocdl.mask_vmem_rd)
                     ops.extend([w[0], w[1]])
             if const_expr(head_dim == 64):

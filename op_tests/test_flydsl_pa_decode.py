@@ -194,20 +194,10 @@ def test_pa_decode_maps_buffers_and_scale_layout(monkeypatch):
 
 
 @pytest.mark.parametrize(
-    "batch_size,query_length,expected",
-    [
-        (1, 1, True),
-        (32, 1, True),
-        (33, 1, True),
-        (64, 1, True),
-        (65, 1, False),
-        (32, 2, False),
-        (33, 2, True),
-        (64, 2, True),
-        (65, 2, False),
-    ],
+    "batch_size,expected",
+    [(32, False), (33, True), (64, True), (65, False)],
 )
-def test_v_prefetch_workgroup_interval(batch_size, query_length, expected):
+def test_v_prefetch_workgroup_interval(batch_size, expected):
     """Warmup boundaries cover both compile-time prefetch variants."""
     if pa_decode is None:
         pytest.skip("FlyDSL is not available")
@@ -218,7 +208,6 @@ def test_v_prefetch_workgroup_interval(batch_size, query_length, expected):
             num_kv_heads=1,
             num_partitions=8,
             num_compute_units=256,
-            query_length=query_length,
         )
         is expected
     )
@@ -613,18 +602,16 @@ def _run_accuracy_case(
 
 
 @pytest.mark.parametrize(
-    "block_size,query_dtype,num_kv_heads,num_partitions,trans_v",
+    "block_size,query_dtype,num_kv_heads,num_partitions",
     [
-        pytest.param(16, dtypes.bf16, 1, 1, False, id="page16-bf16-hkv1-np1"),
-        pytest.param(64, dtypes.fp16, 2, 1, False, id="page64-fp16-hkv2-np1"),
-        pytest.param(128, dtypes.bf16, 2, 4, False, id="page128-bf16-hkv2-np4"),
-        pytest.param(128, dtypes.fp16, 1, 4, False, id="page128-fp16-hkv1-np4"),
-        pytest.param(16, dtypes.bf16, 1, 1, True, id="page16-bf16-hkv1-np1-transv"),
-        pytest.param(16, dtypes.fp16, 2, 4, True, id="page16-fp16-hkv2-np4-transv"),
+        pytest.param(16, dtypes.bf16, 1, 1, id="page16-bf16-hkv1-np1"),
+        pytest.param(64, dtypes.fp16, 2, 1, id="page64-fp16-hkv2-np1"),
+        pytest.param(128, dtypes.bf16, 2, 4, id="page128-bf16-hkv2-np4"),
+        pytest.param(128, dtypes.fp16, 1, 4, id="page128-fp16-hkv1-np4"),
     ],
 )
 def test_pa_decode_fixed_length_accuracy(
-    block_size, query_dtype, num_kv_heads, num_partitions, trans_v
+    block_size, query_dtype, num_kv_heads, num_partitions
 ):
     _run_accuracy_case(
         [257, 257, 257],
@@ -635,23 +622,20 @@ def test_pa_decode_fixed_length_accuracy(
         query_dtype=query_dtype,
         num_partitions=num_partitions,
         tolerance=FIXED_LENGTH_ACCURACY_TOLERANCE,
-        trans_v=trans_v,
     )
 
 
 @pytest.mark.parametrize("query_dtype", [dtypes.bf16, dtypes.fp16])
-@pytest.mark.parametrize("block_size,trans_v", [(128, False), (16, True)])
-def test_pa_decode_variable_length_accuracy(query_dtype, block_size, trans_v):
+def test_pa_decode_variable_length_accuracy(query_dtype):
     _run_accuracy_case(
         [1, 127, 257, 1027],
         num_query_heads=8,
         num_kv_heads=2,
         head_dim=128,
-        block_size=block_size,
+        block_size=128,
         query_dtype=query_dtype,
         num_partitions=4,
         tolerance=VARIABLE_LENGTH_ACCURACY_TOLERANCE,
-        trans_v=trans_v,
     )
 
 
@@ -1205,10 +1189,12 @@ def test_tp4_contexts(block_size, context_length, query_length, per_token):
 def test_tp4_decode_batches(batch_size, block_size, context_length):
     """Served TP4 decode grid: Hq16, Hkv1, D128, transposed V.
 
-    Batch is the only axis that moves the CTA count. At NP=8 the page-128
-    sweep stays within its tuned decode range (batch * 8 <= 512 on a 256-CU
-    part). Page 16 uses early V loads across these grids and walks sixteen
-    physical pages per compute tile.
+    Batch is the only axis that moves the CTA count, and at NP=8 the sweep
+    straddles the tuned V-prefetch window (256 < batch * 8 <= 512 on a 256-CU
+    part), so page-128 batch 64 compiles the prefetch specialization while the
+    smaller batches compile the default schedule. Page 16 never enters that
+    window -- the gate also requires block_size == 128 -- so it covers the
+    sixteen-pages-per-tile block-table walk over the same grids instead.
     """
     _run_accuracy_case(
         [context_length] * batch_size,
@@ -1386,21 +1372,15 @@ def test_mtp3_page128_partition_boundaries(
 
 
 @pytest.mark.parametrize("all_empty", [False, True])
-@pytest.mark.parametrize("batch_size", [8, 64])
-@pytest.mark.parametrize("block_size", [16, 128])
-def test_decode_prefetch_mixed_contexts(all_empty, batch_size, block_size):
-    """Early V loads handle empty partitions and poisoned page-table padding."""
+def test_page128_decode_prefetch_mixed_contexts(all_empty):
+    """A two-CTA-per-CU decode grid handles empty partitions and poisoned padding."""
     _require_gpu()
-    lengths = (
-        [0] * batch_size
-        if all_empty
-        else [0, 1, 63, 127, 128, 129, 257, 2051] * (batch_size // 8)
-    )
+    lengths = [0] * 64 if all_empty else [0, 1, 63, 127, 128, 129, 257, 2051] * 8
     _constant_page_decode_case(
         lengths,
-        block_size=block_size,
+        block_size=128,
         num_partitions=8,
-        block_table_width=(max(lengths) + block_size - 1) // block_size,
+        block_table_width=0 if all_empty else 17,
         poison_padding=True,
         trans_v=True,
     )
