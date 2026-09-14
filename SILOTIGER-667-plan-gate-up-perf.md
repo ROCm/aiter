@@ -107,6 +107,13 @@ both sides of the A/B.
   `tickets/667/harness/run_g9_compare.sh --gpu 6 --iters 100 --flydsl-weight-layout preshuffled -- --shapes qwen3next,deepseek-v3 --batches 1,2`.
   Canary: Qwen B=1 gate_up FP8. Claiming a CK win needs 1000 iters on GPU 6
   with loaded SCLK in the of-record band.
+- **No B=1/B=2 regression.** A change ships only if that G9 gate_up
+  spot-check does not slow the previous of-record on **both** `--batches 1,2`
+  (same timer, loaded SCLK in band, both shapes). A B=1 win that regresses
+  B=2, or the reverse, is a no-ship unless that dtype/path is WontFix'd with
+  the numbers. Qwen B=1 is the occupancy canary; it does not replace the B=2
+  check. Spread of a few percent on an **unchanged** path is noise, not a
+  veto.
 
 ## Subtasks
 
