@@ -3344,14 +3344,13 @@ def get_2stage_cfgs(
         and not doweight_stage1
         and gate_mode != GateMode.INTERLEAVE
         and not (has_stage1_bias or has_stage2_bias)
-        and situ_beta == situ_linear_beta == 1.0
         and hidden_pad == 0
         and intermediate_pad == 0
         and model_dim % 256 == 0
         and aiter.is_mxfp4_moe_shape_supported(expert, model_dim, inter_dim, topk)
         and os.environ.get("AITER_MXMOE_FALLBACK", "1") == "1"
     )
-    if _mxmoe_fallback_ok:
+    if _mxmoe_fallback_ok and cfg is None:
         # A wide sort block only amortizes once there are enough tokens to fill it.
         _bm = 64 if token < 512 else 128
         _g2_tk = 128 if inter_dim % 128 == 0 else 256
@@ -3361,10 +3360,9 @@ def get_2stage_cfgs(
         _rows_per_expert = -(-token * topk // expert)
         _g1_swz = min(6, max(1, -(-_rows_per_expert // _bm)))
         _g1_sfx = f"_xcd{_g1_swz}" if _g1_swz > 1 else ""
-        # Persist needs enough tiles to amortize its loop setup and hide its tail;
-        # the spatial partition pays off one tier earlier.
+        # Persist needs enough tiles to amortize its loop setup and hide its tail.
         _g2_persist = "_persist" if _bm == 128 and token >= 4096 else ""
-        _g2_sfx = "_sp402" if _bm == 128 and token >= 2048 else ""
+        _g2_sfx = ""
         _kn1 = f"flydsl_mxmoe_g1_a4w4_{_bm}x256x256_situv2{_g1_sfx}"
         _kn2 = (
             f"flydsl_moe2_layout_afp4_wfp4_bf16_t{_bm}x256x{_g2_tk}"

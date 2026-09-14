@@ -454,7 +454,11 @@ def compile_gemm2_a4w4_port(
             c_stride = fx.Int32(cu_num)
 
             cumsum0 = global_typed_ptr(arg_cumsum, T.i32)[0]
-            total_m_blocks = _udiv(cumsum0, BM)
+            # Must match the non-persist branches: cumsum0 counts SBM-padded sort
+            # rows, so the tile count is (cumsum0/SBM)*SUBS. Using cumsum0/BM
+            # undercounts whenever SBM is not a multiple of BM and silently drops
+            # the trailing sub-tiles.
+            total_m_blocks = _m_tiles(cumsum0)
             # ceil((total_m_blocks - m_tile0) / cu_num), clamped to 0 when m_tile0 >= total_m_blocks.
             diff = total_m_blocks - m_tile0
             rem = (diff > fx.Int32(0)).select(diff, fx.Int32(0))
