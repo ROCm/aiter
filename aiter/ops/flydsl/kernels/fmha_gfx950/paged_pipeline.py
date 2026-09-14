@@ -15,6 +15,16 @@ from flydsl.expr.utils.arith import _to_raw as as_mlir_value
 from aiter.ops.flydsl.kernels import buffer_ops
 from aiter.ops.flydsl.kernels.fmha_gfx950.paged_memory import load as _load
 
+from .common import (
+    _buffer_load_128,
+    _buffer_load_lds_128,
+    _buffer_store_128,
+    _cu_load,
+)
+from .common import (
+    _read_exec_i64 as _read_exec_i64,  # noqa: PLC0414 - compatibility re-export
+)
+
 _LOG2E = 1.4426950408889634
 
 
@@ -22,12 +32,6 @@ NUM_XCD_GFX950 = 8
 
 
 PAGED_FP8_BUFFER_LIMIT_BYTES = (1 << 31) - 16
-
-
-def _read_exec_i64():
-    """Read the current wave exec mask, matching Clang's builtin lowering."""
-    true_i1 = fx.Boolean(True).ir_value()
-    return rocdl.ballot(T.i64, true_i1)
 
 
 def _ds_read_tr8_b64_imm(result_type, addr_i32, imm_offset=0):
@@ -373,45 +377,6 @@ def _apply_dualwave_causal_mask_pair(s_values, rel_i32, neg_inf_i32, pair_thresh
         )
         s_values[idx_x] = _bitcast_f32(new_x)
         s_values[idx_y] = _bitcast_f32(new_y)
-
-
-def _cu_load(div, idx, cu_atom, cu_v1i32):
-    """Load cu_seqlens[idx] into an SGPR. ``idx`` must be wave-uniform."""
-    v = fly.copy_atom_call_ssa(
-        [cu_v1i32], cu_atom, fx.slice(div, (None, fx.Int32(idx)))
-    )
-    return fx.Index(
-        rocdl.readfirstlane(T.i32, as_mlir_value(fx.Int32(Vec(v, (1,), fx.Int32)[0])))
-    )
-
-
-def _buffer_load_128(elem_index, _load_atom_128, q_div, q_load_i32x4_type):
-    """128-bit global->register load (buffer_load_dwordx4) from Q."""
-    return fly.copy_atom_call_ssa(
-        [q_load_i32x4_type],
-        _load_atom_128,
-        fx.slice(q_div, (None, fx.Int32(elem_index))),
-    )
-
-
-def _buffer_load_lds_128(
-    src_div, lds_byte_addr, src_elem, soffset_elems, _dma_atom, _lds_ptr_ty
-):
-    """128-bit global->LDS DMA; `src_elem` is voffset, `soffset_elems` is scaled by the atom."""
-    lds_ptr = fx.inttoptr(_lds_ptr_ty, fx.Int32(lds_byte_addr))
-    dst = fx.make_view(lds_ptr, fx.make_layout(1, 1))
-    src = fx.slice(src_div, (None, fx.Int32(src_elem)))
-    fx.copy(_dma_atom, src, dst, soffset=fx.Int32(soffset_elems))
-
-
-def _buffer_store_128(
-    pack_i32_vec, elem_index, _o_store_reg_128, _store_atom_128, o_div
-):
-    """128-bit register->global store (buffer_store_dwordx4) into O."""
-    fx.memref_store_vec(pack_i32_vec, _o_store_reg_128)
-    fx.copy(
-        _store_atom_128, _o_store_reg_128, fx.slice(o_div, (None, fx.Int32(elem_index)))
-    )
 
 
 def _vec_k_dma_oct_idx(traits, d, wave_id_uni, lane_in_warp):
