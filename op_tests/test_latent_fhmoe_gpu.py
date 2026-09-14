@@ -186,9 +186,20 @@ def test_k3_latent_fhmoe_exact_dimensions(
     if graph_mode:
         latent_fhmoe(*args)
         torch.cuda.synchronize()
+        # Capture with maximally duplicated routing, then replay the same graph
+        # against a different live routing pattern. This matches vLLM capture
+        # warmup followed by the first speculative decode and catches kernels
+        # that accidentally retain routing values instead of tensor addresses.
+        topk_ids.zero_()
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
             routed_actual, shared_actual = latent_fhmoe(*args)
+        topk_ids.copy_(
+            torch.arange(m * topk, dtype=torch.int32, device=device).reshape(m, topk)
+        )
+        scratch = torch.empty(128 * 1024 * 1024, dtype=torch.uint8, device=device)
+        scratch.fill_(0xA5)
+        del scratch
         graph.replay()
     else:
         routed_actual, shared_actual = latent_fhmoe(*args)
