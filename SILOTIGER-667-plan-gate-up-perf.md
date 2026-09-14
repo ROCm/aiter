@@ -48,10 +48,9 @@ G7’s “`dot2_acc>1` is ~4% slower; B=1 is occupancy-bound” A/B was on the
 over `k0` was WontFix for **down** because down already fills CUs; gate/up
 is the opposite.
 
-The hot loop currently drains all gate `v_dot2`s, then all up `v_dot2`s, each
-with `s_nop 2`. Gate and up already use different accumulators, so pairing
-them should hide the RAW hazard. `x` loads ignore `nlane`: all 16 nlanes
-issue the same activation dwordx4s every `k0`.
+The hot loop **now** interleaves gate/up `v_dot2` (subtask 1). `x` loads still
+ignore `nlane`: all 16 nlanes issue the same activation dwordx4s every `k0`
+(subtask 3).
 
 ## Progress
 
@@ -59,7 +58,7 @@ Track here as work lands (leave unchecked until that item is done). Per-subtask
 gates: op_test with `FLYDSL_RUNTIME_ENABLE_CACHE=0` on GPU 6; plus a G9/667
 preshuffled gate/up spot-check when the hot loop, wait/reduce, or grid changed.
 
-- [ ] 1. Interleave gate/up `v_dot2` (drop half the `s_nop`s)
+- [x] 1. Interleave gate/up `v_dot2` (drop half the `s_nop`s)
 - [ ] 2. Re-A/B G7 `dot2_acc` on the **native** 16×4 grid
 - [ ] 3. Dedup `x` loads within `nlane` (broadcast per `klane`)
 - [ ] 4. Software-pipeline `k0` (prefetch next kpack)
@@ -119,28 +118,45 @@ both sides of the A/B.
 
 ### 1. Interleave gate/up `v_dot2`
 
-The native `k0` loop builds `gate_pairs` / `up_pairs` then
+**Done (2026-09-14).** Native `k0` uses `drain_or_chain_gate_up`: default
+`dot2_acc=1` emits `g0, u0, g1, u1, …`. Gate dots `serialize=False`; **every
+up** dot `serialize=True` (half the nops). `dot2_acc>1` still does per-stream
+G7. Down stays on `drain_or_chain`. Gather gate/up is still sequential.
 
-```text
-gd = drain_or_chain(gate_pairs, ...)
-ud = drain_or_chain(up_pairs, ...)
-```
+Native gate/up `k0` is `range(num_kpack)` (`scf.for`), not
+`range_constexpr` (full unroll). Fully unrolled DeepSeek `k0=112` plus
+`has_side_effects=False` on `v_dot2` miscompiled (cos ~0.973). Forcing
+`has_side_effects=True` was correct but slow (~107 µs DeepSeek B=1 FP8).
+Looping `k0` + interleave + nop-on-every-up + `has_side_effects=False` is
+the combo that is both correct and faster.
 
-That is eight serialized gate dots (`s_nop 2` each), then eight up dots.
-Gate and up already write different f32 accumulators, so a gate `v_dot2` and
-an up `v_dot2` do not share the accumulator RAW. Pair them per `ipair`
-(gate, up, gate, up) so consecutive dots hit different dest regs and drop
-the nop between streams.
+Do **not** nop only the last up: `g_i` then `u_i` then `g_{i+1}` reuses the
+gate acc after one instruction (DeepSeek cold FP8 cos ~0.973). BF16 must
+build pair lists at Python compile time and call the helper — `serialize
+and last` inside `range_constexpr` became `scf.if` and cos ~0.68.
 
-Apply to all four native gate/up builders. Keep `drain_or_chain` / G7 for
-the single-stream case (down); do not silently change down.
+- [x] Interleaved gate/up dots in the native `k0` loop (FP8, FP8-act, FP4, BF16).
+- [x] ISA (native FP8 preshuffled, `h1024`): unrolled k0 was `s_nop 2` **256→128**,
+      `v_dot2` 256, `buffer_load_dwordx4` 64. Looped k0 body is **8 nops / 16
+      dots / 4 dwordx4** per `k0` (same ratio; loads not scalarized).
+- [x] op_test cache-off GPU 6: **100 passed**.
+- [x] G9 spot-check GPU 6, 100 iters, 3 repeats, `timing=device`, loaded SCLK
+      median **2380 MHz** (`/tmp/g9_gu_i1_ck.md`). Gate_up vs the 1000-iter
+      living table above (same shapes; 100 vs 1000 iters):
 
-- [ ] Interleaved gate/up dots in the native `k0` loop (FP8, FP8-act, FP4, BF16).
-- [ ] ISA check: fewer `s_nop 2` between the two streams; still
-      `v_dot2_f32_bf16`; no scalarization of kpack/`x` dwordx4 loads.
-- [ ] **Done when:** op_test cache-off on GPU 6 passes; Qwen+DeepSeek B=1,2
-      gate_up G9 spot-check does not regress vs the living baseline in this
-      file (same timer, loaded SCLK).
+| shape | B | dtype | act | flydsl_us | ratio(f/c) | vs living 1000-iter |
+|---|---|---|---|---|---|---|
+| qwen3next | 1 | fp4 | bf16 | 16.21 | 2.17 | ~flat (occupancy 1.25) |
+| qwen3next | 1 | fp8 | bf16 | 19.99 | 2.57 | slight (was ~21 µs / 2.73) |
+| qwen3next | 1 | fp8 | fp8 | 21.27 | 2.52 | flat vs ~2.53 |
+| deepseek-v3 | 1 | fp4 | bf16 | 48.59 | **0.975** | was ~62 µs / 1.26 |
+| deepseek-v3 | 1 | fp8 | bf16 | 74.59 | **1.52** | was ~83 µs / 1.78 |
+| deepseek-v3 | 1 | fp8 | fp8 | 76.35 | **1.57** | was ~85 µs / 1.78 |
+| deepseek-v3 | 2 | fp8 | bf16 | 90.72 | 1.03 | was ~1.11 |
+
+Qwen B=1 is still occupancy-starved (subtask 5). DeepSeek B=1 FP8 closed
+part of the hole; FP4 now matches CK on this 100-iter canary. Claiming a
+CK win vs the of-record table still needs 1000 iters.
 
 ### 2. Re-A/B G7 `dot2_acc` on the native 16×4 grid
 

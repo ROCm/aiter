@@ -296,6 +296,35 @@ def drain_or_chain(pairs, *, dot2_acc: int, serialize: bool = True):
     return acc
 
 
+def drain_or_chain_gate_up(
+    gate_pairs, up_pairs, *, dot2_acc: int, serialize: bool = True
+):
+    """Interleave gate/up ``v_dot2`` so consecutive dots write different accs.
+
+    Default ``dot2_acc=1`` emits ``g0, u0, g1, u1, ...``. Consecutive dots write
+    different accumulators, so gate dots omit ``s_nop 2``; each up dot keeps the
+    nop so the next gate reuse of the gate acc (and the following f32 add) stay
+    covered. Net nops drop by half vs two serialized drains. ``dot2_acc>1`` keeps
+    per-stream G7. Down stays on :func:`drain_or_chain`.
+    """
+    if len(gate_pairs) != len(up_pairs):
+        raise ValueError("gate/up pair lists must be the same length")
+    if const_expr(dot2_acc > 1):
+        return (
+            drain_or_chain(gate_pairs, dot2_acc=dot2_acc, serialize=serialize),
+            drain_or_chain(up_pairs, dot2_acc=dot2_acc, serialize=serialize),
+        )
+    g_acc = fx.Float32(0.0).ir_value()
+    u_acc = fx.Float32(0.0).ir_value()
+    n = len(gate_pairs)
+    for idx in range_constexpr(n):
+        ga, gb = gate_pairs[idx]
+        ua, ub = up_pairs[idx]
+        g_acc = dot2_f32_bf16(ga, gb, g_acc, serialize=False)
+        u_acc = dot2_f32_bf16(ua, ub, u_acc, serialize=serialize)
+    return g_acc, u_acc
+
+
 def dot2_or_scalar(a_i32, b_i32, acc_f32, *, use_dot2: bool, serialize: bool = True):
     """One packed-bf16 MAC, dispatched to the dot2 path or the scalar-f32 fallback.
 
@@ -772,7 +801,7 @@ def _build_gate_up_fp8_preshuffled_native(
 
         gate_l = fx.Float32(0.0)
         up_l = fx.Float32(0.0)
-        for k0 in range_constexpr(num_kpack):
+        for k0 in range(num_kpack):
             k_base = k0 * 64 + klane * fx.Int32(16)
             x_word0 = (token_b * hidden + k_base) // 2
             xw = load_i32_words(x_rsrc, x_word0, 8)
@@ -787,8 +816,9 @@ def _build_gate_up_fp8_preshuffled_native(
                 u_i32 = bf16x2_to_i32(fp8x2_to_bf16x2(uw[w_word], one_f32, hi=w_hi))
                 gate_pairs.append((xw[ipair], g_i32))
                 up_pairs.append((xw[ipair], u_i32))
-            gd = drain_or_chain(gate_pairs, dot2_acc=dot2_acc, serialize=serialize_dot2)
-            ud = drain_or_chain(up_pairs, dot2_acc=dot2_acc, serialize=serialize_dot2)
+            gd, ud = drain_or_chain_gate_up(
+                gate_pairs, up_pairs, dot2_acc=dot2_acc, serialize=serialize_dot2
+            )
             if const_expr(block2d):
                 row_blk = w_row // scale_bn
                 col_blk = k_base // scale_bk
@@ -1155,7 +1185,7 @@ def _build_gate_up_fp8_act_preshuffled_native(
         gate_l = fx.Float32(0.0)
         up_l = fx.Float32(0.0)
 
-        for k0 in range_constexpr(num_kpack):
+        for k0 in range(num_kpack):
             k_base = k0 * 64 + klane * fx.Int32(16)
             x_word0 = (token_b * hidden + k_base) // 4
             xw = load_i32_words(x_rsrc, x_word0, 4)
@@ -1171,8 +1201,9 @@ def _build_gate_up_fp8_act_preshuffled_native(
                 u_i32 = bf16x2_to_i32(fp8x2_to_bf16x2(uw[word], one_f32, hi=hi))
                 gate_pairs.append((x_i32, g_i32))
                 up_pairs.append((x_i32, u_i32))
-            gd = drain_or_chain(gate_pairs, dot2_acc=1, serialize=serialize_dot2)
-            ud = drain_or_chain(up_pairs, dot2_acc=1, serialize=serialize_dot2)
+            gd, ud = drain_or_chain_gate_up(
+                gate_pairs, up_pairs, dot2_acc=1, serialize=serialize_dot2
+            )
             col_blk = k_base // scale_bk
             x_col_blk = k_base // scale_bxk
             gs = _f32_load(wgs_t, row_blk * scale_cols_g + col_blk)
@@ -1857,7 +1888,7 @@ def _build_gate_up_fp4_preshuffled_native(
         gate_l = fx.Float32(0.0)
         up_l = fx.Float32(0.0)
 
-        for k0 in range_constexpr(num_kpack):
+        for k0 in range(num_kpack):
             k_base = k0 * 128 + klane * fx.Int32(32)
             x_word0 = (token_b * hidden + k_base) // 2
             xw = load_i32_words(x_rsrc, x_word0, 16)
@@ -1876,12 +1907,11 @@ def _build_gate_up_fp4_preshuffled_native(
                 u_i32 = bf16x2_to_i32(fp4x2_to_bf16x2(uw[word], us, sel=sel))
                 gate_pairs.append((xw[ipair], g_i32))
                 up_pairs.append((xw[ipair], u_i32))
-            gate_l = gate_l + fx.Float32(
-                drain_or_chain(gate_pairs, dot2_acc=dot2_acc, serialize=serialize_dot2)
+            gd, ud = drain_or_chain_gate_up(
+                gate_pairs, up_pairs, dot2_acc=dot2_acc, serialize=serialize_dot2
             )
-            up_l = up_l + fx.Float32(
-                drain_or_chain(up_pairs, dot2_acc=dot2_acc, serialize=serialize_dot2)
-            )
+            gate_l = gate_l + fx.Float32(gd)
+            up_l = up_l + fx.Float32(ud)
 
         gate_acc = _reduce_klane4_f32(gate_l.ir_value())
         up_acc = _reduce_klane4_f32(up_l.ir_value())
@@ -2506,27 +2536,36 @@ def _build_gate_up_bf16_preshuffled_native(
         gate_l = fx.Float32(0.0).ir_value()
         up_l = fx.Float32(0.0).ir_value()
 
-        for k0 in range_constexpr(num_kpack):
+        for k0 in range(num_kpack):
             k_base = k0 * 32 + klane * fx.Int32(8)
             x_word0 = (token_b * hidden + k_base) // 2
             xw = load_i32_words(x_rsrc, x_word0, 4)
             gw = _native_kpack_words(wg_b, n0, k0, klane, nlane)
             uw = _native_kpack_words(wu_b, n0, k0, klane, nlane)
-            for ipair in range_constexpr(4):
-                gate_l = dot2_or_scalar(
-                    xw[ipair],
-                    gw[ipair],
-                    gate_l,
-                    use_dot2=use_dot2,
-                    serialize=serialize_dot2,
+            if use_dot2:
+                gate_pairs = [(xw[i], gw[i]) for i in range(4)]
+                up_pairs = [(xw[i], uw[i]) for i in range(4)]
+                gd, ud = drain_or_chain_gate_up(
+                    gate_pairs, up_pairs, dot2_acc=1, serialize=serialize_dot2
                 )
-                up_l = dot2_or_scalar(
-                    xw[ipair],
-                    uw[ipair],
-                    up_l,
-                    use_dot2=use_dot2,
-                    serialize=serialize_dot2,
-                )
+                gate_l = (fx.Float32(gate_l) + fx.Float32(gd)).ir_value()
+                up_l = (fx.Float32(up_l) + fx.Float32(ud)).ir_value()
+            else:
+                for ipair in range_constexpr(4):
+                    gate_l = dot2_or_scalar(
+                        xw[ipair],
+                        gw[ipair],
+                        gate_l,
+                        use_dot2=False,
+                        serialize=False,
+                    )
+                    up_l = dot2_or_scalar(
+                        xw[ipair],
+                        uw[ipair],
+                        up_l,
+                        use_dot2=False,
+                        serialize=False,
+                    )
 
         gate_acc = _reduce_klane4_f32(gate_l)
         up_acc = _reduce_klane4_f32(up_l)
