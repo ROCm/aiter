@@ -203,6 +203,16 @@ def _i32_load(t, idx):
     return buf_copy_load(t, fx.Int32(idx), fx.Int32)
 
 
+def _i8_view(ptr):
+    """Unpacked i8 scale tensor as a buffer-resource view; ``t[i]`` is one byte."""
+    return ptr_buf_tensor(ptr, fx.Int8)
+
+
+def _i8_load(t, idx):
+    """Scalar i8 load at element ``idx`` (``BufferCopy8b`` / ``fx.copy``)."""
+    return buf_copy_load(t, fx.Int32(idx), fx.Int8)
+
+
 def dot2_f32_bf16(a_i32, b_i32, acc_f32, *, serialize: bool = True):
     """``d = a.lo*b.lo + a.hi*b.hi + acc`` via one ``v_dot2_f32_bf16``.
 
@@ -333,7 +343,7 @@ def fp4x2_to_bf16x2(src_i32, scale_f32, *, sel: int):
 def e8m0_byte_to_f32(byte_val):
     """Decode one E8M0 biased-exponent byte to an f32 scale (``shl 23`` + bitcast).
 
-    ``byte_val`` is an i8 ``ir.Value`` (as loaded from a uint8 scale tensor); it
+    ``byte_val`` is an i8 from :func:`_i8_load` (uint8 E8M0 scale tensor); it
     is zero-extended, shifted into the f32 exponent field, and reinterpreted.
     Bit-exact vs ``aiter.utility.fp4_utils.e8m0_to_f32`` on the normal exponent
     range (bytes 1..254); the ``0`` / ``0xFF`` specials are never produced for
@@ -1849,8 +1859,8 @@ def _build_gate_up_fp4_preshuffled_native(
         wg_b = _preshuffled_expert_b_i32_tensor(wg_ptr, e, inter, hidden // 2, 1)
         wu_b = _preshuffled_expert_b_i32_tensor(wu_ptr, e, inter, hidden // 2, 1)
         x_rsrc = _ptr_rsrc(x_ptr)
-        wgs_rsrc = _ptr_rsrc(wgs_ptr)
-        wus_rsrc = _ptr_rsrc(wus_ptr)
+        wgs_t = _i8_view(wgs_ptr)
+        wus_t = _i8_view(wus_ptr)
         gate_l = fx.Float32(0.0)
         up_l = fx.Float32(0.0)
 
@@ -1862,12 +1872,8 @@ def _build_gate_up_fp4_preshuffled_native(
             uw = _native_kpack_words(wu_b, n0, k0, klane, nlane)
             col_blk = k_base // scale_bk
             sidx = fx.Int32(row_blk * scale_cols + col_blk)
-            gs = e8m0_byte_to_f32(
-                buffer_ops.buffer_load(wgs_rsrc, sidx, vec_width=1, dtype=T.i8())
-            )
-            us = e8m0_byte_to_f32(
-                buffer_ops.buffer_load(wus_rsrc, sidx, vec_width=1, dtype=T.i8())
-            )
+            gs = e8m0_byte_to_f32(_i8_load(wgs_t, sidx))
+            us = e8m0_byte_to_f32(_i8_load(wus_t, sidx))
             gate_pairs = []
             up_pairs = []
             for ipair in range_constexpr(16):
@@ -2017,8 +2023,8 @@ def build_gate_up_fp4_module(
         wg_b, wu_b, wg_rsrc, wu_rsrc = _gate_up_weight_ptrs(
             preshuffled, wg_ptr, wu_ptr, e, inter, hidden // 2, 1
         )
-        wgs_rsrc = _ptr_rsrc(wgs_ptr)
-        wus_rsrc = _ptr_rsrc(wus_ptr)
+        wgs_t = _i8_view(wgs_ptr)
+        wus_t = _i8_view(wus_ptr)
 
         # E8M0 scale is baked into the converted weights, so a lane's gate/up dot
         # is one long accumulation across iterations.  G7: collect every
@@ -2052,12 +2058,8 @@ def build_gate_up_fp4_module(
                 elem_bytes=1,
             )
             sidx = fx.Int32(row_blk * scale_cols + k_base // scale_bk)
-            gs = e8m0_byte_to_f32(
-                buffer_ops.buffer_load(wgs_rsrc, sidx, vec_width=1, dtype=T.i8())
-            )
-            us = e8m0_byte_to_f32(
-                buffer_ops.buffer_load(wus_rsrc, sidx, vec_width=1, dtype=T.i8())
-            )
+            gs = e8m0_byte_to_f32(_i8_load(wgs_t, sidx))
+            us = e8m0_byte_to_f32(_i8_load(wus_t, sidx))
             for ipair in range_constexpr(n_pairs):
                 w_word = ipair // 4
                 sel = ipair % 4
@@ -2155,7 +2157,7 @@ def _build_down_fp4_preshuffled_native(
         out_j = n0 * fx.Int32(16) + nlane
 
         inter_rsrc = _ptr_rsrc(inter_ptr)
-        wds_rsrc = _ptr_rsrc(wds_ptr)
+        wds_t = _i8_view(wds_ptr)
         rid_t = _i32_view(rid_ptr)
         rwt_t = _f32_view(rwt_ptr)
 
@@ -2175,9 +2177,7 @@ def _build_down_fp4_preshuffled_native(
             dw = _native_kpack_words(wd_b, n0, k0, klane, nlane)
             col_blk = k_base // scale_bk
             sidx = fx.Int32(row_blk * scale_cols + col_blk)
-            blk_scale = e8m0_byte_to_f32(
-                buffer_ops.buffer_load(wds_rsrc, sidx, vec_width=1, dtype=T.i8())
-            )
+            blk_scale = e8m0_byte_to_f32(_i8_load(wds_t, sidx))
             pairs = []
             for ipair in range_constexpr(16):
                 word = ipair // 4
@@ -2328,7 +2328,7 @@ def build_down_reduce_fp4_module(
 
         inter_rsrc = _ptr_rsrc(inter_ptr)
         wd_rsrc = _ptr_rsrc(wd_ptr)
-        wds_rsrc = _ptr_rsrc(wds_ptr)
+        wds_t = _i8_view(wds_ptr)
         rid_t = _i32_view(rid_ptr)
         rwt_t = _f32_view(rwt_ptr)
 
@@ -2377,13 +2377,11 @@ def build_down_reduce_fp4_module(
                     scale_all.append(
                         [
                             e8m0_byte_to_f32(
-                                buffer_ops.buffer_load(
-                                    wds_rsrc,
+                                _i8_load(
+                                    wds_t,
                                     fx.Int32(
                                         w_row[h] // scale_bn * scale_cols + col_blk
                                     ),
-                                    vec_width=1,
-                                    dtype=T.i8(),
                                 )
                             )
                             for h in range(kh_per_warp)
@@ -2427,10 +2425,7 @@ def build_down_reduce_fp4_module(
                         # E8M0 block scale for this (weight row, K-block), applied
                         # in the convert; uniform over the lane's chunk this iter.
                         sidx = fx.Int32(w_row[h] // scale_bn * scale_cols + col_blk)
-                        blk_byte = buffer_ops.buffer_load(
-                            wds_rsrc, sidx, vec_width=1, dtype=T.i8()
-                        )
-                        blk_scale = e8m0_byte_to_f32(blk_byte)
+                        blk_scale = e8m0_byte_to_f32(_i8_load(wds_t, sidx))
                         for ipair in range_constexpr(n_pairs):
                             w_word = ipair // 4
                             sel = ipair % 4
