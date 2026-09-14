@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (C) 2025-2026 FlyDSL Project Contributors
 
-"""Shared device-side SiLU / SiTUv2 activation helpers for FlyDSL MoE kernels.
+"""Shared device-side gate/up activation helpers for FlyDSL MoE kernels.
 
 Elementwise f32-register helpers (exp2/rcp-based sigmoid, sign-restored tanh, and the
 gate*up batch forms) usable by any FlyDSL gemm1 fused gate+up epilog, plus
@@ -24,6 +24,17 @@ def silu_mul_batch(gs, us):
     e = [fx.Float32(rocdl.exp2(T.f32, _raw(g * fx.Float32(-LOG2E)))) for g in gs]
     sig = [fx.Float32(rocdl.rcp(T.f32, _raw(fx.Float32(1.0) + ei))) for ei in e]
     return [gs[i] * sig[i] * us[i] for i in range(len(gs))]
+
+
+def swiglu_mul_batch(gs, us, neg_clamp_limit):
+    out = []
+    for i in range(len(gs)):
+        gate = -((-gs[i]).maximumf(neg_clamp_limit))
+        up = (-((-us[i]).maximumf(neg_clamp_limit))).maximumf(neg_clamp_limit)
+        out.append(
+            gate * _sigmoid_f32(fx.Float32(1.702) * gate) * (up + fx.Float32(1.0))
+        )
+    return out
 
 
 def _sigmoid_f32(g):
@@ -90,9 +101,11 @@ def situ_params(beta, beta_rcp, linear_beta, linear_beta_rcp, swiglu_limit):
 def gate_up_act(act, gs, us, situ=None):
     """Fused gate+up epilogue activation: ``act(gate) * up``.
 
-    ``act`` is a compile-time string ("silu" or "situv2"); ``situ`` is the
-    :class:`SituParams` bundle, required only by "situv2".
+    ``act`` is a compile-time string ("silu", "swiglu", or "situv2");
+    ``situ`` carries runtime activation parameters for the latter two modes.
     """
     if const_expr(act == "situv2"):
         return situ_mul_batch(gs, us, *situ)
+    if const_expr(act == "swiglu"):
+        return swiglu_mul_batch(gs, us, situ.neg_clamp_limit)
     return silu_mul_batch(gs, us)

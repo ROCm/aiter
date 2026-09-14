@@ -15,18 +15,21 @@ import torch
 import triton
 import triton.language as tl
 
-from ..gated_delta_rule_utils import (
+from aiter.ops.triton._triton_kernels.gated_delta_rule.gated_delta_rule_utils import (
     IS_AMD,
     autotune_cache_kwargs,
-    gated_delta_rule_autotune_configs,
 )
-from ..utils import (
+from aiter.ops.triton._triton_kernels.gated_delta_rule.utils import (
     GatedDeltaRulePrefillMetadata,
     prepare_chunk_indices,
     prepare_rebased_cu_seqlens,
 )
-from ..utils.op import exp
-from ..utils.solve_tril import FLA_TRIL_PRECISION, solve_tril
+from aiter.ops.triton._triton_kernels.gated_delta_rule.utils.op import exp
+from aiter.ops.triton._triton_kernels.gated_delta_rule.utils.solve_tril import (
+    FLA_TRIL_PRECISION,
+    solve_tril,
+)
+from aiter.ops.triton.utils.tuned_config_utils import autotune_configs
 
 # solve_tril + recompute_w_u dispatch threshold in chunks (NT). At or below
 # this the single fused kernel is used; above it the split path
@@ -121,7 +124,8 @@ def _bp_st2d(
 
 @triton.heuristics({"IS_VARLEN": lambda args: args["cu_seqlens"] is not None})
 @triton.autotune(
-    configs=gated_delta_rule_autotune_configs(
+    configs=autotune_configs(
+        "GATED_DELTA_RULE",
         _SOLVE_TRIL_RECOMPUTE_CONFIGS,
         default_config=_SOLVE_TRIL_RECOMPUTE_DEFAULT_CONFIG,
     ),
@@ -482,7 +486,8 @@ _RECOMPUTE_WU_HM_DEFAULT_CONFIG = triton.Config(
 
 @triton.heuristics({"IS_VARLEN": lambda args: args["cu_seqlens"] is not None})
 @triton.autotune(
-    configs=gated_delta_rule_autotune_configs(
+    configs=autotune_configs(
+        "GATED_DELTA_RULE",
         _RECOMPUTE_WU_HM_CONFIGS,
         default_config=_RECOMPUTE_WU_HM_DEFAULT_CONFIG,
     ),

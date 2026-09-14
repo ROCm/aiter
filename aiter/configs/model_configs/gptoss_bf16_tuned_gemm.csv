@@ -84,9 +84,9 @@ gfx950,256,80,2880,4096,True,torch.bfloat16,torch.bfloat16,False,False,flydsl,36
 gfx950,256,96,2880,4096,True,torch.bfloat16,torch.bfloat16,False,False,flydsl,4021,4,13.4578,flydsl_hgemm_abf16_wbf16_bf16_t96x64x128x3_ks4_w2x2x2_bias1_ktail0_gm0_pft_gfx950,0.0201,168.3,1852.63
 gfx950,256,112,2880,4096,True,torch.bfloat16,torch.bfloat16,False,False,flydsl,3447,2,14.2545,flydsl_hgemm_abf16_wbf16_bf16_t64x64x64x6_ks2_w4x2x1_bias1_ktail0_gm0_pft_gfx950,0.0067,185.37,1764.75
 gfx950,256,128,2880,4096,True,torch.bfloat16,torch.bfloat16,False,False,flydsl,3571,2,14.8665,flydsl_hgemm_abf16_wbf16_bf16_t64x64x64x6_ks2_w4x2x1_bias1_ktail0_gm0_pft_gfx950,0.0067,203.13,1707.11
-gfx950,256,192,2880,4096,True,torch.bfloat16,torch.bfloat16,False,False,torch,0,0,17.6739,native,0.0,256.3,1486.47
-gfx950,256,256,2880,4096,True,torch.bfloat16,torch.bfloat16,False,False,torch,0,0,18.6333,native,0.0,324.14,1457.86
-gfx950,256,320,2880,4096,True,torch.bfloat16,torch.bfloat16,False,False,torch,0,0,20.4656,native,0.0,368.9,1370.96
+gfx950,256,192,2880,4096,True,torch.bfloat16,torch.bfloat16,False,False,flydsl,3074,2,18.4618,flydsl_hgemm_abf16_wbf16_bf16_t96x64x128x3_ks2_w2x2x2_bias1_ktail0_gm0_pft_gfx950,0.0138,245.36,1423.03
+gfx950,256,256,2880,4096,True,torch.bfloat16,torch.bfloat16,False,False,triton,0,0,20.523,auto,0.0,294.29,1323.62
+gfx950,256,320,2880,4096,True,torch.bfloat16,torch.bfloat16,False,False,flydsl,1971,1,22.5042,flydsl_hgemm_abf16_wbf16_bf16_t64x64x64x5_ks1_w1x4x1_bias1_ktail0_gm0_pft_gfx950,0.0,335.48,1246.77
 gfx950,256,512,2880,4096,True,torch.bfloat16,torch.bfloat16,False,False,flydsl,2063,1,25.3644,flydsl_hgemm_abf16_wbf16_bf16_t64x96x128x3_ks1_w2x2x2_bias1_ktail0_gm0_pft_gfx950,0.0049,476.24,1211.79
 gfx950,256,1024,2880,4096,True,torch.bfloat16,torch.bfloat16,False,False,flydsl,328,1,36.7809,flydsl_hgemm_abf16_wbf16_bf16_t128x96x64x4_ks1_w2x2x1_bias1_ktail0_gm0_pft_gfx950,0.0,656.84,1029.88
 gfx950,256,2048,2880,4096,True,torch.bfloat16,torch.bfloat16,False,False,torch,0,0,61.2613,native,0.0,788.73,851.54

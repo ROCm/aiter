@@ -39,6 +39,8 @@ from flydsl.expr.rocdl import tdm_ops
 
 from aiter.ops.flydsl.kernels import buffer_ops
 
+from ..kernels_common import create_llvm_ptr
+
 _scf_if_dispatch = ReplaceIfWithDispatch.scf_if_dispatch
 
 
@@ -141,7 +143,7 @@ ENABLE_SCHED_MODE2 = True
 
 # ===========================================================================
 # Memory ops are emitted inline via the plain flydsl/rocdl intrinsics
-# (``buffer_ops.create_llvm_ptr`` + ``llvm_dialect.load``/``store`` /
+# (``create_llvm_ptr`` + ``llvm_dialect.load``/``store`` /
 # ``rocdl.ds_load_tr16_b128`` / ``buffer_ops.buffer_store``). There are no
 # wrapper helpers: under mode 2 the ``amdgpu-expert-scheduling-mode`` LLVM hint
 # makes LLVM insert all DEP_MODE=2 depctr covers itself for these SSA-visible ops,
@@ -324,14 +326,12 @@ class QManager16bV1:
                     + col_chunk * _CHUNK_ELEMS
                 ) * fx.Int32(_BF16_BYTES)
                 gptrs.append(
-                    buffer_ops.create_llvm_ptr(
-                        q_base_i64 + fx.Int64(g_off), address_space=1
-                    )
+                    create_llvm_ptr(q_base_i64 + fx.Int64(g_off), address_space=1)
                 )
                 # LDS slot wraps mod lds_tiles: tile t reuses slot t % lds_tiles.
                 slot = tile % self.lds_tiles
                 lds_off = lds_q_base + self._lds_byte(row, col_chunk, slot)
-                lds_ptrs.append(buffer_ops.create_llvm_ptr(lds_off, address_space=3))
+                lds_ptrs.append(create_llvm_ptr(lds_off, address_space=3))
         return gptrs, lds_ptrs
 
     def ds_load_ptrs(self, *, lds_q_base, lane_idx):
@@ -349,8 +349,8 @@ class QManager16bV1:
             slot = tile % self.lds_tiles  # match global_load_ptrs ring slot
             lo = lds_q_base + self._lds_byte(row, klane, slot)
             hi = lds_q_base + self._lds_byte(row, klane + 2, slot)
-            ptrs.append(buffer_ops.create_llvm_ptr(lo, address_space=3))
-            ptrs.append(buffer_ops.create_llvm_ptr(hi, address_space=3))
+            ptrs.append(create_llvm_ptr(lo, address_space=3))
+            ptrs.append(create_llvm_ptr(hi, address_space=3))
         return ptrs
 
     def load_q_to_vgpr_part1(
@@ -615,9 +615,7 @@ class KManager16bV1:
             g_base = (
                 token * stride_k_seq + kv_head * stride_k_head + chunk * _CHUNK_ELEMS
             ) * _BF16_BYTES
-            gptr = buffer_ops.create_llvm_ptr(
-                base_i64 + fx.Int64(g_base), address_space=1
-            )
+            gptr = create_llvm_ptr(base_i64 + fx.Int64(g_base), address_space=1)
             for i in fx.range_constexpr(self.n_wr_tile_cols):
                 col_idx = i * _K_WR_TILE_HD  # compile-time
                 tile_col = col_idx // _WMMA_K  # == i
@@ -628,7 +626,7 @@ class KManager16bV1:
                     - fx.Int32(imm)  # pre-cancel the immediate on the LDS side
                 )
                 gptrs.append(gptr)  # same source reused across the columns
-                lds_ptrs.append(buffer_ops.create_llvm_ptr(lds_off, address_space=3))
+                lds_ptrs.append(create_llvm_ptr(lds_off, address_space=3))
                 imm_offs.append(imm)
             return gptrs, lds_ptrs, imm_offs
 
@@ -649,11 +647,9 @@ class KManager16bV1:
                 + col_idx
                 + chunk * _CHUNK_ELEMS
             ) * _BF16_BYTES
-            gptrs.append(
-                buffer_ops.create_llvm_ptr(base_i64 + fx.Int64(g_off), address_space=1)
-            )
+            gptrs.append(create_llvm_ptr(base_i64 + fx.Int64(g_off), address_space=1))
             lds_off = ptr_lds + self._lds_byte(tile_row, tile_col, row_in_tile, chunk)
-            lds_ptrs.append(buffer_ops.create_llvm_ptr(lds_off, address_space=3))
+            lds_ptrs.append(create_llvm_ptr(lds_off, address_space=3))
             imm_offs.append(0)
         return gptrs, lds_ptrs, imm_offs
 
@@ -678,7 +674,7 @@ class KManager16bV1:
             chunk_base = (col_idx % _WMMA_K) // _CHUNK_ELEMS  # 0 or 2
             chunk = fx.Int32(chunk_base) + col_half
             off = ptr_lds + self._lds_byte(0, 0, row_in_tile, chunk)
-            bases.append(buffer_ops.create_llvm_ptr(off, address_space=3))
+            bases.append(create_llvm_ptr(off, address_space=3))
         return bases
 
     def load_k_to_reg(self, base_ptrs, lds_imm_offset=0):
@@ -833,9 +829,7 @@ class VManager16bV1:
             g_base = (
                 token * stride_v_seq + kv_head * stride_v_head + chunk * _CHUNK_ELEMS
             ) * _BF16_BYTES
-            gptr = buffer_ops.create_llvm_ptr(
-                v_base_i64 + fx.Int64(g_base), address_space=1
-            )
+            gptr = create_llvm_ptr(v_base_i64 + fx.Int64(g_base), address_space=1)
             for i in fx.range_constexpr(self.n_wr_tile_cols):
                 col_idx = i * _V_WR_TILE_HD  # compile-time
                 imm = col_idx * _BF16_BYTES  # compile-time byte immediate (16B aligned)
@@ -846,7 +840,7 @@ class VManager16bV1:
                     - fx.Int32(imm)  # pre-cancel the immediate on the LDS side
                 )
                 gptrs.append(gptr)  # same source reused across the d columns
-                lds_ptrs.append(buffer_ops.create_llvm_ptr(lds_off, address_space=3))
+                lds_ptrs.append(create_llvm_ptr(lds_off, address_space=3))
                 imm_offs.append(imm)
             return gptrs, lds_ptrs, imm_offs
 
@@ -863,14 +857,10 @@ class VManager16bV1:
             g_off = (
                 token * stride_v_seq + kv_head * stride_v_head + d_col
             ) * _BF16_BYTES
-            gptrs.append(
-                buffer_ops.create_llvm_ptr(
-                    v_base_i64 + fx.Int64(g_off), address_space=1
-                )
-            )
+            gptrs.append(create_llvm_ptr(v_base_i64 + fx.Int64(g_off), address_space=1))
             # LDS position uses the UNCLAMPED kv_row (global read uses clamped safe_kv).
             lds_off = ptr_lds + self._lds_byte(kv_row, d_col)
-            lds_ptrs.append(buffer_ops.create_llvm_ptr(lds_off, address_space=3))
+            lds_ptrs.append(create_llvm_ptr(lds_off, address_space=3))
             imm_offs.append(0)
         return gptrs, lds_ptrs, imm_offs
 
@@ -896,7 +886,7 @@ class VManager16bV1:
             fetch_kv = (lane_idx // 16) * 8 + lane_idx % 8  # kv_idx == 0 (kt=0, half=0)
             fetch_d = fx.Int32(d_idx) + ((lane_idx // 8) % 2) * 8
             addr = ptr_lds + self._lds_byte(fetch_kv, fetch_d)
-            bases.append(buffer_ops.create_llvm_ptr(addr, address_space=3))
+            bases.append(create_llvm_ptr(addr, address_space=3))
         return bases
 
     def load_v_to_reg(self, base_ptrs, lds_imm_offset=0):
@@ -1145,7 +1135,7 @@ class QManager16bV2:
             + (lane % _WMMA_M) * fx.Int32(self.row_bytes)
             + (lane // _WMMA_M) * fx.Int32(_CHUNK_ELEMS * _BF16_BYTES)
         )
-        base = buffer_ops.create_llvm_ptr(lane_base, address_space=3)
+        base = create_llvm_ptr(lane_base, address_space=3)
         q_frags_list = [[] for _ in range(self.q_tiles_per_wave)]
         for qt in range(self.q_tiles_per_wave):
             for tile in range(self.k_tiles):
@@ -1224,7 +1214,7 @@ class KManager16bV2:
             + (lane_idx % _WMMA_M) * fx.Int32(self.row_bytes)
             + (lane_idx // _WMMA_M) * fx.Int32(_CHUNK_ELEMS * _BF16_BYTES)
         )
-        return [buffer_ops.create_llvm_ptr(lane_base, address_space=3)]
+        return [create_llvm_ptr(lane_base, address_space=3)]
 
     def load_k_to_reg(self, base_ptrs, lds_imm_offset=0):
         """Burst all K ``ds_load_b128`` from the row-major padded block, in ``_qk_gemm``
@@ -1311,7 +1301,7 @@ class VManager16bV2:
             + lane_kv * fx.Int32(self.row_bytes)
             + lane_d * fx.Int32(_BF16_BYTES)
         )
-        return [buffer_ops.create_llvm_ptr(lane_base, address_space=3)]
+        return [create_llvm_ptr(lane_base, address_space=3)]
 
     def load_v_to_reg(self, base_ptrs, lds_imm_offset=0):
         """Burst all V ``ds_load_tr16_b128`` from the row-major padded block, in
@@ -1514,7 +1504,7 @@ class OManager16bV1:
                 d_col = d_half + fx.Int32(kk * _WMMA_M)  # slot-local column
                 bf = o_frags[k].to(self.elem_dtype)
                 addr = lds_warp + self._lds_byte(slot, q_st, d_col)
-                lds_ptr = buffer_ops.create_llvm_ptr(addr, address_space=3)
+                lds_ptr = create_llvm_ptr(addr, address_space=3)
                 llvm_dialect.store(_ir(bf), lds_ptr, alignment=_CHUNK_BYTES)
                 last = issued
                 issued += 1
@@ -1535,7 +1525,7 @@ class OManager16bV1:
                 q_out = f // G  # q-row within this warp [0,16)
                 d_local = (f % G) * _CHUNK_ELEMS
                 addr = lds_warp + self._lds_byte(slot, q_out, d_local)
-                lds_ptr = buffer_ops.create_llvm_ptr(addr, address_space=3)
+                lds_ptr = create_llvm_ptr(addr, address_space=3)
                 data = fx.Vector(llvm_dialect.load(v8_ty, lds_ptr))
                 loaded.append((data, q_out, d_local))
                 gidxs.append(issued)
@@ -1654,7 +1644,7 @@ class OManager16bV2:
             + (lane_idx % _WMMA_M) * fx.Int32(self.row_bytes)
             + (lane_idx // _WMMA_M) * fx.Int32(_CHUNK_ELEMS * _BF16_BYTES)
         )
-        base_ptr = buffer_ops.create_llvm_ptr(lane_base, address_space=3)
+        base_ptr = create_llvm_ptr(lane_base, address_space=3)
         for k in range(self.d_tiles):
             bf = o_frags[k].to(self.elem_dtype)
             imm = k * _WMMA_M * _BF16_BYTES
@@ -1817,7 +1807,7 @@ class OManager16bV3:
             + (lane_idx % _WMMA_M) * fx.Int32(self.row_bytes)
             + (lane_idx // _WMMA_M) * fx.Int32(_CHUNK_ELEMS * _BF16_BYTES)
         )
-        base_ptr = buffer_ops.create_llvm_ptr(lane_base, address_space=3)
+        base_ptr = create_llvm_ptr(lane_base, address_space=3)
         ds_ops = []
         for k in range(self.d_tiles):
             bf = o_frags[k].to(self.elem_dtype)  # cvt
@@ -1923,9 +1913,9 @@ class OManager16bV3:
                 + fx.Int64(head) * fx.Int64(stride_o_head)
                 + fx.Int64(d)
             )
-            gdst = buffer_ops.create_llvm_ptr(
+            gdst = create_llvm_ptr(
                 ptr_O_i64 + off64 * fx.Int64(_BF16_BYTES), address_space=1
             )
-            lsrc = buffer_ops.create_llvm_ptr(lds_src, address_space=3)
+            lsrc = create_llvm_ptr(lds_src, address_space=3)
             addrs.append((gdst, lsrc))
         return addrs, valid_rows

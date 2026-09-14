@@ -15,14 +15,18 @@ import torch
 import triton
 import triton.language as tl
 
-from ..gated_delta_rule_utils import (
+from aiter.ops.triton._triton_kernels.gated_delta_rule.gated_delta_rule_utils import (
     IS_TMA_SUPPORTED,
     autotune_cache_kwargs,
-    gated_delta_rule_autotune_configs,
     input_guard,
 )
-from .index import prepare_chunk_indices
-from .op import make_tensor_descriptor
+from aiter.ops.triton._triton_kernels.gated_delta_rule.utils.index import (
+    prepare_chunk_indices,
+)
+from aiter.ops.triton._triton_kernels.gated_delta_rule.utils.op import (
+    make_tensor_descriptor,
+)
+from aiter.ops.triton.utils.tuned_config_utils import autotune_configs
 
 FLA_TRIL_PRECISION = os.environ.get("FLA_TRIL_PRECISION", "ieee")
 assert FLA_TRIL_PRECISION in [
@@ -67,7 +71,8 @@ def _bp_st2d(base, R, C, rs, r0, c0, val, BR: tl.constexpr, BC: tl.constexpr):
     }
 )
 @triton.autotune(
-    configs=gated_delta_rule_autotune_configs(
+    configs=autotune_configs(
+        "GATED_DELTA_RULE",
         [
             triton.Config(
                 {"DOT_PRECISION": "ieee"}, num_warps=num_warps, num_stages=num_stages
@@ -156,7 +161,8 @@ def solve_tril_16x16_kernel(
     }
 )
 @triton.autotune(
-    configs=gated_delta_rule_autotune_configs(
+    configs=autotune_configs(
+        "GATED_DELTA_RULE",
         [
             triton.Config(
                 {"DOT_PRECISION": DOT_PRECISION},
@@ -302,7 +308,8 @@ def merge_16x16_to_32x32_inverse_kernel(
     }
 )
 @triton.autotune(
-    configs=gated_delta_rule_autotune_configs(
+    configs=autotune_configs(
+        "GATED_DELTA_RULE",
         [
             triton.Config(
                 {"DOT_PRECISION": DOT_PRECISION},
