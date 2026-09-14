@@ -4,6 +4,7 @@
 
 #include "opus/opus.hpp"
 
+template<int NUM_XCD_ = 8>
 struct OpusMoeStage2Bf16GemmStyle256x256x64TokenSlotRouteOutNoOobNFast
 {
     static constexpr int BLOCK_SIZE = 512;
@@ -49,7 +50,8 @@ struct OpusMoeStage2Bf16GemmStyle256x256x64TokenSlotRouteOutNoOobNFast
     static constexpr int CACHECTL_A = 0;
     static constexpr int CACHECTL_B = 2;
 
-    static constexpr int NUM_XCD = 8;
+    // Die count of the part this instance is built for.
+    static constexpr int NUM_XCD = NUM_XCD_;
     // Narrow row window keeps A-route reuse local while spreading CTAs across XCDs.
     static constexpr int SWIZZLE_W = 1;
     static constexpr int SWIZZLE_C = 64;
