@@ -64,6 +64,14 @@ _ONE_BLOCK_DISPATCH_BANDS: dict[str, _OneBlockDispatchBands] = {
 }
 _SHORT_ROWS_1024_THREAD_MAX_ROWS = 256
 
+# A 1024-thread block is 16 wave64s, so the wave slots already cap a CU at two
+# blocks; the budget is half the CU's LDS, less a margin for the alignment
+# padding that makes the real allocation exceed the sum of the array sizes.
+# gfx950 has 160 KiB per CU and measures fast up to 81_256 B, then drops to one
+# block per CU and loses 25%. An arch that is absent gets 0 and keeps the
+# original layout: gfx942 has only 64 KiB per CU, and gfx1250 is untested.
+_ONE_BLOCK_LDS_BUDGET_BYTES: dict[str, int] = {"gfx950": 78 * 1024}
+
 _TensorSignature = tuple[
     torch.Size,
     tuple[int, ...],
@@ -380,6 +388,7 @@ def _flydsl_top_k_per_row(
             short_rows=short_rows,
             is_decode=is_decode,
             wave_size=wave_size,
+            lds_budget_bytes=_ONE_BLOCK_LDS_BUDGET_BYTES.get(arch, 0),
         )
         _run_compiled(
             launcher,

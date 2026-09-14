@@ -77,11 +77,13 @@ def build_radix_topk_one_block_module(
     is_decode: bool = False,
     *,
     wave_size: int,
+    lds_budget_bytes: int = 0,
 ):
     """Build a prefill/decode kernel specialized for the row-length bounds.
 
     short_rows requires every effective row length <= 4096.
     wave_size must match the target architecture and is part of the cache key.
+    lds_budget_bytes only grows the candidate buffer; 0 keeps the original layout.
     """
     if k <= 0:
         raise ValueError("k must be positive")
@@ -118,17 +120,44 @@ def build_radix_topk_one_block_module(
     output_vector_steps = (output_vector_count + block_threads - 1) // block_threads
     output_vector_elems = max(_VEC, output_vector_count * _VEC)
 
+    # Once the selected bucket overflows the candidate buffer, level 3 and the
+    # final emit re-scan the row from global instead of reading LDS, so the
+    # buffer gets every byte the budget leaves over. The stable paths stage k
+    # more words and are left with fewer.
+    histogram_bytes = _LATER_BUCKETS * 4
+    stable_stage_bytes = stable_stage_capacity * stable_data_columns * 4
+    scratch_bytes = (num_waves * 2 + _METADATA_SIZE) * 4
+    candidate_entry_bytes = 4 + 4  # ordered key, column index
+
+    spare_bytes = (
+        lds_budget_bytes - histogram_bytes - stable_stage_bytes - scratch_bytes
+    )
+    candidate_capacity = max(_COMPACT_CAPACITY, spare_bytes // candidate_entry_bytes)
+
+    # Replicas of the pass-1 histogram, indexed by lane so that a bin holding
+    # most of the row is not one address serialising a whole wave. Indexing them
+    # by wave instead only separates waves that already ran concurrently and
+    # measures no faster. They share a union with the later arm, so they are free
+    # up to its size; past one per lane they would spread nothing.
+    later_arm_bytes = (
+        histogram_bytes
+        + stable_stage_bytes
+        + candidate_capacity * candidate_entry_bytes
+    )
+    free_replicas = later_arm_bytes // (_HIGH_BUCKETS * 4) if lds_budget_bytes else 0
+    pass1_replicas = max(_PASS1_HISTOGRAM_REPLICAS, min(wave_size, free_replicas))
+
     # LDS layouts
 
     @fx.struct
     class LongPass1Storage:
-        histograms: fx.Array[fx.Int32, _PASS1_HISTOGRAM_REPLICAS * _HIGH_BUCKETS, 16]
+        histograms: fx.Array[fx.Int32, pass1_replicas * _HIGH_BUCKETS, 16]
 
     @fx.struct
     class LongLaterStorage:
         histogram: fx.Array[fx.Int32, _LATER_BUCKETS, 16]
-        candidate_ordered_keys: fx.Array[fx.Int32, _COMPACT_CAPACITY, 16]
-        candidate_local_indices: fx.Array[fx.Int32, _COMPACT_CAPACITY, 16]
+        candidate_ordered_keys: fx.Array[fx.Int32, candidate_capacity, 16]
+        candidate_local_indices: fx.Array[fx.Int32, candidate_capacity, 16]
         stable_data: fx.Array[fx.Int32, stable_stage_capacity * stable_data_columns, 16]
 
     @fx.struct
@@ -235,25 +264,26 @@ def build_radix_topk_one_block_module(
             short_storage = storage.arena
         else:
             long_histogram_matrix = storage.arena.long_pass1.histograms.peek().view(
-                fx.make_layout(
-                    (_PASS1_HISTOGRAM_REPLICAS, _HIGH_BUCKETS), (_HIGH_BUCKETS, 1)
-                )
+                fx.make_layout((pass1_replicas, _HIGH_BUCKETS), (_HIGH_BUCKETS, 1))
             )
-            long_histograms = (
-                fx.slice(long_histogram_matrix, (0, None)),
-                fx.slice(long_histogram_matrix, (1, None)),
+            long_histograms = tuple(
+                fx.slice(long_histogram_matrix, (r, None))
+                for r in range(pass1_replicas)
+            )
+            long_histograms_flat = storage.arena.long_pass1.histograms.peek().view(
+                fx.make_layout(pass1_replicas * _HIGH_BUCKETS, 1)
             )
             histogram = storage.arena.long_later.histogram.peek().view(
                 fx.make_layout(_LATER_BUCKETS, 1)
             )
             candidate_ordered_keys = (
                 storage.arena.long_later.candidate_ordered_keys.peek().view(
-                    fx.make_layout(_COMPACT_CAPACITY, 1)
+                    fx.make_layout(candidate_capacity, 1)
                 )
             )
             candidate_local_indices = (
                 storage.arena.long_later.candidate_local_indices.peek().view(
-                    fx.make_layout(_COMPACT_CAPACITY, 1)
+                    fx.make_layout(candidate_capacity, 1)
                 )
             )
             stable_data = storage.arena.long_later.stable_data.peek().view(
@@ -278,6 +308,9 @@ def build_radix_topk_one_block_module(
         short_histograms = (
             fx.slice(short_histogram_matrix, (0, None)),
             fx.slice(short_histogram_matrix, (1, None)),
+        )
+        short_histograms_flat = short_storage.histograms.peek().view(
+            fx.make_layout(_PASS1_HISTOGRAM_REPLICAS * _SHORT_HIGH_BUCKETS, 1)
         )
         full_keys = short_storage.full_keys.peek().view(
             fx.make_layout(_COMPACT_CAPACITY, 1)
@@ -506,7 +539,7 @@ def build_radix_topk_one_block_module(
 
         # Radix histogram passes
         def accumulate_first_histogram(
-            col, key, shift, mask, histograms, cached_keys=None
+            col, key, shift, mask, flat_histograms, bins, replicas, cached_keys=None
         ):
             active = col < row_len
             if cached_keys is not None:  # noqa: SIM102 - constexpr guard
@@ -514,11 +547,14 @@ def build_radix_topk_one_block_module(
                     cached_keys[col] = key
             if active:
                 bucket = radix_bucket(key, shift, mask)
-                # Wave parity selects a replica; these are not temporal stages.
-                if (wave & one) == zero:
-                    atomic_add_i32(histograms[0], one, bucket, "workgroup")
-                else:
-                    atomic_add_i32(histograms[1], one, bucket, "workgroup")
+                # Lane picks the replica; these are copies, not stages.
+                replica = lane % fx.Int32(replicas)
+                atomic_add_i32(
+                    flat_histograms,
+                    one,
+                    replica * fx.Int32(bins) + bucket,
+                    "workgroup",
+                )
 
         def preceding_prefix(key, shift, mask):
             prefix_shift = shift + mask.bit_length()
@@ -848,7 +884,7 @@ def build_radix_topk_one_block_module(
                     metadata[_SELECTED_BUCKET_COUNT] == num_needed
                 )
                 can_sort_compacted_indices = can_use_index_sort & (
-                    candidate_count <= fx.Int32(_COMPACT_CAPACITY)
+                    candidate_count <= fx.Int32(candidate_capacity)
                 )
                 if can_sort_compacted_indices:
                     scatter_stable_sorted_keys(
@@ -908,7 +944,9 @@ def build_radix_topk_one_block_module(
                     ordered_key(value),
                     _SHORT_RADIX_SHIFTS[0],
                     _SHORT_RADIX_MASKS[0],
-                    histograms,
+                    short_histograms_flat,
+                    _SHORT_HIGH_BUCKETS,
+                    _PASS1_HISTOGRAM_REPLICAS,
                     cached_keys=full_keys,
                 )
             )
@@ -1051,7 +1089,7 @@ def build_radix_topk_one_block_module(
                     candidate_pos = atomic_add_i32(
                         metadata, one, _CANDIDATE_COUNT, "workgroup"
                     )
-                    if candidate_pos < fx.Int32(_COMPACT_CAPACITY):
+                    if candidate_pos < fx.Int32(candidate_capacity):
                         candidate_ordered_keys[candidate_pos] = key
                         if const_expr(not stable or stable_sort_enabled):
                             candidate_local_indices[candidate_pos] = col
@@ -1064,7 +1102,9 @@ def build_radix_topk_one_block_module(
                     ordered_key(value),
                     _LONG_RADIX_SHIFTS[0],
                     _LONG_RADIX_MASKS[0],
-                    histograms,
+                    long_histograms_flat,
+                    _HIGH_BUCKETS,
+                    pass1_replicas,
                 )
             )
             gpu.barrier()
@@ -1091,7 +1131,7 @@ def build_radix_topk_one_block_module(
             # (and also hurt stable variants with smaller k).
             if const_expr(stable and k > 1024):
                 candidate_count = metadata[_SELECTED_BUCKET_COUNT]
-                compact_candidates = candidate_count <= fx.Int32(_COMPACT_CAPACITY)
+                compact_candidates = candidate_count <= fx.Int32(candidate_capacity)
             else:
                 candidate_count = zero
                 compact_candidates = one > zero
@@ -1144,7 +1184,7 @@ def build_radix_topk_one_block_module(
                 can_finish = (
                     unstable_mode
                     & (metadata[_SELECTED_BUCKET_COUNT] == remaining_k)
-                    & (candidate_count <= fx.Int32(_COMPACT_CAPACITY))
+                    & (candidate_count <= fx.Int32(candidate_capacity))
                 )
                 if can_finish:
                     # Fast exit after the second radix pass.
@@ -1162,7 +1202,7 @@ def build_radix_topk_one_block_module(
                 else:
                     # Level 3: select the low bucket and emit the final result.
                     clear_histograms((histogram,), later_bins_per_thread)
-                    if candidate_count <= fx.Int32(_COMPACT_CAPACITY):
+                    if candidate_count <= fx.Int32(candidate_capacity):
                         for pos in range(tid, candidate_count, block_size):
                             accumulate_prefix_histogram(
                                 pos,
@@ -1211,7 +1251,7 @@ def build_radix_topk_one_block_module(
                             staged_local_indices,
                         )
                     else:
-                        if candidate_count <= fx.Int32(_COMPACT_CAPACITY):
+                        if candidate_count <= fx.Int32(candidate_capacity):
                             scatter_unstable_keys(
                                 "compacted_candidates",
                                 _LONG_RADIX_SHIFTS,
