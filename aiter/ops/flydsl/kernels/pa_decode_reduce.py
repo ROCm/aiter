@@ -10,6 +10,55 @@ import flydsl.expr as fx
 from flydsl.expr.typing import T
 
 MAX_CONTEXT_PARTITIONS = 256
+_DTYPE_MAP = {
+    "f32": fx.Float32,
+    "f16": fx.Float16,
+    "bf16": fx.BFloat16,
+}
+
+
+def _validate_pa_decode_ps_reduce_config(
+    *,
+    max_context_partition_num: int,
+    head_size: int,
+    output_dtype_str: str,
+    logits_dtype_str: str,
+    sink_dtype_str: str,
+) -> None:
+    if not 1 <= max_context_partition_num <= MAX_CONTEXT_PARTITIONS:
+        raise ValueError(
+            f"max_context_partition_num must be in [1, {MAX_CONTEXT_PARTITIONS}], "
+            f"got {max_context_partition_num}"
+        )
+    if head_size <= 0 or head_size > 1024 or head_size % 64:
+        raise ValueError(
+            f"head_size must be a multiple of 64 in [64, 1024], got {head_size}"
+        )
+    for dtype_str in (output_dtype_str, logits_dtype_str, sink_dtype_str):
+        if dtype_str not in _DTYPE_MAP:
+            raise ValueError(f"Unsupported FlyDSL dtype: {dtype_str!r}")
+
+
+def is_pa_decode_ps_reduce_supported(
+    *,
+    max_context_partition_num: int,
+    head_size: int,
+    output_dtype_str: str,
+    logits_dtype_str: str,
+    sink_dtype_str: str,
+) -> bool:
+    """Return whether the FlyDSL reducer supports a dispatch configuration."""
+    try:
+        _validate_pa_decode_ps_reduce_config(
+            max_context_partition_num=max_context_partition_num,
+            head_size=head_size,
+            output_dtype_str=output_dtype_str,
+            logits_dtype_str=logits_dtype_str,
+            sink_dtype_str=sink_dtype_str,
+        )
+    except ValueError:
+        return False
+    return True
 
 
 @lru_cache(maxsize=256)
@@ -29,27 +78,17 @@ def compile_pa_decode_ps_reduce(
     once in LDS and splits each output element's partition chain over several
     waves.  Other head sizes retain the register-only lane-striped fallback.
     """
-    if not 1 <= max_context_partition_num <= MAX_CONTEXT_PARTITIONS:
-        raise ValueError(
-            f"max_context_partition_num must be in [1, {MAX_CONTEXT_PARTITIONS}], "
-            f"got {max_context_partition_num}"
-        )
-    if head_size <= 0 or head_size > 1024 or head_size % 64:
-        raise ValueError(
-            f"head_size must be a multiple of 64 in [64, 1024], got {head_size}"
-        )
+    _validate_pa_decode_ps_reduce_config(
+        max_context_partition_num=max_context_partition_num,
+        head_size=head_size,
+        output_dtype_str=output_dtype_str,
+        logits_dtype_str=logits_dtype_str,
+        sink_dtype_str=sink_dtype_str,
+    )
 
-    dtype_map = {
-        "f32": fx.Float32,
-        "f16": fx.Float16,
-        "bf16": fx.BFloat16,
-    }
-    try:
-        output_dtype = dtype_map[output_dtype_str]
-        logits_dtype = dtype_map[logits_dtype_str]
-        sink_dtype = dtype_map[sink_dtype_str]
-    except KeyError as exc:
-        raise ValueError(f"Unsupported FlyDSL dtype: {exc.args[0]!r}") from exc
+    output_dtype = _DTYPE_MAP[output_dtype_str]
+    logits_dtype = _DTYPE_MAP[logits_dtype_str]
+    sink_dtype = _DTYPE_MAP[sink_dtype_str]
 
     warp_size = 64
     log2e = 1.4426950408889634

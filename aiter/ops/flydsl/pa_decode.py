@@ -10,8 +10,9 @@ score, value scale + 1/FP8_MAX into the epilogue); softmax max/sum stay f32.
 ``key_scale``/``value_scale`` are either a ``[1]`` per-tensor scalar or a
 ``[num_blocks, num_kv_heads, block_size, 1]`` per-token tensor.
 
-``block_size`` (16/64/128) and ``head_dim`` (multiple of 64) are compile-time
-constants. Layouts are logical, not production's preshuffle.
+``block_size`` (16/64/128) and ``head_dim`` (64, or a multiple of 128 up to
+1024) are compile-time constants. Layouts are logical, not production's
+preshuffle.
 
 * ``query``        [num_seqs, num_q_heads, head_dim]  f16/bf16 (head_dim contiguous)
 * ``key_cache``    [num_blocks, num_kv_heads, head_dim//16, block_size, 16]  fp8
@@ -67,6 +68,22 @@ def get_recommended_splits(
     denom = max(1, num_sequences * num_kv_heads * split_kv_blocks)
     n = cdiv(num_sm, denom) * split_kv_blocks
     return max(4, min(n, 8))
+
+
+def _workgroup_count_enables_v_prefetch(
+    num_sequences: int,
+    num_kv_heads: int,
+    num_partitions: int,
+    num_compute_units: int,
+) -> bool:
+    """Return whether the launch is in the tuned one-to-two-CTA-per-CU window.
+
+    This result is a kernel specialization and therefore part of the compile
+    cache key. Applications serving shapes on both sides of this interval must
+    materialize both variants before graph capture or latency-sensitive use.
+    """
+    workgroups = num_sequences * num_kv_heads * num_partitions
+    return num_compute_units < workgroups <= 2 * num_compute_units
 
 
 def _flydsl_dtype_str(dtype: torch.dtype) -> str:
@@ -176,9 +193,9 @@ def pa_decode(
     query_scale: torch.Tensor = None,  # [num_seqs * query_length, num_query_heads, 1] or [1]
     key_scale: torch.Tensor = None,  # [num_blocks, num_kv_heads, kv_block_size, 1]
     value_scale: torch.Tensor = None,  # [num_blocks, num_kv_heads, kv_block_size, 1]
-    exp_sums: torch.Tensor = None,  # [num_seqs, num_kv_heads, max_context_partition_num, query_group_size]
-    max_logits: torch.Tensor = None,  # [num_seqs, num_kv_heads, max_context_partition_num, query_group_size]
-    temporary_output: torch.Tensor = None,  # [num_seqs, num_kv_heads, max_context_partition_num, query_group_size, head_size]
+    exp_sums: torch.Tensor = None,  # [num_seqs, num_kv_heads, max_context_partition_num, query_length * query_group_size]
+    max_logits: torch.Tensor = None,  # [num_seqs, num_kv_heads, max_context_partition_num, query_length * query_group_size]
+    temporary_output: torch.Tensor = None,  # [num_seqs, num_kv_heads, max_context_partition_num, query_length * query_group_size, head_size]
     alibi_slopes: torch.Tensor = None,
     sinks: torch.Tensor = None,
     sliding_window: int = 0,
@@ -188,12 +205,21 @@ def pa_decode(
 
     The call signature and intermediate-buffer layouts follow the shared
     aiter paged-attention decode API. This kernel currently supports FP8 K/V caches,
-    BF16/FP16 queries, a 256-token compute tile, and block sizes 16/64/128.
+    BF16/FP16 queries, a 256-token compute tile, block sizes 16/64/128, and
+    ``head_dim=64`` or a multiple of 128 up to 1024.
     Sparse attention uses caller-prepared block tables and selected context
     lengths. Each independently selected MTP query must have its own table row
     and use query_length=1; query_length>1 applies dense causal masking.
     ALiBi, attention sinks, sliding-window attention, and externally quantized
-    FP8 queries are not supported.
+    FP8 queries are not supported. The ``ps=False`` partitioning policy is also
+    not supported.
+
+    ``context_lengths`` and ``block_tables`` are GPU-resident, so their values
+    are not inspected here (which would synchronize the device). Callers must
+    ensure ``0 <= context_lengths[i] <= block_tables.shape[1] * block_size`` and
+    that every block-table entry used by a sequence is a physical block index in
+    ``[0, min(key_cache.shape[0], value_cache.shape[0]))`` -- a packed cache
+    reaches V through a shifted view that spans fewer blocks than K.
     """
     if context_partition_size != KV_COMPUTE_BLOCK:
         raise NotImplementedError(
@@ -210,12 +236,137 @@ def pa_decode(
         raise NotImplementedError("pa_decode does not support attention sinks")
     if sliding_window not in (0, -1):
         raise NotImplementedError("pa_decode does not support sliding-window attention")
+    if not isinstance(ps, bool):
+        raise TypeError(f"ps must be a bool, got {type(ps).__name__}")
+    if not ps:
+        raise NotImplementedError("pa_decode does not support ps=False")
     if query_length < 1:
         raise ValueError(f"query_length must be positive, got {query_length}")
     if not 1 <= max_context_partition_num <= MAX_CONTEXT_PARTITIONS:
         raise ValueError(
             f"max_context_partition_num must be in [1, {MAX_CONTEXT_PARTITIONS}], "
             f"got {max_context_partition_num}"
+        )
+
+    required_tensors = (
+        ("output", output),
+        ("query", query),
+        ("key_cache", key_cache),
+        ("value_cache", value_cache),
+        ("context_lengths", context_lengths),
+        ("block_tables", block_tables),
+    )
+    for name, tensor in required_tensors:
+        if not isinstance(tensor, torch.Tensor):
+            raise TypeError(
+                f"{name} must be a torch.Tensor, got {type(tensor).__name__}"
+            )
+
+    expected_ranks = (
+        ("output", output, (3,)),
+        ("query", query, (3,)),
+        ("key_cache", key_cache, (5,)),
+        ("value_cache", value_cache, (4, 5)),
+        ("context_lengths", context_lengths, (1,)),
+        ("block_tables", block_tables, (2,)),
+    )
+    for name, tensor, ranks in expected_ranks:
+        if tensor.dim() not in ranks:
+            expected = " or ".join(f"{rank}D" for rank in ranks)
+            raise ValueError(
+                f"{name} must be {expected}, got shape {tuple(tensor.shape)}"
+            )
+
+    num_seqs = context_lengths.shape[0]
+    total_q_rows, num_q_heads, head_dim = query.shape
+    if query.device.type != "cuda":
+        raise ValueError(f"query must be on a CUDA device, got {query.device}")
+    if num_q_heads < 1:
+        raise ValueError(f"query must contain at least one head, got {num_q_heads}")
+    if total_q_rows != num_seqs * query_length:
+        raise ValueError(
+            f"query.shape[0] ({total_q_rows}) must equal "
+            f"context_lengths.shape[0] * query_length ({num_seqs} * {query_length})"
+        )
+    if output.shape != query.shape:
+        raise ValueError(
+            f"output shape {tuple(output.shape)} must match "
+            f"query shape {tuple(query.shape)}"
+        )
+    if block_tables.shape[0] != num_seqs:
+        raise ValueError(
+            f"block_tables.shape[0] ({block_tables.shape[0]}) must match "
+            f"context_lengths.shape[0] ({num_seqs})"
+        )
+
+    num_blocks, num_kv_heads, num_hgroups, block_size, hgroup_width = key_cache.shape
+    if num_kv_heads < 1:
+        raise ValueError(
+            f"key_cache must contain at least one KV head, got {num_kv_heads}"
+        )
+
+    # Keep NP==1 and NP>1 on the same domain. The tile requires a multiple of
+    # 64 and complete <=8-element Q-load pieces; the NP>1 reducer additionally
+    # caps its thread block (head_dim) at 1024.
+    q_chunk = head_dim // 16
+    if not (
+        64 <= head_dim <= 1024
+        and head_dim % 64 == 0
+        and (q_chunk <= 8 or q_chunk % 8 == 0)
+    ):
+        raise NotImplementedError(
+            f"pa_decode does not support head_dim={head_dim}; supported values "
+            "are 64 and multiples of 128 in [128, 1024]"
+        )
+    if num_hgroups != head_dim // 16 or hgroup_width != 16:
+        raise ValueError(
+            "key_cache shape must be "
+            "[num_blocks, num_kv_heads, head_dim // 16, block_size, 16], "
+            f"got {tuple(key_cache.shape)} for head_dim={head_dim}"
+        )
+    if block_size not in (16, 64, 128):
+        raise ValueError(
+            f"pa_decode only supports block_size in (16, 64, 128), got {block_size}"
+        )
+
+    trans_v = value_cache.dim() == 5
+    if trans_v:
+        v_num_blocks, v_num_kv_heads = value_cache.shape[:2]
+        expected_v_tail = (block_size // 16, head_dim, 16)
+        if tuple(value_cache.shape[2:]) != expected_v_tail:
+            raise ValueError(
+                "transposed value_cache shape must be "
+                "[num_blocks, num_kv_heads, block_size // 16, head_dim, 16], "
+                f"got {tuple(value_cache.shape)} for block_size={block_size}, "
+                f"head_dim={head_dim}"
+            )
+    else:
+        v_num_blocks, v_num_kv_heads, v_head_dim, v_block_size = value_cache.shape
+        if v_head_dim != head_dim or v_block_size != block_size:
+            raise ValueError(
+                "value_cache shape must be "
+                "[num_blocks, num_kv_heads, head_dim, block_size], "
+                f"got {tuple(value_cache.shape)} for block_size={block_size}, "
+                f"head_dim={head_dim}"
+            )
+    # A packed cache interleaves K and V in one allocation, so the V view starts
+    # part-way into it and legitimately spans fewer blocks than K. Block ids live
+    # on the device, so V's usable extent is a caller contract either way; only
+    # the inverted-argument direction is worth rejecting here.
+    if v_num_blocks > num_blocks:
+        raise ValueError(
+            f"value_cache must not span more blocks than key_cache, "
+            f"got {num_blocks} and {v_num_blocks}"
+        )
+    if v_num_kv_heads != num_kv_heads:
+        raise ValueError(
+            "key_cache and value_cache must have the same number of KV heads, "
+            f"got {num_kv_heads} and {v_num_kv_heads}"
+        )
+    if num_q_heads % num_kv_heads != 0:
+        raise ValueError(
+            f"num_q_heads ({num_q_heads}) must be divisible by "
+            f"num_kv_heads ({num_kv_heads})"
         )
 
     arch = get_gfx_runtime()
@@ -233,60 +384,10 @@ def pa_decode(
             f"got {compute_type}"
         )
 
-    # ``ps`` is retained for drop-in API compatibility. Both partitioning
-    # policies are represented by the caller-provided partition count.
-    del ps
-
-    num_seqs = context_lengths.shape[0]
-    total_q_rows, num_q_heads, head_dim = query.shape
-    assert total_q_rows == num_seqs * query_length, (
-        f"query.shape[0] ({total_q_rows}) must equal "
-        f"context_lengths.shape[0] * query_length ({num_seqs} * {query_length})"
-    )
-    assert output.shape == query.shape, (
-        f"output shape {tuple(output.shape)} must match "
-        f"query shape {tuple(query.shape)}"
-    )
-    _, num_kv_heads, num_hgroups, block_size, hgroup_width = key_cache.shape
-
-    assert num_hgroups == head_dim // 16 and hgroup_width == 16
-    # Q staging loads each lane's head_dim//16 elements in <=8-wide pieces, so a
-    # chunk wider than 8 that isn't a multiple of 8 would silently drop its tail
-    # (head_dim 192/320/448/...). Reject those rather than return wrong results.
-    q_chunk = head_dim // 16
-    if q_chunk > 8 and q_chunk % 8 != 0:
-        raise NotImplementedError(
-            f"pa_decode does not support head_dim={head_dim}: head_dim//16 "
-            f"({q_chunk}) must be <=8 or a multiple of 8"
-        )
-    assert block_size in (
-        16,
-        64,
-        128,
-    ), f"pa_decode only supports block_size in (16, 64, 128), got {block_size}"
-
-    trans_v = value_cache.dim() == 5
-    if trans_v:
-        _, v_num_kv_heads, v_subblocks, v_head_dim, v_width = value_cache.shape
-        assert (
-            v_head_dim == head_dim and v_width == 16 and v_subblocks == block_size // 16
-        ), f"value_cache shape {tuple(value_cache.shape)} doesn't match block_size={block_size}, head_dim={head_dim}"
-    else:
-        _, v_num_kv_heads, v_head_dim, v_block_size = value_cache.shape
-        assert v_head_dim == head_dim and v_block_size == block_size, (
-            f"value_cache shape {tuple(value_cache.shape)} doesn't match "
-            f"block_size={block_size}, head_dim={head_dim}"
-        )
-    assert v_num_kv_heads == num_kv_heads
-    assert (
-        num_q_heads % num_kv_heads == 0
-    ), f"num_q_heads ({num_q_heads}) must be divisible by num_kv_heads ({num_kv_heads})"
-    assert (
-        block_tables.dtype == torch.int32
-    ), f"block_tables must be int32, got {block_tables.dtype}"
-    assert (
-        context_lengths.dtype == torch.int32
-    ), f"context_lengths must be int32, got {context_lengths.dtype}"
+    if block_tables.dtype != torch.int32:
+        raise TypeError(f"block_tables must be int32, got {block_tables.dtype}")
+    if context_lengths.dtype != torch.int32:
+        raise TypeError(f"context_lengths must be int32, got {context_lengths.dtype}")
     query_group_size = num_q_heads // num_kv_heads
     max_blocks_per_seq = block_tables.shape[1]
     if query.dtype == torch.bfloat16:
@@ -294,24 +395,34 @@ def pa_decode(
     elif query.dtype == torch.float16:
         query_dtype = "f16"
     else:
-        raise ValueError(f"pa_decode only supports f16/bf16 query, got {query.dtype}")
-    assert (
-        output.dtype == query.dtype
-    ), f"pa_decode requires output.dtype == query.dtype, got {output.dtype} vs {query.dtype}"
+        raise TypeError(f"pa_decode only supports f16/bf16 query, got {query.dtype}")
+    if output.dtype != query.dtype:
+        raise TypeError(
+            "pa_decode requires output.dtype == query.dtype, "
+            f"got {output.dtype} vs {query.dtype}"
+        )
 
-    assert (
-        key_cache.dtype == expected_fp8_dtype
-    ), f"pa_decode requires {expected_fp8_dtype} key cache on {arch}, got {key_cache.dtype}"
-    assert (
-        value_cache.dtype == expected_fp8_dtype
-    ), f"pa_decode requires {expected_fp8_dtype} value cache on {arch}, got {value_cache.dtype}"
+    if key_cache.dtype != expected_fp8_dtype:
+        raise TypeError(
+            f"pa_decode requires {expected_fp8_dtype} key cache on {arch}, "
+            f"got {key_cache.dtype}"
+        )
+    if value_cache.dtype != expected_fp8_dtype:
+        raise TypeError(
+            f"pa_decode requires {expected_fp8_dtype} value cache on {arch}, "
+            f"got {value_cache.dtype}"
+        )
 
-    assert (
-        query.stride(2) == 1
-    ), f"pa_decode requires a contiguous head_dim axis, got strides {query.stride()}"
-    assert (
-        output.stride(2) == 1
-    ), f"pa_decode requires a contiguous output head_dim axis, got strides {output.stride()}"
+    if query.stride(2) != 1:
+        raise ValueError(
+            "pa_decode requires a contiguous query head_dim axis, "
+            f"got strides {query.stride()}"
+        )
+    if output.stride(2) != 1:
+        raise ValueError(
+            "pa_decode requires a contiguous output head_dim axis, "
+            f"got strides {output.stride()}"
+        )
 
     dev = query.device
     for name, tensor in (
@@ -321,16 +432,19 @@ def pa_decode(
         ("block_tables", block_tables),
         ("context_lengths", context_lengths),
     ):
-        assert (
-            tensor.device == dev
-        ), f"{name} must be on the same device as query ({dev}), got {tensor.device}"
+        if tensor.device != dev:
+            raise ValueError(
+                f"{name} must be on the same device as query ({dev}), "
+                f"got {tensor.device}"
+            )
     for name, tensor in (
         ("key_cache", key_cache),
         ("value_cache", value_cache),
         ("block_tables", block_tables),
         ("context_lengths", context_lengths),
     ):
-        assert tensor.is_contiguous(), f"{name} must be contiguous"
+        if not tensor.is_contiguous():
+            raise ValueError(f"{name} must be contiguous")
 
     def normalize_scale(scale, name):
         if scale is None:
@@ -340,15 +454,17 @@ def pa_decode(
         if scale.numel() == 1:
             return scale.reshape(1)
         if scale.dim() == 4:
-            assert scale.shape[-1] == 1, (
-                f"{name} must have a trailing singleton dimension, "
-                f"got shape {tuple(scale.shape)}"
-            )
+            if scale.shape[-1] != 1:
+                raise ValueError(
+                    f"{name} must have a trailing singleton dimension, "
+                    f"got shape {tuple(scale.shape)}"
+                )
             return scale.squeeze(-1)
-        assert scale.dim() == 3, (
-            f"{name} must be scalar or have shape "
-            "[num_blocks, num_kv_heads, block_size, 1]"
-        )
+        if scale.dim() != 3:
+            raise ValueError(
+                f"{name} must be scalar or have shape "
+                "[num_blocks, num_kv_heads, block_size, 1]"
+            )
         return scale
 
     if (key_scale is None) != (value_scale is None):
@@ -358,36 +474,46 @@ def pa_decode(
     key_scale_t = normalize_scale(key_scale, "key_scale")
     value_scale_t = normalize_scale(value_scale, "value_scale")
     per_token_kv = key_scale_t.numel() > 1
-    assert per_token_kv == (
-        value_scale_t.numel() > 1
-    ), "key_scale and value_scale must both be per-tensor or both be per-token"
-    if per_token_kv:
-        assert (
-            key_scale_t.shape == value_scale_t.shape
-        ), f"key_scale/value_scale shape mismatch: {tuple(key_scale_t.shape)} vs {tuple(value_scale_t.shape)}"
-        assert key_scale_t.shape == (key_cache.shape[0], num_kv_heads, block_size), (
-            "per-token key_scale/value_scale must be [num_blocks, num_kv_heads, block_size] "
-            f"matching the KV cache, got {tuple(key_scale_t.shape)}"
+    if per_token_kv != (value_scale_t.numel() > 1):
+        raise ValueError(
+            "key_scale and value_scale must both be per-tensor or both be per-token"
         )
+    if per_token_kv:
+        if key_scale_t.shape != value_scale_t.shape:
+            raise ValueError(
+                "key_scale/value_scale shape mismatch: "
+                f"{tuple(key_scale_t.shape)} vs {tuple(value_scale_t.shape)}"
+            )
+        expected_scale_shape = (num_blocks, num_kv_heads, block_size)
+        if key_scale_t.shape != expected_scale_shape:
+            raise ValueError(
+                "per-token key_scale/value_scale must be "
+                "[num_blocks, num_kv_heads, block_size] matching the KV cache, "
+                f"got {tuple(key_scale_t.shape)}"
+            )
         stride_ks_block = int(key_scale_t.stride(0))
         stride_ks_head = int(key_scale_t.stride(1))
-        assert key_scale_t.stride(2) == 1, (
-            f"per-token key_scale token dimension must be contiguous, "
-            f"got strides {key_scale_t.stride()}"
-        )
-        assert value_scale_t.stride() == key_scale_t.stride(), (
-            "per-token key_scale and value_scale must have matching strides, "
-            f"got {key_scale_t.stride()} vs {value_scale_t.stride()}"
-        )
+        if key_scale_t.stride(2) != 1:
+            raise ValueError(
+                "per-token key_scale token dimension must be contiguous, "
+                f"got strides {key_scale_t.stride()}"
+            )
+        if value_scale_t.stride() != key_scale_t.stride():
+            raise ValueError(
+                "per-token key_scale and value_scale must have matching strides, "
+                f"got {key_scale_t.stride()} vs {value_scale_t.stride()}"
+            )
     else:
         stride_ks_block = 0
         stride_ks_head = 0
-    assert (
-        key_scale_t.dtype == torch.float32 and key_scale_t.device == dev
-    ), f"key_scale tensor must be float32 on {dev}, got {key_scale_t.dtype} on {key_scale_t.device}"
-    assert (
-        value_scale_t.dtype == torch.float32 and value_scale_t.device == dev
-    ), f"value_scale tensor must be float32 on {dev}, got {value_scale_t.dtype} on {value_scale_t.device}"
+    for name, scale in (("key_scale", key_scale_t), ("value_scale", value_scale_t)):
+        if scale.dtype != torch.float32:
+            raise TypeError(f"{name} tensor must be float32, got {scale.dtype}")
+        if scale.device != dev:
+            raise ValueError(
+                f"{name} tensor must be on the same device as query ({dev}), "
+                f"got {scale.device}"
+            )
 
     num_partitions = max_context_partition_num
     pmax = max_logits
@@ -449,9 +575,13 @@ def pa_decode(
         and query_length * query_group_size <= 16
     ):
         num_cus = torch.cuda.get_device_properties(dev).multi_processor_count
-        workgroups = num_seqs * num_kv_heads * num_partitions
         prefetch_v = _env_enabled(_PAGE128_EARLY_V_ENV) or (
-            num_cus < workgroups <= 2 * num_cus
+            _workgroup_count_enables_v_prefetch(
+                num_seqs,
+                num_kv_heads,
+                num_partitions,
+                num_cus,
+            )
         )
 
     with torch.cuda.device(dev):
@@ -491,25 +621,49 @@ def pa_decode(
                 pout = torch.empty(
                     *expected_scalar_shape, head_dim, dtype=output.dtype, device=dev
                 )
-        assert (
-            pmax.shape == expected_scalar_shape
-        ), f"max_logits shape {tuple(pmax.shape)} != {expected_scalar_shape}"
-        assert (
-            psum.shape == expected_scalar_shape
-        ), f"exp_sums shape {tuple(psum.shape)} != {expected_scalar_shape}"
-        assert pout.shape == (
-            *expected_scalar_shape,
-            head_dim,
-        ), (
-            f"temporary_output shape {tuple(pout.shape)} != "
-            f"{(*expected_scalar_shape, head_dim)}"
-        )
-        assert pmax.dtype == torch.float32 and pmax.device == dev
-        assert psum.dtype == torch.float32 and psum.device == dev
-        assert pout.dtype == output.dtype and pout.device == dev
-        assert pmax.is_contiguous()
-        assert psum.is_contiguous()
-        assert pout.is_contiguous()
+        for name, tensor in (
+            ("max_logits", pmax),
+            ("exp_sums", psum),
+            ("temporary_output", pout),
+        ):
+            if not isinstance(tensor, torch.Tensor):
+                raise TypeError(
+                    f"{name} must be a torch.Tensor, got {type(tensor).__name__}"
+                )
+        if pmax.shape != expected_scalar_shape:
+            raise ValueError(
+                f"max_logits shape {tuple(pmax.shape)} != {expected_scalar_shape}"
+            )
+        if psum.shape != expected_scalar_shape:
+            raise ValueError(
+                f"exp_sums shape {tuple(psum.shape)} != {expected_scalar_shape}"
+            )
+        expected_output_shape = (*expected_scalar_shape, head_dim)
+        if pout.shape != expected_output_shape:
+            raise ValueError(
+                f"temporary_output shape {tuple(pout.shape)} != {expected_output_shape}"
+            )
+        if pmax.dtype != torch.float32:
+            raise TypeError(f"max_logits must be float32, got {pmax.dtype}")
+        if psum.dtype != torch.float32:
+            raise TypeError(f"exp_sums must be float32, got {psum.dtype}")
+        if pout.dtype != output.dtype:
+            raise TypeError(
+                f"temporary_output dtype {pout.dtype} must match output dtype "
+                f"{output.dtype}"
+            )
+        for name, tensor in (
+            ("max_logits", pmax),
+            ("exp_sums", psum),
+            ("temporary_output", pout),
+        ):
+            if tensor.device != dev:
+                raise ValueError(
+                    f"{name} must be on the same device as query ({dev}), "
+                    f"got {tensor.device}"
+                )
+            if not tensor.is_contiguous():
+                raise ValueError(f"{name} must be contiguous")
     with torch.cuda.device(dev):
         s = torch.cuda.current_stream(dev)
         _run_compiled(

@@ -33,6 +33,11 @@ def _default_cuda_device():
 
 SUPPORTED_GFX = ["gfx942", "gfx950"]
 KV_COMPUTE_BLOCK = 256
+# Match the corresponding FP8 Gluon accuracy contracts: fixed-length outputs
+# use the tighter bound, while independently selected variable-length rows use
+# the established varlen bound.
+FIXED_LENGTH_ACCURACY_TOLERANCE = 5e-3
+VARIABLE_LENGTH_ACCURACY_TOLERANCE = 5e-2
 
 # Pairwise coverage of the normal-accuracy axes in FlyDSL's PA regression test:
 # batches {3, 81, 128}, Q/KV heads {(4,1), (8,1), (16,1)}, head dims
@@ -63,6 +68,15 @@ def _quant_dtype() -> torch.dtype:
     )
 
 
+def _require_gpu():
+    if not torch.cuda.is_available():
+        pytest.skip("ROCm is not available")
+    if pa_decode is None:
+        pytest.skip("FlyDSL is not available")
+    if get_gfx_runtime() not in SUPPORTED_GFX:
+        pytest.skip(f"pa_decode is unsupported on {get_gfx_runtime()}")
+
+
 def test_pa_decode_api_matches_gluon():
     if pa_decode is None:
         pytest.skip("FlyDSL is not available")
@@ -82,10 +96,7 @@ def test_pa_decode_api_matches_gluon():
 
 
 def test_pa_decode_maps_gluon_buffers_and_scale_layout(monkeypatch):
-    if not torch.cuda.is_available():
-        pytest.skip("ROCm is not available")
-    if pa_decode is None:
-        pytest.skip("FlyDSL is not available")
+    _require_gpu()
 
     pa_decode_module = importlib.import_module("aiter.ops.flydsl.pa_decode")
     gluon_module = importlib.import_module("aiter.ops.triton.gluon.pa_decode_gluon")
@@ -209,6 +220,128 @@ def test_pa_decode_maps_gluon_buffers_and_scale_layout(monkeypatch):
     assert dispatches == ["flydsl"]
 
 
+def _call_gluon_reduce_wrapper(gluon_module, head_size):
+    output = torch.empty(1, 1, 1, 1, head_size, dtype=dtypes.bf16, device="cpu")
+    exp_sums = torch.empty(1, 1, 4, 1, dtype=dtypes.fp32, device="cpu")
+    max_logits = torch.empty_like(exp_sums)
+    logits = torch.empty(1, 1, 4, 1, head_size, dtype=dtypes.bf16, device="cpu")
+    context_lengths = torch.tensor([256], dtype=dtypes.i32, device="cpu")
+
+    gluon_module._paged_attention_decode_v2_reduce_kernel_wrapper(
+        (1, 1, 1),
+        output,
+        exp_sums,
+        max_logits,
+        logits,
+        context_lengths,
+        None,
+        output.stride(0),
+        output.stride(1),
+        output.stride(2),
+        output.stride(3),
+        exp_sums.stride(0),
+        exp_sums.stride(1),
+        exp_sums.stride(2),
+        logits.stride(0),
+        logits.stride(1),
+        logits.stride(2),
+        logits.stride(3),
+        1,
+        1,
+        head_size,
+        256,
+        PS=True,
+        context_partition_num=4,
+    )
+
+
+def test_gluon_unsupported_flydsl_reducer_falls_back(monkeypatch):
+    """An unsupported optional reducer must fall back instead of failing dispatch."""
+    _require_gpu()
+    gluon_module = importlib.import_module("aiter.ops.triton.gluon.pa_decode_gluon")
+    triton_launches = []
+    flydsl_launches = []
+
+    class TritonReduceStub:
+        def __getitem__(self, grid):
+            def launch(*args, **kwargs):
+                triton_launches.append((grid, args, kwargs))
+
+            return launch
+
+    monkeypatch.setattr(gluon_module, "CXX_PS_REDUCE_AVAILABLE", False)
+    monkeypatch.setattr(gluon_module, "FLYDSL_PS_REDUCE_AVAILABLE", True)
+    monkeypatch.setattr(
+        gluon_module,
+        "launch_pa_decode_ps_reduce_flydsl",
+        lambda *args, **kwargs: flydsl_launches.append((args, kwargs)),
+    )
+    monkeypatch.setattr(
+        gluon_module,
+        "paged_attention_decode_ps_reduce_kernel",
+        TritonReduceStub(),
+    )
+
+    _call_gluon_reduce_wrapper(gluon_module, head_size=96)
+
+    assert not flydsl_launches
+    assert len(triton_launches) == 1
+    assert triton_launches[0][0] == (1, 1, 1)
+
+
+def test_gluon_supported_flydsl_reducer_does_not_mask_errors(monkeypatch):
+    """Errors from a selected FlyDSL reducer are not mistaken for unsupported."""
+    _require_gpu()
+    gluon_module = importlib.import_module("aiter.ops.triton.gluon.pa_decode_gluon")
+    triton_launches = []
+
+    class TritonReduceStub:
+        def __getitem__(self, grid):
+            def launch(*args, **kwargs):
+                triton_launches.append((grid, args, kwargs))
+
+            return launch
+
+    def fail_flydsl(*args, **kwargs):
+        raise ImportError("FlyDSL reducer failed internally")
+
+    monkeypatch.setattr(gluon_module, "CXX_PS_REDUCE_AVAILABLE", False)
+    monkeypatch.setattr(gluon_module, "FLYDSL_PS_REDUCE_AVAILABLE", True)
+    monkeypatch.setattr(gluon_module, "launch_pa_decode_ps_reduce_flydsl", fail_flydsl)
+    monkeypatch.setattr(
+        gluon_module,
+        "paged_attention_decode_ps_reduce_kernel",
+        TritonReduceStub(),
+    )
+    monkeypatch.setattr(
+        gluon_module.torch.cuda, "current_stream", lambda device: object()
+    )
+
+    with pytest.raises(ImportError, match="failed internally"):
+        _call_gluon_reduce_wrapper(gluon_module, head_size=128)
+    assert not triton_launches
+
+
+@pytest.mark.parametrize(
+    "batch_size,expected",
+    [(32, False), (33, True), (64, True), (65, False)],
+)
+def test_v_prefetch_workgroup_interval(batch_size, expected):
+    """Warmup boundaries cover both compile-time prefetch variants."""
+    if pa_decode is None:
+        pytest.skip("FlyDSL is not available")
+    pa_decode_module = importlib.import_module("aiter.ops.flydsl.pa_decode")
+    assert (
+        pa_decode_module._workgroup_count_enables_v_prefetch(
+            batch_size,
+            num_kv_heads=1,
+            num_partitions=8,
+            num_compute_units=256,
+        )
+        is expected
+    )
+
+
 def run_torch(
     query: torch.Tensor,
     key_cache: torch.Tensor,
@@ -296,7 +429,7 @@ def run_pa_decode_tile_case(
     context_length,
     block_size,
     dtype,
-    trans_v=False,
+    trans_v,
 ):
     if pa_decode is None or get_recommended_splits is None:
         raise RuntimeError("FlyDSL is not available")
@@ -346,14 +479,10 @@ def run_pa_decode_tile_case(
     )
     if trans_v:
         value_cache = (
-            value_quant.view(
-                num_blocks,
-                num_kv_heads,
-                head_dim,
-                block_size // 16,
-                16,
-            )
-            .permute(0, 1, 3, 2, 4)
+            value_quant.permute(0, 1, 3, 2)
+            .contiguous()
+            .view(num_blocks, num_kv_heads, block_size // 16, 16, head_dim)
+            .permute(0, 1, 2, 4, 3)
             .contiguous()
         )
     else:
@@ -391,27 +520,12 @@ def run_pa_decode_tile_case(
     pout = torch.empty(*partial_shape, head_dim, dtype=dtype)
     softmax_scale = head_dim**-0.5
 
-    candidates = {
-        "flydsl": lambda: _run_flydsl(
-            output,
-            query,
-            key_cache,
-            value_cache,
-            block_tables,
-            context_lengths,
-            key_scale,
-            value_scale,
-            num_partitions,
-            softmax_scale,
-            pmax,
-            psum,
-            pout,
-        )
-    }
+    candidates = {"flydsl": _run_flydsl}
 
     # QK and PV each perform one multiply-add per query-head/context pair.
     flops = 4 * batch_size * num_query_heads * context_length * head_dim
-    # Logical tensor traffic: Q + O + the referenced K/V tokens and metadata.
+    # Effective bandwidth counts Q + O + referenced K/V tokens and metadata once.
+    # It excludes padded tokens, repeated loads, and partition scratch traffic.
     nbytes = (
         2 * query.numel() * query.element_size()
         + 2
@@ -432,12 +546,28 @@ def run_pa_decode_tile_case(
         "trans_v": trans_v,
     }
     for name, fn in candidates.items():
-        out, us = run_perftest(fn)
+        # Pass tensors explicitly so perftest can rotate their allocations.
+        out, us = run_perftest(
+            fn,
+            output,
+            query,
+            key_cache,
+            value_cache,
+            block_tables,
+            context_lengths,
+            key_scale,
+            value_scale,
+            num_partitions,
+            softmax_scale,
+            pmax,
+            psum,
+            pout,
+        )
         err = checkAllclose(
             reference.to(dtypes.fp32),
             out.to(dtypes.fp32),
-            rtol=3e-2,
-            atol=3e-2,
+            rtol=FIXED_LENGTH_ACCURACY_TOLERANCE,
+            atol=FIXED_LENGTH_ACCURACY_TOLERANCE,
             tol_err_ratio=0.0,
             msg=f"{name}: pa_decode",
         )
@@ -448,35 +578,225 @@ def run_pa_decode_tile_case(
     return ret
 
 
-@pytest.mark.parametrize("block_size", [16, 64, 128])
-def test_pa_decode_tile(block_size):
-    if not torch.cuda.is_available():
-        pytest.skip("ROCm is not available")
-    if pa_decode is None:
-        pytest.skip("FlyDSL is not available")
-    if get_gfx_runtime() not in SUPPORTED_GFX:
-        pytest.skip(f"pa_decode is unsupported on {get_gfx_runtime()}")
+def _run_accuracy_case(
+    lengths,
+    *,
+    num_query_heads,
+    num_kv_heads,
+    head_dim,
+    block_size,
+    query_dtype,
+    num_partitions,
+    tolerance,
+    trans_v=False,
+):
+    """Run PA against a dequantized-FP8 torch reference without benchmarking."""
+    _require_gpu()
+    if num_query_heads % num_kv_heads:
+        raise ValueError("num_query_heads must be divisible by num_kv_heads")
 
-    result = run_pa_decode_tile_case(
-        batch_size=3,
-        num_query_heads=8,
-        num_kv_heads=1,
-        head_dim=128,
-        context_length=257,
-        block_size=block_size,
-        dtype=dtypes.bf16,
+    torch.manual_seed(0)
+    batch_size = len(lengths)
+    pages_per_sequence = [
+        (context_length + block_size - 1) // block_size for context_length in lengths
+    ]
+    max_pages = max(pages_per_sequence)
+    num_blocks = sum(pages_per_sequence)
+
+    query = torch.empty(
+        batch_size, num_query_heads, head_dim, dtype=query_dtype
+    ).uniform_(-0.5, 0.5)
+    key = torch.empty(
+        num_blocks, num_kv_heads, block_size, head_dim, dtype=query_dtype
+    ).uniform_(-0.5, 0.5)
+    value = torch.empty(
+        num_blocks, num_kv_heads, head_dim, block_size, dtype=query_dtype
+    ).uniform_(-0.5, 0.5)
+
+    quant_dtype = _quant_dtype()
+    key_quant, key_scale = per_tensor_quant(key, quant_dtype=quant_dtype)
+    value_quant, value_scale = per_tensor_quant(value, quant_dtype=quant_dtype)
+    key_cache = (
+        key_quant.view(num_blocks, num_kv_heads, block_size, head_dim // 16, 16)
+        .permute(0, 1, 3, 2, 4)
+        .contiguous()
     )
-    assert result["partitions"] > 1
-    assert result["flydsl err"] == 0
+    if trans_v:
+        value_cache = (
+            value_quant.permute(0, 1, 3, 2)
+            .contiguous()
+            .view(num_blocks, num_kv_heads, block_size // 16, 16, head_dim)
+            .permute(0, 1, 2, 4, 3)
+            .contiguous()
+        )
+    else:
+        value_cache = value_quant.contiguous()
+
+    block_tables = torch.zeros(
+        batch_size, max_pages, dtype=dtypes.i32, device=query.device
+    )
+    next_page = 0
+    for seq_idx, page_count in enumerate(pages_per_sequence):
+        block_tables[seq_idx, :page_count] = torch.arange(
+            next_page,
+            next_page + page_count,
+            dtype=dtypes.i32,
+            device=query.device,
+        )
+        next_page += page_count
+    context_lengths = torch.tensor(lengths, dtype=dtypes.i32, device=query.device)
+
+    reference = run_torch(
+        query,
+        key_quant,
+        value_quant,
+        block_tables,
+        context_lengths,
+        key_scale,
+        value_scale,
+    )
+    output = torch.empty_like(query)
+    torch.ops.aiter.pa_decode_flydsl(
+        output,
+        query,
+        key_cache,
+        value_cache,
+        context_lengths,
+        block_tables,
+        head_dim**-0.5,
+        1,
+        num_partitions,
+        KV_COMPUTE_BLOCK,
+        quant_dtype,
+        None,
+        key_scale,
+        value_scale,
+    )
+
+    torch.testing.assert_close(
+        output.float(),
+        reference.float(),
+        atol=tolerance,
+        rtol=tolerance,
+    )
 
 
-def _require_gpu():
-    if not torch.cuda.is_available():
-        pytest.skip("ROCm is not available")
-    if pa_decode is None:
-        pytest.skip("FlyDSL is not available")
-    if get_gfx_runtime() not in SUPPORTED_GFX:
-        pytest.skip(f"pa_decode is unsupported on {get_gfx_runtime()}")
+@pytest.mark.parametrize(
+    "block_size,query_dtype,num_kv_heads,num_partitions",
+    [
+        pytest.param(16, dtypes.bf16, 1, 1, id="page16-bf16-hkv1-np1"),
+        pytest.param(64, dtypes.fp16, 2, 1, id="page64-fp16-hkv2-np1"),
+        pytest.param(128, dtypes.bf16, 2, 4, id="page128-bf16-hkv2-np4"),
+        pytest.param(128, dtypes.fp16, 1, 4, id="page128-fp16-hkv1-np4"),
+    ],
+)
+def test_pa_decode_fixed_length_accuracy(
+    block_size, query_dtype, num_kv_heads, num_partitions
+):
+    _run_accuracy_case(
+        [257, 257, 257],
+        num_query_heads=8,
+        num_kv_heads=num_kv_heads,
+        head_dim=128,
+        block_size=block_size,
+        query_dtype=query_dtype,
+        num_partitions=num_partitions,
+        tolerance=FIXED_LENGTH_ACCURACY_TOLERANCE,
+    )
+
+
+@pytest.mark.parametrize("query_dtype", [dtypes.bf16, dtypes.fp16])
+def test_pa_decode_variable_length_accuracy(query_dtype):
+    _run_accuracy_case(
+        [1, 127, 257, 1027],
+        num_query_heads=8,
+        num_kv_heads=2,
+        head_dim=128,
+        block_size=128,
+        query_dtype=query_dtype,
+        num_partitions=4,
+        tolerance=VARIABLE_LENGTH_ACCURACY_TOLERANCE,
+    )
+
+
+def _valid_pa_decode_arguments(head_dim=128, num_partitions=1):
+    """Small valid call used by host-contract tests that fail before compile."""
+    quant_dtype = _quant_dtype()
+    query = torch.empty(1, 8, head_dim, dtype=dtypes.bf16, device="cuda")
+    scale = torch.ones(1, dtype=dtypes.fp32, device=query.device)
+    return {
+        "output": torch.empty_like(query),
+        "query": query,
+        "key_cache": torch.empty(
+            1, 1, head_dim // 16, 16, 16, dtype=quant_dtype, device=query.device
+        ),
+        "value_cache": torch.empty(
+            1, 1, head_dim, 16, dtype=quant_dtype, device=query.device
+        ),
+        "context_lengths": torch.tensor([16], dtype=dtypes.i32, device=query.device),
+        "block_tables": torch.tensor([[0]], dtype=dtypes.i32, device=query.device),
+        "softmax_scale": head_dim**-0.5,
+        "query_length": 1,
+        "max_context_partition_num": num_partitions,
+        "compute_type": quant_dtype,
+        "key_scale": scale,
+        "value_scale": scale,
+    }
+
+
+def test_ps_false_is_rejected():
+    _require_gpu()
+    with pytest.raises(NotImplementedError, match="ps=False"):
+        pa_decode(**_valid_pa_decode_arguments(), ps=False)
+
+
+@pytest.mark.parametrize(
+    "invalid_input,error_match",
+    [
+        pytest.param("query_rank", "query", id="query-rank"),
+        pytest.param("output_rank", "output", id="output-rank"),
+        pytest.param("key_cache_rank", "key_cache", id="key-cache-rank"),
+        pytest.param("value_cache_rank", "value_cache", id="value-cache-rank"),
+        pytest.param("context_lengths_rank", "context_lengths", id="context-rank"),
+        pytest.param("block_tables_rank", "block_tables", id="block-table-rank"),
+        pytest.param("query_device", "CUDA device", id="query-device"),
+        pytest.param("zero_query_heads", "at least one head", id="zero-query-heads"),
+        pytest.param("block_table_rows", "block_tables", id="block-table-rows"),
+        pytest.param("kv_block_count", "block", id="kv-block-count"),
+        pytest.param("kv_head_count", "head", id="kv-head-count"),
+    ],
+)
+def test_invalid_tensor_structure_is_rejected(invalid_input, error_match):
+    _require_gpu()
+    arguments = _valid_pa_decode_arguments()
+    if invalid_input == "query_rank":
+        arguments["query"] = arguments["query"].squeeze(0)
+    elif invalid_input == "output_rank":
+        arguments["output"] = arguments["output"].squeeze(0)
+    elif invalid_input == "key_cache_rank":
+        arguments["key_cache"] = arguments["key_cache"].squeeze(0)
+    elif invalid_input == "value_cache_rank":
+        arguments["value_cache"] = arguments["value_cache"].squeeze(0)
+    elif invalid_input == "context_lengths_rank":
+        arguments["context_lengths"] = arguments["context_lengths"].reshape(1, 1)
+    elif invalid_input == "block_tables_rank":
+        arguments["block_tables"] = arguments["block_tables"].flatten()
+    elif invalid_input == "query_device":
+        arguments["query"] = arguments["query"].cpu()
+    elif invalid_input == "zero_query_heads":
+        arguments["query"] = arguments["query"][:, :0]
+        arguments["output"] = arguments["output"][:, :0]
+    elif invalid_input == "block_table_rows":
+        arguments["block_tables"] = arguments["block_tables"].repeat(2, 1)
+    elif invalid_input == "kv_block_count":
+        arguments["value_cache"] = arguments["value_cache"].repeat(2, 1, 1, 1)
+    elif invalid_input == "kv_head_count":
+        arguments["value_cache"] = arguments["value_cache"].repeat(1, 2, 1, 1)
+    else:
+        raise AssertionError(f"unknown invalid input: {invalid_input}")
+
+    with pytest.raises(ValueError, match=error_match):
+        pa_decode(**arguments)
 
 
 def _adversarial_case(
@@ -739,19 +1059,54 @@ def test_extreme_tail_value_scale_is_ignored(context_length, query_length):
     _assert_matches(output, reference)
 
 
-@pytest.mark.parametrize("head_dim", [64, 128, 256])
-def test_supported_head_dims_are_accurate(head_dim):
+@pytest.mark.parametrize(
+    "head_dim,num_partitions",
+    [(64, 1), (256, 1), (1024, 1), (1024, 4)],
+)
+def test_additional_supported_head_dims_are_accurate(head_dim, num_partitions):
     _require_gpu()
-    output, reference = _adversarial_case(head_dim=head_dim, context_length=1027)
+    output, reference = _adversarial_case(
+        head_dim=head_dim,
+        context_length=64,
+        num_partitions=num_partitions,
+    )
     _assert_matches(output, reference)
 
 
-@pytest.mark.parametrize("head_dim", [192, 320])
-def test_unsupported_head_dim_is_rejected(head_dim):
-    """head_dim//16 above 8 and not a multiple of 8 leaves the Q tail unloaded."""
+@pytest.mark.parametrize("num_partitions", [1, 4])
+@pytest.mark.parametrize("head_dim", [64, 128, 256, 1024])
+def test_supported_head_dim_boundaries_are_accepted(
+    monkeypatch, head_dim, num_partitions
+):
+    """The public support check is identical before direct and reduced paths."""
+    _require_gpu()
+    pa_decode_module = importlib.import_module("aiter.ops.flydsl.pa_decode")
+    compile_arguments = []
+
+    def capture_compile(**kwargs):
+        compile_arguments.append(kwargs)
+        return {"launch": object()}
+
+    monkeypatch.setattr(pa_decode_module, "compile_pa_decode_tile", capture_compile)
+    monkeypatch.setattr(pa_decode_module, "_run_compiled", lambda *args: None)
+    monkeypatch.setattr(pa_decode_module, "ptr_arg", lambda tensor, dtype=None: tensor)
+    monkeypatch.setattr(
+        pa_decode_module, "launch_pa_decode_ps_reduce", lambda *args, **kwargs: None
+    )
+
+    pa_decode(**_valid_pa_decode_arguments(head_dim, num_partitions))
+    assert len(compile_arguments) == 1
+    assert compile_arguments[0]["head_dim"] == head_dim
+    assert compile_arguments[0]["num_partitions"] == num_partitions
+
+
+@pytest.mark.parametrize("num_partitions", [1, 4])
+@pytest.mark.parametrize("head_dim", [96, 192, 1152])
+def test_unsupported_head_dim_is_rejected(head_dim, num_partitions):
+    """NP=1 and NP>1 expose the same public head-dimension support domain."""
     _require_gpu()
     with pytest.raises(NotImplementedError, match="head_dim"):
-        _adversarial_case(head_dim=head_dim, context_length=64)
+        pa_decode(**_valid_pa_decode_arguments(head_dim, num_partitions))
 
 
 def _constant_page_decode_case(
@@ -884,14 +1239,20 @@ def test_page128_chunk_boundaries(context_length, trans_v, per_token):
     _assert_matches(output, reference)
 
 
+@pytest.mark.parametrize("block_size", [16, 128])
 @pytest.mark.parametrize("context_length", [2048, 100000, 200000])
 @pytest.mark.parametrize("query_length", [1, 3])
 @pytest.mark.parametrize("per_token", [False, True])
-def test_tp4_page128_contexts(context_length, query_length, per_token):
-    """64 Q / 4 KV heads under TP4: Hq16, Hkv1, D128, including dense MTP."""
+def test_tp4_contexts(block_size, context_length, query_length, per_token):
+    """64 Q / 4 KV heads under TP4: Hq16, Hkv1, D128, including dense MTP.
+
+    Page size decides how many block-table entries a 256-token tile walks --
+    two at page-128, sixteen at page-16 -- so both served page sizes are run
+    against every context.
+    """
     _require_gpu()
     output, reference = _adversarial_case(
-        block_size=128,
+        block_size=block_size,
         query_group_size=16,
         context_length=context_length,
         query_length=query_length,
@@ -900,6 +1261,32 @@ def test_tp4_page128_contexts(context_length, query_length, per_token):
         num_partitions=8,
     )
     _assert_matches(output, reference)
+
+
+@pytest.mark.parametrize("batch_size", [1, 2, 4, 8, 16, 32, 64])
+@pytest.mark.parametrize("block_size", [16, 128])
+@pytest.mark.parametrize("context_length", [2048, 100000, 200000])
+def test_tp4_decode_batches(batch_size, block_size, context_length):
+    """Served TP4 decode grid: Hq16, Hkv1, D128, transposed V.
+
+    Batch is the only axis that moves the CTA count, and at NP=8 the sweep
+    straddles the tuned V-prefetch window (256 < batch * 8 <= 512 on a 256-CU
+    part), so page-128 batch 64 compiles the prefetch specialization while the
+    smaller batches compile the default schedule. Page 16 never enters that
+    window -- the gate also requires block_size == 128 -- so it covers the
+    sixteen-pages-per-tile block-table walk over the same grids instead.
+    """
+    _run_accuracy_case(
+        [context_length] * batch_size,
+        num_query_heads=16,
+        num_kv_heads=1,
+        head_dim=128,
+        block_size=block_size,
+        query_dtype=dtypes.bf16,
+        num_partitions=8,
+        tolerance=FIXED_LENGTH_ACCURACY_TOLERANCE,
+        trans_v=True,
+    )
 
 
 @pytest.mark.parametrize("trans_v", [False, True])
@@ -1050,6 +1437,7 @@ def test_mtp3_page128_partition_boundaries(
     context_length, num_partitions, trans_v, zero_query
 ):
     """MTP rows retain independent softmax state across partial/empty partitions."""
+    _require_gpu()
     output, reference = _adversarial_case(
         head_dim=128,
         context_length=context_length,
@@ -1066,6 +1454,7 @@ def test_mtp3_page128_partition_boundaries(
 @pytest.mark.parametrize("all_empty", [False, True])
 def test_page128_decode_prefetch_mixed_contexts(all_empty):
     """A two-CTA-per-CU decode grid handles empty partitions and poisoned padding."""
+    _require_gpu()
     lengths = [0] * 64 if all_empty else [0, 1, 63, 127, 128, 129, 257, 2051] * 8
     _constant_page_decode_case(
         lengths,
@@ -1085,6 +1474,7 @@ def test_page128_reduction_rows_across_m_tiles(
     query_group_size, query_length, context_length
 ):
     """Aligned scratch rows stay independent across padded M-tiles and partitions."""
+    _require_gpu()
     output, reference = _adversarial_case(
         head_dim=128,
         context_length=context_length,
@@ -1153,8 +1543,9 @@ def main():
         type=int,
         nargs="*",
         choices=[0, 1],
-        default=[0],
-        help="""Value-cache layout: 0 for rank-4, 1 for rank-5 transposed V.""",
+        default=[0, 1],
+        help="""V-cache layouts: 0 is the plain 4-D cache, 1 the transposed 5-D
+        cache production serves.""",
     )
     args = parser.parse_args()
 

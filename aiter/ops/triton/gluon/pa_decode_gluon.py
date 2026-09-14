@@ -11,6 +11,12 @@ from triton.language.extra.hip import libdevice as hip_libdevice
 import aiter
 from aiter.ops.triton.utils._triton import arch_info
 
+_FLYDSL_REDUCE_DTYPE_NAMES = {
+    torch.float32: "f32",
+    torch.float16: "f16",
+    torch.bfloat16: "bf16",
+}
+
 CXX_PS_REDUCE_AVAILABLE = True
 try:
     from csrc.cpp_itfs.pa.pa_ps import (
@@ -22,12 +28,16 @@ except Exception:  # noqa: BLE001
 
 FLYDSL_PS_REDUCE_AVAILABLE = True
 try:
+    from aiter.ops.flydsl.kernels.pa_decode_reduce import (
+        is_pa_decode_ps_reduce_supported,
+    )
     from aiter.ops.flydsl.pa_decode import (
         launch_pa_decode_ps_reduce as launch_pa_decode_ps_reduce_flydsl,
     )
 except Exception:  # noqa: BLE001
     FLYDSL_PS_REDUCE_AVAILABLE = False
     launch_pa_decode_ps_reduce_flydsl = None
+    is_pa_decode_ps_reduce_supported = None
 
 GLUON_JIT_KERNEL_ENABLED = True
 try:
@@ -4023,10 +4033,10 @@ def paged_attention_decode_ps_reduce_kernel(
 
 @triton.jit
 def paged_attention_decode_v2_reduce_kernel(
-    output_ptr,  # [num_seqs, num_kv_heads, query_group_size, head_size]
-    exp_sums_ptr,  # [num_seqs, num_kv_heads, max_parts, query_group_size]
-    max_logits_ptr,  # [num_seqs, num_kv_heads, max_parts, query_group_size]
-    logits_ptr,  # [num_seqs, num_kv_heads, max_parts, query_group_size, head_size]
+    output_ptr,  # [num_seqs, query_length, num_kv_heads, query_group_size, head_size]
+    exp_sums_ptr,  # [num_seqs, num_kv_heads, max_parts, query_length * query_group_size]
+    max_logits_ptr,  # [num_seqs, num_kv_heads, max_parts, query_length * query_group_size]
+    logits_ptr,  # [num_seqs, num_kv_heads, max_parts, query_length * query_group_size, head_size]
     context_lengths_ptr,  # [num_seqs]
     sink_token_ptr,  # [num_query_heads]
     stride_output_bs,
@@ -4474,10 +4484,10 @@ def _paged_attention_decode_v2_with_dot_kernel_reshape_wrapper(
 
 def _paged_attention_decode_v2_reduce_kernel_wrapper(
     grid,
-    output_ptr,  # [num_seqs, num_kv_heads, query_group_size, head_size]
-    exp_sums_ptr,  # [num_seqs, num_kv_heads, max_parts, query_group_size]
-    max_logits_ptr,  # [num_seqs, num_kv_heads, max_parts, query_group_size]
-    logits_ptr,  # [num_seqs, num_kv_heads, max_parts, query_group_size, head_size]
+    output_ptr,  # [num_seqs, query_length, num_kv_heads, query_group_size, head_size]
+    exp_sums_ptr,  # [num_seqs, num_kv_heads, max_parts, query_length * query_group_size]
+    max_logits_ptr,  # [num_seqs, num_kv_heads, max_parts, query_length * query_group_size]
+    logits_ptr,  # [num_seqs, num_kv_heads, max_parts, query_length * query_group_size, head_size]
     context_lengths_ptr,  # [num_seqs]
     sink_token_ptr,  # [num_query_heads]
     stride_output_bs,
@@ -4535,9 +4545,25 @@ def _paged_attention_decode_v2_reduce_kernel_wrapper(
                 return
             except ImportError:
                 pass
-        try:
-            if not FLYDSL_PS_REDUCE_AVAILABLE:
-                raise ImportError("FlyDSL pa_decode reduce is unavailable")
+        output_dtype_str = _FLYDSL_REDUCE_DTYPE_NAMES.get(output_ptr.dtype)
+        logits_dtype_str = _FLYDSL_REDUCE_DTYPE_NAMES.get(logits_ptr.dtype)
+        sink_dtype_str = _FLYDSL_REDUCE_DTYPE_NAMES.get(
+            output_ptr.dtype if sink_token_ptr is None else sink_token_ptr.dtype
+        )
+        flydsl_supported = (
+            FLYDSL_PS_REDUCE_AVAILABLE
+            and output_dtype_str is not None
+            and logits_dtype_str is not None
+            and sink_dtype_str is not None
+            and is_pa_decode_ps_reduce_supported(
+                max_context_partition_num=context_partition_num,
+                head_size=head_size,
+                output_dtype_str=output_dtype_str,
+                logits_dtype_str=logits_dtype_str,
+                sink_dtype_str=sink_dtype_str,
+            )
+        )
+        if flydsl_supported:
             launch_pa_decode_ps_reduce_flydsl(
                 output_ptr,
                 exp_sums_ptr,
@@ -4562,32 +4588,31 @@ def _paged_attention_decode_v2_reduce_kernel_wrapper(
                 stream=torch.cuda.current_stream(output_ptr.device),
             )
             return
-        except ImportError:
-            ps_reduce_grid = (grid[0], grid[1], query_seq_len * query_group_size)
-            paged_attention_decode_ps_reduce_kernel[ps_reduce_grid](
-                output_ptr,
-                exp_sums_ptr,
-                max_logits_ptr,
-                logits_ptr,
-                sink_token_ptr,
-                stride_output_bs,
-                stride_output_len,
-                stride_output_kv_head,
-                stride_output_group_size,
-                stride_exp_sums_seq,
-                stride_exp_sums_head,
-                stride_exp_sums_part,
-                stride_logits_seq,
-                stride_logits_head,
-                stride_logits_part,
-                stride_logits_group,
-                query_group_size=query_group_size,
-                head_size=head_size,
-                context_partition_num=context_partition_num,
-                HEAD_SIZE_POW2=triton.next_power_of_2(head_size),
-                USE_SINKS=sink_token_ptr is not None,
-                MAX_CONTEXT_PARTITION_NUM=triton.next_power_of_2(context_partition_num),
-            )
+        ps_reduce_grid = (grid[0], grid[1], query_seq_len * query_group_size)
+        paged_attention_decode_ps_reduce_kernel[ps_reduce_grid](
+            output_ptr,
+            exp_sums_ptr,
+            max_logits_ptr,
+            logits_ptr,
+            sink_token_ptr,
+            stride_output_bs,
+            stride_output_len,
+            stride_output_kv_head,
+            stride_output_group_size,
+            stride_exp_sums_seq,
+            stride_exp_sums_head,
+            stride_exp_sums_part,
+            stride_logits_seq,
+            stride_logits_head,
+            stride_logits_part,
+            stride_logits_group,
+            query_group_size=query_group_size,
+            head_size=head_size,
+            context_partition_num=context_partition_num,
+            HEAD_SIZE_POW2=triton.next_power_of_2(head_size),
+            USE_SINKS=sink_token_ptr is not None,
+            MAX_CONTEXT_PARTITION_NUM=triton.next_power_of_2(context_partition_num),
+        )
     else:
         paged_attention_decode_v2_reduce_kernel[grid](
             output_ptr,
@@ -4633,9 +4658,9 @@ def pa_decode_gluon(
     query_scale: torch.Tensor = None,  # [num_seqs * query_length, num_query_heads, 1] or [1]
     key_scale: torch.Tensor = None,  # [num_blocks, num_kv_heads, kv_block_size, 1]
     value_scale: torch.Tensor = None,  # [num_blocks, num_kv_heads, kv_block_size, 1]
-    exp_sums: torch.Tensor = None,  # [num_seqs, num_kv_heads, max_context_partition_num, query_group_size]
-    max_logits: torch.Tensor = None,  # [num_seqs, num_kv_heads, max_context_partition_num, query_group_size]
-    temporary_output: torch.Tensor = None,  # [num_seqs, num_kv_heads, max_context_partition_num, query_group_size, head_size]
+    exp_sums: torch.Tensor = None,  # [num_seqs, num_kv_heads, max_context_partition_num, query_length * query_group_size]
+    max_logits: torch.Tensor = None,  # [num_seqs, num_kv_heads, max_context_partition_num, query_length * query_group_size]
+    temporary_output: torch.Tensor = None,  # [num_seqs, num_kv_heads, max_context_partition_num, query_length * query_group_size, head_size]
     alibi_slopes: torch.Tensor = None,
     sinks: torch.Tensor = None,
     sliding_window: int = 0,
@@ -4717,19 +4742,22 @@ def pa_decode_gluon(
 
     exp_sums : torch.Tensor
         Buffer for exponential sums used in online softmax computation.
-        - Shape: [num_seqs, num_kv_heads, max_context_partition_num, query_group_size]
+        - Shape: [num_seqs, num_kv_heads, max_context_partition_num,
+          query_length * query_group_size]
           where max_context_partition_num = ceil(max_context_length / context_partition_size)
         - Dtype: torch.float32
 
     max_logits : torch.Tensor
         Buffer for maximum logits used in online softmax computation.
-        - Shape: [num_seqs, num_kv_heads, max_context_partition_num, query_group_size]
+        - Shape: [num_seqs, num_kv_heads, max_context_partition_num,
+          query_length * query_group_size]
         - Dtype: torch.float32
 
     temporary_output : torch.Tensor
         Buffer for partial attention outputs from each context partition.
-        - Shape: [num_seqs, num_kv_heads, max_context_partition_num, query_group_size, head_size]
-        - Dtype: torch.float32
+        - Shape: [num_seqs, num_kv_heads, max_context_partition_num,
+          query_length * query_group_size, head_size]
+        - Dtype: same as query/output
 
     alibi_slopes : torch.Tensor, optional
         ALiBi (Attention with Linear Biases) slopes for positional encoding.

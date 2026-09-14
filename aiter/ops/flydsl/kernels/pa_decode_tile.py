@@ -250,9 +250,9 @@ def compile_pa_decode_tile(
     def pa_decode_tile_kernel(
         output_ptr: fx.Pointer,  # [num_seqs*query_length, num_q_heads, head_dim]  (written directly when NP==1)
         # per-partition partial outputs (combined by the reduce kernel when NP>1):
-        pmax_ptr: fx.Pointer,  # [num_seqs*query_length, num_kv_heads, num_partitions, query_group_size]   row max
-        psum_ptr: fx.Pointer,  # [num_seqs*query_length, num_kv_heads, num_partitions, query_group_size]   row sum
-        pout_ptr: fx.Pointer,  # [num_seqs*query_length, num_kv_heads, num_partitions, query_group_size, head_dim] Q_DTYPE, normalized O_p/l_p
+        pmax_ptr: fx.Pointer,  # [num_seqs, num_kv_heads, num_partitions, query_length*query_group_size] row max
+        psum_ptr: fx.Pointer,  # [num_seqs, num_kv_heads, num_partitions, query_length*query_group_size] row sum
+        pout_ptr: fx.Pointer,  # same shape plus head_dim; Q_DTYPE normalized O_p/l_p
         query_ptr: fx.Pointer,  # [num_seqs*query_length, num_q_heads, head_dim] -- row = seq*query_length + qi (MTP position)
         key_cache_ptr: fx.Pointer,  # [num_blocks, num_kv_heads, head_dim//16, block_size, 16] (blocked, see module docstring)
         value_cache_ptr: fx.Pointer,  # [num_blocks, num_kv_heads, block_size//16, head_dim, 16] (blocked, see module docstring)
