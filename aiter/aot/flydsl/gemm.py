@@ -44,12 +44,14 @@ import flydsl.compiler as flyc
 import flydsl.expr as fx
 
 from aiter.aot.flydsl.common import (
+    DEFAULT_NUM_XCDS,
     collect_aot_jobs,
     compile_only_env,
     cu_num_to_arch,
     job_identity,
     override_env,
     run_jobs_parallel,
+    target_num_xcds,
 )
 from aiter.jit.core import AITER_CONFIGS
 from aiter.ops.flydsl.bpreshuffle_gemm_gfx1250 import (
@@ -389,6 +391,7 @@ def _compile_preshuffle_to_cache(
     use_async_copy: int,
     waves_per_eu: int,
     xcd_swizzle: int = 0,
+    num_xcds: int = DEFAULT_NUM_XCDS,
     lds_stage: int = 2,
     scheduler: str = "Default",
     k_split: int = 1,
@@ -440,6 +443,7 @@ def _compile_preshuffle_to_cache(
         waves_per_eu=None if waves_per_eu <= 0 else waves_per_eu,
         enable_scheduler=enable_scheduler,
         xcd_swizzle=xcd_swizzle,
+        num_xcds=num_xcds,
         lds_stage=lds_stage,
         split_k=k_split,
     )
@@ -471,6 +475,7 @@ def _compile_8wave_to_cache(
     block_n: int,
     waves_per_eu: int,
     xcd_swizzle: int,
+    num_xcds: int = DEFAULT_NUM_XCDS,
     **kwargs,
 ):
     del kwargs
@@ -490,6 +495,7 @@ def _compile_8wave_to_cache(
         block_n=block_n,
         waves_per_eu=waves_per_eu,
         xcd_swizzle=int(xcd_swizzle),
+        num_xcds=int(num_xcds),
     )
     # NOTE: the 8-wave launcher takes (A, B, C, ...), not the preshuffle
     # launcher's (C, A, B, ...).
@@ -668,6 +674,7 @@ def compile_one_config(
     from torch._subclasses.fake_tensor import FakeTensorMode
 
     aot_arch = job_arch(cu_num, gfx)
+    num_xcds = target_num_xcds(aot_arch, cu_num)
     shape_str = f"{kernel_name}  M={m} N={n} K={k}"
     result = {
         "kernel_name": kernel_name,
@@ -689,9 +696,9 @@ def compile_one_config(
                 hgemm_kwargs["target_gfx"] = aot_arch
                 _compile_hgemm_to_cache(m=m, n=n, k=k, **hgemm_kwargs)
             elif kind == "preshuffle":
-                _compile_preshuffle_to_cache(m=m, n=n, k=k, **kwargs)
+                _compile_preshuffle_to_cache(m=m, n=n, k=k, num_xcds=num_xcds, **kwargs)
             elif kind == "8wave":
-                _compile_8wave_to_cache(m=m, n=n, k=k, **kwargs)
+                _compile_8wave_to_cache(m=m, n=n, k=k, num_xcds=num_xcds, **kwargs)
             elif kind == "mxfp8_128_wmma":
                 _compile_mxfp8_128_wmma_to_cache(
                     kernel_name=kernel_name,
