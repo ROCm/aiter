@@ -110,7 +110,8 @@ def _emit_bf16_manifest_header() -> str:
         for idx, inst in enumerate(bf16_kernels):
             suffix = " \\\n" if idx != len(bf16_kernels) - 1 else "\n"
             lines.append(
-                f"    case {inst.kid}: return &{inst.launcher}<{inst.trait}>;" + suffix
+                f"    case {inst.kid}: return &{inst.launcher}<{inst.trait}<{build_num_xcd()}>>;"
+                + suffix
             )
     lines.append("\n")
 
@@ -136,6 +137,23 @@ def _cpp_name_suffix(name: str) -> str:
     )
 
 
+# gfx950 ships at 256 CUs with eight dies and at 128 with four. The stage-2
+# swizzle is baked per instance, so a build is only correct on the part it
+# targets.
+_GFX950_NUM_XCD_BY_CU = {256: 8, 128: 4}
+_DEFAULT_NUM_XCD = 8
+
+
+def build_num_xcd() -> int:
+    """Die count of the part these instances are built for."""
+    try:
+        from aiter.jit.utils.chip_info import get_cu_num
+
+        return _GFX950_NUM_XCD_BY_CU.get(int(get_cu_num()), _DEFAULT_NUM_XCD)
+    except Exception:  # noqa: BLE001
+        return _DEFAULT_NUM_XCD
+
+
 def _stage2_a8w4_traits_alias(kid: int) -> str:
     return f"OpusMoeStage2A8W4DecodeKid{int(kid)}Traits"
 
@@ -152,7 +170,8 @@ def _stage2_a8w4_traits_type(inst) -> str:
         f"{inst.cachectl_b}, "
         f"{inst.cachectl_wscale}, "
         f"{inst.pair_slots}, "
-        f"{inst.steady_pair_slots}"
+        f"{inst.steady_pair_slots}, "
+        f"{build_num_xcd()}"
         ">"
     )
 
@@ -598,7 +617,7 @@ class OpusMoeDeviceCodegen:
             lines.extend(
                 [
                     "template __global__ void opus_moe_stage2_gemmstyle_kernel_gfx950<",
-                    f"{inst.trait}>(opus_moe_stage2_bf16_kargs);\n",
+                    f"{inst.trait}<{build_num_xcd()}>>(opus_moe_stage2_bf16_kargs);\n",
                 ]
             )
         (self.instances_path / "opus_moe_stage2_bf16.device.cu").write_text(

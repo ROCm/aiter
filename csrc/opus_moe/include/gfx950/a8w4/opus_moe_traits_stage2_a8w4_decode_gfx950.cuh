@@ -14,7 +14,8 @@ template<int BlockM = opus_moe::kStage2A8W4DecodeDefaultBlockM,
          int CachectlBOverride = 0,
          int CachectlWScaleOverride = 0,
          int PairSlots = 1,
-         int SteadyPairSlots = PairSlots>
+         int SteadyPairSlots = PairSlots,
+         int NumXcd = 8>
 struct OpusMoeStage2A8W4DecodeShape
 {
     // Atomic vs MXFP8 route-out is a structural compile-time choice.
@@ -45,7 +46,7 @@ struct OpusMoeStage2A8W4DecodeShape
 
     static constexpr int ROUTE_M_STRIDE = B_M;
     // route_out XCD swizzle (gfx950=8 XCDs).
-    static constexpr int NUM_XCD = DIRECT_ATOMIC_OUT ? 1 : 8;
+    static constexpr int NUM_XCD = DIRECT_ATOMIC_OUT ? 1 : NumXcd;
     static constexpr int SWIZZLE_W = 2;
     static constexpr int SWIZZLE_C =
         (!DIRECT_ATOMIC_OUT && (IS_BM32_BN256 || IS_BM64_BN256))
