@@ -1030,17 +1030,15 @@ def launch_gemm_a8w4_tdm(
                 _rm_dst_lanes = []
                 _scatter_lane_valids = []
                 for scatter_vector in range_constexpr(scatter_dst_vectors):
-                    _scatter_pass_lane = (
-                        lane // fx.Int32(SCATTER_GROUP_ROWS)
-                        + fx.Int32(scatter_vector * SCATTER_PASSES_PER_VECTOR)
+                    _scatter_pass_lane = lane // fx.Int32(
+                        SCATTER_GROUP_ROWS
+                    ) + fx.Int32(scatter_vector * SCATTER_PASSES_PER_VECTOR)
+                    _scatter_group_lane = wave + _scatter_pass_lane * fx.Int32(
+                        num_waves
                     )
-                    _scatter_group_lane = (
-                        wave + _scatter_pass_lane * fx.Int32(num_waves)
-                    )
-                    _scatter_row_lane = (
-                        _scatter_group_lane * fx.Int32(SCATTER_GROUP_ROWS)
-                        + lane % fx.Int32(SCATTER_GROUP_ROWS)
-                    )
+                    _scatter_row_lane = _scatter_group_lane * fx.Int32(
+                        SCATTER_GROUP_ROWS
+                    ) + lane % fx.Int32(SCATTER_GROUP_ROWS)
                     _scatter_lane_valid = (
                         _scatter_pass_lane < fx.Int32(scatter_passes)
                     ) & (_scatter_group_lane < fx.Int32(scatter_groups))
@@ -1068,9 +1066,7 @@ def launch_gemm_a8w4_tdm(
                 for wm in range_constexpr(wmma_m_rep):
                     _weight_row = wmb + wm * 16 + lane16
                     _weight_valid = _weight_row < mn_oob
-                    _weight_safe_row = _weight_valid.select(
-                        _weight_row, fx.Int32(0)
-                    )
+                    _weight_safe_row = _weight_valid.select(_weight_row, fx.Int32(0))
                     _weight_bits = fx.Int32(
                         fx.ptr_load(
                             _rm_i32
