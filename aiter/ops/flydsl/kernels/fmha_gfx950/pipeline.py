@@ -694,7 +694,7 @@ class DualwaveFp8KernelContext:
         seq_len_kv=None,
         stride_q_n=None,
         stride_kv_n=None,
-        head_dim_runtime=None,
+        softmax_scale=None,
         lse_stride_h=None,
     ):
         if isinstance(traits_or_ctx, DualwaveFp8KernelContext):
@@ -718,7 +718,7 @@ class DualwaveFp8KernelContext:
         self.seq_len_kv = seq_len_kv
         self.stride_q_n = stride_q_n
         self.stride_kv_n = stride_kv_n
-        self.head_dim_runtime = head_dim_runtime
+        self.softmax_scale = softmax_scale
         self.lse_stride_h = lse_stride_h
 
     def init_types_and_constants(self):
@@ -882,9 +882,8 @@ class DualwaveFp8KernelContext:
             )
             return fx.Float32(Vec(_v, (1,), fx.Float32)[0])
 
-        head_dim_f32 = fx.Float32(self.head_dim_runtime)
         c_log2e_f = fx.Float32(_LOG2E)
-        c_sm_scale_log2e = fx.rsqrt(head_dim_f32, fastmath=self.fm_fast) * c_log2e_f
+        c_sm_scale_log2e = self.softmax_scale * c_log2e_f
         _qd = _load_scale_scalar(self.QDescale)
         _kd = _load_scale_scalar(self.KDescale)
         self.vd_fp8 = _load_scale_scalar(self.VDescale)
