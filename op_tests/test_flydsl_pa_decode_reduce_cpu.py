@@ -111,7 +111,10 @@ def _lane_striped_partition_reduce(exp_sums, max_logits, partials):
     return accumulators
 
 
-@pytest.mark.parametrize("num_partitions", [65, 127, 128, 129, 192, 255, 256])
+@pytest.mark.parametrize(
+    "num_partitions",
+    [26, 30, 32, 34, 36, 40, 64, 65, 96, 127, 128, 129, 160, 192, 255, 256],
+)
 def test_lane_striped_reduce_matches_flat_reference(num_partitions):
     rng = random.Random(num_partitions)
     max_logits = [rng.uniform(-20.0, 5.0) for _ in range(num_partitions)]

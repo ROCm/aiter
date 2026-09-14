@@ -129,24 +129,40 @@ def compile_pa_decode_ps_reduce(
             return reduced
 
         if fx.const_expr(max_context_partition_num <= warp_size):
-            # Preserve the original <=64 path verbatim: one partition per lane
-            # and one bpermute source register per wave.
-            lane_in_range = lane < c_part_num
-            lane_in_reduce = lane < c_reduce_width
-            part_sum = zero_f
-            part_max = neg_inf
-            if lane_in_reduce:
-                part_idx = lane_in_range.select(lane, zero_i)
+            # Exact powers of two have no inactive lanes inside their reduction
+            # subgroup. Keep that original path unchanged; only partial
+            # subgroups need an EXEC-masked load to avoid carrying a predicate
+            # across the shuffle sequence.
+            if fx.const_expr(max_context_partition_num == reduce_width):
+                lane_in_range = lane < c_part_num
+                lane_in_reduce = lane < c_reduce_width
+                part_sum = zero_f
+                part_max = neg_inf
+                if lane_in_reduce:
+                    part_idx = lane_in_range.select(lane, zero_i)
+                    stats_offset = (
+                        batch_idx * stride_exp_sums_seq
+                        + kv_head_idx * stride_exp_sums_head
+                        + part_idx * stride_exp_sums_part
+                        + eqgs_idx
+                    )
+                    loaded_sum = fx.Float32(exp_sums[stats_offset])
+                    loaded_max = fx.Float32(max_logits[stats_offset])
+                    part_sum = lane_in_range.select(loaded_sum, zero_f)
+                    part_max = lane_in_range.select(loaded_max, neg_inf)
+            else:
+                lane_in_range = lane < c_part_num
                 stats_offset = (
                     batch_idx * stride_exp_sums_seq
                     + kv_head_idx * stride_exp_sums_head
-                    + part_idx * stride_exp_sums_part
+                    + lane * stride_exp_sums_part
                     + eqgs_idx
                 )
-                loaded_sum = fx.Float32(exp_sums[stats_offset])
-                loaded_max = fx.Float32(max_logits[stats_offset])
-                part_sum = lane_in_range.select(loaded_sum, zero_f)
-                part_max = lane_in_range.select(loaded_max, neg_inf)
+                part_sum = zero_f
+                part_max = neg_inf
+                if lane_in_range:
+                    part_sum = fx.Float32(exp_sums[stats_offset])
+                    part_max = fx.Float32(max_logits[stats_offset])
 
             global_max = _wave_reduce_max(part_max)
             safe_global_max = (global_max > neg_inf).select(global_max, zero_f)
@@ -205,19 +221,31 @@ def compile_pa_decode_ps_reduce(
             part_maxes = []
             lane_max = neg_inf
             for chunk_idx in fx.range_constexpr(partitions_per_lane):
-                part_idx = lane + fx.Int32(chunk_idx * warp_size)
-                lane_in_range = part_idx < c_part_num
-                safe_part_idx = lane_in_range.select(part_idx, zero_i)
-                stats_offset = (
-                    batch_idx * stride_exp_sums_seq
-                    + kv_head_idx * stride_exp_sums_head
-                    + safe_part_idx * stride_exp_sums_part
-                    + eqgs_idx
-                )
-                loaded_sum = fx.Float32(exp_sums[stats_offset])
-                loaded_max = fx.Float32(max_logits[stats_offset])
-                part_sum = lane_in_range.select(loaded_sum, zero_f)
-                part_max = lane_in_range.select(loaded_max, neg_inf)
+                chunk_base = chunk_idx * warp_size
+                chunk_size = min(warp_size, max_context_partition_num - chunk_base)
+                part_idx = lane + fx.Int32(chunk_base)
+                if fx.const_expr(chunk_size == warp_size):
+                    stats_offset = (
+                        batch_idx * stride_exp_sums_seq
+                        + kv_head_idx * stride_exp_sums_head
+                        + part_idx * stride_exp_sums_part
+                        + eqgs_idx
+                    )
+                    part_sum = fx.Float32(exp_sums[stats_offset])
+                    part_max = fx.Float32(max_logits[stats_offset])
+                else:
+                    lane_in_range = lane < fx.Int32(chunk_size)
+                    stats_offset = (
+                        batch_idx * stride_exp_sums_seq
+                        + kv_head_idx * stride_exp_sums_head
+                        + part_idx * stride_exp_sums_part
+                        + eqgs_idx
+                    )
+                    part_sum = zero_f
+                    part_max = neg_inf
+                    if lane_in_range:
+                        part_sum = fx.Float32(exp_sums[stats_offset])
+                        part_max = fx.Float32(max_logits[stats_offset])
                 part_sums.append(part_sum)
                 part_maxes.append(part_max)
                 lane_max = lane_max.maximumf(part_max)
