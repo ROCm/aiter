@@ -112,7 +112,11 @@ def test_varlen_stride_dispatch_parity(
 
 @pytest.mark.parametrize("which", ["q", "k"])
 @pytest.mark.parametrize("layout", ["strided", "matrix"])
-def test_invalid_sequence_metadata_rejected(which, layout, stride_widths):
+def test_invalid_sequence_metadata_rejected(which, layout, stride_widths, monkeypatch):
+    def unexpected_dispatch(*args, **kwargs):
+        raise AssertionError("invalid metadata reached kernel dispatch")
+
+    monkeypatch.setattr(mha._FlashAttnVarlenFunc, "apply", unexpected_dispatch)
     q = torch.randn(17, 4, 128, device="cuda", dtype=torch.bfloat16)
     lengths = torch.tensor([0, 17], device=q.device, dtype=torch.int32)
     invalid = (
