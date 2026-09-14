@@ -135,6 +135,7 @@ def compile_preshuffle_gemm(
     enable_scheduler: bool = True,
     use_async_copy: bool = False,
     xcd_swizzle: int = 0,
+    num_xcds: int = 8,
     lds_stage: int = 2,
     split_k: int = 1,
 ):
@@ -256,6 +257,7 @@ def compile_preshuffle_gemm(
                 tile_n=tile_n,
                 N=N,
                 xcd_swizzle=xcd_swizzle,
+                num_xcds=num_xcds,
             )
             bid_x, bid_y = Int32(_bx), Int32(_by)
 

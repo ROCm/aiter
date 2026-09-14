@@ -53,6 +53,7 @@ def compile_mixed_moe_gemm1(
     gate_mode: GateMode = GateMode.SEPARATED,
     a_scale_one: bool = False,
     xcd_swizzle: int = 0,
+    num_xcds: int = 8,
     k_wave: int = 1,
     v2_output_layout: bool = False,
 ):
@@ -82,6 +83,7 @@ def compile_mixed_moe_gemm1(
         gate_mode=gate_mode,
         a_scale_one=a_scale_one,
         xcd_swizzle=xcd_swizzle,
+        num_xcds=num_xcds,
         k_wave=k_wave,
         v2_output_layout=v2_output_layout,
     )
@@ -113,6 +115,7 @@ def compile_mixed_moe_gemm2(
     cu_num_mul: int = 1,
     b_nt: int = 0,
     xcd_swizzle: int = 0,
+    num_xcds: int = 8,
 ):
     """Compile an ordinary stage2 MoE kernel."""
     return compile_mixed_moe_gemm2_common(
@@ -139,4 +142,5 @@ def compile_mixed_moe_gemm2(
         cu_num_mul=cu_num_mul,
         b_nt=b_nt,
         xcd_swizzle=xcd_swizzle,
+        num_xcds=num_xcds,
     )
