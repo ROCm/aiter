@@ -488,7 +488,6 @@ def _pa_decode_sparse_gfx950_gluon(
     # 512 B token row per instruction instead of four 128 B quarters, which is what
     # a scattered top-k gather wants. The cost is a longer per-lane slot vector.
     gather_tw1 = 32
-    lds_pad = 8  # bf16 elements of padding after each kv_smem row
     NOPE_DIM, ROPE_DIM = 448, 64
     MAX_BYTES = 2**31 - 1
 
@@ -715,7 +714,6 @@ def _pa_decode_sparse_gfx950_gluon(
         HEAD_ALIGNED=HEAD_ALIGNED,
         MFMA_K=MFMA_K,
         GATHER_TW1=gather_tw1,
-        LDS_PAD=lds_pad,
         NOPE_CHUNK=nope_chunk,
         CHUNK_AXIS=chunk_axis,
         PART_STORE_CACHE="",

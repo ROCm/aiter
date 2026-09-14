@@ -291,7 +291,6 @@ class Cfg:
         MFMA_K,
         NUM_WARPS,
         GATHER_TW1,
-        LDS_PAD,
         UNI_TILE,
         HAS_INVALID,
         HEAD_ALIGNED,
@@ -312,10 +311,7 @@ class Cfg:
         self.QK_DIM = gl.constexpr(KV_DIM + (ROPE_DIM if ROPE_SEPARATE else 0))
         self.NUM_WARPS = gl.constexpr(NUM_WARPS)
         self.GATHER_TW1 = gl.constexpr(GATHER_TW1)
-        # LDS_PAD is in bf16 elements. fp8 tiles store 1 B elements, so double the
-        # count to keep the same row pitch in bytes.
-        if FP8_MFMA:
-            LDS_PAD = LDS_PAD * 2
+        LDS_PAD = 16 if FP8_MFMA else 8
         self.LDS_PAD = gl.constexpr(LDS_PAD)
         self.UNI_TILE = gl.constexpr(UNI_TILE)
         self.HAS_INVALID = gl.constexpr(HAS_INVALID)
@@ -1739,7 +1735,6 @@ def _sparse_mla(
     HEAD_ALIGNED: gl.constexpr,
     MFMA_K: gl.constexpr,
     GATHER_TW1: gl.constexpr,
-    LDS_PAD: gl.constexpr,
     # NOPE_CHUNK: extent of one dequant piece along CHUNK_AXIS (0 = rows,
     # 1 = columns); >= the tile's extent means one shot.
     NOPE_CHUNK: gl.constexpr,
@@ -1856,7 +1851,6 @@ def _sparse_mla(
         MFMA_K,
         NUM_WARPS,
         GATHER_TW1,
-        LDS_PAD,
         UNI_TILE,
         HAS_INVALID,
         HEAD_ALIGNED,

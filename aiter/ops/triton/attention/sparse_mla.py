@@ -28,7 +28,6 @@ _LOGGER = AiterTritonLogger()
 _BLOCK_K = 64
 _MFMA_K = 16
 _GATHER_TW1 = 32
-_LDS_PAD = 8
 
 
 def _check_out(out, q, kv_lora_rank):
@@ -506,7 +505,7 @@ def sparse_mla_fwd(
         part_l,
         part_acc,
         scl,  # f32 side-channel: k_scale ("fp8_scalar") / f32 view ("fp8_dsv32_mla")
-        scl,
+        scl,  # extra segment's slot, unread (HAS_EXTRA=False)
         float(softmax_scale),
         q.stride(0),
         q.stride(1),
@@ -539,7 +538,6 @@ def sparse_mla_fwd(
         HEAD_ALIGNED=head_aligned,
         MFMA_K=_MFMA_K,
         GATHER_TW1=_GATHER_TW1,
-        LDS_PAD=_LDS_PAD,
         NOPE_CHUNK=nope_chunk,
         CHUNK_AXIS=chunk_axis,
         PART_STORE_CACHE="",
