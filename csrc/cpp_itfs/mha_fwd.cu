@@ -183,6 +183,10 @@ std::tuple<int, int, int> get_grid_dim(const mha_fwd_args& a, int ts_qo, const s
     {
         tg_div = 1; // do not merge the head and tail in seqlen_q direction
     }
+    if(arch_id == "gfx950" && a.hdim_q == 256 && a.data_type == "bf16")
+    {
+        tg_div = 1; // hd256 bf16 kernel does not implement tile merging
+    }
     // batch
     int gdx = ((a.seqlen_q + ts_qo - 1) / ts_qo + tg_div - 1) / tg_div;
     int gdy = a.nhead_q;
@@ -261,7 +265,7 @@ float fmha_fwd_v3(mha_fwd_args a, const ck_tile::stream_config& s)
     int bdx = 512;
     if(a.hdim_q == 192 && a.hdim_v == 128)
         bdx = 256;
-    if(arch_id == "gfx950" && a.hdim_q == 256 && a.data_type == "bf16")
+    if(arch_id == "gfx950" && a.hdim_q == 256 && a.data_type == "bf16" && a.is_group_mode)
         bdx = 256;
     auto [gdx, gdy, gdz] = get_grid_dim(a, cfg.ts_qo, arch_id);
 
