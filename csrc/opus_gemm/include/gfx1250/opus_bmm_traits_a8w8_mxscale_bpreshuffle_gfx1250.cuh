@@ -191,15 +191,25 @@ template<int BLOCK_SIZE_,
          // the LDS wait 11.6% -> 9.5%. FlyDSL sits off that curve entirely
          // (0.1% stall AND 6.1% wait), spreading its reads across the step.
          int DS_LOOKAHEAD_ = -1,
-         // TDM load coherence scope (opus::tdm_traits::scope). 2 = dev is the
-         // opus default and the current behaviour; 0 = cu is what FlyDSL's atom
-         // uses (its cache_modifier defaults to 0, documented "0=cached").
-         // A and B are read-only inputs with no cross-workgroup writes, so
-         // device-scope coherence is a cost with nothing to buy. PMC: we issue
-         // 4x FlyDSL's HBM read requests for a bit-identical result on the same
-         // tile, same grid, same TDM -- scope is the only descriptor field that
-         // still differs after a field-by-field comparison.
-         int TDM_SCOPE_ = 2>
+         // TDM load coherence scope (opus::tdm_traits::scope), for the A and B
+         // windows only. 0 = cu is the default because A and B are read-only
+         // inputs that nothing in these kernels writes, so device-scope
+         // coherence costs every L2 re-read and buys nothing. FlyDSL's
+         // make_tdm_atom passes cache_modifier=0 for the same reason (its own
+         // signature documents 0 as "cached"); opus's make_cache_policy()
+         // defaults to scope::dev, so the two "defaults" sat at opposite ends
+         // of the same CPOL field.
+         //
+         // Measured at b=16 m=2048, identical tile and grid:
+         //   EA_RDREQ  4,024,312 -> 1,009,515   (FlyDSL 1,009,492)
+         //   L2 MISS   4,275,483 -> 1,260,678   (FlyDSL 1,260,652)
+         // and 15-33% wall clock across five prefill shapes.
+         //
+         // Set 2 (dev) to get the old behaviour back; kid55 is kept as that
+         // control. NOTE this window pair carries A and B only -- the split-K
+         // workspace in the cluster path is a separate descriptor, so widening
+         // scope here does not touch the one place with cross-workgroup writes.
+         int TDM_SCOPE_ = 0>
 struct opus_bmm_a8w8_mxscale_bpreshuffle_traits_gfx1250 {
     static constexpr int BLOCK_SIZE = BLOCK_SIZE_;
     static constexpr int B_M = B_M_;
@@ -2062,7 +2072,7 @@ using opus_bmm_a8w8_mxscale_bpreshuffle_tile_ns128_la4_gfx1250 =
         /*SF_A_TDM_KG*/0, /*SF_A_TDM_PAD*/16, /*TILE_M*/2, /*NO_SPEC*/true,
         /*SF_A_PANEL_KG*/128, /*ALL_READS_FIRST*/false, /*DS_LOOKAHEAD*/4>;
 
-// kid55: kid35 with the TDM loads at CU scope instead of device scope.
+// kid55: kid35 held at DEVICE scope -- the control for the CU-scope default.
 //
 // Field-by-field against FlyDSL's `make_tdm_atom` for the same shape, every
 // descriptor field matches (extents, strides, pad_interval, pad_amount,
@@ -2085,7 +2095,7 @@ using opus_bmm_a8w8_mxscale_bpreshuffle_tile_ns256_cuscope_gfx1250 =
         /*SF_A_LDS*/true, /*SF_B_LDS*/true,
         /*SF_A_TDM_KG*/0, /*SF_A_TDM_PAD*/16, /*TILE_M*/2, /*NO_SPEC*/true,
         /*SF_A_PANEL_KG*/128, /*ALL_READS_FIRST*/false, /*DS_LOOKAHEAD*/-1,
-        /*TDM_SCOPE*/0>;   // 0 = scope::cu
+        /*TDM_SCOPE*/2>;   // 2 = scope::dev, the pre-fix behaviour
 
 // -- smem -> register read layouts -----------------------------------------
 // Device-only in effect, but compiled on the host pass too so vtype_c matches.
