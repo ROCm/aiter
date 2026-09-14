@@ -509,7 +509,7 @@ def get_device_name():
         raise RuntimeError("Unsupported gfx")
 
 
-def _query_num_xccs(device_id: int) -> int:
+def _query_num_xccs(device_id: int, default: int) -> int:
     """Ask HIP how many XCCs the given device has."""
     import ctypes
 
@@ -523,10 +523,16 @@ def _query_num_xccs(device_id: int) -> int:
         device_id,
     )
     if err != 0:
-        raise RuntimeError(
-            f"hipDeviceGetAttribute(NumberOfXccs) failed with error {err} "
-            f"for device {device_id}"
+        # An attribute this runtime cannot answer is treated the same as a
+        # runtime too old to have it, so it takes the same default.
+        logger.warning(
+            "hipDeviceGetAttribute(NumberOfXccs) failed with error %d for "
+            "device %d; assuming %d XCDs.",
+            err,
+            device_id,
+            default,
         )
+        return default
 
     # A shifted ordinal resolves to an unrelated attribute, whose value lands well
     # outside this range. Loose because MI300A has 6 dies and partitions vary.
@@ -547,8 +553,7 @@ def _num_xcds_for_device(device_id: int) -> int:
     version = get_hip_runtime_version()
     if version is None:
         logger.warning(
-            "Could not read the HIP runtime version for device %d; assuming "
-            "%d XCDs.",
+            "Could not read the HIP runtime version for device %d; assuming %d XCDs.",
             device_id,
             default_xcd_count,
         )
@@ -567,13 +572,14 @@ def _num_xcds_for_device(device_id: int) -> int:
         )
         return default_xcd_count
 
-    return _query_num_xccs(device_id)
+    return _query_num_xccs(device_id, default_xcd_count)
 
 
 def get_num_xcds() -> int:
     """XCD (accelerator die) count of the device this thread is bound to.
 
-    Raises when HIP is unavailable or cannot report the count.
+    Raises when there is no current device to ask, or when the count comes back
+    outside a plausible range.
     """
     device_id = get_current_hip_device()
     if device_id is None:
