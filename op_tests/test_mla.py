@@ -10,7 +10,8 @@ import torch
 
 import aiter
 from aiter import dtypes
-from aiter.jit.utils.chip_info import get_gfx
+from aiter.jit.utils.chip_info import get_gfx, get_num_xcds
+from aiter.ops.triton.utils.device_info import get_num_sms
 from aiter.test_common import benchmark, checkAllclose, run_perftest
 
 torch.set_default_device("cuda")
@@ -652,7 +653,6 @@ def test_mla(
 
     # Gluon MLA decode test
     # Example: -c 16384 -b 64 128 -n 64,1 128,1 -d bf16 -kvd bf16
-    NUM_XCDS_GFX950 = 8
     BLOCK_H_GLUON = 64
     if (
         get_gfx() == "gfx950"
@@ -665,12 +665,16 @@ def test_mla(
         and batch_size in (64, 128, 256)
         and page_size == 1
     ):
+        # Mirror the wrapper: both terms come from the device, not a constant,
+        # so this picks the split count production picks on this part.
+        num_xcds = get_num_xcds()
         base_grid = (
-            NUM_XCDS_GFX950
+            num_xcds
             * ((nhead + BLOCK_H_GLUON - 1) // BLOCK_H_GLUON)
-            * (batch_size // NUM_XCDS_GFX950)
+            * (batch_size // num_xcds)
         )
-        splits_needed = max(1, (256 + base_grid - 1) // base_grid)
+        num_cus = get_num_sms()
+        splits_needed = max(1, (num_cus + base_grid - 1) // base_grid)
         # Round up to a power of two: 1 << (n - 1).bit_length() for n >= 1.
         num_kv_splits = 1 << (splits_needed - 1).bit_length()
         # PIPELINE_STAGES=3, BLOCK_N=64 -> 192; mirror wrapper's bound.

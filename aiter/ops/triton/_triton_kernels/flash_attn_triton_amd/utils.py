@@ -310,7 +310,7 @@ def get_arch() -> GpuArch:
 
 
 @triton.jit
-def remap_xcd(pid, GRID_MN, NUM_XCDS: tl.constexpr = 8):
+def remap_xcd(pid, GRID_MN, NUM_XCDS: tl.constexpr):
     ## pid remapping on xcds
     # Number of pids per XCD in the new arrangement
     pids_per_xcd = (GRID_MN + NUM_XCDS - 1) // NUM_XCDS

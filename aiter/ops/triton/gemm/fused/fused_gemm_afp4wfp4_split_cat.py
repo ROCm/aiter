@@ -11,6 +11,7 @@ from aiter.ops.triton._triton_kernels.gemm.fused.fused_gemm_afp4wfp4_split_cat i
     _fused_gemm_afp4wfp4_split_cat_reduce,
 )
 from aiter.ops.triton.gemm.basic.gemm_afp4wfp4 import get_splitk
+from aiter.ops.triton.utils.device_info import get_num_xcds
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 
 _LOGGER = AiterTritonLogger()
@@ -149,6 +150,7 @@ def fused_gemm_afp4wfp4_split_cat(
         w_scale.stride(0),
         w_scale.stride(1),
         **config,
+        NUM_XCDS=get_num_xcds(),
     )
 
     if config["NUM_KSPLIT"] > 1:
@@ -328,6 +330,7 @@ def fused_gemm_afp4wfp4_preshuffle_split_cat(
         w_scale.stride(0),
         w_scale.stride(1),
         **config,
+        NUM_XCDS=get_num_xcds(),
     )
 
     if config["NUM_KSPLIT"] > 1:

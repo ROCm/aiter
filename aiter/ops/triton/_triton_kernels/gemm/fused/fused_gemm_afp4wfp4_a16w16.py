@@ -90,6 +90,7 @@ def _fused_gemm_afp4wfp4_a16w16_kernel(
     GRID_MN_BF16: tl.constexpr,
     SKIP_REDUCE: tl.constexpr,
     cache_modifier: tl.constexpr,
+    NUM_XCDS: tl.constexpr,
 ):
 
     tl.assume(stride_a_fp4_m > 0)
@@ -115,7 +116,7 @@ def _fused_gemm_afp4wfp4_a16w16_kernel(
     GRID_MN: tl.constexpr = GRID_MN_FP4 + GRID_MN_BF16
 
     pid_unified = tl.program_id(axis=0)
-    pid_unified = remap_xcd(pid_unified, GRID_MN * NUM_KSPLIT, NUM_XCDS=8)
+    pid_unified = remap_xcd(pid_unified, GRID_MN * NUM_KSPLIT, NUM_XCDS=NUM_XCDS)
 
     pid_k = pid_unified % NUM_KSPLIT
     pid = pid_unified // NUM_KSPLIT
@@ -390,6 +391,7 @@ def _fused_gemm_afp4wfp4_preshuffle_a16w16_kernel(
     GRID_MN_BF16: tl.constexpr,
     SKIP_REDUCE: tl.constexpr,
     cache_modifier: tl.constexpr,
+    NUM_XCDS: tl.constexpr,
 ):
 
     tl.assume(stride_a_fp4_m > 0)
@@ -415,7 +417,7 @@ def _fused_gemm_afp4wfp4_preshuffle_a16w16_kernel(
     GRID_MN: tl.constexpr = GRID_MN_FP4 + GRID_MN_BF16
 
     pid_unified = tl.program_id(axis=0)
-    pid_unified = remap_xcd(pid_unified, GRID_MN * NUM_KSPLIT, NUM_XCDS=8)
+    pid_unified = remap_xcd(pid_unified, GRID_MN * NUM_KSPLIT, NUM_XCDS=NUM_XCDS)
 
     pid_k = pid_unified % NUM_KSPLIT
     pid = pid_unified // NUM_KSPLIT

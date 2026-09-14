@@ -57,6 +57,7 @@ def _gemm_a16_w16_atomic_kernel(
     cache_modifier: tl.constexpr,
     EVEN_K: tl.constexpr,
     GRID_MN: tl.constexpr,
+    NUM_XCDS: tl.constexpr,
 ):
     """Kernel for computing the matmul C = A x B.
     A has shape (M, K), B has shape (K, N) and C has shape (M, N)
@@ -79,7 +80,7 @@ def _gemm_a16_w16_atomic_kernel(
     num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
 
     if NUM_KSPLIT == 1:
-        pid = remap_xcd(pid, GRID_MN)
+        pid = remap_xcd(pid, GRID_MN, NUM_XCDS=NUM_XCDS)
         pid_m, pid_n = pid_grid(pid, num_pid_m, num_pid_n, GROUP_SIZE_M=GROUP_SIZE_M)
     else:
         pid_m = pid // num_pid_n
