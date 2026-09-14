@@ -72,7 +72,7 @@ def _test_mha_impl(
         assert len(triton_out) > 1
         lse = triton_out[1]
         if DEBUG_MODE:
-            logger.info(f"lse.shape={lse.shape}, lse={lse}")
+            logger.info("lse.shape=%s, lse=%s", lse.shape, lse)
 
     if DROPOUT > 0.0 and RETURN_SOFTMAX:
         if RETURN_LSE:
@@ -83,24 +83,28 @@ def _test_mha_impl(
             sd_mask = triton_out[1]
         dropout_mask = sd_mask >= 0
         if DEBUG_MODE:
-            logger.info(f"sd_mask.shape={sd_mask.shape}, sd_mask={sd_mask}")
+            logger.info("sd_mask.shape=%s, sd_mask=%s", sd_mask.shape, sd_mask)
             logger.info(
-                f"dropout_mask.shape={dropout_mask.shape}, dropout_mask={dropout_mask}"
+                "dropout_mask.shape=%s, dropout_mask=%s",
+                dropout_mask.shape,
+                dropout_mask,
             )
 
     if RETURN_SOFTMAX or RETURN_LSE:
         triton_out = triton_out[0]
     if DEBUG_MODE:
-        logger.info(f"triton_out.shape={triton_out.shape}, triton_out={triton_out}")
+        logger.info("triton_out.shape=%s, triton_out=%s", triton_out.shape, triton_out)
 
     torch_out = attention_ref(
         q, k, v, dropout_p=DROPOUT, dropout_mask=dropout_mask, causal=CAUSAL
     )
     torch_out, attention_scores, _ = torch_out
     if DEBUG_MODE:
-        logger.info(f"torch_out.shape={torch_out.shape}, torch_out={torch_out}")
+        logger.info("torch_out.shape=%s, torch_out=%s", torch_out.shape, torch_out)
         logger.info(
-            f"attention_scores.shape={attention_scores.shape}, attention_scores={attention_scores}"
+            "attention_scores.shape=%s, attention_scores=%s",
+            attention_scores.shape,
+            attention_scores,
         )
 
     torch.testing.assert_close(triton_out, torch_out, atol=1e-2, rtol=1e-2)
@@ -470,22 +474,26 @@ def _test_mha_varlen_impl(
 
     if DEBUG_MODE:
         logger.info(
-            f"query_padding_mask.shape={query_padding_mask.shape} query_padding_mask={query_padding_mask}"
+            "query_padding_mask.shape=%s query_padding_mask=%s",
+            query_padding_mask.shape,
+            query_padding_mask,
         )
         logger.info(
-            f"key_padding_mask.shape={key_padding_mask.shape} key_padding_mask={key_padding_mask}"
+            "key_padding_mask.shape=%s key_padding_mask=%s",
+            key_padding_mask.shape,
+            key_padding_mask,
         )
 
-        logger.info(f"q.shape={q.shape} q={q}")
-        logger.info(f"k.shape={k.shape} k={k}")
-        logger.info(f"v.shape={v.shape} v={v}")
-        logger.info(f"q_unpad.shape={q_unpad.shape} q_unpad={q_unpad}")
-        logger.info(f"k_unpad.shape={k_unpad.shape} k_unpad={k_unpad}")
-        logger.info(f"v_unpad.shape={v_unpad.shape} v_unpad={v_unpad}")
-        logger.info(f"max_seqlens_q={max_seqlen_q}")
-        logger.info(f"max_seqlens_k={max_seqlen_k}")
-        logger.info(f"cu_seqlens_q={cu_seqlens_q}")
-        logger.info(f"cu_seqlens_k={cu_seqlens_k}")
+        logger.info("q.shape=%s q=%s", q.shape, q)
+        logger.info("k.shape=%s k=%s", k.shape, k)
+        logger.info("v.shape=%s v=%s", v.shape, v)
+        logger.info("q_unpad.shape=%s q_unpad=%s", q_unpad.shape, q_unpad)
+        logger.info("k_unpad.shape=%s k_unpad=%s", k_unpad.shape, k_unpad)
+        logger.info("v_unpad.shape=%s v_unpad=%s", v_unpad.shape, v_unpad)
+        logger.info("max_seqlens_q=%s", max_seqlen_q)
+        logger.info("max_seqlens_k=%s", max_seqlen_k)
+        logger.info("cu_seqlens_q=%s", cu_seqlens_q)
+        logger.info("cu_seqlens_k=%s", cu_seqlens_k)
 
     triton_out = flash_attn_varlen_func(
         q_unpad,
@@ -506,7 +514,7 @@ def _test_mha_varlen_impl(
         assert len(triton_out) > 1
         lse = triton_out[1]
         if DEBUG_MODE:
-            logger.info(f"lse.shape={lse.shape}, lse={lse}")
+            logger.info("lse.shape=%s, lse=%s", lse.shape, lse)
 
     dropout_mask = None
     if DROPOUT > 0.0 and RETURN_SOFTMAX:
@@ -531,14 +539,16 @@ def _test_mha_varlen_impl(
         if DEBUG_MODE:
             # print(f"sd_mask.shape={sd_mask.shape}, sd_mask={sd_mask}")
             logger.info(
-                f"dropout_mask.shape={dropout_mask.shape}, dropout_mask={dropout_mask}"
+                "dropout_mask.shape=%s, dropout_mask=%s",
+                dropout_mask.shape,
+                dropout_mask,
             )
     if RETURN_SOFTMAX or RETURN_LSE:
         triton_out = output_pad_fn(triton_out[0])
     else:
         triton_out = output_pad_fn(triton_out)
     if DEBUG_MODE:
-        logger.info(f"triton_out.shape={triton_out.shape}, triton_out={triton_out}")
+        logger.info("triton_out.shape=%s, triton_out=%s", triton_out.shape, triton_out)
 
     torch_out = attention_ref(
         q,
@@ -553,9 +563,11 @@ def _test_mha_varlen_impl(
     torch_out, attention_scores, _ = torch_out
 
     if DEBUG_MODE:
-        logger.info(f"torch_out.shape={torch_out.shape}, torch_out={torch_out}")
+        logger.info("torch_out.shape=%s, torch_out=%s", torch_out.shape, torch_out)
         logger.info(
-            f"attention_scores.shape={attention_scores.shape}, attention_scores={attention_scores}"
+            "attention_scores.shape=%s, attention_scores=%s",
+            attention_scores.shape,
+            attention_scores,
         )
 
     torch.testing.assert_close(
