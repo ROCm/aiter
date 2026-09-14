@@ -61,7 +61,7 @@ preshuffled gate/up spot-check when the hot loop, wait/reduce, or grid changed.
 - [x] 1. Interleave gate/up `v_dot2` (drop half the `s_nop`s)
 - [x] 2. Re-A/B G7 `dot2_acc` on the **native** 16×4 grid
 - [x] 3. Dedup `x` loads within `nlane` — **WontFix** (broadcast regresses)
-- [ ] 4. Software-pipeline `k0` (prefetch next kpack)
+- [x] 4. Software-pipeline `k0` (prefetch next kpack; FP4 WontFix)
 - [ ] 5. Split-K over `k0` for small-`INTER` occupancy (Qwen B=1 first)
 
 ## Locked decisions
@@ -252,17 +252,46 @@ FP8 `us`/`%peak` do not improve (occupancy 1.25). Keep all-lane coalesced
 
 ### 4. Software-pipeline `k0`
 
-Each `k0` is currently load `x`+`wg`+`wu`, convert, dots, optional block2d
-scale, then the next `k0`. Overlap next-kpack VMEM with current convert/dot
-(`s_waitcnt` so the ALU is not waiting on the same iter’s loads).
+**Done (2026-09-14), with FP4 WontFix.** Native FP8, FP8-act, and BF16 use a
+peeled depth-1 pipeline: a prologue issues `k0=0`; the `num_kpack-1` main loop
+carries current `x`/gate/up dwords, issues `k0+1`, then consumes `k0`; the
+epilogue consumes the last kpack. `final_state = init_state` keeps
+`num_kpack==1` legal. No speculative OOB load and no LDS.
 
-Prefetch depth 1 is enough to start. Do not add `SharedAllocator` B tiles.
+FP8 ISA (`h1024`) now issues four next-kpack `buffer_load_dwordx4`s before
+current-kpack converts/dots, with staged `vmcnt(5/4/...)` waits. VGPRs rise
+**32→48**, without spilling. BF16 likewise has next-kpack dwordx4 loads in
+the loop during current dots (48 VGPRs, no spill). The compiler owns exact
+`s_waitcnt` placement; source does not inject raw waits.
 
-- [ ] Double-buffered kpack/`x` loads in the native `k0` loop (all four
-      gate/up dtypes), or a documented reason the compiler already overlaps
-      them (ISA waitcnt vs load/dot).
-- [ ] **Done when:** ISA shows loads of `k0+1` in flight during `k0` dots, or
-      WontFix with the waitcnt dump; G9 canary does not regress.
+FP4 is deliberately left unpipelined. Carrying all 16 `x` dwords plus 8 B
+dwords improved Qwen B=1 locally (16.2→14.3 us) but regressed DeepSeek B=1
+**48.6→56.3 us**. Carrying only B and loading current `x` in the consume
+step was worse (Qwen 18.6 us, DeepSeek 65.8 us). The FP4 register/loop-carry
+cost is larger than its latency benefit. G9 below therefore has the original
+FP4 path and confirms it stays flat.
+
+GPU 6 G9 (`/tmp/g9_gu_prefetch_ck.md`), 100 iters, 3 repeats,
+`timing=device`, loaded SCLK median **2380 MHz**; comparison is against
+subtask 1 `/tmp/g9_gu_i1_ck.csv`:
+
+| shape | B | dtype | act | before us | prefetch us | delta |
+|---|---|---|---|---|---|---|
+| qwen3next | 1 | fp4 | bf16 | 16.21 | 16.11 | -0.6% (unchanged path) |
+| qwen3next | 1 | fp8 | bf16 | 19.99 | **17.58** | **-12.0%** |
+| qwen3next | 1 | fp8 | fp8 | 21.27 | **18.31** | **-13.9%** (5.3% spread) |
+| qwen3next | 2 | fp8 | bf16 | 21.07 | **18.77** | **-10.9%** |
+| qwen3next | 2 | fp8 | fp8 | 22.16 | **19.81** | **-10.6%** |
+| deepseek-v3 | 1 | fp4 | bf16 | 48.59 | 48.53 | -0.1% (unchanged path) |
+| deepseek-v3 | 1 | fp8 | bf16 | 74.59 | **70.14** | **-6.0%** (5.3% spread) |
+| deepseek-v3 | 1 | fp8 | fp8 | 76.35 | **72.05** | **-5.6%** |
+| deepseek-v3 | 2 | fp8 | bf16 | 90.72 | **86.41** | **-4.7%** |
+| deepseek-v3 | 2 | fp8 | fp8 | 93.29 | **90.29** | **-3.2%** (5.6% spread) |
+
+- [x] Depth-1 `x` + gate/up B prefetch: native FP8, FP8-act, BF16.
+- [x] FP4 WontFix documented after full and B-only prefetch regressions.
+- [x] ISA shows next loads in flight during current compute; no spills.
+- [x] Cache-off op_test GPU 6: **100 passed**; G9 canary does not regress.
 
 ### 5. Split-K over `k0` for small-`INTER` occupancy
 

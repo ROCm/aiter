@@ -824,14 +824,16 @@ def _build_gate_up_fp8_preshuffled_native(
         wus_t = _f32_view(wus_ptr)
         one_f32 = fx.Float32(1.0).ir_value()
 
-        gate_l = fx.Float32(0.0)
-        up_l = fx.Float32(0.0)
-        for k0 in range(num_kpack):
+        def _issue(k0):
             k_base = k0 * 64 + klane * fx.Int32(16)
             x_word0 = (token_b * hidden + k_base) // 2
             xw = load_i32_words(x_rsrc, x_word0, 8)
             gw = _native_kpack_words(wg_b, n0, k0, klane, nlane)
             uw = _native_kpack_words(wu_b, n0, k0, klane, nlane)
+            return xw, gw, uw
+
+        def _consume(k0, gate_l, up_l, xw, gw, uw):
+            k_base = fx.Int32(k0) * fx.Int32(64) + klane * fx.Int32(16)
             gate_pairs = []
             up_pairs = []
             for ipair in range_constexpr(8):
@@ -858,7 +860,37 @@ def _build_gate_up_fp8_preshuffled_native(
             else:
                 gate_l = gate_l + fx.Float32(gd)
                 up_l = up_l + fx.Float32(ud)
+            return gate_l, up_l
 
+        xw0, gw0, uw0 = _issue(fx.Int32(0))
+        init_state = (
+            [fx.Float32(0.0).ir_value(), fx.Float32(0.0).ir_value()]
+            + list(xw0)
+            + list(gw0)
+            + list(uw0)
+        )
+        final_state = init_state
+        for k0, state in range(0, num_kpack - 1, 1, init=init_state):
+            gate_l = fx.Float32(state[0])
+            up_l = fx.Float32(state[1])
+            xw = list(state[2:10])
+            gw = list(state[10:14])
+            uw = list(state[14:18])
+            xw_next, gw_next, uw_next = _issue(fx.Int32(k0) + fx.Int32(1))
+            gate_l, up_l = _consume(k0, gate_l, up_l, xw, gw, uw)
+            final_state = yield (
+                [gate_l.ir_value(), up_l.ir_value()]
+                + list(xw_next)
+                + list(gw_next)
+                + list(uw_next)
+            )
+
+        gate_l = fx.Float32(final_state[0])
+        up_l = fx.Float32(final_state[1])
+        xw = list(final_state[2:10])
+        gw = list(final_state[10:14])
+        uw = list(final_state[14:18])
+        gate_l, up_l = _consume(fx.Int32(num_kpack - 1), gate_l, up_l, xw, gw, uw)
         gate_acc = _reduce_klane4_f32(gate_l.ir_value())
         up_acc = _reduce_klane4_f32(up_l.ir_value())
         if const_expr(not block2d):
@@ -1213,15 +1245,17 @@ def _build_gate_up_fp8_act_preshuffled_native(
         wus_t = _f32_view(wus_ptr)
         one_f32 = fx.Float32(1.0).ir_value()
         row_blk = w_row // scale_bn
-        gate_l = fx.Float32(0.0)
-        up_l = fx.Float32(0.0)
 
-        for k0 in range(num_kpack):
+        def _issue(k0):
             k_base = k0 * 64 + klane * fx.Int32(16)
             x_word0 = (token_b * hidden + k_base) // 4
             xw = load_i32_words(x_rsrc, x_word0, 4)
             gw = _native_kpack_words(wg_b, n0, k0, klane, nlane)
             uw = _native_kpack_words(wu_b, n0, k0, klane, nlane)
+            return xw, gw, uw
+
+        def _consume(k0, gate_l, up_l, xw, gw, uw):
+            k_base = fx.Int32(k0) * fx.Int32(64) + klane * fx.Int32(16)
             gate_pairs = []
             up_pairs = []
             for ipair in range_constexpr(8):
@@ -1242,7 +1276,37 @@ def _build_gate_up_fp8_act_preshuffled_native(
             xs = _f32_load(xs_t, token_b * scale_cols_x + x_col_blk)
             gate_l = gate_l + fx.Float32(gd) * (fx.Float32(gs) * fx.Float32(xs))
             up_l = up_l + fx.Float32(ud) * (fx.Float32(us) * fx.Float32(xs))
+            return gate_l, up_l
 
+        xw0, gw0, uw0 = _issue(fx.Int32(0))
+        init_state = (
+            [fx.Float32(0.0).ir_value(), fx.Float32(0.0).ir_value()]
+            + list(xw0)
+            + list(gw0)
+            + list(uw0)
+        )
+        final_state = init_state
+        for k0, state in range(0, num_kpack - 1, 1, init=init_state):
+            gate_l = fx.Float32(state[0])
+            up_l = fx.Float32(state[1])
+            xw = list(state[2:6])
+            gw = list(state[6:10])
+            uw = list(state[10:14])
+            xw_next, gw_next, uw_next = _issue(fx.Int32(k0) + fx.Int32(1))
+            gate_l, up_l = _consume(k0, gate_l, up_l, xw, gw, uw)
+            final_state = yield (
+                [gate_l.ir_value(), up_l.ir_value()]
+                + list(xw_next)
+                + list(gw_next)
+                + list(uw_next)
+            )
+
+        gate_l = fx.Float32(final_state[0])
+        up_l = fx.Float32(final_state[1])
+        xw = list(final_state[2:6])
+        gw = list(final_state[6:10])
+        uw = list(final_state[10:14])
+        gate_l, up_l = _consume(fx.Int32(num_kpack - 1), gate_l, up_l, xw, gw, uw)
         gate_acc = _reduce_klane4_f32(gate_l.ir_value())
         up_acc = _reduce_klane4_f32(up_l.ir_value())
         if klane == 0:
@@ -2571,15 +2635,16 @@ def _build_gate_up_bf16_preshuffled_native(
         wg_b = _preshuffled_expert_b_i32_tensor(wg_ptr, e, inter, hidden, 2)
         wu_b = _preshuffled_expert_b_i32_tensor(wu_ptr, e, inter, hidden, 2)
         x_rsrc = _i32_word_base(x_ptr)
-        gate_l = fx.Float32(0.0).ir_value()
-        up_l = fx.Float32(0.0).ir_value()
 
-        for k0 in range(num_kpack):
+        def _issue(k0):
             k_base = k0 * 32 + klane * fx.Int32(8)
             x_word0 = (token_b * hidden + k_base) // 2
             xw = load_i32_words(x_rsrc, x_word0, 4)
             gw = _native_kpack_words(wg_b, n0, k0, klane, nlane)
             uw = _native_kpack_words(wu_b, n0, k0, klane, nlane)
+            return xw, gw, uw
+
+        def _consume(gate_l, up_l, xw, gw, uw):
             if use_dot2:
                 gate_pairs = [(xw[i], gw[i]) for i in range(4)]
                 up_pairs = [(xw[i], uw[i]) for i in range(4)]
@@ -2604,7 +2669,34 @@ def _build_gate_up_bf16_preshuffled_native(
                         use_dot2=False,
                         serialize=False,
                     )
+            return gate_l, up_l
 
+        xw0, gw0, uw0 = _issue(fx.Int32(0))
+        init_state = (
+            [fx.Float32(0.0).ir_value(), fx.Float32(0.0).ir_value()]
+            + list(xw0)
+            + list(gw0)
+            + list(uw0)
+        )
+        final_state = init_state
+        for k0, state in range(0, num_kpack - 1, 1, init=init_state):
+            gate_l = state[0]
+            up_l = state[1]
+            xw = list(state[2:6])
+            gw = list(state[6:10])
+            uw = list(state[10:14])
+            xw_next, gw_next, uw_next = _issue(fx.Int32(k0) + fx.Int32(1))
+            gate_l, up_l = _consume(gate_l, up_l, xw, gw, uw)
+            final_state = yield (
+                [gate_l, up_l] + list(xw_next) + list(gw_next) + list(uw_next)
+            )
+
+        gate_l = final_state[0]
+        up_l = final_state[1]
+        xw = list(final_state[2:6])
+        gw = list(final_state[6:10])
+        uw = list(final_state[10:14])
+        gate_l, up_l = _consume(gate_l, up_l, xw, gw, uw)
         gate_acc = _reduce_klane4_f32(gate_l)
         up_acc = _reduce_klane4_f32(up_l)
         if klane == 0:
