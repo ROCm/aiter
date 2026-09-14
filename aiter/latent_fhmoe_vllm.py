@@ -137,13 +137,7 @@ def maybe_run_vllm_k3_latent_fhmoe(
         return None
     config = getattr(runner, "moe_config", None)
     if (
-        # M=8 alone is not a decode discriminator: a chunked-prefill tail can
-        # contain eight local tokens on only some DCP ranks. Dispatching those
-        # ranks differently desynchronizes the following TP collective. The
-        # production decode path is CUDA-graphed, so capture is the rank-stable
-        # signal; replay then executes the captured latent kernels directly.
-        not torch.cuda.is_current_stream_capturing()
-        or shared_input is None
+        shared_input is None
         or tuple(routed_input.shape) != (_K3_DECODE_M, 3584)
         or tuple(shared_input.shape) != (_K3_DECODE_M, 7168)
         or tuple(router_logits.shape) != (_K3_DECODE_M, _K3_EXPERTS)
@@ -152,6 +146,10 @@ def maybe_run_vllm_k3_latent_fhmoe(
         or bool(getattr(config, "is_sequence_parallel", False))
         or getattr(runner, "expert_map", None) is not None
     ):
+        return None
+
+    capturing = torch.cuda.is_current_stream_capturing()
+    if not capturing and getattr(runner, "_k3_latent_fhmoe_prepared", False):
         return None
 
     routed = getattr(runner, "routed_experts", None)
@@ -217,4 +215,15 @@ def maybe_run_vllm_k3_latent_fhmoe(
         shared_w1,
         shared_w2,
     )
+    if not capturing:
+        # vLLM executes each capture size once before graph capture. Use that
+        # warmup to compile FlyDSL and allocate the per-layer workspace from
+        # the ordinary caching pool, but preserve the normal vLLM result.
+        #
+        # M=8 alone cannot select the latent result here: a chunked-prefill
+        # tail can have eight local tokens on only some DCP ranks, which would
+        # desynchronize the following TP collective. During capture all ranks
+        # take this path, and replay executes it without re-entering Python.
+        runner._k3_latent_fhmoe_prepared = True
+        return None
     return shared_output, routed_output

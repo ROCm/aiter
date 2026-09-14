@@ -2937,14 +2937,8 @@ def compile_mixed_moe_gemm1_common(
                                     f32_situ_linear_beta_rcp,
                                     f32_swiglu_limit,
                                 )
-                                shared_lds_ptr = fx.inttoptr(
-                                    fx.PointerType.get(
-                                        T.i8, fx.AddressSpace.Shared, 16
-                                    ),
-                                    arith.index_cast(T.i64, fx.ptrtoint(base_ptr_pong)),
-                                )
                                 _gemm1_body_a16w4(
-                                    shared_lds_ptr,
+                                    base_ptr_pong,
                                     arith.index_cast(T.i64, fx.ptrtoint(arg_shared_x)),
                                     arith.index_cast(T.i64, fx.ptrtoint(arg_shared_w)),
                                     arith.index_cast(
@@ -5423,12 +5417,8 @@ def compile_mixed_moe_gemm2_common(
                                 )
                                 + by
                             )
-                            shared_lds_ptr = fx.inttoptr(
-                                fx.PointerType.get(T.i8, fx.AddressSpace.Shared, 16),
-                                arith.index_cast(T.i64, fx.ptrtoint(base_ptr)),
-                            )
                             _gemm2_body_a16w4(
-                                shared_lds_ptr,
+                                lds_x,
                                 arith.index_cast(T.i64, fx.ptrtoint(arg_x)),
                                 arith.index_cast(T.i64, fx.ptrtoint(arg_shared_w)),
                                 arith.index_cast(
@@ -5607,6 +5597,7 @@ def compile_mixed_moe_gemm2_common(
                 arg_sorted_weights,
                 arg_num_valid_ids,
                 arg_bias,
+                i32_tokens_in,
                 i32_tokens_in,
                 i32_n_in,
                 i32_k_in,
@@ -5871,6 +5862,7 @@ def compile_mixed_moe_gemm2_common(
                 arg_sorted_weights,
                 arg_num_valid_ids,
                 arg_bias,
+                i32_tokens_in,
                 i32_tokens_in,
                 i32_n_in,
                 i32_k_in,
