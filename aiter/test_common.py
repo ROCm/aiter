@@ -631,12 +631,14 @@ def assertAllclose(a, b, rtol=1e-2, atol=1e-2, tol_err_ratio=0.05, msg="", **kwa
     """checkAllclose only logs and returns the mismatch ratio; this variant fails
     the test when the mismatch ratio exceeds tol_err_ratio, i.e. exactly the
     cases checkAllclose already reports as failed."""
+    # Own the separator so no caller has to pad msg; checkAllclose interpolates it too.
+    prefix = f"{msg.strip()} " if msg.strip() else ""
     ratio = checkAllclose(
-        a, b, rtol=rtol, atol=atol, tol_err_ratio=tol_err_ratio, msg=msg, **kwargs
+        a, b, rtol=rtol, atol=atol, tol_err_ratio=tol_err_ratio, msg=prefix, **kwargs
     )
     assert (
         ratio <= tol_err_ratio
-    ), f"{msg}{ratio:.3%} of elements exceed atol={atol} rtol={rtol}"
+    ), f"{prefix}{ratio:.3%} of elements exceed atol={atol} rtol={rtol}"
     return ratio
 
 

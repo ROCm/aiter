@@ -333,8 +333,8 @@ def test_gather_kv_b_proj(
     )
 
     # Validate results
-    assertAllclose(k_ref, k_prefix, atol=1e-2, rtol=1e-2, msg="k ")
-    assertAllclose(v_ref, v_prefix, atol=1e-2, rtol=1e-2, msg="v ")
+    assertAllclose(k_ref, k_prefix, atol=1e-2, rtol=1e-2, msg="k")
+    assertAllclose(v_ref, v_prefix, atol=1e-2, rtol=1e-2, msg="v")
 
     if perf:
         _, elapsed_us = run_perftest(
@@ -477,8 +477,8 @@ def test_gather_kv_b_proj_per_row_scale(
         weight_preshuffle=weight_preshuffle,
     )
 
-    assertAllclose(k_ref, k_prefix, atol=1e-2, rtol=1e-2, msg="k ")
-    assertAllclose(v_ref, v_prefix, atol=1e-2, rtol=1e-2, msg="v ")
+    assertAllclose(k_ref, k_prefix, atol=1e-2, rtol=1e-2, msg="k")
+    assertAllclose(v_ref, v_prefix, atol=1e-2, rtol=1e-2, msg="v")
 
     if perf:
         _, elapsed_us = run_perftest(
@@ -634,8 +634,8 @@ def test_gather_kv_b_proj_bf16_weight(
         weight_preshuffle=weight_preshuffle,
     )
 
-    assertAllclose(k_ref, k_prefix, atol=1e-2, rtol=1e-2, msg="k ")
-    assertAllclose(v_ref, v_prefix, atol=1e-2, rtol=1e-2, msg="v ")
+    assertAllclose(k_ref, k_prefix, atol=1e-2, rtol=1e-2, msg="k")
+    assertAllclose(v_ref, v_prefix, atol=1e-2, rtol=1e-2, msg="v")
 
     if perf:
         _, elapsed_us = run_perftest(
@@ -776,8 +776,8 @@ def test_gather_kv_b_proj_asymmetric_dims(
         weight_preshuffle=weight_preshuffle,
     )
 
-    assertAllclose(k_ref, k_prefix, atol=1e-2, rtol=1e-2, msg="k ")
-    assertAllclose(v_ref, v_prefix, atol=1e-2, rtol=1e-2, msg="v ")
+    assertAllclose(k_ref, k_prefix, atol=1e-2, rtol=1e-2, msg="k")
+    assertAllclose(v_ref, v_prefix, atol=1e-2, rtol=1e-2, msg="v")
 
 
 @pytest.mark.skipif(
@@ -868,8 +868,8 @@ def test_gather_kv_b_proj_mxfp4_weight(k_buffer_type, weight_preshuffle):
         weight_preshuffle=weight_preshuffle,
     )
 
-    assertAllclose(k_ref, k_prefix, atol=1e-1, rtol=1e-1, msg="k ")
-    assertAllclose(v_ref, v_prefix, atol=1e-1, rtol=1e-1, msg="v ")
+    assertAllclose(k_ref, k_prefix, atol=1e-1, rtol=1e-1, msg="k")
+    assertAllclose(v_ref, v_prefix, atol=1e-1, rtol=1e-1, msg="v")
 
 
 @pytest.mark.skipif(
@@ -963,8 +963,8 @@ def test_gather_kv_b_proj_mxfp4_oversized_kv_indices(weight_preshuffle):
         weight_preshuffle=weight_preshuffle,
     )
 
-    assertAllclose(k_ref, k_prefix, atol=1e-1, rtol=1e-1, msg="k ")
-    assertAllclose(v_ref, v_prefix, atol=1e-1, rtol=1e-1, msg="v ")
+    assertAllclose(k_ref, k_prefix, atol=1e-1, rtol=1e-1, msg="k")
+    assertAllclose(v_ref, v_prefix, atol=1e-1, rtol=1e-1, msg="v")
 
 
 @pytest.mark.parametrize(
@@ -1146,8 +1146,8 @@ def test_gather_kv_b_proj_shuffled_kv(
     # FP4 weight reconstruction carries more error than fp8/bf16 weight.
     atol = 1e-1 if is_mxfp4_weight else 1e-2
     rtol = 1e-1 if is_mxfp4_weight else 1e-2
-    assertAllclose(k_ref, k_prefix, atol=atol, rtol=rtol, msg="k ")
-    assertAllclose(v_ref, v_prefix, atol=atol, rtol=rtol, msg="v ")
+    assertAllclose(k_ref, k_prefix, atol=atol, rtol=rtol, msg="k")
+    assertAllclose(v_ref, v_prefix, atol=atol, rtol=rtol, msg="v")
 
     if perf:
         _, elapsed_us = run_perftest(
