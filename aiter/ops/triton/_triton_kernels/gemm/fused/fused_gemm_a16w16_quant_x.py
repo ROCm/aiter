@@ -81,6 +81,7 @@ def _fused_gemm_a16w16_quant_x_kernel(
     use_activation: tl.constexpr,
     ADD_BIAS: tl.constexpr,
     SKIP_REDUCE: tl.constexpr,
+    NUM_XCDS: tl.constexpr,
 ):
     """Kernel that computes C = A x B and also emits an MXFP8-quantized A.
 
@@ -118,7 +119,7 @@ def _fused_gemm_a16w16_quant_x_kernel(
 
     if pid_unified < GEMM_GRID:
         # ---- GEMM branch ----------------------------------------------------
-        pid_unified = remap_xcd(pid_unified, GEMM_GRID, NUM_XCDS=8)
+        pid_unified = remap_xcd(pid_unified, GEMM_GRID, NUM_XCDS=NUM_XCDS)
         pid_k = pid_unified % NUM_KSPLIT
         pid = pid_unified // NUM_KSPLIT
 
