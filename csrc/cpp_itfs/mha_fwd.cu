@@ -226,6 +226,11 @@ float fmha_fwd_v3(mha_fwd_args a, const ck_tile::stream_config& s)
         AITER_LOG_WARNING("unsupported condition in fwd_v3!!! data type: " << a.data_type);
         return -1;
     }
+    // gfx950 bf16 hd256: no GQA/MQA (kernel indexes K/V by h_q directly)
+    if(arch_id == "gfx950" && a.hdim_q == 256 && a.data_type == "bf16" && a.nhead_q != a.nhead_k)
+    {
+        return -1;
+    }
 
     auto fwd_cfgs               = &cfg_fmha_fwd;
     int cfg_mask_type           = get_cfg_mask_type(a);
