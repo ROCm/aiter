@@ -766,19 +766,25 @@ def chunk_gated_delta_rule_fwd_h_flydsl_opt(
     else:
         _total_chunks, _max_seq_chunks = B * NT, NT
 
-    # Experimental context-parallel K5.  Keep this opt-in until its three-pass
-    # crossover has been tuned across serving batches; short sequences stay on
-    # the single-pass FlyDSL kernel regardless of the switch.
+    # Experimental context-parallel K5. Measurements cover 8k/16k/32k token
+    # budgets and packed N=1..16 batches. N<=2 benefits from 8k total tokens;
+    # N==3 crosses over only for a full 32k pack with a >=16k sequence.
     use_segment_scan = os.getenv("AITER_GDN_K5_SEGMENT_SCAN", "0").lower() in (
         "1",
         "true",
         "yes",
         "on",
     )
-    segment_min_chunks = int(os.getenv("AITER_GDN_K5_SEGMENT_MIN_CHUNKS", "256"))
+    segment_min_total_chunks = int(
+        os.getenv("AITER_GDN_K5_SEGMENT_MIN_TOTAL_CHUNKS", "128")
+    )
+    segment_batch_supported = N <= 2 or (
+        N == 3 and _total_chunks >= 512 and _max_seq_chunks >= 256
+    )
     if (
         use_segment_scan
-        and _max_seq_chunks >= segment_min_chunks
+        and _total_chunks >= segment_min_total_chunks
+        and segment_batch_supported
         and B == 1
         and K == V == 128
         and use_g
@@ -786,7 +792,6 @@ def chunk_gated_delta_rule_fwd_h_flydsl_opt(
         and g_head_major
         and g_log2_scaled
         and save_new_value
-        and N == 1
     ):
         from ..triton._triton_kernels.gated_delta_rule.prefill.gdn_segment_scan import (
             gdn_segment_scan_fwd,

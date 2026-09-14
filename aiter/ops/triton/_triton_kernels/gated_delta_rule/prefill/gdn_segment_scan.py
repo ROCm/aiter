@@ -29,7 +29,7 @@ import triton.language as tl
 _K = 128
 _V = 128
 _BT = 64
-_DEFAULT_CHUNKS_PER_SEGMENT = 16
+_TARGET_SEGMENTS = 16
 
 
 @triton.jit
@@ -51,8 +51,7 @@ def _gdn_segment_kernel(
     seg_tok_end,
     seg_seq,
     seg_is_last,
-    TOTAL_CHUNKS: tl.constexpr,
-    T_FLAT: tl.constexpr,
+    T_FLAT,
     H: tl.constexpr,
     HG: tl.constexpr,
     K: tl.constexpr,
@@ -331,13 +330,22 @@ def gdn_segment_scan_fwd(
         )
     if g.shape != (B, H, T_flat):
         raise ValueError(f"GDN segment scan needs head-major g; got {tuple(g.shape)}.")
+    seq_lens = tuple(int(length) for length in seq_lens)
     if sum(seq_lens) != T_flat:
         raise ValueError(f"seq_lens sum to {sum(seq_lens)}, expected {T_flat}.")
 
-    max_chunks = max(triton.cdiv(length, _BT) for length in seq_lens)
+    chunks_per_seq = tuple(triton.cdiv(length, _BT) for length in seq_lens)
+    max_chunks = max(chunks_per_seq)
+    total_chunks = sum(chunks_per_seq)
     if chunks_per_segment is None:
         override = os.getenv("AITER_GDN_K5_SEGMENT_CHUNKS", "").strip()
-        chunks_per_segment = int(override) if override else _DEFAULT_CHUNKS_PER_SEGMENT
+        if override:
+            chunks_per_segment = int(override)
+        else:
+            # Across 8k/16k/32k token budgets and N=1..3, the optimum keeps
+            # roughly 16 segments in flight. This scales from 8 chunks/segment
+            # at 8k tokens through 32 chunks/segment at 32k tokens.
+            chunks_per_segment = triton.cdiv(total_chunks, _TARGET_SEGMENTS)
     chunks_per_segment = min(max_chunks, max(1, chunks_per_segment))
     tile_v = int(os.getenv("AITER_GDN_K5_SEGMENT_BV", "64"))
     if tile_v not in (16, 32, 64):
@@ -349,8 +357,6 @@ def gdn_segment_scan_fwd(
         seq_lens, chunks_per_segment, k.device
     )
     seg_chunk_base, seg_nchunks, seg_tok_base, seg_tok_end, seg_seq, seg_is_last = desc
-    total_chunks = sum(triton.cdiv(length, _BT) for length in seq_lens)
-
     # The regular K5 output contract.
     snapshots = torch.empty(
         B, total_chunks, H, V, K, dtype=snapshot_dtype, device=k.device
@@ -390,7 +396,6 @@ def gdn_segment_scan_fwd(
             "seg_tok_end": seg_tok_end,
             "seg_seq": seg_seq,
             "seg_is_last": seg_is_last,
-            "TOTAL_CHUNKS": total_chunks,
             "T_FLAT": T_flat,
             "H": H,
             "HG": HG,
@@ -470,7 +475,6 @@ def gdn_segment_scan_fwd(
         seg_tok_end=seg_tok_end,
         seg_seq=seg_seq,
         seg_is_last=seg_is_last,
-        TOTAL_CHUNKS=total_chunks,
         T_FLAT=T_flat,
         H=H,
         HG=HG,
