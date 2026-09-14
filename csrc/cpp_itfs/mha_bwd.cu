@@ -460,8 +460,8 @@ float fmha_v3_bwd(mha_bwd_args a, const ck_tile::stream_config& s)
         AITER_LOG_WARNING("fmha_v3_bwd: unsupported mask type for asm kernels.");
         return -1;
     }
-    // gfx950 hd256 only has mask=0 (non-causal) kernels in the CSV
-    if(arch_id == "gfx950" && a.hdim_q == 256 && mt != 0)
+    // gfx950 hd256: non-causal only, no GQA/MQA
+    if(arch_id == "gfx950" && a.hdim_q == 256 && (mt != 0 || a.nhead_q != a.nhead_k))
     {
         return -1;
     }
