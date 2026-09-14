@@ -58,16 +58,26 @@ DEFAULT_NUM_XCDS = 8
 def target_num_xcds(gfx: str, cu_num=None) -> int:
     """Die count of the part a build targets.
 
-    cu_num defaults to what the running device reports, which is what a build
-    on the target part wants. Pass it explicitly to describe another part.
+    Without an explicit cu_num this resolves through get_build_targets(), so it
+    follows GPU_ARCHS and CU_NUM the way the CK codegens filter their tuning
+    CSVs, and needs no GPU when the environment names the target. An
+    architecture absent from the target list takes the default.
+
+    Raises whatever get_build_targets() raises when neither the environment nor
+    a GPU can name a target, so a build does not quietly bake one part's count.
     """
     if cu_num is None:
         # Deferred: chip_info imports this module at load time.
         try:
-            from chip_info import get_cu_num
+            from chip_info import get_build_targets
         except ImportError:
-            from aiter.jit.utils.chip_info import get_cu_num
-        cu_num = get_cu_num()
+            from aiter.jit.utils.chip_info import get_build_targets
+        for target_gfx, target_cu in get_build_targets():
+            if target_gfx == gfx:
+                cu_num = target_cu
+                break
+        else:
+            return DEFAULT_NUM_XCDS
     return NON_DEFAULT_NUM_XCDS.get((gfx, int(cu_num)), DEFAULT_NUM_XCDS)
 
 
