@@ -31,13 +31,14 @@ spot-check when the hot loop or wait/reduce path changed.
 - [x] 2. FP4 native down — TOPK-parallel 16×4, same grid/epilogue as FP8
 - [x] 3. BF16 native down — TOPK-parallel 16×4 oracle; G9 has no BF16 down cell
 - [x] 4. Optional second N tile (32 rows) — **WontFix** (cuts waves; 16 N is not occupancy-bound)
-- [ ] 5. Split-K last, only if extra waves over `k0` help
+- [x] 5. Split-K over `k0` — **WontFix** (native grid already fills CUs; extra `k0` shards would not help B=1,2)
 
 **Landed:** TOPK-parallel 16×4 (`grid = B*TOPK*(HIDDEN/16)`, one expert per
 wave, `atomic_add_f32` into a zeroed FP32 `y`) is the preshuffled FP8, FP4,
 and BF16 down default on legal tiles. Serial-TOPK is abandoned. No INTER/grid
 cutoff. Qwen B=1 vs gather is accepted for FP8; FP4 Qwen B=1 **beats** gather.
-Subtask 4 (32-row / two `n0`) is **WontFix**.
+Subtask 4 (32-row / two `n0`) is **WontFix**. Subtask 5 (extra `k0`
+split-K) is **WontFix**.
 
 ## Locked decisions
 
@@ -211,11 +212,32 @@ Native already splits INTER 4 ways via `klane`. Extra `k_batch` over `k0`
 tiles only if INTER is large enough that more waves help. Do not port
 k-contiguous split-K onto the gather path as a stand-in.
 
-- [ ] Decide from G9 / DeepSeek INTER after 1–3 (and 4 if it shipped).
-- [ ] If go: split `k0` across waves, `atomic_add_f32` epilogue like
-      k-contiguous `k_batch>1`.
-- [ ] **Done when:** either explicitly WontFix, or split-K native down matches
-      non-split cosine and does not regress B=1,2.
+**No-go.** `klane` already partitions INTER 4 ways inside the wave. Extra
+`k_batch` over `k0` would multiply the grid (`B*TOPK*(HIDDEN/16)*k_batch`) and
+add another `atomic_add_f32` into the same FP32 `y` (on top of TOPK). G5
+auto-split-K only fires when `base_grid * k <= CuCount` (256 on this MI355X)
+and returns 1 for already-full grids. Native TOPK-parallel 16×4 already
+exceeds that:
+
+| Shape | B | native down waves | waves/CU | FP8 `k0` (`INTER/64`) |
+|---|---:|---:|---:|---:|
+| DeepSeek-V3 | 1 | 3584 | 14 | 32 |
+| DeepSeek-V3 | 32 | 114688 | 448 | 32 |
+| MiniMax | 1 | 1536 | 6 | 24 |
+| Qwen3-Next | 1 | 1280 | 5 | 8 |
+
+Auto `split_k` would be **1** on every G9 native grid. DeepSeek B=1 down FP8
+is already ~65% peak (B=32 ~75%). Qwen B=1 is the occupancy-looking cell
+(~21% peak) because INTER is **short** (`k0=8`), not because the grid is
+smaller than the CU count; splitting those 8 tiles makes each wave shorter
+and adds atomics. That is the opposite of “INTER large enough that more
+waves help.” Default stays `k_batch=1` / native; `split_k>1` remains the
+illegal-tile gather fallback, not a native `k0` shard.
+
+- [x] Decide from G9 / DeepSeek INTER after 1–4; **no-go**.
+- [x] **WontFix:** no native `k0` split-K kernel.
+
+**Done when:** explicit WontFix in Progress (this section).
 
 ## Non-goals (do not pull into this plan)
 
