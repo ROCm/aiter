@@ -900,8 +900,7 @@ def gemm_a8w8_blockscale_bpreshuffle_fake(
     return torch.empty(XQ.shape[0], WQ.shape[0], dtype=dtype, device=XQ.device)
 
 
-@torch_compile_guard(gen_fake=gemm_a8w8_blockscale_bpreshuffle_fake)
-def gemm_a8w8_blockscale_bpreshuffle(
+def _gemm_a8w8_blockscale_bpreshuffle_impl(
     XQ: Tensor,
     WQ: Tensor,
     x_scale: Tensor,
@@ -930,6 +929,32 @@ def gemm_a8w8_blockscale_bpreshuffle(
         Y = out
     else:
         Y = torch.empty(m, n, dtype=dtype, device=XQ.device)
+
+    # gfx950 E8M0 block128 is not fp32 blockscale. Keep its tuned rows
+    # separate and consume both the preshuffled weight and byte-transposed
+    # activation scales directly (no weight unshuffle / scale expansion).
+    if (
+        get_gfx() == "gfx950"
+        and dtype == dtypes.bf16
+        and x_scale.dtype in (torch.uint8, dtypes.fp8_e8m0)
+        and w_scale.dtype in (torch.uint8, dtypes.fp8_e8m0)
+    ):
+        from .gemm_op_mxfp8 import gemm_mxfp8
+
+        if x_scale.numel() != m * (k // 128):
+            raise ValueError("block128 activation scale has an invalid size")
+        sx = x_scale.view(torch.uint8).reshape(k // 128, m).t()
+        return gemm_mxfp8(
+            XQ,
+            WQ,
+            sx,
+            w_scale,
+            out=Y,
+            dtype=dtype,
+            scale_block=128,
+            bpreshuffle=True,
+            scale_a_transposed=True,
+        )
 
     use_gfx1250_flydsl_or_triton_mxfp8_128 = (
         get_gfx() == "gfx1250"
@@ -1113,6 +1138,74 @@ def gemm_a8w8_blockscale_bpreshuffle(
             f"gemm_a8w8_blockscale_bpreshuffle failed for shape M={m}, N={n}, K={k}, "
             f"{dtype=}, config={config}: {e}"
         ) from e
+
+
+@torch.compiler.assume_constant_result
+def _use_gfx950_mxfp8():
+    return get_gfx() == "gfx950"
+
+
+@torch_compile_guard(gen_fake=gemm_a8w8_blockscale_bpreshuffle_fake, mutates_args=[])
+def _gemm_a8w8_blockscale_bpreshuffle(
+    XQ: Tensor,
+    WQ: Tensor,
+    x_scale: Tensor,
+    w_scale: Tensor,
+    dtype: torch.dtype = dtypes.bf16,
+) -> Tensor:
+    return _gemm_a8w8_blockscale_bpreshuffle_impl(XQ, WQ, x_scale, w_scale, dtype)
+
+
+def _gemm_a8w8_blockscale_bpreshuffle_out_fake(
+    XQ: Tensor,
+    WQ: Tensor,
+    x_scale: Tensor,
+    w_scale: Tensor,
+    out: Tensor,
+    dtype: torch.dtype = dtypes.bf16,
+) -> None:
+    return None
+
+
+@torch_compile_guard(
+    gen_fake=_gemm_a8w8_blockscale_bpreshuffle_out_fake, mutates_args=["out"]
+)
+def _gemm_a8w8_blockscale_bpreshuffle_out(
+    XQ: Tensor,
+    WQ: Tensor,
+    x_scale: Tensor,
+    w_scale: Tensor,
+    out: Tensor,
+    dtype: torch.dtype = dtypes.bf16,
+) -> None:
+    _gemm_a8w8_blockscale_bpreshuffle_impl(XQ, WQ, x_scale, w_scale, dtype, out=out)
+
+
+def gemm_a8w8_blockscale_bpreshuffle(
+    XQ: Tensor,
+    WQ: Tensor,
+    x_scale: Tensor,
+    w_scale: Tensor,
+    dtype: torch.dtype = dtypes.bf16,
+    out: Tensor | None = None,
+) -> Tensor:
+    # Inductor's mutating-op functionalization does not support E8M0 on
+    # some torch versions. The gfx950 MX kernel consumes the same raw bytes:
+    # make this zero-copy dtype view BEFORE crossing the custom-op boundary.
+    if (
+        dtype == dtypes.bf16
+        and x_scale.dtype in (torch.uint8, dtypes.fp8_e8m0)
+        and w_scale.dtype in (torch.uint8, dtypes.fp8_e8m0)
+        and _use_gfx950_mxfp8()
+    ):
+        x_scale = x_scale.view(torch.uint8)
+        w_scale = w_scale.view(torch.uint8)
+    # A mutating custom op must not also return an alias of its output argument:
+    # split functional and out variants so inductor can functionalize both.
+    if out is None:
+        return _gemm_a8w8_blockscale_bpreshuffle(XQ, WQ, x_scale, w_scale, dtype)
+    _gemm_a8w8_blockscale_bpreshuffle_out(XQ, WQ, x_scale, w_scale, out, dtype)
+    return out
 
 
 def gfx950_a8w8_blockscale_ASM(

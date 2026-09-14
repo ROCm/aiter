@@ -275,16 +275,23 @@ def gen_gemm_a16w16_fake_tensor(
     scale_a: Tensor | None = None,
     scale_b: Tensor | None = None,
     scale_c: Tensor | None = None,
+    bpreshuffle: bool | None = None,
 ) -> Tensor:
     return torch.empty(
         *A.shape[:-1],
         B.shape[0],
-        dtype=otype or A.dtype,
+        dtype=otype
+        or (
+            torch.bfloat16
+            if scale_a is not None
+            and scale_a.dtype in (torch.uint8, torch.float8_e8m0fnu)
+            else A.dtype
+        ),
         device=A.device,
     )
 
 
-@torch_compile_guard(gen_fake=gen_gemm_a16w16_fake_tensor)
+@torch_compile_guard(gen_fake=gen_gemm_a16w16_fake_tensor, mutates_args=[])
 def gemm_a16w16(
     A: Tensor,
     B: Tensor,
@@ -293,10 +300,35 @@ def gemm_a16w16(
     scale_a: Tensor | None = None,
     scale_b: Tensor | None = None,
     scale_c: Tensor | None = None,
+    bpreshuffle: bool | None = None,
 ) -> Tensor:
-    bpreshuffle = False
-    if hasattr(B, "is_shuffled") and B.is_shuffled is True:
-        bpreshuffle = True
+    from aiter.ops.gemm_op_mxfp8 import gemm_mxfp8, is_mxfp8_scale
+
+    if is_mxfp8_scale(scale_a) or is_mxfp8_scale(scale_b):
+        if not (is_mxfp8_scale(scale_a) and is_mxfp8_scale(scale_b)):
+            raise ValueError("MXFP8 requires both A and B E8M0 scales")
+        if scale_c is not None:
+            raise ValueError("MXFP8 does not support scale_c")
+        inp = A.reshape(-1, A.shape[-1])
+        # The tuned_gemm API uses native 1x32 scales. Block128 model operands
+        # enter through gemm_a8w8_blockscale_bpreshuffle instead.
+        sx = scale_a.reshape(inp.shape[0], -1)
+        out = gemm_mxfp8(
+            inp,
+            B,
+            sx,
+            scale_b,
+            bias=bias,
+            dtype=otype or torch.bfloat16,
+            bpreshuffle=(
+                bool(getattr(B, "is_shuffled", False))
+                if bpreshuffle is None
+                else bpreshuffle
+            ),
+        )
+        return out.view(*A.shape[:-1], B.shape[0])
+    if bpreshuffle is None:
+        bpreshuffle = bool(getattr(B, "is_shuffled", False))
     if A.dim() >= 3:
         try:
             inp_view = A.view(-1, A.size(-1))
@@ -606,7 +638,11 @@ solMap = {
 
 
 class TunedGemm:
-    """bf16/fp16 with per tensor fp8 quant"""
+    """BF16/FP16, tensor-scaled FP8, and native 1x32 MXFP8 GEMM.
+
+    Pass bpreshuffle explicitly under torch.compile; tensor attributes are
+    only a convenience for eager calls. MXFP8 scales remain unshuffled.
+    """
 
     def __init__(self):
         # self.extensions_created = False
@@ -638,6 +674,7 @@ class TunedGemm:
         scale_a: Tensor | None = None,
         scale_b: Tensor | None = None,
         scale_c: Tensor | None = None,
+        bpreshuffle: bool | None = None,
     ):
 
         out = gemm_a16w16(
@@ -648,6 +685,7 @@ class TunedGemm:
             scale_a=scale_a,
             scale_b=scale_b,
             scale_c=scale_c,
+            bpreshuffle=bpreshuffle,
         )
         return out
 

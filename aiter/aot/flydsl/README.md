@@ -158,3 +158,12 @@ python op_tests/test_moe_2stage.py
   does not need. It is noise, not a failure.
 - **Step 2 reports a cache miss**: confirm step 1 actually ran, the cache dir and
   arch match, and the CSV config hasn't changed.
+
+
+## gfx950 MXFP8 / E8M0 blockscale GEMM
+
+`gemm.py` also collects `flydsl_mxfp8_*` entries from
+`AITER_CONFIGS.AITER_CONFIG_GEMM_MXFP8_FILE`. Native and `(16,16)`-preshuffled
+weights, 1x32 MXFP8 and 128-block E8M0 scaling share the runtime/AOT ABI.
+See [the MXFP8 guide](../../../docs/flydsl_mxfp8.md) for tuning, operand layouts,
+CPU-only compilation and fresh-process run-only tests.

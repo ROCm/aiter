@@ -11,6 +11,7 @@ through ``AITER_CONFIGS`` so model-specific tuned CSVs can be merged the same
 way as runtime JIT config lookup.
 
 Supported kernel families:
+  - ``flydsl_mxfp8_*``                        gfx950 MXFP8 / E8M0 block128 GEMM
   - ``flydsl_hgemm_*``                        gfx950 A16W16 GEMM kernels
   - ``flydsl_bpreshuflle_*``                  a8w8 preshuffle GEMM kernels
   - ``flydsl_bpreshuffle_8w_*``               gfx950 8-wave a8w8 ptpc GEMM kernels
@@ -99,6 +100,7 @@ DEFAULT_CSVS = [
     AITER_CONFIGS.AITER_CONFIG_A8W8_BATCHED_GEMM_FILE,
     AITER_CONFIGS.AITER_CONFIG_BF16_BATCHED_GEMM_FILE,
     AITER_CONFIGS.AITER_CONFIG_GEMM_BF16_FILE,
+    AITER_CONFIGS.AITER_CONFIG_GEMM_MXFP8_FILE,
 ]
 GEMM_AOT_ARCH_DEFAULT = "gfx950"
 
@@ -205,6 +207,18 @@ def parse_csv(csv_path: str):
                 if params is not None:
                     params = dict(params)
                     params["kind"] = "ptpc_wmma"
+            elif kernel_name.startswith("flydsl_mxfp8_"):
+                from aiter.ops.flydsl.gemm_mxfp8 import get_flydsl_mxfp8_kernel_params
+
+                params = get_flydsl_mxfp8_kernel_params(
+                    kernel_name, row.get("splitK", 1)
+                )
+                if params is None:
+                    raise ValueError(
+                        f"Invalid MXFP8 name/splitK pair: {kernel_name}, {row.get('splitK')}"
+                    )
+                if params is not None:
+                    params = dict(params, kind="mxfp8")
             elif kernel_name.startswith("flydsl_hgemm"):
                 params = get_flydsl_hgemm_kernel_params(kernel_name)
                 if params is not None:
@@ -373,6 +387,75 @@ def _compile_hgemm_to_cache(
             constexpr_param=param,
             compiler=flyc.compile,
             dispatch_args=dispatch_args,
+        )
+
+
+def _compile_mxfp8_to_cache(
+    *,
+    m,
+    n,
+    k,
+    out_dtype,
+    has_bias,
+    scale_block,
+    bpreshuffle,
+    scale_a_transposed,
+    target_gfx,
+    **kwargs,
+):
+    import torch
+
+    from aiter.ops.flydsl.gemm_mxfp8 import CONFIG_KEYS, mxfp8_kernel_config
+    from aiter.ops.flydsl.kernels.scaled_gemm_gfx950 import (
+        make_scaled_gemm_param_and_validate,
+        scaled_gemm_dispatch_args,
+        scaled_gemm_gfx950,
+    )
+
+    if target_gfx != "gfx950":
+        raise ValueError("FlyDSL MXFP8 AOT requires gfx950")
+    dtype = _torch_dtype_for_kernel(out_dtype)
+    config = {key: kwargs[key] for key in CONFIG_KEYS}
+    config = mxfp8_kernel_config(
+        config, dtype, has_bias, scale_block, bpreshuffle, scale_a_transposed
+    )
+    param = make_scaled_gemm_param_and_validate(m, n, k, config)
+    if param is None:
+        raise ValueError(f"Invalid MXFP8 AOT shape/config: {(m, n, k)}, {config}")
+    # Tiny real CPU tensors, never model-sized allocations or GPU launches.
+    # All extents/strides are dynamic except the unit-stride dimension.
+    with compile_only_env():
+        a = torch.empty((8, 128), dtype=torch.float8_e4m3fn, device="cpu")
+        b = torch.empty((16, 128), dtype=a.dtype, device="cpu").t()
+        out = torch.empty((8, 16), dtype=dtype, device="cpu")
+        sa = torch.empty((8, 8), dtype=torch.uint8, device="cpu")
+        if scale_a_transposed:
+            sa = sa.t()
+        sb = torch.empty((16, 8), dtype=torch.uint8, device="cpu")
+        bias = torch.empty(16, dtype=dtype, device="cpu") if has_bias else None
+        semaphore = torch.zeros(
+            SPLIT_K_SEMAPHORE_MAX_LEN, dtype=torch.int32, device="cpu"
+        )
+        signal = torch.zeros_like(semaphore)
+        args = scaled_gemm_dispatch_args(
+            out,
+            a,
+            b,
+            sa,
+            sb,
+            bias,
+            semaphore,
+            signal,
+            config["split_k"],
+            param,
+            fx.Stream(0),
+        )
+        run_cached(
+            scaled_gemm_gfx950,
+            *args,
+            constexpr_param=param,
+            compiler=flyc.compile,
+            dispatch_args=args,
         )
 
 
@@ -679,7 +762,9 @@ def compile_one_config(
 
     t0 = time.time()
     try:
-        tensor_context = nullcontext() if kind == "hgemm" else FakeTensorMode()
+        tensor_context = (
+            nullcontext() if kind in ("hgemm", "mxfp8") else FakeTensorMode()
+        )
         with (
             override_env("FLYDSL_GPU_ARCH", aot_arch),
             tensor_context,
@@ -688,6 +773,9 @@ def compile_one_config(
                 hgemm_kwargs = dict(kwargs)
                 hgemm_kwargs["target_gfx"] = aot_arch
                 _compile_hgemm_to_cache(m=m, n=n, k=k, **hgemm_kwargs)
+            elif kind == "mxfp8":
+                mxkwargs = dict(kwargs, target_gfx=aot_arch)
+                _compile_mxfp8_to_cache(m=m, n=n, k=k, **mxkwargs)
             elif kind == "preshuffle":
                 _compile_preshuffle_to_cache(m=m, n=n, k=k, **kwargs)
             elif kind == "8wave":
@@ -748,6 +836,7 @@ def main():
         ]
         print(f"[aiter] ARCH={arch}: {len(all_jobs)}/{n_before} jobs match")
 
+    mxfp8_jobs = [j for j in all_jobs if j["kind"] == "mxfp8"]
     hgemm_jobs = [j for j in all_jobs if j["kind"] == "hgemm"]
     preshuffle_jobs = [j for j in all_jobs if j["kind"] == "preshuffle"]
     eightwave_jobs = [j for j in all_jobs if j["kind"] == "8wave"]
@@ -759,6 +848,7 @@ def main():
     print("=" * 72)
     for csv_path in csv_paths:
         print(f"  CSV:              {csv_path}")
+    print(f"  MXFP8 jobs:       {len(mxfp8_jobs)}")
     print(f"  HGEMM jobs:       {len(hgemm_jobs)}")
     print(f"  Preshuffle jobs:  {len(preshuffle_jobs)}")
     print(f"  8wave jobs:       {len(eightwave_jobs)}")
@@ -777,6 +867,7 @@ def main():
     results = run_jobs_parallel(
         compile_one_config,
         hgemm_jobs
+        + mxfp8_jobs
         + preshuffle_jobs
         + eightwave_jobs
         + mxfp8_128_wmma_jobs

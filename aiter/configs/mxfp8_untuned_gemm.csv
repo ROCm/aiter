@@ -1,0 +1,4 @@
+M,N,K,outdtype,bias,scale_block,bpreshuffle,scale_a_transposed
+32,256,512,torch.bfloat16,False,32,False,False
+32,256,512,torch.bfloat16,False,32,True,False
+32,384,7168,torch.bfloat16,False,128,True,True
