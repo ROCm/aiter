@@ -45,6 +45,7 @@ from .kernels.utils import cdiv
 _PAGE16_VPIPE_ENV = "AITER_FLYDSL_PA_PAGE16_VPIPE"
 _PAGE16_VPIPE_IGLP_ENV = "AITER_FLYDSL_PA_PAGE16_VPIPE_IGLP"
 _MATCH_GLUON_NUMERICS_ENV = "AITER_FLYDSL_PA_MATCH_GLUON_NUMERICS"
+_PAGE128_EARLY_V_ENV = "AITER_FLYDSL_PA_PAGE128_EARLY_V"
 
 
 def _env_enabled(name: str) -> bool:
@@ -426,7 +427,7 @@ def pa_decode(
         _env_enabled(_MATCH_GLUON_NUMERICS_ENV)
         and arch == "gfx950"
         and head_dim == 128
-        and block_size == 16
+        and block_size in (16, 128)
         and trans_v
         and not per_token_kv
         and query.dtype == torch.bfloat16
@@ -436,8 +437,8 @@ def pa_decode(
     )
 
     # Early V loads help the measured one-to-two-workgroup-per-CU regime.
-    # Keep other grids on the existing schedule: early loads regress
-    # short-context decode at larger grid sizes.
+    # Keep other grids on the existing schedule by default; the opt-in override
+    # lets long-context under-filled grids be measured without changing policy.
     prefetch_v = page16_vpipe
     if (
         arch == "gfx950"
@@ -449,7 +450,9 @@ def pa_decode(
     ):
         num_cus = torch.cuda.get_device_properties(dev).multi_processor_count
         workgroups = num_seqs * num_kv_heads * num_partitions
-        prefetch_v = num_cus < workgroups <= 2 * num_cus
+        prefetch_v = _env_enabled(_PAGE128_EARLY_V_ENV) or (
+            num_cus < workgroups <= 2 * num_cus
+        )
 
     with torch.cuda.device(dev):
         compiled = compile_pa_decode_tile(

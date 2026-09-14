@@ -116,13 +116,13 @@ def compile_pa_decode_tile(
         assert (
             is_gfx950
             and head_dim == 128
-            and block_size == 16
+            and block_size in (16, 128)
             and trans_v
             and not per_token_kv
             and query_dtype == "bf16"
             and query_length == 1
             and query_group_size in (8, 16)
-        ), "matched Gluon numerics is restricted to the MiniMax-M3 page-16 shapes"
+        ), "matched Gluon numerics is restricted to the MiniMax-M3 page-16/page-128 shapes"
 
     assert (
         head_dim % 64 == 0
@@ -693,17 +693,11 @@ def compile_pa_decode_tile(
                         _f32_to_fp8_words(q_units[u].to(fx.Float32)),
                     )
             else:
-                absmax = (
-                    fmath.absf(q_units[0])
-                    .reduce(ReductionOp.MAX)
-                    .to(fx.Float32)
-                )
+                absmax = fmath.absf(q_units[0]).reduce(ReductionOp.MAX).to(fx.Float32)
                 for u in range_constexpr(1, N_QLOADS):
                     absmax = fx.maxnumf(
                         absmax,
-                        fmath.absf(q_units[u])
-                        .reduce(ReductionOp.MAX)
-                        .to(fx.Float32),
+                        fmath.absf(q_units[u]).reduce(ReductionOp.MAX).to(fx.Float32),
                     )
                 for sh in (8, 4, 2, 1):
                     absmax = fx.maxnumf(absmax, dpp_utils.dpp_xor_f32(absmax, sh))
@@ -869,9 +863,7 @@ def compile_pa_decode_tile(
             tok0 = tt * TILE_TOK
             # per_tensor phase-split: let IGLP interleave MFMA with softmax
             # VALU/LDS to hide the MFMA-hazard s_nop (per_token is VGPR-cliffed).
-            if const_expr(
-                (not per_token_kv and M_TILES > 1) or PAGE16_VPIPE_IGLP
-            ):
+            if const_expr((not per_token_kv and M_TILES > 1) or PAGE16_VPIPE_IGLP):
                 fx.rocdl.iglp_opt(0)
 
             tt1 = tt + 1
