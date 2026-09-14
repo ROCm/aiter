@@ -42,6 +42,9 @@ class TpIncrementalWorkspace:
         self.received = mori_shmem_create_tensor((num_experts,), torch.int32)
         self.ranks_done = mori_shmem_create_tensor((1,), torch.int32)
         self.local_prod_done = torch.zeros(1, dtype=torch.int32, device=device)
+        self.work_cursor = torch.zeros(1, dtype=torch.int32, device=device)
+        self.expert0_done = torch.zeros(1, dtype=torch.int32, device=device)
+        self.overlap = torch.zeros(1, dtype=torch.int32, device=device)
         self.rx_u8.zero_()
         self.rx_scale.zero_()
         self.received.zero_()
@@ -62,6 +65,9 @@ class TpIncrementalWorkspace:
         self.received.zero_()
         self.ranks_done.zero_()
         self.local_prod_done.zero_()
+        self.work_cursor.zero_()
+        self.expert0_done.zero_()
+        self.overlap.zero_()
         ms.shmem_barrier_all()
 
 
@@ -110,6 +116,11 @@ def compile_tp_incremental_push(
             addr_p2p_received=fx.Int64(fx.ptrtoint(fx.get_iter(p2p_received))),
             addr_p2p_ranks_done=fx.Int64(fx.ptrtoint(fx.get_iter(p2p_ranks_done))),
             addr_local_prod_done=fx.Int64(fx.ptrtoint(fx.get_iter(local_prod_done))),
+            skew_rank=fx.Int32(-1),
+            skew_split=fx.Int32(0),
+            skew_sleeps=fx.Int32(0),
+            addr_expert0_done=fx.Int64(fx.ptrtoint(fx.get_iter(local_prod_done))),
+            addr_overlap=fx.Int64(fx.ptrtoint(fx.get_iter(local_prod_done))),
         )
         if tid == fx.Int32(0):
             comm_ops.spin_until_eq_i32(

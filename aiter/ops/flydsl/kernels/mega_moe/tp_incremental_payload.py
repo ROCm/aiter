@@ -6,6 +6,8 @@ Step 2 host-prefill: ``payload_ready[e] == expected[e]`` before launch.
 Step 3 producers push each local token once to every peer's dense row
 ``rank * m_local + t`` (or row-major for the negative control), then
 ``atomic_add`` ``received[e]`` for each unique topk expert.
+Step 4 consumers wait ``received[e] == expected[e]`` while producers
+continue; rank-0 can delay the second-half min-expert prefix to prove overlap.
 """
 
 from __future__ import annotations
@@ -73,6 +75,7 @@ def emit_tp_incremental_payload(
     *, npes, rank, topk, model_dim, row_major, producer_slot, num_producers, m_local,
     addr_in_tok, addr_in_sc, addr_ids, addr_order, addr_p2p_rx, addr_p2p_sc,
     addr_p2p_received, addr_p2p_ranks_done, addr_local_prod_done,
+    skew_rank, skew_split, skew_sleeps, addr_expert0_done, addr_overlap,
 ):
 # fmt: on
     """Push this rank's tokens in min-expert order; each token is sent once."""
@@ -90,32 +93,65 @@ def emit_tp_incremental_payload(
     r_p2p_sc = crfa(addr_p2p_sc)
     r_p2p_received = crfa(addr_p2p_received)
     r_p2p_ranks_done = crfa(addr_p2p_ranks_done)
+    delayed = fx.Int32(0)
 
     for i in range(producer_slot, m_local, fx.Int32(num_producers)):
         local_row = buffer_ops.buffer_load(r_order, i, vec_width=1, dtype=fx.Int32)
+        if (tid == fx.Int32(0)) & (
+            (fx.Int32(rank) == skew_rank)
+            & (skew_sleeps > fx.Int32(0))
+            & (delayed == fx.Int32(0))
+        ):
+            min_e = buffer_ops.buffer_load(
+                r_ids, local_row * fx.Int32(topk), vec_width=1, dtype=fx.Int32
+            )
+            for k in range_constexpr(topk):
+                ek = buffer_ops.buffer_load(
+                    r_ids,
+                    local_row * fx.Int32(topk) + fx.Int32(k),
+                    vec_width=1,
+                    dtype=fx.Int32,
+                )
+                min_e = (ek < min_e).select(ek, min_e)
+            if min_e >= skew_split:
+                n = fx.Int32(0)
+                seen = fx.Int32(0)
+                while n < skew_sleeps:
+                    fx.rocdl.s_sleep(127)
+                    n = n + fx.Int32(1)
+                    cur = fx.Int32(comm_ops.load_i32_acquire(addr_expert0_done))
+                    if cur == fx.Int32(1):
+                        seen = fx.Int32(1)
+                if seen == fx.Int32(1):
+                    comm_ops.store_i32_system(addr_overlap, fx.Int32(0), fx.Int32(1))
+                delayed = fx.Int32(1)
+        fx.barrier()
         if const_expr(row_major):
             dest_row = local_row * fx.Int32(npes) + fx.Int32(rank)
         else:
             dest_row = fx.Int32(rank) * m_local + local_row
         src_tok = crfa(addr_in_tok + fx.Int64(local_row) * fx.Int64(row_bytes))
         src_sc = addr_in_sc + fx.Int64(local_row) * fx.Int64(n_scale_bytes)
-        for peer in range_constexpr(npes):
-            rx_base = buffer_ops.buffer_load(
-                r_p2p_rx, fx.Int32(peer), vec_width=1, dtype=fx.Int64
-            )
-            sc_base = buffer_ops.buffer_load(
-                r_p2p_sc, fx.Int32(peer), vec_width=1, dtype=fx.Int64
-            )
-            dst_tok = crfa(fx.Int64(rx_base) + fx.Int64(dest_row) * fx.Int64(row_bytes))
-            dst_sc = fx.Int64(sc_base) + fx.Int64(dest_row) * fx.Int64(n_scale_bytes)
-            _copy_token_row(
-                src_tok,
-                dst_tok,
-                lane,
-                fz_safe_end_i32=safe_end,
-                fz_n_i32=n_i32,
-            )
-            _copy_scale_row(src_sc, dst_sc, lane, n_scale_i32)
+        if tid < fx.Int32(64):
+            for peer in range_constexpr(npes):
+                rx_base = buffer_ops.buffer_load(
+                    r_p2p_rx, fx.Int32(peer), vec_width=1, dtype=fx.Int64
+                )
+                sc_base = buffer_ops.buffer_load(
+                    r_p2p_sc, fx.Int32(peer), vec_width=1, dtype=fx.Int64
+                )
+                dst_tok = crfa(
+                    fx.Int64(rx_base) + fx.Int64(dest_row) * fx.Int64(row_bytes)
+                )
+                dst_sc = fx.Int64(sc_base) + fx.Int64(dest_row) * fx.Int64(n_scale_bytes)
+                _copy_token_row(
+                    src_tok,
+                    dst_tok,
+                    lane,
+                    fz_safe_end_i32=safe_end,
+                    fz_n_i32=n_i32,
+                )
+                _copy_scale_row(src_sc, dst_sc, lane, n_scale_i32)
         fx.rocdl.s_waitcnt(0)
         fx.barrier()
         if tid == fx.Int32(0):
