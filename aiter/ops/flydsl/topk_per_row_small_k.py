@@ -104,10 +104,10 @@ def _plan(k: int, width: int, wave_size: int, forced_blocks: bool):
         k,
         _row_bucket(width),
         wave_size,
-        # Compile the forced-block pins in only for callers that use them: they
-        # are six of the eighteen instructions spent per element, and the row
-        # read is what a wide row costs -- worth 1.07x at 4096 columns rising to
-        # 1.29x at 16384. Keyword so every call lands on one `cache` entry.
+        # Compile the forced-block pins in only for callers that use them: six
+        # instructions per element, and the row read is what a wide row costs --
+        # worth 1.07x at 4096 columns rising to 1.29x at 16384. Keyword so every
+        # call lands on one `cache` entry.
         forced_blocks=forced_blocks,
     )
 

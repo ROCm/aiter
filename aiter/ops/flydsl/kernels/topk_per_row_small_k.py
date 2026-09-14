@@ -36,7 +36,7 @@ replaces: equal scores are common (a block score is a max over 128 keys from a
 low-mantissa cache) and that is the order attention accumulates in.
 """
 
-from functools import cache
+from functools import cache, reduce
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
@@ -180,10 +180,10 @@ def build_topk_per_row_small_k_module(
     `prefetch_vecs` is how many of a thread's 128-bit reads are issued before
     any of them is used; see `_PREFETCH_VECS`.
 
-    `forced_blocks` compiles in the leading/trailing pins: six of the eighteen
-    instructions spent per element, on every element, whether or not a caller
-    uses them. The inner loop is the whole cost at a wide row -- its marginal
-    rate is 3.4 TB/s against the 5.7-5.8 the other two selectors reach.
+    `forced_blocks` compiles in the leading/trailing pins: six instructions per
+    element, on every element, whether or not a caller uses them. The inner loop
+    is the whole cost at a wide row -- its marginal rate is 3.4 TB/s against the
+    5.7-5.8 the other two selectors reach.
 
     `block_threads` defaults to the narrowest block that covers the row in one
     round of 128-bit loads, capped at `_BLOCK_THREADS` -- or `_WIDE_BLOCK_THREADS`
@@ -282,27 +282,46 @@ def build_topk_per_row_small_k_module(
         # exposing each latency in turn. Latency-bound, not bandwidth-bound: at
         # k=1 over 32768 columns this loop alone runs 4.1 TB/s against 5.8.
         ords = fx.make_rmem_tensor(elems_per_thread, Int32)
-        cols = fx.make_rmem_tensor(elems_per_thread, Int32)
-        my_max = neg_inf
+        # Thread t's slot (v, j) is column `tid * _VEC + (v * block_threads *
+        # _VEC + j)`, and the bracket is a compile-time constant -- so the
+        # columns are one add from `col_base` and need no register tile of their
+        # own. That halves the tile, on a kernel whose row read is latency-bound
+        # and therefore occupancy-bound: 64 registers of tile at the widest bound
+        # become 32.
+        col_base = tid * Int32(_VEC)
+
+        def col_of(v, j):
+            return col_base + Int32(v * block_threads * _VEC + j)
+
+        # One accumulator per vector lane, so the running maximum chains once per
+        # vector rather than once per element -- 32 deep at the widest bound
+        # otherwise. Splitting costs the fold at the end, `_VEC - 1` extra
+        # maxima, which is only earned back when a thread holds more than one
+        # vector: at exactly one it shortens nothing and measured 7% slower.
+        n_acc = _VEC if vec_per_thread > 1 else 1
+        lane_max = [neg_inf] * n_acc
         group = min(prefetch_vecs, vec_per_thread)
         for base in range_constexpr((vec_per_thread + group - 1) // group):
             width = min(group, vec_per_thread - base * group)
             fragments = []
             for u in range_constexpr(width):
-                vec_idx = tid + Int32((base * group + u) * block_threads)
-                in_row = vec_idx < Int32(vectors)
-                src = fx.slice(score_row, (None, in_row.select(vec_idx, zero)))
+                # No bounds test on the address: the descriptor is built over
+                # this row alone, so its `num_records` already clamps a read past
+                # the end to zero, and the liveness test below discards it.
+                src = fx.slice(
+                    score_row, (None, tid + Int32((base * group + u) * block_threads))
+                )
                 fragment = fx.make_fragment_like(src)
                 fx.copy(buf_copy_atom(16, Float32), src, fragment)
                 fragments.append(fragment)
             for u in range_constexpr(width):
                 v = base * group + u
-                vec_idx = tid + Int32(v * block_threads)
-                in_row = vec_idx < Int32(vectors)
                 loaded = fx.Vector(fx.memref_load_vec(fragments[u]))
                 for j in range_constexpr(_VEC):
-                    col = vec_idx * Int32(_VEC) + Int32(j)
-                    live = in_row & (col < row_len)
+                    col = col_of(v, j)
+                    # `col < row_len` alone: a column past this thread's vectors
+                    # is at least `n_max`, which already bounds `row_len`.
+                    live = col < row_len
                     value = loaded[j]
                     if const_expr(forced_blocks):
                         value = (live & (col < init_blocks)).select(
@@ -316,8 +335,8 @@ def build_topk_per_row_small_k_module(
                     # takes the bottom of the key space. A real NaN now takes the
                     # top, so the two no longer collide.
                     ords[slot] = live.select(_ord_signed(value), neg_inf)
-                    cols[slot] = live.select(col, Int32(-1))
-                    my_max = fx.max(my_max, ords[slot])
+                    lane_max[j % n_acc] = fx.max(lane_max[j % n_acc], ords[slot])
+        my_max = reduce(fx.max, lane_max)
 
         chunk_max[tid] = my_max
         if tid == zero:
@@ -373,10 +392,11 @@ def build_topk_per_row_small_k_module(
         )
         in_chosen = ((mask >> Int64(lane)) & Int64(1)) == Int64(1)
         for slot in range_constexpr(elems_per_thread):
-            if in_chosen & _uge(ords[slot] ^ neg_inf, cut) & (cols[slot] >= zero):
+            col = col_of(slot // _VEC, slot % _VEC)
+            if in_chosen & _uge(ords[slot] ^ neg_inf, cut) & (col < row_len):
                 at = atomic_add_i32(state, one, _ST_COUNT, "workgroup")
                 surv_ord[at] = ords[slot]
-                surv_col[at] = cols[slot]
+                surv_col[at] = col
         gpu.barrier()
 
         # --- 4. Rank the survivors; the rank is the output slot. -------------
