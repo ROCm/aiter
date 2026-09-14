@@ -51,8 +51,9 @@ def test_varlen_stride_dispatch_parity(
         ]
         for n, h in ((nq, 8), (nk, 2), (nk, 2))
     ]
-    cuq = torch.tensor([0, nq], device=q.device, dtype=torch.int32)
-    cuk = torch.tensor([0, nk], device=q.device, dtype=torch.int32)
+    # Contiguous metadata with a nonzero storage offset is still legal.
+    cuq = torch.tensor([-1, 0, nq], device=q.device, dtype=torch.int32)[1:]
+    cuk = torch.tensor([-1, 0, nk], device=q.device, dtype=torch.int32)[1:]
     invoke = partial(
         mha.flash_attn_varlen_func,
         q,
@@ -107,6 +108,30 @@ def test_varlen_stride_dispatch_parity(
         torch.cuda.synchronize()
         torch.testing.assert_close(captured, control, rtol=0, atol=0)
         assert mha._USE_INT64_STRIDES is True
+
+
+@pytest.mark.parametrize("which", ["q", "k"])
+@pytest.mark.parametrize("layout", ["strided", "matrix"])
+def test_invalid_sequence_metadata_rejected(which, layout, stride_widths):
+    q = torch.randn(17, 4, 128, device="cuda", dtype=torch.bfloat16)
+    lengths = torch.tensor([0, 17], device=q.device, dtype=torch.int32)
+    invalid = (
+        torch.tensor([0, -1, 17, -1], device=q.device, dtype=torch.int32)[::2]
+        if layout == "strided"
+        else lengths.view(1, 2)
+    )
+    with pytest.raises(ValueError, match=f"contiguous 1D cu_seqlens_{which}"):
+        mha.flash_attn_varlen_func(
+            q,
+            q,
+            q,
+            invalid if which == "q" else lengths,
+            invalid if which == "k" else lengths,
+            17,
+            17,
+            prefer_int32_strides=True,
+        )
+    assert stride_widths == []
 
 
 def test_training_preserves_int64_and_gradients(stride_widths):

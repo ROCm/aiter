@@ -1328,7 +1328,10 @@ def flash_attn_varlen_func(
             q_descale/k_descale/v_descale.
         prefer_int32_strides: opt in to metadata-guarded int32 addressing for
             the default Triton varlen inference implementation. Unsupported
-            layouts and training retain int64. Gluon and dao_ai reject this
+            Q/K/V layouts and training retain int64. Cumulative lengths must
+            be contiguous one-dimensional tensors; invalid metadata is
+            rejected because the kernel does not consume metadata strides.
+            Gluon and dao_ai reject this
             option. Available through this Triton module, not the top-level
             aiter.flash_attn_varlen_func router.
     Return:
@@ -1350,6 +1353,14 @@ def flash_attn_varlen_func(
         raise ValueError(
             "prefer_int32_strides requires the default Triton implementation"
         )
+    if prefer_int32_strides:
+        for name, lengths in (
+            ("cu_seqlens_q", cu_seqlens_q),
+            ("cu_seqlens_k", cu_seqlens_k),
+        ):
+            # The kernel advances these pointers by one, regardless of index width.
+            if lengths.ndim != 1 or not lengths.is_contiguous():
+                raise ValueError(f"prefer_int32_strides requires contiguous 1D {name}")
     _LOGGER.info(
         f"FLASH_ATTN_VARLEN [{backend}]:  q={tuple(q.shape)}  k={tuple(k.shape)}  v={tuple(v.shape)}"
     )
