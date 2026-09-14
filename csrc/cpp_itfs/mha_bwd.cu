@@ -460,6 +460,11 @@ float fmha_v3_bwd(mha_bwd_args a, const ck_tile::stream_config& s)
         AITER_LOG_WARNING("fmha_v3_bwd: unsupported mask type for asm kernels.");
         return -1;
     }
+    // gfx950 hd256 only has mask=0 (non-causal) kernels in the CSV
+    if(arch_id == "gfx950" && a.hdim_q == 256 && mt != 0)
+    {
+        return -1;
+    }
     // On gfx942, a16 (atomic32=0) has no mask_type=2 (bottom-right causal) kernels,
     // only mask_type=1 (top-left causal). When seqlen_q == seqlen_k the two masks
     // are mathematically equivalent, so we can safely convert 2 → 1 to hit the
@@ -694,7 +699,9 @@ float fmha_v3_bwd(mha_bwd_args a, const ck_tile::stream_config& s)
     auto dqdkdv_kernel_launch = [&]() {
         arg_size                  = sizeof(dqdkdv_args);
         int bdx = (arch_id == "gfx1250") ? 128 : (a.hdim_q >= 256 ? 512 : 256);
-        int gdx = (a.max_seqlen_k + ts_kv - 1) / ts_kv;
+        int gdx_kv = (a.max_seqlen_k + ts_kv - 1) / ts_kv;
+        int gdx_q  = (a.max_seqlen_q + ts_kv - 1) / ts_kv;
+        int gdx = std::max(gdx_kv, gdx_q);
         int gdy = a.nhead_q;
         int gdz = a.batch;
 
