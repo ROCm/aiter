@@ -420,29 +420,17 @@ class AITER_CONFIG:
                     .index
                 )
 
-                saved_files = []
-                offset = 0
-                for src_path, src_df in source_pairs:
-                    start, end = offset, offset + len(src_df)
-                    offset = end
-                    file_rows = merge_df.iloc[start:end]
-                    new_src_df = file_rows[
-                        file_rows.index.isin(best_row_index)
-                    ].reset_index(drop=True)
-                    if len(new_src_df) < len(src_df):
-                        new_src_df.to_csv(src_path, index=False)
-                        saved_files.append(
-                            f"  {src_path}: {len(src_df)} -> {len(new_src_df)} rows"
-                        )
-                saved_info = (
-                    "\n".join(saved_files) if saved_files else "  (no files updated)"
-                )
-                raise RuntimeError(
-                    f"Found {dup_count} duplicate shape entries during merge of '{merge_name}'. "
-                    f"Auto-resolved by keeping best performing (lowest 'us') for each shape "
-                    f"and saved back to source config files. Please re-run.\n"
-                    f"Duplicate rows:\n{dup_rows.to_string(index=False)}\n"
-                    f"Updated files:\n{saved_info}"
+                # Installed configuration files may be read-only (e.g. Bazel
+                # runfiles). Resolve collisions only in the merged cache; do
+                # not rewrite package data or require a second invocation.
+                merge_df = merge_df.loc[
+                    merge_df.index.isin(best_row_index)
+                ].reset_index(drop=True)
+                logger.warning(
+                    "Resolved %s duplicate shape entries while merging '%s'; "
+                    "keeping the lowest-us entry without modifying source files.",
+                    dup_count,
+                    merge_name,
                 )
         else:
             logger.warning(

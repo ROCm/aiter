@@ -1,39 +1,14 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
-"""
-Cross-file shape-collision guard for tuned config CSVs.
+"""Exercise runtime tuned-config merging against isolated copies.
 
-At runtime ``aiter.jit.core.AITER_CONFIGS.get_config_file`` merges, per family,
-the canonical ``aiter/configs/<name>.csv`` with every
-``aiter/configs/model_configs/*<name>*.csv``, then ``update_config_files``
-de-duplicates on a key derived from the matching *untuned* CSV's columns and
-**raises** if two rows collide.
-
-A single PR's CI only ever merges *its own* changed file with current ``main``,
-so two PRs that each add the same shape to different model files both pass, then
-break ``main`` once both land (cross-PR / merge-skew hazard). This test drives
-the **real runtime merge** so the collision is caught statically -- there is no
-re-implementation of the merge/dedup/key logic here, so it cannot drift.
-
-How it stays side-effect free: ``update_config_files`` writes de-duplicated CSVs
-back to their source paths when it finds collisions. We copy the entire
-``aiter/configs/`` tree to a temp dir and point ``core.AITER_ROOT_DIR`` at it, so
-all globbing, untuned-key lookups, and any write-backs hit the copy, never the
-real repo.
-
-Requires torch (importing ``aiter`` pulls it in); it does not need a GPU. It is
-**not yet wired into any CI workflow** -- run it manually in a torch-enabled
-environment, or add it to a suitable job (e.g. the CPU/level01 tuning tests) to
-make it an actual PR/main regression guard.
-
-Run:
-    python3 -m unittest op_tests.tuning_tests.test_config_shape_collision -v
+Duplicate shapes with timings are resolved in memory; source files remain
+unchanged. This module no longer rewrites repository configuration files.
 """
 
 import csv
 import os
 import shutil
-import sys
 import tempfile
 import unittest
 
@@ -168,17 +143,8 @@ class TestConfigShapeCollision(unittest.TestCase):
             _cache_clear()
             shutil.rmtree(tmp, ignore_errors=True)
 
-    def test_selfcheck_detects_planted_duplicate(self):
-        """Positive control: a planted duplicate MUST be caught. If not, the
-        detection harness (temp copy / AITER_ROOT_DIR redirect / merge call) is
-        broken -- not the real config data."""
-        err = self._run_synthetic(dup=True)
-        self.assertIsNotNone(
-            err,
-            "harness FAILED to detect a planted duplicate shape -- the collision "
-            "check is broken; do not trust its PASS on real configs.",
-        )
-        self.assertIn("duplicate shape", err.lower())
+    def test_selfcheck_resolves_planted_duplicate(self):
+        self.assertIsNone(self._run_synthetic(dup=True))
 
     def test_selfcheck_passes_on_clean(self):
         """Negative control: distinct shapes must NOT be flagged (no false
@@ -255,46 +221,5 @@ class TestConfigShapeCollision(unittest.TestCase):
         self._check_family("AITER_CONFIG_GDN_K5_OPT", "chunk_gdn_h_opt_tuned")
 
 
-def _fix_real_tree():
-    """Resolve every family against the REAL checkout (not a temp copy) so
-    `update_config_files`' existing auto-dedup (keep lowest-`us` per shape) writes
-    the pruned CSVs back to the actual source files. Prints what changed; commit
-    the result and re-run without --fix to confirm clean.
-
-    This adds NO dedup logic -- it just triggers the write-back that
-    aiter/jit/core.py::update_config_files already performs, on real files."""
-    if core is None:
-        raise SystemExit(f"aiter.jit.core not importable: {_IMPORT_ERR}")
-    core.AITER_ROOT_DIR = AITER_ROOT  # operate on this checkout's real configs
-    fixed = []
-    for env_name, name in FAMILIES:
-        os.environ.pop(env_name, None)
-        _cache_clear()
-        default_file = os.path.join(AITER_ROOT, "aiter", "configs", f"{name}.csv")
-        try:
-            core.AITER_CONFIGS.get_config_file(env_name, default_file, name)
-        except RuntimeError as e:
-            if "duplicate shape" in str(e).lower():
-                fixed.append((name, str(e)))
-            else:
-                raise
-    if not fixed:
-        print("No duplicate shapes found; nothing to fix.")
-        return
-    print(f"Resolved duplicate shapes in {len(fixed)} family(ies):\n")
-    for name, msg in fixed:
-        print(f"### {name}\n{msg}\n")
-    print(
-        "Source CSVs were rewritten (lowest-`us` row kept per shape). "
-        "Review `git diff`, commit, then re-run without --fix to confirm clean."
-    )
-
-
 if __name__ == "__main__":
-    if "--fix" in sys.argv:
-        # Modify the REAL config files in place. Read-only detection (the default)
-        # runs on a temp copy; --fix intentionally writes back to the checkout.
-        sys.argv.remove("--fix")
-        _fix_real_tree()
-    else:
-        unittest.main(verbosity=2)
+    unittest.main(verbosity=2)
