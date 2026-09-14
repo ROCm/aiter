@@ -50,7 +50,8 @@ template<int BLOCK_SIZE_,
         int CACHECTL_A_ = 0,
         int CACHECTL_B_ = 17,
         int SWIZZLE_W_ = 8,
-        int SWIZZLE_C_ = 32>
+        int SWIZZLE_C_ = 32,
+        int NUM_XCD_ = 8>
 struct opus_gemm_a16w16_traits_gfx950 {
     using BLOCK = opus::remove_cvref_t<BLOCK_>;
     using DTYPE = opus::remove_cvref_t<DTYPE_>;
@@ -118,8 +119,9 @@ struct opus_gemm_a16w16_traits_gfx950 {
     static constexpr int CACHECTL_A = CACHECTL_A_;
     static constexpr int CACHECTL_B = CACHECTL_B_;
 
-    // HipKittens XCD swizzle parameters (Algorithm 1, MI350 = 8 XCDs)
-    static constexpr int NUM_XCD = 8;
+    // HipKittens XCD swizzle parameters (Algorithm 1); the die count is that
+    // of the part this instance is built for.
+    static constexpr int NUM_XCD = NUM_XCD_;
     static constexpr int SWIZZLE_W = SWIZZLE_W_;
     static constexpr int SWIZZLE_C = SWIZZLE_C_;
 };
