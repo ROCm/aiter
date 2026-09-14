@@ -496,27 +496,27 @@ def _compile_moe_sorting_oneshot(
             _lds_store_raw(cumdup_mr, c_zero_i32, c_zero_i32)
             gpu.barrier()
 
-            # DPP prefix sum — all NUM_WAVES waves active
-            ps_tid_valid = tid < c_E
-            val = ps_tid_valid.select(
-                _lds_load_raw(cumdup_mr, tid + c_one_i32), c_zero_i32
-            )
-            _, inclusive_ps = _allwave_inclusive_prefix_sum(
-                val, lane, wave, scratch_mr, NUM_WAVES, WARP_SIZE
-            )
-            _lds_store_raw(
-                cumdup_mr,
-                ps_tid_valid.select(inclusive_ps, c_zero_i32),
-                ps_tid_valid.select(tid + c_one_i32, c_zero_i32),
-            )
-            gpu.barrier()
-
-            # For E > ONESHOT_BLOCK: thread 0 serially extends
-            if E > ONESHOT_BLOCK:
-                if is_t0:
-                    _extend_prefix_sum_serial(
-                        cumdup_mr, ONESHOT_BLOCK, E, _lds_load_raw, _lds_store_raw
+            # Scan every expert chunk in parallel. Previously only the first
+            # block was scanned and thread 0 serially extended E > block_size,
+            # which is especially costly for K3's 897-expert decode domain.
+            for _ps_chunk in range_constexpr(0, E, ONESHOT_BLOCK):
+                ps_eid = fx.Int32(_ps_chunk) + tid
+                ps_valid = ps_eid < c_E
+                val = ps_valid.select(
+                    _lds_load_raw(cumdup_mr, ps_eid + c_one_i32), c_zero_i32
+                )
+                _, inclusive_ps = _allwave_inclusive_prefix_sum(
+                    val, lane, wave, scratch_mr, NUM_WAVES, WARP_SIZE
+                )
+                if _ps_chunk > 0:
+                    inclusive_ps = inclusive_ps + _lds_load_raw(
+                        cumdup_mr, fx.Int32(_ps_chunk)
                     )
+                _lds_store_raw(
+                    cumdup_mr,
+                    ps_valid.select(inclusive_ps, c_zero_i32),
+                    ps_valid.select(ps_eid + c_one_i32, c_zero_i32),
+                )
                 gpu.barrier()
 
             # cumdup[0] = 0
@@ -552,26 +552,25 @@ def _compile_moe_sorting_oneshot(
                 _lds_store_raw(cumdup_mr, c_zero_i32, c_zero_i32)
                 gpu.barrier()
 
-                # All-wave DPP prefix sum over mask values in cumdup
-                m_tid_valid = tid < c_E
-                mval = m_tid_valid.select(
-                    _lds_load_raw(cumdup_mr, tid + c_one_i32), c_zero_i32
-                )
-                _, inclusive_m = _allwave_inclusive_prefix_sum(
-                    mval, lane, wave, scratch_mr, NUM_WAVES, WARP_SIZE
-                )
-                _lds_store_raw(
-                    cumdup_mr,
-                    m_tid_valid.select(inclusive_m, c_zero_i32),
-                    m_tid_valid.select(tid + c_one_i32, c_zero_i32),
-                )
-                gpu.barrier()
-
-                if E > ONESHOT_BLOCK:
-                    if is_t0:
-                        _extend_prefix_sum_serial(
-                            cumdup_mr, ONESHOT_BLOCK, E, _lds_load_raw, _lds_store_raw
+                # All-wave DPP prefix sum over every mask chunk.
+                for _m_chunk in range_constexpr(0, E, ONESHOT_BLOCK):
+                    m_eid = fx.Int32(_m_chunk) + tid
+                    m_valid = m_eid < c_E
+                    mval = m_valid.select(
+                        _lds_load_raw(cumdup_mr, m_eid + c_one_i32), c_zero_i32
+                    )
+                    _, inclusive_m = _allwave_inclusive_prefix_sum(
+                        mval, lane, wave, scratch_mr, NUM_WAVES, WARP_SIZE
+                    )
+                    if _m_chunk > 0:
+                        inclusive_m = inclusive_m + _lds_load_raw(
+                            cumdup_mr, fx.Int32(_m_chunk)
                         )
+                    _lds_store_raw(
+                        cumdup_mr,
+                        m_valid.select(inclusive_m, c_zero_i32),
+                        m_valid.select(m_eid + c_one_i32, c_zero_i32),
+                    )
                     gpu.barrier()
 
                 _lds_store_raw(cumdup_mr, c_zero_i32, c_zero_i32)
