@@ -141,7 +141,7 @@ def launch_mla_pagesize1_fp8_fp8(
     q_row_stride = num_q_heads * Q_HEAD_STRIDE
     output_lds_bytes = max_seqlen_q * num_q_heads * V_HEAD_DIM * 4
     lds_total_bytes = max(KV_RING_BYTES, output_lds_bytes)
-    
+
     assert (
         lds_total_bytes <= lds_size
     ), f"Kernel requires {lds_total_bytes} bytes LDS but CU budget is {lds_size}"
@@ -796,14 +796,13 @@ def launch_mla_pagesize1_fp8_fp8(
             tdm_ops.tensor_wait(0)
             gpu.barrier()
 
-            def stage_output_lds(as_bf16):
+            def stage_output_lds(as_bf16, accs, scale, q_valid):
                 """Stage this wave's slice of the [q_pos, head, Dv] tile in LDS."""
                 elem_bytes = 2 if as_bf16 else 4
                 for d_tile in range_constexpr(pv_d_tiles_per_wave):
                     global_d_tile = dv_wave * pv_d_tiles_per_wave + d_tile
                     output_values = [
-                        reg_output_accs[d_tile][i] * output_scale
-                        for i in range_constexpr(PV_ACC_DWORDS)
+                        accs[d_tile][i] * scale for i in range_constexpr(PV_ACC_DWORDS)
                     ]
                     row_base = (q_pos * num_q_heads + head) * (V_HEAD_DIM * elem_bytes)
                     dim_base = global_d_tile * 16 + lane_half * PV_ACC_DWORDS
@@ -813,7 +812,7 @@ def launch_mla_pagesize1_fp8_fp8(
                             .to(fx.BFloat16)
                             .bitcast(fx.Int32)
                         )
-                        if valid_q_pos:
+                        if q_valid:
                             lds_store_b128(row_base + dim_base * 2, packed)
                     else:
                         for half in range_constexpr(2):
@@ -824,15 +823,15 @@ def launch_mla_pagesize1_fp8_fp8(
                                 ],
                                 fx.Float32,
                             ).bitcast(fx.Int32)
-                            if valid_q_pos:
+                            if q_valid:
                                 lds_store_b128(
                                     row_base + (dim_base + half * 4) * 4,
                                     output_dwords,
                                 )
 
-            def copy_output_to_global(ptr_out, elem_ty, tile_base):
+            def copy_output_to_global(ptr_out, elem_ty, tile_base, q_len):
                 rows = max_seqlen_q * num_q_heads
-                valid_rows = work_q_len * num_q_heads
+                valid_rows = q_len * num_q_heads
                 layout = fx.make_layout((rows, V_HEAD_DIM), (V_HEAD_DIM, 1))
                 lds_view = fx.Tensor(
                     fx.make_view(
@@ -866,20 +865,18 @@ def launch_mla_pagesize1_fp8_fp8(
                 fx.Float32(float("-inf")),
             )
 
-            def write_lse(ptr_dst, row_base):
+            def write_lse(ptr_dst, row_base, q_valid, value):
                 """Store this work item's log-sum-exp for its own q rows."""
-                if valid_q_pos:
-                    if dv_wave == 0:
-                        if lane_half == 0:
-                            ptr_dst[(row_base + q_pos) * num_q_heads + head] = lse_value
+                if q_valid and dv_wave == 0 and lane_half == 0:
+                    ptr_dst[(row_base + q_pos) * num_q_heads + head] = value
 
             writes_partial = partial_qo_loc >= fx.Int32(0)
             head_tile_elems = num_q_heads * V_HEAD_DIM
 
             if writes_partial:
-                stage_output_lds(as_bf16=False)
+                stage_output_lds(False, reg_output_accs, output_scale, valid_q_pos)
             else:
-                stage_output_lds(as_bf16=True)
+                stage_output_lds(True, reg_output_accs, output_scale, valid_q_pos)
             rocdl.s_wait_dscnt(0)
             gpu.barrier()
 
@@ -888,18 +885,20 @@ def launch_mla_pagesize1_fp8_fp8(
                     ptr_r,
                     fx.Float32,
                     fx.Int64(partial_qo_loc) * head_tile_elems,
+                    work_q_len,
                 )
-                write_lse(ptr_lse, partial_qo_loc)
+                write_lse(ptr_lse, partial_qo_loc, valid_q_pos, lse_value)
             else:
                 copy_output_to_global(
                     ptr_final,
                     fx.BFloat16,
                     fx.Int64(qo_start) * head_tile_elems,
+                    work_q_len,
                 )
                 # An un-split work item covers its whole KV run, so this is
                 # already the merged LSE; the reduce never revisits these rows.
                 if const_expr(write_final_lse):
-                    write_lse(ptr_final_lse, qo_start)
+                    write_lse(ptr_final_lse, qo_start, valid_q_pos, lse_value)
             tdm_ops.tensor_wait(0)
             gpu.barrier()
 
