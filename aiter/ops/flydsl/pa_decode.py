@@ -26,6 +26,8 @@ One CTA (4 waves) per (seq, kv_head) runs a flash-style online softmax over
 an LDS round-trip on P transposing ownership between the two MMAs.
 """
 
+import os
+
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 import torch
@@ -36,6 +38,17 @@ from .kernels.pa_decode_reduce import compile_pa_decode_ps_reduce
 from .kernels.pa_decode_tile import KV_COMPUTE_BLOCK, compile_pa_decode_tile
 from .kernels.tensor_shim import _run_compiled, ptr_arg
 from .kernels.utils import cdiv
+
+_PAGE16_VPIPE_ENV = "AITER_FLYDSL_PA_PAGE16_VPIPE"
+
+
+def _page16_vpipe_enabled() -> bool:
+    return os.getenv(_PAGE16_VPIPE_ENV, "0").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
 
 
 def get_recommended_splits(
@@ -378,10 +391,27 @@ def pa_decode(
     # if either does.
     wide_kv_addressing = max(key_cache.numel(), value_cache.numel()) >= 2**31
 
+    # The page-16 long-context pipeline is opt-in until it can be benchmarked
+    # on gfx950.  It loads current V before QK and delays next K until the
+    # current PV, while every unsupported shape keeps the existing schedule.
+    page16_vpipe = (
+        _page16_vpipe_enabled()
+        and arch == "gfx950"
+        and head_dim == 128
+        and block_size == 16
+        and trans_v
+        and not per_token_kv
+        and query.dtype == torch.bfloat16
+        and num_kv_heads == 1
+        and query_length == 1
+        and query_group_size in (8, 16)
+        and num_partitions == 8
+    )
+
     # Early V loads help the measured one-to-two-workgroup-per-CU regime.
     # Keep other grids on the existing schedule: early loads regress
     # short-context decode at larger grid sizes.
-    prefetch_v = False
+    prefetch_v = page16_vpipe
     if (
         arch == "gfx950"
         and head_dim == 128

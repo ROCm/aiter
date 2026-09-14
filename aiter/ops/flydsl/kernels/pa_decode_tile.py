@@ -118,8 +118,10 @@ def compile_pa_decode_tile(
     TOTAL_ROWS = query_length * query_group_size
     M_TILES = cdiv(TOTAL_ROWS, MFMA_MNK)
     ROWS_PADDED = M_TILES * MFMA_MNK
-    # The page-128 gfx950 scalar-scale path benefits from earlier V loads
-    # for decode and alternating P/reduction buffers for three M-tiles.
+    # The gfx950 scalar-scale decode paths can opt into earlier V loads.  The
+    # page-16 single-M-tile variant additionally delays the next K load until
+    # immediately before the current PV, shortening its live range across the
+    # softmax while leaving the existing schedule as the default.
     tune_page128 = (
         is_gfx950
         and head_dim == 128
@@ -127,7 +129,15 @@ def compile_pa_decode_tile(
         and trans_v
         and not per_token_kv
     )
-    EARLY_V = prefetch_v and tune_page128 and M_TILES == 1
+    tune_page16_vpipe = (
+        is_gfx950
+        and head_dim == 128
+        and block_size == 16
+        and trans_v
+        and not per_token_kv
+    )
+    EARLY_V = prefetch_v and (tune_page128 or tune_page16_vpipe) and M_TILES == 1
+    PAGE16_VPIPE = prefetch_v and tune_page16_vpipe and M_TILES == 1
     P_BUFFERS = 2 if tune_page128 and M_TILES == 3 else 1
     # PV layout: V=A, P=B -> output [head-dim (row), query-row (col=lane16)],
     # generalized over head_dim via the VHE_CHUNKS loop.
@@ -432,6 +442,12 @@ def compile_pa_decode_tile(
                 dtype=fx.Int32,
             )
 
+        def _stage_v_page_row(phys_vec):
+            if lane == 0:
+                _lds_store(
+                    sVPage_off + warp * (PAGES_PER_CHUNK * 4), fx.Int32, phys_vec
+                )
+
         def _v_page_fetch_and_stage(tt_i32):
             # V's page depends on `rgroup` (shared across warps): warp w fetches
             # its rgroup row and broadcasts via LDS (read back by _v_page_read_row).
@@ -439,18 +455,19 @@ def compile_pa_decode_tile(
             fetched = _load_phys_scalar(
                 base_page + (warp * TOK_PER_WARP) // block_size, PAGES_PER_CHUNK
             )
-            if lane == 0:
-                fetched_vec = (
-                    fx.Vector.from_elements([fx.Int32(fetched)], dtype=fx.Int32)
-                    if const_expr(PAGES_PER_CHUNK == 1)
-                    else fx.Vector(fetched)
-                )
-                _lds_store(
-                    sVPage_off + warp * (PAGES_PER_CHUNK * 4), fx.Int32, fetched_vec
-                )
+            fetched_vec = (
+                fx.Vector.from_elements([fx.Int32(fetched)], dtype=fx.Int32)
+                if const_expr(PAGES_PER_CHUNK == 1)
+                else fx.Vector(fetched)
+            )
+            _stage_v_page_row(fetched_vec)
 
         def _v_page_read_row():
             off = sVPage_off + rgroup * (PAGES_PER_CHUNK * 4)
+            return _lds_load(off, fx.Int32, PAGES_PER_CHUNK)
+
+        def _k_page_read_warp():
+            off = sVPage_off + warp * (PAGES_PER_CHUNK * 4)
             return _lds_load(off, fx.Int32, PAGES_PER_CHUNK)
 
         def _kv_buf_off(tt_val):
@@ -521,6 +538,16 @@ def compile_pa_decode_tile(
                 ops.extend([w[0], w[1]])
             return ops  # N_SUBCHUNKS i64 operands
 
+        def _k_ops_from_phys(phys_vec):
+            flat = []
+            for a in range_constexpr(NCHUNK):
+                phys = fx.Int32(phys_vec[(a * c16) // block_size])
+                flat.extend(_k_ops(phys, a))
+            if const_expr(head_dim == 64):
+                fx.rocdl.sched_vmem(len(flat) // 2)
+
+            return fx.Vector.from_elements(flat, dtype=fx.Int64)
+
         def _k_ops_flat(tt_i32):
             base_page = tt_i32 * TILE_TOK // block_size  # tile start is page-aligned
             fetched = _load_phys_scalar(
@@ -531,14 +558,7 @@ def compile_pa_decode_tile(
                 if const_expr(PAGES_PER_CHUNK == 1)
                 else fx.Vector(fetched)
             )
-            flat = []
-            for a in range_constexpr(NCHUNK):
-                phys = fx.Int32(phys_vec[(a * c16) // block_size])
-                flat.extend(_k_ops(phys, a))
-            if const_expr(head_dim == 64):
-                fx.rocdl.sched_vmem(len(flat) // 2)
-
-            return fx.Vector.from_elements(flat, dtype=fx.Int64), phys_vec
+            return _k_ops_from_phys(phys_vec), phys_vec
 
         # Empty partitions retain neutral state and must not read K/V or the
         # block table. In particular, an empty context has no valid first tile.
@@ -547,7 +567,12 @@ def compile_pa_decode_tile(
             k_pf0, phys_vec0 = _k_ops_flat(part_start)
             # Issue the V page-index prefetch alongside K; the LDS write is
             # visible after the barrier below.
-            _v_page_fetch_and_stage(part_start)
+            if const_expr(PAGE16_VPIPE):
+                # The K page vector is already resident. Reuse it for the V
+                # page matrix instead of issuing a second block-table load.
+                _stage_v_page_row(phys_vec0)
+            else:
+                _v_page_fetch_and_stage(part_start)
             if const_expr(per_token_kv):
                 _stage_kv_scale_to_lds(phys_vec0, _kv_buf_off(fx.Int32(part_start)))
         elif lane == 0:
@@ -1109,11 +1134,16 @@ def compile_pa_decode_tile(
                 # tt+1 K/V/scale prefetch, issued here to reuse the pass-1 barrier.
                 k_next = k_cur
                 if tt1 < part_end:
-                    k_next, phys_vec1 = _k_ops_flat(tt1)
-                    _v_page_fetch_and_stage(tt1)
-                    if const_expr(per_token_kv):
-                        _stage_kv_scale_to_lds(phys_vec1, _kv_buf_off(tt1))
-                next_state[K_SLOT] = k_next
+                    if const_expr(PAGE16_VPIPE):
+                        # Publish only the next page ids here.  K itself is
+                        # issued after the P barrier so its VMEM can overlap
+                        # the current tile's PV without spanning softmax.
+                        _v_page_fetch_and_stage(tt1)
+                    else:
+                        k_next, phys_vec1 = _k_ops_flat(tt1)
+                        _v_page_fetch_and_stage(tt1)
+                        if const_expr(per_token_kv):
+                            _stage_kv_scale_to_lds(phys_vec1, _kv_buf_off(tt1))
                 # Softmax: each lane owns one qhead (lane%16); register reduce + shuffle_xor.
                 scale = scale_qk * _ld1(
                     sQscale_off, lane16
@@ -1229,6 +1259,13 @@ def compile_pa_decode_tile(
                 if rgroup == 0:
                     _st_lw(sLsum_off, lane16, warp, ls)
                 gpu.barrier()
+                if const_expr(PAGE16_VPIPE):  # noqa: SIM102
+                    # The page matrix is now visible. Issue next K before the
+                    # current P read/PV so those independent operations can
+                    # cover its VMEM latency.
+                    if tt1 < part_end:
+                        k_next = _k_ops_from_phys(_k_page_read_warp())
+                next_state[K_SLOT] = k_next
                 gsum = _ld_lw_row(sLsum_off, lane16).reduce(ReductionOp.ADD)
                 l_new = l_prev * corr_reg + gsum
                 p_ops = _lds_load(
