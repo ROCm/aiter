@@ -10,6 +10,8 @@
 import triton
 import triton.language as tl
 
+from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
+
 # =====================================================================
 # Forward — autotune configs
 # =====================================================================
@@ -49,12 +51,18 @@ def _fwd_prune(configs, named_args, **kwargs):
 # =====================================================================
 
 
+_sparse_mla_fwd_kernel_repr = make_kernel_repr(
+    "_sparse_mla_fwd_kernel",
+    ["HAS_ATTN_SINK", "BLOCK_D", "BLOCK_H", "BLOCK_K"],
+)
+
+
 @triton.autotune(
     configs=_fwd_configs(),
     key=["num_heads", "topk", "head_dim"],
     prune_configs_by={"early_config_prune": _fwd_prune},
 )
-@triton.jit
+@triton.jit(repr=_sparse_mla_fwd_kernel_repr)
 def _sparse_mla_fwd_kernel(
     q_ptr,
     kv_ptr,
@@ -168,7 +176,13 @@ def _sparse_mla_fwd_kernel(
 # Reads pre-computed delta. Stores P and dP to buffers for kernel 2.
 
 
-@triton.jit
+_bwd_dq_store_dp_kernel_repr = make_kernel_repr(
+    "_bwd_dq_store_dp_kernel",
+    ["HAS_ATTN_SINK", "BLOCK_H", "BLOCK_D", "BLOCK_K"],
+)
+
+
+@triton.jit(repr=_bwd_dq_store_dp_kernel_repr)
 def _bwd_dq_store_dp_kernel(
     q_ptr,
     kv_ptr,
@@ -291,7 +305,13 @@ def _bwd_dq_store_dp_kernel(
 # Reads P_buf, dP_buf, Q, dO → computes interm[tok, k, :D].
 
 
-@triton.jit
+_bwd_dkv_interm_kernel_repr = make_kernel_repr(
+    "_bwd_dkv_interm_kernel",
+    ["BLOCK_H", "BLOCK_D", "BLOCK_K", "NUM_HG"],
+)
+
+
+@triton.jit(repr=_bwd_dkv_interm_kernel_repr)
 def _bwd_dkv_interm_kernel(
     q_ptr,
     do_ptr,
@@ -371,7 +391,13 @@ def _bwd_dkv_interm_kernel(
 # =====================================================================
 
 
-@triton.jit
+_bwd_dkv_gather_kernel_repr = make_kernel_repr(
+    "_bwd_dkv_gather_kernel",
+    ["BLOCK_D", "BLOCK_G"],
+)
+
+
+@triton.jit(repr=_bwd_dkv_gather_kernel_repr)
 def _bwd_dkv_gather_kernel(
     interm_ptr,
     inv_ptr_ptr,
