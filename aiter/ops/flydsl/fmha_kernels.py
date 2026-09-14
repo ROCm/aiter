@@ -29,6 +29,7 @@ The kernel implements self-attention only (Lq == Lk). Cross-attention
 from __future__ import annotations
 
 from functools import lru_cache
+from numbers import Real
 
 import torch
 import torch.nn.functional as F
@@ -42,6 +43,7 @@ from .kernels.fmha_gfx1250.fmha_fwd_prefill_a16w16_m32x8 import (
 
 __all__ = [
     "flydsl_flash_attn_batch_func",
+    "flydsl_flash_attn_batch_prefill_func",
     "flydsl_flash_attn_func",
     "flydsl_flash_attn_varlen_bwd",
     "flydsl_flash_attn_varlen_func",
@@ -218,6 +220,120 @@ def flydsl_flash_attn_func(
     if seq_len_pad != seq_len_real:
         return o_p[:, :seq_len_real, :, :].contiguous()
     return o_p
+
+
+def flydsl_flash_attn_batch_prefill_func(
+    q,
+    k,
+    v,
+    cu_seqlens_q,
+    kv_indptr,
+    kv_page_indices,
+    max_seqlen_q,
+    max_seqlen_k,
+    *,
+    dropout_p=0.0,
+    softmax_scale=None,
+    logits_soft_cap=0.0,
+    causal=False,
+    window_size=(-1, -1),
+    alibi_slopes=None,
+    deterministic=False,
+    return_lse=False,
+    return_attn_probs=False,
+    out=None,
+    kv_last_page_lens=None,
+    block_table=None,
+    seqlen_k=None,
+    q_descale=None,
+    k_descale=None,
+    v_descale=None,
+    kv_block_descale=None,
+    sink_ptr=None,
+    sink_size=0,
+):
+    """Native gfx950 FP8 paged prefill, or None for another AITER backend."""
+    if not all(torch.is_tensor(tensor) for tensor in (q, k, v)):
+        return None
+    if not (
+        q.ndim == 3
+        and q.dtype == k.dtype == v.dtype == torch.float8_e4m3fn
+        and q.is_cuda
+        and q.device == k.device == v.device
+        and causal
+        and dropout_p == 0.0
+        and logits_soft_cap == 0.0
+        and len(window_size) >= 2
+        and all(w < 0 for w in window_size[:2])
+        and (len(window_size) < 3 or window_size[2] == 0)
+        and alibi_slopes is None
+        and sink_ptr is None
+        and sink_size == 0
+        and kv_block_descale is None
+        and not return_lse
+        and not return_attn_probs
+        and not any(tensor.requires_grad for tensor in (q, k, v))
+    ):
+        return None
+    from .kernels.flash_attn_paged_fp8_func_gfx950 import (
+        _cache_geometry,
+        _gpu_arch,
+        _is_valid_softmax_scale,
+        flydsl_flash_attn_paged_fp8_func,
+    )
+
+    if _gpu_arch(q.device) != "gfx950":
+        return None
+    if softmax_scale is not None and not isinstance(softmax_scale, Real):
+        return None
+    if not _is_valid_softmax_scale(softmax_scale):
+        return None
+    if any(
+        not torch.is_tensor(scale)
+        or scale.dtype != torch.float32
+        or scale.numel() != 1
+        or scale.device != q.device
+        or scale.requires_grad
+        for scale in (q_descale, k_descale, v_descale)
+    ):
+        return None
+    if out is not None and (out.dtype != torch.bfloat16 or not out.is_contiguous()):
+        return None
+    # These positional metadata arguments remain part of the AITER contract
+    # even when the rectangular block table takes precedence over CSR lookup.
+    if not all(
+        torch.is_tensor(tensor)
+        and tensor.dtype == torch.int32
+        and tensor.device == q.device
+        and tensor.ndim == 1
+        for tensor in (cu_seqlens_q, kv_indptr, kv_page_indices)
+    ):
+        return None
+    if kv_indptr.shape != cu_seqlens_q.shape:
+        return None
+    try:
+        _cache_geometry(q, k, v)
+    except NotImplementedError:
+        return None
+    return flydsl_flash_attn_paged_fp8_func(
+        q,
+        k,
+        v,
+        cu_seqlens_q,
+        max_seqlen_q,
+        max_seqlen_k,
+        kv_indptr=kv_indptr,
+        kv_page_indices=kv_page_indices,
+        kv_last_page_lens=kv_last_page_lens,
+        block_table=block_table,
+        seqlen_k=seqlen_k,
+        q_descale=q_descale,
+        k_descale=k_descale,
+        v_descale=v_descale,
+        softmax_scale=softmax_scale,
+        causal=causal,
+        out=out,
+    )
 
 
 @lru_cache(maxsize=64)

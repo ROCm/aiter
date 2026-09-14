@@ -4096,6 +4096,40 @@ def mha_batch_prefill_func(
 ):
     if softmax_scale is None:
         softmax_scale = q.shape[-1] ** (-0.5)
+    if q.dtype == torch.float8_e4m3fn:
+        from .flydsl.fmha_kernels import flydsl_flash_attn_batch_prefill_func
+
+        flydsl_result = flydsl_flash_attn_batch_prefill_func(
+            q,
+            k,
+            v,
+            cu_seqlens_q,
+            kv_indptr,
+            kv_page_indices,
+            max_seqlen_q,
+            max_seqlen_k,
+            dropout_p=dropout_p,
+            softmax_scale=softmax_scale,
+            logits_soft_cap=logits_soft_cap,
+            causal=causal,
+            window_size=window_size,
+            alibi_slopes=alibi_slopes,
+            deterministic=deterministic,
+            return_lse=return_lse,
+            return_attn_probs=return_attn_probs,
+            out=out,
+            kv_last_page_lens=kv_last_page_lens,
+            block_table=block_table,
+            seqlen_k=seqlen_k,
+            q_descale=q_descale,
+            k_descale=k_descale,
+            v_descale=v_descale,
+            kv_block_descale=kv_block_descale,
+            sink_ptr=sink_ptr,
+            sink_size=sink_size,
+        )
+        if flydsl_result is not None:
+            return flydsl_result
     if sink_ptr is not None:
         assert sink_ptr.device == q.device, "sink_ptr must be on the same device as q"
         assert sink_ptr.shape[0] == q.size(1), "sink_ptr has incorrect shape"
