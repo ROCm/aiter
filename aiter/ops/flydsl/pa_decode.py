@@ -87,15 +87,20 @@ def _workgroup_count_enables_v_prefetch(
     num_kv_heads: int,
     num_partitions: int,
     num_compute_units: int,
+    query_length: int = 1,
 ) -> bool:
-    """Return whether the launch is in the tuned one-to-two-CTA-per-CU window.
+    """Return whether the launch fits the tuned page-128 V-prefetch range.
+
+    Single-query decode benefits on grids up to two CTAs per CU, including
+    grids smaller than one CTA per CU. MTP retains the one-to-two-CTA window.
 
     This result is a kernel specialization and therefore part of the compile
     cache key. Applications serving shapes on both sides of this interval must
     materialize both variants before graph capture or latency-sensitive use.
     """
     workgroups = num_sequences * num_kv_heads * num_partitions
-    return num_compute_units < workgroups <= 2 * num_compute_units
+    min_workgroups = 0 if query_length == 1 else num_compute_units
+    return min_workgroups < workgroups <= 2 * num_compute_units
 
 
 def _flydsl_dtype_str(dtype: torch.dtype) -> str:
@@ -574,27 +579,34 @@ def pa_decode(
         and query_group_size in (8, 16)
     )
 
-    # Early V loads help the measured one-to-two-workgroup-per-CU regime.
-    # Keep other grids on the existing schedule by default; the opt-in override
-    # lets long-context under-filled grids be measured without changing policy.
+    # Native page-16 decode overlaps V with QK/softmax without selecting the
+    # opt-in pipeline or numerical ablation. Page-128 decode also benefits on
+    # smaller grids, up to two CTAs/CU, and keeps its explicit override.
     prefetch_v = page16_vpipe
+    early_v_only = False
     if (
         arch == "gfx950"
         and head_dim == 128
-        and block_size == 128
+        and block_size in (16, 128)
         and trans_v
         and not per_token_kv
         and query_length * query_group_size <= 16
     ):
-        num_cus = torch.cuda.get_device_properties(dev).multi_processor_count
-        prefetch_v = _env_enabled(_PAGE128_EARLY_V_ENV) or (
-            _workgroup_count_enables_v_prefetch(
-                num_seqs,
-                num_kv_heads,
-                num_partitions,
-                num_cus,
+        if block_size == 16:
+            early_v_only = (
+                query_length == 1 and not page16_vpipe and not match_gluon_numerics
             )
-        )
+        else:
+            num_cus = torch.cuda.get_device_properties(dev).multi_processor_count
+            prefetch_v = _env_enabled(_PAGE128_EARLY_V_ENV) or (
+                _workgroup_count_enables_v_prefetch(
+                    num_seqs,
+                    num_kv_heads,
+                    num_partitions,
+                    num_cus,
+                    query_length=query_length,
+                )
+            )
 
     with torch.cuda.device(dev):
         compiled = compile_pa_decode_tile(
@@ -611,6 +623,7 @@ def pa_decode(
             prefetch_v=prefetch_v,
             prefetch_v_iglp=page16_vpipe_iglp,
             match_gluon_numerics=match_gluon_numerics,
+            early_v_only=early_v_only,
         )
 
     if num_partitions == 1:
