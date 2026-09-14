@@ -3,6 +3,10 @@ import triton
 import triton.language as tl
 
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
+from aiter.ops.triton.utils.tuned_config_utils import (
+    autotune_enabled,
+    get_tuned_kernel_config,
+)
 
 # =====================================================================
 # Utility
@@ -24,6 +28,19 @@ def _get_lds_limit():
 
 
 _LDS_LIMIT = _get_lds_limit()
+
+# Tuning is opt-in; unit tests and production launch the tile published for this device.
+SPARSE_ATTENTION_DSV4_TRITON_AUTOTUNE: bool = autotune_enabled("SPARSE_ATTENTION_DSV4")
+_PREFILL_TUNED = get_tuned_kernel_config(
+    "attention",
+    "SPARSE_ATTENTION_DSV4",
+    "_sparse_attn_prefill_kernel",
+    triton.Config(
+        {"BLOCK_H": 32, "BLOCK_K": 16, "waves_per_eu": 0, "matrix_instr_nonkdim": 16},
+        num_warps=4,
+        num_stages=1,
+    ),
+)
 
 
 # ---------------------------------------------------------------------------
@@ -228,6 +245,10 @@ def _combine_topk_swa_indices_ragged_kernel(
 
 def _prefill_prune_configs(configs, named_args, **kwargs):
     BLOCK_D = kwargs.get("BLOCK_D", named_args.get("BLOCK_D"))
+    if not SPARSE_ATTENTION_DSV4_TRITON_AUTOTUNE:
+        cfg = _PREFILL_TUNED
+        if BLOCK_D * cfg.kwargs["BLOCK_K"] * 2 * cfg.num_stages <= _LDS_LIMIT:
+            return [cfg]
     pruned = []
     for cfg in configs:
         bk = cfg.kwargs["BLOCK_K"]
