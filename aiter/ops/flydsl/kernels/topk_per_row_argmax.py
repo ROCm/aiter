@@ -133,12 +133,25 @@ def build_topk_per_row_argmax_module(
                 row = fx.block_idx.x
                 row_key = fx.slice(part_key, (row, None))
                 row_col = fx.slice(part_col, (row, None))
-                # A thread past the partials must not read one, so it folds in
-                # the bottom of the key space instead.
-                in_range = tid < Int32(splits)
-                slot = in_range.select(tid, zero)
-                my_key = in_range.select(row_key[slot], bottom)
-                my_col = in_range.select(row_col[slot], Int32(-1))
+                my_key = bottom
+                my_col = Int32(-1)
+                # A thread folds every `block_threads`-th partial, so any split
+                # count is covered. One each would drop the partials past the
+                # block silently, and the split rule does reach past it: at one
+                # or two rows of a 1M-wide row it asks for 512 against a
+                # 256-thread block. A thread's slots ascend, so its columns do
+                # too, and a strict `>` keeps the earliest of a tie; the tree
+                # below has the column rule for across threads.
+                for chunk in range_constexpr(
+                    (splits + block_threads - 1) // block_threads
+                ):
+                    slot = tid + Int32(chunk * block_threads)
+                    live = slot < Int32(splits)
+                    safe = live.select(slot, zero)
+                    peer_key = row_key[safe]
+                    better = live & (peer_key > my_key)
+                    my_key = better.select(peer_key, my_key)
+                    my_col = better.select(row_col[safe], my_col)
             else:
                 part = fx.block_idx.x
                 row = fx.block_idx.y
@@ -174,6 +187,13 @@ def build_topk_per_row_argmax_module(
                         my_key = better.select(key, my_key)
                         my_col = better.select(col, my_col)
 
+            # An LDS tree over the whole block, not the usual wave `shuffle_xor`
+            # fold with one cross-wave pass through LDS. The shuffle form trades
+            # log2(block) barriers for six shuffles, which only pays if those
+            # barriers are what the fold costs -- and they are not: a wider block
+            # adds a fold step and still wins where the fold is heaviest (one row
+            # of 129280, two vectors a thread, 5.77us at 512 threads against 6.60
+            # at 64). Revisit with a measurement, not with the argument above.
             red_key[tid] = my_key
             red_col[tid] = my_col
             gpu.barrier()
