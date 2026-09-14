@@ -229,6 +229,21 @@ def flydsl_flash_attn_paged_fp8_func(
             raise ValueError("kv_last_page_lens must be int32 [B] on Q's device")
     page_indices = kv_page_indices if csr else block_table
     has_last = csr and kv_last_page_lens is not None
+    # Metadata uses bounded, byte-addressed resources without the K/V wide
+    # fallback. Reject excessive logical extents before contiguous copies.
+    for tensor in (
+        cu_seqlens_q,
+        metadata,
+        page_indices,
+        kv_last_page_lens if has_last else None,
+    ):
+        if (
+            tensor is not None
+            and tensor.numel() * tensor.element_size() > PAGED_FP8_BUFFER_LIMIT_BYTES
+        ):
+            raise NotImplementedError(
+                "paged FP8 metadata exceeds the signed-int32 byte limit"
+            )
     for name, tensor in (
         ("q_descale", q_descale),
         ("k_descale", k_descale),
