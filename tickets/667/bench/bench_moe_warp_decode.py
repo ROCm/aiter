@@ -4,22 +4,29 @@
 
 Compares full MoE-block paths on shared weights/topk inputs:
 
-  1. AITER       : fused_topk + aiter.fused_moe(QuantType.per_1x128)
+  1. AITER-FP8   : fused_topk + aiter.fused_moe(QuantType.per_1x128)
      (internally: moe_sorting + per-1x128 FP8 activation quant + fmoe_fp8_blockscale_g1u1)
 
-  2. FLYDSL-BF16 : fused_topk + flydsl_warp_decode_moe (BF16 act, FP8 w, block2d)
+  2. AITER-FP4   : fused_topk + aiter.fused_moe(QuantType.per_1x32)
+     (a16w4: BF16 x, MXFP4 w. Silu+SEPARATED would pick a4w4 and MX-quant A;
+     this bench uses GateMode.INTERLEAVE + GUGU shuffle so fused_moe stays
+     a16w4 at B<=256, matching FlyDSL-FP4's BF16 activations.)
 
-  3. FLYDSL-FP8  : fused_topk + per-1x128 FP8 quant + flydsl_warp_decode_moe
+  3. FLYDSL-BF16 : fused_topk + flydsl_warp_decode_moe (BF16 act, FP8 w, block2d)
+
+  4. FLYDSL-FP8  : fused_topk + per-1x128 FP8 quant + flydsl_warp_decode_moe
                    (FP8 act, FP8 w, block2d)
 
-  4. FLYDSL-FP4  : fused_topk + flydsl_warp_decode_moe (BF16 act, MXFP4 w, E8M0 1x32)
+  5. FLYDSL-FP4  : fused_topk + flydsl_warp_decode_moe (BF16 act, MXFP4 w, E8M0 1x32)
 
 Headline timings go through the combined wrapper. Per-stage gate_up/down columns
 still call the staged kernels for attribution.
 
-Headline: AITER default vs FlyDSL. FlyDSL weights default to fused-MoE
-preshuffle (native 16x4); pass ``--flydsl-weight-layout k_contiguous`` for the
-row-major gather path. Host shuffle is setup, never timed. Default regime is
+Headline: AITER vs FlyDSL, same-dtype pairing where it exists
+(``aiter_fp8`` <-> ``flydsl_fp8``, ``aiter_fp4`` <-> ``flydsl_fp4``). FlyDSL weights
+default to fused-MoE preshuffle (native 16x4); pass
+``--flydsl-weight-layout k_contiguous`` for the row-major gather path. Host
+shuffle is setup, never timed. Default regime is
 COLD (disjoint-expert router rotation). --regime warm keeps a fixed fused_topk
 router.
 
@@ -50,12 +57,17 @@ import torch.nn.functional as F
 
 from einops import rearrange  # noqa: E402
 
-from aiter import QuantType, get_hip_quant, dtypes  # noqa: E402
+from aiter import QuantType, get_hip_quant, get_torch_quant, dtypes  # noqa: E402
 from aiter.fused_moe import fused_topk, fused_moe  # noqa: E402
+from aiter.ops.flydsl.moe_common import GateMode  # noqa: E402
 from aiter.test_common import run_perftest  # noqa: E402
 from aiter import pertoken_quant  # noqa: E402
 from aiter.ops.quant import per_1x32_f4_quant  # noqa: E402
-from aiter.ops.shuffle import shuffle_weight, shuffle_weight_a16w4  # noqa: E402
+from aiter.ops.shuffle import (  # noqa: E402
+    shuffle_weight,
+    shuffle_weight_a16w4,
+    shuffle_scale_a16w4,
+)
 from aiter.jit.utils.chip_info import get_gfx  # noqa: E402
 
 from aiter.ops.flydsl import (  # noqa: E402
@@ -98,7 +110,8 @@ BLOCK = 128
 _FLYDSL_SCALE_BLOCK = (BLOCK, BLOCK)  # FlyDSL default-vs-default: w_scale_mode=block2d
 _MXFP4_SCALE_BLOCK = (1, 32)  # MXFP4 spec; E8M0 convert operand (plan ?2)
 HEADLINE_PATHS = (
-    "aiter",
+    "aiter_fp8",
+    "aiter_fp4",
     "flydsl_bf16",
     "flydsl_fp8",
     "flydsl_fp4",
@@ -108,7 +121,11 @@ HEADLINE_PATHS = (
 def _path_config(flydsl_layout: WeightLayout) -> dict[str, str]:
     tag = flydsl_layout.value
     return {
-        "aiter": "fused_moe QuantType.per_1x128 shuffle_weight(16,16)",
+        "aiter_fp8": "fused_moe QuantType.per_1x128 shuffle_weight(16,16)",
+        "aiter_fp4": (
+            "fused_moe QuantType.per_1x32 a16w4 "
+            "GateMode.INTERLEAVE shuffle_weight_a16w4(gate_up=True)"
+        ),
         "flydsl_bf16": (
             f"flydsl_warp_decode_moe BF16-act FP8-w block2d (128,128) "
             f"weight_layout={tag}"
@@ -198,6 +215,12 @@ class WeightPack:
     w2_fp8: torch.Tensor  # [E, HIDDEN, INTER] fp8
     w2_scale: torch.Tensor  # [E, HIDDEN/128, INTER/128] fp32
 
+    # AITER fused-MoE MXFP4 (a16w4 / GGUU). Same logical weights as FlyDSL FP4.
+    w1_fp4: torch.Tensor
+    w1_scale_fp4: torch.Tensor
+    w2_fp4: torch.Tensor
+    w2_scale_fp4: torch.Tensor
+
     # MXFP4 + E8M0 (FlyDSL fp4 path). Packed 2 FP4/byte; scales are E8M0 bytes
     # for convert's scale operand (plan ?2), Block2D<1,32>.
     w_gate_fp4: torch.Tensor  # [E, INTER, HIDDEN//2] uint8
@@ -271,6 +294,20 @@ def build_weights(
     w2_fp8 = shuffle_weight(w_down_fp8.contiguous(), (16, 16))
     w2_scale = w_down_scale.contiguous()
 
+    torch_quant_1x32 = get_torch_quant(QuantType.per_1x32)
+    w1_bf16 = torch.cat([w_gate_bf16, w_up_bf16], dim=1).contiguous()
+    w1_qt, w1_s = torch_quant_1x32(w1_bf16, quant_dtype=dtypes.fp4x2)
+    w2_qt, w2_s = torch_quant_1x32(w_down_bf16.contiguous(), quant_dtype=dtypes.fp4x2)
+    if w1_s.ndim == 3:
+        w1_s = w1_s.reshape(w1_s.shape[0] * w1_s.shape[1], w1_s.shape[2])
+    if w2_s.ndim == 3:
+        w2_s = w2_s.reshape(w2_s.shape[0] * w2_s.shape[1], w2_s.shape[2])
+    # GUGU (gate_up=True): fused_moe a16w4 via GateMode.INTERLEAVE, not a4w4.
+    w1_fp4 = shuffle_weight_a16w4(w1_qt, 16, True)
+    w1_scale_fp4 = shuffle_scale_a16w4(w1_s, E, True)
+    w2_fp4 = shuffle_weight_a16w4(w2_qt, 16, False)
+    w2_scale_fp4 = shuffle_scale_a16w4(w2_s, E, False)
+
     w_gate_fp4, w_gate_scale_fp4 = _mxfp4_pack(w_gate_bf16)
     w_up_fp4, w_up_scale_fp4 = _mxfp4_pack(w_up_bf16)
     w_down_fp4, w_down_scale_fp4 = _mxfp4_pack(w_down_bf16)
@@ -307,6 +344,10 @@ def build_weights(
         w1_scale=w1_scale,
         w2_fp8=w2_fp8,
         w2_scale=w2_scale,
+        w1_fp4=w1_fp4,
+        w1_scale_fp4=w1_scale_fp4,
+        w2_fp4=w2_fp4,
+        w2_scale_fp4=w2_scale_fp4,
         w_gate_fp4=w_gate_fp4,
         w_up_fp4=w_up_fp4,
         w_down_fp4=w_down_fp4,
@@ -330,7 +371,7 @@ def build_weights(
 _hip_quant_per_1x128 = get_hip_quant(QuantType.per_1x128)
 
 
-def aiter_moe_core(
+def aiter_fp8_moe_core(
     hidden_states: torch.Tensor,
     topk_weights: torch.Tensor,
     topk_ids: torch.Tensor,
@@ -348,11 +389,37 @@ def aiter_moe_core(
     )
 
 
-def aiter_moe_block(
+def aiter_fp8_moe_block(
     hidden_states: torch.Tensor, gating: torch.Tensor, wp: WeightPack
 ) -> torch.Tensor:
     topk_weights, topk_ids = fused_topk(hidden_states, gating, wp.shape.TOPK, True)
-    return aiter_moe_core(hidden_states, topk_weights, topk_ids, wp)
+    return aiter_fp8_moe_core(hidden_states, topk_weights, topk_ids, wp)
+
+
+def aiter_fp4_moe_core(
+    hidden_states: torch.Tensor,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    wp: WeightPack,
+) -> torch.Tensor:
+    return fused_moe(
+        hidden_states,
+        wp.w1_fp4,
+        wp.w2_fp4,
+        topk_weights,
+        topk_ids,
+        quant_type=QuantType.per_1x32,
+        w1_scale=wp.w1_scale_fp4.view(wp.shape.E, -1),
+        w2_scale=wp.w2_scale_fp4.view(wp.shape.E, -1),
+        gate_mode=GateMode.INTERLEAVE.value,
+    )
+
+
+def aiter_fp4_moe_block(
+    hidden_states: torch.Tensor, gating: torch.Tensor, wp: WeightPack
+) -> torch.Tensor:
+    topk_weights, topk_ids = fused_topk(hidden_states, gating, wp.shape.TOPK, True)
+    return aiter_fp4_moe_core(hidden_states, topk_weights, topk_ids, wp)
 
 
 def flydsl_fp8_moe_block(
@@ -706,7 +773,7 @@ def _time_rotated(entry_fn: Callable, rid_list: list[torch.Tensor], iters, warmu
     return _time(fn, iters=iters, warmup=warmup, num_rotate_args=1)
 
 
-def bench_aiter(
+def bench_aiter_fp8(
     hidden_states,
     gating,
     wp,
@@ -737,7 +804,7 @@ def bench_aiter(
     if cold:
         wts = router_wts
         _, tt.core_us = _time_rotated(
-            lambda rid: aiter_moe_core(hidden_states, wts, rid, wp),
+            lambda rid: aiter_fp8_moe_core(hidden_states, wts, rid, wp),
             rid_list,
             iters,
             warmup,
@@ -746,7 +813,46 @@ def bench_aiter(
     else:
 
         def path(h, g):
-            return aiter_moe_block(h, g, wp)
+            return aiter_fp8_moe_block(h, g, wp)
+
+        _, tt.total_us = _time(path, hidden_states, gating, iters=iters, warmup=warmup)
+        tt.core_us = tt.total_us - tt.topk_us
+    return tt
+
+
+def bench_aiter_fp4(
+    hidden_states,
+    gating,
+    wp,
+    iters,
+    warmup,
+    cold: bool = False,
+    rid_list: Optional[list] = None,
+    router_wts: Optional[torch.Tensor] = None,
+) -> StageTimings:
+    tt = StageTimings()
+
+    _, tt.topk_us = _time(
+        lambda h, g: fused_topk(h, g, wp.shape.TOPK, True),
+        hidden_states,
+        gating,
+        iters=iters,
+        warmup=warmup,
+    )
+
+    if cold:
+        wts = router_wts
+        _, tt.core_us = _time_rotated(
+            lambda rid: aiter_fp4_moe_core(hidden_states, wts, rid, wp),
+            rid_list,
+            iters,
+            warmup,
+        )
+        tt.total_us = tt.core_us + tt.topk_us
+    else:
+
+        def path(h, g):
+            return aiter_fp4_moe_block(h, g, wp)
 
         _, tt.total_us = _time(path, hidden_states, gating, iters=iters, warmup=warmup)
         tt.core_us = tt.total_us - tt.topk_us
@@ -1137,8 +1243,8 @@ def path_bytes(B: int, shape: ShapeCfg, path: str) -> float:
     Per-element bytes: fp8=1, bf16=2, fp32 scales ignored (negligible).
     """
     HIDDEN, INTER, TOPK = shape.HIDDEN, shape.INTER, shape.TOPK
-    x_elem = 1 if path in ("flydsl_fp8", "aiter") else 2
-    w_elem = 0.5 if path.startswith("flydsl_fp4") else 1
+    x_elem = 1 if path in ("flydsl_fp8", "aiter_fp8") else 2
+    w_elem = 0.5 if path.endswith("_fp4") else 1
     inter_elem = 2
     y_elem = 2
 
@@ -1223,7 +1329,8 @@ def _write_headline_md(out: Path, provenance: str, rows: list[dict]) -> None:
     lines.append("")
     lines.append(
         "**Notes:** Default regime is COLD (`rotate=ceil(E/(B*TOPK))`, closure-captured "
-        "weights, `num_rotate_args=1`). `flydsl_fp4` has no FP8-torch cos (different quant). "
+        "weights, `num_rotate_args=1`). `aiter_fp4` / `flydsl_fp4` have no FP8-torch "
+        "cos (different quant). "
         "B=4 has no cos because correctness only runs for B in {1,2,8}."
     )
     out.write_text("\n".join(lines) + "\n")
@@ -1274,6 +1381,16 @@ def sweep(args):
             cold_kw = dict(cold=cold, rid_list=rid_list, router_wts=router_wts)
 
             path_specs = {
+                "aiter_fp8": (
+                    bench_aiter_fp8,
+                    {},
+                    lambda h, g: aiter_fp8_moe_block(h, g, wp),
+                ),
+                "aiter_fp4": (
+                    bench_aiter_fp4,
+                    {},
+                    lambda h, g: aiter_fp4_moe_block(h, g, wp),
+                ),
                 "flydsl_bf16": (
                     bench_flydsl_bf16,
                     {},
@@ -1292,35 +1409,46 @@ def sweep(args):
             }
 
             path_results: dict[str, StageTimings] = {}
-
-            path_results["aiter"] = bench_aiter(
-                hidden_states, gating, wp, iters, warmup, **cold_kw
-            )
+            path_failed: dict[str, str] = {}
             for name, (bench_func, kwargs, _) in path_specs.items():
-                path_results[name] = bench_func(
-                    hidden_states, gating, wp, iters, warmup, **kwargs, **cold_kw
-                )
+                try:
+                    path_results[name] = bench_func(
+                        hidden_states, gating, wp, iters, warmup, **kwargs, **cold_kw
+                    )
+                except Exception as exc:  # noqa: BLE001 -- keep the sweep going
+                    path_failed[name] = f"{type(exc).__name__}: {exc}"
+                    path_results[name] = StageTimings(
+                        total_us=float("nan"), core_us=float("nan")
+                    )
+                    print(
+                        f"{shape.name:<14} {B:>4} {name:<12} FAILED {path_failed[name]}"
+                    )
 
             # Correctness: only for the smaller batches (torch ref is O(B*TOPK*E))
             if args.correctness and B in (1, 2, 8):
                 ref = torch_moe_blockscale_ref(hidden_states, gating, wp)
-                y_a = aiter_moe_block(hidden_states, gating, wp)
-                path_results["aiter"].err = _err_metrics(ref, y_a)
                 for name, (_, _, path_func) in path_specs.items():
-                    if name == "flydsl_fp4":
+                    if name in path_failed or name in ("aiter_fp4", "flydsl_fp4"):
                         continue  # MXFP4 weights; not the FP8 torch_moe_blockscale ref
                     path_results[name].err = _err_metrics(
                         ref, path_func(hidden_states, gating)
                     )
 
             # Ratio = slowest total / current total (so 1.0 = slowest)
-            slowest = max(p.total_us for p in path_results.values())
+            ok_totals = [
+                p.total_us
+                for p in path_results.values()
+                if p.total_us == p.total_us and p.total_us > 0
+            ]
+            slowest = max(ok_totals) if ok_totals else float("nan")
 
             for name, tt in path_results.items():
                 bytes_ = path_bytes(B, shape, name)
                 gbs = bytes_ / (tt.core_us * 1e3) if tt.core_us > 0 else 0.0
                 ratio = slowest / tt.total_us if tt.total_us > 0 else 0.0
-                if tt.err is not None:
+                if name in path_failed:
+                    err_str = "FAILED"
+                elif tt.err is not None:
                     err_str = (
                         f"{tt.err['err_ratio']:.3f}/" f"{tt.err['cosine_sim']:.4f}"
                     )
