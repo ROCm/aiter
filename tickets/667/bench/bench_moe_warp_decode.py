@@ -30,10 +30,12 @@ shuffle is setup, never timed. Default regime is
 COLD (disjoint-expert router rotation). --regime warm keeps a fixed fused_topk
 router.
 
-Sweeps DeepSeek-V3-like (HIDDEN=7168, INTER=2048) and MiniMax-like
-(HIDDEN=3072, INTER=1536) shapes for B in {1,2,4,8,16,32,64} with E=256,
-TOPK=8. Reports total us, per-stage us (topk, quant, gate_up, down_reduce),
-and GB/s per path, plus a correctness column vs. torch_moe_blockscale.
+Sweeps DeepSeek-V3-like (HIDDEN=7168, INTER=2048, E=256, TOPK=8), MiniMax-like
+(HIDDEN=3072, INTER=1536, E=256, TOPK=8), and Qwen3Next TP1 (HIDDEN=2048,
+INTER=512, E=512, TOPK=10; G9 ``qwen3next``) for B in {1,2,4,8,16,32,64}.
+Qwen TP2/TP4 (INTER=256/128) are out of scope. Reports total us, per-stage
+us (topk, quant, gate_up, down_reduce), and GB/s per path, plus a correctness
+column vs. torch_moe_blockscale.
 
 Run (flydsl_venv, GPU 1):
     HIP_VISIBLE_DEVICES=1 ./flydsl_venv/bin/python tickets/667/bench/bench_moe_warp_decode.py
@@ -97,6 +99,7 @@ class ShapeCfg:
 SHAPES = {
     "deepseek": ShapeCfg("deepseek-v3", HIDDEN=7168, INTER=2048),
     "minimax": ShapeCfg("minimax", HIDDEN=3072, INTER=1536),
+    "qwen3next": ShapeCfg("qwen3next", HIDDEN=2048, INTER=512, E=512, TOPK=10),
 }
 
 DEFAULT_BATCHES = (1, 2, 4, 8, 16, 32, 64)
