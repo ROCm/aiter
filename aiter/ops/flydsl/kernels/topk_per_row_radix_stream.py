@@ -105,6 +105,12 @@ _HIGH_SHIFT = 21
 _SOFT_TRIGGER_MAX = 2048
 # Below this the re-selects come often enough to cost more than the LDS they free.
 _SOFT_TRIGGER_MIN = 256
+# k=1 and k=2 return wrong rows, and not a few: at 64 rows of 32768 gaussian
+# columns, 55 and 63 of them. Only once the row is wide enough to re-select --
+# one tile group is right at every k -- and k>=4 is clean at every width tried.
+# Declined rather than shipped while the cause is open; the dispatcher has three
+# other selectors for a k this small, and `topk_per_row_argmax` owns k=1.
+_MIN_SERVED_K = 3
 
 
 # Loads a thread keeps in flight per group. Registers only, since arrivals are
@@ -242,8 +248,8 @@ def topk_per_row_radix_stream_serves(
     """
     if wave_size not in (32, 64):
         return f"wave size must be 32 or 64, got {wave_size}"
-    if k < 1:
-        return f"k must be positive, got {k}"
+    if k < _MIN_SERVED_K:
+        return f"k must be at least {_MIN_SERVED_K}, got {k}"
     if block_threads % wave_size:
         return "block must be a whole number of waves"
     if _NUM_BUCKETS % block_threads:
