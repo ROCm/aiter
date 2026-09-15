@@ -1,6 +1,8 @@
 import triton
 import triton.language as tl
 
+from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
+
 
 @triton.jit
 def compute_padding_info(seqlen_k, BLOCK_N: tl.constexpr):
@@ -564,7 +566,25 @@ def _sage_fwd_blocksparse_mask_mxfp4(
     return acc, l_i, m_i
 
 
-@triton.jit
+_sage_fwd_mxfp4_repr = make_kernel_repr(
+    "sage_fwd_mxfp4",
+    [
+        "HQ",
+        "HK",
+        "ACTUAL_BLOCK_DMODEL_QK",
+        "ACTUAL_BLOCK_DMODEL_V",
+        "IS_CAUSAL",
+        "BLOCK_M",
+        "BLOCK_N",
+        "PRE_LOAD_V",
+        "USE_BIAS",
+        "USE_BLOCK_SPARSE",
+        "RETURN_LSE",
+    ],
+)
+
+
+@triton.jit(repr=_sage_fwd_mxfp4_repr)
 def sage_fwd_mxfp4(
     Q,
     K,

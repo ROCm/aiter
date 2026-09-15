@@ -1,3 +1,14 @@
+//
+// prefill=1 rows: DSA sparse PREFILL (not decode, and despite the name not causal
+// either -- there is no qo_len/kv_len/causal mask in the kernel; causality is
+// pre-baked by the caller into two per-query-token CSR index lists). One
+// workgroup serves one query token x Gqa heads, so Gqa is a HARD constraint,
+// not a dispatch hint. These use their own compact 104-byte kernarg ABI
+// (csrc/py_itfs_cu/asm_mla_sparse_prefill.cu), not the decode packet.
+//   qh128 32mx4_32nx1_sparse_pfl <- my_agent_skills/0805_base/32mx4_32nx1.sp3
+//     (the .sp3 keeps its tile-shape name; the .co/symbol follow the aiter
+//      naming convention here)
 qType,kvType,Gqa,ps,qSeqLen,prefill,causal,lse,knl_name,co_name
 fp8,fp8,64,0,1,0,0,0,_ZN5aiter35mla_a8w8_qh64_1tg_16mx4_64nx1_sparseE,mla_a8w8_qh64_1tg_16mx4_64nx1_sparse.co
 fp8,fp8,16,0,4,0,0,0,_ZN5aiter35mla_a8w8_qh16_1tg_16mx4_64nx1_sparseE,mla_a8w8_qh16_1tg_16mx4_64nx1_sparse.co
+fp8,fp8,128,0,1,1,0,0,_ZN5aiter40mla_a8w8_qh128_1tg_32mx4_32nx1_sparse_pflE,mla_a8w8_qh128_1tg_32mx4_32nx1_sparse_pfl.co

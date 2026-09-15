@@ -1,6 +1,8 @@
 import triton
 import triton.language as tl
 
+from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
+
 
 @triton.jit
 def get_topmask_and_fullmask(x):
@@ -161,7 +163,26 @@ def streaming_topk(
     return y_values, y_indices
 
 
-@triton.jit
+_topk_repr = make_kernel_repr(
+    "_topk",
+    [
+        "BLOCK_M",
+        "BLOCK_N",
+        "BLOCK_S",
+        "BLOCK_SP",
+        "N_EXPTS_PAD",
+        "N_EXPTS_ACT",
+        "N_EXPTS_ACT_PAD",
+        "SCORE_MODE",
+        "APPLY_SOFTMAX",
+        "HAS_BIAS",
+        "APPLY_RENORM",
+        "WRITE_POP",
+    ],
+)
+
+
+@triton.jit(repr=_topk_repr)
 def _topk(
     X,
     stride_xm,  # inputs
@@ -303,7 +324,23 @@ def _topk(
         tl.store(BitsPtrs, r, mask=mask_m)
 
 
-@triton.jit
+_hash_routing_repr = make_kernel_repr(
+    "_hash_routing",
+    [
+        "BLOCK_M",
+        "BLOCK_N",
+        "BLOCK_S",
+        "BLOCK_SP",
+        "N_EXPTS_PAD",
+        "N_EXPTS_ACT",
+        "N_EXPTS_ACT_PAD",
+        "SCORE_MODE",
+        "APPLY_RENORM",
+    ],
+)
+
+
+@triton.jit(repr=_hash_routing_repr)
 def _hash_routing(
     InputIds,  # int32 [n_rows] — token-id per row
     Tid2Eid,  # int32 [vocab_size, K] — per-token-id top-K expert table
@@ -456,7 +493,26 @@ def _hash_routing(
         tl.store(BitsPtrs, r, mask=mask_m[:, None])
 
 
-@triton.jit
+_grouped_topk_repr = make_kernel_repr(
+    "_grouped_topk",
+    [
+        "BLOCK_M",
+        "BLOCK_N",
+        "BLOCK_S",
+        "BLOCK_SP",
+        "N_EXPTS_PAD",
+        "N_EXPTS_ACT",
+        "N_EXPTS_ACT_PAD",
+        "NUM_EXPERT_GROUP",
+        "TOPK_GROUP",
+        "SCORE_MODE",
+        "HAS_BIAS",
+        "APPLY_RENORM",
+    ],
+)
+
+
+@triton.jit(repr=_grouped_topk_repr)
 def _grouped_topk(
     X,  # router logits [n_rows, n_expts_tot] (bf16/fp32)
     stride_xm,

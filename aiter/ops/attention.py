@@ -2,6 +2,7 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 import math
+import os
 
 import torch
 import triton
@@ -1027,12 +1028,12 @@ def get_ps_metadata_info_v1(
     max_qo_split_per_batch = math.ceil(max_qlen / qlen_granularity)
 
     qo_tile_cnt = batch_size * max_qo_split_per_batch
+    # a work item is created either
+    #   1. for every qo tile (no split)
+    #   2. every split qo tile, which can be done at most #TG times in total
     # TODO: consider split q to reduce max_works & max_partials
     max_works = (batch_size + cus_per_cluster - 1) * max_qo_split_per_batch * num_head_k
-    max_partials = (
-        min(batch_size + cus_per_cluster - 1, (cus_per_cluster - 1) * 2)
-        * max_qo_split_per_batch
-    )
+    max_partials = qo_tile_cnt + (cus_per_cluster - 1)
 
     return (
         (2, torch.uint64),  # work_metadata_ptrs
@@ -1062,6 +1063,7 @@ def get_ps_metadata_v1(
     kvlen_granularity: int = 16,
     block_size: int = 16,
     is_causal: bool = True,
+    need_lse: bool = False,
 ) -> None: ...
 
 
@@ -1216,6 +1218,17 @@ def get_mla_metadata_info_v1(
             and kv_dtype == dtypes.fp8
             and effective_seqlen_qo == 1
         )
+        or (
+            # Mirrors the C++ gate, which tests max_seqlen_qo rather than the
+            # sparse-collapsed length; a mismatch here would size the reduce
+            # buffers for a fold the planner does not perform.
+            get_gfx() == "gfx1250"
+            and os.environ.get("AITER_MLA_DECODE_PS1_FLYDSL", "0") == "1"
+            and q_dtype == dtypes.fp8
+            and kv_dtype == dtypes.fp8
+            and num_head_qo in (32, 64, 128)
+            and max_seqlen_qo == 1
+        )
     ):
         max_qo_tiles_per_batch = math.ceil(packed_qo_len / 128)
     elif (
@@ -1224,6 +1237,12 @@ def get_mla_metadata_info_v1(
         and kv_dtype == dtypes.bf16
         and q_dtype == dtypes.bf16
         and num_head_qo != 48
+    ) or (
+        get_gfx() == "gfx950"
+        and q_dtype == dtypes.fp8
+        and kv_dtype == dtypes.fp8
+        and num_head_qo == 96
+        and effective_seqlen_qo <= 6
     ):
         if num_head_qo * 2 > 128:
             max_qo_tiles_per_batch = effective_seqlen_qo
@@ -1633,6 +1652,21 @@ def decode_update_mla_metadata_v1(
             and num_heads_per_head_k == 128
             and q_is_fp8
             and kv_is_fp8
+        )
+        or (
+            arch_id == "gfx950"
+            and num_heads_per_head_k == 96
+            and q_is_fp8
+            and kv_is_fp8
+            and max_seqlen_qo <= 6
+        )
+        or (
+            arch_id == "gfx1250"
+            and os.environ.get("AITER_MLA_DECODE_PS1_FLYDSL", "0") == "1"
+            and q_is_fp8
+            and kv_is_fp8
+            and num_heads_per_head_k in (32, 64, 128)
+            and max_seqlen_qo == 1
         )
     )
     cu_num = work_indptr.shape[0] - 1
