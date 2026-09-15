@@ -9,11 +9,11 @@ import flydsl.expr as fx
 from flydsl.expr import const_expr, range_constexpr, rocdl
 from flydsl.runtime.device import get_rocm_arch as get_hip_arch
 
+from aiter.ops.flydsl.kernels.fmha_gfx950.common import load as _load
 from aiter.ops.flydsl.kernels.fmha_gfx950.paged_lds import (
     DualwaveFp8KvGmemToLdsLoader,
     DualwaveFp8KvLdsToVgprLoader,
 )
-from aiter.ops.flydsl.kernels.fmha_gfx950.paged_memory import load as _load
 from aiter.ops.flydsl.kernels.fmha_gfx950.paged_ops import (
     DualwaveFp8GemmHelper,
     DualwaveFp8SoftmaxHelper,

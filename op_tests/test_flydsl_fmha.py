@@ -1708,11 +1708,7 @@ def test_fp8_softmax_scale_rejects_invalid(scale):
 )
 def test_fp8_softmax_scale_cpu_dispatch_contract(monkeypatch, varlen, scale, valid):
     """Exercise both public APIs with fake tensors; no GPU or compilation."""
-    from torch._subclasses.fake_tensor import (
-        FakeTensor,
-        FakeTensorMode,
-        unset_fake_temporarily,
-    )
+    from torch._subclasses.fake_tensor import FakeTensor, FakeTensorMode
 
     from aiter.jit.utils import chip_info
     from aiter.ops.flydsl import fmha_kernels as dispatch
@@ -1730,13 +1726,9 @@ def test_fp8_softmax_scale_cpu_dispatch_contract(monkeypatch, varlen, scale, val
     with FakeTensorMode() as mode:
 
         def fake(shape, dtype=torch.float8_e4m3fn):
-            # A meta allocation inside FakeTensorMode is already fake on
-            # newer PyTorch; construct the raw backing tensor outside it.
-            with unset_fake_temporarily():
-                backing = torch.empty(shape, dtype=dtype, device="meta")
             return FakeTensor(
                 mode,
-                backing,
+                torch.empty(shape, dtype=dtype, device="meta"),
                 torch.device("cuda:0"),
             )
 

@@ -10,8 +10,8 @@ from flydsl.expr import const_expr, range_constexpr, rocdl
 from flydsl.expr.typing import T
 from flydsl.expr.typing import Vector as Vec
 
-from aiter.ops.flydsl.kernels.fmha_gfx950.paged_memory import load as _load
-from aiter.ops.flydsl.kernels.fmha_gfx950.paged_memory import store as _store
+from aiter.ops.flydsl.kernels.fmha_gfx950.common import load as _load
+from aiter.ops.flydsl.kernels.fmha_gfx950.common import store as _store
 from aiter.ops.flydsl.kernels.fmha_gfx950.paged_pipeline import (
     PAGED_FP8_BUFFER_LIMIT_BYTES,
     DualwaveFp8KernelContext,
