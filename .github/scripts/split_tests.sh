@@ -158,6 +158,7 @@ if [[ "$TEST_TYPE" == "aiter" ]]; then
     FILE_TIMES[op_tests/test_metadata.py]=6
     FILE_TIMES[op_tests/test_opus_a8w8_bmm.py]=6
     FILE_TIMES[op_tests/test_pa_mqa_logits_offset.py]=6
+    FILE_TIMES[op_tests/test_triton_fmoe_dispatch.py]=10
     FILE_TIMES[op_tests/test_quant_mxfp6_gemm.py]=6
     FILE_TIMES[op_tests/test_gdr_decode_packed_bf16.py]=5
     FILE_TIMES[op_tests/test_groupnorm.py]=5

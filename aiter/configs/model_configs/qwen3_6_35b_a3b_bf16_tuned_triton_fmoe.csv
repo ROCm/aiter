@@ -1,0 +1,11 @@
+gfx,cu_num,token,model_dim,inter_dim,expert,topk,act_type,dtype,q_dtype_a,q_dtype_w,q_type,use_g1u1,doweight_stage1,block_size_m,block_size_n,block_size_k,group_size_m,num_warps,num_stages
+gfx1201,64,1152,2048,128,256,8,ActivationType.Silu,torch.bfloat16,torch.bfloat16,torch.bfloat16,QuantType.No,1,0,32,64,128,4,8,2
+gfx1201,64,1543,2048,128,256,8,ActivationType.Silu,torch.bfloat16,torch.bfloat16,torch.bfloat16,QuantType.No,1,0,32,64,128,4,8,2
+gfx1201,64,1728,2048,128,256,8,ActivationType.Silu,torch.bfloat16,torch.bfloat16,torch.bfloat16,QuantType.No,1,0,32,64,128,4,8,2
+gfx1201,64,1799,2048,128,256,8,ActivationType.Silu,torch.bfloat16,torch.bfloat16,torch.bfloat16,QuantType.No,1,0,32,64,128,4,8,2
+gfx1201,64,1803,2048,128,256,8,ActivationType.Silu,torch.bfloat16,torch.bfloat16,torch.bfloat16,QuantType.No,1,0,32,64,128,4,8,2
+gfx1201,64,1815,2048,128,256,8,ActivationType.Silu,torch.bfloat16,torch.bfloat16,torch.bfloat16,QuantType.No,1,0,32,64,128,4,8,2
+gfx1201,64,1837,2048,128,256,8,ActivationType.Silu,torch.bfloat16,torch.bfloat16,torch.bfloat16,QuantType.No,1,0,32,64,128,4,8,2
+gfx1201,64,1944,2048,128,256,8,ActivationType.Silu,torch.bfloat16,torch.bfloat16,torch.bfloat16,QuantType.No,1,0,32,64,128,4,8,2
+gfx1201,64,1945,2048,128,256,8,ActivationType.Silu,torch.bfloat16,torch.bfloat16,torch.bfloat16,QuantType.No,1,0,64,64,128,1,8,2
+gfx1201,64,2048,2048,128,256,8,ActivationType.Silu,torch.bfloat16,torch.bfloat16,torch.bfloat16,QuantType.No,1,0,64,64,128,1,8,2
