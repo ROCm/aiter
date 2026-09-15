@@ -26,7 +26,7 @@ from aiter.int4_utils import (
     convert_int8_to_uint32_int4,
     rearrange_4bit_elements,
 )
-from aiter.jit.core import AITER_CONFIGS
+from aiter.jit.core import AITER_CONFIGS, AITER_ROOT_DIR
 from aiter.jit.utils.chip_info import get_cu_num, get_gfx
 from aiter.ops.flydsl.kernels.mega_moe_gfx1250.types import Stage2ScatterContext
 from aiter.ops.flydsl.moe_common import (
@@ -341,9 +341,9 @@ def test_fmoe(
         and (AQDType in [dtypes.bf16, dtypes.fp16, dtypes.fp8])
         and (WQDType == dtypes.fp4x2)
     ):  # a16w4 / a8w4
-        # a16w4 (bf16/fp16 act) uses standard GGUU (gate_up=False), matching main;
-        # a8w4 (fp8 act) keeps the gate/up-interleaved GUGU (gate_up=True).
-        _w1_gu = AQDType == dtypes.fp8
+        # INTERLEAVE (a8w4, and Silu a16w4) consumes GUGU W1. SEPARATED a16w4
+        # (SiTUv2 / Swiglu) stays GGUU.
+        _w1_gu = GateMode(gateMode) == GateMode.INTERLEAVE
         w1_qt_aiter = shuffle_weight_a16w4(w1_qt_aiter, 16, _w1_gu)
         w1_scale_aiter = shuffle_scale_a16w4(w1_scale, E, _w1_gu)
         w2_qt_aiter = shuffle_weight_a16w4(w2_qt_aiter, 16, False)
@@ -821,7 +821,7 @@ def _row_to_kwargs(row):
     inter_dim = int(row["inter_dim"])
     # Tuned CSV rows do not carry gate mode explicitly. Infer the runtime mode
     # from the selected activation/weight dtype layout used by fused_moe.
-    gate_mode = _effective_gate_mode(aq_dtype, wq_dtype)
+    gate_mode = _effective_gate_mode(aq_dtype, wq_dtype, act_type)
     return {
         "dtype": _str2dtype(row["dtype"]),
         "token": int(row["token"]),
@@ -920,7 +920,16 @@ def _iter_csv_cases():
             continue
         kwargs["strict_accuracy"] = True
         # Targeted configs and env-selected SiTUv2 modes have no pre-registered
-        # AOT cache entry, so let those cases compile on demand.
+        # AOT cache entry, so let those cases compile on demand. Silu a16w4
+        # INTERLEAVE tiles are skipped here: DeepSeek rows advertise ~7%
+        # stage2 err (above the 1% strict gate) and dispatch + Qwen/MiniMax
+        # numerics live in test_silu_a16w4_interleave_tiles.
+        if (
+            kwargs["actType"] == aiter.ActivationType.Silu
+            and kwargs["AQDType"] in (dtypes.bf16, dtypes.fp16)
+            and kwargs["WQDType"] == dtypes.fp4x2
+        ):
+            continue
         kwargs["check_aot_cache"] = (
             args.csv_filter is None and kwargs["actType"] != aiter.ActivationType.Situv2
         )
@@ -950,11 +959,18 @@ def _situv2_beta_kwargs(act_type):
     return {}
 
 
-def _effective_gate_mode(aq_dtype, wq_dtype):
+def _effective_gate_mode(aq_dtype, wq_dtype, act_type=None):
     # a16w4 (bf16 A x mxfp4 W) SiTUv2 is served by the ported FlyDSL kernel via
-    # fused_moe_'s SEPARATED dispatch; keep it in SEPARATED (bf16 activation) so
-    # the abf16_wfp4 rows exercise that kernel instead of downgrading to a8w4/fp8.
-    if aq_dtype == dtypes.bf16 and wq_dtype == dtypes.fp4x2:
+    # fused_moe_'s SEPARATED dispatch; keep SiTUv2 in SEPARATED (bf16 activation) so
+    # those abf16_wfp4 rows exercise that kernel instead of a GUGU INTERLEAVE layout.
+    # Silu a16w4 is INTERLEAVE (GUGU tiles in silu_a16w4_tuned_fmoe.csv).
+    if (
+        aq_dtype in (dtypes.bf16, dtypes.fp16)
+        and wq_dtype == dtypes.fp4x2
+        and act_type == aiter.ActivationType.Silu
+    ):
+        return GateMode.INTERLEAVE.value
+    if aq_dtype in (dtypes.bf16, dtypes.fp16) and wq_dtype == dtypes.fp4x2:
         return GateMode.SEPARATED.value
     # a8w4 mxfp4 weights run the gate/up-interleaved (guinterleave) layout,
     # matching serving's ATOM_MOE_GU_ITLV=1. gate_mode is a runtime weight-layout
@@ -1100,7 +1116,7 @@ def _iter_legacy_cases():
             E=args.expert,
             topk=args.topk,
             actType=act_type,
-            gateMode=_effective_gate_mode(aq_dtype, wq_dtype),
+            gateMode=_effective_gate_mode(aq_dtype, wq_dtype, act_type),
             qType=quant_type,
             AQDType=aq_dtype,
             WQDType=wq_dtype,
@@ -1284,6 +1300,104 @@ def test_bm16_tiled_scale_boundary():
             os.environ["AITER_BF16_FP8_MOE_BOUND"] = old_moe_bound
 
 
+def _silu_a16w4_tuned_rows():
+    """gfx950 Silu a16w4 INTERLEAVE tiles from silu_a16w4_tuned_fmoe.csv."""
+    csv_path = os.path.join(
+        AITER_ROOT_DIR, "aiter", "configs", "model_configs", "silu_a16w4_tuned_fmoe.csv"
+    )
+    if not os.path.isfile(csv_path):
+        return pd.DataFrame()
+    df = pd.read_csv(csv_path)
+    cu = get_cu_num()
+    return df[(df["gfx"].astype(str) == "gfx950") & (df["cu_num"] == cu)]
+
+
+def test_silu_a16w4_interleave_tiles():
+    """Pin Silu a16w4 INTERLEAVE FlyDSL tiles and check Qwen/MiniMax decode."""
+    if get_gfx() != "gfx950":
+        aiter.logger.info("skip Silu a16w4 INTERLEAVE tile test on %s", get_gfx())
+        return
+
+    from aiter.ops.flydsl.moe_kernels import get_flydsl_kernel_params
+
+    rows = _silu_a16w4_tuned_rows()
+    if rows.empty:
+        aiter.logger.info(
+            "skip Silu a16w4 INTERLEAVE tile test: no gfx950 rows for cu_num=%s",
+            get_cu_num(),
+        )
+        return
+
+    for _, row in rows.iterrows():
+        kn1 = str(row["kernelName1"]).strip()
+        kn2 = str(row["kernelName2"]).strip()
+        token = int(row["token"])
+        model_dim = int(row["model_dim"])
+        inter_dim = int(row["inter_dim"])
+        expert = int(row["expert"])
+        topk = int(row["topk"])
+        metadata = get_2stage_cfgs(
+            get_padded_M(token),
+            model_dim,
+            inter_dim,
+            expert,
+            topk,
+            torch.bfloat16,
+            dtypes.bf16,
+            dtypes.fp4x2,
+            aiter.QuantType.per_1x32,
+            True,
+            aiter.ActivationType.Silu,
+            False,
+            0,
+            0,
+            True,
+            GateMode.INTERLEAVE.value,
+        )
+        stages = (metadata.stage1, metadata.stage2)
+        kernel_names = tuple(stage.keywords["kernelName"] for stage in stages)
+        assert kernel_names == (kn1, kn2), (
+            f"token={token} dim=({model_dim},{inter_dim}) E={expert} topk={topk}: "
+            f"got {kernel_names}, expected {(kn1, kn2)}"
+        )
+        assert get_flydsl_kernel_params(kn1) is not None, kn1
+        assert get_flydsl_kernel_params(kn2) is not None, kn2
+
+    # Numerics: Qwen decode B=1 (0% CSV err, smallest weights). MiniMax err2 is
+    # on the 1% gate; DeepSeek advertises ~7% and is dispatch-only above.
+    qwen = rows[(rows["model_dim"] == 2048) & (rows["token"] == 1)]
+    torch.manual_seed(0)
+    for _, row in qwen.iterrows():
+        kwargs = dict(
+            dtype=torch.bfloat16,
+            token=int(row["token"]),
+            model_dim=int(row["model_dim"]),
+            inter_dim=int(row["inter_dim"]),
+            E=int(row["expert"]),
+            topk=int(row["topk"]),
+            actType=aiter.ActivationType.Silu,
+            gateMode=GateMode.INTERLEAVE.value,
+            qType=aiter.QuantType.per_1x32,
+            AQDType=dtypes.bf16,
+            WQDType=dtypes.fp4x2,
+            use_g1u1=True,
+            doweight_stage1=False,
+        )
+        skip_reason = _moe_2stage_skip_reason(kwargs)
+        if skip_reason is not None:
+            aiter.logger.warning(
+                "skip Silu a16w4 INTERLEAVE numerics: %s (%s)",
+                _format_moe_2stage_case(kwargs),
+                skip_reason,
+            )
+            continue
+        test_fmoe(
+            **kwargs,
+            strict_accuracy=True,
+            check_aot_cache=False,
+        )
+
+
 def test_output_buffer_contract():
     """Validate output identity, copy-back, validation, and compile contracts."""
     torch.manual_seed(0)
@@ -1410,6 +1524,7 @@ if args.bm16_scale_boundary:
     test_bm16_tiled_scale_boundary()
 else:
     test_output_buffer_contract()
+    test_silu_a16w4_interleave_tiles()
     if not args.no_flydsl_csv:
         _case_iters.append(
             _iter_with_env(
@@ -1501,5 +1616,11 @@ aiter.logger.info(
     seen - len(df),
 )
 df = pd.DataFrame(df)
-df_md = df.to_markdown(index=False)
-aiter.logger.info("moe_2stage summary (markdown):\n%s", df_md)
+if df.empty:
+    aiter.logger.info("moe_2stage summary (markdown): (no sweep rows)")
+else:
+    try:
+        df_md = df.to_markdown(index=False)
+    except ImportError:
+        df_md = df.to_string(index=False)
+    aiter.logger.info("moe_2stage summary (markdown):\n%s", df_md)
