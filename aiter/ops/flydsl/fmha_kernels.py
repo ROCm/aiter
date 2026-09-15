@@ -28,7 +28,6 @@ The kernel implements self-attention only (Lq == Lk). Cross-attention
 
 from __future__ import annotations
 
-import math
 from functools import lru_cache
 
 import torch
@@ -255,14 +254,15 @@ def _fp8_gfx950_supported(
 ) -> bool:
     """Gate for the gfx950 fp8 kernel.
 
-    It needs e4m3fn Q/K/V with per-tensor descales, hard-wires ``1/sqrt(D)``,
-    and writes bf16. Reject anything else so it falls through rather than
+    It needs e4m3fn Q/K/V with per-tensor descales and a positive, finite
+    softmax scale, and writes bf16. Reject anything else so it falls through rather than
     silently dropping the feature.
     """
     if q.dtype is not torch.float8_e4m3fn or q_descale is None:
         return False
 
     from ...jit.utils.chip_info import get_gfx
+    from .kernels.flash_attn_func_fp8_gfx950 import _is_valid_softmax_scale
 
     if get_gfx() != "gfx950":
         return False
@@ -282,9 +282,7 @@ def _fp8_gfx950_supported(
     ):
         return False
     qk_hdim = q.shape[-1]
-    if softmax_scale is not None and not math.isclose(
-        softmax_scale, 1.0 / math.sqrt(qk_hdim), rel_tol=1e-6
-    ):
+    if not _is_valid_softmax_scale(softmax_scale):
         return False
     if not _fp8_gfx950_buildable(qk_hdim, v.shape[-1]):
         return False
@@ -363,6 +361,7 @@ def flydsl_flash_attn_varlen_func(
             q,
             k,
             v,
+            softmax_scale=softmax_scale,
             causal=causal,
             cu_seqlens_q=cu_seqlens_q,
             cu_seqlens_kv=cu_seqlens_k,
@@ -491,6 +490,7 @@ def flydsl_flash_attn_batch_func(
             q,
             k,
             v,
+            softmax_scale=softmax_scale,
             causal=causal,
             q_descale=q_descale,
             k_descale=k_descale,
