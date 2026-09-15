@@ -2,6 +2,7 @@
 """Production host runtime for communication-fused FlyDSL MoE."""
 
 import csv
+import logging
 import math
 import re
 from dataclasses import MISSING, dataclass, fields
@@ -43,6 +44,8 @@ _ACT_TYPE = "ActivationType.Silu"
 _DTYPE = "torch.bfloat16"
 _Q_DTYPE_A = "torch.float8_e4m3fn"
 _Q_DTYPE_W = "torch.float4_e2m1fn_x2"
+
+logger = logging.getLogger("aiter")
 _Q_TYPE = "QuantType.per_1x32"
 
 
@@ -824,8 +827,11 @@ def create_runner(tp_group, config: PipelineConfig):
 
 
 class _LazyRunners:
-    def __init__(self, tp_group, configs: dict[int, PipelineConfig]) -> None:
+    def __init__(
+        self, tp_group, shape: ShapeKey, configs: dict[int, PipelineConfig]
+    ) -> None:
         self.tp_group = tp_group
+        self.shape = shape
         self.configs = configs
         self.instances = {}
 
@@ -834,7 +840,30 @@ class _LazyRunners:
 
     def __getitem__(self, tokens: int):
         if tokens not in self.instances:
-            self.instances[tokens] = create_runner(self.tp_group, self.configs[tokens])
+            config = self.configs[tokens]
+            if int(self.tp_group.rank_in_group) == 0:
+                lookup_key = (
+                    self.shape.gfx,
+                    self.shape.cu_num,
+                    tokens,
+                    self.shape.model_dim,
+                    self.shape.inter_dim,
+                    self.shape.experts,
+                    self.shape.topk,
+                    self.shape.act_type,
+                    self.shape.dtype,
+                    self.shape.q_dtype_a,
+                    self.shape.q_dtype_w,
+                    self.shape.q_type,
+                    self.shape.use_g1u1,
+                    self.shape.doweight_stage1,
+                )
+                logger.info(
+                    "[comm-fused-moe] activate kernel=%s for %s",
+                    config_name(config),
+                    lookup_key,
+                )
+            self.instances[tokens] = create_runner(self.tp_group, config)
         return self.instances[tokens]
 
 
@@ -850,5 +879,5 @@ def create_flydsl_comm_fused_runners(*, tp_group, model_dim, inter_dim, experts,
     )
     key = (id(tp_group), shape)
     if key not in _RUNNER_CACHE:
-        _RUNNER_CACHE[key] = _LazyRunners(tp_group, winners_for(shape))
+        _RUNNER_CACHE[key] = _LazyRunners(tp_group, shape, winners_for(shape))
     return _RUNNER_CACHE[key]
