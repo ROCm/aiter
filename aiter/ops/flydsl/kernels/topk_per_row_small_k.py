@@ -52,6 +52,7 @@ from flydsl.expr import (
 from flydsl.expr import rocdl as fly_rocdl
 from flydsl.expr.typing import T
 
+from aiter.jit.utils.chip_info import get_gfx_runtime, get_lds_capacity_bytes
 from aiter.ops.flydsl.kernels.kernels_common import (
     atomic_add_i32,
     kernel_signature,
@@ -110,8 +111,20 @@ _LOCAL_PIN = 1e29
 _INT32_MIN = -2147483648
 
 
-# gfx9 gives a workgroup 160 KiB of LDS.
-_LDS_LIMIT = 160 * 1024
+@cache
+def lds_limit() -> int:
+    """LDS one workgroup may claim on this device.
+
+    Asked of the device, not written down. `160 * 1024` was gfx950's figure
+    under a comment claiming it for all of gfx9, which gfx942 answers at 64 KiB
+    -- so `serves` promised the router a k=16 selector over a 32768-wide row
+    that then failed to load with `local memory (69696) exceeds limit (65536)`.
+
+    `get_gfx_runtime`, not `get_gfx`: the latter honours `GPU_ARCHS`, while
+    FlyDSL compiles for the live device either way, so the build target and this
+    budget would answer for different cards.
+    """
+    return get_lds_capacity_bytes(get_gfx_runtime())
 
 
 def topk_per_row_small_k_shape(
@@ -180,13 +193,13 @@ def build_topk_per_row_small_k_module(
     )
     if block_threads % wave_size:
         raise ValueError("block must be a whole number of waves")
-    if lds_bytes > _LDS_LIMIT:
+    if lds_bytes > lds_limit():
         # Caught here rather than in the compiler: an over-budget build fails
         # the module load and leaves the HIP context in an error state, taking
         # the process with it instead of raising.
         raise ValueError(
             f"k={k} over a row bound of {n_max} needs {lds_bytes} bytes of LDS "
-            f"for its survivor buffer, over the {_LDS_LIMIT} limit"
+            f"for its survivor buffer, over the {lds_limit()} limit"
         )
     # Whole vectors per thread, so every load stays 128-bit.
     vec_per_thread = (vectors + block_threads - 1) // block_threads
