@@ -125,21 +125,13 @@ for file in "${sharded_files[@]}"; do
             test_cmd=(env AITER_MLA_DECODE_PERSISTENT_MAX_BATCH=0 timeout 60m python3 "$file")
             ;;
         op_tests/test_flydsl_pa_decode.py)
-            # The CLI sweep does not collect parametrized pytest regressions.
+            # The CLI sweep is separate from the compact parametrized regression.
             test_cmd=(
                 timeout 60m
                 bash -c '
                     set -euo pipefail
                     test_file=$1
-                    python3 -m pytest -q \
-                        "${test_file}::test_recommended_splits_has_configurable_upper_clamp" \
-                        "${test_file}::test_pa_decode_benchmark_reference_causal_mtp" \
-                        "${test_file}::test_pa_decode_benchmark_cli_defaults_and_bs200" \
-                        "${test_file}::test_pa_decode_benchmark_entry" \
-                        "${test_file}::test_pa_decode_fixed_length_accuracy" \
-                        "${test_file}::test_pa_decode_variable_length_accuracy" \
-                        "${test_file}::test_large_negative_logits_preserve_online_softmax" \
-                        "${test_file}::test_additional_supported_head_dims_are_accurate"
+                    python3 -m pytest -q "${test_file}::test_pa_decode"
                     python3 "$test_file"
                 '
                 _ "$file"

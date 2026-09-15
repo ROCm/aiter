@@ -146,15 +146,15 @@ def compile_pa_decode_tile(
     M_TILES = (CTA_ROWS + MFMA_MNK - 1) // MFMA_MNK
     ROWS_PADDED = M_TILES * MFMA_MNK
     # CDNA4 contracts four legacy fp8 K=32 groups in one K=128 instruction.
-    # Concatenating the existing packs preserves cache/LDS layouts for both
-    # fused and query-split MTP4 CTAs.
+    # Concatenating the existing packs preserves cache/LDS layouts for fused
+    # MTP3/MTP4 and query-split MTP4 CTAs.
     WIDE_FP8_MFMA = (
         is_gfx950
         and per_token_kv
         and query_dtype == "bf16"
         and head_dim == 128
         and block_size in (16, 128)
-        and query_length == 4
+        and query_length in (3, 4)
         and query_group_size == 16
     )
     # Small grids split query positions into separate CTAs; otherwise retain

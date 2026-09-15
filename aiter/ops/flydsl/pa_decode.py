@@ -558,9 +558,10 @@ def pa_decode(
             num_cus = torch.cuda.get_device_properties(dev).multi_processor_count
             prefetch_v = num_seqs * num_kv_heads * num_partitions <= num_cus
 
-    # Split small MTP4 grids into one query per CTA, retaining the original
+    # Split small MTP2/MTP4 grids into one query per CTA, retaining the original
     # partial layout and partition count. Larger grids amortize KV loads by
-    # processing all four queries together. Keep QL1's selector above intact.
+    # processing all queries together. MTP3 stays fused because the kernel's
+    # supported split counts (1, 2, 4) must divide query_length.
     query_splits = 1
     if (
         arch == "gfx950"
@@ -568,14 +569,14 @@ def pa_decode(
         and head_dim == 128
         and query.dtype == torch.bfloat16
         and num_kv_heads == 1
-        and query_length == 4
+        and query_length in (2, 4)
         and query_group_size == 16
         and block_size in (16, 128)
     ):
         num_cus = torch.cuda.get_device_properties(dev).multi_processor_count
         base_workgroups = num_seqs * num_kv_heads * num_partitions
-        if 4 * base_workgroups <= 2 * num_cus:
-            query_splits = 4
+        if query_length * base_workgroups <= 2 * num_cus:
+            query_splits = query_length
             prefetch_v = True
 
     with torch.cuda.device(dev):
