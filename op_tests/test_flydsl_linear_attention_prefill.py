@@ -704,20 +704,6 @@ def test_chunk_gdn_prefill_h(
         # gates decaying to 0.
         "use_exp2": False,
     }
-    candidates = {
-        "flydsl": lambda: chunk_gated_delta_rule_fwd_h_flydsl_opt(
-            k, w_c, u_c, g=g, g_head_major=case.g_head_major, **common
-        ),
-        "triton": lambda: chunk_gated_delta_rule_fwd_h_opt_vk(
-            k, w_c, u_c, g=g_hm, **common
-        ),
-    }
-    # Unsupported shapes leave the HIP cells nan rather than dropping the row.
-    if _hip_k5_supported(case):
-        candidates["hip"] = lambda: chunk_gated_delta_rule_fwd_h_hip_fn(
-            k, w_c, u_c, g=g_hm, g_head_major=True, **common
-        )
-
     # Two bf16 MFMA GEMMs against the [V, K] state per (chunk, head):
     #   v_new = u - w @ h^T   ([BT,K] @ [K,V])  -> 2*BT*K*V
     #   h    += v_gated^T @ k ([V,BT] @ [BT,K]) -> 2*BT*V*K
@@ -740,51 +726,86 @@ def test_chunk_gdn_prefill_h(
     )
 
     ret = {"gfx": get_gfx(), "B": B, "N": N, "H": H, "T_flat": T_flat}
-    for name, fn in candidates.items():
-        (h, vn, fs), us = run_perftest(fn)
+    for wu_hm in (True, False):
+        w_in, u_in = (w_c, u_c) if wu_hm else (w_orig, u_orig)
+        candidates = {
+            "flydsl": lambda w_in=w_in, u_in=u_in, wu_hm=wu_hm: chunk_gated_delta_rule_fwd_h_flydsl_opt(
+                k,
+                w_in,
+                u_in,
+                g=g,
+                g_head_major=case.g_head_major,
+                wu_head_major=wu_hm,
+                **common,
+            ),
+        }
+        if wu_hm:
+            candidates["triton"] = lambda: chunk_gated_delta_rule_fwd_h_opt_vk(
+                k, w_c, u_c, g=g_hm, **common
+            )
+            # Unsupported shapes leave the HIP cells nan rather than dropping the row.
+            if _hip_k5_supported(case):
+                candidates["hip"] = lambda: chunk_gated_delta_rule_fwd_h_hip_fn(
+                    k, w_c, u_c, g=g_hm, g_head_major=True, **common
+                )
 
-        # Output contract shared by all three backends.
-        assert h.shape == (B, total_chunks // B, H, V, K), f"{name}: h shape {h.shape}"
-        assert h.dtype == (case.snapshot_dtype or k.dtype), f"{name}: h dtype {h.dtype}"
-        assert vn.shape == (B, H, T_flat, V), f"{name}: v_new shape {vn.shape}"
-        if ofs:
-            assert fs.shape == (N, H, V, K), f"{name}: final_state shape {fs.shape}"
-            assert fs.dtype == case.ssm_state_dtype, f"{name}: fs dtype {fs.dtype}"
-        else:
-            assert fs is None, f"{name}: expected no final_state"
+        for name, fn in candidates.items():
+            (h, vn, fs), us = run_perftest(fn)
 
-        err = checkAllclose(
-            ref_h.to(dtypes.fp32),
-            h.to(dtypes.fp32),
-            rtol=2e-2,
-            atol=2e-2,
-            msg=f"{name}: K5 h snapshots",
-        )
-        err = max(
-            err,
-            checkAllclose(
-                ref_vn.to(dtypes.fp32),
-                _normalize_opt_v_new(vn).to(dtypes.fp32),
+            # Output contract shared by all three backends.
+            assert h.shape == (
+                B,
+                total_chunks // B,
+                H,
+                V,
+                K,
+            ), f"{name}: h shape {h.shape}"
+            assert h.dtype == (
+                case.snapshot_dtype or k.dtype
+            ), f"{name}: h dtype {h.dtype}"
+            expected_vn = (B, H, T_flat, V) if wu_hm else (B, T_flat, H, V)
+            assert (
+                vn.shape == expected_vn
+            ), f"{name} (wu_head_major={wu_hm}): v_new shape {vn.shape}"
+            if ofs:
+                assert fs.shape == (N, H, V, K), f"{name}: final_state shape {fs.shape}"
+                assert fs.dtype == case.ssm_state_dtype, f"{name}: fs dtype {fs.dtype}"
+            else:
+                assert fs is None, f"{name}: expected no final_state"
+
+            err = checkAllclose(
+                ref_h.to(dtypes.fp32),
+                h.to(dtypes.fp32),
                 rtol=2e-2,
                 atol=2e-2,
-                msg=f"{name}: K5 v_new",
-            ),
-        )
-        if ofs:
+                msg=f"{name}: K5 h snapshots",
+            )
+            vn_cmp = _normalize_opt_v_new(vn) if wu_hm else vn
             err = max(
                 err,
                 checkAllclose(
-                    ref_fs.to(dtypes.fp32),
-                    fs.to(dtypes.fp32),
+                    ref_vn.to(dtypes.fp32),
+                    vn_cmp.to(dtypes.fp32),
                     rtol=2e-2,
                     atol=2e-2,
-                    msg=f"{name}: K5 final_state",
+                    msg=f"{name}: K5 v_new",
                 ),
             )
-        ret[f"{name} us"] = us
-        ret[f"{name} TFLOPS"] = flops / us / 1e6
-        ret[f"{name} TB/s"] = nbytes / us / 1e6
-        ret[f"{name} err"] = err
+            if ofs:
+                err = max(
+                    err,
+                    checkAllclose(
+                        ref_fs.to(dtypes.fp32),
+                        fs.to(dtypes.fp32),
+                        rtol=2e-2,
+                        atol=2e-2,
+                        msg=f"{name}: K5 final_state",
+                    ),
+                )
+            ret[f"{name} us"] = us
+            ret[f"{name} TFLOPS"] = flops / us / 1e6
+            ret[f"{name} TB/s"] = nbytes / us / 1e6
+            ret[f"{name} err"] = err
 
     return ret
 

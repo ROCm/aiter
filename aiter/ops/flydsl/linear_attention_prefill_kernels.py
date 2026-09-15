@@ -499,11 +499,11 @@ def chunk_gated_delta_rule_fwd_h_flydsl_opt(
     initial_state_indices: torch.Tensor | None = None,
     inplace_final_state: bool | None = None,
     g_head_major: bool = False,
-    wu_head_major: bool = True,
     bf16_convert_trunc: bool = True,
     prefill_metadata: GatedDeltaRulePrefillMetadata | None = None,
     seq_lens_cpu: Sequence[int] | None = None,
     snapshot_dtype: torch.dtype | None = None,
+    wu_head_major: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
     """K5 opt implementation: NON-VWARP only -- uses the
     16x16x16 bf16 MFMA and the SAME split-M warp partition (BT split-M, K split
