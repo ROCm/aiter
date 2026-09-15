@@ -15,7 +15,6 @@ from aiter.ops.flydsl.kernels.fmha_gfx950.common import store as _store
 from aiter.ops.flydsl.kernels.fmha_gfx950.paged_pipeline import (
     PAGED_FP8_BUFFER_LIMIT_BYTES,
     DualwaveFp8KernelContext,
-    _ds_read_tr8_b64_imm,
     _sigma_k_tile_n,
     _vec_k_dma_oct_idx,
 )
@@ -741,9 +740,7 @@ class DualwaveFp8KvLdsToVgprLoader(DualwaveFp8KernelContext):
         return (_read_strip(n_lo), _read_strip(n_hi))
 
     def load_v(self, buf_id):
-        if const_expr(self.traits.PAGED):
-            return self._load_v_fp8_vectorized_bankpad(buf_id)
-        return self._load_v_fp8_block(buf_id)
+        return self._load_v_fp8_vectorized_bankpad(buf_id)
 
     def _load_v_fp8_vectorized_bankpad(self, buf_id):
         """Read the D-major V tile into the FP8 MFMA A fragment."""
@@ -779,33 +776,3 @@ class DualwaveFp8KvLdsToVgprLoader(DualwaveFp8KernelContext):
             )
             halves.append(_load(fx.get_iter(view), dtype=fx.Int32, count=4))
         return halves[0].shuffle(halves[1], [0, 1, 2, 3, 4, 5, 6, 7]).ir_value()
-
-    def _load_v_fp8_block(self, buf_id):
-        traits = self.traits
-        v_tile_bytes = (traits.BLOCK_N // 8) * (traits.HEAD_DIM_V // 16) * 128
-        buf_off = buf_id * v_tile_bytes
-        nbands = traits.HEAD_DIM_V // 16
-        rh = (self.lane % fx.Index(32)) // fx.Index(16)
-        l16 = self.lane % fx.Index(16)
-        lane_hi = self.lane // fx.Index(32)
-        aligned_base = (
-            (self.lds_vt_base_idx + fx.Index(127)) // fx.Index(128)
-        ) * fx.Index(128)
-        base = fx.Int32(
-            aligned_base
-            + buf_off
-            + rh * fx.Index(128)
-            + l16 * fx.Index(8)
-            + lane_hi * fx.Index(nbands * 128)
-        )
-
-        def _tr8(imm):
-            r = _ds_read_tr8_b64_imm(self.v2i32_type, base, imm)
-            return Vec(r).bitcast(fx.Int64)[0].ir_value()
-
-        packs = [[None] * traits.D_CHUNKS for _ in range(4)]
-        for dc in range_constexpr(traits.D_CHUNKS):
-            for ks in range_constexpr(4):
-                imm0 = (2 * ks * nbands + dc * 2) * 128
-                packs[ks][dc] = _tr8(imm0)
-        return packs

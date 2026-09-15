@@ -81,7 +81,7 @@ if [[ "$TEST_TYPE" == "aiter" ]]; then
     FILE_TIMES[op_tests/test_gemm_a8w8.py]=564
     FILE_TIMES[op_tests/test_rope.py]=402
     FILE_TIMES[op_tests/test_gated_delta_rule.py]=322
-    FILE_TIMES[op_tests/test_flydsl_paged_fmha.py]=210
+    FILE_TIMES[op_tests/test_flydsl_paged_fmha.py]=180
     FILE_TIMES[op_tests/test_concat_cache_mla.py]=277
     FILE_TIMES[op_tests/test_moe_topk_gating.py]=238
     FILE_TIMES[op_tests/test_mha_native_splitkv.py]=186

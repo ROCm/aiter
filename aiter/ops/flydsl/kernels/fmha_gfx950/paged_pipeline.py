@@ -29,28 +29,6 @@ NUM_XCD_GFX950 = 8
 PAGED_FP8_BUFFER_LIMIT_BYTES = (1 << 31) - 16
 
 
-def _ds_read_tr8_b64_imm(result_type, addr_i32, imm_offset=0):
-    """gfx950 ds_read_b64_tr_b8 (8-bit transpose) with immediate byte offset.
-
-    Returns 64 bits = 8 fp8 (the fp8 analog of ds_read_b64_tr_b16's 4 bf16),
-    used for the fp8 V transpose load.
-    """
-    imm = int(imm_offset)
-    raw_type = T.vec(2, T.i32)
-    raw = llvm.inline_asm(
-        raw_type,
-        [as_mlir_value(addr_i32)],
-        f"ds_read_b64_tr_b8 $0, $1 offset:{imm}\n",
-        "=v,v,~{memory}",
-        has_side_effects=True,
-    )
-    return (
-        fx.Vector(raw)
-        .bitcast(fx.Numeric.from_ir_type(ir.VectorType(result_type).element_type))
-        .ir_value()
-    )
-
-
 def _tree_reduce(vals, binop):
     items = list(vals)
     while len(items) > 1:
