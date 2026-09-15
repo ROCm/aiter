@@ -341,17 +341,20 @@ def main() -> None:
         "--loads", choices=["sync", "async"], nargs="+", default=["sync", "async"]
     )
     args = parser.parse_args()
-    rows = [
-        test_large_buffer(m, dtype, mode, storage, family, b_dtype, tuple(args.loads))
-        for m, dtype, mode, storage, family, b_dtype in itertools.product(
-            args.tokens,
-            args.a_dtype,
-            args.modes,
-            args.storage,
-            args.families,
-            args.b_dtype,
+    rows = []
+    for m, dtype, mode, storage, family, b_dtype in itertools.product(
+        args.tokens, args.a_dtype, args.modes, args.storage, args.families, args.b_dtype
+    ):
+        if family == "fhmoe" and b_dtype != "fp4":
+            aiter.logger.warning(
+                "FHMoE requires routed FP4 weights; skipping %s", b_dtype
+            )
+            continue
+        rows.append(
+            test_large_buffer(
+                m, dtype, mode, storage, family, b_dtype, tuple(args.loads)
+            )
         )
-    ]
     aiter.logger.info(
         "GEMM2 large-buffer regression:\n%s",
         pd.DataFrame(rows).to_markdown(index=False),
