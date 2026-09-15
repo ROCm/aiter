@@ -150,7 +150,8 @@ template<int BLOCK_SIZE_,
         int NUM_XCD_ = 8>
 struct opus_gemm_a8w8_mxscale_flatmm_splitk_traits_gfx950 {
     // Die count of the part this instance is built for; the split-K pipeline
-    // folds workgroup ids by it, and the launcher pads its grid to match.
+    // folds workgroup ids by it, and the m-outer launchers pad their grid
+    // to match.
     static constexpr int NUM_XCD = NUM_XCD_;
     using BLOCK = opus::remove_cvref_t<BLOCK_>;
     using DTYPE = opus::remove_cvref_t<DTYPE_>;

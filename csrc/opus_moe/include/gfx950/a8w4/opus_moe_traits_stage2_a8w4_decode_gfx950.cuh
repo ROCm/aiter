@@ -45,7 +45,7 @@ struct OpusMoeStage2A8W4DecodeShape
     static constexpr int T_M = IS_BM32_BN256 ? 2 : 1;
 
     static constexpr int ROUTE_M_STRIDE = B_M;
-    // route_out XCD swizzle (gfx950=8 XCDs).
+    // route_out XCD swizzle.
     static constexpr int NUM_XCD = DIRECT_ATOMIC_OUT ? 1 : NumXcd;
     static constexpr int SWIZZLE_W = 2;
     static constexpr int SWIZZLE_C =
