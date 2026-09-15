@@ -108,6 +108,21 @@ def _dynamic_per_token_quant_fp8_i8_kernel(
 
 
 @triton.jit
+def _mxfp4_scale_from_amax(amax):
+    """Convert an FP32 absolute maximum to E8M0 and its reciprocal."""
+    amax = amax.to(tl.int32, bitcast=True)
+    amax = (amax + 0x200000).to(tl.uint32, bitcast=True) & 0xFF800000
+    amax = amax.to(tl.float32, bitcast=True)
+    scale_e8m0_unbiased = tl.log2(amax).floor() - 2
+    # A biased value of 255 is E8M0 NaN, so 254 is the largest finite scale.
+    scale_e8m0_unbiased = tl.clamp(scale_e8m0_unbiased, min=-127, max=127)
+
+    bs_e8m0 = scale_e8m0_unbiased.to(tl.uint8) + 127
+    quant_scale = tl.exp2(-scale_e8m0_unbiased)
+    return bs_e8m0, quant_scale
+
+
+@triton.jit
 def _mxfp4_quant_op(
     x,
     BLOCK_SIZE_N,
@@ -119,6 +134,32 @@ def _mxfp4_quant_op(
     x: [BLOCK_SIZE_M, BLOCK_SIZE_N], fp32
 
     """
+    NUM_QUANT_BLOCKS: tl.constexpr = BLOCK_SIZE_N // MXFP4_QUANT_BLOCK_SIZE
+    x = x.reshape(BLOCK_SIZE_M, NUM_QUANT_BLOCKS, MXFP4_QUANT_BLOCK_SIZE)
+    # Calculate scale
+    amax = tl.max(tl.abs(x), axis=-1, keep_dims=True)
+    bs_e8m0, quant_scale = _mxfp4_scale_from_amax(amax)
+
+    # Compute quantized x
+    qx = x * quant_scale
+    x_fp4 = _mxfp4_pack_op(
+        qx,
+        BLOCK_SIZE_N,
+        BLOCK_SIZE_M,
+        MXFP4_QUANT_BLOCK_SIZE,
+    )
+
+    return x_fp4, bs_e8m0.reshape(BLOCK_SIZE_M, NUM_QUANT_BLOCKS)
+
+
+@triton.jit
+def _mxfp4_pack_op(
+    qx,
+    BLOCK_SIZE_N: tl.constexpr,
+    BLOCK_SIZE_M: tl.constexpr,
+    MXFP4_QUANT_BLOCK_SIZE: tl.constexpr,
+):
+    """Round normalized FP32 values to E2M1 and pack adjacent columns."""
     EXP_BIAS_FP32: tl.constexpr = 127
     EXP_BIAS_FP4: tl.constexpr = 1
     EBITS_F32: tl.constexpr = 8
@@ -128,36 +169,10 @@ def _mxfp4_quant_op(
 
     max_normal: tl.constexpr = 6
     min_normal: tl.constexpr = 1
-
     NUM_QUANT_BLOCKS: tl.constexpr = BLOCK_SIZE_N // MXFP4_QUANT_BLOCK_SIZE
-    x = x.reshape(BLOCK_SIZE_M, NUM_QUANT_BLOCKS, MXFP4_QUANT_BLOCK_SIZE)
-    # Calculate scale
-    amax = tl.max(tl.abs(x), axis=-1, keep_dims=True)
-    amax = amax.to(tl.int32, bitcast=True)
-    amax = (amax + 0x200000).to(tl.uint32, bitcast=True) & 0xFF800000
-    amax = amax.to(tl.float32, bitcast=True)
-    scale_e8m0_unbiased = tl.log2(amax).floor() - 2
-    scale_e8m0_unbiased = tl.clamp(scale_e8m0_unbiased, min=-127, max=127)
 
-    # blockscale_e8m0
-    bs_e8m0 = scale_e8m0_unbiased.to(tl.uint8) + 127  # in fp32, we have 2&(e - 127)
-
-    quant_scale = tl.exp2(-scale_e8m0_unbiased)
-
-    # Compute quantized x
-    qx = x * quant_scale
-
-    # Convert quantized fp32 tensor to uint32 before converting to mxfp4 format
-    # Note: MXFP4  S:1-bit, E:2-bit, M:1-bit
-    #   Zeros: S000 -> +/-0
-    #   Denormal Numbers: S001 -> +/- 0.5
-    #   Normal Numbers:
-    #           S010 -> +/- 1.0
-    #           S011 -> +/- 1.5
-    #           S100 -> +/- 2.0
-    #           S101 -> +/- 3.0
-    #           S110 -> +/- 4.0
-    #           S111 -> +/- 6.0
+    # MXFP4 E2M1 values are encoded as sign, two exponent bits and one
+    # mantissa bit. Adjacent logical columns share one output byte.
     qx = qx.to(tl.uint32, bitcast=True)
 
     # Extract sign
@@ -208,9 +223,7 @@ def _mxfp4_quant_op(
     )
     evens, odds = tl.split(e2m1_value)
     x_fp4 = evens | (odds << 4)
-    x_fp4 = x_fp4.reshape(BLOCK_SIZE_M, BLOCK_SIZE_N // 2)
-
-    return x_fp4, bs_e8m0.reshape(BLOCK_SIZE_M, NUM_QUANT_BLOCKS)
+    return x_fp4.reshape(BLOCK_SIZE_M, BLOCK_SIZE_N // 2)
 
 
 @triton.jit
@@ -409,6 +422,75 @@ def _dynamic_mxfp4_quant_kernel(
                 bs_e8m0,
                 mask=bs_mask,
             )
+
+
+_dynamic_mxfp4_quant_2d_repr = make_kernel_repr(
+    "_dynamic_mxfp4_quant_2d_kernel",
+    [
+        "BLOCK_SIZE",
+    ],
+)
+
+
+@triton.jit(repr=_dynamic_mxfp4_quant_2d_repr)
+def _dynamic_mxfp4_quant_2d_kernel(
+    x_ptr,
+    x_fp4_ptr,
+    bs_ptr,
+    stride_x_m_in,
+    stride_x_n_in,
+    stride_x_fp4_m_in,
+    stride_x_fp4_n_in,
+    stride_bs_m_in,
+    stride_bs_n_in,
+    BLOCK_SIZE: tl.constexpr,
+):
+    """Quantize one 32x32 input tile with one shared E8M0 scale."""
+    tl.static_assert(BLOCK_SIZE == 32)
+
+    pid_m = tl.cast(tl.program_id(0), tl.int64)
+    pid_n = tl.cast(tl.program_id(1), tl.int64)
+
+    stride_x_m = tl.cast(stride_x_m_in, tl.int64)
+    stride_x_n = tl.cast(stride_x_n_in, tl.int64)
+    stride_x_fp4_m = tl.cast(stride_x_fp4_m_in, tl.int64)
+    stride_x_fp4_n = tl.cast(stride_x_fp4_n_in, tl.int64)
+    stride_bs_m = tl.cast(stride_bs_m_in, tl.int64)
+    stride_bs_n = tl.cast(stride_bs_n_in, tl.int64)
+
+    offsets_m = pid_m * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    offsets_n = pid_n * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    x = tl.load(
+        x_ptr + offsets_m[:, None] * stride_x_m + offsets_n[None, :] * stride_x_n,
+        cache_modifier=".cg",
+    ).to(tl.float32)
+
+    row_amax = tl.max(tl.abs(x), axis=1)
+    tile_amax = tl.max(row_amax, axis=0)
+    bs_e8m0, quant_scale = _mxfp4_scale_from_amax(tile_amax)
+
+    # exp2(-127) may flush to zero on gfx950. Use the smallest normal
+    # reciprocal for raw 254, then apply the remaining factor to normalized
+    # values instead of materializing a subnormal reciprocal.
+    safe_quant_scale = tl.where(bs_e8m0 == 254, tl.exp2(-126.0), quant_scale)
+    x_scaled = x * safe_quant_scale
+    x_scaled = tl.where(bs_e8m0 == 254, x_scaled * 0.5, x_scaled)
+    x_grouped = x_scaled.reshape(BLOCK_SIZE, 1, BLOCK_SIZE)
+    x_fp4 = _mxfp4_pack_op(
+        x_grouped,
+        BLOCK_SIZE,
+        BLOCK_SIZE,
+        BLOCK_SIZE,
+    )
+
+    offsets_n_packed = pid_n * (BLOCK_SIZE // 2) + tl.arange(0, BLOCK_SIZE // 2)
+    tl.store(
+        x_fp4_ptr
+        + offsets_m[:, None] * stride_x_fp4_m
+        + offsets_n_packed[None, :] * stride_x_fp4_n,
+        x_fp4,
+    )
+    tl.store(bs_ptr + pid_m * stride_bs_m + pid_n * stride_bs_n, bs_e8m0)
 
 
 # MXFP8 (1x32 e8m0) quant: derives a per-block uint8 e8m0 scale + FP8 e4m3
