@@ -7,6 +7,7 @@ import pytest
 import torch
 
 # SmoothQuant MoE utilities
+from aiter import logger
 from aiter.ops.triton.moe.moe_op_gemm_int8_smoothquant import (
     moe_gemm_int8_smoothquant,
     moe_gemm_smoothquant_torch,
@@ -131,23 +132,31 @@ def assert_close(ref, tri, maxtol=None, rmstol=None, description="--", verbose=T
     rms_err = torch.sqrt(torch.square(rel_err).mean()).item()
 
     if verbose:
-        print(
-            f"{description} maximum relative error = {max_err} (threshold = {maxtol})"
+        logger.info(
+            "%s maximum relative error = %s (threshold = %s)",
+            description,
+            max_err,
+            maxtol,
         )
-        print(f"{description} RMS relative error = {rms_err} (threshold = {rmstol})")
+        logger.info(
+            "%s RMS relative error = %s (threshold = %s)", description, rms_err, rmstol
+        )
 
     if max_err > maxtol:
         bad_idxs = torch.nonzero(rel_err > maxtol)
         num_nonzero = bad_idxs.size(0)
         bad_idxs = bad_idxs[:1000]
-        print(
-            f"{num_nonzero} / {rel_err.numel()} mismatched elements "
-            f"(shape = {tuple(rel_err.shape)}) at coords {bad_idxs.tolist()}"
+        logger.info(
+            "%s / %s mismatched elements (shape = %s) at coords %s",
+            num_nonzero,
+            rel_err.numel(),
+            tuple(rel_err.shape),
+            bad_idxs.tolist(),
         )
 
         bad_idxs = bad_idxs.unbind(-1)
-        print("ref values: ", ref[tuple(bad_idxs)].cpu())
-        print("tri values: ", tri[tuple(bad_idxs)].cpu())
+        logger.info("ref values: %s", ref[tuple(bad_idxs)].cpu())
+        logger.info("tri values: %s", tri[tuple(bad_idxs)].cpu())
 
     assert max_err <= maxtol
     assert rms_err <= rmstol
