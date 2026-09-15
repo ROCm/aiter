@@ -3,8 +3,8 @@
 
 """Benchmark for sparse_mla_fwd (gfx950 gluon, separated-rope MLA).
 
-The cache is flushed between iterations by default, which matters: a decode shape
-runs up to twice as fast when the loop is allowed to re-read its KV out of cache.
+The cache is flushed between iterations by default. Leaving it warm lets the loop
+re-read its KV and flatters decode shapes badly.
 
 Usage:
   python op_tests/op_benchmarks/triton/bench_sparse_mla.py
@@ -19,8 +19,9 @@ import triton
 from torch.autograd import DeviceType
 from torch.profiler import ProfilerActivity, profile
 
-from aiter.ops.triton.attention.sparse_mla import _mla_num_splits, sparse_mla_fwd
+from aiter.ops.triton.attention.sparse_mla import sparse_mla_fwd
 from aiter.ops.triton.utils._triton import arch_info
+from aiter.ops.triton.utils.types import get_fp8_e4m3_dtype
 from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
     get_caller_name_no_ext,
 )
@@ -28,10 +29,10 @@ from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
 KV_LORA_RANK = 512
 QK_ROPE_HEAD_DIM = 64
 D_QK = KV_LORA_RANK + QK_ROPE_HEAD_DIM
-E4M3_MAX = 448.0
+E4M3_DTYPE = get_fp8_e4m3_dtype()
+E4M3_MAX = torch.finfo(E4M3_DTYPE).max
 
-# Both kernels the launch runs are named after the gluon kernel, the combine as
-# _sparse_mla_reduce, so one substring picks up both and nothing else.
+# Picks up the main kernel and _sparse_mla_reduce, nothing else.
 KERNEL_MATCH = "_sparse_mla"
 FLUSH_BYTES = 512 << 20
 
@@ -69,17 +70,17 @@ def device_time_ms(func, warmup=25, rep=100, flush=True):
     return total / rep / 1e3
 
 
-def bytes_moved(num_tokens, num_heads, nnz, kv_elem_bytes, num_splits):
-    """Bytes the launch actually moves, counting rows as gathered."""
+def bytes_moved(num_tokens, num_heads, nnz, kv_elem_bytes):
+    """Bytes the launch actually moves, counting rows as gathered.
+
+    Split-K partials are left out: the split count is the kernel's own decision,
+    so when it does split, that traffic lands in the time but not here.
+    """
     kv = nnz * D_QK * kv_elem_bytes  # the gather, and the bulk of it
     idx = nnz * 4  # int32 index stream, read once
     q = num_tokens * num_heads * D_QK * kv_elem_bytes
     out = num_tokens * num_heads * KV_LORA_RANK * 2
-    partials = 0
-    if num_splits > 1:
-        # [tokens, splits, heads, lora] bf16 accumulator plus the m/l pair
-        partials = 2 * num_tokens * num_splits * num_heads * (KV_LORA_RANK * 2 + 8)
-    return kv + idx + q + out + partials
+    return kv + idx + q + out
 
 
 def build_case(num_seqs, num_tokens, num_heads, context, topk, device="cuda"):
@@ -88,9 +89,6 @@ def build_case(num_seqs, num_tokens, num_heads, context, topk, device="cuda"):
     Every sequence owns its own slice of the pool, so there is no cross-request
     KV sharing to inflate the cache hit rate. Per-token KV length is
     min(pos + 1, topk), which is what the index converter emits.
-
-    A single query token per sequence is a decode step, so it sits at the end of
-    the context. More than one means prefill, and they walk positions 0..n-1.
     """
     torch.manual_seed(0)
     gen = torch.Generator().manual_seed(1)
@@ -126,9 +124,9 @@ def build_case(num_seqs, num_tokens, num_heads, context, topk, device="cuda"):
 
     # fp8 dots want the flat per-tensor format; bf16 dots read kv as it is.
     scale = (kv.float().abs().amax() / E4M3_MAX).clamp_min(1e-30).reshape(1)
-    kv_fp8 = (
-        (kv.float() / scale).clamp(-E4M3_MAX, E4M3_MAX).to(torch.float8_e4m3fn)
-    ).view(torch.uint8)
+    kv_fp8 = ((kv.float() / scale).clamp(-E4M3_MAX, E4M3_MAX).to(E4M3_DTYPE)).view(
+        torch.uint8
+    )
 
     return q, kv, kv_fp8, scale.to(device), indices, indptr.to(device)
 
@@ -185,7 +183,7 @@ def run_benchmark(args):
             # Hand q over already quantized, the way production does.
             cache, scale = kv_fp8, kv_scale
             q_scale = (q.float().abs().amax() / E4M3_MAX).clamp_min(1e-30).reshape(1)
-            q = (q.float() / q_scale).clamp(-E4M3_MAX, E4M3_MAX).to(torch.float8_e4m3fn)
+            q = (q.float() / q_scale).clamp(-E4M3_MAX, E4M3_MAX).to(E4M3_DTYPE)
         else:
             cache, scale, q_scale = kv, None, None
 
@@ -209,13 +207,7 @@ def run_benchmark(args):
         num_tokens = q.shape[0]
         # QK reads the whole row, PV only the latent half
         flops = 2.0 * num_heads * nnz * (D_QK + KV_LORA_RANK)
-        moved = bytes_moved(
-            num_tokens,
-            num_heads,
-            nnz,
-            1 if dots == "fp8" else 2,
-            _mla_num_splits(num_tokens, 1, nnz / num_tokens),
-        )
+        moved = bytes_moved(num_tokens, num_heads, nnz, 1 if dots == "fp8" else 2)
 
         if metric == "time":
             return time_ms
