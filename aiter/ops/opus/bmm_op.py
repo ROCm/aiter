@@ -422,7 +422,11 @@ def _heuristic_bpreshuffle_kid(
             # regression (+0.5% to +2.6%) sat at wg35 <= 128. One CU each is
             # the cut.
             if wg35 * 4 >= cus * 3:
-                return 56 if wg35 >= cus else 35
+                # kid60 is kid56's C_VIA_LDS epilogue on kid46's 4-wave 2x2
+                # wave grid, so the per-wave tile is square (kExpM=kExpN=8,
+                # 1.0 ds_reads/WMMA). Bracketed A/B at full clock 24/24 rounds:
+                # -7.6%/-1.6%/-3.1%/-2.2% at m 2048/4096/8192/16384.
+                return 60 if wg35 >= cus else 35
             return 47
         # Below half a machine the incumbent is kid31, which already exists to
         # buy parallelism from a narrow tile. kid47 beats it once there are
