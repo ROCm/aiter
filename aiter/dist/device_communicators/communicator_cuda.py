@@ -70,6 +70,10 @@ class CudaCommunicator(DeviceCommunicatorBase):
             self.pynccl_comm = reuse_from.pynccl_comm
             self.ca_comm = reuse_from.ca_comm
             self.qr_comm = reuse_from.qr_comm
+            # Borrowed, not owned: the group this was built for still uses it,
+            # so destroy() here must not close its IPC inboxes.
+            self.fly_comm = reuse_from.fly_comm
+            self._owns_fly_comm = False
             self.symm_mem_comm = reuse_from.symm_mem_comm
             return
 
@@ -101,6 +105,8 @@ class CudaCommunicator(DeviceCommunicatorBase):
 
         self.ca_comm: CustomAllreduce | None = None
         self.qr_comm = None
+        self.fly_comm = None
+        self._owns_fly_comm = True
         self.symm_mem_comm = None
         # if use_torch_symm_mem and current_platform.is_cuda():
         #     self.symm_mem_comm = SymmMemCommunicator(
@@ -129,6 +135,15 @@ class CudaCommunicator(DeviceCommunicatorBase):
             #     # If it's a rocm, 'use_custom_allreduce==True' means it must
             #     # currently be an MI300 series.
             self.qr_comm = QuickAllReduce(group=self.cpu_group, device=self.device)
+
+            # FlyDSL all-reduce family: exact one-shot / quantized mesh / ring,
+            # selected by payload size. Opt-in behind AITER_FLY_AR, and the
+            # policy tables are PCIe-only for now.
+            from aiter.dist.device_communicators.flydsl_all_reduce import (
+                FlyDSLAllReduce,
+            )
+
+            self.fly_comm = FlyDSLAllReduce(group=self.cpu_group, device=self.device)
 
     @property
     def all2all_manager(self):
@@ -193,8 +208,22 @@ class CudaCommunicator(DeviceCommunicatorBase):
         ca_fp8_quant: bool = False,
         prefill_support: bool = False,
     ) -> torch.Tensor:
-        # always try quick reduce first, then custom allreduce,
+        # FlyDSL first when enabled, then quick reduce, then custom allreduce,
         # and then pynccl. (quick reduce just for ROCM MI3*)
+        #
+        # FlyDSL leads because at the sizes it accepts it is the exact one-shot
+        # schedule, which is bit-comparable with cross_device_reduce rather
+        # than quantized. It declines everything else.
+        fly_comm = self.fly_comm
+        if (
+            fly_comm is not None
+            and not fly_comm.disabled
+            and fly_comm.should_fly_all_reduce(input_)
+        ):
+            out = fly_comm.fly_all_reduce(input_)
+            assert out is not None
+            return out
+
         qr_comm = self.qr_comm
         if (
             qr_comm is not None
@@ -903,6 +932,14 @@ class CudaCommunicator(DeviceCommunicatorBase):
             self.pynccl_comm = None
         if self.qr_comm is not None:
             self.qr_comm = None
+        if self.fly_comm is not None:
+            # Closed rather than merely dropped: it holds IPC inboxes opened
+            # against every peer, and the peers' handles have to be released
+            # before the process group goes away. A borrowed engine belongs to
+            # the group it was built for, which closes it itself.
+            if self._owns_fly_comm:
+                self.fly_comm.close()
+            self.fly_comm = None
         if self.ca_comm is not None:
             self.ca_comm = None
         if self._all2all_manager is not None:
