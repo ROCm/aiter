@@ -1280,7 +1280,18 @@ def get_mla_metadata_info_v1(
     # size for it would undersize reduce_partial_map, which faults the GPU
     # rather than raising.
     if fast_mode and max_split_per_batch > 0:
-        per_tile_cap = min(max_splits, max_split_per_batch * batch_size)
+        # The planner folds head counts it does not natively serve down to 16
+        # and scales its batch count up by the same ratio BEFORE applying the
+        # cap (v1_2_device.cuh:924-928 then 948-950), so its budget is
+        # `cap * batch_size * qk_batch_ratio`. Mirroring `natively_supported`
+        # here would duplicate a long arch/dtype gate and drift from it, so
+        # assume the fold whenever it could apply: per_tile_cap is min()ed with
+        # max_splits, so over-estimating can only raise it toward the uncapped
+        # bound and never below what the planner can emit.
+        qk_batch_ratio = num_head_qo // 16 if num_head_qo % 16 == 0 else 1
+        per_tile_cap = min(
+            max_splits, max_split_per_batch * batch_size * max(1, qk_batch_ratio)
+        )
         # Take the min. `tile_cnt + per_tile_cap` is the cap-aware bound; the
         # fast_mode estimate above assumes an unbounded per-batch split budget,
         # so combining them with max() lets the loose estimate always win and a

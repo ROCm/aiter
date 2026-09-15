@@ -82,9 +82,9 @@ def test_a_tight_cap_actually_shrinks_the_allocation(batch_size):
     Measured on gfx950, reduce_partial_map entries at nhead=128, qo_len=4:
 
         batch   uncapped   cap=1   cap=256
-            1       1024       5       260
-            8       1052      40       288
-           64       1276     320       512
+            1       1024      12       260
+            8       1052      96       288
+           64       1276     512       512
     """
     uncapped = _reduce_partial_map_size(batch_size, max_split_per_batch=-1)
     capped = _reduce_partial_map_size(batch_size, max_split_per_batch=1)
