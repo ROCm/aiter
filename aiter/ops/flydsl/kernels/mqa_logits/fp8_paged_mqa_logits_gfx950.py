@@ -57,7 +57,7 @@ W_LDS_OFF = Q_LDS_OFF + Q_LDS_BYTES
 
 _NEUTRAL_E8M0 = 0x7F7F7F7F
 _GFX950 = "gfx950"
-DEFAULT_COMPILE_HINTS = {"waves_per_eu": 2, "fast_fp_math": True}
+DEFAULT_COMPILE_HINTS = {"waves_per_eu": 6, "fast_fp_math": True}
 
 
 def udiv(a, b):
