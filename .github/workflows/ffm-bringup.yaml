@@ -1,6 +1,6 @@
 name: FFM Triton Tests
 
-run-name: FFM Triton tests on ${{ inputs.runner || 'linux-aiter-do-mi350x-1' }}
+run-name: FFM Triton tests on ${{ inputs.runner || 'linux-aiter-build-mi250' }}
 
 on:
   pull_request:
@@ -10,7 +10,7 @@ on:
       runner:
         description: Self-hosted runner label to use for the FFM Triton tests.
         required: true
-        default: linux-aiter-do-mi350x-1
+        default: linux-aiter-build-mi250
         type: string
       docker_image:
         description: FFM image to pull and test.
@@ -27,7 +27,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}-${{ inputs.runner || 'linux-aiter-do-mi350x-1' }}
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ inputs.runner || 'linux-aiter-build-mi250' }}
   cancel-in-progress: true
 
 env:
@@ -38,6 +38,16 @@ env:
   FFM_TRITON_COMMIT: 6cf030fe7bffce12a5712e20fb507a51d5123f10
 
 jobs:
+  ci_config:
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (
+        github.event.action == 'labeled' &&
+        github.event.label.name == 'ci:gfx1250-ffm-triton' &&
+        github.event.pull_request.head.repo.full_name == github.repository
+      )
+    uses: ./.github/workflows/ci-config.yaml
+
   ffm-triton-tests:
     if: >-
       github.event_name == 'workflow_dispatch' ||
@@ -46,8 +56,9 @@ jobs:
         github.event.label.name == 'ci:gfx1250-ffm-triton' &&
         github.event.pull_request.head.repo.full_name == github.repository
       )
-    name: FFM Triton Tests (${{ inputs.runner || 'linux-aiter-do-mi350x-1' }}) / Shard ${{ matrix.shard }}
-    runs-on: ${{ inputs.runner || 'linux-aiter-do-mi350x-1' }}
+    needs: ci_config
+    name: FFM Triton Tests (${{ inputs.runner || 'linux-aiter-build-mi250' }}) / Shard ${{ matrix.shard }}
+    runs-on: ${{ inputs.runner || 'linux-aiter-build-mi250' }}
     timeout-minutes: 7200
     strategy:
       fail-fast: false
@@ -79,17 +90,17 @@ jobs:
 
       - name: Docker login
         env:
-          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
-          DOCKER_PASSWORD: ${{ secrets.DOCKER_PASSWORD }}
+          DOCKER_USERNAME: ${{ secrets[needs.ci_config.outputs.docker_username_secret] }}
+          DOCKER_PASSWORD_SECRET: ${{ needs.ci_config.outputs.docker_password_secret }}
+          DOCKER_PASSWORD: ${{ secrets[needs.ci_config.outputs.docker_password_secret] }}
         run: |
           set -euo pipefail
           if [ -z "${DOCKER_PASSWORD}" ]; then
-            echo "::error::Missing DOCKER_PASSWORD secret required to pull ${FFM_IMAGE}"
+            echo "::error::Missing ${DOCKER_PASSWORD_SECRET} secret required to pull ${FFM_IMAGE}"
             exit 1
           fi
-          DOCKER_USER="${DOCKERHUB_USERNAME:-rocmshared}"
           for attempt in 1 2 3; do
-            if echo "${DOCKER_PASSWORD}" | docker login -u "${DOCKER_USER}" --password-stdin; then
+            if echo "${DOCKER_PASSWORD}" | docker login -u "${DOCKER_USERNAME}" --password-stdin; then
               echo "Docker login succeeded on attempt ${attempt}"
               exit 0
             fi

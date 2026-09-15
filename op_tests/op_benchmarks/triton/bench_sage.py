@@ -22,14 +22,19 @@ from aiter.ops.mha import (
 )
 from aiter.ops.mha_v4 import (
     AttentionFormat,
+    AttentionPack,
     AttentionScaleMode,
     mha_v4,
+    mha_v4_kv_tile,
     mha_v4_packed,
+    native_fp8_format,
+    scale_modes_for_formats,
+)
+from aiter.ops.mha_v4_quant import (
     mha_v4_q_multiplier,
     mxfp4_k_view,
     mxfp4_v_view,
     mxfp6_k_view,
-    native_fp8_format,
     quantize_fp8,
     quantize_fp8_rotated,
     quantize_int8,
@@ -41,10 +46,11 @@ from aiter.ops.mha_v4 import (
     quantize_mxfp8_q,
     quantize_v_fp8,
     quantize_v_mxfp4,
+    quantize_v_mxfp4_fp6_p,
     quantize_v_mxfp6,
-    scale_modes_for_formats,
+    quantize_v_mxfp6_fp6_p,
+    rotate_activation_hd128,
 )
-from aiter.ops.quant import rotate_activation
 from aiter.ops.triton._triton_kernels.flash_attn_triton_amd import flash_attn_3
 from aiter.ops.triton.attention.fav3_sage import (
     fav3_sage_func,
@@ -58,11 +64,9 @@ from aiter.ops.triton.attention.fav3_sage_attention_mxfp4_wrapper import (
 )
 from aiter.ops.triton.attention.mha_v3 import _quantize_bshd
 from aiter.ops.triton.attention.utils import block_attn_mask_to_ragged_lut
-from aiter.ops.triton.quant.mxfp6_fmha_pack import pack_fp6_v_data_scale_views
 from aiter.ops.triton.quant.sage_attention_quant_wrappers import (
     create_hadamard_matrix,
     sage_quant,
-    sage_quant_f4f4,
     sage_quant_mxfp4,
 )
 from aiter.test_mha_common import attention_ref, attention_ref_block_sparse
@@ -78,17 +82,13 @@ logging.getLogger().setLevel(logging.INFO)
 logger = logging.getLogger(__name__)
 
 
-def _production_quantize_v(value: torch.Tensor):
-    """Exact tiled V quantization used by the production MX backends."""
-    return quantize_v_fp8(value)
-
-
 def _production_quantize_mxfp4(query, key, value, softmax_scale):
     q_fp4, q_scale = quantize_mxfp4_q(query, mha_v4_q_multiplier(softmax_scale))
     k_raw, k_scale = quantize_mxfp4_k(key)
     k_fp4 = mxfp4_k_view(k_raw, k_scale)
-    v_fp8, v_scale = _production_quantize_v(value)
-    return q_fp4, q_scale, k_fp4, k_scale, v_fp8, v_scale
+    v_raw, v_scale = quantize_v_mxfp4(value)
+    v_fp4 = mxfp4_v_view(v_raw, v_scale, value.shape[1])
+    return q_fp4, q_scale, k_fp4, k_scale, v_fp4, v_scale
 
 
 def _production_quantize_mxfp8(query, key, value, softmax_scale):
@@ -98,25 +98,34 @@ def _production_quantize_mxfp8(query, key, value, softmax_scale):
     return q_fp8, k_fp8, v_fp8, q_scale, k_scale, v_scale
 
 
-def _production_quantize_f4f4(query, key, value, softmax_scale):
+def _production_quantize_f4f4(query, key, value, softmax_scale, fp6_p=True):
     q_fp4, q_scale = quantize_mxfp4_q(query, mha_v4_q_multiplier(softmax_scale))
     k_raw, k_scale = quantize_mxfp4_k(key)
     k_fp4 = mxfp4_k_view(k_raw, k_scale)
-    v_raw, v_scale = quantize_v_mxfp4(value)
+    quantize_v = quantize_v_mxfp4_fp6_p if fp6_p else quantize_v_mxfp4
+    v_raw, v_scale = quantize_v(value)
     v_fp4 = mxfp4_v_view(v_raw, v_scale, value.shape[1])
     return q_fp4, q_scale, k_fp4, k_scale, v_fp4, v_scale
 
 
-def _production_quantize_mxfp6(query, key, value, softmax_scale, mxfp4_v=False):
+def _production_quantize_mxfp6(
+    query, key, value, softmax_scale, v_format=None, fp6_p=False
+):
     q_fp6, q_scale = quantize_mxfp6_q(query, mha_v4_q_multiplier(softmax_scale))
     k_raw, k_scale_raw = quantize_mxfp6_k(key)
     batch, sequence, heads, _ = key.shape
     k_fp6, k_scale = mxfp6_k_view(k_raw, k_scale_raw, batch, sequence, heads)
-    if not mxfp4_v:
-        v_quantized, v_scale = _production_quantize_v(value)
+    if v_format is None:
+        v_quantized, v_scale = quantize_v_fp8(value)
         return q_fp6, q_scale, k_fp6, k_scale, v_quantized, v_scale
 
-    v_raw, v_scale = quantize_v_mxfp4(value)
+    if v_format == AttentionFormat.MXFP6:
+        quantize_v = quantize_v_mxfp6_fp6_p if fp6_p else quantize_v_mxfp6
+        return q_fp6, q_scale, k_fp6, k_scale, *quantize_v(value)
+    if v_format != AttentionFormat.MXFP4:
+        raise ValueError(f"unsupported MXFP6 Q/K V format: {v_format!r}")
+    quantize_v = quantize_v_mxfp4_fp6_p if fp6_p else quantize_v_mxfp4
+    v_raw, v_scale = quantize_v(value)
     v_quantized = mxfp4_v_view(v_raw, v_scale, value.shape[1])
     return q_fp6, q_scale, k_fp6, k_scale, v_quantized, v_scale
 
@@ -128,46 +137,96 @@ arg_to_torch_dtype = {
 }
 
 
-KernelName = Literal[
-    "sage_fp8",
-    "sage_mxfp4",
-    "fav3_fp8",
-    "aiter_i8fp8",
-    "aiter_mxfp8",
-    "aiter_fp8",
-    "aiter_f8f6",
-    "aiter_mxfp6",
-    "aiter_f6f4",
-    "aiter_mxfp4",
-    "aiter_f4f4",
-    "aiter_bf16",
-]
+@dataclass(frozen=True)
+class KernelSpec:
+    # Logical Q/K/V payload bytes. Scale metadata and tile padding are excluded.
+    payload_bytes: tuple[float, float, float]
+    quantized: bool = False
+    supports_block_sparse: bool = False
+    uses_hadamard: bool = False
+    supports_causal: bool = True
+    include_in_all: bool = False
 
-ALL_KERNELS: list[str] = [
-    "aiter_i8fp8",
-    "aiter_mxfp8",
-    "aiter_fp8",
-    "aiter_f8f6",
-    "aiter_mxfp6",
-    "aiter_f6f4",
-    "aiter_mxfp4",
-    "aiter_f4f4",
-    "aiter_bf16",
-]
 
-QUANT_KERNELS = {
-    "sage_fp8",
-    "sage_mxfp4",
-    "fav3_fp8",
-    "aiter_i8fp8",
-    "aiter_mxfp8",
-    "aiter_fp8",
-    "aiter_f8f6",
-    "aiter_mxfp6",
-    "aiter_f6f4",
-    "aiter_mxfp4",
-    "aiter_f4f4",
+def _mha_v4_spec(
+    payload_bytes: tuple[float, float, float],
+    *,
+    quantized: bool = True,
+    supports_block_sparse: bool = False,
+    uses_hadamard: bool = False,
+) -> KernelSpec:
+    return KernelSpec(
+        payload_bytes,
+        quantized=quantized,
+        supports_block_sparse=supports_block_sparse,
+        uses_hadamard=uses_hadamard,
+        supports_causal=False,
+        include_in_all=True,
+    )
+
+
+KERNEL_SPECS = {
+    "sage_fp8": KernelSpec(
+        (1.0, 1.0, 1.0),
+        quantized=True,
+        supports_block_sparse=True,
+        uses_hadamard=True,
+    ),
+    "sage_mxfp4": KernelSpec(
+        (0.5, 0.5, 1.0),
+        quantized=True,
+        supports_block_sparse=True,
+        uses_hadamard=True,
+    ),
+    "fav3_fp8": KernelSpec((1.0, 1.0, 1.0), quantized=True, uses_hadamard=True),
+    "aiter_bf16": KernelSpec((2.0, 2.0, 2.0), include_in_all=True),
+    "mha4_bf16": _mha_v4_spec((2.0, 2.0, 2.0), quantized=False),
+    "mha4_bf16fp8": _mha_v4_spec((2.0, 2.0, 1.0)),
+    "mha4_i8fp8": _mha_v4_spec((1.0, 1.0, 1.0), supports_block_sparse=True),
+    "mha4_mxfp8": _mha_v4_spec(
+        (1.0, 1.0, 1.0),
+        supports_block_sparse=True,
+        uses_hadamard=True,
+    ),
+    "mha4_fp8": _mha_v4_spec(
+        (1.0, 1.0, 1.0),
+        supports_block_sparse=True,
+        uses_hadamard=True,
+    ),
+    "mha4_f8f6": _mha_v4_spec(
+        (1.0, 1.0, 0.75),
+        supports_block_sparse=True,
+        uses_hadamard=True,
+    ),
+    "mha4_f6f8": _mha_v4_spec(
+        (0.75, 0.75, 1.0),
+        supports_block_sparse=True,
+        uses_hadamard=True,
+    ),
+    "mha4_mxfp6": _mha_v4_spec(
+        (0.75, 0.75, 0.75),
+        uses_hadamard=True,
+    ),
+    "mha4_f6f4": _mha_v4_spec(
+        (0.75, 0.75, 0.5),
+        supports_block_sparse=True,
+        uses_hadamard=True,
+    ),
+    "mha4_mxfp4": _mha_v4_spec(
+        (0.5, 0.5, 0.5),
+        supports_block_sparse=True,
+        uses_hadamard=True,
+    ),
+    "mha4_f4f4": _mha_v4_spec(
+        (0.5, 0.5, 0.5),
+        supports_block_sparse=True,
+        uses_hadamard=True,
+    ),
 }
+
+ALL_KERNELS = tuple(
+    kernel for kernel, spec in KERNEL_SPECS.items() if spec.include_in_all
+)
 
 
 @dataclass
@@ -379,7 +438,7 @@ def generate_test_tensors(
         )
         return q.to(dtype), k.to(dtype), v.to(dtype)
 
-    if distribution == "latesink":
+    if distribution == "latepeak":
         # ADVERSARIAL TRIPWIRE for the frozen-max rollback (added 2026-06-14 after the black-video
         # regression). Mirrors `underflow` but places the high-norm "attention sink" hotspot in the
         # LAST KV tile instead of the first. With a frozen-max rollback that seeds from tile 0, the
@@ -387,9 +446,13 @@ def generate_test_tensors(
         # saturates to 0xFFFFFFFF (NaN bits) -> corrupt P -> NaN/black. The exact (proper running
         # max) path is immune (S - m_new <= 0 always). Random transformer/normal/underflow never
         # produce a late-tile outlier, so this is the structured input cosine-on-random missed.
-        #   AITER_LATESINK_GAP : late-hotspot logit in nats (default 40.0 -> well past the cvt
+        #   AITER_LATEPEAK_GAP : late-peak logit in nats (default 40.0 -> well past the cvt
         #                        saturation at scale_log2e*(S-seed) > 128 for 1/sqrt(d) scaling)
-        gap = float(os.environ.get("AITER_LATESINK_GAP", "40.0"))
+        gap = float(
+            os.environ.get(
+                "AITER_LATEPEAK_GAP", os.environ.get("AITER_LATESINK_GAP", "40.0")
+            )
+        )
         scale = float(d_head) ** -0.5
         hot_keys = min(128, sk)  # one KV tile
         u = torch.randn((1, 1, 1, d_head), device=device, dtype=torch.float32)
@@ -598,7 +661,11 @@ def load_block_mask_from_json(
     return None
 
 
-def kernel_block_sizes(kernel: KernelName) -> tuple[int, int]:
+def kernel_block_sizes(kernel: str) -> tuple[int, int]:
+    # MHA v4's sparse tile is set by its manifest row, not by the Triton configs
+    # below: 256x128 on gfx950 but 256x64 on gfx942.
+    if kernel.startswith("mha4_"):
+        return 256, mha_v4_kv_tile()
     if kernel == "sage_mxfp4":
         cfg = get_sage_fwd_configs_mxfp4()
     else:
@@ -667,7 +734,7 @@ def build_block_mask(
 
 
 def sparse_flops_from_lut(
-    kernel: KernelName,
+    kernel: str,
     block_lut: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
     shape: ShapeSpec,
 ) -> tuple[float, float]:
@@ -710,42 +777,14 @@ def fp8_quantize(
     return q_quant, k_quant, v_quant, q_descale, k_descale, v_descale
 
 
-def f8f6_quantize(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    rotate_qk: bool = True,
-    v_scale_mode: Literal["block", "tensor", "head"] = "block",
-) -> tuple[
-    torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor
-]:
-    quantize_qk = quantize_fp8_rotated if rotate_qk else quantize_fp8
-    q_quant, q_descale = quantize_qk(q)
-    k_quant, k_descale = quantize_qk(k)
-    if v_scale_mode == "block":
-        v_quant, v_descale = quantize_v_mxfp6(v)
-    else:
-        reduce_dims = (0, 1, 2, 3) if v_scale_mode == "tensor" else (1, 3)
-        amax = v.abs().to(torch.float32).amax(dim=reduce_dims, keepdim=True)
-        scale = torch.clamp(amax / 7.5, min=torch.finfo(torch.float32).tiny)
-        v_quant, v_descale = pack_fp6_v_data_scale_views(
-            v.to(torch.float32) / scale, fixed_e8m0=True
-        )
-        batch, _, heads, _ = v.shape
-        scale_by_head = scale.expand(batch, 1, heads, 1)[:, 0, :, 0].contiguous()
-        scale_bytes = scale_by_head.view(torch.uint8).reshape(batch, heads, 4)
-        v_descale.view(batch, heads, -1)[..., :4] = scale_bytes
-    return q_quant, k_quant, v_quant, q_descale, k_descale, v_descale
-
-
 def cancel_internal_qk_rotation(
     q: torch.Tensor, k: torch.Tensor
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Pre-rotate Q/K so a fused production Hadamard quantizer emits raw-domain Q/K."""
     q_rotated = torch.empty_like(q)
     k_rotated = torch.empty_like(k)
-    rotate_activation(q_rotated, q)
-    rotate_activation(k_rotated, k)
+    rotate_activation_hd128(q_rotated, q)
+    rotate_activation_hd128(k_rotated, k)
     return q_rotated, k_rotated
 
 
@@ -890,15 +929,17 @@ def make_fav3_fp8_runner(
     )
 
 
-def make_torch_ref_runner(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    causal: bool,
-) -> Any:
-    return lambda: attention_ref(
-        q, k, v, dropout_p=0.0, dropout_mask=None, causal=causal
-    )
+def _mha_v4_packed_sparse_kwargs(
+    block_lut: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None,
+) -> dict[str, torch.Tensor]:
+    if block_lut is None:
+        return {}
+    kv_block_indices, lut_start, lut_count = block_lut
+    return {
+        "kv_block_indices": kv_block_indices,
+        "lut_start": lut_start,
+        "lut_count": lut_count,
+    }
 
 
 def make_kernel_runner(
@@ -907,6 +948,7 @@ def make_kernel_runner(
     k: torch.Tensor,
     v: torch.Tensor,
     block_lut: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None,
+    block_mask: torch.Tensor | None = None,
 ) -> Any:
     q_bshd, k_bshd, v_bshd = layout_preprocess(
         q, k, v, layout=args.layout, target_layout="bshd"
@@ -921,9 +963,18 @@ def make_kernel_runner(
     i8fp8_scale_modes = scale_modes_for_formats(
         AttentionFormat.INT8, AttentionFormat.INT8, fp8_format
     )
-    mxfp4_scale_modes = scale_modes_for_formats(
-        AttentionFormat.MXFP4, AttentionFormat.MXFP4, fp8_format
+    packed_sparse = _mha_v4_packed_sparse_kwargs(block_lut)
+    raw_sparse = (
+        {"block_mask": block_mask}
+        if block_lut is not None and block_mask is not None
+        else {}
     )
+
+    def launch_mha_v4_packed(*tensors, **kwargs):
+        return mha_v4_packed(*tensors, **packed_sparse, **kwargs)
+
+    def launch_mha_v4(*tensors, **kwargs):
+        return mha_v4(*tensors, **raw_sparse, **kwargs)
 
     if args.kernel == "sage_fp8":
         block_r = args.block_r
@@ -1074,17 +1125,69 @@ def make_kernel_runner(
             return_attn_probs=False,
         )
 
-    if args.kernel == "aiter_fp8":
+    if args.kernel == "mha4_bf16":
+        return lambda: launch_mha_v4(
+            q_bshd,
+            k_bshd,
+            v_bshd,
+            AttentionFormat.BF16,
+            AttentionFormat.BF16,
+            AttentionFormat.BF16,
+            softmax_scale=softmax_scale,
+        )
 
-        def _run_aiter_fp8():
-            packed = fp8_quantize(
+    if args.kernel == "mha4_bf16fp8":
+        if args.e2e:
+            return lambda: launch_mha_v4(
                 q_bshd,
                 k_bshd,
                 v_bshd,
-                rotate_qk=args.hadamard_rotate,
+                AttentionFormat.BF16,
+                AttentionFormat.BF16,
+                fp8_format,
+                softmax_scale=softmax_scale,
             )
-            return mha_v4_packed(
-                *packed,
+
+        v_quantized, v_descale = quantize_fp8(v_bshd)
+        bf16fp8_scale_modes = scale_modes_for_formats(
+            AttentionFormat.BF16, AttentionFormat.BF16, fp8_format
+        )
+        return lambda: launch_mha_v4_packed(
+            q_bshd,
+            k_bshd,
+            v_quantized,
+            q_bshd,
+            k_bshd,
+            v_descale,
+            AttentionFormat.BF16,
+            AttentionFormat.BF16,
+            fp8_format,
+            *bf16fp8_scale_modes,
+            softmax_scale=softmax_scale,
+        )
+
+    if args.kernel == "mha4_fp8":
+        if args.hadamard_rotate and args.block_r != 128:
+            raise ValueError("mha4_fp8 Hadamard preprocessing requires block_r=128")
+        if args.e2e and args.hadamard_rotate:
+            return lambda: launch_mha_v4(
+                q_bshd,
+                k_bshd,
+                v_bshd,
+                fp8_format,
+                fp8_format,
+                fp8_format,
+                softmax_scale=softmax_scale,
+            )
+
+        if args.e2e:
+            return lambda: launch_mha_v4_packed(
+                *fp8_quantize(
+                    q_bshd,
+                    k_bshd,
+                    v_bshd,
+                    rotate_qk=args.hadamard_rotate,
+                ),
                 fp8_format,
                 fp8_format,
                 fp8_format,
@@ -1092,10 +1195,8 @@ def make_kernel_runner(
                 softmax_scale=softmax_scale,
             )
 
-        if args.e2e:
-            return _run_aiter_fp8
         packed = fp8_quantize(q_bshd, k_bshd, v_bshd, rotate_qk=args.hadamard_rotate)
-        return lambda: mha_v4_packed(
+        return lambda: launch_mha_v4_packed(
             *packed,
             fp8_format,
             fp8_format,
@@ -1104,19 +1205,18 @@ def make_kernel_runner(
             softmax_scale=softmax_scale,
         )
 
-    if args.kernel == "aiter_mxfp8":
+    if args.kernel == "mha4_mxfp8":
         if not args.hadamard_rotate or args.block_r != 128 or args.qsmooth:
-            raise ValueError("aiter_mxfp8 requires block_r=128 Hadamard rotation")
+            raise ValueError("mha4_mxfp8 requires block_r=128 Hadamard rotation")
         mxfp8_scale_modes = (
             AttentionScaleMode.E8M0_PER_1X32,
             AttentionScaleMode.E8M0_PER_1X32,
             AttentionScaleMode.F32_PER_TENSOR,
         )
 
-        def _run_aiter_mxfp8():
-            packed = _production_quantize_mxfp8(q_bshd, k_bshd, v_bshd, softmax_scale)
-            return mha_v4_packed(
-                *packed,
+        if args.e2e:
+            return lambda: launch_mha_v4_packed(
+                *_production_quantize_mxfp8(q_bshd, k_bshd, v_bshd, softmax_scale),
                 fp8_format,
                 fp8_format,
                 fp8_format,
@@ -1124,10 +1224,8 @@ def make_kernel_runner(
                 softmax_scale=softmax_scale,
             )
 
-        if args.e2e:
-            return _run_aiter_mxfp8
         packed = _production_quantize_mxfp8(q_bshd, k_bshd, v_bshd, softmax_scale)
-        return lambda: mha_v4_packed(
+        return lambda: launch_mha_v4_packed(
             *packed,
             fp8_format,
             fp8_format,
@@ -1136,64 +1234,52 @@ def make_kernel_runner(
             softmax_scale=softmax_scale,
         )
 
-    if args.kernel == "aiter_f8f6":
-        if args.qsmooth or (args.hadamard_rotate and args.block_r != 128):
+    if args.kernel == "mha4_f8f6":
+        if args.qsmooth or not args.hadamard_rotate or args.block_r != 128:
             raise ValueError(
-                "aiter_f8f6 Hadamard preprocessing requires block_r=128 "
+                "mha4_f8f6 requires block_r=128 Hadamard preprocessing "
                 "and does not support --qsmooth"
             )
-        if args.e2e and args.hadamard_rotate and args.f8f6_v_scale == "block":
-            return lambda: mha_v4(
-                q_bshd,
-                k_bshd,
-                v_bshd,
-                fp8_format,
-                fp8_format,
-                AttentionFormat.MXFP6,
-                softmax_scale=softmax_scale,
-            )
-
-        def _run_aiter_f8f6():
-            packed = f8f6_quantize(
-                q_bshd,
-                k_bshd,
-                v_bshd,
-                rotate_qk=args.hadamard_rotate,
-                v_scale_mode=args.f8f6_v_scale,
-            )
-            return mha_v4_packed(
-                *packed,
-                fp8_format,
-                fp8_format,
-                AttentionFormat.MXFP6,
-                *f8f6_scale_modes,
-                softmax_scale=softmax_scale,
-            )
-
         if args.e2e:
-            return _run_aiter_f8f6
-        packed = f8f6_quantize(
-            q_bshd,
-            k_bshd,
-            v_bshd,
-            rotate_qk=args.hadamard_rotate,
-            v_scale_mode=args.f8f6_v_scale,
-        )
-        return lambda: mha_v4_packed(
-            *packed,
+            return lambda: launch_mha_v4(
+                q_bshd,
+                k_bshd,
+                v_bshd,
+                fp8_format,
+                fp8_format,
+                AttentionFormat.MXFP6,
+                softmax_scale=softmax_scale,
+            )
+
+        q_quantized, q_descale = quantize_fp8_rotated(q_bshd)
+        k_quantized, k_descale = quantize_fp8_rotated(k_bshd)
+        if block_lut is None:
+            v_quantized, v_descale = quantize_v_mxfp6_fp6_p(v_bshd)
+            v_pack = AttentionPack.V_FOR_FP6_P
+        else:
+            v_quantized, v_descale = quantize_v_mxfp6(v_bshd)
+            v_pack = AttentionPack.DEFAULT
+        return lambda: launch_mha_v4_packed(
+            q_quantized,
+            k_quantized,
+            v_quantized,
+            q_descale,
+            k_descale,
+            v_descale,
             fp8_format,
             fp8_format,
             AttentionFormat.MXFP6,
             *f8f6_scale_modes,
             softmax_scale=softmax_scale,
+            v_pack=v_pack,
         )
 
-    if args.kernel == "aiter_i8fp8":
+    if args.kernel == "mha4_i8fp8":
         q_clip = args.q_clip if args.q_clip is not None else args.qk_clip
         k_clip = args.k_clip if args.k_clip is not None else args.qk_clip
 
         if args.e2e:
-            return lambda: mha_v4(
+            return lambda: launch_mha_v4(
                 q_bshd,
                 k_bshd,
                 v_bshd,
@@ -1210,7 +1296,7 @@ def make_kernel_runner(
             q_clip=q_clip,
             k_clip=k_clip,
         )
-        return lambda: mha_v4_packed(
+        return lambda: launch_mha_v4_packed(
             q_i8,
             k_i8,
             v_fp8,
@@ -1224,111 +1310,79 @@ def make_kernel_runner(
             softmax_scale=softmax_scale,
         )
 
-    if args.kernel in ("aiter_mxfp4", "aiter_f4f4"):
-        cfg = get_sage_fwd_configs_mxfp4()
-        fp8_type = aiter.dtypes.fp8
-        fp8_max = torch.finfo(fp8_type).max
-
+    if args.kernel in ("mha4_mxfp4", "mha4_f4f4"):
         block_r = args.block_r
         if block_r != 128:
             raise ValueError(f"{args.kernel} requires block_r=128, got {block_r}")
-        r = create_hadamard_matrix(
-            block_r, device=q_bshd.device, dtype=q_bshd.dtype
-        ) / (block_r**0.5)
+        if args.qsmooth:
+            raise ValueError(f"{args.kernel} does not support --qsmooth")
 
-        # sage_quant_mxfp4 folds sm_scale into Q before fp4 quant, so the kernel
-        # consumes a pre-scaled Q and must NOT re-apply the scale (doing so
-        # double-scales the softmax). Pin the fold scale to the same softmax_scale
-        # used by the reference and pass it through explicitly.
+        is_f4f4 = args.kernel == "mha4_f4f4"
+        sparse_mxfp4 = args.kernel == "mha4_mxfp4" and block_lut is not None
+        v_format = fp8_format if sparse_mxfp4 else AttentionFormat.MXFP4
+        scale_modes = scale_modes_for_formats(
+            AttentionFormat.MXFP4, AttentionFormat.MXFP4, v_format
+        )
+        use_dense_p_pack = block_lut is None
+        v_pack = (
+            AttentionPack.V_FOR_FP6_P
+            if is_f4f4 and use_dense_p_pack
+            else AttentionPack.DEFAULT
+        )
+
         def _quantize_mxfp4():
             quant_q, quant_k = q_bshd, k_bshd
             if not args.hadamard_rotate:
-                if args.kernel == "aiter_mxfp4" or block_r == 128:
-                    quant_q, quant_k = cancel_internal_qk_rotation(quant_q, quant_k)
-                else:
-                    quant_q, quant_k = rotate_qk_blocks(quant_q, quant_k, block_r)
-            if args.kernel == "aiter_mxfp4":
-                if args.qsmooth or (args.hadamard_rotate and block_r != 128):
-                    raise ValueError(
-                        "production aiter_mxfp4 preprocessing requires Hadamard block_r=128 "
-                        "and does not support --qsmooth"
-                    )
-                return (
-                    *_production_quantize_mxfp4(
-                        quant_q, quant_k, v_bshd, softmax_scale
-                    ),
-                    None,
+                quant_q, quant_k = cancel_internal_qk_rotation(quant_q, quant_k)
+            if is_f4f4:
+                return _production_quantize_f4f4(
+                    quant_q, quant_k, v_bshd, softmax_scale, use_dense_p_pack
                 )
-            if not args.qsmooth and block_r == 128:
-                return (
-                    *_production_quantize_f4f4(quant_q, quant_k, v_bshd, softmax_scale),
-                    None,
+            if sparse_mxfp4:
+                q_fp4, q_scale = quantize_mxfp4_q(
+                    quant_q, mha_v4_q_multiplier(softmax_scale)
                 )
-            return sage_quant_f4f4(
-                quant_q,
-                quant_k,
-                v_bshd,
-                fp8_type,
-                fp8_max,
-                BLKQ=cfg["BLOCK_M"],
-                BLKK=64,
-                layout="bshd",
-                R=r,
-                BLOCK_R=block_r,
-                sm_scale=softmax_scale,
-                q_smoothing=args.qsmooth,
-            )
+                k_raw, k_scale = quantize_mxfp4_k(quant_k)
+                k_fp4 = mxfp4_k_view(k_raw, k_scale)
+                v_fp8, v_scale = quantize_v_fp8(v_bshd)
+                return q_fp4, q_scale, k_fp4, k_scale, v_fp8, v_scale
+            return _production_quantize_mxfp4(quant_q, quant_k, v_bshd, softmax_scale)
 
-        # f4f4 emits true-MXFP4 V in the kernel's col-major LDS layout.
-        def _kernel_mxfp4(q_fp4, q_descale, k_fp4, k_descale, v_fp8, v_descale):
-            return mha_v4_packed(
+        def _kernel_mxfp4(q_fp4, q_descale, k_fp4, k_descale, v_quantized, v_descale):
+            return launch_mha_v4_packed(
                 q_fp4,
                 k_fp4,
-                v_fp8,
+                v_quantized,
                 q_descale,
                 k_descale,
                 v_descale,
                 AttentionFormat.MXFP4,
                 AttentionFormat.MXFP4,
-                (fp8_format if args.kernel == "aiter_mxfp4" else AttentionFormat.MXFP4),
-                *(
-                    mxfp4_scale_modes
-                    if args.kernel == "aiter_mxfp4"
-                    else scale_modes_for_formats(
-                        AttentionFormat.MXFP4,
-                        AttentionFormat.MXFP4,
-                        AttentionFormat.MXFP4,
-                    )
-                ),
+                v_format,
+                *scale_modes,
                 softmax_scale=softmax_scale,
+                v_pack=v_pack,
             )
-
-        def _run_aiter_mxfp4():
-            *packed, _delta_s = _quantize_mxfp4()
-            return _kernel_mxfp4(*packed)
 
         if args.e2e:
             if args.hadamard_rotate:
-                return lambda: mha_v4(
+                return lambda: launch_mha_v4(
                     q_bshd,
                     k_bshd,
                     v_bshd,
                     AttentionFormat.MXFP4,
                     AttentionFormat.MXFP4,
-                    (
-                        fp8_format
-                        if args.kernel == "aiter_mxfp4"
-                        else AttentionFormat.MXFP4
-                    ),
+                    v_format,
                     softmax_scale=softmax_scale,
                 )
-            return _run_aiter_mxfp4
+            return lambda: _kernel_mxfp4(*_quantize_mxfp4())
 
-        *packed, _delta_s = _quantize_mxfp4()
+        packed = _quantize_mxfp4()
         return lambda: _kernel_mxfp4(*packed)
 
-    if args.kernel in ("aiter_mxfp6", "aiter_f6f4"):
-        _is_f6f4 = args.kernel == "aiter_f6f4"
+    if args.kernel in ("mha4_f6f8", "mha4_mxfp6", "mha4_f6f4"):
+        is_f6f4 = args.kernel == "mha4_f6f4"
+        is_mxfp6 = args.kernel == "mha4_mxfp6"
         block_r = args.block_r
         if args.qsmooth or (args.hadamard_rotate and block_r != 128):
             raise ValueError(
@@ -1340,54 +1394,62 @@ def make_kernel_runner(
             quant_q, quant_k = q_bshd, k_bshd
             if not args.hadamard_rotate:
                 quant_q, quant_k = cancel_internal_qk_rotation(quant_q, quant_k)
-            return (
-                *_production_quantize_mxfp6(
-                    quant_q,
-                    quant_k,
-                    v_bshd,
-                    softmax_scale,
-                    mxfp4_v=_is_f6f4,
+            return _production_quantize_mxfp6(
+                quant_q,
+                quant_k,
+                v_bshd,
+                softmax_scale,
+                v_format=(
+                    AttentionFormat.MXFP4
+                    if is_f6f4
+                    else AttentionFormat.MXFP6 if is_mxfp6 else None
                 ),
-                None,
+                fp6_p=(is_f6f4 or is_mxfp6) and block_lut is None,
             )
 
-        def _kernel_mxfp6(q_fp4, q_descale, k_fp4, k_descale, v_quantized, v_descale):
-            return mha_v4_packed(
-                q_fp4,
-                k_fp4,
+        v_format = (
+            AttentionFormat.MXFP4
+            if is_f6f4
+            else AttentionFormat.MXFP6 if is_mxfp6 else fp8_format
+        )
+        scale_modes = scale_modes_for_formats(
+            AttentionFormat.MXFP6, AttentionFormat.MXFP6, v_format
+        )
+
+        def _kernel_mxfp6(q_fp6, q_descale, k_fp6, k_descale, v_quantized, v_descale):
+            return launch_mha_v4_packed(
+                q_fp6,
+                k_fp6,
                 v_quantized,
                 q_descale,
                 k_descale,
                 v_descale,
                 AttentionFormat.MXFP6,
                 AttentionFormat.MXFP6,
-                AttentionFormat.MXFP4 if _is_f6f4 else fp8_format,
-                *scale_modes_for_formats(
-                    AttentionFormat.MXFP6,
-                    AttentionFormat.MXFP6,
-                    AttentionFormat.MXFP4 if _is_f6f4 else fp8_format,
+                v_format,
+                *scale_modes,
+                v_pack=(
+                    AttentionPack.V_FOR_FP6_P
+                    if (is_f6f4 or is_mxfp6) and block_lut is None
+                    else AttentionPack.DEFAULT
                 ),
                 softmax_scale=softmax_scale,
             )
 
-        def _run_aiter_mxfp6():
-            *packed, _delta_s = _quantize_mxfp6()
-            return _kernel_mxfp6(*packed)
-
         if args.e2e:
             if args.hadamard_rotate:
-                return lambda: mha_v4(
+                return lambda: launch_mha_v4(
                     q_bshd,
                     k_bshd,
                     v_bshd,
                     AttentionFormat.MXFP6_E2M3,
                     AttentionFormat.MXFP6_E2M3,
-                    AttentionFormat.MXFP4 if _is_f6f4 else fp8_format,
+                    v_format,
                     softmax_scale=softmax_scale,
                 )
-            return _run_aiter_mxfp6
+            return lambda: _kernel_mxfp6(*_quantize_mxfp6())
 
-        *packed, _delta_s = _quantize_mxfp6()
+        packed = _quantize_mxfp6()
         return lambda: _kernel_mxfp6(*packed)
 
     if args.kernel == "fav3_fp8":
@@ -1442,29 +1504,24 @@ def check_output_against_reference(
     current: torch.Tensor,
     reference: torch.Tensor,
 ) -> None:
-    print(current.flatten()[:20], reference.flatten()[:20])
-    # Guard against NaN/Inf in the kernel output before any accuracy stats are
-    # computed (a non-finite output silently wrecks cosine/MAE and is the usual
-    # symptom of softmax tail overflow -- see the "latesink" input distribution).
-    import os as _os
-
-    if _os.environ.get("DUMP_PROBE"):
+    if os.environ.get("DUMP_PROBE"):
         torch.save(
             {
                 "current": current.detach().float().cpu(),
                 "reference": reference.detach().float().cpu(),
             },
-            _os.environ["DUMP_PROBE"],
+            os.environ["DUMP_PROBE"],
         )
-        print(f"[DUMP_PROBE] saved to {_os.environ['DUMP_PROBE']}")
+        print(f"[DUMP_PROBE] saved to {os.environ['DUMP_PROBE']}")
     n_nan = int(torch.isnan(current).sum().item())
     n_inf = int(torch.isinf(current).sum().item())
     if n_nan or n_inf:
-        print(f"[NAN-CHECK] FAIL kernel={args.kernel} nan={n_nan} inf={n_inf}")
-    else:
-        print(f"[NAN-CHECK] PASS kernel={args.kernel} (output finite)")
+        raise AssertionError(
+            f"non-finite output from {args.kernel}: nan={n_nan}, inf={n_inf}"
+        )
+    print(f"[NAN-CHECK] PASS kernel={args.kernel} (output finite)")
     compare_accuracy(current, reference)
-    if args.kernel in QUANT_KERNELS:
+    if KERNEL_SPECS[args.kernel].quantized:
         check_attention_outputs(
             current,
             reference,
@@ -1539,23 +1596,47 @@ def make_reference_output(
             )
         )
 
-    return primary_output(make_torch_ref_runner(q_bshd, k_bshd, v_bshd, args.causal)())
+    return primary_output(
+        attention_ref(
+            q_bshd,
+            k_bshd,
+            v_bshd,
+            dropout_p=0.0,
+            dropout_mask=None,
+            causal=args.causal,
+        )
+    )
 
 
 def compute_memory_bytes(
     shape: ShapeSpec,
-    q_element_size: int,
-    k_element_size: int,
-    v_element_size: int,
+    q_bytes_per_value: float,
+    k_bytes_per_value: float,
+    v_bytes_per_value: float,
 ) -> float:
     total_num_tokens_q = shape.batch * shape.n_ctx_q
     total_num_tokens_k = shape.batch * shape.n_ctx_k
 
-    q_size = total_num_tokens_q * shape.hq * shape.d_head * q_element_size
-    k_size = total_num_tokens_k * shape.hk * shape.d_head * k_element_size
-    v_size = total_num_tokens_k * shape.hk * shape.d_head_v * v_element_size
-    o_size = total_num_tokens_q * shape.hq * shape.d_head_v * q_element_size
+    q_size = total_num_tokens_q * shape.hq * shape.d_head * q_bytes_per_value
+    k_size = total_num_tokens_k * shape.hk * shape.d_head * k_bytes_per_value
+    v_size = total_num_tokens_k * shape.hk * shape.d_head_v * v_bytes_per_value
+    o_size = total_num_tokens_q * shape.hq * shape.d_head_v * 2.0
     return q_size + k_size + v_size + o_size
+
+
+def benchmark_payload_bytes(
+    args: argparse.Namespace,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    *,
+    sparse: bool = False,
+) -> tuple[float, float, float]:
+    if args.e2e:
+        return float(q.element_size()), float(k.element_size()), float(v.element_size())
+    if args.kernel == "mha4_mxfp4" and sparse:
+        return 0.5, 0.5, 1.0
+    return KERNEL_SPECS[args.kernel].payload_bytes
 
 
 def benchmark_single_case(
@@ -1594,7 +1675,9 @@ def benchmark_single_case(
         else None
     )
 
-    fn = make_kernel_runner(args, q, k, v, block_lut=block_lut)
+    fn = make_kernel_runner(
+        args, q, k, v, block_lut=block_lut, block_mask=block_attn_mask
+    )
     ms = triton.testing.do_bench(fn, warmup=args.warmup, rep=args.rep)
 
     if args.compare_to_ref:
@@ -1612,59 +1695,27 @@ def benchmark_single_case(
         * (shape.d_head + shape.d_head_v)
     )
 
-    if args.kernel in (
-        "sage_fp8",
-        "sage_mxfp4",
-        "fav3_fp8",
-        "aiter_i8fp8",
-        "aiter_mxfp8",
-        "aiter_fp8",
-        "aiter_f8f6",
-        "aiter_mxfp6",
-        "aiter_f6f4",
-        "aiter_mxfp4",
-        "aiter_f4f4",
-    ):
-        q_elem_size = 1
-        k_elem_size = 1
-    else:
-        q_elem_size = q.element_size()
-        k_elem_size = k.element_size()
-
-    v_elem_size = (
-        1
-        if args.kernel
-        in (
-            "fav3_fp8",
-            "aiter_mxfp8",
-            "aiter_fp8",
-            "aiter_f8f6",
-            "aiter_i8fp8",
-            "aiter_mxfp4",
-            "aiter_mxfp6",
-            "aiter_f6f4",
-            "aiter_f4f4",
-        )
-        else v.element_size()
+    mem = compute_memory_bytes(
+        shape,
+        *benchmark_payload_bytes(args, q, k, v, sparse=block_lut is not None),
     )
-    mem = compute_memory_bytes(shape, q_elem_size, k_elem_size, v_elem_size)
 
     sparse_flops = None
     if block_lut is not None:
         sparse_flops, _ = sparse_flops_from_lut(args.kernel, block_lut, shape)
 
-    if "time(ms)" in provider:
+    if provider == "time(ms)":
         return ms
-    if "sparse_throughput(TFLOPS)" in provider:
+    if provider == "sparse_throughput(TFLOPS)":
         flops = sparse_flops if sparse_flops is not None else total_flops
         return flops / ms * 1e-9
-    if "throughput(TFLOPS)" in provider:
+    if provider == "throughput(TFLOPS)":
         return total_flops / ms * 1e-9
-    if "bandwidth(GB/s)" in provider:
+    if provider == "bandwidth(GB/s)":
         return mem / ms * 1e-6
-    if "arithmetic_intensity(FLOP/byte)" in provider:
+    if provider == "arithmetic_intensity(FLOP/byte)":
         return total_flops / mem
-    return ms
+    raise ValueError(f"Unknown benchmark provider: {provider}")
 
 
 def metric_lines(args: argparse.Namespace, include_sparse_metric: bool) -> list[str]:
@@ -1728,7 +1779,6 @@ def create_single_shape_config(args: argparse.Namespace) -> list[Any]:
                 "D_HEAD_V": d_head_v,
                 "dtype": arg_to_torch_dtype[args.dtype],
                 "layout": args.layout,
-                "causal": args.causal,
             },
         )
     ]
@@ -1781,7 +1831,6 @@ def create_mask_list_config(
                 "D_HEAD_V": args.dv,
                 "dtype": arg_to_torch_dtype[args.dtype],
                 "layout": args.layout,
-                "causal": args.causal,
                 "args": args,
                 "HQ": args.hq,
                 "HK": hk,
@@ -1824,12 +1873,26 @@ def validate_args(args: argparse.Namespace) -> None:
     if args.block_sparsity is not None and args.block_mask_file:
         logger.info("Using --block-mask-file; ignoring --block-sparsity")
 
+    spec = None if args.kernel == "all" else KERNEL_SPECS[args.kernel]
+    sparse_requested = args.block_sparsity is not None or bool(args.block_mask_file)
+    if sparse_requested and (spec is None or not spec.supports_block_sparse):
+        raise ValueError(f"{args.kernel} does not support block-sparse mode")
+
+    if sparse_requested and args.causal:
+        raise ValueError("block-sparse mode supports non-causal attention only")
+
+    if args.n_repetitions is not None and (
+        args.block_sparsity is None or args.block_mask_file
+    ):
+        raise ValueError(
+            "--n-repetitions requires random --block-sparsity without "
+            "--block-mask-file"
+        )
+
     if args.ref not in ("torch", "aiter_bf16"):
         raise ValueError("--ref must be one of: torch, aiter_bf16")
 
     if args.kernel == "all":
-        if args.block_sparsity is not None or args.block_mask_file:
-            raise ValueError("--kernel=all does not support block-sparse mode")
         if args.load_captured:
             raise ValueError("--kernel=all does not support --load-captured")
         if not args.hadamard_rotate:
@@ -1838,41 +1901,20 @@ def validate_args(args: argparse.Namespace) -> None:
                 "--hadamard-rotate=1"
             )
 
-    _quantized_kernels = (
-        "sage_fp8",
-        "sage_mxfp4",
-        "fav3_fp8",
-        "aiter_i8fp8",
-        "aiter_mxfp8",
-        "aiter_fp8",
-        "aiter_f8f6",
-        "aiter_mxfp6",
-        "aiter_f6f4",
-        "aiter_mxfp4",
-        "aiter_f4f4",
-    )
+    if args.causal and (spec is None or not spec.supports_causal):
+        raise ValueError(f"{args.kernel} supports non-causal attention only")
 
-    if args.e2e and args.kernel not in _quantized_kernels and args.kernel != "all":
+    if args.qsmooth and args.kernel != "sage_mxfp4":
+        raise ValueError("--qsmooth is supported only by sage_mxfp4")
+
+    if args.n_repetitions is not None and args.n_repetitions <= 0:
+        raise ValueError("--n-repetitions must be positive")
+
+    if args.e2e and spec is not None and not spec.quantized:
         logger.warning("--e2e has no effect for kernel %s", args.kernel)
 
-    _hadamard_kernels = (
-        "sage_fp8",
-        "sage_mxfp4",
-        "fav3_fp8",
-        "aiter_mxfp8",
-        "aiter_fp8",
-        "aiter_f8f6",
-        "aiter_mxfp6",
-        "aiter_f6f4",
-        "aiter_mxfp4",
-        "aiter_f4f4",
-        "all",
-    )
-
-    if args.kernel not in _hadamard_kernels and (
-        args.qsmooth or args.hadamard_rotate is False
-    ):
-        logger.warning("Hadamard/qsmooth flags are ignored for kernel %s", args.kernel)
+    if spec is not None and not spec.uses_hadamard and not args.hadamard_rotate:
+        logger.warning("--hadamard-rotate is ignored for kernel %s", args.kernel)
 
 
 def run_benchmark_generated(
@@ -1890,7 +1932,6 @@ def run_benchmark_generated(
         D_HEAD_V,
         dtype,
         layout,
-        causal,
         provider,
         device="cuda",
     ):
@@ -1962,7 +2003,6 @@ def run_benchmark_mask_list(args: argparse.Namespace, masks: list[LoadedMask]) -
         D_HEAD_V,
         dtype,
         layout,
-        causal,
         args,
         HQ,
         HK,
@@ -2051,7 +2091,9 @@ def run_block_sparse_repetitions(
         > args.block_sparsity
     ).to(torch.bool)
     warmup_lut = block_attn_mask_to_ragged_lut(warmup_mask, return_none_if_dense=True)
-    fn_warmup = make_kernel_runner(args, q, k, v, block_lut=warmup_lut)
+    fn_warmup = make_kernel_runner(
+        args, q, k, v, block_lut=warmup_lut, block_mask=warmup_mask
+    )
     triton.testing.do_bench(fn_warmup, warmup=args.warmup, rep=args.rep)
 
     total_flops = (
@@ -2076,7 +2118,7 @@ def run_block_sparse_repetitions(
         ).to(torch.bool)
         lut = block_attn_mask_to_ragged_lut(mask, return_none_if_dense=True)
 
-        fn = make_kernel_runner(args, q, k, v, block_lut=lut)
+        fn = make_kernel_runner(args, q, k, v, block_lut=lut, block_mask=mask)
         ms = triton.testing.do_bench(fn, warmup=args.warmup, rep=args.rep)
         latencies_ms.append(ms)
 
@@ -2187,22 +2229,11 @@ def parse_args() -> argparse.Namespace:
         "--kernel",
         type=str,
         default="sage_fp8",
-        choices=[
-            "sage_fp8",
-            "sage_mxfp4",
-            "fav3_fp8",
-            "aiter_i8fp8",
-            "aiter_mxfp8",
-            "aiter_fp8",
-            "aiter_f8f6",
-            "aiter_mxfp6",
-            "aiter_f6f4",
-            "aiter_mxfp4",
-            "aiter_f4f4",
-            "aiter_bf16",
-            "all",
-        ],
-        help="Kernel implementation to benchmark. Use 'all' to compare all backends.",
+        choices=[*KERNEL_SPECS, "all"],
+        help=(
+            "Kernel implementation to benchmark. Use 'all' to compare the "
+            "configured production MHA variants"
+        ),
     )
 
     parser.add_argument("--b", type=int, default=0, help="Batch size")
@@ -2228,13 +2259,13 @@ def parse_args() -> argparse.Namespace:
             "transformer",
             "sink",
             "underflow",
-            "latesink",
+            "latepeak",
             "maxstair",
         ],
         help=(
             "Distribution used for generated Q/K/V tensors. 'zero' sets all Q/K/V values "
             "to zero; 'sink' is a realistic "
-            "StreamingLLM attention sink pattern; 'underflow'/'latesink' are "
+            "StreamingLLM attention sink pattern; 'underflow'/'latepeak' are "
             "adversarial fp8 tile-skip / frozen-max rollback regression tripwires; "
             "'maxstair' raises the max every KV tile and triggers rollback for alternating "
             "query-row groups."
@@ -2244,25 +2275,19 @@ def parse_args() -> argparse.Namespace:
         "--qk-clip",
         type=float,
         default=1.0,
-        help="Clip factor applied to Q and K absmax before int8 quantization for aiter_i8fp8",
-    )
-    parser.add_argument(
-        "--f8f6-v-scale",
-        choices=["block", "tensor", "head"],
-        default="block",
-        help="F8F6 V quantization scale granularity",
+        help="Clip factor applied to Q and K absmax before int8 quantization for mha4_i8fp8",
     )
     parser.add_argument(
         "--q-clip",
         type=float,
         default=None,
-        help="Optional Q-only absmax clip factor for aiter_i8fp8; overrides --qk-clip for Q",
+        help="Optional Q-only absmax clip factor for mha4_i8fp8; overrides --qk-clip for Q",
     )
     parser.add_argument(
         "--k-clip",
         type=float,
         default=None,
-        help="Optional K-only absmax clip factor for aiter_i8fp8; overrides --qk-clip for K",
+        help="Optional K-only absmax clip factor for mha4_i8fp8; overrides --qk-clip for K",
     )
     parser.add_argument(
         "--metric",
@@ -2276,7 +2301,10 @@ def parse_args() -> argparse.Namespace:
             "arithint",
             "sparseput",
         ],
-        help="Metric(s) to report (default: time+throughput only; 'all' does not include bandwidth/arithint)",
+        help=(
+            "Metric to report. 'all' reports dense throughput and, in sparse mode, "
+            "effective sparse throughput"
+        ),
     )
 
     parser.add_argument("-o", action="store_true", help="Write Triton output CSV")
@@ -2384,9 +2412,6 @@ def parse_args() -> argparse.Namespace:
         value = getattr(args, name)
         if value is not None and value <= 0.0:
             parser.error(f"--{name.replace('_', '-')} must be > 0")
-    args.f8f6_v_scale = os.environ.get("AITER_F8F6_V_SCALE", args.f8f6_v_scale)
-    if args.f8f6_v_scale not in ("block", "tensor", "head"):
-        parser.error("AITER_F8F6_V_SCALE must be one of: block, tensor, head")
     return args
 
 
@@ -2460,7 +2485,7 @@ def benchmark_all_kernel_row(
     k: torch.Tensor,
     v: torch.Tensor,
     total_flops: float,
-    ref_primary: torch.Tensor | None,
+    ref_primary: torch.Tensor,
 ) -> AllKernelRow:
     saved_kernel = args.kernel
     args.kernel = kernel_name
@@ -2468,11 +2493,9 @@ def benchmark_all_kernel_row(
         fn = make_kernel_runner(args, q, k, v, block_lut=None)
         ms = triton.testing.do_bench(fn, warmup=args.warmup, rep=args.rep)
         tflops = total_flops / ms * 1e-9
-        accuracy = None
-        if ref_primary is not None:
-            current_primary = primary_output(fn())
-            current_primary = to_bshd_output_if_needed(current_primary, args.layout)
-            accuracy = compute_accuracy_metrics(current_primary, ref_primary)
+        current_primary = primary_output(fn())
+        current_primary = to_bshd_output_if_needed(current_primary, args.layout)
+        accuracy = compute_accuracy_metrics(current_primary, ref_primary)
         return AllKernelRow(kernel_name, ms, tflops, accuracy)
     finally:
         args.kernel = saved_kernel
@@ -2482,20 +2505,7 @@ def skipped_all_kernel_row(kernel_name: str) -> AllKernelRow:
     return AllKernelRow(kernel_name, float("nan"), float("nan"), None)
 
 
-def print_all_kernel_table(
-    rows: list[AllKernelRow],
-    include_accuracy: bool,
-) -> None:
-    if not include_accuracy:
-        print(f"{'kernel':<16} {'time(ms)':>10} {'TFLOPS':>10}")
-        print("-" * 38)
-        for row in rows:
-            if row.ms != row.ms:  # nan
-                print(f"{row.kernel:<16} {'SKIP':>10} {'SKIP':>10}")
-            else:
-                print(f"{row.kernel:<16} {row.ms:>10.4f} {row.tflops:>10.2f}")
-        return
-
+def print_all_kernel_table(rows: list[AllKernelRow]) -> None:
     print(
         f"{'kernel':<16} {'time(ms)':>10} {'TFLOPS':>10} {'MAE':>12} {'MaxE':>12} {'Cosine':>12}"
     )
@@ -2514,7 +2524,7 @@ def print_all_kernel_table(
 
 
 def run_all_kernels(args: argparse.Namespace) -> None:
-    """Run all backends on the same QKV inputs and print a comparison table."""
+    """Run the configured production MHA variants on shared QKV inputs."""
     dtype = arg_to_torch_dtype[args.dtype]
     device = "cuda"
     hk = args.hk if args.hk else args.hq
@@ -2573,7 +2583,7 @@ def run_all_kernels(args: argparse.Namespace) -> None:
     print(
         f"\nbench_sage --kernel=all  (b={args.b} hq={args.hq} sq={args.sq} sk={sk} d={d_head} input={args.input_distribution}):"
     )
-    print_all_kernel_table(rows, include_accuracy=True)
+    print_all_kernel_table(rows)
 
 
 def run_with_optional_vgpr(args: argparse.Namespace, runner: Any) -> int:

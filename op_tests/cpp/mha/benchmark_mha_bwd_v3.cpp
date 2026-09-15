@@ -937,6 +937,11 @@ bool run_bench(const ArgParser& arg)
                      sizeof(DK) * sk * hdim_q + sizeof(DV) * sk * hdim_v +
                      sizeof(LSE) * sq);
     }
+    // For TFLOPS reporting, treat any masked run as ~0.5x the dense FLOP count (convention).
+    if(mask.type != mask_enum::no_mask)
+    {
+        flop /= 2;
+    }
 
     auto lengths = [&](bool perm, int b, int h, int s, int d) {
         return perm ? std::array<index_t, 4>{b, h, s, d}
@@ -1215,7 +1220,7 @@ bool run_bench(const ArgParser& arg)
     bool pass = true;
 
     // Snapshot Q/K/V/dO per batch in [nhead, seq, dim] layout; recompute O/LSE.
-    // Note: we do NOT cache the fp32 P from forward — the backward recomputes
+    // Note: we do NOT cache the fp32 P from forward -- the backward recomputes
     // P from LSE on the fly, mirroring how the asm v3 kernel reconstructs P
     // (`P = exp(S * scale - LSE)` per tile) rather than re-running softmax.
     std::vector<HostTensor<Q>>   q_refs;
@@ -1421,7 +1426,7 @@ bool run_bench(const ArgParser& arg)
         // src low-precision before the downstream GEMMs is controlled by the
         // `cpu_lp_round` flag. Defaults to OFF: the asm v3 path does NOT round
         // these intermediates to bf16 at the boundary we naively assumed (see
-        // `fmha_bwd_dev` reference vs. the production asm — the production
+        // `fmha_bwd_dev` reference vs. the production asm -- the production
         // kernel keeps them at fp32 precision through V_MFMA's input quant).
         // Forcing a cast here amplifies noise to ~50% nrms on dQ for bf16, so
         // leave it off unless explicitly probing the bf16-quantized variant.

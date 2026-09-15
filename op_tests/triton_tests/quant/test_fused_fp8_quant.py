@@ -383,6 +383,7 @@ def run_torch_flatten_fp8_group_quant(x, dtype_quant, group_size):
 @pytest.mark.parametrize("N1, N2", [(16, 128), (16, 7168)])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 def test_fused_flatten_fp8_group_quant(M: int, N1: int, N2: int, dtype):
+    torch.manual_seed(0)
     group_size = 128
     dtype_quant = aiter.dtypes.fp8
     x = torch.randn((N1, M, N2), dtype=dtype, device="cuda") / 10

@@ -57,6 +57,7 @@ from aiter.ops.flydsl.mxfp4_kname import parse_flydsl_v2_gemm2_kernel
 # Keep the default AOT coverage aligned with runtime config resolution.
 DEFAULT_CSVS = [
     AITER_CONFIGS.AITER_CONFIG_FMOE_FILE,
+    AITER_CONFIGS.AITER_CONFIG_FHMOE_FILE,
 ]
 MOE_AOT_ARCH_DEFAULT = "gfx950"
 
@@ -68,8 +69,8 @@ def parse_csv(csv_path: str):
         kernel_name, stage, model_dim, inter_dim, experts, topk,
         doweight_stage1 (for stage1), and all params from get_flydsl_kernel_params.
 
-    Deduplicates by
-    (kernel_name, model_dim, inter_dim, experts, topk, doweight_stage1).
+    Deduplicates with ``job_identity``, including token bucket, block size, and
+    the shared-expert ID when present.
     """
     jobs = []
     seen = set()
@@ -85,6 +86,7 @@ def parse_csv(csv_path: str):
             doweight_stage1 = bool(int(row.get("doweight_stage1", "0")))
             cu_num = int(row.get("cu_num", "0"))
             block_m = int(row.get("block_m", "0") or "0")
+            shared_expert_id = int(row.get("shared_expert_id", "-1") or "-1")
             act_type = row.get("act_type", "")
             act_name = act_type.strip().split(".")[-1].lower()
             act = act_name if act_name in ("swiglu", "situv2") else "silu"
@@ -99,7 +101,11 @@ def parse_csv(csv_path: str):
                 and dtype in ("torch.bfloat16", "torch.float16")
                 and "float4_e2m1fn_x2" in q_dtype_w
             )
-            enable_bias_options = [False, True] if bias_supported else [False]
+            enable_bias_options = (
+                [False]
+                if shared_expert_id >= 0
+                else ([False, True] if bias_supported else [False])
+            )
 
             # Detect stage1's fuse_quant from kernel suffix to align stage2's
             # a2_scale shape with what runtime actually passes.
@@ -173,7 +179,9 @@ def parse_csv(csv_path: str):
                         "token_num": token,
                         "block_m": block_m,
                     }
-                    # Stage2 needs to know whether stage1 fuses fp4/fp8 quant —
+                    if shared_expert_id >= 0:
+                        job["shared_expert_id"] = shared_expert_id
+                    # Stage2 needs to know whether stage1 fuses fp4/fp8 quant --
                     # this changes the shape of a2_scale (sorted scale buffer
                     # vs separate quant call output).
                     if params["stage"] == 2:
@@ -194,9 +202,7 @@ def parse_csv(csv_path: str):
 
                     jobs.append(full_job)
 
-    from aiter.aot.flydsl.fhmoe import extend_fhmoe_jobs
-
-    return extend_fhmoe_jobs(csv_path, jobs, seen)
+    return jobs
 
 
 def _precompile_to_cache(
@@ -346,7 +352,7 @@ def _precompile_to_cache(
         """Stage2 a2_scale construction per fused_moe_2stages.
 
         When upstream stage1 fuses fp4/fp8 quant (``stage1_fuse_quant`` set),
-        stage2 receives stage1's ``out_scale_sorted`` buffer directly — that
+        stage2 receives stage1's ``out_scale_sorted`` buffer directly -- that
         buffer is padded to 256 rows and 8 cols.  Otherwise stage2 quantizes
         its own input and the resulting sorted scale uses 32-row alignment.
         """
@@ -391,7 +397,7 @@ def _precompile_to_cache(
         return None
 
     def _make_w_scale(scale_storage_numel: int):
-        # mxfp4 e8m0 scale — viewed as uint8 by _view_safe before kernel launch.
+        # mxfp4 e8m0 scale -- viewed as uint8 by _view_safe before kernel launch.
         return torch.zeros(scale_storage_numel, dtype=torch.uint8, device=dev)
 
     def _make_a_user(a_dtype_user_shape):
@@ -663,7 +669,6 @@ def _precompile_to_cache(
             # inter_dim=384), in which case runtime compiles the legal fallback.
             tile_k = resolve_flydsl_stage2_tile_k(inter_dim, tile_k)
 
-            # Stage2 input is (token_num, topk, inter_dim) in a_dtype storage.
             if a_dtype == "fp4":
                 a_shape = (tokens, topk, inter_dim // 2)
             else:
@@ -749,6 +754,7 @@ def _precompile_to_cache(
                     sw_arg,
                     num_valid_ids,
                     tokens,
+                    tokens * topk,
                     _n_in,
                     _k_in,
                     m_blocks,
@@ -837,6 +843,7 @@ def _precompile_a16w4_to_cache(
     b_nt: int = 2,
     xcd_swizzle: int = 0,
     k_wave: int = 1,
+    waves_per_eu: int | None = None,
     b_dtype: str = "fp4",
     **kwargs,
 ):
@@ -845,8 +852,8 @@ def _precompile_a16w4_to_cache(
     The port launch ABI (raw fx.Int64 device pointers) differs from the generic MX
     gemm (``_s1_args_fp4``), so it can't reuse ``_precompile_to_cache``'s arg
     builders.  Instead drive the SAME runtime launchers (``flydsl_a16w4_gemm{1,2}``)
-    the fused-MoE op uses, under ``COMPILE_ONLY=1`` — the cache key then matches
-    runtime by construction (``waves_per_eu=None``, ``persist=False``,
+    the fused-MoE op uses, under ``COMPILE_ONLY=1`` -- the cache key then matches
+    runtime by construction (``waves_per_eu`` follows runtime, ``persist=False``,
     ``w_layout="standard"``, g2 tile downgrade are all applied inside the
     launcher).  The compiled artifact is keyed only on the kernel's constexpr
     params (shapes/tiles/topk/act), never on the launch pointers, grid, or
@@ -872,7 +879,6 @@ def _precompile_a16w4_to_cache(
         "tile_m": tile_m,
         "b_nt": b_nt,
         "xcd_swizzle": xcd_swizzle,
-        "waves_per_eu": None,
         "stream": 0,
     }
     with compile_only_env():
@@ -887,6 +893,7 @@ def _precompile_a16w4_to_cache(
                 tile_n=tile_n,
                 tile_k=tile_k,
                 k_wave=k_wave,
+                waves_per_eu=None if waves_per_eu == 1 else waves_per_eu,
                 act=("situv2" if act in ("situv2", "situ") else act),
                 w_dtype=b_dtype,
                 w_layout="standard",
@@ -917,6 +924,11 @@ def _precompile_a16w4_to_cache(
                 tile_n=g2_tile_n,
                 tile_k=g2_tile_k,
                 w_dtype=b_dtype,
+                epilog=(
+                    "reduce"
+                    if b_dtype == "int4" and kwargs.get("mode") == "reduce"
+                    else "atomic"
+                ),
                 **common,
             )
 

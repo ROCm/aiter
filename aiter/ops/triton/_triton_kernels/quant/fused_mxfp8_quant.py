@@ -4,7 +4,8 @@
 import triton
 import triton.language as tl
 
-from .quant import _mxfp8_quant_op
+from aiter.ops.triton._triton_kernels.quant.quant import _mxfp8_quant_op
+from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
 
 # Fused RMSNorm + MXFP8 (1x32 e8m0) quant. Replaces the separate
 # rmsnorm_quant(fp8 fnuz + fp32 1x128) + transcode-to-MXFP8 sequence used
@@ -19,7 +20,16 @@ from .quant import _mxfp8_quant_op
 #      scale (M, K // 32) uint8 e8m0
 
 
-@triton.jit
+_fused_rms_mxfp8_repr = make_kernel_repr(
+    "_fused_rms_mxfp8_kernel",
+    [
+        "BLOCK_SIZE_K",
+        "QUANT_BLOCK_SIZE",
+    ],
+)
+
+
+@triton.jit(repr=_fused_rms_mxfp8_repr)
 def _fused_rms_mxfp8_kernel(
     x_ptr,
     g_ptr,
@@ -105,7 +115,17 @@ def _fused_rms_mxfp8_kernel(
 #      yk    (M, KK) bf16
 
 
-@triton.jit
+_fused_dual_rmsnorm_mxfp8_quant_repr = make_kernel_repr(
+    "_fused_dual_rmsnorm_mxfp8_quant_kernel",
+    [
+        "BLOCK_SIZE_KQ",
+        "BLOCK_SIZE_KK",
+        "QUANT_BLOCK_SIZE",
+    ],
+)
+
+
+@triton.jit(repr=_fused_dual_rmsnorm_mxfp8_quant_repr)
 def _fused_dual_rmsnorm_mxfp8_quant_kernel(
     q_ptr,
     k_ptr,
@@ -208,7 +228,16 @@ def _fused_dual_rmsnorm_mxfp8_quant_kernel(
 # the M-th row of the (M, N) flattened output.
 
 
-@triton.jit
+_fused_flatten_mxfp8_quant_repr = make_kernel_repr(
+    "_fused_flatten_mxfp8_quant_kernel",
+    [
+        "BLOCK_SIZE_N2",
+        "QUANT_BLOCK_SIZE",
+    ],
+)
+
+
+@triton.jit(repr=_fused_flatten_mxfp8_quant_repr)
 def _fused_flatten_mxfp8_quant_kernel(
     x_ptr,
     out_ptr,

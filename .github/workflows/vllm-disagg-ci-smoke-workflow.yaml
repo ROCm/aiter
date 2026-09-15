@@ -46,12 +46,20 @@ env:
   AITER_WHEEL_ARTIFACT_NAME: aiter-vllm-disagg-wheel-${{ github.run_id }}
 
 jobs:
+  ci_config:
+    if: >-
+      github.event_name != 'pull_request' ||
+      (github.event.pull_request.draft == false &&
+      contains(github.event.pull_request.labels.*.name, 'ci:vllm-di'))
+    uses: ./.github/workflows/ci-config.yaml
+
   build_aiter_wheel:
     name: Build gfx950 Aiter overlay wheels
     if: >-
       github.event_name != 'pull_request' ||
       (github.event.pull_request.draft == false &&
       contains(github.event.pull_request.labels.*.name, 'ci:vllm-di'))
+    needs: ci_config
     runs-on: build-only-aiter
     steps:
       - name: Checkout AITER
@@ -66,10 +74,11 @@ jobs:
       - name: Docker login
         if: ${{ github.event_name != 'pull_request' || !github.event.pull_request.head.repo.fork }}
         env:
-          DOCKER_PASSWORD: ${{ secrets.DOCKER_PASSWORD }}
+          DOCKER_USERNAME: ${{ secrets[needs.ci_config.outputs.docker_username_secret] }}
+          DOCKER_PASSWORD: ${{ secrets[needs.ci_config.outputs.docker_password_secret] }}
         run: |
           for attempt in 1 2 3; do
-            if echo "$DOCKER_PASSWORD" | docker login -u rocmshared --password-stdin; then
+            if echo "$DOCKER_PASSWORD" | docker login -u "$DOCKER_USERNAME" --password-stdin; then
               echo "Docker login succeeded on attempt ${attempt}"
               exit 0
             fi

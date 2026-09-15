@@ -1,2 +1,7 @@
+# mode: 0 = dense 3-D grid, 1 = sorted block-sparse (flat grid + 752-byte kernarg, work_table @ 0x2D0)
+# ts_kv=64: gfx942 product sparse is 256x64 (not the gfx950 256x128 tile).
 q_format,k_format,v_format,o_format,q_scale_mode,k_scale_mode,v_scale_mode,o_scale_mode,hdim_q,hdim_v,mask,mode,ts_qo,ts_kv,knl_name,co_name
 10,10,4,2,1,1,1,0,128,128,0,0,256,64,_ZN5aiter20fmha_fwd_hd128_i8fp8E,MI300/fwd_hd128_i8fp8.co
+4,4,4,2,1,1,1,0,128,128,0,0,256,64,_ZN5aiter18fmha_fwd_hd128_fp8E,MI300/fwd_hd128_fp8.co
+10,10,4,2,1,1,1,0,128,128,0,1,256,64,_ZN5aiter27fmha_fwd_hd128_i8fp8_sparseE,MI300/fwd_hd128_i8fp8_sparse.co
+4,4,4,2,1,1,1,0,128,128,0,1,256,64,_ZN5aiter25fmha_fwd_hd128_fp8_sparseE,MI300/fwd_hd128_fp8_sparse.co

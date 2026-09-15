@@ -185,7 +185,21 @@ void opus_gemm(
 #ifdef OPUS_BUILD_HAS_GFX1250
     if (opus_get_gfx_arch() == OpusGfxArch::Gfx1250)
     {
-      // gfx1250: all kids are split-K and need a workspace. The heuristic
+      // A tuned pre-compiled (.co) winner for this shape, if there is one, is
+      // taken first: that family needs no workspace, so a hit skips the
+      // hipMalloc / hipDeviceSynchronize / hipFree below entirely. It cannot
+      // serve bias (no epilogue for it) or a non-bf16 Y (it stores C straight
+      // out with no reduce kernel to cast), so those shapes fall through to the
+      // split-K path even when the CSV named a .co kid.
+      if (!has_bias && Y.dtype() == AITER_DTYPE_bf16)
+      {
+        if (auto co_fn = opus_a16w16_co_dispatch_gfx1250(M, N, K))
+        {
+          co_fn(XQ, WQ, Y, bias, 0);
+          return;
+        }
+      }
+      // Otherwise: every gfx1250 split-K kid needs a workspace. The heuristic
       // dispatch returns a 6-arg function pointer (with workspace). We allocate
       // a temporary workspace here for the auto/heuristic path. For the tuned
       // path, Python allocates via torch.empty.
@@ -242,15 +256,33 @@ static constexpr int OPUS_SPLITK_KID_MIN = 200;
 static constexpr int OPUS_SPLITK_KID_MAX = 300;
 static constexpr int OPUS_GFX942_KID_OFFSET = 10000;
 static constexpr int OPUS_GFX942_SPLITK_KID_MAX = 300;
-// gfx1250 split-K kids: [20000, 20100) plain cluster/TDM (fp32 workspace +
-// reduce), [20100, 21000) clusterlaunch multicast ws. [21000, 30000) is
-// currently unclaimed -- the FUSED single-kernel family that used to sweep it
-// is unregistered (GFX1250_SPLITK_FUSE_ENABLED in opus_gemm_common.py) while
-// its pipeline is being fixed. The check below keeps covering the whole
-// [20000, 30000) band so a family landing there still gets the workspace
-// dispatch; all gfx1250 split-K kids use the <fp32_t> lookup ABI and fold bias.
+// gfx1250 split-K kids come in TWO bands, because the pre-compiled .co family
+// sits between them:
+//   [20000, 20100)  plain cluster/TDM (fp32 workspace + reduce)
+//   [20100, 21000)  clusterlaunch multicast ws
+//   [21000, 27000)  a16w16_4wave_co / _wl_co -- NOT split-K, see below
+//   [27000, 30000)  FUSED single-kernel family, currently unregistered
+//                   (GFX1250_SPLITK_FUSE_ENABLED in opus_gemm_common.py) while
+//                   its pipeline is being fixed
+// The upper band stays covered even while empty so a family landing there gets
+// the workspace dispatch. All gfx1250 split-K kids use the <fp32_t> lookup ABI
+// and fold bias.
+//
+// KEEP IN LOCKSTEP with _SPLITK_KID_RANGES in aiter/ops/opus/gemm_op_a16w16.py.
 static constexpr int OPUS_GFX1250_SPLITK_KID_MIN = 20000;
-static constexpr int OPUS_GFX1250_SPLITK_KID_MAX = 30000;
+static constexpr int OPUS_GFX1250_SPLITK_KID_MAX = 21000;
+static constexpr int OPUS_GFX1250_SPLITK_FUSE_KID_MIN = 27000;
+static constexpr int OPUS_GFX1250_SPLITK_FUSE_KID_MAX = 30000;
+// gfx1250 symmetric 4-wave compute, device side loaded from a pre-built .co
+// (a16w16_4wave_co). Not a split-K family: no workspace, no split_k, no reduce
+// kernel, and bf16 C written straight out. It therefore has its OWN dispatch
+// (opus_a16w16_co_tune_dispatch_gfx1250) whose launcher takes the ordinary
+// 5-arg a16w16 signature, and is deliberately absent from both
+// opus_kid_is_splitk() and opus_kid_is_gfx1250_splitk() -- which is exactly why
+// the split-K band above had to be cut in two rather than span this range. A
+// split-K .co variant would join those instead of this band.
+static constexpr int OPUS_GFX1250_CO_KID_MIN = 21000;
+static constexpr int OPUS_GFX1250_CO_KID_MAX = 27000;
 // SB a16w16 kids: gfx950 [4,10) + mirrors at +1000/.../+7000.
 static constexpr int OPUS_A16W16_SB_KID_MIN = 4;
 static constexpr int OPUS_A16W16_SB_KID_MAX = 10;
@@ -266,6 +298,15 @@ static constexpr int OPUS_MONO_TILE_KID_MAX = 1500;
 // non-OOB kid offset
 static constexpr int OPUS_NOOOB_KID_OFFSET = 1000;
 
+// Two disjoint bands with the pre-compiled .co family in between; see the kid
+// map above. Defined before opus_kid_is_splitk() because that one calls it.
+static inline bool opus_kid_is_gfx1250_splitk(int kid)
+{
+  return (kid >= OPUS_GFX1250_SPLITK_KID_MIN && kid < OPUS_GFX1250_SPLITK_KID_MAX) ||
+         (kid >= OPUS_GFX1250_SPLITK_FUSE_KID_MIN &&
+          kid < OPUS_GFX1250_SPLITK_FUSE_KID_MAX);
+}
+
 static inline bool opus_kid_is_splitk(int kid)
 {
   return (kid >= OPUS_SPLITK_KID_MIN && kid < OPUS_SPLITK_KID_MAX) ||
@@ -273,8 +314,12 @@ static inline bool opus_kid_is_splitk(int kid)
           kid < OPUS_SPLITK_KID_MAX + OPUS_NOOOB_KID_OFFSET) ||
          (kid >= OPUS_SPLITK_KID_MIN + OPUS_GFX942_KID_OFFSET &&
           kid < OPUS_GFX942_SPLITK_KID_MAX + OPUS_GFX942_KID_OFFSET) ||
-         (kid >= OPUS_GFX1250_SPLITK_KID_MIN &&
-          kid < OPUS_GFX1250_SPLITK_KID_MAX);
+         opus_kid_is_gfx1250_splitk(kid);
+}
+
+static inline bool opus_kid_is_gfx1250_co(int kid)
+{
+  return kid >= OPUS_GFX1250_CO_KID_MIN && kid < OPUS_GFX1250_CO_KID_MAX;
 }
 
 static inline bool opus_kid_is_a16w16_sb(int kid)
@@ -305,11 +350,6 @@ static inline bool opus_kid_is_gfx942_splitk(int kid)
 {
   return kid >= OPUS_SPLITK_KID_MIN + OPUS_GFX942_KID_OFFSET &&
          kid < OPUS_GFX942_SPLITK_KID_MAX + OPUS_GFX942_KID_OFFSET;
-}
-
-static inline bool opus_kid_is_gfx1250_splitk(int kid)
-{
-  return kid >= OPUS_GFX1250_SPLITK_KID_MIN && kid < OPUS_GFX1250_SPLITK_KID_MAX;
 }
 
 static inline bool opus_kid_supports_bias(int kid)
@@ -349,6 +389,19 @@ void opus_gemm_a16w16_tune(
 
   if (XQ.dtype() == AITER_DTYPE_bf16)
   {
+#ifdef OPUS_BUILD_HAS_GFX1250
+    // gfx1250 pre-compiled (.co) kids. Checked first because they are neither
+    // split-K (no workspace to pass) nor reachable through the shared
+    // opus_a16w16_tune_dispatch table (their launcher has its own signature).
+    if (opus_kid_is_gfx1250_co(kernelId))
+    {
+      AITER_CHECK(Y.dtype() == AITER_DTYPE_bf16,
+                  "opus_gemm_a16w16_tune: gfx1250 .co kid writes bf16 C "
+                  "directly (no reduce kernel to cast), so Y must be bf16");
+      opus_a16w16_co_tune_dispatch_gfx1250(kernelId)(XQ, WQ, Y, bias, splitK);
+    }
+    else
+#endif
     // All splitk kids (gfx950/gfx942/gfx1250) force <fp32_t>: the main kernel
     // writes an fp32 workspace and a reduce kernel casts it to Y.dtype() at
     // runtime (gfx1250 cluster_tdm_splitk_ws now follows this same pattern).

@@ -234,6 +234,7 @@ def bench_mlp_single_weight_init(
     op_regex,
     routed_experts=None,
     preshuffle=False,
+    backend=None,
 ):
     rank = 0
     dev = f"cuda:{rank}"
@@ -318,6 +319,7 @@ def bench_mlp_single_weight_init(
             swizzle_mx_scale=swizzle_mx_scale1,
             preshuffle_weights=preshuffle,
             apply_swiglu=True,
+            backend=backend,
         )
         x, x_scale = mxfp4_quant(x)
         x = moe_gemm_a4w4(
@@ -330,6 +332,7 @@ def bench_mlp_single_weight_init(
             scatter_indx=scatter_indx,
             swizzle_mx_scale=swizzle_mx_scale2,
             preshuffle_weights=preshuffle,
+            backend=backend,
         )
     proton.finalize()
     return parse_profile(
@@ -350,6 +353,7 @@ def bench_mlp(
     routed_experts=None,
     num_weight_inits=1,
     preshuffle=False,
+    backend=None,
 ):
     all_results = []
     for _ in range(num_weight_inits):
@@ -365,6 +369,7 @@ def bench_mlp(
             op_regex,
             routed_experts=routed_experts,
             preshuffle=preshuffle,
+            backend=backend,
         )
         all_results.append(result)
 
@@ -394,6 +399,7 @@ def roofline_mlp(
     name="",
     num_weight_inits=1,
     preshuffle=False,
+    backend=None,
 ):
     # Put all outputs under logs/<name>/ and write a CSV file (not a directory-as-stem).
     out_dir = Path("logs") / name
@@ -421,6 +427,7 @@ def roofline_mlp(
         routed_experts,  # fixed args
         num_weight_inits,
         preshuffle,
+        backend,
         bench_fn=bench_mlp,  # function to benchmark
         intensity_proxy_name="batch",  # intensity proxy name
         intensity_proxy_values=batch_sizes,  # intensity proxy values to sweep
@@ -469,6 +476,13 @@ def parse_args(args: list[str] | None = None):
         "routed rows cannot reach more experts than there are rows, so a batch "
         "that small pins fewer. Default: unset, i.e. random routing over all "
         "experts.",
+    )
+    parser.add_argument(
+        "--backend",
+        choices=["triton", "gluon"],
+        default=None,
+        help="Kernel backend for moe_gemm_a4w4. Default: unset, i.e. the arch "
+        "default (gluon on gfx1250, triton elsewhere). gluon requires gfx1250.",
     )
     parser.add_argument(
         "--num-weight-inits",
@@ -521,6 +535,7 @@ def main(args: list[str] | None = None) -> None:
         name="gpt-oss-x2",
         num_weight_inits=parsed_args.num_weight_inits,
         preshuffle=parsed_args.preshuffle,
+        backend=parsed_args.backend,
     )
 
 
