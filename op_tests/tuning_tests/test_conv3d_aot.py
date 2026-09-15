@@ -53,7 +53,7 @@ def _rows_for_this_device():
     return df.reset_index(drop=True)
 
 
-def _call_row(row):
+def _call_row(row, output_layout=None):
     """Run one tuned row through the production entry point."""
     n, c, d, h, w = (int(row[k]) for k in ("N", "C", "D", "H", "W"))
     k, kt, kh, kw = (int(row[x]) for x in ("K", "kT", "kH", "kW"))
@@ -78,6 +78,9 @@ def _call_row(row):
             (k, c // groups, kt, kh, kw), device=dev, dtype=torch.bfloat16
         )
     bias = torch.randn((k,), device=dev, dtype=torch.bfloat16) if has_bias else None
+    extra = {}
+    if output_layout is not None:
+        extra["output_layout"] = "NHWC" if (kt == 1 and d == 1) else "NDHWC"
     try:
         return flydsl_conv_implicit(
             x,
@@ -87,6 +90,7 @@ def _call_row(row):
             padding=padding,
             dilation=dilation,
             groups=groups,
+            **extra,
         )
     finally:
         del x, weight, bias
@@ -255,24 +259,46 @@ class TestConv3dAotCoverage(unittest.TestCase):
             bias=True,
         )
 
-    def test_runtime_never_jits(self):
-        """The real op, run-only. An uncovered or mis-keyed shape raises here."""
+    def _run_only_sweep(self, output_layout=None):
         missed = []
         with run_only_env():
             for i, row in self.rows.iterrows():
                 try:
-                    self.assertIsNotNone(_call_row(row))
+                    self.assertIsNotNone(_call_row(row, output_layout))
                 except Exception as exc:  # noqa: BLE001
                     missed.append(
                         f"row {i} ({row['C']}->{row['K']} D{row['D']} "
                         f"{row['H']}x{row['W']} bias={row['bias']}): "
                         f"{type(exc).__name__}: {str(exc).splitlines()[0][:160]}"
                     )
+        return missed
+
+    def test_runtime_never_jits(self):
+        """The real op, run-only. An uncovered or mis-keyed shape raises here."""
+        missed = self._run_only_sweep()
         self.assertEqual(
             missed,
             [],
             f"{len(missed)}/{len(self.rows)} tuned rows were not served from the "
             "AOT cache:\n" + "\n".join(missed),
+        )
+
+    def test_runtime_never_jits_channels_last_out(self):
+        """Same sweep with a channels-last output.
+
+        ``out_ndhwc`` flips the epilogue, so it is a second compile per row.
+        Covering it now means a caller that later keeps a VAE stage in
+        channels-last does not fall back to JIT -- and the measurement that
+        motivates doing so at all is small (1.10x on the Wan shapes, against a
+        boundary conversion in torch that costs ~18x the op's own transpose),
+        so the JIT would have swamped the gain.
+        """
+        missed = self._run_only_sweep(output_layout="channels_last")
+        self.assertEqual(
+            missed,
+            [],
+            f"{len(missed)}/{len(self.rows)} tuned rows were not served from the "
+            "AOT cache with a channels-last output:\n" + "\n".join(missed),
         )
 
 

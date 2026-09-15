@@ -23,13 +23,22 @@ Unlike the GEMM AOT, no kernel name has to be parsed: the tuned CSV stores the
 launch config as five explicit integer columns, so a job is read straight off
 the row.
 
-Coverage is exactly the CSV, with no generalisation. ``compile_conv3d_implicit``
-takes the whole problem shape as compile-time constants -- the im2col div/mod
-folding against ``(kT, kH, kW)`` and ``C/groups`` is where this kernel's
-performance comes from -- so a resolution, frame count, bias flag or output
-layout outside the table still JITs. ``op_tests/tuning_tests/test_conv3d_aot.py``
-pins that down by re-running the op under ``run_only_env()``, where an uncovered
-shape raises instead of silently falling back.
+Both output layouts are covered, two conv jobs per CSV row. ``out_ndhwc`` is a
+compile-time parameter because it flips the epilogue -- channels-last output
+gives up the vectorised store on the ``n == 1`` fast path, since a lane's four
+accumulator values become four M rows that are K apart. The *input* layout is
+not a compile-time parameter: it only decides whether the host runs the
+pre-transpose, so ``NDHWC -> NCDHW`` is served by the same artifact as
+``NCDHW -> NCDHW``. That makes this 2 variants per row rather than 4.
+
+Coverage is otherwise exactly the CSV, with no generalisation.
+``compile_conv3d_implicit`` takes the whole problem shape as compile-time
+constants -- the im2col div/mod folding against ``(kT, kH, kW)`` and
+``C/groups`` is where this kernel's performance comes from -- so a resolution,
+frame count or bias flag outside the table still JITs.
+``op_tests/tuning_tests/test_conv3d_aot.py`` pins that down by re-running the op
+under ``run_only_env()``, where an uncovered shape raises instead of silently
+falling back.
 
 Usage::
 
@@ -154,21 +163,28 @@ def parse_csv(csv_path: str):
             cgp = _pad_channels(shape["C"] // groups)
             c_padded = groups * cgp
 
-            conv_job = {
-                "kind": "conv3d",
-                "kernel_name": "conv3d_implicit_kernel",
-                "cu_num": cu_num,
-                "gfx": gfx,
-                "c_padded": c_padded,
-                "has_bias": has_bias,
-                "splitk": max(1, splitk),
-                **shape,
-                **config,
-            }
-            key = job_identity(conv_job)
-            if key not in seen:
-                seen.add(key)
-                jobs.append(conv_job)
+            # Both output layouts, because `out_ndhwc` is a compile-time
+            # parameter: it flips the epilogue, which gives up the vectorised
+            # store on the n==1 fast path once channels are innermost. The
+            # *input* layout is not -- it only decides whether the host runs the
+            # pre-transpose -- so this is 2 variants per row rather than 4.
+            for out_ndhwc in (False, True):
+                conv_job = {
+                    "kind": "conv3d",
+                    "kernel_name": "conv3d_implicit_kernel",
+                    "cu_num": cu_num,
+                    "gfx": gfx,
+                    "c_padded": c_padded,
+                    "has_bias": has_bias,
+                    "splitk": max(1, splitk),
+                    "out_ndhwc": out_ndhwc,
+                    **shape,
+                    **config,
+                }
+                key = job_identity(conv_job)
+                if key not in seen:
+                    seen.add(key)
+                    jobs.append(conv_job)
 
             # The NCDHW->NHWC pre-transpose. Keyed only on (n, padded C, T*H*W),
             # so several convolutions collapse onto one job. Skipped where the
@@ -260,6 +276,7 @@ def _compile_conv3d_to_cache(
     wave_m: int,
     wave_n: int,
     wgm: int,
+    out_ndhwc: bool = False,
     **kwargs,
 ):
     del kwargs
@@ -292,9 +309,7 @@ def _compile_conv3d_to_cache(
         (tile_m, tile_n, wave_m, wave_n),
         wgm,
         groups,
-        # The CSV does not carry a layout, and NCDHW is the default. A
-        # channels-last caller compiles a different artifact.
-        False,
+        out_ndhwc,
     )
     with compile_only_env():
         _dispatch(exe, *_conv_probe_args(splitk), stream=None)
@@ -327,7 +342,8 @@ def compile_one_config(
             f"{kernel_name}  {kwargs['N']}x{kwargs['C']}x{kwargs['D']}x"
             f"{kwargs['H']}x{kwargs['W']}->{kwargs['K']} "
             f"k{kwargs['kT']}{kwargs['kH']}{kwargs['kW']} "
-            f"tile={kwargs['tile_m']}x{kwargs['tile_n']}"
+            f"tile={kwargs['tile_m']}x{kwargs['tile_n']} "
+            f"out={'NDHWC' if kwargs.get('out_ndhwc') else 'NCDHW'}"
         )
     result = {
         "kernel_name": kernel_name,
