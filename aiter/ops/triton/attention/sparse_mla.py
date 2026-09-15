@@ -175,11 +175,10 @@ def _classify_cache(q, kv, kv_lora_rank, qk_rope_head_dim, kv_scale, what="kv_bu
     d_qk = q.shape[-1]
     if kv.device != q.device:
         raise ValueError(f"{what} is on {kv.device}, q is on {q.device}")
-    if kv.ndim == 4:
-        if kv.shape[1] != 1 or kv.shape[2] != 1:
-            raise ValueError(
-                f"{what}: a 4-D cache must be [slots, 1, 1, R], got {tuple(kv.shape)}"
-            )
+    if kv.ndim == 4 and (kv.shape[1] != 1 or kv.shape[2] != 1):
+        raise ValueError(
+            f"{what}: a 4-D cache must be [slots, 1, 1, R], got {tuple(kv.shape)}"
+        )
     if kv.ndim in (2, 4):
         width = kv.shape[-1]
         if width != d_qk:
