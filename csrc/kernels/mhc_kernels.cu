@@ -14,6 +14,22 @@
 #include "aiter_tensor.h"
 
 
+// Width of the stage-1 split-k partial reduction in the mhc_pre_big_fuse kernels.
+// Stage 2 sums this many LDS partials on a single serial dependent chain, so a
+// smaller cap shortens the block-wide critical section. Override at build time.
+#ifndef MHC_RM_REDUCE_SPLITS_CAP
+#define MHC_RM_REDUCE_SPLITS_CAP 24
+#endif
+
+// Warp count for the wave64 small-m hidden_size=7168 rms-fused path. Capping the
+// reduction above is what makes 9 warps pay: uncapped, the stage-2 chain would be
+// 96 deep at 9 warps against 53 at 5. Legal values with residual_block=1024 are 5
+// and 9 (at 9, pre_thread_num=512 and res_vec_size=8, so lanes still issue 16B
+// loads). Override at build time to retune for another architecture.
+#ifndef MHC_RM_NUM_WARPS_7168
+#define MHC_RM_NUM_WARPS_7168 9
+#endif
+
 namespace aiter {
 #if defined(__gfx1250__)
     static constexpr bool mhc_async_load_oob_guard = true;
@@ -781,7 +797,17 @@ namespace aiter {
         constexpr int pre_thread_num = block_size - warp_size;
         static_assert(hc_mult3 % 4 == 0, "hc_mult3 must be divisible by 4");
         static constexpr int hc_mult3_threads = num_rows * hc_mult3 / 4;
-        static constexpr int reduce_splits_per_round = block_size / hc_mult3_threads;
+        // The split-k partials are summed twice: stage 1 spreads n_splits over
+        // reduce_splits_per_round lanes (parallel, global loads), stage 2 sums those
+        // LDS partials on only num_rows*hc_mult3 threads -- a fully serial dependent
+        // chain that every other wave waits on at the following __syncthreads.
+        // block_size/hc_mult3_threads makes that chain 53 deep at 5 warps and 96 deep
+        // at 9 warps, and past n_splits (56 here) the extra lanes contribute nothing
+        // but still cost an LDS read. Cap the width so stage 2 stays short; stage 1
+        // just does a few more (independent, unrolled) loads per lane.
+        static constexpr int reduce_splits_raw = block_size / hc_mult3_threads;
+        static constexpr int reduce_splits_per_round =
+            reduce_splits_raw < MHC_RM_REDUCE_SPLITS_CAP ? reduce_splits_raw : MHC_RM_REDUCE_SPLITS_CAP;
         static constexpr int reduce_active_threads = hc_mult3_threads * reduce_splits_per_round;
         static_assert(hc_mult == 4, "hc_mult only supports 4");
         static_assert(reduce_active_threads <= block_size,
@@ -1598,7 +1624,17 @@ namespace aiter {
         constexpr int pre_thread_num = block_size - warp_size;
         static_assert(hc_mult3 % 4 == 0, "hc_mult3 must be divisible by 4");
         static constexpr int hc_mult3_threads = num_rows * hc_mult3 / 4;
-        static constexpr int reduce_splits_per_round = block_size / hc_mult3_threads;
+        // The split-k partials are summed twice: stage 1 spreads n_splits over
+        // reduce_splits_per_round lanes (parallel, global loads), stage 2 sums those
+        // LDS partials on only num_rows*hc_mult3 threads -- a fully serial dependent
+        // chain that every other wave waits on at the following __syncthreads.
+        // block_size/hc_mult3_threads makes that chain 53 deep at 5 warps and 96 deep
+        // at 9 warps, and past n_splits (56 here) the extra lanes contribute nothing
+        // but still cost an LDS read. Cap the width so stage 2 stays short; stage 1
+        // just does a few more (independent, unrolled) loads per lane.
+        static constexpr int reduce_splits_raw = block_size / hc_mult3_threads;
+        static constexpr int reduce_splits_per_round =
+            reduce_splits_raw < MHC_RM_REDUCE_SPLITS_CAP ? reduce_splits_raw : MHC_RM_REDUCE_SPLITS_CAP;
         static constexpr int reduce_active_threads = hc_mult3_threads * reduce_splits_per_round;
         static_assert(hc_mult == 4, "hc_mult only supports 4");
         static_assert(reduce_active_threads <= block_size,
@@ -1810,6 +1846,12 @@ namespace aiter {
                 }
             };
 
+            // Measured on gfx950 (m128/m120/m112, num_warps=9): flattening this
+            // residual stream into an out_loop-deep prefetch -- every 16B load in
+            // flight instead of the 2-stage double buffer below -- REGRESSED ~2%.
+            // The extra live loads cost more in register pressure, and give a
+            // single drain point, than the added memory-level parallelism buys.
+            // Recorded so the experiment is not repeated.
             res_vec_t v_res0 = load_res_loop(0);
             res_vec_t v_res1 = load_res_loop(1);
             int i = 0;
@@ -2021,7 +2063,7 @@ namespace aiter {
 #define MHC_PRE_BIG_FUSE_RM_KERNEL_DISPATCH(m) \
     if (hidden_size == 7168) { \
         if (m < 4 * cu_num) { \
-            if (WARP_SIZE == 32) { \
+            if (WARP_SIZE == 32 || MHC_RM_NUM_WARPS_7168 == 9) { \
                 MHC_PRE_BIG_FUSE_RM_KERNEL_IMPL(9, 4, 1, 7168, 1024, 1024, false); \
             } else { \
                 MHC_PRE_BIG_FUSE_RM_KERNEL_IMPL(5, 4, 1, 7168, 1024, 1024, false); \
