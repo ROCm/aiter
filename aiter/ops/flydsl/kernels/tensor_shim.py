@@ -504,25 +504,6 @@ class GTensor(TensorBase):
         self.base_i64 = base
         self.cache_modifier = cache_modifier
 
-    def rebase_bytes(self, byte_offset_i64):
-        """Return a view with its buffer descriptor based at a dynamic offset.
-
-        Buffer instructions have a 32-bit byte offset even when the allocation
-        is larger than 4 GiB. Rebasing with 64-bit pointer arithmetic keeps the
-        subsequent per-view offset small.
-        """
-        view = GTensor.__new__(GTensor)
-        TensorBase.__init__(
-            view,
-            self.dtype,
-            self.shape,
-            self.stride,
-            self.base_offset,
-        )
-        view.base_i64 = self.base_i64 + fx.Int64(byte_offset_i64)
-        view.cache_modifier = self.cache_modifier
-        return view
-
     def _view(self, elem, unit_elems):
         """Buffer view whose unit is one access.
 

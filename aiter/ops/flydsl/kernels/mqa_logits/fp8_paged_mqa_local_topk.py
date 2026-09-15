@@ -59,7 +59,7 @@ def fp8_paged_mqa_local_topk_kernel_name(
     return (
         f"fp8_paged_mqa_local_topk_h32d128_k{topk}_{layout_name}{packed_tag}_"
         f"w{WAVES}_bn{BLOCK_N}_inc{INCOMING_CAPACITY}_"
-        f"pm{int(prepare_merge)}_scan2safe_{arch}"
+        f"pm{int(prepare_merge)}_ptr64_scan3_{arch}"
     )
 
 
@@ -109,28 +109,41 @@ def _load_fp8x32(i32_view, byte_base, lane_div_16):
     return _concat_i32x4(lo, hi)
 
 
-def _load_preshuffled_fp8x32(
-    i32_view,
+def _ptr_load_i32x4(i32_ptr, offset_i64):
+    return fx.Vector(
+        fx.ptr_load(
+            i32_ptr + fx.Int64(offset_i64),
+            result_type=T.i32x4,
+        )
+    )
+
+
+def _ptr_load_fp8x32(i32_ptr, byte_base_i64, lane_div_16):
+    """Load one lane's contiguous K32 fragment through a 64-bit global pointer."""
+    off = (byte_base_i64 >> fx.Int64(2)) + fx.Int64(lane_div_16) * fx.Int64(8)
+    lo = _ptr_load_i32x4(i32_ptr, off)
+    hi = _ptr_load_i32x4(i32_ptr, off + fx.Int64(4))
+    return _concat_i32x4(lo, hi)
+
+
+def _ptr_load_preshuffled_fp8x32(
+    i32_ptr,
     page_i32,
     token_in_page,
     lane_div_16,
 ):
-    """Load the two 16-byte MFMA fragments from shuffle_weight layout.
-
-    ``page_i32`` is the page origin in i32 units, so packed 8448-byte pages and
-    split 8192-byte pages share the same in-page shuffle addressing.
-    """
-    token_block = token_in_page // fx.Int32(16)
-    token_lane = token_in_page % fx.Int32(16)
-    dim_block = lane_div_16 * fx.Int32(2)
+    """Load one preshuffled K32 fragment with an i64 page offset."""
+    token_block = fx.Int64(token_in_page // fx.Int32(16))
+    token_lane = fx.Int64(token_in_page % fx.Int32(16))
+    dim_block = fx.Int64(lane_div_16) * fx.Int64(2)
     off = (
         page_i32
-        + token_block * fx.Int32(16 * HEAD_DIM // 4)
-        + dim_block * fx.Int32(16 * 16 // 4)
-        + token_lane * fx.Int32(4)
+        + token_block * fx.Int64(16 * HEAD_DIM // 4)
+        + dim_block * fx.Int64(16 * 16 // 4)
+        + token_lane * fx.Int64(4)
     )
-    lo = i32_view.vec_load((off,), vec_size=4)
-    hi = i32_view.vec_load((off + fx.Int32(16 * 16 // 4),), vec_size=4)
+    lo = _ptr_load_i32x4(i32_ptr, off)
+    hi = _ptr_load_i32x4(i32_ptr, off + fx.Int64(16 * 16 // 4))
     return _concat_i32x4(lo, hi)
 
 
@@ -179,46 +192,57 @@ def compile_fp8_paged_mqa_local_topk(
     if page_size == 64 and packed:
 
         def _page_i32(physical_page):
-            return (physical_page << 11) + (physical_page << 6)
+            page = fx.Int64(physical_page)
+            return (page << fx.Int64(11)) + (page << fx.Int64(6))
 
     elif page_size == 64:
 
         def _page_i32(physical_page):
-            return physical_page << 11
+            return fx.Int64(physical_page) << fx.Int64(11)
 
     else:
 
         def _page_i32(physical_page):
-            return physical_page * fx.Int32(block_i32)
+            return fx.Int64(physical_page) * fx.Int64(block_i32)
 
     if preshuffled:
 
-        def _load_k(kv_i32, page_i32, token_in_page, lane):
-            page_view = kv_i32.rebase_bytes(fx.Int64(page_i32) << fx.Int64(2))
-            return _load_preshuffled_fp8x32(
-                page_view,
-                fx.Int32(0),
+        def _load_k(kv_i32_ptr, page_i32, token_in_page, lane):
+            return _ptr_load_preshuffled_fp8x32(
+                kv_i32_ptr,
+                page_i32,
                 token_in_page,
                 lane,
             )
 
     else:
 
-        def _load_k(kv_i32, page_i32, token_in_page, lane):
-            page_view = kv_i32.rebase_bytes(fx.Int64(page_i32) << fx.Int64(2))
-            byte_base = token_in_page * fx.Int32(HEAD_DIM)
-            return _load_fp8x32(page_view, byte_base, lane)
+        def _load_k(kv_i32_ptr, page_i32, token_in_page, lane):
+            byte_base = (page_i32 << fx.Int64(2)) + fx.Int64(token_in_page) * fx.Int64(
+                HEAD_DIM
+            )
+            return _ptr_load_fp8x32(kv_i32_ptr, byte_base, lane)
 
     if packed:
 
-        def _load_scale(scales, page_i32, token_in_page):
-            page_view = scales.rebase_bytes(fx.Int64(page_i32) << fx.Int64(2))
-            return fx.Float32(page_view[fx.Int32(scale_i32) + token_in_page])
+        def _load_scale(scales_ptr, page_i32, token_in_page):
+            return fx.Float32(
+                fx.ptr_load(
+                    scales_ptr
+                    + page_i32
+                    + fx.Int64(scale_i32)
+                    + fx.Int64(token_in_page)
+                )
+            )
 
     else:
 
-        def _load_scale(scales, page_i32, token_in_page):
-            return fx.Float32(scales[(page_i32 >> 5) + token_in_page])
+        def _load_scale(scales_ptr, page_i32, token_in_page):
+            return fx.Float32(
+                fx.ptr_load(
+                    scales_ptr + (page_i32 >> fx.Int64(5)) + fx.Int64(token_in_page)
+                )
+            )
 
     @flyc.kernel(name=kernel_name, known_block_size=[BLOCK_THREADS, 1, 1])
     def kernel(
@@ -248,8 +272,14 @@ def compile_fp8_paged_mqa_local_topk(
         lane_mod_16 = _umod(lane, MFMA_N)
 
         q_i32 = GTensor(q_fp8, dtype=T.i32, shape=(-1,))
-        kv_i32 = GTensor(kv_cache, dtype=T.i32, shape=(-1,))
-        scales = GTensor(k_scales, dtype=T.f32, shape=(-1,))
+        kv_i32_ptr = fx.recast_iter(
+            fx.PointerType.get(T.i32, fx.AddressSpace.Global, 4),
+            fx.get_iter(kv_cache),
+        )
+        scales_ptr = fx.recast_iter(
+            fx.PointerType.get(T.f32, fx.AddressSpace.Global, 4),
+            fx.get_iter(k_scales),
+        )
         weight_t = GTensor(weights, dtype=T.f32, shape=(-1, HEADS))
         lengths = GTensor(context_lens, dtype=T.i32, shape=(-1,))
         tables = GTensor(block_tables, dtype=T.i32, shape=(-1,))
@@ -434,12 +464,12 @@ def compile_fp8_paged_mqa_local_topk(
                 page_i32 = page_i32s[ni]
                 token_in_page = _umod(safe_logical, page_size_i32)
                 k_pack = _load_k(
-                    kv_i32,
+                    kv_i32_ptr,
                     page_i32,
                     token_in_page,
                     lane_div_16,
                 )
-                scale = _load_scale(scales, page_i32, token_in_page)
+                scale = _load_scale(scales_ptr, page_i32, token_in_page)
                 logical_tiles.append(logical)
                 k_packs.append(k_pack)
                 scale_tiles.append(scale)

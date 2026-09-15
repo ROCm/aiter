@@ -155,16 +155,20 @@ def make_block_exclusive_prefix_i32(num_waves):
         fly_rocdl.s_waitcnt(lgkmcnt=0)
         gpu.barrier()
 
-        cross_wave = fx.Int32(0)
-        total = fx.Int32(0)
-        for wave_index in range(num_waves):
-            wave_total = scan[wave_index]
-            cross_wave = (wave > fx.Int32(wave_index)).select(
-                cross_wave + wave_total,
-                cross_wave,
-            )
-            total = total + wave_total
-        result = cross_wave + exclusive
+        if wave == 0:
+            wave_value = fx.Int32(0)
+            if lane < fx.Int32(num_waves):
+                wave_value = scan[lane]
+            wave_inclusive = warp_inclusive_prefix_i32(wave_value, lane)
+            if lane < fx.Int32(num_waves):
+                scan[lane] = wave_inclusive - wave_value
+            if lane == fx.Int32(num_waves - 1):
+                scan[num_waves] = wave_inclusive
+        fly_rocdl.s_waitcnt(lgkmcnt=0)
+        gpu.barrier()
+
+        result = scan[wave] + exclusive
+        total = scan[num_waves]
         gpu.barrier()
         return result, total
 
