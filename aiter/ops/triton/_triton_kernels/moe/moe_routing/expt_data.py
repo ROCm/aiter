@@ -71,7 +71,6 @@ def _expt_data_compute_stage2(
     expt_id = pid
 
     n_tokens = tl.load(Hist + expt_id)
-    # Guarded block, not an early return: the latter miscompiles on gfx950.
     if n_tokens != 0:
         BLOCK: tl.constexpr = 8
         n_blocks = _cdiv_pow2(n_tokens, tile_dim_log2)
@@ -87,7 +86,6 @@ def _expt_data_compute_stage2(
 @triton.jit
 def _expt_data_compute_stage2_fused(expt_id, Hist, tile_start, TileInfo):
     n_tokens = tl.load(Hist + expt_id)
-    # Guarded block, not an early return: the latter miscompiles on gfx950.
     if n_tokens != 0:
         tile_info = TileInfo + tile_start
         tl.store(tile_info, expt_id)
