@@ -3154,6 +3154,7 @@ def compile_mixed_moe_gemm2_common(
     b_nt: int = 0,
     xcd_swizzle: int = 0,
     shared_expert_id: int | None = None,
+    use_global_a: bool = True,
 ):
     """Compile stage2 kernel (moe_gemm2): A2 @ W2.T -> [tokens, model_dim], atomic-add."""
     heterogeneous_b = shared_expert_id is not None
@@ -3341,6 +3342,7 @@ def compile_mixed_moe_gemm2_common(
             f"_vscale_fix3_fp4opt_v1{pm_tag}{sbm_tag}{wpe_tag}{async_tag}"
             f"{cumul_tag}{xcd_tag}{acc_tag}"
         )
+    variant_tags += "_aglobal" if use_global_a else "_abuffer"
     module_name = (
         f"mfma_moe2_a{a_dtype}_w{b_dtype}_{out_s}_{epilog_tag}"
         f"_t{tile_m}x{tile_n}x{tile_k}{variant_tags}"
@@ -3380,18 +3382,15 @@ def compile_mixed_moe_gemm2_common(
         ):
 
             tokens_in = fx.Index(i32_tokens_in)
-            x_rows = fx.Index(i32_x_rows)
             n_in = fx.Index(i32_n_in)
             k_in = fx.Index(i32_k_in)
             size_expert_ids_in = fx.Index(i32_size_expert_ids_in)
-            x_elem = default_f8_type()
             f32 = T.f32
             i32 = T.i32
             i64 = T.i64
             i32_t = fx.Numeric.from_ir_type(i32)
             i64_t = fx.Numeric.from_ir_type(i64)
             vec4_f32 = T.vec(4, f32)
-            vec16_elems = 16 if a_elem_bytes == 1 else 8
 
             acc_init = arith.constant_vector(0.0, vec4_f32)
 
@@ -3496,11 +3495,18 @@ def compile_mixed_moe_gemm2_common(
 
             c_topk = arith.constant(topk, index=True)
 
-            c_elem_bytes = arith.constant(int(a_elem_bytes), index=True)
             c_a_pack = arith.constant(int(a_elem_vec_pack), index=True)
-            x_nbytes_idx = _div_pow2(x_rows * k_in * c_elem_bytes, int(a_elem_vec_pack))
-            x_nbytes_i32 = fx.Int32(x_nbytes_idx)
-            x_rsrc = ptr_rsrc(arg_x, x_nbytes_i32)
+            x_elem = default_f8_type()
+            vec16_elems = 16 if a_elem_bytes == 1 else 8
+            x_rsrc = None
+            if const_expr(not use_global_a):
+                x_rows = fx.Index(i32_x_rows)
+                c_elem_bytes = arith.constant(int(a_elem_bytes), index=True)
+                x_nbytes_idx = _div_pow2(
+                    x_rows * k_in * c_elem_bytes, int(a_elem_vec_pack)
+                )
+                x_nbytes_i32 = fx.Int32(x_nbytes_idx)
+                x_rsrc = ptr_rsrc(arg_x, x_nbytes_i32)
 
             w_rsrc = ptr_rsrc(arg_w, w_nbytes)
             shared_w_rsrc = ptr_rsrc(arg_shared_w, shared_w_nbytes)
@@ -3704,31 +3710,41 @@ def compile_mixed_moe_gemm2_common(
                 )
 
                 def load_x(idx_i32):
-                    """Load `x_load_bytes` bytes from X (gmem) into regs.
-
-                    For 16B, keep the fast dwordx4 path. For 8B/4B, use byte offsets.
-                    """
-                    if const_expr(x_load_bytes == 16):
-                        idx_elem = (
-                            idx_i32 if a_elem_bytes == 1 else (idx_i32 * arith.index(2))
+                    if const_expr(use_global_a):
+                        # Gather rows can span more than a 4 GiB buffer resource.
+                        # Invalid routes already use row 0; K loads stay within a row.
+                        ptr_type = fx.PointerType.get(
+                            T.i32, address_space=fx.AddressSpace.Global, alignment=4
                         )
-                        return buffer_copy_gmem16_dwordx4(
+                        return fx.ptr_load(
+                            fx.recast_iter(ptr_type, arg_x) + fx.Int64(idx_i32),
+                            result_type=fx.Vector.make_type(chunk_i32, fx.Int32),
+                        )
+                    else:
+                        # The 16B path uses element offsets; 8B/4B use bytes.
+                        if const_expr(x_load_bytes == 16):
+                            idx_elem = (
+                                idx_i32
+                                if a_elem_bytes == 1
+                                else (idx_i32 * arith.index(2))
+                            )
+                            return buffer_copy_gmem16_dwordx4(
+                                buffer_ops,
+                                elem_type=x_elem,
+                                idx_i32=idx_elem,
+                                rsrc=x_rsrc,
+                                vec_elems=vec16_elems,
+                            )
+                        idx_bytes = idx_i32 * arith.index(4)
+                        return _buffer_load_vec(
                             buffer_ops,
+                            x_rsrc,
+                            idx_bytes,
                             elem_type=x_elem,
-                            idx_i32=idx_elem,
-                            rsrc=x_rsrc,
-                            vec_elems=vec16_elems,
+                            vec_elems=x_load_vec_elems,
+                            elem_bytes=a_elem_bytes,
+                            offset_in_bytes=True,
                         )
-                    idx_bytes = idx_i32 * arith.index(4)
-                    return _buffer_load_vec(
-                        buffer_ops,
-                        x_rsrc,
-                        idx_bytes,
-                        elem_type=x_elem,
-                        vec_elems=x_load_vec_elems,
-                        elem_bytes=a_elem_bytes,
-                        offset_in_bytes=True,
-                    )
 
                 if const_expr(use_async_copy and a_elem_vec_pack > 1):
                     dma_bytes_pre = 16
@@ -4093,34 +4109,50 @@ def compile_mixed_moe_gemm2_common(
                             )
                             row_k_dw = x_row_base_div4[i] + base_k_div4
                             global_byte_idx = row_k_dw * c4_idx + col_local_sw
-                            global_offset = fx.Int32(global_byte_idx)
-
-                            if const_expr(i == 0):
-                                lds_addr = (
-                                    fx.ptrtoint(lds_x)
-                                    + lds_base * c_a_elem_bytes_dma
-                                    + wave_id * c_wave_dma_bytes
+                            if const_expr(use_global_a):
+                                src = fx.recast_iter(fx.Uint8, arg_x) + fx.Int64(
+                                    global_byte_idx
                                 )
-                                lds_ptr_i64 = rocdl.readfirstlane(
-                                    T.i64, fx.Int64(lds_addr)
+                                # global_load_lds needs each lane's explicit LDS address.
+                                dst = lds_x + fx.Int64(
+                                    lds_base * c_a_elem_bytes_dma
+                                    + (tx + i * total_threads) * dma_bytes
+                                )
+                                rocdl.global_load_lds(
+                                    fx.to_llvm_ptr(src),
+                                    fx.to_llvm_ptr(dst),
+                                    dma_bytes,
+                                    0,
                                 )
                             else:
-                                lds_ptr_i64 = lds_ptr_i64 + arith.constant(
-                                    total_threads * dma_bytes, type=T.i64
+                                global_offset = fx.Int32(global_byte_idx)
+
+                                if const_expr(i == 0):
+                                    lds_addr = (
+                                        fx.ptrtoint(lds_x)
+                                        + lds_base * c_a_elem_bytes_dma
+                                        + wave_id * c_wave_dma_bytes
+                                    )
+                                    lds_ptr_i64 = rocdl.readfirstlane(
+                                        T.i64, fx.Int64(lds_addr)
+                                    )
+                                else:
+                                    lds_ptr_i64 = lds_ptr_i64 + arith.constant(
+                                        total_threads * dma_bytes, type=T.i64
+                                    )
+
+                                lds_ptr_type = ir.Type.parse("!llvm.ptr<3>")
+                                lds_ptr = llvm.inttoptr(lds_ptr_type, lds_ptr_i64)
+
+                                rocdl.raw_ptr_buffer_load_lds(
+                                    x_rsrc,
+                                    lds_ptr,
+                                    arith.constant(dma_bytes, type=T.i32),
+                                    global_offset,
+                                    arith.constant(0, type=T.i32),
+                                    arith.constant(0, type=T.i32),
+                                    arith.constant(0, type=T.i32),
                                 )
-
-                            lds_ptr_type = ir.Type.parse("!llvm.ptr<3>")
-                            lds_ptr = llvm.inttoptr(lds_ptr_type, lds_ptr_i64)
-
-                            rocdl.raw_ptr_buffer_load_lds(
-                                x_rsrc,
-                                lds_ptr,
-                                arith.constant(dma_bytes, type=T.i32),
-                                global_offset,
-                                arith.constant(0, type=T.i32),
-                                arith.constant(0, type=T.i32),
-                                arith.constant(0, type=T.i32),
-                            )
 
                     def prefetch_x_to_lds(base_k, lds_base):
                         dma_x_tile_to_lds(base_k, lds_base)
@@ -5148,6 +5180,7 @@ def compile_mixed_moe_gemm2_common(
         cu_num if persistent else 0,
         waves_per_eu,
         use_async_copy,
+        use_global_a,
         xcd_swizzle,
     )
     if heterogeneous_b:
