@@ -18,21 +18,21 @@ from aiter.ops.flydsl.gemm_mxfp8 import DEFAULT_CONFIG, flydsl_mxfp8_kernel_name
 @pytest.fixture
 def mixed_csv(tmp_path):
     rows = [
-        dict(
-            libtype="flydsl",
-            kernelName=flydsl_mxfp8_kernel_name(
+        {
+            "libtype": "flydsl",
+            "kernelName": flydsl_mxfp8_kernel_name(
                 DEFAULT_CONFIG, out_dtype=torch.bfloat16, bpreshuffle=False
             ),
-            M=17,
-            N=128,
-            K=7168,
-            gfx="gfx950",
-            cu_num=256,
-            outdtype="torch.bfloat16",
-            bias=False,
-            bpreshuffle=False,
-            splitK=1,
-        )
+            "M": 17,
+            "N": 128,
+            "K": 7168,
+            "gfx": "gfx950",
+            "cu_num": 256,
+            "outdtype": "torch.bfloat16",
+            "bias": False,
+            "bpreshuffle": False,
+            "splitK": 1,
+        }
     ]
     for gfx in ("gfx950", "gfx1250"):
         rows.append(
@@ -121,7 +121,7 @@ def test_main_submits_all_filtered_jobs(monkeypatch, mixed_csv, arch, kinds):
     def run_stub(compile_fn, jobs):
         assert compile_fn is gemm.compile_one_config
         submitted.extend(jobs)
-        return [dict(compile_time=0.0) for _ in jobs]
+        return [{"compile_time": 0.0} for _ in jobs]
 
     monkeypatch.setattr(gemm, "run_jobs_parallel", run_stub)
     with pytest.raises(SystemExit) as exc:

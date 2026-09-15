@@ -548,7 +548,9 @@ def _compile_a16w16_gfx1250_to_cache(
             device=dev,
             dtype=torch_dtype if has_bias else torch_out_dtype,
         )
-        workspace = torch.empty((representative_extent,), device=dev, dtype=torch.float32)
+        workspace = torch.empty(
+            (representative_extent,), device=dev, dtype=torch.float32
+        )
         semaphore = torch.zeros((representative_extent,), device=dev, dtype=torch.int32)
         stream = fx.Stream(0)
         dispatch_args = (
