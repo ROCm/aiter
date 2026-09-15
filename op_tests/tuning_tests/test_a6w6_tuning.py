@@ -19,6 +19,9 @@ AITER_ROOT = os.path.dirname(
 MANIFEST = os.path.join(
     AITER_ROOT, "hsa", "gfx950", "f6gemm", "f6gemm_bf16_per1x32Fp6.csv"
 )
+TUNED_CONFIG = os.path.join(
+    AITER_ROOT, "aiter", "configs", "a6w6_blockscale_tuned_gemm.csv"
+)
 TUNED_HEADER = [
     "gfx",
     "cu_num",
@@ -45,10 +48,10 @@ class TestA6W6TuningLookup(unittest.TestCase):
         gemm_op_a6w6.clear_gemm_a6w6_config_cache()
         self.tempdir.cleanup()
 
-    def _write_rows(self, rows):
+    def _write_rows(self, rows, extra_header=()):
         with open(self.config, "w", newline="") as csv_file:
             writer = csv.writer(csv_file)
-            writer.writerow(TUNED_HEADER)
+            writer.writerow([*TUNED_HEADER, *extra_header])
             writer.writerows(rows)
         gemm_op_a6w6.clear_gemm_a6w6_config_cache()
 
@@ -155,19 +158,103 @@ class TestA6W6TuningLookup(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "duplicate"):
             gemm_op_a6w6._load_gemm_a6w6_configs(self.config)
 
-    def test_explicit_override_and_safe_default(self):
+    def test_invalid_logical_shape_is_rejected(self):
+        self._write_rows(
+            [
+                [
+                    "gfx950",
+                    256,
+                    256,
+                    256,
+                    128,
+                    1,
+                    0,
+                    1,
+                    "kernel",
+                    1,
+                    1,
+                    0,
+                    2,
+                ]
+            ],
+            extra_header=["logicalShape"],
+        )
+        with self.assertRaisesRegex(ValueError, "logicalShape must be 0 or 1"):
+            gemm_op_a6w6._load_gemm_a6w6_configs(self.config)
+
+    def test_invalid_split_m64_is_rejected(self):
+        self._write_rows(
+            [
+                [
+                    "gfx950",
+                    256,
+                    576,
+                    55296,
+                    6144,
+                    1,
+                    0,
+                    1,
+                    "kernel",
+                    1,
+                    1,
+                    0,
+                    2,
+                ]
+            ],
+            extra_header=["splitM64"],
+        )
+        with self.assertRaisesRegex(ValueError, "splitM64 must be 0 or 1"):
+            gemm_op_a6w6._load_gemm_a6w6_configs(self.config)
+
+    @mock.patch.object(gemm_op_a6w6, "get_cu_num", return_value=256)
+    @mock.patch.object(gemm_op_a6w6, "get_gfx", return_value="gfx950")
+    def test_blank_separator_column_is_ignored(self, _gfx, _cu):
+        self._write_rows(
+            [
+                [
+                    "gfx950",
+                    256,
+                    256,
+                    256,
+                    128,
+                    1,
+                    0,
+                    "",
+                    1,
+                    "kernel",
+                    1,
+                    1,
+                    0,
+                ]
+            ],
+            extra_header=[""],
+        )
+
+        config = gemm_op_a6w6.get_GEMM_A6W6_config(256, 256, 128, self.config)
+
+        self.assertFalse(any(str(column).startswith("Unnamed:") for column in config))
+
+    def test_explicit_override_and_default(self):
         self.assertEqual(
             gemm_op_a6w6._select_gemm_a6w6_kernel(1, 1, 1, "explicit_kernel"),
             "explicit_kernel",
         )
+
+    def test_legacy_kernel_name_maps_to_canonical_name(self):
+        self.assertEqual(
+            gemm_op_a6w6._select_gemm_a6w6_kernel(
+                1, 1, 1, "f6gemm_tstage_kernel_func"
+            ),
+            "aiter_a6w6_m256n256_tile_stage",
+        )
         self.assertEqual(
             gemm_op_a6w6._default_gemm_a6w6_kernel(512, 55296, 6144),
-            gemm_op_a6w6._SAFE_FALLBACK_KERNEL_NAME,
+            gemm_op_a6w6._DEFAULT_KERNEL_NAME,
         )
 
 
 class TestA6W6ApiValidation(unittest.TestCase):
-    def test_asm_wrapper_selects_safe_default_kernel(self):
+    def test_asm_wrapper_selects_default_kernel(self):
         packed = torch.empty(0, dtype=torch.uint8, device="meta")
         out = torch.empty((512, 55296), dtype=torch.bfloat16, device="meta")
 
@@ -178,7 +265,89 @@ class TestA6W6ApiValidation(unittest.TestCase):
 
         self.assertIs(result, out)
         self.assertEqual(
-            launch.call_args.args[6], gemm_op_a6w6._SAFE_FALLBACK_KERNEL_NAME
+            launch.call_args.args[8], gemm_op_a6w6._DEFAULT_KERNEL_NAME
+        )
+
+    def test_asm_wrapper_forwards_logical_shape(self):
+        packed = torch.empty(0, dtype=torch.uint8, device="meta")
+        out = torch.empty((768, 3072), dtype=torch.bfloat16, device="meta")
+
+        with mock.patch.object(gemm_op_a6w6, "_gemm_a6w6_asm") as launch:
+            gemm_op_a6w6.gemm_a6w6_asm(
+                packed,
+                packed,
+                packed,
+                packed,
+                out,
+                3072,
+                "kernel",
+                M=544,
+                N=3072,
+            )
+
+        self.assertEqual(launch.call_args.args[5:8], (544, 3072, 3072))
+
+    def test_asm_wrapper_rejects_oversized_logical_shape(self):
+        packed = torch.empty(0, dtype=torch.uint8, device="meta")
+        out = torch.empty((256, 256), dtype=torch.bfloat16, device="meta")
+
+        with self.assertRaisesRegex(ValueError, "must fit"):
+            gemm_op_a6w6.gemm_a6w6_asm(
+                packed, packed, packed, packed, out, 128, M=257, N=256
+            )
+
+    def test_logical_shape_config_is_opt_in(self):
+        self.assertFalse(gemm_op_a6w6._config_uses_logical_shape(None))
+        self.assertFalse(gemm_op_a6w6._config_uses_logical_shape({}))
+        self.assertFalse(
+            gemm_op_a6w6._config_uses_logical_shape({"logicalShape": float("nan")})
+        )
+        self.assertTrue(
+            gemm_op_a6w6._config_uses_logical_shape({"logicalShape": 1})
+        )
+
+    @mock.patch.object(gemm_op_a6w6, "get_GEMM_A6W6_config")
+    @mock.patch.object(gemm_op_a6w6, "gemm_a6w6_asm")
+    def test_gemm_forwards_flagged_logical_shape(self, launch, get_config):
+        get_config.return_value = {"kernelName": "kernel", "logicalShape": 1}
+        packed = torch.empty(0, dtype=torch.uint8, device="meta")
+
+        gemm_op_a6w6.gemm_a6w6(
+            packed, packed, packed, packed, 576, 6144, 24576
+        )
+
+        self.assertEqual(launch.call_args.args[8:10], (576, 6144))
+
+    @mock.patch.object(gemm_op_a6w6, "get_GEMM_A6W6_config")
+    @mock.patch.object(gemm_op_a6w6, "gemm_a6w6_asm")
+    def test_gemm_preserves_padded_shape_without_flag(self, launch, get_config):
+        get_config.return_value = {"kernelName": "kernel", "logicalShape": 0}
+        packed = torch.empty(0, dtype=torch.uint8, device="meta")
+
+        gemm_op_a6w6.gemm_a6w6(packed, packed, packed, packed, 544, 3072, 3072)
+
+        self.assertEqual(launch.call_args.args[8:10], (None, None))
+
+    @mock.patch.object(gemm_op_a6w6, "get_GEMM_A6W6_config")
+    @mock.patch.object(gemm_op_a6w6, "gemm_a6w6_asm")
+    def test_gemm_splits_64_row_tail_when_flagged(self, launch, get_config):
+        get_config.return_value = {"kernelName": "main_kernel", "splitM64": 1}
+        M, N, K = 576, 55296, 6144
+        nk_pad = K // 128 + 2
+        packed = torch.empty(3 * nk_pad * 24576, dtype=torch.uint8, device="meta")
+        scales = torch.empty(3 * nk_pad * 1024, dtype=torch.uint8, device="meta")
+
+        result = gemm_op_a6w6.gemm_a6w6(
+            packed, packed, scales, scales, M, N, K
+        )
+
+        self.assertEqual(result.shape, (M, N))
+        self.assertEqual(launch.call_count, 2)
+        main, tail = launch.call_args_list
+        self.assertEqual(main.args[6:10], ("main_kernel", 1.0, 512, N))
+        self.assertEqual(
+            tail.args[6:10],
+            ("aiter_a6w6_m64n128_full_stage", 1.0, 64, N),
         )
 
     def test_torch_quantizer_rejects_non_matrix_input(self):
@@ -206,35 +375,80 @@ class TestA6W6ApiValidation(unittest.TestCase):
 
 class TestA6W6Manifest(unittest.TestCase):
     def test_manifest_candidates_are_compatible_and_present(self):
-        configs = pd.read_csv(MANIFEST)
-        self.assertGreater(len(configs), 1)
-        self.assertFalse(configs["knl_name"].duplicated().any())
+        configs = pd.read_csv(MANIFEST, skipinitialspace=True)
+        configs.columns = configs.columns.str.strip()
+        expected_kernels = {
+            "aiter_a6w6_m256n256_tile_stage",
+            "aiter_a6w6_m256n256_row_stage_gm32_k6k",
+            "aiter_a6w6_m256n256_row_stage_gm64_k6k",
+            "aiter_a6w6_m256n256_row_stage_gm32_k16k",
+            "aiter_a6w6_m256n256_persistent",
+            "aiter_a6w6_m256n256_persistent_prefetch10",
+            "aiter_a6w6_m256n512_persistent",
+            "aiter_a6w6_m256n512_persistent_row_stage",
+            "aiter_a6w6_m128n256_stream",
+            "aiter_a6w6_m64n128_tile_stage",
+            "aiter_a6w6_m64n128_full_stage",
+            "aiter_a6w6_m128n128_tile_stage",
+            "aiter_a6w6_m128n128_full_stage",
+            "aiter_a6w6_m128n256_full_stage",
+            "aiter_a6w6_m256n256_row_stage_gm4_k16k",
+        }
+        self.assertEqual(set(configs["kernel"].str.strip()), expected_kernels)
+        self.assertFalse(configs["kernel"].duplicated().any())
+        self.assertFalse(configs["id"].duplicated().any())
+        self.assertEqual(
+            configs["id"].tolist(), list(range(len(configs)))
+        )
         self.assertTrue((configs["splitK"] == 0).all())
-        self.assertTrue((configs["block_size"] == 256).all())
+        layouts = set(
+            configs[["tile_M", "tile_N", "block_size"]]
+            .itertuples(index=False, name=None)
+        )
+        self.assertEqual(
+            layouts,
+            {
+                (256, 256, 256),
+                (256, 512, 256),
+                (128, 256, 128),
+                (128, 256, 256),
+                (64, 128, 128),
+                (128, 128, 256),
+            },
+        )
         self.assertTrue((configs["pack_layout"] == gemm_op_a6w6._PACK_LAYOUT).all())
         self.assertTrue(
             {"swizzle_max_M", "swizzle_max_N", "swizzle_max_K"}.issubset(
                 configs.columns
             )
         )
-        swz0 = configs[
-            configs["knl_name"] == gemm_op_a6w6._SAFE_FALLBACK_KERNEL_NAME
+        default = configs[
+            configs["kernel"].str.strip() == gemm_op_a6w6._DEFAULT_KERNEL_NAME
         ].iloc[0]
         self.assertEqual(
             (
-                swz0["swizzle_max_M"],
-                swz0["swizzle_max_N"],
-                swz0["swizzle_max_K"],
+                default["swizzle_max_M"],
+                default["swizzle_max_N"],
+                default["swizzle_max_K"],
             ),
             (0, 0, 0),
         )
-        grp16 = configs[configs["knl_name"] == "f6gemm_dmabig_grp16_kernel_func"].iloc[
-            0
-        ]
-        self.assertEqual(grp16["swizzle_max_M"], 65536)
         manifest_dir = os.path.dirname(MANIFEST)
-        for co_name in configs["co_name"]:
+        for co_name in configs["object"].str.strip():
             self.assertTrue(os.path.exists(os.path.join(manifest_dir, co_name)))
+
+    def test_tuned_kernel_ids_match_manifest_rows(self):
+        manifest = pd.read_csv(MANIFEST, skipinitialspace=True)
+        manifest.columns = manifest.columns.str.strip()
+        tuned = pd.read_csv(TUNED_CONFIG)
+        kernel_ids = {
+            row.kernel.strip(): row.id for row in manifest.itertuples(index=False)
+        }
+        self.assertEqual(
+            set(manifest["id"]), set(range(len(manifest)))
+        )
+        for row in tuned.itertuples(index=False):
+            self.assertEqual(row.kernelId, kernel_ids[row.kernelName])
 
 
 class TestA6W6MinimumGainGuard(unittest.TestCase):
