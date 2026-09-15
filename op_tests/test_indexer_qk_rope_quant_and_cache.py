@@ -513,6 +513,69 @@ def test_indexer_qk_rope_quant_and_cache_fp4(
     return ret
 
 
+def test_indexer_determinism(
+    num_tokens: int,
+    num_heads: int,
+    mode: str,
+    dtype: torch.dtype = dtypes.bf16,
+    reps: int = 6,
+):
+    """Same input, several launches, byte-identical outputs.
+
+    The K layernorm's mean and variance rounds reduce through one shared
+    staging buffer, so without a barrier between them kv_cache follows wave
+    scheduling instead of the input. Only a few thousand resident blocks pull
+    the waves far enough apart to see it -- at the token counts the other tests
+    here use, the same defect reproduces in well under one run in ten. The
+    outputs are compared against each other rather than against run_torch
+    because the oracle's reduction order differs from the kernel's, which lands
+    on an fp8/fp4 rounding boundary about once in a million elements.
+    """
+    fp4 = mode == "fp4"
+    *inputs, _num_valid = _make_inputs(num_tokens, num_heads, dtype, 0.5)
+    if fp4:
+        num_blocks = max(
+            1, (num_tokens + FP4_KV_BLOCK_SIZE - 1) // FP4_KV_BLOCK_SIZE
+        )
+        names = ["q_out", "q_scale_out", "weights_out", "kv_cache", "kv_cache_scale"]
+    else:
+        num_blocks = max(1, (num_tokens + BLOCK_SIZE - 1) // BLOCK_SIZE)
+        names = ["q_out", "weights_out", "kv_cache"]
+
+    def alloc():
+        return (
+            _alloc_fp4_outputs(num_tokens, num_heads, num_blocks, dtype)
+            if fp4
+            else _alloc_fp8_outputs(num_tokens, num_heads, num_blocks)
+        )
+
+    first = None
+    diverged = {}
+    for _ in range(reps):
+        outs = alloc()
+        _make_aiter_candidate(*inputs, False, True, outs)()
+        torch.cuda.synchronize()
+        if first is None:
+            first = [out.clone() for out in outs]
+            continue
+        for name, want, have in zip(names, first, outs):
+            if not torch.equal(want, have):
+                diverged[name] = max(
+                    diverged.get(name, 0), int((want != have).sum().item())
+                )
+
+    ret = {
+        "gfx": get_gfx(),
+        "mode": mode,
+        "num_tokens": num_tokens,
+        "num_heads": num_heads,
+        "reps": reps,
+    }
+    ret.update({f"{name} diverged": diverged.get(name, 0) for name in names})
+    assert not diverged, f"{mode} not deterministic across {reps} runs: {diverged}"
+    return ret
+
+
 def test_indexer_fp4_e2e_pa_mqa_logits(
     batch: int,
     next_n: int,
@@ -761,8 +824,8 @@ def main():
         "--mode",
         type=str,
         nargs="*",
-        choices=["fp8", "fp4", "e2e"],
-        default=["fp8", "fp4", "e2e"],
+        choices=["fp8", "fp4", "e2e", "determinism"],
+        default=["fp8", "fp4", "e2e", "determinism"],
         help="Output modes to exercise. e.g.: --mode fp8 fp4",
     )
     args = parser.parse_args()
@@ -795,6 +858,21 @@ def main():
         df = pd.DataFrame(rows)
         aiter.logger.info(
             "indexer_qk_rope_quant_and_cache fp4 summary (markdown):\n%s",
+            df.to_markdown(index=False),
+        )
+
+    if "determinism" in args.mode:
+        rows = [
+            test_indexer_determinism(num_tokens, num_heads, mode)
+            for num_tokens, num_heads, mode in [
+                (16384, 32, "fp8"),
+                (16384, 32, "fp4"),
+            ]
+            if mode != "fp4" or is_gfx950
+        ]
+        df = pd.DataFrame(rows)
+        aiter.logger.info(
+            "indexer_qk_rope_quant_and_cache determinism summary (markdown):\n%s",
             df.to_markdown(index=False),
         )
 

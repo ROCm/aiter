@@ -622,6 +622,9 @@ __global__ void reshape_and_cache_with_block_quant_kernel(
     }
 
     k_max_val = block_reduce<float, decltype(f_max_f32), wg_size, true>(k_max_val, f_max_f32);
+    // block_reduce's only barrier sits after its cross-wave smem write, so
+    // two rounds of one instantiation must be separated by the caller.
+    __syncthreads();
     v_max_val = block_reduce<float, decltype(f_max_f32), wg_size, true>(v_max_val, f_max_f32);
 
     float k_block_scale = k_max_val / dtypeMax;
@@ -870,6 +873,9 @@ __global__ void reshape_and_cache_with_block_quant_kernel_for_asmpa(
     }
 
     k_max_val = block_reduce<float, decltype(f_max_f32), wg_size, true>(k_max_val, f_max_f32);
+    // block_reduce's only barrier sits after its cross-wave smem write, so
+    // two rounds of one instantiation must be separated by the caller.
+    __syncthreads();
     v_max_val = block_reduce<float, decltype(f_max_f32), wg_size, true>(v_max_val, f_max_f32);
 
     float k_block_scale = k_max_val / dtypeMax;
@@ -1674,6 +1680,9 @@ __global__ void indexer_qk_rope_quant_and_cache_kernel(
     const float mean = sum / static_cast<float>(HEAD_DIM);
 
     float centered = x - mean;
+    // block_reduce's only barrier sits after its cross-wave smem write, so
+    // two rounds of one instantiation must be separated by the caller.
+    __syncthreads();
     float ss = block_reduce<float, decltype(sum_func), HEAD_DIM, true>(centered * centered, sum_func);
     const float inv_std = rsqrtf(ss / static_cast<float>(HEAD_DIM) + epsilon);
 
