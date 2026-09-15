@@ -1,0 +1,56 @@
+name: Stale branches
+
+# Comments on branches with no commits for 30 days and deletes them 7 days
+# later if nothing changes, so the first run only ever warns.
+#
+# The exemptions below are not preferences, they are things that break if
+# deleted. Measured against the repo on 2026-09-15:
+#   release/*, v[0-9]*  16 release branches are already past 30 days
+#   gh-pages            the published documentation site
+#   open PRs            deleting the head branch breaks the review
+#   protected branches  main and anything else protected in settings
+#
+# Known limitation: the action reads each branch tip's author date, not the
+# date it was pushed, so a long-lived branch rebased onto main today still
+# looks as old as the work it carries. Of the 717 branches currently past 30
+# days, 4 are in that state. They get the same 7-day warning comment naming
+# their author, and anything under review is covered by the open-PR check
+# below, so a false positive costs a comment rather than a branch.
+
+on:
+  schedule:
+    - cron: '0 2 * * 1'   # Mondays, 02:00 UTC
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Report what would be deleted without deleting anything'
+        type: boolean
+        default: true
+
+permissions:
+  contents: write       # comment on and delete branches
+  actions: read         # required by remove-stale-branches
+  pull-requests: read   # detect branches with open PRs
+
+concurrency:
+  group: stale-branches
+  cancel-in-progress: false
+
+jobs:
+  remove-stale-branches:
+    runs-on: ubuntu-latest
+    # Pinned to the v2.4.0 commit, not the tag: this step can delete refs, and
+    # a tag can be moved. Same convention as reviewdog/action-setup in pre-checks.yaml.
+    steps:
+      - uses: fpicalausa/remove-stale-branches@7c4f2afe88a36c0f9114cd958380979b9d7323fb  # v2.4.0
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          # Manual runs default to a dry run; the schedule acts for real.
+          dry-run: ${{ inputs.dry_run || false }}
+          days-before-branch-stale: 30
+          days-before-branch-delete: 7
+          # Upstream default is false: without this, branches with an open
+          # pull request would be deleted out from under the review.
+          ignore-branches-with-open-prs: true
+          exempt-protected-branches: true
+          exempt-branches-regex: '^(main|master|gh-pages|stable|release/.*|v[0-9].*)$'
