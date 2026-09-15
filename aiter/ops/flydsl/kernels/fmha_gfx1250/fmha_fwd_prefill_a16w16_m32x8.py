@@ -650,11 +650,12 @@ def _softmax(
     length-R lists (R = WMMA_ROW_PER_WAVE); the q_*_list default to all-None. m_prev/d_prev
     are fx.Float32 shared by the l<->l^16 pair.
 
-    Returns 5 length-R lists ``(p, m_new, d_new, corr, do_rescale)`` — per row: p = NKV v8
-    **bf16** P^T = exp(S^T - m_new); m_new = updated running max, STALE (== m_prev) when the
-    deferred-rescale ballot did not fire (FAv4 §9.1.1); d_new = corr*d_prev + rowsum(p);
-    corr = exp(m_prev - m_new) (== 1 on the stale path); do_rescale = wave-uniform i1 (None
-    when deferral is compiled out).
+    Returns 4 length-R lists ``(p, m_new, d_new, corr)`` plus a scalar ``rescale_any`` —
+    per row: p = NKV v8 **bf16** P^T = exp(S^T - m_new); m_new = updated running max, STALE
+    (== m_prev) when that row's deferred-rescale ballot did not fire (FAv4 §9.1.1);
+    d_new = corr*d_prev + rowsum(p); corr = exp(m_prev - m_new) (== 1 on the stale path).
+    ``rescale_any`` is one wave-uniform i1 over ALL R rows (None when deferral is compiled
+    out): staleness stays per-row, but the caller gets a single branch to test.
     """
     NKV = n_block // WMMA_N
     f32 = ir.F32Type.get()
@@ -751,7 +752,8 @@ def _softmax(
     local_max_list = _tree_reduce_multi(s_masked_list, max3, fmax)
 
     # ---- Per row: peer reduce + deferred-rescale decision + corr. ----
-    m_new_list, corr_list, do_rescale_list = [], [], []
+    m_new_list, corr_list = [], []
+    rescale_mask = None
     for r in range(R):
         m_prev, q_min = m_prev_list[r], q_min_list[r]
         row_max = fmax(local_max_list[r], peer(local_max_list[r]))
@@ -766,11 +768,12 @@ def _softmax(
             # `>` lowers to ordered OGT, so a fully-masked lane's -inf - -inf = NaN
             # compares false and never forces a rescale.
             need = fsub(row_max, m_prev) > fx.Float32(RESCALE_THRESHOLD * LOG2E)
-            mask = rocdl.ballot(fx.Int32.ir_type, need)
-            do_rescale = fx.Int32(mask) != fx.Int32(0)
-            m_new = do_rescale.select(m_full, m_prev)
+            mask = fx.Int32(rocdl.ballot(fx.Int32.ir_type, need))
+            m_new = (mask != fx.Int32(0)).select(m_full, m_prev)
+            # OR the raw ballots, not the per-row booleans: one s_or_b32 folds R rows into
+            # the single test the caller branches on.
+            rescale_mask = mask if rescale_mask is None else (rescale_mask | mask)
         else:
-            do_rescale = None
             m_new = m_full
 
         # corr = exp(m_prev - m_new), log2-domain so exp2 takes the difference directly.
@@ -780,7 +783,7 @@ def _softmax(
         corr = exp2(fsub(m_prev, m_new))
         m_new_list.append(m_new)
         corr_list.append(corr)
-        do_rescale_list.append(do_rescale)
+    rescale_any = None if rescale_mask is None else (rescale_mask != fx.Int32(0))
 
     # ---- Pass 2 (all R rows): p = exp(S - m_new) (bf16, per tile) + flat p for the sum
     # tree. Built for every row first so the row sum-trees below emit INTERLEAVED. ----
@@ -812,7 +815,7 @@ def _softmax(
                 fadd(local_sum_list[r], peer(local_sum_list[r])),
             )
         )
-    return p_list, m_new_list, d_new_list, corr_list, do_rescale_list
+    return p_list, m_new_list, d_new_list, corr_list, rescale_any
 
 
 def _pv_gemm(
@@ -1658,7 +1661,7 @@ def _core_attention(
                 seq_idx[qt] + causal_off - window_left if mask_left else None
                 for qt in range(R)
             ]
-            p_list, m_new_list, d_new_list, corr_list, do_rescale_list = _softmax(
+            p_list, m_new_list, d_new_list, corr_list, rescale_any = _softmax(
                 s_list=s_in,
                 m_prev_list=m_prev,
                 d_prev_list=d_prev,
@@ -1676,34 +1679,41 @@ def _core_attention(
             # rescale CLOSES the body (O already carries PV(u-1)) and the next body's PV
             # accumulates onto the rescaled O -- the same product as rescaling first. On
             # the lagging half it precedes this body's own PV, which is the same identity.
-            # When deferral is active (do_rescale is a wave-uniform i1) the wide
-            # `o_acc *= corr` multiply (d_tiles*8 f32/lane) is gated behind a non-divergent
-            # scf.if that fires only when the running max actually moved; on the stale path
-            # corr == 1 so the else-branch passes o_acc through untouched. do_rescale is
-            # None -> deferral compiled out, keep the unconditional multiply.
-            o_resc_list = []
-            for qt in range(R):
-                corr_vec = fx.Vector.from_elements(
-                    [corr_list[qt]], fx.Float32
-                ).broadcast_to(8)
-                o_vecs = [fx.Vector(_ir(o_in[qt][dt])) for dt in range(d_tiles)]
-                if do_rescale_list[qt] is None:
-                    o_resc = [ov * corr_vec for ov in o_vecs]
-                else:
-                    # Gate the wide multiply behind a wave-uniform scf.if (via the file's
-                    # scf_if_dispatch idiom): the then-branch rescales, the omitted
-                    # else-branch auto-passes o_acc through unchanged.
-                    o_resc = list(
-                        scf_if_dispatch(
-                            do_rescale_list[qt],
-                            lambda *_a, _ov=o_vecs, _cv=corr_vec: [
-                                ov * _cv for ov in _ov
-                            ],
-                            result_names=tuple(f"o{qt}_{dt}" for dt in range(d_tiles)),
-                            result_values=o_vecs,
-                        )
+            # When deferral is active the wide `o_acc *= corr` multiply (R*d_tiles*8
+            # f32/lane) is gated behind a non-divergent scf.if that fires only when a
+            # running max actually moved. ONE branch covers all R rows, not one each:
+            # neither row moves in the common case, so the steady state is a single
+            # not-taken s_cbranch_vccz. A row that stayed stale has m_new == m_prev, hence
+            # corr == 1 exactly, so rescaling it inside the taken branch is the identity.
+            # rescale_any is None -> deferral compiled out, keep the plain multiply.
+            corr_vecs = [
+                fx.Vector.from_elements([corr_list[qt]], fx.Float32).broadcast_to(8)
+                for qt in range(R)
+            ]
+            o_vecs = [
+                [fx.Vector(_ir(o_in[qt][dt])) for dt in range(d_tiles)]
+                for qt in range(R)
+            ]
+            if rescale_any is None:
+                o_resc_list = [
+                    [ov * corr_vecs[qt] for ov in o_vecs[qt]] for qt in range(R)
+                ]
+            else:
+                o_flat = list(
+                    scf_if_dispatch(
+                        rescale_any,
+                        lambda *_a, _o=o_vecs, _c=corr_vecs: [
+                            ov * _c[qt] for qt in range(R) for ov in _o[qt]
+                        ],
+                        result_names=tuple(
+                            f"o{qt}_{dt}" for qt in range(R) for dt in range(d_tiles)
+                        ),
+                        result_values=[v for row in o_vecs for v in row],
                     )
-                o_resc_list.append(o_resc)
+                )
+                o_resc_list = [
+                    o_flat[qt * d_tiles : (qt + 1) * d_tiles] for qt in range(R)
+                ]
             return p_list, m_new_list, d_new_list, o_resc_list
 
         def _phase_barrier():
