@@ -4,13 +4,14 @@ MORI_GPU_ARCHS=gfx950 \
 MORI_SHMEM_HEAP_SIZE=40G \
 HSA_COREDUMP_PATTERN=/dev/null \
 PYTHONPATH="$PWD:${PYTHONPATH:-}" \
-timeout 30m \
+timeout 90m \
 torchrun \
   --standalone \
   --nproc-per-node=8 \
   op_tests/multigpu_tests/bench_mega_moe_v2.py \
   --tokens 64 \
-  --mtpr 64 \
+  --mtpr 2048 \
   --iters 30 \
   --route uniform \
-  --tp
+  --tp \
+  --tp-sweep 64,256,512,2048

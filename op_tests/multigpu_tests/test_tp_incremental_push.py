@@ -1,9 +1,9 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
-"""Step 3: min-expert TP activation push vs NCCL all-gather.
+"""Step A: dest-sharded bulk TP all-gather vs NCCL.
 
-Each rank publishes every local token once into every peer's dense slab at
-``rank * m_local + t``. Consumers still wait for full publish (no overlap).
+Each producer CTA owns one peer and blits ``rank * m_local + t``. Handshake is
+``ranks_done == npes`` after the slab, not per-token expert flags.
 
 Run with::
 
@@ -38,7 +38,6 @@ from aiter.ops.flydsl.kernels.mega_moe.tp_incremental_push import (
     run_tp_incremental_push,
 )
 from aiter.ops.flydsl.kernels.mega_moe.tp_incremental_schedule import (
-    expected_token_counts,
     make_tile_row_base,
     pack_rows_by_sorted_ids,
 )
@@ -231,9 +230,6 @@ def test_tp_incremental_push(
     wts_g = torch.empty((n_tokens, topk), dtype=torch.float32, device=device)
     dist.all_gather_into_tensor(ids_g, topk_ids)
     dist.all_gather_into_tensor(wts_g, topk_weights)
-    expected = expected_token_counts(ids_g, experts).to(
-        dtype=torch.int32, device=device
-    )
 
     workspace.reset()
     push_us = _run_push(workspace, x_fp8, x_scale, topk_ids, m_local, row_major=False)
@@ -241,14 +237,13 @@ def test_tp_incremental_push(
     got_scale = workspace.rx_scale[:n_tokens]
     a_err = _mismatch_ratio(got_a, nccl_a)
     scale_err = _mismatch_ratio(got_scale, nccl_scale)
-    recv_ok = torch.equal(workspace.received, expected)
     done_ok = int(workspace.ranks_done.item()) == world
-    layout_ok = a_err == 0.0 and scale_err == 0.0 and recv_ok and done_ok
+    layout_ok = a_err == 0.0 and scale_err == 0.0 and done_ok
     _agree(
         layout_ok,
         device,
-        f"rank-major push mismatch: a_err={a_err} scale_err={scale_err} "
-        f"recv_ok={bool(recv_ok)} ranks_done={int(workspace.ranks_done.item())}",
+        f"rank-major gather mismatch: a_err={a_err} scale_err={scale_err} "
+        f"ranks_done={int(workspace.ranks_done.item())}",
     )
 
     sorted_ids, _, sorted_expert_ids, num_valid_ids, _ = moe_sorting(
@@ -358,7 +353,7 @@ def test_tp_incremental_push(
         "push TB/s": (nbytes / push_us / 1e6) if push_us else float("nan"),
         "a err": a_err,
         "scale err": scale_err,
-        "recv err": 0.0 if recv_ok else 1.0,
+        "done err": 0.0 if done_ok else 1.0,
         "gemm err": gemm_err,
         "gemm scale err": gemm_scale_err,
         "row-major a err": rm_a_err,

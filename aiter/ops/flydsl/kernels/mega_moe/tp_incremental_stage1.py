@@ -20,8 +20,9 @@ from ..tensor_shim import _run_compiled
 from .gemm1 import _LdsF32View
 from .gemm_util import _make_buffer
 from .tp_incremental_payload import emit_tp_incremental_payload, wait_expert_payload
+from .tp_incremental_push import run_tp_incremental_push
 from .tp_incremental_schedule import publish_order_from_topk
-from .tp_token_gemm1 import build_token_gemm1
+from .tp_token_gemm1 import build_token_gemm1, gemm1_token_kernel
 
 WAIT_ON_READY = True
 
@@ -425,3 +426,55 @@ def run_tp_incremental_fused(
         fx.Int32(int(skew_split)), fx.Int32(int(skew_sleeps)), fx.Int32(grid_x), stream,
     )
     return out, out_scale
+
+
+def run_tp_two_launch_stage1(
+    workspace,
+    local_x,
+    local_scale,
+    local_ids,
+    out,
+    w,
+    scale_w,
+    tile_row_base,
+    expert_ids,
+    sorted_ids,
+    out_scale,
+    num_valid,
+    tokens,
+    m_local,
+    stream,
+    *,
+    row_major: bool = False,
+    num_producers: int | None = None,
+    num_waves: int | None = None,
+    **gemm_kwargs,
+):
+    """Bulk P2P gather then token-id GEMM1. Product stage1 for Step B."""
+    run_tp_incremental_push(
+        workspace,
+        local_x,
+        local_scale,
+        local_ids,
+        m_local,
+        stream,
+        row_major=row_major,
+        num_producers=num_producers,
+        num_waves=num_waves,
+    )
+    tokens = int(tokens)
+    return gemm1_token_kernel(
+        out,
+        workspace.rx[: tokens + 1],
+        w,
+        workspace.rx_scale[: tokens + 1],
+        scale_w,
+        tile_row_base,
+        expert_ids,
+        sorted_ids,
+        out_scale,
+        num_valid,
+        tokens,
+        stream,
+        **gemm_kwargs,
+    )

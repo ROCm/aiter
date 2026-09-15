@@ -230,6 +230,10 @@ def capture(body):
     return graph
 
 
+def _fmt_ms(ms):
+    return f"{ms[0]:.4f}/{ms[1]:.4f}ms"
+
+
 def time_graph(graph, iters, device):
     barrier()
     start = torch.cuda.Event(enable_timing=True)
@@ -304,10 +308,19 @@ def main():
         "--tp",
         action="store_true",
         help=(
-            "Also run a dp-input/tp-weight variant: local MXFP8 quant, NCCL AG "
-            "of ids/weights, fused incremental GEMM1 (min-expert P2P push + "
-            "per-expert overlap), then the existing GEMM2+RS path. Accuracy is "
-            "checked against the mori (dp+ep) output, sliced per rank."
+            "TP accounting: NCCL AG(x)+fused_moe baseline vs two-launch "
+            "gather+GEMM1 e2e (local quant, ids AG, sort, bulk P2P gather, "
+            "token-id GEMM1, GEMM2+RS). Accuracy vs Mori is checked on the "
+            "two-launch e2e path at --tokens."
+        ),
+    )
+    parser.add_argument(
+        "--tp-sweep",
+        default="",
+        help=(
+            "Comma-separated per-rank token counts for the TP breakdown "
+            "(e.g. 64,256,512,2048). Empty uses --tokens only. --mtpr must "
+            "cover the largest value."
         ),
     )
     args = parser.parse_args()
@@ -321,6 +334,20 @@ def main():
     if rank_tokens and len(rank_tokens) != world:
         raise ValueError(f"--rank-tokens requires {world} comma-separated values")
     tokens = rank_tokens[rank] if rank_tokens else args.tokens
+    tp_sweep = (
+        [int(value) for value in args.tp_sweep.split(",") if value]
+        if args.tp_sweep
+        else [tokens]
+    )
+    if args.tp:
+        if not tp_sweep:
+            raise ValueError("--tp-sweep is empty")
+        if min(tp_sweep) <= 0:
+            raise ValueError("--tp-sweep values must be positive")
+        if max(tp_sweep) > args.mtpr:
+            raise ValueError(
+                f"--mtpr={args.mtpr} must cover max(--tp-sweep)={max(tp_sweep)}"
+            )
     local_experts = args.experts // world
     x, route_weights, ids = make_inputs(
         tokens,
@@ -529,6 +556,8 @@ def main():
     tp_rel_l2 = None
     tp_ms = (float("nan"), float("nan"))
     tp_stage1_ms = (float("nan"), float("nan"))
+    tp_nccl_ms = (float("nan"), float("nan"))
+    tp_rows = []
     tp_comm_fused = os.environ.get("AITER_TP_COMM_FUSED", "0") == "1"
     if args.tp:
         if rank_tokens:
@@ -538,6 +567,8 @@ def main():
             )
         if mori_graph is None:
             raise ValueError("--tp accuracy check requires Mori (no --mega-only)")
+        if tp_comm_fused and tp_sweep != [tokens]:
+            raise ValueError("AITER_TP_COMM_FUSED is not compatible with --tp-sweep")
         from functools import partial
 
         import flydsl.expr as fx
@@ -551,6 +582,8 @@ def main():
         from aiter.ops.flydsl.kernels.mega_moe.quant import per_1x32_mx_quant
         from aiter.ops.flydsl.kernels.mega_moe.tp_incremental_push import (
             TpIncrementalWorkspace,
+            compile_tp_incremental_push,
+            run_tp_incremental_push,
         )
         from aiter.ops.flydsl.kernels.mega_moe.tp_incremental_schedule import (
             expected_token_counts,
@@ -560,6 +593,11 @@ def main():
         from aiter.ops.flydsl.kernels.mega_moe.tp_incremental_stage1 import (
             compile_tp_incremental_fused,
             run_tp_incremental_fused,
+            run_tp_two_launch_stage1,
+        )
+        from aiter.ops.flydsl.kernels.mega_moe.tp_token_gemm1 import (
+            compile_tp_token_gemm1,
+            gemm1_token_kernel,
         )
         from aiter.ops.flydsl.moe_kernels import (
             build_flydslv2_gemm2_name,
@@ -569,63 +607,8 @@ def main():
         w1_tp, w1_scale_tp, w2_tp, w2_scale_tp = make_weights_tp(
             args.experts, args.model_dim, args.inter_dim, world, rank, device
         )
-        world_tokens = world * tokens
         inter_shard = args.inter_dim // world
         sort_block_m = 32
-        x_g = torch.empty(
-            (world_tokens, args.model_dim), dtype=torch.bfloat16, device=device
-        )
-        route_weights_g = torch.empty(
-            (world_tokens, args.topk), dtype=torch.float32, device=device
-        )
-        ids_g = torch.empty((world_tokens, args.topk), dtype=torch.int32, device=device)
-        tp_local_out = torch.empty(
-            (tokens, args.model_dim), dtype=torch.bfloat16, device=device
-        )
-
-        workspace = TpIncrementalWorkspace(
-            rank=rank,
-            npes=world,
-            max_m_local=tokens,
-            model_dim=args.model_dim,
-            num_experts=args.experts,
-            device=device,
-        )
-        dist.all_gather_into_tensor(route_weights_g, route_weights.contiguous())
-        dist.all_gather_into_tensor(ids_g, ids.contiguous())
-        expected = expected_token_counts(ids_g, args.experts).to(
-            dtype=torch.int32, device=device
-        )
-        sorted_ids0, _, sorted_expert_ids0, num_valid_ids0, _ = moe_sorting(
-            ids_g,
-            route_weights_g,
-            args.experts,
-            args.model_dim,
-            torch.bfloat16,
-            sort_block_m,
-        )
-        num_valid = int(num_valid_ids0[0].item())
-        tile_row_base = make_tile_row_base(num_valid, sort_block_m, device=device)
-        publish_order = publish_order_from_topk(ids).to(torch.int32).contiguous()
-        n_m = num_valid // sort_block_m
-        sorted_rows = max(
-            sorted_ids0.shape[0], sorted_expert_ids0.shape[0] * sort_block_m
-        )
-        scale_cols = (inter_shard // 32 + 7) // 8 * 8
-        padded_rows = (sorted_rows + 255) // 256 * 256
-        gemm1_out = torch.zeros(
-            (sorted_rows, inter_shard), dtype=torch.float8_e4m3fn, device=device
-        )
-        gemm1_scale = torch.zeros(
-            (padded_rows, scale_cols), dtype=torch.uint8, device=device
-        )
-        gemm1_scale_e8m0 = gemm1_scale.view(dtypes.fp8_e8m0)
-        x_fp8 = torch.empty(
-            (tokens, args.model_dim), dtype=torch.float8_e4m3fn, device=device
-        )
-        x_scale = torch.empty(
-            (tokens, args.model_dim // 32), dtype=torch.uint8, device=device
-        )
         fused_kwargs = dict(
             model_dim=args.model_dim,
             inter_dim=inter_shard,
@@ -636,6 +619,7 @@ def main():
             num_cu=torch.cuda.get_device_properties(device).multi_processor_count,
             swiglu_limit=SWIGLU_LIMIT,
         )
+        print(f"[STEP] rank={rank} tp-incremental-compile", flush=True)
         compile_tp_incremental_fused(
             model_dim=args.model_dim,
             inter_dim=inter_shard,
@@ -644,6 +628,32 @@ def main():
             num_producers=8,
             swiglu_limit=SWIGLU_LIMIT,
         )
+        compile_tp_incremental_push(
+            npes=world,
+            model_dim=args.model_dim,
+            row_major=False,
+            num_producers=32,
+            num_waves=4,
+        )
+        compile_tp_token_gemm1(
+            model_dim=args.model_dim,
+            inter_dim=inter_shard,
+            expert_offset=0,
+            sort_block_m=sort_block_m,
+            tile_n=256,
+            tile_k=256,
+            swiglu_limit=SWIGLU_LIMIT,
+        )
+        workspace = TpIncrementalWorkspace(
+            rank=rank,
+            npes=world,
+            max_m_local=max(tp_sweep),
+            model_dim=args.model_dim,
+            num_experts=args.experts,
+            device=device,
+        )
+        handshake_src = torch.zeros(1, dtype=torch.int32, device=device)
+        handshake_dst = torch.empty(world, dtype=torch.int32, device=device)
         stage2_kn = build_flydslv2_gemm2_name(
             "fp8",
             "fp4",
@@ -672,55 +682,17 @@ def main():
                 ),
             )
 
-        def _quant_local_x():
-            return per_1x32_mx_quant(x, quant_mode="fp8", out=x_fp8, scale=x_scale)
-
-        def _run_fused_stage1(sorted_ids, sorted_expert_ids):
-            stream = fx.Stream(torch.cuda.current_stream().cuda_stream)
-            return run_tp_incremental_fused(
-                workspace,
-                x_fp8,
-                x_scale,
-                ids,
-                gemm1_out,
-                w1_tp,
-                w1_scale_tp,
-                tile_row_base,
-                sorted_expert_ids[:n_m].contiguous(),
-                sorted_ids,
-                gemm1_scale,
-                expected,
-                num_valid,
-                world_tokens,
-                tokens,
-                stream,
-                publish_order=publish_order,
-                **fused_kwargs,
-            )
-
-        def tp_stage1_override(
-            *,
-            sorted_ids,
-            sorted_expert_ids,
-            **_kwargs,
-        ):
-            _quant_local_x()
-            _run_fused_stage1(sorted_ids, sorted_expert_ids)
-            return gemm1_out, gemm1_scale_e8m0
-
-        # AITER_TP_COMM_FUSED=1 replaces NCCL reduce_scatter with the comm-fused
-        # Stage2 RS over a separate MORI communicator (arena merge is Step 6).
         fused_runner = None
         if tp_comm_fused:
             from aiter.ops.flydsl.comm_fused_moe_host import (
                 create_flydsl_comm_fused_runners,
             )
 
-            bucket = int(get_padded_M(world_tokens))
-            if bucket != world_tokens:
+            bucket = int(get_padded_M(world * tokens))
+            if bucket != world * tokens:
                 raise ValueError(
                     f"AITER_TP_COMM_FUSED needs an exact padded-M bucket, but "
-                    f"world_tokens={world_tokens} pads to {bucket}"
+                    f"world_tokens={world * tokens} pads to {bucket}"
                 )
             runners = create_flydsl_comm_fused_runners(
                 tp_group=TpGroupShim(rank, world, device),
@@ -734,71 +706,314 @@ def main():
             fused_runner = runners[bucket]
             print(f"[STEP] rank={rank} tp-comm-fused-runner m={bucket}", flush=True)
 
-        def tp_stage2_override(*, ordinary_stage2, stage2_args, stage2_kwargs):
-            return fused_runner(
-                stage2_args=stage2_args,
-                stage2_kwargs=stage2_kwargs,
-                shared_partial=stage2_args[6],
-                ordinary_stage2=ordinary_stage2,
-                all_gather=False,
-            )
+        def _time(body, label):
+            print(f"[STEP] rank={rank} {label}", flush=True)
+            graph = capture(body)
+            print(f"[STEP] rank={rank} {label}-done", flush=True)
+            ms = time_graph(graph, args.iters, device)
+            del graph
+            return ms
 
-        def _tp_fused_moe():
-            return _fused_moe_impl(
-                x_g,
-                w1_tp,
-                w2_tp,
-                route_weights_g,
+        def _fx_stream():
+            return fx.Stream(torch.cuda.current_stream().cuda_stream)
+
+        def measure_tp_size(m_local, x_loc, wts_loc, ids_loc):
+            world_tokens = world * m_local
+            x_loc = x_loc.contiguous()
+            wts_loc = wts_loc.contiguous()
+            ids_loc = ids_loc.contiguous()
+            x_g = torch.empty(
+                (world_tokens, args.model_dim), dtype=torch.bfloat16, device=device
+            )
+            route_weights_g = torch.empty(
+                (world_tokens, args.topk), dtype=torch.float32, device=device
+            )
+            ids_g = torch.empty(
+                (world_tokens, args.topk), dtype=torch.int32, device=device
+            )
+            tp_local_out = torch.empty(
+                (m_local, args.model_dim), dtype=torch.bfloat16, device=device
+            )
+            tp_nccl_local = torch.empty_like(tp_local_out)
+            dist.all_gather_into_tensor(route_weights_g, wts_loc)
+            dist.all_gather_into_tensor(ids_g, ids_loc)
+            expected = expected_token_counts(ids_g, args.experts).to(
+                dtype=torch.int32, device=device
+            )
+            sorted_ids0, _, sorted_expert_ids0, num_valid_ids0, _ = moe_sorting(
                 ids_g,
-                quant_type=aiter.QuantType.per_1x32.value,
-                w1_scale=w1_scale_tp,
-                w2_scale=w2_scale_tp,
-                a1_scale=None,
-                dtype=torch.bfloat16,
-                swiglu_limit=SWIGLU_LIMIT,
-                gate_mode=GateMode.INTERLEAVE.value,
-                _metadata_transform=tp_metadata_transform,
-                _stage1_override=tp_stage1_override,
-                _stage2_override=(
-                    tp_stage2_override if fused_runner is not None else None
-                ),
+                route_weights_g,
+                args.experts,
+                args.model_dim,
+                torch.bfloat16,
+                sort_block_m,
             )
+            num_valid = int(num_valid_ids0[0].item())
+            tile_row_base = make_tile_row_base(num_valid, sort_block_m, device=device)
+            publish_order = (
+                publish_order_from_topk(ids_loc).to(torch.int32).contiguous()
+            )
+            n_m = num_valid // sort_block_m
+            expert_ids0 = sorted_expert_ids0[:n_m].contiguous()
+            sorted_rows = max(
+                sorted_ids0.shape[0], sorted_expert_ids0.shape[0] * sort_block_m
+            )
+            scale_cols = (inter_shard // 32 + 7) // 8 * 8
+            padded_rows = (sorted_rows + 255) // 256 * 256
+            gemm1_out = torch.zeros(
+                (sorted_rows, inter_shard), dtype=torch.float8_e4m3fn, device=device
+            )
+            gemm1_scale = torch.zeros(
+                (padded_rows, scale_cols), dtype=torch.uint8, device=device
+            )
+            gemm1_scale_e8m0 = gemm1_scale.view(dtypes.fp8_e8m0)
+            x_fp8 = torch.empty(
+                (m_local, args.model_dim), dtype=torch.float8_e4m3fn, device=device
+            )
+            x_scale = torch.empty(
+                (m_local, args.model_dim // 32), dtype=torch.uint8, device=device
+            )
+            rx = workspace.rx[: world_tokens + 1]
+            rx_scale = workspace.rx_scale[: world_tokens + 1]
 
-        def tp_stage1_body():
-            workspace.zero_handshake()
-            dist.all_gather_into_tensor(route_weights_g, route_weights.contiguous())
-            dist.all_gather_into_tensor(ids_g, ids.contiguous())
+            def _quant_local_x():
+                return per_1x32_mx_quant(
+                    x_loc, quant_mode="fp8", out=x_fp8, scale=x_scale
+                )
+
+            def _run_fused_stage1():
+                return run_tp_incremental_fused(
+                    workspace,
+                    x_fp8,
+                    x_scale,
+                    ids_loc,
+                    gemm1_out,
+                    w1_tp,
+                    w1_scale_tp,
+                    tile_row_base,
+                    expert_ids0,
+                    sorted_ids0,
+                    gemm1_scale,
+                    expected,
+                    num_valid,
+                    world_tokens,
+                    m_local,
+                    _fx_stream(),
+                    publish_order=publish_order,
+                    **fused_kwargs,
+                )
+
+            def _run_push():
+                return run_tp_incremental_push(
+                    workspace,
+                    x_fp8,
+                    x_scale,
+                    ids_loc,
+                    m_local,
+                    _fx_stream(),
+                    publish_order=publish_order,
+                )
+
+            def _run_token_gemm1():
+                return gemm1_token_kernel(
+                    gemm1_out,
+                    rx,
+                    w1_tp,
+                    rx_scale,
+                    w1_scale_tp,
+                    tile_row_base,
+                    expert_ids0,
+                    sorted_ids0,
+                    gemm1_scale,
+                    num_valid,
+                    world_tokens,
+                    _fx_stream(),
+                    **fused_kwargs,
+                )
+
+            def tp_stage1_override(*, sorted_ids, sorted_expert_ids, **_kwargs):
+                _quant_local_x()
+                run_tp_two_launch_stage1(
+                    workspace,
+                    x_fp8,
+                    x_scale,
+                    ids_loc,
+                    gemm1_out,
+                    w1_tp,
+                    w1_scale_tp,
+                    tile_row_base,
+                    sorted_expert_ids[:n_m].contiguous(),
+                    sorted_ids,
+                    gemm1_scale,
+                    num_valid,
+                    world_tokens,
+                    m_local,
+                    _fx_stream(),
+                    **fused_kwargs,
+                )
+                return gemm1_out, gemm1_scale_e8m0
+
+            def tp_stage2_override(*, ordinary_stage2, stage2_args, stage2_kwargs):
+                return fused_runner(
+                    stage2_args=stage2_args,
+                    stage2_kwargs=stage2_kwargs,
+                    shared_partial=stage2_args[6],
+                    ordinary_stage2=ordinary_stage2,
+                    all_gather=False,
+                )
+
+            def _tp_fused_moe():
+                return _fused_moe_impl(
+                    x_g,
+                    w1_tp,
+                    w2_tp,
+                    route_weights_g,
+                    ids_g,
+                    quant_type=aiter.QuantType.per_1x32.value,
+                    w1_scale=w1_scale_tp,
+                    w2_scale=w2_scale_tp,
+                    a1_scale=None,
+                    dtype=torch.bfloat16,
+                    swiglu_limit=SWIGLU_LIMIT,
+                    gate_mode=GateMode.INTERLEAVE.value,
+                    _metadata_transform=tp_metadata_transform,
+                    _stage1_override=tp_stage1_override,
+                    _stage2_override=(
+                        tp_stage2_override if fused_runner is not None else None
+                    ),
+                )
+
+            def tp_nccl_body():
+                dist.all_gather_into_tensor(x_g, x_loc)
+                dist.all_gather_into_tensor(route_weights_g, wts_loc)
+                dist.all_gather_into_tensor(ids_g, ids_loc)
+                tp_out = fused_moe(
+                    x_g,
+                    w1_tp,
+                    w2_tp,
+                    route_weights_g,
+                    ids_g,
+                    quant_type=aiter.QuantType.per_1x32,
+                    w1_scale=w1_scale_tp,
+                    w2_scale=w2_scale_tp,
+                    a1_scale=None,
+                    dtype=torch.bfloat16,
+                    swiglu_limit=SWIGLU_LIMIT,
+                    gate_mode=GateMode.INTERLEAVE.value,
+                )
+                dist.reduce_scatter_tensor(tp_nccl_local, tp_out, op=dist.ReduceOp.SUM)
+
+            def tp_body():
+                workspace.zero_handshake()
+                dist.all_gather_into_tensor(route_weights_g, wts_loc)
+                dist.all_gather_into_tensor(ids_g, ids_loc)
+                tp_out = _tp_fused_moe()
+                if fused_runner is not None:
+                    holders["tp"] = tp_out
+                    return
+                dist.reduce_scatter_tensor(tp_local_out, tp_out, op=dist.ReduceOp.SUM)
+                holders["tp"] = tp_local_out
+
+            def tp_stage1_body():
+                workspace.zero_handshake()
+                dist.all_gather_into_tensor(route_weights_g, wts_loc)
+                dist.all_gather_into_tensor(ids_g, ids_loc)
+                _quant_local_x()
+                _run_push()
+                _run_token_gemm1()
+
+            def tp_quant_body():
+                _quant_local_x()
+
+            def tp_ag_meta_body():
+                dist.all_gather_into_tensor(route_weights_g, wts_loc)
+                dist.all_gather_into_tensor(ids_g, ids_loc)
+
+            def _handshake_sync():
+                workspace.zero_handshake()
+                dist.all_gather_into_tensor(handshake_dst, handshake_src)
+
+            def tp_fused_k_body():
+                _handshake_sync()
+                _run_fused_stage1()
+
+            def tp_gather_k_body():
+                _handshake_sync()
+                _run_push()
+
+            def tp_two_launch_body():
+                _handshake_sync()
+                _run_push()
+                _run_token_gemm1()
+
+            def tp_gemm1_k_body():
+                _run_token_gemm1()
+
+            tag = f"m{m_local}"
+            nccl_e2e = _time(tp_nccl_body, f"tp-nccl-e2e-{tag}")
+            two_e2e = _time(tp_body, f"tp-two-e2e-{tag}")
+            tp_saved = holders["tp"].clone() if m_local == tokens else None
+            lumped_s1 = _time(tp_stage1_body, f"tp-lumped-s1-{tag}")
+            quant = _time(tp_quant_body, f"tp-quant-{tag}")
+            ag_meta = _time(tp_ag_meta_body, f"tp-ag-meta-{tag}")
             _quant_local_x()
-            _run_fused_stage1(sorted_ids0, sorted_expert_ids0)
+            fused_k = _time(tp_fused_k_body, f"tp-fused-k-{tag}")
+            gather_k = _time(tp_gather_k_body, f"tp-gather-k-{tag}")
+            two_launch = _time(tp_two_launch_body, f"tp-two-launch-{tag}")
+            gemm1_k = _time(tp_gemm1_k_body, f"tp-gemm1-k-{tag}")
+            row = {
+                "tokens": m_local,
+                "nccl_e2e": nccl_e2e,
+                "two_e2e": two_e2e,
+                "lumped_s1": lumped_s1,
+                "quant": quant,
+                "ag_meta": ag_meta,
+                "fused_k": fused_k,
+                "gather_k": gather_k,
+                "two_launch": two_launch,
+                "gemm1_k": gemm1_k,
+            }
+            if rank == 0:
+                print(
+                    f"[TP-BREAKDOWN] tokens={m_local} "
+                    f"nccl_e2e={_fmt_ms(nccl_e2e)} two_e2e={_fmt_ms(two_e2e)} "
+                    f"lumped_s1={_fmt_ms(lumped_s1)} quant={_fmt_ms(quant)} "
+                    f"ag_meta={_fmt_ms(ag_meta)} fused_k={_fmt_ms(fused_k)} "
+                    f"gather_k={_fmt_ms(gather_k)} two_launch={_fmt_ms(two_launch)} "
+                    f"gemm1_k={_fmt_ms(gemm1_k)}",
+                    flush=True,
+                )
+            return row, tp_saved
 
-        def tp_body():
-            workspace.zero_handshake()
-            dist.all_gather_into_tensor(route_weights_g, route_weights.contiguous())
-            dist.all_gather_into_tensor(ids_g, ids.contiguous())
-            tp_out = _tp_fused_moe()
-            if fused_runner is not None:
-                holders["tp"] = tp_out
-                return
-            dist.reduce_scatter_tensor(tp_local_out, tp_out, op=dist.ReduceOp.SUM)
-            holders["tp"] = tp_local_out
-
-        print(f"[STEP] rank={rank} tp-incremental-compile", flush=True)
-        tp_stage1_graph = capture(tp_stage1_body)
-        print(f"[STEP] rank={rank} tp-stage1-capture-done", flush=True)
-        tp_graph = capture(tp_body)
-        print(f"[STEP] rank={rank} tp-capture-done", flush=True)
-        tp_stage1_ms = time_graph(tp_stage1_graph, args.iters, device)
-        tp_ms = time_graph(tp_graph, args.iters, device)
-
-        tp_local = holders["tp"]
-        barrier()
-        mori_graph.replay()
-        torch.cuda.synchronize()
-        mori_ref = holders["mori"][:tokens]
-        tp_rel_l2 = (
-            tp_local.float() - mori_ref.float()
-        ).norm() / mori_ref.float().norm()
-        dist.all_reduce(tp_rel_l2, op=dist.ReduceOp.MAX)
+        for m_local in tp_sweep:
+            if m_local == tokens:
+                x_loc, wts_loc, ids_loc = x, route_weights, ids
+            else:
+                x_loc, wts_loc, ids_loc = make_inputs(
+                    m_local,
+                    rank,
+                    world,
+                    args.model_dim,
+                    args.experts,
+                    args.topk,
+                    args.route,
+                    args.hot_bias,
+                    device,
+                )
+            row, tp_saved = measure_tp_size(m_local, x_loc, wts_loc, ids_loc)
+            tp_rows.append(row)
+            if m_local == tokens:
+                tp_ms = row["two_e2e"]
+                tp_stage1_ms = row["lumped_s1"]
+                tp_nccl_ms = row["nccl_e2e"]
+                barrier()
+                mori_graph.replay()
+                torch.cuda.synchronize()
+                mori_ref = holders["mori"][:tokens]
+                tp_rel_l2 = (
+                    tp_saved.float() - mori_ref.float()
+                ).norm() / mori_ref.float().norm()
+                dist.all_reduce(tp_rel_l2, op=dist.ReduceOp.MAX)
 
     if args.profile_dir:
         if mori_graph is not None:
@@ -837,6 +1052,22 @@ def main():
             )
         if tp_rel_l2 is not None:
             print(f"[ACCURACY] tp_vs_mori_rel_l2={tp_rel_l2.item():.6e}", flush=True)
+        if tp_rows:
+            print(
+                "[TP-TABLE] tokens nccl_e2e two_e2e lumped_s1 quant ag_meta "
+                "fused_k gather_k two_launch gemm1_k",
+                flush=True,
+            )
+            for row in tp_rows:
+                print(
+                    f"[TP-TABLE] {row['tokens']} "
+                    f"{_fmt_ms(row['nccl_e2e'])} {_fmt_ms(row['two_e2e'])} "
+                    f"{_fmt_ms(row['lumped_s1'])} {_fmt_ms(row['quant'])} "
+                    f"{_fmt_ms(row['ag_meta'])} {_fmt_ms(row['fused_k'])} "
+                    f"{_fmt_ms(row['gather_k'])} {_fmt_ms(row['two_launch'])} "
+                    f"{_fmt_ms(row['gemm1_k'])}",
+                    flush=True,
+                )
         print(
             f"[RESULT] route={args.route} hot_bias={args.hot_bias} tokens={tokens} "
             f"rank_tokens={rank_tokens or 'same'} mtpr={args.mtpr} "
@@ -845,9 +1076,10 @@ def main():
             f"mega_e2e={mega_ms[0]:.4f}/{mega_ms[1]:.4f}ms speedup={speedup:.2f}% "
             f"stage1={stage1_ms[0]:.4f}/{stage1_ms[1]:.4f}ms "
             f"stage2_combine={stage2_ms[0]:.4f}/{stage2_ms[1]:.4f}ms "
+            f"tp_nccl_e2e={tp_nccl_ms[0]:.4f}/{tp_nccl_ms[1]:.4f}ms "
             f"tp_e2e={tp_ms[0]:.4f}/{tp_ms[1]:.4f}ms "
             f"tp_stage1={tp_stage1_ms[0]:.4f}/{tp_stage1_ms[1]:.4f}ms "
-            f"tp_path={'comm_fused_rs' if tp_comm_fused else 'nccl_rs'} rank-mean/max",
+            f"tp_path={'comm_fused_rs' if tp_comm_fused else 'two_launch+nccl_rs'} rank-mean/max",
             flush=True,
         )
         if guard_floor is not None:
@@ -856,6 +1088,10 @@ def main():
                 f"[PERF-GUARD] {status} speedup={speedup:.2f}% minimum={guard_floor:.2f}%",
                 flush=True,
             )
+    if args.tp:
+        # MORI shmem_finalize hangs after this bench; timings are already printed.
+        barrier()
+        os._exit(0 if guard_pass else 1)
     ms.shmem_finalize()
     dist.destroy_process_group()
     if not guard_pass:

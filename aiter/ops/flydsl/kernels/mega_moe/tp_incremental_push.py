@@ -1,23 +1,52 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (c) 2025 FlyDSL Project Contributors
-"""Standalone min-expert TP activation push (Step 3 gather, no GEMM overlap)."""
+"""Bulk dest-sharded TP activation all-gather (Step A).
+
+Each producer CTA owns one peer. Warps stripe local rows into that peer's
+dense slab at ``rank * m_local + t``. Handshake is ``npes`` system atomics
+after the whole slab, not per token. The fused incremental kernel still uses
+``emit_tp_incremental_payload``.
+"""
 
 from __future__ import annotations
 
 import functools
+import os
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 import mori.shmem as ms
 import torch
+from flydsl.expr import const_expr, range_constexpr
 from mori.shmem import mori_shmem_create_tensor
+
+from aiter.ops.flydsl.kernels import buffer_ops
 
 from .. import communication_ops_utils as comm_ops
 from ..tensor_shim import _run_compiled
-from .tp_incremental_payload import emit_tp_incremental_payload
-from .tp_incremental_schedule import publish_order_from_topk
+from .dispatch import _copy_token_row
+from .tp_incremental_payload import _copy_scale_row
 
-PRODUCER_THREADS = 64
+_HERE = os.path.dirname(os.path.abspath(__file__))
+DEFAULT_PRODUCER_BLOCKS = 32
+DEFAULT_NUM_WAVES = 4
+
+
+def _register_push_source_dir():
+    try:
+        from flydsl.compiler.jit_function import EXTRA_SOURCE_DIRS
+    except ImportError:
+        EXTRA_SOURCE_DIRS = None
+    if EXTRA_SOURCE_DIRS is not None and _HERE not in EXTRA_SOURCE_DIRS:
+        EXTRA_SOURCE_DIRS.append(_HERE)
+    cur = os.environ.get("FLYDSL_EXTRA_SOURCE_DIRS", "")
+    parts = [p for p in cur.split(":") if p]
+    if _HERE not in parts:
+        parts.append(_HERE)
+        os.environ["FLYDSL_EXTRA_SOURCE_DIRS"] = ":".join(parts)
+
+
+_register_push_source_dir()
 
 
 def _p2p_table(tensor, rank, npes, device):
@@ -83,54 +112,90 @@ class TpIncrementalWorkspace:
 # fmt: off
 @functools.cache
 def compile_tp_incremental_push(
-    *, npes: int, topk: int, model_dim: int, row_major: bool, num_producers: int,
+    *, npes: int, model_dim: int, row_major: bool, num_producers: int,
+    num_waves: int = DEFAULT_NUM_WAVES,
 ):
     # fmt: on
+    if int(num_producers) % int(npes):
+        raise ValueError(
+            f"num_producers={num_producers} must be divisible by npes={npes}"
+        )
+    num_waves = int(num_waves)
+    assert num_waves >= 1
+    total_threads = num_waves * 64
+    blocks_per_dest = int(num_producers) // int(npes)
+    row_bytes = int(model_dim)
+    scale_bytes = int(model_dim) // 32
+    row_i32 = row_bytes // 4
+    scale_i32 = scale_bytes // 4
+    row_safe_end = (row_i32 // 512) * 512
     kernel_name = (
-        f"tp_incr_push_p{npes}_k{topk}_h{model_dim}"
-        f"_rm{int(row_major)}_np{num_producers}"
+        f"tp_bulk_gather_p{npes}_h{model_dim}"
+        f"_rm{int(row_major)}_np{num_producers}_w{num_waves}_sc1"
     )
 
-    @flyc.kernel(name=kernel_name, known_block_size=[PRODUCER_THREADS, 1, 1])
+    @flyc.kernel(name=kernel_name, known_block_size=[total_threads, 1, 1])
     def kernel(
         local_x: fx.Tensor,
         local_scale: fx.Tensor,
-        local_ids: fx.Tensor,
-        publish_order: fx.Tensor,
         p2p_rx: fx.Tensor,
         p2p_scale: fx.Tensor,
-        p2p_received: fx.Tensor,
         p2p_ranks_done: fx.Tensor,
         ranks_done: fx.Tensor,
         local_prod_done: fx.Tensor,
         rank: fx.Int32,
         m_local: fx.Int32,
     ):
+        crfa = buffer_ops.create_buffer_resource_from_addr
         tid = fx.thread_idx.x
-        emit_tp_incremental_payload(
-            npes=npes,
-            rank=rank,
-            topk=topk,
-            model_dim=model_dim,
-            row_major=row_major,
-            producer_slot=fx.Int32(fx.block_idx.x),
-            num_producers=num_producers,
-            m_local=m_local,
-            addr_in_tok=fx.Int64(fx.ptrtoint(fx.get_iter(local_x))),
-            addr_in_sc=fx.Int64(fx.ptrtoint(fx.get_iter(local_scale))),
-            addr_ids=fx.Int64(fx.ptrtoint(fx.get_iter(local_ids))),
-            addr_order=fx.Int64(fx.ptrtoint(fx.get_iter(publish_order))),
-            addr_p2p_rx=fx.Int64(fx.ptrtoint(fx.get_iter(p2p_rx))),
-            addr_p2p_sc=fx.Int64(fx.ptrtoint(fx.get_iter(p2p_scale))),
-            addr_p2p_received=fx.Int64(fx.ptrtoint(fx.get_iter(p2p_received))),
-            addr_p2p_ranks_done=fx.Int64(fx.ptrtoint(fx.get_iter(p2p_ranks_done))),
-            addr_local_prod_done=fx.Int64(fx.ptrtoint(fx.get_iter(local_prod_done))),
-            skew_rank=fx.Int32(-1),
-            skew_split=fx.Int32(0),
-            skew_sleeps=fx.Int32(0),
-            addr_expert0_done=fx.Int64(fx.ptrtoint(fx.get_iter(local_prod_done))),
-            addr_overlap=fx.Int64(fx.ptrtoint(fx.get_iter(local_prod_done))),
-        )
+        lane = tid & fx.Int32(63)
+        warp = tid // fx.Int32(64)
+        producer_slot = fx.Int32(fx.block_idx.x)
+        destination = producer_slot // fx.Int32(blocks_per_dest)
+        sub = producer_slot - destination * fx.Int32(blocks_per_dest)
+        addr_in_tok = fx.Int64(fx.ptrtoint(fx.get_iter(local_x)))
+        addr_in_sc = fx.Int64(fx.ptrtoint(fx.get_iter(local_scale)))
+        r_p2p_rx = crfa(fx.Int64(fx.ptrtoint(fx.get_iter(p2p_rx))))
+        r_p2p_sc = crfa(fx.Int64(fx.ptrtoint(fx.get_iter(p2p_scale))))
+        r_p2p_ranks_done = crfa(fx.Int64(fx.ptrtoint(fx.get_iter(p2p_ranks_done))))
+        peer_x = buffer_ops.buffer_load(r_p2p_rx, destination, vec_width=1, dtype=fx.Int64)
+        peer_s = buffer_ops.buffer_load(r_p2p_sc, destination, vec_width=1, dtype=fx.Int64)
+        row0 = sub + warp * fx.Int32(blocks_per_dest)
+        row_stride = fx.Int32(blocks_per_dest * num_waves)
+        for row in range(row0, m_local, row_stride):
+            if const_expr(row_major):
+                dest_row = row * fx.Int32(npes) + rank
+            else:
+                dest_row = rank * m_local + row
+            _copy_token_row(
+                crfa(addr_in_tok + fx.Int64(row) * fx.Int64(row_bytes)),
+                crfa(fx.Int64(peer_x) + fx.Int64(dest_row) * fx.Int64(row_bytes)),
+                lane,
+                fz_safe_end_i32=row_safe_end,
+                fz_n_i32=row_i32,
+            )
+            _copy_scale_row(
+                addr_in_sc + fx.Int64(row) * fx.Int64(scale_bytes),
+                fx.Int64(peer_s) + fx.Int64(dest_row) * fx.Int64(scale_bytes),
+                lane,
+                scale_i32,
+            )
+        fx.rocdl.s_waitcnt(0)
+        fx.barrier()
+        if tid == fx.Int32(0):
+            comm_ops.fence_system_release()
+            finished = fx.Int32(
+                comm_ops.atomic_add_agent(
+                    fx.Int64(fx.ptrtoint(fx.get_iter(local_prod_done))), fx.Int32(1)
+                )
+            )
+            if finished == fx.Int32(num_producers - 1):
+                for peer in range_constexpr(npes):
+                    done_base = buffer_ops.buffer_load(
+                        r_p2p_ranks_done, fx.Int32(peer), vec_width=1, dtype=fx.Int64
+                    )
+                    comm_ops.atomic_add_system(fx.Int64(done_base), fx.Int32(1))
+        fx.barrier()
         if tid == fx.Int32(0):
             comm_ops.spin_until_eq_i32(
                 fx.Int64(fx.ptrtoint(fx.get_iter(ranks_done))), fx.Int32(npes)
@@ -142,11 +207,8 @@ def compile_tp_incremental_push(
     def launch(
         local_x: fx.Tensor,
         local_scale: fx.Tensor,
-        local_ids: fx.Tensor,
-        publish_order: fx.Tensor,
         p2p_rx: fx.Tensor,
         p2p_scale: fx.Tensor,
-        p2p_received: fx.Tensor,
         p2p_ranks_done: fx.Tensor,
         ranks_done: fx.Tensor,
         local_prod_done: fx.Tensor,
@@ -157,19 +219,20 @@ def compile_tp_incremental_push(
         kernel(
             local_x,
             local_scale,
-            local_ids,
-            publish_order,
             p2p_rx,
             p2p_scale,
-            p2p_received,
             p2p_ranks_done,
             ranks_done,
             local_prod_done,
             rank,
             m_local,
+            value_attrs={
+                "rocdl.waves_per_eu": 2,
+                "rocdl.flat_work_group_size": f"{total_threads},{total_threads}",
+            },
         ).launch(
             grid=(num_producers, 1, 1),
-            block=(PRODUCER_THREADS, 1, 1),
+            block=(total_threads, 1, 1),
             stream=stream,
         )
 
@@ -186,8 +249,11 @@ def run_tp_incremental_push(
     *,
     row_major: bool = False,
     num_producers: int | None = None,
+    num_waves: int | None = None,
+    publish_order=None,
 ):
-    """Publish local FP8 rows into every peer's dense rx; wait until all ranks done."""
+    """Blit local FP8 rows into every peer's dense rx; wait until all ranks done."""
+    del local_ids, publish_order
     m_local = int(m_local)
     if m_local <= 0:
         return workspace
@@ -195,25 +261,21 @@ def run_tp_incremental_push(
         raise ValueError(
             f"m_local={m_local} exceeds workspace max_m_local={workspace.max_m_local}"
         )
-    topk = int(local_ids.shape[1])
-    producers = int(num_producers or 8)
-    order = publish_order_from_topk(local_ids).to(torch.int32).contiguous()
+    producers = int(num_producers or DEFAULT_PRODUCER_BLOCKS)
+    waves = int(num_waves or DEFAULT_NUM_WAVES)
     launch = compile_tp_incremental_push(
         npes=workspace.npes,
-        topk=topk,
         model_dim=workspace.model_dim,
         row_major=bool(row_major),
         num_producers=producers,
+        num_waves=waves,
     )
     _run_compiled(
         launch,
         local_x.contiguous().view(torch.uint8),
         local_scale.contiguous().view(torch.uint8),
-        local_ids.to(torch.int32).contiguous(),
-        order,
         workspace.p2p_rx,
         workspace.p2p_scale,
-        workspace.p2p_received,
         workspace.p2p_ranks_done,
         workspace.ranks_done,
         workspace.local_prod_done,
