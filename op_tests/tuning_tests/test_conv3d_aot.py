@@ -32,6 +32,7 @@ from aiter.aot.flydsl.common import OpKind, run_only_env
 from aiter.jit.core import AITER_CONFIGS
 from aiter.jit.utils.chip_info import get_cu_num, get_gfx
 from aiter.ops.flydsl import flydsl_conv_implicit
+from aiter.ops.flydsl.kernels.conv3d_implicit import _pad_channels
 
 SUPPORTED_GFX = ("gfx942", "gfx950")
 
@@ -128,6 +129,131 @@ class TestConv3dAotCoverage(unittest.TestCase):
         # The NCDHW->NHWC pre-transpose is a separate lru_cache; leaving it out
         # would let it JIT at runtime while the convolution itself was covered.
         self.assertIn("transpose", kinds)
+
+    def _aot_then_run_only(self, *, c, k, d, h, w, groups, tile, wgm, splitk, bias):
+        """AOT one synthetic config, then make the runtime use it, run-only.
+
+        The tuned CSV is all ``splitK=1``/``groups=1``, so the branches those
+        select in this module would otherwise be dead code -- compiled by nobody
+        and therefore never checked against the key the runtime derives. Forcing
+        ``tile``/``wgm``/``splitk`` at the call site reaches them without
+        inventing CSV rows for shapes no model runs.
+        """
+        from aiter.aot.flydsl.conv import compile_one_config
+
+        cgp = _pad_channels(c // groups)
+        c_padded = groups * cgp
+        base = {"cu_num": get_cu_num(), "gfx": get_gfx()}
+        shape = {
+            "N": 1,
+            "C": c,
+            "D": d,
+            "H": h,
+            "W": w,
+            "K": k,
+            "kT": 3,
+            "kH": 3,
+            "kW": 3,
+            "stride_d": 1,
+            "stride_h": 1,
+            "stride_w": 1,
+            "pad_d": 1,
+            "pad_h": 1,
+            "pad_w": 1,
+            "dil_d": 1,
+            "dil_h": 1,
+            "dil_w": 1,
+            "groups": groups,
+        }
+        jobs = [
+            {
+                "kind": "conv3d",
+                "kernel_name": "conv3d_implicit_kernel",
+                "c_padded": c_padded,
+                "has_bias": bias,
+                "splitk": splitk,
+                "tile_m": tile[0],
+                "tile_n": tile[1],
+                "wave_m": tile[2],
+                "wave_n": tile[3],
+                "wgm": wgm,
+                **base,
+                **shape,
+            },
+            {
+                "kind": "transpose",
+                "kernel_name": "transpose_ncdhw_ndhwc",
+                "N": 1,
+                "c_padded": c_padded,
+                "s": d * h * w,
+                **base,
+            },
+        ]
+        for job in jobs:
+            res = compile_one_config(**job)
+            self.assertIsNotNone(
+                res["compile_time"], f"AOT compile failed: {res['shape']}"
+            )
+
+        torch.manual_seed(0)
+        dev = torch.device("cuda")
+        x = torch.randn((1, c, d, h, w), device=dev, dtype=torch.bfloat16)
+        weight = torch.randn(
+            (k, c // groups, 3, 3, 3), device=dev, dtype=torch.bfloat16
+        )
+        b = torch.randn((k,), device=dev, dtype=torch.bfloat16) if bias else None
+        ref = torch.nn.functional.conv3d(
+            x, weight, b, stride=1, padding=1, groups=groups
+        )
+        with run_only_env():
+            out = flydsl_conv_implicit(
+                x,
+                weight,
+                b,
+                stride=1,
+                padding=1,
+                groups=groups,
+                tile=tile,
+                wgm=wgm,
+                splitk=splitk,
+            )
+        torch.cuda.synchronize()
+        self.assertEqual(tuple(out.shape), tuple(ref.shape))
+        torch.testing.assert_close(out, ref, rtol=2e-2, atol=2e-2)
+
+    def test_splitk_path_is_covered(self):
+        """split-K swaps the output for an (npq, k) fp32 staging buffer.
+
+        That drops the epilogue argument from rank 5 to rank 2, and rank is part
+        of the cache key even though the extents are not -- the mistake this
+        whole test file exists to catch.
+        """
+        self._aot_then_run_only(
+            c=128,
+            k=128,
+            d=4,
+            h=16,
+            w=16,
+            groups=1,
+            tile=(128, 128, 2, 4),
+            wgm=1,
+            splitk=2,
+            bias=True,
+        )
+
+    def test_groups_path_is_covered(self):
+        self._aot_then_run_only(
+            c=32,
+            k=48,
+            d=4,
+            h=16,
+            w=16,
+            groups=4,
+            tile=(32, 32, 1, 2),
+            wgm=1,
+            splitk=1,
+            bias=True,
+        )
 
     def test_runtime_never_jits(self):
         """The real op, run-only. An uncovered or mis-keyed shape raises here."""
