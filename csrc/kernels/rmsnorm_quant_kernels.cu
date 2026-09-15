@@ -371,7 +371,13 @@ __global__ void add_rmsnorm_quant_kernel(
     } else if (n <= 4096){ \
         ADD_RMSNORM_QUANT_KERNEL_IMPL(DTYPE_O, 256, 16, ADD_RESIDUAL, FUSE_QUANT); \
     } else if (n <= 6144){ \
-        ADD_RMSNORM_QUANT_KERNEL_IMPL(DTYPE_O, 256, 24, ADD_RESIDUAL, FUSE_QUANT); \
+        if (group_size == 0 || group_size % 24 == 0) { \
+            ADD_RMSNORM_QUANT_KERNEL_IMPL(DTYPE_O, 256, 24, ADD_RESIDUAL, FUSE_QUANT); \
+        } else if (cu_num < 160) { \
+            ADD_RMSNORM_QUANT_KERNEL_IMPL(DTYPE_O, 512, 16, ADD_RESIDUAL, FUSE_QUANT); \
+        } else { \
+            ADD_RMSNORM_QUANT_KERNEL_IMPL(DTYPE_O, 1024, 8, ADD_RESIDUAL, FUSE_QUANT); \
+        } \
     } else if (n <= 8192){ \
         if (group_size == 0) { \
             ADD_RMSNORM_QUANT_KERNEL_IMPL(DTYPE_O, 256, 32, ADD_RESIDUAL, FUSE_QUANT); \
@@ -463,7 +469,13 @@ __global__ void add_rmsnorm_quant_kernel(
     } else if (n <= 4096){ \
         ADD_RMSNORM_QUANT_KERNEL_IMPL(DTYPE_O, 256, 16, ADD_RESIDUAL, FUSE_QUANT); \
     } else if (n <= 6144){ \
-        ADD_RMSNORM_QUANT_KERNEL_IMPL(DTYPE_O, 256, 24, ADD_RESIDUAL, FUSE_QUANT); \
+        if (group_size == 0 || group_size % 24 == 0) { \
+            ADD_RMSNORM_QUANT_KERNEL_IMPL(DTYPE_O, 256, 24, ADD_RESIDUAL, FUSE_QUANT); \
+        } else if (cu_num < 160) { \
+            ADD_RMSNORM_QUANT_KERNEL_IMPL(DTYPE_O, 512, 16, ADD_RESIDUAL, FUSE_QUANT); \
+        } else { \
+            ADD_RMSNORM_QUANT_KERNEL_IMPL(DTYPE_O, 1024, 8, ADD_RESIDUAL, FUSE_QUANT); \
+        } \
     } else if (n <= 8192){ \
         ADD_RMSNORM_QUANT_KERNEL_IMPL(DTYPE_O, 256, 32, ADD_RESIDUAL, FUSE_QUANT); \
     } else { \
