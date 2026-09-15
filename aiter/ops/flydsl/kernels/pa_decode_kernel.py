@@ -74,6 +74,7 @@ def compile_pa_decode_tile(
     wide_kv_addressing: bool = False,
     prefetch_v: bool = False,
     query_splits: int = 1,
+    use_work_plan: bool = False,
 ):
     """Build the tile-programming PA-decode kernel + launch wrapper.
 
@@ -160,6 +161,10 @@ def compile_pa_decode_tile(
     # Small grids split query positions into separate CTAs; otherwise retain
     # all four queries here and share KV loads, scales, and P publication.
     MTP4_FUSED = WIDE_FP8_MFMA and M_TILES == 4
+    # With 64-bit cache addresses, page-128 V carried through QK increases
+    # register pressure: load plain V during P packing and transposed V after
+    # P publication. Page-16 gathers and narrow addresses retain prefetching.
+    MTP4_PREFETCH_V = MTP4_FUSED and (block_size == 16 or not wide_kv_addressing)
     PER_TOKEN_M1 = (
         per_token_kv
         and is_gfx950
@@ -305,6 +310,8 @@ def compile_pa_decode_tile(
         stride_o_head: fx.Int32,
         stride_q_row: fx.Int32,
         stride_q_head: fx.Int32,
+        work_info_ptr: fx.Pointer,
+        num_sequences: fx.Int32,
     ):
         tid = fx.Int32(gpu.thread_id("x"))
         warp = tid // WAVE  # 0..NWARP-1
@@ -315,6 +322,20 @@ def compile_pa_decode_tile(
         query_begin = (kv_query % query_splits) * QUERIES_PER_CTA
         part = fx.Int32(gpu.block_id("z"))  # context partition handled by this CTA
         n_kv = fx.Int32(gpu.grid_dim.y) // query_splits
+        if const_expr(use_work_plan):
+            part = seq  # Packed work slot, shared by all KV heads.
+            work = fx.recast_iter(fx.Int32, work_info_ptr)
+            task = fx.ptr_load(
+                fx.add_offset(work, part * 4),
+                result_type=fx.Vector.make_type(4, fx.Int32),
+            )
+            seq = fx.Int32(task[0])
+            planned_start = fx.Int32(task[1])
+            planned_end = fx.Int32(task[2])
+            planned_context = fx.Int32(task[3])
+            partial_slot = kv_h * fx.Int32(gpu.grid_dim.x) + part
+        else:
+            partial_slot = (seq * n_kv + kv_h) * NP + part
 
         output = fx.recast_iter(Q_DTYPE, output_ptr)
         pmax = fx.recast_iter(fx.Float32, pmax_ptr)
@@ -415,12 +436,14 @@ def compile_pa_decode_tile(
             return _v_load_fp8x16(byte_off).bitcast(fx.Int64)
 
         context_len = fx.Int32(_ctxlen_load(seq)[0])
+        if const_expr(use_work_plan):
+            context_len = planned_context
         # Bound block_tables to its real extent: the last (partial) 256-token tile
         # can index a page past ceil(context/block_size); the bounded resource
         # returns page 0 for that out-of-range read instead of faulting (those
         # tail tokens are masked out anyway).
         bt_num_records_bytes = (
-            fx.Int64(gpu.grid_dim.x) * fx.Int64(max_blocks_per_seq) * 4
+            fx.Int64(num_sequences) * fx.Int64(max_blocks_per_seq) * 4
         )
         # Wide loads must preserve row starts that are only int32-aligned.
         bt_buf = ptr_buf_tensor(
@@ -446,6 +469,9 @@ def compile_pa_decode_tile(
         part_start = part * tiles_per_part
         part_end_raw = part_start + tiles_per_part
         part_end = (part_end_raw < num_tiles).select(part_end_raw, num_tiles)
+        if const_expr(use_work_plan):
+            part_start = planned_start
+            part_end = planned_end
 
         # One i8 blob carved into typed byte-offset pointers. `lds_base` is an
         # ir.Value pointer (safe inside scf control flow); the Python `lds`
@@ -951,7 +977,7 @@ def compile_pa_decode_tile(
         # Fused pipeline: carry next V in registers, reusing each chunk only
         # after its final query has consumed the current tile's values.
         V_DATA_SLOT = 2 + STATE_PER_M * M_TILES
-        if const_expr(MTP4_FUSED):
+        if const_expr(MTP4_PREFETCH_V):
             v_pf0 = fx.Vector.filled(VHE_CHUNKS * NVOPS, 0, fx.Int64)
             if part_start < part_end:
                 v_flat0 = []
@@ -1008,13 +1034,16 @@ def compile_pa_decode_tile(
             # V is independent of QK/softmax. Load it early for the tuned
             # decode path and reuse it across M-tiles in the phase-split path.
             v_vh_shared = None
-            if const_expr(MTP4_FUSED):
+            if const_expr(MTP4_PREFETCH_V):
                 v_carried = ostate[V_DATA_SLOT]
                 v_vh_shared = [
                     [v_carried[vh * NVOPS + i] for i in range_constexpr(NVOPS)]
                     for vh in range_constexpr(VHE_CHUNKS)
                 ]
-            elif const_expr(M_TILES > 1 or (EARLY_V and not SCALES_BEFORE_CURRENT_V)):
+            elif const_expr(
+                (M_TILES > 1 and not MTP4_FUSED)
+                or (EARLY_V and not SCALES_BEFORE_CURRENT_V)
+            ):
                 v_vh_shared = [
                     _v_ops(v_page_cur, vh) for vh in range_constexpr(VHE_CHUNKS)
                 ]
@@ -1189,6 +1218,11 @@ def compile_pa_decode_tile(
                     ]
 
                 if const_expr(MTP4_FUSED):
+                    if const_expr(not MTP4_PREFETCH_V and not trans_v):
+                        # Hide plain V's strided loads behind P packing.
+                        v_vh_shared = [
+                            _v_ops(v_page_cur, vh) for vh in range_constexpr(VHE_CHUNKS)
+                        ]
                     # V-scale normalization is independent of the query row.
                     # Compute it once instead of once per M tile.
                     v_max_global = _ld_lw_row(sVScaleMax_off, 0).reduce(ReductionOp.MAX)
@@ -1266,6 +1300,12 @@ def compile_pa_decode_tile(
 
                     gpu.barrier()
 
+                    if const_expr(not MTP4_PREFETCH_V and trans_v):
+                        # Contiguous transposed V can wait until saved scores
+                        # are dead, avoiding overlap with their live registers.
+                        v_vh_shared = [
+                            _v_ops(v_page_cur, vh) for vh in range_constexpr(VHE_CHUNKS)
+                        ]
                     v_next_chunks = []
                     for m in range_constexpr(M_TILES):
                         p_base = sP_off + m * MFMA_MNK * SP_ROW_BYTES
@@ -1298,7 +1338,7 @@ def compile_pa_decode_tile(
                                 [v_max_scaled], dtype=fx.Float32
                             ).broadcast_to(OP_ELEMS)
                             o_acc[vh] = o_acc[vh] * corr_b + op
-                            if const_expr(m == M_TILES - 1):
+                            if const_expr(MTP4_PREFETCH_V and m == M_TILES - 1):
                                 # The current chunk is dead; reuse its registers
                                 # for the next tile while the final PV finishes.
                                 v_next_chunk = fx.Vector.filled(NVOPS, 0, fx.Int64)
@@ -1310,14 +1350,15 @@ def compile_pa_decode_tile(
                         next_state.extend([*o_acc, m_new, l_new])
                         if const_expr(m < M_TILES - 1):
                             fx.rocdl.sched_barrier(0)
-                    v_next = fx.Vector.from_elements(
-                        [
-                            v_next_chunks[vh][i]
-                            for vh in range_constexpr(VHE_CHUNKS)
-                            for i in range_constexpr(NVOPS)
-                        ],
-                        dtype=fx.Int64,
-                    )
+                    if const_expr(MTP4_PREFETCH_V):
+                        v_next = fx.Vector.from_elements(
+                            [
+                                v_next_chunks[vh][i]
+                                for vh in range_constexpr(VHE_CHUNKS)
+                                for i in range_constexpr(NVOPS)
+                            ],
+                            dtype=fx.Int64,
+                        )
                 else:
                     for m in range_constexpr(M_TILES):
                         p_base = sP_off + (m % P_BUFFERS) * MFMA_MNK * SP_ROW_BYTES
@@ -1711,7 +1752,7 @@ def compile_pa_decode_tile(
                         ).broadcast_to(OP_ELEMS)
                     o_acc[vh] = o_acc[vh] * corr_b + op
                 next_state.extend([*o_acc, m_new, l_new])
-            if const_expr(MTP4_FUSED):
+            if const_expr(MTP4_PREFETCH_V):
                 next_state.append(v_next)
             results = yield next_state
         o_final = results
@@ -1741,7 +1782,7 @@ def compile_pa_decode_tile(
             qh = kv_h * query_group_size + gs_head_e
 
             def _emit(o_norm, sub, query_idx, query_head):
-                if const_expr(NP == 1):
+                if const_expr(NP == 1 and not use_work_plan):
                     out_offset = (
                         (seq * query_length + query_begin + query_idx) * stride_o_row
                         + query_head * stride_o_head
@@ -1749,9 +1790,7 @@ def compile_pa_decode_tile(
                     )
                     fx.ptr_store(o_norm, fx.add_offset(output, out_offset))
                 else:
-                    base = (
-                        (seq * n_kv + kv_h) * NP + part
-                    ) * TOTAL_ROWS + global_row  # noqa: B023
+                    base = partial_slot * TOTAL_ROWS + global_row  # noqa: B023
                     pout_offset = base * head_dim + sub * OP_ELEMS
                     fx.ptr_store(
                         o_norm,
@@ -1769,9 +1808,9 @@ def compile_pa_decode_tile(
                 if row < CTA_ROWS:
                     _emit(o_norm, sub, qi_e, qh)
 
-            if const_expr(NP > 1):  # noqa: SIM102
+            if const_expr(NP > 1 or use_work_plan):  # noqa: SIM102
                 if warp == 0 and rgroup == 0:
-                    base = ((seq * n_kv + kv_h) * NP + part) * TOTAL_ROWS + global_row
+                    base = partial_slot * TOTAL_ROWS + global_row
                     if row < CTA_ROWS:
                         # Convert the running max from log2 units (scale_qk folds
                         # in LOG2E) to natural-log units: the shared reduce
@@ -1801,6 +1840,8 @@ def compile_pa_decode_tile(
         stride_o_head: fx.Int32,
         stride_q_row: fx.Int32,
         stride_q_head: fx.Int32,
+        work_info: fx.Pointer,
+        work_capacity: fx.Int32,
         stream: fx.Stream = fx.Stream(None),  # noqa: B008
     ):
         # `contract` lets the mul/add pairs in the softmax rescale and the
@@ -1826,8 +1867,14 @@ def compile_pa_decode_tile(
                 stride_o_head,
                 stride_q_row,
                 stride_q_head,
+                work_info,
+                num_seqs,
             ).launch(
-                grid=(num_seqs, num_kv_heads * query_splits, NP),
+                grid=(
+                    work_capacity if use_work_plan else num_seqs,
+                    num_kv_heads * query_splits,
+                    1 if use_work_plan else NP,
+                ),
                 block=(BLOCK_THREADS, 1, 1),
                 stream=stream,
             )
