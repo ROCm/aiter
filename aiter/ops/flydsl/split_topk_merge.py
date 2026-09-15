@@ -1,13 +1,21 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Merge unordered Stage A bags with the existing decode TopK operator."""
+"""Split-aware exact TopK merge for fixed-width local candidate bags."""
 
 from functools import cache
 
 import torch
 
-from aiter.ops.flydsl.topk_per_row import flydsl_top_k_per_row_decode
+from .kernels.tensor_shim import _run_compiled
+from .kernels.topk_per_row_decode import (
+    _STATE_SIZE,
+    build_topk_per_row_decode_module,
+)
+
+_RADIX_BINS = 1 << 11
+_BLOCK_THREADS = 256
+_WAVE_SIZE = 64
 
 
 @cache
@@ -20,8 +28,58 @@ def _full_widths(device_index: int, rows: int, width: int) -> torch.Tensor:
     )
 
 
+@cache
+def _split_workspace(
+    device_index: int,
+    stream_id: int,
+    rows: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    del stream_id
+    device = torch.device("cuda", device_index)
+    return (
+        torch.zeros((rows, 1, _RADIX_BINS), dtype=torch.int32, device=device),
+        torch.empty((rows, _STATE_SIZE), dtype=torch.int32, device=device),
+    )
+
+
 def clear_split_topk_merge_workspace_cache() -> None:
     _full_widths.cache_clear()
+    _split_workspace.cache_clear()
+
+
+@cache
+def _build_split_topk_merge(k: int, splits: int, precomputed_first_pass: bool):
+    # One chunk per split, and `split_width` tells the chunk that its slice of
+    # the row is a bag of `k` slots whose live prefix is `candidate_counts`.
+    # NaN sinks to the bottom so a NaN scale can never displace a real score.
+    return build_topk_per_row_decode_module(
+        k,
+        stable=False,
+        wave_size=_WAVE_SIZE,
+        write_values=True,
+        chunks_per_row=splits,
+        block_threads=_BLOCK_THREADS,
+        split_width=k,
+        payload_indices=True,
+        nan_to_bottom=True,
+        combine_histograms=True,
+        use_split_counts=True,
+        precomputed_first_pass=precomputed_first_pass,
+    )
+
+
+def split_topk_merge_workspace(
+    device: torch.device,
+    rows: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return the stream-local histogram and state used by split TopK."""
+    if torch.cuda.is_current_stream_capturing():
+        return (
+            torch.zeros((rows, 1, _RADIX_BINS), dtype=torch.int32, device=device),
+            torch.empty((rows, _STATE_SIZE), dtype=torch.int32, device=device),
+        )
+    stream = torch.cuda.current_stream(device)
+    return _split_workspace(device.index, stream.cuda_stream, rows)
 
 
 def _row_ends(device: torch.device, rows: int, width: int) -> torch.Tensor:
@@ -42,17 +100,17 @@ def split_topk_merge(
     *,
     k: int,
     precomputed_first_pass: bool = False,
-    workspace=None,
+    workspace: tuple[torch.Tensor, torch.Tensor] | None = None,
+    out_scores: torch.Tensor | None = None,
+    out_positions: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Merge unordered split-local TopK pairs into an unordered row TopK.
 
-    Unused slots are masked from ``candidate_counts`` so a caller that left
-    padding as ``+inf`` still gets an exact set. Stage A itself already writes
-    ``(-inf, -1)`` into those slots. ``precomputed_first_pass`` and
-    ``workspace`` are accepted for call-site compatibility and ignored: merge
-    uses the public decode TopK on the compact ``S*k`` bag.
+    ``candidate_counts`` bounds the live prefix of each split's bag, so the
+    slots Stage A left as ``(-inf, -1)`` are never read. Pass
+    ``precomputed_first_pass`` when Stage A already filled the pass-0
+    histogram in ``workspace``; the merge then skips that data pass.
     """
-    del precomputed_first_pass, workspace
     if candidate_scores.ndim != 3:
         raise ValueError("candidate_scores must have shape [rows,splits,local_k]")
     if candidate_positions.shape != candidate_scores.shape:
@@ -84,29 +142,46 @@ def split_topk_merge(
 
     device = candidate_scores.device
     width = splits * k
-    live = torch.arange(k, device=device, dtype=torch.int32).view(
-        1, 1, k
-    ) < candidate_counts.unsqueeze(-1)
-    neg_inf = candidate_scores.new_full((), float("-inf"))
-    merge_scores = torch.where(live, candidate_scores, neg_inf)
-    merge_scores = torch.nan_to_num(merge_scores, nan=float("-inf")).reshape(
-        rows, width
+    scores = candidate_scores.view(rows, width)
+    positions = candidate_positions.view(rows, width)
+    # Skipping pass 0 means the gather can leave a slot untouched when a row
+    # has fewer than k live candidates, so those rows must start as (-inf, -1).
+    if out_scores is None:
+        selected_scores = (
+            torch.full((rows, k), -float("inf"), dtype=torch.float32, device=device)
+            if precomputed_first_pass
+            else torch.empty((rows, k), dtype=torch.float32, device=device)
+        )
+    else:
+        selected_scores = out_scores
+    if out_positions is None:
+        selected_positions = (
+            torch.full((rows, k), -1, dtype=torch.int32, device=device)
+            if precomputed_first_pass
+            else torch.empty((rows, k), dtype=torch.int32, device=device)
+        )
+    else:
+        selected_positions = out_positions
+    row_ends = _row_ends(device, rows, width)
+    stream = torch.cuda.current_stream(device)
+    partial_hist, state = (
+        split_topk_merge_workspace(device, rows) if workspace is None else workspace
     )
-    merge_positions = candidate_positions.reshape(rows, width)
-    merge_slots = torch.empty((rows, k), dtype=torch.int32, device=device)
-    selected_scores = torch.empty((rows, k), dtype=torch.float32, device=device)
-    flydsl_top_k_per_row_decode(
-        logits=merge_scores,
-        next_n=1,
-        seq_lens=_row_ends(device, rows, width),
-        indices=merge_slots,
-        num_rows=rows,
-        stride0=merge_scores.stride(0),
-        stride1=1,
-        k=k,
-        stable=False,
-        values=selected_scores,
+    launcher = _build_split_topk_merge(k, splits, precomputed_first_pass)
+    _run_compiled(
+        launcher,
+        scores,
+        positions,
+        candidate_counts,
+        row_ends,
+        selected_positions,
+        selected_scores,
+        partial_hist,
+        state,
+        width,
+        1,
+        width,
+        rows,
+        stream,
     )
-    selected_positions = merge_positions.gather(1, merge_slots.to(torch.int64))
-    selected_scores = torch.where(selected_positions < 0, neg_inf, selected_scores)
     return selected_scores, selected_positions

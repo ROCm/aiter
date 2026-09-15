@@ -17,7 +17,7 @@ from .kernels.mqa_logits.fp8_paged_mqa_local_topk import (
     WORKGROUPS_PER_CU,
     launch_fp8_paged_mqa_local_topk,
 )
-from .split_topk_merge import split_topk_merge
+from .split_topk_merge import split_topk_merge, split_topk_merge_workspace
 
 SUPPORTED_ARCHES = ("gfx950",)
 
@@ -383,6 +383,10 @@ def flydsl_fp8_paged_mqa_topk(
         dtype=torch.int32,
         device=device,
     )
+    # Stage A holds every candidate's key in registers anyway, so it can fill
+    # the merge's pass-0 histogram on the way out and let the merge start at
+    # pass 1. Only the multi-split path has a merge to prepare for.
+    workspace = split_topk_merge_workspace(device, rows) if num_splits > 1 else None
     stream = torch.cuda.current_stream(device)
     with torch.cuda.device(device):
         launch_fp8_paged_mqa_local_topk(
@@ -402,6 +406,9 @@ def flydsl_fp8_paged_mqa_topk(
             stream=stream,
             packed=packed,
             ordered_emit=False,
+            prepare_merge=workspace is not None,
+            merge_histogram=workspace[0] if workspace is not None else None,
+            merge_state=workspace[1] if workspace is not None else None,
         )
         if num_splits == 1:
             values = candidate_scores[:, 0]
@@ -412,6 +419,8 @@ def flydsl_fp8_paged_mqa_topk(
                 candidate_positions,
                 candidate_counts,
                 k=k,
+                precomputed_first_pass=True,
+                workspace=workspace,
             )
     return values, positions
 
