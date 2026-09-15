@@ -3,6 +3,7 @@
 import copy
 import multiprocessing as mp
 import os
+from functools import wraps
 
 import numpy as np
 import pandas as pd
@@ -87,7 +88,6 @@ def perftest(
                     end_event.record()
                     end_event.synchronize()
                     latencies.append(start_event.elapsed_time(end_event))
-                    torch.cuda.empty_cache()
                 avg = np.mean(latencies) * 1000
                 logger.info(f"avg: {avg} us/iter from cuda.Event")
                 if use_cuda_event:
@@ -124,6 +124,36 @@ def perftest(
                 avg = get_trace_perf(prof, num_iters)
                 logger.info(f"avg: {avg} us/iter with hipgraph")
 
+            if os.environ.get("AITER_SMI_MONITOR", "0") == "1":
+                # Import lazily: normal library/test use has no amdsmi dependency.
+                from aiter.smi_monitor import replay_with_smi_metadata
+
+                if testGraph:
+                    replay = graph.replay
+                    # One replay contains num_iters calls captured above.
+                    replay_us = avg * num_iters
+                else:
+                    replay_index = 0
+
+                    def replay():
+                        nonlocal replay_index
+                        replay_args, replay_kwargs = rotate_args[
+                            replay_index % len(rotate_args)
+                        ]
+                        replay_index += 1
+                        return func(*replay_args, **replay_kwargs)
+
+                    replay_us = avg
+
+                replay_with_smi_metadata(
+                    func,
+                    args,
+                    kwargs,
+                    replay,
+                    synchronize=torch.cuda.synchronize,
+                    estimated_us=replay_us,
+                )
+
             return data, avg
 
         return wrapper
@@ -135,7 +165,13 @@ def benchmark():
     def decorator(func):
         def wrapper(*args, **kwargs):
             callargs = log_args(func, *args, **kwargs)
-            ret = func(*args, **kwargs)
+            if os.environ.get("AITER_SMI_MONITOR", "0") == "1":
+                from aiter.smi_monitor import benchmark_call_context
+
+                with benchmark_call_context(func, callargs):
+                    ret = func(*args, **kwargs)
+            else:
+                ret = func(*args, **kwargs)
             if ret is not None:
                 callargs.update(ret)
             return callargs
@@ -222,6 +258,7 @@ def run_perftest(
         needTrace=needTrace,
         use_cuda_event=use_cuda_event,
     )
+    @wraps(func)
     def worker(*args, **kwargs):
         return func(*args, **kwargs)
 
@@ -401,9 +438,11 @@ def get_trace_perf(prof, num_iters):
             df.at[avg_name, el] = df[el].sum() / actual_iters
     if int(os.environ.get("AITER_LOG_MORE", "0")):
         pd.set_option("display.expand_frame_repr", False)
-        pd.set_option("display.max_colwidth", 90)
         pd.set_option("display.float_format", "{:,.1f}".format)
-        logger.info(f"{df}")
+        # ``name`` is the only potentially long text column in this profiler
+        # table. Keep its full kernel symbol for downstream log parsers without
+        # changing pandas' process-wide column-width setting.
+        logger.info(df.to_string(max_colwidth=None))
     return df.at[avg_name, "device_time_sum"]
 
 
