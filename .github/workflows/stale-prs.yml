@@ -1,0 +1,46 @@
+name: Stale pull requests
+
+# Marks pull requests stale after 30 days without activity and closes them
+# 7 days later. Issues are out of scope. Closing is reversible: the branch
+# is untouched and anyone can reopen the PR when the work resumes.
+
+on:
+  schedule:
+    - cron: '30 1 * * *'
+  workflow_dispatch:
+
+permissions:
+  pull-requests: write
+  issues: write   # the stale label and comments go through the issues API
+
+concurrency:
+  group: stale-prs
+  cancel-in-progress: false
+
+jobs:
+  stale:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/stale@v10
+        with:
+          days-before-pr-stale: 30
+          days-before-pr-close: 7
+          # Issues are left alone.
+          days-before-issue-stale: -1
+          days-before-issue-close: -1
+          stale-pr-label: stale
+          exempt-pr-labels: 'do-not-close'
+          exempt-draft-pr: true
+          ascending: true
+          operations-per-run: 300
+          # Branch deletion is handled by stale-branches.yml, which knows
+          # about release branches and gh-pages.
+          delete-branch: false
+          stale-pr-message: >
+            This pull request has had no activity for 30 days, so it is now
+            marked stale. Push a commit, leave a comment, or add the
+            `keep-open` label within 7 days to keep it open. Closing is not a
+            judgement on the work — reopen it whenever you pick it back up.
+          close-pr-message: >
+            Closed after 37 days without activity. The branch is untouched;
+            reopen this pull request when the work resumes.
