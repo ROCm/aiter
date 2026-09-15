@@ -63,6 +63,7 @@ def flydsl_a16w4_gemm1(
     waves_per_eu=None,
     k_batch=1,
     k_wave=1,
+    num_waves=4,
     b_nt=None,
     xcd_swizzle=0,
     gate_mode="separated",
@@ -139,6 +140,7 @@ def flydsl_a16w4_gemm1(
         w_dtype=w_dtype,
         w_layout=w_layout,
         k_wave=k_wave,
+        num_waves=num_waves,
         use_k16="gfx95" not in str(get_rocm_arch()),
     )
     max_m_blocks = int(sorted_expert_ids.numel())

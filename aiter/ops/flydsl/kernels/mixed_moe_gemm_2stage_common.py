@@ -271,6 +271,11 @@ def compile_mixed_moe_gemm1_common(
     need_fp8 = out_dtype == "fp8"
     need_quant = need_fp4 or need_fp8
     need_sort = need_quant
+    if need_quant and gate_up_interleave and (tile_n // 2) % 32:
+        raise ValueError(
+            "quantized interleaved gate/up requires each workgroup to produce "
+            "whole 32-column output scale groups"
+        )
 
     fp4q_tag = "_fp4q" if need_fp4 else ""
     fp8q_tag = "_fp8q" if need_fp8 else ""

@@ -18,7 +18,7 @@ import torch
 from aiter.latent_fhmoe import latent_fhmoe
 from aiter.ops.shuffle import shuffle_weight
 
-_K3_DECODE_M = 8
+_K3_DECODE_M = frozenset((8, 16))
 _K3_TP_SIZE = 8
 _K3_EXPERTS = 896
 _K3_TOPK = 16
@@ -130,8 +130,7 @@ def maybe_run_vllm_k3_latent_fhmoe(
     """Return ``(shared_partial, routed_partial)`` for the exact IX decode shape.
 
     Every non-matching case returns ``None`` so the caller can use vLLM's
-    existing path.  Restricting the prototype to M=8 also prevents the known
-    FlyDSL runtime-integer cache alias between different token counts.
+    existing path. M=8 and M=16 cover DSpark K=7 decode at conc-1 and conc-2.
     """
     if os.environ.get("VLLM_ROCM_USE_K3_LATENT_FHMOE", "0") != "1":
         return None
@@ -142,11 +141,13 @@ def maybe_run_vllm_k3_latent_fhmoe(
             )
         return None
     config = getattr(runner, "moe_config", None)
+    m = routed_input.shape[0]
     if (
         shared_input is None
-        or tuple(routed_input.shape) != (_K3_DECODE_M, 3584)
-        or tuple(shared_input.shape) != (_K3_DECODE_M, 7168)
-        or tuple(router_logits.shape) != (_K3_DECODE_M, _K3_EXPERTS)
+        or m not in _K3_DECODE_M
+        or tuple(routed_input.shape) != (m, 3584)
+        or tuple(shared_input.shape) != (m, 7168)
+        or tuple(router_logits.shape) != (m, _K3_EXPERTS)
         or getattr(config, "tp_size", None) != _K3_TP_SIZE
         or getattr(config, "ep_size", None) != 1
         or bool(getattr(config, "is_sequence_parallel", False))
@@ -155,7 +156,8 @@ def maybe_run_vllm_k3_latent_fhmoe(
         return None
 
     capturing = torch.cuda.is_current_stream_capturing()
-    if not capturing and getattr(runner, "_k3_latent_fhmoe_prepared", False):
+    prepared = getattr(runner, "_k3_latent_fhmoe_prepared_m", set())
+    if not capturing and m in prepared:
         return None
 
     routed = getattr(runner, "routed_experts", None)
@@ -197,7 +199,7 @@ def maybe_run_vllm_k3_latent_fhmoe(
         topk_indices_dtype=torch.int32,
         input_ids=input_ids,
     )
-    if topk_ids.shape != (_K3_DECODE_M, _K3_TOPK):
+    if topk_ids.shape != (m, _K3_TOPK):
         if os.environ.get("VLLM_ROCM_K3_LATENT_STRICT", "0") == "1":
             raise RuntimeError(f"Unexpected K3 top-k shape: {tuple(topk_ids.shape)}")
         return None
@@ -206,7 +208,7 @@ def maybe_run_vllm_k3_latent_fhmoe(
     if not _LOGGED_LIVE_PATH:
         _LOGGED_LIVE_PATH = True
         print(
-            "K3 latent FHMoE: enabled TP8/EP1/M=8 interleaved A8W4 path",
+            "K3 latent FHMoE: enabled TP8/EP1/M={8,16} interleaved A8W4 path",
             flush=True,
         )
 
@@ -229,10 +231,12 @@ def maybe_run_vllm_k3_latent_fhmoe(
         # warmup to compile FlyDSL and allocate the per-layer workspace from
         # the ordinary caching pool, but preserve the normal vLLM result.
         #
-        # M=8 alone cannot select the latent result here: a chunked-prefill
-        # tail can have eight local tokens on only some DCP ranks, which would
+        # A matching M alone cannot select the latent result here: a chunked-
+        # prefill tail can have that many local tokens on only some DCP ranks,
+        # which would
         # desynchronize the following TP collective. During capture all ranks
         # take this path, and replay executes it without re-entering Python.
-        runner._k3_latent_fhmoe_prepared = True
+        prepared.add(m)
+        runner._k3_latent_fhmoe_prepared_m = prepared
         return None
     return shared_output, routed_output

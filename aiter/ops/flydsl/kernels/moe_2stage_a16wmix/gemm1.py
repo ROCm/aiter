@@ -404,6 +404,7 @@ def compile_gemm1_a16w4_port(
     w_dtype="fp4",
     w_layout="standard",
     k_wave=1,
+    num_waves=4,
     use_k16,
 ):
     """a16w4/a16wi4/a16w16 (bf16 A x mxfp4/int4/bf16 W1) fused stage1 builder.
@@ -437,7 +438,10 @@ def compile_gemm1_a16w4_port(
         w_layout == "guinterleave" and w_dtype != "fp4"
     ), f"w_layout='guinterleave' is mxfp4-only, got w_dtype={w_dtype!r}"
     assert k_wave in (1, 2, 4), f"k_wave must be 1, 2, or 4, got {k_wave}"
-    assert 4 % k_wave == 0, f"4 must be divisible by k_wave, got {k_wave}"
+    assert num_waves in (1, 2, 4), f"num_waves must be 1, 2, or 4, got {num_waves}"
+    assert num_waves % k_wave == 0, (
+        f"num_waves must be divisible by k_wave, got {num_waves=}, {k_wave=}"
+    )
     _K = D_HIDDEN
     _INTER = D_INTER
     _N_OUT = 2 * _INTER
@@ -451,16 +455,16 @@ def compile_gemm1_a16w4_port(
     assert (
         _INTER % TILE_N == 0
     ), f"D_INTER must be a multiple of TILE_N={TILE_N}, got {_INTER}"
-    # 4 waves repartition into (4//k_wave) N-waves; each owns TILE_N//(4//k_wave)
+    # Waves repartition into (num_waves//k_wave) N-waves; each owns its N slice.
     # columns -> num_acc_n = that // 16. num_acc_n==0 makes every accumulate/store
     # loop empty -> silent all-zero output that times fast (e.g. TILE_N=32,k_wave=1).
     assert (
-        TILE_N // (4 // k_wave)
-    ) >= 16, f"TILE_N//(4//k_wave) must be >= 16 (num_acc_n>=1), got TILE_N={TILE_N}, k_wave={k_wave}"
+        TILE_N // (num_waves // k_wave)
+    ) >= 16, f"TILE_N//(num_waves//k_wave) must be >= 16, got TILE_N={TILE_N}, {num_waves=}, {k_wave=}"
     # Whole 16-wide groups per N-wave, else num_acc_n truncates (TILE_N=96: 8 of 24).
-    assert TILE_N % (16 * (4 // k_wave)) == 0, (
-        f"TILE_N must be a multiple of {16 * (4 // k_wave)} (16*(4//k_wave), else "
-        f"num_acc_n truncates and drops columns), got TILE_N={TILE_N}, k_wave={k_wave}"
+    assert TILE_N % (16 * (num_waves // k_wave)) == 0, (
+        f"TILE_N must be a multiple of {16 * (num_waves // k_wave)}, else "
+        f"num_acc_n truncates, got TILE_N={TILE_N}, {num_waves=}, {k_wave=}"
     )
     assert BM % 16 == 0, f"BM must be a multiple of 16, got {BM}"
     NUM_N_BLOCKS = _INTER // TILE_N
@@ -472,10 +476,10 @@ def compile_gemm1_a16w4_port(
     _a_lds_bytes = k_wave * _a_lds_stages * BM * TILE_K * 2
     # k_wave reduce scratch (reuses A-LDS after the K loop); gate/up separate rounds.
     if k_wave > 1:
-        _num_n_waves = 4 // k_wave
+        _num_n_waves = num_waves // k_wave
         _num_acc_n = (TILE_N // _num_n_waves) // 16
         _m_repeat = BM // 16
-        _reduce_bytes = 4 * (_num_acc_n * _m_repeat) * 64 * 4 * 4  # 4 waves total
+        _reduce_bytes = 4 * (_num_acc_n * _m_repeat) * 64 * 4 * num_waves
         lds_bytes = max(_a_lds_bytes, _reduce_bytes)
     else:
         lds_bytes = _a_lds_bytes
@@ -495,13 +499,17 @@ def compile_gemm1_a16w4_port(
     _wd_tag = "" if w_dtype == "fp4" else f"_{w_dtype}"
     _wl_tag = "" if w_layout == "standard" else f"_{w_layout}"
     _kw_tag = f"_kw{k_wave}" if k_wave > 1 else ""
-    name_suffix = f"a16w4{_wd_tag}{_wl_tag}_h{_K}_i{_INTER}_ne{NE}_bm{BM}_tn{TILE_N}{_act_tag}{_bcm_tag}{_xcd_tag}{_wpe_tag}{_kw_tag}"
+    _nw_tag = f"_nw{num_waves}" if num_waves != 4 else ""
+    name_suffix = f"a16w4{_wd_tag}{_wl_tag}_h{_K}_i{_INTER}_ne{NE}_bm{BM}_tn{TILE_N}{_act_tag}{_bcm_tag}{_xcd_tag}{_wpe_tag}{_kw_tag}{_nw_tag}"
 
     @fx.struct
     class SharedStorage:
         raw: fx.Array[fx.Uint8, lds_bytes, 16]
 
-    @flyc.kernel(name=f"gemm1_a16w4_port_{name_suffix}", known_block_size=[256, 1, 1])
+    @flyc.kernel(
+        name=f"gemm1_a16w4_port_{name_suffix}",
+        known_block_size=[num_waves * 64, 1, 1],
+    )
     def gemm1_kernel(
         arg_x: fx.Int64,
         arg_bq: fx.Int64,
@@ -594,6 +602,7 @@ def compile_gemm1_a16w4_port(
                 w_layout=w_layout,
                 k_wave=k_wave,
                 use_k16=_use_k16,
+                num_waves=num_waves,
             )
 
     @flyc.jit
@@ -630,6 +639,8 @@ def compile_gemm1_a16w4_port(
             f32_swiglu_limit,
             arg_out,
             value_attrs={"rocdl.waves_per_eu": waves_per_eu} if waves_per_eu else None,
-        ).launch(grid=(grid_x, 1, 1), block=(256, 1, 1), stream=stream)
+        ).launch(
+            grid=(grid_x, 1, 1), block=(num_waves * 64, 1, 1), stream=stream
+        )
 
     return launch_gemm1

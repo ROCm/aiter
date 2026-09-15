@@ -189,9 +189,16 @@ def _install_latent_tuning_config(
 
 @pytest.mark.parametrize(
     # FlyDSL specializes runtime integer arguments in its process-local cache.
-    # Run M=8 in a fresh pytest process instead of mixing specializations.
+    # Run each M in a fresh pytest process instead of mixing specializations.
     "m",
-    [8] if os.environ.get("AITER_K3_LATENT_M8", "0") == "1" else [1],
+    [
+        int(
+            os.environ.get(
+                "AITER_K3_LATENT_M",
+                "8" if os.environ.get("AITER_K3_LATENT_M8", "0") == "1" else "1",
+            )
+        )
+    ],
 )
 def test_k3_latent_fhmoe_exact_dimensions(
     monkeypatch: pytest.MonkeyPatch, m: int, capsys: pytest.CaptureFixture[str]

@@ -14,6 +14,50 @@ from .mixed_moe_gemm_2stage_common import (
 
 
 @functools.cache
+def compile_latent_routed_gemm1(*, experts: int, topk: int):
+    """Compile the routed-only K3 MXFP8 x MXFP4 stage1 kernel."""
+    return compile_mixed_moe_gemm1_common(
+        model_dim=3584,
+        inter_dim=384,
+        experts=experts,
+        topk=topk,
+        tile_m=32,
+        tile_n=64,
+        tile_k=256,
+        doweight_stage1=False,
+        a_dtype="fp8",
+        b_dtype="fp4",
+        out_dtype="fp8",
+        act="situv2",
+        persist_m=4,
+        waves_per_eu=None,
+        gate_mode=GateMode.INTERLEAVE,
+    )
+
+
+@functools.cache
+def compile_latent_routed_gemm2(*, experts: int, topk: int):
+    """Compile the routed-only K3 MXFP8 x MXFP4 stage2 kernel."""
+    return compile_mixed_moe_gemm2_common(
+        model_dim=3584,
+        inter_dim=384,
+        experts=experts,
+        topk=topk,
+        tile_m=32,
+        tile_n=256,
+        tile_k=128,
+        doweight_stage2=True,
+        a_dtype="fp8",
+        b_dtype="fp4",
+        out_dtype="bf16",
+        accumulate=True,
+        persist_m=4,
+        sort_block_m=32,
+        waves_per_eu=None,
+    )
+
+
+@functools.cache
 def compile_mixed_fhmoe_gemm1(
     *,
     model_dim: int,
@@ -151,8 +195,8 @@ def compile_mixed_latent_fhmoe_gemm1(
     tile_m: int = 32,
     tile_n: int = 64,
     tile_k: int = 256,
-    persist_m: int = 4,
-    waves_per_eu: int | None = 4,
+    persist_m: int = 1,
+    waves_per_eu: int | None = None,
     xcd_swizzle: int = 0,
 ):
     """Compile the K3 routed-MXFP4/shared-BF16 integrated stage1 kernel."""
@@ -190,7 +234,7 @@ def compile_mixed_latent_fhmoe_gemm2(
     tile_m: int = 32,
     tile_n: int = 256,
     tile_k: int = 128,
-    persist_m: int = 4,
+    persist_m: int = 1,
     sort_block_m: int = 32,
     waves_per_eu: int | None = None,
     xcd_swizzle: int = 0,
