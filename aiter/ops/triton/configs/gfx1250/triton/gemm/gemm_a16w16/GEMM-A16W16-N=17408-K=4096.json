@@ -1,0 +1,46 @@
+{
+  "M_LEQ_4": {
+    "backend": "triton",
+    "BLOCK_SIZE_M": 4,
+    "BLOCK_SIZE_N": 32,
+    "BLOCK_SIZE_K": 256,
+    "GROUP_SIZE_M": 1,
+    "num_warps": 4,
+    "num_stages": 3,
+    "waves_per_eu": 4,
+    "matrix_instr_nonkdim": 16,
+    "cache_modifier": null,
+    "NUM_KSPLIT": 1,
+    "SPLITK_BLOCK_SIZE": 4096
+  },
+  "any": {
+    "BLOCK_M": 32,
+    "BLOCK_N": 64,
+    "BLOCK_K": 64,
+    "NUM_BUFFERS": 5,
+    "num_warps": 2,
+    "kernel_type": "bandwidth_bound"
+  },
+  "M_LEQ_8": {
+    "backend": "triton",
+    "BLOCK_SIZE_M": 8,
+    "BLOCK_SIZE_N": 32,
+    "BLOCK_SIZE_K": 256,
+    "GROUP_SIZE_M": 1,
+    "num_warps": 4,
+    "num_stages": 3,
+    "waves_per_eu": 4,
+    "matrix_instr_nonkdim": 16,
+    "cache_modifier": null,
+    "NUM_KSPLIT": 1,
+    "SPLITK_BLOCK_SIZE": 4096
+  },
+  "M_GEQ_2048": {
+    "BLOCK_M": 128,
+    "BLOCK_N": 128,
+    "BLOCK_K": 128,
+    "NUM_BUFFERS": 2,
+    "num_warps": 4,
+    "kernel_type": "compute_bound"
+  }
+}
