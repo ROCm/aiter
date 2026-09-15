@@ -2,6 +2,7 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 import math
+import os
 
 import torch
 import triton
@@ -1217,6 +1218,17 @@ def get_mla_metadata_info_v1(
             and kv_dtype == dtypes.fp8
             and effective_seqlen_qo == 1
         )
+        or (
+            # Mirrors the C++ gate, which tests max_seqlen_qo rather than the
+            # sparse-collapsed length; a mismatch here would size the reduce
+            # buffers for a fold the planner does not perform.
+            get_gfx() == "gfx1250"
+            and os.environ.get("AITER_MLA_DECODE_PS1_FLYDSL", "0") == "1"
+            and q_dtype == dtypes.fp8
+            and kv_dtype == dtypes.fp8
+            and num_head_qo in (32, 64, 128)
+            and max_seqlen_qo == 1
+        )
     ):
         max_qo_tiles_per_batch = math.ceil(packed_qo_len / 128)
     elif (
@@ -1647,6 +1659,14 @@ def decode_update_mla_metadata_v1(
             and q_is_fp8
             and kv_is_fp8
             and max_seqlen_qo <= 6
+        )
+        or (
+            arch_id == "gfx1250"
+            and os.environ.get("AITER_MLA_DECODE_PS1_FLYDSL", "0") == "1"
+            and q_is_fp8
+            and kv_is_fp8
+            and num_heads_per_head_k in (32, 64, 128)
+            and max_seqlen_qo == 1
         )
     )
     cu_num = work_indptr.shape[0] - 1
