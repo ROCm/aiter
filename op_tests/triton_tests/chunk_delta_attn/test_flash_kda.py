@@ -56,16 +56,40 @@ def _force_default_pipeline():
     """Pin the reference to the five-kernel path.
 
     ``chunk_delta_attn_fwd`` dispatches to ``flash_kda_fwd`` whenever
-    CHUNK_DELTA_ATTN_USE_FLASH_KDA is set. Without this, running the suite
-    with that variable exported makes every comparison here flash_kda
-    against itself, which passes unconditionally.
+    AITER_FDA_ENABLE is set. Without this, running the suite with that
+    variable exported makes every comparison here flash_kda against itself,
+    which passes unconditionally.
     """
-    saved = _chunk_fwd.CHUNK_DELTA_ATTN_USE_FLASH_KDA
-    _chunk_fwd.CHUNK_DELTA_ATTN_USE_FLASH_KDA = False
+    saved = _chunk_fwd.AITER_FDA_ENABLE
+    _chunk_fwd.AITER_FDA_ENABLE = False
     try:
         yield
     finally:
-        _chunk_fwd.CHUNK_DELTA_ATTN_USE_FLASH_KDA = saved
+        _chunk_fwd.AITER_FDA_ENABLE = saved
+
+
+@contextlib.contextmanager
+def _route(k1: bool | None = None, k2: bool | None = None):
+    """Pin the named kernels to one of their two implementations.
+
+    AITER_FDA_USE_GLUON is read once at import and resolved into these two
+    flags, so a test that wants the other route sets the flags rather than the
+    variable. Both default to on wherever the tile shape and the arch allow it,
+    which leaves the Triton kernels unreached by every test that does not come
+    through here.
+    """
+    saved = _flash_kda.AITER_FDA_USE_GLUON_K1, _flash_kda.AITER_FDA_USE_GLUON_K2
+    if k1 is not None:
+        _flash_kda.AITER_FDA_USE_GLUON_K1 = k1
+    if k2 is not None:
+        _flash_kda.AITER_FDA_USE_GLUON_K2 = k2
+    try:
+        yield
+    finally:
+        (
+            _flash_kda.AITER_FDA_USE_GLUON_K1,
+            _flash_kda.AITER_FDA_USE_GLUON_K2,
+        ) = saved
 
 
 def run_reference(q, k, v, g, beta, A_log, dt_bias, scale, **kw):
@@ -347,11 +371,176 @@ def test_tuner_keeps_the_two_schedules_apart():
     # without it the unsegmented one passes h_in=None and the key picks up the
     # difference through the dtypes it appends, hiding the collision.
     kw = {"initial_state": torch.zeros(1, 4, K_DIM, K_DIM, device=device)}
-    kern.cache.clear()
-    run_flash(*args, chunks_per_seg=4, **kw)
-    segmented_keys = set(kern.cache)
-    run_flash(*args, chunks_per_seg=0, **kw)
+    # This is about the Triton kernel's autotuner, which never runs -- and whose
+    # cache therefore stays empty -- when K2 is routed to Gluon.
+    with _route(k2=False):
+        kern.cache.clear()
+        run_flash(*args, chunks_per_seg=4, **kw)
+        segmented_keys = set(kern.cache)
+        run_flash(*args, chunks_per_seg=0, **kw)
     assert set(kern.cache) - segmented_keys, "unsegmented reused a segmented config"
+
+
+def test_published_k2_schedules_can_split_their_tile():
+    """Every published (BW, num_warps) must let the warps divide the state.
+
+    Above BW // 16 the extra warps recompute columns their neighbours already
+    hold -- still correct, which is why nothing downstream catches it, and the
+    pairs are now editable from a config file rather than derived.
+    """
+    reached = set()
+    for W in (64, 128, 256):
+        for num_segs in (1, 2, 8, 64, 512):
+            for H in (1, 4, 12, 64):
+                reached.add(_flash_kda._k2_gluon_schedule(W, num_segs, H))
+    assert len(reached) > 1, f"only one schedule reachable: {reached}"
+    for bw, nw in sorted(reached):
+        assert bw % 16 == 0, f"BW={bw} is not a whole number of MFMA tiles"
+        assert nw <= bw // 16, f"BW={bw} cannot be split {nw} ways"
+
+
+def _varlen(lens):
+    return torch.tensor(
+        [0] + list(torch.tensor(lens).cumsum(0)), device=device, dtype=torch.long
+    )
+
+
+# One configuration per branch the two kernels take, so the route below is
+# covered where it can differ rather than on a single smoke shape. Built on call
+# because two of them carry tensors.
+_CASES = {
+    "batched": lambda: (make_inputs(2, 512, 8), {}),
+    "tail chunk": lambda: (make_inputs(1, 200, 4), {}),
+    "final state": lambda: (make_inputs(2, 256, 4), {"output_final_state": True}),
+    "initial state": lambda: (
+        make_inputs(2, 192, 4),
+        {
+            "initial_state": torch.randn(
+                2, 4, K_DIM, K_DIM, device=device, dtype=torch.float32
+            )
+            * 0.1,
+            "output_final_state": True,
+        },
+    ),
+    "varlen v-first": lambda: (
+        make_inputs(1, 292, 4),
+        {
+            "cu_seqlens": _varlen([128, 100, 64]),
+            "output_final_state": True,
+            "state_v_first": True,
+        },
+    ),
+    "weak gate": lambda: (make_inputs(1, 512, 4), {"lower_bound": -0.01}),
+    # Only a segmented schedule has a pass A, and pass A is the only thing the
+    # Gluon K2 is routed to, so these are the cases where K2's route is visible
+    # at all -- see test_cases_reach_the_gluon_k2.
+    "segmented": lambda: (
+        make_inputs(1, 1024, 4),
+        {"output_final_state": True, "chunks_per_seg": 4},
+    ),
+    "segmented varlen": lambda: (
+        make_inputs(1, 292, 4),
+        {
+            "cu_seqlens": _varlen([128, 100, 64]),
+            "output_final_state": True,
+            "state_v_first": True,
+            "chunks_per_seg": 2,
+        },
+    ),
+    "segmented initial state": lambda: (
+        make_inputs(1, 1024, 4),
+        {
+            "initial_state": torch.randn(
+                1, 4, K_DIM, K_DIM, device=device, dtype=torch.float32
+            )
+            * 0.1,
+            "output_final_state": True,
+            "chunks_per_seg": 3,
+        },
+    ),
+    "segmented weak gate": lambda: (
+        make_inputs(1, 512, 4),
+        {"lower_bound": -0.01, "chunks_per_seg": 3},
+    ),
+}
+
+
+@pytest.mark.parametrize("case", list(_CASES))
+def test_triton_route_matches_reference(case):
+    """The Triton kernels against the default pipeline, on the same bound.
+
+    Every other comparison in this file runs whatever AITER_FDA_USE_GLUON
+    resolved to, which is Gluon for both kernels on the arch this suite runs on.
+    Without this the Triton K1 and K2 ship untested.
+    """
+    args, kw = _CASES[case]()
+    o_ref, ht_ref = run_reference(*args, **kw)
+    with _route(k1=False, k2=False):
+        o, ht = run_flash(*args, **kw)
+    assert rel_err(o, o_ref) < 2e-2
+    if kw.get("output_final_state"):
+        assert rel_err(ht, ht_ref) < 2e-2
+
+
+@pytest.mark.parametrize("case", list(_CASES))
+def test_routes_agree(case):
+    """Which implementation ran must not be visible in the answer.
+
+    Both sides write the same ABI and nothing downstream is told which one ran,
+    so a divergence here is a bug in whichever kernel moved rather than a
+    tolerance to widen. Measured across these cases: K2's two implementations
+    agree to the bit, and K1's differ at 3e-4 to 1e-3 on the output and under
+    3e-5 on the state, so the bounds are really about K1.
+    """
+    args, kw = _CASES[case]()
+    with _route(k1=False, k2=False):
+        o_triton, ht_triton = run_flash(*args, **kw)
+    for k1, k2 in ((True, False), (False, True), (True, True)):
+        with _route(k1=k1, k2=k2):
+            o, ht = run_flash(*args, **kw)
+        assert rel_err(o, o_triton) < 2e-3, f"K1={k1} K2={k2}"
+        if kw.get("output_final_state"):
+            assert rel_err(ht, ht_triton) < 1e-4, f"K1={k1} K2={k2}"
+
+
+def test_cases_reach_the_gluon_k2():
+    """The cases above have to exercise the route they are comparing.
+
+    ``use_gluon_k2`` is tested inside ``max_segs > 1``, so an unsegmented shape
+    runs the Triton K2 whichever way the flag is set and test_routes_agree is
+    comparing it against itself. Every non-segmented case here was in exactly
+    that position, and nothing in the assertions would have said so.
+    """
+    if not _flash_kda._gluon_k2_usable(FLASH_KDA_CHUNK, K_DIM, K_DIM):
+        pytest.skip("this arch or tile shape never routes K2 to Gluon")
+    from aiter.ops.triton._gluon_kernels.gfx950.chunk_delta_attn import (
+        flash_kda_k2 as _g2,
+    )
+
+    reached = set()
+    saved = _g2.k2_ab_fused_fast
+
+    class _Counting:
+        def __getitem__(self, grid):
+            inner = saved[grid]
+
+            def launch(**kw):
+                reached.add(current)
+                return inner(**kw)
+
+            return launch
+
+    _g2.k2_ab_fused_fast = _Counting()
+    try:
+        for current, make in _CASES.items():
+            args, kw = make()
+            with _route(k1=True, k2=True):
+                run_flash(*args, **kw)
+    finally:
+        _g2.k2_ab_fused_fast = saved
+
+    want = {name for name in _CASES if name.startswith("segmented")}
+    assert want <= reached, f"never reached the Gluon K2: {sorted(want - reached)}"
 
 
 # A weak gate is the only setting that exposes the intra-chunk inverse. At the
@@ -499,11 +688,11 @@ def test_public_wrapper_routes_to_flash_kda(monkeypatch):
 
     monkeypatch.setattr(_chunk_fwd, "flash_kda_fwd", counting)
 
-    monkeypatch.setattr(_chunk_fwd, "CHUNK_DELTA_ATTN_USE_FLASH_KDA", False)
+    monkeypatch.setattr(_chunk_fwd, "AITER_FDA_ENABLE", False)
     o_ref, ht_ref = chunk_kimi_delta_attn(**kwargs)
     assert not calls, "the flag is off, the default pipeline should have served this"
 
-    monkeypatch.setattr(_chunk_fwd, "CHUNK_DELTA_ATTN_USE_FLASH_KDA", True)
+    monkeypatch.setattr(_chunk_fwd, "AITER_FDA_ENABLE", True)
     o_fkda, ht_fkda = chunk_kimi_delta_attn(**kwargs)
     assert len(calls) == 1, "the wrapper never reached flash_kda_fwd"
 
@@ -546,7 +735,7 @@ def test_unset_chunk_size_follows_the_dispatch(monkeypatch):
         return real(**kw)
 
     monkeypatch.setattr(_chunk_fwd, "flash_kda_fwd", counting)
-    monkeypatch.setattr(_chunk_fwd, "CHUNK_DELTA_ATTN_USE_FLASH_KDA", True)
+    monkeypatch.setattr(_chunk_fwd, "AITER_FDA_ENABLE", True)
 
     chunk_kimi_delta_attn(chunk_size=None, **kwargs)
     assert len(calls) == 1, "an eligible call should have resolved to FLASH_KDA_CHUNK"

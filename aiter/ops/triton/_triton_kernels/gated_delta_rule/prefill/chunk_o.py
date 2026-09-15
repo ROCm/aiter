@@ -12,18 +12,18 @@ import torch
 import triton
 import triton.language as tl
 
-from ..gated_delta_rule_utils import (
+from aiter.ops.triton._triton_kernels.gated_delta_rule.gated_delta_rule_utils import (
     IS_NVIDIA_HOPPER,
     autotune_cache_kwargs,
     check_shared_mem,
-    gated_delta_rule_autotune_configs,
 )
-from ..utils import (
+from aiter.ops.triton._triton_kernels.gated_delta_rule.utils import (
     GatedDeltaRulePrefillMetadata,
     prepare_chunk_indices,
     prepare_rebased_cu_seqlens,
 )
-from ..utils.op import exp
+from aiter.ops.triton._triton_kernels.gated_delta_rule.utils.op import exp
+from aiter.ops.triton.utils.tuned_config_utils import autotune_configs
 
 BKV_LIST = [64, 128] if check_shared_mem() else [32, 64]
 NUM_WARPS = [2, 4] if IS_NVIDIA_HOPPER else [2, 4, 8]
@@ -75,12 +75,13 @@ def _bp_st2d(base, R, C, rs, cs, r0, c0, val, BR: tl.constexpr, BC: tl.constexpr
     }
 )
 @triton.autotune(
-    configs=gated_delta_rule_autotune_configs(
+    configs=autotune_configs(
+        "GATED_DELTA_RULE",
         [
             triton.Config({"BK": 128, "BV": 128}, num_warps=8, num_stages=3),
             triton.Config({"BK": 64, "BV": 64}, num_warps=4, num_stages=3),
             triton.Config({"BK": 32, "BV": 32}, num_warps=2, num_stages=3),
-        ]
+        ],
     ),
     key=["H", "K", "V", "BT"],
     **autotune_cache_kwargs,
@@ -193,12 +194,13 @@ def chunk_fwd_kernel_o(
     }
 )
 @triton.autotune(
-    configs=gated_delta_rule_autotune_configs(
+    configs=autotune_configs(
+        "GATED_DELTA_RULE",
         [
             triton.Config({}, num_warps=num_warps, num_stages=num_stages)
             for num_warps in NUM_WARPS
             for num_stages in [2, 3, 4]
-        ]
+        ],
     ),
     key=["H", "K", "V", "BT", "BK", "BV", "USE_G", "USE_G_GAMMA", "USE_DW"],
     **autotune_cache_kwargs,
@@ -392,12 +394,13 @@ def chunk_bwd_kernel_dqkwg(
     }
 )
 @triton.autotune(
-    configs=gated_delta_rule_autotune_configs(
+    configs=autotune_configs(
+        "GATED_DELTA_RULE",
         [
             triton.Config({}, num_warps=num_warps, num_stages=num_stages)
             for num_warps in NUM_WARPS
             for num_stages in [2, 3, 4]
-        ]
+        ],
     ),
     key=["H", "K", "V", "BT", "BK", "BV", "USE_G", "USE_G_GAMMA"],
     **autotune_cache_kwargs,
@@ -494,12 +497,13 @@ def chunk_bwd_kernel_dv(
     }
 )
 @triton.autotune(
-    configs=gated_delta_rule_autotune_configs(
+    configs=autotune_configs(
+        "GATED_DELTA_RULE",
         [
             triton.Config({}, num_warps=num_warps, num_stages=num_stages)
             for num_warps in NUM_WARPS
             for num_stages in [2, 3, 4]
-        ]
+        ],
     ),
     key=["H", "K", "V", "BT", "BK", "BV", "USE_G"],
     **autotune_cache_kwargs,
@@ -630,7 +634,8 @@ def chunk_fwd_o(
     }
 )
 @triton.autotune(
-    configs=gated_delta_rule_autotune_configs(
+    configs=autotune_configs(
+        "GATED_DELTA_RULE",
         [
             triton.Config(
                 {"BK": BK, "BV": BV}, num_warps=num_warps, num_stages=num_stages
@@ -639,7 +644,7 @@ def chunk_fwd_o(
             for BV in BKV_LIST
             for num_warps in NUM_WARPS
             for num_stages in [2, 3, 4]
-        ]
+        ],
     ),
     key=["H", "K", "V", "BT", "IS_VARLEN"],
     **autotune_cache_kwargs,
@@ -802,7 +807,8 @@ def chunk_fwd_o_opt(
     }
 )
 @triton.autotune(
-    configs=gated_delta_rule_autotune_configs(
+    configs=autotune_configs(
+        "GATED_DELTA_RULE",
         [
             triton.Config(
                 {"BK": BK, "BV": BV}, num_warps=num_warps, num_stages=num_stages
@@ -811,7 +817,7 @@ def chunk_fwd_o_opt(
             for BV in BKV_LIST
             for num_warps in NUM_WARPS
             for num_stages in [2, 3, 4]
-        ]
+        ],
     ),
     key=["H", "K", "V", "BT", "IS_VARLEN"],
     **autotune_cache_kwargs,

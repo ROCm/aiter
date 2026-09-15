@@ -2,6 +2,7 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 import argparse
+import math
 
 import pandas as pd
 import torch
@@ -513,6 +514,1193 @@ def fp8_unit_scale_ref(x: torch.Tensor) -> torch.Tensor:
     return x.float().to(fp8_dtype).float()
 
 
+def run_minimax_tp4_focused_case(
+    *, kv_cache_dtype: str, skip_index_branch: bool, supply_index_args: bool
+):
+    """MiniMax-M3 TP4 page-16 SHUFFLE correctness and non-mutation coverage."""
+    use_static_fp8 = kv_cache_dtype == "fp8_e4m3_static"
+    cache_dtype = dtypes.fp8 if use_static_fp8 else torch.bfloat16
+    case = make_case(
+        dtype=torch.bfloat16,
+        num_tokens=3,
+        block_size=16,
+        num_heads=16,
+        num_kv_heads=1,
+        num_index_heads=1,
+        rotary_dim=64,
+    )
+    case["slot_mapping"] = torch.tensor([0, -1, 17], dtype=torch.int64, device="cuda")
+    case["index_slot_mapping"] = torch.tensor(
+        [2, -1, 20], dtype=torch.int64, device="cuda"
+    )
+    qkv_before = case["qkv"].clone()
+    refs = make_refs(case, qkv_before)
+    q_out = torch.full((3, 16 * HEAD_DIM), 13, dtype=torch.bfloat16, device="cuda")
+    index_q_out = torch.full((3, HEAD_DIM), 17, dtype=torch.bfloat16, device="cuda")
+    index_cache = torch.full(
+        (case["num_blocks"], 16, HEAD_DIM),
+        19,
+        dtype=torch.bfloat16,
+        device="cuda",
+    )
+    index_q_before = index_q_out.clone()
+    index_cache_before = index_cache.clone()
+    kv_cache_k, kv_cache_v = make_shuffle_caches(case, kv_cache_dtype=cache_dtype)
+    k_scale = (
+        torch.tensor([0.25], dtype=torch.float32, device="cuda")
+        if use_static_fp8
+        else None
+    )
+    v_scale = (
+        torch.tensor([0.5], dtype=torch.float32, device="cuda")
+        if use_static_fp8
+        else None
+    )
+
+    pass_index_args = not skip_index_branch or supply_index_args
+    aiter.fused_qknorm_idxrqknorm(
+        case["qkv"],
+        case["q_norm_weight"],
+        case["k_norm_weight"],
+        case["cos_sin_cache"],
+        case["positions"],
+        16,
+        1,
+        64,
+        case["eps"],
+        case["index_q_norm_weight"] if pass_index_args else None,
+        case["index_k_norm_weight"] if pass_index_args else None,
+        1,
+        case["slot_mapping"],
+        kv_cache_k,
+        kv_cache_v,
+        index_cache if pass_index_args else None,
+        16,
+        q_out,
+        index_q_out if pass_index_args else None,
+        case["index_slot_mapping"] if pass_index_args else None,
+        kv_cache_dtype=kv_cache_dtype,
+        index_cache_dtype="auto",
+        k_scale=k_scale,
+        v_scale=v_scale,
+        asm_layout=True,
+        skip_index_branch=skip_index_branch,
+    )
+
+    check_close(q_out, refs["q"], msg="minimax tp4 q", rtol=1e-2, atol=1e-2)
+    _, _, _, index_q_slice, index_k_slice = split_qkv(case, case["qkv"])
+    _, _, _, index_q_before_slice, index_k_before_slice = split_qkv(case, qkv_before)
+    check_close(
+        index_q_slice,
+        index_q_before_slice,
+        msg="minimax tp4 packed index_q unchanged",
+        rtol=0,
+        atol=0,
+    )
+    check_close(
+        index_k_slice,
+        index_k_before_slice,
+        msg="minimax tp4 packed index_k unchanged",
+        rtol=0,
+        atol=0,
+    )
+
+    for token, slot_tensor in enumerate(case["slot_mapping"]):
+        slot = slot_tensor.item()
+        if slot < 0:
+            continue
+        k_actual = maybe_view_fp8(gather_shuffle_k_row(kv_cache_k, slot, 0, 16)).float()
+        v_actual = maybe_view_fp8(gather_shuffle_v_row(kv_cache_v, slot, 0, 16)).float()
+        if use_static_fp8:
+            k_expected = fp8_cache_ref(refs["k"][token, 0], k_scale)
+            v_expected = fp8_cache_ref(refs["v"][token, 0], v_scale)
+            k_actual = k_actual * k_scale
+            v_actual = v_actual * v_scale
+        else:
+            k_expected = refs["k"][token, 0]
+            v_expected = refs["v"][token, 0]
+        check_close(
+            k_actual, k_expected, msg=f"minimax tp4 k token {token}", rtol=0.1, atol=0.1
+        )
+        check_close(
+            v_actual, v_expected, msg=f"minimax tp4 v token {token}", rtol=0.1, atol=0.1
+        )
+
+    # The padded -1 token must not write the cache location that would otherwise
+    # correspond to its token ordinal.
+    assert torch.count_nonzero(gather_shuffle_k_row(kv_cache_k, 1, 0, 16)) == 0
+    assert torch.count_nonzero(gather_shuffle_v_row(kv_cache_v, 1, 0, 16)) == 0
+
+    if skip_index_branch:
+        if supply_index_args:
+            assert torch.equal(index_q_out, index_q_before)
+            assert torch.equal(index_cache, index_cache_before)
+        else:
+            # Also instantiate the non-insert skip path: only Q/K launch slots
+            # run, while V and both packed index slices remain byte-identical.
+            qkv_inplace = qkv_before.clone()
+            aiter.fused_qknorm_idxrqknorm(
+                qkv_inplace,
+                case["q_norm_weight"],
+                case["k_norm_weight"],
+                case["cos_sin_cache"],
+                case["positions"],
+                16,
+                1,
+                64,
+                case["eps"],
+                num_index_heads=1,
+                skip_index_branch=True,
+            )
+            q_actual, k_actual, v_actual, iq_actual, ik_actual = split_qkv(
+                case, qkv_inplace
+            )
+            _, _, v_before, iq_before, ik_before = split_qkv(case, qkv_before)
+            check_close(
+                q_actual,
+                refs["q"],
+                msg="minimax tp4 inplace skip q",
+                rtol=1e-2,
+                atol=1e-2,
+            )
+            check_close(
+                k_actual.view(3, 1, HEAD_DIM),
+                refs["k"],
+                msg="minimax tp4 inplace skip k",
+                rtol=1e-2,
+                atol=1e-2,
+            )
+            for name, actual, expected in (
+                ("v", v_actual, v_before),
+                ("index_q", iq_actual, iq_before),
+                ("index_k", ik_actual, ik_before),
+            ):
+                check_close(
+                    actual,
+                    expected,
+                    msg=f"minimax tp4 inplace skip {name} unchanged",
+                    rtol=0,
+                    atol=0,
+                )
+    else:
+        check_close(
+            index_q_out,
+            refs["index_q"],
+            msg="minimax tp4 index_q",
+            rtol=1e-2,
+            atol=1e-2,
+        )
+        for token in (0, 2):
+            slot = case["index_slot_mapping"][token].item()
+            actual = index_cache.view(-1, HEAD_DIM)[slot]
+            check_close(
+                actual,
+                refs["index_k"][token],
+                msg=f"minimax tp4 index_k token {token}",
+                rtol=1e-2,
+                atol=1e-2,
+            )
+
+
+def run_minimax_tp4_fp8_index_q_case(*, kv_cache_dtype: str, skip_index_branch: bool):
+    """MiniMax TP4: unit-scale e4m3 index_q + index cache (4787 q_idx contract)."""
+    fp8_dtype = fp8_cache_dtype()
+    assert fp8_dtype is not None
+    use_static_fp8 = kv_cache_dtype == "fp8_e4m3_static"
+    cache_dtype = dtypes.fp8 if use_static_fp8 else torch.bfloat16
+    case = make_case(
+        dtype=torch.bfloat16,
+        num_tokens=3,
+        block_size=16,
+        num_heads=16,
+        num_kv_heads=1,
+        num_index_heads=1,
+        rotary_dim=64,
+    )
+    case["slot_mapping"] = torch.tensor([0, -1, 17], dtype=torch.int64, device="cuda")
+    case["index_slot_mapping"] = torch.tensor(
+        [2, -1, 20], dtype=torch.int64, device="cuda"
+    )
+    qkv_before = case["qkv"].clone()
+    refs = make_refs(case, qkv_before)
+    q_out = torch.full((3, 16 * HEAD_DIM), 13, dtype=torch.bfloat16, device="cuda")
+    index_q_out = torch.zeros((3, HEAD_DIM), dtype=fp8_dtype, device="cuda")
+    index_cache = torch.zeros(
+        (case["num_blocks"], 16, HEAD_DIM),
+        dtype=fp8_dtype,
+        device="cuda",
+    )
+    index_q_before = index_q_out.clone()
+    index_cache_before = index_cache.clone()
+    kv_cache_k, kv_cache_v = make_shuffle_caches(case, kv_cache_dtype=cache_dtype)
+    k_scale = (
+        torch.tensor([0.25], dtype=torch.float32, device="cuda")
+        if use_static_fp8
+        else None
+    )
+    v_scale = (
+        torch.tensor([0.5], dtype=torch.float32, device="cuda")
+        if use_static_fp8
+        else None
+    )
+    tag = (
+        f"minimax tp4 fp8-iq {kv_cache_dtype} {'skip' if skip_index_branch else 'full'}"
+    )
+
+    aiter.fused_qknorm_idxrqknorm(
+        case["qkv"],
+        case["q_norm_weight"],
+        case["k_norm_weight"],
+        case["cos_sin_cache"],
+        case["positions"],
+        16,
+        1,
+        64,
+        case["eps"],
+        case["index_q_norm_weight"],
+        case["index_k_norm_weight"],
+        1,
+        case["slot_mapping"],
+        kv_cache_k,
+        kv_cache_v,
+        index_cache,
+        16,
+        q_out,
+        index_q_out,
+        case["index_slot_mapping"],
+        kv_cache_dtype=kv_cache_dtype,
+        index_cache_dtype=None,
+        k_scale=k_scale,
+        v_scale=v_scale,
+        asm_layout=True,
+        skip_index_branch=skip_index_branch,
+    )
+
+    check_close(q_out, refs["q"], msg=f"{tag} q", rtol=1e-2, atol=1e-2)
+    if skip_index_branch:
+        assert torch.equal(
+            index_q_out.view(torch.uint8), index_q_before.view(torch.uint8)
+        )
+        assert torch.equal(
+            index_cache.view(torch.uint8), index_cache_before.view(torch.uint8)
+        )
+        return
+
+    check_close(
+        maybe_view_fp8(index_q_out).float(),
+        fp8_unit_scale_ref(refs["index_q"]),
+        msg=f"{tag} index_q",
+        rtol=1e-2,
+        atol=1e-2,
+    )
+    for token in (0, 2):
+        slot = case["index_slot_mapping"][token].item()
+        actual = maybe_view_fp8(index_cache.view(-1, HEAD_DIM)[slot]).float()
+        check_close(
+            actual,
+            fp8_unit_scale_ref(refs["index_k"][token]),
+            msg=f"{tag} index_k token {token}",
+            rtol=1e-2,
+            atol=1e-2,
+        )
+
+
+def run_fp8_index_q_msa_score_decode_case():
+    """Fused unit-scale e4m3 IQ/IK must be accepted by 4787's score_decode."""
+    from aiter.ops.msa_block_select import pa_sparse_block_score_decode
+
+    fp8_dtype = fp8_cache_dtype()
+    assert fp8_dtype is not None
+    case = make_case(
+        dtype=torch.bfloat16,
+        num_tokens=1,
+        block_size=128,
+        num_heads=16,
+        num_kv_heads=1,
+        num_index_heads=1,
+        rotary_dim=64,
+    )
+    case["slot_mapping"] = torch.tensor([0], dtype=torch.int64, device="cuda")
+    case["index_slot_mapping"] = torch.tensor([0], dtype=torch.int64, device="cuda")
+    refs = make_refs(case, case["qkv"].clone())
+    q_out, _, kv_cache, _ = make_insert_outputs(case)
+    index_q_out = torch.zeros((1, HEAD_DIM), dtype=fp8_dtype, device="cuda")
+    index_cache = torch.zeros(
+        (case["num_blocks"], 128, HEAD_DIM),
+        dtype=fp8_dtype,
+        device="cuda",
+    )
+    aiter.fused_qknorm_idxrqknorm(
+        case["qkv"],
+        case["q_norm_weight"],
+        case["k_norm_weight"],
+        case["cos_sin_cache"],
+        case["positions"],
+        16,
+        1,
+        64,
+        case["eps"],
+        case["index_q_norm_weight"],
+        case["index_k_norm_weight"],
+        1,
+        case["slot_mapping"],
+        kv_cache[:, 0],
+        kv_cache[:, 1],
+        index_cache,
+        128,
+        q_out,
+        index_q_out,
+        case["index_slot_mapping"],
+        kv_cache_dtype="auto",
+        index_cache_dtype=None,
+        asm_layout=False,
+        skip_index_branch=False,
+    )
+    q_idx = index_q_out.view(1, 1, HEAD_DIM)
+    score = torch.full((1, 1, 64), float("-inf"), device="cuda")
+    block_table = torch.zeros((1, 1), dtype=torch.int32, device="cuda")
+    seq_lens = torch.tensor([1], dtype=torch.int32, device="cuda")
+    pa_sparse_block_score_decode(
+        q_idx,
+        index_cache,
+        score,
+        block_table,
+        seq_lens,
+        query_len=1,
+        max_seq_len=128,
+    )
+    ref_dot = (q_idx.float()[0, 0] * maybe_view_fp8(index_cache[0, 0]).float()).sum()
+    check_close(
+        score[0, 0, 0],
+        ref_dot,
+        msg="fused fp8 index_q into msa score_decode",
+        rtol=1e-2,
+        atol=1e-2,
+    )
+    check_close(
+        maybe_view_fp8(index_q_out).float(),
+        fp8_unit_scale_ref(refs["index_q"]),
+        msg="msa cross-check index_q",
+        rtol=1e-2,
+        atol=1e-2,
+    )
+
+
+def make_packed_lbhnc_shuffle_views(
+    *, dtype: torch.dtype, sentinel: float
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Create the runtime packed 3-block allocation and offset SHUFFLE views."""
+    num_logical_blocks = 3
+    logical_block_size = 128
+    pages_per_side = logical_block_size // 16
+    page_elements = 16 * HEAD_DIM
+    packed = torch.full(
+        (num_logical_blocks, 2, logical_block_size, HEAD_DIM),
+        sentinel,
+        dtype=dtype,
+        device="cuda",
+    )
+    x = 16 // packed.element_size()
+    num_physical_pages = num_logical_blocks * 2 * pages_per_side
+    kv_cache_k = packed.view(num_physical_pages, 1, HEAD_DIM // x, 16, x)
+    kv_cache_v = packed.view(num_physical_pages, 1, 16 // x, HEAD_DIM, x)[
+        pages_per_side:
+    ]
+    assert packed.is_contiguous()
+    assert kv_cache_k.storage_offset() == packed.storage_offset()
+    assert kv_cache_v.storage_offset() == pages_per_side * page_elements
+    return packed, kv_cache_k, kv_cache_v
+
+
+def run_minimax_tp4_packed_lbhnc_case(*, kv_cache_dtype: str, skip_index_branch: bool):
+    """Validate runtime-faithful packed LBHNC page spans and rebased slots."""
+    use_static_fp8 = kv_cache_dtype == "fp8_e4m3_static"
+    cache_dtype = dtypes.fp8 if use_static_fp8 else torch.bfloat16
+    cache_sentinel = 24.0
+    logical_slots = torch.tensor(
+        [0, 15, 16, 127, 128, 129, 255, 256, 383, -1],
+        dtype=torch.int64,
+        device="cuda",
+    )
+    rebased_slots = torch.tensor(
+        [0, 15, 16, 127, 256, 257, 383, 512, 639, -1],
+        dtype=torch.int64,
+        device="cuda",
+    )
+    rebased_ref = (
+        logical_slots.clamp_min(0).div(128, rounding_mode="floor").mul(128)
+        + logical_slots
+    )
+    assert torch.equal(rebased_slots, rebased_ref)
+    index_slots = torch.tensor(
+        [0, 1, 127, 128, 129, 255, 256, 383, 300, -1],
+        dtype=torch.int64,
+        device="cuda",
+    )
+    case = make_case(
+        dtype=torch.bfloat16,
+        num_tokens=logical_slots.numel(),
+        block_size=16,
+        num_heads=16,
+        num_kv_heads=1,
+        num_index_heads=1,
+        rotary_dim=64,
+        seed=20260831,
+    )
+    case["slot_mapping"] = rebased_slots
+    case["index_slot_mapping"] = index_slots
+    qkv_before = case["qkv"].clone()
+    refs = make_refs(case, qkv_before)
+
+    packed, kv_cache_k, kv_cache_v = make_packed_lbhnc_shuffle_views(
+        dtype=cache_dtype, sentinel=cache_sentinel
+    )
+    x = 16 // packed.element_size()
+    assert tuple(kv_cache_k.shape) == (48, 1, HEAD_DIM // x, 16, x)
+    assert tuple(kv_cache_v.shape) == (40, 1, 16 // x, HEAD_DIM, x)
+    if use_static_fp8:
+        assert tuple(kv_cache_k.shape) == (48, 1, 8, 16, 16)
+        assert tuple(kv_cache_v.shape) == (40, 1, 1, 128, 16)
+
+    q_out = torch.full(
+        (logical_slots.numel(), 16 * HEAD_DIM),
+        25,
+        dtype=case["dtype"],
+        device="cuda",
+    )
+    index_q_out = torch.full(
+        (logical_slots.numel(), HEAD_DIM),
+        26,
+        dtype=case["dtype"],
+        device="cuda",
+    )
+    index_cache = torch.full((3, 128, HEAD_DIM), 27, dtype=case["dtype"], device="cuda")
+    index_q_before = index_q_out.clone()
+    index_cache_before = index_cache.clone()
+    k_scale = (
+        torch.tensor([0.125], dtype=torch.float32, device="cuda")
+        if use_static_fp8
+        else None
+    )
+    v_scale = (
+        torch.tensor([0.25], dtype=torch.float32, device="cuda")
+        if use_static_fp8
+        else None
+    )
+
+    aiter.fused_qknorm_idxrqknorm(
+        case["qkv"],
+        case["q_norm_weight"],
+        case["k_norm_weight"],
+        case["cos_sin_cache"],
+        case["positions"],
+        16,
+        1,
+        64,
+        case["eps"],
+        case["index_q_norm_weight"],
+        case["index_k_norm_weight"],
+        1,
+        rebased_slots,
+        kv_cache_k,
+        kv_cache_v,
+        index_cache,
+        16,
+        q_out,
+        index_q_out,
+        index_slots,
+        kv_cache_dtype=kv_cache_dtype,
+        index_cache_dtype="auto",
+        k_scale=k_scale,
+        v_scale=v_scale,
+        asm_layout=True,
+        skip_index_branch=skip_index_branch,
+    )
+
+    tag = f"packed {kv_cache_dtype} {'skip' if skip_index_branch else 'full'}"
+    check_close(q_out, refs["q"], msg=f"{tag} q", rtol=1e-2, atol=1e-2)
+    _, _, _, iq_actual, ik_actual = split_qkv(case, case["qkv"])
+    _, _, _, iq_before, ik_before = split_qkv(case, qkv_before)
+    check_close(
+        iq_actual, iq_before, msg=f"{tag} packed index_q unchanged", rtol=0, atol=0
+    )
+    check_close(
+        ik_actual, ik_before, msg=f"{tag} packed index_k unchanged", rtol=0, atol=0
+    )
+
+    page_elements = 16 * HEAD_DIM
+    packed_flat = packed.view(-1)
+    written_mask = torch.zeros(packed.numel(), dtype=torch.bool, device=packed.device)
+    for token, slot_tensor in enumerate(rebased_slots):
+        slot = slot_tensor.item()
+        if slot < 0:
+            continue
+        page, offset = divmod(slot, 16)
+        k_raw = maybe_view_fp8(gather_shuffle_k_row(kv_cache_k, slot, 0, 16)).float()
+        v_raw = maybe_view_fp8(gather_shuffle_v_row(kv_cache_v, slot, 0, 16)).float()
+        if use_static_fp8:
+            k_actual = k_raw * k_scale
+            v_actual = v_raw * v_scale
+            k_expected = fp8_cache_ref(refs["k"][token, 0], k_scale)
+            v_expected = fp8_cache_ref(refs["v"][token, 0], v_scale)
+        else:
+            k_actual = k_raw
+            v_actual = v_raw
+            k_expected = refs["k"][token, 0]
+            v_expected = refs["v"][token, 0]
+        check_close(
+            k_actual, k_expected, msg=f"{tag} k token {token}", rtol=0.1, atol=0.1
+        )
+        check_close(
+            v_actual, v_expected, msg=f"{tag} v token {token}", rtol=0.1, atol=0.1
+        )
+
+        for dim in range(HEAD_DIM):
+            k_abs = page * page_elements + (dim // x) * (16 * x) + offset * x + dim % x
+            # V's view starts eight physical pages into the packed allocation.
+            v_abs = (
+                (8 + page) * page_elements
+                + (offset // x) * (HEAD_DIM * x)
+                + dim * x
+                + offset % x
+            )
+            written_mask[k_abs] = True
+            written_mask[v_abs] = True
+            assert maybe_view_fp8(packed_flat[k_abs]).float() == k_raw[dim]
+            assert maybe_view_fp8(packed_flat[v_abs]).float() == v_raw[dim]
+
+    untouched = maybe_view_fp8(packed_flat[~written_mask]).float()
+    assert torch.all(untouched == cache_sentinel)
+
+    if skip_index_branch:
+        assert torch.equal(index_q_out, index_q_before)
+        assert torch.equal(index_cache, index_cache_before)
+    else:
+        check_close(
+            index_q_out,
+            refs["index_q"],
+            msg=f"{tag} index_q",
+            rtol=1e-2,
+            atol=1e-2,
+        )
+        written_index_rows = torch.zeros(
+            3 * 128, dtype=torch.bool, device=index_cache.device
+        )
+        for token, index_slot_tensor in enumerate(index_slots):
+            index_slot = index_slot_tensor.item()
+            if index_slot < 0:
+                continue
+            written_index_rows[index_slot] = True
+            check_close(
+                index_cache.view(-1, HEAD_DIM)[index_slot],
+                refs["index_k"][token],
+                msg=f"{tag} index_k token {token}",
+                rtol=1e-2,
+                atol=1e-2,
+            )
+        assert torch.all(index_cache.view(-1, HEAD_DIM)[~written_index_rows] == 27)
+
+
+def gpu_latency_stats_us(fn, *, warmup: int, iters: int) -> tuple[float, float]:
+    """Time an already-allocated/JIT-ready callable with per-iteration events."""
+    for iteration in range(warmup):
+        fn(iteration)
+    torch.cuda.synchronize()
+
+    starts = [torch.cuda.Event(enable_timing=True) for _ in range(iters)]
+    ends = [torch.cuda.Event(enable_timing=True) for _ in range(iters)]
+    for iteration, (start, end) in enumerate(zip(starts, ends)):
+        start.record()
+        fn(warmup + iteration)
+        end.record()
+    torch.cuda.synchronize()
+    samples = sorted(
+        start.elapsed_time(end) * 1000.0 for start, end in zip(starts, ends)
+    )
+    middle = len(samples) // 2
+    median = (
+        samples[middle]
+        if len(samples) % 2
+        else (samples[middle - 1] + samples[middle]) / 2.0
+    )
+    p95 = samples[max(0, math.ceil(0.95 * len(samples)) - 1)]
+    return median, p95
+
+
+def quant_quality_metrics(
+    case: dict,
+    refs: dict,
+    kv_cache_k: torch.Tensor,
+    kv_cache_v: torch.Tensor,
+    k_scale: torch.Tensor,
+    v_scale: torch.Tensor,
+    slot_mapping: torch.Tensor,
+    *,
+    per_token: bool,
+) -> list[dict]:
+    """Measure dequantized SHUFFLE-cache quality against post-rounding BF16."""
+    fp8_max = torch.finfo(fp8_cache_dtype()).max
+    actual = {"k": [], "v": []}
+    raw = {"k": [], "v": []}
+    expected = {"k": [], "v": []}
+    for token, slot_tensor in enumerate(slot_mapping):
+        slot = slot_tensor.item()
+        k_raw = maybe_view_fp8(
+            gather_shuffle_k_row(kv_cache_k, slot, 0, case["block_size"])
+        ).float()
+        v_raw = maybe_view_fp8(
+            gather_shuffle_v_row(kv_cache_v, slot, 0, case["block_size"])
+        ).float()
+        if per_token:
+            ks = pertoken_scale_at(
+                k_scale,
+                asm_layout=True,
+                slot=slot,
+                head=0,
+                block_size=case["block_size"],
+            )
+            vs = pertoken_scale_at(
+                v_scale,
+                asm_layout=True,
+                slot=slot,
+                head=0,
+                block_size=case["block_size"],
+            )
+        else:
+            ks, vs = k_scale, v_scale
+        raw["k"].append(k_raw)
+        raw["v"].append(v_raw)
+        actual["k"].append(k_raw * ks)
+        actual["v"].append(v_raw * vs)
+        expected["k"].append(refs["k"][token, 0].float())
+        expected["v"].append(refs["v"][token, 0].float())
+
+    rows = []
+    for component in ("k", "v"):
+        act = torch.stack(actual[component]).float()
+        ref = torch.stack(expected[component]).float()
+        raw_values = torch.stack(raw[component]).float()
+        error = act - ref
+        rows.append(
+            {
+                "component": component,
+                "max_error": error.abs().max().item(),
+                "mae": error.abs().mean().item(),
+                "rmse": error.square().mean().sqrt().item(),
+                "cosine_similarity": torch.nn.functional.cosine_similarity(
+                    act.flatten().reshape(1, -1),
+                    ref.flatten().reshape(1, -1),
+                ).item(),
+                "saturation_rate": (raw_values.abs() >= fp8_max).float().mean().item(),
+            }
+        )
+    return rows
+
+
+def make_minimax_benchmark_state(num_tokens: int) -> tuple[dict, dict]:
+    """Create one deterministic TP4 source shared by all benchmark contracts."""
+    case = make_case(
+        dtype=torch.bfloat16,
+        num_tokens=num_tokens,
+        block_size=16,
+        num_heads=16,
+        num_kv_heads=1,
+        num_index_heads=1,
+        rotary_dim=64,
+        seed=20260830 + num_tokens,
+    )
+    case["slot_mapping"] = torch.arange(num_tokens, dtype=torch.int64, device="cuda")
+    case["index_slot_mapping"] = torch.roll(case["slot_mapping"], shifts=1)
+    refs = make_refs(case, case["qkv"])
+    return case, refs
+
+
+def make_benchmark_layout(
+    case: dict, *, layout: str, cache_dtype: torch.dtype
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Allocate one benchmark layout and return its physical page-16 mapping."""
+    if layout == "separate":
+        kv_cache_k, kv_cache_v = make_shuffle_caches(case, kv_cache_dtype=cache_dtype)
+        return kv_cache_k, kv_cache_v, case["slot_mapping"]
+    if layout != "packed":
+        raise ValueError(f"unknown benchmark layout: {layout}")
+
+    num_tokens = case["qkv"].size(0)
+    num_logical_blocks = (num_tokens + 127) // 128
+    packed = torch.empty(
+        num_logical_blocks,
+        2,
+        128,
+        HEAD_DIM,
+        dtype=cache_dtype,
+        device="cuda",
+    )
+    x = 16 // packed.element_size()
+    num_physical_pages = num_logical_blocks * 16
+    kv_cache_k = packed.view(num_physical_pages, 1, HEAD_DIM // x, 16, x)
+    kv_cache_v = packed.view(num_physical_pages, 1, 16 // x, HEAD_DIM, x)[8:]
+    logical_slots = case["slot_mapping"]
+    rebased_slots = (
+        logical_slots.clamp_min(0).div(128, rounding_mode="floor").mul(128)
+        + logical_slots
+    )
+    return kv_cache_k, kv_cache_v, rebased_slots
+
+
+def benchmark_fused_minimax_case(
+    case: dict,
+    refs: dict,
+    *,
+    layout: str,
+    cache_mode: str,
+    skip_index_branch: bool,
+    warmup: int,
+    iters: int,
+) -> tuple[dict, list[dict]]:
+    """Benchmark one preallocated fused full-index or skip-index configuration."""
+    use_fp8 = cache_mode != "bf16"
+    use_static = cache_mode == "fp8_e4m3_static"
+    cache_dtype = dtypes.fp8 if use_fp8 else torch.bfloat16
+    kv_cache_k, kv_cache_v, slot_mapping = make_benchmark_layout(
+        case, layout=layout, cache_dtype=cache_dtype
+    )
+    q_out = torch.empty(
+        case["qkv"].size(0),
+        case["num_heads"] * HEAD_DIM,
+        dtype=case["dtype"],
+        device="cuda",
+    )
+    index_q_out = None
+    index_cache = None
+    if not skip_index_branch:
+        index_q_out = torch.empty(
+            case["qkv"].size(0), HEAD_DIM, dtype=case["dtype"], device="cuda"
+        )
+        index_cache = torch.empty(
+            (case["qkv"].size(0) + 127) // 128,
+            128,
+            HEAD_DIM,
+            dtype=case["dtype"],
+            device="cuda",
+        )
+
+    k_scale = v_scale = None
+    if use_static:
+        # Synthetic calibration, not model scales: reserve 10% FP8 headroom using
+        # this exact benchmark input's post-rounding BF16 K/V range.
+        fp8_target = 0.9 * torch.finfo(fp8_cache_dtype()).max
+        k_scale = (refs["k"].float().abs().max() / fp8_target).reshape(1)
+        v_scale = (refs["v"].float().abs().max() / fp8_target).reshape(1)
+    elif use_fp8:
+        k_scale, v_scale = make_pertoken_scales(case, asm_layout=True)
+
+    def invoke(_iteration: int):
+        aiter.fused_qknorm_idxrqknorm(
+            case["qkv"],
+            case["q_norm_weight"],
+            case["k_norm_weight"],
+            case["cos_sin_cache"],
+            case["positions"],
+            16,
+            1,
+            64,
+            case["eps"],
+            None if skip_index_branch else case["index_q_norm_weight"],
+            None if skip_index_branch else case["index_k_norm_weight"],
+            1,
+            slot_mapping,
+            kv_cache_k,
+            kv_cache_v,
+            index_cache,
+            16,
+            q_out,
+            index_q_out,
+            None if skip_index_branch else case["index_slot_mapping"],
+            kv_cache_dtype="auto" if cache_mode == "bf16" else cache_mode,
+            index_cache_dtype="auto",
+            k_scale=k_scale,
+            v_scale=v_scale,
+            asm_layout=True,
+            skip_index_branch=skip_index_branch,
+        )
+
+    median_us, p95_us = gpu_latency_stats_us(invoke, warmup=warmup, iters=iters)
+    row = {
+        "implementation": "fused",
+        "layout": layout,
+        "index_mode": "skip" if skip_index_branch else "full",
+        "cache_mode": cache_mode,
+        "num_tokens": case["qkv"].size(0),
+        "median_us": median_us,
+        "p95_us": p95_us,
+        "tokens_per_second": case["qkv"].size(0) * 1e6 / median_us,
+        "synthetic_k_scale": k_scale.item() if use_static else None,
+        "synthetic_v_scale": v_scale.item() if use_static else None,
+    }
+    quality = []
+    if use_fp8:
+        quality = quant_quality_metrics(
+            case,
+            refs,
+            kv_cache_k,
+            kv_cache_v,
+            k_scale,
+            v_scale,
+            slot_mapping,
+            per_token=not use_static,
+        )
+        for metrics in quality:
+            metrics.update(
+                {
+                    "index_mode": row["index_mode"],
+                    "layout": layout,
+                    "cache_mode": cache_mode,
+                    "num_tokens": row["num_tokens"],
+                }
+            )
+    return row, quality
+
+
+def benchmark_vllm_unfused_case(
+    case: dict,
+    refs: dict,
+    *,
+    layout: str,
+    cache_mode: str,
+    skip_index_branch: bool,
+    warmup: int,
+    iters: int,
+) -> tuple[dict | None, str | None]:
+    """Benchmark vLLM csrc norm/RoPE + AITER SHUFFLE insert + index scatter."""
+    if cache_mode == "fp8_e4m3":
+        return (
+            None,
+            (
+                "vLLM's current sparse-PA fallback has fixed scalar FP8 scales, "
+                "not per-token output scales"
+            ),
+        )
+    try:
+        from vllm import _custom_ops as vllm_ops
+        from vllm.models.minimax_m3.amd.ops.sparse_pa import (
+            minimax_m3_insert_index_cache,
+        )
+    except Exception as error:  # noqa: BLE001
+        return None, f"vLLM fallback imports unavailable: {error}"
+    if not hasattr(torch.ops._C, "fused_minimax_m3_qknorm_rope_kv_insert"):
+        return None, "vLLM csrc fused MiniMax norm/RoPE op is unavailable"
+
+    use_static = cache_mode == "fp8_e4m3_static"
+    cache_dtype = dtypes.fp8 if use_static else torch.bfloat16
+    kv_cache_k, kv_cache_v, slot_mapping = make_benchmark_layout(
+        case, layout=layout, cache_dtype=cache_dtype
+    )
+    q_out = torch.empty(
+        case["qkv"].size(0),
+        case["num_heads"] * HEAD_DIM,
+        dtype=case["dtype"],
+        device="cuda",
+    )
+    index_q_out = (
+        None
+        if skip_index_branch
+        else torch.empty(
+            case["qkv"].size(0), HEAD_DIM, dtype=case["dtype"], device="cuda"
+        )
+    )
+    index_cache = (
+        None
+        if skip_index_branch
+        else torch.empty(
+            (case["qkv"].size(0) + 127) // 128,
+            128,
+            HEAD_DIM,
+            dtype=case["dtype"],
+            device="cuda",
+        )
+    )
+    fp8_target = 0.9 * torch.finfo(fp8_cache_dtype()).max
+    k_scale = (
+        (refs["k"].float().abs().max() / fp8_target).reshape(1) if use_static else None
+    )
+    v_scale = (
+        (refs["v"].float().abs().max() / fp8_target).reshape(1) if use_static else None
+    )
+
+    total_calls = warmup + iters
+    qkv_work = [case["qkv"].clone() for _ in range(total_calls)]
+    k_stage = torch.empty_like(refs["k"])
+    v_stage = torch.empty_like(refs["v"])
+    index_k_stage = (
+        None
+        if skip_index_branch
+        else torch.empty(
+            case["qkv"].size(0), HEAD_DIM, dtype=case["dtype"], device="cuda"
+        )
+    )
+    q_size, kv_size, _, iq_size, _ = case["sizes"]
+
+    def invoke(iteration: int):
+        qkv = qkv_work[iteration]
+        vllm_ops.fused_minimax_m3_qknorm_rope_kv_insert(
+            qkv,
+            case["q_norm_weight"],
+            case["k_norm_weight"],
+            case["cos_sin_cache"],
+            case["positions"],
+            16,
+            1,
+            64,
+            case["eps"],
+            None if skip_index_branch else case["index_q_norm_weight"],
+            None if skip_index_branch else case["index_k_norm_weight"],
+            1,
+            q_out=q_out,
+            index_q_out=index_q_out,
+            skip_index_branch=skip_index_branch,
+        )
+        k_stage.copy_(qkv[:, q_size : q_size + kv_size].view_as(k_stage))
+        v_stage.copy_(qkv[:, q_size + kv_size : q_size + 2 * kv_size].view_as(v_stage))
+        aiter.reshape_and_cache(
+            k_stage,
+            v_stage,
+            kv_cache_k,
+            kv_cache_v,
+            slot_mapping,
+            "fp8_e4m3" if use_static else "auto",
+            k_scale=k_scale,
+            v_scale=v_scale,
+            asm_layout=True,
+        )
+        if not skip_index_branch:
+            index_k_begin = q_size + 2 * kv_size + iq_size
+            index_k_stage.copy_(qkv[:, index_k_begin : index_k_begin + HEAD_DIM])
+            minimax_m3_insert_index_cache(
+                index_k_stage, index_cache, case["index_slot_mapping"]
+            )
+
+    try:
+        median_us, p95_us = gpu_latency_stats_us(invoke, warmup=warmup, iters=iters)
+    except Exception as error:  # noqa: BLE001
+        return None, f"vLLM fallback execution failed: {error}"
+    return (
+        {
+            "implementation": "vllm_unfused",
+            "layout": layout,
+            "index_mode": "skip" if skip_index_branch else "full",
+            "cache_mode": cache_mode,
+            "num_tokens": case["qkv"].size(0),
+            "median_us": median_us,
+            "p95_us": p95_us,
+            "tokens_per_second": case["qkv"].size(0) * 1e6 / median_us,
+            "synthetic_k_scale": k_scale.item() if use_static else None,
+            "synthetic_v_scale": v_scale.item() if use_static else None,
+        },
+        None,
+    )
+
+
+def run_gluon_sensitivity(case: dict, refs: dict) -> tuple[list[dict], str | None]:
+    """Compare static/per-token FP8 Gluon outputs with the BF16-cache output."""
+    try:
+        from vllm.models.minimax_m3.amd.ops.sparse_pa import _run_gluon_decode
+    except Exception as error:  # noqa: BLE001
+        return [], f"Gluon reader import unavailable: {error}"
+
+    built = {}
+    for cache_mode in ("bf16", "fp8_e4m3_static", "fp8_e4m3"):
+        use_fp8 = cache_mode != "bf16"
+        use_static = cache_mode == "fp8_e4m3_static"
+        cache_dtype = dtypes.fp8 if use_fp8 else torch.bfloat16
+        kv_cache_k, kv_cache_v = make_shuffle_caches(case, kv_cache_dtype=cache_dtype)
+        q_out = torch.empty(
+            case["qkv"].size(0),
+            case["num_heads"] * HEAD_DIM,
+            dtype=case["dtype"],
+            device="cuda",
+        )
+        k_scale = v_scale = None
+        if use_static:
+            fp8_target = 0.9 * torch.finfo(fp8_cache_dtype()).max
+            k_scale = (refs["k"].float().abs().max() / fp8_target).reshape(1)
+            v_scale = (refs["v"].float().abs().max() / fp8_target).reshape(1)
+        elif use_fp8:
+            k_scale, v_scale = make_pertoken_scales(case, asm_layout=True)
+
+        aiter.fused_qknorm_idxrqknorm(
+            case["qkv"],
+            case["q_norm_weight"],
+            case["k_norm_weight"],
+            case["cos_sin_cache"],
+            case["positions"],
+            16,
+            1,
+            64,
+            case["eps"],
+            num_index_heads=1,
+            slot_mapping=case["slot_mapping"],
+            kv_cache_k=kv_cache_k,
+            kv_cache_v=kv_cache_v,
+            block_size=16,
+            q_out=q_out,
+            kv_cache_dtype="auto" if cache_mode == "bf16" else cache_mode,
+            index_cache_dtype="auto",
+            k_scale=k_scale,
+            v_scale=v_scale,
+            asm_layout=True,
+            skip_index_branch=True,
+        )
+        if cache_mode == "fp8_e4m3":
+            # _run_gluon_decode accepts per-token scales as
+            # [num_kv_heads, physical_pages * 16]. The consolidated writer emits
+            # [physical_pages, num_kv_heads, 16] for SHUFFLE caches.
+            k_scale = k_scale.permute(1, 0, 2).reshape(1, -1).contiguous()
+            v_scale = v_scale.permute(1, 0, 2).reshape(1, -1).contiguous()
+        built[cache_mode] = (kv_cache_k, kv_cache_v, q_out, k_scale, v_scale)
+
+    num_tokens = case["qkv"].size(0)
+    num_written_pages = (num_tokens + case["block_size"] - 1) // case["block_size"]
+    # Benchmark slots are exactly [0, num_tokens), so the reader's physical
+    # page-16 table is consecutive and its context is the number of written rows.
+    sparse_bt = torch.arange(
+        num_written_pages, dtype=torch.int32, device="cuda"
+    ).reshape(1, -1)
+    sparse_ctx = torch.tensor([num_tokens], dtype=torch.int32, device="cuda")
+    query = built["bf16"][2][-1:].view(1, 16, HEAD_DIM).contiguous()
+    outputs = {
+        cache_mode: torch.empty_like(query)
+        for cache_mode in ("bf16", "fp8_e4m3_static", "fp8_e4m3")
+    }
+
+    try:
+        for cache_mode, (k_cache, v_cache, _q_out, k_scale, v_scale) in built.items():
+            _run_gluon_decode(
+                query,
+                k_cache,
+                v_cache,
+                sparse_bt,
+                sparse_ctx,
+                1,
+                HEAD_DIM**-0.5,
+                outputs[cache_mode],
+                k_scale,
+                v_scale,
+            )
+        torch.cuda.synchronize()
+    except Exception as error:  # noqa: BLE001
+        return [], f"Gluon sensitivity execution failed: {error}"
+
+    reference = outputs["bf16"].float()
+    rows = []
+    for cache_mode in ("fp8_e4m3_static", "fp8_e4m3"):
+        actual = outputs[cache_mode].float()
+        error = actual - reference
+        rows.append(
+            {
+                "num_tokens": num_tokens,
+                "cache_mode": cache_mode,
+                "max_error": error.abs().max().item(),
+                "mae": error.abs().mean().item(),
+                "rmse": error.square().mean().sqrt().item(),
+                "cosine_similarity": torch.nn.functional.cosine_similarity(
+                    actual.flatten().reshape(1, -1),
+                    reference.flatten().reshape(1, -1),
+                ).item(),
+            }
+        )
+    return rows, None
+
+
+def run_minimax_benchmark(
+    *, token_counts: list[int], warmup: int, iters: int
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, list[str]]:
+    # Exercise the exact three-logical-block packed geometry, physical offsets,
+    # padded slots, and full/skip index behavior once before collecting timings.
+    for packed_kv_dtype in ("auto", "fp8_e4m3_static"):
+        for packed_skip_index in (False, True):
+            run_minimax_tp4_packed_lbhnc_case(
+                kv_cache_dtype=packed_kv_dtype,
+                skip_index_branch=packed_skip_index,
+            )
+
+    timing_rows = []
+    quality_rows = []
+    sensitivity_rows = []
+    blockers = [
+        "sibling #4813 specialized baseline unavailable: branch switching is prohibited"
+    ]
+    for num_tokens in token_counts:
+        case, refs = make_minimax_benchmark_state(num_tokens)
+        fused_by_key = {}
+        for layout in ("separate", "packed"):
+            cache_modes = (
+                ("bf16", "fp8_e4m3_static", "fp8_e4m3")
+                if layout == "separate"
+                else ("bf16", "fp8_e4m3_static")
+            )
+            for skip_index_branch in (False, True):
+                for cache_mode in cache_modes:
+                    row, quality = benchmark_fused_minimax_case(
+                        case,
+                        refs,
+                        layout=layout,
+                        cache_mode=cache_mode,
+                        skip_index_branch=skip_index_branch,
+                        warmup=warmup,
+                        iters=iters,
+                    )
+                    timing_rows.append(row)
+                    quality_rows.extend(quality)
+                    fused_by_key[(layout, row["index_mode"], cache_mode)] = row
+
+                    baseline, blocker = benchmark_vllm_unfused_case(
+                        case,
+                        refs,
+                        layout=layout,
+                        cache_mode=cache_mode,
+                        skip_index_branch=skip_index_branch,
+                        warmup=warmup,
+                        iters=iters,
+                    )
+                    if baseline is not None:
+                        row["speedup_vs_unfused"] = (
+                            baseline["median_us"] / row["median_us"]
+                        )
+                        timing_rows.append(baseline)
+                    elif blocker is not None:
+                        message = (
+                            f"tokens={num_tokens}, layout={layout}, "
+                            f"index={row['index_mode']}, cache={cache_mode}: {blocker}"
+                        )
+                        if message not in blockers:
+                            blockers.append(message)
+
+        for index_mode in ("full", "skip"):
+            static_row = fused_by_key[("separate", index_mode, "fp8_e4m3_static")]
+            pertoken_row = fused_by_key[("separate", index_mode, "fp8_e4m3")]
+            static_row["fixed_over_pertoken_ratio"] = (
+                static_row["median_us"] / pertoken_row["median_us"]
+            )
+            for cache_mode in ("bf16", "fp8_e4m3_static"):
+                separate_row = fused_by_key[("separate", index_mode, cache_mode)]
+                packed_row = fused_by_key[("packed", index_mode, cache_mode)]
+                packed_row["packed_over_separate_ratio"] = (
+                    packed_row["median_us"] / separate_row["median_us"]
+                )
+
+        sensitivity, blocker = run_gluon_sensitivity(case, refs)
+        sensitivity_rows.extend(sensitivity)
+        if blocker is not None:
+            blockers.append(f"tokens={num_tokens}: {blocker}")
+
+    return (
+        pd.DataFrame(timing_rows),
+        pd.DataFrame(quality_rows),
+        pd.DataFrame(sensitivity_rows),
+        blockers,
+    )
+
+
 @perftest(num_iters=10, num_warmup=1)
 def run_fused_qknorm_idxrqknorm(
     case: dict,
@@ -906,6 +2094,24 @@ parser.add_argument("--num_tokens", type=int, nargs="*", default=None)
 parser.add_argument("--block_size", type=int, nargs="*", default=None)
 parser.add_argument("--rotary_dim", type=int, nargs="*", default=None)
 parser.add_argument("--num_index_heads", type=int, nargs="*", default=None)
+parser.add_argument(
+    "--minimax_tp4",
+    action="store_true",
+    help="Run focused MiniMax-M3 TP4 full/skip BF16/static-FP8 cases",
+)
+parser.add_argument(
+    "--minimax_benchmark",
+    action="store_true",
+    help="Benchmark TP4 full/skip BF16, static-FP8, and per-token-FP8 paths",
+)
+parser.add_argument(
+    "--benchmark_tokens",
+    type=int,
+    nargs="*",
+    default=[1, 16, 64, 128, 256],
+)
+parser.add_argument("--benchmark_warmup", type=int, default=10)
+parser.add_argument("--benchmark_iters", type=int, default=50)
 args = parser.parse_args()
 
 selected_cases = []
@@ -917,6 +2123,8 @@ for (
     rotary_dim,
     num_index_heads,
 ) in DEFAULT_CASES:
+    if args.minimax_tp4 or args.minimax_benchmark:
+        continue
     if args.mode is not None and mode not in args.mode:
         continue
     if args.dtype is not None and dtype_name not in args.dtype:
@@ -931,6 +2139,66 @@ for (
         continue
     selected_cases.append(
         (mode, dtype_name, num_tokens, block_size, rotary_dim, num_index_heads)
+    )
+
+if args.minimax_tp4:
+    if fp8_cache_dtype() is None:
+        raise RuntimeError("MiniMax TP4 focused cases require an FP8 dtype")
+    run_minimax_tp4_focused_case(
+        kv_cache_dtype="auto",
+        skip_index_branch=False,
+        supply_index_args=True,
+    )
+    run_minimax_tp4_focused_case(
+        kv_cache_dtype="auto",
+        skip_index_branch=True,
+        supply_index_args=False,
+    )
+    run_minimax_tp4_focused_case(
+        kv_cache_dtype="fp8_e4m3_static",
+        skip_index_branch=False,
+        supply_index_args=True,
+    )
+    run_minimax_tp4_focused_case(
+        kv_cache_dtype="fp8_e4m3_static",
+        skip_index_branch=True,
+        supply_index_args=True,
+    )
+    for packed_kv_dtype in ("auto", "fp8_e4m3_static"):
+        for packed_skip_index in (False, True):
+            run_minimax_tp4_packed_lbhnc_case(
+                kv_cache_dtype=packed_kv_dtype,
+                skip_index_branch=packed_skip_index,
+            )
+    for fp8_iq_kv_dtype in ("auto", "fp8_e4m3_static"):
+        for fp8_iq_skip in (False, True):
+            run_minimax_tp4_fp8_index_q_case(
+                kv_cache_dtype=fp8_iq_kv_dtype,
+                skip_index_branch=fp8_iq_skip,
+            )
+    run_fp8_index_q_msa_score_decode_case()
+
+benchmark_timing = benchmark_quality = benchmark_sensitivity = None
+benchmark_blockers = []
+if args.minimax_benchmark:
+    if fp8_cache_dtype() is None:
+        raise RuntimeError("MiniMax benchmark requires an FP8 dtype")
+    if (
+        not args.benchmark_tokens
+        or min(args.benchmark_tokens) <= 0
+        or args.benchmark_warmup < 1
+        or args.benchmark_iters < 1
+    ):
+        raise ValueError("benchmark tokens/warmup/iters must all be positive")
+    (
+        benchmark_timing,
+        benchmark_quality,
+        benchmark_sensitivity,
+        benchmark_blockers,
+    ) = run_minimax_benchmark(
+        token_counts=args.benchmark_tokens,
+        warmup=args.benchmark_warmup,
+        iters=args.benchmark_iters,
     )
 
 df = []
@@ -953,5 +2221,28 @@ for (
     df.append(ret)
 
 df = pd.DataFrame(df)
-df_md = df.to_markdown(index=False)
-aiter.logger.info("fused_qknorm_idxrqknorm summary (markdown):\n%s", df_md)
+if args.minimax_tp4:
+    aiter.logger.info("focused MiniMax-M3 TP4 cases passed")
+elif args.minimax_benchmark:
+    aiter.logger.info(
+        "MiniMax benchmark scale note: model artifacts are unavailable; "
+        "fp8_e4m3_static uses synthetic non-unit scales "
+        "amax(post-rounding BF16 reference) / (0.9 * fp8_max)"
+    )
+    aiter.logger.info(
+        "MiniMax benchmark timing CSV:\n%s",
+        benchmark_timing.to_csv(index=False),
+    )
+    aiter.logger.info(
+        "MiniMax benchmark quantization-quality CSV:\n%s",
+        benchmark_quality.to_csv(index=False),
+    )
+    aiter.logger.info(
+        "MiniMax benchmark Gluon sensitivity CSV:\n%s",
+        benchmark_sensitivity.to_csv(index=False),
+    )
+    for blocker in benchmark_blockers:
+        aiter.logger.info("MiniMax benchmark unavailable baseline: %s", blocker)
+else:
+    df_md = df.to_markdown(index=False)
+    aiter.logger.info("fused_qknorm_idxrqknorm summary (markdown):\n%s", df_md)

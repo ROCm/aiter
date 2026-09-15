@@ -28,7 +28,7 @@ void gemm_a4w4_blockscale_tune(aiter_tensor_t& XQ,
 
 } // namespace
 
-PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
+PYBIND11_MODULE(AITER_EXTENSION_NAME, m)
 {
     AITER_SET_STREAM_PYBIND
     GEMM_A4W4_BLOCKSCALE_TUNE_PYBIND;

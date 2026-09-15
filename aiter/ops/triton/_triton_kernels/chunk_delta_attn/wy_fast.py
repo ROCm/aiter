@@ -19,13 +19,13 @@ import triton.language as tl
 
 from aiter.ops.triton._triton_kernels.chunk_delta_attn.chunk_delta_attn_utils import (
     autotune_cache_kwargs,
-    chunk_delta_attn_autotune_configs,
     exp2,
     input_guard,
 )
 from aiter.ops.triton._triton_kernels.chunk_delta_attn.utils.index import (
     prepare_chunk_indices,
 )
+from aiter.ops.triton.utils.tuned_config_utils import autotune_configs
 
 _BK_DEFAULT = 64
 _BV_DEFAULT = 64
@@ -39,7 +39,8 @@ _BV_DEFAULT = 64
     }
 )
 @triton.autotune(
-    configs=chunk_delta_attn_autotune_configs(
+    configs=autotune_configs(
+        "CHUNK_DELTA_ATTN",
         [
             triton.Config({}, num_warps=nw, num_stages=ns)
             for nw in [2, 4, 8]

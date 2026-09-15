@@ -9,7 +9,6 @@ from aiter.ops.triton.gemm.basic.gemm_afp4wfp4 import (
 from aiter.ops.triton.gemm.basic.gemm_afp4wfp4 import (
     gemm_afp4wfp4_preshuffle,
 )
-from aiter.ops.triton.gluon.gemm_afp4wfp4 import gemm_afp4wfp4 as gluon_gemm_afp4wfp4
 from aiter.ops.triton.utils._triton import arch_info
 from op_tests.op_benchmarks.triton.utils.argparse import (
     add_argparse_ff,
@@ -67,7 +66,9 @@ def bench_gemm_fn(
     else:
         if gluon:
             ms = triton.testing.do_bench(
-                lambda: gluon_gemm_afp4wfp4(x, w, x_scale, w_scale, c_dtype, y),
+                lambda: triton_gemm_afp4wfp4(
+                    x, w, x_scale, w_scale, c_dtype, y, backend="gluon"
+                ),
                 warmup=25,
                 rep=100,
             )

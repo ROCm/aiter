@@ -123,6 +123,7 @@ else:
     from .ops.rope import *
     from .ops.topk import *
     from .ops.topk_plain import topk_plain  # noqa: F401
+    from .ops.topk_select import topk_select, topk_select_backend  # noqa: F401
     from .ops.mha import *
     from .ops.vsa_sparse_attention import vsa_sparse_attention  # noqa: F401
     from .ops.gradlib import *
@@ -130,6 +131,8 @@ else:
     from .ops.sample import *
     from .ops.fused_qk_norm_mrope_cache_quant import *
     from .ops.fused_qknorm_idxrqknorm import (  # noqa: F401
+        FUSED_QKNORM_IDXRQKNORM_SUPPORTS_FP8_INDEX_Q,
+        FUSED_QKNORM_IDXRQKNORM_SUPPORTS_PACKED_SHUFFLE,
         fused_qknorm_idxrqknorm,
     )
     from .ops.fused_qk_norm_rope_cache_quant import *

@@ -37,15 +37,7 @@ from aiter.utility.mx_types import (
     MxDtypeInt as _D,
 )
 
-from .tensor_shim import GTensor, _run_compiled
-
-
-def _imin(a, b):
-    return (a < b).select(a, b)
-
-
-def _imax(a, b):
-    return (a > b).select(a, b)
+from .tensor_shim import GTensor, _run_compiled, ptr_buf_tensor
 
 
 def _idiv(a, b):
@@ -973,7 +965,7 @@ def _build_kernel_w32(
         tid = fx.thread_idx.x
         tid_y = fx.thread_idx.y  # wave within workgroup -> token selector
 
-        tok = _imin(bid_t * ROWS_PER_WG + tid_y, num_tokens - 1)
+        tok = fx.min(bid_t * ROWS_PER_WG + tid_y, num_tokens - 1)
         bid_t = tok  # all downstream token offsets use the clamped token
         bid_t_idx = fx.Int64(tok)
 
@@ -986,9 +978,8 @@ def _build_kernel_w32(
                 addr_i64, num_records_bytes=num_records_bytes
             )
 
-        pos_rsrc = _ptr_buffer_resource(positions)
-        pos_val_i64 = buffer_ops.buffer_load(pos_rsrc, bid_t, vec_width=1, dtype=T.i64)
-        pos_i32 = fx.Int32(pos_val_i64.trunci(i32))
+        pos_t = ptr_buf_tensor(positions, fx.Int64)
+        pos_i32 = fx.Int32(pos_t[bid_t])
 
         rope_lay = fx.make_layout(PAIRS_PER_THREAD, 1)
         rope_atom = fx.make_copy_atom(fx.rocdl.BufferCopy(PAIRS_PER_THREAD * 16), 16)
@@ -1024,7 +1015,7 @@ def _build_kernel_w32(
             held by this block. ``x_f32_vec`` and (optional) ``w_f32_vec`` are
             VEC-wide fp32 vectors already loaded by the caller."""
             is_rope_t = tid >= fx.Int32(ROPE_THREAD_LO)
-            rope_rel = _imax(tid - fx.Int32(ROPE_THREAD_LO), fx.Int32(0))
+            rope_rel = fx.max(tid - fx.Int32(ROPE_THREAD_LO), fx.Int32(0))
             cos_rmem = fx.make_rmem_tensor(rope_lay, elem_dtype)
             sin_rmem = fx.make_rmem_tensor(rope_lay, elem_dtype)
             fx.copy(rope_atom, fx.slice(cos_div, (None, rope_rel)), cos_rmem)
@@ -1249,9 +1240,8 @@ def _build_kernel_w32(
                 swa_row_base = None
                 do_swa = None
                 if const_expr(kv_write):
-                    bid_rsrc = _ptr_buffer_resource(batch_id_per_token)
                     bid_i32 = fx.Int32(
-                        buffer_ops.buffer_load(bid_rsrc, bid_t, vec_width=1, dtype=i32)
+                        ptr_buf_tensor(batch_id_per_token, fx.Int32)[bid_t]
                     )
                     # A stale token carries a negative position. `divsi`/`remsi`
                     # truncate toward zero, so pos=-300 with block_size=128 gives
@@ -1261,7 +1251,7 @@ def _build_kernel_w32(
                     # gate is `bid < 0 || pos < 0`; match it, in both modes.
                     pos_ok = pos_i32 >= 0
                     do_swa = (bid_i32 >= 0) & pos_ok
-                    bid_safe = _imax(bid_i32, fx.Int32(0))
+                    bid_safe = fx.max(bid_i32, fx.Int32(0))
                     pos_safe = pos_ok.select(pos_i32, fx.Int32(0))
                     if const_expr(paged):
                         blk = _idiv(pos_safe, swa_cache_size)
@@ -1598,6 +1588,18 @@ def flydsl_qk_norm_rope_quant(
         ssm_arg = q.new_empty(1, dtype=torch.int32)
         bid_arg = q.new_empty(1, dtype=torch.int32)
 
+    has_direct = False
+
+    def _ptr_arg(t):
+        return (
+            int(t.data_ptr())
+            if has_direct
+            else flyc.from_c_void_p(fx.Uint8, t.data_ptr())
+        )
+
+    def _stream_arg():
+        return stream if has_direct else Stream(stream)
+
     if is_gfx1250:
         tdm_quant = quant
         use_tdm = (
@@ -1635,32 +1637,25 @@ def flydsl_qk_norm_rope_quant(
                 stream = torch.cuda.current_stream()
             has_direct = getattr(launcher, "_direct_call_state", None) is not None
 
-            def _t_ptr(t):
-                return (
-                    int(t.data_ptr())
-                    if has_direct
-                    else flyc.from_c_void_p(fx.Uint8, t.data_ptr())
-                )
-
             q_2d = q_view.reshape(num_rows, D)
             per_wg = rows_per_tile * tiles_per_wg
             args = (
                 # q is a per-call activation: uncached, else the adaptor cache
                 # pins its allocation (see _cached_from_dlpack).
                 flyc.from_dlpack(q_2d),
-                _t_ptr(kv),
+                _ptr_arg(kv),
                 _cached_from_dlpack(cos_2d),
                 _cached_from_dlpack(sin_2d),
-                _t_ptr(positions),
-                _t_ptr(q_out.view(num_rows, D)),
-                _t_ptr(kv_out),
-                _t_ptr(q_scale_arg.view(-1)),
-                _t_ptr(kv_scale_arg.view(-1)),
+                _ptr_arg(positions),
+                _ptr_arg(q_out.view(num_rows, D)),
+                _ptr_arg(kv_out),
+                _ptr_arg(q_scale_arg.view(-1)),
+                _ptr_arg(kv_scale_arg.view(-1)),
                 _cached_from_dlpack(q_weight_arg.reshape(-1)),
                 _cached_from_dlpack(kv_weight.reshape(-1)),
-                _t_ptr(swa_kv_arg),
-                _t_ptr(ssm_arg),
-                _t_ptr(bid_arg),
+                _ptr_arg(swa_kv_arg),
+                _ptr_arg(ssm_arg),
+                _ptr_arg(bid_arg),
                 num_rows,
                 T_tok,
                 (num_rows + per_wg - 1) // per_wg,
@@ -1669,7 +1664,7 @@ def flydsl_qk_norm_rope_quant(
                 swa_pos_stride,
                 swa_num_rows,
                 swa_cache_size,
-                stream if has_direct else Stream(stream),
+                _stream_arg(),
             )
             _run_compiled(launcher, *args)
             return (
@@ -1715,25 +1710,8 @@ def flydsl_qk_norm_rope_quant(
         sin_static = _cached_from_dlpack(sin_2d)
         has_direct = getattr(launcher, "_direct_call_state", None) is not None
 
-        def _ptr_arg(t):
-            return (
-                int(t.data_ptr())
-                if has_direct
-                else flyc.from_c_void_p(fx.Uint8, t.data_ptr())
-            )
-
-        def _stream_arg():
-            return stream if has_direct else Stream(stream)
-
         wt_args = (q_weight_static, kv_weight_static, cos_static, sin_static)
     else:
-
-        def _ptr_arg(t):
-            return flyc.from_c_void_p(fx.Uint8, t.data_ptr())
-
-        def _stream_arg():
-            return Stream(stream)
-
         wt_args = (q_weight_arg, kv_weight, cos_2d, sin_2d)
 
     # HW grid Y is a 16-bit field on AMD HIP -> cap 65535 blocks/launch and
@@ -1897,14 +1875,14 @@ def _build_kernel_w32_tdm(
         cos_rsrc = buffer_ops.create_buffer_resource(cos_cache, max_size=True)
         sin_rsrc = buffer_ops.create_buffer_resource(sin_cache, max_size=True)
         is_rope = tid >= ROPE_LO
-        rope_rel = _imax(tid - ROPE_LO, fx.Int32(0))
+        rope_rel = fx.max(tid - ROPE_LO, fx.Int32(0))
 
         def _ptr_res(ptr):
             return buffer_ops.create_buffer_resource_from_addr(
                 fx.Int64(fx.ptrtoint(ptr))
             )
 
-        pos_rsrc = _ptr_res(positions)
+        pos_t = ptr_buf_tensor(positions, fx.Int64)
 
         def _concat(chunks):
             v = chunks[0]
@@ -1930,19 +1908,15 @@ def _build_kernel_w32_tdm(
             )
 
         def load_pos(tok):
-            return fx.Int32(
-                buffer_ops.buffer_load(pos_rsrc, tok, vec_width=1, dtype=T.i64).trunci(
-                    i32
-                )
-            )
+            return fx.Int32(pos_t[tok])
 
         def load_cs(tok):
             """cos/sin for this token, as PAIRS-wide f32 vectors."""
             return _cs_from_pos(load_pos(tok))
 
         def issue_pos(tok):
-            """Fire position buffer_load (returns raw i64, no wait)."""
-            return buffer_ops.buffer_load(pos_rsrc, tok, vec_width=1, dtype=T.i64)
+            """Fire the position load (returns i64, no wait)."""
+            return pos_t[tok]
 
         def _cs_from_pos(pos_i32):
             """Load cos/sin given an already-resolved position value."""
@@ -2091,7 +2065,7 @@ def _build_kernel_w32_tdm(
             )
 
             def row_of(tile_idx):
-                return _imin(tile_idx * RT + wave, nr_m1)
+                return fx.min(tile_idx * RT + wave, nr_m1)
 
             def issue(buf, tile_idx):
                 dst = fx.Tensor(
@@ -2150,9 +2124,7 @@ def _build_kernel_w32_tdm(
             cs_cache = [None, None]
             if const_expr(do_hoist):
                 pending_pos = [issue_pos(tok_of(tile_base + 0))]
-                cs_cache[0], cs_cache[1] = _cs_from_pos(
-                    fx.Int32(pending_pos[0].trunci(i32))
-                )
+                cs_cache[0], cs_cache[1] = _cs_from_pos(pending_pos[0].to(fx.Int32))
             for i in range_constexpr(CT):
                 # Tile i consumes TDM load #i (issued in tile order: K in the
                 # prologue, then one per iteration while i + K < CT). In steady
@@ -2174,13 +2146,11 @@ def _build_kernel_w32_tdm(
                     issue(bufs[i % K], tile_base + i + K)  # reuse after read
                 if const_expr(do_hoist and (i + 1) % GROUP == 0 and i + 1 < CT):
                     pending_pos[0] = issue_pos(tok_of(tile_base + i + 1))
-                    cs_cache[0], cs_cache[1] = _cs_from_pos(
-                        fx.Int32(pending_pos[0].trunci(i32))
-                    )
+                    cs_cache[0], cs_cache[1] = _cs_from_pos(pending_pos[0].to(fx.Int32))
 
         def emit_kv():
             gk = g - gx_q
-            tok = _imin(gk * RT + wave, num_tokens - 1)
+            tok = fx.min(gk * RT + wave, num_tokens - 1)
             kv_rsrc = _ptr_res(kv_in)
             xv = _concat(
                 [
@@ -2211,7 +2181,7 @@ def _build_kernel_w32_tdm(
                 )
                 pos_ok = pos_i32 >= 0
                 do_swa = (bid_i32 >= 0) & pos_ok
-                bid_safe = _imax(bid_i32, fx.Int32(0))
+                bid_safe = fx.max(bid_i32, fx.Int32(0))
                 pos_safe = pos_ok.select(pos_i32, fx.Int32(0))
                 if const_expr(paged):
                     blk = _idiv(pos_safe, swa_cache_size)

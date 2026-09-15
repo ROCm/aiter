@@ -15,7 +15,10 @@ import triton
 import triton.language as tl
 import triton.language.extra.libdevice as tldevice
 
-from ..gated_delta_rule_utils import IS_GATHER_SUPPORTED, IS_TMA_SUPPORTED
+from aiter.ops.triton._triton_kernels.gated_delta_rule.gated_delta_rule_utils import (
+    IS_GATHER_SUPPORTED,
+    IS_TMA_SUPPORTED,
+)
 
 # Use fast math operations if enabled
 if os.environ.get("FLA_USE_FAST_OPS", "0") == "1":
