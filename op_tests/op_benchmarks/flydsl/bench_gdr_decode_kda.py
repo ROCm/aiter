@@ -28,8 +28,10 @@ Usage:
     # Both, at the ticket's batch sizes
     python bench_gdr_decode_kda.py --sweep --bench
 
-The comparator lives on vLLM's kimi-k3 branch: point --vllm at a checkout. Without
-it --bench drops the Triton column rather than failing, since --sweep needs no vLLM.
+The comparator lives on vLLM's tree. ``--bench`` looks under ``--vllm``, then
+``/workspace/vllm_vllm-project``, ``/workspace/vllm``, then those names as
+siblings of this aiter checkout. Without a tree --bench drops the Triton column
+rather than failing, since --sweep needs no vLLM.
 """
 
 from __future__ import annotations
@@ -377,6 +379,31 @@ def sweep(args):
     return rows
 
 
+_COMPARATOR_REL = Path(
+    "vllm/models/kimi_k3/amd/ops/third_party/kda/fused_recurrent.py"
+)
+
+
+def _comparator_candidates(vllm_path):
+    """Places a vLLM checkout of ``fused_recurrent.py`` is expected to live."""
+    roots = []
+    if vllm_path:
+        roots.append(Path(vllm_path))
+    parent = _REPO_ROOT.parent
+    for name in ("vllm_vllm-project", "vllm"):
+        roots.append(Path("/workspace") / name)
+        roots.append(parent / name)
+    seen = set()
+    out = []
+    for root in roots:
+        target = (root / _COMPARATOR_REL).resolve()
+        if target in seen:
+            continue
+        seen.add(target)
+        out.append(target)
+    return out
+
+
 def load_triton(vllm_path):
     """Load the comparator from a vLLM checkout without importing vLLM itself.
 
@@ -392,10 +419,15 @@ def load_triton(vllm_path):
         # Otherwise vLLM binds fast_expf/fast_logf and the stub changes the math.
         raise RuntimeError("unset FLA_USE_FAST_OPS to compare like for like")
 
-    path = Path(vllm_path or "/workspace/vllm")
-    target = path / "vllm/models/kimi_k3/amd/ops/third_party/kda/fused_recurrent.py"
-    if not target.exists():
-        print(f"note: comparator not found at {target}; skipping the Triton column")
+    tried = _comparator_candidates(vllm_path)
+    target = next((p for p in tried if p.is_file()), None)
+    if target is None:
+        print("note: comparator not found; skipping the Triton column")
+        for p in tried:
+            print(f"  looked at {p}")
+        print(
+            "  clone: git clone https://github.com/vllm-project/vllm.git vllm_vllm-project"
+        )
         return None
 
     import triton as _triton
@@ -427,6 +459,7 @@ def load_triton(vllm_path):
     except Exception as exc:  # noqa: BLE001 - degrade to the FlyDSL column alone
         print(f"note: vLLM comparator unavailable ({type(exc).__name__}: {exc})")
         return None
+    print(f"comparator: {target}")
     return mod.fused_recurrent_kda_packed_decode
 
 
@@ -655,7 +688,10 @@ def main():
     p.add_argument("--sweep", action="store_true", help="tune for the 1:1 head ratio")
     p.add_argument("--bench", action="store_true", help="A/B against Triton")
     p.add_argument("-o", "--output", help="write the winning CSV rows here")
-    p.add_argument("--vllm", help="path to a vLLM kimi-k3 checkout")
+    p.add_argument(
+        "--vllm",
+        help="path to a vLLM checkout (default: vllm_vllm-project/, then vllm/)",
+    )
     args = p.parse_args()
     if not args.sweep and not args.bench:
         args.sweep = args.bench = True
