@@ -763,7 +763,7 @@ class _SymmMemBufferProxy:
 
 
 class CustomAllreduce:
-    _SUPPORTED_WORLD_SIZES: ClassVar[list[Any]] = [2, 4, 6, 8]
+    _SUPPORTED_WORLD_SIZES: ClassVar[list[Any]] = [2, 4, 8, 16, 32]
 
     def _select_ops(self):
         """Select the ops backend.
@@ -882,10 +882,10 @@ class CustomAllreduce:
 
         props = torch.cuda.get_device_properties(device)
         gcn_arch = getattr(props, "gcnArchName", "")
-        if "gfx1250" in gcn_arch and world_size > 8:
+        if "gfx1250" in gcn_arch and world_size > 32:
             raise RuntimeError(
                 f"gfx1250 (MI450) custom allreduce only supports "
-                f"world_size <= 8, got world_size={world_size}. "
+                f"world_size <= 32, got world_size={world_size}. "
                 f"RCCL fallback is also not available on this platform."
             )
 
@@ -1309,6 +1309,8 @@ class CustomAllreduce:
         return False
 
     def should_custom_ar(self, inp: torch.Tensor, prefill_support: bool = False):
+        if self.world_size > 8:
+            return False
         return self._fits_custom_ar_size(inp, prefill_support) and is_weak_contiguous(
             inp
         )
