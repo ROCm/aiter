@@ -139,8 +139,7 @@ jobs:
     if: >-
       github.event.pull_request.head.repo.fork == false &&
       github.event.pull_request.head.repo.full_name == github.repository &&
-      github.event.action == 'labeled' &&
-      github.event.label.name == 'ci:extended-test'
+      contains(github.event.pull_request.labels.*.name, 'ci:extended-test')
     runs-on: linux-aiter-build-mi250
 
     steps:
