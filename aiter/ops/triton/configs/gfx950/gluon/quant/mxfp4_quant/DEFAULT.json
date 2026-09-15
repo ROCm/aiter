@@ -1,0 +1,23 @@
+{
+    "default": {
+        "NUM_ITER": 2,
+        "BLOCK_SIZE_M": 64,
+        "BLOCK_SIZE_N": 64,
+        "NUM_WARPS": 4,
+        "NUM_STAGES": 2
+    },
+    "N_LEQ_16384": {
+        "BLOCK_SIZE_M": 32,
+        "BLOCK_SIZE_N": 256
+    },
+    "M_LEQ_32": {
+        "NUM_ITER": 1,
+        "NUM_WARPS": 4,
+        "NUM_STAGES": 1
+    },
+    "N_LEQ_1024": {
+        "NUM_ITER": 1,
+        "NUM_WARPS": 4,
+        "NUM_STAGES": 1
+    }
+}
