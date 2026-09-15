@@ -70,6 +70,7 @@ def compile_pa_decode_ps_reduce(
     logits_dtype_str: str,
     sink_dtype_str: str,
     use_sinks: bool,
+    use_work_plan: bool = False,
 ):
     """Build the partitioned-softmax reduction used by ``pa_decode``.
 
@@ -152,6 +153,7 @@ def compile_pa_decode_ps_reduce(
         stride_logits_part: fx.Int32,
         stride_logits_group: fx.Int32,
         query_group_size: fx.Int32,
+        reduce_info_ptr: fx.Pointer,
     ):
         tid = fx.thread_idx.x
         worker = fx.thread_idx.y
@@ -174,6 +176,15 @@ def compile_pa_decode_ps_reduce(
         c_warp_size = fx.Int32(warp_size)
         c_wave_mask = fx.Int32(warp_size - 1)
         c_part_num = fx.Int32(max_context_partition_num)
+        if fx.const_expr(use_work_plan):
+            reduce_info = fx.recast_iter(fx.Int32, reduce_info_ptr)
+            first_part = fx.Int32(reduce_info[batch_idx * 2])
+            c_part_num = fx.Int32(reduce_info[batch_idx * 2 + 1])
+            stats_seq_offset = first_part * stride_exp_sums_part
+            logits_seq_offset = first_part * stride_logits_part
+        else:
+            stats_seq_offset = batch_idx * stride_exp_sums_seq
+            logits_seq_offset = batch_idx * stride_logits_seq
         c_reduce_width = fx.Int32(reduce_width)
         c_four = fx.Int32(4)
         c_qgs = query_group_size
@@ -219,9 +230,9 @@ def compile_pa_decode_ps_reduce(
                     chunk_base = chunk_idx * warp_size
                     chunk_size = min(warp_size, max_context_partition_num - chunk_base)
                     part_idx = lane + fx.Int32(chunk_base)
-                    if fx.const_expr(chunk_size == warp_size):
+                    if fx.const_expr(chunk_size == warp_size and not use_work_plan):
                         stats_offset = (
-                            batch_idx * stride_exp_sums_seq
+                            stats_seq_offset
                             + kv_head_idx * stride_exp_sums_head
                             + part_idx * stride_exp_sums_part
                             + eqgs_idx
@@ -229,9 +240,11 @@ def compile_pa_decode_ps_reduce(
                         part_sum = fx.Float32(exp_sums[stats_offset])
                         part_max = fx.Float32(max_logits[stats_offset])
                     else:
-                        lane_in_range = lane < fx.Int32(chunk_size)
+                        lane_in_range = (lane < fx.Int32(chunk_size)) & (
+                            part_idx < c_part_num
+                        )
                         stats_offset = (
-                            batch_idx * stride_exp_sums_seq
+                            stats_seq_offset
                             + kv_head_idx * stride_exp_sums_head
                             + part_idx * stride_exp_sums_part
                             + eqgs_idx
@@ -302,7 +315,7 @@ def compile_pa_decode_ps_reduce(
                 if part_in_range:
                     weight = fx.Float32(lds_weights[part_idx])
                     logits_offset = (
-                        batch_idx * stride_logits_seq
+                        logits_seq_offset
                         + kv_head_idx * stride_logits_head
                         + part_idx * stride_logits_part
                         + eqgs_idx * stride_logits_group
@@ -331,7 +344,9 @@ def compile_pa_decode_ps_reduce(
             # subgroup. Keep that original path unchanged; only partial
             # subgroups need an EXEC-masked load to avoid carrying a predicate
             # across the shuffle sequence.
-            if fx.const_expr(max_context_partition_num == reduce_width):
+            if fx.const_expr(
+                max_context_partition_num == reduce_width and not use_work_plan
+            ):
                 lane_in_range = lane < c_part_num
                 lane_in_reduce = lane < c_reduce_width
                 part_sum = zero_f
@@ -339,7 +354,7 @@ def compile_pa_decode_ps_reduce(
                 if lane_in_reduce:
                     part_idx = lane_in_range.select(lane, zero_i)
                     stats_offset = (
-                        batch_idx * stride_exp_sums_seq
+                        stats_seq_offset
                         + kv_head_idx * stride_exp_sums_head
                         + part_idx * stride_exp_sums_part
                         + eqgs_idx
@@ -351,7 +366,7 @@ def compile_pa_decode_ps_reduce(
             else:
                 lane_in_range = lane < c_part_num
                 stats_offset = (
-                    batch_idx * stride_exp_sums_seq
+                    stats_seq_offset
                     + kv_head_idx * stride_exp_sums_head
                     + lane * stride_exp_sums_part
                     + eqgs_idx
@@ -398,13 +413,18 @@ def compile_pa_decode_ps_reduce(
                 )
                 weight = weight_i32.bitcast(fx.Float32)
                 logits_offset = (
-                    batch_idx * stride_logits_seq
+                    logits_seq_offset
                     + kv_head_idx * stride_logits_head
                     + c_part_idx * stride_logits_part
                     + eqgs_idx * stride_logits_group
                     + tid
                 )
-                part_logits = fx.Float32(logits[logits_offset])
+                part_logits = zero_f
+                if fx.const_expr(use_work_plan):
+                    if c_part_idx < c_part_num:
+                        part_logits = fx.Float32(logits[logits_offset])
+                else:
+                    part_logits = fx.Float32(logits[logits_offset])
                 acc = acc + part_logits * weight
         else:
             # A wave covers several 64-partition chunks. Lane ``l`` owns
@@ -422,9 +442,9 @@ def compile_pa_decode_ps_reduce(
                 chunk_base = chunk_idx * warp_size
                 chunk_size = min(warp_size, max_context_partition_num - chunk_base)
                 part_idx = lane + fx.Int32(chunk_base)
-                if fx.const_expr(chunk_size == warp_size):
+                if fx.const_expr(chunk_size == warp_size and not use_work_plan):
                     stats_offset = (
-                        batch_idx * stride_exp_sums_seq
+                        stats_seq_offset
                         + kv_head_idx * stride_exp_sums_head
                         + part_idx * stride_exp_sums_part
                         + eqgs_idx
@@ -432,9 +452,11 @@ def compile_pa_decode_ps_reduce(
                     part_sum = fx.Float32(exp_sums[stats_offset])
                     part_max = fx.Float32(max_logits[stats_offset])
                 else:
-                    lane_in_range = lane < fx.Int32(chunk_size)
+                    lane_in_range = (lane < fx.Int32(chunk_size)) & (
+                        part_idx < c_part_num
+                    )
                     stats_offset = (
-                        batch_idx * stride_exp_sums_seq
+                        stats_seq_offset
                         + kv_head_idx * stride_exp_sums_head
                         + part_idx * stride_exp_sums_part
                         + eqgs_idx
@@ -499,13 +521,18 @@ def compile_pa_decode_ps_reduce(
                     )
                     weight = weight_i32.bitcast(fx.Float32)
                     logits_offset = (
-                        batch_idx * stride_logits_seq
+                        logits_seq_offset
                         + kv_head_idx * stride_logits_head
                         + c_part_idx * stride_logits_part
                         + eqgs_idx * stride_logits_group
                         + tid
                     )
-                    part_logits = fx.Float32(logits[logits_offset])
+                    part_logits = zero_f
+                    if fx.const_expr(use_work_plan):
+                        if c_part_idx < c_part_num:
+                            part_logits = fx.Float32(logits[logits_offset])
+                    else:
+                        part_logits = fx.Float32(logits[logits_offset])
                     acc = acc + part_logits * weight
 
         query_idx = eqgs_idx // c_qgs
@@ -551,6 +578,7 @@ def compile_pa_decode_ps_reduce(
         query_group_size: fx.Int32,
         batch_size: fx.Int32,
         num_kv_heads: fx.Int32,
+        reduce_info: fx.Pointer,
         stream: fx.Stream,
     ):
         pa_decode_ps_reduce_kernel(
@@ -571,6 +599,7 @@ def compile_pa_decode_ps_reduce(
             stride_logits_part,
             stride_logits_group,
             query_group_size,
+            reduce_info,
         ).launch(
             grid=(batch_size, num_kv_heads, query_seq_len * query_group_size),
             block=tuple(block_shape),

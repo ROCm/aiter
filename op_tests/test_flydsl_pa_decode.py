@@ -12,6 +12,9 @@ For example, BS200/MTP4 with FP8 per-token KV scales and explicit split counts::
 Contexts have equal lengths and include the MTP query tokens. Query position
 ``p`` attends to ``max(0, context_length - query_length + 1 + p)`` KV tokens.
 Timing includes the FlyDSL attention kernel and its native FlyDSL reduction.
+Automatic splits use the host-known context length and GPU occupancy, up to
+256 partitions. Use ``--max-partitions 8`` for the legacy clamp, or
+``--num-partitions`` to bypass the recommendation with exact counts.
 """
 
 import argparse
@@ -195,7 +198,7 @@ def run_pa_decode_tile_case(
     block_size,
     dtype,
     trans_v,
-    max_partitions=8,
+    max_partitions=None,
     per_token=False,
     query_length=1,
     num_partitions=None,
@@ -221,6 +224,7 @@ def run_pa_decode_tile_case(
             num_kv_heads,
             split_kv_blocks=KV_COMPUTE_BLOCK // block_size,
             max_partitions=max_partitions,
+            max_context_length=context_length,
         )
 
     torch.manual_seed(0)
@@ -578,13 +582,14 @@ def test_pa_decode(case, monkeypatch):
     monkeypatch.setitem(globals(), "run_perftest", run_once)
 
     explicit_partitions = case["num_partitions"]
-    max_partitions = case.get("max_partitions", 8)
+    max_partitions = case.get("max_partitions")
     if explicit_partitions is None:
         expected_partitions = get_recommended_splits(
             case["batch_size"],
             case["num_kv_heads"],
             split_kv_blocks=KV_COMPUTE_BLOCK // case["block_size"],
             max_partitions=max_partitions,
+            max_context_length=case["context_length"],
         )
     else:
         expected_partitions = explicit_partitions
@@ -674,9 +679,10 @@ def _parse_args(argv=None):
     parser.add_argument(
         "--max-partitions",
         type=int,
-        default=8,
+        default=None,
         help="""Upper clamp passed to get_recommended_splits (4..256).
-        Only used when --num-partitions is omitted.""",
+        By default, use context length and GPU occupancy, up to 256 partitions.
+        Set 8 to retain the legacy clamp. Only used without --num-partitions.""",
     )
     parser.add_argument(
         "--num-partitions",
@@ -695,7 +701,10 @@ def _parse_args(argv=None):
         help="""KV scale layout: 0 for per-tensor, 1 for per-token.""",
     )
     args = parser.parse_args(argv)
-    if not 4 <= args.max_partitions <= MAX_CONTEXT_PARTITIONS:
+    if (
+        args.max_partitions is not None
+        and not 4 <= args.max_partitions <= MAX_CONTEXT_PARTITIONS
+    ):
         parser.error(f"--max-partitions must be in [4, {MAX_CONTEXT_PARTITIONS}]")
     if any(
         count is not None and count > MAX_CONTEXT_PARTITIONS
