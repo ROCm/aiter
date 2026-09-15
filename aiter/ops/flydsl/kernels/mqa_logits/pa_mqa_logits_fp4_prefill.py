@@ -364,44 +364,55 @@ def build_pa_mqa_logits_fp4_prefill_module(
     num_warps=DEFAULT_NUM_WARPS,
     heads=DEFAULT_HEADS,
     head_dim=DEFAULT_HEAD_DIM,
+    kv_page_stride: int | None = None,
+    kv_scale_page_stride: int | None = None,
+    block_table_stride: int | None = None,
 ):
     """Build the ragged-prefill FP4 MQA logits kernel."""
     block_threads_k = num_warps * WARP_SIZE
     m_tiles = heads // MFMA_M
     k_tiles = head_dim // 128  # outer K-loop iters (MFMA K=128)
-    assert (
-        head_dim % 128 == 0
-    ), f"head_dim must be a multiple of 128 (MFMA K), got {head_dim}"
+    assert head_dim % 128 == 0, (
+        f"head_dim must be a multiple of 128 (MFMA K), got {head_dim}"
+    )
     assert heads % MFMA_M == 0, f"heads must be a multiple of {MFMA_M}, got {heads}"
 
     N_TILES = block_k // MFMA_N
-    assert (
-        N_TILES % num_warps == 0
-    ), f"block_k={block_k} -> N_TILES={N_TILES} must be multiple of num_warps={num_warps}"
+    assert N_TILES % num_warps == 0, (
+        f"block_k={block_k} -> N_TILES={N_TILES} must be multiple of num_warps={num_warps}"
+    )
     N_TILES_PER_WARP = N_TILES // num_warps
 
-    assert (
-        kv_block_size % MFMA_N == 0
-    ), f"kv_block_size={kv_block_size} must be a multiple of MFMA_N={MFMA_N}"
-    assert (
-        block_k % kv_block_size == 0
-    ), f"block_k={block_k} must be a multiple of kv_block_size={kv_block_size}"
+    assert kv_block_size % MFMA_N == 0, (
+        f"kv_block_size={kv_block_size} must be a multiple of MFMA_N={MFMA_N}"
+    )
+    assert block_k % kv_block_size == 0, (
+        f"block_k={block_k} must be a multiple of kv_block_size={kv_block_size}"
+    )
     TILES_PER_BLOCK = kv_block_size // MFMA_N
     N_PHYS = (N_TILES_PER_WARP + TILES_PER_BLOCK - 1) // TILES_PER_BLOCK
 
     # block_tables row stride (i32 elements).
-    _stride_bt = max_blocks_per_seq
+    _stride_bt = (
+        max_blocks_per_seq if block_table_stride is None else block_table_stride
+    )
 
     # KV preshuffle layout: [block_id, K_TILES, K_chunk=4, kv_block_size, 16] uint8.
     _kv_chunk_bytes = 16
     _stride_kv_ktile = 4 * kv_block_size * _kv_chunk_bytes
-    _stride_kv_block = k_tiles * _stride_kv_ktile
+    _stride_kv_block = (
+        k_tiles * _stride_kv_ktile if kv_page_stride is None else kv_page_stride
+    )
     # byte stride between consecutive nt tiles inside one kv block (one MFMA_N
     # row of tokens); used as the per-nt constant `soffset` immediate delta.
     _stride_kv_ntile = MFMA_N * _kv_chunk_bytes
     # KV_scale: [block_id, K_TILES, K_chunks=4, kv_block_size]
     _stride_kvs_ktile = 4 * kv_block_size
-    _stride_kvs_block = k_tiles * _stride_kvs_ktile
+    _stride_kvs_block = (
+        k_tiles * _stride_kvs_ktile
+        if kv_scale_page_stride is None
+        else kv_scale_page_stride
+    )
 
     _kb_is_pow2 = kv_block_size & (kv_block_size - 1) == 0
     _kb_log2 = kv_block_size.bit_length() - 1
@@ -483,8 +494,6 @@ def build_pa_mqa_logits_fp4_prefill_module(
         local_start = _uniform(cta_info_bt[(fx.Int32(1), fx.Int32(0))])
         local_end = _uniform(cta_info_bt[(fx.Int32(1), fx.Int32(1))])
 
-        kv_bt = _i32_buffer(kv_cache_ptr, width=4)
-        kvs_bt = _i32_buffer(kv_scale_ptr, width=1)
         bt_bt = _i32_buffer(kv_indices_ptr, width=1)
 
         ZERO_F = fx.Float32(0.0)
@@ -613,7 +622,10 @@ def build_pa_mqa_logits_fp4_prefill_module(
                 + lane_mod_16
             )
             bi_base = _floordiv_kb(token_local_base)
-            phys_vec = bt_bt[batch_id * _stride_bt + bi_base]
+            valid = (token_local_base < local_end) & (bi_base < max_blocks_per_seq)
+            safe_bi = valid.select(bi_base, fx.Int32(0))
+            phys_vec = bt_bt[batch_id * _stride_bt + safe_bi]
+            phys_vec = valid.select(phys_vec, fx.Int32(0))
             return _phys_to_list(phys_vec)
 
         def _prefetch_chunk(c_i32_arg, phys_list):
@@ -623,10 +635,19 @@ def build_pa_mqa_logits_fp4_prefill_module(
             kv_list = []
             kvs_packed_list = []
 
-            phys_shared = phys_list[0]
+            # BLHNC cache pages can be separated by all layers' storage. Rebase
+            # the descriptor in i64, leaving only within-page buffer offsets.
+            phys_shared = fx.Int64(_uniform(fx.Int32(phys_list[0])))
+            kv_bt = _i32_buffer(
+                kv_cache_ptr, width=4,
+                byte_offset=phys_shared * fx.Int64(_stride_kv_block),
+            )
+            kvs_bt = _i32_buffer(
+                kv_scale_ptr, width=1,
+                byte_offset=phys_shared * fx.Int64(_stride_kvs_block),
+            )
             kvs_base_off_elems = (
-                phys_shared * _stride_kvs_block
-                + lane_div_16 * kv_block_size
+                lane_div_16 * kv_block_size
                 + lane_mod_16 * fx.Int32(N_TILES_PER_WARP)
             ) >> fx.Int32(2)
             for k_tile in range_constexpr(k_tiles):
@@ -643,8 +664,7 @@ def build_pa_mqa_logits_fp4_prefill_module(
             )
             token_in_block0 = _mod_kb(token_local0)
             kv_base_off_elems = (
-                phys_shared * _stride_kv_block
-                + lane_div_16 * kv_block_size * _kv_chunk_bytes
+                lane_div_16 * kv_block_size * _kv_chunk_bytes
                 + token_in_block0 * _kv_chunk_bytes
             ) >> fx.Int32(2)
             for nt in range_constexpr(N_TILES_PER_WARP):
@@ -722,9 +742,9 @@ def build_pa_mqa_logits_fp4_prefill_module(
             )
 
         def _compute_chunk(kv_list_in, kvs_packed_list_in, c_i32_arg, nt0_accs_in=None):
-            assert (
-                N_TILES_PER_WARP == 4
-            ), "pipelined-nt structure currently hardcoded for NTPW=4"
+            assert N_TILES_PER_WARP == 4, (
+                "pipelined-nt structure currently hardcoded for NTPW=4"
+            )
 
             accs_nt0 = (
                 _issue_nt_mfmas(kv_list_in, kvs_packed_list_in, 0)
@@ -835,6 +855,9 @@ def compile_pa_mqa_logits_fp4_prefill(
     num_warps: int = DEFAULT_NUM_WARPS,
     heads: int = DEFAULT_HEADS,
     head_dim: int = DEFAULT_HEAD_DIM,
+    kv_page_stride: int | None = None,
+    kv_scale_page_stride: int | None = None,
+    block_table_stride: int | None = None,
 ):
     kfn, block_threads = build_pa_mqa_logits_fp4_prefill_module(
         block_k=block_k,
@@ -843,6 +866,9 @@ def compile_pa_mqa_logits_fp4_prefill(
         num_warps=num_warps,
         heads=heads,
         head_dim=head_dim,
+        kv_page_stride=kv_page_stride,
+        kv_scale_page_stride=kv_scale_page_stride,
+        block_table_stride=block_table_stride,
     )
 
     @flyc.jit
@@ -894,6 +920,10 @@ def flydsl_pa_mqa_logits_fp4_prefill(
     total_tokens, heads, head_dim_packed = q_fp4.shape
     head_dim = head_dim_packed * 2
     max_blocks_per_seq = block_tables.shape[1]
+    if kv_block_size != 64 or block_k != 256:
+        raise ValueError(
+            "FP4 packed-scale kernels require kv_block_size=64, block_k=256"
+        )
 
     if (cta_info is None) != (n_ctas is None):
         raise ValueError("Pass both cta_info and n_ctas, or neither.")
@@ -925,6 +955,9 @@ def flydsl_pa_mqa_logits_fp4_prefill(
         num_warps=num_warps,
         heads=heads,
         head_dim=head_dim,
+        kv_page_stride=kv_cache.stride(0),
+        kv_scale_page_stride=kv_scale.stride(0),
+        block_table_stride=block_tables.stride(0),
     )
 
     if stream is None:
