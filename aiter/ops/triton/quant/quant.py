@@ -7,6 +7,7 @@ import triton
 
 from aiter.ops.triton._triton_kernels.quant.quant import (
     _dynamic_mxfp4_quant_kernel,
+    _dynamic_mxfp4_quant_sr_kernel,
     _dynamic_mxfp8_quant_kernel,
     _dynamic_mxfp8_quant_n32k4_mbn_kernel,
     _dynamic_nvfp4_quant_kernel,
@@ -18,6 +19,7 @@ from aiter.ops.triton._triton_kernels.quant.quant import (
     _nvfp4_quant_op,
     _static_per_tensor_quant_fp8_i8_kernel,
 )
+from aiter.ops.triton.utils._triton import arch_info
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 from aiter.ops.triton.utils.types import e4m3_dtype
 
@@ -150,27 +152,86 @@ def dynamic_per_token_quant_fp8_i8(
 
 
 def dynamic_mxfp4_quant(
-    x: torch.Tensor, scaling_mode: str = "even"
+    x: torch.Tensor,
+    scaling_mode: str = "even",
+    *,
+    use_sr: bool = False,
+    philox_seed: int | None = None,
+    philox_offset: int = 0,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """
-    Quantize a tensor to MX FP4 format.
+    """Quantize a two-dimensional tensor to row-wise MXFP4.
 
     Args:
-        x: The input tensor, typically fp16 or bf16.
+        x: The input tensor, typically fp16, bf16, or fp32. Stochastic
+            rounding currently supports bf16 and fp32.
         scaling_mode: The method to calculate MX block scaling.
             - "even" (default): `even_round` in `quark.torch.quantization.utils`.
-            - etc.
+        use_sr: Use gfx950 native stochastic rounding for the E2M1 payload.
+            The E8M0 scale remains deterministic round-to-nearest-even.
+        philox_seed: Non-negative Philox seed. Required when ``use_sr=True``.
+        philox_offset: Non-negative starting Philox counter. Callers must use
+            disjoint counter ranges across launches that require independent
+            rounding noise. One counter supplies four packed E2M1 pairs.
+
     Returns:
-        A tuple of (x_fp4, blockscale_e8m0).
+        A tuple ``(x_fp4, blockscale_e8m0)``. The payload has shape
+        ``(M, N // 2)`` and dtype uint8. The raw E8M0 scale has shape
+        ``(M, ceil(N / 32))`` and dtype uint8.
+
+    Raises:
+        TypeError: If stochastic rounding receives an unsupported dtype or
+            non-integer Philox argument.
+        ValueError: If stochastic-rounding arguments or shape are invalid.
+        RuntimeError: If stochastic rounding is requested outside gfx950.
     """
-    _LOGGER.info(f"DYNAMIC_MXFP4_QUANT: x={tuple(x.shape)}")
+    _LOGGER.info(f"DYNAMIC_MXFP4_QUANT: x={tuple(x.shape)} use_sr={use_sr}")
+    if use_sr and x.dim() != 2:
+        raise ValueError(f"use_sr=True requires a 2-D tensor, got {x.dim()} dimensions")
     # Assume x is 2D-Tensor for now
     M, N = x.shape
 
-    assert (N // 2) % 2 == 0
-
     # This is fixed by spec for MXFP4. Do not tune this.
     MXFP4_QUANT_BLOCK_SIZE = 32
+
+    if use_sr:
+        if scaling_mode != "even":
+            raise ValueError(
+                "use_sr=True requires scaling_mode='even', " f"got {scaling_mode!r}"
+            )
+        if x.device.type != "cuda":
+            raise ValueError(f"use_sr=True requires a CUDA tensor, got {x.device}")
+        if x.dtype not in (torch.bfloat16, torch.float32):
+            raise TypeError(
+                "use_sr=True requires bfloat16 or float32 input, " f"got {x.dtype}"
+            )
+        if M <= 0 or N <= 0:
+            raise ValueError(
+                f"use_sr=True requires non-empty input, got {tuple(x.shape)}"
+            )
+        if N % MXFP4_QUANT_BLOCK_SIZE != 0:
+            raise ValueError(
+                "use_sr=True requires x.shape[1] to be divisible by "
+                f"{MXFP4_QUANT_BLOCK_SIZE}, got {N}"
+            )
+        if arch_info.get_arch() != "gfx950":
+            raise RuntimeError("MXFP4 stochastic rounding requires gfx950")
+        if philox_seed is None:
+            raise ValueError("philox_seed is required when use_sr=True")
+        if not isinstance(philox_seed, int) or not isinstance(philox_offset, int):
+            raise TypeError("philox_seed and philox_offset must be integers")
+        max_counter = (1 << 63) - 1
+        counters_used = M * N // 8
+        if not 0 <= philox_seed <= max_counter:
+            raise ValueError("philox_seed must be in [0, 2**63 - 1]")
+        if not 0 <= philox_offset <= max_counter - counters_used + 1:
+            raise ValueError(
+                "philox_offset must be non-negative and leave room for all counters"
+            )
+    elif philox_seed is not None or philox_offset != 0:
+        raise ValueError("Philox arguments are only valid when use_sr=True")
+    else:
+        assert (N // 2) % 2 == 0
+
     x_fp4 = torch.empty((M, N // 2), dtype=torch.uint8, device=x.device)
     blockscale_e8m0 = torch.empty(
         ((N + MXFP4_QUANT_BLOCK_SIZE - 1) // MXFP4_QUANT_BLOCK_SIZE, M),
@@ -211,25 +272,47 @@ def dynamic_mxfp4_quant(
         triton.cdiv(N, BLOCK_SIZE_N * NUM_ITER),
     )
 
-    _dynamic_mxfp4_quant_kernel[grid](
-        x,
-        x_fp4,
-        blockscale_e8m0,
-        *x.stride(),
-        *x_fp4.stride(),
-        *blockscale_e8m0.stride(),
-        M=M,
-        N=N,
-        MXFP4_QUANT_BLOCK_SIZE=MXFP4_QUANT_BLOCK_SIZE,
-        SCALING_MODE=0,
-        NUM_ITER=NUM_ITER,
-        BLOCK_SIZE_M=BLOCK_SIZE_M,
-        BLOCK_SIZE_N=BLOCK_SIZE_N,
-        NUM_STAGES=NUM_STAGES,
-        num_warps=NUM_WARPS,
-        waves_per_eu=0,
-        num_stages=1,
-    )
+    if use_sr:
+        _dynamic_mxfp4_quant_sr_kernel[grid](
+            x,
+            x_fp4,
+            blockscale_e8m0,
+            *x.stride(),
+            *x_fp4.stride(),
+            *blockscale_e8m0.stride(),
+            M,
+            N,
+            philox_seed,
+            philox_offset,
+            MXFP4_QUANT_BLOCK_SIZE=MXFP4_QUANT_BLOCK_SIZE,
+            NUM_ITER=NUM_ITER,
+            BLOCK_SIZE_M=BLOCK_SIZE_M,
+            BLOCK_SIZE_N=BLOCK_SIZE_N,
+            NUM_STAGES=NUM_STAGES,
+            num_warps=NUM_WARPS,
+            waves_per_eu=0,
+            num_stages=1,
+        )
+    else:
+        _dynamic_mxfp4_quant_kernel[grid](
+            x,
+            x_fp4,
+            blockscale_e8m0,
+            *x.stride(),
+            *x_fp4.stride(),
+            *blockscale_e8m0.stride(),
+            M=M,
+            N=N,
+            MXFP4_QUANT_BLOCK_SIZE=MXFP4_QUANT_BLOCK_SIZE,
+            SCALING_MODE=0,
+            NUM_ITER=NUM_ITER,
+            BLOCK_SIZE_M=BLOCK_SIZE_M,
+            BLOCK_SIZE_N=BLOCK_SIZE_N,
+            NUM_STAGES=NUM_STAGES,
+            num_warps=NUM_WARPS,
+            waves_per_eu=0,
+            num_stages=1,
+        )
 
     return (x_fp4, blockscale_e8m0)
 
