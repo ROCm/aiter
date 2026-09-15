@@ -376,6 +376,11 @@ def get_topk_scratch_workspace(device: torch.device, size: int) -> torch.Tensor:
     return torch.empty(max(1, int(size)), dtype=torch.uint8, device=device)
 
 
+_FLYDSL_TOPK_PREFILL_DISABLED = os.environ.get(
+    "AITER_DISABLE_FLYDSL_TOPK_PREFILL", "0"
+) in ("1", "true", "True", "yes", "YES")
+
+
 def top_k_per_row_prefill(
     logits: torch.Tensor,
     rowStarts: torch.Tensor,
@@ -397,8 +402,41 @@ def top_k_per_row_prefill(
     When stable=True, the one-block path is forced with deterministic,
     ascending-index ordered, smallest-index tie-breaking emit so every
     tensor-parallel rank selects and orders an identical KV set; the caller sizes
-    the workspace for the ob path in that case."""
-    if not stable and topk_use_mulblocks(numRows, stride0):
+    the workspace for the ob path in that case.
+    """
+    use_mulblocks = not stable and topk_use_mulblocks(numRows, stride0)
+    # FlyDSL one-block outperforms HIP one-block on the remaining prefill cases.
+    if not use_mulblocks and not _FLYDSL_TOPK_PREFILL_DISABLED:
+        from .flydsl.topk_per_row import (
+            _is_flydsl_radix_topk_one_block_supported,
+        )
+
+        if _is_flydsl_radix_topk_one_block_supported(
+            logits,
+            rowStarts,
+            rowEnds,
+            indices,
+            values,
+            numRows,
+            stride0,
+            stride1,
+            k,
+            stable,
+        ):
+            return flydsl_radix_topk_one_block_prefill(
+                logits,
+                rowStarts,
+                rowEnds,
+                indices,
+                values,
+                numRows,
+                stride0,
+                stride1,
+                k,
+                stable,
+            )
+
+    if use_mulblocks:
         size = topk_mb_workspace_size(numRows, stride0, k, False)
         workspace = get_topk_mb_workspace(logits.device, size)
     else:
@@ -620,6 +658,39 @@ def top_k_per_row_decode(
             values,
         )
 
+    # FlyDSL one-block outperforms HIP one-block on the remaining decode cases.
+    if not _FLYDSL_TOPK_DECODE_DISABLED:
+        from .flydsl.topk_per_row import (
+            _is_flydsl_radix_topk_one_block_supported,
+        )
+
+        if _is_flydsl_radix_topk_one_block_supported(
+            logits,
+            None,
+            seqLens,
+            indices,
+            values,
+            numRows,
+            stride0,
+            stride1,
+            k,
+            stable,
+            is_decode=True,
+            next_n=next_n,
+        ):
+            return flydsl_radix_topk_one_block_decode(
+                logits,
+                next_n,
+                seqLens,
+                indices,
+                numRows,
+                stride0,
+                stride1,
+                k,
+                stable,
+                values,
+            )
+
     if values is not None:
         # The C++ side takes values.data_ptr() as a raw float* and writes k
         # entries per row through it, with no metadata of its own. A wrong
@@ -687,6 +758,68 @@ def flydsl_dcp_topk_merge(
         world_size,
         topk_tokens,
         page_size,
+    )
+
+
+def flydsl_radix_topk_one_block_prefill(
+    logits: torch.Tensor,
+    row_starts: torch.Tensor,
+    row_ends: torch.Tensor,
+    indices: torch.Tensor,
+    values: torch.Tensor | None,
+    num_rows: int,
+    stride0: int,
+    stride1: int,
+    k: int = 2048,
+    stable: bool = False,
+) -> None:
+    """Prefill wrapper with the same argument order as HIP top_k_per_row_prefill."""
+    from .flydsl.topk_per_row import flydsl_radix_topk_one_block
+
+    return flydsl_radix_topk_one_block(
+        logits,
+        row_starts,
+        row_ends,
+        indices,
+        values,
+        num_rows,
+        stride0,
+        stride1,
+        k,
+        stable,
+        is_decode=False,
+        next_n=1,
+    )
+
+
+def flydsl_radix_topk_one_block_decode(
+    logits: torch.Tensor,
+    next_n: int,
+    seq_lens: torch.Tensor,
+    indices: torch.Tensor,
+    num_rows: int,
+    stride0: int,
+    stride1: int,
+    k: int = 2048,
+    stable: bool = False,
+    values: torch.Tensor | None = None,
+) -> None:
+    """Decode wrapper with the same argument order as HIP top_k_per_row_decode."""
+    from .flydsl.topk_per_row import flydsl_radix_topk_one_block
+
+    return flydsl_radix_topk_one_block(
+        logits,
+        seq_lens,
+        seq_lens,
+        indices,
+        values,
+        num_rows,
+        stride0,
+        stride1,
+        k,
+        stable,
+        is_decode=True,
+        next_n=next_n,
     )
 
 

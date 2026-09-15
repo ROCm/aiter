@@ -7,7 +7,14 @@ from functools import lru_cache
 
 import torch
 
+from aiter.jit.utils.chip_info import get_gfx
+
 from .kernels.kernels_common import get_warp_size
+from .kernels.radix_topk_one_block import (
+    _COMPACT_CAPACITY,
+    _MAX_ROW_ELEMENTS,
+    build_radix_topk_one_block_module,
+)
 from .kernels.tensor_shim import _run_compiled
 from .kernels.topk_per_row_decode import (
     build_topk_per_row_decode_module,
@@ -20,6 +27,10 @@ from .kernels.topk_per_row_decode_persistent import (
 
 # Measured crossover between the one-workgroup and multi-kernel paths.
 _ONE_WORKGROUP_MAX_ROW_WIDTH = 20_000
+_SHORT_ROWS_1024_THREAD_MAX_ROWS = 256
+# gfx950 has 160 KiB per CU; half of that (minus padding) keeps two 1024-thread
+# blocks resident. Other arches keep the original layout when this is 0.
+_ONE_BLOCK_LDS_BUDGET_BYTES = {"gfx950": 78 * 1024}
 
 
 @lru_cache(maxsize=16)
@@ -185,6 +196,54 @@ def _validate_flydsl_topk_call(
         )
 
 
+_FLYDSL_TOPK_ONE_BLOCK_ARCHES = ("gfx942", "gfx950", "gfx1250")
+
+
+def _validate_radix_topk_one_block_call(
+    logits: torch.Tensor,
+    row_starts: torch.Tensor | None,
+    row_ends: torch.Tensor,
+    indices: torch.Tensor,
+    values: torch.Tensor | None,
+    num_rows: int,
+    stride0: int,
+    stride1: int,
+    k: int,
+    *,
+    is_decode: bool,
+    next_n: int,
+) -> None:
+    """Raise if this call cannot run the one-block radix kernel."""
+    _validate_flydsl_topk_call(
+        logits,
+        next_n,
+        row_ends,
+        indices,
+        num_rows,
+        stride0,
+        stride1,
+        k,
+        values,
+    )
+    if row_starts is None:
+        if not is_decode:
+            raise ValueError("row_starts is required for prefill")
+    elif row_starts is not row_ends:
+        _validate_flydsl_topk_call(
+            logits,
+            next_n,
+            row_starts,
+            indices,
+            num_rows,
+            stride0,
+            stride1,
+            k,
+            values,
+        )
+    if logits.shape[1] > _MAX_ROW_ELEMENTS:
+        raise ValueError("one logits row exceeds the AMD buffer descriptor span")
+
+
 _TensorSignature = tuple[
     torch.Size,
     tuple[int, ...],
@@ -230,6 +289,87 @@ def _is_flydsl_topk_call_supported(
     except (RuntimeError, TypeError, ValueError):
         return False
     return True
+
+
+@lru_cache(maxsize=128)
+def _is_flydsl_radix_topk_one_block_call_supported(
+    logits_signature: _TensorSignature,
+    row_starts_signature: _TensorSignature | None,
+    row_ends_signature: _TensorSignature,
+    indices_signature: _TensorSignature,
+    next_n: int,
+    num_rows: int,
+    stride0: int,
+    stride1: int,
+    k: int,
+    values_signature: _TensorSignature | None,
+    is_decode: bool,
+    arch: str,
+) -> bool:
+    if arch not in _FLYDSL_TOPK_ONE_BLOCK_ARCHES:
+        return False
+    if logits_signature[0][1] > _MAX_ROW_ELEMENTS:
+        return False
+    if not is_decode and row_starts_signature is None:
+        return False
+    if not _is_flydsl_topk_call_supported(
+        logits_signature,
+        row_ends_signature,
+        indices_signature,
+        next_n,
+        num_rows,
+        stride0,
+        stride1,
+        k,
+        values_signature,
+    ):
+        return False
+    if row_starts_signature is None or row_starts_signature == row_ends_signature:
+        return True
+    return _is_flydsl_topk_call_supported(
+        logits_signature,
+        row_starts_signature,
+        indices_signature,
+        next_n,
+        num_rows,
+        stride0,
+        stride1,
+        k,
+        values_signature,
+    )
+
+
+def _is_flydsl_radix_topk_one_block_supported(
+    logits: torch.Tensor,
+    row_starts: torch.Tensor | None,
+    row_ends: torch.Tensor,
+    indices: torch.Tensor,
+    values: torch.Tensor | None,
+    num_rows: int,
+    stride0: int,
+    stride1: int,
+    k: int,
+    stable: bool = False,
+    *,
+    is_decode: bool = False,
+    next_n: int = 1,
+) -> bool:
+    """Return whether the one-block radix kernel supports this call."""
+    del stable
+    return _is_flydsl_radix_topk_one_block_call_supported(
+        _tensor_signature(logits),
+        None if row_starts is None else _tensor_signature(row_starts),
+        _tensor_signature(row_ends),
+        _tensor_signature(indices),
+        next_n,
+        num_rows,
+        stride0,
+        stride1,
+        k,
+        None if values is None else _tensor_signature(values),
+        is_decode,
+        get_gfx(),
+    )
 
 
 def is_flydsl_top_k_per_row_decode_supported(
@@ -340,3 +480,75 @@ def flydsl_top_k_per_row_decode(
         rows,
         stream,
     )
+
+
+def flydsl_radix_topk_one_block(
+    logits: torch.Tensor,
+    row_starts: torch.Tensor | None,
+    row_ends: torch.Tensor,
+    indices: torch.Tensor,
+    values: torch.Tensor | None,
+    num_rows: int,
+    stride0: int,
+    stride1: int,
+    k: int = 2048,
+    stable: bool = False,
+    *,
+    is_decode: bool = False,
+    next_n: int = 1,
+) -> None:
+    """Launch the one-block radix TopK kernel for one prefill or decode call."""
+    if row_starts is None:
+        if not is_decode:
+            raise ValueError("row_starts is required for prefill")
+        row_starts = row_ends
+    _validate_radix_topk_one_block_call(
+        logits,
+        row_starts,
+        row_ends,
+        indices,
+        values,
+        num_rows,
+        stride0,
+        stride1,
+        k,
+        is_decode=is_decode,
+        next_n=next_n,
+    )
+    if num_rows == 0:
+        return
+
+    arch = get_gfx()
+    width = logits.shape[1]
+    wave_size = get_warp_size(arch)
+    stream = torch.cuda.current_stream(logits.device)
+    short_rows = width <= _COMPACT_CAPACITY
+    block_threads = (
+        1024
+        if not short_rows or num_rows <= _SHORT_ROWS_1024_THREAD_MAX_ROWS
+        else 256
+    )
+    launcher = build_radix_topk_one_block_module(
+        k,
+        block_threads=block_threads,
+        write_values=values is not None,
+        stable=stable,
+        short_rows=short_rows,
+        is_decode=is_decode,
+        wave_size=wave_size,
+        lds_budget_bytes=_ONE_BLOCK_LDS_BUDGET_BYTES.get(arch, 0),
+        arch=arch,
+    )
+    _run_compiled(
+        launcher,
+        logits,
+        row_starts,
+        row_ends,
+        indices,
+        values if values is not None else logits,
+        width,
+        next_n,
+        num_rows,
+        stream,
+    )
+
