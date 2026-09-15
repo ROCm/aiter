@@ -36,7 +36,7 @@ the relevant phase as evidence.
 
 ## Progress
 
-- [ ] 0. Repo layout + oracle (no kernel yet)
+- [x] 0. Repo layout + oracle (no kernel yet)
 - [ ] 1. Harness: pin live AMD, #4882, fp32 oracle; measure who dominates
 - [ ] 2. FlyDSL K1 (scorer + fused top-k) — family A then B
 - [ ] 3. FlyDSL K2 (sparse GQA) — family A then B
@@ -85,6 +85,9 @@ them.
 - **Score math.** `I_ib = sum_h ReLU(dot(q[h], k_bar[b]))` for complete blocks
   only (`p_b + r - 1 <= i`). Optional serving scale `1/sqrt(128)` is allowed
   **only if it cannot change top-k argmax**. `eps` is unused.
+- **Top-k tie-break.** On equal finite scores, keep the **smaller block
+  index** (live AMD HIP `top_k_per_row_decode`). Incomplete blocks are `-inf`
+  and are not selected. Remaining slots are `-1`.
 - **Two kernels, one op surface.** K1 = scorer + fused top-k; K2 = sparse GQA.
   Expand+tail may live in K1’s epilogue or K2’s prologue until phase 5. Public
   wrappers under `aiter/ops/flydsl/`; kernels under
@@ -162,11 +165,11 @@ Proposed layout (adjust only if a later lock says so):
   `bench_*` family A / B tables
 - `tickets/1047/` — harness notes, rocprof, competitor pins, pasted tables
 
-- [ ] Oracle: block-causal ReLU-sum, documented top-k tie-break, expand+tail,
+- [x] Oracle: block-causal ReLU-sum, documented top-k tie-break, expand+tail,
       GQA on selected positions (fp32, then cast).
-- [ ] Document family A / B tensor shapes and dtypes in one comment block on
+- [x] Document family A / B tensor shapes and dtypes in one comment block on
       the wrapper (or a tiny `qsa_shapes.py`) so tests and kernels share them.
-- [ ] **Done when:** oracle is importable, covered by a small **pytest**
+- [x] **Done when:** oracle is importable, covered by a small **pytest**
       unit case, and agrees with a hand-checked 1-row / few-block example
       from the tech report formula.
 
@@ -175,6 +178,11 @@ Proposed layout (adjust only if a later lock says so):
   Gate: `HIP_VISIBLE_DEVICES=6 python3 -m pytest op_tests/test_flydsl_qsa.py -q`
   (CPU-safe `test_*`; no kernel compile). Script `__main__` may also run
   those unit cases, but pytest is the correctness gate.
+
+  Layout: `aiter/ops/flydsl/kernels/qsa/{shapes,oracle}.py`,
+  `aiter/ops/flydsl/qsa.py`, `op_tests/test_flydsl_qsa.py`, `tickets/1047/`.
+  Gate: `HIP_VISIBLE_DEVICES=6 python3 op_tests/test_flydsl_qsa.py` (CPU-safe
+  unit cases; no kernel compile).
 
 ### 1. Harness: pin live AMD, #4882, fp32 oracle; measure who dominates
 
