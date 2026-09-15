@@ -41,6 +41,30 @@ _MFMA_K = 16
 _GATHER_TW1 = 32
 _LDS_PAD = 8
 
+SUPPORTED_ARCHS = ("gfx942", "gfx950")
+
+# dot_precision="fp8" feeds the cache's own code points to the matrix core. That
+# needs OCP e4m3 MFMA, which arrives with CDNA4; CDNA3 has fp8 MFMA in the fnuz
+# encoding only, and reading OCP code points with it is silently wrong rather
+# than a fault. The bf16 dots work everywhere, on every cache format.
+FP8_DOT_ARCHS = ("gfx950",)
+
+# gfx942 (CDNA3) carries 64 KB of LDS per workgroup against gfx950's 160 KB.
+# The bf16 KV tile alone is BLOCK_K * (kv_lora_rank + LDS_PAD) * 2 B, so the
+# gfx950 tile of 64 asks for ~67 KB and will not launch; 32 is the largest that
+# fits. num_warps is decoupled from it here because BLOCK_K//16 would otherwise
+# drop 4 -> 2 as a side effect of the LDS cap rather than as a tuning decision.
+_ARCH_BLOCK_K = {"gfx942": 32, "gfx950": 64}
+_ARCH_NUM_WARPS = {"gfx942": 4, "gfx950": 4}
+
+
+def _arch_block_k(arch: str) -> int:
+    return _ARCH_BLOCK_K.get(arch, _BLOCK_K)
+
+
+def _arch_num_warps(arch: str) -> int:
+    return _ARCH_NUM_WARPS.get(arch, _BLOCK_K // 16)
+
 
 def _check_out(out, q, kv_lora_rank):
     """Caller-supplied output buffer, or a fresh one. A buffer wider than
@@ -104,7 +128,9 @@ def _infer_cache_format(kv, d_qk, kv_lora_rank, qk_rope_head_dim, kv_scale):
     raise ValueError(f"unrecognized sparse-MLA kv cache: {tuple(kv.shape)} {kv.dtype}")
 
 
-def _mla_num_splits(num_queries: int, heads_blocks: int, avg_topk: float) -> int:
+def _mla_num_splits(
+    num_queries: int, heads_blocks: int, avg_topk: float, block_k: int = _BLOCK_K
+) -> int:
     """Split-K count for the sparse-MLA decode.
 
     Below one workgroup per CU, split to fill the machine but never past 8.
@@ -112,7 +138,7 @@ def _mla_num_splits(num_queries: int, heads_blocks: int, avg_topk: float) -> int
     num_sms = get_num_sms()
     base_wg = max(1, num_queries * heads_blocks)
     cta_cap = max(1, (2 * num_sms) // base_wg)
-    tiles = max(1, math.ceil(avg_topk / _BLOCK_K))
+    tiles = max(1, math.ceil(avg_topk / block_k))
     if base_wg >= num_sms:
         return max(1, min(cta_cap, tiles // 16))
     return max(1, min(cta_cap, tiles, 8))
@@ -134,6 +160,8 @@ def _async_launch_config(
     use_buffer_load: bool,
     uni_tile: bool = True,
     has_extra: bool = False,
+    block_k: int = _BLOCK_K,
+    lds_limited: bool = False,
 ) -> tuple[bool, int, int]:
     """-> (ASYNC_LDS, BLOCK_K, waves_per_eu) for this launch.
 
@@ -147,24 +175,39 @@ def _async_launch_config(
     enabled = enabled and fp8_dots and uni_tile and not has_invalid and not has_extra
     workgroups = num_queries * heads_blocks * max(1, num_splits)
     num_sms = get_num_sms()
+    # The 64/128 tiles below are chosen against gfx950's LDS budget; where the
+    # arch cannot hold them, block_k is already the largest that fits and the
+    # async pipeline has no deeper tile to stage into.
+    if lds_limited:
+        waves_per_eu = 1 if (use_buffer_load and workgroups <= num_sms) else 2
+        return False, block_k, waves_per_eu
     if enabled and workgroups >= 4 * num_sms:
         return True, 64, 4
     waves_per_eu = 2
     if use_buffer_load and workgroups <= num_sms:
         waves_per_eu = 1
-    return enabled, (128 if enabled else _BLOCK_K), waves_per_eu
+    return enabled, (128 if enabled else block_k), waves_per_eu
 
 
 _E4M3_MAX = 448.0
 
 
-def _resolve_dot_precision(dot_precision: str, fmt: str, fp8_fnuz: bool) -> bool:
+def _resolve_dot_precision(
+    dot_precision: str, fmt: str, fp8_fnuz: bool, arch: str = "gfx950"
+) -> bool:
     if dot_precision not in ("bf16", "fp8"):
         raise ValueError(
             f"dot_precision must be 'bf16' or 'fp8', got {dot_precision!r}"
         )
     if dot_precision == "bf16":
         return False
+    if arch not in FP8_DOT_ARCHS:
+        raise ValueError(
+            f"dot_precision='fp8' is not supported on {arch}: the fp8 matrix "
+            "core there reads the fnuz encoding, so OCP e4m3 code points come "
+            "out wrong. Use dot_precision='bf16', which dequantizes the tile "
+            "on its way into LDS and works with every cache format."
+        )
     if fmt == "fp8_dsv32_mla":
         raise ValueError(
             "dot_precision='fp8' does not support the fp8_dsv32_mla cache."
@@ -242,7 +285,9 @@ def sparse_mla_fwd(
         [C, H, kv_lora_rank] bf16 (the latent V), lse is None unless return_lse.
     """
     assert q.ndim == 3, f"expected q=[b,h,d], got {q.shape}"
-    assert arch_info.get_arch() == "gfx950", "sparse_mla_fwd is gfx950-only"
+    arch = arch_info.get_arch()
+    assert arch in SUPPORTED_ARCHS, f"sparse_mla_fwd does not support {arch}"
+    lds_limited = arch == "gfx942"
     q_is_fp8 = q.dtype == torch.float8_e4m3fn
     if q.dtype not in (torch.bfloat16, torch.float8_e4m3fn):
         raise ValueError(
@@ -275,7 +320,7 @@ def sparse_mla_fwd(
     fmt, cache, alt, scl, block_size, fp8_fnuz = _infer_cache_format(
         kv_buffer, d_qk, kv_lora_rank, qk_rope_head_dim, kv_scale
     )
-    fp8_dots = _resolve_dot_precision(dot_precision, fmt, fp8_fnuz)
+    fp8_dots = _resolve_dot_precision(dot_precision, fmt, fp8_fnuz, arch)
     if fp8_dots and not q_is_fp8:
         # Quantize the way production does, one scaled_fp8_quant over
         # [C, H*d_qk]. A caller-supplied q_scale is the layer's calibrated
@@ -307,7 +352,8 @@ def sparse_mla_fwd(
 
     # H < 16 runs natively at BLOCK_M = next_pow2(H) instead of padding heads.
     block_m = 16 if num_heads >= 16 else max(8, 1 << (num_heads - 1).bit_length())
-    num_warps = _BLOCK_K // 16
+    tuned_block_k = _arch_block_k(arch)
+    num_warps = _arch_num_warps(arch)
 
     num_rows = cache.shape[0] * block_size if cache.ndim >= 2 else cache.shape[0]
     avg_topk = kv_indices.numel() / max(1, num_queries)
@@ -337,7 +383,9 @@ def sparse_mla_fwd(
     if kv_splits is not None:
         num_splits = max(1, int(kv_splits))
     else:
-        num_splits = _mla_num_splits(num_queries, heads_blocks, avg_topk)
+        num_splits = _mla_num_splits(
+            num_queries, heads_blocks, avg_topk, block_k=tuned_block_k
+        )
 
     if num_splits > 1:
         part_m = torch.empty(
@@ -364,7 +412,9 @@ def sparse_mla_fwd(
     # Dequant chunking
     col_reps = kv_lora_rank // (_GATHER_TW1 * 16)
     chunk_axis = 1 if col_reps >= 4 else 0
-    nope_chunk = max(1, _BLOCK_K // 4) if chunk_axis == 0 else min(128, kv_lora_rank)
+    nope_chunk = (
+        max(1, tuned_block_k // 4) if chunk_axis == 0 else min(128, kv_lora_rank)
+    )
     async_lds_on, block_k, waves_per_eu = _async_launch_config(
         fp8_dots,
         has_invalid,
@@ -375,6 +425,8 @@ def sparse_mla_fwd(
         use_buffer_load,
         uni_tile=True,
         has_extra=False,
+        block_k=tuned_block_k,
+        lds_limited=lds_limited,
     )
     # num_warps stays 4: warps tile the dot's N (MFMA N=16), so a larger BLOCK_K just
     # gives each warp two N tiles.
