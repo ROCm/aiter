@@ -1443,6 +1443,7 @@ def _flydsl_moe_stage1_impl(
     swiglu_limit: float | None = None,
     k_wave: int = 1,
     v2_output_layout: bool = False,
+    w_layout: str = "standard",
     _compile_kernel=compile_flydsl_moe_stage1,
     _build_mx_args=_s1_args_fp4,
 ):
@@ -1499,10 +1500,10 @@ def _flydsl_moe_stage1_impl(
 
     dev = a.device
     # a16w-mix ported gemm1: bf16 A x {mxfp4 (a16w4), int4 (a16wi4)} W -> bf16 sorted
-    # intermediate, threaded to stage2 unchanged. Tiles from the CSV kernelName. Both
-    # w_dtypes consume the standard (GGUU) N-major preshuffle; a16wi4 W1 is the
-    # OLD-kernel int4 prep (pack_int8_to_packed_int4(shuffle_weight(w,(16,16)))) +
-    # (E,G//2,N,2) bf16 scale.
+    # intermediate, threaded to stage2 unchanged. Tiles from the CSV kernelName.
+    # mxfp4 W1 is GGUU (`w_layout="standard"`) or GUGU (`"guinterleave"`, Silu
+    # INTERLEAVE). a16wi4 W1 is the OLD-kernel int4 prep
+    # (pack_int8_to_packed_int4(shuffle_weight(w,(16,16)))) + (E,G//2,N,2) bf16 scale.
     # wpe=1 (a no-_w name) must map to None: waves_per_eu=1 is a real occupancy cap.
     _g1_waves_per_eu = (
         waves_per_eu if (waves_per_eu is not None and int(waves_per_eu) > 1) else None
@@ -1548,7 +1549,11 @@ def _flydsl_moe_stage1_impl(
             situ_linear_beta=situ_linear_beta,
             swiglu_limit=runtime_swiglu_limit(swiglu_limit, _act),
             w_dtype=b_dtype,
-            w_layout="standard",
+            w_layout=(
+                "guinterleave"
+                if (b_dtype == "fp4" and w_layout == "guinterleave")
+                else "standard"
+            ),
         )
         return inter_sorted
     # The gate/up (N) axis tile must divide inter_dim; for non-256-aligned
@@ -1907,6 +1912,7 @@ def flydsl_moe_stage1(
     swiglu_limit: float | None = None,
     k_wave: int = 1,
     v2_output_layout: bool = False,
+    w_layout: str = "standard",
 ):
     """Fused gate+up GEMM (MOE stage1).
 
@@ -1964,6 +1970,7 @@ def flydsl_moe_stage1(
         swiglu_limit=swiglu_limit,
         k_wave=k_wave,
         v2_output_layout=v2_output_layout,
+        w_layout=w_layout,
     )
 
 
