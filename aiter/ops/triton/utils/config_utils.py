@@ -53,6 +53,30 @@ def load_config_json(fpath: str, required: bool = True) -> dict | None:
         return None
 
 
+def select_leq_config(
+    configs: dict,
+    value: int,
+    *,
+    prefix: str = "N_LEQ_",
+    fallback_key: str = "any",
+) -> dict:
+    """Select the first threshold config whose upper bound contains ``value``.
+
+    Threshold entries use names such as ``N_LEQ_128``. The smallest numeric
+    bound greater than or equal to ``value`` wins; ``fallback_key`` is used
+    when no threshold contains it. A shallow copy is returned so callers may
+    consume tuning fields without mutating the cached JSON object.
+    """
+    threshold_keys = sorted(
+        (key for key in configs if key.startswith(prefix)),
+        key=lambda key: int(key[len(prefix) :]),
+    )
+    for key in threshold_keys:
+        if value <= int(key[len(prefix) :]):
+            return dict(configs[key])
+    return dict(configs[fallback_key])
+
+
 def _dtype_dir(config_name: str) -> str:
     """Nested-layout directory for a config family:
     ``GEMM-AFP4WFP4`` -> ``gemm_afp4wfp4``."""
