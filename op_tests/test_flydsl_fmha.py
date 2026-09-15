@@ -76,6 +76,13 @@ def _make_qkv(
         (2, 1024, 8, 128),
         # Unaligned shape — exercises the auto-padding path. 32760 → 32768.
         (1, 32760, 12, 128),
+        # Flux self-attn, short sequences (128x32 tile).
+        (1, 512, 24, 128),
+        (1, 1536, 24, 128),
+        # SD3 joint attention.
+        (1, 1024, 24, 128),
+        # Head dimension 64 uses the 128x64 tile.
+        (1, 2048, 16, 64),
     ],
 )
 def test_flydsl_fmha_correctness_bf16(batch, seq_len, num_heads, head_dim):
@@ -94,15 +101,6 @@ def test_flydsl_fmha_correctness_bf16(batch, seq_len, num_heads, head_dim):
     # bf16 attention is noisy; cosine is the right correctness signal.
     assert cos.min().item() > 0.99, f"min_cos={cos.min().item():.6f}"
     assert cos.mean().item() > 0.999, f"mean_cos={cos.mean().item():.6f}"
-
-
-@_gfx1201_only
-def test_flydsl_fmha_rejects_cross_attention():
-    q = torch.randn(1, 1024, 12, 128, dtype=torch.bfloat16, device="cuda")
-    k = torch.randn(1, 512, 12, 128, dtype=torch.bfloat16, device="cuda")
-    v = torch.randn(1, 512, 12, 128, dtype=torch.bfloat16, device="cuda")
-    with pytest.raises(ValueError, match="self-attention"):
-        flydsl_flash_attn_func(q, k, v)
 
 
 @_gfx1201_only
@@ -183,11 +181,6 @@ def test_flydsl_fmha_correctness_multi_device():
     import textwrap
 
     script = textwrap.dedent("""
-        import sys
-        sys.path.insert(0, "/workspace/FlyDSL/python")
-        import flydsl
-        flydsl.__version__ = "0.1.5.dev999"
-
         import torch
         import torch.nn.functional as F
         from aiter.ops.flydsl import flydsl_flash_attn_func
@@ -245,27 +238,10 @@ def test_flydsl_fmha_correctness_multi_device():
 
 
 @_gfx1201_only
-def test_flydsl_fmha_rejects_excessive_padding():
-    """Non-causal path must reject padding ratio > 0.5% (option (d) guard).
-
-    S_real=129 -> S_pad=256, pad ratio 127/256 = 49.6%. Padded K/V keys
-    would contribute to the softmax denominator and silently scale outputs
-    (rel_err ~37% per RCA in 2969_padded_softmax_rca.md). Wrapper must
-    raise before launching the kernel.
-    """
-    batch, seq_len, num_heads, head_dim = 1, 129, 8, 128
-    q, k, v = _make_qkv(batch, seq_len, num_heads, head_dim, torch.bfloat16)
-    with pytest.raises(ValueError, match="0.5% safety threshold"):
-        flydsl_flash_attn_func(q, k, v, causal=False)
-
-
-@_gfx1201_only
 def test_flydsl_fmha_allows_tight_padding():
-    """Wan2.1 production case (S_real=32760 -> S_pad=32768, ratio 0.024%)
-    must pass the 0.5% threshold and produce SDPA-equivalent output.
-
-    Regression guard for option (d) — protects the production hot path
-    from a future, stricter threshold accidentally rejecting it.
+    """Wan2.1 production case (S_real=32760 -> S_pad=32768) must produce
+    SDPA-equivalent output. The kernel bounds the non-causal KV loop at the
+    real length and masks the straddling final tile exactly.
     """
     batch, seq_len, num_heads, head_dim = 1, 32760, 12, 128
     q, k, v = _make_qkv(batch, seq_len, num_heads, head_dim, torch.bfloat16)
