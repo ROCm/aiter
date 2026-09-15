@@ -1,195 +1,247 @@
-# FlyDSL MXFP8 GEMM (gfx950)
+# Standard MXFP8 GEMM
 
-The layout-dynamic kernel is ported from `flydsl-examples/kernels/scaled_gemm_gfx950.py`.
-It uses scaled MFMA, full-tile or half-tile-interleaved (HTI) pipelines, split-K,
-and workgroup-local slice-K. FP32 output and slice-K cshuffle retain FP32
-intermediates; BF16 split-K still uses BF16 atomic accumulation.
+Public entry: `aiter.gemm_a8w8_mxfp8(A, B, ScaleA, ScaleB, ...)`.
+Both operands use E4M3 data with one independent E8M0 scale per **32 K elements**.
+No configurable scale block or block128 broadcasting is provided by this backend.
 
-## Operand contracts
+## Separate architecture contracts
 
-All data tensors are `torch.float8_e4m3fn`. Scale tensors are
-`torch.float8_e8m0fnu` or bit-identical `torch.uint8` E8M0 bytes.
+| | gfx950 | gfx1250 |
+|---|---|---|
+| Backend | FlyDSL, tuned CSV + AOT | Existing ASM heuristic/kernelName |
+| A data | Row-major, unshuffled | Existing A-preshuffle layout by default |
+| B data | `(16,16)` preshuffle by default; plain B optional | Existing preshuffled B |
+| Scales | Unshuffled `[M,K/32]`, `[N,K/32]` E8M0/uint8 | Existing shuffled ASM scale layout |
+| Output | BF16/FP32, optional bias/out | Existing BF16-returning API |
 
-| Mode | A | B | A scale | B scale |
-|---|---|---|---|---|
-| Native MXFP8, `scale_block=32` | `[M,K]` | `[N,K]` | `[M,K/32]` | `[N,K/32]` |
-| E8M0 blockscale, `scale_block=128` | `[M,K]` | `[N,K]` | `[M,K/128]` | `[ceil(N/128),K/128]` |
+`a_preshuffle=None` selects the native default: False on gfx950, True on gfx1250.
+Explicit `a_preshuffle=True` is rejected on gfx950 rather than silently reading
+shuffled A as row-major. The gfx1250 branch does not import or query the gfx950
+FlyDSL tuned table, convert its scale layout, or accept gfx950 kernel names.
+The original positional arguments and default gfx1250 execution are preserved.
+gfx950-only additions (`out`, `bias` and plain B) are rejected
+on gfx1250. The underlying scale buffers are **not interchangeable across arches**.
 
-Output is BF16 (default) or FP32; optional bias has the output dtype and shape
-`[N]`. A caller-owned contiguous `out=[M,N]` is supported.
+gfx950 example:
 
-`bpreshuffle=True` consumes `shuffle_weight(B, layout=(16,16))` **directly**.
-No inverse shuffle or scale expansion runs per GEMM. Scales remain unshuffled:
-do **not** pass MoE `shuffle_scale`/`e8m0_shuffle` or PR #4254's compact shuffled
-scale buffers to this API. The PR was used as a reference for isolating the
-microscale tuned table; its separate kernel/packed-scale ABI is not imported.
-
-Supported dimensions/configs are validated before launch:
-
-- Positive M/N/K; vector-aligned N (normally a multiple of 8 for BF16,
-  4 for FP32). Preshuffled B requires N divisible by 16.
-- K divisible by the scale block and the selected tile/partition alignment.
-  No K-tail; a split partition must have enough tiles for `stages`.
-- HTI requires two stages, two M waves, no slice-K, and an even K-tile count
-  per split partition.
-- Only gfx950 and the above FP8/scale/output types are supported by this backend.
-  Existing gfx1250 kernels and ordinary FP32-scale blockscale dispatch are unchanged.
-
-## Runtime
-
-Native 1x32 MXFP8 through the existing tuned GEMM interface:
-
-    from aiter.tuned_gemm import tgemm
+    import aiter
     from aiter.ops.shuffle import shuffle_weight
 
-    w_shuffled = shuffle_weight(w, layout=(16, 16))
-    y = tgemm.mm(a, w_shuffled, scale_a=sa, scale_b=sw, bpreshuffle=True)
+    y = aiter.gemm_a8w8_mxfp8(a, shuffle_weight(w), sa, sw, out=out)
+    y_plain = aiter.gemm_a8w8_mxfp8(a, w, sa, sw, bpreshuffle=False)
 
-Use explicit `bpreshuffle` under `torch.compile`: Python tensor attributes
-are not an operator-schema layout contract. Eager calls still recognize
-`is_shuffled`. Batched leading dimensions on A/scales are flattened/restored.
+`tgemm.mm(..., scale_a=sa, scale_b=sw, bpreshuffle=True)` also forwards native
+MXFP8 through this entry. Under torch.compile, specify the B layout explicitly.
 
-The existing DSv4 model call needs no new packed-scale preprocessing:
+On gfx950, kernel selection and the dynamic split count both come from the
+tuned CSV row. Callers do not specify `splitK` or override `kernelName`.
+`get_mxfp8_config` is cached only by shape, output dtype, bias and B layout;
+`kernelName` and `splitK` are configuration values, not lookup inputs.
+The public `kernelName` argument exists only for gfx1250 ASM compatibility and
+is rejected on gfx950. The low-level `flydsl_mxfp8_gemm(config=...)` remains
+available to the tuner, while production calls use the table.
 
-    from aiter.ops.gemm_op_a8w8 import gemm_a8w8_blockscale_bpreshuffle
-    # a, sa = per_group_quant_hip(..., group_size=128,
-    #         scale_type=dtypes.fp8_e8m0, transpose_scale=True)
-    y = gemm_a8w8_blockscale_bpreshuffle(a, w_shuffled, sa, sw, out=out)
+## gfx950 kernel and limits
 
-On gfx950, BF16-output calls with **both** scales E8M0/uint8 use this backend.
-The MXFP8 Python entry uses separate functional and output-writing custom ops
-for inductor. It views E8M0 scales as uint8 without copying before a mutating
-custom-op boundary, avoiding an E8M0 functionalization failure in some PyTorch
-versions. The Python API is unchanged; both variants share the existing backend dispatch.
+FT/HTI pipelines, local slice-K and dynamic split-K are supported. Full-tile
+16x16x128 MFMA can either read preshuffled B directly into registers or stage
+it through LDS. The internal `direct_b` policy is selected by the tuned table,
+not by the caller. `_bd1` / `_bd0` in kernelName and the constexpr ABI distinguish
+these two binaries. HTI, plain B and MMA32 only support LDS (`direct_b=False`);
+unsupported direct combinations are rejected. Split-K writes FP32
+partial slabs and reduces once, applying bias and output conversion only at the
+end. Names encode `ks1`/`ksd`, while the runtime count is stored in CSV `splitK`.
 
-`sa` has the existing byte-transposed layout emitted by
-`per_group_quant_hip(transpose_scale=True)`; `sw` is row-major block128 scale.
+Positive dimensions and vector alignment are required. There is no K-tail:
+tile, stage and split partitions must pass validation. HTI uses two stages,
+two M waves, no slice-K and even K-tile counts per partition. Split workspace
+is limited to 4 GiB. AITER's unrelated blockscale operators are unchanged.
 
-For explicit tile policies or logical (rather than byte-packed) scales:
+## MiniMax-M3 tuning only
 
-    from aiter.ops.flydsl import flydsl_mxfp8_gemm
-    y = flydsl_mxfp8_gemm(a, w, sa, sw, config=tile, out=out,
-                          scale_block=32, bpreshuffle=False)
+The source shape list is
+`aiter/configs/model_configs/a8w8_bpreshuffle_tuned_gemm_minimax_m3.csv`.
+Only its **100 unique M/N/K shapes** are reused; the original FP8 kernels,
+scales and timings are not copied.
 
-## Tuning
+The standard MXFP8 files are:
 
-A separate table avoids collisions with tensor/per-token FP8 and FP32 blockscale:
-`aiter/configs/mxfp8_tuned_gemm.csv`. Override it with
-`AITER_CONFIG_GEMM_MXFP8=/path/to/tuned.csv`.
+- `model_configs/mxfp8_untuned_gemm_minimax_m3.csv`
+- `model_configs/mxfp8_tuned_gemm_minimax_m3.csv`
 
-Keys include architecture, CU count, M/N/K, output dtype, bias, scale block,
-weight preshuffle, and A-scale transpose. Stable `flydsl_mxfp8_*` kernel names
-include tile/MMA/pipeline/layout parameters. `ks1` selects the non-split
-kernel; `ksd` selects the dynamic split kernel. The actual partition count is
-stored **only in the CSV `splitK` column**, and runtime/AOT both pass it as an
-Int32 launch argument. Names and compile signatures are identical for split
-counts 2, 4, 7, etc.; a name/splitK mismatch is rejected.
-
-Invalid or mismatched rows
-fall back only to a validated MXFP8 config, never ordinary unscaled GEMM.
-
-    python csrc/gemm_mxfp8/gemm_mxfp8_tune.py \
-      -i aiter/configs/mxfp8_untuned_gemm.csv -o /tmp/mxfp8_tuned.csv
-
-    python csrc/gemm_mxfp8/gemm_mxfp8_tune.py \
-      --run_config /tmp/mxfp8_tuned.csv
-
-The tuner uses `GemmCommonTuner`/`mp_tuner`, with accuracy checks, dirty output
-buffers, full-tile/HTI, split-K/slice-K candidates and standard profiling,
-retuning and compare options. It currently searches the FlyDSL backend only.
-DSv4 shapes and results are in `aiter/configs/model_configs/`:
-`dsv4_mxfp8_untuned_gemm.csv` and `dsv4_mxfp8_tuned_gemm.csv`. They cover all
-204 shapes in the existing `dsv4_a8w8_blockscale_untuned_gemm.csv`: 68 token
-counts from M=1 to M=32768, with (N,K)=(768,7168), (2048,7168), (7168,384).
-All use BF16 output, block128 E8M0, native B preshuffle, and byte-transposed A
-scales. This is an operator sweep, not a full-model inference run.
-
-Reproduce the tuning sweep (shape-grouped on one gfx950 GPU):
+No DSv4 or example performance rows remain. Both generic
+`mxfp8_tuned_gemm.csv` and `mxfp8_untuned_gemm.csv` are removed.
+Runtime/AOT default directly to the MiniMax-M3 tuned table; the tuner uses its
+model-specific untuned table. Explicit multi-table merging also takes its
+deduplication keys from this model shape table, without placeholder CSVs.
+All new measurements use independent per-32 E8M0 scales, BF16 output, no bias
+and B preshuffle; this is an operator shape sweep, not full-model inference.
 
     python csrc/gemm_mxfp8/gemm_mxfp8_tune.py \
-      -i aiter/configs/model_configs/dsv4_mxfp8_untuned_gemm.csv \
-      -o /tmp/dsv4_mxfp8_tuned.csv --mp 1 --shape_grouped \
-      --screen-topk 8 --batch 4 --warmup 2 --iters 11
+      --screen-topk 4 --mp 1 --shape_grouped --warmup 3 --iters 31
 
-The catalog shares HGEMM's search axes: M tiles 16/32/48/64/80/96/128/256,
-N tiles 16/32/64/80/96/128/256, stages 2..9, M/N waves 1/2/4, group_m 0/4,
-FT/HTI. MXFP8 adapts K tiles to 128/256/512 and slice-K (`k_waves`) to 1/2/4.
-Split-K searches 1 and divisors of K from 2..9 (including 7 for K=7168 and 3 for
-K=384), then applies partition/alignment/LDS/grid checks. Slice choices are not
-discarded merely for equal estimated occupancy.
+The tuner defaults to these MiniMax-M3 input/output files. Override `-i/-o`
+for custom experiments. `AITER_CONFIG_GEMM_MXFP8` overrides runtime/AOT lookup.
+HGEMM-style tile/stage/wave axes include K tiles 128/256/512, slice-K 1/2/4,
+and legal split divisors through 32. Optional graph screening retains finalists
+per split/slice/B-loading regime; `mp_tuner` profiles them with three rotating tensor sets.
+`--screen-topk 0` skips screening and profiles the full valid space.
 
-`--screen-topk 8` evaluates the entire legal space using graph-event timing,
-then sends up to eight candidates **per split/slice regime** to the standard
-rotating-buffer `mp_tuner` profiler. Zero disables screening and profiles the
-whole space. Only standard profiler timings go into the CSV. BF16 split-K
-finalists also undergo 16 repeated accuracy checks outside timing to reject
-order-sensitive atomic reductions. Successful rows are resumable.
+### Pruning and the B-loading axis
 
-For the 204 DSv4 shapes the expanded space has 362036 shape/config candidates
-(4518 unique compile configurations), including 152782 split-K and 100028
-slice-K candidates. The original M=1 singleton-scale regression remains covered.
+Yes, the search is pruned before timing:
+1. Hard legality checks: MMA divisibility, vector alignment, stages, wave count,
+   actual LDS usage (different for direct/LDS B), split partitions, output shape
+   and workspace bounds.
+2. HGEMM-derived heuristics: tile IOU relative to the best candidate, tile-grid
+   size <= four times the larger of CU count and the minimum tile grid, split
+   count <= ceil(2*CU/base_grid) (no split when base_grid already fills the CUs),
+   and group_m=4 only for sufficiently large grids divisible by eight.
+3. Non-HTI policies also limit M/N MMA repeats per wave to four.
+   MXFP8 disables HGEMM's slice-K occupancy deduplication (`prune_slice_k=False`).
+
+`direct_b=False/True` is independently enumerated for preshuffled full-tile
+MMA16. A retained direct policy's matching LDS policy is kept whenever it is
+also resource-legal; neither pruning nor screening merges them. Screening
+reserves separate finalist slots for each B path as well as split/slice regime.
+For example, `(M,N,K)=(32,2304,6144)` currently retains 2974 matched pairs and
+1251 additional direct-only policies. A direct-only policy is not evidence of
+timing preference: the corresponding LDS policy exceeds resource limits.
+
+The existing MiniMax-M3 table was migrated to explicit `_bd0/_bd1` names while
+preserving its previous B path, selected tiles and measured timings (75 direct,
+25 HTI/LDS). This is **not** a full retune of the expanded B-loading space.
+A real tuner smoke with `--screen-topk 1` profiled both paths; integration
+tests cover their distinct cache signatures, CPU-only AOT/run-only execution,
+public table-driven calls and preservation through pruning.
 
 
-## AOT and tests
-
-The default GEMM AOT job set includes the new tuned table (including
-model-specific `*mxfp8_tuned_gemm*.csv` merges). Runtime and AOT share the same
-layout-dynamic launch argument builder. AOT allocates tiny CPU tensors, not
-model-sized GPU buffers.
+## AOT and test closure
 
     AITER_AOT_IMPORT=1 GPU_ARCHS=gfx950 HIP_VISIBLE_DEVICES='' \
       FLYDSL_RUNTIME_CACHE_DIR=/tmp/mxfp8_cache \
-      python -m aiter.aot.flydsl.gemm --csv /tmp/mxfp8_tuned.csv
+      python -m aiter.aot.flydsl.gemm \
+      --csv aiter/configs/model_configs/mxfp8_tuned_gemm_minimax_m3.csv
 
     FLYDSL_RUNTIME_CACHE_DIR=/tmp/mxfp8_cache FLYDSL_RUNTIME_RUN_ONLY=1 \
-      AITER_CONFIG_GEMM_MXFP8=/tmp/mxfp8_tuned.csv \
-      python csrc/gemm_mxfp8/gemm_mxfp8_tune.py --run_config /tmp/mxfp8_tuned.csv
+      python op_tests/test_flydsl_mxfp8.py
 
     pytest -q op_tests/flydsl_tests/test_mxfp8_integration.py
-    python op_tests/test_flydsl_mxfp8.py -s 1,768,7168 32,2048,7168 4096,7168,384 \
-      -l preshuffle --scale-block 128
 
-AOT coverage is the selected tuned policies. For deployment, tune/include all
-required shapes; run-only mode intentionally fails for missing artifacts.
-The top-level op test follows the standard `@benchmark` / candidate dictionary /
-`run_perftest` / `checkAllclose` / markdown summary structure. Kernel, tuner,
-inductor and AOT regressions are separate in
-`op_tests/flydsl_tests/test_mxfp8_integration.py`.
-
-Tests cover native/preshuffled weights, actual quantizer outputs, scale dtype
-and layout, tails, stage/scale-chunk wrap, bias, output reuse, stream/graph,
-`torch.compile`, config isolation, tuner CSV roundtrip, CPU-only AOT and fresh
-process run-only execution, including negative cache-miss checks.
-
-Dense random FP8 inputs with tiny products need a small absolute FP32 tolerance
-against dequantized GEMM. A separate binary-exact-input FP64-reference test
-checks that FP32 output is not truncated through BF16 cshuffle.
+The standard `@benchmark` op test invokes the public `gemm_a8w8_mxfp8` entry
+with dirty preallocated outputs, reports us/TFLOPS/TB/s/err, and defaults to
+the new MiniMax-M3 tuned shapes. CPU-only AOT shares the layout-dynamic ABI
+with runtime; tests cover new-process run-only, dynamic split reuse, actual
+MXFP8 quantization, out/graph/inductor, rejected coarse scales and architecture
+dispatch isolation. gfx1250 dispatch tests stub the ASM call on gfx950; they
+do not claim GPU execution coverage on gfx1250.
 
 
-## Previous restricted-space baseline (gfx950, 2026-09-14)
+## MiniMax-M3 verification
 
-All 204 shapes were tuned and then verified through the model entry with
-preallocated output and `FLYDSL_RUNTIME_RUN_ONLY=1`: all errors were zero.
-CPU-only AOT compiled 204 jobs successfully. This run used 11 timing iterations
-during tuning; the standard op-test verification used its normal 101 iterations.
-The table below is the raw verification subset for M=1/32/256/4096, not the
-tuner's shorter timing pass.
+All **100/100** source shapes were independently tuned in standard MXFP8
+format (A/B scale group 32), with zero observed tuning errors. The table
+contains 57 distinct policies: 21 rows use split-K and 57 use slice-K
+(27 with two K waves, 30 with four). The original FP8 timings were not reused.
 
-The sweep exposed and fixed a singleton scale-stride issue at M=1. A BF16
-split-K=4 candidate also failed repeat validation and was replaced by a stable
-split-K=2 candidate after retuning; the test tolerance was not widened.
+The 181643 shape/config candidates were shape-sharded over six idle
+gfx950/256-CU GPUs, keeping each shape's comparison on one GPU. All 6748
+unique candidate configurations were successfully AOT-compiled. Finalists
+used 31 profiler iterations and three rotating tensor sets.
 
-|    m |    n |    k | dtype          | layout     |   scale_block | gfx    |   flydsl us |   flydsl TFLOPS |   flydsl TB/s |   flydsl err |
-|-----:|-----:|-----:|:---------------|:-----------|--------------:|:-------|------------:|----------------:|--------------:|-------------:|
-|    1 |  768 | 7168 | torch.bfloat16 | preshuffle |           128 | gfx950 |    12.303   |        0.894906 |      0.448192 |            0 |
-|   32 |  768 | 7168 | torch.bfloat16 | preshuffle |           128 | gfx950 |    18.558   |       18.9849   |      0.311762 |            0 |
-|  256 |  768 | 7168 | torch.bfloat16 | preshuffle |           128 | gfx950 |    24.182   |      116.556    |      0.3204   |            0 |
-| 4096 |  768 | 7168 | torch.bfloat16 | preshuffle |           128 | gfx950 |    62.3906  |      722.82     |      0.663342 |            0 |
-|    1 | 2048 | 7168 | torch.bfloat16 | preshuffle |           128 | gfx950 |    18.4547  |        1.59093  |      0.796129 |            0 |
-|   32 | 2048 | 7168 | torch.bfloat16 | preshuffle |           128 | gfx950 |    18.7208  |       50.1861   |      0.803555 |            0 |
-|  256 | 2048 | 7168 | torch.bfloat16 | preshuffle |           128 | gfx950 |    29.7902  |      252.304    |      0.590089 |            0 |
-| 4096 | 2048 | 7168 | torch.bfloat16 | preshuffle |           128 | gfx950 |    84.372   |     1425.34     |      0.723554 |            0 |
-|    1 | 7168 |  384 | torch.bfloat16 | preshuffle |           128 | gfx950 |     4.54151 |        1.21216  |      0.609357 |            0 |
-|   32 | 7168 |  384 | torch.bfloat16 | preshuffle |           128 | gfx950 |     4.785   |       36.8152   |      0.673734 |            0 |
-|  256 | 7168 |  384 | torch.bfloat16 | preshuffle |           128 | gfx950 |     6.63331 |      212.456    |      0.983185 |            0 |
-| 4096 | 7168 |  384 | torch.bfloat16 | preshuffle |           128 | gfx950 |    30.5038  |      739.206    |      2.06722  |            0 |
+A fresh cache and a single gfx950 then validated the public-entry closure:
+100 selected AOT jobs succeeded; all 100 shapes passed run-only default
+`aiter.gemm_a8w8_mxfp8` with CSV-selected kernel/splitK, repeated NaN-poisoned
+preallocated output, and `tgemm.mm` calls. Standard op-test profiling used
+101 iterations and three rotating sets; every error column is zero.
+This is GEMM-only timing (including split-K reduce), not model throughput.
+gfx1250 is covered by dispatch/ABI tests here, not gfx1250 GPU execution.
+
+Representative M=32 raw op-test results (other source shape groups do not
+all contain M=32):
+
+|   m |    n |    k | dtype          | layout     | gfx    | tile      |   split_k |   k_waves |   flydsl us |   flydsl TFLOPS |   flydsl TB/s |   flydsl err |
+|----:|-----:|-----:|:---------------|:-----------|:-------|:----------|----------:|----------:|------------:|----------------:|--------------:|-------------:|
+|  32 | 2304 | 6144 | torch.bfloat16 | preshuffle | gfx950 | 16x32x512 |         4 |         1 |    10.6292  |         85.2339 |       1.40634 |            0 |
+|  32 | 2560 | 6144 | torch.bfloat16 | preshuffle | gfx950 | 16x64x512 |         3 |         4 |    10.5819  |         95.1275 |       1.56746 |            0 |
+|  32 | 6144 | 2048 | torch.bfloat16 | preshuffle | gfx950 | 16x32x512 |         1 |         4 |     6.00749 |        134.05   |       2.2367  |            0 |
+|  32 | 6144 | 3072 | torch.bfloat16 | preshuffle | gfx950 | 16x32x512 |         1 |         4 |     7.39418 |        163.366  |       2.69926 |            0 |
+|  32 | 6144 | 6144 | torch.bfloat16 | preshuffle | gfx950 | 16x32x512 |         1 |         2 |    11.6024  |        208.226  |       3.40657 |            0 |
+
+
+## Same-device comparison with the BF16 model configuration
+
+The MiniMax-M3 MXFP8 table overlaps
+`minimax_m3_eagle_bf16_tuned_gemm.csv` on 61 gfx950/256-CU shapes
+(BF16 input/output, no bias/scaling/preshuffle for BF16).
+The selected BF16 backends were 47 FlyDSL, 11 Torch, 2 Triton and 1 ASM;
+each production lookup was checked against the model row. Shapes without a
+matching BF16 model row are excluded rather than benchmarked with fallback.
+
+Both operands' MXFP8 values were dequantized to exactly representable BF16
+values before benchmarking so both GEMMs compute the same mathematical input.
+Preparation/quantization/preshuffle/compilation are outside timing. Both model
+entries allocate output inside the call. Results are the median of three
+alternating-order runs on one gfx950, with five warmups, 51 profiler iterations
+and three rotating tensor sets; times sum GPU kernel durations, including
+split-K reduction, and are not model end-to-end latency.
+
+MXFP8 was faster on 50/61 shapes; geometric-mean BF16/MXFP8 speedup was 1.341x.
+Small M (<=32) is mixed: 9/19 wins, geometric mean 1.018x.
+At M>=1024, MXFP8 won all 28 shapes with geometric mean 1.668x.
+These numbers describe the existing tuned configurations, not the theoretical
+best possible performance of either format.
+
+MXFP8 observed error ratios were zero at rtol=.03/atol=.1.
+Some BF16 split-K configurations use BF16 atomic accumulation: their maximum
+observed element mismatch fraction was 0.00449219; these were explicitly reported
+and checked against a 0.05 bound, not hidden or claimed bitwise-equivalent.
+This comparison does not evaluate quantization error relative to arbitrary
+original BF16 model activations.
+
+Representative raw latency rows:
+
+|    m |    n |    k | bf16_backend   |   bf16 us |   mxfp8 us |
+|-----:|-----:|-----:|:---------------|----------:|-----------:|
+|    1 | 2304 | 6144 | flydsl         |   7.54116 |    8.96068 |
+|   32 | 2304 | 6144 | flydsl         |   8.90196 |   10.1673  |
+|  256 | 2304 | 6144 | flydsl         |  21.0678  |   16.2492  |
+| 4096 | 2304 | 6144 | flydsl         | 161.531   |   81.2592  |
+|    1 | 2560 | 6144 | flydsl         |   8.1291  |    7.48308 |
+|   32 | 2560 | 6144 | flydsl         |   9.43416 |    9.88455 |
+|  256 | 2560 | 6144 | flydsl         |  19.1412  |   15.84    |
+| 4096 | 2560 | 6144 | flydsl         | 202.925   |   81.1208  |
+|    1 | 6144 | 2048 | flydsl         |   7.12587 |    5.65744 |
+|   32 | 6144 | 2048 | triton         |   7.88388 |    6.09128 |
+|  256 | 6144 | 2048 | flydsl         |  14.5691  |   10.7288  |
+| 4096 | 6144 | 2048 | flydsl         | 103.42    |   63.4581  |
+| 4096 | 6144 | 3072 | flydsl         | 166.952   |   88.1024  |
+| 4096 | 6144 | 6144 | torch          | 253.171   |  177.396   |
+
+
+## Pre-PR review
+
+The final functional review passed 140 tests plus 37 subtests. Coverage includes:
+plain/preshuffled B, both direct/LDS paths, BF16/FP32, bias, split/slice/HTI,
+minimal pipeline and scale-chunk boundaries, K=64 fallback, non-contiguous
+inputs/scales, storage offsets and output guards, batched tgemm, streams/graphs,
+inductor, real per-32 quantization, CSV lookup/mismatch rejection, architecture
+dispatch isolation, and tuner -> CSV -> CPU-only AOT -> fresh-process run-only.
+The checked-in 100-row MiniMax-M3 table passed a fresh-cache AOT build and
+public-entry/tgemm/dirty-output verification with all error columns zero.
+Existing HGEMM split-K and BF16/ordinary FP8 eager/inductor smoke tests passed.
+
+Removed unused split_k arguments from the two main GEMM kernels (the launcher
+and reducer still use the dynamic count), unused output-byte metadata and
+no-effect shape expressions. Host input validation now rejects invalid
+data/device/output/bias before launch. AOT checks that dtype/bias/layout/target
+CSV fields agree with kernelName rather than producing an unusable cache entry.
+
+Limits of this review:
+- gfx1250 hardware was not exercised; its original ASM function body and ABI
+  are preserved and dispatch forwarding is tested with a stub on gfx950.
+- The expanded direct/LDS B tuning axis is implemented and smoke-tested, but
+  the shipped table preserves the previously tuned path choices. It has NOT
+  been exhaustively retuned across both B paths.
+- No full-model inference, memory-sanitizer run, or exhaustive shape-space
+  proof is claimed. GEMM measurements exclude quantization/weight preparation.

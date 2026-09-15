@@ -12,15 +12,12 @@ from flydsl.runtime.device import get_rocm_arch
 
 from .gemm_a16w16_gfx950 import (
     _dynamic_tensor_arg,
-    get_split_k_buffers,
     write_cshuffle_vec_to_global,
 )
 from .gemm_a16w16_gfx950_utils import (
     GFX950_DMA_BYTES,
     GFX950_WAVE_SIZE,
-    SPLIT_K_SEMAPHORE_MAX_LEN,
     BlockSwizzle,
-    SplitKProtocol,
     get_wave_lds_offset,
     wait_vmcnt_and_barrier,
 )
@@ -29,8 +26,6 @@ from .scaled_gemm_gfx950_utils import async_load_operand, make_fp8_lds_layout
 
 SCALED_GEMM_DTYPE_FP32 = 1
 SCALED_GEMM_DTYPE_BF16 = 2
-SCALED_GEMM_DTYPE_FP8 = 4
-SCALED_GEMM_DTYPE_MXFP8 = 5
 MXFP8_BLOCK_SIZE = 32
 # Two four-tile buffers occupy the same LDS as one eight-tile buffer.
 MXFP8_HTI_SCALE_CHUNK_TILES = 4
@@ -39,7 +34,6 @@ MXFP8_HTI_SCALE_BUFFERS = 2
 
 @fx.struct
 class ScaledGemmGfx950Param:
-    in_dtype_id: fx.Constexpr[int]
     out_dtype_id: fx.Constexpr[int]
     block_m: fx.Constexpr[int]
     block_n: fx.Constexpr[int]
@@ -55,15 +49,13 @@ class ScaledGemmGfx950Param:
     b_is_transposed: fx.Constexpr[bool]
     has_bias: fx.Constexpr[bool]
     bpreshuffle: fx.Constexpr[bool]
-    scale_block: fx.Constexpr[int]
-    scale_a_transposed: fx.Constexpr[bool]
+    direct_b: fx.Constexpr[bool]
     mma_m: fx.Constexpr[int]
     mma_n: fx.Constexpr[int]
     mma_k: fx.Constexpr[int]
     # derived params
     async_load_bytes: fx.Constexpr[int]
     in_data_bytes: fx.Constexpr[int]
-    out_data_bytes: fx.Constexpr[int]
     cshuffle_r2g_vec_size: fx.Constexpr[int]
     ldg_x_threads: fx.Constexpr[int]
     block_threads: fx.Constexpr[int]
@@ -111,11 +103,7 @@ def mxfp8_scale_stage_bytes(rows, block_k, block_threads):
 def uses_lds_mxfp8_scales(param):
     # Four E8M0 bytes cover 128 K elements. K=64 tiles keep scalar loads:
     # their two-byte rows/tile offsets need not satisfy dword DMA alignment.
-    return (
-        param.in_dtype_id == SCALED_GEMM_DTYPE_MXFP8
-        and param.scale_block == 32
-        and param.block_k % 128 == 0
-    )
+    return param.block_k % 128 == 0
 
 
 def async_load_mxfp8_scales(
@@ -180,8 +168,11 @@ def async_load_mxfp8_scale_chunk(
         fx.copy_atom_call(atom, src, dst)
 
 
+def uses_direct_b(bpreshuffle, use_hti, mma_k):
+    return bpreshuffle and not use_hti and mma_k == 128
+
+
 def make_scaled_gemm_gfx950_param(
-    in_dtype_id: int = SCALED_GEMM_DTYPE_FP8,
     out_dtype_id: int = SCALED_GEMM_DTYPE_BF16,
     block_m: int = 256,
     block_n: int = 256,
@@ -197,24 +188,19 @@ def make_scaled_gemm_gfx950_param(
     b_is_transposed: bool = True,
     has_bias: bool = False,
     bpreshuffle: bool = False,
-    scale_block: int = 32,
-    scale_a_transposed: bool = False,
+    direct_b: bool = False,
     mma_m: int = 16,
     mma_n: int = 16,
     mma_k: int = 128,
 ) -> ScaledGemmGfx950Param:
-    if scale_block not in (32, 128):
-        raise ValueError("scale_block must be 32 (MXFP8) or 128 (blockscale)")
-    if scale_block == 32 and scale_a_transposed:
-        raise ValueError("1x32 scales must be row-major")
+    if not isinstance(direct_b, bool):
+        raise TypeError("direct_b must be bool")
+    if direct_b and not uses_direct_b(bpreshuffle, use_half_tile_interleaved, mma_k):
+        raise ValueError("direct_b requires preshuffled B, full-tile and MMA16x16x128")
     if bpreshuffle and (a_is_transposed or not b_is_transposed):
-        raise ValueError("bpreshuffle requires the NT layout")
-    if in_dtype_id not in (SCALED_GEMM_DTYPE_FP8, SCALED_GEMM_DTYPE_MXFP8):
-        raise ValueError(f"unsupported in_dtype_id={in_dtype_id}")
+        raise ValueError("bpreshuffle requires NT layout")
     if out_dtype_id not in (SCALED_GEMM_DTYPE_BF16, SCALED_GEMM_DTYPE_FP32):
-        raise ValueError(
-            f"unsupported out_dtype_id={out_dtype_id} for in_dtype_id={in_dtype_id}"
-        )
+        raise ValueError(f"unsupported out_dtype_id={out_dtype_id}")
     if block_m <= 0 or block_n <= 0 or block_k <= 0 or stages <= 0 or split_k <= 0:
         raise ValueError(
             "block_m, block_n, block_k, stages, and split_k must be positive"
@@ -260,16 +246,14 @@ def make_scaled_gemm_gfx950_param(
             else max_cshuffle_r2g_vec_size
         )
         assert block_n % cshuffle_r2g_vec_size == 0
-    smem_bytes = stages * (block_m + block_n) * block_k * in_dbytes
+    smem_bytes = stages * block_m * block_k * in_dbytes + (
+        16 if direct_b else stages * block_n * block_k * in_dbytes
+    )
     # Keep FP32 outputs and local slice-K reductions in FP32 until the
     # final global store; otherwise cancellation loses BF16 bits per slice.
-    shuffle_bytes = 4 if out_dbytes == 4 or k_waves > 1 else 2
+    shuffle_bytes = 4 if out_dbytes == 4 or k_waves > 1 or (split_k > 1) else 2
     smem_bytes = max(smem_bytes, k_waves * block_m * block_n * shuffle_bytes)
-    if (
-        in_dtype_id == SCALED_GEMM_DTYPE_MXFP8
-        and scale_block == 32
-        and block_k % 128 == 0
-    ):
+    if block_k % 128 == 0:
         parts = 2 if use_half_tile_interleaved else 1
         if use_half_tile_interleaved and block_k == 128:
             smem_bytes += (
@@ -374,11 +358,7 @@ def make_scaled_gemm_gfx950_param(
             f"required={block_n * block_k}"
         )
     scale_load_iters = 0
-    if (
-        in_dtype_id == SCALED_GEMM_DTYPE_MXFP8
-        and scale_block == 32
-        and block_k % 128 == 0
-    ):
+    if block_k % 128 == 0:
         parts = 2 if use_half_tile_interleaved else 1
         scale_load_iters = (
             parts
@@ -412,7 +392,6 @@ def make_scaled_gemm_gfx950_param(
             f"covered_k={mma_k_repeat * k_waves * mma_k}"
         )
     return ScaledGemmGfx950Param(
-        in_dtype_id=in_dtype_id,
         out_dtype_id=out_dtype_id,
         block_m=block_m,
         block_n=block_n,
@@ -428,11 +407,9 @@ def make_scaled_gemm_gfx950_param(
         b_is_transposed=b_is_transposed,
         has_bias=has_bias,
         bpreshuffle=bpreshuffle,
-        scale_block=scale_block,
-        scale_a_transposed=scale_a_transposed,
+        direct_b=direct_b,
         async_load_bytes=GFX950_DMA_BYTES,
         in_data_bytes=in_dbytes,
-        out_data_bytes=out_dbytes,
         cshuffle_r2g_vec_size=cshuffle_r2g_vec_size,
         ldg_x_threads=ldg_x_threads,
         block_threads=block_threads,
@@ -445,7 +422,7 @@ def make_scaled_gemm_gfx950_param(
 
 
 def make_scaled_gemm_gfx950_kernel_name(param: ScaledGemmGfx950Param):
-    dtype_str = "mxfp8" if param.in_dtype_id == SCALED_GEMM_DTYPE_MXFP8 else "fp8"
+    dtype_str = "mxfp8"
     out_suffix = "_fp32" if param.out_dtype_id == SCALED_GEMM_DTYPE_FP32 else ""
     name = f"hgemm_{dtype_str}{out_suffix}_t{param.block_m}x{param.block_n}x{param.block_k}x{param.stages}"
     name += "_ksd" if param.is_split_k else "_ks1"
@@ -456,10 +433,7 @@ def make_scaled_gemm_gfx950_kernel_name(param: ScaledGemmGfx950Param):
     b_layout = "t" if param.b_is_transposed else "n"
     name += f"_l{a_layout}{b_layout}"
     name += "_phti" if param.use_half_tile_interleaved else "_pft"
-    return (
-        name
-        + f"_bp{int(param.bpreshuffle)}_sb{param.scale_block}_sat{int(param.scale_a_transposed)}"
-    )
+    return name + f"_bp{int(param.bpreshuffle)}_bd{int(param.direct_b)}"
 
 
 def make_gemm_ab_lds_layouts(rows_a, rows_b, block_k, a_is_transposed, b_is_transposed):
@@ -526,12 +500,7 @@ def make_scaled_tiled_mma(param: ScaledGemmGfx950Param):
     if const_expr(param.mma_k == 128):
         k_perm = fx.make_layout((16, 2, 4), (1, 64, 16))
     elif const_expr(param.mma_k == 64):
-        if const_expr(param.in_dtype_id == SCALED_GEMM_DTYPE_MXFP8):
-            # f8f6f4 packs two 16-byte strips per lane. Preserve logical
-            # 32-element scale groups (the PTPC path can permute K freely).
-            k_perm = fx.make_layout((16, 2, 2), (1, 32, 16))
-        else:
-            k_perm = fx.make_layout((32, 2), (1, 32))
+        k_perm = fx.make_layout((16, 2, 2), (1, 32, 16))
     else:
         assert (
             False
@@ -591,9 +560,7 @@ def mxfp8_gemm(
         else:
             row = m_offset + (mi * param.m_waves + wave_m) * param.mma_m + scale_lane
             safe_row = (row < m).select(row, 0)
-            a_scales.append(
-                scale_a[safe_row, scale_k // (param.scale_block // 32)].to(fx.Int32)
-            )
+            a_scales.append(scale_a[safe_row, scale_k].to(fx.Int32))
     b_scales = []
     for ni in range_constexpr(fx.size(frag_B.shape[1]).unpack()):
         if const_expr(scales_are_fragments):
@@ -601,12 +568,7 @@ def mxfp8_gemm(
         else:
             col = n_offset + (ni * param.n_waves + wave_n) * param.mma_n + scale_lane
             safe_col = (col < n).select(col, 0)
-            b_scales.append(
-                scale_b[
-                    safe_col // (128 if const_expr(param.scale_block == 128) else 1),
-                    scale_k // (param.scale_block // 32),
-                ].to(fx.Int32)
-            )
+            b_scales.append(scale_b[safe_col, scale_k].to(fx.Int32))
 
     # Atom calls need rank-1 value vectors; coalesce only changes the view.
     for ni in range_constexpr(fx.size(frag_B.shape[1]).unpack()):
@@ -622,6 +584,28 @@ def mxfp8_gemm(
             )
 
 
+def load_preshuffled_b(frag, b_buf, tid, n_offset, k_offset, n, leading_stride, param):
+    """Two contiguous 16B strips per lane in shuffle_weight's (16,16) layout."""
+    lane = tid % GFX950_WAVE_SIZE
+    wave_n = tid // GFX950_WAVE_SIZE % param.n_waves
+    atom = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), fx.Float8E4M3FN)
+    strip = fx.make_layout(16, 1)
+    for ni in range_constexpr(fx.size(frag.shape[1]).unpack()):
+        col = n_offset + (ni * param.n_waves + wave_n) * 16 + lane % 16
+        safe_col = (col < n).select(col, 0)
+        kk = k_offset + lane // 16 * 16
+        base = (
+            safe_col // 16 * leading_stride * 16 + kk // 16 * 256 + safe_col % 16 * 16
+        )
+        lo = fx.make_rmem_tensor(strip, fx.Float8E4M3FN)
+        hi = fx.make_rmem_tensor(strip, fx.Float8E4M3FN)
+        fx.copy_atom_call(atom, fx.make_view(fx.get_iter(b_buf) + base, strip), lo)
+        fx.copy_atom_call(
+            atom, fx.make_view(fx.get_iter(b_buf) + base + 1024, strip), hi
+        )
+        fx.coalesce(frag[None, ni]).store(lo.load().shuffle(hi.load(), list(range(32))))
+
+
 @flyc.kernel
 def scaled_gemm_gfx950_kernel(
     out: fx.Tensor,
@@ -630,19 +614,24 @@ def scaled_gemm_gfx950_kernel(
     scale_a: fx.Tensor,
     scale_b: fx.Tensor,
     bias: fx.Tensor,
-    semaphore: fx.Tensor,
-    signal: fx.Tensor,
+    workspace: fx.Tensor,
     m: fx.Int32,
     n: fx.Int32,
     k: fx.Int32,
-    split_k: fx.Int32,
     working_k: fx.Int32,
     a_leading_stride: fx.Int32,
     b_leading_stride: fx.Int32,
     param: ScaledGemmGfx950Param,
 ):
     tiled_mma = make_scaled_tiled_mma(param)
-    is_split_k = param.is_split_k
+    direct_b = param.direct_b
+    partial_split = param.is_split_k
+    if const_expr(partial_split):
+        out = fx.make_view(
+            fx.get_iter(workspace)
+            + fx.Int64(fx.block_idx.y) * fx.Int64(m) * fx.Int64(n),
+            fx.make_layout((m, n), (n, 1)),
+        )
     is_slice_k = param.k_waves > 1
     block_m = param.block_m
     block_n = param.block_n
@@ -657,23 +646,18 @@ def scaled_gemm_gfx950_kernel(
     elem_dtype = fx.Float8E4M3FN
     global_output_dtype = (
         fx.Float32
-        if const_expr(param.out_dtype_id == SCALED_GEMM_DTYPE_FP32)
+        if const_expr(param.out_dtype_id == SCALED_GEMM_DTYPE_FP32 or partial_split)
         else fx.BFloat16
     )
     shuffle_dtype = (
         fx.Float32
-        if const_expr(param.out_dtype_id == SCALED_GEMM_DTYPE_FP32 or param.k_waves > 1)
+        if const_expr(
+            param.out_dtype_id == SCALED_GEMM_DTYPE_FP32
+            or param.k_waves > 1
+            or partial_split
+        )
         else fx.BFloat16
     )
-    if const_expr(is_split_k):
-        splitk_protocol = SplitKProtocol(
-            block_m,
-            block_n,
-            cshuffle_r2g_vec_size,
-            param.out_data_bytes,
-            block_threads,
-            param.has_bias,
-        )
 
     tid = fx.thread_idx.x
     threads_per_k_slice = param.m_waves * param.n_waves * GFX950_WAVE_SIZE
@@ -696,7 +680,7 @@ def scaled_gemm_gfx950_kernel(
     @fx.struct
     class SharedABStorage:
         a: fx.Array[elem_dtype, stages * block_m * block_k, 16]
-        b: fx.Array[elem_dtype, stages * block_n * block_k, 16]
+        b: fx.Array[elem_dtype, 16 if direct_b else stages * block_n * block_k, 16]
 
     @fx.union
     class SharedStorage:
@@ -730,27 +714,10 @@ def scaled_gemm_gfx950_kernel(
             .peek()
             .ptr
         )
-    if const_expr(param.has_bias):
+    if const_expr(param.has_bias and not partial_split):
         bias_buf = fx.rocdl.make_buffer_tensor(bias, max_size=True)
     else:
         bias_buf = None
-
-    if const_expr(is_split_k):
-        splitk_protocol.init(
-            semaphore,
-            signal,
-            out,
-            bias,
-            tid,
-            ks_idx,
-            m,
-            n,
-            block_m_offset,
-            block_n_offset,
-            global_output_dtype,
-            fx.block_idx.x,
-            n,
-        )
 
     ab_load_context = make_gemm_ab_load_context(
         elem_dtype,
@@ -817,13 +784,8 @@ def scaled_gemm_gfx950_kernel(
     thr_mma_cRow = thr_mma.partition_C(row_coords)
     thr_mma_cCol = thr_mma.partition_C(col_coords)
 
-    # A16W16 can seed frag_C with bias (C = A@B + bias). PTPC is
-    # C = (A@B) * scale_a * scale_b + bias, so bias must not enter acc.
-    # Split-K: zero_c() writes bias (or 0) into global C; partials atomic-add.
-    # Non-split: add bias after the epilogue scale, same as A16W16's elif.
+    # Accumulate in FP32. With split-K, bias is added once by the reducer.
     frag_C.fill(0.0)
-    if const_expr(is_split_k):
-        splitk_protocol.zero_c()
 
     def async_load_a_to_lds(k_tile, stage):
         async_load_operand(
@@ -845,12 +807,13 @@ def scaled_gemm_gfx950_kernel(
             )
 
     def async_load_b_to_lds(k_tile, stage):
-        async_load_operand(
-            b_load_operand,
-            lds_base=smem_b + stage * block_n * block_k,
-            global_outer_offset=block_n_offset,
-            k_tile=k_tile,
-        )
+        if const_expr(not direct_b):
+            async_load_operand(
+                b_load_operand,
+                lds_base=smem_b + stage * block_n * block_k,
+                global_outer_offset=block_n_offset,
+                k_tile=k_tile,
+            )
         if const_expr(use_lds_scale):
             async_load_mxfp8_scales(
                 scale_b_buf,
@@ -872,22 +835,34 @@ def scaled_gemm_gfx950_kernel(
         )
 
         def compute_k_chunk(block_k_iter):
-            frag_A_chunk = frag_A[None, None, block_k_iter]
-            fx.copy(
-                b_s2r_copy_atom,
-                thr_sB_s2r[None, None, block_k_iter],
-                frag_B_retile[None, None, block_k_iter],
-            )
+            frag_A_chunk = frag_A[None, None, 0]
+            if const_expr(direct_b):
+                load_preshuffled_b(
+                    frag_B[None, None, 0],
+                    b_buf,
+                    tid_in_k_slice,
+                    block_n_offset,
+                    ks_begin + k_tile * block_k + block_k_iter * param.mma_k,
+                    n,
+                    b_leading_stride,
+                    param,
+                )
+            else:
+                fx.copy(
+                    b_s2r_copy_atom,
+                    thr_sB_s2r[None, None, block_k_iter],
+                    frag_B_retile[None, None, 0],
+                )
             fx.copy(
                 a_s2r_copy_atom,
                 thr_sA_s2r[None, None, block_k_iter],
-                frag_A_retile[None, None, block_k_iter],
+                frag_A_retile[None, None, 0],
             )
             if const_expr(use_lds_scale):
                 mxfp8_gemm(
                     frag_C,
                     frag_A_chunk,
-                    frag_B[None, None, block_k_iter],
+                    frag_B[None, None, 0],
                     fx.make_view(
                         smem_sa + read_stage * scale_a_stage_bytes,
                         fx.make_layout((block_m, scale_k), (scale_k, 1)),
@@ -904,11 +879,11 @@ def scaled_gemm_gfx950_kernel(
                     block_n,
                     param,
                 )
-            elif const_expr(param.in_dtype_id == SCALED_GEMM_DTYPE_MXFP8):
+            else:
                 mxfp8_gemm(
                     frag_C,
                     frag_A_chunk,
-                    frag_B[None, None, block_k_iter],
+                    frag_B[None, None, 0],
                     scale_a_buf,
                     scale_b_buf,
                     tid_in_k_slice,
@@ -919,21 +894,12 @@ def scaled_gemm_gfx950_kernel(
                     n,
                     param,
                 )
-            else:
-                fx.gemm(
-                    tiled_mma,
-                    frag_C,
-                    frag_A_chunk,
-                    frag_B[None, None, block_k_iter],
-                    frag_C,
-                    traversal_order=fx.GemmTraversalOrder.KNM,
-                )
 
-        for k_slice in range_constexpr(k_waves):
-            if k_wave_idx == k_slice:
-                for block_k_iter in range_constexpr(k_mma_iters_per_wave):
-                    k_iter = k_slice * k_mma_iters_per_wave + block_k_iter
-                    compute_k_chunk(k_iter)
+        # Each K-wave loads only its own slice into the same small register
+        # fragment. Avoid divergent per-slice branches and loop-carried
+        # partially initialized fragments (LLVM otherwise spills/aborts).
+        for ki in range_constexpr(k_mma_iters_per_wave):
+            compute_k_chunk(k_wave_idx * k_mma_iters_per_wave + ki)
 
     for stage in range_constexpr(stages - 1):
         async_load_b_to_lds(stage, stage)
@@ -962,21 +928,15 @@ def scaled_gemm_gfx950_kernel(
 
     frag_C_out = fx.make_fragment_like(frag_C, shuffle_dtype)
     for i in range_constexpr(fx.size(frag_C.shape).unpack()):
-        row = fx.get_scalar(thr_mma_cRow[i])
         col = fx.get_scalar(thr_mma_cCol[i])
-        global_row = block_m_offset + row
         global_col = block_n_offset + col
-        safe_m = (global_row < m).select(global_row, 0)
         safe_n = (global_col < n).select(global_col, 0)
         acc = frag_C[i]
-        if const_expr(param.in_dtype_id == SCALED_GEMM_DTYPE_FP8):
-            acc = acc * scale_a_buf[safe_m] * scale_b_buf[safe_n]
-        if const_expr(param.has_bias):  # noqa: SIM102 - staged compiler branch
-            if const_expr(not is_split_k):
-                bias_val = bias_buf[safe_n].to(fx.Float32)
-                if const_expr(is_slice_k):
-                    bias_val = (k_wave_idx == 0).select(bias_val, fx.Float32(0.0))
-                acc = acc + bias_val
+        if const_expr(param.has_bias and not partial_split):
+            bias_val = bias_buf[safe_n].to(fx.Float32)
+            if const_expr(is_slice_k):
+                bias_val = (k_wave_idx == 0).select(bias_val, fx.Float32(0.0))
+            acc = acc + bias_val
         frag_C_out[i] = acc.to(shuffle_dtype)
 
     gpu.barrier()
@@ -985,10 +945,7 @@ def scaled_gemm_gfx950_kernel(
         col = fx.get_scalar(thr_mma_cCol[i])
         sC_write[row, col] = frag_C_out[i]
 
-    if const_expr(is_split_k):
-        splitk_protocol.wait_until_initialized()
-    else:
-        gpu.barrier()
+    gpu.barrier()
 
     cshuffle_r2g_x_threads = block_n // cshuffle_r2g_vec_size
     cshuffle_vectors = block_m * block_n // cshuffle_r2g_vec_size
@@ -1023,11 +980,9 @@ def scaled_gemm_gfx950_kernel(
                     out_buf,
                     global_row * n + global_col,
                     c_vec.to(global_output_dtype),
-                    is_split_k,
-                    param.out_dtype_id == SCALED_GEMM_DTYPE_FP32,
+                    False,
+                    param.out_dtype_id == SCALED_GEMM_DTYPE_FP32 or partial_split,
                 )
-    if const_expr(is_split_k):
-        splitk_protocol.finish_split(split_k)
 
 
 @flyc.kernel
@@ -1038,19 +993,23 @@ def scaled_gemm_hti_gfx950_kernel(
     scale_a: fx.Tensor,
     scale_b: fx.Tensor,
     bias: fx.Tensor,
-    semaphore: fx.Tensor,
-    signal: fx.Tensor,
+    workspace: fx.Tensor,
     m: fx.Int32,
     n: fx.Int32,
     k: fx.Int32,
-    split_k: fx.Int32,
     working_k: fx.Int32,
     a_leading_stride: fx.Int32,
     b_leading_stride: fx.Int32,
     param: ScaledGemmGfx950Param,
 ):
     tiled_mma = make_scaled_tiled_mma(param)
-    is_split_k = param.is_split_k
+    partial_split = param.is_split_k
+    if const_expr(partial_split):
+        out = fx.make_view(
+            fx.get_iter(workspace)
+            + fx.Int64(fx.block_idx.y) * fx.Int64(m) * fx.Int64(n),
+            fx.make_layout((m, n), (n, 1)),
+        )
     block_m = param.block_m
     block_n = param.block_n
     block_k = param.block_k
@@ -1065,23 +1024,18 @@ def scaled_gemm_hti_gfx950_kernel(
     elem_dtype = fx.Float8E4M3FN
     global_output_dtype = (
         fx.Float32
-        if const_expr(param.out_dtype_id == SCALED_GEMM_DTYPE_FP32)
+        if const_expr(param.out_dtype_id == SCALED_GEMM_DTYPE_FP32 or partial_split)
         else fx.BFloat16
     )
     shuffle_dtype = (
         fx.Float32
-        if const_expr(param.out_dtype_id == SCALED_GEMM_DTYPE_FP32 or param.k_waves > 1)
+        if const_expr(
+            param.out_dtype_id == SCALED_GEMM_DTYPE_FP32
+            or param.k_waves > 1
+            or partial_split
+        )
         else fx.BFloat16
     )
-    if const_expr(is_split_k):
-        splitk_protocol = SplitKProtocol(
-            block_m,
-            block_n,
-            cshuffle_r2g_vec_size,
-            param.out_data_bytes,
-            block_threads,
-            param.has_bias,
-        )
 
     tid = fx.thread_idx.x
     wid = tid // GFX950_WAVE_SIZE
@@ -1156,27 +1110,10 @@ def scaled_gemm_hti_gfx950_kernel(
         if const_expr(not use_scale_chunk):
             half_ldg_a_iters += scale_a_stage_bytes // (block_threads * 4)
             half_ldg_b_iters += scale_b_stage_bytes // (block_threads * 4)
-    if const_expr(param.has_bias):
+    if const_expr(param.has_bias and not partial_split):
         bias_buf = fx.rocdl.make_buffer_tensor(bias, max_size=True)
     else:
         bias_buf = None
-
-    if const_expr(is_split_k):
-        splitk_protocol.init(
-            semaphore,
-            signal,
-            out,
-            bias,
-            tid,
-            ks_idx,
-            m,
-            n,
-            block_m_offset,
-            block_n_offset,
-            global_output_dtype,
-            fx.block_idx.x,
-            n,
-        )
 
     ab_load_context = make_gemm_ab_load_context(
         elem_dtype,
@@ -1425,7 +1362,7 @@ def scaled_gemm_hti_gfx950_kernel(
                     param,
                     scales_are_fragments=True,
                 )
-            elif const_expr(param.in_dtype_id == SCALED_GEMM_DTYPE_MXFP8):
+            else:
                 mxfp8_gemm(
                     frag_C,
                     frag_A[None, None, block_k_iter],
@@ -1440,15 +1377,6 @@ def scaled_gemm_hti_gfx950_kernel(
                     n,
                     param,
                 )
-            else:
-                fx.gemm(
-                    tiled_mma,
-                    frag_C,
-                    frag_A[None, None, block_k_iter],
-                    frag_B[None, None, block_k_iter],
-                    frag_C,
-                    traversal_order=fx.GemmTraversalOrder.KNM,
-                )
         if const_expr(emit_sched_barrier):
             rocdl.sched_barrier(0)
 
@@ -1461,16 +1389,11 @@ def scaled_gemm_hti_gfx950_kernel(
         for i in range_constexpr(fx.size(frag_C.shape).unpack()):
             row = fx.get_scalar(thr_mma_cRow[i])
             col = fx.get_scalar(thr_mma_cCol[i])
-            global_row = block_m_offset + m_part * half_block_m + row
             global_col = block_n_offset + n_part * half_block_n + col
-            safe_m = (global_row < m).select(global_row, 0)
             safe_n = (global_col < n).select(global_col, 0)
             acc = frag_C[i]
-            if const_expr(param.in_dtype_id == SCALED_GEMM_DTYPE_FP8):
-                acc = acc * scale_a_buf[safe_m] * scale_b_buf[safe_n]
-            if const_expr(param.has_bias):  # noqa: SIM102 - staged compiler branch
-                if const_expr(not is_split_k):
-                    acc = acc + bias_buf[safe_n].to(fx.Float32)
+            if const_expr(param.has_bias and not partial_split):
+                acc = acc + bias_buf[safe_n].to(fx.Float32)
             sC[row, col] = acc.to(shuffle_dtype)
 
     def store_half_tile_to_global(m_part, n_part):
@@ -1497,8 +1420,8 @@ def scaled_gemm_hti_gfx950_kernel(
                         out_buf,
                         global_row * n + global_col,
                         c_vec.to(global_output_dtype),
-                        is_split_k,
-                        param.out_dtype_id == SCALED_GEMM_DTYPE_FP32,
+                        False,
+                        param.out_dtype_id == SCALED_GEMM_DTYPE_FP32 or partial_split,
                     )
 
     c00 = make_c_fragment(0, 0)
@@ -1506,13 +1429,11 @@ def scaled_gemm_hti_gfx950_kernel(
     c10 = make_c_fragment(1, 0)
     c11 = make_c_fragment(1, 1)
 
-    # PTPC must not seed acc with bias; scale happens in store_half_tile_to_lds.
+    # Bias is added in the epilogue or, for split-K, once in the reducer.
     c00.fill(0.0)
     c01.fill(0.0)
     c10.fill(0.0)
     c11.fill(0.0)
-    if const_expr(is_split_k):
-        splitk_protocol.zero_c()
 
     if const_expr(use_scale_chunk):
         # Prime the first slot while all waves are aligned, before the
@@ -1586,8 +1507,6 @@ def scaled_gemm_hti_gfx950_kernel(
     k_tile = main_loop_end
     prefetch_scale_chunk(k_tile)
     # 0
-    if const_expr(is_split_k):
-        wait_vmcnt_and_barrier(0)
     b0 = load_b_fragment(0, 0, k_tile)
     a0 = load_a_fragment(0, 0, k_tile)
     async_load_a_to_lds(1, k_tile + 1, 1)
@@ -1625,7 +1544,7 @@ def scaled_gemm_hti_gfx950_kernel(
         rocdl.s_barrier()
     wait_vmcnt_and_barrier(0)
 
-    # Overlap the last two MMA groups with the PTPC epilogue, as in the
+    # Overlap the last two MMA groups with the output epilogue, as in the
     # reference: C00/C01 -> global, then C10, then C11.
     store_half_tile_to_lds(0, 0, c00)
     store_half_tile_to_lds(0, 1, c01)
@@ -1633,8 +1552,6 @@ def scaled_gemm_hti_gfx950_kernel(
     rocdl.sched_barrier(0)
     rocdl.s_barrier()
     rocdl.sched_barrier(0)
-    if const_expr(is_split_k):
-        splitk_protocol.wait_until_initialized()
     store_half_tile_to_global(0, 0)
     store_half_tile_to_global(0, 1)
     store_half_tile_to_lds(1, 0, c10)
@@ -1645,8 +1562,36 @@ def scaled_gemm_hti_gfx950_kernel(
     store_half_tile_to_lds(1, 1, c11)
     rocdl.s_barrier()
     store_half_tile_to_global(1, 1)
-    if const_expr(is_split_k):
-        splitk_protocol.finish_split(split_k)
+
+
+@flyc.kernel
+def scaled_gemm_splitk_reduce(
+    partials: fx.Tensor,
+    out: fx.Tensor,
+    bias: fx.Tensor,
+    m: fx.Int32,
+    n: fx.Int32,
+    split_k: fx.Int32,
+    param: ScaledGemmGfx950Param,
+):
+    # One vector per thread; sum in a fixed order and cast only once.
+    offset = (fx.block_idx.x * 256 + fx.thread_idx.x) * 4
+    if offset < m * n:
+        acc = fx.Vector.from_elements([fx.Float32(0.0)] * 4, fx.Float32)
+        for split in range(split_k):
+            value = fx.ptr_load(
+                fx.get_iter(partials)
+                + fx.Int64(split) * fx.Int64(m) * fx.Int64(n)
+                + offset,
+                result_type=fx.Vector.make_type(4, fx.Float32),
+            )
+            acc = acc + value
+        if const_expr(param.has_bias):
+            acc = acc + fx.ptr_load(
+                fx.get_iter(bias) + offset % n,
+                result_type=fx.Vector.make_type(4, out.dtype),
+            ).to(fx.Float32)
+        fx.ptr_store(acc.to(out.dtype), fx.get_iter(out) + offset)
 
 
 @flyc.jit
@@ -1657,8 +1602,7 @@ def scaled_gemm_gfx950(
     scale_a: fx.Tensor,
     scale_b: fx.Tensor,
     bias: fx.Tensor,
-    semaphore: fx.Tensor,
-    signal: fx.Tensor,
+    workspace: fx.Tensor,
     split_k: fx.Int32,
     param: ScaledGemmGfx950Param,
     stream: fx.Stream = fx.Stream(None),  # noqa: B008 - FlyDSL signature
@@ -1691,12 +1635,10 @@ def scaled_gemm_gfx950(
         scale_a,
         scale_b,
         bias,
-        semaphore,
-        signal,
+        workspace,
         m,
         n,
         k,
-        split_k,
         working_k,
         a_leading_stride,
         b_leading_stride,
@@ -1707,11 +1649,16 @@ def scaled_gemm_gfx950(
         stream=stream,
     )
 
+    if const_expr(param.is_split_k):
+        scaled_gemm_splitk_reduce._known_block_size = [256, 1, 1]
+        scaled_gemm_splitk_reduce(workspace, out, bias, m, n, split_k, param).launch(
+            grid=((m * n + 1023) // 1024, 1, 1), block=(256, 1, 1), stream=stream
+        )
+
 
 def make_scaled_gemm_param_and_validate(m, n, k, kwargs):
     if min(m, n, k) <= 0:
         return None
-    result = None
     try:
         result = make_scaled_gemm_gfx950_param(**kwargs)
     except (ValueError, AssertionError, TypeError):
@@ -1721,7 +1668,7 @@ def make_scaled_gemm_param_and_validate(m, n, k, kwargs):
         assert_no_k_tail(k, kwargs)
     except AssertionError:
         return None
-    if k % result.scale_block != 0:
+    if k % MXFP8_BLOCK_SIZE != 0:
         return None
     if result.bpreshuffle and n % 16 != 0:
         return None
@@ -1735,15 +1682,8 @@ def make_scaled_gemm_param_and_validate(m, n, k, kwargs):
         return None
     if result.b_is_transposed and k % async_load_vec_size != 0:
         return None
-    num_pid_m = (m + result.block_m - 1) // result.block_m
-    num_pid_n = (n + result.block_n - 1) // result.block_n
-    if split_k > 1:
-        c_elements_per_iteration = result.block_threads * cshuffle_r2g_vec_size
-        if (
-            num_pid_m * num_pid_n > SPLIT_K_SEMAPHORE_MAX_LEN
-            or result.block_m * result.block_n % c_elements_per_iteration != 0
-        ):
-            return None
+    if split_k > 1 and split_k * m * n * 4 > 1 << 32:
+        return None
     return result
 
 
@@ -1799,30 +1739,18 @@ def scaled_gemm(
     layout: str = "nt",
     out_dtype: torch.dtype | None = None,
 ) -> torch.Tensor:
-    """Compute a per-row/per-column FP8 or block-scaled MXFP8 GEMM.
+    """Standard MXFP8: E4M3 data, unshuffled E8M0 [outer,K/32] scales.
 
-    FP8 uses float32 scales of shapes [M] and [N] (per-row/per-column):
-    C = (A @ B) * scale_a[:, None] * scale_b[None, :] [+ bias].
-    MXFP8 is selected by ``torch.float8_e8m0fnu`` or raw ``torch.uint8``
-    scales of shapes [M, K // 32] and [N, K // 32]. Each E8M0 byte scales
-    32 consecutive K elements: C = dequant(A) @ dequant(B) [+ bias].
-    Raw scale byte e represents 2**(e - 127); 255 represents NaN.
-    Scale shapes are independent of ``layout``; no preshuffling is required.
-    Both modes take ``torch.float8_e4m3fn`` data and support the same pipelines.
-    MXFP8 HTI with block_k=128 double-buffers scales in four-K-tile chunks,
-    overlapping next-chunk prefetch with current-chunk computation. This
-    requires no input preshuffle or extra K alignment from the caller.
-
-    Each layout character controls only the corresponding tensor stride:
-    N is row-major and T is column-major. Logical tensor shapes never change.
-    Inputs that violate the selected layout or DMA alignment are rejected.
-    Set ``user_kwargs["split_k"]`` above 1 to atomically reduce K partitions.
-    Set ``user_kwargs["k_waves"]`` above 1 for full-tile workgroup-local slice-K.
-    Set ``user_kwargs["use_half_tile_interleaved"]`` for the A16W16-style HTI
-    pipeline (no slice-K; even K-tile count).
-    ``out_dtype`` may be ``torch.bfloat16`` or ``torch.float32``.
+    Logical A[M,K], B[K,N]; layout describes data strides only. Optional
+    bias has the output dtype. Split-K writes FP32 partials and reduces once.
     """
     user_kwargs = {} if user_kwargs is None else user_kwargs
+    if a.ndim != 2 or b.ndim != 2 or a.shape[1] != b.shape[0]:
+        raise ValueError("expected logical A[M,K] and B[K,N]")
+    if not a.is_cuda or b.device != a.device:
+        raise ValueError("MXFP8 data must be on the same GPU")
+    if a.dtype != torch.float8_e4m3fn or b.dtype != a.dtype:
+        raise ValueError("MXFP8 data must be torch.float8_e4m3fn")
     if stream is None:
         stream = torch.cuda.current_stream(device=a.device)
     if stream.device != a.device:
@@ -1837,13 +1765,8 @@ def scaled_gemm(
     a_is_transposed = layout[0] == "t"
     b_is_transposed = layout[1] == "t"
     device = a.device
-    assert a.device == b.device
-    assert a.ndim == 2 and b.ndim == 2
     m, k = a.shape
-    assert b.shape[0] == k
     n = b.shape[1]
-    assert a.dtype == b.dtype
-    assert a.dtype == torch.float8_e4m3fn
     if a_is_transposed:
         a_vec_size = GFX950_DMA_BYTES // a.element_size()
         if (
@@ -1895,54 +1818,24 @@ def scaled_gemm(
                 f"{GFX950_DMA_BYTES}-byte-aligned data pointer and leading "
                 f"stride; got shape={tuple(b.shape)} and stride={b.stride()}"
             )
-    mx_scale_dtypes = (torch.uint8, torch.float8_e8m0fnu)
-    is_mxfp8 = scale_a.dtype in mx_scale_dtypes or scale_b.dtype in mx_scale_dtypes
-    assert scale_a.device == device and scale_b.device == device
-    if is_mxfp8:
-        if scale_a.dtype not in mx_scale_dtypes or scale_b.dtype not in mx_scale_dtypes:
-            raise ValueError("MXFP8 requires both scales to have E8M0 or uint8 dtype")
-        scale_block = user_kwargs.get("scale_block", 32)
-        if k % scale_block != 0:
-            raise ValueError(f"MXFP8 requires K divisible by {MXFP8_BLOCK_SIZE}")
-        if tuple(scale_a.shape) != (m, k // scale_block):
-            raise ValueError("MXFP8 scale_a has an invalid shape for scale_block")
-        scale_rows = n if scale_block == 32 else (n + 127) // 128
-        if tuple(scale_b.shape) != (scale_rows, k // scale_block):
-            raise ValueError("MXFP8 scale_b has an invalid shape for scale_block")
-        # Preserve E8M0 encodings, not a numeric conversion to integers.
-        # Materialize on the launch stream so strided scale inputs are safe.
-        with torch.cuda.stream(stream):
-            scale_a = scale_a.view(torch.uint8)
-            if user_kwargs.get("scale_a_transposed", False):
-                # contiguous() alone preserves non-unit singleton strides.
-                # Rebuild the compact view so FlyDSL's unit-stride ABI also
-                # holds for decode M=1 and K/scale_block=1.
-                scale_a = (
-                    scale_a.t().contiguous().view(-1).view(k // scale_block, m).t()
-                )
-            else:
-                scale_a = scale_a.contiguous().view(-1).view(m, k // scale_block)
-            scale_b = (
-                scale_b.view(torch.uint8)
-                .contiguous()
-                .view(-1)
-                .view(scale_rows, k // scale_block)
-            )
-            # contiguous() is a no-op on an offset contiguous view. Dword
-            # direct-to-LDS requires 4-byte alignment, including leading stride.
-            if scale_block == 32 and user_kwargs.get("block_k", 128) % 128 == 0:
-                if scale_a.data_ptr() % 4 != 0 or scale_a.stride(0) % 4 != 0:
-                    scale_a = scale_a.clone(memory_format=torch.contiguous_format)
-                if scale_b.data_ptr() % 4 != 0 or scale_b.stride(0) % 4 != 0:
-                    scale_b = scale_b.clone(memory_format=torch.contiguous_format)
-    else:
-        assert scale_a.dtype == torch.float32 and scale_b.dtype == torch.float32
-        assert scale_a.ndim == 1 and scale_a.shape[0] == m
-        assert scale_b.ndim == 1 and scale_b.shape[0] == n
-        if not scale_a.is_contiguous():
-            scale_a = scale_a.contiguous()
-        if not scale_b.is_contiguous():
-            scale_b = scale_b.contiguous()
+    scale_dtypes = (torch.uint8, torch.float8_e8m0fnu)
+    if scale_a.dtype not in scale_dtypes or scale_b.dtype not in scale_dtypes:
+        raise ValueError("MXFP8 requires both scales to be E8M0 or uint8")
+    if scale_a.device != device or scale_b.device != device:
+        raise ValueError("MXFP8 scales must be on the input device")
+    if k % MXFP8_BLOCK_SIZE:
+        raise ValueError("MXFP8 requires K divisible by 32")
+    if scale_a.shape != (m, k // 32) or scale_b.shape != (n, k // 32):
+        raise ValueError("MXFP8 scales must be [M,K/32] and [N,K/32]")
+    # Preserve scale encodings; canonicalize singleton strides for DLPack.
+    with torch.cuda.stream(stream):
+        scale_a = scale_a.view(torch.uint8).contiguous().view(-1).view(m, k // 32)
+        scale_b = scale_b.view(torch.uint8).contiguous().view(-1).view(n, k // 32)
+        if user_kwargs.get("block_k", 128) % 128 == 0:
+            if scale_a.data_ptr() % 4:
+                scale_a = scale_a.clone()
+            if scale_b.data_ptr() % 4:
+                scale_b = scale_b.clone()
     if out_dtype is None:
         out_dtype = torch.bfloat16 if out is None else out.dtype
     if out_dtype not in (torch.bfloat16, torch.float32):
@@ -1950,16 +1843,19 @@ def scaled_gemm(
             f"unsupported output dtype {out_dtype}; expected torch.bfloat16 or torch.float32"
         )
     if out is None:
-        out = torch.empty((m, n), dtype=out_dtype, device=a.device)
-    else:
-        assert out.dtype == out_dtype
-        assert out.device == device
-        assert out.is_contiguous()
-    out = out.view(-1, n)
-    assert out.shape[0] == m
-    assert out.dtype == out_dtype
-
-    if bias is not None and not bias.is_contiguous():
+        out = torch.empty((m, n), dtype=out_dtype, device=device)
+    elif (
+        out.shape != (m, n)
+        or out.dtype != out_dtype
+        or out.device != device
+        or not out.is_contiguous()
+    ):
+        raise ValueError(
+            "out must be contiguous [M,N] on the input device with out_dtype"
+        )
+    if bias is not None:
+        if bias.shape != (n,) or bias.dtype != out_dtype or bias.device != device:
+            raise ValueError("bias must be [N] on the input device with out_dtype")
         bias = bias.contiguous()
 
     kwargs = {
@@ -1978,28 +1874,17 @@ def scaled_gemm(
     kwargs.update(user_kwargs)
     kwargs["a_is_transposed"] = a_is_transposed
     kwargs["b_is_transposed"] = b_is_transposed
-    kwargs["in_dtype_id"] = (
-        SCALED_GEMM_DTYPE_MXFP8 if is_mxfp8 else SCALED_GEMM_DTYPE_FP8
-    )
     kwargs["out_dtype_id"] = (
         SCALED_GEMM_DTYPE_FP32 if out.dtype is torch.float32 else SCALED_GEMM_DTYPE_BF16
     )
     kwargs["has_bias"] = bias is not None
     split_k = kwargs["split_k"]
-    assert_no_k_tail(k, kwargs)
-
-    if bias is not None:
-        assert bias.shape[0] == n
-        assert bias.dtype == out_dtype
-        assert bias.ndim == 1 and bias.device == device
 
     param = make_scaled_gemm_param_and_validate(m, n, k, kwargs)
-    assert param is not None, "unsupported scaled_gemm_gfx950 shape/config"
-    semaphore, signal = (
-        get_split_k_buffers(stream, device) if param.is_split_k else (None, None)
-    )
+    if param is None:
+        raise ValueError("unsupported scaled_gemm_gfx950 shape/config")
     dispatch_args = scaled_gemm_dispatch_args(
-        out, a, b, scale_a, scale_b, bias, semaphore, signal, split_k, param, stream
+        out, a, b, scale_a, scale_b, bias, split_k, param, stream
     )
     run_cached(
         scaled_gemm_gfx950,
@@ -2012,29 +1897,31 @@ def scaled_gemm(
 
 
 def scaled_gemm_dispatch_args(
-    out, a, b, scale_a, scale_b, bias, semaphore, signal, split_k, param, stream
+    out, a, b, scale_a, scale_b, bias, split_k, param, stream
 ):
-    """Identical layout-dynamic ABI for runtime and CPU-only AOT."""
+    """Shared layout-dynamic ABI for runtime and tiny CPU-only AOT inputs."""
     a_arg = _dynamic_tensor_arg(a, 0 if param.a_is_transposed else 1)
     b_arg = _dynamic_tensor_arg(b, 0 if param.b_is_transposed else 1)
     out_arg = _dynamic_tensor_arg(out, 1)
-    is_mxfp8 = param.in_dtype_id == SCALED_GEMM_DTYPE_MXFP8
-    scale_a_arg = _dynamic_tensor_arg(
-        scale_a, 0 if param.scale_a_transposed or not is_mxfp8 else 1
-    )
-    scale_b_arg = _dynamic_tensor_arg(scale_b, 1 if is_mxfp8 else 0)
-    bias_arg = scale_a_arg if bias is None else _dynamic_tensor_arg(bias, 0)
-    if not param.is_split_k:
-        semaphore = signal = scale_a_arg
+    sa_arg = _dynamic_tensor_arg(scale_a, 1)
+    sb_arg = _dynamic_tensor_arg(scale_b, 1)
+    bias_arg = sa_arg if bias is None else _dynamic_tensor_arg(bias, 0)
+    workspace = out_arg
+    if param.is_split_k:
+        partials = torch.empty(
+            (split_k * out.shape[0], out.shape[1]),
+            device=out.device,
+            dtype=torch.float32,
+        )
+        workspace = _dynamic_tensor_arg(partials, 1)
     return (
         out_arg,
         a_arg,
         b_arg,
-        scale_a_arg,
-        scale_b_arg,
+        sa_arg,
+        sb_arg,
         bias_arg,
-        semaphore,
-        signal,
+        workspace,
         split_k,
         param,
         stream,

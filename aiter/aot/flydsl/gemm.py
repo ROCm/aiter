@@ -11,7 +11,7 @@ through ``AITER_CONFIGS`` so model-specific tuned CSVs can be merged the same
 way as runtime JIT config lookup.
 
 Supported kernel families:
-  - ``flydsl_mxfp8_*``                        gfx950 MXFP8 / E8M0 block128 GEMM
+  - ``flydsl_mxfp8_*``                        gfx950 standard 1x32 MXFP8 GEMM
   - ``flydsl_hgemm_*``                        gfx950 A16W16 GEMM kernels
   - ``flydsl_bpreshuflle_*``                  a8w8 preshuffle GEMM kernels
   - ``flydsl_bpreshuffle_8w_*``               gfx950 8-wave a8w8 ptpc GEMM kernels
@@ -217,8 +217,21 @@ def parse_csv(csv_path: str):
                     raise ValueError(
                         f"Invalid MXFP8 name/splitK pair: {kernel_name}, {row.get('splitK')}"
                     )
-                if params is not None:
-                    params = dict(params, kind="mxfp8")
+                expected = {
+                    "out_dtype": {
+                        "torch.bfloat16": "bf16",
+                        "torch.float32": "fp32",
+                    }.get(row.get("outdtype")),
+                    "has_bias": _parse_bool(row.get("bias")),
+                    "bpreshuffle": _parse_bool(row.get("bpreshuffle")),
+                    "target_gfx": gfx
+                    or cu_num_to_arch(cu_num, default=GEMM_AOT_ARCH_DEFAULT),
+                }
+                if any(params[key] != value for key, value in expected.items()):
+                    raise ValueError(
+                        f"MXFP8 CSV fields disagree with kernelName: {kernel_name}"
+                    )
+                params = dict(params, kind="mxfp8")
             elif kernel_name.startswith("flydsl_hgemm"):
                 params = get_flydsl_hgemm_kernel_params(kernel_name)
                 if params is not None:
@@ -397,9 +410,7 @@ def _compile_mxfp8_to_cache(
     k,
     out_dtype,
     has_bias,
-    scale_block,
     bpreshuffle,
-    scale_a_transposed,
     target_gfx,
     **kwargs,
 ):
@@ -416,9 +427,7 @@ def _compile_mxfp8_to_cache(
         raise ValueError("FlyDSL MXFP8 AOT requires gfx950")
     dtype = _torch_dtype_for_kernel(out_dtype)
     config = {key: kwargs[key] for key in CONFIG_KEYS}
-    config = mxfp8_kernel_config(
-        config, dtype, has_bias, scale_block, bpreshuffle, scale_a_transposed
-    )
+    config = mxfp8_kernel_config(config, dtype, has_bias, bpreshuffle)
     param = make_scaled_gemm_param_and_validate(m, n, k, config)
     if param is None:
         raise ValueError(f"Invalid MXFP8 AOT shape/config: {(m, n, k)}, {config}")
@@ -429,14 +438,8 @@ def _compile_mxfp8_to_cache(
         b = torch.empty((16, 128), dtype=a.dtype, device="cpu").t()
         out = torch.empty((8, 16), dtype=dtype, device="cpu")
         sa = torch.empty((8, 8), dtype=torch.uint8, device="cpu")
-        if scale_a_transposed:
-            sa = sa.t()
         sb = torch.empty((16, 8), dtype=torch.uint8, device="cpu")
         bias = torch.empty(16, dtype=dtype, device="cpu") if has_bias else None
-        semaphore = torch.zeros(
-            SPLIT_K_SEMAPHORE_MAX_LEN, dtype=torch.int32, device="cpu"
-        )
-        signal = torch.zeros_like(semaphore)
         args = scaled_gemm_dispatch_args(
             out,
             a,
@@ -444,8 +447,6 @@ def _compile_mxfp8_to_cache(
             sa,
             sb,
             bias,
-            semaphore,
-            signal,
             config["split_k"],
             param,
             fx.Stream(0),

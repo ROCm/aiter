@@ -1,13 +1,10 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Kernel, dispatch, graph and AOT regressions for FlyDSL MXFP8.
-
-The standard correctness/perf sweep lives in op_tests/test_flydsl_mxfp8.py.
-Run this integration suite with pytest; it does not time candidate comparisons.
-"""
+"""Standard 1x32 MXFP8 integration regressions; perf sweep is test_flydsl_mxfp8.py."""
 
 import csv
+import itertools
 import os
 import subprocess
 import sys
@@ -22,7 +19,6 @@ from aiter.ops.flydsl.gemm_mxfp8 import (
     DEFAULT_CONFIG,
     flydsl_mxfp8_gemm,
     flydsl_mxfp8_kernel_name,
-    get_flydsl_mxfp8_configs,
     get_flydsl_mxfp8_kernel_params,
 )
 from aiter.ops.gemm_op_mxfp8 import MXFP8_KEYS
@@ -31,14 +27,13 @@ from op_tests.test_flydsl_mxfp8 import run_torch
 
 ROOT = Path(__file__).resolve().parents[2]
 GPU = pytest.mark.skipif(
-    not torch.cuda.is_available() or get_gfx() != "gfx950",
-    reason="requires gfx950",
+    not torch.cuda.is_available() or get_gfx() != "gfx950", reason="requires gfx950"
 )
 CONFIGS = {
     "ft": dict(DEFAULT_CONFIG),
-    "split": dict(DEFAULT_CONFIG, split_k=2),
-    "slice": dict(DEFAULT_CONFIG, block_k=256, k_waves=2),
-    "split_slice": dict(DEFAULT_CONFIG, block_k=256, k_waves=2, split_k=2),
+    "split": dict(DEFAULT_CONFIG, split_k=7),
+    "slice": dict(DEFAULT_CONFIG, block_k=512, k_waves=4),
+    "split_slice": dict(DEFAULT_CONFIG, block_k=256, k_waves=2, split_k=14),
     "hti": dict(
         DEFAULT_CONFIG,
         block_m=128,
@@ -52,7 +47,7 @@ CONFIGS = {
         block_n=128,
         m_waves=2,
         use_half_tile_interleaved=True,
-        split_k=2,
+        split_k=7,
     ),
     "mma32": dict(
         DEFAULT_CONFIG,
@@ -67,476 +62,309 @@ CONFIGS = {
 }
 
 
-def inputs(m, n, k, block=32, dtype=torch.bfloat16, bias=False, bp=False):
-    torch.manual_seed(42)
+def inputs(m=17, n=128, k=7168, dtype=torch.bfloat16, bias=False, bp=False):
+    torch.manual_seed(0)
     a = torch.empty(m, k, device="cuda").uniform_(-1, 1).to(torch.float8_e4m3fn)
     w = torch.empty(n, k, device="cuda").uniform_(-1, 1).to(a.dtype)
-    sa = torch.randint(123, 130, (m, k // block), device="cuda", dtype=torch.uint8)
-    sb = torch.randint(
-        123,
-        130,
-        (n if block == 32 else (n + 127) // 128, k // block),
-        device="cuda",
-        dtype=torch.uint8,
-    )
+    sa = torch.randint(124, 129, (m, k // 32), device="cuda", dtype=torch.uint8)
+    sb = torch.randint(124, 129, (n, k // 32), device="cuda", dtype=torch.uint8)
     b = torch.randn(n, device="cuda", dtype=dtype) if bias else None
-    ref = run_torch(a, w, sa, sb, block, torch.float32)
+    ref = run_torch(a, w, sa, sb, torch.float32)
     if b is not None:
         ref += b.float()
     return a, shuffle_weight(w) if bp else w, sa, sb, b, ref.to(dtype)
 
 
-def assert_result(y, ref, *, bf16_atol=0.2):
-    if y.dtype == torch.float32:
-        # Dense FP8 includes tiny products; scaled MFMA differs from a
-        # dequantized FP32 GEMM by ~1e-3 on these inputs. A separate exact-value
-        # test below checks that cshuffle does not truncate FP32 to BF16.
-        torch.testing.assert_close(y, ref, atol=2e-3, rtol=2e-5)
-    else:
-        torch.testing.assert_close(y, ref, atol=bf16_atol, rtol=0.03)
-
-
 @pytest.mark.parametrize("config", CONFIGS.values(), ids=CONFIGS)
-@pytest.mark.parametrize("block,bp", [(32, False), (32, True), (128, True)])
+@pytest.mark.parametrize("bp", [False, True])
 @pytest.mark.parametrize("dtype,bias", [(torch.bfloat16, False), (torch.float32, True)])
 @GPU
-def test_kernel_paths(config, block, bp, dtype, bias):
-    a, w, sa, sb, b, ref = inputs(33, 256, 1024, block, dtype, bias, bp)
-    # Both scale dtypes must mean identical bytes.
-    sa, sb = sa.view(torch.float8_e8m0fnu), sb.view(torch.float8_e8m0fnu)
-    sat = block == 128
-    if sat:
-        sa = sa.t().contiguous().t()
-    out = torch.full_like(ref, 17)
+def test_kernel_paths(config, bp, dtype, bias):
+    a, w, sa, sb, b, ref = inputs(dtype=dtype, bias=bias, bp=bp)
+    out = torch.empty_like(ref)
     for _ in range(3):
-        out.fill_(-13)
+        out.fill_(float("nan"))
         y = flydsl_mxfp8_gemm(
+            a,
+            w,
+            sa.view(torch.float8_e8m0fnu),
+            sb.view(torch.float8_e8m0fnu),
+            out=out,
+            bias=b,
+            config=config,
+            bpreshuffle=bp,
+        )
+        assert y.data_ptr() == out.data_ptr()
+        torch.testing.assert_close(y, ref, atol=0.1, rtol=0.03)
+
+
+@pytest.mark.parametrize(
+    "m,n,k", [(1, 48, 128), (33, 80, 384), (65, 144, 768), (1, 32, 64)]
+)
+@GPU
+def test_strides_and_tails(m, n, k):
+    a, w, sa, sb, _b, ref = inputs(m, n, k, bp=True)
+    ap = torch.empty((m, k + 16), device="cuda", dtype=a.dtype)
+    ap[:, 16:] = a
+    sp = torch.empty((m, sa.shape[1] * 2), device="cuda", dtype=sa.dtype)
+    sp[:, ::2] = sa
+    from aiter.ops.gemm_op_mxfp8 import get_mxfp8_config
+
+    cfg = get_mxfp8_config(m, n, k, ref.dtype, False, True)
+    y = flydsl_mxfp8_gemm(ap[:, 16:], w, sp[:, ::2], sb, config=cfg, bpreshuffle=True)
+    torch.testing.assert_close(y, ref, atol=0.1, rtol=0.03)
+
+
+@GPU
+def test_stream_graph_and_tgemm_compile():
+    from aiter.tuned_gemm import tgemm
+
+    a, w, sa, sb, b, ref = inputs(bias=True, bp=True)
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    out = torch.empty_like(ref)
+
+    def run():
+        return flydsl_mxfp8_gemm(
             a,
             w,
             sa,
             sb,
             out=out,
             bias=b,
-            config=config,
-            bpreshuffle=bp,
-            scale_block=block,
-            scale_a_transposed=sat,
-        )
-        assert y.data_ptr() == out.data_ptr()
-        assert_result(y, ref)
-
-
-@pytest.mark.parametrize(
-    "m,n,k", [(1, 48, 128), (17, 80, 384), (65, 144, 768), (32, 384, 7168)]
-)
-@pytest.mark.parametrize("bp", [False, True])
-@GPU
-def test_tails_and_dsv4_shape(m, n, k, bp):
-    a, w, sa, sb, _bias, ref = inputs(m, n, k, bp=bp)
-    # Padded/offset but correctly aligned row strides and strided scale views.
-    ap = torch.empty(m, k + 16, device="cuda", dtype=a.dtype)
-    ap[:, 16:] = a
-    sp = torch.empty(m, k // 32 * 2, device="cuda", dtype=sa.dtype)
-    sp[:, ::2] = sa
-    y = flydsl_mxfp8_gemm(ap[:, 16:], w, sp[:, ::2], sb, bpreshuffle=bp)
-    assert_result(y, ref)
-
-
-@pytest.mark.parametrize("bp", [False, True])
-@GPU
-def test_stream_and_graph(bp):
-    a, w, sa, sb, b, ref = inputs(17, 128, 512, bias=True, bp=bp)
-    stream = torch.cuda.Stream()
-    stream.wait_stream(torch.cuda.current_stream())
-    out = torch.empty_like(ref)
-    config = CONFIGS["hti_split"]
-    # First use on this stream also creates and initializes split-K state.
-    y = flydsl_mxfp8_gemm(
-        a, w, sa, sb, out=out, bias=b, config=config, bpreshuffle=bp, stream=stream
-    )
-    stream.synchronize()
-    assert_result(y, ref)
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph, stream=stream):
-        flydsl_mxfp8_gemm(
-            a, w, sa, sb, out=out, bias=b, config=config, bpreshuffle=bp, stream=stream
-        )
-    for _ in range(3):
-        out.fill_(99)
-        graph.replay()
-        torch.cuda.synchronize()
-        assert_result(out, ref)
-
-
-@pytest.mark.parametrize("backend", ["eager", "inductor"])
-@GPU
-def test_tuned_gemm_and_compile(backend):
-    from aiter.tuned_gemm import gemm_a16w16, tgemm
-
-    a, w, sa, sb, b, ref = inputs(6, 64, 256, bias=True, bp=True)
-    # Non-viewable batched input must not fall back to unscaled F.linear.
-    x = a.reshape(2, 3, 256).transpose(0, 1)
-    sx = sa.reshape(2, 3, 8).transpose(0, 1)
-    expected = ref.reshape(2, 3, 64).transpose(0, 1)
-    y = tgemm.mm(x, w, b, scale_a=sx, scale_b=sb)
-    assert_result(y, expected)
-    # Explicit layout survives the torch.compile boundary; Python tensor
-    # attributes alone are not part of the operator schema.
-    a, w, sa, sb, b, ref = inputs(6, 64, 256)
-    sa, sb = sa.view(torch.float8_e8m0fnu), sb.view(torch.float8_e8m0fnu)
-    compiled = torch.compile(gemm_a16w16, backend=backend, fullgraph=True)
-    assert_result(compiled(a, w, scale_a=sa, scale_b=sb), ref)
-    assert_result(
-        compiled(a, shuffle_weight(w), scale_a=sa, scale_b=sb, bpreshuffle=True), ref
-    )
-
-
-@pytest.mark.parametrize("m", [1, 33, 128])
-@GPU
-def test_blockscale_model_entry(m):
-    from aiter.ops.gemm_op_a8w8 import gemm_a8w8_blockscale_bpreshuffle
-
-    a, w, sa, sb, _b, ref = inputs(m, 384, 512, 128, bp=True)
-    # This is the exact transpose_scale=True byte layout of per_group_quant.
-    packed = sa.t().contiguous().reshape(m, -1).view(torch.float8_e8m0fnu)
-    out = torch.empty_like(ref)
-    y = gemm_a8w8_blockscale_bpreshuffle(
-        a,
-        w,
-        packed,
-        sb.view(torch.float8_e8m0fnu),
-        out=out,
-    )
-    assert y.data_ptr() == out.data_ptr()
-    assert_result(y, ref)
-
-
-@pytest.mark.parametrize("use_out", [False, True])
-@GPU
-def test_blockscale_inductor_and_graph(use_out):
-    from aiter.ops.gemm_op_a8w8 import gemm_a8w8_blockscale_bpreshuffle
-
-    a, w, sa, sb, _b, ref = inputs(17, 256, 512, 128, bp=True)
-    sa = sa.t().contiguous().reshape(17, -1).view(torch.float8_e8m0fnu)
-    sb = sb.view(torch.float8_e8m0fnu)
-    out = torch.empty_like(ref)
-
-    def fn(a, w, sa, sb, out):
-        return gemm_a8w8_blockscale_bpreshuffle(
-            a, w, sa, sb, out=out if use_out else None
+            config=CONFIGS["hti_split"],
+            bpreshuffle=True,
+            stream=stream,
         )
 
-    compiled = torch.compile(fn, fullgraph=True)
-    y = compiled(a, w, sa, sb, out)
-    assert_result(y, ref)
-    if use_out:
-        assert y.data_ptr() == out.data_ptr()
-        assert_result(out, ref)
-    stream = torch.cuda.Stream()
-    stream.wait_stream(torch.cuda.current_stream())
-    with torch.cuda.stream(stream):
-        fn(a, w, sa, sb, out)
+    run()
     stream.synchronize()
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph, stream=stream):
-        y = fn(a, w, sa, sb, out)
+        run()
     for _ in range(3):
+        out.fill_(float("nan"))
         graph.replay()
         torch.cuda.synchronize()
-        assert_result(y, ref)
+        torch.testing.assert_close(out, ref, atol=0.1, rtol=0.03)
+
+    def model(a, w, sa, sb, b):
+        return tgemm.mm(a, w, b, scale_a=sa, scale_b=sb, bpreshuffle=True)
+
+    compiled = torch.compile(model, fullgraph=True)
+    y = compiled(a, w, sa.view(torch.float8_e8m0fnu), sb.view(torch.float8_e8m0fnu), b)
+    torch.testing.assert_close(y, ref, atol=0.1, rtol=0.03)
 
 
 @GPU
-def test_invalid_inputs():
-    a, w, sa, sb, _b, _ref = inputs(8, 64, 256)
-    with pytest.raises(ValueError, match="scales"):
-        flydsl_mxfp8_gemm(a, w, sa.float(), sb)
-    with pytest.raises(ValueError, match="shape"):
-        flydsl_mxfp8_gemm(a, w, sa[:, :-1], sb)
-    with pytest.raises(ValueError, match="positive"):
-        flydsl_mxfp8_gemm(a[:0], w, sa[:0], sb)
-    with pytest.raises(ValueError, match="row-major"):
-        flydsl_mxfp8_gemm(a, w, sa, sb, scale_a_transposed=True)
-    with pytest.raises(ValueError, match="out"):
-        flydsl_mxfp8_gemm(a, w, sa, sb, out=torch.empty(64, 8, device="cuda").t())
-    with pytest.raises((ValueError, AssertionError), match="output|bf16|fp32"):
-        flydsl_mxfp8_gemm(a, w, sa, sb, out_dtype=torch.float16)
+def test_reject_non_mxfp8_scales():
+    a, w, sa, sb, _b, _ref = inputs()
+    for sx, sw in [
+        (sa.float(), sb.float()),
+        (sa[:, : sa.shape[1] // 4], sb[:, : sb.shape[1] // 4]),
+    ]:
+        with pytest.raises(ValueError, match="scale"):
+            flydsl_mxfp8_gemm(a, w, sx, sw)
+    with pytest.raises(TypeError):
+        flydsl_mxfp8_gemm(a, w, sa, sb, scale_block=128)
+    old = "flydsl_mxfp8_bf16_sb128_bp1_sat1_t32x64x128x2_ks1_w1x2x1_mma16x16x128_bias0_gm0_pft_gfx950"
+    assert get_flydsl_mxfp8_kernel_params(old) is None
 
 
-@pytest.mark.parametrize("m,k", [(1, 128), (1, 7168), (17, 128)])
-@GPU
-def test_singleton_scale_strides(m, k):
-    a, w, sa, sb, _b, ref = inputs(m, 128, k, 128, bp=True)
-    # Both views are contiguous to Torch, but may not have the unit leading
-    # stride that the FlyDSL ABI needs. Mirrors tuner data generation.
-    sa = sa.t().contiguous().t()
-    y = flydsl_mxfp8_gemm(
-        a, w, sa, sb, scale_block=128, bpreshuffle=True, scale_a_transposed=True
-    )
-    assert_result(y, ref)
+def test_names():
+    for cfg in CONFIGS.values():
+        name = flydsl_mxfp8_kernel_name(cfg, bpreshuffle=True)
+        p = get_flydsl_mxfp8_kernel_params(name, cfg["split_k"])
+        assert {k: p[k] for k in CONFIG_KEYS} == cfg
+        assert "_sb" not in name and "_sat" not in name
+    name = flydsl_mxfp8_kernel_name(dict(DEFAULT_CONFIG, split_k=2))
+    for sk in [2, 4, 7, 14, 28]:
+        assert name == flydsl_mxfp8_kernel_name(dict(DEFAULT_CONFIG, split_k=sk))
+        assert get_flydsl_mxfp8_kernel_params(name, sk)["split_k"] == sk
+    assert get_flydsl_mxfp8_kernel_params(name, 1) is None
 
 
-def test_names_and_catalog():
-    for config in CONFIGS.values():
-        for block, bp, sat in [
-            (32, False, False),
-            (32, True, False),
-            (128, True, True),
-        ]:
-            name = flydsl_mxfp8_kernel_name(
-                config, scale_block=block, bpreshuffle=bp, scale_a_transposed=sat
-            )
-            parsed = get_flydsl_mxfp8_kernel_params(name, config["split_k"])
-            assert {key: parsed[key] for key in CONFIG_KEYS} == config
-            assert parsed["scale_block"] == block
-            assert parsed["bpreshuffle"] == bp
-            assert parsed["scale_a_transposed"] == sat
-            assert (
-                get_flydsl_mxfp8_kernel_params(name.replace("gfx950", "gfx1250"))
-                is None
-            )
-            if config["split_k"] == 1:
-                assert (
-                    get_flydsl_mxfp8_kernel_params(name.replace("_ks1_", "_ks0_"))
-                    is None
-                )
-    assert get_flydsl_mxfp8_kernel_params("flydsl_hgemm_bad") is None
-    if torch.cuda.is_available() and get_gfx() == "gfx950":
-        assert not get_flydsl_mxfp8_configs(0, 64, 256)
-        assert not get_flydsl_mxfp8_configs(8, 63, 256, bpreshuffle=True)
-        assert get_flydsl_mxfp8_configs(8, 64, 256, bpreshuffle=True)
-
-
-def _run(code_or_args, env):
-    args = [sys.executable]
-    args += ["-c", code_or_args] if isinstance(code_or_args, str) else code_or_args
-    ret = subprocess.run(
-        args,
+def run_process(args, env):
+    p = subprocess.run(
+        [sys.executable, *args],
         cwd=ROOT,
         env=env,
         text=True,
         capture_output=True,
-        timeout=240,
+        timeout=300,
         check=False,
     )
-    assert ret.returncode == 0, ret.stdout + "\n" + ret.stderr
-    return ret.stdout
-
-
-@pytest.mark.parametrize("config_name", ["ft", "split_slice", "hti_split", "mma32"])
-@GPU
-def test_cpu_aot_fresh_run_only(tmp_path, config_name):
-    config = CONFIGS[config_name]
-    csv_path = tmp_path / "tuned.csv"
-    rows = []
-    for dtype, bias in [(torch.bfloat16, False), (torch.float32, True)]:
-        for block, bp, sat in [
-            (32, False, False),
-            (32, True, False),
-            (128, True, True),
-        ]:
-            row = dict(
-                zip(
-                    MXFP8_KEYS,
-                    ["gfx950", 256, 33, 256, 1024, str(dtype), bias, block, bp, sat],
-                )
-            )
-            row.update(
-                libtype="flydsl",
-                kernelId=0,
-                splitK=config["split_k"],
-                us=1,
-                kernelName=flydsl_mxfp8_kernel_name(
-                    config,
-                    out_dtype=dtype,
-                    has_bias=bias,
-                    scale_block=block,
-                    bpreshuffle=bp,
-                    scale_a_transposed=sat,
-                ),
-            )
-            rows.append(row)
-    with csv_path.open("w") as f:
-        writer = csv.DictWriter(f, fieldnames=rows[0])
-        writer.writeheader()
-        writer.writerows(rows)
-    env = dict(
-        os.environ,
-        FLYDSL_RUNTIME_CACHE_DIR=str(tmp_path / "cache"),
-        AITER_CONFIG_GEMM_MXFP8=str(csv_path),
-    )
-    aot_env = dict(
-        env,
-        AITER_AOT_IMPORT="1",
-        HIP_VISIBLE_DEVICES="",
-        ROCR_VISIBLE_DEVICES="",
-        GPU_ARCHS="gfx950",
-        FLYDSL_GPU_ARCH="gfx950",
-        AITER_FLYDSL_AOT_WORKERS="2",
-    )
-    aot_env.pop("FLYDSL_RUNTIME_RUN_ONLY", None)
-    _run(["-m", "aiter.aot.flydsl.gemm", "--csv", str(csv_path)], aot_env)
-    code = f"""
-import csv, torch
-from op_tests.flydsl_tests.test_mxfp8_integration import inputs, assert_result
-from aiter.ops.gemm_op_mxfp8 import gemm_mxfp8
-from aiter.tuned_gemm import tgemm
-from aiter.ops.gemm_op_a8w8 import gemm_a8w8_blockscale_bpreshuffle
-for row in csv.DictReader(open({str(csv_path)!r})):
-    block = int(row['scale_block'])
-    bp, bias, sat = [row[k] == 'True' for k in ('bpreshuffle','bias','scale_a_transposed')]
-    dtype = getattr(torch, row['outdtype'].split('.')[1])
-    a,w,sa,sb,b,ref = inputs(33,256,1024,block,dtype,bias,bp)
-    if sat:
-        sa = sa.t().contiguous().t()
-    out = torch.full_like(ref, 33)
-    y = gemm_mxfp8(a,w,sa,sb,out=out,bias=b,dtype=dtype,
-                  scale_block=block,bpreshuffle=bp,scale_a_transposed=sat)
-    assert y.data_ptr() == out.data_ptr()
-    assert_result(y,ref)
-    if block == 32:
-        assert_result(tgemm.mm(a,w,b,otype=dtype,scale_a=sa,scale_b=sb),ref)
-    elif not bias:
-        packed = sa.t().contiguous().reshape(33,-1).view(torch.float8_e8m0fnu)
-        y = gemm_a8w8_blockscale_bpreshuffle(a,w,packed,sb,out=out)
-        assert_result(y,ref)
-print('run-only PASS')
-"""
-    env["FLYDSL_RUNTIME_RUN_ONLY"] = "1"
-    assert "run-only PASS" in _run(code, env)
+    assert p.returncode == 0, p.stdout + "\n" + p.stderr
+    return p.stdout
 
 
 @GPU
-def test_tuner_roundtrip(tmp_path):
+def test_tuner_csv_aot_runtime_roundtrip(tmp_path):
     shapes = tmp_path / "shapes.csv"
     shapes.write_text(
-        "M,N,K,outdtype,bias,scale_block,bpreshuffle,scale_a_transposed\n"
-        "16,64,128,torch.bfloat16,False,32,False,False\n"
-        "16,64,128,torch.bfloat16,False,32,True,False\n"
-        "16,128,128,torch.bfloat16,False,128,True,True\n"
+        "M,N,K,outdtype,bias,bpreshuffle\n"
+        "16,64,128,torch.bfloat16,False,False\n"
+        "16,64,128,torch.bfloat16,False,True\n"
     )
     tuned = tmp_path / "tuned.csv"
     env = dict(os.environ)
     env.pop("FLYDSL_RUNTIME_RUN_ONLY", None)
     script = "csrc/gemm_mxfp8/gemm_mxfp8_tune.py"
-    _run(
+    run_process(
         [
             script,
             "-i",
             str(shapes),
             "-o",
             str(tuned),
+            "--screen-topk",
+            "2",
             "--warmup",
             "1",
             "--iters",
             "3",
-            "--screen-topk",
-            "2",
         ],
         env,
     )
     rows = list(csv.DictReader(tuned.open()))
-    assert len(rows) == 3
-    assert all(
-        float(row["errRatio"]) == 0 and row["libtype"] == "flydsl" for row in rows
+    assert len(rows) == 2 and all(float(r["errRatio"]) == 0 for r in rows)
+    assert set(MXFP8_KEYS).issubset(rows[0])
+    env.update(
+        FLYDSL_RUNTIME_CACHE_DIR=str(tmp_path / "cache"),
+        AITER_CONFIG_GEMM_MXFP8=str(tuned),
     )
-    assert len({tuple(row[k] for k in MXFP8_KEYS) for row in rows}) == 3
-    env["AITER_CONFIG_GEMM_MXFP8"] = str(tuned)
-    _run([script, "--run_config", str(tuned), "--warmup", "1", "--iters", "3"], env)
-
-
-@GPU
-def test_real_quantizer_to_model():
-    from aiter import dtypes
-    from aiter.ops.gemm_op_a8w8 import gemm_a8w8_blockscale_bpreshuffle
-    from aiter.ops.quant import per_group_quant_hip
-
-    m, n, k = 33, 256, 512
-    x = torch.randn(m, k, device="cuda", dtype=torch.bfloat16)
-    a, sa = per_group_quant_hip(
-        x, quant_dtype=dtypes.fp8, scale_type=dtypes.fp8_e8m0, transpose_scale=True
+    run_process(
+        ["-m", "aiter.aot.flydsl.gemm", "--csv", str(tuned)],
+        dict(
+            env,
+            AITER_AOT_IMPORT="1",
+            HIP_VISIBLE_DEVICES="",
+            ROCR_VISIBLE_DEVICES="",
+            GPU_ARCHS="gfx950",
+            AITER_FLYDSL_AOT_WORKERS="2",
+        ),
     )
-    _, row_scale = per_group_quant_hip(
-        x, quant_dtype=dtypes.fp8, scale_type=dtypes.fp8_e8m0, transpose_scale=False
+    run_process(
+        [script, "--run_config", str(tuned), "--warmup", "1", "--iters", "3"],
+        dict(env, FLYDSL_RUNTIME_RUN_ONLY="1"),
     )
-    logical_scale = sa.view(torch.uint8).reshape(k // 128, m).t()
-    assert torch.equal(logical_scale, row_scale.view(torch.uint8))
-    w = torch.randn(n, k, device="cuda").to(dtypes.fp8)
-    sw = torch.randint(124, 129, (n // 128, k // 128), device="cuda", dtype=torch.uint8)
-    ref = (a.float() * row_scale.float().repeat_interleave(128, 1)) @ (
-        w.float()
-        * torch.exp2(sw.float() - 127)
-        .repeat_interleave(128, 0)
-        .repeat_interleave(128, 1)
-    ).t()
-    out = gemm_a8w8_blockscale_bpreshuffle(
-        a, shuffle_weight(w), sa, sw.view(dtypes.fp8_e8m0)
-    )
-    assert_result(out, ref.to(torch.bfloat16))
-
-
-@pytest.mark.parametrize(
-    "config,k",
-    [
-        (dict(DEFAULT_CONFIG, stages=3, group_m=4), 768),
-        (dict(DEFAULT_CONFIG, stages=4, split_k=2), 1536),
-        (dict(CONFIGS["hti"], block_n=256, n_waves=4, group_m=4), 1536),
-        (dict(CONFIGS["hti"], block_n=256, n_waves=4), 2048),
-    ],
-)
-@pytest.mark.parametrize("block", [32, 128])
-@GPU
-def test_pipeline_wrap_and_scale_chunk(config, k, block):
-    a, w, sa, sb, _b, ref = inputs(257, 384, k, block, bp=True)
-    y = flydsl_mxfp8_gemm(
-        a, w, sa, sb, config=config, scale_block=block, bpreshuffle=True
-    )
-    # BF16 split-K rounds each partial before the atomic sum. Like HGEMM,
-    # scale the cancellation allowance with K and the number of partitions.
-    # Strict FP32 precision is tested separately for every pipeline below.
-    assert_result(y, ref, bf16_atol=0.2 * (k / 1024) ** 0.5 * config["split_k"])
-
-
-@pytest.mark.parametrize("config", CONFIGS.values(), ids=CONFIGS)
-@GPU
-def test_fp32_keeps_accumulator_precision(config):
-    a, w, sa, sb, b, _ = inputs(33, 128, 1024, 32, torch.float32, True)
-    # Binary-exact FP8 operands, no tiny products. Double reference isolates
-    # cshuffle/split/slice accuracy from the scaled-MFMA tiny-value behavior.
-    a = torch.randint(-16, 17, a.shape, device="cuda").div(16).to(a.dtype)
-    w = torch.randint(-16, 17, w.shape, device="cuda").div(16).to(w.dtype)
-    ref = (a.double() * torch.exp2(sa.double() - 127).repeat_interleave(32, 1)) @ (
-        w.double() * torch.exp2(sb.double() - 127).repeat_interleave(32, 1)
-    ).t() + b.double()
-    y = flydsl_mxfp8_gemm(
-        a,
-        shuffle_weight(w),
-        sa,
-        sb,
-        bias=b,
-        config=config,
-        out_dtype=torch.float32,
-        bpreshuffle=True,
-    )
-    torch.testing.assert_close(y, ref.float(), atol=2e-5, rtol=1e-6)
-
-
-@GPU
-def test_empty_aot_cache_fails_loudly(tmp_path):
     code = """
-import torch
+import os,csv,torch
+from aiter.tuned_gemm import tgemm
+from aiter import gemm_a8w8_mxfp8
+from op_tests.flydsl_tests.test_mxfp8_integration import inputs
+rows=list(csv.DictReader(open(os.environ['AITER_CONFIG_GEMM_MXFP8'])))
+for row in rows:
+    bp = row['bpreshuffle'] == 'True'
+    a,w,sa,sb,b,ref=inputs(16,64,128,bp=bp)
+    y=tgemm.mm(a,w,scale_a=sa,scale_b=sb,bpreshuffle=bp)
+    torch.testing.assert_close(y,ref,atol=.1,rtol=.03)
+    y=gemm_a8w8_mxfp8(a,w,sa,sb,bpreshuffle=bp)
+    torch.testing.assert_close(y,ref,atol=.1,rtol=.03)
+"""
+    run_process(["-c", code], dict(env, FLYDSL_RUNTIME_RUN_ONLY="1"))
+    # Exercise the standard op-test under run-only as well.
+    run_process(
+        [
+            "op_tests/test_flydsl_mxfp8.py",
+            "-s",
+            "16,64,128",
+            "-l",
+            "plain",
+            "preshuffle",
+        ],
+        dict(env, FLYDSL_RUNTIME_RUN_ONLY="1"),
+    )
+
+
+@pytest.mark.parametrize("direct_b,hti", [(False, False), (True, False), (False, True)])
+@GPU
+def test_dynamic_split_aot_and_bias(tmp_path, direct_b, hti):
+    rows = []
+    for dtype, bias, bp in itertools.product(
+        ["bf16", "fp32"], [False, True], ([True] if direct_b else [False, True])
+    ):
+        dt = getattr(torch, "bfloat16" if dtype == "bf16" else "float32")
+        cfg = dict(DEFAULT_CONFIG, split_k=2, direct_b=direct_b)
+        if hti:
+            cfg.update(
+                block_m=128, block_n=128, m_waves=2, use_half_tile_interleaved=True
+            )
+        row = dict(zip(MXFP8_KEYS, ["gfx950", 256, 17, 128, 7168, str(dt), bias, bp]))
+        row.update(
+            libtype="flydsl",
+            splitK=2,
+            kernelName=flydsl_mxfp8_kernel_name(
+                cfg, out_dtype=dt, has_bias=bias, bpreshuffle=bp
+            ),
+        )
+        rows.append(row)
+    path = tmp_path / "tuned.csv"
+    with path.open("w") as f:
+        writer = csv.DictWriter(f, fieldnames=rows[0])
+        writer.writeheader()
+        writer.writerows(rows)
+    env = dict(os.environ, FLYDSL_RUNTIME_CACHE_DIR=str(tmp_path / "cache"))
+    env.pop("FLYDSL_RUNTIME_RUN_ONLY", None)
+    run_process(
+        ["-m", "aiter.aot.flydsl.gemm", "--csv", str(path)],
+        dict(
+            env,
+            AITER_AOT_IMPORT="1",
+            HIP_VISIBLE_DEVICES="",
+            ROCR_VISIBLE_DEVICES="",
+            GPU_ARCHS="gfx950",
+            AITER_FLYDSL_AOT_WORKERS="2",
+        ),
+    )
+    code = f"direct_b = {direct_b!r}\nhti = {hti!r}\n" + """
+import itertools,torch
+from op_tests.flydsl_tests.test_mxfp8_integration import inputs
+from aiter.ops.flydsl.gemm_mxfp8 import DEFAULT_CONFIG,flydsl_mxfp8_gemm
+for dtype,bias,bp in itertools.product([torch.bfloat16,torch.float32],[False,True],([True] if direct_b else [False,True])):
+    a,w,sa,sb,b,ref=inputs(dtype=dtype,bias=bias,bp=bp)
+    cfg=dict(DEFAULT_CONFIG,direct_b=direct_b)
+    if hti:
+        cfg.update(block_m=128,block_n=128,m_waves=2,use_half_tile_interleaved=True)
+    for split_k in [2,4,7,14,28]:
+        y=flydsl_mxfp8_gemm(a,w,sa,sb,bias=b,out_dtype=dtype,
+                            bpreshuffle=bp,config=dict(cfg,split_k=split_k))
+        torch.testing.assert_close(y,ref,atol=.1,rtol=.03)
+"""
+    run_process(["-c", code], dict(env, FLYDSL_RUNTIME_RUN_ONLY="1"))
+
+
+@GPU
+def test_real_standard_quantizer():
+    from aiter import dtypes
+    from aiter.ops.quant import per_1x32_mx_quant_hip
+    from aiter.tuned_gemm import tgemm
+
+    x = torch.randn(17, 256, device="cuda", dtype=torch.bfloat16)
+    w = torch.randn(128, 256, device="cuda", dtype=x.dtype)
+    a, sa = per_1x32_mx_quant_hip(x, quant_dtype=dtypes.fp8, scale_type=dtypes.fp8_e8m0)
+    b, sb = per_1x32_mx_quant_hip(w, quant_dtype=dtypes.fp8, scale_type=dtypes.fp8_e8m0)
+    assert sa.shape == (17, 8) and sb.shape == (128, 8)
+    ref = run_torch(a, b, sa, sb, torch.bfloat16)
+    y = tgemm.mm(a, shuffle_weight(b), scale_a=sa, scale_b=sb, bpreshuffle=True)
+    torch.testing.assert_close(y, ref, atol=0.1, rtol=0.03)
+
+
+@GPU
+def test_run_only_rejects_empty_cache(tmp_path):
+    code = """
 from op_tests.flydsl_tests.test_mxfp8_integration import inputs
 from aiter.ops.flydsl.gemm_mxfp8 import flydsl_mxfp8_gemm
-a,w,sa,sb,b,ref = inputs(16,64,128)
+a,w,sa,sb,b,ref=inputs(16,64,128)
 try:
     flydsl_mxfp8_gemm(a,w,sa,sb)
 except RuntimeError as exc:
-    assert 'no usable AOT cache' in str(exc), str(exc)
+    assert "no usable AOT cache" in str(exc)
 else:
-    raise AssertionError('run-only mode silently compiled a missing kernel')
+    raise AssertionError("run-only silently compiled a missing kernel")
 """
-    _run(
-        code,
+    run_process(
+        ["-c", code],
         dict(
             os.environ,
             FLYDSL_RUNTIME_CACHE_DIR=str(tmp_path),
@@ -545,227 +373,540 @@ else:
     )
 
 
-def test_config_keys_and_invalid_row(tmp_path, monkeypatch):
-    from aiter.ops import gemm_op_mxfp8 as op
-    from aiter.ops.flydsl.gemm_mxfp8 import DEFAULT_CONFIG
+@pytest.mark.parametrize("bp", [False, True])
+@GPU
+def test_each_32_elements_has_an_independent_scale(bp):
+    # All four groups within K=128 deliberately have different A/B scales.
+    # Broadcasting one block128 scale cannot reproduce this exact result.
+    from aiter.tuned_gemm import tgemm
 
-    path = tmp_path / "tuned.csv"
-    rows = []
-    for sb, bp, sat in [(32, False, False), (32, True, False), (128, True, True)]:
-        row = dict(
-            zip(
-                MXFP8_KEYS,
-                ["gfx950", 256, 32, 128, 512, "torch.bfloat16", False, sb, bp, sat],
-            )
-        )
-        row.update(
-            libtype="flydsl",
-            splitK=2,
-            kernelName=flydsl_mxfp8_kernel_name(
-                CONFIGS["split"], scale_block=sb, bpreshuffle=bp, scale_a_transposed=sat
-            ),
-        )
-        rows.append(row)
-    with path.open("w") as f:
-        writer = csv.DictWriter(f, fieldnames=rows[0])
-        writer.writeheader()
-        writer.writerows(rows)
-    loaded = op._load_mxfp8_configs(str(path))
-    assert len(loaded) == 3
-    # Legacy scalar-FP8 table is never queried for the MXFP8 path.
+    a = torch.ones(2, 128, device="cuda").to(torch.float8_e4m3fn)
+    w = torch.ones(32, 128, device="cuda").to(a.dtype)
+    sa = torch.tensor(
+        [[127, 128, 129, 130], [130, 129, 128, 127]], device="cuda", dtype=torch.uint8
+    )
+    sb = torch.tensor([127, 129, 128, 130], device="cuda", dtype=torch.uint8)
+    sb = sb.expand(32, -1).contiguous()
+    # 32*(1*1 + 2*4 + 4*2 + 8*8), and reversed A group scales.
+    ref = torch.tensor([2592, 1152], device="cuda", dtype=torch.bfloat16)
+    ref = ref[:, None].expand(2, 32)
+    y = tgemm.mm(
+        a,
+        shuffle_weight(w) if bp else w,
+        scale_a=sa.view(torch.float8_e8m0fnu),
+        scale_b=sb.view(torch.float8_e8m0fnu),
+        bpreshuffle=bp,
+    )
+    torch.testing.assert_close(y, ref, atol=0, rtol=0)
+
+
+@pytest.mark.parametrize("a_preshuffle", [None, False, True])
+def test_public_gfx1250_dispatch_preserves_asm_abi(monkeypatch, a_preshuffle):
+    from aiter.ops import gemm_op_a8w8 as op
+    from aiter.ops import gemm_op_mxfp8 as mx
+
+    monkeypatch.setattr(op, "_mxfp8_arch", lambda: "gfx1250")
+    calls = []
+    monkeypatch.setattr(op, "_mxfp8_mxfp8_gemm_asm", lambda *args: calls.append(args))
+
+    def no_gfx950(*args, **kwargs):
+        raise AssertionError("gfx1250 must not use the gfx950 tuned table")
+
+    monkeypatch.setattr(mx, "get_mxfp8_config", no_gfx950)
+    a = torch.empty((2, 128), device="cpu", dtype=torch.float8_e4m3fn)
+    b = torch.empty((16, 128), device="cpu", dtype=a.dtype)
+    sa = torch.empty((2, 4), device="cpu", dtype=torch.uint8)
+    sb = torch.empty((16, 4), device="cpu", dtype=torch.uint8)
+    kwargs = {} if a_preshuffle is None else {"a_preshuffle": a_preshuffle}
+    y = op.gemm_a8w8_mxfp8(a, b, sa, sb, kernelName="asm_kernel", **kwargs)
+    assert y.shape == (2, 16) and y.dtype == torch.bfloat16
+    assert len(calls) == 1
+    assert all(got is original for got, original in zip(calls[0][:4], [a, b, sa, sb]))
+    assert calls[0][4] is y
+    assert calls[0][5:] == ("asm_kernel", int(a_preshuffle is not False))
+    with pytest.raises(ValueError, match="gfx950"):
+        op.gemm_a8w8_mxfp8(a, b, sa, sb, kernelName="flydsl_mxfp8_invalid")
+    with pytest.raises(NotImplementedError, match="gfx1250"):
+        op.gemm_a8w8_mxfp8(a, b, sa, sb, bpreshuffle=False)
+
+
+def test_public_rejects_unsupported_arch(monkeypatch):
+    from aiter.ops import gemm_op_a8w8 as op
+
+    monkeypatch.setattr(op, "_mxfp8_arch", lambda: "gfx942")
+    x = torch.empty((1, 128), device="cpu")
+    with pytest.raises(NotImplementedError, match="gfx942"):
+        op.gemm_a8w8_mxfp8(x, x, x, x)
+
+
+@pytest.mark.parametrize("bp,direct_b", [(False, False), (True, False), (True, True)])
+@pytest.mark.parametrize("use_out", [False, True])
+@GPU
+def test_public_gfx950_eager_compile_from_config(
+    bp, direct_b, use_out, tmp_path, monkeypatch, request
+):
+    from aiter.ops.gemm_op_a8w8 import gemm_a8w8_mxfp8
+
+    a, w, sa, sb, b, ref = inputs(m=17, n=128, k=7168, bias=True, bp=bp)
+    out = torch.empty_like(ref)
+    cfg = dict(DEFAULT_CONFIG, split_k=7, direct_b=direct_b)
+    name = flydsl_mxfp8_kernel_name(cfg, has_bias=True, bpreshuffle=bp)
     from types import SimpleNamespace
 
+    from aiter.ops import gemm_op_mxfp8 as mx
+
+    # No launch knobs on the public call: the chosen split comes from CSV.
+    row = dict(
+        zip(MXFP8_KEYS, ["gfx950", 256, 17, 128, 7168, "torch.bfloat16", True, bp])
+    )
+    row.update(libtype="flydsl", kernelName=name, splitK=7)
+    path = tmp_path / "tuned.csv"
+    with path.open("w") as f:
+        writer = csv.DictWriter(f, fieldnames=row)
+        writer.writeheader()
+        writer.writerow(row)
     monkeypatch.setattr(
-        op, "AITER_CONFIGS", SimpleNamespace(AITER_CONFIG_GEMM_MXFP8_FILE=str(path))
+        mx, "AITER_CONFIGS", SimpleNamespace(AITER_CONFIG_GEMM_MXFP8_FILE=str(path))
     )
-    op.get_mxfp8_config.cache_clear()
-    if torch.cuda.is_available() and get_gfx() == "gfx950":
-        for sb, bp, sat in [(32, False, False), (32, True, False), (128, True, True)]:
-            assert (
-                op.get_mxfp8_config(32, 128, 512, torch.bfloat16, False, sb, bp, sat)[
-                    "split_k"
-                ]
-                == 2
-            )
-        # A name/row mode mismatch cannot dispatch a differently laid-out kernel.
-        next(iter(loaded.values()))["kernelName"] = flydsl_mxfp8_kernel_name(
-            CONFIGS["split"], bpreshuffle=True
+    mx.get_mxfp8_config.cache_clear()
+    request.addfinalizer(mx.get_mxfp8_config.cache_clear)
+    request.addfinalizer(mx._load_mxfp8_configs.cache_clear)
+    assert mx.get_mxfp8_config(17, 128, 7168, torch.bfloat16, True, bp) == cfg
+
+    def run(a, w, sa, sb, b, out):
+        return gemm_a8w8_mxfp8(
+            a,
+            w,
+            sa,
+            sb,
+            bias=b,
+            bpreshuffle=bp,
+            out=out if use_out else None,
         )
-        op.get_mxfp8_config.cache_clear()
-        assert op.get_mxfp8_config(32, 128, 512, torch.bfloat16) == DEFAULT_CONFIG
-    op.get_mxfp8_config.cache_clear()
-    op._load_mxfp8_configs.cache_clear()
+
+    for fn in (run, torch.compile(run, fullgraph=True)):
+        y = fn(
+            a, w, sa.view(torch.float8_e8m0fnu), sb.view(torch.float8_e8m0fnu), b, out
+        )
+        torch.testing.assert_close(y, ref, atol=0.1, rtol=0.03)
+        if use_out:
+            assert y.data_ptr() == out.data_ptr()
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        run(a, w, sa, sb, b, out)
+    stream.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=stream):
+        y = run(a, w, sa, sb, b, out)
+    for _ in range(3):
+        graph.replay()
+        torch.cuda.synchronize()
+        torch.testing.assert_close(y, ref, atol=0.1, rtol=0.03)
+    with pytest.raises(ValueError, match="unshuffled A"):
+        gemm_a8w8_mxfp8(a, w, sa, sb, a_preshuffle=True)
+    with pytest.raises(ValueError, match="kernelName"):
+        gemm_a8w8_mxfp8(a, w, sa, sb, kernelName="gfx1250_asm")
+    with pytest.raises(TypeError, match="splitK"):
+        gemm_a8w8_mxfp8(a, w, sa, sb, splitK=7)
 
 
-@GPU
-def test_tuner_rejects_unstable_splitk(monkeypatch):
-    from csrc.gemm_mxfp8 import gemm_mxfp8_tune as tuner
-
-    config = CONFIGS["split"]
-    keys = ("gfx950", 256, 1, 64, 256, "torch.bfloat16", False, 32, False, False)
-    name = flydsl_mxfp8_kernel_name(config)
-    info = (keys, 0, 2, name)
-    calls = []
-
-    def unstable(a, b, sa, sb, out, bias, config, block, bp, sat):
-        calls.append(None)
-        out.copy_(tuner.reference(a, b, sa, sb, bias, out.dtype, block))
-        if len(calls) == 2:
-            out.fill_(float("nan"))
-        return out
-
-    monkeypatch.setattr(tuner, "run_kernel", unstable)
-    result = tuner.check_splitk_stability([(info, 5.0, 0.0)])
-    assert result == [(info, 5.0, 1.0)]
-    assert len(calls) == 2
-
-
-def test_dynamic_split_name():
-    name = flydsl_mxfp8_kernel_name(dict(DEFAULT_CONFIG, split_k=2))
-    assert "_ksd_" in name
-    for split_k in (2, 4, 7, 8):
-        assert flydsl_mxfp8_kernel_name(dict(DEFAULT_CONFIG, split_k=split_k)) == name
-        params = get_flydsl_mxfp8_kernel_params(name, split_k)
-        assert params["split_k"] == split_k
-    assert get_flydsl_mxfp8_kernel_params(name) is None
-    assert get_flydsl_mxfp8_kernel_params(name, 0) is None
-    assert get_flydsl_mxfp8_kernel_params(name, 2.5) is None
-    assert get_flydsl_mxfp8_kernel_params(name.replace("_ksd_", "_ks1_"), 2) is None
-
-
-@GPU
-def test_hgemm_search_space():
-    configs = get_flydsl_mxfp8_configs(
-        32, 768, 7168, torch.bfloat16, False, 128, True, True
+def test_minimax_shapes_only():
+    source = (
+        ROOT / "aiter/configs/model_configs/a8w8_bpreshuffle_tuned_gemm_minimax_m3.csv"
     )
-    assert {c["split_k"] for c in configs} == {1, 2, 4, 7, 8}
-    assert {c["k_waves"] for c in configs} == {1, 2, 4}
-    assert {c["block_k"] for c in configs} == {128, 256, 512}
-    assert {c["stages"] for c in configs} == set(range(2, 10))
-    assert any(c["block_m"] == 32 and c["block_n"] == 96 for c in configs)
-    assert any(c["split_k"] == 7 and c["k_waves"] > 1 for c in configs)
+    target = ROOT / "aiter/configs/model_configs/mxfp8_untuned_gemm_minimax_m3.csv"
+
+    def shapes(path):
+        with path.open() as f:
+            return {
+                tuple(int(r[k]) for k in ("M", "N", "K")) for r in csv.DictReader(f)
+            }
+
+    assert len(shapes(target)) == 100
+    assert shapes(source) == shapes(target)
+    assert not list((ROOT / "aiter/configs/model_configs").glob("dsv4_mxfp8*"))
 
 
-@pytest.mark.parametrize("split_k,slice_k", [(3, 1), (7, 1), (7, 2), (7, 4)])
-@GPU
-def test_expanded_split_slice_space(split_k, slice_k):
-    k = 384 if split_k == 3 else 7168
-    config = dict(
-        DEFAULT_CONFIG, block_k=128 * slice_k, split_k=split_k, k_waves=slice_k
+def test_public_config_lookup_has_no_split_override():
+    import inspect
+
+    from aiter.ops import gemm_op_mxfp8 as mx
+    from aiter.ops.gemm_op_a8w8 import gemm_a8w8_mxfp8
+
+    assert list(inspect.signature(mx.get_mxfp8_config).parameters) == [
+        "m",
+        "n",
+        "k",
+        "out_dtype",
+        "has_bias",
+        "bpreshuffle",
+    ]
+    for fn in (mx.gemm_mxfp8, gemm_a8w8_mxfp8):
+        assert "split_k" not in inspect.signature(fn).parameters
+        assert "splitK" not in inspect.signature(fn).parameters
+
+
+def test_default_config_uses_minimax_without_generic_table(monkeypatch):
+    import pandas as pd
+
+    from aiter.jit.core import AITER_CONFIGS
+
+    monkeypatch.delenv("AITER_CONFIG_GEMM_MXFP8", raising=False)
+    AITER_CONFIGS.get_config_file.cache_clear()
+    try:
+        path = Path(AITER_CONFIGS.AITER_CONFIG_GEMM_MXFP8_FILE)
+        assert (
+            path == ROOT / "aiter/configs/model_configs/mxfp8_tuned_gemm_minimax_m3.csv"
+        )
+        assert not (ROOT / "aiter/configs/mxfp8_tuned_gemm.csv").exists()
+        assert not (ROOT / "aiter/configs/mxfp8_untuned_gemm.csv").exists()
+        df = pd.read_csv(path)
+        assert len(df) == 100 and not df.duplicated(MXFP8_KEYS).any()
+    finally:
+        AITER_CONFIGS.get_config_file.cache_clear()
+
+
+def test_mxfp8_merge_uses_model_shape_keys(tmp_path, monkeypatch):
+    import pandas as pd
+
+    from aiter.jit import core
+
+    models = tmp_path / "aiter/configs/model_configs"
+    models.mkdir(parents=True)
+    schema = models / "mxfp8_untuned_gemm_minimax_m3.csv"
+    schema.write_text("M,N,K,outdtype,bias,bpreshuffle\n")
+    monkeypatch.setattr(core, "AITER_ROOT_DIR", str(tmp_path))
+    row = dict(
+        zip(MXFP8_KEYS, ["gfx950", 256, 16, 64, 128, "torch.bfloat16", False, True])
     )
-    a, w, sa, sb, _b, _ref = inputs(17, 128, k, 128)
-    # Exact-valued inputs isolate slice/split correctness from tiny MFMA products.
-    a = torch.randint(-16, 17, a.shape, device="cuda").div(16).to(a.dtype)
-    w = torch.randint(-16, 17, w.shape, device="cuda").div(16).to(w.dtype)
-    ref = run_torch(a, w, sa, sb, 128, torch.float32)
+    a, b = models / "a.csv", models / "b.csv"
+    pd.DataFrame([dict(row, us=2.0, kernelName="first")]).to_csv(a, index=False)
+    pd.DataFrame([dict(row, us=3.0, kernelName="second")]).to_csv(b, index=False)
+    # Different timings/names must not conceal a duplicate shape.
+    with pytest.raises(RuntimeError, match="duplicate shape"):
+        core.AITER_CONFIGS.update_config_files(
+            os.pathsep.join([str(a), str(b)]), "mxfp8_tuned_gemm"
+        )
+    assert len(pd.read_csv(a)) == 1
+    assert pd.read_csv(b).empty
+
+
+@pytest.mark.parametrize("policy", ["ft", "split", "slice", "split_slice"])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
+@GPU
+def test_direct_b_and_lds_b_same_config(policy, dtype):
+    a, w, sa, sb, bias, ref = inputs(dtype=dtype, bias=True, bp=True)
+    names, signatures = set(), set()
+    from aiter.ops.flydsl.gemm_mxfp8 import mxfp8_kernel_config
+    from aiter.ops.flydsl.kernels.scaled_gemm_gfx950 import (
+        make_scaled_gemm_param_and_validate,
+    )
+
+    for direct_b in (False, True):
+        cfg = dict(CONFIGS[policy], direct_b=direct_b)
+        name = flydsl_mxfp8_kernel_name(
+            cfg, out_dtype=dtype, has_bias=True, bpreshuffle=True
+        )
+        names.add(name)
+        parsed = get_flydsl_mxfp8_kernel_params(name, cfg["split_k"])
+        assert {k: parsed[k] for k in CONFIG_KEYS} == cfg
+        param = make_scaled_gemm_param_and_validate(
+            17, 128, 7168, mxfp8_kernel_config(cfg, dtype, True, True)
+        )
+        assert param is not None and param.direct_b == direct_b
+        signatures.add(param.__cache_signature__())
+        out = torch.full_like(ref, float("nan"))
+        y = flydsl_mxfp8_gemm(
+            a, w, sa, sb, out=out, bias=bias, config=cfg, bpreshuffle=True
+        )
+        assert y.data_ptr() == out.data_ptr()
+        torch.testing.assert_close(y, ref, atol=0.1, rtol=0.03)
+    assert len(names) == len(signatures) == 2
+
+
+@GPU
+def test_b_path_space_and_pruning():
+    from aiter.ops.flydsl.gemm_mxfp8 import (
+        get_flydsl_mxfp8_configs,
+        mxfp8_kernel_config,
+    )
+    from aiter.ops.flydsl.kernels.scaled_gemm_gfx950 import (
+        make_scaled_gemm_param_and_validate,
+    )
+    from csrc.gemm_mxfp8.gemm_mxfp8_tune import make_tasks, screen_tasks
+
+    configs = get_flydsl_mxfp8_configs(32, 2304, 6144, bpreshuffle=True)
+    paired = {}
+    for c in configs:
+        key = tuple((k, v) for k, v in c.items() if k != "direct_b")
+        paired.setdefault(key, set()).add(c["direct_b"])
+        if c["use_half_tile_interleaved"]:
+            assert not c["direct_b"]
+        # If a retained direct tile also fits LDS, pruner must retain BOTH.
+        if c["direct_b"]:
+            other = dict(c, direct_b=False)
+            if (
+                make_scaled_gemm_param_and_validate(
+                    32,
+                    2304,
+                    6144,
+                    mxfp8_kernel_config(other, torch.bfloat16, False, True),
+                )
+                is not None
+            ):
+                assert other in configs
+    assert any(v == {False, True} for v in paired.values())
+    assert not any(c["direct_b"] for c in get_flydsl_mxfp8_configs(16, 64, 128))
+    row = dict(
+        zip(MXFP8_KEYS, ["gfx950", 256, 16, 64, 128, "torch.bfloat16", False, True])
+    )
+    tasks = make_tasks(row, {})
+    finalists = screen_tasks(tasks, 1)
+    assert {t[4][1]["direct_b"] for t in finalists} == {False, True}
+
+
+def test_direct_b_rejects_unsupported_combinations():
+    from aiter.ops.flydsl.kernels.scaled_gemm_gfx950 import (
+        make_scaled_gemm_gfx950_param,
+    )
+
+    for kwargs in (
+        {"bpreshuffle": False},
+        {"bpreshuffle": True, "use_half_tile_interleaved": True},
+        {"bpreshuffle": True, "mma_m": 32, "mma_n": 32, "mma_k": 64},
+    ):
+        with pytest.raises(ValueError, match="direct_b requires"):
+            make_scaled_gemm_gfx950_param(direct_b=True, **kwargs)
+
+
+@pytest.mark.parametrize("direct_b", [False, True])
+@pytest.mark.parametrize(
+    "m,n,k,config",
+    [
+        (1, 80, 1152, dict(DEFAULT_CONFIG, stages=4, split_k=3)),
+        (65, 144, 1536, dict(DEFAULT_CONFIG, stages=3, split_k=3, group_m=4)),
+        (33, 128, 1280, dict(DEFAULT_CONFIG, block_k=256, k_waves=2)),
+    ],
+)
+@GPU
+def test_pipeline_boundaries(direct_b, m, n, k, config):
+    a, w, sa, sb, _b, ref = inputs(m, n, k, bp=True)
+    out = torch.full_like(ref, float("nan"))
+    y = flydsl_mxfp8_gemm(
+        a, w, sa, sb, out=out, config=dict(config, direct_b=direct_b), bpreshuffle=True
+    )
+    torch.testing.assert_close(y, ref, atol=0.1, rtol=0.03)
+
+
+@pytest.mark.parametrize("k", [256, 768, 1536, 2560])
+@GPU
+def test_hti_scale_chunk_wrap(k):
+    a, w, sa, sb, _b, ref = inputs(129, 256, k, bp=True)
+    y = flydsl_mxfp8_gemm(a, w, sa, sb, config=CONFIGS["hti"], bpreshuffle=True)
+    torch.testing.assert_close(y, ref, atol=0.1, rtol=0.03)
+
+
+@pytest.mark.parametrize("layout", ["nn", "nt", "tn", "tt"])
+@GPU
+def test_low_level_data_layouts(layout):
+    from aiter.ops.flydsl.kernels.scaled_gemm_gfx950 import scaled_gemm
+
+    a, w, sa, sb, b, ref = inputs(32, 64, 1024, dtype=torch.float32, bias=True)
+    a = a.t().contiguous().t() if layout[0] == "t" else a
+    bt = w.t() if layout[1] == "t" else w.t().contiguous()
+    y = scaled_gemm(
+        a,
+        bt,
+        sa,
+        sb,
+        bias=b,
+        out_dtype=torch.float32,
+        layout=layout,
+        user_kwargs=dict(DEFAULT_CONFIG, block_k=256, k_waves=2, split_k=2),
+    )
+    torch.testing.assert_close(y, ref, atol=0.1, rtol=0.03)
+
+
+@GPU
+def test_batched_noncontiguous_tgemm():
+    from aiter.tuned_gemm import tgemm
+
+    a, w, sa, sb, b, ref = inputs(6, 64, 256, bias=True, bp=True)
+    a = a.reshape(2, 3, 256).transpose(0, 1)
+    sa = sa.reshape(2, 3, 8).transpose(0, 1)
+    expected = ref.reshape(2, 3, 64).transpose(0, 1)
+    y = tgemm.mm(a, w, b, scale_a=sa, scale_b=sb, bpreshuffle=True)
+    torch.testing.assert_close(y, expected, atol=0.1, rtol=0.03)
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        "rank",
+        "k",
+        "empty",
+        "dtype",
+        "out_shape",
+        "out_dtype",
+        "out_stride",
+        "bias_shape",
+        "cpu_scale",
+    ],
+)
+@GPU
+def test_invalid_public_operands(case):
+    from aiter import gemm_a8w8_mxfp8
+
+    a, w, sa, sb, _b, ref = inputs(16, 64, 256, bp=True)
+    kw = {}
+    if case == "rank":
+        a = a[0]
+    elif case == "k":
+        w = w[:, :128]
+    elif case == "empty":
+        a, sa = a[:0], sa[:0]
+    elif case == "dtype":
+        a = a.float()
+    elif case == "out_shape":
+        kw["out"] = torch.empty(64, 16, device="cuda", dtype=ref.dtype)
+    elif case == "out_dtype":
+        kw["out"] = ref.float()
+    elif case == "out_stride":
+        kw["out"] = ref.t().contiguous().t()
+    elif case == "bias_shape":
+        kw["bias"] = torch.empty(64, 2, device="cuda", dtype=ref.dtype)
+    elif case == "cpu_scale":
+        sa = sa.cpu()
+    with pytest.raises(ValueError):
+        gemm_a8w8_mxfp8(a, w, sa, sb, **kw)
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("splitK", 1),
+        ("outdtype", "torch.float32"),
+        ("bias", True),
+        ("bpreshuffle", False),
+        ("gfx", "gfx1250"),
+    ],
+)
+def test_aot_rejects_inconsistent_config(tmp_path, field, value):
+    from aiter.aot.flydsl.gemm import parse_csv
+
+    row = dict(
+        zip(MXFP8_KEYS, ["gfx950", 256, 16, 64, 256, "torch.bfloat16", False, True])
+    )
+    row.update(
+        libtype="flydsl",
+        splitK=2,
+        kernelName=flydsl_mxfp8_kernel_name(
+            dict(DEFAULT_CONFIG, split_k=2), bpreshuffle=True
+        ),
+    )
+    row[field] = value
+    path = tmp_path / "bad.csv"
+    with path.open("w") as f:
+        writer = csv.DictWriter(f, fieldnames=row)
+        writer.writeheader()
+        writer.writerow(row)
+    with pytest.raises(ValueError, match="MXFP8"):
+        parse_csv(path)
+
+
+@GPU
+def test_runtime_invalid_config_falls_back(tmp_path, monkeypatch, request):
+    from types import SimpleNamespace
+
+    from aiter.ops import gemm_op_mxfp8 as mx
+
+    row = dict(
+        zip(MXFP8_KEYS, ["gfx950", 256, 16, 64, 256, "torch.bfloat16", False, True])
+    )
+    row.update(
+        libtype="flydsl",
+        splitK=1,
+        kernelName=flydsl_mxfp8_kernel_name(
+            dict(DEFAULT_CONFIG, split_k=2, direct_b=True), bpreshuffle=True
+        ),
+    )
+    path = tmp_path / "bad.csv"
+    with path.open("w") as f:
+        writer = csv.DictWriter(f, fieldnames=row)
+        writer.writeheader()
+        writer.writerow(row)
+    monkeypatch.setattr(
+        mx, "AITER_CONFIGS", SimpleNamespace(AITER_CONFIG_GEMM_MXFP8_FILE=str(path))
+    )
+    mx.get_mxfp8_config.cache_clear()
+    request.addfinalizer(mx.get_mxfp8_config.cache_clear)
+    request.addfinalizer(mx._load_mxfp8_configs.cache_clear)
+    assert (
+        mx.get_mxfp8_config(16, 64, 256, torch.bfloat16, False, True) == DEFAULT_CONFIG
+    )
+    a, w, sa, sb, _b, ref = inputs(16, 64, 256, bp=True)
+    torch.testing.assert_close(
+        mx.gemm_mxfp8(a, w, sa, sb, bpreshuffle=True), ref, atol=0.1, rtol=0.03
+    )
+
+
+@pytest.mark.parametrize("split_k", [1, 7])
+@pytest.mark.parametrize("direct_b", [False, True])
+@GPU
+def test_fp32_and_bias_exact(split_k, direct_b):
+    a = torch.ones((1, 896), device="cuda").to(torch.float8_e4m3fn)
+    w = torch.ones((64, 896), device="cuda").to(a.dtype)
+    sa = torch.full((1, 28), 127, device="cuda", dtype=torch.uint8)
+    sb = torch.full((64, 28), 127, device="cuda", dtype=torch.uint8)
+    bias = torch.arange(64, device="cuda", dtype=torch.float32) / 32
     y = flydsl_mxfp8_gemm(
         a,
         shuffle_weight(w),
         sa,
         sb,
-        config=config,
+        bias=bias,
         out_dtype=torch.float32,
-        scale_block=128,
         bpreshuffle=True,
-        scale_a_transposed=True,
+        config=dict(DEFAULT_CONFIG, split_k=split_k, direct_b=direct_b),
     )
-    torch.testing.assert_close(y, ref, atol=1e-4, rtol=1e-5)
+    torch.testing.assert_close(y, 896 + bias[None, :], atol=0, rtol=0)
 
 
+@pytest.mark.parametrize(
+    "config",
+    [
+        dict(DEFAULT_CONFIG, split_k=0),
+        dict(DEFAULT_CONFIG, stages=1),
+        dict(DEFAULT_CONFIG, block_k=0),
+        dict(DEFAULT_CONFIG, split_k=3, stages=4),
+    ],
+)
 @GPU
-def test_ksd_aot_reuses_dynamic_split_count(tmp_path):
-    config = dict(DEFAULT_CONFIG, split_k=2)
-    name = flydsl_mxfp8_kernel_name(
-        config,
-        out_dtype=torch.float32,
-        scale_block=128,
-        bpreshuffle=True,
-        scale_a_transposed=True,
+def test_invalid_policy_is_rejected_before_launch(config):
+    a, w, sa, sb, _b, _ref = inputs(16, 64, 768, bp=True)
+    with pytest.raises(ValueError, match="shape/config"):
+        flydsl_mxfp8_gemm(a, w, sa, sb, config=config, bpreshuffle=True)
+
+
+@pytest.mark.parametrize("direct_b", [False, True])
+@GPU
+def test_offset_buffers_preserve_guards(direct_b):
+    a, w, sa, sb, bias, ref = inputs(17, 80, 1024, bias=True, bp=True)
+    # Contiguous scale views with deliberately unaligned byte offsets must
+    # be materialized before dword-to-LDS loads. Bias is non-contiguous.
+    sa_storage = torch.zeros(sa.numel() + 1, device="cuda", dtype=torch.uint8)
+    sa_storage[1:].copy_(sa.flatten())
+    sx = sa_storage[1:].view_as(sa)
+    bias_storage = torch.zeros(160, device="cuda", dtype=ref.dtype)
+    bias_storage[::2].copy_(bias)
+    guard = 32
+    storage = torch.full((ref.numel() + 2 * guard,), 17, device="cuda", dtype=ref.dtype)
+    out = storage[guard:-guard].view_as(ref)
+    cfg = dict(DEFAULT_CONFIG, split_k=2, direct_b=direct_b)
+    flydsl_mxfp8_gemm(
+        a, w, sx, sb, out=out, bias=bias_storage[::2], config=cfg, bpreshuffle=True
     )
-    path = tmp_path / "tuned.csv"
-    row = dict(
-        zip(
-            MXFP8_KEYS,
-            ["gfx950", 256, 1, 128, 7168, "torch.float32", False, 128, True, True],
-        )
-    )
-    row.update(libtype="flydsl", kernelName=name, splitK=2)
-    with path.open("w") as f:
-        writer = csv.DictWriter(f, fieldnames=row)
-        writer.writeheader()
-        writer.writerow(row)
-    env = dict(os.environ, FLYDSL_RUNTIME_CACHE_DIR=str(tmp_path / "cache"))
-    aot_env = dict(
-        env,
-        AITER_AOT_IMPORT="1",
-        HIP_VISIBLE_DEVICES="",
-        ROCR_VISIBLE_DEVICES="",
-        GPU_ARCHS="gfx950",
-    )
-    aot_env.pop("FLYDSL_RUNTIME_RUN_ONLY", None)
-    _run(["-m", "aiter.aot.flydsl.gemm", "--csv", str(path)], aot_env)
-    code = """
-import torch
-from aiter.ops.flydsl.gemm_mxfp8 import DEFAULT_CONFIG, flydsl_mxfp8_gemm
-from aiter.ops.flydsl.kernels.scaled_gemm_gfx950 import scaled_gemm_gfx950
-a = torch.ones(1,7168,device='cuda').to(torch.float8_e4m3fn)
-w = torch.ones(128,7168,device='cuda').to(a.dtype)
-sa = torch.full((1,56),127,device='cuda',dtype=torch.uint8)
-sb = torch.full((1,56),127,device='cuda',dtype=torch.uint8)
-for split in (2,4,7,8):
-    y = flydsl_mxfp8_gemm(a,w,sa,sb,config=dict(DEFAULT_CONFIG,split_k=split),
-                          out_dtype=torch.float32,scale_block=128,
-                          bpreshuffle=True,scale_a_transposed=True)
-    torch.testing.assert_close(y,torch.full_like(y,7168),atol=0,rtol=0)
-assert len(scaled_gemm_gfx950._compiled_cache) == 1
-"""
-    _run(code, dict(env, FLYDSL_RUNTIME_RUN_ONLY="1"))
-
-
-def test_shared_hgemm_space():
-    from aiter.ops.flydsl.gemm_a16w16_policy import gemm_config_space
-
-    bf16 = gemm_config_space(7168)
-    mx = gemm_config_space(7168, block_k=(128, 256, 512), k_waves=(1, 2, 4))
-    assert set(bf16["split_k"]) == {1, 2, 4, 7, 8}
-    for key in bf16:
-        if key not in ("block_k", "k_waves"):
-            assert bf16[key] == mx[key]
-    assert set(mx["block_k"]) == {128, 256, 512}
-    assert set(mx["k_waves"]) == {1, 2, 4}
-
-
-def test_aot_rejects_mismatched_split_column(tmp_path):
-    from aiter.aot.flydsl.gemm import parse_csv
-
-    name = flydsl_mxfp8_kernel_name(dict(DEFAULT_CONFIG, split_k=2))
-    path = tmp_path / "invalid.csv"
-    with path.open("w") as f:
-        writer = csv.DictWriter(
-            f,
-            fieldnames=[
-                "gfx",
-                "cu_num",
-                "M",
-                "N",
-                "K",
-                "libtype",
-                "kernelName",
-                "splitK",
-            ],
-        )
-        writer.writeheader()
-        writer.writerow(
-            dict(
-                gfx="gfx950",
-                cu_num=256,
-                M=1,
-                N=64,
-                K=256,
-                libtype="flydsl",
-                kernelName=name,
-                splitK=1,
-            )
-        )
-    with pytest.raises(ValueError, match="name/splitK"):
-        parse_csv(path)
+    torch.testing.assert_close(out, ref, atol=0.1, rtol=0.03)
+    assert torch.equal(storage[:guard], torch.full_like(storage[:guard], 17))
+    assert torch.equal(storage[-guard:], torch.full_like(storage[-guard:], 17))

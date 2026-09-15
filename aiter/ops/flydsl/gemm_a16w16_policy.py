@@ -129,10 +129,12 @@ class GemmConfigPruner:
         return [config for index, config in enumerate(kept) if index in keep]
 
 
-def gemm_config_space(k, *, block_k=(64, 128, 256), k_waves=(1, 2)):
+def gemm_config_space(k, *, block_k=(64, 128, 256), k_waves=(1, 2), max_split_k=9):
     """Shared HGEMM/MXFP8 axes; split count is a runtime launch parameter."""
     split_k_candidates = [1]
-    split_k_candidates.extend(split_k for split_k in range(2, 10) if k % split_k == 0)
+    split_k_candidates.extend(
+        split_k for split_k in range(2, max_split_k + 1) if k % split_k == 0
+    )
     selections = {
         "block_m": [16, 32, 48, 64, 80, 96, 128, 256],
         "block_n": [16, 32, 64, 80, 96, 128, 256],

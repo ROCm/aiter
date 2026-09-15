@@ -302,23 +302,30 @@ def gemm_a16w16(
     scale_c: Tensor | None = None,
     bpreshuffle: bool | None = None,
 ) -> Tensor:
-    from aiter.ops.gemm_op_mxfp8 import gemm_mxfp8, is_mxfp8_scale
+    from aiter.ops.gemm_op_mxfp8 import is_mxfp8_scale
 
     if is_mxfp8_scale(scale_a) or is_mxfp8_scale(scale_b):
+        if get_gfx() != "gfx950":
+            raise NotImplementedError(
+                "tgemm MXFP8 accepts gfx950 unshuffled scales only; "
+                "use gemm_a8w8_mxfp8 with the architecture-specific layout"
+            )
         if not (is_mxfp8_scale(scale_a) and is_mxfp8_scale(scale_b)):
             raise ValueError("MXFP8 requires both A and B E8M0 scales")
         if scale_c is not None:
             raise ValueError("MXFP8 does not support scale_c")
         inp = A.reshape(-1, A.shape[-1])
-        # The tuned_gemm API uses native 1x32 scales. Block128 model operands
-        # enter through gemm_a8w8_blockscale_bpreshuffle instead.
+        # Native MXFP8: unshuffled E8M0 scales for each 32 K elements.
         sx = scale_a.reshape(inp.shape[0], -1)
-        out = gemm_mxfp8(
+        from aiter.ops.gemm_op_a8w8 import gemm_a8w8_mxfp8
+
+        out = gemm_a8w8_mxfp8(
             inp,
             B,
             sx,
             scale_b,
             bias=bias,
+            a_preshuffle=False,
             dtype=otype or torch.bfloat16,
             bpreshuffle=(
                 bool(getattr(B, "is_shuffled", False))

@@ -900,7 +900,8 @@ def gemm_a8w8_blockscale_bpreshuffle_fake(
     return torch.empty(XQ.shape[0], WQ.shape[0], dtype=dtype, device=XQ.device)
 
 
-def _gemm_a8w8_blockscale_bpreshuffle_impl(
+@torch_compile_guard(gen_fake=gemm_a8w8_blockscale_bpreshuffle_fake)
+def gemm_a8w8_blockscale_bpreshuffle(
     XQ: Tensor,
     WQ: Tensor,
     x_scale: Tensor,
@@ -929,32 +930,6 @@ def _gemm_a8w8_blockscale_bpreshuffle_impl(
         Y = out
     else:
         Y = torch.empty(m, n, dtype=dtype, device=XQ.device)
-
-    # gfx950 E8M0 block128 is not fp32 blockscale. Keep its tuned rows
-    # separate and consume both the preshuffled weight and byte-transposed
-    # activation scales directly (no weight unshuffle / scale expansion).
-    if (
-        get_gfx() == "gfx950"
-        and dtype == dtypes.bf16
-        and x_scale.dtype in (torch.uint8, dtypes.fp8_e8m0)
-        and w_scale.dtype in (torch.uint8, dtypes.fp8_e8m0)
-    ):
-        from .gemm_op_mxfp8 import gemm_mxfp8
-
-        if x_scale.numel() != m * (k // 128):
-            raise ValueError("block128 activation scale has an invalid size")
-        sx = x_scale.view(torch.uint8).reshape(k // 128, m).t()
-        return gemm_mxfp8(
-            XQ,
-            WQ,
-            sx,
-            w_scale,
-            out=Y,
-            dtype=dtype,
-            scale_block=128,
-            bpreshuffle=True,
-            scale_a_transposed=True,
-        )
 
     use_gfx1250_flydsl_or_triton_mxfp8_128 = (
         get_gfx() == "gfx1250"
@@ -1140,74 +1115,6 @@ def _gemm_a8w8_blockscale_bpreshuffle_impl(
         ) from e
 
 
-@torch.compiler.assume_constant_result
-def _use_gfx950_mxfp8():
-    return get_gfx() == "gfx950"
-
-
-@torch_compile_guard(gen_fake=gemm_a8w8_blockscale_bpreshuffle_fake, mutates_args=[])
-def _gemm_a8w8_blockscale_bpreshuffle(
-    XQ: Tensor,
-    WQ: Tensor,
-    x_scale: Tensor,
-    w_scale: Tensor,
-    dtype: torch.dtype = dtypes.bf16,
-) -> Tensor:
-    return _gemm_a8w8_blockscale_bpreshuffle_impl(XQ, WQ, x_scale, w_scale, dtype)
-
-
-def _gemm_a8w8_blockscale_bpreshuffle_out_fake(
-    XQ: Tensor,
-    WQ: Tensor,
-    x_scale: Tensor,
-    w_scale: Tensor,
-    out: Tensor,
-    dtype: torch.dtype = dtypes.bf16,
-) -> None:
-    return None
-
-
-@torch_compile_guard(
-    gen_fake=_gemm_a8w8_blockscale_bpreshuffle_out_fake, mutates_args=["out"]
-)
-def _gemm_a8w8_blockscale_bpreshuffle_out(
-    XQ: Tensor,
-    WQ: Tensor,
-    x_scale: Tensor,
-    w_scale: Tensor,
-    out: Tensor,
-    dtype: torch.dtype = dtypes.bf16,
-) -> None:
-    _gemm_a8w8_blockscale_bpreshuffle_impl(XQ, WQ, x_scale, w_scale, dtype, out=out)
-
-
-def gemm_a8w8_blockscale_bpreshuffle(
-    XQ: Tensor,
-    WQ: Tensor,
-    x_scale: Tensor,
-    w_scale: Tensor,
-    dtype: torch.dtype = dtypes.bf16,
-    out: Tensor | None = None,
-) -> Tensor:
-    # Inductor's mutating-op functionalization does not support E8M0 on
-    # some torch versions. The gfx950 MX kernel consumes the same raw bytes:
-    # make this zero-copy dtype view BEFORE crossing the custom-op boundary.
-    if (
-        dtype == dtypes.bf16
-        and x_scale.dtype in (torch.uint8, dtypes.fp8_e8m0)
-        and w_scale.dtype in (torch.uint8, dtypes.fp8_e8m0)
-        and _use_gfx950_mxfp8()
-    ):
-        x_scale = x_scale.view(torch.uint8)
-        w_scale = w_scale.view(torch.uint8)
-    # A mutating custom op must not also return an alias of its output argument:
-    # split functional and out variants so inductor can functionalize both.
-    if out is None:
-        return _gemm_a8w8_blockscale_bpreshuffle(XQ, WQ, x_scale, w_scale, dtype)
-    _gemm_a8w8_blockscale_bpreshuffle_out(XQ, WQ, x_scale, w_scale, out, dtype)
-    return out
-
-
 def gfx950_a8w8_blockscale_ASM(
     XQ: Tensor,
     WQ: Tensor,
@@ -1381,7 +1288,7 @@ def _mxfp8_mxfp8_gemm_asm(
 ) -> None: ...
 
 
-def gemm_a8w8_mxfp8(
+def _gemm_a8w8_mxfp8_gfx1250(
     A: Tensor,  # A:[M, K]   mxfp8 e4m3
     B: Tensor,  # B:[N, K]   mxfp8 e4m3
     ScaleA: Tensor,  # ScaleA:[M, K/32] e8m0
@@ -1422,3 +1329,76 @@ def gemm_a8w8_mxfp8(
         int(bool(a_preshuffle)),
     )
     return out
+
+
+@torch.compiler.assume_constant_result
+def _mxfp8_arch():
+    return get_gfx()
+
+
+def gemm_a8w8_mxfp8(
+    A: Tensor,
+    B: Tensor,
+    ScaleA: Tensor,
+    ScaleB: Tensor,
+    dtype: torch.dtype = dtypes.bf16,
+    a_preshuffle: bool | None = None,
+    kernelName: str = "",
+    *,
+    out: Tensor | None = None,
+    bias: Tensor | None = None,
+    bpreshuffle: bool = True,
+) -> Tensor:
+    """Standard MXFP8 GEMM, with explicitly separate architecture contracts.
+
+    gfx950: row-major A, (16,16)-preshuffled B by default, unshuffled E8M0
+    scales [M,K/32] and [N,K/32]. FlyDSL tuned dispatch, BF16/FP32 output.
+    Set bpreshuffle=False for plain B. A preshuffle is not supported.
+
+    gfx1250: the existing ASM ABI, shuffled scales and preshuffled B;
+    A preshuffle defaults to True, as before. No gfx950 CSV lookup/conversion.
+
+    a_preshuffle=None uses the architecture's native layout. On gfx950,
+    the kernel and split count are selected from the tuned config; kernelName
+    is retained only for the existing gfx1250 ASM API.
+    """
+    gfx = _mxfp8_arch()
+    if gfx == "gfx950":
+        if kernelName:
+            raise ValueError(
+                "gfx950 MXFP8 selects kernelName and splitK from tuned config"
+            )
+        if a_preshuffle:
+            raise ValueError("gfx950 MXFP8 requires unshuffled A (a_preshuffle=False)")
+        from .gemm_op_mxfp8 import (
+            _gemm_a8w8_mxfp8_gfx950,
+            _gemm_a8w8_mxfp8_gfx950_out,
+        )
+
+        scale_types = (torch.uint8, torch.float8_e8m0fnu)
+        if ScaleA.dtype not in scale_types or ScaleB.dtype not in scale_types:
+            raise ValueError("gfx950 MXFP8 requires E8M0 or uint8 scales")
+        # Bit-preserving views before the custom-op boundary avoid E8M0
+        # auto-functionalization failures in inductor's mutating-out path.
+        sa, sb = ScaleA.view(torch.uint8), ScaleB.view(torch.uint8)
+        if out is None:
+            return _gemm_a8w8_mxfp8_gfx950(A, B, sa, sb, dtype, bias, bpreshuffle)
+        _gemm_a8w8_mxfp8_gfx950_out(A, B, sa, sb, out, dtype, bias, bpreshuffle)
+        return out
+    if gfx == "gfx1250":
+        if out is not None or bias is not None or not bpreshuffle:
+            raise NotImplementedError(
+                "gfx1250 MXFP8 retains the ASM ABI: no out/bias/plain-B override"
+            )
+        if kernelName.startswith("flydsl_"):
+            raise ValueError("gfx950 FlyDSL kernelName cannot be used on gfx1250")
+        return _gemm_a8w8_mxfp8_gfx1250(
+            A,
+            B,
+            ScaleA,
+            ScaleB,
+            dtype,
+            True if a_preshuffle is None else a_preshuffle,
+            kernelName,
+        )
+    raise NotImplementedError(f"gemm_a8w8_mxfp8 is not supported on {gfx}")
