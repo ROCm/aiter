@@ -15,7 +15,7 @@ import flydsl.expr as fx
 from flydsl.expr import const_expr, gpu, range_constexpr
 from flydsl.expr.typing import T
 
-from .kernels_common import atomic_add_i32, atomic_or_i32
+from ..kernels_common import atomic_add_i32, atomic_or_i32
 from .topk_per_row_decode import _load_f32x4
 
 _VEC = 4
