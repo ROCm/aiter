@@ -381,11 +381,12 @@ def _heuristic_bpreshuffle_kid(
         #
         # Names the measured winner in 48 of 55 cells; every miss is a near-tie
         # it declines to chase (worst 6.7%, at b<=2 m=32 where kid8 edges kid10).
-        # The m*batch bound was 256, fitted to the sweep's own edge. Measured
-        # on profiler kernel time at b=16 m=32 (m*batch = 512), kid38 is 12.1 us
-        # against kid31's 13.2 -- the narrow tile still wins there. It does NOT
-        # extend further: at b=16 m=64 kid38 is 32.8 us against kid31's 25.6.
-        if m <= 128 and m * batch <= 512 and m <= 32:
+        # The m*batch <= 256 bound is load-bearing in both directions. Widening
+        # it to 512 with an `m <= 32` guard -- to catch b=16 m=32, where kid38
+        # and kid31 measure level -- instead dropped b=4 m=64 and b=2 m=128 out
+        # of the decode band, and kid31 is 33% and 27% slower there. Measured
+        # with run_perftest. Leave the bound alone.
+        if m <= 128 and m * batch <= 256:
             # kid38 is kid8's 16x64 tile moved onto the NON-SPECIALIZED pipeline
             # at B_K=512 / slots=4. ATT at b=16 m=16 put 43.7% of kid8's latency
             # in s_barrier_wait -- the specialized DATA/FREE handshake, one pair
