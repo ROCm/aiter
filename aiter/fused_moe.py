@@ -1837,6 +1837,10 @@ def _flydsl_stage1_wrapper(
         swiglu_limit=swiglu_limit,
         k_wave=parsed.get("k_wave", 1),
         v2_output_layout=v2_output_layout,
+        w_layout=_kwargs.get(
+            "w_layout",
+            "guinterleave" if activation == ActivationType.Silu else "standard",
+        ),
     )
 
 
@@ -3160,6 +3164,9 @@ def get_2stage_cfgs(
                 activation=activation,
                 inter_dim_pad=intermediate_pad,
                 model_dim_pad=hidden_pad,
+                w_layout=(
+                    "guinterleave" if gate_mode == GateMode.INTERLEAVE else "standard"
+                ),
             )
         else:
             stage1_func = functools.partial(
@@ -3956,7 +3963,10 @@ def fused_moe_2stages(
         and w1.dtype == dtypes.fp4x2
         and (
             q_dtype_a in [dtypes.bf16, dtypes.fp16]
-            and activation in (ActivationType.Swiglu, ActivationType.Situv2)
+            and (
+                activation in (ActivationType.Swiglu, ActivationType.Situv2)
+                or gate_mode == GateMode.INTERLEAVE
+            )
             or (metadata.ksplit > 1 and is_shuffled)
         )
     ):
