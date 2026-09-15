@@ -549,6 +549,64 @@ def test_flydsl_gdr_decode_rejects_noncontiguous_output():
         func(*inouts)
 
 
+def test_flydsl_gdr_decode_rejects_unshuffled_state_without_unit_k_stride():
+    args = Args(
+        dtype=torch.bfloat16,
+        b=2,
+        sq=1,
+        num_k_heads=16,
+        num_v_heads=32,
+        head_k_dim=128,
+        head_v_dim=128,
+    )
+    query, key, value, a, b, dt_bias, A_log, indices, state = create_inputs(args)[1:]
+    (out,) = create_outputs(args)
+    state = state.permute(0, 1, 3, 2).contiguous()
+    storage = torch.empty(
+        *state.shape[:-1],
+        state.shape[-1] * 2,
+        dtype=state.dtype,
+        device=state.device,
+    )
+    strided_state = storage[..., ::2]
+    strided_state.copy_(state)
+    assert strided_state.shape == state.shape
+    assert strided_state.stride(-1) == 2
+
+    with pytest.raises(ValueError, match=r"`state` must be \[pool, HV, V, K\]"):
+        flydsl_gdr_decode(
+            query,
+            key,
+            value,
+            a,
+            b,
+            dt_bias,
+            A_log,
+            indices,
+            strided_state,
+            out,
+            use_qk_l2norm=True,
+            need_shuffle_state=False,
+        )
+
+
+@pytest.mark.skipif(torch.cuda.device_count() < 2, reason="needs a second GPU")
+def test_flydsl_gdr_decode_rejects_stream_from_another_device():
+    args = Args(
+        dtype=torch.bfloat16,
+        b=2,
+        sq=1,
+        num_k_heads=16,
+        num_v_heads=32,
+        head_k_dim=128,
+        head_v_dim=128,
+    )
+    inouts = list(create_inputs(args) + create_outputs(args))
+    foreign = torch.cuda.Stream(device=1)
+    with pytest.raises(ValueError, match=r"`stream` must be on"):
+        flydsl_gdr_decode(*inouts[1:], True, True, foreign)
+
+
 @pytest.mark.parametrize(
     "num_k_heads,num_v_heads",
     [(2, 8), (4, 8), (4, 16), (8, 16), (8, 32), (16, 32), (16, 64)],

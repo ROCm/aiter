@@ -407,8 +407,7 @@ def flydsl_gdr_decode(
 ):
     device = query.device
     dtype = query.dtype
-    if stream is None:
-        stream = torch.cuda.current_stream(device)
+    stream = _mtp_stream(query, stream)
     read_indices = indices if read_indices is None else read_indices
     write_indices = indices if write_indices is None else write_indices
     for input in [
@@ -422,6 +421,7 @@ def flydsl_gdr_decode(
         read_indices,
         write_indices,
         out,
+        state,
     ]:
         assert input.device == device
     assert state.data_ptr() % 16 == 0
@@ -452,6 +452,11 @@ def flydsl_gdr_decode(
         raise ValueError(
             "`out` must be contiguous because the kernel uses packed output strides; "
             f"got stride {out.stride()}."
+        )
+    if not need_shuffle_state and state.stride(-1) != 1:
+        raise ValueError(
+            "`state` must be [pool, HV, V, K] with K contiguous when "
+            f"`need_shuffle_state` is False; got stride {state.stride()}."
         )
 
     # `a`'s rank selects the gate; the shapes below follow from it.
